@@ -15,7 +15,8 @@ export const VENUE_NAMES: Record<VenueId, string> = {
   orderly: 'Orderly',
 };
 
-// Paused and Needs you come with the Desk screen: DeskState carries no pause flag or rescue failure yet.
+// Paused (desk.paused) and Needs you (desk.rescueFailure) come with the Desk screen; the order is in
+// docs/interfaces.md next to RescueFailure.
 export function statusOf(desk: DeskState): StatusView {
   const nearest = nearestToLiquidation(desk.legs);
   if (!nearest) return { tone: 'waiting', word: 'Waiting', sentence: 'No position is open.' };
