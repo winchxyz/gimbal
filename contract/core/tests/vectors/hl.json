@@ -1,0 +1,3573 @@
+{
+  "file": "hl.json",
+  "briefs": "C3 (hl.rs builders and digests, px/sz rules, E_ASSET/E_DECIMAL/E_SIZE), C6 (band, staleness, unpriced; hl_send_to_intents uses the sendAsset shape), C5 (signature recovers to the desk address)",
+  "generator": "gen/hl.mjs, cross-checked by gen/hl_check.py",
+  "references": [
+    "nktkas/hyperliquid 0.33.3",
+    "viem 2.57.7",
+    "ethers 6.17.0",
+    "msgpack/msgpack 3.1.3",
+    "std/msgpack 1.0.3 (bundled in nktkas)",
+    "hyperliquid-python-sdk 0.24.0 + eth-account 0.13.7 + msgpack 1.2.4 (hl_check.py)"
+  ],
+  "keys": {
+    "deskEvm": {
+      "role": "desk EVM address: Hyperliquid master, Orderly account owner, EIP-3009 `from`",
+      "private_key": "0x0101010101010101010101010101010101010101010101010101010101010101",
+      "address": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+      "address_lower": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1"
+    },
+    "builder": {
+      "role": "treasury Hyperliquid builder address (`Treasury.hl_builder`)",
+      "private_key": "0x0202020202020202020202020202020202020202020202020202020202020202",
+      "address": "0x5050A4F4b3f9338C3472dcC01A87C76A144b3c9c",
+      "address_lower": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c"
+    },
+    "depositEvm": {
+      "role": "a 1Click-style EVM deposit address (sendAsset destination, EIP-3009 `to`)",
+      "private_key": "0x0303030303030303030303030303030303030303030303030303030303030303",
+      "address": "0x3325a78425F17a7E487Eb5666b2bFd93aBb06c70",
+      "address_lower": "0x3325a78425f17a7e487eb5666b2bfd93abb06c70"
+    }
+  },
+  "key_note": "Public test keys (secp256k1 private keys 0x01..01, 0x02..02, 0x03..03). Never fund them. ECDSA signatures are RFC 6979 deterministic with low s, so every library gives the same r, s, v; MPC signatures will differ but must recover to the same address.",
+  "l1": {
+    "domain": {
+      "name": "Exchange",
+      "version": "1",
+      "chainId": 1337,
+      "verifyingContract": "0x0000000000000000000000000000000000000000"
+    },
+    "domain_separator": "0xd79297fcdf2ffcd4ae223d01edaa2ba214ff8f401d7c9300d995d17c82aa4040",
+    "agent_type": "Agent(string source,bytes32 connectionId)",
+    "agent_typehash": "0x26f05c2f7239b6983075e58321292d77b3aa173d19b27257ac96ab362570f508",
+    "connection_id_rule": "keccak256(msgpack(action) || nonce as u64 big-endian || 0x00); no vault, no expiresAfter",
+    "source": {
+      "mainnet": "a",
+      "testnet": "b"
+    },
+    "cases": [
+      {
+        "name": "ETH buy IOC, no cloid, fee 1 bp",
+        "kind": "order",
+        "params": {
+          "asset": 1,
+          "is_buy": true,
+          "px": "2400.5",
+          "sz": "0.0042",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null,
+          "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+          "builder_fee_tenth_bps": 10
+        },
+        "action": {
+          "type": "order",
+          "orders": [
+            {
+              "a": 1,
+              "b": true,
+              "p": "2400.5",
+              "s": "0.0042",
+              "r": false,
+              "t": {
+                "limit": {
+                  "tif": "Ioc"
+                }
+              }
+            }
+          ],
+          "grouping": "na",
+          "builder": {
+            "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+            "f": 10
+          }
+        },
+        "nonce": 1793491200000,
+        "msgpack_hex": "84a474797065a56f72646572a66f72646572739186a16101a162c3a170a6323430302e35a173a6302e30303432a172c2a17481a56c696d697481a3746966a3496f63a867726f7570696e67a26e61a76275696c64657282a162d92a307835303530613466346233663933333863333437326463633031613837633736613134346233633963a1660a",
+        "connection_id": "0xfd2828ed919795927ff8a7a60a759975f026889ff25dd66f7a8ad6fd32273c8c",
+        "mainnet": {
+          "source": "a",
+          "struct_hash": "0xc809ec84cc0a9c815056ebe2b0146100a354f201a4a3357818ceea2a21fac2fe",
+          "digest": "0xf4d4443acbd2848d64253f1563a3120053124cf7f879bb0619c2da530e384ce5",
+          "signature": {
+            "r": "0xfeb53e084cce64bb44cb208ce086873b8f0fdffaa6f47747454852bd95cafd0d",
+            "s": "0x67ea358d75d8bb5531038b3fd8cff04cda9fa3f661c42f64d82e95d3b869af92",
+            "v": 28,
+            "hex": "0xfeb53e084cce64bb44cb208ce086873b8f0fdffaa6f47747454852bd95cafd0d67ea358d75d8bb5531038b3fd8cff04cda9fa3f661c42f64d82e95d3b869af921c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 1,
+                  "b": true,
+                  "p": "2400.5",
+                  "s": "0.0042",
+                  "r": false,
+                  "t": {
+                    "limit": {
+                      "tif": "Ioc"
+                    }
+                  }
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 10
+              }
+            },
+            "nonce": 1793491200000,
+            "signature": {
+              "r": "0xfeb53e084cce64bb44cb208ce086873b8f0fdffaa6f47747454852bd95cafd0d",
+              "s": "0x67ea358d75d8bb5531038b3fd8cff04cda9fa3f661c42f64d82e95d3b869af92",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        },
+        "testnet": {
+          "source": "b",
+          "struct_hash": "0x48baa511c86de89a8fa46db8a5f9473ec72006d3559bb95b6798511fdc9726b9",
+          "digest": "0xc7458114768a28a0726caf9df88becdcf7b0889d35c046901d91b12791a46589",
+          "signature": {
+            "r": "0x06b31f25779e09de1541afd81a48c6fdc6a899fc2f4e8522c14afc9be3e60f95",
+            "s": "0x6ab7b7d3a02652ecdc0604166a60fd0a891f7fa59e965b3b9a7e05a146896007",
+            "v": 28,
+            "hex": "0x06b31f25779e09de1541afd81a48c6fdc6a899fc2f4e8522c14afc9be3e60f956ab7b7d3a02652ecdc0604166a60fd0a891f7fa59e965b3b9a7e05a1468960071c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 1,
+                  "b": true,
+                  "p": "2400.5",
+                  "s": "0.0042",
+                  "r": false,
+                  "t": {
+                    "limit": {
+                      "tif": "Ioc"
+                    }
+                  }
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 10
+              }
+            },
+            "nonce": 1793491200000,
+            "signature": {
+              "r": "0x06b31f25779e09de1541afd81a48c6fdc6a899fc2f4e8522c14afc9be3e60f95",
+              "s": "0x6ab7b7d3a02652ecdc0604166a60fd0a891f7fa59e965b3b9a7e05a146896007",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        }
+      },
+      {
+        "name": "ETH sell IOC with cloid",
+        "kind": "order",
+        "params": {
+          "asset": 1,
+          "is_buy": false,
+          "px": "2399.9",
+          "sz": "0.0042",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": "0x00000000000000000000000000000001",
+          "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+          "builder_fee_tenth_bps": 10
+        },
+        "action": {
+          "type": "order",
+          "orders": [
+            {
+              "a": 1,
+              "b": false,
+              "p": "2399.9",
+              "s": "0.0042",
+              "r": false,
+              "t": {
+                "limit": {
+                  "tif": "Ioc"
+                }
+              },
+              "c": "0x00000000000000000000000000000001"
+            }
+          ],
+          "grouping": "na",
+          "builder": {
+            "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+            "f": 10
+          }
+        },
+        "nonce": 1793491201000,
+        "msgpack_hex": "84a474797065a56f72646572a66f72646572739187a16101a162c2a170a6323339392e39a173a6302e30303432a172c2a17481a56c696d697481a3746966a3496f63a163d92230783030303030303030303030303030303030303030303030303030303030303031a867726f7570696e67a26e61a76275696c64657282a162d92a307835303530613466346233663933333863333437326463633031613837633736613134346233633963a1660a",
+        "connection_id": "0x8eaeb12c8118e46bce731109509e2e890b154d602719ff06280599064725e0fd",
+        "mainnet": {
+          "source": "a",
+          "struct_hash": "0x08f9bb5beb7ff0d58e134b0b6134af63f94c263cd1aa8d381bb038f41c1f0eec",
+          "digest": "0xfb0d6345d06b1c19bb659f8f6c370cec7f2ce530d80ae80e1fd4c50066141e67",
+          "signature": {
+            "r": "0x4a9a61c27e3d6a0111db47c932d20fab07b96b9728b1b63fcbf596a5905d11f1",
+            "s": "0x1c41a5bfd32d1f84383c46022606b6096131d14ae8d199726834855224776560",
+            "v": 28,
+            "hex": "0x4a9a61c27e3d6a0111db47c932d20fab07b96b9728b1b63fcbf596a5905d11f11c41a5bfd32d1f84383c46022606b6096131d14ae8d1997268348552247765601c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 1,
+                  "b": false,
+                  "p": "2399.9",
+                  "s": "0.0042",
+                  "r": false,
+                  "t": {
+                    "limit": {
+                      "tif": "Ioc"
+                    }
+                  },
+                  "c": "0x00000000000000000000000000000001"
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 10
+              }
+            },
+            "nonce": 1793491201000,
+            "signature": {
+              "r": "0x4a9a61c27e3d6a0111db47c932d20fab07b96b9728b1b63fcbf596a5905d11f1",
+              "s": "0x1c41a5bfd32d1f84383c46022606b6096131d14ae8d199726834855224776560",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        },
+        "testnet": {
+          "source": "b",
+          "struct_hash": "0x55bf9159c545b42614922b867a08bfa815698b19c5cb9a1d846ba8551c38ba0a",
+          "digest": "0x2680d1b088823500f3967f78a40e110a7a65e01b6fa2169a319215b9c5f85469",
+          "signature": {
+            "r": "0x816a884eb629444c1b52c2960c72e8956a1e06e9c019ed770b818a6fb24cc8c8",
+            "s": "0x7834a9ed672f6e9b2f11b6f3e0643ed77ca28701397d8a2d626674481f48577a",
+            "v": 28,
+            "hex": "0x816a884eb629444c1b52c2960c72e8956a1e06e9c019ed770b818a6fb24cc8c87834a9ed672f6e9b2f11b6f3e0643ed77ca28701397d8a2d626674481f48577a1c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 1,
+                  "b": false,
+                  "p": "2399.9",
+                  "s": "0.0042",
+                  "r": false,
+                  "t": {
+                    "limit": {
+                      "tif": "Ioc"
+                    }
+                  },
+                  "c": "0x00000000000000000000000000000001"
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 10
+              }
+            },
+            "nonce": 1793491201000,
+            "signature": {
+              "r": "0x816a884eb629444c1b52c2960c72e8956a1e06e9c019ed770b818a6fb24cc8c8",
+              "s": "0x7834a9ed672f6e9b2f11b6f3e0643ed77ca28701397d8a2d626674481f48577a",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        }
+      },
+      {
+        "name": "BTC buy GTC, no cloid",
+        "kind": "order",
+        "params": {
+          "asset": 0,
+          "is_buy": true,
+          "px": "81255",
+          "sz": "0.00012",
+          "reduce_only": false,
+          "tif": "Gtc",
+          "cloid": null,
+          "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+          "builder_fee_tenth_bps": 10
+        },
+        "action": {
+          "type": "order",
+          "orders": [
+            {
+              "a": 0,
+              "b": true,
+              "p": "81255",
+              "s": "0.00012",
+              "r": false,
+              "t": {
+                "limit": {
+                  "tif": "Gtc"
+                }
+              }
+            }
+          ],
+          "grouping": "na",
+          "builder": {
+            "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+            "f": 10
+          }
+        },
+        "nonce": 1793491202000,
+        "msgpack_hex": "84a474797065a56f72646572a66f72646572739186a16100a162c3a170a53831323535a173a7302e3030303132a172c2a17481a56c696d697481a3746966a3477463a867726f7570696e67a26e61a76275696c64657282a162d92a307835303530613466346233663933333863333437326463633031613837633736613134346233633963a1660a",
+        "connection_id": "0x5d7e93156f69a37953f77f0efa85c86965211994792aac97661bdeaf1e61d686",
+        "mainnet": {
+          "source": "a",
+          "struct_hash": "0x71b264f4edf2b38ae282f14153f332a60f51bd2801ad9ca73c0e899a6c951c64",
+          "digest": "0xfb50eadcdf5e036f6ccf35e08a2c71b50765b44ff50e2ece06ba663f44edb1c2",
+          "signature": {
+            "r": "0x3eac8d300940112ca727919ac58752838afb6208729854f7626cc2b291681050",
+            "s": "0x4023554ff01179ab7db7fa61fd4aea14a87ba2eec20382be88d0cb9424f3bde4",
+            "v": 28,
+            "hex": "0x3eac8d300940112ca727919ac58752838afb6208729854f7626cc2b2916810504023554ff01179ab7db7fa61fd4aea14a87ba2eec20382be88d0cb9424f3bde41c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 0,
+                  "b": true,
+                  "p": "81255",
+                  "s": "0.00012",
+                  "r": false,
+                  "t": {
+                    "limit": {
+                      "tif": "Gtc"
+                    }
+                  }
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 10
+              }
+            },
+            "nonce": 1793491202000,
+            "signature": {
+              "r": "0x3eac8d300940112ca727919ac58752838afb6208729854f7626cc2b291681050",
+              "s": "0x4023554ff01179ab7db7fa61fd4aea14a87ba2eec20382be88d0cb9424f3bde4",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        },
+        "testnet": {
+          "source": "b",
+          "struct_hash": "0x9f96a0539d216c276346e0abb484c20d348207d343585710d813da98c291f1ec",
+          "digest": "0xc4461f998621c2bafa3e57ffbdc35dec23ac6ca88ad0501cd48ee13aeef8e986",
+          "signature": {
+            "r": "0x42d253eb72f5b50fa5a036ea403596a5a72df3988465992f90fd43cea83382b8",
+            "s": "0x1d0274ff49cab8a911f669534f066d20c0f1bf24d6ff40b0fe6ac9a232216021",
+            "v": 27,
+            "hex": "0x42d253eb72f5b50fa5a036ea403596a5a72df3988465992f90fd43cea83382b81d0274ff49cab8a911f669534f066d20c0f1bf24d6ff40b0fe6ac9a2322160211b"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 0,
+                  "b": true,
+                  "p": "81255",
+                  "s": "0.00012",
+                  "r": false,
+                  "t": {
+                    "limit": {
+                      "tif": "Gtc"
+                    }
+                  }
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 10
+              }
+            },
+            "nonce": 1793491202000,
+            "signature": {
+              "r": "0x42d253eb72f5b50fa5a036ea403596a5a72df3988465992f90fd43cea83382b8",
+              "s": "0x1d0274ff49cab8a911f669534f066d20c0f1bf24d6ff40b0fe6ac9a232216021",
+              "v": 27
+            },
+            "vaultAddress": null
+          }
+        }
+      },
+      {
+        "name": "BTC sell GTC reduce-only with cloid",
+        "kind": "order",
+        "params": {
+          "asset": 0,
+          "is_buy": false,
+          "px": "81260",
+          "sz": "0.00012",
+          "reduce_only": true,
+          "tif": "Gtc",
+          "cloid": "0x0123456789abcdef0123456789abcdef",
+          "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+          "builder_fee_tenth_bps": 10
+        },
+        "action": {
+          "type": "order",
+          "orders": [
+            {
+              "a": 0,
+              "b": false,
+              "p": "81260",
+              "s": "0.00012",
+              "r": true,
+              "t": {
+                "limit": {
+                  "tif": "Gtc"
+                }
+              },
+              "c": "0x0123456789abcdef0123456789abcdef"
+            }
+          ],
+          "grouping": "na",
+          "builder": {
+            "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+            "f": 10
+          }
+        },
+        "nonce": 1793491203000,
+        "msgpack_hex": "84a474797065a56f72646572a66f72646572739187a16100a162c2a170a53831323630a173a7302e3030303132a172c3a17481a56c696d697481a3746966a3477463a163d92230783031323334353637383961626364656630313233343536373839616263646566a867726f7570696e67a26e61a76275696c64657282a162d92a307835303530613466346233663933333863333437326463633031613837633736613134346233633963a1660a",
+        "connection_id": "0x613b5d3ef692dc2c7e757739d50b63dca7e3fc85c28267c83106723d27599e07",
+        "mainnet": {
+          "source": "a",
+          "struct_hash": "0xe2a50a49ef15a27eb6ed261bafd96aca886013e2add7d3ccfae02846ead63146",
+          "digest": "0x62f2ff6be1d8e5d5458d50e7cacbc96bed3d9f3e73eca61b8a9b30993dd3d005",
+          "signature": {
+            "r": "0x66981bf3f9c87a14881eb328772d6650480dce623fd436363c9fe4a7373a734d",
+            "s": "0x223974cf5532ca0eaf23fb88ea1e8bc8aad8ef762f27062c5ee6738251717239",
+            "v": 27,
+            "hex": "0x66981bf3f9c87a14881eb328772d6650480dce623fd436363c9fe4a7373a734d223974cf5532ca0eaf23fb88ea1e8bc8aad8ef762f27062c5ee67382517172391b"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 0,
+                  "b": false,
+                  "p": "81260",
+                  "s": "0.00012",
+                  "r": true,
+                  "t": {
+                    "limit": {
+                      "tif": "Gtc"
+                    }
+                  },
+                  "c": "0x0123456789abcdef0123456789abcdef"
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 10
+              }
+            },
+            "nonce": 1793491203000,
+            "signature": {
+              "r": "0x66981bf3f9c87a14881eb328772d6650480dce623fd436363c9fe4a7373a734d",
+              "s": "0x223974cf5532ca0eaf23fb88ea1e8bc8aad8ef762f27062c5ee6738251717239",
+              "v": 27
+            },
+            "vaultAddress": null
+          }
+        },
+        "testnet": {
+          "source": "b",
+          "struct_hash": "0x14fa1e6c77dc9369b974b1676a2d7454c4fd8abfffe02d76069cd8154b9fcf23",
+          "digest": "0xb1c000ca99f4867c2328e0347ae80e661f7140df89fff4ccc9297ac47c618154",
+          "signature": {
+            "r": "0x145c82208b8322b2f224604034460541adce7ae63911a450f42381e2ea7e64d1",
+            "s": "0x107e3d635508057feeff610a4abe009293542a908778440923a890ed946cd4c8",
+            "v": 28,
+            "hex": "0x145c82208b8322b2f224604034460541adce7ae63911a450f42381e2ea7e64d1107e3d635508057feeff610a4abe009293542a908778440923a890ed946cd4c81c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 0,
+                  "b": false,
+                  "p": "81260",
+                  "s": "0.00012",
+                  "r": true,
+                  "t": {
+                    "limit": {
+                      "tif": "Gtc"
+                    }
+                  },
+                  "c": "0x0123456789abcdef0123456789abcdef"
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 10
+              }
+            },
+            "nonce": 1793491203000,
+            "signature": {
+              "r": "0x145c82208b8322b2f224604034460541adce7ae63911a450f42381e2ea7e64d1",
+              "s": "0x107e3d635508057feeff610a4abe009293542a908778440923a890ed946cd4c8",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        }
+      },
+      {
+        "name": "SOL buy ALO, no cloid",
+        "kind": "order",
+        "params": {
+          "asset": 5,
+          "is_buy": true,
+          "px": "103.75",
+          "sz": "1.5",
+          "reduce_only": false,
+          "tif": "Alo",
+          "cloid": null,
+          "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+          "builder_fee_tenth_bps": 10
+        },
+        "action": {
+          "type": "order",
+          "orders": [
+            {
+              "a": 5,
+              "b": true,
+              "p": "103.75",
+              "s": "1.5",
+              "r": false,
+              "t": {
+                "limit": {
+                  "tif": "Alo"
+                }
+              }
+            }
+          ],
+          "grouping": "na",
+          "builder": {
+            "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+            "f": 10
+          }
+        },
+        "nonce": 1793491204000,
+        "msgpack_hex": "84a474797065a56f72646572a66f72646572739186a16105a162c3a170a63130332e3735a173a3312e35a172c2a17481a56c696d697481a3746966a3416c6fa867726f7570696e67a26e61a76275696c64657282a162d92a307835303530613466346233663933333863333437326463633031613837633736613134346233633963a1660a",
+        "connection_id": "0x7c0d671ccc104090da6290094b5bfd1a2524308e0851568cb53ef8aab814bc46",
+        "mainnet": {
+          "source": "a",
+          "struct_hash": "0x5bbca47852908479ba8f8b293163777d39d899e2070e483d71ac49912592245a",
+          "digest": "0x2661e70321e6742c90c66c04c0bb2c5541b0ee8cf829cefdb9392f5cf892757e",
+          "signature": {
+            "r": "0x2377b26d2794c49c5129c1116c9b35048405e9688b88042932eff570782d69e5",
+            "s": "0x4882e1ed78f68f070661d419fb27423e91ebe3b1ac79f00dc8b4683d3fcd93a5",
+            "v": 28,
+            "hex": "0x2377b26d2794c49c5129c1116c9b35048405e9688b88042932eff570782d69e54882e1ed78f68f070661d419fb27423e91ebe3b1ac79f00dc8b4683d3fcd93a51c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 5,
+                  "b": true,
+                  "p": "103.75",
+                  "s": "1.5",
+                  "r": false,
+                  "t": {
+                    "limit": {
+                      "tif": "Alo"
+                    }
+                  }
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 10
+              }
+            },
+            "nonce": 1793491204000,
+            "signature": {
+              "r": "0x2377b26d2794c49c5129c1116c9b35048405e9688b88042932eff570782d69e5",
+              "s": "0x4882e1ed78f68f070661d419fb27423e91ebe3b1ac79f00dc8b4683d3fcd93a5",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        },
+        "testnet": {
+          "source": "b",
+          "struct_hash": "0x4001cb63d4a736115790a9f95572a2b7dd5ca8a405b2b84bb9ec7f1cb7a85231",
+          "digest": "0x8f1062013a6d52c6e4fc06e2c879d153092531fe6f5c24913571a290bc821039",
+          "signature": {
+            "r": "0xd29a22c784f2efcbb4b1a4e769c9bc509f509457e3ddca7f1cae6232fb9d2634",
+            "s": "0x455d675a9f16429f3b828e3975a050f6963d8faa38623c315ed8548734852722",
+            "v": 28,
+            "hex": "0xd29a22c784f2efcbb4b1a4e769c9bc509f509457e3ddca7f1cae6232fb9d2634455d675a9f16429f3b828e3975a050f6963d8faa38623c315ed85487348527221c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 5,
+                  "b": true,
+                  "p": "103.75",
+                  "s": "1.5",
+                  "r": false,
+                  "t": {
+                    "limit": {
+                      "tif": "Alo"
+                    }
+                  }
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 10
+              }
+            },
+            "nonce": 1793491204000,
+            "signature": {
+              "r": "0xd29a22c784f2efcbb4b1a4e769c9bc509f509457e3ddca7f1cae6232fb9d2634",
+              "s": "0x455d675a9f16429f3b828e3975a050f6963d8faa38623c315ed8548734852722",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        }
+      },
+      {
+        "name": "SOL sell IOC reduce-only, no cloid",
+        "kind": "order",
+        "params": {
+          "asset": 5,
+          "is_buy": false,
+          "px": "103.7",
+          "sz": "1.5",
+          "reduce_only": true,
+          "tif": "Ioc",
+          "cloid": null,
+          "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+          "builder_fee_tenth_bps": 10
+        },
+        "action": {
+          "type": "order",
+          "orders": [
+            {
+              "a": 5,
+              "b": false,
+              "p": "103.7",
+              "s": "1.5",
+              "r": true,
+              "t": {
+                "limit": {
+                  "tif": "Ioc"
+                }
+              }
+            }
+          ],
+          "grouping": "na",
+          "builder": {
+            "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+            "f": 10
+          }
+        },
+        "nonce": 1793491205000,
+        "msgpack_hex": "84a474797065a56f72646572a66f72646572739186a16105a162c2a170a53130332e37a173a3312e35a172c3a17481a56c696d697481a3746966a3496f63a867726f7570696e67a26e61a76275696c64657282a162d92a307835303530613466346233663933333863333437326463633031613837633736613134346233633963a1660a",
+        "connection_id": "0x077003f4a71adb0912f2d4abbc41dbe0ed138d141741376ad58a21d6f1b5aa3c",
+        "mainnet": {
+          "source": "a",
+          "struct_hash": "0xc4bce38a5706edcf2f623bf0c93e1dce6467fe7fd6ecf294c1e5bcf0128b2b30",
+          "digest": "0xea21dd95667ca635e3763393b47782c46db7f45135e8248812f7ea47f79259e5",
+          "signature": {
+            "r": "0x1d1a5beecdae54b19272202eeeb9f53ef15cd3115f0af110a5fbf862e49eb18b",
+            "s": "0x02ee36c859e11a61300e2ecaf67371cda77487d252b5805134fa3abed3005873",
+            "v": 28,
+            "hex": "0x1d1a5beecdae54b19272202eeeb9f53ef15cd3115f0af110a5fbf862e49eb18b02ee36c859e11a61300e2ecaf67371cda77487d252b5805134fa3abed30058731c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 5,
+                  "b": false,
+                  "p": "103.7",
+                  "s": "1.5",
+                  "r": true,
+                  "t": {
+                    "limit": {
+                      "tif": "Ioc"
+                    }
+                  }
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 10
+              }
+            },
+            "nonce": 1793491205000,
+            "signature": {
+              "r": "0x1d1a5beecdae54b19272202eeeb9f53ef15cd3115f0af110a5fbf862e49eb18b",
+              "s": "0x02ee36c859e11a61300e2ecaf67371cda77487d252b5805134fa3abed3005873",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        },
+        "testnet": {
+          "source": "b",
+          "struct_hash": "0x3c10e45505de3a1efa8d1e523a8eb8710e74d917b4fd8f5d3bbd5fbe61511442",
+          "digest": "0x80304f1db10735a9ac956b73b30f93b2914fb907a28747144d07119d542d270e",
+          "signature": {
+            "r": "0xe544aaf948bf9820a63ecb7eb59700205b0d70941849b55431369293bc7726a1",
+            "s": "0x6128fe0dc8328a136f710b43c56b01633957b7f5851b8bf3e012cfae0a24cb58",
+            "v": 27,
+            "hex": "0xe544aaf948bf9820a63ecb7eb59700205b0d70941849b55431369293bc7726a16128fe0dc8328a136f710b43c56b01633957b7f5851b8bf3e012cfae0a24cb581b"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 5,
+                  "b": false,
+                  "p": "103.7",
+                  "s": "1.5",
+                  "r": true,
+                  "t": {
+                    "limit": {
+                      "tif": "Ioc"
+                    }
+                  }
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 10
+              }
+            },
+            "nonce": 1793491205000,
+            "signature": {
+              "r": "0xe544aaf948bf9820a63ecb7eb59700205b0d70941849b55431369293bc7726a1",
+              "s": "0x6128fe0dc8328a136f710b43c56b01633957b7f5851b8bf3e012cfae0a24cb58",
+              "v": 27
+            },
+            "vaultAddress": null
+          }
+        }
+      },
+      {
+        "name": "ETH buy IOC reduce-only with cloid",
+        "kind": "order",
+        "params": {
+          "asset": 1,
+          "is_buy": true,
+          "px": "2401",
+          "sz": "0.01",
+          "reduce_only": true,
+          "tif": "Ioc",
+          "cloid": "0xffffffffffffffffffffffffffffffff",
+          "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+          "builder_fee_tenth_bps": 10
+        },
+        "action": {
+          "type": "order",
+          "orders": [
+            {
+              "a": 1,
+              "b": true,
+              "p": "2401",
+              "s": "0.01",
+              "r": true,
+              "t": {
+                "limit": {
+                  "tif": "Ioc"
+                }
+              },
+              "c": "0xffffffffffffffffffffffffffffffff"
+            }
+          ],
+          "grouping": "na",
+          "builder": {
+            "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+            "f": 10
+          }
+        },
+        "nonce": 1793491206000,
+        "msgpack_hex": "84a474797065a56f72646572a66f72646572739187a16101a162c3a170a432343031a173a4302e3031a172c3a17481a56c696d697481a3746966a3496f63a163d92230786666666666666666666666666666666666666666666666666666666666666666a867726f7570696e67a26e61a76275696c64657282a162d92a307835303530613466346233663933333863333437326463633031613837633736613134346233633963a1660a",
+        "connection_id": "0xd56169407246f201a979cbf2f13c345b916951b5e57380eb908e5c81c3a62ba8",
+        "mainnet": {
+          "source": "a",
+          "struct_hash": "0x1ed45ba085416de7f9aa7e15fd4c8c3be19521d083ef01b833ba0ab7106a6ed5",
+          "digest": "0x185002a4a6faddc5e339d7cf0b6a27321f764283ecc28f468ab4dc14602b81c3",
+          "signature": {
+            "r": "0x190bcb936cdd761a43e21b4cf462e26090a75109179c28c61e6f2f493941a566",
+            "s": "0x75bf2fa452cccd52fbfcbf40d9233c0ed67e514969e41c16fe62715d43931266",
+            "v": 27,
+            "hex": "0x190bcb936cdd761a43e21b4cf462e26090a75109179c28c61e6f2f493941a56675bf2fa452cccd52fbfcbf40d9233c0ed67e514969e41c16fe62715d439312661b"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 1,
+                  "b": true,
+                  "p": "2401",
+                  "s": "0.01",
+                  "r": true,
+                  "t": {
+                    "limit": {
+                      "tif": "Ioc"
+                    }
+                  },
+                  "c": "0xffffffffffffffffffffffffffffffff"
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 10
+              }
+            },
+            "nonce": 1793491206000,
+            "signature": {
+              "r": "0x190bcb936cdd761a43e21b4cf462e26090a75109179c28c61e6f2f493941a566",
+              "s": "0x75bf2fa452cccd52fbfcbf40d9233c0ed67e514969e41c16fe62715d43931266",
+              "v": 27
+            },
+            "vaultAddress": null
+          }
+        },
+        "testnet": {
+          "source": "b",
+          "struct_hash": "0xbe0b21db01897e0cde6eefff068653c333e124746b2a6dc42d6031ba4d05149d",
+          "digest": "0x060f1f7086ab01a61f4abf4fb1c9bfc5d2e571ce88b7daba3bfe8f7e6cb74883",
+          "signature": {
+            "r": "0x1a8f6d234164472499ed1fc7c1ba1cc9321fe0f1908bec3306cf3631fad98e04",
+            "s": "0x6dbd48f77801afd03b0c67cd6ea478ef60e9d8eefe04db82f87e318781435ffa",
+            "v": 28,
+            "hex": "0x1a8f6d234164472499ed1fc7c1ba1cc9321fe0f1908bec3306cf3631fad98e046dbd48f77801afd03b0c67cd6ea478ef60e9d8eefe04db82f87e318781435ffa1c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 1,
+                  "b": true,
+                  "p": "2401",
+                  "s": "0.01",
+                  "r": true,
+                  "t": {
+                    "limit": {
+                      "tif": "Ioc"
+                    }
+                  },
+                  "c": "0xffffffffffffffffffffffffffffffff"
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 10
+              }
+            },
+            "nonce": 1793491206000,
+            "signature": {
+              "r": "0x1a8f6d234164472499ed1fc7c1ba1cc9321fe0f1908bec3306cf3631fad98e04",
+              "s": "0x6dbd48f77801afd03b0c67cd6ea478ef60e9d8eefe04db82f87e318781435ffa",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        }
+      },
+      {
+        "name": "ETH buy GTC, uppercase cloid input is signed lowercase",
+        "kind": "order",
+        "params": {
+          "asset": 1,
+          "is_buy": true,
+          "px": "1200.5",
+          "sz": "0.0087",
+          "reduce_only": false,
+          "tif": "Gtc",
+          "cloid": "0xABCDEF0123456789ABCDEF0123456789",
+          "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+          "builder_fee_tenth_bps": 10
+        },
+        "action": {
+          "type": "order",
+          "orders": [
+            {
+              "a": 1,
+              "b": true,
+              "p": "1200.5",
+              "s": "0.0087",
+              "r": false,
+              "t": {
+                "limit": {
+                  "tif": "Gtc"
+                }
+              },
+              "c": "0xabcdef0123456789abcdef0123456789"
+            }
+          ],
+          "grouping": "na",
+          "builder": {
+            "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+            "f": 10
+          }
+        },
+        "nonce": 1793491207000,
+        "msgpack_hex": "84a474797065a56f72646572a66f72646572739187a16101a162c3a170a6313230302e35a173a6302e30303837a172c2a17481a56c696d697481a3746966a3477463a163d92230786162636465663031323334353637383961626364656630313233343536373839a867726f7570696e67a26e61a76275696c64657282a162d92a307835303530613466346233663933333863333437326463633031613837633736613134346233633963a1660a",
+        "connection_id": "0xedbe55879f42c4cb581c909a1a4ca107aedcf3ff13e4d4f61b0ac688c38a2d26",
+        "mainnet": {
+          "source": "a",
+          "struct_hash": "0xd8c14086a4e721f91f4a6f5a2d5c20f32f7b471139278c90dc5f79941f8977c6",
+          "digest": "0xb79ffb231e827ea82f27ea9a0ce2249a88a15c77d27c155f59a3e35c23c0aade",
+          "signature": {
+            "r": "0x75fa1d3e294f0a83778cd544151f53ea2efebfb9c7221a98bf20b3e89cd3ab5b",
+            "s": "0x5c222d96269fbe689326c3606e9c21760befd9efa97fe734c59584ef84268d4d",
+            "v": 28,
+            "hex": "0x75fa1d3e294f0a83778cd544151f53ea2efebfb9c7221a98bf20b3e89cd3ab5b5c222d96269fbe689326c3606e9c21760befd9efa97fe734c59584ef84268d4d1c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 1,
+                  "b": true,
+                  "p": "1200.5",
+                  "s": "0.0087",
+                  "r": false,
+                  "t": {
+                    "limit": {
+                      "tif": "Gtc"
+                    }
+                  },
+                  "c": "0xabcdef0123456789abcdef0123456789"
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 10
+              }
+            },
+            "nonce": 1793491207000,
+            "signature": {
+              "r": "0x75fa1d3e294f0a83778cd544151f53ea2efebfb9c7221a98bf20b3e89cd3ab5b",
+              "s": "0x5c222d96269fbe689326c3606e9c21760befd9efa97fe734c59584ef84268d4d",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        },
+        "testnet": {
+          "source": "b",
+          "struct_hash": "0x958b594c19d8fc23429f225c517daddbcc841722acdd380759bc19c713552742",
+          "digest": "0x39ff142947f0e8bfaf7736b100db8939f07aa488f38973fa66b3af87711d885e",
+          "signature": {
+            "r": "0x4f319c7438d833009c3e3f1aaf13ec77554537a932268f235d401e6d167cf046",
+            "s": "0x4b956dcd85dfcc61f654de40ed1368cd75f43961fcc7717c3dc72370f95ed1ed",
+            "v": 27,
+            "hex": "0x4f319c7438d833009c3e3f1aaf13ec77554537a932268f235d401e6d167cf0464b956dcd85dfcc61f654de40ed1368cd75f43961fcc7717c3dc72370f95ed1ed1b"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 1,
+                  "b": true,
+                  "p": "1200.5",
+                  "s": "0.0087",
+                  "r": false,
+                  "t": {
+                    "limit": {
+                      "tif": "Gtc"
+                    }
+                  },
+                  "c": "0xabcdef0123456789abcdef0123456789"
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 10
+              }
+            },
+            "nonce": 1793491207000,
+            "signature": {
+              "r": "0x4f319c7438d833009c3e3f1aaf13ec77554537a932268f235d401e6d167cf046",
+              "s": "0x4b956dcd85dfcc61f654de40ed1368cd75f43961fcc7717c3dc72370f95ed1ed",
+              "v": 27
+            },
+            "vaultAddress": null
+          }
+        }
+      },
+      {
+        "name": "DOGE buy IOC, integer size (szDecimals 0)",
+        "kind": "order",
+        "params": {
+          "asset": 12,
+          "is_buy": true,
+          "px": "0.19876",
+          "sz": "100",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null,
+          "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+          "builder_fee_tenth_bps": 10
+        },
+        "action": {
+          "type": "order",
+          "orders": [
+            {
+              "a": 12,
+              "b": true,
+              "p": "0.19876",
+              "s": "100",
+              "r": false,
+              "t": {
+                "limit": {
+                  "tif": "Ioc"
+                }
+              }
+            }
+          ],
+          "grouping": "na",
+          "builder": {
+            "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+            "f": 10
+          }
+        },
+        "nonce": 1793491208000,
+        "msgpack_hex": "84a474797065a56f72646572a66f72646572739186a1610ca162c3a170a7302e3139383736a173a3313030a172c2a17481a56c696d697481a3746966a3496f63a867726f7570696e67a26e61a76275696c64657282a162d92a307835303530613466346233663933333863333437326463633031613837633736613134346233633963a1660a",
+        "connection_id": "0xff1d5d6d773169eb9feae4d53fa57b8b0d6d9a68334ebc36208cb364bf686fb0",
+        "mainnet": {
+          "source": "a",
+          "struct_hash": "0xe1fb9b5a6bd79a459fff6bc2c5d848358dd8ebd19b5af3874d3c93337492e0e8",
+          "digest": "0x59d952504c2d7abee96af701cb095477744b17c990fd4b026e4e8ba57a3ec57d",
+          "signature": {
+            "r": "0x8a0338e566c21e487f9786a4942b8c67ffb76e6ee408d9bdd6d9a8817299917a",
+            "s": "0x67251ee8e7b2d7f46bcd8834f8c81fa8dd0cbe2fcec78067de49f97c2891be35",
+            "v": 28,
+            "hex": "0x8a0338e566c21e487f9786a4942b8c67ffb76e6ee408d9bdd6d9a8817299917a67251ee8e7b2d7f46bcd8834f8c81fa8dd0cbe2fcec78067de49f97c2891be351c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 12,
+                  "b": true,
+                  "p": "0.19876",
+                  "s": "100",
+                  "r": false,
+                  "t": {
+                    "limit": {
+                      "tif": "Ioc"
+                    }
+                  }
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 10
+              }
+            },
+            "nonce": 1793491208000,
+            "signature": {
+              "r": "0x8a0338e566c21e487f9786a4942b8c67ffb76e6ee408d9bdd6d9a8817299917a",
+              "s": "0x67251ee8e7b2d7f46bcd8834f8c81fa8dd0cbe2fcec78067de49f97c2891be35",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        },
+        "testnet": {
+          "source": "b",
+          "struct_hash": "0xf2d269a0a5cf179ca2900706b259db4df26f8f08232aa8071c889c946514661a",
+          "digest": "0xa455fce9657c52cb021b832927c13c0997a037b169c375aa6922397e7f33bedf",
+          "signature": {
+            "r": "0xeb4521148fe33b7364d97797d411121a45ac6e128c2128b69ec9add08887be8c",
+            "s": "0x7b8bd8f2ebb500594cf134b27e80846835a794537ca6c18eaefe61ec94783043",
+            "v": 27,
+            "hex": "0xeb4521148fe33b7364d97797d411121a45ac6e128c2128b69ec9add08887be8c7b8bd8f2ebb500594cf134b27e80846835a794537ca6c18eaefe61ec947830431b"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 12,
+                  "b": true,
+                  "p": "0.19876",
+                  "s": "100",
+                  "r": false,
+                  "t": {
+                    "limit": {
+                      "tif": "Ioc"
+                    }
+                  }
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 10
+              }
+            },
+            "nonce": 1793491208000,
+            "signature": {
+              "r": "0xeb4521148fe33b7364d97797d411121a45ac6e128c2128b69ec9add08887be8c",
+              "s": "0x7b8bd8f2ebb500594cf134b27e80846835a794537ca6c18eaefe61ec94783043",
+              "v": 27
+            },
+            "vaultAddress": null
+          }
+        }
+      },
+      {
+        "name": "asset 150 (msgpack uint8), fee 100 (max for perps)",
+        "kind": "order",
+        "params": {
+          "asset": 150,
+          "is_buy": true,
+          "px": "1.2345",
+          "sz": "10",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null,
+          "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+          "builder_fee_tenth_bps": 100
+        },
+        "action": {
+          "type": "order",
+          "orders": [
+            {
+              "a": 150,
+              "b": true,
+              "p": "1.2345",
+              "s": "10",
+              "r": false,
+              "t": {
+                "limit": {
+                  "tif": "Ioc"
+                }
+              }
+            }
+          ],
+          "grouping": "na",
+          "builder": {
+            "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+            "f": 100
+          }
+        },
+        "nonce": 1793491209000,
+        "msgpack_hex": "84a474797065a56f72646572a66f72646572739186a161cc96a162c3a170a6312e32333435a173a23130a172c2a17481a56c696d697481a3746966a3496f63a867726f7570696e67a26e61a76275696c64657282a162d92a307835303530613466346233663933333863333437326463633031613837633736613134346233633963a16664",
+        "connection_id": "0x75fa56f375dee316c739eff81463ed7a07006571a270c971b2aefde6c98782cd",
+        "mainnet": {
+          "source": "a",
+          "struct_hash": "0x7d825712ef1c8b6047b2946746ca9e88a645596091efa7094a15dccb8734d575",
+          "digest": "0x4e3013e2670154f7f1db02d0dcc3555c18bc4f17262522440cac0e281ca942f4",
+          "signature": {
+            "r": "0xcc3c412e7bd2b600dd8efa20351c00255aad599c25fe83eb4c33643f13644cba",
+            "s": "0x2573c0a3cfd843d98e90746c430cbd8bb9caea9e8d18e1f1feefbc8ceed7394a",
+            "v": 28,
+            "hex": "0xcc3c412e7bd2b600dd8efa20351c00255aad599c25fe83eb4c33643f13644cba2573c0a3cfd843d98e90746c430cbd8bb9caea9e8d18e1f1feefbc8ceed7394a1c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 150,
+                  "b": true,
+                  "p": "1.2345",
+                  "s": "10",
+                  "r": false,
+                  "t": {
+                    "limit": {
+                      "tif": "Ioc"
+                    }
+                  }
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 100
+              }
+            },
+            "nonce": 1793491209000,
+            "signature": {
+              "r": "0xcc3c412e7bd2b600dd8efa20351c00255aad599c25fe83eb4c33643f13644cba",
+              "s": "0x2573c0a3cfd843d98e90746c430cbd8bb9caea9e8d18e1f1feefbc8ceed7394a",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        },
+        "testnet": {
+          "source": "b",
+          "struct_hash": "0x73319ab48167ceacd84cf3864d7afff3c9f113f5c57c8c108a8ddcdcf39154d4",
+          "digest": "0x00ea623665fe76101b3cd5d020f09c27699950f4901bea276efdda4e1f8815c4",
+          "signature": {
+            "r": "0x3e10983c405300bbec07b4d763cc0447f8fa5b3b6cc9442cf9ceb13a0d2edaa1",
+            "s": "0x01c48a9e513f1755b75e10a6d209f60ece61996f38204ee6f319b45a25d92764",
+            "v": 28,
+            "hex": "0x3e10983c405300bbec07b4d763cc0447f8fa5b3b6cc9442cf9ceb13a0d2edaa101c48a9e513f1755b75e10a6d209f60ece61996f38204ee6f319b45a25d927641c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 150,
+                  "b": true,
+                  "p": "1.2345",
+                  "s": "10",
+                  "r": false,
+                  "t": {
+                    "limit": {
+                      "tif": "Ioc"
+                    }
+                  }
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 100
+              }
+            },
+            "nonce": 1793491209000,
+            "signature": {
+              "r": "0x3e10983c405300bbec07b4d763cc0447f8fa5b3b6cc9442cf9ceb13a0d2edaa1",
+              "s": "0x01c48a9e513f1755b75e10a6d209f60ece61996f38204ee6f319b45a25d92764",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        }
+      },
+      {
+        "name": "asset 300 (msgpack uint16), fee 1",
+        "kind": "order",
+        "params": {
+          "asset": 300,
+          "is_buy": false,
+          "px": "0.012345",
+          "sz": "1000",
+          "reduce_only": false,
+          "tif": "Gtc",
+          "cloid": null,
+          "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+          "builder_fee_tenth_bps": 1
+        },
+        "action": {
+          "type": "order",
+          "orders": [
+            {
+              "a": 300,
+              "b": false,
+              "p": "0.012345",
+              "s": "1000",
+              "r": false,
+              "t": {
+                "limit": {
+                  "tif": "Gtc"
+                }
+              }
+            }
+          ],
+          "grouping": "na",
+          "builder": {
+            "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+            "f": 1
+          }
+        },
+        "nonce": 1793491210000,
+        "msgpack_hex": "84a474797065a56f72646572a66f72646572739186a161cd012ca162c2a170a8302e303132333435a173a431303030a172c2a17481a56c696d697481a3746966a3477463a867726f7570696e67a26e61a76275696c64657282a162d92a307835303530613466346233663933333863333437326463633031613837633736613134346233633963a16601",
+        "connection_id": "0xa630150d647883ff65f17f0446c17c1d084370bc28d58ff9e1f39a57bf7bc92a",
+        "mainnet": {
+          "source": "a",
+          "struct_hash": "0xb54c58555f7f854d68b31f421299b313a24f8f5d2d916a75e5f186afd45359a4",
+          "digest": "0x68a25e9700261b51fd02b929ae459be31d9931c8bc32bbfc9f2f16069057f66d",
+          "signature": {
+            "r": "0x97414658c1626accb24b0f9732b438181a0ab4a7bd0270caa364af8d1eb89f38",
+            "s": "0x7a149e66bbedbaff96bda9c75312bf03971d6c361c50076ba17454b7a2454a9a",
+            "v": 28,
+            "hex": "0x97414658c1626accb24b0f9732b438181a0ab4a7bd0270caa364af8d1eb89f387a149e66bbedbaff96bda9c75312bf03971d6c361c50076ba17454b7a2454a9a1c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 300,
+                  "b": false,
+                  "p": "0.012345",
+                  "s": "1000",
+                  "r": false,
+                  "t": {
+                    "limit": {
+                      "tif": "Gtc"
+                    }
+                  }
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 1
+              }
+            },
+            "nonce": 1793491210000,
+            "signature": {
+              "r": "0x97414658c1626accb24b0f9732b438181a0ab4a7bd0270caa364af8d1eb89f38",
+              "s": "0x7a149e66bbedbaff96bda9c75312bf03971d6c361c50076ba17454b7a2454a9a",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        },
+        "testnet": {
+          "source": "b",
+          "struct_hash": "0xbbc4d6e135f98d4b0a24b524f8dea393cb489ab9b6483aeca9e7b2bffd7958da",
+          "digest": "0x6f5fe96bf88eaf862c9f8a5e30e981adb47875dbcab4af96a486137aedff2ffd",
+          "signature": {
+            "r": "0x28b5a43dc99af25e5d2391a95ac2dd0eeea74e0a5f393dc29dcbf986a6f7bdf4",
+            "s": "0x05a51656173290364e38b6345fb1afbf806a7d3c75f708d952db59224d917e16",
+            "v": 27,
+            "hex": "0x28b5a43dc99af25e5d2391a95ac2dd0eeea74e0a5f393dc29dcbf986a6f7bdf405a51656173290364e38b6345fb1afbf806a7d3c75f708d952db59224d917e161b"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 300,
+                  "b": false,
+                  "p": "0.012345",
+                  "s": "1000",
+                  "r": false,
+                  "t": {
+                    "limit": {
+                      "tif": "Gtc"
+                    }
+                  }
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 1
+              }
+            },
+            "nonce": 1793491210000,
+            "signature": {
+              "r": "0x28b5a43dc99af25e5d2391a95ac2dd0eeea74e0a5f393dc29dcbf986a6f7bdf4",
+              "s": "0x05a51656173290364e38b6345fb1afbf806a7d3c75f708d952db59224d917e16",
+              "v": 27
+            },
+            "vaultAddress": null
+          }
+        }
+      },
+      {
+        "name": "asset 110003 (msgpack uint32), fee 0",
+        "kind": "order",
+        "params": {
+          "asset": 110003,
+          "is_buy": true,
+          "px": "45.5",
+          "sz": "2.25",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": "0x10000000000000000000000000000000",
+          "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+          "builder_fee_tenth_bps": 0
+        },
+        "action": {
+          "type": "order",
+          "orders": [
+            {
+              "a": 110003,
+              "b": true,
+              "p": "45.5",
+              "s": "2.25",
+              "r": false,
+              "t": {
+                "limit": {
+                  "tif": "Ioc"
+                }
+              },
+              "c": "0x10000000000000000000000000000000"
+            }
+          ],
+          "grouping": "na",
+          "builder": {
+            "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+            "f": 0
+          }
+        },
+        "nonce": 1793491211000,
+        "msgpack_hex": "84a474797065a56f72646572a66f72646572739187a161ce0001adb3a162c3a170a434352e35a173a4322e3235a172c2a17481a56c696d697481a3746966a3496f63a163d92230783130303030303030303030303030303030303030303030303030303030303030a867726f7570696e67a26e61a76275696c64657282a162d92a307835303530613466346233663933333863333437326463633031613837633736613134346233633963a16600",
+        "connection_id": "0xbc3f202a9686fe544277f8d284710c38a8f08da925af07925ce912677495b278",
+        "mainnet": {
+          "source": "a",
+          "struct_hash": "0x62614f6b05e7a36095b656e25b40e2152208c2a5b63809b087b80f3da444c0c2",
+          "digest": "0x5948e43c052f8c6d3abe225b3839c89f904b47b613ee0484ddf90173b3032c07",
+          "signature": {
+            "r": "0x7166bd6127aebe789c569ed13dddd6594bea31e7a4dda321c0b6f59fa2a58c52",
+            "s": "0x4586d85e6cdc8efd2cac308047cf79040dad507b6a52d73e7bbd79ef6e8c9b79",
+            "v": 28,
+            "hex": "0x7166bd6127aebe789c569ed13dddd6594bea31e7a4dda321c0b6f59fa2a58c524586d85e6cdc8efd2cac308047cf79040dad507b6a52d73e7bbd79ef6e8c9b791c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 110003,
+                  "b": true,
+                  "p": "45.5",
+                  "s": "2.25",
+                  "r": false,
+                  "t": {
+                    "limit": {
+                      "tif": "Ioc"
+                    }
+                  },
+                  "c": "0x10000000000000000000000000000000"
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 0
+              }
+            },
+            "nonce": 1793491211000,
+            "signature": {
+              "r": "0x7166bd6127aebe789c569ed13dddd6594bea31e7a4dda321c0b6f59fa2a58c52",
+              "s": "0x4586d85e6cdc8efd2cac308047cf79040dad507b6a52d73e7bbd79ef6e8c9b79",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        },
+        "testnet": {
+          "source": "b",
+          "struct_hash": "0x4d6eaa4396f6b955efedc284af383a6810647d13477e057c0c406b74691af484",
+          "digest": "0xc96e927ced52ea8531430bd337f210969e2bd07ca4b7b6f06b1280e2b50a426d",
+          "signature": {
+            "r": "0xad98b13dfc3fd2e8092a4e30527aae70e19746207ccf8bbe1eecca524d773bc2",
+            "s": "0x033b1620646222e875f50ffa670fcfd3054e2bfb7ba809f0396d506f74f27eec",
+            "v": 27,
+            "hex": "0xad98b13dfc3fd2e8092a4e30527aae70e19746207ccf8bbe1eecca524d773bc2033b1620646222e875f50ffa670fcfd3054e2bfb7ba809f0396d506f74f27eec1b"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "order",
+              "orders": [
+                {
+                  "a": 110003,
+                  "b": true,
+                  "p": "45.5",
+                  "s": "2.25",
+                  "r": false,
+                  "t": {
+                    "limit": {
+                      "tif": "Ioc"
+                    }
+                  },
+                  "c": "0x10000000000000000000000000000000"
+                }
+              ],
+              "grouping": "na",
+              "builder": {
+                "b": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+                "f": 0
+              }
+            },
+            "nonce": 1793491211000,
+            "signature": {
+              "r": "0xad98b13dfc3fd2e8092a4e30527aae70e19746207ccf8bbe1eecca524d773bc2",
+              "s": "0x033b1620646222e875f50ffa670fcfd3054e2bfb7ba809f0396d506f74f27eec",
+              "v": 27
+            },
+            "vaultAddress": null
+          }
+        }
+      },
+      {
+        "name": "cancel ETH oid 77 (fixint)",
+        "kind": "cancel",
+        "params": {
+          "asset": 1,
+          "oid": 77
+        },
+        "action": {
+          "type": "cancel",
+          "cancels": [
+            {
+              "a": 1,
+              "o": 77
+            }
+          ]
+        },
+        "nonce": 1793491212000,
+        "msgpack_hex": "82a474797065a663616e63656ca763616e63656c739182a16101a16f4d",
+        "connection_id": "0x3cd6a463d737e324687a9fa1615e9274a47abee9a7124e5e8ebd4cf2ba327944",
+        "mainnet": {
+          "source": "a",
+          "struct_hash": "0xc8da6b1d89819c49d1ab9a880b325f4d5cc06c9cd29dc8b123ef79b185ead65a",
+          "digest": "0xff9effc407b4a06617077afe45bd77cea179a94c4933b98e532546b56e3576d8",
+          "signature": {
+            "r": "0x365e80ba936d6cb0939844598fb0a31337e7bea1a1545d43f8fb7fdf9f63ad09",
+            "s": "0x7a9963ab2145526e97d342b91e8da648f2903762c9d7ecb2fcd7e3ddb6c6be19",
+            "v": 28,
+            "hex": "0x365e80ba936d6cb0939844598fb0a31337e7bea1a1545d43f8fb7fdf9f63ad097a9963ab2145526e97d342b91e8da648f2903762c9d7ecb2fcd7e3ddb6c6be191c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "cancel",
+              "cancels": [
+                {
+                  "a": 1,
+                  "o": 77
+                }
+              ]
+            },
+            "nonce": 1793491212000,
+            "signature": {
+              "r": "0x365e80ba936d6cb0939844598fb0a31337e7bea1a1545d43f8fb7fdf9f63ad09",
+              "s": "0x7a9963ab2145526e97d342b91e8da648f2903762c9d7ecb2fcd7e3ddb6c6be19",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        },
+        "testnet": {
+          "source": "b",
+          "struct_hash": "0xb523e3f388d41d89aeedb367dc41be846a581320b9ad116128d8c9b2a939b821",
+          "digest": "0xa0cb41f4932d4ed7d0ab5dba4bd6630a8393289122a71cafc6c1e72d98d916b8",
+          "signature": {
+            "r": "0x589eac12b3b47fc115afc6e1012ed1e76a134ef69af450e07ae51c0dd1f45ae4",
+            "s": "0x540dd2091bdf45fc7a880e8ff10096eb7d16573df08e61217530619834d2821f",
+            "v": 28,
+            "hex": "0x589eac12b3b47fc115afc6e1012ed1e76a134ef69af450e07ae51c0dd1f45ae4540dd2091bdf45fc7a880e8ff10096eb7d16573df08e61217530619834d2821f1c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "cancel",
+              "cancels": [
+                {
+                  "a": 1,
+                  "o": 77
+                }
+              ]
+            },
+            "nonce": 1793491212000,
+            "signature": {
+              "r": "0x589eac12b3b47fc115afc6e1012ed1e76a134ef69af450e07ae51c0dd1f45ae4",
+              "s": "0x540dd2091bdf45fc7a880e8ff10096eb7d16573df08e61217530619834d2821f",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        }
+      },
+      {
+        "name": "cancel BTC oid 4294967295 (uint32)",
+        "kind": "cancel",
+        "params": {
+          "asset": 0,
+          "oid": 4294967295
+        },
+        "action": {
+          "type": "cancel",
+          "cancels": [
+            {
+              "a": 0,
+              "o": 4294967295
+            }
+          ]
+        },
+        "nonce": 1793491213000,
+        "msgpack_hex": "82a474797065a663616e63656ca763616e63656c739182a16100a16fceffffffff",
+        "connection_id": "0xb5cd9b11e2b5a0e1482c1fc416e9747ed1fbe1a1550c0e2e5c3f86368f2e35c9",
+        "mainnet": {
+          "source": "a",
+          "struct_hash": "0xcc1843cf643fd82180c55414016c930c9066203ef078510c1c738c562de19f20",
+          "digest": "0xcc4f662d0c9ca103de31b41f604df6dfef016a45497a45c7cca57986f9957e3c",
+          "signature": {
+            "r": "0x3b43c045d5191fc1d649adbb7b95f7a6536951b143838221938275c2ec105628",
+            "s": "0x15a8df448b6940f07eab3db538262ef19d4f07424accc41372d00bbaa6a4cab1",
+            "v": 27,
+            "hex": "0x3b43c045d5191fc1d649adbb7b95f7a6536951b143838221938275c2ec10562815a8df448b6940f07eab3db538262ef19d4f07424accc41372d00bbaa6a4cab11b"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "cancel",
+              "cancels": [
+                {
+                  "a": 0,
+                  "o": 4294967295
+                }
+              ]
+            },
+            "nonce": 1793491213000,
+            "signature": {
+              "r": "0x3b43c045d5191fc1d649adbb7b95f7a6536951b143838221938275c2ec105628",
+              "s": "0x15a8df448b6940f07eab3db538262ef19d4f07424accc41372d00bbaa6a4cab1",
+              "v": 27
+            },
+            "vaultAddress": null
+          }
+        },
+        "testnet": {
+          "source": "b",
+          "struct_hash": "0x1b08069355a36c3eebd9c7e0f8eda5bd413ee878646981e0f36c175b191345f8",
+          "digest": "0xb1113b194c80a090c239649c93f55e9726b7f18f72ca0a97aafabae21c907c29",
+          "signature": {
+            "r": "0x07ce5715e11e0154fed4a09e5539c65eb40687308f077a5edf7bfd356f3f8883",
+            "s": "0x3a92b74a7358edf47a295ff516dca8371c2c6a90c8903fc3733b282cfbad5d02",
+            "v": 27,
+            "hex": "0x07ce5715e11e0154fed4a09e5539c65eb40687308f077a5edf7bfd356f3f88833a92b74a7358edf47a295ff516dca8371c2c6a90c8903fc3733b282cfbad5d021b"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "cancel",
+              "cancels": [
+                {
+                  "a": 0,
+                  "o": 4294967295
+                }
+              ]
+            },
+            "nonce": 1793491213000,
+            "signature": {
+              "r": "0x07ce5715e11e0154fed4a09e5539c65eb40687308f077a5edf7bfd356f3f8883",
+              "s": "0x3a92b74a7358edf47a295ff516dca8371c2c6a90c8903fc3733b282cfbad5d02",
+              "v": 27
+            },
+            "vaultAddress": null
+          }
+        }
+      },
+      {
+        "name": "cancel SOL oid 123456789012 (uint64)",
+        "kind": "cancel",
+        "params": {
+          "asset": 5,
+          "oid": 123456789012
+        },
+        "action": {
+          "type": "cancel",
+          "cancels": [
+            {
+              "a": 5,
+              "o": 123456789012
+            }
+          ]
+        },
+        "nonce": 1793491214000,
+        "msgpack_hex": "82a474797065a663616e63656ca763616e63656c739182a16105a16fcf0000001cbe991a14",
+        "connection_id": "0xb7c882d020e183522128008f3434ecae1b1f7a839916a10115b7b5307c88a369",
+        "mainnet": {
+          "source": "a",
+          "struct_hash": "0x0a5040d160521764bf750b08734b15dd0f7113a7bddd63e279032c63820ccd09",
+          "digest": "0x70ff90c0f2238c5f50032d874b2b3bb423cf2bb84a3e20954d13ec4cc5cfeef4",
+          "signature": {
+            "r": "0xd92e54e960d6f4ec9871c587e60406a198331a7df426122ea1f43126d69ce182",
+            "s": "0x581457fb0da9296903c74702e1fd027f76b8c992b4782aa42380b7549f1fc71b",
+            "v": 28,
+            "hex": "0xd92e54e960d6f4ec9871c587e60406a198331a7df426122ea1f43126d69ce182581457fb0da9296903c74702e1fd027f76b8c992b4782aa42380b7549f1fc71b1c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "cancel",
+              "cancels": [
+                {
+                  "a": 5,
+                  "o": 123456789012
+                }
+              ]
+            },
+            "nonce": 1793491214000,
+            "signature": {
+              "r": "0xd92e54e960d6f4ec9871c587e60406a198331a7df426122ea1f43126d69ce182",
+              "s": "0x581457fb0da9296903c74702e1fd027f76b8c992b4782aa42380b7549f1fc71b",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        },
+        "testnet": {
+          "source": "b",
+          "struct_hash": "0xb43b674f97ec135d33ebfd6a3cd585ade02ea26053682620e9ca830a46a02325",
+          "digest": "0x100930b7cb55a93a18dffd0cc34d7b695b6e089d21d00cf2658af45c4c80a2f6",
+          "signature": {
+            "r": "0x117fd5565ffce3242fac13e932302a581e8777d532b028f04b3f03df7da72d73",
+            "s": "0x6eb88fcf2a4c43808c638e02ce4de08102a6135cef2c0f588befb08e2294d077",
+            "v": 27,
+            "hex": "0x117fd5565ffce3242fac13e932302a581e8777d532b028f04b3f03df7da72d736eb88fcf2a4c43808c638e02ce4de08102a6135cef2c0f588befb08e2294d0771b"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "cancel",
+              "cancels": [
+                {
+                  "a": 5,
+                  "o": 123456789012
+                }
+              ]
+            },
+            "nonce": 1793491214000,
+            "signature": {
+              "r": "0x117fd5565ffce3242fac13e932302a581e8777d532b028f04b3f03df7da72d73",
+              "s": "0x6eb88fcf2a4c43808c638e02ce4de08102a6135cef2c0f588befb08e2294d077",
+              "v": 27
+            },
+            "vaultAddress": null
+          }
+        }
+      },
+      {
+        "name": "setReferrer TESTCODE",
+        "kind": "setReferrer",
+        "params": {
+          "code": "TESTCODE"
+        },
+        "action": {
+          "type": "setReferrer",
+          "code": "TESTCODE"
+        },
+        "nonce": 1793491215000,
+        "msgpack_hex": "82a474797065ab7365745265666572726572a4636f6465a854455354434f4445",
+        "connection_id": "0x9d2d177ec3c863ced11d65bbd907a7f497999ef2e071d84b7e7f9890e942c06e",
+        "mainnet": {
+          "source": "a",
+          "struct_hash": "0xec50362ed7e24dd9121e969cde24d2136202323f5e6106bf6615a22d00c11a72",
+          "digest": "0x9f6e1ee3fd972ae585275024f17a29b8d7a7209513deff65af6ca61f46175df1",
+          "signature": {
+            "r": "0x7c9ff7bc085d270aab4545e84d871b7a2ed9839a2fbcf9385c171055e2a804da",
+            "s": "0x5b5f029b4b210e74dcbe6f5f8c9a67f810e26098ba7a0144c9f3abcaaae4f44e",
+            "v": 28,
+            "hex": "0x7c9ff7bc085d270aab4545e84d871b7a2ed9839a2fbcf9385c171055e2a804da5b5f029b4b210e74dcbe6f5f8c9a67f810e26098ba7a0144c9f3abcaaae4f44e1c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "setReferrer",
+              "code": "TESTCODE"
+            },
+            "nonce": 1793491215000,
+            "signature": {
+              "r": "0x7c9ff7bc085d270aab4545e84d871b7a2ed9839a2fbcf9385c171055e2a804da",
+              "s": "0x5b5f029b4b210e74dcbe6f5f8c9a67f810e26098ba7a0144c9f3abcaaae4f44e",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        },
+        "testnet": {
+          "source": "b",
+          "struct_hash": "0xbc08003cef850f5ba159a42c73a50ad6e9bda239117bf6ca0da5774ff794e46b",
+          "digest": "0x0f1ee88fa04b8f799039e4e90a0653f8d0914aba268449e2b5d85fa84e989402",
+          "signature": {
+            "r": "0x70c6a5ce077e00cf4f73127d1654370e0d30153c6bad940eb7e86e1132d51112",
+            "s": "0x1b7fe6ce77a00d685b6676c171be9c4b629d4a17c846abefbe2af6a605a2931c",
+            "v": 27,
+            "hex": "0x70c6a5ce077e00cf4f73127d1654370e0d30153c6bad940eb7e86e1132d511121b7fe6ce77a00d685b6676c171be9c4b629d4a17c846abefbe2af6a605a2931c1b"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "setReferrer",
+              "code": "TESTCODE"
+            },
+            "nonce": 1793491215000,
+            "signature": {
+              "r": "0x70c6a5ce077e00cf4f73127d1654370e0d30153c6bad940eb7e86e1132d51112",
+              "s": "0x1b7fe6ce77a00d685b6676c171be9c4b629d4a17c846abefbe2af6a605a2931c",
+              "v": 27
+            },
+            "vaultAddress": null
+          }
+        }
+      },
+      {
+        "name": "setReferrer 1 char",
+        "kind": "setReferrer",
+        "params": {
+          "code": "A"
+        },
+        "action": {
+          "type": "setReferrer",
+          "code": "A"
+        },
+        "nonce": 1793491216000,
+        "msgpack_hex": "82a474797065ab7365745265666572726572a4636f6465a141",
+        "connection_id": "0x239b9e8cbba885a93695f9eabd90acccff3a19dc9f44851683b090b0161b71d6",
+        "mainnet": {
+          "source": "a",
+          "struct_hash": "0x6b8b096bf2c9f30e10a408edcd676aa94a95068d30a6bb12adb046aa57bd178a",
+          "digest": "0x9ca918a00dcc8d853937c5124fc781cf48c6ef225493d77d6c8c85cce8ca6746",
+          "signature": {
+            "r": "0xe1e1bcf5b646e3824e8ed861df204d3662ae807cb395746f10e37e6690a4006c",
+            "s": "0x3b5e8c146fbf808e18c9c8f013feb24a80e64f39aa49c8377a9c176c0b1887ac",
+            "v": 28,
+            "hex": "0xe1e1bcf5b646e3824e8ed861df204d3662ae807cb395746f10e37e6690a4006c3b5e8c146fbf808e18c9c8f013feb24a80e64f39aa49c8377a9c176c0b1887ac1c"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "setReferrer",
+              "code": "A"
+            },
+            "nonce": 1793491216000,
+            "signature": {
+              "r": "0xe1e1bcf5b646e3824e8ed861df204d3662ae807cb395746f10e37e6690a4006c",
+              "s": "0x3b5e8c146fbf808e18c9c8f013feb24a80e64f39aa49c8377a9c176c0b1887ac",
+              "v": 28
+            },
+            "vaultAddress": null
+          }
+        },
+        "testnet": {
+          "source": "b",
+          "struct_hash": "0xee5ea1de510574278de5b6f57b93b6490de47d9e16c69ee8691976154f44223c",
+          "digest": "0x3d80d87f52677536f39d2334378e879fdf09fa6c4591611881b64bb2e11dca07",
+          "signature": {
+            "r": "0x812697b4e3915076b1a077b119a7de4a929b46b0cc6210303a7b22e58a8509c4",
+            "s": "0x02985aef5d5412eef428417e77697138abff79e5c3daf754c6ef4fa542e38c6a",
+            "v": 27,
+            "hex": "0x812697b4e3915076b1a077b119a7de4a929b46b0cc6210303a7b22e58a8509c402985aef5d5412eef428417e77697138abff79e5c3daf754c6ef4fa542e38c6a1b"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "setReferrer",
+              "code": "A"
+            },
+            "nonce": 1793491216000,
+            "signature": {
+              "r": "0x812697b4e3915076b1a077b119a7de4a929b46b0cc6210303a7b22e58a8509c4",
+              "s": "0x02985aef5d5412eef428417e77697138abff79e5c3daf754c6ef4fa542e38c6a",
+              "v": 27
+            },
+            "vaultAddress": null
+          }
+        }
+      },
+      {
+        "name": "setReferrer 20 chars",
+        "kind": "setReferrer",
+        "params": {
+          "code": "ABCDEFGHIJ0123456789"
+        },
+        "action": {
+          "type": "setReferrer",
+          "code": "ABCDEFGHIJ0123456789"
+        },
+        "nonce": 1793491217000,
+        "msgpack_hex": "82a474797065ab7365745265666572726572a4636f6465b44142434445464748494a30313233343536373839",
+        "connection_id": "0x7c006db29512f4f5db68e1ff7a12c4d801e79139dbe14d646abf0d77e109cc2c",
+        "mainnet": {
+          "source": "a",
+          "struct_hash": "0xaa9f100314b00adda724ccc1261947aaf6891a17f3c3aaab79e2cb856faf97a4",
+          "digest": "0x083b8486ad1005507a3e294b5403304017ab5a1e39eead1ef4a65c857aaf302c",
+          "signature": {
+            "r": "0x4506d91e0467c6bfc07cbbf5408a2e74c0b5b939900ce3763c6854988727b444",
+            "s": "0x4fcf3413cc562fe7d1a9fa1d899df3cac8a72b6822176050dd9b97de76528585",
+            "v": 27,
+            "hex": "0x4506d91e0467c6bfc07cbbf5408a2e74c0b5b939900ce3763c6854988727b4444fcf3413cc562fe7d1a9fa1d899df3cac8a72b6822176050dd9b97de765285851b"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "setReferrer",
+              "code": "ABCDEFGHIJ0123456789"
+            },
+            "nonce": 1793491217000,
+            "signature": {
+              "r": "0x4506d91e0467c6bfc07cbbf5408a2e74c0b5b939900ce3763c6854988727b444",
+              "s": "0x4fcf3413cc562fe7d1a9fa1d899df3cac8a72b6822176050dd9b97de76528585",
+              "v": 27
+            },
+            "vaultAddress": null
+          }
+        },
+        "testnet": {
+          "source": "b",
+          "struct_hash": "0x7949dfac0b08889e1e0ee2f0fc6a4afaa9ed9e44c35a0962469bc847d2ddc339",
+          "digest": "0xcbe78cd23624dc82a2c14da13a4831e589c17bb33675e65d2144aa7e00697161",
+          "signature": {
+            "r": "0x76b447822aa1d64bf62d403a845982ed2492c9565e7a515621f072e8723d3ba5",
+            "s": "0x7d1e9591b6c8510f4467eda61f69d50f3c2ad511fb81d383b42cf5e1f063c1be",
+            "v": 27,
+            "hex": "0x76b447822aa1d64bf62d403a845982ed2492c9565e7a515621f072e8723d3ba57d1e9591b6c8510f4467eda61f69d50f3c2ad511fb81d383b42cf5e1f063c1be1b"
+          },
+          "exchange_body": {
+            "action": {
+              "type": "setReferrer",
+              "code": "ABCDEFGHIJ0123456789"
+            },
+            "nonce": 1793491217000,
+            "signature": {
+              "r": "0x76b447822aa1d64bf62d403a845982ed2492c9565e7a515621f072e8723d3ba5",
+              "s": "0x7d1e9591b6c8510f4467eda61f69d50f3c2ad511fb81d383b42cf5e1f063c1be",
+              "v": 27
+            },
+            "vaultAddress": null
+          }
+        }
+      }
+    ]
+  },
+  "user_signed": {
+    "domain": {
+      "name": "HyperliquidSignTransaction",
+      "version": "1",
+      "chainId": 421614,
+      "verifyingContract": "0x0000000000000000000000000000000000000000"
+    },
+    "domain_separator": "0xfeb1393ca4412a4ca577bd51d04f0a77033514c602f4d0a11490fb95f7428df6",
+    "note": "signatureChainId \"0x66eee\" (= 421614) is the EIP-712 domain chainId; hyperliquidChain carries the network. uint64 fields are nonce / time.",
+    "usdc_token": {
+      "mainnet": "USDC:0x6d1e7cde53ba9467b783cb7c530ce054",
+      "testnet": "USDC:0xeb62eee3685fc4c43992febcd9e75443"
+    },
+    "cases": [
+      {
+        "name": "usdClassTransfer 12.5 to perp (mainnet)",
+        "kind": "usdClassTransfer",
+        "network": "mainnet",
+        "action": {
+          "type": "usdClassTransfer",
+          "signatureChainId": "0x66eee",
+          "hyperliquidChain": "Mainnet",
+          "amount": "12.5",
+          "toPerp": true,
+          "nonce": 1793491300000
+        },
+        "primary_type": "HyperliquidTransaction:UsdClassTransfer",
+        "type_string": "HyperliquidTransaction:UsdClassTransfer(string hyperliquidChain,string amount,bool toPerp,uint64 nonce)",
+        "typehash": "0x7a3eebb1997d2e459472886f8cf9829a79b1b00c72a06c9fe015c91299aecd43",
+        "domain": {
+          "name": "HyperliquidSignTransaction",
+          "version": "1",
+          "chainId": 421614,
+          "verifyingContract": "0x0000000000000000000000000000000000000000"
+        },
+        "domain_separator": "0xfeb1393ca4412a4ca577bd51d04f0a77033514c602f4d0a11490fb95f7428df6",
+        "struct_hash": "0x9c46aab45f2516767092ed39595310df553fa6a7a9a522dc4a169e3c1fa80410",
+        "digest": "0xf77275ec4d85b68b55ecd8b1d738e5a830ff352284f520bf07659b81162ce372",
+        "signature": {
+          "r": "0x7b3215fd3fb9cb3f28e1fc273682176922baa4f979d07bf799ef64e4bebc38f3",
+          "s": "0x646eeffc882b323f4aa78a2cf3c6656debde2b2318c03d53789b522dae8820f8",
+          "v": 28,
+          "hex": "0x7b3215fd3fb9cb3f28e1fc273682176922baa4f979d07bf799ef64e4bebc38f3646eeffc882b323f4aa78a2cf3c6656debde2b2318c03d53789b522dae8820f81c"
+        },
+        "exchange_body": {
+          "action": {
+            "type": "usdClassTransfer",
+            "signatureChainId": "0x66eee",
+            "hyperliquidChain": "Mainnet",
+            "amount": "12.5",
+            "toPerp": true,
+            "nonce": 1793491300000
+          },
+          "nonce": 1793491300000,
+          "signature": {
+            "r": "0x7b3215fd3fb9cb3f28e1fc273682176922baa4f979d07bf799ef64e4bebc38f3",
+            "s": "0x646eeffc882b323f4aa78a2cf3c6656debde2b2318c03d53789b522dae8820f8",
+            "v": 28
+          }
+        }
+      },
+      {
+        "name": "usdClassTransfer 3 to spot (mainnet)",
+        "kind": "usdClassTransfer",
+        "network": "mainnet",
+        "action": {
+          "type": "usdClassTransfer",
+          "signatureChainId": "0x66eee",
+          "hyperliquidChain": "Mainnet",
+          "amount": "3",
+          "toPerp": false,
+          "nonce": 1793491301000
+        },
+        "primary_type": "HyperliquidTransaction:UsdClassTransfer",
+        "type_string": "HyperliquidTransaction:UsdClassTransfer(string hyperliquidChain,string amount,bool toPerp,uint64 nonce)",
+        "typehash": "0x7a3eebb1997d2e459472886f8cf9829a79b1b00c72a06c9fe015c91299aecd43",
+        "domain": {
+          "name": "HyperliquidSignTransaction",
+          "version": "1",
+          "chainId": 421614,
+          "verifyingContract": "0x0000000000000000000000000000000000000000"
+        },
+        "domain_separator": "0xfeb1393ca4412a4ca577bd51d04f0a77033514c602f4d0a11490fb95f7428df6",
+        "struct_hash": "0x405c7713be476581814313d0cbb26600a84414c3c857724b4fdf247e204ed238",
+        "digest": "0x5261484f1a74a51ae15491f8df0ba88e840d95853dab36f206becb115844862f",
+        "signature": {
+          "r": "0x14f6cff6d0c017a415dc6b815ec6bf79706de091cefe003fae402cee9dac1a19",
+          "s": "0x039f2460a99cebb92fc12844fa6ad8a46586ded1fada7dbe672f6f7a664cb578",
+          "v": 28,
+          "hex": "0x14f6cff6d0c017a415dc6b815ec6bf79706de091cefe003fae402cee9dac1a19039f2460a99cebb92fc12844fa6ad8a46586ded1fada7dbe672f6f7a664cb5781c"
+        },
+        "exchange_body": {
+          "action": {
+            "type": "usdClassTransfer",
+            "signatureChainId": "0x66eee",
+            "hyperliquidChain": "Mainnet",
+            "amount": "3",
+            "toPerp": false,
+            "nonce": 1793491301000
+          },
+          "nonce": 1793491301000,
+          "signature": {
+            "r": "0x14f6cff6d0c017a415dc6b815ec6bf79706de091cefe003fae402cee9dac1a19",
+            "s": "0x039f2460a99cebb92fc12844fa6ad8a46586ded1fada7dbe672f6f7a664cb578",
+            "v": 28
+          }
+        }
+      },
+      {
+        "name": "sendAsset 4 USDC perp -> 1Click deposit address (mainnet)",
+        "kind": "sendAsset",
+        "network": "mainnet",
+        "action": {
+          "type": "sendAsset",
+          "signatureChainId": "0x66eee",
+          "hyperliquidChain": "Mainnet",
+          "destination": "0x3325a78425f17a7e487eb5666b2bfd93abb06c70",
+          "sourceDex": "",
+          "destinationDex": "spot",
+          "token": "USDC:0x6d1e7cde53ba9467b783cb7c530ce054",
+          "amount": "4",
+          "fromSubAccount": "",
+          "nonce": 1793491302000
+        },
+        "primary_type": "HyperliquidTransaction:SendAsset",
+        "type_string": "HyperliquidTransaction:SendAsset(string hyperliquidChain,string destination,string sourceDex,string destinationDex,string token,string amount,string fromSubAccount,uint64 nonce)",
+        "typehash": "0x5f7cf397b977b076f0fbb993badfc7dd11bd71461a3d076c0940eff5f91ac849",
+        "domain": {
+          "name": "HyperliquidSignTransaction",
+          "version": "1",
+          "chainId": 421614,
+          "verifyingContract": "0x0000000000000000000000000000000000000000"
+        },
+        "domain_separator": "0xfeb1393ca4412a4ca577bd51d04f0a77033514c602f4d0a11490fb95f7428df6",
+        "struct_hash": "0xa77fef3b43155000baf6776c628d8817d0f97bdd9277d55974d32eb41986a90e",
+        "digest": "0xb37e3bbc35fa7488ab94d5b65c32eba6b5223e3f3944bbe7bb501d1974e29ca6",
+        "signature": {
+          "r": "0x55488ab45cf4fbbdedead7d5933c60b7017008699001419cf2863b6348702b96",
+          "s": "0x1f5a51e8c18b995de98edc711527bb79cf906993954df5744617d2004a4962da",
+          "v": 28,
+          "hex": "0x55488ab45cf4fbbdedead7d5933c60b7017008699001419cf2863b6348702b961f5a51e8c18b995de98edc711527bb79cf906993954df5744617d2004a4962da1c"
+        },
+        "exchange_body": {
+          "action": {
+            "type": "sendAsset",
+            "signatureChainId": "0x66eee",
+            "hyperliquidChain": "Mainnet",
+            "destination": "0x3325a78425f17a7e487eb5666b2bfd93abb06c70",
+            "sourceDex": "",
+            "destinationDex": "spot",
+            "token": "USDC:0x6d1e7cde53ba9467b783cb7c530ce054",
+            "amount": "4",
+            "fromSubAccount": "",
+            "nonce": 1793491302000
+          },
+          "nonce": 1793491302000,
+          "signature": {
+            "r": "0x55488ab45cf4fbbdedead7d5933c60b7017008699001419cf2863b6348702b96",
+            "s": "0x1f5a51e8c18b995de98edc711527bb79cf906993954df5744617d2004a4962da",
+            "v": 28
+          }
+        },
+        "note": "token is the USDC spot token of mainnet; Hyperliquid also charges the sender a 1 USDC activation fee for a new destination"
+      },
+      {
+        "name": "sendAsset 0.5 USDC (1Click minimum) (mainnet)",
+        "kind": "sendAsset",
+        "network": "mainnet",
+        "action": {
+          "type": "sendAsset",
+          "signatureChainId": "0x66eee",
+          "hyperliquidChain": "Mainnet",
+          "destination": "0x3325a78425f17a7e487eb5666b2bfd93abb06c70",
+          "sourceDex": "",
+          "destinationDex": "spot",
+          "token": "USDC:0x6d1e7cde53ba9467b783cb7c530ce054",
+          "amount": "0.5",
+          "fromSubAccount": "",
+          "nonce": 1793491303000
+        },
+        "primary_type": "HyperliquidTransaction:SendAsset",
+        "type_string": "HyperliquidTransaction:SendAsset(string hyperliquidChain,string destination,string sourceDex,string destinationDex,string token,string amount,string fromSubAccount,uint64 nonce)",
+        "typehash": "0x5f7cf397b977b076f0fbb993badfc7dd11bd71461a3d076c0940eff5f91ac849",
+        "domain": {
+          "name": "HyperliquidSignTransaction",
+          "version": "1",
+          "chainId": 421614,
+          "verifyingContract": "0x0000000000000000000000000000000000000000"
+        },
+        "domain_separator": "0xfeb1393ca4412a4ca577bd51d04f0a77033514c602f4d0a11490fb95f7428df6",
+        "struct_hash": "0xe697bcdfb5c93c2fd117e356ae0a54c1e2d2a73b72c87db43db51ad1663e40bd",
+        "digest": "0x70a0092d5f19384a8771403c63262a2b36963346f01c555fe5c1b58bf37fd3f6",
+        "signature": {
+          "r": "0x547a09cd96b9d3b299b73bcd355d9627cde7cde4fc860c48eba93871e1f36d9c",
+          "s": "0x52799eb91a05ab63a7867fe05c2769f323126d3b78e798a96ee5cb342bff1ab7",
+          "v": 28,
+          "hex": "0x547a09cd96b9d3b299b73bcd355d9627cde7cde4fc860c48eba93871e1f36d9c52799eb91a05ab63a7867fe05c2769f323126d3b78e798a96ee5cb342bff1ab71c"
+        },
+        "exchange_body": {
+          "action": {
+            "type": "sendAsset",
+            "signatureChainId": "0x66eee",
+            "hyperliquidChain": "Mainnet",
+            "destination": "0x3325a78425f17a7e487eb5666b2bfd93abb06c70",
+            "sourceDex": "",
+            "destinationDex": "spot",
+            "token": "USDC:0x6d1e7cde53ba9467b783cb7c530ce054",
+            "amount": "0.5",
+            "fromSubAccount": "",
+            "nonce": 1793491303000
+          },
+          "nonce": 1793491303000,
+          "signature": {
+            "r": "0x547a09cd96b9d3b299b73bcd355d9627cde7cde4fc860c48eba93871e1f36d9c",
+            "s": "0x52799eb91a05ab63a7867fe05c2769f323126d3b78e798a96ee5cb342bff1ab7",
+            "v": 28
+          }
+        }
+      },
+      {
+        "name": "withdraw3 10 USDC to the desk's own address (mainnet)",
+        "kind": "withdraw3",
+        "network": "mainnet",
+        "action": {
+          "type": "withdraw3",
+          "signatureChainId": "0x66eee",
+          "hyperliquidChain": "Mainnet",
+          "destination": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "amount": "10",
+          "time": 1793491304000
+        },
+        "primary_type": "HyperliquidTransaction:Withdraw",
+        "type_string": "HyperliquidTransaction:Withdraw(string hyperliquidChain,string destination,string amount,uint64 time)",
+        "typehash": "0xdbde952fa0de88158fc71336e44c61876611a2a65553bebd4d52b44a2a000d9a",
+        "domain": {
+          "name": "HyperliquidSignTransaction",
+          "version": "1",
+          "chainId": 421614,
+          "verifyingContract": "0x0000000000000000000000000000000000000000"
+        },
+        "domain_separator": "0xfeb1393ca4412a4ca577bd51d04f0a77033514c602f4d0a11490fb95f7428df6",
+        "struct_hash": "0x6cb5d12a6c9a1ac8f0ee8e019514e465a8338c7551e9a7c9568e06f1394ad2b3",
+        "digest": "0xe5891fa9880bdfe63f6d3b2f7ee55814272d68e21e739fe891ec0ee010cb16a3",
+        "signature": {
+          "r": "0x30065aff6c85bda948d6c54f4ab37fdd52eea5f8ae93121dc0774cced79b5d38",
+          "s": "0x475c8d8cb4a193c63d9b5421d90a6e8331164b98c06f7308928a854603111c55",
+          "v": 27,
+          "hex": "0x30065aff6c85bda948d6c54f4ab37fdd52eea5f8ae93121dc0774cced79b5d38475c8d8cb4a193c63d9b5421d90a6e8331164b98c06f7308928a854603111c551b"
+        },
+        "exchange_body": {
+          "action": {
+            "type": "withdraw3",
+            "signatureChainId": "0x66eee",
+            "hyperliquidChain": "Mainnet",
+            "destination": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+            "amount": "10",
+            "time": 1793491304000
+          },
+          "nonce": 1793491304000,
+          "signature": {
+            "r": "0x30065aff6c85bda948d6c54f4ab37fdd52eea5f8ae93121dc0774cced79b5d38",
+            "s": "0x475c8d8cb4a193c63d9b5421d90a6e8331164b98c06f7308928a854603111c55",
+            "v": 27
+          }
+        }
+      },
+      {
+        "name": "approveBuilderFee 0.01% (mainnet)",
+        "kind": "approveBuilderFee",
+        "network": "mainnet",
+        "action": {
+          "type": "approveBuilderFee",
+          "signatureChainId": "0x66eee",
+          "hyperliquidChain": "Mainnet",
+          "maxFeeRate": "0.01%",
+          "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+          "nonce": 1793491305000
+        },
+        "primary_type": "HyperliquidTransaction:ApproveBuilderFee",
+        "type_string": "HyperliquidTransaction:ApproveBuilderFee(string hyperliquidChain,string maxFeeRate,address builder,uint64 nonce)",
+        "typehash": "0x461684eab6dcdfdd79c6250648d41a1abe3c826ceab6c513fc4f30156f233ad3",
+        "domain": {
+          "name": "HyperliquidSignTransaction",
+          "version": "1",
+          "chainId": 421614,
+          "verifyingContract": "0x0000000000000000000000000000000000000000"
+        },
+        "domain_separator": "0xfeb1393ca4412a4ca577bd51d04f0a77033514c602f4d0a11490fb95f7428df6",
+        "struct_hash": "0x4c13f5c5ed81969166c9f5234fe01d187e9b1d48bfd6bf63211ce76b7b26cbae",
+        "digest": "0xbfdeb1f488b7dd873afa21a6bd8fe3155202bb2fa69dac2ec7fe80c453f291bb",
+        "signature": {
+          "r": "0x14e36f42431886a3ff39bd24c81e03af1e84d3e5df95498a6b442c7755bcc5e5",
+          "s": "0x1984f4b7bd67f69c24c8e1f1e87e8210e3e567de60eb1de5d607037519015937",
+          "v": 28,
+          "hex": "0x14e36f42431886a3ff39bd24c81e03af1e84d3e5df95498a6b442c7755bcc5e51984f4b7bd67f69c24c8e1f1e87e8210e3e567de60eb1de5d6070375190159371c"
+        },
+        "exchange_body": {
+          "action": {
+            "type": "approveBuilderFee",
+            "signatureChainId": "0x66eee",
+            "hyperliquidChain": "Mainnet",
+            "maxFeeRate": "0.01%",
+            "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+            "nonce": 1793491305000
+          },
+          "nonce": 1793491305000,
+          "signature": {
+            "r": "0x14e36f42431886a3ff39bd24c81e03af1e84d3e5df95498a6b442c7755bcc5e5",
+            "s": "0x1984f4b7bd67f69c24c8e1f1e87e8210e3e567de60eb1de5d607037519015937",
+            "v": 28
+          }
+        }
+      },
+      {
+        "name": "approveBuilderFee 0.1% (mainnet)",
+        "kind": "approveBuilderFee",
+        "network": "mainnet",
+        "action": {
+          "type": "approveBuilderFee",
+          "signatureChainId": "0x66eee",
+          "hyperliquidChain": "Mainnet",
+          "maxFeeRate": "0.1%",
+          "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+          "nonce": 1793491306000
+        },
+        "primary_type": "HyperliquidTransaction:ApproveBuilderFee",
+        "type_string": "HyperliquidTransaction:ApproveBuilderFee(string hyperliquidChain,string maxFeeRate,address builder,uint64 nonce)",
+        "typehash": "0x461684eab6dcdfdd79c6250648d41a1abe3c826ceab6c513fc4f30156f233ad3",
+        "domain": {
+          "name": "HyperliquidSignTransaction",
+          "version": "1",
+          "chainId": 421614,
+          "verifyingContract": "0x0000000000000000000000000000000000000000"
+        },
+        "domain_separator": "0xfeb1393ca4412a4ca577bd51d04f0a77033514c602f4d0a11490fb95f7428df6",
+        "struct_hash": "0x70dda046ff1738d9d296dfc2c5f8bbd1b3f9ce51356082cf086fc5378098a69b",
+        "digest": "0x3f798a80fab2208c7e2fb23e4e716dea5acd09430e4cb0ff17241280c4f31aa2",
+        "signature": {
+          "r": "0x8b1efbb683c39631631d57a566f2bb15a7968078c81b6078fd73215c9bf77fff",
+          "s": "0x1ad64d1f84db66488df9efbe8ca66da968adeb9c8bc832d8c4676a2a411127e4",
+          "v": 28,
+          "hex": "0x8b1efbb683c39631631d57a566f2bb15a7968078c81b6078fd73215c9bf77fff1ad64d1f84db66488df9efbe8ca66da968adeb9c8bc832d8c4676a2a411127e41c"
+        },
+        "exchange_body": {
+          "action": {
+            "type": "approveBuilderFee",
+            "signatureChainId": "0x66eee",
+            "hyperliquidChain": "Mainnet",
+            "maxFeeRate": "0.1%",
+            "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+            "nonce": 1793491306000
+          },
+          "nonce": 1793491306000,
+          "signature": {
+            "r": "0x8b1efbb683c39631631d57a566f2bb15a7968078c81b6078fd73215c9bf77fff",
+            "s": "0x1ad64d1f84db66488df9efbe8ca66da968adeb9c8bc832d8c4676a2a411127e4",
+            "v": 28
+          }
+        }
+      },
+      {
+        "name": "usdClassTransfer 12.5 to perp (testnet)",
+        "kind": "usdClassTransfer",
+        "network": "testnet",
+        "action": {
+          "type": "usdClassTransfer",
+          "signatureChainId": "0x66eee",
+          "hyperliquidChain": "Testnet",
+          "amount": "12.5",
+          "toPerp": true,
+          "nonce": 1793491307000
+        },
+        "primary_type": "HyperliquidTransaction:UsdClassTransfer",
+        "type_string": "HyperliquidTransaction:UsdClassTransfer(string hyperliquidChain,string amount,bool toPerp,uint64 nonce)",
+        "typehash": "0x7a3eebb1997d2e459472886f8cf9829a79b1b00c72a06c9fe015c91299aecd43",
+        "domain": {
+          "name": "HyperliquidSignTransaction",
+          "version": "1",
+          "chainId": 421614,
+          "verifyingContract": "0x0000000000000000000000000000000000000000"
+        },
+        "domain_separator": "0xfeb1393ca4412a4ca577bd51d04f0a77033514c602f4d0a11490fb95f7428df6",
+        "struct_hash": "0x241e3b918afc037c0f0b240a47313ff1615263487e45169fcd5d180ed0d75dc8",
+        "digest": "0x2bb6eba9932ff4d9a72f272fde66a86c96b4fe5b0241d8a6ed8b79881c372e08",
+        "signature": {
+          "r": "0x259c828792f3f00f45fe344228ef7a9dea81fd36fbf649deef27a70bbde1c12a",
+          "s": "0x42130282d8d3f416184122797a46ec2296f1fcd50011b13542fd55fb30c61d83",
+          "v": 28,
+          "hex": "0x259c828792f3f00f45fe344228ef7a9dea81fd36fbf649deef27a70bbde1c12a42130282d8d3f416184122797a46ec2296f1fcd50011b13542fd55fb30c61d831c"
+        },
+        "exchange_body": {
+          "action": {
+            "type": "usdClassTransfer",
+            "signatureChainId": "0x66eee",
+            "hyperliquidChain": "Testnet",
+            "amount": "12.5",
+            "toPerp": true,
+            "nonce": 1793491307000
+          },
+          "nonce": 1793491307000,
+          "signature": {
+            "r": "0x259c828792f3f00f45fe344228ef7a9dea81fd36fbf649deef27a70bbde1c12a",
+            "s": "0x42130282d8d3f416184122797a46ec2296f1fcd50011b13542fd55fb30c61d83",
+            "v": 28
+          }
+        }
+      },
+      {
+        "name": "usdClassTransfer 3 to spot (testnet)",
+        "kind": "usdClassTransfer",
+        "network": "testnet",
+        "action": {
+          "type": "usdClassTransfer",
+          "signatureChainId": "0x66eee",
+          "hyperliquidChain": "Testnet",
+          "amount": "3",
+          "toPerp": false,
+          "nonce": 1793491308000
+        },
+        "primary_type": "HyperliquidTransaction:UsdClassTransfer",
+        "type_string": "HyperliquidTransaction:UsdClassTransfer(string hyperliquidChain,string amount,bool toPerp,uint64 nonce)",
+        "typehash": "0x7a3eebb1997d2e459472886f8cf9829a79b1b00c72a06c9fe015c91299aecd43",
+        "domain": {
+          "name": "HyperliquidSignTransaction",
+          "version": "1",
+          "chainId": 421614,
+          "verifyingContract": "0x0000000000000000000000000000000000000000"
+        },
+        "domain_separator": "0xfeb1393ca4412a4ca577bd51d04f0a77033514c602f4d0a11490fb95f7428df6",
+        "struct_hash": "0x88eba0c8427b6a2a596cda5f64818d526486942709851cb4483ebd9bfcb2b125",
+        "digest": "0x9719bc128e223b3b959c7527908b156fd9063af405ccc2b1321adf35f2ffac39",
+        "signature": {
+          "r": "0x854cde99bfbc064bc681fd4605f36990356ce977ace3234b93c3afa5f21a71aa",
+          "s": "0x4329a1511b0fbd57fa81c478c94d662aee600e93836dbdf332b42aa1a23ced3a",
+          "v": 27,
+          "hex": "0x854cde99bfbc064bc681fd4605f36990356ce977ace3234b93c3afa5f21a71aa4329a1511b0fbd57fa81c478c94d662aee600e93836dbdf332b42aa1a23ced3a1b"
+        },
+        "exchange_body": {
+          "action": {
+            "type": "usdClassTransfer",
+            "signatureChainId": "0x66eee",
+            "hyperliquidChain": "Testnet",
+            "amount": "3",
+            "toPerp": false,
+            "nonce": 1793491308000
+          },
+          "nonce": 1793491308000,
+          "signature": {
+            "r": "0x854cde99bfbc064bc681fd4605f36990356ce977ace3234b93c3afa5f21a71aa",
+            "s": "0x4329a1511b0fbd57fa81c478c94d662aee600e93836dbdf332b42aa1a23ced3a",
+            "v": 27
+          }
+        }
+      },
+      {
+        "name": "sendAsset 4 USDC perp -> 1Click deposit address (testnet)",
+        "kind": "sendAsset",
+        "network": "testnet",
+        "action": {
+          "type": "sendAsset",
+          "signatureChainId": "0x66eee",
+          "hyperliquidChain": "Testnet",
+          "destination": "0x3325a78425f17a7e487eb5666b2bfd93abb06c70",
+          "sourceDex": "",
+          "destinationDex": "spot",
+          "token": "USDC:0xeb62eee3685fc4c43992febcd9e75443",
+          "amount": "4",
+          "fromSubAccount": "",
+          "nonce": 1793491309000
+        },
+        "primary_type": "HyperliquidTransaction:SendAsset",
+        "type_string": "HyperliquidTransaction:SendAsset(string hyperliquidChain,string destination,string sourceDex,string destinationDex,string token,string amount,string fromSubAccount,uint64 nonce)",
+        "typehash": "0x5f7cf397b977b076f0fbb993badfc7dd11bd71461a3d076c0940eff5f91ac849",
+        "domain": {
+          "name": "HyperliquidSignTransaction",
+          "version": "1",
+          "chainId": 421614,
+          "verifyingContract": "0x0000000000000000000000000000000000000000"
+        },
+        "domain_separator": "0xfeb1393ca4412a4ca577bd51d04f0a77033514c602f4d0a11490fb95f7428df6",
+        "struct_hash": "0x5e616bcbc93acc8d1311d6965062e33f47d50dcc7969ead96cbfeda442548c35",
+        "digest": "0x62bf246bc1176e89ee709f5a859f7f5ee87ca97cdb10c6781918b5c6e7c9c4a8",
+        "signature": {
+          "r": "0xca5b102c7f68f1624a68baeb96b579804f0aca143f103bb46181a4fa5cc75b4d",
+          "s": "0x60a8eb4c647a4b7b39fc35b9b27e49cd4b0ec1bac03067940cc3b31c6e644bbd",
+          "v": 28,
+          "hex": "0xca5b102c7f68f1624a68baeb96b579804f0aca143f103bb46181a4fa5cc75b4d60a8eb4c647a4b7b39fc35b9b27e49cd4b0ec1bac03067940cc3b31c6e644bbd1c"
+        },
+        "exchange_body": {
+          "action": {
+            "type": "sendAsset",
+            "signatureChainId": "0x66eee",
+            "hyperliquidChain": "Testnet",
+            "destination": "0x3325a78425f17a7e487eb5666b2bfd93abb06c70",
+            "sourceDex": "",
+            "destinationDex": "spot",
+            "token": "USDC:0xeb62eee3685fc4c43992febcd9e75443",
+            "amount": "4",
+            "fromSubAccount": "",
+            "nonce": 1793491309000
+          },
+          "nonce": 1793491309000,
+          "signature": {
+            "r": "0xca5b102c7f68f1624a68baeb96b579804f0aca143f103bb46181a4fa5cc75b4d",
+            "s": "0x60a8eb4c647a4b7b39fc35b9b27e49cd4b0ec1bac03067940cc3b31c6e644bbd",
+            "v": 28
+          }
+        },
+        "note": "token is the USDC spot token of testnet; Hyperliquid also charges the sender a 1 USDC activation fee for a new destination"
+      },
+      {
+        "name": "sendAsset 0.5 USDC (1Click minimum) (testnet)",
+        "kind": "sendAsset",
+        "network": "testnet",
+        "action": {
+          "type": "sendAsset",
+          "signatureChainId": "0x66eee",
+          "hyperliquidChain": "Testnet",
+          "destination": "0x3325a78425f17a7e487eb5666b2bfd93abb06c70",
+          "sourceDex": "",
+          "destinationDex": "spot",
+          "token": "USDC:0xeb62eee3685fc4c43992febcd9e75443",
+          "amount": "0.5",
+          "fromSubAccount": "",
+          "nonce": 1793491310000
+        },
+        "primary_type": "HyperliquidTransaction:SendAsset",
+        "type_string": "HyperliquidTransaction:SendAsset(string hyperliquidChain,string destination,string sourceDex,string destinationDex,string token,string amount,string fromSubAccount,uint64 nonce)",
+        "typehash": "0x5f7cf397b977b076f0fbb993badfc7dd11bd71461a3d076c0940eff5f91ac849",
+        "domain": {
+          "name": "HyperliquidSignTransaction",
+          "version": "1",
+          "chainId": 421614,
+          "verifyingContract": "0x0000000000000000000000000000000000000000"
+        },
+        "domain_separator": "0xfeb1393ca4412a4ca577bd51d04f0a77033514c602f4d0a11490fb95f7428df6",
+        "struct_hash": "0x6ff3a56d1d9e125816abb338edddd3509c6299e662598858a63b6be3aa22afe7",
+        "digest": "0x4b010c76722e73d6e9e5c975bf2169d3ff7897ea1fb2dd4ee571b48b7e04aad1",
+        "signature": {
+          "r": "0x89581bf43ebda581a4e722614cb87003cbc510d2b04ae791f9a21c6a74e1a909",
+          "s": "0x4942fd2bf17bdda94a1ddc445a0c5976cd094968f513c6a9a53064c948452069",
+          "v": 28,
+          "hex": "0x89581bf43ebda581a4e722614cb87003cbc510d2b04ae791f9a21c6a74e1a9094942fd2bf17bdda94a1ddc445a0c5976cd094968f513c6a9a53064c9484520691c"
+        },
+        "exchange_body": {
+          "action": {
+            "type": "sendAsset",
+            "signatureChainId": "0x66eee",
+            "hyperliquidChain": "Testnet",
+            "destination": "0x3325a78425f17a7e487eb5666b2bfd93abb06c70",
+            "sourceDex": "",
+            "destinationDex": "spot",
+            "token": "USDC:0xeb62eee3685fc4c43992febcd9e75443",
+            "amount": "0.5",
+            "fromSubAccount": "",
+            "nonce": 1793491310000
+          },
+          "nonce": 1793491310000,
+          "signature": {
+            "r": "0x89581bf43ebda581a4e722614cb87003cbc510d2b04ae791f9a21c6a74e1a909",
+            "s": "0x4942fd2bf17bdda94a1ddc445a0c5976cd094968f513c6a9a53064c948452069",
+            "v": 28
+          }
+        }
+      },
+      {
+        "name": "withdraw3 10 USDC to the desk's own address (testnet)",
+        "kind": "withdraw3",
+        "network": "testnet",
+        "action": {
+          "type": "withdraw3",
+          "signatureChainId": "0x66eee",
+          "hyperliquidChain": "Testnet",
+          "destination": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "amount": "10",
+          "time": 1793491311000
+        },
+        "primary_type": "HyperliquidTransaction:Withdraw",
+        "type_string": "HyperliquidTransaction:Withdraw(string hyperliquidChain,string destination,string amount,uint64 time)",
+        "typehash": "0xdbde952fa0de88158fc71336e44c61876611a2a65553bebd4d52b44a2a000d9a",
+        "domain": {
+          "name": "HyperliquidSignTransaction",
+          "version": "1",
+          "chainId": 421614,
+          "verifyingContract": "0x0000000000000000000000000000000000000000"
+        },
+        "domain_separator": "0xfeb1393ca4412a4ca577bd51d04f0a77033514c602f4d0a11490fb95f7428df6",
+        "struct_hash": "0x141b1b7a4b14ddef6c2e47f8a8f9de9d620ee866655180089747863c94319fb6",
+        "digest": "0xf0786df3da36cad393934044278f57a59b2dee200ba282f3bd726795f41a2500",
+        "signature": {
+          "r": "0x155fc64141dde269007d8781bc9aa5ba27dbbb209acfd143caf5c5fb1656258e",
+          "s": "0x6bd38a25374b91cd5daca74d31d67dd2f63d793c37f8713276177e8691c92384",
+          "v": 27,
+          "hex": "0x155fc64141dde269007d8781bc9aa5ba27dbbb209acfd143caf5c5fb1656258e6bd38a25374b91cd5daca74d31d67dd2f63d793c37f8713276177e8691c923841b"
+        },
+        "exchange_body": {
+          "action": {
+            "type": "withdraw3",
+            "signatureChainId": "0x66eee",
+            "hyperliquidChain": "Testnet",
+            "destination": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+            "amount": "10",
+            "time": 1793491311000
+          },
+          "nonce": 1793491311000,
+          "signature": {
+            "r": "0x155fc64141dde269007d8781bc9aa5ba27dbbb209acfd143caf5c5fb1656258e",
+            "s": "0x6bd38a25374b91cd5daca74d31d67dd2f63d793c37f8713276177e8691c92384",
+            "v": 27
+          }
+        }
+      },
+      {
+        "name": "approveBuilderFee 0.01% (testnet)",
+        "kind": "approveBuilderFee",
+        "network": "testnet",
+        "action": {
+          "type": "approveBuilderFee",
+          "signatureChainId": "0x66eee",
+          "hyperliquidChain": "Testnet",
+          "maxFeeRate": "0.01%",
+          "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+          "nonce": 1793491312000
+        },
+        "primary_type": "HyperliquidTransaction:ApproveBuilderFee",
+        "type_string": "HyperliquidTransaction:ApproveBuilderFee(string hyperliquidChain,string maxFeeRate,address builder,uint64 nonce)",
+        "typehash": "0x461684eab6dcdfdd79c6250648d41a1abe3c826ceab6c513fc4f30156f233ad3",
+        "domain": {
+          "name": "HyperliquidSignTransaction",
+          "version": "1",
+          "chainId": 421614,
+          "verifyingContract": "0x0000000000000000000000000000000000000000"
+        },
+        "domain_separator": "0xfeb1393ca4412a4ca577bd51d04f0a77033514c602f4d0a11490fb95f7428df6",
+        "struct_hash": "0xd593fd1520d57e8235311115ff7b1f778100ad0f9879da33570d85398f89e224",
+        "digest": "0x882bdda4eda3ff74c52fd456c8b9bf44dc2873de936698d09b82607b6dc646ef",
+        "signature": {
+          "r": "0x75816ebc1737a05598887604a00beea584099a5ca9382f0b8d7b4fe86b6f587e",
+          "s": "0x598e32d55cda4048271eb598db70e0dd933392433a764d79eaa48faa30925cae",
+          "v": 28,
+          "hex": "0x75816ebc1737a05598887604a00beea584099a5ca9382f0b8d7b4fe86b6f587e598e32d55cda4048271eb598db70e0dd933392433a764d79eaa48faa30925cae1c"
+        },
+        "exchange_body": {
+          "action": {
+            "type": "approveBuilderFee",
+            "signatureChainId": "0x66eee",
+            "hyperliquidChain": "Testnet",
+            "maxFeeRate": "0.01%",
+            "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+            "nonce": 1793491312000
+          },
+          "nonce": 1793491312000,
+          "signature": {
+            "r": "0x75816ebc1737a05598887604a00beea584099a5ca9382f0b8d7b4fe86b6f587e",
+            "s": "0x598e32d55cda4048271eb598db70e0dd933392433a764d79eaa48faa30925cae",
+            "v": 28
+          }
+        }
+      },
+      {
+        "name": "approveBuilderFee 0.1% (testnet)",
+        "kind": "approveBuilderFee",
+        "network": "testnet",
+        "action": {
+          "type": "approveBuilderFee",
+          "signatureChainId": "0x66eee",
+          "hyperliquidChain": "Testnet",
+          "maxFeeRate": "0.1%",
+          "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+          "nonce": 1793491313000
+        },
+        "primary_type": "HyperliquidTransaction:ApproveBuilderFee",
+        "type_string": "HyperliquidTransaction:ApproveBuilderFee(string hyperliquidChain,string maxFeeRate,address builder,uint64 nonce)",
+        "typehash": "0x461684eab6dcdfdd79c6250648d41a1abe3c826ceab6c513fc4f30156f233ad3",
+        "domain": {
+          "name": "HyperliquidSignTransaction",
+          "version": "1",
+          "chainId": 421614,
+          "verifyingContract": "0x0000000000000000000000000000000000000000"
+        },
+        "domain_separator": "0xfeb1393ca4412a4ca577bd51d04f0a77033514c602f4d0a11490fb95f7428df6",
+        "struct_hash": "0x59a804c9c41f13ec6f1a8e4e432b60cdc1bdedf291b9e2076134b2e9f0534d71",
+        "digest": "0x0e75ac2c76c156af10002b09e3ffaa20282088ccaf3ced2157fa540263238d7d",
+        "signature": {
+          "r": "0x223efbdc638cbd3eb813e5192155425bf59ac9a89d4ca36af2e140d854255e1d",
+          "s": "0x1fe9c28326b0ec1527caac714bfce442e018cd471b804ce8ea491fb06ea40d8a",
+          "v": 27,
+          "hex": "0x223efbdc638cbd3eb813e5192155425bf59ac9a89d4ca36af2e140d854255e1d1fe9c28326b0ec1527caac714bfce442e018cd471b804ce8ea491fb06ea40d8a1b"
+        },
+        "exchange_body": {
+          "action": {
+            "type": "approveBuilderFee",
+            "signatureChainId": "0x66eee",
+            "hyperliquidChain": "Testnet",
+            "maxFeeRate": "0.1%",
+            "builder": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+            "nonce": 1793491313000
+          },
+          "nonce": 1793491313000,
+          "signature": {
+            "r": "0x223efbdc638cbd3eb813e5192155425bf59ac9a89d4ca36af2e140d854255e1d",
+            "s": "0x1fe9c28326b0ec1527caac714bfce442e018cd471b804ce8ea491fb06ea40d8a",
+            "v": 27
+          }
+        }
+      }
+    ]
+  },
+  "strings": {
+    "rule": "px: canonical decimal > 0, <= 6 - szDecimals decimals, integer or <= 5 significant figures; sz: canonical decimal > 0, <= szDecimals decimals (zero size is E_SIZE). The contract validates and never rounds.",
+    "px_cases": [
+      {
+        "px": "2400.5",
+        "sz_decimals": 4,
+        "valid": true,
+        "nktkas_format_price": "2400.5"
+      },
+      {
+        "px": "2400.55",
+        "sz_decimals": 4,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "more than 5 significant figures",
+        "nktkas_format_price": "2400.5"
+      },
+      {
+        "px": "2400.555",
+        "sz_decimals": 4,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "more than 2 decimals",
+        "nktkas_format_price": "2400.5"
+      },
+      {
+        "px": "81255",
+        "sz_decimals": 5,
+        "valid": true,
+        "nktkas_format_price": "81255"
+      },
+      {
+        "px": "81255.5",
+        "sz_decimals": 5,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "more than 5 significant figures",
+        "nktkas_format_price": "81255"
+      },
+      {
+        "px": "123456",
+        "sz_decimals": 5,
+        "valid": true,
+        "nktkas_format_price": "123456"
+      },
+      {
+        "px": "123456.7",
+        "sz_decimals": 0,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "more than 5 significant figures",
+        "nktkas_format_price": "123450"
+      },
+      {
+        "px": "103.75",
+        "sz_decimals": 2,
+        "valid": true,
+        "nktkas_format_price": "103.75"
+      },
+      {
+        "px": "103.755",
+        "sz_decimals": 2,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "more than 5 significant figures",
+        "nktkas_format_price": "103.75"
+      },
+      {
+        "px": "0.19876",
+        "sz_decimals": 0,
+        "valid": true,
+        "nktkas_format_price": "0.19876"
+      },
+      {
+        "px": "0.198765",
+        "sz_decimals": 0,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "more than 5 significant figures",
+        "nktkas_format_price": "0.19876"
+      },
+      {
+        "px": "0.012345",
+        "sz_decimals": 0,
+        "valid": true,
+        "nktkas_format_price": "0.012345"
+      },
+      {
+        "px": "0.0012345",
+        "sz_decimals": 0,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "more than 6 decimals",
+        "nktkas_format_price": "0.001234"
+      },
+      {
+        "px": "0.000012",
+        "sz_decimals": 0,
+        "valid": true,
+        "nktkas_format_price": "0.000012"
+      },
+      {
+        "px": "1.2345",
+        "sz_decimals": 1,
+        "valid": true,
+        "nktkas_format_price": "1.2345"
+      },
+      {
+        "px": "1.23456",
+        "sz_decimals": 1,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "more than 5 significant figures",
+        "nktkas_format_price": "1.2345"
+      },
+      {
+        "px": "10000.5",
+        "sz_decimals": 0,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "more than 5 significant figures",
+        "nktkas_format_price": "10000"
+      },
+      {
+        "px": "99999",
+        "sz_decimals": 0,
+        "valid": true,
+        "nktkas_format_price": "99999"
+      },
+      {
+        "px": "1",
+        "sz_decimals": 6,
+        "valid": true,
+        "nktkas_format_price": "1"
+      },
+      {
+        "px": "0.1",
+        "sz_decimals": 6,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "more than 0 decimals",
+        "nktkas_format_price": null
+      },
+      {
+        "px": "2400.50",
+        "sz_decimals": 4,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "not canonical (trailing_zero)",
+        "nktkas_format_price": "2400.5"
+      },
+      {
+        "px": "02400",
+        "sz_decimals": 4,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "not canonical (leading_zero)",
+        "nktkas_format_price": "2400"
+      },
+      {
+        "px": "0",
+        "sz_decimals": 4,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "zero price",
+        "nktkas_format_price": null
+      },
+      {
+        "px": "-1",
+        "sz_decimals": 4,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "not canonical (sign)",
+        "nktkas_format_price": "-1"
+      },
+      {
+        "px": "1e3",
+        "sz_decimals": 4,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "not canonical (invalid_char)",
+        "nktkas_format_price": "1000"
+      }
+    ],
+    "sz_cases": [
+      {
+        "sz": "0.0042",
+        "sz_decimals": 4,
+        "valid": true,
+        "nktkas_format_size": "0.0042"
+      },
+      {
+        "sz": "0.00421",
+        "sz_decimals": 4,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "more than 4 decimals",
+        "nktkas_format_size": "0.0042"
+      },
+      {
+        "sz": "0.00012",
+        "sz_decimals": 5,
+        "valid": true,
+        "nktkas_format_size": "0.00012"
+      },
+      {
+        "sz": "1.5",
+        "sz_decimals": 2,
+        "valid": true,
+        "nktkas_format_size": "1.5"
+      },
+      {
+        "sz": "1.55",
+        "sz_decimals": 2,
+        "valid": true,
+        "nktkas_format_size": "1.55"
+      },
+      {
+        "sz": "1.555",
+        "sz_decimals": 2,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "more than 2 decimals",
+        "nktkas_format_size": "1.55"
+      },
+      {
+        "sz": "100",
+        "sz_decimals": 0,
+        "valid": true,
+        "nktkas_format_size": "100"
+      },
+      {
+        "sz": "100.5",
+        "sz_decimals": 0,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "more than 0 decimals",
+        "nktkas_format_size": "100"
+      },
+      {
+        "sz": "0.1",
+        "sz_decimals": 0,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "more than 0 decimals",
+        "nktkas_format_size": null
+      },
+      {
+        "sz": "0",
+        "sz_decimals": 4,
+        "valid": false,
+        "code": "E_SIZE",
+        "reason": "zero size",
+        "nktkas_format_size": null
+      },
+      {
+        "sz": "0.0",
+        "sz_decimals": 4,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "not canonical (trailing_zero)",
+        "nktkas_format_size": null
+      },
+      {
+        "sz": "1.50",
+        "sz_decimals": 2,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "not canonical (trailing_zero)",
+        "nktkas_format_size": "1.5"
+      },
+      {
+        "sz": ".5",
+        "sz_decimals": 2,
+        "valid": false,
+        "code": "E_DECIMAL",
+        "reason": "not canonical (empty_part)",
+        "nktkas_format_size": "0.5"
+      }
+    ],
+    "format_cases_note": "engine side only: nktkas formatPrice / formatSize round DOWN; the Python SDK examples round half-even instead, so the engine must use one rule (round down is safe for both sides of the book only with a band check)",
+    "format_cases": [
+      {
+        "kind": "px",
+        "input": "2400.56789",
+        "sz_decimals": 4,
+        "output": "2400.5"
+      },
+      {
+        "kind": "px",
+        "input": "97123.456789",
+        "sz_decimals": 0,
+        "output": "97123"
+      },
+      {
+        "kind": "px",
+        "input": "1.23456789",
+        "sz_decimals": 5,
+        "output": "1.2"
+      },
+      {
+        "kind": "px",
+        "input": "0.0000123456",
+        "sz_decimals": 0,
+        "output": "0.000012"
+      },
+      {
+        "kind": "px",
+        "input": "81255.9",
+        "sz_decimals": 5,
+        "output": "81255"
+      },
+      {
+        "kind": "px",
+        "input": "103.759",
+        "sz_decimals": 2,
+        "output": "103.75"
+      },
+      {
+        "kind": "px",
+        "input": "123456.789",
+        "sz_decimals": 1,
+        "output": "123450"
+      },
+      {
+        "kind": "sz",
+        "input": "0.00123456789",
+        "sz_decimals": 5,
+        "output": "0.00123"
+      },
+      {
+        "kind": "sz",
+        "input": "1.23456789",
+        "sz_decimals": 5,
+        "output": "1.23456"
+      },
+      {
+        "kind": "sz",
+        "input": "0.123456789",
+        "sz_decimals": 2,
+        "output": "0.12"
+      },
+      {
+        "kind": "sz",
+        "input": "100.9",
+        "sz_decimals": 0,
+        "output": "100"
+      },
+      {
+        "kind": "sz",
+        "input": "1.5",
+        "sz_decimals": 2,
+        "output": "1.5"
+      }
+    ],
+    "hex_cases": [
+      {
+        "field": "cloid",
+        "input": "0x0123456789abcdef0123456789abcdef",
+        "ok": true,
+        "wire": "0x0123456789abcdef0123456789abcdef"
+      },
+      {
+        "field": "cloid",
+        "input": "0xABCDEF0123456789ABCDEF0123456789",
+        "ok": true,
+        "wire": "0xabcdef0123456789abcdef0123456789",
+        "note": "lowercased before signing; Hyperliquid lowercases before it verifies"
+      },
+      {
+        "field": "cloid",
+        "input": "0x0123",
+        "ok": false,
+        "code": "E_ARGS",
+        "note": "not 16 bytes"
+      },
+      {
+        "field": "cloid",
+        "input": "0123456789abcdef0123456789abcdef",
+        "ok": false,
+        "code": "E_ARGS",
+        "note": "no 0x prefix"
+      },
+      {
+        "field": "cloid",
+        "input": "0X0123456789abcdef0123456789abcdef",
+        "ok": false,
+        "code": "E_ARGS",
+        "note": "prefix must be lowercase 0x"
+      },
+      {
+        "field": "cloid",
+        "input": "0x0123456789abcdef0123456789abcdeg",
+        "ok": false,
+        "code": "E_ARGS",
+        "note": "not hex"
+      },
+      {
+        "field": "cloid",
+        "input": "0x0123456789abcdef0123456789abcdef00",
+        "ok": false,
+        "code": "E_ARGS",
+        "note": "17 bytes"
+      },
+      {
+        "field": "address",
+        "input": "0x5050A4F4b3f9338C3472dcC01A87C76A144b3c9c",
+        "ok": true,
+        "wire": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+        "note": "EIP-55 input is lowercased in every action"
+      },
+      {
+        "field": "address",
+        "input": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c",
+        "ok": true,
+        "wire": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c"
+      },
+      {
+        "field": "address",
+        "input": "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c",
+        "ok": false,
+        "code": "E_ARGS",
+        "note": "19 bytes"
+      }
+    ],
+    "fee_rate_cases_note": "FeeConfig.hl_builder_tenth_bps -> ApproveBuilderFee.maxFeeRate: f / 1000 as a canonical decimal, then \"%\"",
+    "fee_rate_cases": [
+      {
+        "builder_fee_tenth_bps": 1,
+        "max_fee_rate": "0.001%"
+      },
+      {
+        "builder_fee_tenth_bps": 5,
+        "max_fee_rate": "0.005%"
+      },
+      {
+        "builder_fee_tenth_bps": 10,
+        "max_fee_rate": "0.01%"
+      },
+      {
+        "builder_fee_tenth_bps": 25,
+        "max_fee_rate": "0.025%"
+      },
+      {
+        "builder_fee_tenth_bps": 100,
+        "max_fee_rate": "0.1%"
+      }
+    ],
+    "referral_code_cases": [
+      {
+        "code": null,
+        "ok": false,
+        "code_refusal": "E_ARGS",
+        "note": "referral_codes.hyperliquid is None: hl_set_referrer refuses, setup skips it"
+      },
+      {
+        "code": "A",
+        "ok": true
+      },
+      {
+        "code": "TESTCODE",
+        "ok": true
+      },
+      {
+        "code": "ABCDEFGHIJ0123456789",
+        "ok": true
+      },
+      {
+        "code": "",
+        "ok": false,
+        "code_refusal": "E_ARGS",
+        "note": "empty"
+      },
+      {
+        "code": "ABCDEFGHIJ0123456789K",
+        "ok": false,
+        "code_refusal": "E_ARGS",
+        "note": "21 chars"
+      }
+    ]
+  },
+  "order_policy": {
+    "rule": "check order: asset in policy (E_ASSET) -> tif in {Ioc,Gtc,Alo} and cloid 0x+32 hex (E_ARGS) -> px/sz strings (E_DECIMAL; zero size E_SIZE) -> notional px*sz <= cap, unpriced symbols use unpriced_max_notional_usd (E_SIZE) -> unpriced: done, no band -> oracle age <= oracle_max_age_s (E_ORACLE_STALE) -> |px - oracle| * 10000 <= band_bps * oracle (E_PRICE_BAND); edges are inclusive",
+    "policy": {
+      "hl_assets": [
+        {
+          "index": 0,
+          "symbol": "BTC",
+          "sz_decimals": 5
+        },
+        {
+          "index": 1,
+          "symbol": "ETH",
+          "sz_decimals": 4
+        },
+        {
+          "index": 5,
+          "symbol": "SOL",
+          "sz_decimals": 2
+        },
+        {
+          "index": 12,
+          "symbol": "DOGE",
+          "sz_decimals": 0
+        },
+        {
+          "index": 159,
+          "symbol": "HYPE",
+          "sz_decimals": 2
+        }
+      ],
+      "max_notional_usd": 1000,
+      "price_band_bps": 200,
+      "oracle_max_age_s": 300,
+      "unpriced": [
+        "HYPE"
+      ],
+      "unpriced_max_notional_usd": 100
+    },
+    "now_ms": 1793491200000,
+    "oracle_by_symbol": {
+      "ETH": {
+        "price_e8": "250000000000",
+        "at_ms": 1793491190000
+      },
+      "BTC": {
+        "price_e8": "8125000000000",
+        "at_ms": 1793491190000
+      },
+      "SOL": {
+        "price_e8": "10380000000",
+        "at_ms": 1793490899000
+      }
+    },
+    "oracle_note": "keyed by policy symbol for brevity; the contract maps symbols to OutLayer asset ids (C6)",
+    "cases": [
+      {
+        "name": "ETH 0.1 at 2500.5: inside cap and band",
+        "order": {
+          "asset": 1,
+          "is_buy": true,
+          "px": "2500.5",
+          "sz": "0.1",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": true,
+          "unpriced": false
+        }
+      },
+      {
+        "name": "ETH 0.4 at 2500: notional exactly the cap",
+        "order": {
+          "asset": 1,
+          "is_buy": true,
+          "px": "2500",
+          "sz": "0.4",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": true,
+          "unpriced": false
+        }
+      },
+      {
+        "name": "ETH 0.4001 at 2500: notional over the cap",
+        "order": {
+          "asset": 1,
+          "is_buy": true,
+          "px": "2500",
+          "sz": "0.4001",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": false,
+          "code": "E_SIZE"
+        }
+      },
+      {
+        "name": "ETH 0.1 at 2550: exactly +2.00% from oracle (band edge, allowed)",
+        "order": {
+          "asset": 1,
+          "is_buy": true,
+          "px": "2550",
+          "sz": "0.1",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": true,
+          "unpriced": false
+        }
+      },
+      {
+        "name": "ETH 0.1 at 2550.1: just over +2%",
+        "order": {
+          "asset": 1,
+          "is_buy": true,
+          "px": "2550.1",
+          "sz": "0.1",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": false,
+          "code": "E_PRICE_BAND"
+        }
+      },
+      {
+        "name": "ETH 0.1 at 2450: exactly -2.00%",
+        "order": {
+          "asset": 1,
+          "is_buy": false,
+          "px": "2450",
+          "sz": "0.1",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": true,
+          "unpriced": false
+        }
+      },
+      {
+        "name": "ETH 0.1 at 2449.9: just over -2%",
+        "order": {
+          "asset": 1,
+          "is_buy": false,
+          "px": "2449.9",
+          "sz": "0.1",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": false,
+          "code": "E_PRICE_BAND"
+        }
+      },
+      {
+        "name": "ETH size 0",
+        "order": {
+          "asset": 1,
+          "is_buy": true,
+          "px": "2500",
+          "sz": "0",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": false,
+          "code": "E_SIZE"
+        }
+      },
+      {
+        "name": "asset 7 is not in the policy",
+        "order": {
+          "asset": 7,
+          "is_buy": true,
+          "px": "10",
+          "sz": "1",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": false,
+          "code": "E_ASSET"
+        }
+      },
+      {
+        "name": "ETH px with a trailing zero",
+        "order": {
+          "asset": 1,
+          "is_buy": true,
+          "px": "2500.50",
+          "sz": "0.1",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": false,
+          "code": "E_DECIMAL"
+        }
+      },
+      {
+        "name": "ETH px with 3 decimals (szDecimals 4 allows 2)",
+        "order": {
+          "asset": 1,
+          "is_buy": true,
+          "px": "2500.125",
+          "sz": "0.1",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": false,
+          "code": "E_DECIMAL"
+        }
+      },
+      {
+        "name": "ETH sz with 5 decimals (szDecimals 4)",
+        "order": {
+          "asset": 1,
+          "is_buy": true,
+          "px": "2500",
+          "sz": "0.12345",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": false,
+          "code": "E_DECIMAL"
+        }
+      },
+      {
+        "name": "BTC px with 6 significant figures",
+        "order": {
+          "asset": 0,
+          "is_buy": true,
+          "px": "81250.5",
+          "sz": "0.001",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": false,
+          "code": "E_DECIMAL"
+        }
+      },
+      {
+        "name": "BTC 0.01 at 81250: inside cap and band",
+        "order": {
+          "asset": 0,
+          "is_buy": true,
+          "px": "81250",
+          "sz": "0.01",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": true,
+          "unpriced": false
+        }
+      },
+      {
+        "name": "SOL: oracle price 301 s old (max 300)",
+        "order": {
+          "asset": 5,
+          "is_buy": true,
+          "px": "103.8",
+          "sz": "1",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": false,
+          "code": "E_ORACLE_STALE"
+        }
+      },
+      {
+        "name": "DOGE: no oracle price at all",
+        "order": {
+          "asset": 12,
+          "is_buy": true,
+          "px": "0.2",
+          "sz": "100",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": false,
+          "code": "E_ORACLE_STALE"
+        }
+      },
+      {
+        "name": "HYPE (unpriced): no band, notional 99.75 under the unpriced cap",
+        "order": {
+          "asset": 159,
+          "is_buy": true,
+          "px": "39.9",
+          "sz": "2.5",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": true,
+          "unpriced": true
+        }
+      },
+      {
+        "name": "HYPE (unpriced): notional 150 over the unpriced cap 100",
+        "order": {
+          "asset": 159,
+          "is_buy": true,
+          "px": "50",
+          "sz": "3",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": false,
+          "code": "E_SIZE"
+        }
+      },
+      {
+        "name": "tif FrontendMarket is not allowed",
+        "order": {
+          "asset": 1,
+          "is_buy": true,
+          "px": "2500",
+          "sz": "0.1",
+          "reduce_only": false,
+          "tif": "FrontendMarket",
+          "cloid": null
+        },
+        "expect": {
+          "ok": false,
+          "code": "E_ARGS"
+        }
+      },
+      {
+        "name": "tif must be capitalised like Hyperliquid",
+        "order": {
+          "asset": 1,
+          "is_buy": true,
+          "px": "2500",
+          "sz": "0.1",
+          "reduce_only": false,
+          "tif": "ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": false,
+          "code": "E_ARGS"
+        }
+      },
+      {
+        "name": "cloid of 15 bytes",
+        "order": {
+          "asset": 1,
+          "is_buy": true,
+          "px": "2500",
+          "sz": "0.1",
+          "reduce_only": false,
+          "tif": "Ioc",
+          "cloid": "0x0123456789abcdef0123456789abcd"
+        },
+        "expect": {
+          "ok": false,
+          "code": "E_ARGS"
+        }
+      },
+      {
+        "name": "reduce-only sell inside the band",
+        "order": {
+          "asset": 1,
+          "is_buy": false,
+          "px": "2499",
+          "sz": "0.2",
+          "reduce_only": true,
+          "tif": "Ioc",
+          "cloid": null
+        },
+        "expect": {
+          "ok": true,
+          "unpriced": false
+        }
+      }
+    ]
+  }
+}

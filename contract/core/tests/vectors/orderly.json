@@ -1,0 +1,1097 @@
+{
+  "file": "orderly.json",
+  "briefs": "C5 (orderly_register, orderly_add_key, orderly_settle_pnl, orderly_withdraw, orderly_request, orderly_ws_auth), E3/E5 (request headers)",
+  "generator": "gen/orderly.mjs, cross-checked by gen/orderly_check.py",
+  "references": [
+    "viem 2.57.7",
+    "ethers 6.17.0",
+    "noble/curves 1.9.7",
+    "node:crypto (OpenSSL) 3.5.6",
+    "eth-account 0.13.7 + PyNaCl 1.6.2 (orderly_check.py)",
+    "Orderly docs: user-flows/wallet-authentication, withdrawal-deposit, settle-pnl, restful-api/private/* (read 2026-10-27)"
+  ],
+  "keys": {
+    "deskEvm": {
+      "role": "desk EVM address: Hyperliquid master, Orderly account owner, EIP-3009 `from`",
+      "private_key": "0x0101010101010101010101010101010101010101010101010101010101010101",
+      "address": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+      "address_lower": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1"
+    },
+    "deskSol": {
+      "role": "desk Ed25519 key: Solana authority (Phoenix) and the desk's Orderly key",
+      "seed_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+      "public_key_hex": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+      "public_key_b58": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB"
+    },
+    "orderly_key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB"
+  },
+  "key_note": "Public test keys (secp256k1 0x01..01; Ed25519 seed 0x07..07). Never register or fund them on a real venue.",
+  "networks": {
+    "testnet": {
+      "chainId": 421614,
+      "ledger": "0x1826B75e2ef249173FC735149AE4B8e9ea10abff",
+      "brokerId": "woofi_dex",
+      "api": "https://testnet-api.orderly.org"
+    },
+    "mainnet": {
+      "chainId": 42161,
+      "ledger": "0x6F7a338F2aA472838dEFD3283eB360d4Dff5D203",
+      "brokerId": "example_broker",
+      "api": "https://api.orderly.org"
+    }
+  },
+  "network_note": "mainnet brokerId \"example_broker\" stands in for Gimbal's own broker id (OrderlyConfig.broker_id); the testnet broker is woofi_dex",
+  "domains": {
+    "testnet": {
+      "off_chain": {
+        "name": "Orderly",
+        "version": "1",
+        "chainId": 421614,
+        "verifyingContract": "0xCcCCccccCCCCcCCCCCCcCcCccCcCCCcCcccccccC",
+        "separator": "0x0915877eb5b859a694eb5f6b05edde5572a3aefc6714c90d7947f924d2bbe995"
+      },
+      "on_chain": {
+        "name": "Orderly",
+        "version": "1",
+        "chainId": 421614,
+        "verifyingContract": "0x1826B75e2ef249173FC735149AE4B8e9ea10abff",
+        "separator": "0x37af68ff13e8808a16c2ad1cdb1d5fe14fca4f36d12637b62374754c3544d6f4"
+      }
+    },
+    "mainnet": {
+      "off_chain": {
+        "name": "Orderly",
+        "version": "1",
+        "chainId": 42161,
+        "verifyingContract": "0xCcCCccccCCCCcCCCCCCcCcCccCcCCCcCcccccccC",
+        "separator": "0x2c8b7c3b8d1c30ae77ce31aa12b9b2bb7ec63da9fb55fae3fd6f5b841df122a4"
+      },
+      "on_chain": {
+        "name": "Orderly",
+        "version": "1",
+        "chainId": 42161,
+        "verifyingContract": "0x6F7a338F2aA472838dEFD3283eB360d4Dff5D203",
+        "separator": "0x6c98191559c60eb363f98b3e97dac0f7308cdce3c9e367456bd14b013653259b"
+      }
+    }
+  },
+  "types": {
+    "Registration": {
+      "type_string": "Registration(string brokerId,uint256 chainId,uint64 timestamp,uint256 registrationNonce)",
+      "typehash": "0x84daea14814a64084aadc697e84b5a9aa69e80251ac00a9ca075736ae9ff4ec2",
+      "domain": "off_chain",
+      "evidence": "accepted by Orderly testnet (register_account succeeded with this type)"
+    },
+    "AddOrderlyKey": {
+      "type_string": "AddOrderlyKey(string brokerId,uint256 chainId,string orderlyKey,string scope,uint64 timestamp,uint64 expiration)",
+      "typehash": "0xaa38c792ad024dcf05f2c975629d008464086e446b9327c8c0cd9c026c986e0a",
+      "domain": "off_chain",
+      "evidence": "accepted by Orderly testnet (orderly_key succeeded with this type)"
+    },
+    "Withdraw": {
+      "type_string": "Withdraw(string brokerId,uint256 chainId,address receiver,string token,uint256 amount,uint64 withdrawNonce,uint64 timestamp)",
+      "typehash": "0xc10724aa3581b3a6dd4421bc262fc60a90afd9dbfcefc045010f1d7bea8f1216",
+      "domain": "on_chain",
+      "evidence": "signature accepted by Orderly testnet (withdraw_request answered 76 \"Insufficient balance\"; a flipped bit answered 3 \"Signature error\")"
+    },
+    "SettlePnl": {
+      "type_string": "SettlePnl(string brokerId,uint256 chainId,uint64 settleNonce,uint64 timestamp)",
+      "typehash": "0x8f0d3e84e0efdef29e07da8fbd6183594c6d533069c9608b84103c3bfb6361fd",
+      "domain": "on_chain",
+      "evidence": "Orderly docs only; never sent",
+      "verify": "day 5"
+    }
+  },
+  "eip712_rules": "digest = keccak256(0x1901 || domainSeparator || structHash); strings hashed with keccak256, uint fields 32-byte big-endian, address left-padded; the signature Orderly takes is 0x + r || s || v with v = 27/28. JSON messages: chainId, timestamps and nonces are numbers, Withdraw.amount is a string (raw USDC, 6 decimals), registrationNonce is the string the API returned.",
+  "eip712": [
+    {
+      "name": "Registration (testnet)",
+      "network": "testnet",
+      "primary_type": "Registration",
+      "evidence": "accepted by Orderly testnet (register_account succeeded with this type)",
+      "domain": {
+        "name": "Orderly",
+        "version": "1",
+        "chainId": 421614,
+        "verifyingContract": "0xCcCCccccCCCCcCCCCCCcCcCccCcCCCcCcccccccC"
+      },
+      "domain_separator": "0x0915877eb5b859a694eb5f6b05edde5572a3aefc6714c90d7947f924d2bbe995",
+      "type_string": "Registration(string brokerId,uint256 chainId,uint64 timestamp,uint256 registrationNonce)",
+      "typehash": "0x84daea14814a64084aadc697e84b5a9aa69e80251ac00a9ca075736ae9ff4ec2",
+      "message_typed": {
+        "brokerId": "woofi_dex",
+        "chainId": "421614",
+        "timestamp": "1793491200000",
+        "registrationNonce": "123456789012"
+      },
+      "struct_hash": "0x6bf8cdb2c6c824fa1d6639976a64b460f7494f2ae2a5f8c992f83e2952a038cf",
+      "digest": "0xf03d3ae24974e0570f862856a63af66a1996e5319f6f318245e323a3d2a38da3",
+      "signature": {
+        "hex": "0x55408ab10b7c6686f5cd8781a62631e705a44fd4542dfcbaa4523c779aa4d6f11a94430dd03cd2e602c540e196cc25d2aecc2257b983a50877f2f46a521a64ff1c",
+        "r": "0x55408ab10b7c6686f5cd8781a62631e705a44fd4542dfcbaa4523c779aa4d6f1",
+        "s": "0x1a94430dd03cd2e602c540e196cc25d2aecc2257b983a50877f2f46a521a64ff",
+        "v": 28
+      },
+      "post_body": {
+        "message": {
+          "brokerId": "woofi_dex",
+          "chainId": 421614,
+          "timestamp": 1793491200000,
+          "registrationNonce": "123456789012"
+        },
+        "signature": "0x55408ab10b7c6686f5cd8781a62631e705a44fd4542dfcbaa4523c779aa4d6f11a94430dd03cd2e602c540e196cc25d2aecc2257b983a50877f2f46a521a64ff1c",
+        "userAddress": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1"
+      }
+    },
+    {
+      "name": "AddOrderlyKey 30 days (testnet)",
+      "network": "testnet",
+      "primary_type": "AddOrderlyKey",
+      "evidence": "accepted by Orderly testnet (orderly_key succeeded with this type)",
+      "domain": {
+        "name": "Orderly",
+        "version": "1",
+        "chainId": 421614,
+        "verifyingContract": "0xCcCCccccCCCCcCCCCCCcCcCccCcCCCcCcccccccC"
+      },
+      "domain_separator": "0x0915877eb5b859a694eb5f6b05edde5572a3aefc6714c90d7947f924d2bbe995",
+      "type_string": "AddOrderlyKey(string brokerId,uint256 chainId,string orderlyKey,string scope,uint64 timestamp,uint64 expiration)",
+      "typehash": "0xaa38c792ad024dcf05f2c975629d008464086e446b9327c8c0cd9c026c986e0a",
+      "message_typed": {
+        "brokerId": "woofi_dex",
+        "chainId": "421614",
+        "orderlyKey": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "scope": "read,trading",
+        "timestamp": "1793491201000",
+        "expiration": "1796083201000"
+      },
+      "struct_hash": "0x0420ad3955c9cccb154fc6495f191adccb04c3bf5ea91144a72e8492bda229bb",
+      "digest": "0x7d56af6f6ebcd77a2eaf72f5e3371663980027f179514bb3e37c1af7f1992989",
+      "signature": {
+        "hex": "0x29d1f6702382c2d15357a2d267d3eae682d08f9b7290610325f04875366b56aa2a4c42bf75c97419dbcfba4fd2caa67b5ba272c06971b0d3d8d53a65ec7c690c1c",
+        "r": "0x29d1f6702382c2d15357a2d267d3eae682d08f9b7290610325f04875366b56aa",
+        "s": "0x2a4c42bf75c97419dbcfba4fd2caa67b5ba272c06971b0d3d8d53a65ec7c690c",
+        "v": 28
+      },
+      "post_body": {
+        "message": {
+          "brokerId": "woofi_dex",
+          "chainId": 421614,
+          "orderlyKey": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "scope": "read,trading",
+          "timestamp": 1793491201000,
+          "expiration": 1796083201000
+        },
+        "signature": "0x29d1f6702382c2d15357a2d267d3eae682d08f9b7290610325f04875366b56aa2a4c42bf75c97419dbcfba4fd2caa67b5ba272c06971b0d3d8d53a65ec7c690c1c",
+        "userAddress": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1"
+      }
+    },
+    {
+      "name": "AddOrderlyKey 365 days, the maximum (testnet)",
+      "network": "testnet",
+      "primary_type": "AddOrderlyKey",
+      "evidence": "accepted by Orderly testnet (orderly_key succeeded with this type)",
+      "domain": {
+        "name": "Orderly",
+        "version": "1",
+        "chainId": 421614,
+        "verifyingContract": "0xCcCCccccCCCCcCCCCCCcCcCccCcCCCcCcccccccC"
+      },
+      "domain_separator": "0x0915877eb5b859a694eb5f6b05edde5572a3aefc6714c90d7947f924d2bbe995",
+      "type_string": "AddOrderlyKey(string brokerId,uint256 chainId,string orderlyKey,string scope,uint64 timestamp,uint64 expiration)",
+      "typehash": "0xaa38c792ad024dcf05f2c975629d008464086e446b9327c8c0cd9c026c986e0a",
+      "message_typed": {
+        "brokerId": "woofi_dex",
+        "chainId": "421614",
+        "orderlyKey": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "scope": "read,trading",
+        "timestamp": "1793491202000",
+        "expiration": "1825027202000"
+      },
+      "struct_hash": "0x97fa6e56ec92e6bb5848adba08f5bd24866da41b8379a41b933af5164e6c26f3",
+      "digest": "0x9b8c5e64bec97ea6cd1df7e33ca0dfb2186321ba1243aa179cb6a4d2524a79f7",
+      "signature": {
+        "hex": "0xf11b64543846df1c43d2ffcae6b090d7ccc2fad6f1a0d2b9cb795c6d950eabf00dda6a87814568119d0dc13817197c1eb52e63f53fbe5c8599850c2ee02d1cf71c",
+        "r": "0xf11b64543846df1c43d2ffcae6b090d7ccc2fad6f1a0d2b9cb795c6d950eabf0",
+        "s": "0x0dda6a87814568119d0dc13817197c1eb52e63f53fbe5c8599850c2ee02d1cf7",
+        "v": 28
+      },
+      "post_body": {
+        "message": {
+          "brokerId": "woofi_dex",
+          "chainId": 421614,
+          "orderlyKey": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "scope": "read,trading",
+          "timestamp": 1793491202000,
+          "expiration": 1825027202000
+        },
+        "signature": "0xf11b64543846df1c43d2ffcae6b090d7ccc2fad6f1a0d2b9cb795c6d950eabf00dda6a87814568119d0dc13817197c1eb52e63f53fbe5c8599850c2ee02d1cf71c",
+        "userAddress": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1"
+      }
+    },
+    {
+      "name": "Withdraw 5 USDC to the desk address (testnet)",
+      "network": "testnet",
+      "primary_type": "Withdraw",
+      "evidence": "signature accepted by Orderly testnet (withdraw_request answered 76 \"Insufficient balance\"; a flipped bit answered 3 \"Signature error\")",
+      "domain": {
+        "name": "Orderly",
+        "version": "1",
+        "chainId": 421614,
+        "verifyingContract": "0x1826B75e2ef249173FC735149AE4B8e9ea10abff"
+      },
+      "domain_separator": "0x37af68ff13e8808a16c2ad1cdb1d5fe14fca4f36d12637b62374754c3544d6f4",
+      "type_string": "Withdraw(string brokerId,uint256 chainId,address receiver,string token,uint256 amount,uint64 withdrawNonce,uint64 timestamp)",
+      "typehash": "0xc10724aa3581b3a6dd4421bc262fc60a90afd9dbfcefc045010f1d7bea8f1216",
+      "message_typed": {
+        "brokerId": "woofi_dex",
+        "chainId": "421614",
+        "receiver": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+        "token": "USDC",
+        "amount": "5000000",
+        "withdrawNonce": "1",
+        "timestamp": "1793491203000"
+      },
+      "struct_hash": "0x432178221f34133f19eced01506dd355892056e021f9094bc6f4d69e8ce8e6b2",
+      "digest": "0xdcfe1a0944ae80b9c3cc3027868dacde362a06f0bd6e94123efa77712b0acdc1",
+      "signature": {
+        "hex": "0x566de9a35029d06394b59c7fdeed4e7d39678784075b2114cccc399eccbca5182c866eb4b6bc8b40fa4e1b29962ad04cd4fe3c33a826d83628809b03b3ab82221c",
+        "r": "0x566de9a35029d06394b59c7fdeed4e7d39678784075b2114cccc399eccbca518",
+        "s": "0x2c866eb4b6bc8b40fa4e1b29962ad04cd4fe3c33a826d83628809b03b3ab8222",
+        "v": 28
+      },
+      "post_body": {
+        "message": {
+          "brokerId": "woofi_dex",
+          "chainId": 421614,
+          "receiver": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+          "token": "USDC",
+          "amount": "5000000",
+          "withdrawNonce": 1,
+          "timestamp": 1793491203000
+        },
+        "signature": "0x566de9a35029d06394b59c7fdeed4e7d39678784075b2114cccc399eccbca5182c866eb4b6bc8b40fa4e1b29962ad04cd4fe3c33a826d83628809b03b3ab82221c",
+        "userAddress": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+        "verifyingContract": "0x1826B75e2ef249173FC735149AE4B8e9ea10abff"
+      }
+    },
+    {
+      "name": "Withdraw 1234.56789 USDC, nonce 42 (testnet)",
+      "network": "testnet",
+      "primary_type": "Withdraw",
+      "evidence": "signature accepted by Orderly testnet (withdraw_request answered 76 \"Insufficient balance\"; a flipped bit answered 3 \"Signature error\")",
+      "domain": {
+        "name": "Orderly",
+        "version": "1",
+        "chainId": 421614,
+        "verifyingContract": "0x1826B75e2ef249173FC735149AE4B8e9ea10abff"
+      },
+      "domain_separator": "0x37af68ff13e8808a16c2ad1cdb1d5fe14fca4f36d12637b62374754c3544d6f4",
+      "type_string": "Withdraw(string brokerId,uint256 chainId,address receiver,string token,uint256 amount,uint64 withdrawNonce,uint64 timestamp)",
+      "typehash": "0xc10724aa3581b3a6dd4421bc262fc60a90afd9dbfcefc045010f1d7bea8f1216",
+      "message_typed": {
+        "brokerId": "woofi_dex",
+        "chainId": "421614",
+        "receiver": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+        "token": "USDC",
+        "amount": "1234567890",
+        "withdrawNonce": "42",
+        "timestamp": "1793491204000"
+      },
+      "struct_hash": "0xf83a0553c15ddca4b4d790cfee28e44c7efb8598cbcc0e86d59505a510eaff60",
+      "digest": "0x0db1de3e2854dd7d76281de5e34abc10b6860158642cecf0d341adf618a4cfff",
+      "signature": {
+        "hex": "0xe2ac73503e9914b47176b0c29581ae314e670f046b77178f10d1fe424010c6f720d2f6b5b79f7611e99911b612aefd51149a198618f8161cc0c25defda435c601b",
+        "r": "0xe2ac73503e9914b47176b0c29581ae314e670f046b77178f10d1fe424010c6f7",
+        "s": "0x20d2f6b5b79f7611e99911b612aefd51149a198618f8161cc0c25defda435c60",
+        "v": 27
+      },
+      "post_body": {
+        "message": {
+          "brokerId": "woofi_dex",
+          "chainId": 421614,
+          "receiver": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+          "token": "USDC",
+          "amount": "1234567890",
+          "withdrawNonce": 42,
+          "timestamp": 1793491204000
+        },
+        "signature": "0xe2ac73503e9914b47176b0c29581ae314e670f046b77178f10d1fe424010c6f720d2f6b5b79f7611e99911b612aefd51149a198618f8161cc0c25defda435c601b",
+        "userAddress": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+        "verifyingContract": "0x1826B75e2ef249173FC735149AE4B8e9ea10abff"
+      }
+    },
+    {
+      "name": "SettlePnl nonce 1 (testnet)",
+      "network": "testnet",
+      "primary_type": "SettlePnl",
+      "evidence": "Orderly docs only; never sent",
+      "verify": "day 5",
+      "domain": {
+        "name": "Orderly",
+        "version": "1",
+        "chainId": 421614,
+        "verifyingContract": "0x1826B75e2ef249173FC735149AE4B8e9ea10abff"
+      },
+      "domain_separator": "0x37af68ff13e8808a16c2ad1cdb1d5fe14fca4f36d12637b62374754c3544d6f4",
+      "type_string": "SettlePnl(string brokerId,uint256 chainId,uint64 settleNonce,uint64 timestamp)",
+      "typehash": "0x8f0d3e84e0efdef29e07da8fbd6183594c6d533069c9608b84103c3bfb6361fd",
+      "message_typed": {
+        "brokerId": "woofi_dex",
+        "chainId": "421614",
+        "settleNonce": "1",
+        "timestamp": "1793491205000"
+      },
+      "struct_hash": "0x59a340887ae3bb05c6763451d6d37c7ce3ed4c380d235e97e54eb4278e8483c6",
+      "digest": "0x2c74e2005f4d2fc9d74de94c49f72055620601d363d9620c821cd217c09988bd",
+      "signature": {
+        "hex": "0x0057ad808089b4ae4068ae3d2e2039b8ade32cb84365780170a75fed8e4701d26c1e1967d0d318ef791cbed9e2c06d22bec290313bf1f1640ed32c33621d9bbf1c",
+        "r": "0x0057ad808089b4ae4068ae3d2e2039b8ade32cb84365780170a75fed8e4701d2",
+        "s": "0x6c1e1967d0d318ef791cbed9e2c06d22bec290313bf1f1640ed32c33621d9bbf",
+        "v": 28
+      },
+      "post_body": {
+        "message": {
+          "brokerId": "woofi_dex",
+          "chainId": 421614,
+          "settleNonce": 1,
+          "timestamp": 1793491205000
+        },
+        "signature": "0x0057ad808089b4ae4068ae3d2e2039b8ade32cb84365780170a75fed8e4701d26c1e1967d0d318ef791cbed9e2c06d22bec290313bf1f1640ed32c33621d9bbf1c",
+        "userAddress": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+        "verifyingContract": "0x1826B75e2ef249173FC735149AE4B8e9ea10abff"
+      }
+    },
+    {
+      "name": "Registration (mainnet)",
+      "network": "mainnet",
+      "primary_type": "Registration",
+      "evidence": "accepted by Orderly testnet (register_account succeeded with this type)",
+      "domain": {
+        "name": "Orderly",
+        "version": "1",
+        "chainId": 42161,
+        "verifyingContract": "0xCcCCccccCCCCcCCCCCCcCcCccCcCCCcCcccccccC"
+      },
+      "domain_separator": "0x2c8b7c3b8d1c30ae77ce31aa12b9b2bb7ec63da9fb55fae3fd6f5b841df122a4",
+      "type_string": "Registration(string brokerId,uint256 chainId,uint64 timestamp,uint256 registrationNonce)",
+      "typehash": "0x84daea14814a64084aadc697e84b5a9aa69e80251ac00a9ca075736ae9ff4ec2",
+      "message_typed": {
+        "brokerId": "example_broker",
+        "chainId": "42161",
+        "timestamp": "1793491200000",
+        "registrationNonce": "123456789012"
+      },
+      "struct_hash": "0xb1ed73ebd15ab44d9c7f3717bc242211ec1d5e17726714a799601d146d8d2660",
+      "digest": "0x9c492cc6a515b9e77b3e01cff42b06bf7ef0d746333272e7a781e16babfd723b",
+      "signature": {
+        "hex": "0x92c42056f268e9f89eb7d69a6ed8536ec0a3109ef0f8741bf876c419ea11834f249d25272f4e3f52e7862963345b0970596b99c283329db75e20d7e6384d620f1c",
+        "r": "0x92c42056f268e9f89eb7d69a6ed8536ec0a3109ef0f8741bf876c419ea11834f",
+        "s": "0x249d25272f4e3f52e7862963345b0970596b99c283329db75e20d7e6384d620f",
+        "v": 28
+      },
+      "post_body": {
+        "message": {
+          "brokerId": "example_broker",
+          "chainId": 42161,
+          "timestamp": 1793491200000,
+          "registrationNonce": "123456789012"
+        },
+        "signature": "0x92c42056f268e9f89eb7d69a6ed8536ec0a3109ef0f8741bf876c419ea11834f249d25272f4e3f52e7862963345b0970596b99c283329db75e20d7e6384d620f1c",
+        "userAddress": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1"
+      }
+    },
+    {
+      "name": "AddOrderlyKey 30 days (mainnet)",
+      "network": "mainnet",
+      "primary_type": "AddOrderlyKey",
+      "evidence": "accepted by Orderly testnet (orderly_key succeeded with this type)",
+      "domain": {
+        "name": "Orderly",
+        "version": "1",
+        "chainId": 42161,
+        "verifyingContract": "0xCcCCccccCCCCcCCCCCCcCcCccCcCCCcCcccccccC"
+      },
+      "domain_separator": "0x2c8b7c3b8d1c30ae77ce31aa12b9b2bb7ec63da9fb55fae3fd6f5b841df122a4",
+      "type_string": "AddOrderlyKey(string brokerId,uint256 chainId,string orderlyKey,string scope,uint64 timestamp,uint64 expiration)",
+      "typehash": "0xaa38c792ad024dcf05f2c975629d008464086e446b9327c8c0cd9c026c986e0a",
+      "message_typed": {
+        "brokerId": "example_broker",
+        "chainId": "42161",
+        "orderlyKey": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "scope": "read,trading",
+        "timestamp": "1793491201000",
+        "expiration": "1796083201000"
+      },
+      "struct_hash": "0xb74ba71efd59d60aeae8a945e07c4aef78d499f6cdaedd899ec8aff8990e8310",
+      "digest": "0x4df7ee1e1360fec51e5d6464085dcbfed6205fe8e3564553aeb437159beb75d0",
+      "signature": {
+        "hex": "0x79f38ecbbce27b499100425d1b65ac667d286dd22b451501cd1f01406d96679f697add2b9e138103c5a16ce36c077cd6b5de3a859bcd3466dd24c4ec02c8dd0b1b",
+        "r": "0x79f38ecbbce27b499100425d1b65ac667d286dd22b451501cd1f01406d96679f",
+        "s": "0x697add2b9e138103c5a16ce36c077cd6b5de3a859bcd3466dd24c4ec02c8dd0b",
+        "v": 27
+      },
+      "post_body": {
+        "message": {
+          "brokerId": "example_broker",
+          "chainId": 42161,
+          "orderlyKey": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "scope": "read,trading",
+          "timestamp": 1793491201000,
+          "expiration": 1796083201000
+        },
+        "signature": "0x79f38ecbbce27b499100425d1b65ac667d286dd22b451501cd1f01406d96679f697add2b9e138103c5a16ce36c077cd6b5de3a859bcd3466dd24c4ec02c8dd0b1b",
+        "userAddress": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1"
+      }
+    },
+    {
+      "name": "AddOrderlyKey 365 days, the maximum (mainnet)",
+      "network": "mainnet",
+      "primary_type": "AddOrderlyKey",
+      "evidence": "accepted by Orderly testnet (orderly_key succeeded with this type)",
+      "domain": {
+        "name": "Orderly",
+        "version": "1",
+        "chainId": 42161,
+        "verifyingContract": "0xCcCCccccCCCCcCCCCCCcCcCccCcCCCcCcccccccC"
+      },
+      "domain_separator": "0x2c8b7c3b8d1c30ae77ce31aa12b9b2bb7ec63da9fb55fae3fd6f5b841df122a4",
+      "type_string": "AddOrderlyKey(string brokerId,uint256 chainId,string orderlyKey,string scope,uint64 timestamp,uint64 expiration)",
+      "typehash": "0xaa38c792ad024dcf05f2c975629d008464086e446b9327c8c0cd9c026c986e0a",
+      "message_typed": {
+        "brokerId": "example_broker",
+        "chainId": "42161",
+        "orderlyKey": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "scope": "read,trading",
+        "timestamp": "1793491202000",
+        "expiration": "1825027202000"
+      },
+      "struct_hash": "0xb230d59a25429b13f39ace7fc026d66270939a823ec08efa80e8ed0f4a9fb95e",
+      "digest": "0xb14e45c04c05ef0bd4fbd37f2c73d469b9b1de0303fb2888887bfca92c39861c",
+      "signature": {
+        "hex": "0x697bb2fb89f12bc554fc3222bd04f0cfdf87527c74a6678054f986bb262884e476978018cc9d2b3f6a7b34217bf9b566bc141bbb2681963f88d1413bbb7d70761b",
+        "r": "0x697bb2fb89f12bc554fc3222bd04f0cfdf87527c74a6678054f986bb262884e4",
+        "s": "0x76978018cc9d2b3f6a7b34217bf9b566bc141bbb2681963f88d1413bbb7d7076",
+        "v": 27
+      },
+      "post_body": {
+        "message": {
+          "brokerId": "example_broker",
+          "chainId": 42161,
+          "orderlyKey": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "scope": "read,trading",
+          "timestamp": 1793491202000,
+          "expiration": 1825027202000
+        },
+        "signature": "0x697bb2fb89f12bc554fc3222bd04f0cfdf87527c74a6678054f986bb262884e476978018cc9d2b3f6a7b34217bf9b566bc141bbb2681963f88d1413bbb7d70761b",
+        "userAddress": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1"
+      }
+    },
+    {
+      "name": "Withdraw 5 USDC to the desk address (mainnet)",
+      "network": "mainnet",
+      "primary_type": "Withdraw",
+      "evidence": "signature accepted by Orderly testnet (withdraw_request answered 76 \"Insufficient balance\"; a flipped bit answered 3 \"Signature error\")",
+      "domain": {
+        "name": "Orderly",
+        "version": "1",
+        "chainId": 42161,
+        "verifyingContract": "0x6F7a338F2aA472838dEFD3283eB360d4Dff5D203"
+      },
+      "domain_separator": "0x6c98191559c60eb363f98b3e97dac0f7308cdce3c9e367456bd14b013653259b",
+      "type_string": "Withdraw(string brokerId,uint256 chainId,address receiver,string token,uint256 amount,uint64 withdrawNonce,uint64 timestamp)",
+      "typehash": "0xc10724aa3581b3a6dd4421bc262fc60a90afd9dbfcefc045010f1d7bea8f1216",
+      "message_typed": {
+        "brokerId": "example_broker",
+        "chainId": "42161",
+        "receiver": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+        "token": "USDC",
+        "amount": "5000000",
+        "withdrawNonce": "1",
+        "timestamp": "1793491203000"
+      },
+      "struct_hash": "0xc04ca59274500e74a19937fca8b281952c4e7ff2639b0badc14ac4bdb3cb6a4e",
+      "digest": "0xf19eeb89429a2034ede8e6c30f2163ccaa2144825a9f460acde265fce1126d64",
+      "signature": {
+        "hex": "0x20cf55c2b39f899804c6fcd23a906ec434f231a14b06d09126ee0fd7d49629fd28a376c712f8714446005fb33c4df2783bf44b50ddba1867dc169c53ff29279a1b",
+        "r": "0x20cf55c2b39f899804c6fcd23a906ec434f231a14b06d09126ee0fd7d49629fd",
+        "s": "0x28a376c712f8714446005fb33c4df2783bf44b50ddba1867dc169c53ff29279a",
+        "v": 27
+      },
+      "post_body": {
+        "message": {
+          "brokerId": "example_broker",
+          "chainId": 42161,
+          "receiver": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+          "token": "USDC",
+          "amount": "5000000",
+          "withdrawNonce": 1,
+          "timestamp": 1793491203000
+        },
+        "signature": "0x20cf55c2b39f899804c6fcd23a906ec434f231a14b06d09126ee0fd7d49629fd28a376c712f8714446005fb33c4df2783bf44b50ddba1867dc169c53ff29279a1b",
+        "userAddress": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+        "verifyingContract": "0x6F7a338F2aA472838dEFD3283eB360d4Dff5D203"
+      }
+    },
+    {
+      "name": "Withdraw 1234.56789 USDC, nonce 42 (mainnet)",
+      "network": "mainnet",
+      "primary_type": "Withdraw",
+      "evidence": "signature accepted by Orderly testnet (withdraw_request answered 76 \"Insufficient balance\"; a flipped bit answered 3 \"Signature error\")",
+      "domain": {
+        "name": "Orderly",
+        "version": "1",
+        "chainId": 42161,
+        "verifyingContract": "0x6F7a338F2aA472838dEFD3283eB360d4Dff5D203"
+      },
+      "domain_separator": "0x6c98191559c60eb363f98b3e97dac0f7308cdce3c9e367456bd14b013653259b",
+      "type_string": "Withdraw(string brokerId,uint256 chainId,address receiver,string token,uint256 amount,uint64 withdrawNonce,uint64 timestamp)",
+      "typehash": "0xc10724aa3581b3a6dd4421bc262fc60a90afd9dbfcefc045010f1d7bea8f1216",
+      "message_typed": {
+        "brokerId": "example_broker",
+        "chainId": "42161",
+        "receiver": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+        "token": "USDC",
+        "amount": "1234567890",
+        "withdrawNonce": "42",
+        "timestamp": "1793491204000"
+      },
+      "struct_hash": "0x1e515d9fa87339468dfecf000462b3b3c60c889cce462ae439f643a4c14a9b32",
+      "digest": "0x49ef20fdaaf8402353fcbfdb698ba5cc4daa7aa7a84d5f9d87c5091e34bdd2d0",
+      "signature": {
+        "hex": "0x6c8775a493df2c42ede7c63c6040008b158c7fb27515a469cdd651319b5569e74c536e5cc4ead6e59b30aaf10b49a9da852dafb77983f03a92d368fe7308ed041b",
+        "r": "0x6c8775a493df2c42ede7c63c6040008b158c7fb27515a469cdd651319b5569e7",
+        "s": "0x4c536e5cc4ead6e59b30aaf10b49a9da852dafb77983f03a92d368fe7308ed04",
+        "v": 27
+      },
+      "post_body": {
+        "message": {
+          "brokerId": "example_broker",
+          "chainId": 42161,
+          "receiver": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+          "token": "USDC",
+          "amount": "1234567890",
+          "withdrawNonce": 42,
+          "timestamp": 1793491204000
+        },
+        "signature": "0x6c8775a493df2c42ede7c63c6040008b158c7fb27515a469cdd651319b5569e74c536e5cc4ead6e59b30aaf10b49a9da852dafb77983f03a92d368fe7308ed041b",
+        "userAddress": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+        "verifyingContract": "0x6F7a338F2aA472838dEFD3283eB360d4Dff5D203"
+      }
+    },
+    {
+      "name": "SettlePnl nonce 1 (mainnet)",
+      "network": "mainnet",
+      "primary_type": "SettlePnl",
+      "evidence": "Orderly docs only; never sent",
+      "verify": "day 5",
+      "domain": {
+        "name": "Orderly",
+        "version": "1",
+        "chainId": 42161,
+        "verifyingContract": "0x6F7a338F2aA472838dEFD3283eB360d4Dff5D203"
+      },
+      "domain_separator": "0x6c98191559c60eb363f98b3e97dac0f7308cdce3c9e367456bd14b013653259b",
+      "type_string": "SettlePnl(string brokerId,uint256 chainId,uint64 settleNonce,uint64 timestamp)",
+      "typehash": "0x8f0d3e84e0efdef29e07da8fbd6183594c6d533069c9608b84103c3bfb6361fd",
+      "message_typed": {
+        "brokerId": "example_broker",
+        "chainId": "42161",
+        "settleNonce": "1",
+        "timestamp": "1793491205000"
+      },
+      "struct_hash": "0x9d56802bd8e35828dc16668a6d150befd5f3b8dcab8a4b906e4acea95a4f6a0a",
+      "digest": "0xac0a2ff03b352447eb25c24d4ba0b2dab857b7c6f912ab9cabcad906d409fd53",
+      "signature": {
+        "hex": "0x6f6fe6cffc970a704e53e85b15d028720960faae7c8917319eb9d8e38d26631c465a360f2ec5fe7cde627db7999b8f4c649ee123401d11a4ba143b85de4311911b",
+        "r": "0x6f6fe6cffc970a704e53e85b15d028720960faae7c8917319eb9d8e38d26631c",
+        "s": "0x465a360f2ec5fe7cde627db7999b8f4c649ee123401d11a4ba143b85de431191",
+        "v": 27
+      },
+      "post_body": {
+        "message": {
+          "brokerId": "example_broker",
+          "chainId": 42161,
+          "settleNonce": 1,
+          "timestamp": 1793491205000
+        },
+        "signature": "0x6f6fe6cffc970a704e53e85b15d028720960faae7c8917319eb9d8e38d26631c465a360f2ec5fe7cde627db7999b8f4c649ee123401d11a4ba143b85de4311911b",
+        "userAddress": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+        "verifyingContract": "0x6F7a338F2aA472838dEFD3283eB360d4Dff5D203"
+      }
+    }
+  ],
+  "account_id_rule": "keccak256(abi.encode(address user, keccak256(utf8(brokerId))))",
+  "account_ids": [
+    {
+      "user_address": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+      "broker_id": "woofi_dex",
+      "broker_hash": "0x083098c593f395bea1de45dda552d9f14e8fcb0be3faaa7a1903c5477d7ba7fd",
+      "account_id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313"
+    },
+    {
+      "user_address": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+      "broker_id": "example_broker",
+      "broker_hash": "0x27be1e595d9c151fedccdb2aef0533e85b007034894958c186e9c2a1c37cb5e5",
+      "account_id": "0x07e60f45224a7814f23fa78d34da6e52bfbfdd8d827aa62bd1bd094fc61b33d3"
+    }
+  ],
+  "request_rules": {
+    "message": "timestamp (ms, decimal) + METHOD + path including the query string + body (\"\" for GET and DELETE)",
+    "signature": "Ed25519 over the UTF-8 bytes of the message; header orderly-signature = base64url without padding",
+    "body": "contract-built JSON, no spaces; order keys: symbol, client_order_id (if set), order_type, order_price (not for MARKET), order_quantity, side, reduce_only (only when true); prices and quantities are the canonical decimal digits written as bare JSON numbers",
+    "validity": "Orderly accepts a request for 300 s after its timestamp"
+  },
+  "requests": [
+    {
+      "name": "order LIMIT BUY with client_order_id",
+      "network": "testnet",
+      "kind": "order",
+      "method": "POST",
+      "path": "/v1/order",
+      "body": "{\"symbol\":\"PERP_ETH_USDC\",\"client_order_id\":\"gimbal-alpha-1\",\"order_type\":\"LIMIT\",\"order_price\":1212.89,\"order_quantity\":0.0087,\"side\":\"BUY\"}",
+      "timestamp": 1793491211000,
+      "message": "1793491211000POST/v1/order{\"symbol\":\"PERP_ETH_USDC\",\"client_order_id\":\"gimbal-alpha-1\",\"order_type\":\"LIMIT\",\"order_price\":1212.89,\"order_quantity\":0.0087,\"side\":\"BUY\"}",
+      "signature_hex": "88e1675ebf706188ba18ebe3ca018055d7ad8733e5c22ae06f3170eb18c60177e4bf01027b73630855c1ffc0a68b1422169cb3f504cc68f7bb636de8807eb30f",
+      "signature_b64url": "iOFnXr9wYYi6GOvjygGAVdethzPlwirgbzFw6xjGAXfkvwECe3NjCFXB_8CmixQiFpyz9QTMaPe7Y23ogH6zDw",
+      "headers": {
+        "Content-Type": "application/json",
+        "orderly-timestamp": "1793491211000",
+        "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "iOFnXr9wYYi6GOvjygGAVdethzPlwirgbzFw6xjGAXfkvwECe3NjCFXB_8CmixQiFpyz9QTMaPe7Y23ogH6zDw"
+      },
+      "url": "https://testnet-api.orderly.org/v1/order",
+      "request": {
+        "kind": "order",
+        "symbol": "PERP_ETH_USDC",
+        "side": "BUY",
+        "order_type": "LIMIT",
+        "price": "1212.89",
+        "quantity": "0.0087",
+        "reduce_only": false,
+        "client_order_id": "gimbal-alpha-1"
+      }
+    },
+    {
+      "name": "order IOC SELL reduce-only",
+      "network": "testnet",
+      "kind": "order",
+      "method": "POST",
+      "path": "/v1/order",
+      "body": "{\"symbol\":\"PERP_SOL_USDC\",\"client_order_id\":\"gimbal-alpha-2\",\"order_type\":\"IOC\",\"order_price\":103.8,\"order_quantity\":1.5,\"side\":\"SELL\",\"reduce_only\":true}",
+      "timestamp": 1793491212000,
+      "message": "1793491212000POST/v1/order{\"symbol\":\"PERP_SOL_USDC\",\"client_order_id\":\"gimbal-alpha-2\",\"order_type\":\"IOC\",\"order_price\":103.8,\"order_quantity\":1.5,\"side\":\"SELL\",\"reduce_only\":true}",
+      "signature_hex": "c24be47b08246a492e4efad37f5cec6b35a8ea5078fa52070b7ea47e619ed682c242ca45471ad6cb371d9df3a11d65f3612fd92fd94d301d06161011e5155205",
+      "signature_b64url": "wkvkewgkakkuTvrTf1zsazWo6lB4-lIHC36kfmGe1oLCQspFRxrWyzcdnfOhHWXzYS_ZL9lNMB0GFhAR5RVSBQ",
+      "headers": {
+        "Content-Type": "application/json",
+        "orderly-timestamp": "1793491212000",
+        "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "wkvkewgkakkuTvrTf1zsazWo6lB4-lIHC36kfmGe1oLCQspFRxrWyzcdnfOhHWXzYS_ZL9lNMB0GFhAR5RVSBQ"
+      },
+      "url": "https://testnet-api.orderly.org/v1/order",
+      "request": {
+        "kind": "order",
+        "symbol": "PERP_SOL_USDC",
+        "side": "SELL",
+        "order_type": "IOC",
+        "price": "103.8",
+        "quantity": "1.5",
+        "reduce_only": true,
+        "client_order_id": "gimbal-alpha-2"
+      }
+    },
+    {
+      "name": "order MARKET BUY (no order_price)",
+      "network": "testnet",
+      "kind": "order",
+      "method": "POST",
+      "path": "/v1/order",
+      "body": "{\"symbol\":\"PERP_BTC_USDC\",\"client_order_id\":\"gimbal-alpha-3\",\"order_type\":\"MARKET\",\"order_quantity\":0.0002,\"side\":\"BUY\"}",
+      "timestamp": 1793491213000,
+      "message": "1793491213000POST/v1/order{\"symbol\":\"PERP_BTC_USDC\",\"client_order_id\":\"gimbal-alpha-3\",\"order_type\":\"MARKET\",\"order_quantity\":0.0002,\"side\":\"BUY\"}",
+      "signature_hex": "92f1f97495c8bb86517763595f4ebf5afb5ce858a767b824d1373f71f9c34de47f66ac1205638ae48ed8b6f1ce6e0f5dcddba2c14d570884892c771ef092b504",
+      "signature_b64url": "kvH5dJXIu4ZRd2NZX06_Wvtc6FinZ7gk0Tc_cfnDTeR_ZqwSBWOK5I7YtvHObg9dzduiwU1XCISJLHce8JK1BA",
+      "headers": {
+        "Content-Type": "application/json",
+        "orderly-timestamp": "1793491213000",
+        "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "kvH5dJXIu4ZRd2NZX06_Wvtc6FinZ7gk0Tc_cfnDTeR_ZqwSBWOK5I7YtvHObg9dzduiwU1XCISJLHce8JK1BA"
+      },
+      "url": "https://testnet-api.orderly.org/v1/order",
+      "request": {
+        "kind": "order",
+        "symbol": "PERP_BTC_USDC",
+        "side": "BUY",
+        "order_type": "MARKET",
+        "price": null,
+        "quantity": "0.0002",
+        "reduce_only": false,
+        "client_order_id": "gimbal-alpha-3"
+      }
+    },
+    {
+      "name": "order with a quantity JavaScript would print as 1e-7",
+      "network": "testnet",
+      "kind": "order",
+      "method": "POST",
+      "path": "/v1/order",
+      "body": "{\"symbol\":\"PERP_ETH_USDC\",\"client_order_id\":\"gimbal-alpha-4\",\"order_type\":\"LIMIT\",\"order_price\":81255,\"order_quantity\":0.0000001,\"side\":\"BUY\"}",
+      "timestamp": 1793491214000,
+      "message": "1793491214000POST/v1/order{\"symbol\":\"PERP_ETH_USDC\",\"client_order_id\":\"gimbal-alpha-4\",\"order_type\":\"LIMIT\",\"order_price\":81255,\"order_quantity\":0.0000001,\"side\":\"BUY\"}",
+      "signature_hex": "929d92309dca0a9bceda2de7df44b47066cedeab52920fa357bc96fb13cc6948cc88e5fc4cc9c3b4e592a66de3972499fd8fd938c5690aa7dc60c707ea0c2205",
+      "signature_b64url": "kp2SMJ3KCpvO2i3n30S0cGbO3qtSkg-jV7yW-xPMaUjMiOX8TMnDtOWSpm3jlySZ_Y_ZOMVpCqfcYMcH6gwiBQ",
+      "headers": {
+        "Content-Type": "application/json",
+        "orderly-timestamp": "1793491214000",
+        "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "kp2SMJ3KCpvO2i3n30S0cGbO3qtSkg-jV7yW-xPMaUjMiOX8TMnDtOWSpm3jlySZ_Y_ZOMVpCqfcYMcH6gwiBQ"
+      },
+      "url": "https://testnet-api.orderly.org/v1/order",
+      "request": {
+        "kind": "order",
+        "symbol": "PERP_ETH_USDC",
+        "side": "BUY",
+        "order_type": "LIMIT",
+        "price": "81255",
+        "quantity": "0.0000001",
+        "reduce_only": false,
+        "client_order_id": "gimbal-alpha-4"
+      },
+      "note": "the body carries the canonical digits 0.0000001, not JSON.stringify(1e-7) = \"1e-7\"; Orderly will refuse the size, the vector is about the bytes"
+    },
+    {
+      "name": "cancel one order (query string is signed)",
+      "network": "testnet",
+      "kind": "cancel",
+      "method": "DELETE",
+      "path": "/v1/order?order_id=123456&symbol=PERP_ETH_USDC",
+      "body": "",
+      "timestamp": 1793491215000,
+      "message": "1793491215000DELETE/v1/order?order_id=123456&symbol=PERP_ETH_USDC",
+      "signature_hex": "0980de119f48bfd3f91321cb17f873ceff11925d3697bb84e855d2f661f973469aac9fb94c81be3d0fb651a87c212934b884ba506ad81d05760e5342f101780c",
+      "signature_b64url": "CYDeEZ9Iv9P5EyHLF_hzzv8Rkl02l7uE6FXS9mH5c0aarJ-5TIG-PQ-2Uah8ISk0uIS6UGrYHQV2DlNC8QF4DA",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "orderly-timestamp": "1793491215000",
+        "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "CYDeEZ9Iv9P5EyHLF_hzzv8Rkl02l7uE6FXS9mH5c0aarJ-5TIG-PQ-2Uah8ISk0uIS6UGrYHQV2DlNC8QF4DA"
+      },
+      "url": "https://testnet-api.orderly.org/v1/order?order_id=123456&symbol=PERP_ETH_USDC",
+      "request": {
+        "kind": "cancel",
+        "symbol": "PERP_ETH_USDC",
+        "order_id": 123456
+      }
+    },
+    {
+      "name": "cancel all orders of a symbol",
+      "network": "testnet",
+      "kind": "cancel_all",
+      "method": "DELETE",
+      "path": "/v1/orders?symbol=PERP_ETH_USDC",
+      "body": "",
+      "timestamp": 1793491216000,
+      "message": "1793491216000DELETE/v1/orders?symbol=PERP_ETH_USDC",
+      "signature_hex": "839a2adb172baa6597eb1f033bffc0bf9b13af6e8409f0102faab9e023c4b3212d8e183c2d6844f8e1cf56fff2c17a126b9fc416b392383e5d47f42c246c2c01",
+      "signature_b64url": "g5oq2xcrqmWX6x8DO__Av5sTr26ECfAQL6q54CPEsyEtjhg8LWhE-OHPVv_ywXoSa5_EFrOSOD5dR_QsJGwsAQ",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "orderly-timestamp": "1793491216000",
+        "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "g5oq2xcrqmWX6x8DO__Av5sTr26ECfAQL6q54CPEsyEtjhg8LWhE-OHPVv_ywXoSa5_EFrOSOD5dR_QsJGwsAQ"
+      },
+      "url": "https://testnet-api.orderly.org/v1/orders?symbol=PERP_ETH_USDC",
+      "request": {
+        "kind": "cancel_all",
+        "symbol": "PERP_ETH_USDC"
+      },
+      "evidence": "docs: DELETE /v1/orders?symbol="
+    },
+    {
+      "name": "receiver_address lookup (testnet)",
+      "network": "testnet",
+      "kind": "receiver_address",
+      "method": "GET",
+      "path": "/v1/client/asset/receiver_address?chain_id=421614&token=USDC",
+      "body": "",
+      "timestamp": 1793491217000,
+      "message": "1793491217000GET/v1/client/asset/receiver_address?chain_id=421614&token=USDC",
+      "signature_hex": "d5aa95961bb3d8c5d4d927519c4fa85b5365a5b7aacdc4b2333e5117cdc73d3f3956ad9f75be263764a24a31c280cf5342a99bf2480655636c2c3ea8eba97604",
+      "signature_b64url": "1aqVlhuz2MXU2SdRnE-oW1NlpbeqzcSyMz5RF83HPT85Vq2fdb4mN2SiSjHCgM9TQqmb8kgGVWNsLD6o66l2BA",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "orderly-timestamp": "1793491217000",
+        "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "1aqVlhuz2MXU2SdRnE-oW1NlpbeqzcSyMz5RF83HPT85Vq2fdb4mN2SiSjHCgM9TQqmb8kgGVWNsLD6o66l2BA"
+      },
+      "url": "https://testnet-api.orderly.org/v1/client/asset/receiver_address?chain_id=421614&token=USDC",
+      "evidence": "called on testnet"
+    },
+    {
+      "name": "settle_nonce (testnet)",
+      "network": "testnet",
+      "kind": "settle_nonce",
+      "method": "GET",
+      "path": "/v1/settle_nonce",
+      "body": "",
+      "timestamp": 1793491218000,
+      "message": "1793491218000GET/v1/settle_nonce",
+      "signature_hex": "b179cabfcb06d81db3e4554723ef53e645ccbc0a19fc42e0187cce41377cf0efc6fecf210fa4cc6445bab27f5954704605892454245424bf5cfe3106ec6f1606",
+      "signature_b64url": "sXnKv8sG2B2z5FVHI-9T5kXMvAoZ_ELgGHzOQTd88O_G_s8hD6TMZEW6sn9ZVHBGBYkkVCRUJL9c_jEG7G8WBg",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "orderly-timestamp": "1793491218000",
+        "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "sXnKv8sG2B2z5FVHI-9T5kXMvAoZ_ELgGHzOQTd88O_G_s8hD6TMZEW6sn9ZVHBGBYkkVCRUJL9c_jEG7G8WBg"
+      },
+      "url": "https://testnet-api.orderly.org/v1/settle_nonce",
+      "evidence": "docs",
+      "verify": "day 5"
+    },
+    {
+      "name": "withdraw_nonce (testnet)",
+      "network": "testnet",
+      "kind": "withdraw_nonce",
+      "method": "GET",
+      "path": "/v1/withdraw_nonce",
+      "body": "",
+      "timestamp": 1793491219000,
+      "message": "1793491219000GET/v1/withdraw_nonce",
+      "signature_hex": "363b69cb6a25242cbb41f42cf7e164af8dbee3b08cd399f4f83e9efa254d1649cf9b494d6f5a0ff7f2eac286bbb4e5d33d326170272d4531598b3a4481e7f209",
+      "signature_b64url": "Njtpy2olJCy7QfQs9-Fkr42-47CM05n0-D6e-iVNFknPm0lNb1oP9_Lqwoa7tOXTPTJhcCctRTFZizpEgefyCQ",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "orderly-timestamp": "1793491219000",
+        "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "Njtpy2olJCy7QfQs9-Fkr42-47CM05n0-D6e-iVNFknPm0lNb1oP9_Lqwoa7tOXTPTJhcCctRTFZizpEgefyCQ"
+      },
+      "url": "https://testnet-api.orderly.org/v1/withdraw_nonce",
+      "evidence": "called on testnet"
+    },
+    {
+      "name": "settle_pnl POST (testnet)",
+      "network": "testnet",
+      "kind": "settle_pnl",
+      "method": "POST",
+      "path": "/v1/settle_pnl",
+      "body": "{\"message\":{\"brokerId\":\"woofi_dex\",\"chainId\":421614,\"settleNonce\":1,\"timestamp\":1793491205000},\"signature\":\"0x0057ad808089b4ae4068ae3d2e2039b8ade32cb84365780170a75fed8e4701d26c1e1967d0d318ef791cbed9e2c06d22bec290313bf1f1640ed32c33621d9bbf1c\",\"userAddress\":\"0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1\",\"verifyingContract\":\"0x1826B75e2ef249173FC735149AE4B8e9ea10abff\"}",
+      "timestamp": 1793491220000,
+      "message": "1793491220000POST/v1/settle_pnl{\"message\":{\"brokerId\":\"woofi_dex\",\"chainId\":421614,\"settleNonce\":1,\"timestamp\":1793491205000},\"signature\":\"0x0057ad808089b4ae4068ae3d2e2039b8ade32cb84365780170a75fed8e4701d26c1e1967d0d318ef791cbed9e2c06d22bec290313bf1f1640ed32c33621d9bbf1c\",\"userAddress\":\"0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1\",\"verifyingContract\":\"0x1826B75e2ef249173FC735149AE4B8e9ea10abff\"}",
+      "signature_hex": "0149464320150876577a22336584c7b8c627377132522dca95cb0e10a67c53e3c0b0b38eb200d4be2ba851cb49f6467ffc84286d8997325334d758a7ab881e07",
+      "signature_b64url": "AUlGQyAVCHZXeiIzZYTHuMYnN3EyUi3KlcsOEKZ8U-PAsLOOsgDUviuoUctJ9kZ__IQobYmXMlM011inq4geBw",
+      "headers": {
+        "Content-Type": "application/json",
+        "orderly-timestamp": "1793491220000",
+        "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "AUlGQyAVCHZXeiIzZYTHuMYnN3EyUi3KlcsOEKZ8U-PAsLOOsgDUviuoUctJ9kZ__IQobYmXMlM011inq4geBw"
+      },
+      "url": "https://testnet-api.orderly.org/v1/settle_pnl",
+      "eip712_case": "SettlePnl nonce 1 (testnet)",
+      "evidence": "docs",
+      "verify": "day 5"
+    },
+    {
+      "name": "withdraw_request POST (testnet)",
+      "network": "testnet",
+      "kind": "withdraw_request",
+      "method": "POST",
+      "path": "/v1/withdraw_request",
+      "body": "{\"message\":{\"brokerId\":\"woofi_dex\",\"chainId\":421614,\"receiver\":\"0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1\",\"token\":\"USDC\",\"amount\":\"5000000\",\"withdrawNonce\":1,\"timestamp\":1793491203000},\"signature\":\"0x566de9a35029d06394b59c7fdeed4e7d39678784075b2114cccc399eccbca5182c866eb4b6bc8b40fa4e1b29962ad04cd4fe3c33a826d83628809b03b3ab82221c\",\"userAddress\":\"0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1\",\"verifyingContract\":\"0x1826B75e2ef249173FC735149AE4B8e9ea10abff\"}",
+      "timestamp": 1793491221000,
+      "message": "1793491221000POST/v1/withdraw_request{\"message\":{\"brokerId\":\"woofi_dex\",\"chainId\":421614,\"receiver\":\"0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1\",\"token\":\"USDC\",\"amount\":\"5000000\",\"withdrawNonce\":1,\"timestamp\":1793491203000},\"signature\":\"0x566de9a35029d06394b59c7fdeed4e7d39678784075b2114cccc399eccbca5182c866eb4b6bc8b40fa4e1b29962ad04cd4fe3c33a826d83628809b03b3ab82221c\",\"userAddress\":\"0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1\",\"verifyingContract\":\"0x1826B75e2ef249173FC735149AE4B8e9ea10abff\"}",
+      "signature_hex": "ef389bda29f7eb5054392deb405390dc5f042189e409d6e69c9976f9c34a2222ab1eb35d8b98f9f8c628e114f40c4be0ad2aa8a22d5343488faa2c9e31404600",
+      "signature_b64url": "7zib2in361BUOS3rQFOQ3F8EIYnkCdbmnJl2-cNKIiKrHrNdi5j5-MYo4RT0DEvgrSqooi1TQ0iPqiyeMUBGAA",
+      "headers": {
+        "Content-Type": "application/json",
+        "orderly-timestamp": "1793491221000",
+        "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "7zib2in361BUOS3rQFOQ3F8EIYnkCdbmnJl2-cNKIiKrHrNdi5j5-MYo4RT0DEvgrSqooi1TQ0iPqiyeMUBGAA"
+      },
+      "url": "https://testnet-api.orderly.org/v1/withdraw_request",
+      "eip712_case": "Withdraw 5 USDC to the desk address (testnet)",
+      "evidence": "this body shape was accepted on testnet (EIP-55 addresses, amount as a string, nonce and timestamp as numbers)"
+    },
+    {
+      "name": "referral_bind (testnet)",
+      "network": "testnet",
+      "kind": "referral_bind",
+      "method": "POST",
+      "path": "/v1/referral/bind",
+      "body": "{\"referral_code\":\"TESTCODE\"}",
+      "timestamp": 1793491222000,
+      "message": "1793491222000POST/v1/referral/bind{\"referral_code\":\"TESTCODE\"}",
+      "signature_hex": "6b88d4c545e026cbd979430f7472ee5c7dfe28f06b93cf6ac17b372d89b9506ff27e67840796de087b96d8c45cb9e87f94fc2132f06f6b352d823e854de6380d",
+      "signature_b64url": "a4jUxUXgJsvZeUMPdHLuXH3-KPBrk89qwXs3LYm5UG_yfmeEB5beCHuW2MRcueh_lPwhMvBvazUtgj6FTeY4DQ",
+      "headers": {
+        "Content-Type": "application/json",
+        "orderly-timestamp": "1793491222000",
+        "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "a4jUxUXgJsvZeUMPdHLuXH3-KPBrk89qwXs3LYm5UG_yfmeEB5beCHuW2MRcueh_lPwhMvBvazUtgj6FTeY4DQ"
+      },
+      "url": "https://testnet-api.orderly.org/v1/referral/bind",
+      "evidence": "docs: POST /v1/referral/bind {referral_code}",
+      "verify": "day 5"
+    },
+    {
+      "name": "receiver_address lookup (mainnet)",
+      "network": "mainnet",
+      "kind": "receiver_address",
+      "method": "GET",
+      "path": "/v1/client/asset/receiver_address?chain_id=42161&token=USDC",
+      "body": "",
+      "timestamp": 1793491223000,
+      "message": "1793491223000GET/v1/client/asset/receiver_address?chain_id=42161&token=USDC",
+      "signature_hex": "5deed2bf08ae93878108b8e31cd79154bb83555fb80ee881c7d806eaff53edfdcc20f267c89fa467eb5bb60015bd0e38fb50c9ddb355e3f2669c042d439b270e",
+      "signature_b64url": "Xe7Svwiuk4eBCLjjHNeRVLuDVV-4DuiBx9gG6v9T7f3MIPJnyJ-kZ-tbtgAVvQ44-1DJ3bNV4_JmnAQtQ5snDg",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "orderly-timestamp": "1793491223000",
+        "orderly-account-id": "0x07e60f45224a7814f23fa78d34da6e52bfbfdd8d827aa62bd1bd094fc61b33d3",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "Xe7Svwiuk4eBCLjjHNeRVLuDVV-4DuiBx9gG6v9T7f3MIPJnyJ-kZ-tbtgAVvQ44-1DJ3bNV4_JmnAQtQ5snDg"
+      },
+      "url": "https://api.orderly.org/v1/client/asset/receiver_address?chain_id=42161&token=USDC",
+      "evidence": "docs"
+    },
+    {
+      "name": "settle_nonce (mainnet)",
+      "network": "mainnet",
+      "kind": "settle_nonce",
+      "method": "GET",
+      "path": "/v1/settle_nonce",
+      "body": "",
+      "timestamp": 1793491224000,
+      "message": "1793491224000GET/v1/settle_nonce",
+      "signature_hex": "da162f3b0d4c9ab6e0761ad6893e523767dbea39d7dcaf7d8d04dbec852f7b9595c717ce14b5df16e2f0346e570b950123bf4d1c0aa6972b372bcb6351c7e30e",
+      "signature_b64url": "2hYvOw1MmrbgdhrWiT5SN2fb6jnX3K99jQTb7IUve5WVxxfOFLXfFuLwNG5XC5UBI79NHAqmlys3K8tjUcfjDg",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "orderly-timestamp": "1793491224000",
+        "orderly-account-id": "0x07e60f45224a7814f23fa78d34da6e52bfbfdd8d827aa62bd1bd094fc61b33d3",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "2hYvOw1MmrbgdhrWiT5SN2fb6jnX3K99jQTb7IUve5WVxxfOFLXfFuLwNG5XC5UBI79NHAqmlys3K8tjUcfjDg"
+      },
+      "url": "https://api.orderly.org/v1/settle_nonce",
+      "evidence": "docs",
+      "verify": "day 5"
+    },
+    {
+      "name": "withdraw_nonce (mainnet)",
+      "network": "mainnet",
+      "kind": "withdraw_nonce",
+      "method": "GET",
+      "path": "/v1/withdraw_nonce",
+      "body": "",
+      "timestamp": 1793491225000,
+      "message": "1793491225000GET/v1/withdraw_nonce",
+      "signature_hex": "901ec3a40d5a78a6b72dfd57d0fcf09496e908fb44c00780fe3455c3f1ae9bf1353f0b97487cda9416006f7d18302abbc84db6408d466ac2f9eb1f2174bbd503",
+      "signature_b64url": "kB7DpA1aeKa3Lf1X0PzwlJbpCPtEwAeA_jRVw_Gum_E1PwuXSHzalBYAb30YMCq7yE22QI1GasL56x8hdLvVAw",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "orderly-timestamp": "1793491225000",
+        "orderly-account-id": "0x07e60f45224a7814f23fa78d34da6e52bfbfdd8d827aa62bd1bd094fc61b33d3",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "kB7DpA1aeKa3Lf1X0PzwlJbpCPtEwAeA_jRVw_Gum_E1PwuXSHzalBYAb30YMCq7yE22QI1GasL56x8hdLvVAw"
+      },
+      "url": "https://api.orderly.org/v1/withdraw_nonce",
+      "evidence": "docs"
+    },
+    {
+      "name": "settle_pnl POST (mainnet)",
+      "network": "mainnet",
+      "kind": "settle_pnl",
+      "method": "POST",
+      "path": "/v1/settle_pnl",
+      "body": "{\"message\":{\"brokerId\":\"example_broker\",\"chainId\":42161,\"settleNonce\":1,\"timestamp\":1793491205000},\"signature\":\"0x6f6fe6cffc970a704e53e85b15d028720960faae7c8917319eb9d8e38d26631c465a360f2ec5fe7cde627db7999b8f4c649ee123401d11a4ba143b85de4311911b\",\"userAddress\":\"0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1\",\"verifyingContract\":\"0x6F7a338F2aA472838dEFD3283eB360d4Dff5D203\"}",
+      "timestamp": 1793491226000,
+      "message": "1793491226000POST/v1/settle_pnl{\"message\":{\"brokerId\":\"example_broker\",\"chainId\":42161,\"settleNonce\":1,\"timestamp\":1793491205000},\"signature\":\"0x6f6fe6cffc970a704e53e85b15d028720960faae7c8917319eb9d8e38d26631c465a360f2ec5fe7cde627db7999b8f4c649ee123401d11a4ba143b85de4311911b\",\"userAddress\":\"0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1\",\"verifyingContract\":\"0x6F7a338F2aA472838dEFD3283eB360d4Dff5D203\"}",
+      "signature_hex": "64c7356a0cd15d17a0c703b48ac7e250edea54fa4cf805ac1c61fd89fef1b75eb0e60e4b78a21853cd829e9ad3ffd7d44ad7aee4df9bad08f8e0fca786addc0d",
+      "signature_b64url": "ZMc1agzRXRegxwO0isfiUO3qVPpM-AWsHGH9if7xt16w5g5LeKIYU82CnprT_9fUSteu5N-brQj44Pynhq3cDQ",
+      "headers": {
+        "Content-Type": "application/json",
+        "orderly-timestamp": "1793491226000",
+        "orderly-account-id": "0x07e60f45224a7814f23fa78d34da6e52bfbfdd8d827aa62bd1bd094fc61b33d3",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "ZMc1agzRXRegxwO0isfiUO3qVPpM-AWsHGH9if7xt16w5g5LeKIYU82CnprT_9fUSteu5N-brQj44Pynhq3cDQ"
+      },
+      "url": "https://api.orderly.org/v1/settle_pnl",
+      "eip712_case": "SettlePnl nonce 1 (mainnet)",
+      "evidence": "docs",
+      "verify": "day 5"
+    },
+    {
+      "name": "withdraw_request POST (mainnet)",
+      "network": "mainnet",
+      "kind": "withdraw_request",
+      "method": "POST",
+      "path": "/v1/withdraw_request",
+      "body": "{\"message\":{\"brokerId\":\"example_broker\",\"chainId\":42161,\"receiver\":\"0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1\",\"token\":\"USDC\",\"amount\":\"5000000\",\"withdrawNonce\":1,\"timestamp\":1793491203000},\"signature\":\"0x20cf55c2b39f899804c6fcd23a906ec434f231a14b06d09126ee0fd7d49629fd28a376c712f8714446005fb33c4df2783bf44b50ddba1867dc169c53ff29279a1b\",\"userAddress\":\"0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1\",\"verifyingContract\":\"0x6F7a338F2aA472838dEFD3283eB360d4Dff5D203\"}",
+      "timestamp": 1793491227000,
+      "message": "1793491227000POST/v1/withdraw_request{\"message\":{\"brokerId\":\"example_broker\",\"chainId\":42161,\"receiver\":\"0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1\",\"token\":\"USDC\",\"amount\":\"5000000\",\"withdrawNonce\":1,\"timestamp\":1793491203000},\"signature\":\"0x20cf55c2b39f899804c6fcd23a906ec434f231a14b06d09126ee0fd7d49629fd28a376c712f8714446005fb33c4df2783bf44b50ddba1867dc169c53ff29279a1b\",\"userAddress\":\"0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1\",\"verifyingContract\":\"0x6F7a338F2aA472838dEFD3283eB360d4Dff5D203\"}",
+      "signature_hex": "5a4bd9a38986a09a6c656c4073afc9dfb3261b5c50aeb9e0bee883739afad682c1e5f3e97365d51e69c31e148c89433fa9466166b2b833b2fa4b8af6226c340a",
+      "signature_b64url": "WkvZo4mGoJpsZWxAc6_J37MmG1xQrrngvuiDc5r61oLB5fPpc2XVHmnDHhSMiUM_qUZhZrK4M7L6S4r2Imw0Cg",
+      "headers": {
+        "Content-Type": "application/json",
+        "orderly-timestamp": "1793491227000",
+        "orderly-account-id": "0x07e60f45224a7814f23fa78d34da6e52bfbfdd8d827aa62bd1bd094fc61b33d3",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "WkvZo4mGoJpsZWxAc6_J37MmG1xQrrngvuiDc5r61oLB5fPpc2XVHmnDHhSMiUM_qUZhZrK4M7L6S4r2Imw0Cg"
+      },
+      "url": "https://api.orderly.org/v1/withdraw_request",
+      "eip712_case": "Withdraw 5 USDC to the desk address (mainnet)",
+      "evidence": "docs"
+    },
+    {
+      "name": "referral_bind (mainnet)",
+      "network": "mainnet",
+      "kind": "referral_bind",
+      "method": "POST",
+      "path": "/v1/referral/bind",
+      "body": "{\"referral_code\":\"TESTCODE\"}",
+      "timestamp": 1793491228000,
+      "message": "1793491228000POST/v1/referral/bind{\"referral_code\":\"TESTCODE\"}",
+      "signature_hex": "b9f66542f25ea1a8f043392053dac08b0995e4556212b1781290d3be61e6d7aa6a1fbd3b734a505f7389ef552d0dee6aa4e872254a526d185ceafe4a98638c0b",
+      "signature_b64url": "ufZlQvJeoajwQzkgU9rAiwmV5FViErF4EpDTvmHm16pqH707c0pQX3OJ71UtDe5qpOhyJUpSbRhc6v5KmGOMCw",
+      "headers": {
+        "Content-Type": "application/json",
+        "orderly-timestamp": "1793491228000",
+        "orderly-account-id": "0x07e60f45224a7814f23fa78d34da6e52bfbfdd8d827aa62bd1bd094fc61b33d3",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "ufZlQvJeoajwQzkgU9rAiwmV5FViErF4EpDTvmHm16pqH707c0pQX3OJ71UtDe5qpOhyJUpSbRhc6v5KmGOMCw"
+      },
+      "url": "https://api.orderly.org/v1/referral/bind",
+      "evidence": "docs: POST /v1/referral/bind {referral_code}",
+      "verify": "day 5"
+    }
+  ],
+  "ws_auth": {
+    "name": "private WebSocket auth: the signed text is only the timestamp in decimal",
+    "timestamp": 1793491260000,
+    "message": "1793491260000",
+    "signature_hex": "b223f47892281a78f8d9cc803af16e312a783e69797e223fcdd1a983b71bd89ec05d23330d434b1b12989942d7edb4b5c6d0038ca610b1369607055919f6480e",
+    "signature_b64url": "siP0eJIoGnj42cyAOvFuMSp4Pml5fiI_zdGpg7cb2J7AXSMzDUNLGxKYmULX7bS1xtADjKYQsTaWBwVZGfZIDg",
+    "frame": {
+      "id": "auth-1",
+      "event": "auth",
+      "params": {
+        "orderly_key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "sign": "siP0eJIoGnj42cyAOvFuMSp4Pml5fiI_zdGpg7cb2J7AXSMzDUNLGxKYmULX7bS1xtADjKYQsTaWBwVZGfZIDg",
+        "timestamp": 1793491260000
+      }
+    },
+    "evidence": "accepted on testnet with base64url (no padding)"
+  }
+}

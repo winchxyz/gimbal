@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # The npm workspaces exist from the first commit; scripts run with --if-present, so this job is
+  # green before any package has code and real from the first package that adds build/test/typecheck.
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: npm run typecheck
+
+  # hashFiles() is not allowed in a job-level `if`, so this probe tells the contract job whether
+  # contract/Cargo.toml exists yet. Until C1 lands, the contract job is skipped, not failed.
+  layout:
+    runs-on: ubuntu-latest
+    outputs:
+      contract: ${{ steps.probe.outputs.contract }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: probe
+        run: echo "contract=${{ hashFiles('contract/Cargo.toml') != '' }}" >> "$GITHUB_OUTPUT"
+
+  contract:
+    needs: layout
+    if: needs.layout.outputs.contract == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contract
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contract
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - name: Install cargo-near 0.22.0
+        run: curl --proto '=https' --tlsv1.2 -LsSf https://github.com/near/cargo-near/releases/download/cargo-near-v0.22.0/cargo-near-installer.sh | sh
+      - run: cargo near build non-reproducible-wasm --no-abi
+      - run: ls -l target/near/*.wasm

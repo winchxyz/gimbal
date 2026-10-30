@@ -1,0 +1,329 @@
+{
+  "file": "decimal.json",
+  "brief": "C1 (decimal.rs); used by every brief that takes a decimal string (C3 px/sz, C5 Orderly price/quantity, C6/C8 amounts)",
+  "generator": "gen/decimal.mjs (regex + BigInt), cross-checked by gen/decimal_check.py (char-by-char parser)",
+  "rule": "canonical = \"0\" | [1-9][0-9]* , optionally \".\" + 1..8 ASCII digits not ending in \"0\"; value in 1e-8 units must fit u128; anything else is E_DECIMAL",
+  "fields": {
+    "input": "the exact string passed to the parser (JSON-escaped; \\u0661 is one non-ASCII character)",
+    "ok": "true = accept",
+    "units_e8": "accepted value in 1e-8 units, as a decimal string (may exceed u64)",
+    "fits_u64": "whether units_e8 fits a u64 (callers that store u64 must refuse the rest)",
+    "code": "refusal code when ok is false",
+    "reason": "hint only; tests should not depend on it"
+  },
+  "cases": [
+    {
+      "input": "0",
+      "ok": true,
+      "units_e8": "0",
+      "fits_u64": true,
+      "note": "zero is canonical (a zero size is E_SIZE, not E_DECIMAL)"
+    },
+    {
+      "input": "1",
+      "ok": true,
+      "units_e8": "100000000",
+      "fits_u64": true,
+      "note": "integer"
+    },
+    {
+      "input": "10",
+      "ok": true,
+      "units_e8": "1000000000",
+      "fits_u64": true,
+      "note": "trailing zeros in the integer part are fine"
+    },
+    {
+      "input": "100",
+      "ok": true,
+      "units_e8": "10000000000",
+      "fits_u64": true
+    },
+    {
+      "input": "0.1",
+      "ok": true,
+      "units_e8": "10000000",
+      "fits_u64": true
+    },
+    {
+      "input": "0.5",
+      "ok": true,
+      "units_e8": "50000000",
+      "fits_u64": true
+    },
+    {
+      "input": "1.5",
+      "ok": true,
+      "units_e8": "150000000",
+      "fits_u64": true
+    },
+    {
+      "input": "0.00000001",
+      "ok": true,
+      "units_e8": "1",
+      "fits_u64": true,
+      "note": "smallest unit"
+    },
+    {
+      "input": "0.12345678",
+      "ok": true,
+      "units_e8": "12345678",
+      "fits_u64": true,
+      "note": "exactly 8 decimals"
+    },
+    {
+      "input": "12345.6789",
+      "ok": true,
+      "units_e8": "1234567890000",
+      "fits_u64": true
+    },
+    {
+      "input": "2400.5",
+      "ok": true,
+      "units_e8": "240050000000",
+      "fits_u64": true,
+      "note": "Hyperliquid-style price"
+    },
+    {
+      "input": "81255",
+      "ok": true,
+      "units_e8": "8125500000000",
+      "fits_u64": true
+    },
+    {
+      "input": "0.0042",
+      "ok": true,
+      "units_e8": "420000",
+      "fits_u64": true,
+      "note": "Hyperliquid-style size"
+    },
+    {
+      "input": "999999999.99999999",
+      "ok": true,
+      "units_e8": "99999999999999999",
+      "fits_u64": true
+    },
+    {
+      "input": "184467440737.09551615",
+      "ok": true,
+      "units_e8": "18446744073709551615",
+      "fits_u64": true,
+      "note": "u64::MAX units"
+    },
+    {
+      "input": "184467440737.09551616",
+      "ok": true,
+      "units_e8": "18446744073709551616",
+      "fits_u64": false,
+      "note": "u64::MAX + 1 units: still fits u128"
+    },
+    {
+      "input": "3402823669209384634633746074317.68211455",
+      "ok": true,
+      "units_e8": "340282366920938463463374607431768211455",
+      "fits_u64": false,
+      "note": "u128::MAX units"
+    },
+    {
+      "input": "",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "empty",
+      "note": "empty"
+    },
+    {
+      "input": ".",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "empty_part",
+      "note": "empty parts"
+    },
+    {
+      "input": "1.",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "empty_part",
+      "note": "empty fraction"
+    },
+    {
+      "input": ".5",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "empty_part",
+      "note": "empty integer part"
+    },
+    {
+      "input": "00",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "leading_zero",
+      "note": "leading zero"
+    },
+    {
+      "input": "01",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "leading_zero",
+      "note": "leading zero"
+    },
+    {
+      "input": "007.5",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "leading_zero",
+      "note": "leading zeros"
+    },
+    {
+      "input": "1.0",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "trailing_zero",
+      "note": "trailing zero after the dot"
+    },
+    {
+      "input": "1.50",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "trailing_zero",
+      "note": "trailing zero after the dot"
+    },
+    {
+      "input": "0.0",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "trailing_zero",
+      "note": "trailing zero after the dot"
+    },
+    {
+      "input": "0.00000000",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "trailing_zero",
+      "note": "trailing zeros after the dot"
+    },
+    {
+      "input": "1.123456789",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "too_many_decimals",
+      "note": "9 decimals"
+    },
+    {
+      "input": "0.000000001",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "too_many_decimals",
+      "note": "9 decimals"
+    },
+    {
+      "input": "-1",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "sign",
+      "note": "sign"
+    },
+    {
+      "input": "+1",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "sign",
+      "note": "sign"
+    },
+    {
+      "input": "-0",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "sign",
+      "note": "sign"
+    },
+    {
+      "input": " 1",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "invalid_char",
+      "note": "leading whitespace"
+    },
+    {
+      "input": "1 ",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "invalid_char",
+      "note": "trailing whitespace"
+    },
+    {
+      "input": "1e8",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "invalid_char",
+      "note": "exponent"
+    },
+    {
+      "input": "1E-8",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "invalid_char",
+      "note": "exponent"
+    },
+    {
+      "input": "1,5",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "invalid_char",
+      "note": "comma"
+    },
+    {
+      "input": "1.2.3",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "invalid_char",
+      "note": "two dots"
+    },
+    {
+      "input": "0x10",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "invalid_char",
+      "note": "hex"
+    },
+    {
+      "input": "1_000",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "invalid_char",
+      "note": "separator"
+    },
+    {
+      "input": "NaN",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "invalid_char"
+    },
+    {
+      "input": "Infinity",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "invalid_char"
+    },
+    {
+      "input": "١",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "invalid_char",
+      "note": "ARABIC-INDIC DIGIT ONE: only ASCII digits count"
+    },
+    {
+      "input": "１",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "invalid_char",
+      "note": "FULLWIDTH DIGIT ONE"
+    },
+    {
+      "input": "3402823669209384634633746074317.68211456",
+      "ok": false,
+      "code": "E_DECIMAL",
+      "reason": "overflow",
+      "note": "u128::MAX + 1 units: overflow"
+    }
+  ]
+}
