@@ -5,11 +5,13 @@
 import { readFileSync } from 'node:fs';
 import { constants, gunzipSync } from 'node:zlib';
 import type { VenueId } from '@gimbal/shared';
-import type { RecordLine } from './recorder.ts';
-import type { AccountState, Book, Clock, Market, MarketFunding, VenueMethod, VenueReader } from './venue.ts';
+import type { RecordLine, WireLine } from './recorder.ts';
+import type {
+  AccountState, Book, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, VenueMethod, VenueReader,
+} from './venue.ts';
 import { systemClock, trimBook } from './venue.ts';
 
-const METHODS: readonly VenueMethod[] = ['markets', 'funding', 'book', 'account'];
+const METHODS: readonly VenueMethod[] = ['markets', 'funding', 'book', 'account', 'userFunding'];
 
 /** A call the recording cannot answer: nothing recorded for it at or before the clock's time. */
 export class ReplayMissError extends Error {
@@ -64,13 +66,25 @@ export class ScaledClock implements Clock {
  * the last complete line instead of failing.
  */
 export function readRecording(path: string): RecordLine[] {
-  const text = gunzipSync(readFileSync(path), { finishFlush: constants.Z_SYNC_FLUSH }).toString('utf8');
-  return parseRecording(text, path);
+  return parseRecording(gunzipFile(path), path);
+}
+
+/** Reads a recording of raw HTTP exchanges (recordingFetch), cut-off tolerant like readRecording. */
+export function readWireRecording(path: string): WireLine[] {
+  return parseJsonl(gunzipFile(path), path, checkWireLine);
+}
+
+function gunzipFile(path: string): string {
+  return gunzipSync(readFileSync(path), { finishFlush: constants.Z_SYNC_FLUSH }).toString('utf8');
 }
 
 export function parseRecording(text: string, source = 'recording'): RecordLine[] {
+  return parseJsonl(text, source, checkLine);
+}
+
+function parseJsonl<L>(text: string, source: string, check: (v: unknown, where: string) => L): L[] {
   const raw = text.split('\n');
-  const out: RecordLine[] = [];
+  const out: L[] = [];
   for (let i = 0; i < raw.length; i++) {
     const s = raw[i];
     if (s === undefined || s === '') continue;
@@ -82,9 +96,60 @@ export function parseRecording(text: string, source = 'recording'): RecordLine[]
       if (i === raw.length - 1) break;
       throw new Error(`${source}:${i + 1}: not JSON`);
     }
-    out.push(checkLine(value, `${source}:${i + 1}`));
+    out.push(check(value, `${source}:${i + 1}`));
   }
   return out;
+}
+
+function checkWireLine(v: unknown, where: string): WireLine {
+  if (typeof v !== 'object' || v === null) throw new Error(`${where}: not an object`);
+  const o = v as Record<string, unknown>;
+  if (typeof o.t !== 'number' || !Number.isFinite(o.t)) throw new Error(`${where}: t must be a number`);
+  if (typeof o.url !== 'string') throw new Error(`${where}: url must be a string`);
+  if (typeof o.status !== 'number') throw new Error(`${where}: status must be a number`);
+  if (!('request' in o) || !('response' in o)) throw new Error(`${where}: needs request and response`);
+  return v as WireLine;
+}
+
+/**
+ * A `fetch` that answers from a wire recording: the same url and JSON body (key order ignored) get the recorded
+ * status and body, and the same call made again gets the next recorded answer (the last one repeats). A call
+ * nothing was recorded for throws ReplayMissError, so a reader that changes what it asks fails its test.
+ */
+export function replayFetch(lines: readonly WireLine[]): typeof fetch {
+  const byCall = new Map<string, WireLine[]>();
+  for (const line of lines) {
+    const key = wireKey(line.url, line.request);
+    const list = byCall.get(key);
+    if (list === undefined) byCall.set(key, [line]);
+    else list.push(line);
+  }
+  const served = new Map<string, number>();
+  return async (input, init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (init?.method !== 'POST' || typeof init.body !== 'string') throw new Error(`replayFetch: ${url}: only POST with a JSON string body`);
+    const key = wireKey(url, JSON.parse(init.body) as unknown);
+    const list = byCall.get(key);
+    if (list === undefined) throw new ReplayMissError(`replay fetch: nothing recorded for POST ${key}`);
+    const n = served.get(key) ?? 0;
+    served.set(key, n + 1);
+    const line = list[Math.min(n, list.length - 1)]!;
+    const body = typeof line.response === 'string' ? line.response : JSON.stringify(line.response);
+    return new Response(body, { status: line.status });
+  };
+}
+
+function wireKey(url: string, request: unknown): string {
+  return `${url} ${stableJson(request)}`;
+}
+
+function stableJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(stableJson).join(',')}]`;
+  if (typeof v === 'object' && v !== null) {
+    const o = v as Record<string, unknown>;
+    return `{${Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${stableJson(o[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(v);
 }
 
 function checkLine(v: unknown, where: string): RecordLine {
@@ -98,7 +163,7 @@ function checkLine(v: unknown, where: string): RecordLine {
   return v as RecordLine;
 }
 
-export class ReplayVenue implements VenueReader {
+export class ReplayVenue implements VenueReader, FundingHistorySource {
   readonly id: VenueId;
   readonly start: number;          // first answer in the recording, ms
   readonly end: number;            // last answer, ms
@@ -151,6 +216,11 @@ export class ReplayVenue implements VenueReader {
 
   async account(address: string): Promise<AccountState> {
     return this.#answer<AccountState>('account', [address]);
+  }
+
+  /** Only a window that was recorded is answered: the same address, startTime and endTime (or none). */
+  async userFunding(address: string, startTime: number, endTime?: number): Promise<FundingPayment[]> {
+    return this.#answer<FundingPayment[]>('userFunding', endTime === undefined ? [address, startTime] : [address, startTime, endTime]);
   }
 
   #answer<T>(method: VenueMethod, args: unknown[]): T {
