@@ -97,10 +97,24 @@ owner's account that may call only the operator methods below (receiver = the gi
 cannot attach deposits, so operator methods are not payable; the contract pays MPC and oracle deposits
 from its own balance. Gas is paid by the calling account: a 300 TGas call reserves ~0.3 NEAR until the
 refund (the real fee is ~0.001 NEAR), so that account needs ≥ 0.3 NEAR free per call in flight. The operator
-key has an allowance, set at onboarding from config (default 5 NEAR); each call is charged against it, and
-whether the unused-gas refund comes back to the allowance is measured in C2. The engine checks the remaining
-allowance (`view_access_key`) before every signature and keeps at most min(balance, allowance) / 0.3 NEAR
-signatures in flight. A separate `operator` account can also be set.
+key has an allowance, set at onboarding from config (default 5 NEAR); each call is charged against it. The
+unused-gas refund comes back to the allowance (measured on testnet 2026-10-30: a 300 TGas call held ~0.30 NEAR
+of it while in flight, and the allowance went down only by the tokens burnt, 0.0002 NEAR). The engine checks the
+remaining allowance (`view_access_key`) before every signature and keeps at most min(balance, allowance) / 0.3
+NEAR signatures in flight. A separate `operator` account can also be set.
+
+**Owner methods need 1 yoctoNEAR.** The operator key lives on the owner's account, so the contract sees the
+owner as the caller either way. Every owner method (no ✓ in the Operator column, except `ft_on_transfer`), and
+`set_paused` with `paused: false`, requires at least 1 yoctoNEAR attached. A FunctionCall key cannot attach a
+deposit, so the operator key is refused (`E_NOT_ALLOWED`); only the owner's wallet (a full-access key) can
+call them. Onboarding adds the operator key with `method_names` = the operator methods only. `create_desk` and
+`set_policy` take a storage deposit: at least 1 yocto and at least the storage the call adds (`E_DEPOSIT`); the
+excess is refunded to the caller, and storage freed by a smaller policy is not refunded.
+
+**Paused desks.** While a desk is paused every operator action method refuses `E_PAUSED`, except reduce-only
+closes, which `panic_close` relies on: `hl_order` with `reduce_only: true`, an `orderly_request` order with
+`reduce_only: true`, and Phoenix closes through `sol_sign` (the Solana parser decides, day 4). `set_policy` and
+`set_operator` work on a paused desk.
 
 The owner's wallet signs only what needs the owner: `create_desk`, `set_policy`, `set_operator`, adding the
 operator key, `set_orderly_receiver`, deposits and payouts. Venue setup runs from the engine through operator
@@ -116,9 +130,9 @@ chooses nothing:
 | Method | Owner | Operator | Notes |
 |---|---|---|---|
 | `create_desk(desk_id, policy, evm_address, solana)` | ✓ | | payable: storage deposit |
-| `set_policy(desk_id, policy)` | ✓ | | |
+| `set_policy(desk_id, policy)` | ✓ | | payable: storage deposit for a larger policy (≥ 1 yocto) |
 | `set_operator(desk_id, operator: Option<AccountId>)` | ✓ | | |
-| `set_paused(desk_id, paused)` | ✓ | pause only | |
+| `set_paused(desk_id, paused)` | ✓ | pause only | unpausing needs 1 yocto attached, so the operator key cannot unpause |
 | `ft_on_transfer(sender_id, amount, msg)` | any sender | | USDC on NEAR only (`ft_transfer_call`, msg `{"desk_id"}`): owner → `deposited` + `idle_usdc`; others → `idle_usdc`; unknown desk → full refund (§1.2) |
 | `fund_venue(desk_id, quote, quote_signature, reason)` | ✓ | ✓ | sends the desk's USDC on NEAR to a verified 1Click deposit address (recipient = a desk venue address or the pinned Orderly receiver) |
 | `withdraw_to_owner(desk_id, amount)` | ✓ | | pays USDC on NEAR the contract holds for the desk, minus the performance fee to the treasury |
@@ -216,11 +230,11 @@ A refusal is a panic with a stable code first: `"E_PRICE_BAND: px 2500 is 4.3% f
 
 | Code | When |
 |---|---|
-| `E_NOT_ALLOWED` | caller is neither owner nor operator, or operator called an owner method |
+| `E_NOT_ALLOWED` | caller is neither owner nor operator, operator called an owner method, or an owner method came without 1 yocto attached (§1.3) |
 | `E_PAUSED` | desk paused |
 | `E_NO_DESK` / `E_DESK_EXISTS` | |
 | `E_ARGS` | malformed argument: desk_id outside `[a-z0-9-]{1,32}`, bad address or base58/hex, `reason` over 280 characters, a once-only setting set twice |
-| `E_DEPOSIT` | attached deposit below the storage cost |
+| `E_DEPOSIT` | attached deposit below the storage cost (`create_desk`, `set_policy`) |
 | `E_ASSET` | asset, symbol or market not in the policy |
 | `E_SIZE` | notional over `max_notional_usd`, or zero |
 | `E_DECIMAL` | non-canonical decimal string |
