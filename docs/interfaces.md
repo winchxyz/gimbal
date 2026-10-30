@@ -47,7 +47,13 @@ A desk belongs to one owner. Its venue addresses are MPC keys derived for the co
 | Solana authority (Phoenix) and Orderly key | `gimbal/<desk_id>/sol` | 1 (Ed25519) |
 
 The engine computes the addresses with the MPC contract's `derived_public_key({path, predecessor: <contract>, domain_id})`
-and the owner passes them to `create_desk`. They can never change afterwards. The Solana key is also the desk's
+and the owner passes them to `create_desk`. The contract checks them: `create_desk` asks the MPC contract's
+`derived_public_key` for both paths (a cross-contract call) and stores the desk only in the callback, when the EVM
+address and the Solana authority match; otherwise it refunds the deposit and emits nothing (`E_ARGS` in the log).
+Without that check an owner could register their own wallet as the desk's address and take profit out through
+`hl_withdraw` or `orderly_withdraw` without the performance fee. The Solana token accounts and the Phoenix trader
+account are derived from the authority and checked from day 4 (Solana parser). They can never change afterwards.
+Owner and operator can never be the contract itself, the MPC contract or the oracle (`E_ARGS`). The Solana key is also the desk's
 Orderly key; the contract builds every payload either key signs, so the two uses cannot be confused.
 
 ```rust
@@ -62,8 +68,11 @@ struct Policy {
     max_transfer_cost_bps: u32,              // 1Click: minAmountOut ≥ amountIn − max(bps share, flat); default 100
     max_transfer_cost_flat_e6: u64,          // USDC ×1e6; default 500000 (0.5 USDC; measured 0.21–0.32 on 4–7 USDC)
     unpriced: Vec<String>,                   // symbols WITHOUT an oracle price the owner explicitly allowed
-    unpriced_max_notional_usd: u64,          // their own, smaller cap per leg (default 100)
+    unpriced_max_notional_usd: u64,          // their own cap per leg (default 100); an unpriced order must fit
+                                             // min(max_notional_usd, unpriced_max_notional_usd)
 }
+// Every u64 in Policy is at most 2^53 − 1 (E_ARGS above), so JavaScript reads it exactly.
+// policy_sha256 (event policy_set) = hex sha256 of the policy JSON exactly as get_desk returns it.
 struct SolanaAccounts {                      // registered by the owner; Solana programs enforce them
     authority: String, usdc_ata: String, phusd_ata: String, phoenix_trader: String,
 }
@@ -105,16 +114,20 @@ NEAR signatures in flight. A separate `operator` account can also be set.
 
 **Owner methods need 1 yoctoNEAR.** The operator key lives on the owner's account, so the contract sees the
 owner as the caller either way. Every owner method (no ✓ in the Operator column, except `ft_on_transfer`), and
-`set_paused` with `paused: false`, requires at least 1 yoctoNEAR attached. A FunctionCall key cannot attach a
+`set_paused` with `paused: false`, requires exactly 1 yoctoNEAR attached. A FunctionCall key cannot attach a
 deposit, so the operator key is refused (`E_NOT_ALLOWED`); only the owner's wallet (a full-access key) can
-call them. Onboarding adds the operator key with `method_names` = the operator methods only. `create_desk` and
-`set_policy` take a storage deposit: at least 1 yocto and at least the storage the call adds (`E_DEPOSIT`); the
-excess is refunded to the caller, and storage freed by a smaller policy is not refunded.
+call them. Onboarding adds the operator key with `method_names` = the operator methods only. `create_desk`,
+`set_policy` and `set_operator` take a storage deposit instead: at least 1 yocto and at least the storage the
+call adds (`E_DEPOSIT`, measured as the change in storage usage); the excess is refunded to the caller, and
+storage freed later is not refunded. The contract never pays for storage a caller adds.
 
-**Paused desks.** While a desk is paused every operator action method refuses `E_PAUSED`, except reduce-only
-closes, which `panic_close` relies on: `hl_order` with `reduce_only: true`, an `orderly_request` order with
-`reduce_only: true`, and Phoenix closes through `sol_sign` (the Solana parser decides, day 4). `set_policy` and
-`set_operator` work on a paused desk.
+**Paused desks.** While a desk is paused every operator action method refuses `E_PAUSED`, except actions that
+only reduce risk, which `panic_close` and a rescue rely on: reduce-only orders (`hl_order` / an `orderly_request`
+order with `reduce_only: true`, Phoenix closes through `sol_sign` as the Solana parser decides, day 4), cancels,
+and rescue transfers (`fund_venue`, `hl_send_to_intents`, `sol_sign_rescue`, within `rescue_cap_usd_per_hour`).
+`set_policy` and `set_operator` work on a paused desk.
+
+Mutating methods use `#[deny_unknown_arguments]`, so a misspelt argument is refused instead of read as `None`.
 
 The owner's wallet signs only what needs the owner: `create_desk`, `set_policy`, `set_operator`, adding the
 operator key, `set_orderly_receiver`, deposits and payouts. Venue setup runs from the engine through operator
@@ -129,9 +142,9 @@ chooses nothing:
 
 | Method | Owner | Operator | Notes |
 |---|---|---|---|
-| `create_desk(desk_id, policy, evm_address, solana)` | ✓ | | payable: storage deposit |
+| `create_desk(desk_id, policy, evm_address, solana)` | ✓ | | payable: storage deposit; the desk is stored in the callback after the MPC address check (§1.2) |
 | `set_policy(desk_id, policy)` | ✓ | | payable: storage deposit for a larger policy (≥ 1 yocto) |
-| `set_operator(desk_id, operator: Option<AccountId>)` | ✓ | | |
+| `set_operator(desk_id, operator: Option<AccountId>)` | ✓ | | payable: storage deposit (≥ 1 yocto) |
 | `set_paused(desk_id, paused)` | ✓ | pause only | unpausing needs 1 yocto attached, so the operator key cannot unpause |
 | `ft_on_transfer(sender_id, amount, msg)` | any sender | | USDC on NEAR only (`ft_transfer_call`, msg `{"desk_id"}`): owner → `deposited` + `idle_usdc`; others → `idle_usdc`; unknown desk → full refund (§1.2) |
 | `fund_venue(desk_id, quote, quote_signature, reason)` | ✓ | ✓ | sends the desk's USDC on NEAR to a verified 1Click deposit address (recipient = a desk venue address or the pinned Orderly receiver) |
@@ -227,6 +240,8 @@ Every action method returns a `SignedAction` (from the `on_signed` callback) tha
 ### 1.5 Refusals
 
 A refusal is a panic with a stable code first: `"E_PRICE_BAND: px 2500 is 4.3% from oracle 2397.1"`.
+One exception: arguments that do not deserialize (wrong type, unknown field, out-of-range integer) panic inside
+near-sdk before the method runs ("Failed to deserialize input from JSON"); clients treat that as `E_ARGS`.
 
 | Code | When |
 |---|---|
@@ -255,7 +270,7 @@ A refusal is a panic with a stable code first: `"E_PRICE_BAND: px 2500 is 4.3% f
 | Event | Data |
 |---|---|
 | `desk_created` | desk_id, owner, evm_address, sol_authority |
-| `policy_set` | desk_id, policy_sha256 |
+| `policy_set` | desk_id, policy_sha256 (also emitted by `create_desk`, for the first policy) |
 | `operator_set` | desk_id, operator |
 | `orderly_receiver_set` | desk_id, receiver |
 | `paused` | desk_id, paused, by |
@@ -288,10 +303,10 @@ export interface Window {
   costs: { feesPct: number; slippagePct: number; basisPct: number; rescueReservePct: number };
   netAprPct: number; usdPerDayPer1k: number; breakevenHours: number; depthUsd: number;
   intervalsAbove: number; updatedAt: number;
-  tradable: boolean;              // true only if both legs are VenueIds and the symbol has an oracle price
-                                  // (or is in policy.unpriced); false = watch only
+  tradable: boolean;              // both legs are VenueIds, so a desk could trade it; false = watch only
   veto?: { verdict: 'pass' | 'veto'; reasons: string[]; model: string; at: number };   // NEAR AI, can only refuse
-  refused?: { code: string; reason: string };   // the contract would refuse it under the current policy (E_* code)
+  refused?: { code: string; reason: string };   // tradable, but the contract would refuse it under the current
+                                                // policy (E_* code), e.g. no oracle price and not in policy.unpriced
   held: { since: number } | null;   // the desk holds this window now
   checks: { ok: boolean; text: string }[];   // what the engine checked (policy, oracle, rescue path), one line
                                              // each, engine-written; the first failing one is why it is not entered
@@ -321,10 +336,14 @@ export interface ContractPolicy {  // the contract's Policy (§1.2), same snake_
 }
 
 export interface StrategyConfig {  // engine rules, off-chain: the contract never sees or enforces them
+  auto: boolean;                   // the engine enters, exits and rotates by itself; false = it only watches,
+                                   // rescues and journals, and the owner acts by hand (POST /rotate, /close)
   minNetAprPct: number;            // "your minimum": enter only above this net APR
   legUsd: number;                  // notional per leg the engine opens (≤ policy.max_notional_usd)
   maxLeverage: number;             // leverage target per leg
   stopDrawdownPct: number | null;  // close both legs when the desk's drawdown reaches this
+  rotate: { minGainPts: number; forHours: number };   // rotate when another window beats the held one by at
+                                                      // least minGainPts of net APR for forHours in a row
 }
 
 export interface PolicyDraft {     // NEAR AI turns the owner's words into this; the owner edits and confirms
@@ -424,7 +443,11 @@ it is 168 points per window), `POST /stress` (testnet and replay only: tighten t
 no testnet, so on testnet the rescue's 1Click steps are replayed from recorded mainnet responses),
 `POST /policy/draft` `{ text }` → `PolicyDraft` (NEAR AI; nothing is applied until the owner signs `set_policy`
 and confirms the engine rules), `GET` / `PUT /strategy` (`StrategyConfig`), `POST /setup` `{ deskId }` (starts
-venue setup; progress arrives as `setup` events).
+venue setup; progress arrives as `setup` events), `POST /rotate` `{ windowId }` (manual override: close the held
+window and open this one, with the same checks as auto; refused with the reason when a check fails) and
+`POST /close` (close both legs with reduce-only orders). Both answer `{ ok: true }` or `{ ok: false, reason }`
+at once; progress arrives as `journal` and `desk` events. Pause and Resume are not engine calls: the owner's
+wallet signs `set_paused` (§1.3).
 
 **NEAR AI rule:** the model drafts and refuses, never acts. A policy draft becomes real only through the
 owner's own `set_policy` transaction (and the engine rules only after the owner confirms them); a veto can

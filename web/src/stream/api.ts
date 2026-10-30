@@ -16,12 +16,16 @@ const isNumber = (value: unknown): value is number => typeof value === 'number' 
 /** Checks the body of `GET /strategy`; throws with what is wrong, so the screen can say so. */
 export function parseStrategy(value: unknown): StrategyConfig {
   if (!isObject(value)) throw new Error('GET /strategy: not an object');
-  const { minNetAprPct, legUsd, maxLeverage, stopDrawdownPct } = value;
+  const { auto, minNetAprPct, legUsd, maxLeverage, stopDrawdownPct, rotate } = value;
+  if (typeof auto !== 'boolean') throw new Error('GET /strategy: auto is not a boolean');
   if (!isNumber(minNetAprPct)) throw new Error('GET /strategy: minNetAprPct is not a number');
   if (!isNumber(legUsd)) throw new Error('GET /strategy: legUsd is not a number');
   if (!isNumber(maxLeverage)) throw new Error('GET /strategy: maxLeverage is not a number');
   if (stopDrawdownPct !== null && !isNumber(stopDrawdownPct)) throw new Error('GET /strategy: stopDrawdownPct is neither a number nor null');
-  return { minNetAprPct, legUsd, maxLeverage, stopDrawdownPct };
+  if (!isObject(rotate) || !isNumber(rotate.minGainPts) || !isNumber(rotate.forHours)) {
+    throw new Error('GET /strategy: rotate needs minGainPts and forHours');
+  }
+  return { auto, minNetAprPct, legUsd, maxLeverage, stopDrawdownPct, rotate: { minGainPts: rotate.minGainPts, forHours: rotate.forHours } };
 }
 
 /** Checks the body of `GET /windows/history`; the points are returned oldest first whatever the order sent. */

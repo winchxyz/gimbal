@@ -30,4 +30,11 @@ export function win(overrides: Partial<FundingWindow> & { symbol?: string } = {}
 export const net = (symbol: string, netAprPct: number, overrides: Partial<FundingWindow> = {}): FundingWindow =>
   win({ symbol, netAprPct, grossAprPct: Math.round((netAprPct + 3.3) * 10) / 10, ...overrides });
 
-export const STRATEGY: StrategyConfig = { minNetAprPct: 5, legUsd: 1200, maxLeverage: 3, stopDrawdownPct: 10 };
+export const STRATEGY: StrategyConfig = {
+  auto: true,
+  minNetAprPct: 5,
+  legUsd: 1200,
+  maxLeverage: 3,
+  stopDrawdownPct: 10,
+  rotate: { minGainPts: 3, forHours: 4 },
+};

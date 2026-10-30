@@ -19,10 +19,10 @@ export interface Window {
   costs: { feesPct: number; slippagePct: number; basisPct: number; rescueReservePct: number };
   netAprPct: number; usdPerDayPer1k: number; breakevenHours: number; depthUsd: number;
   intervalsAbove: number; updatedAt: number;
-  tradable: boolean;              // true only if both legs are VenueIds and the symbol has an oracle price
-                                  // (or is in policy.unpriced); false = watch only
+  tradable: boolean;              // both legs are VenueIds, so a desk could trade it; false = watch only
   veto?: { verdict: 'pass' | 'veto'; reasons: string[]; model: string; at: number };   // NEAR AI, can only refuse
-  refused?: { code: string; reason: string };   // the contract would refuse it under the current policy (E_* code)
+  refused?: { code: string; reason: string };   // tradable, but the contract would refuse it under the current
+                                                // policy (E_* code), e.g. no oracle price and not in policy.unpriced
   held: { since: number } | null;   // the desk holds this window now
   checks: { ok: boolean; text: string }[];   // what the engine checked (policy, oracle, rescue path), one line
                                              // each, engine-written; the first failing one is why it is not entered
@@ -52,10 +52,14 @@ export interface ContractPolicy {  // the contract's Policy (§1.2), same snake_
 }
 
 export interface StrategyConfig {  // engine rules, off-chain: the contract never sees or enforces them
+  auto: boolean;                   // the engine enters, exits and rotates by itself; false = it only watches,
+                                   // rescues and journals, and the owner acts by hand (POST /rotate, /close)
   minNetAprPct: number;            // "your minimum": enter only above this net APR
   legUsd: number;                  // notional per leg the engine opens (≤ policy.max_notional_usd)
   maxLeverage: number;             // leverage target per leg
   stopDrawdownPct: number | null;  // close both legs when the desk's drawdown reaches this
+  rotate: { minGainPts: number; forHours: number };   // rotate when another window beats the held one by at
+                                                      // least minGainPts of net APR for forHours in a row
 }
 
 export interface PolicyDraft {     // NEAR AI turns the owner's words into this; the owner edits and confirms
