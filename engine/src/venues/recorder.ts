@@ -2,13 +2,18 @@
 // Line format (docs/interfaces.md section 3): {"t", "venue", "method", "args", "result"}, plus
 // "ms" (how long the venue took) and "error" in place of "result" when the call threw, so a
 // replay reproduces outages as well as data.
+//
+// recordingFetch records one level lower: the raw HTTP exchanges a reader makes, so a test can run the
+// reader's own parsing and paging against what the venue really answered (see replayFetch).
 
 import { createWriteStream, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { constants, createGzip } from 'node:zlib';
 import type { VenueId } from '@gimbal/shared';
-import type { AccountState, Book, Clock, Market, MarketFunding, VenueMethod, VenueReader } from './venue.ts';
+import type {
+  AccountState, Book, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, VenueMethod, VenueReader,
+} from './venue.ts';
 import { systemClock } from './venue.ts';
 
 export interface RecordLine {
@@ -21,17 +26,29 @@ export interface RecordLine {
   error?: string;
 }
 
-export interface RecordSink {
-  write(line: RecordLine): void;
+/** One HTTP exchange: a POST with a JSON body and the answer to it, whatever its status. */
+export interface WireLine {
+  t: number;                     // ms, when the answer arrived
+  url: string;
+  request: unknown;              // the parsed JSON body
+  status: number;
+  ms: number;
+  response: unknown;             // parsed JSON when the body was JSON, the text otherwise
 }
 
-export class RecordingVenue implements VenueReader {
+export interface LineSink<L> {
+  write(line: L): void;
+}
+
+export type RecordSink = LineSink<RecordLine>;
+
+export class RecordingVenue implements VenueReader, FundingHistorySource {
   readonly id: VenueId;
-  readonly #inner: VenueReader;
+  readonly #inner: VenueReader & Partial<FundingHistorySource>;
   readonly #sink: RecordSink;
   readonly #clock: Clock;
 
-  constructor(inner: VenueReader, sink: RecordSink, clock: Clock = systemClock) {
+  constructor(inner: VenueReader & Partial<FundingHistorySource>, sink: RecordSink, clock: Clock = systemClock) {
     this.id = inner.id;
     this.#inner = inner;
     this.#sink = sink;
@@ -55,6 +72,13 @@ export class RecordingVenue implements VenueReader {
     return this.#call('account', [address], () => this.#inner.account(address));
   }
 
+  async userFunding(address: string, startTime: number, endTime?: number): Promise<FundingPayment[]> {
+    const inner = this.#inner;
+    if (inner.userFunding === undefined) throw new Error(`${this.id}: this reader has no userFunding`);
+    const args = endTime === undefined ? [address, startTime] : [address, startTime, endTime];
+    return this.#call('userFunding', args, () => inner.userFunding!(address, startTime, endTime));
+  }
+
   async #call<T>(method: VenueMethod, args: unknown[], run: () => Promise<T>): Promise<T> {
     const started = this.#clock.now();
     let result: T;
@@ -71,8 +95,31 @@ export class RecordingVenue implements VenueReader {
   }
 }
 
+/**
+ * Wraps `fetch` and writes each POST it answers, with its status, to `sink`. The caller gets the real
+ * response back untouched. Only POSTs with a JSON string body are supported: that is all /info takes.
+ */
+export function recordingFetch(inner: typeof fetch, sink: LineSink<WireLine>, clock: Clock = systemClock): typeof fetch {
+  return async (input, init) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (init?.method !== 'POST' || typeof init.body !== 'string') throw new Error(`recordingFetch: ${url}: only POST with a JSON string body`);
+    const started = clock.now();
+    const res = await inner(input, init);
+    const text = await res.clone().text();
+    let response: unknown = text;
+    try {
+      response = JSON.parse(text);
+    } catch {
+      // not JSON: keep the text
+    }
+    const t = clock.now();
+    sink.write({ t, url, request: JSON.parse(init.body) as unknown, status: res.status, ms: t - started, response });
+    return res;
+  };
+}
+
 /** Gzipped JSONL file. Refuses to touch an existing file, so a committed fixture is never extended by accident. */
-export class JsonlGzWriter implements RecordSink {
+export class JsonlGzWriter<L = RecordLine> implements LineSink<L> {
   readonly path: string;
   readonly #gzip = createGzip({ level: 9 });
   readonly #done: Promise<void>;
@@ -92,7 +139,7 @@ export class JsonlGzWriter implements RecordSink {
     return this.#lines;
   }
 
-  write(line: RecordLine): void {
+  write(line: L): void {
     if (this.#closed) throw new Error(`${this.path}: write after close`);
     this.#gzip.write(JSON.stringify(line) + '\n');
     this.#lines++;

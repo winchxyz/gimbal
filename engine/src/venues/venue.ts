@@ -63,6 +63,23 @@ export interface AccountState {
   positions: Position[];
 }
 
+/** One funding payment the venue booked to an account. */
+export interface FundingPayment {
+  time: number;                  // ms, when the venue booked it
+  symbol: string;
+  fundingUsd: number;            // received > 0, paid < 0: the same sign as Position.fundingSinceOpenUsd
+  size: number;                  // position size at that time, base units, signed
+  ratePerHour: number;           // the rate it was priced at; > 0 means longs pay shorts
+  samples: number | null;        // a row the venue aggregated (older history is one row per day): how many hourly
+                                 // payments it sums, 24 for a full day; null on an ordinary hourly row
+}
+
+/** What a reader offers when its venue keeps a per-account funding history (Hyperliquid today). */
+export interface FundingHistorySource {
+  /** Every payment with `startTime <= time <= endTime` (ms; no end = up to now), oldest first. */
+  userFunding(address: string, startTime: number, endTime?: number): Promise<FundingPayment[]>;
+}
+
 export interface VenueReader {
   readonly id: VenueId;
   markets(): Promise<Market[]>;
@@ -72,7 +89,7 @@ export interface VenueReader {
   account(address: string): Promise<AccountState>;
 }
 
-export type VenueMethod = 'markets' | 'funding' | 'book' | 'account';
+export type VenueMethod = 'markets' | 'funding' | 'book' | 'account' | 'userFunding';
 
 /** Time source shared by readers, the recorder and replay, so replay can swap in a virtual clock. */
 export interface Clock {

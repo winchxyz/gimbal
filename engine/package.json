@@ -7,7 +7,9 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test \"src/**/*.test.ts\"",
-    "record": "node src/cli/record.ts"
+    "record": "node src/cli/record.ts",
+    "capture": "node src/cli/capture.ts",
+    "smoke": "node src/cli/smoke.ts"
   },
   "dependencies": {
     "@gimbal/shared": "*"

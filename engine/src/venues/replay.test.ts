@@ -4,10 +4,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { gzipSync } from 'node:zlib';
-import type { RecordLine } from './recorder.ts';
-import { JsonlGzWriter, RecordingVenue } from './recorder.ts';
-import { ReplayMissError, ReplayVenue, ScaledClock, VirtualClock, parseRecording, readRecording } from './replay.ts';
-import type { AccountState, Book, Market, MarketFunding, VenueReader } from './venue.ts';
+import type { RecordLine, WireLine } from './recorder.ts';
+import { JsonlGzWriter, RecordingVenue, recordingFetch } from './recorder.ts';
+import {
+  ReplayMissError, ReplayVenue, ScaledClock, VirtualClock, parseRecording, readRecording, readWireRecording, replayFetch,
+} from './replay.ts';
+import type { AccountState, Book, FundingPayment, Market, MarketFunding, VenueReader } from './venue.ts';
 
 const dir = mkdtempSync(join(tmpdir(), 'gimbal-replay-'));
 after(() => rmSync(dir, { recursive: true, force: true }));
@@ -206,4 +208,113 @@ test('malformed lines are refused with their line number', () => {
     /unknown method trade/,
   );
   assert.throws(() => parseRecording('{"t":1,"venue":"hyperliquid","method":"funding","args":[]}\n', 'f'), /needs result or error/);
+});
+
+const payment = (time: number, fundingUsd: number): FundingPayment =>
+  ({ time, symbol: 'ETH', fundingUsd, size: 2, ratePerHour: 0.0000125, samples: null });
+
+class FundingFakeReader extends FakeReader {
+  readonly asked: unknown[][] = [];
+  async userFunding(address: string, startTime: number, endTime?: number): Promise<FundingPayment[]> {
+    this.asked.push([address, startTime, endTime]);
+    if (address === '0xbad') throw new Error('hyperliquid info userFunding: HTTP 429 rate limited');
+    return [payment(startTime, -1), payment(startTime + 3_600_000, -2)];
+  }
+}
+
+test('userFunding is recorded with its window and replayed for the same window only', async () => {
+  const path = join(dir, 'funding.jsonl.gz');
+  const clock = new VirtualClock(T0);
+  const writer = new JsonlGzWriter(path);
+  const inner = new FundingFakeReader(clock);
+  const rec = new RecordingVenue(inner, writer, clock);
+  const open = await rec.userFunding('0xabc', 1_000);
+  const closed = await rec.userFunding('0xabc', 1_000, 9_000);
+  await assert.rejects(rec.userFunding('0xbad', 1_000), /HTTP 429/);
+  await writer.close();
+  assert.deepEqual(inner.asked, [['0xabc', 1_000, undefined], ['0xabc', 1_000, 9_000], ['0xbad', 1_000, undefined]]);
+
+  const lines = readRecording(path);
+  assert.deepEqual(lines.map((l) => [l.method, l.args]), [
+    ['userFunding', ['0xabc', 1_000]], ['userFunding', ['0xabc', 1_000, 9_000]], ['userFunding', ['0xbad', 1_000]],
+  ]);
+  assert.equal(lines[2]!.error, 'hyperliquid info userFunding: HTTP 429 rate limited');
+
+  const replay = new ReplayVenue(lines, new VirtualClock(lines[2]!.t));
+  assert.deepEqual(await replay.userFunding('0xabc', 1_000), open);
+  assert.deepEqual(await replay.userFunding('0xabc', 1_000, 9_000), closed);
+  await assert.rejects(replay.userFunding('0xbad', 1_000), /HTTP 429/);
+  // A window nothing was recorded for is a miss, never a guess from a neighbouring one.
+  await assert.rejects(replay.userFunding('0xabc', 2_000), ReplayMissError);
+  await assert.rejects(replay.userFunding('0xabc', 1_000, 9_001), ReplayMissError);
+  (await replay.userFunding('0xabc', 1_000))[0]!.fundingUsd = 99;
+  assert.equal((await replay.userFunding('0xabc', 1_000))[0]!.fundingUsd, -1);
+});
+
+test('a reader without a funding history cannot be asked for one, and nothing is recorded', async () => {
+  const path = join(dir, 'no-funding.jsonl.gz');
+  const clock = new VirtualClock(T0);
+  const writer = new JsonlGzWriter(path);
+  const rec = new RecordingVenue(new FakeReader(clock), writer, clock);
+  await assert.rejects(rec.userFunding('0xabc', 0), /no userFunding/);
+  await writer.close();
+  assert.equal(writer.lines, 0);
+});
+
+test('raw exchanges are recorded with their status, then served back by request, key order ignored', async () => {
+  const clock = new VirtualClock(T0);
+  const seen: string[] = [];
+  const inner = (async (_url: string | URL | Request, init?: RequestInit) => {
+    seen.push(String(init?.body));
+    clock.advance(40);
+    const body = JSON.parse(String(init?.body)) as { type: string; n?: number };
+    if (body.type === 'broken') return new Response('null', { status: 500 });
+    if (body.type === 'text') return new Response('not json at all');
+    return new Response(JSON.stringify({ echo: body.type, n: body.n ?? 0 }));
+  }) as typeof fetch;
+  const path = join(dir, 'wire.jsonl.gz');
+  const writer = new JsonlGzWriter<WireLine>(path);
+  const rec = recordingFetch(inner, writer, clock);
+  const url = 'https://api.example.test/info';
+  const post = (f: typeof fetch, body: unknown) => f(url, { method: 'POST', body: JSON.stringify(body) });
+
+  const first = await post(rec, { type: 'a', n: 1 });
+  assert.deepEqual(await first.json(), { echo: 'a', n: 1 });            // the caller still gets a readable response
+  await post(rec, { type: 'a', n: 1 });
+  await post(rec, { type: 'broken' });
+  await post(rec, { type: 'text' });
+  await assert.rejects(rec(url, { method: 'GET' }), /only POST/);
+  await writer.close();
+
+  const lines = readWireRecording(path);
+  assert.deepEqual(lines.map((l) => [l.status, l.request, l.ms]), [
+    [200, { type: 'a', n: 1 }, 40], [200, { type: 'a', n: 1 }, 40], [500, { type: 'broken' }, 40], [200, { type: 'text' }, 40],
+  ]);
+  assert.deepEqual(lines[2]!.response, null);
+  assert.equal(lines[3]!.response, 'not json at all');
+
+  const replay = replayFetch(lines);
+  const sameButReordered = await post(replay, { n: 1, type: 'a' });
+  assert.deepEqual(await sameButReordered.json(), { echo: 'a', n: 1 });
+  const broken = await post(replay, { type: 'broken' });
+  assert.equal(broken.status, 500);
+  assert.equal(await broken.text(), 'null');
+  assert.equal(await (await post(replay, { type: 'text' })).text(), 'not json at all');
+  await assert.rejects(post(replay, { type: 'a', n: 2 }), ReplayMissError);
+  await assert.rejects(replay('https://other.example.test/info', { method: 'POST', body: JSON.stringify({ type: 'a', n: 1 }) }), ReplayMissError);
+  await assert.rejects(replay(url, { method: 'GET' }), /only POST/);
+  assert.equal(seen.length, 4);                                          // replay never touched the network
+});
+
+test('the same call made again replays the next recorded answer, then repeats the last', async () => {
+  const answers = [1, 2].map((n): WireLine => ({ t: T0 + n, url: 'u', request: { type: 'x' }, status: 200, ms: 1, response: { n } }));
+  const replay = replayFetch(answers);
+  const ask = async () => ((await (await replay('u', { method: 'POST', body: '{"type":"x"}' })).json()) as { n: number }).n;
+  assert.deepEqual([await ask(), await ask(), await ask()], [1, 2, 2]);
+});
+
+test('malformed wire lines are refused with their line number', () => {
+  const badFile = join(dir, 'bad-wire.jsonl.gz');
+  writeFileSync(badFile, gzipSync('{"t":1,"url":"u","status":200,"request":{}}\n'));
+  assert.throws(() => readWireRecording(badFile), /bad-wire.jsonl.gz:1: needs request and response/);
 });
