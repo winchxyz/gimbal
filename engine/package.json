@@ -1,5 +1,15 @@
 {
   "name": "@gimbal/engine",
   "private": true,
-  "license": "BUSL-1.1"
+  "license": "BUSL-1.1",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test \"src/**/*.test.ts\"",
+    "record": "node src/cli/record.ts"
+  },
+  "dependencies": {
+    "@gimbal/shared": "*"
+  }
 }
