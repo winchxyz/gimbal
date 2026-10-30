@@ -9,7 +9,7 @@ import {
   type StreamAction,
   type StreamState,
 } from './store.ts';
-import { pickFakeMode, pickSource } from './source.ts';
+import { pickFakeDrift, pickFakeMode, pickFakeScenario, pickSource } from './source.ts';
 import { startFakeStream } from './fake.ts';
 
 const desk = (equityUsd: number): DeskState => ({
@@ -125,6 +125,16 @@ test('production always reads the engine; development defaults to the fake', () 
   assert.equal(pickFakeMode('?net=other'), 'testnet');
 });
 
+test('?state= picks the Windows scenario in the fake, and ?drift=off freezes the rates', () => {
+  assert.equal(pickFakeScenario(''), 'normal');
+  assert.equal(pickFakeScenario('?state=loading'), 'loading');
+  assert.equal(pickFakeScenario('?state=empty&net=replay'), 'empty');
+  assert.equal(pickFakeScenario('?state=error'), 'error');
+  assert.equal(pickFakeScenario('?state=other'), 'normal');
+  assert.equal(pickFakeDrift(''), true);
+  assert.equal(pickFakeDrift('?drift=off'), false);
+});
+
 test('the fake stream emits valid StreamEvents into the store', () => {
   const actions: StreamAction[] = [];
   const stop = startFakeStream((a) => actions.push(a), { mode: 'replay', intervalMs: 60_000 });
@@ -135,8 +145,9 @@ test('the fake stream emits valid StreamEvents into the store', () => {
   assert.equal(actions.filter((a) => a.kind === 'rejected').length, 0);
 
   const s = actions.reduce(reduceStream, initialStreamState());
-  assert.deepEqual(s.counts, { windows: 1, scan: 0, desk: 1, journal: 0, rescue: 0, setup: 1, health: 1 });
+  assert.deepEqual(s.counts, { windows: 1, scan: 1, desk: 1, journal: 0, rescue: 0, setup: 1, health: 1 });
   assert.equal(s.desk?.mode, 'replay');
   assert.equal(s.desk?.legs.length, 2);
-  assert.equal(s.windows?.length, 4);
+  assert.equal(s.windows?.length, 13);
+  assert.equal(s.scan?.venues, 32);
 });
