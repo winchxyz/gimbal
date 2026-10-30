@@ -22,6 +22,24 @@ export interface Window {
   tradable: boolean;              // true only if both legs are VenueIds and the symbol has an oracle price
                                   // (or is in policy.unpriced); false = watch only
   veto?: { verdict: 'pass' | 'veto'; reasons: string[]; model: string; at: number };   // NEAR AI, can only refuse
+  refused?: { code: string; reason: string };   // the contract would refuse it under the current policy (E_* code)
+  held: { since: number } | null;   // the desk holds this window now
+  checks: { ok: boolean; text: string }[];   // what the engine checked (policy, oracle, rescue path), one line
+                                             // each, engine-written; the first failing one is why it is not entered
+  switchCostUsd: number | null;     // cost to rotate from the held window into this one at strategy.legUsd;
+                                    // null when nothing is held or this is the held one
+  stale: boolean;                   // a venue it needs did not answer: the numbers are from the last good read
+}
+
+export interface WindowHistory {   // GET /windows/history?id=<window id>: hourly net APR, oldest first
+  windowId: string;
+  points: { t: number; netAprPct: number }[];   // one per hour, up to 168 (7 days)
+}
+
+export interface ScanStatus {      // one per scan, next to the windows it produced
+  venues: number;                  // venues the scanner read
+  failed: ScanVenueId[];           // venues that did not answer this time
+  at: number;                      // ms
 }
 
 export interface ContractPolicy {  // the contract's Policy (§1.2), same snake_case fields: passed as is to set_policy
@@ -34,6 +52,8 @@ export interface ContractPolicy {  // the contract's Policy (§1.2), same snake_
 }
 
 export interface StrategyConfig {  // engine rules, off-chain: the contract never sees or enforces them
+  minNetAprPct: number;            // "your minimum": enter only above this net APR
+  legUsd: number;                  // notional per leg the engine opens (≤ policy.max_notional_usd)
   maxLeverage: number;             // leverage target per leg
   stopDrawdownPct: number | null;  // close both legs when the desk's drawdown reaches this
 }
@@ -68,7 +88,20 @@ export interface DeskState {
   legs: Leg[]; netDelta: number; equityUsd: number; reserveUsd: number;
   pnl: { fundingUsd: number; feesUsd: number; priceUsd: number; netUsd: number };
   health: 'level' | 'watch' | 'rescue';
+  paused: { by: string; at: number } | null;   // set_paused / panic_close: the NEAR account that paused, ms; null = running
+  rescueFailure: RescueFailure | null;         // a rescue failed and the owner must act; cleared once margin is safe again
   updatedAt: number;
+}
+
+// The status line reads, first match wins: rescueFailure → Needs you, paused → Paused, health rescue →
+// Rescuing, health watch → Watch, no legs → Waiting, else Level.
+export interface RescueFailure {
+  rescueId: string;
+  step: Exclude<RescueProgress['step'], 'landed' | 'failed'>;   // the step that failed
+  reason: string;                 // one line: why it failed
+  tries: number;
+  next: string;                   // one line: what the desk tries next, or that only the owner can act now
+  at: number;                     // ms
 }
 
 export interface TxRef { chain: 'near' | 'hyperliquid' | 'solana' | 'arbitrum'; id: string; url: string }
@@ -89,10 +122,28 @@ export interface RescueProgress {
   startedAt: number; elapsedS: number; tx: TxRef[];
 }
 
+export type HealthMap = Record<VenueId | 'intents' | 'near', 'ok' | 'slow' | 'down'>;
+
 export type StreamEvent =
   | { type: 'windows'; data: Window[] }
+  | { type: 'scan'; data: ScanStatus }
   | { type: 'desk'; data: DeskState }
   | { type: 'journal'; data: JournalEntry }
   | { type: 'rescue'; data: RescueProgress }
   | { type: 'setup'; data: SetupProgress }
-  | { type: 'health'; data: Record<VenueId | 'intents' | 'near', 'ok' | 'slow' | 'down'> };
+  | { type: 'health'; data: HealthMap };
+
+// GET /state: the latest value of each StreamEvent type, so a client that (re)connects draws at once and
+// then applies /events on top. null = the engine has not produced that type yet.
+export interface EngineState {
+  mode: Mode;
+  windows: Window[] | null;
+  scan: ScanStatus | null;
+  strategy: StrategyConfig | null;   // as GET /strategy returns it
+  desk: DeskState | null;
+  journal: JournalEntry[];        // the most recent entries, newest first, at most 100
+  rescue: RescueProgress | null;  // the running rescue, else the last one
+  setup: SetupProgress | null;
+  health: HealthMap | null;
+  at: number;                     // ms, when the engine built the response
+}

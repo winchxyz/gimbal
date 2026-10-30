@@ -31,6 +31,8 @@ const desk = (health: DeskState['health'], legs: Leg[]): DeskState => ({
   reserveUsd: 0,
   pnl: { fundingUsd: 0, feesUsd: 0, priceUsd: 0, netUsd: 0 },
   health,
+  paused: null,
+  rescueFailure: null,
   updatedAt: 0,
 });
 

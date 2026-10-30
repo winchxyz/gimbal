@@ -67,6 +67,8 @@ function fakeDesk(mode: Mode, now: number, tick: number): DeskState {
     reserveUsd: 40,
     pnl: { fundingUsd, feesUsd, priceUsd: 0, netUsd: round(fundingUsd + feesUsd, 2) },
     health: nearest < 15 ? 'watch' : 'level',
+    paused: null,
+    rescueFailure: null,
     updatedAt: now,
   };
 }
@@ -116,6 +118,10 @@ function fakeWindows(now: number, tick: number): FundingWindow[] {
       intervalsAbove: 12 - i,
       updatedAt: now,
       tradable: true,
+      held: i === 0 ? { since: now - 6 * 3_600_000 } : null,
+      checks: [],
+      switchCostUsd: i === 0 ? null : 1.1,
+      stale: false,
     };
   });
 }

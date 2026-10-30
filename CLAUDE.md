@@ -29,15 +29,30 @@ except the designer.
 ## Commands
 
 ```bash
+npm run ci                       # everything below, in order; one line when green, else the failing step's tail
 npm install                      # root workspaces, in order: shared, engine, web, tools
 npm run build                    # shared first: engine and web import its dist/
 npm run demo                     # replay mode: engine + web, no keys needed
-npm test                         # all workspaces; run npm run build first
+npm test                         # all workspaces; run npm run build first; the output must say "tests N" with N > 0
 npm run typecheck
+cd contract && cargo fmt --all --check
 cd contract && cargo test -p gimbal-core   # logic tests: digest vectors, parser, every refusal (native, fast)
-cd contract && cargo test --workspace      # also the near-sdk tests (plain `cargo test` runs only `gimbal`); on Windows they need MinGW-w64 gcc + nasm, else CI runs them
-cd contract && cargo near build non-reproducible-wasm --no-abi   # wasm; the ABI step fails to link on Windows
+cd contract && cargo near build non-reproducible-wasm --no-abi   # wasm, default (gnu) toolchain; the ABI step fails to link on Windows
 ```
+
+On Windows the near-sdk tests and clippy build with the MSVC toolchain, in their own target dir (no rustup
+override, so the wasm build keeps the gnu default):
+
+```bash
+cd contract
+export AWS_LC_SYS_PREBUILT_NASM=1 CARGO_TARGET_DIR=target/msvc
+cargo +stable-x86_64-pc-windows-msvc clippy --workspace --all-targets -- -D warnings
+cargo +stable-x86_64-pc-windows-msvc test --workspace   # plain `cargo test` runs only `gimbal`
+```
+
+- near-sdk is pinned `"~5.29"` (a plain `"5.29"` resolves to 5.30). `contract/Cargo.lock` is committed; keep it in
+  every contract PR that changes dependencies.
+- GitHub Actions does not run for this repo yet: run `npm run ci` before opening a PR and paste its output.
 
 ## Rules
 

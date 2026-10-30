@@ -4,6 +4,7 @@ import type {
   DeskState,
   JournalEntry,
   RescueProgress,
+  ScanStatus,
   SetupProgress,
   StreamEvent,
   Window as FundingWindow,
@@ -12,7 +13,7 @@ import type {
 export type StreamType = StreamEvent['type'];
 export type Health = Extract<StreamEvent, { type: 'health' }>['data'];
 
-export const STREAM_TYPES: readonly StreamType[] = ['windows', 'desk', 'journal', 'rescue', 'setup', 'health'];
+export const STREAM_TYPES: readonly StreamType[] = ['windows', 'scan', 'desk', 'journal', 'rescue', 'setup', 'health'];
 
 /** Where events come from: the engine's `/events`, or the development fake. */
 export type Source = 'sse' | 'fake';
@@ -30,6 +31,7 @@ export interface StreamState {
   counts: Record<StreamType, number>;
   last: { type: StreamType; at: number } | null;
   windows: FundingWindow[] | null;
+  scan: ScanStatus | null;
   desk: DeskState | null;
   journal: JournalEntry[];               // newest first
   rescue: RescueProgress | null;
@@ -48,9 +50,10 @@ export function initialStreamState(): StreamState {
     connection: 'idle',
     received: 0,
     rejected: 0,
-    counts: { windows: 0, desk: 0, journal: 0, rescue: 0, setup: 0, health: 0 },
+    counts: { windows: 0, scan: 0, desk: 0, journal: 0, rescue: 0, setup: 0, health: 0 },
     last: null,
     windows: null,
+    scan: null,
     desk: null,
     journal: [],
     rescue: null,
@@ -77,6 +80,8 @@ export function reduceStream(state: StreamState, action: StreamAction): StreamSt
       switch (event.type) {
         case 'windows':
           return { ...next, windows: event.data };
+        case 'scan':
+          return { ...next, scan: event.data };
         case 'desk':
           return { ...next, desk: event.data };
         case 'journal':
