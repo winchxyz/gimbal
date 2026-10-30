@@ -100,6 +100,38 @@ pub struct Config {
     pub orderly: OrderlyConfig,
 }
 
+impl Config {
+    /// The price oracle account, when prices come from one.
+    pub fn oracle(&self) -> Option<&AccountId> {
+        match &self.price_source {
+            PriceSource::OutLayer { contract } => Some(contract),
+            PriceSource::Mock => None,
+        }
+    }
+
+    /// Owner and operator can never be the contract itself, the MPC contract or the oracle
+    /// (`E_ARGS`). Those accounts call into the contract on their own (callbacks, signatures,
+    /// prices), so a desk role on one of them would make such a call count as the owner's or the
+    /// operator's. `field` names the argument in the message.
+    pub fn check_not_reserved(
+        &self,
+        contract: &AccountId,
+        field: &str,
+        account: &AccountId,
+    ) -> Result<(), Refusal> {
+        let what = if account == contract {
+            "the contract itself"
+        } else if *account == self.mpc {
+            "the MPC contract"
+        } else if self.oracle() == Some(account) {
+            "the price oracle"
+        } else {
+            return Ok(());
+        };
+        Err(Refusal::new(E_ARGS, format!("{field} {account} is {what}")))
+    }
+}
+
 /// Checks the arguments of `new`. They are fixed for the contract's life and every desk depends on
 /// them, so a wrong value is refused up front rather than at the first order.
 pub fn check(
@@ -336,5 +368,41 @@ mod tests {
             from_str::<ReferralCodes>("{}").unwrap(),
             ReferralCodes::default()
         );
+    }
+
+    fn config(price_source: PriceSource) -> Config {
+        Config {
+            network: Network::Mainnet,
+            mpc: "v1.signer".parse().unwrap(),
+            price_source,
+            treasury: treasury(),
+            fees: fees(),
+            orderly: orderly(ARBITRUM_MAINNET),
+        }
+    }
+
+    #[test]
+    fn reserved_accounts_never_hold_a_desk_role() {
+        let contract: AccountId = "gimbal.near".parse().unwrap();
+        let c = config(PriceSource::OutLayer {
+            contract: "price-oracle.near".parse().unwrap(),
+        });
+        for (account, what) in [
+            ("gimbal.near", "the contract itself"),
+            ("v1.signer", "the MPC contract"),
+            ("price-oracle.near", "the price oracle"),
+        ] {
+            let r = c
+                .check_not_reserved(&contract, "operator", &account.parse().unwrap())
+                .unwrap_err();
+            assert_eq!(r.code, E_ARGS);
+            assert_eq!(r.msg, format!("operator {account} is {what}"));
+        }
+        c.check_not_reserved(&contract, "owner", &"alice.near".parse().unwrap())
+            .unwrap();
+        // With Mock prices there is no oracle account to reserve.
+        config(PriceSource::Mock)
+            .check_not_reserved(&contract, "owner", &"price-oracle.near".parse().unwrap())
+            .unwrap();
     }
 }

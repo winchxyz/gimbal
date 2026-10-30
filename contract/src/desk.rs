@@ -62,6 +62,16 @@ pub enum Role {
     Operator,
 }
 
+/// Whether an action method runs on a paused desk (docs/interfaces.md §1.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gate {
+    /// Opens or grows risk: refused on a paused desk (`E_PAUSED`).
+    Running,
+    /// Only reduces risk, which `panic_close` and a rescue rely on: reduce-only orders, cancels and
+    /// rescue transfers. Allowed on a paused desk.
+    ReducesRisk,
+}
+
 impl Desk {
     /// A new, running desk with no operator, no Orderly receiver and an empty ledger.
     pub fn new(
@@ -132,12 +142,18 @@ impl Desk {
     }
 
     /// The check every action method makes before anything else: the owner or the operator
-    /// (`E_NOT_ALLOWED`), then a running desk (`E_PAUSED`). A pause stops the owner's actions too.
-    pub fn check_action(&self, desk_id: &str, caller: &AccountId) -> Result<Role, Refusal> {
+    /// (`E_NOT_ALLOWED`), then, for a [`Gate::Running`] action, a running desk (`E_PAUSED`). A pause
+    /// stops the owner's actions too; actions that only reduce risk pass it.
+    pub fn check_action(
+        &self,
+        desk_id: &str,
+        caller: &AccountId,
+        gate: Gate,
+    ) -> Result<Role, Refusal> {
         let role = self
             .role_of(caller)
             .ok_or_else(|| self.stranger(desk_id, caller))?;
-        if self.paused {
+        if self.paused && gate == Gate::Running {
             return Err(Refusal::new(
                 E_PAUSED,
                 format!("desk {desk_id} is paused; only its owner can unpause it"),

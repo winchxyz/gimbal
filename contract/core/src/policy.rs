@@ -11,9 +11,11 @@ use crate::errors::{shown, Refusal, E_ARGS};
 use crate::ids::decode_base58_32;
 
 /// Most entries in one list of a policy. A desk trades a handful of markets; the cap bounds the
-/// storage a policy takes, and `set_policy` is not payable, so a larger policy grows at the
-/// contract's expense.
+/// storage a policy takes (and the deposit a larger one needs).
 pub const MAX_LIST_LEN: usize = 32;
+/// Largest integer JavaScript reads exactly (2^53 − 1): every u64 in a policy stays at or below it,
+/// so the engine and the web see the number the contract enforces.
+pub const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 /// Longest symbol, in bytes.
 pub const MAX_SYMBOL_LEN: usize = 32;
 /// Hyperliquid allows `6 − szDecimals` price decimals on perps, so `szDecimals` is at most 6.
@@ -45,7 +47,7 @@ pub struct Policy {
     pub max_transfer_cost_flat_e6: u64,
     /// Symbols without an oracle price that the owner explicitly allowed (no price band).
     pub unpriced: Vec<String>,
-    /// Their own, smaller cap per leg.
+    /// Their own cap per leg; an unpriced order must fit [`Policy::unpriced_cap_usd`].
     pub unpriced_max_notional_usd: u64,
 }
 
@@ -73,10 +75,16 @@ pub struct PhoenixMarket {
 }
 
 impl Policy {
+    /// The notional cap per leg of an order for an `unpriced` symbol: both caps apply.
+    pub fn unpriced_cap_usd(&self) -> u64 {
+        self.max_notional_usd.min(self.unpriced_max_notional_usd)
+    }
+
     /// Checks the fields on their own, before the policy is stored (`create_desk`, `set_policy`):
-    /// limits that make no sense, malformed symbols and addresses, duplicates. Every refusal is
-    /// `E_ARGS` and names the field, e.g. `policy.hl_assets[1].sz_decimals`. Whether a symbol has an
-    /// oracle price is chain state, checked per order (`E_ORACLE_STALE`, `E_ASSET`).
+    /// limits that make no sense, malformed symbols and addresses, duplicates, integers JavaScript
+    /// cannot read exactly. Every refusal is `E_ARGS` and names the field, e.g.
+    /// `policy.hl_assets[1].sz_decimals`. Whether a symbol has an oracle price is chain state,
+    /// checked per order (`E_ORACLE_STALE`, `E_ASSET`).
     pub fn validate(&self) -> Result<(), Refusal> {
         list_len("hl_assets", self.hl_assets.len())?;
         for (i, asset) in self.hl_assets.iter().enumerate() {
@@ -116,6 +124,11 @@ impl Policy {
                     "phoenix_markets[{i}] has a zero base_lot_e8 or tick_e8"
                 ));
             }
+            safe_integer(
+                &format!("phoenix_markets[{i}].base_lot_e8"),
+                market.base_lot_e8,
+            )?;
+            safe_integer(&format!("phoenix_markets[{i}].tick_e8"), market.tick_e8)?;
             let earlier = &self.phoenix_markets[..i];
             if earlier.iter().any(|m| m.symbol == market.symbol) {
                 return refuse(format!(
@@ -170,15 +183,32 @@ impl Policy {
                 self.max_transfer_cost_bps
             ));
         }
+        for (field, value) in [
+            ("max_notional_usd", self.max_notional_usd),
+            ("rescue_cap_usd_per_hour", self.rescue_cap_usd_per_hour),
+            ("max_transfer_cost_flat_e6", self.max_transfer_cost_flat_e6),
+            ("unpriced_max_notional_usd", self.unpriced_max_notional_usd),
+        ] {
+            safe_integer(field, value)?;
+        }
         // Notional caps and the rescue cap may be zero: that refuses every order or rescue, which is
-        // the owner's call. `unpriced_max_notional_usd` is not compared with `max_notional_usd`:
-        // the defaults (100 against the canary's 20) already put it above.
+        // the owner's call. The two notional caps are not compared: an unpriced order has to fit
+        // both (`unpriced_cap_usd`), and the defaults (100 against the canary's 20) differ that way.
         Ok(())
     }
 }
 
 fn refuse(msg: String) -> Result<(), Refusal> {
     Err(Refusal::new(E_ARGS, format!("policy.{msg}")))
+}
+
+fn safe_integer(field: &str, value: u64) -> Result<(), Refusal> {
+    if value > MAX_SAFE_INTEGER {
+        return refuse(format!(
+            "{field} {value} is over 2^53 - 1, the largest integer JavaScript reads exactly"
+        ));
+    }
+    Ok(())
 }
 
 fn list_len(field: &str, len: usize) -> Result<(), Refusal> {
@@ -362,6 +392,56 @@ mod tests {
     }
 
     #[test]
+    fn an_unpriced_order_fits_both_caps() {
+        let mut p = sample();
+        p.max_notional_usd = 20;
+        p.unpriced_max_notional_usd = 100;
+        assert_eq!(p.unpriced_cap_usd(), 20);
+        p.max_notional_usd = 500;
+        assert_eq!(p.unpriced_cap_usd(), 100);
+    }
+
+    #[test]
+    fn every_u64_is_one_javascript_reads_exactly() {
+        accepted(|p| {
+            p.max_notional_usd = MAX_SAFE_INTEGER;
+            p.rescue_cap_usd_per_hour = MAX_SAFE_INTEGER;
+            p.max_transfer_cost_flat_e6 = MAX_SAFE_INTEGER;
+            p.unpriced_max_notional_usd = MAX_SAFE_INTEGER;
+            p.phoenix_markets[0].base_lot_e8 = MAX_SAFE_INTEGER;
+            p.phoenix_markets[0].tick_e8 = MAX_SAFE_INTEGER;
+        });
+        let over = MAX_SAFE_INTEGER + 1;
+        let msg = refused(|p| p.max_notional_usd = over);
+        assert_eq!(
+            msg,
+            "policy.max_notional_usd 9007199254740992 is over 2^53 - 1, the largest integer JavaScript reads exactly"
+        );
+        let msg = refused(|p| p.rescue_cap_usd_per_hour = over);
+        assert!(msg.starts_with("policy.rescue_cap_usd_per_hour "), "{msg}");
+        let msg = refused(|p| p.max_transfer_cost_flat_e6 = over);
+        assert!(
+            msg.starts_with("policy.max_transfer_cost_flat_e6 "),
+            "{msg}"
+        );
+        let msg = refused(|p| p.unpriced_max_notional_usd = over);
+        assert!(
+            msg.starts_with("policy.unpriced_max_notional_usd "),
+            "{msg}"
+        );
+        let msg = refused(|p| p.phoenix_markets[0].base_lot_e8 = over);
+        assert!(
+            msg.starts_with("policy.phoenix_markets[0].base_lot_e8 "),
+            "{msg}"
+        );
+        let msg = refused(|p| p.phoenix_markets[0].tick_e8 = over);
+        assert!(
+            msg.starts_with("policy.phoenix_markets[0].tick_e8 "),
+            "{msg}"
+        );
+    }
+
+    #[test]
     fn lists_are_capped() {
         accepted(|p| {
             p.hl_assets = (0..MAX_LIST_LEN as u32)
@@ -396,8 +476,8 @@ mod tests {
         }
     }
 
-    /// The largest policy `validate` accepts stays under 8 KiB in storage: that bounds what one
-    /// `set_policy` can grow a desk by at the contract's expense (0.08 NEAR at 1e19 yocto per byte).
+    /// The largest policy `validate` accepts stays under 8 KiB in storage, so the deposit a
+    /// `set_policy` can need is bounded (0.08 NEAR at 1e19 yocto per byte).
     #[test]
     fn the_largest_valid_policy_is_under_8_kib() {
         let n = MAX_LIST_LEN as u32;
@@ -417,8 +497,8 @@ mod tests {
                     PhoenixMarket {
                         symbol: sym(i),
                         orderbook: bs58::encode(key).into_string(),
-                        base_lot_e8: u64::MAX,
-                        tick_e8: u64::MAX,
+                        base_lot_e8: MAX_SAFE_INTEGER,
+                        tick_e8: MAX_SAFE_INTEGER,
                     }
                 })
                 .collect(),
