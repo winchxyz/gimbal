@@ -5,17 +5,13 @@
 //! string the venue parses, and nothing is rounded on the way. The contract refuses anything else
 //! with `E_DECIMAL` instead of normalising it.
 
-use crate::errors::{Refusal, E_DECIMAL};
+use crate::errors::{shown, Refusal, E_DECIMAL};
 
 /// Digits allowed after the dot.
 pub const DECIMALS: usize = 8;
 
 /// Units in 1: values are integers of 1e-8.
 pub const UNIT: u128 = 100_000_000;
-
-/// How much of a refused input the message repeats; the rest is cut so a huge argument cannot
-/// blow up the panic message.
-const SHOWN_CHARS: usize = 40;
 
 /// Parses a canonical decimal string into units of 1e-8.
 ///
@@ -87,17 +83,6 @@ pub fn format_e8(units: u128) -> String {
     }
     let digits = format!("{part:0width$}", width = DECIMALS);
     format!("{whole}.{}", digits.trim_end_matches('0'))
-}
-
-/// The input as the refusal message quotes it: escaped, and cut after [`SHOWN_CHARS`] characters.
-fn shown(s: &str) -> String {
-    let mut chars = s.chars();
-    let head: String = chars.by_ref().take(SHOWN_CHARS).collect();
-    if chars.next().is_some() {
-        format!("{head:?}…")
-    } else {
-        format!("{head:?}")
-    }
 }
 
 #[cfg(test)]

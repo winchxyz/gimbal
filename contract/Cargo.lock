@@ -899,6 +899,7 @@ name = "gimbal-core"
 version = "0.1.0"
 dependencies = [
  "borsh",
+ "bs58 0.5.1",
  "serde",
  "serde_json",
 ]

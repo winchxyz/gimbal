@@ -2,6 +2,7 @@
 //! price source differ between testnet and mainnet; the code is the same.
 
 use gimbal_core::errors::{Refusal, E_ARGS};
+use gimbal_core::ids::is_lower_evm_address;
 use near_sdk::{near, AccountId};
 
 /// Hyperliquid caps a builder fee on perps at 100 tenths of a bp (0.1 %).
@@ -86,6 +87,19 @@ pub struct FeeConfig {
     pub hl_builder_tenth_bps: u16,
 }
 
+/// Everything `new` fixes, as `config()` returns it.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Config {
+    pub network: Network,
+    /// The MPC signer contract (`v1.signer` mainnet, `v1.signer-prod.testnet` testnet).
+    pub mpc: AccountId,
+    pub price_source: PriceSource,
+    pub treasury: Treasury,
+    pub fees: FeeConfig,
+    pub orderly: OrderlyConfig,
+}
+
 /// Checks the arguments of `new`. They are fixed for the contract's life and every desk depends on
 /// them, so a wrong value is refused up front rather than at the first order.
 pub fn check(
@@ -147,16 +161,6 @@ pub fn check(
         ));
     }
     Ok(())
-}
-
-/// `0x` and 40 lowercase hex digits: Hyperliquid lowercases addresses before it verifies a
-/// signature, so a mixed-case address in a signed action would not match.
-fn is_lower_evm_address(s: &str) -> bool {
-    s.len() == 42
-        && s.starts_with("0x")
-        && s[2..]
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[cfg(test)]
