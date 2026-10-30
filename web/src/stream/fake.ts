@@ -1,24 +1,23 @@
 // Development only: a stream of StreamEvent-shaped events so the shell can run without an engine.
 // Every value here is made up; the UI labels this source "Fake stream". Each event goes through
 // JSON and the same parser as the SSE client, so it exercises the real path into the store.
-import type {
-  DeskState,
-  JournalEntry,
-  Leg,
-  Mode,
-  SetupProgress,
-  StreamEvent,
-  Window as FundingWindow,
-} from '@gimbal/shared';
+import type { DeskState, JournalEntry, Leg, Mode, SetupProgress, StreamEvent } from '@gimbal/shared';
 import { parseStreamEvent, type Health, type StreamAction } from './store.ts';
+import { fakeScan, fakeWindows, type Scenario } from './fake-windows.ts';
 
 export interface FakeOptions {
   mode: Mode;
   intervalMs?: number;
+  /** What the Windows screen shows (`?state=`); the default is the mockup's full list. */
+  scenario?: Scenario;
+  /** A slow swing in every funding rate, so the list re-sorts now and then. Off for a still picture. */
+  drift?: boolean;
 }
 
 export function startFakeStream(dispatch: (action: StreamAction) => void, options: FakeOptions): () => void {
   const intervalMs = options.intervalMs ?? 800;
+  const scenario = options.scenario ?? 'normal';
+  const windowsOptions = { scenario, startedAt: Date.now(), drift: options.drift ?? true };
   let tick = 0;
 
   const send = (event: StreamEvent) => {
@@ -30,7 +29,11 @@ export function startFakeStream(dispatch: (action: StreamAction) => void, option
     const now = Date.now();
     if (tick === 0) send({ type: 'setup', data: fakeSetup() });
     if (tick % 3 === 0) send({ type: 'health', data: fakeHealth(tick) });
-    if (tick % 4 === 0) send({ type: 'windows', data: fakeWindows(now, tick) });
+    // The scanner sends its windows and its status together; `loading` sends neither.
+    if (tick % 4 === 0 && scenario !== 'loading') {
+      send({ type: 'windows', data: fakeWindows(now, tick, windowsOptions) });
+      send({ type: 'scan', data: fakeScan(now, scenario) });
+    }
     if (tick % 6 === 5) send({ type: 'journal', data: fakeFunding(now, tick) });
     send({ type: 'desk', data: fakeDesk(options.mode, now, tick) });
     tick += 1;
@@ -90,40 +93,6 @@ function fakeLeg(venue: Leg['venue'], side: Leg['side'], mark: number, liqPx: nu
     unsettledFundingUsd: venue === 'phoenix' ? round(0.001 * (tick % 50), 3) : 0,
     unpriced: false,
   };
-}
-
-function fakeWindows(now: number, tick: number): FundingWindow[] {
-  const rows: [string, string, string, number][] = [
-    ['DOGE', 'phoenix', 'hyperliquid', 13.8],
-    ['SOL', 'phoenix', 'orderly', 8.6],
-    ['AVAX', 'orderly', 'hyperliquid', 6.1],
-    ['LTC', 'hyperliquid', 'phoenix', 4.2],
-  ];
-  return rows.map(([symbol, longVenue, shortVenue, base], i) => {
-    const netAprPct = round(base + 1.5 * Math.sin((tick + i * 7) / 9), 1);
-    const costs = { feesPct: 1.9, slippagePct: 0.4, basisPct: 0.3, rescueReservePct: 0.5 };
-    const grossAprPct = round(netAprPct + costs.feesPct + costs.slippagePct + costs.basisPct + costs.rescueReservePct, 1);
-    return {
-      id: `fake-${symbol.toLowerCase()}`,
-      symbol,
-      longVenue,
-      shortVenue,
-      grossAprPct,
-      grossApr7dPct: round(grossAprPct - 0.8, 1),
-      costs,
-      netAprPct,
-      usdPerDayPer1k: round((netAprPct / 100 / 365) * 1000, 2),
-      breakevenHours: round(30 - netAprPct, 0),
-      depthUsd: 25000 - i * 4000,
-      intervalsAbove: 12 - i,
-      updatedAt: now,
-      tradable: true,
-      held: i === 0 ? { since: now - 6 * 3_600_000 } : null,
-      checks: [],
-      switchCostUsd: i === 0 ? null : 1.1,
-      stale: false,
-    };
-  });
 }
 
 function fakeFunding(now: number, tick: number): JournalEntry {

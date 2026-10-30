@@ -4,7 +4,7 @@ import react from '@vitejs/plugin-react';
 // The engine's HTTP API (docs/interfaces.md §2). In development the dashboard talks to it through
 // this proxy, so the browser only ever sees one origin.
 const engine = process.env.GIMBAL_ENGINE_URL ?? `http://localhost:${process.env.ENGINE_PORT ?? '8790'}`;
-const engineRoutes = ['/events', '/state', '/stress', '/policy', '/strategy', '/setup'];
+const engineRoutes = ['/events', '/state', '/stress', '/policy', '/strategy', '/setup', '/windows'];
 
 export default defineConfig({
   plugins: [react()],

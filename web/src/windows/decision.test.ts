@@ -1,0 +1,78 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { decide, perDayOnLegs } from './decision.ts';
+import { STRATEGY, net, win } from './testing.ts';
+
+const NOW = Date.UTC(2026, 9, 27, 14, 0);
+const heldSince = NOW - (2 * 24 + 14) * 3_600_000;
+const doge = net('DOGE', 13.8, { held: { since: heldSince }, usdPerDayPer1k: 0.38 });
+const sol = net('SOL', 8.6, { switchCostUsd: 1.1, usdPerDayPer1k: 0.24 });
+
+test('a lower window than the held one: auto keeps the held one and says what switching costs', () => {
+  const d = decide({ selected: sol, windows: [doge, sol], strategy: STRATEGY, now: NOW });
+  assert.equal(d.text, 'Auto keeps DOGE: SOL is 5.2 points lower. Switching now costs about $1.10.');
+  assert.equal(d.rotate?.to.symbol, 'SOL');
+  assert.equal(d.rotate?.costUsd, 1.1);
+  assert.equal(d.alert?.over.symbol, 'DOGE');
+  assert.equal(d.close, false);
+});
+
+test('the held window: since when, for how long, and Close position', () => {
+  const d = decide({ selected: doge, windows: [doge, sol], strategy: STRATEGY, now: NOW });
+  assert.equal(d.text, 'Held since 25 Oct 00:00 UTC · 2 d 14 h.');
+  assert.equal(d.close, true);
+  assert.equal(d.rotate, null);
+  assert.equal(d.alert, null);
+});
+
+test('a window above the held one: the numbers and the payback, not a claim about what auto does', () => {
+  const better = net('NEAR', 15.8, { switchCostUsd: 1.1, usdPerDayPer1k: 0.43 });
+  const d = decide({ selected: better, windows: [doge, better], strategy: STRATEGY, now: NOW });
+  // 2.0 points above; extra $0.05 per $1k = $0.06 a day on $1,200 legs; $1.10 / $0.06 is about 18 days
+  assert.match(d.text, /^NEAR is 2\.0 points above DOGE\. Switching now costs about \$1\.10\. The extra \$0\.06 a day earns that back in \d+ days\.$/);
+  assert.equal(d.alert, null);
+  assert.ok(d.rotate);
+  const noStrategy = decide({ selected: better, windows: [doge, better], strategy: null, now: NOW });
+  assert.equal(noStrategy.text, 'NEAR is 2.0 points above DOGE. Switching now costs about $1.10.');
+  const noCost = decide({ selected: { ...better, switchCostUsd: null }, windows: [doge, better], strategy: STRATEGY, now: NOW });
+  assert.equal(noCost.text, 'NEAR is 2.0 points above DOGE.');
+});
+
+test('refused and vetoed windows cannot be rotated into', () => {
+  const refused = net('ZRO', 35.2, { refused: { code: 'E_ORACLE_STALE', reason: 'no trusted price' }, switchCostUsd: 1.1 });
+  const d = decide({ selected: refused, windows: [doge, refused], strategy: STRATEGY, now: NOW });
+  assert.equal(d.text, 'The contract would refuse this window under your policy: no trusted price. Auto will not enter it.');
+  assert.equal(d.rotate, null);
+
+  const vetoed = net('AVAX', 9.1, { veto: { verdict: 'veto', reasons: ['one-off spike'], model: 'm', at: 1 } });
+  const v = decide({ selected: vetoed, windows: [doge, vetoed], strategy: STRATEGY, now: NOW });
+  assert.equal(v.text, 'NEAR AI vetoed it: one-off spike. A veto only removes a window, so auto will not enter it.');
+  assert.equal(v.rotate, null);
+  assert.equal(v.alert, null);
+});
+
+test('watch-only windows name the venues the desk cannot trade', () => {
+  const w = win({ symbol: 'XMR', tradable: false, longVenue: 'lighter', shortVenue: 'hyperliquid' });
+  assert.equal(
+    decide({ selected: w, windows: [w], strategy: STRATEGY, now: NOW }).text,
+    'Watch-only: the desk can’t trade on Lighter. It is shown so you can see where the funding is.',
+  );
+});
+
+test('nothing held: auto enters the best window that clears the minimum', () => {
+  const a = net('SOL', 8.6);
+  const b = net('NEAR', 12);
+  const c = net('BTC', 2.1);
+  assert.equal(decide({ selected: b, windows: [a, b, c], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters NEAR: it is the best window that clears your 5% minimum.');
+  assert.equal(decide({ selected: a, windows: [a, b, c], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters NEAR first: 12.0% against 8.6% here.');
+  assert.equal(decide({ selected: c, windows: [a, b, c], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. BTC is under your 5% minimum, so auto will not enter it.');
+  assert.match(decide({ selected: a, windows: [a, b, c], strategy: null, now: NOW }).text, /minimum could not be read/);
+  const none = decide({ selected: a, windows: [a, b, c], strategy: STRATEGY, now: NOW });
+  assert.equal(none.rotate, null);
+  assert.equal(none.close, false);
+});
+
+test('"about $X a day on $Y legs" uses the window’s $/day per $1k at the strategy’s leg size', () => {
+  assert.ok(Math.abs(perDayOnLegs(sol, 1200) - 0.288) < 1e-9);
+  assert.equal(perDayOnLegs(win({ usdPerDayPer1k: 0 }), 1200), 0);
+});
