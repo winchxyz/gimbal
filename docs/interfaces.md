@@ -49,7 +49,13 @@ A desk belongs to one owner. Its venue addresses are MPC keys derived for the co
 The engine computes the addresses with the MPC contract's `derived_public_key({path, predecessor: <contract>, domain_id})`
 and the owner passes them to `create_desk`. The contract checks them: `create_desk` asks the MPC contract's
 `derived_public_key` for both paths (a cross-contract call) and stores the desk only in the callback, when the EVM
-address and the Solana authority match; otherwise it refunds the deposit and emits nothing (`E_ARGS` in the log).
+address and the Solana authority match; otherwise it refunds the whole deposit, stores nothing and ends the
+transaction as a refusal (`E_MPC`, `E_ARGS`, `E_DESK_EXISTS` or `E_DEPOSIT`). Attach about **100 TGas**: the
+call and its callback burn ~18 TGas (measured on testnet 2026-10-30), and `create_desk` refuses less than its
+floor (2 × the MPC derive gas + the callback gas + its own cost, ~54 TGas) with `E_ARGS`. The transaction's result
+is the callback's. Desk ids are global, so another owner can take an id between the call and its callback: after
+`create_desk` a client reads `get_desk(desk_id)` and checks that `owner` is its own account before it funds the
+desk's addresses.
 Without that check an owner could register their own wallet as the desk's address and take profit out through
 `hl_withdraw` or `orderly_withdraw` without the performance fee. The Solana token accounts and the Phoenix trader
 account are derived from the authority and checked from day 4 (Solana parser). They can never change afterwards.
@@ -117,9 +123,11 @@ owner as the caller either way. Every owner method (no ✓ in the Operator colum
 `set_paused` with `paused: false`, requires exactly 1 yoctoNEAR attached. A FunctionCall key cannot attach a
 deposit, so the operator key is refused (`E_NOT_ALLOWED`); only the owner's wallet (a full-access key) can
 call them. Onboarding adds the operator key with `method_names` = the operator methods only. `create_desk`,
-`set_policy` and `set_operator` take a storage deposit instead: at least 1 yocto and at least the storage the
-call adds (`E_DEPOSIT`, measured as the change in storage usage); the excess is refunded to the caller, and
-storage freed later is not refunded. The contract never pays for storage a caller adds.
+`set_policy` and `set_operator` take a storage deposit instead: at least 1 yocto (no deposit at all is the
+FunctionCall-key path, `E_NOT_ALLOWED`) and at least the storage the call adds (`E_DEPOSIT`, measured as the
+change in storage usage); the excess is refunded to the caller, and storage freed later is not refunded. The
+contract never pays for storage a caller adds. Pausing takes no deposit, or the 1 yocto a wallet may attach to
+every owner call; more would stay in the contract and is refused (`E_DEPOSIT`).
 
 **Paused desks.** While a desk is paused every operator action method refuses `E_PAUSED`, except actions that
 only reduce risk, which `panic_close` and a rescue rely on: reduce-only orders (`hl_order` / an `orderly_request`
@@ -142,10 +150,10 @@ chooses nothing:
 
 | Method | Owner | Operator | Notes |
 |---|---|---|---|
-| `create_desk(desk_id, policy, evm_address, solana)` | ✓ | | payable: storage deposit; the desk is stored in the callback after the MPC address check (§1.2) |
+| `create_desk(desk_id, policy, evm_address, solana)` | ✓ | | payable: storage deposit; ~100 TGas; the desk is stored in the callback after the MPC address check, and the transaction's result is the callback's (§1.2) |
 | `set_policy(desk_id, policy)` | ✓ | | payable: storage deposit for a larger policy (≥ 1 yocto) |
 | `set_operator(desk_id, operator: Option<AccountId>)` | ✓ | | payable: storage deposit (≥ 1 yocto) |
-| `set_paused(desk_id, paused)` | ✓ | pause only | unpausing needs 1 yocto attached, so the operator key cannot unpause |
+| `set_paused(desk_id, paused)` | ✓ | pause only | pausing: 0 or 1 yocto (more → `E_DEPOSIT`); unpausing needs exactly 1 yocto attached, so the operator key cannot unpause |
 | `ft_on_transfer(sender_id, amount, msg)` | any sender | | USDC on NEAR only (`ft_transfer_call`, msg `{"desk_id"}`): owner → `deposited` + `idle_usdc`; others → `idle_usdc`; unknown desk → full refund (§1.2) |
 | `fund_venue(desk_id, quote, quote_signature, reason)` | ✓ | ✓ | sends the desk's USDC on NEAR to a verified 1Click deposit address (recipient = a desk venue address or the pinned Orderly receiver) |
 | `withdraw_to_owner(desk_id, amount)` | ✓ | | pays USDC on NEAR the contract holds for the desk, minus the performance fee to the treasury |
@@ -245,11 +253,11 @@ near-sdk before the method runs ("Failed to deserialize input from JSON"); clien
 
 | Code | When |
 |---|---|
-| `E_NOT_ALLOWED` | caller is neither owner nor operator, operator called an owner method, or an owner method came without 1 yocto attached (§1.3) |
+| `E_NOT_ALLOWED` | caller is neither owner nor operator, operator called an owner method, an owner method came without exactly 1 yocto attached, or a storage method (`create_desk`, `set_policy`, `set_operator`) came with no deposit (§1.3) |
 | `E_PAUSED` | desk paused |
 | `E_NO_DESK` / `E_DESK_EXISTS` | |
-| `E_ARGS` | malformed argument: desk_id outside `[a-z0-9-]{1,32}`, bad address or base58/hex, `reason` over 280 characters, a once-only setting set twice |
-| `E_DEPOSIT` | attached deposit below the storage cost (`create_desk`, `set_policy`) |
+| `E_ARGS` | malformed argument: desk_id outside `[a-z0-9-]{1,32}`, bad address or base58/hex, `reason` over 280 characters, a once-only setting set twice, `create_desk` with less prepaid gas than its floor (§1.2) |
+| `E_DEPOSIT` | attached deposit below the storage cost (`create_desk`, `set_policy`, `set_operator`), or a pause carrying more than 1 yocto |
 | `E_ASSET` | asset, symbol or market not in the policy |
 | `E_SIZE` | notional over `max_notional_usd`, or zero |
 | `E_DECIMAL` | non-canonical decimal string |
