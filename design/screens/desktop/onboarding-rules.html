@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1440">
+<title>Gimbal · Your rules</title>
+<link rel="stylesheet" href="../../tokens.css">
+<link rel="stylesheet" href="../shared/stage.css">
+</head>
+<body>
+<header>
+  <i data-mark></i>
+  <div class="lite"><span class="dot" style="color:var(--ink)">Mainnet</span><span>demo-owner.near</span></div>
+</header>
+
+<div class="ob">
+  <aside class="rail">
+    <div class="st done"><i>✓</i><div><b>Wallet connected</b><span>demo-owner.near</span></div></div>
+    <div class="st done"><i>✓</i><div><b>Desk created</b><span>desk-07 · accounts derived on Hyperliquid, Phoenix and Orderly</span></div></div>
+    <div class="st done"><i>✓</i><div><b>$1,050.00 deposited</b><span>USDC from NEAR through Intents · $500 to Hyperliquid, $500 to Phoenix, $50 kept as rescue reserve</span></div></div>
+    <div class="st now"><i>4</i><div><b>Your rules</b><span>Say what the desk may do. NEAR AI turns it into a policy.</span></div></div>
+    <div class="st todo"><i>5</i><div><b>Sign the policy</b><span>One signature with your wallet. The contract enforces it from then on.</span></div></div>
+  </aside>
+
+  <section class="obmain">
+    <h1>Your rules</h1>
+    <p>Write them the way you would tell a person. The contract only enforces numbers, so here is exactly what it will read.</p>
+
+    <div class="two">
+      <div>
+        <h3><span>In your words</span><span>NEAR AI · 1.4 s</span></h3>
+        <div class="words">I want steady income from funding, nothing fancy. Big coins plus DOGE and NEAR are fine. Never more than $1,500 a side and never more than 3x. If prices look weird, don’t trade. Money only ever comes back to me.<span class="caret"></span></div>
+        <p class="hint">Drafted inside a TEE on NEAR AI Cloud. The model never signs anything; you do.</p>
+      </div>
+      <div>
+        <h3><span>What the contract will enforce</span><span>8 rules</span></h3>
+        <div class="pol" id="pol"></div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<div class="obbar" style="left:440px">
+  <span>Each change later needs your signature again. Signing costs about 0.003 NEAR.</span>
+  <span class="end"><a class="btn quiet">Edit a rule</a><a class="btn big primary">Sign policy</a></span>
+</div>
+
+<script src="../shared/mark.js"></script>
+<script>
+const rules = [
+  ['Assets', 'BTC, ETH, SOL, AVAX, LTC, DOGE, NEAR', '“Big coins plus DOGE and NEAR”'],
+  ['Exchanges', 'Hyperliquid, Phoenix, Orderly', 'All three the desk can trade on', true],
+  ['Size per leg', 'up to $1,500', '“Never more than $1,500 a side”'],
+  ['Leverage', 'up to 3×', '“Never more than 3x”'],
+  ['Price check', 'within 1% of the oracle, oracle under 60 s old', '“If prices look weird, don’t trade”'],
+  ['Assets without a trusted price', 'not allowed', '“Nothing fancy”'],
+  ['Minimum to enter', '5% net a year after costs', 'you gave none, so the 5% default', true],
+  ['Money out', 'only to demo-owner.near', '“Money only ever comes back to me”'],
+];
+document.getElementById('pol').innerHTML = rules.map(([k, v, src, ai]) => `<div><b>${k}</b><span class="val">${v}</span><span class="src ${ai ? 'ai' : ''}">${ai ? 'Added by NEAR AI: ' : 'From '}${src}</span></div>`).join('');
+</script>
+<script>
+window.STATE_HOOKS = {
+  loading() {
+    document.getElementById('pol').innerHTML = '<p class="g" style="margin:0 0 12px">NEAR AI is drafting your policy, usually in under 2 s…</p>' + Array(6).fill('<div><b class="sk" style="color:transparent;background:var(--sel);border-radius:4px">Assets placeholder</b><span class="val sk" style="color:transparent;background:var(--sel);border-radius:4px">placeholder value</span></div>').join('');
+  },
+  empty() {
+    document.querySelector('.words').innerHTML = '<span class="g">For example: steady income, only big coins, never more than $1,000 a side, money only comes back to me.</span><span class="caret"></span>';
+    document.querySelector('.words').previousElementSibling.lastElementChild.textContent = '';
+    document.getElementById('pol').innerHTML = '<p class="g" style="margin:0">Your rules will appear here as numbers the contract can check.</p>';
+    document.getElementById('pol').previousElementSibling.lastElementChild.textContent = '';
+    document.querySelectorAll('.obbar .btn').forEach(b => { b.setAttribute('aria-disabled', 'true'); });
+  },
+  error() {
+    document.getElementById('pol').innerHTML = '<p style="margin:0 0 8px">NEAR AI didn’t answer in 10 s.</p><p class="g" style="margin:0 0 20px">Your words are kept. Try again, or set the numbers yourself.</p><a class="btn">Try again</a> <a class="btn quiet">Set numbers myself</a>';
+  }
+};
+</script>
+<script src="../shared/states.js"></script>
+</body>
+</html>

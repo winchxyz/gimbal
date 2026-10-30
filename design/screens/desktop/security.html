@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1440">
+<title>Gimbal · Security</title>
+<link rel="stylesheet" href="../../tokens.css">
+<link rel="stylesheet" href="../shared/stage.css">
+</head>
+<body class="scroll">
+<header>
+  <i data-mark></i>
+  <nav><a href="desk.html">Desk</a><a href="windows.html">Windows</a><a href="journal.html">Journal</a><a href="rescue.html">Rescue</a><a class="on" href="security.html">Security</a></nav>
+  <div class="right"><span class="dot" style="color:var(--ink)">Mainnet</span><span>desk-07</span><a class="btn">Withdraw</a><a class="btn primary">Add funds</a></div>
+</header>
+
+<main class="sec">
+  <section class="sechead">
+    <div>
+      <div class="zero">0</div>
+      <h1>private keys exist for this desk</h1>
+      <p>Not ours, not the bot’s, not yours. A NEAR contract owns every exchange account and asks the NEAR MPC network to sign, one order at a time, only after checking it against your policy.</p>
+    </div>
+    <div class="flow">
+      <h3>How an order gets signed</h3>
+      <ol>
+        <li><b>You sign the policy</b><span>demo-owner.near, once; again for every change</span></li>
+        <li><b>The operator proposes an order</b><span>the desk engine; it holds no key</span></li>
+        <li><b>The gimbal contract checks it</b><span>asset, size, leverage, price against the oracle, destination</span></li>
+        <li><b>NEAR MPC signs it</b><span>v1.signer, in 5 to 7 seconds</span></li>
+        <li><b>The exchange fills it</b><span>Hyperliquid, Phoenix or Orderly</span></li>
+      </ol>
+      <p>If step 3 fails, nothing is signed and the refusal goes in the Journal.</p>
+    </div>
+  </section>
+
+  <section class="cols3">
+    <div>
+      <h2>Your policy</h2>
+      <ul id="policy"></ul>
+      <p class="g" style="font-size:13px;margin-top:14px">Signed by demo-owner.near on 21 Oct · <a style="color:var(--ink)">Change policy</a></p>
+    </div>
+    <div>
+      <h2>The operator can</h2>
+      <ul>
+        <li class="yes">Propose an order<small>The contract builds it, checks it, then signs or refuses.</small></li>
+        <li class="yes">Propose a margin move<small>Only between the desk’s own accounts, through a signed Intents quote, up to $500 an hour.</small></li>
+        <li class="yes">Refresh oracle prices<small>Read-only; costs gas, moves no money.</small></li>
+      </ul>
+      <h2 style="margin-top:36px">The operator cannot</h2>
+      <ul>
+        <li class="no">Withdraw to any address but yours</li>
+        <li class="no">Trade an asset or size outside the policy</li>
+        <li class="no">Change the policy or unpause the desk</li>
+        <li class="no">Get a key: there is none to give</li>
+      </ul>
+    </div>
+    <div>
+      <h2>Only you can</h2>
+      <ul>
+        <li class="yes">Pause the desk<small>Stops new orders at once. Rescue still runs.</small></li>
+        <li class="yes">Close both legs</li>
+        <li class="yes">Withdraw<small>Always to demo-owner.near.</small></li>
+        <li class="yes">Change the policy<small>A new signature from your wallet each time.</small></li>
+        <li class="yes">Replace the operator</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="addrs">
+    <h2>Accounts the contract controls</h2>
+    <div class="arow hd"><span>Exchange</span><span>Chain · signature</span><span>Address, derived from the contract</span><span>Derivation path</span><span></span></div>
+    <div class="arow"><span>Hyperliquid</span><span class="g">EVM · secp256k1</span><span class="mono">0x5e1d 7a03 b8c4 … 2f6e c09a</span><span class="g">gimbal/desk-07 · hl</span><a class="g">Explorer ↗</a></div>
+    <div class="arow"><span>Phoenix</span><span class="g">Solana · Ed25519</span><span class="mono">7Hq3 kR2v Ua9d … Lm4x wP2f</span><span class="g">gimbal/desk-07 · sol</span><a class="g">Solscan ↗</a></div>
+    <div class="arow"><span>Orderly</span><span class="g">EVM · secp256k1 + Ed25519</span><span class="mono">0x2b9c 41de 07fa … 9e13 5d77</span><span class="g">gimbal/desk-07 · orderly</span><a class="g">Explorer ↗</a></div>
+    <div class="arow"><span>Rescue reserve</span><span class="g">Solana · Ed25519</span><span class="mono">7Hq3 kR2v Ua9d … Lm4x wP2f</span><span class="g">same as Phoenix</span><a class="g">Solscan ↗</a></div>
+  </section>
+
+  <section class="trust">
+    <div>
+      <h2 style="font:var(--t-l);margin:0 0 14px">What you still trust</h2>
+      <ul style="list-style:none;margin:0;padding:0">
+        <li style="padding:10px 0;border-top:1px solid var(--line)">The NEAR MPC network to sign only what the contract asks</li>
+        <li style="padding:10px 0;border-top:1px solid var(--line)">NEAR Intents to deliver a quoted transfer; the contract checks the quote’s signature</li>
+        <li style="padding:10px 0;border-top:1px solid var(--line)">Each exchange to stay solvent and honour withdrawals</li>
+        <li style="padding:10px 0;border-top:1px solid var(--line)">The oracle price, within the 1% band and 60 s age</li>
+      </ul>
+    </div>
+    <div>
+      <h2 style="font:var(--t-l);margin:0 0 14px">Checked so far</h2>
+      <ul style="list-style:none;margin:0;padding:0" id="tests"></ul>
+    </div>
+  </section>
+</main>
+
+<script src="../shared/mark.js"></script>
+<script>
+const pol = ['Assets: BTC, ETH, SOL, AVAX, LTC, DOGE, NEAR', 'Exchanges: Hyperliquid, Phoenix, Orderly', 'Up to $1,500 a leg, 3× leverage', 'Orders within 1% of the oracle price', 'No assets without a trusted price', 'Enter at 5% net a year or more', 'Money out only to demo-owner.near'];
+document.getElementById('policy').innerHTML = pol.map(p => `<li>${p}</li>`).join('');
+const tests = [['Order over the size cap', 'refused'], ['Asset outside the list', 'refused'], ['Price 3% from the oracle', 'refused'], ['Intents quote with a swapped address', 'refused'], ['Withdraw to another account', 'refused']];
+document.getElementById('tests').innerHTML = tests.map(([t, r]) => `<li style="padding:10px 0;border-top:1px solid var(--line);display:flex;justify-content:space-between"><span>${t}</span><span style="color:var(--danger)">${r} ↗</span></li>`).join('');
+
+</script>
+<template id="t-empty"><div class="state-page"><div class="state-msg"><div class="lab">Security</div><h1>No desk yet</h1><p>Once you create a desk, this page shows the accounts its contract controls, your policy, and what the operator can and cannot do.</p><div class="go"><a class="btn primary">Create a desk</a></div></div></div></template>
+<template id="t-error"><div class="state-page"><div class="state-msg"><div class="lab">Security</div><h1>Can’t read the contract</h1><p>The NEAR RPC didn’t answer. Nothing about the desk has changed; this page reads the contract directly and will refresh when it can.</p><div class="go"><a class="btn primary">Try again</a><a class="btn quiet">Open the contract in the explorer</a></div></div></div></template>
+<script src="../shared/states.js"></script>
+</body>
+</html>

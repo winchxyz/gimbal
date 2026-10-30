@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=390">
+<title>Gimbal · Rescue · phone</title>
+<link rel="stylesheet" href="../../tokens.css">
+<link rel="stylesheet" href="../shared/phone.css">
+</head>
+<body>
+<header><i data-mark></i><div class="right"><span class="dot" style="color:var(--ink)">Mainnet</span><span>desk-07</span></div></header>
+<div class="status rescuing"><span class="state dot">Rescuing</span>The Hyperliquid short came within 7.9% of liquidation. No action needed from you.</div>
+<section class="sec">
+  <div class="lab">Time since detected</div><div class="hero">0:31</div><p class="small">Usually done in 52 s</p>
+  <div class="rows" style="margin-top:16px"><div><span>Moving</span><span>$120.00 · Phoenix → Hyperliquid</span></div><div><span>Distance after</span><span>7.9% → 16.1%</span></div></div>
+</section>
+<section class="sec"><ol class="steps"><li class="done"><span class="n">1</span><b>Detect</b><span class="tm">0.0 s</span><small>within 7.9%, under your 8% rule</small></li><li class="done"><span class="n">2</span><b>Source</b><span class="tm">0.4 s</span><small>Phoenix free margin; reserve kept</small></li><li class="done"><span class="n">3</span><b>Quote</b><span class="tm">1.2 s</span><small>NEAR Intents: $120.00 → $119.52</small></li><li class="done"><span class="n">4</span><b>Verify</b><span class="tm">0.3 s</span><small>quote signature and deposit address</small></li><li class="now"><span class="n">5</span><b>Sign</b><span class="tm">4.2 s</span><small>NEAR MPC signs the transfer</small></li><li class="todo"><span class="n">6</span><b>Deposit</b><span class="tm">~2 s</span><small>to the Intents address on Solana</small></li><li class="todo"><span class="n">7</span><b>Landed</b><span class="tm">~40 s</span><small>credited to Hyperliquid margin</small></li></ol></section>
+<section class="sec"><div class="lab">Stress test · testnet only</div><p class="small">You are on mainnet. Switch to testnet to run one.</p></section>
+<nav class="tabs"><a href="desk.html"><i></i>Desk</a><a href="windows.html"><i></i>Windows</a><a href="journal.html"><i></i>Journal</a><a class="on" href="rescue.html"><i></i>Rescue</a><a href="security.html"><i></i>Security</a></nav>
+<script src="../shared/mark.js"></script>
+<script src="../shared/states.js"></script>
+</body>
+</html>

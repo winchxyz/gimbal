@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1440">
+<title>Gimbal · Rescue</title>
+<link rel="stylesheet" href="../../tokens.css">
+<link rel="stylesheet" href="../shared/stage.css">
+</head>
+<body>
+<header>
+  <i data-mark></i>
+  <nav><a href="desk.html">Desk</a><a href="windows.html">Windows</a><a href="journal.html">Journal</a><a class="on" href="rescue.html">Rescue</a><a href="security.html">Security</a></nav>
+  <div class="right"><span class="dot" style="color:var(--ink)">Mainnet</span><span>desk-07</span><a class="btn">Withdraw</a><a class="btn primary">Add funds</a></div>
+</header>
+
+<div class="status rescuing">
+  <span class="state dot">Rescuing</span>
+  <span>DOGE rose 23% and the Hyperliquid short came within 7.9% of liquidation. The desk is moving margin to it now.</span>
+  <span class="end"><span class="g3" style="font-size:13px">No action needed from you</span></span>
+</div>
+
+<section class="rhero">
+  <div>
+    <div class="lab">Time since detected</div>
+    <div class="timer">0:31</div>
+    <div class="lab" style="margin-top:12px">Usually done in 52 s</div>
+  </div>
+  <div class="move">
+    <div class="lab">Moving</div>
+    <b>$120.00</b>
+    <span>Phoenix free margin → Hyperliquid margin, through NEAR Intents</span>
+  </div>
+  <div class="after">
+    <div class="lab">Hyperliquid short, distance to liquidation</div>
+    <b>16.1%</b>
+    <span>once the margin lands, up from 7.9% now</span>
+  </div>
+</section>
+
+<section class="rsteps" id="steps"></section>
+
+<section class="rbottom">
+  <div>
+    <h3><span>Hyperliquid short</span><span>now → after</span></h3>
+    <div class="ba">
+      <span>Mark price</span><span>0.24410</span><span>0.24410</span>
+      <span>Margin</span><span>$205.40</span><span>$324.92</span>
+      <span>Liquidation price</span><span>0.26340</span><span>0.28319</span>
+      <span>Distance</span><span class="wt">7.9%</span><span>16.1%</span>
+      <span>Net exposure</span><span>0 DOGE</span><span>0 DOGE</span>
+    </div>
+  </div>
+  <div class="past">
+    <h3><span>Earlier rescues</span><span>average 52 s</span></h3>
+    <div><span>26 Oct · to Hyperliquid</span><span>$120.00</span><span>52 s</span></div>
+    <div><span>22 Oct · to Phoenix</span><span>$20.00</span><span>1 min 47 s</span></div>
+    <div><span>22 Oct · to Hyperliquid</span><span>$25.00</span><span>51 s</span></div>
+    <p class="g" style="font-size:13px;margin:12px 0 0">Fees were $0.21 to $0.32 each. Every rescue is in the Journal with its transactions.</p>
+  </div>
+  <div class="stress">
+    <h3><span>Stress test</span><span>testnet only</span></h3>
+    <p>Pushes one leg past the rescue line on testnet so you can watch every step run. NEAR Intents has no testnet, so the transfer step plays back a recorded mainnet run, marked as replay.</p>
+    <a class="btn" aria-disabled="true">Run a stress test</a>
+    <p style="margin-top:12px">You are on mainnet. Switch to testnet to run it.</p>
+  </div>
+</section>
+
+<script src="../shared/mark.js"></script>
+<script>
+// state: done | now | todo; tm: measured or expected time
+const steps = [
+  ['Detect', 'Short at 7.9% from liquidation, inside your 8% rule', 'done', '0.0 s'],
+  ['Source', 'Phoenix long gained $118 as DOGE rose; its free margin pays. Reserve kept.', 'done', '0.4 s'],
+  ['Quote', 'NEAR Intents: $120.00 in, $119.52 lands on Hyperliquid', 'done', '1.2 s'],
+  ['Verify', 'Contract checks the quote signature and the deposit address', 'done', '0.3 s'],
+  ['Sign', 'NEAR MPC signs the Phoenix withdrawal and transfer', 'now', '4.2 s · usually 6 s'],
+  ['Deposit', 'Sent to the Intents deposit address on Solana', 'todo', 'about 2 s'],
+  ['Landed', 'Credited to Hyperliquid margin', 'todo', 'about 40 s'],
+];
+document.getElementById('steps').innerHTML = steps.map(([b, p, st, tm], i) => `<div class="${st}"><span class="n">${i + 1}</span><b>${b}</b><p>${p}</p><span class="tm">${tm}</span></div>`).join('');
+</script>
+<template id="t-empty"><div class="state-page"><div class="status"><span class="state dot">Level</span><span>Nothing to rescue. Both legs are more than 15% from liquidation.</span></div><div class="state-msg"><div class="lab">Rescue</div><h1>Standing by</h1><p>The desk checks both legs every 4 s. If one comes within <b>8% of liquidation</b>, it moves margin from the reserve or the other leg through NEAR Intents, usually in under a minute.</p><div class="facts2"><div><b>32.6%</b><span>Hyperliquid to liquidation</span></div><div><b>31.9%</b><span>Phoenix to liquidation</span></div><div><b>$40.81</b><span>reserve ready</span></div></div><div class="go"><a class="btn quiet">Earlier rescues</a><a class="btn" aria-disabled="true">Run a stress test · testnet only</a></div></div></div></template>
+<script>
+window.STATE_HOOKS = {
+  error() {
+    const st = document.querySelector('.status');
+    st.className = 'status error';
+    st.innerHTML = '<span class="state dot">Needs you</span><span>The rescue could not finish. The short is now 6.8% from liquidation.</span><span class="end"><a class="btn">Add $200 to Hyperliquid</a><a class="btn primary">Close both legs</a></span>';
+    document.querySelector('.timer').textContent = '1:12';
+    document.querySelector('.timer + .lab').textContent = 'Usually done in 52 s';
+    document.querySelector('.move').innerHTML = '<div class="lab">Trying next</div><b>$40.00</b><span>from the Solana reserve, a smaller amount NEAR Intents can route</span>';
+    document.querySelector('.after').innerHTML = '<div class="lab">Hyperliquid short, distance to liquidation</div><b class="neg">6.8%</b><span>rescue line is 8%</span>';
+    const d = document.querySelectorAll('#steps > div');
+    d[2].className = 'fail'; d[2].querySelector('p').textContent = 'No route for $120 within 30 s, tried twice'; d[2].querySelector('.tm').textContent = 'failed after 61 s';
+    [3, 4].forEach(i => { d[i].className = 'todo'; d[i].querySelector('.tm').textContent = 'not started'; });
+    const ba = document.querySelectorAll('.ba span');
+    ba[5].textContent = '$245.40'; ba[8].textContent = '0.27000'; ba[10].textContent = '6.8%'; ba[11].textContent = '10.6%';
+    document.querySelector('.rbottom h3 span:last-child').textContent = 'now → after $40';
+  }
+};
+</script>
+<script src="../shared/states.js"></script>
+</body>
+</html>

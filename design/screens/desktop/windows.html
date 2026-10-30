@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1440">
+<title>Gimbal · Windows</title>
+<link rel="stylesheet" href="../../tokens.css">
+<link rel="stylesheet" href="../shared/stage.css">
+</head>
+<body>
+<header>
+  <i data-mark></i>
+  <nav><a href="desk.html">Desk</a><a class="on" href="windows.html">Windows</a><a href="journal.html">Journal</a><a href="rescue.html">Rescue</a><a href="security.html">Security</a></nav>
+  <div class="right"><span class="dot" style="color:var(--ink)">Mainnet</span><span>desk-07</span><a class="btn">Withdraw</a><a class="btn primary">Add funds</a></div>
+</header>
+
+<div class="split">
+  <section class="list">
+    <div class="lhead"><a class="on">Tradable 8</a><a>Watch-only 29 venues</a><span class="end"><span class="dot">Live</span> &nbsp;32 venues · 2 s ago · net APR ↓</span></div>
+    <div id="items"></div>
+  </section>
+  <section class="detail" id="detail"></section>
+</div>
+
+<script src="../shared/mark.js"></script>
+<script src="../shared/data.js"></script>
+<script>
+const G = window.GIMBAL, f = window.fmt;
+const SEL = 'SOL';
+const sorted = [...G.windows].sort((a, b) => b.net - a.net);
+let h = '', below = false;
+sorted.forEach(w => {
+  if (!below && w.net < G.rule.minNet) { below = true; h += `<div class="minline">Your minimum · 5%</div>`; }
+  const st = w.refused ? '<span class="st ref">Refused · no trusted price</span>' : w.ai === 'veto' ? '<span class="st veto">Veto · one-off spike</span>' : w.status === 'open' ? '<span class="st held">Held</span>' : '';
+  h += `<div class="item ${w.asset === SEL ? 'sel' : ''} ${below ? 'below' : ''}">
+    <span class="a">${w.asset}${st}</span>
+    <svg width="88" height="24"><polyline points="${f.spark(w.spark, 88, 24)}"/></svg>
+    <span class="netv ${w.refused ? 'struck' : w.net < 0 ? 'neg' : ''}">${f.pctPlain(w.net)}</span>
+    <span class="s"><span>${w.long} / ${w.short}</span><span>${w.gross.toFixed(1)} now · ${w.gross7.toFixed(1)} 7 d · −${w.costs.toFixed(1)} costs · ${f.depth(w.depth)}</span></span></div>`;
+});
+document.getElementById('items').innerHTML = h;
+
+// hourly net APR over 7 days, deterministic mock built from each window's 7-day shape
+let seed = 11; const rnd = () => (seed = (seed * 9301 + 49297) % 233280) / 233280;
+const series = (w, jitter) => Array.from({ length: 169 }, (_, i) => {
+  const t = i / 168 * (w.spark.length - 1), a = Math.floor(t), b = Math.min(a + 1, w.spark.length - 1);
+  const e = (t - a), ease = e * e * (3 - 2 * e);
+  return w.spark[a] + (w.spark[b] - w.spark[a]) * ease - w.costs + Math.sin(i / 3.1) * jitter * .35 + (rnd() - .5) * jitter * .3;
+});
+const w = G.windows.find(x => x.asset === SEL), held = G.windows.find(x => x.status === 'open');
+const sSel = series(w, 1.2); sSel[168] = w.net;
+const sHeld = series(held, 1.6); sHeld[168] = held.net;
+const W = 688, H = 168, yMax = 20, x = i => i / 168 * (W - 48), y = v => 8 + (yMax - v) / yMax * (H - 28);
+const pts = s => s.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+let svg = '';
+for (const v of [0, 5, 10, 15, 20]) svg += `<line x1="0" x2="${W - 48}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line)"/><text x="${W - 40}" y="${y(v) + 4}">${v}%</text>`;
+svg += `<line x1="0" x2="${W - 48}" y1="${y(5)}" y2="${y(5)}" stroke="var(--ink-2)" stroke-dasharray="3 4"/>`;
+svg += `<polyline points="${pts(sHeld)}" fill="none" stroke="var(--ink-2)" stroke-width="1.5"/>`;
+svg += `<polyline points="${pts(sSel)}" fill="none" stroke="var(--ink)" stroke-width="2"/>`;
+svg += `<circle cx="${x(168)}" cy="${y(w.net)}" r="4" fill="var(--ink)"/><circle cx="${x(168)}" cy="${y(held.net)}" r="3" fill="var(--ink-2)"/>`;
+svg += `<text x="0" y="${H - 2}">20 Oct</text><text x="${(W - 48) / 2}" y="${H - 2}" text-anchor="middle">23 Oct</text><text x="${W - 48}" y="${H - 2}" text-anchor="end">now</text>`;
+
+const costs = [['Trading fees · 4 fills', 1.6], ['Slippage at $1,200', 0.3], ['Funding timing', 0.2], ['Rescue reserve', 0.9], ['Gas and signatures', 0.3]];
+const pct = v => (v / w.gross * 100).toFixed(2) + '%';
+document.getElementById('detail').innerHTML = `
+  <div class="dtop">
+    <div><h1>${w.asset}</h1><p>Long ${w.long} · short ${w.short} · ${f.depth(w.depth)} depth</p></div>
+    <div class="n"><b>${w.net}%</b><span class="g">net a year</span><span>≈ $0.28 a day on $1,200 legs</span></div>
+  </div>
+  <div class="chart">
+    <div class="cap"><span>Net APR, 7 days · <span style="color:var(--ink)">— ${w.asset}</span> &nbsp;<span>— DOGE, held</span></span><span>- - your minimum</span></div>
+    <svg width="${W}" height="${H}">${svg}</svg>
+  </div>
+  <div class="cols2">
+    <div>
+      <h3>Where ${w.net}% comes from</h3>
+      <div class="stack"><i style="width:${pct(w.longEarn)};background:var(--ink)"></i><i style="width:${pct(w.shortEarn)};background:var(--ink-2)"></i></div>
+      <div class="stack" style="margin-top:4px"><i style="width:${pct(w.net)};background:var(--level)"></i><i style="width:${pct(w.costs)};background:var(--line-2)"></i></div>
+      <div class="legend">
+        <div><span><i style="background:var(--ink)"></i>Long ${w.long} earns</span><span>+${w.longEarn}%</span></div>
+        <div><span><i style="background:var(--ink-2)"></i>Short ${w.short} earns</span><span>+${w.shortEarn}%</span></div>
+        <div><span><i style="background:var(--line-2)"></i>Costs, mostly fees and the rescue reserve</span><span>−${w.costs}%</span></div>
+        <div class="tot"><span><i style="background:var(--level)"></i>Net</span><span>${w.net}%</span></div>
+      </div>
+    </div>
+    <div class="verdict">
+      <h3>Checks</h3>
+      <p class="ok">NEAR AI: ${w.aiNote}</p>
+      <p class="ok">Passes your policy: SOL allowed, leg under $1,500, 2.5× under 3×</p>
+      <p class="ok">Oracle price 9 s old, inside the 100 bp band</p>
+      <p class="ok">Both venues can be rescued in under a minute</p>
+    </div>
+  </div>
+  <div class="cta"><span>Auto keeps DOGE: SOL is 5.2 points lower. Switching now costs about $1.10.</span><span class="end"><a class="btn quiet">Alert me if it passes DOGE</a><a class="btn">Rotate to SOL</a></span></div>`;
+</script>
+<template id="t-empty"><div class="state-page"><div class="state-msg"><div class="lab">Windows</div><h1>Nothing clears your 5% right now</h1><p>The scanner read 32 venues two seconds ago. The best window you allow is <b>BTC at 2.1% net</b>. The desk holds nothing rather than pay fees for less than your minimum.</p><div class="go"><a class="btn">Show windows below my minimum</a><a class="btn quiet">Change my minimum</a></div></div></div></template>
+<script>
+window.STATE_HOOKS = {
+  error() {
+    document.querySelector('.lhead').insertAdjacentHTML('afterend', '<div class="errline"><b>3 of 32 venues didn’t answer</b><span>Phoenix, Lighter, Paradex. Windows that need them use data from 1 min ago and are greyed. The desk keeps holding DOGE.</span></div>');
+    document.querySelectorAll('.item').forEach(i => { if (i.textContent.includes('Phoenix')) i.classList.add('stale'); });
+  }
+};
+</script>
+<script src="../shared/states.js"></script>
+</body>
+</html>

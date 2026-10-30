@@ -1,0 +1,65 @@
+/* Gimbal · Stage — design tokens. Source of truth: tokens.json (same values).
+   Dark ground; one typeface; colour reports state only. Copy into web/ with the fonts/ folder. */
+
+/* Apple devices use the system SF fonts. Everywhere else the open fallbacks below
+   stand in (Inter 4.1 and Geist Mono, SIL OFL 1.1, Latin subset), so no screen
+   ever shows Arial, Segoe or Helvetica. SF itself cannot be shipped: Apple's licence. */
+/* Inter is variable on weight (400–600) and optical size (14–32): the browser picks the text
+   cut for small type and the display cut for large type, the way SF switches Text and Display. */
+@font-face { font-family: 'Gimbal Sans'; src: url('fonts/Inter.subset.woff') format('woff'); font-weight: 400 600; font-display: swap; }
+@font-face { font-family: 'Gimbal Mono'; src: url('fonts/GeistMono.subset.woff') format('woff'); font-weight: 400 500; font-display: swap; }
+:root {
+  color-scheme: dark;
+
+  /* colour */
+  --bg: #0A0A0A;          /* page ground */
+  --sel: #141414;         /* selected row */
+  --line: #1E1E1D;        /* dividers */
+  --line-2: #2E2E2C;      /* the level line, tracks, outlined buttons */
+  --ink: #F2F2F0;         /* primary text, primary button fill */
+  --ink-2: #7E7E7B;       /* secondary text, labels */
+  --ink-3: #4A4A48;       /* timestamps, disabled */
+  --level: #00EC97;       /* level bar, live dots, "Level" state; never a fill larger than 4 px tall */
+  --pos: #3FD9A0;         /* positive money and rates */
+  --watch: #F0A531;       /* watch state, unprotected orders */
+  --danger: #FF5A5F;      /* rescue state, refusals, negative values */
+  --testnet: #6FD8E8;     /* network marker on testnet */
+  --replay: #B9A6FF;      /* network marker in replay mode */
+
+  /* type: SF on Apple devices, the open Gimbal fallbacks everywhere else */
+  --font: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Gimbal Sans', sans-serif;
+  --display: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Gimbal Sans', sans-serif;
+  --mono: ui-monospace, 'SF Mono', 'Gimbal Mono', monospace; /* hashes and addresses only */
+  --t-hero: 400 112px/0.9 var(--display);   /* desk value */
+  --t-display: 400 72px/1 var(--display);   /* selected window asset and net APR */
+  --t-xl: 400 48px/1 var(--display);        /* venue names */
+  --t-num: 400 44px/1 var(--display);       /* distance to liquidation */
+  --t-l: 400 20px/1.2 var(--display);       /* list assets and values */
+  --t-m: 400 15px/1.45 var(--font);         /* body */
+  --t-s: 400 13px/1.4 var(--font);          /* labels, captions */
+  --t-btn: 500 14px/1 var(--font);
+  --track-hero: -0.03em;
+  --track-display: -0.025em;
+  --track-xl: -0.025em;
+  --track-num: -0.02em;
+  --track-text: 0;
+
+  /* space: every distance is a multiple of 4, layout steps of 8 */
+  --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px; --s-5: 24px; --s-6: 32px; --s-7: 48px; --s-8: 64px; --s-9: 80px;
+  --gutter: 64px;          /* 16px on phones */
+  --header: 72px;
+  --status: 52px;
+  --list-w: 600px;         /* Windows list column */
+
+  /* radius: only buttons are rounded */
+  --r-0: 0;
+  --r-btn: 18px;           /* 36 px tall pill */
+  --r-dot: 50%;
+
+  /* motion */
+  --ease: cubic-bezier(.25, .1, .25, 1);
+  --dur-fast: 120ms;       /* a number that changed flashes once */
+  --dur: 240ms;            /* hover, selection */
+  --dur-tilt: 400ms;       /* level line tilts with net delta */
+}
+@media (prefers-reduced-motion: reduce) { :root { --dur-fast: 0ms; --dur: 0ms; --dur-tilt: 0ms; } }
