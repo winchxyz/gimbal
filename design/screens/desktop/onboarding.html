@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1440">
+<title>Gimbal · Welcome</title>
+<link rel="stylesheet" href="../../tokens.css">
+<link rel="stylesheet" href="../shared/stage.css">
+</head>
+<body class="welcome" data-wait>
+<header>
+  <i data-mark></i>
+  <div class="lite"><span class="dot" style="color:var(--ink)">Mainnet</span><a>Docs</a><a>GitHub</a></div>
+</header>
+
+<canvas class="gimbal-bg" id="field" aria-hidden="true"></canvas>
+
+<section class="hero-copy" id="copy">
+  <h1>Stays level when the market doesn’t.</h1>
+  <p>Hold a long on one exchange and a short on another, earn the funding gap, and move margin before either side can be liquidated. A NEAR contract signs every order. Nobody holds a key.</p>
+  <div class="go"><a class="btn big primary">Connect NEAR wallet</a><a class="btn big">Watch a replay first</a></div>
+  <p class="cap"><i></i>The rings swing with the market. The green platform is your desk.</p>
+</section>
+
+<section class="hero-facts" id="facts">
+  <div><b style="color:var(--level)">0</b><span>private keys</span></div>
+  <div><b>13.8%</b><span>best window now, net a year</span></div>
+  <div><b>about 1 min</b><span>to move margin before liquidation</span></div>
+  <div><b>32</b><span>venues scanned in 2.4 s</span></div>
+</section>
+
+<script src="../shared/mark.js"></script>
+<script src="../shared/gimbal-fx.js"></script>
+<script src="../shared/gimbal.js"></script>
+<script>
+const q = new URLSearchParams(location.search);
+// the phosphor shader (WebGL2); browsers without it get the 2D gimbal
+const field = document.getElementById('field');
+const opts = { look: 'phosphor', cx: 0.72, cy: 0.5, size: 0.42,
+  quiet: [document.getElementById('copy'), document.getElementById('facts')],
+  still: q.has('still'), t: Number(q.get('t') || 6) };
+GimbalFX.mount(field, opts)
+  .then(ok => ok || (field.classList.add('fallback'), GimbalAscii.mount(field, opts)))
+  .then(() => { document.body.dataset.ready = '1'; });
+</script>
+<template id="t-error"><div class="state-page"><div class="state-msg"><div class="lab">Connect</div><h1>No NEAR wallet answered</h1><p>The wallet window closed or was blocked by the browser. Gimbal only asks your wallet to sign; it never sees a key.</p><div class="go"><a class="btn big primary">Try again</a><a class="btn big">Watch a replay instead</a></div></div></div></template>
+<script>
+window.STATE_HOOKS = {
+  loading() {
+    document.querySelector('.hero-copy .go').innerHTML = '<span class="g">Waiting for your wallet to confirm…</span>';
+  }
+};
+</script>
+<script src="../shared/states.js"></script>
+</body>
+</html>

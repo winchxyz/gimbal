@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1440">
+<title>Gimbal · Desk</title>
+<link rel="stylesheet" href="../../tokens.css">
+<link rel="stylesheet" href="../shared/stage.css">
+</head>
+<body>
+<header>
+  <i data-mark></i>
+  <nav><a class="on" href="desk.html">Desk</a><a href="windows.html">Windows</a><a href="journal.html">Journal</a><a href="rescue.html">Rescue</a><a href="security.html">Security</a></nav>
+  <div class="right"><span class="dot" style="color:var(--ink)">Mainnet</span><span>desk-07</span><a class="btn">Withdraw</a><a class="btn primary">Add funds</a></div>
+</header>
+
+<div class="status">
+  <span class="state dot">Level</span>
+  <span>Both legs are safe. Funding is coming in on both sides.</span>
+  <span class="g3">Checked 4 s ago</span>
+  <span class="end"><a class="btn quiet">Auto on</a><a class="btn quiet">Pause</a><a class="btn">Close position</a></span>
+</div>
+
+
+<div class="center top">
+  <div class="lab">Desk value</div>
+  <div class="value">$999<small>.41</small></div>
+  <div class="rate"><span class="pos">+$0.60 a day</span> <span class="g">· 13.8% a year after costs</span></div>
+  <div class="payback"><div class="t"><i style="width:70%"></i></div><div class="c"><span>Entry costs 70% earned back</span><span>~23 h left</span></div></div>
+</div>
+<div class="center mid"><span>Net exposure</span><b>0 DOGE</b><span class="ex">Both legs are the same size, so a DOGE price move adds to one and takes the same from the other.</span></div>
+
+<section class="half l" id="L"></section>
+<section class="half r" id="R"></section>
+
+<div class="bottom">
+  <div>
+    <h3><span>Latest</span><a href="journal.html">Journal</a></h3>
+    <div class="ev"><span class="t">Today 14:00</span><span>Funding paid · Phoenix +$0.026 · Hyperliquid +$0.004</span><span class="g3">on-chain ↗</span></div>
+    <div class="ev"><span class="t">24 Oct 23:41</span><span>Opened DOGE · both legs filled 1.2 s apart</span><span class="g3">2 signatures ↗</span></div>
+    <div class="ev"><span class="t">24 Oct 23:39</span><span>Closed LTC to rotate · <span class="flag wt">Phoenix leg sent without price protection</span></span><span class="g3">Why ↗</span></div>
+  </div>
+  <div>
+    <h3><span>Next best window</span><a>All windows</a></h3>
+    <div class="next"><span><b>SOL</b> <span class="g">&nbsp;Phoenix / Orderly</span></span><b>8.6%</b></div>
+    <p class="g" style="font-size:13px;margin:12px 0 0">5.2 points below DOGE. The desk rotates when another window beats the held one by 3 points for 4 hours.</p>
+  </div>
+</div>
+
+<script src="../shared/mark.js"></script>
+<script src="../shared/data.js"></script>
+<script>
+const P = window.GIMBAL.position, f = window.fmt;
+const MAX = 50;
+const half = (g, right) => {
+  const x = d => right ? `left:${d / MAX * 100}%` : `left:${100 - d / MAX * 100}%`;
+  const z = (a, b, c) => right ? `<span class="${c}" style="left:${a / MAX * 100}%;width:${(b - a) / MAX * 100}%"></span>` : `<span class="${c}" style="right:${a / MAX * 100}%;width:${(b - a) / MAX * 100}%"></span>`;
+  const move = g.side === 'Short' ? `DOGE has to rise ${g.dist}% to ${g.liq.toFixed(4)}` : `DOGE has to fall ${g.dist}% to ${g.liq.toFixed(4)}`;
+  return `
+  <h2>${g.venue}</h2><p>${g.side} ${f.num(Math.abs(g.size))} DOGE · ${f.usd(g.margin)} margin</p>
+  <div class="dist">${g.dist}%</div><p>to liquidation · ${move}</p><p>Rescue starts at 8%, a warning at 15%.</p>
+  <div class="rows">
+    <div><span>Entry · mark</span><span>${g.entry.toFixed(5)} · ${g.mark.toFixed(5)}</span></div>
+    <div><span>Margin ratio</span><span>${g.ratio}%</span></div>
+    <div><span>Funding earned</span><span class="pos">+$${g.funding.toFixed(2)}</span></div>
+    <div><span>Fees paid</span><span>−$${g.fees.toFixed(2)}</span></div>
+    <div><span>Next funding</span><span>${right ? 'accrues hourly · settles 00:00' : 'in 23 min'}</span></div>
+  </div>`;
+};
+document.getElementById('L').innerHTML = half(P.legs[0], false);
+document.getElementById('R').innerHTML = half(P.legs[1], true);
+</script>
+<template id="t-empty"><div class="state-page"><div class="status waiting"><span class="state dot">Waiting</span><span>No window clears your 5% minimum right now.</span></div><div class="state-msg"><div class="lab">Desk value</div><h1>$1,050.00</h1><p>Your money sits as margin on Hyperliquid and Phoenix and earns nothing until a window pays at least <b>5% a year after costs</b>. The scanner checks 32 venues every few seconds.</p><div class="facts2"><div><b>2.1%</b><span>best you allow now, BTC</span></div><div><b>5%</b><span>your minimum</span></div><div><b>2 s</b><span>since the last scan</span></div></div><div class="go"><a class="btn primary">See all windows</a><a class="btn quiet">Change my minimum</a></div></div></div></template>
+<script>
+window.STATE_HOOKS = {
+  error() {
+    const s = document.querySelector('.status');
+    s.classList.add('error');
+    s.innerHTML = '<span class="state dot">Hyperliquid not answering</span><span>No data for 2 min. Your short is still open on the exchange and the contract still enforces your policy.</span><span class="end"><a class="btn">Close both legs</a></span>';
+    document.getElementById('L').classList.add('stale');
+    document.querySelector('#L h2 + p').textContent = 'Last data 2 min ago · retrying every 5 s';
+  }
+};
+</script>
+<script src="../shared/states.js"></script>
+</body>
+</html>

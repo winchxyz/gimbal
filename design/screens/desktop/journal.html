@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1440">
+<title>Gimbal · Journal</title>
+<link rel="stylesheet" href="../../tokens.css">
+<link rel="stylesheet" href="../shared/stage.css">
+</head>
+<body class="scroll">
+<header>
+  <i data-mark></i>
+  <nav><a href="desk.html">Desk</a><a href="windows.html">Windows</a><a class="on" href="journal.html">Journal</a><a href="rescue.html">Rescue</a><a href="security.html">Security</a></nav>
+  <div class="right"><span class="dot" style="color:var(--ink)">Mainnet</span><span>desk-07</span><a class="btn">Withdraw</a><a class="btn primary">Add funds</a></div>
+</header>
+
+<section class="jtop">
+  <div>
+    <h1>Journal</h1>
+    <p>Everything the desk did, as the contract recorded it. <b>23 actions signed, 0 by a private key.</b></p>
+  </div>
+  <a class="btn">Export CSV</a>
+</section>
+
+<nav class="filters">
+  <a class="on">All<span>23</span></a><a>Trades<span>6</span></a><a>Funding<span>9</span></a><a>Money in and out<span>3</span></a><a>Rescue<span>1</span></a><a>Refused and vetoed<span>4</span></a>
+</nav>
+
+<div class="jgrid">
+  <section class="feed" id="feed"></section>
+
+  <aside class="side">
+    <h3>Since 21 Oct</h3>
+    <div class="big">−$0.59</div>
+    <p>The DOGE window paid its entry costs up front; about 23 h until they are earned back.</p>
+    <div class="attr">
+      <div><span>Funding received</span><span class="pos">+$3.90</span></div>
+      <div><span>Trading fees</span><span>−$2.88</span></div>
+      <div><span>Basis at entry and exit</span><span>−$0.66</span></div>
+      <div><span>Transfers, rescue, app fees</span><span>−$0.95</span></div>
+      <div class="tot"><span>Net</span><span>−$0.59</span></div>
+    </div>
+    <div class="counts">
+      <div><b>23</b><span>actions signed by the contract</span></div>
+      <div><b style="color:var(--level)">0</b><span>signed by a private key</span></div>
+      <div><b>3</b><span>refused by your policy</span></div>
+      <div><b>1</b><span>vetoed by NEAR AI</span></div>
+    </div>
+    <div class="contract">
+      <p>Every row is an event the contract emitted on NEAR. Open any link to check it yourself.</p>
+      <p><span class="mono">gimbal · desk-07</span> &nbsp;NEAR explorer ↗</p>
+    </div>
+  </aside>
+</div>
+
+<script src="../shared/mark.js"></script>
+<script>
+// k: event kind; amt: dollars, signed; proof: [label, short hash]
+const days = [
+  ['Today · 27 Oct', '+$0.03', [
+    { t: '14:00', k: 'Funding', what: 'Funding paid on both legs: Phoenix <b>+$0.026</b>, Hyperliquid <b>+$0.004</b>', amt: 0.03, proof: [['NEAR', '9xQe…4Ta1']] },
+    { t: '09:12', k: 'Veto', cls: 'veto', what: 'Skipped <b>AVAX</b>, long Orderly / short Hyperliquid at 9.1% net', why: 'NEAR AI: one 8-hour spike; the 7-day median gap is 1.2%, so it would likely close before fees are earned back.', proof: [['NEAR', 'Fh2k…p0Zs']] },
+    { t: '06:30', k: 'Refused', cls: 'refused', what: 'Contract refused to open <b>ZRO</b> at 35.2% net', why: 'No trusted oracle price for ZRO. Unpriced assets need your opt-in in the policy.', proof: [['NEAR', 'Cw7r…bE9n']] },
+  ]],
+  ['26 Oct', '+$0.21', [
+    { t: '18:44', k: 'Rescue', cls: 'rescue', what: 'Moved <b>$120.00</b> to Hyperliquid margin. The short had come within 13.8% of liquidation after DOGE rose 4.1%.', steps: ['detected', 'source: reserve', 'quote ✓', 'signed 6.1 s', 'landed 52 s'], amt: -0.31, proof: [['NEAR', 'Lq3v…8kRd'], ['Solscan', '4uZp…Qe1x']] },
+    { t: '00:00', k: 'Funding', what: 'Phoenix daily settlement <b>+$0.52</b>', amt: 0.52, proof: [['NEAR', 'Ta9m…c21H'], ['Solscan', 'Hh6s…Vn4c']] },
+  ]],
+  ['25 Oct', '−$0.08', [
+    { t: '16:20', k: 'Withdraw', what: '<b>$50.00</b> sent to demo-owner.near through NEAR Intents', amt: -50, note: 'fee −$0.14', proof: [['NEAR', 'Pp1d…Z7aw']] },
+    { t: '00:00', k: 'Funding', what: 'Phoenix daily settlement <b>+$0.06</b>, first partial day', amt: 0.06, proof: [['NEAR', 'Bx0f…3sYe']] },
+  ]],
+  ['24 Oct', '−$0.35', [
+    { t: '23:41', k: 'Open', cls: 'open', what: 'Opened <b>DOGE</b>: short 6,040 on Hyperliquid at 0.19861, long 6,040 on Phoenix at 0.19873. Filled 1.2 s apart.', why: 'NEAR AI: spread held for 13 straight weeks; Phoenix book is thin, so each leg stays under $1,500.', amt: -1.47, note: 'fees', proof: [['NEAR', 'Jd5c…w2Lp'], ['Hyperliquid', '0x88b2…14d0'], ['Solscan', '2rTq…kF8m']] },
+    { t: '23:39', k: 'Rotate', cls: 'rotate', what: 'Closed <b>LTC</b> (6.9% net) to move into DOGE (13.8%). LTC earned <b>+$2.54</b> over 3 days.', flag: 'Phoenix leg sent without price protection: the oracle was 74 s old, past the 60 s limit. Reduce-only, so it could only shrink the position.', amt: 1.12, note: 'after fees', proof: [['NEAR', 'Mk8e…u6Gv'], ['Hyperliquid', '0xd51e…7b28'], ['Solscan', '7wJa…Nn3t']] },
+  ]],
+];
+const money = v => (v > 0 ? '+' : '−') + '$' + Math.abs(v).toFixed(2);
+document.getElementById('feed').innerHTML = days.map(([d, tot, evs]) => `
+  <div class="day"><span>${d}</span><span>${tot}</span></div>
+  ${evs.map(e => `<div class="evt">
+    <span class="t">${e.t}</span>
+    <span class="k ${e.cls || ''}">${e.k}</span>
+    <span class="what">${e.what}${e.steps ? `<div class="steps">${e.steps.map(s => `<span>${s}</span>`).join('')}</div>` : ''}${e.why ? `<span class="why">${e.why}</span>` : ''}${e.flag ? `<span class="why flag">${e.flag}</span>` : ''}</span>
+    <span class="amt">${e.amt === undefined ? '' : `<span class="${e.amt > 0 && e.k !== 'Withdraw' ? 'pos' : ''}">${money(e.amt)}</span>${e.note ? `<br><span class="g3" style="font-size:13px">${e.note}</span>` : ''}`}</span>
+    <span class="proof">${e.proof.map(([l, h]) => `<a>${l} ↗ <span>${h}</span></a>`).join('')}</span>
+  </div>`).join('')}`).join('') + `<div class="more">21–23 Oct · 11 earlier events: deposit of $1,050.00, LTC opened, 9 funding payments. Show</div>`;
+</script>
+<template id="t-empty"><div class="state-page"><div class="state-msg"><div class="lab">Journal</div><h1>Nothing here yet</h1><p>Every action the desk takes will appear here as an event the contract wrote on NEAR, with a link to check it. Your deposit will be the first.</p><div class="go"><a class="btn primary">Add funds</a><a class="btn">Watch a replay</a></div></div></div></template>
+<template id="t-error"><div class="state-page"><div class="state-msg"><div class="lab">Journal</div><h1>Can’t load the journal</h1><p>The NEAR RPC timed out at 14:02. The desk is still running; only this view is affected. Every event stays on chain and loads when the connection is back.</p><div class="go"><a class="btn primary">Try again</a><a class="btn quiet">Open the NEAR explorer</a></div></div></div></template>
+<script src="../shared/states.js"></script>
+</body>
+</html>

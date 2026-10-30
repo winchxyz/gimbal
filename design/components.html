@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1440">
+<title>Gimbal · Components</title>
+<link rel="stylesheet" href="tokens.css">
+<link rel="stylesheet" href="screens/shared/stage.css">
+<style>
+  body { height: auto; overflow: visible; }
+  .sheet { padding: 48px 64px 96px; }
+  .sheet > h1 { font: var(--t-display); letter-spacing: var(--track-display); margin: 0; }
+  .sheet > p { color: var(--ink-2); margin: 12px 0 0; max-width: 760px; }
+  .c { display: grid; grid-template-columns: 280px 1fr; column-gap: 48px; padding: 32px 0; border-top: 1px solid var(--line); margin-top: 32px; }
+  .c + .c { margin-top: 0; }
+  .c h2 { font: var(--t-l); margin: 0; }
+  .c .meta { font: var(--t-s); color: var(--ink-2); margin-top: 8px; line-height: 1.6; }
+  .c .meta code { font-family: var(--mono); font-size: 12px; color: var(--ink); }
+  .row-demo { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .vstack { display: flex; flex-direction: column; gap: 12px; }
+  .lab2 { font: var(--t-s); color: var(--ink-3); margin-bottom: 6px; }
+  .box { position: relative; border: 1px dashed var(--line-2); }
+  .box .status { border-bottom: 0; }
+  .item { border-top: 1px solid var(--line); }
+  .demo-num div { display: flex; align-items: baseline; gap: 24px; padding: 8px 0; }
+  .demo-num span { font: var(--t-s); color: var(--ink-2); width: 200px; flex: none; }
+  .tabsdemo { display: flex; gap: 28px; border-bottom: 1px solid var(--line); }
+  .tabsdemo a { color: var(--ink-2); padding-bottom: 12px; }
+  .tabsdemo a.on { color: var(--ink); box-shadow: inset 0 -2px 0 var(--ink); }
+  .tabsdemo a span { color: var(--ink-3); margin-left: 6px; }
+  .phonetabs { width: 390px; display: grid; grid-template-columns: repeat(5, 1fr); border: 1px solid var(--line); padding: 10px 8px 14px; font: 500 11px/1 var(--font); text-align: center; }
+  .phonetabs a { color: var(--ink-3); display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  .phonetabs i { width: 18px; height: 3px; border-radius: 2px; background: transparent; }
+  .phonetabs a.on { color: var(--ink); } .phonetabs a.on i { background: var(--level); }
+  .sw { display: grid; grid-template-columns: repeat(7, 1fr); gap: 12px; }
+  .sw div { font: var(--t-s); color: var(--ink-2); }
+  .sw i { display: block; height: 48px; border: 1px solid var(--line-2); margin-bottom: 8px; }
+  .sw b { display: block; color: var(--ink); font-weight: 400; }
+</style>
+</head>
+<body>
+<header>
+  <i data-mark></i>
+  <nav><a class="on">Desk</a><a>Windows</a><a>Journal</a><a>Rescue</a><a>Security</a></nav>
+  <div class="right"><span class="dot" style="color:var(--ink)">Mainnet</span><span>desk-07</span><a class="btn">Withdraw</a><a class="btn primary">Add funds</a></div>
+</header>
+
+<main class="sheet">
+  <h1>Components</h1>
+  <p>Every piece the six screens are built from, in each of its states. Values come from <code style="font-family:var(--mono)">tokens.css</code>; the class names match <code style="font-family:var(--mono)">screens/shared/stage.css</code> and <code style="font-family:var(--mono)">phone.css</code>.</p>
+
+  <section class="c"><div><h2>Colour</h2><div class="meta">Colour reports state only. Green: level, earning, positive. Amber: watch, veto, unprotected order. Red: rescue failed, refused, negative.</div></div>
+    <div class="sw">
+      <div><i style="background:var(--bg)"></i><b>--bg</b>#0A0A0A</div><div><i style="background:var(--ink)"></i><b>--ink</b>#F2F2F0</div><div><i style="background:var(--ink-2)"></i><b>--ink-2</b>#7E7E7B</div><div><i style="background:var(--level)"></i><b>--level</b>#00EC97</div><div><i style="background:var(--watch)"></i><b>--watch</b>#F0A531</div><div><i style="background:var(--danger)"></i><b>--danger</b>#FF5A5F</div><div><i style="background:var(--testnet)"></i><b>--testnet / --replay</b>#6FD8E8 · #B9A6FF</div>
+    </div></section>
+
+  <section class="c"><div><h2>Figures</h2><div class="meta">SF on Apple devices, Inter 4.1 elsewhere. One weight (400); 500 only on buttons. Tabular figures everywhere.</div></div>
+    <div class="demo-num">
+      <div><span>--t-hero · 112 · −0.03em</span><b style="font:var(--t-hero);letter-spacing:var(--track-hero);font-weight:400">$999<small style="font-size:56px;color:var(--ink-2)">.41</small></b></div>
+      <div><span>--t-display · 72</span><b style="font:var(--t-display);letter-spacing:var(--track-display);font-weight:400">13.8%</b></div>
+      <div><span>--t-xl · 48</span><b style="font:var(--t-xl);letter-spacing:var(--track-xl);font-weight:400">Hyperliquid</b></div>
+      <div><span>--t-num · 44</span><b style="font:var(--t-num);letter-spacing:var(--track-num);font-weight:400">32.6%</b></div>
+      <div><span>--t-l · 20</span><b style="font:var(--t-l);font-weight:400">SOL &nbsp; 8.6%</b></div>
+      <div><span>--t-m · 15 · body</span><span style="color:var(--ink);width:auto">Both legs are safe. Funding is coming in on both sides.</span></div>
+      <div><span>--t-s · 13 · labels</span><span style="width:auto">to liquidation · DOGE has to rise 32.6% to 0.2631</span></div>
+      <div><span>--mono · 12 · hashes only</span><span style="width:auto;font-family:var(--mono);font-size:12px">0x88b2…14d0</span></div>
+    </div></section>
+
+  <section class="c"><div><h2>Buttons</h2><div class="meta">36 px pill on desktop, 44 px on phone, 48 px for the one main action of a page. One primary per view.</div></div>
+    <div class="row-demo"><a class="btn primary">Add funds</a><a class="btn">Withdraw</a><a class="btn quiet">Pause</a><a class="btn" aria-disabled="true">Run a stress test</a><a class="btn big primary">Connect NEAR wallet</a><a class="btn big">Watch a replay first</a></div></section>
+
+  <section class="c"><div><h2>Network marker</h2><div class="meta">In the header on every screen. Testnet swaps Add funds for Get test USDC. Replay removes money buttons and shows Exit replay.</div></div>
+    <div class="row-demo" style="gap:40px"><span class="dot">Mainnet</span><span class="dot" style="--dot:var(--testnet)">Testnet</span><span class="dot" style="--dot:var(--replay)">Replay</span></div></section>
+
+  <section class="c"><div><h2>Status line</h2><div class="meta">Under the header on Desk and Rescue. One sentence; actions sit at its right end. Only this line changes colour for risk.</div></div>
+    <div class="vstack">
+      <div class="box"><div class="status"><span class="state dot">Level</span><span>Both legs are safe. Funding is coming in on both sides.</span><span class="g3">Checked 4 s ago</span><span class="end"><a class="btn quiet">Auto on</a><a class="btn quiet">Pause</a><a class="btn">Close position</a></span></div></div>
+      <div class="box"><div class="status waiting"><span class="state dot">Waiting</span><span>No window clears your 5% minimum right now.</span></div></div>
+      <div class="box"><div class="status rescuing"><span class="state dot">Rescuing</span><span>The Hyperliquid short came within 7.9% of liquidation. The desk is moving margin to it now.</span><span class="end"><span class="g3" style="font-size:13px">No action needed from you</span></span></div></div>
+      <div class="box"><div class="status error"><span class="state dot">Needs you</span><span>The rescue could not finish. The short is now 6.8% from liquidation.</span><span class="end"><a class="btn primary">Close both legs</a></span></div></div>
+      <div class="box"><div class="status"><span class="state dot" style="--dot:var(--ink-3);color:var(--ink-2)">Loading</span><span class="g">Reading both exchanges and the contract…</span></div></div>
+    </div></section>
+
+  <section class="c"><div><h2>Window row</h2><div class="meta">Windows list. Status word after the asset; 7-day line; net APR right. Rows under your minimum sit below a rule at 40% opacity.</div></div>
+    <div style="width:600px" id="rows"></div></section>
+
+  <section class="c"><div><h2>Journal event</h2><div class="meta">Time, kind, plain sentence, dollar effect, proof links. The why line is NEAR AI’s reason or the policy rule; amber flags an unprotected order.</div></div>
+    <div id="events"></div></section>
+
+  <section class="c"><div><h2>Rescue step</h2><div class="meta">Seven in a row on desktop, a list on phone. The top border shows the step’s state: done, running, failed, waiting.</div></div>
+    <div class="rsteps" style="margin:0;grid-template-columns:repeat(4,1fr)">
+      <div class="done"><span class="n">3</span><b>Quote</b><p>NEAR Intents: $120.00 in, $119.52 lands</p><span class="tm">1.2 s</span></div>
+      <div class="now"><span class="n">5</span><b>Sign</b><p>NEAR MPC signs the transfer</p><span class="tm">4.2 s · usually 6 s</span></div>
+      <div class="fail"><span class="n">3</span><b>Quote</b><p>No route for $120 within 30 s, tried twice</p><span class="tm">failed after 61 s</span></div>
+      <div class="todo"><span class="n">7</span><b>Landed</b><p>Credited to Hyperliquid margin</p><span class="tm">about 40 s</span></div>
+    </div></section>
+
+  <section class="c"><div><h2>Policy rule</h2><div class="meta">Onboarding. The rule as the contract reads it, and where it came from. Anything NEAR AI added is amber.</div></div>
+    <div class="pol" style="width:520px">
+      <div><b>Size per leg</b><span class="val">up to $1,500</span><span class="src">From “Never more than $1,500 a side”</span></div>
+      <div><b>Minimum to enter</b><span class="val">5% net a year after costs</span><span class="src ai">Added by NEAR AI: you gave none, so the 5% default</span></div>
+    </div></section>
+
+  <section class="c"><div><h2>Values and checks</h2><div class="meta">Label left in grey, value right. Before-and-after tables add a second value column. Checks: tick in green, refusal in red.</div></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1.3fr;gap:48px">
+      <div class="rows" style="position:static;width:auto"><div><span>Margin ratio</span><span>31%</span></div><div><span>Funding earned</span><span class="pos">+$0.31</span></div><div><span>Fees paid</span><span>−$0.48</span></div></div>
+      <div class="ba"><span>Margin</span><span>$205.40</span><span>$324.92</span><span>Distance</span><span class="wt">7.9%</span><span>16.1%</span></div>
+      <div><div class="verdict"><p class="ok">Passes your policy</p><p class="ok">Oracle price 9 s old</p></div><ul style="list-style:none;padding:0;margin:0" class="cols3"><li class="no" style="border:0;padding:4px 0;white-space:nowrap">Withdraw to any address but yours</li></ul></div>
+    </div></section>
+
+  <section class="c"><div><h2>Progress</h2><div class="meta">The only bar in the app, and always labelled at both ends.</div></div>
+    <div class="payback" style="width:360px;margin:0"><div class="t"><i style="width:70%"></i></div><div class="c"><span>Entry costs 70% earned back</span><span>~23 h left</span></div></div></section>
+
+  <section class="c"><div><h2>Tabs</h2><div class="meta">Desktop filters with counts; phone tab bar with the green bar under the current screen.</div></div>
+    <div class="vstack" style="gap:28px"><div class="tabsdemo"><a class="on">All<span>23</span></a><a>Trades<span>6</span></a><a>Funding<span>9</span></a><a>Refused and vetoed<span>4</span></a></div>
+      <div class="phonetabs"><a class="on"><i></i>Desk</a><a><i></i>Windows</a><a><i></i>Journal</a><a><i></i>Rescue</a><a><i></i>Security</a></div></div></section>
+
+  <section class="c"><div><h2>Loading, empty, error</h2><div class="meta">Loading keeps every label and turns each figure into a placeholder. Empty says what will appear and how to start. Errors say what failed, what is still safe, and what to do.</div></div>
+    <div class="vstack" style="gap:24px">
+      <div class="rows" style="position:static;width:400px" id="sk"><div><span>Margin ratio</span><span class="sk">31%</span></div><div><span>Funding earned</span><span class="sk">+$0.31</span></div></div>
+      <div class="box" style="height:240px"><div class="state-msg" style="width:560px"><div class="lab">Journal</div><h1>Nothing here yet</h1><p>Every action the desk takes will appear here as an event the contract wrote on NEAR. Your deposit will be the first.</p></div></div>
+      <div class="errline" style="padding-left:16px"><b>3 of 32 venues didn’t answer</b><span>Phoenix, Lighter, Paradex. Windows that need them use data from 1 min ago and are greyed.</span></div>
+    </div></section>
+</main>
+
+<script src="screens/shared/mark.js"></script>
+<script>
+document.getElementById('sk').classList.add('loading'); document.body.classList.add('loading');
+document.querySelector('header').querySelectorAll('.sk').forEach(e => e.classList.remove('sk'));
+const sp = 'M2,16 L10,12 L18,14 L26,8 L34,11 L42,6 L50,9 L58,4 L66,7 L74,5 L82,6';
+const row = (cls, a, st, stc, venues, net, netc = '') => `<div class="item ${cls}"><span class="a">${a}${st ? `<span class="st ${stc}">${st}</span>` : ''}</span><svg width="88" height="24"><path d="${sp}" fill="none" stroke="var(--ink-2)" stroke-width="1.25"/></svg><span class="netv ${netc}">${net}</span><span class="s"><span>${venues}</span><span>18.4 now · 16.9 7 d · −4.6 costs · $41k</span></span></div>`;
+document.getElementById('rows').innerHTML =
+  row('', 'NEAR', '', '', 'Phoenix / Orderly', '8.0%') + row('', 'DOGE', 'Held', 'held', 'Phoenix / Hyperliquid', '13.8%') + row('sel', 'SOL', '', '', 'Phoenix / Orderly', '8.6%') +
+  row('', 'AVAX', 'Veto · one-off spike', 'veto', 'Orderly / Hyperliquid', '9.1%') + row('', 'ZRO', 'Refused · no trusted price', 'ref', 'Hyperliquid / Orderly', '<span class="struck">35.2%</span>') +
+  row('stale', 'LTC', '', '', 'Phoenix / Hyperliquid · data 1 min old', '6.9%') + '<div class="minline">Your minimum · 5%</div>' + row('below', 'BTC', '', '', 'Phoenix / Hyperliquid', '2.1%') +
+  row('below', 'XMR', 'Watch-only', '', 'Lighter / Hyperliquid', '—');
+const ev = (t, k, cls, what, extra, amt, proof) => `<div class="evt"><span class="t">${t}</span><span class="k ${cls}">${k}</span><span class="what">${what}${extra}</span><span class="amt">${amt}</span><span class="proof">${proof}</span></div>`;
+document.getElementById('events').innerHTML =
+  ev('14:00', 'Funding', '', 'Funding paid on both legs: Phoenix <b>+$0.026</b>, Hyperliquid <b>+$0.004</b>', '', '<span class="pos">+$0.03</span>', '<a>NEAR ↗ <span>9xQe…4Ta1</span></a>') +
+  ev('23:41', 'Open', 'open', 'Opened <b>DOGE</b>: short on Hyperliquid, long on Phoenix', '<span class="why">NEAR AI: spread held for 13 straight weeks.</span>', '−$1.47', '<a>NEAR ↗ <span>Jd5c…w2Lp</span></a><a>Hyperliquid ↗ <span>0x88b2…14d0</span></a>') +
+  ev('18:44', 'Rescue', 'rescue', 'Moved <b>$120.00</b> to Hyperliquid margin', '<div class="steps"><span>detected</span><span>quote ✓</span><span>signed 6.1 s</span><span>landed 52 s</span></div>', '−$0.31', '<a>NEAR ↗ <span>Lq3v…8kRd</span></a>') +
+  ev('06:30', 'Refused', 'refused', 'Contract refused to open <b>ZRO</b>', '<span class="why">No trusted oracle price for ZRO.</span>', '', '<a>NEAR ↗ <span>Cw7r…bE9n</span></a>') +
+  ev('23:39', 'Rotate', 'rotate', 'Closed <b>LTC</b> to move into DOGE', '<span class="why flag">Phoenix leg sent without price protection.</span>', '<span class="pos">+$1.12</span>', '<a>NEAR ↗ <span>Mk8e…u6Gv</span></a>');
+</script>
+</body>
+</html>

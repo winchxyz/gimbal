@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=390">
+<title>Gimbal · Security · phone</title>
+<link rel="stylesheet" href="../../tokens.css">
+<link rel="stylesheet" href="../shared/phone.css">
+</head>
+<body>
+<header><i data-mark></i><div class="right"><span class="dot" style="color:var(--ink)">Mainnet</span><span>desk-07</span></div></header>
+<section class="sec">
+  <div style="font:400 120px/0.85 var(--display);letter-spacing:var(--track-hero);color:var(--level)">0</div>
+  <h2 style="margin-top:12px">private keys exist for this desk</h2>
+  <p class="g">A NEAR contract owns every exchange account and asks the NEAR MPC network to sign, one order at a time, only after checking it against your policy.</p>
+</section>
+<section class="sec"><div class="lab">How an order gets signed</div>
+  <ol class="steps" style="margin-top:6px">
+    <li><span class="n">1</span><b>You sign the policy</b><span></span><small>once; again for every change</small></li>
+    <li><span class="n">2</span><b>The operator proposes an order</b><span></span><small>it holds no key</small></li>
+    <li><span class="n">3</span><b style="color:var(--level)">The contract checks it</b><span></span><small>asset, size, leverage, price, destination</small></li>
+    <li><span class="n">4</span><b>NEAR MPC signs it</b><span></span><small>5 to 7 seconds</small></li>
+    <li><span class="n">5</span><b>The exchange fills it</b><span></span><small>Hyperliquid, Phoenix or Orderly</small></li>
+  </ol>
+</section>
+<section class="sec"><h2>The operator cannot</h2><ul class="list">
+  <li class="no">Withdraw to any address but yours</li><li class="no">Trade outside the policy</li><li class="no">Change the policy or unpause</li><li class="no">Get a key: there is none</li></ul></section>
+<section class="sec"><h2>Only you can</h2><ul class="list">
+  <li class="yes">Pause the desk<small>Rescue still runs</small></li><li class="yes">Close both legs</li><li class="yes">Withdraw, always to demo-owner.near</li><li class="yes">Change the policy</li></ul></section>
+<section class="sec"><h2>Accounts the contract controls</h2>
+  <div class="rows" style="margin-top:8px"><div><span>Hyperliquid</span><span class="mono">0x5e1d…c09a ↗</span></div><div><span>Phoenix</span><span class="mono">7Hq3…wP2f ↗</span></div><div><span>Orderly</span><span class="mono">0x2b9c…5d77 ↗</span></div></div>
+</section>
+<nav class="tabs"><a href="desk.html"><i></i>Desk</a><a href="windows.html"><i></i>Windows</a><a href="journal.html"><i></i>Journal</a><a href="rescue.html"><i></i>Rescue</a><a class="on" href="security.html"><i></i>Security</a></nav>
+<script src="../shared/mark.js"></script>
+<script src="../shared/states.js"></script>
+</body>
+</html>

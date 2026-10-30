@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=390">
+<title>Gimbal · Welcome · phone</title>
+<link rel="stylesheet" href="../../tokens.css">
+<link rel="stylesheet" href="../shared/phone.css">
+</head>
+<body class="welcome" data-wait>
+<header><i data-mark></i><div class="right"><span class="dot" style="color:var(--ink)">Mainnet</span></div></header>
+<canvas class="gimbal-bg" id="field" aria-hidden="true"></canvas>
+<section class="hero-copy" id="copy">
+  <h1>Stays level when the market doesn’t.</h1>
+  <p>Long on one exchange, short on another. Earn the funding gap while a NEAR contract signs every order. Nobody holds a key.</p>
+  <div class="btns one"><a class="btn primary">Connect NEAR wallet</a><a class="btn">Watch a replay first</a></div>
+  <p class="cap"><i></i>The rings swing with the market. The green platform is your desk.</p>
+</section>
+
+<script src="../shared/mark.js"></script>
+<script src="../shared/gimbal-fx.js"></script>
+<script src="../shared/gimbal.js"></script>
+<script>
+const field = document.getElementById('field');
+const opts = { look: 'phosphor', cx: 0.5, cy: 0.25, size: 0.23, quiet: [document.getElementById('copy')], still: new URLSearchParams(location.search).has('still'), t: 6 };
+GimbalFX.mount(field, opts)
+  .then(ok => ok || (field.classList.add('fallback'), GimbalAscii.mount(field, opts)))
+  .then(() => { document.body.dataset.ready = '1'; });
+</script>
+<script src="../shared/states.js"></script>
+</body>
+</html>
