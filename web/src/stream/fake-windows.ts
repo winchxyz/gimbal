@@ -13,7 +13,14 @@ import type { EngineApi } from './api.ts';
  */
 export type Scenario = 'normal' | 'loading' | 'empty' | 'error';
 
-export const FAKE_STRATEGY: StrategyConfig = { minNetAprPct: 5, legUsd: 1200, maxLeverage: 3, stopDrawdownPct: 10 };
+export const FAKE_STRATEGY: StrategyConfig = {
+  auto: true,
+  minNetAprPct: 5,
+  legUsd: 1200,
+  maxLeverage: 3,
+  stopDrawdownPct: 10,
+  rotate: { minGainPts: 3, forHours: 4 },
+};
 export const FAKE_VENUE_COUNT = 32;
 export const FAKE_FAILED_VENUES = ['phoenix', 'lighter', 'paradex'];
 
