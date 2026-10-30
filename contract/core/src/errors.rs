@@ -92,6 +92,21 @@ impl fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
+/// How much of a refused input a message repeats; the rest is cut so a huge argument cannot blow
+/// up the panic message.
+pub const SHOWN_CHARS: usize = 40;
+
+/// The input as a refusal message quotes it: escaped, and cut after [`SHOWN_CHARS`] characters.
+pub fn shown(s: &str) -> String {
+    let mut chars = s.chars();
+    let head: String = chars.by_ref().take(SHOWN_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{head:?}…")
+    } else {
+        format!("{head:?}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

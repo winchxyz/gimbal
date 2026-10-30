@@ -5,16 +5,27 @@
 //! events, and turns a core [`Refusal`] into the panic `"E_CODE: msg"` with [`fail`].
 
 pub mod config;
+pub mod deposit;
 pub mod desk;
 pub mod events;
+pub mod mpc;
 
 pub use gimbal_core::Refusal;
 
+use gimbal_core::errors::{shown, E_ARGS, E_DESK_EXISTS, E_NO_DESK};
+use gimbal_core::ids::{check_desk_id, check_evm_address, decode_base58_32};
+use gimbal_core::policy::Policy;
 use near_sdk::store::LookupMap;
-use near_sdk::{env, near, AccountId, BorshStorageKey, PanicOnDefault};
+use near_sdk::{env, near, AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault, Promise};
 
-use crate::config::{FeeConfig, Network, OrderlyConfig, PriceSource, Treasury};
-use crate::desk::Desk;
+use crate::config::{Config, FeeConfig, Network, OrderlyConfig, PriceSource, Treasury};
+use crate::deposit::{check_one_yocto, check_pause_deposit, check_some_deposit, refund_after};
+use crate::desk::{policy_sha256, Desk, Gate, Role, SolanaAccounts};
+use crate::events::{DeskCreated, Event, OperatorSet, Paused, PolicySet};
+
+/// Gas `on_desk_keys` gets besides its share of what `create_desk` leaves unused: it reads two keys,
+/// hashes one, and writes the desk.
+pub const ON_DESK_KEYS_GAS: Gas = Gas::from_tgas(20);
 
 /// Ends the call with the refusal's stable code first: `"E_PRICE_BAND: px 2500 is 4.3% from oracle
 /// 2397.1"`. Clients match on the code, people read the rest.
@@ -46,15 +57,9 @@ enum StorageKey {
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct Gimbal {
-    network: Network,
-    /// The MPC signer contract (`v1.signer` mainnet, `v1.signer-prod.testnet` testnet).
-    mpc: AccountId,
-    price_source: PriceSource,
-    treasury: Treasury,
-    fees: FeeConfig,
-    orderly: OrderlyConfig,
+    config: Config,
     desks: LookupMap<String, Desk>,
-    /// Desk ids per owner, for `desks_of`.
+    /// Desk ids per owner, in creation order, for `desks_of`.
     desks_by_owner: LookupMap<AccountId, Vec<String>>,
 }
 
@@ -64,6 +69,7 @@ impl Gimbal {
     /// initialise it, so nobody can front-run the deploy with their own treasury or fees.
     #[init]
     #[private]
+    #[deny_unknown_arguments]
     pub fn new(
         network: Network,
         mpc: AccountId,
@@ -74,119 +80,339 @@ impl Gimbal {
     ) -> Self {
         config::check(network, &price_source, &treasury, &fees, &orderly).or_fail();
         Self {
-            network,
-            mpc,
-            price_source,
-            treasury,
-            fees,
-            orderly,
+            config: Config {
+                network,
+                mpc,
+                price_source,
+                treasury,
+                fees,
+                orderly,
+            },
             desks: LookupMap::new(StorageKey::Desks),
             desks_by_owner: LookupMap::new(StorageKey::DesksByOwner),
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::{ReferralCodes, ARBITRUM_MAINNET, ARBITRUM_SEPOLIA};
-    use gimbal_core::errors::E_ARGS;
-    use near_sdk::test_utils::{accounts, VMContextBuilder};
-    use near_sdk::testing_env;
-
-    fn contract_id() -> AccountId {
-        "gimbal.testnet".parse().unwrap()
-    }
-
-    fn called_by(predecessor: AccountId) {
-        testing_env!(VMContextBuilder::new()
-            .current_account_id(contract_id())
-            .predecessor_account_id(predecessor)
-            .build());
-    }
-
-    fn treasury() -> Treasury {
-        Treasury {
-            near: accounts(5),
-            hl_builder: "0x5050a4f4b3f9338c3472dcc01a87c76a144b3c9c".into(),
-            referral_codes: ReferralCodes {
-                hyperliquid: Some("TESTCODE".into()),
-                orderly: None,
-                phoenix: None,
-            },
+    /// Creates a desk owned by the caller once the MPC contract confirms its addresses.
+    /// `evm_address` and `solana` are the desk's MPC-derived venue accounts and can never change.
+    ///
+    /// Attach the storage the desk takes (`E_DEPOSIT` below it; no deposit at all is
+    /// `E_NOT_ALLOWED`) and about 100 TGas. The call asks the MPC contract's `derived_public_key`
+    /// for `gimbal/<desk_id>/evm` and `gimbal/<desk_id>/sol` and stores nothing itself;
+    /// [`Self::on_desk_keys`] stores the desk, refunds the excess and emits `desk_created` and
+    /// `policy_set`, or refunds everything. The transaction's result is that callback's `bool`.
+    #[payable]
+    #[deny_unknown_arguments]
+    pub fn create_desk(
+        &mut self,
+        desk_id: String,
+        policy: Policy,
+        evm_address: String,
+        solana: SolanaAccounts,
+    ) -> Promise {
+        let attached = env::attached_deposit();
+        check_some_deposit("create_desk", attached).or_fail();
+        let owner = env::predecessor_account_id();
+        let contract = env::current_account_id();
+        self.config
+            .check_not_reserved(&contract, "owner", &owner)
+            .or_fail();
+        check_desk_id(&desk_id).or_fail();
+        if self.desks.contains_key(&desk_id) {
+            fail(Refusal::new(
+                E_DESK_EXISTS,
+                format!("desk {desk_id} exists already"),
+            ));
         }
-    }
+        check_evm_address("evm_address", &evm_address).or_fail();
+        solana.check().or_fail();
+        policy.validate().or_fail();
 
-    fn fees() -> FeeConfig {
-        FeeConfig {
-            performance_bps: 1000,
-            hl_builder_tenth_bps: 10,
-        }
-    }
+        let desk = Desk::new(owner, policy, evm_address, solana);
+        // A short deposit is refused here, before the MPC calls: write the desk, measure, undo.
+        let added = self.write_desk(&desk_id, &desk);
+        self.unwrite_desk(&desk_id, &desk.owner);
+        refund_after(
+            &format!("desk {desk_id}"),
+            added,
+            env::storage_byte_cost(),
+            attached,
+        )
+        .or_fail();
 
-    fn testnet() -> Gimbal {
-        Gimbal::new(
-            Network::Testnet,
-            "v1.signer-prod.testnet".parse().unwrap(),
-            PriceSource::Mock,
-            treasury(),
-            fees(),
-            OrderlyConfig {
-                broker_id: "woofi_dex".into(),
-                chain_id: ARBITRUM_SEPOLIA,
-            },
+        mpc::desk_keys(&self.config.mpc, &desk_id, &contract).then(
+            Self::ext(contract)
+                .with_static_gas(ON_DESK_KEYS_GAS)
+                .with_unused_gas_weight(1)
+                .on_desk_keys(desk_id, desk, attached),
         )
     }
 
-    #[test]
-    fn new_stores_the_config() {
-        called_by(contract_id());
-        let g = testnet();
-        assert_eq!(g.network, Network::Testnet);
-        assert_eq!(g.mpc.as_str(), "v1.signer-prod.testnet");
-        assert_eq!(g.price_source, PriceSource::Mock);
-        assert_eq!(g.treasury, treasury());
-        assert_eq!(g.fees, fees());
-        assert_eq!(g.orderly.chain_id, ARBITRUM_SEPOLIA);
-        assert!(g.desks.get("alpha").is_none());
-        assert!(g.desks_by_owner.get(&accounts(0)).is_none());
+    /// The callback of `create_desk`. When the MPC keys give the desk's `evm_address` and Solana
+    /// authority and the id is still free, it stores the desk, keeps its storage out of `attached`,
+    /// refunds the rest and emits `desk_created` and `policy_set`. Otherwise it stores nothing,
+    /// refunds all of `attached` and logs the refusal (`E_MPC`, `E_ARGS`, `E_DESK_EXISTS` or
+    /// `E_DEPOSIT`): it never panics on them, since a failed callback would keep the deposit.
+    /// Returns whether the desk was created.
+    #[private]
+    pub fn on_desk_keys(&mut self, desk_id: String, desk: Desk, attached: NearToken) -> bool {
+        match self.store_checked_desk(&desk_id, &desk, attached) {
+            Ok(refund) => {
+                refund_to(&desk.owner, refund);
+                DeskCreated {
+                    desk_id: &desk_id,
+                    owner: &desk.owner,
+                    evm_address: &desk.evm_address,
+                    sol_authority: &desk.solana.authority,
+                }
+                .emit();
+                PolicySet {
+                    desk_id: &desk_id,
+                    policy_sha256: &policy_sha256(&desk.policy),
+                }
+                .emit();
+                true
+            }
+            Err(refusal) => {
+                refund_to(&desk.owner, attached);
+                env::log_str(&refusal.to_string());
+                false
+            }
+        }
     }
 
-    // `#[private]` and the already-initialised guard live in the wasm entry point that near-sdk
-    // generates, which a unit test calling `Gimbal::new` directly does not go through.
-
-    #[test]
-    #[should_panic(expected = "E_ARGS: the Mock price source is for testnet and demo only")]
-    fn new_refuses_mock_prices_on_mainnet() {
-        called_by(contract_id());
-        Gimbal::new(
-            Network::Mainnet,
-            "v1.signer".parse().unwrap(),
-            PriceSource::Mock,
-            treasury(),
-            fees(),
-            OrderlyConfig {
-                broker_id: "gimbal".into(),
-                chain_id: ARBITRUM_MAINNET,
-            },
-        );
+    /// Replaces the desk's policy. Owner only, allowed while the desk is paused. Attach the storage
+    /// a larger policy adds (at least 1 yoctoNEAR); the rest is refunded.
+    #[payable]
+    #[deny_unknown_arguments]
+    pub fn set_policy(&mut self, desk_id: String, policy: Policy) {
+        let attached = env::attached_deposit();
+        let desk = owner_desk(&mut self.desks, &desk_id, "set_policy");
+        check_some_deposit("set_policy", attached).or_fail();
+        policy.validate().or_fail();
+        let sha = policy_sha256(&policy);
+        let before = env::storage_usage();
+        desk.policy = policy;
+        self.desks.flush();
+        charge_storage(before, &format!("set_policy on desk {desk_id}"), attached);
+        PolicySet {
+            desk_id: &desk_id,
+            policy_sha256: &sha,
+        }
+        .emit();
     }
 
-    #[test]
-    #[should_panic(expected = "E_ARGS: desk id is too long")]
-    fn fail_panics_with_code_first() {
-        fail(Refusal::new(E_ARGS, "desk id is too long"));
+    /// Sets the separate operator account, or clears it with `null`. Owner only. Attach the storage
+    /// a longer account id adds (at least 1 yoctoNEAR); the rest is refunded.
+    #[payable]
+    #[deny_unknown_arguments]
+    pub fn set_operator(&mut self, desk_id: String, operator: Option<AccountId>) {
+        let attached = env::attached_deposit();
+        let desk = owner_desk(&mut self.desks, &desk_id, "set_operator");
+        check_some_deposit("set_operator", attached).or_fail();
+        if let Some(account) = &operator {
+            self.config
+                .check_not_reserved(&env::current_account_id(), "operator", account)
+                .or_fail();
+        }
+        let before = env::storage_usage();
+        desk.operator = operator.clone();
+        self.desks.flush();
+        charge_storage(before, &format!("set_operator on desk {desk_id}"), attached);
+        OperatorSet {
+            desk_id: &desk_id,
+            operator: operator.as_ref(),
+        }
+        .emit();
     }
 
-    #[test]
-    // The mock escapes quotes in the panic it reports, so match the part before the quoted input.
-    #[should_panic(expected = "E_DECIMAL: ")]
-    fn or_fail_panics_on_a_refusal() {
-        gimbal_core::decimal::parse_e8("1.50").or_fail();
+    /// Pauses or unpauses the desk. The owner may do both, the operator only pause. Pausing takes no
+    /// deposit (or 1 yoctoNEAR), so the engine's key can pause; unpausing needs exactly 1 yoctoNEAR,
+    /// so only the owner's wallet can. Setting the state the desk is already in changes nothing and
+    /// logs nothing.
+    #[payable]
+    #[deny_unknown_arguments]
+    pub fn set_paused(&mut self, desk_id: String, paused: bool) {
+        let by = env::predecessor_account_id();
+        let attached = env::attached_deposit();
+        let desk = desk_mut(&mut self.desks, &desk_id);
+        desk.check_set_paused(&desk_id, &by, paused).or_fail();
+        if paused {
+            check_pause_deposit(attached)
+        } else {
+            check_one_yocto("set_paused(false)", attached)
+        }
+        .or_fail();
+        if desk.paused == paused {
+            return;
+        }
+        desk.paused = paused;
+        Paused {
+            desk_id: &desk_id,
+            paused,
+            by: &by,
+        }
+        .emit();
     }
 
-    #[test]
-    fn or_fail_passes_values_through() {
-        assert_eq!(gimbal_core::decimal::parse_e8("1.5").or_fail(), 150_000_000);
+    /// The desk, or `null` when there is none with that id.
+    pub fn get_desk(&self, desk_id: String) -> Option<Desk> {
+        self.desks.get(&desk_id).cloned()
+    }
+
+    /// The ids of the owner's desks, in creation order.
+    pub fn desks_of(&self, owner: AccountId) -> Vec<String> {
+        self.desks_by_owner.get(&owner).cloned().unwrap_or_default()
+    }
+
+    /// Everything `new` fixed: network, MPC signer, price source, treasury, fees, Orderly broker.
+    pub fn config(&self) -> Config {
+        self.config.clone()
+    }
+
+    /// The contract crate's version.
+    pub fn version(&self) -> String {
+        env!("CARGO_PKG_VERSION").to_string()
     }
 }
+
+impl Gimbal {
+    /// The checks of [`Self::on_desk_keys`], then the write. Returns the part of `attached` to
+    /// refund; on a refusal nothing is left written.
+    fn store_checked_desk(
+        &mut self,
+        desk_id: &str,
+        desk: &Desk,
+        attached: NearToken,
+    ) -> Result<NearToken, Refusal> {
+        let evm_address = mpc::evm_address(&mpc::answer(mpc::EVM_RESULT, "EVM")?)?;
+        let sol_authority = mpc::sol_authority(&mpc::answer(mpc::SOL_RESULT, "Solana")?)?;
+        if desk.evm_address != evm_address {
+            return Err(Refusal::new(
+                E_ARGS,
+                format!(
+                    "evm_address {} is not the MPC address of desk {desk_id}, {evm_address}",
+                    desk.evm_address
+                ),
+            ));
+        }
+        // Base58 has one spelling per key, so comparing the bytes compares the strings.
+        if decode_base58_32(&desk.solana.authority) != Some(sol_authority) {
+            return Err(Refusal::new(
+                E_ARGS,
+                format!(
+                    "solana.authority {} is not the MPC key of desk {desk_id}, {}",
+                    desk.solana.authority,
+                    bs58::encode(sol_authority).into_string()
+                ),
+            ));
+        }
+        if self.desks.contains_key(desk_id) {
+            return Err(Refusal::new(
+                E_DESK_EXISTS,
+                format!("desk {desk_id} was created while its addresses were checked"),
+            ));
+        }
+        let added = self.write_desk(desk_id, desk);
+        let refund = refund_after(
+            &format!("desk {desk_id}"),
+            added,
+            env::storage_byte_cost(),
+            attached,
+        );
+        if refund.is_err() {
+            self.unwrite_desk(desk_id, &desk.owner);
+        }
+        refund
+    }
+
+    /// Stores the desk and appends its id to the owner's list; returns the bytes that took.
+    fn write_desk(&mut self, desk_id: &str, desk: &Desk) -> u64 {
+        let before = env::storage_usage();
+        self.desks.insert(desk_id.to_owned(), desk.clone());
+        self.desks_by_owner
+            .entry(desk.owner.clone())
+            .or_default()
+            .push(desk_id.to_owned());
+        // The maps write on flush; flushing now makes the bytes measurable within this call.
+        self.desks.flush();
+        self.desks_by_owner.flush();
+        env::storage_usage().saturating_sub(before)
+    }
+
+    /// Undoes [`Self::write_desk`] in the same call. Desks are never deleted, so an owner's list
+    /// that empties was created by that write.
+    fn unwrite_desk(&mut self, desk_id: &str, owner: &AccountId) {
+        self.desks.remove(desk_id);
+        let emptied = match self.desks_by_owner.get_mut(owner) {
+            Some(ids) => {
+                ids.pop();
+                ids.is_empty()
+            }
+            None => false,
+        };
+        if emptied {
+            self.desks_by_owner.remove(owner);
+        }
+        self.desks.flush();
+        self.desks_by_owner.flush();
+    }
+}
+
+/// Sends `amount` back, unless it is zero.
+fn refund_to(account: &AccountId, amount: NearToken) {
+    if !amount.is_zero() {
+        Promise::new(account.clone()).transfer(amount).detach();
+    }
+}
+
+/// The end of a storage method, after its writes are flushed: keeps the storage added since
+/// `before` (at least 1 yoctoNEAR) out of `attached`, or `E_DEPOSIT`, and refunds the rest to the
+/// caller. Storage freed is not paid back.
+fn charge_storage(before: u64, what: &str, attached: NearToken) {
+    let added = env::storage_usage().saturating_sub(before);
+    let refund = refund_after(what, added, env::storage_byte_cost(), attached).or_fail();
+    refund_to(&env::predecessor_account_id(), refund);
+}
+
+/// The desk `desk_id`, or `E_NO_DESK`. Takes the map rather than the contract so a method can hold
+/// the desk and still read `self.config`.
+pub fn desk_mut<'a>(desks: &'a mut LookupMap<String, Desk>, desk_id: &str) -> &'a mut Desk {
+    match desks.get_mut(desk_id) {
+        Some(desk) => desk,
+        None => fail(Refusal::new(
+            E_NO_DESK,
+            format!("no desk {}", shown(desk_id)),
+        )),
+    }
+}
+
+/// The desk of an owner method, after `E_NO_DESK` and `E_NOT_ALLOWED` (anyone but the owner).
+pub fn owner_desk<'a>(
+    desks: &'a mut LookupMap<String, Desk>,
+    desk_id: &str,
+    method: &str,
+) -> &'a mut Desk {
+    let desk = desk_mut(desks, desk_id);
+    desk.check_owner(desk_id, &env::predecessor_account_id(), method)
+        .or_fail();
+    desk
+}
+
+/// The guard every action method calls first: the desk exists (`E_NO_DESK`), the caller is its
+/// owner or operator (`E_NOT_ALLOWED`), and, for a [`Gate::Running`] action, it is not paused
+/// (`E_PAUSED`). Returns the desk and the caller's role.
+pub fn action_desk<'a>(
+    desks: &'a mut LookupMap<String, Desk>,
+    desk_id: &str,
+    gate: Gate,
+) -> (&'a mut Desk, Role) {
+    let desk = desk_mut(desks, desk_id);
+    let role = desk
+        .check_action(desk_id, &env::predecessor_account_id(), gate)
+        .or_fail();
+    (desk, role)
+}
+
+#[cfg(test)]
+mod tests;

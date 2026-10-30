@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 borsh = { version = "1", features = ["derive"] }
+bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]

@@ -2,6 +2,7 @@
 //! price source differ between testnet and mainnet; the code is the same.
 
 use gimbal_core::errors::{Refusal, E_ARGS};
+use gimbal_core::ids::is_lower_evm_address;
 use near_sdk::{near, AccountId};
 
 /// Hyperliquid caps a builder fee on perps at 100 tenths of a bp (0.1 %).
@@ -86,6 +87,51 @@ pub struct FeeConfig {
     pub hl_builder_tenth_bps: u16,
 }
 
+/// Everything `new` fixes, as `config()` returns it.
+#[near(serializers = [borsh, json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Config {
+    pub network: Network,
+    /// The MPC signer contract (`v1.signer` mainnet, `v1.signer-prod.testnet` testnet).
+    pub mpc: AccountId,
+    pub price_source: PriceSource,
+    pub treasury: Treasury,
+    pub fees: FeeConfig,
+    pub orderly: OrderlyConfig,
+}
+
+impl Config {
+    /// The price oracle account, when prices come from one.
+    pub fn oracle(&self) -> Option<&AccountId> {
+        match &self.price_source {
+            PriceSource::OutLayer { contract } => Some(contract),
+            PriceSource::Mock => None,
+        }
+    }
+
+    /// Owner and operator can never be the contract itself, the MPC contract or the oracle
+    /// (`E_ARGS`). Those accounts call into the contract on their own (callbacks, signatures,
+    /// prices), so a desk role on one of them would make such a call count as the owner's or the
+    /// operator's. `field` names the argument in the message.
+    pub fn check_not_reserved(
+        &self,
+        contract: &AccountId,
+        field: &str,
+        account: &AccountId,
+    ) -> Result<(), Refusal> {
+        let what = if account == contract {
+            "the contract itself"
+        } else if *account == self.mpc {
+            "the MPC contract"
+        } else if self.oracle() == Some(account) {
+            "the price oracle"
+        } else {
+            return Ok(());
+        };
+        Err(Refusal::new(E_ARGS, format!("{field} {account} is {what}")))
+    }
+}
+
 /// Checks the arguments of `new`. They are fixed for the contract's life and every desk depends on
 /// them, so a wrong value is refused up front rather than at the first order.
 pub fn check(
@@ -147,16 +193,6 @@ pub fn check(
         ));
     }
     Ok(())
-}
-
-/// `0x` and 40 lowercase hex digits: Hyperliquid lowercases addresses before it verifies a
-/// signature, so a mixed-case address in a signed action would not match.
-fn is_lower_evm_address(s: &str) -> bool {
-    s.len() == 42
-        && s.starts_with("0x")
-        && s[2..]
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[cfg(test)]
@@ -332,5 +368,41 @@ mod tests {
             from_str::<ReferralCodes>("{}").unwrap(),
             ReferralCodes::default()
         );
+    }
+
+    fn config(price_source: PriceSource) -> Config {
+        Config {
+            network: Network::Mainnet,
+            mpc: "v1.signer".parse().unwrap(),
+            price_source,
+            treasury: treasury(),
+            fees: fees(),
+            orderly: orderly(ARBITRUM_MAINNET),
+        }
+    }
+
+    #[test]
+    fn reserved_accounts_never_hold_a_desk_role() {
+        let contract: AccountId = "gimbal.near".parse().unwrap();
+        let c = config(PriceSource::OutLayer {
+            contract: "price-oracle.near".parse().unwrap(),
+        });
+        for (account, what) in [
+            ("gimbal.near", "the contract itself"),
+            ("v1.signer", "the MPC contract"),
+            ("price-oracle.near", "the price oracle"),
+        ] {
+            let r = c
+                .check_not_reserved(&contract, "operator", &account.parse().unwrap())
+                .unwrap_err();
+            assert_eq!(r.code, E_ARGS);
+            assert_eq!(r.msg, format!("operator {account} is {what}"));
+        }
+        c.check_not_reserved(&contract, "owner", &"alice.near".parse().unwrap())
+            .unwrap();
+        // With Mock prices there is no oracle account to reserve.
+        config(PriceSource::Mock)
+            .check_not_reserved(&contract, "owner", &"price-oracle.near".parse().unwrap())
+            .unwrap();
     }
 }
