@@ -1,0 +1,31 @@
+[workspace]
+members = ["core"]
+resolver = "2"
+
+[package]
+name = "gimbal"
+version = "0.1.0"
+edition = "2021"
+description = "Gimbal NEAR contract: desks, policy, MPC signing requests and events"
+license = "BUSL-1.1"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+gimbal-core = { path = "core" }
+near-sdk = "~5.29"
+hex = "0.4"
+bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+near-sdk = { version = "~5.29", features = ["unit-testing"] }
+
+[profile.release]
+codegen-units = 1
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+overflow-checks = true
