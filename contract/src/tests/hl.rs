@@ -28,7 +28,15 @@ fn case(section: &str, name: &str) -> Value {
         .clone()
 }
 
-/// The `order_policy` vectors' assets: BTC 0, ETH 1, SOL 5, DOGE 12, and HYPE 159 unpriced.
+fn unpriced(symbol: &str, max_sz: &str) -> UnpricedAsset {
+    UnpricedAsset {
+        symbol: symbol.into(),
+        max_sz: max_sz.into(),
+    }
+}
+
+/// The `order_policy` vectors' assets: BTC 0, ETH 1, SOL 5, DOGE 12, and HYPE 159 unpriced (up to
+/// 3 HYPE per order).
 fn hl_policy() -> Policy {
     let asset = |index, symbol: &str, sz_decimals| HlAsset {
         index,
@@ -44,7 +52,8 @@ fn hl_policy() -> Policy {
             asset(159, "HYPE", 2),
         ],
         max_notional_usd: 1000,
-        unpriced: vec!["HYPE".into()],
+        oracle_max_age_s: 300,
+        unpriced: vec![unpriced("HYPE", "3")],
         unpriced_max_notional_usd: 100,
         ..policy()
     }
@@ -53,8 +62,12 @@ fn hl_policy() -> Policy {
 /// A testnet contract with desk `alpha` of `owner()` on the vectors' desk address, operator
 /// `operator()`.
 fn hl_desk() -> Gimbal {
+    hl_desk_with(hl_policy())
+}
+
+fn hl_desk_with(policy: Policy) -> Gimbal {
     let mut g = testnet();
-    let mut desk = Desk::new(owner(), hl_policy(), VECTOR_DESK_EVM.into(), solana());
+    let mut desk = Desk::new(owner(), policy, VECTOR_DESK_EVM.into(), solana());
     desk.operator = Some(operator());
     g.desks.insert("alpha".into(), desk);
     g
@@ -83,8 +96,14 @@ fn order(asset: u32, px: &str, sz: &str) -> HlOrder {
     }
 }
 
+/// A priced order: refused (`E_ORACLE_STALE`) until the contract stores prices (C6).
 fn eth() -> HlOrder {
     order(1, "2500", "0.1")
+}
+
+/// An unpriced order that fits the policy: 99.75 USD of HYPE, which signs without an oracle price.
+fn hype() -> HlOrder {
+    order(159, "39.9", "2.5")
 }
 
 fn sha256_hex(s: &str) -> String {
@@ -138,7 +157,15 @@ fn nonce_of(desk_id: &str, g: &Gimbal) -> u64 {
 
 #[test]
 fn hl_order_signs_the_vector_bytes() {
-    let mut g = hl_desk();
+    // Until prices are stored (C6) only unpriced symbols sign, so the vectors' assets are listed
+    // as unpriced here, with caps none of their orders reach.
+    let mut p = hl_policy();
+    p.unpriced = ["BTC", "ETH", "SOL", "DOGE"]
+        .iter()
+        .map(|s| unpriced(s, "1000"))
+        .collect();
+    p.unpriced_max_notional_usd = 1000;
+    let mut g = hl_desk_with(p);
     let mut signed = 0;
     for c in vectors()["l1"]["cases"].as_array().unwrap() {
         let p = &c["params"];
@@ -181,12 +208,12 @@ fn hl_order_refuses_what_the_policy_does_not_allow() {
         (order(1, "2500", "0.12345"), "E_DECIMAL: sz "),
         (order(1, "2500", "0"), "E_SIZE: sz is zero"),
         (
-            order(1, "2500", "0.4001"),
-            "E_SIZE: ETH 2500 x 0.4001 = 1000.25 USD is over max_notional_usd 1000",
-        ),
-        (
             order(159, "50", "3"),
             "E_SIZE: HYPE 50 x 3 = 150 USD is over the unpriced cap",
+        ),
+        (
+            order(159, "1", "3.01"),
+            "E_SIZE: HYPE size 3.01 is over its max_sz 3",
         ),
     ] {
         at(operator(), T, yocto(0));
@@ -196,12 +223,33 @@ fn hl_order_refuses_what_the_policy_does_not_allow() {
     }
     at(operator(), T, yocto(0));
     assert_refused("E_ARGS: reason has 281 characters, over 280", || {
-        g.hl_order("alpha".into(), eth(), "x".repeat(281));
+        g.hl_order("alpha".into(), hype(), "x".repeat(281));
     });
     assert_eq!(nonce_of("alpha", &g), 0, "a refused order takes no nonce");
-    // The cap itself and the unpriced cap itself pass.
-    g.hl_order("alpha".into(), order(1, "2500", "0.4"), "x".repeat(280));
-    g.hl_order("alpha".into(), order(159, "40", "2.5"), String::new());
+    // The unpriced cap itself passes.
+    g.hl_order("alpha".into(), order(159, "40", "2.5"), "x".repeat(280));
+    g.hl_order("alpha".into(), order(159, "33.33", "3"), String::new());
+}
+
+/// No prices are stored before C6, so every priced order is refused, whatever its size and side:
+/// the oversize order and the tiny-price sell of the C3 review included.
+#[test]
+fn a_priced_order_is_refused_until_prices_are_stored() {
+    let mut g = hl_desk();
+    let mut tiny_sell = order(1, "1", "1000");
+    tiny_sell.is_buy = false;
+    let mut close = eth();
+    close.reduce_only = true;
+    for o in [eth(), order(1, "2500", "0.4001"), tiny_sell, close] {
+        at(operator(), T, yocto(0));
+        assert_refused(
+            "E_ORACLE_STALE: no oracle price for ETH younger than 300 s, and ETH is not in policy.unpriced",
+            || {
+                g.hl_order("alpha".into(), o, "enter".into());
+            },
+        );
+    }
+    assert_eq!(nonce_of("alpha", &g), 0);
 }
 
 #[test]
@@ -215,7 +263,10 @@ fn a_reduce_only_order_passes_a_paused_desk_and_nothing_else_does() {
         assert_refused(paused, || {
             g.hl_order("alpha".into(), eth(), "open".into());
         });
-        let mut close = eth();
+        assert_refused(paused, || {
+            g.hl_order("alpha".into(), hype(), "open".into());
+        });
+        let mut close = hype();
         close.reduce_only = true;
         close.is_buy = false;
         let got = g.hl_order("alpha".into(), close, "panic close".into());
@@ -259,7 +310,7 @@ fn hl_actions_are_for_the_owner_and_the_operator() {
         g.hl_order("bravo".into(), eth(), "x".into());
     });
     // The owner's FunctionCall key (no deposit) reaches every operator method.
-    g.hl_order("alpha".into(), eth(), "x".into());
+    g.hl_order("alpha".into(), hype(), "x".into());
     g.hl_set_referrer("alpha".into());
     g.hl_approve_builder_fee("alpha".into());
     g.hl_usd_class_transfer("alpha".into(), "5".into(), true, "x".into());
@@ -275,7 +326,7 @@ fn every_action_takes_the_next_nonce_of_its_desk() {
     let nonce = |u: &UnsignedAction| u.payload.get("nonce").cloned();
     let n = |ms: u64| Some(gimbal_core::msgpack::Value::UInt(ms));
     at(operator(), T, yocto(0));
-    assert_eq!(nonce(&g.hl_order("alpha".into(), eth(), "a".into())), n(T));
+    assert_eq!(nonce(&g.hl_order("alpha".into(), hype(), "a".into())), n(T));
     // Two in one block, then a user-signed one: never the same nonce twice.
     assert_eq!(nonce(&g.hl_set_referrer("alpha".into())), n(T + 1));
     assert_eq!(nonce(&g.hl_approve_builder_fee("alpha".into())), n(T + 2));
@@ -284,7 +335,7 @@ fn every_action_takes_the_next_nonce_of_its_desk() {
     // A later block moves on to the block time; an earlier one cannot go back.
     at(operator(), T + 5_000, yocto(0));
     assert_eq!(
-        nonce(&g.hl_order("alpha".into(), eth(), "b".into())),
+        nonce(&g.hl_order("alpha".into(), hype(), "b".into())),
         n(T + 5_000)
     );
     at(owner(), T - 10, ONE_YOCTO);

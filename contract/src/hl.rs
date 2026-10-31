@@ -14,6 +14,7 @@ use crate::action::UnsignedAction;
 use crate::config::Config;
 use crate::deposit::check_one_yocto;
 use crate::desk::Gate;
+use crate::prices::reference_price;
 use crate::{action_desk, owner_desk, Gimbal, GimbalExt, OrFail};
 
 /// The host's keccak256, which the core builders take as a function.
@@ -26,13 +27,22 @@ impl Gimbal {
     /// A limit order on Hyperliquid, with the treasury's builder fee. Owner or operator; a
     /// reduce-only order also on a paused desk. Refuses an asset outside the policy (`E_ASSET`),
     /// a bad tif or cloid (`E_ARGS`), px or sz strings that are not canonical or break
-    /// Hyperliquid's rules (`E_DECIMAL`), and a zero size or a notional px × sz over the policy's
-    /// cap (`E_SIZE`). The oracle price band joins on day 6.
+    /// Hyperliquid's rules (`E_DECIMAL`), a zero size (`E_SIZE`), and then, for a symbol in
+    /// `policy.unpriced`, a size over its `max_sz` or a notional px × sz over the unpriced cap
+    /// (`E_SIZE`); for any other symbol no fresh oracle price (`E_ORACLE_STALE`, every priced
+    /// order until prices are stored, C6), a price outside the band (`E_PRICE_BAND`) or a notional
+    /// sz × max(px, oracle) over `max_notional_usd` (`E_SIZE`).
     #[deny_unknown_arguments]
     pub fn hl_order(&mut self, desk_id: String, order: HlOrder, reason: String) -> UnsignedAction {
         let (desk, _) = action_desk(&mut self.desks, &desk_id, Gate::order(order.reduce_only));
         check_reason(&reason).or_fail();
-        let checked = check_order(&desk.policy, &order).or_fail();
+        let reference = desk
+            .policy
+            .hl_assets
+            .iter()
+            .find(|a| a.index == order.asset)
+            .and_then(|a| reference_price(&a.symbol, desk.policy.oracle_max_age_s));
+        let checked = check_order(&desk.policy, &order, reference).or_fail();
         let builder = treasury_builder(&self.config);
         let action = order_action(
             &checked.wire,

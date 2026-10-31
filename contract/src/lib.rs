@@ -11,6 +11,7 @@ pub mod desk;
 pub mod events;
 pub mod hl;
 pub mod mpc;
+pub mod prices;
 
 pub use gimbal_core::Refusal;
 

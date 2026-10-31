@@ -7,7 +7,7 @@ use crate::config::{ReferralCodes, ARBITRUM_MAINNET, ARBITRUM_SEPOLIA};
 use crate::deposit::ONE_YOCTO;
 use crate::mpc::tests::{MPC_EVM, MPC_SOL};
 use gimbal_core::errors::{E_ARGS, E_NOT_ALLOWED, E_PAUSED};
-use gimbal_core::policy::{HlAsset, PhoenixMarket};
+use gimbal_core::policy::{HlAsset, PhoenixMarket, UnpricedAsset};
 use near_sdk::mock::MockAction;
 use near_sdk::serde_json::{self, json, Value};
 use near_sdk::test_utils::{accounts, get_created_receipts, get_logs, VMContextBuilder};
@@ -892,15 +892,18 @@ fn the_callback_refunds_a_deposit_short_of_the_storage_and_undoes_its_write() {
 fn policy_2() -> Policy {
     let mut p = policy();
     p.max_notional_usd = 50;
-    p.unpriced = vec!["HYPE".into()];
+    p.unpriced = vec![UnpricedAsset {
+        symbol: "HYPE".into(),
+        max_sz: "2.5".into(),
+    }];
     p
 }
 
-const POLICY_2_JSON: &str = r#"{"hl_assets":[{"index":4,"symbol":"ETH","sz_decimals":4}],"phoenix_markets":[{"symbol":"SOL","orderbook":"11111111111111111111111111111111","base_lot_e8":1000000,"tick_e8":1000}],"orderly_symbols":["PERP_SOL_USDC"],"max_notional_usd":50,"price_band_bps":100,"oracle_max_age_s":60,"rescue_cap_usd_per_hour":50,"max_transfer_cost_bps":100,"max_transfer_cost_flat_e6":500000,"unpriced":["HYPE"],"unpriced_max_notional_usd":100}"#;
+const POLICY_2_JSON: &str = r#"{"hl_assets":[{"index":4,"symbol":"ETH","sz_decimals":4}],"phoenix_markets":[{"symbol":"SOL","orderbook":"11111111111111111111111111111111","base_lot_e8":1000000,"tick_e8":1000}],"orderly_symbols":["PERP_SOL_USDC"],"max_notional_usd":50,"price_band_bps":100,"oracle_max_age_s":60,"rescue_cap_usd_per_hour":50,"max_transfer_cost_bps":100,"max_transfer_cost_flat_e6":500000,"unpriced":[{"symbol":"HYPE","max_sz":"2.5"}],"unpriced_max_notional_usd":100}"#;
 
 /// sha256 of [`POLICY_2_JSON`], computed outside Rust as
 /// `sha256(JSON.stringify(JSON.parse(POLICY_2_JSON)))`, which gives back the same bytes.
-const POLICY_2_SHA256: &str = "159187a1835ef294181f0ecee01a9b0c59d5c6758f927ea2987d4bdf0290b5e7";
+const POLICY_2_SHA256: &str = "dd22d0c2ea4a07a460be1dc73aabfc2cb228416bb358d42e9f19457f0adcce3e";
 
 #[test]
 fn policy_sha256_hashes_the_json_get_desk_returns() {

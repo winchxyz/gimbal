@@ -6,6 +6,7 @@ pub mod eip712;
 pub mod errors;
 pub mod hl;
 pub mod ids;
+pub mod limits;
 pub mod msgpack;
 pub mod network;
 pub mod policy;
