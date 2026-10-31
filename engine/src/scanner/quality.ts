@@ -17,10 +17,11 @@
 //   8 h) while a crowd of other venues agrees far from it (BLUR on Bybit): more likely a default than the market's
 //   rate. A venue with data of its own at the pin is not flagged: its premium sits inside the clamp, and the carry
 //   against the crowd is real.
-// - Market closed: a stock perp read while no stock exchange is in session, or another traditional asset (a
-//   hl-xyz market) over the futures weekend: its rate is not set by a live market (a Kraken rate against 0
-//   elsewhere on a Saturday). A listing names a leg's market only when their marks agree, never by ticker alone:
-//   Bitget's DASHSTOCKUSDT is DoorDash, not the Dash coin.
+// - Market closed: a stock perp read while its own exchange is shut (New York's hours unless config lists the share
+//   elsewhere: Samsung keeps Seoul's), or a commodity, index or FX market of a traditional-only venue (hl-xyz) over
+//   the futures weekend: its rate is not set by a live market (a Kraken rate against 0 elsewhere on a Saturday). A
+//   stock or ETF on hl-xyz is a stock perp too. A listing names a leg's market only when their marks agree, never
+//   by ticker alone: Bitget's DASHSTOCKUSDT is DoorDash, not the Dash coin.
 // Pure: the legs, the time and the tables come in as arguments.
 
 import type { ScanVenueId, Window as FundingWindow } from '@gimbal/shared';
@@ -110,10 +111,10 @@ export interface QualityInput {
   config: QualityConfig;
 }
 
-/** A listing that says what kind of market a base is: a venue's stock-perp symbol, or a traditional-only venue. */
+/** A listing that says what kind of market a base is: a venue's stock-perp symbol, or a traditional-only venue's. */
 interface Listing {
   leg: ScanLeg & { markPx: number };
-  /** The venue's own symbol names it a stock perp (else: a traditional-only venue lists it). */
+  /** A stock or ETF: a venue's stock-perp symbol, or a traditional-only venue's equity. Else a commodity, index or FX. */
   stock: boolean;
 }
 
@@ -130,7 +131,6 @@ export class WatchQuality {
   readonly #listings = new Map<string, Listing[]>();
   /** Base -> the median mark of its kept legs: what a leg without a mark of its own is compared at. */
   readonly #refMark = new Map<string, number>();
-  readonly #stocksClosed: boolean;
   readonly #weekend: boolean;
   readonly #findings = new Map<ScanLeg, string[]>();
 
@@ -172,8 +172,10 @@ export class WatchQuality {
       const m = config.equityMarkers[leg.venue]?.exec(leg.symbol);
       if (m?.[1] !== undefined && normalizeBase(m[1]).base === leg.base) add(leg, true);
     }
-    for (const leg of input.listed) if (config.traditionalVenues.includes(leg.venue)) add(leg, false);
-    this.#stocksClosed = !config.stockSessions.some((s) => inSession(s, now));
+    // A traditional-only venue's listing of a stock or ETF names a stock too; its commodities, indices and FX do not.
+    for (const leg of input.listed) {
+      if (config.traditionalVenues.includes(leg.venue)) add(leg, !config.traditionalNonEquity.includes(leg.base));
+    }
     this.#weekend = inTraditionalWeekend(config.traditionalWeekend, now);
   }
 
@@ -267,13 +269,16 @@ export class WatchQuality {
     const when = `${DAYS[new Date(this.#input.now).getUTCDay()]} ${new Date(this.#input.now).toISOString().slice(11, 16)} UTC`;
     const stock = this.#listing(leg, true);
     if (stock !== null) {
-      return this.#stocksClosed
-        ? `Market closed: ${leg.base} is a stock perp (${stock.leg.venue} ${stock.leg.symbol}) and no stock exchange is in session at ${when}: its rates are not set by a live market`
-        : null;
+      const { config } = this.#input;
+      const exchange = config.stockExchanges[config.stockExchangeOf[leg.base] ?? config.defaultStockExchange];
+      if (exchange === undefined) throw new Error(`quality: no session for the exchange of ${leg.base}`);
+      return inSession(exchange, this.#input.now)
+        ? null
+        : `Market closed: ${leg.base} is a stock perp (${stock.leg.venue} ${stock.leg.symbol}) and ${exchange.name}, whose hours it keeps, is not in session at ${when}: its rates are not set by a live market`;
     }
     const traditional = this.#listing(leg, false);
     if (traditional !== null && this.#weekend) {
-      return `Market closed: ${leg.base} is listed on ${traditional.leg.venue}, which lists traditional assets only, and their markets are shut for the weekend at ${when}: its rates are not set by a live market`;
+      return `Market closed: ${leg.base} is a commodity, index or FX market (${traditional.leg.venue} ${traditional.leg.symbol}) and its futures are shut for the weekend at ${when}: its rates are not set by a live market`;
     }
     return null;
   }

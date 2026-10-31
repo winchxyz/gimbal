@@ -126,7 +126,7 @@ test('lone baseline: a relayed baseline reading against a crowd that agrees (BLU
 });
 
 test('market hours: each exchange\'s session in its own time zone, summer time included', () => {
-  const ny = DEFAULT_QUALITY.stockSessions.find((s) => s.name === 'New York')!;
+  const ny = DEFAULT_QUALITY.stockExchanges.NYSE!;
   // Friday 30 Oct 2026 is still summer time in New York (EDT, UTC-4): it opens at 13:30 UTC.
   assert.equal(inSession(ny, Date.UTC(2026, 9, 30, 13, 30)), true);
   assert.equal(inSession(ny, Date.UTC(2026, 9, 30, 13, 29)), false);
@@ -143,20 +143,18 @@ test('market hours: each exchange\'s session in its own time zone, summer time i
   assert.equal(inTraditionalWeekend(wk, Date.UTC(2026, 10, 8, 23, 0)), false);   // Sun 18:00 EST
 });
 
-test('market closed: a stock perp, named so by a venue\'s own symbol, read while no stock exchange is open', () => {
-  // SAMSUNG on a Saturday: Kraken charges a rate, Aster reads 0. MEXC's listing says it is a stock.
+test('market closed: a stock perp, named so by a venue\'s own symbol, read while its exchange is shut', () => {
+  // SAMSUNG on a Saturday: Kraken charges a rate, Aster reads 0. MEXC's listing says it is a stock; it lists in Seoul.
   const kraken = w('kraken', 'PF_SAMSUNGUSD', -0.00057849, { base: 'SAMSUNG' }, 'cex');
   const aster = w('aster', 'SAMSUNGUSDT', 0, { base: 'SAMSUNG' });
   const mexc = w('mexc', 'SAMSUNGSTOCK_USDT', 0, { base: 'SAMSUNG' }, 'cex');
   const legs = [kraken, aster, mexc];
-  const line = 'Market closed: SAMSUNG is a stock perp (mexc SAMSUNGSTOCK_USDT) and no stock exchange is in session at Sat 10:30 UTC: its rates are not set by a live market';
+  const line = 'Market closed: SAMSUNG is a stock perp (mexc SAMSUNGSTOCK_USDT) and KRX (Seoul), whose hours it keeps, is not in session at Sat 10:30 UTC: its rates are not set by a live market';
   const pair = pairLegs(legs).find((p) => p.long === kraken && p.short === aster)!;
   assert.deepEqual(quality(legs).checks(pair), [{ ok: false, text: line }], 'one line for the base, not one per leg');
-  // While one exchange is in session the rate is a market's: New York on Monday, Tokyo at 01:00 UTC.
-  assert.deepEqual(quality(legs, MON_NY_OPEN).checks(pair), []);
+  // KRX trades 09:00 to 15:30 Seoul time, 00:00 to 06:30 UTC: on Tuesday at 01:00 UTC the rate is a market's.
   assert.deepEqual(quality(legs, Date.UTC(2026, 10, 3, 1)).checks(pair), []);
-  // Tuesday 22:00 UTC: New York has closed and Tokyo has not opened.
-  assert.match(quality(legs, TUE_NIGHT).checks(pair)[0]!.text, /^Market closed: SAMSUNG is a stock perp .* at Tue 22:00 UTC/);
+  assert.match(quality(legs, TUE_NIGHT).checks(pair)[0]!.text, /^Market closed: SAMSUNG is a stock perp .* KRX \(Seoul\), whose hours it keeps, is not in session at Tue 22:00 UTC/);
   // Without a venue naming it a stock, SAMSUNG is just a name.
   assert.deepEqual(quality([kraken, aster]).checks(pair), []);
   // MEXC's 4STOCK_USDT is a coin called 4STOCK: the marker's ticker must name the base.
@@ -169,14 +167,60 @@ test('market closed: a stock perp, named so by a venue\'s own symbol, read while
   }
 });
 
-test('market closed: a hl-xyz market (traditional assets only) over the futures weekend, not on weekday nights', () => {
+test('market closed: a hl-xyz commodity, index or FX market over the futures weekend, not on weekday nights', () => {
   const gold = w('hl-xyz', 'xyz:GOLD', -0.0003612, { base: 'XAU' });
   const okx = w('okx', 'XAU-USDT-SWAP', 0, { base: 'XAU' }, 'cex');
   const pair = pairLegs([gold, okx]).find((p) => p.long === gold)!;
   assert.deepEqual(quality([gold, okx]).checks(pair), [{
-    ok: false, text: 'Market closed: XAU is listed on hl-xyz, which lists traditional assets only, and their markets are shut for the weekend at Sat 10:30 UTC: its rates are not set by a live market',
+    ok: false, text: 'Market closed: XAU is a commodity, index or FX market (hl-xyz xyz:GOLD) and its futures are shut for the weekend at Sat 10:30 UTC: its rates are not set by a live market',
   }]);
   assert.deepEqual(quality([gold, okx], TUE_NIGHT).checks(pair), []);
+  for (const b of ['XAU', 'WTI', 'BRENT', 'SPX500', 'XYZ100', 'JP225', 'EUR']) assert.ok(DEFAULT_QUALITY.traditionalNonEquity.includes(b), b);
+});
+
+test('market closed: each stock keeps its own exchange\'s hours (Monday 02:00 and 15:00 UTC)', () => {
+  const MON_0200 = Date.UTC(2026, 10, 2, 2);     // Mon 11:00 Seoul and Tokyo, Sun 21:00 New York
+  const MON_1500 = MON_NY_OPEN;                  // Mon 10:00 New York, 00:00 Tuesday in Seoul
+  const legs = [
+    // Tesla: a US share, so New York's hours.
+    w('kraken', 'PF_TSLAUSD', 0.0004, { base: 'TSLA' }, 'cex'), w('aster', 'TSLAUSDT', 0, { base: 'TSLA' }),
+    w('extended', 'TSLA_24_5-USD', 0, { base: 'TSLA' }),
+    // Samsung in Seoul, Toyota in Tokyo.
+    w('kraken', 'PF_SAMSUNGUSD', -0.0005, { base: 'SAMSUNG' }, 'cex'), w('aster', 'SAMSUNGUSDT', 0, { base: 'SAMSUNG' }),
+    w('mexc', 'SAMSUNGSTOCK_USDT', 0, { base: 'SAMSUNG' }, 'cex'),
+    w('mexc', 'TOYOTASTOCK_USDT', 0.0001, { base: 'TOYOTA' }, 'cex'), w('bitget', 'TOYOTAUSDT', 0, { base: 'TOYOTA' }, 'cex'),
+    // ETFs listed only on hl-xyz: stocks in New York, not futures.
+    ...['SOXL', 'SMH', 'EWZ'].flatMap((b) => [w('hl-xyz', `xyz:${b}`, 0.0002, { base: b }), w('okx', `${b}-USDT-SWAP`, 0, { base: b }, 'cex')]),
+    // Gold on hl-xyz: futures, which reopened on Sunday 18:00 New York time.
+    w('hl-xyz', 'xyz:GOLD', -0.0003, { base: 'XAU' }), w('okx', 'XAU-USDT-SWAP', 0, { base: 'XAU' }, 'cex'),
+  ];
+  const closed = (now: number) => {
+    const q = quality(legs, now);
+    return Object.fromEntries([...new Set(legs.map((l) => l.base))].map((b) => {
+      const l = legs.find((x) => x.base === b)!;
+      return [b, q.legFindings(l).find((t) => t.startsWith('Market closed:'))?.replace(/^Market closed: \S+ is a stock perp \([^)]*\) and (.*), whose hours it keeps.*$/, '$1') ?? 'open'];
+    }));
+  };
+  const ny = 'NYSE and Nasdaq (New York)';
+  // Monday 02:00 UTC: Seoul and Tokyo trade, New York does not; Kraken's TSLA against Aster's is not a window.
+  assert.deepEqual(closed(MON_0200), { TSLA: ny, SAMSUNG: 'open', TOYOTA: 'open', SOXL: ny, SMH: ny, EWZ: ny, XAU: 'open' });
+  // Monday 15:00 UTC: New York trades, Seoul and Tokyo have closed.
+  assert.deepEqual(closed(MON_1500), { TSLA: 'open', SAMSUNG: 'KRX (Seoul)', TOYOTA: 'the Tokyo Stock Exchange', SOXL: 'open', SMH: 'open', EWZ: 'open', XAU: 'open' });
+  assert.match(quality(legs, MON_0200).legFindings(legs.find((l) => l.symbol === 'xyz:SOXL')!)[0]!,
+    /^Market closed: SOXL is a stock perp \(hl-xyz xyz:SOXL\) and NYSE and Nasdaq \(New York\), whose hours it keeps, is not in session at Mon 02:00 UTC/);
+});
+
+test('stock exchanges: every exchange named has a session, and the names listed outside New York are sourced ones', () => {
+  const q = DEFAULT_QUALITY;
+  assert.ok(q.stockExchanges[q.defaultStockExchange] !== undefined);
+  for (const [base, x] of Object.entries(q.stockExchangeOf)) assert.ok(q.stockExchanges[x] !== undefined, `${base} on ${x}`);
+  assert.equal(q.stockExchangeOf.SAMSUNG, 'KRX');
+  assert.equal(q.stockExchangeOf.SKHX, 'KRX');
+  assert.equal(q.stockExchangeOf.TOYOTA, 'TSE');
+  assert.equal(q.stockExchangeOf.TENCENT, 'HKEX');
+  assert.equal(q.stockExchangeOf.TSMC, 'TWSE');
+  assert.equal(q.stockExchangeOf.TSM, undefined, 'the New York ADR keeps New York hours');
+  assert.deepEqual(q.stockExchanges.KRX, { name: 'KRX (Seoul)', timeZone: 'Asia/Seoul', open: '09:00', close: '15:30' });
 });
 
 test('market closed: a stock ticker never marks a coin of the same base: the marks must agree (DASH, QNT)', () => {
@@ -246,8 +290,8 @@ test('the recorded sweep (Saturday 02:09 UTC): each finding of the audit, and cl
   const windows = await sweepScan();
   const byId = (id: string) => windows.find((x) => x.id === id);
   // Kraken's weekend rate on a stock against 0 elsewhere: 507 % gross, not a window.
-  assert.deepEqual(findings(byId('samsung-kraken-aster')), ['Market closed: SAMSUNG is a stock perp (mexc SAMSUNGSTOCK_USDT) and no stock exchange is in session at Sat 02:09 UTC: its rates are not set by a live market']);
-  assert.match(findings(byId('snxx-hl-xyz-aster'))[0]!, /^Market closed: SNXX is listed on hl-xyz/);
+  assert.deepEqual(findings(byId('samsung-kraken-aster')), ['Market closed: SAMSUNG is a stock perp (mexc SAMSUNGSTOCK_USDT) and KRX (Seoul), whose hours it keeps, is not in session at Sat 02:09 UTC: its rates are not set by a live market']);
+  assert.match(findings(byId('snxx-hl-xyz-aster'))[0]!, /^Market closed: SNXX is a stock perp \(hl-xyz xyz:SNXX\) and NYSE and Nasdaq \(New York\)/);
   assert.match(findings(byId('intc-hl-xyz-kraken'))[0]!, /^Market closed: INTC is a stock perp \(extended INTC_24_5-USD\)/);
   // Bybit's relayed BLUR at the baseline while every other venue reads about -0.05 % per hour.
   assert.match(findings(byId('blur-hyperliquid-bybit'))[0]!, /^Lone baseline: bybit BLUR reads the quiet 0.00125 % per hour while 7 other venues agree/);
@@ -293,9 +337,20 @@ test('the recorded sweep with the default cut: the best windows by gross are sen
   t.diagnostic(`${flagged.length} of the ${sent.length} watch windows sent carry a quality finding`);
 });
 
-test('the recorded sweep read on a weekday in New York hours: no market is closed, the other findings stand', async () => {
-  const windows = await sweepScan(MON_NY_OPEN);
-  assert.ok(!windows.some((x) => findings(x).some((t) => t.startsWith('Market closed:'))));
-  assert.deepEqual(findings(windows.find((x) => x.id === 'samsung-kraken-aster')), []);
-  assert.equal(findings(windows.find((x) => x.id === 'gtc-aster-kucoin')).length, 1);
+test('the recorded sweep read on Monday: each stock closed only while its own exchange is, the other findings stand', async () => {
+  const closedLines = (windows: FundingWindow[]) => windows.flatMap((x) => findings(x).filter((t) => t.startsWith('Market closed:')));
+  // 15:00 UTC, New York open: no US share and no futures market is closed; Seoul's Samsung is.
+  const afternoon = await sweepScan(MON_NY_OPEN);
+  assert.ok(!closedLines(afternoon).some((t) => t.includes('NYSE and Nasdaq') || t.includes('futures are shut')));
+  assert.match(findings(afternoon.find((x) => x.id === 'samsung-kraken-aster'))[0]!, /^Market closed: SAMSUNG .* KRX \(Seoul\)/);
+  assert.deepEqual(findings(afternoon.find((x) => x.id === 'intc-hl-xyz-kraken')), []);
+  assert.deepEqual(findings(afternoon.find((x) => x.id === 'snxx-hl-xyz-aster')), []);
+  assert.equal(findings(afternoon.find((x) => x.id === 'gtc-aster-kucoin')).length, 1);
+  // 02:00 UTC, Seoul, Tokyo, Hong Kong, Taipei and Shanghai open, New York shut: the reverse.
+  const night = await sweepScan(Date.UTC(2026, 10, 2, 2));
+  const nightLines = closedLines(night);
+  assert.ok(!nightLines.some((t) => /KRX|Tokyo|HKEX|TWSE|SSE/.test(t)));
+  assert.deepEqual(findings(night.find((x) => x.id === 'samsung-kraken-aster')), []);
+  assert.match(findings(night.find((x) => x.id === 'intc-hl-xyz-kraken'))[0]!, /^Market closed: INTC .* NYSE and Nasdaq \(New York\)/);
+  assert.match(findings(night.find((x) => x.id === 'snxx-hl-xyz-aster'))[0]!, /^Market closed: SNXX is a stock perp \(hl-xyz xyz:SNXX\)/);
 });

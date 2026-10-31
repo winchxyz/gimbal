@@ -77,8 +77,17 @@ export interface QualityConfig {
   equityMarkers: Readonly<Record<string, RegExp>>;
   /** Venues that list traditional assets only (equities, indices, commodities, FX): their markets keep market hours. */
   traditionalVenues: readonly string[];
-  /** A stock perp is outside market hours when none of these is in session. */
-  stockSessions: readonly MarketSession[];
+  /**
+   * The bases on a traditional-only venue that are commodities, indices or FX: they keep futures hours
+   * (traditionalWeekend). Every other base there is a stock or an ETF, and keeps its exchange's hours.
+   */
+  traditionalNonEquity: readonly string[];
+  /** Each stock exchange's regular session, by a short code. */
+  stockExchanges: Readonly<Record<string, MarketSession>>;
+  /** The exchange of each stock listed outside New York, by base. */
+  stockExchangeOf: Readonly<Record<string, string>>;
+  /** The exchange whose hours every other stock keeps (New York: US shares, ADRs and ETFs). */
+  defaultStockExchange: string;
   /** Other traditional assets (index, commodity and FX futures) shut from Friday `close` to Sunday `open`, local. */
   traditionalWeekend: { timeZone: string; close: string; open: string };
 }
@@ -110,6 +119,46 @@ export const FUNDING_LIMITS: Readonly<Record<string, VenueFundingLimits>> = {
   },
 };
 
+/**
+ * The stock perps of the recorded sweep (2026-10-31) whose shares list outside New York, under the scanner's bases,
+ * by exchange (each with its own exchange's ticker). Every other stock keeps New York hours: US shares, ADRs and
+ * ETFs, and also the names with no exchange to follow or none sourced here: pre-IPO markets (ANT, SPCX, SHEIN,
+ * CXMT, YMTC, UNITREE, JIO, POLYMARKET), MUFG and SONY (their ticker is also their New York ADR's), MELCO, KBLAM.
+ */
+const LISTED_OUTSIDE_NEW_YORK: Readonly<Record<string, readonly string[]>> = {
+  // Samsung Electronics 005930 (SMSN on hl-xyz, same mark), Samsung Electro-Mechanics 009150, SK hynix 000660 (SKHX
+  // on hl-xyz), Hyundai Motor 005380, Hanmi Semiconductor 042700, Hanwha Aerospace 012450, KB Financial 105560,
+  // Naver 035420, SK Innovation 096770, SK Square 402340.
+  KRX: ['SAMSUNG', 'SMSN', 'SAMSUNGEM', 'SKHYNIX', 'SKHX', 'HYUNDAI', 'HANMI', 'HANWHAAERO', 'KBFIN', 'NAVER', 'SKINNOV', 'SKSQUARE'],
+  // Advantest 6857, Ajinomoto 2802, Disco 6146, Fanuc 6954, Fast Retailing 9983, Fujikura 5803, Furukawa Electric
+  // 5801, Hitachi 6501, Ibiden 4062, Keyence 6861, Kioxia 285A, Kokusai Electric 6525, Lasertec 6920, MITSUBISHI (a
+  // Mitsubishi group share; the listing does not say which, all trade in Tokyo), Murata 6981, NEC 6701, Nintendo
+  // 7974, Panasonic 6752, Recruit 6098, Renesas 6723, Shin-Etsu 4063, SoftBank Group 9984, Sumitomo Electric 5802,
+  // Taiyo Yuden 6976, Takeda 4502, Tokyo Electron 8035, Toyota 7203.
+  TSE: [
+    'ADVANTEST', 'AJINOMOTO', 'DISCO', 'FANUC', 'FASTRETAIL', 'FUJIKURA', 'FURUKAWA', 'HITACHI', 'IBIDEN', 'KEYENCE',
+    'KIOXIA', 'KOKUSAI', 'LASERTEC', 'MITSUBISHI', 'MURATA', 'NEC', 'NINTENDO', 'PANASONIC', 'RECRUIT', 'RENESAS',
+    'SHINETSU', 'SOFTBANK', 'SUMIELEC', 'TAIYOYUDEN', 'TAKEDA', 'TOKYOEL', 'TOYOTA',
+  ],
+  // Akeso 9926, Alibaba's Hong Kong line 9988 (BABA is its New York ADR), GenScript 1548, Innovent 1801, Kuaishou
+  // 1024, Meituan 3690, MiniMax, Pop Mart 9992, SMIC 0981 (its 5.45 USD mark is the Hong Kong line's), Tencent 0700,
+  // WuXi Biologics 2269, Xiaomi 1810, Zhipu (Knowledge Atlas).
+  HKEX: ['AKESO', 'BABAHK', 'GENSCRIPT', 'INNOVENT', 'KUAISHOU', 'MEITUAN', 'MINIMAX', 'POPMART', 'SMIC', 'TENCENT', 'WUXIBIO', 'XIAOMI', 'ZHIPU'],
+  // Alchip 3661, ASE Technology 3711 (ASX is its New York ADR), Asia Vital Components 3017, BizLink 3665, Delta
+  // Electronics 2308, Elite Material 2383, GlobalWafers 6488 (TPEx), Gold Circuit 2368, Global Unichip 3443, Innolux
+  // 3481, Kinsus 3189, Largan 3008, MediaTek 2454, Nan Ya PCB 8046, Nan Ya Plastics 1303, Nanya Technology 2408,
+  // Powerchip 6770, TSMC 2330 (TSM is its New York ADR), Unimicron 3037, Winbond 2344, Yageo 2327, Zhen Ding 4958.
+  TWSE: [
+    'ALCHIP', 'ASE', 'AVC', 'BIZLINK', 'DELTAELEC', 'ELITEMAT', 'GLOBALWFR', 'GOLDCIR', 'GUC', 'INNOLUX', 'KINSUS',
+    'LARGAN', 'MEDIATEK', 'NANYAPCB', 'NANYAPLST', 'NANYATECH', 'POWERCHIP', 'TSMC', 'UNIMICRON', 'WINBOND', 'YAGEO',
+    'ZHENDING',
+  ],
+  // Cambricon 688256 (SSE STAR), GigaDevice 603986 (SSE), Zhongji Innolight 300308 (SZSE).
+  SSE: ['CAMBRICON', 'GIGADEV', 'ZHONGJI'],
+  // Reliance Industries.
+  NSE: ['RELIANCE'],
+};
+
 export const DEFAULT_QUALITY: QualityConfig = {
   // The watch-unit audit of 2026-10-31: every leg it found too thin to trust (HMSTR on Hyperliquid, UNITREE on
   // hl-para, GTC and NIL on Aster) traded under 0.1M USD a day.
@@ -122,20 +171,29 @@ export const DEFAULT_QUALITY: QualityConfig = {
     extended: /^([A-Z0-9]+)_24_5-USD$/,        // AAPL_24_5-USD: traded 24 hours, 5 days a week
     backpack: /^([A-Z0-9]+)\.US_USDC_PERP$/,   // AAPL.US_USDC_PERP
   },
-  // hl-xyz (trade.xyz) lists only equities, indices, commodities and FX: all 120 of its markets in the recorded sweep.
+  // hl-xyz (trade.xyz) lists only equities, ETFs, indices, commodities and FX: all 120 of its markets in the
+  // recorded sweep.
   traditionalVenues: ['hl-xyz'],
-  // Each exchange's published regular session. Lunch breaks count as open; holidays are not modelled.
-  stockSessions: [
-    { name: 'New York', timeZone: 'America/New_York', open: '09:30', close: '16:00' },     // NYSE, Nasdaq
-    { name: 'London', timeZone: 'Europe/London', open: '08:00', close: '16:30' },          // LSE
-    { name: 'Frankfurt, Paris', timeZone: 'Europe/Paris', open: '09:00', close: '17:30' }, // Xetra, Euronext
-    { name: 'Mumbai', timeZone: 'Asia/Kolkata', open: '09:15', close: '15:30' },           // NSE, BSE
-    { name: 'Shanghai', timeZone: 'Asia/Shanghai', open: '09:30', close: '15:00' },        // SSE, SZSE
-    { name: 'Hong Kong', timeZone: 'Asia/Hong_Kong', open: '09:30', close: '16:00' },      // HKEX
-    { name: 'Taipei', timeZone: 'Asia/Taipei', open: '09:00', close: '13:30' },            // TWSE
-    { name: 'Seoul', timeZone: 'Asia/Seoul', open: '09:00', close: '15:30' },              // KRX
-    { name: 'Tokyo', timeZone: 'Asia/Tokyo', open: '09:00', close: '15:30' },              // TSE
+  // hl-xyz's commodities (Brent, WTI, natural gas, heating oil, copper, gold, silver, palladium, platinum), indices
+  // (S&P 500, its own XYZ100, Nikkei 225, KOSPI 200, Nifty 50) and FX (EUR, GBP, JPY) in the recorded sweep, under
+  // the scanner's bases. The rest of its listing is stocks and ETFs.
+  traditionalNonEquity: [
+    'BRENT', 'WTI', 'NATGAS', 'HO', 'COPPER', 'XAU', 'XAG', 'XPD', 'XPT',
+    'SPX500', 'XYZ100', 'JP225', 'KR200', 'NIFTY',
+    'EUR', 'GBP', 'JPY',
   ],
+  // Each exchange's published regular session. Lunch breaks count as open; holidays are not modelled.
+  stockExchanges: {
+    NYSE: { name: 'NYSE and Nasdaq (New York)', timeZone: 'America/New_York', open: '09:30', close: '16:00' },
+    KRX: { name: 'KRX (Seoul)', timeZone: 'Asia/Seoul', open: '09:00', close: '15:30' },
+    TSE: { name: 'the Tokyo Stock Exchange', timeZone: 'Asia/Tokyo', open: '09:00', close: '15:30' },
+    HKEX: { name: 'HKEX (Hong Kong)', timeZone: 'Asia/Hong_Kong', open: '09:30', close: '16:00' },
+    TWSE: { name: 'TWSE and TPEx (Taipei)', timeZone: 'Asia/Taipei', open: '09:00', close: '13:30' },
+    SSE: { name: 'SSE and SZSE (Shanghai, Shenzhen)', timeZone: 'Asia/Shanghai', open: '09:30', close: '15:00' },
+    NSE: { name: 'NSE (Mumbai)', timeZone: 'Asia/Kolkata', open: '09:15', close: '15:30' },
+  },
+  stockExchangeOf: Object.fromEntries(Object.entries(LISTED_OUTSIDE_NEW_YORK).flatMap(([x, bases]) => bases.map((b) => [b, x]))),
+  defaultStockExchange: 'NYSE',
   // CME Globex trades Sunday 18:00 to Friday 17:00 New York time; spot FX closes and opens about then too.
   traditionalWeekend: { timeZone: 'America/New_York', close: '17:00', open: '18:00' },
 };
