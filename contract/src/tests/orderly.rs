@@ -754,9 +754,11 @@ fn ip_restriction_signs_the_owners_list_and_passes_a_paused_desk() {
     let req = |t: u64| -> OrderlyRequest {
         serde_json::from_value(json!({ "kind": "ip_restriction", "timestamp_ms": t })).unwrap()
     };
-    // No list yet: nothing to apply.
+    // No list yet: nothing to apply, and get_desk shows an empty one.
     let msg = request(&mut g, operator(), req(t)).unwrap_err();
     assert!(msg.starts_with("E_ARGS: the owner set no IP list"), "{msg}");
+    let view = serde_json::to_value(g.get_desk("alpha".into()).unwrap()).unwrap();
+    assert_eq!(view["orderly_ips"], json!([]));
 
     let ips: Vec<String> = vec!["203.0.113.7".into(), "2001:db8::1".into()];
     for who in [operator(), stranger()] {
@@ -792,6 +794,14 @@ fn ip_restriction_signs_the_owners_list_and_passes_a_paused_desk() {
             r#"{"desk_id":"alpha","ips":["203.0.113.7","2001:db8::1"]}"#
         )]
     );
+    // get_desk returns the list next to orderly_receiver.
+    let view = serde_json::to_value(g.get_desk("alpha".into()).unwrap()).unwrap();
+    assert_eq!(view["orderly_ips"], json!(ips));
+    let text = serde_json::to_string(&g.get_desk("alpha".into()).unwrap()).unwrap();
+    let receiver = text.find(r#""orderly_receiver":"#).unwrap();
+    let list = text.find(r#""orderly_ips":"#).unwrap();
+    let ledger = text.find(r#""ledger":"#).unwrap();
+    assert!(receiver < list && list < ledger, "{text}");
 
     g.desks.get_mut("alpha").unwrap().paused = true;
     let got = request(&mut g, operator(), req(t)).unwrap();

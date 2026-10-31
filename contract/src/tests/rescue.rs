@@ -1,18 +1,21 @@
 //! The rescue methods on the mocked chain, with 1Click's own signed quotes
 //! (`core/tests/vectors/oneclick-live.json`, `oneclick.json`): `evm_usdc_to_intents` against the
 //! contract cases of `eip3009.json`, `sol_sign_rescue` against the rescue rows of `solana.json`,
-//! `hl_send_to_intents` against the `sendAsset` vectors of `hl.json`, the hourly cap across calls
-//! and methods, the pause rules, and tampered or foreign quotes.
+//! `hl_send_to_intents` against the `sendAsset` vectors of `hl.json`, the sliding hourly cap and
+//! cost budget across calls and methods, a deposit address paid once, the pause rules, and
+//! tampered or foreign quotes.
 
 use super::hl::{at, vectors as hl_vectors, VECTOR_DESK_EVM};
 use super::sol::{outcome, vector_solana};
 use super::*;
 use crate::action::{Pending, UnsignedAction};
 use crate::mpc::SignRequest;
-use crate::rescue::{ed25519_verify, DeskCounters, RESCUE_WINDOW_MS};
+use crate::rescue::{decayed, ed25519_verify, DeskCounters, DEPOSIT_RING, RESCUE_WINDOW_MS};
 use crate::sol::sha256;
 use gimbal_core::errors::{E_NO_DESK, E_QUOTE_FIELDS, E_QUOTE_SIGNATURE, E_RESCUE_CAP};
-use gimbal_core::oneclick::{verify_quote, Context, DeskAddresses, Method};
+use gimbal_core::oneclick::{
+    check_cost, verify_quote, Context, DeskAddresses, Method, VerifiedQuote, SOL_USDC,
+};
 use gimbal_core::phoenix::{check_message, Rescue};
 use gimbal_core::solana::{parse_message, SolDesk};
 use near_sdk::base64::engine::general_purpose::STANDARD;
@@ -116,6 +119,33 @@ fn counters(g: &Gimbal) -> DeskCounters {
     *g.desk_counters.get("alpha").unwrap()
 }
 
+/// Clears the desk's deposit ring, so the one live Arbitrum quote can sign again: the tests that
+/// count many rescues have no second live quote.
+fn forget_deposits(g: &mut Gimbal) {
+    let mut c = counters(g);
+    c.deposits = Default::default();
+    g.desk_counters.insert("alpha".into(), c);
+}
+
+/// The live Arbitrum quote as the desk verifies it at `NOW_MS`, for the build steps to be handed
+/// copies with other amounts and deposit addresses.
+fn arb_verified(g: &Gimbal) -> VerifiedQuote {
+    at(operator(), NOW_MS, yocto(0));
+    let (q, sig) = quote(&live(), ARB_QUOTE);
+    g.verified_quote("alpha", &q, &sig, Method::EvmUsdcToIntents)
+}
+
+/// `v` paying deposit address `0x…<n>` instead, `amount_e8` in (6 decimals), `min_out_e8` out.
+fn paying(v: &VerifiedQuote, n: u32, amount_e8: u128, min_out_e8: u128) -> VerifiedQuote {
+    VerifiedQuote {
+        deposit_address: Some(format!("0x{n:040x}")),
+        amount_in: amount_e8 / 100,
+        amount_in_e8: amount_e8,
+        min_amount_out_e8: min_out_e8,
+        ..v.clone()
+    }
+}
+
 fn evm_to_intents(g: &mut Gimbal, q: &(String, String)) -> Result<UnsignedAction, String> {
     outcome(|| {
         g.prepare_evm_usdc_to_intents("alpha".into(), q.0.clone(), q.1.clone(), "out".into())
@@ -142,6 +172,7 @@ fn evm_usdc_to_intents_signs_the_eip3009_contract_cases_and_moves_the_counter() 
         .filter(|c| c["network"] == "testnet")
         .collect();
     assert_eq!(cases.len(), 2);
+    let mut times = vec![];
     for c in cases {
         let name = c["name"].as_str().unwrap();
         assert_eq!(c["quote"], ARB_QUOTE);
@@ -149,7 +180,11 @@ fn evm_usdc_to_intents_signs_the_eip3009_contract_cases_and_moves_the_counter() 
             counters(&g).eip3009_next.to_string(),
             c["counter"].as_str().unwrap()
         );
-        at(operator(), c["now_s"].as_u64().unwrap() * 1000, yocto(0));
+        // Both cases sign the one live quote, which the desk's ring would refuse the second time.
+        forget_deposits(&mut g);
+        let ms = c["now_s"].as_u64().unwrap() * 1000;
+        times.push(ms);
+        at(operator(), ms, yocto(0));
         let got = evm_to_intents(&mut g, &q).unwrap();
         assert_eq!(
             (got.desk_id.as_str(), got.venue.as_str(), got.kind.as_str()),
@@ -178,24 +213,36 @@ fn evm_usdc_to_intents_signs_the_eip3009_contract_cases_and_moves_the_counter() 
     }
     let c = counters(&g);
     assert_eq!(c.eip3009_next, 2);
-    assert_eq!(c.rescue_spent_e8, 20 * 100_000_000);
-    assert_eq!(c.rescue_window_start_ms, NOW_MS);
+    let ten = 10 * 100_000_000;
+    assert_eq!(c.rescue_at_ms, times[1]);
+    assert_eq!(c.rescue_spent_e8, decayed(ten, times[0], times[1]) + ten);
 }
 
+/// The cap slides (review round 2, item 4): a rescue weighs its full amount when made and nothing
+/// an hour later, falling linearly in between, so no stretch of time sees more than the cap plus
+/// what the time gone frees, and a moment never sees more than the cap.
 #[test]
-fn every_rescue_method_counts_against_one_hourly_cap() {
-    let mut g = rescue_desk();
+fn every_rescue_method_counts_against_one_sliding_hourly_cap() {
+    // A 10% cost bound, so the cost budget (5 USD) stays out of the cap's way.
+    let mut g = rescue_desk_with(Policy {
+        max_transfer_cost_bps: 1000,
+        ..rescue_policy()
+    });
     let q = quote(&live(), ARB_QUOTE);
-    // 50 USD an hour: five 10 USDC authorizations, then E_RESCUE_CAP for the rest of the hour.
-    for i in 0..5 {
-        at(operator(), NOW_MS + i * 60_000, yocto(0));
-        evm_to_intents(&mut g, &q).unwrap();
+    let again = |g: &mut Gimbal, ms: u64| {
+        forget_deposits(g);
+        at(operator(), ms, yocto(0));
+        evm_to_intents(g, &q)
+    };
+    // 50 USD an hour: five 10 USDC authorizations, then a millisecond later nothing.
+    for _ in 0..5 {
+        again(&mut g, NOW_MS).unwrap();
     }
-    at(operator(), NOW_MS + RESCUE_WINDOW_MS - 1, yocto(0));
-    let refused = evm_to_intents(&mut g, &q).unwrap_err();
-    assert!(
-        refused.starts_with(&format!("{E_RESCUE_CAP}: ")),
-        "{refused}"
+    let refused = again(&mut g, NOW_MS + 1).unwrap_err();
+    assert_eq!(
+        refused,
+        "E_RESCUE_CAP: amountIn 10 USDC is over what is left of the hourly rescue cap, \
+         0.00001388 USD"
     );
     assert_eq!(
         counters(&g).eip3009_next,
@@ -205,26 +252,30 @@ fn every_rescue_method_counts_against_one_hourly_cap() {
     // A Solana rescue shares the cap.
     let (message, _) = rescue_message("rescue: USDC to the verified 1Click deposit owner");
     let sol = quote(&live(), SOL_ORDERLY_QUOTE);
+    at(operator(), NOW_MS + 1, yocto(0));
     let refused = sol_rescue(&mut g, &message, &sol).unwrap_err();
     assert!(
         refused.starts_with(&format!("{E_RESCUE_CAP}: ")),
         "{refused}"
     );
-    // The window closes an hour after its first rescue; the next one opens a new one.
-    at(operator(), NOW_MS + RESCUE_WINDOW_MS, yocto(0));
-    sol_rescue(&mut g, &message, &sol).unwrap();
+    // A fifth of an hour later a fifth of the cap is back: one more, then nothing.
+    let later = NOW_MS + RESCUE_WINDOW_MS / 5;
+    assert_eq!(counters(&g).remaining_cap_e8(50, later), 10 * 100_000_000);
+    again(&mut g, later).unwrap();
+    assert!(again(&mut g, later).unwrap_err().starts_with(E_RESCUE_CAP));
     let c = counters(&g);
     assert_eq!(
-        (c.rescue_window_start_ms, c.rescue_spent_e8),
-        (NOW_MS + RESCUE_WINDOW_MS, 10 * 100_000_000)
+        (c.rescue_at_ms, c.rescue_spent_e8),
+        (later, 50 * 100_000_000)
     );
-    // Four more fill the new window: 10 + 40 = 50, then nothing.
-    for _ in 0..4 {
-        evm_to_intents(&mut g, &q).unwrap();
-    }
-    assert!(evm_to_intents(&mut g, &q)
-        .unwrap_err()
-        .starts_with(E_RESCUE_CAP));
+    // Half an hour after the last rescue half the cap is back, an hour after it all of it.
+    assert_eq!(
+        c.remaining_cap_e8(50, later + RESCUE_WINDOW_MS / 2),
+        25 * 100_000_000
+    );
+    at(operator(), later + RESCUE_WINDOW_MS, yocto(0));
+    sol_rescue(&mut g, &message, &sol).unwrap();
+    assert_eq!(counters(&g).rescue_spent_e8, 10 * 100_000_000);
     // A lower cap applies at once.
     let mut g = rescue_desk_with(Policy {
         rescue_cap_usd_per_hour: 9,
@@ -235,6 +286,173 @@ fn every_rescue_method_counts_against_one_hourly_cap() {
         .unwrap_err()
         .starts_with(E_RESCUE_CAP));
     assert_eq!(counters(&g), DeskCounters::default());
+}
+
+#[test]
+fn a_meter_falls_linearly_over_the_hour_and_rounds_up() {
+    let w = RESCUE_WINDOW_MS;
+    assert_eq!(decayed(u128::from(w), 0, 0), u128::from(w));
+    assert_eq!(decayed(u128::from(w), 0, 1), u128::from(w) - 1);
+    assert_eq!(decayed(1, 0, w - 1), 1, "rounded up");
+    assert_eq!(decayed(1, 0, w), 0);
+    assert_eq!(decayed(1, 0, u64::MAX), 0);
+    assert_eq!(decayed(u128::MAX, 0, w / 2), u128::MAX / 2 + 1);
+    assert_eq!(
+        decayed(7, 10, 5),
+        7,
+        "a time before the last rescue frees nothing"
+    );
+}
+
+/// The skim the review found (round 2, item 1): rescues that each cost what `check_cost` allows,
+/// the flat 0.5 USDC on any amount, could pay most of the cap away in fees an hour, on a paused
+/// desk too. The hourly cost budget, max(cap × bps / 10⁴, 2 × flat) = 1 USD at the defaults,
+/// stops it; Hyperliquid's 1 USDC send fee counts in it.
+#[test]
+fn the_hourly_cost_budget_stops_skimming_the_cap_through_fees() {
+    let mut g = rescue_desk();
+    g.desks.get_mut("alpha").unwrap().paused = true;
+    let base = arb_verified(&g);
+    // 1 USDC in, 0.5 out: within the per-transfer bound.
+    let skim = |n| paying(&base, n, 100_000_000, 50_000_000);
+    assert!(check_cost(&skim(1), 100, 500_000).is_ok());
+    let build = |g: &mut Gimbal, q: &VerifiedQuote| {
+        outcome(|| g.build_evm_usdc_to_intents("alpha".into(), q, "out"))
+    };
+    at(operator(), NOW_MS, yocto(0));
+    build(&mut g, &skim(1)).unwrap();
+    build(&mut g, &skim(2)).unwrap();
+    let before = counters(&g);
+    assert_eq!(
+        build(&mut g, &skim(3)).unwrap_err(),
+        "E_RESCUE_CAP: the rescue may cost 0.5 USD, over what is left of the hourly rescue cost \
+         budget, 0 of 1 USD"
+    );
+    assert_eq!(counters(&g), before, "a refused rescue counts nothing");
+    assert_eq!(
+        (before.rescue_spent_e8, before.rescue_cost_e8),
+        (2 * 100_000_000, 100_000_000)
+    );
+    // The cap alone would have let 48 more through: 24 USDC of fees an hour.
+    assert_eq!(before.remaining_cap_e8(50, NOW_MS), 48 * 100_000_000);
+    // A quarter of an hour later a quarter of the budget is back, too little; at half, enough.
+    at(operator(), NOW_MS + RESCUE_WINDOW_MS / 4, yocto(0));
+    assert!(build(&mut g, &skim(3))
+        .unwrap_err()
+        .contains("0.25 of 1 USD"));
+    at(operator(), NOW_MS + RESCUE_WINDOW_MS / 2, yocto(0));
+    build(&mut g, &skim(3)).unwrap();
+
+    // The live quote through the public method on the paused desk: 0.415247 USDC each, two fit.
+    let mut g = rescue_desk();
+    g.desks.get_mut("alpha").unwrap().paused = true;
+    let q = quote(&live(), ARB_QUOTE);
+    for _ in 0..2 {
+        forget_deposits(&mut g);
+        at(operator(), NOW_MS, yocto(0));
+        evm_to_intents(&mut g, &q).unwrap();
+    }
+    forget_deposits(&mut g);
+    assert_eq!(
+        evm_to_intents(&mut g, &q).unwrap_err(),
+        "E_RESCUE_CAP: the rescue may cost 0.415247 USD, over what is left of the hourly rescue \
+         cost budget, 0.169506 of 1 USD"
+    );
+
+    // Hyperliquid: the send fee is the whole budget at the defaults. A send that also costs
+    // through its quote is refused; one costing only the fee fits, once.
+    let mut g = rescue_desk();
+    let hl = |n: u32, min_out_e8| VerifiedQuote {
+        method: Method::HlSendToIntents,
+        deposit_address: Some(format!("0x{n:040x}")),
+        amount_in: 400_000_000,
+        amount_in_e8: 400_000_000,
+        min_amount_out_e8: min_out_e8,
+        destination_asset: SOL_USDC.into(),
+        recipient: vector_solana().authority,
+        deadline_ms: u64::MAX,
+    };
+    let send =
+        |g: &mut Gimbal, q| outcome(|| g.build_hl_send_to_intents("alpha".into(), &q, "out"));
+    at(operator(), NOW_MS, yocto(0));
+    assert_eq!(
+        send(&mut g, hl(1, 364_434_300)).unwrap_err(),
+        "E_RESCUE_CAP: the rescue may cost 1.355657 USD, over what is left of the hourly rescue \
+         cost budget, 1 of 1 USD"
+    );
+    assert_eq!(g.hl_nonces.get("alpha").copied(), None, "no nonce taken");
+    send(&mut g, hl(2, 400_000_000)).unwrap();
+    assert!(send(&mut g, hl(3, 400_000_000))
+        .unwrap_err()
+        .starts_with(E_RESCUE_CAP));
+    assert_eq!(counters(&g).rescue_cost_e8, 100_000_000);
+}
+
+/// A quote pays once (review round 2, item 2): a rescue to a deposit address one of the desk's
+/// last 32 rescues paid is refused, whatever quote names it.
+#[test]
+fn a_deposit_address_is_paid_once() {
+    let mut g = rescue_desk();
+    let q = quote(&live(), ARB_QUOTE);
+    at(operator(), NOW_MS, yocto(0));
+    evm_to_intents(&mut g, &q).unwrap();
+    let before = counters(&g);
+    assert_eq!(
+        evm_to_intents(&mut g, &q).unwrap_err(),
+        "E_QUOTE_FIELDS: deposit address 0x1d5ed45fc6fdcca040abebb0b016bdf4962931be was paid by \
+         one of this desk's last 32 rescues; a quote pays once"
+    );
+    assert_eq!(counters(&g), before, "a refused rescue counts nothing");
+    // The same address in another verified quote (the build step sees the address alone).
+    let other = paying(&arb_verified(&g), 0, 100_000_000, 100_000_000);
+    let other = VerifiedQuote {
+        deposit_address: Some("0x1d5ed45fc6fdcca040abebb0b016bdf4962931be".into()),
+        ..other
+    };
+    let got = outcome(|| g.build_evm_usdc_to_intents("alpha".into(), &other, "out"));
+    assert!(got.unwrap_err().starts_with(E_QUOTE_FIELDS));
+}
+
+#[test]
+fn the_deposit_ring_forgets_the_oldest_of_33() {
+    let mut c = DeskCounters::default();
+    let hash = |i: usize| [u8::try_from(i + 1).unwrap(); 32];
+    for i in 0..DEPOSIT_RING {
+        c.spend(0, 0, hash(i), NOW_MS);
+    }
+    assert!((0..DEPOSIT_RING).all(|i| c.paid(&hash(i))));
+    assert_eq!(c.deposit_next, 0);
+    c.spend(0, 0, hash(DEPOSIT_RING), NOW_MS);
+    assert!(!c.paid(&hash(0)));
+    assert!((1..=DEPOSIT_RING).all(|i| c.paid(&hash(i))));
+    assert_eq!(c.deposit_next, 1);
+}
+
+/// A rescue whose MPC call returns no signature stays counted (review round 2, item 7): a late
+/// `respond` can still publish the signature, so neither the cap, the cost nor the deposit
+/// address is given back.
+#[test]
+fn a_rescue_the_mpc_did_not_sign_stays_counted() {
+    let mut g = rescue_desk();
+    let q = quote(&live(), ARB_QUOTE);
+    at(operator(), NOW_MS, yocto(0));
+    let action = evm_to_intents(&mut g, &q).unwrap();
+    let counted = counters(&g);
+    assert_eq!(counted.rescue_spent_e8, 10 * 100_000_000);
+    callback(vec![PromiseResult::Failed]);
+    let got = outcome(|| {
+        g.on_signed(Pending {
+            request_id: 0,
+            signer: VECTOR_DESK_EVM.into(),
+            action,
+        })
+    });
+    assert!(got.unwrap_err().starts_with("E_MPC: "));
+    assert_eq!(counters(&g), counted);
+    at(operator(), NOW_MS + 1, yocto(0));
+    assert!(evm_to_intents(&mut g, &q)
+        .unwrap_err()
+        .starts_with(E_QUOTE_FIELDS));
 }
 
 #[test]
@@ -318,6 +536,7 @@ fn rescues_are_for_the_owner_and_the_operator_and_pass_a_paused_desk() {
     assert!(long.unwrap_err().starts_with(E_ARGS));
     g.desks.get_mut("alpha").unwrap().paused = true;
     for who in [owner(), operator()] {
+        forget_deposits(&mut g);
         at(who, NOW_MS, yocto(0));
         evm_to_intents(&mut g, &q).unwrap();
     }
@@ -539,12 +758,23 @@ fn sol_sign_rescue_refuses_a_quote_that_does_not_match_the_message() {
 /// An instruction by its addresses: program, accounts, data.
 type Ix = ([u8; 32], Vec<[u8; 32]>, Vec<u8>);
 
-/// The legacy message `m` with `extra` appended to its instructions, the keys it lacks appended as
-/// read-only (the contract does not read writability).
+/// The legacy message `m` with `extra` appended to its instructions.
 fn appended(m: &[u8], extra: Vec<Ix>) -> Vec<u8> {
+    rewritten(m, |ixs| ixs.extend(extra))
+}
+
+/// The legacy message `m` with its instructions edited by `edit`, the keys the new ones lack
+/// appended as read-only (the contract does not read writability); unused keys stay.
+fn rewritten(m: &[u8], edit: impl FnOnce(&mut Vec<Ix>)) -> Vec<u8> {
     let a = parse_message(m).unwrap();
+    let mut list: Vec<Ix> = a
+        .instructions
+        .iter()
+        .map(|ix| (ix.program, ix.accounts.clone(), ix.data.to_vec()))
+        .collect();
+    edit(&mut list);
     let mut keys = a.keys.clone();
-    for (program, accounts, _) in &extra {
+    for (program, accounts, _) in &list {
         for k in std::iter::once(program).chain(accounts) {
             if !keys.contains(k) {
                 keys.push(*k);
@@ -553,24 +783,16 @@ fn appended(m: &[u8], extra: Vec<Ix>) -> Vec<u8> {
     }
     let added = u8::try_from(keys.len() - a.keys.len()).unwrap();
     let index = |k: &[u8; 32]| u8::try_from(keys.iter().position(|x| x == k).unwrap()).unwrap();
-    let mut ixs: Vec<(u8, Vec<u8>, Vec<u8>)> = a
-        .instructions
+    let ixs: Vec<(u8, Vec<u8>, Vec<u8>)> = list
         .iter()
-        .map(|ix| {
+        .map(|(program, accounts, data)| {
             (
-                ix.program_index,
-                ix.account_indexes.clone(),
-                ix.data.to_vec(),
+                index(program),
+                accounts.iter().map(index).collect(),
+                data.clone(),
             )
         })
         .collect();
-    for (program, accounts, data) in &extra {
-        ixs.push((
-            index(program),
-            accounts.iter().map(index).collect(),
-            data.clone(),
-        ));
-    }
     let mut out = vec![
         a.num_required_signatures,
         a.num_readonly_signed,
@@ -625,15 +847,27 @@ fn compact(out: &mut Vec<u8>, mut n: usize) {
     out.push(n as u8);
 }
 
-/// The rescue's own pause rule: on a paused desk a rescue message signs with its transfer, the
-/// account create, a Phoenix withdrawal and an Ember unwrap (which `sol_sign` refuses there), but
-/// not with an order that can grow a position.
+/// The rescue's own pause rule (review round 2, item 6): on a paused desk a rescue message signs
+/// only when it frees and pays out the quote's amountIn and nothing else. The simple rescue, and
+/// the one-transaction rescue without its priority fee and its creates of desk accounts, sign;
+/// the one-transaction rescue as the SDK builds it, or a rescue with an order or a cancel, need a
+/// running desk.
 #[test]
-fn a_rescue_passes_a_paused_desk_unless_it_carries_an_order_that_is_not_reduce_only() {
+fn a_paused_desk_signs_only_a_rescue_that_frees_and_pays_amount_in() {
     let q = quote(&live(), SOL_ORDERLY_QUOTE);
     let (simple, _) = rescue_message("rescue: USDC to the verified 1Click deposit owner");
     let full = with_revoke(&rescue_message("rescue in one transaction:").0);
-    let order = |prefix: &str| {
+    let authority = vector_accounts().authority;
+    let compute_budget = check_base58("ComputeBudget111111111111111111111111111111");
+    let ata = check_base58("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+    let lean = rewritten(&full, |ixs| {
+        ixs.retain(|(program, accounts, data)| {
+            let unit_price = *program == compute_budget && data.first() == Some(&3);
+            let desk_create = *program == ata && accounts[2] == authority;
+            !unit_price && !desk_create
+        });
+    });
+    let vector = |prefix: &str| {
         let v = solana_vectors();
         let c = v["cases"]
             .as_array()
@@ -644,7 +878,8 @@ fn a_rescue_passes_a_paused_desk_unless_it_carries_an_order_that_is_not_reduce_o
             .clone();
         hex::decode(c["message_hex"].as_str().unwrap()).unwrap()
     };
-    let buy = merged(&simple, &order("IOC buy 0.005 ETH, limit 2474.5"));
+    let buy = merged(&simple, &vector("IOC buy 0.005 ETH, limit 2474.5"));
+    let cancel = merged(&simple, &vector("cancel all ETH"));
     let paused_desk = || {
         let mut g = rescue_desk();
         g.desks.get_mut("alpha").unwrap().paused = true;
@@ -653,14 +888,30 @@ fn a_rescue_passes_a_paused_desk_unless_it_carries_an_order_that_is_not_reduce_o
         at(operator(), NOW_MS, yocto(0));
         g
     };
-    let mut g = paused_desk();
-    for bytes in [&simple, &full] {
-        sol_rescue(&mut g, bytes, &q).unwrap();
+    for (what, bytes) in [("simple", &simple), ("one transaction, lean", &lean)] {
+        let mut g = paused_desk();
+        let got = sol_rescue(&mut g, bytes, &q).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(got.kind, "rescue");
         // The same message through sol_sign: not a rescue, so the deposit owner is a stranger.
         let plain = outcome(|| g.prepare_sol_sign("alpha".into(), b64(bytes), "x".into()));
-        assert!(plain.is_err());
+        assert!(plain.is_err(), "{what}");
     }
-    // The core reads the merged order as an ETH buy that can grow the position.
+    for (what, bytes) in [
+        ("one transaction, as the SDK builds it", &full),
+        ("with an ETH buy", &buy),
+        ("with a cancel", &cancel),
+    ] {
+        let mut g = paused_desk();
+        let got = sol_rescue(&mut g, bytes, &q).unwrap_err();
+        assert!(got.starts_with(&format!("{E_PAUSED}: ")), "{what}: {got}");
+        assert_eq!(counters(&g), DeskCounters::default(), "{what}");
+        // Running, the same message signs.
+        g.desks.get_mut("alpha").unwrap().paused = false;
+        let got = sol_rescue(&mut g, bytes, &q).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(got.kind, "rescue", "{what}");
+    }
+    // The core reads the merged order as an ETH buy that can grow the position, and the action
+    // of the running desk carries it.
     let rescue = Rescue::new(
         sha256,
         check_base58(&deposit_of(&live(), SOL_ORDERLY_QUOTE)),
@@ -680,13 +931,8 @@ fn a_rescue_passes_a_paused_desk_unless_it_carries_an_order_that_is_not_reduce_o
     assert_eq!(checked.orders.len(), 1);
     assert!(!checked.orders[0].reduce_only);
     let mut g = paused_desk();
-    let got = sol_rescue(&mut g, &buy, &q).unwrap_err();
-    assert!(got.starts_with(&format!("{E_PAUSED}: ")), "{got}");
-    assert_eq!(counters(&g), DeskCounters::default());
-    // Running, the same message signs, its order in the action.
     g.desks.get_mut("alpha").unwrap().paused = false;
     let got = sol_rescue(&mut g, &buy, &q).unwrap();
-    assert_eq!(got.kind, "rescue");
     assert_eq!(got.orders.len(), 1);
     assert_eq!(got.orders[0].side, "buy");
 }
@@ -702,7 +948,11 @@ fn hl_send_to_intents_sends_the_verified_amount_to_the_deposit_address() {
     let doc = recorded();
     let name = "rescue Hyperliquid -> Phoenix: HyperCore USDC to the desk Solana authority";
     let (q, sig) = quote(&doc, name);
-    let mut g = rescue_desk();
+    // A 200 USD cap: a 2 USD cost budget, which holds the quote's 0.36 and the 1 USDC send fee.
+    let mut g = rescue_desk_with(Policy {
+        rescue_cap_usd_per_hour: 200,
+        ..rescue_policy()
+    });
     let vector = named(
         &hl_vectors()["user_signed"]["cases"],
         "sendAsset 4 USDC perp -> 1Click deposit address (testnet)",

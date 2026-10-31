@@ -3,10 +3,11 @@
 //! `prices()`, and the `order_policy` rows of `core/tests/vectors/hl.json` against stored prices.
 
 use super::hl::{at, hl_desk_with, hl_policy, unpriced};
+use super::sol::outcome;
 use super::*;
 use crate::prices::{
-    OraclePriceData, PriceRow, ON_PRICES_GAS, ORACLE_CALL_GAS, ORACLE_DEPOSIT,
-    REFRESH_PRICES_MIN_GAS, REQUEST_PRICE_DATA_GAS,
+    answer_time_ms, OraclePriceData, PriceRow, ON_PRICES_GAS, ORACLE_CALL_GAS, ORACLE_DEPOSIT,
+    REFRESH_PRICES_MIN_GAS, REFRESH_SKIP_MS, REQUEST_PRICE_DATA_GAS,
 };
 use gimbal_core::errors::E_ORACLE_STALE;
 use gimbal_core::hl::HlOrder;
@@ -26,10 +27,16 @@ fn outlayer_desk() -> Gimbal {
 
 /// A call from `who` with `gas` prepaid and no deposit.
 fn call_with_gas_by(who: AccountId, gas: Gas) {
+    call_at(who, 0, gas);
+}
+
+/// A call from `who` at block time `ms` with `gas` prepaid and no deposit.
+fn call_at(who: AccountId, ms: u64, gas: Gas) {
     testing_env!(VMContextBuilder::new()
         .current_account_id(contract_id())
         .predecessor_account_id(who.clone())
         .signer_account_id(who)
+        .block_timestamp(ms * 1_000_000)
         .prepaid_gas(gas)
         .build());
 }
@@ -63,8 +70,9 @@ fn calls_with_deposits() -> Vec<(AccountId, String, Value, Gas, u64, NearToken)>
         .collect()
 }
 
-/// A `PriceData` answer at `timestamp_ns`: WASI prices (8 decimals) of ETH 2500 and BTC 81250,
-/// plus what the contract skips: an asset it does not track, a null price and a Burrow-form price.
+/// A `PriceData` answer at `timestamp_ns` of reports up to 90 s older: WASI prices (8 decimals) of
+/// ETH 2500 and BTC 81250, plus what the contract skips: an asset it does not track, a null price
+/// and a Burrow-form price.
 fn answer_at(timestamp_ns: u64) -> Value {
     json!({
         "timestamp": timestamp_ns.to_string(),
@@ -79,8 +87,15 @@ fn answer_at(timestamp_ns: u64) -> Value {
     })
 }
 
-/// 2026-11-01T00:00:00Z less 10 s, in ns: the `order_policy` rows' ETH and BTC time.
+/// 2026-11-01T00:00:00Z less 10 s, in ns.
 const ANSWER_NS: u64 = 1_793_491_190_000_000_000;
+
+/// The block time the answers arrive at, ms: two minutes after [`ANSWER_NS`].
+const BLOCK_MS: u64 = ANSWER_NS / 1_000_000 + 120_000;
+
+/// The time the contract gives the prices of `answer_at(ANSWER_NS)`: the oldest a report behind
+/// them can be, 90 s before the oracle's read.
+const ANSWER_AT_MS: u64 = ANSWER_NS / 1_000_000 - 90_000;
 
 fn row(asset: &str, price_e8: u64, at_ms: u64) -> PriceRow {
     PriceRow {
@@ -226,6 +241,7 @@ fn refresh_prices_asks_the_oracle_on_the_contracts_deposit_then_on_prices() {
 #[test]
 fn refresh_prices_refuses_bad_symbols_strangers_little_gas_and_the_mock_source() {
     let mut g = outlayer_desk();
+    // `operator()` operates no desk here.
     for (assets, expected) in [
         (vec![], "E_ARGS: "),
         (vec!["ETH", "ETH"], "E_ARGS: "),
@@ -260,15 +276,77 @@ fn refresh_prices_refuses_bad_symbols_strangers_little_gas_and_the_mock_source()
     });
 }
 
+/// A desk's operator may refresh prices too (interfaces §1.3), as long as it operates one; and a
+/// call whose prices the contract stored under 30 s ago asks nothing and spends nothing (review
+/// round 2, item 5).
+#[test]
+fn refresh_prices_takes_operators_and_skips_prices_stored_under_30_s_ago() {
+    let mut g = outlayer_desk();
+    call(owner(), storage_deposit());
+    g.set_operator("alpha".into(), Some(operator()));
+    call_at(operator(), BLOCK_MS, Gas::from_tgas(300));
+    assert!(matches!(
+        g.refresh_prices(vec!["ETH".into()]),
+        PromiseOrValue::Promise(_)
+    ));
+    assert_eq!(calls_with_deposits()[0].1, "request_price_data");
+    // Another operator, then none: the old one has no desk left to refresh for.
+    call(owner(), storage_deposit());
+    g.set_operator("alpha".into(), Some(stranger()));
+    for (who, allowed) in [(operator(), false), (stranger(), true)] {
+        call_at(who.clone(), BLOCK_MS, Gas::from_tgas(300));
+        let got = outcome(|| g.refresh_prices(vec!["ETH".into()]).detach());
+        assert_eq!(got.is_ok(), allowed, "{who}");
+    }
+    call(owner(), ONE_YOCTO);
+    g.set_operator("alpha".into(), None);
+    call_at(stranger(), BLOCK_MS, Gas::from_tgas(300));
+    assert_refused("E_NOT_ALLOWED: charlie owns and operates no desk", || {
+        g.refresh_prices(vec!["ETH".into()]).detach();
+    });
+
+    // ETH and BTC stored at BLOCK_MS: for 30 s a refresh of them returns true at once.
+    let answer = successful(&answer_at(ANSWER_NS));
+    assert!(value(on_prices_with(&mut g, answer, &["ETH", "BTC"])));
+    for (ms, assets, skips) in [
+        (BLOCK_MS + REFRESH_SKIP_MS - 1, vec!["BTC", "ETH"], true),
+        (BLOCK_MS + REFRESH_SKIP_MS - 1, vec!["ETH", "SOL"], false),
+        (BLOCK_MS + REFRESH_SKIP_MS, vec!["ETH"], false),
+    ] {
+        call_at(owner(), ms, Gas::from_tgas(300));
+        let got = g.refresh_prices(assets.iter().map(|s| s.to_string()).collect());
+        if skips {
+            assert!(matches!(got, PromiseOrValue::Value(true)), "{assets:?}");
+            assert!(calls_with_deposits().is_empty());
+            assert_eq!(
+                get_logs(),
+                vec!["every price asked for was stored under 30 s ago; no oracle call"]
+            );
+        } else {
+            assert!(
+                matches!(got, PromiseOrValue::Promise(_)),
+                "{assets:?} at {ms}"
+            );
+            drop(got);
+            assert_eq!(calls_with_deposits()[0].5, ORACLE_DEPOSIT);
+        }
+    }
+    // The skip counts from when the contract stored the price, not from the price's time, which
+    // trails it by the oracle's recency window.
+    assert_eq!(BLOCK_MS - ANSWER_AT_MS, 210_000);
+}
+
 // --- the oracle's answers ---
 
-/// `on_prices` with the oracle's answer `result`, prepaid what `refresh_prices` gives it.
+/// `on_prices` at [`BLOCK_MS`] with the oracle's answer `result`, prepaid what `refresh_prices`
+/// gives it.
 fn on_prices_with(g: &mut Gimbal, result: PromiseResult, assets: &[&str]) -> PromiseOrValue<bool> {
     testing_env!(
         VMContextBuilder::new()
             .current_account_id(contract_id())
             .predecessor_account_id(contract_id())
             .signer_account_id(owner())
+            .block_timestamp(BLOCK_MS * 1_000_000)
             .prepaid_gas(ON_PRICES_GAS)
             .build(),
         near_sdk::test_vm_config(),
@@ -295,7 +373,7 @@ fn on_prices_stores_the_usd_prices_of_the_answer_and_says_whether_all_came() {
     let mut g = outlayer();
     let answer = successful(&answer_at(ANSWER_NS));
     assert!(value(on_prices_with(&mut g, answer, &["ETH", "BTC"])));
-    let at_ms = ANSWER_NS / 1_000_000;
+    let at_ms = ANSWER_AT_MS;
     assert_eq!(
         g.prices(),
         vec![
@@ -308,7 +386,7 @@ fn on_prices_stores_the_usd_prices_of_the_answer_and_says_whether_all_came() {
         logs.last().unwrap(),
         &event(
             "prices",
-            r#"{"asset":"BTC","price_e8":8125000000000,"at_ms":1793491190000},{"asset":"ETH","price_e8":250000000000,"at_ms":1793491190000}"#
+            r#"{"asset":"BTC","price_e8":8125000000000,"at_ms":1793491100000},{"asset":"ETH","price_e8":250000000000,"at_ms":1793491100000}"#
         )
     );
     assert!(logs.contains(&r#"no USD price for "doge.omft.near" in the oracle's answer"#.into()));
@@ -330,10 +408,84 @@ fn on_prices_stores_the_usd_prices_of_the_answer_and_says_whether_all_came() {
     new["prices"][0]["price"]["multiplier"] = json!("251000000000");
     assert!(value(on_prices_with(&mut g, successful(&new), &["ETH"])));
     assert_eq!(g.prices()[1], row("ETH", 251_000_000_000, at_ms + 60_000));
-    // An answer that is not PriceData stores nothing.
+    // An answer that is not PriceData stores nothing; nor does one that leaves out how old its
+    // reports may be.
     let junk = successful(&json!({ "prices": [] }));
     let r = on_prices_with(&mut g, junk, &["ETH"]);
     assert!(matches!(r, PromiseOrValue::Promise(_)), "falls back");
+    // Dropped here, the fallback is scheduled under this call's gas, not the next one's.
+    drop(r);
+    let mut ageless = answer_at(ANSWER_NS + 90_000_000_000);
+    ageless
+        .as_object_mut()
+        .unwrap()
+        .remove("recency_duration_sec");
+    let r = on_prices_with(&mut g, successful(&ageless), &["ETH"]);
+    assert!(matches!(r, PromiseOrValue::Promise(_)), "falls back");
+    assert_eq!(g.prices()[1].at_ms, at_ms + 60_000);
+}
+
+/// A price's time is the oldest a report behind it can be (review round 2, item 3): the answer's
+/// `timestamp` less its `recency_duration_sec`, so `oracle_max_age_s` bounds the reports, and at
+/// most the block time, so an answer from the future is not fresh forever and does not keep
+/// every later answer out.
+#[test]
+fn a_price_is_as_old_as_the_oldest_report_behind_it_and_never_from_the_future() {
+    let data = |timestamp_ns: u64, recency_s: u64| -> OraclePriceData {
+        let mut v = answer_at(timestamp_ns);
+        v["recency_duration_sec"] = json!(recency_s);
+        serde_json::from_value(v).unwrap()
+    };
+    let read_ms = ANSWER_NS / 1_000_000;
+    assert_eq!(
+        answer_time_ms(&data(ANSWER_NS, 90), BLOCK_MS),
+        read_ms - 90_000
+    );
+    assert_eq!(
+        answer_time_ms(&data(ANSWER_NS, 600), BLOCK_MS),
+        read_ms - 600_000
+    );
+    assert_eq!(answer_time_ms(&data(ANSWER_NS, 0), BLOCK_MS), read_ms);
+    assert_eq!(
+        answer_time_ms(&data(ANSWER_NS, 90), read_ms - 100_000),
+        read_ms - 100_000
+    );
+    assert_eq!(answer_time_ms(&data(0, 90), BLOCK_MS), 0);
+    // The recency as a string, as the oracle may write integers.
+    let mut v = answer_at(ANSWER_NS);
+    v["recency_duration_sec"] = json!("600");
+    let parsed: OraclePriceData = serde_json::from_value(v).unwrap();
+    assert_eq!(parsed.recency_duration_sec, 600);
+
+    // An answer an hour ahead of the block is stored at the block time, and goes stale.
+    let mut g = outlayer();
+    let ahead = answer_at(BLOCK_MS * 1_000_000 + 3_600_000_000_000);
+    assert!(value(on_prices_with(&mut g, successful(&ahead), &["ETH"])));
+    assert_eq!(g.prices()[1].at_ms, BLOCK_MS);
+    let eth = |g: &Gimbal, max_age_s: u32, now_ms: u64| {
+        crate::prices::reference_price(&g.prices, "ETH", max_age_s, now_ms)
+    };
+    assert_eq!(eth(&g, 60, BLOCK_MS + 60_000), Some(250_000_000_000));
+    assert_eq!(eth(&g, 60, BLOCK_MS + 60_001), None);
+    // A later answer of the right time replaces it once its reports are newer than the block
+    // the early one was stored at.
+    let later = |ms: u64| answer_at((ms + 90_000) * 1_000_000);
+    let mut next = later(BLOCK_MS + 1);
+    next["prices"][0]["price"]["multiplier"] = json!("251000000000");
+    testing_env!(
+        VMContextBuilder::new()
+            .current_account_id(contract_id())
+            .predecessor_account_id(contract_id())
+            .block_timestamp((BLOCK_MS + 100_000) * 1_000_000)
+            .prepaid_gas(ON_PRICES_GAS)
+            .build(),
+        near_sdk::test_vm_config(),
+        near_sdk::RuntimeFeesConfig::test(),
+        Default::default(),
+        vec![successful(&next)]
+    );
+    assert!(value(g.on_prices(vec!["ETH".into()])));
+    assert_eq!(g.prices()[1], row("ETH", 251_000_000_000, BLOCK_MS + 1));
 }
 
 #[test]
