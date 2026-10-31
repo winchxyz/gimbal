@@ -8,10 +8,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { VenueId } from '@gimbal/shared';
-import { OutcomeUnknown } from '../contract/types.ts';
+import { MpcTimeoutError, OutcomeUnknown } from '../contract/types.ts';
+import type { HlOrder } from '../contract/types.ts';
 import { NothingExecuted } from '../relayer/tx.ts';
 import type { LegOutcome, LegRef, LegSide, TradeLeg } from './legs.ts';
-import { LegCheckError } from './legs.ts';
+import { HlLeg, LegCheckError } from './legs.ts';
 import { lotQty, toQty } from './lots.ts';
 import { PairTrader, REPLAY_WINDOW_MS, reducedTarget } from './pair.ts';
 
@@ -38,7 +39,7 @@ interface FakeOptions {
   script?: Step[];
   replayable?: boolean;
   lot?: string;
-  /** Hyperliquid from C6 on: an unknown order is dead this long after it was sent. */
+  /** Hyperliquid: an unknown order whose signed payload was seen, with expiresAfter this long after it was sent. */
   expiresAfterMs?: number;
   /** The policy cap's largest order (maxSize); unlimited when unset. */
   max?: string;
@@ -237,7 +238,7 @@ test('outcome unknown: when the venue shows nothing ran, the retry goes out; whe
   assert.equal(lost.trader.intent(lost.a), null, 'the watch trades nothing against an unknown leg');
 });
 
-test('hyperliquid unknown with an expiry: read back only once the order has expired, then retried', async () => {
+test('hyperliquid unknown with a signed expiry: read back only once the order has expired, then retried', async () => {
   const s = setup({ expiresAfterMs: 60_000, script: ['unknown-none', 'fill'] });
   const r = await s.trader.open({ size: '0.005', longIndex: 0, reason: 'open' });
   assert.equal(r.status, 'open');
@@ -263,6 +264,27 @@ test('hyperliquid unknown without an expiry: never retried; the partner goes bac
   assert.equal(rc.status, 'stuck');
   assert.deepEqual([c.a.orders.length, c.b.orders.length], [1, 1]);
   assert.deepEqual([c.a.pos, c.b.pos], [q('0.005'), 0n]);
+});
+
+test('hyperliquid MPC timeout: no signed payload, so no expiry; nothing ran when read, so it is never retried', async () => {
+  // The real leg: the relayer's MPC call timed out, the venue shows no position.
+  const shared: Shared = { started: 0, overlap: false, now: 1_000_000 };
+  const sent: HlOrder[] = [];
+  const hl = new HlLeg({
+    relayer: { hlOrder: async (order) => { sent.push(order); throw new MpcTimeoutError('hl_order', 'no signature within 120 s'); } },
+    info: async () => ({ assetPositions: [] }), user: '0xabc', coin: 'ETH', asset: 4, szDecimals: 4, oraclePx: async () => 2500, bandBps: 500,
+    maxNotionalUsd: 50, bestPx: async (side) => (side === 'BUY' ? 2500 : 2499), clock: { now: () => shared.now },
+  });
+  const b = new FakeLeg('orderly', shared);
+  const sleeps: number[] = [];
+  const trader = new PairTrader({ legs: [hl, b], clock: { now: () => shared.now }, sleep: async (ms) => { sleeps.push(ms); shared.now += ms; } });
+  const r = await trader.open({ size: '0.005', longIndex: 0, reason: 'open' });
+  assert.equal(r.status, 'stuck');
+  assert.equal(sent.length, 1, 'a retry could double the order when the late signature lands');
+  assert.equal(r.legs[0].orders[0]!.outcome, 'unknown');
+  assert.deepEqual(sleeps, [], 'no expiry to wait for');
+  assert.deepEqual(b.orders.map((o) => [o.side, o.size, o.reduceOnly]), [['SELL', '0.005', false], ['BUY', '0.005', true]]);
+  assert.match(r.notes.join(' '), /no answer and no expiry/);
 });
 
 test('replayed fill: a copy of the filled Orderly IOC is seen on the position read and closed reduce-only', async () => {

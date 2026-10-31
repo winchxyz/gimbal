@@ -258,7 +258,7 @@ async function orderly(plan: SetupPlan, run: Run, waits: (name: SetupStepName, o
   }
 
   // The detail is the address alone, lowercase: the dashboard reads it from there and asks the owner to pin it with
-  // set_orderly_receiver. A receiver already pinned is looked up too: withdrawals go to the pinned one, so one that is
+  // set_orderly_receiver. A receiver already pinned is looked up too: deposits go to the pinned one, so one that is
   // not Orderly's answer for this account fails the step.
   await run('orderly_receiver_lookup', async () => {
     const pinned = (await plan.desk()).orderly_receiver;
@@ -323,7 +323,7 @@ async function phoenix(plan: SetupPlan, run: Run, waits: (name: SetupStepName, o
 
 /**
  * The receiver in Orderly's receiver_address answer: its `receiver_address` field, lowercase. Anything else is an
- * error: the owner pins this address for withdrawals, so a guess from another field is never good enough.
+ * error: the owner pins this address and deposits are sent to it, so a guess from another field is never good enough.
  */
 export function receiverOf(answer: unknown): string {
   const v = typeof answer === 'object' && answer !== null ? (answer as { receiver_address?: unknown }).receiver_address : undefined;

@@ -11,10 +11,6 @@
 //                                                            and an idle account leave the Orderly start unknown:
 //                                                            assert it (signed ETH; checked against later pushes)
 //                             [--close-only]                 skip the open: close what the desk holds
-//                             [--hl-expiry 60]               the contract stamps Hyperliquid orders with expiresAfter
-//                                                            = block time + this many seconds (C6 on): an order
-//                                                            with no answer is read back after it, then retried.
-//                                                            Unset (C5): such an order is never retried
 // ETH priced in the policy takes its oracle price from the contract's prices() (refresh a mock price first).
 // Reads the repo's .env (values are never printed); testnet only. One engine process at a time (nonces).
 
@@ -45,7 +41,6 @@ const { values } = parseArgs({
     'replay-copy': { type: 'boolean', default: false },
     'orderly-start': { type: 'string' },
     'close-only': { type: 'boolean', default: false },
-    'hl-expiry': { type: 'string' },
   },
 });
 const log = (line: string) => logAs(TAG, line);
@@ -102,8 +97,6 @@ async function run(): Promise<void> {
     return Number(row.price_e8) / 1e8;
   };
   if (unpriced === undefined) log(`${HL_COIN} is priced: oracle ${await oraclePx()} USD from the contract's prices()`);
-  const hlExpiryMs = values['hl-expiry'] === undefined ? undefined : Number(values['hl-expiry']) * 1000;
-  if (hlExpiryMs !== undefined && !(hlExpiryMs > 0)) throw new Error('--hl-expiry must be a positive number of seconds');
   const hlReader = new HyperliquidReader({ network: 'testnet', url: `${live.hlUrl}/info` });
   const info = async (body: Record<string, unknown>): Promise<unknown> => {
     const res = await fetch(`${live.hlUrl}/info`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) });
@@ -114,7 +107,7 @@ async function run(): Promise<void> {
   const maxSz = unpriced === undefined ? {} : { maxSz: unpriced.max_sz };
   const hl = new HlLeg({
     relayer, info, user, coin: HL_COIN, asset: asset.index, szDecimals: asset.sz_decimals, oraclePx,
-    bandBps: desk.policy.price_band_bps, maxNotionalUsd, ...maxSz, ...(hlExpiryMs === undefined ? {} : { expiresAfterMs: hlExpiryMs }),
+    bandBps: desk.policy.price_band_bps, maxNotionalUsd, ...maxSz,
     bestPx: async (side) => {
       const book = await hlReader.book(HL_COIN, 5);
       const px = side === 'BUY' ? book.asks[0]?.px : book.bids[0]?.px;

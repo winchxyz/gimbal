@@ -7,9 +7,10 @@
 // so the desk is left hedged (and the pair reported stuck), never with one leg alone.
 //
 // Outcome unknown: a leg whose order did not prove what it did is read back from the venue before anything else is
-// sent for it. A Hyperliquid order is read only once no copy of it can execute any more (after its expiresAfter);
-// one without an expiry may land at any time, so it is never retried: its partner goes back reduce-only and the pair
-// is stuck. If a read fails, the pair stops: nothing more is sent for either leg, and the result says why.
+// sent for it. A Hyperliquid order is read only once no copy of it can execute any more (after the expiresAfter of
+// its signed payload); one without a known expiry (C5, or an MPC timeout: no payload) may land at any time, so it is
+// never retried: its partner goes back reduce-only and the pair is stuck. If a read fails, the pair stops: nothing
+// more is sent for either leg, and the result says why.
 //
 // Replays (Orderly): every signed order is public and can be sent again inside Orderly's 300 s window, a refused or
 // unfilled one too. Every order that got a signature arms the leg's watch for that window; a position push during it
@@ -383,7 +384,7 @@ export class PairTrader {
       r.pos = await this.#read(leg, undefined, 'after the order expired');
       return;
     }
-    // No expiry (a contract before C6): a late signature can still execute it. A position that moved shows it ran (a
+    // No known expiry (a contract before C6, or an MPC timeout with no payload): a late signature can still execute it. A position that moved shows it ran (a
     // signed action runs once); one that did not leaves it pending, and nothing more is sent on this leg.
     r.pos = await this.#read(leg, undefined, 'after an order whose outcome is unknown');
     if (r.pos === from) r.unsettled = out;

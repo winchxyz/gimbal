@@ -29,13 +29,13 @@ function hlResult(totalSz: string | null): HlSubmitResult {
   };
 }
 
-function hlLeg(answer: (order: HlOrder) => Promise<HlSubmitResult>, info: unknown = { assetPositions: [] }, extra: { oraclePx?: number; expiresAfterMs?: number; clock?: Clock } = {}) {
+function hlLeg(answer: (order: HlOrder) => Promise<HlSubmitResult>, info: unknown = { assetPositions: [] }, extra: { oraclePx?: number; clock?: Clock } = {}) {
   const sent: HlOrder[] = [];
   const leg = new HlLeg({
     relayer: { hlOrder: async (order) => { sent.push(order); return answer(order); } },
     info: async () => info, user: '0xABC', coin: 'ETH', asset: 4, szDecimals: 4, oraclePx: async () => extra.oraclePx ?? null, bandBps: 2000,
     maxNotionalUsd: 50, ...(extra.oraclePx === undefined ? { maxSz: '0.02' } : {}), bestPx: async (side) => (side === 'BUY' ? 2500 : 2499),
-    ...(extra.expiresAfterMs === undefined ? {} : { expiresAfterMs: extra.expiresAfterMs }), ...(extra.clock === undefined ? {} : { clock: extra.clock }),
+    ...(extra.clock === undefined ? {} : { clock: extra.clock }),
   });
   return { leg, sent };
 }
@@ -235,13 +235,9 @@ test('hyperliquid: an order with no answer says until when it can still execute'
   const posted = await hlLeg(async () => { throw new OutcomeUnknown('hl order', 'no answer', { hlExpiresAfter: 5_060_000 }, [NEAR_TX]); }, undefined, { clock })
     .leg.order('BUY', q('0.0045'), false, 'open');
   assert.deepEqual([posted.kind, posted.kind === 'unknown' && posted.expiresAt, posted.ref.expiresAfter], ['unknown', 5_060_000 + HL_EXPIRY_MARGIN_MS, 5_060_000]);
-  // An MPC timeout returns no payload: the contract's window from now (the block that asked was not later).
-  const timedOut = await hlLeg(async () => { throw new MpcTimeoutError('hl_order', 'slow'); }, undefined, { clock, expiresAfterMs: 60_000 })
-    .leg.order('BUY', q('0.0045'), false, 'open');
-  assert.equal(timedOut.kind === 'unknown' && timedOut.expiresAt, 5_000_000 + 60_000 + HL_EXPIRY_MARGIN_MS);
-  // A contract without expiresAfter (C5): never known dead.
-  const c5 = await hlLeg(async () => { throw new MpcTimeoutError('hl_order', 'slow'); }, undefined, { clock }).leg.order('BUY', q('0.0045'), false, 'open');
-  assert.equal(c5.kind === 'unknown' && c5.expiresAt, null);
+  // An MPC timeout returns no payload: nothing proves an expiry (a C5 contract stamps none), so it has none.
+  const timedOut = await hlLeg(async () => { throw new MpcTimeoutError('hl_order', 'slow'); }, undefined, { clock }).leg.order('BUY', q('0.0045'), false, 'open');
+  assert.deepEqual([timedOut.kind, timedOut.kind === 'unknown' && timedOut.expiresAt, timedOut.ref.expiresAfter], ['unknown', null, undefined]);
   // An accepted order shows its expiresAfter.
   const accepted = await hlLeg(async () => ({ ...hlResult('0.0045'), expiresAfter: 5_060_000 })).leg.order('BUY', q('0.0045'), false, 'open');
   assert.equal(accepted.ref.expiresAfter, 5_060_000);

@@ -8,7 +8,8 @@
 //
 // An unknown order can still execute later: a late MPC signature is public on NEAR, and Orderly takes a signed copy
 // for 300 s. `expiresAt` says until when. Hyperliquid refuses an action after its expiresAfter (stamped by the contract
-// from C6 on, block time + 60 s); without one there is no such time, and the order may still land whenever.
+// from C6 on, block time + 60 s), but only the signed payload proves there is one: after an MPC timeout no payload is
+// in hand, so the order counts as having no expiry, and it may still land whenever.
 
 import type { TxRef, VenueId } from '@gimbal/shared';
 import { ContractRefusal, OutcomeUnknown, SignatureBudgetError } from '../contract/types.ts';
@@ -117,11 +118,6 @@ export interface HlLegOptions {
   /** Best ask for a buy, best bid for a sell. */
   bestPx: (side: LegSide) => Promise<number>;
   slippageBps?: number;
-  /**
-   * The contract stamps orders with expiresAfter = block time + this (60 s from C6 on). An MPC timeout returns no
-   * payload to read it from; with this set, its late signature is known dead by then. Unset (C5): never known dead.
-   */
-  expiresAfterMs?: number;
   clock?: Clock;
 }
 
@@ -194,15 +190,13 @@ export class HlLeg implements TradeLeg {
   }
 
   /**
-   * When no copy of an order whose outcome is unknown can execute any more: its signed expiresAfter when the payload
-   * was seen (a lost /exchange answer), else, after an MPC timeout, now + the contract's window (the block that asked
-   * for the signature is not later than now); null without either.
+   * When no copy of an order whose outcome is unknown can execute any more: the signed payload's expiresAfter (a lost
+   * /exchange answer), plus a margin. Nothing else counts: after an MPC timeout no payload is in hand, and a window
+   * assumed from settings would be wrong on a contract that stamps none (C5), so the answer is null (no expiry).
    */
   #expiresAt(err: unknown): number | null {
     const signed = err instanceof OutcomeUnknown ? err.ids.hlExpiresAfter : undefined;
-    if (signed !== undefined) return signed + HL_EXPIRY_MARGIN_MS;
-    if (this.#o.expiresAfterMs !== undefined) return this.#clock.now() + this.#o.expiresAfterMs + HL_EXPIRY_MARGIN_MS;
-    return null;
+    return signed === undefined ? null : signed + HL_EXPIRY_MARGIN_MS;
   }
 
   async #plan(side: LegSide, size: bigint, reduceOnly: boolean): Promise<{ order: HlOrder; px: number }> {
