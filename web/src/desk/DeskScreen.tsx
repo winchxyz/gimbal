@@ -14,7 +14,6 @@ import { bestEnterable, heldWindow } from '../windows/model.ts';
 import { useStrategy } from '../windows/useEngine.ts';
 import { elapsed, splitUsd, signedUsd } from './format.ts';
 import {
-  THRESHOLD_TEXT,
   dayRate,
   distanceText,
   exposureOf,
@@ -29,6 +28,7 @@ import {
   placeLegs,
   pnlRows,
   sizeText,
+  thresholdText,
   type EventRow,
 } from './model.ts';
 import { DeskLoading } from './States.tsx';
@@ -115,8 +115,8 @@ function Stage({ desk, windows, strategy, journal, down, now, phoneActions }: St
           <MoneyActions mode={desk.mode} className="btns d-phone" />
         </section>
 
-        <Half side="left" leg={left} down={down} now={now} />
-        <Half side="right" leg={right} down={down} now={now} />
+        <Half side="left" leg={left} down={down} now={now} risk={strategy?.risk ?? null} />
+        <Half side="right" leg={right} down={down} now={now} risk={strategy?.risk ?? null} />
 
         <section className="d-exposure" aria-label="Net exposure">
           <div className="lab">Net exposure</div>
@@ -155,7 +155,16 @@ function Stage({ desk, windows, strategy, journal, down, now, phoneActions }: St
 
 // ---------- one leg ----------
 
-function Half({ side, leg, down, now }: { side: 'left' | 'right'; leg: Leg | null; down: readonly VenueId[]; now: number }) {
+interface HalfProps {
+  side: 'left' | 'right';
+  leg: Leg | null;
+  down: readonly VenueId[];
+  now: number;
+  /** The owner's thresholds (`StrategyConfig.risk`), or null until the strategy has been read. */
+  risk: StrategyConfig['risk'] | null;
+}
+
+function Half({ side, leg, down, now, risk }: HalfProps) {
   if (leg === null) {
     // One leg only: the desk is not hedged. Say so where the other leg would be.
     return (
@@ -195,7 +204,7 @@ function Half({ side, leg, down, now }: { side: 'left' | 'right'; leg: Leg | nul
           <Flash value={leg.distanceToLiqPct}>{distanceText(leg)}</Flash>
         </div>
         <p className="move">{moveText(leg)}</p>
-        <p className="thr d-desk">{THRESHOLD_TEXT}</p>
+        {thresholdText(risk) ? <p className="thr d-desk">{thresholdText(risk)}</p> : null}
       </div>
       <div className={cx('d-rows', side, stale && 'stale')}>
         {legRows(leg, now).map((r) => (

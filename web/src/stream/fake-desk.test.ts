@@ -94,7 +94,10 @@ test('the mockup’s three latest events: funding paid, the open, and an unprote
   const rows = latestEvents(fakeLatest(T0, 'level').sort((x, y) => y.t - x.t), T0);
   assert.deepEqual(rows.map((r) => r.when), ['Today 14:00', '24 Oct 23:41', '24 Oct 23:39']);
   assert.equal(rows[2]?.unprotected, 'Phoenix leg sent without price protection');
-  assert.equal(rows[1]?.proof?.label, '2 transactions ↗');
+  // the Journal lists the same three entries with their NEAR, Hyperliquid and Solscan links
+  assert.equal(rows[1]?.proof?.label, '3 transactions ↗');
+  assert.equal(rows[2]?.proof?.label, '3 transactions ↗');
+  assert.equal(rows[0]?.proof?.label, 'on-chain ↗');
   assert.deepEqual(fakeLatest(T0, 'waiting'), []);
 });
 

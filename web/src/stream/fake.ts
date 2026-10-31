@@ -36,7 +36,7 @@ export function startFakeStream(dispatch: (action: StreamAction) => void, option
     const now = Date.now();
     if (tick === 0) {
       send({ type: 'setup', data: fakeSetup() });
-      for (const entry of fakeLatest(now, desk)) send({ type: 'journal', data: entry });
+      for (const entry of fakeLatest(now, desk, options.mode)) send({ type: 'journal', data: entry });
     }
     if (tick % 3 === 0) send({ type: 'health', data: fakeDeskHealth(tick, desk) });
     // The scanner sends its windows and its status together; `loading` sends neither.
@@ -78,9 +78,8 @@ function fakeSetup(): SetupProgress {
     'orderly_add_key',
     'orderly_receiver_lookup',
     'orderly_referral_bind',
-    'phoenix_login',
-    'phoenix_invite',
     'phoenix_register',
+    'phoenix_referral',
   ];
   return { deskId: 'desk-07', steps: steps.map((step) => ({ step, status: 'done', tx: [] })) };
 }

@@ -89,7 +89,7 @@ losses; no management fee. Every charge is a `fee_charged` event on NEAR. Each d
 codes fixed in the contract's config, where a venue has one: on Hyperliquid the desk pays 4% less in fees, and
 Hyperliquid pays the code's owner 10% of the fees the desk pays.
 
-<!-- fill: Orderly referral and Phoenix invite terms once those codes are decided -->
+<!-- fill: Orderly and Phoenix referral terms once those codes are decided -->
 
 ## Security model
 
