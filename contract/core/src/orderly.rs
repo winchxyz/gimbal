@@ -45,14 +45,25 @@ pub const KEY_SCOPE: &str = "read,trading";
 pub const MAX_KEY_LIFETIME_MS: u64 = 365 * 86_400_000;
 /// Orderly accepts a signed request for 300 s after its timestamp.
 pub const REQUEST_TTL_MS: u64 = 300_000;
-/// How far past the block time a request timestamp may be: the engine's clock and the block's
-/// differ by a few seconds; a minute leaves room without letting a request outlive its window by
-/// much.
-pub const MAX_AHEAD_MS: u64 = 60_000;
+/// How far past the block time a request timestamp may be. The engine stamps a request before it
+/// sends the transaction, so its timestamp is normally behind the block's; a few seconds cover
+/// clock skew. Every second allowed here is a second the signed request (public on chain once
+/// signed) stays valid at Orderly past the 300 s after the block.
+pub const MAX_AHEAD_MS: u64 = 5_000;
 /// The token every withdrawal moves.
 pub const TOKEN: &str = "USDC";
 /// Orderly takes a `client_order_id` of up to 36 characters.
 pub const CLIENT_ORDER_ID_MAX_LEN: usize = 36;
+
+/// The `client_order_id` of the order signed with `request_id`: `g<request_id>`, at most 21
+/// characters of `[a-z0-9]`. The contract always sets it and never takes the caller's, so every
+/// order the contract signs carries an id no other signed order has. Orderly refuses a
+/// `client_order_id` that is already open, so a resting order's signed request cannot be posted a
+/// second time while the order rests; once it filled or was cancelled it can (see `order`).
+pub fn client_order_id(request_id: u64) -> String {
+    format!("g{request_id}")
+}
+
 /// The `kind` of the WebSocket login.
 pub const WS_AUTH: &str = "ws_auth";
 
@@ -437,6 +448,8 @@ pub struct OrderlyRequest {
     pub quantity: Option<String>,
     #[serde(default)]
     pub reduce_only: bool,
+    /// Must be absent or null: the contract sets every order's `client_order_id` itself
+    /// ([`client_order_id`]), so no caller can pick one.
     #[serde(default)]
     pub client_order_id: Option<String>,
     #[serde(default)]
@@ -468,7 +481,7 @@ pub struct OrderlyRequest {
 }
 
 /// The request kinds and the fields each takes besides `kind` and `timestamp_ms`.
-const KINDS: [(&str, &[&str]); 10] = [
+const KINDS: [(&str, &[&str]); 12] = [
     (
         "order",
         &[
@@ -478,7 +491,6 @@ const KINDS: [(&str, &[&str]); 10] = [
             "price",
             "quantity",
             "reduce_only",
-            "client_order_id",
         ],
     ),
     ("cancel", &["symbol", "order_id"]),
@@ -496,6 +508,8 @@ const KINDS: [(&str, &[&str]); 10] = [
         "funding_fee_history",
         &["symbol", "start_t", "end_t", "page", "size"],
     ),
+    ("positions", &[]),
+    ("holding", &[]),
 ];
 
 impl OrderlyRequest {
@@ -590,6 +604,9 @@ pub struct Context<'a> {
     /// `treasury.referral_codes.orderly`: the only code `referral_bind` can carry.
     pub referral_code: Option<&'a str>,
     pub block_ms: u64,
+    /// The `request_id` the signature of this request gets; an order's `client_order_id` is
+    /// [`client_order_id`] of it.
+    pub request_id: u64,
     /// The oracle price of a base symbol (`ETH` for `PERP_ETH_USDC`) if it is fresh.
     pub reference: &'a dyn Fn(&str) -> Option<u128>,
 }
@@ -617,7 +634,10 @@ pub fn check_timestamp(field: &str, timestamp: u64, block_ms: u64) -> Result<(),
     if timestamp > block_ms.saturating_add(MAX_AHEAD_MS) {
         return Err(Refusal::new(
             E_ARGS,
-            format!("{field} {timestamp} is more than 60 s after the block time {block_ms}"),
+            format!(
+                "{field} {timestamp} is more than {} s after the block time {block_ms}",
+                MAX_AHEAD_MS / 1000
+            ),
         ));
     }
     Ok(())
@@ -625,6 +645,12 @@ pub fn check_timestamp(field: &str, timestamp: u64, block_ms: u64) -> Result<(),
 
 /// The WebSocket login: the timestamp alone, in decimal (method, path and body blank), within the
 /// request window at `block_ms`.
+///
+/// Accepted risk: the signed login is public once signed (the `SignedAction` result and the MPC's
+/// answer are on chain) and the account id and orderly key are in `get_desk`, so anyone can open
+/// the desk's private stream with it until Orderly's window closes, and read the account's
+/// positions, balances and order events. It grants no trading. The signed reads of
+/// [`build_request`] are replayable the same way, with the same read-only exposure.
 pub fn ws_auth(timestamp: u64, block_ms: u64) -> Result<Signable, Refusal> {
     check_timestamp("timestamp", timestamp, block_ms)?;
     Ok(Signable {
@@ -650,27 +676,6 @@ fn check_symbol_form(symbol: &str) -> Result<(), Refusal> {
             format!(
                 "symbol {} is not PERP_<BASE>_USDC with BASE of A-Z and 0-9",
                 shown(symbol)
-            ),
-        ))
-    }
-}
-
-/// 1 to 36 characters of A-Z, a-z, 0-9, `-` and `_` (`E_ARGS`).
-fn check_client_order_id(id: &str) -> Result<(), Refusal> {
-    let ok = !id.is_empty()
-        && id.len() <= CLIENT_ORDER_ID_MAX_LEN
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-    if ok {
-        Ok(())
-    } else {
-        Err(Refusal::new(
-            E_ARGS,
-            format!(
-                "client_order_id {} is not 1 to {CLIENT_ORDER_ID_MAX_LEN} characters of A-Z, a-z, \
-                 0-9, - and _",
-                shown(id)
             ),
         ))
     }
@@ -731,15 +736,19 @@ pub fn signed_message_body(
 ///
 /// - `order`: a symbol of the policy (`E_ASSET`), side `BUY`/`SELL` and type `IOC`/`LIMIT`
 ///   (`E_ARGS`; `MARKET` has no price limit, `E_PRICE_BAND`), canonical price above zero and
-///   quantity (`E_DECIMAL`), a client order id of 1 to 36 of `[A-Za-z0-9_-]` (`E_ARGS`), then
+///   quantity (`E_DECIMAL`), then
 ///   [`check_value`] for the base symbol at its reference price (`E_SIZE`, `E_ORACLE_STALE`,
-///   `E_PRICE_BAND`); `POST /v1/order`;
+///   `E_PRICE_BAND`); `POST /v1/order` with the contract's `client_order_id` (a caller's is
+///   `E_ARGS`);
 /// - `cancel`: `DELETE /v1/order?order_id=<id>&symbol=<symbol>`; `cancel_all`:
 ///   `DELETE /v1/orders?symbol=<symbol>`; the symbol in Orderly's form (`E_ARGS`) but not
 ///   necessarily still in the policy, so a dropped market can be cancelled;
 /// - `receiver_address` (`GET /v1/client/asset/receiver_address?chain_id=<chain>&token=USDC`),
-///   `settle_nonce`, `withdraw_nonce` and `funding_fee_history` (`GET /v1/funding_fee/history` with
-///   `symbol`, `start_t`, `end_t`, `page`, `size` in that order, each only when set): reads;
+///   `settle_nonce`, `withdraw_nonce`, `funding_fee_history` (`GET /v1/funding_fee/history` with
+///   `symbol`, `start_t`, `end_t`, `page`, `size` in that order, each only when set), `positions`
+///   (`GET /v1/positions`) and `holding` (`GET /v1/client/holding`): reads. The private stream
+///   pushes no snapshot on subscribe, so the engine reads positions and holdings once per session.
+///   A signed read is replayable inside Orderly's window, a read-only exposure (see [`ws_auth`]);
 /// - `settle_pnl` / `withdraw_request`: `POST /v1/settle_pnl` / `POST /v1/withdraw_request` with
 ///   the EIP-712 message rebuilt from the typed fields (receiver the desk, token USDC) and the
 ///   signature passed (`E_ARGS` if malformed; the caller checks it recovers to the desk);
@@ -747,6 +756,12 @@ pub fn signed_message_body(
 ///   (`E_ARGS` when none is configured).
 pub fn build_request(ctx: &Context, req: &OrderlyRequest) -> Result<Signable, Refusal> {
     check_timestamp("timestamp_ms", req.timestamp_ms, ctx.block_ms)?;
+    if req.client_order_id.is_some() {
+        return Err(Refusal::new(
+            E_ARGS,
+            "client_order_id is the contract's (g<request_id>), never the caller's: leave it null",
+        ));
+    }
     let (kind, fields) = KINDS
         .iter()
         .find(|(k, _)| *k == req.kind)
@@ -808,6 +823,8 @@ pub fn build_request(ctx: &Context, req: &OrderlyRequest) -> Result<Signable, Re
         )),
         "settle_nonce" => read("/v1/settle_nonce".into()),
         "withdraw_nonce" => read("/v1/withdraw_nonce".into()),
+        "positions" => read("/v1/positions".into()),
+        "holding" => read("/v1/client/holding".into()),
         "funding_fee_history" => {
             if let Some(symbol) = &req.symbol {
                 check_symbol_form(symbol)?;
@@ -882,6 +899,16 @@ pub fn build_request(ctx: &Context, req: &OrderlyRequest) -> Result<Signable, Re
 }
 
 /// The `order` kind of [`build_request`].
+///
+/// RESIDUAL RISK, replay: the signed request is public on chain once `on_signed` returns, and
+/// Orderly takes the same signed request again until 300 s after its timestamp. The contract's
+/// `client_order_id` only stops a copy while the first order is open. Tested on testnet
+/// (PR 30 round 2): a copy of a resting LIMIT was refused (HTTP 409, -1007 "The client_order_id
+/// is repeated."), but after that LIMIT was cancelled the same copy was accepted as a new order,
+/// and a copy of an IOC that had filled was accepted and filled again: the position doubled.
+/// So anyone who reads the chain can post a signed order N times inside the window, each one
+/// up to the policy's size, bounded only by the account's margin. A copy of a reduce-only order
+/// can only shrink the position.
 fn order(ctx: &Context, req: &OrderlyRequest) -> Result<Signable, Refusal> {
     let need = |field: &str, v: &Option<String>| {
         v.clone()
@@ -932,9 +959,6 @@ fn order(ctx: &Context, req: &OrderlyRequest) -> Result<Signable, Refusal> {
     }
     let price = need("price", &req.price)?;
     let quantity = need("quantity", &req.quantity)?;
-    if let Some(id) = &req.client_order_id {
-        check_client_order_id(id)?;
-    }
     let decimal = |field: &str, s: &str| {
         parse_e8(s).map_err(|r| Refusal::new(r.code, format!("{field} {}", r.msg)))
     };
@@ -947,7 +971,7 @@ fn order(ctx: &Context, req: &OrderlyRequest) -> Result<Signable, Refusal> {
     let valued = check_value(ctx.policy, base, px_e8, sz_e8, (ctx.reference)(base))?;
     let body = order_body(
         &symbol,
-        req.client_order_id.as_deref(),
+        Some(&client_order_id(ctx.request_id)),
         &order_type,
         Some(&price),
         &quantity,
@@ -997,6 +1021,17 @@ mod tests {
         for (i, (kind, _)) in KINDS.iter().enumerate() {
             assert!(KINDS[i + 1..].iter().all(|(k, _)| k != kind), "{kind}");
         }
+    }
+
+    #[test]
+    fn the_contracts_client_order_ids_fit_orderly() {
+        assert_eq!(client_order_id(0), "g0");
+        assert_eq!(client_order_id(42), "g42");
+        let longest = client_order_id(u64::MAX);
+        assert!(longest.len() <= CLIENT_ORDER_ID_MAX_LEN, "{longest}");
+        assert!(longest
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()));
     }
 
     #[test]

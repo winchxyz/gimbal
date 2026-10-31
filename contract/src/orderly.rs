@@ -218,6 +218,7 @@ impl Gimbal {
             desk_evm: desk_evm(desk),
             referral_code: self.config.treasury.referral_codes.orderly.as_deref(),
             block_ms: env::block_timestamp_ms(),
+            request_id: self.upcoming_request_id(),
             reference: &reference,
         };
         let signable = build_request(&ctx, &req).or_fail();

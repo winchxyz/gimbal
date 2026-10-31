@@ -268,7 +268,7 @@ switch (step) {
       show('PERP_BTC_USDC position', { before, after, filled_per_order: quantity });
       if (after > 0) {
         const close = await request(
-          { kind: 'order', symbol: 'PERP_BTC_USDC', side: 'SELL', order_type: 'IOC', price: String(Math.floor(mark * 0.99)), quantity: String(after), reduce_only: true },
+          { kind: 'order', symbol: 'PERP_BTC_USDC', side: 'SELL', order_type: 'IOC', price: String(Math.floor(mark * 0.995)), quantity: String(after), reduce_only: true },
           'C5 live check: close after the replay',
         );
         await sendRest(close);

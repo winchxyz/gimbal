@@ -6,9 +6,9 @@ use gimbal_core::decimal::parse_e8;
 use gimbal_core::errors::{E_ARGS, E_ASSET, E_DECIMAL, E_ORACLE_STALE, E_PRICE_BAND, E_SIZE};
 use gimbal_core::network::Network;
 use gimbal_core::orderly::{
-    account_id, build_request, checksum_address, order_body, orderly_key, parse_signature,
-    signed_message_body, ws_auth, Broker, Context, Message, OrderlyRequest, KEY_SCOPE,
-    LEDGER_MAINNET, LEDGER_TESTNET, MAX_AHEAD_MS, MAX_KEY_LIFETIME_MS,
+    account_id, build_request, checksum_address, client_order_id, order_body, orderly_key,
+    parse_signature, signed_message_body, ws_auth, Broker, Context, Message, OrderlyRequest,
+    KEY_SCOPE, LEDGER_MAINNET, LEDGER_TESTNET, MAX_AHEAD_MS, MAX_KEY_LIFETIME_MS,
     OFF_CHAIN_VERIFYING_CONTRACT, REQUEST_TTL_MS,
 };
 use gimbal_core::policy::{Policy, UnpricedAsset};
@@ -300,6 +300,7 @@ fn context<'a>(
         desk_evm: desk_evm(v),
         referral_code: Some("TESTCODE"),
         block_ms,
+        request_id: 0,
         reference,
     }
 }
@@ -333,7 +334,7 @@ fn every_request() {
     let v = vectors();
     let policy = vector_policy();
     let requests = v["requests"].as_array().unwrap();
-    assert_eq!(requests.len(), 20);
+    assert_eq!(requests.len(), 22);
     let mut kinds = std::collections::BTreeSet::new();
     for r in requests {
         let name = r["name"].as_str().unwrap();
@@ -341,7 +342,13 @@ fn every_request() {
         let req = request_of(&v, r);
         let px = req.price.as_deref().map(|p| parse_e8(p).unwrap());
         let at_px = move |_: &str| px;
-        let ctx = context(&v, &r["network"], &policy, ts, &at_px);
+        // An order's client_order_id is the contract's, from the request_id it signs with.
+        let request_id = r["request_id"].as_u64();
+        assert_eq!(request_id.is_some(), req.kind == "order", "{name}");
+        let ctx = Context {
+            request_id: request_id.unwrap_or(0),
+            ..context(&v, &r["network"], &policy, ts, &at_px)
+        };
         kinds.insert(req.kind.clone());
         assert_eq!(
             r["message"].as_str().unwrap(),
@@ -359,7 +366,7 @@ fn every_request() {
             assert_eq!(refusal.code, E_PRICE_BAND, "{name}");
             let body = order_body(
                 req.symbol.as_deref().unwrap(),
-                req.client_order_id.as_deref(),
+                Some(&client_order_id(ctx.request_id)),
                 "MARKET",
                 None,
                 req.quantity.as_deref().unwrap(),
@@ -431,7 +438,9 @@ fn every_request() {
         "cancel",
         "cancel_all",
         "funding_fee_history",
+        "holding",
         "order",
+        "positions",
         "receiver_address",
         "referral_bind",
         "settle_nonce",
@@ -487,6 +496,7 @@ fn ctx_at<'a>(policy: &'a Policy, referral_code: Option<&'a str>) -> Context<'a>
         desk_evm: address("0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1"),
         referral_code,
         block_ms: BLOCK,
+        request_id: 0,
         reference: &vector_price,
     }
 }
@@ -561,7 +571,7 @@ fn request_refusals() {
             E_ARGS,
         ),
         (
-            "61 s ahead",
+            "5 s and 1 ms ahead",
             with(eth_buy(), json!({"timestamp_ms": BLOCK + MAX_AHEAD_MS + 1})),
             E_ARGS,
         ),
@@ -676,24 +686,30 @@ fn request_refusals() {
             with(eth_buy(), json!({"quantity": "0.0080"})),
             E_DECIMAL,
         ),
+        // The contract sets every client_order_id; a caller's is refused, even the one it would set.
         (
-            "a 37-character client_order_id",
-            with(eth_buy(), json!({"client_order_id": "a".repeat(37)})),
+            "a caller's client_order_id",
+            with(eth_buy(), json!({"client_order_id": "my-order-1"})),
             E_ARGS,
         ),
         (
-            "an empty client_order_id",
-            with(eth_buy(), json!({"client_order_id": ""})),
+            "the contract's own client_order_id",
+            with(eth_buy(), json!({"client_order_id": "g0"})),
             E_ARGS,
         ),
         (
-            "a client_order_id with a quote",
-            with(eth_buy(), json!({"client_order_id": "a\"b"})),
+            "a client_order_id on a cancel",
+            json!({"kind": "cancel", "symbol": "PERP_ETH_USDC", "order_id": 1, "client_order_id": "g0"}),
             E_ARGS,
         ),
         (
-            "a client_order_id with a space",
-            with(eth_buy(), json!({"client_order_id": "a b"})),
+            "a symbol on a positions read",
+            json!({"kind": "positions", "symbol": "PERP_ETH_USDC"}),
+            E_ARGS,
+        ),
+        (
+            "a page on a holding read",
+            json!({"kind": "holding", "page": 1}),
             E_ARGS,
         ),
         (
@@ -878,23 +894,31 @@ fn what_each_request_allows() {
         refused(ws_auth(BLOCK + MAX_AHEAD_MS + 1, BLOCK)).code,
         E_ARGS
     );
-    // A 36-character client order id, a price at the band's edge.
-    let id = "A-z_0".repeat(7) + "9";
-    assert_eq!(id.len(), 36);
-    build_request(
-        &ctx,
-        &req(with(
-            eth_buy(),
-            json!({"client_order_id": id, "price": "1260"}),
-        )),
-    )
-    .unwrap();
-    // No client order id: the key is left out.
-    let s = build_request(&ctx, &req(eth_buy())).unwrap();
+    // A price at the band's edge.
+    build_request(&ctx, &req(with(eth_buy(), json!({"price": "1260"})))).unwrap();
+    // The client order id is the contract's, from the request id; a null one is no caller's id.
+    let ctx41 = Context {
+        request_id: 41,
+        ..ctx_at(&policy, Some("TESTCODE"))
+    };
+    let s = build_request(&ctx41, &req(eth_buy())).unwrap();
     assert_eq!(
         s.body,
-        r#"{"symbol":"PERP_ETH_USDC","order_type":"LIMIT","order_price":1212.89,"order_quantity":0.0087,"side":"BUY"}"#
+        r#"{"symbol":"PERP_ETH_USDC","client_order_id":"g41","order_type":"LIMIT","order_price":1212.89,"order_quantity":0.0087,"side":"BUY"}"#
     );
+    // A null client_order_id (as the engine may send it) is no caller's id.
+    let mut null_id = eth_buy();
+    null_id["client_order_id"] = Value::Null;
+    assert_eq!(build_request(&ctx41, &req(null_id)).unwrap().body, s.body);
+    // The two snapshot reads: no fields, nothing in the query.
+    let s = build_request(&ctx41, &req(json!({"kind": "positions"}))).unwrap();
+    assert_eq!(
+        (s.method, s.path.as_str(), s.body.as_str()),
+        ("GET", "/v1/positions", "")
+    );
+    let s = build_request(&ctx41, &req(json!({"kind": "holding"}))).unwrap();
+    assert_eq!(s.path, "/v1/client/holding");
+    let s = build_request(&ctx41, &req(eth_buy())).unwrap();
     let order = s.order.unwrap();
     assert!(order.buy && !order.reduce_only);
     assert_eq!(order.valued.oracle_e8, Some(1_200 * E8));
@@ -918,6 +942,8 @@ fn what_each_request_allows() {
         "settle_nonce",
         "withdraw_nonce",
         "funding_fee_history",
+        "positions",
+        "holding",
     ] {
         assert!(reduces(json!({ "kind": kind })), "{kind}");
     }

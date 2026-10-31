@@ -264,6 +264,115 @@ fn on_signed_returns_the_signed_hyperliquid_order_and_logs_it() {
     );
 }
 
+#[test]
+fn on_signed_returns_a_high_s_answer_with_the_low_s() {
+    let mut g = hl_desk_with(vector_policy());
+    let (order, nonce, sig, _) = vector_order();
+    at(operator(), nonce, yocto(0));
+    let action = g.prepare_hl_order("alpha".into(), order, "vector order".into());
+    let pending = Pending {
+        request_id: 41,
+        signer: VECTOR_DESK_EVM.into(),
+        action,
+    };
+    let (r, s, v) = (
+        sig["r"].as_str().unwrap(),
+        sig["s"].as_str().unwrap(),
+        sig["v"].as_u64().unwrap(),
+    );
+    // The vector's s is low; n − s with the other recovery id is the same signature, high.
+    assert_eq!(
+        s,
+        "0x6ab7b7d3a02652ecdc0604166a60fd0a891f7fa59e965b3b9a7e05a146896007"
+    );
+    let high_s = "9548482c5fd9ad1323f9fbe9959f02f4318f5d4110b24500255458eb89ace13a";
+    let low = secp_answer(r, s, v);
+    let mut high = low.clone();
+    high["s"]["scalar"] = json!(high_s);
+    high["recovery_id"] = json!(1 - (v - 27));
+    let signed = run_on_signed(&g, &pending, ok(&high)).unwrap();
+    assert_eq!(
+        serde_json::to_value(&signed.signature).unwrap(),
+        low,
+        "s = n − s and the recovery id flipped; big_r as the MPC wrote it"
+    );
+    // A low s passes as it is.
+    let signed = run_on_signed(&g, &pending, ok(&low)).unwrap();
+    assert_eq!(serde_json::to_value(&signed.signature).unwrap(), low);
+
+    // The edges: n / 2 is low, n / 2 + 1 is high, n itself is no scalar and is left to the check.
+    use crate::mpc::{low_s, AffinePoint, MpcSignature, Scalar};
+    let with_s = |scalar: &str| MpcSignature::Secp256k1 {
+        big_r: AffinePoint {
+            affine_point: "02".to_owned() + &"11".repeat(32),
+        },
+        s: Scalar {
+            scalar: scalar.into(),
+        },
+        recovery_id: 0,
+    };
+    let half = "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0";
+    assert_eq!(low_s(with_s(half)), with_s(half));
+    let MpcSignature::Secp256k1 { s, recovery_id, .. } = low_s(with_s(
+        "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a1",
+    )) else {
+        unreachable!()
+    };
+    assert_eq!((s.scalar.as_str(), recovery_id), (half, 1));
+    let n = "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141";
+    assert_eq!(low_s(with_s(n)), with_s(n));
+    let mut at_n = low.clone();
+    at_n["s"]["scalar"] = json!(n);
+    let msg = run_on_signed(&g, &pending, ok(&at_n)).unwrap_err();
+    assert!(
+        msg.starts_with("E_MPC: the MPC signature recovers to"),
+        "{msg}"
+    );
+}
+
+/// An order's `client_order_id` is `g<request_id>`, the id its signature gets, call after call;
+/// a caller's is refused.
+#[test]
+fn an_orderly_order_carries_the_contracts_client_order_id() {
+    let mut g = hl_desk_with(vector_policy());
+    {
+        let p = &mut g.desks.get_mut("alpha").unwrap().policy;
+        p.orderly_symbols = vec!["PERP_ETH_USDC".into()];
+    }
+    let order = |ts: u64, id: Option<&str>| -> gimbal_core::orderly::OrderlyRequest {
+        serde_json::from_value(json!({
+            "kind": "order", "symbol": "PERP_ETH_USDC", "side": "BUY", "order_type": "IOC",
+            "price": "2000", "quantity": "0.01", "reduce_only": false,
+            "client_order_id": id, "timestamp_ms": ts,
+        }))
+        .unwrap()
+    };
+    for (i, ts) in [T, T + 1, T + 2].into_iter().enumerate() {
+        at(operator(), ts, yocto(0));
+        g.orderly_request("alpha".into(), order(ts, None), "r".into())
+            .detach();
+        let p = pending();
+        assert_eq!(p.request_id, i as u64);
+        let payload = serde_json::to_value(&p.action.payload).unwrap();
+        let body = payload["body"].as_str().unwrap();
+        assert!(
+            body.starts_with(&format!(
+                r#"{{"symbol":"PERP_ETH_USDC","client_order_id":"g{i}","order_type":"IOC""#
+            )),
+            "{body}"
+        );
+    }
+    at(operator(), T + 3, yocto(0));
+    let r = outcome(|| {
+        g.orderly_request("alpha".into(), order(T + 3, Some("g3")), "r".into())
+            .detach()
+    });
+    assert!(r
+        .unwrap_err()
+        .starts_with("E_ARGS: client_order_id is the contract's"),);
+    assert_eq!(g.next_request_id, 3);
+}
+
 /// The orderly.json WebSocket login, signed by the vectors' Solana key.
 fn ws_auth_pending(g: &mut Gimbal) -> (Pending, Value) {
     let v: Value =

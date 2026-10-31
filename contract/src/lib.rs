@@ -244,10 +244,11 @@ impl Gimbal {
     /// The callback of every action method's MPC `sign` call: checks that the answer is a
     /// signature by the desk's key of exactly what was asked (`E_MPC` otherwise, also when the MPC
     /// failed or timed out), emits `signed` and returns the [`SignedAction`] the engine submits.
+    /// A secp256k1 signature comes back with a low s ([`mpc::low_s`]).
     /// The action method's transaction ends with this result.
     #[private]
     pub fn on_signed(&self, pending: Pending) -> SignedAction {
-        let signature = mpc::signature().or_fail();
+        let signature = mpc::low_s(mpc::signature().or_fail());
         mpc::check_signature(&signature, &pending.action.sign_request, &pending.signer).or_fail();
         emit_signed(&pending);
         let Pending {
@@ -370,6 +371,12 @@ impl Gimbal {
 }
 
 impl Gimbal {
+    /// The `request_id` the next [`Self::sign`] call gives: an action method that needs its own id
+    /// before it signs (an Orderly order's `client_order_id`) reads it here, then signs once.
+    pub fn upcoming_request_id(&self) -> u64 {
+        self.next_request_id
+    }
+
     /// Sends a built and checked action to the MPC contract's `sign` with 1 yoctoNEAR from the
     /// contract's balance and gives it the next `request_id`; [`Self::on_signed`] returns the
     /// [`SignedAction`]. `E_ARGS` with less than [`mpc::SIGN_MIN_GAS`] prepaid. Every action

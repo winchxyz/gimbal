@@ -154,6 +154,65 @@ pub fn signature() -> Result<MpcSignature, Refusal> {
     })
 }
 
+/// secp256k1's group order n, and n / 2 rounded down (the largest low s), big-endian hex.
+const SECP256K1_N: &str = "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141";
+const SECP256K1_HALF_N: &str = "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0";
+
+fn bytes32(hex_digits: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(hex_digits, &mut out).expect("a 32-byte hex constant");
+    out
+}
+
+/// `signature` with a low s: a secp256k1 signature whose s is over n / 2 becomes (r, n − s) with
+/// the recovery id flipped, which recovers to the same key; anything else is returned as it is
+/// (a malformed s or recovery id is left for [`check_signature`] to refuse). Circle's FiatToken
+/// (EIP-3009) and every EIP-2 check refuse a high s, so every consumer gets the canonical form.
+/// The MPC network already answers with a low s (each testnet signature seen had one, with the
+/// recovery id flipped to match), so this is a guard. `big_r` stays as the MPC wrote it:
+/// consumers take only its x coordinate, r.
+pub fn low_s(signature: MpcSignature) -> MpcSignature {
+    let MpcSignature::Secp256k1 {
+        big_r,
+        s,
+        recovery_id,
+    } = signature
+    else {
+        return signature;
+    };
+    let mut value = [0u8; 32];
+    let parsed = !s.scalar.is_empty()
+        && s.scalar.len() <= 64
+        && hex::decode_to_slice(format!("{:0>64}", s.scalar), &mut value).is_ok();
+    let n = bytes32(SECP256K1_N);
+    if !parsed || recovery_id > 1 || value <= bytes32(SECP256K1_HALF_N) || value >= n {
+        return MpcSignature::Secp256k1 {
+            big_r,
+            s,
+            recovery_id,
+        };
+    }
+    // n − s, byte by byte from the low end.
+    let mut low = [0u8; 32];
+    let mut borrow = 0u16;
+    for i in (0..32).rev() {
+        let take = u16::from(value[i]) + borrow;
+        let have = u16::from(n[i]);
+        (low[i], borrow) = if have >= take {
+            ((have - take) as u8, 0)
+        } else {
+            ((have + 256 - take) as u8, 1)
+        };
+    }
+    MpcSignature::Secp256k1 {
+        big_r,
+        s: Scalar {
+            scalar: hex::encode(low),
+        },
+        recovery_id: recovery_id ^ 1,
+    }
+}
+
 /// The lowercase `0x` address whose key made the 64-byte `rs` with recovery id `v` (0 or 1) over
 /// `digest`, if any. High-s signatures are accepted, as Ethereum's `ecrecover` accepts them.
 pub fn recover_evm(digest: &[u8; 32], rs: &[u8; 64], v: u8) -> Option<String> {

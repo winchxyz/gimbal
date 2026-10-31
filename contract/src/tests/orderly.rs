@@ -324,6 +324,8 @@ fn orderly_request_signs_every_testnet_vector() {
         }
         let name = r["name"].as_str().unwrap();
         let req = request_of(r);
+        // An order's vector body carries the client_order_id of its request_id.
+        g.next_request_id = r["request_id"].as_u64().unwrap_or(0);
         let got = request(&mut g, operator(), req.clone());
         if req.order_type.as_deref() == Some("MARKET") {
             assert!(
@@ -354,7 +356,7 @@ fn orderly_request_signs_every_testnet_vector() {
         assert_eq!(got.amount, amount, "{name}");
         signed += 1;
     }
-    assert_eq!(signed, 13, "every testnet request but the MARKET order");
+    assert_eq!(signed, 15, "every testnet request but the MARKET order");
 }
 
 #[test]
@@ -405,7 +407,7 @@ fn a_money_path_body_carries_only_the_desks_signature() {
 #[test]
 fn orderly_requests_refuse_what_the_policy_does_not_allow() {
     let mut g = orderly_desk();
-    let base = request_of(&request_case("order LIMIT BUY with client_order_id"));
+    let base = request_of(&request_case("order LIMIT BUY"));
     let with = |f: &dyn Fn(&mut OrderlyRequest)| {
         let mut r = base.clone();
         f(&mut r);
@@ -471,6 +473,8 @@ fn a_paused_desk_signs_only_orderly_calls_that_reduce_risk() {
         "settle_nonce (testnet)",
         "withdraw_nonce (testnet)",
         "funding_fee_history of one symbol, one day, page 1 of 60 rows (testnet)",
+        "positions (testnet)",
+        "holding (testnet)",
     ] {
         let req = request_of(&request_case(name));
         request(&mut g, owner(), req.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -481,7 +485,7 @@ fn a_paused_desk_signs_only_orderly_calls_that_reduce_risk() {
     g.prepare_orderly_ws_auth("alpha".into(), t);
 
     for name in [
-        "order LIMIT BUY with client_order_id",
+        "order LIMIT BUY",
         "settle_pnl POST (testnet)",
         "withdraw_request POST (testnet)",
         "referral_bind (testnet)",
@@ -522,7 +526,7 @@ fn a_paused_desk_signs_only_orderly_calls_that_reduce_risk() {
 fn orderly_methods_are_for_the_owner_and_the_operator() {
     let mut g = orderly_desk();
     let t = 1_793_491_211_000;
-    let req = request_of(&request_case("order LIMIT BUY with client_order_id"));
+    let req = request_of(&request_case("order LIMIT BUY"));
     for who in [owner(), operator()] {
         request(&mut g, who, req.clone()).unwrap();
     }
@@ -611,7 +615,8 @@ fn the_vector_signatures_pass_on_signed() {
     );
 
     // An order: the orderly key's signature of the vector message, and the order in the event.
-    let r = request_case("order LIMIT BUY with client_order_id");
+    let r = request_case("order LIMIT BUY");
+    g.next_request_id = r["request_id"].as_u64().unwrap();
     let action = request(&mut g, operator(), request_of(&r)).unwrap();
     let answer = json!({
         "scheme": "Ed25519",
