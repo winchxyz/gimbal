@@ -245,11 +245,6 @@ fn is_orderly_perp(s: &str) -> bool {
             })
 }
 
-/// Checks of orders and transfers against a [`Policy`]. Each returns the refusal of interfaces §1.5
-/// (`E_ASSET`, `E_SIZE`, `E_PRICE_BAND`, `E_ORACLE_STALE`, `E_RESCUE_CAP`, …). They arrive with the
-/// methods that need them, starting with Hyperliquid orders; this module only fixes where they live.
-pub mod check {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
