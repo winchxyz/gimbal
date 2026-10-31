@@ -11,6 +11,7 @@ import {
   bytesToHex, exchangeBody, hlSignature, l1ConnectionId, l1Digest, msgpack, payloadDigest, recoverSigner, userSignedDigest,
 } from './hl-wire.ts';
 import type { MsgpackValue } from './hl-wire.ts';
+import { keccak256 } from 'viem';
 
 const VECTORS = fileURLToPath(new URL('../../../contract/core/tests/vectors/hl.json', import.meta.url));
 const v = JSON.parse(readFileSync(VECTORS, 'utf8'));
@@ -93,4 +94,44 @@ test('msgpack picks the smallest int and string forms and refuses floats', () =>
   assert.equal(hex('a'.repeat(31)).slice(0, 2), 'bf');
   assert.equal(hex('a'.repeat(32)).slice(0, 4), 'd920');
   assert.throws(() => msgpack(1.5), /safe integer/);
+});
+
+// expiresAfter (C6): the Python SDK's action_hash appends 0x00 and expiresAfter as u64 big-endian after the vault
+// byte. The digests below were computed outside the engine (viem's keccak256 and hashTypedData over the SDK's byte
+// layout and the vectors' msgpack, for the contract's tests in C6), at each case's nonce with expiresAfter = nonce +
+// 60 s; the connection id is also rebuilt here byte by byte from the vector's own msgpack_hex.
+const EXPIRING = [
+  {
+    name: 'cancel ETH oid 77 (fixint)',
+    connection: '0x615afe3d2a7e6a208a317396befbba2f096d833fba7c40380a32ddf9f661fb39',
+    mainnet: '0xf26ff7219889a502216f9a7022903ef0b5130f5330835427e798c503a5c9af98',
+    testnet: '0xd81f2e4e8f110e874e28493580e46b830d9dbdf808a221813aa3af4dd5476130',
+  },
+  {
+    name: 'ETH buy IOC, no cloid, fee 1 bp',
+    connection: '0x59db084d38b6d2e4d892ac3fc60b8e947f35b6c6c49ac523c579274a3228f7fb',
+    mainnet: '0x883ce8d2d8cc74e61980d19f3ac4c3c3f05aaf79e85a6ff2731a0000205bbc1d',
+    testnet: '0x6b4e114abfc4a56ec39875d230c9afa55aca3ef82374fe75b6849cb117302d86',
+  },
+];
+
+test('expiresAfter enters the L1 hash as the SDK writes it, and the payload digest reads it', () => {
+  for (const e of EXPIRING) {
+    const c = v.l1.cases.find((x: { name: string }) => x.name === e.name);
+    assert.ok(c, e.name);
+    const expires = c.nonce + 60_000;
+    const u64 = (n: number) => Buffer.from(BigInt(n).toString(16).padStart(16, '0'), 'hex');
+    const written = Buffer.concat([Buffer.from(c.msgpack_hex, 'hex'), u64(c.nonce), Buffer.from([0]), Buffer.from([0]), u64(expires)]);
+    assert.equal(keccak256(written), e.connection, e.name);
+    assert.equal(l1ConnectionId(c.action, c.nonce, expires), e.connection, e.name);
+    // Without it, the vector's own connection id.
+    assert.equal(l1ConnectionId(c.action, c.nonce), c.connection_id, e.name);
+    for (const network of ['mainnet', 'testnet'] as const) {
+      assert.equal(l1Digest(c.action, c.nonce, network, expires), e[network], `${e.name} ${network}`);
+      const payload: HlPayload = { action: c.action, nonce: c.nonce, vaultAddress: null, expiresAfter: expires };
+      assert.equal(payloadDigest(payload, network), e[network], `${e.name} ${network}`);
+      const body = exchangeBody(payload, { r: '0x01', s: '0x02', v: 27 });
+      assert.equal(body.expiresAfter, expires);
+    }
+  }
 });

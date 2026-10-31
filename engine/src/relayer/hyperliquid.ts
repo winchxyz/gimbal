@@ -48,6 +48,8 @@ export interface HlSubmitResult {
   tx: TxRef[];
   /** False when Hyperliquid accepted it but the fill or ledger entry did not show up within confirmMs (or /info failed). */
   confirmed: boolean;
+  /** The signed action's expiresAfter (ms; the contract stamps orders and cancels from C6 on), null without one. */
+  expiresAfter: number | null;
 }
 
 /** Hyperliquid refused the whole action (`{"status":"err"}`) or did not answer as expected. */
@@ -120,6 +122,7 @@ export class HyperliquidSubmitter {
     const actionType = signed.payload.action.type;
     const result: HlSubmitResult = {
       kind: signed.kind, statuses: response.statuses, oid: null, filled: null, resting: false, fills: [], tx: nearTx, confirmed: true,
+      expiresAfter: typeof signed.payload.expiresAfter === 'number' ? signed.payload.expiresAfter : null,
     };
 
     if (actionType === 'order') {
@@ -223,6 +226,7 @@ export class HyperliquidSubmitter {
 /** What reconciles a Hyperliquid action: the NEAR transaction, the first order's cloid, the action's nonce. */
 export function hlIds(signed: HlSignedAction): OutcomeIds {
   const ids: OutcomeIds = { hlNonce: signed.payload.nonce };
+  if (typeof signed.payload.expiresAfter === 'number') ids.hlExpiresAfter = signed.payload.expiresAfter;
   if (signed.nearTx !== undefined) ids.nearTx = signed.nearTx.id;
   const orders = (signed.payload.action as { orders?: { c?: unknown }[] }).orders;
   const cloid = Array.isArray(orders) ? orders.find((o) => typeof o?.c === 'string')?.c : undefined;

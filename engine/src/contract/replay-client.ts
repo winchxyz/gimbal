@@ -37,6 +37,8 @@ export interface ReplayContractConfig {
   /** OrderlyConfig. */
   orderlyBrokerId?: string;
   orderlyChainId?: number;
+  /** C6 and later: orders and cancels carry expiresAfter = block time + this (60 s); unset = C5, no expiry. */
+  hlExpiresAfterMs?: number;
 }
 
 export interface ReplayKeys {
@@ -232,7 +234,8 @@ export class ReplayContractClient implements ContractClient {
       type: 'sendAsset', signatureChainId: HL_SIGNATURE_CHAIN_ID, hyperliquidChain: this.#hlChain(),
       destination: q.depositAddress.toLowerCase(), sourceDex: '', destinationDex: 'spot',
       token: this.#config.network === 'mainnet' ? 'USDC:0x6d1e7cde53ba9467b783cb7c530ce054' : 'USDC:0xeb62eee3685fc4c43992febcd9e75443',
-      amount: unitsToDecimal(q.amountIn, 6), fromSubAccount: '', nonce,
+      // HyperCore USDC has 8 decimals in 1Click quotes, as the contract reads amountIn.
+      amount: unitsToDecimal(q.amountIn, 8), fromSubAccount: '', nonce,
     }, nonce);
   }
 
@@ -397,8 +400,9 @@ export class ReplayContractClient implements ContractClient {
 
   async #hlL1(deskId: string, kind: string, action: Record<string, MsgpackValue> & { type: string }): Promise<HlSignedAction> {
     const nonce = this.#hlNonce(deskId);
-    const digest = l1Digest(action, nonce, this.#config.network);
-    const payload: HlPayload = { action, nonce, vaultAddress: null };
+    const expires = this.#config.hlExpiresAfterMs !== undefined && (kind === 'order' || kind === 'cancel') ? this.#now() + this.#config.hlExpiresAfterMs : undefined;
+    const digest = l1Digest(action, nonce, this.#config.network, expires);
+    const payload: HlPayload = expires === undefined ? { action, nonce, vaultAddress: null } : { action, nonce, vaultAddress: null, expiresAfter: expires };
     return this.#action(deskId, 'hyperliquid', kind, payload, await this.#secp(deskId, digest)) as HlSignedAction;
   }
 

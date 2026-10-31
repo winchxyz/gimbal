@@ -48,6 +48,8 @@ export interface HlPayload {
   action: Record<string, unknown> & { type: string };
   nonce: number;
   vaultAddress?: null;
+  /** From C6: orders and cancels carry block time + 60 s (ms); Hyperliquid refuses the action after it. */
+  expiresAfter?: number;
 }
 
 /** `sol_sign` and friends: the message exactly as signed. */
@@ -139,6 +141,8 @@ export interface OutcomeIds {
   /** Hyperliquid: the order's client order id (orderStatus by cloid) and the action's nonce. */
   hlCloid?: string;
   hlNonce?: number;
+  /** The signed action's expiresAfter (ms): after it Hyperliquid refuses every copy, so the outcome is final. */
+  hlExpiresAfter?: number;
   /** Solana: the transaction signature (getSignatureStatuses with history). */
   solSignature?: string;
   /**
