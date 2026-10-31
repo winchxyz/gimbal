@@ -1,48 +1,101 @@
-// Captures the raw HTTP exchanges of one pass over the Hyperliquid reader, as a test fixture.
+// Captures the raw exchanges of one pass over a venue reader, as a test fixture.
 //   npm run capture -w engine -- --out fixtures/hl-wire/<name>.jsonl.gz [--testnet] [--address 0x...] [--coins ETH,BTC]
-// It calls markets, funding, a book per coin, and one unknown coin (to keep the venue's real answer to it).
-// With --address it adds that account's state and its whole funding history (all pages), from time 0.
-// Public data only.
+//   npm run capture -w engine -- --venue phoenix --out fixtures/phoenix-wire/<name>.jsonl.gz [--coins SOL,ETH,BTC]
+//       [--address <authority> [--view <trader key>] [--funding-since <ms>]]
+//   npm run capture -w engine -- --venue orderly --out fixtures/orderly-wire/<name>.jsonl.gz [--testnet] [--coins SOL,ETH,BTC]
+// Each pass calls markets, funding, a book per coin, and one unknown coin (to keep the venue's real answer to it).
+// Hyperliquid with --address adds that account's state and its whole funding history (all pages), from time 0.
+// Phoenix with --address adds that authority's trader snapshot, the venue's own computed view of the same trader
+// (--view, its trader key: tests check the margin math against it) and its funding history since --funding-since.
+// Orderly adds the funding-rate history of each coin over the last 3 days. Public data only.
 
 import { statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { HyperliquidReader } from '../venues/hyperliquid.ts';
+import { OrderlyReader, orderlySymbol } from '../venues/orderly.ts';
+import { PhoenixReader, PHOENIX_API_URL } from '../venues/phoenix.ts';
 import type { WireLine } from '../venues/recorder.ts';
-import { JsonlGzWriter, errorMessage, recordingFetch } from '../venues/recorder.ts';
+import { JsonlGzWriter, errorMessage, recordingFetch, recordingWsRequester } from '../venues/recorder.ts';
+import { WsRequestClient } from '../venues/ws.ts';
 
 const { values } = parseArgs({
   options: {
+    venue: { type: 'string', default: 'hl' },
     out: { type: 'string' },
     testnet: { type: 'boolean', default: false },
     address: { type: 'string' },
-    coins: { type: 'string', default: 'ETH,BTC' },
+    view: { type: 'string' },
+    'funding-since': { type: 'string' },
+    coins: { type: 'string' },
   },
 });
 
 if (values.out === undefined) fail('--out <path.jsonl.gz> is required');
 if (!values.out.endsWith('.jsonl.gz')) fail('--out must end in .jsonl.gz');
-const coins = values.coins.split(',').map((c) => c.trim()).filter((c) => c !== '');
+const venue = values.venue;
+if (venue !== 'hl' && venue !== 'phoenix' && venue !== 'orderly') fail('--venue must be hl, phoenix or orderly');
+if (venue === 'phoenix' && values.testnet) fail('phoenix has no public testnet API');
+const coins = (values.coins ?? (venue === 'hl' ? 'ETH,BTC' : 'SOL,ETH,BTC')).split(',').map((c) => c.trim()).filter((c) => c !== '');
 
 const out = resolve(values.out);
 const writer = new JsonlGzWriter<WireLine>(out);
-const reader = new HyperliquidReader({
-  network: values.testnet ? 'testnet' : 'mainnet',
-  fetch: recordingFetch(fetch, writer),
-});
+const wireFetch = recordingFetch(fetch, writer);
+let label: string;
 
-await step('markets', () => reader.markets());
-await step('funding', () => reader.funding());
-for (const coin of coins) await step(`book ${coin}`, () => reader.book(coin));
-await step('book NOT_A_COIN', () => reader.book('NOT_A_COIN'));   // expected to fail: the failure is what is recorded
-if (values.address !== undefined) {
-  const address = values.address;
-  await step('account', () => reader.account(address));
-  await step('userFunding', () => reader.userFunding(address, 0));
+if (venue === 'hl') {
+  const reader = new HyperliquidReader({ network: values.testnet ? 'testnet' : 'mainnet', fetch: wireFetch });
+  label = `hyperliquid ${reader.network}`;
+  await step('markets', () => reader.markets());
+  await step('funding', () => reader.funding());
+  for (const coin of coins) await step(`book ${coin}`, () => reader.book(coin));
+  await step('book NOT_A_COIN', () => reader.book('NOT_A_COIN'));   // expected to fail: the failure is what is recorded
+  if (values.address !== undefined) {
+    const address = values.address;
+    await step('account', () => reader.account(address));
+    await step('userFunding', () => reader.userFunding(address, 0));
+  }
+} else if (venue === 'phoenix') {
+  const reader = new PhoenixReader({ fetch: wireFetch });
+  label = 'phoenix mainnet';
+  await step('markets', () => reader.markets());
+  await step('funding', () => reader.funding());
+  for (const coin of coins) await step(`book ${coin}`, () => reader.book(coin));
+  await step('book NOT_A_COIN', () => reader.book('NOT_A_COIN'));
+  if (values.address !== undefined) {
+    const address = values.address;
+    await step('account', () => reader.account(address));
+    if (values.view !== undefined) {
+      const url = `${PHOENIX_API_URL}/v1/view/trader/${encodeURIComponent(values.view)}`;
+      await step('trader view', async () => (await wireFetch(url, { method: 'GET' })).json());
+    }
+    const since = Number(values['funding-since'] ?? Date.now() - 20 * 86_400_000);
+    if (!Number.isInteger(since)) fail('--funding-since must be a ms timestamp');
+    await step(`userFunding since ${new Date(since).toISOString()}`, () => reader.userFunding(address, since));
+  }
+} else {
+  const ws = new WsRequestClient();
+  const reader = new OrderlyReader({
+    network: values.testnet ? 'testnet' : 'mainnet',
+    fetch: wireFetch,
+    wsRequest: recordingWsRequester(ws.request, writer),
+  });
+  label = `orderly ${reader.network}`;
+  const symbols = coins.map(orderlySymbol);
+  try {
+    await step('markets', () => reader.markets());
+    await step('funding', () => reader.funding());
+    for (const symbol of symbols) await step(`book ${symbol}`, () => reader.book(symbol));
+    await step('book NOT_A_COIN', () => reader.book('NOT_A_COIN'));
+    const end = Date.now();
+    for (const symbol of symbols) await step(`funding history ${symbol}`, () => reader.marketFundingHistory(symbol, end - 3 * 86_400_000, end));
+  } finally {
+    ws.close();
+  }
 }
 
 await writer.close();
-console.log(`${reader.network}: ${writer.lines} exchanges, ${(statSync(out).size / 1024).toFixed(1)} KiB -> ${values.out}`);
+console.log(`${label}: ${writer.lines} exchanges, ${(statSync(out).size / 1024).toFixed(1)} KiB -> ${values.out}`);
 
 async function step(name: string, run: () => Promise<unknown>): Promise<void> {
   try {
