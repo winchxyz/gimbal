@@ -31,6 +31,11 @@ pub fn asset_of(symbol: &str) -> Option<&'static str> {
         .map(|(_, a)| *a)
 }
 
+/// The row of a policy symbol in [`ORACLE_ASSETS`].
+pub fn index_of(symbol: &str) -> Option<usize> {
+    ORACLE_ASSETS.iter().position(|(s, _)| *s == symbol)
+}
+
 /// The policy symbol of an oracle asset id.
 pub fn symbol_of(asset_id: &str) -> Option<&'static str> {
     ORACLE_ASSETS
@@ -104,12 +109,14 @@ mod tests {
         let mut sorted = symbols.clone();
         sorted.sort_unstable();
         assert_eq!(symbols, sorted);
-        for (symbol, id) in ORACLE_ASSETS {
+        for (i, (symbol, id)) in ORACLE_ASSETS.into_iter().enumerate() {
             assert_eq!(asset_of(symbol), Some(id));
             assert_eq!(symbol_of(id), Some(symbol));
+            assert_eq!(index_of(symbol), Some(i));
         }
         assert_eq!(asset_of("HYPE"), None);
         assert_eq!(symbol_of("wrap.near"), None);
+        assert_eq!(index_of("HYPE"), None);
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub use gimbal_core::Refusal;
 
 use gimbal_core::errors::{shown, E_ARGS, E_DESK_EXISTS, E_NO_DESK};
 use gimbal_core::ids::{check_desk_id, check_evm_address, decode_base58_32, MPC_DOMAIN_SECP256K1};
+use gimbal_core::oracle::ORACLE_ASSETS;
 use gimbal_core::policy::Policy;
 use near_sdk::store::LookupMap;
 use near_sdk::{
@@ -115,6 +116,10 @@ pub struct Gimbal {
     next_request_id: u64,
     /// Policy symbol → its last stored oracle price ([`prices`]).
     prices: LookupMap<String, StoredPrice>,
+    /// The block time `refresh_prices` last asked the oracle for each symbol of [`ORACLE_ASSETS`],
+    /// in the table's order, ms (0 before the first), so asking again within
+    /// [`prices::REFRESH_SKIP_MS`] spends nothing even when no answer was stored.
+    price_asked_ms: [u64; ORACLE_ASSETS.len()],
     /// Desk id → its rescue window and EIP-3009 counter ([`rescue`]). Stored with the desk, like
     /// its nonce entry, so an action never adds storage.
     desk_counters: LookupMap<String, DeskCounters>,
@@ -152,6 +157,7 @@ impl Gimbal {
             hl_nonces: LookupMap::new(StorageKey::HlNonces),
             next_request_id: 0,
             prices: LookupMap::new(StorageKey::Prices),
+            price_asked_ms: [0; ORACLE_ASSETS.len()],
             desk_counters: LookupMap::new(StorageKey::DeskCounters),
         }
     }
@@ -192,7 +198,7 @@ impl Gimbal {
         }
         check_evm_address("evm_address", &evm_address).or_fail();
         solana.check().or_fail();
-        policy.validate().or_fail();
+        policy.validate_for(self.config.network).or_fail();
 
         let desk = Desk::new(
             owner,
@@ -300,7 +306,7 @@ impl Gimbal {
         let attached = env::attached_deposit();
         let desk = owner_desk_mut(&mut self.desks, &desk_id, "set_policy");
         check_some_deposit("set_policy", attached).or_fail();
-        policy.validate().or_fail();
+        policy.validate_for(self.config.network).or_fail();
         let sha = policy_sha256(&policy);
         let before = env::storage_usage();
         desk.policy = policy;

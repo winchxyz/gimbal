@@ -238,11 +238,12 @@ fn pinned(a: &[Pubkey], n: usize, layout: &[(usize, Pubkey, &str)]) -> Result<()
     Ok(())
 }
 
-/// A token transfer's amount (`amount`, 8 little-endian bytes) is not 0 (`E_SOL_PROGRAM`): an
-/// empty transfer moves nothing and would only pass a paused desk's gate.
-fn moves_something(amount: &[u8], n: usize) -> Result<(), Refusal> {
+/// The amount (8 little-endian bytes) of a token transfer, a Phoenix withdraw or an Ember unwrap
+/// (`what`) is not 0 (`E_SOL_PROGRAM`): an empty one moves nothing and would only pass a paused
+/// desk's gate.
+fn moves_something(amount: &[u8], what: &str, n: usize) -> Result<(), Refusal> {
     if le_u64(amount) == 0 {
-        return Err(at(n, E_SOL_PROGRAM, "a token transfer of 0"));
+        return Err(at(n, E_SOL_PROGRAM, format!("{what} of 0")));
     }
     Ok(())
 }
@@ -623,7 +624,7 @@ impl<'a> Walk<'a> {
                 }
                 // source, destination, owner
                 let a = accounts(ix, n, 3)?;
-                moves_something(&ix.data[1..9], n)?;
+                moves_something(&ix.data[1..9], "a token transfer", n)?;
                 if !d.is_token_account(&a[1]) {
                     return Err(self.foreign_destination(&a[1], n));
                 }
@@ -636,7 +637,7 @@ impl<'a> Walk<'a> {
                 }
                 // source, mint, destination, owner
                 let a = accounts(ix, n, 4)?;
-                moves_something(&ix.data[1..9], n)?;
+                moves_something(&ix.data[1..9], "a token transfer", n)?;
                 if d.is_token_account(&a[2]) {
                     self.rescue_pause_ok = false;
                     return not_into_itself(&a[0], &a[2], n);
@@ -732,7 +733,10 @@ impl<'a> Walk<'a> {
         if disc == Some(&EMBER_WITHDRAW[..]) {
             // An Option<u64>: 1 and the amount, or 0 for the whole balance.
             let amount = match (ix.data.get(8), ix.data.len()) {
-                (Some(1), 17) => Some(le_u64(&ix.data[9..])),
+                (Some(1), 17) => {
+                    moves_something(&ix.data[9..], "an Ember unwrap", n)?;
+                    Some(le_u64(&ix.data[9..]))
+                }
                 (Some(0), 9) => None,
                 _ => return Err(at(n, E_SOL_PROGRAM, "a malformed Ember withdraw")),
             };
@@ -870,6 +874,7 @@ impl<'a> Walk<'a> {
                     return Err(malformed("withdraw_funds"));
                 }
                 let a = exactly(ix, n, 12)?;
+                moves_something(&ix.data[8..16], "a Phoenix withdraw", n)?;
                 pinned(a, n, &head)?;
                 pinned(
                     a,

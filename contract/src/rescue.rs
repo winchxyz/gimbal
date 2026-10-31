@@ -27,7 +27,7 @@ use gimbal_core::hl::{usdc_token, Address, UserAction};
 use gimbal_core::ids::{check_base58_32, check_reason};
 use gimbal_core::oneclick::{
     check_cost, rescue_cost_budget_e8, transfer_cost_e8, verify_quote, Context, DeskAddresses,
-    Method, VerifiedQuote,
+    Method, VerifiedQuote, QUOTE_PAYABLE_MS,
 };
 use gimbal_core::phoenix::{check_message, Rescue};
 use near_sdk::{env, near, Promise};
@@ -44,10 +44,12 @@ use crate::{action_desk, desk_ref, fail, take_hl_nonce, Gimbal, GimbalExt, OrFai
 pub const RESCUE_WINDOW_MS: u64 = 3_600_000;
 
 /// How many deposit addresses a desk remembers: a quote pays once, so a rescue to an address one
-/// of the desk's last 32 rescues paid is refused.
+/// of the desk's last 32 rescues paid is refused. A slot is reused only once its address was paid
+/// more than [`QUOTE_PAYABLE_MS`] ago, when no quote can pay it any more ([`DeskCounters::held`]):
+/// a desk makes at most 32 rescues in any 65 min.
 pub const DEPOSIT_RING: usize = 32;
 
-/// What the contract counts per desk besides its Hyperliquid nonce. Fixed size (1.1 KB), stored
+/// What the contract counts per desk besides its Hyperliquid nonce. Fixed size (1.3 KB), stored
 /// by `create_desk`, so an action rewrites it without adding storage.
 ///
 /// The two meters hold the weight of the desk's rescues at `rescue_at_ms`; at a later time each
@@ -71,6 +73,8 @@ pub struct DeskCounters {
     pub deposits: [[u8; 32]; DEPOSIT_RING],
     /// The slot the next deposit address takes, the oldest one's.
     pub deposit_next: u8,
+    /// Block time (ms) each slot's address was paid; 0 for an unused slot.
+    pub deposit_paid_ms: [u64; DEPOSIT_RING],
 }
 
 /// `weight`, a meter's value at `since_ms`, at `now_ms`: falling linearly to 0 over
@@ -110,14 +114,27 @@ impl DeskCounters {
         self.deposits.contains(deposit_sha256)
     }
 
+    /// When the address in the slot the next rescue takes was paid, while that is
+    /// [`QUOTE_PAYABLE_MS`] or less before `now_ms`: a quote may still pay that address then
+    /// (paid at its earliest, 5 min before its `timestamp`, it stays payable until 60 min after),
+    /// so forgetting it would let the quote pay it twice. `None` for an unused slot or one paid
+    /// longer ago, which the next rescue may take.
+    pub fn held(&self, now_ms: u64) -> Option<u64> {
+        let slot = usize::from(self.deposit_next) % DEPOSIT_RING;
+        let paid_ms = self.deposit_paid_ms[slot];
+        let used = self.deposits[slot] != [0; 32];
+        (used && now_ms.saturating_sub(paid_ms) <= QUOTE_PAYABLE_MS).then_some(paid_ms)
+    }
+
     /// Counts a rescue of `amount_e8` that may cost `cost_e8`, to the deposit address hashing to
-    /// `deposit_sha256`, at `now_ms`.
+    /// `deposit_sha256`, at `now_ms`. The caller checked [`Self::held`] first.
     pub fn spend(&mut self, amount_e8: u128, cost_e8: u128, deposit_sha256: [u8; 32], now_ms: u64) {
         self.rescue_spent_e8 = self.spent_e8(now_ms).saturating_add(amount_e8);
         self.rescue_cost_e8 = self.cost_e8(now_ms).saturating_add(cost_e8);
         self.rescue_at_ms = now_ms;
         let slot = usize::from(self.deposit_next) % DEPOSIT_RING;
         self.deposits[slot] = deposit_sha256;
+        self.deposit_paid_ms[slot] = now_ms;
         self.deposit_next = u8::try_from((slot + 1) % DEPOSIT_RING).unwrap_or(0);
     }
 }
@@ -146,11 +163,13 @@ impl Gimbal {
     /// `"spot"`), the network's USDC token, the desk's next nonce. The quote: a live 1Click quote
     /// of HyperCore USDC, signed by 1Click (`E_QUOTE_SIGNATURE`), into another asset, paying a
     /// desk address, the pinned Orderly receiver or the contract for the desk, refunds to the
-    /// desk's EVM address, a deposit address none of the desk's last 32 rescues paid, within the
+    /// desk's EVM address, signed at most 1 h before the block time (5 min after it), before its
+    /// deadline, a deposit address none of the desk's last 32 rescues paid, within the
     /// policy's transfer cost, with an `amountIn` Hyperliquid's perp balance can send (at most 6
     /// decimals) (`E_QUOTE_FIELDS`), within what is left of the hourly cap and of the hourly cost
     /// budget, which counts the quote's cost, not Hyperliquid's 1 USDC send fee
-    /// ([`transfer_cost_e8`]) (`E_RESCUE_CAP`). Owner or operator, also on a paused desk. `kind`
+    /// ([`transfer_cost_e8`]), and not a 33rd rescue within 65 min ([`DEPOSIT_RING`])
+    /// (`E_RESCUE_CAP`). Owner or operator, also on a paused desk. `kind`
     /// `sendAsset`; a user-signed action, so no
     /// `expiresAfter`: the nonce window bounds a late signature.
     #[deny_unknown_arguments]
@@ -211,8 +230,10 @@ impl Gimbal {
 
 impl Gimbal {
     /// The quote checked for `method` on the desk at the block time: [`verify_quote`] (with what
-    /// is left of the desk's cap), then [`check_cost`] at the policy's bounds. The build step
-    /// counts it ([`Self::counted_rescue`]).
+    /// is left of the desk's cap; it also bounds the quote's age, so a quote is payable for
+    /// [`QUOTE_PAYABLE_MS`] at most), then [`check_cost`] at the policy's bounds. The build step
+    /// counts it ([`Self::counted_rescue`]), whose deposit ring keeps every address it paid for at
+    /// least that long.
     pub fn verified_quote(
         &self,
         desk_id: &str,
@@ -250,9 +271,11 @@ impl Gimbal {
 
     /// The desk's counters with the verified rescue `q` counted at the block time, or the
     /// refusal: `E_QUOTE_FIELDS` for a deposit address one of the desk's last [`DEPOSIT_RING`]
-    /// rescues paid (a quote pays once), `E_RESCUE_CAP` for an amount over what is left of the
-    /// hourly cap or a cost ([`transfer_cost_e8`]) over what is left of the hourly cost budget
-    /// ([`rescue_cost_budget_e8`] of the policy's cap and transfer cost bounds). Writes nothing:
+    /// rescues paid (a quote pays once), `E_RESCUE_CAP` for a 33rd rescue within 65 min (it would
+    /// forget an address a quote can still pay, [`DeskCounters::held`]), an amount over what is
+    /// left of the hourly cap or a cost ([`transfer_cost_e8`]) over what is left of the hourly
+    /// cost budget ([`rescue_cost_budget_e8`] of the policy's cap and transfer cost bounds), each
+    /// a limit on how much the desk rescues in a stretch of time. Writes nothing:
     /// each build step stores the result once all its checks passed. Nothing is ever given back
     /// (module doc).
     pub fn counted_rescue(&self, desk_id: &str, q: &VerifiedQuote) -> DeskCounters {
@@ -265,6 +288,17 @@ impl Gimbal {
             fail_fields(format!(
                 "deposit address {deposit} was paid by one of this desk's last {DEPOSIT_RING} \
                  rescues; a quote pays once"
+            ));
+        }
+        if let Some(paid_ms) = counters.held(now_ms) {
+            fail(Refusal::new(
+                E_RESCUE_CAP,
+                format!(
+                    "this desk's last {DEPOSIT_RING} rescues were paid within 65 min, the oldest \
+                     at {paid_ms} ms: a quote can pay its deposit address again until {} ms, so \
+                     the next rescue waits until after then",
+                    paid_ms.saturating_add(QUOTE_PAYABLE_MS)
+                ),
             ));
         }
         let cap_left = counters.remaining_cap_e8(policy.rescue_cap_usd_per_hour, now_ms);
