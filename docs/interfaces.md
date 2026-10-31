@@ -21,7 +21,8 @@ struct ReferralCodes {                 // fixed in `new`; None = that venue's st
                                        // first order; None on testnet unless the code exists on HL testnet
     orderly: Option<String>,           // ORDERLY_REFERRAL_CODE: bound once per desk (`referral_bind`, permanent); it must
                                        // belong to `OrderlyConfig.broker_id`; None if Gimbal runs its own broker
-    phoenix: Option<String>,           // PHOENIX_INVITE_CODE: Phoenix's invite gate before trader registration
+    phoenix: Option<String>,           // PHOENIX_REFERRAL_CODE: bound once per desk after registration; it travels in
+                                       // the `referral/activate-tx` HTTP body, not in the signed bytes (§1.3)
 }
 struct OrderlyConfig {
     broker_id: String,                 // testnet "woofi_dex"; mainnet: Gimbal's broker id
@@ -153,9 +154,12 @@ chooses nothing:
 - Hyperliquid: `hl_set_referrer` (if a code is set), `hl_approve_builder_fee`.
 - Orderly: `orderly_register`, `orderly_add_key`, the `receiver_address` lookup (the owner then pins it), and
   `referral_bind` (if a code is set).
-- Phoenix: wallet login (`phoenix_sign_login`), `POST /v1/invite/validate {code, wallet_address}` with
-  `referral_codes.phoenix` (body: verify on day 6), then `sol_sign_register`. The invite call itself is not signed
-  by the desk, so the contract cannot enforce that code; it only gates access.
+- Phoenix (no wallet login, no invite): `POST /v1/exchange/build-register-ixs` with the desk as authority and fee
+  payer, `sol_sign_register` over the compiled message, then `send-register-ixs` (Phoenix's onboarder
+  co-signs). If `referral_codes.phoenix` is set, `referral/activate-tx` with that code in the HTTP body; its
+  transaction is signed through `sol_sign_register` too. The code is not in the signed bytes, so the contract
+  cannot enforce it; the engine sends only the configured code. Verify on day 6 whether `activate-tx` still
+  binds a code after registration (it may answer `already_activated`).
 
 | Method | Owner | Operator | Notes |
 |---|---|---|---|
@@ -176,8 +180,7 @@ chooses nothing:
 | `hl_usd_class_transfer(desk_id, amount, to_perp, reason)` | ✓ | ✓ | |
 | `hl_send_to_intents(desk_id, quote, quote_signature, reason)` | ✓ | ✓ | rescue out of Hyperliquid |
 | `sol_sign(desk_id, message_b64, reason)` | ✓ | ✓ | Phoenix / Ember / own transfers |
-| `sol_sign_register(desk_id, message_b64)` | ✓ | ✓ | Phoenix trader registration only: `register_trader` + `set_trader_capabilities_delegated`, two signers (desk + Phoenix's pinned onboarder) |
-| `phoenix_sign_login(desk_id, message)` | ✓ | ✓ | Ed25519 over Phoenix's `/v1/auth/*` wallet-login message only, before the invite check and registration; the contract accepts only Phoenix's login template (`E_ARGS` otherwise). Template and endpoints: verify on day 4 |
+| `sol_sign_register(desk_id, message_b64)` | ✓ | ✓ | Phoenix onboarding only, two shapes: registration (`register_trader` + `set_trader_capabilities_delegated`) and referral activation (`set_trader_capabilities_delegated` alone); legacy or v0 with no address-table lookups; two signers, keys[0] = the desk as fee payer and Phoenix's pinned onboarder (the desk authority itself is not a signer of `register_trader`); accounts are checked through each instruction's positions, instruction data is pinned |
 | `sol_sign_rescue(desk_id, message_b64, quote, quote_signature, reason)` | ✓ | ✓ | rescue out of Solana |
 | `orderly_register(desk_id, registration_nonce)` | ✓ | ✓ | EIP-712 `Registration` (nonce from `GET /v1/registration_nonce`, block time as timestamp, broker and chain from `OrderlyConfig`) |
 | `orderly_add_key(desk_id, expiration_ms)` | ✓ | ✓ | EIP-712 `AddOrderlyKey`: the desk's Ed25519 MPC key as orderly key, scope `read,trading`, ≤ 365 days |
@@ -386,7 +389,7 @@ export interface SetupProgress {   // venue setup the engine runs through operat
   deskId: string;
   steps: {
     step: 'hl_set_referrer' | 'hl_approve_builder_fee' | 'orderly_register' | 'orderly_add_key'
-        | 'orderly_receiver_lookup' | 'orderly_referral_bind' | 'phoenix_login' | 'phoenix_invite' | 'phoenix_register';
+        | 'orderly_receiver_lookup' | 'orderly_referral_bind' | 'phoenix_register' | 'phoenix_referral';
     status: 'pending' | 'running' | 'done' | 'skipped' | 'failed';
     detail?: string; tx: TxRef[];
   }[];
@@ -439,6 +442,12 @@ export interface JournalEntry {
       | 'deposit' | 'withdraw' | 'fee';
   summary: string;                // one line, written by the engine
   why?: string;                   // optional plain-language reason from NEAR AI; never used for decisions
+  // Keys the web reads; numbers may come as decimal strings ("1050.00"). Every key is optional.
+  //   usd                     the signed money effect in USD (income > 0, cost < 0)
+  //   feeUsd                  a fee on top of `usd`, ≤ 0
+  //   unpriced, venue         1 or "true" when an order went out without the oracle price band, and on which venue
+  //   from, signedS, landedS  on a rescue: "reserve" or the venue id the margin came from, then the seconds the
+  //                           MPC signature and the landing took
   numbers: Record<string, number | string>;
   tx: TxRef[];
 }
@@ -468,7 +477,7 @@ export interface EngineState {
   scan: ScanStatus | null;
   strategy: StrategyConfig | null;   // as GET /strategy returns it
   desk: DeskState | null;
-  journal: JournalEntry[];        // the most recent entries, newest first, at most 100
+  journal: JournalEntry[];        // the most recent entries, newest first, at most 100; older: GET /journal?before=<id>
   rescue: RescueProgress | null;  // the running rescue, else the last one
   setup: SetupProgress | null;
   health: HealthMap | null;
@@ -480,7 +489,8 @@ HTTP (engine, port 8790): `GET /events` (SSE, one `StreamEvent` per message), `G
 `GET /windows/history?id=<window id>` (`WindowHistory`, for the Windows chart; kept out of the stream because
 it is 168 points per window), `POST /stress` (testnet and replay only: tighten the margin threshold to force a rescue; 1Click has
 no testnet, so on testnet the rescue's 1Click steps are replayed from recorded mainnet responses),
-`POST /policy/draft` `{ text }` → `PolicyDraft` (NEAR AI; nothing is applied until the owner signs `set_policy`
+`GET /journal?before=<id>` (`JournalEntry[]`: up to 100 entries older than that id, newest first; `[]` past the
+oldest), `POST /policy/draft` `{ text }` → `PolicyDraft` (NEAR AI; nothing is applied until the owner signs `set_policy`
 and confirms the engine rules), `GET` / `PUT /strategy` (`StrategyConfig`), `POST /setup` `{ deskId }` (starts
 venue setup; progress arrives as `setup` events), `POST /rotate` `{ windowId }` (manual override: close the held
 window and open this one, with the same checks as auto; refused with the reason when a check fails) and

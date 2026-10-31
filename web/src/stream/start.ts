@@ -21,14 +21,20 @@ export async function startStream(): Promise<() => void> {
 
 let api: Promise<EngineApi> | null = null;
 
+/** The development fake: strategy and history from fake-windows.ts, the journal's backlog for the `?state=` scenario. */
+async function fakeEngineApi(search: string): Promise<EngineApi> {
+  const [{ fakeApi }, { fakeJournalRead }] = await Promise.all([import('./fake-windows.ts'), import('./fake-journal.ts')]);
+  return fakeApi(fakeJournalRead(pickFakeScenario(search), pickFakeMode(search)));
+}
+
 /**
- * The engine's HTTP reads (`GET /strategy`, `GET /windows/history`), from the same source as the stream: the
+ * The engine's HTTP reads (`GET /strategy`, `GET /windows/history`, `GET /state`), from the same source as the stream: the
  * fake in development by default, the engine otherwise. This is the one place the live-data task changes.
  */
 export function engineApi(): Promise<EngineApi> {
   api ??=
     import.meta.env.DEV && pickSource(window.location.search, true) === 'fake'
-      ? import('./fake-windows.ts').then((m) => m.fakeApi())
+      ? fakeEngineApi(window.location.search)
       : Promise.resolve(httpApi());
   return api;
 }

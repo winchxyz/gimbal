@@ -2,25 +2,22 @@
 // rules in design/HANDOFF.md (Desk) are tested without a browser.
 import type { DeskState, JournalEntry, Leg, StrategyConfig, VenueId, Window as FundingWindow } from '@gimbal/shared';
 import { VENUE_NAMES } from '../shell/status.ts';
-import { dayMonthTime, hours, plain, usd, venueName } from '../windows/format.ts';
+import { amountUsd, clock, proofLinks, unprotectedText } from '../journal/entry.ts';
+import { dayMonthTime, hours, pct, plain, usd } from '../windows/format.ts';
 import { heldWindow, isEnterable, sortWindows, venuePair } from '../windows/model.ts';
 import { perDayOnLegs } from '../windows/decision.ts';
 import { price, qty, ratioPct, signedQty, signedUsd } from './format.ts';
 
 /**
- * Where the desk starts a rescue and where it warns, in % of price from liquidation. The mockup states them
- * under each leg ("Rescue starts at 8%, a warning at 15%"). Neither `DeskState` nor `StrategyConfig` carries
- * them yet, so they are fixed here until the engine publishes its risk thresholds.
+ * Where the desk warns and where it starts a rescue, in % of price from liquidation: the owner's own numbers
+ * (`StrategyConfig.risk`). The mockup states them under each leg ("Rescue starts at 8%, a warning at 15%").
+ * Null until the strategy has been read: the line is left out rather than showing numbers that may be wrong.
  */
-export const RESCUE_AT_PCT = 8;
-export const WARN_AT_PCT = 15;
-export const THRESHOLD_TEXT = `Rescue starts at ${RESCUE_AT_PCT}%, a warning at ${WARN_AT_PCT}%.`;
-
-/**
- * Net exposure is level while the legs differ by less than this share of the larger leg: each venue trades in
- * its own lot size, so an exact zero is not expected. `DeskState` has no lot size, hence a share.
- */
-export const DRIFT_SHARE = 0.01;
+export function thresholdText(risk: StrategyConfig['risk'] | null | undefined): string | null {
+  if (!risk) return null;
+  const at = (n: number) => pct(n, Number.isInteger(n) ? 0 : 1);
+  return `Rescue starts at ${at(risk.rescueDistancePct)}, a warning at ${at(risk.watchDistancePct)}.`;
+}
 
 // ---------- the two halves ----------
 
@@ -51,7 +48,7 @@ export function moveText(leg: Leg): string {
 export const sizeText = (leg: Leg): string => `${leg.side === 'short' ? 'Short' : 'Long'} ${qty(Math.abs(leg.size))} ${leg.symbol}`;
 
 export interface LegRow {
-  key: 'entry' | 'margin' | 'ratio' | 'funding' | 'unsettled' | 'next';
+  key: 'entry' | 'margin' | 'ratio' | 'funding' | 'fees' | 'unsettled' | 'next';
   label: string;
   value: string;
   tone: 'pos' | 'neg' | null;
@@ -65,6 +62,8 @@ export function legRows(leg: Leg, now: number): LegRow[] {
     { key: 'margin', label: 'Margin', value: `${usd(leg.marginUsd)} · ratio ${ratioPct(leg.marginRatio)}`, tone: null, only: 'phone' },
     { key: 'ratio', label: 'Margin ratio', value: ratioPct(leg.marginRatio), tone: null, only: 'desktop' },
     { key: 'funding', label: 'Funding earned', value: signedUsd(leg.fundingEarnedUsd), tone: moneyTone(leg.fundingEarnedUsd), only: null },
+    // `feesUsd` is a cost, so it is negative and shows as −$0.48; a cost has no colour of its own
+    { key: 'fees', label: 'Fees paid', value: signedUsd(leg.feesUsd), tone: null, only: null },
     { key: 'unsettled', label: 'Unsettled funding', value: signedUsd(leg.unsettledFundingUsd, 3), tone: null, only: null },
     { key: 'next', label: 'Next funding', value: nextFunding(leg.venue, now), tone: null, only: null },
   ];
@@ -95,15 +94,25 @@ export function nextFunding(venue: VenueId, now: number): string {
 export interface Exposure {
   /** `0 DOGE`, `+120 DOGE` */
   text: string;
-  /** The legs differ by more than `DRIFT_SHARE` of the larger one: shown in --watch. */
+  /** The legs differ by more than one lot: shown in --watch. */
   drift: boolean;
   explain: string;
 }
 
+/**
+ * How far the legs may differ and still count as level: one lot (`Leg.lotSize`, base units). Each venue trades in
+ * its own lot, so a hedge can only be as exact as the coarser one; an exact zero is not expected. Without legs
+ * there is nothing to drift.
+ */
+export function lotLimit(legs: readonly Leg[]): number {
+  return Math.max(0, ...legs.map((l) => l.lotSize));
+}
+
 export function exposureOf(desk: Pick<DeskState, 'legs' | 'netDelta'>): Exposure {
   const symbol = desk.legs[0]?.symbol ?? '';
-  const largest = Math.max(0, ...desk.legs.map((l) => Math.abs(l.size)));
-  const drift = Math.abs(desk.netDelta) > DRIFT_SHARE * largest;
+  const limit = lotLimit(desk.legs);
+  // `netDelta` is a sum of sizes in base units, so it can be a rounding error above exactly one lot
+  const drift = Math.abs(desk.netDelta) > limit * (1 + 1e-9);
   return {
     text: `${signedQty(desk.netDelta)} ${symbol}`.trim(),
     drift,
@@ -197,38 +206,20 @@ const SAME_DAY = 86_400_000;
 /** `Today 14:00` for an event from today (UTC), else `24 Oct 23:41` */
 export function whenLabel(t: number, now: number): string {
   const full = dayMonthTime(t);
-  return Math.floor(t / SAME_DAY) === Math.floor(now / SAME_DAY) ? `Today ${full.slice(-5)}` : full;
-}
-
-/**
- * An order sent without the oracle price band. The engine marks the journal entry with `numbers.unpriced`
- * (1 or "true") and may name the venue in `numbers.venue`; the contract's `signed` event carries the same flag.
- */
-export function unprotectedText(entry: JournalEntry): string | null {
-  const flag = entry.numbers.unpriced;
-  if (flag !== 1 && flag !== '1' && flag !== 'true') return null;
-  const venue = entry.numbers.venue;
-  return typeof venue === 'string' && venue.length > 0 ? `${venueName(venue)} leg sent without price protection` : 'Sent without price protection';
+  return Math.floor(t / SAME_DAY) === Math.floor(now / SAME_DAY) ? `Today ${clock(t)}` : full;
 }
 
 /** The most recent journal entries, newest first: the engine sends them in that order. */
 export function latestEvents(journal: readonly JournalEntry[], now: number, limit = 3): EventRow[] {
   return journal.slice(0, limit).map((e) => {
-    const first = e.tx[0];
+    const links = proofLinks(e.tx);
+    const first = links[0];
     const proof = first
-      ? { label: e.tx.length === 1 ? 'on-chain ↗' : `${e.tx.length} transactions ↗`, href: first.url }
+      ? { label: links.length === 1 ? 'on-chain ↗' : `${links.length} transactions ↗`, href: first.href }
       : e.why
         ? { label: 'Why ↗', href: '#/journal' }
         : null;
-    const usdNumber = e.numbers.usd;
-    return {
-      id: e.id,
-      when: whenLabel(e.t, now),
-      text: e.summary,
-      amountUsd: typeof usdNumber === 'number' ? usdNumber : null,
-      proof,
-      unprotected: unprotectedText(e),
-    };
+    return { id: e.id, when: whenLabel(e.t, now), text: e.summary, amountUsd: amountUsd(e), proof, unprotected: unprotectedText(e) };
   });
 }
 

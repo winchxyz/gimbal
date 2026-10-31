@@ -79,7 +79,7 @@ export interface SetupProgress {   // venue setup the engine runs through operat
   deskId: string;
   steps: {
     step: 'hl_set_referrer' | 'hl_approve_builder_fee' | 'orderly_register' | 'orderly_add_key'
-        | 'orderly_receiver_lookup' | 'orderly_referral_bind' | 'phoenix_login' | 'phoenix_invite' | 'phoenix_register';
+        | 'orderly_receiver_lookup' | 'orderly_referral_bind' | 'phoenix_register' | 'phoenix_referral';
     status: 'pending' | 'running' | 'done' | 'skipped' | 'failed';
     detail?: string; tx: TxRef[];
   }[];
@@ -132,6 +132,12 @@ export interface JournalEntry {
       | 'deposit' | 'withdraw' | 'fee';
   summary: string;                // one line, written by the engine
   why?: string;                   // optional plain-language reason from NEAR AI; never used for decisions
+  // Keys the web reads; numbers may come as decimal strings ("1050.00"). Every key is optional.
+  //   usd                     the signed money effect in USD (income > 0, cost < 0)
+  //   feeUsd                  a fee on top of `usd`, ≤ 0
+  //   unpriced, venue         1 or "true" when an order went out without the oracle price band, and on which venue
+  //   from, signedS, landedS  on a rescue: "reserve" or the venue id the margin came from, then the seconds the
+  //                           MPC signature and the landing took
   numbers: Record<string, number | string>;
   tx: TxRef[];
 }
@@ -161,7 +167,7 @@ export interface EngineState {
   scan: ScanStatus | null;
   strategy: StrategyConfig | null;   // as GET /strategy returns it
   desk: DeskState | null;
-  journal: JournalEntry[];        // the most recent entries, newest first, at most 100
+  journal: JournalEntry[];        // the most recent entries, newest first, at most 100; older: GET /journal?before=<id>
   rescue: RescueProgress | null;  // the running rescue, else the last one
   setup: SetupProgress | null;
   health: HealthMap | null;

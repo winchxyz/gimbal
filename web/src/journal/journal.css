@@ -1,0 +1,152 @@
+/* Journal screen. The layout follows design/screens/desktop/journal.html (1440 px) and phone/journal.html (390 px)
+   with the numbers of design/screens/shared/stage.css and phone.css; every value comes from tokens.css.
+   Colour means state only; a line separates rows or shows data. */
+
+/* What only the phone or only the desktop draws. The flag beats the display a rule on the element itself sets. */
+@media (min-width: 1024px) { .j-phone { display: none !important; } }
+@media (max-width: 1023px) { .j-desk { display: none !important; } }
+
+/* ---------- head: title, one sentence, Export CSV; then the filters ---------- */
+.j-top { padding: 40px var(--gutter) 0; display: flex; justify-content: space-between; align-items: flex-end; gap: var(--s-5); }
+.j-top h1 { font: var(--t-display); letter-spacing: var(--track-display); }
+.j-top h1 + p { margin: 14px 0 0; color: var(--ink-2); }
+.j-top h1 + p b { color: var(--ink); font-weight: 400; }
+.j-top .btn { flex: none; }
+.j-top .btn:disabled { opacity: .4; cursor: default; }
+.j-top .btn:disabled:hover { background: none; }
+
+.j-filters { display: flex; gap: 28px; padding: 0 var(--gutter); margin-top: 32px; border-bottom: 1px solid var(--line); }
+.j-filters button { color: var(--ink-2); padding-bottom: 14px; white-space: nowrap; transition: color var(--dur) var(--ease); }
+.j-filters button:hover { color: var(--ink); }
+.j-filters button .n { color: var(--ink-3); margin-left: 6px; }
+.j-filters button:disabled { cursor: default; }
+.j-filters button[aria-pressed='true'] { color: var(--ink); box-shadow: inset 0 -2px 0 var(--ink); }
+
+.j-grid { display: grid; grid-template-columns: minmax(0, 1fr) 400px; }
+
+/* ---------- the feed ---------- */
+.j-feed { padding: 0 48px 64px var(--gutter); border-right: 1px solid var(--line); min-width: 0; }
+.j-day { font: var(--t-s); color: var(--ink-2); padding: 28px 0 10px; border-bottom: 1px solid var(--line-2); display: flex; justify-content: space-between; gap: var(--s-4); }
+.j-day h2 { font: inherit; }
+
+.j-evt { display: grid; grid-template-columns: 56px 88px minmax(0, 1fr) 104px 200px; column-gap: var(--s-4); padding: var(--s-4) 0; border-bottom: 1px solid var(--line); align-items: baseline; }
+.j-lead { display: contents; }
+.j-lead .sep { display: none; }
+.j-evt .t { font: var(--t-s); color: var(--ink-3); }
+.j-evt .k { font: var(--t-s); color: var(--ink-2); }
+.j-evt .k.watch { color: var(--watch); }
+.j-evt .k.danger { color: var(--danger); }
+.j-evt .k.ink { color: var(--ink); }
+.j-evt .what { min-width: 0; overflow-wrap: anywhere; }
+.j-evt .why { display: block; font: var(--t-s); color: var(--ink-2); margin-top: 6px; }
+.j-evt .why.flag { color: var(--watch); }
+.j-evt .why.flag::before { content: ''; display: inline-block; width: 6px; height: 6px; border-radius: var(--r-dot); background: var(--watch); margin-right: var(--s-2); vertical-align: 1px; }
+.j-evt .amt { text-align: right; min-width: 0; }
+.j-evt .amt .note { display: block; font: var(--t-s); color: var(--ink-3); }
+.j-evt .proof { font: var(--t-s); color: var(--ink-2); text-align: right; display: flex; flex-direction: column; gap: var(--s-1); white-space: nowrap; min-width: 0; }
+.j-evt .proof a { transition: color var(--dur) var(--ease); }
+.j-evt .proof a:hover { color: var(--ink); }
+.j-evt .proof .hash { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); }
+.j-evt .proof .sep { display: none; }
+
+/* the rescue's steps, inline: a line between steps shows they are one run. On the desktop the row may reach into
+   the gap and the empty part of the amount column beside it, so all five steps sit on one line at 1440; narrower, they wrap. */
+.j-steps { display: flex; flex-wrap: wrap; row-gap: 4px; margin-top: 10px; font: var(--t-s); color: var(--ink-2); }
+@media (min-width: 1024px) { .j-steps { margin-right: -32px; } }
+.j-steps span { white-space: nowrap; padding-right: var(--s-3); margin-right: var(--s-3); border-right: 1px solid var(--line-2); }
+.j-steps span:last-child { border: 0; padding-right: 0; margin-right: 0; color: var(--ink); }
+
+.j-more { display: block; width: 100%; padding: 20px 0; font: var(--t-s); color: var(--ink-2); text-align: left; }
+.j-more span { color: var(--ink); }
+.j-more:hover span { text-decoration: underline; text-underline-offset: 3px; }
+.j-none { padding: var(--s-5) 0; font: var(--t-s); color: var(--ink-2); }
+
+/* "2 new events": stays in view while the reader is scrolled down, and takes them to the top */
+.j-new { position: sticky; top: var(--s-3); z-index: 2; height: 0; display: flex; justify-content: center; }
+.j-new .btn { background: var(--sel); border-color: var(--line-2); height: 32px; margin-top: var(--s-2); }
+.j-new .btn:hover { background: var(--line); }
+
+/* ---------- the side column ---------- */
+.j-side { padding: var(--s-6) var(--gutter) 0 40px; min-width: 0; }
+.j-side h3 { font: var(--t-s); color: var(--ink-2); margin: 0 0 12px; }
+.j-side .big { font: var(--t-xl); letter-spacing: var(--track-xl); }
+.j-side .big + p { margin: 10px 0 0; font: var(--t-s); color: var(--ink-2); }
+.j-attr { margin-top: 28px; }
+.j-attr > div { display: flex; justify-content: space-between; gap: var(--s-3); padding: 9px 0; border-bottom: 1px solid var(--line); }
+.j-attr > div > span:first-child { color: var(--ink-2); }
+.j-attr > .tot { border-bottom: 0; border-top: 1px solid var(--ink-2); margin-top: -1px; }
+.j-counts { margin-top: 40px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px var(--s-4); }
+.j-counts b { display: block; font: var(--t-num); letter-spacing: var(--track-num); font-weight: 400; }
+.j-counts b.lvl { color: var(--level); }
+.j-counts > div > span { font: var(--t-s); color: var(--ink-2); }
+.j-contract { margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--line); font: var(--t-s); color: var(--ink-2); }
+.j-contract p { margin: 0 0 8px; }
+.j-contract .mono { font-family: var(--mono); color: var(--ink); font-size: 12px; overflow-wrap: anywhere; }
+.j-contract a { transition: color var(--dur) var(--ease); }
+.j-contract a:hover { color: var(--ink); }
+
+/* ---------- empty and error: one message in the middle ---------- */
+.j-state { min-height: calc(100dvh - var(--header)); display: flex; }
+.j-state-msg { margin: auto; width: 640px; max-width: 100%; padding: 0 var(--s-4); text-align: center; transform: translateY(-5%); }
+.j-state-msg .lab { font: var(--t-s); color: var(--ink-2); }
+.j-state-msg h1 { font: var(--t-xl); letter-spacing: var(--track-xl); margin: 14px 0 0; }
+.j-state-msg p { color: var(--ink-2); margin: 16px auto 0; max-width: 560px; }
+.j-state-msg .go { display: flex; justify-content: center; gap: 10px; margin-top: 28px; }
+
+/* ---------- loading: the labels stay, every figure is a placeholder bar ---------- */
+.j-sk { display: inline-block; vertical-align: middle; background: var(--sel); border-radius: 4px; animation: j-sk 1.4s var(--ease) infinite; }
+@keyframes j-sk { 50% { background: var(--line-2); } }
+@media (prefers-reduced-motion: reduce) { .j-sk { animation: none; } }
+.j-evt .j-sk, .j-day .j-sk, .j-attr .j-sk, .j-counts .j-sk { display: block; }
+.j-evt .amt .j-sk, .j-evt .proof .j-sk { margin-left: auto; }
+.j-evt .proof { align-items: flex-end; }
+.j-counts .j-sk { margin-bottom: 6px; }
+
+/* ---------- phone: up to 1023 px, one column ---------- */
+@media (max-width: 1023px) {
+  .j-top { display: block; padding: var(--s-5) var(--gutter) 0; }
+  .j-top h1 { font: 400 40px/1.05 var(--display); letter-spacing: var(--track-xl); }
+  .j-top p { margin: var(--s-2) 0 0; }
+  .j-top .lvl { color: var(--level); }
+
+  .j-summary { margin: var(--s-4) var(--gutter) 0; }
+  .j-summary > div { display: flex; justify-content: space-between; gap: var(--s-3); padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .j-summary > div > span:first-child { color: var(--ink-2); }
+
+  /* the six filters do not fit in 390 px: the row scrolls sideways instead of cutting them off */
+  .j-filters { gap: 18px; padding: 0 var(--gutter); margin-top: var(--s-4); border-bottom: 0; overflow-x: auto; scrollbar-width: none; font: var(--t-s); }
+  .j-filters::-webkit-scrollbar { display: none; }
+  .j-filters button { padding-bottom: 0; }
+  .j-filters button[aria-pressed='true'] { box-shadow: none; }
+  .j-filters button .n { color: inherit; margin-left: 4px; }
+
+  .j-grid { display: block; margin-top: 20px; }
+  .j-feed { padding: 0 0 var(--s-5); border-right: 0; }
+  .j-day { padding: 20px var(--gutter) var(--s-2); }
+
+  .j-evt { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: 'lead amt' 'what what' 'proof proof'; row-gap: 0; column-gap: var(--s-3); padding: 14px var(--gutter); align-items: start; }
+  .j-lead { display: block; grid-area: lead; font: var(--t-s); color: var(--ink-2); }
+  .j-lead .sep { display: inline; }
+  .j-lead .j-sk { display: inline-block; margin-right: var(--s-2); }
+  .j-evt .t { color: var(--ink-2); }
+  .j-evt .what { grid-area: what; margin-top: 6px; }
+  .j-evt .amt { grid-area: amt; font: var(--t-s); }
+  .j-evt .amt .note { display: none; }
+  .j-evt .proof { grid-area: proof; flex-direction: row; justify-content: flex-start; margin-top: var(--s-2); gap: 0; }
+  .j-evt .proof .hash { display: none; }
+  .j-evt .proof .sep { display: inline; margin: 0 var(--s-2); }
+  .j-steps { margin-top: var(--s-2); }
+  .j-more { padding: 20px var(--gutter); }
+  .j-none { padding: var(--s-5) var(--gutter); }
+
+  .j-side { display: none; }
+
+  .j-new { top: var(--s-2); }
+
+  .j-state { min-height: calc(100dvh - 56px - 96px); }
+  .j-state-msg { width: auto; transform: none; padding: var(--s-5) var(--gutter); text-align: left; }
+  .j-state-msg h1 { font: 400 32px/1.1 var(--display); letter-spacing: var(--track-xl); }
+  .j-state-msg p { margin-left: 0; }
+  .j-state-msg .go { flex-direction: column; justify-content: stretch; }
+  .j-state-msg .go .btn { width: 100%; }
+}
