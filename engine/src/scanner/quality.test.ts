@@ -11,7 +11,7 @@ import type { MarketFunding } from '../venues/venue.ts';
 import { watchReaders } from '../venues/watch/index.ts';
 import { DEFAULT_QUALITY, DEFAULT_SCANNER_CONFIG, DEFAULT_STRATEGY, FUNDING_LIMITS } from './config.ts';
 import type { LegKind, ScanLeg } from './pairs.ts';
-import { pairLegs } from './pairs.ts';
+import { filterLegs, pairLegs } from './pairs.ts';
 import { QUALITY_PREFIXES, WatchQuality, hasQualityFinding, inSession, inTraditionalWeekend, localTime, perHour } from './quality.ts';
 import { Scanner } from './scanner.ts';
 import { T0, leg } from './test-helpers.ts';
@@ -20,8 +20,16 @@ const BASE = 0.0001 / 8;                         // the 0.01 % per 8 h baseline,
 const MON_NY_OPEN = Date.UTC(2026, 10, 2, 15);   // Monday 2 Nov 15:00 UTC = 10:00 New York (EST)
 const TUE_NIGHT = Date.UTC(2026, 10, 3, 22);     // Tuesday 22:00 UTC: New York shut, Tokyo not yet open
 
+const MAX_DEV = DEFAULT_SCANNER_CONFIG.maxMarkDeviation;
+
 function quality(legs: ScanLeg[], now = T0, hasHistory: (v: ScanVenueId) => boolean = () => false): WatchQuality {
-  return new WatchQuality({ now, listed: legs, kept: legs, hasHistory, config: DEFAULT_QUALITY });
+  return new WatchQuality({ now, listed: legs, kept: legs, dropped: [], maxMarkDeviation: MAX_DEV, hasHistory, config: DEFAULT_QUALITY });
+}
+
+/** As the scanner builds it: the legs through filterLegs first. */
+function filtered(legs: ScanLeg[], now = T0): { q: WatchQuality; kept: ScanLeg[] } {
+  const { kept, dropped } = filterLegs(legs, { oiFloorUsd: DEFAULT_SCANNER_CONFIG.oiFloorUsd, maxMarkDeviation: MAX_DEV });
+  return { q: new WatchQuality({ now, listed: legs, kept, dropped, maxMarkDeviation: MAX_DEV, hasHistory: () => false, config: DEFAULT_QUALITY }), kept };
 }
 
 /** A watch leg reading `rate` per hour, with a mark, OI (5M USD) and volume unless the fields say otherwise. */
@@ -169,6 +177,50 @@ test('market closed: a hl-xyz market (traditional assets only) over the futures 
     ok: false, text: 'Market closed: XAU is listed on hl-xyz, which lists traditional assets only, and their markets are shut for the weekend at Sat 10:30 UTC: its rates are not set by a live market',
   }]);
   assert.deepEqual(quality([gold, okx], TUE_NIGHT).checks(pair), []);
+});
+
+test('market closed: a stock ticker never marks a coin of the same base: the marks must agree (DASH, QNT)', () => {
+  // The recorded sweep: Bitget and MEXC list DoorDash as DASHSTOCK (179 USD) beside the Dash coin (48.75 USD);
+  // filterLegs drops the stock listings as duplicates of each venue's coin.
+  const dash = [
+    leg('hyperliquid', 'DASH', { markPx: 48.757 }),
+    w('aster', 'DASHUSDT', -0.0001, { base: 'DASH', markPx: 48.727 }),
+    w('bitget', 'DASHUSDT', BASE, { base: 'DASH', markPx: 48.75 }, 'cex'),
+    w('bitget', 'DASHSTOCKUSDT', 0, { base: 'DASH', markPx: 179.1, openInterest: 1000 }, 'cex'),
+    w('mexc', 'DASH_USDT', BASE, { base: 'DASH', markPx: 48.73 }, 'cex'),
+    w('mexc', 'DASHSTOCK_USDT', 0, { base: 'DASH', markPx: 178.89, openInterest: 1000 }, 'cex'),
+  ];
+  const d = filtered(dash);
+  assert.deepEqual(d.kept.map((l) => l.symbol), ['DASH', 'DASHUSDT', 'DASHUSDT', 'DASH_USDT']);
+  for (const l of d.kept) assert.deepEqual(d.q.legFindings(l), [], `${l.venue} ${l.symbol}`);
+  // Quant: hl-xyz's QNT and the QNTSTOCK listings mark about 34 USD, the Quant coin 194: hl-xyz's is a mark outlier.
+  const qnt = [
+    w('hl-xyz', 'xyz:QNT', 0.0001, { base: 'QNT', markPx: 33.975 }),
+    w('aster', 'QNTUSDT', -0.00005, { base: 'QNT', markPx: 194.34 }),
+    w('bitget', 'QNTUSDT', BASE, { base: 'QNT', markPx: 194.08 }, 'cex'),
+    w('bitget', 'QNTSTOCKUSDT', 0, { base: 'QNT', markPx: 34.097, openInterest: 1000 }, 'cex'),
+    w('mexc', 'QNT_USDT', BASE, { base: 'QNT', markPx: 194.16 }, 'cex'),
+    w('mexc', 'QNTSTOCK_USDT', 0, { base: 'QNT', markPx: 34.03, openInterest: 1000 }, 'cex'),
+    w('kraken', 'PF_QNTUSD', 0.00003, { base: 'QNT', markPx: 194.05 }, 'cex'),
+  ];
+  const n = filtered(qnt);
+  assert.deepEqual(n.kept.map((l) => `${l.venue} ${l.symbol}`), ['aster QNTUSDT', 'bitget QNTUSDT', 'mexc QNT_USDT', 'kraken PF_QNTUSD']);
+  for (const l of n.kept) assert.deepEqual(n.q.legFindings(l), [], `${l.venue} ${l.symbol}`);
+  // The marks decide even where nothing was dropped: a DoorDash listing at 179 USD says nothing of a coin at 48.73,
+  // and a leg without a mark (Binance, relayed) is compared at its base's median mark.
+  const coins = [w('aster', 'DASHUSDT', -0.0001, { base: 'DASH', markPx: 48.727 }), w('gate', 'DASH_USDT', BASE, { base: 'DASH', markPx: 48.75 })];
+  const stock = w('mexc', 'DASHSTOCK_USDT', 0, { base: 'DASH', markPx: 178.89 }, 'cex');
+  const binance = relayed('binance', 'DASH', BASE);
+  const q = new WatchQuality({
+    now: T0, listed: [...coins, stock, binance], kept: [...coins, binance], dropped: [], maxMarkDeviation: MAX_DEV, hasHistory: () => false, config: DEFAULT_QUALITY,
+  });
+  for (const l of [...coins, binance]) assert.ok(!q.legFindings(l).some((t) => t.startsWith('Market closed:')), l.symbol);
+  assert.match(q.legFindings(stock).at(-1)!, /^Market closed: DASH is a stock perp \(mexc DASHSTOCK_USDT\)/);
+  // Samsung's marks agree, so the relayed leg is Samsung's too.
+  const samsung = [w('aster', 'SAMSUNGUSDT', 0, { base: 'SAMSUNG', markPx: 162.86 }), w('mexc', 'SAMSUNGSTOCK_USDT', 0, { base: 'SAMSUNG', markPx: 162.64 }, 'cex')];
+  const relayedSamsung = relayed('binance', 'SAMSUNG', BASE);
+  const s = quality([...samsung, relayedSamsung]);
+  assert.match(s.legFindings(relayedSamsung).at(-1)!, /^Market closed: SAMSUNG is a stock perp \(mexc SAMSUNGSTOCK_USDT\)/);
 });
 
 // ---------- the recorded sweep ----------

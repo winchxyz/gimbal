@@ -209,7 +209,8 @@ export class Scanner {
     const { kept, dropped } = filterLegs(legs, filter, heldLegKeys(legs, heldId));
     const sourceById = new Map(this.#sources.map((s) => [s.id, s]));
     const quality = new WatchQuality({
-      now, listed: legs, kept, config: config.quality, hasHistory: (v) => sourceById.get(v)?.history !== undefined,
+      now, listed: legs, kept, dropped, maxMarkDeviation: config.maxMarkDeviation, config: config.quality,
+      hasHistory: (v) => sourceById.get(v)?.history !== undefined,
     });
     const droppedCount: ScanNotes['dropped'] = {};
     for (const d of dropped) droppedCount[d.reason] = (droppedCount[d.reason] ?? 0) + 1;

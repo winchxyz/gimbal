@@ -19,13 +19,14 @@
 //   against the crowd is real.
 // - Market closed: a stock perp read while no stock exchange is in session, or another traditional asset (a
 //   hl-xyz market) over the futures weekend: its rate is not set by a live market (a Kraken rate against 0
-//   elsewhere on a Saturday).
+//   elsewhere on a Saturday). A listing names a leg's market only when their marks agree, never by ticker alone:
+//   Bitget's DASHSTOCKUSDT is DoorDash, not the Dash coin.
 // Pure: the legs, the time and the tables come in as arguments.
 
 import type { ScanVenueId, Window as FundingWindow } from '@gimbal/shared';
 import { normalizeBase } from '../venues/watch/symbols.ts';
 import type { FundingLimit, MarketSession, QualityConfig } from './config.ts';
-import type { Pair, ScanLeg } from './pairs.ts';
+import type { LegDrop, Pair, ScanLeg } from './pairs.ts';
 import { usd } from './price.ts';
 
 /** The 0.01 % per 8 h baseline most venues pin quiet markets at, per hour. */
@@ -100,9 +101,20 @@ export interface QualityInput {
   listed: readonly ScanLeg[];
   /** The legs filterLegs kept: the readings compared with each other. */
   kept: readonly ScanLeg[];
+  /** What filterLegs dropped: a leg dropped as a duplicate or a mark outlier is another asset, and says nothing. */
+  dropped: readonly LegDrop[];
+  /** The mark check of filterLegs: a stock listing names a leg's market only if their marks agree this closely. */
+  maxMarkDeviation: number;
   /** Whether a venue publishes funding history the scanner reads. */
   hasHistory: (venue: ScanVenueId) => boolean;
   config: QualityConfig;
+}
+
+/** A listing that says what kind of market a base is: a venue's stock-perp symbol, or a traditional-only venue. */
+interface Listing {
+  leg: ScanLeg & { markPx: number };
+  /** The venue's own symbol names it a stock perp (else: a traditional-only venue lists it). */
+  stock: boolean;
 }
 
 /** The quality findings of one scan's legs; built once per scan, asked once per watch-only window. */
@@ -110,10 +122,14 @@ export class WatchQuality {
   readonly #input: QualityInput;
   readonly #byBase = new Map<string, ScanLeg[]>();
   readonly #pins = new Map<string, number>();
-  /** Base -> the leg whose own symbol names it a stock perp ("mexc SAMSUNGSTOCK_USDT"). */
-  readonly #stocks = new Map<string, string>();
-  /** Base -> the traditional-only venue that lists it. */
-  readonly #traditional = new Map<string, string>();
+  /**
+   * Base -> the listings that say what it is, stock-perp symbols first. A ticker is not a market: Bitget's
+   * DASHSTOCKUSDT is DoorDash at 179 USD, not the Dash coin at 49, so a listing counts for a leg only when their
+   * marks agree (#listing).
+   */
+  readonly #listings = new Map<string, Listing[]>();
+  /** Base -> the median mark of its kept legs: what a leg without a mark of its own is compared at. */
+  readonly #refMark = new Map<string, number>();
   readonly #stocksClosed: boolean;
   readonly #weekend: boolean;
   readonly #findings = new Map<ScanLeg, string[]>();
@@ -125,6 +141,10 @@ export class WatchQuality {
       const list = this.#byBase.get(leg.base);
       if (list === undefined) this.#byBase.set(leg.base, [leg]);
       else list.push(leg);
+    }
+    for (const [base, legs] of this.#byBase) {
+      const marks = legs.map((l) => l.markPx).filter((m): m is number => m !== null);
+      if (marks.length > 0) this.#refMark.set(base, median(marks));
     }
     // A venue's quiet pin: the one rate 10+ markets of a settlement group share, if it lies near the baseline (on a
     // weekend a venue's stock perps can make 0 its most common rate, which is not a pin).
@@ -139,14 +159,20 @@ export class WatchQuality {
       const [rate, n] = [...c.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0])[0]!;
       if (n >= MIN_PINNED && rate >= 0.4 * BASELINE_PER_HOUR && rate <= 2.5 * BASELINE_PER_HOUR) this.#pins.set(group, rate);
     }
+    // A listing filterLegs dropped as a duplicate (Bitget lists DASHUSDT and DASHSTOCKUSDT under one base) or a mark
+    // outlier (hl-xyz's QNT, Quant Corp at 34 USD, against the Quant coin at 194) is another asset's.
+    const otherAsset = new Set(input.dropped.filter((d) => d.reason === 'duplicate' || d.reason === 'mark-outlier').map((d) => `${d.venue}|${d.symbol}`));
+    const add = (leg: ScanLeg, stock: boolean) => {
+      if (leg.markPx === null || otherAsset.has(`${leg.venue}|${leg.symbol}`)) return;
+      const list = this.#listings.get(leg.base) ?? [];
+      list.push({ leg: { ...leg, markPx: leg.markPx }, stock });
+      this.#listings.set(leg.base, list);
+    };
     for (const leg of input.listed) {
-      const marker = config.equityMarkers[leg.venue];
-      const m = marker?.exec(leg.symbol);
-      if (m?.[1] !== undefined && normalizeBase(m[1]).base === leg.base && !this.#stocks.has(leg.base)) {
-        this.#stocks.set(leg.base, `${leg.venue} ${leg.symbol}`);
-      }
-      if (config.traditionalVenues.includes(leg.venue) && !this.#traditional.has(leg.base)) this.#traditional.set(leg.base, leg.venue);
+      const m = config.equityMarkers[leg.venue]?.exec(leg.symbol);
+      if (m?.[1] !== undefined && normalizeBase(m[1]).base === leg.base) add(leg, true);
     }
+    for (const leg of input.listed) if (config.traditionalVenues.includes(leg.venue)) add(leg, false);
     this.#stocksClosed = !config.stockSessions.some((s) => inSession(s, now));
     this.#weekend = inTraditionalWeekend(config.traditionalWeekend, now);
   }
@@ -226,17 +252,28 @@ export class WatchQuality {
     return `Lone baseline: ${leg.venue} ${leg.symbol} reads the quiet ${perHour(leg.ratePerHour)} while ${agreeing.length} other venues agree near ${perHour(m)}: more likely a default than the market's rate`;
   }
 
+  /**
+   * The first listing of `leg`'s base, of the kind asked, whose mark agrees with the leg's own (or, for a leg without
+   * one, with its base's median mark) within maxMarkDeviation; null when none does.
+   */
+  #listing(leg: ScanLeg, stock: boolean): Listing | null {
+    const ref = leg.markPx ?? this.#refMark.get(leg.base) ?? null;
+    if (ref === null) return null;
+    const max = this.#input.maxMarkDeviation;
+    return (this.#listings.get(leg.base) ?? []).find((l) => l.stock === stock && Math.abs(l.leg.markPx / ref - 1) <= max) ?? null;
+  }
+
   #closed(leg: ScanLeg): string | null {
     const when = `${DAYS[new Date(this.#input.now).getUTCDay()]} ${new Date(this.#input.now).toISOString().slice(11, 16)} UTC`;
-    const stock = this.#stocks.get(leg.base);
-    if (stock !== undefined) {
+    const stock = this.#listing(leg, true);
+    if (stock !== null) {
       return this.#stocksClosed
-        ? `Market closed: ${leg.base} is a stock perp (${stock}) and no stock exchange is in session at ${when}: its rates are not set by a live market`
+        ? `Market closed: ${leg.base} is a stock perp (${stock.leg.venue} ${stock.leg.symbol}) and no stock exchange is in session at ${when}: its rates are not set by a live market`
         : null;
     }
-    const venue = this.#traditional.get(leg.base);
-    if (venue !== undefined && this.#weekend) {
-      return `Market closed: ${leg.base} is listed on ${venue}, which lists traditional assets only, and their markets are shut for the weekend at ${when}: its rates are not set by a live market`;
+    const traditional = this.#listing(leg, false);
+    if (traditional !== null && this.#weekend) {
+      return `Market closed: ${leg.base} is listed on ${traditional.leg.venue}, which lists traditional assets only, and their markets are shut for the weekend at ${when}: its rates are not set by a live market`;
     }
     return null;
   }
