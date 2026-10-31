@@ -1,8 +1,9 @@
 // The transactions the owner's wallet signs (docs/interfaces.md §1.3): create the desk, set the policy, deposit, pin the
 // Orderly receiver and set the Orderly IP list. Pure builders, so the arguments, gas and deposits are tested.
 //
-// Owner methods need exactly 1 yoctoNEAR, except the three that add storage (`create_desk`, `set_policy`,
-// `set_operator`), which need at least 1 yocto and the storage they add; the excess is refunded to the caller.
+// Owner methods need exactly 1 yoctoNEAR, except the ones that add storage (`create_desk`, `set_policy`,
+// `set_operator`, `set_orderly_receiver`, `set_orderly_ips`), which need at least 1 yocto and the storage they add;
+// the excess is refunded to the caller.
 import type { ContractPolicy } from '@gimbal/shared';
 import type { DerivedAddresses } from './derive.ts';
 import { storageDeposit, tgas } from './near.ts';
@@ -42,17 +43,20 @@ export function setPolicyTx(contractId: string, deskId: string, policy: Contract
 /** What `set_policy` may hold as a storage deposit, in yoctoNEAR: an upper bound; the rest comes back. */
 export const setPolicyDeposit = (deskId: string, policy: ContractPolicy): bigint => storageDeposit(JSON.stringify({ desk_id: deskId, policy }));
 
+/** The contract takes the receiver as a lowercase `0x` address only (`E_ARGS`). */
 export function setOrderlyReceiverTx(contractId: string, deskId: string, receiver: string): WalletTx {
+  const args = { desk_id: deskId, receiver: receiver.toLowerCase() };
   return {
     receiverId: contractId,
-    actions: [{ type: 'FunctionCall', params: { methodName: 'set_orderly_receiver', args: { desk_id: deskId, receiver }, gas: OWNER_CALL_GAS, deposit: ONE_YOCTO } }],
+    actions: [{ type: 'FunctionCall', params: { methodName: 'set_orderly_receiver', args, gas: OWNER_CALL_GAS, deposit: storageDeposit(JSON.stringify(args)).toString() } }],
   };
 }
 
 export function setOrderlyIpsTx(contractId: string, deskId: string, ips: string[]): WalletTx {
+  const args = { desk_id: deskId, ips };
   return {
     receiverId: contractId,
-    actions: [{ type: 'FunctionCall', params: { methodName: 'set_orderly_ips', args: { desk_id: deskId, ips }, gas: OWNER_CALL_GAS, deposit: ONE_YOCTO } }],
+    actions: [{ type: 'FunctionCall', params: { methodName: 'set_orderly_ips', args, gas: OWNER_CALL_GAS, deposit: storageDeposit(JSON.stringify(args)).toString() } }],
   };
 }
 

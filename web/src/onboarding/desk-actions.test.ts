@@ -35,14 +35,16 @@ test('create_desk: 100 TGas, a storage deposit, the policy and the derived addre
   assert.ok(BigInt(a.params.deposit) < 5n * YOCTO, 'and a small fraction of a NEAR: the storage of one desk');
 });
 
-test('set_policy carries a storage deposit, the owner calls exactly 1 yocto', () => {
+test('set_policy, set_orderly_receiver and set_orderly_ips carry a storage deposit, not 1 yocto', () => {
   const sp = setPolicyTx('c.testnet', 'd', starterPolicy()).actions[0]!;
   assert.equal(sp.type === 'FunctionCall' && sp.params.gas, OWNER_CALL_GAS);
   assert.ok(sp.type === 'FunctionCall' && BigInt(sp.params.deposit) > 1n);
-  const rec = setOrderlyReceiverTx('c.testnet', 'd', '0x' + 'a'.repeat(40)).actions[0]!;
-  assert.deepEqual(rec.type === 'FunctionCall' && [rec.params.methodName, rec.params.deposit, rec.params.args], ['set_orderly_receiver', '1', { desk_id: 'd', receiver: '0x' + 'a'.repeat(40) }]);
+  const rec = setOrderlyReceiverTx('c.testnet', 'd', '0x' + 'A'.repeat(40)).actions[0]!;
+  assert.deepEqual(rec.type === 'FunctionCall' && [rec.params.methodName, rec.params.args], ['set_orderly_receiver', { desk_id: 'd', receiver: '0x' + 'a'.repeat(40) }], 'the receiver goes lowercase');
+  assert.ok(rec.type === 'FunctionCall' && BigInt(rec.params.deposit) > 1n && BigInt(rec.params.deposit) < YOCTO);
   const ips = setOrderlyIpsTx('c.testnet', 'd', ['203.0.113.7']).actions[0]!;
-  assert.deepEqual(ips.type === 'FunctionCall' && [ips.params.methodName, ips.params.deposit], ['set_orderly_ips', '1']);
+  assert.equal(ips.type === 'FunctionCall' && ips.params.methodName, 'set_orderly_ips');
+  assert.ok(ips.type === 'FunctionCall' && BigInt(ips.params.deposit) > 1n && BigInt(ips.params.deposit) < YOCTO);
 });
 
 test('a deposit is ft_transfer_call on the USDC token with the desk id in msg, 1 yocto', () => {
