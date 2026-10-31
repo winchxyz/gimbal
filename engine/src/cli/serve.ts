@@ -14,6 +14,9 @@
 //   --record <file>     live modes only: write every venue answer the scanner gets, for replay (funding and books
 //                       at most every 30 s per market, so an hour stays a few MB)
 //   --minutes <n>       with --record: stop after n minutes and close the file
+//   --state-dir <dir>   GIMBAL_STATE_DIR: where the confirmed engine rules (PUT /strategy) are kept across restarts,
+//                       one file per mode and desk; default engine/state/ (gitignored)
+// NEAR_AI_API_KEY turns on POST /policy/draft (src/nearai/); without it the route answers 503, drafting unavailable.
 // The contract (testnet and mainnet, src/cli/serve-contract.ts): with GIMBAL_CONTRACT_ID and DESK_ID set (and
 // OWNER_ACCOUNT_ID or OPERATOR_ACCOUNT_ID, OPERATOR_PRIVATE_KEY, optional NEAR_NETWORK / NEAR_RPC_URL), the policy
 // is get_desk's, the oracle is the contract's stored prices, and a `health` event carries NEAR's state. Views
@@ -28,6 +31,9 @@ import { parseArgs } from 'node:util';
 import type { ContractPolicy, HealthMap, Mode } from '@gimbal/shared';
 import type { NearHealth } from '../contract/budget.ts';
 import { ReplayOracle } from '../contract/replay-oracle.ts';
+import { NearAiClient } from '../nearai/client.ts';
+import { PolicyDrafter, deskMarkets } from '../nearai/draft-route.ts';
+import { StrategyStore, strategyFile } from '../strategy-store.ts';
 import { liveReaders, replayReaders } from '../readers.ts';
 import type { Readers } from '../readers.ts';
 import { DEFAULT_STRATEGY, ORDERLY_BROKERS, scannerConfigFor } from '../scanner/config.ts';
@@ -52,6 +58,7 @@ const { values } = parseArgs({
     policy: { type: 'string' },
     record: { type: 'string' },
     minutes: { type: 'string' },
+    'state-dir': { type: 'string' },
   },
 });
 
@@ -77,9 +84,11 @@ if (policyFile !== undefined && policyFile !== '') {
 }
 let contract: ContractSide | null = null;
 let nearHealth: NearHealth = 'ok';
+let deskId: string | null = null;
 try {
   const cfg = contractEnv(envVar, mode);
   if (cfg !== null) {
+    deskId = cfg.deskId;
     contract = await connectContract(cfg, {
       onHealth: (status, detail) => {
         nearHealth = status;
@@ -168,10 +177,26 @@ function publishHealth(): void {
   health = next;
   server.publish({ type: 'health', data: next });
 }
+// The confirmed engine rules survive a restart; a file that no longer passes the checks falls back to the defaults.
+const stateDir = values['state-dir'] ?? envVar('GIMBAL_STATE_DIR') ?? fileURLToPath(new URL('../../state/', import.meta.url));
+let strategyStore: StrategyStore;
+try {
+  strategyStore = new StrategyStore(strategyFile(resolve(stateDir), mode, deskId));
+} catch (err) {
+  fail(errorMessage(err));
+}
+const saved = strategyStore.load(policy);
+if (saved.problem !== null) log(`engine rules not loaded, starting from the defaults (auto off): ${saved.problem}`);
+else if (saved.strategy !== null) log(`engine rules from ${strategyStore.path}`);
+const drafter = new PolicyDrafter({ client: new NearAiClient({ apiKey: envVar('NEAR_AI_API_KEY') }), markets: deskMarkets(readers.venues) });
+log(drafter.configured ? `policy drafts: NEAR AI ${drafter.model}` : 'policy drafts: off (NEAR_AI_API_KEY is not set), POST /policy/draft answers 503');
+
 server = new EngineServer({
   mode,
   scanner,
-  strategy: DEFAULT_STRATEGY,
+  strategy: saved.strategy ?? DEFAULT_STRATEGY,
+  saveStrategy: (s) => strategyStore.save(s),
+  drafter,
   policy,
   intervalMs: scannerConfig.intervalMs,
   log,

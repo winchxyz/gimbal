@@ -29,6 +29,15 @@ export function redact(text: string, url: string | undefined): string {
   return out;
 }
 
+/**
+ * `text` with every copy of `secret` (an API key sent in a header) cut to "…". A service may quote the key back in
+ * an error ("invalid key sk-…"), and such a text ends up in logs and HTTP answers.
+ */
+export function redactSecret(text: string, secret: string | undefined): string {
+  if (secret === undefined || secret === '') return text;
+  return text.split(secret).join('…');
+}
+
 /** The error itself when its text holds nothing of the URL to hide; else an Error of the same name with the text cut. */
 export function redactError(err: unknown, url: string | undefined): unknown {
   if (!(err instanceof Error)) return err;

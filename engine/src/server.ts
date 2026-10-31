@@ -25,6 +25,8 @@ import type {
   StrategyConfig, StreamEvent, Window as FundingWindow,
 } from '@gimbal/shared';
 import { errorMessage } from './venues/recorder.ts';
+import { policyDraftRoute } from './nearai/draft-route.ts';
+import type { PolicyDrafter } from './nearai/draft-route.ts';
 import { parseStrategyConfig } from './scanner/config.ts';
 import type { ScanResult, Scanner } from './scanner/scanner.ts';
 
@@ -84,6 +86,10 @@ export interface EngineServerOptions {
   allowedOrigins?: readonly string[];
   /** Unread SSE bytes after which a client is dropped; default 1 MiB. */
   sseMaxBufferBytes?: number;
+  /** POST /policy/draft (src/nearai/draft-route.ts); none = 503, drafting is unavailable. */
+  drafter?: Pick<PolicyDrafter, 'draft'>;
+  /** Persists a confirmed PUT /strategy before it takes effect (src/strategy-store.ts); none = memory only. */
+  saveStrategy?: (strategy: StrategyConfig) => Promise<void>;
 }
 
 type Latest = {
@@ -339,13 +345,25 @@ export class EngineServer {
       } catch (err) {
         return json(res, 400, { error: `PUT /strategy: ${errorMessage(err)}` });
       }
+      let next: StrategyConfig;
       try {
-        this.#strategy = parseStrategyConfig(body, this.#options.policy);
+        next = parseStrategyConfig(body, this.#options.policy);
       } catch (err) {
         return json(res, 400, { error: errorMessage(err) });
       }
+      try {
+        await this.#options.saveStrategy?.(next);
+      } catch (err) {
+        return json(res, 500, { error: `PUT /strategy: not saved, so nothing changed: ${errorMessage(err)}` });
+      }
+      this.#strategy = next;
       this.#log(`strategy set: ${JSON.stringify(this.#strategy)}`);
       return json(res, 200, this.#strategy);
+    }
+    if (path === '/policy/draft') {
+      if (method !== 'POST') return notAllowed(res, 'POST');
+      const answer = await policyDraftRoute(() => readBody(req), this.#options.drafter ?? null, (line) => this.#log(line));
+      return json(res, answer.status, answer.body);
     }
     if (path === '/rotate' || path === '/close') {
       if (method !== 'POST') return notAllowed(res, 'POST');
