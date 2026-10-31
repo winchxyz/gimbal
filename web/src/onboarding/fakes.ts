@@ -8,6 +8,7 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import type { ContractPolicy, PolicyDraft, SetupProgress, StrategyConfig } from '@gimbal/shared';
 import { createStore, type Store } from '../stream/hub.ts';
 import { b58encode, evmPath, solPath, addressesFrom } from './derive.ts';
+import { createDeskBytes, depositRefusal, noDepositRefusal, setIpsBytes, setPolicyBytes, setReceiverBytes } from './fake-storage.ts';
 import type { Chain, ChainDesk } from './chain.ts';
 import { DraftUnavailable, EngineError, type OnboardingEngine } from './engine.ts';
 import type { IntentsApi, IntentsQuote, IntentsRequest, IntentsStatus } from './intents.ts';
@@ -179,9 +180,19 @@ export class FakeWorld {
     if (method === 'create_desk') {
       if (!/^[a-z0-9-]{1,32}$/.test(deskId)) return 'E_ARGS: bad desk id';
       if (this.desks.has(deskId)) return 'E_DESK_EXISTS: a desk with this id exists already';
-      if (BigInt(deposit) < 1n) return 'E_DEPOSIT: attach NEAR for storage';
+      if (BigInt(deposit) < 1n) return noDepositRefusal('create_desk');
       const policy = args.policy as ContractPolicy;
       if (policyProblems(policy).length > 0) return 'E_ARGS: the policy is not valid';
+      // The contract measures the storage the desk takes before it asks the MPC contract for the keys, and refuses
+      // a deposit short of it. What the page attaches has to cover the desk as the contract stores it.
+      const ownerHasDesk = [...this.desks.values()].some((d) => d.owner === signer);
+      const short = depositRefusal(
+        'create_desk',
+        `desk ${deskId}`,
+        createDeskBytes({ deskId, owner: signer, policy, evm_address: String(args.evm_address), solana: args.solana as FakeDesk['solana'], ownerHasDesk }),
+        BigInt(deposit),
+      );
+      if (short !== null) return short;
       const want = this.derived(deskId);
       if (args.evm_address !== want.evm_address || JSON.stringify(args.solana) !== JSON.stringify(want.solana)) return 'E_MPC: the addresses do not match the MPC keys';
       this.desks.set(deskId, { owner: signer, policy, evm_address: want.evm_address, solana: want.solana, orderly_receiver: null, ips: [], deposited: 0n });
@@ -190,24 +201,32 @@ export class FakeWorld {
     const desk = this.desks.get(deskId);
     if (!desk) return 'E_NO_DESK: no such desk';
     if (desk.owner !== signer) return 'E_NOT_ALLOWED: only the owner may call this';
+    // The storage methods keep what they add, at 1e19 yocto a byte and at least 1 yocto, and refund the rest
+    // (contract/src/deposit.rs); the fake checks the minimum and does not move balances.
     if (method === 'set_policy') {
-      if (BigInt(deposit) < 1n) return 'E_DEPOSIT: attach NEAR for storage';
+      if (BigInt(deposit) < 1n) return noDepositRefusal(method);
       const policy = args.policy as ContractPolicy;
       if (policyProblems(policy).length > 0) return 'E_ARGS: the policy is not valid';
+      const short = depositRefusal(method, `set_policy on desk ${deskId}`, setPolicyBytes(desk.policy, policy), BigInt(deposit));
+      if (short !== null) return short;
       desk.policy = policy;
       return null;
     }
     if (method === 'set_orderly_receiver') {
-      if (BigInt(deposit) <= 1n) return 'E_DEPOSIT: attach NEAR for storage';
+      if (BigInt(deposit) < 1n) return noDepositRefusal(method);
       if (!/^0x[0-9a-f]{40}$/.test(String(args.receiver))) return 'E_ARGS: the receiver is not a lowercase 0x address';
       if (desk.orderly_receiver !== null) return 'E_ARGS: the Orderly receiver is pinned already';
+      const short = depositRefusal(method, `set_orderly_receiver on desk ${deskId}`, setReceiverBytes(String(args.receiver)), BigInt(deposit));
+      if (short !== null) return short;
       desk.orderly_receiver = String(args.receiver);
       return null;
     }
     if (method === 'set_orderly_ips') {
-      if (BigInt(deposit) <= 1n) return 'E_DEPOSIT: attach NEAR for storage';
+      if (BigInt(deposit) < 1n) return noDepositRefusal(method);
       const ips = args.ips as string[];
       if (ips.length < 1 || ips.length > 10) return 'E_ARGS: 1 to 10 IPs';
+      const short = depositRefusal(method, `set_orderly_ips on desk ${deskId}`, setIpsBytes(desk.ips, ips), BigInt(deposit));
+      if (short !== null) return short;
       desk.ips = ips;
       return null;
     }

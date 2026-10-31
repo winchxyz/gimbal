@@ -24,11 +24,35 @@ export const isDeskId = (id: string): boolean => /^[a-z0-9-]{1,32}$/.test(id);
 /** What the contract asks for each owner call, for the page to show before the wallet opens. */
 export const CREATE_DESK_NOTE = 'The contract keeps only the storage the desk uses and returns the rest of the NEAR you attach.';
 
+// Every storage deposit here is an upper bound, not the exact price. The contract measures what the call added to its
+// storage, keeps that at 1e19 yoctoNEAR a byte and refunds the rest to the caller (contract/src/deposit.rs
+// `refund_after`; for `create_desk` the callback `on_desk_keys` sends it back), so attaching more than needed costs
+// nothing but a moment's lock, while attaching less is `E_DEPOSIT` and nothing is created. The exact price is not
+// computed here because it depends on how the contract stores the desk, which changes with the contract.
+
+/**
+ * Bytes `create_desk` may store beyond the JSON it is given. The desk is not its arguments: the contract also stores
+ * the desk's meters and its ring of 32 deposit-address hashes (1,329 B), its Orderly account id, the owner's index
+ * entries and 40 B of chain overhead for each of the five records. Measured by the contract's own test
+ * (`the_storage_each_owner_method_adds`): 2,156 B with a small policy, 9,758 B with the largest valid one, and it caps
+ * them at 2,500 and 10,000. The policy takes less in Borsh than its JSON takes in the arguments, so what is left over
+ * is the fixed part, at most about 2,300 B (a 64-character owner and a 32-character desk id). 12,000 B is far over
+ * that and over the largest desk in all (0.12 NEAR, returned). The old margin of 1,000 B was short of even a small desk:
+ * `E_DEPOSIT: desk alpha takes 2068 bytes of storage: attach at least 0.02068 NEAR, not 0.01597`.
+ */
+export const CREATE_DESK_EXTRA_BYTES = 12_000;
+
+/**
+ * Bytes the other storage calls get on top of their JSON. They store no more than they are given (a policy, an
+ * address, a list of IPs, each smaller in Borsh than in JSON), so their JSON already covers them; this is a margin.
+ */
+export const STORAGE_MARGIN_BYTES = 1_000;
+
 export function createDeskTx(contractId: string, deskId: string, policy: ContractPolicy, derived: DerivedAddresses): WalletTx {
   const args = { desk_id: deskId, policy, evm_address: derived.evm_address, solana: derived.solana };
   return {
     receiverId: contractId,
-    actions: [{ type: 'FunctionCall', params: { methodName: 'create_desk', args, gas: CREATE_DESK_GAS, deposit: storageDeposit(JSON.stringify(args), 1_000).toString() } }],
+    actions: [{ type: 'FunctionCall', params: { methodName: 'create_desk', args, gas: CREATE_DESK_GAS, deposit: storageDeposit(JSON.stringify(args), CREATE_DESK_EXTRA_BYTES).toString() } }],
   };
 }
 
@@ -36,19 +60,19 @@ export function setPolicyTx(contractId: string, deskId: string, policy: Contract
   const args = { desk_id: deskId, policy };
   return {
     receiverId: contractId,
-    actions: [{ type: 'FunctionCall', params: { methodName: 'set_policy', args, gas: OWNER_CALL_GAS, deposit: storageDeposit(JSON.stringify(args)).toString() } }],
+    actions: [{ type: 'FunctionCall', params: { methodName: 'set_policy', args, gas: OWNER_CALL_GAS, deposit: setPolicyDeposit(deskId, policy).toString() } }],
   };
 }
 
 /** What `set_policy` may hold as a storage deposit, in yoctoNEAR: an upper bound; the rest comes back. */
-export const setPolicyDeposit = (deskId: string, policy: ContractPolicy): bigint => storageDeposit(JSON.stringify({ desk_id: deskId, policy }));
+export const setPolicyDeposit = (deskId: string, policy: ContractPolicy): bigint => storageDeposit(JSON.stringify({ desk_id: deskId, policy }), STORAGE_MARGIN_BYTES);
 
 /** The contract takes the receiver as a lowercase `0x` address only (`E_ARGS`). */
 export function setOrderlyReceiverTx(contractId: string, deskId: string, receiver: string): WalletTx {
   const args = { desk_id: deskId, receiver: receiver.toLowerCase() };
   return {
     receiverId: contractId,
-    actions: [{ type: 'FunctionCall', params: { methodName: 'set_orderly_receiver', args, gas: OWNER_CALL_GAS, deposit: storageDeposit(JSON.stringify(args)).toString() } }],
+    actions: [{ type: 'FunctionCall', params: { methodName: 'set_orderly_receiver', args, gas: OWNER_CALL_GAS, deposit: storageDeposit(JSON.stringify(args), STORAGE_MARGIN_BYTES).toString() } }],
   };
 }
 
@@ -56,7 +80,7 @@ export function setOrderlyIpsTx(contractId: string, deskId: string, ips: string[
   const args = { desk_id: deskId, ips };
   return {
     receiverId: contractId,
-    actions: [{ type: 'FunctionCall', params: { methodName: 'set_orderly_ips', args, gas: OWNER_CALL_GAS, deposit: storageDeposit(JSON.stringify(args)).toString() } }],
+    actions: [{ type: 'FunctionCall', params: { methodName: 'set_orderly_ips', args, gas: OWNER_CALL_GAS, deposit: storageDeposit(JSON.stringify(args), STORAGE_MARGIN_BYTES).toString() } }],
   };
 }
 
