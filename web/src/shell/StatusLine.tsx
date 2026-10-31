@@ -1,13 +1,14 @@
-import { useStream } from '../stream/hub.ts';
 import { ago, useNow } from '../ui/useNow.ts';
-import { statusOf } from './status.ts';
+import type { ScreenId } from './routes.ts';
+import { StatusActions } from './StatusActions.tsx';
+import { useStatus } from './useStatus.ts';
 
 /** The one line under the header on Desk and Rescue that changes colour for risk. */
-export function StatusLine() {
-  const desk = useStream((s) => s.desk);
+export function StatusLine({ screen }: { screen: ScreenId }) {
+  const status = useStatus(screen === 'rescue' ? 'rescue' : 'desk');
   const now = useNow();
 
-  if (!desk) {
+  if (!status) {
     return (
       <div className="status loading">
         <span className="state dot">Loading</span>
@@ -16,12 +17,16 @@ export function StatusLine() {
     );
   }
 
-  const view = statusOf(desk);
+  const { desk, view, actions } = status;
   return (
     <div className={`status ${view.tone}`}>
       <span className="state dot">{view.word}</span>
-      <span>{view.sentence}</span>
-      <span className="g3 checked">Checked {ago(desk.updatedAt, now)}</span>
+      <span className="say">
+        {view.sentence}
+        {view.detail ? <span className="g"> {view.detail}</span> : null}
+      </span>
+      {view.tone === 'down' ? null : <span className="g3 checked">Checked {ago(desk.updatedAt, now)}</span>}
+      <StatusActions view={actions} className="end" />
     </div>
   );
 }

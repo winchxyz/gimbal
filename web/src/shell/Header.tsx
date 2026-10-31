@@ -58,18 +58,19 @@ export function Header({ screen }: { screen: ScreenId }) {
 }
 
 // design/HANDOFF.md, Network: testnet swaps Add funds for Get test USDC; replay has no money buttons.
-// The flows behind these buttons arrive with the Desk and onboarding screens.
-function MoneyActions({ mode }: { mode: Mode }) {
+// The flows behind these buttons arrive with onboarding. The phone has no header buttons: the Desk screen
+// draws the same pair under the desk value, with its own `className`.
+export function MoneyActions({ mode, className = 'money' }: { mode: Mode; className?: string }) {
   if (mode === 'replay') {
     return (
-      <span className="money">
+      <span className={className}>
         <button type="button" className="btn">Exit replay</button>
         <button type="button" className="btn primary">Connect wallet</button>
       </span>
     );
   }
   return (
-    <span className="money">
+    <span className={className}>
       <button type="button" className="btn">Withdraw</button>
       <button type="button" className="btn primary">{mode === 'testnet' ? 'Get test USDC' : 'Add funds'}</button>
     </span>

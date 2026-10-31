@@ -46,14 +46,30 @@ h1, h2, h3, p { margin: 0; font-weight: 400; }
 .money { display: contents; }
 
 /* status line: under the header on Desk and Rescue; the only line that changes colour for risk */
-.status { min-height: var(--status); padding: 0 var(--gutter); display: flex; align-items: center; gap: var(--s-4); border-bottom: 1px solid var(--line); --dot: var(--level); }
-.status .state { color: var(--level); font-weight: 500; }
+.status { min-height: var(--status); padding: var(--s-2) var(--gutter); display: flex; align-items: center; gap: var(--s-4); border-bottom: 1px solid var(--line); --dot: var(--level); }
+.status .state { color: var(--level); font-weight: 500; flex: none; }
+.status .say { min-width: 0; }
 .status.watch { --dot: var(--watch); }
 .status.watch .state { color: var(--watch); }
 .status.rescuing { --dot: var(--watch); background: rgba(240, 165, 49, .08); }
 .status.rescuing .state { color: var(--watch); }
-.status.waiting, .status.loading { --dot: var(--ink-3); }
-.status.waiting .state, .status.loading .state { color: var(--ink-2); }
+.status.needs, .status.down { --dot: var(--danger); background: rgba(255, 90, 95, .08); }
+.status.needs .state, .status.down .state { color: var(--danger); }
+.status.waiting, .status.loading, .status.paused { --dot: var(--ink-3); }
+.status.waiting .state, .status.loading .state, .status.paused .state { color: var(--ink-2); }
+.status .checked { flex: none; }
+
+/* the owner's buttons for the state, at the right end of the status line; the phone draws them on the page */
+.actions { display: inline-flex; align-items: center; gap: var(--s-1); }
+.status .actions { margin-left: auto; flex: none; }
+.actions .note { font: var(--t-s); }
+.actions .ask { margin-right: var(--s-3); }
+
+/* "Not sent": a button whose wallet or engine call is not connected yet says so, and nothing changes */
+.notice { display: flex; align-items: baseline; gap: var(--s-4); padding: var(--s-3) var(--gutter); border-bottom: 1px solid var(--line); background: rgba(240, 165, 49, .08); font: var(--t-s); }
+.notice b { color: var(--watch); font-weight: 500; flex: none; }
+.notice span { color: var(--ink-2); flex: 1; min-width: 0; }
+.notice .btn { height: 28px; flex: none; }
 
 /* ---------- placeholder body (until each screen is built) ---------- */
 .ph { display: grid; grid-template-columns: minmax(0, 1fr) 400px; column-gap: var(--s-8); padding: 40px var(--gutter) var(--s-8); }
@@ -84,7 +100,12 @@ h1, h2, h3, p { margin: 0; font-weight: 400; }
 
   .status { display: block; min-height: 0; padding: var(--s-3) var(--gutter); font: var(--t-s); }
   .status .state { margin-right: 6px; }
-  .status .checked { display: none; }
+  .status .checked, .status .actions { display: none; }
+  .status .say { display: inline; }
+  .notice { display: block; padding: var(--s-3) var(--gutter); }
+  .notice b { margin-right: var(--s-2); }
+  .notice span { display: inline; }
+  .notice .btn { display: block; margin-top: var(--s-2); height: 36px; padding: 0; }
 
   .ph { display: block; padding: var(--s-5) var(--gutter) 0; }
   .ph h1 { font: 400 40px/1.05 var(--display); letter-spacing: var(--track-xl); }
