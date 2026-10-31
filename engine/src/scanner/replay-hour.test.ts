@@ -2,6 +2,10 @@
 // `GIMBAL_MODE=mainnet npm run serve -w engine -- --record <file> --minutes 65`): the three desk venues, and in the
 // newer recordings the watch-only venues too. Each is played twice: the two plays must agree exactly, every scan
 // must be ranked and complete, the ranking must hold steady, and a recording with watch venues serves watch windows.
+//
+// A recording with the watch venues plays only its first 11 minutes by default: its first sweeps and the next ones,
+// 10 min later. The whole hour takes about a minute of CPU, too much for the CI every worker runs several times a
+// day. GIMBAL_SLOW_TESTS=1 plays every recording whole: `GIMBAL_SLOW_TESTS=1 node --test src/scanner/replay-hour.test.ts`.
 
 import assert from 'node:assert/strict';
 import { readdirSync } from 'node:fs';
@@ -26,23 +30,35 @@ const files = readdirSync(FIXTURES).filter((f) => f.startsWith('scan-') && f.end
 const LIVE_STEP_MS = 5_000;
 
 const hasWatch = (lines: readonly RecordLine[]) => lines.some((l) => !isDeskVenueId(l.venue));
+const SLOW = process.env.GIMBAL_SLOW_TESTS === '1';
+/** What a recording with the watch venues plays by default: past the 10 min mark, so its second sweeps are served. */
+const WATCH_SLICE_MS = 11 * 60_000;
 /**
- * The replay step. A recording with the watch venues is played every 30 s, the scanner's watch read interval: their
- * thousands of legs make a scan about 0.3 s of CPU, and three plays of an hour in 5 s steps would take minutes.
+ * The replay step. The watch venues' thousands of legs make a scan about 0.25 s of CPU, so a recording with them is
+ * played every 30 s (the scanner's watch read interval) with GIMBAL_SLOW_TESTS=1, and every 60 s by default.
  */
-const stepOf = (lines: readonly RecordLine[]) => (hasWatch(lines) ? DEFAULT_SCANNER_CONFIG.watchIntervalMs : LIVE_STEP_MS);
+const stepOf = (lines: readonly RecordLine[]) =>
+  (hasWatch(lines) ? (SLOW ? DEFAULT_SCANNER_CONFIG.watchIntervalMs : 2 * DEFAULT_SCANNER_CONFIG.watchIntervalMs) : LIVE_STEP_MS);
+
+// Replays copy every answer they serve, so the plays of one file share its parsed lines.
+const recordings = new Map<string, RecordLine[]>();
+const recording = (file: string) => recordings.get(file) ?? recordings.set(file, readRecording(join(FIXTURES, file))).get(file)!;
 
 interface Played {
   span: number;
   step: number;
   watch: boolean;
+  /** Successful watch sweeps recorded after the play's start and served by it: the slice is past the first sweeps. */
+  laterSweeps: number;
   scans: { windows: FundingWindow[]; scan: ScanStatus }[];
 }
 
 async function play(file: string): Promise<Played> {
-  const lines = readRecording(join(FIXTURES, file));
+  const lines = recording(file);
   const start = replayStart(lines);
-  const end = lines.reduce((m, l) => Math.max(m, l.t), 0);
+  const last = lines.reduce((m, l) => Math.max(m, l.t), 0);
+  const end = hasWatch(lines) && !SLOW ? Math.min(last, start + WATCH_SLICE_MS) : last;
+  const laterSweeps = lines.filter((l) => !isDeskVenueId(l.venue) && l.error === undefined && l.t > start && l.t <= end).length;
   const step = stepOf(lines);
   const clock = new VirtualClock(start);
   const readers = replayReaders(lines, clock);
@@ -55,7 +71,7 @@ async function play(file: string): Promise<Played> {
     await scanner.idle();
     scans.push({ windows: r.windows, scan: r.scan });
   }
-  return { span: end - start, step, watch: readers.watch.length > 0, scans };
+  return { span: end - start, step, watch: readers.watch.length > 0, laterSweeps, scans };
 }
 
 // The second test checks the first test's first play rather than playing the hour a third time.
@@ -64,7 +80,7 @@ const firstPlay = (file: string) => firstPlays.get(file) ?? firstPlays.set(file,
 
 test('there is a committed scanner recording of about an hour, with the desk venues and the watch-only ones', () => {
   assert.ok(files.length > 0, `no scan-*.jsonl.gz in ${FIXTURES}`);
-  const lines = readRecording(join(FIXTURES, files.at(-1)!));
+  const lines = recording(files.at(-1)!);
   const span = lines.at(-1)!.t - lines[0]!.t;
   assert.ok(span >= 55 * 60_000, `the recording spans ${Math.round(span / 60_000)} min`);
   const venues = [...new Set(lines.map((l) => l.venue))];
@@ -85,7 +101,7 @@ for (const file of files) {
   });
 
   test(`${file}: every scan is ranked, complete and finite; the ranking holds steady`, async (t) => {
-    const { scans, span, watch } = await firstPlay(file);
+    const { scans, span, watch, laterSweeps } = await firstPlay(file);
     const tops = new Map<string, number>();
     let setChanges = 0;
     let previous = '';
@@ -135,6 +151,13 @@ for (const file of files) {
     // A recording with the watch venues serves watch windows from its first scan on: the replay starts once every
     // venue has answered.
     assert.equal(watchServed, watch ? scans.length : 0, `watch windows in ${watchServed} of ${scans.length} scans`);
+    if (watch) {
+      // Past the first sweeps: the later ones are served, and their rates reach the watch windows.
+      assert.ok(laterSweeps > 0, 'the play ends before any watch venue swept again');
+      const gross = (s: (typeof scans)[number]) => new Map(s.windows.filter((w) => !w.tradable).map((w) => [w.id, w.grossAprPct]));
+      const [first, end] = [gross(scans[0]!), gross(scans.at(-1)!)];
+      assert.ok([...end].some(([id, g]) => first.get(id) !== g), 'the watch windows at the end are those of the first sweeps');
+    }
     // The recorded history reads give the leading windows a 7-day gross by the end of the hour.
     const last = scans.at(-1)!.windows;
     assert.ok(last.filter((w) => w.tradable).slice(0, 3).every((w) => w.grossApr7dPct !== null), 'the top windows have a 7-day gross');
