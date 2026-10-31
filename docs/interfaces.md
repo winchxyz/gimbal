@@ -163,8 +163,9 @@ operator key, `set_orderly_receiver`, deposits and payouts. Venue setup runs fro
 methods, and its content is fixed by the policy, `Treasury`, `FeeConfig` and `OrderlyConfig`, so the operator
 chooses nothing:
 - Hyperliquid: `hl_set_referrer` (if a code is set), `hl_approve_builder_fee`.
-- Orderly: `orderly_register`, `orderly_add_key`, the `receiver_address` lookup (the owner then pins it), and
-  `referral_bind` (if a code is set).
+- Orderly: `orderly_register`, `orderly_add_key`, the `receiver_address` lookup (the owner then pins it),
+  `referral_bind` (if a code is set; Orderly says none is needed under Gimbal's own broker), and the key's IP
+  restriction (`orderly_request` kind `ip_restriction`, if the owner set a list with `set_orderly_ips`).
 - Phoenix (no wallet login, no invite): `POST /v1/exchange/build-register-ixs` with the desk as authority and fee
   payer, `sol_sign_register` over the compiled message, then `send-register-ixs` (Phoenix's onboarder
   co-signs). If `referral_codes.phoenix` is set, `referral/activate-tx` with that code in the HTTP body; its
@@ -185,7 +186,8 @@ chooses nothing:
 | `hl_set_referrer(desk_id)` | ✓ | ✓ | L1 action `{type:"setReferrer", code}` with `code = treasury.referral_codes.hyperliquid`; setup calls it once per desk, before its first order (the contract does not refuse a repeat; Hyperliquid does); no other code can be signed; with no code configured it refuses (`E_ARGS`) and setup skips it |
 | `hl_withdraw(desk_id, amount)` | ✓ | | emergency only: to the desk's own EVM address |
 | `set_mock_price(asset, price_e8)` | contract owner | | only with `PriceSource::Mock` |
-| `refresh_prices(assets: Vec<String>)` | ✓ | ✓ | asks the OutLayer oracle → stores price + time |
+| `refresh_prices(assets: Vec<String>)` | ✓ | ✓ | asks the OutLayer oracle → stores price + time; the oracle deposit (0.02 NEAR, mostly refunded) comes from the contract balance; event `prices` |
+| `oracle_on_call(…)` | the oracle only | | the OutLayer oracle's callback when `refresh_prices` uses `oracle_call`; argument shape from OutLayer's docs; any predecessor other than the configured oracle → `E_NOT_ALLOWED` |
 | `hl_order(desk_id, order: HlOrder, reason)` | ✓ | ✓ | price band vs stored oracle price; size cap at the reference price (§1.2); reduce-only passes a paused desk |
 | `hl_cancel(desk_id, asset: u32, oid: u64, reason)` | ✓ | ✓ | L1 action `{type:"cancel", cancels:[{a, o}]}`; passes a paused desk, so a pause can stop resting orders |
 | `hl_usd_class_transfer(desk_id, amount, to_perp, reason)` | ✓ | ✓ | |
@@ -196,6 +198,7 @@ chooses nothing:
 | `orderly_register(desk_id, registration_nonce)` | ✓ | ✓ | EIP-712 `Registration` (nonce from `GET /v1/registration_nonce`, block time as timestamp, broker and chain from `OrderlyConfig`) |
 | `orderly_add_key(desk_id, expiration_ms)` | ✓ | ✓ | EIP-712 `AddOrderlyKey`: the desk's Ed25519 MPC key as orderly key, scope `read,trading`, ≤ 365 days |
 | `set_orderly_receiver(desk_id, receiver)` | ✓ | | pins the Orderly account's exclusive receiver address on Arbitrum (below); once. Owner only: a wrong receiver would redirect every deposit into Orderly |
+| `set_orderly_ips(desk_id, ips: Vec<String>)` | ✓ | | the relayer IPs the desk's orderly key may be used from: 1–10 IPv4 / IPv6 addresses in canonical form (else `E_ARGS`); replaceable; event `orderly_ips_set`. The operator can only apply the stored list (`orderly_request` kind `ip_restriction`) |
 | `orderly_request(desk_id, req: OrderlyRequest, reason)` | ✓ | ✓ | private REST call signed with the orderly key after policy checks: orders, cancels, reads, and the money-path requests below |
 | `orderly_ws_auth(desk_id, timestamp)` | ✓ | ✓ | one signature per private WebSocket session (positions, balances); kind `ws_auth`, payload `method` is `""` and the signed message is the timestamp alone. Orderly's streams send no snapshot on subscribe, so a session starts with the `positions` and `holding` reads |
 | `orderly_settle_pnl(desk_id, settle_nonce)` | ✓ | ✓ | EIP-712 `SettlePnl`; runs before every withdraw, or the withdrawable balance is short |
@@ -210,7 +213,21 @@ into the vault and credits it in 1–2 min, the desk signs nothing. Out, run by 
 call signed through `orderly_request`: `settle_nonce` → `orderly_settle_pnl` → `settle_pnl` → `withdraw_nonce`
 → `orderly_withdraw` → `withdraw_request` → USDC on the desk's Arbitrum address (40–52 s) →
 `evm_usdc_to_intents` → 1Click. The relayer's Arbitrum gas wallet holds a few dollars of ETH and can never
-move desk money (it only submits authorizations the contract signed).
+move desk money (it only submits authorizations the contract signed). Orderly's answers (2026-10-31): the receiver
+address is exclusive to each account (whether `gimbal_dex` has it on mainnet is checked on the canary); a withdrawal
+costs 1 USD and takes 30–60 s; unsettled PnL cannot be withdrawn, so settle first.
+
+**1Click quotes.** `quote: String` is the canonical JSON the relayer hashed, passed exactly as hashed:
+json-stable-stringify (sorted keys, no spaces) of the signed request fields, the signed quote fields and
+`timestamp` (field lists in `contract/core/tests/vectors/oneclick.json`, `signed_fields`). `quote_signature: String`
+is 1Click's `ed25519:<base58>`. The contract verifies the signature with 1Click's key (CLAUDE.md) over the UTF-8 of
+base58(sha256(`quote`)) before it parses anything (`E_QUOTE_SIGNATURE`), then applies the field rules (`field_rule`
+in the same file; `E_QUOTE_FIELDS`, `E_RESCUE_CAP`). Only live quotes pass: a dry quote has no `depositAddress`
+(`E_QUOTE_FIELDS`). A live quote's signed message also carries `depositAddress`, the quote's own `deadline` (it
+replaces the request's), `timeWhenInactive`, `timeEstimate`, `refundFee` and `withdrawFee` (when truthy), as recorded
+in `oneclick-live.json` (2026-10-31). On 2026-10-31 1Click refused every quote out of HyperCore, dry ones too
+("Quoting for this pair is not available"), so a route out of Hyperliquid can be missing at times; the engine
+treats "no quote" as a normal answer.
 
 Views: `config()`, `get_desk(desk_id)`, `desks_of(owner)`, `prices()`, `version()`. `get_desk` also returns
 `orderly_account_id` (keccak of the desk EVM address and the broker hash, fixed at `create_desk`). `prices()`
@@ -233,6 +250,9 @@ struct OrderlyRequest {                      // the contract builds path and bod
                                              //   The account's accruedFundingFee > 0 means it pays)
                                              // | "positions" (GET /v1/positions) | "holding" (GET /v1/client/holding)
                                              // Every read kind passes a paused desk.
+                                             // | "ip_restriction" (POST /v1/client/set_orderly_key_ip_restriction): the body
+                                             //   is built from the desk's orderly key and its `set_orderly_ips` list (none
+                                             //   set → E_ARGS); it only narrows who can use the key, so it passes a paused desk
     symbol: Option<String>,
     start_t: Option<u64>, end_t: Option<u64>, page: Option<u32>, size: Option<u32>,   // funding_fee_history only (ms)
     side: Option<String> /* BUY|SELL */, order_type: Option<String> /* IOC|LIMIT; MARKET → E_PRICE_BAND */,
@@ -275,6 +295,10 @@ Every action method returns a `SignedAction` (from the `on_signed` callback) tha
 (`on_signed` turns s > n/2 into n − s and flips the recovery id), which Circle's USDC requires.
 
 - Hyperliquid: POST `/exchange` with `payload` + `signature: { r: "0x" + affine_point[2..], s: "0x" + scalar, v: 27 + recovery_id }`.
+  `affine_point` keeps the MPC's 02/03 prefix, which goes stale after the low-s flip: consumers take v from
+  `recovery_id` only (C6 fixes or documents it). L1 actions the contract builds carry `expiresAfter` = block time
+  + 60 s (ms) in `payload` and in the signed hash, where Hyperliquid accepts it (C6 checks which actions do), so a
+  signature the MPC returns late dies on its own.
 - Solana: `payload = { "message_b64": "…" }`, `signature = { "scheme": "Ed25519", "signature": [64 bytes] }`;
   the transaction is `[1][signature][message]`. `sol_sign_register` is the exception: two signers, and
   Phoenix's API adds its onboarder signature and sends it.
@@ -290,7 +314,9 @@ Every action method returns a `SignedAction` (from the `on_signed` callback) tha
   with `payload = { "message": { <the typed fields, including timestamp> }, "userAddress": "<desk EVM address>" }`;
   the relayer posts `{ message, signature, userAddress }` (e.g. `POST /v1/register_account`, `/v1/orderly_key`), and
   Orderly takes the signature as `0x` + r ‖ s ‖ v (65 bytes, v = 27 + recovery_id).
-- Arbitrum (`evm_usdc_to_intents`): `payload` = the typed-data message `{ from, to, value, validAfter, validBefore, nonce }`
+- Arbitrum (`evm_usdc_to_intents`): `validAfter` 0, `validBefore` ≤ block time + 5 min, `nonce` =
+  keccak256(utf8(desk_id) ‖ a per-desk counter as u64 big-endian) kept by the contract (never the relayer's);
+  `payload` = the typed-data message `{ from, to, value, validAfter, validBefore, nonce }`
   plus `token` and `chainId`; the relayer's gas wallet calls the USDC contract's
   `transferWithAuthorization(from, to, value, validAfter, validBefore, nonce, v, r, s)`.
 
@@ -330,6 +356,7 @@ near-sdk before the method runs ("Failed to deserialize input from JSON"); clien
 | `policy_set` | desk_id, policy_sha256 (also emitted by `create_desk`, for the first policy) |
 | `operator_set` | desk_id, operator |
 | `orderly_receiver_set` | desk_id, receiver |
+| `orderly_ips_set` | desk_id, ips |
 | `paused` | desk_id, paused, by |
 | `prices` | [{ asset, price_e8, at_ms }] |
 | `signed` | desk_id, request_id, venue, kind, asset?, side?, size?, px?, oracle_px?, amount?, deposit_address?, reason_sha256 |
@@ -425,7 +452,8 @@ export interface SetupProgress {   // venue setup the engine runs through operat
   deskId: string;
   steps: {
     step: 'hl_set_referrer' | 'hl_approve_builder_fee' | 'orderly_register' | 'orderly_add_key'
-        | 'orderly_receiver_lookup' | 'orderly_referral_bind' | 'phoenix_register' | 'phoenix_referral';
+        | 'orderly_receiver_lookup' | 'orderly_referral_bind' | 'orderly_ip_restriction'   // skipped without an IP list
+        | 'phoenix_register' | 'phoenix_referral';
     status: 'pending' | 'running' | 'done' | 'skipped' | 'failed';
     detail?: string; tx: TxRef[];
   }[];

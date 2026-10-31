@@ -1,0 +1,1731 @@
+{
+  "file": "oneclick-live.json",
+  "briefs": "C6 (verify_quote, hl_send_to_intents, sol_sign_rescue, evm_usdc_to_intents, E_QUOTE_SIGNATURE / E_QUOTE_FIELDS / E_RESCUE_CAP), C8 (fund_venue, payouts to the contract)",
+  "generator": "gen/oneclick.mjs, cross-checked by gen/oneclick_check.py",
+  "references": [
+    "defuse-protocol/one-click-sdk-typescript 0.1.26 (quoteHash, verifyQuoteSignature over tweetnacl)",
+    "noble/curves 1.9.7",
+    "PyNaCl 1.6.2 + json.dumps(sort_keys) (oneclick_check.py)",
+    "live (dry: false, keyed) quotes from https://1click.chaindefuser.com/v0/quote fetched 2026-10-31"
+  ],
+  "public_key": "ed25519:reYaWhvwu8Jzo3WUM3zhn6VrhuMEF4eADL17qtRVifc",
+  "signature_rule": "Ed25519 by public_key over the UTF-8 bytes of base58(sha256(canonical_json)); canonical_json = json-stable-stringify (sorted keys, no spaces, undefined dropped) of the signed request fields, the signed quote fields and timestamp. The relayer passes canonical_json as the exact string; the contract hashes it as is, then parses it.",
+  "signed_fields": {
+    "request": [
+      "dry",
+      "swapType",
+      "slippageTolerance",
+      "originAsset",
+      "depositType",
+      "destinationAsset",
+      "amount",
+      "refundTo",
+      "refundType",
+      "recipient",
+      "recipientType",
+      "deadline"
+    ],
+    "request_if_truthy": [
+      "quoteWaitingTimeMs",
+      "referral",
+      "virtualChainRecipient",
+      "virtualChainRefundRecipient",
+      "customRecipientMsg"
+    ],
+    "quote_dry": [
+      "amountIn",
+      "amountInFormatted",
+      "amountInUsd",
+      "minAmountIn",
+      "amountOut",
+      "amountOutFormatted",
+      "amountOutUsd",
+      "minAmountOut"
+    ],
+    "quote_live_extra_if_truthy": [
+      "depositAddress",
+      "depositMemo",
+      "deadline",
+      "timeWhenInactive",
+      "timeEstimate",
+      "refundFee",
+      "withdrawFee"
+    ],
+    "plus": [
+      "timestamp"
+    ]
+  },
+  "not_signed": [
+    "appFees",
+    "depositMode",
+    "confidentiality",
+    "insured",
+    "sessionId",
+    "connectedWallets",
+    "correlationId",
+    "partnerId",
+    "userAccountId"
+  ],
+  "finding_app_fees": "appFees is not in the signed message (the SDK drops it), and 1Click echoes an appFees entry of its own even when the request sends none. The contract therefore never sees appFees and cannot refuse them; the only signed evidence of fees is amountOut / minAmountOut. See signed_cost_e8 on each quote.",
+  "dry_note": "These are live quotes (dry: false): each reserved a 1Click deposit address, and the signed message carries the live fields (depositAddress, the quote deadline replacing the request one, timeWhenInactive, timeEstimate, refundFee, withdrawFee when truthy). The field cases run with ctx.dry_ok = false, as in production. The deposit addresses lead to public test keys and must never be funded.",
+  "assets": {
+    "solUsdc": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+    "hlUsdc": "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054",
+    "arbUsdc": "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+    "nearUsdc": "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1"
+  },
+  "decimals": {
+    "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near": 6,
+    "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054": 8,
+    "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near": 6,
+    "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1": 6
+  },
+  "keys": {
+    "deskEvm": {
+      "role": "desk EVM address: Hyperliquid master, Orderly account owner, EIP-3009 `from`",
+      "private_key": "0x0101010101010101010101010101010101010101010101010101010101010101",
+      "address": "0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1",
+      "address_lower": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1"
+    },
+    "deskSol": {
+      "role": "desk Ed25519 key: Solana authority (Phoenix) and the desk's Orderly key",
+      "seed_hex": "0707070707070707070707070707070707070707070707070707070707070707",
+      "public_key_hex": "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+      "public_key_b58": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB"
+    },
+    "orderlyReceiver": {
+      "role": "the desk's pinned Orderly exclusive receiver address on Arbitrum",
+      "private_key": "0x0404040404040404040404040404040404040404040404040404040404040404",
+      "address": "0xc48B812bB43401392c037381AcA934F4069C0517",
+      "address_lower": "0xc48b812bb43401392c037381aca934f4069c0517"
+    },
+    "contractNear": {
+      "role": "the gimbal contract as a NEAR implicit account (hex of this public key)",
+      "seed_hex": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "public_key_hex": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+      "public_key_b58": "5Z6Ay5NEcbg3xhopc522sBCRXQujkTiuDRnHGfQdcnSf"
+    },
+    "strangerEvm": {
+      "role": "an EVM address the desk does not own (attacks, tampered quotes)",
+      "private_key": "0x0505050505050505050505050505050505050505050505050505050505050505",
+      "address": "0xd09Ad14080d4b257a819a4f579b8485Be88f086c",
+      "address_lower": "0xd09ad14080d4b257a819a4f579b8485be88f086c"
+    },
+    "strangerSol": {
+      "role": "a Solana address the desk does not own (attacks)",
+      "seed_hex": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+      "public_key_hex": "66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a",
+      "public_key_b58": "7v54NWdBtkjuAFJrLGsS2SXnuk8nKam81mZJeeYxVFi9"
+    }
+  },
+  "key_note": "Every address in these quotes belongs to a public test key (see the README); they are synthetic and must never be funded.",
+  "desk": {
+    "desk_id": "alpha",
+    "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+    "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+    "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+  },
+  "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+  "field_rule": "signature (E_QUOTE_SIGNATURE) -> live quote: dry refused unless ctx.dry_ok, live needs depositAddress (E_QUOTE_FIELDS) -> originAsset of the method: sol_sign_rescue Solana USDC, hl_send_to_intents HyperCore USDC, evm_usdc_to_intents Arbitrum USDC, fund_venue USDC on NEAR -> refundTo = desk Solana authority / desk EVM / desk EVM / the contract -> recipientType DESTINATION_CHAIN -> recipient: pinned Orderly receiver (Arbitrum USDC, minAmountOut >= 6000000), desk EVM (HyperCore USDC), desk Solana authority (Solana USDC), the contract (USDC on NEAR, customRecipientMsg exactly {\"desk_id\":\"<desk>\"}); anything else E_QUOTE_FIELDS -> deadline > now -> rescue methods: amountIn <= remaining_cap_usd * 10^decimals(origin) (E_RESCUE_CAP). EVM addresses compare case-insensitively, others exactly.",
+  "quotes": [
+    {
+      "name": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "request_body": {
+        "dry": false,
+        "swapType": "EXACT_INPUT",
+        "slippageTolerance": 100,
+        "depositType": "ORIGIN_CHAIN",
+        "refundType": "ORIGIN_CHAIN",
+        "recipientType": "DESTINATION_CHAIN",
+        "deadline": "2026-10-31T15:59:10.605Z",
+        "originAsset": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+        "destinationAsset": "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054",
+        "amount": "4000000",
+        "refundTo": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "recipient": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1"
+      },
+      "response": {
+        "quote": {
+          "amountIn": "4000000",
+          "amountInFormatted": "4.0",
+          "amountInUsd": "3.999496000000",
+          "minAmountIn": "4000000",
+          "amountOut": "368428600",
+          "amountOutFormatted": "3.684286",
+          "amountOutUsd": "3.683821779964",
+          "minAmountOut": "364434300",
+          "timeEstimate": 30,
+          "refundFee": "10024",
+          "withdrawFee": "31530000",
+          "deadline": "2026-11-03T15:59:10.605Z",
+          "timeWhenInactive": "2026-11-03T15:59:10.605Z",
+          "depositAddress": "68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36"
+        },
+        "quoteRequest": {
+          "dry": false,
+          "depositMode": "SIMPLE",
+          "swapType": "EXACT_INPUT",
+          "slippageTolerance": 100,
+          "originAsset": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+          "depositType": "ORIGIN_CHAIN",
+          "destinationAsset": "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054",
+          "amount": "4000000",
+          "refundTo": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "refundType": "ORIGIN_CHAIN",
+          "recipient": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "recipientType": "DESTINATION_CHAIN",
+          "deadline": "2026-10-31T15:59:10.605Z",
+          "confidentiality": "public",
+          "quoteWaitingTimeMs": 0,
+          "insured": false,
+          "appFees": [
+            {
+              "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+              "fee": 1,
+              "limitOrderId": null
+            }
+          ]
+        },
+        "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+        "timestamp": "2026-10-31T15:29:10.251Z"
+      },
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signed_message": "D4kCk24xMuFomAdJSGHBmHmSCBKjBZndChmYgXumAHnr",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "signature_valid": true,
+      "signed_cost_e8": "35565700",
+      "echoed_app_fees": [
+        {
+          "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+          "fee": 1,
+          "limitOrderId": null
+        }
+      ]
+    },
+    {
+      "name": "Solana USDC to the pinned Orderly receiver, 10 USDC",
+      "method": "sol_sign_rescue",
+      "request_body": {
+        "dry": false,
+        "swapType": "EXACT_INPUT",
+        "slippageTolerance": 100,
+        "depositType": "ORIGIN_CHAIN",
+        "refundType": "ORIGIN_CHAIN",
+        "recipientType": "DESTINATION_CHAIN",
+        "deadline": "2026-10-31T15:59:11.543Z",
+        "originAsset": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+        "destinationAsset": "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+        "amount": "10000000",
+        "refundTo": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "recipient": "0xc48b812bb43401392c037381aca934f4069c0517"
+      },
+      "response": {
+        "quote": {
+          "amountIn": "10000000",
+          "amountInFormatted": "10.0",
+          "amountInUsd": "9.998740000000",
+          "minAmountIn": "10000000",
+          "amountOut": "9993665",
+          "amountOutFormatted": "9.993665",
+          "amountOutUsd": "9.992405798210",
+          "minAmountOut": "9893728",
+          "timeEstimate": 19,
+          "refundFee": "10024",
+          "withdrawFee": "5300",
+          "deadline": "2026-11-03T15:59:11.543Z",
+          "timeWhenInactive": "2026-11-03T15:59:11.543Z",
+          "depositAddress": "3c4FLYTWuAbDVwi1Xpz4kFryXW2GudrmXUzLq4W17oxi"
+        },
+        "quoteRequest": {
+          "dry": false,
+          "depositMode": "SIMPLE",
+          "swapType": "EXACT_INPUT",
+          "slippageTolerance": 100,
+          "originAsset": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+          "depositType": "ORIGIN_CHAIN",
+          "destinationAsset": "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+          "amount": "10000000",
+          "refundTo": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "refundType": "ORIGIN_CHAIN",
+          "recipient": "0xc48b812bb43401392c037381aca934f4069c0517",
+          "recipientType": "DESTINATION_CHAIN",
+          "deadline": "2026-10-31T15:59:11.543Z",
+          "confidentiality": "public",
+          "quoteWaitingTimeMs": 0,
+          "insured": false,
+          "appFees": [
+            {
+              "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+              "fee": 1,
+              "limitOrderId": null
+            }
+          ]
+        },
+        "signature": "ed25519:3mrGwAT7Y22zymj3qmpXHGQidLmi7mw294tsPsGM1E8EZiATAiQh8TAFRE47GyASfr4nPm45rgmThPDwQY8gszKK",
+        "timestamp": "2026-10-31T15:29:11.125Z"
+      },
+      "canonical_json": "{\"amount\":\"10000000\",\"amountIn\":\"10000000\",\"amountInFormatted\":\"10.0\",\"amountInUsd\":\"9.998740000000\",\"amountOut\":\"9993665\",\"amountOutFormatted\":\"9.993665\",\"amountOutUsd\":\"9.992405798210\",\"deadline\":\"2026-11-03T15:59:11.543Z\",\"depositAddress\":\"3c4FLYTWuAbDVwi1Xpz4kFryXW2GudrmXUzLq4W17oxi\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near\",\"dry\":false,\"minAmountIn\":\"10000000\",\"minAmountOut\":\"9893728\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0xc48b812bb43401392c037381aca934f4069c0517\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":19,\"timeWhenInactive\":\"2026-11-03T15:59:11.543Z\",\"timestamp\":\"2026-10-31T15:29:11.125Z\",\"withdrawFee\":\"5300\"}",
+      "signed_message": "DgQR7YxveCZoGZnYcCwakA7tma3T4LwpioGtV2fEaYEP",
+      "signature": "ed25519:3mrGwAT7Y22zymj3qmpXHGQidLmi7mw294tsPsGM1E8EZiATAiQh8TAFRE47GyASfr4nPm45rgmThPDwQY8gszKK",
+      "signature_valid": true,
+      "signed_cost_e8": "10627200",
+      "echoed_app_fees": [
+        {
+          "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+          "fee": 1,
+          "limitOrderId": null
+        }
+      ]
+    },
+    {
+      "name": "Solana USDC to the pinned Orderly receiver, 5 USDC (minAmountOut below 6)",
+      "method": "sol_sign_rescue",
+      "request_body": {
+        "dry": false,
+        "swapType": "EXACT_INPUT",
+        "slippageTolerance": 100,
+        "depositType": "ORIGIN_CHAIN",
+        "refundType": "ORIGIN_CHAIN",
+        "recipientType": "DESTINATION_CHAIN",
+        "deadline": "2026-10-31T15:59:12.242Z",
+        "originAsset": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+        "destinationAsset": "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+        "amount": "5000000",
+        "refundTo": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "recipient": "0xc48b812bb43401392c037381aca934f4069c0517"
+      },
+      "response": {
+        "quote": {
+          "amountIn": "5000000",
+          "amountInFormatted": "5.0",
+          "amountInUsd": "4.999370000000",
+          "minAmountIn": "5000000",
+          "amountOut": "4994183",
+          "amountOutFormatted": "4.994183",
+          "amountOutUsd": "4.993553732942",
+          "minAmountOut": "4944241",
+          "timeEstimate": 19,
+          "refundFee": "10024",
+          "withdrawFee": "5300",
+          "deadline": "2026-11-03T15:59:12.242Z",
+          "timeWhenInactive": "2026-11-03T15:59:12.242Z",
+          "depositAddress": "AAgow2yoSuNdWu9S9GJrVfGNME9si4CNqTQS9vwwepTo"
+        },
+        "quoteRequest": {
+          "dry": false,
+          "depositMode": "SIMPLE",
+          "swapType": "EXACT_INPUT",
+          "slippageTolerance": 100,
+          "originAsset": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+          "depositType": "ORIGIN_CHAIN",
+          "destinationAsset": "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+          "amount": "5000000",
+          "refundTo": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "refundType": "ORIGIN_CHAIN",
+          "recipient": "0xc48b812bb43401392c037381aca934f4069c0517",
+          "recipientType": "DESTINATION_CHAIN",
+          "deadline": "2026-10-31T15:59:12.242Z",
+          "confidentiality": "public",
+          "quoteWaitingTimeMs": 0,
+          "insured": false,
+          "appFees": [
+            {
+              "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+              "fee": 1,
+              "limitOrderId": null
+            }
+          ]
+        },
+        "signature": "ed25519:44CACr763xKXNMSEpLhbuUpVJPoe8xau25pR8sAPbGY48XfT52JNCiwycc3pNTAdUzfjStPwBu3Bc8yt9Vs9WT1T",
+        "timestamp": "2026-10-31T15:29:11.796Z"
+      },
+      "canonical_json": "{\"amount\":\"5000000\",\"amountIn\":\"5000000\",\"amountInFormatted\":\"5.0\",\"amountInUsd\":\"4.999370000000\",\"amountOut\":\"4994183\",\"amountOutFormatted\":\"4.994183\",\"amountOutUsd\":\"4.993553732942\",\"deadline\":\"2026-11-03T15:59:12.242Z\",\"depositAddress\":\"AAgow2yoSuNdWu9S9GJrVfGNME9si4CNqTQS9vwwepTo\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near\",\"dry\":false,\"minAmountIn\":\"5000000\",\"minAmountOut\":\"4944241\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0xc48b812bb43401392c037381aca934f4069c0517\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":19,\"timeWhenInactive\":\"2026-11-03T15:59:12.242Z\",\"timestamp\":\"2026-10-31T15:29:11.796Z\",\"withdrawFee\":\"5300\"}",
+      "signed_message": "9F13T45UN8x3Rx8KFUPhGBGsNZYQDDVcTu1kx1spSdrK",
+      "signature": "ed25519:44CACr763xKXNMSEpLhbuUpVJPoe8xau25pR8sAPbGY48XfT52JNCiwycc3pNTAdUzfjStPwBu3Bc8yt9Vs9WT1T",
+      "signature_valid": true,
+      "signed_cost_e8": "5575900",
+      "echoed_app_fees": [
+        {
+          "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+          "fee": 1,
+          "limitOrderId": null
+        }
+      ]
+    },
+    {
+      "name": "Orderly money out: Arbitrum USDC (desk EVM) to Hyperliquid",
+      "method": "evm_usdc_to_intents",
+      "request_body": {
+        "dry": false,
+        "swapType": "EXACT_INPUT",
+        "slippageTolerance": 100,
+        "depositType": "ORIGIN_CHAIN",
+        "refundType": "ORIGIN_CHAIN",
+        "recipientType": "DESTINATION_CHAIN",
+        "deadline": "2026-10-31T15:59:12.894Z",
+        "originAsset": "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+        "destinationAsset": "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054",
+        "amount": "10000000",
+        "refundTo": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+        "recipient": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1"
+      },
+      "response": {
+        "quote": {
+          "amountIn": "10000000",
+          "amountInFormatted": "10.0",
+          "amountInUsd": "9.998740000000",
+          "minAmountIn": "10000000",
+          "amountOut": "968470000",
+          "amountOutFormatted": "9.6847",
+          "amountOutUsd": "9.683479727800",
+          "minAmountOut": "958475300",
+          "timeEstimate": 35,
+          "refundFee": "5300",
+          "withdrawFee": "31530000",
+          "deadline": "2026-11-03T15:59:12.894Z",
+          "timeWhenInactive": "2026-11-03T15:59:12.894Z",
+          "depositAddress": "0x1d5eD45fc6FDCca040aBEbB0B016bDf4962931Be"
+        },
+        "quoteRequest": {
+          "dry": false,
+          "depositMode": "SIMPLE",
+          "swapType": "EXACT_INPUT",
+          "slippageTolerance": 100,
+          "originAsset": "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+          "depositType": "ORIGIN_CHAIN",
+          "destinationAsset": "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054",
+          "amount": "10000000",
+          "refundTo": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "refundType": "ORIGIN_CHAIN",
+          "recipient": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "recipientType": "DESTINATION_CHAIN",
+          "deadline": "2026-10-31T15:59:12.894Z",
+          "confidentiality": "public",
+          "quoteWaitingTimeMs": 0,
+          "insured": false,
+          "appFees": []
+        },
+        "signature": "ed25519:3Q7CorNWby352VqVx7WBZT1qfZe8gfaEQKoQEiqM7wz8p2FS1ghEpzK3GcW31TJucBsUge6rWbGfPaZ4ZT6k7Bnj",
+        "timestamp": "2026-10-31T15:29:12.462Z"
+      },
+      "canonical_json": "{\"amount\":\"10000000\",\"amountIn\":\"10000000\",\"amountInFormatted\":\"10.0\",\"amountInUsd\":\"9.998740000000\",\"amountOut\":\"968470000\",\"amountOutFormatted\":\"9.6847\",\"amountOutUsd\":\"9.683479727800\",\"deadline\":\"2026-11-03T15:59:12.894Z\",\"depositAddress\":\"0x1d5eD45fc6FDCca040aBEbB0B016bDf4962931Be\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"10000000\",\"minAmountOut\":\"958475300\",\"originAsset\":\"nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"5300\",\"refundTo\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":35,\"timeWhenInactive\":\"2026-11-03T15:59:12.894Z\",\"timestamp\":\"2026-10-31T15:29:12.462Z\",\"withdrawFee\":\"31530000\"}",
+      "signed_message": "BdpVBe7RxY17yfiyQvCEYtpyCKVDTbvbXMkKAtkqrtnK",
+      "signature": "ed25519:3Q7CorNWby352VqVx7WBZT1qfZe8gfaEQKoQEiqM7wz8p2FS1ghEpzK3GcW31TJucBsUge6rWbGfPaZ4ZT6k7Bnj",
+      "signature_valid": true,
+      "signed_cost_e8": "41524700",
+      "echoed_app_fees": []
+    },
+    {
+      "name": "fund_venue: USDC on NEAR (contract) to Hyperliquid",
+      "method": "fund_venue",
+      "request_body": {
+        "dry": false,
+        "swapType": "EXACT_INPUT",
+        "slippageTolerance": 100,
+        "depositType": "ORIGIN_CHAIN",
+        "refundType": "ORIGIN_CHAIN",
+        "recipientType": "DESTINATION_CHAIN",
+        "deadline": "2026-10-31T15:59:13.224Z",
+        "originAsset": "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
+        "destinationAsset": "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054",
+        "amount": "20000000",
+        "refundTo": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "recipient": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1"
+      },
+      "response": {
+        "quote": {
+          "amountIn": "20000000",
+          "amountInFormatted": "20.0",
+          "amountInUsd": "19.997480000000",
+          "minAmountIn": "20000000",
+          "amountOut": "1968086000",
+          "amountOutFormatted": "19.68086",
+          "amountOutUsd": "19.678380211640",
+          "minAmountOut": "1948095100",
+          "timeEstimate": 30,
+          "refundFee": "5551",
+          "withdrawFee": "31530000",
+          "deadline": "2026-11-03T15:59:13.224Z",
+          "timeWhenInactive": "2026-11-03T15:59:13.224Z",
+          "depositAddress": "5a35e664068487b81f18a8aa38af2dfbc0984244296988bed60774ae2354d626"
+        },
+        "quoteRequest": {
+          "dry": false,
+          "depositMode": "SIMPLE",
+          "swapType": "EXACT_INPUT",
+          "slippageTolerance": 100,
+          "originAsset": "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
+          "depositType": "ORIGIN_CHAIN",
+          "destinationAsset": "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054",
+          "amount": "20000000",
+          "refundTo": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+          "refundType": "ORIGIN_CHAIN",
+          "recipient": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "recipientType": "DESTINATION_CHAIN",
+          "deadline": "2026-10-31T15:59:13.224Z",
+          "confidentiality": "public",
+          "quoteWaitingTimeMs": 0,
+          "insured": false,
+          "appFees": [
+            {
+              "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+              "fee": 1,
+              "limitOrderId": null
+            }
+          ]
+        },
+        "signature": "ed25519:52uVqJpL6gdRUr6jQ2YSA1TFP54iv4i47WrH9TSnxCYNUvTmSfeEbrzv1LWMg2M7qjBeJ6ZpBapqTVbRPv65F7nn",
+        "timestamp": "2026-10-31T15:29:12.781Z"
+      },
+      "canonical_json": "{\"amount\":\"20000000\",\"amountIn\":\"20000000\",\"amountInFormatted\":\"20.0\",\"amountInUsd\":\"19.997480000000\",\"amountOut\":\"1968086000\",\"amountOutFormatted\":\"19.68086\",\"amountOutUsd\":\"19.678380211640\",\"deadline\":\"2026-11-03T15:59:13.224Z\",\"depositAddress\":\"5a35e664068487b81f18a8aa38af2dfbc0984244296988bed60774ae2354d626\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"20000000\",\"minAmountOut\":\"1948095100\",\"originAsset\":\"nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"5551\",\"refundTo\":\"43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:13.224Z\",\"timestamp\":\"2026-10-31T15:29:12.781Z\",\"withdrawFee\":\"31530000\"}",
+      "signed_message": "2ZbCr1aNcru8cbsSuGRmWD4vM9pSFgrXi2CxAEkbf54G",
+      "signature": "ed25519:52uVqJpL6gdRUr6jQ2YSA1TFP54iv4i47WrH9TSnxCYNUvTmSfeEbrzv1LWMg2M7qjBeJ6ZpBapqTVbRPv65F7nn",
+      "signature_valid": true,
+      "signed_cost_e8": "51904900",
+      "echoed_app_fees": [
+        {
+          "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+          "fee": 1,
+          "limitOrderId": null
+        }
+      ]
+    },
+    {
+      "name": "fund_venue: USDC on NEAR (contract) to the pinned Orderly receiver",
+      "method": "fund_venue",
+      "request_body": {
+        "dry": false,
+        "swapType": "EXACT_INPUT",
+        "slippageTolerance": 100,
+        "depositType": "ORIGIN_CHAIN",
+        "refundType": "ORIGIN_CHAIN",
+        "recipientType": "DESTINATION_CHAIN",
+        "deadline": "2026-10-31T15:59:13.896Z",
+        "originAsset": "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
+        "destinationAsset": "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+        "amount": "10000000",
+        "refundTo": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "recipient": "0xc48b812bb43401392c037381aca934f4069c0517"
+      },
+      "response": {
+        "quote": {
+          "amountIn": "10000000",
+          "amountInFormatted": "10.0",
+          "amountInUsd": "9.998740000000",
+          "minAmountIn": "10000000",
+          "amountOut": "9992780",
+          "amountOutFormatted": "9.99278",
+          "amountOutUsd": "9.991520909720",
+          "minAmountOut": "9892852",
+          "timeEstimate": 19,
+          "refundFee": "5551",
+          "withdrawFee": "5300",
+          "deadline": "2026-11-03T15:59:13.896Z",
+          "timeWhenInactive": "2026-11-03T15:59:13.896Z",
+          "depositAddress": "d8d315f9fe45dbd7a287cce8df148cf71cc890dbf51ebc80e01aa302fe548c48"
+        },
+        "quoteRequest": {
+          "dry": false,
+          "depositMode": "SIMPLE",
+          "swapType": "EXACT_INPUT",
+          "slippageTolerance": 100,
+          "originAsset": "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
+          "depositType": "ORIGIN_CHAIN",
+          "destinationAsset": "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+          "amount": "10000000",
+          "refundTo": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+          "refundType": "ORIGIN_CHAIN",
+          "recipient": "0xc48b812bb43401392c037381aca934f4069c0517",
+          "recipientType": "DESTINATION_CHAIN",
+          "deadline": "2026-10-31T15:59:13.896Z",
+          "confidentiality": "public",
+          "quoteWaitingTimeMs": 0,
+          "insured": false,
+          "appFees": [
+            {
+              "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+              "fee": 1,
+              "limitOrderId": null
+            }
+          ]
+        },
+        "signature": "ed25519:2VhkyFzAaN2zPw3FWbxr6wN5hpdDzVXYzpSVyhx6X7BLGwCiEuFa7us7nQqnxyxqRkVzbfa3pPrYkkEUczVJQnbJ",
+        "timestamp": "2026-10-31T15:29:13.455Z"
+      },
+      "canonical_json": "{\"amount\":\"10000000\",\"amountIn\":\"10000000\",\"amountInFormatted\":\"10.0\",\"amountInUsd\":\"9.998740000000\",\"amountOut\":\"9992780\",\"amountOutFormatted\":\"9.99278\",\"amountOutUsd\":\"9.991520909720\",\"deadline\":\"2026-11-03T15:59:13.896Z\",\"depositAddress\":\"d8d315f9fe45dbd7a287cce8df148cf71cc890dbf51ebc80e01aa302fe548c48\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near\",\"dry\":false,\"minAmountIn\":\"10000000\",\"minAmountOut\":\"9892852\",\"originAsset\":\"nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1\",\"recipient\":\"0xc48b812bb43401392c037381aca934f4069c0517\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"5551\",\"refundTo\":\"43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":19,\"timeWhenInactive\":\"2026-11-03T15:59:13.896Z\",\"timestamp\":\"2026-10-31T15:29:13.455Z\",\"withdrawFee\":\"5300\"}",
+      "signed_message": "5gDm5QknEbZFCBW4k1faK8S4iY8TRxEQozgxWqd1kSxV",
+      "signature": "ed25519:2VhkyFzAaN2zPw3FWbxr6wN5hpdDzVXYzpSVyhx6X7BLGwCiEuFa7us7nQqnxyxqRkVzbfa3pPrYkkEUczVJQnbJ",
+      "signature_valid": true,
+      "signed_cost_e8": "10714800",
+      "echoed_app_fees": [
+        {
+          "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+          "fee": 1,
+          "limitOrderId": null
+        }
+      ]
+    },
+    {
+      "name": "rescue Phoenix -> Hyperliquid with appFees of 1% to a stranger",
+      "method": "sol_sign_rescue",
+      "request_body": {
+        "dry": false,
+        "swapType": "EXACT_INPUT",
+        "slippageTolerance": 100,
+        "depositType": "ORIGIN_CHAIN",
+        "refundType": "ORIGIN_CHAIN",
+        "recipientType": "DESTINATION_CHAIN",
+        "deadline": "2026-10-31T15:59:14.727Z",
+        "originAsset": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+        "destinationAsset": "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054",
+        "amount": "4000000",
+        "refundTo": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "recipient": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+        "appFees": [
+          {
+            "recipient": "66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a",
+            "fee": 100
+          }
+        ]
+      },
+      "response": {
+        "quote": {
+          "amountIn": "4000000",
+          "amountInFormatted": "4.0",
+          "amountInUsd": "3.999496000000",
+          "minAmountIn": "4000000",
+          "amountOut": "364468600",
+          "amountOutFormatted": "3.644686",
+          "amountOutUsd": "3.644226769564",
+          "minAmountOut": "360513900",
+          "timeEstimate": 30,
+          "refundFee": "10002",
+          "withdrawFee": "31530000",
+          "deadline": "2026-11-03T15:59:14.727Z",
+          "timeWhenInactive": "2026-11-03T15:59:14.727Z",
+          "depositAddress": "HcL6X3XyeaP1Yih2trcwEfAGBrouhnHxuQ5gB51YmuPp"
+        },
+        "quoteRequest": {
+          "dry": false,
+          "depositMode": "SIMPLE",
+          "swapType": "EXACT_INPUT",
+          "slippageTolerance": 100,
+          "originAsset": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+          "depositType": "ORIGIN_CHAIN",
+          "destinationAsset": "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054",
+          "amount": "4000000",
+          "refundTo": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "refundType": "ORIGIN_CHAIN",
+          "recipient": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "recipientType": "DESTINATION_CHAIN",
+          "deadline": "2026-10-31T15:59:14.727Z",
+          "confidentiality": "public",
+          "quoteWaitingTimeMs": 0,
+          "appFees": [
+            {
+              "recipient": "66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a",
+              "fee": 50,
+              "limitOrderId": null
+            },
+            {
+              "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+              "fee": 50,
+              "limitOrderId": null
+            }
+          ],
+          "insured": false
+        },
+        "signature": "ed25519:5u9Tj5bfVVmx3DVT6GMNeyQT5tXSGb7LEmKZS8f5PY5KUVukeKXNfevUtVVjvTGPPJGMoaYKgdEe1oKofokMbFAR",
+        "timestamp": "2026-10-31T15:29:14.286Z"
+      },
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"364468600\",\"amountOutFormatted\":\"3.644686\",\"amountOutUsd\":\"3.644226769564\",\"deadline\":\"2026-11-03T15:59:14.727Z\",\"depositAddress\":\"HcL6X3XyeaP1Yih2trcwEfAGBrouhnHxuQ5gB51YmuPp\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"360513900\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10002\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:14.727Z\",\"timestamp\":\"2026-10-31T15:29:14.286Z\",\"withdrawFee\":\"31530000\"}",
+      "signed_message": "DHhgCcj7DnGMEWUTJYvGM3jyZ2Uf8BfQu135prXjZP5A",
+      "signature": "ed25519:5u9Tj5bfVVmx3DVT6GMNeyQT5tXSGb7LEmKZS8f5PY5KUVukeKXNfevUtVVjvTGPPJGMoaYKgdEe1oKofokMbFAR",
+      "signature_valid": true,
+      "signed_cost_e8": "39486100",
+      "echoed_app_fees": [
+        {
+          "recipient": "66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a",
+          "fee": 50,
+          "limitOrderId": null
+        },
+        {
+          "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+          "fee": 50,
+          "limitOrderId": null
+        }
+      ]
+    },
+    {
+      "name": "Solana USDC with the refund going to a stranger",
+      "method": "sol_sign_rescue",
+      "request_body": {
+        "dry": false,
+        "swapType": "EXACT_INPUT",
+        "slippageTolerance": 100,
+        "depositType": "ORIGIN_CHAIN",
+        "refundType": "ORIGIN_CHAIN",
+        "recipientType": "DESTINATION_CHAIN",
+        "deadline": "2026-10-31T15:59:15.578Z",
+        "originAsset": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+        "destinationAsset": "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054",
+        "amount": "4000000",
+        "refundTo": "7v54NWdBtkjuAFJrLGsS2SXnuk8nKam81mZJeeYxVFi9",
+        "recipient": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1"
+      },
+      "response": {
+        "quote": {
+          "amountIn": "4000000",
+          "amountInFormatted": "4.0",
+          "amountInUsd": "3.999496000000",
+          "minAmountIn": "4000000",
+          "amountOut": "368428600",
+          "amountOutFormatted": "3.684286",
+          "amountOutUsd": "3.683821779964",
+          "minAmountOut": "364434300",
+          "timeEstimate": 30,
+          "refundFee": "255092",
+          "withdrawFee": "31530000",
+          "deadline": "2026-11-03T15:59:15.578Z",
+          "timeWhenInactive": "2026-11-03T15:59:15.578Z",
+          "depositAddress": "9VA427gfosP59V6NWUjreT7ijoXE5WPU9qyfA1jmEvJ4"
+        },
+        "quoteRequest": {
+          "dry": false,
+          "depositMode": "SIMPLE",
+          "swapType": "EXACT_INPUT",
+          "slippageTolerance": 100,
+          "originAsset": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+          "depositType": "ORIGIN_CHAIN",
+          "destinationAsset": "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054",
+          "amount": "4000000",
+          "refundTo": "7v54NWdBtkjuAFJrLGsS2SXnuk8nKam81mZJeeYxVFi9",
+          "refundType": "ORIGIN_CHAIN",
+          "recipient": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "recipientType": "DESTINATION_CHAIN",
+          "deadline": "2026-10-31T15:59:15.578Z",
+          "confidentiality": "public",
+          "quoteWaitingTimeMs": 0,
+          "insured": false,
+          "appFees": [
+            {
+              "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+              "fee": 1,
+              "limitOrderId": null
+            }
+          ]
+        },
+        "signature": "ed25519:5SLufuE1jT2t6Te7ZiQnnRKn3GDJSmi7XwjiLYwykHZFYDs7gLP6gUHLiAEQ2QNGnYZCr7oZhPQACZ2qR66pB9PE",
+        "timestamp": "2026-10-31T15:29:15.136Z"
+      },
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:15.578Z\",\"depositAddress\":\"9VA427gfosP59V6NWUjreT7ijoXE5WPU9qyfA1jmEvJ4\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"255092\",\"refundTo\":\"7v54NWdBtkjuAFJrLGsS2SXnuk8nKam81mZJeeYxVFi9\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:15.578Z\",\"timestamp\":\"2026-10-31T15:29:15.136Z\",\"withdrawFee\":\"31530000\"}",
+      "signed_message": "ESs4tZFPshJPaZ5P95z2VDuUA8NWJWZgCtEsh7H2g6v4",
+      "signature": "ed25519:5SLufuE1jT2t6Te7ZiQnnRKn3GDJSmi7XwjiLYwykHZFYDs7gLP6gUHLiAEQ2QNGnYZCr7oZhPQACZ2qR66pB9PE",
+      "signature_valid": true,
+      "signed_cost_e8": "35565700",
+      "echoed_app_fees": [
+        {
+          "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+          "fee": 1,
+          "limitOrderId": null
+        }
+      ]
+    }
+  ],
+  "unavailable": [
+    {
+      "name": "rescue Hyperliquid -> Phoenix: HyperCore USDC to the desk Solana authority",
+      "method": "hl_send_to_intents",
+      "request_body": {
+        "dry": false,
+        "swapType": "EXACT_INPUT",
+        "slippageTolerance": 100,
+        "depositType": "ORIGIN_CHAIN",
+        "refundType": "ORIGIN_CHAIN",
+        "recipientType": "DESTINATION_CHAIN",
+        "deadline": "2026-10-31T15:59:11.331Z",
+        "originAsset": "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054",
+        "destinationAsset": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+        "amount": "400000000",
+        "refundTo": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+        "recipient": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB"
+      },
+      "status": 400,
+      "message": "Quoting for this pair is not available",
+      "timestamp": "2026-10-31T15:29:10.937Z"
+    },
+    {
+      "name": "owner payout leg: HyperCore USDC to the contract with customRecipientMsg",
+      "method": "hl_send_to_intents",
+      "request_body": {
+        "dry": false,
+        "swapType": "EXACT_INPUT",
+        "slippageTolerance": 100,
+        "depositType": "ORIGIN_CHAIN",
+        "refundType": "ORIGIN_CHAIN",
+        "recipientType": "DESTINATION_CHAIN",
+        "deadline": "2026-10-31T15:59:14.538Z",
+        "originAsset": "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054",
+        "destinationAsset": "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
+        "amount": "1000000000",
+        "refundTo": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+        "recipient": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "customRecipientMsg": "{\"desk_id\":\"alpha\"}"
+      },
+      "status": 400,
+      "message": "Quoting for this pair is not available",
+      "timestamp": "2026-10-31T15:29:14.119Z"
+    },
+    {
+      "name": "HyperCore USDC to a stranger on Solana",
+      "method": "hl_send_to_intents",
+      "request_body": {
+        "dry": false,
+        "swapType": "EXACT_INPUT",
+        "slippageTolerance": 100,
+        "depositType": "ORIGIN_CHAIN",
+        "refundType": "ORIGIN_CHAIN",
+        "recipientType": "DESTINATION_CHAIN",
+        "deadline": "2026-10-31T15:59:15.403Z",
+        "originAsset": "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054",
+        "destinationAsset": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+        "amount": "400000000",
+        "refundTo": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+        "recipient": "7v54NWdBtkjuAFJrLGsS2SXnuk8nKam81mZJeeYxVFi9"
+      },
+      "status": 400,
+      "message": "Quoting for this pair is not available",
+      "timestamp": "2026-10-31T15:29:14.971Z"
+    }
+  ],
+  "unavailable_note": "Routes 1Click refused to quote at recording time (HTTP 400 \"Quoting for this pair is not available\"), dry quotes included; the same routes quoted on 2026-10-27 (oneclick.json).",
+  "tampered": [
+    {
+      "name": "amount raised (request amount and amountIn)",
+      "of": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "canonical_json": "{\"amount\":\"40000000\",\"amountIn\":\"40000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "signature_valid": false,
+      "expect": "E_QUOTE_SIGNATURE"
+    },
+    {
+      "name": "amountIn only",
+      "of": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000001\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "signature_valid": false,
+      "expect": "E_QUOTE_SIGNATURE"
+    },
+    {
+      "name": "minAmountOut raised",
+      "of": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434301\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "signature_valid": false,
+      "expect": "E_QUOTE_SIGNATURE"
+    },
+    {
+      "name": "recipient swapped for a stranger",
+      "of": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0xd09ad14080d4b257a819a4f579b8485be88f086c\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "signature_valid": false,
+      "expect": "E_QUOTE_SIGNATURE"
+    },
+    {
+      "name": "recipient in EIP-55 case (the signed string differs)",
+      "of": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "signature_valid": false,
+      "expect": "E_QUOTE_SIGNATURE"
+    },
+    {
+      "name": "refundTo swapped for a stranger",
+      "of": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"7v54NWdBtkjuAFJrLGsS2SXnuk8nKam81mZJeeYxVFi9\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "signature_valid": false,
+      "expect": "E_QUOTE_SIGNATURE"
+    },
+    {
+      "name": "deadline pushed back one day",
+      "of": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-04T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "signature_valid": false,
+      "expect": "E_QUOTE_SIGNATURE"
+    },
+    {
+      "name": "destinationAsset swapped",
+      "of": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "signature_valid": false,
+      "expect": "E_QUOTE_SIGNATURE"
+    },
+    {
+      "name": "originAsset swapped",
+      "of": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "signature_valid": false,
+      "expect": "E_QUOTE_SIGNATURE"
+    },
+    {
+      "name": "timestamp changed",
+      "of": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:11.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "signature_valid": false,
+      "expect": "E_QUOTE_SIGNATURE"
+    },
+    {
+      "name": "appFees field injected",
+      "of": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"appFees\":{\"0\":{\"fee\":100,\"recipient\":\"66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a\"}},\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "signature_valid": false,
+      "expect": "E_QUOTE_SIGNATURE"
+    },
+    {
+      "name": "same fields, pretty-printed (the contract hashes the exact string)",
+      "of": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "canonical_json": "{\n \"amount\": \"4000000\",\n \"amountIn\": \"4000000\",\n \"amountInFormatted\": \"4.0\",\n \"amountInUsd\": \"3.999496000000\",\n \"amountOut\": \"368428600\",\n \"amountOutFormatted\": \"3.684286\",\n \"amountOutUsd\": \"3.683821779964\",\n \"deadline\": \"2026-11-03T15:59:10.605Z\",\n \"depositAddress\": \"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\n \"depositType\": \"ORIGIN_CHAIN\",\n \"destinationAsset\": \"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\n \"dry\": false,\n \"minAmountIn\": \"4000000\",\n \"minAmountOut\": \"364434300\",\n \"originAsset\": \"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\n \"recipient\": \"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\n \"recipientType\": \"DESTINATION_CHAIN\",\n \"refundFee\": \"10024\",\n \"refundTo\": \"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\n \"refundType\": \"ORIGIN_CHAIN\",\n \"slippageTolerance\": 100,\n \"swapType\": \"EXACT_INPUT\",\n \"timeEstimate\": 30,\n \"timeWhenInactive\": \"2026-11-03T15:59:10.605Z\",\n \"timestamp\": \"2026-10-31T15:29:10.251Z\",\n \"withdrawFee\": \"31530000\"\n}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "expect": "E_QUOTE_SIGNATURE",
+      "signature_valid": false
+    },
+    {
+      "name": "one bit flipped in the signature",
+      "of": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTF6NCZf81HX8tPNUsZ6eahQaDbWev1kSxeHFyt8Yj3RURqR1895f4w5Jnn8hGTxXSp1NtobMNj",
+      "expect": "E_QUOTE_SIGNATURE",
+      "signature_valid": false
+    },
+    {
+      "name": "signature of another quote",
+      "of": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:3mrGwAT7Y22zymj3qmpXHGQidLmi7mw294tsPsGM1E8EZiATAiQh8TAFRE47GyASfr4nPm45rgmThPDwQY8gszKK",
+      "expect": "E_QUOTE_SIGNATURE",
+      "signature_valid": false
+    },
+    {
+      "name": "depositAddress swapped for another quote's",
+      "of": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"3c4FLYTWuAbDVwi1Xpz4kFryXW2GudrmXUzLq4W17oxi\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "signature_valid": false,
+      "expect": "E_QUOTE_SIGNATURE"
+    },
+    {
+      "name": "depositAddress dropped",
+      "of": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "signature_valid": false,
+      "expect": "E_QUOTE_SIGNATURE"
+    },
+    {
+      "name": "depositMemo injected",
+      "of": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositMemo\":\"1\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "signature_valid": false,
+      "expect": "E_QUOTE_SIGNATURE"
+    },
+    {
+      "name": "timeWhenInactive pushed back one day",
+      "of": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-04T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "signature_valid": false,
+      "expect": "E_QUOTE_SIGNATURE"
+    },
+    {
+      "name": "dry flipped to true",
+      "of": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":true,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "signature_valid": false,
+      "expect": "E_QUOTE_SIGNATURE"
+    }
+  ],
+  "field_cases": [
+    {
+      "name": "as quoted: rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "name": "as quoted: Solana USDC to the pinned Orderly receiver, 10 USDC",
+      "quote": "Solana USDC to the pinned Orderly receiver, 10 USDC",
+      "method": "sol_sign_rescue",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460611125,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "name": "as quoted: Solana USDC to the pinned Orderly receiver, 5 USDC (minAmountOut below 6)",
+      "quote": "Solana USDC to the pinned Orderly receiver, 5 USDC (minAmountOut below 6)",
+      "method": "sol_sign_rescue",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460611796,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_FIELDS",
+        "why": "minAmountOut below 6 USDC for the Orderly receiver"
+      }
+    },
+    {
+      "name": "as quoted: Orderly money out: Arbitrum USDC (desk EVM) to Hyperliquid",
+      "quote": "Orderly money out: Arbitrum USDC (desk EVM) to Hyperliquid",
+      "method": "evm_usdc_to_intents",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460612462,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "name": "as quoted: fund_venue: USDC on NEAR (contract) to Hyperliquid",
+      "quote": "fund_venue: USDC on NEAR (contract) to Hyperliquid",
+      "method": "fund_venue",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460612781,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "name": "as quoted: fund_venue: USDC on NEAR (contract) to the pinned Orderly receiver",
+      "quote": "fund_venue: USDC on NEAR (contract) to the pinned Orderly receiver",
+      "method": "fund_venue",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460613455,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "name": "as quoted: rescue Phoenix -> Hyperliquid with appFees of 1% to a stranger",
+      "quote": "rescue Phoenix -> Hyperliquid with appFees of 1% to a stranger",
+      "method": "sol_sign_rescue",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460614286,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "name": "as quoted: Solana USDC with the refund going to a stranger",
+      "quote": "Solana USDC with the refund going to a stranger",
+      "method": "sol_sign_rescue",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460615136,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_FIELDS",
+        "why": "refundTo"
+      }
+    },
+    {
+      "name": "Solana-origin quote passed to hl_send_to_intents",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "hl_send_to_intents",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_FIELDS",
+        "why": "origin asset"
+      }
+    },
+    {
+      "name": "NEAR-origin quote passed to evm_usdc_to_intents",
+      "quote": "fund_venue: USDC on NEAR (contract) to Hyperliquid",
+      "method": "evm_usdc_to_intents",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460612781,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_FIELDS",
+        "why": "origin asset"
+      }
+    },
+    {
+      "name": "deadline already passed",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793721550605,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_FIELDS",
+        "why": "deadline passed"
+      }
+    },
+    {
+      "name": "one millisecond before the deadline",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793721550604,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "name": "remaining rescue cap 3 USD < 4 USDC",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 3,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_RESCUE_CAP"
+      }
+    },
+    {
+      "name": "remaining rescue cap 3 USD does not apply to fund_venue",
+      "quote": "fund_venue: USDC on NEAR (contract) to Hyperliquid",
+      "method": "fund_venue",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460612781,
+        "remaining_cap_usd": 3,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "name": "desk whose EVM address differs (recipient is not this desk)",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0xd09ad14080d4b257a819a4f579b8485be88f086c",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_FIELDS",
+        "why": "recipient is not a desk address"
+      }
+    },
+    {
+      "name": "desk with a different pinned Orderly receiver",
+      "quote": "Solana USDC to the pinned Orderly receiver, 10 USDC",
+      "method": "sol_sign_rescue",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xd09ad14080d4b257a819a4f579b8485be88f086c"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460611125,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_FIELDS",
+        "why": "recipient is not a desk address"
+      }
+    },
+    {
+      "name": "tampered: amount raised (request amount and amountIn)",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "canonical_json": "{\"amount\":\"40000000\",\"amountIn\":\"40000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_SIGNATURE"
+      }
+    },
+    {
+      "name": "tampered: amountIn only",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000001\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_SIGNATURE"
+      }
+    },
+    {
+      "name": "tampered: minAmountOut raised",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434301\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_SIGNATURE"
+      }
+    },
+    {
+      "name": "tampered: recipient swapped for a stranger",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0xd09ad14080d4b257a819a4f579b8485be88f086c\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_SIGNATURE"
+      }
+    },
+    {
+      "name": "tampered: recipient in EIP-55 case (the signed string differs)",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0E3c3aF545E7AcBD38b07251B3990914F1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_SIGNATURE"
+      }
+    },
+    {
+      "name": "tampered: refundTo swapped for a stranger",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"7v54NWdBtkjuAFJrLGsS2SXnuk8nKam81mZJeeYxVFi9\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_SIGNATURE"
+      }
+    },
+    {
+      "name": "tampered: deadline pushed back one day",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-04T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_SIGNATURE"
+      }
+    },
+    {
+      "name": "tampered: destinationAsset swapped",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_SIGNATURE"
+      }
+    },
+    {
+      "name": "tampered: originAsset swapped",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_SIGNATURE"
+      }
+    },
+    {
+      "name": "tampered: timestamp changed",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:11.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_SIGNATURE"
+      }
+    },
+    {
+      "name": "tampered: appFees field injected",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"appFees\":{\"0\":{\"fee\":100,\"recipient\":\"66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a\"}},\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_SIGNATURE"
+      }
+    },
+    {
+      "name": "tampered: same fields, pretty-printed (the contract hashes the exact string)",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "canonical_json": "{\n \"amount\": \"4000000\",\n \"amountIn\": \"4000000\",\n \"amountInFormatted\": \"4.0\",\n \"amountInUsd\": \"3.999496000000\",\n \"amountOut\": \"368428600\",\n \"amountOutFormatted\": \"3.684286\",\n \"amountOutUsd\": \"3.683821779964\",\n \"deadline\": \"2026-11-03T15:59:10.605Z\",\n \"depositAddress\": \"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\n \"depositType\": \"ORIGIN_CHAIN\",\n \"destinationAsset\": \"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\n \"dry\": false,\n \"minAmountIn\": \"4000000\",\n \"minAmountOut\": \"364434300\",\n \"originAsset\": \"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\n \"recipient\": \"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\n \"recipientType\": \"DESTINATION_CHAIN\",\n \"refundFee\": \"10024\",\n \"refundTo\": \"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\n \"refundType\": \"ORIGIN_CHAIN\",\n \"slippageTolerance\": 100,\n \"swapType\": \"EXACT_INPUT\",\n \"timeEstimate\": 30,\n \"timeWhenInactive\": \"2026-11-03T15:59:10.605Z\",\n \"timestamp\": \"2026-10-31T15:29:10.251Z\",\n \"withdrawFee\": \"31530000\"\n}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_SIGNATURE"
+      }
+    },
+    {
+      "name": "tampered: one bit flipped in the signature",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTF6NCZf81HX8tPNUsZ6eahQaDbWev1kSxeHFyt8Yj3RURqR1895f4w5Jnn8hGTxXSp1NtobMNj",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_SIGNATURE"
+      }
+    },
+    {
+      "name": "tampered: signature of another quote",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:3mrGwAT7Y22zymj3qmpXHGQidLmi7mw294tsPsGM1E8EZiATAiQh8TAFRE47GyASfr4nPm45rgmThPDwQY8gszKK",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_SIGNATURE"
+      }
+    },
+    {
+      "name": "tampered: depositAddress swapped for another quote's",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"3c4FLYTWuAbDVwi1Xpz4kFryXW2GudrmXUzLq4W17oxi\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_SIGNATURE"
+      }
+    },
+    {
+      "name": "tampered: depositAddress dropped",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_SIGNATURE"
+      }
+    },
+    {
+      "name": "tampered: depositMemo injected",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositMemo\":\"1\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_SIGNATURE"
+      }
+    },
+    {
+      "name": "tampered: timeWhenInactive pushed back one day",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":false,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-04T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_SIGNATURE"
+      }
+    },
+    {
+      "name": "tampered: dry flipped to true",
+      "quote": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "method": "sol_sign_rescue",
+      "canonical_json": "{\"amount\":\"4000000\",\"amountIn\":\"4000000\",\"amountInFormatted\":\"4.0\",\"amountInUsd\":\"3.999496000000\",\"amountOut\":\"368428600\",\"amountOutFormatted\":\"3.684286\",\"amountOutUsd\":\"3.683821779964\",\"deadline\":\"2026-11-03T15:59:10.605Z\",\"depositAddress\":\"68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36\",\"depositType\":\"ORIGIN_CHAIN\",\"destinationAsset\":\"1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054\",\"dry\":true,\"minAmountIn\":\"4000000\",\"minAmountOut\":\"364434300\",\"originAsset\":\"nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near\",\"recipient\":\"0x1a642f0e3c3af545e7acbd38b07251b3990914f1\",\"recipientType\":\"DESTINATION_CHAIN\",\"refundFee\":\"10024\",\"refundTo\":\"GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\"refundType\":\"ORIGIN_CHAIN\",\"slippageTolerance\":100,\"swapType\":\"EXACT_INPUT\",\"timeEstimate\":30,\"timeWhenInactive\":\"2026-11-03T15:59:10.605Z\",\"timestamp\":\"2026-10-31T15:29:10.251Z\",\"withdrawFee\":\"31530000\"}",
+      "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793460610251,
+        "remaining_cap_usd": 50,
+        "dry_ok": false
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_SIGNATURE"
+      }
+    }
+  ]
+}
