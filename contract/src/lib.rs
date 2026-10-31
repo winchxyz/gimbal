@@ -4,10 +4,12 @@
 //! Rules that need no chain state live in `gimbal-core`; this crate holds state, roles, MPC calls and
 //! events, and turns a core [`Refusal`] into the panic `"E_CODE: msg"` with [`fail`].
 
+pub mod action;
 pub mod config;
 pub mod deposit;
 pub mod desk;
 pub mod events;
+pub mod hl;
 pub mod mpc;
 
 pub use gimbal_core::Refusal;

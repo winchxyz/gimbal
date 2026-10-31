@@ -14,6 +14,9 @@ use near_sdk::test_utils::{accounts, get_created_receipts, get_logs, VMContextBu
 use near_sdk::{testing_env, PromiseResult};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+/// The Hyperliquid methods, on these fixtures.
+mod hl;
+
 /// The EVM address and Solana authority the MPC answers in [`MPC_EVM`] and [`MPC_SOL`] give.
 const EVM: &str = "0x77cf7951f48ed15194825e2fe0908a6aa486d45a";
 const SOL_AUTHORITY: &str = "31wj7NJqAnKJYF9cZu7XR7xdCPxxcLKYkc2sh8ZExcJd";
