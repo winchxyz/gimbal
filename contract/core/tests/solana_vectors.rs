@@ -9,11 +9,11 @@ use gimbal_core::errors::{
 };
 use gimbal_core::phoenix::{
     check_message, check_onboarding, check_registration, Onboarding, Rescue, CANCEL_ALL,
-    DEPOSIT_FUNDS, EMBER_DEPOSIT, EMBER_WITHDRAW, PHOENIX_ACTIVE_TRADER_BUFFER,
-    PHOENIX_GLOBAL_CONFIGURATION, PHOENIX_GLOBAL_TRADER_INDEX, PHOENIX_LOG_AUTHORITY,
-    PHOENIX_ONBOARDING_PERMISSION, PHOENIX_PERP_ASSET_MAP, PHOENIX_RISK_AUTHORITY,
-    PHOENIX_WITHDRAW_QUEUE, PLACE_MARKET_ORDER, REGISTER_TRADER, SET_TRADER_CAPABILITIES_DELEGATED,
-    WITHDRAW_FUNDS,
+    DEPOSIT_FUNDS, EMBER_DEPOSIT, EMBER_WITHDRAW, MAX_COMPUTE_UNIT_LIMIT, MAX_COMPUTE_UNIT_PRICE,
+    MAX_PRIORITY_FEE_LAMPORTS, PHOENIX_ACTIVE_TRADER_BUFFER, PHOENIX_GLOBAL_CONFIGURATION,
+    PHOENIX_GLOBAL_TRADER_INDEX, PHOENIX_LOG_AUTHORITY, PHOENIX_ONBOARDING_PERMISSION,
+    PHOENIX_PERP_ASSET_MAP, PHOENIX_RISK_AUTHORITY, PHOENIX_WITHDRAW_QUEUE, PLACE_MARKET_ORDER,
+    REGISTER_TRADER, SET_TRADER_CAPABILITIES_DELEGATED, WITHDRAW_FUNDS,
 };
 use gimbal_core::policy::{PhoenixMarket, Policy, UnpricedAsset};
 use gimbal_core::solana::{
@@ -305,7 +305,7 @@ fn kinds_and_the_pause_gate() {
     };
     for (prefix, kind, reduces_risk) in [
         ("cancel all ETH", "cancel_all", true),
-        ("deposit 15 USDC", "deposit", true),
+        ("deposit 15 USDC", "deposit", false),
         ("withdraw 10 USDC", "withdraw", false),
         ("IOC sell 0.005 ETH", "order", false),
         ("rescue in one transaction", "rescue", false),
@@ -766,6 +766,25 @@ impl Draft {
         self.ixs[ix].1.swap(i, j);
         self
     }
+
+    /// The index of `key`, added as the last writable non-signer account if the message lacks
+    /// it (every index after it moves up one).
+    fn writable(&mut self, key: Pubkey) -> u8 {
+        if let Some(i) = self.keys.iter().position(|k| *k == key) {
+            return u8::try_from(i).unwrap();
+        }
+        let at = self.keys.len() - usize::from(self.header[2]);
+        self.keys.insert(at, key);
+        let at = u8::try_from(at).unwrap();
+        for (program, accounts, _) in &mut self.ixs {
+            for i in std::iter::once(program).chain(accounts.iter_mut()) {
+                if *i >= at {
+                    *i += 1;
+                }
+            }
+        }
+        at
+    }
 }
 
 #[test]
@@ -1200,6 +1219,200 @@ fn approval_cases(r: &mut Review<'_>) {
     );
 }
 
+/// Review item 3: a priority fee only with a unit limit, something to do besides the compute
+/// budget, and what a paused desk may sign.
+fn budget_cases(r: &mut Review<'_>) {
+    let doc = r.doc;
+    let desk = vector_desk(doc);
+    let stranger = key(&doc["keys"]["strangerSol"]["public_key_b58"]);
+    let cancel = "cancel all ETH";
+    // The vectors' budget: [limit 400000, price 100000, …].
+    let (limit, price) = (0, 1);
+    let mut d = r.draft(cancel);
+    d.ixs[price].2[1..9].copy_from_slice(&MAX_COMPUTE_UNIT_PRICE.to_le_bytes());
+    d.ixs = vec![d.ixs[price].clone()];
+    r.add(
+        3,
+        "review 3: only SetComputeUnitPrice 1000000",
+        cancel,
+        &d,
+        E_SOL_PROGRAM,
+    );
+    let mut d = r.draft(cancel);
+    d.ixs.remove(limit);
+    r.add(
+        3,
+        "review 3: a cancel_all with a priority fee and no unit limit",
+        cancel,
+        &d,
+        E_SOL_PROGRAM,
+    );
+    let mut d = r.draft(cancel);
+    d.ixs.swap(limit, price);
+    r.add(
+        3,
+        "review 3: a cancel_all with the unit limit after the price",
+        cancel,
+        &d,
+        "cancel_all reduces_risk",
+    );
+    let mut d = r.draft(cancel);
+    d.ixs.remove(price);
+    r.add(
+        3,
+        "review 3: a cancel_all with a unit limit and no price",
+        cancel,
+        &d,
+        "cancel_all reduces_risk",
+    );
+    let mut d = r.draft(cancel);
+    let again = d.ixs[limit].clone();
+    d.ixs.insert(limit, again);
+    r.add(
+        3,
+        "review 3: a cancel_all with two unit limits",
+        cancel,
+        &d,
+        E_SOL_PROGRAM,
+    );
+    let caps = "compute budget at the caps";
+    let mut d = r.draft(caps);
+    d.ixs.truncate(2);
+    r.add(
+        3,
+        "review 3: only the compute budget, at its caps",
+        caps,
+        &d,
+        E_SOL_MESSAGE,
+    );
+    let mut d = r.draft(cancel);
+    d.ixs.truncate(1);
+    r.add(3, "review 3: only a unit limit", cancel, &d, E_SOL_MESSAGE);
+    let mut d = r.draft(cancel);
+    d.ixs.clear();
+    r.add(
+        3,
+        "review 3: no instruction at all",
+        cancel,
+        &d,
+        E_SOL_MESSAGE,
+    );
+
+    // The pause gate.
+    let sell = "IOC sell 0.005 ETH, limit 2425.5";
+    let reduce_only = |r: &Review<'_>| {
+        let (mut d, i) = r.at(sell, PHOENIX_PROGRAM, &PLACE_MARKET_ORDER);
+        let flags = d.ixs[i].2.len() - 2;
+        d.ixs[i].2[flags] = 0x80;
+        (d, i)
+    };
+    let (d, _) = reduce_only(r);
+    r.add(
+        3,
+        "review 3: a reduce-only IOC sell",
+        sell,
+        &d,
+        "order reduces_risk",
+    );
+    let (mut d, i) = reduce_only(r);
+    let mut cancel_ix = d.ixs[i].clone();
+    cancel_ix.2 = CANCEL_ALL.to_vec();
+    d.ixs.push(cancel_ix);
+    r.add(
+        3,
+        "review 3: a reduce-only IOC sell, then cancel_all",
+        sell,
+        &d,
+        "order reduces_risk",
+    );
+    let (mut d, i) = r.at(sell, PHOENIX_PROGRAM, &PLACE_MARKET_ORDER);
+    let mut cancel_ix = d.ixs[i].clone();
+    cancel_ix.2 = CANCEL_ALL.to_vec();
+    d.ixs.insert(i, cancel_ix);
+    r.add(
+        3,
+        "review 3: cancel_all, then an IOC sell that is not reduce-only",
+        sell,
+        &d,
+        "order running",
+    );
+    // The lone Approve turned into a transfer from an account the desk may move (a stranger's,
+    // with the desk as its delegate) into the desk's PhUSD account.
+    let lone = "Token Approve of the desk PhUSD account to the Ember authority";
+    let transfer = |r: &Review<'_>, data: Vec<u8>| {
+        let (mut d, i) = r.at(lone, TOKEN_PROGRAM, &[4]);
+        let source = d.writable(stranger);
+        let into = d.ixs[i].1[0];
+        let owner = d.index(desk.authority);
+        d.ixs[i].1 = if data[0] == 12 {
+            vec![source, d.index(PHUSD_MINT), into, owner]
+        } else {
+            vec![source, into, owner]
+        };
+        d.ixs[i].2 = data;
+        d
+    };
+    let amount = 1_000_000u64.to_le_bytes();
+    let d = transfer(r, [&[3][..], &amount].concat());
+    r.add(
+        3,
+        "review 3: a Transfer into the desk PhUSD account",
+        lone,
+        &d,
+        "transaction reduces_risk",
+    );
+    let d = transfer(r, [&[12][..], &amount, &[6]].concat());
+    r.add(
+        3,
+        "review 3: a TransferChecked into the desk PhUSD account",
+        lone,
+        &d,
+        "transaction reduces_risk",
+    );
+    let deposit = "deposit 15 USDC";
+    let mut d = r.draft(deposit);
+    d.ixs.truncate(3);
+    r.add(
+        3,
+        "review 3: the desk PhUSD account created, nothing else",
+        deposit,
+        &d,
+        "transaction running",
+    );
+    let mut d = r.draft(deposit);
+    let wrap = d.find(EMBER_PROGRAM, &EMBER_DEPOSIT);
+    d.ixs = vec![d.ixs[0].clone(), d.ixs[1].clone(), d.ixs[wrap].clone()];
+    r.add(
+        3,
+        "review 3: an Ember wrap alone",
+        deposit,
+        &d,
+        "transaction running",
+    );
+    let withdraw = "withdraw 10 USDC";
+    let (mut d, i) = r.at(withdraw, PHOENIX_PROGRAM, &WITHDRAW_FUNDS);
+    d.ixs.remove(i);
+    r.add(
+        3,
+        "review 3: an Approve and its unwrap without the Phoenix withdrawal",
+        withdraw,
+        &d,
+        "transaction running",
+    );
+}
+
+/// With the limit the price now needs, the priority fee is at most 0.0006 SOL; without one, the
+/// 1,400,000 units a message may burn at the top price would pay 0.0014 SOL.
+#[test]
+fn the_priority_fee_is_capped_by_the_limit_and_the_price_together() {
+    assert_eq!(
+        MAX_PRIORITY_FEE_LAMPORTS,
+        u64::from(MAX_COMPUTE_UNIT_LIMIT) * MAX_COMPUTE_UNIT_PRICE / 1_000_000
+    );
+    assert_eq!(MAX_PRIORITY_FEE_LAMPORTS, 600_000);
+    assert_eq!(1_400_000 * MAX_COMPUTE_UNIT_PRICE / 1_000_000, 1_400_000);
+}
+
 fn review_doc() -> Value {
     let doc = sol_doc();
     let mut r = Review {
@@ -1208,6 +1421,7 @@ fn review_doc() -> Value {
     };
     layout_cases(&mut r);
     approval_cases(&mut r);
+    budget_cases(&mut r);
     serde_json::json!({
         "file": "solana-review.json",
         "note": "Review cases for the sol_sign policy. Each edits one message of solana.json, \

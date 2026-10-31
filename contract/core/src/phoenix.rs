@@ -24,6 +24,10 @@ use crate::solana::{
 pub const MAX_COMPUTE_UNIT_LIMIT: u32 = 600_000;
 /// The highest priority fee a message may set, in micro-lamports per compute unit.
 pub const MAX_COMPUTE_UNIT_PRICE: u64 = 1_000_000;
+/// The most a message may pay in priority fees, in lamports: both caps together, 0.0006 SOL. A
+/// price is taken only with a unit limit, which bounds the units it pays for.
+pub const MAX_PRIORITY_FEE_LAMPORTS: u64 =
+    MAX_COMPUTE_UNIT_LIMIT as u64 * MAX_COMPUTE_UNIT_PRICE / 1_000_000;
 
 // Anchor discriminators, sha256("global:<name>")[0..8].
 /// Phoenix `place_market_order`.
@@ -168,8 +172,10 @@ pub struct CheckedMessage {
     /// Phoenix action it takes, else `transaction`; `rescue` in rescue mode.
     pub kind: &'static str,
     pub orders: Vec<PhoenixOrder>,
-    /// True when it only reduces risk, so a paused desk may sign it: every order is reduce-only
-    /// and nothing is withdrawn from Phoenix.
+    /// True when a paused desk may sign it: besides the compute budget, every instruction is a
+    /// `cancel_all`, a reduce-only order, a `Revoke` of a desk token account or a token transfer
+    /// into a desk token account. Anything else (a deposit or withdrawal, Ember, a token account
+    /// created, an `Approve`, a rescue transfer, which moves money out) needs a running desk.
     pub reduces_risk: bool,
 }
 
@@ -222,9 +228,9 @@ fn le_u64(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(word)
 }
 
-/// A compute budget instruction within the caps; returns its opcode. Anything but a unit limit
+/// A compute budget instruction within the caps: its opcode and value. Anything but a unit limit
 /// or a unit price is `E_SOL_PROGRAM`.
-fn check_compute_budget(data: &[u8], n: usize) -> Result<u8, Refusal> {
+fn check_compute_budget(data: &[u8], n: usize) -> Result<(u8, u64), Refusal> {
     match (data.first(), data.len()) {
         (Some(&SET_COMPUTE_UNIT_LIMIT), 5) => {
             let limit = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
@@ -235,7 +241,7 @@ fn check_compute_budget(data: &[u8], n: usize) -> Result<u8, Refusal> {
                     format!("compute unit limit {limit} is over {MAX_COMPUTE_UNIT_LIMIT}"),
                 ));
             }
-            Ok(SET_COMPUTE_UNIT_LIMIT)
+            Ok((SET_COMPUTE_UNIT_LIMIT, u64::from(limit)))
         }
         (Some(&SET_COMPUTE_UNIT_PRICE), 9) => {
             let price = le_u64(&data[1..]);
@@ -248,7 +254,7 @@ fn check_compute_budget(data: &[u8], n: usize) -> Result<u8, Refusal> {
                     ),
                 ));
             }
-            Ok(SET_COMPUTE_UNIT_PRICE)
+            Ok((SET_COMPUTE_UNIT_PRICE, price))
         }
         _ => Err(at(
             n,
@@ -258,23 +264,54 @@ fn check_compute_budget(data: &[u8], n: usize) -> Result<u8, Refusal> {
     }
 }
 
-/// Compute budget instructions may each come once (Solana refuses a repeat anyway).
+/// The compute budget a message sets: a unit limit and a unit price, each at most once (Solana
+/// refuses a repeat anyway), with the instruction that set it.
 #[derive(Default)]
 struct Budget {
-    seen: Vec<u8>,
+    limit: Option<(usize, u64)>,
+    price: Option<(usize, u64)>,
 }
 
 impl Budget {
     fn check(&mut self, data: &[u8], n: usize) -> Result<(), Refusal> {
-        let op = check_compute_budget(data, n)?;
-        if self.seen.contains(&op) {
+        let (op, value) = check_compute_budget(data, n)?;
+        let slot = if op == SET_COMPUTE_UNIT_LIMIT {
+            &mut self.limit
+        } else {
+            &mut self.price
+        };
+        if slot.replace((n, value)).is_some() {
             return Err(at(
                 n,
                 E_SOL_PROGRAM,
                 "a repeated compute budget instruction",
             ));
         }
-        self.seen.push(op);
+        Ok(())
+    }
+
+    /// A price needs a limit: without one every instruction may burn 200,000 units, up to
+    /// 1,400,000, each paying the price. With both, the priority fee is at most
+    /// [`MAX_PRIORITY_FEE_LAMPORTS`].
+    fn finish(&self) -> Result<(), Refusal> {
+        let Some((n, price)) = self.price else {
+            return Ok(());
+        };
+        let Some((_, limit)) = self.limit else {
+            return Err(at(
+                n,
+                E_SOL_PROGRAM,
+                "a priority fee needs a SetComputeUnitLimit in the same message",
+            ));
+        };
+        let fee = (u128::from(limit) * u128::from(price)).div_ceil(1_000_000);
+        if fee > u128::from(MAX_PRIORITY_FEE_LAMPORTS) {
+            return Err(at(
+                n,
+                E_SOL_PROGRAM,
+                format!("a priority fee of {fee} lamports is over {MAX_PRIORITY_FEE_LAMPORTS}"),
+            ));
+        }
         Ok(())
     }
 }
@@ -382,18 +419,31 @@ struct Walk<'a> {
     rescue_transfers: u32,
     orders: Vec<PhoenixOrder>,
     phoenix: Option<&'static str>,
-    withdraws: bool,
+    /// Instructions besides the compute budget.
+    actions: usize,
+    /// False once an instruction a paused desk may not sign comes ([`CheckedMessage`]); orders
+    /// are counted at the end.
+    reduces_risk: bool,
     /// An `Approve` waiting for the Ember unwrap it is for: its instruction and amount.
     approval: Option<(usize, u64)>,
 }
 
 impl<'a> Walk<'a> {
     fn instruction(&mut self, ix: &Instruction<'_>, n: usize) -> Result<(), Refusal> {
+        if ix.program != COMPUTE_BUDGET_PROGRAM {
+            self.actions += 1;
+        }
         match ix.program {
             COMPUTE_BUDGET_PROGRAM => self.budget.check(ix.data, n),
-            ATA_PROGRAM => self.create_token_account(ix, n),
+            ATA_PROGRAM => {
+                self.reduces_risk = false;
+                self.create_token_account(ix, n)
+            }
             TOKEN_PROGRAM => self.token(ix, n),
-            EMBER_PROGRAM => self.ember(ix, n),
+            EMBER_PROGRAM => {
+                self.reduces_risk = false;
+                self.ember(ix, n)
+            }
             PHOENIX_PROGRAM => self.phoenix(ix, n),
             program => Err(at(
                 n,
@@ -495,6 +545,7 @@ impl<'a> Walk<'a> {
                     ));
                 }
                 self.approval = Some((n, le_u64(&ix.data[1..])));
+                self.reduces_risk = false;
                 Ok(())
             }
             Some(&TOKEN_REVOKE) => {
@@ -555,6 +606,7 @@ impl<'a> Walk<'a> {
                     ));
                 }
                 self.rescue_transfers += 1;
+                self.reduces_risk = false;
                 if self.rescue_transfers > 1 {
                     return Err(at(n, E_QUOTE_FIELDS, "a second rescue transfer"));
                 }
@@ -717,6 +769,7 @@ impl<'a> Walk<'a> {
                         (9, PHOENIX_ACTIVE_TRADER_BUFFER, buffer),
                     ],
                 )?;
+                self.reduces_risk = false;
                 self.phoenix.get_or_insert("deposit");
             }
             WITHDRAW_FUNDS => {
@@ -738,7 +791,7 @@ impl<'a> Walk<'a> {
                         (11, PHOENIX_WITHDRAW_QUEUE, "Phoenix's withdraw queue"),
                     ],
                 )?;
-                self.withdraws = true;
+                self.reduces_risk = false;
                 self.phoenix.get_or_insert("withdraw");
             }
             _ => {
@@ -812,7 +865,7 @@ impl<'a> Walk<'a> {
 /// first refusal being the answer:
 ///
 /// - compute budget: a unit limit up to [`MAX_COMPUTE_UNIT_LIMIT`] and a price up to
-///   [`MAX_COMPUTE_UNIT_PRICE`], once each;
+///   [`MAX_COMPUTE_UNIT_PRICE`], once each, a price only with a limit;
 /// - token account program: `CreateIdempotent` paid by the desk for its own USDC or PhUSD account
 ///   (or, in a rescue, the deposit owner's USDC account);
 /// - SPL Token: `Approve` of the desk's PhUSD account to the Ember authority for exactly the
@@ -830,7 +883,10 @@ impl<'a> Walk<'a> {
 ///
 /// A program outside this list, another instruction of these programs or a value over a cap is
 /// `E_SOL_PROGRAM`, an account the desk does not own or out of its place `E_SOL_ACCOUNT`, a
-/// market outside the policy `E_ASSET`.
+/// market outside the policy `E_ASSET`. After the walk: a price without a limit, then an
+/// `Approve` its unwrap never spent, is `E_SOL_PROGRAM`, and a message with nothing besides the
+/// compute budget `E_SOL_MESSAGE`. [`CheckedMessage::reduces_risk`] says whether a paused desk
+/// may sign the message.
 pub fn check_message(
     sha256: Sha256,
     policy: &Policy,
@@ -859,17 +915,25 @@ pub fn check_message(
         rescue_transfers: 0,
         orders: Vec::new(),
         phoenix: None,
-        withdraws: false,
+        actions: 0,
+        reduces_risk: true,
         approval: None,
     };
     for (n, ix) in m.instructions.iter().enumerate() {
         walk.instruction(ix, n)?;
     }
+    walk.budget.finish()?;
     if let Some((n, amount)) = walk.approval {
         return Err(at(
             n,
             E_SOL_PROGRAM,
             format!("an Approve of {amount} with no Ember unwrap of that amount after it"),
+        ));
+    }
+    if walk.actions == 0 {
+        return Err(Refusal::new(
+            E_SOL_MESSAGE,
+            "the message has no instruction besides the compute budget",
         ));
     }
     if rescue.is_some() && walk.rescue_transfers != 1 {
@@ -885,7 +949,7 @@ pub fn check_message(
     } else {
         walk.phoenix.unwrap_or("transaction")
     };
-    let reduces_risk = walk.orders.iter().all(|o| o.reduce_only) && !walk.withdraws;
+    let reduces_risk = walk.reduces_risk && walk.orders.iter().all(|o| o.reduce_only);
     Ok(CheckedMessage {
         kind,
         orders: walk.orders,

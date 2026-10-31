@@ -270,14 +270,9 @@ fn sol_sign_signs_an_unpriced_order() {
         .starts_with("E_SIZE: instruction 2: ETH size 0.04 is over its max_sz 0.005"));
 }
 
-/// The vector order `prefix` with its order flags byte (second to last) set to `flags`.
-fn with_flags(prefix: &str, flags: u8) -> Vec<u8> {
-    let mut bytes = bytes_of(&case(&vectors(), prefix));
-    let at = bytes.len() - 2;
-    bytes[at] = flags;
-    bytes
-}
-
+/// A paused desk signs a message only if, besides the compute budget, it cancels, places
+/// reduce-only orders, revokes a delegate of a desk token account or moves tokens into one; every
+/// other message that passes the policy waits for a running desk.
 #[test]
 fn a_paused_desk_signs_only_what_reduces_risk() {
     let mut p = sol_policy();
@@ -286,28 +281,52 @@ fn a_paused_desk_signs_only_what_reduces_risk() {
         max_sz: "0.005".into(),
     }];
     p.unpriced_max_notional_usd = 50;
-    let mut g = sol_desk_with(p);
+    let accounts = derived();
+    let mut g = sol_desk_with(p.clone());
     g.desks.get_mut("alpha").unwrap().paused = true;
     let paused = "E_PAUSED: desk alpha is paused";
-    for (doc, prefix, kind) in [
-        (vectors(), "cancel all ETH", "cancel_all"),
-        (vectors(), "deposit 15 USDC", "deposit"),
-        (
-            review(),
-            "review 2: lone Revoke of the desk PhUSD",
-            "transaction",
-        ),
-    ] {
-        let bytes = bytes_of(&case(&doc, prefix));
-        assert_eq!(sol_sign(&mut g, &bytes).unwrap().kind, kind, "{prefix}");
+    let mut answers = vec![];
+    for c in cases(&vectors()).into_iter().chain(cases(&review())) {
+        let bytes = bytes_of(&c);
+        let Ok(want) = check_message(sha256, &p, &accounts, &bytes, &|_| None, None) else {
+            continue;
+        };
+        let got = sol_sign(&mut g, &bytes);
+        let name = c["name"].as_str().unwrap().to_owned();
+        if want.reduces_risk {
+            assert_eq!(got.unwrap().kind, want.kind, "{name}");
+        } else {
+            assert!(got.unwrap_err().starts_with(paused), "{name}");
+        }
+        answers.push((name, want.reduces_risk));
     }
-    // A reduce-only close signs; the same order opening risk does not.
-    let close = with_flags("IOC sell 0.005 ETH, limit 2425.5", 0x80);
-    assert_eq!(sol_sign(&mut g, &close).unwrap().kind, "order");
-    let open = bytes_of(&case(&vectors(), "IOC sell 0.005 ETH, limit 2425.5"));
-    assert!(sol_sign(&mut g, &open).unwrap_err().starts_with(paused));
-    let withdraw = bytes_of(&case(&vectors(), "withdraw 10 USDC"));
-    assert!(sol_sign(&mut g, &withdraw).unwrap_err().starts_with(paused));
+    let signs = |prefix: &str| {
+        answers
+            .iter()
+            .find(|(n, _)| n.starts_with(prefix))
+            .unwrap_or_else(|| panic!("{prefix}"))
+            .1
+    };
+    for prefix in [
+        "cancel all ETH",
+        "review 2: lone Revoke of the desk PhUSD account",
+        "review 3: a reduce-only IOC sell",
+        "review 3: a Transfer into the desk PhUSD account",
+        "review 3: a TransferChecked into the desk PhUSD account",
+    ] {
+        assert!(signs(prefix), "{prefix}");
+    }
+    for prefix in [
+        "deposit 15 USDC",
+        "withdraw 10 USDC",
+        "IOC sell 0.005 ETH, limit 2425.5",
+        "review 3: cancel_all, then an IOC sell that is not reduce-only",
+        "review 3: the desk PhUSD account created, nothing else",
+        "review 3: an Ember wrap alone",
+        "review 3: an Approve and its unwrap without the Phoenix withdrawal",
+    ] {
+        assert!(!signs(prefix), "{prefix}");
+    }
     // The message is checked first: a bad one is its own refusal, paused or not.
     let attack = bytes_of(&case(&vectors(), "attack: memo program"));
     assert!(sol_sign(&mut g, &attack)
