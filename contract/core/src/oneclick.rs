@@ -9,7 +9,8 @@
 //! destination pair, the deadline, and for a rescue the remaining hourly cap (`E_QUOTE_FIELDS`,
 //! `E_RESCUE_CAP`). [`check_cost`] bounds what one transfer may cost through the signed
 //! `minAmountOut`; [`transfer_cost_e8`] and [`rescue_cost_budget_e8`] bound what the rescues of an
-//! hour may cost together.
+//! hour may cost together. [`check_quote_age`] bounds how long after 1Click signed it a quote can
+//! be paid, which the contract applies next to its ring of paid deposit addresses.
 //!
 //! sha256 and the Ed25519 check come from the caller, so the contract uses the host's.
 
@@ -41,6 +42,16 @@ pub const NEAR_USDC: &str =
 /// The least `minAmountOut` of a quote into the Orderly receiver, USDC × 1e6: Orderly loses a
 /// deposit under 5 USDC, and the margin covers the transfer's own cost.
 pub const ORDERLY_MIN_OUT_E6: u128 = 6_000_000;
+
+/// How long after its signed `timestamp` a quote can still be paid, ms. A desk remembers only the
+/// last 32 deposit addresses it paid, and a live quote's `deadline` is three days out (1Click sets
+/// it to the requested deadline + 72 h, `oneclick-live.json`), so the deadline alone would let a
+/// quote come back once the ring has forgotten it.
+pub const QUOTE_MAX_AGE_MS: u64 = 3_600_000;
+
+/// How far after the block time a quote's `timestamp` may lie, ms: clock skew between 1Click and
+/// the chain, never a way to stretch [`QUOTE_MAX_AGE_MS`].
+pub const QUOTE_MAX_AHEAD_MS: u64 = 300_000;
 
 /// The decimals of a USDC asset 1Click quotes.
 pub fn decimals(asset: &str) -> Option<u32> {
@@ -143,6 +154,8 @@ pub struct VerifiedQuote {
     pub destination_asset: String,
     pub recipient: String,
     pub deadline_ms: u64,
+    /// The signed `timestamp`: when 1Click signed the quote, ms.
+    pub signed_at_ms: u64,
 }
 
 /// The signed fields (oneclick.json `signed_fields`). Anything else in a signed quote is refused.
@@ -193,7 +206,7 @@ struct Fields {
     refund_fee: Option<IgnoredAny>,
     #[serde(default)]
     withdraw_fee: Option<IgnoredAny>,
-    timestamp: IgnoredAny,
+    timestamp: String,
 }
 
 fn fields(msg: impl AsRef<str>) -> Refusal {
@@ -331,6 +344,12 @@ pub fn verify_quote(
             f.deadline, ctx.now_ms
         )));
     }
+    let signed_at_ms = parse_time_ms(&f.timestamp).ok_or_else(|| {
+        fields(format!(
+            "timestamp {} is not a UTC time",
+            shown(&f.timestamp)
+        ))
+    })?;
 
     let origin_decimals = decimals(method.origin_asset()).unwrap_or(6);
     let amount_in_e8 = to_e8(amount_in, origin_decimals)?;
@@ -355,7 +374,30 @@ pub fn verify_quote(
         destination_asset: f.destination_asset,
         recipient: f.recipient,
         deadline_ms,
+        signed_at_ms,
     })
+}
+
+/// The quote was signed at most [`QUOTE_MAX_AGE_MS`] before `now_ms` and at most
+/// [`QUOTE_MAX_AHEAD_MS`] after it (`E_QUOTE_FIELDS`). With the deadline check of
+/// [`verify_quote`], a quote can be paid until the earlier of its deadline and an hour after
+/// 1Click signed it.
+pub fn check_quote_age(q: &VerifiedQuote, now_ms: u64) -> Result<(), Refusal> {
+    if now_ms.saturating_sub(q.signed_at_ms) > QUOTE_MAX_AGE_MS {
+        return Err(fields(format!(
+            "the quote was signed at {} ms, more than 1 h before the block time {now_ms} ms: a \
+             desk remembers only its last 32 deposit addresses, so an older quote could pay one \
+             twice",
+            q.signed_at_ms
+        )));
+    }
+    if q.signed_at_ms.saturating_sub(now_ms) > QUOTE_MAX_AHEAD_MS {
+        return Err(fields(format!(
+            "the quote was signed at {} ms, more than 5 min after the block time {now_ms} ms",
+            q.signed_at_ms
+        )));
+    }
+    Ok(())
 }
 
 /// The recipient and destination pairs a quote may pay: the pinned Orderly receiver (Arbitrum
@@ -629,7 +671,30 @@ mod tests {
             destination_asset: HL_USDC.into(),
             recipient: String::new(),
             deadline_ms: 0,
+            signed_at_ms: 0,
         }
+    }
+
+    /// An hour after signing at most, five minutes before it at most; both edges included.
+    #[test]
+    fn the_age_bound() {
+        let at = |signed_at_ms| VerifiedQuote {
+            signed_at_ms,
+            ..verified(400_000_000, 364_422_300)
+        };
+        let now = 1_793_460_610_251;
+        assert!(check_quote_age(&at(now), now).is_ok());
+        assert!(check_quote_age(&at(now - QUOTE_MAX_AGE_MS), now).is_ok());
+        assert!(check_quote_age(&at(now + QUOTE_MAX_AHEAD_MS), now).is_ok());
+        let old = check_quote_age(&at(now - QUOTE_MAX_AGE_MS - 1), now).unwrap_err();
+        assert_eq!(old.code, E_QUOTE_FIELDS);
+        assert!(old.msg.contains("more than 1 h before"), "{}", old.msg);
+        let ahead = check_quote_age(&at(now + QUOTE_MAX_AHEAD_MS + 1), now).unwrap_err();
+        assert_eq!(ahead.code, E_QUOTE_FIELDS);
+        assert!(ahead.msg.contains("more than 5 min after"), "{}", ahead.msg);
+        // Neither end overflows.
+        assert!(check_quote_age(&at(0), u64::MAX).is_err());
+        assert!(check_quote_age(&at(u64::MAX), 0).is_err());
     }
 
     /// The policy defaults (100 bp, 0.5 USDC) against the recorded quotes' costs.

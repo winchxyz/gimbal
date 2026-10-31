@@ -26,8 +26,8 @@ use gimbal_core::errors::{Refusal, E_QUOTE_FIELDS, E_RESCUE_CAP};
 use gimbal_core::hl::{usdc_token, Address, UserAction};
 use gimbal_core::ids::{check_base58_32, check_reason};
 use gimbal_core::oneclick::{
-    check_cost, rescue_cost_budget_e8, transfer_cost_e8, verify_quote, Context, DeskAddresses,
-    Method, VerifiedQuote,
+    check_cost, check_quote_age, rescue_cost_budget_e8, transfer_cost_e8, verify_quote, Context,
+    DeskAddresses, Method, VerifiedQuote,
 };
 use gimbal_core::phoenix::{check_message, Rescue};
 use near_sdk::{env, near, Promise};
@@ -211,8 +211,9 @@ impl Gimbal {
 
 impl Gimbal {
     /// The quote checked for `method` on the desk at the block time: [`verify_quote`] (with what
-    /// is left of the desk's cap), then [`check_cost`] at the policy's bounds. The build step
-    /// counts it ([`Self::counted_rescue`]).
+    /// is left of the desk's cap), [`check_quote_age`] (signed at most an hour ago, so the ring
+    /// of paid deposit addresses outlives every quote it could see again), then [`check_cost`]
+    /// at the policy's bounds. The build step counts it ([`Self::counted_rescue`]).
     pub fn verified_quote(
         &self,
         desk_id: &str,
@@ -239,6 +240,7 @@ impl Gimbal {
         };
         let q =
             verify_quote(sha256, ed25519_verify, quote, quote_signature, method, &ctx).or_fail();
+        check_quote_age(&q, now_ms).or_fail();
         check_cost(
             &q,
             desk.policy.max_transfer_cost_bps,

@@ -18,7 +18,7 @@
 
 use gimbal_core::errors::{shown, Refusal, E_ARGS, E_NOT_ALLOWED};
 use gimbal_core::limits::fresh_price;
-use gimbal_core::oracle::{check_symbols, price_e8, symbol_of, ORACLE_ASSETS};
+use gimbal_core::oracle::{check_symbols, index_of, price_e8, symbol_of, ORACLE_ASSETS};
 use gimbal_core::policy::MAX_SAFE_INTEGER;
 use near_sdk::serde::{Deserialize, Deserializer, Serialize};
 use near_sdk::store::LookupMap;
@@ -57,8 +57,9 @@ pub const REFRESH_PRICES_MIN_GAS: Gas = Gas::from_gas(
 /// The longest oracle answer `on_prices` reads.
 pub const PRICE_DATA_MAX_LEN: usize = 8 * 1024;
 
-/// How recently stored every price `refresh_prices` is asked for must be for the call to skip
-/// the oracle, ms: within it a second call spends nothing from the contract's balance.
+/// How recently every price `refresh_prices` is asked for must have been stored, or asked the
+/// oracle for, for the call to skip the oracle, ms: within it a second call spends nothing from the
+/// contract's balance, also while the oracle answers nothing.
 pub const REFRESH_SKIP_MS: u64 = 30_000;
 
 /// One stored price: USD per whole token × 1e8, and its time, ms: the oldest a report in it can
@@ -172,10 +173,12 @@ impl Gimbal {
     /// contract's balance and is mostly refunded. Callers are the owners of desks, whose engine
     /// key calls it, the desks' separate operator accounts and the contract account
     /// (`E_NOT_ALLOWED` for anyone else, so strangers cannot spend the contract's deposit);
-    /// `E_ARGS` with the Mock source or under [`REFRESH_PRICES_MIN_GAS`]. When the contract stored
-    /// every price asked for less than [`REFRESH_SKIP_MS`] ago it asks nothing and returns `true`
-    /// at once; otherwise the transaction's result is `true` when every symbol asked for got a
-    /// price from the oracle's answer.
+    /// `E_ARGS` with the Mock source or under [`REFRESH_PRICES_MIN_GAS`]. When every price asked
+    /// for was stored, or asked the oracle for, less than [`REFRESH_SKIP_MS`] ago it asks nothing
+    /// and returns at once: `true` when every one was stored that recently, `false` when one was
+    /// only asked for (its answer still on the way, or one that brought no price). Otherwise it
+    /// asks the oracle for all of them and the transaction's result is `true` when every symbol
+    /// asked for got a price from the oracle's answer.
     #[deny_unknown_arguments]
     pub fn refresh_prices(&mut self, assets: Vec<String>) -> PromiseOrValue<bool> {
         let oracle = self.oracle_or_fail();
@@ -194,14 +197,29 @@ impl Gimbal {
         }
         check_refresh_gas(env::prepaid_gas()).or_fail();
         let now_ms = env::block_timestamp_ms();
-        let all_recent = assets.iter().all(|a| {
-            self.prices
-                .get(a)
-                .is_some_and(|p| now_ms.saturating_sub(p.stored_ms) < REFRESH_SKIP_MS)
-        });
-        if all_recent {
-            env::log_str("every price asked for was stored under 30 s ago; no oracle call");
-            return PromiseOrValue::Value(true);
+        let recent = |ms: u64| now_ms.saturating_sub(ms) < REFRESH_SKIP_MS;
+        let stored_recently = |a: &String| self.prices.get(a).is_some_and(|p| recent(p.stored_ms));
+        // `check_symbols` passed, so every symbol has its row; 0 is "never asked".
+        let rows: Vec<usize> = assets.iter().filter_map(|a| index_of(a)).collect();
+        let asked_recently = |row: usize| {
+            let asked = self.price_asked_ms[row];
+            asked != 0 && recent(asked)
+        };
+        if assets
+            .iter()
+            .zip(&rows)
+            .all(|(a, row)| stored_recently(a) || asked_recently(*row))
+        {
+            let all_stored = assets.iter().all(stored_recently);
+            env::log_str(if all_stored {
+                "every price asked for was stored under 30 s ago; no oracle call"
+            } else {
+                "every price asked for was stored or asked for under 30 s ago; no oracle call"
+            });
+            return PromiseOrValue::Value(all_stored);
+        }
+        for row in rows {
+            self.price_asked_ms[row] = now_ms;
         }
         let args = serde_json::json!({ "asset_ids": ids });
         let call = Promise::new(oracle)

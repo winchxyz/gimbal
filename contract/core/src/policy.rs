@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::decimal::parse_e8;
 use crate::errors::{shown, Refusal, E_ARGS};
 use crate::ids::decode_base58_32;
+use crate::network::Network;
 
 /// Most entries in one list of a policy. A desk trades a handful of markets; the cap bounds the
 /// storage a policy takes (and the deposit a larger one needs).
@@ -26,6 +27,11 @@ pub const MAX_PRICE_BAND_BPS: u32 = 10_000;
 /// An oracle price older than an hour cannot bound an order price; a larger value is most likely
 /// milliseconds typed as seconds.
 pub const MAX_ORACLE_AGE_S: u32 = 3_600;
+/// The least `oracle_max_age_s` a mainnet desk takes: the oracle stamps its prices
+/// `recency_duration_sec` (600 s on mainnet) before its read, so a smaller bound leaves a fresh
+/// answer usable for under five minutes, or not at all. Testnet keeps 1 to [`MAX_ORACLE_AGE_S`]
+/// for its Mock prices.
+pub const MAINNET_MIN_ORACLE_AGE_S: u32 = 900;
 /// A transfer cannot be allowed to cost more than all of it.
 pub const MAX_TRANSFER_COST_BPS: u32 = 10_000;
 
@@ -232,6 +238,20 @@ impl Policy {
         // Notional caps and the rescue cap may be zero: that refuses every order or rescue, which is
         // the owner's call. The two notional caps are not compared: an unpriced order has to fit
         // both (`unpriced_cap_usd`), and the defaults (100 against the canary's 20) differ that way.
+        Ok(())
+    }
+
+    /// [`Policy::validate`] for a contract on `network`: on mainnet also `oracle_max_age_s` at
+    /// least [`MAINNET_MIN_ORACLE_AGE_S`] (`E_ARGS`).
+    pub fn validate_for(&self, network: Network) -> Result<(), Refusal> {
+        self.validate()?;
+        if network == Network::Mainnet && self.oracle_max_age_s < MAINNET_MIN_ORACLE_AGE_S {
+            return refuse(format!(
+                "oracle_max_age_s {} is under {MAINNET_MIN_ORACLE_AGE_S} on mainnet: the oracle's \
+                 prices are already up to 600 s old when stored",
+                self.oracle_max_age_s
+            ));
+        }
         Ok(())
     }
 
@@ -697,5 +717,43 @@ mod tests {
         assert!(msg.contains("oracle_max_age_s 60000"), "{msg}");
         accepted(|p| p.max_transfer_cost_bps = MAX_TRANSFER_COST_BPS);
         refused(|p| p.max_transfer_cost_bps = MAX_TRANSFER_COST_BPS + 1);
+    }
+
+    /// A mainnet desk takes `oracle_max_age_s` from 900 (the oracle's prices are 600 s old when
+    /// stored); testnet keeps 1 to 3600; every other rule holds on both.
+    #[test]
+    fn a_mainnet_policy_takes_an_oracle_age_of_900_s_at_least() {
+        let with_age = |s: u32| Policy {
+            oracle_max_age_s: s,
+            ..sample()
+        };
+        for s in [MAINNET_MIN_ORACLE_AGE_S, MAX_ORACLE_AGE_S] {
+            with_age(s).validate_for(Network::Mainnet).unwrap();
+        }
+        for s in [1, 60, MAINNET_MIN_ORACLE_AGE_S - 1] {
+            let r = with_age(s).validate_for(Network::Mainnet).unwrap_err();
+            assert_eq!(r.code, E_ARGS);
+            assert_eq!(
+                r.msg,
+                format!(
+                    "policy.oracle_max_age_s {s} is under 900 on mainnet: the oracle's prices are \
+                     already up to 600 s old when stored"
+                )
+            );
+            with_age(s).validate_for(Network::Testnet).unwrap();
+        }
+        for network in [Network::Mainnet, Network::Testnet] {
+            for s in [0, MAX_ORACLE_AGE_S + 1] {
+                let r = with_age(s).validate_for(network).unwrap_err();
+                assert!(r.msg.contains("is not 1 to 3600"), "{}", r.msg);
+            }
+            let r = Policy {
+                price_band_bps: 0,
+                ..with_age(MAINNET_MIN_ORACLE_AGE_S)
+            }
+            .validate_for(network)
+            .unwrap_err();
+            assert!(r.msg.contains("price_band_bps"), "{}", r.msg);
+        }
     }
 }

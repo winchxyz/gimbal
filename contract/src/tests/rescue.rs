@@ -16,13 +16,16 @@ use gimbal_core::errors::{E_NO_DESK, E_QUOTE_FIELDS, E_QUOTE_SIGNATURE, E_RESCUE
 use gimbal_core::oneclick::{
     check_cost, verify_quote, Context, DeskAddresses, Method, VerifiedQuote, SOL_USDC,
 };
-use gimbal_core::phoenix::{check_message, Rescue};
+use gimbal_core::phoenix::{check_message, Rescue, EMBER_WITHDRAW, WITHDRAW_FUNDS};
 use gimbal_core::solana::{parse_message, SolDesk};
 use near_sdk::base64::engine::general_purpose::STANDARD;
 use near_sdk::base64::Engine as _;
 
-/// 2026-11-01T00:00:00Z: before every live quote's deadline (2026-11-03).
-const NOW_MS: u64 = 1_793_491_200_000;
+/// 2026-10-31T15:30:00Z: 45 to 50 s after 1Click signed the live quotes, so within the hour a
+/// quote can be paid (`check_quote_age`), and before every deadline (2026-11-03).
+const NOW_MS: u64 = 1_793_460_600_000;
+/// The live Arbitrum quote's signed `timestamp`, 2026-10-31T15:29:12.462Z.
+const ARB_SIGNED_MS: u64 = 1_793_460_552_462;
 const ORDERLY_RECEIVER: &str = "0xc48b812bb43401392c037381aca934f4069c0517";
 
 const ARB_QUOTE: &str = "Orderly money out: Arbitrum USDC (desk EVM) to Hyperliquid";
@@ -135,6 +138,15 @@ fn arb_verified(g: &Gimbal) -> VerifiedQuote {
     g.verified_quote("alpha", &q, &sig, Method::EvmUsdcToIntents)
 }
 
+/// Live quote `name` as a fresh desk verifies it for `method` at `NOW_MS`, for build steps run
+/// later than the hour a quote can be paid in.
+fn verified_live(name: &str, method: Method) -> VerifiedQuote {
+    let g = rescue_desk();
+    at(operator(), NOW_MS, yocto(0));
+    let (q, sig) = quote(&live(), name);
+    g.verified_quote("alpha", &q, &sig, method)
+}
+
 /// `v` paying deposit address `0x…<n>` instead, `amount_e8` in (6 decimals), `min_out_e8` out.
 fn paying(v: &VerifiedQuote, n: u32, amount_e8: u128, min_out_e8: u128) -> VerifiedQuote {
     VerifiedQuote {
@@ -160,10 +172,12 @@ fn digest_of(hex_str: &str) -> [u8; 32] {
 
 // --- evm_usdc_to_intents ---
 
+/// The cases' block time (2026-11-01T00:00Z) is 8.5 h after 1Click signed the quote, past the
+/// hour `verified_quote` pays it in: the quote is verified at `NOW_MS` and the authorization built
+/// at the case's time, which is what its `validBefore` and digest are made of.
 #[test]
 fn evm_usdc_to_intents_signs_the_eip3009_contract_cases_and_moves_the_counter() {
     let mut g = rescue_desk();
-    let q = quote(&live(), ARB_QUOTE);
     let v = eip3009();
     let cases: Vec<&Value> = v["contract_cases"]
         .as_array()
@@ -182,10 +196,12 @@ fn evm_usdc_to_intents_signs_the_eip3009_contract_cases_and_moves_the_counter() 
         );
         // Both cases sign the one live quote, which the desk's ring would refuse the second time.
         forget_deposits(&mut g);
+        let verified = arb_verified(&g);
         let ms = c["now_s"].as_u64().unwrap() * 1000;
         times.push(ms);
         at(operator(), ms, yocto(0));
-        let got = evm_to_intents(&mut g, &q).unwrap();
+        let got =
+            outcome(|| g.build_evm_usdc_to_intents("alpha".into(), &verified, "out")).unwrap();
         assert_eq!(
             (got.desk_id.as_str(), got.venue.as_str(), got.kind.as_str()),
             ("alpha", "arbitrum", "transfer_with_authorization"),
@@ -273,8 +289,11 @@ fn every_rescue_method_counts_against_one_sliding_hourly_cap() {
         c.remaining_cap_e8(50, later + RESCUE_WINDOW_MS / 2),
         25 * 100_000_000
     );
+    // (That is 72 min after 1Click signed the quote: verified at `NOW_MS`, built then.)
+    let sol_verified = verified_live(SOL_ORDERLY_QUOTE, Method::SolSignRescue);
     at(operator(), later + RESCUE_WINDOW_MS, yocto(0));
-    sol_rescue(&mut g, &message, &sol).unwrap();
+    outcome(|| g.build_sol_sign_rescue("alpha".into(), b64(&message), &sol_verified, "rescue"))
+        .unwrap();
     assert_eq!(counters(&g).rescue_spent_e8, 10 * 100_000_000);
     // A lower cap applies at once.
     let mut g = rescue_desk_with(Policy {
@@ -375,6 +394,7 @@ fn the_hourly_cost_budget_stops_skimming_the_cap_through_fees() {
         destination_asset: SOL_USDC.into(),
         recipient: vector_solana().authority,
         deadline_ms: u64::MAX,
+        signed_at_ms: NOW_MS,
     };
     let send =
         |g: &mut Gimbal, q| outcome(|| g.build_hl_send_to_intents("alpha".into(), &q, "out"));
@@ -509,8 +529,24 @@ fn a_rescue_refuses_tampered_foreign_and_expired_quotes() {
     // At the deadline, 2026-11-03T15:59:12.894Z, the quote is dead.
     at(operator(), 1_793_721_552_894, yocto(0));
     assert!(refused(&mut g, &arb, &arb_sig).starts_with(E_QUOTE_FIELDS));
-    at(operator(), 1_793_721_552_893, yocto(0));
-    evm_to_intents(&mut g, &(arb.clone(), arb_sig.clone())).unwrap();
+    // Long before it, too (C6 review): a desk remembers 32 deposit addresses, so a quote pays
+    // only within the hour after 1Click signed it, the deadline being three days out.
+    for (ms, refusal) in [
+        (1_793_721_552_893, "more than 1 h before"),
+        (ARB_SIGNED_MS + 3_600_001, "more than 1 h before"),
+        (ARB_SIGNED_MS - 300_001, "more than 5 min after"),
+    ] {
+        at(operator(), ms, yocto(0));
+        let got = refused(&mut g, &arb, &arb_sig);
+        assert!(got.starts_with(E_QUOTE_FIELDS), "{ms}: {got}");
+        assert!(got.contains(refusal), "{ms}: {got}");
+    }
+    assert_eq!(counters(&g), DeskCounters::default());
+    for ms in [ARB_SIGNED_MS + 3_600_000, ARB_SIGNED_MS - 300_000] {
+        let mut g = rescue_desk();
+        at(operator(), ms, yocto(0));
+        evm_to_intents(&mut g, &(arb.clone(), arb_sig.clone())).unwrap();
+    }
     // A cost over the policy's bound: 10 USDC in, 9.584753 out is 0.42 USDC, over 0.4.
     let mut g = rescue_desk_with(Policy {
         max_transfer_cost_flat_e6: 400_000,
@@ -941,6 +977,104 @@ fn a_paused_desk_signs_only_a_rescue_that_frees_and_pays_amount_in() {
     let got = sol_rescue(&mut g, &buy, &q).unwrap();
     assert_eq!(got.orders.len(), 1);
     assert_eq!(got.orders[0].side, "buy");
+}
+
+/// The host gas of each rescue's own receipt on the mocked chain, verify and build apart (the
+/// mock meters host calls, not wasm instructions): the Ed25519 check, the hashes and the storage
+/// of the counters. With the wasm work, which a testnet call refused right after the verify
+/// measures, it stays inside the 20 TGas of `mpc::ACTION_GAS` that `mpc::SIGN_MIN_GAS` keeps for
+/// the method itself, beside
+/// the MPC `sign` (50 TGas and the unused gas) and `on_signed` (15). `--nocapture` prints them.
+#[test]
+fn a_rescue_verifies_and_builds_on_little_host_gas() {
+    const TGAS: f64 = 1e12;
+    let used = || env::used_gas().as_gas();
+    let message = with_revoke(&rescue_message("rescue in one transaction:").0);
+    let mut rows = vec![];
+
+    let mut g = rescue_desk();
+    at(operator(), NOW_MS, yocto(0));
+    let (q, sig) = quote(&live(), ARB_QUOTE);
+    let start = used();
+    let arb = g.verified_quote("alpha", &q, &sig, Method::EvmUsdcToIntents);
+    let verify = used() - start;
+    let start = used();
+    g.build_evm_usdc_to_intents("alpha".into(), &arb, "out");
+    rows.push(("evm_usdc_to_intents", verify, used() - start));
+
+    let mut g = rescue_desk();
+    at(operator(), NOW_MS, yocto(0));
+    let start = used();
+    let hl = VerifiedQuote {
+        method: Method::HlSendToIntents,
+        ..g.verified_quote("alpha", &q, &sig, Method::EvmUsdcToIntents)
+    };
+    let verify = used() - start;
+    let start = used();
+    g.build_hl_send_to_intents("alpha".into(), &hl, "out");
+    rows.push((
+        "hl_send_to_intents (an EVM quote's fields)",
+        verify,
+        used() - start,
+    ));
+
+    let mut g = rescue_desk();
+    at(operator(), NOW_MS, yocto(0));
+    let (q, sig) = quote(&live(), SOL_ORDERLY_QUOTE);
+    let start = used();
+    let sol = g.verified_quote("alpha", &q, &sig, Method::SolSignRescue);
+    let verify = used() - start;
+    let start = used();
+    g.build_sol_sign_rescue("alpha".into(), b64(&message), &sol, "rescue");
+    rows.push((
+        "sol_sign_rescue (one transaction, 920 B)",
+        verify,
+        used() - start,
+    ));
+
+    for (method, verify, build) in rows {
+        eprintln!(
+            "{method}: verify {:.2} TGas, build {:.2} TGas of host gas",
+            verify as f64 / TGAS,
+            build as f64 / TGAS
+        );
+        assert!(verify + build <= Gas::from_tgas(10).as_gas(), "{method}");
+    }
+    assert_eq!(message.len(), 920);
+}
+
+/// A Phoenix withdraw or an Ember unwrap of 0 in a rescue moves nothing (C6 review): refused like
+/// a token transfer of 0, `E_SOL_PROGRAM`, on a paused desk and a running one, counting nothing.
+/// (`solana-review.json` item 7 has the same through `sol_sign`.)
+#[test]
+fn sol_sign_rescue_refuses_a_withdraw_or_unwrap_of_0() {
+    let q = quote(&live(), SOL_ORDERLY_QUOTE);
+    let full = with_revoke(&rescue_message("rescue in one transaction:").0);
+    let zeroed = |disc: &[u8; 8], at: usize| {
+        rewritten(&full, |ixs| {
+            let found: Vec<&mut Ix> = ixs.iter_mut().filter(|ix| ix.2.starts_with(disc)).collect();
+            assert_eq!(found.len(), 1);
+            found.into_iter().for_each(|ix| ix.2[at..at + 8].fill(0));
+        })
+    };
+    for (what, bytes) in [
+        ("a Phoenix withdraw of 0", zeroed(&WITHDRAW_FUNDS, 8)),
+        ("an Ember unwrap of 0", zeroed(&EMBER_WITHDRAW, 9)),
+    ] {
+        for paused in [true, false] {
+            let mut g = rescue_desk();
+            g.desks.get_mut("alpha").unwrap().paused = paused;
+            at(operator(), NOW_MS, yocto(0));
+            let got = sol_rescue(&mut g, &bytes, &q).unwrap_err();
+            assert!(got.starts_with("E_SOL_PROGRAM: "), "{what}: {got}");
+            assert!(got.ends_with(what), "{what}: {got}");
+            assert_eq!(counters(&g), DeskCounters::default(), "{what}");
+        }
+    }
+    // As recorded (with its Revoke) the same message signs on a running desk.
+    let mut g = rescue_desk();
+    at(operator(), NOW_MS, yocto(0));
+    assert_eq!(sol_rescue(&mut g, &full, &q).unwrap().kind, "rescue");
 }
 
 // --- hl_send_to_intents ---

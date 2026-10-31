@@ -1831,6 +1831,52 @@ fn vault_cases(r: &mut Review<'_>) {
     );
 }
 
+/// Review item 7 (C6 review): a Phoenix withdraw or an Ember unwrap of 0 moves nothing, so it is
+/// refused like a token transfer of 0 (`E_SOL_PROGRAM`); an unwrap of the whole balance (no
+/// amount) and a withdraw of 1 still sign.
+fn zero_cases(r: &mut Review<'_>) {
+    let desk = vector_desk(r.doc);
+    let withdraw = "withdraw 10 USDC";
+    let set = |d: &mut Draft, i: usize, at: usize, amount: u64| {
+        d.ixs[i].2[at..at + 8].copy_from_slice(&amount.to_le_bytes());
+    };
+    // The withdrawal with the Revoke item 6 asks for, so the amount is the one thing wrong.
+    for (amount, answer) in [(0, E_SOL_PROGRAM), (1, "withdraw running")] {
+        let (mut d, i) = r.at(withdraw, PHOENIX_PROGRAM, &WITHDRAW_FUNDS);
+        set(&mut d, i, 8, amount);
+        d.push_revoke(desk.phusd_ata, desk.authority);
+        let case_name = format!("review 7: a Phoenix withdraw of {amount}, then a Revoke");
+        r.add(7, &case_name, withdraw, &d, answer);
+    }
+    // Without its Approve (and so its Revoke) the unwrap's amount is the only one that changes.
+    let unapproved = |r: &Review<'_>| {
+        let (mut d, approve) = r.at(withdraw, TOKEN_PROGRAM, &[4]);
+        d.ixs.remove(approve);
+        d
+    };
+    let mut d = unapproved(r);
+    let unwrap = d.find(EMBER_PROGRAM, &EMBER_WITHDRAW);
+    set(&mut d, unwrap, 9, 0);
+    r.add(
+        7,
+        "review 7: an Ember unwrap of 0, no Approve",
+        withdraw,
+        &d,
+        E_SOL_PROGRAM,
+    );
+    let mut d = unapproved(r);
+    let unwrap = d.find(EMBER_PROGRAM, &EMBER_WITHDRAW);
+    d.ixs[unwrap].2.truncate(8);
+    d.ixs[unwrap].2.push(0);
+    r.add(
+        7,
+        "review 7: an Ember unwrap of the whole balance (no amount), no Approve",
+        withdraw,
+        &d,
+        "withdraw running",
+    );
+}
+
 fn review_doc() -> Value {
     let doc = sol_doc();
     let mut r = Review {
@@ -1843,6 +1889,7 @@ fn review_doc() -> Value {
     vault_cases(&mut r);
     fee_cases(&mut r);
     revoke_cases(&mut r);
+    zero_cases(&mut r);
     serde_json::json!({
         "file": "solana-review.json",
         "note": "Review cases for the sol_sign policy. Each edits one message of solana.json, \
@@ -1889,6 +1936,32 @@ fn every_review_case_gets_its_expected_answer() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The review 7 refusals are the zero amounts', not another rule's.
+#[test]
+fn a_withdraw_or_unwrap_of_0_is_refused_for_its_amount() {
+    let doc = sol_doc();
+    let ctx = &doc["ctx"]["sol_sign"];
+    let (policy, desk, reference) = (vector_policy(ctx), vector_desk(&doc), reference_of(ctx));
+    let review: Value = serde_json::from_str(include_str!("vectors/solana-review.json")).unwrap();
+    let mut seen = 0;
+    for case in review["cases"].as_array().unwrap() {
+        let case_name = name(case);
+        let what = if case_name.starts_with("review 7: a Phoenix withdraw of 0") {
+            "a Phoenix withdraw of 0"
+        } else if case_name.starts_with("review 7: an Ember unwrap of 0") {
+            "an Ember unwrap of 0"
+        } else {
+            continue;
+        };
+        let r =
+            check_message(sha256, &policy, &desk, &message(case), &reference, None).unwrap_err();
+        assert_eq!(r.code, E_SOL_PROGRAM, "{case_name}");
+        assert!(r.msg.ends_with(what), "{case_name}: {r}");
+        seen += 1;
+    }
+    assert_eq!(seen, 2);
 }
 
 fn base64_decode(s: &str) -> Vec<u8> {

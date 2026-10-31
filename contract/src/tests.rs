@@ -892,6 +892,73 @@ fn create_desk_refuses_an_invalid_policy() {
     });
 }
 
+/// A mainnet contract on the OutLayer oracle, as the canary deploys it.
+fn mainnet() -> Gimbal {
+    called_by(contract_id());
+    Gimbal::new(
+        Network::Mainnet,
+        "v1.signer".parse().unwrap(),
+        PriceSource::OutLayer {
+            contract: "price-oracle.near".parse().unwrap(),
+        },
+        treasury(),
+        fees(),
+        OrderlyConfig {
+            broker_id: "gimbal".into(),
+            chain_id: ARBITRUM_MAINNET,
+        },
+    )
+}
+
+/// On mainnet `oracle_max_age_s` is 900 to 3600 (C6 review): the oracle's prices are 600 s old
+/// when stored. `create_desk` refuses a smaller one before the MPC calls, `set_policy` before it
+/// writes; testnet takes the fixtures' 60.
+#[test]
+fn a_mainnet_desk_takes_an_oracle_age_of_900_s_at_least() {
+    let mut g = mainnet();
+    let aged = |s: u32| Policy {
+        oracle_max_age_s: s,
+        ..policy()
+    };
+    for s in [60, 899] {
+        call(owner(), NearToken::from_near(1));
+        assert_refused(
+            &format!("E_ARGS: policy.oracle_max_age_s {s} is under 900 on mainnet"),
+            || {
+                g.create_desk("alpha".into(), aged(s), EVM.into(), solana())
+                    .detach();
+            },
+        );
+        assert!(function_calls().is_empty(), "refused before the MPC calls");
+    }
+    call(owner(), NearToken::from_near(1));
+    g.create_desk("alpha".into(), aged(900), EVM.into(), solana())
+        .detach();
+    let (id, desk, attached) = scheduled_callback();
+    callback(mpc_answers());
+    run_callback(&mut g, id, desk, attached).unwrap();
+    for s in [1, 899] {
+        call(owner(), storage_deposit());
+        assert_refused(
+            &format!("E_ARGS: policy.oracle_max_age_s {s} is under 900 on mainnet"),
+            || g.set_policy("alpha".into(), aged(s)),
+        );
+    }
+    assert_eq!(g.get_desk("alpha".into()).unwrap().policy, aged(900));
+    call(owner(), storage_deposit());
+    g.set_policy("alpha".into(), aged(3600));
+    assert_eq!(g.get_desk("alpha".into()).unwrap().policy, aged(3600));
+    // Testnet keeps 1 to 3600 (a fresh chain: the mock's storage outlives `g`).
+    std::thread::spawn(move || {
+        let mut g = with_desk();
+        call(owner(), storage_deposit());
+        g.set_policy("alpha".into(), aged(1));
+        assert_eq!(g.get_desk("alpha".into()).unwrap().policy, aged(1));
+    })
+    .join()
+    .unwrap();
+}
+
 #[test]
 fn create_desk_refuses_an_existing_id() {
     let mut g = with_desk();
@@ -1211,6 +1278,81 @@ fn owner_sets_and_clears_the_operator() {
             r#"{"desk_id":"alpha","operator":null}"#
         )]
     );
+}
+
+/// The storage each owner method that adds some adds, in bytes and in NEAR at the chain's price
+/// (10^19 yoctoNEAR a byte), from the fixtures' desk to the largest one: the table of the C7 PR
+/// (`--nocapture` prints it). The caps hold every case with room; the numbers are printed, not
+/// pinned.
+#[test]
+fn the_storage_each_owner_method_adds() {
+    /// The bytes `act` adds in the current call (each `testing_env!` restarts the mock's count).
+    fn added(act: impl FnOnce()) -> u64 {
+        let before = env::storage_usage();
+        act();
+        env::storage_usage().saturating_sub(before)
+    }
+    let mut g = testnet();
+    assert_eq!(env::storage_byte_cost(), yocto(10_000_000_000_000_000_000));
+    let mut rows: Vec<(&str, u64, u64)> = vec![];
+    for (what, id, p, cap) in [
+        (
+            "create_desk (the fixtures' policy)",
+            "small",
+            policy(),
+            2_500,
+        ),
+        (
+            "create_desk (the largest valid policy)",
+            "large",
+            Policy::largest_valid(),
+            10_000,
+        ),
+    ] {
+        call(owner(), NearToken::from_near(1));
+        g.create_desk(id.into(), p, EVM.into(), solana()).detach();
+        let (id, desk, attached) = scheduled_callback();
+        callback(mpc_answers());
+        let bytes = added(|| run_callback(&mut g, id, desk, attached).unwrap());
+        rows.push((what, bytes, cap));
+    }
+    call(owner(), NearToken::from_near(1));
+    let bytes = added(|| g.set_policy("small".into(), Policy::largest_valid()));
+    rows.push(("set_policy (the fixtures' to the largest)", bytes, 8_000));
+    call(owner(), ONE_YOCTO);
+    let bytes = added(|| g.set_policy("small".into(), Policy::largest_valid()));
+    rows.push(("set_policy (the same again)", bytes, 0));
+    let longest: AccountId = format!("{}.testnet", "o".repeat(56)).parse().unwrap();
+    assert_eq!(longest.len(), 64);
+    call(owner(), storage_deposit());
+    let bytes = added(|| g.set_operator("small".into(), Some(longest.clone())));
+    rows.push((
+        "set_operator (64-byte account, new to the index)",
+        bytes,
+        250,
+    ));
+    call(owner(), storage_deposit());
+    let bytes = added(|| g.set_operator("large".into(), Some(longest.clone())));
+    rows.push(("set_operator (the same account, a second desk)", bytes, 100));
+    call(owner(), storage_deposit());
+    let bytes = added(|| g.set_orderly_receiver("small".into(), OTHER_EVM.into()));
+    rows.push(("set_orderly_receiver", bytes, 100));
+    let ips: Vec<String> = (0..10)
+        .map(|i| format!("1111:2222:3333:4444:5555:6666:7777:{:04x}", 0x8880 + i))
+        .collect();
+    assert!(ips.iter().all(|ip| ip.len() == 39));
+    call(owner(), storage_deposit());
+    let bytes = added(|| g.set_orderly_ips("small".into(), ips.clone()));
+    rows.push((
+        "set_orderly_ips (10 IPv6 addresses of 39 bytes)",
+        bytes,
+        500,
+    ));
+    for (what, bytes, cap) in rows {
+        let near = bytes as f64 * 1e-5;
+        eprintln!("{what}: {bytes} bytes, {near:.5} NEAR");
+        assert!(bytes <= cap, "{what}: {bytes} bytes, over {cap}");
+    }
 }
 
 #[test]

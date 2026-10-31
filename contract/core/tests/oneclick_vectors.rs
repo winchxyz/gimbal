@@ -5,8 +5,9 @@
 use ed25519_dalek::{Signature, VerifyingKey};
 use gimbal_core::errors::{E_QUOTE_FIELDS, E_QUOTE_SIGNATURE, E_RESCUE_CAP};
 use gimbal_core::oneclick::{
-    check_cost, check_signature, decimals, parse_time_ms, verify_quote, Context, DeskAddresses,
-    Method, ARB_USDC, HL_USDC, NEAR_USDC, ONECLICK_PUBLIC_KEY_B58, SOL_USDC,
+    check_cost, check_quote_age, check_signature, decimals, parse_time_ms, verify_quote, Context,
+    DeskAddresses, Method, ARB_USDC, HL_USDC, NEAR_USDC, ONECLICK_PUBLIC_KEY_B58, QUOTE_MAX_AGE_MS,
+    QUOTE_MAX_AHEAD_MS, SOL_USDC,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -201,6 +202,10 @@ fn a_live_quote_yields_its_deposit_address() {
             v.deadline_ms,
             parse_time_ms(s(&fields["deadline"])).unwrap()
         );
+        assert_eq!(
+            v.signed_at_ms,
+            parse_time_ms(s(&fields["timestamp"])).unwrap()
+        );
         assert_eq!(v.recipient, s(&fields["recipient"]));
         assert_eq!(v.destination_asset, s(&fields["destinationAsset"]));
         let cost = v.amount_in_e8 - v.min_amount_out_e8;
@@ -239,6 +244,87 @@ fn the_recorded_costs_against_the_default_bound() {
 /// Any signature: for a quote 1Click would not sign, to reach the field rules.
 fn any_signature(_: &[u8; 64], _: &[u8], _: &[u8; 32]) -> bool {
     true
+}
+
+/// Every live quote's deadline is about three days after its signed `timestamp` (1Click adds 72 h
+/// to the requested deadline), longer than a desk's 32 remembered deposit addresses can be trusted
+/// to last: [`check_quote_age`] pays a quote within the hour after the timestamp, and within five
+/// minutes before it, edges included. A quote without a readable timestamp is refused.
+#[test]
+fn a_quote_pays_within_the_hour_after_it_was_signed() {
+    let [_, (_, live)] = files();
+    let mut checked = 0;
+    for c in live["field_cases"].as_array().unwrap() {
+        if !c["name"].as_str().unwrap().starts_with("as quoted: ") || c["expect"]["ok"] != true {
+            continue;
+        }
+        let q = quote(&live, s(&c["quote"]));
+        let fields: Value = serde_json::from_str(s(&q["canonical_json"])).unwrap();
+        let v = verify_quote(
+            sha256,
+            ed25519_verify,
+            s(&q["canonical_json"]),
+            s(&q["signature"]),
+            Method::parse(s(&c["method"])).unwrap(),
+            &context(&c["ctx"]),
+        )
+        .unwrap();
+        let name = s(&q["name"]);
+        let signed = parse_time_ms(s(&fields["timestamp"])).unwrap();
+        let deadline = parse_time_ms(s(&fields["deadline"])).unwrap();
+        assert!(deadline - signed > 70 * QUOTE_MAX_AGE_MS, "{name}");
+        for ok in [
+            signed - QUOTE_MAX_AHEAD_MS,
+            signed,
+            signed + QUOTE_MAX_AGE_MS,
+        ] {
+            check_quote_age(&v, ok).unwrap_or_else(|r| panic!("{name} at {ok}: {r}"));
+        }
+        for late in [
+            signed - QUOTE_MAX_AHEAD_MS - 1,
+            signed + QUOTE_MAX_AGE_MS + 1,
+            deadline - 1,
+        ] {
+            let r = check_quote_age(&v, late).unwrap_err();
+            assert_eq!(r.code, E_QUOTE_FIELDS, "{name} at {late}");
+        }
+        checked += 1;
+    }
+    assert!(checked >= 5, "{checked}");
+    // A quote whose timestamp is no UTC time, or missing, never verifies.
+    let q = quote(
+        &live,
+        "Orderly money out: Arbitrum USDC (desk EVM) to Hyperliquid",
+    );
+    let canonical = s(&q["canonical_json"]);
+    let c = live["field_cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["quote"] == q["name"] && c["expect"]["ok"] == true)
+        .unwrap();
+    let ctx = context(&c["ctx"]);
+    let fields: Value = serde_json::from_str(canonical).unwrap();
+    let stamp = format!(r#""timestamp":"{}""#, s(&fields["timestamp"]));
+    assert_eq!(canonical.matches(&stamp).count(), 1);
+    for (bad, says) in [
+        (r#""timestamp":"yesterday""#, "timestamp"),
+        (r#""timestamp":"""#, "timestamp"),
+        (r#""timestamp":1793460552462"#, "not a 1Click quote"),
+        (r#""ignored":"x""#, "not a 1Click quote"),
+    ] {
+        let r = verify_quote(
+            sha256,
+            any_signature,
+            &canonical.replace(&stamp, bad),
+            s(&q["signature"]),
+            Method::EvmUsdcToIntents,
+            &ctx,
+        )
+        .unwrap_err();
+        assert_eq!(r.code, E_QUOTE_FIELDS, "{bad}: {r}");
+        assert!(r.msg.contains(says), "{bad}: {r}");
+    }
 }
 
 /// A quote into its own origin asset only pays fees: refused even when it pays a desk address,
