@@ -569,6 +569,20 @@ fn each_desk_adds_the_same_storage_however_many_the_owner_has() {
         g.desks_of(owner()),
         ["desk-1", "desk-2", "desk-3", "desk-4"]
     );
+    // What is stored, read back through fresh maps on the same prefixes rather than the contract's
+    // caches: one `(owner, n)` entry per desk, from 0, and the owner's count.
+    let ids: LookupMap<(AccountId, u32), String> = LookupMap::new(StorageKey::DeskIds);
+    let counts: LookupMap<AccountId, u32> = LookupMap::new(StorageKey::DeskCounts);
+    for (n, id) in ["desk-1", "desk-2", "desk-3", "desk-4"]
+        .into_iter()
+        .enumerate()
+    {
+        let n = u32::try_from(n).unwrap();
+        assert_eq!(ids.get(&(owner(), n)).map(String::as_str), Some(id));
+    }
+    assert_eq!(ids.get(&(owner(), 4)), None);
+    assert_eq!(counts.get(&owner()), Some(&4));
+    assert_eq!(counts.get(&operator()), None, "nobody else has a count");
 }
 
 /// A call from `owner()` with 1 NEAR and `gas` attached. The mock charges receipt fees from an older
