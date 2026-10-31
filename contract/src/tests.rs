@@ -1103,7 +1103,7 @@ fn a_cleared_operator_has_no_role() {
     );
     for gate in [Gate::Running, Gate::ReducesRisk] {
         assert_refused("E_NOT_ALLOWED: ", || {
-            action_desk(&mut g.desks, "alpha", gate);
+            action_desk(&g.desks, "alpha", gate);
         });
     }
 }
@@ -1254,12 +1254,12 @@ fn a_stranger_may_not_pause_and_an_unknown_desk_is_refused() {
 
 #[test]
 fn owner_and_operator_pass_both_gates_on_a_running_desk() {
-    let mut g = with_desk();
+    let g = with_desk();
     for gate in [Gate::Running, Gate::ReducesRisk] {
         called_by(owner());
-        assert_eq!(action_desk(&mut g.desks, "alpha", gate).1, Role::Owner);
+        assert_eq!(action_desk(&g.desks, "alpha", gate).1, Role::Owner);
         called_by(operator());
-        let (desk, role) = action_desk(&mut g.desks, "alpha", gate);
+        let (desk, role) = action_desk(&g.desks, "alpha", gate);
         assert_eq!(role, Role::Operator);
         assert_eq!(desk.evm_address, EVM);
     }
@@ -1267,13 +1267,13 @@ fn owner_and_operator_pass_both_gates_on_a_running_desk() {
 
 #[test]
 fn the_action_guard_refuses_a_stranger() {
-    let mut g = with_desk();
+    let g = with_desk();
     called_by(stranger());
     for gate in [Gate::Running, Gate::ReducesRisk] {
         assert_refused(
             "E_NOT_ALLOWED: charlie is neither the owner nor the operator of desk alpha",
             || {
-                action_desk(&mut g.desks, "alpha", gate);
+                action_desk(&g.desks, "alpha", gate);
             },
         );
     }
@@ -1289,33 +1289,27 @@ fn on_a_paused_desk_only_risk_reducing_actions_pass() {
         assert_refused(
             &format!("{E_PAUSED}: desk alpha is paused; only its owner can unpause it"),
             || {
-                action_desk(&mut g.desks, "alpha", Gate::Running);
+                action_desk(&g.desks, "alpha", Gate::Running);
             },
         );
-        assert_eq!(
-            action_desk(&mut g.desks, "alpha", Gate::ReducesRisk).1,
-            role
-        );
+        assert_eq!(action_desk(&g.desks, "alpha", Gate::ReducesRisk).1, role);
     }
     // The role comes first: a stranger learns nothing about the pause.
     called_by(stranger());
     assert_refused(&format!("{E_NOT_ALLOWED}: "), || {
-        action_desk(&mut g.desks, "alpha", Gate::Running);
+        action_desk(&g.desks, "alpha", Gate::Running);
     });
     call(owner(), ONE_YOCTO);
     g.set_paused("alpha".into(), false);
-    assert_eq!(
-        action_desk(&mut g.desks, "alpha", Gate::Running).1,
-        Role::Owner
-    );
+    assert_eq!(action_desk(&g.desks, "alpha", Gate::Running).1, Role::Owner);
 }
 
 #[test]
 fn the_action_guard_refuses_an_unknown_desk() {
-    let mut g = with_desk();
+    let g = with_desk();
     called_by(owner());
     assert_refused("E_NO_DESK: no desk ", || {
-        action_desk(&mut g.desks, "bravo", Gate::ReducesRisk);
+        action_desk(&g.desks, "bravo", Gate::ReducesRisk);
     });
 }
 

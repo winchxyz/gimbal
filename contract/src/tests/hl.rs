@@ -150,7 +150,7 @@ fn assert_signs_user(got: &UnsignedAction, kind: &str, name: &str) {
 }
 
 fn nonce_of(desk_id: &str, g: &Gimbal) -> u64 {
-    g.get_desk(desk_id.into()).unwrap().hl_last_nonce
+    g.hl_nonces.get(desk_id).copied().unwrap_or(0)
 }
 
 // --- hl_order ---
@@ -320,8 +320,7 @@ fn hl_actions_are_for_the_owner_and_the_operator() {
 #[test]
 fn every_action_takes_the_next_nonce_of_its_desk() {
     let mut g = hl_desk();
-    let mut bravo = g.get_desk("alpha".into()).unwrap();
-    bravo.hl_last_nonce = 0;
+    let bravo = g.get_desk("alpha".into()).unwrap();
     g.desks.insert("bravo".into(), bravo);
     let nonce = |u: &UnsignedAction| u.payload.get("nonce").cloned();
     let n = |ms: u64| Some(gimbal_core::msgpack::Value::UInt(ms));
@@ -347,6 +346,59 @@ fn every_action_takes_the_next_nonce_of_its_desk() {
     );
     assert_eq!(nonce_of("alpha", &g), T + 5_001);
     assert_eq!(nonce_of("bravo", &g), T);
+}
+
+/// The gas `f` burns, less the cost of reading the gas counter itself.
+fn gas_of(f: impl FnOnce()) -> u64 {
+    let start = env::used_gas().as_gas();
+    let idle = env::used_gas().as_gas() - start;
+    let start = env::used_gas().as_gas();
+    f();
+    env::used_gas().as_gas() - start - idle
+}
+
+#[test]
+fn an_action_writes_its_nonce_and_never_rewrites_the_desk() {
+    let mut g = hl_desk();
+    at(owner(), T, yocto(0));
+    g.desks.flush();
+    assert_eq!(gas_of(|| g.desks.flush()), 0, "nothing left to write");
+    // An order reads the desk and writes only its nonce entry.
+    g.hl_order("alpha".into(), hype(), "a".into());
+    assert_eq!(
+        gas_of(|| g.desks.flush()),
+        0,
+        "the desk is not written back"
+    );
+    assert!(
+        gas_of(|| g.hl_nonces.flush()) > 0,
+        "the nonce entry is written"
+    );
+    // The control: a method that changes the desk does write it back.
+    g.set_paused("alpha".into(), true);
+    assert!(
+        gas_of(|| g.desks.flush()) > 0,
+        "set_paused rewrites the desk"
+    );
+}
+
+#[test]
+fn a_new_desk_pays_for_its_nonce_entry_and_an_action_adds_no_storage() {
+    let mut g = hl_desk();
+    at(owner(), T, yocto(0));
+    g.desks.remove("alpha");
+    g.desks.flush();
+    let desk = Desk::new(owner(), hl_policy(), VECTOR_DESK_EVM.into(), solana());
+    // `write_desk` measures what `create_desk` charges for, the stored nonce entry included.
+    let before = env::storage_usage();
+    let added = g.write_desk("alpha", &desk);
+    assert_eq!(env::storage_usage(), before + added);
+    assert_eq!(g.hl_nonces.get("alpha"), Some(&0));
+    let before = env::storage_usage();
+    g.hl_order("alpha".into(), hype(), "a".into());
+    g.hl_nonces.flush();
+    assert_eq!(nonce_of("alpha", &g), T);
+    assert_eq!(env::storage_usage(), before, "an action adds no storage");
 }
 
 // --- hl_cancel ---

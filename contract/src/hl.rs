@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::deposit::check_one_yocto;
 use crate::desk::Gate;
 use crate::prices::reference_price;
-use crate::{action_desk, owner_desk, Gimbal, GimbalExt, OrFail};
+use crate::{action_desk, owner_desk, take_hl_nonce, Gimbal, GimbalExt, OrFail};
 
 /// The host's keccak256, which the core builders take as a function.
 pub fn keccak(data: &[u8]) -> [u8; 32] {
@@ -34,7 +34,7 @@ impl Gimbal {
     /// sz × max(px, oracle) over `max_notional_usd` (`E_SIZE`).
     #[deny_unknown_arguments]
     pub fn hl_order(&mut self, desk_id: String, order: HlOrder, reason: String) -> UnsignedAction {
-        let (desk, _) = action_desk(&mut self.desks, &desk_id, Gate::order(order.reduce_only));
+        let (desk, _) = action_desk(&self.desks, &desk_id, Gate::order(order.reduce_only));
         check_reason(&reason).or_fail();
         let reference = desk
             .policy
@@ -49,7 +49,7 @@ impl Gimbal {
             &builder,
             self.config.fees.hl_builder_tenth_bps,
         );
-        let nonce = desk.take_hl_nonce(env::block_timestamp_ms());
+        let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
         let prepared = prepare_l1(keccak, self.config.network, "order", action, nonce);
         UnsignedAction::hyperliquid(desk_id, prepared, Some(&reason))
     }
@@ -66,9 +66,9 @@ impl Gimbal {
         oid: u64,
         reason: String,
     ) -> UnsignedAction {
-        let (desk, _) = action_desk(&mut self.desks, &desk_id, Gate::ReducesRisk);
+        action_desk(&self.desks, &desk_id, Gate::ReducesRisk);
         check_reason(&reason).or_fail();
-        let nonce = desk.take_hl_nonce(env::block_timestamp_ms());
+        let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
         let action = cancel_action(asset, oid);
         let prepared = prepare_l1(keccak, self.config.network, "cancel", action, nonce);
         UnsignedAction::hyperliquid(desk_id, prepared, Some(&reason))
@@ -79,11 +79,11 @@ impl Gimbal {
     /// configured it is `E_ARGS` and setup skips it. Owner or operator, running desk.
     #[deny_unknown_arguments]
     pub fn hl_set_referrer(&mut self, desk_id: String) -> UnsignedAction {
-        let (desk, _) = action_desk(&mut self.desks, &desk_id, Gate::Running);
+        action_desk(&self.desks, &desk_id, Gate::Running);
         let code =
             referral_code(self.config.treasury.referral_codes.hyperliquid.as_deref()).or_fail();
         let action = set_referrer_action(code);
-        let nonce = desk.take_hl_nonce(env::block_timestamp_ms());
+        let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
         let prepared = prepare_l1(keccak, self.config.network, "setReferrer", action, nonce);
         UnsignedAction::hyperliquid(desk_id, prepared, None)
     }
@@ -92,10 +92,10 @@ impl Gimbal {
     /// bp = `"0.01%"`), which every order then carries. Owner or operator, running desk.
     #[deny_unknown_arguments]
     pub fn hl_approve_builder_fee(&mut self, desk_id: String) -> UnsignedAction {
-        let (desk, _) = action_desk(&mut self.desks, &desk_id, Gate::Running);
+        action_desk(&self.desks, &desk_id, Gate::Running);
         let builder = treasury_builder(&self.config);
         let max_fee_rate = max_fee_rate(self.config.fees.hl_builder_tenth_bps);
-        let nonce = desk.take_hl_nonce(env::block_timestamp_ms());
+        let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
         let action = UserAction::ApproveBuilderFee {
             max_fee_rate,
             builder,
@@ -115,10 +115,10 @@ impl Gimbal {
         to_perp: bool,
         reason: String,
     ) -> UnsignedAction {
-        let (desk, _) = action_desk(&mut self.desks, &desk_id, Gate::Running);
+        action_desk(&self.desks, &desk_id, Gate::Running);
         check_reason(&reason).or_fail();
         check_usdc_amount(&amount).or_fail();
-        let nonce = desk.take_hl_nonce(env::block_timestamp_ms());
+        let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
         let action = UserAction::UsdClassTransfer {
             amount,
             to_perp,
@@ -135,11 +135,11 @@ impl Gimbal {
     #[payable]
     #[deny_unknown_arguments]
     pub fn hl_withdraw(&mut self, desk_id: String, amount: String) -> UnsignedAction {
-        let desk = owner_desk(&mut self.desks, &desk_id, "hl_withdraw");
+        let desk = owner_desk(&self.desks, &desk_id, "hl_withdraw");
         check_one_yocto("hl_withdraw", env::attached_deposit()).or_fail();
         check_usdc_amount(&amount).or_fail();
         let destination = Address::parse("evm_address", &desk.evm_address).or_fail();
-        let time = desk.take_hl_nonce(env::block_timestamp_ms());
+        let time = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
         let action = UserAction::Withdraw {
             destination,
             amount,

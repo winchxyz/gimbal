@@ -23,9 +23,6 @@ pub struct Desk {
     /// The Orderly account's exclusive receiver address on Arbitrum, pinned once by the owner.
     pub orderly_receiver: Option<String>,
     pub ledger: Ledger,
-    /// The last nonce the desk's master address was given to sign on Hyperliquid (ms); the next one
-    /// is `max(block_ms, hl_last_nonce + 1)`. Part of the desk, so `create_desk` pays its storage.
-    pub hl_last_nonce: u64,
 }
 
 /// The desk's Solana accounts, base58. `authority` is the MPC Ed25519 key at `gimbal/<desk_id>/sol`,
@@ -103,14 +100,7 @@ impl Desk {
             solana,
             orderly_receiver: None,
             ledger: Ledger::default(),
-            hl_last_nonce: 0,
         }
-    }
-
-    /// The desk's next Hyperliquid nonce, which it records as used.
-    pub fn take_hl_nonce(&mut self, block_ms: u64) -> u64 {
-        self.hl_last_nonce = gimbal_core::hl::next_nonce(block_ms, self.hl_last_nonce);
-        self.hl_last_nonce
     }
 
     /// The caller's role, if any. An operator set to the owner's own account stays the owner.
@@ -252,33 +242,6 @@ mod tests {
     fn only_reduce_only_orders_pass_a_pause() {
         assert_eq!(Gate::order(true), Gate::ReducesRisk);
         assert_eq!(Gate::order(false), Gate::Running);
-    }
-
-    #[test]
-    fn hl_nonces_follow_the_block_and_never_repeat() {
-        let mut desk = Desk::new(
-            "alice.near".parse().unwrap(),
-            Policy {
-                hl_assets: vec![],
-                phoenix_markets: vec![],
-                orderly_symbols: vec![],
-                max_notional_usd: 0,
-                price_band_bps: 1,
-                oracle_max_age_s: 1,
-                rescue_cap_usd_per_hour: 0,
-                max_transfer_cost_bps: 0,
-                max_transfer_cost_flat_e6: 0,
-                unpriced: vec![],
-                unpriced_max_notional_usd: 0,
-            },
-            "0x77cf7951f48ed15194825e2fe0908a6aa486d45a".into(),
-            solana(),
-        );
-        assert_eq!(desk.take_hl_nonce(1_000), 1_000);
-        assert_eq!(desk.take_hl_nonce(1_000), 1_001);
-        assert_eq!(desk.take_hl_nonce(900), 1_002);
-        assert_eq!(desk.take_hl_nonce(5_000), 5_000);
-        assert_eq!(desk.hl_last_nonce, 5_000);
     }
 
     #[test]
