@@ -65,6 +65,9 @@ export interface OrderlyAccountSnapshot {
                                  // cache is current up to here (pushes arrive in order, so nothing earlier is missing)
 }
 
+/** The positions half of a snapshot: what a leg's reconcile needs, known even while the holding is not. */
+export type OrderlyPositionsSnapshot = Pick<OrderlyAccountSnapshot, 'accountId' | 'positions' | 'positionsAt' | 'positionsFrom' | 'positionsReceivedAt' | 'confirmedAt'>;
+
 /**
  * The signed reads a session starts with (OrderlyDeskClient has both): Orderly's `data` of GET /v1/positions and
  * GET /v1/client/holding, each through `orderly_request`.
@@ -137,6 +140,8 @@ interface Session {
   onAck: (() => void) | null;
   /** Resolves once positions and balances are both known (pushed or read), rejects when the session dies. */
   known: Deferred;
+  /** Resolves once positions are known, rejects when the session dies. */
+  positionsKnown: Deferred;
   /** The running (or last) seed; settles once its reads have answered. */
   seeding: Promise<void>;
   /** Why a seed read failed, per topic still unknown. */
@@ -204,7 +209,7 @@ export class OrderlyAccountStream {
     if (this.#session !== null && this.#session.dead === null) return this.#session.ready;
     const session: Session = {
       ws: null, ready: Promise.resolve(), dead: null, failStart: null, watchdog: null, lastFrameAt: null,
-      acked: new Set(), onAck: null, known: deferred(), seeding: Promise.resolve(), seedErrors: {},
+      acked: new Set(), onAck: null, known: deferred(), positionsKnown: deferred(), seeding: Promise.resolve(), seedErrors: {},
     };
     this.#session = session;
     this.#positions = [];
@@ -264,6 +269,40 @@ export class OrderlyAccountStream {
       positionsFrom: this.#positionsFrom!,
       positionsReceivedAt: this.#positionsReceivedAt!,
       balancesFrom: this.#balancesFrom!,
+      confirmedAt: current.lastFrameAt!,
+    };
+  }
+
+  /**
+   * The cached positions alone, once they are known (seed read or push), whether or not the holding is: a contract
+   * without the `holding` read kind and an account with no balance push still have usable positions after a fill.
+   */
+  async positionsState(): Promise<OrderlyPositionsSnapshot> {
+    if (this.#session === null) this.start();
+    const current = this.#session!;
+    if (current.dead !== null) throw current.dead;
+    await current.ready;
+    if (current.dead !== null) throw current.dead;
+    if (!current.positionsKnown.settled) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`orderly private stream: no positions within ${this.#seedTimeoutMs} ms (neither the seed read nor a push)`)), this.#seedTimeoutMs);
+      });
+      try {
+        await Promise.race([current.positionsKnown.promise, current.seeding, late]);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    if (current.dead !== null) throw current.dead;
+    if (this.#positionsAt === null) throw current.seedErrors.positions ?? new Error('orderly private stream: positions not known yet');
+    if (this.#positionsError !== null) throw this.#positionsError;
+    return {
+      accountId: this.accountId,
+      positions: this.#positions.map((p) => ({ ...p })),
+      positionsAt: this.#positionsAt,
+      positionsFrom: this.#positionsFrom!,
+      positionsReceivedAt: this.#positionsReceivedAt!,
       confirmedAt: current.lastFrameAt!,
     };
   }
@@ -456,6 +495,8 @@ export class OrderlyAccountStream {
     this.#positionsAt = at;
     this.#positionsFrom = from;
     this.#positionsReceivedAt = this.#clock.now();
+    const session = this.#session;
+    if (session !== null && !session.positionsKnown.settled) session.positionsKnown.resolve();
     if (this.#positionsError === null) this.#onPositions?.(this.#positions.map((p) => ({ ...p })), from);
   }
 
@@ -493,6 +534,7 @@ export class OrderlyAccountStream {
     session.watchdog = null;
     session.failStart?.(err);
     if (!session.known.settled) session.known.reject(err);
+    if (!session.positionsKnown.settled) session.positionsKnown.reject(err);
     session.onAck?.();
     if (session.ws !== null && session.ws.readyState <= 1) session.ws.close(1000);
   }

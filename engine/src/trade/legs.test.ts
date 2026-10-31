@@ -12,7 +12,7 @@ import type { HlSubmitResult } from '../relayer/hyperliquid.ts';
 import { HlExchangeError } from '../relayer/hyperliquid.ts';
 import { NothingExecuted } from '../relayer/tx.ts';
 import { OrderlyApiError } from '../venues/orderly-http.ts';
-import type { OrderlyAccountSnapshot, OrderlyStreamPosition } from '../venues/orderly-stream.ts';
+import type { OrderlyPositionsSnapshot, OrderlyStreamPosition } from '../venues/orderly-stream.ts';
 import type { OrderlyRequest } from '../venues/orderly-signer.ts';
 import { HlLeg, OrderlyLeg, provesNothingRan } from './legs.ts';
 import { lotQty, toQty } from './lots.ts';
@@ -87,15 +87,12 @@ test('hyperliquid: sizes off the lot or over the policy are refused before anyth
 // ---- Orderly ----
 
 interface FakeStream {
-  snap: OrderlyAccountSnapshot | null;
-  state(): Promise<OrderlyAccountSnapshot>;
+  snap: OrderlyPositionsSnapshot | null;
+  positionsState(): Promise<OrderlyPositionsSnapshot>;
 }
 
-function snapshot(positions: OrderlyStreamPosition[], receivedAt: number): OrderlyAccountSnapshot {
-  return {
-    accountId: '0x', positions, balances: {}, invalidBalances: {}, positionsAt: receivedAt, balancesAt: receivedAt, positionsFrom: 'push',
-    positionsReceivedAt: receivedAt, balancesFrom: 'push', confirmedAt: receivedAt,
-  };
+function snapshot(positions: OrderlyStreamPosition[], receivedAt: number): OrderlyPositionsSnapshot {
+  return { accountId: '0x', positions, positionsAt: receivedAt, positionsFrom: 'push', positionsReceivedAt: receivedAt, confirmedAt: receivedAt };
 }
 
 const ROW = (qty: number): OrderlyStreamPosition => ({
@@ -109,7 +106,7 @@ function orderlyLeg(options: {
   assumedStart?: bigint;
 } = {}) {
   const sent: Partial<OrderlyRequest>[] = [];
-  const stream: FakeStream = { snap: null, state: async () => { if (stream.snap === null) throw new Error('not known'); return stream.snap; } };
+  const stream: FakeStream = { snap: null, positionsState: async () => { if (stream.snap === null) throw new Error('not known'); return stream.snap; } };
   const lines: string[] = [];
   const leg: OrderlyLeg = new OrderlyLeg({
     relayer: {

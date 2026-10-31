@@ -108,12 +108,14 @@ export class PairTrader {
       return Promise.resolve();
     }
     if (reducedTarget(position, w.target) === null) return Promise.resolve();
+    // The push itself is the newest state: the reconcile reads from it on, not from when its turn comes.
+    const seenAt = this.#clock.now() - 50;
     return this.#serial(async () => {
       const current = this.#watch.get(leg);
       if (current === undefined) return;
       this.#log(`${leg.venue} ${leg.symbol}: a push shows ${signedQtyString(position)} against the target ${signedQtyString(current.target)}: reconciling`);
       const report: LegReport = { venue: leg.venue, symbol: leg.symbol, start: signedQtyString(position), target: signedQtyString(current.target), final: null, orders: [] };
-      const final = await this.#reconcile(leg, current.target, this.#clock.now() - 1, report, 'watch');
+      const final = await this.#reconcile(leg, current.target, seenAt, report, 'watch');
       report.final = final === null ? null : signedQtyString(final);
       this.lastWatch = report;
     }).then(() => undefined);

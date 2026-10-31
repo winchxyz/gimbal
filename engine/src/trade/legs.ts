@@ -15,7 +15,7 @@ import { HlExchangeError } from '../relayer/hyperliquid.ts';
 import type { OrderlyRequest, OrderlyRequestKind } from '../venues/orderly-signer.ts';
 import { NothingExecuted } from '../relayer/tx.ts';
 import { OrderlyApiError } from '../venues/orderly-http.ts';
-import type { OrderlyAccountSnapshot, OrderlyStreamPosition } from '../venues/orderly-stream.ts';
+import type { OrderlyPositionsSnapshot, OrderlyStreamPosition } from '../venues/orderly-stream.ts';
 import { parseRestPositions, streamNumber } from '../venues/orderly-stream.ts';
 import type { Clock } from '../venues/venue.ts';
 import { systemClock } from '../venues/venue.ts';
@@ -199,7 +199,7 @@ export interface OrderlyLegOptions {
   /** The signed `positions` read (OrderlyDeskClient.positions); refused by a contract without the read kinds. */
   readPositions: () => Promise<unknown>;
   /** The desk's private session: its pushes are the fallback when the read is refused. */
-  stream: { state(): Promise<OrderlyAccountSnapshot> };
+  stream: { positionsState(): Promise<OrderlyPositionsSnapshot> };
   symbol: string;                // "PERP_ETH_USDC"
   lot: bigint;                   // base_tick
   baseMin: bigint;
@@ -364,13 +364,13 @@ export class OrderlyLeg implements TradeLeg {
   }
 
   /** The session's state when it says something newer than `after`; null when it knows nothing usable. */
-  async #snapshot(after: number | undefined): Promise<OrderlyAccountSnapshot | null> {
+  async #snapshot(after: number | undefined): Promise<OrderlyPositionsSnapshot | null> {
     const wait = this.#o.pushWaitMs ?? 8_000;
     const deadline = this.#clock.now() + (after === undefined ? 0 : wait);
     if (after !== undefined) await this.#sleep(this.#o.settleMs ?? 1_500);   // the pushes of one IOC come together
     for (;;) {
       try {
-        const snap = await this.#o.stream.state();
+        const snap = await this.#o.stream.positionsState();
         if (after === undefined || snap.positionsReceivedAt >= after) return snap;
       } catch {
         // not known yet (no seed, no push): wait for a push below

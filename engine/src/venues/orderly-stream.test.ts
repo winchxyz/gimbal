@@ -459,6 +459,21 @@ test('a failed seed read leaves its topic unknown without ending the session; a 
   odd.stream.close();
 });
 
+test('positionsState(): positions alone, usable while the holding is unknown (round-1 contract: both reads refused)', async () => {
+  const refused = async () => { throw new Error('E_ARGS: kind is not an Orderly request kind'); };
+  const s = setup({ reads: { positions: refused, holding: refused } });
+  const sock = await loggedIn(s);
+  acks(sock);
+  await assert.rejects(s.stream.positionsState(), /the positions read that seeds the session failed/);
+  s.clock.set(NOW + 300);
+  sock.push(positionPush([{ ...SOL_ROW, positionQty: -0.005 }], NOW + 290));
+  const p = await s.stream.positionsState();
+  assert.deepEqual([p.positions[0]!.positionQty, p.positionsFrom, p.positionsAt, p.positionsReceivedAt], [-0.005, 'push', NOW + 290, NOW + 300]);
+  await assert.rejects(s.stream.state(), /the holding read that seeds the session failed/, 'the full state still needs the holding');
+  sock.drop(1006, 'gone');
+  await assert.rejects(s.stream.positionsState(), /closed \(1006 gone\)/);
+});
+
 test('a refused subscription ends the session', async () => {
   const s = setup({ reads: { positions: async () => restPositions(), holding: async () => restHolding() } });
   const sock = await loggedIn(s);
