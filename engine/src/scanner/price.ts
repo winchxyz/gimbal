@@ -35,6 +35,12 @@ export interface OracleSource {
   price(venue: VenueId, symbol: string): OraclePrice | null;
 }
 
+/**
+ * How far ahead of the engine's clock an oracle price may be dated and still count (NEAR block time against this
+ * machine's clock). Beyond it the price is counted as stale: a future date would otherwise read as 0 s old.
+ */
+export const ORACLE_MAX_SKEW_MS = 5_000;
+
 export interface PricingContext {
   now: number;
   strategy: StrategyConfig;
@@ -255,7 +261,8 @@ function inVenuePolicy(policy: ContractPolicy, leg: ScanLeg): boolean {
  * - a leg outside the policy's list for its venue: E_ASSET;
  * - a leg in policy.unpriced needs no oracle, but its size in the venue's own units (legUsd at the venue mark) must
  *   fit its own max_sz, and its notional the unpriced cap (E_SIZE; a leg without a mark cannot be sized: E_SIZE);
- * - any other leg needs an oracle price no older than policy.oracle_max_age_s (E_ORACLE_STALE);
+ * - any other leg needs an oracle price no older than policy.oracle_max_age_s, and dated no more than
+ *   ORACLE_MAX_SKEW_MS ahead of now (E_ORACLE_STALE);
  * - the notional the contract values, up to legUsd × (1 + price_band_bps / 10⁴) at a limit price inside the band,
  *   must fit max_notional_usd, or the unpriced cap when a leg is unpriced (E_SIZE).
  */
@@ -306,9 +313,15 @@ export function deskVerdict(pair: Pair, ctx: Pick<PricingContext, 'strategy' | '
     const raw = ctx.oracle?.price(leg.venue as VenueId, leg.symbol) ?? null;
     const o = raw !== null && Number.isFinite(raw.px) && raw.px > 0 && Number.isFinite(raw.at) ? raw : null;
     const age = o === null ? null : Math.max(0, (ctx.now - o.at) / 1000);
-    if (age === null) {
+    if (o === null || age === null) {
       checks.push({ ok: false, text: `No oracle price for ${where}: the contract refuses its orders` });
       refuse('E_ORACLE_STALE', `no oracle price for ${where}`);
+    } else if (o.at > ctx.now + ORACLE_MAX_SKEW_MS) {
+      // A price dated ahead of now would count as 0 s old however old it really is: one clock is wrong, and which
+      // one cannot be told from here.
+      const ahead = Math.round((o.at - ctx.now) / 1000);
+      checks.push({ ok: false, text: `The oracle price for ${where} is dated ${ahead} s ahead of the engine's clock, past the ${ORACLE_MAX_SKEW_MS / 1000} s skew allowed: counted as stale` });
+      refuse('E_ORACLE_STALE', `oracle price for ${where} dated ${ahead} s ahead`);
     } else if (age > policy.oracle_max_age_s) {
       checks.push({ ok: false, text: `The oracle price for ${where} is ${Math.round(age)} s old, over the ${policy.oracle_max_age_s} s limit: the contract refuses its orders` });
       refuse('E_ORACLE_STALE', `oracle price for ${where} ${Math.round(age)} s old`);
