@@ -48,6 +48,8 @@ export interface HlPayload {
   action: Record<string, unknown> & { type: string };
   nonce: number;
   vaultAddress?: null;
+  /** From C6: orders and cancels carry block time + 60 s (ms); Hyperliquid refuses the action after it. */
+  expiresAfter?: number;
 }
 
 /** `sol_sign` and friends: the message exactly as signed. */
@@ -86,6 +88,10 @@ export interface DeskView {
   evm_address: string;
   solana: { authority: string; usdc_ata: string; phusd_ata: string; phoenix_trader: string };
   orderly_receiver: string | null;
+  /** keccak of the desk EVM address and the broker hash, fixed at create_desk (interfaces 1.3). */
+  orderly_account_id?: string;
+  /** The relayer IPs the owner set with set_orderly_ips (C6); absent or null when none are set. */
+  orderly_ips?: string[] | null;
   // u128 in the contract: JSON numbers today, which JavaScript reads exactly only below 2^53 (9e9 USDC)
   ledger: { deposited: number | string; withdrawn: number | string; fees_paid: number | string; hwm: number | string; idle_usdc: number | string };
 }
@@ -135,6 +141,8 @@ export interface OutcomeIds {
   /** Hyperliquid: the order's client order id (orderStatus by cloid) and the action's nonce. */
   hlCloid?: string;
   hlNonce?: number;
+  /** The signed action's expiresAfter (ms): after it Hyperliquid refuses every copy, so the outcome is final. */
+  hlExpiresAfter?: number;
   /** Solana: the transaction signature (getSignatureStatuses with history). */
   solSignature?: string;
   /**

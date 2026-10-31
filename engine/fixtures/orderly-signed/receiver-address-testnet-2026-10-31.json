@@ -1,0 +1,8 @@
+{
+  "captured": "2026-10-31 on Orderly testnet: GET /v1/client/asset/receiver_address?chain_id=421614&token=USDC, signed through the contract for a testnet desk; the answer's data",
+  "data": {
+    "receiver_address": "0xdd31bf887d636fd83ab68716c61ec63f162e2df1",
+    "token_address": "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d",
+    "minimum_deposit": 5
+  }
+}

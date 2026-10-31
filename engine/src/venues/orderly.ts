@@ -77,8 +77,13 @@ interface OrderlyPageMeta {
 
 /** The desk's Orderly account, with the age of what the private stream pushed. `time` is when the server last spoke. */
 export interface OrderlyAccountState extends AccountState {
-  positionsPushedAt: number;     // venue ms of the last position push
-  balancesPushedAt: number;      // venue ms of the last balance push
+  positionsPushedAt: number;     // venue ms of the last position push (local ms of the session's seed read before one)
+  balancesPushedAt: number;      // venue ms of the last balance push (likewise)
+  /**
+   * Symbols whose fundingSinceOpenUsd is not known: their row comes from the session's seed read, which carries no
+   * accrued funding fee, and they have not pushed since. Their fundingSinceOpenUsd reads 0 and must not be shown.
+   */
+  fundingUnknown: string[];
 }
 
 /** An Orderly market, with what sizing and the broker split need on top of the shared shape. */
@@ -507,8 +512,10 @@ export function parseAccount(
   let initial = 0;
   let maintenance = 0;
   const positions: Position[] = [];
+  const fundingUnknown: string[] = [];
   for (const p of snapshot.positions) {
     if (p.positionQty === 0) continue;
+    if (p.accruedFundingFee === undefined) fundingUnknown.push(p.symbol);
     const f = futuresBySymbol.get(p.symbol);
     const i = infoBySymbol.get(p.symbol);
     if (i === undefined) throw new Error(`orderly account: no market info for ${p.symbol} in /v1/public/info`);
@@ -534,7 +541,7 @@ export function parseAccount(
       leverage: 1 / imr,
       // ASSUMPTION: accruedFundingFee is paid > 0 like Hyperliquid's cumFunding, so it is flipped. Verify the sign
       // on the first testnet position (C5).
-      fundingSinceOpenUsd: -p.accruedFundingFee || 0,
+      fundingSinceOpenUsd: p.accruedFundingFee === undefined ? 0 : -p.accruedFundingFee || 0,
       unsettledFundingUsd: unsettledFundingUsd(p.positionQty, suf, p.lastSumUnitaryFunding),
     });
   }
@@ -548,6 +555,7 @@ export function parseAccount(
     positions,
     positionsPushedAt: snapshot.positionsAt,
     balancesPushedAt: snapshot.balancesAt,
+    fundingUnknown,
   };
 }
 

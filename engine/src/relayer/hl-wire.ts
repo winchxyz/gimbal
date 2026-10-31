@@ -93,23 +93,32 @@ const toHex = (bytes: Uint8Array): Hex => `0x${Buffer.from(bytes).toString('hex'
 
 // ---- digests ----
 
-/** keccak256(msgpack(action) ‖ nonce as u64 big-endian ‖ 0x00): no vault, no expiresAfter. */
-export function l1ConnectionId(action: MsgpackValue, nonce: number | bigint): Hex {
+/**
+ * keccak256(msgpack(action) ‖ nonce as u64 big-endian ‖ 0x00 (no vault) [‖ 0x00 ‖ expiresAfter as u64 big-endian]),
+ * the layout of the Python SDK's action_hash. The contract stamps expiresAfter (block time + 60 s) on orders and
+ * cancels from C6 on; Hyperliquid refuses the action after it.
+ */
+export function l1ConnectionId(action: MsgpackValue, nonce: number | bigint, expiresAfter?: number | bigint): Hex {
   const packed = msgpack(action);
-  const bytes = new Uint8Array(packed.length + 9);
+  const tail = expiresAfter === undefined ? 0 : 9;
+  const bytes = new Uint8Array(packed.length + 9 + tail);
   bytes.set(packed, 0);
   bytes.set(be(BigInt(nonce), 8), packed.length);
   bytes[packed.length + 8] = 0;
+  if (expiresAfter !== undefined) {
+    bytes[packed.length + 9] = 0;
+    bytes.set(be(BigInt(expiresAfter), 8), packed.length + 10);
+  }
   return keccak256(bytes);
 }
 
 /** The EIP-712 digest of an L1 action: `Agent(source, connectionId)` in domain Exchange / 1 / 1337. */
-export function l1Digest(action: MsgpackValue, nonce: number | bigint, network: HlNetwork): Hex {
+export function l1Digest(action: MsgpackValue, nonce: number | bigint, network: HlNetwork, expiresAfter?: number | bigint): Hex {
   return hashTypedData({
     domain: { name: 'Exchange', version: '1', chainId: 1337, verifyingContract: ZERO_ADDRESS },
     types: { Agent: [{ name: 'source', type: 'string' }, { name: 'connectionId', type: 'bytes32' }] },
     primaryType: 'Agent',
-    message: { source: network === 'mainnet' ? 'a' : 'b', connectionId: l1ConnectionId(action, nonce) },
+    message: { source: network === 'mainnet' ? 'a' : 'b', connectionId: l1ConnectionId(action, nonce, expiresAfter) },
   });
 }
 
@@ -183,7 +192,7 @@ export function payloadDigest(payload: HlPayload, network: HlNetwork): Hex {
     if (chain !== want) throw new Error(`hyperliquid ${action.type}: signed for ${String(chain)}, the relayer posts to ${want}`);
     return userSignedDigest(action);
   }
-  return l1Digest(action as MsgpackValue, payload.nonce, network);
+  return l1Digest(action as MsgpackValue, payload.nonce, network, payload.expiresAfter);
 }
 
 // ---- signatures ----

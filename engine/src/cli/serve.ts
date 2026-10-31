@@ -18,6 +18,7 @@
 //   --state-dir <dir>   GIMBAL_STATE_DIR: where the confirmed engine rules (PUT /strategy) are kept across restarts,
 //                       one file per mode and desk; default engine/state/ (gitignored)
 // NEAR_AI_API_KEY turns on POST /policy/draft (src/nearai/); without it the route answers 503, drafting unavailable.
+// GIMBAL_SETUP=1 turns on POST /setup (src/setup/): venue setup signs through the operator key (OPERATOR_PRIVATE_KEY).
 // The contract (testnet and mainnet, src/cli/serve-contract.ts): with GIMBAL_CONTRACT_ID and DESK_ID set (and
 // OWNER_ACCOUNT_ID or OPERATOR_ACCOUNT_ID, OPERATOR_PRIVATE_KEY, optional NEAR_NETWORK / NEAR_RPC_URL), the policy
 // is get_desk's, the oracle is the contract's stored prices, and a `health` event carries NEAR's state. Views
@@ -35,6 +36,7 @@ import { ReplayOracle } from '../contract/replay-oracle.ts';
 import { NearAiClient } from '../nearai/client.ts';
 import { PolicyDrafter, deskMarkets } from '../nearai/draft-route.ts';
 import { StrategyStore, strategyFile } from '../strategy-store.ts';
+import { setupFromEnv } from '../setup/serve-setup.ts';
 import { liveReaders, replayReaders } from '../readers.ts';
 import type { Readers } from '../readers.ts';
 import { DEFAULT_STRATEGY, ORDERLY_BROKERS, scannerConfigFor } from '../scanner/config.ts';
@@ -83,6 +85,8 @@ if (policyFile !== undefined && policyFile !== '') {
     fail(errorMessage(err));
   }
 }
+// Before connectContract: its price cache can report a failed first read through noteOnce.
+const seenNotes = new Map<string, number>();
 let contract: ContractSide | null = null;
 let nearHealth: NearHealth = 'ok';
 let deskId: string | null = null;
@@ -197,6 +201,7 @@ if (saved.problem !== null) log(`engine rules not loaded, starting from the defa
 else if (saved.strategy !== null) log(`engine rules from ${strategyStore.path}`);
 const drafter = new PolicyDrafter({ client: new NearAiClient({ apiKey: envVar('NEAR_AI_API_KEY') }), markets: deskMarkets(readers.venues) });
 log(drafter.configured ? `policy drafts: NEAR AI ${drafter.model}` : 'policy drafts: off (NEAR_AI_API_KEY is not set), POST /policy/draft answers 503');
+const setup = await setupFromEnv(mode, envVar, log).catch((err: unknown) => fail(`setup: ${errorMessage(err)}`));
 
 server = new EngineServer({
   mode,
@@ -204,6 +209,7 @@ server = new EngineServer({
   strategy: saved.strategy ?? DEFAULT_STRATEGY,
   saveStrategy: (s) => strategyStore.save(s),
   drafter,
+  ...(setup === null ? {} : { setup }),
   policy,
   intervalMs: scannerConfig.intervalMs,
   log,
@@ -238,7 +244,6 @@ process.once('SIGINT', () => void shutdown('SIGINT'));
 process.once('SIGTERM', () => void shutdown('SIGTERM'));
 if (minutes !== null) setTimeout(() => void shutdown(`${minutes} min done`), minutes * 60_000).unref();
 
-const seenNotes = new Map<string, number>();
 function noteOnce(note: string): void {
   // The same failure every 5 s would flood the log: one line per kind of note a minute.
   const kind = note.replace(/\d+/g, '#');

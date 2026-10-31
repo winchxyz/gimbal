@@ -75,6 +75,11 @@ export interface IocPlan {
   notionalUsd: number;
 }
 
+/** The price the contract values an order's size cap at: max(limit, oracle), the limit alone for an unpriced asset. */
+export function capPrice(limitPx: number, oraclePx: number | null): number {
+  return oraclePx === null ? limitPx : Math.max(limitPx, oraclePx);
+}
+
 /**
  * An IOC that should fill now: the limit is the best price plus slippage, held to 95 % of the band around the oracle
  * so the contract's E_PRICE_BAND check passes. Throws when the book is already outside the band (it could not fill).
@@ -93,9 +98,12 @@ export function planIoc(input: IocInput): IocPlan {
     throw new Error(`the best ${buy ? 'ask' : 'bid'} ${input.bookPx} is outside the contract's band of ${input.bandBps} bps around its oracle price ${input.oraclePx}: an IOC inside the band would not fill`);
   }
   const sz = input.sz ?? hlSz((input.notionalUsd ?? HL_MIN_ORDER_USD + 1) / pxN, input.szDecimals, 'up');
+  // The contract values the size cap at the higher of the limit and its oracle price; the venue minimum at the limit.
+  const capPx = capPrice(pxN, oracle);
   const notionalUsd = Number(sz) * pxN;
+  const cappedUsd = Number(sz) * capPx;
   if (input.maxSz !== undefined && Number(sz) > Number(input.maxSz)) throw new Error(`${sz} is over the unpriced asset's max_sz ${input.maxSz}`);
-  if (notionalUsd > input.maxNotionalUsd) throw new Error(`${sz} at ${px} is ${notionalUsd.toFixed(2)} USD, over policy.max_notional_usd ${input.maxNotionalUsd}`);
+  if (cappedUsd > input.maxNotionalUsd) throw new Error(`${sz} at ${capPx} is ${cappedUsd.toFixed(2)} USD, over policy.max_notional_usd ${input.maxNotionalUsd}`);
   if (!input.reduceOnly && notionalUsd < HL_MIN_ORDER_USD) throw new Error(`${sz} at ${px} is ${notionalUsd.toFixed(2)} USD, under Hyperliquid's ${HL_MIN_ORDER_USD} USD minimum`);
   return {
     order: { asset: input.asset, is_buy: buy, px, sz, reduce_only: input.reduceOnly ?? false, tif: 'Ioc', cloid: input.cloid ?? newCloid() },

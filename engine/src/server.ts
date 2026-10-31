@@ -27,6 +27,8 @@ import type {
 import { errorMessage } from './venues/recorder.ts';
 import { policyDraftRoute } from './nearai/draft-route.ts';
 import type { PolicyDrafter } from './nearai/draft-route.ts';
+import { setupRoute } from './setup/route.ts';
+import type { SetupStarter } from './setup/route.ts';
 import { parseStrategyConfig } from './scanner/config.ts';
 import type { ScanResult, Scanner } from './scanner/scanner.ts';
 
@@ -90,6 +92,8 @@ export interface EngineServerOptions {
   drafter?: Pick<PolicyDrafter, 'draft'>;
   /** Persists a confirmed PUT /strategy before it takes effect (src/strategy-store.ts); none = memory only. */
   saveStrategy?: (strategy: StrategyConfig) => Promise<void>;
+  /** POST /setup (src/setup/route.ts); none = 503, venue setup is off. */
+  setup?: SetupStarter;
 }
 
 type Latest = {
@@ -365,11 +369,16 @@ export class EngineServer {
       const answer = await policyDraftRoute(() => readBody(req), this.#options.drafter ?? null, (line) => this.#log(line));
       return json(res, answer.status, answer.body);
     }
+    if (path === '/setup') {
+      if (method !== 'POST') return notAllowed(res, 'POST');
+      const answer = await setupRoute(() => readBody(req), this.#options.setup ?? null, (p) => this.publish({ type: 'setup', data: p }));
+      return json(res, answer.status, answer.body);
+    }
     if (path === '/rotate' || path === '/close') {
       if (method !== 'POST') return notAllowed(res, 'POST');
       return json(res, 501, { ok: false, reason: 'the strategy engine is not running yet: nothing is entered or closed' });
     }
-    if (path === '/stress' || path === '/policy/draft' || path === '/setup') {
+    if (path === '/stress' || path === '/policy/draft') {
       if (method !== 'POST') return notAllowed(res, 'POST');
       return json(res, 501, { error: `POST ${path} is not built yet` });
     }
