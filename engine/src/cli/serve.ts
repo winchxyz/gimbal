@@ -10,28 +10,35 @@
 //                       in fixtures/replay/
 //   --speed <x>         GIMBAL_REPLAY_SPEED: replay time runs x times faster than real time, default 1
 //   --policy <file>     GIMBAL_POLICY_FILE: the desk's ContractPolicy as JSON (get_desk's policy), checked at start;
-//                       default none (every desk window is refused E_NO_DESK)
+//                       default none (every desk window is refused E_NO_DESK); ignored when the contract is set
 //   --record <file>     live modes only: write every venue answer the scanner gets, for replay (funding and books
 //                       at most every 30 s per market, so an hour stays a few MB)
 //   --minutes <n>       with --record: stop after n minutes and close the file
-// No oracle prices are read yet (that is the contract client's job), so every priced desk leg is refused
-// E_ORACLE_STALE, as the contract would refuse it. Public reads only: no keys.
+// The contract (testnet and mainnet, src/cli/serve-contract.ts): with GIMBAL_CONTRACT_ID and DESK_ID set (and
+// OWNER_ACCOUNT_ID or OPERATOR_ACCOUNT_ID, OPERATOR_PRIVATE_KEY, optional NEAR_NETWORK / NEAR_RPC_URL), the policy
+// is get_desk's, the oracle is the contract's stored prices, and a `health` event carries NEAR's state. Views
+// only: serve signs nothing. Without it no oracle prices are read, so every priced desk leg is refused
+// E_ORACLE_STALE, as the contract would refuse it, and the venue reads are public: no keys.
 
 import { readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import type { ContractPolicy, Mode } from '@gimbal/shared';
+import type { ContractPolicy, HealthMap, Mode } from '@gimbal/shared';
+import type { NearHealth } from '../contract/budget.ts';
 import { liveReaders, replayReaders } from '../readers.ts';
 import type { Readers } from '../readers.ts';
 import { DEFAULT_SCANNER_CONFIG, DEFAULT_STRATEGY } from '../scanner/config.ts';
 import { Scanner } from '../scanner/scanner.ts';
+import type { ScanResult } from '../scanner/scanner.ts';
 import { DEFAULT_ENGINE_HOST, DEFAULT_ENGINE_PORT, EngineServer } from '../server.ts';
 import type { RecordLine } from '../venues/recorder.ts';
 import { JsonlGzWriter, RecordingVenue, errorMessage } from '../venues/recorder.ts';
 import { ScaledClock, readRecording } from '../venues/replay.ts';
 import { watchReaders } from '../venues/watch/index.ts';
 import type { Clock } from '../venues/venue.ts';
+import type { ContractSide } from './serve-contract.ts';
+import { connectContract, contractEnv, healthChanged, healthMap, marginVenues } from './serve-contract.ts';
 import { ThinningSink, loadPolicyFile, replayStart, scanLine } from './serve-replay.ts';
 
 const { values } = parseArgs({
@@ -65,6 +72,26 @@ if (policyFile !== undefined && policyFile !== '') {
   } catch (err) {
     fail(errorMessage(err));
   }
+}
+let contract: ContractSide | null = null;
+let nearHealth: NearHealth = 'ok';
+try {
+  const cfg = contractEnv(envVar, mode);
+  if (cfg !== null) {
+    contract = await connectContract(cfg, {
+      onHealth: (status, detail) => {
+        nearHealth = status;
+        log(`near ${status}: ${detail}`);
+        publishHealth();
+      },
+      onError: (message) => noteOnce(message),
+    });
+    if (policy !== null) log(`${policyFile}: ignored, the policy is get_desk(${cfg.deskId})'s`);
+    policy = contract.policy;
+    log(`contract ${cfg.contractId} (${cfg.network}), desk ${cfg.deskId}: policy read, ${contract.prices.size} stored prices`);
+  }
+} catch (err) {
+  fail(`contract: ${errorMessage(err)}`);
 }
 const recordPath = values.record;
 if (recordPath !== undefined && mode === 'replay') fail('--record needs GIMBAL_MODE=mainnet or testnet');
@@ -110,12 +137,23 @@ let server: EngineServer | null = null;
 const scanner = new Scanner(readers.venues, readers.watch, {
   config: { ...DEFAULT_SCANNER_CONFIG, policy },
   clock,
-  oracle: null,
+  oracle: contract?.prices ?? null,
+  marginHeldAt: () => marginVenues(server?.state().desk ?? null),
   strategy: () => server?.strategy ?? DEFAULT_STRATEGY,
   onNote: (note) => noteOnce(note),
 });
 
 let scans = 0;
+let lastScan: ScanResult['scan'] | null = null;
+let health: HealthMap | null = null;
+/** With the contract set: a `health` event whenever NEAR's state or a desk venue's changes. */
+function publishHealth(): void {
+  if (contract === null || server === null) return;
+  const next = healthMap(lastScan, nearHealth);
+  if (!healthChanged(health, next)) return;
+  health = next;
+  server.publish({ type: 'health', data: next });
+}
 server = new EngineServer({
   mode,
   scanner,
@@ -127,6 +165,8 @@ server = new EngineServer({
     scans++;
     if (scans === 1 || scans % 12 === 0) log(scanLine(scans, r));
     if (writer !== null && scans % 12 === 0) void writer.flush();
+    lastScan = r.scan;
+    publishHealth();
   },
 });
 
@@ -140,6 +180,7 @@ async function shutdown(reason: string): Promise<void> {
   stopping = true;
   log(`stopping: ${reason}`);
   await server!.stop();
+  contract?.prices.stop();
   readers.close();
   if (writer !== null) {
     await writer.close();
