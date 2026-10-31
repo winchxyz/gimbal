@@ -52,7 +52,7 @@ and the owner passes them to `create_desk`. The contract checks them: `create_de
 address and the Solana authority match; otherwise it refunds the whole deposit, stores nothing and ends the
 transaction as a refusal (`E_MPC`, `E_ARGS`, `E_DESK_EXISTS` or `E_DEPOSIT`). Attach about **100 TGas**: the
 call and its callback burn ~18 TGas (measured on testnet 2026-10-30), and `create_desk` refuses less than its
-floor (2 × the MPC derive gas + the callback gas + its own cost, ~54 TGas) with `E_ARGS`. The transaction's result
+floor (2 × the MPC derive gas + the callback gas + its own cost, 56 TGas) with `E_ARGS`. The transaction's result
 is the callback's. Desk ids are global, so another owner can take an id between the call and its callback: after
 `create_desk` a client reads `get_desk(desk_id)` and checks that `owner` is its own account before it funds the
 desk's addresses.
@@ -73,9 +73,10 @@ struct Policy {
     rescue_cap_usd_per_hour: u64,
     max_transfer_cost_bps: u32,              // 1Click: minAmountOut ≥ amountIn − max(bps share, flat); default 100
     max_transfer_cost_flat_e6: u64,          // USDC ×1e6; default 500000 (0.5 USDC; measured 0.21–0.32 on 4–7 USDC)
-    unpriced: Vec<String>,                   // symbols WITHOUT an oracle price the owner explicitly allowed
+    unpriced: Vec<UnpricedAsset>,            // { symbol: String, max_sz: String /*canonical decimal, base units*/ }:
+                                             // symbols WITHOUT an oracle price the owner explicitly allowed
     unpriced_max_notional_usd: u64,          // their own cap per leg (default 100); an unpriced order must fit
-                                             // min(max_notional_usd, unpriced_max_notional_usd)
+                                             // min(max_notional_usd, unpriced_max_notional_usd) at its own price
 }
 // Every u64 in Policy is at most 2^53 − 1 (E_ARGS above), so JavaScript reads it exactly.
 // policy_sha256 (event policy_set) = hex sha256 of the policy JSON exactly as get_desk returns it.
@@ -100,10 +101,18 @@ the whole amount is refunded (returned as unused). A 1Click quote that delivers 
 Performance fee on a payout `x` to the owner: `profit = withdrawn + x − deposited`;
 `fee = performance_bps × max(0, profit − hwm) / 10000`; then `hwm = max(hwm, profit)`.
 
-**Unpriced assets.** An order for a symbol in `unpriced` skips the oracle band (there is no trusted price)
-and must fit `unpriced_max_notional_usd`; the `signed` event carries `oracle_px: null, unpriced: true`.
-Only the owner can add a symbol to `unpriced` (it is part of `set_policy`); the UI shows such symbols as
-"no price protection". Any other symbol without a fresh oracle price is refused (`E_ORACLE_STALE` / `E_ASSET`).
+**Order size cap.** An order's notional is valued at a reference price, never at the caller's limit price
+alone (a sell at a tiny limit price would otherwise fit any size): `notional = sz × max(px, oracle_px)`, buys and
+sells alike, and it must fit `max_notional_usd` (`E_SIZE`). The same rule holds for Phoenix orders (lots × base lot ×
+max(price, oracle_px)) and Orderly orders.
+
+**Unpriced assets.** An order for a symbol in `unpriced` skips the oracle band (there is no trusted price), so
+its size is capped in base units instead: `sz ≤ max_sz` of that symbol, and `sz × px` must also fit
+min(`max_notional_usd`, `unpriced_max_notional_usd`) (`E_SIZE`). The `signed` event carries `oracle_px: null,
+unpriced: true`. Only the owner can add a symbol to `unpriced` (it is part of `set_policy`); the UI asks for the
+cap in USD, converts it to `max_sz` at the current price, and shows such symbols as "no price protection". Any
+other symbol without a fresh oracle price is refused (`E_ORACLE_STALE` / `E_ASSET`), so until prices are stored
+(C6) every priced order is refused.
 
 ### 1.3 Who may call what
 
@@ -158,11 +167,12 @@ chooses nothing:
 | `fund_venue(desk_id, quote, quote_signature, reason)` | ✓ | ✓ | sends the desk's USDC on NEAR to a verified 1Click deposit address (recipient = a desk venue address or the pinned Orderly receiver) |
 | `withdraw_to_owner(desk_id, amount)` | ✓ | | pays USDC on NEAR the contract holds for the desk, minus the performance fee to the treasury |
 | `hl_approve_builder_fee(desk_id)` | ✓ | ✓ | `ApproveBuilderFee` for the treasury builder at `maxFeeRate` from `FeeConfig` |
-| `hl_set_referrer(desk_id)` | ✓ | ✓ | L1 action `{type:"setReferrer", code}` with `code = treasury.referral_codes.hyperliquid`; once per desk, before its first order; no other code can be signed; with no code configured it refuses (`E_ARGS`) and setup skips it |
+| `hl_set_referrer(desk_id)` | ✓ | ✓ | L1 action `{type:"setReferrer", code}` with `code = treasury.referral_codes.hyperliquid`; setup calls it once per desk, before its first order (the contract does not refuse a repeat; Hyperliquid does); no other code can be signed; with no code configured it refuses (`E_ARGS`) and setup skips it |
 | `hl_withdraw(desk_id, amount)` | ✓ | | emergency only: to the desk's own EVM address |
 | `set_mock_price(asset, price_e8)` | contract owner | | only with `PriceSource::Mock` |
 | `refresh_prices(assets: Vec<String>)` | ✓ | ✓ | asks the OutLayer oracle → stores price + time |
-| `hl_order(desk_id, order: HlOrder, reason)` | ✓ | ✓ | price band vs stored oracle price |
+| `hl_order(desk_id, order: HlOrder, reason)` | ✓ | ✓ | price band vs stored oracle price; size cap at the reference price (§1.2); reduce-only passes a paused desk |
+| `hl_cancel(desk_id, asset: u32, oid: u64, reason)` | ✓ | ✓ | L1 action `{type:"cancel", cancels:[{a, o}]}`; passes a paused desk, so a pause can stop resting orders |
 | `hl_usd_class_transfer(desk_id, amount, to_perp, reason)` | ✓ | ✓ | |
 | `hl_send_to_intents(desk_id, quote, quote_signature, reason)` | ✓ | ✓ | rescue out of Hyperliquid |
 | `sol_sign(desk_id, message_b64, reason)` | ✓ | ✓ | Phoenix / Ember / own transfers |
@@ -199,7 +209,10 @@ struct OrderlyRequest {                      // the contract builds path and bod
                                              // | "settle_pnl" (POST /v1/settle_pnl; body: verify on day 5) | "withdraw_request" (POST /v1/withdraw_request)
                                              // | "referral_bind" (POST /v1/referral/bind {referral_code}, code = referral_codes.orderly
                                              //   only; once per desk, permanent; path and field: verify on day 5)
-    symbol: Option<String>, side: Option<String> /* BUY|SELL */, order_type: Option<String> /* IOC|LIMIT|MARKET */,
+                                             // | "funding_fee_history" (GET /v1/funding_fee/history?symbol&start_t&end_t&page&size;
+                                             //   read only; row fields: verify on day 5)
+    symbol: Option<String>,
+    start_t: Option<u64>, end_t: Option<u64>, page: Option<u32>, size: Option<u32>,   // funding_fee_history only (ms) side: Option<String> /* BUY|SELL */, order_type: Option<String> /* IOC|LIMIT|MARKET */,
     price: Option<String>, quantity: Option<String>, reduce_only: bool, client_order_id: Option<String>,
     order_id: Option<u64>, timestamp_ms: u64,
     // settle_pnl / withdraw_request only: the fields of the EIP-712 message signed earlier and its signature.
@@ -239,8 +252,10 @@ Every action method returns a `SignedAction` (from the `on_signed` callback) tha
 - Orderly: `payload = { "method", "path", "body", "timestamp", "message": "<timestamp + METHOD + path + body, exactly as signed>" }`,
   Ed25519 as above; the relayer sends headers `orderly-timestamp`, `orderly-account-id`, `orderly-key`
   (`ed25519:<base58 public key>`) and `orderly-signature` (base64url of the 64 bytes). EIP-712 actions
-  (`Registration`, `AddOrderlyKey`, `Withdraw`) come back as secp256k1 signatures like Hyperliquid's; Orderly
-  takes them as `0x` + r ‖ s ‖ v (65 bytes, v = 27 + recovery_id).
+  (`Registration`, `AddOrderlyKey`, `SettlePnl`, `Withdraw`) come back as secp256k1 signatures like Hyperliquid's,
+  with `payload = { "message": { <the typed fields, including timestamp> }, "userAddress": "<desk EVM address>" }`;
+  the relayer posts `{ message, signature, userAddress }` (e.g. `POST /v1/register_account`, `/v1/orderly_key`), and
+  Orderly takes the signature as `0x` + r ‖ s ‖ v (65 bytes, v = 27 + recovery_id).
 - Arbitrum (`evm_usdc_to_intents`): `payload` = the typed-data message `{ from, to, value, validAfter, validBefore, nonce }`
   plus `token` and `chainId`; the relayer's gas wallet calls the USDC contract's
   `transferWithAuthorization(from, to, value, validAfter, validBefore, nonce, v, r, s)`.
@@ -259,7 +274,7 @@ near-sdk before the method runs ("Failed to deserialize input from JSON"); clien
 | `E_ARGS` | malformed argument: desk_id outside `[a-z0-9-]{1,32}`, bad address or base58/hex, `reason` over 280 characters, a once-only setting set twice, `create_desk` with less prepaid gas than its floor (§1.2) |
 | `E_DEPOSIT` | attached deposit below the storage cost (`create_desk`, `set_policy`, `set_operator`), or a pause carrying more than 1 yocto |
 | `E_ASSET` | asset, symbol or market not in the policy |
-| `E_SIZE` | notional over `max_notional_usd`, or zero |
+| `E_SIZE` | notional at the reference price over `max_notional_usd`, an unpriced size over its `max_sz` or its notional over the unpriced cap (§1.2), or zero |
 | `E_DECIMAL` | non-canonical decimal string |
 | `E_PRICE_BAND` | price outside `price_band_bps` of the oracle price |
 | `E_ORACLE_STALE` | no oracle price younger than `oracle_max_age_s` |
@@ -339,7 +354,9 @@ export interface ContractPolicy {  // the contract's Policy (§1.2), same snake_
   phoenix_markets: { symbol: string; orderbook: string; base_lot_e8: number; tick_e8: number }[];
   orderly_symbols: string[];
   max_notional_usd: number; price_band_bps: number; oracle_max_age_s: number;
-  rescue_cap_usd_per_hour: number; unpriced: string[]; unpriced_max_notional_usd: number;
+  rescue_cap_usd_per_hour: number;
+  unpriced: { symbol: string; max_sz: string }[];   // no oracle price: max_sz caps the size in base units (canonical decimal)
+  unpriced_max_notional_usd: number;
   max_transfer_cost_bps: number; max_transfer_cost_flat_e6: number;
 }
 
@@ -352,6 +369,8 @@ export interface StrategyConfig {  // engine rules, off-chain: the contract neve
   stopDrawdownPct: number | null;  // close both legs when the desk's drawdown reaches this
   rotate: { minGainPts: number; forHours: number };   // rotate when another window beats the held one by at
                                                       // least minGainPts of net APR for forHours in a row
+  risk: { watchDistancePct: number; rescueDistancePct: number };   // a leg closer to liquidation than these
+                                                      // percentages is watch / rescue (defaults 15 and 8)
 }
 
 export interface PolicyDraft {     // NEAR AI turns the owner's words into this; the owner edits and confirms
@@ -371,17 +390,26 @@ export interface SetupProgress {   // venue setup the engine runs through operat
   }[];
 }
 
+// Money is signed USD: income positive, costs negative (fees are ≤ 0).
 export interface Leg {
-  venue: VenueId; symbol: string; side: 'long' | 'short'; size: number;
-  entry: number; mark: number; liqPx: number | null;
-  marginUsd: number; marginRatio: number; distanceToLiqPct: number | null;
+  venue: VenueId; symbol: string; side: 'long' | 'short';
+  size: number;                   // base units, always positive; side gives the direction
+  lotSize: number;                // base units per lot on this venue (Phoenix base lot, HL 10^-szDecimals)
+  entry: number; mark: number; liqPx: number | null;   // USD per base unit
+  marginUsd: number;              // margin held for this leg on its venue
+  marginRatio: number;            // maintenance margin ÷ margin, a fraction: 0.31 = 31 %, 1 = liquidation
+  distanceToLiqPct: number | null;   // how far mark must move to reach liqPx, in percent: 32.6 = 32.6 %
   fundingEarnedUsd: number; unsettledFundingUsd: number;
+  feesUsd: number;                // trading fees paid on this leg since it opened (≤ 0)
   unpriced: boolean;              // opened under policy.unpriced: no oracle price band
 }
 
 export interface DeskState {
   deskId: string; owner: string; contract: string; mode: Mode;
-  legs: Leg[]; netDelta: number; equityUsd: number; reserveUsd: number;
+  legs: Leg[];
+  netDelta: number;               // base units, long minus short; 0 when level
+  equityUsd: number;              // the desk value: margin on every venue + reserve + open P&L
+  reserveUsd: number;             // the part of equityUsd held back for rescues
   pnl: { fundingUsd: number; feesUsd: number; priceUsd: number; netUsd: number };
   health: 'level' | 'watch' | 'rescue';
   paused: { by: string; at: number } | null;   // set_paused / panic_close: the NEAR account that paused, ms; null = running
@@ -389,8 +417,9 @@ export interface DeskState {
   updatedAt: number;
 }
 
-// The status line reads, first match wins: rescueFailure → Needs you, paused → Paused, health rescue →
-// Rescuing, health watch → Watch, no legs → Waiting, else Level.
+// The status line reads, first match wins: rescueFailure → Needs you, a leg's venue down in HealthMap →
+// "<venue> not answering", paused → Paused, health rescue → Rescuing, health watch → Watch, no legs → Waiting,
+// else Level.
 export interface RescueFailure {
   rescueId: string;
   step: Exclude<RescueProgress['step'], 'landed' | 'failed'>;   // the step that failed
@@ -472,6 +501,19 @@ export interface VenueReader {           // engine/src/venues/venue.ts; readers 
   funding(): Promise<MarketFunding[]>;
   book(symbol: string, depth?: number): Promise<Book>;   // best levels first
   account(address: string): Promise<AccountState>;   // equity, free margin, positions incl. unsettled funding
+  userFunding(address: string, startTime: number, endTime?: number): Promise<FundingPayment[]>;
+                                         // FundingHistorySource: every payment with startTime ≤ time ≤ endTime (ms;
+                                         // no end = up to now), oldest first, deduplicated across pages
+}
+
+export interface FundingPayment {
+  time: number;                          // ms, when the venue booked it
+  symbol: string;
+  fundingUsd: number;                    // received > 0, paid < 0 (same sign as a position's funding since open)
+  size: number;                          // position size at that time, base units, signed
+  ratePerHour: number;                   // the rate it was priced at; > 0 means longs pay shorts
+  samples: number | null;                // a row the venue aggregated (Hyperliquid: one row per day after a week):
+                                         // how many hourly payments it sums; null on an ordinary hourly row
 }
 
 export interface MarketFunding extends FundingRate {   // the prices the rate applies to, from the same read,

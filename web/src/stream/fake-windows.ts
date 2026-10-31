@@ -20,6 +20,7 @@ export const FAKE_STRATEGY: StrategyConfig = {
   maxLeverage: 3,
   stopDrawdownPct: 10,
   rotate: { minGainPts: 3, forHours: 4 },
+  risk: { watchDistancePct: 15, rescueDistancePct: 8 },
 };
 export const FAKE_VENUE_COUNT = 32;
 export const FAKE_FAILED_VENUES = ['phoenix', 'lighter', 'paradex'];

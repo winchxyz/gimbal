@@ -37,4 +37,5 @@ export const STRATEGY: StrategyConfig = {
   maxLeverage: 3,
   stopDrawdownPct: 10,
   rotate: { minGainPts: 3, forHours: 4 },
+  risk: { watchDistancePct: 15, rescueDistancePct: 8 },
 };

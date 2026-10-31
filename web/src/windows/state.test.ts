@@ -59,13 +59,15 @@ test('histories: a refresh keeps the last good line; fetch rules for fresh, stal
 
 test('GET /strategy: every field or a clear error', () => {
   const rotate = { minGainPts: 3, forHours: 4 };
-  const base = { auto: true, minNetAprPct: 5, legUsd: 1200, maxLeverage: 3, stopDrawdownPct: null, rotate };
-  assert.deepEqual(parseStrategy({ ...base, extra: 1, rotate: { ...rotate, extra: 1 } }), base);
+  const risk = { watchDistancePct: 15, rescueDistancePct: 8 };
+  const base = { auto: true, minNetAprPct: 5, legUsd: 1200, maxLeverage: 3, stopDrawdownPct: null, rotate, risk };
+  assert.deepEqual(parseStrategy({ ...base, extra: 1, rotate: { ...rotate, extra: 1 }, risk: { ...risk, extra: 1 } }), base);
   assert.throws(() => parseStrategy(null), /not an object/);
   assert.throws(() => parseStrategy({ ...base, auto: 'yes' }), /auto/);
   assert.throws(() => parseStrategy({ ...base, minNetAprPct: '5' }), /minNetAprPct/);
   assert.throws(() => parseStrategy({ ...base, stopDrawdownPct: undefined }), /stopDrawdownPct/);
   assert.throws(() => parseStrategy({ ...base, rotate: { minGainPts: 3 } }), /rotate/);
+  assert.throws(() => parseStrategy({ ...base, risk: { watchDistancePct: 15 } }), /risk/);
 });
 
 test('GET /windows/history: points come back oldest first', () => {
