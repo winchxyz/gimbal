@@ -816,8 +816,9 @@ const CAPABILITIES_STEP: Step = Step {
 };
 
 impl Onboarding {
-    /// The message type a format stands for: legacy messages are registrations, version 0 ones
-    /// referral activations.
+    /// The type a format stands for: a registration is always a legacy message and a referral
+    /// activation always a version 0 one, so `sol_sign_register` needs no type argument. A
+    /// message is then refused as the type of its format.
     pub fn of(format: Format) -> Onboarding {
         match format {
             Format::Legacy => Onboarding::Register,
@@ -862,6 +863,29 @@ pub fn check_onboarding(
     which: Onboarding,
 ) -> Result<(), Refusal> {
     let m = parse_message(message)?;
+    check_shape(authority, trader, message.len(), &m, which)
+}
+
+/// `sol_sign_register`'s check: the message's type is the one its format stands for
+/// ([`Onboarding::of`]), and it is checked as [`check_onboarding`] checks that type.
+pub fn check_registration(
+    authority: &Pubkey,
+    trader: &Pubkey,
+    message: &[u8],
+) -> Result<Onboarding, Refusal> {
+    let m = parse_message(message)?;
+    let which = Onboarding::of(m.format);
+    check_shape(authority, trader, message.len(), &m, which)?;
+    Ok(which)
+}
+
+fn check_shape(
+    authority: &Pubkey,
+    trader: &Pubkey,
+    len: usize,
+    m: &Message,
+    which: Onboarding,
+) -> Result<(), Refusal> {
     if m.format != which.format() {
         return Err(Refusal::new(
             E_SOL_MESSAGE,
@@ -873,8 +897,8 @@ pub fn check_onboarding(
             ),
         ));
     }
-    check_transaction_size(message.len(), 2)?;
-    check_signers(&m, 2, authority)?;
+    check_transaction_size(len, 2)?;
+    check_signers(m, 2, authority)?;
     if m.keys[1] != PHOENIX_ONBOARDER {
         return Err(Refusal::new(
             E_SOL_ACCOUNT,

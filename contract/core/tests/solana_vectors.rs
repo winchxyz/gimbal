@@ -4,13 +4,13 @@
 
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use gimbal_core::ed25519::is_on_curve;
-use gimbal_core::errors::{E_ORACLE_STALE, E_PRICE_BAND, E_SIZE, E_SOL_PROGRAM};
+use gimbal_core::errors::{E_ORACLE_STALE, E_PRICE_BAND, E_SIZE, E_SOL_MESSAGE, E_SOL_PROGRAM};
 use gimbal_core::phoenix::{
-    check_message, check_onboarding, Onboarding, Rescue, CANCEL_ALL, DEPOSIT_FUNDS, EMBER_DEPOSIT,
-    EMBER_WITHDRAW, PHOENIX_ACTIVE_TRADER_BUFFER, PHOENIX_GLOBAL_CONFIGURATION,
-    PHOENIX_GLOBAL_TRADER_INDEX, PHOENIX_LOG_AUTHORITY, PHOENIX_ONBOARDING_PERMISSION,
-    PHOENIX_RISK_AUTHORITY, PLACE_MARKET_ORDER, REGISTER_TRADER, SET_TRADER_CAPABILITIES_DELEGATED,
-    WITHDRAW_FUNDS,
+    check_message, check_onboarding, check_registration, Onboarding, Rescue, CANCEL_ALL,
+    DEPOSIT_FUNDS, EMBER_DEPOSIT, EMBER_WITHDRAW, PHOENIX_ACTIVE_TRADER_BUFFER,
+    PHOENIX_GLOBAL_CONFIGURATION, PHOENIX_GLOBAL_TRADER_INDEX, PHOENIX_LOG_AUTHORITY,
+    PHOENIX_ONBOARDING_PERMISSION, PHOENIX_RISK_AUTHORITY, PLACE_MARKET_ORDER, REGISTER_TRADER,
+    SET_TRADER_CAPABILITIES_DELEGATED, WITHDRAW_FUNDS,
 };
 use gimbal_core::policy::{PhoenixMarket, Policy, UnpricedAsset};
 use gimbal_core::solana::{
@@ -415,7 +415,7 @@ fn every_onboarding_case_gets_its_expected_answer() {
         cases.iter().filter(|c| c["expect"]["ok"] == true).count(),
         5
     );
-    // The golden messages, and the type a format stands for.
+    // The golden messages, whose type is read from their instructions.
     for (which, kind) in [
         (Onboarding::Register, "register"),
         (Onboarding::ReferralActivate, "referral_activate"),
@@ -423,10 +423,53 @@ fn every_onboarding_case_gets_its_expected_answer() {
         let golden = &doc["messages"][kind];
         let bytes = base64_decode(golden["message_b64"].as_str().unwrap());
         check_onboarding(&authority, &trader, &bytes, which).unwrap();
-        let format = parse_message(&bytes).unwrap().format;
-        assert_eq!(Onboarding::of(format), which);
+        assert_eq!(check_registration(&authority, &trader, &bytes), Ok(which));
         assert_eq!(which.kind(), kind);
     }
+}
+
+/// `sol_sign_register` takes no type: a registration is a legacy message and a referral
+/// activation a version 0 one, so the format names the type. Every case whose format is its
+/// type's gets the vector's answer. Of the four others, the two that offer one type's valid
+/// message as the other pass as what they are, and the two compiled in the other type's format
+/// are refused as that type (`E_SOL_PROGRAM` where the typed check says `E_SOL_MESSAGE`).
+#[test]
+fn sol_sign_register_takes_the_type_its_format_stands_for() {
+    let doc = onboarding_doc();
+    let ctx = &doc["ctx"];
+    let authority = key(&ctx["desk"]["authority"]);
+    let trader = phoenix_trader_address(sha256, &authority).unwrap();
+    let mut wrong = vec![];
+    let (mut passed_as_other, mut refused_as_other) = (0, 0);
+    for case in doc["cases"].as_array().unwrap() {
+        let bytes = message(case);
+        let got = check_registration(&authority, &trader, &bytes);
+        let format_type = match parse_message(&bytes) {
+            Ok(m) => Onboarding::of(m.format).kind(),
+            Err(_) => case["type"].as_str().unwrap(),
+        };
+        if format_type == case["type"] {
+            if outcome(&got) != expected(case) {
+                wrong.push(format!(
+                    "{}: got {got:?}, want {}",
+                    name(case),
+                    expected(case)
+                ));
+            }
+            if let Ok(which) = got {
+                assert_eq!(which.kind(), format_type);
+            }
+        } else if name(case).contains(" offered as ") {
+            assert_eq!(got.map(Onboarding::kind), Ok(format_type), "{}", name(case));
+            passed_as_other += 1;
+        } else {
+            assert_eq!(expected(case), E_SOL_MESSAGE, "{}", name(case));
+            assert_eq!(outcome(&got), E_SOL_PROGRAM, "{}", name(case));
+            refused_as_other += 1;
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert_eq!((passed_as_other, refused_as_other), (2, 2));
 }
 
 #[test]
