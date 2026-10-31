@@ -83,7 +83,7 @@ function setup(options: SetupOptions = {}) {
       if (failure instanceof Error) throw failure;
       return {
         desk_id: failure?.desk ?? deskId, request_id: signed.length, venue: 'orderly', kind: 'ws_auth',
-        payload: { method: 'GET', path: '', body: '', timestamp, message: String(timestamp) }, signature: { scheme: 'Ed25519', signature: SIG },
+        payload: { method: '', path: '', body: '', timestamp, message: String(timestamp) }, signature: { scheme: 'Ed25519', signature: SIG },
       };
     },
   };

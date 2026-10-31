@@ -42,18 +42,32 @@ export class OrderlyApiError extends Error {
   }
 }
 
-/** The `data` of a successful answer; OrderlyApiError for anything else (non-2xx, success false, not JSON). */
-export async function readOrderlyData<T>(res: Response, what: string): Promise<T> {
-  const text = await res.text();
+/**
+ * What one answer says:
+ *   - data: HTTP 2xx with success true;
+ *   - refused: Orderly's own refusal, success false under a status below 500 (a 4xx, or a 200 that says no). The
+ *     request was turned down;
+ *   - unclear: anything else (a 5xx, a body that is not JSON, no success flag). It does not say whether the request
+ *     was carried out.
+ */
+export function orderlyAnswer<T>(status: number, text: string, what: string):
+  { kind: 'data'; data: T } | { kind: 'refused' | 'unclear'; error: OrderlyApiError } {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw new OrderlyApiError(what, res.status, null, `not JSON: ${text.slice(0, 120)}`, text);
+    return { kind: 'unclear', error: new OrderlyApiError(what, status, null, `not JSON: ${text.slice(0, 120)}`, text) };
   }
   const o = (typeof parsed === 'object' && parsed !== null ? parsed : {}) as { success?: unknown; data?: unknown; code?: unknown; message?: unknown };
-  if (!res.ok || o.success !== true) {
-    throw new OrderlyApiError(what, res.status, typeof o.code === 'number' ? o.code : null, typeof o.message === 'string' ? o.message : text.slice(0, 200), text);
-  }
-  return o.data as T;
+  const ok = status >= 200 && status < 300;
+  if (ok && o.success === true) return { kind: 'data', data: o.data as T };
+  const error = new OrderlyApiError(what, status, typeof o.code === 'number' ? o.code : null, typeof o.message === 'string' ? o.message : text.slice(0, 200), text);
+  return { kind: status < 500 && o.success === false ? 'refused' : 'unclear', error };
+}
+
+/** The `data` of a successful answer; OrderlyApiError for anything else (non-2xx, success false, not JSON). */
+export async function readOrderlyData<T>(res: Response, what: string): Promise<T> {
+  const answer = orderlyAnswer<T>(res.status, await res.text(), what);
+  if (answer.kind === 'data') return answer.data;
+  throw answer.error;
 }

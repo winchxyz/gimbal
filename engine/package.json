@@ -10,10 +10,13 @@
     "record": "node src/cli/record.ts",
     "capture": "node src/cli/capture.ts",
     "smoke": "node src/cli/smoke.ts",
-    "serve": "node src/cli/serve.ts"
+    "serve": "node src/cli/serve.ts",
+    "relay-hl": "node src/cli/relay-hl.ts"
   },
   "dependencies": {
     "@ellipsis-labs/rise": "0.6.2",
-    "@gimbal/shared": "*"
+    "@gimbal/shared": "*",
+    "near-api-js": "7.3.1",
+    "viem": "2.57.7"
   }
 }
