@@ -20,7 +20,17 @@ test('names that only look like a prefix are left alone', () => {
 
 test('equity suffixes are dropped and aliases applied', () => {
   assert.equal(normalizeBase('NVDA.US').base, 'NVDA');          // Backpack
-  assert.equal(normalizeBase('TSLASTOCK').base, 'TSLA');        // MEXC, Bitget
+  const stocks = { stockSuffix: true };                         // MEXC, Bitget
+  assert.equal(normalizeBase('TSLASTOCK', stocks).base, 'TSLA');
+  assert.equal(normalizeBase('CSTOCK', stocks).base, 'C');      // Citigroup: a one-letter ticker
+  assert.equal(normalizeBase('TSTOCK', stocks).base, 'T');      // AT&T
+  assert.equal(normalizeBase('VSTOCK', stocks).base, 'V');      // Visa
+  assert.equal(normalizeBase('4STOCK', stocks).base, '4STOCK'); // MEXC's coin called 4STOCK
+  assert.equal(normalizeBase('STOCK', stocks).base, 'STOCK');
+  assert.deepEqual(baseFields('CSTOCK', stocks), { base: 'C' });
+  // A venue that does not mark its stocks so keeps the name: Aster's GSTOCKUSDT is a coin, not stock G.
+  assert.equal(normalizeBase('GSTOCK').base, 'GSTOCK');
+  assert.equal(normalizeBase('TSLASTOCK').base, 'TSLASTOCK');
   assert.equal(normalizeBase('XAU_24_5').base, 'XAU');          // Extended
   assert.equal(normalizeBase('XBT').base, 'BTC');               // Kraken, KuCoin
   assert.equal(normalizeBase('GOLD').base, 'XAU');

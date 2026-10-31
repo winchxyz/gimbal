@@ -64,6 +64,8 @@ export interface MarketSession {
   timeZone: string;
   open: string;
   close: string;
+  /** Breaks inside the session, local "HH:MM" (end excluded): the market is shut for them like after the close. */
+  breaks?: readonly { from: string; to: string }[];
 }
 
 export interface QualityConfig {
@@ -93,14 +95,15 @@ export interface QualityConfig {
 }
 
 /**
- * Funding caps the scanner can source. Each is the venue's own statement; a venue left out has no cap the scanner
- * knows. Left out, with per-market limits in their raw answers that the readers do not pass on yet: aster
+ * Funding caps the scanner can source, for venues whose answer does not carry them. Each is the venue's own
+ * statement; a market's own limits from its venue's answer (MarketFunding.fundingCapPerHour / fundingFloorPerHour)
+ * come first, side by side, and this table only fills in. Left out, their readers pass each market's limits on: aster
  * (fundingInfo fundingFeeCap/Floor), okx (funding-rate max/minFundingRate), bitget (current-fund-rate
  * max/minFundingRate), gate (contracts funding_rate_limit), kucoin (contracts fundingRateCap/Floor), mexc
- * (funding_rate max/minFundingRate), extended (hourlyFundingRateCap), backpack (fundingRateUpper/LowerBound, unit
- * not checked). Left out, no cap found: binance and bybit (Hyperliquid's predictedFundings carries none), pacifica,
- * paradex, dydx, nado, aevo, variational, gmx-arbitrum, kraken, the hl-* HIP-3 dexes (set by each deployer),
- * phoenix and orderly. A rate several venues share to the digit is caught without a table (quality.ts).
+ * (funding_rate max/minFundingRate), extended (hourlyFundingRateCap), backpack (fundingRateUpper/LowerBound).
+ * Left out, no cap found: binance and bybit (Hyperliquid's predictedFundings carries none), pacifica, paradex, dydx,
+ * nado, aevo, variational, gmx-arbitrum, kraken, the hl-* HIP-3 dexes (set by each deployer), phoenix and orderly.
+ * A rate several venues share to the digit is caught without a table (quality.ts).
  */
 export const FUNDING_LIMITS: Readonly<Record<string, VenueFundingLimits>> = {
   // Hyperliquid docs, Trading > Funding: "Funding on Hyperliquid is capped at 4%/hour"; the cap "does not depend
@@ -182,14 +185,20 @@ export const DEFAULT_QUALITY: QualityConfig = {
     'SPX500', 'XYZ100', 'JP225', 'KR200', 'NIFTY',
     'EUR', 'GBP', 'JPY',
   ],
-  // Each exchange's published regular session. Lunch breaks count as open; holidays are not modelled.
+  // Each exchange's published regular session, with its lunch break where it has one: no price is set over lunch,
+  // so a stock perp then drifts as it does after the close. KRX, TWSE and NSE trade straight through. Holidays are
+  // not modelled.
   stockExchanges: {
     NYSE: { name: 'NYSE and Nasdaq (New York)', timeZone: 'America/New_York', open: '09:30', close: '16:00' },
     KRX: { name: 'KRX (Seoul)', timeZone: 'Asia/Seoul', open: '09:00', close: '15:30' },
-    TSE: { name: 'the Tokyo Stock Exchange', timeZone: 'Asia/Tokyo', open: '09:00', close: '15:30' },
-    HKEX: { name: 'HKEX (Hong Kong)', timeZone: 'Asia/Hong_Kong', open: '09:30', close: '16:00' },
+    // Morning 09:00-11:30, afternoon 12:30-15:30 (the close moved from 15:00 on 5 Nov 2024).
+    TSE: { name: 'the Tokyo Stock Exchange', timeZone: 'Asia/Tokyo', open: '09:00', close: '15:30', breaks: [{ from: '11:30', to: '12:30' }] },
+    // Morning 09:30-12:00, afternoon 13:00-16:00.
+    HKEX: { name: 'HKEX (Hong Kong)', timeZone: 'Asia/Hong_Kong', open: '09:30', close: '16:00', breaks: [{ from: '12:00', to: '13:00' }] },
     TWSE: { name: 'TWSE and TPEx (Taipei)', timeZone: 'Asia/Taipei', open: '09:00', close: '13:30' },
-    SSE: { name: 'SSE and SZSE (Shanghai, Shenzhen)', timeZone: 'Asia/Shanghai', open: '09:30', close: '15:00' },
+    // Morning 09:30-11:30, afternoon 13:00-15:00, the same on Shenzhen.
+    SSE: { name: 'SSE and SZSE (Shanghai, Shenzhen)', timeZone: 'Asia/Shanghai', open: '09:30', close: '15:00', breaks: [{ from: '11:30', to: '13:00' }] },
+    // IST is UTC+5:30 all year: 03:45-10:00 UTC.
     NSE: { name: 'NSE (Mumbai)', timeZone: 'Asia/Kolkata', open: '09:15', close: '15:30' },
   },
   stockExchangeOf: Object.fromEntries(Object.entries(LISTED_OUTSIDE_NEW_YORK).flatMap(([x, bases]) => bases.map((b) => [b, x]))),

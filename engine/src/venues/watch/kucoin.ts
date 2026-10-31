@@ -5,7 +5,7 @@ import type { MarketFunding, WatchReader } from '../venue.ts';
 import type { WatchReaderOptions } from './http.ts';
 import { WatchHttp, WatchVenueError, collect, list, num, optNum, optPrice, record } from './http.ts';
 import { baseFields } from './symbols.ts';
-import { HOUR_MS, kucoinRatePerHour, nextAtOr, settlementForHours } from './units.ts';
+import { HOUR_MS, fundingLimitsPerHour, kucoinRatePerHour, nextAtOr, settlementForHours } from './units.ts';
 
 export const KUCOIN_API_URL = 'https://api-futures.kucoin.com/api/v1';
 
@@ -27,11 +27,13 @@ interface KucoinContract {
   symbol: string; baseCurrency: string; quoteCurrency: string; isInverse: boolean; status: string;
   fundingFeeRate: number | null; currentFundingRateGranularity: number | null; nextFundingRateDateTime: number;
   markPrice: number; indexPrice: number; openInterest: string; multiplier: number; turnoverOf24h: number;
+  fundingRateCap?: number | null; fundingRateFloor?: number | null;
 }
 
 /**
  * `openInterest` counts lots; `multiplier` is base coins per lot (XBTUSDTM: 0.001 BTC). A contract without a
- * funding granularity (pre-market) is left out. `XBT` is KuCoin's BTC.
+ * funding granularity (pre-market) is left out. `XBT` is KuCoin's BTC. `fundingRateCap` / `fundingRateFloor` are
+ * per granularity, like `fundingFeeRate` (XBTUSDTM: 0.003 and -0.003 per 8 h).
  */
 export function parseKucoin(answer: unknown, now: number): MarketFunding[] {
   const o = record('kucoin', answer, 'contracts/active');
@@ -53,6 +55,7 @@ export function parseKucoin(answer: unknown, now: number): MarketFunding[] {
       openInterest: lots === null || perLot === null ? null : lots * perLot,
       volume24hUsd: optNum(c.turnoverOf24h),
       ...baseFields(c.baseCurrency),
+      ...fundingLimitsPerHour(c.fundingRateCap, c.fundingRateFloor, hours),
     };
   });
 }

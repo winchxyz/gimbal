@@ -24,9 +24,10 @@ export interface NormalizedBase {
 /**
  * A venue's base name (quote already stripped) to the shared key: size prefixes `k`, `1000`, `10000`,
  * `100000`, `1000000`, `1M` and the Bybit-style suffix `SHIB1000` become a multiplier; Extended's `_24_5` and
- * Backpack's `.US` equity suffixes and MEXC's `STOCK` suffix are dropped; then aliases apply.
+ * Backpack's `.US` equity suffixes are dropped, and the `STOCK` suffix where the venue uses one (`stockSuffix`:
+ * MEXC and Bitget); then aliases apply.
  */
-export function normalizeBase(raw: string): NormalizedBase {
+export function normalizeBase(raw: string, options: NormalizeOptions = {}): NormalizedBase {
   let s = raw.trim().replace(/_24_5$/, '').replace(/\.US$/i, '');
   let multiplier = 1;
   let m: RegExpExecArray | null;
@@ -44,13 +45,22 @@ export function normalizeBase(raw: string): NormalizedBase {
     s = m[1]!;
   }
   s = s.toUpperCase();
-  if ((m = /^([A-Z]{2,})STOCK$/.exec(s)) !== null) s = m[1]!;
+  // One letter is a whole ticker (CSTOCK is Citigroup, VSTOCK Visa, TSTOCK AT&T). A coin of the same name (MEXC's
+  // C_USDT, Chainbase) then shares the base: filterLegs keeps the listing whose mark agrees with the other venues',
+  // and a stock listing names a leg's market only when their marks agree (quality.ts). A digit first is a coin's own
+  // name (MEXC's 4STOCK_USDT). Only where the venue marks its stocks so: Aster's GSTOCKUSDT is a coin.
+  if (options.stockSuffix === true && (m = /^([A-Z]+)STOCK$/.exec(s)) !== null) s = m[1]!;
   return { base: BASE_ALIASES[s] ?? s, multiplier };
 }
 
+export interface NormalizeOptions {
+  /** The venue names its stock perps `<ticker>STOCK` (MEXC's TSLASTOCK_USDT, Bitget's TSLASTOCKUSDT). */
+  stockSuffix?: boolean;
+}
+
 /** `base` always, `multiplier` only when it is not 1 (absent means 1 in MarketFunding). */
-export function baseFields(raw: string): { base: string; multiplier?: number } {
-  const { base, multiplier } = normalizeBase(raw);
+export function baseFields(raw: string, options: NormalizeOptions = {}): { base: string; multiplier?: number } {
+  const { base, multiplier } = normalizeBase(raw, options);
   return multiplier === 1 ? { base } : { base, multiplier };
 }
 

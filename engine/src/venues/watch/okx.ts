@@ -6,7 +6,7 @@ import type { MarketFunding, WatchReader } from '../venue.ts';
 import type { WatchReaderOptions } from './http.ts';
 import { WatchHttp, WatchVenueError, collect, list, num, optNum, optPrice, record } from './http.ts';
 import { baseFields } from './symbols.ts';
-import { HOUR_MS, nextAtOr, okxRatePerHour, settlementForHours } from './units.ts';
+import { HOUR_MS, fundingLimitsPerHour, nextAtOr, okxRatePerHour, settlementForHours } from './units.ts';
 
 export const OKX_API_URL = 'https://www.okx.com/api/v5';
 
@@ -29,7 +29,10 @@ export class OkxReader implements WatchReader {
   }
 }
 
-interface OkxRate { instId: string; fundingRate: string; fundingTime: string; prevFundingTime?: string; nextFundingTime: string }
+interface OkxRate {
+  instId: string; fundingRate: string; fundingTime: string; prevFundingTime?: string; nextFundingTime: string;
+  maxFundingRate?: string; minFundingRate?: string;
+}
 interface OkxMark { instId: string; markPx: string }
 interface OkxOi { instId: string; oiCcy: string }
 
@@ -41,7 +44,8 @@ function okxData(answer: unknown, what: string): unknown {
 
 /**
  * `fundingRate` is the running period's, settled at `fundingTime`; the period is `fundingTime - prevFundingTime`
- * (2, 4 or 8 h). `oiCcy` is open interest in the base coin. No 24 h volume: it would take a fourth call.
+ * (2, 4 or 8 h). `maxFundingRate` / `minFundingRate` bound it, per the same period (0.01 on most swaps, 0.00375 on
+ * BTC). `oiCcy` is open interest in the base coin. No 24 h volume: it would take a fourth call.
  */
 export function parseOkx(rates: unknown, marks: unknown, oi: unknown, now: number): MarketFunding[] {
   const mark = new Map(list<OkxMark>('okx', okxData(marks, 'mark-price'), 'mark-price data').map((m) => [m.instId, m.markPx]));
@@ -64,6 +68,7 @@ export function parseOkx(rates: unknown, marks: unknown, oi: unknown, now: numbe
       openInterest: optNum(open.get(r.instId)),
       volume24hUsd: null,
       ...baseFields(m[1]!),
+      ...fundingLimitsPerHour(r.maxFundingRate, r.minFundingRate, hours),
     };
   });
 }

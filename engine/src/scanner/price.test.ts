@@ -119,7 +119,7 @@ test('a desk window by hand: gross 39.42 %, costs 29.322 %, net 10.098 %, breake
   assert.deepEqual(w.checks, [
     { ok: false, text: 'No desk policy loaded yet: nothing can be entered' },
     { ok: true, text: 'Books 0 s old: slippage $0.40 on 4 fills at $1,000 a leg' },
-    { ok: true, text: 'Moving $333 of margin a leg onto phoenix and hyperliquid and back costs $2.86' },
+    { ok: true, text: 'Moving $333 of margin a leg onto Phoenix and Hyperliquid and back costs $2.86' },
     { ok: true, text: 'Rescue of $70.00 from the reserve costs up to $0.46 a move' },
     { ok: true, text: 'Capacity $2.0M: the smaller leg\'s open interest' },
   ]);
@@ -139,8 +139,8 @@ test('a policy that lists both markets and a fresh oracle price: every check pas
   assert.ok(w.checks.every((c) => c.ok), JSON.stringify(w.checks));
   assert.equal(isEnterable(w), true);
   assert.deepEqual(w.checks.slice(0, 3), [
-    { ok: true, text: 'The oracle price for SOL on phoenix is 5 s old, within the 60 s limit' },
-    { ok: true, text: 'The oracle price for SOL on hyperliquid is 5 s old, within the 60 s limit' },
+    { ok: true, text: 'The oracle price for SOL on Phoenix is 5 s old, within the 60 s limit' },
+    { ok: true, text: 'The oracle price for SOL on Hyperliquid is 5 s old, within the 60 s limit' },
     { ok: true, text: 'A $1,000 leg (up to $1,010 at the edge of the price band) fits the $5,000 cap' },
   ]);
   // A NEAR AI veto makes it not enterable, with nothing else changed.
@@ -154,12 +154,12 @@ test('a priced leg passes only on a fresh oracle price: no source, or one too ol
   const none = priced(LONG, SHORT, ctx({ policy: POLICY })).window;
   assert.deepEqual(none.refused, { code: 'E_ORACLE_STALE', reason: 'no oracle price for SOL on phoenix' });
   assert.equal(none.tradable, true);
-  assert.ok(none.checks.some((c) => !c.ok && c.text === 'No oracle price for SOL on hyperliquid: the contract refuses its orders'));
+  assert.ok(none.checks.some((c) => !c.ok && c.text === 'No oracle price for SOL on Hyperliquid: the contract refuses its orders'));
   assert.ok(!none.checks.some((c) => c.ok && /oracle/.test(c.text)), JSON.stringify(none.checks));
   // A price 61 s old against a 60 s limit.
   const old = priced(LONG, SHORT, ctx({ policy: POLICY, oracle: oracleAged(61) })).window;
   assert.deepEqual(old.refused, { code: 'E_ORACLE_STALE', reason: 'oracle price for SOL on phoenix 61 s old' });
-  assert.ok(old.checks.some((c) => !c.ok && c.text === 'The oracle price for SOL on phoenix is 61 s old, over the 60 s limit: the contract refuses its orders'));
+  assert.ok(old.checks.some((c) => !c.ok && c.text === 'The oracle price for SOL on Phoenix is 61 s old, over the 60 s limit: the contract refuses its orders'));
   // One leg fresh, the other without a price: still refused, for that leg.
   const half = priced(LONG, SHORT, ctx({ policy: POLICY, oracle: oracleAged(5, (v) => v === 'phoenix') })).window;
   assert.deepEqual(half.refused, { code: 'E_ORACLE_STALE', reason: 'no oracle price for SOL on hyperliquid' });
@@ -174,10 +174,10 @@ test('an oracle price dated in the future is stale past a 5 s skew: it would oth
   assert.equal(ORACLE_MAX_SKEW_MS, 5_000);
   const within = priced(LONG, SHORT, ctx({ policy: POLICY, oracle: oracleAged(-5) })).window;
   assert.equal(within.refused, undefined);
-  assert.ok(within.checks.some((c) => c.ok && c.text === 'The oracle price for SOL on phoenix is 0 s old, within the 60 s limit'));
+  assert.ok(within.checks.some((c) => c.ok && c.text === 'The oracle price for SOL on Phoenix is 0 s old, within the 60 s limit'));
   const ahead = priced(LONG, SHORT, ctx({ policy: POLICY, oracle: oracleAged(-3600) })).window;
   assert.deepEqual(ahead.refused, { code: 'E_ORACLE_STALE', reason: 'oracle price for SOL on phoenix dated 3600 s ahead' });
-  assert.ok(ahead.checks.some((c) => !c.ok && c.text === 'The oracle price for SOL on hyperliquid is dated 3600 s ahead of the engine\'s clock, past the 5 s skew allowed: counted as stale'));
+  assert.ok(ahead.checks.some((c) => !c.ok && c.text === 'The oracle price for SOL on Hyperliquid is dated 3600 s ahead of the engine\'s clock, past the 5 s skew allowed: counted as stale'));
   assert.equal(isEnterable(ahead), false);
   // Just past the skew.
   assert.equal(priced(LONG, SHORT, ctx({ policy: POLICY, oracle: oracleAged(-5.001) })).window.refused?.code, 'E_ORACLE_STALE');
@@ -205,11 +205,11 @@ test('stale numbers say so first: the venue, and how old the oldest number is', 
   const w1 = priced(staleLong, SHORT).window;
   assert.equal(w1.stale, true);
   assert.equal(w1.updatedAt, T0 - 30_000);
-  assert.deepEqual(w1.checks[0], { ok: false, text: 'phoenix did not answer: numbers from 30 s ago' });
+  assert.deepEqual(w1.checks[0], { ok: false, text: 'Phoenix did not answer: numbers from 30 s ago' });
   // A book whose last read failed counts too.
   const oldBook: BookRead = { book: BOOKS.hyperliquid!, readAt: T0 - 45_000, stale: true };
   const w2 = priced(staleLong, SHORT, ctx({}, { hyperliquid: oldBook })).window;
-  assert.deepEqual(w2.checks[0], { ok: false, text: 'phoenix and hyperliquid did not answer: numbers from 45 s ago' });
+  assert.deepEqual(w2.checks[0], { ok: false, text: 'Phoenix and Hyperliquid did not answer: numbers from 45 s ago' });
   assert.equal(w2.updatedAt, T0 - 45_000);
   // Stale numbers are never enterable, even with every policy check passing.
   assert.equal(isEnterable(priced(staleLong, SHORT, ctx({ policy: POLICY, oracle: FRESH })).window), false);
@@ -219,7 +219,7 @@ test('a book too thin for the leg prices what it fills, fails a check, and is no
   // 5 units a side at about 100 USD: about 500 USD of the 1000 USD leg.
   const thin: BookRead = { book: book('hyperliquid', 'SOL', 99.99, 100.01, 5), readAt: T0, stale: false };
   const { window: w, breakdown } = priced(LONG, SHORT, ctx({ policy: POLICY, oracle: FRESH }, { hyperliquid: thin }));
-  assert.ok(w.checks.some((c) => !c.ok && c.text === 'The hyperliquid book fills only $500 of $1,000 within the 1 level read: slippage counts the filled part only'), JSON.stringify(w.checks));
+  assert.ok(w.checks.some((c) => !c.ok && c.text === 'The Hyperliquid book fills only $500 of $1,000 within the 1 level read: slippage counts the filled part only'), JSON.stringify(w.checks));
   assert.ok(!w.checks.some((c) => c.text.startsWith('Books ')), 'no "slippage on 4 fills" line for a partial fill');
   // Slippage of the filled part: Phoenix's two full fills, Hyperliquid's 5 units each way at 0.01 off the mid.
   near(breakdown.slippageUsd, 10 / 100.01 + 10 / 99.99 + 0.05 + 0.05);
@@ -240,13 +240,13 @@ test('watch-only pairs: gross and basis priced, fees, slippage and reserve not, 
   assert.equal(w.tradable, false);
   assert.equal(w.refused, undefined);
   assert.equal(isEnterable(w), false);
-  assert.deepEqual(w.checks[0], { ok: false, text: 'Watch-only: pacifica cannot be traded by the desk. Fees, slippage and the rescue reserve are not priced' });
+  assert.deepEqual(w.checks[0], { ok: false, text: 'Watch-only: Pacifica cannot be traded by the desk. Fees, slippage and the rescue reserve are not priced' });
   const okx = leg('okx', 'SOL', { ratePerHour: 0.00001, markPx: null, openInterest: null }, 'cex');
   const w2 = priced(okx, SHORT).window;
-  assert.equal(w2.checks[0]!.text, 'Watch-only: okx is a CEX, reference only. Fees, slippage and the rescue reserve are not priced');
-  assert.ok(w2.checks.some((c) => !c.ok && c.text === 'No mark on okx: basis not priced'));
+  assert.equal(w2.checks[0]!.text, 'Watch-only: OKX is a CEX, reference only. Fees, slippage and the rescue reserve are not priced');
+  assert.ok(w2.checks.some((c) => !c.ok && c.text === 'No mark on OKX: basis not priced'));
   assert.equal(w2.depthUsd, 4_999_750);       // the one open interest known, and the check says so
-  assert.deepEqual(w2.checks.at(-1), { ok: false, text: 'Capacity $5.0M is one leg\'s only: okx publishes no open interest' });
+  assert.deepEqual(w2.checks.at(-1), { ok: false, text: 'Capacity $5.0M is one leg\'s only: OKX publishes no open interest' });
 });
 
 test('tradable is structural: a desk pair with no oracle price is tradable and refused E_ORACLE_STALE', () => {
@@ -265,8 +265,8 @@ test('unpriced is per leg: WIF on Hyperliquid is unpriced, PERP_WIF_USDC on Orde
   const half = deskVerdict(pair, verdictCtx());
   assert.deepEqual(half.refused, { code: 'E_ORACLE_STALE', reason: 'no oracle price for PERP_WIF_USDC on orderly' });
   assert.deepEqual(half.checks.slice(0, 2), [
-    { ok: true, text: 'WIF on hyperliquid is unpriced, no price protection: a $1,000 leg is 2000 WIF, within its max_sz 5000' },
-    { ok: false, text: 'No oracle price for PERP_WIF_USDC on orderly: the contract refuses its orders' },
+    { ok: true, text: 'WIF on Hyperliquid is unpriced, no price protection: a $1,000 leg is 2000 WIF, within its max_sz 5000' },
+    { ok: false, text: 'No oracle price for PERP_WIF_USDC on Orderly: the contract refuses its orders' },
   ]);
   // A fresh oracle price for the Orderly leg covers it: one leg unpriced, one priced, both covered.
   const mixed = deskVerdict(pair, verdictCtx({ oracle: oracleAged(5, (v) => v === 'orderly') }));
@@ -294,8 +294,8 @@ test('max_sz is per leg, in each venue\'s own units: kPEPE on Hyperliquid agains
   const orderlyOver = deskVerdict(pair, verdictCtx({ policy: policy('200000', '50000') }));
   assert.deepEqual(orderlyOver.refused, { code: 'E_SIZE', reason: 'PERP_1000PEPE_USDC on orderly over max_sz 50000' });
   assert.deepEqual(orderlyOver.checks.slice(0, 2), [
-    { ok: true, text: 'kPEPE on hyperliquid is unpriced, no price protection: a $1,000 leg is 100000 kPEPE, within its max_sz 200000' },
-    { ok: false, text: 'PERP_1000PEPE_USDC on orderly is unpriced: a $1,000 leg is 100000 PERP_1000PEPE_USDC, over its max_sz 50000' },
+    { ok: true, text: 'kPEPE on Hyperliquid is unpriced, no price protection: a $1,000 leg is 100000 kPEPE, within its max_sz 200000' },
+    { ok: false, text: 'PERP_1000PEPE_USDC on Orderly is unpriced: a $1,000 leg is 100000 PERP_1000PEPE_USDC, over its max_sz 50000' },
   ]);
   // And the other way round.
   assert.deepEqual(deskVerdict(pair, verdictCtx({ policy: policy('50000', '200000') })).refused, { code: 'E_SIZE', reason: 'kPEPE on hyperliquid over max_sz 50000' });
@@ -314,7 +314,7 @@ test('verdicts with a policy: a market outside it is E_ASSET, before any oracle 
   const orderly = leg('orderly', 'PERP_SOL_USDC', { base: 'SOL' });
   const asset = deskVerdict(pairOf(LONG, orderly), verdictCtx());
   assert.deepEqual(asset.refused, { code: 'E_ASSET', reason: 'PERP_SOL_USDC not in policy on orderly' });
-  assert.deepEqual(asset.checks, [{ ok: false, text: 'PERP_SOL_USDC is not in the desk policy on orderly' }]);
+  assert.deepEqual(asset.checks, [{ ok: false, text: 'PERP_SOL_USDC is not in the desk policy on Orderly' }]);
   // No policy at all: E_NO_DESK.
   assert.deepEqual(deskVerdict(pairOf(LONG, SHORT), verdictCtx({ policy: null })).refused, { code: 'E_NO_DESK', reason: 'no desk policy loaded yet' });
 });
@@ -330,7 +330,7 @@ test('switch cost: close the legs that change and open the new ones; the margin 
   // Moving the 333.33 USD of margin onto Orderly and back is already in that window's feesPct, at 0.32 + 0.6667 in
   // and 1.00 + 0.32 + 0.6667 out = 2.9733 USD (the review found the switch cost adding the move a second time).
   near(toOrderly.breakdown.transferUsd, 0.32 + 1.0 + 0.32 + 2 * (1000 / 3) * 0.002, 1e-9);
-  assert.ok(toOrderly.window.checks.some((c) => c.text === 'Moving $333 of margin a leg onto orderly and back costs $2.97'), JSON.stringify(toOrderly.window.checks));
+  assert.ok(toOrderly.window.checks.some((c) => c.text === 'Moving $333 of margin a leg onto Orderly and back costs $2.97'), JSON.stringify(toOrderly.window.checks));
   // Long moves Phoenix -> Orderly: close 0.35 + 0.10001, open 0.40 + 0.09999 = 0.950000002 USD.
   const longOrderly = priced(leg('orderly', 'PERP_SOL_USDC', { base: 'SOL', ratePerHour: 0 }), SHORT, heldAt);
   assert.equal(switchCostUsd(held, longOrderly), 0.95);
@@ -349,7 +349,7 @@ test('a leg kept only for the held window fails a check that says why', () => {
   const r = priceWindow({ ...pairOf(LONG, SHORT), long: kept }, ctx({ policy: POLICY, oracle: FRESH }));
   assert.ok(r.ok);
   const w = r.priced.window;
-  assert.ok(w.checks.some((c) => !c.ok && c.text === 'Kept only because the desk holds it: phoenix SOL has $40,000 of open interest, under the $500,000 floor'));
+  assert.ok(w.checks.some((c) => !c.ok && c.text === 'Kept only because the desk holds it: Phoenix SOL has $40,000 of open interest, under the $500,000 floor'));
   assert.equal(isEnterable(w), false);
 });
 

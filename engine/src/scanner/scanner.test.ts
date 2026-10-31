@@ -194,8 +194,8 @@ test('watch-only windows: one with a quality finding ranks after a clean one tha
     ['sol-lighter-hyperliquid', 306.6], ['sol-pacifica-hyperliquid', 481.8], ['sol-pacifica-lighter', 175.2],
   ]);
   assert.deepEqual(byId(windows, 'sol-pacifica-hyperliquid')!.checks.slice(0, 2).map((c) => c.text), [
-    'Watch-only: pacifica cannot be traded by the desk. Fees, slippage and the rescue reserve are not priced',
-    'Thin: pacifica SOL traded $20k in 24 h, under the $100k floor',
+    'Watch-only: Pacifica cannot be traded by the desk. Fees, slippage and the rescue reserve are not priced',
+    'Thin: Pacifica SOL traded $20k in 24 h, under the $100k floor',
   ]);
   assert.ok(!byId(windows, 'sol-lighter-hyperliquid')!.checks.some((c) => c.text.startsWith('Thin:')));
   // The cut takes the best two by gross, so the flagged 481.8 % window is still sent, after the clean one; the
@@ -236,7 +236,7 @@ test('a venue that does not answer: listed as failed, its last good numbers mark
   const w = byId(r2.windows, 'sol-phoenix-hyperliquid')!;
   assert.equal(w.stale, true);
   assert.equal(w.updatedAt, T0);
-  assert.deepEqual(w.checks[0], { ok: false, text: 'phoenix did not answer: numbers from 5 s ago' });
+  assert.deepEqual(w.checks[0], { ok: false, text: 'Phoenix did not answer: numbers from 5 s ago' });
   assert.equal(byId(r2.windows, 'sol-orderly-hyperliquid')!.stale, false);
   assert.ok(notes.some((n) => n === 'phoenix funding failed: HTTP 502'));
 
@@ -338,7 +338,7 @@ test('a desk pair whose book was never read is left out, not shown with zero sli
   const w = byId(r3.windows, 'sol-phoenix-orderly')!;
   assert.equal(w.stale, true);
   assert.equal(w.updatedAt, T0 + 5_000);
-  assert.deepEqual(w.checks[0], { ok: false, text: 'orderly did not answer: numbers from 35 s ago' });
+  assert.deepEqual(w.checks[0], { ok: false, text: 'Orderly did not answer: numbers from 35 s ago' });
 });
 
 test('the held window is marked and kept whatever its gross; the others carry the cost of switching to them', async () => {
@@ -381,7 +381,7 @@ test('the held window survives the filters: its legs fail a check instead of bei
   const r = await s.scan();
   const h = byId(r.windows, 'sol-phoenix-hyperliquid')!;
   assert.deepEqual(h.held, { since: T0 - HOUR_MS });
-  assert.ok(h.checks.some((c) => !c.ok && c.text === 'Kept only because the desk holds it: phoenix SOL has $40,000 of open interest, under the $500,000 floor'), JSON.stringify(h.checks));
+  assert.ok(h.checks.some((c) => !c.ok && c.text === 'Kept only because the desk holds it: Phoenix SOL has $40,000 of open interest, under the $500,000 floor'), JSON.stringify(h.checks));
   assert.equal(isEnterable(h), false);
   assert.equal(r.notes.dropped['under-oi-floor'], undefined);
   // The low-OI leg makes no other window, and the others still know what leaving the held one costs.
