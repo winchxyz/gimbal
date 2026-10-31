@@ -5,8 +5,10 @@
 // OPERATOR_ACCOUNT_ID), OPERATOR_PRIVATE_KEY, and optionally NEAR_RPC_URL and HL_API_URL.
 // Before the order: the desk's Hyperliquid testnet account must hold margin, the builder fee is approved if
 // Hyperliquid does not have it yet (one more signature), and a stored price older than policy.oracle_max_age_s is
-// refreshed (refresh_prices). --close sends the reduce-only IOC that flattens the position afterwards.
-// Testnet only: NEAR_NETWORK=mainnet or a mainnet HL_API_URL is refused.
+// refreshed (refresh_prices); an unpriced asset (policy.unpriced) has no oracle band, only its max_sz and
+// unpriced_max_notional_usd. --close sends the reduce-only IOC that flattens the position afterwards.
+// Testnet only: NEAR_NETWORK=mainnet, a mainnet contract (config().network) or a mainnet HL_API_URL is refused.
+// An outcome that cannot be proven (OutcomeUnknown) stops the run with every id to reconcile by: never rerun blindly.
 
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -16,7 +18,7 @@ import { formatNear } from '../contract/budget.ts';
 import { NearContractClient } from '../contract/near-client.ts';
 import { NearApiTransport } from '../contract/near-transport.ts';
 import { priceUsd } from '../contract/prices.ts';
-import { ContractRefusal } from '../contract/types.ts';
+import { ContractRefusal, OutcomeUnknown } from '../contract/types.ts';
 import { planIoc } from '../relayer/hl-order.ts';
 import type { HlSubmitResult } from '../relayer/hyperliquid.ts';
 import { HyperliquidSubmitter } from '../relayer/hyperliquid.ts';
@@ -24,7 +26,7 @@ import { Relayer } from '../relayer/relayer.ts';
 import { NothingExecuted } from '../relayer/tx.ts';
 import { HL_TESTNET_URL, HyperliquidReader } from '../venues/hyperliquid.ts';
 import { errorMessage } from '../venues/recorder.ts';
-import { contractEnv } from './serve-contract.ts';
+import { checkContractNetwork, contractEnv } from './serve-contract.ts';
 
 const { values } = parseArgs({
   options: {
@@ -49,16 +51,17 @@ if (!(usd >= 10 && usd <= 50)) fail('--usd must be between 10 and 50');
 
 let cfg;
 try {
-  cfg = contractEnv(envVar, 'testnet');
+  cfg = contractEnv(envVar, 'testnet', { signing: true });
 } catch (err) {
   fail(errorMessage(err));
 }
 if (cfg === null) fail('GIMBAL_CONTRACT_ID is not set (the testnet contract)');
 if (cfg.network !== 'testnet') fail('testnet only: NEAR_NETWORK must be testnet');
+if (cfg.privateKey === undefined || cfg.accountId === undefined) fail('OPERATOR_PRIVATE_KEY and OWNER_ACCOUNT_ID are needed to sign');
 const hlUrl = (envVar('HL_API_URL') ?? HL_TESTNET_URL).replace(/\/+$/, '').replace(/\/info$/, '');
 if (!/testnet/.test(hlUrl)) fail(`testnet only: HL_API_URL ${hlUrl} is not a Hyperliquid testnet URL`);
 
-const transport = new NearApiTransport({ network: 'testnet', accountId: cfg.accountId, privateKey: cfg.privateKey, ...(cfg.rpcUrl === undefined ? {} : { rpcUrl: cfg.rpcUrl }) });
+const transport = new NearApiTransport({ network: 'testnet', accountId: cfg.accountId!, privateKey: cfg.privateKey!, ...(cfg.rpcUrl === undefined ? {} : { rpcUrl: cfg.rpcUrl }) });
 const client = new NearContractClient({
   contractId: cfg.contractId, network: 'testnet', transport, onHealth: (status, detail) => log(`near ${status}: ${detail}`),
 });
@@ -69,13 +72,17 @@ const reader = new HyperliquidReader({ network: 'testnet', url: `${hlUrl}/info` 
 try {
   await run();
 } catch (err) {
-  if (err instanceof ContractRefusal) console.error(`refused by the contract: ${err.message}${err.txHash === null ? '' : ` (tx ${err.txHash})`}`);
+  if (err instanceof OutcomeUnknown) {
+    console.error(`OUTCOME UNKNOWN: stop and reconcile before sending anything else.\n  ${err.message}${err.tx.length > 0 ? `\n  ${refs(err.tx)}` : ''}`);
+    process.exitCode = 3;
+  } else if (err instanceof ContractRefusal) console.error(`refused by the contract: ${err.message}${err.txHash === null ? '' : ` (tx ${err.txHash})`}`);
   else if (err instanceof NothingExecuted) console.error(`${err.message}${err.tx.length > 0 ? `\n  ${refs(err.tx)}` : ''}`);
   else console.error(`relay-hl failed: ${errorMessage(err)}`);
-  process.exitCode = 1;
+  if (process.exitCode === undefined) process.exitCode = 1;
 }
 
 async function run(): Promise<void> {
+  checkContractNetwork(cfg!.contractId, await client.config(), 'testnet');
   const [account, allowance] = await Promise.all([transport.account(), transport.allowance()]);
   log(`operator ${cfg!.accountId}: ${formatNear(account.amount)} balance, allowance ${allowance === null ? 'unlimited' : formatNear(allowance)}`);
   const desk = await relayer.desk();
@@ -109,15 +116,19 @@ async function run(): Promise<void> {
     log('config(): no treasury.hl_builder / fees.hl_builder_tenth_bps read; the builder fee is not checked');
   }
 
-  const oracle = await freshPrice(desk.policy.oracle_max_age_s);
+  const unpriced = desk.policy.unpriced.find((u) => u.symbol === coin);
+  const oracle = unpriced === undefined ? await freshPrice(desk.policy.oracle_max_age_s) : null;
+  const maxNotionalUsd = unpriced === undefined ? desk.policy.max_notional_usd : Math.min(desk.policy.max_notional_usd, desk.policy.unpriced_max_notional_usd);
+  if (unpriced !== undefined) log(`${coin} is unpriced in the policy: no oracle band; max_sz ${unpriced.max_sz}, max ${maxNotionalUsd} USD`);
+  const caps = unpriced === undefined ? {} : { maxSz: unpriced.max_sz };
   const book = await reader.book(coin, 5);
   const bookPx = side === 'buy' ? book.asks[0]?.px : book.bids[0]?.px;
   if (bookPx === undefined) throw new Error(`the ${coin} book on Hyperliquid testnet has no ${side === 'buy' ? 'asks' : 'bids'}`);
   const plan = planIoc({
     asset: asset.index, szDecimals: asset.sz_decimals, side, oraclePx: oracle, bandBps: desk.policy.price_band_bps, bookPx,
-    notionalUsd: usd, maxNotionalUsd: desk.policy.max_notional_usd,
+    notionalUsd: usd, maxNotionalUsd, ...caps,
   });
-  log(`IOC ${side} ${plan.order.sz} ${coin} at ${plan.order.px} (${plan.notionalUsd.toFixed(2)} USD; best ${bookPx}, contract oracle ${oracle})`);
+  log(`IOC ${side} ${plan.order.sz} ${coin} at ${plan.order.px} (${plan.notionalUsd.toFixed(2)} USD; best ${bookPx}, contract oracle ${oracle ?? 'none (unpriced)'}), cloid ${plan.order.cloid}`);
   const result = await timed('hl_order', () => relayer.hlOrder(plan.order, `relay-hl live check: IOC ${side} ${coin}`));
   report(result);
   const seen = await inUserFills(user, result.oid);
@@ -130,9 +141,9 @@ async function run(): Promise<void> {
     if (closePx === undefined) throw new Error('no book to close against');
     const close = planIoc({
       asset: asset.index, szDecimals: asset.sz_decimals, side: side === 'buy' ? 'sell' : 'buy', oraclePx: oracle,
-      bandBps: desk.policy.price_band_bps, bookPx: closePx, maxNotionalUsd: desk.policy.max_notional_usd, sz: result.filled.totalSz, reduceOnly: true,
+      bandBps: desk.policy.price_band_bps, bookPx: closePx, maxNotionalUsd, sz: result.filled.totalSz, reduceOnly: true, ...caps,
     });
-    log(`close: reduce-only IOC ${close.order.is_buy ? 'buy' : 'sell'} ${close.order.sz} ${coin} at ${close.order.px}`);
+    log(`close: reduce-only IOC ${close.order.is_buy ? 'buy' : 'sell'} ${close.order.sz} ${coin} at ${close.order.px}, cloid ${close.order.cloid}`);
     report(await timed('hl_order (close)', () => relayer.hlOrder(close.order, `relay-hl live check: close ${coin}`)));
   }
 }

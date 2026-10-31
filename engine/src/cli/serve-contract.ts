@@ -5,14 +5,15 @@
 //     check would;
 //   - marginHeldAt: the venues where the desk holds margin now (DeskState legs), so entering there moves nothing;
 //   - health: NEAR's state (the operator key's budget, slow signatures) next to the venues the last scan missed.
-// The operator key is loaded here (OPERATOR_PRIVATE_KEY, held by OWNER_ACCOUNT_ID or OPERATOR_ACCOUNT_ID) but serve
-// signs nothing yet: it only reads views.
+// serve signs nothing: it reads views over a keyless transport and never loads OPERATOR_PRIVATE_KEY. relay-hl, which
+// signs, asks contractEnv for the key. Either way NEAR_NETWORK, the mode (GIMBAL_MODE) and the contract's own
+// config().network must name the same network, or nothing starts.
 
 import type { ContractPolicy, DeskState, HealthMap, Mode, ScanStatus, VenueId } from '@gimbal/shared';
 import type { NearHealth } from '../contract/budget.ts';
 import type { NearNetwork, NearTransport } from '../contract/near-client.ts';
 import { NearContractClient } from '../contract/near-client.ts';
-import { NearApiTransport } from '../contract/near-transport.ts';
+import { NearViewTransport } from '../contract/near-transport.ts';
 import { ContractPriceCache } from '../contract/prices.ts';
 import type { DeskView } from '../contract/types.ts';
 import { parseContractPolicy } from '../scanner/config.ts';
@@ -22,31 +23,53 @@ export interface ContractEnv {
   deskId: string;
   network: NearNetwork;
   rpcUrl: string | undefined;
-  accountId: string;
-  /** ed25519:<base58>; never printed. */
-  privateKey: string;
+  /** OPERATOR_ACCOUNT_ID or OWNER_ACCOUNT_ID; optional for views. */
+  accountId: string | undefined;
+  /** ed25519:<base58>, only when asked for with `signing`; never printed. */
+  privateKey?: string;
 }
 
 /**
  * The contract settings from the environment: null in replay or without GIMBAL_CONTRACT_ID; an error naming the
- * missing variables (never their values) when only some are set.
+ * missing variables (never their values) when only some are set, or when NEAR_NETWORK, the mode and the contract id
+ * disagree on the network. OPERATOR_PRIVATE_KEY is read only with `signing`.
  */
-export function contractEnv(env: (name: string) => string | undefined, mode: Mode): ContractEnv | null {
+export function contractEnv(env: (name: string) => string | undefined, mode: Mode, options: { signing?: boolean } = {}): ContractEnv | null {
   if (mode === 'replay') return null;
   const contractId = env('GIMBAL_CONTRACT_ID');
   if (contractId === undefined) return null;
   const deskId = env('DESK_ID');
   const accountId = env('OPERATOR_ACCOUNT_ID') ?? env('OWNER_ACCOUNT_ID');
-  const privateKey = env('OPERATOR_PRIVATE_KEY');
+  const privateKey = options.signing === true ? env('OPERATOR_PRIVATE_KEY') : undefined;
   const missing = [
     deskId === undefined ? 'DESK_ID' : null,
-    accountId === undefined ? 'OWNER_ACCOUNT_ID (or OPERATOR_ACCOUNT_ID)' : null,
-    privateKey === undefined ? 'OPERATOR_PRIVATE_KEY' : null,
+    options.signing === true && accountId === undefined ? 'OWNER_ACCOUNT_ID (or OPERATOR_ACCOUNT_ID)' : null,
+    options.signing === true && privateKey === undefined ? 'OPERATOR_PRIVATE_KEY' : null,
   ].filter((m): m is string => m !== null);
   if (missing.length > 0) throw new Error(`GIMBAL_CONTRACT_ID is set, so these are needed too: ${missing.join(', ')}`);
-  const network = (env('NEAR_NETWORK') ?? mode) as NearNetwork;
-  if (network !== 'mainnet' && network !== 'testnet') throw new Error(`NEAR_NETWORK must be mainnet or testnet, got ${network}`);
-  return { contractId, deskId: deskId!, network, rpcUrl: env('NEAR_RPC_URL'), accountId: accountId!, privateKey: privateKey! };
+  const nearNetwork = env('NEAR_NETWORK');
+  if (nearNetwork !== undefined && nearNetwork !== 'mainnet' && nearNetwork !== 'testnet') {
+    throw new Error(`NEAR_NETWORK must be mainnet or testnet, got ${nearNetwork}`);
+  }
+  if (nearNetwork !== undefined && nearNetwork !== mode) {
+    throw new Error(`NEAR_NETWORK is ${nearNetwork} but the engine runs in ${mode} mode (GIMBAL_MODE): a ${nearNetwork} contract would sign for ${mode} venues. Set both to the same network.`);
+  }
+  const network = mode as NearNetwork;
+  const suffix = /\.(near|testnet)$/.exec(contractId)?.[1];
+  if (suffix !== undefined && (suffix === 'near' ? 'mainnet' : 'testnet') !== network) {
+    throw new Error(`GIMBAL_CONTRACT_ID ${contractId} is a ${suffix === 'near' ? 'mainnet' : 'testnet'} account, but the engine runs on ${network}`);
+  }
+  return {
+    contractId, deskId: deskId!, network, rpcUrl: env('NEAR_RPC_URL'), accountId,
+    ...(privateKey === undefined ? {} : { privateKey }),
+  };
+}
+
+/** Refuses a contract whose config().network is not the engine's network (or does not say). */
+export function checkContractNetwork(contractId: string, config: { network?: unknown }, network: NearNetwork): void {
+  const said = typeof config.network === 'string' ? config.network.toLowerCase() : null;
+  if (said === null) throw new Error(`${contractId}: config() names no network, so it cannot be checked against ${network}; not starting`);
+  if (said !== network) throw new Error(`${contractId} is a ${said} contract (config().network), but the engine runs on ${network}; not starting`);
 }
 
 export interface ContractSide {
@@ -63,12 +86,14 @@ export async function connectContract(cfg: ContractEnv, options: {
   transport?: NearTransport;
   refreshMs?: number;
 } = {}): Promise<ContractSide> {
-  const transport = options.transport ?? new NearApiTransport({
-    network: cfg.network, accountId: cfg.accountId, privateKey: cfg.privateKey, ...(cfg.rpcUrl === undefined ? {} : { rpcUrl: cfg.rpcUrl }),
+  // Views only: no key is loaded, whatever the environment holds.
+  const transport = options.transport ?? new NearViewTransport({
+    network: cfg.network, ...(cfg.accountId === undefined ? {} : { accountId: cfg.accountId }), ...(cfg.rpcUrl === undefined ? {} : { rpcUrl: cfg.rpcUrl }),
   });
   const client = new NearContractClient({
     contractId: cfg.contractId, network: cfg.network, transport, ...(options.onHealth === undefined ? {} : { onHealth: options.onHealth }),
   });
+  checkContractNetwork(cfg.contractId, await client.config(), cfg.network);
   const desk = await client.getDesk(cfg.deskId);
   if (desk === null) throw new Error(`${cfg.contractId} has no desk ${cfg.deskId}`);
   let policy: ContractPolicy;
