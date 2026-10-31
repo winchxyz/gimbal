@@ -6,11 +6,11 @@
 //! base58(sha256(`quote`)), before anything is parsed (`E_QUOTE_SIGNATURE`). Then the fields, in
 //! the order of `field_rule` in `tests/vectors/oneclick.json`: a live quote, the method's origin
 //! asset (and a destination asset that is not it), `refundTo`, `recipientType`, the recipient and
-//! destination pair, the deadline, and for a rescue the remaining hourly cap (`E_QUOTE_FIELDS`,
-//! `E_RESCUE_CAP`). [`check_cost`] bounds what one transfer may cost through the signed
-//! `minAmountOut`; [`transfer_cost_e8`] and [`rescue_cost_budget_e8`] bound what the rescues of an
-//! hour may cost together. [`check_quote_age`] bounds how long after 1Click signed it a quote can
-//! be paid, which the contract applies next to its ring of paid deposit addresses.
+//! destination pair, the deadline, the quote's age ([`check_quote_age`]: signed at most 1 h before
+//! the block time and at most 5 min after it), and for a rescue the remaining hourly cap
+//! (`E_QUOTE_FIELDS`, `E_RESCUE_CAP`). [`check_cost`] bounds what one transfer may cost through
+//! the signed `minAmountOut`; [`transfer_cost_e8`] and [`rescue_cost_budget_e8`] bound what the
+//! rescues of an hour may cost together.
 //!
 //! sha256 and the Ed25519 check come from the caller, so the contract uses the host's.
 
@@ -43,15 +43,21 @@ pub const NEAR_USDC: &str =
 /// deposit under 5 USDC, and the margin covers the transfer's own cost.
 pub const ORDERLY_MIN_OUT_E6: u128 = 6_000_000;
 
-/// How long after its signed `timestamp` a quote can still be paid, ms. A desk remembers only the
-/// last 32 deposit addresses it paid, and a live quote's `deadline` is three days out (1Click sets
-/// it to the requested deadline + 72 h, `oneclick-live.json`), so the deadline alone would let a
-/// quote come back once the ring has forgotten it.
+/// How long after its signed `timestamp` a quote can still be paid, ms. A live quote's `deadline`
+/// is three days out (1Click sets it to the requested deadline + 72 h, `oneclick-live.json`); a
+/// contract remembers the deposit addresses it paid only for a bounded time ([`QUOTE_PAYABLE_MS`]
+/// at least), so the deadline alone would let a quote come back once they are forgotten.
 pub const QUOTE_MAX_AGE_MS: u64 = 3_600_000;
 
 /// How far after the block time a quote's `timestamp` may lie, ms: clock skew between 1Click and
 /// the chain, never a way to stretch [`QUOTE_MAX_AGE_MS`].
 pub const QUOTE_MAX_AHEAD_MS: u64 = 300_000;
+
+/// The longest a quote stays payable, ms: from [`QUOTE_MAX_AHEAD_MS`] before its `timestamp` to
+/// [`QUOTE_MAX_AGE_MS`] after it, both ends included, 65 min. A quote paid at a block time `t` can
+/// be paid again at most until `t` + this, so a deposit address paid at `t` must stay remembered
+/// through it.
+pub const QUOTE_PAYABLE_MS: u64 = QUOTE_MAX_AGE_MS + QUOTE_MAX_AHEAD_MS;
 
 /// The decimals of a USDC asset 1Click quotes.
 pub fn decimals(asset: &str) -> Option<u32> {
@@ -129,6 +135,7 @@ pub struct Context<'a> {
     pub desk: DeskAddresses<'a>,
     /// The contract's account id: `refundTo` of `fund_venue`, recipient of a payout.
     pub contract: &'a str,
+    /// The block time, ms: the deadline and the quote's age are checked against it.
     pub now_ms: u64,
     /// What is left of the desk's hourly rescue cap, USD × 1e8 (a USDC counts as 1 USD).
     pub remaining_cap_e8: u128,
@@ -350,6 +357,7 @@ pub fn verify_quote(
             shown(&f.timestamp)
         ))
     })?;
+    check_quote_age(signed_at_ms, ctx.now_ms)?;
 
     let origin_decimals = decimals(method.origin_asset()).unwrap_or(6);
     let amount_in_e8 = to_e8(amount_in, origin_decimals)?;
@@ -378,23 +386,21 @@ pub fn verify_quote(
     })
 }
 
-/// The quote was signed at most [`QUOTE_MAX_AGE_MS`] before `now_ms` and at most
-/// [`QUOTE_MAX_AHEAD_MS`] after it (`E_QUOTE_FIELDS`). With the deadline check of
-/// [`verify_quote`], a quote can be paid until the earlier of its deadline and an hour after
-/// 1Click signed it.
-pub fn check_quote_age(q: &VerifiedQuote, now_ms: u64) -> Result<(), Refusal> {
-    if now_ms.saturating_sub(q.signed_at_ms) > QUOTE_MAX_AGE_MS {
+/// A quote signed at `signed_at_ms` (its `timestamp`) is payable at the block time `now_ms`:
+/// signed at most [`QUOTE_MAX_AGE_MS`] before it and at most [`QUOTE_MAX_AHEAD_MS`] after it, both
+/// edges included (`E_QUOTE_FIELDS`). [`verify_quote`] applies it after the deadline, so a quote
+/// is paid until the earlier of its deadline and an hour after 1Click signed it.
+pub fn check_quote_age(signed_at_ms: u64, now_ms: u64) -> Result<(), Refusal> {
+    if now_ms.saturating_sub(signed_at_ms) > QUOTE_MAX_AGE_MS {
         return Err(fields(format!(
-            "the quote was signed at {} ms, more than 1 h before the block time {now_ms} ms: a \
-             desk remembers only its last 32 deposit addresses, so an older quote could pay one \
-             twice",
-            q.signed_at_ms
+            "the quote was signed at {signed_at_ms} ms, more than 1 h before the block time \
+             {now_ms} ms: a quote is paid within the hour after 1Click signed it"
         )));
     }
-    if q.signed_at_ms.saturating_sub(now_ms) > QUOTE_MAX_AHEAD_MS {
+    if signed_at_ms.saturating_sub(now_ms) > QUOTE_MAX_AHEAD_MS {
         return Err(fields(format!(
-            "the quote was signed at {} ms, more than 5 min after the block time {now_ms} ms",
-            q.signed_at_ms
+            "the quote was signed at {signed_at_ms} ms, more than 5 min after the block time \
+             {now_ms} ms"
         )));
     }
     Ok(())
@@ -678,23 +684,21 @@ mod tests {
     /// An hour after signing at most, five minutes before it at most; both edges included.
     #[test]
     fn the_age_bound() {
-        let at = |signed_at_ms| VerifiedQuote {
-            signed_at_ms,
-            ..verified(400_000_000, 364_422_300)
-        };
         let now = 1_793_460_610_251;
-        assert!(check_quote_age(&at(now), now).is_ok());
-        assert!(check_quote_age(&at(now - QUOTE_MAX_AGE_MS), now).is_ok());
-        assert!(check_quote_age(&at(now + QUOTE_MAX_AHEAD_MS), now).is_ok());
-        let old = check_quote_age(&at(now - QUOTE_MAX_AGE_MS - 1), now).unwrap_err();
+        assert!(check_quote_age(now, now).is_ok());
+        assert!(check_quote_age(now - QUOTE_MAX_AGE_MS, now).is_ok());
+        assert!(check_quote_age(now + QUOTE_MAX_AHEAD_MS, now).is_ok());
+        let old = check_quote_age(now - QUOTE_MAX_AGE_MS - 1, now).unwrap_err();
         assert_eq!(old.code, E_QUOTE_FIELDS);
         assert!(old.msg.contains("more than 1 h before"), "{}", old.msg);
-        let ahead = check_quote_age(&at(now + QUOTE_MAX_AHEAD_MS + 1), now).unwrap_err();
+        let ahead = check_quote_age(now + QUOTE_MAX_AHEAD_MS + 1, now).unwrap_err();
         assert_eq!(ahead.code, E_QUOTE_FIELDS);
         assert!(ahead.msg.contains("more than 5 min after"), "{}", ahead.msg);
         // Neither end overflows.
-        assert!(check_quote_age(&at(0), u64::MAX).is_err());
-        assert!(check_quote_age(&at(u64::MAX), 0).is_err());
+        assert!(check_quote_age(0, u64::MAX).is_err());
+        assert!(check_quote_age(u64::MAX, 0).is_err());
+        // The payable window is 65 min, both ends included.
+        assert_eq!(QUOTE_PAYABLE_MS, 65 * 60_000);
     }
 
     /// The policy defaults (100 bp, 0.5 USDC) against the recorded quotes' costs.

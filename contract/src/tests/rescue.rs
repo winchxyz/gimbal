@@ -14,7 +14,8 @@ use crate::rescue::{decayed, ed25519_verify, DeskCounters, DEPOSIT_RING, RESCUE_
 use crate::sol::sha256;
 use gimbal_core::errors::{E_NO_DESK, E_QUOTE_FIELDS, E_QUOTE_SIGNATURE, E_RESCUE_CAP};
 use gimbal_core::oneclick::{
-    check_cost, verify_quote, Context, DeskAddresses, Method, VerifiedQuote, SOL_USDC,
+    check_cost, verify_quote, Context, DeskAddresses, Method, VerifiedQuote, QUOTE_PAYABLE_MS,
+    SOL_USDC,
 };
 use gimbal_core::phoenix::{check_message, Rescue, EMBER_WITHDRAW, WITHDRAW_FUNDS};
 use gimbal_core::solana::{parse_message, SolDesk};
@@ -127,6 +128,7 @@ fn counters(g: &Gimbal) -> DeskCounters {
 fn forget_deposits(g: &mut Gimbal) {
     let mut c = counters(g);
     c.deposits = Default::default();
+    c.deposit_paid_ms = Default::default();
     g.desk_counters.insert("alpha".into(), c);
 }
 
@@ -439,19 +441,104 @@ fn a_deposit_address_is_paid_once() {
     assert!(got.unwrap_err().starts_with(E_QUOTE_FIELDS));
 }
 
+/// The ring forgets the oldest of 33 addresses, and holds a slot until 65 min after its payment:
+/// [`DeskCounters::held`] answers its payment time through `QUOTE_PAYABLE_MS` after it, edge
+/// included, and nothing 1 ms later or for an unused slot.
 #[test]
 fn the_deposit_ring_forgets_the_oldest_of_33() {
     let mut c = DeskCounters::default();
     let hash = |i: usize| [u8::try_from(i + 1).unwrap(); 32];
     for i in 0..DEPOSIT_RING {
-        c.spend(0, 0, hash(i), NOW_MS);
+        assert_eq!(c.held(NOW_MS), None, "slot {i} is unused");
+        c.spend(0, 0, hash(i), NOW_MS + i as u64);
     }
     assert!((0..DEPOSIT_RING).all(|i| c.paid(&hash(i))));
     assert_eq!(c.deposit_next, 0);
-    c.spend(0, 0, hash(DEPOSIT_RING), NOW_MS);
+    assert_eq!(c.held(NOW_MS + 1_000), Some(NOW_MS));
+    assert_eq!(c.held(NOW_MS + QUOTE_PAYABLE_MS), Some(NOW_MS));
+    assert_eq!(c.held(NOW_MS + QUOTE_PAYABLE_MS + 1), None);
+    c.spend(0, 0, hash(DEPOSIT_RING), NOW_MS + QUOTE_PAYABLE_MS + 1);
     assert!(!c.paid(&hash(0)));
     assert!((1..=DEPOSIT_RING).all(|i| c.paid(&hash(i))));
     assert_eq!(c.deposit_next, 1);
+    // The next slot was paid 1 ms after the first.
+    assert_eq!(c.held(NOW_MS + QUOTE_PAYABLE_MS + 1), Some(NOW_MS + 1));
+    assert_eq!(c.held(NOW_MS + QUOTE_PAYABLE_MS + 2), None);
+}
+
+/// Review of PR 42 (its repro): 32 rescues of 5 USDC inside a quote's payable window, well within
+/// a 1000 USD cap and the cost budget, used to evict the quote's deposit address, and the same
+/// signed quote then paid that address again 15 min after the first payment. Now the rescue that
+/// would evict it is refused (`E_RESCUE_CAP`, nothing counted) until 65 min after the first
+/// payment, and the replay still finds the address; 65 min and 1 ms after it the slot is taken,
+/// when the quote is too old to pay.
+#[test]
+fn a_quote_cannot_pay_twice_after_32_rescues_in_its_window() {
+    let mut g = rescue_desk_with(Policy {
+        rescue_cap_usd_per_hour: 1_000,
+        ..rescue_policy()
+    });
+    let (q, sig) = quote(&live(), ARB_QUOTE);
+    at(operator(), NOW_MS, yocto(0));
+    let first = evm_to_intents(&mut g, &(q.clone(), sig.clone())).unwrap();
+    let first_deposit = first.deposit_address.clone().unwrap();
+    let first_hash = env::sha256_array(first_deposit.as_bytes());
+    assert!(counters(&g).paid(&first_hash));
+    at(operator(), NOW_MS + 1_000, yocto(0));
+    let again = evm_to_intents(&mut g, &(q.clone(), sig.clone())).unwrap_err();
+    assert!(again.starts_with(E_QUOTE_FIELDS), "{again}");
+    let v = arb_verified(&g);
+    let rescue = |g: &mut Gimbal, n: u32, ms: u64| {
+        at(operator(), ms, yocto(0));
+        // 5 USDC each, costing 0.21 USDC (the low end of the measured 1Click costs).
+        let p = paying(&v, n + 1, 500_000_000, 500_000_000 - 21_000_000);
+        outcome(|| g.build_evm_usdc_to_intents("alpha".into(), &p, "out"))
+    };
+    let ring = DEPOSIT_RING as u32;
+    for n in 0..ring - 1 {
+        rescue(&mut g, n, NOW_MS + 2_000 + u64::from(n) * 10_000).unwrap();
+    }
+    // The ring is full: the next rescue would take the first quote's slot, 5.2 min after it.
+    let before = counters(&g);
+    let held = rescue(
+        &mut g,
+        ring - 1,
+        NOW_MS + 2_000 + u64::from(ring - 1) * 10_000,
+    );
+    assert_eq!(
+        held.unwrap_err(),
+        format!(
+            "E_RESCUE_CAP: this desk's last 32 rescues were paid within 65 min, the oldest at \
+             {NOW_MS} ms: a quote can pay its deposit address again until {} ms, so the next \
+             rescue waits until after then",
+            NOW_MS + QUOTE_PAYABLE_MS
+        )
+    );
+    assert_eq!(counters(&g), before, "a refused rescue counts nothing");
+    // The reviewer's replay, 15 min after the first payment: refused, the address is remembered.
+    at(operator(), NOW_MS + 15 * 60_000, yocto(0));
+    let replay = evm_to_intents(&mut g, &(q.clone(), sig.clone())).unwrap_err();
+    assert_eq!(
+        replay,
+        format!(
+            "E_QUOTE_FIELDS: deposit address {first_deposit} was paid by one of this desk's last \
+             32 rescues; a quote pays once"
+        )
+    );
+    // 65 min after the first payment the slot is still held; 1 ms later a rescue takes it.
+    let edge = rescue(&mut g, ring - 1, NOW_MS + QUOTE_PAYABLE_MS);
+    assert!(edge.unwrap_err().starts_with(E_RESCUE_CAP));
+    rescue(&mut g, ring - 1, NOW_MS + QUOTE_PAYABLE_MS + 1).unwrap();
+    assert!(!counters(&g).paid(&first_hash));
+    // The forgotten address cannot be paid again: its quote is past its hour.
+    let late = evm_to_intents(&mut g, &(q, sig)).unwrap_err();
+    assert!(
+        late.starts_with(E_QUOTE_FIELDS) && late.contains("more than 1 h before"),
+        "{late}"
+    );
+    // The next slot was paid 2 s after the first: still held at that time.
+    let next = rescue(&mut g, ring, NOW_MS + QUOTE_PAYABLE_MS + 1);
+    assert!(next.unwrap_err().starts_with(E_RESCUE_CAP));
 }
 
 /// A rescue whose MPC call returns no signature stays counted (review round 2, item 7): a late

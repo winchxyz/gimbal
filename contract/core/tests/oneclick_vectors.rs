@@ -247,9 +247,10 @@ fn any_signature(_: &[u8; 64], _: &[u8], _: &[u8; 32]) -> bool {
 }
 
 /// Every live quote's deadline is about three days after its signed `timestamp` (1Click adds 72 h
-/// to the requested deadline), longer than a desk's 32 remembered deposit addresses can be trusted
-/// to last: [`check_quote_age`] pays a quote within the hour after the timestamp, and within five
-/// minutes before it, edges included. A quote without a readable timestamp is refused.
+/// to the requested deadline), longer than a contract remembers the deposit addresses it paid:
+/// [`verify_quote`] pays a quote within the hour after the timestamp, and within five minutes
+/// before it, edges included ([`check_quote_age`]), whatever the deadline. A quote without a
+/// readable timestamp is refused.
 #[test]
 fn a_quote_pays_within_the_hour_after_it_was_signed() {
     let [_, (_, live)] = files();
@@ -260,15 +261,21 @@ fn a_quote_pays_within_the_hour_after_it_was_signed() {
         }
         let q = quote(&live, s(&c["quote"]));
         let fields: Value = serde_json::from_str(s(&q["canonical_json"])).unwrap();
-        let v = verify_quote(
-            sha256,
-            ed25519_verify,
-            s(&q["canonical_json"]),
-            s(&q["signature"]),
-            Method::parse(s(&c["method"])).unwrap(),
-            &context(&c["ctx"]),
-        )
-        .unwrap();
+        let method = Method::parse(s(&c["method"])).unwrap();
+        let at = |now_ms: u64| {
+            let ctx = Context {
+                now_ms,
+                ..context(&c["ctx"])
+            };
+            verify_quote(
+                sha256,
+                ed25519_verify,
+                s(&q["canonical_json"]),
+                s(&q["signature"]),
+                method,
+                &ctx,
+            )
+        };
         let name = s(&q["name"]);
         let signed = parse_time_ms(s(&fields["timestamp"])).unwrap();
         let deadline = parse_time_ms(s(&fields["deadline"])).unwrap();
@@ -278,15 +285,19 @@ fn a_quote_pays_within_the_hour_after_it_was_signed() {
             signed,
             signed + QUOTE_MAX_AGE_MS,
         ] {
-            check_quote_age(&v, ok).unwrap_or_else(|r| panic!("{name} at {ok}: {r}"));
+            let v = at(ok).unwrap_or_else(|r| panic!("{name} at {ok}: {r}"));
+            assert_eq!(v.signed_at_ms, signed);
+            check_quote_age(signed, ok).unwrap();
         }
-        for late in [
-            signed - QUOTE_MAX_AHEAD_MS - 1,
-            signed + QUOTE_MAX_AGE_MS + 1,
-            deadline - 1,
+        for (late, says) in [
+            (signed - QUOTE_MAX_AHEAD_MS - 1, "more than 5 min after"),
+            (signed + QUOTE_MAX_AGE_MS + 1, "more than 1 h before"),
+            (deadline - 1, "more than 1 h before"),
         ] {
-            let r = check_quote_age(&v, late).unwrap_err();
+            let r = at(late).unwrap_err();
             assert_eq!(r.code, E_QUOTE_FIELDS, "{name} at {late}");
+            assert!(r.msg.contains(says), "{name} at {late}: {r}");
+            assert_eq!(check_quote_age(signed, late).unwrap_err(), r);
         }
         checked += 1;
     }

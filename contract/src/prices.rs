@@ -173,12 +173,12 @@ impl Gimbal {
     /// contract's balance and is mostly refunded. Callers are the owners of desks, whose engine
     /// key calls it, the desks' separate operator accounts and the contract account
     /// (`E_NOT_ALLOWED` for anyone else, so strangers cannot spend the contract's deposit);
-    /// `E_ARGS` with the Mock source or under [`REFRESH_PRICES_MIN_GAS`]. When every price asked
-    /// for was stored, or asked the oracle for, less than [`REFRESH_SKIP_MS`] ago it asks nothing
-    /// and returns at once: `true` when every one was stored that recently, `false` when one was
-    /// only asked for (its answer still on the way, or one that brought no price). Otherwise it
-    /// asks the oracle for all of them and the transaction's result is `true` when every symbol
-    /// asked for got a price from the oracle's answer.
+    /// `E_ARGS` with the Mock source or under [`REFRESH_PRICES_MIN_GAS`]. When for every symbol
+    /// asked for a price was stored, or the oracle was asked, less than [`REFRESH_SKIP_MS`] ago
+    /// (by an earlier call: its answer may still be on the way) it asks nothing and returns `true`
+    /// at once. Otherwise it asks the oracle for all of them and the transaction's result is
+    /// `true` when every symbol asked for got a price from the oracle's answer, `false` when one
+    /// did not.
     #[deny_unknown_arguments]
     pub fn refresh_prices(&mut self, assets: Vec<String>) -> PromiseOrValue<bool> {
         let oracle = self.oracle_or_fail();
@@ -210,13 +210,12 @@ impl Gimbal {
             .zip(&rows)
             .all(|(a, row)| stored_recently(a) || asked_recently(*row))
         {
-            let all_stored = assets.iter().all(stored_recently);
-            env::log_str(if all_stored {
+            env::log_str(if assets.iter().all(stored_recently) {
                 "every price asked for was stored under 30 s ago; no oracle call"
             } else {
                 "every price asked for was stored or asked for under 30 s ago; no oracle call"
             });
-            return PromiseOrValue::Value(all_stored);
+            return PromiseOrValue::Value(true);
         }
         for row in rows {
             self.price_asked_ms[row] = now_ms;
