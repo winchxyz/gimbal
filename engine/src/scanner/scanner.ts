@@ -13,7 +13,7 @@
 // 5. each window priced (price.ts); the 7-day gross and intervalsAbove from the hourly rate store, which a few
 //    public history reads per scan fill in the background (a scan never waits on them);
 // 6. ranked: enterable windows by net APR, then the other desk windows by net APR, then watch-only windows by gross
-//    APR (their net is not complete).
+//    APR (their net is not complete): first those whose legs pass every quality check (quality.ts), then the rest.
 
 import type { ScanStatus, ScanVenueId, StrategyConfig, VenueId, Window as FundingWindow, WindowHistory } from '@gimbal/shared';
 import type { Book, Clock, MarketFunding, MarketHistorySource, VenueReader, WatchReader } from '../venues/venue.ts';
@@ -24,6 +24,7 @@ import type { DropReason, LegKind, ScanLeg } from './pairs.ts';
 import { filterLegs, heldLegKeys, pairLegs, toLeg } from './pairs.ts';
 import type { BookRead, OracleSource, PricedWindow, PricingContext } from './price.ts';
 import { isEnterable, priceWindow, switchCostUsd } from './price.ts';
+import { WatchQuality } from './quality.ts';
 
 export interface HeldWindow {
   windowId: string;
@@ -205,6 +206,10 @@ export class Scanner {
     }
     const filter = { oiFloorUsd: config.oiFloorUsd, maxMarkDeviation: config.maxMarkDeviation };
     const { kept, dropped } = filterLegs(legs, filter, heldLegKeys(legs, heldId));
+    const sourceById = new Map(this.#sources.map((s) => [s.id, s]));
+    const quality = new WatchQuality({
+      now, listed: legs, kept, config: config.quality, hasHistory: (v) => sourceById.get(v)?.history !== undefined,
+    });
     const droppedCount: ScanNotes['dropped'] = {};
     for (const d of dropped) droppedCount[d.reason] = (droppedCount[d.reason] ?? 0) + 1;
 
@@ -212,7 +217,6 @@ export class Scanner {
     const pairs = pairLegs(kept, heldId).filter((p) => p.grossPerHour > 0 || p.id === heldId);
 
     // 4. books
-    const sourceById = new Map(this.#sources.map((s) => [s.id, s]));
     const wanted = new Map<string, ScanLeg>();
     for (const p of pairs) if (p.desk) for (const leg of [p.long, p.short]) wanted.set(legKey(leg), leg);
     const skipped = new Set<ScanVenueId>();
@@ -255,6 +259,7 @@ export class Scanner {
       oracle: this.#options.oracle ?? null,
       book: (leg: ScanLeg) => this.#books.get(legKey(leg)) ?? null,
       marginHeldAt: this.#options.marginHeldAt?.() ?? new Set(),
+      quality: (pair) => quality.checks(pair),
     };
     const priced: PricedWindow[] = [];
     const unpriced: ScanNotes['unpriced'] = [];
@@ -300,8 +305,10 @@ export class Scanner {
     const byNet = (a: PricedWindow, b: PricedWindow) => b.window.netAprPct - a.window.netAprPct || byId(a, b);
     const enterable = priced.filter((pw) => isEnterable(pw.window)).sort(byNet);
     const deskOther = priced.filter((pw) => pw.pair.desk && !isEnterable(pw.window)).sort(byNet);
+    // A watch window with a quality finding (a thin leg, a capped or unconfirmed rate, a closed market) never leads
+    // a clean one, however large its gross.
     const watch = priced.filter((pw) => !pw.pair.desk)
-      .sort((a, b) => b.window.grossAprPct - a.window.grossAprPct || byId(a, b))
+      .sort((a, b) => Number(a.flagged) - Number(b.flagged) || b.window.grossAprPct - a.window.grossAprPct || byId(a, b))
       .slice(0, config.maxWatchWindows);
     const ranked = [...enterable, ...deskOther, ...watch];
     this.#priced = new Map(ranked.map((pw) => [pw.pair.id, pw]));

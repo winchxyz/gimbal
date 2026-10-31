@@ -27,6 +27,7 @@ export interface ScanLeg {
   venueMarkPx: number | null;    // USD per unit of `symbol`
   markPx: number | null;         // USD per base unit (venueMarkPx ÷ multiplier)
   oiUsd: number | null;          // open interest in USD
+  volume24hUsd: number | null;   // traded in the last 24 h, USD; null where the venue does not say
   readAt: number;                // ms, when this venue's funding was read
   stale: boolean;                // the venue did not answer this scan: this is its last good read
   /** Set on a leg of the held window that the filters would have dropped: why. The window fails a check for it. */
@@ -66,6 +67,7 @@ export function toLeg(f: MarketFunding, kind: LegKind, readAt: number, stale: bo
     // Open interest is counted in units of the venue's own symbol (kPEPE units for kPEPE), so its USD value is
     // OI × the venue's own mark; the multiplier plays no part.
     oiUsd: oi === null || venueMarkPx === null ? null : oi * venueMarkPx,
+    volume24hUsd: typeof f.volume24hUsd === 'number' && Number.isFinite(f.volume24hUsd) && f.volume24hUsd >= 0 ? f.volume24hUsd : null,
     readAt,
     stale,
   };

@@ -22,8 +22,10 @@ export interface ScannerConfig {
   oiFloorUsd: number;
   /** A leg whose mark (÷ multiplier) is further than this fraction from the median of the same base elsewhere is dropped. */
   maxMarkDeviation: number;
-  /** Watch-only windows are many; at most this many (best gross first) are sent. Desk windows are never cut. */
+  /** Watch-only windows are many; at most this many (in rank order) are sent. Desk windows are never cut. */
   maxWatchWindows: number;
+  /** What makes a watch-only window's leg a poor reference (quality.ts): a failing check, and a lower rank. */
+  quality: QualityConfig;
   /** The contract's policy for the desk, as get_desk returns it; null until a desk exists (nothing can be entered). */
   policy: ContractPolicy | null;
   intervalMs: number;
@@ -43,6 +45,100 @@ export interface ScannerConfig {
   /** A failed history read waits this long before it is tried again. */
   historyRetryMs: number;
 }
+
+/** A venue's funding cap and floor, fractions per hour (the floor < 0). */
+export interface FundingLimit {
+  capPerHour: number;
+  floorPerHour: number;
+}
+
+/** One venue's funding limits: for every market, with exceptions by the venue's own symbol. */
+export interface VenueFundingLimits {
+  all: FundingLimit;
+  bySymbol?: Readonly<Record<string, FundingLimit>>;
+}
+
+/** A stock exchange's regular session, Monday to Friday in its own time zone ("HH:MM", close excluded). */
+export interface MarketSession {
+  name: string;
+  timeZone: string;
+  open: string;
+  close: string;
+}
+
+export interface QualityConfig {
+  /** A watch-window leg that traded less than this in 24 h is thin (where the venue publishes volume). */
+  minVolume24hUsd: number;
+  fundingLimits: Readonly<Record<string, VenueFundingLimits>>;
+  /**
+   * How a venue's own symbol says a market is a stock perp: the pattern captures the ticker, which must name the
+   * leg's base ("4STOCK_USDT" on MEXC is a coin called 4STOCK, not stock number 4).
+   */
+  equityMarkers: Readonly<Record<string, RegExp>>;
+  /** Venues that list traditional assets only (equities, indices, commodities, FX): their markets keep market hours. */
+  traditionalVenues: readonly string[];
+  /** A stock perp is outside market hours when none of these is in session. */
+  stockSessions: readonly MarketSession[];
+  /** Other traditional assets (index, commodity and FX futures) shut from Friday `close` to Sunday `open`, local. */
+  traditionalWeekend: { timeZone: string; close: string; open: string };
+}
+
+/**
+ * Funding caps the scanner can source. Each is the venue's own statement; a venue left out has no cap the scanner
+ * knows. Left out, with per-market limits in their raw answers that the readers do not pass on yet: aster
+ * (fundingInfo fundingFeeCap/Floor), okx (funding-rate max/minFundingRate), bitget (current-fund-rate
+ * max/minFundingRate), gate (contracts funding_rate_limit), kucoin (contracts fundingRateCap/Floor), mexc
+ * (funding_rate max/minFundingRate), extended (hourlyFundingRateCap), backpack (fundingRateUpper/LowerBound, unit
+ * not checked). Left out, no cap found: binance and bybit (Hyperliquid's predictedFundings carries none), pacifica,
+ * paradex, dydx, nado, aevo, variational, gmx-arbitrum, kraken, the hl-* HIP-3 dexes (set by each deployer),
+ * phoenix and orderly. A rate several venues share to the digit is caught without a table (quality.ts).
+ */
+export const FUNDING_LIMITS: Readonly<Record<string, VenueFundingLimits>> = {
+  // Hyperliquid docs, Trading > Funding: "Funding on Hyperliquid is capped at 4%/hour"; the cap "does not depend
+  // on the asset".
+  hyperliquid: { all: { capPerHour: 0.04, floorPerHour: -0.04 } },
+  // Lighter docs, Trading > Funding: the BigClamp "limits funding payments to 4% per 8 hours, or 0.5% per hour",
+  // "defaults, not universal values". The exceptions are orderBookDetails funding_clamp_big in the recorded sweep
+  // (fixtures/watch-wire, 2026-10-31): ARC 20 % and RIVER 16 % per 8 h, the Korean equities 0.02 % per 8 h.
+  lighter: {
+    all: { capPerHour: 0.04 / 8, floorPerHour: -0.04 / 8 },
+    bySymbol: {
+      ARC: { capPerHour: 0.2 / 8, floorPerHour: -0.2 / 8 },
+      RIVER: { capPerHour: 0.16 / 8, floorPerHour: -0.16 / 8 },
+      ...Object.fromEntries(['SAMSUNG', 'HYUNDAI', 'HANMI', 'SKHYNIX', 'KRCOMP'].map((s) => [s, { capPerHour: 0.0002 / 8, floorPerHour: -0.0002 / 8 }])),
+    },
+  },
+};
+
+export const DEFAULT_QUALITY: QualityConfig = {
+  // The watch-unit audit of 2026-10-31: every leg it found too thin to trust (HMSTR on Hyperliquid, UNITREE on
+  // hl-para, GTC and NIL on Aster) traded under 0.1M USD a day.
+  minVolume24hUsd: 100_000,
+  fundingLimits: FUNDING_LIMITS,
+  // Each venue's naming of its stock perps, from its listing in the recorded sweep (2026-10-31).
+  equityMarkers: {
+    mexc: /^([A-Z0-9]+)STOCK_USDT$/,           // AAPLSTOCK_USDT
+    bitget: /^([A-Z0-9]+)STOCKUSDT$/,          // ACNSTOCKUSDT
+    extended: /^([A-Z0-9]+)_24_5-USD$/,        // AAPL_24_5-USD: traded 24 hours, 5 days a week
+    backpack: /^([A-Z0-9]+)\.US_USDC_PERP$/,   // AAPL.US_USDC_PERP
+  },
+  // hl-xyz (trade.xyz) lists only equities, indices, commodities and FX: all 120 of its markets in the recorded sweep.
+  traditionalVenues: ['hl-xyz'],
+  // Each exchange's published regular session. Lunch breaks count as open; holidays are not modelled.
+  stockSessions: [
+    { name: 'New York', timeZone: 'America/New_York', open: '09:30', close: '16:00' },     // NYSE, Nasdaq
+    { name: 'London', timeZone: 'Europe/London', open: '08:00', close: '16:30' },          // LSE
+    { name: 'Frankfurt, Paris', timeZone: 'Europe/Paris', open: '09:00', close: '17:30' }, // Xetra, Euronext
+    { name: 'Mumbai', timeZone: 'Asia/Kolkata', open: '09:15', close: '15:30' },           // NSE, BSE
+    { name: 'Shanghai', timeZone: 'Asia/Shanghai', open: '09:30', close: '15:00' },        // SSE, SZSE
+    { name: 'Hong Kong', timeZone: 'Asia/Hong_Kong', open: '09:30', close: '16:00' },      // HKEX
+    { name: 'Taipei', timeZone: 'Asia/Taipei', open: '09:00', close: '13:30' },            // TWSE
+    { name: 'Seoul', timeZone: 'Asia/Seoul', open: '09:00', close: '15:30' },              // KRX
+    { name: 'Tokyo', timeZone: 'Asia/Tokyo', open: '09:00', close: '15:30' },              // TSE
+  ],
+  // CME Globex trades Sunday 18:00 to Friday 17:00 New York time; spot FX closes and opens about then too.
+  traditionalWeekend: { timeZone: 'America/New_York', close: '17:00', open: '18:00' },
+};
 
 /** Orderly's own taker fee, before the broker's markup. */
 const ORDERLY_BASE_TAKER_BPS = 3;
@@ -107,6 +203,7 @@ export const DEFAULT_SCANNER_CONFIG: ScannerConfig = {
   oiFloorUsd: 500_000,
   maxMarkDeviation: 0.1,
   maxWatchWindows: 150,
+  quality: DEFAULT_QUALITY,
   policy: null,
   intervalMs: 5_000,
   bookTtlMs: 30_000,

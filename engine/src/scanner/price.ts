@@ -51,6 +51,8 @@ export interface PricingContext {
   book(leg: ScanLeg): BookRead | null;
   /** Desk venues that already hold the desk's margin: entering there moves nothing in or out. Default: none. */
   marginHeldAt?: ReadonlySet<VenueId>;
+  /** The quality findings of a watch-only pair's legs (quality.ts), as failing checks. Default: none. */
+  quality?: (pair: Pair) => FundingWindow['checks'];
 }
 
 /** What one fill of a leg costs, USD: its taker fee plus the slippage of that side on today's book. */
@@ -76,6 +78,8 @@ export interface PricedWindow {
   costsApr: number;              // the sum of the four cost fields, APR points
   breakdown: CostBreakdown;
   fills: { long: LegFills; short: LegFills } | null;
+  /** A watch-only window with a quality finding: it ranks after the clean watch windows. */
+  flagged: boolean;
 }
 
 export type PriceResult = { ok: true; priced: PricedWindow } | { ok: false; reason: 'no-book' | 'empty-book'; venue: VenueId };
@@ -102,7 +106,7 @@ export function isEnterable(w: FundingWindow): boolean {
  * ever read it is not priced (`no-book`), so a missing book never shows as zero slippage. A book too thin for the leg
  * prices the slippage of what it fills and fails a check, so the window is never enterable or ranked as if filled.
  * A watch-only pair is priced from what the scanner can know (gross, basis between marks, funding timing); its fees,
- * slippage and rescue reserve are not priced and its checks say so.
+ * slippage and rescue reserve are not priced and its checks say so, followed by its legs' quality findings.
  */
 export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
   const { long, short } = pair;
@@ -189,6 +193,7 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
   const depthUsd = ois.length > 0 ? Math.round(Math.min(...ois)) : 0;
 
   const verdict = pair.desk ? deskVerdict(pair, ctx) : watchVerdict(pair);
+  const quality = pair.desk ? [] : (ctx.quality?.(pair) ?? []);
   const head: FundingWindow['checks'] = [];
   if (staleVenues.length > 0) {
     head.push({ ok: false, text: `${staleVenues.join(' and ')} did not answer: numbers from ${Math.max(0, Math.round((ctx.now - oldest) / 1000))} s ago` });
@@ -229,11 +234,11 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
     tradable: pair.desk,
     ...(verdict.refused === undefined ? {} : { refused: verdict.refused }),
     held: null,
-    checks: [...head, ...verdict.checks, ...checks, ...tail],
+    checks: [...head, ...verdict.checks, ...quality, ...checks, ...tail],
     switchCostUsd: null,
     stale: staleVenues.length > 0,
   };
-  return { ok: true, priced: { pair, window, costsApr, breakdown, fills } };
+  return { ok: true, priced: { pair, window, costsApr, breakdown, fills, flagged: quality.length > 0 } };
 }
 
 function schedule(leg: ScanLeg, incomePerHourUsd: number, now: number) {
