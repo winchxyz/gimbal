@@ -10,17 +10,24 @@
 //!
 //! Each verifies the 1Click quote in `gimbal-core` (signature, then the field rules, then the cap,
 //! then the transfer cost the policy allows), builds the transfer from the verified quote alone
-//! and spends the cap in the same call, before the MPC answers: a signature that fails or comes
-//! late never frees its share. Each public method is its `prepare_*` followed by `Gimbal::sign`;
-//! the `build_*` step takes the verified quote, so the unit tests can hand it one.
+//! and counts it in the desk's [`DeskCounters`] in the same call: its amount against the hourly
+//! cap, its cost against the hourly cost budget, its deposit address against reuse. Each public
+//! method is its `prepare_*` followed by `Gimbal::sign`; the `build_*` step takes the verified
+//! quote, so the unit tests can hand it one.
+//!
+//! A rescue stays counted whatever the MPC answers. A `sign` that returns no signature to
+//! `on_signed` (failed, timed out) may still be answered later by the MPC network's `respond`,
+//! which publishes the signature on chain where the relayer can read it: freeing the cap, the
+//! cost or the deposit address then would let the same transfer be signed again.
 
 use gimbal_core::decimal::format_e8;
 use gimbal_core::eip3009::{nonce as eip3009_nonce, Authorization, VALIDITY_S};
-use gimbal_core::errors::{Refusal, E_QUOTE_FIELDS};
+use gimbal_core::errors::{Refusal, E_QUOTE_FIELDS, E_RESCUE_CAP};
 use gimbal_core::hl::{usdc_token, Address, UserAction};
 use gimbal_core::ids::{check_base58_32, check_reason};
 use gimbal_core::oneclick::{
-    check_cost, verify_quote, Context, DeskAddresses, Method, VerifiedQuote,
+    check_cost, rescue_cost_budget_e8, transfer_cost_e8, verify_quote, Context, DeskAddresses,
+    Method, VerifiedQuote,
 };
 use gimbal_core::phoenix::{check_message, Rescue};
 use near_sdk::{env, near, Promise};
@@ -30,49 +37,88 @@ use crate::desk::{Desk, Gate};
 use crate::hl::keccak;
 use crate::prices::reference_price;
 use crate::sol::{decode_message, desk_accounts, sha256};
-use crate::{action_desk, desk_ref, take_hl_nonce, Gimbal, GimbalExt, OrFail};
+use crate::{action_desk, desk_ref, fail, take_hl_nonce, Gimbal, GimbalExt, OrFail};
 
-/// The rescue cap's window: an hour from the first rescue after the last window closed.
+/// How long a rescue weighs on the desk's meters: its weight falls linearly from its full amount
+/// (or cost) to 0 over this hour, so the cap bounds any stretch of time, not a fixed window.
 pub const RESCUE_WINDOW_MS: u64 = 3_600_000;
 
-/// What the contract counts per desk besides its Hyperliquid nonce. Fixed size, stored by
-/// `create_desk`, so an action rewrites it without adding storage.
+/// How many deposit addresses a desk remembers: a quote pays once, so a rescue to an address one
+/// of the desk's last 32 rescues paid is refused.
+pub const DEPOSIT_RING: usize = 32;
+
+/// What the contract counts per desk besides its Hyperliquid nonce. Fixed size (1.1 KB), stored
+/// by `create_desk`, so an action rewrites it without adding storage.
+///
+/// The two meters hold the weight of the desk's rescues at `rescue_at_ms`; at a later time each
+/// weighs `weight × (1 − elapsed / 1 h)`, 0 after an hour ([`decayed`]). What a desk may still
+/// rescue is the cap minus the amount meter's weight now: 2 × the cap can never move within a
+/// moment, as with a fixed window, and the full cap is back an hour after the last rescue.
 #[near(serializers = [borsh])]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DeskCounters {
-    /// Block time (ms) of the first rescue of the current window.
-    pub rescue_window_start_ms: u64,
-    /// USDC × 1e8 the rescues of that window moved.
+    /// Block time (ms) the meters were last brought to.
+    pub rescue_at_ms: u64,
+    /// USDC × 1e8: the weight of the rescues' amounts, against `rescue_cap_usd_per_hour`.
     pub rescue_spent_e8: u128,
+    /// USD × 1e8: the weight of what they may cost ([`transfer_cost_e8`]), against
+    /// [`rescue_cost_budget_e8`].
+    pub rescue_cost_e8: u128,
     /// The counter of the desk's next EIP-3009 nonce, from 0.
     pub eip3009_next: u64,
+    /// sha256 of the deposit addresses of the desk's last [`DEPOSIT_RING`] rescues, as the
+    /// verified quote gives them (lowercase EVM, base58 Solana); all zero for an unused slot.
+    pub deposits: [[u8; 32]; DEPOSIT_RING],
+    /// The slot the next deposit address takes, the oldest one's.
+    pub deposit_next: u8,
+}
+
+/// `weight`, a meter's value at `since_ms`, at `now_ms`: falling linearly to 0 over
+/// [`RESCUE_WINDOW_MS`], rounded up so a meter never frees more than the time allows.
+pub fn decayed(weight: u128, since_ms: u64, now_ms: u64) -> u128 {
+    let window = u128::from(RESCUE_WINDOW_MS);
+    let elapsed = u128::from(now_ms.saturating_sub(since_ms).min(RESCUE_WINDOW_MS));
+    let left = window - elapsed;
+    // weight × left / window, without the product overflowing.
+    (weight / window) * left + ((weight % window) * left).div_ceil(window)
 }
 
 impl DeskCounters {
-    /// Whether the window that started at `rescue_window_start_ms` still runs at `now_ms`.
-    pub const fn in_window(&self, now_ms: u64) -> bool {
-        self.rescue_spent_e8 > 0
-            && now_ms < self.rescue_window_start_ms.saturating_add(RESCUE_WINDOW_MS)
+    /// The amount meter's weight at `now_ms`, USDC × 1e8.
+    pub fn spent_e8(&self, now_ms: u64) -> u128 {
+        decayed(self.rescue_spent_e8, self.rescue_at_ms, now_ms)
     }
 
-    /// USDC × 1e8 the desk can still rescue at `now_ms` under a cap of `cap_usd` per hour.
+    /// The cost meter's weight at `now_ms`, USD × 1e8.
+    pub fn cost_e8(&self, now_ms: u64) -> u128 {
+        decayed(self.rescue_cost_e8, self.rescue_at_ms, now_ms)
+    }
+
+    /// USDC × 1e8 the desk can still rescue at `now_ms` under a cap of `cap_usd` an hour.
     pub fn remaining_cap_e8(&self, cap_usd: u64, now_ms: u64) -> u128 {
-        let cap = u128::from(cap_usd) * 100_000_000;
-        if self.in_window(now_ms) {
-            cap.saturating_sub(self.rescue_spent_e8)
-        } else {
-            cap
-        }
+        (u128::from(cap_usd) * 100_000_000).saturating_sub(self.spent_e8(now_ms))
     }
 
-    /// Counts a rescue of `amount_e8` at `now_ms`, opening a new window if none runs.
-    pub fn spend(&mut self, amount_e8: u128, now_ms: u64) {
-        if self.in_window(now_ms) {
-            self.rescue_spent_e8 = self.rescue_spent_e8.saturating_add(amount_e8);
-        } else {
-            self.rescue_window_start_ms = now_ms;
-            self.rescue_spent_e8 = amount_e8;
-        }
+    /// USD × 1e8 the desk's rescues may still cost at `now_ms` under a budget of `budget_e8`.
+    pub fn remaining_cost_e8(&self, budget_e8: u128, now_ms: u64) -> u128 {
+        budget_e8.saturating_sub(self.cost_e8(now_ms))
+    }
+
+    /// Whether one of the last [`DEPOSIT_RING`] rescues paid the deposit address hashing to
+    /// `deposit_sha256`.
+    pub fn paid(&self, deposit_sha256: &[u8; 32]) -> bool {
+        self.deposits.contains(deposit_sha256)
+    }
+
+    /// Counts a rescue of `amount_e8` that may cost `cost_e8`, to the deposit address hashing to
+    /// `deposit_sha256`, at `now_ms`.
+    pub fn spend(&mut self, amount_e8: u128, cost_e8: u128, deposit_sha256: [u8; 32], now_ms: u64) {
+        self.rescue_spent_e8 = self.spent_e8(now_ms).saturating_add(amount_e8);
+        self.rescue_cost_e8 = self.cost_e8(now_ms).saturating_add(cost_e8);
+        self.rescue_at_ms = now_ms;
+        let slot = usize::from(self.deposit_next) % DEPOSIT_RING;
+        self.deposits[slot] = deposit_sha256;
+        self.deposit_next = u8::try_from((slot + 1) % DEPOSIT_RING).unwrap_or(0);
     }
 }
 
@@ -98,11 +144,13 @@ impl Gimbal {
     /// Rescue out of Hyperliquid: `sendAsset` of the quote's `amountIn` of the desk's perp USDC
     /// (`sourceDex` `""`) to the quote's deposit address on the spot side (`destinationDex`
     /// `"spot"`), the network's USDC token, the desk's next nonce. The quote: a live 1Click quote
-    /// of HyperCore USDC, signed by 1Click (`E_QUOTE_SIGNATURE`), paying a desk address, the
-    /// pinned Orderly receiver or the contract for the desk, refunds to the desk's EVM address,
-    /// within what is left of the hourly cap (`E_RESCUE_CAP`) and the policy's transfer cost, with
-    /// an `amountIn` Hyperliquid's perp balance can send (at most 6 decimals) (`E_QUOTE_FIELDS`).
-    /// Owner or operator, also on a paused desk. `kind` `sendAsset`; a user-signed action, so no
+    /// of HyperCore USDC, signed by 1Click (`E_QUOTE_SIGNATURE`), into another asset, paying a
+    /// desk address, the pinned Orderly receiver or the contract for the desk, refunds to the
+    /// desk's EVM address, a deposit address none of the desk's last 32 rescues paid, within the
+    /// policy's transfer cost, with an `amountIn` Hyperliquid's perp balance can send (at most 6
+    /// decimals) (`E_QUOTE_FIELDS`), within what is left of the hourly cap and of the hourly cost
+    /// budget, which counts Hyperliquid's 1 USDC send fee besides the quote's cost
+    /// (`E_RESCUE_CAP`). Owner or operator, also on a paused desk. `kind` `sendAsset`; a user-signed action, so no
     /// `expiresAfter`: the nonce window bounds a late signature.
     #[deny_unknown_arguments]
     pub fn hl_send_to_intents(
@@ -121,9 +169,10 @@ impl Gimbal {
     /// it, exactly one `TransferChecked` of exactly the quote's `amountIn` USDC into that account
     /// (`E_QUOTE_FIELDS`). The quote as for [`Self::hl_send_to_intents`], of Solana USDC, refunds
     /// to the desk's Solana authority. Owner or operator; on a paused desk too, under its own
-    /// rule: the rescue transfer, the account create and the steps that free the USDC (Phoenix
-    /// withdrawal, Ember unwrap) pass a pause, an order that is not reduce-only does not
-    /// (`E_PAUSED`). `kind` `rescue`.
+    /// rule (`E_PAUSED` otherwise): only what frees and pays out the quote's `amountIn` passes a
+    /// pause, Phoenix withdrawals and Ember unwraps of at most `amountIn` in all (with the
+    /// unwrap's `Approve` and `Revoke`), the deposit owner's account create and the transfer; no
+    /// priority fee, order, cancel, deposit, wrap or create of a desk account. `kind` `rescue`.
     #[deny_unknown_arguments]
     pub fn sol_sign_rescue(
         &mut self,
@@ -161,7 +210,8 @@ impl Gimbal {
 
 impl Gimbal {
     /// The quote checked for `method` on the desk at the block time: [`verify_quote`] (with what
-    /// is left of the desk's cap), then [`check_cost`] at the policy's bounds.
+    /// is left of the desk's cap), then [`check_cost`] at the policy's bounds. The build step
+    /// counts it ([`Self::counted_rescue`]).
     pub fn verified_quote(
         &self,
         desk_id: &str,
@@ -197,11 +247,57 @@ impl Gimbal {
         q
     }
 
-    /// Counts `amount_e8` against the desk's cap at the block time.
-    fn spend_rescue(&mut self, desk_id: &str, amount_e8: u128) {
+    /// The desk's counters with the verified rescue `q` counted at the block time, or the
+    /// refusal: `E_QUOTE_FIELDS` for a deposit address one of the desk's last [`DEPOSIT_RING`]
+    /// rescues paid (a quote pays once), `E_RESCUE_CAP` for an amount over what is left of the
+    /// hourly cap or a cost ([`transfer_cost_e8`]) over what is left of the hourly cost budget
+    /// ([`rescue_cost_budget_e8`] of the policy's cap and transfer cost bounds). Writes nothing:
+    /// each build step stores the result once all its checks passed. Nothing is ever given back
+    /// (module doc).
+    pub fn counted_rescue(&self, desk_id: &str, q: &VerifiedQuote) -> DeskCounters {
+        let policy = &desk_ref(&self.desks, desk_id).policy;
+        let now_ms = env::block_timestamp_ms();
         let mut counters = self.desk_counters.get(desk_id).copied().unwrap_or_default();
-        counters.spend(amount_e8, env::block_timestamp_ms());
-        self.desk_counters.insert(desk_id.to_owned(), counters);
+        let deposit = deposit_of(q);
+        let deposit_sha256 = env::sha256_array(deposit.as_bytes());
+        if counters.paid(&deposit_sha256) {
+            fail_fields(format!(
+                "deposit address {deposit} was paid by one of this desk's last {DEPOSIT_RING} \
+                 rescues; a quote pays once"
+            ));
+        }
+        let cap_left = counters.remaining_cap_e8(policy.rescue_cap_usd_per_hour, now_ms);
+        if q.amount_in_e8 > cap_left {
+            fail(Refusal::new(
+                E_RESCUE_CAP,
+                format!(
+                    "amountIn {} USDC is over what is left of the hourly rescue cap, {} USD",
+                    format_e8(q.amount_in_e8),
+                    format_e8(cap_left)
+                ),
+            ));
+        }
+        let cost = transfer_cost_e8(q);
+        let budget = rescue_cost_budget_e8(
+            policy.rescue_cap_usd_per_hour,
+            policy.max_transfer_cost_bps,
+            policy.max_transfer_cost_flat_e6,
+        );
+        let cost_left = counters.remaining_cost_e8(budget, now_ms);
+        if cost > cost_left {
+            fail(Refusal::new(
+                E_RESCUE_CAP,
+                format!(
+                    "the rescue may cost {} USD, over what is left of the hourly rescue cost \
+                     budget, {} of {} USD",
+                    format_e8(cost),
+                    format_e8(cost_left),
+                    format_e8(budget)
+                ),
+            ));
+        }
+        counters.spend(q.amount_in_e8, cost, deposit_sha256, now_ms);
+        counters
     }
 
     /// [`Self::hl_send_to_intents`] up to the signature.
@@ -233,6 +329,7 @@ impl Gimbal {
                 format_e8(q.amount_in_e8)
             ));
         }
+        let counters = self.counted_rescue(&desk_id, q);
         let amount = format_e8(q.amount_in_e8);
         let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
         let action = UserAction::SendAsset {
@@ -244,7 +341,7 @@ impl Gimbal {
             nonce,
         };
         let prepared = action.prepare(keccak, self.config.network);
-        self.spend_rescue(&desk_id, q.amount_in_e8);
+        self.desk_counters.insert(desk_id.clone(), counters);
         UnsignedAction::hyperliquid(desk_id, prepared, Some(reason))
             .with_amount(Some(amount))
             .with_deposit_address(deposit)
@@ -279,6 +376,7 @@ impl Gimbal {
             .map_err(|_| quote_fields("amountIn is over 2^64 - 1"))
             .or_fail();
         let rescue = Rescue::new(sha256, owner, amount_in).or_fail();
+        let counters = self.counted_rescue(&desk_id, q);
         let message = decode_message(&message_b64).or_fail();
         let desk: &Desk = desk_ref(&self.desks, &desk_id);
         let accounts = desk_accounts(desk).or_fail();
@@ -295,9 +393,8 @@ impl Gimbal {
             Some(&rescue),
         )
         .or_fail();
-        // The rescue's own pause rule: everything a rescue message may carry passes a paused
-        // desk, except an order that can grow a position.
-        if checked.orders.iter().any(|o| !o.reduce_only) {
+        // The rescue's own pause rule, which the core reads in rescue mode.
+        if !checked.reduces_risk {
             desk.check_action(&desk_id, &env::predecessor_account_id(), Gate::Running)
                 .or_fail();
         }
@@ -306,7 +403,7 @@ impl Gimbal {
             .iter()
             .map(|o| OrderDetail::new(&o.symbol, o.bid, o.size_e8, o.price_e8, o.valued))
             .collect();
-        self.spend_rescue(&desk_id, q.amount_in_e8);
+        self.desk_counters.insert(desk_id.clone(), counters);
         UnsignedAction::solana(desk_id, checked.kind, message_b64, &message, Some(reason))
             .with_orders(orders)
             .with_amount(Some(format_e8(q.amount_in_e8)))
@@ -341,17 +438,12 @@ impl Gimbal {
         let value = u64::try_from(q.amount_in)
             .map_err(|_| quote_fields("amountIn is over 2^64 - 1"))
             .or_fail();
-        let mut counters = self
-            .desk_counters
-            .get(&desk_id)
-            .copied()
-            .unwrap_or_default();
+        let mut counters = self.counted_rescue(&desk_id, q);
         let counter = counters.eip3009_next;
         counters.eip3009_next = counter
             .checked_add(1)
             .ok_or_else(|| quote_fields("the desk's EIP-3009 counter is exhausted"))
             .or_fail();
-        self.desk_counters.insert(desk_id.clone(), counters);
         let block_s = env::block_timestamp_ms() / 1000;
         let auth = Authorization {
             from: from.0,
@@ -363,7 +455,7 @@ impl Gimbal {
         };
         let network = self.config.network;
         let digest = auth.digest(keccak, network);
-        self.spend_rescue(&desk_id, q.amount_in_e8);
+        self.desk_counters.insert(desk_id.clone(), counters);
         UnsignedAction::arbitrum(
             desk_id,
             "transfer_with_authorization",
@@ -377,5 +469,5 @@ impl Gimbal {
 }
 
 fn fail_fields(msg: String) -> ! {
-    crate::fail(quote_fields(msg))
+    fail(quote_fields(msg))
 }
