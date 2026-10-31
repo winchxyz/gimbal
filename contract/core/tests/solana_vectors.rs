@@ -4,19 +4,22 @@
 
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use gimbal_core::ed25519::is_on_curve;
-use gimbal_core::errors::{E_ORACLE_STALE, E_PRICE_BAND, E_SIZE, E_SOL_MESSAGE, E_SOL_PROGRAM};
+use gimbal_core::errors::{
+    E_ASSET, E_ORACLE_STALE, E_PRICE_BAND, E_SIZE, E_SOL_ACCOUNT, E_SOL_MESSAGE, E_SOL_PROGRAM,
+};
 use gimbal_core::phoenix::{
     check_message, check_onboarding, check_registration, Onboarding, Rescue, CANCEL_ALL,
     DEPOSIT_FUNDS, EMBER_DEPOSIT, EMBER_WITHDRAW, PHOENIX_ACTIVE_TRADER_BUFFER,
     PHOENIX_GLOBAL_CONFIGURATION, PHOENIX_GLOBAL_TRADER_INDEX, PHOENIX_LOG_AUTHORITY,
-    PHOENIX_ONBOARDING_PERMISSION, PHOENIX_RISK_AUTHORITY, PLACE_MARKET_ORDER, REGISTER_TRADER,
-    SET_TRADER_CAPABILITIES_DELEGATED, WITHDRAW_FUNDS,
+    PHOENIX_ONBOARDING_PERMISSION, PHOENIX_PERP_ASSET_MAP, PHOENIX_RISK_AUTHORITY,
+    PHOENIX_WITHDRAW_QUEUE, PLACE_MARKET_ORDER, REGISTER_TRADER, SET_TRADER_CAPABILITIES_DELEGATED,
+    WITHDRAW_FUNDS,
 };
 use gimbal_core::policy::{PhoenixMarket, Policy, UnpricedAsset};
 use gimbal_core::solana::{
-    find_program_address, parse_message, phoenix_trader_address, Format, Pubkey, SolDesk,
-    ATA_PROGRAM, COMPUTE_BUDGET_PROGRAM, EMBER_AUTHORITY, EMBER_PROGRAM, PHOENIX_ONBOARDER,
-    PHOENIX_PROGRAM, PHUSD_MINT, SYSTEM_PROGRAM, TOKEN_PROGRAM, USDC_MINT,
+    find_program_address, parse_message, phoenix_spline_address, phoenix_trader_address, Format,
+    Pubkey, SolDesk, ATA_PROGRAM, COMPUTE_BUDGET_PROGRAM, EMBER_AUTHORITY, EMBER_PROGRAM,
+    PHOENIX_ONBOARDER, PHOENIX_PROGRAM, PHUSD_MINT, SYSTEM_PROGRAM, TOKEN_PROGRAM, USDC_MINT,
 };
 use gimbal_core::Refusal;
 use serde_json::Value;
@@ -155,6 +158,7 @@ fn every_sol_sign_case_gets_its_expected_answer() {
     let cases = doc["cases"].as_array().unwrap();
     for case in cases {
         let got = check_message(
+            sha256,
             &policy,
             &desk,
             &message(case),
@@ -186,7 +190,7 @@ fn a_rescue_message_never_passes_plain_sol_sign() {
     for case in doc["cases"].as_array().unwrap() {
         if case["method"] == "sol_sign_rescue" {
             rows += 1;
-            let got = check_message(&policy, &desk, &message(case), &reference, None);
+            let got = check_message(sha256, &policy, &desk, &message(case), &reference, None);
             assert!(got.is_err(), "{}", name(case));
         }
     }
@@ -201,7 +205,14 @@ fn without_a_fresh_price_every_priced_order_is_stale() {
     let mut stale = 0;
     for case in doc["cases"].as_array().unwrap() {
         let bytes = message(case);
-        let got = check_message(&policy, &desk, &bytes, &|_| None, rescue_of(case).as_ref());
+        let got = check_message(
+            sha256,
+            &policy,
+            &desk,
+            &bytes,
+            &|_| None,
+            rescue_of(case).as_ref(),
+        );
         let want = expected(case);
         let has_price = case["why"]
             .as_str()
@@ -243,7 +254,7 @@ fn an_unpriced_phoenix_market_is_capped_at_its_own_price_and_max_sz() {
             .iter()
             .find(|c| name(c).starts_with(prefix))
             .unwrap();
-        check_message(&policy, &desk, &message(case), &|_| None, None)
+        check_message(sha256, &policy, &desk, &message(case), &|_| None, None)
     };
     let ok = run("IOC buy 0.005 ETH, limit 2474.5").unwrap();
     assert!(ok.orders[0].valued.unpriced());
@@ -270,6 +281,7 @@ fn kinds_and_the_pause_gate() {
             .find(|c| name(c).starts_with(prefix))
             .unwrap();
         check_message(
+            sha256,
             &policy,
             &desk,
             &message(case),
@@ -321,11 +333,11 @@ fn a_reduce_only_order_reduces_risk_and_no_other_flag_passes() {
     let ctx = &doc["ctx"]["sol_sign"];
     let (policy, desk, reference) = (vector_policy(ctx), vector_desk(&doc), reference_of(ctx));
     let close = with_flags(&doc, "IOC sell 0.005 ETH", 0x80);
-    let c = check_message(&policy, &desk, &close, &reference, None).unwrap();
+    let c = check_message(sha256, &policy, &desk, &close, &reference, None).unwrap();
     assert!(c.orders[0].reduce_only && c.reduces_risk);
     for flags in [0x10, 0x20, 0x40, 0xc0, 0x01] {
         let bad = with_flags(&doc, "IOC sell 0.005 ETH", flags);
-        let r = check_message(&policy, &desk, &bad, &reference, None).unwrap_err();
+        let r = check_message(sha256, &policy, &desk, &bad, &reference, None).unwrap_err();
         assert_eq!(r.code, E_SOL_PROGRAM, "{flags:#04x}");
         assert!(r.msg.contains("only reduce-only (0x80) may be set"), "{r}");
     }
@@ -478,7 +490,7 @@ fn onboarding_messages_are_not_sol_sign_messages() {
     let ctx = &sol["ctx"]["sol_sign"];
     let (policy, desk, reference) = (vector_policy(ctx), vector_desk(&sol), reference_of(ctx));
     for case in onboarding_doc()["cases"].as_array().unwrap() {
-        let got = check_message(&policy, &desk, &message(case), &reference, None);
+        let got = check_message(sha256, &policy, &desk, &message(case), &reference, None);
         assert!(got.is_err(), "{}", name(case));
     }
 }
@@ -519,6 +531,38 @@ fn the_pinned_phoenix_accounts_are_their_program_addresses() {
         key(&ctx["active_trader_buffer"][0])
     );
     assert_eq!(ctx["active_trader_buffer"].as_array().unwrap().len(), 1);
+}
+
+/// The accounts every passing vector puts in the pinned places of a Phoenix instruction are the
+/// pinned constants, and each order's and cancel's spline is the one derived from its orderbook.
+#[test]
+fn the_vectors_put_the_pinned_and_derived_accounts_in_their_places() {
+    let doc = sol_doc();
+    let mut seen = [0; 3];
+    for case in doc["cases"].as_array().unwrap() {
+        if case["expect"]["ok"] != true {
+            continue;
+        }
+        let bytes = message(case);
+        for ix in parse_message(&bytes).unwrap().instructions {
+            if ix.program != PHOENIX_PROGRAM {
+                continue;
+            }
+            let a = &ix.accounts;
+            if ix.data.starts_with(&PLACE_MARKET_ORDER) || ix.data.starts_with(&CANCEL_ALL) {
+                assert_eq!(a[5], PHOENIX_PERP_ASSET_MAP, "{}", name(case));
+                assert_eq!(a[9], spline(&a[8]), "{}", name(case));
+                seen[0] += 1;
+            } else if ix.data.starts_with(&WITHDRAW_FUNDS) {
+                assert_eq!(a[5], PHOENIX_PERP_ASSET_MAP, "{}", name(case));
+                assert_eq!(a[11], PHOENIX_WITHDRAW_QUEUE, "{}", name(case));
+                seen[1] += 1;
+            } else if ix.data.starts_with(&DEPOSIT_FUNDS) {
+                seen[2] += 1;
+            }
+        }
+    }
+    assert_eq!(seen, [8, 2, 1]);
 }
 
 #[test]
@@ -593,6 +637,465 @@ fn the_curve_check_agrees_with_curve25519_dalek() {
         "{on} of {}",
         inputs.len()
     );
+}
+
+// --- review cases (vectors/solana-review.json) ---
+
+/// A legacy message taken apart for editing: the header, the keys, the blockhash and each
+/// instruction as its program index, account indexes and data.
+#[derive(Clone)]
+struct Draft {
+    header: [u8; 3],
+    keys: Vec<Pubkey>,
+    blockhash: Pubkey,
+    ixs: Vec<(u8, Vec<u8>, Vec<u8>)>,
+}
+
+fn compact_u16(out: &mut Vec<u8>, mut n: usize) {
+    loop {
+        let low = u8::try_from(n & 0x7f).unwrap();
+        n >>= 7;
+        if n == 0 {
+            out.push(low);
+            return;
+        }
+        out.push(low | 0x80);
+    }
+}
+
+impl Draft {
+    fn of(bytes: &[u8]) -> Draft {
+        let m = parse_message(bytes).unwrap();
+        assert_eq!(m.format, Format::Legacy);
+        Draft {
+            header: [
+                m.num_required_signatures,
+                m.num_readonly_signed,
+                m.num_readonly_unsigned,
+            ],
+            keys: m.keys.clone(),
+            blockhash: m.recent_blockhash,
+            ixs: m
+                .instructions
+                .iter()
+                .map(|ix| {
+                    (
+                        ix.program_index,
+                        ix.account_indexes.clone(),
+                        ix.data.to_vec(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        let mut out = self.header.to_vec();
+        compact_u16(&mut out, self.keys.len());
+        for k in &self.keys {
+            out.extend_from_slice(k);
+        }
+        out.extend_from_slice(&self.blockhash);
+        compact_u16(&mut out, self.ixs.len());
+        for (program, accounts, data) in &self.ixs {
+            out.push(*program);
+            compact_u16(&mut out, accounts.len());
+            out.extend_from_slice(accounts);
+            compact_u16(&mut out, data.len());
+            out.extend_from_slice(data);
+        }
+        out
+    }
+
+    /// The index of `key`, added as the last read-only account if the message lacks it.
+    fn index(&mut self, key: Pubkey) -> u8 {
+        let i = self.keys.iter().position(|k| *k == key).unwrap_or_else(|| {
+            self.keys.push(key);
+            self.header[2] += 1;
+            self.keys.len() - 1
+        });
+        u8::try_from(i).unwrap()
+    }
+
+    /// The one instruction of `program` whose data starts with `prefix`.
+    fn find(&self, program: Pubkey, prefix: &[u8]) -> usize {
+        let found: Vec<usize> = (0..self.ixs.len())
+            .filter(|&i| {
+                let (p, _, data) = &self.ixs[i];
+                self.keys[usize::from(*p)] == program && data.starts_with(prefix)
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "{prefix:02x?}");
+        found[0]
+    }
+
+    fn account(&self, ix: usize, i: usize) -> Pubkey {
+        self.keys[usize::from(self.ixs[ix].1[i])]
+    }
+
+    fn set_account(&mut self, ix: usize, i: usize, key: Pubkey) -> &mut Self {
+        let k = self.index(key);
+        self.ixs[ix].1[i] = k;
+        self
+    }
+
+    fn push_account(&mut self, ix: usize, key: Pubkey) -> &mut Self {
+        let k = self.index(key);
+        self.ixs[ix].1.push(k);
+        self
+    }
+
+    fn remove_account(&mut self, ix: usize, i: usize) -> &mut Self {
+        self.ixs[ix].1.remove(i);
+        self
+    }
+
+    fn swap_accounts(&mut self, ix: usize, i: usize, j: usize) -> &mut Self {
+        self.ixs[ix].1.swap(i, j);
+        self
+    }
+}
+
+#[test]
+fn a_draft_writes_back_the_message_it_read() {
+    for case in sol_doc()["cases"].as_array().unwrap() {
+        let bytes = message(case);
+        if parse_message(&bytes).is_ok_and(|m| m.format == Format::Legacy) {
+            assert_eq!(Draft::of(&bytes).bytes(), bytes, "{}", name(case));
+        }
+    }
+}
+
+/// The review cases, built from the messages of `solana.json`.
+struct Review<'d> {
+    doc: &'d Value,
+    cases: Vec<Value>,
+}
+
+impl<'d> Review<'d> {
+    fn base(&self, prefix: &str) -> &'d Value {
+        self.doc["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| name(c).starts_with(prefix))
+            .unwrap_or_else(|| panic!("no case {prefix:?}"))
+    }
+
+    fn draft(&self, base: &str) -> Draft {
+        Draft::of(&message(self.base(base)))
+    }
+
+    /// The draft of case `base` and the index of its one instruction of `program` whose data
+    /// starts with `prefix`.
+    fn at(&self, base: &str, program: Pubkey, prefix: &[u8]) -> (Draft, usize) {
+        let d = self.draft(base);
+        let i = d.find(program, prefix);
+        (d, i)
+    }
+
+    /// Adds `draft`, an edit of case `base` for review item `item`, which must get `answer`: a
+    /// refusal code, or `<kind> reduces_risk` / `<kind> running` for a message that passes.
+    fn add(&mut self, item: u32, case_name: &str, base: &str, draft: &Draft, answer: &str) {
+        let expect = match answer.split_once(' ') {
+            Some((kind, gate)) => serde_json::json!({
+                "ok": true,
+                "kind": kind,
+                "reduces_risk": gate == "reduces_risk",
+            }),
+            None => serde_json::json!({ "ok": false, "code": answer }),
+        };
+        assert!(
+            self.cases.iter().all(|c| c["name"] != case_name),
+            "{case_name} twice"
+        );
+        self.cases.push(serde_json::json!({
+            "name": case_name,
+            "review_item": item,
+            "base": name(self.base(base)),
+            "method": "sol_sign",
+            "message_hex": hex::encode(draft.bytes()),
+            "expect": expect,
+        }));
+    }
+}
+
+/// A named edit of an instruction (the draft, the instruction's index, the keys
+/// [`layout_cases`] hands it) and the code its message must get.
+type Edit = (
+    &'static str,
+    fn(&mut Draft, usize, &[Pubkey; 5]),
+    &'static str,
+);
+
+fn spline(orderbook: &Pubkey) -> Pubkey {
+    phoenix_spline_address(sha256, orderbook).unwrap()
+}
+
+/// Review item 1: every Phoenix instruction has its exact account list, with Phoenix's own
+/// accounts in their places and, for an order or a cancel, the spline derived from its
+/// orderbook.
+fn layout_cases(r: &mut Review<'_>) {
+    let doc = r.doc;
+    let book = |symbol: &str| key(&doc["markets"][symbol]["orderbook"]);
+    let (eth, sol) = (book("ETH"), book("SOL"));
+    let stranger = key(&doc["keys"]["strangerSol"]["public_key_b58"]);
+    let unlisted = {
+        let (d, i) = r.at(
+            "attack: order on an unknown market",
+            PHOENIX_PROGRAM,
+            &PLACE_MARKET_ORDER,
+        );
+        d.account(i, 8)
+    };
+    let desk = vector_desk(doc);
+
+    let buy = "IOC buy 0.005 ETH, limit 2474.5";
+    let order = |r: &Review<'_>| r.at(buy, PHOENIX_PROGRAM, &PLACE_MARKET_ORDER);
+    let (mut d, i) = order(r);
+    d.set_account(i, 8, unlisted)
+        .set_account(i, 9, spline(&unlisted))
+        .push_account(i, eth)
+        .push_account(i, spline(&eth));
+    r.add(
+        1,
+        "review 1: IOC buy on an unlisted orderbook and its spline, the ETH orderbook appended \
+         (12 accounts)",
+        buy,
+        &d,
+        E_SOL_ACCOUNT,
+    );
+    let edits: [Edit; 8] = [
+        (
+            "IOC buy with a trailing account (11)",
+            |d, i, k| {
+                d.push_account(i, k[0]);
+            },
+            E_SOL_ACCOUNT,
+        ),
+        (
+            "IOC buy without its spline (9 accounts)",
+            |d, i, _| {
+                d.remove_account(i, 9);
+            },
+            E_SOL_ACCOUNT,
+        ),
+        (
+            "IOC buy without the perp asset map (9 accounts)",
+            |d, i, _| {
+                d.remove_account(i, 5);
+            },
+            E_SOL_ACCOUNT,
+        ),
+        (
+            "IOC buy on the ETH orderbook with the SOL spline",
+            |d, i, k| {
+                d.set_account(i, 9, spline(&k[1]));
+            },
+            E_SOL_ACCOUNT,
+        ),
+        (
+            "IOC buy on an unlisted orderbook with its own spline",
+            |d, i, k| {
+                d.set_account(i, 8, k[2]).set_account(i, 9, spline(&k[2]));
+            },
+            E_ASSET,
+        ),
+        (
+            "IOC buy with the trader index and the trader buffer swapped",
+            |d, i, _| {
+                d.swap_accounts(i, 6, 7);
+            },
+            E_SOL_ACCOUNT,
+        ),
+        (
+            "IOC buy with another perp asset map",
+            |d, i, k| {
+                d.set_account(i, 5, k[3]);
+            },
+            E_SOL_ACCOUNT,
+        ),
+        (
+            "IOC buy naming another authority at accounts[3]",
+            |d, i, k| {
+                d.set_account(i, 3, k[3]);
+            },
+            E_SOL_ACCOUNT,
+        ),
+    ];
+    let k = [desk.usdc_ata, sol, unlisted, stranger, eth];
+    for (what, edit, code) in edits {
+        let (mut d, i) = order(r);
+        edit(&mut d, i, &k);
+        r.add(1, &format!("review 1: {what}"), buy, &d, code);
+    }
+    let sol_buy = "IOC buy 0.1 SOL, limit 104.84";
+    let (mut d, i) = r.at(sol_buy, PHOENIX_PROGRAM, &PLACE_MARKET_ORDER);
+    d.set_account(i, 8, eth);
+    r.add(
+        1,
+        "review 1: IOC buy sized for SOL on the ETH orderbook with the SOL spline",
+        sol_buy,
+        &d,
+        E_SOL_ACCOUNT,
+    );
+
+    let cancel = "cancel all ETH";
+    let edits: [Edit; 5] = [
+        (
+            "cancel_all with a trailing account (11)",
+            |d, i, k| {
+                d.push_account(i, k[0]);
+            },
+            E_SOL_ACCOUNT,
+        ),
+        (
+            "cancel_all without its spline (9 accounts)",
+            |d, i, _| {
+                d.remove_account(i, 9);
+            },
+            E_SOL_ACCOUNT,
+        ),
+        (
+            "cancel_all on the ETH orderbook with the SOL spline",
+            |d, i, k| {
+                d.set_account(i, 9, spline(&k[1]));
+            },
+            E_SOL_ACCOUNT,
+        ),
+        (
+            "cancel_all on an unlisted orderbook with its own spline",
+            |d, i, k| {
+                d.set_account(i, 8, k[2]).set_account(i, 9, spline(&k[2]));
+            },
+            E_ASSET,
+        ),
+        (
+            "cancel_all with a trailing data byte",
+            |d, i, _| d.ixs[i].2.push(0),
+            E_SOL_PROGRAM,
+        ),
+    ];
+    for (what, edit, code) in edits {
+        let (mut d, i) = r.at(cancel, PHOENIX_PROGRAM, &CANCEL_ALL);
+        edit(&mut d, i, &k);
+        r.add(1, &format!("review 1: {what}"), cancel, &d, code);
+    }
+
+    let deposit = "deposit 15 USDC";
+    let edits: [Edit; 3] = [
+        (
+            "deposit_funds with a trailing account (11)",
+            |d, i, k| {
+                d.push_account(i, k[3]);
+            },
+            E_SOL_ACCOUNT,
+        ),
+        (
+            "deposit_funds without the trader buffer (9 accounts)",
+            |d, i, _| {
+                d.remove_account(i, 9);
+            },
+            E_SOL_ACCOUNT,
+        ),
+        (
+            "deposit_funds with the PhUSD account and the trader swapped",
+            |d, i, _| {
+                d.swap_accounts(i, 4, 5);
+            },
+            E_SOL_ACCOUNT,
+        ),
+    ];
+    for (what, edit, code) in edits {
+        let (mut d, i) = r.at(deposit, PHOENIX_PROGRAM, &DEPOSIT_FUNDS);
+        edit(&mut d, i, &k);
+        r.add(1, &format!("review 1: {what}"), deposit, &d, code);
+    }
+
+    let withdraw = "withdraw 10 USDC";
+    let edits: [Edit; 3] = [
+        (
+            "withdraw_funds with a trailing account (13)",
+            |d, i, k| {
+                d.push_account(i, k[3]);
+            },
+            E_SOL_ACCOUNT,
+        ),
+        (
+            "withdraw_funds without the withdraw queue (11 accounts)",
+            |d, i, _| {
+                d.remove_account(i, 11);
+            },
+            E_SOL_ACCOUNT,
+        ),
+        (
+            "withdraw_funds with another withdraw queue",
+            |d, i, k| {
+                d.set_account(i, 11, k[3]);
+            },
+            E_SOL_ACCOUNT,
+        ),
+    ];
+    for (what, edit, code) in edits {
+        let (mut d, i) = r.at(withdraw, PHOENIX_PROGRAM, &WITHDRAW_FUNDS);
+        edit(&mut d, i, &k);
+        r.add(1, &format!("review 1: {what}"), withdraw, &d, code);
+    }
+}
+
+fn review_doc() -> Value {
+    let doc = sol_doc();
+    let mut r = Review {
+        doc: &doc,
+        cases: vec![],
+    };
+    layout_cases(&mut r);
+    serde_json::json!({
+        "file": "solana-review.json",
+        "note": "Review cases for the sol_sign policy. Each edits one message of solana.json, \
+                 named in base; the desk, markets and sol_sign context are solana.json's. Built \
+                 by core/tests/solana_vectors.rs (GIMBAL_BLESS=1 cargo test rewrites this file).",
+        "cases": r.cases,
+    })
+}
+
+/// `vectors/solana-review.json` is what [`review_doc`] builds; `GIMBAL_BLESS=1` rewrites it.
+#[test]
+fn the_review_vectors_are_the_edits_this_file_makes() {
+    let want = review_doc();
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/vectors/solana-review.json"
+    );
+    if std::env::var_os("GIMBAL_BLESS").is_some() {
+        std::fs::write(path, serde_json::to_string_pretty(&want).unwrap() + "\n").unwrap();
+    }
+    let got: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert!(
+        got == want,
+        "solana-review.json is stale: GIMBAL_BLESS=1 cargo test rewrites it"
+    );
+}
+
+#[test]
+fn every_review_case_gets_its_expected_answer() {
+    let doc = sol_doc();
+    let ctx = &doc["ctx"]["sol_sign"];
+    let (policy, desk, reference) = (vector_policy(ctx), vector_desk(&doc), reference_of(ctx));
+    let review: Value = serde_json::from_str(include_str!("vectors/solana-review.json")).unwrap();
+    let mut wrong = vec![];
+    for case in review["cases"].as_array().unwrap() {
+        let got = check_message(sha256, &policy, &desk, &message(case), &reference, None);
+        let e = &case["expect"];
+        let fine = match &got {
+            Ok(c) => e["ok"] == true && e["kind"] == c.kind && e["reduces_risk"] == c.reduces_risk,
+            Err(r) => e["code"] == r.code,
+        };
+        if !fine {
+            wrong.push(format!("{}: got {got:?}, want {e}", name(case)));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 fn base64_decode(s: &str) -> Vec<u8> {

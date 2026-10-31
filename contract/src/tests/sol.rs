@@ -1,6 +1,6 @@
 //! The Solana action methods on the mocked chain: every message of `core/tests/vectors/solana.json`
-//! through `sol_sign` and of `solana-onboarding.json` through `sol_sign_register`, the request
-//! they hand the MPC, and every guard on the way.
+//! and `solana-review.json` through `sol_sign` and of `solana-onboarding.json` through
+//! `sol_sign_register`, the request they hand the MPC, and every guard on the way.
 
 use super::*;
 use crate::action::UnsignedAction;
@@ -14,6 +14,10 @@ use near_sdk::base64::Engine as _;
 
 fn vectors() -> Value {
     serde_json::from_str(include_str!("../../core/tests/vectors/solana.json")).unwrap()
+}
+
+fn review() -> Value {
+    serde_json::from_str(include_str!("../../core/tests/vectors/solana-review.json")).unwrap()
 }
 
 fn onboarding() -> Value {
@@ -168,7 +172,7 @@ fn sol_sign_answers_every_vector_message_as_the_core_does_without_prices() {
     let (mut signed, mut stale, mut refused) = (0, 0, 0);
     for c in cases(&vectors()) {
         let bytes = bytes_of(&c);
-        let want = check_message(&policy, &accounts, &bytes, &|_| None, None);
+        let want = check_message(sha256, &policy, &accounts, &bytes, &|_| None, None);
         let got = sol_sign(&mut g, &bytes);
         let name = c["name"].as_str().unwrap();
         match (&want, &got) {
@@ -195,6 +199,34 @@ fn sol_sign_answers_every_vector_message_as_the_core_does_without_prices() {
     // 13 messages pass the vectors' policy with prices: 6 of them place priced orders and now
     // stop at the missing price, like the 3 the band or the cap refuses, and 2 are rescues.
     assert_eq!((signed, stale, refused), (5, 9, 48));
+}
+
+/// Every review case gets the core's answer too; each one the vectors refuse is refused with the
+/// code they name.
+#[test]
+fn sol_sign_answers_every_review_message_as_the_core_does() {
+    let mut g = sol_desk();
+    let policy = sol_policy();
+    let accounts = derived();
+    let mut refused = 0;
+    for c in cases(&review()) {
+        let bytes = bytes_of(&c);
+        let want = check_message(sha256, &policy, &accounts, &bytes, &|_| None, None);
+        let got = sol_sign(&mut g, &bytes);
+        let name = c["name"].as_str().unwrap();
+        match (&want, &got) {
+            (Ok(w), Ok(got)) => assert_signs(got, w.kind, &bytes, Some("vector")),
+            (Err(w), Err(got)) => {
+                assert_eq!(got, &core_refusal(w), "{name}");
+                if c["expect"]["ok"] == false {
+                    assert_eq!(c["expect"]["code"], w.code, "{name}");
+                    refused += 1;
+                }
+            }
+            _ => panic!("{name}: the core says {want:?}, the contract {got:?}"),
+        }
+    }
+    assert!(refused >= 21, "{refused}");
 }
 
 #[test]

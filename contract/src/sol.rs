@@ -80,7 +80,8 @@ impl Gimbal {
         let accounts = desk_accounts(desk).or_fail();
         let max_age_s = desk.policy.oracle_max_age_s;
         let reference = |symbol: &str| reference_price(symbol, max_age_s);
-        let checked = check_message(&desk.policy, &accounts, &message, &reference, None).or_fail();
+        let checked =
+            check_message(sha256, &desk.policy, &accounts, &message, &reference, None).or_fail();
         if !checked.reduces_risk {
             desk.check_action(&desk_id, &env::predecessor_account_id(), Gate::Running)
                 .or_fail();

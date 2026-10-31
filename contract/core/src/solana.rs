@@ -120,6 +120,13 @@ pub fn phoenix_trader_address(sha256: Sha256, authority: &Pubkey) -> Option<Pubk
     find_program_address(sha256, &seeds, &PHOENIX_PROGRAM).map(|(a, _)| a)
 }
 
+/// The spline collection of a Phoenix market: seeds `["spline", orderbook]`, as the Phoenix SDK
+/// derives it when the market metadata names none (it names none for ETH, SOL and BTC).
+pub fn phoenix_spline_address(sha256: Sha256, orderbook: &Pubkey) -> Option<Pubkey> {
+    let seeds: [&[u8]; 2] = [b"spline", orderbook];
+    find_program_address(sha256, &seeds, &PHOENIX_PROGRAM).map(|(a, _)| a)
+}
+
 /// The desk's Solana accounts, all derived from its authority (the MPC Ed25519 key).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SolDesk {

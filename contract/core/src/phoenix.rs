@@ -14,10 +14,10 @@ use crate::ids::decode_base58_32;
 use crate::limits::{check_value, Valued};
 use crate::policy::{PhoenixMarket, Policy};
 use crate::solana::{
-    associated_token_address, b58, check_transaction_size, parse_message, Format, Instruction,
-    Message, Pubkey, Sha256, SolDesk, ATA_PROGRAM, COMPUTE_BUDGET_PROGRAM, EMBER_AUTHORITY,
-    EMBER_PROGRAM, PHOENIX_ONBOARDER, PHOENIX_PROGRAM, PHUSD_MINT, SYSTEM_PROGRAM, TOKEN_PROGRAM,
-    USDC_MINT,
+    associated_token_address, b58, check_transaction_size, parse_message, phoenix_spline_address,
+    Format, Instruction, Message, Pubkey, Sha256, SolDesk, ATA_PROGRAM, COMPUTE_BUDGET_PROGRAM,
+    EMBER_AUTHORITY, EMBER_PROGRAM, PHOENIX_ONBOARDER, PHOENIX_PROGRAM, PHUSD_MINT, SYSTEM_PROGRAM,
+    TOKEN_PROGRAM, USDC_MINT,
 };
 
 /// The highest compute-unit limit a message may set.
@@ -77,6 +77,19 @@ pub const PHOENIX_GLOBAL_TRADER_INDEX: Pubkey = [
 pub const PHOENIX_ACTIVE_TRADER_BUFFER: Pubkey = [
     0x15, 0xc8, 0xaa, 0x92, 0x3d, 0xe3, 0x61, 0x0f, 0x99, 0x61, 0x2f, 0x3b, 0xf7, 0xb8, 0x64, 0x4c,
     0x37, 0x0c, 0x90, 0xf1, 0xbb, 0xed, 0x89, 0x08, 0x66, 0x17, 0xfe, 0xa5, 0x2e, 0x50, 0x8e, 0x13,
+];
+/// `2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC`, the perp asset map Phoenix's global
+/// configuration names (the SDK reads it from there; accounts[5] of an order, a cancel and a
+/// withdrawal).
+pub const PHOENIX_PERP_ASSET_MAP: Pubkey = [
+    0x1a, 0x75, 0x35, 0xd1, 0xdc, 0x09, 0xee, 0xe8, 0xf9, 0x4e, 0x8d, 0x3e, 0x78, 0xaa, 0xe7, 0x24,
+    0x52, 0xac, 0xed, 0xd0, 0xd0, 0xec, 0x9b, 0xda, 0xe5, 0xd0, 0x3f, 0xd0, 0x33, 0x25, 0x48, 0xd1,
+];
+/// `3c3NTwpg7yW91FxijkHBXwVH1xUifun3Z8TC5eW5Si3K`, the withdraw queue the global configuration
+/// names (as above; the last account of a withdrawal).
+pub const PHOENIX_WITHDRAW_QUEUE: Pubkey = [
+    0x26, 0xb1, 0x61, 0xcc, 0x85, 0xc0, 0xe0, 0x4b, 0x39, 0xf7, 0x7e, 0xaf, 0xe4, 0x98, 0x0c, 0xad,
+    0x32, 0x2f, 0x85, 0xc6, 0xd0, 0x36, 0xe7, 0x65, 0x4f, 0x63, 0x67, 0xaa, 0x8a, 0x64, 0x8c, 0xd2,
 ];
 
 /// `register_trader` exactly as Phoenix builds it for the desk: max positions 128, preference
@@ -173,6 +186,33 @@ fn accounts<'m>(ix: &'m Instruction<'_>, n: usize, count: usize) -> Result<&'m [
         ));
     }
     Ok(&ix.accounts)
+}
+
+/// The instruction's accounts if there are exactly `count` (`E_SOL_ACCOUNT` otherwise): a
+/// program reads its accounts by position, so one more or one less moves every account after it.
+fn exactly<'m>(ix: &'m Instruction<'_>, n: usize, count: usize) -> Result<&'m [Pubkey], Refusal> {
+    if ix.accounts.len() != count {
+        return Err(at(
+            n,
+            E_SOL_ACCOUNT,
+            format!("{} accounts, exactly {count} expected", ix.accounts.len()),
+        ));
+    }
+    Ok(&ix.accounts)
+}
+
+/// Every `(index, key, what)` of `layout` holds its key (`E_SOL_ACCOUNT` otherwise).
+fn pinned(a: &[Pubkey], n: usize, layout: &[(usize, Pubkey, &str)]) -> Result<(), Refusal> {
+    for &(i, key, what) in layout {
+        if a[i] != key {
+            return Err(at(
+                n,
+                E_SOL_ACCOUNT,
+                format!("account {i} is {}, not {what} {}", b58(&a[i]), b58(&key)),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn le_u64(bytes: &[u8]) -> u64 {
@@ -331,6 +371,7 @@ fn decode_ioc(packet: &[u8], n: usize) -> Result<Ioc, Refusal> {
 }
 
 struct Walk<'a> {
+    sha256: Sha256,
     policy: &'a Policy,
     desk: &'a SolDesk,
     reference: &'a dyn Fn(&str) -> Option<u128>,
@@ -343,7 +384,7 @@ struct Walk<'a> {
     withdraws: bool,
 }
 
-impl Walk<'_> {
+impl<'a> Walk<'a> {
     fn instruction(&mut self, ix: &Instruction<'_>, n: usize) -> Result<(), Refusal> {
         match ix.program {
             COMPUTE_BUDGET_PROGRAM => self.budget.check(ix.data, n),
@@ -531,6 +572,18 @@ impl Walk<'_> {
         Ok(())
     }
 
+    /// The four Phoenix instructions, each with its exact account list as the Phoenix SDK builds
+    /// it (one global trader index and one active trader buffer arena):
+    ///
+    /// - `place_market_order` and `cancel_all`, 10 accounts: program, log authority, global
+    ///   configuration, desk authority, trader, perp asset map, global trader index, active
+    ///   trader buffer, orderbook (a market of the policy, `E_ASSET`), its spline collection;
+    /// - `deposit_funds`, 10: program, log authority, global configuration, desk authority, desk
+    ///   PhUSD account, trader, global vault, token program, global trader index, active trader
+    ///   buffer;
+    /// - `withdraw_funds`, 12: program, log authority, global configuration, desk authority,
+    ///   trader, perp asset map, global vault, desk PhUSD account, token program, global trader
+    ///   index, active trader buffer, withdraw queue.
     fn phoenix(&mut self, ix: &Instruction<'_>, n: usize) -> Result<(), Refusal> {
         let d = *self.desk;
         let disc: [u8; 8] = ix
@@ -538,61 +591,104 @@ impl Walk<'_> {
             .get(..8)
             .and_then(|s| s.try_into().ok())
             .unwrap_or_default();
-        let trader_at = |a: &[Pubkey], i: usize| {
-            if a[i] == d.trader {
-                Ok(())
-            } else {
-                Err(at(
-                    n,
-                    E_SOL_ACCOUNT,
-                    format!(
-                        "trader account {} is not the desk's, {}",
-                        b58(&a[i]),
-                        b58(&d.trader)
-                    ),
-                ))
-            }
-        };
+        let head = [
+            (0, PHOENIX_PROGRAM, "the Phoenix program"),
+            (1, PHOENIX_LOG_AUTHORITY, "Phoenix's log authority"),
+            (
+                2,
+                PHOENIX_GLOBAL_CONFIGURATION,
+                "Phoenix's global configuration",
+            ),
+            (3, d.authority, "the desk authority"),
+        ];
+        let trader = "the desk's trader account";
+        let phusd = "the desk's PhUSD account";
+        let index = "Phoenix's global trader index";
+        let buffer = "Phoenix's active trader buffer";
+        let malformed = |what: &str| at(n, E_SOL_PROGRAM, format!("a malformed {what}"));
         match disc {
-            PLACE_MARKET_ORDER => {
-                if ix.data.get(8) != Some(&IOC_VARIANT) {
+            PLACE_MARKET_ORDER | CANCEL_ALL => {
+                let is_order = disc == PLACE_MARKET_ORDER;
+                if is_order && ix.data.get(8) != Some(&IOC_VARIANT) {
                     return Err(at(
                         n,
                         E_SOL_PROGRAM,
                         "only immediate-or-cancel orders (packet variant 2) are allowed",
                     ));
                 }
-                let a = accounts(ix, n, 6)?;
-                trader_at(a, 4)?;
-                let order = self.order(ix, a[a.len() - 2], n)?;
-                self.orders.push(order);
-            }
-            CANCEL_ALL => {
-                trader_at(accounts(ix, n, 5)?, 4)?;
-                self.phoenix.get_or_insert("cancel_all");
-            }
-            DEPOSIT_FUNDS => {
-                let a = accounts(ix, n, 6)?;
-                if a[4] != d.phusd_ata {
-                    return Err(at(
+                if !is_order && ix.data.len() != 8 {
+                    return Err(malformed("cancel_all"));
+                }
+                let a = exactly(ix, n, 10)?;
+                pinned(a, n, &head)?;
+                pinned(
+                    a,
+                    n,
+                    &[
+                        (4, d.trader, trader),
+                        (5, PHOENIX_PERP_ASSET_MAP, "Phoenix's perp asset map"),
+                        (6, PHOENIX_GLOBAL_TRADER_INDEX, index),
+                        (7, PHOENIX_ACTIVE_TRADER_BUFFER, buffer),
+                    ],
+                )?;
+                let market = self.market(&a[8], n)?;
+                let spline = phoenix_spline_address(self.sha256, &a[8]).ok_or_else(|| {
+                    at(
                         n,
                         E_SOL_ACCOUNT,
-                        "a Phoenix deposit must come from the desk's PhUSD account",
-                    ));
+                        format!("no spline collection address for orderbook {}", b58(&a[8])),
+                    )
+                })?;
+                pinned(
+                    a,
+                    n,
+                    &[(9, spline, "the spline collection of that orderbook")],
+                )?;
+                if is_order {
+                    let order = self.order(ix, market, n)?;
+                    self.orders.push(order);
+                } else {
+                    self.phoenix.get_or_insert("cancel_all");
                 }
-                trader_at(a, 5)?;
+            }
+            DEPOSIT_FUNDS => {
+                if ix.data.len() != 16 {
+                    return Err(malformed("deposit_funds"));
+                }
+                let a = exactly(ix, n, 10)?;
+                pinned(a, n, &head)?;
+                pinned(
+                    a,
+                    n,
+                    &[
+                        (4, d.phusd_ata, phusd),
+                        (5, d.trader, trader),
+                        (7, TOKEN_PROGRAM, "the token program"),
+                        (8, PHOENIX_GLOBAL_TRADER_INDEX, index),
+                        (9, PHOENIX_ACTIVE_TRADER_BUFFER, buffer),
+                    ],
+                )?;
                 self.phoenix.get_or_insert("deposit");
             }
             WITHDRAW_FUNDS => {
-                let a = accounts(ix, n, 8)?;
-                trader_at(a, 4)?;
-                if a[7] != d.phusd_ata {
-                    return Err(at(
-                        n,
-                        E_SOL_ACCOUNT,
-                        "a Phoenix withdrawal must land in the desk's PhUSD account",
-                    ));
+                if ix.data.len() != 16 {
+                    return Err(malformed("withdraw_funds"));
                 }
+                let a = exactly(ix, n, 12)?;
+                pinned(a, n, &head)?;
+                pinned(
+                    a,
+                    n,
+                    &[
+                        (4, d.trader, trader),
+                        (5, PHOENIX_PERP_ASSET_MAP, "Phoenix's perp asset map"),
+                        (7, d.phusd_ata, phusd),
+                        (8, TOKEN_PROGRAM, "the token program"),
+                        (9, PHOENIX_GLOBAL_TRADER_INDEX, index),
+                        (10, PHOENIX_ACTIVE_TRADER_BUFFER, buffer),
+                        (11, PHOENIX_WITHDRAW_QUEUE, "Phoenix's withdraw queue"),
+                    ],
+                )?;
                 self.withdraws = true;
                 self.phoenix.get_or_insert("withdraw");
             }
@@ -607,30 +703,29 @@ impl Walk<'_> {
         Ok(())
     }
 
-    /// An IOC order on `orderbook`: a market of the policy (`E_ASSET`), a well-formed packet, a
-    /// price limit (`E_PRICE_BAND` without one), then the checks every order makes
-    /// ([`check_value`]).
-    fn order(
-        &self,
-        ix: &Instruction<'_>,
-        orderbook: Pubkey,
-        n: usize,
-    ) -> Result<PhoenixOrder, Refusal> {
-        let market: &PhoenixMarket = self
-            .policy
+    /// The policy's market on `orderbook` (`E_ASSET` if there is none).
+    fn market(&self, orderbook: &Pubkey, n: usize) -> Result<&'a PhoenixMarket, Refusal> {
+        self.policy
             .phoenix_markets
             .iter()
-            .find(|m| decode_base58_32(&m.orderbook) == Some(orderbook))
+            .find(|m| decode_base58_32(&m.orderbook).as_ref() == Some(orderbook))
             .ok_or_else(|| {
                 at(
                     n,
                     E_ASSET,
-                    format!(
-                        "orderbook {} is not a market of the policy",
-                        b58(&orderbook)
-                    ),
+                    format!("orderbook {} is not a market of the policy", b58(orderbook)),
                 )
-            })?;
+            })
+    }
+
+    /// An IOC order on `market`: a well-formed packet, a price limit (`E_PRICE_BAND` without
+    /// one), then the checks every order makes ([`check_value`]).
+    fn order(
+        &self,
+        ix: &Instruction<'_>,
+        market: &PhoenixMarket,
+        n: usize,
+    ) -> Result<PhoenixOrder, Refusal> {
         let ioc = decode_ioc(&ix.data[9..], n)?;
         let ticks = ioc.price_in_ticks.ok_or_else(|| {
             at(
@@ -675,14 +770,17 @@ impl Walk<'_> {
 ///   `TransferChecked` into a desk token account (in a rescue also exactly one `TransferChecked` of
 ///   `amount_in` USDC into the deposit owner's account created before it, else `E_QUOTE_FIELDS`);
 /// - Ember deposit and withdraw between the desk's USDC and PhUSD accounts;
-/// - Phoenix: `place_market_order` (immediate-or-cancel only, the desk's trader account, a market of
-///   the policy, a price limit, then [`check_value`] at the `reference` price), `cancel_all`,
-///   `deposit_funds` and `withdraw_funds` on the desk's own accounts.
+/// - Phoenix: `place_market_order` (immediate-or-cancel only, a market of the policy, a price
+///   limit, then [`check_value`] at the `reference` price), `cancel_all`, `deposit_funds` and
+///   `withdraw_funds`, each with its exact account list: the desk's own accounts, Phoenix's
+///   pinned ones and, for an order or a cancel, the orderbook with the spline collection derived
+///   from it (`sha256` derives it).
 ///
 /// A program outside this list, another instruction of these programs or a value over a cap is
-/// `E_SOL_PROGRAM`, an account the desk does not own `E_SOL_ACCOUNT`, a market outside the policy
-/// `E_ASSET`.
+/// `E_SOL_PROGRAM`, an account the desk does not own or out of its place `E_SOL_ACCOUNT`, a
+/// market outside the policy `E_ASSET`.
 pub fn check_message(
+    sha256: Sha256,
     policy: &Policy,
     desk: &SolDesk,
     message: &[u8],
@@ -699,6 +797,7 @@ pub fn check_message(
     check_transaction_size(message.len(), 1)?;
     check_signers(&m, 1, &desk.authority)?;
     let mut walk = Walk {
+        sha256,
         policy,
         desk,
         reference,
