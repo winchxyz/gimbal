@@ -11,15 +11,17 @@ use gimbal_core::phoenix::{
     check_message, check_onboarding, check_registration, Onboarding, Rescue, CANCEL_ALL,
     DEPOSIT_FUNDS, EMBER_DEPOSIT, EMBER_WITHDRAW, MAX_COMPUTE_UNIT_LIMIT, MAX_COMPUTE_UNIT_PRICE,
     MAX_PRIORITY_FEE_LAMPORTS, PHOENIX_ACTIVE_TRADER_BUFFER, PHOENIX_GLOBAL_CONFIGURATION,
-    PHOENIX_GLOBAL_TRADER_INDEX, PHOENIX_LOG_AUTHORITY, PHOENIX_ONBOARDING_PERMISSION,
-    PHOENIX_PERP_ASSET_MAP, PHOENIX_RISK_AUTHORITY, PHOENIX_WITHDRAW_QUEUE, PLACE_MARKET_ORDER,
-    REGISTER_TRADER, SET_TRADER_CAPABILITIES_DELEGATED, WITHDRAW_FUNDS,
+    PHOENIX_GLOBAL_TRADER_INDEX, PHOENIX_GLOBAL_VAULT, PHOENIX_LOG_AUTHORITY,
+    PHOENIX_ONBOARDING_PERMISSION, PHOENIX_PERP_ASSET_MAP, PHOENIX_RISK_AUTHORITY,
+    PHOENIX_WITHDRAW_QUEUE, PLACE_MARKET_ORDER, REGISTER_TRADER, SET_TRADER_CAPABILITIES_DELEGATED,
+    WITHDRAW_FUNDS,
 };
 use gimbal_core::policy::{PhoenixMarket, Policy, UnpricedAsset};
 use gimbal_core::solana::{
     find_program_address, parse_message, phoenix_spline_address, phoenix_trader_address, Format,
     Pubkey, SolDesk, ATA_PROGRAM, COMPUTE_BUDGET_PROGRAM, EMBER_AUTHORITY, EMBER_PROGRAM,
-    PHOENIX_ONBOARDER, PHOENIX_PROGRAM, PHUSD_MINT, SYSTEM_PROGRAM, TOKEN_PROGRAM, USDC_MINT,
+    EMBER_VAULT, PHOENIX_ONBOARDER, PHOENIX_PROGRAM, PHUSD_MINT, SYSTEM_PROGRAM, TOKEN_PROGRAM,
+    USDC_MINT,
 };
 use gimbal_core::Refusal;
 use serde_json::Value;
@@ -516,6 +518,14 @@ fn the_pinned_phoenix_accounts_are_their_program_addresses() {
     };
     assert_eq!(pda(&[b"log"]), PHOENIX_LOG_AUTHORITY);
     assert_eq!(pda(&[b"global"]), PHOENIX_GLOBAL_CONFIGURATION);
+    assert_eq!(pda(&[b"vault", &PHUSD_MINT]), PHOENIX_GLOBAL_VAULT);
+    let ember = |seed: &[u8]| {
+        find_program_address(sha256, &[&PHOENIX_PROGRAM, seed], &EMBER_PROGRAM)
+            .unwrap()
+            .0
+    };
+    assert_eq!(ember(b"state"), EMBER_AUTHORITY);
+    assert_eq!(ember(b"vault"), EMBER_VAULT);
     assert_eq!(
         pda(&[b"permission", &PHOENIX_RISK_AUTHORITY, &PHOENIX_ONBOARDER]),
         PHOENIX_ONBOARDING_PERMISSION
@@ -550,17 +560,26 @@ fn the_pinned_phoenix_accounts_are_their_program_addresses() {
 #[test]
 fn the_vectors_put_the_pinned_and_derived_accounts_in_their_places() {
     let doc = sol_doc();
-    let mut seen = [0; 3];
+    let mut seen = [0; 4];
     for case in doc["cases"].as_array().unwrap() {
         if case["expect"]["ok"] != true {
             continue;
         }
         let bytes = message(case);
         for ix in parse_message(&bytes).unwrap().instructions {
+            let a = &ix.accounts;
+            if ix.program == EMBER_PROGRAM {
+                assert_eq!(
+                    (a[1], a[6]),
+                    (EMBER_AUTHORITY, EMBER_VAULT),
+                    "{}",
+                    name(case)
+                );
+                seen[3] += 1;
+            }
             if ix.program != PHOENIX_PROGRAM {
                 continue;
             }
-            let a = &ix.accounts;
             if ix.data.starts_with(&PLACE_MARKET_ORDER) || ix.data.starts_with(&CANCEL_ALL) {
                 assert_eq!(a[5], PHOENIX_PERP_ASSET_MAP, "{}", name(case));
                 assert_eq!(a[9], spline(&a[8]), "{}", name(case));
@@ -568,13 +587,15 @@ fn the_vectors_put_the_pinned_and_derived_accounts_in_their_places() {
             } else if ix.data.starts_with(&WITHDRAW_FUNDS) {
                 assert_eq!(a[5], PHOENIX_PERP_ASSET_MAP, "{}", name(case));
                 assert_eq!(a[11], PHOENIX_WITHDRAW_QUEUE, "{}", name(case));
+                assert_eq!(a[6], PHOENIX_GLOBAL_VAULT, "{}", name(case));
                 seen[1] += 1;
             } else if ix.data.starts_with(&DEPOSIT_FUNDS) {
+                assert_eq!(a[6], PHOENIX_GLOBAL_VAULT, "{}", name(case));
                 seen[2] += 1;
             }
         }
     }
-    assert_eq!(seen, [8, 2, 1]);
+    assert_eq!(seen, [8, 2, 1, 3]);
 }
 
 #[test]
@@ -1413,6 +1434,108 @@ fn the_priority_fee_is_capped_by_the_limit_and_the_price_together() {
     assert_eq!(1_400_000 * MAX_COMPUTE_UNIT_PRICE / 1_000_000, 1_400_000);
 }
 
+/// Review item 4: Phoenix's vault in a deposit and a withdrawal, and every account of an Ember
+/// wrap and unwrap, Ember's state and vault among them, in their places.
+fn vault_cases(r: &mut Review<'_>) {
+    let doc = r.doc;
+    let stranger = key(&doc["keys"]["strangerSol"]["public_key_b58"]);
+    let usdc_vault = find_program_address(sha256, &[b"vault", &USDC_MINT], &PHOENIX_PROGRAM)
+        .unwrap()
+        .0;
+    let (deposit, withdraw) = ("deposit 15 USDC", "withdraw 10 USDC");
+    let (mut d, i) = r.at(deposit, PHOENIX_PROGRAM, &DEPOSIT_FUNDS);
+    d.set_account(i, 6, usdc_vault);
+    r.add(
+        4,
+        "review 4: deposit_funds into the USDC vault",
+        deposit,
+        &d,
+        E_SOL_ACCOUNT,
+    );
+    let (mut d, i) = r.at(withdraw, PHOENIX_PROGRAM, &WITHDRAW_FUNDS);
+    d.set_account(i, 6, stranger);
+    r.add(
+        4,
+        "review 4: withdraw_funds from another vault",
+        withdraw,
+        &d,
+        E_SOL_ACCOUNT,
+    );
+    let edits: [Edit; 7] = [
+        (
+            "Ember wrap with another state",
+            |d, i, k| {
+                d.set_account(i, 1, k[3]);
+            },
+            E_SOL_ACCOUNT,
+        ),
+        (
+            "Ember wrap into another vault",
+            |d, i, k| {
+                d.set_account(i, 6, k[3]);
+            },
+            E_SOL_ACCOUNT,
+        ),
+        (
+            "Ember wrap with the mints swapped",
+            |d, i, _| {
+                d.swap_accounts(i, 2, 3);
+            },
+            E_SOL_ACCOUNT,
+        ),
+        (
+            "Ember wrap with another token program",
+            |d, i, k| {
+                d.set_account(i, 7, k[3]);
+            },
+            E_SOL_ACCOUNT,
+        ),
+        (
+            "Ember wrap with a trailing account (9)",
+            |d, i, k| {
+                d.push_account(i, k[3]);
+            },
+            E_SOL_ACCOUNT,
+        ),
+        (
+            "Ember wrap without the token program (7 accounts)",
+            |d, i, _| {
+                d.remove_account(i, 7);
+            },
+            E_SOL_ACCOUNT,
+        ),
+        (
+            "Ember wrap with a trailing data byte",
+            |d, i, _| d.ixs[i].2.push(0),
+            E_SOL_PROGRAM,
+        ),
+    ];
+    let k = [stranger; 5];
+    for (what, edit, code) in edits {
+        let (mut d, i) = r.at(deposit, EMBER_PROGRAM, &EMBER_DEPOSIT);
+        edit(&mut d, i, &k);
+        r.add(4, &format!("review 4: {what}"), deposit, &d, code);
+    }
+    let (mut d, i) = r.at(withdraw, EMBER_PROGRAM, &EMBER_WITHDRAW);
+    d.set_account(i, 6, stranger);
+    r.add(
+        4,
+        "review 4: Ember unwrap from another vault",
+        withdraw,
+        &d,
+        E_SOL_ACCOUNT,
+    );
+    let (mut d, i) = r.at(withdraw, EMBER_PROGRAM, &EMBER_WITHDRAW);
+    d.set_account(i, 1, stranger);
+    r.add(
+        4,
+        "review 4: Ember unwrap with another state",
+        withdraw,
+        &d,
+        E_SOL_ACCOUNT,
+    );
+}
+
 fn review_doc() -> Value {
     let doc = sol_doc();
     let mut r = Review {
@@ -1422,6 +1545,7 @@ fn review_doc() -> Value {
     layout_cases(&mut r);
     approval_cases(&mut r);
     budget_cases(&mut r);
+    vault_cases(&mut r);
     serde_json::json!({
         "file": "solana-review.json",
         "note": "Review cases for the sol_sign policy. Each edits one message of solana.json, \

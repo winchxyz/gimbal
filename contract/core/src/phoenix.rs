@@ -16,8 +16,8 @@ use crate::policy::{PhoenixMarket, Policy};
 use crate::solana::{
     associated_token_address, b58, check_transaction_size, parse_message, phoenix_spline_address,
     Format, Instruction, Message, Pubkey, Sha256, SolDesk, ATA_PROGRAM, COMPUTE_BUDGET_PROGRAM,
-    EMBER_AUTHORITY, EMBER_PROGRAM, PHOENIX_ONBOARDER, PHOENIX_PROGRAM, PHUSD_MINT, SYSTEM_PROGRAM,
-    TOKEN_PROGRAM, USDC_MINT,
+    EMBER_AUTHORITY, EMBER_PROGRAM, EMBER_VAULT, PHOENIX_ONBOARDER, PHOENIX_PROGRAM, PHUSD_MINT,
+    SYSTEM_PROGRAM, TOKEN_PROGRAM, USDC_MINT,
 };
 
 /// The highest compute-unit limit a message may set.
@@ -81,6 +81,12 @@ pub const PHOENIX_GLOBAL_TRADER_INDEX: Pubkey = [
 pub const PHOENIX_ACTIVE_TRADER_BUFFER: Pubkey = [
     0x15, 0xc8, 0xaa, 0x92, 0x3d, 0xe3, 0x61, 0x0f, 0x99, 0x61, 0x2f, 0x3b, 0xf7, 0xb8, 0x64, 0x4c,
     0x37, 0x0c, 0x90, 0xf1, 0xbb, 0xed, 0x89, 0x08, 0x66, 0x17, 0xfe, 0xa5, 0x2e, 0x50, 0x8e, 0x13,
+];
+/// `csZXgw2G58hbiWc9ndxaxrQVYVvqdXgQzYLuznEzHJu`, Phoenix's global vault for PhUSD, the
+/// canonical mint: PDA `["vault", PhUSD mint]` (accounts[6] of a deposit and a withdrawal).
+pub const PHOENIX_GLOBAL_VAULT: Pubkey = [
+    0x09, 0x30, 0x7f, 0x65, 0xf1, 0xeb, 0xe9, 0xfa, 0x1a, 0x51, 0x23, 0xbc, 0xca, 0xb4, 0xf8, 0x89,
+    0x15, 0xce, 0x74, 0xbe, 0x6f, 0x1e, 0x7f, 0x7d, 0x1b, 0x73, 0x3f, 0x94, 0x11, 0xd3, 0xeb, 0x66,
 ];
 /// `2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC`, the perp asset map Phoenix's global
 /// configuration names (the SDK reads it from there; accounts[5] of an order, a cancel and a
@@ -632,6 +638,9 @@ impl<'a> Walk<'a> {
         )
     }
 
+    /// Ember deposit (a wrap of USDC into PhUSD) and withdraw (the unwrap back), both with the
+    /// 8 accounts the SDK gives them: desk authority, Ember's state, the USDC and PhUSD mints,
+    /// the desk's USDC and PhUSD accounts, Ember's vault, the token program.
     fn ember(&mut self, ix: &Instruction<'_>, n: usize) -> Result<(), Refusal> {
         let disc = ix.data.get(..8);
         if disc != Some(&EMBER_DEPOSIT[..]) && disc != Some(&EMBER_WITHDRAW[..]) {
@@ -641,14 +650,24 @@ impl<'a> Walk<'a> {
                 "only Ember deposit and withdraw are allowed",
             ));
         }
-        let a = accounts(ix, n, 6)?;
-        if a[4] != self.desk.usdc_ata || a[5] != self.desk.phusd_ata {
-            return Err(at(
-                n,
-                E_SOL_ACCOUNT,
-                "Ember must convert between the desk's own USDC and PhUSD accounts",
-            ));
+        if disc == Some(&EMBER_DEPOSIT[..]) && ix.data.len() != 16 {
+            return Err(at(n, E_SOL_PROGRAM, "a malformed Ember deposit"));
         }
+        let d = self.desk;
+        pinned(
+            exactly(ix, n, 8)?,
+            n,
+            &[
+                (0, d.authority, "the desk authority"),
+                (1, EMBER_AUTHORITY, "Ember's state"),
+                (2, USDC_MINT, "the USDC mint"),
+                (3, PHUSD_MINT, "the PhUSD mint"),
+                (4, d.usdc_ata, "the desk's USDC account"),
+                (5, d.phusd_ata, "the desk's PhUSD account"),
+                (6, EMBER_VAULT, "Ember's vault"),
+                (7, TOKEN_PROGRAM, "the token program"),
+            ],
+        )?;
         if disc == Some(&EMBER_WITHDRAW[..]) {
             // An Option<u64>: 1 and the amount, or 0 for the whole balance.
             let amount = match (ix.data.get(8), ix.data.len()) {
@@ -706,6 +725,7 @@ impl<'a> Walk<'a> {
         let phusd = "the desk's PhUSD account";
         let index = "Phoenix's global trader index";
         let buffer = "Phoenix's active trader buffer";
+        let vault = "Phoenix's PhUSD vault";
         let malformed = |what: &str| at(n, E_SOL_PROGRAM, format!("a malformed {what}"));
         match disc {
             PLACE_MARKET_ORDER | CANCEL_ALL => {
@@ -764,6 +784,7 @@ impl<'a> Walk<'a> {
                     &[
                         (4, d.phusd_ata, phusd),
                         (5, d.trader, trader),
+                        (6, PHOENIX_GLOBAL_VAULT, vault),
                         (7, TOKEN_PROGRAM, "the token program"),
                         (8, PHOENIX_GLOBAL_TRADER_INDEX, index),
                         (9, PHOENIX_ACTIVE_TRADER_BUFFER, buffer),
@@ -784,6 +805,7 @@ impl<'a> Walk<'a> {
                     &[
                         (4, d.trader, trader),
                         (5, PHOENIX_PERP_ASSET_MAP, "Phoenix's perp asset map"),
+                        (6, PHOENIX_GLOBAL_VAULT, vault),
                         (7, d.phusd_ata, phusd),
                         (8, TOKEN_PROGRAM, "the token program"),
                         (9, PHOENIX_GLOBAL_TRADER_INDEX, index),
@@ -874,7 +896,7 @@ impl<'a> Walk<'a> {
 ///   desk token account (in a rescue also exactly one `TransferChecked` of `amount_in` USDC into
 ///   the deposit owner's account created before it, else `E_QUOTE_FIELDS`);
 /// - Ember deposit and withdraw (an unwrap of an amount, or of the whole balance) between the
-///   desk's USDC and PhUSD accounts;
+///   desk's USDC and PhUSD accounts, with Ember's state and vault in their places;
 /// - Phoenix: `place_market_order` (immediate-or-cancel only, a market of the policy, a price
 ///   limit, then [`check_value`] at the `reference` price), `cancel_all`, `deposit_funds` and
 ///   `withdraw_funds`, each with its exact account list: the desk's own accounts, Phoenix's
