@@ -162,7 +162,13 @@ async function run(): Promise<void> {
     values.fail === 'hyperliquid' ? failing(hl) : hl,
     values.fail === 'orderly' ? failing(orderly) : orderly,
   ];
-  trader = new PairTrader({ legs, log, priceBandBps: desk.policy.price_band_bps });
+  trader = new PairTrader({
+    legs, log, priceBandBps: desk.policy.price_band_bps,
+    // An alert the watch raises, or raises again (an order with no answer whose window ended), reaches the operator.
+    onWatch: (w) => {
+      if (w.status === 'unhedged') alert(`watch: ${w.notes.join('; ')}`);
+    },
+  });
   // A session that dies while Orderly orders can still be replayed is opened again (one more signature); its seed
   // read goes through positionPushed like a push, so a copy that landed while it was down is still checked.
   const watchedTrader = trader;
@@ -179,7 +185,7 @@ async function run(): Promise<void> {
 
   if (values['close-only']) {
     print('close', await trader.close({ reason: 'pair-live: close' }));
-    await finish(hl, stream);
+    await finish(hl, stream, watchedTrader);
     return;
   }
   log(`open ${values.size} ETH: long ${values.long}${values.fail === undefined ? '' : `, ${values.fail} forced to fail`}`);
@@ -217,11 +223,14 @@ async function run(): Promise<void> {
     print('close', closed);
   }
 
-  await finish(hl, stream);
+  await finish(hl, stream, watchedTrader);
 }
 
-/** Both venues' final positions from their own state: Hyperliquid's clearinghouse, Orderly's last push or read. */
-async function finish(hl: HlLeg, stream: OrderlyAccountStream): Promise<void> {
+/**
+ * Both venues' final positions from their own state: Hyperliquid's clearinghouse, Orderly's last push or read. The
+ * trader's watch ends with this process: an alert that stands, or an order that may still run, is said once more.
+ */
+async function finish(hl: HlLeg, stream: OrderlyAccountStream, trader: PairTrader): Promise<void> {
   await sleep(2000);
   const [hlFinal, orderlyFinal] = await Promise.all([
     hl.position(),
@@ -232,7 +241,20 @@ async function finish(hl: HlLeg, stream: OrderlyAccountStream): Promise<void> {
   log(`final positions: Hyperliquid ${HL_COIN} ${signedQtyString(hlFinal)}; Orderly ${ORDERLY_SYMBOL} ${orderlyFinal}`);
   stopKeepUp();
   stream.close();
+  trader.stop();
+  if (trader.unhedged !== null) alert(trader.unhedged);
+  for (const leg of trader.legs) {
+    const u = trader.unsettled(leg);
+    if (u === null) continue;
+    alert(`${leg.venue} ${u.ref.side} ${u.ref.size} (${u.ref.clientId ?? u.ref.orderId ?? 'no id'}) has no answer and may still run until ${new Date(u.until).toISOString()}; its watch ends with this process: check ${leg.venue} ${leg.symbol} by hand until then`);
+  }
   if (hlFinal !== 0n || !orderlyFinal.startsWith('0 ')) process.exitCode = 1;
+}
+
+/** The owner must act: on stderr, and the run fails. */
+function alert(line: string): void {
+  console.error(`[${TAG} ${new Date().toISOString()}] ALERT ${line}`);
+  process.exitCode = 1;
 }
 
 /** The leg with its opening orders refused before signing (reduce-only closes still go out). */

@@ -10,15 +10,18 @@
 // sent for it. A Hyperliquid order is read only once no copy of it can execute any more (after the expiresAfter of
 // its signed payload); one without a known expiry (C5, or an MPC timeout: no payload) may land at any time, so it is
 // never retried: its partner goes back reduce-only and the pair is stuck. If a read fails, the pair stops: nothing
-// more is sent for either leg, and the result says why.
+// more is sent for either leg, and the result says why. A position that cannot be read counts as open: the pair is
+// unhedged until it reads again.
 //
-// Unsettled orders: such an order (no answer, no expiry, not run when read) can still run until Hyperliquid's nonce
-// window ends, 2 days after it was signed. Its leg stays watched until then: read every 15 s (nothing pushes
-// Hyperliquid positions), and a move away from where the trader left it means the order ran, after which the leg is
-// reconciled against the pair's intent like a replayed copy. The pair means that leg to offset its partner. A move
-// that stops with one leg not offset (a close whose Orderly leg is flat while the Hyperliquid reduce-only has no
-// answer) is unhedged: the result says so and `unhedged` is set; the watch clears it once the order runs and the
-// pair offsets again, and raises it again when the window ends with the order never run.
+// Unsettled orders: such an order (no answer, no expiry, not run when read, or not read at all) can still run until
+// Hyperliquid's nonce window ends, 2 days after it was signed. Its leg stays watched until then, whatever the leg
+// holds meanwhile: read every 15 s (nothing pushes Hyperliquid positions), and a move away from where the order left
+// it means the order ran, after which the leg is reconciled against the pair's intent like a replayed copy. The pair
+// means that leg to offset its partner. A move that stops with one leg not offset (a close whose Orderly leg is flat
+// while the Hyperliquid reduce-only has no answer) is unhedged: the result says so and `unhedged` is set; the watch
+// clears it once the order runs and the pair offsets again, and when the window ends it raises it again (the legs
+// do not offset) or clears it (they do). While an order is unsettled, open and close are refused: a new order on its
+// leg could double it, or be undone by it.
 //
 // Replays (Orderly): every signed order is public and can be sent again inside Orderly's 300 s window, a refused or
 // unfilled one too. Every order that got a signature arms the leg's watch for that window; a position push during it
@@ -27,9 +30,10 @@
 // by the same amount.
 //
 // Reduce-only moves are split into orders under the policy's notional cap; a close never needs one order larger than
-// the open it undoes, but a position grown by copies can. Each order prices itself again when it goes out, so a
-// chunk sized at the cap now could be over it after an uptick: chunks are sized under the cap by the policy's price
-// band, and still fit at any price inside it.
+// the open it undoes, but a position grown by copies can. Each order prices itself again when it goes out, and the cap
+// is valued at max(price, oracle) ≤ oracle × (1 + band), so a chunk sized at the cap now could be over it after an
+// uptick: chunks are cap × 10^4 / (10^4 + band), which fits at any price inside the band. A close that would take
+// more than MAX_CLOSE_ORDERS such orders on a leg is refused before anything is sent, rather than stopped half way.
 
 import type { TxRef, VenueId } from '@gimbal/shared';
 import type { Clock } from '../venues/venue.ts';
@@ -44,15 +48,17 @@ export const REPLAY_WINDOW_MS = ORDERLY_REPLAY_MS;
 export const UNSETTLED_WATCH_MS = HL_NONCE_WINDOW_MS + HL_EXPIRY_MARGIN_MS;
 /** How often a leg with an unsettled order is read while it is watched. */
 export const UNSETTLED_POLL_MS = 15_000;
-/** A split reduce-only move stops after this many orders; what is left is the caller's to judge. */
-const MAX_CHUNKS = 10;
+/** A close that needs more reduce-only orders than this on one leg, at today's cap, is refused before it starts. */
+export const MAX_CLOSE_ORDERS = 40;
+/** A split reduce-only move stops after this many orders (room for copies and price moves past the close's count). */
+const MAX_MOVE_ORDERS = 50;
 
 export type PairStatus =
   | 'open'        // both legs at their open targets
   | 'closed'      // both legs at their close targets
   | 'flat'        // an open that did not happen: both legs back at their start
-  | 'stuck'       // a leg could not reach its target; the desk is hedged or a position is unknown (see notes)
-  | 'unhedged';   // one leg is exposed alone: the owner must act
+  | 'stuck'       // a leg could not reach its target, or the request was refused; the desk is hedged (see notes)
+  | 'unhedged';   // one leg is exposed alone, or a position cannot be read: the owner must act
 
 export interface LegOrderRecord {
   ref: LegRef;
@@ -85,7 +91,8 @@ export interface WatchReport {
   status:
     | 'reconciled'   // an excess was closed: the leg holds its intent again
     | 'rehedged'     // a deficit, matched by closing the partner by as much: hedged again, at a smaller size
-    | 'settled'      // an unsettled order ran and left its leg at its intent: the legs offset each other again
+    | 'settled'      // an unsettled order ran and left its leg at its intent, or its leg reads again: the legs offset
+    | 'lapsed'       // an unsettled order's window ended without it running, and the legs offset each other
     | 'unhedged'     // a deficit the partner could not match, or an unsettled order that never ran: the owner must act
     | 'unknown';     // a position or the intent is unknown: nothing was traded
   legs: LegReport[];
@@ -100,16 +107,23 @@ export interface PairTraderOptions {
   clock?: Clock;
   sleep?: (ms: number) => Promise<void>;
   log?: (line: string) => void;
-  /** Every push check that found the leg off its intent, and every change an unsettled order's watch saw. */
+  /**
+   * Every push check that found the leg off its intent, and every change an unsettled order's watch saw: an
+   * 'unhedged' report is an alert for the owner.
+   */
   onWatch?: (report: WatchReport) => void;
-  /** How often a leg with an unsettled order is read (default UNSETTLED_POLL_MS); null: only positionPushed feeds it. */
+  /**
+   * How often a leg with an unsettled order is read (default UNSETTLED_POLL_MS); null: only positionPushed feeds it.
+   * The poll sleeps on `sleep` when one is given, else on an unref'd timer that stop() ends.
+   */
   unsettledPollMs?: number | null;
 }
 
-/** An unsettled order on a leg: it can still run until `until` (local ms). */
+/** An unsettled order on a leg: it can still run until `until` (local ms); `from` is the leg's position before it. */
 interface Unsettled {
   ref: LegRef;
   until: number;
+  from: bigint;
 }
 
 interface LegRun {
@@ -117,8 +131,12 @@ interface LegRun {
   start: bigint;
   target: bigint;
   pos: bigint | null;
-  /** An order with no answer and no expiry that had not run when read: it may still, so nothing more goes on this leg. */
+  /**
+   * An order with no answer and no expiry that had not run when read, or whose read failed: it may still run, so
+   * nothing more goes on this leg. `unsettledFrom` is the position before it.
+   */
   unsettled: LegOutcome | null;
+  unsettledFrom: bigint | null;
   report: LegReport;
 }
 
@@ -131,6 +149,11 @@ export class PairTrader {
   readonly #onWatch: (report: WatchReport) => void;
   readonly #bandBps: number;
   readonly #pollMs: number | null;
+  readonly #pollSleep: (ms: number) => Promise<void>;
+  /** stop() was called: no poll runs or starts any more. */
+  #ended = false;
+  /** Ends the polls' unref'd timers early (stop()). */
+  readonly #wakes = new Set<() => void>();
   #queue: Promise<unknown> = Promise.resolve();
   /**
    * What each leg should hold: the final position of the last open or close (null: it was unknown); for a leg with an
@@ -168,6 +191,26 @@ export class PairTrader {
     this.#onWatch = options.onWatch ?? (() => {});
     this.#bandBps = options.priceBandBps;
     this.#pollMs = options.unsettledPollMs === undefined ? UNSETTLED_POLL_MS : options.unsettledPollMs;
+    // A watch that lasts 2 days must not keep a CLI alive: its timer is unref'd, and stop() ends it.
+    this.#pollSleep = options.sleep ?? ((ms) => new Promise<void>((resolve) => {
+      const wake = () => {
+        clearTimeout(timer);
+        this.#wakes.delete(wake);
+        resolve();
+      };
+      const timer = setTimeout(wake, ms);
+      timer.unref();
+      this.#wakes.add(wake);
+    }));
+  }
+
+  /**
+   * Ends the unsettled orders' polls (a CLI calls it before it exits). What they watch stays as it was: unsettled()
+   * still names each order, open and close still refuse while one can run, and positionPushed still checks a leg.
+   */
+  stop(): void {
+    this.#ended = true;
+    for (const wake of [...this.#wakes]) wake();
   }
 
   /** `size` in base units, rounded down to the coarser lot; leg `longIndex` buys, the other sells. */
@@ -233,6 +276,8 @@ export class PairTrader {
   async #open(request: { size: bigint | number | string; longIndex: 0 | 1; reason: string }): Promise<PairResult> {
     const size = floorToLot(typeof request.size === 'bigint' ? request.size : toQty(request.size), this.lot);
     if (size === 0n) throw new LegCheckError(`size ${String(request.size)} is under one common lot ${qtyString(this.lot)}`);
+    const blocked = await this.#blocked('open', size);
+    if (blocked !== null) return blocked;
     // Nothing is signed until both venues and the policy accept the size and both starts are known.
     await Promise.all(this.legs.map((leg) => leg.check(size, false)));
     const starts = await Promise.all(this.legs.map((leg) => leg.position()));
@@ -275,6 +320,8 @@ export class PairTrader {
 
   async #close(request: { reason: string; targets?: [bigint, bigint] }): Promise<PairResult> {
     const targets = request.targets ?? [0n, 0n];
+    const blocked = await this.#blocked('close', 0n);
+    if (blocked !== null) return blocked;
     const starts = await Promise.all(this.legs.map((leg) => leg.position()));
     const runs = this.legs.map((leg, i) => this.#run(leg, starts[i]!, targets[i]!)) as [LegRun, LegRun];
     const size = abs(starts[0]! - targets[0]!) > abs(starts[1]! - targets[1]!) ? abs(starts[0]! - targets[0]!) : abs(starts[1]! - targets[1]!);
@@ -284,6 +331,19 @@ export class PairTrader {
       notes.push('both legs were already at their close targets');
       return this.#result('closed', size, runs, notes, net);
     }
+    // A close that cannot finish under the cap at today's price is refused whole: stopped half way, it would leave
+    // one leg closed and its partner open.
+    const tooMany: string[] = [];
+    for (const r of runs) {
+      const delta = crossesZero(r.start, r.target) ? -r.start : r.target - r.start;
+      if (delta === 0n) continue;
+      const max = await this.#chunkMax(r.leg, delta > 0n ? 'BUY' : 'SELL');
+      const orders = max === null ? 1n : (abs(delta) + max - 1n) / max;
+      if (orders > BigInt(MAX_CLOSE_ORDERS)) {
+        tooMany.push(`${r.leg.venue} needs ${orders} reduce-only orders of at most ${qtyString(max!)} (the policy cap less the ${this.#bandBps} bps band) to go from ${signedQtyString(r.start)} to ${signedQtyString(r.target)}, over ${MAX_CLOSE_ORDERS}`);
+      }
+    }
+    if (tooMany.length > 0) return this.#refused(size, [`close refused, nothing sent: ${tooMany.join('; ')}; close in parts (targets) or raise the cap`], starts);
     this.#log(`close: ${runs.map((r) => `${r.leg.venue} ${r.leg.symbol} ${signedQtyString(r.start)} -> ${signedQtyString(r.target)}`).join(', ')}`);
     for (const r of runs) {
       if (crossesZero(r.start, r.target)) notes.push(`${r.leg.venue}: target ${signedQtyString(r.target)} is on the other side of zero; a reduce-only close stops at 0`);
@@ -321,10 +381,11 @@ export class PairTrader {
   /**
    * An open stopped by an unsettled leg: the other leg goes back to its start reduce-only (twice at most). Stuck when
    * that leaves the legs offsetting each other (the unsettled order can still land; its watch then closes it back),
-   * unhedged when it does not (#stop). A lost position stops all.
+   * unhedged when it does not (#stop). A lost position stops all, unhedged: the other leg may be the hedge of a fill
+   * that cannot be read, so it is not unwound.
    */
   async #halt(runs: [LegRun, LegRun], notes: string[], size: bigint, net: bigint, reason: string): Promise<PairResult> {
-    if (runs.some((r) => r.pos === null)) return this.#result('stuck', size, runs, notes, net);
+    if (runs.some((r) => r.pos === null)) return this.#stop(size, runs, notes, net);
     const others = runs.filter((r) => r.unsettled === null);
     for (const r of others) r.target = r.start;
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -337,23 +398,58 @@ export class PairTrader {
   }
 
   /**
-   * A move that stopped on an unsettled order or a lost position. With both positions known and not offsetting each
-   * other (one leg flat, its partner still open behind an unsettled order) it is unhedged: the owner is alerted, and
-   * the unsettled leg stays watched (#result). Otherwise stuck: hedged now, or a position is unknown.
+   * A move that stopped on an unsettled order or a lost position. Unhedged when the positions do not offset each
+   * other (one leg flat, its partner still open behind an unsettled order) or one cannot be read (it counts as open):
+   * the owner is alerted, and an unsettled leg stays watched (#result). Stuck when the legs offset each other.
    */
   #stop(size: bigint, runs: [LegRun, LegRun], notes: string[], net: bigint): PairResult {
-    if (runs.every((r) => r.pos !== null) && !hedged(runs, net)) {
+    if (!hedged(runs, net)) {
       const waiting = runs.filter((r) => r.unsettled !== null)
         .map((r) => `; the ${r.leg.venue} order with no answer (${refId(r.unsettled!.ref)}) may still run and is watched until ${iso(r.unsettled!.ref.sentAt + UNSETTLED_WATCH_MS)}`);
-      notes.push(`unhedged: ${runs.map((r) => `${r.leg.venue} holds ${signedQtyString(r.pos!)}`).join(', ')}, which do not offset each other${waiting.join('')}`);
+      const lost = runs.some((r) => r.pos === null);
+      const holds = runs.map((r) => (r.pos === null ? `${r.leg.venue}'s position cannot be read` : `${r.leg.venue} holds ${signedQtyString(r.pos)}`)).join(', ');
+      notes.push(`unhedged: ${holds}, ${lost ? 'and a position that cannot be read counts as open' : 'which do not offset each other'}${waiting.join('')}`);
       return this.#result('unhedged', size, runs, notes, net);
     }
     return this.#result('stuck', size, runs, notes, net);
   }
 
+  /**
+   * Open and close wait while an order on the pair has no answer and can still run: another order on its leg could
+   * double it (an open) or be undone by it (a close, then a reopen). A watch whose window ended is closed out first.
+   */
+  async #blocked(what: 'open' | 'close', size: bigint): Promise<PairResult | null> {
+    for (const leg of this.legs) {
+      const u = this.#unsettled.get(leg);
+      if (u !== undefined && this.#clock.now() > u.until) await this.#lapse(leg);
+    }
+    const pending = this.legs.flatMap((leg) => {
+      const u = this.#unsettled.get(leg);
+      return u === undefined ? [] : [`the ${leg.venue} ${u.ref.side} ${u.ref.size}${u.ref.reduceOnly ? ' reduce-only' : ''} (${refId(u.ref)}) has no answer and may still run until ${iso(u.until)}`];
+    });
+    if (pending.length === 0) return null;
+    return this.#refused(size, [
+      `${what} refused, nothing sent: ${pending.join('; ')}; nothing more goes out on this pair until it runs or can no longer (its watch reads the leg every ${Math.round((this.#pollMs ?? UNSETTLED_POLL_MS) / 1000)} s)`,
+    ]);
+  }
+
+  /** A request refused before anything was signed: the pair's state is left as it was (an alert stands). */
+  #refused(size: bigint, notes: string[], positions?: readonly (bigint | null)[]): PairResult {
+    const report = (i: 0 | 1): LegReport => {
+      const leg = this.legs[i];
+      const pos = positions === undefined ? this.#known.get(leg) ?? null : positions[i] ?? null;
+      const text = pos === null ? 'unknown' : signedQtyString(pos);
+      return { venue: leg.venue, symbol: leg.symbol, start: text, target: text, final: pos === null ? null : text, orders: [] };
+    };
+    const legs: [LegReport, LegReport] = [report(0), report(1)];
+    const status: PairStatus = this.unhedged === null ? 'stuck' : 'unhedged';
+    this.#log(`${status}: ${notes.join('; ')}`);
+    return { status, size: qtyString(size), legs, notes, tx: [] };
+  }
+
   #run(leg: TradeLeg, start: bigint, target: bigint): LegRun {
     return {
-      leg, start, target, pos: start, unsettled: null,
+      leg, start, target, pos: start, unsettled: null, unsettledFrom: null,
       report: { venue: leg.venue, symbol: leg.symbol, start: signedQtyString(start), target: signedQtyString(target), final: null, orders: [] },
     };
   }
@@ -365,7 +461,7 @@ export class PairTrader {
    */
   async #move(r: LegRun, target: bigint, reduceOnly: boolean, reason: string, purpose: LegOrderRecord['purpose'], trim = true): Promise<void> {
     let dir = 0n;
-    for (let n = 0; n < MAX_CHUNKS; n++) {
+    for (let n = 0; n < MAX_MOVE_ORDERS; n++) {
       if (r.pos === null || r.unsettled !== null) return;
       const from = r.pos;
       let delta = target - from;
@@ -396,27 +492,39 @@ export class PairTrader {
   }
 
   /**
-   * The order size for a reduce-only move: all of it, or the most the policy cap allows in one order, less the price
-   * band. The cap is valued at today's price, and the order prices itself again when it goes out: sized at the cap,
-   * an uptick would put it over and stop the split half way.
+   * The order size for a reduce-only move: all of it, or the most one order may be under the policy cap (#chunkMax).
+   * The cap is valued at today's price, and the order prices itself again when it goes out: sized at the cap, an
+   * uptick would put it over and stop the split half way.
    */
   async #chunk(leg: TradeLeg, side: LegSide, want: bigint): Promise<bigint> {
-    let max: bigint;
-    try {
-      const cap = await leg.maxSize(side, true);
-      const keep = BigInt(Math.max(0, 10_000 - Math.ceil(this.#bandBps)));
-      max = floorToLot((abs(cap) * keep) / 10_000n, leg.lot);
-      // Under one lot after the band: one lot still fits at today's price, and nothing smaller can be sent.
-      if (max === 0n) max = floorToLot(cap, leg.lot);
-    } catch (err) {
-      this.#log(`${leg.venue} ${leg.symbol}: no size cap known (${errorText(err)}); sending ${qtyString(want)} whole`);
+    const max = await this.#chunkMax(leg, side);
+    if (max === null) {
+      this.#log(`${leg.venue} ${leg.symbol}: no size cap known; sending ${qtyString(want)} whole`);
       return want;
     }
-    if (max > 0n && want > max) {
+    if (want > max) {
       this.#log(`${leg.venue} ${leg.symbol}: ${qtyString(want)} reduce-only is over the policy cap: splitting into orders of ${qtyString(max)} (the cap less the ${this.#bandBps} bps band)`);
       return max;
     }
     return want;
+  }
+
+  /**
+   * The largest reduce-only order that fits the policy cap at any price inside the band: the cap is valued at
+   * max(price, oracle) ≤ oracle × (1 + band), so cap × 10^4 / (10^4 + band), floored to the lot; one lot when that
+   * is under it (nothing smaller can be sent). Null when the cap cannot be read.
+   */
+  async #chunkMax(leg: TradeLeg, side: LegSide): Promise<bigint | null> {
+    let cap: bigint;
+    try {
+      cap = abs(await leg.maxSize(side, true));
+    } catch (err) {
+      this.#log(`${leg.venue} ${leg.symbol}: the size cap cannot be read: ${errorText(err)}`);
+      return null;
+    }
+    const band = BigInt(Math.ceil(this.#bandBps));
+    const max = floorToLot((cap * 10_000n) / (10_000n + band), leg.lot);
+    return max > 0n ? max : leg.lot;
   }
 
   async #send(r: LegRun, side: LegSide, size: bigint, reduceOnly: boolean, reason: string, purpose: LegOrderRecord['purpose']): Promise<LegOutcome> {
@@ -470,10 +578,14 @@ export class PairTrader {
       r.pos = await this.#read(leg, undefined, 'after the order expired');
       return;
     }
-    // No known expiry (a contract before C6, or an MPC timeout with no payload): a late signature can still execute it. A position that moved shows it ran (a
-    // signed action runs once); one that did not leaves it pending, and nothing more is sent on this leg.
+    // No known expiry (a contract before C6, or an MPC timeout with no payload): a late signature can still execute
+    // it. A position that moved shows it ran (a signed action runs once); one that did not, or that cannot be read,
+    // leaves it pending: nothing more is sent on this leg, and it is watched from the position it left.
     r.pos = await this.#read(leg, undefined, 'after an order whose outcome is unknown');
-    if (r.pos === from) r.unsettled = out;
+    if (r.pos === from || r.pos === null) {
+      r.unsettled = out;
+      r.unsettledFrom = from;
+    }
   }
 
   async #read(leg: TradeLeg, after: number | undefined, why: string): Promise<bigint | null> {
@@ -487,8 +599,8 @@ export class PairTrader {
 
   /**
    * One watch check: the venue's position against the pair's intent for the leg (see the header). On a leg with an
-   * unsettled order, only a move away from where the trader left it counts: the order ran, and the leg is then
-   * reconciled like any other.
+   * unsettled order, only a move away from where the order left it counts: the order ran, and the leg is then
+   * reconciled like any other. A leg that could not be read reads again here: unmoved, its position is known again.
    */
   async #check(leg: TradeLeg, pushed: bigint, seenAt: number): Promise<void> {
     const notes: string[] = [];
@@ -508,16 +620,28 @@ export class PairTrader {
       return this.#watched('unknown', [run], notes);
     }
     if (unsettled !== undefined) {
-      const was = this.#known.get(leg) ?? null;
-      if (pos === was) return;                // the order has not run (the push was older than the venue's state)
+      // Where the order left the leg: the last position read, or the one before the order when no read since worked.
+      const known = this.#known.get(leg) ?? null;
+      const was = known ?? unsettled.from;
+      if (pos === was && known !== null) return;   // the order has not run (the push was older than the venue's state)
+      run.start = was;
+      run.pos = pos;
+      run.report.start = signedQtyString(was);
+      if (pos === was) {
+        // The leg reads again, and its order has not run (yet): its position is known again, the order still watched.
+        this.#known.set(leg, pos);
+        notes.push(`${leg.venue} ${leg.symbol} reads again: ${signedQtyString(pos)}, so ${unsettled.ref.side} ${unsettled.ref.size} (${refId(unsettled.ref)}) has not run; it may until ${iso(unsettled.until)}`);
+        if (this.#offsets()) return this.#watched('settled', [run], notes);
+        const partner = this.#partner(leg);
+        notes.push(`unhedged: ${leg.venue} holds ${signedQtyString(pos)}, ${partner.venue} holds ${knownText(this.#known.get(partner))}: the legs do not offset each other`);
+        this.unhedged = notes.at(-1)!;
+        return this.#watched('unhedged', [run], notes);
+      }
       // A signed action runs once: the leg moved, so its order ran (in full, or in part for an IOC), and nothing on
       // this leg can land any more.
       this.#unsettled.delete(leg);
-      notes.push(`${leg.venue} ${unsettled.ref.side} ${unsettled.ref.size} (${refId(unsettled.ref)}), which had no answer, ran: ${was === null ? 'unknown' : signedQtyString(was)} -> ${signedQtyString(pos)}`);
+      notes.push(`${leg.venue} ${unsettled.ref.side} ${unsettled.ref.size} (${refId(unsettled.ref)}), which had no answer, ran: ${signedQtyString(was)} -> ${signedQtyString(pos)}`);
       if (pos === intent) {
-        run.start = was ?? pos;
-        run.pos = pos;
-        run.report.start = signedQtyString(run.start);
         this.#known.set(leg, pos);
         if (this.#offsets()) return this.#watched('settled', [run], notes);
         const partner = this.#partner(leg);
@@ -546,15 +670,19 @@ export class PairTrader {
       return this.#watched('unhedged', [run], notes);
     }
 
-    // A deficit: a copy of a reducing order landed, and this leg no longer offsets its partner in full.
+    // A deficit (a copy of a reducing order landed), or an excess whose close did not go through: this leg no longer
+    // offsets its partner in full.
     const missing = intent - run.pos;
-    const exposed = `unhedged: ${leg.venue} holds ${signedQtyString(run.pos)}, ${qtyString(abs(missing))} short of its intent ${signedQtyString(intent)}`;
+    const off = reducedTarget(run.pos, intent) === null ? 'short of' : 'past';
+    const exposed = `unhedged: ${leg.venue} holds ${signedQtyString(run.pos)}, ${qtyString(abs(missing))} ${off} its intent ${signedQtyString(intent)}`;
     notes.push(exposed);
     this.#intent.set(leg, run.pos);
     const partner = this.#partner(leg);
     if (this.#unsettled.has(partner)) {
-      // Its own order may still run: another one on it could double that.
-      notes.push(`${partner.venue} has an order with no answer that may still run: not matched`);
+      // Its own order may still run: another one on it could double that. Where that order should leave it now is
+      // what offsets this leg as it stands, so a landing there is seen as hedged, not trimmed back.
+      this.#intent.set(partner, this.#net - run.pos);
+      notes.push(`${partner.venue} has an order with no answer that may still run: not matched; it offsets this leg at ${signedQtyString(this.#net - run.pos)}`);
       this.unhedged = exposed;
       return this.#watched('unhedged', [run], notes);
     }
@@ -619,16 +747,17 @@ export class PairTrader {
       r.report.final = r.pos === null ? null : signedQtyString(r.pos);
       // The watch holds each leg to where this result left it: the target when it was reached, the start of a flat
       // open, the last known position when stuck or unhedged (null: unknown, and the watch trades nothing).
+      // An older unsettled order keeps its watch until its own window ends, whatever the leg holds now: a reduce-only
+      // one that cannot move a flat leg today can once the leg is open again.
       this.#intent.set(r.leg, r.pos);
       this.#known.set(r.leg, r.pos);
-      // A reduce-only order cannot move a flat leg: an older unsettled one has nothing left to do there.
-      if (r.unsettled === null && r.pos === 0n && this.#unsettled.get(r.leg)?.ref.reduceOnly === true) this.#unsettled.delete(r.leg);
     }
     for (const [i, r] of runs.entries()) {
       if (r.unsettled === null) continue;
-      // The pair means this leg to offset its partner: where its order takes it, or a reconcile once it ran.
+      // The pair means this leg to offset its partner: where its order takes it, or a reconcile once it ran (also when
+      // the leg could not be read: its position is unknown, its intent is not).
       const partner = runs[i === 0 ? 1 : 0];
-      if (r.pos !== null && partner.pos !== null && partner.unsettled === null) this.#intent.set(r.leg, net - partner.pos);
+      if (partner.pos !== null && partner.unsettled === null) this.#intent.set(r.leg, net - partner.pos);
       this.#armUnsettled(r);
     }
     this.unhedged = status === 'unhedged' ? notes.at(-1) ?? 'unhedged' : null;
@@ -640,7 +769,7 @@ export class PairTrader {
   /** Watches the leg of an unsettled order until it can no longer run, and starts its poll. */
   #armUnsettled(r: LegRun): void {
     const ref = r.unsettled!.ref;
-    this.#unsettled.set(r.leg, { ref, until: ref.sentAt + UNSETTLED_WATCH_MS });
+    this.#unsettled.set(r.leg, { ref, until: ref.sentAt + UNSETTLED_WATCH_MS, from: r.unsettledFrom ?? r.start });
     this.#log(`${r.leg.venue} ${r.leg.symbol}: ${ref.side} ${ref.size} (${refId(ref)}) has no answer and may still run: watched until ${iso(ref.sentAt + UNSETTLED_WATCH_MS)}`);
     this.#poll(r.leg);
   }
@@ -648,14 +777,15 @@ export class PairTrader {
   /** Reads a leg with an unsettled order every #pollMs while it can still run: nothing pushes Hyperliquid positions. */
   #poll(leg: TradeLeg): void {
     const every = this.#pollMs;
-    if (every === null || this.#polling.has(leg)) return;
+    if (every === null || this.#ended || this.#polling.has(leg)) return;
     this.#polling.add(leg);
     const loop = async (): Promise<void> => {
       try {
         for (;;) {
-          await this.#sleep(every);
+          await this.#pollSleep(every);
+          if (this.#ended) return;
           const u = this.#unsettled.get(leg);
-          if (u === undefined) return;          // it ran, or a result found nothing left for it to do
+          if (u === undefined) return;          // it ran, or its window ended
           if (this.#clock.now() > u.until) {
             await this.#serial(() => this.#lapse(leg));
             if (!this.#unsettled.has(leg)) return;
@@ -678,19 +808,23 @@ export class PairTrader {
     loop().catch((err) => this.#log(`${leg.venue} ${leg.symbol}: the unsettled order's watch stopped: ${errorText(err)}`));
   }
 
-  /** The window of an unsettled order ended and it never ran: it no longer can. Not offset → the alert again. */
+  /**
+   * The window of an unsettled order ended and it was not seen to run: it no longer can. Not offset (or a leg that
+   * cannot be read): the alert again. Offset: an alert raised earlier is cleared, as a settled landing clears it.
+   */
   async #lapse(leg: TradeLeg): Promise<void> {
     const u = this.#unsettled.get(leg);
     if (u === undefined || this.#clock.now() <= u.until) return;
     this.#unsettled.delete(leg);
-    const note = `${leg.venue} ${u.ref.side} ${u.ref.size} (${refId(u.ref)}) had no answer and never ran; since ${iso(u.until)} it no longer can`;
+    const pos = this.#known.get(leg) ?? null;
+    const ran = pos === null ? 'was not seen to run (its leg has not been read since)' : 'never ran';
+    const note = `${leg.venue} ${u.ref.side} ${u.ref.size} (${refId(u.ref)}) had no answer and ${ran}; since ${iso(u.until)} it no longer can`;
+    const run = this.#run(leg, pos ?? u.from, this.#intent.get(leg) ?? pos ?? u.from);
+    run.pos = pos;
     if (this.#offsets()) {
-      this.#log(`${leg.venue} ${leg.symbol}: ${note}; the legs offset each other`);
+      this.#watched('lapsed', [run], [`${note}; the legs offset each other`]);
       return;
     }
-    const pos = this.#known.get(leg) ?? null;
-    const run = this.#run(leg, pos ?? 0n, this.#intent.get(leg) ?? pos ?? 0n);
-    run.pos = pos;
     const exposed = `unhedged: ${note}; ${this.legs.map((l) => `${l.venue} holds ${knownText(this.#known.get(l))}`).join(', ')}, which do not offset each other`;
     this.unhedged = exposed;
     this.#watched('unhedged', [run], [exposed]);

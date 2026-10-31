@@ -9,7 +9,8 @@
 //                skipped) -> ip_restriction (no set_orderly_ips list: skipped)
 //   phoenix      register (build-register-ixs, sol_sign_register, send-register-ixs; done once the trader account
 //                exists; with none, every run first looks for one for as long as an earlier run's registration could
-//                still land) -> referral (no code: skipped; already activated: done without signing); mainnet only
+//                still land) -> referral (no code: skipped; already activated: done without signing; not activated on
+//                an account this run did not register: looked for as long first); mainnet only
 //
 // A SetupProgress with every step goes out after each change.
 
@@ -312,18 +313,31 @@ async function phoenix(plan: SetupPlan, run: Run, waits: (name: SetupStepName, o
     await run('phoenix_referral', async () => ({ status: 'skipped', detail: 'Phoenix runs on mainnet only' }));
     return;
   }
-  const registered = await run('phoenix_register', async () => {
-    if (await p.isRegistered()) return { status: 'done', detail: 'trader account exists' };
-    const pollMs = plan.phoenixPollMs ?? 3_000;
-    // An earlier run's registration may still be landing: watch for it until no transaction signed before this run
-    // can land any more. A read that fails here fails the step: nothing is signed on a guess.
-    const landingMs = plan.phoenixLandingMs ?? PHOENIX_LANDING_MS;
-    plan.log?.(`setup ${plan.deskId} phoenix_register: no trader account; looking for one for ${Math.ceil(landingMs / 1000)} s before signing, in case an earlier run's registration is still landing`);
+  const pollMs = plan.phoenixPollMs ?? 3_000;
+  const landingMs = plan.phoenixLandingMs ?? PHOENIX_LANDING_MS;
+  const landingS = Math.ceil(landingMs / 1000);
+  /**
+   * Looks for what an earlier run may have signed until it can no longer land, before this run signs it again. A read
+   * that fails here fails the step: nothing is signed on a guess.
+   */
+  const lookFor = async (landed: () => Promise<boolean>): Promise<boolean> => {
+    if (!(pollMs > 0) || !Number.isFinite(pollMs) || !(landingMs >= 0) || !Number.isFinite(landingMs)) {
+      throw new Error(`phoenixPollMs must be over 0 and phoenixLandingMs 0 or more, got ${pollMs} and ${landingMs}: nothing is signed`);
+    }
     for (let waited = 0; waited < landingMs; waited += pollMs) {
       await sleep(pollMs);
-      if (await p.isRegistered()) return { status: 'done', detail: 'trader account exists: an earlier registration landed' };
+      if (await landed()) return true;
     }
+    return false;
+  };
+  /** This run signed the registration: the account did not exist before, so no earlier run reached the referral. */
+  let registeredHere = false;
+  const registered = await run('phoenix_register', async () => {
+    if (await p.isRegistered()) return { status: 'done', detail: 'trader account exists' };
+    plan.log?.(`setup ${plan.deskId} phoenix_register: no trader account; looking for one for ${landingS} s before signing, in case an earlier run's registration is still landing`);
+    if (await lookFor(() => p.isRegistered())) return { status: 'done', detail: 'trader account exists: an earlier registration landed' };
     const { tx } = await p.register();
+    registeredHere = true;
     // send-register-ixs answering is not the account existing: Phoenix sends the transaction, Solana lands it or not.
     for (let i = 0; i < (plan.phoenixPolls ?? 10); i++) {
       await sleep(pollMs);
@@ -331,13 +345,19 @@ async function phoenix(plan: SetupPlan, run: Run, waits: (name: SetupStepName, o
     }
     return {
       status: 'failed', tx,
-      detail: `Phoenix took the registration, but the trader account does not exist yet: a rerun looks for it for ${Math.ceil(landingMs / 1000)} s before it signs anything`,
+      detail: `Phoenix took the registration, but the trader account does not exist yet: a rerun looks for it for ${landingS} s before it signs anything`,
     };
   });
   if (registered !== 'done') return waits('phoenix_referral', 'phoenix_register');
   await run('phoenix_referral', async () => {
     if (plan.referralCodes.phoenix === null) return { status: 'skipped', detail: 'no Phoenix referral code is configured' };
     if (await p.referralActivated()) return { status: 'done', detail: 'already activated: the trader account has the referral capabilities' };
+    // An earlier run's activation (sent, then a crash or a rerun before it landed) can land as long as a
+    // registration can; a second one signed meanwhile is a second transaction. Not needed when this run registered.
+    if (!registeredHere) {
+      plan.log?.(`setup ${plan.deskId} phoenix_referral: not activated; looking for ${landingS} s before signing, in case an earlier run's activation is still landing`);
+      if (await lookFor(() => p.referralActivated())) return { status: 'done', detail: 'activated: an earlier activation landed' };
+    }
     const r = await p.activateReferral();
     if (r === null) return { status: 'skipped', detail: 'no Phoenix referral code is configured' };
     return { status: 'done', detail: `activate-tx: ${r.status}`, tx: r.tx };

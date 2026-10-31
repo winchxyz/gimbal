@@ -16,7 +16,7 @@ import type { LegOutcome, LegRef, LegSide, TradeLeg } from './legs.ts';
 import { HlLeg, LegCheckError } from './legs.ts';
 import { floorToLot, lotQty, toQty } from './lots.ts';
 import type { PairTraderOptions, WatchReport } from './pair.ts';
-import { PairTrader, REPLAY_WINDOW_MS, UNSETTLED_POLL_MS, UNSETTLED_WATCH_MS, reducedTarget } from './pair.ts';
+import { MAX_CLOSE_ORDERS, PairTrader, REPLAY_WINDOW_MS, UNSETTLED_POLL_MS, UNSETTLED_WATCH_MS, reducedTarget } from './pair.ts';
 
 type Step =
   | 'fill'
@@ -24,7 +24,8 @@ type Step =
   | 'check'                      // refused by a local check: nothing was signed
   | 'unknown-filled'             // the answer was lost, the order filled
   | 'unknown-none'               // the answer was lost, nothing ran (yet)
-  | 'unknown-unreadable'         // the answer was lost and the venue cannot be read afterwards
+  | 'unknown-unreadable'         // the answer was lost, the order filled, and the venue cannot be read afterwards
+  | 'unknown-lost'               // the answer was lost, nothing ran (yet), and the venue cannot be read afterwards
   | 'copy'                       // filled, and a replayed copy of the signed order filled too
   | 'fill-unreadable'            // filled, and the next position read fails
   | { partial: string }
@@ -46,8 +47,8 @@ interface FakeOptions {
   /** The policy cap's largest order (maxSize); unlimited when unset. */
   max?: string;
   /**
-   * A cap in USD at a moving price instead: maxSize is the cap at `px` now, then the price moves by the next of
-   * `upticksBps` (the last repeats) before the order goes out, which is refused when it is over the cap at its price.
+   * A cap in USD at a moving price instead: maxSize is the cap at `px` now; each order first moves the price by the
+   * next of `upticksBps` (the last repeats), and is refused when it is over the cap at its price.
    */
   capUsd?: number;
   px?: number;
@@ -90,10 +91,7 @@ class FakeLeg implements TradeLeg {
 
   async maxSize(): Promise<bigint> {
     if (this.#o.capUsd !== undefined) {
-      const max = floorToLot(toQty((this.#o.capUsd / this.px).toFixed(8)), this.lot);
-      const move = this.#upticks.length > 1 ? this.#upticks.shift()! : this.#upticks[0]!;
-      this.px *= 1 + move / 10_000;
-      return max;
+      return floorToLot(toQty((this.#o.capUsd / this.px).toFixed(8)), this.lot);
     }
     return this.#o.max === undefined ? 10n ** 16n : toQty(this.#o.max);
   }
@@ -122,7 +120,10 @@ class FakeLeg implements TradeLeg {
       await step.hold;
       step = 'fill';
     }
-    // As HlLeg plans it: the order is priced again now, and refused before signing when that puts it over the cap.
+    // The price moves between sizing and sending; as HlLeg plans it, the order is priced again now and refused
+    // before signing when that puts it over the cap.
+    const move = this.#upticks.length > 1 ? this.#upticks.shift()! : this.#upticks[0]!;
+    this.px *= 1 + move / 10_000;
     const usd = (Number(size) / 1e8) * this.px;
     if (this.#o.capUsd !== undefined && usd > this.#o.capUsd + 1e-9) {
       return { kind: 'failed', error: new LegCheckError(`${this.venue}: ${usd.toFixed(2)} USD at ${this.px.toFixed(2)} is over the ${this.#o.capUsd} USD cap`), ref };
@@ -147,6 +148,10 @@ class FakeLeg implements TradeLeg {
     }
     if (step === 'unknown-unreadable') {
       apply(signed);
+      this.unreadable = true;
+      return unknown();
+    }
+    if (step === 'unknown-lost') {
       this.unreadable = true;
       return unknown();
     }
@@ -269,19 +274,59 @@ test('outcome unknown: the leg is read back first; a fill that happened is not s
   assert.deepEqual(s.sleeps, [], 'a position that moved proves the order ran: nothing to wait for');
 });
 
-test('outcome unknown: when the venue shows nothing ran, the retry goes out; when it cannot be read, nothing more is sent', async () => {
+test('outcome unknown: when the venue shows nothing ran, the retry goes out; when it cannot be read, the pair is unhedged and the leg watched', async () => {
   const none = setup({}, { script: ['unknown-none', 'fill'] });
   assert.equal((await none.trader.open({ size: '0.005', longIndex: 0, reason: 'open' })).status, 'open');
   assert.equal(none.b.orders.length, 2);
 
+  // The open order filled, and Hyperliquid cannot be read: a position that cannot be read counts as open.
   const lost = setup({ script: ['unknown-unreadable'] });
   const r = await lost.trader.open({ size: '0.005', longIndex: 0, reason: 'open' });
-  assert.equal(r.status, 'stuck');
+  assert.equal(r.status, 'unhedged');
   assert.equal(r.legs[0].final, null);
   assert.equal(lost.a.orders.length, 1, 'no retry without proof');
-  assert.equal(lost.b.orders.length, 1, 'and no close of the other leg either: its partner may be open');
+  assert.equal(lost.b.orders.length, 1, 'and no unwind of the other leg: it may be the hedge of a fill that cannot be read');
   assert.match(r.notes.join(' '), /position unknown on hyperliquid/);
-  assert.equal(lost.trader.intent(lost.a), null, 'the watch trades nothing against an unknown leg');
+  assert.match(lost.trader.unhedged ?? '', /^unhedged: hyperliquid's position cannot be read, orderly holds -0\.005, and a position that cannot be read counts as open; the hyperliquid order with no answer \(hyperliquid-1\) may still run and is watched until /);
+  assert.ok(lost.trader.watching(lost.a), 'the order may still run: its leg is watched whether or not the read worked');
+  assert.equal(lost.trader.intent(lost.a), q('0.005'), 'what offsets its partner');
+
+  // It reads again: the order had run, the legs offset, the alert clears, and nothing is sent.
+  lost.a.unreadable = false;
+  await lost.trader.positionPushed(lost.a, lost.a.pos);
+  assert.deepEqual(lost.watches.map((w) => w.status), ['settled']);
+  assert.equal(lost.trader.unhedged, null);
+  assert.equal(lost.trader.watching(lost.a), false);
+  assert.deepEqual([lost.a.orders.length, lost.b.orders.length], [1, 1]);
+});
+
+test('outcome unknown on a close, and the leg cannot be read: unhedged and watched; when it reads again unmoved, still watched', async () => {
+  const c = setup({ pos: '0.005', script: ['unknown-lost'] }, { pos: '-0.005' });
+  const r = await c.trader.close({ reason: 'close' });
+  assert.equal(r.status, 'unhedged');
+  assert.equal(r.legs[0].final, null);
+  assert.deepEqual([c.a.orders.length, c.b.orders.length], [1, 1]);
+  assert.match(c.trader.unhedged ?? '', /^unhedged: hyperliquid's position cannot be read, orderly holds 0, and a position that cannot be read counts as open; the hyperliquid order with no answer \(hyperliquid-1\) may still run/);
+  assert.ok(c.trader.watching(c.a));
+  assert.equal(c.trader.intent(c.a), 0n);
+
+  // Reads again, unmoved: the order has not run; its position is known again, the pair still unhedged, still watched.
+  c.a.unreadable = false;
+  await c.trader.positionPushed(c.a, q('0.005'));
+  assert.deepEqual(c.watches.map((w) => w.status), ['unhedged']);
+  assert.match(c.watches[0]!.notes.join(' '), /hyperliquid ETH reads again: 0\.005, so SELL \S+ \(hyperliquid-1\) has not run/);
+  assert.match(c.trader.unhedged ?? '', /^unhedged: hyperliquid holds 0\.005, orderly holds 0: the legs do not offset each other$/);
+  assert.ok(c.trader.watching(c.a));
+  await c.trader.positionPushed(c.a, q('0.005'));
+  assert.equal(c.watches.length, 1, 'known again: an unmoved push is nothing new');
+
+  // The order runs: flat after all.
+  c.a.pos = 0n;
+  await c.trader.positionPushed(c.a, 0n);
+  assert.deepEqual(c.watches.map((w) => w.status), ['unhedged', 'settled']);
+  assert.equal(c.trader.unhedged, null);
+  assert.equal(c.trader.watching(c.a), false);
+  assert.deepEqual([c.a.orders.length, c.b.orders.length], [1, 1]);
 });
 
 test('hyperliquid unknown with a signed expiry: read back only once the order has expired, then retried', async () => {
@@ -368,9 +413,87 @@ test('an unsettled order that never runs: when its window ends with the legs not
   assert.equal((await o.trader.open({ size: '0.005', longIndex: 0, reason: 'open' })).status, 'stuck');
   o.shared.now = o.trader.unsettled(o.a)!.until + 1;
   await o.trader.positionPushed(o.a, 0n);
-  assert.equal(o.watches.length, 0);
+  assert.deepEqual(o.watches.map((w) => w.status), ['lapsed']);
+  assert.match(o.watches[0]!.notes.join(' '), /never ran; since \S+ it no longer can; the legs offset each other$/);
   assert.equal(o.trader.unhedged, null);
   assert.equal(o.trader.unsettled(o.a), null);
+});
+
+test('a window that ends with the legs offset clears an alert raised meanwhile, as a settled landing does', async () => {
+  // The open's Orderly unwind fails twice: Orderly is short alone, Hyperliquid's BUY has no answer.
+  const s = setup({ script: ['unknown-none'] }, { script: ['fill', 'fail', 'fail'] });
+  assert.equal((await s.trader.open({ size: '0.005', longIndex: 0, reason: 'open' })).status, 'unhedged');
+  assert.equal(s.trader.intent(s.a), q('0.005'));
+  // A copy of a refused unwind lands: Orderly is flat. A deficit against its intent, and its partner cannot be
+  // matched while its order may run: still the alert.
+  s.b.pos = 0n;
+  await s.trader.positionPushed(s.b, 0n);
+  assert.deepEqual(s.watches.map((w) => w.status), ['unhedged']);
+  assert.equal(s.trader.intent(s.a), 0n, 'what offsets Orderly now');
+  assert.notEqual(s.trader.unhedged, null);
+  // The window ends and the BUY never ran: both legs flat, offset. The alert clears.
+  s.shared.now = s.trader.unsettled(s.a)!.until + 1;
+  await s.trader.positionPushed(s.a, 0n);
+  assert.deepEqual(s.watches.map((w) => w.status), ['unhedged', 'lapsed']);
+  assert.equal(s.trader.unhedged, null);
+  assert.equal(s.a.orders.length, 1);
+});
+
+test('a deficit while the partner\'s order has no answer: where that order would leave the partner moves, so its landing is hedged', async () => {
+  // A stuck open: Hyperliquid's BUY has no answer, Orderly went back to 0. Then a copy of Orderly's SELL lands, and
+  // its excess close is refused twice: Orderly is short 0.005 against its intent of 0.
+  const s = setup({ script: ['unknown-none'] }, { script: ['fill', 'fill', 'fail', 'fail'] });
+  assert.equal((await s.trader.open({ size: '0.005', longIndex: 0, reason: 'open' })).status, 'stuck');
+  assert.equal(s.trader.intent(s.a), 0n);
+  s.b.pos = q('-0.005');
+  await s.trader.positionPushed(s.b, s.b.pos);
+  assert.deepEqual(s.watches.map((w) => w.status), ['unhedged']);
+  assert.match(s.watches[0]!.notes.join(' '), /hyperliquid has an order with no answer that may still run: not matched; it offsets this leg at 0\.005/);
+  assert.equal(s.trader.intent(s.a), q('0.005'));
+  // The BUY lands: the legs offset at 0.005 / -0.005. Hedged: nothing is closed back, the alert clears.
+  s.a.pos = q('0.005');
+  await s.trader.positionPushed(s.a, s.a.pos);
+  assert.deepEqual(s.watches.map((w) => w.status), ['unhedged', 'settled']);
+  assert.equal(s.a.orders.length, 1, 'no reduce-only close of the landing');
+  assert.equal(s.trader.unhedged, null);
+});
+
+test('open and close are refused while an order has no answer, naming it; the watch lasts its whole window', async () => {
+  // A close whose Hyperliquid reduce-only has no answer: unhedged, Orderly flat.
+  const c = setup({ pos: '0.005', script: ['unknown-none'] }, { pos: '-0.005' });
+  assert.equal((await c.trader.close({ reason: 'close' })).status, 'unhedged');
+  const sent = () => c.a.orders.length + c.b.orders.length;
+  const until = c.trader.unsettled(c.a)!.until;
+  const again = await c.trader.close({ reason: 'close again' });
+  assert.equal(again.status, 'unhedged', 'the alert stands');
+  assert.match(again.notes[0]!, /^close refused, nothing sent: the hyperliquid SELL \S+ reduce-only \(hyperliquid-1\) has no answer and may still run until \S+; nothing more goes out on this pair until it runs or can no longer/);
+  assert.deepEqual(again.tx, []);
+  // An open now would reopen Hyperliquid, and the old reduce-only could then close it alone.
+  const reopen = await c.trader.open({ size: '0.005', longIndex: 0, reason: 'open' });
+  assert.equal(reopen.status, 'unhedged');
+  assert.match(reopen.notes[0]!, /^open refused, nothing sent: the hyperliquid SELL/);
+  assert.equal(sent(), 2);
+  assert.equal(c.trader.unsettled(c.a)?.until, until, 'still watched, whatever the leg holds');
+
+  // The late SELL lands a day later: flat, hedged, and a new open goes out.
+  c.shared.now += 86_400_000;
+  c.a.pos = 0n;
+  await c.trader.positionPushed(c.a, 0n);
+  assert.deepEqual(c.watches.map((w) => w.status), ['settled']);
+  assert.equal(c.trader.unsettled(c.a), null);
+  assert.equal((await c.trader.open({ size: '0.005', longIndex: 0, reason: 'open' })).status, 'open');
+  assert.equal(sent(), 4);
+
+  // A stuck open: refused until the window ends; then the watch is closed out first and the open goes out.
+  const o = setup({ script: ['unknown-none'] });
+  assert.equal((await o.trader.open({ size: '0.005', longIndex: 0, reason: 'open' })).status, 'stuck');
+  const blocked = await o.trader.open({ size: '0.005', longIndex: 0, reason: 'open' });
+  assert.equal(blocked.status, 'stuck');
+  assert.match(blocked.notes[0]!, /^open refused, nothing sent: the hyperliquid BUY \S+ \(hyperliquid-1\) has no answer/);
+  assert.equal(o.a.orders.length, 1);
+  o.shared.now = o.trader.unsettled(o.a)!.until + 1;
+  assert.equal((await o.trader.open({ size: '0.005', longIndex: 0, reason: 'open' })).status, 'open');
+  assert.deepEqual(o.watches.map((w) => w.status), ['lapsed']);
 });
 
 test('the unsettled watch reads Hyperliquid itself every 15 s (nothing pushes it) until the order runs or cannot', async () => {
@@ -401,6 +524,39 @@ test('the unsettled watch reads Hyperliquid itself every 15 s (nothing pushes it
   assert.deepEqual(l.watches.map((w) => w.status), ['unhedged']);
   assert.match(l.trader.unhedged ?? '', /never ran/);
   assert.equal(sl.waiting(), 0);
+});
+
+test('stop() ends the unsettled poll, and on the real clock its timer never keeps the process alive', async () => {
+  let c!: ReturnType<typeof setup>;
+  const st = steppedSleep(() => c.shared);
+  c = setup({ pos: '0.005', script: ['unknown-none'] }, { pos: '-0.005' }, { sleep: st.sleep, unsettledPollMs: UNSETTLED_POLL_MS });
+  assert.equal((await c.trader.close({ reason: 'close' })).status, 'unhedged');
+  assert.equal(st.waiting(), 1);
+  const reads = c.a.reads.length;
+  c.trader.stop();
+  await st.step();
+  assert.equal(c.a.reads.length, reads, 'no read after stop()');
+  assert.equal(st.waiting(), 0, 'the poll ended');
+  assert.notEqual(c.trader.unsettled(c.a), null, 'what it watched stays: open and close still refuse');
+  assert.equal((await c.trader.close({ reason: 'close' })).status, 'unhedged');
+  assert.equal(c.a.orders.length, 1);
+
+  // The real clock: the poll's 60 s timer is unref'd, and stop() ends it.
+  const timers = () => process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length;
+  const before = timers();
+  const shared: Shared = { started: 0, overlap: false, now: Date.now() };
+  const a = new FakeLeg('hyperliquid', shared, { pos: '0.005', script: ['unknown-none'] });
+  const b = new FakeLeg('orderly', shared, { pos: '-0.005' });
+  const lines: string[] = [];
+  const trader = new PairTrader({ legs: [a, b], priceBandBps: 0, unsettledPollMs: 60_000, clock: { now: () => shared.now }, log: (l) => lines.push(l) });
+  assert.equal((await trader.close({ reason: 'close' })).status, 'unhedged');
+  assert.ok(trader.watching(a));
+  assert.equal(timers(), before, 'a 2-day watch must not keep a CLI alive');
+  const readsBefore = a.reads.length;
+  trader.stop();
+  await ticks(20);
+  assert.equal(a.reads.length, readsBefore, 'stop() woke the poll, which ended without a read');
+  assert.ok(!lines.some((l) => /watch stopped/.test(l)));
 });
 
 test('hyperliquid MPC timeout: no signed payload, so no expiry; nothing ran when read, so it is never retried', async () => {
@@ -550,7 +706,37 @@ test('reduce-only chunks are sized under the cap by the price band: an uptick be
   assert.deepEqual([banded.a.pos, banded.b.pos], [0n, 0n]);
   assert.ok(banded.lines.some((l) => /splitting into orders of 0\.00495 \(the cap less the 100 bps band\)/.test(l)));
 
+  // Wide bands: cap × 10^4 / (10^4 + band), so 9000 bps is a little over half the cap, 10000 bps half of it.
+  const wide = setup({ ...hl }, { pos: '-0.01' }, { priceBandBps: 9000 });
+  assert.equal((await wide.trader.close({ reason: 'close' })).status, 'closed');
+  assert.deepEqual(wide.a.orders.map((o) => o.size).slice(0, 2), ['0.002631', '0.002631']);
+  assert.equal(wide.a.orders.length, 4, 'not 20 orders of a tenth of the cap');
+  const widest = setup({ ...hl }, { pos: '-0.01' }, { priceBandBps: 10_000 });
+  assert.equal((await widest.trader.close({ reason: 'close' })).status, 'closed');
+  assert.deepEqual(widest.a.orders.map((o) => o.size).slice(0, 2), ['0.0025', '0.0025'], 'half the cap, not the whole cap');
+  assert.ok(widest.a.orders.length <= 5);
+  assert.deepEqual([widest.a.pos, widest.b.pos], [0n, 0n]);
+  // A cap of one lot: nothing smaller can be sent, so one lot.
+  const tiny = setup({ pos: '0.000003', lot: '0.000001', capUsd: 0.0025, px: 2500 }, { pos: '-0.000003', lot: '0.000001' }, { priceBandBps: 10_000 });
+  assert.equal((await tiny.trader.close({ reason: 'close' })).status, 'closed');
+  assert.deepEqual(tiny.a.orders.map((o) => o.size), ['0.000001', '0.000001', '0.000001']);
+
   assert.throws(() => setup({}, {}, { priceBandBps: -1 }), /priceBandBps must be 0 or more/);
+});
+
+test('a close that needs more than MAX_CLOSE_ORDERS orders on a leg at today\'s cap is refused before anything is sent', async () => {
+  const hl: FakeOptions = { pos: '0.3', lot: '0.000001', capUsd: 12.5, px: 2500 };
+  const s = setup(hl, { pos: '-0.3' }, { priceBandBps: 10_000 });
+  const r = await s.trader.close({ reason: 'close' });
+  assert.equal(r.status, 'stuck', 'hedged as it was');
+  assert.equal(MAX_CLOSE_ORDERS, 40);
+  assert.match(r.notes[0]!, /^close refused, nothing sent: hyperliquid needs 120 reduce-only orders of at most 0\.0025 \(the policy cap less the 10000 bps band\) to go from 0\.3 to 0, over 40; close in parts \(targets\) or raise the cap$/);
+  assert.deepEqual([s.a.orders.length, s.b.orders.length], [0, 0]);
+  assert.deepEqual([r.legs[0].final, r.legs[1].final], ['0.3', '-0.3']);
+  // In parts: a close to targets that one leg can reach in 40 orders goes out.
+  const part = await s.trader.close({ reason: 'close part', targets: [q('0.2'), q('-0.2')] });
+  assert.equal(part.status, 'closed');
+  assert.equal(s.a.orders.length, 40);
 });
 
 test('one queued check per leg, and the window is checked again when its turn comes', async () => {
