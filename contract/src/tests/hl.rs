@@ -349,6 +349,74 @@ fn every_action_takes_the_next_nonce_of_its_desk() {
     assert_eq!(nonce_of("bravo", &g), T);
 }
 
+// --- hl_cancel ---
+
+#[test]
+fn hl_cancel_signs_the_vector_bytes() {
+    let mut g = hl_desk();
+    let mut signed = 0;
+    for c in vectors()["l1"]["cases"].as_array().unwrap() {
+        if c["kind"] != "cancel" {
+            continue;
+        }
+        let p = &c["params"];
+        at(operator(), c["nonce"].as_u64().unwrap(), yocto(0));
+        let got = g.hl_cancel(
+            "alpha".into(),
+            u32::try_from(p["asset"].as_u64().unwrap()).unwrap(),
+            p["oid"].as_u64().unwrap(),
+            "stale order".into(),
+        );
+        assert_signs_l1(&got, "cancel", c["name"].as_str().unwrap());
+        assert_eq!(got.reason_sha256, Some(sha256_hex("stale order")));
+        signed += 1;
+    }
+    assert_eq!(signed, 3, "every cancel in the vectors");
+}
+
+#[test]
+fn hl_cancel_passes_a_paused_desk_and_takes_the_next_nonce() {
+    let mut g = hl_desk();
+    at(operator(), T, yocto(0));
+    g.set_paused("alpha".into(), true);
+    for (who, n) in [(owner(), T), (operator(), T + 1)] {
+        at(who, T, yocto(0));
+        let got = g.hl_cancel("alpha".into(), 1, 77, "pause".into());
+        assert_eq!(
+            serde_json::to_value(&got.payload).unwrap(),
+            json!({
+                "action": { "type": "cancel", "cancels": [{ "a": 1, "o": 77 }] },
+                "nonce": n,
+                "vaultAddress": null,
+            })
+        );
+    }
+    // An asset the policy no longer lists can still be cancelled.
+    let got = g.hl_cancel("alpha".into(), 4242, u64::MAX, String::new());
+    assert_eq!(got.kind, "cancel");
+    assert_eq!(nonce_of("alpha", &g), T + 2);
+}
+
+#[test]
+fn hl_cancel_is_for_the_owner_and_the_operator() {
+    let mut g = hl_desk();
+    at(stranger(), T, yocto(0));
+    assert_refused(
+        "E_NOT_ALLOWED: charlie is neither the owner nor the operator of desk alpha",
+        || {
+            g.hl_cancel("alpha".into(), 1, 77, "x".into());
+        },
+    );
+    at(operator(), T, yocto(0));
+    assert_refused(&format!("{E_NO_DESK}: no desk "), || {
+        g.hl_cancel("bravo".into(), 1, 77, "x".into());
+    });
+    assert_refused("E_ARGS: reason has 281 characters, over 280", || {
+        g.hl_cancel("alpha".into(), 1, 77, "x".repeat(281));
+    });
+    assert_eq!(nonce_of("alpha", &g), 0);
+}
+
 // --- venue setup ---
 
 #[test]
@@ -519,6 +587,7 @@ fn hl_methods_refuse_unknown_arguments_and_only_hl_withdraw_is_payable() {
     let source = include_str!("../hl.rs");
     for method in [
         "hl_order",
+        "hl_cancel",
         "hl_set_referrer",
         "hl_approve_builder_fee",
         "hl_usd_class_transfer",

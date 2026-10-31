@@ -4,8 +4,8 @@
 //! master address. The desk's EVM key signs everything: Gimbal uses no agent wallets.
 
 use gimbal_core::hl::{
-    check_order, check_usdc_amount, max_fee_rate, order_action, prepare_l1, referral_code,
-    set_referrer_action, Address, HlOrder, UserAction,
+    cancel_action, check_order, check_usdc_amount, max_fee_rate, order_action, prepare_l1,
+    referral_code, set_referrer_action, Address, HlOrder, UserAction,
 };
 use gimbal_core::ids::check_reason;
 use near_sdk::{env, near};
@@ -51,6 +51,26 @@ impl Gimbal {
         );
         let nonce = desk.take_hl_nonce(env::block_timestamp_ms());
         let prepared = prepare_l1(keccak, self.config.network, "order", action, nonce);
+        UnsignedAction::hyperliquid(desk_id, prepared, Some(&reason))
+    }
+
+    /// Cancels the desk's resting order `oid` on Hyperliquid asset `asset`:
+    /// `{type:"cancel", cancels:[{a, o}]}`. Owner or operator, also on a paused desk, so a pause
+    /// can stop resting orders. The asset need not be in the policy any more: an owner who drops
+    /// an asset must still be able to cancel what rests on it.
+    #[deny_unknown_arguments]
+    pub fn hl_cancel(
+        &mut self,
+        desk_id: String,
+        asset: u32,
+        oid: u64,
+        reason: String,
+    ) -> UnsignedAction {
+        let (desk, _) = action_desk(&mut self.desks, &desk_id, Gate::ReducesRisk);
+        check_reason(&reason).or_fail();
+        let nonce = desk.take_hl_nonce(env::block_timestamp_ms());
+        let action = cancel_action(asset, oid);
+        let prepared = prepare_l1(keccak, self.config.network, "cancel", action, nonce);
         UnsignedAction::hyperliquid(desk_id, prepared, Some(&reason))
     }
 
