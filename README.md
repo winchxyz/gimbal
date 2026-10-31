@@ -83,8 +83,9 @@ rescue through Intents (with measured seconds), four refusals -->
 
 ## Fees
 
-10% of profit above the owner's high-water mark, charged by the contract when profit is paid out, and
-0.01% per Hyperliquid fill through Hyperliquid's builder code. Nothing on deposits, margin rescues or
+10% of profit above the owner's high-water mark, charged by the contract when profit is paid out;
+0.01% per Hyperliquid fill through Hyperliquid's builder code; and 0.01% per Orderly taker fill as Gimbal's
+Orderly broker markup (maker fills carry none). Nothing on deposits, margin rescues or
 losses; no management fee. Every charge is a `fee_charged` event on NEAR. Each desk also uses the referral
 codes fixed in the contract's config, where a venue has one: on Hyperliquid the desk pays 4% less in fees, and
 Hyperliquid pays the code's owner 10% of the fees the desk pays.

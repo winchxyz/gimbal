@@ -119,10 +119,12 @@ cargo +stable-x86_64-pc-windows-msvc test --workspace   # plain `cargo test` run
 **Orderly**: an EVM-type account owned by the desk's EVM address; the desk's Ed25519 MPC key is registered as
 its orderly key (EIP-712 `AddOrderlyKey`, ≤ 365 days); private REST calls sign `timestamp + METHOD + path + body`,
 valid 300 s. Private reads go over one authenticated WebSocket session (never one MPC signature per read); the
-order book is only on the public WebSocket. Funding periods are 8 h or 4 h — normalise per hour. Taker fee
-3 bps + broker markup. No agent keys. Broker id and chain id are fixed in the contract (`OrderlyConfig`).
-- Referral: once per desk, `POST /v1/referral/bind {referral_code}` (permanent) with `referral_codes.orderly`,
-  which must belong to our broker id; skipped when Gimbal runs its own broker (path and field: verify on day 5).
+order book is only on the public WebSocket. Funding periods are 8 h or 4 h — normalise per hour. No agent keys.
+Broker id and chain id are fixed in the contract (`OrderlyConfig`).
+- Broker: mainnet runs under Gimbal's own broker `gimbal_dex`: taker 4 bps (Orderly's 3 bps + Gimbal's 1 bp
+  markup), maker 0, crypto and RWA alike. Testnet runs under `woofi_dex` (Gimbal's broker is mainnet only).
+- Referral: none. With its own broker Gimbal binds no code (`referral_codes.orderly` = None, setup skips
+  `referral_bind`).
 - Money in: 1Click sends USDC on Arbitrum to the account's exclusive receiver address; Orderly sweeps it into
   its vault and credits it in 1–2 min. Below 5 USDC it is lost, never refunded.
 - Money out: settle PnL first (EIP-712 `SettlePnl`), then EIP-712 `Withdraw` to the desk's EVM address on Arbitrum (40–52 s for small amounts, 1 USDC fee),
