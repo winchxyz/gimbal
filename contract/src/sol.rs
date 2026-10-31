@@ -66,8 +66,8 @@ impl Gimbal {
     /// only signer and fee payer and something to do besides the compute budget
     /// (`E_SOL_MESSAGE`); any other program or instruction is `E_SOL_PROGRAM`, a foreign or
     /// misplaced account `E_SOL_ACCOUNT`, a market outside the policy `E_ASSET`, and each order
-    /// is checked as `hl_order` checks one: `E_ORACLE_STALE` for every priced order until prices
-    /// are stored (C6), `E_PRICE_BAND`, `E_SIZE`. Owner or operator; on a paused desk only a
+    /// is checked as `hl_order` checks one against the stored oracle price: `E_ORACLE_STALE`,
+    /// `E_PRICE_BAND`, `E_SIZE`. Owner or operator; on a paused desk only a
     /// message that reduces risk (besides the compute budget only `cancel_all`, reduce-only
     /// orders, Revokes and transfers into the desk's token accounts, and a priority fee only with
     /// a `cancel_all` or a reduce-only order), else `E_PAUSED`. `kind` is `order`, else the first
@@ -108,7 +108,9 @@ impl Gimbal {
         let message = decode_message(&message_b64).or_fail();
         let accounts = desk_accounts(desk).or_fail();
         let max_age_s = desk.policy.oracle_max_age_s;
-        let reference = |symbol: &str| reference_price(symbol, max_age_s);
+        let block_ms = env::block_timestamp_ms();
+        let prices = &self.prices;
+        let reference = |symbol: &str| reference_price(prices, symbol, max_age_s, block_ms);
         let checked =
             check_message(sha256, &desk.policy, &accounts, &message, &reference, None).or_fail();
         if !checked.reduces_risk {

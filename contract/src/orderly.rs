@@ -8,18 +8,23 @@
 
 use gimbal_core::errors::{Refusal, E_ARGS};
 use gimbal_core::hl::Address;
-use gimbal_core::ids::{check_base58_32, check_reason};
+use gimbal_core::ids::{check_base58_32, check_evm_address, check_reason};
 use gimbal_core::orderly::{
-    account_id, build_request, ws_auth, Broker, Context, Message, OrderlyRequest, Signable,
+    account_id, build_request, check_ip_list, orderly_key, ws_auth, Broker, Context, Message,
+    OrderlyRequest, Signable,
 };
 use near_sdk::{env, near, Promise};
 
 use crate::action::{OrderDetail, UnsignedAction};
+use crate::deposit::check_some_deposit;
 use crate::desk::{Desk, Gate};
+use crate::events::{Event, OrderlyIpsSet, OrderlyReceiverSet};
 use crate::hl::keccak;
 use crate::mpc::recover_evm;
 use crate::prices::reference_price;
-use crate::{action_desk, Gimbal, GimbalExt, OrFail};
+use crate::{
+    action_desk, charge_storage, fail, owner_desk, owner_desk_mut, Gimbal, GimbalExt, OrFail,
+};
 
 /// The Orderly account id of `evm_address` (a checked `0x` address) under `broker_id`, lowercase
 /// `0x` hex: keccak256(abi.encode(address, keccak256(broker_id))).
@@ -144,6 +149,67 @@ impl Gimbal {
         let action = self.prepare_orderly_withdraw(desk_id, amount, withdraw_nonce);
         self.sign(action)
     }
+
+    /// Pins the Orderly account's exclusive receiver address on Arbitrum (`GET
+    /// /v1/client/asset/receiver_address`, read through `orderly_request` kind `receiver_address`),
+    /// the only Orderly recipient a 1Click quote may pay. Owner only: a wrong receiver would send
+    /// every deposit into Orderly elsewhere. Once (`E_ARGS` the second time); a lowercase 0x
+    /// address (`E_ARGS`). Attach the storage it adds (at least 1 yoctoNEAR); the rest is
+    /// refunded. Event `orderly_receiver_set`.
+    #[payable]
+    #[deny_unknown_arguments]
+    pub fn set_orderly_receiver(&mut self, desk_id: String, receiver: String) {
+        let attached = env::attached_deposit();
+        let desk = owner_desk_mut(&mut self.desks, &desk_id, "set_orderly_receiver");
+        check_some_deposit("set_orderly_receiver", attached).or_fail();
+        check_evm_address("receiver", &receiver).or_fail();
+        if let Some(pinned) = &desk.orderly_receiver {
+            fail(Refusal::new(
+                E_ARGS,
+                format!("desk {desk_id} has its Orderly receiver pinned already, {pinned}"),
+            ));
+        }
+        let before = env::storage_usage();
+        desk.orderly_receiver = Some(receiver.clone());
+        self.desks.flush();
+        charge_storage(
+            before,
+            &format!("set_orderly_receiver on desk {desk_id}"),
+            attached,
+        );
+        OrderlyReceiverSet {
+            desk_id: &desk_id,
+            receiver: &receiver,
+        }
+        .emit();
+    }
+
+    /// Sets the relayer IPs the desk's orderly key may be used from, replacing any earlier list:
+    /// 1 to 10 distinct IPv4 or IPv6 addresses in canonical form (`E_ARGS`). The operator applies
+    /// it at Orderly with `orderly_request` kind `ip_restriction`; nothing else reads it. Owner
+    /// only. Attach the storage a longer list adds (at least 1 yoctoNEAR); the rest is refunded.
+    /// Event `orderly_ips_set`.
+    #[payable]
+    #[deny_unknown_arguments]
+    pub fn set_orderly_ips(&mut self, desk_id: String, ips: Vec<String>) {
+        let attached = env::attached_deposit();
+        owner_desk(&self.desks, &desk_id, "set_orderly_ips");
+        check_some_deposit("set_orderly_ips", attached).or_fail();
+        check_ip_list(&ips).or_fail();
+        let before = env::storage_usage();
+        self.orderly_ips.insert(desk_id.clone(), ips.clone());
+        self.orderly_ips.flush();
+        charge_storage(
+            before,
+            &format!("set_orderly_ips on desk {desk_id}"),
+            attached,
+        );
+        OrderlyIpsSet {
+            desk_id: &desk_id,
+            ips: &ips,
+        }
+        .emit();
+    }
 }
 
 impl Gimbal {
@@ -210,16 +276,22 @@ impl Gimbal {
         let (desk, _) = action_desk(&self.desks, &desk_id, Gate::ReducesRisk);
         check_reason(&reason).or_fail();
         let max_age_s = desk.policy.oracle_max_age_s;
-        let reference = |symbol: &str| reference_price(symbol, max_age_s);
+        let block_ms = env::block_timestamp_ms();
+        let prices = &self.prices;
+        let reference = |symbol: &str| reference_price(prices, symbol, max_age_s, block_ms);
+        let authority = check_base58_32("solana.authority", &desk.solana.authority).or_fail();
+        let key = orderly_key(&authority);
         let ctx = Context {
             keccak,
             broker: self.broker(),
             policy: &desk.policy,
             desk_evm: desk_evm(desk),
             referral_code: self.config.treasury.referral_codes.orderly.as_deref(),
-            block_ms: env::block_timestamp_ms(),
+            block_ms,
             request_id: self.upcoming_request_id(),
             reference: &reference,
+            orderly_key: &key,
+            orderly_ips: self.orderly_ips.get(&desk_id).map(Vec::as_slice),
         };
         let signable = build_request(&ctx, &req).or_fail();
         if !signable.reduces_risk {

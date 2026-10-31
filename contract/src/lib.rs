@@ -13,6 +13,7 @@ pub mod hl;
 pub mod mpc;
 pub mod orderly;
 pub mod prices;
+pub mod rescue;
 pub mod sol;
 
 pub use gimbal_core::Refusal;
@@ -30,6 +31,8 @@ use crate::config::{Config, FeeConfig, Network, OrderlyConfig, PriceSource, Trea
 use crate::deposit::{check_one_yocto, check_pause_deposit, check_some_deposit, refund_after};
 use crate::desk::{policy_sha256, Desk, Gate, Role, SolanaAccounts};
 use crate::events::{emit_signed, DeskCreated, Event, OperatorSet, Paused, PolicySet};
+use crate::prices::StoredPrice;
+use crate::rescue::DeskCounters;
 
 /// Gas `on_desk_keys` gets besides its share of what `create_desk` leaves unused: it reads two keys,
 /// hashes one, and writes the desk, or schedules the refund and [`Gimbal::refuse`].
@@ -81,6 +84,9 @@ enum StorageKey {
     DeskCounts,
     DeskIds,
     HlNonces,
+    Prices,
+    DeskCounters,
+    OrderlyIps,
 }
 
 #[near(contract_state)]
@@ -101,6 +107,13 @@ pub struct Gimbal {
     /// The `request_id` of the next signing request, from 0; one per action call that reaches the
     /// MPC contract.
     next_request_id: u64,
+    /// Policy symbol → its last stored oracle price ([`prices`]).
+    prices: LookupMap<String, StoredPrice>,
+    /// Desk id → its rescue window and EIP-3009 counter ([`rescue`]). Stored with the desk, like
+    /// its nonce entry, so an action never adds storage.
+    desk_counters: LookupMap<String, DeskCounters>,
+    /// Desk id → the relayer IPs the owner allows the desk's orderly key from (`set_orderly_ips`).
+    orderly_ips: LookupMap<String, Vec<String>>,
 }
 
 #[near]
@@ -133,6 +146,9 @@ impl Gimbal {
             desk_ids: LookupMap::new(StorageKey::DeskIds),
             hl_nonces: LookupMap::new(StorageKey::HlNonces),
             next_request_id: 0,
+            prices: LookupMap::new(StorageKey::Prices),
+            desk_counters: LookupMap::new(StorageKey::DeskCounters),
+            orderly_ips: LookupMap::new(StorageKey::OrderlyIps),
         }
     }
 
@@ -452,12 +468,14 @@ impl Gimbal {
         refund
     }
 
-    /// Stores the desk and its nonce entry and appends its id to the owner's ids; returns the
-    /// bytes that took.
+    /// Stores the desk, its nonce entry and its counters and appends its id to the owner's ids;
+    /// returns the bytes that took.
     fn write_desk(&mut self, desk_id: &str, desk: &Desk) -> u64 {
         let before = env::storage_usage();
         self.desks.insert(desk_id.to_owned(), desk.clone());
         self.hl_nonces.insert(desk_id.to_owned(), 0);
+        self.desk_counters
+            .insert(desk_id.to_owned(), DeskCounters::default());
         let n = self.desk_counts.get(&desk.owner).copied().unwrap_or(0);
         self.desk_ids
             .insert((desk.owner.clone(), n), desk_id.to_owned());
@@ -471,6 +489,7 @@ impl Gimbal {
     fn unwrite_desk(&mut self, desk_id: &str, owner: &AccountId) {
         self.desks.remove(desk_id);
         self.hl_nonces.remove(desk_id);
+        self.desk_counters.remove(desk_id);
         let count = self.desk_counts.get(owner).copied().unwrap_or(0);
         if let Some(last) = count.checked_sub(1) {
             self.desk_ids.remove(&(owner.clone(), last));
@@ -487,6 +506,7 @@ impl Gimbal {
     fn flush_desks(&mut self) {
         self.desks.flush();
         self.hl_nonces.flush();
+        self.desk_counters.flush();
         self.desk_counts.flush();
         self.desk_ids.flush();
     }
