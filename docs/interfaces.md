@@ -538,7 +538,7 @@ export interface FundingPayment {
 export interface MarketFunding extends FundingRate {   // the prices the rate applies to, from the same read,
   markPx: number | null;                               // so the scanner prices basis and size without a book
   oraclePx: number | null;                             // per market; null where the venue does not say
-  openInterest: number | null;           // base units
+  openInterest: number | null;           // units of `symbol` (what markPx prices); USD = openInterest × markPx
   volume24hUsd: number | null;
   base?: string;                         // cross-venue key the scanner pairs on: quote, suffixes, broker tags stripped,
                                          // aliases applied ("kPEPE" → "PEPE", "PERP_SOL_USDC" → "SOL", "XBT" → "BTC")

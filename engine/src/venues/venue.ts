@@ -24,7 +24,7 @@ export interface Market {
 export interface MarketFunding extends FundingRate {
   markPx: number | null;
   oraclePx: number | null;
-  openInterest: number | null;   // base units
+  openInterest: number | null;   // units of `symbol` (what markPx prices); USD = openInterest × markPx
   volume24hUsd: number | null;
   base?: string;                 // the cross-venue key the scanner pairs on: quote, suffixes and broker tags stripped,
                                  // aliases applied ("kPEPE" → "PEPE", "PERP_SOL_USDC" → "SOL", "XBT" → "BTC");
