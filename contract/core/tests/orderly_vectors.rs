@@ -6,9 +6,9 @@ use gimbal_core::decimal::parse_e8;
 use gimbal_core::errors::{E_ARGS, E_ASSET, E_DECIMAL, E_ORACLE_STALE, E_PRICE_BAND, E_SIZE};
 use gimbal_core::network::Network;
 use gimbal_core::orderly::{
-    account_id, build_request, checksum_address, client_order_id, order_body, orderly_key,
-    parse_signature, signed_message_body, ws_auth, Broker, Context, Message, OrderlyRequest,
-    KEY_SCOPE, LEDGER_MAINNET, LEDGER_TESTNET, MAX_AHEAD_MS, MAX_KEY_LIFETIME_MS,
+    account_id, build_request, check_ip_list, checksum_address, client_order_id, order_body,
+    orderly_key, parse_signature, signed_message_body, ws_auth, Broker, Context, Message,
+    OrderlyRequest, KEY_SCOPE, LEDGER_MAINNET, LEDGER_TESTNET, MAX_AHEAD_MS, MAX_KEY_LIFETIME_MS,
     OFF_CHAIN_VERIFYING_CONTRACT, REQUEST_TTL_MS,
 };
 use gimbal_core::policy::{Policy, UnpricedAsset};
@@ -17,6 +17,9 @@ use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
 
 const VECTORS: &str = include_str!("vectors/orderly.json");
+
+/// The orderly key of the vectors' desk (Solana authority GmaDrpp…, the seed 0x07…07).
+const DESK_ORDERLY_KEY: &str = "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB";
 
 fn keccak(data: &[u8]) -> [u8; 32] {
     Keccak256::digest(data).into()
@@ -302,6 +305,8 @@ fn context<'a>(
         block_ms,
         request_id: 0,
         reference,
+        orderly_key: DESK_ORDERLY_KEY,
+        orderly_ips: None,
     }
 }
 
@@ -535,6 +540,8 @@ fn ctx_at<'a>(policy: &'a Policy, referral_code: Option<&'a str>) -> Context<'a>
         block_ms: BLOCK,
         request_id: 0,
         reference: &vector_price,
+        orderly_key: DESK_ORDERLY_KEY,
+        orderly_ips: None,
     }
 }
 
@@ -1072,4 +1079,69 @@ fn eip712_refusals() {
     }
     let m = Message::withdraw(to, "0.000001", 1, BLOCK).unwrap();
     assert!(matches!(m, Message::Withdraw { amount_e6: 1, .. }));
+}
+
+/// `ip_restriction` posts the desk's orderly key and the owner's list, comma-joined; without a
+/// list it is refused, and only a canonical list of 1 to 10 distinct addresses is built.
+#[test]
+fn ip_restriction_applies_the_owners_list() {
+    let policy = vector_policy();
+    let ips = vec!["203.0.113.7".to_string(), "2001:db8::1".to_string()];
+    let ctx = Context {
+        orderly_ips: Some(&ips),
+        ..ctx_at(&policy, None)
+    };
+    let s = build_request(&ctx, &req(json!({ "kind": "ip_restriction" }))).unwrap();
+    assert_eq!(s.kind, "ip_restriction");
+    assert_eq!(s.method, "POST");
+    assert_eq!(s.path, "/v1/client/set_orderly_key_ip_restriction");
+    assert_eq!(
+        s.body,
+        "{\"orderly_key\":\"ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB\",\
+         \"ip_restriction_list\":\"203.0.113.7,2001:db8::1\"}"
+    );
+    assert!(s.reduces_risk, "it passes a paused desk");
+    assert!(s.order.is_none() && s.amount.is_none() && s.eip712.is_none());
+
+    let none = build_request(
+        &ctx_at(&policy, None),
+        &req(json!({ "kind": "ip_restriction" })),
+    );
+    assert_eq!(refused(none).code, E_ARGS);
+    let extra = build_request(
+        &ctx,
+        &req(json!({ "kind": "ip_restriction", "symbol": "PERP_ETH_USDC" })),
+    );
+    assert_eq!(refused(extra).code, E_ARGS);
+
+    let list = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    for ok in [
+        list(&["1.2.3.4"]),
+        list(&["0.0.0.0", "255.255.255.255"]),
+        list(&["::1", "fe80::1:2", "2001:db8:0:1:1:1:1:1", "1::"]),
+        list(&["::ffff:1.2.3.4"]),
+        (0..10).map(|i| format!("10.0.0.{i}")).collect(),
+    ] {
+        assert!(check_ip_list(&ok).is_ok(), "{ok:?}");
+    }
+    for bad in [
+        list(&[]),
+        (0..11).map(|i| format!("10.0.0.{i}")).collect(),
+        list(&["1.2.3.4", "1.2.3.4"]),
+        list(&["01.2.3.4"]),
+        list(&["1.2.3"]),
+        list(&["1.2.3.256"]),
+        list(&[" 1.2.3.4"]),
+        list(&["1.2.3.4/32"]),
+        list(&["1.2.3.4,5.6.7.8"]),
+        list(&["2001:DB8::1"]),
+        list(&["2001:db8:0:0:0:0:0:1"]),
+        list(&["2001:0db8::1"]),
+        list(&["2001:db8::0:1"]),
+        list(&["[::1]"]),
+        list(&["localhost"]),
+        list(&[""]),
+    ] {
+        assert_eq!(refused(check_ip_list(&bad)).code, E_ARGS, "{bad:?}");
+    }
 }

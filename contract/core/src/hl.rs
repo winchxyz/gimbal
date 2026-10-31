@@ -221,8 +221,7 @@ pub struct CheckedOrder {
 /// price, any other symbol a reference price (`E_ORACLE_STALE`), the band around it
 /// (`E_PRICE_BAND`) and `sz × max(px, reference)` within `max_notional_usd` (`E_SIZE`).
 ///
-/// `reference_e8` is the symbol's oracle price if it is fresh, else `None` (the contract passes
-/// `None` until it stores prices, C6).
+/// `reference_e8` is the symbol's stored oracle price if it is fresh, else `None`.
 pub fn check_order(
     policy: &Policy,
     order: &HlOrder,
