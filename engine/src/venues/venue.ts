@@ -105,7 +105,23 @@ export interface VenueReader extends FundingHistorySource {
   account(address: string): Promise<AccountState>;
 }
 
-export type VenueMethod = 'markets' | 'funding' | 'book' | 'account' | 'userFunding';
+/**
+ * One funding print of a market from the venue's public history: the rate a position held over the period that
+ * ends at `time` was priced at. Engine-internal: the scanner's 7-day gross APR and the window history.
+ */
+export interface MarketFundingPoint {
+  time: number;                  // ms, when the period ended (the venue books it then)
+  symbol: string;                // the venue's own symbol
+  ratePerHour: number;           // fraction per hour; > 0 means longs pay shorts
+  periodHours: number;           // hours the print covers: 1 on Hyperliquid and Phoenix, 4 or 8 on Orderly
+}
+
+/** Public funding history of one market, oldest first, with `startTime <= time <= endTime` (ms). */
+export interface MarketHistorySource {
+  marketFundingHistory(symbol: string, startTime: number, endTime: number): Promise<MarketFundingPoint[]>;
+}
+
+export type VenueMethod = 'markets' | 'funding' | 'book' | 'account' | 'userFunding' | 'marketFundingHistory';
 
 /** Time source shared by readers, the recorder and replay, so replay can swap in a virtual clock. */
 export interface Clock {

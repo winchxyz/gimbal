@@ -9,13 +9,16 @@ import {
   PhoenixHttpError, api, buildTraderMarginInputsFromSnapshot, createMarginCalculator, createPhoenixClient, priceUsdToTicks,
 } from '@ellipsis-labs/rise';
 import type {
-  ExchangeMarketConfig, FundingHourlyEvent, FundingOverviewResponse, HttpTransport, LatestMarketsStatsResponse,
-  MarketParams, OrderbookView, PhoenixClient, QueryParams, RequestOptions, TraderStateSnapshotResponse,
+  ExchangeMarketConfig, FundingHourlyEvent, FundingOverviewResponse, FundingOverviewSeries, HttpTransport,
+  LatestMarketsStatsResponse, MarketParams, OrderbookView, PhoenixClient, QueryParams, RequestOptions,
+  TraderStateSnapshotResponse,
 } from '@ellipsis-labs/rise';
 import type {
-  AccountState, Book, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, Position, VenueReader,
+  AccountState, Book, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, MarketFundingPoint,
+  MarketHistorySource, Position, VenueReader,
 } from './venue.ts';
 import { systemClock, trimBook } from './venue.ts';
+import { baseFields, kiloBase } from './base-symbol.ts';
 import {
   baseLotSize, baseLotsToUnits, fundingRatePerHour, percentToFraction, phoenixTimeMs, priceDecimals, quoteLotsToUsd,
   tickSizeUsd,
@@ -31,6 +34,8 @@ const FUNDING_PAGE_ROWS = 1000;
 const FUNDING_MAX_PAGES = 200;
 // Market configs change only with a listing; account() and funding() reuse them this long.
 const CONFIG_TTL_MS = 10 * 60_000;
+// One overview request per history read: 31 days of hours at most, so a request stays a few hundred kB.
+const HISTORY_MAX_POINTS = 31 * 24 + 2;
 
 /** A Phoenix market, with what the desk's policy and fee model need on top of the shared shape. */
 export interface PhoenixMarket extends Market {
@@ -55,7 +60,7 @@ export interface PhoenixReaderOptions {
   traderPdaIndex?: number;       // which trader account of an authority; 0 unless the desk registers more
 }
 
-export class PhoenixReader implements VenueReader, FundingHistorySource {
+export class PhoenixReader implements VenueReader, FundingHistorySource, MarketHistorySource {
   readonly id = 'phoenix' as const;
   readonly apiUrl: string;
   readonly #rpcUrl: string;
@@ -161,6 +166,26 @@ export class PhoenixReader implements VenueReader, FundingHistorySource {
       cursor = res.nextCursor;
     }
     return out.sort((a, b) => a.time - b.time || a.symbol.localeCompare(b.symbol));
+  }
+
+  /**
+   * Hourly funding prints of one market with `startTime <= time <= endTime` (ms), oldest first, from the public
+   * funding overview of that symbol, priced like funding(): fundingAmountPerUnit / markPrice of each booked hour.
+   */
+  async marketFundingHistory(symbol: string, startTime: number, endTime: number): Promise<MarketFundingPoint[]> {
+    if (!Number.isInteger(startTime) || !Number.isInteger(endTime) || startTime < 0 || endTime < startTime) {
+      throw new RangeError(`marketFundingHistory needs ms timestamps with start <= end, got ${startTime}, ${endTime}`);
+    }
+    const limit = Math.ceil((endTime - startTime) / HOUR_MS) + 2;
+    if (limit > HISTORY_MAX_POINTS) throw new RangeError(`phoenix marketFundingHistory: ${limit} hours asked, at most ${HISTORY_MAX_POINTS}`);
+    let series: FundingOverviewSeries;
+    try {
+      series = await this.#api().funding.getFundingOverviewBySymbol(symbol, { startTime, endTime, perMarketLimit: limit });
+    } catch (err) {
+      if (err instanceof PhoenixHttpError && err.status === 404) throw new Error(`phoenix funding overview: unknown symbol ${symbol}`);
+      throw err;
+    }
+    return parseFundingSeries(series, startTime, endTime);
   }
 
   /** Releases the SDK client, if one was made. Reads after this make a new one. */
@@ -299,6 +324,7 @@ export function parseFunding(
     out.push({
       venue: 'phoenix',
       symbol: series.symbol,
+      ...baseFields(phoenixBase(series.symbol)),
       // The amount is per funding interval (one hour on every market so far); scale to one hour regardless.
       ratePerHour: (fundingRatePerHour(point.fundingAmountPerUnit, point.markPrice) * HOUR_MS) / intervalMs || 0,
       settlement: 'daily',
@@ -310,6 +336,28 @@ export function parseFunding(
     });
   }
   return out;
+}
+
+/**
+ * The cross-venue key of a Phoenix market: symbols are the asset's own name ("SOL", "NVDA"), except the per-thousand
+ * coins, which Phoenix lists the way Hyperliquid does ("kBONK", "kPEPE", "kSHIB": 1000 units each, same marks).
+ */
+export function phoenixBase(symbol: string): { base: string; multiplier: number } {
+  return kiloBase(symbol);
+}
+
+/**
+ * One market's overview series as hourly history points: each booked hour priced as fundingAmountPerUnit / markPrice,
+ * the same as funding(). Points outside [startTime, endTime] are dropped; one point per booked time.
+ */
+export function parseFundingSeries(series: FundingOverviewSeries, startTime: number, endTime: number): MarketFundingPoint[] {
+  const byTime = new Map<number, MarketFundingPoint>();
+  for (const p of series.points) {
+    const time = phoenixTimeMs(p.timestamp);
+    if (time < startTime || time > endTime) continue;
+    byTime.set(time, { time, symbol: series.symbol, ratePerHour: fundingRatePerHour(p.fundingAmountPerUnit, p.markPrice), periodHours: 1 });
+  }
+  return [...byTime.values()].sort((a, b) => a.time - b.time);
 }
 
 export function parseBook(raw: OrderbookView, time: number): Book {

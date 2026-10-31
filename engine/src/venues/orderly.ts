@@ -8,9 +8,11 @@
 // keeps its full symbol and never maps to the shared base symbol (orderlyBaseSymbol).
 
 import type {
-  AccountState, Book, BookLevel, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, Position, VenueReader,
+  AccountState, Book, BookLevel, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, MarketHistorySource,
+  Position, VenueReader,
 } from './venue.ts';
 import { systemClock, trimBook } from './venue.ts';
+import { baseFields } from './base-symbol.ts';
 import type { OrderlyEndpoints, OrderlyNetwork } from './orderly-http.ts';
 import { ORDERLY_ENDPOINTS, normalizeAccountId, readOrderlyData } from './orderly-http.ts';
 import type { OrderlyFundingFeePage, OrderlyFundingFeeRow } from './orderly-actions.ts';
@@ -153,12 +155,30 @@ export function orderlyBaseSymbol(symbol: string): string | null {
   return m === null ? null : m[1]!;
 }
 
+/**
+ * Orderly names that are another venue's base under a different name: marks agreed within 0.1 % with Phoenix's
+ * GOLD, SILVER and WTIOIL on 2026-10-31 (XAU 3890.61 / 3888.2, XAG 49.39 / 49.407, CL 103.05 / 103.11).
+ */
+export const ORDERLY_ALIASES: Readonly<Record<string, string>> = { XAU: 'GOLD', XAG: 'SILVER', CL: 'WTIOIL' };
+
+/**
+ * The cross-venue key of an Orderly market: "PERP_SOL_USDC" -> SOL, "PERP_1000PEPE_USDC" -> 1000 PEPE, aliases
+ * applied. A broker's own market keeps its full symbol as its key, so it never pairs with the shared one.
+ */
+export function orderlyBase(symbol: string): { base: string; multiplier: number } {
+  const name = orderlyBaseSymbol(symbol);
+  if (name === null) return { base: symbol, multiplier: 1 };
+  const thousand = /^1000([A-Z0-9]+)$/.exec(name);
+  if (thousand !== null) return { base: thousand[1]!, multiplier: 1000 };
+  return { base: ORDERLY_ALIASES[name] ?? name, multiplier: 1 };
+}
+
 /** A market the desk can trade: a shared one, or its own broker's. */
 export function tradableByBroker(row: { broker_id: string | null }, brokerId: string | null): boolean {
   return row.broker_id === null || (brokerId !== null && row.broker_id === brokerId);
 }
 
-export class OrderlyReader implements VenueReader, FundingHistorySource {
+export class OrderlyReader implements VenueReader, FundingHistorySource, MarketHistorySource {
   readonly id = 'orderly' as const;
   readonly network: OrderlyNetwork;
   readonly apiUrl: string;
@@ -437,6 +457,7 @@ export function parseFunding(
     out.push({
       venue: 'orderly',
       symbol: f.symbol,
+      ...baseFields(orderlyBase(f.symbol)),
       ratePerHour: ratePerHourFromPeriod(f.est_funding_rate, period),
       settlement,
       nextAt: f.next_funding_time,

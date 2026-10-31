@@ -9,11 +9,12 @@ import type { RecordLine, WireLine } from './recorder.ts';
 import { requestUrl, wireRequest, withoutId } from './recorder.ts';
 import type { WsRequester } from './ws.ts';
 import type {
-  AccountState, Book, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, VenueMethod, VenueReader,
+  AccountState, Book, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, MarketFundingPoint,
+  MarketHistorySource, VenueMethod, VenueReader,
 } from './venue.ts';
 import { systemClock, trimBook } from './venue.ts';
 
-const METHODS: readonly VenueMethod[] = ['markets', 'funding', 'book', 'account', 'userFunding'];
+const METHODS: readonly VenueMethod[] = ['markets', 'funding', 'book', 'account', 'userFunding', 'marketFundingHistory'];
 
 /** A call the recording cannot answer: nothing recorded for it at or before the clock's time. */
 export class ReplayMissError extends Error {
@@ -181,7 +182,7 @@ function checkLine(v: unknown, where: string): RecordLine {
   return v as RecordLine;
 }
 
-export class ReplayVenue implements VenueReader, FundingHistorySource {
+export class ReplayVenue implements VenueReader, FundingHistorySource, MarketHistorySource {
   readonly id: VenueId;
   readonly start: number;          // first answer in the recording, ms
   readonly end: number;            // last answer, ms
@@ -239,6 +240,11 @@ export class ReplayVenue implements VenueReader, FundingHistorySource {
   /** Only a window that was recorded is answered: the same address, startTime and endTime (or none). */
   async userFunding(address: string, startTime: number, endTime?: number): Promise<FundingPayment[]> {
     return this.#answer<FundingPayment[]>('userFunding', endTime === undefined ? [address, startTime] : [address, startTime, endTime]);
+  }
+
+  /** Only a window that was recorded is answered: the same symbol, startTime and endTime. */
+  async marketFundingHistory(symbol: string, startTime: number, endTime: number): Promise<MarketFundingPoint[]> {
+    return this.#answer<MarketFundingPoint[]>('marketFundingHistory', [symbol, startTime, endTime]);
   }
 
   #answer<T>(method: VenueMethod, args: unknown[]): T {

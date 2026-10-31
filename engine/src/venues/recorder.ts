@@ -13,7 +13,8 @@ import { pipeline } from 'node:stream/promises';
 import { constants, createGzip } from 'node:zlib';
 import type { VenueId } from '@gimbal/shared';
 import type {
-  AccountState, Book, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, VenueMethod, VenueReader,
+  AccountState, Book, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, MarketFundingPoint,
+  MarketHistorySource, VenueMethod, VenueReader,
 } from './venue.ts';
 import { systemClock } from './venue.ts';
 import type { WsRequester } from './ws.ts';
@@ -48,7 +49,7 @@ export interface LineSink<L> {
 
 export type RecordSink = LineSink<RecordLine>;
 
-export class RecordingVenue implements VenueReader, FundingHistorySource {
+export class RecordingVenue implements VenueReader, FundingHistorySource, MarketHistorySource {
   readonly id: VenueId;
   readonly #inner: VenueReader;
   readonly #sink: RecordSink;
@@ -81,6 +82,15 @@ export class RecordingVenue implements VenueReader, FundingHistorySource {
   userFunding(address: string, startTime: number, endTime?: number): Promise<FundingPayment[]> {
     const args = endTime === undefined ? [address, startTime] : [address, startTime, endTime];
     return this.#call('userFunding', args, () => this.#inner.userFunding(address, startTime, endTime));
+  }
+
+  /** Recorded like every other call; a reader without public history fails the call (and that is recorded too). */
+  marketFundingHistory(symbol: string, startTime: number, endTime: number): Promise<MarketFundingPoint[]> {
+    const inner = this.#inner as VenueReader & Partial<MarketHistorySource>;
+    return this.#call('marketFundingHistory', [symbol, startTime, endTime], async () => {
+      if (typeof inner.marketFundingHistory !== 'function') throw new Error(`${this.id}: no public funding history`);
+      return inner.marketFundingHistory(symbol, startTime, endTime);
+    });
   }
 
   async #call<T>(method: VenueMethod, args: unknown[], run: () => Promise<T>): Promise<T> {
