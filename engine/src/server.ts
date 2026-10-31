@@ -4,9 +4,18 @@
 //   GET /windows/history?id=     WindowHistory of one window (404 when the last scan did not list it)
 //   GET /strategy, PUT /strategy StrategyConfig (PUT takes the whole config, checked, and answers the new one)
 //   GET /journal?before=<id>     JournalEntry[]: up to 100 entries older than that id, newest first ([] past the
-//                                oldest; 404 for an id not in memory); without `before`, the newest 100
+//                                oldest, and for an id not in memory); without `before`, the newest 100
 // The scanner feeds it: every scan publishes a `scan` and a `windows` event. Routes other parts build later answer
 // 501 for now (POST /rotate and /close in their own { ok, reason } shape).
+//
+// Only this machine's dashboard may use it. PUT /strategy changes what the desk trades, and a web page on any other
+// site could otherwise reach a local server (a cross-site form post, or DNS rebinding a name onto 127.0.0.1), so:
+// - it listens on 127.0.0.1 unless told otherwise (GIMBAL_HOST);
+// - a Host header that does not name this machine (localhost, 127.0.0.1, [::1], or the address it was told to bind)
+//   is refused, which stops DNS rebinding; the dashboard's dev proxy rewrites Host to the engine's, so it passes;
+// - an Origin header other than the dashboard's own (dev and preview, on localhost) is refused;
+// - POST and PUT need a JSON content type, which a cross-site form cannot send without a CORS preflight, and the
+//   engine answers no preflight.
 
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
@@ -20,12 +29,22 @@ import { parseStrategyConfig } from './scanner/config.ts';
 import type { ScanResult, Scanner } from './scanner/scanner.ts';
 
 export const DEFAULT_ENGINE_PORT = 8790;
+export const DEFAULT_ENGINE_HOST = '127.0.0.1';
+/** The dashboard's origins: Vite dev and preview both serve it on port 5190 (web/vite.config.ts). */
+export const DEFAULT_WEB_ORIGINS: readonly string[] = ['http://localhost:5190', 'http://127.0.0.1:5190', 'http://[::1]:5190'];
+/** Names a Host header may carry for this machine, with or without a port. */
+const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
 /** Journal entries per page: GET /state's newest and each GET /journal?before= page. */
 const JOURNAL_PAGE = 100;
 /** Entries kept in memory for paging back; older ones are not served (the journal is not persisted yet). */
 const JOURNAL_KEEP = 5_000;
 const HEARTBEAT_MS = 15_000;
 const MAX_BODY_BYTES = 64 * 1024;
+/**
+ * An SSE client with more than this queued and unread is dropped: a stalled tab would otherwise make the engine
+ * hold every event since it stalled. EventSource reconnects on its own and gets the latest state first.
+ */
+const SSE_MAX_BUFFER_BYTES = 1024 * 1024;
 
 export interface EngineServerOptions {
   mode: Mode;
@@ -39,6 +58,10 @@ export interface EngineServerOptions {
   log?: (line: string) => void;
   /** Called after every scan, with what it produced. */
   onScan?: (result: ScanResult) => void;
+  /** Origins allowed to call the engine from a browser; default DEFAULT_WEB_ORIGINS. */
+  allowedOrigins?: readonly string[];
+  /** Unread SSE bytes after which a client is dropped; default 1 MiB. */
+  sseMaxBufferBytes?: number;
 }
 
 type Latest = {
@@ -61,10 +84,13 @@ export class EngineServer {
   #heartbeat: ReturnType<typeof setInterval> | undefined;
   #running = false;
   #scanning: Promise<void> | null = null;
+  #hostnames = new Set(LOCAL_HOSTNAMES);
+  readonly #origins: ReadonlySet<string>;
 
   constructor(options: EngineServerOptions) {
     this.#options = options;
     this.#strategy = options.strategy;
+    this.#origins = new Set(options.allowedOrigins ?? DEFAULT_WEB_ORIGINS);
     this.#server = createServer((req, res) => {
       this.#route(req, res).catch((err: unknown) => {
         this.#log(`${req.method} ${req.url}: ${errorMessage(err)}`);
@@ -79,11 +105,27 @@ export class EngineServer {
     return this.#strategy;
   }
 
-  /** Listens on `port` (0 = any free port) and starts scanning; resolves with the port it listens on. */
-  async start(port: number): Promise<number> {
+  /** SSE clients connected now. */
+  get clientCount(): number {
+    return this.#clients.size;
+  }
+
+  /** Where it listens, once started. */
+  get address(): { host: string; port: number } | null {
+    const a = this.#server.address();
+    return a === null || typeof a === 'string' ? null : { host: a.address, port: a.port };
+  }
+
+  /**
+   * Listens on `host`:`port` (0 = any free port) and starts scanning; resolves with the port it listens on. A
+   * specific address to bind is also accepted as a Host header (a wildcard such as 0.0.0.0 is not a name).
+   */
+  async start(port: number, host: string = DEFAULT_ENGINE_HOST): Promise<number> {
+    const bound = host.includes(':') ? `[${host.toLowerCase()}]` : host.toLowerCase();
+    if (host !== '0.0.0.0' && host !== '::') this.#hostnames.add(bound);
     await new Promise<void>((resolve, reject) => {
       this.#server.once('error', reject);
-      this.#server.listen(port, () => {
+      this.#server.listen(port, host, () => {
         this.#server.off('error', reject);
         resolve();
       });
@@ -144,7 +186,12 @@ export class EngineServer {
     const started = Date.now();
     this.#scanning = this.scanOnce().then(
       () => undefined,
-      (err: unknown) => this.#log(`scan failed: ${errorMessage(err)}`),
+      (err: unknown) => {
+        this.#log(`scan failed: ${errorMessage(err)}`);
+        // The last windows are no longer current: say so rather than serve them as fresh.
+        const last = this.#latest.windows;
+        if (last !== null && last.some((w) => !w.stale)) this.publish({ type: 'windows', data: last.map((w) => ({ ...w, stale: true })) });
+      },
     ).finally(() => {
       this.#scanning = null;
       if (!this.#running) return;
@@ -154,7 +201,37 @@ export class EngineServer {
   }
 
   #write(chunk: string): void {
-    for (const res of this.#clients) res.write(chunk);
+    for (const res of this.#clients) this.#send(res, chunk);
+  }
+
+  /** Writes to one SSE client, and drops it once it has more queued than it reads. */
+  #send(res: ServerResponse, chunk: string): void {
+    res.write(chunk);
+    const cap = this.#options.sseMaxBufferBytes ?? SSE_MAX_BUFFER_BYTES;
+    if (res.writableLength > cap) {
+      this.#clients.delete(res);
+      this.#log(`SSE client dropped: ${res.writableLength} bytes unread, over ${cap}`);
+      res.destroy();
+    }
+  }
+
+  /** Why a request is refused before routing (see the top of this file), or null. */
+  #refusal(req: IncomingMessage): { status: number; error: string } | null {
+    const host = (req.headers.host ?? '').toLowerCase();
+    const name = /^(\[[0-9a-f:.]*\]|[^:[\]]+)(:\d+)?$/.exec(host)?.[1];
+    if (name === undefined || !this.#hostnames.has(name)) {
+      return { status: 403, error: `host ${JSON.stringify(req.headers.host ?? '')} is not this machine: the engine answers its own dashboard only` };
+    }
+    const origin = req.headers.origin;
+    if (origin !== undefined && !this.#origins.has(origin)) {
+      return { status: 403, error: `origin ${JSON.stringify(origin)} is not the dashboard's` };
+    }
+    const method = req.method ?? 'GET';
+    if (method === 'POST' || method === 'PUT') {
+      const type = (req.headers['content-type'] ?? '').split(';')[0]!.trim().toLowerCase();
+      if (type !== 'application/json') return { status: 415, error: `${method} needs content-type application/json` };
+    }
+    return null;
   }
 
   #log(line: string): void {
@@ -165,6 +242,11 @@ export class EngineServer {
     const url = new URL(req.url ?? '/', 'http://engine');
     const method = req.method ?? 'GET';
     const path = url.pathname.replace(/\/+$/, '') || '/';
+    const refused = this.#refusal(req);
+    if (refused !== null) {
+      this.#log(`refused ${method} ${path}: ${refused.error}`);
+      return json(res, refused.status, { error: refused.error });
+    }
 
     if (path === '/events') {
       if (method !== 'GET') return notAllowed(res, 'GET');
@@ -186,8 +268,9 @@ export class EngineServer {
       if (method !== 'GET') return notAllowed(res, 'GET');
       const before = url.searchParams.get('before');
       if (before === null || before === '') return json(res, 200, this.#journal.slice(0, JOURNAL_PAGE));
+      // An id not in memory (older than the last JOURNAL_KEEP, or never seen) has nothing older to page to.
       const at = this.#journal.findIndex((e) => e.id === before);
-      if (at === -1) return json(res, 404, { error: `no journal entry ${before} in the last ${JOURNAL_KEEP}` });
+      if (at === -1) return json(res, 200, []);
       return json(res, 200, this.#journal.slice(at + 1, at + 1 + JOURNAL_PAGE));
     }
     if (path === '/strategy') {
@@ -226,12 +309,12 @@ export class EngineServer {
       connection: 'keep-alive',
       'x-accel-buffering': 'no',
     });
-    res.write('retry: 5000\n\n');
+    this.#clients.add(res);
+    this.#send(res, 'retry: 5000\n\n');
     for (const type of ['scan', 'windows', 'desk', 'health', 'setup', 'rescue'] as const) {
       const data = this.#latest[type];
-      if (data !== null) res.write(`data: ${JSON.stringify({ type, data })}\n\n`);
+      if (data !== null && this.#clients.has(res)) this.#send(res, `data: ${JSON.stringify({ type, data })}\n\n`);
     }
-    this.#clients.add(res);
     const drop = () => this.#clients.delete(res);
     req.on('close', drop);
     res.on('close', drop);

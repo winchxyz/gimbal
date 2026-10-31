@@ -1,0 +1,59 @@
+// What PUT /strategy accepts: finite numbers inside sane bounds, nothing unknown.
+
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import type { ContractPolicy } from '@gimbal/shared';
+import { DEFAULT_STRATEGY, STRATEGY_LIMITS, parseStrategyConfig } from './config.ts';
+
+const POLICY: ContractPolicy = {
+  hl_assets: [{ index: 5, symbol: 'SOL', sz_decimals: 2 }],
+  phoenix_markets: [{ symbol: 'SOL', orderbook: 'test-orderbook-sol', base_lot_e8: 1, tick_e8: 1 }],
+  orderly_symbols: ['PERP_SOL_USDC'],
+  max_notional_usd: 5000, price_band_bps: 100, oracle_max_age_s: 60, rescue_cap_usd_per_hour: 500,
+  unpriced: [{ symbol: 'WIF', max_sz: '5000.5' }], unpriced_max_notional_usd: 100,
+  max_transfer_cost_bps: 50, max_transfer_cost_flat_e6: 2_000_000,
+};
+
+test('strategy: the default passes and comes back as a clean copy', () => {
+  const out = parseStrategyConfig(DEFAULT_STRATEGY, POLICY);
+  assert.deepEqual(out, DEFAULT_STRATEGY);
+  assert.notEqual(out, DEFAULT_STRATEGY);
+  assert.notEqual(out.risk, DEFAULT_STRATEGY.risk);
+});
+
+test('strategy: what a hostile page sent is refused, field by field', () => {
+  const bad: [Record<string, unknown>, RegExp][] = [
+    // The values a cross-site PUT tried: a negative minimum, a billion-dollar leg, 1000× leverage.
+    [{ minNetAprPct: -1000 }, /minNetAprPct must be a number from 0 to 1000/],
+    [{ legUsd: 1e9 }, /legUsd must be a number > 0 and <= 100000/],
+    [{ maxLeverage: 1000 }, /maxLeverage must be a number from 1 to 10/],
+    // 1e308 passes a plain > 0 check and turns into NaN and Infinity in every cost term.
+    [{ legUsd: 1e308 }, /legUsd must be a number > 0/],
+    [{ legUsd: 0 }, /legUsd must be a number > 0/],
+    [{ legUsd: Number.NaN }, /legUsd must be a number > 0/],
+    [{ legUsd: '1000' }, /legUsd must be a number > 0/],
+    [{ legUsd: 6000 }, /legUsd 6000 is over the policy cap of 5000 USD per leg/],
+    [{ maxLeverage: 0.5 }, /maxLeverage must be a number from 1 to 10/],
+    [{ minNetAprPct: 1e6 }, /minNetAprPct must be a number from 0 to 1000/],
+    [{ stopDrawdownPct: 0 }, /stopDrawdownPct must be null or a percentage in \(0, 100\]/],
+    [{ stopDrawdownPct: 101 }, /stopDrawdownPct must be null/],
+    [{ rotate: { minGainPts: -1, forHours: 4 } }, /rotate needs minGainPts from 0 to 1000/],
+    [{ rotate: { minGainPts: 3, forHours: 1e6 } }, /forHours from 0 to 720/],
+    [{ rotate: { minGainPts: 3, forHours: 4, when: 'now' } }, /unknown field rotate.when/],
+    [{ risk: { watchDistancePct: 8, rescueDistancePct: 15 } }, /0 < rescueDistancePct < watchDistancePct < 100/],
+    [{ risk: { watchDistancePct: 8, rescueDistancePct: 8 } }, /0 < rescueDistancePct < watchDistancePct < 100/],
+    [{ risk: { watchDistancePct: 150, rescueDistancePct: 8 } }, /watchDistancePct < 100/],
+    [{ risk: { watchDistancePct: 15, rescueDistancePct: 0 } }, /0 < rescueDistancePct/],
+    [{ risk: { watchDistancePct: 15, rescueDistancePct: 8, margin: 1 } }, /unknown field risk.margin/],
+    [{ auto: 'yes' }, /auto must be a boolean/],
+    [{ extra: 1 }, /unknown field extra/],
+  ];
+  for (const [over, error] of bad) assert.throws(() => parseStrategyConfig({ ...DEFAULT_STRATEGY, ...over }, POLICY), error, JSON.stringify(over));
+  assert.throws(() => parseStrategyConfig(null), /not an object/);
+  assert.throws(() => parseStrategyConfig([DEFAULT_STRATEGY]), /not an object/);
+  // The bounds hold with no policy loaded too.
+  assert.throws(() => parseStrategyConfig({ ...DEFAULT_STRATEGY, legUsd: STRATEGY_LIMITS.maxLegUsd + 1 }), /legUsd must be/);
+  // Without a policy the engine cap is the only one: 100k passes.
+  assert.equal(parseStrategyConfig({ ...DEFAULT_STRATEGY, legUsd: STRATEGY_LIMITS.maxLegUsd }).legUsd, 100_000);
+  assert.equal(parseStrategyConfig({ ...DEFAULT_STRATEGY, stopDrawdownPct: null }, POLICY).stopDrawdownPct, null);
+});

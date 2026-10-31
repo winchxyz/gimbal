@@ -107,12 +107,26 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   risk: { watchDistancePct: 15, rescueDistancePct: 8 },
 };
 
+/**
+ * Bounds PUT /strategy enforces on top of the policy. They are the engine's own sanity limits, not the contract's:
+ * the contract caps every order at policy.max_notional_usd whatever the engine is told.
+ */
+export const STRATEGY_LIMITS = {
+  maxLegUsd: 100_000,
+  maxLeverage: 10,
+  maxMinNetAprPct: 1_000,
+  maxRotateGainPts: 1_000,
+  maxRotateHours: 24 * 30,
+} as const;
+
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+const between = (v: unknown, lo: number, hi: number): v is number => isNum(v) && v >= lo && v <= hi;
 
 /**
  * Checks a StrategyConfig from PUT /strategy and returns a clean copy, or throws with the first thing wrong.
- * Unknown fields are refused, so a misspelt rule is never silently ignored.
+ * Unknown fields are refused, so a misspelt rule is never silently ignored; every number must be finite and inside
+ * STRATEGY_LIMITS (and legUsd inside the policy's cap when one is loaded).
  */
 export function parseStrategyConfig(value: unknown, policy: ContractPolicy | null = null): StrategyConfig {
   if (!isObject(value)) throw new Error('strategy: not an object');
@@ -120,22 +134,27 @@ export function parseStrategyConfig(value: unknown, policy: ContractPolicy | nul
   const extra = Object.keys(value).filter((k) => !known.includes(k));
   if (extra.length > 0) throw new Error(`strategy: unknown field ${extra[0]}`);
   const { auto, minNetAprPct, legUsd, maxLeverage, stopDrawdownPct, rotate, risk } = value;
+  const L = STRATEGY_LIMITS;
   if (typeof auto !== 'boolean') throw new Error('strategy: auto must be a boolean');
-  if (!isNum(minNetAprPct)) throw new Error('strategy: minNetAprPct must be a number');
-  if (!isNum(legUsd) || !(legUsd > 0)) throw new Error('strategy: legUsd must be a number > 0');
+  if (!between(minNetAprPct, 0, L.maxMinNetAprPct)) throw new Error(`strategy: minNetAprPct must be a number from 0 to ${L.maxMinNetAprPct}`);
+  if (!isNum(legUsd) || !(legUsd > 0) || legUsd > L.maxLegUsd) throw new Error(`strategy: legUsd must be a number > 0 and <= ${L.maxLegUsd}`);
   if (policy !== null && legUsd > policy.max_notional_usd) {
     throw new Error(`strategy: legUsd ${legUsd} is over the policy cap of ${policy.max_notional_usd} USD per leg`);
   }
-  if (!isNum(maxLeverage) || !(maxLeverage >= 1)) throw new Error('strategy: maxLeverage must be a number >= 1');
+  if (!between(maxLeverage, 1, L.maxLeverage)) throw new Error(`strategy: maxLeverage must be a number from 1 to ${L.maxLeverage}`);
   if (stopDrawdownPct !== null && (!isNum(stopDrawdownPct) || !(stopDrawdownPct > 0 && stopDrawdownPct <= 100))) {
     throw new Error('strategy: stopDrawdownPct must be null or a percentage in (0, 100]');
   }
-  if (!isObject(rotate) || !isNum(rotate.minGainPts) || !isNum(rotate.forHours) || rotate.minGainPts < 0 || rotate.forHours < 0) {
-    throw new Error('strategy: rotate needs minGainPts >= 0 and forHours >= 0');
+  if (!isObject(rotate) || !between(rotate.minGainPts, 0, L.maxRotateGainPts) || !between(rotate.forHours, 0, L.maxRotateHours)) {
+    throw new Error(`strategy: rotate needs minGainPts from 0 to ${L.maxRotateGainPts} and forHours from 0 to ${L.maxRotateHours}`);
   }
+  const extraRotate = Object.keys(rotate).filter((k) => k !== 'minGainPts' && k !== 'forHours');
+  if (extraRotate.length > 0) throw new Error(`strategy: unknown field rotate.${extraRotate[0]}`);
   if (!isObject(risk) || !isNum(risk.watchDistancePct) || !isNum(risk.rescueDistancePct)) {
     throw new Error('strategy: risk needs watchDistancePct and rescueDistancePct');
   }
+  const extraRisk = Object.keys(risk).filter((k) => k !== 'watchDistancePct' && k !== 'rescueDistancePct');
+  if (extraRisk.length > 0) throw new Error(`strategy: unknown field risk.${extraRisk[0]}`);
   if (!(risk.rescueDistancePct > 0 && risk.rescueDistancePct < risk.watchDistancePct && risk.watchDistancePct < 100)) {
     throw new Error('strategy: risk needs 0 < rescueDistancePct < watchDistancePct < 100');
   }
