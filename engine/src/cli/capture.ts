@@ -3,7 +3,10 @@
 //   npm run capture -w engine -- --venue phoenix --out fixtures/phoenix-wire/<name>.jsonl.gz [--coins SOL,ETH,BTC]
 //       [--address <authority> [--view <trader key>] [--funding-since <ms>]]
 //   npm run capture -w engine -- --venue orderly --out fixtures/orderly-wire/<name>.jsonl.gz [--testnet] [--coins SOL,ETH,BTC]
+//   npm run capture -w engine -- --venue watch --out fixtures/watch-wire/<name>.jsonl.gz
 // Each pass calls markets, funding, a book per coin, and one unknown coin (to keep the venue's real answer to it).
+// The watch pass is one funding sweep over every watch-only venue plus Hyperliquid's main dex (the self-check's
+// reference), mainnet only.
 // Hyperliquid with --address adds that account's state and its whole funding history (all pages), from time 0.
 // Phoenix with --address adds that authority's trader snapshot, the venue's own computed view of the same trader
 // (--view, its trader key: tests check the margin math against it) and its funding history since --funding-since.
@@ -17,6 +20,8 @@ import { OrderlyReader, orderlySymbol } from '../venues/orderly.ts';
 import { PhoenixReader, PHOENIX_API_URL } from '../venues/phoenix.ts';
 import type { WireLine } from '../venues/recorder.ts';
 import { JsonlGzWriter, errorMessage, recordingFetch, recordingWsRequester } from '../venues/recorder.ts';
+import { watchReaders } from '../venues/watch/index.ts';
+import { sweep, sweepReport } from '../venues/watch/sweep.ts';
 import { WsRequestClient } from '../venues/ws.ts';
 
 const { values } = parseArgs({
@@ -34,8 +39,9 @@ const { values } = parseArgs({
 if (values.out === undefined) fail('--out <path.jsonl.gz> is required');
 if (!values.out.endsWith('.jsonl.gz')) fail('--out must end in .jsonl.gz');
 const venue = values.venue;
-if (venue !== 'hl' && venue !== 'phoenix' && venue !== 'orderly') fail('--venue must be hl, phoenix or orderly');
+if (venue !== 'hl' && venue !== 'phoenix' && venue !== 'orderly' && venue !== 'watch') fail('--venue must be hl, phoenix, orderly or watch');
 if (venue === 'phoenix' && values.testnet) fail('phoenix has no public testnet API');
+if (venue === 'watch' && values.testnet) fail('the watch venues are read on mainnet only');
 const coins = (values.coins ?? (venue === 'hl' ? 'ETH,BTC' : 'SOL,ETH,BTC')).split(',').map((c) => c.trim()).filter((c) => c !== '');
 
 const out = resolve(values.out);
@@ -73,6 +79,10 @@ if (venue === 'hl') {
     if (!Number.isInteger(since)) fail('--funding-since must be a ms timestamp');
     await step(`userFunding since ${new Date(since).toISOString()}`, () => reader.userFunding(address, since));
   }
+} else if (venue === 'watch') {
+  label = 'watch venues mainnet';
+  const result = await sweep([new HyperliquidReader({ fetch: wireFetch }), ...watchReaders({ fetch: wireFetch })]);
+  for (const line of sweepReport(result)) console.log(line);
 } else {
   const ws = new WsRequestClient();
   const reader = new OrderlyReader({
