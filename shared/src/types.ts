@@ -32,7 +32,8 @@ export interface Window {
   held: { since: number } | null;   // the desk holds this window now
   checks: { ok: boolean; text: string }[];   // what the engine checked (policy, oracle, rescue path), one line
                                              // each, engine-written; the first failing one is why it is not entered
-  switchCostUsd: number | null;     // cost to rotate from the held window into this one at strategy.legUsd;
+  switchCostUsd: number | null;     // cost to rotate from the held window into this one at strategy.legUsd:
+                                    // the fills only; the margin moves are already in this window's feesPct;
                                     // null when nothing is held or this is the held one
   stale: boolean;                   // a venue it needs did not answer: the numbers are from the last good read
 }

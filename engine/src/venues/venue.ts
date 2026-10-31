@@ -32,6 +32,8 @@ export interface MarketFunding extends FundingRate {
   multiplier?: number;           // base units per unit of `symbol` ("kPEPE" 1000); absent = 1
   shortRatePerHour?: number;     // what a short receives per hour where it differs from ratePerHour (GMX v2 per-side
                                  // funding plus borrow); absent = the same as ratePerHour
+  fundingCapPerHour?: number;    // the venue's own per-market rate limits, per hour, from the same answer where it
+  fundingFloorPerHour?: number;  // gives them; absent = unknown (the scanner falls back to its sourced caps)
 }
 
 /**
