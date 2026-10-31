@@ -1,5 +1,8 @@
 {
   "name": "@gimbal/tools",
   "private": true,
-  "license": "BUSL-1.1"
+  "license": "BUSL-1.1",
+  "scripts": {
+    "test": "node --test \"mainnet/*.test.mjs\""
+  }
 }
