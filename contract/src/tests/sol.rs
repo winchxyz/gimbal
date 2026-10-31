@@ -197,8 +197,9 @@ fn sol_sign_answers_every_vector_message_as_the_core_does_without_prices() {
         }
     }
     // 13 messages pass the vectors' policy with prices: 6 of them place priced orders and now
-    // stop at the missing price, like the 3 the band or the cap refuses, and 2 are rescues.
-    assert_eq!((signed, stale, refused), (5, 9, 48));
+    // stop at the missing price, like the 3 the band or the cap refuses, 2 are rescues, and the
+    // review refuses the lone Approve (an allowance with no unwrap to spend it).
+    assert_eq!((signed, stale, refused), (4, 9, 49));
 }
 
 /// Every review case gets the core's answer too; each one the vectors refuse is refused with the
@@ -288,12 +289,16 @@ fn a_paused_desk_signs_only_what_reduces_risk() {
     let mut g = sol_desk_with(p);
     g.desks.get_mut("alpha").unwrap().paused = true;
     let paused = "E_PAUSED: desk alpha is paused";
-    for (prefix, kind) in [
-        ("cancel all ETH", "cancel_all"),
-        ("deposit 15 USDC", "deposit"),
-        ("Token Approve", "transaction"),
+    for (doc, prefix, kind) in [
+        (vectors(), "cancel all ETH", "cancel_all"),
+        (vectors(), "deposit 15 USDC", "deposit"),
+        (
+            review(),
+            "review 2: lone Revoke of the desk PhUSD",
+            "transaction",
+        ),
     ] {
-        let bytes = bytes_of(&case(&vectors(), prefix));
+        let bytes = bytes_of(&case(&doc, prefix));
         assert_eq!(sol_sign(&mut g, &bytes).unwrap().kind, kind, "{prefix}");
     }
     // A reduce-only close signs; the same order opening risk does not.

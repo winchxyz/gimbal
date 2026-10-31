@@ -113,6 +113,7 @@ const REDUCE_ONLY: u8 = 0x80;
 // SPL Token instructions.
 const TOKEN_TRANSFER: u8 = 3;
 const TOKEN_APPROVE: u8 = 4;
+const TOKEN_REVOKE: u8 = 5;
 const TOKEN_TRANSFER_CHECKED: u8 = 12;
 // Compute budget instructions.
 const SET_COMPUTE_UNIT_LIMIT: u8 = 2;
@@ -382,6 +383,8 @@ struct Walk<'a> {
     orders: Vec<PhoenixOrder>,
     phoenix: Option<&'static str>,
     withdraws: bool,
+    /// An `Approve` waiting for the Ember unwrap it is for: its instruction and amount.
+    approval: Option<(usize, u64)>,
 }
 
 impl<'a> Walk<'a> {
@@ -474,15 +477,40 @@ impl<'a> Walk<'a> {
                     return Err(malformed());
                 }
                 // source, delegate, owner
-                let a = accounts(ix, n, 3)?;
-                if !d.is_token_account(&a[0]) || a[1] != EMBER_AUTHORITY {
+                let a = exactly(ix, n, 3)?;
+                pinned(
+                    a,
+                    n,
+                    &[
+                        (0, d.phusd_ata, "the desk's PhUSD account"),
+                        (1, EMBER_AUTHORITY, "the Ember authority"),
+                        (2, d.authority, "the desk authority"),
+                    ],
+                )?;
+                if let Some((first, _)) = self.approval {
+                    return Err(at(
+                        n,
+                        E_SOL_PROGRAM,
+                        format!("a second Approve before the unwrap of instruction {first}'s"),
+                    ));
+                }
+                self.approval = Some((n, le_u64(&ix.data[1..])));
+                Ok(())
+            }
+            Some(&TOKEN_REVOKE) => {
+                if ix.data.len() != 1 {
+                    return Err(malformed());
+                }
+                // source, owner
+                let a = exactly(ix, n, 2)?;
+                if !d.is_token_account(&a[0]) {
                     return Err(at(
                         n,
                         E_SOL_ACCOUNT,
-                        "only the Ember authority may be approved, on a desk token account",
+                        format!("{} is not a desk token account", b58(&a[0])),
                     ));
                 }
-                Ok(())
+                pinned(a, n, &[(1, d.authority, "the desk authority")])
             }
             Some(&TOKEN_TRANSFER) => {
                 if ix.data.len() != 9 {
@@ -568,6 +596,27 @@ impl<'a> Walk<'a> {
                 E_SOL_ACCOUNT,
                 "Ember must convert between the desk's own USDC and PhUSD accounts",
             ));
+        }
+        if disc == Some(&EMBER_WITHDRAW[..]) {
+            // An Option<u64>: 1 and the amount, or 0 for the whole balance.
+            let amount = match (ix.data.get(8), ix.data.len()) {
+                (Some(1), 17) => Some(le_u64(&ix.data[9..])),
+                (Some(0), 9) => None,
+                _ => return Err(at(n, E_SOL_PROGRAM, "a malformed Ember withdraw")),
+            };
+            if let Some((approved_at, approved)) = self.approval.take() {
+                if amount != Some(approved) {
+                    return Err(at(
+                        n,
+                        E_SOL_PROGRAM,
+                        format!(
+                            "the unwrap of {} is not the {approved} instruction {approved_at} \
+                             approves",
+                            amount.map_or_else(|| "the whole balance".into(), |a| a.to_string())
+                        ),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -766,10 +815,13 @@ impl<'a> Walk<'a> {
 ///   [`MAX_COMPUTE_UNIT_PRICE`], once each;
 /// - token account program: `CreateIdempotent` paid by the desk for its own USDC or PhUSD account
 ///   (or, in a rescue, the deposit owner's USDC account);
-/// - SPL Token: `Approve` of a desk token account to the Ember authority, `Transfer` and
-///   `TransferChecked` into a desk token account (in a rescue also exactly one `TransferChecked` of
-///   `amount_in` USDC into the deposit owner's account created before it, else `E_QUOTE_FIELDS`);
-/// - Ember deposit and withdraw between the desk's USDC and PhUSD accounts;
+/// - SPL Token: `Approve` of the desk's PhUSD account to the Ember authority for exactly the
+///   amount of the Ember unwrap that follows it, before any other `Approve` (else
+///   `E_SOL_PROGRAM`); `Revoke` of a desk token account; `Transfer` and `TransferChecked` into a
+///   desk token account (in a rescue also exactly one `TransferChecked` of `amount_in` USDC into
+///   the deposit owner's account created before it, else `E_QUOTE_FIELDS`);
+/// - Ember deposit and withdraw (an unwrap of an amount, or of the whole balance) between the
+///   desk's USDC and PhUSD accounts;
 /// - Phoenix: `place_market_order` (immediate-or-cancel only, a market of the policy, a price
 ///   limit, then [`check_value`] at the `reference` price), `cancel_all`, `deposit_funds` and
 ///   `withdraw_funds`, each with its exact account list: the desk's own accounts, Phoenix's
@@ -808,9 +860,17 @@ pub fn check_message(
         orders: Vec::new(),
         phoenix: None,
         withdraws: false,
+        approval: None,
     };
     for (n, ix) in m.instructions.iter().enumerate() {
         walk.instruction(ix, n)?;
+    }
+    if let Some((n, amount)) = walk.approval {
+        return Err(at(
+            n,
+            E_SOL_PROGRAM,
+            format!("an Approve of {amount} with no Ember unwrap of that amount after it"),
+        ));
     }
     if rescue.is_some() && walk.rescue_transfers != 1 {
         return Err(Refusal::new(

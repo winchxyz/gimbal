@@ -108,7 +108,19 @@ fn outcome(r: &Result<impl Sized, Refusal>) -> String {
     }
 }
 
+/// The `solana.json` cases whose answer the review changed: a lone Approve would leave Ember an
+/// allowance on the desk's PhUSD, so an Approve now needs an unwrap of its amount after it
+/// (review item 2).
+const REVIEWED: [(&str, &str); 1] = [(
+    "Token Approve of the desk PhUSD account to the Ember authority",
+    E_SOL_PROGRAM,
+)];
+
+/// The answer a case must get: the vector's, or the reviewed one.
 fn expected(case: &Value) -> String {
+    if let Some((_, code)) = REVIEWED.iter().find(|(n, _)| *n == name(case)) {
+        return (*code).into();
+    }
     if case["expect"]["ok"] == true {
         "ok".into()
     } else {
@@ -179,6 +191,7 @@ fn every_sol_sign_case_gets_its_expected_answer() {
         cases.iter().filter(|c| c["expect"]["ok"] == true).count(),
         13
     );
+    assert_eq!(cases.iter().filter(|c| expected(c) == "ok").count(), 12);
 }
 
 #[test]
@@ -295,7 +308,6 @@ fn kinds_and_the_pause_gate() {
         ("deposit 15 USDC", "deposit", true),
         ("withdraw 10 USDC", "withdraw", false),
         ("IOC sell 0.005 ETH", "order", false),
-        ("Token Approve", "transaction", true),
         ("rescue in one transaction", "rescue", false),
     ] {
         let c = check(prefix);
@@ -1043,6 +1055,151 @@ fn layout_cases(r: &mut Review<'_>) {
     }
 }
 
+/// Review item 2: an Approve is of the desk's PhUSD account to the Ember authority, for exactly
+/// the amount of an Ember unwrap after it; a Revoke of a desk token account passes alone.
+fn approval_cases(r: &mut Review<'_>) {
+    let doc = r.doc;
+    let desk = vector_desk(doc);
+    let stranger = key(&doc["keys"]["strangerSol"]["public_key_b58"]);
+    let withdraw = "withdraw 10 USDC";
+    let approve_at = |r: &Review<'_>| r.at(withdraw, TOKEN_PROGRAM, &[4]);
+    let set_amount = |d: &mut Draft, i: usize, amount: u64| {
+        d.ixs[i].2[1..9].copy_from_slice(&amount.to_le_bytes());
+    };
+    for (what, amount) in [
+        ("1 above", 10_000_001),
+        ("1 below", 9_999_999),
+        ("of u64::MAX before", u64::MAX),
+    ] {
+        let (mut d, i) = approve_at(r);
+        set_amount(&mut d, i, amount);
+        let case_name = format!("review 2: Approve {what} the unwrap");
+        r.add(2, &case_name, withdraw, &d, E_SOL_PROGRAM);
+    }
+    let (mut d, _) = approve_at(r);
+    let unwrap = d.find(EMBER_PROGRAM, &EMBER_WITHDRAW);
+    d.ixs.remove(unwrap);
+    r.add(
+        2,
+        "review 2: Approve with no unwrap after it",
+        withdraw,
+        &d,
+        E_SOL_PROGRAM,
+    );
+    let (mut d, i) = approve_at(r);
+    let approve = d.ixs.remove(i);
+    d.ixs.push(approve);
+    r.add(
+        2,
+        "review 2: Approve after the unwrap",
+        withdraw,
+        &d,
+        E_SOL_PROGRAM,
+    );
+    let (mut d, i) = approve_at(r);
+    let approve = d.ixs[i].clone();
+    d.ixs.insert(i, approve);
+    r.add(
+        2,
+        "review 2: two Approves before the unwrap",
+        withdraw,
+        &d,
+        E_SOL_PROGRAM,
+    );
+    let (mut d, _) = approve_at(r);
+    let unwrap = d.find(EMBER_PROGRAM, &EMBER_WITHDRAW);
+    d.ixs[unwrap].2.truncate(8);
+    d.ixs[unwrap].2.push(0);
+    r.add(
+        2,
+        "review 2: Approve before an unwrap of the whole balance (no amount)",
+        withdraw,
+        &d,
+        E_SOL_PROGRAM,
+    );
+    let (mut d, i) = approve_at(r);
+    d.set_account(i, 0, desk.usdc_ata);
+    r.add(
+        2,
+        "review 2: Approve of the desk USDC account to the Ember authority",
+        withdraw,
+        &d,
+        E_SOL_ACCOUNT,
+    );
+    let (mut d, i) = approve_at(r);
+    d.set_account(i, 2, stranger);
+    r.add(
+        2,
+        "review 2: Approve with another owner",
+        withdraw,
+        &d,
+        E_SOL_ACCOUNT,
+    );
+    let (mut d, i) = approve_at(r);
+    d.push_account(i, stranger);
+    r.add(
+        2,
+        "review 2: Approve with a trailing account (4)",
+        withdraw,
+        &d,
+        E_SOL_ACCOUNT,
+    );
+
+    let lone = "Token Approve of the desk PhUSD account to the Ember authority";
+    let (mut d, i) = r.at(lone, TOKEN_PROGRAM, &[4]);
+    set_amount(&mut d, i, u64::MAX);
+    r.add(
+        2,
+        "review 2: lone Approve of u64::MAX",
+        lone,
+        &d,
+        E_SOL_PROGRAM,
+    );
+    // The lone Approve turned into a Revoke of its source; `source` takes the PhUSD account's key
+    // slot, which is writable.
+    let revoke = |r: &Review<'_>, source: Pubkey| {
+        let (mut d, i) = r.at(lone, TOKEN_PROGRAM, &[4]);
+        let slot = d.ixs[i].1[0];
+        d.ixs[i].1 = vec![slot, d.index(desk.authority)];
+        d.ixs[i].2 = vec![5];
+        d.keys[usize::from(slot)] = source;
+        (d, i)
+    };
+    let (d, _) = revoke(r, desk.phusd_ata);
+    r.add(
+        2,
+        "review 2: lone Revoke of the desk PhUSD account",
+        lone,
+        &d,
+        "transaction reduces_risk",
+    );
+    let (d, _) = revoke(r, desk.usdc_ata);
+    r.add(
+        2,
+        "review 2: lone Revoke of the desk USDC account",
+        lone,
+        &d,
+        "transaction reduces_risk",
+    );
+    let (d, _) = revoke(r, stranger);
+    r.add(
+        2,
+        "review 2: Revoke of an account the desk does not own",
+        lone,
+        &d,
+        E_SOL_ACCOUNT,
+    );
+    let (mut d, i) = revoke(r, desk.phusd_ata);
+    d.ixs[i].2.push(0);
+    r.add(
+        2,
+        "review 2: Revoke with a trailing data byte",
+        lone,
+        &d,
+        E_SOL_PROGRAM,
+    );
+}
+
 fn review_doc() -> Value {
     let doc = sol_doc();
     let mut r = Review {
@@ -1050,6 +1207,7 @@ fn review_doc() -> Value {
         cases: vec![],
     };
     layout_cases(&mut r);
+    approval_cases(&mut r);
     serde_json::json!({
         "file": "solana-review.json",
         "note": "Review cases for the sol_sign policy. Each edits one message of solana.json, \
