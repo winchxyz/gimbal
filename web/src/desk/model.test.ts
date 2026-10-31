@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { DeskState, JournalEntry, Leg, StrategyConfig } from '@gimbal/shared';
+import { unprotectedText } from '../journal/entry.ts';
 import { STRATEGY, win } from '../windows/testing.ts';
 import {
   distanceText,
@@ -9,6 +10,7 @@ import {
   latestEvents,
   legNotional,
   legRows,
+  lotLimit,
   moveText,
   nextBest,
   nextFunding,
@@ -17,7 +19,7 @@ import {
   pnlRows,
   sizeText,
   dayRate,
-  unprotectedText,
+  thresholdText,
   whenLabel,
 } from './model.ts';
 
@@ -60,7 +62,7 @@ test('the distance sentence names the price move and where it ends, as in the mo
   assert.equal(sizeText(LONG), 'Long 6,040 DOGE');
 });
 
-test('the rows of a leg: entry and mark, margin ratio, funding earned, what is unsettled, the next funding', () => {
+test('the rows of a leg: entry and mark, margin ratio, funding earned, fees paid, what is unsettled, the next funding', () => {
   const now = Date.UTC(2026, 9, 27, 14, 37, 0);
   const rows = legRows(SHORT, now);
   assert.deepEqual(
@@ -70,6 +72,7 @@ test('the rows of a leg: entry and mark, margin ratio, funding earned, what is u
       ['margin', 'Margin', '$482.10 · ratio 31%', null, 'phone'],
       ['ratio', 'Margin ratio', '31%', null, 'desktop'],
       ['funding', 'Funding earned', '+$0.31', 'pos', null],
+      ['fees', 'Fees paid', '−$0.48', null, null],
       ['unsettled', 'Unsettled funding', '$0.000', null, null],
       ['next', 'Next funding', 'in 23 min', null, null],
     ],
@@ -78,6 +81,23 @@ test('the rows of a leg: entry and mark, margin ratio, funding earned, what is u
   assert.equal(phoenix.find((r) => r.key === 'unsettled')?.value, '+$0.011');
   assert.equal(phoenix.find((r) => r.key === 'next')?.value, 'accrues hourly · settles 00:00');
   assert.equal(legRows(leg({ fundingEarnedUsd: -0.2 }), now).find((r) => r.key === 'funding')?.tone, 'neg');
+});
+
+test('fees paid are a cost: negative on the leg, shown with the minus and no colour; none yet reads $0.00', () => {
+  const now = Date.UTC(2026, 9, 27, 14, 37, 0);
+  const fees = (l: Leg) => legRows(l, now).find((r) => r.key === 'fees');
+  assert.deepEqual(fees(LONG)?.value, '−$0.48');
+  assert.equal(fees(leg({ feesUsd: -1234.5 }))?.value, '−$1,234.50');
+  assert.equal(fees(leg({ feesUsd: 0 }))?.value, '$0.00');
+  assert.equal(fees(leg({ feesUsd: -0.99 }))?.tone, null);
+});
+
+test('the rescue and warning distances are the owner’s own numbers, and the line waits for them', () => {
+  assert.equal(thresholdText({ watchDistancePct: 15, rescueDistancePct: 8 }), 'Rescue starts at 8%, a warning at 15%.');
+  assert.equal(thresholdText({ watchDistancePct: 12.5, rescueDistancePct: 6 }), 'Rescue starts at 6%, a warning at 12.5%.');
+  assert.equal(thresholdText({ watchDistancePct: 20, rescueDistancePct: 7.5 }), 'Rescue starts at 7.5%, a warning at 20%.');
+  assert.equal(thresholdText(null), null);
+  assert.equal(thresholdText(undefined), null);
 });
 
 test('next funding follows each venue’s schedule', () => {
@@ -89,19 +109,36 @@ test('next funding follows each venue’s schedule', () => {
   assert.equal(nextFunding('orderly', at(0)), 'every 8 h');
 });
 
-test('net exposure is level within one percent of the larger leg and drifts beyond it', () => {
+test('net exposure drifts when the legs differ by more than one lot, and not before', () => {
   const level = exposureOf({ legs: [SHORT, LONG], netDelta: 0 });
   assert.deepEqual(level, {
     text: '0 DOGE',
     drift: false,
     explain: 'Both legs are the same size, so a DOGE price move adds to one and takes the same from the other.',
   });
-  assert.equal(exposureOf({ legs: [SHORT, LONG], netDelta: 60 }).drift, false);
+  // one lot is level, the next step is not
+  assert.equal(exposureOf({ legs: [SHORT, LONG], netDelta: 1 }).drift, false);
+  assert.equal(exposureOf({ legs: [SHORT, LONG], netDelta: -1 }).drift, false);
+  assert.equal(exposureOf({ legs: [SHORT, LONG], netDelta: 2 }).drift, true);
   const drift = exposureOf({ legs: [SHORT, leg({ side: 'long', size: 6160 })], netDelta: 120 });
   assert.equal(drift.drift, true);
   assert.equal(drift.text, '+120 DOGE');
   assert.match(drift.explain, /The legs differ by 120 DOGE.*The desk is rebalancing\.$/);
   assert.equal(exposureOf({ legs: [SHORT], netDelta: -6040 }).text, '−6,040 DOGE');
+});
+
+test('the lot is the coarser venue’s: a hedge cannot be more exact than the venue with the bigger lot', () => {
+  const fine = leg({ lotSize: 0.1 });
+  const coarse = leg({ venue: 'phoenix', side: 'long', lotSize: 10 });
+  assert.equal(lotLimit([fine, coarse]), 10);
+  assert.equal(exposureOf({ legs: [fine, coarse], netDelta: 10 }).drift, false);
+  assert.equal(exposureOf({ legs: [fine, coarse], netDelta: 10.1 }).drift, true);
+  assert.equal(exposureOf({ legs: [fine, fine], netDelta: 0.1 }).drift, false);
+  // a size sum that is one lot plus a rounding error is still one lot
+  assert.equal(exposureOf({ legs: [fine, fine], netDelta: 0.30000000000000004 - 0.2 }).drift, false);
+  assert.equal(exposureOf({ legs: [fine, fine], netDelta: 0.2 }).drift, true);
+  assert.equal(lotLimit([]), 0);
+  assert.equal(exposureOf({ legs: [], netDelta: 0 }).drift, false);
 });
 
 test('a day on these legs: the held window’s net APR on the legs’ own size', () => {
