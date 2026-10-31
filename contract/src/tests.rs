@@ -206,15 +206,41 @@ fn scheduled_callback() -> (String, Desk, NearToken) {
     )
 }
 
+/// Runs `on_desk_keys` and says how the transaction ends: `Ok(())` once the desk is stored, or the
+/// refusal it handed to `refuse`, the call it returns instead of a value.
+fn run_callback(
+    g: &mut Gimbal,
+    desk_id: String,
+    desk: Desk,
+    attached: NearToken,
+) -> Result<(), String> {
+    match g.on_desk_keys(desk_id, desk, attached) {
+        PromiseOrValue::Value(created) => {
+            assert!(created, "a stored desk returns true");
+            assert!(function_calls().is_empty());
+            Ok(())
+        }
+        PromiseOrValue::Promise(promise) => {
+            promise.detach();
+            let calls = function_calls();
+            assert_eq!(calls.len(), 1, "{calls:?}");
+            let (to, method, args, gas, _) = &calls[0];
+            assert_eq!((to, method.as_str()), (&contract_id(), "refuse"));
+            assert_eq!(*gas, REFUSE_GAS);
+            Err(args["refusal"].as_str().unwrap().to_owned())
+        }
+    }
+}
+
 /// `create_desk` of `desk_id` as `who` with `attached`, then its callback with the MPC's answers.
-/// Returns what the callback returned.
+/// Returns whether the desk was stored.
 fn create(g: &mut Gimbal, who: AccountId, desk_id: &str, attached: NearToken) -> bool {
     call(who, attached);
     g.create_desk(desk_id.into(), policy(), EVM.into(), solana())
         .detach();
     let (id, desk, deposit) = scheduled_callback();
     callback(mpc_answers());
-    g.on_desk_keys(id, desk, deposit)
+    run_callback(g, id, desk, deposit).is_ok()
 }
 
 /// A fresh contract with desk `alpha` of `owner()`, whose operator is `operator()`.
@@ -279,7 +305,7 @@ fn storage_cost_of_alpha() -> NearToken {
         let (id, desk, attached) = scheduled_callback();
         callback(mpc_answers());
         let before = env::storage_usage();
-        assert!(g.on_desk_keys(id, desk, attached));
+        run_callback(&mut g, id, desk, attached).unwrap();
         cost_of(env::storage_usage() - before)
     })
     .join()
@@ -306,7 +332,7 @@ fn new_stores_the_config() {
     assert_eq!(g.config.fees, fees());
     assert_eq!(g.config.orderly.chain_id, ARBITRUM_SEPOLIA);
     assert!(g.desks.get("alpha").is_none());
-    assert!(g.desks_by_owner.get(&owner()).is_none());
+    assert!(g.desks_of(owner()).is_empty());
 }
 
 // `#[private]`, the already-initialised guard and `#[deny_unknown_arguments]` live in the wasm entry
@@ -344,6 +370,19 @@ fn version_is_the_crate_version() {
     assert_eq!(testnet().version(), env!("CARGO_PKG_VERSION"));
 }
 
+/// The attribute and doc lines right above `pub fn {method}(` in `source`.
+fn attributes_of<'a>(source: &'a str, method: &str) -> Vec<&'a str> {
+    let at = source
+        .find(&format!("    pub fn {method}("))
+        .unwrap_or_else(|| panic!("no method {method}"));
+    source[..at]
+        .lines()
+        .rev()
+        .map(str::trim)
+        .take_while(|l| l.starts_with("#[") || l.starts_with("///"))
+        .collect()
+}
+
 /// The generated entry points refuse unknown arguments only where the method carries the
 /// attribute, so a misspelt `operater` is refused instead of read as `operator: null`. The wasm
 /// build is proved on testnet (PR #8); this keeps the attribute from being dropped.
@@ -357,17 +396,24 @@ fn mutating_methods_refuse_unknown_arguments() {
         "set_operator",
         "set_paused",
     ] {
-        let at = source
-            .find(&format!("    pub fn {method}("))
-            .unwrap_or_else(|| panic!("no method {method}"));
-        let attributes: Vec<&str> = source[..at]
-            .lines()
-            .rev()
-            .map(str::trim)
-            .take_while(|l| l.starts_with("#[") || l.starts_with("///"))
-            .collect();
+        let attributes = attributes_of(source, method);
         assert!(
             attributes.contains(&"#[deny_unknown_arguments]"),
+            "{method}: {attributes:?}"
+        );
+    }
+}
+
+/// `#[private]` lives in the wasm entry point too. Without it on `on_desk_keys` any contract could
+/// call it with made-up MPC answers and a desk of its choosing and drain refunds; `refuse` and
+/// `new` are the contract's own as well.
+#[test]
+fn callbacks_and_init_are_private() {
+    let source = include_str!("lib.rs");
+    for method in ["new", "on_desk_keys", "refuse"] {
+        let attributes = attributes_of(source, method);
+        assert!(
+            attributes.contains(&"#[private]"),
             "{method}: {attributes:?}"
         );
     }
@@ -473,10 +519,76 @@ fn the_callback_keeps_exactly_the_storage_the_desk_adds() {
     let (id, desk, deposit) = scheduled_callback();
     callback(mpc_answers());
     let before = env::storage_usage();
-    assert!(g.on_desk_keys(id, desk, deposit));
+    run_callback(&mut g, id, desk, deposit).unwrap();
     let added = env::storage_usage() - before;
     assert!(added > 0);
     assert_eq!(kept(attached), cost_of(added));
+}
+
+#[test]
+fn each_desk_adds_the_same_storage_however_many_the_owner_has() {
+    let mut g = testnet();
+    let mut added = Vec::new();
+    for id in ["desk-1", "desk-2", "desk-3", "desk-4"] {
+        call(owner(), NearToken::from_near(1));
+        g.create_desk(id.into(), policy(), EVM.into(), solana())
+            .detach();
+        let (id, desk, attached) = scheduled_callback();
+        callback(mpc_answers());
+        let before = env::storage_usage();
+        run_callback(&mut g, id, desk, attached).unwrap();
+        added.push(env::storage_usage() - before);
+    }
+    // The first desk also creates the owner's count; after that each id is one entry of its own.
+    assert!(added[0] > added[1], "{added:?}");
+    assert_eq!(added[1..], [added[1]; 3], "{added:?}");
+    assert_eq!(
+        g.desks_of(owner()),
+        ["desk-1", "desk-2", "desk-3", "desk-4"]
+    );
+}
+
+/// A call from `owner()` with 1 NEAR and `gas` attached. The mock charges receipt fees from an older
+/// fee table (2.3 TGas per function call), so they are left out here to see what the contract
+/// itself allows; [`CREATE_DESK_GAS`] holds today's fees, measured on testnet.
+fn call_with_gas(gas: Gas) {
+    let context = VMContextBuilder::new()
+        .current_account_id(contract_id())
+        .predecessor_account_id(owner())
+        .signer_account_id(owner())
+        .attached_deposit(NearToken::from_near(1))
+        .prepaid_gas(gas)
+        .build();
+    testing_env!(
+        context,
+        near_sdk::test_vm_config(),
+        near_sdk::RuntimeFeesConfig::free(),
+        Default::default(),
+        vec![]
+    );
+}
+
+#[test]
+fn create_desk_refuses_less_gas_than_its_floor() {
+    assert_eq!(CREATE_DESK_MIN_GAS, Gas::from_tgas(56));
+    let mut g = testnet();
+    let short = CREATE_DESK_MIN_GAS.saturating_sub(Gas::from_gas(1));
+    for gas in [short, Gas::from_tgas(10)] {
+        call_with_gas(gas);
+        assert_refused(
+            "E_ARGS: create_desk needs at least 56 TGas attached (100 TGas recommended), not ",
+            || {
+                g.create_desk("alpha".into(), policy(), EVM.into(), solana())
+                    .detach();
+            },
+        );
+        assert!(function_calls().is_empty());
+    }
+    // At the floor it goes on to the two MPC calls and the callback.
+    call_with_gas(CREATE_DESK_MIN_GAS);
+    g.create_desk("alpha".into(), policy(), EVM.into(), solana())
+        .detach();
+    assert_eq!(function_calls().len(), 3);
 }
 
 #[test]
@@ -646,8 +758,8 @@ fn scheduled(
     scheduled_callback()
 }
 
-/// Runs the callback with `results` and checks that it stored nothing, logged one line starting
-/// with `expected`, and sent the whole deposit back to the caller.
+/// Runs the callback with `results` and checks that it stored nothing, sent the whole deposit back
+/// to the caller, and ends the transaction with a refusal starting with `expected`.
 fn assert_callback_refused(
     g: &mut Gimbal,
     (desk_id, desk, attached): (String, Desk, NearToken),
@@ -659,17 +771,27 @@ fn assert_callback_refused(
     let listed = g.desks_of(owner.clone());
     callback(results);
     let before = env::storage_usage();
-    assert!(!g.on_desk_keys(desk_id.clone(), desk, attached));
+    let refusal = run_callback(g, desk_id.clone(), desk, attached)
+        .expect_err("the callback should end as a refusal");
+    assert!(
+        refusal.starts_with(expected),
+        "expected {expected:?}, got {refusal:?}"
+    );
     assert_eq!(env::storage_usage(), before, "nothing is stored");
     assert_eq!(g.get_desk(desk_id), had);
     assert_eq!(g.desks_of(owner.clone()), listed);
-    let logs = get_logs();
-    assert_eq!(logs.len(), 1, "{logs:?}");
-    assert!(
-        logs[0].starts_with(expected),
-        "expected {expected:?}, got {logs:?}"
-    );
+    assert!(get_logs().is_empty(), "{:?}", get_logs());
     assert_eq!(transfers(), vec![(owner, attached)]);
+}
+
+#[test]
+fn refuse_ends_the_call_as_its_refusal() {
+    let g = testnet();
+    callback(vec![]);
+    assert_refused(
+        "E_MPC: the MPC contract did not return the desk's EVM key",
+        || g.refuse("E_MPC: the MPC contract did not return the desk's EVM key".into()),
+    );
 }
 
 #[test]

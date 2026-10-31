@@ -16,7 +16,9 @@ use gimbal_core::errors::{shown, E_ARGS, E_DESK_EXISTS, E_NO_DESK};
 use gimbal_core::ids::{check_desk_id, check_evm_address, decode_base58_32};
 use gimbal_core::policy::Policy;
 use near_sdk::store::LookupMap;
-use near_sdk::{env, near, AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault, Promise};
+use near_sdk::{
+    env, near, AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault, Promise, PromiseOrValue,
+};
 
 use crate::config::{Config, FeeConfig, Network, OrderlyConfig, PriceSource, Treasury};
 use crate::deposit::{check_one_yocto, check_pause_deposit, check_some_deposit, refund_after};
@@ -24,8 +26,23 @@ use crate::desk::{policy_sha256, Desk, Gate, Role, SolanaAccounts};
 use crate::events::{DeskCreated, Event, OperatorSet, Paused, PolicySet};
 
 /// Gas `on_desk_keys` gets besides its share of what `create_desk` leaves unused: it reads two keys,
-/// hashes one, and writes the desk.
+/// hashes one, and writes the desk, or schedules the refund and [`Gimbal::refuse`].
 pub const ON_DESK_KEYS_GAS: Gas = Gas::from_tgas(20);
+
+/// Gas for [`Gimbal::refuse`], which only panics.
+pub const REFUSE_GAS: Gas = Gas::from_tgas(5);
+
+/// What `create_desk` uses itself besides the gas it attaches, measured on testnet on 2026-10-30
+/// with a one-asset policy: it burnt 3.33 and 3.38 TGas, and prepays the execution fees of the
+/// three receipts it creates (1.8 TGas: with 60 TGas attached the callback got 24.8). Rounded up.
+pub const CREATE_DESK_GAS: Gas = Gas::from_tgas(6);
+
+/// The least prepaid gas `create_desk` accepts (`E_ARGS` below it): its own cost, the two MPC calls
+/// and the callback, 56 TGas. Clients attach 100 TGas; a shorter call would otherwise fail on the
+/// host's gas error with no code to match on.
+pub const CREATE_DESK_MIN_GAS: Gas = Gas::from_gas(
+    CREATE_DESK_GAS.as_gas() + 2 * mpc::DERIVE_GAS.as_gas() + ON_DESK_KEYS_GAS.as_gas(),
+);
 
 /// Ends the call with the refusal's stable code first: `"E_PRICE_BAND: px 2500 is 4.3% from oracle
 /// 2397.1"`. Clients match on the code, people read the rest.
@@ -51,7 +68,8 @@ impl<T> OrFail<T> for Result<T, Refusal> {
 #[near]
 enum StorageKey {
     Desks,
-    DesksByOwner,
+    DeskCounts,
+    DeskIds,
 }
 
 #[near(contract_state)]
@@ -59,8 +77,11 @@ enum StorageKey {
 pub struct Gimbal {
     config: Config,
     desks: LookupMap<String, Desk>,
-    /// Desk ids per owner, in creation order, for `desks_of`.
-    desks_by_owner: LookupMap<AccountId, Vec<String>>,
+    /// How many desks each owner has.
+    desk_counts: LookupMap<AccountId, u32>,
+    /// `(owner, n)` → the id of the owner's `n`-th desk, from 0, for `desks_of`. One entry per desk,
+    /// so adding a desk writes the same few bytes however many the owner has.
+    desk_ids: LookupMap<(AccountId, u32), String>,
 }
 
 #[near]
@@ -89,7 +110,8 @@ impl Gimbal {
                 orderly,
             },
             desks: LookupMap::new(StorageKey::Desks),
-            desks_by_owner: LookupMap::new(StorageKey::DesksByOwner),
+            desk_counts: LookupMap::new(StorageKey::DeskCounts),
+            desk_ids: LookupMap::new(StorageKey::DeskIds),
         }
     }
 
@@ -97,10 +119,11 @@ impl Gimbal {
     /// `evm_address` and `solana` are the desk's MPC-derived venue accounts and can never change.
     ///
     /// Attach the storage the desk takes (`E_DEPOSIT` below it; no deposit at all is
-    /// `E_NOT_ALLOWED`) and about 100 TGas. The call asks the MPC contract's `derived_public_key`
-    /// for `gimbal/<desk_id>/evm` and `gimbal/<desk_id>/sol` and stores nothing itself;
-    /// [`Self::on_desk_keys`] stores the desk, refunds the excess and emits `desk_created` and
-    /// `policy_set`, or refunds everything. The transaction's result is that callback's `bool`.
+    /// `E_NOT_ALLOWED`) and about 100 TGas (`E_ARGS` below [`CREATE_DESK_MIN_GAS`]). The call asks
+    /// the MPC contract's `derived_public_key` for `gimbal/<desk_id>/evm` and `gimbal/<desk_id>/sol`
+    /// and stores nothing itself; [`Self::on_desk_keys`] stores the desk, refunds the excess and
+    /// emits `desk_created` and `policy_set`, or refunds everything and fails. The transaction's
+    /// result is that callback's: `true`, or the refusal.
     #[payable]
     #[deny_unknown_arguments]
     pub fn create_desk(
@@ -112,6 +135,7 @@ impl Gimbal {
     ) -> Promise {
         let attached = env::attached_deposit();
         check_some_deposit("create_desk", attached).or_fail();
+        check_create_desk_gas(env::prepaid_gas()).or_fail();
         let owner = env::predecessor_account_id();
         let contract = env::current_account_id();
         self.config
@@ -150,12 +174,17 @@ impl Gimbal {
 
     /// The callback of `create_desk`. When the MPC keys give the desk's `evm_address` and Solana
     /// authority and the id is still free, it stores the desk, keeps its storage out of `attached`,
-    /// refunds the rest and emits `desk_created` and `policy_set`. Otherwise it stores nothing,
-    /// refunds all of `attached` and logs the refusal (`E_MPC`, `E_ARGS`, `E_DESK_EXISTS` or
-    /// `E_DEPOSIT`): it never panics on them, since a failed callback would keep the deposit.
-    /// Returns whether the desk was created.
+    /// refunds the rest, emits `desk_created` and `policy_set` and returns `true`. Otherwise
+    /// (`E_MPC`, `E_ARGS`, `E_DESK_EXISTS` or `E_DEPOSIT`) it stores nothing, refunds all of
+    /// `attached` and returns [`Self::refuse`] with the refusal, so the transaction ends as that
+    /// failure. It never panics itself: a failed callback would keep the deposit.
     #[private]
-    pub fn on_desk_keys(&mut self, desk_id: String, desk: Desk, attached: NearToken) -> bool {
+    pub fn on_desk_keys(
+        &mut self,
+        desk_id: String,
+        desk: Desk,
+        attached: NearToken,
+    ) -> PromiseOrValue<bool> {
         match self.store_checked_desk(&desk_id, &desk, attached) {
             Ok(refund) => {
                 refund_to(&desk.owner, refund);
@@ -171,14 +200,25 @@ impl Gimbal {
                     policy_sha256: &policy_sha256(&desk.policy),
                 }
                 .emit();
-                true
+                PromiseOrValue::Value(true)
             }
             Err(refusal) => {
                 refund_to(&desk.owner, attached);
-                env::log_str(&refusal.to_string());
-                false
+                PromiseOrValue::Promise(
+                    Self::ext(env::current_account_id())
+                        .with_static_gas(REFUSE_GAS)
+                        .refuse(refusal.to_string()),
+                )
             }
         }
+    }
+
+    /// Ends the transaction as `refusal` (`"E_CODE: msg"`). A callback that must not panic, since
+    /// that would undo the refund it scheduled, returns a call to this instead, so a wallet shows
+    /// the refused call as failed and not as a success.
+    #[private]
+    pub fn refuse(&self, refusal: String) {
+        env::panic_str(&refusal)
     }
 
     /// Replaces the desk's policy. Owner only, allowed while the desk is paused. Attach the storage
@@ -262,7 +302,10 @@ impl Gimbal {
 
     /// The ids of the owner's desks, in creation order.
     pub fn desks_of(&self, owner: AccountId) -> Vec<String> {
-        self.desks_by_owner.get(&owner).cloned().unwrap_or_default()
+        let count = self.desk_counts.get(&owner).copied().unwrap_or(0);
+        (0..count)
+            .filter_map(|n| self.desk_ids.get(&(owner.clone(), n)).cloned())
+            .collect()
     }
 
     /// Everything `new` fixed: network, MPC signer, price source, treasury, fees, Orderly broker.
@@ -326,37 +369,55 @@ impl Gimbal {
         refund
     }
 
-    /// Stores the desk and appends its id to the owner's list; returns the bytes that took.
+    /// Stores the desk and appends its id to the owner's ids; returns the bytes that took.
     fn write_desk(&mut self, desk_id: &str, desk: &Desk) -> u64 {
         let before = env::storage_usage();
         self.desks.insert(desk_id.to_owned(), desk.clone());
-        self.desks_by_owner
-            .entry(desk.owner.clone())
-            .or_default()
-            .push(desk_id.to_owned());
-        // The maps write on flush; flushing now makes the bytes measurable within this call.
-        self.desks.flush();
-        self.desks_by_owner.flush();
+        let n = self.desk_counts.get(&desk.owner).copied().unwrap_or(0);
+        self.desk_ids
+            .insert((desk.owner.clone(), n), desk_id.to_owned());
+        self.desk_counts.insert(desk.owner.clone(), n + 1);
+        self.flush_desks();
         env::storage_usage().saturating_sub(before)
     }
 
-    /// Undoes [`Self::write_desk`] in the same call. Desks are never deleted, so an owner's list
-    /// that empties was created by that write.
+    /// Undoes [`Self::write_desk`] in the same call. Desks are never deleted, so the owner's last
+    /// id is the one that write added, and a count that drops to 0 was created by it.
     fn unwrite_desk(&mut self, desk_id: &str, owner: &AccountId) {
         self.desks.remove(desk_id);
-        let emptied = match self.desks_by_owner.get_mut(owner) {
-            Some(ids) => {
-                ids.pop();
-                ids.is_empty()
+        let count = self.desk_counts.get(owner).copied().unwrap_or(0);
+        if let Some(last) = count.checked_sub(1) {
+            self.desk_ids.remove(&(owner.clone(), last));
+            if last == 0 {
+                self.desk_counts.remove(owner);
+            } else {
+                self.desk_counts.insert(owner.clone(), last);
             }
-            None => false,
-        };
-        if emptied {
-            self.desks_by_owner.remove(owner);
         }
-        self.desks.flush();
-        self.desks_by_owner.flush();
+        self.flush_desks();
     }
+
+    /// The maps write on flush; flushing now makes the bytes measurable within this call.
+    fn flush_desks(&mut self) {
+        self.desks.flush();
+        self.desk_counts.flush();
+        self.desk_ids.flush();
+    }
+}
+
+/// `E_ARGS` when `create_desk` came with less than [`CREATE_DESK_MIN_GAS`].
+pub fn check_create_desk_gas(prepaid: Gas) -> Result<(), Refusal> {
+    if prepaid >= CREATE_DESK_MIN_GAS {
+        return Ok(());
+    }
+    Err(Refusal::new(
+        E_ARGS,
+        format!(
+            "create_desk needs at least {} TGas attached (100 TGas recommended), not {}",
+            CREATE_DESK_MIN_GAS.as_tgas(),
+            prepaid.as_tgas()
+        ),
+    ))
 }
 
 /// Sends `amount` back, unless it is zero.
