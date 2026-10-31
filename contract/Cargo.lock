@@ -900,9 +900,11 @@ version = "0.1.0"
 dependencies = [
  "borsh",
  "bs58 0.5.1",
+ "curve25519-dalek",
  "hex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sha3 0.10.9",
 ]
 
