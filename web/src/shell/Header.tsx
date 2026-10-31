@@ -2,7 +2,7 @@ import type { Mode } from '@gimbal/shared';
 import { useStream } from '../stream/hub.ts';
 import type { Connection } from '../stream/store.ts';
 import { dotColor } from '../ui/dot.ts';
-import { SCREENS, hrefOf, type ScreenId } from './routes.ts';
+import { ONBOARDING_HREF, SCREENS, hrefOf, type ScreenId } from './routes.ts';
 import { Wordmark } from './Wordmark.tsx';
 
 const NETWORKS: Record<Mode, { label: string; dot: string }> = {
@@ -60,21 +60,22 @@ export function Header({ screen }: { screen: ScreenId }) {
 }
 
 // design/HANDOFF.md, Network: testnet swaps Add funds for Get test USDC; replay has no money buttons.
-// The flows behind these buttons arrive with onboarding. The phone has no header buttons: the Desk screen
-// draws the same pair under the desk value, with its own `className`.
+// Connecting and adding funds both open onboarding, which reads the chain and lands on the step that is next for this
+// wallet (the funds step once the desk exists). The phone has no header buttons: the Desk screen draws the same pair
+// under the desk value, with its own `className`.
 export function MoneyActions({ mode, className = 'money' }: { mode: Mode; className?: string }) {
   if (mode === 'replay') {
     return (
       <span className={className}>
         <button type="button" className="btn">Exit replay</button>
-        <button type="button" className="btn primary">Connect wallet</button>
+        <a className="btn primary" href={ONBOARDING_HREF}>Connect wallet</a>
       </span>
     );
   }
   return (
     <span className={className}>
       <button type="button" className="btn">Withdraw</button>
-      <button type="button" className="btn primary">{mode === 'testnet' ? 'Get test USDC' : 'Add funds'}</button>
+      <a className="btn primary" href={ONBOARDING_HREF}>{mode === 'testnet' ? 'Get test USDC' : 'Add funds'}</a>
     </span>
   );
 }

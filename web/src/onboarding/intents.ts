@@ -109,6 +109,13 @@ export function formatUsdc(units: bigint): string {
   return frac === '' ? whole.toString() : `${whole}.${frac}`;
 }
 
+/** USDC units as money for reading: "$1,050.00". Cents are cut off, not rounded, so the page never shows more than the desk holds. */
+export function dollars(units: bigint): string {
+  const cents = units / 10_000n;
+  const whole = (cents / 100n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return `$${whole}.${(cents % 100n).toString().padStart(2, '0')}`;
+}
+
 /** The body of `POST /v0/quote`: a live quote (it reserves a deposit address), exact input, delivered to the owner's account. */
 export function quoteBody(request: IntentsRequest): object {
   const amount = usdcUnits(request.amountUsdc);

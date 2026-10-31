@@ -20,7 +20,7 @@ import type { OnboardingConfig } from './config.ts';
 import { createDeskTx, depositTx, isDeskId, isEvmAddress, isIp, setOrderlyIpsTx, setOrderlyReceiverTx, setPolicyTx, splitIps } from './desk-actions.ts';
 import type { DerivedAddresses } from './derive.ts';
 import { DraftUnavailable, EngineError, type OnboardingEngine } from './engine.ts';
-import { formatUsdc, ORIGINS, usdcUnits, type IntentsApi, type IntentsQuote, type IntentsStatus, MIN_FUND_USDC } from './intents.ts';
+import { dollars, formatUsdc, ORIGINS, usdcUnits, type IntentsApi, type IntentsQuote, type IntentsStatus, MIN_FUND_USDC } from './intents.ts';
 import type { HlAsset, VenueData } from './marks.ts';
 import { addOperatorKeyAction, hasOperatorKey, isPublicKey, type AccessKeyInfo } from './operator.ts';
 import { addHlAsset, addUnpriced, policyProblems, removeCoin, removeUnpriced, removeVenue, starterPolicy, strategyProblems, type Problem, type VenueKey } from './policy.ts';
@@ -220,11 +220,11 @@ export function stepsOf(s: FlowState): StepView[] {
       done.setup ? 'Hyperliquid, Phoenix and Orderly accounts opened for the desk' : setup === null ? 'The engine opens the desk’s accounts on each exchange.' : `${finishedSteps} of ${setup.steps.length} steps done`,
     ],
     funds: [
-      done.funds ? `$${formatUsdc(s.desk!.ledger.deposited)} deposited` : 'Add funds',
+      done.funds ? `${dollars(s.desk!.ledger.deposited)} deposited` : 'Add funds',
       done.funds ? 'USDC from NEAR, counted as your principal' : 'Send USDC from another chain through Intents, then deposit it into the desk.',
     ],
-    rules: [done.rules ? 'Rules confirmed' : 'Your rules', 'Say what the desk may do. NEAR AI turns it into a policy.'],
-    sign: [done.sign ? 'Policy signed' : 'Sign the policy', 'One signature with your wallet. The contract enforces it from then on.'],
+    rules: [done.rules ? 'Rules confirmed' : 'Your rules', done.rules ? 'Your words, as numbers the contract can check' : 'Say what the desk may do. NEAR AI turns it into a policy.'],
+    sign: [done.sign ? 'Policy signed' : 'Sign the policy', done.sign ? 'The contract enforces it, the engine follows it' : 'One signature with your wallet. The contract enforces it from then on.'],
   };
   const order: StepId[] = ['wallet', 'desk', 'key', 'setup', 'funds', 'rules', 'sign'];
   let now = true;
@@ -265,7 +265,11 @@ export class OnboardingFlow {
   constructor(deps: FlowDeps) {
     this.d = { sleep: (ms) => new Promise((r) => setTimeout(r, ms)), retries: 8, retryMs: 1500, now: Date.now, ...deps };
     this.store = createStore<FlowState, Update>((s, f) => f(s), { ...initialFlowState(deps.config), setup: deps.setupFeed.get() });
-    this.stopFeed = deps.setupFeed.subscribe(() => this.set((s) => ({ ...s, setup: deps.setupFeed.get() })));
+    // The stream store notifies on every event of every type; only a new `setup` value changes this state.
+    this.stopFeed = deps.setupFeed.subscribe(() => {
+      const next = deps.setupFeed.get();
+      this.set((s) => (s.setup === next ? s : { ...s, setup: next }));
+    });
     this.stopSignOut = deps.wallet.onSignOut(() => this.set((s) => ({ ...initialFlowState(s.config), operatorKey: s.operatorKey, setup: s.setup })));
   }
 

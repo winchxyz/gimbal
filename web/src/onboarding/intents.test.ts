@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { formatUsdc, NEAR_USDC_ASSET, oneClick, ORIGINS, parseQuote, parseStatus, quoteBody, statusText, usdcUnits, type IntentsRequest } from './intents.ts';
+import { dollars, formatUsdc, NEAR_USDC_ASSET, oneClick, ORIGINS, parseQuote, parseStatus, quoteBody, statusText, usdcUnits, type IntentsRequest } from './intents.ts';
 
 const ARBITRUM = ORIGINS[0]!;
 const REQUEST: IntentsRequest = {
@@ -19,6 +19,13 @@ test('USDC amounts are read and written in whole units of 1e-6', () => {
   assert.equal(formatUsdc(250_500_000n), '250.5');
   assert.equal(formatUsdc(100_000_000n), '100');
   assert.equal(formatUsdc(1n), '0.000001');
+});
+
+test('money for reading has thousands, two decimals, and cuts instead of rounding up', () => {
+  assert.equal(dollars(1_050_000_000n), '$1,050.00');
+  assert.equal(dollars(0n), '$0.00');
+  assert.equal(dollars(999_999n), '$0.99');
+  assert.equal(dollars(1_234_567_891_230_000n), '$1,234,567,891.23');
 });
 
 test('the quote request is live, exact-input, to the owner’s NEAR account, with a refund address', () => {

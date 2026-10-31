@@ -83,10 +83,14 @@ export class FakeWorld {
   /** The wallet remembers a session from an earlier visit. */
   restores = false;
   walletSilent = false;
+  /** The wallet window stays open: Connect never answers. */
+  walletHangs = false;
+  /** ms between setup steps when the fake engine runs them by itself; 0 leaves them to `advanceSetup`. */
+  autoAdvanceMs = 0;
   signSilent = false;
   /** Make the contract refuse this method with this text. */
   refuse: { method: string; text: string } | null = null;
-  draftMode: 'ok' | 'unavailable' | 'silent' | 'broken' = 'ok';
+  draftMode: 'ok' | 'unavailable' | 'silent' | 'broken' | 'hang' = 'ok';
   putStrategyRefusal: string | null = null;
   setupRefusal: string | null = null;
   intentsStatus: IntentsStatus = 'PENDING_DEPOSIT';
@@ -201,6 +205,7 @@ export class FakeWorld {
       return this.account_;
     },
     connect: async () => {
+      if (this.walletHangs) return new Promise<string>(() => undefined);
       if (this.walletSilent) throw new WalletError('no wallet answered');
       this.account_ = this.account;
       return this.account;
@@ -266,6 +271,7 @@ export class FakeWorld {
   readonly engine: OnboardingEngine = {
     draftPolicy: async (text) => {
       this.engineCalls.push('POST /policy/draft');
+      if (this.draftMode === 'hang') return new Promise<PolicyDraft>(() => undefined);
       if (this.draftMode === 'unavailable') throw new DraftUnavailable('NEAR AI is not available');
       if (this.draftMode === 'silent') throw new EngineError('the engine did not answer');
       if (this.draftMode === 'broken') throw new Error('POST /policy/draft: policy: hl_assets is not a list');
@@ -288,6 +294,13 @@ export class FakeWorld {
       if (!desk) throw new EngineError(`there is no desk ${deskId}`);
       if (!(this.keys.get(desk.owner) ?? []).some((k) => k.publicKey === FAKE_ENGINE_KEY)) throw new EngineError('the engine key is not on the owner’s account yet');
       this.setupStore.dispatch({ deskId, steps: SETUP_STEPS.map((step, i) => ({ step, status: i === 0 ? 'running' : 'pending', tx: [] })) });
+      // On the development page nobody calls `advanceSetup`, so the fake engine works through its steps by itself.
+      if (this.autoAdvanceMs > 0) {
+        const timer = setInterval(() => {
+          this.advanceSetup();
+          if (this.setupStore.getState()?.steps.every((s) => s.status === 'done' || s.status === 'skipped')) clearInterval(timer);
+        }, this.autoAdvanceMs);
+      }
     },
   };
 
