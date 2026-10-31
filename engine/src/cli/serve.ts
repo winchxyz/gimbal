@@ -1,6 +1,7 @@
 // Runs the engine server: the scanner and the HTTP/SSE side (src/server.ts) on ENGINE_PORT (default 8790).
 //   GIMBAL_MODE=replay  npm run serve -w engine [-- --replay <recording.jsonl.gz>] [--speed 10]
 //   GIMBAL_MODE=mainnet npm run serve -w engine [-- --record fixtures/replay/<name>.jsonl.gz --minutes 65]
+//                       (mainnet also reads the 23 watch-only venues, src/venues/watch; testnet does not)
 //   GIMBAL_MODE=testnet npm run serve -w engine
 // Options (and the environment variables they override):
 //   --port <n>          ENGINE_PORT, default 8790
@@ -27,6 +28,7 @@ import { DEFAULT_ENGINE_PORT, EngineServer } from '../server.ts';
 import type { RecordLine } from '../venues/recorder.ts';
 import { JsonlGzWriter, RecordingVenue } from '../venues/recorder.ts';
 import { ScaledClock, readRecording } from '../venues/replay.ts';
+import { watchReaders } from '../venues/watch/index.ts';
 import type { Clock } from '../venues/venue.ts';
 import { ThinningSink, replayStart } from './serve-replay.ts';
 
@@ -78,8 +80,12 @@ if (mode === 'replay') {
   log(`replay ${file}: ${lines.length} answers from ${readers.venues.map((v) => v.id).join(', ')}, ${new Date(start).toISOString()} to ${new Date(end).toISOString()}, x${speed}`);
 } else {
   clock = { now: () => Date.now() };
-  readers = liveReaders(mode, clock);
+  // The watch-only venues are mainnet feeds. On testnet the desk venues' marks are testnet prices, so the mark
+  // check would drop them against the 23 mainnet feeds: testnet scans the desk venues alone.
+  const watch = mode === 'mainnet' ? watchReaders({ clock }) : [];
+  readers = liveReaders(mode, clock, watch);
   if (recordPath !== undefined) {
+    // Only the desk venues are recorded; the watch-only feeds are not part of a replay yet.
     writer = new JsonlGzWriter(resolve(recordPath));
     const sink = new ThinningSink(writer, { funding: 30_000, book: 30_000 });
     readers = { ...readers, venues: readers.venues.map((v) => new RecordingVenue(v, sink, clock)) };

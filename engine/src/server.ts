@@ -3,6 +3,8 @@
 //   GET /state                   EngineState: the latest of each event type
 //   GET /windows/history?id=     WindowHistory of one window (404 when the last scan did not list it)
 //   GET /strategy, PUT /strategy StrategyConfig (PUT takes the whole config, checked, and answers the new one)
+//   GET /journal?before=<id>     JournalEntry[]: up to 100 entries older than that id, newest first ([] past the
+//                                oldest; 404 for an id not in memory); without `before`, the newest 100
 // The scanner feeds it: every scan publishes a `scan` and a `windows` event. Routes other parts build later answer
 // 501 for now (POST /rotate and /close in their own { ok, reason } shape).
 
@@ -18,7 +20,10 @@ import { parseStrategyConfig } from './scanner/config.ts';
 import type { ScanResult, Scanner } from './scanner/scanner.ts';
 
 export const DEFAULT_ENGINE_PORT = 8790;
-const JOURNAL_KEEP = 100;
+/** Journal entries per page: GET /state's newest and each GET /journal?before= page. */
+const JOURNAL_PAGE = 100;
+/** Entries kept in memory for paging back; older ones are not served (the journal is not persisted yet). */
+const JOURNAL_KEEP = 5_000;
 const HEARTBEAT_MS = 15_000;
 const MAX_BODY_BYTES = 64 * 1024;
 
@@ -117,7 +122,7 @@ export class EngineServer {
       scan: this.#latest.scan,
       strategy: this.#strategy,
       desk: this.#latest.desk,
-      journal: [...this.#journal],
+      journal: this.#journal.slice(0, JOURNAL_PAGE),
       rescue: this.#latest.rescue,
       setup: this.#latest.setup,
       health: this.#latest.health,
@@ -176,6 +181,14 @@ export class EngineServer {
       const history = this.#options.scanner.history(id);
       if (history === null) return json(res, 404, { error: `no history for ${id}: the last scan did not list it` });
       return json(res, 200, history);
+    }
+    if (path === '/journal') {
+      if (method !== 'GET') return notAllowed(res, 'GET');
+      const before = url.searchParams.get('before');
+      if (before === null || before === '') return json(res, 200, this.#journal.slice(0, JOURNAL_PAGE));
+      const at = this.#journal.findIndex((e) => e.id === before);
+      if (at === -1) return json(res, 404, { error: `no journal entry ${before} in the last ${JOURNAL_KEEP}` });
+      return json(res, 200, this.#journal.slice(at + 1, at + 1 + JOURNAL_PAGE));
     }
     if (path === '/strategy') {
       if (method === 'GET') return json(res, 200, this.#strategy);

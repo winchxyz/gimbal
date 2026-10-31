@@ -173,3 +173,22 @@ test('publish keeps the latest of each type for /state, and the journal newest f
   const state = (await call('GET', '/state')).json as EngineState;
   assert.deepEqual(state.journal.map((j) => j.id), ['second', 'first']);
 });
+
+test('GET /journal?before=<id>: up to 100 entries older than that id, newest first, [] past the oldest', async () => {
+  const entry = (id: string) => ({ id, t: T0, kind: 'window' as const, summary: id, numbers: {}, tx: [] });
+  // 250 more entries, j0 oldest ... j249 newest, on top of 'first' and 'second' from the test above.
+  for (let i = 0; i < 250; i++) server.publish({ type: 'journal', data: entry(`j${i}`) });
+  const ids = async (path: string) => ((await call('GET', path)).json as { id: string }[]).map((e) => e.id);
+  const state = (await call('GET', '/state')).json as EngineState;
+  assert.equal(state.journal.length, 100);
+  assert.equal(state.journal[0]!.id, 'j249');
+  assert.deepEqual(await ids('/journal'), state.journal.map((e) => e.id));
+  const page = await ids('/journal?before=j150');
+  assert.equal(page.length, 100);
+  assert.equal(page[0], 'j149');
+  assert.equal(page.at(-1), 'j50');
+  assert.deepEqual(await ids('/journal?before=j10'), ['j9', 'j8', 'j7', 'j6', 'j5', 'j4', 'j3', 'j2', 'j1', 'j0', 'second', 'first']);
+  assert.deepEqual(await ids('/journal?before=first'), []);
+  assert.equal((await call('GET', '/journal?before=nope')).status, 404);
+  assert.equal((await call('POST', '/journal', '{}')).status, 405);
+});

@@ -181,6 +181,34 @@ test('a venue that does not answer: listed as failed, its last good numbers mark
   assert.equal(r4.windows.length, 0);
 });
 
+test('a read that outlives its scan is not asked again: the next scan waits on the same request and uses its answer', async () => {
+  const { hl, phoenix } = venues();
+  let calls = 0;
+  const slow = watch('pacifica', 'dex', []);
+  slow.funding = () => {
+    calls++;
+    return new Promise((resolve) => setTimeout(() => resolve([row('pacifica', 'SOL', { ratePerHour: 0.0002 })]), 60));
+  };
+  const clock = new VirtualClock(T0);
+  const { scanner: s } = scanner({ venues: [hl, phoenix], watch: [slow] }, clock, { readTimeoutMs: 40 });
+  assert.deepEqual((await s.scan()).scan.failed, ['pacifica']);
+  clock.set(T0 + 5_000);
+  const r2 = await s.scan();
+  assert.equal(calls, 1);
+  assert.deepEqual(r2.scan.failed, []);
+  assert.ok(byId(r2.windows, 'sol-phoenix-pacifica') !== undefined);
+  // A watch-only venue is read every 30 s: its answer stands until then, dated when it came, and is not stale.
+  clock.set(T0 + 30_000);
+  const r3 = await s.scan();
+  assert.equal(calls, 1);
+  const w = byId(r3.windows, 'sol-phoenix-pacifica')!;
+  assert.equal(w.stale, false);
+  assert.equal(w.updatedAt, T0 + 5_000);
+  clock.set(T0 + 35_000);
+  await s.scan();
+  assert.equal(calls, 2);
+});
+
 test('a desk pair whose book was never read is left out, not shown with zero slippage; a later failure keeps the old book, stale', async () => {
   const { hl, phoenix, orderly } = venues();
   orderly.books.set('PERP_SOL_USDC', new Error('socket closed'));

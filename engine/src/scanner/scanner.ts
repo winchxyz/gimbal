@@ -98,6 +98,7 @@ export class Scanner {
   readonly #books = new Map<string, BookRead>();
   readonly #rates = new RateStore();
   readonly #history = new Map<string, HistoryState>();
+  readonly #inFlight = new Map<string, Promise<unknown>>();
   #priced = new Map<string, PricedWindow>();
   #lastAt = 0;
 
@@ -142,8 +143,14 @@ export class Scanner {
 
     // 1. funding
     const reads = await Promise.all(this.#sources.map(async (s) => {
+      // A watch-only venue is read every watchIntervalMs, not every scan: its rates are reference only, and some
+      // of these public APIs rate-limit a 5 s poll. Between reads its last answer stands, dated when it was read.
+      const recent = this.#lastGood.get(s.id);
+      if (s.kind !== 'desk' && recent !== undefined && now - recent.at < config.watchIntervalMs) {
+        return { source: s, rows: recent.rows, at: recent.at, stale: false };
+      }
       try {
-        const rows = await withTimeout(s.funding(), config.readTimeoutMs, `${s.id} funding`);
+        const rows = await withTimeout(this.#once(`funding ${s.id}`, () => s.funding()), config.readTimeoutMs, `${s.id} funding`);
         if (!Array.isArray(rows)) throw new Error(`${s.id} funding: not a list`);
         this.#lastGood.set(s.id, { rows, at: now });
         return { source: s, rows, at: now, stale: false };
@@ -186,7 +193,8 @@ export class Scanner {
       const src = sourceById.get(leg.venue);
       if (src?.book === undefined) return;
       try {
-        const book = await withTimeout(src.book(leg.symbol, config.bookDepth), config.bookTimeoutMs, `${leg.venue} book ${leg.symbol}`);
+        const read = this.#once(`book ${key}`, () => src.book!(leg.symbol, config.bookDepth));
+        const book = await withTimeout(read, config.bookTimeoutMs, `${leg.venue} book ${leg.symbol}`);
         this.#books.set(key, { book, readAt: now, stale: false });
       } catch (err) {
         failed.add(leg.venue);
@@ -313,6 +321,20 @@ export class Scanner {
       }
     }), 2);
     return reads;
+  }
+
+  /**
+   * The read still running for `key`, or a new one. A read that outlived its scan's timeout is waited on again by
+   * the next scan instead of being asked a second time, so a slow venue never has requests piling up.
+   */
+  #once<T>(key: string, start: () => Promise<T>): Promise<T> {
+    const running = this.#inFlight.get(key);
+    if (running !== undefined) return running as Promise<T>;
+    const p = start().finally(() => this.#inFlight.delete(key));
+    // The rejection is handled by the caller that awaits it; this copy only keeps an unawaited one quiet.
+    p.catch(() => {});
+    this.#inFlight.set(key, p);
+    return p;
   }
 
   #note(note: string): void {

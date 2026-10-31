@@ -32,6 +32,8 @@ export interface ScannerConfig {
   /** A desk venue's book is read again once it is this old. */
   bookTtlMs: number;
   bookDepth: number;
+  /** A watch-only venue's funding is read again once its last answer is this old (desk venues: every scan). */
+  watchIntervalMs: number;
   /** A funding read that takes longer than this counts as "did not answer" for this scan. */
   readTimeoutMs: number;
   /** The same for a book: longer, because Orderly's first book also opens its public WebSocket. */
@@ -85,6 +87,8 @@ export const DEFAULT_SCANNER_CONFIG: ScannerConfig = {
   intervalMs: 5_000,
   bookTtlMs: 30_000,
   bookDepth: 20,
+  // Variational answered HTTP 429 to a 5 s poll on 2026-10-31.
+  watchIntervalMs: 30_000,
   readTimeoutMs: 4_000,
   bookTimeoutMs: 8_000,
   dropAfterMs: 10 * 60_000,
