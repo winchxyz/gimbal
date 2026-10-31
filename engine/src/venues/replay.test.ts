@@ -5,9 +5,9 @@ import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { gzipSync } from 'node:zlib';
 import type { RecordLine, WireLine } from './recorder.ts';
-import { JsonlGzWriter, RecordingVenue, recordingFetch } from './recorder.ts';
+import { JsonlGzWriter, RecordingVenue, recordingFetch, recordingWsRequester } from './recorder.ts';
 import {
-  ReplayMissError, ReplayVenue, ScaledClock, VirtualClock, parseRecording, readRecording, readWireRecording, replayFetch,
+  ReplayMissError, ReplayVenue, ScaledClock, VirtualClock, parseRecording, readRecording, readWireRecording, replayFetch, replayWsRequester,
 } from './replay.ts';
 import type { AccountState, Book, FundingPayment, Market, MarketFunding, VenueReader } from './venue.ts';
 
@@ -283,7 +283,7 @@ test('raw exchanges are recorded with their status, then served back by request,
   await post(rec, { type: 'a', n: 1 });
   await post(rec, { type: 'broken' });
   await post(rec, { type: 'text' });
-  await assert.rejects(rec(url, { method: 'GET' }), /only POST/);
+  await assert.rejects(rec(url, { method: 'PUT', body: '{}' }), /only POST/);
   await writer.close();
 
   const lines = readWireRecording(path);
@@ -302,7 +302,7 @@ test('raw exchanges are recorded with their status, then served back by request,
   assert.equal(await (await post(replay, { type: 'text' })).text(), 'not json at all');
   await assert.rejects(post(replay, { type: 'a', n: 2 }), ReplayMissError);
   await assert.rejects(replay('https://other.example.test/info', { method: 'POST', body: JSON.stringify({ type: 'a', n: 1 }) }), ReplayMissError);
-  await assert.rejects(replay(url, { method: 'GET' }), /only POST/);
+  await assert.rejects(replay(url, { method: 'DELETE' }), /only POST/);
   assert.equal(seen.length, 4);                                          // replay never touched the network
 });
 
@@ -317,4 +317,62 @@ test('malformed wire lines are refused with their line number', () => {
   const badFile = join(dir, 'bad-wire.jsonl.gz');
   writeFileSync(badFile, gzipSync('{"t":1,"url":"u","status":200,"request":{}}\n'));
   assert.throws(() => readWireRecording(badFile), /bad-wire.jsonl.gz:1: needs request and response/);
+  writeFileSync(badFile, gzipSync('{"t":1,"method":"PATCH","url":"u","status":200,"request":null,"response":1}\n'));
+  assert.throws(() => readWireRecording(badFile), /bad-wire.jsonl.gz:1: unknown method PATCH/);
+});
+
+test('GET exchanges are recorded by url (query included) and kept apart from a POST to the same url', async () => {
+  const clock = new VirtualClock(T0);
+  const inner = (async (input: string | URL | Request, init?: RequestInit) => {
+    clock.advance(25);
+    const url = String(input);
+    if (url.endsWith('missing')) return new Response('{"error":"not found"}', { status: 404 });
+    return new Response(JSON.stringify({ method: init?.method ?? 'GET', url }));
+  }) as typeof fetch;
+  const path = join(dir, 'wire-get.jsonl.gz');
+  const writer = new JsonlGzWriter<WireLine>(path);
+  const rec = recordingFetch(inner, writer, clock);
+  const base = 'https://api.example.test/v1';
+  await rec(`${base}/futures?a=1&b=2`);                                 // no init at all: a plain GET
+  await rec(`${base}/futures?a=1&b=2`, { method: 'POST', body: '{"x":1}' });
+  await rec(`${base}/missing`, { method: 'GET' });
+  await writer.close();
+
+  const lines = readWireRecording(path);
+  assert.deepEqual(lines.map((l) => [l.method ?? 'POST', l.request, l.status]), [['GET', null, 200], ['POST', { x: 1 }, 200], ['GET', null, 404]]);
+  const replay = replayFetch(lines);
+  assert.equal(((await (await replay(`${base}/futures?a=1&b=2`)).json()) as { method: string }).method, 'GET');
+  assert.equal(((await (await replay(`${base}/futures?a=1&b=2`, { method: 'POST', body: '{"x":1}' })).json()) as { method: string }).method, 'POST');
+  assert.equal((await replay(`${base}/missing`)).status, 404);
+  // The query is part of the call: another order or value is another call.
+  await assert.rejects(replay(`${base}/futures?b=2&a=1`), ReplayMissError);
+});
+
+test('WebSocket request frames are recorded without their id and answered with the caller id on replay', async () => {
+  const clock = new VirtualClock(T0);
+  const inner = async (_url: string, frame: { id: string } & Record<string, unknown>) => {
+    clock.advance(120);
+    const params = frame.params as { symbol: string };
+    return { id: frame.id, event: 'request', success: true, data: { symbol: params.symbol, asks: [[1, 2]], bids: [] } };
+  };
+  const path = join(dir, 'wire-ws.jsonl.gz');
+  const writer = new JsonlGzWriter<WireLine>(path);
+  const rec = recordingWsRequester(inner, writer, clock);
+  const url = 'wss://ws.example.test/stream/abc';
+  const answer = await rec(url, { id: 'book-7', event: 'request', params: { type: 'orderbook', symbol: 'PERP_SOL_USDC' } });
+  assert.equal(answer.id, 'book-7');
+  await writer.close();
+
+  const lines = readWireRecording(path);
+  assert.deepEqual(lines[0], {
+    t: T0 + 120, method: 'WS', url, request: { event: 'request', params: { type: 'orderbook', symbol: 'PERP_SOL_USDC' } }, status: 101, ms: 120,
+    response: { event: 'request', success: true, data: { symbol: 'PERP_SOL_USDC', asks: [[1, 2]], bids: [] } },
+  });
+  const replay = replayWsRequester(lines);
+  const again = await replay(url, { id: 'other-1', event: 'request', params: { symbol: 'PERP_SOL_USDC', type: 'orderbook' } });
+  assert.equal(again.id, 'other-1');
+  assert.deepEqual(again.data, { symbol: 'PERP_SOL_USDC', asks: [[1, 2]], bids: [] });
+  await assert.rejects(replay(url, { id: 'x', event: 'request', params: { type: 'orderbook', symbol: 'PERP_ETH_USDC' } }), ReplayMissError);
+  // WS lines never answer an HTTP fetch, and HTTP lines never answer a WS request.
+  await assert.rejects(replayFetch(lines)(url), ReplayMissError);
 });

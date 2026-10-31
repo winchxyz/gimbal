@@ -5,6 +5,7 @@
 //
 // recordingFetch records one level lower: the raw HTTP exchanges a reader makes, so a test can run the
 // reader's own parsing and paging against what the venue really answered (see replayFetch).
+// recordingWsRequester does the same for request/answer frames over a WebSocket (Orderly's public book).
 
 import { createWriteStream, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -15,6 +16,7 @@ import type {
   AccountState, Book, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, VenueMethod, VenueReader,
 } from './venue.ts';
 import { systemClock } from './venue.ts';
+import type { WsRequester } from './ws.ts';
 
 export interface RecordLine {
   t: number;                     // ms, when the answer arrived: replay serves it from this moment on
@@ -26,14 +28,18 @@ export interface RecordLine {
   error?: string;
 }
 
-/** One HTTP exchange: a POST with a JSON body and the answer to it, whatever its status. */
+/**
+ * One exchange and the answer to it, whatever its status: an HTTP POST with a JSON body, an HTTP GET (the query is
+ * part of `url`), or one request frame sent over a WebSocket and the frame that answered it.
+ */
 export interface WireLine {
   t: number;                     // ms, when the answer arrived
+  method?: 'POST' | 'GET' | 'WS';   // absent on lines recorded before GET support: POST
   url: string;
-  request: unknown;              // the parsed JSON body
-  status: number;
+  request: unknown;              // POST: the parsed JSON body; GET: null; WS: the frame sent, without its `id`
+  status: number;                // HTTP status; 101 for a WS answer
   ms: number;
-  response: unknown;             // parsed JSON when the body was JSON, the text otherwise
+  response: unknown;             // parsed JSON when the body was JSON, the text otherwise; WS: the answer, without its `id`
 }
 
 export interface LineSink<L> {
@@ -96,26 +102,63 @@ export class RecordingVenue implements VenueReader, FundingHistorySource {
 }
 
 /**
- * Wraps `fetch` and writes each POST it answers, with its status, to `sink`. The caller gets the real
- * response back untouched. Only POSTs with a JSON string body are supported: that is all /info takes.
+ * Wraps `fetch` and writes each exchange it answers, with its status, to `sink`. The caller gets the real
+ * response back untouched. Supported: POST with a JSON string body (Hyperliquid's /info) and GET without a body
+ * (Phoenix, Orderly public REST). Request headers are not recorded: a recording never holds a signature.
  */
 export function recordingFetch(inner: typeof fetch, sink: LineSink<WireLine>, clock: Clock = systemClock): typeof fetch {
   return async (input, init) => {
-    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-    if (init?.method !== 'POST' || typeof init.body !== 'string') throw new Error(`recordingFetch: ${url}: only POST with a JSON string body`);
+    const url = requestUrl(input);
+    const { method, request } = wireRequest(url, init, 'recordingFetch');
     const started = clock.now();
     const res = await inner(input, init);
-    const text = await res.clone().text();
-    let response: unknown = text;
-    try {
-      response = JSON.parse(text);
-    } catch {
-      // not JSON: keep the text
-    }
+    const response = parseBody(await res.clone().text());
     const t = clock.now();
-    sink.write({ t, url, request: JSON.parse(init.body) as unknown, status: res.status, ms: t - started, response });
+    sink.write(method === 'POST'
+      ? { t, url, request, status: res.status, ms: t - started, response }
+      : { t, method, url, request, status: res.status, ms: t - started, response });
     return res;
   };
+}
+
+export function requestUrl(input: string | URL | Request): string {
+  return typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+}
+
+/** The method and recorded request of a fetch call, or an error for a shape recordings do not support. */
+export function wireRequest(url: string, init: RequestInit | undefined, who: string): { method: 'POST' | 'GET'; request: unknown } {
+  const method = (init?.method ?? 'GET').toUpperCase();
+  if (method === 'POST' && typeof init?.body === 'string') return { method: 'POST', request: JSON.parse(init.body) as unknown };
+  if (method === 'GET' && (init?.body === undefined || init.body === null)) return { method: 'GET', request: null };
+  throw new Error(`${who}: ${url}: only POST with a JSON string body or GET without one`);
+}
+
+/** Parsed JSON when the text is JSON, the text itself otherwise. */
+export function parseBody(text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return text;
+  }
+}
+
+/**
+ * Wraps a WebSocket requester and writes each request frame and its answer as a WireLine with method "WS".
+ * The client-chosen `id` is dropped from both, so a replay matches on what was asked, not on a counter.
+ */
+export function recordingWsRequester(inner: WsRequester, sink: LineSink<WireLine>, clock: Clock = systemClock): WsRequester {
+  return async (url, frame) => {
+    const started = clock.now();
+    const answer = await inner(url, frame);
+    const t = clock.now();
+    sink.write({ t, method: 'WS', url, request: withoutId(frame), status: 101, ms: t - started, response: withoutId(answer) });
+    return answer;
+  };
+}
+
+export function withoutId(frame: Record<string, unknown>): Record<string, unknown> {
+  const { id: _id, ...rest } = frame;
+  return rest;
 }
 
 /** Gzipped JSONL file. Refuses to touch an existing file, so a committed fixture is never extended by accident. */
