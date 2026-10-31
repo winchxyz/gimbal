@@ -78,9 +78,8 @@ function fakeSetup(): SetupProgress {
     'orderly_add_key',
     'orderly_receiver_lookup',
     'orderly_referral_bind',
-    'phoenix_login',
-    'phoenix_invite',
     'phoenix_register',
+    'phoenix_referral',
   ];
   return { deskId: 'desk-07', steps: steps.map((step) => ({ step, status: 'done', tx: [] })) };
 }
