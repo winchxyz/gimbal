@@ -76,6 +76,22 @@ pub fn check_base58_32(field: &str, s: &str) -> Result<[u8; 32], Refusal> {
     })
 }
 
+/// Longest `reason` of an action method, in characters.
+pub const REASON_MAX_CHARS: usize = 280;
+
+/// An action's `reason`: at most [`REASON_MAX_CHARS`] characters (`E_ARGS`). Events carry its
+/// sha256, not the text.
+pub fn check_reason(reason: &str) -> Result<(), Refusal> {
+    let chars = reason.chars().count();
+    if chars > REASON_MAX_CHARS {
+        return Err(Refusal::new(
+            E_ARGS,
+            format!("reason has {chars} characters, over {REASON_MAX_CHARS}"),
+        ));
+    }
+    Ok(())
+}
+
 /// MPC domain 0: the desk's EVM key.
 pub const MPC_DOMAIN_SECP256K1: u32 = 0;
 /// MPC domain 1: the desk's Solana and Orderly key.
@@ -247,6 +263,15 @@ mod tests {
         let address = evm_address_from_keccak(&hash);
         assert_eq!(address, "0x676f777f878f979fa7afb7bfc7cfd7dfe7eff7ff");
         assert!(is_lower_evm_address(&address));
+    }
+
+    #[test]
+    fn reasons_are_at_most_280_characters() {
+        check_reason("").unwrap();
+        check_reason(&"\u{e9}".repeat(REASON_MAX_CHARS)).unwrap();
+        let r = check_reason(&"a".repeat(REASON_MAX_CHARS + 1)).unwrap_err();
+        assert_eq!(r.code, E_ARGS);
+        assert_eq!(r.msg, "reason has 281 characters, over 280");
     }
 
     #[test]

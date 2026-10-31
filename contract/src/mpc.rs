@@ -1,12 +1,43 @@
-//! The MPC contract's `derived_public_key`, which `create_desk` asks for a desk's two keys before it
-//! stores the desk (docs/interfaces.md §1.2).
+//! The MPC contract: `derived_public_key`, which `create_desk` asks for a desk's two keys before it
+//! stores the desk (docs/interfaces.md §1.2), and the request its `sign` takes.
 
 use gimbal_core::errors::{shown, Refusal, E_MPC};
 use gimbal_core::ids::{
     decode_mpc_ed25519, decode_mpc_secp256k1, evm_address_from_keccak, evm_path, sol_path,
     MPC_DOMAIN_ED25519, MPC_DOMAIN_SECP256K1,
 };
-use near_sdk::{env, serde_json, AccountId, Gas, NearToken, Promise};
+use near_sdk::{env, near, serde_json, AccountId, Gas, NearToken, Promise};
+
+/// The `request` of the MPC contract's `sign({request})`: `{path, payload_v2: {Ecdsa: hex},
+/// domain_id}`, derived for this contract as predecessor.
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignRequest {
+    pub path: String,
+    pub payload_v2: SignPayload,
+    pub domain_id: u32,
+}
+
+/// What the key signs, as lowercase hex without `0x`.
+#[near(serializers = [json])]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SignPayload {
+    /// A 32-byte digest, for the secp256k1 key (domain 0). Ed25519 payloads (`Eddsa`) come with
+    /// the Solana and Orderly methods.
+    Ecdsa(String),
+}
+
+impl SignRequest {
+    /// `digest` signed by the desk's EVM key, `gimbal/<desk_id>/evm` in domain 0: its Hyperliquid
+    /// master address.
+    pub fn evm(desk_id: &str, digest: &[u8; 32]) -> Self {
+        Self {
+            path: evm_path(desk_id),
+            payload_v2: SignPayload::Ecdsa(hex::encode(digest)),
+            domain_id: MPC_DOMAIN_SECP256K1,
+        }
+    }
+}
 
 /// Gas for one `derived_public_key` call. Measured on `v1.signer-prod.testnet` on 2026-10-30 as a
 /// transaction: 5.37 TGas for domain 0, 5.29 TGas for domain 1.

@@ -5,32 +5,12 @@ use gimbal_core::errors::{Refusal, E_ARGS};
 use gimbal_core::ids::is_lower_evm_address;
 use near_sdk::{near, AccountId};
 
+pub use gimbal_core::network::{Network, ARBITRUM_MAINNET, ARBITRUM_SEPOLIA};
+
 /// Hyperliquid caps a builder fee on perps at 100 tenths of a bp (0.1 %).
 pub const HL_BUILDER_FEE_MAX_TENTH_BPS: u16 = 100;
 /// A performance fee is a share of profit: at most all of it.
 pub const PERFORMANCE_FEE_MAX_BPS: u16 = 10_000;
-/// Hyperliquid referral codes are 1 to 20 characters.
-pub const HL_REFERRAL_CODE_MAX_CHARS: usize = 20;
-/// Arbitrum chain ids Orderly runs on.
-pub const ARBITRUM_MAINNET: u64 = 42161;
-pub const ARBITRUM_SEPOLIA: u64 = 421614;
-
-#[near(serializers = [borsh, json])]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Network {
-    Mainnet,
-    Testnet,
-}
-
-impl Network {
-    /// The Arbitrum chain Orderly uses on this network: EIP-712 chainId, withdrawals, receiver address.
-    pub const fn arbitrum_chain_id(self) -> u64 {
-        match self {
-            Network::Mainnet => ARBITRUM_MAINNET,
-            Network::Testnet => ARBITRUM_SEPOLIA,
-        }
-    }
-}
 
 /// Where the price band gets its oracle price.
 #[near(serializers = [borsh, json])]
@@ -153,12 +133,8 @@ pub fn check(
         ));
     }
     if let Some(code) = &treasury.referral_codes.hyperliquid {
-        let chars = code.chars().count();
-        if chars == 0 || chars > HL_REFERRAL_CODE_MAX_CHARS {
-            return refuse(format!(
-                "Hyperliquid referral code has {chars} characters, not 1 to {HL_REFERRAL_CODE_MAX_CHARS}"
-            ));
-        }
+        // The same rule `hl_set_referrer` applies, so a code `new` accepts can always be signed.
+        gimbal_core::hl::check_referral_code(code)?;
     }
     for (venue, code) in [
         ("Orderly", &treasury.referral_codes.orderly),
