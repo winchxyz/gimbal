@@ -18,6 +18,10 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 mod hl;
 /// The Orderly methods, on these fixtures.
 mod orderly;
+/// Oracle prices and orders against them.
+mod prices;
+/// The rescue methods and their 1Click quotes.
+mod rescue;
 /// The MPC `sign` call and `on_signed`.
 mod signing;
 /// The Solana methods, on these fixtures.
@@ -428,7 +432,7 @@ fn attributes_of<'a>(source: &'a str, method: &str) -> Vec<&'a str> {
 /// build is proved on testnet (PR #8); this keeps the attribute from being dropped.
 #[test]
 fn mutating_methods_refuse_unknown_arguments() {
-    let sources: [(&str, &[&str]); 4] = [
+    let sources: [(&str, &[&str]); 6] = [
         (
             include_str!("lib.rs"),
             &[
@@ -460,6 +464,20 @@ fn mutating_methods_refuse_unknown_arguments() {
                 "orderly_ws_auth",
                 "orderly_settle_pnl",
                 "orderly_withdraw",
+                "set_orderly_receiver",
+                "set_orderly_ips",
+            ],
+        ),
+        (
+            include_str!("prices.rs"),
+            &["refresh_prices", "oracle_on_call", "set_mock_price"],
+        ),
+        (
+            include_str!("rescue.rs"),
+            &[
+                "hl_send_to_intents",
+                "sol_sign_rescue",
+                "evm_usdc_to_intents",
             ],
         ),
     ];
@@ -480,13 +498,21 @@ fn mutating_methods_refuse_unknown_arguments() {
 /// `refuse` and `new` are the contract's own as well.
 #[test]
 fn callbacks_and_init_are_private() {
-    let source = include_str!("lib.rs");
-    for method in ["new", "on_desk_keys", "on_signed", "refuse"] {
-        let attributes = attributes_of(source, method);
-        assert!(
-            attributes.contains(&"#[private]"),
-            "{method}: {attributes:?}"
-        );
+    let sources: [(&str, &[&str]); 2] = [
+        (
+            include_str!("lib.rs"),
+            &["new", "on_desk_keys", "on_signed", "refuse"],
+        ),
+        (include_str!("prices.rs"), &["on_prices"]),
+    ];
+    for (source, methods) in sources {
+        for method in methods {
+            let attributes = attributes_of(source, method);
+            assert!(
+                attributes.contains(&"#[private]"),
+                "{method}: {attributes:?}"
+            );
+        }
     }
 }
 

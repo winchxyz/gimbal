@@ -184,6 +184,14 @@ pub struct CheckedMessage {
     /// `cancel_all` or a reduce-only order, so a paused desk cannot be made to burn SOL on fees.
     /// Anything else (a deposit or withdrawal, Ember, a token account created, an `Approve`, a
     /// rescue transfer, which moves money out) needs a running desk.
+    ///
+    /// In rescue mode the rescue's own rule instead: a paused desk may sign a rescue that only
+    /// frees and pays out the quote's `amountIn`: Phoenix withdrawals of at most `amountIn` in
+    /// all, Ember unwraps of an amount, at most `amountIn` in all (with the `Approve` each spends
+    /// and the `Revoke` after it, which the walk requires), `Revoke`s, the create of the deposit
+    /// owner's account and the one transfer to it. No order, `cancel_all` (`sol_sign` signs
+    /// those on a paused desk), deposit, wrap, other token transfer, create of a desk account or
+    /// priority fee.
     pub reduces_risk: bool,
 }
 
@@ -461,6 +469,12 @@ struct Walk<'a> {
     revoke_due: Option<usize>,
     /// A `cancel_all` came.
     cancel_all: bool,
+    /// False once an instruction a paused desk's rescue may not carry comes
+    /// ([`CheckedMessage::reduces_risk`] in rescue mode).
+    rescue_pause_ok: bool,
+    /// What the Phoenix withdrawals and the Ember unwraps of the message free, each summed.
+    withdrawn: u64,
+    unwrapped: u64,
 }
 
 impl<'a> Walk<'a> {
@@ -517,6 +531,7 @@ impl<'a> Walk<'a> {
             ));
         }
         let expected = if owner == d.authority {
+            self.rescue_pause_ok = false;
             if mint == USDC_MINT {
                 d.usdc_ata
             } else {
@@ -612,6 +627,7 @@ impl<'a> Walk<'a> {
                 if !d.is_token_account(&a[1]) {
                     return Err(self.foreign_destination(&a[1], n));
                 }
+                self.rescue_pause_ok = false;
                 not_into_itself(&a[0], &a[1], n)
             }
             Some(&TOKEN_TRANSFER_CHECKED) => {
@@ -622,6 +638,7 @@ impl<'a> Walk<'a> {
                 let a = accounts(ix, n, 4)?;
                 moves_something(&ix.data[1..9], n)?;
                 if d.is_token_account(&a[2]) {
+                    self.rescue_pause_ok = false;
                     return not_into_itself(&a[0], &a[2], n);
                 }
                 let Some(r) = self.rescue.filter(|r| r.deposit_account == a[2]) else {
@@ -660,6 +677,11 @@ impl<'a> Walk<'a> {
             )),
             None => Err(malformed()),
         }
+    }
+
+    /// The rescue's `amountIn`, 0 outside rescue mode.
+    fn rescue_amount(&self) -> u64 {
+        self.rescue.map_or(0, |r| r.amount_in)
     }
 
     fn foreign_destination(&self, account: &Pubkey, n: usize) -> Refusal {
@@ -703,6 +725,10 @@ impl<'a> Walk<'a> {
                 (7, TOKEN_PROGRAM, "the token program"),
             ],
         )?;
+        if disc == Some(&EMBER_DEPOSIT[..]) {
+            // A wrap puts USDC back into PhUSD, no step of a rescue.
+            self.rescue_pause_ok = false;
+        }
         if disc == Some(&EMBER_WITHDRAW[..]) {
             // An Option<u64>: 1 and the amount, or 0 for the whole balance.
             let amount = match (ix.data.get(8), ix.data.len()) {
@@ -710,6 +736,13 @@ impl<'a> Walk<'a> {
                 (Some(0), 9) => None,
                 _ => return Err(at(n, E_SOL_PROGRAM, "a malformed Ember withdraw")),
             };
+            match amount {
+                Some(a) => self.unwrapped = self.unwrapped.saturating_add(a),
+                None => self.rescue_pause_ok = false,
+            }
+            if self.unwrapped > self.rescue_amount() {
+                self.rescue_pause_ok = false;
+            }
             if let Some((approved_at, approved)) = self.approval.take() {
                 if amount != Some(approved) {
                     return Err(at(
@@ -801,6 +834,7 @@ impl<'a> Walk<'a> {
                     n,
                     &[(9, spline, "the spline collection of that orderbook")],
                 )?;
+                self.rescue_pause_ok = false;
                 if is_order {
                     let order = self.order(ix, market, n)?;
                     self.orders.push(order);
@@ -828,6 +862,7 @@ impl<'a> Walk<'a> {
                     ],
                 )?;
                 self.reduces_risk = false;
+                self.rescue_pause_ok = false;
                 self.phoenix.get_or_insert("deposit");
             }
             WITHDRAW_FUNDS => {
@@ -851,6 +886,10 @@ impl<'a> Walk<'a> {
                     ],
                 )?;
                 self.reduces_risk = false;
+                self.withdrawn = self.withdrawn.saturating_add(le_u64(&ix.data[8..16]));
+                if self.withdrawn > self.rescue_amount() {
+                    self.rescue_pause_ok = false;
+                }
                 self.phoenix.get_or_insert("withdraw");
             }
             _ => {
@@ -981,6 +1020,9 @@ pub fn check_message(
         approval: None,
         revoke_due: None,
         cancel_all: false,
+        rescue_pause_ok: true,
+        withdrawn: 0,
+        unwrapped: 0,
     };
     for (n, ix) in m.instructions.iter().enumerate() {
         walk.instruction(ix, n)?;
@@ -1024,9 +1066,13 @@ pub fn check_message(
     // or to reduce a position.
     let priority_fee = walk.budget.price.is_some_and(|(_, price)| price > 0);
     let cancels_or_reduces = walk.cancel_all || walk.orders.iter().any(|o| o.reduce_only);
-    let reduces_risk = walk.reduces_risk
-        && walk.orders.iter().all(|o| o.reduce_only)
-        && (!priority_fee || cancels_or_reduces);
+    let reduces_risk = if rescue.is_some() {
+        walk.rescue_pause_ok && !priority_fee
+    } else {
+        walk.reduces_risk
+            && walk.orders.iter().all(|o| o.reduce_only)
+            && (!priority_fee || cancels_or_reduces)
+    };
     Ok(CheckedMessage {
         kind,
         orders: walk.orders,

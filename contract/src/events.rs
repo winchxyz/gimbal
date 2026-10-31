@@ -14,6 +14,7 @@ pub const DESK_CREATED: &str = "desk_created";
 pub const POLICY_SET: &str = "policy_set";
 pub const OPERATOR_SET: &str = "operator_set";
 pub const ORDERLY_RECEIVER_SET: &str = "orderly_receiver_set";
+pub const ORDERLY_IPS_SET: &str = "orderly_ips_set";
 pub const PAUSED: &str = "paused";
 pub const PRICES: &str = "prices";
 /// Emitted in `on_signed`, only when the MPC returned a signature.
@@ -112,6 +113,30 @@ impl Event for Paused<'_> {
     const NAME: &'static str = PAUSED;
 }
 
+/// The owner pinned the desk's Orderly receiver on Arbitrum (once).
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct OrderlyReceiverSet<'a> {
+    pub desk_id: &'a str,
+    pub receiver: &'a str,
+}
+
+impl Event for OrderlyReceiverSet<'_> {
+    const NAME: &'static str = ORDERLY_RECEIVER_SET;
+}
+
+/// The owner set the relayer IPs the desk's orderly key may be used from.
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct OrderlyIpsSet<'a> {
+    pub desk_id: &'a str,
+    pub ips: &'a [String],
+}
+
+impl Event for OrderlyIpsSet<'_> {
+    const NAME: &'static str = ORDERLY_IPS_SET;
+}
+
 /// One item of `signed`: the action the MPC signed, one item per order it places (asset, side,
 /// size, px, oracle_px, unpriced), or one without them for any other action.
 #[derive(Serialize)]
@@ -125,6 +150,9 @@ pub struct Signed<'a> {
     pub order: Option<&'a OrderDetail>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub amount: Option<&'a str>,
+    /// The verified 1Click deposit address a rescue transfer pays.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deposit_address: Option<&'a str>,
     pub reason_sha256: Option<&'a str>,
 }
 
@@ -138,6 +166,7 @@ pub fn emit_signed(pending: &Pending) {
         kind: &a.kind,
         order,
         amount: a.amount.as_deref(),
+        deposit_address: a.deposit_address.as_deref(),
         reason_sha256: a.reason_sha256.as_deref(),
     };
     let items: Vec<Signed> = if a.orders.is_empty() {

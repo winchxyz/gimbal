@@ -18,23 +18,28 @@ pub const VENUE_HYPERLIQUID: &str = "hyperliquid";
 /// Every Solana message the desk signs: Phoenix, and the Ember and token steps around it.
 pub const VENUE_PHOENIX: &str = "phoenix";
 pub const VENUE_ORDERLY: &str = "orderly";
+/// The desk's own address on Arbitrum: EIP-3009 authorizations the relayer submits.
+pub const VENUE_ARBITRUM: &str = "arbitrum";
 
 #[near(serializers = [json])]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnsignedAction {
     pub desk_id: String,
-    /// `hyperliquid`, `phoenix` or `orderly`.
+    /// `hyperliquid`, `phoenix`, `orderly` or `arbitrum`.
     pub venue: String,
-    /// The action's type: `order`, `setReferrer`, `approveBuilderFee`, `usdClassTransfer`,
-    /// `withdraw3`, … for Hyperliquid; `order`, `cancel_all`, `deposit`, `withdraw`, `transaction`,
-    /// `register`, `referral_activate` for Solana; the request kind, `ws_auth` or the EIP-712
-    /// primary type for Orderly.
+    /// The action's type: `order`, `cancel`, `setReferrer`, `approveBuilderFee`,
+    /// `usdClassTransfer`, `withdraw3`, `sendAsset` for Hyperliquid; `order`, `cancel_all`,
+    /// `deposit`, `withdraw`, `transaction`, `rescue`, `register`, `referral_activate` for Solana;
+    /// the request kind, `ws_auth` or the EIP-712 primary type for Orderly;
+    /// `transfer_with_authorization` on Arbitrum.
     pub kind: String,
     /// For Hyperliquid, the `/exchange` body without `signature`: `{action, nonce, vaultAddress:
-    /// null}` for an L1 action, `{action, nonce}` for a user-signed one. Keys in the order signed.
-    /// For Solana, `{message_b64}`: the message exactly as signed. For an Orderly REST call
-    /// `{method, path, body, timestamp, message}`, for an Orderly EIP-712 message `{message,
-    /// userAddress}`.
+    /// null}` for an L1 action (plus `expiresAfter` for an order or cancel), `{action, nonce}` for
+    /// a user-signed one. Keys in the order signed. For Solana, `{message_b64}`: the message
+    /// exactly as signed. For an Orderly REST call `{method, path, body, timestamp, message}`, for
+    /// an Orderly EIP-712 message `{message, userAddress}`. On Arbitrum `{from, to, value,
+    /// validAfter, validBefore, nonce, token, chainId}`: the EIP-3009 message, then the USDC
+    /// contract and its chain.
     pub payload: Value,
     /// What the desk's key must sign.
     pub sign_request: SignRequest,
@@ -46,6 +51,9 @@ pub struct UnsignedAction {
     /// The USDC it moves out of or between venue balances, canonical decimal, for the `signed`
     /// event: transfers and withdrawals.
     pub amount: Option<String>,
+    /// The verified 1Click deposit address a rescue transfer pays, for the `signed` event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deposit_address: Option<String>,
 }
 
 /// One order of an action, as the `signed` event shows it.
@@ -95,6 +103,7 @@ impl UnsignedAction {
             reason_sha256: reason_sha256(reason),
             orders: Vec::new(),
             amount: None,
+            deposit_address: None,
         }
     }
 
@@ -115,6 +124,7 @@ impl UnsignedAction {
             reason_sha256: reason_sha256(reason),
             orders: Vec::new(),
             amount: None,
+            deposit_address: None,
         }
     }
 
@@ -136,6 +146,7 @@ impl UnsignedAction {
             reason_sha256: reason_sha256(reason),
             orders: Vec::new(),
             amount: None,
+            deposit_address: None,
         }
     }
 
@@ -150,7 +161,34 @@ impl UnsignedAction {
             reason_sha256: None,
             orders: Vec::new(),
             amount: None,
+            deposit_address: None,
         }
+    }
+
+    /// An EIP-3009 authorization on Arbitrum for the desk's EVM key: it signs `digest`.
+    pub fn arbitrum(
+        desk_id: String,
+        kind: &str,
+        payload: Value,
+        digest: &[u8; 32],
+        reason: &str,
+    ) -> Self {
+        Self {
+            sign_request: SignRequest::evm(&desk_id, digest),
+            desk_id,
+            venue: VENUE_ARBITRUM.into(),
+            kind: kind.into(),
+            payload,
+            reason_sha256: reason_sha256(Some(reason)),
+            orders: Vec::new(),
+            amount: None,
+            deposit_address: None,
+        }
+    }
+
+    pub fn with_deposit_address(mut self, deposit_address: String) -> Self {
+        self.deposit_address = Some(deposit_address);
+        self
     }
 
     pub fn with_orders(mut self, orders: Vec<OrderDetail>) -> Self {

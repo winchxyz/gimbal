@@ -8,9 +8,9 @@
 use gimbal_core::eip712;
 use gimbal_core::hl::{
     agent_struct_hash, cancel_action, check_order, check_px, check_sz, connection_id,
-    exchange_domain_separator, max_fee_rate, order_action, prepare_l1, referral_code,
-    set_referrer_action, sign_transaction_domain_separator, usdc_token, Address, Cloid, HlOrder,
-    OrderWire, UserAction, AGENT_TYPE,
+    exchange_domain_separator, expiring_connection_id, max_fee_rate, order_action, prepare_l1,
+    referral_code, set_referrer_action, sign_transaction_domain_separator, usdc_token, Address,
+    Cloid, HlOrder, OrderWire, UserAction, AGENT_TYPE, EXPIRES_AFTER_MS,
 };
 use gimbal_core::limits::fresh_price;
 use gimbal_core::msgpack::Value as Mp;
@@ -106,6 +106,86 @@ fn the_l1_domain_and_agent_type_match() {
     }
 }
 
+/// `expiresAfter` enters the L1 hash as `0x00` ‖ u64 big-endian after the vault byte, as
+/// hyperliquid-python-sdk's `action_hash` writes it. The hashes below are the SDK's own output
+/// (hyperliquid-python-sdk 0.24.0 with eth-account 0.13.7 and msgpack 1.2.4, 2026-10-31): the two
+/// vector actions built with its `order_request_to_order_wire` / `order_wires_to_order_action`
+/// (the cancel as `Exchange.bulk_cancel` writes it), their msgpack checked against the vectors',
+/// `action_hash(action, None, nonce, nonce + 60 s)` for the connection id, and the EIP-191 hash of
+/// `encode_typed_data(l1_payload(construct_phantom_agent(...)))` for each network, which a
+/// `sign_l1_action` signature with the same `expires_after` recovers from.
+#[test]
+fn expires_after_enters_the_l1_hash_as_the_sdk_writes_it() {
+    let doc = doc();
+    let pinned = [
+        (
+            "cancel ETH oid 77 (fixint)",
+            "0x615afe3d2a7e6a208a317396befbba2f096d833fba7c40380a32ddf9f661fb39",
+            "0xf26ff7219889a502216f9a7022903ef0b5130f5330835427e798c503a5c9af98",
+            "0xd81f2e4e8f110e874e28493580e46b830d9dbdf808a221813aa3af4dd5476130",
+        ),
+        (
+            "ETH buy IOC, no cloid, fee 1 bp",
+            "0x59db084d38b6d2e4d892ac3fc60b8e947f35b6c6c49ac523c579274a3228f7fb",
+            "0x883ce8d2d8cc74e61980d19f3ac4c3c3f05aaf79e85a6ff2731a0000205bbc1d",
+            "0x6b4e114abfc4a56ec39875d230c9afa55aca3ef82374fe75b6849cb117302d86",
+        ),
+    ];
+    for (name, connection, mainnet, testnet) in pinned {
+        let case = doc["l1"]["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap();
+        let p = &case["params"];
+        let action = if case["kind"] == "cancel" {
+            cancel_action(u32::try_from(u(&p["asset"])).unwrap(), u(&p["oid"]))
+        } else {
+            let order: HlOrder = serde_json::from_value(json!({
+                "asset": p["asset"], "is_buy": p["is_buy"], "px": p["px"], "sz": p["sz"],
+                "reduce_only": p["reduce_only"], "tif": p["tif"], "cloid": p["cloid"],
+            }))
+            .unwrap();
+            let builder = Address::parse("builder", s(&p["builder"])).unwrap();
+            order_action(&OrderWire::from_order(&order).unwrap(), &builder, 10)
+        };
+        let nonce = u(&case["nonce"]);
+        let expires = nonce + EXPIRES_AFTER_MS;
+        // Without the expiry it is the vector's own connection id.
+        assert_eq!(
+            hex0x(&expiring_connection_id(keccak, &action, nonce, None)),
+            s(&case["connection_id"]),
+            "{name}"
+        );
+        assert_eq!(
+            hex0x(&expiring_connection_id(
+                keccak,
+                &action,
+                nonce,
+                Some(expires)
+            )),
+            connection,
+            "{name}"
+        );
+        for (network, digest) in [(Network::Mainnet, mainnet), (Network::Testnet, testnet)] {
+            let prepared = prepare_l1(keccak, network, "x", action.clone(), nonce, Some(expires));
+            assert_eq!(hex0x(&prepared.digest), digest, "{name} {network:?}");
+            // The body carries the same expiry after vaultAddress, as the SDK posts it.
+            let Mp::Map(entries) = &prepared.payload else {
+                panic!("the payload is a map")
+            };
+            assert_eq!(
+                entries.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+                ["action", "nonce", "vaultAddress", "expiresAfter"]
+            );
+            let body = json_of(&prepared.payload);
+            assert_eq!(body["expiresAfter"], json!(expires));
+            assert_eq!(body["vaultAddress"], Value::Null);
+        }
+    }
+}
+
 #[test]
 fn every_l1_vector_matches() {
     let doc = doc();
@@ -169,7 +249,7 @@ fn every_l1_vector_matches() {
                 hex0x(&agent_struct_hash(keccak, network, &connection)),
                 s(&want["struct_hash"]).to_owned(),
             );
-            let prepared = prepare_l1(keccak, network, "x", action.clone(), nonce);
+            let prepared = prepare_l1(keccak, network, "x", action.clone(), nonce, None);
             f.eq(
                 name,
                 &what("digest"),

@@ -345,6 +345,92 @@ fn kinds_and_the_pause_gate() {
     assert_eq!(o.valued.oracle_e8, Some(245_000_000_000));
 }
 
+/// `d` without the instructions `drop` picks, given each one's program, accounts and data.
+fn without(d: &Draft, drop: impl Fn(Pubkey, &[Pubkey], &[u8]) -> bool) -> Draft {
+    let mut out = d.clone();
+    let keys = out.keys.clone();
+    out.ixs.retain(|(program, accounts, data)| {
+        let accounts: Vec<Pubkey> = accounts.iter().map(|i| keys[usize::from(*i)]).collect();
+        !drop(keys[usize::from(*program)], &accounts, data)
+    });
+    out
+}
+
+/// The rescue's own pause rule (review round 2, item 6). The one-transaction rescue, with the
+/// Revoke its unwrap needs, passes a paused desk once it leaves out the priority fee and the
+/// creates of the desk's own token accounts: a Phoenix withdrawal and an Ember unwrap (with its
+/// Approve and Revoke) of the quote's amountIn, the deposit owner's account and the transfer.
+/// Each thing a paused rescue may not carry, put back or made larger, needs a running desk.
+#[test]
+fn a_paused_desk_signs_a_rescue_that_only_frees_and_pays_amount_in() {
+    let doc = sol_doc();
+    let ctx = &doc["ctx"]["sol_sign"];
+    let (policy, desk, reference) = (vector_policy(ctx), vector_desk(&doc), reference_of(ctx));
+    let case = doc["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| name(c).starts_with("rescue in one transaction"))
+        .unwrap();
+    let rescue = rescue_of(case).unwrap();
+    let check = |d: &Draft| {
+        check_message(
+            sha256,
+            &policy,
+            &desk,
+            &d.bytes(),
+            &reference,
+            Some(&rescue),
+        )
+        .unwrap()
+    };
+    let mut full = Draft::of(&message(case));
+    full.push_revoke(desk.phusd_ata, desk.authority);
+    let unit_price = |p: Pubkey, _: &[Pubkey], data: &[u8]| {
+        p == COMPUTE_BUDGET_PROGRAM && data.first() == Some(&3)
+    };
+    let desk_create =
+        |p: Pubkey, a: &[Pubkey], _: &[u8]| p == ATA_PROGRAM && a[2] == desk.authority;
+    let lean = without(&full, |p, a, d| unit_price(p, a, d) || desk_create(p, a, d));
+    assert_eq!(lean.ixs.len(), full.ixs.len() - 3);
+    let c = check(&lean);
+    assert_eq!((c.kind, c.reduces_risk), ("rescue", true));
+
+    let mut needs_running: Vec<(&str, Draft)> = vec![
+        ("as the SDK builds it", full.clone()),
+        ("with the priority fee", without(&full, desk_create)),
+        (
+            "with a create of a desk account",
+            without(&full, unit_price),
+        ),
+    ];
+    let amount = rescue.amount_in;
+    let mut over = lean.clone();
+    let w = over.find(PHOENIX_PROGRAM, &WITHDRAW_FUNDS);
+    over.ixs[w].2[8..16].copy_from_slice(&(amount + 1).to_le_bytes());
+    needs_running.push(("a withdrawal of amountIn + 1", over));
+    let mut twice = lean.clone();
+    let w = twice.find(PHOENIX_PROGRAM, &WITHDRAW_FUNDS);
+    let again = twice.ixs[w].clone();
+    twice.ixs.insert(w, again);
+    needs_running.push(("two withdrawals of amountIn", twice));
+    let mut unwrap_more = lean.clone();
+    let u = unwrap_more.find(EMBER_PROGRAM, &EMBER_WITHDRAW);
+    unwrap_more.ixs[u].2[9..17].copy_from_slice(&(amount + 1).to_le_bytes());
+    let a = unwrap_more.find(TOKEN_PROGRAM, &[4]);
+    unwrap_more.ixs[a].2[1..9].copy_from_slice(&(amount + 1).to_le_bytes());
+    needs_running.push(("an unwrap of amountIn + 1", unwrap_more));
+    let mut whole = without(&lean, |p, _, d| p == TOKEN_PROGRAM && d.first() == Some(&4));
+    let u = whole.find(EMBER_PROGRAM, &EMBER_WITHDRAW);
+    whole.ixs[u].2.truncate(8);
+    whole.ixs[u].2.push(0);
+    needs_running.push(("an unwrap of the whole balance", whole));
+    for (what, d) in &needs_running {
+        let c = check(d);
+        assert_eq!((c.kind, c.reduces_risk), ("rescue", false), "{what}");
+    }
+}
+
 /// The vector order message `prefix` with its order flags byte set to `flags`. The order is the
 /// last instruction and its packet ends with orderFlags u8, cancelExisting bool.
 fn with_flags(doc: &Value, prefix: &str, flags: u8) -> Vec<u8> {

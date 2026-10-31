@@ -481,7 +481,7 @@ pub struct OrderlyRequest {
 }
 
 /// The request kinds and the fields each takes besides `kind` and `timestamp_ms`.
-const KINDS: [(&str, &[&str]); 12] = [
+const KINDS: [(&str, &[&str]); 13] = [
     (
         "order",
         &[
@@ -510,6 +510,7 @@ const KINDS: [(&str, &[&str]); 12] = [
     ),
     ("positions", &[]),
     ("holding", &[]),
+    ("ip_restriction", &[]),
 ];
 
 impl OrderlyRequest {
@@ -609,6 +610,10 @@ pub struct Context<'a> {
     pub request_id: u64,
     /// The oracle price of a base symbol (`ETH` for `PERP_ETH_USDC`) if it is fresh.
     pub reference: &'a dyn Fn(&str) -> Option<u128>,
+    /// The desk's orderly key, `ed25519:<base58>` ([`orderly_key`] of its Solana authority).
+    pub orderly_key: &'a str,
+    /// The relayer IPs the owner set with `set_orderly_ips`, if any: what `ip_restriction` applies.
+    pub orderly_ips: Option<&'a [String]>,
 }
 
 /// The base asset of `PERP_<BASE>_USDC`: the symbol prices and `policy.unpriced` use (`ETH`).
@@ -753,7 +758,12 @@ pub fn signed_message_body(
 ///   the EIP-712 message rebuilt from the typed fields (receiver the desk, token USDC) and the
 ///   signature passed (`E_ARGS` if malformed; the caller checks it recovers to the desk);
 /// - `referral_bind`: `POST /v1/referral/bind {"referral_code"}` with the configured code only
-///   (`E_ARGS` when none is configured).
+///   (`E_ARGS` when none is configured);
+/// - `ip_restriction`: `POST /v1/client/set_orderly_key_ip_restriction {"orderly_key",
+///   "ip_restriction_list"}` with the desk's orderly key and the owner's IP list joined by commas
+///   (`E_ARGS` when the owner set none). It only narrows where the key works, so it passes a
+///   paused desk. This is the mainnet answer to the order replay ([`order`]): a copy posted from
+///   any other address is refused.
 pub fn build_request(ctx: &Context, req: &OrderlyRequest) -> Result<Signable, Refusal> {
     check_timestamp("timestamp_ms", req.timestamp_ms, ctx.block_ms)?;
     if req.client_order_id.is_some() {
@@ -892,10 +902,69 @@ pub fn build_request(ctx: &Context, req: &OrderlyRequest) -> Result<Signable, Re
                 ..read("/v1/referral/bind".into())
             }
         }
+        "ip_restriction" => {
+            let ips = ctx.orderly_ips.ok_or_else(|| {
+                Refusal::new(
+                    E_ARGS,
+                    "the owner set no IP list for the orderly key (set_orderly_ips); setup skips \
+                     ip_restriction",
+                )
+            })?;
+            check_ip_list(ips)?;
+            Signable {
+                method: "POST",
+                body: format!(
+                    "{{\"orderly_key\":{},\"ip_restriction_list\":{}}}",
+                    json_string(ctx.orderly_key),
+                    json_string(&ips.join(","))
+                ),
+                ..read(IP_RESTRICTION_PATH.into())
+            }
+        }
         // KINDS lists exactly the kinds matched above.
         _ => return Err(Refusal::new(E_ARGS, format!("kind {kind} is not built"))),
     };
     Ok(signed)
+}
+
+/// Where `ip_restriction` posts.
+pub const IP_RESTRICTION_PATH: &str = "/v1/client/set_orderly_key_ip_restriction";
+
+/// The most addresses `set_orderly_ips` takes.
+pub const MAX_ORDERLY_IPS: usize = 10;
+
+/// An IP list for the orderly key: 1 to [`MAX_ORDERLY_IPS`] distinct addresses, each IPv4 in
+/// dotted decimal without leading zeros or IPv6 in RFC 5952 form (lowercase, zeros compressed
+/// once at the longest run), exactly as Rust's own formatting writes it (`E_ARGS`). No ranges:
+/// the key is meant for the relayer's few addresses.
+pub fn check_ip_list(ips: &[String]) -> Result<(), Refusal> {
+    if ips.is_empty() || ips.len() > MAX_ORDERLY_IPS {
+        return Err(Refusal::new(
+            E_ARGS,
+            format!("{} IP addresses; give 1 to {MAX_ORDERLY_IPS}", ips.len()),
+        ));
+    }
+    for (i, ip) in ips.iter().enumerate() {
+        let canonical = ip
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|parsed| parsed.to_string() == *ip);
+        if !canonical {
+            return Err(Refusal::new(
+                E_ARGS,
+                format!(
+                    "ips[{i}] {} is not an IPv4 or IPv6 address in canonical form",
+                    shown(ip)
+                ),
+            ));
+        }
+        if ips[..i].contains(ip) {
+            return Err(Refusal::new(
+                E_ARGS,
+                format!("ips[{i}] {ip} is listed twice"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The `order` kind of [`build_request`].
@@ -913,8 +982,9 @@ pub fn build_request(ctx: &Context, req: &OrderlyRequest) -> Result<Signable, Re
 /// Decided (PR 30 round 2): an accepted, documented residual risk for now. The window is
 /// Orderly's timestamp window, each copy is capped by the policy's size, and every copy shows
 /// in the desk's own account: the engine reconciles positions after each order and closes any
-/// excess reduce-only. For mainnet, C6 adds a request kind for Orderly's key IP restriction
-/// (`POST /v1/client/set_orderly_key_ip_restriction`), so only the relayer can use the desk key.
+/// excess reduce-only. For mainnet the request kind `ip_restriction` sets Orderly's key IP
+/// restriction (`POST /v1/client/set_orderly_key_ip_restriction`) to the owner's list
+/// (`set_orderly_ips`), so only the relayer can use the desk key.
 fn order(ctx: &Context, req: &OrderlyRequest) -> Result<Signable, Refusal> {
     let need = |field: &str, v: &Option<String>| {
         v.clone()

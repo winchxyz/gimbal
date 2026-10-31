@@ -30,6 +30,9 @@ pub struct Desk {
     pub orderly_account_id: String,
     /// The Orderly account's exclusive receiver address on Arbitrum, pinned once by the owner.
     pub orderly_receiver: Option<String>,
+    /// The relayer IPs the owner allows the desk's orderly key from (`set_orderly_ips`), which
+    /// `orderly_request` kind `ip_restriction` applies at Orderly; empty until set.
+    pub orderly_ips: Vec<String>,
     pub ledger: Ledger,
 }
 
@@ -110,6 +113,7 @@ impl Desk {
             evm_address,
             solana,
             orderly_receiver: None,
+            orderly_ips: Vec::new(),
             ledger: Ledger::default(),
         }
     }

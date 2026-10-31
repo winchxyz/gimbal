@@ -9,7 +9,7 @@
 
 use gimbal_core::hl::{
     cancel_action, check_order, check_usdc_amount, max_fee_rate, order_action, prepare_l1,
-    referral_code, set_referrer_action, Address, HlOrder, UserAction,
+    referral_code, set_referrer_action, Address, HlOrder, UserAction, EXPIRES_AFTER_MS,
 };
 use gimbal_core::ids::check_reason;
 use gimbal_core::limits::Valued;
@@ -34,8 +34,8 @@ impl Gimbal {
     /// a bad tif or cloid (`E_ARGS`), px or sz strings that are not canonical or break
     /// Hyperliquid's rules (`E_DECIMAL`), a zero size (`E_SIZE`), and then, for a symbol in
     /// `policy.unpriced`, a size over its `max_sz` or a notional px × sz over the unpriced cap
-    /// (`E_SIZE`); for any other symbol no fresh oracle price (`E_ORACLE_STALE`, every priced
-    /// order until prices are stored, C6), a price outside the band (`E_PRICE_BAND`) or a notional
+    /// (`E_SIZE`); for any other symbol no stored oracle price at most `oracle_max_age_s` old
+    /// (`E_ORACLE_STALE`), a price outside the band (`E_PRICE_BAND`) or a notional
     /// sz × max(px, oracle) over `max_notional_usd` (`E_SIZE`).
     #[deny_unknown_arguments]
     pub fn hl_order(&mut self, desk_id: String, order: HlOrder, reason: String) -> Promise {
@@ -107,12 +107,20 @@ impl Gimbal {
     ) -> UnsignedAction {
         let (desk, _) = action_desk(&self.desks, &desk_id, Gate::order(order.reduce_only));
         check_reason(&reason).or_fail();
+        let block_ms = env::block_timestamp_ms();
         let reference = desk
             .policy
             .hl_assets
             .iter()
             .find(|a| a.index == order.asset)
-            .and_then(|a| reference_price(&a.symbol, desk.policy.oracle_max_age_s));
+            .and_then(|a| {
+                reference_price(
+                    &self.prices,
+                    &a.symbol,
+                    desk.policy.oracle_max_age_s,
+                    block_ms,
+                )
+            });
         let checked = check_order(&desk.policy, &order, reference).or_fail();
         let detail = OrderDetail::new(
             &checked.symbol,
@@ -129,8 +137,15 @@ impl Gimbal {
             &builder,
             self.config.fees.hl_builder_tenth_bps,
         );
-        let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
-        let prepared = prepare_l1(keccak, self.config.network, "order", action, nonce);
+        let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, block_ms);
+        let prepared = prepare_l1(
+            keccak,
+            self.config.network,
+            "order",
+            action,
+            nonce,
+            Some(block_ms + EXPIRES_AFTER_MS),
+        );
         UnsignedAction::hyperliquid(desk_id, prepared, Some(&reason)).with_orders(vec![detail])
     }
 
@@ -144,9 +159,17 @@ impl Gimbal {
     ) -> UnsignedAction {
         action_desk(&self.desks, &desk_id, Gate::ReducesRisk);
         check_reason(&reason).or_fail();
-        let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
+        let block_ms = env::block_timestamp_ms();
+        let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, block_ms);
         let action = cancel_action(asset, oid);
-        let prepared = prepare_l1(keccak, self.config.network, "cancel", action, nonce);
+        let prepared = prepare_l1(
+            keccak,
+            self.config.network,
+            "cancel",
+            action,
+            nonce,
+            Some(block_ms + EXPIRES_AFTER_MS),
+        );
         UnsignedAction::hyperliquid(desk_id, prepared, Some(&reason))
     }
 
@@ -157,7 +180,16 @@ impl Gimbal {
             referral_code(self.config.treasury.referral_codes.hyperliquid.as_deref()).or_fail();
         let action = set_referrer_action(code);
         let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
-        let prepared = prepare_l1(keccak, self.config.network, "setReferrer", action, nonce);
+        // Hyperliquid does not list expiresAfter for setReferrer; a late copy only sets the same
+        // configured code, which Hyperliquid refuses a second time.
+        let prepared = prepare_l1(
+            keccak,
+            self.config.network,
+            "setReferrer",
+            action,
+            nonce,
+            None,
+        );
         UnsignedAction::hyperliquid(desk_id, prepared, None)
     }
 

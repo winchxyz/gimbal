@@ -2,13 +2,20 @@
 //! order passes first (docs/interfaces.md §1.3; CLAUDE.md, "Venue facts that bite").
 //!
 //! - **L1 actions** (`order`, `cancel`, `setReferrer`): connection id = keccak256(msgpack(action) ‖
-//!   nonce as u64 big-endian ‖ `0x00`, no vault); the key signs the EIP-712 `Agent(string
-//!   source,bytes32 connectionId)` in domain `Exchange` / `1` / chainId 1337 / zero address, source
-//!   `a` on mainnet and `b` on testnet.
+//!   nonce as u64 big-endian ‖ `0x00`, no vault ‖ with `expiresAfter` also `0x00` ‖ expiresAfter as
+//!   u64 big-endian); the key signs the EIP-712 `Agent(string source,bytes32 connectionId)` in
+//!   domain `Exchange` / `1` / chainId 1337 / zero address, source `a` on mainnet and `b` on
+//!   testnet. Orders and cancels carry `expiresAfter` = block time + [`EXPIRES_AFTER_MS`], in the
+//!   hash and in the posted body, so a signature the MPC returns late dies on its own; Hyperliquid
+//!   lists the field for order, cancel, cancelByCloid, modify and a few more, not for setReferrer.
 //! - **User-signed actions** (`usdClassTransfer`, `sendAsset`, `withdraw3`, `approveBuilderFee`):
 //!   EIP-712 `HyperliquidTransaction:<Name>(…)` in domain `HyperliquidSignTransaction` / `1` /
 //!   chainId 0x66eee / zero address; the posted action carries the same fields plus `type`,
-//!   `signatureChainId` and `hyperliquidChain`.
+//!   `signatureChainId` and `hyperliquidChain`. Hyperliquid refuses `expiresAfter` on them; what
+//!   bounds their life is the nonce rule: a nonce must be inside (block time − 2 days, block time +
+//!   1 day) and above the smallest of the signer's 100 highest nonces used, so a late signature
+//!   dies 2 days after its nonce (the block time it was built at), or once the desk has signed 100
+//!   later actions.
 //!
 //! All hex is lowercase: Hyperliquid lowercases before it verifies. Every vector in
 //! `tests/vectors/hl.json` (from the venue's own SDKs) is checked in `tests/hl_vectors.rs`.
@@ -34,6 +41,9 @@ pub const PX_MAX_DECIMALS: u8 = 6;
 pub const USDC_DECIMALS: usize = 6;
 /// Referral codes are 1 to 20 characters.
 pub const REFERRAL_CODE_MAX_CHARS: usize = 20;
+/// How long after the block time an order or cancel the contract builds stays valid (ms): its
+/// `expiresAfter`.
+pub const EXPIRES_AFTER_MS: u64 = 60_000;
 
 /// The USDC spot token `sendAsset` moves, per network.
 pub const fn usdc_token(network: Network) -> &'static str {
@@ -211,8 +221,7 @@ pub struct CheckedOrder {
 /// price, any other symbol a reference price (`E_ORACLE_STALE`), the band around it
 /// (`E_PRICE_BAND`) and `sz × max(px, reference)` within `max_notional_usd` (`E_SIZE`).
 ///
-/// `reference_e8` is the symbol's oracle price if it is fresh, else `None` (the contract passes
-/// `None` until it stores prices, C6).
+/// `reference_e8` is the symbol's stored oracle price if it is fresh, else `None`.
 pub fn check_order(
     policy: &Policy,
     order: &HlOrder,
@@ -411,11 +420,27 @@ pub fn check_referral_code(code: &str) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// keccak256(msgpack(action) ‖ nonce as u64 big-endian ‖ `0x00`): no vault address.
+/// keccak256(msgpack(action) ‖ nonce as u64 big-endian ‖ `0x00`): no vault address, no expiry.
 pub fn connection_id(keccak: Keccak, action: &Value, nonce: u64) -> [u8; 32] {
+    expiring_connection_id(keccak, action, nonce, None)
+}
+
+/// [`connection_id`], and with `expires_after` (ms) also `0x00` ‖ expires_after as u64 big-endian
+/// after the vault byte, as Hyperliquid's own SDK hashes it (`action_hash` of
+/// hyperliquid-python-sdk 0.x, `signing.py`).
+pub fn expiring_connection_id(
+    keccak: Keccak,
+    action: &Value,
+    nonce: u64,
+    expires_after: Option<u64>,
+) -> [u8; 32] {
     let mut bytes = action.to_msgpack();
     bytes.extend_from_slice(&nonce.to_be_bytes());
     bytes.push(0x00);
+    if let Some(expires_after) = expires_after {
+        bytes.push(0x00);
+        bytes.extend_from_slice(&expires_after.to_be_bytes());
+    }
     keccak(&bytes)
 }
 
@@ -436,27 +461,33 @@ pub fn agent_struct_hash(keccak: Keccak, network: Network, connection_id: &[u8; 
     )
 }
 
-/// An L1 action ready to sign at `nonce`.
+/// An L1 action ready to sign at `nonce`; with `expires_after` (ms) Hyperliquid refuses it after
+/// that time. The payload is `{action, nonce, vaultAddress: null}`, plus `expiresAfter` when set.
 pub fn prepare_l1(
     keccak: Keccak,
     network: Network,
     kind: &'static str,
     action: Value,
     nonce: u64,
+    expires_after: Option<u64>,
 ) -> Prepared {
-    let connection = connection_id(keccak, &action, nonce);
+    let connection = expiring_connection_id(keccak, &action, nonce, expires_after);
     let digest = eip712::digest(
         keccak,
         &exchange_domain_separator(keccak),
         &agent_struct_hash(keccak, network, &connection),
     );
+    let mut payload = vec![
+        ("action", action),
+        ("nonce", Value::UInt(nonce)),
+        ("vaultAddress", Value::Nil),
+    ];
+    if let Some(expires_after) = expires_after {
+        payload.push(("expiresAfter", Value::UInt(expires_after)));
+    }
     Prepared {
         kind,
-        payload: Value::map([
-            ("action", action),
-            ("nonce", Value::UInt(nonce)),
-            ("vaultAddress", Value::Nil),
-        ]),
+        payload: Value::map(payload),
         digest,
     }
 }
