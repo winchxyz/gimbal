@@ -1,11 +1,13 @@
 // The relayer end to end over the replay contract and stubbed venues: one call signs and delivers, the Orderly
-// headers match orderly.json, a Solana message is built again after an MPC timeout once its blockhash is proven
-// expired, and an unknown outcome carries the ids the relayer added (the order's cloid).
+// headers match orderly.json, an Orderly order whose answer is lost is OutcomeUnknown with its client_order_id, a
+// Solana message is built again after an MPC timeout once its blockhash is proven expired, and an unknown outcome
+// carries the ids the relayer added (the order's cloid, the Solana message).
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ContractClient } from '../contract/types.ts';
-import { MpcTimeoutError, OutcomeUnknown } from '../contract/types.ts';
+import { MpcTimeoutError, OutcomeUnknown, solMessageDigest } from '../contract/types.ts';
+import { OrderlyApiError } from '../venues/orderly-http.ts';
 import { HyperliquidSubmitter } from './hyperliquid.ts';
 import { Relayer } from './relayer.ts';
 import { SolanaSubmitter } from './solana.ts';
@@ -52,6 +54,46 @@ test('orderlyRequest: the four orderly-* headers of orderly.json, then Orderly d
   assert.equal(call.method, 'POST');
   assert.equal(call.body, r.body);
   for (const h of ['orderly-timestamp', 'orderly-account-id', 'orderly-key', 'orderly-signature']) assert.equal(call.headers[h], r.headers[h], h);
+});
+
+test('orderlyRequest order: no answer, a 5xx or a body that is not JSON is OutcomeUnknown with the client_order_id; a refusal stays OrderlyApiError', async () => {
+  const v = vectors('orderly');
+  const r = v.requests[0];
+  const { kind, client_order_id: derived, ...fields } = r.request;
+  const answers: [string, () => Response | never][] = [
+    ['timeout', () => { throw new DOMException('The operation was aborted due to timeout', 'TimeoutError'); }],
+    ['dropped', () => { throw new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } }); }],
+    ['502', () => new Response('<html>Bad Gateway</html>', { status: 502 })],
+    ['500 json', () => new Response(JSON.stringify({ success: false, code: -1000, message: 'internal' }), { status: 500 })],
+    ['200 not json', () => new Response('ok', { status: 200 })],
+  ];
+  const relayerWith = (answer: () => Response) => {
+    const contract = testContract(() => r.timestamp, { orderlyBrokerId: v.networks.testnet.brokerId, orderlyChainId: v.networks.testnet.chainId });
+    contract.setDesk('alpha', testDesk({ evm_address: v.keys.deskEvm.address }));
+    const f = (async () => answer()) as unknown as typeof fetch;
+    return new Relayer({
+      contract, deskId: 'alpha',
+      orderly: { apiUrl: v.networks.testnet.api, accountId: r.headers['orderly-account-id'], orderlyKey: r.headers['orderly-key'], fetch: f, now: () => r.timestamp },
+    });
+  };
+  for (const [name, answer] of answers) {
+    await assert.rejects(relayerWith(answer).orderlyRequest(kind, fields, 'hedge'), (err: unknown) => {
+      assert.ok(err instanceof OutcomeUnknown, `${name}: ${String(err)}`);
+      assert.equal(err.what, 'orderly order');
+      assert.equal(err.ids.orderlyClientOrderId, derived, name);
+      assert.match(err.message, /may have taken the request/);
+      return true;
+    });
+  }
+  // Orderly's own refusal, under a 4xx or a 200: nothing was taken, OrderlyApiError as before.
+  for (const status of [400, 200]) {
+    const refused = () => new Response(JSON.stringify({ success: false, code: -1102, message: 'quantity too small' }), { status });
+    await assert.rejects(relayerWith(refused).orderlyRequest(kind, fields, 'hedge'), (err: unknown) => {
+      assert.ok(err instanceof OrderlyApiError && !(err instanceof OutcomeUnknown), String(err));
+      assert.equal(err.code, -1102);
+      return true;
+    });
+  }
 });
 
 test('solSign: after an MPC timeout the message is built again with a fresh blockhash and signed once more', async () => {

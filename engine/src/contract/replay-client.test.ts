@@ -8,7 +8,7 @@ import { hlSignature, recoverSigner } from '../relayer/hl-wire.ts';
 import { TEST_DEPOSIT_EVM, TEST_EVM_ADDRESS, testContract, testDesk, vectors } from '../relayer/test-helpers.ts';
 import type { OrderlyRequest } from '../venues/orderly-signer.ts';
 import { ed25519SignatureBase64Url } from '../venues/orderly-signer.ts';
-import { ReplayContractClient, eip3009Nonce } from './replay-client.ts';
+import { ORDERLY_CLIENT_ORDER_ID_MAX, ReplayContractClient, eip3009Nonce, standInClientOrderId } from './replay-client.ts';
 import type { HlOrder } from './types.ts';
 import { ContractRefusal } from './types.ts';
 
@@ -134,4 +134,12 @@ test('orderly EIP-712 actions recover to the desk, and the refusals the contract
   assert.equal(reg.payload.userAddress, TEST_EVM_ADDRESS);
   assert.equal(reg.payload.message.brokerId, 'woofi_dex');
   assert.equal(reg.payload.message.chainId, v.networks.testnet.chainId);
+});
+
+test('the stand-in client_order_id keeps orderly.json\'s form and never passes Orderly\'s 36 characters', () => {
+  assert.equal(standInClientOrderId('alpha', 1), 'gimbal-alpha-1');
+  const long = standInClientOrderId('a-desk-id-far-longer-than-any-orderly-limit', 9_007_199_254_740_991);
+  assert.ok(long.length <= ORDERLY_CLIENT_ORDER_ID_MAX, long);
+  assert.ok(long.endsWith('-9007199254740991'), long);
+  assert.equal(standInClientOrderId('a-desk-id-far-longer-than-any-orderly-limit', 12).length, ORDERLY_CLIENT_ORDER_ID_MAX);
 });

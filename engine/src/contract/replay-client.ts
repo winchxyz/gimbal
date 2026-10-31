@@ -64,6 +64,19 @@ const ORDERLY_LEDGER: Record<ReplayNetwork, string> = {
   testnet: '0x1826B75e2ef249173FC735149AE4B8e9ea10abff',
 };
 const ORDERLY_OFF_CHAIN = '0xCcCCccccCCCCcCCCCCCcCcCccCcCCCcCcccccccC';
+/** Orderly's limit on a client_order_id. */
+export const ORDERLY_CLIENT_ORDER_ID_MAX = 36;
+
+/**
+ * The replay's stand-in for the contract's derived client_order_id, `gimbal-<desk>-<request_id>` as orderly.json
+ * writes it, with the desk part cut so the whole fits Orderly's 36 characters (the request id stays whole, and the
+ * Orderly account is the desk's, so it stays unique). C5 pins the real format.
+ */
+export function standInClientOrderId(deskId: string, requestId: number): string {
+  const n = String(requestId);
+  const room = Math.max(0, ORDERLY_CLIENT_ORDER_ID_MAX - 'gimbal--'.length - n.length);
+  return `gimbal-${deskId.slice(0, room)}-${n}`;
+}
 /** EIP-3009 authorizations are valid for at most this long (contract rule, eip3009.json). */
 const EIP3009_VALID_S = 1800;
 
@@ -427,7 +440,7 @@ export class ReplayContractClient implements ContractClient {
         const fields: string[] = [`"symbol":${JSON.stringify(s)}`];
         // The contract derives the id from its request_id; orderly.json still passes its own, which is kept until
         // the vectors pin the derivation.
-        const clientOrderId = req.client_order_id || `gimbal-${deskId}-${this.#requestId + 1}`;
+        const clientOrderId = req.client_order_id || standInClientOrderId(deskId, this.#requestId + 1);
         fields.push(`"client_order_id":${JSON.stringify(clientOrderId)}`);
         fields.push(`"order_type":${JSON.stringify(type)}`);
         if (type !== 'MARKET') fields.push(`"order_price":${decimalNumber('price', req.price)}`);

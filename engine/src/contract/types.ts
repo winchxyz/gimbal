@@ -2,6 +2,7 @@
 // return, and how a refusal reaches the engine. NearContractClient (the chain) and ReplayContractClient (the demo and
 // tests) both implement ContractClient, so the relayer cannot tell them apart.
 
+import { createHash } from 'node:crypto';
 import type { ContractPolicy, TxRef } from '@gimbal/shared';
 import type { OrderlySigner } from '../venues/orderly-signer.ts';
 
@@ -136,9 +137,23 @@ export interface OutcomeIds {
   hlNonce?: number;
   /** Solana: the transaction signature (getSignatureStatuses with history). */
   solSignature?: string;
+  /**
+   * Solana, when the signature itself is not known: sha256 (hex) of the message the contract was asked to sign
+   * (find it among the desk authority's transactions), and the height after which it can no longer land.
+   */
+  solMessage?: string;
+  solLastValidBlockHeight?: number;
   /** Arbitrum: the transaction hash, and the EIP-3009 nonce (USDC authorizationState). */
   arbitrumTx?: string;
   eip3009Nonce?: string;
+  /** Orderly: the order's contract-derived client_order_id (GET /v1/client/order/{id}), a withdrawal's nonce. */
+  orderlyClientOrderId?: string;
+  orderlyWithdrawNonce?: number;
+}
+
+/** OutcomeIds.solMessage of a base64 Solana message. */
+export function solMessageDigest(messageB64: string): string {
+  return createHash('sha256').update(Buffer.from(messageB64, 'base64')).digest('hex');
 }
 
 /**

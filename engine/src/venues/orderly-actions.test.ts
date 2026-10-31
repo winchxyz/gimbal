@@ -3,6 +3,8 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { OutcomeUnknown } from '../contract/types.ts';
+import { OrderlyApiError } from './orderly-http.ts';
 import { OrderlyDeskClient } from './orderly-actions.ts';
 import type { OrderlyFundingFeeRow } from './orderly-actions.ts';
 import { OrderlyReader, morePages, parseFundingFeeRow } from './orderly.ts';
@@ -185,6 +187,30 @@ test('money out stops at the first refusal and never withdraws unsettled', async
   await assert.rejects(client(signer, f).withdraw('12.5'), /orderly settle_pnl POST \/v1\/settle_pnl: HTTP 404 code -1000/);
   assert.ok(!signer.calls.some((c) => c.startsWith('orderly_withdraw')));
   assert.ok(!sent.some((s) => s.url.includes('withdraw')));
+});
+
+test('a withdraw_request with a lost answer (a 5xx, a timeout) is OutcomeUnknown with its nonce; a read with one stays a plain error', async () => {
+  const venue = fakeVenue({
+    'GET /v1/settle_nonce': { settle_nonce: 17 },
+    'POST /v1/settle_pnl': { settle_pnl_id: 3 },
+    'GET /v1/withdraw_nonce': { withdraw_nonce: '41' },
+  });
+  for (const lost of [
+    () => new Response('<html>Bad Gateway</html>', { status: 502 }),
+    () => { throw new DOMException('The operation was aborted due to timeout', 'TimeoutError'); },
+  ]) {
+    const f = (async (input: string | URL | Request, init?: RequestInit) =>
+      (String(input).endsWith('/v1/withdraw_request') ? lost() : venue.f(input, init))) as typeof fetch;
+    await assert.rejects(client(new FakeSigner(), f).withdraw('12.5'), (err: unknown) => {
+      assert.ok(err instanceof OutcomeUnknown, String(err));
+      assert.equal(err.what, 'orderly withdraw_request');
+      assert.equal(err.ids.orderlyWithdrawNonce, 41);
+      return true;
+    });
+  }
+  // The receiver address read meeting a 502: not a money move, so the plain OrderlyApiError.
+  const down = (async () => new Response('<html>Bad Gateway</html>', { status: 502 })) as unknown as typeof fetch;
+  await assert.rejects(client(new FakeSigner(), down).receiverAddress(), (err: unknown) => err instanceof OrderlyApiError && !(err instanceof OutcomeUnknown));
 });
 
 test('a withdraw amount must be a canonical USDC decimal string, at most 6 decimals', async () => {
