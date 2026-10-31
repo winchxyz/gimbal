@@ -111,6 +111,8 @@ function leg(
     distanceToLiqPct: round(distance * 100, 1),
     fundingEarnedUsd: round(fundingEarnedUsd, 3),
     unsettledFundingUsd,
+    feesUsd: side === 'short' ? -0.48 : -0.99,
+    lotSize: 1,
     unpriced,
   };
 }

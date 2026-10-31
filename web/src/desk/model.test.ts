@@ -34,6 +34,8 @@ const leg = (overrides: Partial<Leg> = {}): Leg => ({
   distanceToLiqPct: 32.6,
   fundingEarnedUsd: 0.31,
   unsettledFundingUsd: 0,
+  feesUsd: -0.48,
+  lotSize: 1,
   unpriced: false,
   ...overrides,
 });

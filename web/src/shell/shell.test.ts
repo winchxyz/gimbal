@@ -17,6 +17,8 @@ const leg = (venue: Leg['venue'], side: Leg['side'], distanceToLiqPct: number | 
   distanceToLiqPct,
   fundingEarnedUsd: 0,
   unsettledFundingUsd: 0,
+  feesUsd: 0,
+  lotSize: 1,
   unpriced: false,
 });
 

@@ -16,7 +16,7 @@ const isNumber = (value: unknown): value is number => typeof value === 'number' 
 /** Checks the body of `GET /strategy`; throws with what is wrong, so the screen can say so. */
 export function parseStrategy(value: unknown): StrategyConfig {
   if (!isObject(value)) throw new Error('GET /strategy: not an object');
-  const { auto, minNetAprPct, legUsd, maxLeverage, stopDrawdownPct, rotate } = value;
+  const { auto, minNetAprPct, legUsd, maxLeverage, stopDrawdownPct, rotate, risk } = value;
   if (typeof auto !== 'boolean') throw new Error('GET /strategy: auto is not a boolean');
   if (!isNumber(minNetAprPct)) throw new Error('GET /strategy: minNetAprPct is not a number');
   if (!isNumber(legUsd)) throw new Error('GET /strategy: legUsd is not a number');
@@ -25,7 +25,14 @@ export function parseStrategy(value: unknown): StrategyConfig {
   if (!isObject(rotate) || !isNumber(rotate.minGainPts) || !isNumber(rotate.forHours)) {
     throw new Error('GET /strategy: rotate needs minGainPts and forHours');
   }
-  return { auto, minNetAprPct, legUsd, maxLeverage, stopDrawdownPct, rotate: { minGainPts: rotate.minGainPts, forHours: rotate.forHours } };
+  if (!isObject(risk) || !isNumber(risk.watchDistancePct) || !isNumber(risk.rescueDistancePct)) {
+    throw new Error('GET /strategy: risk needs watchDistancePct and rescueDistancePct');
+  }
+  return {
+    auto, minNetAprPct, legUsd, maxLeverage, stopDrawdownPct,
+    rotate: { minGainPts: rotate.minGainPts, forHours: rotate.forHours },
+    risk: { watchDistancePct: risk.watchDistancePct, rescueDistancePct: risk.rescueDistancePct },
+  };
 }
 
 /** Checks the body of `GET /windows/history`; the points are returned oldest first whatever the order sent. */

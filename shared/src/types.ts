@@ -47,7 +47,9 @@ export interface ContractPolicy {  // the contract's Policy (§1.2), same snake_
   phoenix_markets: { symbol: string; orderbook: string; base_lot_e8: number; tick_e8: number }[];
   orderly_symbols: string[];
   max_notional_usd: number; price_band_bps: number; oracle_max_age_s: number;
-  rescue_cap_usd_per_hour: number; unpriced: string[]; unpriced_max_notional_usd: number;
+  rescue_cap_usd_per_hour: number;
+  unpriced: { symbol: string; max_sz: string }[];   // no oracle price: max_sz caps the size in base units (canonical decimal)
+  unpriced_max_notional_usd: number;
   max_transfer_cost_bps: number; max_transfer_cost_flat_e6: number;
 }
 
@@ -60,6 +62,8 @@ export interface StrategyConfig {  // engine rules, off-chain: the contract neve
   stopDrawdownPct: number | null;  // close both legs when the desk's drawdown reaches this
   rotate: { minGainPts: number; forHours: number };   // rotate when another window beats the held one by at
                                                       // least minGainPts of net APR for forHours in a row
+  risk: { watchDistancePct: number; rescueDistancePct: number };   // a leg closer to liquidation than these
+                                                      // percentages is watch / rescue (defaults 15 and 8)
 }
 
 export interface PolicyDraft {     // NEAR AI turns the owner's words into this; the owner edits and confirms
@@ -79,17 +83,26 @@ export interface SetupProgress {   // venue setup the engine runs through operat
   }[];
 }
 
+// Money is signed USD: income positive, costs negative (fees are ≤ 0).
 export interface Leg {
-  venue: VenueId; symbol: string; side: 'long' | 'short'; size: number;
-  entry: number; mark: number; liqPx: number | null;
-  marginUsd: number; marginRatio: number; distanceToLiqPct: number | null;
+  venue: VenueId; symbol: string; side: 'long' | 'short';
+  size: number;                   // base units, always positive; side gives the direction
+  lotSize: number;                // base units per lot on this venue (Phoenix base lot, HL 10^-szDecimals)
+  entry: number; mark: number; liqPx: number | null;   // USD per base unit
+  marginUsd: number;              // margin held for this leg on its venue
+  marginRatio: number;            // maintenance margin ÷ margin, a fraction: 0.31 = 31 %, 1 = liquidation
+  distanceToLiqPct: number | null;   // how far mark must move to reach liqPx, in percent: 32.6 = 32.6 %
   fundingEarnedUsd: number; unsettledFundingUsd: number;
+  feesUsd: number;                // trading fees paid on this leg since it opened (≤ 0)
   unpriced: boolean;              // opened under policy.unpriced: no oracle price band
 }
 
 export interface DeskState {
   deskId: string; owner: string; contract: string; mode: Mode;
-  legs: Leg[]; netDelta: number; equityUsd: number; reserveUsd: number;
+  legs: Leg[];
+  netDelta: number;               // base units, long minus short; 0 when level
+  equityUsd: number;              // the desk value: margin on every venue + reserve + open P&L
+  reserveUsd: number;             // the part of equityUsd held back for rescues
   pnl: { fundingUsd: number; feesUsd: number; priceUsd: number; netUsd: number };
   health: 'level' | 'watch' | 'rescue';
   paused: { by: string; at: number } | null;   // set_paused / panic_close: the NEAR account that paused, ms; null = running
@@ -97,8 +110,9 @@ export interface DeskState {
   updatedAt: number;
 }
 
-// The status line reads, first match wins: rescueFailure → Needs you, paused → Paused, health rescue →
-// Rescuing, health watch → Watch, no legs → Waiting, else Level.
+// The status line reads, first match wins: rescueFailure → Needs you, a leg's venue down in HealthMap →
+// "<venue> not answering", paused → Paused, health rescue → Rescuing, health watch → Watch, no legs → Waiting,
+// else Level.
 export interface RescueFailure {
   rescueId: string;
   step: Exclude<RescueProgress['step'], 'landed' | 'failed'>;   // the step that failed
