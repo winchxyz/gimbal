@@ -12,6 +12,7 @@
     "smoke": "node src/cli/smoke.ts"
   },
   "dependencies": {
+    "@ellipsis-labs/rise": "0.6.2",
     "@gimbal/shared": "*"
   }
 }
