@@ -19,12 +19,16 @@ export interface Window {
   grossAprPct: number;
   grossApr7dPct: number | null;   // over the last 7 days; null until the history is loaded
   costs: { feesPct: number; slippagePct: number; basisPct: number; rescueReservePct: number };
+                                  // feesPct: venue fees on four fills plus the 1Click fees to move both legs' margin
+                                  // in and out while the desk holds none there; basisPct includes the timing loss
+                                  // when the legs settle on different schedules
   netAprPct: number; usdPerDayPer1k: number; breakevenHours: number; depthUsd: number;
   intervalsAbove: number; updatedAt: number;
-  tradable: boolean;              // both legs are VenueIds, so a desk could trade it; false = watch only
+  tradable: boolean;              // both legs are VenueIds, so a desk could trade it; false = watch only. Structural
+                                  // only: policy, oracle and desk reasons go in `refused`, never here
   veto?: { verdict: 'pass' | 'veto'; reasons: string[]; model: string; at: number };   // NEAR AI, can only refuse
-  refused?: { code: string; reason: string };   // tradable, but the contract would refuse it under the current
-                                                // policy (E_* code), e.g. no oracle price and not in policy.unpriced
+  refused?: { code: string; reason: string };   // tradable, but it cannot be entered now: the contract would refuse
+                                                // it (E_ORACLE_STALE, E_ASSET, E_SIZE) or no desk exists (E_NO_DESK)
   held: { since: number } | null;   // the desk holds this window now
   checks: { ok: boolean; text: string }[];   // what the engine checked (policy, oracle, rescue path), one line
                                              // each, engine-written; the first failing one is why it is not entered
