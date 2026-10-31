@@ -309,14 +309,16 @@ near-sdk before the method runs ("Failed to deserialize input from JSON"); clien
 
 ```ts
 export type VenueId = 'hyperliquid' | 'phoenix' | 'orderly';   // the venues a desk can trade
-export type ScanVenueId = string;   // any venue the scanner reads (the 3 above plus the watch-only ones, 32 in all)
+export type ScanVenueId = string;   // any venue the scanner reads: the 3 above plus the watch-only ones (33 ids in all)
 export type Mode = 'replay' | 'testnet' | 'mainnet';
 
 export interface FundingRate {
   venue: ScanVenueId; symbol: string;
   ratePerHour: number;            // fraction per hour; > 0 means longs pay shorts
-  settlement: 'hourly' | '4h' | '8h' | 'daily'; // HL hourly; Phoenix accrues hourly, settles daily; Orderly 8 h (4 h on some symbols)
-  nextAt: number;                 // ms
+  settlement: 'hourly' | '2h' | '4h' | '8h' | 'daily' | 'continuous';
+                                  // HL hourly; Phoenix accrues hourly, settles daily; Orderly 8 h (4 h on some symbols);
+                                  // continuous = accrues every block (GMX v2, Paradex)
+  nextAt: number;                 // ms; for continuous funding, the time of the read
 }
 
 export interface Window {
@@ -521,6 +523,16 @@ export interface MarketFunding extends FundingRate {   // the prices the rate ap
   oraclePx: number | null;                             // per market; null where the venue does not say
   openInterest: number | null;           // base units
   volume24hUsd: number | null;
+  base?: string;                         // cross-venue key the scanner pairs on: quote, suffixes, broker tags stripped,
+                                         // aliases applied ("kPEPE" → "PEPE", "PERP_SOL_USDC" → "SOL", "XBT" → "BTC")
+  multiplier?: number;                   // base units per unit of `symbol` ("kPEPE" 1000); absent = 1
+  shortRatePerHour?: number;             // what a short receives where it differs from ratePerHour (GMX v2)
+}
+
+export interface WatchReader {           // a watch-only venue: public funding and marks, no account, no orders;
+  readonly id: ScanVenueId;              // its windows are ranked but never traded ("pacifica", "hl-xyz", "okx")
+  readonly kind: 'dex' | 'cex';          // CEX legs are reference only: CEX-vs-CEX pairs are not ranked
+  funding(): Promise<MarketFunding[]>;
 }
 
 export interface ContractClient {                      // NearContractClient | ReplayContractClient

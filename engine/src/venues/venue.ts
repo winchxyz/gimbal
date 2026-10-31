@@ -1,7 +1,7 @@
 // What every venue reader exposes (docs/interfaces.md section 3). Readers only read: orders and
 // transfers go through the contract, never through a reader.
 
-import type { FundingRate, VenueId } from '@gimbal/shared';
+import type { FundingRate, ScanVenueId, VenueId } from '@gimbal/shared';
 
 /** A perp market as the venue lists it. Static between listings; read once per session. */
 export interface Market {
@@ -26,6 +26,22 @@ export interface MarketFunding extends FundingRate {
   oraclePx: number | null;
   openInterest: number | null;   // base units
   volume24hUsd: number | null;
+  base?: string;                 // the cross-venue key the scanner pairs on: quote, suffixes and broker tags stripped,
+                                 // aliases applied ("kPEPE" → "PEPE", "PERP_SOL_USDC" → "SOL", "XBT" → "BTC");
+                                 // absent = the scanner uses `symbol` as is
+  multiplier?: number;           // base units per unit of `symbol` ("kPEPE" 1000); absent = 1
+  shortRatePerHour?: number;     // what a short receives per hour where it differs from ratePerHour (GMX v2 per-side
+                                 // funding plus borrow); absent = the same as ratePerHour
+}
+
+/**
+ * A watch-only venue: public funding and marks only, no account, no orders. The scanner ranks its
+ * windows next to the tradable ones but the desk never trades them (interfaces section 3).
+ */
+export interface WatchReader {
+  readonly id: ScanVenueId;      // lowercase, e.g. "pacifica", "hl-xyz", "okx"
+  readonly kind: 'dex' | 'cex';  // CEX legs are reference only: CEX-vs-CEX pairs are not ranked
+  funding(): Promise<MarketFunding[]>;
 }
 
 export interface BookLevel {

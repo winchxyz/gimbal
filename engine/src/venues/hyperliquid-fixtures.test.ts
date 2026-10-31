@@ -33,7 +33,7 @@ function raw<T>(all: WireLine[], type: string): T {
 function readerOver(all: WireLine[], network: 'mainnet' | 'testnet', at = Date.UTC(2026, 9, 30, 20, 42, 35)) {
   const replay = replayFetch(all);
   const sent: Request[] = [];
-  const f = ((input: string | URL | Request, init?: RequestInit) => {
+  const f = ((input: Parameters<typeof fetch>[0], init?: RequestInit) => {
     sent.push(JSON.parse(String(init?.body)) as Request);
     return replay(input, init);
   }) as typeof fetch;

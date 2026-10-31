@@ -2,14 +2,16 @@
 // in the same PR.
 
 export type VenueId = 'hyperliquid' | 'phoenix' | 'orderly';   // the venues a desk can trade
-export type ScanVenueId = string;   // any venue the scanner reads (the 3 above plus the watch-only ones, 32 in all)
+export type ScanVenueId = string;   // any venue the scanner reads: the 3 above plus the watch-only ones (33 ids in all)
 export type Mode = 'replay' | 'testnet' | 'mainnet';
 
 export interface FundingRate {
   venue: ScanVenueId; symbol: string;
   ratePerHour: number;            // fraction per hour; > 0 means longs pay shorts
-  settlement: 'hourly' | '4h' | '8h' | 'daily'; // HL hourly; Phoenix accrues hourly, settles daily; Orderly 8 h (4 h on some symbols)
-  nextAt: number;                 // ms
+  settlement: 'hourly' | '2h' | '4h' | '8h' | 'daily' | 'continuous';
+                                  // HL hourly; Phoenix accrues hourly, settles daily; Orderly 8 h (4 h on some symbols);
+                                  // continuous = accrues every block (GMX v2, Paradex)
+  nextAt: number;                 // ms; for continuous funding, the time of the read
 }
 
 export interface Window {
