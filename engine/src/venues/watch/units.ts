@@ -6,7 +6,8 @@
 // ms), a 24 h rate paid hourly, an annualised fraction, and GMX's x1e30 annualised fraction per side.
 
 import type { FundingRate } from '@gimbal/shared';
-import { num } from './http.ts';
+import type { MarketFunding } from '../venue.ts';
+import { num, optNum } from './http.ts';
 
 export const HOUR_MS = 3_600_000;
 export const HOURS_PER_YEAR = 24 * 365;
@@ -18,6 +19,26 @@ export function perPeriodToHourly(ratePerPeriod: number, periodHours: number): n
   if (!Number.isFinite(ratePerPeriod)) throw new Error(`funding rate is not a number: ${ratePerPeriod}`);
   if (!(periodHours > 0) || !Number.isFinite(periodHours)) throw new RangeError(`funding period must be > 0 hours, got ${periodHours}`);
   return ratePerPeriod / periodHours || 0;
+}
+
+export type FundingLimitFields = Pick<MarketFunding, 'fundingCapPerHour' | 'fundingFloorPerHour'>;
+
+/**
+ * A market's own funding cap and floor, given per funding period of `periodHours` in units of `unit` (1 for a
+ * fraction, 100 for a percentage, 10,000 for basis points), as MarketFunding's per-hour fields. A side the venue
+ * leaves out (null, empty) is left out. A cap that is not above its floor is no range: MEXC answers 0 and 0 on
+ * markets whose funding is switched off, and such a pair says nothing of a premium, so both sides are left out.
+ */
+export function fundingLimitsPerHour(cap: unknown, floor: unknown, periodHours: number, unit = 1): FundingLimitFields {
+  if (!(periodHours > 0) || !Number.isFinite(periodHours)) return {};
+  const c = optNum(cap);
+  const f = optNum(floor);
+  if (c !== null && f !== null && !(c > f)) return {};
+  const perHour = (x: number) => x / unit / periodHours || 0;
+  return {
+    ...(c === null ? {} : { fundingCapPerHour: perHour(c) }),
+    ...(f === null ? {} : { fundingFloorPerHour: perHour(f) }),
+  };
 }
 
 /** How often a market pays, from its period in hours; throws for a period the shared type has no name for. */

@@ -2,12 +2,13 @@
 
 import type { ScanVenueId, VenueId } from '@gimbal/shared';
 import type { MarketFunding } from '../venues/venue.ts';
+import { DESK_VENUE_IDS, isDeskVenueId } from '../venues/venue.ts';
 import { grossPerHour } from './costs.ts';
 
-export const DESK_VENUES: readonly VenueId[] = ['hyperliquid', 'phoenix', 'orderly'];
+export const DESK_VENUES: readonly VenueId[] = DESK_VENUE_IDS;
 
 export function isDeskVenue(venue: ScanVenueId): venue is VenueId {
-  return (DESK_VENUES as readonly string[]).includes(venue);
+  return isDeskVenueId(venue);
 }
 
 /** What a venue is to the scanner: a desk venue (VenueReader) or a watch-only one (WatchReader.kind). */
@@ -30,6 +31,8 @@ export interface ScanLeg {
   volume24hUsd: number | null;   // traded in the last 24 h, USD; null where the venue does not say
   readAt: number;                // ms, when this venue's funding was read
   stale: boolean;                // the venue did not answer this scan: this is its last good read
+  fundingCapPerHour?: number;    // the market's own funding limits from the venue's answer, per hour; absent where
+  fundingFloorPerHour?: number;  // it gives none (quality.ts then falls back to the sourced FUNDING_LIMITS)
   /** Set on a leg of the held window that the filters would have dropped: why. The window fails a check for it. */
   heldOnly?: string;
 }
@@ -70,6 +73,10 @@ export function toLeg(f: MarketFunding, kind: LegKind, readAt: number, stale: bo
     volume24hUsd: typeof f.volume24hUsd === 'number' && Number.isFinite(f.volume24hUsd) && f.volume24hUsd >= 0 ? f.volume24hUsd : null,
     readAt,
     stale,
+    // A cap at or below zero, or a floor at or above it, would put a quiet market "at the cap": not a limit.
+    ...(finitePositive(f.fundingCapPerHour) ? { fundingCapPerHour: f.fundingCapPerHour } : {}),
+    ...(typeof f.fundingFloorPerHour === 'number' && Number.isFinite(f.fundingFloorPerHour) && f.fundingFloorPerHour < 0
+      ? { fundingFloorPerHour: f.fundingFloorPerHour } : {}),
   };
 }
 
@@ -94,7 +101,9 @@ export interface FilterOptions {
 
 /**
  * The legs worth pairing, in four steps:
- * 1. one leg per venue and base: a venue listing the same base twice keeps the one with more open interest;
+ * 1. one leg per venue and base: a venue listing the same base twice keeps the one whose mark agrees with the other
+ *    venues' (two assets under one name: MEXC's C_USDT is the Chainbase coin, its CSTOCK_USDT Citigroup), else the
+ *    one with more open interest;
  * 2. a leg without a mark cannot be checked against the others or priced: dropped, except a CEX leg (reference only);
  * 3. a leg whose mark is more than `maxMarkDeviation` from the median mark of the same base on the other venues is
  *    another asset under the same name, or a wrong multiplier: dropped (with two venues that disagree, both go);
@@ -112,6 +121,20 @@ export function filterLegs(
   const drop = (l: ScanLeg, reason: DropReason) => dropped.push({ venue: l.venue, symbol: l.symbol, reason });
   const isExempt = (l: ScanLeg) => exempt.has(`${l.venue}|${l.symbol}`);
 
+  const allMarks = new Map<string, ScanLeg[]>();
+  for (const leg of legs) {
+    if (leg.markPx === null) continue;
+    const list = allMarks.get(leg.base);
+    if (list === undefined) allMarks.set(leg.base, [leg]);
+    else list.push(leg);
+  }
+  /** Whether a leg's mark agrees with the other venues' marks of its base; false without a mark or other venues. */
+  const agreesElsewhere = (l: ScanLeg): boolean => {
+    if (l.markPx === null) return false;
+    const others = (allMarks.get(l.base) ?? []).filter((o) => o.venue !== l.venue).map((o) => o.markPx!);
+    return others.length > 0 && Math.abs(l.markPx / nearestMedian(others, l.markPx) - 1) <= options.maxMarkDeviation;
+  };
+
   const best = new Map<string, ScanLeg>();
   for (const leg of legs) {
     const key = `${leg.venue}\u0000${leg.base}`;
@@ -121,7 +144,8 @@ export function filterLegs(
       continue;
     }
     const byOi = (leg.oiUsd ?? -1) > (held.oiUsd ?? -1) || ((leg.oiUsd ?? -1) === (held.oiUsd ?? -1) && leg.symbol < held.symbol);
-    const better = isExempt(leg) !== isExempt(held) ? isExempt(leg) : byOi;
+    const byMark = agreesElsewhere(leg) !== agreesElsewhere(held) ? agreesElsewhere(leg) : byOi;
+    const better = isExempt(leg) !== isExempt(held) ? isExempt(leg) : byMark;
     if (better) {
       drop(held, 'duplicate');
       best.set(key, leg);

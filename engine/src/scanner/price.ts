@@ -2,6 +2,7 @@
 // Pure: the books, the oracle prices and the time come in as arguments.
 
 import type { ContractPolicy, StrategyConfig, VenueId, Window as FundingWindow } from '@gimbal/shared';
+import { venueName, venueNames } from '../venues/names.ts';
 import type { Book } from '../venues/venue.ts';
 import type { CostParams } from './config.ts';
 import {
@@ -164,7 +165,7 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
     const thin = ([[long, ls, lb], [short, ss, sb]] as [ScanLeg, LegSlippage, BookRead][]).filter(([, s]) => s.exhausted);
     for (const [leg, s, b] of thin) {
       const levels = Math.min(b.book.bids.length, b.book.asks.length);
-      checks.push({ ok: false, text: `The ${leg.venue} book fills only ${usd(s.filledUsd)} of ${usd(L)} within the ${levels} level${levels === 1 ? '' : 's'} read: slippage counts the filled part only` });
+      checks.push({ ok: false, text: `The ${venueName(leg.venue)} book fills only ${usd(s.filledUsd)} of ${usd(L)} within the ${levels} level${levels === 1 ? '' : 's'} read: slippage counts the filled part only` });
     }
     if (thin.length === 0) {
       const bookAge = Math.max(0, Math.round((ctx.now - Math.min(lb.readAt, sb.readAt)) / 1000));
@@ -172,7 +173,7 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
     }
     checks.push(moving.length === 0
       ? { ok: true, text: 'Margin already sits on both venues: nothing to move in or out' }
-      : { ok: true, text: `Moving ${usd(margin)} of margin a leg onto ${moving.join(' and ')} and back costs ${usd(transferUsd)}` });
+      : { ok: true, text: `Moving ${usd(margin)} of margin a leg onto ${venueNames(moving)} and back costs ${usd(transferUsd)}` });
   } else {
     breakdown = { feesUsd: null, transferUsd: null, slippageUsd: null, basisUsd, timingUsd, rescueUsd: null };
   }
@@ -196,16 +197,16 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
   const quality = pair.desk ? [] : (ctx.quality?.(pair) ?? []);
   const head: FundingWindow['checks'] = [];
   if (staleVenues.length > 0) {
-    head.push({ ok: false, text: `${staleVenues.join(' and ')} did not answer: numbers from ${Math.max(0, Math.round((ctx.now - oldest) / 1000))} s ago` });
+    head.push({ ok: false, text: `${venueNames(staleVenues)} did not answer: numbers from ${Math.max(0, Math.round((ctx.now - oldest) / 1000))} s ago` });
   }
   const tail: FundingWindow['checks'] = [];
   for (const leg of [long, short]) {
-    if (leg.heldOnly !== undefined) tail.push({ ok: false, text: `Kept only because the desk holds it: ${leg.venue} ${leg.symbol} ${leg.heldOnly}` });
+    if (leg.heldOnly !== undefined) tail.push({ ok: false, text: `Kept only because the desk holds it: ${venueName(leg.venue)} ${leg.symbol} ${leg.heldOnly}` });
   }
   if (be === null) tail.push({ ok: false, text: 'Does not break even within a year at today\'s rates' });
   if (basisUsd === null) {
     const missing = [long, short].filter((l) => l.markPx === null).map((l) => l.venue);
-    tail.push({ ok: false, text: `No mark on ${missing.join(' and ')}: basis not priced` });
+    tail.push({ ok: false, text: `No mark on ${venueNames(missing)}: basis not priced` });
   }
   if (pair.desk) {
     const amount = rescueAmountUsd(L, ctx.strategy.risk.watchDistancePct, ctx.strategy.risk.rescueDistancePct);
@@ -214,7 +215,7 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
   const noOi = [long, short].filter((l) => l.oiUsd === null).map((l) => l.venue);
   tail.push(noOi.length === 0
     ? { ok: true, text: `Capacity ${usd(depthUsd)}: the smaller leg's open interest` }
-    : { ok: false, text: `Capacity ${usd(depthUsd)} is one leg's only: ${noOi.join(' and ')} publishes no open interest` });
+    : { ok: false, text: `Capacity ${usd(depthUsd)} is one leg's only: ${venueNames(noOi)} publishes no open interest` });
 
   const window: FundingWindow = {
     id: pair.id,
@@ -286,7 +287,7 @@ export function deskVerdict(pair: Pair, ctx: Pick<PricingContext, 'strategy' | '
   const legs = [pair.long, pair.short];
   for (const leg of legs) {
     if (!inVenuePolicy(policy, leg)) {
-      checks.push({ ok: false, text: `${leg.symbol} is not in the desk policy on ${leg.venue}` });
+      checks.push({ ok: false, text: `${leg.symbol} is not in the desk policy on ${venueName(leg.venue)}` });
       refuse('E_ASSET', `${leg.symbol} not in policy on ${leg.venue}`);
     }
   }
@@ -295,13 +296,15 @@ export function deskVerdict(pair: Pair, ctx: Pick<PricingContext, 'strategy' | '
   const atBand = L * (1 + policy.price_band_bps / 1e4);
   let cap = policy.max_notional_usd;
   for (const leg of legs) {
-    const where = `${leg.symbol} on ${leg.venue}`;
+    // Checks are read by the owner (venue names); refusal reasons are logged and matched (venue ids).
+    const where = `${leg.symbol} on ${venueName(leg.venue)}`;
+    const whereId = `${leg.symbol} on ${leg.venue}`;
     const unpriced = policy.unpriced.find((u) => u.symbol === leg.symbol);
     if (unpriced !== undefined) {
       cap = Math.min(cap, policy.unpriced_max_notional_usd);
       if (leg.venueMarkPx === null) {
         checks.push({ ok: false, text: `${where} is unpriced and has no mark: its size cannot be checked against max_sz ${unpriced.max_sz}` });
-        refuse('E_SIZE', `no mark to size ${where}`);
+        refuse('E_SIZE', `no mark to size ${whereId}`);
         continue;
       }
       // The order's size in the venue's own units (kPEPE, PERP_1000PEPE_USDC), which is what max_sz counts.
@@ -309,7 +312,7 @@ export function deskVerdict(pair: Pair, ctx: Pick<PricingContext, 'strategy' | '
       const size = `${Number(sz.toPrecision(6))} ${leg.symbol}`;
       if (sz > Number(unpriced.max_sz)) {
         checks.push({ ok: false, text: `${where} is unpriced: a ${usd(L)} leg is ${size}, over its max_sz ${unpriced.max_sz}` });
-        refuse('E_SIZE', `${where} over max_sz ${unpriced.max_sz}`);
+        refuse('E_SIZE', `${whereId} over max_sz ${unpriced.max_sz}`);
       } else {
         checks.push({ ok: true, text: `${where} is unpriced, no price protection: a ${usd(L)} leg is ${size}, within its max_sz ${unpriced.max_sz}` });
       }
@@ -320,16 +323,16 @@ export function deskVerdict(pair: Pair, ctx: Pick<PricingContext, 'strategy' | '
     const age = o === null ? null : Math.max(0, (ctx.now - o.at) / 1000);
     if (o === null || age === null) {
       checks.push({ ok: false, text: `No oracle price for ${where}: the contract refuses its orders` });
-      refuse('E_ORACLE_STALE', `no oracle price for ${where}`);
+      refuse('E_ORACLE_STALE', `no oracle price for ${whereId}`);
     } else if (o.at > ctx.now + ORACLE_MAX_SKEW_MS) {
       // A price dated ahead of now would count as 0 s old however old it really is: one clock is wrong, and which
       // one cannot be told from here.
       const ahead = Math.round((o.at - ctx.now) / 1000);
       checks.push({ ok: false, text: `The oracle price for ${where} is dated ${ahead} s ahead of the engine's clock, past the ${ORACLE_MAX_SKEW_MS / 1000} s skew allowed: counted as stale` });
-      refuse('E_ORACLE_STALE', `oracle price for ${where} dated ${ahead} s ahead`);
+      refuse('E_ORACLE_STALE', `oracle price for ${whereId} dated ${ahead} s ahead`);
     } else if (age > policy.oracle_max_age_s) {
       checks.push({ ok: false, text: `The oracle price for ${where} is ${Math.round(age)} s old, over the ${policy.oracle_max_age_s} s limit: the contract refuses its orders` });
-      refuse('E_ORACLE_STALE', `oracle price for ${where} ${Math.round(age)} s old`);
+      refuse('E_ORACLE_STALE', `oracle price for ${whereId} ${Math.round(age)} s old`);
     } else {
       checks.push({ ok: true, text: `The oracle price for ${where} is ${Math.round(age)} s old, within the ${policy.oracle_max_age_s} s limit` });
     }
@@ -347,7 +350,7 @@ function watchVerdict(pair: Pair): Verdict {
   const watch = [pair.long, pair.short].filter((l) => !isDeskVenue(l.venue));
   const cex = watch.filter((l) => l.kind === 'cex').map((l) => l.venue);
   const dex = watch.filter((l) => l.kind !== 'cex').map((l) => l.venue);
-  const who = [...(dex.length > 0 ? [`${dex.join(' and ')} cannot be traded by the desk`] : []), ...(cex.length > 0 ? [`${cex.join(' and ')} is a CEX, reference only`] : [])];
+  const who = [...(dex.length > 0 ? [`${venueNames(dex)} cannot be traded by the desk`] : []), ...(cex.length > 0 ? [`${venueNames(cex)} is a CEX, reference only`] : [])];
   return { checks: [{ ok: false, text: `Watch-only: ${who.join('; ')}. Fees, slippage and the rescue reserve are not priced` }] };
 }
 

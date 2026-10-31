@@ -3,6 +3,13 @@
 
 import type { FundingRate, ScanVenueId, VenueId } from '@gimbal/shared';
 
+/** The venues a desk trades; every other venue the scanner reads is watch-only. */
+export const DESK_VENUE_IDS: readonly VenueId[] = ['hyperliquid', 'phoenix', 'orderly'];
+
+export function isDeskVenueId(venue: ScanVenueId): venue is VenueId {
+  return (DESK_VENUE_IDS as readonly string[]).includes(venue);
+}
+
 /** A perp market as the venue lists it. Static between listings; read once per session. */
 export interface Market {
   venue: VenueId;

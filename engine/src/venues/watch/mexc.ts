@@ -1,11 +1,12 @@
-// MEXC (CEX, reference only): USDT-margined perps. `funding_rate` has every rate, interval and mark, `ticker` the
-// open interest (in contracts) and volume; `detail` (cached) the contract sizes and which contracts are enabled.
+// MEXC (CEX, reference only): USDT-margined perps. `funding_rate` has every rate, interval, rate limit and mark,
+// `ticker` the open interest (in contracts) and volume; `detail` (cached) the contract sizes and which contracts are
+// enabled.
 
 import type { MarketFunding, WatchReader } from '../venue.ts';
 import type { WatchReaderOptions } from './http.ts';
 import { LISTING_TTL_MS, TtlCache, WatchHttp, WatchVenueError, collect, list, optNum, optPrice, record } from './http.ts';
 import { baseFields } from './symbols.ts';
-import { mexcRatePerHour, nextAtOr, settlementForHours } from './units.ts';
+import { fundingLimitsPerHour, mexcRatePerHour, nextAtOr, settlementForHours } from './units.ts';
 
 export const MEXC_API_URL = 'https://contract.mexc.com/api/v1/contract';
 
@@ -30,7 +31,10 @@ export class MexcReader implements WatchReader {
   }
 }
 
-interface MexcRate { symbol: string; fundingRate: number; collectCycle: number; nextSettleTime: number; fairPrice: number; idxPrice: number }
+interface MexcRate {
+  symbol: string; fundingRate: number; collectCycle: number; nextSettleTime: number; fairPrice: number; idxPrice: number;
+  maxFundingRate?: number; minFundingRate?: number;
+}
 interface MexcTicker { symbol: string; holdVol: number; amount24: number }
 interface MexcDetail { symbol: string; baseCoin: string; quoteCoin: string; contractSize: number; state: number }
 
@@ -43,6 +47,9 @@ function mexcData(answer: unknown, what: string): unknown {
 /**
  * Enabled (state 0) `_USDT` contracts only. Open interest in base coins is `holdVol` (contracts) x `contractSize`;
  * the mark is `fairPrice`. Equities carry a `STOCK` suffix on the base, dropped by the normaliser.
+ * `maxFundingRate` / `minFundingRate` are per `collectCycle`, like the rate: 99 of the markets kept from the recorded
+ * sweep sit exactly on theirs (most at 0.0002 per 4 h). They need not mirror each other (KMISTOCK_USDT: 0.0002 and
+ * -0.002, its rate on the floor). A 0 / 0 range (US30_USDT, USDGO_USDT) is no limit and is left out.
  */
 export function parseMexc(rates: unknown, ticker: unknown, detail: unknown, now: number): MarketFunding[] {
   const contracts = new Map(list<MexcDetail>('mexc', mexcData(detail, 'detail'), 'detail data').map((d) => [d.symbol, d]));
@@ -64,7 +71,8 @@ export function parseMexc(rates: unknown, ticker: unknown, detail: unknown, now:
       oraclePx: optPrice(r.idxPrice),
       openInterest: held === null || size === null ? null : held * size,
       volume24hUsd: optNum(t?.amount24),
-      ...baseFields(d.baseCoin),
+      ...baseFields(d.baseCoin, { stockSuffix: true }),
+      ...fundingLimitsPerHour(r.maxFundingRate, r.minFundingRate, hours),
     };
   });
 }

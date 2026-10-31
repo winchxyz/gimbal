@@ -5,11 +5,12 @@ import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { gzipSync } from 'node:zlib';
 import type { RecordLine, WireLine } from './recorder.ts';
-import { JsonlGzWriter, RecordingVenue, recordingFetch, recordingWsRequester } from './recorder.ts';
+import { JsonlGzWriter, RecordingVenue, RecordingWatch, recordingFetch, recordingWsRequester } from './recorder.ts';
 import {
-  ReplayMissError, ReplayVenue, ScaledClock, VirtualClock, parseRecording, readRecording, readWireRecording, replayFetch, replayWsRequester,
+  ReplayMissError, ReplayVenue, ReplayWatch, ScaledClock, VirtualClock, parseRecording, readRecording, readWireRecording, replayFetch,
+  replayWsRequester,
 } from './replay.ts';
-import type { AccountState, Book, FundingPayment, Market, MarketFunding, MarketFundingPoint, VenueReader } from './venue.ts';
+import type { AccountState, Book, FundingPayment, Market, MarketFunding, MarketFundingPoint, VenueReader, WatchReader } from './venue.ts';
 
 const dir = mkdtempSync(join(tmpdir(), 'gimbal-replay-'));
 after(() => rmSync(dir, { recursive: true, force: true }));
@@ -411,4 +412,67 @@ test('WebSocket request frames are recorded without their id and answered with t
   await assert.rejects(replay(url, { id: 'x', event: 'request', params: { type: 'orderbook', symbol: 'PERP_ETH_USDC' } }), ReplayMissError);
   // WS lines never answer an HTTP fetch, and HTTP lines never answer a WS request.
   await assert.rejects(replayFetch(lines)(url), ReplayMissError);
+});
+
+const okxAt = (rate: number): MarketFunding[] => [{
+  venue: 'okx', symbol: 'ETH-USDT-SWAP', base: 'ETH', ratePerHour: rate, settlement: '8h', nextAt: T0 + 3_600_000,
+  markPx: 2235, oraclePx: 2236, openInterest: 3, volume24hUsd: 4, fundingCapPerHour: 0.00375 / 8, fundingFloorPerHour: -0.00375 / 8,
+}];
+
+class FakeWatch implements WatchReader {
+  readonly id = 'okx';
+  readonly kind = 'cex';
+  readonly #clock: VirtualClock;
+  #sweep = 0;
+  constructor(clock: VirtualClock) {
+    this.#clock = clock;
+  }
+  async funding(): Promise<MarketFunding[]> {
+    this.#clock.advance(300);
+    this.#sweep += 1;
+    if (this.#sweep === 2) throw new Error('okx funding: HTTP 503');
+    return okxAt(this.#sweep / 1e5);
+  }
+}
+
+test('a watch-only sweep is recorded under its venue and replayed as it was, its outage and its limits included', async () => {
+  const path = join(dir, 'watch.jsonl.gz');
+  const clock = new VirtualClock(T0);
+  const writer = new JsonlGzWriter(path);
+  const rec = new RecordingWatch(new FakeWatch(clock), writer, clock);
+  assert.deepEqual([rec.id, rec.kind], ['okx', 'cex']);
+  const first = await rec.funding();
+  clock.advance(30_000);
+  await assert.rejects(rec.funding(), /HTTP 503/);
+  clock.advance(30_000);
+  const third = await rec.funding();
+  await writer.close();
+
+  const lines = readRecording(path);
+  assert.deepEqual(lines.map((l) => [l.t - T0, l.venue, l.method, l.ms, l.error ?? 'ok']), [
+    [300, 'okx', 'funding', 300, 'ok'], [30_600, 'okx', 'funding', 300, 'okx funding: HTTP 503'], [60_900, 'okx', 'funding', 300, 'ok'],
+  ]);
+  const replayClock = new VirtualClock(T0);
+  const replay = new ReplayWatch(lines, replayClock, 'okx', 'cex');
+  await assert.rejects(replay.funding(), ReplayMissError);
+  replayClock.set(T0 + 300);
+  assert.deepEqual(await replay.funding(), first);
+  assert.equal((await replay.funding())[0]!.fundingCapPerHour, 0.00375 / 8);
+  replayClock.set(T0 + 30_600);
+  await assert.rejects(replay.funding(), /okx funding: HTTP 503/);
+  replayClock.set(T0 + 600_000);
+  assert.deepEqual(await replay.funding(), third);
+  // Copies, as for the desk venues.
+  (await replay.funding())[0]!.ratePerHour = 1;
+  assert.deepEqual(await replay.funding(), third);
+});
+
+test('a watch replay is for watch-only venues with funding lines; a desk replay skips watch lines', () => {
+  const watchLine: RecordLine = { t: T0 - 1_000, venue: 'okx', method: 'funding', args: [], ms: 5, result: okxAt(0.0001) };
+  assert.throws(() => new ReplayWatch(LINES, new VirtualClock(T0), 'hyperliquid', 'dex'), /desk venue, not a watch-only one/);
+  assert.throws(() => new ReplayWatch(LINES, new VirtualClock(T0), 'okx', 'cex'), /no okx funding lines/);
+  // The first line is a watch venue's: the desk replay still picks the desk venue, not okx.
+  const venue = new ReplayVenue([watchLine, ...LINES], new VirtualClock(T0));
+  assert.deepEqual([venue.id, venue.start], ['hyperliquid', T0]);
+  assert.throws(() => new ReplayVenue([watchLine], new VirtualClock(T0)), /no desk venue in the recording/);
 });

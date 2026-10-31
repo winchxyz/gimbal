@@ -42,6 +42,23 @@ test('one leg per venue and base: the one with more open interest stays', () => 
   assert.deepEqual(filterLegs([a, c], OPTS).kept.map((l) => l.symbol), ['PERP_X_USDC']);
 });
 
+test('one leg per venue and base: two assets under one name keep the one whose mark the other venues share', () => {
+  // The recorded sweep: MEXC lists the Chainbase coin C (0.0743) and Citigroup (CSTOCK, 122.74) under base C; the
+  // stock has more open interest, but every other venue's C is the coin.
+  const coin = leg('mexc', 'C_USDT', { base: 'C', markPx: 0.0743, openInterest: 907_490 }, 'cex');
+  const stock = leg('mexc', 'CSTOCK_USDT', { base: 'C', markPx: 122.74, openInterest: 13_096 }, 'cex');
+  const others = [
+    leg('gate', 'C_USDT', { base: 'C', markPx: 0.07433, openInterest: 313_620_000 }, 'cex'),
+    leg('aster', 'CUSDT', { base: 'C', markPx: 0.07431535, openInterest: null }),
+  ];
+  assert.ok(stock.oiUsd! > coin.oiUsd!);
+  const { kept, dropped } = filterLegs([stock, coin, ...others], { ...OPTS, oiFloorUsd: 0 });
+  assert.deepEqual(kept.map((l) => `${l.venue} ${l.symbol}`), ['mexc C_USDT', 'gate C_USDT', 'aster CUSDT']);
+  assert.deepEqual(dropped, [{ venue: 'mexc', symbol: 'CSTOCK_USDT', reason: 'duplicate' }]);
+  // With no other venue to tell them apart, open interest decides as before.
+  assert.deepEqual(filterLegs([stock, coin], { ...OPTS, oiFloorUsd: 0 }).kept.map((l) => l.symbol), ['CSTOCK_USDT']);
+});
+
 test('marks: a leg more than 10 % from the median of the same base elsewhere is dropped', () => {
   // 100, 101, 130: only the 130 leg goes; the 100 leg is checked against 101 (the nearest median of 101 and 130).
   const legs = [

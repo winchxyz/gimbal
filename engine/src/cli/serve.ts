@@ -11,8 +11,9 @@
 //   --speed <x>         GIMBAL_REPLAY_SPEED: replay time runs x times faster than real time, default 1
 //   --policy <file>     GIMBAL_POLICY_FILE: the desk's ContractPolicy as JSON (get_desk's policy), checked at start;
 //                       default none (every desk window is refused E_NO_DESK); ignored when the contract is set
-//   --record <file>     live modes only: write every venue answer the scanner gets, for replay (funding and books
-//                       at most every 30 s per market, so an hour stays a few MB)
+//   --record <file>     live modes only: write every venue answer the scanner gets, for replay (desk funding and
+//                       books at most every 30 s per market, each watch-only venue's sweep every 10 min, so an hour
+//                       stays a few MB)
 //   --minutes <n>       with --record: stop after n minutes and close the file
 //   --state-dir <dir>   GIMBAL_STATE_DIR: where the confirmed engine rules (PUT /strategy) are kept across restarts,
 //                       one file per mode and desk; default engine/state/ (gitignored)
@@ -41,13 +42,13 @@ import { Scanner } from '../scanner/scanner.ts';
 import type { ScanResult } from '../scanner/scanner.ts';
 import { DEFAULT_ENGINE_HOST, DEFAULT_ENGINE_PORT, EngineServer } from '../server.ts';
 import type { RecordLine } from '../venues/recorder.ts';
-import { JsonlGzWriter, RecordingVenue, errorMessage } from '../venues/recorder.ts';
+import { JsonlGzWriter, RecordingVenue, RecordingWatch, errorMessage } from '../venues/recorder.ts';
 import { ScaledClock, readRecording } from '../venues/replay.ts';
 import { watchReaders } from '../venues/watch/index.ts';
 import type { Clock } from '../venues/venue.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { connectContract, contractEnv, healthChanged, healthMap, marginVenues } from './serve-contract.ts';
-import { ThinningSink, loadPolicyFile, replayStart, scanLine } from './serve-replay.ts';
+import { ThinningSink, WATCH_RECORD_GAPS, loadPolicyFile, replayStart, scanLine } from './serve-replay.ts';
 
 const { values } = parseArgs({
   options: {
@@ -133,7 +134,8 @@ if (mode === 'replay') {
   replayOracle = new ReplayOracle(clock);
   const tapped = replayOracle;
   readers = { ...readers, venues: readers.venues.map((v) => tapped.tap(v)) };
-  log(`replay ${file}: ${lines.length} answers from ${readers.venues.map((v) => v.id).join(', ')}, ${new Date(start).toISOString()} to ${new Date(end).toISOString()}, x${speed}`);
+  log(`replay ${file}: ${lines.length} answers from ${readers.venues.map((v) => v.id).join(', ')}`
+    + `${readers.watch.length > 0 ? ` and ${readers.watch.length} watch-only venues` : ''}, ${new Date(start).toISOString()} to ${new Date(end).toISOString()}, x${speed}`);
 } else {
   clock = { now: () => Date.now() };
   // The watch-only venues are mainnet feeds. On testnet the desk venues' marks are testnet prices, so the mark
@@ -141,11 +143,16 @@ if (mode === 'replay') {
   const watch = mode === 'mainnet' ? watchReaders({ clock }) : [];
   readers = liveReaders(mode, clock, watch);
   if (recordPath !== undefined) {
-    // Only the desk venues are recorded; the watch-only feeds are not part of a replay yet.
     writer = new JsonlGzWriter(resolve(recordPath));
     const sink = new ThinningSink(writer, { funding: 30_000, book: 30_000 });
-    readers = { ...readers, venues: readers.venues.map((v) => new RecordingVenue(v, sink, clock)) };
-    log(`recording to ${recordPath}${minutes === null ? '' : ` for ${minutes} min`}`);
+    const watchSink = new ThinningSink(writer, WATCH_RECORD_GAPS);
+    readers = {
+      ...readers,
+      venues: readers.venues.map((v) => new RecordingVenue(v, sink, clock)),
+      watch: readers.watch.map((w) => new RecordingWatch(w, watchSink, clock)),
+    };
+    log(`recording to ${recordPath}${minutes === null ? '' : ` for ${minutes} min`}`
+      + (readers.watch.length > 0 ? `, with ${readers.watch.length} watch-only venues` : ''));
   }
 }
 

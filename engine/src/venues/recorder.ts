@@ -1,7 +1,8 @@
 // Wraps a reader and writes every call it answers (or fails) as one JSON line, gzipped.
 // Line format (docs/interfaces.md section 3): {"t", "venue", "method", "args", "result"}, plus
 // "ms" (how long the venue took) and "error" in place of "result" when the call threw, so a
-// replay reproduces outages as well as data.
+// replay reproduces outages as well as data. RecordingWatch does the same for a watch-only reader's sweeps
+// (`funding`, its one call), under the watch venue's own id.
 //
 // recordingFetch records one level lower: the raw HTTP exchanges a reader makes, so a test can run the
 // reader's own parsing and paging against what the venue really answered (see replayFetch).
@@ -11,17 +12,17 @@ import { createWriteStream, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { constants, createGzip } from 'node:zlib';
-import type { VenueId } from '@gimbal/shared';
+import type { ScanVenueId, VenueId } from '@gimbal/shared';
 import type {
   AccountState, Book, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, MarketFundingPoint,
-  MarketHistorySource, VenueMethod, VenueReader,
+  MarketHistorySource, VenueMethod, VenueReader, WatchReader,
 } from './venue.ts';
 import { systemClock } from './venue.ts';
 import type { WsRequester } from './ws.ts';
 
 export interface RecordLine {
   t: number;                     // ms, when the answer arrived: replay serves it from this moment on
-  venue: VenueId;
+  venue: ScanVenueId;            // a desk venue, or a watch-only one (its `funding` sweeps only)
   method: VenueMethod;
   args: unknown[];
   ms: number;
@@ -93,20 +94,45 @@ export class RecordingVenue implements VenueReader, FundingHistorySource, Market
     });
   }
 
-  async #call<T>(method: VenueMethod, args: unknown[], run: () => Promise<T>): Promise<T> {
-    const started = this.#clock.now();
-    let result: T;
-    try {
-      result = await run();
-    } catch (err) {
-      const t = this.#clock.now();
-      this.#sink.write({ t, venue: this.id, method, args, ms: t - started, error: errorMessage(err) });
-      throw err;
-    }
-    const t = this.#clock.now();
-    this.#sink.write({ t, venue: this.id, method, args, ms: t - started, result });
-    return result;
+  #call<T>(method: VenueMethod, args: unknown[], run: () => Promise<T>): Promise<T> {
+    return recordCall(this.#sink, this.#clock, this.id, method, args, run);
   }
+}
+
+/** A watch-only reader whose sweeps are written to `sink` as `funding` lines under its own id. */
+export class RecordingWatch implements WatchReader {
+  readonly id: ScanVenueId;
+  readonly kind: WatchReader['kind'];
+  readonly #inner: WatchReader;
+  readonly #sink: RecordSink;
+  readonly #clock: Clock;
+
+  constructor(inner: WatchReader, sink: RecordSink, clock: Clock = systemClock) {
+    this.id = inner.id;
+    this.kind = inner.kind;
+    this.#inner = inner;
+    this.#sink = sink;
+    this.#clock = clock;
+  }
+
+  funding(): Promise<MarketFunding[]> {
+    return recordCall(this.#sink, this.#clock, this.id, 'funding', [], () => this.#inner.funding());
+  }
+}
+
+async function recordCall<T>(sink: RecordSink, clock: Clock, venue: ScanVenueId, method: VenueMethod, args: unknown[], run: () => Promise<T>): Promise<T> {
+  const started = clock.now();
+  let result: T;
+  try {
+    result = await run();
+  } catch (err) {
+    const t = clock.now();
+    sink.write({ t, venue, method, args, ms: t - started, error: errorMessage(err) });
+    throw err;
+  }
+  const t = clock.now();
+  sink.write({ t, venue, method, args, ms: t - started, result });
+  return result;
 }
 
 /**
