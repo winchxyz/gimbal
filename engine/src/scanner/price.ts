@@ -6,7 +6,7 @@ import type { Book } from '../venues/venue.ts';
 import type { CostParams } from './config.ts';
 import {
   HOURS_PER_YEAR, aprPct, basisCostUsd, breakevenHours, fillFeeBps, fundingTimingUsd, hoursUntil, legSlippage,
-  marginRoundTripUsd, moveCostUsd, oneOffAprPct, paymentPeriodHours, rescueAmountUsd, rescueCostUsd, takerFeesUsd,
+  marginRoundTripUsd, oneOffAprPct, paymentPeriodHours, rescueAmountUsd, rescueCostUsd, takerFeesUsd,
 } from './costs.ts';
 import type { LegSlippage } from './costs.ts';
 import { round } from './history.ts';
@@ -35,6 +35,12 @@ export interface OracleSource {
   price(venue: VenueId, symbol: string): OraclePrice | null;
 }
 
+/**
+ * How far ahead of the engine's clock an oracle price may be dated and still count (NEAR block time against this
+ * machine's clock). Beyond it the price is counted as stale: a future date would otherwise read as 0 s old.
+ */
+export const ORACLE_MAX_SKEW_MS = 5_000;
+
 export interface PricingContext {
   now: number;
   strategy: StrategyConfig;
@@ -45,6 +51,8 @@ export interface PricingContext {
   book(leg: ScanLeg): BookRead | null;
   /** Desk venues that already hold the desk's margin: entering there moves nothing in or out. Default: none. */
   marginHeldAt?: ReadonlySet<VenueId>;
+  /** The quality findings of a watch-only pair's legs (quality.ts), as failing checks. Default: none. */
+  quality?: (pair: Pair) => FundingWindow['checks'];
 }
 
 /** What one fill of a leg costs, USD: its taker fee plus the slippage of that side on today's book. */
@@ -70,6 +78,8 @@ export interface PricedWindow {
   costsApr: number;              // the sum of the four cost fields, APR points
   breakdown: CostBreakdown;
   fills: { long: LegFills; short: LegFills } | null;
+  /** A watch-only window with a quality finding: it ranks after the clean watch windows. */
+  flagged: boolean;
 }
 
 export type PriceResult = { ok: true; priced: PricedWindow } | { ok: false; reason: 'no-book' | 'empty-book'; venue: VenueId };
@@ -96,7 +106,7 @@ export function isEnterable(w: FundingWindow): boolean {
  * ever read it is not priced (`no-book`), so a missing book never shows as zero slippage. A book too thin for the leg
  * prices the slippage of what it fills and fails a check, so the window is never enterable or ranked as if filled.
  * A watch-only pair is priced from what the scanner can know (gross, basis between marks, funding timing); its fees,
- * slippage and rescue reserve are not priced and its checks say so.
+ * slippage and rescue reserve are not priced and its checks say so, followed by its legs' quality findings.
  */
 export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
   const { long, short } = pair;
@@ -183,6 +193,7 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
   const depthUsd = ois.length > 0 ? Math.round(Math.min(...ois)) : 0;
 
   const verdict = pair.desk ? deskVerdict(pair, ctx) : watchVerdict(pair);
+  const quality = pair.desk ? [] : (ctx.quality?.(pair) ?? []);
   const head: FundingWindow['checks'] = [];
   if (staleVenues.length > 0) {
     head.push({ ok: false, text: `${staleVenues.join(' and ')} did not answer: numbers from ${Math.max(0, Math.round((ctx.now - oldest) / 1000))} s ago` });
@@ -223,11 +234,11 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
     tradable: pair.desk,
     ...(verdict.refused === undefined ? {} : { refused: verdict.refused }),
     held: null,
-    checks: [...head, ...verdict.checks, ...checks, ...tail],
+    checks: [...head, ...verdict.checks, ...quality, ...checks, ...tail],
     switchCostUsd: null,
     stale: staleVenues.length > 0,
   };
-  return { ok: true, priced: { pair, window, costsApr, breakdown, fills } };
+  return { ok: true, priced: { pair, window, costsApr, breakdown, fills, flagged: quality.length > 0 } };
 }
 
 function schedule(leg: ScanLeg, incomePerHourUsd: number, now: number) {
@@ -255,7 +266,8 @@ function inVenuePolicy(policy: ContractPolicy, leg: ScanLeg): boolean {
  * - a leg outside the policy's list for its venue: E_ASSET;
  * - a leg in policy.unpriced needs no oracle, but its size in the venue's own units (legUsd at the venue mark) must
  *   fit its own max_sz, and its notional the unpriced cap (E_SIZE; a leg without a mark cannot be sized: E_SIZE);
- * - any other leg needs an oracle price no older than policy.oracle_max_age_s (E_ORACLE_STALE);
+ * - any other leg needs an oracle price no older than policy.oracle_max_age_s, and dated no more than
+ *   ORACLE_MAX_SKEW_MS ahead of now (E_ORACLE_STALE);
  * - the notional the contract values, up to legUsd × (1 + price_band_bps / 10⁴) at a limit price inside the band,
  *   must fit max_notional_usd, or the unpriced cap when a leg is unpriced (E_SIZE).
  */
@@ -306,9 +318,15 @@ export function deskVerdict(pair: Pair, ctx: Pick<PricingContext, 'strategy' | '
     const raw = ctx.oracle?.price(leg.venue as VenueId, leg.symbol) ?? null;
     const o = raw !== null && Number.isFinite(raw.px) && raw.px > 0 && Number.isFinite(raw.at) ? raw : null;
     const age = o === null ? null : Math.max(0, (ctx.now - o.at) / 1000);
-    if (age === null) {
+    if (o === null || age === null) {
       checks.push({ ok: false, text: `No oracle price for ${where}: the contract refuses its orders` });
       refuse('E_ORACLE_STALE', `no oracle price for ${where}`);
+    } else if (o.at > ctx.now + ORACLE_MAX_SKEW_MS) {
+      // A price dated ahead of now would count as 0 s old however old it really is: one clock is wrong, and which
+      // one cannot be told from here.
+      const ahead = Math.round((o.at - ctx.now) / 1000);
+      checks.push({ ok: false, text: `The oracle price for ${where} is dated ${ahead} s ahead of the engine's clock, past the ${ORACLE_MAX_SKEW_MS / 1000} s skew allowed: counted as stale` });
+      refuse('E_ORACLE_STALE', `oracle price for ${where} dated ${ahead} s ahead`);
     } else if (age > policy.oracle_max_age_s) {
       checks.push({ ok: false, text: `The oracle price for ${where} is ${Math.round(age)} s old, over the ${policy.oracle_max_age_s} s limit: the contract refuses its orders` });
       refuse('E_ORACLE_STALE', `oracle price for ${where} ${Math.round(age)} s old`);
@@ -335,13 +353,15 @@ function watchVerdict(pair: Pair): Verdict {
 
 /**
  * What it costs to rotate from the held window into another at the same leg size, USD: close the held legs that
- * change and open the new ones (taker fee and slippage of each of those fills), plus moving each leg's margin
- * (legUsd / maxLeverage) from a venue the desk leaves to one it enters, by the cheaper pairing. A leg that stays
- * (same venue, market and side) costs nothing.
+ * change and open the new ones (taker fee and slippage of each of those fills). A leg that stays (same venue, market
+ * and side) costs nothing.
+ *
+ * Margin moves are not in it. Each window's feesPct already counts moving its margin onto its venues and back
+ * (none where marginHeldAt says the desk's margin already sits), so a rotation judged on the next window's net APR
+ * plus this cost would pay for the same move twice. Moving margin from the venue the desk leaves rather than from
+ * the reserve costs about the same, and the held window's own trip back is saved.
  */
-export function switchCostUsd(
-  held: PricedWindow, next: PricedWindow, legUsd: number, maxLeverage: number, costs: CostParams,
-): number | null {
+export function switchCostUsd(held: PricedWindow, next: PricedWindow): number | null {
   if (held.fills === null || next.fills === null) return null;
   let total = 0;
   for (const side of ['long', 'short'] as const) {
@@ -349,16 +369,6 @@ export function switchCostUsd(
     const b = next.pair[side];
     if (a.venue === b.venue && a.symbol === b.symbol) continue;
     total += held.fills[side].closeUsd + next.fills[side].openUsd;
-  }
-  const before = [held.pair.long.venue, held.pair.short.venue] as VenueId[];
-  const after = [next.pair.long.venue, next.pair.short.venue] as VenueId[];
-  const freed = before.filter((v) => !after.includes(v));
-  const needed = after.filter((v) => !before.includes(v));
-  const margin = legUsd / maxLeverage;
-  const move = (from: VenueId, to: VenueId) => moveCostUsd(from, to, margin, costs.transfers);
-  if (needed.length === 1) total += move(freed[0]!, needed[0]!);
-  else if (needed.length === 2) {
-    total += Math.min(move(freed[0]!, needed[0]!) + move(freed[1]!, needed[1]!), move(freed[0]!, needed[1]!) + move(freed[1]!, needed[0]!));
   }
   return round(total, 4);
 }

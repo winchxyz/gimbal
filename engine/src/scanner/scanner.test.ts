@@ -181,6 +181,31 @@ test('one scan without a desk: desk windows by net, then watch-only by gross; CE
   assert.equal((await few.scan()).windows.length, 5 + 3);
 });
 
+test('watch-only windows: one with a quality finding ranks after a clean one that grosses less; the cut is by gross', async () => {
+  const hl = new FakeVenue('hyperliquid', [row('hyperliquid', 'SOL', { ratePerHour: 0.00005, volume24hUsd: 5e7 })]);
+  const watchers = [
+    // Pacifica pays the most, but traded 20k USD in 24 h.
+    watch('pacifica', 'dex', [row('pacifica', 'SOL', { ratePerHour: -0.0005, volume24hUsd: 20_000 })]),
+    watch('lighter', 'dex', [row('lighter', 'SOL', { ratePerHour: -0.0003, volume24hUsd: 2e6 })]),
+  ];
+  const { scanner: s } = scanner({ venues: [hl], watch: watchers }, new VirtualClock(T0));
+  const { windows } = await s.scan();
+  assert.deepEqual(windows.map((w) => [w.id, w.grossAprPct]), [
+    ['sol-lighter-hyperliquid', 306.6], ['sol-pacifica-hyperliquid', 481.8], ['sol-pacifica-lighter', 175.2],
+  ]);
+  assert.deepEqual(byId(windows, 'sol-pacifica-hyperliquid')!.checks.slice(0, 2).map((c) => c.text), [
+    'Watch-only: pacifica cannot be traded by the desk. Fees, slippage and the rescue reserve are not priced',
+    'Thin: pacifica SOL traded $20k in 24 h, under the $100k floor',
+  ]);
+  assert.ok(!byId(windows, 'sol-lighter-hyperliquid')!.checks.some((c) => c.text.startsWith('Thin:')));
+  // The cut takes the best two by gross, so the flagged 481.8 % window is still sent, after the clean one; the
+  // 175.2 % window is the one cut. A finding ranks a window, it never keeps it from the reader.
+  const { scanner: two } = scanner({ venues: [hl], watch: watchers }, new VirtualClock(T0), { maxWatchWindows: 2 });
+  assert.deepEqual((await two.scan()).windows.map((w) => w.id), ['sol-lighter-hyperliquid', 'sol-pacifica-hyperliquid']);
+  const { scanner: one } = scanner({ venues: [hl], watch: watchers }, new VirtualClock(T0), { maxWatchWindows: 1 });
+  assert.deepEqual((await one.scan()).windows.map((w) => w.id), ['sol-pacifica-hyperliquid']);
+});
+
 test('with a policy and fresh oracle prices: enterable windows first by net, ahead of a refused window that nets more', async () => {
   const { hl, phoenix, orderly, watchers } = venues();
   const { scanner: s } = scanner({ venues: [hl, phoenix, orderly], watch: watchers }, new VirtualClock(T0), { policy: POLICY }, { oracle: SOL_ORACLE });
