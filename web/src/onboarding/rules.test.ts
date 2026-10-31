@@ -53,7 +53,7 @@ test('the contract part says where each number came from: the owner’s words, o
   assert.equal(sourceLine(row('venues').source).ai, true);
   assert.equal(row('size').value, 'up to $1,500');
   assert.equal(sourceLine(row('size').source).text, 'From “Never more than $1,500 a side and never more than 3x”');
-  assert.equal(row('band').value, 'within 1% of the oracle, oracle under 60 s old');
+  assert.equal(row('band').value, 'within 1% of the oracle, oracle under 900 s old');
   assert.equal(row('unpriced').value, 'not allowed');
   assert.equal(row('out').value, 'only to demo-owner.near');
   assert.match(sourceLine(row('out').source).text, /always/);

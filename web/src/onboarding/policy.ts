@@ -13,6 +13,13 @@ export interface Problem {
   message: string;
 }
 
+/**
+ * The shortest oracle age that lets a priced order through: the contract dates a stored price at the oldest report
+ * behind it, up to the oracle's 10-minute window before the read, so under 900 s every priced order would be refused
+ * (`E_ORACLE_STALE`). The engine's policy drafts take the same floor.
+ */
+export const MIN_ORACLE_AGE_S = 900;
+
 // ---------- the policy a desk starts with ----------
 
 /**
@@ -26,7 +33,7 @@ export function starterPolicy(): ContractPolicy {
     orderly_symbols: [],
     max_notional_usd: 0,
     price_band_bps: 100,
-    oracle_max_age_s: 60,
+    oracle_max_age_s: MIN_ORACLE_AGE_S,
     rescue_cap_usd_per_hour: 0,
     max_transfer_cost_bps: 100,
     max_transfer_cost_flat_e6: 500_000,
@@ -90,7 +97,8 @@ export function policyProblems(p: ContractPolicy): Problem[] {
   });
 
   if (!safeInt(p.price_band_bps) || p.price_band_bps < 1 || p.price_band_bps > 10_000) add('band', 'The price band must be between 0.01% and 100% of the oracle price.');
-  if (!safeInt(p.oracle_max_age_s) || p.oracle_max_age_s < 1 || p.oracle_max_age_s > 3_600) add('age', 'The oracle price may be 1 to 3,600 seconds old.');
+  if (!safeInt(p.oracle_max_age_s) || p.oracle_max_age_s > 3_600) add('age', 'The oracle price may be at most 3,600 seconds old.');
+  else if (p.oracle_max_age_s < MIN_ORACLE_AGE_S) add('age', `Under ${MIN_ORACLE_AGE_S} seconds every priced order is refused: a stored oracle price is up to 10 minutes old already.`);
   if (!safeInt(p.max_transfer_cost_bps) || p.max_transfer_cost_bps > 10_000) add('transfer', 'A transfer may cost at most 100% of its amount.');
   for (const [field, value, label] of [
     ['size', p.max_notional_usd, 'The size per leg'],

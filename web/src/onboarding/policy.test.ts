@@ -48,12 +48,13 @@ test('lists are limited to 32, and a duplicate or a bad symbol is refused', () =
   assert.match(policyProblems(ph)[0]!.message, /32-byte address/);
 });
 
-test('numbers: band 1..10000 bps, oracle age 1..3600 s, integers within 2^53', () => {
+test('numbers: band 1..10000 bps, oracle age 900..3600 s, integers within 2^53', () => {
   const p = policy();
   for (const [key, value, field] of [
     ['price_band_bps', 0, 'band'],
     ['price_band_bps', 10_001, 'band'],
     ['oracle_max_age_s', 0, 'age'],
+    ['oracle_max_age_s', 899, 'age'],
     ['oracle_max_age_s', 3_601, 'age'],
     ['max_transfer_cost_bps', 10_001, 'transfer'],
     ['max_notional_usd', 1.5, 'size'],

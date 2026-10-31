@@ -110,7 +110,7 @@ test('the whole flow: connect, desk, engine key, setup, funds, rules, signature,
   await flow.pinReceiver();
   const pin = call(world, 'set_orderly_receiver');
   assert.deepEqual(pin.params.args, { desk_id: 'desk-07', receiver: FAKE_RECEIVER });
-  assert.equal(pin.params.deposit, '1');
+  assert.ok(BigInt(pin.params.deposit) > 1n, 'a storage deposit, not 1 yocto');
   assert.equal(pin.params.gas, OWNER_CALL_GAS);
   assert.equal(setupView(flow.state), 'done');
   assert.equal(stepNow(flow.state), 'funds');
@@ -287,7 +287,7 @@ test('a failed setup step is shown with the engine’s reason', async () => {
   assert.equal(stepNow(flow.state), 'setup');
 });
 
-test('mainnet: the IP list takes 1 to 10 addresses and is signed with 1 yocto', async () => {
+test('mainnet: the IP list takes 1 to 10 addresses and carries a storage deposit', async () => {
   const world = new FakeWorld({ network: 'mainnet', contractId: 'gimbal.near', usdcToken: 'usdc.mainnet' });
   const { flow } = start(world);
   await flow.connect();
@@ -303,7 +303,7 @@ test('mainnet: the IP list takes 1 to 10 addresses and is signed with 1 yocto', 
   await flow.setIps();
   const ips = call(world, 'set_orderly_ips');
   assert.deepEqual(ips.params.args, { desk_id: 'desk-07', ips: ['203.0.113.7', '198.51.100.20'] });
-  assert.equal(ips.params.deposit, '1');
+  assert.ok(BigInt(ips.params.deposit) > 1n, 'a storage deposit, not 1 yocto');
   // and on mainnet the IP step is not skipped
   await flow.addEngineKey();
   await flow.startSetup();

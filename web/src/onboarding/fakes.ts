@@ -180,12 +180,14 @@ export class FakeWorld {
       return null;
     }
     if (method === 'set_orderly_receiver') {
-      if (deposit !== '1') return 'E_DEPOSIT: attach exactly 1 yoctoNEAR';
+      if (BigInt(deposit) <= 1n) return 'E_DEPOSIT: attach NEAR for storage';
+      if (!/^0x[0-9a-f]{40}$/.test(String(args.receiver))) return 'E_ARGS: the receiver is not a lowercase 0x address';
+      if (desk.orderly_receiver !== null) return 'E_ARGS: the Orderly receiver is pinned already';
       desk.orderly_receiver = String(args.receiver);
       return null;
     }
     if (method === 'set_orderly_ips') {
-      if (deposit !== '1') return 'E_DEPOSIT: attach exactly 1 yoctoNEAR';
+      if (BigInt(deposit) <= 1n) return 'E_DEPOSIT: attach NEAR for storage';
       const ips = args.ips as string[];
       if (ips.length < 1 || ips.length > 10) return 'E_ARGS: 1 to 10 IPs';
       desk.ips = ips;
@@ -434,7 +436,7 @@ export function fakeDraft(text: string): PolicyDraft {
       orderly_symbols: hl.map((a) => `PERP_${a.symbol}_USDC`),
       max_notional_usd: size,
       price_band_bps: 100,
-      oracle_max_age_s: 60,
+      oracle_max_age_s: 900,
       rescue_cap_usd_per_hour: Math.round(size / 2),
       max_transfer_cost_bps: 100,
       max_transfer_cost_flat_e6: 500_000,
