@@ -199,6 +199,11 @@ export class OrderlyAccountStream {
     return this.#signatures;
   }
 
+  /** Why the current session ended, null while it lives (or before the first start): a caller decides to start again. */
+  get down(): Error | null {
+    return this.#session?.dead ?? null;
+  }
+
   /**
    * Opens and authenticates the session, then subscribes and starts the seed reads; resolves once Orderly accepts
    * the login. Idempotent while the session lives. Any failure before or after the login (signer, socket, refusal,

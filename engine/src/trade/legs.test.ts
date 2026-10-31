@@ -1,7 +1,8 @@
 // The two venue legs against fakes: Hyperliquid positions from clearinghouseState and IOC outcomes classified from
 // the relayer's answers and errors; Orderly orders confirmed by their executionreports (which may arrive before the
-// POST answer), positions from the signed read or, when the contract refuses the read, from a push after the order,
-// and an asserted start that a later push contradicts.
+// POST answer), positions from the signed read or, when the contract refuses the read, from a push after the order's
+// final report, and an asserted start that a later push contradicts. Both value the policy cap at max(limit, oracle)
+// as the contract does, and say until when an order with no answer can still execute.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -14,7 +15,8 @@ import { NothingExecuted } from '../relayer/tx.ts';
 import { OrderlyApiError } from '../venues/orderly-http.ts';
 import type { OrderlyPositionsSnapshot, OrderlyStreamPosition } from '../venues/orderly-stream.ts';
 import type { OrderlyRequest } from '../venues/orderly-signer.ts';
-import { HlLeg, OrderlyLeg, provesNothingRan } from './legs.ts';
+import type { Clock } from '../venues/venue.ts';
+import { HL_EXPIRY_MARGIN_MS, HlLeg, LegCheckError, ORDERLY_REPLAY_MS, OrderlyLeg, provesNothingRan, wasSigned } from './legs.ts';
 import { lotQty, toQty } from './lots.ts';
 
 const NEAR_TX: TxRef = { chain: 'near', id: 'NEARTX', url: 'https://testnet.nearblocks.io/txns/NEARTX' };
@@ -23,16 +25,17 @@ const q = (s: string) => toQty(s);
 function hlResult(totalSz: string | null): HlSubmitResult {
   return {
     kind: 'order', statuses: [], oid: 4242, filled: totalSz === null ? null : { totalSz, avgPx: '2500.5' }, resting: false, fills: [],
-    tx: [NEAR_TX], confirmed: true,
+    tx: [NEAR_TX], confirmed: true, expiresAfter: null,
   };
 }
 
-function hlLeg(answer: (order: HlOrder) => Promise<HlSubmitResult>, info: unknown = { assetPositions: [] }) {
+function hlLeg(answer: (order: HlOrder) => Promise<HlSubmitResult>, info: unknown = { assetPositions: [] }, extra: { oraclePx?: number; expiresAfterMs?: number; clock?: Clock } = {}) {
   const sent: HlOrder[] = [];
   const leg = new HlLeg({
     relayer: { hlOrder: async (order) => { sent.push(order); return answer(order); } },
-    info: async () => info, user: '0xABC', coin: 'ETH', asset: 4, szDecimals: 4, oraclePx: async () => null, bandBps: 500,
-    maxNotionalUsd: 50, maxSz: '0.02', bestPx: async (side) => (side === 'BUY' ? 2500 : 2499),
+    info: async () => info, user: '0xABC', coin: 'ETH', asset: 4, szDecimals: 4, oraclePx: async () => extra.oraclePx ?? null, bandBps: 2000,
+    maxNotionalUsd: 50, ...(extra.oraclePx === undefined ? { maxSz: '0.02' } : {}), bestPx: async (side) => (side === 'BUY' ? 2500 : 2499),
+    ...(extra.expiresAfterMs === undefined ? {} : { expiresAfterMs: extra.expiresAfterMs }), ...(extra.clock === undefined ? {} : { clock: extra.clock }),
   });
   return { leg, sent };
 }
@@ -104,6 +107,8 @@ function orderlyLeg(options: {
   reports?: (leg: OrderlyLeg) => void;
   read?: () => Promise<unknown>;
   assumedStart?: bigint;
+  oraclePx?: number;
+  clock?: { t: number; now(): number };
 } = {}) {
   const sent: Partial<OrderlyRequest>[] = [];
   const stream: FakeStream = { snap: null, positionsState: async () => { if (stream.snap === null) throw new Error('not known'); return stream.snap; } };
@@ -122,6 +127,9 @@ function orderlyLeg(options: {
     stream, symbol: 'PERP_ETH_USDC', lot: lotQty('0.0001'), baseMin: lotQty('0.0001'), quoteTick: 0.01, minNotional: 10, maxNotionalUsd: 50,
     maxSz: '0.02', bestPx: async (side) => (side === 'BUY' ? 2500.004 : 2499.996), reportTimeoutMs: 60, pushWaitMs: 40, settleMs: 5,
     log: (l) => lines.push(l), ...(options.assumedStart === undefined ? {} : { assumedStart: options.assumedStart }),
+    ...(options.oraclePx === undefined ? {} : { oraclePx: async () => options.oraclePx! }),
+    // A fake clock moves only when the leg sleeps.
+    ...(options.clock === undefined ? {} : { clock: options.clock, sleep: async (ms: number) => { options.clock!.t += ms; } }),
   });
   return { leg, sent, stream, lines };
 }
@@ -219,4 +227,66 @@ test('orderly: an asserted start is used only when nothing is known, and a push 
   wrong.stream.snap = snapshot([ROW(-0.015)], t2 + 1);
   await assert.rejects(wrong.leg.position(t2), /the asserted start 0 was wrong: the venue shows -0.015/);
   await assert.rejects(wrong.leg.position(), /was wrong/, 'and stays stopped');
+});
+
+test('hyperliquid: an order with no answer says until when it can still execute', async () => {
+  const clock = { t: 5_000_000, now() { return this.t; } };
+  // The /exchange answer was lost: the signed payload's expiresAfter is known.
+  const posted = await hlLeg(async () => { throw new OutcomeUnknown('hl order', 'no answer', { hlExpiresAfter: 5_060_000 }, [NEAR_TX]); }, undefined, { clock })
+    .leg.order('BUY', q('0.0045'), false, 'open');
+  assert.deepEqual([posted.kind, posted.kind === 'unknown' && posted.expiresAt, posted.ref.expiresAfter], ['unknown', 5_060_000 + HL_EXPIRY_MARGIN_MS, 5_060_000]);
+  // An MPC timeout returns no payload: the contract's window from now (the block that asked was not later).
+  const timedOut = await hlLeg(async () => { throw new MpcTimeoutError('hl_order', 'slow'); }, undefined, { clock, expiresAfterMs: 60_000 })
+    .leg.order('BUY', q('0.0045'), false, 'open');
+  assert.equal(timedOut.kind === 'unknown' && timedOut.expiresAt, 5_000_000 + 60_000 + HL_EXPIRY_MARGIN_MS);
+  // A contract without expiresAfter (C5): never known dead.
+  const c5 = await hlLeg(async () => { throw new MpcTimeoutError('hl_order', 'slow'); }, undefined, { clock }).leg.order('BUY', q('0.0045'), false, 'open');
+  assert.equal(c5.kind === 'unknown' && c5.expiresAt, null);
+  // An accepted order shows its expiresAfter.
+  const accepted = await hlLeg(async () => ({ ...hlResult('0.0045'), expiresAfter: 5_060_000 })).leg.order('BUY', q('0.0045'), false, 'open');
+  assert.equal(accepted.ref.expiresAfter, 5_060_000);
+});
+
+test('the policy cap is valued at max(limit, oracle), as the contract does; maxSize is the largest whole-lot order under it', async () => {
+  const hl = hlLeg(async () => hlResult('1'), undefined, { oraclePx: 3000 });
+  // 0.0175 at the 2512.5 limit is 43.97 USD, at the 3000 oracle 52.50: over the 50 USD cap.
+  const o = await hl.leg.order('BUY', q('0.0175'), false, 'open');
+  assert.ok(o.kind === 'failed' && o.error instanceof LegCheckError && /at 3000 is 52.50 USD/.test(o.error.message), o.kind === 'failed' ? o.error.message : o.kind);
+  assert.equal(hl.sent.length, 0);
+  assert.equal(await hl.leg.maxSize('BUY'), q('0.0166'));
+  assert.equal(await hlLeg(async () => hlResult('1')).leg.maxSize('SELL'), q('0.02'), 'unpriced: max_sz is the tighter cap');
+
+  const ol = orderlyLeg({ oraclePx: 3000 });
+  await assert.rejects(ol.leg.check(q('0.0175'), true), /at 3000 is 52.50 USD, over the policy's 50 USD/);
+  assert.equal(await ol.leg.maxSize('SELL'), q('0.0166'));
+  assert.equal(ol.sent.length, 0);
+});
+
+test('orderly: every order that was signed is reported so; an unknown one is live for the replay window', async () => {
+  const clock = { t: 9_000_000, now() { return this.t; } };
+  const lost = await orderlyLeg({ clock, answer: async () => { throw new OutcomeUnknown('orderly order', 'timeout', {}, [NEAR_TX]); } }).leg.order('SELL', q('0.005'), false, 'open');
+  assert.equal(lost.kind === 'unknown' && lost.expiresAt, 9_000_000 + ORDERLY_REPLAY_MS);
+  const refused = await orderlyLeg({ answer: async () => { throw new OrderlyApiError('order', 400, -1102, 'too small', '{}'); } }).leg.order('SELL', q('0.005'), false, 'open');
+  const cancelled = await orderlyLeg({ reports: (leg) => leg.onExecutionReport(report('CANCELLED')) }).leg.order('SELL', q('0.005'), false, 'open');
+  const checked = await orderlyLeg().leg.order('SELL', q('0.00455'), false, 'open');
+  assert.deepEqual([refused, cancelled, checked].map((o) => [o.kind, wasSigned(o)]), [['failed', true], ['failed', true], ['failed', false]]);
+  assert.equal(wasSigned({ kind: 'failed', error: new ContractRefusal('E_SIZE', 'x'), ref: checked.ref }), false);
+});
+
+test("orderly: with the read refused, only a push after the order's final report counts", async () => {
+  const clock = { t: 1_000, now() { return this.t; } };
+  const refused = new ContractRefusal('E_ARGS', 'kind "positions" is not an Orderly request kind');
+  const s = orderlyLeg({
+    clock, read: async () => { throw refused; },
+    reports: (leg) => {
+      clock.t = 1_100;                                // the final report comes 100 ms after the order went out
+      leg.onExecutionReport(report('FILLED', { executedQuantity: 0.005, totalExecutedQuantity: 0.005 }));
+    },
+  });
+  const out = await s.leg.order('SELL', q('0.005'), false, 'open');
+  assert.deepEqual([out.kind, out.ref.sentAt, out.ref.settledAt], ['filled', 1_000, 1_100]);
+  s.stream.snap = snapshot([ROW(0)], 1_050);          // newer than the order, older than its fill
+  await assert.rejects(s.leg.position(out.ref.sentAt), /no push came after the order/);
+  s.stream.snap = snapshot([ROW(-0.005)], clock.t + 1);
+  assert.equal(await s.leg.position(out.ref.sentAt), q('-0.005'));
 });

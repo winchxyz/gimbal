@@ -11,6 +11,11 @@
 //                                                            and an idle account leave the Orderly start unknown:
 //                                                            assert it (signed ETH; checked against later pushes)
 //                             [--close-only]                 skip the open: close what the desk holds
+//                             [--hl-expiry 60]               the contract stamps Hyperliquid orders with expiresAfter
+//                                                            = block time + this many seconds (C6 on): an order
+//                                                            with no answer is read back after it, then retried.
+//                                                            Unset (C5): such an order is never retried
+// ETH priced in the policy takes its oracle price from the contract's prices() (refresh a mock price first).
 // Reads the repo's .env (values are never printed); testnet only. One engine process at a time (nonces).
 
 import { parseArgs } from 'node:util';
@@ -40,10 +45,13 @@ const { values } = parseArgs({
     'replay-copy': { type: 'boolean', default: false },
     'orderly-start': { type: 'string' },
     'close-only': { type: 'boolean', default: false },
+    'hl-expiry': { type: 'string' },
   },
 });
 const log = (line: string) => logAs(TAG, line);
 const HL_COIN = 'ETH';
+/** Stops reopening the Orderly session; finish() calls it before it closes the session. */
+let stopKeepUp = (): void => {};
 const ORDERLY_SYMBOL = 'PERP_ETH_USDC';
 
 try {
@@ -84,18 +92,29 @@ async function run(): Promise<void> {
   // ---- Hyperliquid leg ----
   const asset = desk.policy.hl_assets.find((a) => a.symbol === HL_COIN);
   if (asset === undefined) throw new Error(`${HL_COIN} is not in the desk's policy.hl_assets`);
+  // Priced: the contract checks the band and values the cap at max(limit, its stored price); unpriced: max_sz instead.
   const unpriced = desk.policy.unpriced.find((u) => u.symbol === HL_COIN);
-  if (unpriced === undefined) throw new Error(`${HL_COIN} is priced in this policy: this check only runs unpriced (no oracle band to keep fresh)`);
+  const oraclePx = unpriced !== undefined ? async () => null : async (): Promise<number> => {
+    const row = (await client.prices()).find((p) => p.asset === HL_COIN);
+    if (row === undefined) throw new Error(`the contract has no stored ${HL_COIN} price (set_mock_price or refresh_prices first)`);
+    const ageS = (Date.now() - row.at_ms) / 1000;
+    if (ageS > desk.policy.oracle_max_age_s) throw new Error(`the contract's ${HL_COIN} price is ${Math.round(ageS)} s old, over oracle_max_age_s ${desk.policy.oracle_max_age_s}: refresh it first`);
+    return Number(row.price_e8) / 1e8;
+  };
+  if (unpriced === undefined) log(`${HL_COIN} is priced: oracle ${await oraclePx()} USD from the contract's prices()`);
+  const hlExpiryMs = values['hl-expiry'] === undefined ? undefined : Number(values['hl-expiry']) * 1000;
+  if (hlExpiryMs !== undefined && !(hlExpiryMs > 0)) throw new Error('--hl-expiry must be a positive number of seconds');
   const hlReader = new HyperliquidReader({ network: 'testnet', url: `${live.hlUrl}/info` });
   const info = async (body: Record<string, unknown>): Promise<unknown> => {
     const res = await fetch(`${live.hlUrl}/info`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) });
     if (!res.ok) throw new Error(`hyperliquid /info ${String(body.type)}: HTTP ${res.status}`);
     return res.json();
   };
-  const maxNotionalUsd = Math.min(desk.policy.max_notional_usd, desk.policy.unpriced_max_notional_usd);
+  const maxNotionalUsd = unpriced === undefined ? desk.policy.max_notional_usd : Math.min(desk.policy.max_notional_usd, desk.policy.unpriced_max_notional_usd);
+  const maxSz = unpriced === undefined ? {} : { maxSz: unpriced.max_sz };
   const hl = new HlLeg({
-    relayer, info, user, coin: HL_COIN, asset: asset.index, szDecimals: asset.sz_decimals, oraclePx: async () => null,
-    bandBps: desk.policy.price_band_bps, maxNotionalUsd, maxSz: unpriced.max_sz,
+    relayer, info, user, coin: HL_COIN, asset: asset.index, szDecimals: asset.sz_decimals, oraclePx,
+    bandBps: desk.policy.price_band_bps, maxNotionalUsd, ...maxSz, ...(hlExpiryMs === undefined ? {} : { expiresAfterMs: hlExpiryMs }),
     bestPx: async (side) => {
       const book = await hlReader.book(HL_COIN, 5);
       const px = side === 'BUY' ? book.asks[0]?.px : book.bids[0]?.px;
@@ -120,13 +139,14 @@ async function run(): Promise<void> {
     onPositions: (positions, from) => {
       const qty = positions.filter((p) => p.symbol === ORDERLY_SYMBOL).reduce((s, p) => s + toQty(p.positionQty), 0n);
       log(`orderly positions (${from}): ${ORDERLY_SYMBOL} ${signedQtyString(qty)}`);
-      if (trader !== null && orderly !== null && from === 'push') void trader.positionPushed(orderly, qty);
+      // A session's seed read counts too: a copy that landed while the session was down shows up there first.
+      if (trader !== null && orderly !== null) void trader.positionPushed(orderly, qty);
     },
   });
   orderly = new OrderlyLeg({
     relayer, readPositions: () => live.orderly.positions('pair-live: reconcile'), stream, symbol: ORDERLY_SYMBOL,
     lot: lotQty(String(market.data.base_tick)), baseMin: lotQty(String(market.data.base_min)), quoteTick: market.data.quote_tick,
-    minNotional: market.data.min_notional, maxNotionalUsd, maxSz: unpriced.max_sz,
+    minNotional: market.data.min_notional, maxNotionalUsd, oraclePx, ...maxSz,
     bestPx: async (side) => {
       const book = await orderlyReader.book(ORDERLY_SYMBOL, 5);
       const px = side === 'BUY' ? book.asks[0]?.px : book.bids[0]?.px;
@@ -150,6 +170,18 @@ async function run(): Promise<void> {
     values.fail === 'orderly' ? failing(orderly) : orderly,
   ];
   trader = new PairTrader({ legs, log });
+  // A session that dies while Orderly orders can still be replayed is opened again (one more signature); its seed
+  // read goes through positionPushed like a push, so a copy that landed while it was down is still checked.
+  const watchedTrader = trader;
+  const orderlyLeg = orderly;
+  const keepUp = setInterval(() => {
+    const down = stream.down;
+    if (down === null || !watchedTrader.watching(orderlyLeg)) return;
+    log(`orderly session down (${down.message}) inside the replay window: opening it again`);
+    stream.start().catch((err: Error) => log(`orderly session: ${err.message}`));
+  }, 5_000);
+  keepUp.unref();
+  stopKeepUp = () => clearInterval(keepUp);
   const longIndex = values.long === 'hyperliquid' ? 0 : 1;
 
   if (values['close-only']) {
@@ -170,13 +202,20 @@ async function run(): Promise<void> {
     } catch (err) {
       log(`replay: Orderly refused the copy: ${(err as Error).message}`);
     }
-    // The copy's position push starts the reconcile (positionPushed); its close is one more signature (up to 120 s).
+    // The copy's position push starts the check (positionPushed): a REST positions read, then the excess close (one
+    // more signature, up to 120 s).
     for (let i = 0; i < 180; i++) {
       await sleep(1000);
       if (trader.lastWatch !== null) break;
     }
-    if (trader.lastWatch === null) log('replay: no reconcile ran (no push over the target arrived)');
-    else log(`replay: reconcile ${trader.lastWatch.start} -> ${trader.lastWatch.final ?? 'unknown'} with ${trader.lastWatch.orders.map((o) => `${o.ref.side} ${o.ref.size} ${o.outcome} (${o.ref.orderId})`).join(', ')}`);
+    const watch = trader.lastWatch;
+    if (watch === null) log('replay: no reconcile ran (no push over the target arrived)');
+    else {
+      log(`replay: watch ${watch.status}${watch.notes.length === 0 ? '' : ` (${watch.notes.join('; ')})`}`);
+      for (const leg of watch.legs) {
+        log(`  ${leg.venue} ${leg.start} -> ${leg.final ?? 'unknown'} (intent ${leg.target}) with ${leg.orders.map((o) => `${o.purpose} ${o.ref.side} ${o.ref.size} ${o.outcome} (${o.ref.orderId})`).join(', ')}`);
+      }
+    }
   }
 
   if (opened.status === 'open') {
@@ -198,6 +237,7 @@ async function finish(hl: HlLeg, stream: OrderlyAccountStream): Promise<void> {
       .catch((err: Error) => `unknown (${err.message})`),
   ]);
   log(`final positions: Hyperliquid ${HL_COIN} ${signedQtyString(hlFinal)}; Orderly ${ORDERLY_SYMBOL} ${orderlyFinal}`);
+  stopKeepUp();
   stream.close();
   if (hlFinal !== 0n || !orderlyFinal.startsWith('0 ')) process.exitCode = 1;
 }
@@ -207,6 +247,7 @@ function failing(leg: TradeLeg): TradeLeg {
   return {
     venue: leg.venue, symbol: leg.symbol, lot: leg.lot, replayable: leg.replayable,
     check: (size, reduceOnly) => leg.check(size, reduceOnly),
+    maxSize: (side, reduceOnly) => leg.maxSize(side, reduceOnly),
     position: (after) => leg.position(after),
     order: async (side: LegSide, size: bigint, reduceOnly: boolean, reason: string): Promise<LegOutcome> => {
       if (reduceOnly) return leg.order(side, size, reduceOnly, reason);
@@ -224,7 +265,8 @@ function print(what: string, r: PairResult): void {
     log(`  ${leg.venue} ${leg.symbol}: ${leg.start} -> target ${leg.target}, final ${leg.final ?? 'unknown'}`);
     for (const o of leg.orders) {
       log(`    ${o.purpose} ${o.ref.side} ${o.ref.size}${o.ref.reduceOnly ? ' reduce-only' : ''}: ${o.outcome}${o.filled === null ? '' : ` ${o.filled} at ${o.avgPx}`}`
-        + ` order ${o.ref.orderId ?? '-'} client ${o.ref.clientId ?? '-'}${o.error === null ? '' : ` (${o.error})`}${o.ref.tx.length === 0 ? '' : ` ${refs(o.ref.tx)}`}`);
+        + ` order ${o.ref.orderId ?? '-'} client ${o.ref.clientId ?? '-'}${o.ref.expiresAfter === undefined ? '' : ` expiresAfter ${o.ref.expiresAfter} (${new Date(o.ref.expiresAfter).toISOString()})`}`
+        + `${o.error === null ? '' : ` (${o.error})`}${o.ref.tx.length === 0 ? '' : ` ${refs(o.ref.tx)}`}`);
     }
   }
 }
