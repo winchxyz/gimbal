@@ -1,12 +1,13 @@
 import { useEffect } from 'react';
 import { DeskScreen } from '../desk/DeskScreen.tsx';
 import { JournalScreen } from '../journal/JournalScreen.tsx';
+import { OnboardingScreen } from '../onboarding/OnboardingScreen.tsx';
 import { Placeholder } from '../screens/Placeholder.tsx';
 import { NoticeBar } from '../ui/NoticeBar.tsx';
 import { WindowsScreen } from '../windows/WindowsScreen.tsx';
 import { ConnectionBar } from './ConnectionBar.tsx';
 import { Header } from './Header.tsx';
-import { SCREENS, useScreen } from './routes.ts';
+import { SCREENS, useOnboardingRoute, useScreen } from './routes.ts';
 import { StatusLine } from './StatusLine.tsx';
 import { TabBar } from './TabBar.tsx';
 
@@ -15,12 +16,22 @@ const WITH_STATUS = new Set(['desk', 'rescue']);
 
 export function Shell() {
   const screen = useScreen();
-  const label = SCREENS.find((s) => s.id === screen)?.label ?? '';
+  const onboarding = useOnboardingRoute();
+  const label = onboarding ? 'Set up' : (SCREENS.find((s) => s.id === screen)?.label ?? '');
 
   useEffect(() => {
     document.title = `Gimbal · ${label}`;
     window.scrollTo(0, 0);
   }, [label]);
+
+  // Onboarding brings its own header and has no tab bar (design/screens/desktop/onboarding.html).
+  if (onboarding) {
+    return (
+      <div className="app ob-app">
+        <OnboardingScreen />
+      </div>
+    );
+  }
 
   return (
     <div className="app">

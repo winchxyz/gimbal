@@ -20,6 +20,23 @@ export function screenFromHash(hash: string): ScreenId {
   return SCREENS.find((s) => s.id === id)?.id ?? 'desk';
 }
 
+/** Onboarding is not one of the five sections: it has its own header and no tabs, and the sections never link to it. */
+export const ONBOARDING_HREF = '#/onboarding';
+
+export function isOnboardingHash(hash: string): boolean {
+  return /^#\/?onboarding(?:[/?]|$)/.test(hash);
+}
+
+export function useOnboardingRoute(): boolean {
+  const [on, setOn] = useState<boolean>(() => isOnboardingHash(window.location.hash));
+  useEffect(() => {
+    const onChange = () => setOn(isOnboardingHash(window.location.hash));
+    window.addEventListener('hashchange', onChange);
+    return () => window.removeEventListener('hashchange', onChange);
+  }, []);
+  return on;
+}
+
 export function useScreen(): ScreenId {
   const [screen, setScreen] = useState<ScreenId>(() => screenFromHash(window.location.hash));
   useEffect(() => {

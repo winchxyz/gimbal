@@ -23,7 +23,7 @@ function seeded(text: string): () => number {
 }
 
 /** The repo's own testnet contract: the one real account the fakes name, so the explorer link opens on its page. */
-export const TESTNET_CONTRACT = 'gimbal-fcf135.testnet';
+export const TESTNET_CONTRACT = 'gimbal-c6-fcf135.testnet';
 /** A label that is not a NEAR account id (capitals and spaces), so the dashboard builds no explorer link for it. */
 export const FAKE_CONTRACT = 'Demo contract (fake)';
 /** The fake desk's owner, as a label for the same reason: nothing here may be somebody else's account. */

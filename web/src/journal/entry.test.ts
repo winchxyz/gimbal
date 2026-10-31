@@ -68,7 +68,7 @@ test('a link is built from the transaction’s own url; the chain only picks the
 });
 
 // The repo's own testnet contract: the tests build addresses from it and never name an account that is not ours.
-const CONTRACT = 'gimbal-fcf135.testnet';
+const CONTRACT = 'gimbal-c6-fcf135.testnet';
 
 test('the contract’s page opens on the explorer of its network, and a replay plays mainnet', () => {
   assert.equal(contractUrl(CONTRACT, 'testnet'), `https://testnet.nearblocks.io/address/${CONTRACT}`);
