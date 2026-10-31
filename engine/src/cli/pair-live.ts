@@ -246,7 +246,8 @@ async function finish(hl: HlLeg, stream: OrderlyAccountStream, trader: PairTrade
   for (const leg of trader.legs) {
     const u = trader.unsettled(leg);
     if (u === null) continue;
-    alert(`${leg.venue} ${u.ref.side} ${u.ref.size} (${u.ref.clientId ?? u.ref.orderId ?? 'no id'}) has no answer and may still run until ${new Date(u.until).toISOString()}; its watch ends with this process: check ${leg.venue} ${leg.symbol} by hand until then`);
+    const orders = u.refs.map((ref) => `${ref.side} ${ref.size}${ref.reduceOnly ? ' reduce-only' : ''} (${ref.clientId ?? ref.orderId ?? 'no id'})`).join(' and ');
+    alert(`${leg.venue} ${orders}: no answer, may still run until ${new Date(u.until).toISOString()}; the watch ends with this process: check ${leg.venue} ${leg.symbol} by hand until then`);
   }
   if (hlFinal !== 0n || !orderlyFinal.startsWith('0 ')) process.exitCode = 1;
 }
