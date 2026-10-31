@@ -148,6 +148,44 @@ fn assert_signs_l1(got: &UnsignedAction, kind: &str, name: &str) {
     );
 }
 
+/// The L1 vector `name` on testnet as an order or cancel the contract builds at `block_ms`: the
+/// vector's body plus `expiresAfter` = block time + 60 s after `vaultAddress`, and the digest of
+/// that action with that expiry (the core pins the encoding against the venue SDK's layout,
+/// `expires_after_enters_the_l1_hash_as_the_sdk_writes_it`), never the vector's own digest.
+fn assert_signs_l1_expiring(got: &UnsignedAction, kind: &str, name: &str, block_ms: u64) {
+    let c = case("l1", name);
+    let expires = block_ms + gimbal_core::hl::EXPIRES_AFTER_MS;
+    let mut body = c["testnet"]["exchange_body"].clone();
+    body.as_object_mut().unwrap().remove("signature");
+    body["expiresAfter"] = json!(expires);
+    assert_eq!(
+        (got.desk_id.as_str(), got.venue.as_str(), got.kind.as_str()),
+        ("alpha", "hyperliquid", kind)
+    );
+    assert_eq!(serde_json::to_value(&got.payload).unwrap(), body);
+    let gimbal_core::msgpack::Value::Map(entries) = &got.payload else {
+        panic!("the payload is a map")
+    };
+    assert_eq!(
+        entries.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        ["action", "nonce", "vaultAddress", "expiresAfter"]
+    );
+    let want = gimbal_core::hl::prepare_l1(
+        crate::hl::keccak,
+        Network::Testnet,
+        "x",
+        got.payload.get("action").unwrap().clone(),
+        c["nonce"].as_u64().unwrap(),
+        Some(expires),
+    );
+    assert_eq!(
+        got.sign_request,
+        crate::mpc::SignRequest::evm("alpha", &want.digest)
+    );
+    let vector_digest = c["testnet"]["digest"].as_str().unwrap();
+    assert_ne!(format!("0x{}", hex::encode(want.digest)), vector_digest);
+}
+
 /// The user-signed vector `name`.
 fn assert_signs_user(got: &UnsignedAction, kind: &str, name: &str) {
     let c = case("user_signed", name);
@@ -187,7 +225,8 @@ fn hl_order_signs_the_vector_bytes() {
         at(operator(), c["nonce"].as_u64().unwrap(), yocto(0));
         let reason = format!("vector {}", c["name"]);
         let got = g.prepare_hl_order("alpha".into(), order, reason.clone());
-        assert_signs_l1(&got, "order", c["name"].as_str().unwrap());
+        let nonce = c["nonce"].as_u64().unwrap();
+        assert_signs_l1_expiring(&got, "order", c["name"].as_str().unwrap(), nonce);
         assert_eq!(got.reason_sha256, Some(sha256_hex(&reason)));
         signed += 1;
     }
@@ -437,7 +476,8 @@ fn hl_cancel_signs_the_vector_bytes() {
             p["oid"].as_u64().unwrap(),
             "stale order".into(),
         );
-        assert_signs_l1(&got, "cancel", c["name"].as_str().unwrap());
+        let nonce = c["nonce"].as_u64().unwrap();
+        assert_signs_l1_expiring(&got, "cancel", c["name"].as_str().unwrap(), nonce);
         assert_eq!(got.reason_sha256, Some(sha256_hex("stale order")));
         signed += 1;
     }
@@ -458,6 +498,7 @@ fn hl_cancel_passes_a_paused_desk_and_takes_the_next_nonce() {
                 "action": { "type": "cancel", "cancels": [{ "a": 1, "o": 77 }] },
                 "nonce": n,
                 "vaultAddress": null,
+                "expiresAfter": T + 60_000,
             })
         );
     }

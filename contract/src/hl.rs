@@ -9,7 +9,7 @@
 
 use gimbal_core::hl::{
     cancel_action, check_order, check_usdc_amount, max_fee_rate, order_action, prepare_l1,
-    referral_code, set_referrer_action, Address, HlOrder, UserAction,
+    referral_code, set_referrer_action, Address, HlOrder, UserAction, EXPIRES_AFTER_MS,
 };
 use gimbal_core::ids::check_reason;
 use gimbal_core::limits::Valued;
@@ -129,8 +129,16 @@ impl Gimbal {
             &builder,
             self.config.fees.hl_builder_tenth_bps,
         );
-        let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
-        let prepared = prepare_l1(keccak, self.config.network, "order", action, nonce);
+        let block_ms = env::block_timestamp_ms();
+        let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, block_ms);
+        let prepared = prepare_l1(
+            keccak,
+            self.config.network,
+            "order",
+            action,
+            nonce,
+            Some(block_ms + EXPIRES_AFTER_MS),
+        );
         UnsignedAction::hyperliquid(desk_id, prepared, Some(&reason)).with_orders(vec![detail])
     }
 
@@ -144,9 +152,17 @@ impl Gimbal {
     ) -> UnsignedAction {
         action_desk(&self.desks, &desk_id, Gate::ReducesRisk);
         check_reason(&reason).or_fail();
-        let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
+        let block_ms = env::block_timestamp_ms();
+        let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, block_ms);
         let action = cancel_action(asset, oid);
-        let prepared = prepare_l1(keccak, self.config.network, "cancel", action, nonce);
+        let prepared = prepare_l1(
+            keccak,
+            self.config.network,
+            "cancel",
+            action,
+            nonce,
+            Some(block_ms + EXPIRES_AFTER_MS),
+        );
         UnsignedAction::hyperliquid(desk_id, prepared, Some(&reason))
     }
 
@@ -157,7 +173,16 @@ impl Gimbal {
             referral_code(self.config.treasury.referral_codes.hyperliquid.as_deref()).or_fail();
         let action = set_referrer_action(code);
         let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
-        let prepared = prepare_l1(keccak, self.config.network, "setReferrer", action, nonce);
+        // Hyperliquid does not list expiresAfter for setReferrer; a late copy only sets the same
+        // configured code, which Hyperliquid refuses a second time.
+        let prepared = prepare_l1(
+            keccak,
+            self.config.network,
+            "setReferrer",
+            action,
+            nonce,
+            None,
+        );
         UnsignedAction::hyperliquid(desk_id, prepared, None)
     }
 
