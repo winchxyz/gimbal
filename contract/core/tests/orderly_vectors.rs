@@ -451,6 +451,43 @@ fn every_request() {
     assert_eq!(kinds.into_iter().collect::<Vec<_>>(), all);
 }
 
+/// The pinned `client_order_id` rule the engine matches: every example and every order vector's
+/// body carries `g<request_id>`.
+#[test]
+fn the_client_order_id_rule_is_pinned() {
+    let v = vectors();
+    let rule = &v["request_rules"]["client_order_id"];
+    assert_eq!(rule["format"], "g<request_id>");
+    let examples = rule["examples"].as_array().unwrap();
+    assert!(examples.len() >= 3);
+    for e in examples {
+        let id = e["request_id"].as_u64().unwrap();
+        assert_eq!(client_order_id(id), e["client_order_id"].as_str().unwrap());
+    }
+    let orders: Vec<_> = v["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["kind"] == "order")
+        .collect();
+    assert_eq!(orders.len(), 4);
+    for r in orders {
+        let body: Value = serde_json::from_str(r["body"].as_str().unwrap()).unwrap();
+        let id = r["request_id"].as_u64().unwrap();
+        assert_eq!(
+            body["client_order_id"],
+            client_order_id(id),
+            "{}",
+            r["name"]
+        );
+        assert!(
+            r["request"].get("client_order_id").is_none(),
+            "{}",
+            r["name"]
+        );
+    }
+}
+
 #[test]
 fn ws_auth_signs_the_timestamp_alone() {
     let v = vectors();

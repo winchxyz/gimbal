@@ -640,7 +640,30 @@
     "message": "timestamp (ms, decimal) + METHOD + path including the query string + body (\"\" for GET and DELETE)",
     "signature": "Ed25519 over the UTF-8 bytes of the message; header orderly-signature = base64url without padding",
     "body": "contract-built JSON, no spaces; order keys: symbol, client_order_id (always the contract's g<request_id>, never the caller's), order_type, order_price (not for MARKET), order_quantity, side, reduce_only (only when true); prices and quantities are the canonical decimal digits written as bare JSON numbers",
-    "validity": "Orderly accepts a request for 300 s after its timestamp"
+    "validity": "Orderly accepts a request for 300 s after its timestamp",
+    "client_order_id": {
+      "format": "g<request_id>",
+      "rule": "the letter g, then the request_id of the signature request in decimal without padding (the request_id the signed event carries); set by the contract on every order, never taken from the caller (a caller's client_order_id is E_ARGS); at most 21 characters, inside Orderly's 36",
+      "examples": [
+        {
+          "request_id": 0,
+          "client_order_id": "g0"
+        },
+        {
+          "request_id": 7,
+          "client_order_id": "g7"
+        },
+        {
+          "request_id": 42,
+          "client_order_id": "g42"
+        },
+        {
+          "request_id": 1000000,
+          "client_order_id": "g1000000"
+        }
+      ],
+      "replay": "Orderly refuses a copy of a signed order only while the first order is open (HTTP 409, -1007 \"The client_order_id is repeated.\"); a copy is accepted once the first order filled or was cancelled (testnet, PR 30 round 2)"
+    }
   },
   "requests": [
     {
