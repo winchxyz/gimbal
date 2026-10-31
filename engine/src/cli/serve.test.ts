@@ -68,3 +68,46 @@ test('it listens on 127.0.0.1 by default and on GIMBAL_HOST when set', async () 
   const blank = await run(['--port', '0'], empty, /engine replay on http:\/\/\S+:\d+/);
   assert.match(blank.out, /engine replay on http:\/\/127\.0\.0\.1:\d+: /);
 });
+
+test('replay prices desk legs from the recording on the replay clock: priced legs are not refused E_ORACLE_STALE', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gimbal-serve-'));
+  const policyPath = join(dir, 'policy.json');
+  writeFileSync(policyPath, JSON.stringify({
+    ...GOOD, hl_assets: [{ index: 0, symbol: 'BTC', sz_decimals: 5 }, { index: 1, symbol: 'ETH', sz_decimals: 4 }, { index: 5, symbol: 'SOL', sz_decimals: 2 }],
+    orderly_symbols: ['PERP_BTC_USDC', 'PERP_ETH_USDC', 'PERP_SOL_USDC'], oracle_max_age_s: 300,
+  }));
+  const child = spawn(process.execPath, [SERVE, '--port', '0', '--policy', policyPath], { env: { ...process.env, GIMBAL_MODE: 'replay' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    let out = '';
+    const port = await new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`serve did not start: ${out}`)), 20_000);
+      const seen = (chunk: Buffer) => {
+        out += chunk.toString('utf8');
+        const m = /engine replay on http:\/\/127\.0\.0\.1:(\d+)/.exec(out);
+        if (m !== null) {
+          clearTimeout(timer);
+          resolve(Number(m[1]));
+        }
+      };
+      child.stdout.on('data', seen);
+      child.stderr.on('data', seen);
+      child.on('exit', () => reject(new Error(`serve exited: ${out}`)));
+    });
+    type W = { symbol: string; longVenue: string; shortVenue: string; refused?: { code: string }; checks: { ok: boolean; text: string }[] };
+    const hlOrderly = (w: W) => ['BTC', 'ETH', 'SOL'].includes(w.symbol) && [w.longVenue, w.shortVenue].sort().join() === 'hyperliquid,orderly';
+    let priced: W[] = [];
+    for (let i = 0; i < 150 && priced.length === 0; i++) {
+      const state = (await (await fetch(`http://127.0.0.1:${port}/state`)).json()) as { windows: W[] | null };
+      priced = (state.windows ?? []).filter(hlOrderly);
+      if (priced.length === 0) await new Promise((r) => setTimeout(r, 100));
+    }
+    assert.ok(priced.length > 0, 'no Hyperliquid-Orderly window on BTC, ETH or SOL');
+    for (const w of priced) {
+      assert.notEqual(w.refused?.code, 'E_ORACLE_STALE', JSON.stringify(w.refused));
+      assert.ok(w.checks.some((c) => c.ok && /The oracle price for .* within the 300 s limit/.test(c.text)), JSON.stringify(w.checks));
+    }
+  } finally {
+    child.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

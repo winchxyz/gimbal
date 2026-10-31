@@ -17,8 +17,9 @@
 // The contract (testnet and mainnet, src/cli/serve-contract.ts): with GIMBAL_CONTRACT_ID and DESK_ID set (and
 // OWNER_ACCOUNT_ID or OPERATOR_ACCOUNT_ID, OPERATOR_PRIVATE_KEY, optional NEAR_NETWORK / NEAR_RPC_URL), the policy
 // is get_desk's, the oracle is the contract's stored prices, and a `health` event carries NEAR's state. Views
-// only: serve signs nothing. Without it no oracle prices are read, so every priced desk leg is refused
-// E_ORACLE_STALE, as the contract would refuse it, and the venue reads are public: no keys.
+// only: serve signs nothing. Without it the live modes read no oracle prices, so every priced desk leg is refused
+// E_ORACLE_STALE, as the contract would refuse it, and the venue reads are public: no keys. Replay stands in the
+// contract's Mock prices: the recording's Hyperliquid oracle prices, dated by the replay clock the scanner runs on.
 
 import { readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -26,6 +27,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import type { ContractPolicy, HealthMap, Mode } from '@gimbal/shared';
 import type { NearHealth } from '../contract/budget.ts';
+import { ReplayOracle } from '../contract/replay-oracle.ts';
 import { liveReaders, replayReaders } from '../readers.ts';
 import type { Readers } from '../readers.ts';
 import { DEFAULT_SCANNER_CONFIG, DEFAULT_STRATEGY } from '../scanner/config.ts';
@@ -103,6 +105,7 @@ let clock: Clock;
 let readers: Readers;
 let writer: JsonlGzWriter | null = null;
 let replayEnd: number | null = null;
+let replayOracle: ReplayOracle | null = null;
 
 if (mode === 'replay') {
   const file = values.replay ?? envVar('GIMBAL_REPLAY_FILE') ?? newestRecording();
@@ -117,6 +120,10 @@ if (mode === 'replay') {
   // The recording ends: time stops there, so the windows keep their last real numbers and timestamps.
   clock = { now: () => Math.min(scaled.now(), end) };
   readers = replayReaders(lines, clock);
+  // The contract's Mock prices in replay: the recording's Hyperliquid oracle prices, dated by the replay clock.
+  replayOracle = new ReplayOracle(clock);
+  const tapped = replayOracle;
+  readers = { ...readers, venues: readers.venues.map((v) => tapped.tap(v)) };
   log(`replay ${file}: ${lines.length} answers from ${readers.venues.map((v) => v.id).join(', ')}, ${new Date(start).toISOString()} to ${new Date(end).toISOString()}, x${speed}`);
 } else {
   clock = { now: () => Date.now() };
@@ -137,7 +144,7 @@ let server: EngineServer | null = null;
 const scanner = new Scanner(readers.venues, readers.watch, {
   config: { ...DEFAULT_SCANNER_CONFIG, policy },
   clock,
-  oracle: contract?.prices ?? null,
+  oracle: contract?.prices ?? replayOracle,
   marginHeldAt: () => marginVenues(server?.state().desk ?? null),
   strategy: () => server?.strategy ?? DEFAULT_STRATEGY,
   onNote: (note) => noteOnce(note),
