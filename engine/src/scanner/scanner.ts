@@ -13,7 +13,8 @@
 // 5. each window priced (price.ts); the 7-day gross and intervalsAbove from the hourly rate store, which a few
 //    public history reads per scan fill in the background (a scan never waits on them);
 // 6. ranked: enterable windows by net APR, then the other desk windows by net APR, then watch-only windows by gross
-//    APR (their net is not complete): first those whose legs pass every quality check (quality.ts), then the rest.
+//    APR (their net is not complete), the best maxWatchWindows of them: within those, first the windows whose legs
+//    pass every quality check (quality.ts), then the rest.
 
 import type { ScanStatus, ScanVenueId, StrategyConfig, VenueId, Window as FundingWindow, WindowHistory } from '@gimbal/shared';
 import type { Book, Clock, MarketFunding, MarketHistorySource, VenueReader, WatchReader } from '../venues/venue.ts';
@@ -305,11 +306,12 @@ export class Scanner {
     const byNet = (a: PricedWindow, b: PricedWindow) => b.window.netAprPct - a.window.netAprPct || byId(a, b);
     const enterable = priced.filter((pw) => isEnterable(pw.window)).sort(byNet);
     const deskOther = priced.filter((pw) => pw.pair.desk && !isEnterable(pw.window)).sort(byNet);
-    // A watch window with a quality finding (a thin leg, a capped or unconfirmed rate, a closed market) never leads
-    // a clean one, however large its gross.
-    const watch = priced.filter((pw) => !pw.pair.desk)
-      .sort((a, b) => Number(a.flagged) - Number(b.flagged) || b.window.grossAprPct - a.window.grossAprPct || byId(a, b))
-      .slice(0, config.maxWatchWindows);
+    // The watch windows sent are the maxWatchWindows best by gross, whatever their checks say: a finding ranks a
+    // window, it never keeps it from the reader. Inside that cut a window with a quality finding (a thin leg, a capped
+    // or unconfirmed rate, a closed market) never leads a clean one, however large its gross.
+    const byGross = (a: PricedWindow, b: PricedWindow) => b.window.grossAprPct - a.window.grossAprPct || byId(a, b);
+    const watch = priced.filter((pw) => !pw.pair.desk).sort(byGross).slice(0, config.maxWatchWindows)
+      .sort((a, b) => Number(a.flagged) - Number(b.flagged) || byGross(a, b));
     const ranked = [...enterable, ...deskOther, ...watch];
     this.#priced = new Map(ranked.map((pw) => [pw.pair.id, pw]));
 

@@ -175,12 +175,12 @@ test('market closed: a hl-xyz market (traditional assets only) over the futures 
 
 const SWEEP = readWireRecording(fileURLToPath(new URL('../../fixtures/watch-wire/watch-mainnet-2026-10-31.jsonl.gz', import.meta.url)));
 
-async function sweepScan(now?: number): Promise<FundingWindow[]> {
+async function sweepScan(now?: number, maxWatchWindows = 10_000): Promise<FundingWindow[]> {
   const clock = new VirtualClock(SWEEP[0]!.t);
   const fetch = replayFetch(SWEEP);
   const scanClock = now === undefined ? clock : { now: () => now };
   const s = new Scanner([new HyperliquidReader({ fetch, clock })], watchReaders({ fetch, clock }), {
-    config: { ...DEFAULT_SCANNER_CONFIG, maxWatchWindows: 10_000 }, clock: scanClock, strategy: () => DEFAULT_STRATEGY,
+    config: { ...DEFAULT_SCANNER_CONFIG, maxWatchWindows }, clock: scanClock, strategy: () => DEFAULT_STRATEGY,
   });
   return (await s.scan()).windows;
 }
@@ -218,6 +218,27 @@ test('the recorded sweep (Saturday 02:09 UTC): each finding of the audit, and cl
   const samsung = byId('samsung-kraken-aster')!;
   assert.match(samsung.checks[0]!.text, /^Watch-only: /);
   assert.match(samsung.checks[1]!.text, /^Market closed: /);
+});
+
+test('the recorded sweep with the default cut: the best windows by gross are sent, the flagged ones after the clean', async (t) => {
+  const all = (await sweepScan()).filter((x) => !x.tradable);
+  const sent = (await sweepScan(undefined, DEFAULT_SCANNER_CONFIG.maxWatchWindows)).filter((x) => !x.tradable);
+  assert.equal(DEFAULT_SCANNER_CONFIG.maxWatchWindows, 150);
+  assert.equal(sent.length, 150);
+  // The same 150 as a cut by gross alone: a finding never keeps a window from the reader.
+  const best = [...all].sort((a, b) => b.grossAprPct - a.grossAprPct || (a.id < b.id ? -1 : 1)).slice(0, 150);
+  assert.deepEqual(sent.map((x) => x.id).sort(), best.map((x) => x.id).sort());
+  // The audit's large flagged windows are among them, and say why.
+  for (const [id, prefix] of [['samsung-kraken-aster', 'Market closed:'], ['nil-aster-hyperliquid', 'Thin:'], ['blur-hyperliquid-bybit', 'Lone baseline:']] as const) {
+    assert.ok(findings(sent.find((x) => x.id === id))[0]!.startsWith(prefix), id);
+  }
+  // Inside the cut: clean first, then flagged, each by gross.
+  const flagged = sent.filter(hasQualityFinding);
+  const clean = sent.filter((x) => !hasQualityFinding(x));
+  assert.deepEqual(sent, [...clean, ...flagged]);
+  for (const group of [clean, flagged]) for (let i = 1; i < group.length; i++) assert.ok(group[i - 1]!.grossAprPct >= group[i]!.grossAprPct);
+  assert.ok(flagged.length > 0 && clean.length > 0);
+  t.diagnostic(`${flagged.length} of the ${sent.length} watch windows sent carry a quality finding`);
 });
 
 test('the recorded sweep read on a weekday in New York hours: no market is closed, the other findings stand', async () => {
