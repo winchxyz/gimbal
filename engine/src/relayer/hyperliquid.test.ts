@@ -4,6 +4,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { HlOrder } from '../contract/types.ts';
+import { OutcomeUnknown } from '../contract/types.ts';
 import { HlExchangeError, HyperliquidSubmitter } from './hyperliquid.ts';
 import type { StubCall } from './test-helpers.ts';
 import { TEST_EVM_ADDRESS, fakeTime, stubFetch, testContract } from './test-helpers.ts';
@@ -103,4 +104,41 @@ test('usdClassTransfer: user-signed, confirmed by its ledger entry', async () =>
 test('cancel: an error status is NothingExecuted', async () => {
   const { contract, hl } = setup(() => ({ status: 'ok', response: { type: 'cancel', data: { statuses: [{ error: 'Order was never placed, already canceled, or filled. asset=1' }] } } }));
   await assert.rejects(hl.submit(await contract.hlCancel('alpha', 1, 77, 'stop'), TEST_EVM_ADDRESS), NothingExecuted);
+});
+
+test('after a fill, /info failing (429, timeout) leaves the fill unconfirmed, never a refusal', async () => {
+  const { contract, hl } = setup((call) => {
+    if (call.url.endsWith('/exchange')) return okOrder({ filled: { totalSz: '0.01', avgPx: '2500.1', oid: 77 } });
+    return new Response('Too Many Requests', { status: 429 });
+  });
+  const signed = await contract.hlOrder('alpha', { ...ORDER, cloid: '0x0123456789abcdef0123456789abcdef' }, 'enter');
+  const result = await hl.submit(signed, TEST_EVM_ADDRESS);
+  assert.equal(result.confirmed, false);
+  assert.equal(result.oid, 77);
+  assert.deepEqual(result.filled, { totalSz: '0.01', avgPx: '2500.1' });
+  // A transfer's ledger lookup failing the same way.
+  const t = setup((call) => (call.url.endsWith('/exchange') ? { status: 'ok', response: { type: 'default' } } : new Response('', { status: 502 })));
+  const moved = await t.hl.submit(await t.contract.hlUsdClassTransfer('alpha', '25', true, 'margin'), TEST_EVM_ADDRESS);
+  assert.equal(moved.confirmed, false);
+});
+
+test('/exchange with no answer (timeout, 5xx, not JSON) is OutcomeUnknown with the cloid and nonce; a 4xx is a refusal', async () => {
+  const cloid = '0x0123456789abcdef0123456789abcdef';
+  for (const answer of [
+    () => { throw Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }); },
+    () => { throw new TypeError('fetch failed'); },
+    () => new Response('bad gateway', { status: 502 }),
+    () => new Response('<html>', { status: 200 }),
+  ]) {
+    const { contract, hl } = setup((call) => (call.url.endsWith('/exchange') ? answer() : []));
+    const signed = await contract.hlOrder('alpha', { ...ORDER, cloid }, 'enter');
+    await assert.rejects(hl.submit(signed, TEST_EVM_ADDRESS), (err: unknown) => {
+      assert.ok(err instanceof OutcomeUnknown, String(err));
+      assert.equal(err.ids.hlCloid, cloid);
+      assert.equal(err.ids.hlNonce, signed.payload.nonce);
+      return true;
+    });
+  }
+  const { contract, hl } = setup(() => new Response('Failed to deserialize the JSON body', { status: 422 }));
+  await assert.rejects(hl.submit(await contract.hlOrder('alpha', ORDER, 'enter'), TEST_EVM_ADDRESS), HlExchangeError);
 });

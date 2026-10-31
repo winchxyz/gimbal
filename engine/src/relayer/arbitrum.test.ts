@@ -1,5 +1,6 @@
 // The Arbitrum submitter against a stub RPC: the transferWithAuthorization the gas wallet sends is byte for byte the
-// calldata of eip3009.json, and an expired, used or foreign authorization costs no gas.
+// calldata of eip3009.json; an expired, used or foreign authorization costs no gas; once sent, no receipt is
+// OutcomeUnknown with the hash, and a send error with a receipt after it is a success.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -7,6 +8,7 @@ import { custom, decodeFunctionData, keccak256, parseTransaction } from 'viem';
 import type { Hex } from 'viem';
 import { ReplayContractClient } from '../contract/replay-client.ts';
 import type { Eip3009SignedAction } from '../contract/types.ts';
+import { OutcomeUnknown } from '../contract/types.ts';
 import { ARBITRUM_USDC, ArbitrumSubmitter, USDC_EIP3009_ABI } from './arbitrum.ts';
 import { TEST_EVM_ADDRESS, testDesk, vectors } from './test-helpers.ts';
 import { NothingExecuted } from './tx.ts';
@@ -27,7 +29,7 @@ async function signedCase(): Promise<Eip3009SignedAction> {
   return c.evmUsdcToIntents('alpha', quote, 'rescue to the deposit address');
 }
 
-function chain(options: { used?: boolean; reverted?: boolean } = {}) {
+function chain(options: { used?: boolean; reverted?: boolean; sendFails?: boolean; noReceipt?: boolean } = {}) {
   const sent: Hex[] = [];
   const methods: string[] = [];
   const transport = custom({
@@ -48,10 +50,12 @@ function chain(options: { used?: boolean; reverted?: boolean } = {}) {
         case 'eth_getBlockByNumber': return { number: '0x10', hash: `0x${'11'.repeat(32)}`, baseFeePerGas: '0x989680', timestamp: '0x1', transactions: [] };
         case 'eth_sendRawTransaction': {
           sent.push(p[0] as Hex);
+          if (options.sendFails) throw Object.assign(new Error('the request took too long to respond'), { code: -32603 });
           return keccak256(p[0] as Hex);
         }
         case 'eth_getTransactionReceipt': {
           const hash = p[0] as Hex;
+          if (options.noReceipt) return null;
           return {
             transactionHash: hash, status: options.reverted ? '0x0' : '0x1', blockNumber: '0x11', blockHash: `0x${'22'.repeat(32)}`,
             transactionIndex: '0x0', from: '0x0', to: ARBITRUM_USDC.testnet.token, cumulativeGasUsed: '0x1', gasUsed: '0x1',
@@ -67,8 +71,10 @@ function chain(options: { used?: boolean; reverted?: boolean } = {}) {
   return { transport, sent, methods };
 }
 
-function submitter(transport: ReturnType<typeof custom>, nowS = CASE.now_s) {
-  return new ArbitrumSubmitter({ network: 'testnet', relayerKey: GAS_KEY, transport, now: () => nowS * 1000 });
+function submitter(transport: ReturnType<typeof custom>, nowS = CASE.now_s, receiptTimeoutMs?: number) {
+  return new ArbitrumSubmitter({
+    network: 'testnet', relayerKey: GAS_KEY, transport, now: () => nowS * 1000, ...(receiptTimeoutMs === undefined ? {} : { receiptTimeoutMs }),
+  });
 }
 
 test('transferWithAuthorization: the gas wallet sends exactly the vector calldata to Arbitrum Sepolia USDC', async () => {
@@ -89,7 +95,13 @@ test('transferWithAuthorization: the gas wallet sends exactly the vector calldat
 test('no gas spent on an authorization that is used, expiring, from someone else or signed for another chain', async () => {
   const signed = await signedCase();
   const used = chain({ used: true });
-  await assert.rejects(submitter(used.transport).submit(signed, TEST_EVM_ADDRESS), (err: unknown) => err instanceof NothingExecuted && /already used/.test(err.message));
+  // Used means the transfer ran somewhere (anyone may submit it): never "nothing executed".
+  await assert.rejects(submitter(used.transport).submit(signed, TEST_EVM_ADDRESS), (err: unknown) => {
+    assert.ok(err instanceof OutcomeUnknown, String(err));
+    assert.match(err.message, /already used/);
+    assert.equal(err.ids.eip3009Nonce, signed.payload.nonce);
+    return true;
+  });
   const late = chain();
   await assert.rejects(submitter(late.transport, Number(CASE.message.validBefore) - 30).submit(signed, TEST_EVM_ADDRESS), /too soon to send/);
   const other = chain();
@@ -109,4 +121,24 @@ test('a reverted transfer is NothingExecuted with the transaction that paid the 
     assert.equal(err.tx[0]?.chain, 'arbitrum');
     return true;
   });
+});
+
+test('sent but no receipt in time: OutcomeUnknown with the transaction hash, known before it was sent', async () => {
+  const c = chain({ noReceipt: true });
+  const signed = await signedCase();
+  await assert.rejects(submitter(c.transport, CASE.now_s, 50).submit(signed, TEST_EVM_ADDRESS), (err: unknown) => {
+    assert.ok(err instanceof OutcomeUnknown, String(err));
+    const hash = keccak256(c.sent[0]!);
+    assert.equal(err.ids.arbitrumTx, hash);
+    assert.equal(err.ids.eip3009Nonce, signed.payload.nonce);
+    assert.equal(err.tx.at(-1)?.id, hash);
+    return true;
+  });
+  assert.equal(c.sent.length, 1);
+});
+
+test('a send error after the node took the transaction: its receipt still decides', async () => {
+  const c = chain({ sendFails: true });
+  const tx = await submitter(c.transport).submit(await signedCase(), TEST_EVM_ADDRESS);
+  assert.equal(tx.at(-1)?.id, keccak256(c.sent[0]!));
 });

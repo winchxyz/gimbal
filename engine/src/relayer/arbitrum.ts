@@ -3,14 +3,18 @@
 // few dollars of ETH, never desk money) calls the USDC contract's transferWithAuthorization with it. The wallet can
 // only submit what the contract signed: USDC itself checks the signature.
 // Before paying any gas: the token and chain are the network's USDC, `from` is the desk, the authorization is not
-// expired or already used, and its signature recovers to `from`. Then simulate, send, and wait for the receipt.
+// expired or already used, and its signature recovers to `from`. Then simulate, sign the transaction locally (so its
+// hash is known before it leaves), send, and wait for the receipt. Once sent, no receipt in time (or a send error,
+// which may come after the node took it) is OutcomeUnknown with the hash and the EIP-3009 nonce. An authorization
+// already used means the transfer ran somewhere (anyone may submit it): OutcomeUnknown too, never NothingExecuted.
 
 import type { TxRef } from '@gimbal/shared';
-import { createPublicClient, createWalletClient, hashTypedData, http, isAddressEqual, parseAbi } from 'viem';
+import { createPublicClient, createWalletClient, encodeFunctionData, hashTypedData, http, isAddressEqual, keccak256, parseAbi } from 'viem';
 import type { Account, Chain, Hex, PublicClient, Transport, WalletClient } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { arbitrum, arbitrumSepolia } from 'viem/chains';
-import type { Eip3009SignedAction } from '../contract/types.ts';
+import type { Eip3009SignedAction, OutcomeIds } from '../contract/types.ts';
+import { OutcomeUnknown } from '../contract/types.ts';
 import { hlSignature, recoverSigner } from './hl-wire.ts';
 import type { ChainNetwork } from './tx.ts';
 import { NothingExecuted, arbitrumTxRef } from './tx.ts';
@@ -103,21 +107,46 @@ export class ArbitrumSubmitter {
     const sig = hlSignature(signed.signature);
     const signer = await recoverSigner(eip3009Digest(p), sig);
     if (signer !== deskAddress.toLowerCase()) throw new Error(`arbitrum: the authorization recovers to ${signer}, not the desk's ${deskAddress.toLowerCase()}; nothing sent`);
+    const ids: OutcomeIds = { eip3009Nonce: p.nonce, ...(signed.nearTx === undefined ? {} : { nearTx: signed.nearTx.id }) };
     const used = await this.#public.readContract({
       address: this.#token, abi: USDC_EIP3009_ABI, functionName: 'authorizationState', args: [p.from as Hex, p.nonce as Hex],
     });
-    if (used) throw new NothingExecuted('arbitrum', `authorization ${p.nonce} was already used`, nearTx);
+    if (used) {
+      throw new OutcomeUnknown('arbitrum transferWithAuthorization', `authorization ${p.nonce} is already used: the transfer ran in a transaction this relayer did not see`, ids, nearTx);
+    }
 
     const args = [
       p.from as Hex, p.to as Hex, BigInt(p.value), BigInt(p.validAfter), BigInt(p.validBefore), p.nonce as Hex, sig.v, sig.r, sig.s,
     ] as const;
-    const { request } = await this.#public.simulateContract({
+    await this.#public.simulateContract({
       address: this.#token, abi: USDC_EIP3009_ABI, functionName: 'transferWithAuthorization', args, account: this.#wallet.account,
     });
-    const hash = await this.#wallet.writeContract(request);
+    const prepared = await this.#wallet.prepareTransactionRequest({
+      account: this.#wallet.account, chain: this.#chain, to: this.#token,
+      data: encodeFunctionData({ abi: USDC_EIP3009_ABI, functionName: 'transferWithAuthorization', args }),
+    });
+    const serialized = await this.#wallet.signTransaction(prepared);
+    const hash = keccak256(serialized);
     const ref = arbitrumTxRef(this.network, hash);
-    const receipt = await this.#public.waitForTransactionReceipt({ hash, timeout: this.#receiptTimeoutMs });
+    let sendError: string | null = null;
+    try {
+      await this.#wallet.sendRawTransaction({ serializedTransaction: serialized });
+    } catch (err) {
+      // The node may have taken it before the error (a timeout, a retried request answering "already known").
+      sendError = (err as Error).message;
+    }
+    let receipt;
+    try {
+      receipt = await this.#public.waitForTransactionReceipt({ hash, timeout: this.#receiptTimeoutMs });
+    } catch (err) {
+      const why = sendError === null ? (err as Error).message : `send: ${sendError}; then ${(err as Error).message}`;
+      throw new OutcomeUnknown('arbitrum transferWithAuthorization', `no receipt for ${hash}: ${oneLine(why)}`, { ...ids, arbitrumTx: hash }, [...nearTx, ref]);
+    }
     if (receipt.status !== 'success') throw new NothingExecuted('arbitrum', `transferWithAuthorization reverted in ${hash}`, [...nearTx, ref]);
     return [...nearTx, ref];
   }
+}
+
+function oneLine(text: string): string {
+  return text.replace(/\s+/g, ' ').slice(0, 300);
 }

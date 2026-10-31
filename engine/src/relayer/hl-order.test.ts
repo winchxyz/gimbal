@@ -38,3 +38,15 @@ test('planIoc refuses what could not fill or the policy would refuse', () => {
   assert.equal(close.order.sz, '0.0002');
   assert.equal(close.order.reduce_only, true);
 });
+
+test('every planned IOC carries a fresh cloid; an unpriced asset has no band but its max_sz', () => {
+  const a = planIoc({ asset: 1, szDecimals: 4, side: 'buy', oraclePx: 2500, bandBps: 200, bookPx: 2501, maxNotionalUsd: 1000 });
+  const b = planIoc({ asset: 1, szDecimals: 4, side: 'buy', oraclePx: 2500, bandBps: 200, bookPx: 2501, maxNotionalUsd: 1000 });
+  assert.match(a.order.cloid!, /^0x[0-9a-f]{32}$/);
+  assert.notEqual(a.order.cloid, b.order.cloid);
+  assert.equal(planIoc({ asset: 1, szDecimals: 4, side: 'buy', oraclePx: 2500, bandBps: 200, bookPx: 2501, maxNotionalUsd: 1000, cloid: '0xab' }).order.cloid, '0xab');
+  // Unpriced: the limit is the book plus slippage, wherever the (absent) oracle would be.
+  const u = planIoc({ asset: 1, szDecimals: 4, side: 'buy', oraclePx: null, bandBps: 200, bookPx: 2600, maxNotionalUsd: 100, maxSz: '3' });
+  assert.equal(u.order.px, '2613');
+  assert.throws(() => planIoc({ asset: 1, szDecimals: 1, side: 'buy', oraclePx: null, bandBps: 200, bookPx: 1, maxNotionalUsd: 100, notionalUsd: 50, maxSz: '3' }), /over the unpriced asset's max_sz 3/);
+});

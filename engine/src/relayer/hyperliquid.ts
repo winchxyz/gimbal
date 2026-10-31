@@ -4,10 +4,14 @@
 //   2. POST /exchange with the payload as the contract returned it, plus the signature;
 //   3. the answer is read per action: an order's status (filled / resting / error), a cancel's, or "ok";
 //   4. a fill is confirmed in userFillsByTime (its transaction hash is the explorer link); a transfer in the ledger.
-// An order that filled nothing (an IOC with no match, a size under the minimum) is NothingExecuted.
+// An order that filled nothing (an IOC with no match, a size under the minimum) is NothingExecuted. Hyperliquid's
+// own refusal ({"status":"err"}, an HTTP 4xx) is HlExchangeError. When /exchange gives no answer (a timeout, a
+// dropped connection, a 5xx, a body that is not JSON) the action may have run: OutcomeUnknown with its cloid and
+// nonce. Once /exchange has answered, a failing /info read only leaves the result unconfirmed (confirmed: false).
 
 import type { TxRef } from '@gimbal/shared';
-import type { HlSignedAction } from '../contract/types.ts';
+import type { HlSignedAction, OutcomeIds } from '../contract/types.ts';
+import { OutcomeUnknown } from '../contract/types.ts';
 import { HL_MAINNET_URL, HL_TESTNET_URL } from '../venues/hyperliquid.ts';
 import type { Clock } from '../venues/venue.ts';
 import { systemClock } from '../venues/venue.ts';
@@ -42,7 +46,7 @@ export interface HlSubmitResult {
   fills: HlFill[];
   /** The NEAR signature first, then the Hyperliquid transactions it produced. */
   tx: TxRef[];
-  /** False when Hyperliquid accepted it but the fill or ledger entry did not show up within confirmMs. */
+  /** False when Hyperliquid accepted it but the fill or ledger entry did not show up within confirmMs (or /info failed). */
   confirmed: boolean;
 }
 
@@ -105,7 +109,13 @@ export class HyperliquidSubmitter {
       throw new Error(`hyperliquid ${signed.kind}: the signature recovers to ${signer}, not the desk's ${deskAddress.toLowerCase()}; nothing posted`);
     }
     const postedAt = this.#clock.now();
-    const answer = await this.#post('/exchange', exchangeBody(signed.payload, signature));
+    let answer: unknown;
+    try {
+      answer = await this.#post('/exchange', exchangeBody(signed.payload, signature));
+    } catch (err) {
+      if (err instanceof HlExchangeError && err.status >= 400 && err.status < 500) throw err;
+      throw new OutcomeUnknown(`hyperliquid ${signed.kind}`, `/exchange gave no answer: ${(err as Error).message ?? String(err)}`, hlIds(signed), nearTx);
+    }
     const response = readResponse(answer, signed.kind);
     const actionType = signed.payload.action.type;
     const result: HlSubmitResult = {
@@ -155,8 +165,12 @@ export class HyperliquidSubmitter {
     const until = this.#clock.now() + this.#confirmMs;
     let fills: HlFill[] = [];
     for (;;) {
-      const rows = await this.#info<HlFill[]>({ type: 'userFillsByTime', user: user.toLowerCase(), startTime: postedAt - 60_000, aggregateByTime: false });
-      fills = (Array.isArray(rows) ? rows : []).filter((f) => Number(f.oid) === oid);
+      try {
+        const rows = await this.#info<HlFill[]>({ type: 'userFillsByTime', user: user.toLowerCase(), startTime: postedAt - 60_000, aggregateByTime: false });
+        fills = (Array.isArray(rows) ? rows : []).filter((f) => Number(f.oid) === oid);
+      } catch {
+        // a 429 or a timeout on /info: read again until confirmMs, then return what was found
+      }
       const sz = fills.reduce((sum, f) => sum + Number(f.sz), 0);
       if (fills.length > 0 && sz + 1e-12 >= totalSz) return fills;
       if (this.#clock.now() >= until) return fills;
@@ -171,9 +185,12 @@ export class HyperliquidSubmitter {
     const amount = Number(action.amount);
     const until = this.#clock.now() + this.#confirmMs;
     for (;;) {
-      const rows = await this.#info<{ time: number; hash: string; delta: Record<string, unknown> }[]>({
-        type: 'userNonFundingLedgerUpdates', user: user.toLowerCase(), startTime: postedAt - 60_000,
-      });
+      let rows: { time: number; hash: string; delta: Record<string, unknown> }[] = [];
+      try {
+        rows = await this.#info({ type: 'userNonFundingLedgerUpdates', user: user.toLowerCase(), startTime: postedAt - 60_000 });
+      } catch {
+        // as in #fillsOf: an /info failure only delays the confirmation
+      }
       const hit = (Array.isArray(rows) ? rows : []).find((r) => r.delta?.type === type
         && Math.abs(Number(r.delta.usdc ?? r.delta.amount) - amount) < 1e-9 && !ZERO_HASH.test(r.hash));
       if (hit !== undefined) return hit.hash;
@@ -201,6 +218,16 @@ export class HyperliquidSubmitter {
       throw new HlExchangeError(`hyperliquid ${path}: not JSON: ${text.slice(0, 200)}`, res.status, text);
     }
   }
+}
+
+/** What reconciles a Hyperliquid action: the NEAR transaction, the first order's cloid, the action's nonce. */
+export function hlIds(signed: HlSignedAction): OutcomeIds {
+  const ids: OutcomeIds = { hlNonce: signed.payload.nonce };
+  if (signed.nearTx !== undefined) ids.nearTx = signed.nearTx.id;
+  const orders = (signed.payload.action as { orders?: { c?: unknown }[] }).orders;
+  const cloid = Array.isArray(orders) ? orders.find((o) => typeof o?.c === 'string')?.c : undefined;
+  if (typeof cloid === 'string') ids.hlCloid = cloid;
+  return ids;
 }
 
 /** `{status:"ok", response:{type, data:{statuses}}}`, or HlExchangeError with Hyperliquid's own message. */

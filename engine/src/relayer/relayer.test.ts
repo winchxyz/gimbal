@@ -1,10 +1,11 @@
 // The relayer end to end over the replay contract and stubbed venues: one call signs and delivers, the Orderly
-// headers match orderly.json, and a Solana message is built again after an MPC timeout (its blockhash is stale).
+// headers match orderly.json, a Solana message is built again after an MPC timeout once its blockhash is proven
+// expired, and an unknown outcome carries the ids the relayer added (the order's cloid).
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ContractClient } from '../contract/types.ts';
-import { MpcTimeoutError } from '../contract/types.ts';
+import { MpcTimeoutError, OutcomeUnknown } from '../contract/types.ts';
 import { HyperliquidSubmitter } from './hyperliquid.ts';
 import { Relayer } from './relayer.ts';
 import { SolanaSubmitter } from './solana.ts';
@@ -39,9 +40,13 @@ test('orderlyRequest: the four orderly-* headers of orderly.json, then Orderly d
     contract, deskId: 'alpha',
     orderly: { apiUrl: v.networks.testnet.api, accountId: r.headers['orderly-account-id'], orderlyKey: r.headers['orderly-key'], fetch: stub.fetch, now: () => r.timestamp },
   });
-  const { kind, ...fields } = r.request;
+  // The contract derives client_order_id from its request_id: the engine never sends one, and reads it back.
+  const { kind, client_order_id: derived, ...fields } = r.request;
+  await assert.rejects(relayer.orderlyRequest(kind, { ...fields, client_order_id: derived }, 'hedge'), /do not pass one/);
   const out = await relayer.orderlyRequest<{ order_id: number }>(kind, fields, 'hedge');
   assert.equal(out.data.order_id, 991);
+  assert.equal(out.clientOrderId, derived);
+  assert.equal((contract.calls.at(-1)!.args as { req: Record<string, unknown> }).req.client_order_id, undefined);
   const call = stub.calls[0]!;
   assert.equal(call.url, r.url);
   assert.equal(call.method, 'POST');
@@ -56,6 +61,7 @@ test('solSign: after an MPC timeout the message is built again with a fresh bloc
   const contract = testContract(time.now);
   let timeouts = 1;
   const flaky: ContractClient = Object.assign(Object.create(contract) as ContractClient, {
+    getDesk: (deskId: string) => contract.getDesk(deskId),
     solSign: async (deskId: string, messageB64: string, reason: string) => {
       if (timeouts-- > 0) throw new MpcTimeoutError('sol_sign', 'Request has timed out', null);
       return contract.solSign(deskId, messageB64, reason);
@@ -63,7 +69,8 @@ test('solSign: after an MPC timeout the message is built again with a fresh bloc
   });
   const rpc = stubFetch((call) => {
     const { id, method } = call.json as { id: number; method: string };
-    const result = method === 'getSignatureStatuses' ? { value: [{ err: null, confirmationStatus: 'confirmed' }] } : method === 'getBlockHeight' ? 10 : 'sig';
+    // Height 101 > lastValidBlockHeight 100: the first message's blockhash is proven expired.
+    const result = method === 'getSignatureStatuses' ? { value: [{ err: null, confirmationStatus: 'confirmed' }] } : method === 'getBlockHeight' ? 101 : 'sig';
     return { jsonrpc: '2.0', id, result };
   });
   let builds = 0;
@@ -80,5 +87,65 @@ test('solSign: after an MPC timeout the message is built again with a fresh bloc
   assert.equal(tx[0]!.chain, 'solana');
   // A second timeout in a row is the caller's to see.
   timeouts = 2;
-  await assert.rejects(relayer.solSign(async () => ({ messageB64: Buffer.from(ioc.message_hex, 'hex').toString('base64') }), 'enter'), MpcTimeoutError);
+  const message = Buffer.from(ioc.message_hex, 'hex').toString('base64');
+  await assert.rejects(relayer.solSign(async () => ({ messageB64: message, lastValidBlockHeight: 100 }), 'enter'), MpcTimeoutError);
+  // Without lastValidBlockHeight the first blockhash is never proven expired: OutcomeUnknown, no second signature.
+  timeouts = 1;
+  builds = 0;
+  await assert.rejects(relayer.solSign(async () => { builds++; return { messageB64: message }; }, 'enter'), (err: unknown) => {
+    assert.ok(err instanceof OutcomeUnknown, String(err));
+    assert.match(err.message, /not proven expired \(no lastValidBlockHeight\)/);
+    return true;
+  });
+  assert.equal(builds, 1);
+});
+
+test('solSign: a contract that signed another message than the one built, or for another fee payer, sends nothing', async () => {
+  const sol = vectors('solana');
+  const ioc = sol.cases.find((c: { name: string }) => c.name.startsWith('IOC buy 0.005 ETH'));
+  const time = fakeTime(T0);
+  const contract = testContract(time.now);
+  const message = Buffer.from(ioc.message_hex, 'hex');
+  const other = Buffer.from(message);
+  other[other.length - 1] ^= 1;
+  const swapped: ContractClient = Object.assign(Object.create(contract) as ContractClient, {
+    getDesk: (deskId: string) => contract.getDesk(deskId),
+    solSign: (deskId: string, _m: string, reason: string) => contract.solSign(deskId, other.toString('base64'), reason),
+  });
+  const rpc = stubFetch(() => ({ jsonrpc: '2.0', id: 1, result: 'sig' }));
+  const solana = new SolanaSubmitter({ rpcUrl: 'https://rpc.example', network: 'testnet', fetch: rpc.fetch, sleep: time.sleep, now: time.now });
+  const relayer = new Relayer({ contract: swapped, deskId: 'alpha', solana });
+  await assert.rejects(relayer.solSign(async () => ({ messageB64: message.toString('base64'), lastValidBlockHeight: 100 }), 'enter'), /signed a different message .* nothing sent/);
+  // get_desk names another authority than the message's fee payer.
+  const elsewhere: ContractClient = Object.assign(Object.create(contract) as ContractClient, {
+    getDesk: async () => testDesk({ solana: { ...testDesk().solana, authority: '11111111111111111111111111111111' } }),
+    solSign: (deskId: string, m: string, reason: string) => contract.solSign(deskId, m, reason),
+  });
+  const strict = new Relayer({ contract: elsewhere, deskId: 'alpha', solana });
+  await assert.rejects(strict.solSign(async () => ({ messageB64: message.toString('base64'), lastValidBlockHeight: 100 }), 'enter'), /not the desk authority .* nothing sent/);
+  assert.equal(rpc.calls.length, 0);
+});
+
+test('hlOrder: every order gets a cloid, and an unknown outcome names it', async () => {
+  const time = fakeTime(T0);
+  const contract = testContract(time.now);
+  const stub = stubFetch(() => { throw new TypeError('fetch failed'); });
+  const relayer = new Relayer({
+    contract, deskId: 'alpha',
+    hyperliquid: new HyperliquidSubmitter({ network: 'testnet', fetch: stub.fetch, clock: time.clock, sleep: time.sleep }),
+  });
+  await assert.rejects(relayer.hlOrder({ asset: 1, is_buy: true, px: '2510', sz: '0.004', reduce_only: false, tif: 'Ioc', cloid: null }, 'enter'), (err: unknown) => {
+    assert.ok(err instanceof OutcomeUnknown, String(err));
+    const sent = (contract.calls[0]!.args as { order: { cloid: string } }).order.cloid;
+    assert.match(sent, /^0x[0-9a-f]{32}$/);
+    assert.equal(err.ids.hlCloid, sent);
+    return true;
+  });
+  // The contract side failing the same way still names the cloid the relayer chose.
+  const lost: ContractClient = Object.assign(Object.create(contract) as ContractClient, {
+    hlOrder: async () => { throw new OutcomeUnknown('hl_order', 'no final outcome', { nearTx: 'h1' }); },
+  });
+  const cloid = '0x0123456789abcdef0123456789abcdef';
+  await assert.rejects(new Relayer({ contract: lost, deskId: 'alpha' }).hlOrder({ asset: 1, is_buy: true, px: '2510', sz: '0.004', reduce_only: false, tif: 'Ioc', cloid }, 'enter'),
+    (err: unknown) => err instanceof OutcomeUnknown && err.ids.hlCloid === cloid && err.ids.nearTx === 'h1');
 });

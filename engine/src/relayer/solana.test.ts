@@ -1,10 +1,12 @@
 // The Solana submitter with solana.json messages the replay contract signed with the public desk seed, against a
-// stub JSON-RPC: rebroadcast until confirmed, expiry and on-chain failure as NothingExecuted, and what is never sent.
+// stub JSON-RPC: rebroadcast until confirmed; NothingExecuted only for a proven expiry or an on-chain failure, every
+// RPC failure or a run out of time as OutcomeUnknown with the signature; and what is never sent.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ed25519Sign } from '../contract/replay-client.ts';
 import type { SolSignedAction } from '../contract/types.ts';
+import { OutcomeUnknown } from '../contract/types.ts';
 import { base58 } from '../venues/orderly-signer.ts';
 import {
   COMPUTE_BUDGET_PROGRAM, SOLANA_COMPUTE_UNITS, SOLANA_PRIORITY_MICROLAMPORTS, SolanaSubmitter, base58Decode,
@@ -22,12 +24,19 @@ async function signedIoc(): Promise<SolSignedAction> {
   return contract.solSign('alpha', Buffer.from(IOC_BUY.message_hex, 'hex').toString('base64'), 'enter');
 }
 
-/** A JSON-RPC stub: `statuses` answers getSignatureStatuses in turn (the last one repeats). */
-function rpc(options: { statuses: unknown[]; blockhashValid?: boolean[]; blockHeight?: number }) {
+/**
+ * A JSON-RPC stub: `statuses` answers getSignatureStatuses in turn (the last one repeats); `fail` answers a method
+ * with HTTP 429 (when it returns true for that call's params).
+ */
+function rpc(options: {
+  statuses: unknown[]; blockhashValid?: boolean[]; blockHeight?: number;
+  fail?: Record<string, (params: unknown[]) => boolean>;
+}) {
   let s = 0;
   let b = 0;
   const stub = stubFetch((call) => {
-    const { id, method } = call.json as { id: number; method: string };
+    const { id, method, params } = call.json as { id: number; method: string; params: unknown[] };
+    if (options.fail?.[method]?.(params) === true) return new Response('Too Many Requests', { status: 429 });
     const result = (() => {
       switch (method) {
         case 'sendTransaction': return 'sig';
@@ -78,18 +87,76 @@ test('sent with skipPreflight, rebroadcast every 2 s until confirmed, then retur
   assert.equal(Buffer.from(first.params[0], 'base64').subarray(65).toString('hex'), IOC_BUY.message_hex);
 });
 
-test('a blockhash that expires before the transaction lands: nothing executed', async () => {
-  const r = rpc({ statuses: [null], blockhashValid: [true, true, false] });
-  await assert.rejects(submitter(r.fetch).submit(await signedIoc()), (err: unknown) => {
+test('NothingExecuted only for a proven expiry: past lastValidBlockHeight, and a history lookup that found nothing', async () => {
+  const h = rpc({ statuses: [null], blockHeight: 1001 });
+  const signed = await signedIoc();
+  await assert.rejects(submitter(h.fetch).submit(signed, { lastValidBlockHeight: 1000 }), (err: unknown) => {
     assert.ok(err instanceof NothingExecuted);
-    assert.match(err.message, /solana: nothing executed: the blockhash expired before it landed/);
+    assert.match(err.message, /past lastValidBlockHeight 1000\) and the signature is not on chain/);
     return true;
   });
-  assert.equal(r.methods().filter((m) => m === 'sendTransaction').length, 3);
-  // With lastValidBlockHeight the block height decides.
-  const h = rpc({ statuses: [null], blockHeight: 1001 });
-  await assert.rejects(submitter(h.fetch).submit(await signedIoc(), { lastValidBlockHeight: 1000 }), NothingExecuted);
-  assert.ok(h.methods().includes('getBlockHeight') && !h.methods().includes('isBlockhashValid'));
+  const lookups = h.calls.map((c) => c.json as { method: string; params: unknown[] }).filter((c) => c.method === 'getSignatureStatuses');
+  assert.deepEqual(lookups.at(-1)!.params[1], { searchTransactionHistory: true });
+  assert.ok(!h.methods().includes('isBlockhashValid'));
+  // Not there yet: rebroadcast, and once the height passes, the same verdict.
+  let height = 990;
+  const later = stubFetch((call) => {
+    const { id, method } = call.json as { id: number; method: string };
+    const result = method === 'getBlockHeight' ? (height += 5) : method === 'getSignatureStatuses' ? { value: [null] } : 'sig';
+    return { jsonrpc: '2.0', id, result };
+  });
+  await assert.rejects(submitter(later.fetch).submit(signed, { lastValidBlockHeight: 1000 }), NothingExecuted);
+  assert.equal(later.calls.filter((c) => (c.json as { method: string }).method === 'sendTransaction').length, 3);
+});
+
+test('an RPC 429 on the status reads is OutcomeUnknown with the signature, never NothingExecuted', async () => {
+  const signed = await signedIoc();
+  const { signature } = SolanaSubmitter.transaction(signed);
+  const r = rpc({ statuses: [null], blockHeight: 1001, fail: { getSignatureStatuses: () => true } });
+  await assert.rejects(submitter(r.fetch).submit(signed, { lastValidBlockHeight: 1000 }), (err: unknown) => {
+    assert.ok(err instanceof OutcomeUnknown, String(err));
+    assert.equal(err.ids.solSignature, signature);
+    assert.match(err.message, /HTTP 429/);
+    assert.equal(err.tx.at(-1)?.id, signature);
+    return true;
+  });
+  // The block height read failing is no proof of expiry either.
+  const noHeight = rpc({ statuses: [null], fail: { getBlockHeight: () => true } });
+  await assert.rejects(submitter(noHeight.fetch).submit(signed, { lastValidBlockHeight: 1000 }), OutcomeUnknown);
+});
+
+test('a failed history lookup after the blockhash expired is OutcomeUnknown', async () => {
+  const signed = await signedIoc();
+  const history = (params: unknown[]) => (params[1] as { searchTransactionHistory?: boolean })?.searchTransactionHistory === true;
+  const r = rpc({ statuses: [null], blockHeight: 1001, fail: { getSignatureStatuses: history } });
+  await assert.rejects(submitter(r.fetch).submit(signed, { lastValidBlockHeight: 1000 }), (err: unknown) => {
+    assert.ok(err instanceof OutcomeUnknown, String(err));
+    assert.match(err.message, /no proof either way/);
+    return true;
+  });
+});
+
+test('maxWaitMs reached without proof: OutcomeUnknown, also when the RPC only says the blockhash is invalid', async () => {
+  const signed = await signedIoc();
+  const pending = rpc({ statuses: [{ err: null, confirmationStatus: 'processed' }], blockHeight: 10 });
+  await assert.rejects(submitter(pending.fetch).submit(signed, { lastValidBlockHeight: 1000 }), (err: unknown) => {
+    assert.ok(err instanceof OutcomeUnknown, String(err));
+    assert.match(err.message, /no proof either way after 150 s/);
+    return true;
+  });
+  // Without lastValidBlockHeight, isBlockhashValid false plus an empty lookup is a hint, not proof.
+  const hint = rpc({ statuses: [null], blockhashValid: [true, false] });
+  await assert.rejects(submitter(hint.fetch).submit(signed), (err: unknown) => {
+    assert.ok(err instanceof OutcomeUnknown, String(err));
+    assert.match(err.message, /without lastValidBlockHeight that is no proof/);
+    return true;
+  });
+});
+
+test('a fee payer other than the desk authority is never sent', async () => {
+  const r = rpc({ statuses: [null] });
+  await assert.rejects(submitter(r.fetch).submit(await signedIoc(), { authority: '11111111111111111111111111111111' }), /not the desk authority .* nothing sent/);
+  assert.equal(r.calls.length, 0);
 });
 
 test('a transaction that failed on chain is NothingExecuted and still points at the transaction', async () => {

@@ -106,6 +106,9 @@ export class OrderlyDeskClient {
   }
 
   async #request<T>(kind: OrderlyRequestKind, fields: Partial<OrderlyRequest>, reason: string): Promise<T> {
+    if (kind === 'order' && fields.client_order_id !== undefined && fields.client_order_id !== null) {
+      throw new Error('orderly: the contract derives an order\'s client_order_id from its request_id; do not pass one');
+    }
     const req: OrderlyRequest = { reduce_only: false, ...fields, kind, timestamp_ms: this.#clock.now() };
     const action = await this.#signer.orderlyRequest(this.deskId, req, reason);
     return sendOrderlyRest<T>(action, kind, {

@@ -155,7 +155,21 @@ export function checkRestAction(action: OrderlyRestAction, expectedKind: string,
   signatureBytes(action.signature);
 }
 
-/** A ws auth action signs the timestamp alone; checked the same way. */
+/**
+ * The client_order_id of a signed order: the contract derives it from its request_id (a caller-chosen one is
+ * refused), so the engine reads it back from the signed body. null when the body has none.
+ */
+export function signedClientOrderId(action: OrderlyRestAction): string | null {
+  if (action.payload.body === '') return null;
+  try {
+    const id = (JSON.parse(action.payload.body) as { client_order_id?: unknown }).client_order_id;
+    return typeof id === 'string' && id !== '' ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A ws auth action signs the timestamp alone; checked the same way (the contract's payload has method ""). */
 export function checkWsAuthAction(action: OrderlyRestAction, timestamp: number, now: number, deskId: string): void {
   checkVenueAndDesk(action, deskId);
   if (action.kind !== ORDERLY_WS_AUTH_KIND) throw new Error(`orderly ws auth: the contract signed ${action.kind}, not ${ORDERLY_WS_AUTH_KIND}`);

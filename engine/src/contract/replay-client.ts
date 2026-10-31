@@ -247,7 +247,7 @@ export class ReplayContractClient implements ContractClient {
     this.calls.push({ method: 'orderly_request', args: { desk_id: deskId, req, reason } });
     const desk = this.#gate(deskId, req.kind === 'order' && !req.reduce_only ? 'running' : 'reduces-risk');
     checkReason(reason);
-    const route = this.#orderlyRoute(desk, req);
+    const route = this.#orderlyRoute(deskId, desk, req);
     const message = orderlyRestMessage(req.timestamp_ms, route.method, route.path, route.body);
     return this.#orderlyRest(deskId, req.kind, { ...route, timestamp: req.timestamp_ms, message });
   }
@@ -255,7 +255,8 @@ export class ReplayContractClient implements ContractClient {
   async orderlyWsAuth(deskId: string, timestamp: number): Promise<OrderlyRestAction> {
     this.calls.push({ method: 'orderly_ws_auth', args: { desk_id: deskId, timestamp } });
     this.#gate(deskId, 'reduces-risk');
-    return this.#orderlyRest(deskId, ORDERLY_WS_AUTH_KIND, { method: 'GET', path: '', body: '', timestamp, message: String(timestamp) });
+    // The contract's ws auth payload has no HTTP method: "".
+    return this.#orderlyRest(deskId, ORDERLY_WS_AUTH_KIND, { method: '', path: '', body: '', timestamp, message: String(timestamp) });
   }
 
   async orderlyRegister(deskId: string, registrationNonce: string): Promise<OrderlyEip712Action> {
@@ -413,7 +414,7 @@ export class ReplayContractClient implements ContractClient {
   }
 
   /** The path and body the contract builds for each kind (orderly.json request_rules). */
-  #orderlyRoute(desk: DeskView, req: OrderlyRequest): { method: string; path: string; body: string } {
+  #orderlyRoute(deskId: string, desk: DeskView, req: OrderlyRequest): { method: string; path: string; body: string } {
     const symbol = (): string => {
       const s = req.symbol ?? '';
       if (!desk.policy.orderly_symbols.includes(s)) throw new ContractRefusal('E_ASSET', `Orderly symbol ${s} is not in the desk's policy`);
@@ -424,7 +425,10 @@ export class ReplayContractClient implements ContractClient {
         const s = symbol();
         const type = req.order_type ?? 'IOC';
         const fields: string[] = [`"symbol":${JSON.stringify(s)}`];
-        if (req.client_order_id) fields.push(`"client_order_id":${JSON.stringify(req.client_order_id)}`);
+        // The contract derives the id from its request_id; orderly.json still passes its own, which is kept until
+        // the vectors pin the derivation.
+        const clientOrderId = req.client_order_id || `gimbal-${deskId}-${this.#requestId + 1}`;
+        fields.push(`"client_order_id":${JSON.stringify(clientOrderId)}`);
         fields.push(`"order_type":${JSON.stringify(type)}`);
         if (type !== 'MARKET') fields.push(`"order_price":${decimalNumber('price', req.price)}`);
         fields.push(`"order_quantity":${decimalNumber('quantity', req.quantity)}`);

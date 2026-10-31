@@ -1,8 +1,15 @@
 // Hyperliquid order numbers the contract accepts: prices with at most 5 significant figures (integers excepted) and
 // 6 - szDecimals decimals, sizes with szDecimals decimals, both canonical decimal strings; and an IOC limit that
-// crosses the book while staying inside the contract's band around its oracle price.
+// crosses the book while staying inside the contract's band around its oracle price. Every order carries a cloid, so
+// an order whose outcome is unknown can be looked up (orderStatus by cloid) before anything else is sent.
 
+import { randomBytes } from 'node:crypto';
 import type { HlOrder } from '../contract/types.ts';
+
+/** A fresh Hyperliquid client order id: 0x and 16 random bytes. */
+export function newCloid(): string {
+  return `0x${randomBytes(16).toString('hex')}`;
+}
 
 /** Hyperliquid's minimum order value, USD. */
 export const HL_MIN_ORDER_USD = 10;
@@ -40,10 +47,12 @@ export interface IocInput {
   asset: number;
   szDecimals: number;
   side: 'buy' | 'sell';
-  /** The contract's stored price for the asset, USD. */
-  oraclePx: number;
+  /** The contract's stored price for the asset, USD; null for an unpriced asset (no band, the size cap instead). */
+  oraclePx: number | null;
   /** policy.price_band_bps. */
   bandBps: number;
+  /** An unpriced asset's max_sz from the policy. */
+  maxSz?: string;
   /** The best ask for a buy, the best bid for a sell. */
   bookPx: number;
   /** The order value to aim for; default 11 USD (Hyperliquid's minimum is 10). */
@@ -55,6 +64,8 @@ export interface IocInput {
   /** A size to trade instead of notionalUsd (closing a position). */
   sz?: string;
   reduceOnly?: boolean;
+  /** Default: newCloid(). */
+  cloid?: string;
 }
 
 export interface IocPlan {
@@ -73,7 +84,8 @@ export function planIoc(input: IocInput): IocPlan {
   const band = (input.bandBps * 0.95) / 10_000;
   const buy = input.side === 'buy';
   const want = buy ? input.bookPx * (1 + slip) : input.bookPx * (1 - slip);
-  const edge = buy ? input.oraclePx * (1 + band) : input.oraclePx * (1 - band);
+  const oracle = input.oraclePx;
+  const edge = oracle === null ? want : buy ? oracle * (1 + band) : oracle * (1 - band);
   const limit = buy ? Math.min(want, edge) : Math.max(want, edge);
   const px = hlPx(limit, input.szDecimals, buy ? 'down' : 'up');
   const pxN = Number(px);
@@ -82,10 +94,11 @@ export function planIoc(input: IocInput): IocPlan {
   }
   const sz = input.sz ?? hlSz((input.notionalUsd ?? HL_MIN_ORDER_USD + 1) / pxN, input.szDecimals, 'up');
   const notionalUsd = Number(sz) * pxN;
+  if (input.maxSz !== undefined && Number(sz) > Number(input.maxSz)) throw new Error(`${sz} is over the unpriced asset's max_sz ${input.maxSz}`);
   if (notionalUsd > input.maxNotionalUsd) throw new Error(`${sz} at ${px} is ${notionalUsd.toFixed(2)} USD, over policy.max_notional_usd ${input.maxNotionalUsd}`);
   if (!input.reduceOnly && notionalUsd < HL_MIN_ORDER_USD) throw new Error(`${sz} at ${px} is ${notionalUsd.toFixed(2)} USD, under Hyperliquid's ${HL_MIN_ORDER_USD} USD minimum`);
   return {
-    order: { asset: input.asset, is_buy: buy, px, sz, reduce_only: input.reduceOnly ?? false, tif: 'Ioc', cloid: null },
+    order: { asset: input.asset, is_buy: buy, px, sz, reduce_only: input.reduceOnly ?? false, tif: 'Ioc', cloid: input.cloid ?? newCloid() },
     px: pxN, sz: Number(sz), notionalUsd,
   };
 }

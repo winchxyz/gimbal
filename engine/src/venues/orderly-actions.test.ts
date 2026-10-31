@@ -52,7 +52,7 @@ class FakeSigner implements OrderlySigner {
   }
   async orderlyWsAuth(deskId: string, timestamp: number): Promise<OrderlyRestAction> {
     this.calls.push('orderly_ws_auth');
-    return { desk_id: deskId, request_id: ++this.#id, venue: 'orderly', kind: 'ws_auth', payload: { method: 'GET', path: '', body: '', timestamp, message: String(timestamp) }, signature: { scheme: 'Ed25519', signature: SIG } };
+    return { desk_id: deskId, request_id: ++this.#id, venue: 'orderly', kind: 'ws_auth', payload: { method: '', path: '', body: '', timestamp, message: String(timestamp) }, signature: { scheme: 'Ed25519', signature: SIG } };
   }
   async orderlyRegister(deskId: string, registrationNonce: string): Promise<OrderlyEip712Action> {
     this.calls.push(`orderly_register:${registrationNonce}`);
@@ -337,4 +337,10 @@ test('a funding fee row received on a positive rate is a short receiving', () =>
   assert.equal(flat.size, 0);
   assert.ok(Object.is(flat.fundingUsd, 0));
   assert.throws(() => parseFundingFeeRow({ ...flatRow, payment_type: 'Other' }, 8), /unknown payment_type Other/);
+});
+
+test('an order never carries a caller-chosen client_order_id: the contract derives it from its request_id', async () => {
+  const signer = new FakeSigner();
+  await assert.rejects(client(signer, fakeVenue({}).f).request('order', { symbol: 'PERP_ETH_USDC', client_order_id: 'mine' }), /do not pass one/);
+  assert.deepEqual(signer.calls, []);
 });

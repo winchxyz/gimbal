@@ -6,13 +6,17 @@
 //     drop transactions without a fee. The engine builds messages with computeBudgetInstructions() (400k, 100,000
 //     µlamports per CU);
 //   - sent with skipPreflight and maxRetries 0, then rebroadcast every 2 s while the status is polled;
-//   - once the blockhash is past lastValidBlockHeight (or no longer valid) and the signature never landed, it is
-//     NothingExecuted: the transaction can no longer run, so the caller may build a new one.
+//   - NothingExecuted only with proof: the transaction landed with an error (confirmed), or the chain is past the
+//     message's lastValidBlockHeight (a block height read that succeeded) AND a history lookup of the signature
+//     succeeded and found nothing. Then it can never run, and the caller may build a new one;
+//   - anything short of that (an RPC error on the status or the height, no lastValidBlockHeight, maxWaitMs reached)
+//     is OutcomeUnknown with the signature: the caller reconciles before it sends anything else.
 // sol_sign_register transactions have two signers and are sent by Phoenix's API, not here.
 
 import { createPublicKey, verify as edVerify } from 'node:crypto';
 import type { TxRef } from '@gimbal/shared';
 import type { SolSignedAction } from '../contract/types.ts';
+import { OutcomeUnknown } from '../contract/types.ts';
 import { base58 } from '../venues/orderly-signer.ts';
 import type { ChainNetwork } from './tx.ts';
 import { NothingExecuted, sleep, solanaTxRef } from './tx.ts';
@@ -143,9 +147,14 @@ export interface SolanaSubmitterOptions {
 }
 
 export interface SolanaSendOptions {
-  /** From the getLatestBlockhash the message was built with; without it the RPC's isBlockhashValid decides. */
+  /** From the getLatestBlockhash the message was built with; without it expiry is never proven (OutcomeUnknown). */
   lastValidBlockHeight?: number;
+  /** The desk's Solana authority: keys[0] must be it, or nothing is sent. */
+  authority?: string;
 }
+
+/** An RPC read that may have failed: ok false is "no answer", never "nothing there". */
+type Read<T> = { ok: true; value: T } | { ok: false; error: string };
 
 interface SignatureStatus {
   err: unknown;
@@ -185,12 +194,15 @@ export class SolanaSubmitter {
     return { bytes: Buffer.concat([Buffer.from([1]), sig, message]), signature: base58(sig), message };
   }
 
-  /** Checks, sends and rebroadcasts until confirmed; resolves with the transaction, or throws NothingExecuted. */
+  /** Checks, sends and rebroadcasts until confirmed; resolves with the transaction, or NothingExecuted / OutcomeUnknown. */
   async submit(signed: SolSignedAction, options: SolanaSendOptions = {}): Promise<TxRef[]> {
     const nearTx = signed.nearTx === undefined ? [] : [signed.nearTx];
     const { bytes, signature, message } = SolanaSubmitter.transaction(signed);
     const parsed = parseMessage(message);
     if (parsed.signers !== 1) throw new Error(`solana: the message needs ${parsed.signers} signatures; registration transactions go through Phoenix's API`);
+    if (options.authority !== undefined && parsed.keys[0] !== options.authority) {
+      throw new Error(`solana ${signed.kind}: the fee payer is ${parsed.keys[0]}, not the desk authority ${options.authority}; nothing sent`);
+    }
     if (!verifyEd25519(parsed.keys[0]!, message, bytes.subarray(1, 65))) {
       throw new Error(`solana ${signed.kind}: the signature does not verify for ${parsed.keys[0]}; nothing sent`);
     }
@@ -198,52 +210,83 @@ export class SolanaSubmitter {
       throw new Error(`solana ${signed.kind}: the message sets no compute-unit limit and priority fee; public RPCs drop it, nothing sent`);
     }
     const ref = solanaTxRef(this.#network, signature);
+    const unknown = (detail: string) => new OutcomeUnknown(`solana ${signed.kind}`, detail, {
+      solSignature: signature, ...(signed.nearTx === undefined ? {} : { nearTx: signed.nearTx.id }),
+    }, [...nearTx, ref]);
     const b64 = bytes.toString('base64');
     const started = this.#now();
-    let lastSendError: string | null = null;
+    let lastError: string | null = null;
     for (;;) {
       try {
         await this.#rpc('sendTransaction', [b64, { encoding: 'base64', skipPreflight: true, maxRetries: 0 }]);
       } catch (err) {
-        lastSendError = (err as Error).message;
+        lastError = `send: ${(err as Error).message}`;
       }
       const status = await this.#status(signature, false);
-      if (status !== null) {
-        if (status.err !== null && status.err !== undefined) {
-          throw new NothingExecuted('solana', `the transaction failed on chain: ${JSON.stringify(status.err)}`, [...nearTx, ref]);
-        }
-        if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') return [...nearTx, ref];
-      }
-      if (await this.#expired(parsed.blockhash, options.lastValidBlockHeight) || this.#now() - started > this.#maxWaitMs) {
+      if (!status.ok) lastError = status.error;
+      const landed = status.ok ? verdict(status.value) : null;
+      if (landed === 'confirmed') return [...nearTx, ref];
+      if (landed !== null) throw new NothingExecuted('solana', `the transaction failed on chain: ${landed.failed}`, [...nearTx, ref]);
+
+      const expiry = await this.#expired(parsed.blockhash, options.lastValidBlockHeight);
+      if (!expiry.ok) lastError = expiry.error;
+      if (expiry.ok && expiry.value !== 'valid') {
         const last = await this.#status(signature, true);
-        if (last !== null && (last.err === null || last.err === undefined)
-          && (last.confirmationStatus === 'confirmed' || last.confirmationStatus === 'finalized')) return [...nearTx, ref];
-        const why = last?.err ? `failed on chain: ${JSON.stringify(last.err)}` : `the blockhash expired before it landed${lastSendError === null ? '' : ` (last send error: ${lastSendError})`}`;
-        throw new NothingExecuted('solana', why, nearTx);
+        const seen = last.ok ? verdict(last.value) : null;
+        if (seen === 'confirmed') return [...nearTx, ref];
+        if (seen !== null) throw new NothingExecuted('solana', `the transaction failed on chain: ${seen.failed}`, [...nearTx, ref]);
+        if (expiry.value === 'past-last-valid-height' && last.ok && last.value === null) {
+          throw new NothingExecuted('solana', `the blockhash expired (past lastValidBlockHeight ${options.lastValidBlockHeight}) and the signature is not on chain${lastError === null ? '' : ` (last error: ${lastError})`}`, nearTx);
+        }
+        if (expiry.value === 'rpc-says-invalid' && last.ok && last.value === null) {
+          throw unknown('the RPC says the blockhash is no longer valid and the signature is not found, but without lastValidBlockHeight that is no proof');
+        }
+        if (!last.ok) lastError = last.error;
+      }
+      if (this.#now() - started > this.#maxWaitMs) {
+        throw unknown(`no proof either way after ${Math.round(this.#maxWaitMs / 1000)} s${lastError === null ? '' : ` (last error: ${lastError})`}`);
       }
       await this.#sleep(this.#rebroadcastMs);
     }
   }
 
-  async #status(signature: string, history: boolean): Promise<SignatureStatus | null> {
-    try {
-      const r = await this.#rpc<{ value: (SignatureStatus | null)[] }>('getSignatureStatuses', [[signature], { searchTransactionHistory: history }]);
-      return r.value[0] ?? null;
-    } catch {
-      return null;
+  /**
+   * Waits until the chain is proven past `lastValidBlockHeight` (a block height read that succeeded), up to
+   * `maxWaitMs`; false when that was not proven in time. A message signed for that blockhash can then never run, so a
+   * caller may sign a new one after an MPC timeout.
+   */
+  async waitPastLastValidHeight(lastValidBlockHeight: number, maxWaitMs = 90_000): Promise<boolean> {
+    const until = this.#now() + maxWaitMs;
+    for (;;) {
+      const r = await this.#expired('', lastValidBlockHeight);
+      if (r.ok && r.value === 'past-last-valid-height') return true;
+      if (this.#now() >= until) return false;
+      await this.#sleep(this.#rebroadcastMs);
     }
   }
 
-  async #expired(blockhash: string, lastValidBlockHeight: number | undefined): Promise<boolean> {
+  async #status(signature: string, history: boolean): Promise<Read<SignatureStatus | null>> {
+    try {
+      const r = await this.#rpc<{ value: (SignatureStatus | null)[] }>('getSignatureStatuses', [[signature], { searchTransactionHistory: history }]);
+      if (!Array.isArray(r?.value)) return { ok: false, error: 'getSignatureStatuses: no value list in the answer' };
+      return { ok: true, value: r.value[0] ?? null };
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
+    }
+  }
+
+  async #expired(blockhash: string, lastValidBlockHeight: number | undefined): Promise<Read<'valid' | 'past-last-valid-height' | 'rpc-says-invalid'>> {
     try {
       if (lastValidBlockHeight !== undefined) {
         const height = await this.#rpc<number>('getBlockHeight', [{ commitment: 'confirmed' }]);
-        return height > lastValidBlockHeight;
+        if (!Number.isSafeInteger(height)) return { ok: false, error: `getBlockHeight answered ${JSON.stringify(height)}` };
+        return { ok: true, value: height > lastValidBlockHeight ? 'past-last-valid-height' : 'valid' };
       }
       const r = await this.#rpc<{ value: boolean }>('isBlockhashValid', [blockhash, { commitment: 'confirmed' }]);
-      return r.value === false;
-    } catch {
-      return false;
+      if (typeof r?.value !== 'boolean') return { ok: false, error: 'isBlockhashValid: no value in the answer' };
+      return { ok: true, value: r.value ? 'valid' : 'rpc-says-invalid' };
+    } catch (err) {
+      return { ok: false, error: (err as Error).message };
     }
   }
 
@@ -254,8 +297,17 @@ export class SolanaSubmitter {
       body: JSON.stringify({ jsonrpc: '2.0', id: ++this.#id, method, params }),
       signal: AbortSignal.timeout(this.#timeoutMs),
     });
+    if (!res.ok) throw new Error(`solana ${method}: HTTP ${res.status}`);
     const body = await res.json() as { result?: T; error?: { code?: number; message?: string } };
     if (body.error !== undefined) throw new Error(`solana ${method}: ${body.error.message ?? JSON.stringify(body.error)}`);
     return body.result as T;
   }
+}
+
+/** A landed signature's verdict: 'confirmed' (success, at least confirmed), a failure (confirmed), or null (not yet). */
+function verdict(status: SignatureStatus | null): 'confirmed' | { failed: string } | null {
+  if (status === null) return null;
+  const settled = status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized';
+  if (!settled) return null;
+  return status.err === null || status.err === undefined ? 'confirmed' : { failed: JSON.stringify(status.err) };
 }
