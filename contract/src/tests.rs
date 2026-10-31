@@ -16,6 +16,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 /// The Hyperliquid methods, on these fixtures.
 mod hl;
+/// The Solana methods, on these fixtures.
+mod sol;
 
 /// The EVM address and Solana authority the MPC answers in [`MPC_EVM`] and [`MPC_SOL`] give.
 const EVM: &str = "0x77cf7951f48ed15194825e2fe0908a6aa486d45a";
@@ -161,12 +163,23 @@ fn b58(n: u8) -> String {
     bs58::encode([n; 32]).into_string()
 }
 
+/// The accounts [`SOL_AUTHORITY`] derives (bumps 254, 255 and 252), which `create_desk` requires.
 fn solana() -> SolanaAccounts {
     SolanaAccounts {
         authority: SOL_AUTHORITY.into(),
-        usdc_ata: b58(2),
-        phusd_ata: b58(3),
-        phoenix_trader: b58(4),
+        usdc_ata: "5EbDUDCy2ycULpJ4xDCmrDJ3zqVpshLLm46BQpYXLDAU".into(),
+        phusd_ata: "4mVZb1tNA7QGWXnqFhT4yfuBAi8Ff5mHWs2otZwuH5Et".into(),
+        phoenix_trader: "FgXaTCYWdnqYPd7cCPruqbggfHbNCs4EGqmrxBePz9A8".into(),
+    }
+}
+
+/// The accounts of authority `[1; 32]` (`b58(1)`), a key the MPC does not give the test desk.
+fn stranger_solana() -> SolanaAccounts {
+    SolanaAccounts {
+        authority: b58(1),
+        usdc_ata: "Gs6NxmndAL3PULGZeYUHCknpMdDVbL46eFCBh856p5z6".into(),
+        phusd_ata: "F1VgsU8zdX5KM64eRdTiGHjbhqetYfXY9FcopvsmFbKm".into(),
+        phoenix_trader: "5odgPeixtpPBCiA1fDhnFuncxYT6YEBBiqW8NAvii1QN".into(),
     }
 }
 
@@ -607,13 +620,13 @@ fn call_with_gas(gas: Gas) {
 
 #[test]
 fn create_desk_refuses_less_gas_than_its_floor() {
-    assert_eq!(CREATE_DESK_MIN_GAS, Gas::from_tgas(62));
+    assert_eq!(CREATE_DESK_MIN_GAS, Gas::from_tgas(64));
     let mut g = testnet();
     let short = CREATE_DESK_MIN_GAS.saturating_sub(Gas::from_gas(1));
     for gas in [short, Gas::from_tgas(10)] {
         call_with_gas(gas);
         assert_refused(
-            "E_ARGS: create_desk needs at least 62 TGas attached (100 TGas recommended), not ",
+            "E_ARGS: create_desk needs at least 64 TGas attached (100 TGas recommended), not ",
             || {
                 g.create_desk("alpha".into(), policy(), EVM.into(), solana())
                     .detach();
@@ -660,7 +673,12 @@ fn the_gas_create_desk_keeps_covers_the_largest_policy() {
     let (small_create, small_keys, small_json, small_borsh) = desk_gas(&mut g, "small", policy());
     let (create, keys, json, borsh) = desk_gas(&mut g, "large", Policy::largest_valid());
     assert!(json > 12_000 && borsh > 8_000, "{json} {borsh}");
-    let extra = create - small_create + wasm(json - small_json, borsh - small_borsh);
+    // The Solana accounts check (after that measurement) derives three program addresses: one
+    // curve check per bump tried, about 125,000 wasm instructions each (counted in the wasm32
+    // build: 254 squarings of 447 and 11 multiplications of 622). An authority takes 6 on average
+    // (the test one 7); more than 24 happens for fewer than 2 in 100,000.
+    let derivation = 24 * 125_000 * 822_756;
+    let extra = create - small_create + wasm(json - small_json, borsh - small_borsh) + derivation;
     assert!(
         measured + extra + 4 * TGAS <= CREATE_DESK_GAS.as_gas(),
         "create_desk: {measured} + {extra} with a 4 TGas margin is over {CREATE_DESK_GAS:?}"
@@ -758,7 +776,7 @@ fn create_desk_refuses_a_malformed_evm_address() {
 }
 
 #[test]
-fn create_desk_refuses_malformed_or_repeated_solana_accounts() {
+fn create_desk_refuses_malformed_or_underived_solana_accounts() {
     let mut g = testnet();
     call(owner(), NearToken::from_near(1));
     let mut s = solana();
@@ -773,15 +791,26 @@ fn create_desk_refuses_malformed_or_repeated_solana_accounts() {
         g.create_desk("alpha".into(), policy(), EVM.into(), s)
             .detach();
     });
+    // An account of the owner's choosing, here the authority itself, is not the derived one.
     let mut s = solana();
     s.phoenix_trader = s.authority.clone();
     assert_refused(
-        "E_ARGS: solana.authority and solana.phoenix_trader are the same account",
+        &format!(
+            "E_ARGS: solana.phoenix_trader {SOL_AUTHORITY} is not the Phoenix trader account of \
+             solana.authority {SOL_AUTHORITY}, FgXaTCYWdnqYPd7cCPruqbggfHbNCs4EGqmrxBePz9A8"
+        ),
         || {
             g.create_desk("alpha".into(), policy(), EVM.into(), s)
                 .detach();
         },
     );
+    let mut s = solana();
+    s.phusd_ata = stranger_solana().phusd_ata;
+    assert_refused("E_ARGS: solana.phusd_ata F1Vgs", || {
+        g.create_desk("alpha".into(), policy(), EVM.into(), s)
+            .detach();
+    });
+    assert!(function_calls().is_empty(), "refused before the MPC calls");
 }
 
 #[test]
@@ -892,9 +921,7 @@ fn the_callback_refunds_an_evm_address_that_is_not_the_mpc_key() {
 #[test]
 fn the_callback_refunds_a_solana_authority_that_is_not_the_mpc_key() {
     let mut g = testnet();
-    let mut s = solana();
-    s.authority = b58(1);
-    let args = scheduled(&mut g, EVM, s);
+    let args = scheduled(&mut g, EVM, stranger_solana());
     assert_callback_refused(
         &mut g,
         args,
