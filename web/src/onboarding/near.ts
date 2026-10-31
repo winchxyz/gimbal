@@ -25,9 +25,10 @@ export function formatNear(yocto: bigint, decimals = 3): string {
 export const STORAGE_BYTE_COST = 10n ** 19n;
 
 /**
- * An upper bound for a storage deposit: the JSON the call carries is larger than what the contract stores of it, so
- * paying for every byte of the JSON covers the storage it adds. The contract keeps only the storage it uses and
- * refunds the rest (docs/interfaces.md §1.3), so over-paying costs nothing but a moment's lock.
+ * An upper bound for a storage deposit: a byte of storage for every byte of the JSON the call carries, plus
+ * `extraBytes` for what the call stores that is not in its arguments (`create_desk` stores a desk's counters and index
+ * entries too: see desk-actions.ts). The contract keeps only the storage it uses and refunds the rest
+ * (docs/interfaces.md §1.3), so over-paying costs nothing but a moment's lock; paying less is `E_DEPOSIT`.
  */
 export function storageDeposit(argsJson: string, extraBytes = 0): bigint {
   return STORAGE_BYTE_COST * BigInt(new TextEncoder().encode(argsJson).length + extraBytes);
