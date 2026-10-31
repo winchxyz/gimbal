@@ -12,7 +12,7 @@
 import type { Clock } from './venue.ts';
 import { systemClock } from './venue.ts';
 import type { OrderlyEndpoints, OrderlyNetwork } from './orderly-http.ts';
-import { ORDERLY_ENDPOINTS, normalizeAccountId, readOrderlyData } from './orderly-http.ts';
+import { ORDERLY_ENDPOINTS, OrderlyApiError, normalizeAccountId, readOrderlyData } from './orderly-http.ts';
 import type { OrderlyEip712Action, OrderlyRequest, OrderlyRequestKind, OrderlySigner } from './orderly-signer.ts';
 import { checkEip712Action, evmSignatureHex, isOrderlyKeyString } from './orderly-signer.ts';
 import { MpcTimeoutError } from '../contract/types.ts';
@@ -205,6 +205,62 @@ export class OrderlyDeskClient {
   /** One page of the account's funding payments in [startMs, endMs]. Needs the proposed `funding_fee_history` kind. */
   fundingFeeHistory(startMs: number, endMs: number, page: number, size: number): Promise<OrderlyFundingFeePage> {
     return this.request<OrderlyFundingFeePage>('funding_fee_history', { start_t: startMs, end_t: endMs, page, size }, 'read funding history');
+  }
+
+  /** GET /v1/positions `data` (rows in Orderly's REST names); with holding(), what a private session starts with. */
+  positions(reason = 'read Orderly positions'): Promise<unknown> {
+    return this.request('positions', {}, reason);
+  }
+
+  /** GET /v1/client/holding `data`. */
+  holding(reason = 'read Orderly holding'): Promise<unknown> {
+    return this.request('holding', {}, reason);
+  }
+
+  /**
+   * Limits the desk's orderly key to the IP list the owner set with set_orderly_ips; the contract builds the body
+   * from that list, so the engine passes nothing. Without a list the contract refuses (E_ARGS) and setup skips it.
+   */
+  restrictKeyIps(): Promise<unknown> {
+    return this.request('ip_restriction', {}, 'limit the Orderly key to the relayer IPs');
+  }
+
+  // ---- public reads: setup's done-checks, no signature ----
+
+  /** Whether Orderly has an account for the desk's address under this broker (and it is the desk's account id). */
+  async isRegistered(brokerId: string): Promise<boolean> {
+    const q = new URLSearchParams({ address: this.evmAddress, broker_id: brokerId });
+    let data: { account_id?: unknown };
+    try {
+      data = await this.#public('GET', `/v1/get_account?${q}`, undefined, 'get_account');
+    } catch (err) {
+      // Seen on testnet 2026-10-31: an unknown address is HTTP 200, success false, code -1607 "Account not found.".
+      if (err instanceof OrderlyApiError && err.status < 500 && err.code === -1607) return false;
+      throw err;
+    }
+    if (typeof data.account_id !== 'string') throw new Error(`orderly get_account: no account_id in ${JSON.stringify(data)}`);
+    const got = normalizeAccountId(data.account_id);
+    if (got !== this.accountId) throw new Error(`orderly: the address's account under ${brokerId} is ${got}, the desk expects ${this.accountId}`);
+    return true;
+  }
+
+  /** The desk's orderly key as Orderly holds it, or null when Orderly does not know it for this account. */
+  async keyInfo(): Promise<{ scope: string | null; expiration: number | null; status: string | null } | null> {
+    const q = new URLSearchParams({ account_id: this.accountId, orderly_key: this.orderlyKey });
+    let data: { orderly_key?: unknown; scope?: unknown; expiration?: unknown; key_status?: unknown };
+    try {
+      data = await this.#public('GET', `/v1/get_orderly_key?${q}`, undefined, 'get_orderly_key');
+    } catch (err) {
+      // Seen on testnet 2026-10-31: an unknown key is HTTP 200, success false, code -1617 "orderlyKey is not exist".
+      if (err instanceof OrderlyApiError && err.status < 500 && err.code === -1617) return null;
+      throw err;
+    }
+    if (data.orderly_key !== this.orderlyKey) throw new Error(`orderly get_orderly_key: asked for ${this.orderlyKey}, got ${String(data.orderly_key)}`);
+    return {
+      scope: typeof data.scope === 'string' ? data.scope : null,
+      expiration: typeof data.expiration === 'number' ? data.expiration : null,
+      status: typeof data.key_status === 'string' ? data.key_status : null,
+    };
   }
 
   #eip712Body(action: OrderlyEip712Action): string {

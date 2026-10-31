@@ -476,6 +476,13 @@ export class ReplayContractClient implements ContractClient {
       }
       case 'positions': return { method: 'GET', path: '/v1/positions', body: '' };
       case 'holding': return { method: 'GET', path: '/v1/client/holding', body: '' };
+      case 'ip_restriction': {
+        // As interfaces 1.3: the body comes from the desk's orderly key and its set_orderly_ips list, never the caller.
+        const ips = desk.orderly_ips ?? [];
+        if (ips.length === 0) throw new ContractRefusal('E_ARGS', 'no Orderly IP list is set for this desk (set_orderly_ips)');
+        const body = JSON.stringify({ orderly_key: `ed25519:${desk.solana.authority}`, ip_restriction_list: ips.join(',') });
+        return { method: 'POST', path: '/v1/client/set_orderly_key_ip_restriction', body };
+      }
       case 'settle_pnl': case 'withdraw_request': {
         const ledger = ORDERLY_LEDGER[this.#config.network];
         const ts = req.signed_at_ms ?? 0;
