@@ -7,9 +7,11 @@
 //      where only the caller can renew the input (a blockhash) it is MpcTimeoutError. On a method that moves money
 //      or opens a position it is OutcomeUnknown: the contract takes a fresh Hyperliquid nonce or EIP-3009 counter
 //      in the first receipt, so a retry would sign a second action, while a late MPC `respond` can still publish
-//      the first signature for anyone to post.
-// set_paused is the exception to step 1: its own small gas, past the budget's queue and its 'down' refusal, so a
-// pause always goes out.
+//      the first signature for anyone to post. A Solana signature (sol_sign*) stays postable while its blockhash
+//      lives: an MPC timeout is MpcTimeoutError (the relayer signs a new message only once the first is proven
+//      expired), and any other failure, or an answer that cannot be read, is OutcomeUnknown.
+// set_paused is the exception to step 1: its own gas, past the budget's queue and its 'down' refusal, so a pause
+// always goes out.
 // The chain is behind NearTransport (near-transport.ts in production, a fake in tests), so nothing here needs keys.
 
 import type { TxRef } from '@gimbal/shared';
@@ -17,13 +19,16 @@ import type { OrderlyEip712Action, OrderlyRequest, OrderlyRestAction } from '../
 import type { NearHealth } from './budget.ts';
 import { DEFAULT_CALL_TGAS, SignatureBudget } from './budget.ts';
 import type {
-  ContractClient, DeskView, Eip3009SignedAction, HlOrder, HlSignedAction, SignedAction, SignedQuote, SolSignedAction,
-  StoredPrice,
+  ContractClient, DeskView, Eip3009SignedAction, HlOrder, HlSignedAction, OutcomeIds, SignedAction, SignedQuote,
+  SolSignedAction, StoredPrice,
 } from './types.ts';
-import { ContractRefusal, MpcTimeoutError, OutcomeUnknown, isMpcTimeout, parseRefusal } from './types.ts';
+import { ContractRefusal, MpcTimeoutError, OutcomeUnknown, isMpcTimeout, parseRefusal, solMessageDigest } from './types.ts';
 
-/** set_paused writes one flag and logs one event: ~10 TGas, far below an MPC call's 300. */
-export const PAUSE_TGAS = 10;
+/**
+ * set_paused writes one flag and logs one event. Not measured yet, so 30 TGas: headroom over the few it should
+ * burn, still a tenth of an MPC call's 300, and outside the budget either way.
+ */
+export const PAUSE_TGAS = 30;
 
 export type NearNetwork = 'mainnet' | 'testnet';
 
@@ -46,13 +51,16 @@ export interface NearTransport {
 type Retry =
   | 'same'          // read-only or idempotent (a cancel, a fee approval, prices): signing the same arguments twice is harmless
   | 'fresh'         // the same, with a timestamp the client renews (orderly_request other than an order)
-  | 'caller'        // only the caller can renew the input (a Solana blockhash, an Orderly registration nonce)
+  | 'caller'        // only the caller can renew the input (an Orderly registration nonce, a ws auth timestamp)
+  | 'blockhash'     // a Solana message: MpcTimeoutError for the caller, as 'caller'; any other failure is OutcomeUnknown
   | 'never';        // moves money or opens a position: an MPC timeout, or any failure that is not a refusal, is OutcomeUnknown
 
 interface CallOptions {
   tgas?: number;
   /** false: no budget slot (set_paused), so neither the queue nor the 'down' refusal can hold it back. */
   budget?: boolean;
+  /** Ids an OutcomeUnknown carries next to the NEAR transaction (a Solana message's digest). */
+  ids?: OutcomeIds;
 }
 
 export interface NearContractClientOptions {
@@ -203,17 +211,19 @@ export class NearContractClient implements ContractClient {
   // ---- Solana: the message carries a blockhash that a 120 s timeout outlives, so the caller rebuilds it ----
 
   solSign(deskId: string, messageB64: string, reason: string): Promise<SolSignedAction> {
-    return this.#signed('sol_sign', () => ({ desk_id: deskId, message_b64: messageB64, reason }), 'caller', deskId);
+    return this.#signed('sol_sign', () => ({ desk_id: deskId, message_b64: messageB64, reason }), 'blockhash', deskId,
+      { solMessage: solMessageDigest(messageB64) });
   }
 
   solSignRegister(deskId: string, messageB64: string): Promise<SolSignedAction> {
-    return this.#signed('sol_sign_register', () => ({ desk_id: deskId, message_b64: messageB64 }), 'caller', deskId);
+    return this.#signed('sol_sign_register', () => ({ desk_id: deskId, message_b64: messageB64 }), 'blockhash', deskId,
+      { solMessage: solMessageDigest(messageB64) });
   }
 
   solSignRescue(deskId: string, messageB64: string, quote: SignedQuote, reason: string): Promise<SolSignedAction> {
     return this.#signed('sol_sign_rescue', () => ({
       desk_id: deskId, message_b64: messageB64, quote: quote.quote, quote_signature: quote.quote_signature, reason,
-    }), 'caller', deskId);
+    }), 'blockhash', deskId, { solMessage: solMessageDigest(messageB64) });
   }
 
   // ---- Orderly (OrderlySigner) ----
@@ -285,14 +295,16 @@ export class NearContractClient implements ContractClient {
 
   // ---- the steps every call shares ----
 
-  async #signed<A extends SignedAction>(method: string, args: () => object, retry: Retry, deskId: string): Promise<A> {
-    const r = await this.#call(method, args, retry);
+  async #signed<A extends SignedAction>(method: string, args: () => object, retry: Retry, deskId: string, ids: OutcomeIds = {}): Promise<A> {
+    const r = await this.#call(method, args, retry, { ids });
     let action: SignedAction;
     try {
       action = parseSignedAction(method, r.value, deskId);
     } catch (err) {
       // The transaction ran, so a signature may be on chain even though this one cannot be read.
-      if (retry === 'never') throw new OutcomeUnknown(method, (err as Error).message, { nearTx: r.txHash }, [nearTxRef(this.network, r.txHash)]);
+      if (unknownOnFailure(retry)) {
+        throw new OutcomeUnknown(method, `${(err as Error).message}${signatureMayBePublic(retry)}`, { ...ids, nearTx: r.txHash }, [nearTxRef(this.network, r.txHash)]);
+      }
       throw err;
     }
     return { ...action, nearTx: nearTxRef(this.network, r.txHash) } as A;
@@ -300,7 +312,7 @@ export class NearContractClient implements ContractClient {
 
   async #call(method: string, args: () => object, retry: Retry, options: CallOptions = {}): Promise<{ txHash: string; value: unknown }> {
     const tgas = options.tgas ?? this.#tgas;
-    const attempts = retry === 'caller' || retry === 'never' ? 1 : 2;
+    const attempts = retry === 'same' || retry === 'fresh' ? 2 : 1;
     let last: MpcTimeoutError | null = null;
     for (let attempt = 1; attempt <= attempts; attempt++) {
       const release = options.budget === false ? () => {} : await this.#budget.acquire(tgas);
@@ -317,18 +329,19 @@ export class NearContractClient implements ContractClient {
       else if (this.#health === 'slow') this.#setHealth('ok', `${method} signed in ${Math.round(took / 1000)} s`);
       if (outcome.ok) return { txHash: outcome.txHash, value: outcome.value };
       const ref = [nearTxRef(this.network, outcome.txHash)];
+      const ids = { ...options.ids, nearTx: outcome.txHash };
       if (isMpcTimeout(outcome.failure)) {
         if (retry === 'never') {
-          throw new OutcomeUnknown(method, `the MPC network did not sign in time (${oneLine(outcome.failure)}); a late signature may still be published and posted`, { nearTx: outcome.txHash }, ref);
+          throw new OutcomeUnknown(method, `the MPC network did not sign in time (${oneLine(outcome.failure)}); a late signature may still be published and posted`, ids, ref);
         }
         last = new MpcTimeoutError(method, oneLine(outcome.failure), outcome.txHash);
         continue;
       }
       const refusal = parseRefusal(outcome.failure);
       if (refusal !== null) throw new ContractRefusal(refusal.code, refusal.message, outcome.txHash);
-      if (retry === 'never') {
+      if (unknownOnFailure(retry)) {
         // Not a refusal: the failure may have come after the MPC network signed (in the callback).
-        throw new OutcomeUnknown(method, `failed without a refusal code: ${oneLine(outcome.failure)}`, { nearTx: outcome.txHash }, ref);
+        throw new OutcomeUnknown(method, `failed without a refusal code: ${oneLine(outcome.failure)}${signatureMayBePublic(retry)}`, ids, ref);
       }
       throw new Error(`${method} failed in transaction ${outcome.txHash}: ${oneLine(outcome.failure)}`);
     }
@@ -344,6 +357,17 @@ export class NearContractClient implements ContractClient {
 
 function oneLine(text: string): string {
   return text.replace(/\s+/g, ' ').slice(0, 400);
+}
+
+/** Whether a failure that is no refusal (or an unreadable answer) leaves a signature that may be posted. */
+function unknownOnFailure(retry: Retry): boolean {
+  return retry === 'never' || retry === 'blockhash';
+}
+
+function signatureMayBePublic(retry: Retry): string {
+  return retry === 'blockhash'
+    ? '; a signature of this message may be public while its blockhash lives, so no new message until it is proven expired'
+    : '';
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);

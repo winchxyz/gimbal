@@ -11,8 +11,8 @@
 //   Arbitrum     evm_usdc_to_intents  -> transferWithAuthorization from the gas-only wallet      (arbitrum.ts)
 
 import type { TxRef } from '@gimbal/shared';
-import type { ContractClient, DeskView, HlOrder, HlSignedAction, SignedQuote, SolSignedAction } from '../contract/types.ts';
-import { MpcTimeoutError, OutcomeUnknown } from '../contract/types.ts';
+import type { ContractClient, DeskView, HlOrder, HlSignedAction, OutcomeIds, SignedQuote, SolSignedAction } from '../contract/types.ts';
+import { MpcTimeoutError, OutcomeUnknown, solMessageDigest } from '../contract/types.ts';
 import type { OrderlyRequest, OrderlyRequestKind } from '../venues/orderly-signer.ts';
 import { signedClientOrderId } from '../venues/orderly-signer.ts';
 import type { ArbitrumSubmitter } from './arbitrum.ts';
@@ -102,7 +102,10 @@ export class Relayer {
 
   // ---- Solana ----
 
-  /** sol_sign over a message `build` makes; after an MPC timeout the blockhash is stale, so it is built again once. */
+  /**
+   * sol_sign over a message `build` makes. After an MPC timeout it is built again once, only when the first
+   * blockhash is proven expired; a second timeout reaches the caller as MpcTimeoutError only on the same proof.
+   */
   async solSign(build: SolanaMessageBuilder, reason: string): Promise<TxRef[]> {
     return this.#solana(build, (m) => this.#contract.solSign(this.deskId, m, reason));
   }
@@ -118,16 +121,21 @@ export class Relayer {
     for (let attempt = 1; ; attempt++) {
       const message = await build();
       let signed: SolSignedAction;
+      const lvbh = message.lastValidBlockHeight;
+      const ids: OutcomeIds = { solMessage: solMessageDigest(message.messageB64), ...(lvbh === undefined ? {} : { solLastValidBlockHeight: lvbh }) };
       try {
         signed = await sign(message.messageB64);
       } catch (err) {
-        if (attempt < 2 && err instanceof MpcTimeoutError) {
+        if (err instanceof OutcomeUnknown) throw err.with(ids);
+        if (err instanceof MpcTimeoutError) {
           // A late MPC signature of this message could still be posted while its blockhash lives: sign a new one
-          // only once that blockhash is proven expired.
-          const lvbh = message.lastValidBlockHeight;
-          if (lvbh !== undefined && await sol.waitPastLastValidHeight(lvbh)) continue;
-          throw new OutcomeUnknown('solana', `${err.message}; the first message's blockhash is not proven expired${lvbh === undefined ? ' (no lastValidBlockHeight)' : ''}, so no second one is signed`,
-            err.txHash === null ? {} : { nearTx: err.txHash });
+          // (or hand the timeout to the caller, who may build another) only once that blockhash is proven expired.
+          if (lvbh !== undefined && await sol.waitPastLastValidHeight(lvbh)) {
+            if (attempt < 2) continue;
+            throw err;
+          }
+          throw new OutcomeUnknown('solana', `${err.message}; the ${attempt === 1 ? 'first' : 'second'} message's blockhash is not proven expired${lvbh === undefined ? ' (no lastValidBlockHeight)' : ''}, so no other one is signed`,
+            err.txHash === null ? ids : { ...ids, nearTx: err.txHash });
         }
         throw err;
       }

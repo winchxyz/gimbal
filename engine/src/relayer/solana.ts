@@ -7,10 +7,13 @@
 //     µlamports per CU);
 //   - sent with skipPreflight and maxRetries 0, then rebroadcast every 2 s while the status is polled;
 //   - NothingExecuted only with proof: the transaction landed with an error (confirmed), or the chain is past the
-//     message's lastValidBlockHeight (a block height read that succeeded) AND a history lookup of the signature
-//     succeeded and found nothing. Then it can never run, and the caller may build a new one;
-//   - anything short of that (an RPC error on the status or the height, no lastValidBlockHeight, maxWaitMs reached)
-//     is OutcomeUnknown with the signature: the caller reconciles before it sends anything else.
+//     message's lastValidBlockHeight (getEpochInfo: a block height and its slot, from one node) AND a history
+//     lookup of the signature succeeded, found nothing, and answered from a slot at or past that one. Behind a load
+//     balancer the two reads may hit different nodes; a lagging node's empty lookup proves nothing. Then it can
+//     never run, and the caller may build a new one;
+//   - anything short of that (an RPC error on the status or the height, a lookup from a node behind the height
+//     read, no lastValidBlockHeight, maxWaitMs reached) is OutcomeUnknown with the signature: the caller reconciles
+//     before it sends anything else.
 // sol_sign_register transactions have two signers and are sent by Phoenix's API, not here.
 
 import { createPublicKey, verify as edVerify } from 'node:crypto';
@@ -224,21 +227,27 @@ export class SolanaSubmitter {
       }
       const status = await this.#status(signature, false);
       if (!status.ok) lastError = status.error;
-      const landed = status.ok ? verdict(status.value) : null;
+      const landed = status.ok ? verdict(status.value.status) : null;
       if (landed === 'confirmed') return [...nearTx, ref];
       if (landed !== null) throw new NothingExecuted('solana', `the transaction failed on chain: ${landed.failed}`, [...nearTx, ref]);
 
       const expiry = await this.#expired(parsed.blockhash, options.lastValidBlockHeight);
       if (!expiry.ok) lastError = expiry.error;
-      if (expiry.ok && expiry.value !== 'valid') {
+      if (expiry.ok && expiry.value.state !== 'valid') {
         const last = await this.#status(signature, true);
-        const seen = last.ok ? verdict(last.value) : null;
+        const seen = last.ok ? verdict(last.value.status) : null;
         if (seen === 'confirmed') return [...nearTx, ref];
         if (seen !== null) throw new NothingExecuted('solana', `the transaction failed on chain: ${seen.failed}`, [...nearTx, ref]);
-        if (expiry.value === 'past-last-valid-height' && last.ok && last.value === null) {
-          throw new NothingExecuted('solana', `the blockhash expired (past lastValidBlockHeight ${options.lastValidBlockHeight}) and the signature is not on chain${lastError === null ? '' : ` (last error: ${lastError})`}`, nearTx);
+        const notFound = last.ok && last.value.status === null;
+        if (expiry.value.state === 'past-last-valid-height' && notFound) {
+          const behind = last.value.slot === null || last.value.slot < expiry.value.slot;
+          if (!behind) {
+            throw new NothingExecuted('solana', `the blockhash expired (past lastValidBlockHeight ${options.lastValidBlockHeight}) and the signature is not on chain${lastError === null ? '' : ` (last error: ${lastError})`}`, nearTx);
+          }
+          // The lookup came from a node that had not reached the slot the height was read at: no proof.
+          lastError = `the history lookup answered at slot ${String(last.value.slot ?? 'unknown')}, behind slot ${expiry.value.slot} where the height passed lastValidBlockHeight (a lagging node)`;
         }
-        if (expiry.value === 'rpc-says-invalid' && last.ok && last.value === null) {
+        if (expiry.value.state === 'rpc-says-invalid' && notFound) {
           throw unknown('the RPC says the blockhash is no longer valid and the signature is not found, but without lastValidBlockHeight that is no proof');
         }
         if (!last.ok) lastError = last.error;
@@ -259,32 +268,41 @@ export class SolanaSubmitter {
     const until = this.#now() + maxWaitMs;
     for (;;) {
       const r = await this.#expired('', lastValidBlockHeight);
-      if (r.ok && r.value === 'past-last-valid-height') return true;
+      if (r.ok && r.value.state === 'past-last-valid-height') return true;
       if (this.#now() >= until) return false;
       await this.#sleep(this.#rebroadcastMs);
     }
   }
 
-  async #status(signature: string, history: boolean): Promise<Read<SignatureStatus | null>> {
+  /** A signature's status, and the slot the answering node read it at (its context; null when it gave none). */
+  async #status(signature: string, history: boolean): Promise<Read<{ status: SignatureStatus | null; slot: number | null }>> {
     try {
-      const r = await this.#rpc<{ value: (SignatureStatus | null)[] }>('getSignatureStatuses', [[signature], { searchTransactionHistory: history }]);
+      const r = await this.#rpc<{ context?: { slot?: unknown }; value: (SignatureStatus | null)[] }>('getSignatureStatuses', [[signature], { searchTransactionHistory: history }]);
       if (!Array.isArray(r?.value)) return { ok: false, error: 'getSignatureStatuses: no value list in the answer' };
-      return { ok: true, value: r.value[0] ?? null };
+      const slot = r.context?.slot;
+      return { ok: true, value: { status: r.value[0] ?? null, slot: Number.isSafeInteger(slot) ? slot as number : null } };
     } catch (err) {
       return { ok: false, error: (err as Error).message };
     }
   }
 
-  async #expired(blockhash: string, lastValidBlockHeight: number | undefined): Promise<Read<'valid' | 'past-last-valid-height' | 'rpc-says-invalid'>> {
+  /**
+   * Whether the message's blockhash is still valid, with the slot the answer holds for. With lastValidBlockHeight,
+   * getEpochInfo gives the height and its slot from the same node; else isBlockhashValid (a hint, never proof).
+   */
+  async #expired(blockhash: string, lastValidBlockHeight: number | undefined): Promise<Read<{ state: 'valid' | 'past-last-valid-height' | 'rpc-says-invalid'; slot: number }>> {
     try {
       if (lastValidBlockHeight !== undefined) {
-        const height = await this.#rpc<number>('getBlockHeight', [{ commitment: 'confirmed' }]);
-        if (!Number.isSafeInteger(height)) return { ok: false, error: `getBlockHeight answered ${JSON.stringify(height)}` };
-        return { ok: true, value: height > lastValidBlockHeight ? 'past-last-valid-height' : 'valid' };
+        const info = await this.#rpc<{ absoluteSlot?: unknown; blockHeight?: unknown }>('getEpochInfo', [{ commitment: 'confirmed' }]);
+        const { absoluteSlot, blockHeight } = info ?? {};
+        if (!Number.isSafeInteger(blockHeight) || !Number.isSafeInteger(absoluteSlot)) {
+          return { ok: false, error: `getEpochInfo answered ${JSON.stringify(info)?.slice(0, 120)}` };
+        }
+        return { ok: true, value: { state: (blockHeight as number) > lastValidBlockHeight ? 'past-last-valid-height' : 'valid', slot: absoluteSlot as number } };
       }
-      const r = await this.#rpc<{ value: boolean }>('isBlockhashValid', [blockhash, { commitment: 'confirmed' }]);
+      const r = await this.#rpc<{ context?: { slot?: unknown }; value: boolean }>('isBlockhashValid', [blockhash, { commitment: 'confirmed' }]);
       if (typeof r?.value !== 'boolean') return { ok: false, error: 'isBlockhashValid: no value in the answer' };
-      return { ok: true, value: r.value ? 'valid' : 'rpc-says-invalid' };
+      return { ok: true, value: { state: r.value ? 'valid' : 'rpc-says-invalid', slot: Number(r.context?.slot ?? 0) } };
     } catch (err) {
       return { ok: false, error: (err as Error).message };
     }

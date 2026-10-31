@@ -1,6 +1,7 @@
 // The Solana submitter with solana.json messages the replay contract signed with the public desk seed, against a
 // stub JSON-RPC: rebroadcast until confirmed; NothingExecuted only for a proven expiry or an on-chain failure, every
-// RPC failure or a run out of time as OutcomeUnknown with the signature; and what is never sent.
+// RPC failure, a lookup from a lagging node or a run out of time as OutcomeUnknown with the signature; and what is
+// never sent.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -25,11 +26,12 @@ async function signedIoc(): Promise<SolSignedAction> {
 }
 
 /**
- * A JSON-RPC stub: `statuses` answers getSignatureStatuses in turn (the last one repeats); `fail` answers a method
- * with HTTP 429 (when it returns true for that call's params).
+ * A JSON-RPC stub: `statuses` answers getSignatureStatuses in turn (the last one repeats), read at `statusSlot`;
+ * getEpochInfo answers `blockHeight` at `slot`; `fail` answers a method with HTTP 429 (when it returns true for that
+ * call's params).
  */
 function rpc(options: {
-  statuses: unknown[]; blockhashValid?: boolean[]; blockHeight?: number;
+  statuses: unknown[]; blockhashValid?: boolean[]; blockHeight?: number; slot?: number; statusSlot?: number;
   fail?: Record<string, (params: unknown[]) => boolean>;
 }) {
   let s = 0;
@@ -40,9 +42,9 @@ function rpc(options: {
     const result = (() => {
       switch (method) {
         case 'sendTransaction': return 'sig';
-        case 'getSignatureStatuses': return { context: { slot: 1 }, value: [options.statuses[Math.min(s++, options.statuses.length - 1)]] };
+        case 'getSignatureStatuses': return { context: { slot: options.statusSlot ?? options.slot ?? 1 }, value: [options.statuses[Math.min(s++, options.statuses.length - 1)]] };
         case 'isBlockhashValid': return { context: { slot: 1 }, value: options.blockhashValid?.[Math.min(b++, options.blockhashValid.length - 1)] ?? true };
-        case 'getBlockHeight': return options.blockHeight ?? 0;
+        case 'getEpochInfo': return { absoluteSlot: options.slot ?? 1, blockHeight: options.blockHeight ?? 0, epoch: 1, slotIndex: 0, slotsInEpoch: 432_000 };
         default: throw new Error(`unexpected ${method}`);
       }
     })();
@@ -102,7 +104,7 @@ test('NothingExecuted only for a proven expiry: past lastValidBlockHeight, and a
   let height = 990;
   const later = stubFetch((call) => {
     const { id, method } = call.json as { id: number; method: string };
-    const result = method === 'getBlockHeight' ? (height += 5) : method === 'getSignatureStatuses' ? { value: [null] } : 'sig';
+    const result = method === 'getEpochInfo' ? { absoluteSlot: 7, blockHeight: (height += 5) } : method === 'getSignatureStatuses' ? { context: { slot: 7 }, value: [null] } : 'sig';
     return { jsonrpc: '2.0', id, result };
   });
   await assert.rejects(submitter(later.fetch).submit(signed, { lastValidBlockHeight: 1000 }), NothingExecuted);
@@ -121,7 +123,7 @@ test('an RPC 429 on the status reads is OutcomeUnknown with the signature, never
     return true;
   });
   // The block height read failing is no proof of expiry either.
-  const noHeight = rpc({ statuses: [null], fail: { getBlockHeight: () => true } });
+  const noHeight = rpc({ statuses: [null], fail: { getEpochInfo: () => true } });
   await assert.rejects(submitter(noHeight.fetch).submit(signed, { lastValidBlockHeight: 1000 }), OutcomeUnknown);
 });
 
@@ -134,6 +136,29 @@ test('a failed history lookup after the blockhash expired is OutcomeUnknown', as
     assert.match(err.message, /no proof either way/);
     return true;
   });
+});
+
+test('an empty history lookup from a node behind the height read proves nothing (a load balancer, a lagging node)', async () => {
+  const signed = await signedIoc();
+  const { signature } = SolanaSubmitter.transaction(signed);
+  // The height passed lastValidBlockHeight at slot 500, the lookup answered at slot 480: OutcomeUnknown.
+  const lagging = rpc({ statuses: [null], blockHeight: 1001, slot: 500, statusSlot: 480 });
+  await assert.rejects(submitter(lagging.fetch).submit(signed, { lastValidBlockHeight: 1000 }), (err: unknown) => {
+    assert.ok(err instanceof OutcomeUnknown, String(err));
+    assert.equal(err.ids.solSignature, signature);
+    assert.match(err.message, /answered at slot 480, behind slot 500 .*a lagging node/);
+    return true;
+  });
+  // No context slot on the lookup: no proof either.
+  const noContext = stubFetch((call) => {
+    const { id, method } = call.json as { id: number; method: string };
+    const result = method === 'getEpochInfo' ? { absoluteSlot: 500, blockHeight: 1001 } : method === 'getSignatureStatuses' ? { value: [null] } : 'sig';
+    return { jsonrpc: '2.0', id, result };
+  });
+  await assert.rejects(submitter(noContext.fetch).submit(signed, { lastValidBlockHeight: 1000 }), OutcomeUnknown);
+  // A lookup at the same slot or later is the proof.
+  const caughtUp = rpc({ statuses: [null], blockHeight: 1001, slot: 500, statusSlot: 500 });
+  await assert.rejects(submitter(caughtUp.fetch).submit(signed, { lastValidBlockHeight: 1000 }), NothingExecuted);
 });
 
 test('maxWaitMs reached without proof: OutcomeUnknown, also when the RPC only says the blockhash is invalid', async () => {

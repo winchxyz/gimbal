@@ -9,7 +9,7 @@ import type { NearCallOutcome, NearTransport } from './near-client.ts';
 import { NearContractClient, parseSignedAction, parseStoredPrices } from './near-client.ts';
 import { allowanceOf, outcomeOf } from './near-transport.ts';
 import type { HlOrder } from './types.ts';
-import { ContractRefusal, MpcTimeoutError, OutcomeUnknown, SignatureBudgetError, isMpcTimeout, parseRefusal } from './types.ts';
+import { ContractRefusal, MpcTimeoutError, OutcomeUnknown, SignatureBudgetError, isMpcTimeout, parseRefusal, solMessageDigest } from './types.ts';
 
 const DESK = 'alpha';
 const ORDER: HlOrder = { asset: 1, is_buy: true, px: '2400.5', sz: '0.0042', reduce_only: false, tif: 'Ioc', cloid: null };
@@ -114,6 +114,36 @@ test('orderly_request retries with a fresh timestamp; sol_sign and orderly_regis
     once.answers.push(timeout);
     await assert.rejects(call(client(once)), MpcTimeoutError);
     assert.equal(once.calls.length, 1);
+  }
+});
+
+test('sol_sign*: a failure that is no refusal, or an answer that cannot be read, is OutcomeUnknown with the message digest', async () => {
+  const message = Buffer.from('a solana message').toString('base64');
+  const digest = solMessageDigest(message);
+  const gasOut = (): NearCallOutcome => ({ txHash: '', ok: false, failure: '{"ActionError":{"kind":{"FunctionCallError":{"ExecutionError":"Exceeded the prepaid gas."}}}}' });
+  const unreadable = (): NearCallOutcome => ({ txHash: '', ok: true, value: { desk_id: DESK, kind: 'transaction' } });
+  for (const [name, call] of [
+    ['sol_sign', (c: NearContractClient) => c.solSign(DESK, message, 'enter')],
+    ['sol_sign_register', (c: NearContractClient) => c.solSignRegister(DESK, message)],
+    ['sol_sign_rescue', (c: NearContractClient) => c.solSignRescue(DESK, message, { quote: { amountIn: '1' }, quote_signature: 'q' }, 'rescue')],
+  ] as const) {
+    for (const answer of [gasOut, unreadable]) {
+      const chain = new FakeChain();
+      chain.answers.push(answer);
+      await assert.rejects(call(client(chain)), (err: unknown) => {
+        assert.ok(err instanceof OutcomeUnknown, `${name}: ${String(err)}`);
+        assert.equal(err.what, name);
+        assert.equal(err.ids.nearTx, 'tx1');
+        assert.equal(err.ids.solMessage, digest);
+        assert.match(err.message, /may be public while its blockhash lives/);
+        return true;
+      });
+      assert.equal(chain.calls.length, 1, `${name}: signed once`);
+    }
+    // A refusal is still a refusal, and an MPC timeout still the caller's MpcTimeoutError.
+    const refused = new FakeChain();
+    refused.answers.push(refusal('E_SOL_MESSAGE: no compute budget'));
+    await assert.rejects(call(client(refused)), ContractRefusal);
   }
 });
 
@@ -228,7 +258,7 @@ test('fund_venue is checked by the ledger: idle USDC must drop by amountIn, else
   });
 });
 
-test('pause goes out at 10 TGas past a full or empty budget, and is read back from get_desk', async () => {
+test('pause goes out at 30 TGas past a full or empty budget, and is read back from get_desk', async () => {
   const chain = new FakeChain();
   chain.allowanceLeft = 0n;                                  // the budget is 'down': MPC calls are refused
   let paused = false;
@@ -238,7 +268,7 @@ test('pause goes out at 10 TGas past a full or empty budget, and is read back fr
   const c = client(chain, { onHealth: (s) => health.push(s) });
   await assert.rejects(c.hlOrder(DESK, ORDER, 'enter'), SignatureBudgetError);
   const tx = await c.pause(DESK);
-  assert.deepEqual(chain.calls.map((x) => [x.method, x.tgas]), [['set_paused', 10]]);
+  assert.deepEqual(chain.calls.map((x) => [x.method, x.tgas]), [['set_paused', 30]]);
   assert.deepEqual(chain.calls[0]!.args, { desk_id: DESK, paused: true });
   assert.equal(tx[0]!.id, 'tx1');
   assert.deepEqual(health, ['down']);

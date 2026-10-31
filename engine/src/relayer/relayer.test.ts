@@ -112,7 +112,8 @@ test('solSign: after an MPC timeout the message is built again with a fresh bloc
   const rpc = stubFetch((call) => {
     const { id, method } = call.json as { id: number; method: string };
     // Height 101 > lastValidBlockHeight 100: the first message's blockhash is proven expired.
-    const result = method === 'getSignatureStatuses' ? { value: [{ err: null, confirmationStatus: 'confirmed' }] } : method === 'getBlockHeight' ? 101 : 'sig';
+    const result = method === 'getSignatureStatuses' ? { value: [{ err: null, confirmationStatus: 'confirmed' }] }
+      : method === 'getEpochInfo' ? { absoluteSlot: 5, blockHeight: 101 } : 'sig';
     return { jsonrpc: '2.0', id, result };
   });
   let builds = 0;
@@ -127,19 +128,54 @@ test('solSign: after an MPC timeout the message is built again with a fresh bloc
   assert.equal(builds, 2);
   assert.equal(tx.length, 1);
   assert.equal(tx[0]!.chain, 'solana');
-  // A second timeout in a row is the caller's to see.
+  // A second timeout in a row is the caller's to see, once that message's blockhash is proven expired too.
   timeouts = 2;
   const message = Buffer.from(ioc.message_hex, 'hex').toString('base64');
   await assert.rejects(relayer.solSign(async () => ({ messageB64: message, lastValidBlockHeight: 100 }), 'enter'), MpcTimeoutError);
+  // The second message built with a later lastValidBlockHeight the chain has not passed: OutcomeUnknown.
+  timeouts = 2;
+  let lvbh = 100;
+  await assert.rejects(relayer.solSign(async () => ({ messageB64: message, lastValidBlockHeight: (lvbh += 50) - 50 }), 'enter'), (err: unknown) => {
+    assert.ok(err instanceof OutcomeUnknown, String(err));
+    assert.match(err.message, /the second message's blockhash is not proven expired/);
+    assert.equal(err.ids.solLastValidBlockHeight, 150);
+    return true;
+  });
   // Without lastValidBlockHeight the first blockhash is never proven expired: OutcomeUnknown, no second signature.
   timeouts = 1;
   builds = 0;
   await assert.rejects(relayer.solSign(async () => { builds++; return { messageB64: message }; }, 'enter'), (err: unknown) => {
     assert.ok(err instanceof OutcomeUnknown, String(err));
     assert.match(err.message, /not proven expired \(no lastValidBlockHeight\)/);
+    assert.equal(err.ids.solMessage, solMessageDigest(message));
     return true;
   });
   assert.equal(builds, 1);
+});
+
+test('solSign: an unknown outcome from the contract (no refusal, unreadable answer) is never rebuilt and names the message', async () => {
+  const sol = vectors('solana');
+  const ioc = sol.cases.find((c: { name: string }) => c.name.startsWith('IOC buy 0.005 ETH'));
+  const time = fakeTime(T0);
+  const contract = testContract(time.now);
+  const lost: ContractClient = Object.assign(Object.create(contract) as ContractClient, {
+    getDesk: (deskId: string) => contract.getDesk(deskId),
+    solSign: async () => { throw new OutcomeUnknown('sol_sign', 'failed without a refusal code', { nearTx: 'h9' }); },
+  });
+  const rpc = stubFetch(() => ({ jsonrpc: '2.0', id: 1, result: 'sig' }));
+  let builds = 0;
+  const relayer = new Relayer({
+    contract: lost, deskId: 'alpha',
+    solana: new SolanaSubmitter({ rpcUrl: 'https://rpc.example', network: 'testnet', fetch: rpc.fetch, sleep: time.sleep, now: time.now }),
+  });
+  const message = Buffer.from(ioc.message_hex, 'hex').toString('base64');
+  await assert.rejects(relayer.solSign(async () => { builds++; return { messageB64: message, lastValidBlockHeight: 100 }; }, 'enter'), (err: unknown) => {
+    assert.ok(err instanceof OutcomeUnknown, String(err));
+    assert.deepEqual(err.ids, { nearTx: 'h9', solMessage: solMessageDigest(message), solLastValidBlockHeight: 100 });
+    return true;
+  });
+  assert.equal(builds, 1);
+  assert.equal(rpc.calls.length, 0);
 });
 
 test('solSign: a contract that signed another message than the one built, or for another fee payer, sends nothing', async () => {
