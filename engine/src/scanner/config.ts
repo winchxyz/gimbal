@@ -102,6 +102,10 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
  * the contract caps every order at policy.max_notional_usd whatever the engine is told.
  */
 export const STRATEGY_LIMITS = {
+  // The smallest order the desk venues take: Hyperliquid refuses an order under $10 of value, Orderly's
+  // min_notional is 10 USDC on its markets (orderly-wire fixture, 2026-10-31). A leg below it could never be
+  // opened, and a tiny one turns every one-off cost into an APR of 1e13 or a null number.
+  minLegUsd: 10,
   maxLegUsd: 100_000,
   maxLeverage: 10,
   maxMinNetAprPct: 1_000,
@@ -127,7 +131,7 @@ export function parseStrategyConfig(value: unknown, policy: ContractPolicy | nul
   const L = STRATEGY_LIMITS;
   if (typeof auto !== 'boolean') throw new Error('strategy: auto must be a boolean');
   if (!between(minNetAprPct, 0, L.maxMinNetAprPct)) throw new Error(`strategy: minNetAprPct must be a number from 0 to ${L.maxMinNetAprPct}`);
-  if (!isNum(legUsd) || !(legUsd > 0) || legUsd > L.maxLegUsd) throw new Error(`strategy: legUsd must be a number > 0 and <= ${L.maxLegUsd}`);
+  if (!between(legUsd, L.minLegUsd, L.maxLegUsd)) throw new Error(`strategy: legUsd must be a number from ${L.minLegUsd} to ${L.maxLegUsd}`);
   if (policy !== null && legUsd > policy.max_notional_usd) {
     throw new Error(`strategy: legUsd ${legUsd} is over the policy cap of ${policy.max_notional_usd} USD per leg`);
   }

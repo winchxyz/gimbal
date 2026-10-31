@@ -253,7 +253,7 @@ test('the cross-site PUT /strategy from the review changes nothing; POST and PUT
   assert.match((bounded.json as { error: string }).error, /minNetAprPct must be a number from 0/);
   const huge = await call('PUT', '/strategy', JSON.stringify({ ...DEFAULT_STRATEGY, legUsd: 1e308 }));
   assert.equal(huge.status, 400);
-  assert.match((huge.json as { error: string }).error, /legUsd must be a number > 0 and <= 100000/);
+  assert.match((huge.json as { error: string }).error, /legUsd must be a number from 10 to 100000/);
   assert.deepEqual((await call('GET', '/strategy')).json, before);
 });
 

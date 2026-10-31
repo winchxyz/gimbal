@@ -25,13 +25,17 @@ test('strategy: what a hostile page sent is refused, field by field', () => {
   const bad: [Record<string, unknown>, RegExp][] = [
     // The values a cross-site PUT tried: a negative minimum, a billion-dollar leg, 1000× leverage.
     [{ minNetAprPct: -1000 }, /minNetAprPct must be a number from 0 to 1000/],
-    [{ legUsd: 1e9 }, /legUsd must be a number > 0 and <= 100000/],
+    [{ legUsd: 1e9 }, /legUsd must be a number from 10 to 100000/],
     [{ maxLeverage: 1000 }, /maxLeverage must be a number from 1 to 10/],
     // 1e308 passes a plain > 0 check and turns into NaN and Infinity in every cost term.
-    [{ legUsd: 1e308 }, /legUsd must be a number > 0/],
-    [{ legUsd: 0 }, /legUsd must be a number > 0/],
-    [{ legUsd: Number.NaN }, /legUsd must be a number > 0/],
-    [{ legUsd: '1000' }, /legUsd must be a number > 0/],
+    [{ legUsd: 1e308 }, /legUsd must be a number from 10/],
+    [{ legUsd: 0 }, /legUsd must be a number from 10/],
+    [{ legUsd: Number.NaN }, /legUsd must be a number from 10/],
+    [{ legUsd: '1000' }, /legUsd must be a number from 10/],
+    // From the review: 1e-310 made null numbers, 1e-9 made ±1e13 % APR. Below the venues' $10 minimum order.
+    [{ legUsd: 1e-310 }, /legUsd must be a number from 10 to 100000/],
+    [{ legUsd: 1e-9 }, /legUsd must be a number from 10 to 100000/],
+    [{ legUsd: 9.99 }, /legUsd must be a number from 10 to 100000/],
     [{ legUsd: 6000 }, /legUsd 6000 is over the policy cap of 5000 USD per leg/],
     [{ maxLeverage: 0.5 }, /maxLeverage must be a number from 1 to 10/],
     [{ minNetAprPct: 1e6 }, /minNetAprPct must be a number from 0 to 1000/],
@@ -55,6 +59,9 @@ test('strategy: what a hostile page sent is refused, field by field', () => {
   assert.throws(() => parseStrategyConfig({ ...DEFAULT_STRATEGY, legUsd: STRATEGY_LIMITS.maxLegUsd + 1 }), /legUsd must be/);
   // Without a policy the engine cap is the only one: 100k passes.
   assert.equal(parseStrategyConfig({ ...DEFAULT_STRATEGY, legUsd: STRATEGY_LIMITS.maxLegUsd }).legUsd, 100_000);
+  // The smallest order the venues take is the smallest leg.
+  assert.equal(STRATEGY_LIMITS.minLegUsd, 10);
+  assert.equal(parseStrategyConfig({ ...DEFAULT_STRATEGY, legUsd: 10 }, POLICY).legUsd, 10);
   assert.equal(parseStrategyConfig({ ...DEFAULT_STRATEGY, stopDrawdownPct: null }, POLICY).stopDrawdownPct, null);
 });
 
