@@ -360,6 +360,26 @@ fn new_refuses_mock_prices_on_mainnet() {
 }
 
 #[test]
+#[should_panic(expected = "E_ARGS: hl_builder_tenth_bps is 0")]
+fn new_refuses_a_zero_builder_fee() {
+    called_by(contract_id());
+    Gimbal::new(
+        Network::Testnet,
+        mpc_id(),
+        PriceSource::Mock,
+        treasury(),
+        FeeConfig {
+            hl_builder_tenth_bps: 0,
+            ..fees()
+        },
+        OrderlyConfig {
+            broker_id: "woofi_dex".into(),
+            chain_id: ARBITRUM_SEPOLIA,
+        },
+    );
+}
+
+#[test]
 fn config_json() {
     let g = testnet();
     assert_eq!(
