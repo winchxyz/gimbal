@@ -1,0 +1,332 @@
+// A minimal NEAR testnet client for the deploy and live-check scripts: JSON-RPC, transactions signed
+// with a key file from .keys/ (never printed), keccak256, base58 and Solana address derivation.
+// No dependencies: node:crypto signs and hashes, the rest is written out here.
+
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign } from 'node:crypto';
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+export const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+export const KEYS = join(ROOT, '.keys');
+export const RPC_URLS = [process.env.NEAR_RPC_URL, 'https://rpc.testnet.near.org', 'https://test.rpc.fastnear.com'].filter(Boolean);
+export const TGAS = 10n ** 12n;
+export const YOCTO_PER_NEAR = 10n ** 24n;
+
+// --- base58 ---
+
+const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+export function b58encode(bytes) {
+  let n = 0n;
+  for (const b of bytes) n = n * 256n + BigInt(b);
+  let out = '';
+  while (n > 0n) {
+    out = B58[Number(n % 58n)] + out;
+    n /= 58n;
+  }
+  for (const b of bytes) {
+    if (b !== 0) break;
+    out = '1' + out;
+  }
+  return out;
+}
+
+export function b58decode(s) {
+  let n = 0n;
+  for (const c of s) {
+    const i = B58.indexOf(c);
+    if (i < 0) throw new Error('not base58');
+    n = n * 58n + BigInt(i);
+  }
+  const bytes = [];
+  while (n > 0n) {
+    bytes.unshift(Number(n % 256n));
+    n /= 256n;
+  }
+  for (const c of s) {
+    if (c !== '1') break;
+    bytes.unshift(0);
+  }
+  return Buffer.from(bytes);
+}
+
+// --- keccak256 (Ethereum's, not SHA3-256) ---
+
+const RC = [
+  0x0000000000000001n, 0x0000000000008082n, 0x800000000000808an, 0x8000000080008000n,
+  0x000000000000808bn, 0x0000000080000001n, 0x8000000080008081n, 0x8000000000008009n,
+  0x000000000000008an, 0x0000000000000088n, 0x0000000080008009n, 0x000000008000000an,
+  0x000000008000808bn, 0x800000000000008bn, 0x8000000000008089n, 0x8000000000008003n,
+  0x8000000000008002n, 0x8000000000000080n, 0x000000000000800an, 0x800000008000000an,
+  0x8000000080008081n, 0x8000000000008080n, 0x0000000080000001n, 0x8000000080008008n,
+];
+// ROT[x][y]
+const ROT = [
+  [0, 36, 3, 41, 18],
+  [1, 44, 10, 45, 2],
+  [62, 6, 43, 15, 61],
+  [28, 55, 25, 21, 56],
+  [27, 20, 39, 8, 14],
+];
+const M64 = (1n << 64n) - 1n;
+const rotl = (v, n) => (n === 0 ? v : ((v << BigInt(n)) | (v >> BigInt(64 - n))) & M64);
+
+function keccakF(a) {
+  for (let r = 0; r < 24; r++) {
+    const c = [0, 1, 2, 3, 4].map((x) => a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20]);
+    for (let i = 0; i < 25; i++) a[i] ^= c[(i % 5 + 4) % 5] ^ rotl(c[(i % 5 + 1) % 5], 1);
+    const b = new Array(25);
+    for (let x = 0; x < 5; x++) for (let y = 0; y < 5; y++) b[y + 5 * ((2 * x + 3 * y) % 5)] = rotl(a[x + 5 * y], ROT[x][y]);
+    for (let x = 0; x < 5; x++) for (let y = 0; y < 5; y++) a[x + 5 * y] = b[x + 5 * y] ^ (~b[((x + 1) % 5) + 5 * y] & M64 & b[((x + 2) % 5) + 5 * y]);
+    a[0] ^= RC[r];
+  }
+}
+
+export function keccak256(data) {
+  const rate = 136;
+  const msg = Buffer.from(data);
+  const padded = Buffer.alloc(Math.ceil((msg.length + 1) / rate) * rate);
+  msg.copy(padded);
+  padded[msg.length] ^= 0x01;
+  padded[padded.length - 1] ^= 0x80;
+  const a = new Array(25).fill(0n);
+  for (let off = 0; off < padded.length; off += rate) {
+    for (let i = 0; i < rate / 8; i++) a[i] ^= padded.readBigUInt64LE(off + 8 * i);
+    keccakF(a);
+  }
+  const out = Buffer.alloc(32);
+  for (let i = 0; i < 4; i++) out.writeBigUInt64LE(a[i], 8 * i);
+  return out;
+}
+
+if (keccak256(Buffer.alloc(0)).toString('hex') !== 'c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470') {
+  throw new Error('keccak256 self-test failed');
+}
+
+export const sha256 = (data) => createHash('sha256').update(data).digest();
+
+/** The lowercase 0x address of a 64-byte uncompressed secp256k1 key (x ‖ y). */
+export const evmAddress = (key64) => '0x' + keccak256(key64).subarray(12).toString('hex');
+
+// --- Solana derivation (find_program_address, as the contract's core does it) ---
+
+const P = (1n << 255n) - 19n;
+const modp = (x) => ((x % P) + P) % P;
+function powmod(b, e) {
+  let r = 1n;
+  b = modp(b);
+  while (e > 0n) {
+    if (e & 1n) r = (r * b) % P;
+    b = (b * b) % P;
+    e >>= 1n;
+  }
+  return r;
+}
+const D = modp(-121665n * powmod(121666n, P - 2n));
+
+/** Whether 32 bytes decompress to an Ed25519 point (curve25519-dalek's `decompress`). */
+export function isOnCurve(bytes) {
+  const b = Buffer.from(bytes);
+  b[31] &= 0x7f;
+  let y = 0n;
+  for (let i = 31; i >= 0; i--) y = (y << 8n) | BigInt(b[i]);
+  y = modp(y);
+  const y2 = (y * y) % P;
+  const u = modp(y2 - 1n);
+  const v = modp(D * y2 + 1n);
+  const w = (u * powmod(v, P - 2n)) % P;
+  return w === 0n || powmod(w, (P - 1n) / 2n) === 1n;
+}
+
+export function findProgramAddress(seeds, program) {
+  for (let bump = 255; bump >= 1; bump--) {
+    const hash = sha256(Buffer.concat([...seeds.map((s) => Buffer.from(s)), Buffer.from([bump]), program, Buffer.from('ProgramDerivedAddress')]));
+    if (!isOnCurve(hash)) return hash;
+  }
+  throw new Error('no program address');
+}
+
+const TOKEN_PROGRAM = b58decode('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+const ATA_PROGRAM = b58decode('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
+const PHOENIX_PROGRAM = b58decode('EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih');
+
+/** The `SolanaAccounts` `create_desk` takes for an authority (base58), given the two mints. */
+export function solanaAccounts(authority, usdcMint, phusdMint) {
+  const a = b58decode(authority);
+  const ata = (mint) => b58encode(findProgramAddress([a, TOKEN_PROGRAM, b58decode(mint)], ATA_PROGRAM));
+  return {
+    authority,
+    usdc_ata: ata(usdcMint),
+    phusd_ata: ata(phusdMint),
+    phoenix_trader: b58encode(findProgramAddress([Buffer.from('trader'), a, Buffer.from([0]), Buffer.from([0])], PHOENIX_PROGRAM)),
+  };
+}
+
+// --- keys (the values never leave this module) ---
+
+const PKCS8_ED25519 = Buffer.from('302e020100300506032b657004220420', 'hex');
+
+/** A key file of .keys/ as a signer: its account, public key and a sign function. */
+export function loadKey(accountId) {
+  const file = join(KEYS, `${accountId}.json`);
+  const json = JSON.parse(readFileSync(file, 'utf8'));
+  if (json.account_id !== accountId) throw new Error(`${file} is not the key of ${accountId}`);
+  const raw = b58decode(json.private_key.replace(/^ed25519:/, ''));
+  const privateKey = createPrivateKey({ key: Buffer.concat([PKCS8_ED25519, raw.subarray(0, 32)]), format: 'der', type: 'pkcs8' });
+  const publicKey = b58decode(json.public_key.replace(/^ed25519:/, ''));
+  const derived = createPublicKey(privateKey).export({ format: 'jwk' }).x;
+  if (Buffer.from(derived, 'base64url').compare(publicKey) !== 0) throw new Error(`${file}: the public key is not the private key's`);
+  return { accountId, publicKey, publicKeyString: json.public_key, sign: (msg) => sign(null, msg, privateKey) };
+}
+
+/** Writes a new ed25519 key for `accountId` into .keys/ (refusing to overwrite) and returns its public key. */
+export function newKey(accountId) {
+  const file = join(KEYS, `${accountId}.json`);
+  if (existsSync(file)) throw new Error(`${file} exists`);
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+  const seed = Buffer.from(privateKey.export({ format: 'jwk' }).d, 'base64url');
+  const pub = Buffer.from(publicKey.export({ format: 'jwk' }).x, 'base64url');
+  mkdirSync(KEYS, { recursive: true });
+  const public_key = `ed25519:${b58encode(pub)}`;
+  writeFileSync(file, JSON.stringify({ account_id: accountId, public_key, private_key: `ed25519:${b58encode(Buffer.concat([seed, pub]))}` }) + '\n', { mode: 0o600 });
+  return public_key;
+}
+
+// --- JSON-RPC ---
+
+export async function rpc(method, params) {
+  let last;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const url = RPC_URLS[attempt % RPC_URLS.length];
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 'gimbal', method, params }),
+        signal: AbortSignal.timeout(60_000),
+      });
+      const json = await res.json();
+      if (json.error) {
+        const cause = json.error.cause?.name ?? json.error.name;
+        if (['TIMEOUT_ERROR', 'TooManyRequests'].includes(cause) || res.status === 429) {
+          last = new Error(`${method}: ${cause}`);
+          last.timeout = cause === 'TIMEOUT_ERROR';
+          await sleep(2000);
+          if (last.timeout) throw last;
+          continue;
+        }
+        const err = new Error(`${method}: ${JSON.stringify(json.error).slice(0, 2000)}`);
+        err.rpc = json.error;
+        throw err;
+      }
+      return json.result;
+    } catch (e) {
+      if (e.rpc || e.timeout) throw e;
+      last = e;
+      await sleep(1500);
+    }
+  }
+  throw last;
+}
+
+export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+export async function view(contract, method, args = {}) {
+  const r = await rpc('query', {
+    request_type: 'call_function',
+    finality: 'final',
+    account_id: contract,
+    method_name: method,
+    args_base64: Buffer.from(JSON.stringify(args)).toString('base64'),
+  });
+  if (r.error) throw new Error(`${contract}.${method}: ${r.error}`);
+  return JSON.parse(Buffer.from(r.result).toString() || 'null');
+}
+
+export async function account(accountId) {
+  return rpc('query', { request_type: 'view_account', finality: 'final', account_id: accountId });
+}
+
+// --- borsh transactions ---
+
+class Writer {
+  parts = [];
+  u8(n) { this.parts.push(Buffer.from([n])); return this; }
+  u32(n) { const b = Buffer.alloc(4); b.writeUInt32LE(n); this.parts.push(b); return this; }
+  u64(n) { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); this.parts.push(b); return this; }
+  u128(n) { const b = Buffer.alloc(16); const v = BigInt(n); b.writeBigUInt64LE(v & M64); b.writeBigUInt64LE(v >> 64n, 8); this.parts.push(b); return this; }
+  bytes(b) { this.parts.push(Buffer.from(b)); return this; }
+  vec(b) { return this.u32(b.length).bytes(b); }
+  string(s) { return this.vec(Buffer.from(s, 'utf8')); }
+  done() { return Buffer.concat(this.parts); }
+}
+
+export const actions = {
+  deploy: (code) => (w) => w.u8(1).vec(code),
+  call: (method, args, gasTgas = 300n, deposit = 0n) => (w) =>
+    w.u8(2).string(method).vec(Buffer.from(JSON.stringify(args))).u64(BigInt(gasTgas) * TGAS).u128(deposit),
+  transfer: (deposit) => (w) => w.u8(3).u128(deposit),
+};
+
+/**
+ * Signs and sends a transaction from `key` to `receiverId` and waits until every receipt ran.
+ * Returns { hash, value (the parsed SuccessValue or null), failure (the error or null), logs, burnt (TGas) }.
+ */
+export async function send(key, receiverId, acts) {
+  const access = await rpc('query', {
+    request_type: 'view_access_key',
+    finality: 'final',
+    account_id: key.accountId,
+    public_key: key.publicKeyString,
+  });
+  const w = new Writer()
+    .string(key.accountId)
+    .u8(0).bytes(key.publicKey)
+    .u64(BigInt(access.nonce) + 1n)
+    .string(receiverId)
+    .bytes(b58decode(access.block_hash))
+    .u32(acts.length);
+  for (const a of acts) a(w);
+  const tx = w.done();
+  const hash = sha256(tx);
+  const signed = Buffer.concat([tx, Buffer.from([0]), key.sign(hash)]);
+  const txHash = b58encode(hash);
+  let outcome;
+  try {
+    outcome = await rpc('send_tx', { signed_tx_base64: signed.toString('base64'), wait_until: 'EXECUTED_OPTIMISTIC' });
+  } catch (e) {
+    if (!e.timeout) throw e;
+  }
+  for (let i = 0; !outcome?.final_execution_status || outcome.final_execution_status === 'INCLUDED' || !outcome.status; i++) {
+    if (i > 40) throw new Error(`transaction ${txHash} did not finish`);
+    await sleep(3000);
+    try {
+      outcome = await rpc('tx', { tx_hash: txHash, sender_account_id: key.accountId, wait_until: 'EXECUTED_OPTIMISTIC' });
+    } catch (e) {
+      if (!e.timeout && !/UNKNOWN_TRANSACTION/.test(e.message)) throw e;
+    }
+  }
+  const all = [outcome.transaction_outcome, ...outcome.receipts_outcome];
+  const logs = outcome.receipts_outcome.flatMap((r) => r.outcome.logs);
+  const burnt = all.reduce((s, o) => s + BigInt(o.outcome.gas_burnt), 0n);
+  const status = outcome.status;
+  const value = status.SuccessValue !== undefined && status.SuccessValue !== ''
+    ? JSON.parse(Buffer.from(status.SuccessValue, 'base64').toString())
+    : null;
+  return {
+    hash: txHash,
+    value,
+    failure: status.Failure ?? null,
+    logs,
+    burntTgas: Number((burnt * 100n) / TGAS) / 100,
+    receipts: outcome.receipts_outcome,
+  };
+}
+
+/** The panic message of a failed transaction, if it is a contract panic. */
+export function panicOf(failure) {
+  const s = JSON.stringify(failure ?? '');
+  const m = s.match(/ExecutionError\\?":\\?"([^"\\]*(?:\\.[^"\\]*)*)/);
+  return m ? m[1].replace(/\\\\/g, '\\') : s;
+}
