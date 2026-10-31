@@ -4,10 +4,11 @@
 //
 //   hyperliquid  hl_set_referrer (no code: skipped), hl_approve_builder_fee; both need the account to exist, so an
 //                unfunded desk waits for its first deposit and retries then
-//   orderly      register -> add key -> receiver_address lookup (the owner pins it) -> referral_bind (no code:
+//   orderly      register -> add key (an expired key is reported, never added again: Orderly refuses a key it holds)
+//                -> receiver_address lookup (the owner pins it; a pinned one must match) -> referral_bind (no code:
 //                skipped) -> ip_restriction (no set_orderly_ips list: skipped)
-//   phoenix      register (build-register-ixs, sol_sign_register, send-register-ixs) -> referral (no code: skipped);
-//                mainnet only
+//   phoenix      register (build-register-ixs, sol_sign_register, send-register-ixs; done once the trader account
+//                exists) -> referral (no code: skipped; already activated: done without signing); mainnet only
 //
 // A SetupProgress with every step goes out after each change.
 
@@ -54,6 +55,8 @@ export interface OrderlySetup {
 export interface PhoenixSetup {
   isRegistered(): Promise<boolean>;
   register(): Promise<{ tx: TxRef[] }>;
+  /** The trader account already carries the capabilities a referral activation grants. */
+  referralActivated(): Promise<boolean>;
   activateReferral(): Promise<{ status: string; tx: TxRef[] } | null>;
 }
 
@@ -81,9 +84,12 @@ export interface SetupPlan {
   depositWaitMs?: number;
   /** An orderly key that expires sooner than this shows the days it has left; default 30 days. */
   keyWarnMs?: number;
+  /** How often, and how many times, a sent Phoenix registration is looked for on Solana; default 3 s, 10 times. */
+  phoenixPollMs?: number;
+  phoenixPolls?: number;
 }
 
-type Outcome = { status: 'done' | 'skipped' | 'pending'; detail?: string; tx?: TxRef[] };
+type Outcome = { status: 'done' | 'skipped' | 'pending' | 'failed'; detail?: string; tx?: TxRef[] };
 
 /** Hyperliquid's answer when the address has no account yet (seen on testnet: "User or API Wallet 0x… does not exist."). */
 const HL_NO_ACCOUNT = /does not exist|must deposit/i;
@@ -129,7 +135,7 @@ export async function runSetup(plan: SetupPlan): Promise<SetupProgress> {
   emit();
   let hlWaiting = await hyperliquid(plan, run);
   await orderly(plan, run, waits, now);
-  await phoenix(plan, run, waits);
+  await phoenix(plan, run, waits, sleep);
 
   // The Hyperliquid steps need an account, which exists only after the first deposit: look again until it lands.
   const deadline = now() + (plan.depositWaitMs ?? 30 * 60_000);
@@ -221,6 +227,8 @@ async function orderly(plan: SetupPlan, run: Run, waits: (name: SetupStepName, o
     key !== null && key.status === 'ACTIVE' && (key.scope ?? '').split(',').includes('trading') && (key.expiration ?? 0) > now();
   // Orderly refuses to add a key it already holds (seen on testnet 2026-10-31: -1616 "orderlyKey already exists"),
   // even close to its expiry, and the desk has exactly one Ed25519 key: an active key is done, its expiry is shown.
+  // A key Orderly knows but that is no longer usable (expired, another scope) cannot be added again either: the step
+  // fails with what Orderly holds, and nothing is signed.
   const keyDetail = (key: { expiration: number | null }, prefix: string) => {
     if (key.expiration === null) return prefix;
     const left = key.expiration - now();
@@ -229,6 +237,10 @@ async function orderly(plan: SetupPlan, run: Run, waits: (name: SetupStepName, o
   const keyed = await run('orderly_add_key', async () => {
     const key = await o.keyInfo();
     if (usable(key)) return { status: 'done', detail: keyDetail(key!, 'key active') };
+    if (key !== null) {
+      const until = key.expiration === null ? 'no expiry' : `expiration ${new Date(key.expiration).toISOString().slice(0, 10)}`;
+      return { status: 'failed', detail: `Orderly holds the desk's key as ${key.status ?? 'status unknown'}, scope ${key.scope ?? 'unknown'}, ${until}: it is not usable and Orderly refuses to add it again (-1616); the desk needs a new key` };
+    }
     try {
       await o.addKey();
     } catch (err) {
@@ -246,14 +258,15 @@ async function orderly(plan: SetupPlan, run: Run, waits: (name: SetupStepName, o
   }
 
   // The detail is the address alone, lowercase: the dashboard reads it from there and asks the owner to pin it with
-  // set_orderly_receiver (an address already pinned is shown the same way).
+  // set_orderly_receiver. A receiver already pinned is looked up too: withdrawals go to the pinned one, so one that is
+  // not Orderly's answer for this account fails the step.
   await run('orderly_receiver_lookup', async () => {
     const pinned = (await plan.desk()).orderly_receiver;
-    if (pinned !== null) return { status: 'done', detail: pinned.toLowerCase() };
-    const answer = await o.receiverAddress();
-    const address = receiverOf(answer);
-    if (address === null) throw new Error(`receiver_address: no address in ${JSON.stringify(answer).slice(0, 200)}`);
-    return { status: 'done', detail: address.toLowerCase() };
+    const address = receiverOf(await o.receiverAddress());
+    if (pinned !== null && pinned.toLowerCase() !== address) {
+      throw new Error(`the pinned receiver ${pinned.toLowerCase()} is not the one Orderly gives this account (${address}): pin ${address} with set_orderly_receiver`);
+    }
+    return { status: 'done', detail: address };
   });
 
   await run('orderly_referral_bind', async () => {
@@ -281,7 +294,7 @@ function orderlyWarnMs(plan: SetupPlan): number {
   return plan.keyWarnMs ?? 30 * DAY_MS;
 }
 
-async function phoenix(plan: SetupPlan, run: Run, waits: (name: SetupStepName, on: SetupStepName) => void): Promise<void> {
+async function phoenix(plan: SetupPlan, run: Run, waits: (name: SetupStepName, on: SetupStepName) => void, sleep: (ms: number) => Promise<void>): Promise<void> {
   const p = plan.phoenix;
   if (p === null) {
     await run('phoenix_register', async () => ({ status: 'skipped', detail: 'Phoenix runs on mainnet only' }));
@@ -290,23 +303,32 @@ async function phoenix(plan: SetupPlan, run: Run, waits: (name: SetupStepName, o
   }
   const registered = await run('phoenix_register', async () => {
     if (await p.isRegistered()) return { status: 'done', detail: 'trader account exists' };
-    return { status: 'done', detail: 'registered', tx: (await p.register()).tx };
+    const { tx } = await p.register();
+    // send-register-ixs answering is not the account existing: Phoenix sends the transaction, Solana lands it or not.
+    for (let i = 0; i < (plan.phoenixPolls ?? 10); i++) {
+      await sleep(plan.phoenixPollMs ?? 3_000);
+      if (await p.isRegistered().catch(() => false)) return { status: 'done', detail: 'registered: trader account exists', tx };
+    }
+    return { status: 'failed', detail: 'Phoenix took the registration, but the trader account does not exist yet: a rerun looks again before it signs anything', tx };
   });
   if (registered !== 'done') return waits('phoenix_referral', 'phoenix_register');
   await run('phoenix_referral', async () => {
     if (plan.referralCodes.phoenix === null) return { status: 'skipped', detail: 'no Phoenix referral code is configured' };
+    if (await p.referralActivated()) return { status: 'done', detail: 'already activated: the trader account has the referral capabilities' };
     const r = await p.activateReferral();
     if (r === null) return { status: 'skipped', detail: 'no Phoenix referral code is configured' };
     return { status: 'done', detail: `activate-tx: ${r.status}`, tx: r.tx };
   });
 }
 
-/** The receiver address in Orderly's receiver_address answer: the data itself, or its first EVM address field. */
-export function receiverOf(answer: unknown): string | null {
-  const isAddress = (v: unknown): v is string => typeof v === 'string' && /^0x[0-9a-fA-F]{40}$/.test(v);
-  if (isAddress(answer)) return answer;
-  if (typeof answer !== 'object' || answer === null) return null;
-  const entries = Object.entries(answer as Record<string, unknown>);
-  const named = entries.find(([k, v]) => /address|receiver/i.test(k) && isAddress(v));
-  return (named ?? entries.find(([, v]) => isAddress(v)))?.[1] as string | undefined ?? null;
+/**
+ * The receiver in Orderly's receiver_address answer: its `receiver_address` field, lowercase. Anything else is an
+ * error: the owner pins this address for withdrawals, so a guess from another field is never good enough.
+ */
+export function receiverOf(answer: unknown): string {
+  const v = typeof answer === 'object' && answer !== null ? (answer as { receiver_address?: unknown }).receiver_address : undefined;
+  if (typeof v !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(v)) {
+    throw new Error(`receiver_address: no receiver_address address in the answer ${JSON.stringify(answer).slice(0, 200)}`);
+  }
+  return v.toLowerCase();
 }

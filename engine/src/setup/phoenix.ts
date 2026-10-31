@@ -8,7 +8,7 @@
 // The combined includeRegisterTrader transaction is never built: the contract refuses it (E_SOL_PROGRAM).
 // Phoenix runs on mainnet only; the engine reaches this path on testnet only through recorded answers.
 
-import { buildReferralActivationTransaction, referralActivationExchangeAccountsFromSnapshot } from '@ellipsis-labs/rise';
+import { buildReferralActivationTransaction, decodeTrader, hasReferralActivationCapabilities, referralActivationExchangeAccountsFromSnapshot } from '@ellipsis-labs/rise';
 import type { TxRef } from '@gimbal/shared';
 import type { SolSignedAction } from '../contract/types.ts';
 import { base58Decode, parseMessage, verifyEd25519 } from '../relayer/solana.ts';
@@ -32,6 +32,8 @@ export interface SolanaReads {
   latestBlockhash(): Promise<string>;
   /** Whether an account exists (has data); throws when the RPC does not answer, never "no". */
   accountExists(address: string): Promise<boolean>;
+  /** An account's data, null when it does not exist; throws when the RPC does not answer. */
+  accountData(address: string): Promise<Uint8Array | null>;
 }
 
 export interface PhoenixOnboardingOptions {
@@ -71,6 +73,16 @@ export class PhoenixOnboarding {
   /** The desk's trader account exists: registration is done. */
   isRegistered(): Promise<boolean> {
     return this.#o.solana.accountExists(this.#o.traderPda);
+  }
+
+  /**
+   * The trader account already has the capabilities a referral activation grants (rise's own test, on the account's
+   * flags): activation happens once per trader, so a rerun must not sign another. Not registered is not activated.
+   */
+  async referralActivated(): Promise<boolean> {
+    const data = await this.#o.solana.accountData(this.#o.traderPda);
+    if (data === null || data.length === 0) return false;
+    return hasReferralActivationCapabilities(Number(decodeTrader(data).state.flags));
   }
 
   async register(): Promise<PhoenixRegisterResult> {
@@ -250,5 +262,11 @@ export function solanaReads(rpcUrl: string, fetchImpl: typeof fetch = fetch): So
   return {
     latestBlockhash: async () => (await rpc<{ value: { blockhash: string } }>('getLatestBlockhash', [{ commitment: 'confirmed' }])).value.blockhash,
     accountExists: async (address) => (await rpc<{ value: unknown }>('getAccountInfo', [address, { encoding: 'base64', commitment: 'confirmed' }])).value !== null,
+    accountData: async (address) => {
+      const { value } = await rpc<{ value: { data?: [string, string] } | null }>('getAccountInfo', [address, { encoding: 'base64', commitment: 'confirmed' }]);
+      if (value === null) return null;
+      if (!Array.isArray(value.data) || value.data[1] !== 'base64') throw new Error(`solana getAccountInfo ${address}: no base64 data`);
+      return new Uint8Array(Buffer.from(value.data[0], 'base64'));
+    },
   };
 }

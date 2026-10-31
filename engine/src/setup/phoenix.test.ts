@@ -26,7 +26,7 @@ function onboarding(api: ReturnType<typeof phoenixApi>, referralCode: string | n
   const contract = testContract(() => 1_800_000_000_000);
   const o = new PhoenixOnboarding({
     deskId: 'alpha', authority: TEST_SOL_AUTHORITY, traderPda: TRADER_PDA, referralCode, signer: contract,
-    solana: { latestBlockhash: async () => BLOCKHASH, accountExists: async () => exists },
+    solana: { latestBlockhash: async () => BLOCKHASH, accountExists: async () => exists, accountData: async () => null },
     fetch: api.fetch,
   });
   return { o, contract };
@@ -124,4 +124,5 @@ test('solanaReads: blockhash and account existence over JSON-RPC', async () => {
   assert.equal(await reads.latestBlockhash(), BLOCKHASH);
   assert.equal(await reads.accountExists(TRADER_PDA), true);
   assert.equal(await reads.accountExists(TEST_SOL_AUTHORITY), false);
+  assert.deepEqual([await reads.accountData(TRADER_PDA), await reads.accountData(TEST_SOL_AUTHORITY)], [new Uint8Array(0), null]);
 });

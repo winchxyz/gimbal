@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import type { SetupProgress, TxRef } from '@gimbal/shared';
 import { OutcomeUnknown } from '../contract/types.ts';
 import { HlExchangeError } from '../relayer/hyperliquid.ts';
@@ -133,7 +134,7 @@ test('a new testnet desk: Orderly set up, Phoenix skipped, Hyperliquid waits for
   assert.ok(events.every((e) => e.deskId === 'alpha' && e.steps.length === SETUP_STEPS.length));
 });
 
-test('a rerun on a desk that is set up signs nothing', async () => {
+test('a rerun on a desk that is set up signs no action: only the receiver read, to check the pinned one', async () => {
   const hl = fakeHl({ approved: 10, referredBy: 'GIMBAL' });
   const ob = fakeOrderly({ registered: true, key: true });
   const { plan: p } = plan({
@@ -142,7 +143,7 @@ test('a rerun on a desk that is set up signs nothing', async () => {
   });
   const final = await runSetup(p);
   assert.deepEqual(hl.calls, []);
-  assert.deepEqual(ob.calls, []);
+  assert.deepEqual(ob.calls, ['receiverAddress']);
   assert.equal(status(final).hl_set_referrer, 'done');
   assert.equal(step(final, 'hl_set_referrer').detail, 'referred by GIMBAL');
   assert.equal(step(final, 'orderly_add_key').detail, 'key active until 2027-08-27');
@@ -175,7 +176,7 @@ test('an unfunded desk signs nothing on Hyperliquid, and stays pending when no d
   assert.match(step(final, 'hl_approve_builder_fee').detail!, /POST \/setup again/);
 });
 
-test('Hyperliquid refusing an account it does not know yet: pending with the signature spent, one signature only', async () => {
+test('Hyperliquid refusing an account it does not know yet: pending with the spent signature kept; the builder fee waits instead of spending one too', async () => {
   let accepts = false;
   let approved = 0;
   const calls: string[] = [];
@@ -202,6 +203,7 @@ test('Hyperliquid refusing an account it does not know yet: pending with the sig
     },
   });
   const final = await runSetup(p);
+  // The refused setReferrer, its retry once the deposit settled, then the builder fee: never a refused builder fee.
   assert.deepEqual(calls, ['setReferrer', 'setReferrer', 'approveBuilderFee'], 'the builder fee waits too instead of being refused the same way');
   assert.equal(status(final).hl_set_referrer, 'done');
   assert.deepEqual(step(final, 'hl_set_referrer').tx, [near('spent'), near('ref')]);
@@ -264,41 +266,82 @@ test('Orderly signatures are attached to their step', async () => {
   assert.deepEqual(step(final, 'orderly_receiver_lookup').tx, []);
 });
 
-test('Phoenix on mainnet: register when the trader account is missing, the referral only with a code', async () => {
+function fakePhoenix(o: { landsAfter?: number; activated?: boolean } = {}) {
   const calls: string[] = [];
-  let exists = false;
+  let polls = -1;                                   // -1: not sent yet
+  let activated = o.activated ?? false;
   const phoenix: PhoenixSetup = {
-    isRegistered: async () => exists,
+    isRegistered: async () => {
+      if (polls < 0) return false;
+      polls++;
+      return polls > (o.landsAfter ?? 0);
+    },
     register: async () => {
       calls.push('register');
-      exists = true;
+      polls = 0;
       return { tx: [near('sol')] };
     },
+    referralActivated: async () => activated,
     activateReferral: async () => {
       calls.push('activate');
-      return { status: 'already_activated', tx: [] };
+      activated = true;
+      return { status: 'activated', tx: [near('act')] };
     },
   };
-  const base = { hl: fakeHl({ approved: 10 }).hl, orderly: fakeOrderly({ registered: true, key: true }).orderly, phoenix };
+  return { phoenix, calls };
+}
+
+test('Phoenix on mainnet: register when the trader account is missing, done once it exists; the referral only with a code', async () => {
+  const ph = fakePhoenix({ landsAfter: 2 });
+  const base = { hl: fakeHl({ approved: 10 }).hl, orderly: fakeOrderly({ registered: true, key: true }).orderly, phoenix: ph.phoenix };
   const first = await runSetup(plan(base).plan);
   assert.equal(status(first).phoenix_register, 'done');
+  assert.equal(step(first, 'phoenix_register').detail, 'registered: trader account exists');
   assert.deepEqual(step(first, 'phoenix_register').tx, [near('sol')]);
   assert.equal(status(first).phoenix_referral, 'skipped');
-  const second = await runSetup(plan({ ...base, referralCodes: { hyperliquid: null, orderly: null, phoenix: 'TESTREF1' } }).plan);
-  assert.deepEqual(calls, ['register', 'activate']);
+  const coded = { ...base, referralCodes: { hyperliquid: null, orderly: null, phoenix: 'TESTREF1' } };
+  const second = await runSetup(plan(coded).plan);
   assert.equal(step(second, 'phoenix_register').detail, 'trader account exists');
-  assert.equal(step(second, 'phoenix_referral').detail, 'activate-tx: already_activated');
+  assert.equal(step(second, 'phoenix_referral').detail, 'activate-tx: activated');
+  // A rerun reads the activation on the trader account and signs nothing.
+  const third = await runSetup(plan(coded).plan);
+  assert.equal(step(third, 'phoenix_referral').detail, 'already activated: the trader account has the referral capabilities');
+  assert.deepEqual(ph.calls, ['register', 'activate']);
 });
 
-test('receiverOf reads the address however Orderly wraps it', () => {
-  assert.equal(receiverOf(RECEIVER), RECEIVER);
-  assert.equal(receiverOf({ receiver_address: RECEIVER }), RECEIVER);
-  assert.equal(receiverOf({ chain_id: 1, other: RECEIVER }), RECEIVER);
-  assert.equal(receiverOf({ chain_id: 1 }), null);
-  assert.equal(receiverOf(null), null);
+test('Phoenix: a registration whose trader account never shows up fails with its transactions, and the referral waits', async () => {
+  const ph = fakePhoenix({ landsAfter: 1_000 });
+  const final = await runSetup(plan({
+    hl: fakeHl({ approved: 10 }).hl, orderly: fakeOrderly({ registered: true, key: true }).orderly, phoenix: ph.phoenix,
+    referralCodes: { hyperliquid: null, orderly: null, phoenix: 'TESTREF1' },
+  }).plan);
+  assert.equal(status(final).phoenix_register, 'failed');
+  assert.match(step(final, 'phoenix_register').detail!, /trader account does not exist yet: a rerun looks again/);
+  assert.deepEqual(step(final, 'phoenix_register').tx, [near('sol')]);
+  assert.equal(step(final, 'phoenix_referral').detail, 'waits for phoenix_register');
+  assert.deepEqual(ph.calls, ['register']);
 });
 
-test('an active orderly key close to its expiry is done (Orderly refuses re-adding it); an expired one is added again', async () => {
+test('receiverOf reads receiver_address and nothing else', () => {
+  // What Orderly testnet answered for a desk on 2026-10-31.
+  const recorded = JSON.parse(readFileSync(new URL('../../fixtures/orderly-signed/receiver-address-testnet-2026-10-31.json', import.meta.url), 'utf8')) as { data: unknown };
+  assert.equal(receiverOf(recorded.data), '0xdd31bf887d636fd83ab68716c61ec63f162e2df1');
+  assert.equal(receiverOf({ chain_id: 421614, receiver_address: RECEIVER, token: 'USDC' }), RECEIVER.toLowerCase());
+  for (const answer of [RECEIVER, { chain_id: 1, other: RECEIVER }, { receiver_address: '0x12' }, { chain_id: 1 }, null]) {
+    assert.throws(() => receiverOf(answer), /no receiver_address address in the answer/);
+  }
+});
+
+test('a pinned receiver is checked against Orderly: a different one fails the step', async () => {
+  const other = '0x1111111111111111111111111111111111111111';
+  const final = await runSetup(plan({
+    hl: fakeHl({ approved: 10 }).hl, orderly: fakeOrderly({ registered: true, key: true }).orderly, desk: async () => testDesk({ orderly_receiver: other }),
+  }).plan);
+  assert.equal(status(final).orderly_receiver_lookup, 'failed');
+  assert.equal(step(final, 'orderly_receiver_lookup').detail, `the pinned receiver ${other} is not the one Orderly gives this account (${RECEIVER.toLowerCase()}): pin ${RECEIVER.toLowerCase()} with set_orderly_receiver`);
+});
+
+test('an active orderly key close to its expiry is done; an expired one fails the step (Orderly refuses to re-add a key, -1616), nothing signed', async () => {
   const hl = fakeHl({ approved: 10 });
   let expiration = NOW + 29 * DAY + 3_600_000;
   let adds = 0;
@@ -316,8 +359,10 @@ test('an active orderly key close to its expiry is done (Orderly refuses re-addi
   assert.equal(step(soon, 'orderly_add_key').detail, 'key active until 2026-11-29 (29 days left)');
   expiration = NOW - 1;
   const expired = await runSetup(plan({ hl: hl.hl, orderly }).plan);
-  assert.equal(adds, 1);
-  assert.equal(step(expired, 'orderly_add_key').detail, 'key added, ACTIVE until 2027-10-30');
+  assert.equal(adds, 0);
+  assert.equal(status(expired).orderly_add_key, 'failed');
+  assert.equal(step(expired, 'orderly_add_key').detail, "Orderly holds the desk's key as ACTIVE, scope read,trading, expiration 2026-10-31: it is not usable and Orderly refuses to add it again (-1616); the desk needs a new key");
+  assert.equal(step(expired, 'orderly_receiver_lookup').detail, 'waits for orderly_add_key');
 });
 
 test('an add-key refusal for a key Orderly turns out to hold is done', async () => {
