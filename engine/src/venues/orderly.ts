@@ -2,6 +2,10 @@
 // WebSocket only (Orderly serves no REST book to the public); the account over the desk's private WebSocket session
 // (orderly-stream.ts, one signature per session); the desk's own funding history over a signed REST read
 // (orderly-actions.ts). Without a desk, account() and userFunding() refuse: nothing here signs.
+//
+// Orderly lists every broker's own markets (PERP_X_USDC_<broker>) next to the shared ones (PERP_X_USDC). A desk can
+// trade the shared ones and its own broker's only, so markets() and funding() return just those; a broker market
+// keeps its full symbol and never maps to the shared base symbol (orderlyBaseSymbol).
 
 import type {
   AccountState, Book, BookLevel, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, Position, VenueReader,
@@ -20,6 +24,9 @@ import { WsRequestClient } from './ws.ts';
 
 // Static market parameters change only with a listing; funding() and account() reuse them this long.
 const INFO_TTL_MS = 10 * 60_000;
+const HOUR_MS = 3_600_000;
+/** account() refuses stream state the server has not confirmed for this long (the stream's own watchdog is 30 s too). */
+export const ORDERLY_MAX_STATE_AGE_MS = 30_000;
 const FUNDING_FEE_PAGE_ROWS = 500;
 const FUNDING_FEE_MAX_PAGES = 200;
 const RATE_HISTORY_PAGE_ROWS = 500;
@@ -57,6 +64,19 @@ export interface OrderlyRateHistoryRow {
   symbol: string;
   funding_rate: number;          // per funding period
   funding_rate_timestamp: number;   // ms
+  next_funding_time?: number;    // ms; with funding_rate_timestamp it gives the row's own period
+}
+
+interface OrderlyPageMeta {
+  total?: number;
+  records_per_page?: number;
+  current_page?: number;
+}
+
+/** The desk's Orderly account, with the age of what the private stream pushed. `time` is when the server last spoke. */
+export interface OrderlyAccountState extends AccountState {
+  positionsPushedAt: number;     // venue ms of the last position push
+  balancesPushedAt: number;      // venue ms of the last balance push
 }
 
 /** An Orderly market, with what sizing and the broker split need on top of the shared shape. */
@@ -104,6 +124,12 @@ export interface OrderlyReaderOptions {
   streamAccountId?: string;
   accountStream?: OrderlyAccountSource;
   fundingFees?: OrderlyFundingFeeSource;
+  /** The desk's broker id: its own markets are listed next to the shared ones. Default none: shared markets only. */
+  brokerId?: string | null;
+  /** account() refuses stream state older than this (ms since the server's last frame); default 30 s. */
+  maxStateAgeMs?: number;
+  /** Where a skipped row is reported (userFunding); default console.warn. */
+  onNote?: (note: string) => void;
   clock?: Clock;
   timeoutMs?: number;
 }
@@ -113,9 +139,23 @@ export function orderlyKeepAlive(msg: Record<string, unknown>): Record<string, u
   return msg.event === 'ping' ? { event: 'pong', ts: msg.ts } : null;
 }
 
-/** The venue's symbol for a base asset: "SOL" -> "PERP_SOL_USDC"; a full symbol is kept as it is. */
+/** The venue's symbol for a base asset: "SOL" -> "PERP_SOL_USDC" (a shared market); a full symbol is kept as it is. */
 export function orderlySymbol(base: string): string {
   return base.startsWith('PERP_') ? base : `PERP_${base}_USDC`;
+}
+
+/**
+ * The base asset of a shared market: "PERP_SOL_USDC" -> "SOL". A broker's own market ("PERP_SOL_USDC_<broker>") is
+ * another market with its own book and fees, so it has no shared base symbol: null.
+ */
+export function orderlyBaseSymbol(symbol: string): string | null {
+  const m = /^PERP_([A-Za-z0-9]+)_USDC$/.exec(symbol);
+  return m === null ? null : m[1]!;
+}
+
+/** A market the desk can trade: a shared one, or its own broker's. */
+export function tradableByBroker(row: { broker_id: string | null }, brokerId: string | null): boolean {
+  return row.broker_id === null || (brokerId !== null && row.broker_id === brokerId);
 }
 
 export class OrderlyReader implements VenueReader, FundingHistorySource {
@@ -127,8 +167,11 @@ export class OrderlyReader implements VenueReader, FundingHistorySource {
   readonly #fetch: typeof fetch;
   readonly #clock: Clock;
   readonly #timeoutMs: number;
+  readonly brokerId: string | null;
   readonly #accountStream: OrderlyAccountSource | undefined;
   readonly #fundingFees: OrderlyFundingFeeSource | undefined;
+  readonly #maxStateAgeMs: number;
+  readonly #note: (note: string) => void;
   #wsRequest: WsRequester | null;
   #ownWs: WsRequestClient | null = null;
   #streamId: Promise<string> | null;
@@ -143,20 +186,27 @@ export class OrderlyReader implements VenueReader, FundingHistorySource {
     this.#fetch = options.fetch ?? fetch;
     this.#clock = options.clock ?? systemClock;
     this.#timeoutMs = options.timeoutMs ?? 10_000;
+    this.brokerId = options.brokerId ?? null;
     this.#accountStream = options.accountStream;
     this.#fundingFees = options.fundingFees;
+    this.#maxStateAgeMs = options.maxStateAgeMs ?? ORDERLY_MAX_STATE_AGE_MS;
+    this.#note = options.onNote ?? ((note) => console.warn(note));
     this.#wsRequest = options.wsRequest ?? null;
     this.#streamId = options.streamAccountId === undefined ? null : Promise.resolve(normalizeAccountId(options.streamAccountId));
   }
 
+  /** The shared markets and the desk's own broker's. */
   async markets(): Promise<OrderlyMarket[]> {
-    return parseMarkets(await this.#infoRows(true));
+    return parseMarkets((await this.#infoRows(true)).filter((r) => tradableByBroker(r, this.brokerId)));
   }
 
-  /** The estimated rate of the running period (what is paid at next_funding_time), per hour. Inactive markets left out. */
+  /**
+   * The estimated rate of the running period (what is paid at next_funding_time), per hour, for the markets the desk
+   * can trade. Inactive markets, and markets whose period has not rolled for two periods (stale), are left out.
+   */
   async funding(): Promise<MarketFunding[]> {
     const [futures, info] = await Promise.all([this.#futures(), this.#infoRows(false)]);
-    return parseFunding(futures, info);
+    return parseFunding(futures, info, this.#clock.now(), this.brokerId);
   }
 
   async book(symbol: string, depth?: number): Promise<Book> {
@@ -165,14 +215,17 @@ export class OrderlyReader implements VenueReader, FundingHistorySource {
     return trimBook(parseBookAnswer(symbol, answer), depth);
   }
 
-  /** `address` is the desk's Orderly account id; the state comes from its private stream session. */
-  async account(address: string): Promise<AccountState> {
+  /**
+   * `address` is the desk's Orderly account id; the state comes from its private stream session, priced at the
+   * current REST mark. `time` is when the server last confirmed the stream; older than maxStateAgeMs throws.
+   */
+  async account(address: string): Promise<OrderlyAccountState> {
     const accountId = normalizeAccountId(address);
     const stream = this.#accountStream;
     if (stream === undefined) throw new Error('orderly account: needs the desk\'s private stream session (accountStream)');
     if (stream.accountId !== accountId) throw new Error(`orderly account: the stream is for ${stream.accountId}, not ${accountId}`);
     const [snapshot, futures, info] = await Promise.all([stream.state(), this.#futures(), this.#infoRows(false)]);
-    return parseAccount(snapshot, futures, info, this.#clock.now());
+    return parseAccount(snapshot, futures, info, this.#clock.now(), this.#maxStateAgeMs);
   }
 
   /**
@@ -187,20 +240,28 @@ export class OrderlyReader implements VenueReader, FundingHistorySource {
     if (!Number.isInteger(startTime) || startTime < 0) throw new RangeError(`userFunding startTime must be a ms timestamp, got ${startTime}`);
     const end = endTime ?? this.#clock.now();
     if (!Number.isInteger(end) || end < startTime) throw new RangeError(`userFunding endTime must be a ms timestamp >= startTime, got ${endTime}`);
+    // The fee rows carry no period of their own (row fields: verify on day 5), so it comes from /v1/public/info.
     const periods = periodsBySymbol(await this.#infoRows(false));
     const rows: OrderlyFundingFeeRow[] = [];
     for (let page = 1; ; page++) {
       if (page > FUNDING_FEE_MAX_PAGES) throw new Error(`orderly userFunding: still more rows after ${FUNDING_FEE_MAX_PAGES} pages`);
       const res = await source.fundingFeeHistory(startTime, end, page, FUNDING_FEE_PAGE_ROWS);
       rows.push(...res.rows);
-      if (!morePages(res.rows.length, FUNDING_FEE_PAGE_ROWS, page, res.meta?.total)) break;
+      if (!morePages(res.rows.length, FUNDING_FEE_PAGE_ROWS, rows.length, res.meta)) break;
     }
     const out: FundingPayment[] = [];
+    const skipped = new Map<string, number>();
     for (const row of rows) {
       if (row.created_time < startTime || row.created_time > end) continue;
       const period = periods.get(row.symbol);
-      if (period === undefined) throw new Error(`orderly userFunding: no funding period for ${row.symbol}`);
+      if (period === undefined) {
+        skipped.set(row.symbol, (skipped.get(row.symbol) ?? 0) + 1);
+        continue;
+      }
       out.push(parseFundingFeeRow(row, period));
+    }
+    for (const [symbol, n] of skipped) {
+      this.#note(`orderly userFunding: skipped ${n} payment(s) on ${symbol}: no funding period (not in /v1/public/info)`);
     }
     return out.sort((a, b) => a.time - b.time || a.symbol.localeCompare(b.symbol));
   }
@@ -217,19 +278,23 @@ export class OrderlyReader implements VenueReader, FundingHistorySource {
       const q = new URLSearchParams({
         symbol, start_t: String(startTime), end_t: String(endTime), page: String(page), size: String(RATE_HISTORY_PAGE_ROWS),
       });
-      const res = await this.#get<{ rows: OrderlyRateHistoryRow[]; meta?: { total?: number } }>(`/v1/public/funding_rate_history?${q}`, 'funding_rate_history');
+      const res = await this.#get<{ rows: OrderlyRateHistoryRow[]; meta?: OrderlyPageMeta }>(`/v1/public/funding_rate_history?${q}`, 'funding_rate_history');
       rows.push(...res.rows);
-      if (!morePages(res.rows.length, RATE_HISTORY_PAGE_ROWS, page, res.meta?.total)) break;
+      if (!morePages(res.rows.length, RATE_HISTORY_PAGE_ROWS, rows.length, res.meta)) break;
     }
     return rows
       .filter((r) => r.funding_rate_timestamp >= startTime && r.funding_rate_timestamp <= endTime)
-      .map((r) => ({
-        time: r.funding_rate_timestamp,
-        symbol: r.symbol,
-        ratePerHour: ratePerHourFromPeriod(r.funding_rate, info.funding_period),
-        ratePerPeriod: r.funding_rate,
-        periodHours: info.funding_period,
-      }))
+      .map((r) => {
+        // A market's period can change; a row that names its next funding time says which period it covered.
+        const periodHours = rowPeriodHours(r) ?? info.funding_period;
+        return {
+          time: r.funding_rate_timestamp,
+          symbol: r.symbol,
+          ratePerHour: ratePerHourFromPeriod(r.funding_rate, periodHours),
+          ratePerPeriod: r.funding_rate,
+          periodHours,
+        };
+      })
       .sort((a, b) => a.time - b.time);
   }
 
@@ -303,9 +368,26 @@ export class OrderlyReader implements VenueReader, FundingHistorySource {
   }
 }
 
-function morePages(got: number, size: number, page: number, total: number | undefined): boolean {
-  if (total !== undefined) return page * size < total && got > 0;
-  return got >= size;
+/**
+ * Whether to ask for the next page, after one that returned `got` rows (`seen` in all so far) when `requested` were
+ * asked for. The venue may cap a page below the size asked for: a short page is measured against its
+ * records_per_page when it says, and `total` (when given) ends the walk once every row is in.
+ */
+export function morePages(got: number, requested: number, seen: number, meta: OrderlyPageMeta | undefined): boolean {
+  if (got === 0) return false;
+  const total = meta?.total;
+  if (total !== undefined && seen >= total) return false;
+  const perPage = meta?.records_per_page;
+  if (perPage !== undefined && perPage > 0) return got >= perPage;
+  if (total !== undefined) return true;
+  return got >= requested;
+}
+
+/** A history row's own period in whole hours, from its timestamp and next funding time; null when it does not say. */
+function rowPeriodHours(r: OrderlyRateHistoryRow): number | null {
+  if (r.next_funding_time === undefined) return null;
+  const hours = (r.next_funding_time - r.funding_rate_timestamp) / HOUR_MS;
+  return Number.isInteger(hours) && hours > 0 ? hours : null;
 }
 
 function periodsBySymbol(info: readonly OrderlyInfoRow[]): Map<string, number> {
@@ -334,16 +416,24 @@ export function parseMarkets(info: readonly OrderlyInfoRow[]): OrderlyMarket[] {
   }));
 }
 
-/** Markets that are not active, or whose funding period has no shared name, are left out. */
-export function parseFunding(futures: readonly OrderlyFuturesRow[], info: readonly OrderlyInfoRow[]): MarketFunding[] {
-  const periods = periodsBySymbol(info);
+/**
+ * The running period's estimate per hour. Left out: markets that are not active, other brokers' markets, periods the
+ * shared type cannot name, and stale rows: a next_funding_time more than one period in the past means the last
+ * booking is over two periods old, so the estimate is not current.
+ */
+export function parseFunding(
+  futures: readonly OrderlyFuturesRow[], info: readonly OrderlyInfoRow[], now: number, brokerId: string | null = null,
+): MarketFunding[] {
+  const infoBySymbol = new Map(info.map((r) => [r.symbol, r]));
   const out: MarketFunding[] = [];
   for (const f of futures) {
     if (f.status !== 'ACTIVE') continue;
-    const period = periods.get(f.symbol);
-    if (period === undefined) continue;
+    const i = infoBySymbol.get(f.symbol);
+    if (i === undefined || !tradableByBroker(i, brokerId)) continue;
+    const period = i.funding_period;
     const settlement = settlementForPeriod(period);
     if (settlement === null) continue;
+    if (!Number.isFinite(f.next_funding_time) || f.next_funding_time < now - period * HOUR_MS) continue;
     out.push({
       venue: 'orderly',
       symbol: f.symbol,
@@ -375,13 +465,23 @@ export function parseBookAnswer(symbol: string, answer: Record<string, unknown>)
  * The desk's account from its stream cache, re-priced at the current mark and sum_unitary_funding (REST):
  * equity = USDC holding + every position's unsettled PnL (price PnL and unsettled funding); maintenance and
  * initial margin from Orderly's IMR/MMR formulas (or the rates the stream pushed); free = equity - initial - frozen.
+ * Nothing missing is read as zero: no USDC balance, no REST mark or funding sum for a held symbol, or stream state the
+ * server last confirmed more than `maxAgeMs` before `now` all throw. `time` is that confirmation, not `now`.
  */
 export function parseAccount(
-  snapshot: OrderlyAccountSnapshot, futures: readonly OrderlyFuturesRow[], info: readonly OrderlyInfoRow[], time: number,
-): AccountState {
+  snapshot: OrderlyAccountSnapshot, futures: readonly OrderlyFuturesRow[], info: readonly OrderlyInfoRow[], now: number,
+  maxAgeMs: number = ORDERLY_MAX_STATE_AGE_MS,
+): OrderlyAccountState {
+  const age = now - snapshot.confirmedAt;
+  if (age > maxAgeMs) {
+    throw new Error(`orderly account: stale: the private stream last heard from the server ${age} ms ago (limit ${maxAgeMs} ms)`);
+  }
   const futuresBySymbol = new Map(futures.map((f) => [f.symbol, f]));
   const infoBySymbol = new Map(info.map((r) => [r.symbol, r]));
-  const usdc = snapshot.balances.USDC ?? { holding: 0, frozen: 0 };
+  const badUsdc = snapshot.invalidBalances.USDC ?? snapshot.invalidBalances['*'];
+  if (badUsdc !== undefined) throw new Error(`orderly account: the USDC balance push is unusable: ${badUsdc}`);
+  const usdc = snapshot.balances.USDC;
+  if (usdc === undefined) throw new Error('orderly account: the private stream pushed no USDC balance');
   let equity = usdc.holding;
   let initial = 0;
   let maintenance = 0;
@@ -390,10 +490,12 @@ export function parseAccount(
     if (p.positionQty === 0) continue;
     const f = futuresBySymbol.get(p.symbol);
     const i = infoBySymbol.get(p.symbol);
-    if (i === undefined) throw new Error(`orderly account: no market info for ${p.symbol}`);
-    const mark = f?.mark_price ?? p.markPrice;
-    if (mark === undefined || !(mark > 0)) throw new Error(`orderly account: no mark price for ${p.symbol}`);
-    const suf = f?.sum_unitary_funding ?? p.lastSumUnitaryFunding;
+    if (i === undefined) throw new Error(`orderly account: no market info for ${p.symbol} in /v1/public/info`);
+    if (f === undefined) throw new Error(`orderly account: no ${p.symbol} row in /v1/public/futures (mark price and funding sum missing)`);
+    const mark = f.mark_price;
+    const suf = f.sum_unitary_funding;
+    if (!(typeof mark === 'number' && mark > 0)) throw new Error(`orderly account: no usable mark price for ${p.symbol}: ${JSON.stringify(mark)}`);
+    if (!(typeof suf === 'number' && Number.isFinite(suf))) throw new Error(`orderly account: no usable sum_unitary_funding for ${p.symbol}: ${JSON.stringify(suf)}`);
     const notional = Math.abs(p.positionQty) * mark;
     const imr = p.imr ?? positionImr(notional, i.base_imr, i.imr_factor);
     const mmr = p.mmr ?? positionMmr(notional, i.base_mmr, i.base_imr, i.imr_factor);
@@ -405,23 +507,26 @@ export function parseAccount(
       symbol: p.symbol,
       size: p.positionQty,
       entryPx: p.averageOpenPrice,
-      liqPx: p.estLiqPrice !== undefined && p.estLiqPrice > 0 ? p.estLiqPrice : null,
+      liqPx: p.estLiqPrice > 0 ? p.estLiqPrice : null,          // Orderly sends 0 when there is none
       marginUsd,
       unrealizedPnlUsd: p.positionQty * (mark - p.averageOpenPrice) || 0,
       leverage: 1 / imr,
-      // Assumed paid > 0 like Hyperliquid's cumFunding, so flipped; to verify on the first testnet position (C5).
-      fundingSinceOpenUsd: p.accruedFundingFee === undefined ? 0 : -p.accruedFundingFee || 0,
+      // ASSUMPTION: accruedFundingFee is paid > 0 like Hyperliquid's cumFunding, so it is flipped. Verify the sign
+      // on the first testnet position (C5).
+      fundingSinceOpenUsd: -p.accruedFundingFee || 0,
       unsettledFundingUsd: unsettledFundingUsd(p.positionQty, suf, p.lastSumUnitaryFunding),
     });
   }
   return {
     venue: 'orderly',
     address: snapshot.accountId,
-    time,
+    time: snapshot.confirmedAt,
     equityUsd: equity,
     freeMarginUsd: Math.max(0, equity - initial - usdc.frozen),
     maintenanceMarginUsd: maintenance,
     positions,
+    positionsPushedAt: snapshot.positionsAt,
+    balancesPushedAt: snapshot.balancesAt,
   };
 }
 

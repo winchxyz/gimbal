@@ -2,8 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { OrderlyRestAction } from './orderly-signer.ts';
 import {
-  base58, checkRestAction, checkWsAuthAction, ed25519SignatureBase64Url, evmSignatureHex, isOrderlyKeyString,
-  orderlyAuthHeaders, orderlyKeyString, orderlyRestMessage,
+  ORDERLY_WS_AUTH_KIND, base58, checkEip712Action, checkRestAction, checkWsAuthAction, ed25519SignatureBase64Url, evmSignatureHex,
+  isOrderlyKeyString, orderlyAuthHeaders, orderlyKeyString, orderlyRestMessage,
 } from './orderly-signer.ts';
 
 const NOW = Date.UTC(2026, 9, 31, 1);
@@ -56,21 +56,37 @@ test('EIP-712 signature for Orderly = 0x + r (affine point without its prefix by
   assert.throws(() => evmSignatureHex({ ...sig, recovery_id: 2 }), /recovery id/);
 });
 
-test('a signed REST action is checked before sending: kind, message, method and body, 300 s window', () => {
-  checkRestAction(restAction(), 'settle_nonce', NOW + 1000);
-  assert.throws(() => checkRestAction(restAction(), 'withdraw_nonce', NOW), /asked for withdraw_nonce/);
-  assert.throws(() => checkRestAction(restAction({ message: `${NOW}GET/v1/withdraw_nonce` }), 'settle_nonce', NOW), /not timestamp \+ method/);
-  assert.throws(() => checkRestAction(restAction({ body: '{}' }), 'settle_nonce', NOW), /carries a body/);
-  assert.throws(() => checkRestAction(restAction({ path: '/v2/x' }), 'settle_nonce', NOW), /unexpected path/);
-  assert.throws(() => checkRestAction(restAction(), 'settle_nonce', NOW + 300_001), /outside 300 s/);
-  assert.throws(() => checkRestAction({ ...restAction(), venue: 'hyperliquid' }, 'settle_nonce', NOW), /for hyperliquid/);
+test('a signed REST action is checked before sending: desk, kind, message, method and body, 300 s window', () => {
+  checkRestAction(restAction(), 'settle_nonce', NOW + 1000, 'alpha');
+  assert.throws(() => checkRestAction(restAction(), 'settle_nonce', NOW, 'beta'), /for desk alpha, not beta/);
+  assert.throws(() => checkRestAction(restAction(), 'withdraw_nonce', NOW, 'alpha'), /asked for withdraw_nonce/);
+  assert.throws(() => checkRestAction(restAction({ message: `${NOW}GET/v1/withdraw_nonce` }), 'settle_nonce', NOW, 'alpha'), /not timestamp \+ method/);
+  assert.throws(() => checkRestAction(restAction({ body: '{}' }), 'settle_nonce', NOW, 'alpha'), /carries a body/);
+  assert.throws(() => checkRestAction(restAction({ path: '/v2/x' }), 'settle_nonce', NOW, 'alpha'), /unexpected path/);
+  assert.throws(() => checkRestAction(restAction(), 'settle_nonce', NOW + 300_001, 'alpha'), /outside 300 s/);
+  assert.throws(() => checkRestAction({ ...restAction(), venue: 'hyperliquid' }, 'settle_nonce', NOW, 'alpha'), /for hyperliquid/);
 });
 
-test('a ws auth action signs the timestamp alone', () => {
+test('a ws auth action signs the timestamp alone, for this desk, as kind ws_auth', () => {
+  assert.equal(ORDERLY_WS_AUTH_KIND, 'ws_auth');
   const ok = restAction({ message: String(NOW) }, 'ws_auth');
-  checkWsAuthAction(ok, NOW, NOW);
-  assert.throws(() => checkWsAuthAction(ok, NOW + 1, NOW), /asked to sign/);
-  assert.throws(() => checkWsAuthAction(restAction({}, 'ws_auth'), NOW, NOW), /not the timestamp/);
+  checkWsAuthAction(ok, NOW, NOW, 'alpha');
+  assert.throws(() => checkWsAuthAction(ok, NOW + 1, NOW, 'alpha'), /asked to sign/);
+  assert.throws(() => checkWsAuthAction(restAction({}, 'ws_auth'), NOW, NOW, 'alpha'), /not the timestamp/);
+  assert.throws(() => checkWsAuthAction(ok, NOW, NOW, 'beta'), /for desk alpha, not beta/);
+  assert.throws(() => checkWsAuthAction(restAction({ message: String(NOW) }, 'settle_nonce'), NOW, NOW, 'alpha'), /signed settle_nonce, not ws_auth/);
+});
+
+test('an EIP-712 action is for this desk and carries the nonce asked for (a number or its decimal string)', () => {
+  const sig = { scheme: 'Secp256k1' as const, big_r: { affine_point: `02${'ab'.repeat(32)}` }, s: { scalar: 'cd'.repeat(32) }, recovery_id: 0 };
+  const action = (message: Record<string, unknown>, desk = 'alpha') => ({
+    desk_id: desk, request_id: 1, venue: 'orderly', kind: 'withdraw', payload: { message: { timestamp: NOW, ...message } }, signature: sig,
+  });
+  checkEip712Action(action({ withdrawNonce: 41 }), 'alpha', 'withdraw', { withdrawNonce: 41 });
+  checkEip712Action(action({ withdrawNonce: '41' }), 'alpha', 'withdraw', { withdrawNonce: 41 });
+  assert.throws(() => checkEip712Action(action({ withdrawNonce: 42 }), 'alpha', 'withdraw', { withdrawNonce: 41 }), /signed withdrawNonce 42, the engine asked for 41/);
+  assert.throws(() => checkEip712Action(action({}), 'alpha', 'withdraw', { withdrawNonce: 41 }), /signed withdrawNonce undefined/);
+  assert.throws(() => checkEip712Action(action({ withdrawNonce: 41 }, 'beta'), 'alpha', 'withdraw', { withdrawNonce: 41 }), /for desk beta, not alpha/);
 });
 
 test('the four headers of a private call', () => {

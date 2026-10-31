@@ -1,16 +1,17 @@
 // The desk's private Orderly stream against a fake socket: one ws auth signature per session, the auth frame
-// Orderly expects, the three subscriptions, ping answered with pong, and state() waiting for the first pushes.
-// No live private call is made anywhere in the suite.
+// Orderly expects, the three subscriptions, ping answered with pong, state() waiting for the first pushes, a new
+// session after any failure, the silence watchdog, and pushes with missing fields read as unknown, never zero.
+// The account valuation is checked against numbers worked out by hand. No live private call is made anywhere.
 
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import type { OrderlyFuturesRow, OrderlyInfoRow } from './orderly.ts';
-import { OrderlyReader } from './orderly.ts';
+import { OrderlyReader, parseAccount } from './orderly.ts';
 import type { OrderlyRestAction } from './orderly-signer.ts';
-import { OrderlyAccountStream, ORDERLY_PRIVATE_TOPICS } from './orderly-stream.ts';
-import { positionImr, positionMmr, unsettledFundingUsd, unsettledPnlUsd } from './orderly-units.ts';
+import type { OrderlyAccountSnapshot, OrderlyStreamPosition } from './orderly-stream.ts';
+import { ORDERLY_PRIVATE_TOPICS, OrderlyAccountStream, parsePosition } from './orderly-stream.ts';
 import { VirtualClock, readWireRecording, replayFetch, replayWsRequester } from './replay.ts';
 import type { WebSocketLike, WsEvent } from './ws.ts';
 
@@ -60,22 +61,47 @@ class FakeSocket implements WebSocketLike {
   }
 }
 
-function setup(timeoutMs = 200) {
+interface SetupOptions {
+  timeoutMs?: number;
+  silenceMs?: number;
+  /** Signer failures to inject, one per call, before it signs normally: an Error to throw, or a desk id to sign for. */
+  failures?: (Error | { desk: string })[];
+  factoryThrows?: number;
+}
+
+function setup(options: SetupOptions = {}) {
   const sockets: FakeSocket[] = [];
   const signed: number[] = [];
   const reports: Record<string, unknown>[] = [];
+  const failures = [...(options.failures ?? [])];
+  let factoryThrows = options.factoryThrows ?? 0;
+  const clock = new VirtualClock(NOW);
   const signer = {
     async orderlyWsAuth(deskId: string, timestamp: number): Promise<OrderlyRestAction> {
       signed.push(timestamp);
-      return { desk_id: deskId, request_id: signed.length, venue: 'orderly', kind: 'ws_auth', payload: { method: 'GET', path: '', body: '', timestamp, message: String(timestamp) }, signature: { scheme: 'Ed25519', signature: SIG } };
+      const failure = failures.shift();
+      if (failure instanceof Error) throw failure;
+      return {
+        desk_id: failure?.desk ?? deskId, request_id: signed.length, venue: 'orderly', kind: 'ws_auth',
+        payload: { method: 'GET', path: '', body: '', timestamp, message: String(timestamp) }, signature: { scheme: 'Ed25519', signature: SIG },
+      };
     },
   };
   const stream = new OrderlyAccountStream({
-    deskId: 'alpha', accountId: ACCOUNT, orderlyKey: KEY, signer, clock: new VirtualClock(NOW), timeoutMs,
-    webSocket: (url) => { const s = new FakeSocket(url); sockets.push(s); queueMicrotask(() => s.open()); return s; },
+    deskId: 'alpha', accountId: ACCOUNT, orderlyKey: KEY, signer, clock, timeoutMs: options.timeoutMs ?? 200, silenceMs: options.silenceMs ?? 10_000,
+    webSocket: (url) => {
+      if (factoryThrows > 0) {
+        factoryThrows--;
+        throw new Error('socket factory failed');
+      }
+      const s = new FakeSocket(url);
+      sockets.push(s);
+      queueMicrotask(() => s.open());
+      return s;
+    },
     onExecutionReport: (r) => reports.push(r),
   });
-  return { stream, sockets, signed, reports };
+  return { stream, sockets, signed, reports, clock };
 }
 
 async function until(check: () => boolean): Promise<void> {
@@ -83,130 +109,182 @@ async function until(check: () => boolean): Promise<void> {
   assert.ok(check(), 'condition never held');
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 function login(s: FakeSocket): void {
-  s.push({ id: 'auth', event: 'auth', success: true, ts: NOW });
+  s.push({ id: 'auth-1', event: 'auth', success: true, ts: NOW });
 }
 
+async function loggedIn(s: ReturnType<typeof setup>, index = 0): Promise<FakeSocket> {
+  const started = s.stream.start();
+  await until(() => s.sockets[index]?.sent.length === 1);
+  login(s.sockets[index]!);
+  await started;
+  return s.sockets[index]!;
+}
+
+const SOL_ROW = {
+  symbol: 'PERP_SOL_USDC', positionQty: 2, costPosition: 190, lastSumUnitaryFunding: 1.5, averageOpenPrice: 95, estLiqPrice: 0, accruedFundingFee: 0.4,
+};
 const positionPush = (positions: unknown[], ts = NOW + 5) => ({ topic: 'position', ts, data: { positions } });
 const balancePush = (holding: number, frozen = 0, ts = NOW + 6) => ({ topic: 'balance', ts, data: { balances: { USDC: { holding, frozen } } } });
 
-test('one ws auth signature opens the session: auth frame, then the three topics', async () => {
-  const { stream, sockets, signed } = setup();
-  const started = stream.start();
-  await until(() => sockets[0]?.sent.length === 1);
-  const s = sockets[0]!;
-  assert.equal(s.url, `wss://ws-private-evm.orderly.org/v2/ws/private/stream/${ACCOUNT}`);
-  assert.deepEqual(s.sent[0], { id: 'auth', event: 'auth', params: { orderly_key: KEY, sign: Buffer.from(SIG).toString('base64url'), timestamp: NOW } });
-  login(s);
+test('one ws auth signature opens the session: auth frame auth-1, then the three topics', async () => {
+  const s = setup();
+  const started = s.stream.start();
+  await until(() => s.sockets[0]?.sent.length === 1);
+  const sock = s.sockets[0]!;
+  assert.equal(sock.url, `wss://ws-private-evm.orderly.org/v2/ws/private/stream/${ACCOUNT}`);
+  assert.deepEqual(sock.sent[0], { id: 'auth-1', event: 'auth', params: { orderly_key: KEY, sign: Buffer.from(SIG).toString('base64url'), timestamp: NOW } });
+  login(sock);
   await started;
-  assert.deepEqual(s.sent.slice(1), ORDERLY_PRIVATE_TOPICS.map((topic) => ({ id: `sub-${topic}`, event: 'subscribe', topic })));
+  assert.deepEqual(sock.sent.slice(1), ORDERLY_PRIVATE_TOPICS.map((topic) => ({ id: `sub-${topic}`, event: 'subscribe', topic })));
   // Reads and repeated starts reuse the session: still one signature.
-  await stream.start();
-  s.push(positionPush([]));
-  s.push(balancePush(100));
-  await stream.state();
-  await stream.state();
-  assert.deepEqual(signed, [NOW]);
-  assert.equal(stream.signatures, 1);
-  stream.close();
+  await s.stream.start();
+  sock.push(positionPush([]));
+  sock.push(balancePush(100));
+  await s.stream.state();
+  await s.stream.state();
+  assert.deepEqual(s.signed, [NOW]);
+  assert.equal(s.stream.signatures, 1);
+  s.stream.close();
 });
 
 test('ping is answered with pong carrying the same ts, before and after login', async () => {
-  const { stream, sockets } = setup();
-  const started = stream.start();
-  await until(() => sockets[0]?.sent.length === 1);
-  const s = sockets[0]!;
-  s.push({ event: 'ping', ts: 111 });
-  login(s);
+  const s = setup();
+  const started = s.stream.start();
+  await until(() => s.sockets[0]?.sent.length === 1);
+  const sock = s.sockets[0]!;
+  sock.push({ event: 'ping', ts: 111 });
+  login(sock);
   await started;
-  s.push({ event: 'ping', ts: 222 });
-  assert.deepEqual(s.sent.filter((f) => f.event === 'pong'), [{ event: 'pong', ts: 111 }, { event: 'pong', ts: 222 }]);
-  stream.close();
+  sock.push({ event: 'ping', ts: 222 });
+  assert.deepEqual(sock.sent.filter((f) => f.event === 'pong'), [{ event: 'pong', ts: 111 }, { event: 'pong', ts: 222 }]);
+  s.stream.close();
 });
 
 test('state() waits for both first pushes; positions replace, balances merge, reports go to the callback', async () => {
-  const { stream, sockets, reports } = setup();
-  const started = stream.start();
-  await until(() => sockets[0]?.sent.length === 1);
-  const s = sockets[0]!;
-  login(s);
-  await started;
+  const s = setup();
+  const sock = await loggedIn(s);
   let done = false;
-  const first = stream.state().then((x) => { done = true; return x; });
-  s.push(positionPush([{ symbol: 'PERP_SOL_USDC', positionQty: 2, costPosition: 190, lastSumUnitaryFunding: 1.5, averageOpenPrice: 95, markPrice: 96, estLiqPrice: 0, accruedFundingFee: '0.4' }]));
+  const first = s.stream.state().then((x) => { done = true; return x; });
+  s.clock.set(NOW + 50);
+  sock.push(positionPush([{ ...SOL_ROW, markPrice: 96, accruedFundingFee: '0.4' }]));
   await new Promise((r) => setImmediate(r));
   assert.equal(done, false, 'no balance push yet');
-  s.push(balancePush(500, 20));
+  s.clock.set(NOW + 70);
+  sock.push(balancePush(500, 20));
   const snap = await first;
   assert.deepEqual(snap, {
     accountId: ACCOUNT,
-    positions: [{ symbol: 'PERP_SOL_USDC', positionQty: 2, costPosition: 190, lastSumUnitaryFunding: 1.5, averageOpenPrice: 95, markPrice: 96, estLiqPrice: 0 }],
+    positions: [{ ...SOL_ROW, markPrice: 96 }],
     balances: { USDC: { holding: 500, frozen: 20 } },
+    invalidBalances: {},
     positionsAt: NOW + 5,
     balancesAt: NOW + 6,
+    confirmedAt: NOW + 70,          // the local time of the server's last frame
   });
-  s.push(positionPush([{ symbol: 'PERP_ETH_USDC', positionQty: -1, costPosition: -3000, lastSumUnitaryFunding: 0, averageOpenPrice: 3000 }], NOW + 9));
-  s.push({ topic: 'balance', ts: NOW + 10, data: { balances: { USDT: { holding: '7', frozen: 0 } } } });
-  s.push({ topic: 'executionreport', ts: NOW + 11, data: { orderId: 42, status: 'FILLED' } });
-  const next = await stream.state();
+  sock.push(positionPush([{ ...SOL_ROW, symbol: 'PERP_ETH_USDC', positionQty: -1 }], NOW + 9));
+  sock.push({ topic: 'balance', ts: NOW + 10, data: { balances: { USDT: { holding: '7', frozen: 0 } } } });
+  sock.push({ topic: 'executionreport', ts: NOW + 11, data: { orderId: 42, status: 'FILLED' } });
+  s.clock.set(NOW + 90);
+  sock.push({ event: 'ping', ts: 1 });
+  const next = await s.stream.state();
   assert.deepEqual(next.positions.map((p) => p.symbol), ['PERP_ETH_USDC'], 'each position push is the whole list');
   assert.deepEqual(next.balances, { USDC: { holding: 500, frozen: 20 }, USDT: { holding: 7, frozen: 0 } });
-  assert.deepEqual(reports, [{ orderId: 42, status: 'FILLED' }]);
-  stream.close();
+  assert.equal(next.confirmedAt, NOW + 90, 'a ping confirms the cache too');
+  assert.deepEqual(s.reports, [{ orderId: 42, status: 'FILLED' }]);
+  s.stream.close();
+});
+
+test('a signer that throws ends the session: the next start() signs again and connects', async () => {
+  const s = setup({ failures: [new Error('contract unreachable')] });
+  await assert.rejects(s.stream.start(), /contract unreachable/);
+  await assert.rejects(s.stream.state(), /contract unreachable/, 'a dead session stays dead for reads');
+  assert.equal(s.sockets.length, 0);
+  await loggedIn(s);
+  assert.equal(s.signed.length, 2);
+  assert.equal(s.sockets.length, 1);
+  s.stream.close();
+});
+
+test('a signature for another desk and a socket factory that throws also end the session, and the next start() retries', async () => {
+  const wrongDesk = setup({ failures: [{ desk: 'beta' }] });
+  await assert.rejects(wrongDesk.stream.start(), /for desk beta, not alpha/);
+  assert.equal(wrongDesk.sockets.length, 0, 'nothing is opened with a signature for another desk');
+  await loggedIn(wrongDesk);
+  assert.equal(wrongDesk.signed.length, 2);
+  wrongDesk.stream.close();
+
+  const noSocket = setup({ factoryThrows: 1 });
+  await assert.rejects(noSocket.stream.start(), /socket factory failed/);
+  await loggedIn(noSocket);
+  assert.equal(noSocket.signed.length, 2);
+  noSocket.stream.close();
 });
 
 test('a refused login fails start(); the next start signs again on a new socket', async () => {
-  const { stream, sockets, signed } = setup();
-  const started = stream.start();
-  await until(() => sockets[0]?.sent.length === 1);
-  sockets[0]!.push({ id: 'auth', event: 'auth', success: false, errorMsg: 'orderly key error' });
+  const s = setup();
+  const started = s.stream.start();
+  await until(() => s.sockets[0]?.sent.length === 1);
+  s.sockets[0]!.push({ id: 'auth-1', event: 'auth', success: false, errorMsg: 'orderly key error' });
   await assert.rejects(started, /login refused: orderly key error/);
-  assert.equal(sockets[0]!.closedWith, 1000);
-  const again = stream.start();
-  await until(() => sockets[1]?.sent.length === 1);
-  login(sockets[1]!);
-  await again;
-  assert.equal(signed.length, 2);
-  stream.close();
+  assert.equal(s.sockets[0]!.closedWith, 1000);
+  await loggedIn(s, 1);
+  assert.equal(s.signed.length, 2);
+  s.stream.close();
 });
 
 test('timeouts: no auth answer, then no pushes after login', async () => {
-  const quiet = setup(30);
+  const quiet = setup({ timeoutMs: 30 });
   await assert.rejects(quiet.stream.start(), /no auth answer within 30 ms/);
 
-  const { stream, sockets } = setup(30);
-  const started = stream.start();
-  await until(() => sockets[0]?.sent.length === 1);
-  login(sockets[0]!);
-  await started;
-  sockets[0]!.push(balancePush(1));
-  await assert.rejects(stream.state(), /no position push within 30 ms/);
-  stream.close();
+  const s = setup({ timeoutMs: 30 });
+  const sock = await loggedIn(s);
+  sock.push(balancePush(1));
+  await assert.rejects(s.stream.state(), /no position push within 30 ms/);
+  s.stream.close();
 });
 
-test('a dropped socket fails waiting reads; close() before login fails the start', async () => {
-  const { stream, sockets } = setup();
-  const started = stream.start();
-  await until(() => sockets[0]?.sent.length === 1);
-  login(sockets[0]!);
-  await started;
-  const waiting = stream.state();
+test('a stalled stream (half-open socket) is killed after silenceMs; pings keep a live one open', async () => {
+  const live = setup({ silenceMs: 60 });
+  const liveSock = await loggedIn(live);
+  liveSock.push(positionPush([]));
+  liveSock.push(balancePush(10));
+  for (let i = 0; i < 5; i++) {
+    await sleep(20);
+    liveSock.push({ event: 'ping', ts: i });
+  }
+  await live.stream.state();                                   // 100 ms in, still alive: pings every 20 ms
+  live.stream.close();
+
+  const stalled = setup({ silenceMs: 40 });
+  const sock = await loggedIn(stalled);
+  sock.push(positionPush([SOL_ROW]));
+  sock.push(balancePush(10));
+  await stalled.stream.state();
+  await sleep(70);                                             // the server says nothing, the socket stays "open"
+  await assert.rejects(stalled.stream.state(), /no frame from the server for 40 ms/);
+  assert.equal(sock.closedWith, 1000);
+  await loggedIn(stalled, 1);                                  // a new session, a new signature
+  assert.equal(stalled.signed.length, 2);
+  stalled.stream.close();
+});
+
+test('a dropped socket fails waiting reads; reads stay dead until start(); close() before login fails the start', async () => {
+  const s = setup();
+  const sock = await loggedIn(s);
+  const waiting = s.stream.state();
   await new Promise((r) => setImmediate(r));
-  sockets[0]!.drop(1006, 'gone');
+  sock.drop(1006, 'gone');
   await assert.rejects(waiting, /closed \(1006 gone\)/);
-  // A dead session stays dead for reads: no new socket and no new signature until start() is called.
-  const dropped = stream.state();
-  sockets.length = 0;
-  await assert.rejects(dropped, /closed \(1006 gone\)/);
-  assert.equal(sockets.length, 0);
-  assert.equal(stream.signatures, 1);
+  await assert.rejects(s.stream.state(), /closed \(1006 gone\)/);
+  assert.equal(s.sockets.length, 1);
+  assert.equal(s.stream.signatures, 1);
   // A drop between start() and the read is caught too.
-  const again = stream.start();
-  await until(() => sockets[0]?.sent.length === 1);
-  login(sockets[0]!);
-  await again;
-  const racing = stream.state();
-  sockets[0]!.drop(1001, 'away');
+  const again = await loggedIn(s, 1);
+  const racing = s.stream.state();
+  again.drop(1001, 'away');
   await assert.rejects(racing, /closed \(1001 away\)/);
 
   const early = setup();
@@ -216,37 +294,108 @@ test('a dropped socket fails waiting reads; close() before login fails the start
   await assert.rejects(pending, /orderly private stream: closed/);
 });
 
-test('the stream refuses a key that is not ed25519:<base58>', () => {
-  const signer = { orderlyWsAuth: async () => { throw new Error('never'); } };
-  assert.throws(() => new OrderlyAccountStream({ deskId: 'alpha', accountId: ACCOUNT, orderlyKey: 'ed25519:0O', signer }), /ed25519:<base58>/);
+test('a position push with a missing or renamed field makes the positions unknown, never zero, until a good push', async () => {
+  const s = setup();
+  const sock = await loggedIn(s);
+  sock.push(balancePush(10));
+  const { lastSumUnitaryFunding: _gone, ...noSum } = SOL_ROW;
+  sock.push(positionPush([noSum]));
+  await assert.rejects(s.stream.state(), /position push unusable: position PERP_SOL_USDC: lastSumUnitaryFunding is missing/);
+  sock.push(positionPush([{ ...SOL_ROW, positionQty: 'two' }]));
+  await assert.rejects(s.stream.state(), /positionQty is not a number \("two"\)/);
+  sock.push({ topic: 'position', ts: NOW, data: { rows: [SOL_ROW] } });     // the list under another name
+  await assert.rejects(s.stream.state(), /data\.positions is not a list/);
+  sock.push(positionPush([SOL_ROW]));
+  assert.equal((await s.stream.state()).positions.length, 1);
+  s.stream.close();
 });
 
-test('reader account(): stream state valued at the recorded SOL mark, sum unitary funding and IMR/MMR', async () => {
-  const lines = readWireRecording(join(fileURLToPath(new URL('../../fixtures/orderly-wire/', import.meta.url)), 'orderly-mainnet-2026-10-31.jsonl.gz'));
-  const futures = (lines.find((l) => l.url.includes('/v1/public/futures'))!.response as { data: { rows: OrderlyFuturesRow[] } }).data.rows;
-  const info = (lines.find((l) => l.url.endsWith('/v1/public/info'))!.response as { data: { rows: OrderlyInfoRow[] } }).data.rows;
-  const sol = futures.find((f) => f.symbol === 'PERP_SOL_USDC')!;
-  const solInfo = info.find((r) => r.symbol === 'PERP_SOL_USDC')!;
-  const position = { symbol: 'PERP_SOL_USDC', positionQty: -3, costPosition: -300, lastSumUnitaryFunding: sol.sum_unitary_funding - 0.05, averageOpenPrice: 100, estLiqPrice: 130.5, accruedFundingFee: -0.25 };
-  const accountStream = { accountId: ACCOUNT, state: async () => ({ accountId: ACCOUNT, positions: [position], balances: { USDC: { holding: 1000, frozen: 10 } }, positionsAt: NOW, balancesAt: NOW }) };
-  const reader = new OrderlyReader({ fetch: replayFetch(lines), wsRequest: replayWsRequester(lines), accountStream, clock: new VirtualClock(lines[0]!.t) });
+test('a balance row missing a field is marked invalid for that token, not read as 0', async () => {
+  const s = setup();
+  const sock = await loggedIn(s);
+  sock.push(positionPush([]));
+  sock.push({ topic: 'balance', ts: NOW, data: { balances: { USDC: { holding: 12 }, USDT: { holding: 1, frozen: 0 } } } });
+  const snap = await s.stream.state();
+  assert.deepEqual(snap.balances, { USDT: { holding: 1, frozen: 0 } });
+  assert.deepEqual(snap.invalidBalances, { USDC: 'balance: frozen is missing' });
+  sock.push(balancePush(12, 1));
+  const fixed = await s.stream.state();
+  assert.deepEqual([fixed.balances.USDC, fixed.invalidBalances], [{ holding: 12, frozen: 1 }, {}]);
+  s.stream.close();
+});
 
-  const state = await reader.account(ACCOUNT.toUpperCase().replace('0X', '0x'));
-  const notional = 3 * sol.mark_price;                                              // USD
-  const imr = positionImr(notional, solInfo.base_imr, solInfo.imr_factor);          // fraction of notional
-  const mmr = positionMmr(notional, solInfo.base_mmr, solInfo.base_imr, solInfo.imr_factor);
-  const equity = 1000 + unsettledPnlUsd(-3, sol.mark_price, -300, sol.sum_unitary_funding, position.lastSumUnitaryFunding);
-  assert.equal(state.venue, 'orderly');
-  assert.equal(state.address, ACCOUNT);
-  assert.equal(state.equityUsd, equity);
-  assert.equal(state.freeMarginUsd, equity - notional * imr - 10);
-  assert.equal(state.maintenanceMarginUsd, notional * mmr);
-  assert.equal(state.positions.length, 1);
+test('the stream refuses a key that is not ed25519:<base58>; parsePosition names what is missing', () => {
+  const signer = { orderlyWsAuth: async () => { throw new Error('never'); } };
+  assert.throws(() => new OrderlyAccountStream({ deskId: 'alpha', accountId: ACCOUNT, orderlyKey: 'ed25519:0O', signer }), /ed25519:<base58>/);
+  assert.throws(() => parsePosition({ ...SOL_ROW, estLiqPrice: undefined }), /estLiqPrice is missing/);
+  assert.throws(() => parsePosition({ ...SOL_ROW, symbol: '' }), /no symbol/);
+  assert.deepEqual(parsePosition({ ...SOL_ROW, mmr: 'x' }), SOL_ROW, 'an optional field that is not a number is left out');
+});
+
+// ---- valuation, worked by hand ----
+
+const INFO: OrderlyInfoRow = {
+  symbol: 'PERP_SOL_USDC', broker_id: null, status: 'ACTIVE', base_tick: 0.01, quote_tick: 0.001, base_min: 0.01, min_notional: 10,
+  base_imr: 0.01, base_mmr: 0.006, imr_factor: 0.0000010667, funding_period: 8,
+};
+const FUTURES: OrderlyFuturesRow = {
+  symbol: 'PERP_SOL_USDC', status: 'ACTIVE', index_price: 100.1, mark_price: 100, sum_unitary_funding: 10.05, est_funding_rate: 0,
+  last_funding_rate: 0, next_funding_time: NOW + 3_600_000, open_interest: 1, '24h_amount': 1,
+};
+const SHORT: OrderlyStreamPosition = {
+  symbol: 'PERP_SOL_USDC', positionQty: -3, costPosition: -303, lastSumUnitaryFunding: 10, averageOpenPrice: 101, estLiqPrice: 130.5, accruedFundingFee: -0.25,
+};
+const snapshot = (over: Partial<OrderlyAccountSnapshot> = {}): OrderlyAccountSnapshot => ({
+  accountId: ACCOUNT, positions: [SHORT], balances: { USDC: { holding: 1000, frozen: 10 } }, invalidBalances: {},
+  positionsAt: NOW - 4000, balancesAt: NOW - 9000, confirmedAt: NOW - 2000, ...over,
+});
+const near = (a: number, b: number, what: string) => assert.ok(Math.abs(a - b) < 1e-9, `${what}: ${a} vs ${b}`);
+
+test('account: a 3 SOL short valued by hand at mark 100, funding sum up 0.05 since it was last settled', () => {
+  // notional = 3 x 100 = 300 USD. Size term 1.0667e-6 x 300^0.8 = 1.02e-4 < base IMR 0.01, so IMR = 0.01 and
+  // MMR = 0.006: margin 3.00 USD, maintenance 1.80 USD.
+  // unsettled PnL = qty x mark - cost - qty x (sum - last) = -300 + 303 + 3 x 0.05 = 3.15 USD; equity 1003.15.
+  // free = equity - initial - frozen = 1003.15 - 3 - 10 = 990.15. Unsettled funding = -qty x 0.05 = +0.15 (a short receives).
+  const state = parseAccount(snapshot(), [FUTURES], [INFO], NOW);
+  near(state.equityUsd, 1003.15, 'equity');
+  near(state.freeMarginUsd, 990.15, 'free margin');
+  near(state.maintenanceMarginUsd, 1.8, 'maintenance');
   const p = state.positions[0]!;
-  assert.deepEqual([p.symbol, p.size, p.entryPx, p.liqPx, p.leverage], ['PERP_SOL_USDC', -3, 100, 130.5, 1 / imr]);
-  assert.equal(p.marginUsd, notional * imr);
-  assert.equal(p.unrealizedPnlUsd, -3 * (sol.mark_price - 100));
-  assert.equal(p.unsettledFundingUsd, unsettledFundingUsd(-3, sol.sum_unitary_funding, position.lastSumUnitaryFunding));
-  assert.equal(p.fundingSinceOpenUsd, 0.25, 'accruedFundingFee read as paid > 0 (to verify on C5)');
+  near(p.marginUsd, 3, 'margin');
+  near(p.unrealizedPnlUsd, 3, 'unrealized: -3 x (100 - 101)');
+  near(p.unsettledFundingUsd, 0.15, 'unsettled funding');
+  assert.deepEqual([p.symbol, p.size, p.entryPx, p.liqPx, p.leverage], ['PERP_SOL_USDC', -3, 101, 130.5, 100]);
+  // ASSUMPTION, to verify on day 5 (C5): accruedFundingFee is paid > 0, so -0.25 is read as 0.25 received.
+  assert.equal(p.fundingSinceOpenUsd, 0.25);
+  assert.equal(state.time, NOW - 2000, 'the time is when the server last confirmed the stream, not now');
+  assert.deepEqual([state.positionsPushedAt, state.balancesPushedAt], [NOW - 4000, NOW - 9000]);
+  // Orderly's estLiqPrice 0 means none.
+  assert.equal(parseAccount(snapshot({ positions: [{ ...SHORT, estLiqPrice: 0 }] }), [FUTURES], [INFO], NOW).positions[0]!.liqPx, null);
+});
+
+test('account: nothing missing is read as zero, and stream state the server has not confirmed lately is refused', () => {
+  assert.throws(() => parseAccount(snapshot(), [], [INFO], NOW), /no PERP_SOL_USDC row in \/v1\/public\/futures/);
+  assert.throws(() => parseAccount(snapshot(), [FUTURES], [], NOW), /no market info for PERP_SOL_USDC/);
+  assert.throws(() => parseAccount(snapshot({ balances: {} }), [FUTURES], [INFO], NOW), /pushed no USDC balance/);
+  assert.throws(() => parseAccount(snapshot({ balances: {}, invalidBalances: { USDC: 'balance: frozen is missing' } }), [FUTURES], [INFO], NOW), /USDC balance push is unusable: balance: frozen is missing/);
+  assert.throws(() => parseAccount(snapshot(), [{ ...FUTURES, mark_price: 0 }], [INFO], NOW), /no usable mark price/);
+  assert.throws(() => parseAccount(snapshot({ confirmedAt: NOW - 30_001 }), [FUTURES], [INFO], NOW), /stale: the private stream last heard from the server 30001 ms ago \(limit 30000 ms\)/);
+  parseAccount(snapshot({ confirmedAt: NOW - 30_000 }), [FUTURES], [INFO], NOW);
+});
+
+test('reader account(): the stream state priced at the recorded REST mark, refused when stale or for another account', async () => {
+  const lines = readWireRecording(join(fileURLToPath(new URL('../../fixtures/orderly-wire/', import.meta.url)), 'orderly-mainnet-2026-10-31.jsonl.gz'));
+  const at = lines[0]!.t;
+  const clock = new VirtualClock(at);
+  let confirmedAt = at - 1000;
+  const accountStream = { accountId: ACCOUNT, state: async () => snapshot({ confirmedAt }) };
+  const reader = new OrderlyReader({ fetch: replayFetch(lines), wsRequest: replayWsRequester(lines), accountStream, clock });
+  const state = await reader.account(ACCOUNT.toUpperCase().replace('0X', '0x'));
+  assert.equal(state.address, ACCOUNT);
+  assert.equal(state.time, at - 1000);
+  // The recorded SOL mark is 96.134: a 3 SOL short opened at 101 is 3 x (101 - 96.134) = 14.598 USD up.
+  near(state.positions[0]!.unrealizedPnlUsd, 14.598, 'unrealized at the recorded mark');
+  confirmedAt = at - 31_000;
+  await assert.rejects(reader.account(ACCOUNT), /stale/);
   await assert.rejects(reader.account(`0x${'11'.repeat(32)}`), /the stream is for/);
 });

@@ -3,12 +3,14 @@
 // The engine never signs: an OrderlySigner is the contract client (or a fake one in tests); this file only checks
 // and encodes what it returns.
 
-/** Orderly request kinds the contract builds (interfaces 1.3), plus `funding_fee_history` (proposed, see below). */
+/** Orderly request kinds the contract builds (interfaces 1.3). */
 export type OrderlyRequestKind =
   | 'order' | 'cancel' | 'cancel_all'
   | 'receiver_address' | 'settle_nonce' | 'withdraw_nonce' | 'settle_pnl' | 'withdraw_request' | 'referral_bind'
-  // Not in the contract yet: GET /v1/funding_fee/history?start_t&end_t&page&size, so userFunding has a source.
-  | 'funding_fee_history';
+  | 'funding_fee_history';         // GET /v1/funding_fee/history?start_t&end_t&page&size, read only
+
+/** The `kind` the engine expects on an orderly_ws_auth SignedAction (interfaces 1.4 names no kind for it yet). */
+export const ORDERLY_WS_AUTH_KIND = 'ws_auth';
 
 /** interfaces 1.3 `OrderlyRequest`; the contract builds path and body from it, the engine never passes raw JSON. */
 export interface OrderlyRequest {
@@ -26,7 +28,7 @@ export interface OrderlyRequest {
   nonce?: number | null;
   signed_at_ms?: number | null;
   eip712_signature?: string | null;
-  // funding_fee_history only (proposed): ms window and paging.
+  // funding_fee_history only: ms window and paging.
   start_t?: number | null;
   end_t?: number | null;
   page?: number | null;
@@ -64,10 +66,7 @@ export interface OrderlyRestPayload {
   message: string;                      // timestamp + METHOD + path + body, exactly as signed; the timestamp alone for ws auth
 }
 
-/**
- * An EIP-712 action (Registration, AddOrderlyKey, SettlePnl, Withdraw): the typed-data message the contract signed.
- * Interfaces 1.4 does not spell this payload out yet; this is the shape the relayer needs, and what is asked for.
- */
+/** An EIP-712 action (Registration, AddOrderlyKey, SettlePnl, Withdraw): the typed-data message the contract signed (interfaces 1.4). */
 export interface OrderlyEip712Payload {
   message: Record<string, unknown> & { timestamp: number | string };
   userAddress?: string;                 // the desk's EVM address; the relayer falls back to its config
@@ -156,11 +155,11 @@ export interface OrderlyAuthHeaders {
 }
 
 /**
- * Checks a signed REST action before anything is sent: the right venue and kind, a message that is exactly
+ * Checks a signed REST action before anything is sent: the right venue, desk and kind, a message that is exactly
  * timestamp + METHOD + path + body, a timestamp still inside Orderly's 300 s window. Throws on any mismatch.
  */
-export function checkRestAction(action: OrderlyRestAction, expectedKind: string, now: number): void {
-  if (action.venue !== 'orderly') throw new Error(`orderly: signed action is for ${action.venue}`);
+export function checkRestAction(action: OrderlyRestAction, expectedKind: string, now: number, deskId: string): void {
+  checkVenueAndDesk(action, deskId);
   if (action.kind !== expectedKind) throw new Error(`orderly: asked for ${expectedKind}, the contract signed ${action.kind}`);
   const p = action.payload;
   const method = String(p.method).toUpperCase();
@@ -175,12 +174,34 @@ export function checkRestAction(action: OrderlyRestAction, expectedKind: string,
 }
 
 /** A ws auth action signs the timestamp alone; checked the same way. */
-export function checkWsAuthAction(action: OrderlyRestAction, timestamp: number, now: number): void {
-  if (action.venue !== 'orderly') throw new Error(`orderly: signed action is for ${action.venue}`);
+export function checkWsAuthAction(action: OrderlyRestAction, timestamp: number, now: number, deskId: string): void {
+  checkVenueAndDesk(action, deskId);
+  if (action.kind !== ORDERLY_WS_AUTH_KIND) throw new Error(`orderly ws auth: the contract signed ${action.kind}, not ${ORDERLY_WS_AUTH_KIND}`);
   if (action.payload.timestamp !== timestamp) throw new Error(`orderly ws auth: asked to sign ${timestamp}, got ${action.payload.timestamp}`);
   if (action.payload.message !== String(timestamp)) throw new Error('orderly ws auth: the signed message is not the timestamp');
   checkFresh(timestamp, now, 'ws auth');
   signatureBytes(action.signature);
+}
+
+/**
+ * An EIP-712 action: for Orderly, for this desk, and its typed message carries exactly the `fields` the engine asked
+ * the contract to sign (a nonce, an amount). A number and its decimal string compare equal.
+ */
+export function checkEip712Action(action: OrderlyEip712Action, deskId: string, what: string, fields: Record<string, string | number> = {}): void {
+  checkVenueAndDesk(action, deskId);
+  const message = action.payload?.message;
+  if (typeof message !== 'object' || message === null) throw new Error(`orderly ${what}: the signed action has no EIP-712 message`);
+  for (const [field, want] of Object.entries(fields)) {
+    const got = message[field];
+    if (got === undefined || got === null || String(got) !== String(want)) {
+      throw new Error(`orderly ${what}: the contract signed ${field} ${JSON.stringify(got)}, the engine asked for ${JSON.stringify(want)}`);
+    }
+  }
+}
+
+function checkVenueAndDesk(action: SignedAction, deskId: string): void {
+  if (action.venue !== 'orderly') throw new Error(`orderly: signed action is for ${action.venue}`);
+  if (action.desk_id !== deskId) throw new Error(`orderly: signed action is for desk ${action.desk_id}, not ${deskId}`);
 }
 
 function checkFresh(timestamp: number, now: number, what: string): void {

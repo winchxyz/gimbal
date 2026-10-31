@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { OrderlyDeskClient } from './orderly-actions.ts';
 import type { OrderlyFundingFeeRow } from './orderly-actions.ts';
-import { OrderlyReader, parseFundingFeeRow } from './orderly.ts';
+import { OrderlyReader, morePages, parseFundingFeeRow } from './orderly.ts';
 import type {
   OrderlyEip712Action, OrderlyRequest, OrderlyRestAction, OrderlySigner, Secp256k1Signature,
 } from './orderly-signer.ts';
@@ -70,8 +70,11 @@ class FakeSigner implements OrderlySigner {
     this.calls.push(`orderly_withdraw:${amount}:${withdrawNonce}`);
     return this.#eip712(deskId, 'withdraw', { brokerId: 'gimbal', chainId: 42161, receiver: EVM, token: 'USDC', amount, withdrawNonce, timestamp: NOW + 2 });
   }
+  /** Rewrites an EIP-712 action before it is returned: a contract that signed something else. */
+  eip712Tamper: ((a: OrderlyEip712Action) => OrderlyEip712Action) | null = null;
   #eip712(deskId: string, kind: string, message: OrderlyEip712Action['payload']['message']): OrderlyEip712Action {
-    return { desk_id: deskId, request_id: ++this.#id, venue: 'orderly', kind, payload: { message, userAddress: EVM }, signature: SECP };
+    const action: OrderlyEip712Action = { desk_id: deskId, request_id: ++this.#id, venue: 'orderly', kind, payload: { message, userAddress: EVM }, signature: SECP };
+    return this.eip712Tamper === null ? action : this.eip712Tamper(action);
   }
 }
 
@@ -184,13 +187,66 @@ test('money out stops at the first refusal and never withdraws unsettled', async
   assert.ok(!sent.some((s) => s.url.includes('withdraw')));
 });
 
-test('a withdraw amount must be a canonical decimal string', async () => {
+test('a withdraw amount must be a canonical USDC decimal string, at most 6 decimals', async () => {
   const signer = new FakeSigner();
   const { f } = fakeVenue({});
-  for (const bad of ['0', '-1', '1.50', '01', '1.123456789', 'abc']) {
+  for (const bad of ['0', '-1', '1.50', '01', '1.1234567', '1.123456789', 'abc']) {
     await assert.rejects(client(signer, f).withdraw(bad), /canonical/, bad);
   }
   assert.deepEqual(signer.calls, []);
+});
+
+test('settle_pnl and withdraw_request only run inside withdraw(): request() refuses them without signing', async () => {
+  const signer = new FakeSigner();
+  const { f, sent } = fakeVenue({});
+  for (const kind of ['settle_pnl', 'withdraw_request'] as const) {
+    await assert.rejects(client(signer, f).request(kind, { amount: '1', nonce: 1 }), new RegExp(`${kind} only runs inside withdraw\\(\\)`));
+  }
+  assert.deepEqual(signer.calls, []);
+  assert.equal(sent.length, 0);
+});
+
+const MONEY_OUT = {
+  'GET /v1/settle_nonce': { settle_nonce: 17 },
+  'POST /v1/settle_pnl': { settle_pnl_id: 3 },
+  'GET /v1/withdraw_nonce': { withdraw_nonce: 41 },
+  'POST /v1/withdraw_request': { withdraw_id: 9 },
+};
+
+test('the settle and withdraw messages must carry the nonce, amount and receiver asked for, or nothing more is sent', async () => {
+  const cases: [string, (a: OrderlyEip712Action) => OrderlyEip712Action, RegExp, string][] = [
+    ['settle nonce', (a) => (a.kind === 'settle_pnl' ? { ...a, payload: { ...a.payload, message: { ...a.payload.message, settleNonce: 16 } } } : a), /settle pnl: the contract signed settleNonce 16, the engine asked for 17/, 'GET /v1/settle_nonce'],
+    ['withdraw nonce', (a) => (a.kind === 'withdraw' ? { ...a, payload: { ...a.payload, message: { ...a.payload.message, withdrawNonce: 40 } } } : a), /signed withdrawNonce 40/, 'GET /v1/withdraw_nonce'],
+    ['amount', (a) => (a.kind === 'withdraw' ? { ...a, payload: { ...a.payload, message: { ...a.payload.message, amount: '125' } } } : a), /signed amount "125", the engine asked for 12.5 USDC/, 'GET /v1/withdraw_nonce'],
+    ['receiver', (a) => (a.kind === 'withdraw' ? { ...a, payload: { ...a.payload, message: { ...a.payload.message, receiver: `0x${'aa'.repeat(20)}` } } } : a), /signed receiver 0xaaaa/, 'GET /v1/withdraw_nonce'],
+    ['desk', (a) => (a.kind === 'settle_pnl' ? { ...a, desk_id: 'beta' } : a), /for desk beta, not alpha/, 'GET /v1/settle_nonce'],
+  ];
+  for (const [name, tamper, error, lastSent] of cases) {
+    const signer = new FakeSigner();
+    signer.eip712Tamper = tamper;
+    const { f, sent } = fakeVenue(MONEY_OUT);
+    await assert.rejects(client(signer, f).withdraw('12.5'), error, name);
+    assert.equal(`${sent.at(-1)!.method} ${new URL(sent.at(-1)!.url).pathname}`, lastSent, name);
+    assert.ok(!sent.some((s) => s.url.endsWith('/v1/withdraw_request')), name);
+  }
+  // The amount may come back in USDC's 6-decimal units: 12.5 USDC = 12500000.
+  const signer = new FakeSigner();
+  signer.eip712Tamper = (a) => (a.kind === 'withdraw' ? { ...a, payload: { ...a.payload, message: { ...a.payload.message, amount: 12_500_000 } } } : a);
+  const { f } = fakeVenue(MONEY_OUT);
+  assert.equal((await client(signer, f).withdraw('12.5')).withdrawNonce, 41);
+});
+
+test('setup refuses a registration or key the contract signed for something else', async () => {
+  const wrongNonce = new FakeSigner();
+  wrongNonce.eip712Tamper = (a) => ({ ...a, payload: { ...a.payload, message: { ...a.payload.message, registrationNonce: '1' } } });
+  const one = fakeVenue(SETUP_ANSWERS);
+  await assert.rejects(client(wrongNonce, one.f).register(), /register: the contract signed registrationNonce "1", the engine asked for "194528949540"/);
+  assert.ok(!one.sent.some((s) => s.url.endsWith('/v1/register_account')));
+  const wrongKey = new FakeSigner();
+  wrongKey.eip712Tamper = (a) => ({ ...a, payload: { ...a.payload, message: { ...a.payload.message, orderlyKey: `ed25519:${'3'.repeat(44)}` } } });
+  const two = fakeVenue(SETUP_ANSWERS);
+  await assert.rejects(client(wrongKey, two.f).addKey(), /add key: the contract signed orderlyKey/);
+  assert.equal(two.sent.length, 0);
 });
 
 test('a signed request whose message does not match what is sent is never sent', async () => {
@@ -238,12 +294,47 @@ test('userFunding over the signed funding_fee_history read: pages, signs by paym
   await assert.rejects(reader.userFunding(`0x${'77'.repeat(32)}`, 0), /the client is for/);
 });
 
+test('userFunding pages by what the venue says: capped at 100 per page with 450 in all is five pages, not one', async () => {
+  const signer = new FakeSigner();
+  const all = Array.from({ length: 450 }, (_, i): OrderlyFundingFeeRow =>
+    ({ symbol: i === 7 ? 'PERP_GONE_USDC' : 'PERP_SOL_USDC', funding_rate: 0.0001, mark_price: 100, funding_fee: 0.01, payment_type: 'Pay', created_time: NOW - (i + 1) * 28_800_000 }));
+  const asked: number[] = [];
+  const f = (async (input: string | URL | Request) => {
+    const url = new URL(String(input));
+    if (url.pathname === '/v1/public/info') return new Response(JSON.stringify({ success: true, data: { rows: [{ symbol: 'PERP_SOL_USDC', funding_period: 8 }] } }));
+    const page = Number(url.searchParams.get('page'));
+    asked.push(Number(url.searchParams.get('size')));
+    // The venue serves at most 100 rows whatever size was asked for, and says so.
+    const rows = all.slice((page - 1) * 100, page * 100);
+    return new Response(JSON.stringify({ success: true, data: { rows, meta: { total: 450, records_per_page: 100, current_page: page } } }));
+  }) as typeof fetch;
+  const notes: string[] = [];
+  const reader = new OrderlyReader({ fetch: f, fundingFees: client(signer, f), clock: new VirtualClock(NOW), onNote: (n) => notes.push(n) });
+  const out = await reader.userFunding(ACCOUNT, 0, NOW);
+  assert.deepEqual(asked, [500, 500, 500, 500, 500]);
+  assert.equal(signer.calls.filter((c) => c === 'orderly_request:funding_fee_history').length, 5);
+  // A symbol missing from /v1/public/info is skipped and said, not a failure of the whole read.
+  assert.equal(out.length, 449);
+  assert.deepEqual(notes, ['orderly userFunding: skipped 1 payment(s) on PERP_GONE_USDC: no funding period (not in /v1/public/info)']);
+});
+
+test('page walk: short page against records_per_page, the total when given, else the size asked for', () => {
+  assert.equal(morePages(100, 500, 100, { total: 450, records_per_page: 100 }), true);
+  assert.equal(morePages(50, 500, 450, { total: 450, records_per_page: 100 }), false);
+  assert.equal(morePages(100, 500, 450, { total: 450, records_per_page: 100 }), false, 'every row is in');
+  assert.equal(morePages(100, 500, 100, { total: 450 }), true, 'capped silently: the total keeps the walk going');
+  assert.equal(morePages(100, 500, 100, undefined), false, 'nothing said: a page short of the size asked for is the last');
+  assert.equal(morePages(500, 500, 500, undefined), true);
+  assert.equal(morePages(0, 500, 300, { total: 450 }), false, 'an empty page ends it');
+});
+
 test('a funding fee row received on a positive rate is a short receiving', () => {
   const p = parseFundingFeeRow({ symbol: 'PERP_SOL_USDC', funding_rate: 0.0001, mark_price: 50, funding_fee: 0.01, payment_type: 'Receive', created_time: 5 }, 8);
   assert.equal(p.fundingUsd, 0.01);
   assert.ok(Math.abs(p.size + 2) < 1e-12);
-  const flat = parseFundingFeeRow({ symbol: 'PERP_SOL_USDC', funding_rate: 0, mark_price: 50, funding_fee: 0, payment_type: 'Pay', created_time: 5 }, 8);
+  const flatRow: OrderlyFundingFeeRow = { symbol: 'PERP_SOL_USDC', funding_rate: 0, mark_price: 50, funding_fee: 0, payment_type: 'Pay', created_time: 5 };
+  const flat = parseFundingFeeRow(flatRow, 8);
   assert.equal(flat.size, 0);
   assert.ok(Object.is(flat.fundingUsd, 0));
-  assert.throws(() => parseFundingFeeRow({ ...flat, payment_type: 'Other' } as OrderlyFundingFeeRow, 8), /payment_type/);
+  assert.throws(() => parseFundingFeeRow({ ...flatRow, payment_type: 'Other' }, 8), /unknown payment_type Other/);
 });

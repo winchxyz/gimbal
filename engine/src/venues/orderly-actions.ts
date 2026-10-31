@@ -14,9 +14,11 @@ import { systemClock } from './venue.ts';
 import type { OrderlyEndpoints, OrderlyNetwork } from './orderly-http.ts';
 import { ORDERLY_ENDPOINTS, normalizeAccountId, readOrderlyData } from './orderly-http.ts';
 import type { OrderlyEip712Action, OrderlyRequest, OrderlyRequestKind, OrderlySigner } from './orderly-signer.ts';
-import { checkRestAction, evmSignatureHex, isOrderlyKeyString, orderlyAuthHeaders } from './orderly-signer.ts';
+import { checkEip712Action, checkRestAction, evmSignatureHex, isOrderlyKeyString, orderlyAuthHeaders } from './orderly-signer.ts';
 
 const DAY_MS = 86_400_000;
+/** Kinds that move money out; request() refuses them so they only run in withdraw()'s settle-first order. */
+const MONEY_OUT_KINDS: ReadonlySet<OrderlyRequestKind> = new Set(['settle_pnl', 'withdraw_request']);
 /** AddOrderlyKey allows at most 365 days; ask for a day less so a slow signature cannot cross the limit. */
 export const ORDERLY_KEY_LIFETIME_MS = 364 * DAY_MS;
 
@@ -92,11 +94,19 @@ export class OrderlyDeskClient {
     this.#timeoutMs = config.timeoutMs ?? 10_000;
   }
 
-  /** Has the contract sign one private REST request, checks it, sends it with Orderly's headers, returns `data`. */
-  async request<T = unknown>(kind: OrderlyRequestKind, fields: Partial<OrderlyRequest> = {}, reason: string = kind): Promise<T> {
+  /**
+   * Has the contract sign one private REST request, checks it, sends it with Orderly's headers, returns `data`.
+   * settle_pnl and withdraw_request are refused here: they only run inside withdraw(), settle first.
+   */
+  request<T = unknown>(kind: OrderlyRequestKind, fields: Partial<OrderlyRequest> = {}, reason: string = kind): Promise<T> {
+    if (MONEY_OUT_KINDS.has(kind)) return Promise.reject(new Error(`orderly: ${kind} only runs inside withdraw(), after settle_pnl`));
+    return this.#request<T>(kind, fields, reason);
+  }
+
+  async #request<T>(kind: OrderlyRequestKind, fields: Partial<OrderlyRequest>, reason: string): Promise<T> {
     const req: OrderlyRequest = { reduce_only: false, ...fields, kind, timestamp_ms: this.#clock.now() };
     const action = await this.#signer.orderlyRequest(this.deskId, req, reason);
-    checkRestAction(action, kind, this.#clock.now());
+    checkRestAction(action, kind, this.#clock.now(), this.deskId);
     const p = action.payload;
     const method = p.method.toUpperCase();
     const res = await this.#fetch(`${this.#apiUrl}${p.path}`, {
@@ -116,7 +126,9 @@ export class OrderlyDeskClient {
   /** Registers the desk's EVM address with the broker; returns the account id Orderly assigned. */
   async register(): Promise<string> {
     const nonce = await this.#public<{ registration_nonce: string | number }>('GET', '/v1/registration_nonce', undefined, 'registration_nonce');
-    const action = await this.#signer.orderlyRegister(this.deskId, String(nonce.registration_nonce));
+    const registrationNonce = String(nonce.registration_nonce);
+    const action = await this.#signer.orderlyRegister(this.deskId, registrationNonce);
+    checkEip712Action(action, this.deskId, 'register', { registrationNonce });
     const data = await this.#public<{ account_id: string }>('POST', '/v1/register_account', this.#eip712Body(action), 'register_account');
     const accountId = normalizeAccountId(data.account_id);
     if (accountId !== this.accountId) throw new Error(`orderly register: Orderly assigned ${accountId}, the desk expects ${this.accountId}`);
@@ -127,6 +139,7 @@ export class OrderlyDeskClient {
   async addKey(expirationMs = this.#clock.now() + ORDERLY_KEY_LIFETIME_MS): Promise<string> {
     if (expirationMs - this.#clock.now() > 365 * DAY_MS) throw new RangeError('orderly add key: an orderly key lives at most 365 days');
     const action = await this.#signer.orderlyAddKey(this.deskId, expirationMs);
+    checkEip712Action(action, this.deskId, 'add key', { orderlyKey: this.orderlyKey, expiration: expirationMs });
     const data = await this.#public<{ orderly_key?: string }>('POST', '/v1/orderly_key', this.#eip712Body(action), 'orderly_key');
     if (data.orderly_key !== undefined && data.orderly_key !== this.orderlyKey) {
       throw new Error(`orderly add key: Orderly registered ${data.orderly_key}, the desk's key is ${this.orderlyKey}`);
@@ -159,17 +172,21 @@ export class OrderlyDeskClient {
 
   /** Settles PnL, then withdraws `amount` USDC (canonical decimal string) to the desk's own EVM address. */
   async withdraw(amount: string, reason = 'withdraw from Orderly'): Promise<OrderlyWithdrawReport> {
-    if (!/^(0|[1-9]\d*)(\.\d{1,8})?$/.test(amount) || /\.\d*0$/.test(amount) || Number(amount) <= 0) {
-      throw new Error(`orderly withdraw: amount must be a canonical positive decimal string, got ${amount}`);
+    // USDC has 6 decimals: a canonical positive decimal with at most 6 of them.
+    if (!/^(0|[1-9]\d*)(\.\d{1,6})?$/.test(amount) || /\.\d*0$/.test(amount) || Number(amount) <= 0) {
+      throw new Error(`orderly withdraw: amount must be a canonical positive USDC decimal string (at most 6 decimals), got ${amount}`);
     }
-    const settleNonce = nonceOf(await this.request<{ settle_nonce: unknown }>('settle_nonce', {}, reason), 'settle_nonce');
+    const settleNonce = nonceOf(await this.#request<{ settle_nonce: unknown }>('settle_nonce', {}, reason), 'settle_nonce');
     const settleAction = await this.#signer.orderlySettlePnl(this.deskId, settleNonce);
-    const settled = await this.request('settle_pnl', {
+    checkEip712Action(settleAction, this.deskId, 'settle pnl', { settleNonce });
+    const settled = await this.#request('settle_pnl', {
       nonce: settleNonce, signed_at_ms: signedAt(settleAction), eip712_signature: evmSignatureHex(settleAction.signature),
     }, reason);
-    const withdrawNonce = nonceOf(await this.request<{ withdraw_nonce: unknown }>('withdraw_nonce', {}, reason), 'withdraw_nonce');
+    const withdrawNonce = nonceOf(await this.#request<{ withdraw_nonce: unknown }>('withdraw_nonce', {}, reason), 'withdraw_nonce');
     const withdrawAction = await this.#signer.orderlyWithdraw(this.deskId, amount, withdrawNonce);
-    const withdraw = await this.request('withdraw_request', {
+    checkEip712Action(withdrawAction, this.deskId, 'withdraw', { withdrawNonce });
+    checkWithdrawMessage(withdrawAction.payload.message, amount, this.evmAddress);
+    const withdraw = await this.#request('withdraw_request', {
       amount, nonce: withdrawNonce, signed_at_ms: signedAt(withdrawAction), eip712_signature: evmSignatureHex(withdrawAction.signature),
     }, reason);
     return { settleNonce, withdrawNonce, settled, withdraw };
@@ -183,7 +200,7 @@ export class OrderlyDeskClient {
   }
 
   #eip712Body(action: OrderlyEip712Action): string {
-    if (action.venue !== 'orderly') throw new Error(`orderly: signed action is for ${action.venue}`);
+    checkEip712Action(action, this.deskId, action.kind);
     const userAddress = action.payload.userAddress ?? this.evmAddress;
     if (userAddress.toLowerCase() !== this.evmAddress.toLowerCase()) {
       throw new Error(`orderly: the contract signed for ${userAddress}, the desk's address is ${this.evmAddress}`);
@@ -198,6 +215,23 @@ export class OrderlyDeskClient {
       signal: AbortSignal.timeout(this.#timeoutMs),
     });
     return readOrderlyData<T>(res, what);
+  }
+}
+
+/**
+ * The Withdraw message must carry the amount asked for, as the same decimal string or in USDC's 6-decimal units
+ * (which of the two the contract writes: verify on day 5), and a receiver, when it names one, that is the desk.
+ */
+export function checkWithdrawMessage(message: Record<string, unknown>, amount: string, evmAddress: string): void {
+  const got = message.amount;
+  const [whole, frac = ''] = amount.split('.');
+  const units = (BigInt(whole!) * 1_000_000n + BigInt(frac.padEnd(6, '0'))).toString();
+  if (got === undefined || got === null || (String(got) !== amount && String(got) !== units)) {
+    throw new Error(`orderly withdraw: the contract signed amount ${JSON.stringify(got)}, the engine asked for ${amount} USDC`);
+  }
+  const receiver = message.receiver;
+  if (receiver !== undefined && String(receiver).toLowerCase() !== evmAddress.toLowerCase()) {
+    throw new Error(`orderly withdraw: the contract signed receiver ${String(receiver)}, the desk's address is ${evmAddress}`);
   }
 }
 
