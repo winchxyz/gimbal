@@ -22,9 +22,7 @@ use crate::events::{Event, OrderlyIpsSet, OrderlyReceiverSet};
 use crate::hl::keccak;
 use crate::mpc::recover_evm;
 use crate::prices::reference_price;
-use crate::{
-    action_desk, charge_storage, fail, owner_desk, owner_desk_mut, Gimbal, GimbalExt, OrFail,
-};
+use crate::{action_desk, charge_storage, fail, owner_desk_mut, Gimbal, GimbalExt, OrFail};
 
 /// The Orderly account id of `evm_address` (a checked `0x` address) under `broker_id`, lowercase
 /// `0x` hex: keccak256(abi.encode(address, keccak256(broker_id))).
@@ -186,19 +184,20 @@ impl Gimbal {
 
     /// Sets the relayer IPs the desk's orderly key may be used from, replacing any earlier list:
     /// 1 to 10 distinct IPv4 or IPv6 addresses in canonical form (`E_ARGS`). The operator applies
-    /// it at Orderly with `orderly_request` kind `ip_restriction`; nothing else reads it. Owner
+    /// it at Orderly with `orderly_request` kind `ip_restriction`; `get_desk` shows it as
+    /// `orderly_ips`, next to `orderly_receiver` (empty until set); nothing else reads it. Owner
     /// only. Attach the storage a longer list adds (at least 1 yoctoNEAR); the rest is refunded.
     /// Event `orderly_ips_set`.
     #[payable]
     #[deny_unknown_arguments]
     pub fn set_orderly_ips(&mut self, desk_id: String, ips: Vec<String>) {
         let attached = env::attached_deposit();
-        owner_desk(&self.desks, &desk_id, "set_orderly_ips");
+        let desk = owner_desk_mut(&mut self.desks, &desk_id, "set_orderly_ips");
         check_some_deposit("set_orderly_ips", attached).or_fail();
         check_ip_list(&ips).or_fail();
         let before = env::storage_usage();
-        self.orderly_ips.insert(desk_id.clone(), ips.clone());
-        self.orderly_ips.flush();
+        desk.orderly_ips = ips.clone();
+        self.desks.flush();
         charge_storage(
             before,
             &format!("set_orderly_ips on desk {desk_id}"),
@@ -291,7 +290,7 @@ impl Gimbal {
             request_id: self.upcoming_request_id(),
             reference: &reference,
             orderly_key: &key,
-            orderly_ips: self.orderly_ips.get(&desk_id).map(Vec::as_slice),
+            orderly_ips: (!desk.orderly_ips.is_empty()).then_some(desk.orderly_ips.as_slice()),
         };
         let signable = build_request(&ctx, &req).or_fail();
         if !signable.reduces_risk {

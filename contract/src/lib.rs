@@ -86,9 +86,12 @@ enum StorageKey {
     HlNonces,
     Prices,
     DeskCounters,
-    OrderlyIps,
+    OperatorCounts,
 }
 
+/// The contract's state. There is no `migrate` method and the layout carries no version: every
+/// deploy goes to a fresh account (testnet, the day 7 canary, the day 11 final), so no newer
+/// version ever reads an older one's state.
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct Gimbal {
@@ -96,6 +99,9 @@ pub struct Gimbal {
     desks: LookupMap<String, Desk>,
     /// How many desks each owner has.
     desk_counts: LookupMap<AccountId, u32>,
+    /// How many desks each separate operator account operates (`set_operator`), so a desk's
+    /// operator can call `refresh_prices`.
+    operator_counts: LookupMap<AccountId, u32>,
     /// `(owner, n)` → the id of the owner's `n`-th desk, from 0, for `desks_of`. One entry per desk,
     /// so adding a desk writes the same few bytes however many the owner has.
     desk_ids: LookupMap<(AccountId, u32), String>,
@@ -112,8 +118,6 @@ pub struct Gimbal {
     /// Desk id → its rescue window and EIP-3009 counter ([`rescue`]). Stored with the desk, like
     /// its nonce entry, so an action never adds storage.
     desk_counters: LookupMap<String, DeskCounters>,
-    /// Desk id → the relayer IPs the owner allows the desk's orderly key from (`set_orderly_ips`).
-    orderly_ips: LookupMap<String, Vec<String>>,
 }
 
 #[near]
@@ -143,12 +147,12 @@ impl Gimbal {
             },
             desks: LookupMap::new(StorageKey::Desks),
             desk_counts: LookupMap::new(StorageKey::DeskCounts),
+            operator_counts: LookupMap::new(StorageKey::OperatorCounts),
             desk_ids: LookupMap::new(StorageKey::DeskIds),
             hl_nonces: LookupMap::new(StorageKey::HlNonces),
             next_request_id: 0,
             prices: LookupMap::new(StorageKey::Prices),
             desk_counters: LookupMap::new(StorageKey::DeskCounters),
-            orderly_ips: LookupMap::new(StorageKey::OrderlyIps),
         }
     }
 
@@ -310,7 +314,8 @@ impl Gimbal {
     }
 
     /// Sets the separate operator account, or clears it with `null`. Owner only. Attach the storage
-    /// a longer account id adds (at least 1 yoctoNEAR); the rest is refunded.
+    /// a longer account id and the operator's entry in the operator index add (at least 1
+    /// yoctoNEAR); the rest is refunded.
     #[payable]
     #[deny_unknown_arguments]
     pub fn set_operator(&mut self, desk_id: String, operator: Option<AccountId>) {
@@ -323,8 +328,17 @@ impl Gimbal {
                 .or_fail();
         }
         let before = env::storage_usage();
-        desk.operator = operator.clone();
+        let previous = std::mem::replace(&mut desk.operator, operator.clone());
         self.desks.flush();
+        if previous != operator {
+            if let Some(old) = &previous {
+                count_operator(&mut self.operator_counts, old, false);
+            }
+            if let Some(new) = &operator {
+                count_operator(&mut self.operator_counts, new, true);
+            }
+            self.operator_counts.flush();
+        }
         charge_storage(before, &format!("set_operator on desk {desk_id}"), attached);
         OperatorSet {
             desk_id: &desk_id,
@@ -509,6 +523,22 @@ impl Gimbal {
         self.desk_counters.flush();
         self.desk_counts.flush();
         self.desk_ids.flush();
+    }
+}
+
+/// One more (`up`) or one fewer desk operated by `account`; an account that operates none has no
+/// entry.
+fn count_operator(counts: &mut LookupMap<AccountId, u32>, account: &AccountId, up: bool) {
+    let n = counts.get(account).copied().unwrap_or(0);
+    let n = if up {
+        n.saturating_add(1)
+    } else {
+        n.saturating_sub(1)
+    };
+    if n == 0 {
+        counts.remove(account);
+    } else {
+        counts.insert(account.clone(), n);
     }
 }
 
