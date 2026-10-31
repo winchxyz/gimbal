@@ -6,6 +6,8 @@ import { readFileSync } from 'node:fs';
 import { constants, gunzipSync } from 'node:zlib';
 import type { VenueId } from '@gimbal/shared';
 import type { RecordLine, WireLine } from './recorder.ts';
+import { requestUrl, wireRequest, withoutId } from './recorder.ts';
+import type { WsRequester } from './ws.ts';
 import type {
   AccountState, Book, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, VenueMethod, VenueReader,
 } from './venue.ts';
@@ -108,39 +110,55 @@ function checkWireLine(v: unknown, where: string): WireLine {
   if (typeof o.url !== 'string') throw new Error(`${where}: url must be a string`);
   if (typeof o.status !== 'number') throw new Error(`${where}: status must be a number`);
   if (!('request' in o) || !('response' in o)) throw new Error(`${where}: needs request and response`);
+  if ('method' in o && o.method !== 'POST' && o.method !== 'GET' && o.method !== 'WS') throw new Error(`${where}: unknown method ${String(o.method)}`);
   return v as WireLine;
 }
 
 /**
- * A `fetch` that answers from a wire recording: the same url and JSON body (key order ignored) get the recorded
- * status and body, and the same call made again gets the next recorded answer (the last one repeats). A call
- * nothing was recorded for throws ReplayMissError, so a reader that changes what it asks fails its test.
+ * A `fetch` that answers from a wire recording: the same method, url and JSON body (key order ignored) get the
+ * recorded status and body, and the same call made again gets the next recorded answer (the last one repeats).
+ * A call nothing was recorded for throws ReplayMissError, so a reader that changes what it asks fails its test.
  */
 export function replayFetch(lines: readonly WireLine[]): typeof fetch {
-  const byCall = new Map<string, WireLine[]>();
-  for (const line of lines) {
-    const key = wireKey(line.url, line.request);
-    const list = byCall.get(key);
-    if (list === undefined) byCall.set(key, [line]);
-    else list.push(line);
-  }
-  const served = new Map<string, number>();
+  const next = answersByCall(lines.filter((l) => (l.method ?? 'POST') !== 'WS'));
   return async (input, init) => {
-    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-    if (init?.method !== 'POST' || typeof init.body !== 'string') throw new Error(`replayFetch: ${url}: only POST with a JSON string body`);
-    const key = wireKey(url, JSON.parse(init.body) as unknown);
-    const list = byCall.get(key);
-    if (list === undefined) throw new ReplayMissError(`replay fetch: nothing recorded for POST ${key}`);
-    const n = served.get(key) ?? 0;
-    served.set(key, n + 1);
-    const line = list[Math.min(n, list.length - 1)]!;
+    const url = requestUrl(input);
+    const { method, request } = wireRequest(url, init, 'replayFetch');
+    const line = next(wireKey(method, url, request));
     const body = typeof line.response === 'string' ? line.response : JSON.stringify(line.response);
     return new Response(body, { status: line.status });
   };
 }
 
-function wireKey(url: string, request: unknown): string {
-  return `${url} ${stableJson(request)}`;
+/** A WebSocket requester answering from the WS lines of a wire recording; the answer carries the caller's id. */
+export function replayWsRequester(lines: readonly WireLine[]): WsRequester {
+  const next = answersByCall(lines.filter((l) => l.method === 'WS'));
+  return async (url, frame) => {
+    const line = next(wireKey('WS', url, withoutId(frame)));
+    return { id: frame.id, ...(line.response as Record<string, unknown>) };
+  };
+}
+
+function answersByCall(lines: readonly WireLine[]): (key: string) => WireLine {
+  const byCall = new Map<string, WireLine[]>();
+  for (const line of lines) {
+    const key = wireKey(line.method ?? 'POST', line.url, line.request);
+    const list = byCall.get(key);
+    if (list === undefined) byCall.set(key, [line]);
+    else list.push(line);
+  }
+  const served = new Map<string, number>();
+  return (key) => {
+    const list = byCall.get(key);
+    if (list === undefined) throw new ReplayMissError(`replay: nothing recorded for ${key}`);
+    const n = served.get(key) ?? 0;
+    served.set(key, n + 1);
+    return list[Math.min(n, list.length - 1)]!;
+  };
+}
+
+function wireKey(method: string, url: string, request: unknown): string {
+  return `${method} ${url} ${stableJson(request)}`;
 }
 
 function stableJson(v: unknown): string {
