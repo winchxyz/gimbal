@@ -11,23 +11,25 @@ pub mod desk;
 pub mod events;
 pub mod hl;
 pub mod mpc;
+pub mod orderly;
 pub mod prices;
 pub mod sol;
 
 pub use gimbal_core::Refusal;
 
 use gimbal_core::errors::{shown, E_ARGS, E_DESK_EXISTS, E_NO_DESK};
-use gimbal_core::ids::{check_desk_id, check_evm_address, decode_base58_32};
+use gimbal_core::ids::{check_desk_id, check_evm_address, decode_base58_32, MPC_DOMAIN_SECP256K1};
 use gimbal_core::policy::Policy;
 use near_sdk::store::LookupMap;
 use near_sdk::{
     env, near, AccountId, BorshStorageKey, Gas, NearToken, PanicOnDefault, Promise, PromiseOrValue,
 };
 
+use crate::action::{Pending, SignedAction, UnsignedAction};
 use crate::config::{Config, FeeConfig, Network, OrderlyConfig, PriceSource, Treasury};
 use crate::deposit::{check_one_yocto, check_pause_deposit, check_some_deposit, refund_after};
 use crate::desk::{policy_sha256, Desk, Gate, Role, SolanaAccounts};
-use crate::events::{DeskCreated, Event, OperatorSet, Paused, PolicySet};
+use crate::events::{emit_signed, DeskCreated, Event, OperatorSet, Paused, PolicySet};
 
 /// Gas `on_desk_keys` gets besides its share of what `create_desk` leaves unused: it reads two keys,
 /// hashes one, and writes the desk, or schedules the refund and [`Gimbal::refuse`].
@@ -96,6 +98,9 @@ pub struct Gimbal {
     /// writes these few bytes and never rewrites the desk record with its policy. `create_desk`
     /// stores the 0, so the owner pays the entry's storage and an action never adds any.
     hl_nonces: LookupMap<String, u64>,
+    /// The `request_id` of the next signing request, from 0; one per action call that reaches the
+    /// MPC contract.
+    next_request_id: u64,
 }
 
 #[near]
@@ -127,6 +132,7 @@ impl Gimbal {
             desk_counts: LookupMap::new(StorageKey::DeskCounts),
             desk_ids: LookupMap::new(StorageKey::DeskIds),
             hl_nonces: LookupMap::new(StorageKey::HlNonces),
+            next_request_id: 0,
         }
     }
 
@@ -168,7 +174,13 @@ impl Gimbal {
         solana.check().or_fail();
         policy.validate().or_fail();
 
-        let desk = Desk::new(owner, policy, evm_address, solana);
+        let desk = Desk::new(
+            owner,
+            policy,
+            evm_address,
+            solana,
+            &self.config.orderly.broker_id,
+        );
         // A short deposit is refused here, before the MPC calls: write the desk, measure, undo.
         let added = self.write_desk(&desk_id, &desk);
         self.unwrite_desk(&desk_id, &desk.owner);
@@ -226,6 +238,29 @@ impl Gimbal {
                         .refuse(refusal.to_string()),
                 )
             }
+        }
+    }
+
+    /// The callback of every action method's MPC `sign` call: checks that the answer is a
+    /// signature by the desk's key of exactly what was asked (`E_MPC` otherwise, also when the MPC
+    /// failed or timed out), emits `signed` and returns the [`SignedAction`] the engine submits.
+    /// A secp256k1 signature comes back with a low s ([`mpc::low_s`]).
+    /// The action method's transaction ends with this result.
+    #[private]
+    pub fn on_signed(&self, pending: Pending) -> SignedAction {
+        let signature = mpc::low_s(mpc::signature().or_fail());
+        mpc::check_signature(&signature, &pending.action.sign_request, &pending.signer).or_fail();
+        emit_signed(&pending);
+        let Pending {
+            request_id, action, ..
+        } = pending;
+        SignedAction {
+            desk_id: action.desk_id,
+            request_id,
+            venue: action.venue,
+            kind: action.kind,
+            payload: action.payload,
+            signature,
         }
     }
 
@@ -336,6 +371,38 @@ impl Gimbal {
 }
 
 impl Gimbal {
+    /// The `request_id` the next [`Self::sign`] call gives: an action method that needs its own id
+    /// before it signs (an Orderly order's `client_order_id`) reads it here, then signs once.
+    pub fn upcoming_request_id(&self) -> u64 {
+        self.next_request_id
+    }
+
+    /// Sends a built and checked action to the MPC contract's `sign` with 1 yoctoNEAR from the
+    /// contract's balance and gives it the next `request_id`; [`Self::on_signed`] returns the
+    /// [`SignedAction`]. `E_ARGS` with less than [`mpc::SIGN_MIN_GAS`] prepaid. Every action
+    /// method ends here.
+    pub fn sign(&mut self, action: UnsignedAction) -> Promise {
+        mpc::check_sign_gas(env::prepaid_gas()).or_fail();
+        let desk = desk_ref(&self.desks, &action.desk_id);
+        let signer = if action.sign_request.domain_id == MPC_DOMAIN_SECP256K1 {
+            desk.evm_address.clone()
+        } else {
+            desk.solana.authority.clone()
+        };
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+        mpc::sign(&self.config.mpc, &action.sign_request).then(
+            Self::ext(env::current_account_id())
+                .with_static_gas(mpc::ON_SIGNED_GAS)
+                .with_unused_gas_weight(0)
+                .on_signed(Pending {
+                    request_id,
+                    signer,
+                    action,
+                }),
+        )
+    }
+
     /// The checks of [`Self::on_desk_keys`], then the write. Returns the part of `attached` to
     /// refund; on a refusal nothing is left written.
     fn store_checked_desk(

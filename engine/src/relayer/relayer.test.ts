@@ -37,13 +37,15 @@ test('orderlyRequest: the four orderly-* headers of orderly.json, then Orderly d
   const r = v.requests[0];
   const contract = testContract(() => r.timestamp, { orderlyBrokerId: v.networks.testnet.brokerId, orderlyChainId: v.networks.testnet.chainId });
   contract.setDesk('alpha', testDesk({ evm_address: v.keys.deskEvm.address }));
-  const stub = stubFetch(() => ({ success: true, data: { order_id: 991, client_order_id: 'gimbal-alpha-1' } }));
+  contract.setNextRequestId(r.request_id);
+  // The contract derives client_order_id from its request_id: the engine never sends one, and reads it back.
+  const derived: string = JSON.parse(r.body).client_order_id;
+  const stub = stubFetch(() => ({ success: true, data: { order_id: 991, client_order_id: derived } }));
   const relayer = new Relayer({
     contract, deskId: 'alpha',
     orderly: { apiUrl: v.networks.testnet.api, accountId: r.headers['orderly-account-id'], orderlyKey: r.headers['orderly-key'], fetch: stub.fetch, now: () => r.timestamp },
   });
-  // The contract derives client_order_id from its request_id: the engine never sends one, and reads it back.
-  const { kind, client_order_id: derived, ...fields } = r.request;
+  const { kind, ...fields } = r.request;
   await assert.rejects(relayer.orderlyRequest(kind, { ...fields, client_order_id: derived }, 'hedge'), /do not pass one/);
   const out = await relayer.orderlyRequest<{ order_id: number }>(kind, fields, 'hedge');
   assert.equal(out.data.order_id, 991);
@@ -59,7 +61,8 @@ test('orderlyRequest: the four orderly-* headers of orderly.json, then Orderly d
 test('orderlyRequest order: no answer, a 5xx or a body that is not JSON is OutcomeUnknown with the client_order_id; a refusal stays OrderlyApiError', async () => {
   const v = vectors('orderly');
   const r = v.requests[0];
-  const { kind, client_order_id: derived, ...fields } = r.request;
+  const { kind, ...fields } = r.request;
+  const derived: string = JSON.parse(r.body).client_order_id;
   const answers: [string, () => Response | never][] = [
     ['timeout', () => { throw new DOMException('The operation was aborted due to timeout', 'TimeoutError'); }],
     ['dropped', () => { throw new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } }); }],
@@ -70,6 +73,7 @@ test('orderlyRequest order: no answer, a 5xx or a body that is not JSON is Outco
   const relayerWith = (answer: () => Response) => {
     const contract = testContract(() => r.timestamp, { orderlyBrokerId: v.networks.testnet.brokerId, orderlyChainId: v.networks.testnet.chainId });
     contract.setDesk('alpha', testDesk({ evm_address: v.keys.deskEvm.address }));
+    contract.setNextRequestId(r.request_id);
     const f = (async () => answer()) as unknown as typeof fetch;
     return new Relayer({
       contract, deskId: 'alpha',

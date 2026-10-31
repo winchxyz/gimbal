@@ -10,6 +10,7 @@ pub mod ids;
 pub mod limits;
 pub mod msgpack;
 pub mod network;
+pub mod orderly;
 pub mod phoenix;
 pub mod policy;
 pub mod solana;

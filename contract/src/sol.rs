@@ -3,7 +3,8 @@
 //! compiled message, derives the desk's token accounts and Phoenix trader account from its
 //! authority (the stored `solana` fields are not read: `create_desk` checked them against the
 //! same derivation, and no check depends on that), checks every instruction in `gimbal-core` and
-//! returns the [`UnsignedAction`] for the desk's Solana key.
+//! has the desk's Solana key sign the message through the MPC contract; the transaction returns
+//! the `SignedAction`. Each public method is its `prepare_*` followed by `Gimbal::sign`.
 
 use gimbal_core::errors::{Refusal, E_ARGS, E_SOL_MESSAGE};
 use gimbal_core::ids::{check_base58_32, check_reason};
@@ -11,9 +12,9 @@ use gimbal_core::phoenix::{check_message, check_registration};
 use gimbal_core::solana::{SolDesk, MAX_TRANSACTION_BYTES};
 use near_sdk::base64::engine::general_purpose::STANDARD;
 use near_sdk::base64::Engine as _;
-use near_sdk::{env, near};
+use near_sdk::{env, near, Promise};
 
-use crate::action::UnsignedAction;
+use crate::action::{OrderDetail, UnsignedAction};
 use crate::desk::{Desk, Gate};
 use crate::prices::reference_price;
 use crate::{action_desk, Gimbal, GimbalExt, OrFail};
@@ -57,8 +58,9 @@ pub fn desk_accounts(desk: &Desk) -> Result<SolDesk, Refusal> {
 impl Gimbal {
     /// Signs a Solana transaction message for the desk's authority: compute budget (within the
     /// caps, a price only with a unit limit), creation of the desk's USDC and PhUSD token
-    /// accounts, an Approve to Ember for exactly the unwrap that follows it, Revokes, transfers
-    /// into the desk's own token accounts, Ember deposits and withdrawals between them, and
+    /// accounts, an Approve to Ember for exactly the unwrap that follows it with a Revoke of the
+    /// desk's PhUSD account after that unwrap, Revokes, transfers of more than 0 into the desk's
+    /// own token accounts from another account, Ember deposits and withdrawals between them, and
     /// Phoenix IOC orders on policy markets, `cancel_all`, deposits and withdrawals on the desk's
     /// trader account, each with its exact account list. A legacy message with the desk as its
     /// only signer and fee payer and something to do besides the compute budget
@@ -67,11 +69,35 @@ impl Gimbal {
     /// is checked as `hl_order` checks one: `E_ORACLE_STALE` for every priced order until prices
     /// are stored (C6), `E_PRICE_BAND`, `E_SIZE`. Owner or operator; on a paused desk only a
     /// message that reduces risk (besides the compute budget only `cancel_all`, reduce-only
-    /// orders, Revokes and transfers into the desk's token accounts), else `E_PAUSED`. `kind` is
-    /// `order`, else the first Phoenix action (`cancel_all`, `deposit`, `withdraw`), else
-    /// `transaction`.
+    /// orders, Revokes and transfers into the desk's token accounts, and a priority fee only with
+    /// a `cancel_all` or a reduce-only order), else `E_PAUSED`. `kind` is `order`, else the first
+    /// Phoenix action (`cancel_all`, `deposit`, `withdraw`), else `transaction`.
     #[deny_unknown_arguments]
-    pub fn sol_sign(
+    pub fn sol_sign(&mut self, desk_id: String, message_b64: String, reason: String) -> Promise {
+        let action = self.prepare_sol_sign(desk_id, message_b64, reason);
+        self.sign(action)
+    }
+
+    /// Signs one of Phoenix's two onboarding messages for the desk, which Phoenix's onboarder
+    /// co-signs and Phoenix's API sends: the registration `build-register-ixs` returns
+    /// (`register_trader` + `set_trader_capabilities_delegated`, a legacy message) or a referral
+    /// activation (`set_trader_capabilities_delegated` alone, a version 0 message without
+    /// lookups). The format names the type; then two signers, keys[0] the desk paying fees and
+    /// keys[1] Phoenix's onboarder (`E_SOL_MESSAGE`, `E_SOL_ACCOUNT`), an optional compute budget
+    /// prefix within the caps, Phoenix's instruction data byte for byte (`E_ARGS`) and its
+    /// accounts position by position (`E_SOL_ACCOUNT`), the desk's own trader account derived from
+    /// its authority. The referral code travels only in the HTTP call, so nothing here binds one.
+    /// Owner or operator, running desk; `kind` is `register` or `referral_activate`.
+    #[deny_unknown_arguments]
+    pub fn sol_sign_register(&mut self, desk_id: String, message_b64: String) -> Promise {
+        let action = self.prepare_sol_sign_register(desk_id, message_b64);
+        self.sign(action)
+    }
+}
+
+impl Gimbal {
+    /// [`Self::sol_sign`] up to the signature.
+    pub fn prepare_sol_sign(
         &mut self,
         desk_id: String,
         message_b64: String,
@@ -89,21 +115,21 @@ impl Gimbal {
             desk.check_action(&desk_id, &env::predecessor_account_id(), Gate::Running)
                 .or_fail();
         }
+        let orders = checked
+            .orders
+            .iter()
+            .map(|o| OrderDetail::new(&o.symbol, o.bid, o.size_e8, o.price_e8, o.valued))
+            .collect();
         UnsignedAction::solana(desk_id, checked.kind, message_b64, &message, Some(&reason))
+            .with_orders(orders)
     }
 
-    /// Signs one of Phoenix's two onboarding messages for the desk, which Phoenix's onboarder
-    /// co-signs and Phoenix's API sends: the registration `build-register-ixs` returns
-    /// (`register_trader` + `set_trader_capabilities_delegated`, a legacy message) or a referral
-    /// activation (`set_trader_capabilities_delegated` alone, a version 0 message without
-    /// lookups). The format names the type; then two signers, keys[0] the desk paying fees and
-    /// keys[1] Phoenix's onboarder (`E_SOL_MESSAGE`, `E_SOL_ACCOUNT`), an optional compute budget
-    /// prefix within the caps, Phoenix's instruction data byte for byte (`E_ARGS`) and its
-    /// accounts position by position (`E_SOL_ACCOUNT`), the desk's own trader account derived from
-    /// its authority. The referral code travels only in the HTTP call, so nothing here binds one.
-    /// Owner or operator, running desk; `kind` is `register` or `referral_activate`.
-    #[deny_unknown_arguments]
-    pub fn sol_sign_register(&mut self, desk_id: String, message_b64: String) -> UnsignedAction {
+    /// [`Self::sol_sign_register`] up to the signature.
+    pub fn prepare_sol_sign_register(
+        &mut self,
+        desk_id: String,
+        message_b64: String,
+    ) -> UnsignedAction {
         let (desk, _) = action_desk(&self.desks, &desk_id, Gate::Running);
         let message = decode_message(&message_b64).or_fail();
         let accounts = desk_accounts(desk).or_fail();

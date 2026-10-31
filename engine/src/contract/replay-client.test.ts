@@ -103,6 +103,8 @@ test('orderly_request: the body, message and signature of every testnet request 
       orderlyBrokerId: v.networks.testnet.brokerId, orderlyChainId: v.networks.testnet.chainId, orderlyReferralCode: 'TESTCODE',
     });
     c.setDesk('alpha', desk);
+    // An order's client_order_id is g<request_id>: sign with the vector's request_id.
+    if (r.request_id !== undefined) c.setNextRequestId(r.request_id);
     // Requests without a `request` object carry their inputs in the body (the EIP-712 parts the engine passes in).
     const fromBody: Partial<OrderlyRequest> = {};
     if (r.kind === 'settle_pnl' || r.kind === 'withdraw_request') {
@@ -130,16 +132,22 @@ test('orderly EIP-712 actions recover to the desk, and the refusals the contract
   await assert.rejects(c.orderlyRegister('alpha', '12ab'), { code: 'E_ARGS' });
   await assert.rejects(c.orderlyAddKey('alpha', 1_793_491_200_000 + 400 * 86_400_000), { code: 'E_ARGS' });
   await assert.rejects(c.orderlyRequest('alpha', { kind: 'order', symbol: 'PERP_DOGE_USDC', reduce_only: false, timestamp_ms: 1 }, 'x'), { code: 'E_ASSET' });
+  // The client_order_id is the contract's, and a timestamp may lead the block by 5 s at most.
+  const cancel = { kind: 'cancel', symbol: 'PERP_ETH_USDC', order_id: 5, reduce_only: false, timestamp_ms: 1_793_491_200_000 } as const;
+  await assert.rejects(c.orderlyRequest('alpha', { ...cancel, client_order_id: 'g0' }, 'x'), { code: 'E_ARGS' });
+  await assert.rejects(c.orderlyRequest('alpha', { ...cancel, timestamp_ms: 1_793_491_205_001 }, 'x'), { code: 'E_ARGS' });
+  await c.orderlyRequest('alpha', { ...cancel, timestamp_ms: 1_793_491_205_000 }, 'x');
+  await assert.rejects(c.orderlyWsAuth('alpha', 1_793_491_205_001), { code: 'E_ARGS' });
   const reg = await c.orderlyRegister('alpha', '194528949540');
   assert.equal(reg.payload.userAddress, TEST_EVM_ADDRESS);
   assert.equal(reg.payload.message.brokerId, 'woofi_dex');
   assert.equal(reg.payload.message.chainId, v.networks.testnet.chainId);
 });
 
-test('the stand-in client_order_id keeps orderly.json\'s form and never passes Orderly\'s 36 characters', () => {
-  assert.equal(standInClientOrderId('alpha', 1), 'gimbal-alpha-1');
-  const long = standInClientOrderId('a-desk-id-far-longer-than-any-orderly-limit', 9_007_199_254_740_991);
+test('the stand-in client_order_id is orderly.json\'s g<request_id> and fits Orderly\'s 36 characters', () => {
+  const rule = vectors('orderly').request_rules.client_order_id;
+  assert.equal(rule.format, 'g<request_id>');
+  for (const e of rule.examples) assert.equal(standInClientOrderId(e.request_id), e.client_order_id);
+  const long = standInClientOrderId(Number.MAX_SAFE_INTEGER);
   assert.ok(long.length <= ORDERLY_CLIENT_ORDER_ID_MAX, long);
-  assert.ok(long.endsWith('-9007199254740991'), long);
-  assert.equal(standInClientOrderId('a-desk-id-far-longer-than-any-orderly-limit', 12).length, ORDERLY_CLIENT_ORDER_ID_MAX);
 });

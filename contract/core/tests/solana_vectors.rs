@@ -112,11 +112,23 @@ fn outcome(r: &Result<impl Sized, Refusal>) -> String {
 
 /// The `solana.json` cases whose answer the review changed: a lone Approve would leave Ember an
 /// allowance on the desk's PhUSD, so an Approve now needs an unwrap of its amount after it
-/// (review item 2).
-const REVIEWED: [(&str, &str); 1] = [(
-    "Token Approve of the desk PhUSD account to the Ember authority",
-    E_SOL_PROGRAM,
-)];
+/// (review item 2), and that unwrap a Revoke of the desk's PhUSD account after it (review item
+/// 6), which the SDK's withdrawal and the one-transaction rescue do not carry.
+const REVIEWED: [(&str, &str); 3] = [
+    (
+        "Token Approve of the desk PhUSD account to the Ember authority",
+        E_SOL_PROGRAM,
+    ),
+    (
+        "withdraw 10 USDC (ATA, approve, ATA, Phoenix withdraw, Ember unwrap)",
+        E_SOL_PROGRAM,
+    ),
+    (
+        "rescue in one transaction: Phoenix withdraw + Ember unwrap + ATA for the deposit owner + \
+         TransferChecked of amountIn",
+        E_SOL_PROGRAM,
+    ),
+];
 
 /// The answer a case must get: the vector's, or the reviewed one.
 fn expected(case: &Value) -> String {
@@ -193,7 +205,7 @@ fn every_sol_sign_case_gets_its_expected_answer() {
         cases.iter().filter(|c| c["expect"]["ok"] == true).count(),
         13
     );
-    assert_eq!(cases.iter().filter(|c| expected(c) == "ok").count(), 12);
+    assert_eq!(cases.iter().filter(|c| expected(c) == "ok").count(), 10);
 }
 
 #[test]
@@ -288,33 +300,41 @@ fn kinds_and_the_pause_gate() {
     let doc = sol_doc();
     let ctx = &doc["ctx"]["sol_sign"];
     let (policy, desk, reference) = (vector_policy(ctx), vector_desk(&doc), reference_of(ctx));
-    let check = |prefix: &str| {
+    // The vector message `prefix`, with a Revoke of the desk's PhUSD account appended when
+    // `revoke` (the withdrawal and the rescue spend an Approve, review item 6).
+    let check = |prefix: &str, revoke: bool| {
         let case = doc["cases"]
             .as_array()
             .unwrap()
             .iter()
             .find(|c| name(c).starts_with(prefix))
             .unwrap();
+        let mut d = Draft::of(&message(case));
+        if revoke {
+            d.push_revoke(desk.phusd_ata, desk.authority);
+        }
         check_message(
             sha256,
             &policy,
             &desk,
-            &message(case),
+            &d.bytes(),
             &reference,
             rescue_of(case).as_ref(),
         )
         .unwrap()
     };
-    for (prefix, kind, reduces_risk) in [
-        ("cancel all ETH", "cancel_all", true),
-        ("deposit 15 USDC", "deposit", false),
-        ("withdraw 10 USDC", "withdraw", false),
-        ("IOC sell 0.005 ETH", "order", false),
-        ("rescue in one transaction", "rescue", false),
+    for (prefix, revoke, kind, reduces_risk) in [
+        ("cancel all ETH", false, "cancel_all", true),
+        ("compute budget at the caps", false, "cancel_all", true),
+        ("deposit 15 USDC", false, "deposit", false),
+        ("withdraw 10 USDC", true, "withdraw", false),
+        ("IOC sell 0.005 ETH", false, "order", false),
+        ("rescue in one transaction", true, "rescue", false),
     ] {
-        let c = check(prefix);
+        let c = check(prefix, revoke);
         assert_eq!((c.kind, c.reduces_risk), (kind, reduces_risk), "{prefix}");
     }
+    let check = |prefix: &str| check(prefix, false);
     let sell = check("IOC sell 0.005 ETH, limit 2425.5");
     let o = &sell.orders[0];
     assert_eq!(
@@ -788,6 +808,15 @@ impl Draft {
         self
     }
 
+    /// Appends a token `Revoke` of `source` by `owner`.
+    fn push_revoke(&mut self, source: Pubkey, owner: Pubkey) -> &mut Self {
+        let source = self.writable(source);
+        let owner = self.index(owner);
+        let program = self.index(TOKEN_PROGRAM);
+        self.ixs.push((program, vec![source, owner], vec![5]));
+        self
+    }
+
     /// The index of `key`, added as the last writable non-signer account if the message lacks
     /// it (every index after it moves up one).
     fn writable(&mut self, key: Pubkey) -> u8 {
@@ -1096,13 +1125,19 @@ fn layout_cases(r: &mut Review<'_>) {
 }
 
 /// Review item 2: an Approve is of the desk's PhUSD account to the Ember authority, for exactly
-/// the amount of an Ember unwrap after it; a Revoke of a desk token account passes alone.
+/// the amount of an Ember unwrap after it; a Revoke of a desk token account passes alone. Each
+/// edit is of the withdrawal with the Revoke item 6 asks for appended, so it is the one thing
+/// wrong with its message.
 fn approval_cases(r: &mut Review<'_>) {
     let doc = r.doc;
     let desk = vector_desk(doc);
     let stranger = key(&doc["keys"]["strangerSol"]["public_key_b58"]);
     let withdraw = "withdraw 10 USDC";
-    let approve_at = |r: &Review<'_>| r.at(withdraw, TOKEN_PROGRAM, &[4]);
+    let approve_at = |r: &Review<'_>| {
+        let (mut d, i) = r.at(withdraw, TOKEN_PROGRAM, &[4]);
+        d.push_revoke(desk.phusd_ata, desk.authority);
+        (d, i)
+    };
     let set_amount = |d: &mut Draft, i: usize, amount: u64| {
         d.ixs[i].2[1..9].copy_from_slice(&amount.to_le_bytes());
     };
@@ -1205,13 +1240,14 @@ fn approval_cases(r: &mut Review<'_>) {
         d.keys[usize::from(slot)] = source;
         (d, i)
     };
+    // The base carries a priority fee, so a paused desk no longer signs these (review item 5).
     let (d, _) = revoke(r, desk.phusd_ata);
     r.add(
         2,
         "review 2: lone Revoke of the desk PhUSD account",
         lone,
         &d,
-        "transaction reduces_risk",
+        "transaction running",
     );
     let (d, _) = revoke(r, desk.usdc_ata);
     r.add(
@@ -1219,7 +1255,7 @@ fn approval_cases(r: &mut Review<'_>) {
         "review 2: lone Revoke of the desk USDC account",
         lone,
         &d,
-        "transaction reduces_risk",
+        "transaction running",
     );
     let (d, _) = revoke(r, stranger);
     r.add(
@@ -1373,6 +1409,7 @@ fn budget_cases(r: &mut Review<'_>) {
         d.ixs[i].2 = data;
         d
     };
+    // The base carries a priority fee, so a paused desk no longer signs these (review item 5).
     let amount = 1_000_000u64.to_le_bytes();
     let d = transfer(r, [&[3][..], &amount].concat());
     r.add(
@@ -1380,7 +1417,7 @@ fn budget_cases(r: &mut Review<'_>) {
         "review 3: a Transfer into the desk PhUSD account",
         lone,
         &d,
-        "transaction reduces_risk",
+        "transaction running",
     );
     let d = transfer(r, [&[12][..], &amount, &[6]].concat());
     r.add(
@@ -1388,7 +1425,7 @@ fn budget_cases(r: &mut Review<'_>) {
         "review 3: a TransferChecked into the desk PhUSD account",
         lone,
         &d,
-        "transaction reduces_risk",
+        "transaction running",
     );
     let deposit = "deposit 15 USDC";
     let mut d = r.draft(deposit);
@@ -1413,12 +1450,184 @@ fn budget_cases(r: &mut Review<'_>) {
     let withdraw = "withdraw 10 USDC";
     let (mut d, i) = r.at(withdraw, PHOENIX_PROGRAM, &WITHDRAW_FUNDS);
     d.ixs.remove(i);
+    d.push_revoke(desk.phusd_ata, desk.authority);
     r.add(
         3,
         "review 3: an Approve and its unwrap without the Phoenix withdrawal",
         withdraw,
         &d,
         "transaction running",
+    );
+}
+
+/// Review item 5: a paused desk pays a priority fee only for a message that cancels or reduces a
+/// position, and a token transfer moves something into another account.
+fn fee_cases(r: &mut Review<'_>) {
+    let doc = r.doc;
+    let desk = vector_desk(doc);
+    let stranger = key(&doc["keys"]["strangerSol"]["public_key_b58"]);
+    let lone = "Token Approve of the desk PhUSD account to the Ember authority";
+    // The vectors' budget: [limit 400000, price 100000, …].
+    let (limit, price) = (0, 1);
+    let set_price = |d: &mut Draft, value: u64| {
+        d.ixs[price].2[1..9].copy_from_slice(&value.to_le_bytes());
+    };
+    // The lone Approve turned into a Revoke of the desk's PhUSD account.
+    let revoke = |r: &Review<'_>| {
+        let (mut d, i) = r.at(lone, TOKEN_PROGRAM, &[4]);
+        d.ixs[i].1 = vec![d.ixs[i].1[0], d.index(desk.authority)];
+        d.ixs[i].2 = vec![5];
+        d
+    };
+    let mut d = revoke(r);
+    d.ixs.remove(price);
+    r.add(
+        5,
+        "review 5: lone Revoke of the desk PhUSD account without a priority fee",
+        lone,
+        &d,
+        "transaction reduces_risk",
+    );
+    let mut d = revoke(r);
+    set_price(&mut d, 0);
+    r.add(
+        5,
+        "review 5: lone Revoke of the desk PhUSD account at a unit price of 0",
+        lone,
+        &d,
+        "transaction reduces_risk",
+    );
+    let mut d = revoke(r);
+    d.ixs[limit].2[1..5].copy_from_slice(&MAX_COMPUTE_UNIT_LIMIT.to_le_bytes());
+    set_price(&mut d, MAX_COMPUTE_UNIT_PRICE);
+    r.add(
+        5,
+        "review 5: lone Revoke of the desk PhUSD account at the budget caps",
+        lone,
+        &d,
+        "transaction running",
+    );
+    // The lone Approve turned into a transfer from `source` into the desk's PhUSD account, as in
+    // review item 3.
+    let transfer = |r: &Review<'_>, source: Pubkey, data: Vec<u8>| {
+        let (mut d, i) = r.at(lone, TOKEN_PROGRAM, &[4]);
+        let source = d.writable(source);
+        let into = d.ixs[i].1[0];
+        let owner = d.index(desk.authority);
+        d.ixs[i].1 = if data[0] == 12 {
+            vec![source, d.index(PHUSD_MINT), into, owner]
+        } else {
+            vec![source, into, owner]
+        };
+        d.ixs[i].2 = data;
+        d
+    };
+    for (op, what) in [(3u8, "Transfer"), (12, "TransferChecked")] {
+        let data = |amount: u64| {
+            let mut data = vec![op];
+            data.extend_from_slice(&amount.to_le_bytes());
+            if op == 12 {
+                data.push(6);
+            }
+            data
+        };
+        let mut d = transfer(r, stranger, data(1_000_000));
+        d.ixs.remove(price);
+        r.add(
+            5,
+            &format!("review 5: a {what} into the desk PhUSD account without a priority fee"),
+            lone,
+            &d,
+            "transaction reduces_risk",
+        );
+        let mut d = transfer(r, stranger, data(0));
+        d.ixs.remove(price);
+        r.add(
+            5,
+            &format!("review 5: a {what} of 0 into the desk PhUSD account"),
+            lone,
+            &d,
+            E_SOL_PROGRAM,
+        );
+        let mut d = transfer(r, desk.phusd_ata, data(1_000_000));
+        d.ixs.remove(price);
+        r.add(
+            5,
+            &format!("review 5: a {what} from the desk PhUSD account into itself"),
+            lone,
+            &d,
+            E_SOL_ACCOUNT,
+        );
+    }
+}
+
+/// Review item 6: an Ember unwrap that spends an Approve is followed by a Revoke of the desk's
+/// PhUSD account in the same message, so no allowance outlives it, whatever the amounts.
+fn revoke_cases(r: &mut Review<'_>) {
+    let doc = r.doc;
+    let desk = vector_desk(doc);
+    let withdraw = "withdraw 10 USDC";
+    let mut d = r.draft(withdraw);
+    d.push_revoke(desk.phusd_ata, desk.authority);
+    r.add(
+        6,
+        "review 6: withdraw 10 USDC with a Revoke of the desk PhUSD account after the unwrap",
+        withdraw,
+        &d,
+        "withdraw running",
+    );
+    let max = |r: &Review<'_>| {
+        let (mut d, approve) = r.at(withdraw, TOKEN_PROGRAM, &[4]);
+        let unwrap = d.find(EMBER_PROGRAM, &EMBER_WITHDRAW);
+        d.ixs[approve].2[1..9].copy_from_slice(&u64::MAX.to_le_bytes());
+        d.ixs[unwrap].2[9..17].copy_from_slice(&u64::MAX.to_le_bytes());
+        d
+    };
+    r.add(
+        6,
+        "review 6: Approve and unwrap of u64::MAX with no Revoke",
+        withdraw,
+        &max(r),
+        E_SOL_PROGRAM,
+    );
+    let mut d = max(r);
+    d.push_revoke(desk.phusd_ata, desk.authority);
+    r.add(
+        6,
+        "review 6: Approve and unwrap of u64::MAX, then a Revoke",
+        withdraw,
+        &d,
+        "withdraw running",
+    );
+    let mut d = r.draft(withdraw);
+    d.push_revoke(desk.usdc_ata, desk.authority);
+    r.add(
+        6,
+        "review 6: withdraw 10 USDC with a Revoke of the desk USDC account instead",
+        withdraw,
+        &d,
+        E_SOL_PROGRAM,
+    );
+    let mut d = r.draft(withdraw);
+    let unwrap = d.find(EMBER_PROGRAM, &EMBER_WITHDRAW);
+    d.push_revoke(desk.phusd_ata, desk.authority);
+    let revoke_ix = d.ixs.pop().unwrap();
+    d.ixs.insert(unwrap, revoke_ix);
+    r.add(
+        6,
+        "review 6: withdraw 10 USDC with the Revoke before the unwrap",
+        withdraw,
+        &d,
+        E_SOL_PROGRAM,
+    );
+    let (mut d, approve) = r.at(withdraw, TOKEN_PROGRAM, &[4]);
+    d.ixs.remove(approve);
+    r.add(
+        6,
+        "review 6: an unwrap with no Approve needs no Revoke",
+        withdraw,
+        &d,
+        "withdraw running",
     );
 }
 
@@ -1546,6 +1755,8 @@ fn review_doc() -> Value {
     approval_cases(&mut r);
     budget_cases(&mut r);
     vault_cases(&mut r);
+    fee_cases(&mut r);
+    revoke_cases(&mut r);
     serde_json::json!({
         "file": "solana-review.json",
         "note": "Review cases for the sol_sign policy. Each edits one message of solana.json, \

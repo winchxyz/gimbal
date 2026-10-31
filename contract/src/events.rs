@@ -5,6 +5,8 @@ use near_sdk::serde::Serialize;
 use near_sdk::serde_json;
 use near_sdk::{env, AccountId};
 
+use crate::action::{OrderDetail, Pending};
+
 pub const STANDARD: &str = "gimbal";
 pub const VERSION: &str = "1.0.0";
 
@@ -108,6 +110,42 @@ pub struct Paused<'a> {
 
 impl Event for Paused<'_> {
     const NAME: &'static str = PAUSED;
+}
+
+/// One item of `signed`: the action the MPC signed, one item per order it places (asset, side,
+/// size, px, oracle_px, unpriced), or one without them for any other action.
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Signed<'a> {
+    pub desk_id: &'a str,
+    pub request_id: u64,
+    pub venue: &'a str,
+    pub kind: &'a str,
+    #[serde(flatten)]
+    pub order: Option<&'a OrderDetail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<&'a str>,
+    pub reason_sha256: Option<&'a str>,
+}
+
+/// Logs `signed` for the action of `pending`, which the MPC signed.
+pub fn emit_signed(pending: &Pending) {
+    let a = &pending.action;
+    let item = |order| Signed {
+        desk_id: &a.desk_id,
+        request_id: pending.request_id,
+        venue: &a.venue,
+        kind: &a.kind,
+        order,
+        amount: a.amount.as_deref(),
+        reason_sha256: a.reason_sha256.as_deref(),
+    };
+    let items: Vec<Signed> = if a.orders.is_empty() {
+        vec![item(None)]
+    } else {
+        a.orders.iter().map(|o| item(Some(o))).collect()
+    };
+    emit(SIGNED, &items);
 }
 
 #[cfg(test)]

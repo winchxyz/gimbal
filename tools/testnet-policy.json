@@ -1,0 +1,25 @@
+{
+  "hl_assets": [
+    { "index": 3, "symbol": "BTC", "sz_decimals": 5 },
+    { "index": 4, "symbol": "ETH", "sz_decimals": 4 },
+    { "index": 0, "symbol": "SOL", "sz_decimals": 2 }
+  ],
+  "phoenix_markets": [
+    { "symbol": "ETH", "orderbook": "9u7aqptdRFbsnnoHtjK13E5JkeM14EW5fAKTRPidVF88", "base_lot_e8": 100000, "tick_e8": 10000000 },
+    { "symbol": "SOL", "orderbook": "71Si24E4uc3oCaPbPZTozC1ptSNNqygjjebxSmErSsC2", "base_lot_e8": 1000000, "tick_e8": 1000000 },
+    { "symbol": "BTC", "orderbook": "AXFz1MuzMUBHi5UKJuK3FDCQ73o3rSzubGU2mPr4LLU7", "base_lot_e8": 10000, "tick_e8": 100000000 }
+  ],
+  "orderly_symbols": ["PERP_BTC_USDC", "PERP_ETH_USDC", "PERP_SOL_USDC"],
+  "max_notional_usd": 50,
+  "price_band_bps": 500,
+  "oracle_max_age_s": 120,
+  "rescue_cap_usd_per_hour": 20,
+  "max_transfer_cost_bps": 100,
+  "max_transfer_cost_flat_e6": 500000,
+  "unpriced": [
+    { "symbol": "BTC", "max_sz": "0.0005" },
+    { "symbol": "ETH", "max_sz": "0.02" },
+    { "symbol": "SOL", "max_sz": "0.4" }
+  ],
+  "unpriced_max_notional_usd": 50
+}

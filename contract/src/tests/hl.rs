@@ -9,11 +9,11 @@ use gimbal_core::hl::HlOrder;
 
 /// The vectors sign for the address of test key 0x01…01; no MPC answer in these tests gives it, so
 /// the desk on it is written straight into the map.
-const VECTOR_DESK_EVM: &str = "0x1a642f0e3c3af545e7acbd38b07251b3990914f1";
+pub(super) const VECTOR_DESK_EVM: &str = "0x1a642f0e3c3af545e7acbd38b07251b3990914f1";
 /// A block time in the vectors' range (ms).
 const T: u64 = 1_793_491_200_000;
 
-fn vectors() -> Value {
+pub(super) fn vectors() -> Value {
     serde_json::from_str(include_str!("../../core/tests/vectors/hl.json")).unwrap()
 }
 
@@ -28,7 +28,7 @@ fn case(section: &str, name: &str) -> Value {
         .clone()
 }
 
-fn unpriced(symbol: &str, max_sz: &str) -> UnpricedAsset {
+pub(super) fn unpriced(symbol: &str, max_sz: &str) -> UnpricedAsset {
     UnpricedAsset {
         symbol: symbol.into(),
         max_sz: max_sz.into(),
@@ -37,7 +37,7 @@ fn unpriced(symbol: &str, max_sz: &str) -> UnpricedAsset {
 
 /// The `order_policy` vectors' assets: BTC 0, ETH 1, SOL 5, DOGE 12, and HYPE 159 unpriced (up to
 /// 3 HYPE per order).
-fn hl_policy() -> Policy {
+pub(super) fn hl_policy() -> Policy {
     let asset = |index, symbol: &str, sz_decimals| HlAsset {
         index,
         symbol: symbol.into(),
@@ -65,16 +65,22 @@ fn hl_desk() -> Gimbal {
     hl_desk_with(hl_policy())
 }
 
-fn hl_desk_with(policy: Policy) -> Gimbal {
+pub(super) fn hl_desk_with(policy: Policy) -> Gimbal {
     let mut g = testnet();
-    let mut desk = Desk::new(owner(), policy, VECTOR_DESK_EVM.into(), solana());
+    let mut desk = Desk::new(
+        owner(),
+        policy,
+        VECTOR_DESK_EVM.into(),
+        solana(),
+        "woofi_dex",
+    );
     desk.operator = Some(operator());
     g.desks.insert("alpha".into(), desk);
     g
 }
 
 /// A call from `who` at block time `ms` with `deposit` attached.
-fn at(who: AccountId, ms: u64, deposit: NearToken) {
+pub(super) fn at(who: AccountId, ms: u64, deposit: NearToken) {
     testing_env!(VMContextBuilder::new()
         .current_account_id(contract_id())
         .predecessor_account_id(who.clone())
@@ -84,7 +90,7 @@ fn at(who: AccountId, ms: u64, deposit: NearToken) {
         .build());
 }
 
-fn order(asset: u32, px: &str, sz: &str) -> HlOrder {
+pub(super) fn order(asset: u32, px: &str, sz: &str) -> HlOrder {
     HlOrder {
         asset,
         is_buy: true,
@@ -102,7 +108,7 @@ fn eth() -> HlOrder {
 }
 
 /// An unpriced order that fits the policy: 99.75 USD of HYPE, which signs without an oracle price.
-fn hype() -> HlOrder {
+pub(super) fn hype() -> HlOrder {
     order(159, "39.9", "2.5")
 }
 
@@ -180,7 +186,7 @@ fn hl_order_signs_the_vector_bytes() {
         .unwrap();
         at(operator(), c["nonce"].as_u64().unwrap(), yocto(0));
         let reason = format!("vector {}", c["name"]);
-        let got = g.hl_order("alpha".into(), order, reason.clone());
+        let got = g.prepare_hl_order("alpha".into(), order, reason.clone());
         assert_signs_l1(&got, "order", c["name"].as_str().unwrap());
         assert_eq!(got.reason_sha256, Some(sha256_hex(&reason)));
         signed += 1;
@@ -218,17 +224,17 @@ fn hl_order_refuses_what_the_policy_does_not_allow() {
     ] {
         at(operator(), T, yocto(0));
         assert_refused(expected, || {
-            g.hl_order("alpha".into(), o, "enter".into());
+            g.prepare_hl_order("alpha".into(), o, "enter".into());
         });
     }
     at(operator(), T, yocto(0));
     assert_refused("E_ARGS: reason has 281 characters, over 280", || {
-        g.hl_order("alpha".into(), hype(), "x".repeat(281));
+        g.prepare_hl_order("alpha".into(), hype(), "x".repeat(281));
     });
     assert_eq!(nonce_of("alpha", &g), 0, "a refused order takes no nonce");
     // The unpriced cap itself passes.
-    g.hl_order("alpha".into(), order(159, "40", "2.5"), "x".repeat(280));
-    g.hl_order("alpha".into(), order(159, "33.33", "3"), String::new());
+    g.prepare_hl_order("alpha".into(), order(159, "40", "2.5"), "x".repeat(280));
+    g.prepare_hl_order("alpha".into(), order(159, "33.33", "3"), String::new());
 }
 
 /// No prices are stored before C6, so every priced order is refused, whatever its size and side:
@@ -245,7 +251,7 @@ fn a_priced_order_is_refused_until_prices_are_stored() {
         assert_refused(
             "E_ORACLE_STALE: no oracle price for ETH younger than 300 s, and ETH is not in policy.unpriced",
             || {
-                g.hl_order("alpha".into(), o, "enter".into());
+                g.prepare_hl_order("alpha".into(), o, "enter".into());
             },
         );
     }
@@ -261,30 +267,30 @@ fn a_reduce_only_order_passes_a_paused_desk_and_nothing_else_does() {
     for who in [owner(), operator()] {
         at(who, T, yocto(0));
         assert_refused(paused, || {
-            g.hl_order("alpha".into(), eth(), "open".into());
+            g.prepare_hl_order("alpha".into(), eth(), "open".into());
         });
         assert_refused(paused, || {
-            g.hl_order("alpha".into(), hype(), "open".into());
+            g.prepare_hl_order("alpha".into(), hype(), "open".into());
         });
         let mut close = hype();
         close.reduce_only = true;
         close.is_buy = false;
-        let got = g.hl_order("alpha".into(), close, "panic close".into());
+        let got = g.prepare_hl_order("alpha".into(), close, "panic close".into());
         let payload = serde_json::to_value(&got.payload).unwrap();
         assert_eq!(payload["action"]["orders"][0]["r"], true);
         assert_refused(paused, || {
-            g.hl_set_referrer("alpha".into());
+            g.prepare_hl_set_referrer("alpha".into());
         });
         assert_refused(paused, || {
-            g.hl_approve_builder_fee("alpha".into());
+            g.prepare_hl_approve_builder_fee("alpha".into());
         });
         assert_refused(paused, || {
-            g.hl_usd_class_transfer("alpha".into(), "5".into(), true, "margin".into());
+            g.prepare_hl_usd_class_transfer("alpha".into(), "5".into(), true, "margin".into());
         });
     }
     // The owner's emergency withdrawal works on a paused desk.
     at(owner(), T, ONE_YOCTO);
-    g.hl_withdraw("alpha".into(), "10".into());
+    g.prepare_hl_withdraw("alpha".into(), "10".into());
 }
 
 #[test]
@@ -294,26 +300,26 @@ fn hl_actions_are_for_the_owner_and_the_operator() {
     let stranger_refused =
         "E_NOT_ALLOWED: charlie is neither the owner nor the operator of desk alpha";
     assert_refused(stranger_refused, || {
-        g.hl_order("alpha".into(), eth(), "x".into());
+        g.prepare_hl_order("alpha".into(), eth(), "x".into());
     });
     assert_refused(stranger_refused, || {
-        g.hl_set_referrer("alpha".into());
+        g.prepare_hl_set_referrer("alpha".into());
     });
     assert_refused(stranger_refused, || {
-        g.hl_approve_builder_fee("alpha".into());
+        g.prepare_hl_approve_builder_fee("alpha".into());
     });
     assert_refused(stranger_refused, || {
-        g.hl_usd_class_transfer("alpha".into(), "5".into(), true, "x".into());
+        g.prepare_hl_usd_class_transfer("alpha".into(), "5".into(), true, "x".into());
     });
     at(owner(), T, yocto(0));
     assert_refused(&format!("{E_NO_DESK}: no desk "), || {
-        g.hl_order("bravo".into(), eth(), "x".into());
+        g.prepare_hl_order("bravo".into(), eth(), "x".into());
     });
     // The owner's FunctionCall key (no deposit) reaches every operator method.
-    g.hl_order("alpha".into(), hype(), "x".into());
-    g.hl_set_referrer("alpha".into());
-    g.hl_approve_builder_fee("alpha".into());
-    g.hl_usd_class_transfer("alpha".into(), "5".into(), true, "x".into());
+    g.prepare_hl_order("alpha".into(), hype(), "x".into());
+    g.prepare_hl_set_referrer("alpha".into());
+    g.prepare_hl_approve_builder_fee("alpha".into());
+    g.prepare_hl_usd_class_transfer("alpha".into(), "5".into(), true, "x".into());
     assert_eq!(nonce_of("alpha", &g), T + 3);
 }
 
@@ -325,20 +331,26 @@ fn every_action_takes_the_next_nonce_of_its_desk() {
     let nonce = |u: &UnsignedAction| u.payload.get("nonce").cloned();
     let n = |ms: u64| Some(gimbal_core::msgpack::Value::UInt(ms));
     at(operator(), T, yocto(0));
-    assert_eq!(nonce(&g.hl_order("alpha".into(), hype(), "a".into())), n(T));
+    assert_eq!(
+        nonce(&g.prepare_hl_order("alpha".into(), hype(), "a".into())),
+        n(T)
+    );
     // Two in one block, then a user-signed one: never the same nonce twice.
-    assert_eq!(nonce(&g.hl_set_referrer("alpha".into())), n(T + 1));
-    assert_eq!(nonce(&g.hl_approve_builder_fee("alpha".into())), n(T + 2));
+    assert_eq!(nonce(&g.prepare_hl_set_referrer("alpha".into())), n(T + 1));
+    assert_eq!(
+        nonce(&g.prepare_hl_approve_builder_fee("alpha".into())),
+        n(T + 2)
+    );
     // Another desk has its own nonces.
-    assert_eq!(nonce(&g.hl_set_referrer("bravo".into())), n(T));
+    assert_eq!(nonce(&g.prepare_hl_set_referrer("bravo".into())), n(T));
     // A later block moves on to the block time; an earlier one cannot go back.
     at(operator(), T + 5_000, yocto(0));
     assert_eq!(
-        nonce(&g.hl_order("alpha".into(), hype(), "b".into())),
+        nonce(&g.prepare_hl_order("alpha".into(), hype(), "b".into())),
         n(T + 5_000)
     );
     at(owner(), T - 10, ONE_YOCTO);
-    let w = g.hl_withdraw("alpha".into(), "10".into());
+    let w = g.prepare_hl_withdraw("alpha".into(), "10".into());
     assert_eq!(nonce(&w), n(T + 5_001));
     assert_eq!(
         w.payload.get("action").unwrap().get("time"),
@@ -364,7 +376,7 @@ fn an_action_writes_its_nonce_and_never_rewrites_the_desk() {
     g.desks.flush();
     assert_eq!(gas_of(|| g.desks.flush()), 0, "nothing left to write");
     // An order reads the desk and writes only its nonce entry.
-    g.hl_order("alpha".into(), hype(), "a".into());
+    g.prepare_hl_order("alpha".into(), hype(), "a".into());
     assert_eq!(
         gas_of(|| g.desks.flush()),
         0,
@@ -388,14 +400,20 @@ fn a_new_desk_pays_for_its_nonce_entry_and_an_action_adds_no_storage() {
     at(owner(), T, yocto(0));
     g.desks.remove("alpha");
     g.desks.flush();
-    let desk = Desk::new(owner(), hl_policy(), VECTOR_DESK_EVM.into(), solana());
+    let desk = Desk::new(
+        owner(),
+        hl_policy(),
+        VECTOR_DESK_EVM.into(),
+        solana(),
+        "woofi_dex",
+    );
     // `write_desk` measures what `create_desk` charges for, the stored nonce entry included.
     let before = env::storage_usage();
     let added = g.write_desk("alpha", &desk);
     assert_eq!(env::storage_usage(), before + added);
     assert_eq!(g.hl_nonces.get("alpha"), Some(&0));
     let before = env::storage_usage();
-    g.hl_order("alpha".into(), hype(), "a".into());
+    g.prepare_hl_order("alpha".into(), hype(), "a".into());
     g.hl_nonces.flush();
     assert_eq!(nonce_of("alpha", &g), T);
     assert_eq!(env::storage_usage(), before, "an action adds no storage");
@@ -413,7 +431,7 @@ fn hl_cancel_signs_the_vector_bytes() {
         }
         let p = &c["params"];
         at(operator(), c["nonce"].as_u64().unwrap(), yocto(0));
-        let got = g.hl_cancel(
+        let got = g.prepare_hl_cancel(
             "alpha".into(),
             u32::try_from(p["asset"].as_u64().unwrap()).unwrap(),
             p["oid"].as_u64().unwrap(),
@@ -433,7 +451,7 @@ fn hl_cancel_passes_a_paused_desk_and_takes_the_next_nonce() {
     g.set_paused("alpha".into(), true);
     for (who, n) in [(owner(), T), (operator(), T + 1)] {
         at(who, T, yocto(0));
-        let got = g.hl_cancel("alpha".into(), 1, 77, "pause".into());
+        let got = g.prepare_hl_cancel("alpha".into(), 1, 77, "pause".into());
         assert_eq!(
             serde_json::to_value(&got.payload).unwrap(),
             json!({
@@ -444,7 +462,7 @@ fn hl_cancel_passes_a_paused_desk_and_takes_the_next_nonce() {
         );
     }
     // An asset the policy no longer lists can still be cancelled.
-    let got = g.hl_cancel("alpha".into(), 4242, u64::MAX, String::new());
+    let got = g.prepare_hl_cancel("alpha".into(), 4242, u64::MAX, String::new());
     assert_eq!(got.kind, "cancel");
     assert_eq!(nonce_of("alpha", &g), T + 2);
 }
@@ -456,15 +474,15 @@ fn hl_cancel_is_for_the_owner_and_the_operator() {
     assert_refused(
         "E_NOT_ALLOWED: charlie is neither the owner nor the operator of desk alpha",
         || {
-            g.hl_cancel("alpha".into(), 1, 77, "x".into());
+            g.prepare_hl_cancel("alpha".into(), 1, 77, "x".into());
         },
     );
     at(operator(), T, yocto(0));
     assert_refused(&format!("{E_NO_DESK}: no desk "), || {
-        g.hl_cancel("bravo".into(), 1, 77, "x".into());
+        g.prepare_hl_cancel("bravo".into(), 1, 77, "x".into());
     });
     assert_refused("E_ARGS: reason has 281 characters, over 280", || {
-        g.hl_cancel("alpha".into(), 1, 77, "x".repeat(281));
+        g.prepare_hl_cancel("alpha".into(), 1, 77, "x".repeat(281));
     });
     assert_eq!(nonce_of("alpha", &g), 0);
 }
@@ -475,7 +493,7 @@ fn hl_cancel_is_for_the_owner_and_the_operator() {
 fn hl_set_referrer_signs_the_treasury_code_only() {
     let mut g = hl_desk();
     at(operator(), 1_793_491_215_000, yocto(0));
-    let got = g.hl_set_referrer("alpha".into());
+    let got = g.prepare_hl_set_referrer("alpha".into());
     assert_signs_l1(&got, "setReferrer", "setReferrer TESTCODE");
     assert_eq!(got.reason_sha256, None);
 }
@@ -498,13 +516,19 @@ fn hl_set_referrer_without_a_code_is_e_args() {
     );
     g.desks.insert(
         "alpha".into(),
-        Desk::new(owner(), hl_policy(), VECTOR_DESK_EVM.into(), solana()),
+        Desk::new(
+            owner(),
+            hl_policy(),
+            VECTOR_DESK_EVM.into(),
+            solana(),
+            "woofi_dex",
+        ),
     );
     at(owner(), T, yocto(0));
     assert_refused(
         "E_ARGS: no Hyperliquid referral code is configured (treasury.referral_codes.hyperliquid is null)",
         || {
-            g.hl_set_referrer("alpha".into());
+            g.prepare_hl_set_referrer("alpha".into());
         },
     );
     assert_eq!(nonce_of("alpha", &g), 0);
@@ -515,7 +539,7 @@ fn hl_approve_builder_fee_approves_the_fee_config() {
     let mut g = hl_desk();
     let c = case("user_signed", "approveBuilderFee 0.01% (testnet)");
     at(operator(), c["action"]["nonce"].as_u64().unwrap(), yocto(0));
-    let got = g.hl_approve_builder_fee("alpha".into());
+    let got = g.prepare_hl_approve_builder_fee("alpha".into());
     assert_signs_user(
         &got,
         "approveBuilderFee",
@@ -534,7 +558,12 @@ fn hl_usd_class_transfer_signs_the_vectors() {
     ] {
         let c = case("user_signed", name);
         at(operator(), c["action"]["nonce"].as_u64().unwrap(), yocto(0));
-        let got = g.hl_usd_class_transfer("alpha".into(), amount.into(), to_perp, "margin".into());
+        let got = g.prepare_hl_usd_class_transfer(
+            "alpha".into(),
+            amount.into(),
+            to_perp,
+            "margin".into(),
+        );
         assert_signs_user(&got, "usdClassTransfer", name);
         assert_eq!(got.reason_sha256, Some(sha256_hex("margin")));
     }
@@ -551,11 +580,11 @@ fn hl_usd_class_transfer_refuses_bad_amounts() {
         ("0", "E_SIZE: amount is zero"),
     ] {
         assert_refused(expected, || {
-            g.hl_usd_class_transfer("alpha".into(), amount.into(), true, "m".into());
+            g.prepare_hl_usd_class_transfer("alpha".into(), amount.into(), true, "m".into());
         });
     }
     assert_refused("E_ARGS: reason has 281 characters", || {
-        g.hl_usd_class_transfer("alpha".into(), "1".into(), true, "x".repeat(281));
+        g.prepare_hl_usd_class_transfer("alpha".into(), "1".into(), true, "x".repeat(281));
     });
     assert_eq!(nonce_of("alpha", &g), 0);
 }
@@ -569,7 +598,7 @@ fn hl_withdraw_pays_the_desks_own_address() {
     );
     assert_eq!(c["action"]["destination"], VECTOR_DESK_EVM);
     at(owner(), c["action"]["time"].as_u64().unwrap(), ONE_YOCTO);
-    let got = g.hl_withdraw("alpha".into(), "10".into());
+    let got = g.prepare_hl_withdraw("alpha".into(), "10".into());
     assert_signs_user(
         &got,
         "withdraw3",
@@ -585,7 +614,7 @@ fn hl_withdraw_is_for_the_owners_wallet_only() {
     assert_refused(
         "E_NOT_ALLOWED: hl_withdraw on desk alpha is for its owner; bob is its operator",
         || {
-            g.hl_withdraw("alpha".into(), "10".into());
+            g.prepare_hl_withdraw("alpha".into(), "10".into());
         },
     );
     for wrong in [yocto(0), yocto(2), NearToken::from_near(1)] {
@@ -593,16 +622,16 @@ fn hl_withdraw_is_for_the_owners_wallet_only() {
         assert_refused(
             "E_NOT_ALLOWED: hl_withdraw needs exactly 1 yoctoNEAR attached",
             || {
-                g.hl_withdraw("alpha".into(), "10".into());
+                g.prepare_hl_withdraw("alpha".into(), "10".into());
             },
         );
     }
     at(owner(), T, ONE_YOCTO);
     assert_refused("E_SIZE: amount is zero", || {
-        g.hl_withdraw("alpha".into(), "0".into());
+        g.prepare_hl_withdraw("alpha".into(), "0".into());
     });
     assert_refused("E_DECIMAL: amount ", || {
-        g.hl_withdraw("alpha".into(), "10.0".into());
+        g.prepare_hl_withdraw("alpha".into(), "10.0".into());
     });
     assert_eq!(nonce_of("alpha", &g), 0);
 }
@@ -616,7 +645,7 @@ fn an_unsigned_action_is_this_json() {
     let mut g = hl_desk();
     let nonce = 1_793_491_215_000;
     at(operator(), nonce, yocto(0));
-    let got = g.hl_set_referrer("alpha".into());
+    let got = g.prepare_hl_set_referrer("alpha".into());
     let c = case("l1", "setReferrer TESTCODE");
     let digest = c["testnet"]["digest"]
         .as_str()
@@ -628,7 +657,7 @@ fn an_unsigned_action_is_this_json() {
     assert_eq!(
         json,
         format!(
-            r#"{{"desk_id":"alpha","venue":"hyperliquid","kind":"setReferrer","payload":{{"action":{{"type":"setReferrer","code":"TESTCODE"}},"nonce":{nonce},"vaultAddress":null}},"sign_request":{{"path":"gimbal/alpha/evm","payload_v2":{{"Ecdsa":"{digest}"}},"domain_id":0}},"reason_sha256":null}}"#
+            r#"{{"desk_id":"alpha","venue":"hyperliquid","kind":"setReferrer","payload":{{"action":{{"type":"setReferrer","code":"TESTCODE"}},"nonce":{nonce},"vaultAddress":null}},"sign_request":{{"path":"gimbal/alpha/evm","payload_v2":{{"Ecdsa":"{digest}"}},"domain_id":0}},"reason_sha256":null,"orders":[],"amount":null}}"#
         )
     );
     assert_eq!(serde_json::from_str::<UnsignedAction>(&json).unwrap(), got);

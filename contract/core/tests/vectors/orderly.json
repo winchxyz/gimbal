@@ -639,27 +639,51 @@
   "request_rules": {
     "message": "timestamp (ms, decimal) + METHOD + path including the query string + body (\"\" for GET and DELETE)",
     "signature": "Ed25519 over the UTF-8 bytes of the message; header orderly-signature = base64url without padding",
-    "body": "contract-built JSON, no spaces; order keys: symbol, client_order_id (if set), order_type, order_price (not for MARKET), order_quantity, side, reduce_only (only when true); prices and quantities are the canonical decimal digits written as bare JSON numbers",
-    "validity": "Orderly accepts a request for 300 s after its timestamp"
+    "body": "contract-built JSON, no spaces; order keys: symbol, client_order_id (always the contract's g<request_id>, never the caller's), order_type, order_price (not for MARKET), order_quantity, side, reduce_only (only when true); prices and quantities are the canonical decimal digits written as bare JSON numbers",
+    "validity": "Orderly accepts a request for 300 s after its timestamp",
+    "client_order_id": {
+      "format": "g<request_id>",
+      "rule": "the letter g, then the request_id of the signature request in decimal without padding (the request_id the signed event carries); set by the contract on every order, never taken from the caller (a caller's client_order_id is E_ARGS); at most 21 characters, inside Orderly's 36",
+      "examples": [
+        {
+          "request_id": 0,
+          "client_order_id": "g0"
+        },
+        {
+          "request_id": 7,
+          "client_order_id": "g7"
+        },
+        {
+          "request_id": 42,
+          "client_order_id": "g42"
+        },
+        {
+          "request_id": 1000000,
+          "client_order_id": "g1000000"
+        }
+      ],
+      "replay": "Orderly refuses a copy of a signed order only while the first order is open (HTTP 409, -1007 \"The client_order_id is repeated.\"); a copy is accepted once the first order filled or was cancelled (testnet, PR 30 round 2)"
+    }
   },
   "requests": [
     {
-      "name": "order LIMIT BUY with client_order_id",
+      "name": "order LIMIT BUY",
       "network": "testnet",
       "kind": "order",
       "method": "POST",
       "path": "/v1/order",
-      "body": "{\"symbol\":\"PERP_ETH_USDC\",\"client_order_id\":\"gimbal-alpha-1\",\"order_type\":\"LIMIT\",\"order_price\":1212.89,\"order_quantity\":0.0087,\"side\":\"BUY\"}",
+      "body": "{\"symbol\":\"PERP_ETH_USDC\",\"client_order_id\":\"g7\",\"order_type\":\"LIMIT\",\"order_price\":1212.89,\"order_quantity\":0.0087,\"side\":\"BUY\"}",
       "timestamp": 1793491211000,
-      "message": "1793491211000POST/v1/order{\"symbol\":\"PERP_ETH_USDC\",\"client_order_id\":\"gimbal-alpha-1\",\"order_type\":\"LIMIT\",\"order_price\":1212.89,\"order_quantity\":0.0087,\"side\":\"BUY\"}",
-      "signature_hex": "88e1675ebf706188ba18ebe3ca018055d7ad8733e5c22ae06f3170eb18c60177e4bf01027b73630855c1ffc0a68b1422169cb3f504cc68f7bb636de8807eb30f",
-      "signature_b64url": "iOFnXr9wYYi6GOvjygGAVdethzPlwirgbzFw6xjGAXfkvwECe3NjCFXB_8CmixQiFpyz9QTMaPe7Y23ogH6zDw",
+      "request_id": 7,
+      "message": "1793491211000POST/v1/order{\"symbol\":\"PERP_ETH_USDC\",\"client_order_id\":\"g7\",\"order_type\":\"LIMIT\",\"order_price\":1212.89,\"order_quantity\":0.0087,\"side\":\"BUY\"}",
+      "signature_hex": "708fa469b42c1086d82a9cc3c1861c9cbf2dde63a9f930a79c4e1878f9a8143ab3859eec0b6ecb8272b3416960ff1ad2af68763a4b625552cb05e8bd19759105",
+      "signature_b64url": "cI-kabQsEIbYKpzDwYYcnL8t3mOp-TCnnE4YePmoFDqzhZ7sC27LgnKzQWlg_xrSr2h2OktiVVLLBei9GXWRBQ",
       "headers": {
         "Content-Type": "application/json",
         "orderly-timestamp": "1793491211000",
         "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
         "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
-        "orderly-signature": "iOFnXr9wYYi6GOvjygGAVdethzPlwirgbzFw6xjGAXfkvwECe3NjCFXB_8CmixQiFpyz9QTMaPe7Y23ogH6zDw"
+        "orderly-signature": "cI-kabQsEIbYKpzDwYYcnL8t3mOp-TCnnE4YePmoFDqzhZ7sC27LgnKzQWlg_xrSr2h2OktiVVLLBei9GXWRBQ"
       },
       "url": "https://testnet-api.orderly.org/v1/order",
       "request": {
@@ -669,8 +693,7 @@
         "order_type": "LIMIT",
         "price": "1212.89",
         "quantity": "0.0087",
-        "reduce_only": false,
-        "client_order_id": "gimbal-alpha-1"
+        "reduce_only": false
       }
     },
     {
@@ -679,17 +702,18 @@
       "kind": "order",
       "method": "POST",
       "path": "/v1/order",
-      "body": "{\"symbol\":\"PERP_SOL_USDC\",\"client_order_id\":\"gimbal-alpha-2\",\"order_type\":\"IOC\",\"order_price\":103.8,\"order_quantity\":1.5,\"side\":\"SELL\",\"reduce_only\":true}",
+      "body": "{\"symbol\":\"PERP_SOL_USDC\",\"client_order_id\":\"g8\",\"order_type\":\"IOC\",\"order_price\":103.8,\"order_quantity\":1.5,\"side\":\"SELL\",\"reduce_only\":true}",
       "timestamp": 1793491212000,
-      "message": "1793491212000POST/v1/order{\"symbol\":\"PERP_SOL_USDC\",\"client_order_id\":\"gimbal-alpha-2\",\"order_type\":\"IOC\",\"order_price\":103.8,\"order_quantity\":1.5,\"side\":\"SELL\",\"reduce_only\":true}",
-      "signature_hex": "c24be47b08246a492e4efad37f5cec6b35a8ea5078fa52070b7ea47e619ed682c242ca45471ad6cb371d9df3a11d65f3612fd92fd94d301d06161011e5155205",
-      "signature_b64url": "wkvkewgkakkuTvrTf1zsazWo6lB4-lIHC36kfmGe1oLCQspFRxrWyzcdnfOhHWXzYS_ZL9lNMB0GFhAR5RVSBQ",
+      "request_id": 8,
+      "message": "1793491212000POST/v1/order{\"symbol\":\"PERP_SOL_USDC\",\"client_order_id\":\"g8\",\"order_type\":\"IOC\",\"order_price\":103.8,\"order_quantity\":1.5,\"side\":\"SELL\",\"reduce_only\":true}",
+      "signature_hex": "d2aeddb3cc0cb035874b83f381a587c8669b3204196faed6ad874da3c3657c5443c0b020c19e55c157710b7bf0ae184469fd0e8124ae640d68d77ce988566f00",
+      "signature_b64url": "0q7ds8wMsDWHS4PzgaWHyGabMgQZb67WrYdNo8NlfFRDwLAgwZ5VwVdxC3vwrhhEaf0OgSSuZA1o13zpiFZvAA",
       "headers": {
         "Content-Type": "application/json",
         "orderly-timestamp": "1793491212000",
         "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
         "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
-        "orderly-signature": "wkvkewgkakkuTvrTf1zsazWo6lB4-lIHC36kfmGe1oLCQspFRxrWyzcdnfOhHWXzYS_ZL9lNMB0GFhAR5RVSBQ"
+        "orderly-signature": "0q7ds8wMsDWHS4PzgaWHyGabMgQZb67WrYdNo8NlfFRDwLAgwZ5VwVdxC3vwrhhEaf0OgSSuZA1o13zpiFZvAA"
       },
       "url": "https://testnet-api.orderly.org/v1/order",
       "request": {
@@ -699,8 +723,7 @@
         "order_type": "IOC",
         "price": "103.8",
         "quantity": "1.5",
-        "reduce_only": true,
-        "client_order_id": "gimbal-alpha-2"
+        "reduce_only": true
       }
     },
     {
@@ -709,17 +732,18 @@
       "kind": "order",
       "method": "POST",
       "path": "/v1/order",
-      "body": "{\"symbol\":\"PERP_BTC_USDC\",\"client_order_id\":\"gimbal-alpha-3\",\"order_type\":\"MARKET\",\"order_quantity\":0.0002,\"side\":\"BUY\"}",
+      "body": "{\"symbol\":\"PERP_BTC_USDC\",\"client_order_id\":\"g9\",\"order_type\":\"MARKET\",\"order_quantity\":0.0002,\"side\":\"BUY\"}",
       "timestamp": 1793491213000,
-      "message": "1793491213000POST/v1/order{\"symbol\":\"PERP_BTC_USDC\",\"client_order_id\":\"gimbal-alpha-3\",\"order_type\":\"MARKET\",\"order_quantity\":0.0002,\"side\":\"BUY\"}",
-      "signature_hex": "92f1f97495c8bb86517763595f4ebf5afb5ce858a767b824d1373f71f9c34de47f66ac1205638ae48ed8b6f1ce6e0f5dcddba2c14d570884892c771ef092b504",
-      "signature_b64url": "kvH5dJXIu4ZRd2NZX06_Wvtc6FinZ7gk0Tc_cfnDTeR_ZqwSBWOK5I7YtvHObg9dzduiwU1XCISJLHce8JK1BA",
+      "request_id": 9,
+      "message": "1793491213000POST/v1/order{\"symbol\":\"PERP_BTC_USDC\",\"client_order_id\":\"g9\",\"order_type\":\"MARKET\",\"order_quantity\":0.0002,\"side\":\"BUY\"}",
+      "signature_hex": "491479bb1615f6626381bacbd4b2ea4778ee36c18df89803aed0a0066fe180da63888ecbaf19d6191d24f2c57a4e9d431bccfdfc7bfce65311ddddc4b17ee90a",
+      "signature_b64url": "SRR5uxYV9mJjgbrL1LLqR3juNsGN-JgDrtCgBm_hgNpjiI7LrxnWGR0k8sV6Tp1DG8z9_Hv85lMR3d3EsX7pCg",
       "headers": {
         "Content-Type": "application/json",
         "orderly-timestamp": "1793491213000",
         "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
         "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
-        "orderly-signature": "kvH5dJXIu4ZRd2NZX06_Wvtc6FinZ7gk0Tc_cfnDTeR_ZqwSBWOK5I7YtvHObg9dzduiwU1XCISJLHce8JK1BA"
+        "orderly-signature": "SRR5uxYV9mJjgbrL1LLqR3juNsGN-JgDrtCgBm_hgNpjiI7LrxnWGR0k8sV6Tp1DG8z9_Hv85lMR3d3EsX7pCg"
       },
       "url": "https://testnet-api.orderly.org/v1/order",
       "request": {
@@ -729,8 +753,7 @@
         "order_type": "MARKET",
         "price": null,
         "quantity": "0.0002",
-        "reduce_only": false,
-        "client_order_id": "gimbal-alpha-3"
+        "reduce_only": false
       }
     },
     {
@@ -739,17 +762,18 @@
       "kind": "order",
       "method": "POST",
       "path": "/v1/order",
-      "body": "{\"symbol\":\"PERP_ETH_USDC\",\"client_order_id\":\"gimbal-alpha-4\",\"order_type\":\"LIMIT\",\"order_price\":81255,\"order_quantity\":0.0000001,\"side\":\"BUY\"}",
+      "body": "{\"symbol\":\"PERP_ETH_USDC\",\"client_order_id\":\"g10\",\"order_type\":\"LIMIT\",\"order_price\":81255,\"order_quantity\":0.0000001,\"side\":\"BUY\"}",
       "timestamp": 1793491214000,
-      "message": "1793491214000POST/v1/order{\"symbol\":\"PERP_ETH_USDC\",\"client_order_id\":\"gimbal-alpha-4\",\"order_type\":\"LIMIT\",\"order_price\":81255,\"order_quantity\":0.0000001,\"side\":\"BUY\"}",
-      "signature_hex": "929d92309dca0a9bceda2de7df44b47066cedeab52920fa357bc96fb13cc6948cc88e5fc4cc9c3b4e592a66de3972499fd8fd938c5690aa7dc60c707ea0c2205",
-      "signature_b64url": "kp2SMJ3KCpvO2i3n30S0cGbO3qtSkg-jV7yW-xPMaUjMiOX8TMnDtOWSpm3jlySZ_Y_ZOMVpCqfcYMcH6gwiBQ",
+      "request_id": 10,
+      "message": "1793491214000POST/v1/order{\"symbol\":\"PERP_ETH_USDC\",\"client_order_id\":\"g10\",\"order_type\":\"LIMIT\",\"order_price\":81255,\"order_quantity\":0.0000001,\"side\":\"BUY\"}",
+      "signature_hex": "c123978b138d07092524d7cf1a08a0eba5609477db8a115c4b4a522939a28c47640664c92309ec93bf15ddc4a819b1902768d583a5a99065264c8aecae06b102",
+      "signature_b64url": "wSOXixONBwklJNfPGgig66VglHfbihFcS0pSKTmijEdkBmTJIwnsk78V3cSoGbGQJ2jVg6WpkGUmTIrsrgaxAg",
       "headers": {
         "Content-Type": "application/json",
         "orderly-timestamp": "1793491214000",
         "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
         "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
-        "orderly-signature": "kp2SMJ3KCpvO2i3n30S0cGbO3qtSkg-jV7yW-xPMaUjMiOX8TMnDtOWSpm3jlySZ_Y_ZOMVpCqfcYMcH6gwiBQ"
+        "orderly-signature": "wSOXixONBwklJNfPGgig66VglHfbihFcS0pSKTmijEdkBmTJIwnsk78V3cSoGbGQJ2jVg6WpkGUmTIrsrgaxAg"
       },
       "url": "https://testnet-api.orderly.org/v1/order",
       "request": {
@@ -759,8 +783,7 @@
         "order_type": "LIMIT",
         "price": "81255",
         "quantity": "0.0000001",
-        "reduce_only": false,
-        "client_order_id": "gimbal-alpha-4"
+        "reduce_only": false
       },
       "note": "the body carries the canonical digits 0.0000001, not JSON.stringify(1e-7) = \"1e-7\"; Orderly will refuse the size, the vector is about the bytes"
     },
@@ -1075,6 +1098,111 @@
       "url": "https://api.orderly.org/v1/referral/bind",
       "evidence": "docs: POST /v1/referral/bind {referral_code}",
       "verify": "day 5"
+    },
+    {
+      "name": "funding_fee_history of one symbol, one day, page 1 of 60 rows (testnet)",
+      "network": "testnet",
+      "kind": "funding_fee_history",
+      "method": "GET",
+      "path": "/v1/funding_fee/history?symbol=PERP_ETH_USDC&start_t=1793404800000&end_t=1793491200000&page=1&size=60",
+      "body": "",
+      "timestamp": 1793491229000,
+      "message": "1793491229000GET/v1/funding_fee/history?symbol=PERP_ETH_USDC&start_t=1793404800000&end_t=1793491200000&page=1&size=60",
+      "signature_hex": "72b26a8b97441b60ec7519f5c6266ef28fb21eb62a5bf52728395a07a54b2395fe6e0b2e348ac8f6c8cf8c26389d6158d50fe6ad38af0edc2c415dead4587602",
+      "signature_b64url": "crJqi5dEG2DsdRn1xiZu8o-yHrYqW_UnKDlaB6VLI5X-bgsuNIrI9sjPjCY4nWFY1Q_mrTivDtwsQV3q1Fh2Ag",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "orderly-timestamp": "1793491229000",
+        "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "crJqi5dEG2DsdRn1xiZu8o-yHrYqW_UnKDlaB6VLI5X-bgsuNIrI9sjPjCY4nWFY1Q_mrTivDtwsQV3q1Fh2Ag"
+      },
+      "url": "https://testnet-api.orderly.org/v1/funding_fee/history?symbol=PERP_ETH_USDC&start_t=1793404800000&end_t=1793491200000&page=1&size=60",
+      "request": {
+        "kind": "funding_fee_history",
+        "symbol": "PERP_ETH_USDC",
+        "start_t": 1793404800000,
+        "end_t": 1793491200000,
+        "page": 1,
+        "size": 60
+      },
+      "evidence": "docs: GET /v1/funding_fee/history (symbol, start_t, end_t, page, size)"
+    },
+    {
+      "name": "funding_fee_history of every symbol, the parameters the engine sends (testnet)",
+      "network": "testnet",
+      "kind": "funding_fee_history",
+      "method": "GET",
+      "path": "/v1/funding_fee/history?start_t=1793404800000&end_t=1793491200000&page=1&size=500",
+      "body": "",
+      "timestamp": 1793491230000,
+      "message": "1793491230000GET/v1/funding_fee/history?start_t=1793404800000&end_t=1793491200000&page=1&size=500",
+      "signature_hex": "2cc0bc0e01ca8dc9fb4247a96c8ba7c7f09e585719f058e1cd83532ffcd9a49397d2e7f99c62ef7fdf55b4a2f9693d4fce5af947be8e42da3d9fa0cddf39f102",
+      "signature_b64url": "LMC8DgHKjcn7QkepbIunx_CeWFcZ8FjhzYNTL_zZpJOX0uf5nGLvf99VtKL5aT1Pzlr5R76OQto9n6DN3znxAg",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "orderly-timestamp": "1793491230000",
+        "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "LMC8DgHKjcn7QkepbIunx_CeWFcZ8FjhzYNTL_zZpJOX0uf5nGLvf99VtKL5aT1Pzlr5R76OQto9n6DN3znxAg"
+      },
+      "url": "https://testnet-api.orderly.org/v1/funding_fee/history?start_t=1793404800000&end_t=1793491200000&page=1&size=500",
+      "request": {
+        "kind": "funding_fee_history",
+        "start_t": 1793404800000,
+        "end_t": 1793491200000,
+        "page": 1,
+        "size": 500
+      },
+      "evidence": "docs: GET /v1/funding_fee/history (symbol, start_t, end_t, page, size)"
+    },
+    {
+      "name": "positions (testnet)",
+      "network": "testnet",
+      "kind": "positions",
+      "method": "GET",
+      "path": "/v1/positions",
+      "body": "",
+      "timestamp": 1793491231000,
+      "message": "1793491231000GET/v1/positions",
+      "signature_hex": "f781c834bda5ba3ad6fdec94cfcef5c62cddd157e8d420e613a6322b13cc8a9e48d26d8ee4a35a623da84983e178e84ad53f5b69b2b47cb5d19a6a37f0293400",
+      "signature_b64url": "94HINL2lujrW_eyUz871xizd0Vfo1CDmE6YyKxPMip5I0m2O5KNaYj2oSYPheOhK1T9babK0fLXRmmo38Ck0AA",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "orderly-timestamp": "1793491231000",
+        "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "94HINL2lujrW_eyUz871xizd0Vfo1CDmE6YyKxPMip5I0m2O5KNaYj2oSYPheOhK1T9babK0fLXRmmo38Ck0AA"
+      },
+      "url": "https://testnet-api.orderly.org/v1/positions",
+      "request": {
+        "kind": "positions"
+      },
+      "evidence": "testnet: GET /v1/positions answered 200 to a contract-signed request (PR 30 round 2)"
+    },
+    {
+      "name": "holding (testnet)",
+      "network": "testnet",
+      "kind": "holding",
+      "method": "GET",
+      "path": "/v1/client/holding",
+      "body": "",
+      "timestamp": 1793491232000,
+      "message": "1793491232000GET/v1/client/holding",
+      "signature_hex": "424adb7d47fe8d4ba30b9aecee0367385cf430e67480c72e607035861bac6a13a70209c73e4ee774d7d756bbc846adb1bd04b62aa197a51bf858f3e0d2d95c01",
+      "signature_b64url": "QkrbfUf-jUujC5rs7gNnOFz0MOZ0gMcuYHA1hhusahOnAgnHPk7ndNfXVrvIRq2xvQS2KqGXpRv4WPPg0tlcAQ",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "orderly-timestamp": "1793491232000",
+        "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "QkrbfUf-jUujC5rs7gNnOFz0MOZ0gMcuYHA1hhusahOnAgnHPk7ndNfXVrvIRq2xvQS2KqGXpRv4WPPg0tlcAQ"
+      },
+      "url": "https://testnet-api.orderly.org/v1/client/holding",
+      "request": {
+        "kind": "holding"
+      },
+      "evidence": "testnet: GET /v1/client/holding answered 200 to a contract-signed request (PR 30 round 2)"
     }
   ],
   "ws_auth": {
