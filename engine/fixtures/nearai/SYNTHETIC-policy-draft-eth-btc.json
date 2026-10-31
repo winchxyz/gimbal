@@ -1,0 +1,18 @@
+{
+  "_comment": "SYNTHETIC: written by hand in NEAR AI Cloud's chat-completions format before a NEAR_AI_API_KEY existed. It is NOT a recorded reply. Record a real one next to it with `npm run record-nearai -w engine` (src/cli/record-nearai.ts); the tests then check both. The sentence it answers is ETH_BTC_SENTENCE in src/nearai/recorded.ts.",
+  "id": "synthetic-policy-draft-eth-btc",
+  "object": "chat.completion",
+  "created": 1793448000,
+  "model": "Qwen/Qwen3-VL-30B-A3B-Instruct",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "{\"symbols\": [\"ETH\", \"BTC\"], \"venues\": null, \"max_notional_usd\": 500, \"leg_usd\": 500, \"max_leverage\": 3, \"stop_drawdown_pct\": 10, \"min_net_apr_pct\": 15, \"auto\": null, \"rotate_min_gain_pts\": null, \"rotate_for_hours\": null, \"watch_distance_pct\": null, \"rescue_distance_pct\": null, \"price_band_pct\": null, \"oracle_max_age_s\": null, \"rescue_cap_usd_per_hour\": null, \"max_transfer_cost_pct\": null, \"max_transfer_cost_flat_usd\": null, \"unpriced\": [], \"unpriced_max_notional_usd\": null, \"unmapped\": []}"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+}
