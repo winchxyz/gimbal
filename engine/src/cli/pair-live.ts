@@ -162,7 +162,7 @@ async function run(): Promise<void> {
     values.fail === 'hyperliquid' ? failing(hl) : hl,
     values.fail === 'orderly' ? failing(orderly) : orderly,
   ];
-  trader = new PairTrader({ legs, log });
+  trader = new PairTrader({ legs, log, priceBandBps: desk.policy.price_band_bps });
   // A session that dies while Orderly orders can still be replayed is opened again (one more signature); its seed
   // read goes through positionPushed like a push, so a copy that landed while it was down is still checked.
   const watchedTrader = trader;

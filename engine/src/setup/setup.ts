@@ -8,7 +8,8 @@
 //                -> receiver_address lookup (the owner pins it; a pinned one must match) -> referral_bind (no code:
 //                skipped) -> ip_restriction (no set_orderly_ips list: skipped)
 //   phoenix      register (build-register-ixs, sol_sign_register, send-register-ixs; done once the trader account
-//                exists) -> referral (no code: skipped; already activated: done without signing); mainnet only
+//                exists; with none, every run first looks for one for as long as an earlier run's registration could
+//                still land) -> referral (no code: skipped; already activated: done without signing); mainnet only
 //
 // A SetupProgress with every step goes out after each change.
 
@@ -87,7 +88,17 @@ export interface SetupPlan {
   /** How often, and how many times, a sent Phoenix registration is looked for on Solana; default 3 s, 10 times. */
   phoenixPollMs?: number;
   phoenixPolls?: number;
+  /** How long a signed Phoenix registration can still land (see PHOENIX_LANDING_MS). */
+  phoenixLandingMs?: number;
 }
+
+/**
+ * How long a signed Solana transaction can still land: its blockhash is good for 150 blocks, about 60 s, and this
+ * leaves a margin for slow or skipped slots. Every run that finds no trader account looks for one this long before it
+ * signs a registration: an earlier run's (whose poll gave up, or which crashed) can land until then, and a second
+ * registration signed meanwhile would be a second transaction for the same account.
+ */
+export const PHOENIX_LANDING_MS = 90_000;
 
 type Outcome = { status: 'done' | 'skipped' | 'pending' | 'failed'; detail?: string; tx?: TxRef[] };
 
@@ -303,13 +314,25 @@ async function phoenix(plan: SetupPlan, run: Run, waits: (name: SetupStepName, o
   }
   const registered = await run('phoenix_register', async () => {
     if (await p.isRegistered()) return { status: 'done', detail: 'trader account exists' };
+    const pollMs = plan.phoenixPollMs ?? 3_000;
+    // An earlier run's registration may still be landing: watch for it until no transaction signed before this run
+    // can land any more. A read that fails here fails the step: nothing is signed on a guess.
+    const landingMs = plan.phoenixLandingMs ?? PHOENIX_LANDING_MS;
+    plan.log?.(`setup ${plan.deskId} phoenix_register: no trader account; looking for one for ${Math.ceil(landingMs / 1000)} s before signing, in case an earlier run's registration is still landing`);
+    for (let waited = 0; waited < landingMs; waited += pollMs) {
+      await sleep(pollMs);
+      if (await p.isRegistered()) return { status: 'done', detail: 'trader account exists: an earlier registration landed' };
+    }
     const { tx } = await p.register();
     // send-register-ixs answering is not the account existing: Phoenix sends the transaction, Solana lands it or not.
     for (let i = 0; i < (plan.phoenixPolls ?? 10); i++) {
-      await sleep(plan.phoenixPollMs ?? 3_000);
+      await sleep(pollMs);
       if (await p.isRegistered().catch(() => false)) return { status: 'done', detail: 'registered: trader account exists', tx };
     }
-    return { status: 'failed', detail: 'Phoenix took the registration, but the trader account does not exist yet: a rerun looks again before it signs anything', tx };
+    return {
+      status: 'failed', tx,
+      detail: `Phoenix took the registration, but the trader account does not exist yet: a rerun looks for it for ${Math.ceil(landingMs / 1000)} s before it signs anything`,
+    };
   });
   if (registered !== 'done') return waits('phoenix_referral', 'phoenix_register');
   await run('phoenix_referral', async () => {

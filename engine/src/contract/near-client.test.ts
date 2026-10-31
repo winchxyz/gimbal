@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { OrderlyRequest } from '../venues/orderly-signer.ts';
-import { YOCTO_PER_NEAR } from './budget.ts';
+import { SignatureBudget, YOCTO_PER_NEAR } from './budget.ts';
 import type { NearCallOutcome, NearTransport } from './near-client.ts';
 import { NearContractClient, parseSignedAction, parseStoredPrices } from './near-client.ts';
 import { allowanceOf, outcomeOf } from './near-transport.ts';
@@ -31,15 +31,24 @@ class FakeChain implements NearTransport {
   views = new Map<string, unknown>();
   /** Views answered by a function, read at each call (state that a call changes). */
   live = new Map<string, () => unknown>();
-  delayMs = 0;
+  /** A call of this method waits on the chain for its promise before it answers (no timers). */
+  holds = new Map<string, Promise<void>>();
+  readonly #arrivals = new Map<string, () => void>();
 
   async call(_contract: string, method: string, args: object, tgas: number): Promise<NearCallOutcome> {
     const a = args as Record<string, unknown>;
     this.calls.push({ method, args: a, tgas });
-    if (this.delayMs > 0) await new Promise((r) => setTimeout(r, this.delayMs));
+    // The answer is the one queued when the call arrives, whenever a held call gets to give it.
     const answer = this.answers.shift();
     const hash = `tx${this.calls.length}`;
+    this.#arrivals.get(method)?.();
+    const hold = this.holds.get(method);
+    if (hold !== undefined) await hold;
     return answer === undefined ? { txHash: hash, ok: true, value: signed(method, a) } : { ...answer(method, a), txHash: hash };
+  }
+  /** Resolves when the next call of `method` reaches the chain. */
+  arrival(method: string): Promise<void> {
+    return new Promise((resolve) => this.#arrivals.set(method, resolve));
   }
   async view<T>(_contract: string, method: string, args: object): Promise<T> {
     const key = `${method} ${JSON.stringify(args)}`;
@@ -284,18 +293,32 @@ test('pause goes out at 30 TGas past a full or empty budget, and is read back fr
 test('pause does not wait behind MPC calls that hold every budget slot', async () => {
   const chain = new FakeChain();
   chain.balance = 3n * YOCTO_PER_NEAR / 10n;                 // one 300 TGas slot
-  chain.delayMs = 30;
   let paused = false;
   chain.live.set(`get_desk ${JSON.stringify({ desk_id: DESK })}`, () => ({ paused }));
-  const c = client(chain);
-  const order = c.hlCancel(DESK, 1, 5, 'stop');
-  await new Promise((r) => setImmediate(r));
+  // The budget's clock moves only by its own sleeps: a call that waits for a slot gives up after 5 polls, at once,
+  // instead of hanging or racing a timer.
+  let t = 0;
+  const budget = new SignatureBudget({
+    reads: { account: () => chain.account(), allowance: () => chain.allowance() }, maxWaitMs: 5_000, pollMs: 1_000,
+    now: () => t, sleep: async (ms) => { t += ms; },
+  });
+  const c = client(chain, { budget });
+  // hl_cancel takes the only slot and stays on the chain (the MPC network has not signed) until the test lets it go.
+  let sign!: () => void;
+  chain.holds.set('hl_cancel', new Promise<void>((resolve) => { sign = resolve; }));
+  const reached = chain.arrival('hl_cancel');
+  const cancel = c.hlCancel(DESK, 1, 5, 'stop');
+  await reached;
   assert.equal(c.inFlight, 1);
-  chain.answers.push((m, a) => ({ txHash: '', ok: true, value: signed(m, a) }));
+  await assert.rejects(budget.acquire(300), SignatureBudgetError, 'every slot is held: a budgeted call cannot get one');
   chain.answers.push(() => { paused = true; return { txHash: '', ok: true, value: null }; });
-  const pause = c.pause(DESK);
-  await Promise.all([order, pause]);
-  assert.deepEqual(chain.calls.map((x) => x.method), ['hl_cancel', 'set_paused']);
+  const tx = await c.pause(DESK);                          // resolves with hl_cancel still held
+  assert.equal(tx[0]!.id, 'tx2');
+  assert.equal(c.inFlight, 1, 'the cancel is still waiting for its signature');
+  assert.deepEqual(chain.calls.map((x) => [x.method, x.tgas]), [['hl_cancel', 300], ['set_paused', 30]]);
+  sign();
+  assert.equal((await cancel).nearTx?.id, 'tx1');
+  assert.equal(c.inFlight, 0);
 });
 
 test('refresh_prices is read back: every asset asked for needs a newer stored price', async () => {

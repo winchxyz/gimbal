@@ -6,7 +6,7 @@ import { OutcomeUnknown } from '../contract/types.ts';
 import { HlExchangeError } from '../relayer/hyperliquid.ts';
 import { testDesk } from '../relayer/test-helpers.ts';
 import type { HlSetup, OrderlySetup, PhoenixSetup, SetupPlan, SetupStepName } from './setup.ts';
-import { receiverOf, runSetup, SETUP_STEPS } from './setup.ts';
+import { PHOENIX_LANDING_MS, receiverOf, runSetup, SETUP_STEPS } from './setup.ts';
 
 const NOW = Date.UTC(2026, 9, 31, 12);
 const DAY = 86_400_000;
@@ -316,10 +316,64 @@ test('Phoenix: a registration whose trader account never shows up fails with its
     referralCodes: { hyperliquid: null, orderly: null, phoenix: 'TESTREF1' },
   }).plan);
   assert.equal(status(final).phoenix_register, 'failed');
-  assert.match(step(final, 'phoenix_register').detail!, /trader account does not exist yet: a rerun looks again/);
+  assert.match(step(final, 'phoenix_register').detail!, /trader account does not exist yet: a rerun looks for it for 90 s before it signs anything/);
   assert.deepEqual(step(final, 'phoenix_register').tx, [near('sol')]);
   assert.equal(step(final, 'phoenix_referral').detail, 'waits for phoenix_register');
   assert.deepEqual(ph.calls, ['register']);
+});
+
+/** Phoenix on a clock: each registration lands `landsAfterMs` after it was signed (never when null). */
+function clockedPhoenix(now: () => number, landsAfterMs: number | null) {
+  const signed: number[] = [];
+  const reads: number[] = [];
+  let failReadAt: number | null = null;
+  const phoenix: PhoenixSetup = {
+    isRegistered: async () => {
+      reads.push(now());
+      if (failReadAt !== null && reads.length === failReadAt) throw new Error('solana: getAccountInfo timed out');
+      return landsAfterMs !== null && signed.some((at) => now() >= at + landsAfterMs);
+    },
+    register: async () => {
+      signed.push(now());
+      return { tx: [near('sol')] };
+    },
+    referralActivated: async () => false,
+    activateReferral: async () => null,
+  };
+  return { phoenix, signed, reads, failRead: (n: number) => { failReadAt = n; } };
+}
+
+test('Phoenix: every run looks for an earlier registration before it signs one, as long as that one could land', async () => {
+  let t = NOW;
+  const clock = { now: () => t, sleep: async (ms: number) => { t += ms; } };
+  const desk = { hl: fakeHl({ approved: 10 }).hl, orderly: fakeOrderly({ registered: true, key: true }).orderly, ...clock };
+
+  // The registration lands 45 s after it was signed: after the 30 s poll gave up. A rerun at once does not sign again.
+  const late = clockedPhoenix(() => t, 45_000);
+  const first = await runSetup(plan({ ...desk, phoenix: late.phoenix }).plan);
+  assert.equal(status(first).phoenix_register, 'failed');
+  assert.equal(late.signed.length, 1);
+  assert.ok(late.signed[0]! - NOW >= PHOENIX_LANDING_MS, 'a first run looks too: it cannot know there was no earlier one');
+  const second = await runSetup(plan({ ...desk, phoenix: late.phoenix }).plan);
+  assert.equal(status(second).phoenix_register, 'done');
+  assert.equal(step(second, 'phoenix_register').detail, 'trader account exists: an earlier registration landed');
+  assert.deepEqual(step(second, 'phoenix_register').tx, []);
+  assert.equal(late.signed.length, 1, 'one registration: a second one signed while the first could land is a second transaction');
+
+  // One that never lands: the rerun signs again only once the first can no longer land.
+  const lost = clockedPhoenix(() => t, null);
+  await runSetup(plan({ ...desk, phoenix: lost.phoenix }).plan);
+  await runSetup(plan({ ...desk, phoenix: lost.phoenix }).plan);
+  assert.equal(lost.signed.length, 2);
+  assert.ok(lost.signed[1]! - lost.signed[0]! >= PHOENIX_LANDING_MS);
+
+  // A read that fails while looking fails the step: nothing is signed on a guess.
+  const flaky = clockedPhoenix(() => t, null);
+  flaky.failRead(3);
+  const r = await runSetup(plan({ ...desk, phoenix: flaky.phoenix }).plan);
+  assert.equal(status(r).phoenix_register, 'failed');
+  assert.match(step(r, 'phoenix_register').detail!, /getAccountInfo timed out/);
+  assert.equal(flaky.signed.length, 0);
 });
 
 test('receiverOf reads receiver_address and nothing else', () => {

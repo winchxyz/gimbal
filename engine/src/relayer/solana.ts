@@ -4,7 +4,8 @@
 //   - the signature must verify against keys[0] (the desk authority), or nothing is sent;
 //   - the message must set a compute-unit limit and a priority fee: Phoenix orders need ~190k CU, and public RPCs
 //     drop transactions without a fee. The engine builds messages with computeBudgetInstructions() (400k, 100,000
-//     µlamports per CU);
+//     µlamports per CU). One exception: a paused desk's rescue (kind 'rescue') carries no fee, as the contract
+//     signs none for a paused desk, and is rebroadcast every 500 ms instead;
 //   - sent with skipPreflight and maxRetries 0, then rebroadcast every 2 s while the status is polled;
 //   - NothingExecuted only with proof: the transaction landed with an error (confirmed), or the chain is past the
 //     message's lastValidBlockHeight (getEpochInfo: a block height and its slot, from one node) AND a history
@@ -46,7 +47,8 @@ export interface ParsedMessage {
   signers: number;
   keys: string[];                // base58
   blockhash: string;             // base58
-  instructions: { program: string; data: Uint8Array }[];
+  /** Each instruction's program and accounts (base58, in their places) and data. */
+  instructions: { program: string; accounts: string[]; data: Uint8Array }[];
   computeUnitLimit: number | null;
   computeUnitPrice: bigint | null;
 }
@@ -95,12 +97,16 @@ export function parseMessage(message: Uint8Array): ParsedMessage {
   let computeUnitPrice: bigint | null = null;
   for (let i = 0; i < ixCount; i++) {
     const programIndex = byte();
-    const accounts = compactU16();
-    bytes(accounts);
+    const accountIndexes = bytes(compactU16());
     const data = bytes(compactU16());
     const program = keys[programIndex];
     if (program === undefined) throw new Error(`solana: instruction ${i} names program index ${programIndex} outside the keys`);
-    instructions.push({ program, data });
+    const accounts = [...accountIndexes].map((k) => {
+      const key = keys[k];
+      if (key === undefined) throw new Error(`solana: instruction ${i} names account index ${k} outside the keys`);
+      return key;
+    });
+    instructions.push({ program, accounts, data });
     if (program === COMPUTE_BUDGET_PROGRAM && data[0] === 2 && data.length === 5) computeUnitLimit = Buffer.from(data).readUInt32LE(1);
     if (program === COMPUTE_BUDGET_PROGRAM && data[0] === 3 && data.length === 9) computeUnitPrice = Buffer.from(data).readBigUInt64LE(1);
   }
@@ -142,6 +148,8 @@ export interface SolanaSubmitterOptions {
   fetch?: typeof fetch;
   /** Between rebroadcasts and status polls; default 2 s. */
   rebroadcastMs?: number;
+  /** The same for a rescue with no priority fee (a paused desk's), which RPCs drop more often; default 500 ms. */
+  feelessRebroadcastMs?: number;
   /** Hard stop even if the RPC never says the blockhash expired; default 150 s. */
   maxWaitMs?: number;
   sleep?: (ms: number) => Promise<void>;
@@ -169,6 +177,7 @@ export class SolanaSubmitter {
   readonly #network: ChainNetwork;
   readonly #fetch: typeof fetch;
   readonly #rebroadcastMs: number;
+  readonly #feelessRebroadcastMs: number;
   readonly #maxWaitMs: number;
   readonly #sleep: (ms: number) => Promise<void>;
   readonly #now: () => number;
@@ -180,6 +189,7 @@ export class SolanaSubmitter {
     this.#network = options.network ?? 'mainnet';
     this.#fetch = options.fetch ?? fetch;
     this.#rebroadcastMs = options.rebroadcastMs ?? 2_000;
+    this.#feelessRebroadcastMs = options.feelessRebroadcastMs ?? 500;
     this.#maxWaitMs = options.maxWaitMs ?? 150_000;
     this.#sleep = options.sleep ?? sleep;
     this.#now = options.now ?? Date.now;
@@ -209,9 +219,12 @@ export class SolanaSubmitter {
     if (!verifyEd25519(parsed.keys[0]!, message, bytes.subarray(1, 65))) {
       throw new Error(`solana ${signed.kind}: the signature does not verify for ${parsed.keys[0]}; nothing sent`);
     }
-    if (parsed.computeUnitLimit === null || parsed.computeUnitPrice === null || parsed.computeUnitPrice === 0n) {
-      throw new Error(`solana ${signed.kind}: the message sets no compute-unit limit and priority fee; public RPCs drop it, nothing sent`);
+    // A paused desk's rescue has no priority fee (the contract signs none for a paused desk): it goes more often.
+    const feeless = parsed.computeUnitPrice === null || parsed.computeUnitPrice === 0n;
+    if (parsed.computeUnitLimit === null || (feeless && signed.kind !== 'rescue')) {
+      throw new Error(`solana ${signed.kind}: the message sets no compute-unit limit${signed.kind === 'rescue' ? '' : ' and priority fee'}; public RPCs drop it, nothing sent`);
     }
+    const every = feeless ? this.#feelessRebroadcastMs : this.#rebroadcastMs;
     const ref = solanaTxRef(this.#network, signature);
     const unknown = (detail: string) => new OutcomeUnknown(`solana ${signed.kind}`, detail, {
       solSignature: signature, ...(signed.nearTx === undefined ? {} : { nearTx: signed.nearTx.id }),
@@ -255,7 +268,7 @@ export class SolanaSubmitter {
       if (this.#now() - started > this.#maxWaitMs) {
         throw unknown(`no proof either way after ${Math.round(this.#maxWaitMs / 1000)} s${lastError === null ? '' : ` (last error: ${lastError})`}`);
       }
-      await this.#sleep(this.#rebroadcastMs);
+      await this.#sleep(every);
     }
   }
 
