@@ -11,17 +11,22 @@
 //   register   GET /v1/registration_nonce, orderly_register, POST /v1/register_account
 //   add-key    orderly_add_key (30 days), POST /v1/orderly_key
 //   faucet     POST the operator's testnet USDC faucet for the desk (no signature)
-//   order      orderly_request order (LIMIT buy, PERP_BTC_USDC, 3% under the mark), POST /v1/order
+//   order      orderly_request order (LIMIT buy, PERP_BTC_USDC, 3% under the mark), POST /v1/order;
+//              --take: IOC buy 0.5% over the mark; --close: reduce-only IOC sell; --qty <base units>
+//   read <kind> orderly_request of a kind without fields (receiver_address, settle_nonce, ...)
+//   cancel <order_id>  orderly_request cancel of one PERP_BTC_USDC order
 //   cancel-all orderly_request cancel_all PERP_BTC_USDC
 //   ws         orderly_ws_auth, log in to the private stream, subscribe to position and balance and
 //              print what arrives within 15 s or --listen <s> (does a subscribe push a snapshot?)
 //   funding    orderly_request funding_fee_history for the last 7 days
+//   funding-check  after a funding time with a position open: a resting order and its cancel make
+//              Orderly push the position (accruedFundingFee), then the day's funding history
 //   settle     settle_nonce, orderly_settle_pnl, settle_pnl
 //   withdraw   withdraw_nonce, orderly_withdraw 1 USDC, withdraw_request (needs a balance)
 //
 // No key value is printed: signatures and public addresses only.
 
-import { actions, keccak256, loadKey, panicOf, send, view } from './near.mjs';
+import { actions, keccak256, loadKey, panicOf, send, sleep, view } from './near.mjs';
 import { hlL1Digest, hlSignature, recoverAddress } from './evm.mjs';
 
 const HL_API = 'https://api.hyperliquid-testnet.xyz';
@@ -103,6 +108,45 @@ async function sendRest(action) {
   });
 }
 
+/**
+ * Logs in to the private stream with one orderly_ws_auth signature and subscribes to the account
+ * topics; prints every frame and keeps the position lists it pushes. Resolves once subscribed.
+ */
+async function privateStream() {
+  const timestamp = Date.now();
+  const action = await signed('orderly_ws_auth', { desk_id: deskId, timestamp });
+  show('SignedAction', { ...action, signature: { scheme: action.signature.scheme } });
+  const ws = new WebSocket(ORDERLY_PRIVATE_WS + desk.orderly_account_id);
+  const started = Date.now();
+  const positions = [];
+  await new Promise((resolve, reject) => {
+    let subscribed = 0;
+    ws.addEventListener('open', () => {
+      ws.send(JSON.stringify({
+        id: 'auth-1',
+        event: 'auth',
+        params: { orderly_key: orderlyKey, sign: Buffer.from(action.signature.signature).toString('base64url'), timestamp },
+      }));
+    });
+    ws.addEventListener('message', (ev) => {
+      const msg = JSON.parse(String(ev.data));
+      if (msg.event === 'ping') {
+        ws.send(JSON.stringify({ event: 'pong', ts: msg.ts }));
+        return;
+      }
+      console.log(`ws +${Date.now() - started} ms`, JSON.stringify(msg).slice(0, 1500));
+      if (msg.topic === 'position') positions.push(msg.data.positions);
+      if (msg.event === 'auth' && msg.success) {
+        for (const topic of ['executionreport', 'position', 'balance']) ws.send(JSON.stringify({ id: `sub-${topic}`, event: 'subscribe', topic }));
+      }
+      if (msg.event === 'auth' && !msg.success) reject(new Error(`ws login refused: ${msg.errorMsg}`));
+      if (msg.event === 'subscribe' && ++subscribed === 3) resolve();
+    });
+    ws.addEventListener('error', (e) => reject(new Error(`ws error ${e.message ?? ''}`)));
+  });
+  return { positions, close: () => ws.close() };
+}
+
 const request = (req, reason) =>
   signed('orderly_request', { desk_id: deskId, req: { reduce_only: false, ...req, timestamp_ms: Date.now() }, reason });
 
@@ -162,14 +206,40 @@ switch (step) {
   case 'order': {
     const fut = await http('GET', `${ORDERLY_API}/v1/public/futures/PERP_BTC_USDC`);
     const mark = Number(fut.data.mark_price);
-    const price = String(Math.floor(mark * 0.97));
-    const quantity = (Math.ceil((12 / Number(price)) * 1e5) / 1e5).toFixed(5).replace(/0+$/, '');
-    show('order', { mark, price, quantity });
+    // --take buys at once (IOC 0.5% over the mark); --close sells the same size back, reduce-only.
+    const take = args.includes('--take') || args.includes('--close');
+    const close = args.includes('--close');
+    const price = String(close ? Math.floor(mark * 0.995) : take ? Math.ceil(mark * 1.005) : Math.floor(mark * 0.97));
+    const quantity = args.includes('--qty') ? args[args.indexOf('--qty') + 1] : (Math.ceil((12 / Number(price)) * 1e5) / 1e5).toFixed(5).replace(/0+$/, '');
+    show('order', { mark, price, quantity, take, close });
     const action = await request(
-      { kind: 'order', symbol: 'PERP_BTC_USDC', side: 'BUY', order_type: 'LIMIT', price, quantity, client_order_id: `c5-${Date.now()}` },
+      {
+        kind: 'order',
+        symbol: 'PERP_BTC_USDC',
+        side: close ? 'SELL' : 'BUY',
+        order_type: take ? 'IOC' : 'LIMIT',
+        price,
+        quantity,
+        reduce_only: close,
+        client_order_id: `c5-${Date.now()}`,
+      },
       'C5 live check: testnet Orderly order',
     );
     show('SignedAction', action);
+    await sendRest(action);
+    break;
+  }
+  case 'read': {
+    const kind = positional[3];
+    const action = await request({ kind }, `C5 live check: ${kind}`);
+    show('signed', `${action.payload.method} ${action.payload.path}`);
+    await sendRest(action);
+    break;
+  }
+  case 'cancel': {
+    const orderId = Number(positional[3]);
+    const action = await request({ kind: 'cancel', symbol: 'PERP_BTC_USDC', order_id: orderId }, 'C5 live check: cancel');
+    show('signed', `${action.payload.method} ${action.payload.path}`);
     await sendRest(action);
     break;
   }
@@ -179,41 +249,31 @@ switch (step) {
     break;
   }
   case 'ws': {
-    const timestamp = Date.now();
-    const action = await signed('orderly_ws_auth', { desk_id: deskId, timestamp });
-    show('SignedAction', { ...action, signature: { scheme: action.signature.scheme } });
-    const ws = new WebSocket(ORDERLY_PRIVATE_WS + desk.orderly_account_id);
-    const started = Date.now();
-    await new Promise((resolve) => {
-      const done = setTimeout(() => {
-        ws.close();
-        resolve();
-      }, 1000 * Number(args.includes('--listen') ? args[args.indexOf('--listen') + 1] : 15));
-      ws.addEventListener('open', () => {
-        ws.send(JSON.stringify({
-          id: 'auth-1',
-          event: 'auth',
-          params: { orderly_key: orderlyKey, sign: Buffer.from(action.signature.signature).toString('base64url'), timestamp },
-        }));
-      });
-      ws.addEventListener('message', (ev) => {
-        const msg = JSON.parse(String(ev.data));
-        if (msg.event === 'ping') {
-          ws.send(JSON.stringify({ event: 'pong', ts: msg.ts }));
-          return;
-        }
-        console.log(`+${Date.now() - started} ms`, JSON.stringify(msg).slice(0, 1500));
-        if (msg.event === 'auth' && msg.success) {
-          for (const topic of ['executionreport', 'position', 'balance']) ws.send(JSON.stringify({ id: `sub-${topic}`, event: 'subscribe', topic }));
-        }
-        if (msg.event === 'auth' && !msg.success) {
-          clearTimeout(done);
-          ws.close();
-          resolve();
-        }
-      });
-      ws.addEventListener('error', (e) => console.log('ws error', e.message ?? ''));
-    });
+    const stream = await privateStream();
+    await sleep(1000 * Number(args.includes('--listen') ? args[args.indexOf('--listen') + 1] : 15));
+    stream.close();
+    break;
+  }
+  case 'funding-check': {
+    // Position pushes come only on a change, so a resting order (placed, then cancelled) makes
+    // Orderly push the position with its accruedFundingFee; then the funding history of the day.
+    const stream = await privateStream();
+    const fut = await http('GET', `${ORDERLY_API}/v1/public/futures/PERP_BTC_USDC`, { quiet: true });
+    show('PERP_BTC_USDC', { last_funding_rate: fut.data.last_funding_rate, sum_unitary_funding: fut.data.sum_unitary_funding });
+    const price = String(Math.floor(Number(fut.data.mark_price) * 0.97));
+    const order = await request(
+      { kind: 'order', symbol: 'PERP_BTC_USDC', side: 'BUY', order_type: 'LIMIT', price, quantity: '0.00017', client_order_id: `c5-${Date.now()}` },
+      'C5 live check: a resting order to make Orderly push the position',
+    );
+    const placed = await sendRest(order);
+    for (let i = 0; i < 20 && !stream.positions.length; i++) await sleep(500);
+    for (const p of stream.positions.at(-1) ?? []) {
+      show('position', { symbol: p.symbol, positionQty: p.positionQty, lastSumUnitaryFunding: p.lastSumUnitaryFunding, accruedFundingFee: p.accruedFundingFee, unsettledPnl: p.unsettledPnl });
+    }
+    if (placed?.data?.order_id) await sendRest(await request({ kind: 'cancel', symbol: 'PERP_BTC_USDC', order_id: placed.data.order_id }, 'C5 live check: cancel'));
+    stream.close();
+    const end = Date.now();
+    await sendRest(await request({ kind: 'funding_fee_history', start_t: end - DAY_MS, end_t: end, page: 1, size: 60 }, 'C5 live check: funding history'));
     break;
   }
   case 'funding': {
