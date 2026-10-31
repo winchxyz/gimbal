@@ -1,0 +1,141 @@
+// The relayer: has the contract sign one action for the desk and delivers it to its venue, confirmed, as TxRef[]
+// (the NEAR signature first, then what the venue's chain recorded). The contract client admits each signature
+// against the operator key's budget and retries an MPC timeout where it can; inputs only the relayer can renew (a
+// Solana message's blockhash) are rebuilt here and signed once more.
+//
+//   Hyperliquid  contract.hl_*        -> POST /exchange, confirmed in userFills / the ledger      (hyperliquid.ts)
+//   Solana       contract.sol_sign*   -> sendTransaction, rebroadcast every 2 s until it lands   (solana.ts)
+//   Orderly      contract.orderly_*   -> REST with the orderly-* headers                         (orderly.ts)
+//   Arbitrum     evm_usdc_to_intents  -> transferWithAuthorization from the gas-only wallet      (arbitrum.ts)
+
+import type { TxRef } from '@gimbal/shared';
+import type { ContractClient, DeskView, HlOrder, HlSignedAction, SignedQuote, SolSignedAction } from '../contract/types.ts';
+import { MpcTimeoutError } from '../contract/types.ts';
+import type { OrderlyRequest, OrderlyRequestKind } from '../venues/orderly-signer.ts';
+import type { ArbitrumSubmitter } from './arbitrum.ts';
+import type { HlSubmitResult, HyperliquidSubmitter } from './hyperliquid.ts';
+import type { OrderlyRestTarget } from './orderly.ts';
+import { sendOrderlyRest } from './orderly.ts';
+import type { SolanaSubmitter } from './solana.ts';
+
+/** A Solana message to sign, built with a fresh blockhash each time it is asked for. */
+export type SolanaMessageBuilder = () => Promise<{ messageB64: string; lastValidBlockHeight?: number }>;
+
+export interface RelayerOptions {
+  contract: ContractClient;
+  deskId: string;
+  hyperliquid?: HyperliquidSubmitter;
+  solana?: SolanaSubmitter;
+  arbitrum?: ArbitrumSubmitter;
+  orderly?: Omit<OrderlyRestTarget, 'deskId'>;
+}
+
+export class Relayer {
+  readonly deskId: string;
+  readonly #contract: ContractClient;
+  readonly #hl: HyperliquidSubmitter | undefined;
+  readonly #sol: SolanaSubmitter | undefined;
+  readonly #arb: ArbitrumSubmitter | undefined;
+  readonly #orderly: OrderlyRestTarget | undefined;
+  #desk: DeskView | null = null;
+
+  constructor(options: RelayerOptions) {
+    this.deskId = options.deskId;
+    this.#contract = options.contract;
+    this.#hl = options.hyperliquid;
+    this.#sol = options.solana;
+    this.#arb = options.arbitrum;
+    this.#orderly = options.orderly === undefined ? undefined : { ...options.orderly, deskId: options.deskId };
+  }
+
+  /** The desk as get_desk returns it, read once; `fresh` reads it again (a pause, a new policy). */
+  async desk(fresh = false): Promise<DeskView> {
+    if (this.#desk === null || fresh) {
+      const d = await this.#contract.getDesk(this.deskId);
+      if (d === null) throw new Error(`relayer: the contract has no desk ${this.deskId}`);
+      this.#desk = d;
+    }
+    return this.#desk;
+  }
+
+  // ---- Hyperliquid ----
+
+  async hlOrder(order: HlOrder, reason: string): Promise<HlSubmitResult> {
+    return this.submitHl(await this.#contract.hlOrder(this.deskId, order, reason));
+  }
+
+  async hlCancel(asset: number, oid: number, reason: string): Promise<HlSubmitResult> {
+    return this.submitHl(await this.#contract.hlCancel(this.deskId, asset, oid, reason));
+  }
+
+  async hlApproveBuilderFee(): Promise<HlSubmitResult> {
+    return this.submitHl(await this.#contract.hlApproveBuilderFee(this.deskId));
+  }
+
+  async hlSetReferrer(): Promise<HlSubmitResult> {
+    return this.submitHl(await this.#contract.hlSetReferrer(this.deskId));
+  }
+
+  async hlUsdClassTransfer(amount: string, toPerp: boolean, reason: string): Promise<HlSubmitResult> {
+    return this.submitHl(await this.#contract.hlUsdClassTransfer(this.deskId, amount, toPerp, reason));
+  }
+
+  async hlSendToIntents(quote: SignedQuote, reason: string): Promise<HlSubmitResult> {
+    return this.submitHl(await this.#contract.hlSendToIntents(this.deskId, quote, reason));
+  }
+
+  async submitHl(signed: HlSignedAction): Promise<HlSubmitResult> {
+    if (this.#hl === undefined) throw new Error('relayer: no Hyperliquid submitter configured');
+    return this.#hl.submit(signed, (await this.desk()).evm_address);
+  }
+
+  // ---- Solana ----
+
+  /** sol_sign over a message `build` makes; after an MPC timeout the blockhash is stale, so it is built again once. */
+  async solSign(build: SolanaMessageBuilder, reason: string): Promise<TxRef[]> {
+    return this.#solana(build, (m) => this.#contract.solSign(this.deskId, m, reason));
+  }
+
+  async solSignRescue(build: SolanaMessageBuilder, quote: SignedQuote, reason: string): Promise<TxRef[]> {
+    return this.#solana(build, (m) => this.#contract.solSignRescue(this.deskId, m, quote, reason));
+  }
+
+  async #solana(build: SolanaMessageBuilder, sign: (messageB64: string) => Promise<SolSignedAction>): Promise<TxRef[]> {
+    if (this.#sol === undefined) throw new Error('relayer: no Solana submitter configured');
+    for (let attempt = 1; ; attempt++) {
+      const message = await build();
+      let signed: SolSignedAction;
+      try {
+        signed = await sign(message.messageB64);
+      } catch (err) {
+        if (attempt < 2 && err instanceof MpcTimeoutError) continue;
+        throw err;
+      }
+      return this.#sol.submit(signed, message.lastValidBlockHeight === undefined ? {} : { lastValidBlockHeight: message.lastValidBlockHeight });
+    }
+  }
+
+  // ---- Orderly ----
+
+  /** One private REST call signed by the contract and sent with Orderly's headers; Orderly's `data` and the NEAR tx. */
+  async orderlyRequest<T = unknown>(kind: OrderlyRequestKind, fields: Partial<OrderlyRequest>, reason: string): Promise<{ data: T; tx: TxRef[] }> {
+    if (this.#orderly === undefined) throw new Error('relayer: no Orderly target configured');
+    const now = this.#orderly.now ?? Date.now;
+    const req: OrderlyRequest = { reduce_only: false, ...fields, kind, timestamp_ms: now() };
+    const signed = await this.#contract.orderlyRequest(this.deskId, req, reason);
+    const data = await sendOrderlyRest<T>(signed, kind, this.#orderly);
+    return { data, tx: signed.nearTx === undefined ? [] : [signed.nearTx] };
+  }
+
+  // ---- Arbitrum and NEAR ----
+
+  async evmUsdcToIntents(quote: SignedQuote, reason: string): Promise<TxRef[]> {
+    if (this.#arb === undefined) throw new Error('relayer: no Arbitrum submitter configured');
+    const signed = await this.#contract.evmUsdcToIntents(this.deskId, quote, reason);
+    return this.#arb.submit(signed, (await this.desk()).evm_address);
+  }
+
+  fundVenue(quote: SignedQuote, reason: string): Promise<TxRef[]> {
+    return this.#contract.fundVenue(this.deskId, quote, reason);
+  }
+}

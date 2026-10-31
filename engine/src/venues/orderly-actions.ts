@@ -14,7 +14,9 @@ import { systemClock } from './venue.ts';
 import type { OrderlyEndpoints, OrderlyNetwork } from './orderly-http.ts';
 import { ORDERLY_ENDPOINTS, normalizeAccountId, readOrderlyData } from './orderly-http.ts';
 import type { OrderlyEip712Action, OrderlyRequest, OrderlyRequestKind, OrderlySigner } from './orderly-signer.ts';
-import { checkEip712Action, checkRestAction, evmSignatureHex, isOrderlyKeyString, orderlyAuthHeaders } from './orderly-signer.ts';
+import { checkEip712Action, evmSignatureHex, isOrderlyKeyString } from './orderly-signer.ts';
+import { MpcTimeoutError } from '../contract/types.ts';
+import { sendOrderlyRest } from '../relayer/orderly.ts';
 
 const DAY_MS = 86_400_000;
 /** Kinds that move money out; request() refuses them so they only run in withdraw()'s settle-first order. */
@@ -106,28 +108,31 @@ export class OrderlyDeskClient {
   async #request<T>(kind: OrderlyRequestKind, fields: Partial<OrderlyRequest>, reason: string): Promise<T> {
     const req: OrderlyRequest = { reduce_only: false, ...fields, kind, timestamp_ms: this.#clock.now() };
     const action = await this.#signer.orderlyRequest(this.deskId, req, reason);
-    checkRestAction(action, kind, this.#clock.now(), this.deskId);
-    const p = action.payload;
-    const method = p.method.toUpperCase();
-    const res = await this.#fetch(`${this.#apiUrl}${p.path}`, {
-      method,
-      headers: {
-        ...orderlyAuthHeaders(action, this.accountId, this.orderlyKey),
-        'content-type': method === 'GET' || method === 'DELETE' ? 'application/x-www-form-urlencoded' : 'application/json',
-      },
-      ...(method === 'GET' || method === 'DELETE' ? {} : { body: p.body }),
-      signal: AbortSignal.timeout(this.#timeoutMs),
+    return sendOrderlyRest<T>(action, kind, {
+      apiUrl: this.#apiUrl, deskId: this.deskId, accountId: this.accountId, orderlyKey: this.orderlyKey,
+      fetch: this.#fetch, now: () => this.#clock.now(), timeoutMs: this.#timeoutMs,
     });
-    return readOrderlyData<T>(res, `${kind} ${method} ${p.path.split('?')[0]}`);
   }
 
   // ---- setup ----
 
-  /** Registers the desk's EVM address with the broker; returns the account id Orderly assigned. */
+  /**
+   * Registers the desk's EVM address with the broker; returns the account id Orderly assigned. A registration nonce
+   * lives 2 min and an MPC signature can take 120 s, so after an MPC timeout it fetches a fresh nonce and signs once more.
+   */
   async register(): Promise<string> {
-    const nonce = await this.#public<{ registration_nonce: string | number }>('GET', '/v1/registration_nonce', undefined, 'registration_nonce');
-    const registrationNonce = String(nonce.registration_nonce);
-    const action = await this.#signer.orderlyRegister(this.deskId, registrationNonce);
+    let action: OrderlyEip712Action;
+    let registrationNonce: string;
+    for (let attempt = 1; ; attempt++) {
+      const nonce = await this.#public<{ registration_nonce: string | number }>('GET', '/v1/registration_nonce', undefined, 'registration_nonce');
+      registrationNonce = String(nonce.registration_nonce);
+      try {
+        action = await this.#signer.orderlyRegister(this.deskId, registrationNonce);
+        break;
+      } catch (err) {
+        if (attempt >= 2 || !(err instanceof MpcTimeoutError)) throw err;
+      }
+    }
     checkEip712Action(action, this.deskId, 'register', { registrationNonce });
     const data = await this.#public<{ account_id: string }>('POST', '/v1/register_account', this.#eip712Body(action), 'register_account');
     const accountId = normalizeAccountId(data.account_id);
