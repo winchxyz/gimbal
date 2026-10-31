@@ -50,11 +50,11 @@ export type RecordSink = LineSink<RecordLine>;
 
 export class RecordingVenue implements VenueReader, FundingHistorySource {
   readonly id: VenueId;
-  readonly #inner: VenueReader & Partial<FundingHistorySource>;
+  readonly #inner: VenueReader;
   readonly #sink: RecordSink;
   readonly #clock: Clock;
 
-  constructor(inner: VenueReader & Partial<FundingHistorySource>, sink: RecordSink, clock: Clock = systemClock) {
+  constructor(inner: VenueReader, sink: RecordSink, clock: Clock = systemClock) {
     this.id = inner.id;
     this.#inner = inner;
     this.#sink = sink;
@@ -78,11 +78,9 @@ export class RecordingVenue implements VenueReader, FundingHistorySource {
     return this.#call('account', [address], () => this.#inner.account(address));
   }
 
-  async userFunding(address: string, startTime: number, endTime?: number): Promise<FundingPayment[]> {
-    const inner = this.#inner;
-    if (inner.userFunding === undefined) throw new Error(`${this.id}: this reader has no userFunding`);
+  userFunding(address: string, startTime: number, endTime?: number): Promise<FundingPayment[]> {
     const args = endTime === undefined ? [address, startTime] : [address, startTime, endTime];
-    return this.#call('userFunding', args, () => inner.userFunding!(address, startTime, endTime));
+    return this.#call('userFunding', args, () => this.#inner.userFunding(address, startTime, endTime));
   }
 
   async #call<T>(method: VenueMethod, args: unknown[], run: () => Promise<T>): Promise<T> {

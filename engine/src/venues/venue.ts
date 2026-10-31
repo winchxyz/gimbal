@@ -74,13 +74,13 @@ export interface FundingPayment {
                                  // payments it sums, 24 for a full day; null on an ordinary hourly row
 }
 
-/** What a reader offers when its venue keeps a per-account funding history (Hyperliquid today). */
+/** A venue's per-account funding history; every VenueReader has one (interfaces section 3). */
 export interface FundingHistorySource {
-  /** Every payment with `startTime <= time <= endTime` (ms; no end = up to now), oldest first. */
+  /** Every payment with `startTime <= time <= endTime` (ms; no end = up to now), oldest first, deduplicated across pages. */
   userFunding(address: string, startTime: number, endTime?: number): Promise<FundingPayment[]>;
 }
 
-export interface VenueReader {
+export interface VenueReader extends FundingHistorySource {
   readonly id: VenueId;
   markets(): Promise<Market[]>;
   funding(): Promise<MarketFunding[]>;

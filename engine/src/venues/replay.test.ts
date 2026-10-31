@@ -143,6 +143,9 @@ class FakeReader implements VenueReader {
   async account(address: string): Promise<AccountState> {
     return { venue: 'hyperliquid', address, time: this.#clock.now(), equityUsd: 1, freeMarginUsd: 1, maintenanceMarginUsd: 0, positions: [] };
   }
+  async userFunding(_address: string, _startTime: number, _endTime?: number): Promise<FundingPayment[]> {
+    return [];
+  }
 }
 
 test('record to .jsonl.gz, then replay gives back exactly what was recorded', async () => {
@@ -251,14 +254,16 @@ test('userFunding is recorded with its window and replayed for the same window o
   assert.equal((await replay.userFunding('0xabc', 1_000))[0]!.fundingUsd, -1);
 });
 
-test('a reader without a funding history cannot be asked for one, and nothing is recorded', async () => {
+test('every reader has a funding history (interfaces 3): an empty one is recorded and replayed as empty', async () => {
   const path = join(dir, 'no-funding.jsonl.gz');
   const clock = new VirtualClock(T0);
   const writer = new JsonlGzWriter(path);
   const rec = new RecordingVenue(new FakeReader(clock), writer, clock);
-  await assert.rejects(rec.userFunding('0xabc', 0), /no userFunding/);
+  assert.deepEqual(await rec.userFunding('0xabc', 0), []);
   await writer.close();
-  assert.equal(writer.lines, 0);
+  assert.equal(writer.lines, 1);
+  const replay = new ReplayVenue(readRecording(path), clock);
+  assert.deepEqual(await replay.userFunding('0xabc', 0), []);
 });
 
 test('raw exchanges are recorded with their status, then served back by request, key order ignored', async () => {
