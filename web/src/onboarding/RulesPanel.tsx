@@ -14,6 +14,9 @@ interface Props {
   steps: StepView[];
 }
 
+/** The longest text POST /policy/draft takes (the engine answers 400 above it): a few sentences, not a document. */
+const MAX_WORDS = 2_000;
+
 const EXAMPLE = 'For example: steady income, only big coins, never more than $1,000 a side, money only comes back to me.';
 
 /** The second number of a row that holds two (price band and oracle age are rows of their own). */
@@ -300,6 +303,7 @@ export function RulesPanel({ flow, s, steps }: Props) {
             value={r.words}
             placeholder={EXAMPLE}
             rows={9}
+            maxLength={MAX_WORDS}
             onChange={(e) => flow.setWords(e.target.value)}
           />
           <p className="ob-row">
