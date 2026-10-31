@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
-import type { ExchangeMarketConfig, FundingOverviewResponse, TraderStateSnapshotResponse } from '@ellipsis-labs/rise';
+import type { ExchangeMarketConfig, FundingOverviewResponse, LatestMarketsStatsResponse, TraderStateSnapshotResponse } from '@ellipsis-labs/rise';
 import { FetchTransport, PhoenixReader, parseAccount, parseFunding } from './phoenix.ts';
 import type { PhoenixPosition } from './phoenix.ts';
 import type { WireLine } from './recorder.ts';
@@ -77,8 +77,13 @@ test('funding: fundingAmountPerUnit / markPrice of the last booked hour, never t
   const sol = funding.find((f) => f.symbol === 'SOL')!;
   assert.equal(sol.ratePerHour, Number(solPoint.fundingAmountPerUnit) / Number(solPoint.markPrice));
   assert.ok(Math.abs(sol.ratePerHour - 0.0000207533) < 1e-10);
-  // The API's own fundingRate field is on another scale (it is not the hourly fraction).
-  assert.notEqual(Number(solPoint.fundingRate), sol.ratePerHour);
+  // The API's own fundingRate field plays no part: the same answer with every fundingRate rewritten prices the same.
+  const stats = response<LatestMarketsStatsResponse>('/v1/markets/stats/latest');
+  const configs = response<ExchangeMarketConfig[]>('/v1/view/exchange/markets');
+  const rewritten: FundingOverviewResponse = {
+    series: overview.series.map((s) => ({ ...s, points: s.points.map((p) => ({ ...p, fundingRate: '0.5' })) })),
+  };
+  assert.deepEqual(parseFunding(rewritten, stats, configs, AT), parseFunding(overview, stats, configs, AT));
   assert.equal(sol.settlement, 'daily');
   assert.equal(sol.nextAt, Date.UTC(2026, 9, 31, 1));               // the next full hour after the capture
   assert.equal(sol.markPx, 96.3);
@@ -105,6 +110,41 @@ test('funding leaves out markets that are not active and markets with no booked 
   assert.equal(active.length, 1);
   assert.equal(active[0]!.ratePerHour, 0.0001);
   assert.equal(active[0]!.markPx, null);
+});
+
+test('funding leaves out a market whose last booking is more than two hourly intervals old (stale)', () => {
+  const configs = response<ExchangeMarketConfig[]>('/v1/view/exchange/markets');
+  const sol = configs.find((c) => c.symbol === 'SOL')!;
+  assert.equal(sol.fundingIntervalSeconds, 3600);
+  const booked = Date.UTC(2026, 9, 31, 0) / 1000;              // seconds, as the overview gives it
+  const overview: FundingOverviewResponse = {
+    series: [{ marketId: 1, symbol: 'SOL', points: [{ timestamp: booked, fundingAmountPerUnit: '0.01', markPrice: '100', fundingRate: '0' }] }],
+  };
+  const at = (h: number, m = 0, s = 0) => parseFunding(overview, { markets: [] }, [sol], Date.UTC(2026, 9, 31, h, m, s));
+  assert.deepEqual(at(0, 37).map((f) => [f.ratePerHour, f.nextAt]), [[0.0001, Date.UTC(2026, 9, 31, 1)]]);
+  assert.equal(at(2).length, 1, 'two intervals old: still the last booking');
+  assert.deepEqual(at(2, 0, 1), [], 'over two intervals: stale, left out');
+});
+
+test('userFunding keeps two real rows of one hour on one page, and drops only rows a later page repeats', async () => {
+  const event = (size: string, payment: string) => ({
+    timestamp: '2026-10-31T00:00:00Z', symbol: 'SOL', fundingPayment: payment, fundingRatePercentage: '0.002', positionSize: size, positionSide: 'Short',
+  });
+  // Cross and isolated subaccounts both short SOL at 00:00: two rows, same time and symbol.
+  const pages: Record<string, unknown> = {
+    first: { events: [event('-10', '0.02'), event('-5', '0.01')], prevCursor: null, nextCursor: 'second', hasMore: true },
+    second: { events: [event('-5', '0.01'), { ...event('-10', '0.02'), timestamp: '2026-10-30T23:00:00Z' }], prevCursor: 'first', nextCursor: null, hasMore: false },
+  };
+  const f = (async (input: string | URL | Request) => {
+    const cursor = new URL(String(input)).searchParams.get('cursor') ?? 'first';
+    return new Response(JSON.stringify(pages[cursor]), { headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  const rows = await new PhoenixReader({ fetch: f, clock: new VirtualClock(AT) }).userFunding(AUTHORITY, Date.UTC(2026, 9, 30));
+  assert.deepEqual(rows.map((r) => [new Date(r.time).toISOString(), r.size, r.fundingUsd]), [
+    ['2026-10-30T23:00:00.000Z', -10, 0.02],
+    ['2026-10-31T00:00:00.000Z', -10, 0.02],
+    ['2026-10-31T00:00:00.000Z', -5, 0.01],
+  ]);
 });
 
 test('book: USD prices and base sizes, best first, stamped with the arrival time; unknown symbols say so', async () => {

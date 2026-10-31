@@ -82,7 +82,8 @@ export class PhoenixReader implements VenueReader, FundingHistorySource {
 
   /**
    * The rate of the last hour each market booked (Phoenix publishes no forward estimate that matches what it
-   * books), priced as fundingAmountPerUnit / markPrice of that hour. Markets that are not active are left out.
+   * books), priced as fundingAmountPerUnit / markPrice of that hour. Markets that are not active, and markets whose
+   * last booking is more than two funding intervals old (stale), are left out.
    */
   async funding(): Promise<MarketFunding[]> {
     const c = this.#api();
@@ -133,7 +134,10 @@ export class PhoenixReader implements VenueReader, FundingHistorySource {
     }
     const c = this.#api();
     const out: FundingPayment[] = [];
-    const seen = new Set<string>();
+    // Cursor pages do not overlap; this only guards against a page repeating rows of an earlier page, keyed on the
+    // whole raw row. Rows within one page are never merged: two real rows of one hour (cross and isolated
+    // subaccounts) both count.
+    const earlier = new Set<string>();
     let cursor: string | undefined;
     for (let page = 0; ; page++) {
       if (page >= FUNDING_MAX_PAGES) throw new Error(`phoenix userFunding: still more events after ${FUNDING_MAX_PAGES} pages`);
@@ -141,15 +145,17 @@ export class PhoenixReader implements VenueReader, FundingHistorySource {
         pdaIndex: this.#traderPdaIndex, limit: FUNDING_PAGE_ROWS, ...(cursor === undefined ? {} : { cursor }),
       });
       let oldest = Infinity;
+      const keys: string[] = [];
       for (const event of res.events) {
         const row = parseFundingEvent(event);
         oldest = Math.min(oldest, row.time);
+        const key = JSON.stringify([event.timestamp, event.symbol, event.fundingPayment, event.fundingRatePercentage, event.positionSize, event.positionSide]);
+        keys.push(key);
+        if (earlier.has(key)) continue;
         if (row.time < startTime || (endTime !== undefined && row.time > endTime)) continue;
-        const key = `${row.time}:${row.symbol}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
         out.push(row);
       }
+      for (const key of keys) earlier.add(key);
       if (!res.hasMore || res.nextCursor === null || res.events.length === 0 || oldest < startTime) break;
       if (res.nextCursor === cursor) throw new Error('phoenix userFunding: the cursor did not advance');
       cursor = res.nextCursor;
@@ -286,6 +292,9 @@ export function parseFunding(
     if (point === undefined) continue;
     const intervalMs = config.fundingIntervalSeconds * 1000;
     if (!(intervalMs > 0)) throw new Error(`phoenix ${series.symbol}: funding interval ${config.fundingIntervalSeconds} s`);
+    // A last booking more than two intervals old is not the current rate: left out (stale), never shown as current
+    // with a fresh nextAt.
+    if (now - phoenixTimeMs(point.timestamp) > 2 * intervalMs) continue;
     const s = statsBySymbol.get(series.symbol);
     out.push({
       venue: 'phoenix',
