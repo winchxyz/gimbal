@@ -68,7 +68,7 @@ export class FakeWorld {
   readonly contractId: string;
   readonly usdcToken: string;
   readonly account: string;
-  readonly mpc = 'v1.signer-prod.testnet';
+  readonly mpc: string;
 
   readonly desks = new Map<string, FakeDesk>();
   readonly keys = new Map<string, AccessKeyInfo[]>();
@@ -119,10 +119,28 @@ export class FakeWorld {
     this.contractId = options.contractId ?? 'gimbal-c6-fcf135.testnet';
     this.usdcToken = options.usdcToken ?? 'usdc.fakes.testnet';
     this.account = options.account ?? 'demo-owner.testnet';
+    this.mpc = this.network === 'mainnet' ? 'v1.signer' : 'v1.signer-prod.testnet';
     this.wallet = this.makeWallet();
   }
 
   // ---- contract rules, as the contract applies them ----
+
+  /** `config()` as the contract returns it (docs/interfaces.md §1.1): onboarding reads two fields, the Security screen all. */
+  private configJson(): unknown {
+    const mainnet = this.network === 'mainnet';
+    return {
+      network: mainnet ? 'Mainnet' : 'Testnet',
+      mpc: this.mpc,
+      price_source: mainnet ? { OutLayer: { contract: 'price-oracle.near' } } : 'Mock',
+      treasury: {
+        near: mainnet ? 'treasury.fakes.near' : 'treasury.fakes.testnet',
+        hl_builder: `0x${'0'.repeat(36)}b1de`,
+        referral_codes: { hyperliquid: null, orderly: null, phoenix: null },
+      },
+      fees: { performance_bps: 1000, hl_builder_tenth_bps: 10 },
+      orderly: { broker_id: mainnet ? 'gimbal_dex' : 'woofi_dex', chain_id: mainnet ? 42161 : 421614 },
+    };
+  }
 
   private derived(deskId: string) {
     return addressesFrom(fakeSecp256k1(evmPath(deskId)), fakeEd25519(solPath(deskId)));
@@ -259,7 +277,7 @@ export class FakeWorld {
       }
       if (contract === this.usdcToken && method === 'ft_balance_of') return (this.tokens.get(String(a.account_id)) ?? 0n).toString();
       if (contract !== this.contractId) throw new Error(`${contract}: no such account`);
-      if (method === 'config') return { network: this.network === 'mainnet' ? 'Mainnet' : 'Testnet', mpc: this.mpc };
+      if (method === 'config') return this.configJson();
       if (method === 'desks_of') return [...this.desks].filter(([, d]) => d.owner === a.owner).map(([id]) => id);
       if (method === 'get_desk') {
         const d = this.desks.get(String(a.desk_id));

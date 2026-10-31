@@ -1,5 +1,9 @@
-import { defineConfig, type ProxyOptions } from 'vite';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { defineConfig, type Plugin, type ProxyOptions } from 'vite';
 import react from '@vitejs/plugin-react';
+import { REFUSAL_CODES } from './src/security/refusals.ts';
+import { findRefusalTests, readContractSources } from './src/security/scan.ts';
 
 // The engine's HTTP API (docs/interfaces.md §2). The dashboard talks to it through this proxy, in development and
 // in `vite preview` alike, so the browser only ever sees one origin.
@@ -44,8 +48,19 @@ const proxy = (): Record<string, ProxyOptions> =>
     ]),
   );
 
+// The Security screen links every refusal code to the contract tests that assert it. The lines are read from
+// `contract/` when the page is built (or the dev server starts), so a link never points at a line that moved.
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
+const REFUSAL_TESTS = 'virtual:refusal-tests';
+const refusalTests = (): Plugin => ({
+  name: 'gimbal-refusal-tests',
+  resolveId: (id) => (id === REFUSAL_TESTS ? `\0${REFUSAL_TESTS}` : null),
+  load: (id) =>
+    id === `\0${REFUSAL_TESTS}` ? `export default ${JSON.stringify(findRefusalTests(readContractSources(repoRoot), REFUSAL_CODES))};` : null,
+});
+
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), refusalTests()],
   server: {
     port: 5190,
     strictPort: true,
