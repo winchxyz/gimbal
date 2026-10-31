@@ -53,7 +53,7 @@ and the owner passes them to `create_desk`. The contract checks them: `create_de
 address and the Solana authority match; otherwise it refunds the whole deposit, stores nothing and ends the
 transaction as a refusal (`E_MPC`, `E_ARGS`, `E_DESK_EXISTS` or `E_DEPOSIT`). Attach about **100 TGas**: the
 call and its callback burn ~18 TGas (measured on testnet 2026-10-30), and `create_desk` refuses less than its
-floor (2 × the MPC derive gas + the callback gas + its own cost, 56 TGas) with `E_ARGS`. The transaction's result
+floor (2 × the MPC derive gas + the callback gas + its own cost: 2 × 15 + 20 + 14 = 64 TGas, the last an estimate from a unit test) with `E_ARGS`. The transaction's result
 is the callback's. Desk ids are global, so another owner can take an id between the call and its callback: after
 `create_desk` a client reads `get_desk(desk_id)` and checks that `owner` is its own account before it funds the
 desk's addresses.
@@ -141,8 +141,11 @@ every owner call; more would stay in the contract and is refused (`E_DEPOSIT`).
 
 **Paused desks.** While a desk is paused every operator action method refuses `E_PAUSED`, except actions that
 only reduce risk, which `panic_close` and a rescue rely on: reduce-only orders (`hl_order` / an `orderly_request`
-order with `reduce_only: true`, Phoenix closes through `sol_sign` as the Solana parser decides, day 4), cancels,
-and rescue transfers (`fund_venue`, `hl_send_to_intents`, `sol_sign_rescue`, within `rescue_cap_usd_per_hour`).
+order with `reduce_only: true`), cancels, and rescue transfers (`fund_venue`, `hl_send_to_intents`,
+`sol_sign_rescue`, within `rescue_cap_usd_per_hour`). On Solana a paused desk's `sol_sign` accepts only, besides
+the compute budget: Phoenix `cancel_all`, reduce-only Phoenix orders, a token `Revoke` of a desk token account and a
+`Transfer` / `TransferChecked` into a desk token account; deposits, withdrawals, Ember, ATA creates and Approves
+need a running desk.
 `set_policy` and `set_operator` work on a paused desk.
 
 Mutating methods use `#[deny_unknown_arguments]`, so a misspelt argument is refused instead of read as `None`.
@@ -179,8 +182,8 @@ chooses nothing:
 | `hl_cancel(desk_id, asset: u32, oid: u64, reason)` | ✓ | ✓ | L1 action `{type:"cancel", cancels:[{a, o}]}`; passes a paused desk, so a pause can stop resting orders |
 | `hl_usd_class_transfer(desk_id, amount, to_perp, reason)` | ✓ | ✓ | |
 | `hl_send_to_intents(desk_id, quote, quote_signature, reason)` | ✓ | ✓ | rescue out of Hyperliquid |
-| `sol_sign(desk_id, message_b64, reason)` | ✓ | ✓ | Phoenix / Ember / own transfers |
-| `sol_sign_register(desk_id, message_b64)` | ✓ | ✓ | Phoenix onboarding only, two shapes: registration (`register_trader` + `set_trader_capabilities_delegated`) and referral activation (`set_trader_capabilities_delegated` alone); legacy or v0 with no address-table lookups; two signers, keys[0] = the desk as fee payer and Phoenix's pinned onboarder (the desk authority itself is not a signer of `register_trader`); accounts are checked through each instruction's positions, instruction data is pinned |
+| `sol_sign(desk_id, message_b64, reason)` | ✓ | ✓ | Phoenix / Ember / own transfers, legacy messages, one signer (the desk). Every Phoenix and Ember instruction has an exact account list with its fixed accounts pinned: an order or cancel has 10 accounts, the orderbook at [8] (a policy market) and its spline PDA `["spline", book]` at [9]; deposit 10, withdraw 12, Ember wrap / unwrap 8. A token Approve only on the desk PhUSD account to Ember, for exactly the amount an unwrap after it takes. A compute-unit price needs a unit limit; priority fee ≤ 600,000 lamports. A message of compute budget only is refused |
+| `sol_sign_register(desk_id, message_b64)` | ✓ | ✓ | Phoenix onboarding only, two shapes: registration (`register_trader` + `set_trader_capabilities_delegated`) and referral activation (`set_trader_capabilities_delegated` alone); registration is a legacy message, referral activation a v0 message with no address-table lookups (the other format → `E_SOL_MESSAGE`); two signers, keys[0] = the desk as fee payer and Phoenix's pinned onboarder (the desk authority itself is not a signer of `register_trader`); accounts are checked through each instruction's positions, instruction data is pinned |
 | `sol_sign_rescue(desk_id, message_b64, quote, quote_signature, reason)` | ✓ | ✓ | rescue out of Solana |
 | `orderly_register(desk_id, registration_nonce)` | ✓ | ✓ | EIP-712 `Registration` (nonce from `GET /v1/registration_nonce`, block time as timestamp, broker and chain from `OrderlyConfig`) |
 | `orderly_add_key(desk_id, expiration_ms)` | ✓ | ✓ | EIP-712 `AddOrderlyKey`: the desk's Ed25519 MPC key as orderly key, scope `read,trading`, ≤ 365 days |
@@ -284,9 +287,9 @@ near-sdk before the method runs ("Failed to deserialize input from JSON"); clien
 | `E_QUOTE_SIGNATURE` | 1Click quote signature does not verify |
 | `E_QUOTE_FIELDS` | quote recipient / refundTo / assets / deadline not acceptable |
 | `E_RESCUE_CAP` | over `rescue_cap_usd_per_hour` |
-| `E_SOL_MESSAGE` | not a legacy message, trailing bytes, wrong signer count or fee payer |
-| `E_SOL_PROGRAM` | instruction for a program outside the allowlist |
-| `E_SOL_ACCOUNT` | instruction touches an account the desk does not own |
+| `E_SOL_MESSAGE` | not the accepted message format (legacy; v0 without lookups only for referral activation), trailing bytes, wrong signer count or fee payer, no instruction besides the compute budget |
+| `E_SOL_PROGRAM` | instruction for a program outside the allowlist, or instruction data not accepted (extra bytes, an Approve without its matching unwrap, a priority fee without a unit limit or over the cap; changed registration arguments are `E_ARGS`). The code for each case is pinned in `contract/core/tests/vectors/solana*.json` |
+| `E_SOL_ACCOUNT` | wrong account count, or an account that is not the pinned one or the desk's own at its position |
 | `E_MPC` | the MPC network did not return a signature |
 
 ### 1.6 Events (NEP-297)
@@ -329,12 +332,16 @@ export interface Window {
   grossAprPct: number;
   grossApr7dPct: number | null;   // over the last 7 days; null until the history is loaded
   costs: { feesPct: number; slippagePct: number; basisPct: number; rescueReservePct: number };
+                                  // feesPct: venue fees on four fills plus the 1Click fees to move both legs' margin
+                                  // in and out while the desk holds none there; basisPct includes the timing loss
+                                  // when the legs settle on different schedules
   netAprPct: number; usdPerDayPer1k: number; breakevenHours: number; depthUsd: number;
   intervalsAbove: number; updatedAt: number;
-  tradable: boolean;              // both legs are VenueIds, so a desk could trade it; false = watch only
+  tradable: boolean;              // both legs are VenueIds, so a desk could trade it; false = watch only. Structural
+                                  // only: policy, oracle and desk reasons go in `refused`, never here
   veto?: { verdict: 'pass' | 'veto'; reasons: string[]; model: string; at: number };   // NEAR AI, can only refuse
-  refused?: { code: string; reason: string };   // tradable, but the contract would refuse it under the current
-                                                // policy (E_* code), e.g. no oracle price and not in policy.unpriced
+  refused?: { code: string; reason: string };   // tradable, but it cannot be entered now: the contract would refuse
+                                                // it (E_ORACLE_STALE, E_ASSET, E_SIZE) or no desk exists (E_NO_DESK)
   held: { since: number } | null;   // the desk holds this window now
   checks: { ok: boolean; text: string }[];   // what the engine checked (policy, oracle, rescue path), one line
                                              // each, engine-written; the first failing one is why it is not entered
@@ -485,12 +492,12 @@ export interface EngineState {
 }
 ```
 
-HTTP (engine, port 8790): `GET /events` (SSE, one `StreamEvent` per message), `GET /state` (`EngineState`),
+HTTP (engine, `127.0.0.1:8790`; it refuses a Host other than localhost and a foreign Origin, and POST / PUT bodies must be `application/json`): `GET /events` (SSE, one `StreamEvent` per message), `GET /state` (`EngineState`),
 `GET /windows/history?id=<window id>` (`WindowHistory`, for the Windows chart; kept out of the stream because
 it is 168 points per window), `POST /stress` (testnet and replay only: tighten the margin threshold to force a rescue; 1Click has
 no testnet, so on testnet the rescue's 1Click steps are replayed from recorded mainnet responses),
 `GET /journal?before=<id>` (`JournalEntry[]`: up to 100 entries older than that id, newest first; `[]` past the
-oldest), `POST /policy/draft` `{ text }` → `PolicyDraft` (NEAR AI; nothing is applied until the owner signs `set_policy`
+oldest or for an id the engine no longer holds), `POST /policy/draft` `{ text }` → `PolicyDraft` (NEAR AI; nothing is applied until the owner signs `set_policy`
 and confirms the engine rules), `GET` / `PUT /strategy` (`StrategyConfig`), `POST /setup` `{ deskId }` (starts
 venue setup; progress arrives as `setup` events), `POST /rotate` `{ windowId }` (manual override: close the held
 window and open this one, with the same checks as auto; refused with the reason when a check fails) and

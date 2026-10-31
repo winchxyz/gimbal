@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::decimal::{format_e8, parse_e8};
 use crate::eip712::{self, Field, Keccak};
 use crate::errors::{shown, Refusal, E_ARGS, E_ASSET, E_DECIMAL, E_SIZE};
+use crate::limits;
 use crate::msgpack::Value;
 use crate::network::Network;
 use crate::policy::Policy;
@@ -194,19 +195,29 @@ impl OrderWire {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckedOrder {
     pub wire: OrderWire,
-    /// The policy's symbol for the asset (the oracle price is looked up by it, day 6).
+    /// The policy's symbol for the asset; the reference price is the oracle price of it.
     pub symbol: String,
     pub px_e8: u128,
     pub sz_e8: u128,
-    /// In `policy.unpriced`: no price band, and the smaller notional cap applied.
+    /// The oracle price the order was checked against; `None` for a symbol in `policy.unpriced`.
+    pub oracle_e8: Option<u128>,
+    /// In `policy.unpriced`: no price band, and capped by its `max_sz` and the smaller notional cap.
     pub unpriced: bool,
 }
 
-/// The order checks that need no oracle, in this order: the asset is in the policy (`E_ASSET`); tif
-/// and cloid (`E_ARGS`); px and sz strings (`E_DECIMAL`, a zero size `E_SIZE`); notional px × sz
-/// within `max_notional_usd`, or for an `unpriced` symbol within
-/// min(`max_notional_usd`, `unpriced_max_notional_usd`) (`E_SIZE`). The price band joins on day 6.
-pub fn check_order(policy: &Policy, order: &HlOrder) -> Result<CheckedOrder, Refusal> {
+/// The order checks, in this order: the asset is in the policy (`E_ASSET`); tif and cloid
+/// (`E_ARGS`); px and sz strings (`E_DECIMAL`, a zero size `E_SIZE`); then
+/// [`limits::check_value`]: an unpriced symbol within its `max_sz` and the unpriced cap at its own
+/// price, any other symbol a reference price (`E_ORACLE_STALE`), the band around it
+/// (`E_PRICE_BAND`) and `sz × max(px, reference)` within `max_notional_usd` (`E_SIZE`).
+///
+/// `reference_e8` is the symbol's oracle price if it is fresh, else `None` (the contract passes
+/// `None` until it stores prices, C6).
+pub fn check_order(
+    policy: &Policy,
+    order: &HlOrder,
+    reference_e8: Option<u128>,
+) -> Result<CheckedOrder, Refusal> {
     let asset = policy
         .hl_assets
         .iter()
@@ -223,37 +234,14 @@ pub fn check_order(policy: &Policy, order: &HlOrder) -> Result<CheckedOrder, Ref
     let wire = OrderWire::from_order(order)?;
     let px_e8 = check_px(&order.px, asset.sz_decimals)?;
     let sz_e8 = check_sz(&order.sz, asset.sz_decimals)?;
-    let unpriced = policy.unpriced.contains(&asset.symbol);
-    let (cap, cap_name) = if unpriced {
-        (
-            policy.unpriced_cap_usd(),
-            "the unpriced cap, min(max_notional_usd, unpriced_max_notional_usd)",
-        )
-    } else {
-        (policy.max_notional_usd, "max_notional_usd")
-    };
-    // px × sz in units of 1e-16 USD; an overflow is far over any cap.
-    let notional = px_e8.checked_mul(sz_e8);
-    let cap_e16 = u128::from(cap) * 10u128.pow(16);
-    if notional.is_none_or(|n| n > cap_e16) {
-        let shown_notional = notional.map_or_else(
-            || "more than 2^128 / 1e16".to_string(),
-            |n| format_e8(n / 100_000_000),
-        );
-        return Err(Refusal::new(
-            E_SIZE,
-            format!(
-                "{} {} x {} = {shown_notional} USD is over {cap_name} {cap}",
-                asset.symbol, order.px, order.sz
-            ),
-        ));
-    }
+    let valued = limits::check_value(policy, &asset.symbol, px_e8, sz_e8, reference_e8)?;
     Ok(CheckedOrder {
         wire,
         symbol: asset.symbol.clone(),
         px_e8,
         sz_e8,
-        unpriced,
+        oracle_e8: valued.oracle_e8,
+        unpriced: valued.unpriced(),
     })
 }
 
@@ -673,7 +661,8 @@ pub fn max_fee_rate(fee_tenth_bps: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::HlAsset;
+    use crate::errors::{E_ORACLE_STALE, E_PRICE_BAND};
+    use crate::policy::{HlAsset, UnpricedAsset};
 
     fn policy() -> Policy {
         Policy {
@@ -697,10 +686,16 @@ mod tests {
             rescue_cap_usd_per_hour: 0,
             max_transfer_cost_bps: 0,
             max_transfer_cost_flat_e6: 0,
-            unpriced: vec!["HYPE".into()],
+            unpriced: vec![UnpricedAsset {
+                symbol: "HYPE".into(),
+                max_sz: "3".into(),
+            }],
             unpriced_max_notional_usd: 100,
         }
     }
+
+    /// ETH's oracle price in these tests: 2500 USD.
+    const ETH_E8: Option<u128> = Some(250_000_000_000);
 
     fn order(asset: u32, px: &str, sz: &str) -> HlOrder {
         HlOrder {
@@ -720,25 +715,59 @@ mod tests {
 
     #[test]
     fn notional_cap_messages_name_the_cap() {
-        let r = refused(check_order(&policy(), &order(1, "2500", "0.4001")));
+        let r = refused(check_order(&policy(), &order(1, "2500", "0.4001"), ETH_E8));
         assert_eq!(r.code, E_SIZE);
         assert_eq!(
             r.msg,
             "ETH 2500 x 0.4001 = 1000.25 USD is over max_notional_usd 1000"
         );
-        let r = refused(check_order(&policy(), &order(159, "50", "3")));
+        let r = refused(check_order(&policy(), &order(159, "50", "3"), None));
         assert_eq!(
             r.to_string(),
             "E_SIZE: HYPE 50 x 3 = 150 USD is over the unpriced cap, min(max_notional_usd, unpriced_max_notional_usd) 100"
         );
         let mut p = policy();
         p.max_notional_usd = 50;
-        let r = refused(check_order(&p, &order(159, "39.9", "2.5")));
+        let r = refused(check_order(&p, &order(159, "39.9", "2.5"), None));
         assert!(r.msg.ends_with("unpriced_max_notional_usd) 50"), "{r}");
         p.max_notional_usd = 0;
         assert_eq!(
-            refused(check_order(&p, &order(1, "1", "0.0001"))).code,
+            refused(check_order(&p, &order(1, "2500", "0.0001"), ETH_E8)).code,
             E_SIZE
+        );
+    }
+
+    /// The review of C3: `px:"1", sz:"1000"` on ETH fit a 1000 USD cap when a sell was valued at
+    /// its own limit price.
+    #[test]
+    fn a_sell_at_a_tiny_limit_price_is_valued_at_the_oracle() {
+        let mut sell = order(1, "1", "1000");
+        sell.is_buy = false;
+        assert_eq!(
+            refused(check_order(&policy(), &sell, ETH_E8)).code,
+            E_PRICE_BAND
+        );
+        let mut wide = policy();
+        wide.price_band_bps = 10_000;
+        let r = refused(check_order(&wide, &sell, ETH_E8));
+        assert_eq!(
+            r.to_string(),
+            "E_SIZE: ETH 2500 (the oracle price, above the limit 1) x 1000 = 2500000 USD is over max_notional_usd 1000"
+        );
+        // A sell that fits at the oracle price passes, whatever its limit.
+        sell.sz = "0.4".into();
+        check_order(&wide, &sell, ETH_E8).unwrap();
+    }
+
+    #[test]
+    fn a_priced_asset_without_a_fresh_oracle_price_is_refused() {
+        let r = refused(check_order(&policy(), &order(1, "2500", "0.1"), None));
+        assert_eq!(r.code, E_ORACLE_STALE);
+        // An unpriced symbol needs none: its size is capped in base units instead.
+        let r = refused(check_order(&policy(), &order(159, "1", "3.01"), None));
+        assert_eq!(
+            r.to_string(),
+            "E_SIZE: HYPE size 3.01 is over its max_sz 3 (an unpriced symbol, capped in base units)"
         );
     }
 
@@ -746,9 +775,11 @@ mod tests {
     fn a_notional_past_u128_is_over_any_cap() {
         let mut p = policy();
         p.max_notional_usd = crate::policy::MAX_SAFE_INTEGER;
+        p.price_band_bps = 10_000;
         p.hl_assets[0].sz_decimals = 0;
         let huge = "3".repeat(30);
-        let r = refused(check_order(&p, &order(1, &huge, &huge)));
+        let reference = Some(parse_e8(&huge).unwrap());
+        let r = refused(check_order(&p, &order(1, &huge, &huge), reference));
         assert_eq!(r.code, E_SIZE);
         assert!(r.msg.contains("more than 2^128 / 1e16"), "{r}");
     }
@@ -758,32 +789,45 @@ mod tests {
         // An asset outside the policy is refused before its malformed strings are looked at.
         let mut o = order(7, "x", "0");
         o.tif = "ioc".into();
-        assert_eq!(refused(check_order(&policy(), &o)).code, E_ASSET);
+        assert_eq!(refused(check_order(&policy(), &o, ETH_E8)).code, E_ASSET);
         o.asset = 1;
-        assert_eq!(refused(check_order(&policy(), &o)).code, E_ARGS);
+        assert_eq!(refused(check_order(&policy(), &o, ETH_E8)).code, E_ARGS);
         o.tif = "Ioc".into();
-        assert_eq!(refused(check_order(&policy(), &o)).code, E_DECIMAL);
+        assert_eq!(refused(check_order(&policy(), &o, ETH_E8)).code, E_DECIMAL);
         o.px = "2500".into();
-        assert_eq!(refused(check_order(&policy(), &o)).code, E_SIZE);
+        assert_eq!(refused(check_order(&policy(), &o, ETH_E8)).code, E_SIZE);
+        // A size of its own is checked before the oracle.
+        assert_eq!(refused(check_order(&policy(), &o, None)).code, E_SIZE);
+        o.sz = "1".into();
+        assert_eq!(
+            refused(check_order(&policy(), &o, None)).code,
+            E_ORACLE_STALE
+        );
+        o.px = "3000".into();
+        assert_eq!(
+            refused(check_order(&policy(), &o, ETH_E8)).code,
+            E_PRICE_BAND
+        );
+        o.px = "2500".into();
+        assert_eq!(refused(check_order(&policy(), &o, ETH_E8)).code, E_SIZE);
     }
 
     #[test]
     fn a_checked_order_carries_its_units_and_wire_form() {
         let mut o = order(1, "2500.5", "0.1");
         o.cloid = Some("0xABCDEF0123456789ABCDEF0123456789".into());
-        let c = check_order(&policy(), &o).unwrap();
+        let c = check_order(&policy(), &o, ETH_E8).unwrap();
         assert_eq!((c.px_e8, c.sz_e8), (250_050_000_000, 10_000_000));
         assert_eq!(c.symbol, "ETH");
+        assert_eq!(c.oracle_e8, ETH_E8);
         assert!(!c.unpriced);
         assert_eq!(
             c.wire.cloid.unwrap().to_hex(),
             "0xabcdef0123456789abcdef0123456789"
         );
-        assert!(
-            check_order(&policy(), &order(159, "39.9", "2.5"))
-                .unwrap()
-                .unpriced
-        );
+        let hype = check_order(&policy(), &order(159, "39.9", "2.5"), None).unwrap();
+        assert!(hype.unpriced);
+        assert_eq!(hype.oracle_e8, None);
     }
 
     #[test]

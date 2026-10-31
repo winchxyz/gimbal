@@ -4,7 +4,10 @@
 use gimbal_core::errors::{Refusal, E_ARGS, E_NOT_ALLOWED, E_PAUSED};
 use gimbal_core::ids::check_base58_32;
 use gimbal_core::policy::Policy;
+use gimbal_core::solana::{b58, SolDesk};
 use near_sdk::{env, near, serde_json, AccountId};
+
+use crate::sol::sha256;
 
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18,14 +21,12 @@ pub struct Desk {
     /// Hyperliquid master, Orderly account owner and EIP-3009 `from`: the MPC secp256k1 key at
     /// `gimbal/<desk_id>/evm`, lowercase `0x` address. Never changes.
     pub evm_address: String,
-    /// Registered by the owner; the Solana programs enforce them.
+    /// Registered by the owner and checked against the authority's derived accounts; the Solana
+    /// methods derive them again and never read the stored ones.
     pub solana: SolanaAccounts,
     /// The Orderly account's exclusive receiver address on Arbitrum, pinned once by the owner.
     pub orderly_receiver: Option<String>,
     pub ledger: Ledger,
-    /// The last nonce the desk's master address was given to sign on Hyperliquid (ms); the next one
-    /// is `max(block_ms, hl_last_nonce + 1)`. Part of the desk, so `create_desk` pays its storage.
-    pub hl_last_nonce: u64,
 }
 
 /// The desk's Solana accounts, base58. `authority` is the MPC Ed25519 key at `gimbal/<desk_id>/sol`,
@@ -103,14 +104,7 @@ impl Desk {
             solana,
             orderly_receiver: None,
             ledger: Ledger::default(),
-            hl_last_nonce: 0,
         }
-    }
-
-    /// The desk's next Hyperliquid nonce, which it records as used.
-    pub fn take_hl_nonce(&mut self, block_ms: u64) -> u64 {
-        self.hl_last_nonce = gimbal_core::hl::next_nonce(block_ms, self.hl_last_nonce);
-        self.hl_last_nonce
     }
 
     /// The caller's role, if any. An operator set to the owner's own account stays the owner.
@@ -192,27 +186,39 @@ impl Desk {
 }
 
 impl SolanaAccounts {
-    /// Each field a base58 address of 32 bytes, and the four of them different accounts.
-    pub fn check(&self) -> Result<(), Refusal> {
+    /// Each field a base58 address of 32 bytes, and the three accounts the ones the authority
+    /// derives, as Solana's runtime derives them (`E_ARGS`): its associated token accounts for
+    /// USDC and PhUSD and its Phoenix trader account (index 0). Returns the derived accounts.
+    pub fn check(&self) -> Result<SolDesk, Refusal> {
+        let authority = check_base58_32("solana.authority", &self.authority)?;
         let fields = [
-            ("authority", &self.authority),
             ("usdc_ata", &self.usdc_ata),
             ("phusd_ata", &self.phusd_ata),
             ("phoenix_trader", &self.phoenix_trader),
         ];
-        for (name, value) in fields {
-            check_base58_32(&format!("solana.{name}"), value)?;
+        let mut given = [[0u8; 32]; 3];
+        for ((name, value), bytes) in fields.iter().zip(given.iter_mut()) {
+            *bytes = check_base58_32(&format!("solana.{name}"), value)?;
         }
-        // Base58 has one spelling per address, so equal strings are the only way to be equal.
-        for (i, (a, value)) in fields.iter().enumerate() {
-            if let Some((b, _)) = fields[i + 1..].iter().find(|(_, v)| v == value) {
+        let desk = SolDesk::derive(sha256, authority)?;
+        let derived = [
+            (desk.usdc_ata, "USDC token account"),
+            (desk.phusd_ata, "PhUSD token account"),
+            (desk.trader, "Phoenix trader account"),
+        ];
+        for (((name, value), bytes), (want, what)) in fields.iter().zip(given).zip(derived) {
+            if bytes != want {
                 return Err(Refusal::new(
                     E_ARGS,
-                    format!("solana.{a} and solana.{b} are the same account"),
+                    format!(
+                        "solana.{name} {value} is not the {what} of solana.authority {}, {}",
+                        self.authority,
+                        b58(&want)
+                    ),
                 ));
             }
         }
-        Ok(())
+        Ok(desk)
     }
 }
 
@@ -229,16 +235,14 @@ pub fn policy_sha256(policy: &Policy) -> String {
 mod tests {
     use super::*;
 
-    fn b58(n: u8) -> String {
-        bs58::encode([n; 32]).into_string()
-    }
-
+    /// The testnet desk's MPC key and the accounts it derives (checked independently with
+    /// web3.js-equivalent derivation: bumps 254, 255 and 252).
     fn solana() -> SolanaAccounts {
         SolanaAccounts {
-            authority: b58(1),
-            usdc_ata: b58(2),
-            phusd_ata: b58(3),
-            phoenix_trader: b58(4),
+            authority: "31wj7NJqAnKJYF9cZu7XR7xdCPxxcLKYkc2sh8ZExcJd".into(),
+            usdc_ata: "5EbDUDCy2ycULpJ4xDCmrDJ3zqVpshLLm46BQpYXLDAU".into(),
+            phusd_ata: "4mVZb1tNA7QGWXnqFhT4yfuBAi8Ff5mHWs2otZwuH5Et".into(),
+            phoenix_trader: "FgXaTCYWdnqYPd7cCPruqbggfHbNCs4EGqmrxBePz9A8".into(),
         }
     }
 
@@ -255,35 +259,13 @@ mod tests {
     }
 
     #[test]
-    fn hl_nonces_follow_the_block_and_never_repeat() {
-        let mut desk = Desk::new(
-            "alice.near".parse().unwrap(),
-            Policy {
-                hl_assets: vec![],
-                phoenix_markets: vec![],
-                orderly_symbols: vec![],
-                max_notional_usd: 0,
-                price_band_bps: 1,
-                oracle_max_age_s: 1,
-                rescue_cap_usd_per_hour: 0,
-                max_transfer_cost_bps: 0,
-                max_transfer_cost_flat_e6: 0,
-                unpriced: vec![],
-                unpriced_max_notional_usd: 0,
-            },
-            "0x77cf7951f48ed15194825e2fe0908a6aa486d45a".into(),
-            solana(),
-        );
-        assert_eq!(desk.take_hl_nonce(1_000), 1_000);
-        assert_eq!(desk.take_hl_nonce(1_000), 1_001);
-        assert_eq!(desk.take_hl_nonce(900), 1_002);
-        assert_eq!(desk.take_hl_nonce(5_000), 5_000);
-        assert_eq!(desk.hl_last_nonce, 5_000);
-    }
-
-    #[test]
-    fn distinct_32_byte_solana_accounts_pass() {
-        solana().check().unwrap();
+    fn the_derived_solana_accounts_pass() {
+        let s = solana();
+        let desk = s.check().unwrap();
+        assert_eq!(b58(&desk.authority), s.authority);
+        assert_eq!(b58(&desk.usdc_ata), s.usdc_ata);
+        assert_eq!(b58(&desk.phusd_ata), s.phusd_ata);
+        assert_eq!(b58(&desk.trader), s.phoenix_trader);
     }
 
     #[test]
@@ -298,23 +280,29 @@ mod tests {
         s.phusd_ata = String::new();
         assert!(refused(s).starts_with("solana.phusd_ata "));
         let mut s = solana();
-        s.phoenix_trader = format!("{}O", b58(4));
+        s.phoenix_trader = format!("{}O", s.phoenix_trader);
         assert!(refused(s).starts_with("solana.phoenix_trader "));
     }
 
     #[test]
-    fn solana_accounts_must_differ() {
+    fn each_account_must_be_the_one_the_authority_derives() {
         let mut s = solana();
-        s.phoenix_trader = s.authority.clone();
+        s.usdc_ata = s.phusd_ata.clone();
         assert_eq!(
             refused(s),
-            "solana.authority and solana.phoenix_trader are the same account"
+            "solana.usdc_ata 4mVZb1tNA7QGWXnqFhT4yfuBAi8Ff5mHWs2otZwuH5Et is not the USDC token \
+             account of solana.authority 31wj7NJqAnKJYF9cZu7XR7xdCPxxcLKYkc2sh8ZExcJd, \
+             5EbDUDCy2ycULpJ4xDCmrDJ3zqVpshLLm46BQpYXLDAU"
         );
         let mut s = solana();
-        s.phusd_ata = s.usdc_ata.clone();
-        assert_eq!(
-            refused(s),
-            "solana.usdc_ata and solana.phusd_ata are the same account"
-        );
+        s.phusd_ata = s.authority.clone();
+        assert!(refused(s).starts_with("solana.phusd_ata 31wj7"));
+        let mut s = solana();
+        s.phoenix_trader = bs58::encode([4u8; 32]).into_string();
+        assert!(refused(s).contains(" is not the Phoenix trader account of solana.authority "));
+        // Another authority's accounts are not this one's.
+        let mut s = solana();
+        s.authority = bs58::encode([1u8; 32]).into_string();
+        assert!(refused(s).starts_with("solana.usdc_ata 5EbDUD"));
     }
 }

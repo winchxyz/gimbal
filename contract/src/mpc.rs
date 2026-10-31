@@ -8,8 +8,8 @@ use gimbal_core::ids::{
 };
 use near_sdk::{env, near, serde_json, AccountId, Gas, NearToken, Promise};
 
-/// The `request` of the MPC contract's `sign({request})`: `{path, payload_v2: {Ecdsa: hex},
-/// domain_id}`, derived for this contract as predecessor.
+/// The `request` of the MPC contract's `sign({request})`: `{path, payload_v2: {Ecdsa: hex} or
+/// {Eddsa: hex}, domain_id}`, derived for this contract as predecessor.
 #[near(serializers = [json])]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignRequest {
@@ -22,9 +22,11 @@ pub struct SignRequest {
 #[near(serializers = [json])]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SignPayload {
-    /// A 32-byte digest, for the secp256k1 key (domain 0). Ed25519 payloads (`Eddsa`) come with
-    /// the Solana and Orderly methods.
+    /// A 32-byte digest, for the secp256k1 key (domain 0).
     Ecdsa(String),
+    /// The whole message, for the Ed25519 key (domain 1), which signs it as it is: a Solana
+    /// message (32 to 1232 bytes, the range the MPC contract takes).
+    Eddsa(String),
 }
 
 impl SignRequest {
@@ -35,6 +37,16 @@ impl SignRequest {
             path: evm_path(desk_id),
             payload_v2: SignPayload::Ecdsa(hex::encode(digest)),
             domain_id: MPC_DOMAIN_SECP256K1,
+        }
+    }
+
+    /// `message` signed by the desk's Solana key, `gimbal/<desk_id>/sol` in domain 1: its Solana
+    /// authority (and Orderly key).
+    pub fn sol(desk_id: &str, message: &[u8]) -> Self {
+        Self {
+            path: sol_path(desk_id),
+            payload_v2: SignPayload::Eddsa(hex::encode(message)),
+            domain_id: MPC_DOMAIN_ED25519,
         }
     }
 }

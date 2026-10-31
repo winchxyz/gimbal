@@ -7,7 +7,7 @@ use crate::config::{ReferralCodes, ARBITRUM_MAINNET, ARBITRUM_SEPOLIA};
 use crate::deposit::ONE_YOCTO;
 use crate::mpc::tests::{MPC_EVM, MPC_SOL};
 use gimbal_core::errors::{E_ARGS, E_NOT_ALLOWED, E_PAUSED};
-use gimbal_core::policy::{HlAsset, PhoenixMarket};
+use gimbal_core::policy::{HlAsset, PhoenixMarket, UnpricedAsset};
 use near_sdk::mock::MockAction;
 use near_sdk::serde_json::{self, json, Value};
 use near_sdk::test_utils::{accounts, get_created_receipts, get_logs, VMContextBuilder};
@@ -16,6 +16,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 /// The Hyperliquid methods, on these fixtures.
 mod hl;
+/// The Solana methods, on these fixtures.
+mod sol;
 
 /// The EVM address and Solana authority the MPC answers in [`MPC_EVM`] and [`MPC_SOL`] give.
 const EVM: &str = "0x77cf7951f48ed15194825e2fe0908a6aa486d45a";
@@ -161,12 +163,23 @@ fn b58(n: u8) -> String {
     bs58::encode([n; 32]).into_string()
 }
 
+/// The accounts [`SOL_AUTHORITY`] derives (bumps 254, 255 and 252), which `create_desk` requires.
 fn solana() -> SolanaAccounts {
     SolanaAccounts {
         authority: SOL_AUTHORITY.into(),
-        usdc_ata: b58(2),
-        phusd_ata: b58(3),
-        phoenix_trader: b58(4),
+        usdc_ata: "5EbDUDCy2ycULpJ4xDCmrDJ3zqVpshLLm46BQpYXLDAU".into(),
+        phusd_ata: "4mVZb1tNA7QGWXnqFhT4yfuBAi8Ff5mHWs2otZwuH5Et".into(),
+        phoenix_trader: "FgXaTCYWdnqYPd7cCPruqbggfHbNCs4EGqmrxBePz9A8".into(),
+    }
+}
+
+/// The accounts of authority `[1; 32]` (`b58(1)`), a key the MPC does not give the test desk.
+fn stranger_solana() -> SolanaAccounts {
+    SolanaAccounts {
+        authority: b58(1),
+        usdc_ata: "Gs6NxmndAL3PULGZeYUHCknpMdDVbL46eFCBh856p5z6".into(),
+        phusd_ata: "F1VgsU8zdX5KM64eRdTiGHjbhqetYfXY9FcopvsmFbKm".into(),
+        phoenix_trader: "5odgPeixtpPBCiA1fDhnFuncxYT6YEBBiqW8NAvii1QN".into(),
     }
 }
 
@@ -355,6 +368,26 @@ fn new_refuses_mock_prices_on_mainnet() {
         OrderlyConfig {
             broker_id: "gimbal".into(),
             chain_id: ARBITRUM_MAINNET,
+        },
+    );
+}
+
+#[test]
+#[should_panic(expected = "E_ARGS: hl_builder_tenth_bps is 0")]
+fn new_refuses_a_zero_builder_fee() {
+    called_by(contract_id());
+    Gimbal::new(
+        Network::Testnet,
+        mpc_id(),
+        PriceSource::Mock,
+        treasury(),
+        FeeConfig {
+            hl_builder_tenth_bps: 0,
+            ..fees()
+        },
+        OrderlyConfig {
+            broker_id: "woofi_dex".into(),
+            chain_id: ARBITRUM_SEPOLIA,
         },
     );
 }
@@ -549,6 +582,20 @@ fn each_desk_adds_the_same_storage_however_many_the_owner_has() {
         g.desks_of(owner()),
         ["desk-1", "desk-2", "desk-3", "desk-4"]
     );
+    // What is stored, read back through fresh maps on the same prefixes rather than the contract's
+    // caches: one `(owner, n)` entry per desk, from 0, and the owner's count.
+    let ids: LookupMap<(AccountId, u32), String> = LookupMap::new(StorageKey::DeskIds);
+    let counts: LookupMap<AccountId, u32> = LookupMap::new(StorageKey::DeskCounts);
+    for (n, id) in ["desk-1", "desk-2", "desk-3", "desk-4"]
+        .into_iter()
+        .enumerate()
+    {
+        let n = u32::try_from(n).unwrap();
+        assert_eq!(ids.get(&(owner(), n)).map(String::as_str), Some(id));
+    }
+    assert_eq!(ids.get(&(owner(), 4)), None);
+    assert_eq!(counts.get(&owner()), Some(&4));
+    assert_eq!(counts.get(&operator()), None, "nobody else has a count");
 }
 
 /// A call from `owner()` with 1 NEAR and `gas` attached. The mock charges receipt fees from an older
@@ -573,13 +620,13 @@ fn call_with_gas(gas: Gas) {
 
 #[test]
 fn create_desk_refuses_less_gas_than_its_floor() {
-    assert_eq!(CREATE_DESK_MIN_GAS, Gas::from_tgas(56));
+    assert_eq!(CREATE_DESK_MIN_GAS, Gas::from_tgas(64));
     let mut g = testnet();
     let short = CREATE_DESK_MIN_GAS.saturating_sub(Gas::from_gas(1));
     for gas in [short, Gas::from_tgas(10)] {
         call_with_gas(gas);
         assert_refused(
-            "E_ARGS: create_desk needs at least 56 TGas attached (100 TGas recommended), not ",
+            "E_ARGS: create_desk needs at least 64 TGas attached (100 TGas recommended), not ",
             || {
                 g.create_desk("alpha".into(), policy(), EVM.into(), solana())
                     .detach();
@@ -592,6 +639,57 @@ fn create_desk_refuses_less_gas_than_its_floor() {
     g.create_desk("alpha".into(), policy(), EVM.into(), solana())
         .detach();
     assert_eq!(function_calls().len(), 3);
+}
+
+/// The host gas (storage, hashing, logs, promise arguments) `create_desk` and then `on_desk_keys`
+/// burn for a new desk with `policy`, leaving out the gas `create_desk` attaches to its calls, and
+/// the desk's size as JSON and as borsh. The mock meters host functions, not wasm instructions.
+fn desk_gas(g: &mut Gimbal, desk_id: &str, policy: Policy) -> (u64, u64, u64, u64) {
+    call_with_gas(Gas::from_tgas(100));
+    let start = env::used_gas().as_gas();
+    g.create_desk(desk_id.into(), policy, EVM.into(), solana())
+        .detach();
+    let attached = 2 * mpc::DERIVE_GAS.as_gas() + ON_DESK_KEYS_GAS.as_gas();
+    let create = env::used_gas().as_gas() - start - attached;
+    let (id, desk, deposit) = scheduled_callback();
+    let json = serde_json::to_vec(&desk).unwrap().len() as u64;
+    let borsh = near_sdk::borsh::to_vec(&desk).unwrap().len() as u64;
+    callback(mpc_answers());
+    let start = env::used_gas().as_gas();
+    run_callback(g, id, desk, deposit).unwrap();
+    (create, env::used_gas().as_gas() - start, json, borsh)
+}
+
+#[test]
+fn the_gas_create_desk_keeps_covers_the_largest_policy() {
+    const TGAS: u64 = Gas::from_tgas(1).as_gas();
+    // `create_desk` with a one-asset policy on testnet: 3.38 TGas burnt, 1.8 TGas of receipt fees.
+    let measured = 3_380 * TGAS / 1000 + 1_800 * TGAS / 1000;
+    // Wasm work for every extra byte, which the mock does not meter: parsed from JSON and written
+    // back as JSON (the callback's arguments) at 100 instructions a byte, written as borsh at 20,
+    // at 822,756 gas an instruction.
+    let wasm = |json: u64, borsh: u64| (2 * json * 100 + borsh * 20) * 822_756;
+    let mut g = testnet();
+    let (small_create, small_keys, small_json, small_borsh) = desk_gas(&mut g, "small", policy());
+    let (create, keys, json, borsh) = desk_gas(&mut g, "large", Policy::largest_valid());
+    assert!(json > 12_000 && borsh > 8_000, "{json} {borsh}");
+    // The Solana accounts check (after that measurement) derives three program addresses: one
+    // curve check per bump tried, about 125,000 wasm instructions each (counted in the wasm32
+    // build: 254 squarings of 447 and 11 multiplications of 622). An authority takes 6 on average
+    // (the test one 7); more than 24 happens for fewer than 2 in 100,000.
+    let derivation = 24 * 125_000 * 822_756;
+    let extra = create - small_create + wasm(json - small_json, borsh - small_borsh) + derivation;
+    assert!(
+        measured + extra + 4 * TGAS <= CREATE_DESK_GAS.as_gas(),
+        "create_desk: {measured} + {extra} with a 4 TGas margin is over {CREATE_DESK_GAS:?}"
+    );
+    // `on_desk_keys` parses the same JSON and stores the borsh; its host gas stays far below what
+    // it is attached, the rest being wasm work of the same size as above.
+    assert!(keys > small_keys);
+    assert!(
+        keys + wasm(json, borsh) + 10 * TGAS <= ON_DESK_KEYS_GAS.as_gas(),
+        "on_desk_keys: {keys} host gas"
+    );
 }
 
 #[test]
@@ -678,7 +776,7 @@ fn create_desk_refuses_a_malformed_evm_address() {
 }
 
 #[test]
-fn create_desk_refuses_malformed_or_repeated_solana_accounts() {
+fn create_desk_refuses_malformed_or_underived_solana_accounts() {
     let mut g = testnet();
     call(owner(), NearToken::from_near(1));
     let mut s = solana();
@@ -693,15 +791,26 @@ fn create_desk_refuses_malformed_or_repeated_solana_accounts() {
         g.create_desk("alpha".into(), policy(), EVM.into(), s)
             .detach();
     });
+    // An account of the owner's choosing, here the authority itself, is not the derived one.
     let mut s = solana();
     s.phoenix_trader = s.authority.clone();
     assert_refused(
-        "E_ARGS: solana.authority and solana.phoenix_trader are the same account",
+        &format!(
+            "E_ARGS: solana.phoenix_trader {SOL_AUTHORITY} is not the Phoenix trader account of \
+             solana.authority {SOL_AUTHORITY}, FgXaTCYWdnqYPd7cCPruqbggfHbNCs4EGqmrxBePz9A8"
+        ),
         || {
             g.create_desk("alpha".into(), policy(), EVM.into(), s)
                 .detach();
         },
     );
+    let mut s = solana();
+    s.phusd_ata = stranger_solana().phusd_ata;
+    assert_refused("E_ARGS: solana.phusd_ata F1Vgs", || {
+        g.create_desk("alpha".into(), policy(), EVM.into(), s)
+            .detach();
+    });
+    assert!(function_calls().is_empty(), "refused before the MPC calls");
 }
 
 #[test]
@@ -812,9 +921,7 @@ fn the_callback_refunds_an_evm_address_that_is_not_the_mpc_key() {
 #[test]
 fn the_callback_refunds_a_solana_authority_that_is_not_the_mpc_key() {
     let mut g = testnet();
-    let mut s = solana();
-    s.authority = b58(1);
-    let args = scheduled(&mut g, EVM, s);
+    let args = scheduled(&mut g, EVM, stranger_solana());
     assert_callback_refused(
         &mut g,
         args,
@@ -892,15 +999,18 @@ fn the_callback_refunds_a_deposit_short_of_the_storage_and_undoes_its_write() {
 fn policy_2() -> Policy {
     let mut p = policy();
     p.max_notional_usd = 50;
-    p.unpriced = vec!["HYPE".into()];
+    p.unpriced = vec![UnpricedAsset {
+        symbol: "HYPE".into(),
+        max_sz: "2.5".into(),
+    }];
     p
 }
 
-const POLICY_2_JSON: &str = r#"{"hl_assets":[{"index":4,"symbol":"ETH","sz_decimals":4}],"phoenix_markets":[{"symbol":"SOL","orderbook":"11111111111111111111111111111111","base_lot_e8":1000000,"tick_e8":1000}],"orderly_symbols":["PERP_SOL_USDC"],"max_notional_usd":50,"price_band_bps":100,"oracle_max_age_s":60,"rescue_cap_usd_per_hour":50,"max_transfer_cost_bps":100,"max_transfer_cost_flat_e6":500000,"unpriced":["HYPE"],"unpriced_max_notional_usd":100}"#;
+const POLICY_2_JSON: &str = r#"{"hl_assets":[{"index":4,"symbol":"ETH","sz_decimals":4}],"phoenix_markets":[{"symbol":"SOL","orderbook":"11111111111111111111111111111111","base_lot_e8":1000000,"tick_e8":1000}],"orderly_symbols":["PERP_SOL_USDC"],"max_notional_usd":50,"price_band_bps":100,"oracle_max_age_s":60,"rescue_cap_usd_per_hour":50,"max_transfer_cost_bps":100,"max_transfer_cost_flat_e6":500000,"unpriced":[{"symbol":"HYPE","max_sz":"2.5"}],"unpriced_max_notional_usd":100}"#;
 
 /// sha256 of [`POLICY_2_JSON`], computed outside Rust as
 /// `sha256(JSON.stringify(JSON.parse(POLICY_2_JSON)))`, which gives back the same bytes.
-const POLICY_2_SHA256: &str = "159187a1835ef294181f0ecee01a9b0c59d5c6758f927ea2987d4bdf0290b5e7";
+const POLICY_2_SHA256: &str = "dd22d0c2ea4a07a460be1dc73aabfc2cb228416bb358d42e9f19457f0adcce3e";
 
 #[test]
 fn policy_sha256_hashes_the_json_get_desk_returns() {
@@ -1100,7 +1210,7 @@ fn a_cleared_operator_has_no_role() {
     );
     for gate in [Gate::Running, Gate::ReducesRisk] {
         assert_refused("E_NOT_ALLOWED: ", || {
-            action_desk(&mut g.desks, "alpha", gate);
+            action_desk(&g.desks, "alpha", gate);
         });
     }
 }
@@ -1251,12 +1361,12 @@ fn a_stranger_may_not_pause_and_an_unknown_desk_is_refused() {
 
 #[test]
 fn owner_and_operator_pass_both_gates_on_a_running_desk() {
-    let mut g = with_desk();
+    let g = with_desk();
     for gate in [Gate::Running, Gate::ReducesRisk] {
         called_by(owner());
-        assert_eq!(action_desk(&mut g.desks, "alpha", gate).1, Role::Owner);
+        assert_eq!(action_desk(&g.desks, "alpha", gate).1, Role::Owner);
         called_by(operator());
-        let (desk, role) = action_desk(&mut g.desks, "alpha", gate);
+        let (desk, role) = action_desk(&g.desks, "alpha", gate);
         assert_eq!(role, Role::Operator);
         assert_eq!(desk.evm_address, EVM);
     }
@@ -1264,13 +1374,13 @@ fn owner_and_operator_pass_both_gates_on_a_running_desk() {
 
 #[test]
 fn the_action_guard_refuses_a_stranger() {
-    let mut g = with_desk();
+    let g = with_desk();
     called_by(stranger());
     for gate in [Gate::Running, Gate::ReducesRisk] {
         assert_refused(
             "E_NOT_ALLOWED: charlie is neither the owner nor the operator of desk alpha",
             || {
-                action_desk(&mut g.desks, "alpha", gate);
+                action_desk(&g.desks, "alpha", gate);
             },
         );
     }
@@ -1286,33 +1396,27 @@ fn on_a_paused_desk_only_risk_reducing_actions_pass() {
         assert_refused(
             &format!("{E_PAUSED}: desk alpha is paused; only its owner can unpause it"),
             || {
-                action_desk(&mut g.desks, "alpha", Gate::Running);
+                action_desk(&g.desks, "alpha", Gate::Running);
             },
         );
-        assert_eq!(
-            action_desk(&mut g.desks, "alpha", Gate::ReducesRisk).1,
-            role
-        );
+        assert_eq!(action_desk(&g.desks, "alpha", Gate::ReducesRisk).1, role);
     }
     // The role comes first: a stranger learns nothing about the pause.
     called_by(stranger());
     assert_refused(&format!("{E_NOT_ALLOWED}: "), || {
-        action_desk(&mut g.desks, "alpha", Gate::Running);
+        action_desk(&g.desks, "alpha", Gate::Running);
     });
     call(owner(), ONE_YOCTO);
     g.set_paused("alpha".into(), false);
-    assert_eq!(
-        action_desk(&mut g.desks, "alpha", Gate::Running).1,
-        Role::Owner
-    );
+    assert_eq!(action_desk(&g.desks, "alpha", Gate::Running).1, Role::Owner);
 }
 
 #[test]
 fn the_action_guard_refuses_an_unknown_desk() {
-    let mut g = with_desk();
+    let g = with_desk();
     called_by(owner());
     assert_refused("E_NO_DESK: no desk ", || {
-        action_desk(&mut g.desks, "bravo", Gate::ReducesRisk);
+        action_desk(&g.desks, "bravo", Gate::ReducesRisk);
     });
 }
 
