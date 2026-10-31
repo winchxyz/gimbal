@@ -110,10 +110,10 @@ cargo +stable-x86_64-pc-windows-msvc test --workspace   # plain `cargo test` run
 - Funding history: `/v1/funding/overview?startTime&endTime&perMarketLimit` (ms; ≤ 1 year per call;
   without parameters it returns only the last 168 h).
 - Taker fee 3.5 bps, maker 0.5 bps on every market.
-- Onboarding is invite-gated: wallet login (`/v1/auth/*`, the login message signed by the desk's Ed25519 key
-  through the contract), then `POST /v1/invite/validate {code, wallet_address}` with `referral_codes.phoenix`
-  (endpoints and body: verify on day 4–6), then registration.
-- Trader registration is built, co-signed and sent by Phoenix's API (onboarder key `EzkM8YbCkBLaCqX2cdxtMyxfTLpKui3mWQWnhe5w2P4Z`).
+- Onboarding needs no wallet login and no invite: `build-register-ixs` returns the instructions with no session,
+  the desk signs only as fee payer, Phoenix's API co-signs and sends (onboarder key
+  `EzkM8YbCkBLaCqX2cdxtMyxfTLpKui3mWQWnhe5w2P4Z`). The referral code goes in the `referral/activate-tx` HTTP
+  body, never in the signed bytes; that transaction is v0 (no lookups). Steps: interfaces §1.3.
 - One transaction fits Phoenix withdraw + Ember unwrap + a 1Click transfer (~980 bytes of 1232).
 
 **Orderly**: an EVM-type account owned by the desk's EVM address; the desk's Ed25519 MPC key is registered as
