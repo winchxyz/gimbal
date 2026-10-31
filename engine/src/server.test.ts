@@ -291,6 +291,50 @@ test('an SSE client that stops reading is dropped once too much is queued for it
   }
 });
 
+test('refused requests are logged once a minute per kind of refusal, with a count of those left out', async () => {
+  const quiet = {
+    scan: async () => ({ windows: [], scan: { venues: 0, failed: [], at: T0 }, notes: { dropped: {}, unpriced: [], historyReads: 0, ms: 0 } }),
+    history: () => null,
+  } as unknown as Scanner;
+  const logs: string[] = [];
+  let now = T0;
+  const s = new EngineServer({ mode: 'replay', scanner: quiet, strategy: DEFAULT_STRATEGY, policy: null, intervalMs: 3_600_000, now: () => now, log: (l) => logs.push(l) });
+  const port = await s.start(0);
+  const send = (headers: OutgoingHttpHeaders, method = 'GET', path = '/state') => new Promise<number>((resolve, reject) => {
+    const req = request({ host: '127.0.0.1', port, method, path, headers }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode!));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+  const refused = () => logs.filter((l) => l.startsWith('refused '));
+  try {
+    // A probe that varies its Host every time still writes one line a minute.
+    for (let i = 0; i < 20; i++) assert.equal(await send({ host: `evil${i}.example` }), 403);
+    assert.deepEqual(refused(), ['refused GET /state: host "evil0.example" is not this machine: the engine answers its own dashboard only']);
+    // Another kind of refusal has its own line.
+    assert.equal(await send({ origin: 'http://evil.example' }), 403);
+    assert.equal(await send({ 'content-type': 'text/plain' }, 'PUT', '/strategy'), 415);
+    assert.equal(await send({ 'content-type': 'text/plain' }, 'PUT', '/strategy'), 415);
+    assert.equal(refused().length, 3);
+    assert.equal(refused()[2], 'refused PUT /strategy: PUT needs content-type application/json');
+    // A minute later the next one is logged, with the count left out since.
+    now = T0 + 59_999;
+    await send({ host: 'evil.example' });
+    assert.equal(refused().length, 3);
+    now = T0 + 60_000;
+    await send({ host: 'evil.example' });
+    assert.equal(refused().at(-1), 'refused GET /state: host "evil.example" is not this machine: the engine answers its own dashboard only (and 20 more like it since the last line)');
+    now = T0 + 120_000;
+    await send({ 'content-type': 'text/plain' }, 'POST', '/rotate');
+    assert.equal(refused().at(-1), 'refused POST /rotate: POST needs content-type application/json (and 1 more like it since the last line)');
+    assert.equal(refused().length, 5);
+  } finally {
+    await s.stop();
+  }
+});
+
 test('a scan that fails marks the windows last sent as stale, never leaves them looking current', async () => {
   let scans = 0;
   const w = { id: 'sol-phoenix-hyperliquid', stale: false } as FundingWindow;

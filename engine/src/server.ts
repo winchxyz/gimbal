@@ -45,6 +45,13 @@ const MAX_BODY_BYTES = 64 * 1024;
  * hold every event since it stalled. EventSource reconnects on its own and gets the latest state first.
  */
 const SSE_MAX_BUFFER_BYTES = 1024 * 1024;
+/**
+ * A refused request is logged at most once this often per kind of refusal (Host, Origin, content type), with a count
+ * of the ones left out: a page retrying, or something probing the port, would otherwise write a line per request.
+ */
+const REFUSED_LOG_EVERY_MS = 60_000;
+
+type RefusalKind = 'host' | 'origin' | 'content-type';
 
 export interface EngineServerOptions {
   mode: Mode;
@@ -53,7 +60,7 @@ export interface EngineServerOptions {
   policy: ContractPolicy | null;
   /** ms between the end of one scan and the start of the next one; the scan's own time counts against it. */
   intervalMs: number;
-  /** Real-time clock for EngineState.at (the scanner keeps its own, virtual in replay). */
+  /** Real-time clock for EngineState.at and the refused-request log (the scanner keeps its own, virtual in replay). */
   now?: () => number;
   log?: (line: string) => void;
   /** Called after every scan, with what it produced. */
@@ -86,6 +93,7 @@ export class EngineServer {
   #scanning: Promise<void> | null = null;
   #hostnames = new Set(LOCAL_HOSTNAMES);
   readonly #origins: ReadonlySet<string>;
+  readonly #refusedLogged = new Map<RefusalKind, { at: number; skipped: number }>();
 
   constructor(options: EngineServerOptions) {
     this.#options = options;
@@ -216,20 +224,20 @@ export class EngineServer {
   }
 
   /** Why a request is refused before routing (see the top of this file), or null. */
-  #refusal(req: IncomingMessage): { status: number; error: string } | null {
+  #refusal(req: IncomingMessage): { status: number; error: string; kind: RefusalKind } | null {
     const host = (req.headers.host ?? '').toLowerCase();
     const name = /^(\[[0-9a-f:.]*\]|[^:[\]]+)(:\d+)?$/.exec(host)?.[1];
     if (name === undefined || !this.#hostnames.has(name)) {
-      return { status: 403, error: `host ${JSON.stringify(req.headers.host ?? '')} is not this machine: the engine answers its own dashboard only` };
+      return { status: 403, kind: 'host', error: `host ${JSON.stringify(req.headers.host ?? '')} is not this machine: the engine answers its own dashboard only` };
     }
     const origin = req.headers.origin;
     if (origin !== undefined && !this.#origins.has(origin)) {
-      return { status: 403, error: `origin ${JSON.stringify(origin)} is not the dashboard's` };
+      return { status: 403, kind: 'origin', error: `origin ${JSON.stringify(origin)} is not the dashboard's` };
     }
     const method = req.method ?? 'GET';
     if (method === 'POST' || method === 'PUT') {
       const type = (req.headers['content-type'] ?? '').split(';')[0]!.trim().toLowerCase();
-      if (type !== 'application/json') return { status: 415, error: `${method} needs content-type application/json` };
+      if (type !== 'application/json') return { status: 415, kind: 'content-type', error: `${method} needs content-type application/json` };
     }
     return null;
   }
@@ -238,13 +246,29 @@ export class EngineServer {
     this.#options.log?.(line);
   }
 
+  /**
+   * One line per kind of refusal per REFUSED_LOG_EVERY_MS, saying how many were left out since the last one. Keyed by
+   * kind, not by the Host or Origin sent, so varying those cannot grow the map or the log.
+   */
+  #logRefused(kind: RefusalKind, line: string): void {
+    const now = (this.#options.now ?? Date.now)();
+    const last = this.#refusedLogged.get(kind);
+    if (last !== undefined && now >= last.at && now - last.at < REFUSED_LOG_EVERY_MS) {
+      last.skipped++;
+      return;
+    }
+    const skipped = last === undefined || last.skipped === 0 ? '' : ` (and ${last.skipped} more like it since the last line)`;
+    this.#refusedLogged.set(kind, { at: now, skipped: 0 });
+    this.#log(`${line}${skipped}`);
+  }
+
   async #route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? '/', 'http://engine');
     const method = req.method ?? 'GET';
     const path = url.pathname.replace(/\/+$/, '') || '/';
     const refused = this.#refusal(req);
     if (refused !== null) {
-      this.#log(`refused ${method} ${path}: ${refused.error}`);
+      this.#logRefused(refused.kind, `refused ${method} ${path}: ${refused.error}`);
       return json(res, refused.status, { error: refused.error });
     }
 
