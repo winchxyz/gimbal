@@ -4,6 +4,7 @@
 pub mod decimal;
 pub mod errors;
 pub mod ids;
+pub mod network;
 pub mod policy;
 
 pub use errors::Refusal;
