@@ -71,9 +71,18 @@ export function envValues(names, { file = DOT_ENV, env = process.env } = {}) {
   return out;
 }
 
-/** How a value from the environment or .env is printed: by name and length, never the value itself. */
-export function shownEnv(name, entry) {
-  return entry.value === null ? null : `<${name} from ${entry.from}, ${[...entry.value].length} characters>`;
+/**
+ * The printout of public settings that new() fixes for good (the broker id, the referral codes): each value in
+ * plain text, quoted so stray spaces show, with where it came from; and a warning for every value the shell
+ * environment set over .env (the shell wins, so what .env says is not what is used). Never for secrets.
+ */
+export function envReport(env) {
+  const lines = [];
+  for (const [name, e] of env) lines.push(`env       ${name} ${e.value === null ? 'empty (null)' : `${JSON.stringify(e.value)} (from ${e.from})`}`);
+  for (const [name, e] of env) {
+    if (e.from === 'the environment') lines.push(`warning   ${name} comes from the shell environment, not .env: the shell wins over .env, so check this value, not the file's`);
+  }
+  return lines;
 }
 
 /** Whether the module at `url` is the script node was started with. */

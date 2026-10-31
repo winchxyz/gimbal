@@ -2,14 +2,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createPublicKey, verify } from 'node:crypto';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { b58decode, b58encode } from '../testnet/near.mjs';
 import {
-  NO_CODE, PRIVATE_KEY_OF_FILE, act, ceilToTenth, createClient, describeTx, encodeTransaction, freeBalance, fullAccessVerdict,
-  isFunctionCallKey, isMainnetId, mainnetId, nearText, newKeyFile, parseNear, readKeyFile, topLevelNearId, writeEnvFile,
+  NO_CODE, PRIVATE_KEY_OF_FILE, RPC_URLS, act, assertNotInLinkedWorktree, ceilToTenth, createClient, describeTx, encodeTransaction,
+  feesOf, freeBalance, fullAccessVerdict, isFunctionCallKey, isMainnetId, linkedWorktreeOf, mainnetId, nearText, newKeyFile, parseNear,
+  nearTextUp, readKeyFile, tgasText, topLevelNearId, txGasCap, writeEnvFile,
 } from './near.mjs';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'gimbal-mainnet-'));
@@ -71,6 +72,89 @@ test('mainnet only: send refuses a testnet signer or receiver before it touches 
   await assert.rejects(client.send({ ...signer, accountId: 'owner.near' }, 'gimbal.testnet', []), /receiver "gimbal.testnet" is not a mainnet account/);
   await assert.rejects(client.view('gimbal.testnet', 'config'), /contract "gimbal.testnet" is not a mainnet account/);
   await assert.rejects(client.account('gimbal.testnet'), /not a mainnet account/);
+});
+
+test('an answer with neither result nor error is retried on the next endpoint, never taken as a result', async () => {
+  const calls = [];
+  const fetch = async (url, init) => {
+    const body = JSON.parse(init.body);
+    calls.push([new URL(url).host, body.method]);
+    if (body.method === 'status') return reply({ jsonrpc: '2.0', result: { chain_id: 'mainnet' } });
+    if (new URL(url).host === 'deprecated.example') return reply({ jsonrpc: '2.0', message: 'this endpoint is deprecated' }, 429);
+    return reply({ jsonrpc: '2.0', result: { height: 7 } });
+  };
+  const client = createClient({ urls: ['https://deprecated.example', 'https://good.example'], fetch, pause: noPause });
+  assert.deepEqual(await client.rpc('block', { finality: 'final' }), { height: 7 });
+  assert.deepEqual(calls.filter((c) => c[1] === 'block').map((c) => c[0]), ['deprecated.example', 'good.example']);
+  const only = createClient({ urls: ['https://deprecated.example'], fetch, pause: noPause });
+  await assert.rejects(only.rpc('block', { finality: 'final' }), /neither result nor error/);
+});
+
+test('the default endpoints: NEAR_RPC_URL from the shell, then public mainnet endpoints; not the deprecated rpc.mainnet.near.org', () => {
+  assert.equal(RPC_URLS.includes('https://rpc.mainnet.near.org'), false);
+  assert.deepEqual(RPC_URLS.slice(-2), ['https://free.rpc.fastnear.com', 'https://near.drpc.org']);
+});
+
+// The mainnet runtime's fees as EXPERIMENTAL_protocol_config gave them on 2026-10-31 (protocol 86), cut to the
+// entries txGasCap reads.
+const PROTOCOL_CONFIG = {
+  runtime_config: {
+    transaction_costs: {
+      action_receipt_creation_config: { execution: 108059500000, send_not_sir: 108059500000, send_sir: 108059500000 },
+      action_creation_config: {
+        deploy_contract_cost: { execution: 184765750000, send_not_sir: 184765750000, send_sir: 184765750000 },
+        deploy_contract_cost_per_byte: { execution: 64572944, send_not_sir: 47683715, send_sir: 6812999 },
+        function_call_cost: { execution: 780000000000, send_not_sir: 200000000000, send_sir: 200000000000 },
+        function_call_cost_per_byte: { execution: 2235934, send_not_sir: 47683715, send_sir: 2235934 },
+        add_key_cost: {
+          function_call_cost: { execution: 102217625000, send_not_sir: 102217625000, send_sir: 102217625000 },
+          function_call_cost_per_byte: { execution: 1925331, send_not_sir: 47683715, send_sir: 1925331 },
+        },
+      },
+    },
+  },
+};
+
+test('gas caps: prepaid gas plus the action fees, DeployContract at about 71 Mgas per byte', () => {
+  const fees = feesOf(PROTOCOL_CONFIG);
+  const code = Buffer.alloc(569_702);
+  const tx2 = txGasCap(fees, { signer: 'g.near', receiver: 'g.near', actions: [act.deploy(code, 'x'), act.call('new', { network: 'Mainnet' }, 100, 0n)] });
+  // DeployContract: 184,765,750,000 x 2 + 569,702 x (6,812,999 + 64,572,944) = 41,038,337,221,486 gas, about 41 TGas.
+  assert.equal(tx2.deploy, 184_765_750_000n * 2n + 569_702n * (6_812_999n + 64_572_944n));
+  assert.equal(tgasText(tx2.deploy), '41.1', 'rounded up: an upper bound stays one');
+  assert.equal(tx2.prepaid, 100n * 10n ** 12n);
+  const args = Buffer.byteLength('new') + Buffer.byteLength(JSON.stringify({ network: 'Mainnet' }));
+  assert.equal(tx2.fees, 108_059_500_000n * 2n + 200_000_000_000n + 780_000_000_000n + BigInt(args) * (2_235_934n * 2n));
+  assert.equal(tx2.total, tx2.deploy + tx2.prepaid + tx2.fees);
+  assert.equal(tgasText(tx2.total), '142.3', 'tx 2 of the current wasm: 100 prepaid + 41.04 deploy + 1.2 fees');
+  assert.equal(tgasText(100n * 10n ** 12n), '100.0');
+  assert.equal(nearTextUp(14_224_000_000_000_000_000_000n, 4), '0.0143');
+  assert.equal(nearTextUp(10n ** 22n, 4), '0.0100', 'an exact amount is not rounded up');
+  // A call to another account pays the not-sir send fees.
+  const tx1 = txGasCap(fees, { signer: 'f.near', receiver: 'near', actions: [act.call('create_account', {}, 100, 1n)] });
+  assert.equal(tx1.fees, 108_059_500_000n * 2n + 200_000_000_000n + 780_000_000_000n + BigInt(Buffer.byteLength('create_account{}')) * (47_683_715n + 2_235_934n));
+  // AddKey: the base fee plus each method name's bytes and one more per name.
+  const key = txGasCap(fees, { signer: 'o.near', receiver: 'o.near', actions: [act.functionCallKey(OP_KEY, 'g.near', ['ab', 'cde'], 1n)] });
+  assert.equal(key.total, 108_059_500_000n * 2n + 102_217_625_000n * 2n + 7n * (1_925_331n * 2n));
+  assert.throws(() => feesOf({}), /no receipt fee/);
+});
+
+test('key files are never written into a linked git worktree: .git as a file marks one, a .git directory the main checkout', () => {
+  const tree = tmp();
+  writeFileSync(join(tree, '.git'), 'gitdir: /elsewhere/.git/worktrees/x\n');
+  mkdirSync(join(tree, '.keys'));
+  const inTree = join(tree, '.keys', 'gimbal-canary.near.json');
+  assert.equal(linkedWorktreeOf(inTree), tree);
+  assert.throws(() => assertNotInLinkedWorktree(inTree, 'the contract account\'s key'), (e) => e.message.includes(tree) && /Run from the main checkout/.test(e.message));
+  const main = tmp();
+  mkdirSync(join(main, '.git'));
+  mkdirSync(join(main, '.keys'));
+  assert.equal(linkedWorktreeOf(join(main, '.keys', 'x.json')), null);
+  assert.doesNotThrow(() => assertNotInLinkedWorktree(join(main, '.keys', 'x.json'), 'x'));
+  // The nearest .git decides: a main checkout nested in a worktree's folder is a main checkout.
+  const nested = join(tree, 'nested');
+  mkdirSync(join(nested, '.git'), { recursive: true });
+  assert.equal(linkedWorktreeOf(join(nested, 'a.json')), null);
 });
 
 test('view_account of a missing account and view_access_key of a missing key are null', async () => {

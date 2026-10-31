@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { envValues, parseDotEnv, parseFlags, shownEnv } from './cli.mjs';
+import { envReport, envValues, parseDotEnv, parseFlags } from './cli.mjs';
 import { ENTRY, ethText, evmAddressOf, newEvmKey, setEnvEntry } from './relayer-wallet.mjs';
 
 const SCRIPT = fileURLToPath(new URL('./relayer-wallet.mjs', import.meta.url));
@@ -34,7 +34,7 @@ test('the .env entry is written only when it is empty or missing, never over a v
   assert.throws(() => setEnvEntry(`${ENTRY}=\n${ENTRY}=\n`, ENTRY, KEY), /2 times/);
 });
 
-test('.env reading: comments, quotes, export; the environment wins; values are shown by name only', () => {
+test('.env reading: comments, quotes, export; the environment wins, and is named with a warning', () => {
   const m = parseDotEnv('# c\nexport A="x y" # z\nB=plain   # comment\nC=\nD=#only a comment\nE=\'q\'\n');
   assert.deepEqual([...m], [['A', 'x y'], ['B', 'plain'], ['C', ''], ['D', ''], ['E', 'q']]);
   const dir = mkdtempSync(join(tmpdir(), 'gimbal-env-'));
@@ -44,29 +44,61 @@ test('.env reading: comments, quotes, export; the environment wins; values are s
   assert.deepEqual(v.get('ORDERLY_BROKER_ID'), { value: 'from_file', from: '.env' });
   assert.deepEqual(v.get('HL_REFERRAL_CODE'), { value: null, from: null });
   assert.deepEqual(v.get('PHOENIX_REFERRAL_CODE'), { value: 'ENV', from: 'the environment' });
-  assert.equal(shownEnv('ORDERLY_BROKER_ID', v.get('ORDERLY_BROKER_ID')), '<ORDERLY_BROKER_ID from .env, 9 characters>');
-  assert.equal(shownEnv('HL_REFERRAL_CODE', v.get('HL_REFERRAL_CODE')), null);
+  // The settings new() fixes for good are public: printed in full, quoted, with a warning for each the shell set.
+  assert.deepEqual(envReport(v), [
+    'env       ORDERLY_BROKER_ID "from_file" (from .env)',
+    'env       HL_REFERRAL_CODE empty (null)',
+    'env       PHOENIX_REFERRAL_CODE "ENV" (from the environment)',
+    'warning   PHOENIX_REFERRAL_CODE comes from the shell environment, not .env: the shell wins over .env, so check this value, not the file\'s',
+  ]);
+  assert.equal(envReport(envValues(['ORDERLY_BROKER_ID'], { file, env: {} })).some((l) => l.startsWith('warning')), false, 'no warning for .env values');
   assert.throws(() => parseFlags(['--x'], {}), /unknown option --x/);
 });
 
-test('the script: writes a key into an empty entry once, prints the address and never the key', () => {
+test('the script: a dry run by default; --write writes a key into an empty entry once, prints the address and never the key', () => {
   const dir = mkdtempSync(join(tmpdir(), 'gimbal-relayer-'));
   const file = join(dir, '.env');
-  writeFileSync(file, 'GIMBAL_MODE=replay\nRELAYER_EVM_PRIVATE_KEY=\n');
-  const first = spawnSync(process.execPath, [SCRIPT, '--env-file', file], { encoding: 'utf8' });
+  const before = 'GIMBAL_MODE=replay\nRELAYER_EVM_PRIVATE_KEY=\n';
+  writeFileSync(file, before);
+  const dry = spawnSync(process.execPath, [SCRIPT, '--env-file', file], { encoding: 'utf8' });
+  assert.equal(dry.status, 0, dry.stderr);
+  assert.match(dry.stdout, /dry run: .* has no RELAYER_EVM_PRIVATE_KEY; --write would generate/);
+  assert.equal(readFileSync(file, 'utf8'), before, 'no flag writes nothing');
+  const first = spawnSync(process.execPath, [SCRIPT, '--write', '--env-file', file], { encoding: 'utf8' });
   assert.equal(first.status, 0, first.stderr);
   const key = parseDotEnv(readFileSync(file, 'utf8')).get(ENTRY);
   assert.match(key, /^0x[0-9a-f]{64}$/);
   assert.equal(first.stdout.includes(key.slice(2)), false, 'the key is not printed');
   assert.match(first.stdout, new RegExp(`relayer wallet ${evmAddressOf(key)}`));
-  const second = spawnSync(process.execPath, [SCRIPT, '--env-file', file], { encoding: 'utf8' });
-  assert.equal(second.status, 0, second.stderr);
-  assert.match(second.stdout, /set already: not touched/);
+  assert.ok(first.stdout.includes(file), 'the file written is named by its absolute path');
+  for (const argv of [['--write'], []]) {
+    const again = spawnSync(process.execPath, [SCRIPT, ...argv, '--env-file', file], { encoding: 'utf8' });
+    assert.equal(again.status, 0, again.stderr);
+    assert.match(again.stdout, /set already: not touched/);
+    assert.match(again.stdout, new RegExp(`relayer wallet ${evmAddressOf(key)}`));
+  }
   assert.equal(parseDotEnv(readFileSync(file, 'utf8')).get(ENTRY), key, 'never overwritten');
   const empty = join(dir, 'empty.env');
   writeFileSync(empty, '');
   const check = spawnSync(process.execPath, [SCRIPT, '--check', '--env-file', empty], { encoding: 'utf8' });
   assert.equal(check.status, 1);
-  assert.match(check.stderr, /has no RELAYER_EVM_PRIVATE_KEY: run without --check first/);
+  assert.match(check.stderr, /has no RELAYER_EVM_PRIVATE_KEY: run with --write first/);
+  const both = spawnSync(process.execPath, [SCRIPT, '--check', '--write', '--env-file', empty], { encoding: 'utf8' });
+  assert.equal(both.status, 2);
   assert.equal(ethText('1234567890000000000'), '1.234567');
+});
+
+test('the script: --write refuses a .env inside a linked git worktree (deleted with it), and says to use the main checkout', () => {
+  const tree = mkdtempSync(join(tmpdir(), 'gimbal-worktree-'));
+  writeFileSync(join(tree, '.git'), 'gitdir: /elsewhere/.git/worktrees/x\n');
+  mkdirSync(join(tree, 'sub'));
+  const file = join(tree, 'sub', '.env');
+  writeFileSync(file, `${ENTRY}=\n`);
+  const r = spawnSync(process.execPath, [SCRIPT, '--write', '--env-file', file], { encoding: 'utf8' });
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /linked git worktree .*Run from the main checkout/);
+  assert.equal(readFileSync(file, 'utf8'), `${ENTRY}=\n`, 'nothing written');
+  const dry = spawnSync(process.execPath, [SCRIPT, '--env-file', file], { encoding: 'utf8' });
+  assert.equal(dry.status, 0, 'a dry run still runs there');
+  assert.match(dry.stdout, /--write refuses here; run it from the main checkout/);
 });

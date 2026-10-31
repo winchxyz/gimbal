@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { CANARY_POLICY_FILE, policyDiff } from './policy.mjs';
-import { CANARY_SYMBOLS, buildPolicy, formatPolicy, livePolicyProblems, phoenixUnits, policyShapeProblems, readLive } from './venues.mjs';
+import {
+  CANARY_SYMBOLS, MAINNET_ORDERLY_BROKER, brokerIdProblem, buildPolicy, formatPolicy, livePolicyProblems, phoenixUnits, policyShapeProblems,
+  readLive,
+} from './venues.mjs';
 
 // The venues' answers as recorded on mainnet 2026-10-31, cut to the fields the policy reads.
 const HL_META = {
@@ -120,6 +123,18 @@ test('policy shape: what the contract would refuse, and mainnet\'s oracle age fl
     const p = clone(good);
     change(p);
     assert.match(policyShapeProblems(p).join('\n'), pattern);
+  }
+});
+
+test('the Orderly broker: one expected value, the engine\'s mainnet broker; the testnet broker and any other id are refused', async () => {
+  // The engine's own table (its imports are type-only, so Node loads the .ts as it is).
+  const { ORDERLY_BROKERS } = await import('../../engine/src/scanner/config.ts');
+  assert.equal(MAINNET_ORDERLY_BROKER, ORDERLY_BROKERS.mainnet.brokerId);
+  assert.equal(brokerIdProblem(ORDERLY_BROKERS.mainnet.brokerId), null);
+  assert.match(brokerIdProblem(ORDERLY_BROKERS.testnet.brokerId), /the testnet broker/);
+  assert.match(brokerIdProblem('woofi_dex'), /is woofi_dex, the testnet broker/);
+  for (const id of ['', 'someone_else', `${MAINNET_ORDERLY_BROKER} `, MAINNET_ORDERLY_BROKER.toUpperCase()]) {
+    assert.match(brokerIdProblem(id), /is not the engine's mainnet broker/, JSON.stringify(id));
   }
 });
 

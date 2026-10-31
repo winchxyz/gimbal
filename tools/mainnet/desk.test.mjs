@@ -8,6 +8,7 @@ import {
   OPERATOR_METHODS, contractConfigProblems, engineEnvEntries, operatorKeyPlan, orderlyAccountId, parseDeskArgs,
 } from './desk.mjs';
 import { PRIVATE_KEY_OF_FILE } from './near.mjs';
+import { MAINNET_ORDERLY_BROKER } from './venues.mjs';
 
 const OK = ['gimbal-canary.near', 'canary', '--owner', 'owner.near', '--policy', 'p.json'];
 const usage = (argv, pattern) => assert.throws(() => parseDeskArgs(argv), (e) => e instanceof UsageError && pattern.test(e.message), argv.join(' '));
@@ -62,14 +63,17 @@ test('the desk\'s Orderly account id is Orderly\'s own (vectors from contract/co
   for (const a of v.account_ids) assert.equal(orderlyAccountId(a.user_address.toLowerCase(), a.broker_id), a.account_id, a.broker_id);
 });
 
-test('config() must be a mainnet canary\'s: Mainnet, v1.signer, OutLayer price-oracle.near, Arbitrum One', () => {
-  const good = { network: 'Mainnet', mpc: 'v1.signer', price_source: { OutLayer: { contract: 'price-oracle.near' } }, orderly: { broker_id: 'b', chain_id: 42161 } };
+test('config() must be a mainnet canary\'s: Mainnet, v1.signer, OutLayer price-oracle.near, Arbitrum One, the mainnet broker', () => {
+  const good = { network: 'Mainnet', mpc: 'v1.signer', price_source: { OutLayer: { contract: 'price-oracle.near' } }, orderly: { broker_id: MAINNET_ORDERLY_BROKER, chain_id: 42161 } };
   assert.deepEqual(contractConfigProblems(good), []);
   assert.match(contractConfigProblems({ ...good, network: 'Testnet' }).join(), /not Mainnet/);
   assert.match(contractConfigProblems({ ...good, mpc: 'v1.signer-prod.testnet' }).join(), /not v1\.signer/);
   assert.match(contractConfigProblems({ ...good, price_source: 'Mock' }).join(), /not OutLayer/);
-  assert.match(contractConfigProblems({ ...good, orderly: { broker_id: 'b', chain_id: 421614 } }).join(), /not 42161/);
+  assert.match(contractConfigProblems({ ...good, orderly: { broker_id: MAINNET_ORDERLY_BROKER, chain_id: 421614 } }).join(), /not 42161/);
   assert.match(contractConfigProblems({ ...good, orderly: { broker_id: '', chain_id: 42161 } }).join(), /broker_id is empty/);
+  for (const other of ['woofi_dex', 'someone_else']) {
+    assert.match(contractConfigProblems({ ...good, orderly: { broker_id: other, chain_id: 42161 } }).join(), /not the engine's mainnet broker/, other);
+  }
 });
 
 test('the operator key on chain: added when missing, skipped when exact, refused with any other permission', () => {

@@ -2,24 +2,29 @@
 // The relayer's Arbitrum gas wallet (interfaces §1.3, Orderly money path): it submits the EIP-3009 transfers the
 // contract signed and pays their gas, so it holds a few dollars of ETH and never desk money.
 //
-//   node tools/mainnet/relayer-wallet.mjs            a new key into .env RELAYER_EVM_PRIVATE_KEY, only when that
+//   node tools/mainnet/relayer-wallet.mjs            dry run: the wallet's address when .env has its key, or what
+//                                                    --write would do; writes nothing
+//   node tools/mainnet/relayer-wallet.mjs --write    a new key into .env RELAYER_EVM_PRIVATE_KEY, only when that
 //                                                    entry is empty (never overwritten); prints the address only
 //   node tools/mainnet/relayer-wallet.mjs --check    the wallet's ETH balance on Arbitrum One (chain 42161)
 //
-// --env-file <file> uses another file than the repo's .env. ARBITRUM_RPC_URL (environment or .env) is the RPC for
-// --check, default the public https://arb1.arbitrum.io/rpc; it must answer chain id 42161. No key or .env value is
-// printed.
+// --env-file <file> uses another file than the repo's .env. --write refuses a file inside a linked git worktree
+// (its ignored files go with it): run it from the main checkout. ARBITRUM_RPC_URL (environment or .env) is the RPC
+// for --check, default the public https://arb1.arbitrum.io/rpc; it must answer chain id 42161. No key or .env
+// value is printed.
 
 import { createECDH } from 'node:crypto';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { keccak256 } from '../testnet/near.mjs';
 import { DOT_ENV, UsageError, envValues, isMain, parseDotEnv, parseFlags, run } from './cli.mjs';
+import { assertNotInLinkedWorktree, linkedWorktreeOf } from './near.mjs';
 
 export const ENTRY = 'RELAYER_EVM_PRIVATE_KEY';
 export const ARBITRUM_ONE = 42161;
 export const PUBLIC_ARBITRUM_RPC = 'https://arb1.arbitrum.io/rpc';
 const N = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
-const USAGE = 'usage: node tools/mainnet/relayer-wallet.mjs [--check] [--env-file <file>]';
+const USAGE = 'usage: node tools/mainnet/relayer-wallet.mjs [--write | --check] [--env-file <file>]';
 
 /** The lowercase address of a `0x` + 64 hex secp256k1 private key. */
 export function evmAddressOf(privateKeyHex) {
@@ -81,10 +86,11 @@ export function ethText(wei) {
 }
 
 async function main() {
-  const { positional, values } = parseFlags(process.argv.slice(2), { '--check': 'switch', '--env-file': 'value' });
+  const { positional, values } = parseFlags(process.argv.slice(2), { '--check': 'switch', '--write': 'switch', '--env-file': 'value' });
   if (positional.length > 0) throw new UsageError(`unexpected argument ${positional[0]}`);
-  const file = values['--env-file'] ?? DOT_ENV;
-  const shown = values['--env-file'] ?? '.env';
+  if (values['--check'] && values['--write']) throw new UsageError('--write and --check are separate steps: run one, then the other');
+  const file = resolve(values['--env-file'] ?? DOT_ENV);
+  const shown = file;
   const text = existsSync(file) ? readFileSync(file, 'utf8') : '';
   const current = parseDotEnv(text).get(ENTRY) ?? '';
 
@@ -94,6 +100,15 @@ async function main() {
       console.log(`relayer wallet ${evmAddressOf(current)}`);
       return;
     }
+    if (!values['--write']) {
+      // The default is a dry run, like every script here: nothing is generated or written.
+      console.log(`dry run: ${shown} has no ${ENTRY}; --write would generate a new key into it (the value is never shown)`);
+      console.log('and print the wallet\'s address. Nothing was written.');
+      const tree = linkedWorktreeOf(file);
+      if (tree !== null) console.log(`warning   ${tree} is a linked git worktree: --write refuses here; run it from the main checkout`);
+      return;
+    }
+    assertNotInLinkedWorktree(file, `${ENTRY} (in ${file})`);
     const key = newEvmKey();
     const next = setEnvEntry(text, ENTRY, key.privateKey);
     if (!next.written) throw new Error(`${ENTRY} could not be written`);
@@ -105,7 +120,7 @@ async function main() {
     return;
   }
 
-  if (current === '') throw new Error(`${shown} has no ${ENTRY}: run without --check first`);
+  if (current === '') throw new Error(`${shown} has no ${ENTRY}: run with --write first`);
   const address = evmAddressOf(current);
   const rpc = envValues(['ARBITRUM_RPC_URL'], { file }).get('ARBITRUM_RPC_URL');
   const url = rpc.value ?? PUBLIC_ARBITRUM_RPC;

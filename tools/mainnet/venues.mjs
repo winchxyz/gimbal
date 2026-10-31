@@ -9,6 +9,24 @@ export const HL_API = 'https://api.hyperliquid.xyz';
 export const PHOENIX_API = 'https://perp-api.phoenix.trade';
 export const ORDERLY_API = 'https://api.orderly.org';
 
+/**
+ * The Orderly broker a mainnet contract must be created with: the engine's mainnet broker
+ * (engine/src/scanner/config.ts ORDERLY_BROKERS.mainnet; a test checks they are the same). new() fixes it for the
+ * contract's life, so any other id is refused.
+ */
+export const MAINNET_ORDERLY_BROKER = 'gimbal_dex';
+/** Orderly's testnet broker (ORDERLY_BROKERS.testnet): refused by name on mainnet. */
+const TESTNET_ORDERLY_BROKER = 'woofi_dex';
+
+/** null when `id` is the mainnet broker; otherwise why it is refused. */
+export function brokerIdProblem(id) {
+  if (id === TESTNET_ORDERLY_BROKER) return `ORDERLY_BROKER_ID is ${TESTNET_ORDERLY_BROKER}, the testnet broker: a mainnet contract must use the engine's mainnet broker`;
+  if (id !== MAINNET_ORDERLY_BROKER) {
+    return `ORDERLY_BROKER_ID ${JSON.stringify(id)} is not the engine's mainnet broker ${MAINNET_ORDERLY_BROKER} (engine/src/scanner/config.ts ORDERLY_BROKERS.mainnet)`;
+  }
+  return null;
+}
+
 /** The canary's limits (CLAUDE.md: a capped canary, at most 20 USDC notional per leg). */
 export const CANARY_LIMITS = {
   max_notional_usd: 20,

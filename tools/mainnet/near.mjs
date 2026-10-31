@@ -12,8 +12,8 @@
 // a key file that names a network must name mainnet.
 
 import { createPrivateKey, createPublicKey, generateKeyPairSync, sign } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { b58decode, b58encode, sha256 } from '../testnet/near.mjs';
 
@@ -25,7 +25,12 @@ export const MPC = 'v1.signer';
 export const ORACLE = 'price-oracle.near';
 /** Creates `<name>.near` accounts through its `create_account`. */
 export const REGISTRAR = 'near';
-export const RPC_URLS = [process.env.NEAR_RPC_URL, 'https://free.rpc.fastnear.com', 'https://rpc.mainnet.near.org'].filter(Boolean);
+/**
+ * NEAR_RPC_URL (from the shell environment only: .env may hold a testnet RPC), then two public mainnet endpoints,
+ * both checked on 2026-10-31 to answer `status` with chain_id "mainnet". rpc.mainnet.near.org is deprecated and
+ * no longer listed.
+ */
+export const RPC_URLS = [process.env.NEAR_RPC_URL, 'https://free.rpc.fastnear.com', 'https://near.drpc.org'].filter(Boolean);
 export const TGAS = 10n ** 12n;
 export const YOCTO_PER_NEAR = 10n ** 24n;
 /** Storage staking: 10^19 yoctoNEAR per byte (1 NEAR per 100 kB). */
@@ -167,6 +172,8 @@ export function createClient({ urls = RPC_URLS, fetch: fetchImpl = (...a) => glo
           err.rpc = json.error;
           throw err;
         }
+        // Neither result nor error (a proxy's or a deprecation notice's JSON): retried, never taken as an answer.
+        if (json.result === undefined) throw new Error(`${method}: HTTP ${status} from ${host(url)} with neither result nor error`);
         return json.result;
       } catch (e) {
         if (e.rpc || e.timeout || e.fatal) throw e;
@@ -277,7 +284,95 @@ export function createClient({ urls = RPC_URLS, fetch: fetchImpl = (...a) => glo
     };
   }
 
-  return { rpc, view, account, accessKey, accessKeys, send };
+  /** The runtime's action fees, from EXPERIMENTAL_protocol_config (for txGasCap). */
+  async function fees() {
+    return feesOf(await rpc('EXPERIMENTAL_protocol_config', { finality: 'final' }));
+  }
+
+  return { rpc, view, account, accessKey, accessKeys, send, fees };
+}
+
+// --- gas ---
+
+/** The fee entries txGasCap needs, each { send_sir, send_not_sir, execution } in gas, from a protocol config. */
+export function feesOf(protocolConfig) {
+  const t = protocolConfig?.runtime_config?.transaction_costs;
+  const a = t?.action_creation_config;
+  const fees = {
+    receipt: t?.action_receipt_creation_config,
+    deploy: a?.deploy_contract_cost,
+    deployByte: a?.deploy_contract_cost_per_byte,
+    call: a?.function_call_cost,
+    callByte: a?.function_call_cost_per_byte,
+    addKey: a?.add_key_cost?.function_call_cost,
+    addKeyByte: a?.add_key_cost?.function_call_cost_per_byte,
+  };
+  for (const [name, f] of Object.entries(fees)) {
+    if (!['send_sir', 'send_not_sir', 'execution'].every((k) => Number.isSafeInteger(f?.[k]) || /^\d+$/.test(String(f?.[k])))) {
+      throw new Error(`EXPERIMENTAL_protocol_config: no ${name} fee`);
+    }
+  }
+  return fees;
+}
+
+/**
+ * The most gas a transaction can burn: the action receipt's fee, every action's fee (send, by whether the signer is
+ * the receiver, plus execution; per byte where the runtime charges per byte) and every FunctionCall's prepaid gas.
+ * Returns { total, prepaid, deploy, fees } in gas, so the printout can say where it comes from.
+ */
+export function txGasCap(fees, { signer, receiver, actions }) {
+  const sir = signer === receiver;
+  const fee = (f, n = 1n) => (BigInt(sir ? f.send_sir : f.send_not_sir) + BigInt(f.execution)) * n;
+  let other = fee(fees.receipt);
+  let prepaid = 0n;
+  let deploy = 0n;
+  for (const a of actions) {
+    if (a.type === 'DeployContract') {
+      deploy += fee(fees.deploy) + fee(fees.deployByte, BigInt(a.code.length));
+    } else if (a.type === 'FunctionCall') {
+      other += fee(fees.call) + fee(fees.callByte, BigInt(Buffer.byteLength(a.method) + Buffer.byteLength(JSON.stringify(a.args))));
+      prepaid += a.gasTgas * TGAS;
+    } else if (a.type === 'AddKey') {
+      // Per byte of the method names, each counted with a terminating byte (as the runtime counts them).
+      other += fee(fees.addKey) + fee(fees.addKeyByte, BigInt(a.methodNames.reduce((n, m) => n + Buffer.byteLength(m) + 1, 0)));
+    } else {
+      throw new Error(`unknown action ${a.type}`);
+    }
+  }
+  return { total: other + prepaid + deploy, prepaid, deploy, fees: other };
+}
+
+/** Gas as TGas with one decimal, rounded up (the caps it prints are upper bounds). */
+export const tgasText = (gas) => `${(Number((BigInt(gas) * 10n + TGAS - 1n) / TGAS) / 10).toFixed(1)}`;
+
+/** yoctoNEAR as NEAR cut to `decimals`, rounded up: for "at most" amounts. */
+export const nearTextUp = (yocto, decimals) => nearText(BigInt(yocto) + 10n ** BigInt(24 - decimals) - 1n, decimals);
+
+// --- where key files may be written ---
+
+/**
+ * The linked git worktree that contains `path`, or null: the nearest ancestor with a `.git` decides (a file means
+ * a linked worktree, a directory the main checkout). Ignored files in a linked worktree (.keys/, .env) are deleted
+ * with it, without a warning, so key files are never written there.
+ */
+export function linkedWorktreeOf(path) {
+  let dir = resolve(path);
+  for (;;) {
+    const git = join(dir, '.git');
+    if (existsSync(git)) return statSync(git).isFile() ? dir : null;
+    const up = dirname(dir);
+    if (up === dir) return null;
+    dir = up;
+  }
+}
+
+/** Throws when `path` is inside a linked worktree: keys and env files are written from the main checkout only. */
+export function assertNotInLinkedWorktree(path, what) {
+  const tree = linkedWorktreeOf(path);
+  if (tree !== null) {
+    throw new Error(`${what} would be written to ${resolve(path)}, inside the linked git worktree ${tree}: a worktree `
+      + 'cleanup deletes ignored files without a warning. Run from the main checkout');
+  }
 }
 
 /** The client the scripts use: the default mainnet endpoints, the global fetch. */
@@ -296,7 +391,7 @@ export function panicOf(failure) {
 export const act = {
   /** `label` names the code in the printout (e.g. the wasm's path). */
   deploy: (code, label) => ({ type: 'DeployContract', code, label }),
-  /** `shownArgs` replaces `args` in the printout only (values from .env are shown by name). */
+  /** `shownArgs` replaces `args` in the printout only (default: the args themselves). */
   call: (method, args, gasTgas, deposit = 0n, shownArgs = args) => ({
     type: 'FunctionCall', method, args, gasTgas: BigInt(gasTgas), deposit: BigInt(deposit), shownArgs,
   }),

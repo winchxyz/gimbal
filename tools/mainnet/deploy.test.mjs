@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { UsageError } from './cli.mjs';
-import { canonical, checkFunder, deployPlanFor, initArgs, initialBalance, minInitialBalance, parseDeployArgs, referralCodes } from './deploy.mjs';
+import {
+  MONEY_METHODS, canonical, checkFunder, deployPlanFor, initArgs, initialBalance, minInitialBalance, parseDeployArgs, referralCodes, wasmExports,
+} from './deploy.mjs';
 import { NO_CODE } from './near.mjs';
 
 const NEAR = 10n ** 24n;
@@ -83,6 +85,22 @@ test('new() for mainnet: v1.signer, OutLayer price-oracle.near, Arbitrum One, th
   env.set('HL_REFERRAL_CODE', { value: 'x'.repeat(21), from: '.env' });
   assert.throws(() => referralCodes(env), /more than 20 characters/);
   assert.equal(canonical({ b: 1, a: [{ d: null, c: 'x' }] }), canonical({ a: [{ c: 'x', d: null }], b: 1 }));
+});
+
+test('the wasm\'s exported methods: read from its export section, functions only', () => {
+  const str = (s) => [s.length, ...Buffer.from(s)];
+  // Two function exports and a memory export; the type and custom sections around them are skipped.
+  const exports = [3, ...str('new'), 0, 0, ...str('memory'), 2, 0, ...str('config'), 0, 0x81, 0x01];
+  const wasm = Buffer.from([
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+    0x07, exports.length, ...exports,
+    0x00, 0x03, ...str('x'), 0xff,
+  ]);
+  assert.deepEqual(wasmExports(wasm), ['new', 'config']);
+  assert.throws(() => wasmExports(Buffer.from('not wasm at all')), /not a wasm module/);
+  assert.throws(() => wasmExports(wasm.subarray(0, 20)), /truncated/);
+  assert.deepEqual(MONEY_METHODS, ['ft_on_transfer', 'fund_venue', 'withdraw_to_owner', 'panic_close']);
 });
 
 test('the script itself: a testnet id or a --send without a key ends with the usage, before any network read', () => {

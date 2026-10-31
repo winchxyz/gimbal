@@ -16,17 +16,23 @@
 // The policy is checked against live data first (Hyperliquid indices and szDecimals, Phoenix orderbooks, lots and
 // ticks, Orderly symbols) and refused on any mismatch. Default: a dry run that reads mainnet and prints the planned
 // transactions, the desk's addresses and their explorer links; it works without --key-file and against a contract
-// that does not exist yet. --send: one transaction at a time, each waited for until final.
+// that does not exist yet. --send: one transaction at a time, each waited for until final; it refuses to write the
+// key and env files into a linked git worktree (its ignored files go with it), so run it from the main checkout.
+// Every file written is printed with its absolute path. The contract's Orderly broker must be the engine's mainnet
+// broker; ORDERLY_BROKER_ID, when set, must be the same and is printed in full.
 
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { b58decode, evmAddress, keccak256, solanaAccounts } from '../testnet/near.mjs';
-import { UsageError, envValues, isMain, parseFlags, run } from './cli.mjs';
+import { UsageError, envReport, envValues, isMain, parseFlags, run } from './cli.mjs';
 import {
-  KEYS, MPC, NO_CODE, ORACLE, PRIVATE_KEY_OF_FILE, TGAS, YOCTO_PER_NEAR, accountLink, act, describeTx, freeBalance,
-  fullAccessVerdict, isFunctionCallKey, mainnetId, near, nearText, newKeyFile, panicOf, parseNear, readKeyFile, txLink, writeEnvFile,
+  KEYS, MPC, NO_CODE, ORACLE, PRIVATE_KEY_OF_FILE, YOCTO_PER_NEAR, accountLink, act, assertNotInLinkedWorktree, describeTx,
+  freeBalance, fullAccessVerdict, isFunctionCallKey, linkedWorktreeOf, mainnetId, near, nearText, newKeyFile, panicOf, parseNear,
+  nearTextUp, readKeyFile, tgasText, txGasCap, txLink, writeEnvFile,
 } from './near.mjs';
-import { HL_API, ORDERLY_API, PHOENIX_API, livePolicyProblems, policyShapeProblems, readLive } from './venues.mjs';
+import {
+  HL_API, MAINNET_ORDERLY_BROKER, ORDERLY_API, PHOENIX_API, brokerIdProblem, livePolicyProblems, policyShapeProblems, readLive,
+} from './venues.mjs';
 
 /**
  * The operator methods, the engine key's whole allowlist: every method with a mark in the Operator column of the
@@ -125,6 +131,7 @@ export function contractConfigProblems(config) {
   if (config?.price_source?.OutLayer?.contract !== ORACLE) out.push(`price_source is ${JSON.stringify(config?.price_source)}, not OutLayer ${ORACLE}`);
   if (config?.orderly?.chain_id !== 42161) out.push(`orderly.chain_id is ${JSON.stringify(config?.orderly?.chain_id)}, not 42161`);
   if (typeof config?.orderly?.broker_id !== 'string' || config.orderly.broker_id === '') out.push('orderly.broker_id is empty');
+  else if (brokerIdProblem(config.orderly.broker_id) !== null) out.push(`orderly.broker_id ${JSON.stringify(config.orderly.broker_id)} is not the engine's mainnet broker ${MAINNET_ORDERLY_BROKER}`);
   return out;
 }
 
@@ -154,8 +161,8 @@ export function engineEnvEntries({ contract, deskId, owner, allowance, brokerId 
   ];
 }
 
-/** The desk's venue addresses with explorer links, as lines; `brokerShown` is the broker id as it may be printed. */
-export function addressLines(addr, orderlyId, brokerShown) {
+/** The desk's venue addresses with explorer links, as lines. */
+export function addressLines(addr, orderlyId, brokerId) {
   const s = addr.solana;
   return [
     `  EVM address        ${addr.evm_address}`,
@@ -167,7 +174,7 @@ export function addressLines(addr, orderlyId, brokerShown) {
     `  Phoenix trader     ${s.phoenix_trader}  https://solscan.io/account/${s.phoenix_trader}`,
     orderlyId === null
       ? '  Orderly account    needs the broker id (config() once deployed, or ORDERLY_BROKER_ID)'
-      : `  Orderly account    ${orderlyId}\n                     ${ORDERLY_API}/v1/get_account?address=${addr.evm_address}&broker_id=${brokerShown} (answers once registered)`,
+      : `  Orderly account    ${orderlyId}\n                     ${ORDERLY_API}/v1/get_account?address=${addr.evm_address}&broker_id=${brokerId} (answers once registered)`,
   ];
 }
 
@@ -175,6 +182,17 @@ async function main() {
   const a = parseDeskArgs(process.argv.slice(2));
   const say = (s = '') => console.log(s);
   say(`gimbal mainnet desk ${a.deskId} on ${a.contract}: ${a.send ? 'SEND' : 'dry run'}`);
+  const opFile = operatorKeyFile(a.contract);
+  const opShown = opFile;
+  const envFile = engineEnvFile(a.contract);
+  const envShown = envFile;
+  // The operator key and the engine env file are never written into a linked worktree (deleted with it).
+  if (a.send) {
+    assertNotInLinkedWorktree(opFile, 'the operator key');
+    assertNotInLinkedWorktree(envFile, 'the engine env file');
+  }
+  const tree = linkedWorktreeOf(opFile);
+  if (tree !== null) say(`warning   ${tree} is a linked git worktree: --send refuses here; run it from the main checkout`);
 
   let policy;
   try {
@@ -194,16 +212,17 @@ async function main() {
 
   const status = await near.rpc('status', []);
   say(`chain     ${status.chain_id}, block ${status.sync_info.latest_block_height}`);
-  const envBroker = envValues(['ORDERLY_BROKER_ID']).get('ORDERLY_BROKER_ID');
+  // The broker id is public (config() once deployed): printed in full, with a warning when the shell set it.
+  const brokerEnv = envValues(['ORDERLY_BROKER_ID']);
+  for (const line of envReport(brokerEnv)) say(line);
+  const envBroker = brokerEnv.get('ORDERLY_BROKER_ID');
+  if (envBroker.value !== null && brokerIdProblem(envBroker.value) !== null) throw new Error(brokerIdProblem(envBroker.value));
   const contractState = await near.account(a.contract);
   let brokerId = null;
-  // config()'s broker id is public; one from .env is printed by name only.
-  let brokerShown = null;
   let desk = null;
   if (contractState === null) {
     if (a.send) throw new Error(`${a.contract} does not exist: deploy it first (tools/mainnet/deploy.mjs)`);
     brokerId = envBroker.value;
-    brokerShown = '<ORDERLY_BROKER_ID>';
     say(`contract  ${a.contract}: does not exist yet, so config() and get_desk are not checked (--send refuses until it does)`);
   } else {
     if (contractState.code_hash === NO_CODE) throw new Error(`${a.contract} has no contract code`);
@@ -211,10 +230,11 @@ async function main() {
     const bad = contractConfigProblems(config);
     if (bad.length > 0) throw new Error(`${a.contract} is not a mainnet Gimbal contract:\n  ${bad.join('\n  ')}`);
     brokerId = config.orderly.broker_id;
-    brokerShown = brokerId;
-    if (envBroker.value !== null && envBroker.value !== brokerId) throw new Error(`ORDERLY_BROKER_ID (from ${envBroker.from}) is not the contract's broker id`);
+    if (envBroker.value !== null && envBroker.value !== brokerId) {
+      throw new Error(`ORDERLY_BROKER_ID ${JSON.stringify(envBroker.value)} (from ${envBroker.from}) is not the contract's broker id ${JSON.stringify(brokerId)}`);
+    }
     say(`contract  ${a.contract}: version ${JSON.stringify(await near.view(a.contract, 'version'))}, Mainnet, MPC ${config.mpc}, `
-      + `OutLayer ${config.price_source.OutLayer.contract}, Orderly chain ${config.orderly.chain_id}`);
+      + `OutLayer ${config.price_source.OutLayer.contract}, Orderly broker ${JSON.stringify(brokerId)} on chain ${config.orderly.chain_id}`);
     desk = await near.view(a.contract, 'get_desk', { desk_id: a.deskId });
     if (desk !== null && desk.owner !== a.owner) throw new Error(`desk ${a.deskId} exists and belongs to ${desk.owner}, not ${a.owner}`);
     if (desk !== null) say(`desk      ${a.deskId} exists already, owned by ${a.owner}: create_desk is skipped`);
@@ -239,8 +259,6 @@ async function main() {
   say(`key       --key-file: ${verdict ?? 'check skipped (no --key-file)'}`);
   if (a.send && verdict !== 'matches') throw new Error('--send needs --key-file holding a full-access key of the owner');
 
-  const opFile = operatorKeyFile(a.contract);
-  const opShown = `.keys/operator-${a.contract}.json`;
   let opKey = null;
   let opPlan = 'add';
   if (existsSync(opFile)) {
@@ -250,13 +268,11 @@ async function main() {
   } else {
     say(`operator  a new key; --send writes it to ${opShown}`);
   }
-  const envFile = engineEnvFile(a.contract);
-  const envShown = `.keys/engine-mainnet-${a.contract}.env`;
   const envExists = existsSync(envFile);
   if (desk !== null && opPlan === 'on chain' && envExists) {
     say(`engine    ${envShown} exists`);
     say('\nnothing to send: the desk, its operator key and the engine env file are all in place.');
-    say(addressLines(addr, orderlyId, brokerShown).join('\n'));
+    say(addressLines(addr, orderlyId, brokerId).join('\n'));
     return;
   }
   if (envExists) {
@@ -269,6 +285,10 @@ async function main() {
   const createActions = [act.call('create_desk', { desk_id: a.deskId, policy, evm_address: addr.evm_address, solana: addr.solana }, CREATE_DESK_TGAS, CREATE_DESK_DEPOSIT)];
   const keyActions = (publicKey) => [act.functionCallKey(publicKey, a.contract, OPERATOR_METHODS, a.allowance)];
   const gasPrice = BigInt((await near.rpc('gas_price', [null])).gas_price);
+  const fees = await near.fees();
+  // The most gas each can burn (prepaid gas plus the action fees, from the live runtime config).
+  const createCap = txGasCap(fees, { signer: a.owner, receiver: a.contract, actions: createActions });
+  const keyCap = txGasCap(fees, { signer: a.owner, receiver: a.owner, actions: keyActions(`ed25519:${'1'.repeat(44)}`) });
   say();
   let n = 0;
   if (desk === null) say(describeTx(`tx ${++n}: create the desk`, { signer: a.owner, signedBy, receiver: a.contract, actions: createActions }).join('\n'));
@@ -277,23 +297,27 @@ async function main() {
       signer: a.owner, signedBy, receiver: a.owner, actions: keyActions(opKey ?? `ed25519:<new key; --send writes it to ${opShown}>`),
     }).join('\n'));
   }
+  say(`gas       ${desk === null ? `create_desk at most ${tgasText(createCap.total)} TGas (${tgasText(createCap.prepaid)} prepaid + ${tgasText(createCap.fees)} action fees)` : ''}`
+    + `${desk === null && opPlan === 'add' ? '; ' : ''}${opPlan === 'add' ? `AddKey at most ${tgasText(keyCap.total)} TGas (action fees only)` : ''}`);
 
   say('\nbalances (NEAR)');
   const before = BigInt(owner.amount);
-  const gasCap = (desk === null ? CREATE_DESK_TGAS : 0n) * TGAS * gasPrice;
-  say(`  ${a.owner}: ${nearText(before, 4)} now; ${desk === null ? `at most ${nearText(before - CREATE_DESK_DEPOSIT - gasCap, 4)} right after create_desk `
-    + `(${nearText(CREATE_DESK_DEPOSIT)} deposit, the storage the desk does not take comes back; gas at most ${nearText(gasCap, 4)}, mostly refunded); ` : ''}`
-    + 'AddKey costs gas and holds a few hundred bytes of storage on the account');
+  const createGas = desk === null ? createCap.total * gasPrice : 0n;
+  const keyGas = opPlan === 'add' ? keyCap.total * gasPrice : 0n;
+  say(`  ${a.owner}: ${nearText(before, 4)} now; ${desk === null ? `at least ${nearText(before - CREATE_DESK_DEPOSIT - createGas, 4)} right after create_desk `
+    + `(${nearText(CREATE_DESK_DEPOSIT)} deposit, the storage the desk does not take comes back; gas at most ${nearTextUp(createGas, 4)}, mostly refunded); ` : ''}`
+    + `${opPlan === 'add' ? `AddKey burns at most ${nearTextUp(keyGas, 4)} and holds a few hundred bytes of storage on the account` : ''}`);
   say(`  the operator key may spend at most ${nearText(a.allowance)} NEAR of the owner's balance on gas (its allowance); `
     + 'keep 0.3 NEAR free per signature in flight');
 
   say(`\ndesk ${a.deskId} addresses (MPC ${MPC}, predecessor ${a.contract})`);
-  say(addressLines(addr, orderlyId, brokerShown).join('\n'));
-  say(`\nengine    ${envShown}: ${engineEnvEntries({ contract: a.contract, deskId: a.deskId, owner: a.owner, allowance: a.allowance, brokerId: brokerId ?? '' })
+  say(addressLines(addr, orderlyId, brokerId).join('\n'));
+  say(`\nengine    ${a.send ? '' : '--send writes '}${envShown}: ${engineEnvEntries({ contract: a.contract, deskId: a.deskId, owner: a.owner, allowance: a.allowance, brokerId: brokerId ?? '' })
     .map(([k]) => k).join(', ')} (values not shown)`);
 
   if (!a.send) {
-    say(`\ndry run: nothing was signed, sent or written. Add --send (and --key-file) to send ${n === 2 ? 'both transactions' : 'the transaction'} above, one at a time.`);
+    say(`\ndry run: nothing was signed, sent or written. Add --send (and --key-file) to send ${n === 2 ? 'both transactions' : 'the transaction'} above, one at a time,`);
+    say('from the main checkout.');
     return;
   }
 
@@ -314,7 +338,7 @@ async function main() {
   }
   if (opPlan === 'add') {
     opKey ??= newKeyFile(opFile, a.owner);
-    say(`\noperator  ${opKey} -> ${opShown}`);
+    say(`\noperator  ${opKey}, key file ${opShown}`);
     const out = await near.send(ownerKey, a.owner, keyActions(opKey), { onSent: (h) => say(`AddKey sent ${h}; waiting for final`) });
     if (out.failure !== null) throw new Error(`AddKey ${out.hash}: ${panicOf(out.failure)} (${txLink(out.hash)})`);
     say(`AddKey final: ${txLink(out.hash)} (${out.burntTgas} TGas, ${nearText(out.burntYocto, 6)} NEAR burnt)`);
@@ -326,11 +350,11 @@ async function main() {
   }
   writeEnvFile(envFile, [
     `Gimbal engine, mainnet: ${a.contract}, desk ${a.deskId}. Written by tools/mainnet/desk.mjs; never commit.`,
-    `node --env-file=${envShown} engine/src/cli/serve.ts`,
+    `node --env-file=.keys/engine-mainnet-${a.contract}.env engine/src/cli/serve.ts`,
   ], engineEnvEntries({ contract: a.contract, deskId: a.deskId, owner: a.owner, allowance: a.allowance, brokerId }), { keyFile: opFile, accountId: a.owner });
   say(`wrote ${envShown} (values not shown)`);
   say(`\ndesk ${a.deskId}: owner ${desk.owner}, paused ${desk.paused}, ${accountLink(a.contract)}`);
-  say(addressLines({ evm_address: desk.evm_address, solana: desk.solana }, desk.orderly_account_id, brokerShown).join('\n'));
+  say(addressLines({ evm_address: desk.evm_address, solana: desk.solana }, desk.orderly_account_id, brokerId).join('\n'));
 }
 
 if (isMain(import.meta.url)) await run(main, USAGE);
