@@ -335,6 +335,53 @@ test('refused requests are logged once a minute per kind of refusal, with a coun
   }
 });
 
+test('a burst of refusals that stops still has its count logged, when the minute is up or the server stops', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const quiet = {
+    scan: async () => ({ windows: [], scan: { venues: 0, failed: [], at: T0 }, notes: { dropped: {}, unpriced: [], historyReads: 0, ms: 0 } }),
+    history: () => null,
+  } as unknown as Scanner;
+  const logs: string[] = [];
+  let now = T0;
+  const s = new EngineServer({ mode: 'replay', scanner: quiet, strategy: DEFAULT_STRATEGY, policy: null, intervalMs: 3_600_000, now: () => now, log: (l) => logs.push(l) });
+  const port = await s.start(0);
+  const send = (headers: OutgoingHttpHeaders) => new Promise<number>((resolve, reject) => {
+    const req = request({ host: '127.0.0.1', port, path: '/state', headers }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode!));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+  const refused = () => logs.filter((l) => l.startsWith('refused '));
+  let stopped = false;
+  try {
+    for (let i = 0; i < 5; i++) assert.equal(await send({ host: `evil${i}.example` }), 403);
+    assert.equal(refused().length, 1);
+    // Nothing more arrives: the four left out are counted when the minute since the logged one is up.
+    t.mock.timers.tick(59_999);
+    assert.equal(refused().length, 1);
+    t.mock.timers.tick(1);
+    assert.deepEqual(refused().slice(1), ['refused 4 more requests whose Host is not this machine since the last line']);
+    // Counted once: no further line, and the next refusal after the minute is logged in full, without a count.
+    t.mock.timers.tick(600_000);
+    assert.equal(refused().length, 2);
+    now = T0 + 60_000;
+    await send({ host: 'evil.example' });
+    assert.equal(refused().at(-1), 'refused GET /state: host "evil.example" is not this machine: the engine answers its own dashboard only');
+    // A count still pending when the server stops is logged by stop().
+    await send({ origin: 'http://evil.example' });
+    await send({ origin: 'http://evil.example' });
+    assert.equal(refused().length, 4);
+    stopped = true;
+    await s.stop();
+    assert.equal(refused().at(-1), 'refused 1 more request from an Origin other than the dashboard\'s since the last line');
+    assert.equal(refused().length, 5);
+  } finally {
+    if (!stopped) await s.stop();
+  }
+});
+
 test('a scan that fails marks the windows last sent as stale, never leaves them looking current', async () => {
   let scans = 0;
   const w = { id: 'sol-phoenix-hyperliquid', stale: false } as FundingWindow;

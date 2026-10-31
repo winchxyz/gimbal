@@ -48,10 +48,25 @@ const SSE_MAX_BUFFER_BYTES = 1024 * 1024;
 /**
  * A refused request is logged at most once this often per kind of refusal (Host, Origin, content type), with a count
  * of the ones left out: a page retrying, or something probing the port, would otherwise write a line per request.
+ * The count is logged when the next line of its kind is, or when the period ends, whichever comes first.
  */
 const REFUSED_LOG_EVERY_MS = 60_000;
 
 type RefusalKind = 'host' | 'origin' | 'content-type';
+
+/** What the refused requests of each kind had in common, for the line that counts them. */
+const REFUSED_WHAT: Record<RefusalKind, string> = {
+  host: 'whose Host is not this machine',
+  origin: 'from an Origin other than the dashboard\'s',
+  'content-type': 'without content-type application/json',
+};
+
+interface RefusedLog {
+  at: number;
+  skipped: number;
+  /** Logs `skipped` when the period ends, if no line of this kind has by then. */
+  flush?: ReturnType<typeof setTimeout>;
+}
 
 export interface EngineServerOptions {
   mode: Mode;
@@ -93,7 +108,7 @@ export class EngineServer {
   #scanning: Promise<void> | null = null;
   #hostnames = new Set(LOCAL_HOSTNAMES);
   readonly #origins: ReadonlySet<string>;
-  readonly #refusedLogged = new Map<RefusalKind, { at: number; skipped: number }>();
+  readonly #refusedLogged = new Map<RefusalKind, RefusedLog>();
 
   constructor(options: EngineServerOptions) {
     this.#options = options;
@@ -148,6 +163,7 @@ export class EngineServer {
     this.#running = false;
     clearTimeout(this.#timer);
     clearInterval(this.#heartbeat);
+    for (const kind of this.#refusedLogged.keys()) this.#flushRefused(kind);
     await this.#scanning;
     for (const res of this.#clients) res.end();
     this.#clients.clear();
@@ -255,11 +271,28 @@ export class EngineServer {
     const last = this.#refusedLogged.get(kind);
     if (last !== undefined && now >= last.at && now - last.at < REFUSED_LOG_EVERY_MS) {
       last.skipped++;
+      if (last.flush === undefined) {
+        // A burst that stops still has its count logged once the period is up. Unref'd: it never holds the process.
+        last.flush = setTimeout(() => this.#flushRefused(kind), last.at + REFUSED_LOG_EVERY_MS - now);
+        last.flush.unref();
+      }
       return;
     }
     const skipped = last === undefined || last.skipped === 0 ? '' : ` (and ${last.skipped} more like it since the last line)`;
+    clearTimeout(last?.flush);
     this.#refusedLogged.set(kind, { at: now, skipped: 0 });
     this.#log(`${line}${skipped}`);
+  }
+
+  /** Logs how many refusals of `kind` were left out since its last line, if any. */
+  #flushRefused(kind: RefusalKind): void {
+    const last = this.#refusedLogged.get(kind);
+    if (last === undefined) return;
+    clearTimeout(last.flush);
+    delete last.flush;
+    if (last.skipped === 0) return;
+    this.#log(`refused ${last.skipped} more ${last.skipped === 1 ? 'request' : 'requests'} ${REFUSED_WHAT[kind]} since the last line`);
+    last.skipped = 0;
   }
 
   async #route(req: IncomingMessage, res: ServerResponse): Promise<void> {
