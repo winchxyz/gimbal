@@ -149,8 +149,9 @@ impl Gimbal {
     /// desk's EVM address, a deposit address none of the desk's last 32 rescues paid, within the
     /// policy's transfer cost, with an `amountIn` Hyperliquid's perp balance can send (at most 6
     /// decimals) (`E_QUOTE_FIELDS`), within what is left of the hourly cap and of the hourly cost
-    /// budget, which counts Hyperliquid's 1 USDC send fee besides the quote's cost
-    /// (`E_RESCUE_CAP`). Owner or operator, also on a paused desk. `kind` `sendAsset`; a user-signed action, so no
+    /// budget, which counts the quote's cost, not Hyperliquid's 1 USDC send fee
+    /// ([`transfer_cost_e8`]) (`E_RESCUE_CAP`). Owner or operator, also on a paused desk. `kind`
+    /// `sendAsset`; a user-signed action, so no
     /// `expiresAfter`: the nonce window bounds a late signature.
     #[deny_unknown_arguments]
     pub fn hl_send_to_intents(

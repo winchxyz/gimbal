@@ -448,19 +448,16 @@ pub fn check_cost(q: &VerifiedQuote, max_bps: u32, max_flat_e6: u64) -> Result<(
     Ok(())
 }
 
-/// What Hyperliquid takes from the sender for a `sendAsset` to another account, USDC × 1e8, on
-/// top of the amount sent.
-pub const HL_SEND_FEE_E8: u128 = 100_000_000;
-
-/// What a verified transfer may cost the desk, USD × 1e8: `amountIn` − `minAmountOut` (0 for a
-/// quote that pays out at least what it takes), plus [`HL_SEND_FEE_E8`] for `hl_send_to_intents`.
-/// The rescue cost budget counts it.
+/// What a verified transfer may cost the desk through its quote, USD × 1e8: `amountIn` −
+/// `minAmountOut` (0 for a quote that pays out at least what it takes). The rescue cost budget
+/// counts it.
+///
+/// Hyperliquid's 1 USDC `sendAsset` fee for `hl_send_to_intents` is not in it. The budget bounds
+/// what a quote's `appFees` can pay to a third party, and that shows only in the signed quote.
+/// The send fee is burnt by Hyperliquid, like trading fees, which the contract does not bound
+/// either; counting it would fill the 1 USD budget of the policy defaults with a single send.
 pub fn transfer_cost_e8(q: &VerifiedQuote) -> u128 {
-    let signed = q.amount_in_e8.saturating_sub(q.min_amount_out_e8);
-    match q.method {
-        Method::HlSendToIntents => signed.saturating_add(HL_SEND_FEE_E8),
-        _ => signed,
-    }
+    q.amount_in_e8.saturating_sub(q.min_amount_out_e8)
 }
 
 /// What the rescues of an hour may cost together, USD × 1e8: max(`cap_usd` × `max_bps` / 10⁴,
@@ -665,12 +662,13 @@ mod tests {
             35_577_700
         );
         assert_eq!(transfer_cost_e8(&verified(400_000_000, 500_000_000)), 0);
-        // Hyperliquid's sendAsset fee on top.
+        // Hyperliquid's 1 USDC sendAsset fee is a burn, not a quote cost: the same for every
+        // method.
         let hl = VerifiedQuote {
             method: Method::HlSendToIntents,
             ..verified(400_000_000, 364_422_300)
         };
-        assert_eq!(transfer_cost_e8(&hl), 135_577_700);
+        assert_eq!(transfer_cost_e8(&hl), 35_577_700);
         // The defaults (100 bp, 0.5 USDC): 1 USD an hour up to a 100 USD cap (two flat
         // transfers), then 1% of the cap.
         assert_eq!(rescue_cost_budget_e8(50, 100, 500_000), 100_000_000);

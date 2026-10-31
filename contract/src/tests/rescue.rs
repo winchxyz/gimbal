@@ -307,7 +307,8 @@ fn a_meter_falls_linearly_over_the_hour_and_rounds_up() {
 /// The skim the review found (round 2, item 1): rescues that each cost what `check_cost` allows,
 /// the flat 0.5 USDC on any amount, could pay most of the cap away in fees an hour, on a paused
 /// desk too. The hourly cost budget, max(cap × bps / 10⁴, 2 × flat) = 1 USD at the defaults,
-/// stops it; Hyperliquid's 1 USDC send fee counts in it.
+/// stops it. It counts the signed quote's cost only, not Hyperliquid's 1 USDC send fee, a burn
+/// that pays no third party (`transfer_cost_e8`).
 #[test]
 fn the_hourly_cost_budget_stops_skimming_the_cap_through_fees() {
     let mut g = rescue_desk();
@@ -359,9 +360,12 @@ fn the_hourly_cost_budget_stops_skimming_the_cap_through_fees() {
          cost budget, 0.169506 of 1 USD"
     );
 
-    // Hyperliquid: the send fee is the whole budget at the defaults. A send that also costs
-    // through its quote is refused; one costing only the fee fits, once.
-    let mut g = rescue_desk();
+    // Hyperliquid on a 20 USD cap desk (c6-desk's): the 1 USD budget counts the quote's 0.355657,
+    // not the 1 USDC send fee, so two sends with a normal quote cost fit, and a third does not.
+    let mut g = rescue_desk_with(Policy {
+        rescue_cap_usd_per_hour: 20,
+        ..rescue_policy()
+    });
     let hl = |n: u32, min_out_e8| VerifiedQuote {
         method: Method::HlSendToIntents,
         deposit_address: Some(format!("0x{n:040x}")),
@@ -375,17 +379,19 @@ fn the_hourly_cost_budget_stops_skimming_the_cap_through_fees() {
     let send =
         |g: &mut Gimbal, q| outcome(|| g.build_hl_send_to_intents("alpha".into(), &q, "out"));
     at(operator(), NOW_MS, yocto(0));
+    send(&mut g, hl(1, 364_434_300)).unwrap();
+    send(&mut g, hl(2, 364_434_300)).unwrap();
+    assert_eq!(counters(&g).rescue_cost_e8, 2 * 35_565_700);
+    let nonces = g.hl_nonces.get("alpha").copied();
     assert_eq!(
-        send(&mut g, hl(1, 364_434_300)).unwrap_err(),
-        "E_RESCUE_CAP: the rescue may cost 1.355657 USD, over what is left of the hourly rescue \
-         cost budget, 1 of 1 USD"
+        send(&mut g, hl(3, 364_434_300)).unwrap_err(),
+        "E_RESCUE_CAP: the rescue may cost 0.355657 USD, over what is left of the hourly rescue \
+         cost budget, 0.288686 of 1 USD"
     );
-    assert_eq!(g.hl_nonces.get("alpha").copied(), None, "no nonce taken");
-    send(&mut g, hl(2, 400_000_000)).unwrap();
-    assert!(send(&mut g, hl(3, 400_000_000))
-        .unwrap_err()
-        .starts_with(E_RESCUE_CAP));
-    assert_eq!(counters(&g).rescue_cost_e8, 100_000_000);
+    assert_eq!(g.hl_nonces.get("alpha").copied(), nonces, "no nonce taken");
+    // A send costing nothing through its quote still fits.
+    send(&mut g, hl(4, 400_000_000)).unwrap();
+    assert_eq!(counters(&g).rescue_cost_e8, 2 * 35_565_700);
 }
 
 /// A quote pays once (review round 2, item 2): a rescue to a deposit address one of the desk's
@@ -948,9 +954,10 @@ fn hl_send_to_intents_sends_the_verified_amount_to_the_deposit_address() {
     let doc = recorded();
     let name = "rescue Hyperliquid -> Phoenix: HyperCore USDC to the desk Solana authority";
     let (q, sig) = quote(&doc, name);
-    // A 200 USD cap: a 2 USD cost budget, which holds the quote's 0.36 and the 1 USDC send fee.
+    // A 20 USD cap, as c6-desk: the 1 USD cost budget holds the quote's 0.36 (Hyperliquid's send
+    // fee is not counted, `transfer_cost_e8`).
     let mut g = rescue_desk_with(Policy {
-        rescue_cap_usd_per_hour: 200,
+        rescue_cap_usd_per_hour: 20,
         ..rescue_policy()
     });
     let vector = named(
