@@ -607,13 +607,13 @@ fn call_with_gas(gas: Gas) {
 
 #[test]
 fn create_desk_refuses_less_gas_than_its_floor() {
-    assert_eq!(CREATE_DESK_MIN_GAS, Gas::from_tgas(56));
+    assert_eq!(CREATE_DESK_MIN_GAS, Gas::from_tgas(62));
     let mut g = testnet();
     let short = CREATE_DESK_MIN_GAS.saturating_sub(Gas::from_gas(1));
     for gas in [short, Gas::from_tgas(10)] {
         call_with_gas(gas);
         assert_refused(
-            "E_ARGS: create_desk needs at least 56 TGas attached (100 TGas recommended), not ",
+            "E_ARGS: create_desk needs at least 62 TGas attached (100 TGas recommended), not ",
             || {
                 g.create_desk("alpha".into(), policy(), EVM.into(), solana())
                     .detach();
@@ -626,6 +626,52 @@ fn create_desk_refuses_less_gas_than_its_floor() {
     g.create_desk("alpha".into(), policy(), EVM.into(), solana())
         .detach();
     assert_eq!(function_calls().len(), 3);
+}
+
+/// The host gas (storage, hashing, logs, promise arguments) `create_desk` and then `on_desk_keys`
+/// burn for a new desk with `policy`, leaving out the gas `create_desk` attaches to its calls, and
+/// the desk's size as JSON and as borsh. The mock meters host functions, not wasm instructions.
+fn desk_gas(g: &mut Gimbal, desk_id: &str, policy: Policy) -> (u64, u64, u64, u64) {
+    call_with_gas(Gas::from_tgas(100));
+    let start = env::used_gas().as_gas();
+    g.create_desk(desk_id.into(), policy, EVM.into(), solana())
+        .detach();
+    let attached = 2 * mpc::DERIVE_GAS.as_gas() + ON_DESK_KEYS_GAS.as_gas();
+    let create = env::used_gas().as_gas() - start - attached;
+    let (id, desk, deposit) = scheduled_callback();
+    let json = serde_json::to_vec(&desk).unwrap().len() as u64;
+    let borsh = near_sdk::borsh::to_vec(&desk).unwrap().len() as u64;
+    callback(mpc_answers());
+    let start = env::used_gas().as_gas();
+    run_callback(g, id, desk, deposit).unwrap();
+    (create, env::used_gas().as_gas() - start, json, borsh)
+}
+
+#[test]
+fn the_gas_create_desk_keeps_covers_the_largest_policy() {
+    const TGAS: u64 = Gas::from_tgas(1).as_gas();
+    // `create_desk` with a one-asset policy on testnet: 3.38 TGas burnt, 1.8 TGas of receipt fees.
+    let measured = 3_380 * TGAS / 1000 + 1_800 * TGAS / 1000;
+    // Wasm work for every extra byte, which the mock does not meter: parsed from JSON and written
+    // back as JSON (the callback's arguments) at 100 instructions a byte, written as borsh at 20,
+    // at 822,756 gas an instruction.
+    let wasm = |json: u64, borsh: u64| (2 * json * 100 + borsh * 20) * 822_756;
+    let mut g = testnet();
+    let (small_create, small_keys, small_json, small_borsh) = desk_gas(&mut g, "small", policy());
+    let (create, keys, json, borsh) = desk_gas(&mut g, "large", Policy::largest_valid());
+    assert!(json > 12_000 && borsh > 8_000, "{json} {borsh}");
+    let extra = create - small_create + wasm(json - small_json, borsh - small_borsh);
+    assert!(
+        measured + extra + 4 * TGAS <= CREATE_DESK_GAS.as_gas(),
+        "create_desk: {measured} + {extra} with a 4 TGas margin is over {CREATE_DESK_GAS:?}"
+    );
+    // `on_desk_keys` parses the same JSON and stores the borsh; its host gas stays far below what
+    // it is attached, the rest being wasm work of the same size as above.
+    assert!(keys > small_keys);
+    assert!(
+        keys + wasm(json, borsh) + 10 * TGAS <= ON_DESK_KEYS_GAS.as_gas(),
+        "on_desk_keys: {keys} host gas"
+    );
 }
 
 #[test]

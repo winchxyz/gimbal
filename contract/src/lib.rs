@@ -35,13 +35,16 @@ pub const ON_DESK_KEYS_GAS: Gas = Gas::from_tgas(20);
 /// Gas for [`Gimbal::refuse`], which only panics.
 pub const REFUSE_GAS: Gas = Gas::from_tgas(5);
 
-/// What `create_desk` uses itself besides the gas it attaches, measured on testnet on 2026-10-30
+/// What `create_desk` uses itself besides the gas it attaches. Measured on testnet on 2026-10-30
 /// with a one-asset policy: it burnt 3.33 and 3.38 TGas, and prepays the execution fees of the
-/// three receipts it creates (1.8 TGas: with 60 TGas attached the callback got 24.8). Rounded up.
-pub const CREATE_DESK_GAS: Gas = Gas::from_tgas(6);
+/// three receipts it creates (1.8 TGas: with 60 TGas attached the callback got 24.8). The largest
+/// valid policy is 28 times the bytes to parse and write back; the unit test
+/// `the_gas_create_desk_keeps_covers_the_largest_policy` adds its host gas and an estimate of that
+/// wasm work, and keeps a 4 TGas margin on top.
+pub const CREATE_DESK_GAS: Gas = Gas::from_tgas(12);
 
 /// The least prepaid gas `create_desk` accepts (`E_ARGS` below it): its own cost, the two MPC calls
-/// and the callback, 56 TGas. Clients attach 100 TGas; a shorter call would otherwise fail on the
+/// and the callback, 62 TGas. Clients attach 100 TGas; a shorter call would otherwise fail on the
 /// host's gas error with no code to match on.
 pub const CREATE_DESK_MIN_GAS: Gas = Gas::from_gas(
     CREATE_DESK_GAS.as_gas() + 2 * mpc::DERIVE_GAS.as_gas() + ON_DESK_KEYS_GAS.as_gas(),
