@@ -102,7 +102,7 @@ pub(super) fn order(asset: u32, px: &str, sz: &str) -> HlOrder {
     }
 }
 
-/// A priced order: refused (`E_ORACLE_STALE`) until the contract stores prices (C6).
+/// A priced order: refused (`E_ORACLE_STALE`) while no ETH price is stored.
 fn eth() -> HlOrder {
     order(1, "2500", "0.1")
 }
@@ -201,8 +201,9 @@ fn nonce_of(desk_id: &str, g: &Gimbal) -> u64 {
 
 #[test]
 fn hl_order_signs_the_vector_bytes() {
-    // Until prices are stored (C6) only unpriced symbols sign, so the vectors' assets are listed
-    // as unpriced here, with caps none of their orders reach.
+    // The l1 vectors price their orders with no one oracle price in mind, so their assets are
+    // listed as unpriced here, with caps none of their orders reach; `tests::prices` runs the
+    // priced `order_policy` rows against stored prices.
     let mut p = hl_policy();
     p.unpriced = ["BTC", "ETH", "SOL", "DOGE"]
         .iter()
@@ -276,10 +277,10 @@ fn hl_order_refuses_what_the_policy_does_not_allow() {
     g.prepare_hl_order("alpha".into(), order(159, "33.33", "3"), String::new());
 }
 
-/// No prices are stored before C6, so every priced order is refused, whatever its size and side:
-/// the oversize order and the tiny-price sell of the C3 review included.
+/// With no price stored every priced order is refused, whatever its size and side: the oversize
+/// order and the tiny-price sell of the C3 review included.
 #[test]
-fn a_priced_order_is_refused_until_prices_are_stored() {
+fn a_priced_order_is_refused_without_a_stored_price() {
     let mut g = hl_desk();
     let mut tiny_sell = order(1, "1", "1000");
     tiny_sell.is_buy = false;
