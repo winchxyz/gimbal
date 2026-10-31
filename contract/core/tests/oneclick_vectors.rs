@@ -235,3 +235,73 @@ fn the_recorded_costs_against_the_default_bound() {
         }
     }
 }
+
+/// Any signature: for a quote 1Click would not sign, to reach the field rules.
+fn any_signature(_: &[u8; 64], _: &[u8], _: &[u8; 32]) -> bool {
+    true
+}
+
+/// A quote into its own origin asset only pays fees: refused even when it pays a desk address,
+/// before the refund and recipient rules (review round 2, item 1).
+#[test]
+fn a_quote_into_its_own_origin_asset_is_refused() {
+    let [_, (_, live)] = files();
+    let name = "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address";
+    let q = quote(&live, name);
+    let c = live["field_cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == format!("as quoted: {name}"))
+        .unwrap();
+    let ctx = context(&c["ctx"]);
+    let canonical = s(&q["canonical_json"]);
+    let signature = s(&q["signature"]);
+    // As quoted it passes, with the stand-in verifier as with the real one.
+    for verify in [
+        ed25519_verify as fn(&[u8; 64], &[u8], &[u8; 32]) -> bool,
+        any_signature,
+    ] {
+        verify_quote(
+            sha256,
+            verify,
+            canonical,
+            signature,
+            Method::SolSignRescue,
+            &ctx,
+        )
+        .unwrap();
+    }
+    // Solana USDC back to the desk's Solana authority, the desk's own pair for Solana USDC.
+    let looped = canonical
+        .replace(HL_USDC, SOL_USDC)
+        .replace(ctx.desk.evm, ctx.desk.sol);
+    assert_ne!(looped, canonical);
+    let r = verify_quote(
+        sha256,
+        any_signature,
+        &looped,
+        signature,
+        Method::SolSignRescue,
+        &ctx,
+    )
+    .unwrap_err();
+    assert_eq!(
+        r.to_string(),
+        format!(
+            "E_QUOTE_FIELDS: destinationAsset is the originAsset {SOL_USDC}: a transfer into the \
+             same asset only pays fees"
+        )
+    );
+    // 1Click's real signature does not cover it.
+    let r = verify_quote(
+        sha256,
+        ed25519_verify,
+        &looped,
+        signature,
+        Method::SolSignRescue,
+        &ctx,
+    )
+    .unwrap_err();
+    assert_eq!(r.code, E_QUOTE_SIGNATURE);
+}

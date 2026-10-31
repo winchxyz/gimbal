@@ -107,9 +107,13 @@ fn the_l1_domain_and_agent_type_match() {
 }
 
 /// `expiresAfter` enters the L1 hash as `0x00` ‖ u64 big-endian after the vault byte, as
-/// hyperliquid-python-sdk's `action_hash` writes it. The hashes below were computed outside this
-/// crate (viem's keccak256 and hashTypedData over the SDK's byte layout and the vectors' msgpack,
-/// 2026-10-31), for two vector actions at their own nonce with expiresAfter = nonce + 60 s.
+/// hyperliquid-python-sdk's `action_hash` writes it. The hashes below are the SDK's own output
+/// (hyperliquid-python-sdk 0.24.0 with eth-account 0.13.7 and msgpack 1.2.4, 2026-10-31): the two
+/// vector actions built with its `order_request_to_order_wire` / `order_wires_to_order_action`
+/// (the cancel as `Exchange.bulk_cancel` writes it), their msgpack checked against the vectors',
+/// `action_hash(action, None, nonce, nonce + 60 s)` for the connection id, and the EIP-191 hash of
+/// `encode_typed_data(l1_payload(construct_phantom_agent(...)))` for each network, which a
+/// `sign_l1_action` signature with the same `expires_after` recovers from.
 #[test]
 fn expires_after_enters_the_l1_hash_as_the_sdk_writes_it() {
     let doc = doc();

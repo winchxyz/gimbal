@@ -5,9 +5,11 @@
 //! is 1Click's `ed25519:<base58>`. The signature is checked first, over the UTF-8 of
 //! base58(sha256(`quote`)), before anything is parsed (`E_QUOTE_SIGNATURE`). Then the fields, in
 //! the order of `field_rule` in `tests/vectors/oneclick.json`: a live quote, the method's origin
-//! asset, `refundTo`, `recipientType`, the recipient and destination pair, the deadline, and for
-//! a rescue the remaining hourly cap (`E_QUOTE_FIELDS`, `E_RESCUE_CAP`). [`check_cost`] bounds
-//! what the transfer may cost through the signed `minAmountOut`.
+//! asset (and a destination asset that is not it), `refundTo`, `recipientType`, the recipient and
+//! destination pair, the deadline, and for a rescue the remaining hourly cap (`E_QUOTE_FIELDS`,
+//! `E_RESCUE_CAP`). [`check_cost`] bounds what one transfer may cost through the signed
+//! `minAmountOut`; [`transfer_cost_e8`] and [`rescue_cost_budget_e8`] bound what the rescues of an
+//! hour may cost together.
 //!
 //! sha256 and the Ed25519 check come from the caller, so the contract uses the host's.
 
@@ -257,10 +259,22 @@ pub fn verify_quote(
             method.origin_asset()
         )));
     }
+    // Out of an asset into the same asset moves nothing a desk needs and only pays fees, each up
+    // to what `check_cost` allows: a loop an operator could repeat to drain the desk.
+    if f.destination_asset == f.origin_asset {
+        return Err(fields(format!(
+            "destinationAsset is the originAsset {}: a transfer into the same asset only pays fees",
+            method.origin_asset()
+        )));
+    }
 
     let refund_to_ok = match method {
         Method::SolSignRescue => f.refund_to == ctx.desk.sol,
         Method::HlSendToIntents | Method::EvmUsdcToIntents => same_evm(&f.refund_to, ctx.desk.evm),
+        // TODO(C8 fund_venue): a 1Click refund to refundTo = the contract most likely arrives as
+        // a plain `ft_transfer` (no `ft_on_transfer`, no msg), which credits no desk: fund_venue
+        // must record the deposit address it paid per desk and credit a refund from it, or the
+        // owner's USDC sits in the contract unassigned.
         Method::FundVenue => f.refund_to == ctx.contract,
     };
     if !refund_to_ok {
@@ -432,6 +446,30 @@ pub fn check_cost(q: &VerifiedQuote, max_bps: u32, max_flat_e6: u64) -> Result<(
         )));
     }
     Ok(())
+}
+
+/// What Hyperliquid takes from the sender for a `sendAsset` to another account, USDC × 1e8, on
+/// top of the amount sent.
+pub const HL_SEND_FEE_E8: u128 = 100_000_000;
+
+/// What a verified transfer may cost the desk, USD × 1e8: `amountIn` − `minAmountOut` (0 for a
+/// quote that pays out at least what it takes), plus [`HL_SEND_FEE_E8`] for `hl_send_to_intents`.
+/// The rescue cost budget counts it.
+pub fn transfer_cost_e8(q: &VerifiedQuote) -> u128 {
+    let signed = q.amount_in_e8.saturating_sub(q.min_amount_out_e8);
+    match q.method {
+        Method::HlSendToIntents => signed.saturating_add(HL_SEND_FEE_E8),
+        _ => signed,
+    }
+}
+
+/// What the rescues of an hour may cost together, USD × 1e8: max(`cap_usd` × `max_bps` / 10⁴,
+/// 2 × `max_flat_e6`), the policy's per-transfer bound applied once to the whole hourly cap, or
+/// two transfers at the flat bound. Without it many small rescues, each within [`check_cost`]
+/// (the flat part allows 0.5 USDC on any amount), could pay most of the cap away in fees.
+pub fn rescue_cost_budget_e8(cap_usd: u64, max_bps: u32, max_flat_e6: u64) -> u128 {
+    let share = u128::from(cap_usd) * 100_000_000 * u128::from(max_bps) / 10_000;
+    share.max(2 * u128::from(max_flat_e6) * 100)
 }
 
 fn same_evm(a: &str, b: &str) -> bool {
@@ -617,6 +655,32 @@ mod tests {
         assert!(check_cost(&verified(10_000_000_000, 9_899_999_999), 100, 500_000).is_err());
         // A quote paying out more than it takes costs nothing.
         assert!(check_cost(&verified(400_000_000, 500_000_000), 0, 0).is_ok());
+    }
+
+    #[test]
+    fn the_cost_of_a_transfer_and_the_hourly_budget() {
+        // 4 in, 3.644223 out: 0.355777; nothing for a quote paying out more than it takes.
+        assert_eq!(
+            transfer_cost_e8(&verified(400_000_000, 364_422_300)),
+            35_577_700
+        );
+        assert_eq!(transfer_cost_e8(&verified(400_000_000, 500_000_000)), 0);
+        // Hyperliquid's sendAsset fee on top.
+        let hl = VerifiedQuote {
+            method: Method::HlSendToIntents,
+            ..verified(400_000_000, 364_422_300)
+        };
+        assert_eq!(transfer_cost_e8(&hl), 135_577_700);
+        // The defaults (100 bp, 0.5 USDC): 1 USD an hour up to a 100 USD cap (two flat
+        // transfers), then 1% of the cap.
+        assert_eq!(rescue_cost_budget_e8(50, 100, 500_000), 100_000_000);
+        assert_eq!(rescue_cost_budget_e8(100, 100, 500_000), 100_000_000);
+        assert_eq!(rescue_cost_budget_e8(1000, 100, 500_000), 1_000_000_000);
+        assert_eq!(rescue_cost_budget_e8(0, 100, 0), 0);
+        assert_eq!(
+            rescue_cost_budget_e8(u64::MAX, u32::MAX, u64::MAX),
+            u128::from(u64::MAX) * 100_000_000 * u128::from(u32::MAX) / 10_000
+        );
     }
 
     #[test]
