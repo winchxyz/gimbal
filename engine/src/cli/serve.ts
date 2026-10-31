@@ -30,7 +30,7 @@ import type { NearHealth } from '../contract/budget.ts';
 import { ReplayOracle } from '../contract/replay-oracle.ts';
 import { liveReaders, replayReaders } from '../readers.ts';
 import type { Readers } from '../readers.ts';
-import { DEFAULT_SCANNER_CONFIG, DEFAULT_STRATEGY } from '../scanner/config.ts';
+import { DEFAULT_STRATEGY, ORDERLY_BROKERS, scannerConfigFor } from '../scanner/config.ts';
 import { Scanner } from '../scanner/scanner.ts';
 import type { ScanResult } from '../scanner/scanner.ts';
 import { DEFAULT_ENGINE_HOST, DEFAULT_ENGINE_PORT, EngineServer } from '../server.ts';
@@ -141,8 +141,15 @@ if (mode === 'replay') {
 }
 
 let server: EngineServer | null = null;
+// The costs of the network the desk trades on: testnet prices Orderly under woofi_dex, mainnet and replay (recorded
+// mainnet answers) under gimbal_dex.
+const scannerConfig = { ...scannerConfigFor(mode), policy };
+const fees = scannerConfig.costs.fees;
+const fill = (v: keyof typeof fees) => `${v} ${fees[v].takerBps + fees[v].extraBps} bps`;
+log(`scanner costs (${mode}): taker fill ${fill('hyperliquid')}, ${fill('phoenix')}, ${fill('orderly')} `
+  + `(Orderly broker ${ORDERLY_BROKERS[mode === 'testnet' ? 'testnet' : 'mainnet'].brokerId})`);
 const scanner = new Scanner(readers.venues, readers.watch, {
-  config: { ...DEFAULT_SCANNER_CONFIG, policy },
+  config: scannerConfig,
   clock,
   oracle: contract?.prices ?? replayOracle,
   marginHeldAt: () => marginVenues(server?.state().desk ?? null),
@@ -166,7 +173,7 @@ server = new EngineServer({
   scanner,
   strategy: DEFAULT_STRATEGY,
   policy,
-  intervalMs: DEFAULT_SCANNER_CONFIG.intervalMs,
+  intervalMs: scannerConfig.intervalMs,
   log,
   onScan: (r) => {
     scans++;

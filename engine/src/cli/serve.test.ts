@@ -111,3 +111,11 @@ test('replay prices desk legs from the recording on the replay clock: priced leg
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('the scanner gets the costs of the mode: testnet prices Orderly under woofi_dex, replay (mainnet answers) under gimbal_dex', async () => {
+  // Stopped at the costs line, before the first scan: no venue is read.
+  const testnet = await run(['--port', '0'], { GIMBAL_MODE: 'testnet', GIMBAL_CONTRACT_ID: '' }, /scanner costs .*\)\n/);
+  assert.match(testnet.out, /scanner costs \(testnet\): taker fill hyperliquid 5\.5 bps, phoenix 3\.5 bps, orderly 4\.5 bps \(Orderly broker woofi_dex\)/);
+  const replay = await run(['--port', '0'], {}, /scanner costs .*\)\n/);
+  assert.match(replay.out, /scanner costs \(replay\): taker fill hyperliquid 5\.5 bps, phoenix 3\.5 bps, orderly 4 bps \(Orderly broker gimbal_dex\)/);
+});
