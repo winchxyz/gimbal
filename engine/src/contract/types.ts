@@ -127,6 +127,51 @@ export class MpcTimeoutError extends Error {
   }
 }
 
+/** Every id the engine holds for an action whose outcome it cannot prove: what reconciliation looks up. */
+export interface OutcomeIds {
+  /** The NEAR transaction that asked for the signature. */
+  nearTx?: string;
+  /** Hyperliquid: the order's client order id (orderStatus by cloid) and the action's nonce. */
+  hlCloid?: string;
+  hlNonce?: number;
+  /** Solana: the transaction signature (getSignatureStatuses with history). */
+  solSignature?: string;
+  /** Arbitrum: the transaction hash, and the EIP-3009 nonce (USDC authorizationState). */
+  arbitrumTx?: string;
+  eip3009Nonce?: string;
+}
+
+/**
+ * Sent, and no proof either way: the action may have executed, or may still execute (a transaction still in a
+ * mempool, a late MPC signature someone posts). Callers reconcile from the venue's state by these ids before doing
+ * anything else; they never retry on this error and never build a fresh action in its place.
+ */
+export class OutcomeUnknown extends Error {
+  readonly what: string;
+  readonly detail: string;
+  readonly ids: OutcomeIds;
+  readonly tx: TxRef[];
+  constructor(what: string, detail: string, ids: OutcomeIds, tx: TxRef[] = []) {
+    super(`${what}: outcome unknown, reconcile before acting (${describeIds(ids)}): ${detail}`);
+    this.name = 'OutcomeUnknown';
+    this.what = what;
+    this.detail = detail;
+    this.ids = ids;
+    this.tx = tx;
+  }
+
+  /** The same error with ids (and transactions) a caller knows on top: the cloid it chose, the NEAR transaction. */
+  with(ids: OutcomeIds, tx: TxRef[] = []): OutcomeUnknown {
+    const known = new Set(this.tx.map((t) => `${t.chain} ${t.id}`));
+    return new OutcomeUnknown(this.what, this.detail, { ...ids, ...this.ids }, [...tx.filter((t) => !known.has(`${t.chain} ${t.id}`)), ...this.tx]);
+  }
+}
+
+function describeIds(ids: OutcomeIds): string {
+  const parts = Object.entries(ids).filter(([, v]) => v !== undefined && v !== null).map(([k, v]) => `${k} ${String(v)}`);
+  return parts.length === 0 ? 'no ids' : parts.join(', ');
+}
+
 /** The operator account cannot pay for one more signature (gas reservation or key allowance below one call). */
 export class SignatureBudgetError extends Error {
   constructor(message: string) {
@@ -152,9 +197,14 @@ export function parseRefusal(text: string): { code: string; message: string } | 
   return null;
 }
 
-/** True when a NEAR failure means the MPC network gave no signature: a timeout, or E_MPC from the callback. */
+/**
+ * True when a NEAR failure means the MPC network gave no signature: E_MPC from the callback, or a bare "timed out"
+ * with no refusal code. A refusal is read first, so `E_ORACLE_STALE: … timed out` stays a refusal.
+ */
 export function isMpcTimeout(text: string): boolean {
-  return /timed out/i.test(text) || /\bE_MPC\b/.test(text);
+  const refusal = parseRefusal(text);
+  if (refusal !== null) return refusal.code === 'E_MPC';
+  return /timed out/i.test(text);
 }
 
 /**

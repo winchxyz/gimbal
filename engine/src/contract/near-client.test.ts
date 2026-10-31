@@ -9,7 +9,7 @@ import type { NearCallOutcome, NearTransport } from './near-client.ts';
 import { NearContractClient, parseSignedAction, parseStoredPrices } from './near-client.ts';
 import { allowanceOf, outcomeOf } from './near-transport.ts';
 import type { HlOrder } from './types.ts';
-import { ContractRefusal, MpcTimeoutError, SignatureBudgetError, isMpcTimeout, parseRefusal } from './types.ts';
+import { ContractRefusal, MpcTimeoutError, OutcomeUnknown, SignatureBudgetError, isMpcTimeout, parseRefusal } from './types.ts';
 
 const DESK = 'alpha';
 const ORDER: HlOrder = { asset: 1, is_buy: true, px: '2400.5', sz: '0.0042', reduce_only: false, tif: 'Ioc', cloid: null };
@@ -29,6 +29,8 @@ class FakeChain implements NearTransport {
   balance = 5n * YOCTO_PER_NEAR;
   allowanceLeft: bigint | null = 5n * YOCTO_PER_NEAR;
   views = new Map<string, unknown>();
+  /** Views answered by a function, read at each call (state that a call changes). */
+  live = new Map<string, () => unknown>();
   delayMs = 0;
 
   async call(_contract: string, method: string, args: object, tgas: number): Promise<NearCallOutcome> {
@@ -40,7 +42,9 @@ class FakeChain implements NearTransport {
     return answer === undefined ? { txHash: hash, ok: true, value: signed(method, a) } : { ...answer(method, a), txHash: hash };
   }
   async view<T>(_contract: string, method: string, args: object): Promise<T> {
-    return this.views.get(`${method} ${JSON.stringify(args)}`) as T;
+    const key = `${method} ${JSON.stringify(args)}`;
+    const fn = this.live.get(key);
+    return (fn === undefined ? this.views.get(key) : fn()) as T;
   }
   async account() {
     return { amount: this.balance, locked: 0n, storageUsage: 0 };
@@ -54,7 +58,7 @@ const timeout = (): NearCallOutcome => ({ txHash: '', ok: false, failure: '{"Act
 const refusal = (text: string) => (): NearCallOutcome => ({ txHash: '', ok: false, failure: `{"ActionError":{"kind":{"FunctionCallError":{"ExecutionError":"Smart contract panicked: ${text}"}}}}` });
 
 function client(chain: FakeChain, extra: Partial<ConstructorParameters<typeof NearContractClient>[0]> = {}) {
-  return new NearContractClient({ contractId: 'gimbal.testnet', network: 'testnet', transport: chain, ...extra });
+  return new NearContractClient({ contractId: 'gimbal.testnet', network: 'testnet', transport: chain, sleep: async () => {}, ...extra });
 }
 
 test('hl_order sends the order as the contract takes it, at 300 TGas, and returns the SignedAction with its NEAR tx', async () => {
@@ -78,10 +82,10 @@ test('a refusal comes back as ContractRefusal with its code, not retried', async
   assert.equal(chain.calls.length, 1);
 });
 
-test('an MPC timeout on a contract-nonced method is retried once with the same arguments', async () => {
+test('an MPC timeout on an idempotent method is retried once with the same arguments', async () => {
   const chain = new FakeChain();
   chain.answers.push(timeout);
-  const action = await client(chain).hlOrder(DESK, ORDER, 'enter');
+  const action = await client(chain).hlCancel(DESK, 1, 77, 'stop');
   assert.equal(chain.calls.length, 2);
   assert.deepEqual(chain.calls[0]!.args, chain.calls[1]!.args);
   assert.equal(action.nearTx?.id, 'tx2');
@@ -96,8 +100,8 @@ test('orderly_request retries with a fresh timestamp; sol_sign and orderly_regis
   let now = 1_000_000;
   const chain = new FakeChain();
   chain.answers.push(() => { now += 120_000; return timeout(); });
-  const req: OrderlyRequest = { kind: 'order', symbol: 'PERP_ETH_USDC', reduce_only: false, timestamp_ms: now };
-  await client(chain, { now: () => now }).orderlyRequest(DESK, req, 'hedge');
+  const req: OrderlyRequest = { kind: 'cancel', symbol: 'PERP_ETH_USDC', order_id: 5, reduce_only: false, timestamp_ms: now };
+  await client(chain, { now: () => now }).orderlyRequest(DESK, req, 'stop');
   assert.equal((chain.calls[0]!.args.req as OrderlyRequest).timestamp_ms, 1_000_000);
   assert.equal((chain.calls[1]!.args.req as OrderlyRequest).timestamp_ms, 1_120_000);
 
@@ -175,4 +179,112 @@ test('transport parsing: final statuses and key allowances', () => {
   assert.equal(allowanceOf({ FunctionCall: { allowance: '4700000000000000000000000', receiver_id: 'g', method_names: [] } }), 4_700_000_000_000_000_000_000_000n);
   assert.equal(allowanceOf({ FunctionCall: { allowance: null, receiver_id: 'g', method_names: [] } }), null);
   assert.equal(allowanceOf('FullAccess'), null);
+});
+
+test('a money move is never signed twice: an MPC timeout, or a failure without a refusal code, is OutcomeUnknown', async () => {
+  const quote = { quote: { amountIn: '5000000' }, quote_signature: 'ed25519:q' };
+  const moves: [string, (c: NearContractClient) => Promise<unknown>][] = [
+    ['hl_order', (c) => c.hlOrder(DESK, ORDER, 'enter')],
+    ['hl_usd_class_transfer', (c) => c.hlUsdClassTransfer(DESK, '25', true, 'margin')],
+    ['hl_send_to_intents', (c) => c.hlSendToIntents(DESK, quote, 'rescue')],
+    ['evm_usdc_to_intents', (c) => c.evmUsdcToIntents(DESK, quote, 'rescue')],
+    ['orderly_withdraw', (c) => c.orderlyWithdraw(DESK, '2000000', 3)],
+    ['orderly_settle_pnl', (c) => c.orderlySettlePnl(DESK, 4)],
+    ['orderly_request', (c) => c.orderlyRequest(DESK, { kind: 'order', symbol: 'PERP_ETH_USDC', reduce_only: false, timestamp_ms: 1 }, 'hedge')],
+  ];
+  for (const [method, call] of moves) {
+    for (const answer of [timeout, () => ({ txHash: '', ok: false, failure: 'Exceeded the prepaid gas.' }) as NearCallOutcome]) {
+      const chain = new FakeChain();
+      chain.answers.push(answer);
+      await assert.rejects(call(client(chain)), (err: unknown) => {
+        assert.ok(err instanceof OutcomeUnknown, `${method}: ${String(err)}`);
+        assert.equal(err.ids.nearTx, 'tx1');
+        assert.equal(err.what, method);
+        return true;
+      });
+      assert.equal(chain.calls.length, 1, method);
+    }
+  }
+  // fund_venue too (its ledger is read before the call).
+  const chain = new FakeChain();
+  chain.views.set(`get_desk ${JSON.stringify({ desk_id: DESK })}`, { ledger: { idle_usdc: 9_000_000 } });
+  chain.answers.push(timeout);
+  await assert.rejects(client(chain).fundVenue(DESK, quote, 'fund'), OutcomeUnknown);
+  assert.equal(chain.calls.length, 1);
+});
+
+test('fund_venue is checked by the ledger: idle USDC must drop by amountIn, else OutcomeUnknown', async () => {
+  const quote = { quote: { amountIn: '5000000' }, quote_signature: 'ed25519:q' };
+  let idle = 9_000_000;
+  const chain = new FakeChain();
+  chain.live.set(`get_desk ${JSON.stringify({ desk_id: DESK })}`, () => ({ ledger: { idle_usdc: idle } }));
+  chain.answers.push(() => { idle -= 5_000_000; return { txHash: '', ok: true, value: null }; });
+  assert.deepEqual((await client(chain).fundVenue(DESK, quote, 'fund')).map((t) => t.id), ['tx1']);
+  chain.answers.push(() => ({ txHash: '', ok: true, value: false }));
+  await assert.rejects(client(chain).fundVenue(DESK, quote, 'fund'), (err: unknown) => {
+    assert.ok(err instanceof OutcomeUnknown);
+    assert.match(err.message, /returned false; the desk's idle USDC went from 4000000 to 4000000, the quote sends 5000000/);
+    return true;
+  });
+});
+
+test('pause goes out at 10 TGas past a full or empty budget, and is read back from get_desk', async () => {
+  const chain = new FakeChain();
+  chain.allowanceLeft = 0n;                                  // the budget is 'down': MPC calls are refused
+  let paused = false;
+  chain.live.set(`get_desk ${JSON.stringify({ desk_id: DESK })}`, () => ({ paused }));
+  chain.answers.push(() => { paused = true; return { txHash: '', ok: true, value: null }; });
+  const health: string[] = [];
+  const c = client(chain, { onHealth: (s) => health.push(s) });
+  await assert.rejects(c.hlOrder(DESK, ORDER, 'enter'), SignatureBudgetError);
+  const tx = await c.pause(DESK);
+  assert.deepEqual(chain.calls.map((x) => [x.method, x.tgas]), [['set_paused', 10]]);
+  assert.deepEqual(chain.calls[0]!.args, { desk_id: DESK, paused: true });
+  assert.equal(tx[0]!.id, 'tx1');
+  assert.deepEqual(health, ['down']);
+  // A pause that ran but left the desk running is an error, not a success.
+  const stuck = new FakeChain();
+  stuck.views.set(`get_desk ${JSON.stringify({ desk_id: DESK })}`, { paused: false });
+  stuck.answers.push(() => ({ txHash: '', ok: true, value: null }));
+  await assert.rejects(client(stuck).pause(DESK), /does not say paused/);
+  stuck.answers.push(() => ({ txHash: '', ok: true, value: 'odd' }));
+  await assert.rejects(client(stuck).pause(DESK), /set_paused returned "odd"/);
+});
+
+test('pause does not wait behind MPC calls that hold every budget slot', async () => {
+  const chain = new FakeChain();
+  chain.balance = 3n * YOCTO_PER_NEAR / 10n;                 // one 300 TGas slot
+  chain.delayMs = 30;
+  let paused = false;
+  chain.live.set(`get_desk ${JSON.stringify({ desk_id: DESK })}`, () => ({ paused }));
+  const c = client(chain);
+  const order = c.hlCancel(DESK, 1, 5, 'stop');
+  await new Promise((r) => setImmediate(r));
+  assert.equal(c.inFlight, 1);
+  chain.answers.push((m, a) => ({ txHash: '', ok: true, value: signed(m, a) }));
+  chain.answers.push(() => { paused = true; return { txHash: '', ok: true, value: null }; });
+  const pause = c.pause(DESK);
+  await Promise.all([order, pause]);
+  assert.deepEqual(chain.calls.map((x) => x.method), ['hl_cancel', 'set_paused']);
+});
+
+test('refresh_prices is read back: every asset asked for needs a newer stored price', async () => {
+  const chain = new FakeChain();
+  let at = 5;
+  chain.live.set('prices {}', () => [{ asset: 'ETH', price_e8: 250_000_000_000, at_ms: at }]);
+  chain.answers.push(() => { at = 9; return { txHash: '', ok: true, value: null }; });
+  assert.equal((await client(chain).refreshPrices(['ETH'])).length, 1);
+  chain.answers.push(() => ({ txHash: '', ok: true, value: null }));
+  await assert.rejects(client(chain).refreshPrices(['ETH', 'BTC']), /prices\(\) has no newer price for ETH, BTC/);
+  chain.answers.push(() => ({ txHash: '', ok: true, value: false }));
+  await assert.rejects(client(chain).refreshPrices(['ETH']), /returned false/);
+});
+
+test('a refusal code is read before "timed out": E_ORACLE_STALE that mentions a timeout stays a refusal', async () => {
+  assert.ok(!isMpcTimeout('Smart contract panicked: E_ORACLE_STALE: the oracle timed out'));
+  assert.ok(isMpcTimeout('Smart contract panicked: E_MPC: Request has timed out.'));
+  const chain = new FakeChain();
+  chain.answers.push(refusal('E_ORACLE_STALE: the oracle request timed out'));
+  await assert.rejects(client(chain).hlCancel(DESK, 1, 5, 'stop'), (err: unknown) => err instanceof ContractRefusal && err.code === 'E_ORACLE_STALE');
+  assert.equal(chain.calls.length, 1);
 });

@@ -96,11 +96,12 @@ export class SignatureBudget {
   /**
    * Waits until a call of `tgas` fits, then counts it in flight; the returned function releases it (call it once the
    * transaction has its outcome, success or not). Throws SignatureBudgetError, after raising 'down', when even one
-   * call does not fit with nothing in flight, or when the wait runs past maxWaitMs.
+   * call does not fit with nothing in flight on two reads pollMs apart, or when the wait runs past maxWaitMs.
    */
   async acquire(tgas: number = DEFAULT_CALL_TGAS): Promise<() => void> {
     const need = reserveFor(tgas);
     const started = this.#now();
+    let readAgain = true;
     for (;;) {
       const r = await this.room();
       const held = this.#inFlight.reduce((sum, x) => sum + x, 0n);
@@ -120,6 +121,12 @@ export class SignatureBudget {
           this.#waiters = [];
           for (const w of waiters) w();
         };
+      }
+      if (this.#inFlight.length === 0 && readAgain) {
+        // A call that just ended may not have its refund in the reads yet: one more read, pollMs later, decides.
+        readAgain = false;
+        await this.#sleep(this.#pollMs);
+        continue;
       }
       if (this.#inFlight.length === 0) {
         const detail = `operator key cannot pay for one more signature (${formatNear(need)} each): ${describe(r)}`;

@@ -79,3 +79,20 @@ test('a call that waits too long for a slot gives up with the reason', async () 
   await assert.rejects(budget.acquire(), /waited \d+ s for a signature slot/);
   held();
 });
+
+test('with nothing in flight it reads once more before down: a refund still pending does not trip it', async () => {
+  let reads = 0;
+  const health: string[] = [];
+  const budget = new SignatureBudget({
+    reads: {
+      account: async () => ({ amount: near(5), locked: 0n, storageUsage: 0 }),
+      // The last call's 0.3 NEAR is still held on the first read; the refund shows on the second.
+      allowance: async () => (++reads === 1 ? near(0.2) : near(0.5)),
+    },
+    ...instant, onHealth: (s) => health.push(s),
+  });
+  const release = await budget.acquire();
+  assert.equal(reads, 2);
+  assert.deepEqual(health, []);
+  release();
+});

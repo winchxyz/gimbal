@@ -2,9 +2,14 @@
 // (docs/interfaces.md §1.3). Every action method runs the same steps:
 //   1. the signature budget (budget.ts) admits the call, after reading the balance and the key's allowance;
 //   2. one transaction of 300 TGas to the contract; its result is on_signed's SignedAction (§1.4);
-//   3. a refusal comes back as ContractRefusal with its E_* code; an MPC timeout ("Request has timed out", E_MPC) is
-//      retried once where the client can make the inputs fresh itself, else thrown as MpcTimeoutError for the
-//      caller that owns them.
+//   3. a refusal comes back as ContractRefusal with its E_* code. An MPC timeout ("Request has timed out", E_MPC)
+//      on a read-only or idempotent method is retried once (with a fresh timestamp where the client owns one);
+//      where only the caller can renew the input (a blockhash) it is MpcTimeoutError. On a method that moves money
+//      or opens a position it is OutcomeUnknown: the contract takes a fresh Hyperliquid nonce or EIP-3009 counter
+//      in the first receipt, so a retry would sign a second action, while a late MPC `respond` can still publish
+//      the first signature for anyone to post.
+// set_paused is the exception to step 1: its own small gas, past the budget's queue and its 'down' refusal, so a
+// pause always goes out.
 // The chain is behind NearTransport (near-transport.ts in production, a fake in tests), so nothing here needs keys.
 
 import type { TxRef } from '@gimbal/shared';
@@ -15,7 +20,10 @@ import type {
   ContractClient, DeskView, Eip3009SignedAction, HlOrder, HlSignedAction, SignedAction, SignedQuote, SolSignedAction,
   StoredPrice,
 } from './types.ts';
-import { ContractRefusal, MpcTimeoutError, isMpcTimeout, parseRefusal } from './types.ts';
+import { ContractRefusal, MpcTimeoutError, OutcomeUnknown, isMpcTimeout, parseRefusal } from './types.ts';
+
+/** set_paused writes one flag and logs one event: ~10 TGas, far below an MPC call's 300. */
+export const PAUSE_TGAS = 10;
 
 export type NearNetwork = 'mainnet' | 'testnet';
 
@@ -36,9 +44,16 @@ export interface NearTransport {
 
 /** How a method is retried after an MPC timeout. */
 type Retry =
-  | 'same'          // the contract stamps its own nonce or block time: the same arguments sign something fresh
-  | 'fresh'         // the arguments carry a timestamp the client renews (orderly_request)
-  | 'caller';       // only the caller can renew the input (a Solana blockhash, an Orderly registration nonce)
+  | 'same'          // read-only or idempotent (a cancel, a fee approval, prices): signing the same arguments twice is harmless
+  | 'fresh'         // the same, with a timestamp the client renews (orderly_request other than an order)
+  | 'caller'        // only the caller can renew the input (a Solana blockhash, an Orderly registration nonce)
+  | 'never';        // moves money or opens a position: an MPC timeout, or any failure that is not a refusal, is OutcomeUnknown
+
+interface CallOptions {
+  tgas?: number;
+  /** false: no budget slot (set_paused), so neither the queue nor the 'down' refusal can hold it back. */
+  budget?: boolean;
+}
 
 export interface NearContractClientOptions {
   contractId: string;
@@ -51,6 +66,7 @@ export interface NearContractClientOptions {
   /** A signature slower than this marks NEAR 'slow' (MPC usually signs in 5–6 s); default 30 s. */
   slowMs?: number;
   now?: () => number;
+  sleep?: (ms: number) => Promise<void>;
   tgas?: number;
 }
 
@@ -75,6 +91,7 @@ export class NearContractClient implements ContractClient {
   readonly #onHealth: (status: NearHealth, detail: string) => void;
   readonly #slowMs: number;
   readonly #now: () => number;
+  readonly #sleep: (ms: number) => Promise<void>;
   readonly #tgas: number;
   #health: NearHealth = 'ok';
 
@@ -86,9 +103,11 @@ export class NearContractClient implements ContractClient {
     this.#budget = options.budget ?? new SignatureBudget({
       reads: { account: () => this.#transport.account(), allowance: () => this.#transport.allowance() },
       onHealth: (status, detail) => this.#setHealth(status, detail),
+      ...(options.sleep === undefined ? {} : { sleep: options.sleep }),
     });
     this.#slowMs = options.slowMs ?? 30_000;
     this.#now = options.now ?? Date.now;
+    this.#sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.#tgas = options.tgas ?? DEFAULT_CALL_TGAS;
   }
 
@@ -118,20 +137,47 @@ export class NearContractClient implements ContractClient {
 
   // ---- prices and pause ----
 
+  /** refresh_prices, then prices() must show a newer stored price for every asset asked for. */
   async refreshPrices(assets: string[]): Promise<TxRef[]> {
+    const before = new Map((await this.prices()).map((p) => [p.asset, p.at_ms]));
     const r = await this.#call('refresh_prices', () => ({ assets }), 'same');
+    if (r.value === false) throw new Error(`refresh_prices returned false in ${r.txHash}`);
+    const stale = await this.#retryRead(async () => {
+      const after = new Map((await this.prices()).map((p) => [p.asset, p.at_ms]));
+      const missing = assets.filter((a) => !after.has(a) || (before.has(a) && after.get(a)! <= before.get(a)!));
+      return missing.length === 0 ? null : missing;
+    });
+    if (stale !== null) throw new Error(`refresh_prices ran in ${r.txHash} but prices() has no newer price for ${stale.join(', ')}`);
     return [nearTxRef(this.network, r.txHash)];
   }
 
+  /**
+   * set_paused(desk, true) at PAUSE_TGAS, past the signature budget: it must go out even when MPC calls fill every
+   * slot or the budget is 'down'. It returns nothing, so success is read back: get_desk must say paused.
+   */
   async pause(deskId: string): Promise<TxRef[]> {
-    const r = await this.#call('set_paused', () => ({ desk_id: deskId, paused: true }), 'same');
+    const r = await this.#call('set_paused', () => ({ desk_id: deskId, paused: true }), 'same', { tgas: PAUSE_TGAS, budget: false });
+    if (r.value !== null && r.value !== undefined) throw new Error(`set_paused returned ${JSON.stringify(r.value)} in ${r.txHash}, not nothing`);
+    const notPaused = await this.#retryRead(async () => ((await this.getDesk(deskId))?.paused === true ? null : true));
+    if (notPaused !== null) throw new Error(`set_paused ran in ${r.txHash} but get_desk(${deskId}) does not say paused`);
     return [nearTxRef(this.network, r.txHash)];
+  }
+
+  /** A view check right after a transaction, read up to 3 times 1 s apart (an RPC node may lag one block). */
+  async #retryRead<T>(check: () => Promise<T | null>): Promise<T | null> {
+    let last: T | null = null;
+    for (let i = 0; i < 3; i++) {
+      last = await check();
+      if (last === null) return null;
+      if (i < 2) await this.#sleep(1_000);
+    }
+    return last;
   }
 
   // ---- Hyperliquid ----
 
   hlOrder(deskId: string, order: HlOrder, reason: string): Promise<HlSignedAction> {
-    return this.#signed('hl_order', () => ({ desk_id: deskId, order, reason }), 'same', deskId);
+    return this.#signed('hl_order', () => ({ desk_id: deskId, order, reason }), 'never', deskId);
   }
 
   hlCancel(deskId: string, asset: number, oid: number, reason: string): Promise<HlSignedAction> {
@@ -147,11 +193,11 @@ export class NearContractClient implements ContractClient {
   }
 
   hlUsdClassTransfer(deskId: string, amount: string, toPerp: boolean, reason: string): Promise<HlSignedAction> {
-    return this.#signed('hl_usd_class_transfer', () => ({ desk_id: deskId, amount, to_perp: toPerp, reason }), 'same', deskId);
+    return this.#signed('hl_usd_class_transfer', () => ({ desk_id: deskId, amount, to_perp: toPerp, reason }), 'never', deskId);
   }
 
   hlSendToIntents(deskId: string, quote: SignedQuote, reason: string): Promise<HlSignedAction> {
-    return this.#signed('hl_send_to_intents', () => ({ desk_id: deskId, quote: quote.quote, quote_signature: quote.quote_signature, reason }), 'same', deskId);
+    return this.#signed('hl_send_to_intents', () => ({ desk_id: deskId, quote: quote.quote, quote_signature: quote.quote_signature, reason }), 'never', deskId);
   }
 
   // ---- Solana: the message carries a blockhash that a 120 s timeout outlives, so the caller rebuilds it ----
@@ -174,12 +220,13 @@ export class NearContractClient implements ContractClient {
 
   orderlyRequest(deskId: string, req: OrderlyRequest, reason: string): Promise<OrderlyRestAction> {
     // A retry renews the timestamp: Orderly takes a signed call for 300 s, and the first try may have used 120 s.
+    // Not for an order: the first signature, published late, stays postable for those 300 s.
     let first = true;
     return this.#signed('orderly_request', () => {
       const r = first ? req : { ...req, timestamp_ms: this.#now() };
       first = false;
       return { desk_id: deskId, req: r, reason };
-    }, 'fresh', deskId);
+    }, req.kind === 'order' ? 'never' : 'fresh', deskId);
   }
 
   orderlyWsAuth(deskId: string, timestamp: number): Promise<OrderlyRestAction> {
@@ -197,41 +244,71 @@ export class NearContractClient implements ContractClient {
   }
 
   orderlySettlePnl(deskId: string, settleNonce: number): Promise<OrderlyEip712Action> {
-    return this.#signed('orderly_settle_pnl', () => ({ desk_id: deskId, settle_nonce: settleNonce }), 'same', deskId);
+    return this.#signed('orderly_settle_pnl', () => ({ desk_id: deskId, settle_nonce: settleNonce }), 'never', deskId);
   }
 
   orderlyWithdraw(deskId: string, amount: string, withdrawNonce: number): Promise<OrderlyEip712Action> {
-    return this.#signed('orderly_withdraw', () => ({ desk_id: deskId, amount, withdraw_nonce: withdrawNonce }), 'same', deskId);
+    return this.#signed('orderly_withdraw', () => ({ desk_id: deskId, amount, withdraw_nonce: withdrawNonce }), 'never', deskId);
   }
 
   // ---- Arbitrum and NEAR money paths ----
 
   evmUsdcToIntents(deskId: string, quote: SignedQuote, reason: string): Promise<Eip3009SignedAction> {
-    return this.#signed('evm_usdc_to_intents', () => ({ desk_id: deskId, quote: quote.quote, quote_signature: quote.quote_signature, reason }), 'same', deskId);
+    return this.#signed('evm_usdc_to_intents', () => ({ desk_id: deskId, quote: quote.quote, quote_signature: quote.quote_signature, reason }), 'never', deskId);
   }
 
+  /**
+   * fund_venue, checked by the desk's ledger rather than by a return value the contract has not pinned yet: idle_usdc
+   * must have dropped by the quote's amountIn. Anything else after the transaction ran is OutcomeUnknown.
+   */
   async fundVenue(deskId: string, quote: SignedQuote, reason: string): Promise<TxRef[]> {
-    const r = await this.#call('fund_venue', () => ({ desk_id: deskId, quote: quote.quote, quote_signature: quote.quote_signature, reason }), 'same');
-    return [nearTxRef(this.network, r.txHash)];
+    const idle = async () => {
+      const d = await this.getDesk(deskId);
+      if (d === null) throw new Error(`fund_venue: the contract has no desk ${deskId}`);
+      return BigInt(String(d.ledger.idle_usdc));
+    };
+    const amountIn = String((quote.quote as { amountIn?: unknown } | null)?.amountIn ?? '');
+    if (!/^[1-9]\d*$/.test(amountIn)) throw new Error('fund_venue: the quote has no amountIn');
+    const before = await idle();
+    const r = await this.#call('fund_venue', () => ({ desk_id: deskId, quote: quote.quote, quote_signature: quote.quote_signature, reason }), 'never');
+    const ref = nearTxRef(this.network, r.txHash);
+    let after: bigint | null = null;
+    const short = await this.#retryRead(async () => {
+      after = await idle().catch(() => null);
+      return after !== null && r.value !== false && before - after >= BigInt(amountIn) ? null : true;
+    });
+    if (short !== null) {
+      throw new OutcomeUnknown('fund_venue', `returned ${JSON.stringify(r.value)}; the desk's idle USDC went from ${before} to ${String(after ?? 'unread')}, the quote sends ${amountIn}`, { nearTx: r.txHash }, [ref]);
+    }
+    return [ref];
   }
 
   // ---- the steps every call shares ----
 
   async #signed<A extends SignedAction>(method: string, args: () => object, retry: Retry, deskId: string): Promise<A> {
     const r = await this.#call(method, args, retry);
-    const action = parseSignedAction(method, r.value, deskId);
+    let action: SignedAction;
+    try {
+      action = parseSignedAction(method, r.value, deskId);
+    } catch (err) {
+      // The transaction ran, so a signature may be on chain even though this one cannot be read.
+      if (retry === 'never') throw new OutcomeUnknown(method, (err as Error).message, { nearTx: r.txHash }, [nearTxRef(this.network, r.txHash)]);
+      throw err;
+    }
     return { ...action, nearTx: nearTxRef(this.network, r.txHash) } as A;
   }
 
-  async #call(method: string, args: () => object, retry: Retry): Promise<{ txHash: string; value: unknown }> {
-    const attempts = retry === 'caller' ? 1 : 2;
+  async #call(method: string, args: () => object, retry: Retry, options: CallOptions = {}): Promise<{ txHash: string; value: unknown }> {
+    const tgas = options.tgas ?? this.#tgas;
+    const attempts = retry === 'caller' || retry === 'never' ? 1 : 2;
     let last: MpcTimeoutError | null = null;
     for (let attempt = 1; attempt <= attempts; attempt++) {
-      const release = await this.#budget.acquire(this.#tgas);
+      const release = options.budget === false ? () => {} : await this.#budget.acquire(tgas);
       const started = this.#now();
       let outcome: NearCallOutcome;
       try {
-        outcome = await this.#transport.call(this.contractId, method, args(), this.#tgas);
+        // OutcomeUnknown from the transport (sent, no final outcome) goes up as is: never a second transaction.
+        outcome = await this.#transport.call(this.contractId, method, args(), tgas);
       } finally {
         release();
       }
@@ -239,12 +316,20 @@ export class NearContractClient implements ContractClient {
       if (took > this.#slowMs) this.#setHealth('slow', `${method} took ${Math.round(took / 1000)} s to sign`);
       else if (this.#health === 'slow') this.#setHealth('ok', `${method} signed in ${Math.round(took / 1000)} s`);
       if (outcome.ok) return { txHash: outcome.txHash, value: outcome.value };
+      const ref = [nearTxRef(this.network, outcome.txHash)];
       if (isMpcTimeout(outcome.failure)) {
+        if (retry === 'never') {
+          throw new OutcomeUnknown(method, `the MPC network did not sign in time (${oneLine(outcome.failure)}); a late signature may still be published and posted`, { nearTx: outcome.txHash }, ref);
+        }
         last = new MpcTimeoutError(method, oneLine(outcome.failure), outcome.txHash);
         continue;
       }
       const refusal = parseRefusal(outcome.failure);
       if (refusal !== null) throw new ContractRefusal(refusal.code, refusal.message, outcome.txHash);
+      if (retry === 'never') {
+        // Not a refusal: the failure may have come after the MPC network signed (in the callback).
+        throw new OutcomeUnknown(method, `failed without a refusal code: ${oneLine(outcome.failure)}`, { nearTx: outcome.txHash }, ref);
+      }
       throw new Error(`${method} failed in transaction ${outcome.txHash}: ${oneLine(outcome.failure)}`);
     }
     throw last!;
