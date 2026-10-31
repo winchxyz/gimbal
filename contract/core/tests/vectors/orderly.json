@@ -1075,6 +1075,63 @@
       "url": "https://api.orderly.org/v1/referral/bind",
       "evidence": "docs: POST /v1/referral/bind {referral_code}",
       "verify": "day 5"
+    },
+    {
+      "name": "funding_fee_history of one symbol, one day, page 1 of 60 rows (testnet)",
+      "network": "testnet",
+      "kind": "funding_fee_history",
+      "method": "GET",
+      "path": "/v1/funding_fee/history?symbol=PERP_ETH_USDC&start_t=1793404800000&end_t=1793491200000&page=1&size=60",
+      "body": "",
+      "timestamp": 1793491229000,
+      "message": "1793491229000GET/v1/funding_fee/history?symbol=PERP_ETH_USDC&start_t=1793404800000&end_t=1793491200000&page=1&size=60",
+      "signature_hex": "72b26a8b97441b60ec7519f5c6266ef28fb21eb62a5bf52728395a07a54b2395fe6e0b2e348ac8f6c8cf8c26389d6158d50fe6ad38af0edc2c415dead4587602",
+      "signature_b64url": "crJqi5dEG2DsdRn1xiZu8o-yHrYqW_UnKDlaB6VLI5X-bgsuNIrI9sjPjCY4nWFY1Q_mrTivDtwsQV3q1Fh2Ag",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "orderly-timestamp": "1793491229000",
+        "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "crJqi5dEG2DsdRn1xiZu8o-yHrYqW_UnKDlaB6VLI5X-bgsuNIrI9sjPjCY4nWFY1Q_mrTivDtwsQV3q1Fh2Ag"
+      },
+      "url": "https://testnet-api.orderly.org/v1/funding_fee/history?symbol=PERP_ETH_USDC&start_t=1793404800000&end_t=1793491200000&page=1&size=60",
+      "request": {
+        "kind": "funding_fee_history",
+        "symbol": "PERP_ETH_USDC",
+        "start_t": 1793404800000,
+        "end_t": 1793491200000,
+        "page": 1,
+        "size": 60
+      },
+      "evidence": "docs: GET /v1/funding_fee/history (symbol, start_t, end_t, page, size)"
+    },
+    {
+      "name": "funding_fee_history of every symbol, the parameters the engine sends (testnet)",
+      "network": "testnet",
+      "kind": "funding_fee_history",
+      "method": "GET",
+      "path": "/v1/funding_fee/history?start_t=1793404800000&end_t=1793491200000&page=1&size=500",
+      "body": "",
+      "timestamp": 1793491230000,
+      "message": "1793491230000GET/v1/funding_fee/history?start_t=1793404800000&end_t=1793491200000&page=1&size=500",
+      "signature_hex": "2cc0bc0e01ca8dc9fb4247a96c8ba7c7f09e585719f058e1cd83532ffcd9a49397d2e7f99c62ef7fdf55b4a2f9693d4fce5af947be8e42da3d9fa0cddf39f102",
+      "signature_b64url": "LMC8DgHKjcn7QkepbIunx_CeWFcZ8FjhzYNTL_zZpJOX0uf5nGLvf99VtKL5aT1Pzlr5R76OQto9n6DN3znxAg",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "orderly-timestamp": "1793491230000",
+        "orderly-account-id": "0x5f62d983208f89b4e53111d5ba79deb4abc633b7c2b75e68f0ef8cfdb4c3b313",
+        "orderly-key": "ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "orderly-signature": "LMC8DgHKjcn7QkepbIunx_CeWFcZ8FjhzYNTL_zZpJOX0uf5nGLvf99VtKL5aT1Pzlr5R76OQto9n6DN3znxAg"
+      },
+      "url": "https://testnet-api.orderly.org/v1/funding_fee/history?start_t=1793404800000&end_t=1793491200000&page=1&size=500",
+      "request": {
+        "kind": "funding_fee_history",
+        "start_t": 1793404800000,
+        "end_t": 1793491200000,
+        "page": 1,
+        "size": 500
+      },
+      "evidence": "docs: GET /v1/funding_fee/history (symbol, start_t, end_t, page, size)"
     }
   ],
   "ws_auth": {

@@ -49,6 +49,45 @@ impl Value {
         }
     }
 
+    /// The value as compact JSON text, entries in order: what an Orderly body carries byte for
+    /// byte. The same text `serde_json::to_string` writes.
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        self.write_json(&mut out);
+        out
+    }
+
+    fn write_json(&self, out: &mut String) {
+        match self {
+            Value::Nil => out.push_str("null"),
+            Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Value::UInt(n) => out.push_str(&n.to_string()),
+            Value::Str(s) => out.push_str(&json_string(s)),
+            Value::Array(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    item.write_json(out);
+                }
+                out.push(']');
+            }
+            Value::Map(entries) => {
+                out.push('{');
+                for (i, (key, value)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&json_string(key));
+                    out.push(':');
+                    value.write_json(out);
+                }
+                out.push('}');
+            }
+        }
+    }
+
     /// The msgpack bytes of the value.
     pub fn to_msgpack(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -77,6 +116,28 @@ impl Value {
             }
         }
     }
+}
+
+/// `s` as a JSON string literal, escaped as `serde_json` and `JSON.stringify` escape it: the quote,
+/// the backslash and the control characters below 0x20, nothing else.
+pub fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if u32::from(c) < 0x20 => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn write_uint(out: &mut Vec<u8>, n: u64) {
@@ -319,5 +380,26 @@ mod tests {
         assert_eq!(v.get("x"), None);
         assert!(serde_json::from_str::<Value>("1.5").is_err());
         assert!(serde_json::from_str::<Value>("-1").is_err());
+    }
+
+    #[test]
+    fn to_json_writes_what_serde_json_writes() {
+        let tricky = "q\"b\\s/\u{08}\u{0c}\n\r\t\u{01}\u{1f}\u{7f}é€😀";
+        let v = Value::map([
+            ("s", Value::str(tricky)),
+            ("n", Value::UInt(u64::MAX)),
+            ("z", Value::UInt(0)),
+            ("t", Value::Bool(true)),
+            ("f", Value::Bool(false)),
+            ("nil", Value::Nil),
+            (
+                "a",
+                Value::Array(vec![Value::Array(vec![]), Value::map([])]),
+            ),
+            (tricky, Value::UInt(1)),
+        ]);
+        assert_eq!(v.to_json(), serde_json::to_string(&v).unwrap());
+        assert_eq!(json_string(tricky), serde_json::to_string(tricky).unwrap());
+        assert_eq!(json_string("\u{01}"), "\"\\u0001\"");
     }
 }

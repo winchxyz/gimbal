@@ -317,7 +317,7 @@ fn symbol(field: &str, s: &str) -> Result<(), Refusal> {
 }
 
 /// Orderly perps are all `PERP_<BASE>_USDC`, e.g. `PERP_SOL_USDC`, `PERP_1000PEPE_USDC`.
-fn is_orderly_perp(s: &str) -> bool {
+pub fn is_orderly_perp(s: &str) -> bool {
     s.len() <= MAX_SYMBOL_LEN
         && s.strip_prefix("PERP_")
             .and_then(|rest| rest.strip_suffix("_USDC"))
