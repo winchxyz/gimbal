@@ -1,16 +1,18 @@
 import { stream } from './hub.ts';
 import { connectSse } from './sse.ts';
 import { httpApi, type EngineApi } from './api.ts';
-import { pickFakeDrift, pickFakeMode, pickFakeScenario, pickSource } from './source.ts';
+import { pickFakeDesk, pickFakeDrift, pickFakeMode, pickFakeScenario, pickSource } from './source.ts';
 
 /** Starts the app's one stream. The fake is behind `import.meta.env.DEV`, so production builds drop it. */
 export async function startStream(): Promise<() => void> {
   const search = window.location.search;
   if (import.meta.env.DEV && pickSource(search, true) === 'fake') {
     const { startFakeStream } = await import('./fake.ts');
+    const scenario = pickFakeScenario(search);
     return startFakeStream(stream.dispatch, {
       mode: pickFakeMode(search),
-      scenario: pickFakeScenario(search),
+      scenario,
+      desk: pickFakeDesk(search, scenario),
       drift: pickFakeDrift(search),
     });
   }

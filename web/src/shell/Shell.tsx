@@ -1,5 +1,7 @@
 import { useEffect } from 'react';
+import { DeskScreen } from '../desk/DeskScreen.tsx';
 import { Placeholder } from '../screens/Placeholder.tsx';
+import { NoticeBar } from '../ui/NoticeBar.tsx';
 import { WindowsScreen } from '../windows/WindowsScreen.tsx';
 import { Header } from './Header.tsx';
 import { SCREENS, useScreen } from './routes.ts';
@@ -21,9 +23,10 @@ export function Shell() {
   return (
     <div className="app">
       <Header screen={screen} />
-      {WITH_STATUS.has(screen) && <StatusLine />}
+      {WITH_STATUS.has(screen) && <StatusLine screen={screen} />}
+      <NoticeBar />
       <main className="page">
-        {screen === 'windows' ? <WindowsScreen /> : <Placeholder screen={screen} />}
+        {screen === 'desk' ? <DeskScreen /> : screen === 'windows' ? <WindowsScreen /> : <Placeholder screen={screen} />}
       </main>
       <TabBar screen={screen} />
     </div>
