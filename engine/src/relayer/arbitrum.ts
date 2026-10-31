@@ -7,6 +7,7 @@
 // hash is known before it leaves), send, and wait for the receipt. Once sent, no receipt in time (or a send error,
 // which may come after the node took it) is OutcomeUnknown with the hash and the EIP-3009 nonce. An authorization
 // already used means the transfer ran somewhere (anyone may submit it): OutcomeUnknown too, never NothingExecuted.
+// viem quotes the RPC URL in its errors; ARBITRUM_RPC_URL's path and query (API keys) are cut from every error text.
 
 import type { TxRef } from '@gimbal/shared';
 import { createPublicClient, createWalletClient, encodeFunctionData, hashTypedData, http, isAddressEqual, keccak256, parseAbi } from 'viem';
@@ -15,6 +16,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { arbitrum, arbitrumSepolia } from 'viem/chains';
 import type { Eip3009SignedAction, OutcomeIds } from '../contract/types.ts';
 import { OutcomeUnknown } from '../contract/types.ts';
+import { redact, redactError } from '../redact.ts';
 import { hlSignature, recoverSigner } from './hl-wire.ts';
 import type { ChainNetwork } from './tx.ts';
 import { NothingExecuted, arbitrumTxRef } from './tx.ts';
@@ -71,6 +73,7 @@ export class ArbitrumSubmitter {
   readonly #receiptTimeoutMs: number;
   readonly #minValidityS: number;
   readonly #now: () => number;
+  readonly #rpcUrl: string | undefined;
 
   constructor(options: ArbitrumSubmitterOptions) {
     if (!/^0x[0-9a-fA-F]{64}$/.test(options.relayerKey)) throw new Error('RELAYER_EVM_PRIVATE_KEY must be 0x + 32 bytes of hex');
@@ -86,6 +89,16 @@ export class ArbitrumSubmitter {
     this.#receiptTimeoutMs = options.receiptTimeoutMs ?? 120_000;
     this.#minValidityS = options.minValidityS ?? 60;
     this.#now = options.now ?? Date.now;
+    this.#rpcUrl = options.rpcUrl;
+  }
+
+  /** The promise's error with the RPC URL's path and query taken out of its text. */
+  async #safe<T>(p: Promise<T>): Promise<T> {
+    try {
+      return await p;
+    } catch (err) {
+      throw redactError(err, this.#rpcUrl);
+    }
   }
 
   /** Checks, submits and confirms one authorization from the desk at `deskAddress`. */
@@ -108,9 +121,9 @@ export class ArbitrumSubmitter {
     const signer = await recoverSigner(eip3009Digest(p), sig);
     if (signer !== deskAddress.toLowerCase()) throw new Error(`arbitrum: the authorization recovers to ${signer}, not the desk's ${deskAddress.toLowerCase()}; nothing sent`);
     const ids: OutcomeIds = { eip3009Nonce: p.nonce, ...(signed.nearTx === undefined ? {} : { nearTx: signed.nearTx.id }) };
-    const used = await this.#public.readContract({
+    const used = await this.#safe(this.#public.readContract({
       address: this.#token, abi: USDC_EIP3009_ABI, functionName: 'authorizationState', args: [p.from as Hex, p.nonce as Hex],
-    });
+    }));
     if (used) {
       throw new OutcomeUnknown('arbitrum transferWithAuthorization', `authorization ${p.nonce} is already used: the transfer ran in a transaction this relayer did not see`, ids, nearTx);
     }
@@ -118,13 +131,13 @@ export class ArbitrumSubmitter {
     const args = [
       p.from as Hex, p.to as Hex, BigInt(p.value), BigInt(p.validAfter), BigInt(p.validBefore), p.nonce as Hex, sig.v, sig.r, sig.s,
     ] as const;
-    await this.#public.simulateContract({
+    await this.#safe(this.#public.simulateContract({
       address: this.#token, abi: USDC_EIP3009_ABI, functionName: 'transferWithAuthorization', args, account: this.#wallet.account,
-    });
-    const prepared = await this.#wallet.prepareTransactionRequest({
+    }));
+    const prepared = await this.#safe(this.#wallet.prepareTransactionRequest({
       account: this.#wallet.account, chain: this.#chain, to: this.#token,
       data: encodeFunctionData({ abi: USDC_EIP3009_ABI, functionName: 'transferWithAuthorization', args }),
-    });
+    }));
     const serialized = await this.#wallet.signTransaction(prepared);
     const hash = keccak256(serialized);
     const ref = arbitrumTxRef(this.network, hash);
@@ -133,13 +146,14 @@ export class ArbitrumSubmitter {
       await this.#wallet.sendRawTransaction({ serializedTransaction: serialized });
     } catch (err) {
       // The node may have taken it before the error (a timeout, a retried request answering "already known").
-      sendError = (err as Error).message;
+      sendError = redact((err as Error).message, this.#rpcUrl);
     }
     let receipt;
     try {
       receipt = await this.#public.waitForTransactionReceipt({ hash, timeout: this.#receiptTimeoutMs });
     } catch (err) {
-      const why = sendError === null ? (err as Error).message : `send: ${sendError}; then ${(err as Error).message}`;
+      const receiptError = redact((err as Error).message, this.#rpcUrl);
+      const why = sendError === null ? receiptError : `send: ${sendError}; then ${receiptError}`;
       throw new OutcomeUnknown('arbitrum transferWithAuthorization', `no receipt for ${hash}: ${oneLine(why)}`, { ...ids, arbitrumTx: hash }, [...nearTx, ref]);
     }
     if (receipt.status !== 'success') throw new NothingExecuted('arbitrum', `transferWithAuthorization reverted in ${hash}`, [...nearTx, ref]);

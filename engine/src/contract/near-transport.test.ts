@@ -1,14 +1,15 @@
 // NearApiTransport against a fake RPC provider (no network, a random key made here): once the signed bytes may have
 // left the process, the outcome is read from their hash and nothing is signed twice. Covered: fetch failed after the
 // send, a 429 on near-api-js's own re-send after a 408, InvalidNonce when the first copy landed (and when it did not),
-// a definitive rejection, a hash that never shows up (OutcomeUnknown), and the RPC URL's key kept out of errors.
+// a definitive rejection (and the same one answering a re-send of a copy that landed), a congested or stuck shard, a
+// hash that never shows up (OutcomeUnknown), and the RPC URL's key kept out of errors.
 
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { KeyPairEd25519 } from 'near-api-js';
 import type { SignedTransaction } from 'near-api-js';
-import { InvalidNonceError, NotEnoughBalanceError, UnknownTransactionError } from 'near-api-js/rpc-errors';
+import { InvalidNonceError, NotEnoughBalanceError, ShardCongestedError, ShardStuckError, UnknownTransactionError } from 'near-api-js/rpc-errors';
 import { base58 } from '../venues/orderly-signer.ts';
 import type { NearRpc } from './near-transport.ts';
 import { NearApiTransport, NearViewTransport, redact, rpcLabel } from './near-transport.ts';
@@ -122,11 +123,43 @@ test('InvalidNonce with the hash absent on three reads: the transaction can neve
   assert.deepEqual(rpc.statusReads, ['NONE', 'NONE', 'NONE']);
 });
 
-test('a definitive rejection (not enough balance) is thrown as is, with no follow', async () => {
+test('a definitive rejection (not enough balance) is thrown as is once the hash lookup finds nothing', async () => {
   const rpc = new FakeRpc();
   rpc.sendAnswers.push((h) => new NotEnoughBalanceError(1n, 2n, 'owner.testnet', h, BLOCK));
   await assert.rejects(transport(rpc).call('gimbal.testnet', 'hl_order', {}, 300), NotEnoughBalanceError);
-  assert.equal(rpc.statusReads.length, 0);
+  assert.deepEqual(rpc.statusReads, ['NONE', 'NONE', 'NONE']);
+  assert.equal(rpc.sends.length, 1);
+  // The same refusal answering near-api-js's re-send while the first copy landed: that copy's outcome, not "nothing ran".
+  const landed = new FakeRpc();
+  landed.sendAnswers.push((h) => new NotEnoughBalanceError(1n, 2n, 'owner.testnet', h, BLOCK));
+  landed.statusAnswers.push(() => ok({ first: true }));
+  const out = await transport(landed).call('gimbal.testnet', 'hl_order', {}, 300);
+  assert.deepEqual(out, { txHash: landed.sends[0]!.hash, ok: true, value: { first: true } });
+  assert.equal(landed.keyReads, 1);
+});
+
+test('ShardCongested / ShardStuck (checked before the nonce): the hash is followed, never "nothing ran"', async () => {
+  // near-api-js re-sent after a 408 while the first copy was executing (waiting on the MPC network); the re-send
+  // met a congested shard. The first copy's outcome is what comes back.
+  const running = new FakeRpc();
+  running.sendAnswers.push((h) => new ShardCongestedError(0.9, 2, h, BLOCK));
+  let reads = 0;
+  running.statusAnswers.push((h) => (++reads < 4 ? new UnknownTransactionError(h) : ok({ signed: true })));
+  const out = await transport(running).call('gimbal.testnet', 'hl_order', {}, 300);
+  assert.deepEqual(out, { txHash: running.sends[0]!.hash, ok: true, value: { signed: true } });
+  assert.equal(new Set(running.sends.map((s) => s.hash)).size, 1);
+  assert.equal(running.keyReads, 1, 'no second transaction');
+  // Stuck the whole time: OutcomeUnknown with the hash, after rebroadcasting the same bytes only.
+  const stuck = new FakeRpc();
+  stuck.sendAnswers.push((h) => new ShardStuckError(5, 2, h, BLOCK));
+  await assert.rejects(transport(stuck, { followMs: 30_000 }).call('gimbal.testnet', 'hl_order', {}, 300), (err: unknown) => {
+    assert.ok(err instanceof OutcomeUnknown, String(err));
+    assert.equal(err.ids.nearTx, stuck.sends[0]!.hash);
+    return true;
+  });
+  assert.ok(stuck.sends.length >= 2);
+  assert.equal(new Set(stuck.sends.map((s) => s.hash)).size, 1);
+  assert.equal(stuck.keyReads, 1);
 });
 
 test('NEAR_RPC_URL keys never reach an error text', async () => {

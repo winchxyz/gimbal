@@ -1,6 +1,7 @@
 // The Arbitrum submitter against a stub RPC: the transferWithAuthorization the gas wallet sends is byte for byte the
 // calldata of eip3009.json; an expired, used or foreign authorization costs no gas; once sent, no receipt is
-// OutcomeUnknown with the hash, and a send error with a receipt after it is a success.
+// OutcomeUnknown with the hash, and a send error with a receipt after it is a success; the RPC URL's key never
+// reaches an error.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -29,7 +30,7 @@ async function signedCase(): Promise<Eip3009SignedAction> {
   return c.evmUsdcToIntents('alpha', quote, 'rescue to the deposit address');
 }
 
-function chain(options: { used?: boolean; reverted?: boolean; sendFails?: boolean; noReceipt?: boolean } = {}) {
+function chain(options: { used?: boolean; reverted?: boolean; sendFails?: boolean; sendMessage?: string; noReceipt?: boolean } = {}) {
   const sent: Hex[] = [];
   const methods: string[] = [];
   const transport = custom({
@@ -50,7 +51,7 @@ function chain(options: { used?: boolean; reverted?: boolean; sendFails?: boolea
         case 'eth_getBlockByNumber': return { number: '0x10', hash: `0x${'11'.repeat(32)}`, baseFeePerGas: '0x989680', timestamp: '0x1', transactions: [] };
         case 'eth_sendRawTransaction': {
           sent.push(p[0] as Hex);
-          if (options.sendFails) throw Object.assign(new Error('the request took too long to respond'), { code: -32603 });
+          if (options.sendFails) throw Object.assign(new Error(options.sendMessage ?? 'the request took too long to respond'), { code: -32603 });
           return keccak256(p[0] as Hex);
         }
         case 'eth_getTransactionReceipt': {
@@ -141,4 +142,19 @@ test('a send error after the node took the transaction: its receipt still decide
   const c = chain({ sendFails: true });
   const tx = await submitter(c.transport).submit(await signedCase(), TEST_EVM_ADDRESS);
   assert.equal(tx.at(-1)?.id, keccak256(c.sent[0]!));
+});
+
+test('the RPC URL viem quotes in an error loses its path and query (the API key) before it reaches OutcomeUnknown', async () => {
+  const rpcUrl = 'https://arb-sepolia.example.org/v2/0123456789abcdefSECRET';
+  const c = chain({ sendFails: true, noReceipt: true, sendMessage: `HTTP request failed. URL: ${rpcUrl} Details: timeout` });
+  const s = new ArbitrumSubmitter({
+    network: 'testnet', relayerKey: GAS_KEY, transport: c.transport, rpcUrl, now: () => CASE.now_s * 1000, receiptTimeoutMs: 50,
+  });
+  await assert.rejects(s.submit(await signedCase(), TEST_EVM_ADDRESS), (err: unknown) => {
+    assert.ok(err instanceof OutcomeUnknown, String(err));
+    assert.ok(!err.message.includes('0123456789abcdefSECRET'), err.message);
+    assert.ok(!err.detail.includes('0123456789abcdefSECRET'), err.detail);
+    assert.match(err.message, /arb-sepolia\.example\.org\/…/);
+    return true;
+  });
 });

@@ -2,16 +2,20 @@
 // computed before sending, and once the signed bytes may have left the process the outcome is only ever read from
 // that hash:
 //   - the RPC answered with the final outcome: done;
-//   - the network refused the transaction itself (a bad signature, not enough balance or allowance, ...): nothing
-//     ran, the error is thrown as is;
-//   - InvalidNonce: the key's nonce moved past this transaction's, so it can never run now. near-api-js re-sends
-//     after a 408 by itself, so that may be the first copy having landed: the hash is looked up first, and only
-//     when it is absent is a new transaction signed (a fresh nonce);
+//   - near-api-js re-sends the same bytes after a 408 by itself, so any refusal may answer a second copy while the
+//     first one landed (and may be running, waiting on the MPC network). The hash is always looked up first:
+//       - the network refused the transaction itself (a bad signature, not enough balance or allowance, ...) and
+//         the hash is absent: nothing ran, the error is thrown as is;
+//       - InvalidNonce (the key's nonce moved past this transaction's, so it can never run now) and the hash is
+//         absent: a new transaction is signed (a fresh nonce);
+//       - the hash is known, or the lookup failed: followed, as below;
+//   - ShardCongested / ShardStuck: nearcore checks congestion before the nonce, so this says nothing about a first
+//     copy, and a copy waiting in a pool may still run. Followed, as below;
 //   - anything else (fetch failed, a 429 or 5xx, the RPC's own timeout, a slow MPC signature that outlives the
 //     wait): the same hash is followed, the same signed bytes rebroadcast while the RPC does not know them. If no
 //     final outcome shows up within followMs, OutcomeUnknown with the hash: never a second transaction that would
 //     ask for a second signature.
-// Error texts never carry NEAR_RPC_URL's path or query, where providers put API keys.
+// Error texts never carry NEAR_RPC_URL's path or query, where providers put API keys (../redact.ts).
 
 import { createHash } from 'node:crypto';
 import { Account, JsonRpcProvider, KeyPairSigner, actions } from 'near-api-js';
@@ -20,13 +24,16 @@ import {
   AccessKeyDepositWithFunctionCallActionError, AccessKeyMethodNameMismatchActionError, AccessKeyNotEnoughAllowanceActionError,
   AccessKeyNotFoundActionError, AccessKeyReceiverMismatchActionError, AccessKeyRequiresFullAccessActionError, CostOverflowError,
   InvalidChainError, InvalidNonceError, InvalidReceiverIdError, InvalidSignatureError, InvalidSignerIdError,
-  InvalidTransactionVersionError, LackBalanceForStateActionError, NonceTooLargeError, NotEnoughBalanceError, ShardCongestedError,
-  ShardStuckError, SignerDoesNotExistError, TransactionExpiredError, TransactionSizeExceededError, UnknownTransactionError,
+  InvalidTransactionVersionError, LackBalanceForStateActionError, NonceTooLargeError, NotEnoughBalanceError,
+  SignerDoesNotExistError, TransactionExpiredError, TransactionSizeExceededError, UnknownTransactionError,
 } from 'near-api-js/rpc-errors';
+import { redact, redactError } from '../redact.ts';
 import { base58 } from '../venues/orderly-signer.ts';
 import type { NearCallOutcome, NearNetwork, NearTransport } from './near-client.ts';
 import { nearTxRef } from './near-client.ts';
 import { OutcomeUnknown } from './types.ts';
+
+export { redact, redactError, rpcLabel } from '../redact.ts';
 
 export const NEAR_RPC_URLS: Record<NearNetwork, string> = {
   mainnet: 'https://free.rpc.fastnear.com',
@@ -157,19 +164,18 @@ export class NearApiTransport extends NearViewTransport {
     } catch (err) {
       sendError = err;
     }
-    if (sendError !== null) {
-      if (isRejected(sendError)) throw redactError(sendError, this.rpcUrl);
-      if (sendError instanceof InvalidNonceError) {
-        const seen = await this.#lookup(txHash);
-        if (seen === 'absent') {
-          if (nonceRetries <= 0) throw redactError(sendError, this.rpcUrl);
-          // Another process used the key, or the cached nonce went stale; this transaction can never run now.
-          await (this.#account as unknown as { nonceManager?: { invalidate(pk: unknown): Promise<void> } })
-            .nonceManager?.invalidate(signed.transaction.publicKey);
-          return this.call(contractId, method, args, tgas, nonceRetries - 1);
-        }
+    if (sendError !== null && (isRejected(sendError) || sendError instanceof InvalidNonceError)) {
+      // The answer may be to near-api-js's own re-send while the first copy landed: the hash decides.
+      const seen = await this.#lookup(txHash);
+      if (seen === 'absent') {
+        if (isRejected(sendError) || nonceRetries <= 0) throw redactError(sendError, this.rpcUrl);
+        // Another process used the key, or the cached nonce went stale; this transaction can never run now.
+        await (this.#account as unknown as { nonceManager?: { invalidate(pk: unknown): Promise<void> } })
+          .nonceManager?.invalidate(signed.transaction.publicKey);
+        return this.call(contractId, method, args, tgas, nonceRetries - 1);
       }
     }
+    // Congested, stuck, lost or not final yet: follow the hash.
     if (result === null || !isFinal(result)) result = await this.#follow(method, signed, txHash, sendError);
     return outcomeOf(txHash, result);
   }
@@ -259,13 +265,14 @@ function isFinal(r: RpcStatus): boolean {
 
 /**
  * The network refused these signed bytes as a transaction (InvalidTxError other than InvalidNonce): nothing ran and
- * nothing can. nearcore checks the nonce before balance and allowance, so a copy that already landed would answer
- * InvalidNonce, never one of these.
+ * nothing can, once the hash lookup also finds nothing (the answer may be to a re-sent copy). ShardCongested and
+ * ShardStuck are not here: they are checked before the nonce and say nothing about a copy already in a pool, so the
+ * hash is followed instead.
  */
 const REJECTED = [
   InvalidSignatureError, CostOverflowError, InvalidChainError, TransactionExpiredError, InvalidTransactionVersionError,
   InvalidSignerIdError, SignerDoesNotExistError, NonceTooLargeError, InvalidReceiverIdError, NotEnoughBalanceError,
-  LackBalanceForStateActionError, TransactionSizeExceededError, ShardCongestedError, ShardStuckError,
+  LackBalanceForStateActionError, TransactionSizeExceededError,
   AccessKeyNotFoundActionError, AccessKeyReceiverMismatchActionError, AccessKeyMethodNameMismatchActionError,
   AccessKeyRequiresFullAccessActionError, AccessKeyNotEnoughAllowanceActionError, AccessKeyDepositWithFunctionCallActionError,
 ];
@@ -278,40 +285,4 @@ function errorText(err: unknown): string {
   const name = (err as { constructor?: { name?: string } })?.constructor?.name;
   const message = String((err as Error)?.message ?? err);
   return name !== undefined && name !== 'Error' && !message.startsWith(name) ? `${name}: ${message}` : message;
-}
-
-/** What may be shown of an RPC URL: its origin, with "/…" when a path or query (where API keys go) was cut. */
-export function rpcLabel(url: string): string {
-  try {
-    const u = new URL(url);
-    const hidden = u.pathname.replace(/\/+$/, '') !== '' || u.search !== '' || u.username !== '' || u.password !== '';
-    return hidden ? `${u.protocol}//${u.host}/…` : `${u.protocol}//${u.host}`;
-  } catch {
-    return '<NEAR RPC>';
-  }
-}
-
-/** `text` with the RPC URL shown only as rpcLabel(url), and its path, query and credentials cut wherever they appear. */
-export function redact(text: string, url: string): string {
-  let out = text.split(url).join(rpcLabel(url));
-  try {
-    const u = new URL(url);
-    const secrets = [u.href, `${u.pathname}${u.search}`, u.pathname, u.search, u.username, u.password,
-      ...[...u.searchParams.values()], ...u.pathname.split('/')]
-      .filter((s) => s.length >= 6 && s !== '/');
-    for (const s of secrets.sort((a, b) => b.length - a.length)) out = out.split(s).join('…');
-  } catch {
-    // not a URL: nothing more to cut
-  }
-  return out;
-}
-
-/** The error itself when its text holds nothing of the URL to hide; else an Error of the same name with the text cut. */
-export function redactError(err: unknown, url: string): unknown {
-  if (!(err instanceof Error)) return err;
-  const text = redact(err.message, url);
-  if (text === err.message) return err;
-  const safe = new Error(text);
-  safe.name = err.name;
-  return safe;
 }
