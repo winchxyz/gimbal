@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { StrategyConfig, Window as FundingWindow } from '@gimbal/shared';
 import { Flash } from '../ui/Flash.tsx';
 import { cx } from '../ui/cx.ts';
@@ -8,10 +8,11 @@ import { Chart } from './Chart.tsx';
 import { decide, perDayOnLegs, type Decision } from './decision.ts';
 import { depth, hours, pct, plain, usd, usdWhole, venueName } from './format.ts';
 import type { HistoryState } from './history.ts';
-import { checkLines, heldWindow } from './model.ts';
+import { checkLines, heldWindow, isNoDesk } from './model.ts';
 import { Ago } from './WindowList.tsx';
 import { waterfall, type StepKey } from './waterfall.ts';
-import { retryHistory } from './useEngine.ts';
+import type { ManualAction, Outcome } from './manual.ts';
+import { retryHistory, sendManual } from './useEngine.ts';
 
 interface Props {
   w: FundingWindow;
@@ -57,7 +58,7 @@ export function Detail({ w, windows, strategy, histories, alerts, onToggleAlert 
             </>
           ) : (
             <>
-              <b className={cx(neg && 'neg', w.refused && 'struck')}><Flash value={w.netAprPct}>{pct(w.netAprPct)}</Flash></b>
+              <b className={cx(neg && 'neg', w.refused && !isNoDesk(w) && 'struck')}><Flash value={w.netAprPct}>{pct(w.netAprPct)}</Flash></b>
               <span className="g">net a year</span>
               {strategy ? <span>≈ {usd(perDayOnLegs(w, strategy.legUsd))} a day on {usdWhole(strategy.legUsd)} legs</span> : null}
             </>
@@ -169,20 +170,46 @@ interface DecisionProps {
 
 type Asking = 'rotate' | 'close' | null;
 
+/** How long the answer to a send stays under the line before it clears itself. */
+const OUTCOME_MS = 20_000;
+
 /**
- * What auto will do and why, with the two manual overrides. Rotating and closing ask for a confirmation
- * here, in the page. The engine has no endpoint for them yet (docs/interfaces.md §2), so a confirmed one says
- * that it was not sent; the alert is local and works now.
+ * What auto will do and why, with the two manual overrides. Rotating and closing ask for a confirmation here, in the
+ * page, and then go to the engine (`POST /rotate`, `POST /close`). It answers at once, `ok` or the reason a check
+ * refused; the work itself arrives as Journal and Desk events. The alert is local.
  */
 function DecisionLine({ decision, w, alerts, onToggleAlert }: DecisionProps) {
   const [asking, setAsking] = useState<Asking>(null);
-  const [notSent, setNotSent] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [outcome, setOutcome] = useState<Outcome | null>(null);
   const { rotate, alert: alertOver, close } = decision;
   const alertSet = alertOver ? hasAlert(alerts, w.id, alertOver.over.id) : false;
 
+  useEffect(() => {
+    if (outcome === null) return;
+    const timer = setTimeout(() => setOutcome(null), OUTCOME_MS);
+    return () => clearTimeout(timer);
+  }, [outcome]);
+
+  const ask = (what: Exclude<Asking, null>) => {
+    setOutcome(null);
+    setAsking(what);
+  };
+
   const confirm = () => {
+    const action: ManualAction | null =
+      asking === 'rotate' && rotate
+        ? { kind: 'rotate', from: rotate.from.symbol, to: rotate.to.symbol, windowId: rotate.to.id }
+        : asking === 'close'
+          ? { kind: 'close', symbol: w.symbol }
+          : null;
     setAsking(null);
-    setNotSent(true); // nothing is sent: there is no engine endpoint to send it to
+    if (action === null) return;
+    setSending(true);
+    void sendManual(action).then((result) => {
+      setSending(false);
+      setOutcome(result);
+    });
   };
 
   if (asking && (rotate || close)) {
@@ -204,7 +231,13 @@ function DecisionLine({ decision, w, alerts, onToggleAlert }: DecisionProps) {
     <div className="w-cta">
       <span>
         {decision.text}
-        {notSent ? <span className="wt"> Not sent: manual changes are not connected to the engine yet.</span> : null}
+        {sending ? <span className="g"> Sending to the engine…</span> : null}
+        {outcome ? (
+          <span className={outcome.tone === 'sent' ? 'ink' : 'wt'} role="status">
+            {' '}
+            {outcome.title}: {outcome.text}
+          </span>
+        ) : null}
       </span>
       <span className="end">
         {alertOver ? (
@@ -212,8 +245,8 @@ function DecisionLine({ decision, w, alerts, onToggleAlert }: DecisionProps) {
             {alertSet ? `Alert set for ${alertOver.over.symbol}. Clear` : `Alert me if it passes ${alertOver.over.symbol}`}
           </button>
         ) : null}
-        {rotate ? <button type="button" className="btn" onClick={() => { setNotSent(false); setAsking('rotate'); }}>Rotate to {rotate.to.symbol}</button> : null}
-        {close ? <button type="button" className="btn" onClick={() => { setNotSent(false); setAsking('close'); }}>Close position</button> : null}
+        {rotate ? <button type="button" className="btn" disabled={sending} onClick={() => ask('rotate')}>Rotate to {rotate.to.symbol}</button> : null}
+        {close ? <button type="button" className="btn" disabled={sending} onClick={() => ask('close')}>Close position</button> : null}
       </span>
     </div>
   );

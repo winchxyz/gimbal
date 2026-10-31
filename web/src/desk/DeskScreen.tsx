@@ -10,7 +10,7 @@ import { dotColor } from '../ui/dot.ts';
 import { notify } from '../ui/notice.ts';
 import { useNow } from '../ui/useNow.ts';
 import { pct, usd } from '../windows/format.ts';
-import { bestEnterable, heldWindow } from '../windows/model.ts';
+import { bestEnterable, deskMissing, heldWindow } from '../windows/model.ts';
 import { useStrategy } from '../windows/useEngine.ts';
 import { elapsed, splitUsd, signedUsd } from './format.ts';
 import {
@@ -43,9 +43,10 @@ export function DeskScreen() {
   const health = useStream((s) => s.health);
   const strategy = useStrategy().value;
   const status = useStatus('desk');
+  const noDesk = useStream((s) => deskMissing(s.windows));
   const now = useNow(10_000);
 
-  if (desk === null || status === null) return <DeskLoading />;
+  if (desk === null || status === null) return noDesk ? <NoDesk scan={scan} now={now} /> : <DeskLoading />;
   if (desk.legs.length === 0) return <Waiting desk={desk} windows={windows} strategy={strategy} scan={scan} now={now} />;
 
   return (
@@ -290,6 +291,28 @@ interface WaitingProps {
   strategy: StrategyConfig | null;
   scan: ScanStatus | null;
   now: number;
+}
+
+/**
+ * The engine runs but no desk is loaded (it refuses every desk window with E_NO_DESK): there are no legs, margin or
+ * value to draw. The mockups have no screen for it, so it is the Empty screen's frame with what is true.
+ */
+function NoDesk({ scan, now }: { scan: ScanStatus | null; now: number }) {
+  return (
+    <div className="d-empty">
+      <div className="msg">
+        <div className="lab">Desk</div>
+        <h1>No desk yet</h1>
+        <p>
+          The engine is running and reading funding{scan ? ` on ${scan.venues} venues, ${elapsed(now - scan.at)} ago` : ''}, but no desk is
+          loaded. There are no legs, margin or value to show until one exists.
+        </p>
+        <div className="go">
+          <a className="btn primary" href="#/windows">See all windows</a>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /** No legs (design/HANDOFF.md, Desk: Empty): the desk value, best window now against the owner's minimum, and a way to Windows. */

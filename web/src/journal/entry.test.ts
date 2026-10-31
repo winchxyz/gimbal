@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { JournalEntry, TxRef } from '@gimbal/shared';
-import { amountUsd, clock, contractUrl, externalUrl, feeUsd, numberOf, proofLinks, shortId, unprotectedText } from './entry.ts';
+import { amountUsd, clock, contractUrl, externalUrl, feeUsd, isAccountId, numberOf, proofLinks, shortId, unprotectedText } from './entry.ts';
 
 const entry = (numbers: JournalEntry['numbers']): Pick<JournalEntry, 'numbers'> => ({ numbers });
 
@@ -67,8 +67,20 @@ test('a link is built from the transaction’s own url; the chain only picks the
   assert.deepEqual(proofLinks([]), []);
 });
 
+// The repo's own testnet contract: the tests build addresses from it and never name an account that is not ours.
+const CONTRACT = 'gimbal-fcf135.testnet';
+
 test('the contract’s page opens on the explorer of its network, and a replay plays mainnet', () => {
-  assert.equal(contractUrl('gimbal.near', 'mainnet'), 'https://nearblocks.io/address/gimbal.near');
-  assert.equal(contractUrl('gimbal.near', 'replay'), 'https://nearblocks.io/address/gimbal.near');
-  assert.equal(contractUrl('gimbal-demo.testnet', 'testnet'), 'https://testnet.nearblocks.io/address/gimbal-demo.testnet');
+  assert.equal(contractUrl(CONTRACT, 'testnet'), `https://testnet.nearblocks.io/address/${CONTRACT}`);
+  assert.equal(contractUrl(CONTRACT, 'mainnet'), `https://nearblocks.io/address/${CONTRACT}`);
+  assert.equal(contractUrl(CONTRACT, 'replay'), `https://nearblocks.io/address/${CONTRACT}`);
+});
+
+test('a name that is not an account id gets no explorer link, so a fake never points at a real account', () => {
+  for (const label of ['Demo contract (fake)', '(test contract)', 'Gimbal', '', 'a', '.near', 'near.', 'a..near', '-a.near', 'a.near/x']) {
+    assert.equal(isAccountId(label), false, label);
+    assert.equal(contractUrl(label, 'mainnet'), null, label);
+  }
+  for (const id of [CONTRACT, 'ab', 'a-b_c.d1.near', '0'.repeat(64)]) assert.equal(isAccountId(id), true, id);
+  assert.equal(isAccountId('a'.repeat(65)), false);
 });

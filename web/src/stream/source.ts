@@ -3,13 +3,27 @@ import type { Mode } from '@gimbal/shared';
 import type { Scenario } from './fake-windows.ts';
 import type { Source } from './store.ts';
 
+/** What a design state of the fake needs in the address; with none of them (and no `?stream=`) the page looks for the engine. */
+const FAKE_PARAMS = ['state', 'desk', 'net', 'drift'] as const;
+
 /**
- * Production always reads the engine. In development the fake is the default, so the shell runs
- * without an engine; `?stream=sse` reads the engine through the dev proxy instead.
+ * Production always reads the engine. In development `?stream=sse` and `?stream=fake` choose; the design-state
+ * parameters (`?state=`, `?desk=`, `?net=`, `?drift=`) mean the fake. With none of them the answer is `auto`: the
+ * engine when it answers, else the fake, so the shell still runs without one.
  */
-export function pickSource(search: string, dev: boolean): Source {
+export function pickSource(search: string, dev: boolean): Source | 'auto' {
   if (!dev) return 'sse';
-  return new URLSearchParams(search).get('stream') === 'sse' ? 'sse' : 'fake';
+  const params = new URLSearchParams(search);
+  const stream = params.get('stream');
+  if (stream === 'sse' || stream === 'fake') return stream;
+  return FAKE_PARAMS.some((name) => params.has(name)) ? 'fake' : 'auto';
+}
+
+/** `pickSource` with `auto` settled: `engineAnswers` is asked only then. */
+export async function resolveSource(search: string, dev: boolean, engineAnswers: () => Promise<boolean>): Promise<Source> {
+  const pick = pickSource(search, dev);
+  if (pick !== 'auto') return pick;
+  return (await engineAnswers()) ? 'sse' : 'fake';
 }
 
 /** The network the fake desk reports, so each header variant can be seen: `?net=mainnet|testnet|replay`. */

@@ -9,7 +9,7 @@ import type { Alert, Reached } from './alerts.ts';
 import { sparkline } from './chart.ts';
 import { depth, hours, pct, plain, usd } from './format.ts';
 import type { HistoryEntry } from './history.ts';
-import { rowStatus, totalCosts, venuePair, type FailedScan, type Tab } from './model.ts';
+import { isNoDesk, rowStatus, totalCosts, venuePair, type FailedScan, type Tab } from './model.ts';
 
 /** "2 s ago", ticking: a component of its own so the list does not re-render every second. */
 export function Ago({ at }: { at: number }) {
@@ -66,6 +66,8 @@ export function ListHead({ tab, onTab, tradableCount, watchCount, watchVenues, s
 // ---------- notices under the header ----------
 
 interface NoticesProps {
+  /** No desk is loaded, so the engine refuses every desk window (E_NO_DESK). */
+  noDesk: boolean;
   failed: FailedScan | null;
   held: FundingWindow | null;
   reached: Reached[];
@@ -73,10 +75,19 @@ interface NoticesProps {
   strategyError: string | null;
 }
 
-/** The amber lines: venues that did not answer, local alerts that fired, a strategy that could not be read. */
-export function Notices({ failed, held, reached, onClearAlert, strategyError }: NoticesProps) {
+/** The lines under the header: no desk yet, venues that did not answer (amber), local alerts that fired, a strategy that could not be read. */
+export function Notices({ noDesk, failed, held, reached, onClearAlert, strategyError }: NoticesProps) {
   return (
     <>
+      {noDesk ? (
+        <div className="w-notice calm" role="status">
+          <b>No desk yet</b>
+          <span>
+            The scanner is reading funding, but no desk is loaded, so nothing here can be entered. These are the windows a desk could trade;
+            they open for entry once one exists.
+          </span>
+        </div>
+      ) : null}
       {failed ? (
         <div className="w-notice" role="status">
           <b>{failed.headline}</b>
@@ -160,7 +171,8 @@ export function Row({ w, selected, below, history, onSelect }: RowProps) {
         ) : null}
       </span>
       <Sparkline entry={watch ? undefined : history} />
-      <span className={cx('netv', !watch && w.refused && 'struck', !watch && !w.refused && w.netAprPct < 0 && 'neg', watch && 'g')}>
+      {/* No desk is a fact about the page, not about this window: its net number is real, so it is not struck out. */}
+      <span className={cx('netv', !watch && w.refused && !isNoDesk(w) && 'struck', !watch && !(w.refused && !isNoDesk(w)) && w.netAprPct < 0 && 'neg', watch && 'g')}>
         {watch ? '—' : <Flash value={w.netAprPct}>{pct(w.netAprPct)}</Flash>}
       </span>
       <span className="s">

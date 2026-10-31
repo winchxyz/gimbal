@@ -15,7 +15,7 @@ import { startFakeStream } from './fake.ts';
 const desk = (equityUsd: number): DeskState => ({
   deskId: 'd1',
   owner: 'owner.testnet',
-  contract: 'gimbal.testnet',
+  contract: '(test contract)',
   mode: 'testnet',
   legs: [],
   netDelta: 0,
@@ -114,11 +114,17 @@ test('parseStreamEvent accepts StreamEvent envelopes only', () => {
   }
 });
 
-test('production always reads the engine; development defaults to the fake', () => {
+test('production always reads the engine; development reads it when it answers, and the design states ask for the fake', () => {
   assert.equal(pickSource('', false), 'sse');
   assert.equal(pickSource('?stream=fake', false), 'sse');
-  assert.equal(pickSource('', true), 'fake');
+  assert.equal(pickSource('?desk=watch', false), 'sse');
+  assert.equal(pickSource('', true), 'auto');
   assert.equal(pickSource('?stream=sse', true), 'sse');
+  assert.equal(pickSource('?stream=fake', true), 'fake');
+  for (const search of ['?desk=watch', '?state=empty', '?net=replay', '?drift=off', '?stream=other&desk=level']) {
+    assert.equal(pickSource(search, true), 'fake', search);
+  }
+  assert.equal(pickSource('?stream=sse&desk=watch', true), 'sse');
   assert.equal(pickFakeMode(''), 'testnet');
   assert.equal(pickFakeMode('?net=replay'), 'replay');
   assert.equal(pickFakeMode('?net=mainnet'), 'mainnet');

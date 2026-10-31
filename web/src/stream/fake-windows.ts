@@ -155,10 +155,17 @@ export function fakeHistory(spec: Spec, now: number): WindowHistory {
   return { windowId: specId(spec), points };
 }
 
-/** The fake engine API: the same reads the real engine serves. The journal comes from fake-journal.ts, passed in by start.ts. */
+/**
+ * The fake engine API: the same reads the real engine serves. The journal comes from fake-journal.ts, passed in by
+ * start.ts, and it is all there at once, so there is never an older page. The manual overrides say yes: the fake
+ * changes nothing, and the real refusals are seen against the engine.
+ */
 export function fakeApi(journal: EngineApi['journal'] = async () => []): EngineApi {
   return {
     journal,
+    journalBefore: async () => [],
+    rotate: async () => ({ ok: true }),
+    close: async () => ({ ok: true }),
     strategy: async () => ({ ...FAKE_STRATEGY }),
     windowHistory: async (id) => {
       const spec = SPECS.find((s) => specId(s) === id);

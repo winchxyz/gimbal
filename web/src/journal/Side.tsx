@@ -15,6 +15,7 @@ export function Side({ entries, desk, windows }: { entries: readonly JournalEntr
   const a = attributionOf(desk?.pnl ?? null, entries);
   const counts = countsOf(entries);
   const note = desk ? sinceNote(desk, windows) : null;
+  const explorer = desk ? contractUrl(desk.contract, desk.mode) : null;
 
   return (
     <aside className="j-side" aria-label="Summary">
@@ -88,10 +89,14 @@ export function Side({ entries, desk, windows }: { entries: readonly JournalEntr
             <span className="mono">
               {desk.contract} · {desk.deskId}
             </span>
-            &nbsp;{' '}
-            <a href={contractUrl(desk.contract, desk.mode)} target="_blank" rel="noreferrer noopener">
-              NEAR explorer ↗
-            </a>
+            {explorer ? (
+              <>
+                &nbsp;{' '}
+                <a href={explorer} target="_blank" rel="noreferrer noopener">
+                  NEAR explorer ↗
+                </a>
+              </>
+            ) : null}
           </p>
         ) : null}
       </div>

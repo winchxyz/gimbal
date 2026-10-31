@@ -3,7 +3,6 @@
 import type { DeskState, JournalEntry, Window as FundingWindow } from '@gimbal/shared';
 import { signedUsd } from '../desk/format.ts';
 import { dayRate, paybackOf } from '../desk/model.ts';
-import { JOURNAL_LIMIT } from '../stream/store.ts';
 import { dayMonth, dayMonthTime, hours, venueName } from '../windows/format.ts';
 import { heldWindow } from '../windows/model.ts';
 import { amountUsd, clock, feeUsd, numberOf, proofLinks, unprotectedText, type ProofLink } from './entry.ts';
@@ -14,15 +13,15 @@ const DAY_MS = 86_400_000;
 // ---------- the list of entries ----------
 
 /**
- * The entries the engine read (`GET /state`) and the ones that arrived on the stream since, newest first, one per
- * id. The stream's copy wins: it is the later one. A reconnect can resend entries the page already has.
+ * The entries the engine read (`GET /state`, and the older pages after it) and the ones that arrived on the stream
+ * since, newest first, one per id. The stream's copy wins: it is the later one. A reconnect can resend entries the
+ * page already has. Nothing is cut: a reader who asked for older pages keeps them, and the engine holds a bounded few thousand.
  */
 export function mergeEntries(loaded: readonly JournalEntry[], live: readonly JournalEntry[]): JournalEntry[] {
   const byId = new Map<string, JournalEntry>();
   for (const e of loaded) byId.set(e.id, e);
   for (const e of live) byId.set(e.id, e);
-  const merged = [...byId.values()].sort((a, b) => b.t - a.t); // the sort is stable: entries at the same time keep their order
-  return merged.length > JOURNAL_LIMIT ? merged.slice(0, JOURNAL_LIMIT) : merged;
+  return [...byId.values()].sort((a, b) => b.t - a.t); // the sort is stable: entries at the same time keep their order
 }
 
 export const entriesIn = (entries: readonly JournalEntry[], filter: FilterId): JournalEntry[] =>
@@ -42,10 +41,15 @@ export function filterCounts(entries: readonly JournalEntry[]): Record<FilterId,
  * Live updates (design/HANDOFF.md, Journal): while the reader is scrolled down, the page keeps the entries it
  * showed (`frozen`, a set of ids) and only counts the new ones, so nothing moves under them.
  * `frozen` null = the reader is at the top and sees everything.
+ *
+ * Only an entry newer than everything the reader was shown waits. One older than that is a page they asked for
+ * (`GET /journal?before=`) and belongs at the bottom, where it moves nothing, so it shows at once.
  */
 export function visibleFeed(entries: readonly JournalEntry[], frozen: ReadonlySet<string> | null): { shown: JournalEntry[]; pending: number } {
   if (frozen === null) return { shown: [...entries], pending: 0 };
-  const shown = entries.filter((e) => frozen.has(e.id));
+  let newest = -Infinity;
+  for (const e of entries) if (frozen.has(e.id) && e.t > newest) newest = e.t;
+  const shown = entries.filter((e) => frozen.has(e.id) || e.t < newest);
   return { shown, pending: entries.length - shown.length };
 }
 

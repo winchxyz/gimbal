@@ -1,14 +1,15 @@
 // How one `JournalEntry` is read, shared by the Journal screen and the Desk's "Latest" so both show an entry the
 // same way. Pure, so `node --test` runs it as it is.
 //
-// `JournalEntry.numbers` has no fixed keys in docs/interfaces.md §2. The dashboard reads these, and shows nothing
-// for one that is missing:
-//   usd       the money effect of the entry, signed: funding received +, fees and costs −. For `deposit` and
-//             `withdraw` it is the principal moved, which is not profit or loss.
-//   feeUsd    a fee charged on top of `usd` (≤ 0), for a withdrawal or a deposit.
-//   unpriced  1 or "true" when an order went out without the oracle price band; `venue` names it.
-//   from, signedS, landedS   on a rescue: where the margin came from ("reserve" or a venue id), and the seconds
-//             the MPC signature and the landing took.
+// `JournalEntry.numbers` is read by the keys docs/interfaces.md §2 names, every one optional (a missing key shows
+// nothing), and a number may arrive as a decimal string ("1050.00"):
+//   usd       the signed money effect in USD: funding received +, fees and costs −. For `deposit` and `withdraw`
+//             it is the principal moved, which is not profit or loss.
+//   feeUsd    a fee on top of `usd`, ≤ 0, for a withdrawal or a deposit.
+//   unpriced  1 or "true" when an order went out without the oracle price band; `venue` names the venue.
+//   from, signedS, landedS   on a rescue: "reserve" or the venue id the margin came from, then the seconds the
+//             MPC signature and the landing took.
+// Any other key (a symbol, a rate) is kept for the CSV and shown nowhere.
 import type { JournalEntry, Mode, TxRef } from '@gimbal/shared';
 import { venueName } from '../windows/format.ts';
 
@@ -57,10 +58,20 @@ export const CHAIN_LABELS: Record<TxRef['chain'], string> = {
 };
 
 /**
- * The contract's page on the NEAR explorer. This is the one link the dashboard builds itself, because it is not a
- * transaction (`TxRef.url`): the network picks the explorer, and a replay plays recorded mainnet data.
+ * Whether a name is a NEAR account id (2 to 64 characters of lower-case letters and digits, with `-`, `_` and `.`
+ * between them). Anything else is a label, such as the fake stream's, and has no page on any explorer.
  */
-export function contractUrl(contract: string, mode: Mode): string {
+export function isAccountId(name: string): boolean {
+  return name.length >= 2 && name.length <= 64 && /^(([a-z\d]+[-_])*[a-z\d]+\.)*([a-z\d]+[-_])*[a-z\d]+$/.test(name);
+}
+
+/**
+ * The contract's page on the NEAR explorer, or null when the name is not an account id. This is the one link the
+ * dashboard builds itself, because it is not a transaction (`TxRef.url`): the network picks the explorer, and a
+ * replay plays recorded mainnet data.
+ */
+export function contractUrl(contract: string, mode: Mode): string | null {
+  if (!isAccountId(contract)) return null;
   const origin = mode === 'testnet' ? 'https://testnet.nearblocks.io' : 'https://nearblocks.io';
   return `${origin}/address/${encodeURIComponent(contract)}`;
 }

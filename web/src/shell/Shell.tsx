@@ -4,6 +4,7 @@ import { JournalScreen } from '../journal/JournalScreen.tsx';
 import { Placeholder } from '../screens/Placeholder.tsx';
 import { NoticeBar } from '../ui/NoticeBar.tsx';
 import { WindowsScreen } from '../windows/WindowsScreen.tsx';
+import { ConnectionBar } from './ConnectionBar.tsx';
 import { Header } from './Header.tsx';
 import { SCREENS, useScreen } from './routes.ts';
 import { StatusLine } from './StatusLine.tsx';
@@ -24,6 +25,7 @@ export function Shell() {
   return (
     <div className="app">
       <Header screen={screen} />
+      <ConnectionBar />
       {WITH_STATUS.has(screen) && <StatusLine screen={screen} />}
       <NoticeBar />
       <main className="page">

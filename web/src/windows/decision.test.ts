@@ -19,23 +19,34 @@ test('a lower window than the held one: auto keeps the held one and says what sw
 
 test('the held window: since when, for how long, and Close position', () => {
   const d = decide({ selected: doge, windows: [doge, sol], strategy: STRATEGY, now: NOW });
-  assert.equal(d.text, 'Held since 25 Oct 00:00 UTC · 2 d 14 h.');
+  assert.equal(
+    d.text,
+    'Held since 25 Oct 00:00 UTC · 2 d 14 h. Auto moves out of it when another window beats it by 3 points of net APR for 4 hours in a row.',
+  );
   assert.equal(d.close, true);
   assert.equal(d.rotate, null);
   assert.equal(d.alert, null);
 });
 
-test('a window above the held one: the numbers and the payback, not a claim about what auto does', () => {
+test('a window above the held one: the numbers, the payback, and whether it clears auto’s rotation rule', () => {
   const better = net('NEAR', 15.8, { switchCostUsd: 1.1, usdPerDayPer1k: 0.43 });
   const d = decide({ selected: better, windows: [doge, better], strategy: STRATEGY, now: NOW });
   // 2.0 points above; extra $0.05 per $1k = $0.06 a day on $1,200 legs; $1.10 / $0.06 is about 18 days
-  assert.match(d.text, /^NEAR is 2\.0 points above DOGE\. Switching now costs about \$1\.10\. The extra \$0\.06 a day earns that back in \d+ days\.$/);
+  assert.match(d.text, /^NEAR is 2\.0 points above DOGE\. Switching now costs about \$1\.10\. The extra \$0\.06 a day earns that back in \d+ days\./);
+  assert.match(d.text, / That is under auto’s rule of 3 points of net APR for 4 hours in a row, so it stays in DOGE\.$/);
   assert.equal(d.alert, null);
   assert.ok(d.rotate);
+  const enough = net('NEAR', 17.8, { switchCostUsd: 1.1, usdPerDayPer1k: 0.5 });
+  assert.match(
+    decide({ selected: enough, windows: [doge, enough], strategy: STRATEGY, now: NOW }).text,
+    / That clears auto’s rule of 3 points of net APR for 4 hours in a row, so it rotates if the gap holds\.$/,
+  );
+  const half = { ...STRATEGY, rotate: { minGainPts: 2.5, forHours: 1 } };
+  assert.match(decide({ selected: enough, windows: [doge, enough], strategy: half, now: NOW }).text, /rule of 2\.5 points of net APR for 1 hour in a row/);
   const noStrategy = decide({ selected: better, windows: [doge, better], strategy: null, now: NOW });
   assert.equal(noStrategy.text, 'NEAR is 2.0 points above DOGE. Switching now costs about $1.10.');
   const noCost = decide({ selected: { ...better, switchCostUsd: null }, windows: [doge, better], strategy: STRATEGY, now: NOW });
-  assert.equal(noCost.text, 'NEAR is 2.0 points above DOGE.');
+  assert.equal(noCost.text, 'NEAR is 2.0 points above DOGE. That is under auto’s rule of 3 points of net APR for 4 hours in a row, so it stays in DOGE.');
 });
 
 test('refused and vetoed windows cannot be rotated into', () => {

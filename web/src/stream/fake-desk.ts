@@ -3,7 +3,7 @@
 // scenario (`?desk=`, listed with their meaning in source.ts). The short leg is 32.6% from liquidation in `level`,
 // 12.4% in `watch`, 7.6% in `rescuing` and 6.8% in `needs`.
 import type { DeskState, JournalEntry, Leg, Mode } from '@gimbal/shared';
-import { fakeTx } from './fake-explorer.ts';
+import { FAKE_OWNER, fakeContract, fakeTx } from './fake-explorer.ts';
 import type { DeskScenario } from './source.ts';
 import type { Health } from './store.ts';
 
@@ -28,9 +28,9 @@ const SHORT_DISTANCE: Partial<Record<DeskScenario, number>> = { watch: 12.4, res
 export function fakeDesk(now: number, tick: number, options: DeskOptions): DeskState {
   const { scenario } = options;
   const wobble = options.drift ? Math.sin(tick / 7) * 0.0004 : 0;
-  const owner = 'demo-owner.testnet';
-  // The contract lives on the network the mode names, so its link opens on the right explorer.
-  const contract = options.mode === 'testnet' ? 'gimbal-demo.testnet' : 'gimbal.near';
+  const owner = FAKE_OWNER;
+  // Only the testnet fake names a real contract (the repo's own), so its link opens on the right explorer.
+  const contract = fakeContract(options.mode);
   const base = { deskId: 'desk-07', owner, contract, mode: options.mode, updatedAt: now };
 
   if (scenario === 'waiting' || scenario === 'loading') {
