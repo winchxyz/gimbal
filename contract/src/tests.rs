@@ -16,6 +16,10 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 /// The Hyperliquid methods, on these fixtures.
 mod hl;
+/// The Orderly methods, on these fixtures.
+mod orderly;
+/// The MPC `sign` call and `on_signed`.
+mod signing;
 /// The Solana methods, on these fixtures.
 mod sol;
 
@@ -424,29 +428,60 @@ fn attributes_of<'a>(source: &'a str, method: &str) -> Vec<&'a str> {
 /// build is proved on testnet (PR #8); this keeps the attribute from being dropped.
 #[test]
 fn mutating_methods_refuse_unknown_arguments() {
-    let source = include_str!("lib.rs");
-    for method in [
-        "new",
-        "create_desk",
-        "set_policy",
-        "set_operator",
-        "set_paused",
-    ] {
-        let attributes = attributes_of(source, method);
-        assert!(
-            attributes.contains(&"#[deny_unknown_arguments]"),
-            "{method}: {attributes:?}"
-        );
+    let sources: [(&str, &[&str]); 4] = [
+        (
+            include_str!("lib.rs"),
+            &[
+                "new",
+                "create_desk",
+                "set_policy",
+                "set_operator",
+                "set_paused",
+            ],
+        ),
+        (
+            include_str!("hl.rs"),
+            &[
+                "hl_order",
+                "hl_cancel",
+                "hl_set_referrer",
+                "hl_approve_builder_fee",
+                "hl_usd_class_transfer",
+                "hl_withdraw",
+            ],
+        ),
+        (include_str!("sol.rs"), &["sol_sign", "sol_sign_register"]),
+        (
+            include_str!("orderly.rs"),
+            &[
+                "orderly_register",
+                "orderly_add_key",
+                "orderly_request",
+                "orderly_ws_auth",
+                "orderly_settle_pnl",
+                "orderly_withdraw",
+            ],
+        ),
+    ];
+    for (source, methods) in sources {
+        for method in methods {
+            let attributes = attributes_of(source, method);
+            assert!(
+                attributes.contains(&"#[deny_unknown_arguments]"),
+                "{method}: {attributes:?}"
+            );
+        }
     }
 }
 
 /// `#[private]` lives in the wasm entry point too. Without it on `on_desk_keys` any contract could
-/// call it with made-up MPC answers and a desk of its choosing and drain refunds; `refuse` and
-/// `new` are the contract's own as well.
+/// call it with made-up MPC answers and a desk of its choosing and drain refunds; without it on
+/// `on_signed` anyone could make the contract log a `signed` event for an action it never built;
+/// `refuse` and `new` are the contract's own as well.
 #[test]
 fn callbacks_and_init_are_private() {
     let source = include_str!("lib.rs");
-    for method in ["new", "on_desk_keys", "refuse"] {
+    for method in ["new", "on_desk_keys", "on_signed", "refuse"] {
         let attributes = attributes_of(source, method);
         assert!(
             attributes.contains(&"#[private]"),
@@ -507,7 +542,7 @@ fn create_desk_asks_the_mpc_for_both_keys_and_stores_nothing_itself() {
         args,
         &json!({
             "desk_id": "alpha",
-            "desk": Desk::new(owner(), policy(), EVM.into(), solana()),
+            "desk": Desk::new(owner(), policy(), EVM.into(), solana(), "woofi_dex"),
             "attached": attached,
         })
     );
@@ -519,7 +554,13 @@ fn the_callback_stores_the_desk_refunds_the_rest_and_logs_both_events() {
     assert!(create(&mut g, owner(), "alpha", NearToken::from_near(1)));
     assert_eq!(
         g.get_desk("alpha".into()),
-        Some(Desk::new(owner(), policy(), EVM.into(), solana()))
+        Some(Desk::new(
+            owner(),
+            policy(),
+            EVM.into(),
+            solana(),
+            "woofi_dex"
+        ))
     );
     assert_eq!(g.desks_of(owner()), vec!["alpha".to_string()]);
     assert_eq!(

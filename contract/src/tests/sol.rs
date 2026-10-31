@@ -34,7 +34,7 @@ fn num(v: &Value) -> u64 {
 }
 
 /// The vectors' desk: authority `Gma…EGB` and the accounts it derives.
-fn vector_solana() -> SolanaAccounts {
+pub(super) fn vector_solana() -> SolanaAccounts {
     serde_json::from_value(vectors()["desk"].clone()).unwrap()
 }
 
@@ -64,7 +64,7 @@ fn sol_policy() -> Policy {
 /// `operator()`, written straight into the map (no MPC answer gives that authority).
 fn sol_desk_with(policy: Policy) -> Gimbal {
     let mut g = testnet();
-    let mut desk = Desk::new(owner(), policy, EVM.into(), vector_solana());
+    let mut desk = Desk::new(owner(), policy, EVM.into(), vector_solana(), "woofi_dex");
     desk.operator = Some(operator());
     g.desks.insert("alpha".into(), desk);
     g
@@ -101,7 +101,7 @@ fn derived() -> SolDesk {
 
 /// What `f` returns, or the text it panicked with: the mock wraps `env::panic_str` as
 /// `… GuestPanic { panic_msg: "<text, Debug-escaped>" }…`, unwrapped here.
-fn outcome(f: impl FnOnce() -> UnsignedAction) -> Result<UnsignedAction, String> {
+pub(super) fn outcome<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     let mut got = None;
     match catch_unwind(AssertUnwindSafe(|| got = Some(f()))) {
         Ok(()) => Ok(got.unwrap()),
@@ -123,13 +123,13 @@ fn outcome(f: impl FnOnce() -> UnsignedAction) -> Result<UnsignedAction, String>
 /// `sol_sign` by the operator.
 fn sol_sign(g: &mut Gimbal, bytes: &[u8]) -> Result<UnsignedAction, String> {
     called_by(operator());
-    outcome(|| g.sol_sign("alpha".into(), b64(bytes), "vector".into()))
+    outcome(|| g.prepare_sol_sign("alpha".into(), b64(bytes), "vector".into()))
 }
 
 /// `sol_sign_register` by the operator.
 fn sol_sign_register(g: &mut Gimbal, bytes: &[u8]) -> Result<UnsignedAction, String> {
     called_by(operator());
-    outcome(|| g.sol_sign_register("alpha".into(), b64(bytes)))
+    outcome(|| g.prepare_sol_sign_register("alpha".into(), b64(bytes)))
 }
 
 /// `got` signs `bytes` with the desk's Solana key and carries them as `message_b64`.
@@ -236,13 +236,13 @@ fn sol_sign_returns_the_message_for_the_desk_key() {
     let mut g = sol_desk();
     let deposit = bytes_of(&case(&vectors(), "deposit 15 USDC"));
     called_by(operator());
-    let got = g.sol_sign("alpha".into(), b64(&deposit), "fund Phoenix".into());
+    let got = g.prepare_sol_sign("alpha".into(), b64(&deposit), "fund Phoenix".into());
     assert_signs(&got, "deposit", &deposit, Some("fund Phoenix"));
     let json = serde_json::to_string(&got).unwrap();
     assert_eq!(
         json,
         format!(
-            r#"{{"desk_id":"alpha","venue":"phoenix","kind":"deposit","payload":{{"message_b64":"{}"}},"sign_request":{{"path":"gimbal/alpha/sol","payload_v2":{{"Eddsa":"{}"}},"domain_id":1}},"reason_sha256":"{}"}}"#,
+            r#"{{"desk_id":"alpha","venue":"phoenix","kind":"deposit","payload":{{"message_b64":"{}"}},"sign_request":{{"path":"gimbal/alpha/sol","payload_v2":{{"Eddsa":"{}"}},"domain_id":1}},"reason_sha256":"{}","orders":[],"amount":null}}"#,
             b64(&deposit),
             hex::encode(&deposit),
             hex::encode(env::sha256_array("fund Phoenix"))
@@ -346,17 +346,17 @@ fn sol_sign_is_for_the_owner_and_the_operator() {
     let mut g = sol_desk();
     let deposit = bytes_of(&case(&vectors(), "deposit 15 USDC"));
     called_by(owner());
-    g.sol_sign("alpha".into(), b64(&deposit), String::new());
+    g.prepare_sol_sign("alpha".into(), b64(&deposit), String::new());
     called_by(stranger());
     assert_refused("E_NOT_ALLOWED: ", || {
-        g.sol_sign("alpha".into(), b64(&deposit), String::new());
+        g.prepare_sol_sign("alpha".into(), b64(&deposit), String::new());
     });
     called_by(operator());
     assert_refused(&format!("{E_NO_DESK}: "), || {
-        g.sol_sign("bravo".into(), b64(&deposit), String::new());
+        g.prepare_sol_sign("bravo".into(), b64(&deposit), String::new());
     });
     assert_refused("E_ARGS: reason has 281 characters", || {
-        g.sol_sign("alpha".into(), b64(&deposit), "x".repeat(281));
+        g.prepare_sol_sign("alpha".into(), b64(&deposit), "x".repeat(281));
     });
 }
 
@@ -377,7 +377,7 @@ fn message_b64_is_standard_padded_base64_of_a_transaction_size() {
         assert_refused(
             "E_ARGS: message_b64 is not standard base64 with padding",
             || {
-                g.sol_sign("alpha".into(), bad.clone(), String::new());
+                g.prepare_sol_sign("alpha".into(), bad.clone(), String::new());
             },
         );
     }
@@ -385,13 +385,13 @@ fn message_b64_is_standard_padded_base64_of_a_transaction_size() {
     assert_refused(
         &format!("{E_SOL_MESSAGE}: message_b64 has {} characters", long.len()),
         || {
-            g.sol_sign("alpha".into(), long.clone(), String::new());
+            g.prepare_sol_sign("alpha".into(), long.clone(), String::new());
         },
     );
     // The longest one decoded is still checked against the transaction size by the core.
     let max = "A".repeat(MESSAGE_B64_MAX_LEN);
     assert_refused(&format!("{E_SOL_MESSAGE}: "), || {
-        g.sol_sign("alpha".into(), max.clone(), String::new());
+        g.prepare_sol_sign("alpha".into(), max.clone(), String::new());
     });
 }
 
@@ -453,7 +453,7 @@ fn sol_sign_register_signs_the_golden_messages() {
     for kind in ["register", "referral_activate"] {
         let b64 = doc["messages"][kind]["message_b64"].as_str().unwrap();
         called_by(operator());
-        let got = g.sol_sign_register("alpha".into(), b64.into());
+        let got = g.prepare_sol_sign_register("alpha".into(), b64.into());
         assert_signs(&got, kind, &STANDARD.decode(b64).unwrap(), None);
     }
 }
@@ -468,11 +468,11 @@ fn sol_sign_register_needs_a_running_desk() {
     g.desks.get_mut("alpha").unwrap().paused = true;
     called_by(operator());
     assert_refused("E_PAUSED: desk alpha is paused", || {
-        g.sol_sign_register("alpha".into(), register.clone());
+        g.prepare_sol_sign_register("alpha".into(), register.clone());
     });
     called_by(stranger());
     assert_refused("E_NOT_ALLOWED: ", || {
-        g.sol_sign_register("alpha".into(), register.clone());
+        g.prepare_sol_sign_register("alpha".into(), register.clone());
     });
 }
 
@@ -489,7 +489,7 @@ fn an_onboarding_message_signs_for_its_own_desk_only() {
     assert_refused(
         &format!("{E_SOL_MESSAGE}: the fee payer (keys[0]) is "),
         || {
-            g.sol_sign_register("alpha".into(), register.clone());
+            g.prepare_sol_sign_register("alpha".into(), register.clone());
         },
     );
 }

@@ -24,6 +24,10 @@ pub struct Desk {
     /// Registered by the owner and checked against the authority's derived accounts; the Solana
     /// methods derive them again and never read the stored ones.
     pub solana: SolanaAccounts,
+    /// The desk's Orderly account id under `OrderlyConfig.broker_id`, lowercase `0x` hex:
+    /// keccak256(abi.encode(evm_address, keccak256(broker_id))), known before registration, the
+    /// `orderly-account-id` header of every request. Never changes.
+    pub orderly_account_id: String,
     /// The Orderly account's exclusive receiver address on Arbitrum, pinned once by the owner.
     pub orderly_receiver: Option<String>,
     pub ledger: Ledger,
@@ -88,18 +92,21 @@ impl Gate {
 }
 
 impl Desk {
-    /// A new, running desk with no operator, no Orderly receiver and an empty ledger.
+    /// A new, running desk with no operator, no Orderly receiver and an empty ledger, its Orderly
+    /// account id that of `evm_address` (checked by the caller) under `broker_id`.
     pub fn new(
         owner: AccountId,
         policy: Policy,
         evm_address: String,
         solana: SolanaAccounts,
+        broker_id: &str,
     ) -> Self {
         Self {
             owner,
             operator: None,
             paused: false,
             policy,
+            orderly_account_id: crate::orderly::orderly_account_id(&evm_address, broker_id),
             evm_address,
             solana,
             orderly_receiver: None,
