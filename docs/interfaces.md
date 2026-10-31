@@ -70,8 +70,9 @@ struct Policy {
     orderly_symbols: Vec<String>,            // e.g. "PERP_SOL_USDC"
     max_notional_usd: u64,                   // per leg, whole USD
     price_band_bps: u32,                     // order price vs oracle price
-    oracle_max_age_s: u32,                   // 1–3600; drafts and the web take ≥ 900: a stored price is dated at its
-                                             // oldest report, up to 10 min before the oracle's read (§1.3, Views)
+    oracle_max_age_s: u32,                   // 1–3600 on testnet; 900–3600 on a Mainnet contract (E_ARGS in create_desk
+                                             // and set_policy): a stored price is dated at its oldest report, up to
+                                             // 10 min before the oracle's read (§1.3, Views); drafts and the web take 900
     rescue_cap_usd_per_hour: u64,            // a sliding hour, with a cost budget and a deposit-address ring (§1.3)
     max_transfer_cost_bps: u32,              // 1Click: minAmountOut ≥ amountIn − max(bps share, flat); default 100
     max_transfer_cost_flat_e6: u64,          // USDC ×1e6; default 500000 (0.5 USDC; measured 0.21–0.32 on 4–7 USDC)
@@ -190,13 +191,13 @@ chooses nothing:
 | `hl_set_referrer(desk_id)` | ✓ | ✓ | L1 action `{type:"setReferrer", code}` with `code = treasury.referral_codes.hyperliquid`; setup calls it once per desk, before its first order (the contract does not refuse a repeat; Hyperliquid does); no other code can be signed; with no code configured it refuses (`E_ARGS`) and setup skips it |
 | `hl_withdraw(desk_id, amount)` | ✓ | | emergency only: to the desk's own EVM address |
 | `set_mock_price(asset, price_e8)` | contract owner | | only with `PriceSource::Mock` |
-| `refresh_prices(assets: Vec<String>)` | ✓ | ✓ | 1–5 symbols, each once. Callers: any desk owner (so its engine key), any desk's separate operator account and the contract account; anyone else `E_NOT_ALLOWED`, so strangers cannot spend the contract's deposit. Needs ≥ 285 TGas (`E_ARGS`). Asks the OutLayer oracle (`request_price_data`, falling back to `oracle_call`) and stores each price newer than the stored one; the oracle deposit (0.02 NEAR, mostly refunded) comes from the contract balance; event `prices`. Returns `true` when every symbol asked for got a price; when every one was stored under 30 s ago it asks nothing and returns `true` at once |
+| `refresh_prices(assets: Vec<String>)` | ✓ | ✓ | 1–5 symbols, each once. Callers: any desk owner (so its engine key), any desk's separate operator account and the contract account; anyone else `E_NOT_ALLOWED`, so strangers cannot spend the contract's deposit. Needs ≥ 285 TGas (`E_ARGS`). Asks the OutLayer oracle (`request_price_data`, falling back to `oracle_call`) and stores each price newer than the stored one; the oracle deposit (0.02 NEAR, mostly refunded) comes from the contract balance; event `prices`. The contract remembers when each symbol was last asked for: when every symbol asked for had a price stored, or was asked for by an earlier call, under 30 s before the block time, it asks nothing and returns `true` at once (a skip means "nothing to do now", not "priced": a caller that needs a newer price reads `prices()` again). Otherwise it asks the oracle for all of them and returns `true` only when every symbol got a price from that answer |
 | `oracle_on_call(…)` | the oracle only | | the OutLayer oracle's callback when `refresh_prices` uses `oracle_call`; argument shape from OutLayer's docs; any predecessor other than the configured oracle → `E_NOT_ALLOWED` |
 | `hl_order(desk_id, order: HlOrder, reason)` | ✓ | ✓ | price band vs stored oracle price; size cap at the reference price (§1.2); reduce-only passes a paused desk |
 | `hl_cancel(desk_id, asset: u32, oid: u64, reason)` | ✓ | ✓ | L1 action `{type:"cancel", cancels:[{a, o}]}`; passes a paused desk, so a pause can stop resting orders |
 | `hl_usd_class_transfer(desk_id, amount, to_perp, reason)` | ✓ | ✓ | |
 | `hl_send_to_intents(desk_id, quote, quote_signature, reason)` | ✓ | ✓ | rescue out of Hyperliquid |
-| `sol_sign(desk_id, message_b64, reason)` | ✓ | ✓ | Phoenix / Ember / own transfers, legacy messages, one signer (the desk). Every Phoenix and Ember instruction has an exact account list with its fixed accounts pinned: an order or cancel has 10 accounts, the orderbook at [8] (a policy market) and its spline PDA `["spline", book]` at [9]; deposit 10, withdraw 12, Ember wrap / unwrap 8. A token Approve only on the desk PhUSD account to Ember, for exactly the amount an unwrap after it takes; a Revoke may follow that unwrap. No empty (zero-amount) or self transfers. A compute-unit price needs a unit limit; priority fee ≤ 600,000 lamports (on a paused desk only with a cancel or a reduce, §1.3). A message of compute budget only is refused |
+| `sol_sign(desk_id, message_b64, reason)` | ✓ | ✓ | Phoenix / Ember / own transfers, legacy messages, one signer (the desk). Every Phoenix and Ember instruction has an exact account list with its fixed accounts pinned: an order or cancel has 10 accounts, the orderbook at [8] (a policy market) and its spline PDA `["spline", book]` at [9]; deposit 10, withdraw 12, Ember wrap / unwrap 8. A token Approve only on the desk PhUSD account to Ember, for exactly the amount an unwrap after it takes; a Revoke may follow that unwrap. No empty (zero-amount) or self transfers; a Phoenix withdraw of 0 or an Ember unwrap of 0 is `E_SOL_PROGRAM` here and in `sol_sign_rescue` (an unwrap of the whole balance, no amount, still passes `sol_sign`). A compute-unit price needs a unit limit; priority fee ≤ 600,000 lamports (on a paused desk only with a cancel or a reduce, §1.3). A message of compute budget only is refused |
 | `sol_sign_register(desk_id, message_b64)` | ✓ | ✓ | Phoenix onboarding only, two shapes: registration (`register_trader` + `set_trader_capabilities_delegated`) and referral activation (`set_trader_capabilities_delegated` alone); registration is a legacy message, referral activation a v0 message with no address-table lookups (the other format → `E_SOL_MESSAGE`); two signers, keys[0] = the desk as fee payer and Phoenix's pinned onboarder (the desk authority itself is not a signer of `register_trader`); accounts are checked through each instruction's positions, instruction data is pinned |
 | `sol_sign_rescue(desk_id, message_b64, quote, quote_signature, reason)` | ✓ | ✓ | rescue out of Solana |
 | `orderly_register(desk_id, registration_nonce)` | ✓ | ✓ | EIP-712 `Registration` (nonce from `GET /v1/registration_nonce`, block time as timestamp, broker and chain from `OrderlyConfig`) |
@@ -229,7 +230,10 @@ base58(sha256(`quote`)) before it parses anything (`E_QUOTE_SIGNATURE`), then ap
 in the same file; `E_QUOTE_FIELDS`, `E_RESCUE_CAP`). Only live quotes pass: a dry quote has no `depositAddress`
 (`E_QUOTE_FIELDS`). A live quote's signed message also carries `depositAddress`, the quote's own `deadline` (it
 replaces the request's), `timeWhenInactive`, `timeEstimate`, `refundFee` and `withdrawFee` (when truthy), as recorded
-in `oneclick-live.json` (2026-10-31). On 2026-10-31 1Click refused every quote out of HyperCore, dry ones too
+in `oneclick-live.json` (2026-10-31). 1Click sets a live quote's `deadline` to the requested one + 72 h, so the age
+limit uses the signed `timestamp` instead: a quote is refused when its `timestamp` is more than 1 h before or more
+than 5 min after the block time (`E_QUOTE_FIELDS`, checked inside `verify_quote`, so every quoted method gets it). A
+quote can therefore be paid in a window of 65 min at most. On 2026-10-31 1Click refused every quote out of HyperCore, dry ones too
 ("Quoting for this pair is not available"), so a route out of Hyperliquid can be missing at times; the engine
 treats "no quote" as a normal answer.
 
@@ -243,8 +247,10 @@ treats "no quote" as a normal answer.
   max(`rescue_cap_usd_per_hour` × `max_transfer_cost_bps` / 10⁴, 2 × `max_transfer_cost_flat_e6`), so many small
   transfers cannot pay the cap away in fees (`E_RESCUE_CAP`). Hyperliquid's 1 USDC send fee is not counted: it is
   burnt like a trading fee.
-- **Deposit addresses.** The last 32 deposit addresses a desk paid; a quote pays once, so a quote to one of them is
-  refused (`E_QUOTE_FIELDS`).
+- **Deposit addresses.** The last 32 deposit addresses a desk paid, each with the time it was paid; a quote pays once,
+  so a quote to one of them is refused (`E_QUOTE_FIELDS`). A rescue that would push out an address paid 65 min ago or
+  less (a quote's whole payable window) is refused (`E_RESCUE_CAP`) and counts nothing, so a desk makes at most 32
+  rescues in any 65 min and no quote can be replayed after the ring forgets it.
 
 A signature the MPC returns late still counts, so nothing is given back after `E_MPC`. A quote whose
 `destinationAsset` is its `originAsset` is refused (`E_QUOTE_FIELDS`): it moves nothing and only pays fees.
@@ -362,7 +368,7 @@ near-sdk before the method runs ("Failed to deserialize input from JSON"); clien
 | `E_NOT_ALLOWED` | caller is neither owner nor operator, operator called an owner method, an owner method came without exactly 1 yocto attached, or a storage method (`create_desk`, `set_policy`, `set_operator`, `set_orderly_receiver`, `set_orderly_ips`) came with no deposit (§1.3); `refresh_prices` from an account that owns and operates no desk |
 | `E_PAUSED` | desk paused |
 | `E_NO_DESK` / `E_DESK_EXISTS` | |
-| `E_ARGS` | malformed argument: desk_id outside `[a-z0-9-]{1,32}`, bad address or base58/hex, `reason` over 280 characters, a once-only setting set twice, `create_desk` with less prepaid gas than its floor (§1.2), an action method with less than 85 TGas (§1.3), an Orderly `client_order_id` from the caller, an Orderly timestamp outside [block − 300 s, block + 5 s], an `eip712_signature` that does not recover to the desk |
+| `E_ARGS` | malformed argument: desk_id outside `[a-z0-9-]{1,32}`, bad address or base58/hex, `reason` over 280 characters, a once-only setting set twice, `create_desk` with less prepaid gas than its floor (§1.2), an action method with less than 85 TGas (§1.3), an Orderly `client_order_id` from the caller, an Orderly timestamp outside [block − 300 s, block + 5 s], an `eip712_signature` that does not recover to the desk, `oracle_max_age_s` under 900 on a Mainnet contract |
 | `E_DEPOSIT` | attached deposit below the storage cost (`create_desk`, `set_policy`, `set_operator`, `set_orderly_receiver`, `set_orderly_ips`), or a pause carrying more than 1 yocto |
 | `E_ASSET` | asset, symbol or market not in the policy |
 | `E_SIZE` | notional at the reference price over `max_notional_usd`, an unpriced size over its `max_sz` or its notional over the unpriced cap (§1.2), or zero |
@@ -370,10 +376,10 @@ near-sdk before the method runs ("Failed to deserialize input from JSON"); clien
 | `E_PRICE_BAND` | price outside `price_band_bps` of the oracle price |
 | `E_ORACLE_STALE` | no oracle price younger than `oracle_max_age_s` |
 | `E_QUOTE_SIGNATURE` | 1Click quote signature does not verify |
-| `E_QUOTE_FIELDS` | quote recipient / refundTo / assets / deadline not acceptable, a dry quote, a cost over the policy's transfer bound, a deposit address one of the desk's last 32 rescues paid, or a destination asset equal to the origin asset |
-| `E_RESCUE_CAP` | over what is left of `rescue_cap_usd_per_hour` or of the hourly cost budget in the sliding hour (§1.3, "Rescue limits") |
+| `E_QUOTE_FIELDS` | quote recipient / refundTo / assets / deadline not acceptable, a quote `timestamp` more than 1 h before or 5 min after the block time, a dry quote, a cost over the policy's transfer bound, a deposit address one of the desk's last 32 rescues paid, or a destination asset equal to the origin asset |
+| `E_RESCUE_CAP` | over what is left of `rescue_cap_usd_per_hour` or of the hourly cost budget in the sliding hour, or a 33rd rescue within 65 min (it would push out a deposit address whose quote may still be payable) (§1.3, "Rescue limits") |
 | `E_SOL_MESSAGE` | not the accepted message format (legacy; v0 without lookups only for referral activation), trailing bytes, wrong signer count or fee payer, no instruction besides the compute budget |
-| `E_SOL_PROGRAM` | instruction for a program outside the allowlist, or instruction data not accepted (extra bytes, an Approve without its matching unwrap, a priority fee without a unit limit or over the cap; changed registration arguments are `E_ARGS`). The code for each case is pinned in `contract/core/tests/vectors/solana*.json` |
+| `E_SOL_PROGRAM` | instruction for a program outside the allowlist, or instruction data not accepted (extra bytes, an Approve without its matching unwrap, a Phoenix withdraw or Ember unwrap of 0, a priority fee without a unit limit or over the cap; changed registration arguments are `E_ARGS`). The code for each case is pinned in `contract/core/tests/vectors/solana*.json` |
 | `E_SOL_ACCOUNT` | wrong account count, or an account that is not the pinned one or the desk's own at its position |
 | `E_MPC` | the MPC network did not return a signature |
 
