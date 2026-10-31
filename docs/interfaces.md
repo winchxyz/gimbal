@@ -145,7 +145,15 @@ order with `reduce_only: true`), cancels, and rescue transfers (`fund_venue`, `h
 `sol_sign_rescue`, within `rescue_cap_usd_per_hour`). On Solana a paused desk's `sol_sign` accepts only, besides
 the compute budget: Phoenix `cancel_all`, reduce-only Phoenix orders, a token `Revoke` of a desk token account and a
 `Transfer` / `TransferChecked` into a desk token account; deposits, withdrawals, Ember, ATA creates and Approves
-need a running desk.
+need a running desk. A paused desk's message may carry a priority fee only when it cancels or reduces. On Orderly a
+paused desk still signs reads (every read kind of `orderly_request`), cancels, reduce-only orders and
+`orderly_ws_auth`; `orderly_register`, `orderly_add_key`, `orderly_settle_pnl`, `orderly_withdraw`, `settle_pnl`
+and `withdraw_request` need a running desk.
+
+**Gas.** Every action method (one that signs through the MPC) needs at least **85 TGas** prepaid, else `E_ARGS`:
+the MPC `sign` gets 50 TGas plus the unused gas, and `on_signed` 15. Measured on testnet 2026-10-31: a max-size
+(≈1,160-byte) `sol_sign` succeeds at exactly 85 TGas. The engine attaches 300. `set_paused` signs nothing; the
+engine sends it at 30 TGas.
 `set_policy` and `set_operator` work on a paused desk.
 
 Mutating methods use `#[deny_unknown_arguments]`, so a misspelt argument is refused instead of read as `None`.
@@ -182,14 +190,14 @@ chooses nothing:
 | `hl_cancel(desk_id, asset: u32, oid: u64, reason)` | ✓ | ✓ | L1 action `{type:"cancel", cancels:[{a, o}]}`; passes a paused desk, so a pause can stop resting orders |
 | `hl_usd_class_transfer(desk_id, amount, to_perp, reason)` | ✓ | ✓ | |
 | `hl_send_to_intents(desk_id, quote, quote_signature, reason)` | ✓ | ✓ | rescue out of Hyperliquid |
-| `sol_sign(desk_id, message_b64, reason)` | ✓ | ✓ | Phoenix / Ember / own transfers, legacy messages, one signer (the desk). Every Phoenix and Ember instruction has an exact account list with its fixed accounts pinned: an order or cancel has 10 accounts, the orderbook at [8] (a policy market) and its spline PDA `["spline", book]` at [9]; deposit 10, withdraw 12, Ember wrap / unwrap 8. A token Approve only on the desk PhUSD account to Ember, for exactly the amount an unwrap after it takes. A compute-unit price needs a unit limit; priority fee ≤ 600,000 lamports. A message of compute budget only is refused |
+| `sol_sign(desk_id, message_b64, reason)` | ✓ | ✓ | Phoenix / Ember / own transfers, legacy messages, one signer (the desk). Every Phoenix and Ember instruction has an exact account list with its fixed accounts pinned: an order or cancel has 10 accounts, the orderbook at [8] (a policy market) and its spline PDA `["spline", book]` at [9]; deposit 10, withdraw 12, Ember wrap / unwrap 8. A token Approve only on the desk PhUSD account to Ember, for exactly the amount an unwrap after it takes; a Revoke may follow that unwrap. No empty (zero-amount) or self transfers. A compute-unit price needs a unit limit; priority fee ≤ 600,000 lamports (on a paused desk only with a cancel or a reduce, §1.3). A message of compute budget only is refused |
 | `sol_sign_register(desk_id, message_b64)` | ✓ | ✓ | Phoenix onboarding only, two shapes: registration (`register_trader` + `set_trader_capabilities_delegated`) and referral activation (`set_trader_capabilities_delegated` alone); registration is a legacy message, referral activation a v0 message with no address-table lookups (the other format → `E_SOL_MESSAGE`); two signers, keys[0] = the desk as fee payer and Phoenix's pinned onboarder (the desk authority itself is not a signer of `register_trader`); accounts are checked through each instruction's positions, instruction data is pinned |
 | `sol_sign_rescue(desk_id, message_b64, quote, quote_signature, reason)` | ✓ | ✓ | rescue out of Solana |
 | `orderly_register(desk_id, registration_nonce)` | ✓ | ✓ | EIP-712 `Registration` (nonce from `GET /v1/registration_nonce`, block time as timestamp, broker and chain from `OrderlyConfig`) |
 | `orderly_add_key(desk_id, expiration_ms)` | ✓ | ✓ | EIP-712 `AddOrderlyKey`: the desk's Ed25519 MPC key as orderly key, scope `read,trading`, ≤ 365 days |
 | `set_orderly_receiver(desk_id, receiver)` | ✓ | | pins the Orderly account's exclusive receiver address on Arbitrum (below); once. Owner only: a wrong receiver would redirect every deposit into Orderly |
-| `orderly_request(desk_id, req: OrderlyRequest, reason)` | ✓ | ✓ | private REST call signed with the orderly key after policy checks: orders, cancels, and the money-path requests below |
-| `orderly_ws_auth(desk_id, timestamp)` | ✓ | ✓ | one signature per private WebSocket session (positions, balances) |
+| `orderly_request(desk_id, req: OrderlyRequest, reason)` | ✓ | ✓ | private REST call signed with the orderly key after policy checks: orders, cancels, reads, and the money-path requests below |
+| `orderly_ws_auth(desk_id, timestamp)` | ✓ | ✓ | one signature per private WebSocket session (positions, balances); kind `ws_auth`, payload `method` is `""` and the signed message is the timestamp alone. Orderly's streams send no snapshot on subscribe, so a session starts with the `positions` and `holding` reads |
 | `orderly_settle_pnl(desk_id, settle_nonce)` | ✓ | ✓ | EIP-712 `SettlePnl`; runs before every withdraw, or the withdrawable balance is short |
 | `orderly_withdraw(desk_id, amount, withdraw_nonce)` | ✓ | ✓ | EIP-712 `Withdraw` to the desk's own EVM address only (Arbitrum) |
 | `evm_usdc_to_intents(desk_id, quote, quote_signature, reason)` | ✓ | ✓ | EIP-712 USDC `TransferWithAuthorization` (EIP-3009) from the desk's EVM address to a verified 1Click deposit address on Arbitrum; the relayer submits it and pays the gas |
@@ -204,25 +212,37 @@ call signed through `orderly_request`: `settle_nonce` → `orderly_settle_pnl` �
 `evm_usdc_to_intents` → 1Click. The relayer's Arbitrum gas wallet holds a few dollars of ETH and can never
 move desk money (it only submits authorizations the contract signed).
 
-Views: `config()`, `get_desk(desk_id)`, `desks_of(owner)`, `prices()`, `version()`.
+Views: `config()`, `get_desk(desk_id)`, `desks_of(owner)`, `prices()`, `version()`. `get_desk` also returns
+`orderly_account_id` (keccak of the desk EVM address and the broker hash, fixed at `create_desk`). `prices()`
+returns the same shape as the `prices` event, `[{ asset, price_e8, at_ms }]` sorted by asset (C6).
 
 ```rust
 struct HlOrder { asset: u32, is_buy: bool, px: String, sz: String, reduce_only: bool, tif: String /* Ioc|Gtc|Alo */, cloid: Option<String> }
 struct OrderlyRequest {                      // the contract builds path and body; the engine never passes raw JSON
     kind: String,                            // "order" | "cancel" | "cancel_all"
                                              // | "receiver_address" (GET /v1/client/asset/receiver_address?chain_id=<OrderlyConfig.chain_id>&token=USDC)
-                                             // | "settle_nonce" (GET /v1/settle_nonce; path: verify on day 5) | "withdraw_nonce" (GET /v1/withdraw_nonce)
-                                             // | "settle_pnl" (POST /v1/settle_pnl; body: verify on day 5) | "withdraw_request" (POST /v1/withdraw_request)
+                                             // | "settle_nonce" (GET /v1/settle_nonce) | "withdraw_nonce" (GET /v1/withdraw_nonce)
+                                             // | "settle_pnl" (POST /v1/settle_pnl) | "withdraw_request" (POST /v1/withdraw_request;
+                                             //   amount in 1e-6 USDC units as a string, "2000000" = 2 USDC)
                                              // | "referral_bind" (POST /v1/referral/bind {referral_code}, code = referral_codes.orderly
-                                             //   only; once per desk, permanent; path and field: verify on day 5)
+                                             //   only; once per desk, permanent; unused while Gimbal runs its own broker)
                                              // | "funding_fee_history" (GET /v1/funding_fee/history?symbol&start_t&end_t&page&size;
-                                             //   read only; row fields: verify on day 5)
+                                             //   rows: symbol, funding_rate, mark_price, funding_fee, payment_type, status,
+                                             //   created_time, updated_time, margin_mode; seen live: a long paying funding_fee
+                                             //   0.001232, payment_type "Pay", status "Accrued"; a "Receive" row not seen yet.
+                                             //   The account's accruedFundingFee > 0 means it pays)
+                                             // | "positions" (GET /v1/positions) | "holding" (GET /v1/client/holding)
+                                             // Every read kind passes a paused desk.
     symbol: Option<String>,
-    start_t: Option<u64>, end_t: Option<u64>, page: Option<u32>, size: Option<u32>,   // funding_fee_history only (ms) side: Option<String> /* BUY|SELL */, order_type: Option<String> /* IOC|LIMIT|MARKET */,
-    price: Option<String>, quantity: Option<String>, reduce_only: bool, client_order_id: Option<String>,
-    order_id: Option<u64>, timestamp_ms: u64,
+    start_t: Option<u64>, end_t: Option<u64>, page: Option<u32>, size: Option<u32>,   // funding_fee_history only (ms)
+    side: Option<String> /* BUY|SELL */, order_type: Option<String> /* IOC|LIMIT; MARKET → E_PRICE_BAND */,
+    price: Option<String>, quantity: Option<String>, reduce_only: bool,
+    client_order_id: Option<String>,         // must be None (E_ARGS): the contract sets "g<request_id>"
+    order_id: Option<u64>,
+    timestamp_ms: u64,                       // at most 300 s before the block time and 5 s after it (E_ARGS)
     // settle_pnl / withdraw_request only: the fields of the EIP-712 message signed earlier and its signature.
-    // The contract rebuilds the message itself (receiver = desk EVM, token USDC, broker and chain from config).
+    // The contract rebuilds the message itself (receiver = desk EVM, token USDC, broker and chain from config)
+    // and recovers eip712_signature from it: v 27/28, and a signer other than the desk is E_ARGS.
     amount: Option<String>, nonce: Option<u64>, signed_at_ms: Option<u64>, eip712_signature: Option<String>,
 }
 ```
@@ -251,13 +271,21 @@ Every action method returns a `SignedAction` (from the `on_signed` callback) tha
 }
 ```
 
+`request_id` is a counter in contract state, one per signing call. Every secp256k1 signature comes back low-s
+(`on_signed` turns s > n/2 into n − s and flips the recovery id), which Circle's USDC requires.
+
 - Hyperliquid: POST `/exchange` with `payload` + `signature: { r: "0x" + affine_point[2..], s: "0x" + scalar, v: 27 + recovery_id }`.
 - Solana: `payload = { "message_b64": "…" }`, `signature = { "scheme": "Ed25519", "signature": [64 bytes] }`;
   the transaction is `[1][signature][message]`. `sol_sign_register` is the exception: two signers, and
   Phoenix's API adds its onboarder signature and sends it.
 - Orderly: `payload = { "method", "path", "body", "timestamp", "message": "<timestamp + METHOD + path + body, exactly as signed>" }`,
   Ed25519 as above; the relayer sends headers `orderly-timestamp`, `orderly-account-id`, `orderly-key`
-  (`ed25519:<base58 public key>`) and `orderly-signature` (base64url of the 64 bytes). EIP-712 actions
+  (`ed25519:<base58 public key>`) and `orderly-signature` (base64url of the 64 bytes). The signed message and
+  signature are public (in the call's result and the MPC's respond transaction), so anyone can resend them inside
+  Orderly's window: Orderly refuses a copy of an order that is still open (-1007, the same `client_order_id`), but
+  accepts a copy of a filled IOC or a cancelled LIMIT. That is an accepted residual risk on testnet. The engine
+  reconciles positions after every order and closes any excess reduce-only. For mainnet, C6 adds the Orderly key
+  IP restriction. EIP-712 actions
   (`Registration`, `AddOrderlyKey`, `SettlePnl`, `Withdraw`) come back as secp256k1 signatures like Hyperliquid's,
   with `payload = { "message": { <the typed fields, including timestamp> }, "userAddress": "<desk EVM address>" }`;
   the relayer posts `{ message, signature, userAddress }` (e.g. `POST /v1/register_account`, `/v1/orderly_key`), and
@@ -277,7 +305,7 @@ near-sdk before the method runs ("Failed to deserialize input from JSON"); clien
 | `E_NOT_ALLOWED` | caller is neither owner nor operator, operator called an owner method, an owner method came without exactly 1 yocto attached, or a storage method (`create_desk`, `set_policy`, `set_operator`) came with no deposit (§1.3) |
 | `E_PAUSED` | desk paused |
 | `E_NO_DESK` / `E_DESK_EXISTS` | |
-| `E_ARGS` | malformed argument: desk_id outside `[a-z0-9-]{1,32}`, bad address or base58/hex, `reason` over 280 characters, a once-only setting set twice, `create_desk` with less prepaid gas than its floor (§1.2) |
+| `E_ARGS` | malformed argument: desk_id outside `[a-z0-9-]{1,32}`, bad address or base58/hex, `reason` over 280 characters, a once-only setting set twice, `create_desk` with less prepaid gas than its floor (§1.2), an action method with less than 85 TGas (§1.3), an Orderly `client_order_id` from the caller, an Orderly timestamp outside [block − 300 s, block + 5 s], an `eip712_signature` that does not recover to the desk |
 | `E_DEPOSIT` | attached deposit below the storage cost (`create_desk`, `set_policy`, `set_operator`), or a pause carrying more than 1 yocto |
 | `E_ASSET` | asset, symbol or market not in the policy |
 | `E_SIZE` | notional at the reference price over `max_notional_usd`, an unpriced size over its `max_sz` or its notional over the unpriced cap (§1.2), or zero |
@@ -345,7 +373,8 @@ export interface Window {
   held: { since: number } | null;   // the desk holds this window now
   checks: { ok: boolean; text: string }[];   // what the engine checked (policy, oracle, rescue path), one line
                                              // each, engine-written; the first failing one is why it is not entered
-  switchCostUsd: number | null;     // cost to rotate from the held window into this one at strategy.legUsd;
+  switchCostUsd: number | null;     // cost to rotate from the held window into this one at strategy.legUsd:
+                                    // the fills only; the margin moves are already in this window's feesPct;
                                     // null when nothing is held or this is the held one
   stale: boolean;                   // a venue it needs did not answer: the numbers are from the last good read
 }
@@ -544,6 +573,9 @@ export interface MarketFunding extends FundingRate {   // the prices the rate ap
                                          // aliases applied ("kPEPE" → "PEPE", "PERP_SOL_USDC" → "SOL", "XBT" → "BTC")
   multiplier?: number;                   // base units per unit of `symbol` ("kPEPE" 1000); absent = 1
   shortRatePerHour?: number;             // what a short receives where it differs from ratePerHour (GMX v2)
+  fundingCapPerHour?: number;            // the venue's own per-market rate limits, per hour, from the same answer
+  fundingFloorPerHour?: number;          // where it gives them; absent = unknown (the scanner then falls back to its
+                                         // sourced caps and the same-rate rule for "At the cap")
 }
 
 export interface WatchReader {           // a watch-only venue: public funding and marks, no account, no orders;
@@ -559,6 +591,23 @@ export interface ContractClient {                      // NearContractClient | R
   // … one method per contract action method
 }
 ```
+
+**Outcome unknown.** Signing and sending never guess. When the engine cannot prove an action did not run, it
+throws `OutcomeUnknown` (`engine/src/contract/types.ts`) with every id it knows: the NEAR tx hash, the HL cloid
+and nonce, the Solana signature or message sha256, the Arbitrum tx hash, the EIP-3009 nonce, the Orderly
+`client_order_id` or withdraw nonce. The caller reconciles from venue state before anything else, and never
+retries or rebuilds. In particular:
+- Money moves are never retried after an MPC timeout. A retry would take a fresh contract nonce, while the
+  first signature can still be published late.
+- A NEAR refusal counts as "nothing ran" only after its hash is looked up and found absent. Congested or stuck
+  shards are followed, with the same signed bytes rebroadcast.
+- Solana is `NothingExecuted` only on an on-chain failure, or past `lastValidBlockHeight` (with the slot read from
+  the same node) with an empty signature lookup at or after that slot.
+- HL: `/exchange` with no clear answer is unknown, and a 4xx is a refusal. `/info` errors after an accepted order
+  only leave it unconfirmed.
+- Orderly orders and `withdraw_request`: a timeout, a 5xx or an unclear body is unknown, and `success:false` under
+  500 is a refusal.
+- `set_paused` goes out at 30 TGas, outside the signature budget, and is never refused for budget.
 
 **Record / replay.** `engine/fixtures/replay/<name>.jsonl.gz`, one line per call:
 `{"t": <ms>, "venue": "hyperliquid", "method": "funding", "args": [], "ms": <how long the venue took>, "result": …}`,
