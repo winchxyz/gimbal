@@ -291,7 +291,7 @@ export class Scanner {
     if (heldPriced !== undefined) {
       for (const pw of priced) {
         if (pw === heldPriced || !pw.pair.desk) continue;
-        pw.window.switchCostUsd = switchCostUsd(heldPriced, pw, strategy.legUsd, strategy.maxLeverage, config.costs);
+        pw.window.switchCostUsd = switchCostUsd(heldPriced, pw);
       }
     }
 

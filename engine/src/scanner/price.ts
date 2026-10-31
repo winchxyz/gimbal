@@ -6,7 +6,7 @@ import type { Book } from '../venues/venue.ts';
 import type { CostParams } from './config.ts';
 import {
   HOURS_PER_YEAR, aprPct, basisCostUsd, breakevenHours, fillFeeBps, fundingTimingUsd, hoursUntil, legSlippage,
-  marginRoundTripUsd, moveCostUsd, oneOffAprPct, paymentPeriodHours, rescueAmountUsd, rescueCostUsd, takerFeesUsd,
+  marginRoundTripUsd, oneOffAprPct, paymentPeriodHours, rescueAmountUsd, rescueCostUsd, takerFeesUsd,
 } from './costs.ts';
 import type { LegSlippage } from './costs.ts';
 import { round } from './history.ts';
@@ -348,13 +348,15 @@ function watchVerdict(pair: Pair): Verdict {
 
 /**
  * What it costs to rotate from the held window into another at the same leg size, USD: close the held legs that
- * change and open the new ones (taker fee and slippage of each of those fills), plus moving each leg's margin
- * (legUsd / maxLeverage) from a venue the desk leaves to one it enters, by the cheaper pairing. A leg that stays
- * (same venue, market and side) costs nothing.
+ * change and open the new ones (taker fee and slippage of each of those fills). A leg that stays (same venue, market
+ * and side) costs nothing.
+ *
+ * Margin moves are not in it. Each window's feesPct already counts moving its margin onto its venues and back
+ * (none where marginHeldAt says the desk's margin already sits), so a rotation judged on the next window's net APR
+ * plus this cost would pay for the same move twice. Moving margin from the venue the desk leaves rather than from
+ * the reserve costs about the same, and the held window's own trip back is saved.
  */
-export function switchCostUsd(
-  held: PricedWindow, next: PricedWindow, legUsd: number, maxLeverage: number, costs: CostParams,
-): number | null {
+export function switchCostUsd(held: PricedWindow, next: PricedWindow): number | null {
   if (held.fills === null || next.fills === null) return null;
   let total = 0;
   for (const side of ['long', 'short'] as const) {
@@ -362,16 +364,6 @@ export function switchCostUsd(
     const b = next.pair[side];
     if (a.venue === b.venue && a.symbol === b.symbol) continue;
     total += held.fills[side].closeUsd + next.fills[side].openUsd;
-  }
-  const before = [held.pair.long.venue, held.pair.short.venue] as VenueId[];
-  const after = [next.pair.long.venue, next.pair.short.venue] as VenueId[];
-  const freed = before.filter((v) => !after.includes(v));
-  const needed = after.filter((v) => !before.includes(v));
-  const margin = legUsd / maxLeverage;
-  const move = (from: VenueId, to: VenueId) => moveCostUsd(from, to, margin, costs.transfers);
-  if (needed.length === 1) total += move(freed[0]!, needed[0]!);
-  else if (needed.length === 2) {
-    total += Math.min(move(freed[0]!, needed[0]!) + move(freed[1]!, needed[1]!), move(freed[0]!, needed[1]!) + move(freed[1]!, needed[0]!));
   }
   return round(total, 4);
 }

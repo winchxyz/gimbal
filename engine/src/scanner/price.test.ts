@@ -319,23 +319,29 @@ test('verdicts with a policy: a market outside it is E_ASSET, before any oracle 
   assert.deepEqual(deskVerdict(pairOf(LONG, SHORT), verdictCtx({ policy: null })).refused, { code: 'E_NO_DESK', reason: 'no desk policy loaded yet' });
 });
 
-test('switch cost: close the legs that change, open the new ones, move margin by the cheaper route', () => {
-  const held = priced(LONG, SHORT);
+test('switch cost: close the legs that change and open the new ones; the margin move is the next window\'s, counted once', () => {
+  // The desk holds long Phoenix / short Hyperliquid, so its margin sits on those two venues.
+  const heldAt = ctx({ marginHeldAt: new Set<VenueId>(['phoenix', 'hyperliquid']) });
+  const held = priced(LONG, SHORT, heldAt);
   // Short moves Hyperliquid -> Orderly (4 bps under gimbal_dex). Fills: close the HL short 0.55 + 0.09999, open the
-  // Orderly short 0.40 + 0.10001 = 1.150000002 USD. Margin 1000 / 3 = 333.33 USD from Hyperliquid to Orderly: 1.00
-  // activation + 0.21 flat + 0.6667 (20 bps) = 1.8767 USD. Total 3.0267 USD.
-  const toOrderly = priced(LONG, leg('orderly', 'PERP_SOL_USDC', { base: 'SOL', ratePerHour: 0.00006 }));
-  assert.equal(switchCostUsd(held, toOrderly, 1000, 3, DEFAULT_COSTS), 3.0267);
-  // Long moves Phoenix -> Orderly: close 0.35 + 0.10001, open 0.40 + 0.09999 = 0.950000002 USD; margin from the
-  // Solana wallet: 0.32 + 0.6667 = 0.9867 USD. Total 1.9367 USD.
-  const longOrderly = priced(leg('orderly', 'PERP_SOL_USDC', { base: 'SOL', ratePerHour: 0 }), SHORT);
-  assert.equal(switchCostUsd(held, longOrderly, 1000, 3, DEFAULT_COSTS), 1.9367);
-  // The same two venues the other way round: all four fills, no margin moves: 0.4500 + 0.6500 + 0.6500 + 0.4500 = 2.2.
-  const swapped = priced(leg('hyperliquid', 'SOL'), leg('phoenix', 'SOL', { ratePerHour: 0.0001 }));
-  assert.equal(switchCostUsd(held, swapped, 1000, 3, DEFAULT_COSTS), 2.2);
-  assert.equal(switchCostUsd(held, held, 1000, 3, DEFAULT_COSTS), 0);
+  // Orderly short 0.40 + 0.10001 = 1.150000002 USD.
+  const toOrderly = priced(LONG, leg('orderly', 'PERP_SOL_USDC', { base: 'SOL', ratePerHour: 0.00006 }), heldAt);
+  assert.equal(switchCostUsd(held, toOrderly), 1.15);
+  // Moving the 333.33 USD of margin onto Orderly and back is already in that window's feesPct, at 0.32 + 0.6667 in
+  // and 1.00 + 0.32 + 0.6667 out = 2.9733 USD (the review found the switch cost adding the move a second time).
+  near(toOrderly.breakdown.transferUsd, 0.32 + 1.0 + 0.32 + 2 * (1000 / 3) * 0.002, 1e-9);
+  assert.ok(toOrderly.window.checks.some((c) => c.text === 'Moving $333 of margin a leg onto orderly and back costs $2.97'), JSON.stringify(toOrderly.window.checks));
+  // Long moves Phoenix -> Orderly: close 0.35 + 0.10001, open 0.40 + 0.09999 = 0.950000002 USD.
+  const longOrderly = priced(leg('orderly', 'PERP_SOL_USDC', { base: 'SOL', ratePerHour: 0 }), SHORT, heldAt);
+  assert.equal(switchCostUsd(held, longOrderly), 0.95);
+  // The same two venues the other way round: all four fills, and no margin moves in either window:
+  // 0.4500 + 0.6500 + 0.6500 + 0.4500 = 2.2.
+  const swapped = priced(leg('hyperliquid', 'SOL'), leg('phoenix', 'SOL', { ratePerHour: 0.0001 }), heldAt);
+  assert.equal(switchCostUsd(held, swapped), 2.2);
+  assert.equal(swapped.breakdown.transferUsd, 0);
+  assert.equal(switchCostUsd(held, held), 0);
   // A watch-only window has no fills: no switch cost.
-  assert.equal(switchCostUsd(held, priced(leg('pacifica', 'SOL'), SHORT), 1000, 3, DEFAULT_COSTS), null);
+  assert.equal(switchCostUsd(held, priced(leg('pacifica', 'SOL'), SHORT)), null);
 });
 
 test('a leg kept only for the held window fails a check that says why', () => {
