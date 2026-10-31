@@ -3,7 +3,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ContractPolicy } from '@gimbal/shared';
-import { DEFAULT_STRATEGY, STRATEGY_LIMITS, parseContractPolicy, parseStrategyConfig } from './config.ts';
+import {
+  DEFAULT_COSTS, DEFAULT_SCANNER_CONFIG, DEFAULT_STRATEGY, MAINNET_COSTS, ORDERLY_BROKERS, STRATEGY_LIMITS, TESTNET_COSTS,
+  costsFor, parseContractPolicy, parseStrategyConfig, scannerConfigFor,
+} from './config.ts';
+import { fillFeeBps } from './costs.ts';
 
 const POLICY: ContractPolicy = {
   hl_assets: [{ index: 5, symbol: 'SOL', sz_decimals: 2 }],
@@ -63,6 +67,23 @@ test('strategy: what a hostile page sent is refused, field by field', () => {
   assert.equal(STRATEGY_LIMITS.minLegUsd, 10);
   assert.equal(parseStrategyConfig({ ...DEFAULT_STRATEGY, legUsd: 10 }, POLICY).legUsd, 10);
   assert.equal(parseStrategyConfig({ ...DEFAULT_STRATEGY, stopDrawdownPct: null }, POLICY).stopDrawdownPct, null);
+});
+
+test('Orderly fees: gimbal_dex on mainnet (maker 0, taker 4 = 3 base + 1 markup); the testnet broker keeps 1.5 bps', () => {
+  assert.deepEqual(ORDERLY_BROKERS.mainnet, { brokerId: 'gimbal_dex', makerBps: 0, takerBps: 4, markupBps: 1 });
+  assert.deepEqual(MAINNET_COSTS.fees.orderly, { takerBps: 3, extraBps: 1 });
+  assert.equal(fillFeeBps(MAINNET_COSTS.fees.orderly), ORDERLY_BROKERS.mainnet.takerBps);
+  assert.equal(ORDERLY_BROKERS.testnet.brokerId, 'woofi_dex');
+  assert.deepEqual(TESTNET_COSTS.fees.orderly, { takerBps: 3, extraBps: 1.5 });
+  assert.equal(fillFeeBps(TESTNET_COSTS.fees.orderly), ORDERLY_BROKERS.testnet.takerBps);
+  // Only Orderly differs between the networks; replay plays recorded mainnet answers, so it prices mainnet's fees.
+  assert.deepEqual({ ...TESTNET_COSTS, fees: { ...TESTNET_COSTS.fees, orderly: MAINNET_COSTS.fees.orderly } }, MAINNET_COSTS);
+  assert.equal(DEFAULT_COSTS, MAINNET_COSTS);
+  assert.equal(DEFAULT_SCANNER_CONFIG.costs, MAINNET_COSTS);
+  assert.equal(costsFor('mainnet'), MAINNET_COSTS);
+  assert.equal(costsFor('replay'), MAINNET_COSTS);
+  assert.equal(costsFor('testnet'), TESTNET_COSTS);
+  assert.deepEqual(scannerConfigFor('testnet'), { ...DEFAULT_SCANNER_CONFIG, costs: TESTNET_COSTS });
 });
 
 test('policy file: a good one is copied; a policy without unpriced has none', () => {

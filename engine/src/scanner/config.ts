@@ -1,7 +1,7 @@
 // The scanner's settings and their defaults. Every number here is either measured (with the date it was measured)
 // or a stated assumption the owner can change; the strategy defaults are the engine rules a new desk starts with.
 
-import type { ContractPolicy, StrategyConfig, VenueId } from '@gimbal/shared';
+import type { ContractPolicy, Mode, StrategyConfig, VenueId } from '@gimbal/shared';
 import type { FillFee, Place, TransferCosts } from './costs.ts';
 
 export interface CostParams {
@@ -44,7 +44,23 @@ export interface ScannerConfig {
   historyRetryMs: number;
 }
 
-export const DEFAULT_COSTS: CostParams = {
+/** Orderly's own taker fee, before the broker's markup. */
+const ORDERLY_BASE_TAKER_BPS = 3;
+
+/**
+ * The Orderly broker the desk trades under on each network, with its all-in trader fees (Orderly's base fee plus
+ * the broker's markup). The scanner prices taker fills only; the maker fee is kept for the record.
+ */
+export const ORDERLY_BROKERS = {
+  // Gimbal's own broker (gimbal_dex broker settings, 2026-10-31): maker 0 bps, taker 4 bps = Orderly's base 3 bps
+  // plus Gimbal's 1 bp markup, the same for crypto and RWA perps.
+  mainnet: { brokerId: 'gimbal_dex', makerBps: 0, takerBps: 4, markupBps: 1 },
+  // The testnet broker. Its markup is not measured: the 1.5 bps assumed before gimbal_dex existed stands.
+  testnet: { brokerId: 'woofi_dex', makerBps: null, takerBps: ORDERLY_BASE_TAKER_BPS + 1.5, markupBps: 1.5 },
+} as const;
+
+/** Costs on mainnet, and in replay, which plays recorded mainnet answers. */
+export const MAINNET_COSTS: CostParams = {
   holdHours: 168,
   fees: {
     // Hyperliquid tier-0 taker 4.5 bps, plus the treasury builder fee on every order (FeeConfig.hl_builder_tenth_bps
@@ -52,8 +68,8 @@ export const DEFAULT_COSTS: CostParams = {
     hyperliquid: { takerBps: 4.5, extraBps: 1 },
     // Phoenix: 3.5 bps taker on every market (its market config, 2026-10-31).
     phoenix: { takerBps: 3.5, extraBps: 0 },
-    // Orderly: 3 bps base taker plus the broker's markup; 1.5 bps is an assumption until the desk's broker is fixed.
-    orderly: { takerBps: 3, extraBps: 1.5 },
+    // Orderly under gimbal_dex: 3 bps base taker plus the 1 bp markup (ORDERLY_BROKERS.mainnet).
+    orderly: { takerBps: ORDERLY_BASE_TAKER_BPS, extraBps: ORDERLY_BROKERS.mainnet.markupBps },
   },
   transfers: {
     // Measured on mainnet 2026-10-27: Phoenix -> Hyperliquid 0.32 USD on 4 USD; Hyperliquid -> 1Click 0.21 USD. From
@@ -67,6 +83,24 @@ export const DEFAULT_COSTS: CostParams = {
   rescuesPerHold: 1,
   reserveAt: 'reserve',
 };
+
+/** Costs on testnet: the same, but Orderly under the testnet broker woofi_dex (ORDERLY_BROKERS.testnet). */
+export const TESTNET_COSTS: CostParams = {
+  ...MAINNET_COSTS,
+  fees: { ...MAINNET_COSTS.fees, orderly: { takerBps: ORDERLY_BASE_TAKER_BPS, extraBps: ORDERLY_BROKERS.testnet.markupBps } },
+};
+
+/** The default is mainnet's: the scanner's live data is mainnet, and replay plays recorded mainnet answers. */
+export const DEFAULT_COSTS: CostParams = MAINNET_COSTS;
+
+export function costsFor(mode: Mode): CostParams {
+  return mode === 'testnet' ? TESTNET_COSTS : MAINNET_COSTS;
+}
+
+/** DEFAULT_SCANNER_CONFIG with the costs of `mode`'s network. */
+export function scannerConfigFor(mode: Mode): ScannerConfig {
+  return { ...DEFAULT_SCANNER_CONFIG, costs: costsFor(mode) };
+}
 
 export const DEFAULT_SCANNER_CONFIG: ScannerConfig = {
   costs: DEFAULT_COSTS,

@@ -307,15 +307,15 @@ test('verdicts with a policy: a market outside it is E_ASSET, before any oracle 
 
 test('switch cost: close the legs that change, open the new ones, move margin by the cheaper route', () => {
   const held = priced(LONG, SHORT);
-  // Short moves Hyperliquid -> Orderly (4.5 bps). Fills: close the HL short 0.55 + 0.09999, open the Orderly short
-  // 0.45 + 0.10001 = 1.200000002 USD. Margin 1000 / 3 = 333.33 USD from Hyperliquid to Orderly: 1.00 activation +
-  // 0.21 flat + 0.6667 (20 bps) = 1.8767 USD. Total 3.0767 USD.
+  // Short moves Hyperliquid -> Orderly (4 bps under gimbal_dex). Fills: close the HL short 0.55 + 0.09999, open the
+  // Orderly short 0.40 + 0.10001 = 1.150000002 USD. Margin 1000 / 3 = 333.33 USD from Hyperliquid to Orderly: 1.00
+  // activation + 0.21 flat + 0.6667 (20 bps) = 1.8767 USD. Total 3.0267 USD.
   const toOrderly = priced(LONG, leg('orderly', 'PERP_SOL_USDC', { base: 'SOL', ratePerHour: 0.00006 }));
-  assert.equal(switchCostUsd(held, toOrderly, 1000, 3, DEFAULT_COSTS), 3.0767);
-  // Long moves Phoenix -> Orderly: close 0.35 + 0.10001, open 0.45 + 0.09999 = 1.000000002 USD; margin from the
-  // Solana wallet: 0.32 + 0.6667 = 0.9867 USD. Total 1.9867 USD.
+  assert.equal(switchCostUsd(held, toOrderly, 1000, 3, DEFAULT_COSTS), 3.0267);
+  // Long moves Phoenix -> Orderly: close 0.35 + 0.10001, open 0.40 + 0.09999 = 0.950000002 USD; margin from the
+  // Solana wallet: 0.32 + 0.6667 = 0.9867 USD. Total 1.9367 USD.
   const longOrderly = priced(leg('orderly', 'PERP_SOL_USDC', { base: 'SOL', ratePerHour: 0 }), SHORT);
-  assert.equal(switchCostUsd(held, longOrderly, 1000, 3, DEFAULT_COSTS), 1.9867);
+  assert.equal(switchCostUsd(held, longOrderly, 1000, 3, DEFAULT_COSTS), 1.9367);
   // The same two venues the other way round: all four fills, no margin moves: 0.4500 + 0.6500 + 0.6500 + 0.4500 = 2.2.
   const swapped = priced(leg('hyperliquid', 'SOL'), leg('phoenix', 'SOL', { ratePerHour: 0.0001 }));
   assert.equal(switchCostUsd(held, swapped, 1000, 3, DEFAULT_COSTS), 2.2);
