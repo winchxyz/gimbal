@@ -135,3 +135,31 @@ test('expiresAfter enters the L1 hash as the SDK writes it, and the payload dige
     }
   }
 });
+
+// An independent expiresAfter vector: engine/fixtures/hl-sdk/expires-after.json was written by
+// hyperliquid-python-sdk 0.24.0 itself, sign_l1_action(wallet, action, None, nonce, expires_after, is_mainnet) with
+// the vectors' public desk test key, and its action_hash for the connection id. The cases above check the byte layout
+// against digests worked out by hand; these check the SDK's own hash and signature (one case expires 1 ms after its
+// nonce).
+const SDK_EXPIRING = JSON.parse(readFileSync(fileURLToPath(new URL('../../fixtures/hl-sdk/expires-after.json', import.meta.url)), 'utf8'));
+
+test('expiresAfter: hash, digests and signatures match what hyperliquid-python-sdk 0.24.0 signs', async () => {
+  assert.match(SDK_EXPIRING.generator, /^hyperliquid-python-sdk 0\.24\.0: hyperliquid\.utils\.signing\.sign_l1_action\(/);
+  assert.equal(SDK_EXPIRING.signer, DESK);
+  assert.ok(SDK_EXPIRING.cases.length >= 3);
+  for (const c of SDK_EXPIRING.cases) {
+    assert.ok(c.expires_after > c.nonce, c.name);
+    assert.equal(l1ConnectionId(c.action, c.nonce, c.expires_after), c.connection_id, c.name);
+    assert.notEqual(l1ConnectionId(c.action, c.nonce), c.connection_id, `${c.name}: expiresAfter changes the hash`);
+    for (const network of ['mainnet', 'testnet'] as const) {
+      const n = c[network];
+      assert.equal(l1Digest(c.action, c.nonce, network, c.expires_after), n.digest, `${c.name} ${network}`);
+      const payload: HlPayload = { action: c.action, nonce: c.nonce, vaultAddress: null, expiresAfter: c.expires_after };
+      assert.equal(payloadDigest(payload, network), n.digest, `${c.name} ${network}`);
+      const sig = hlSignature(asMpc(n.signature));
+      assert.deepEqual(sig, n.signature, `${c.name} ${network}`);
+      assert.equal(await recoverSigner(n.digest, sig), DESK, `${c.name} ${network}`);
+      assert.deepEqual(exchangeBody(payload, sig), { action: c.action, nonce: c.nonce, vaultAddress: null, expiresAfter: c.expires_after, signature: n.signature });
+    }
+  }
+});

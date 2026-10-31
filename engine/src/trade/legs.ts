@@ -32,6 +32,11 @@ export type LegSide = 'BUY' | 'SELL';
 export const ORDERLY_REPLAY_MS = 310_000;
 /** After an action's expiresAfter: Hyperliquid's clock and NEAR's block time against the local one. */
 export const HL_EXPIRY_MARGIN_MS = 10_000;
+/**
+ * Hyperliquid takes an action only while its nonce is inside (block time − 2 days, block time + 1 day), and the
+ * contract's nonce is the block time it signed at: an order with no answer and no expiry can land that long after.
+ */
+export const HL_NONCE_WINDOW_MS = 2 * 86_400_000;
 
 /** What one order did, as far as the venue's answer proves it. */
 export type LegOutcome =

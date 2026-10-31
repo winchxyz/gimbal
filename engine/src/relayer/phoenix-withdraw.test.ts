@@ -1,15 +1,20 @@
 // The withdrawal and rescue messages against the shapes the contract accepts: byte for byte the vector withdrawal
 // with its Revoke (solana-review.json, review 6) and the vector rescue with the Revoke appended (solana.json; the
-// contract's kinds_and_the_pause_gate test accepts it so).
+// contract's kinds_and_the_pause_gate test accepts it so); a paused desk's rescue against the lean one the contract's
+// a_paused_desk_signs_a_rescue_that_only_frees_and_pays_amount_in test accepts, and its rule for each thing it refuses.
 
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import type { DeskSolanaAccounts, PhoenixExchangeAccounts } from './phoenix-withdraw.ts';
-import { rescueInstructions, rescueMessage, withdrawInstructions, withdrawMessage } from './phoenix-withdraw.ts';
-import { TOKEN_PROGRAM, tokenTransferChecked } from './solana-message.ts';
-import { parseMessage } from './solana.ts';
+import type { DeskSolanaAccounts, PhoenixExchangeAccounts, RescueDeposit } from './phoenix-withdraw.ts';
+import {
+  ATA_PROGRAM, pausedRescueInstructions, pausedRescueMessage, pausedRescueRefusals, rescueInstructions, rescueMessage, withdrawInstructions,
+  withdrawMessage,
+} from './phoenix-withdraw.ts';
+import type { SolInstruction } from './solana-message.ts';
+import { TOKEN_PROGRAM, asSolInstructions, compileLegacyMessage, tokenTransferChecked } from './solana-message.ts';
+import { COMPUTE_BUDGET_PROGRAM, computeBudgetInstructions, parseMessage } from './solana.ts';
 
 interface VectorIx { program: string; accounts: string[]; data_hex: string }
 interface VectorCase {
@@ -104,6 +109,111 @@ test('the rescue is the vector rescue with the Revoke appended, after the unwrap
   const programs = rescueInstructions(EXCHANGE, DESK, AMOUNT, deposit).map((ix) => ix.programAddress.slice(0, 8));
   assert.deepEqual(programs, ['ComputeB', 'ComputeB', 'ATokenGP', 'Tokenkeg', 'ATokenGP', 'EtrnLzgb', 'EMBERpYN', 'ATokenGP', 'Tokenkeg', 'Tokenkeg']);
 });
+
+// ---- A paused desk's rescue ----
+
+const R = RESCUE.rescue!;
+const DEPOSIT: RescueDeposit = { owner: R.deposit_owner, usdcAta: RESCUE.parsed!.instructions.at(-1)!.accounts[2]!, amountIn: BigInt(R.amount_in) };
+const RESCUE_HASH = RESCUE.parsed!.recent_blockhash;
+const parsedShape = (m: Uint8Array) => parseMessage(m).instructions.map((ix) => ({ program: ix.program, accounts: ix.accounts, data: Buffer.from(ix.data).toString('hex') }));
+const refusals = (ixs: readonly SolInstruction[]) => pausedRescueRefusals(compileLegacyMessage(DESK.authority, ixs, RESCUE_HASH), EXCHANGE, DESK, DEPOSIT);
+/** A vector instruction as a SolInstruction: the desk authority signs, every other account is writable (the rule reads no roles). */
+const fromVector = (ix: VectorIx): SolInstruction => ({
+  programAddress: ix.program,
+  accounts: ix.accounts.map((address) => ({ address, role: address === DESK.authority ? 3 : 1 })),
+  data: Buffer.from(ix.data_hex, 'hex'),
+});
+const vectorIx = (casePrefix: string, program: string, dataPrefix: string) => {
+  const ix = byName(SOL, casePrefix).parsed!.instructions.find((x) => x.program === program && x.data_hex.startsWith(dataPrefix));
+  assert.ok(ix !== undefined, `${casePrefix}: ${dataPrefix}`);
+  return fromVector(ix);
+};
+const PHOENIX = EXCHANGE.phoenixProgram;
+const LEAN = pausedRescueInstructions(EXCHANGE, DESK, AMOUNT, DEPOSIT);
+const at = (ixs: readonly SolInstruction[], program: string, dataPrefix: string) => {
+  const i = ixs.findIndex((ix) => ix.programAddress === program && Buffer.from(ix.data ?? []).toString('hex').startsWith(dataPrefix));
+  assert.ok(i >= 0, dataPrefix);
+  return i;
+};
+const withData = (ix: SolInstruction, edit: (data: Buffer) => Buffer): SolInstruction => ({ ...ix, data: edit(Buffer.from(ix.data ?? [])) });
+const u64At = (offset: number, value: bigint) => (data: Buffer) => {
+  const d = Buffer.from(data);
+  d.writeBigUInt64LE(value, offset);
+  return d;
+};
+
+test('a paused rescue is the contract\'s lean rescue: the full one without the priority fee and the desk-account creates', () => {
+  assert.equal(DEPOSIT.amountIn, AMOUNT);
+  const built = pausedRescueMessage(EXCHANGE, DESK, AMOUNT, DEPOSIT, RESCUE_HASH);
+  // The contract's a_paused_desk_signs_a_rescue_that_only_frees_and_pays_amount_in builds its accepted message so:
+  // the vector rescue with the Revoke appended, less SetComputeUnitPrice and the creates whose owner is the desk.
+  const lean = [...RESCUE.parsed!.instructions, { program: TOKEN_PROGRAM, accounts: [DESK.phusdAta, DESK.authority], data_hex: '05' }]
+    .filter((ix) => !(ix.program === COMPUTE_BUDGET_PROGRAM && ix.data_hex.startsWith('03')))
+    .filter((ix) => !(ix.program === ATA_PROGRAM && ix.accounts[2] === DESK.authority))
+    .map((ix) => ({ program: ix.program, accounts: ix.accounts, data: ix.data_hex }));
+  assert.equal(lean.length, RESCUE.parsed!.instructions.length + 1 - 3);
+  assert.deepEqual(parsedShape(built), lean);
+  const m = parseMessage(built);
+  assert.deepEqual([m.computeUnitLimit, m.computeUnitPrice, m.keys[0], m.signers], [400_000, null, DESK.authority, 1]);
+  assert.deepEqual(pausedRescueRefusals(built, EXCHANGE, DESK, DEPOSIT), []);
+  // Less than amountIn may be withdrawn (the desk USDC account holds the rest); more never.
+  assert.deepEqual(refusals(pausedRescueInstructions(EXCHANGE, DESK, AMOUNT - 1n, DEPOSIT)), []);
+  assert.throws(() => pausedRescueInstructions(EXCHANGE, DESK, AMOUNT + 1n, DEPOSIT), /at most amountIn 10000000, not 10000001/);
+  assert.throws(() => pausedRescueInstructions(EXCHANGE, DESK, 0n, DEPOSIT), /more than 0/);
+});
+
+test('a paused desk refuses the rescue as the SDK builds it: the priority fee and both desk-account creates', () => {
+  const full = refusals(rescueInstructions(EXCHANGE, DESK, AMOUNT, DEPOSIT));
+  assert.equal(full.length, 3, full.join('; '));
+  assert.match(full[0]!, /^instruction 1: a priority fee of 100000 µlamports per CU$/);
+  assert.match(full[1]!, new RegExp(`^instruction 2: a create of the desk's own token account ${DESK.phusdAta}$`));
+  assert.match(full[2]!, new RegExp(`^instruction 4: a create of the desk's own token account ${DESK.usdcAta}$`));
+});
+
+// One case per thing a paused rescue may not carry, each the lean rescue with that one thing put back or made larger.
+const REFUSED: [string, () => SolInstruction[], RegExp][] = [
+  ['a compute-unit price', () => [LEAN[0]!, asSolInstructions(computeBudgetInstructions())[1]!, ...LEAN.slice(1)], /a priority fee of 100000/],
+  ['a create of the desk USDC account', () => [...LEAN.slice(0, 1), rescueInstructions(EXCHANGE, DESK, AMOUNT, DEPOSIT)[4]!, ...LEAN.slice(1)], /a create of the desk's own token account/],
+  ['an order', () => [...LEAN, vectorIx('market sell 0.005 ETH', PHOENIX, '5a76c0fcc0632791')], /a Phoenix place_market_order/],
+  ['a cancel', () => [...LEAN, vectorIx('cancel all ETH', PHOENIX, '62bf4bdc732847ed')], /a Phoenix cancel_all/],
+  ['a deposit', () => [...LEAN, vectorIx('deposit 15 USDC', PHOENIX, 'ca2734d33514fa58')], /a Phoenix deposit_funds/],
+  ['a wrap', () => [...LEAN, vectorIx('deposit 15 USDC', 'EMBERpYNE6ehWmXymZZS2skiFmCa9V5dp14e1iduM5qy', 'f223c68952e1f2b6')], /an Ember wrap/],
+  ['a withdrawal of amountIn + 1', () => {
+    const ixs = [...LEAN];
+    const w = at(ixs, PHOENIX, 'f1241d6fd01f68d9');
+    ixs[w] = withData(ixs[w]!, u64At(8, AMOUNT + 1n));
+    return ixs;
+  }, /^Phoenix withdrawals of 10000001 in all, over amountIn 10000000$/],
+  ['two withdrawals of amountIn', () => {
+    const ixs = [...LEAN];
+    const w = at(ixs, PHOENIX, 'f1241d6fd01f68d9');
+    ixs.splice(w, 0, ixs[w]!);
+    return ixs;
+  }, /^Phoenix withdrawals of 20000000 in all/],
+  ['an unwrap of amountIn + 1', () => {
+    const ixs = [...LEAN];
+    const u = at(ixs, 'EMBERpYNE6ehWmXymZZS2skiFmCa9V5dp14e1iduM5qy', 'b712469c946da122');
+    ixs[u] = withData(ixs[u]!, u64At(9, AMOUNT + 1n));
+    const a = at(ixs, TOKEN_PROGRAM, '04');
+    ixs[a] = withData(ixs[a]!, u64At(1, AMOUNT + 1n));
+    return ixs;
+  }, /^Ember unwraps of 10000001 in all, over amountIn 10000000$/],
+  ['an unwrap of the whole balance', () => {
+    const ixs = LEAN.filter((ix) => !(ix.programAddress === TOKEN_PROGRAM && Buffer.from(ix.data ?? []).toString('hex').startsWith('04')));
+    const u = at(ixs, 'EMBERpYNE6ehWmXymZZS2skiFmCa9V5dp14e1iduM5qy', 'b712469c946da122');
+    ixs[u] = withData(ixs[u]!, (d) => Buffer.concat([d.subarray(0, 8), Buffer.of(0)]));
+    return ixs;
+  }, /an Ember unwrap of the whole balance/],
+  ['a transfer into a desk account', () => [...LEAN, tokenTransferChecked(DESK.usdcAta, EXCHANGE.usdcMint, DESK.phusdAta, DESK.authority, 1n, 6)], /a TransferChecked into the desk account/],
+];
+
+for (const [what, build, refusal] of REFUSED) {
+  test(`a paused rescue may not carry ${what}`, () => {
+    const got = refusals(build());
+    assert.equal(got.length, 1, got.join('; '));
+    assert.match(got[0]!, refusal);
+  });
+}
 
 test('a TransferChecked of nothing is refused before it is built: the contract refuses empty transfers', () => {
   assert.throws(() => tokenTransferChecked(DESK.usdcAta, EXCHANGE.usdcMint, DESK.phusdAta, DESK.authority, 0n, 6), /not a u64 above 0/);

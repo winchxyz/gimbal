@@ -14,6 +14,7 @@ import {
   computeBudgetInstructions, parseMessage,
 } from './solana.ts';
 import { TEST_SOL_AUTHORITY, TEST_SOL_SEED, fakeTime, stubFetch, testContract, vectors } from './test-helpers.ts';
+import { asSolInstructions, compileLegacyMessage, tokenRevoke } from './solana-message.ts';
 import { NothingExecuted } from './tx.ts';
 
 const SOL = vectors('solana');
@@ -176,6 +177,37 @@ test('maxWaitMs reached without proof: OutcomeUnknown, also when the RPC only sa
     assert.match(err.message, /without lastValidBlockHeight that is no proof/);
     return true;
   });
+});
+
+test('a paused desk\'s rescue goes without a priority fee and is rebroadcast every 500 ms; nothing else goes without one', async () => {
+  // A compute-unit limit and no price, as pausedRescueMessage builds it (any instruction will do for the submitter).
+  const [limit] = asSolInstructions(computeBudgetInstructions());
+  const message = Buffer.from(compileLegacyMessage(TEST_SOL_AUTHORITY, [limit!, tokenRevoke(SOL.desk.phusd_ata, TEST_SOL_AUTHORITY)], SOL.recent_blockhash));
+  assert.deepEqual([parseMessage(message).computeUnitLimit, parseMessage(message).computeUnitPrice], [SOLANA_COMPUTE_UNITS, null]);
+  const signed = (kind: string): SolSignedAction => ({
+    desk_id: 'alpha', request_id: 1, venue: 'phoenix', kind, payload: { message_b64: message.toString('base64') },
+    signature: { scheme: 'Ed25519', signature: [...ed25519Sign(TEST_SOL_SEED, message)] },
+  });
+  const sleeps: number[] = [];
+  const time = fakeTime(T0);
+  const s = (f: typeof fetch) => new SolanaSubmitter({
+    rpcUrl: 'https://rpc.example', network: 'testnet', fetch: f, now: time.now,
+    sleep: async (ms) => { sleeps.push(ms); await time.sleep(ms); },
+  });
+  const r = rpc({ statuses: [null, null, { err: null, confirmationStatus: 'confirmed' }] });
+  const tx = await s(r.fetch).submit(signed('rescue'));
+  assert.equal(tx.length, 1);
+  assert.equal(r.methods().filter((m) => m === 'sendTransaction').length, 3);
+  assert.deepEqual(sleeps, [500, 500]);
+
+  // A fee-paying message keeps the 2 s pace.
+  sleeps.length = 0;
+  await s(rpc({ statuses: [null, { err: null, confirmationStatus: 'confirmed' }] }).fetch).submit(await signedIoc());
+  assert.deepEqual(sleeps, [2_000]);
+
+  const other = rpc({ statuses: [null] });
+  await assert.rejects(s(other.fetch).submit(signed('transaction')), /no compute-unit limit and priority fee; public RPCs drop it, nothing sent/);
+  assert.equal(other.calls.length, 0);
 });
 
 test('a fee payer other than the desk authority is never sent', async () => {

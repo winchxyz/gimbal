@@ -6,7 +6,7 @@ import { OutcomeUnknown } from '../contract/types.ts';
 import { HlExchangeError } from '../relayer/hyperliquid.ts';
 import { testDesk } from '../relayer/test-helpers.ts';
 import type { HlSetup, OrderlySetup, PhoenixSetup, SetupPlan, SetupStepName } from './setup.ts';
-import { receiverOf, runSetup, SETUP_STEPS } from './setup.ts';
+import { PHOENIX_LANDING_MS, receiverOf, runSetup, SETUP_STEPS } from './setup.ts';
 
 const NOW = Date.UTC(2026, 9, 31, 12);
 const DAY = 86_400_000;
@@ -316,10 +316,125 @@ test('Phoenix: a registration whose trader account never shows up fails with its
     referralCodes: { hyperliquid: null, orderly: null, phoenix: 'TESTREF1' },
   }).plan);
   assert.equal(status(final).phoenix_register, 'failed');
-  assert.match(step(final, 'phoenix_register').detail!, /trader account does not exist yet: a rerun looks again/);
+  assert.match(step(final, 'phoenix_register').detail!, /trader account does not exist yet: a rerun looks for it for 90 s before it signs anything/);
   assert.deepEqual(step(final, 'phoenix_register').tx, [near('sol')]);
   assert.equal(step(final, 'phoenix_referral').detail, 'waits for phoenix_register');
   assert.deepEqual(ph.calls, ['register']);
+});
+
+/** Phoenix on a clock: each registration lands `landsAfterMs` after it was signed (never when null). */
+function clockedPhoenix(now: () => number, landsAfterMs: number | null) {
+  const signed: number[] = [];
+  const reads: number[] = [];
+  let failReadAt: number | null = null;
+  const phoenix: PhoenixSetup = {
+    isRegistered: async () => {
+      reads.push(now());
+      if (failReadAt !== null && reads.length === failReadAt) throw new Error('solana: getAccountInfo timed out');
+      return landsAfterMs !== null && signed.some((at) => now() >= at + landsAfterMs);
+    },
+    register: async () => {
+      signed.push(now());
+      return { tx: [near('sol')] };
+    },
+    referralActivated: async () => false,
+    activateReferral: async () => null,
+  };
+  return { phoenix, signed, reads, failRead: (n: number) => { failReadAt = n; } };
+}
+
+test('Phoenix: every run looks for an earlier registration before it signs one, as long as that one could land', async () => {
+  let t = NOW;
+  const clock = { now: () => t, sleep: async (ms: number) => { t += ms; } };
+  const desk = { hl: fakeHl({ approved: 10 }).hl, orderly: fakeOrderly({ registered: true, key: true }).orderly, ...clock };
+
+  // The registration lands 45 s after it was signed: after the 30 s poll gave up. A rerun at once does not sign again.
+  const late = clockedPhoenix(() => t, 45_000);
+  const first = await runSetup(plan({ ...desk, phoenix: late.phoenix }).plan);
+  assert.equal(status(first).phoenix_register, 'failed');
+  assert.equal(late.signed.length, 1);
+  assert.ok(late.signed[0]! - NOW >= PHOENIX_LANDING_MS, 'a first run looks too: it cannot know there was no earlier one');
+  const second = await runSetup(plan({ ...desk, phoenix: late.phoenix }).plan);
+  assert.equal(status(second).phoenix_register, 'done');
+  assert.equal(step(second, 'phoenix_register').detail, 'trader account exists: an earlier registration landed');
+  assert.deepEqual(step(second, 'phoenix_register').tx, []);
+  assert.equal(late.signed.length, 1, 'one registration: a second one signed while the first could land is a second transaction');
+
+  // One that never lands: the rerun signs again only once the first can no longer land.
+  const lost = clockedPhoenix(() => t, null);
+  await runSetup(plan({ ...desk, phoenix: lost.phoenix }).plan);
+  await runSetup(plan({ ...desk, phoenix: lost.phoenix }).plan);
+  assert.equal(lost.signed.length, 2);
+  assert.ok(lost.signed[1]! - lost.signed[0]! >= PHOENIX_LANDING_MS);
+
+  // A read that fails while looking fails the step: nothing is signed on a guess.
+  const flaky = clockedPhoenix(() => t, null);
+  flaky.failRead(3);
+  const r = await runSetup(plan({ ...desk, phoenix: flaky.phoenix }).plan);
+  assert.equal(status(r).phoenix_register, 'failed');
+  assert.match(step(r, 'phoenix_register').detail!, /getAccountInfo timed out/);
+  assert.equal(flaky.signed.length, 0);
+});
+
+/** Phoenix on a clock for the referral: each activation lands `landsAfterMs` after it was signed. */
+function referralPhoenix(now: () => number, o: { registered: boolean; landsAfterMs: number }) {
+  const registered: number[] = o.registered ? [0] : [];
+  const activations: number[] = [];
+  const phoenix: PhoenixSetup = {
+    isRegistered: async () => registered.some((at) => now() >= at + 3_000),
+    register: async () => {
+      registered.push(now());
+      return { tx: [near('sol')] };
+    },
+    referralActivated: async () => activations.some((at) => now() >= at + o.landsAfterMs),
+    activateReferral: async () => {
+      activations.push(now());
+      return { status: 'sent', tx: [near('act')] };
+    },
+  };
+  return { phoenix, registered, activations };
+}
+
+test('Phoenix: the referral, like the registration, is looked for before it is signed again, unless this run registered', async () => {
+  let t = NOW;
+  const clock = { now: () => t, sleep: async (ms: number) => { t += ms; } };
+  const desk = {
+    hl: fakeHl({ approved: 10 }).hl, orderly: fakeOrderly({ registered: true, key: true }).orderly, ...clock,
+    referralCodes: { hyperliquid: null, orderly: null, phoenix: 'TESTREF1' },
+  };
+
+  // An activation sent by a run that ended before it landed (45 s later): a rerun at once does not sign another.
+  const late = referralPhoenix(() => t, { registered: true, landsAfterMs: 45_000 });
+  const first = await runSetup(plan({ ...desk, phoenix: late.phoenix }).plan);
+  assert.equal(step(first, 'phoenix_referral').detail, 'activate-tx: sent');
+  assert.ok(late.activations[0]! - NOW >= PHOENIX_LANDING_MS, 'the account was there before this run: an earlier run may have activated it');
+  const second = await runSetup(plan({ ...desk, phoenix: late.phoenix }).plan);
+  assert.equal(status(second).phoenix_referral, 'done');
+  assert.equal(step(second, 'phoenix_referral').detail, 'activated: an earlier activation landed');
+  assert.deepEqual(step(second, 'phoenix_referral').tx, []);
+  assert.equal(late.activations.length, 1, 'one activation: a second one signed while the first could land is a second transaction');
+
+  // A run that registers the account itself activates without the look: no earlier run got that far.
+  const fresh = referralPhoenix(() => t, { registered: false, landsAfterMs: 1_000 });
+  const r = await runSetup(plan({ ...desk, phoenix: fresh.phoenix }).plan);
+  assert.equal(status(r).phoenix_register, 'done');
+  assert.equal(step(r, 'phoenix_referral').detail, 'activate-tx: sent');
+  assert.ok(fresh.activations[0]! - fresh.registered[0]! < PHOENIX_LANDING_MS);
+});
+
+test('Phoenix: a poll interval of 0 fails the step instead of looking forever; nothing is signed', async () => {
+  let sleeps = 0;
+  const ph = fakePhoenix();
+  const final = await runSetup(plan({
+    hl: fakeHl({ approved: 10 }).hl, orderly: fakeOrderly({ registered: true, key: true }).orderly, phoenix: ph.phoenix,
+    phoenixPollMs: 0,
+    sleep: async () => {
+      if (++sleeps > 10_000) throw new Error('the look never ends');
+    },
+  }).plan);
+  assert.equal(status(final).phoenix_register, 'failed');
+  assert.match(step(final, 'phoenix_register').detail!, /phoenixPollMs must be over 0 and phoenixLandingMs 0 or more, got 0 and 90000: nothing is signed/);
+  assert.deepEqual(ph.calls, []);
 });
 
 test('receiverOf reads receiver_address and nothing else', () => {
