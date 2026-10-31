@@ -7,7 +7,8 @@
 export type OrderlyRequestKind =
   | 'order' | 'cancel' | 'cancel_all'
   | 'receiver_address' | 'settle_nonce' | 'withdraw_nonce' | 'settle_pnl' | 'withdraw_request' | 'referral_bind'
-  | 'funding_fee_history';         // GET /v1/funding_fee/history?start_t&end_t&page&size, read only
+  | 'funding_fee_history'          // GET /v1/funding_fee/history?symbol&start_t&end_t&page&size, read only
+  | 'positions' | 'holding';       // GET /v1/positions, GET /v1/client/holding, read only
 
 /** The `kind` the engine expects on an orderly_ws_auth SignedAction (interfaces 1.4 names no kind for it yet). */
 export const ORDERLY_WS_AUTH_KIND = 'ws_auth';

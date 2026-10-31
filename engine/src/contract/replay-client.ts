@@ -67,15 +67,15 @@ const ORDERLY_OFF_CHAIN = '0xCcCCccccCCCCcCCCCCCcCcCccCcCCCcCcccccccC';
 /** Orderly's limit on a client_order_id. */
 export const ORDERLY_CLIENT_ORDER_ID_MAX = 36;
 
+/** How far past the block time an Orderly request timestamp may be (the contract's MAX_AHEAD_MS). */
+export const ORDERLY_MAX_AHEAD_MS = 5_000;
+
 /**
- * The replay's stand-in for the contract's derived client_order_id, `gimbal-<desk>-<request_id>` as orderly.json
- * writes it, with the desk part cut so the whole fits Orderly's 36 characters (the request id stays whole, and the
- * Orderly account is the desk's, so it stays unique). C5 pins the real format.
+ * The client_order_id the contract sets on the order it signs with `requestId`: `g<request_id>`, as orderly.json
+ * pins it (request_rules.client_order_id). It is never the caller's: the contract refuses one with E_ARGS.
  */
-export function standInClientOrderId(deskId: string, requestId: number): string {
-  const n = String(requestId);
-  const room = Math.max(0, ORDERLY_CLIENT_ORDER_ID_MAX - 'gimbal--'.length - n.length);
-  return `gimbal-${deskId.slice(0, room)}-${n}`;
+export function standInClientOrderId(requestId: number): string {
+  return `g${requestId}`;
 }
 /** EIP-3009 authorizations are valid for at most this long (contract rule, eip3009.json). */
 const EIP3009_VALID_S = 1800;
@@ -125,6 +125,11 @@ export class ReplayContractClient implements ContractClient {
 
   setDesk(deskId: string, desk: DeskView): void {
     this.#desks.set(deskId, structuredClone(desk));
+  }
+
+  /** The request_id the next signature gets (the contract's next_request_id), e.g. a vector's. */
+  setNextRequestId(requestId: number): void {
+    this.#requestId = requestId - 1;
   }
 
   /** set_mock_price: the contract owner's Mock price source. */
@@ -260,6 +265,10 @@ export class ReplayContractClient implements ContractClient {
     this.calls.push({ method: 'orderly_request', args: { desk_id: deskId, req, reason } });
     const desk = this.#gate(deskId, req.kind === 'order' && !req.reduce_only ? 'running' : 'reduces-risk');
     checkReason(reason);
+    checkOrderlyTimestamp('timestamp_ms', req.timestamp_ms, this.#now());
+    if (req.client_order_id !== undefined && req.client_order_id !== null) {
+      throw new ContractRefusal('E_ARGS', 'client_order_id is the contract\'s (g<request_id>), never the caller\'s: leave it null');
+    }
     const route = this.#orderlyRoute(deskId, desk, req);
     const message = orderlyRestMessage(req.timestamp_ms, route.method, route.path, route.body);
     return this.#orderlyRest(deskId, req.kind, { ...route, timestamp: req.timestamp_ms, message });
@@ -268,6 +277,7 @@ export class ReplayContractClient implements ContractClient {
   async orderlyWsAuth(deskId: string, timestamp: number): Promise<OrderlyRestAction> {
     this.calls.push({ method: 'orderly_ws_auth', args: { desk_id: deskId, timestamp } });
     this.#gate(deskId, 'reduces-risk');
+    checkOrderlyTimestamp('timestamp', timestamp, this.#now());
     // The contract's ws auth payload has no HTTP method: "".
     return this.#orderlyRest(deskId, ORDERLY_WS_AUTH_KIND, { method: '', path: '', body: '', timestamp, message: String(timestamp) });
   }
@@ -438,10 +448,8 @@ export class ReplayContractClient implements ContractClient {
         const s = symbol();
         const type = req.order_type ?? 'IOC';
         const fields: string[] = [`"symbol":${JSON.stringify(s)}`];
-        // The contract derives the id from its request_id; orderly.json still passes its own, which is kept until
-        // the vectors pin the derivation.
-        const clientOrderId = req.client_order_id || standInClientOrderId(deskId, this.#requestId + 1);
-        fields.push(`"client_order_id":${JSON.stringify(clientOrderId)}`);
+        // The contract's id, from the request_id this signature gets.
+        fields.push(`"client_order_id":${JSON.stringify(standInClientOrderId(this.#requestId + 1))}`);
         fields.push(`"order_type":${JSON.stringify(type)}`);
         if (type !== 'MARKET') fields.push(`"order_price":${decimalNumber('price', req.price)}`);
         fields.push(`"order_quantity":${decimalNumber('quantity', req.quantity)}`);
@@ -459,8 +467,15 @@ export class ReplayContractClient implements ContractClient {
         if (code === null) throw new ContractRefusal('E_ARGS', 'no Orderly referral code is configured');
         return { method: 'POST', path: '/v1/referral/bind', body: JSON.stringify({ referral_code: code }) };
       }
-      case 'funding_fee_history':
-        return { method: 'GET', path: `/v1/funding_fee/history?start_t=${req.start_t}&end_t=${req.end_t}&page=${req.page}&size=${req.size}`, body: '' };
+      case 'funding_fee_history': {
+        // As the contract: the fields given, in this order.
+        const params = (['symbol', 'start_t', 'end_t', 'page', 'size'] as const)
+          .filter((k) => req[k] !== undefined && req[k] !== null)
+          .map((k) => `${k}=${req[k]}`);
+        return { method: 'GET', path: `/v1/funding_fee/history${params.length === 0 ? '' : `?${params.join('&')}`}`, body: '' };
+      }
+      case 'positions': return { method: 'GET', path: '/v1/positions', body: '' };
+      case 'holding': return { method: 'GET', path: '/v1/client/holding', body: '' };
       case 'settle_pnl': case 'withdraw_request': {
         const ledger = ORDERLY_LEDGER[this.#config.network];
         const ts = req.signed_at_ms ?? 0;
@@ -504,6 +519,13 @@ export class ReplayContractClient implements ContractClient {
 }
 
 // ---- helpers ----
+
+/** As the contract: an Orderly timestamp at most ORDERLY_MAX_AHEAD_MS past the block time (E_ARGS). */
+function checkOrderlyTimestamp(field: string, timestamp: number, blockMs: number): void {
+  if (timestamp > blockMs + ORDERLY_MAX_AHEAD_MS) {
+    throw new ContractRefusal('E_ARGS', `${field} ${timestamp} is more than ${ORDERLY_MAX_AHEAD_MS / 1000} s after the block time ${blockMs}`);
+  }
+}
 
 function quoteFields(quote: SignedQuote): { depositAddress: string; amountIn: string } {
   const q = (quote.quote ?? {}) as { quote?: { depositAddress?: unknown; amountIn?: unknown }; depositAddress?: unknown; amountIn?: unknown };

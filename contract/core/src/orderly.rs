@@ -909,6 +909,12 @@ pub fn build_request(ctx: &Context, req: &OrderlyRequest) -> Result<Signable, Re
 /// So anyone who reads the chain can post a signed order N times inside the window, each one
 /// up to the policy's size, bounded only by the account's margin. A copy of a reduce-only order
 /// can only shrink the position.
+///
+/// Decided (PR 30 round 2): an accepted, documented residual risk for now. The window is
+/// Orderly's timestamp window, each copy is capped by the policy's size, and every copy shows
+/// in the desk's own account: the engine reconciles positions after each order and closes any
+/// excess reduce-only. For mainnet, C6 adds a request kind for Orderly's key IP restriction
+/// (`POST /v1/client/set_orderly_key_ip_restriction`), so only the relayer can use the desk key.
 fn order(ctx: &Context, req: &OrderlyRequest) -> Result<Signable, Refusal> {
     let need = |field: &str, v: &Option<String>| {
         v.clone()
