@@ -35,27 +35,9 @@ export interface OrderlyRequest {
   size?: number | null;
 }
 
-export interface Secp256k1Signature {
-  scheme: 'Secp256k1';
-  big_r: { affine_point: string };      // 33-byte compressed point, hex: 02/03 then r
-  s: { scalar: string };                // 32 bytes, hex
-  recovery_id: number;                  // 0 or 1
-}
-
-export interface Ed25519Signature {
-  scheme: 'Ed25519';
-  signature: number[];                  // 64 bytes
-}
-
-/** interfaces 1.4: what every action method returns; the engine submits it as is. */
-export interface SignedAction<P = unknown, S = Secp256k1Signature | Ed25519Signature> {
-  desk_id: string;
-  request_id: number;
-  venue: string;
-  kind: string;
-  payload: P;
-  signature: S;
-}
+// The signature shapes and SignedAction live with the contract client, which every venue's submitter shares.
+import type { Ed25519Signature, Secp256k1Signature, SignedAction } from '../contract/types.ts';
+export type { Ed25519Signature, Secp256k1Signature, SignedAction } from '../contract/types.ts';
 
 /** A signed Orderly REST call (orderly_request) or WebSocket login (orderly_ws_auth). */
 export interface OrderlyRestPayload {
