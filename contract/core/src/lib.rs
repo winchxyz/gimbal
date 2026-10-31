@@ -2,12 +2,16 @@
 //! runs and is tested natively; the `gimbal` crate calls into it and turns a [`Refusal`] into a panic.
 
 pub mod decimal;
+pub mod ed25519;
 pub mod eip712;
 pub mod errors;
 pub mod hl;
 pub mod ids;
+pub mod limits;
 pub mod msgpack;
 pub mod network;
+pub mod phoenix;
 pub mod policy;
+pub mod solana;
 
 pub use errors::Refusal;

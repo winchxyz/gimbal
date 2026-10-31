@@ -63,7 +63,8 @@ pub struct OrderlyConfig {
 pub struct FeeConfig {
     /// Share of profit above the desk's high-water mark; 1000 = 10 %.
     pub performance_bps: u16,
-    /// Per Hyperliquid fill, in tenths of a bp; 10 = 1 bp.
+    /// Per Hyperliquid fill, in tenths of a bp; 10 = 1 bp. From 1 to Hyperliquid's cap: every
+    /// order carries the builder field, and Hyperliquid has no zero builder fee to approve.
     pub hl_builder_tenth_bps: u16,
 }
 
@@ -151,6 +152,13 @@ pub fn check(
             "performance_bps {} is over {PERFORMANCE_FEE_MAX_BPS}",
             fees.performance_bps
         ));
+    }
+    if fees.hl_builder_tenth_bps == 0 {
+        return refuse(
+            "hl_builder_tenth_bps is 0; every Hyperliquid order carries the builder fee, so it is at \
+             least 1"
+                .into(),
+        );
     }
     if fees.hl_builder_tenth_bps > HL_BUILDER_FEE_MAX_TENTH_BPS {
         return refuse(format!(
@@ -303,6 +311,26 @@ mod tests {
         let mut f = edge;
         f.hl_builder_tenth_bps += 1;
         refused(check(Network::Testnet, &PriceSource::Mock, &t, &f, &o));
+    }
+
+    #[test]
+    fn a_zero_builder_fee_is_refused() {
+        let o = orderly(ARBITRUM_SEPOLIA);
+        let t = treasury();
+        let lowest = FeeConfig {
+            performance_bps: 0,
+            hl_builder_tenth_bps: 1,
+        };
+        check(Network::Testnet, &PriceSource::Mock, &t, &lowest, &o).unwrap();
+        let zero = FeeConfig {
+            hl_builder_tenth_bps: 0,
+            ..lowest
+        };
+        assert_eq!(
+            refused(check(Network::Testnet, &PriceSource::Mock, &t, &zero, &o)),
+            "hl_builder_tenth_bps is 0; every Hyperliquid order carries the builder fee, so it is \
+             at least 1"
+        );
     }
 
     #[test]

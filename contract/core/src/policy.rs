@@ -7,6 +7,7 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
+use crate::decimal::parse_e8;
 use crate::errors::{shown, Refusal, E_ARGS};
 use crate::ids::decode_base58_32;
 
@@ -45,10 +46,24 @@ pub struct Policy {
     pub max_transfer_cost_bps: u32,
     /// USDC × 1e6.
     pub max_transfer_cost_flat_e6: u64,
-    /// Symbols without an oracle price that the owner explicitly allowed (no price band).
-    pub unpriced: Vec<String>,
-    /// Their own cap per leg; an unpriced order must fit [`Policy::unpriced_cap_usd`].
+    /// Symbols without an oracle price that the owner explicitly allowed (no price band), each
+    /// with its size cap in base units.
+    pub unpriced: Vec<UnpricedAsset>,
+    /// Their own cap per leg; an unpriced order must fit [`Policy::unpriced_cap_usd`] at its own
+    /// price.
     pub unpriced_max_notional_usd: u64,
+}
+
+/// A symbol without a trusted price that the owner allowed. Its orders skip the price band, so the
+/// size is capped in base units: a notional cap at the caller's own limit price alone would let a
+/// tiny price carry any size.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnpricedAsset {
+    pub symbol: String,
+    /// The largest order size in base units, a canonical decimal. The UI asks the owner for a cap
+    /// in USD and converts it at the current price.
+    pub max_sz: String,
 }
 
 /// A Hyperliquid perp the desk may trade.
@@ -78,6 +93,16 @@ impl Policy {
     /// The notional cap per leg of an order for an `unpriced` symbol: both caps apply.
     pub fn unpriced_cap_usd(&self) -> u64 {
         self.max_notional_usd.min(self.unpriced_max_notional_usd)
+    }
+
+    /// The `max_sz` of `symbol` in units of 1e-8, if the owner listed it in `unpriced`. A stored
+    /// policy was validated, so its `max_sz` parses; one that does not counts as 0, which refuses
+    /// every order.
+    pub fn unpriced_max_sz_e8(&self, symbol: &str) -> Option<u128> {
+        self.unpriced
+            .iter()
+            .find(|u| u.symbol == symbol)
+            .map(|u| parse_e8(&u.max_sz).unwrap_or(0))
     }
 
     /// Checks the fields on their own, before the policy is stored (`create_desk`, `set_policy`):
@@ -158,10 +183,23 @@ impl Policy {
         }
 
         list_len("unpriced", self.unpriced.len())?;
-        for (i, s) in self.unpriced.iter().enumerate() {
-            symbol(&format!("unpriced[{i}]"), s)?;
-            if self.unpriced[..i].contains(s) {
-                return refuse(format!("unpriced[{i}] {} is listed twice", shown(s)));
+        for (i, asset) in self.unpriced.iter().enumerate() {
+            symbol(&format!("unpriced[{i}].symbol"), &asset.symbol)?;
+            if self.unpriced[..i].iter().any(|u| u.symbol == asset.symbol) {
+                return refuse(format!(
+                    "unpriced[{i}].symbol {} is listed twice",
+                    shown(&asset.symbol)
+                ));
+            }
+            let max_sz = parse_e8(&asset.max_sz).map_err(|r| {
+                Refusal::new(E_ARGS, format!("policy.unpriced[{i}].max_sz {}", r.msg))
+            })?;
+            // Zero is allowed, like the other caps: it refuses every order of that symbol.
+            if max_sz > u128::from(MAX_SAFE_INTEGER) * crate::decimal::UNIT {
+                return refuse(format!(
+                    "unpriced[{i}].max_sz {} is over 2^53 - 1 base units",
+                    shown(&asset.max_sz)
+                ));
             }
         }
 
@@ -195,6 +233,52 @@ impl Policy {
         // the owner's call. The two notional caps are not compared: an unpriced order has to fit
         // both (`unpriced_cap_usd`), and the defaults (100 against the canary's 20) differ that way.
         Ok(())
+    }
+
+    /// The largest policy [`Policy::validate`] accepts: every list full and every string as long
+    /// as it may be. It bounds the storage a desk takes and the gas `create_desk` needs, which
+    /// tests on both sides measure with it.
+    pub fn largest_valid() -> Policy {
+        let n = MAX_LIST_LEN as u32;
+        let sym = |i: u32| format!("{i:0>width$}", width = MAX_SYMBOL_LEN);
+        Policy {
+            hl_assets: (0..n)
+                .map(|i| HlAsset {
+                    index: u32::MAX - i,
+                    symbol: sym(i),
+                    sz_decimals: HL_MAX_SZ_DECIMALS,
+                })
+                .collect(),
+            phoenix_markets: (0..n)
+                .map(|i| {
+                    let mut key = [0xffu8; 32];
+                    key[31] = i as u8;
+                    PhoenixMarket {
+                        symbol: sym(i),
+                        orderbook: bs58::encode(key).into_string(),
+                        base_lot_e8: MAX_SAFE_INTEGER,
+                        tick_e8: MAX_SAFE_INTEGER,
+                    }
+                })
+                .collect(),
+            orderly_symbols: (0..n)
+                .map(|i| format!("PERP_{i:0>width$}_USDC", width = MAX_SYMBOL_LEN - 10))
+                .collect(),
+            max_notional_usd: MAX_SAFE_INTEGER,
+            price_band_bps: MAX_PRICE_BAND_BPS,
+            oracle_max_age_s: MAX_ORACLE_AGE_S,
+            rescue_cap_usd_per_hour: MAX_SAFE_INTEGER,
+            max_transfer_cost_bps: MAX_TRANSFER_COST_BPS,
+            max_transfer_cost_flat_e6: MAX_SAFE_INTEGER,
+            unpriced: (0..n)
+                .map(|i| UnpricedAsset {
+                    symbol: sym(i),
+                    // 2^53 - 1 less 1e-8: the longest max_sz under the cap.
+                    max_sz: "9007199254740990.99999999".into(),
+                })
+                .collect(),
+            unpriced_max_notional_usd: MAX_SAFE_INTEGER,
+        }
     }
 }
 
@@ -265,7 +349,7 @@ mod tests {
         "rescue_cap_usd_per_hour": 50,
         "max_transfer_cost_bps": 100,
         "max_transfer_cost_flat_e6": 500000,
-        "unpriced": ["HYPE"],
+        "unpriced": [{ "symbol": "HYPE", "max_sz": "2.5" }],
         "unpriced_max_notional_usd": 100
     }"#;
 
@@ -289,8 +373,15 @@ mod tests {
             rescue_cap_usd_per_hour: 50,
             max_transfer_cost_bps: 100,
             max_transfer_cost_flat_e6: 500_000,
-            unpriced: vec!["HYPE".into()],
+            unpriced: vec![unpriced("HYPE", "2.5")],
             unpriced_max_notional_usd: 100,
+        }
+    }
+
+    fn unpriced(symbol: &str, max_sz: &str) -> UnpricedAsset {
+        UnpricedAsset {
+            symbol: symbol.into(),
+            max_sz: max_sz.into(),
         }
     }
 
@@ -322,7 +413,11 @@ mod tests {
 
     #[test]
     fn missing_field_is_refused() {
-        let json = SHARED_JSON.replace("\"unpriced\": [\"HYPE\"],", "");
+        let json = SHARED_JSON.replace(
+            "\"unpriced\": [{ \"symbol\": \"HYPE\", \"max_sz\": \"2.5\" }],",
+            "",
+        );
+        assert_ne!(json, SHARED_JSON);
         assert!(serde_json::from_str::<Policy>(&json).is_err());
     }
 
@@ -447,7 +542,7 @@ mod tests {
         let msg = refused(|p| p.hl_assets = (0..n).map(|i| hl(i, &format!("A{i}"))).collect());
         assert!(msg.contains("hl_assets has 33 entries"), "{msg}");
         refused(|p| p.orderly_symbols = (0..n).map(|i| format!("PERP_A{i}_USDC")).collect());
-        refused(|p| p.unpriced = (0..n).map(|i| format!("U{i}")).collect());
+        refused(|p| p.unpriced = (0..n).map(|i| unpriced(&format!("U{i}"), "1")).collect());
         refused(|p| {
             p.phoenix_markets = (0..n)
                 .map(|i| {
@@ -467,7 +562,8 @@ mod tests {
             let msg = refused(|p| p.hl_assets[0].symbol = bad.into());
             assert!(msg.starts_with("policy.hl_assets[0].symbol "), "{msg}");
             refused(|p| p.phoenix_markets[0].symbol = bad.into());
-            refused(|p| p.unpriced[0] = bad.into());
+            let msg = refused(|p| p.unpriced[0].symbol = bad.into());
+            assert!(msg.starts_with("policy.unpriced[0].symbol "), "{msg}");
         }
     }
 
@@ -475,37 +571,16 @@ mod tests {
     /// `set_policy` can need is bounded (0.08 NEAR at 1e19 yocto per byte).
     #[test]
     fn the_largest_valid_policy_is_under_8_kib() {
-        let n = MAX_LIST_LEN as u32;
-        let sym = |i: u32| format!("{i:0>width$}", width = MAX_SYMBOL_LEN);
-        let p = Policy {
-            hl_assets: (0..n)
-                .map(|i| HlAsset {
-                    index: i,
-                    symbol: sym(i),
-                    sz_decimals: 0,
-                })
-                .collect(),
-            phoenix_markets: (0..n)
-                .map(|i| {
-                    let mut key = [0xffu8; 32];
-                    key[31] = i as u8;
-                    PhoenixMarket {
-                        symbol: sym(i),
-                        orderbook: bs58::encode(key).into_string(),
-                        base_lot_e8: MAX_SAFE_INTEGER,
-                        tick_e8: MAX_SAFE_INTEGER,
-                    }
-                })
-                .collect(),
-            orderly_symbols: (0..n)
-                .map(|i| format!("PERP_{i:0>width$}_USDC", width = MAX_SYMBOL_LEN - 10))
-                .collect(),
-            unpriced: (0..n).map(sym).collect(),
-            ..sample()
-        };
+        let p = Policy::largest_valid();
         p.validate().unwrap();
         let bytes = borsh::to_vec(&p).unwrap().len();
         assert!(bytes < 8 * 1024, "{bytes} bytes");
+        // Every list is full and every string as long as it may be.
+        assert_eq!(p.unpriced.len(), MAX_LIST_LEN);
+        let longer = format!("{}9", p.unpriced[0].max_sz);
+        let mut q = Policy::largest_valid();
+        q.unpriced[0].max_sz = longer;
+        assert_eq!(q.validate().unwrap_err().code, E_ARGS);
     }
 
     #[test]
@@ -569,8 +644,44 @@ mod tests {
 
     #[test]
     fn unpriced_symbols_are_unique() {
-        let msg = refused(|p| p.unpriced.push("HYPE".into()));
-        assert!(msg.contains("unpriced[1]"), "{msg}");
+        let msg = refused(|p| p.unpriced.push(unpriced("HYPE", "1")));
+        assert_eq!(msg, "policy.unpriced[1].symbol \"HYPE\" is listed twice");
+        accepted(|p| p.unpriced.push(unpriced("kPEPE", "1000000")));
+    }
+
+    #[test]
+    fn unpriced_max_sz_is_a_canonical_decimal_up_to_2_pow_53() {
+        accepted(|p| p.unpriced[0].max_sz = "0".into());
+        accepted(|p| p.unpriced[0].max_sz = "0.00000001".into());
+        accepted(|p| p.unpriced[0].max_sz = "9007199254740991".into());
+        for bad in ["", "2.50", "-1", "1e3", "02.5", "0.000000001"] {
+            let msg = refused(|p| p.unpriced[0].max_sz = bad.into());
+            assert!(msg.starts_with("policy.unpriced[0].max_sz "), "{msg}");
+        }
+        let msg = refused(|p| p.unpriced[0].max_sz = "9007199254740991.00000001".into());
+        assert_eq!(
+            msg,
+            "policy.unpriced[0].max_sz \"9007199254740991.00000001\" is over 2^53 - 1 base units"
+        );
+    }
+
+    #[test]
+    fn the_unpriced_size_cap_is_found_by_symbol() {
+        let p = sample();
+        assert_eq!(p.unpriced_max_sz_e8("HYPE"), Some(250_000_000));
+        assert_eq!(p.unpriced_max_sz_e8("ETH"), None);
+        let mut q = sample();
+        q.unpriced[0].max_sz = "not a number".into();
+        assert_eq!(q.unpriced_max_sz_e8("HYPE"), Some(0));
+    }
+
+    #[test]
+    fn an_unpriced_entry_needs_both_fields() {
+        let json = SHARED_JSON.replace(", \"max_sz\": \"2.5\"", "");
+        assert_ne!(json, SHARED_JSON);
+        assert!(serde_json::from_str::<Policy>(&json).is_err());
+        let json = SHARED_JSON.replace("\"max_sz\": \"2.5\"", "\"max_sz\": 2.5");
+        assert!(serde_json::from_str::<Policy>(&json).is_err());
     }
 
     #[test]

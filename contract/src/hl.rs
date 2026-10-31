@@ -4,8 +4,8 @@
 //! master address. The desk's EVM key signs everything: Gimbal uses no agent wallets.
 
 use gimbal_core::hl::{
-    check_order, check_usdc_amount, max_fee_rate, order_action, prepare_l1, referral_code,
-    set_referrer_action, Address, HlOrder, UserAction,
+    cancel_action, check_order, check_usdc_amount, max_fee_rate, order_action, prepare_l1,
+    referral_code, set_referrer_action, Address, HlOrder, UserAction,
 };
 use gimbal_core::ids::check_reason;
 use near_sdk::{env, near};
@@ -14,7 +14,8 @@ use crate::action::UnsignedAction;
 use crate::config::Config;
 use crate::deposit::check_one_yocto;
 use crate::desk::Gate;
-use crate::{action_desk, owner_desk, Gimbal, GimbalExt, OrFail};
+use crate::prices::reference_price;
+use crate::{action_desk, owner_desk, take_hl_nonce, Gimbal, GimbalExt, OrFail};
 
 /// The host's keccak256, which the core builders take as a function.
 pub fn keccak(data: &[u8]) -> [u8; 32] {
@@ -26,21 +27,50 @@ impl Gimbal {
     /// A limit order on Hyperliquid, with the treasury's builder fee. Owner or operator; a
     /// reduce-only order also on a paused desk. Refuses an asset outside the policy (`E_ASSET`),
     /// a bad tif or cloid (`E_ARGS`), px or sz strings that are not canonical or break
-    /// Hyperliquid's rules (`E_DECIMAL`), and a zero size or a notional px × sz over the policy's
-    /// cap (`E_SIZE`). The oracle price band joins on day 6.
+    /// Hyperliquid's rules (`E_DECIMAL`), a zero size (`E_SIZE`), and then, for a symbol in
+    /// `policy.unpriced`, a size over its `max_sz` or a notional px × sz over the unpriced cap
+    /// (`E_SIZE`); for any other symbol no fresh oracle price (`E_ORACLE_STALE`, every priced
+    /// order until prices are stored, C6), a price outside the band (`E_PRICE_BAND`) or a notional
+    /// sz × max(px, oracle) over `max_notional_usd` (`E_SIZE`).
     #[deny_unknown_arguments]
     pub fn hl_order(&mut self, desk_id: String, order: HlOrder, reason: String) -> UnsignedAction {
-        let (desk, _) = action_desk(&mut self.desks, &desk_id, Gate::order(order.reduce_only));
+        let (desk, _) = action_desk(&self.desks, &desk_id, Gate::order(order.reduce_only));
         check_reason(&reason).or_fail();
-        let checked = check_order(&desk.policy, &order).or_fail();
+        let reference = desk
+            .policy
+            .hl_assets
+            .iter()
+            .find(|a| a.index == order.asset)
+            .and_then(|a| reference_price(&a.symbol, desk.policy.oracle_max_age_s));
+        let checked = check_order(&desk.policy, &order, reference).or_fail();
         let builder = treasury_builder(&self.config);
         let action = order_action(
             &checked.wire,
             &builder,
             self.config.fees.hl_builder_tenth_bps,
         );
-        let nonce = desk.take_hl_nonce(env::block_timestamp_ms());
+        let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
         let prepared = prepare_l1(keccak, self.config.network, "order", action, nonce);
+        UnsignedAction::hyperliquid(desk_id, prepared, Some(&reason))
+    }
+
+    /// Cancels the desk's resting order `oid` on Hyperliquid asset `asset`:
+    /// `{type:"cancel", cancels:[{a, o}]}`. Owner or operator, also on a paused desk, so a pause
+    /// can stop resting orders. The asset need not be in the policy any more: an owner who drops
+    /// an asset must still be able to cancel what rests on it.
+    #[deny_unknown_arguments]
+    pub fn hl_cancel(
+        &mut self,
+        desk_id: String,
+        asset: u32,
+        oid: u64,
+        reason: String,
+    ) -> UnsignedAction {
+        action_desk(&self.desks, &desk_id, Gate::ReducesRisk);
+        check_reason(&reason).or_fail();
+        let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
+        let action = cancel_action(asset, oid);
+        let prepared = prepare_l1(keccak, self.config.network, "cancel", action, nonce);
         UnsignedAction::hyperliquid(desk_id, prepared, Some(&reason))
     }
 
@@ -49,11 +79,11 @@ impl Gimbal {
     /// configured it is `E_ARGS` and setup skips it. Owner or operator, running desk.
     #[deny_unknown_arguments]
     pub fn hl_set_referrer(&mut self, desk_id: String) -> UnsignedAction {
-        let (desk, _) = action_desk(&mut self.desks, &desk_id, Gate::Running);
+        action_desk(&self.desks, &desk_id, Gate::Running);
         let code =
             referral_code(self.config.treasury.referral_codes.hyperliquid.as_deref()).or_fail();
         let action = set_referrer_action(code);
-        let nonce = desk.take_hl_nonce(env::block_timestamp_ms());
+        let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
         let prepared = prepare_l1(keccak, self.config.network, "setReferrer", action, nonce);
         UnsignedAction::hyperliquid(desk_id, prepared, None)
     }
@@ -62,10 +92,10 @@ impl Gimbal {
     /// bp = `"0.01%"`), which every order then carries. Owner or operator, running desk.
     #[deny_unknown_arguments]
     pub fn hl_approve_builder_fee(&mut self, desk_id: String) -> UnsignedAction {
-        let (desk, _) = action_desk(&mut self.desks, &desk_id, Gate::Running);
+        action_desk(&self.desks, &desk_id, Gate::Running);
         let builder = treasury_builder(&self.config);
         let max_fee_rate = max_fee_rate(self.config.fees.hl_builder_tenth_bps);
-        let nonce = desk.take_hl_nonce(env::block_timestamp_ms());
+        let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
         let action = UserAction::ApproveBuilderFee {
             max_fee_rate,
             builder,
@@ -85,10 +115,10 @@ impl Gimbal {
         to_perp: bool,
         reason: String,
     ) -> UnsignedAction {
-        let (desk, _) = action_desk(&mut self.desks, &desk_id, Gate::Running);
+        action_desk(&self.desks, &desk_id, Gate::Running);
         check_reason(&reason).or_fail();
         check_usdc_amount(&amount).or_fail();
-        let nonce = desk.take_hl_nonce(env::block_timestamp_ms());
+        let nonce = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
         let action = UserAction::UsdClassTransfer {
             amount,
             to_perp,
@@ -105,11 +135,11 @@ impl Gimbal {
     #[payable]
     #[deny_unknown_arguments]
     pub fn hl_withdraw(&mut self, desk_id: String, amount: String) -> UnsignedAction {
-        let desk = owner_desk(&mut self.desks, &desk_id, "hl_withdraw");
+        let desk = owner_desk(&self.desks, &desk_id, "hl_withdraw");
         check_one_yocto("hl_withdraw", env::attached_deposit()).or_fail();
         check_usdc_amount(&amount).or_fail();
         let destination = Address::parse("evm_address", &desk.evm_address).or_fail();
-        let time = desk.take_hl_nonce(env::block_timestamp_ms());
+        let time = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
         let action = UserAction::Withdraw {
             destination,
             amount,

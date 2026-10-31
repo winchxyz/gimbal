@@ -1,8 +1,9 @@
 //! Every case in `vectors/hl.json` (built with `@nktkas/hyperliquid`, viem, ethers and msgpack, and
 //! cross-checked with `hyperliquid-python-sdk`) must give the same bytes, hashes and refusals here:
-//! `l1` (orders, cancels, setReferrer), `user_signed`, `strings` and the non-oracle rows of
-//! `order_policy` (the oracle rows join with the price band on day 6). The signatures in the file
-//! are of fixed test keys; the MPC's differ but must recover to the desk address (C5).
+//! `l1` (orders, cancels, setReferrer), `user_signed`, `strings` and every row of `order_policy`,
+//! with the file's oracle prices as reference prices and without any (the contract until it stores
+//! prices, C6). The signatures in the file are of fixed test keys; the MPC's differ but must
+//! recover to the desk address (C5).
 
 use gimbal_core::eip712;
 use gimbal_core::hl::{
@@ -11,9 +12,10 @@ use gimbal_core::hl::{
     set_referrer_action, sign_transaction_domain_separator, usdc_token, Address, Cloid, HlOrder,
     OrderWire, UserAction, AGENT_TYPE,
 };
+use gimbal_core::limits::fresh_price;
 use gimbal_core::msgpack::Value as Mp;
 use gimbal_core::network::Network;
-use gimbal_core::policy::{HlAsset, Policy};
+use gimbal_core::policy::{HlAsset, Policy, UnpricedAsset};
 use gimbal_core::Refusal;
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
@@ -428,8 +430,14 @@ fn every_string_vector_matches() {
     f.done(total);
 }
 
+/// The largest size of an unpriced symbol in these tests. The vectors list `unpriced` as plain
+/// symbols, from before `max_sz`; their HYPE rows are sized 2.5 and 3, so with a `max_sz` of 3 the
+/// notional cap decides them, as the vectors expect.
+const VECTOR_UNPRICED_MAX_SZ: &str = "3";
+
 /// The order-policy cases' policy, with the fields an order check does not read left empty.
 fn vector_policy(p: &Value) -> Policy {
+    let unpriced: Vec<String> = serde_json::from_value(p["unpriced"].clone()).unwrap();
     Policy {
         hl_assets: serde_json::from_value::<Vec<HlAsset>>(p["hl_assets"].clone()).unwrap(),
         phoenix_markets: vec![],
@@ -440,16 +448,42 @@ fn vector_policy(p: &Value) -> Policy {
         rescue_cap_usd_per_hour: 0,
         max_transfer_cost_bps: 0,
         max_transfer_cost_flat_e6: 0,
-        unpriced: serde_json::from_value(p["unpriced"].clone()).unwrap(),
+        unpriced: unpriced
+            .into_iter()
+            .map(|symbol| UnpricedAsset {
+                symbol,
+                max_sz: VECTOR_UNPRICED_MAX_SZ.into(),
+            })
+            .collect(),
         unpriced_max_notional_usd: u(&p["unpriced_max_notional_usd"]),
     }
 }
 
-/// Today's checks decide every row whose outcome needs no oracle price. A row the band or the
-/// staleness check decides (day 6) must pass today's checks as a priced order, so those checks
-/// hand it on to the oracle step.
+/// The reference price of `symbol` at the vectors' `now_ms`: its oracle price if young enough.
+fn vector_reference(op: &Value, policy: &Policy, symbol: &str) -> Option<u128> {
+    let oracle = op["oracle_by_symbol"].get(symbol)?;
+    let price_e8: u128 = s(&oracle["price_e8"]).parse().unwrap();
+    fresh_price(
+        price_e8,
+        u(&oracle["at_ms"]),
+        u(&op["now_ms"]),
+        policy.oracle_max_age_s,
+    )
+}
+
+/// The symbol of the order's asset, if the policy lists it.
+fn symbol_of(policy: &Policy, order: &HlOrder) -> Option<String> {
+    policy
+        .hl_assets
+        .iter()
+        .find(|a| a.index == order.asset)
+        .map(|a| a.symbol.clone())
+}
+
+/// With the vectors' oracle prices as references every row ends as the file says: the band edges
+/// pass, the stale and missing prices are `E_ORACLE_STALE`, the band is `E_PRICE_BAND`.
 #[test]
-fn every_order_policy_row_without_an_oracle_matches() {
+fn every_order_policy_row_matches_with_the_vector_oracle() {
     let doc = doc();
     let op = &doc["order_policy"];
     let policy = vector_policy(&op["policy"]);
@@ -457,22 +491,15 @@ fn every_order_policy_row_without_an_oracle_matches() {
     let cases = op["cases"].as_array().unwrap();
     assert_eq!(cases.len(), 22);
     let mut f = Failures::default();
-    let mut oracle_rows = 0;
+    let mut codes = Vec::new();
     for case in cases {
         let name = s(&case["name"]);
         let order: HlOrder = serde_json::from_value(case["order"].clone()).unwrap();
-        let got = check_order(&policy, &order);
+        let reference =
+            symbol_of(&policy, &order).and_then(|sym| vector_reference(op, &policy, &sym));
+        let got = check_order(&policy, &order, reference);
         let want = &case["expect"];
-        let code = want["code"].as_str();
-        if matches!(code, Some("E_PRICE_BAND" | "E_ORACLE_STALE")) {
-            oracle_rows += 1;
-            f.eq(
-                name,
-                "handed to the oracle step",
-                got.map(|c| c.unpriced).map_err(|r| r.code),
-                Ok(false),
-            );
-        } else if want["ok"].as_bool().unwrap() {
+        if want["ok"].as_bool().unwrap() {
             let unpriced = want["unpriced"].as_bool().unwrap();
             f.eq(
                 name,
@@ -481,15 +508,48 @@ fn every_order_policy_row_without_an_oracle_matches() {
                 Ok(unpriced),
             );
         } else {
-            f.eq(
-                name,
-                "code",
-                got.map(|_| ()).map_err(|r| r.code),
-                Err(code.unwrap()),
-            );
+            let code = s(&want["code"]);
+            codes.push(code);
+            f.eq(name, "code", got.map(|_| ()).map_err(|r| r.code), Err(code));
         }
     }
-    // Two band edges and two stale or missing prices wait for day 6.
-    assert_eq!(oracle_rows, 4);
+    let count = |c: &str| codes.iter().filter(|x| **x == c).count();
+    assert_eq!((count("E_PRICE_BAND"), count("E_ORACLE_STALE")), (2, 2));
     f.done(cases.len());
+}
+
+/// Without a stored price (the contract until C6), a priced order that the vectors pass is
+/// `E_ORACLE_STALE`; refusals decided before the oracle, and unpriced orders, stay as they are.
+#[test]
+fn without_an_oracle_every_priced_row_that_passes_is_stale() {
+    let doc = doc();
+    let op = &doc["order_policy"];
+    let policy = vector_policy(&op["policy"]);
+    let mut f = Failures::default();
+    let mut flipped = 0;
+    for case in op["cases"].as_array().unwrap() {
+        let name = s(&case["name"]);
+        let order: HlOrder = serde_json::from_value(case["order"].clone()).unwrap();
+        let got = check_order(&policy, &order, None).map(|c| c.unpriced);
+        let want = &case["expect"];
+        let code = want["code"].as_str();
+        let priced_pass = want["ok"].as_bool().unwrap() && !want["unpriced"].as_bool().unwrap();
+        // A zero size and HYPE's notional are refused before any oracle is needed.
+        let decided_by_oracle = matches!(code, Some("E_PRICE_BAND" | "E_ORACLE_STALE"))
+            || (code == Some("E_SIZE")
+                && order.sz != "0"
+                && symbol_of(&policy, &order).as_deref() != Some("HYPE"));
+        let expected = if priced_pass || decided_by_oracle {
+            flipped += usize::from(priced_pass);
+            Err("E_ORACLE_STALE")
+        } else if let Some(code) = code {
+            Err(code)
+        } else {
+            Ok(true)
+        };
+        f.eq(name, "outcome", got.map_err(|r| r.code), expected);
+    }
+    // ETH and BTC inside the cap and the band, the two band edges, the reduce-only close.
+    assert_eq!(flipped, 6);
+    f.done(22);
 }
