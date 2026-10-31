@@ -961,3 +961,138 @@ fn check_shape(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fields of an IOC packet, encoded as Phoenix's SDK encodes them.
+    struct Packet {
+        side: u8,
+        price: Option<u64>,
+        lots: u64,
+        quote_lots: Option<u64>,
+        self_trade: u8,
+        flags: u8,
+        cancel_existing: u8,
+    }
+
+    fn option(out: &mut Vec<u8>, v: Option<u64>) {
+        match v {
+            None => out.push(0),
+            Some(x) => {
+                out.push(1);
+                out.extend(x.to_le_bytes());
+            }
+        }
+    }
+
+    impl Packet {
+        fn buy() -> Packet {
+            Packet {
+                side: 0,
+                price: Some(24_745),
+                lots: 50,
+                quote_lots: None,
+                self_trade: 1,
+                flags: 0,
+                cancel_existing: 0,
+            }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            let mut out = vec![self.side];
+            option(&mut out, self.price);
+            out.extend(self.lots.to_le_bytes());
+            option(&mut out, self.quote_lots);
+            out.extend(0u64.to_le_bytes()); // minBaseLotsToFill
+            out.extend(0u64.to_le_bytes()); // minQuoteLotsToFill
+            out.push(self.self_trade);
+            option(&mut out, None); // matchLimit
+            out.extend(7u128.to_le_bytes()); // clientOrderId
+            option(&mut out, Some(300_000_000)); // lastValidSlot
+            out.push(self.flags);
+            out.push(self.cancel_existing);
+            out
+        }
+    }
+
+    fn refused(bytes: &[u8]) -> String {
+        match decode_ioc(bytes, 2) {
+            Ok(_) => panic!("decoded"),
+            Err(r) => {
+                assert_eq!(r.code, E_SOL_PROGRAM);
+                r.msg
+            }
+        }
+    }
+
+    #[test]
+    fn an_ioc_packet_decodes_to_side_price_lots_and_reduce_only() {
+        let ioc = decode_ioc(&Packet::buy().bytes(), 2).unwrap();
+        assert!(ioc.bid && !ioc.reduce_only);
+        assert_eq!((ioc.price_in_ticks, ioc.num_base_lots), (Some(24_745), 50));
+        let close = Packet {
+            side: 1,
+            price: None,
+            flags: REDUCE_ONLY,
+            ..Packet::buy()
+        };
+        let ioc = decode_ioc(&close.bytes(), 2).unwrap();
+        assert!(!ioc.bid && ioc.reduce_only);
+        assert_eq!(
+            ioc.price_in_ticks, None,
+            "the policy refuses it, not the decoder"
+        );
+    }
+
+    #[test]
+    fn a_malformed_packet_is_refused() {
+        let malformed = "instruction 2: the order packet is malformed";
+        let good = Packet::buy().bytes();
+        for cut in [0, 1, 9, good.len() - 1] {
+            assert_eq!(refused(&good[..cut]), malformed, "cut at {cut}");
+        }
+        let mut long = good.clone();
+        long.push(0);
+        assert_eq!(refused(&long), malformed);
+        let mut bad_tag = good.clone();
+        bad_tag[1] = 2; // priceInTicks option tag
+        assert_eq!(refused(&bad_tag), malformed);
+        for p in [
+            Packet {
+                side: 2,
+                ..Packet::buy()
+            },
+            Packet {
+                self_trade: 3,
+                ..Packet::buy()
+            },
+            Packet {
+                cancel_existing: 2,
+                ..Packet::buy()
+            },
+        ] {
+            assert_eq!(refused(&p.bytes()), malformed);
+        }
+    }
+
+    #[test]
+    fn orders_are_sized_in_base_lots_with_no_flag_but_reduce_only() {
+        let quote = Packet {
+            quote_lots: Some(1),
+            ..Packet::buy()
+        };
+        assert!(refused(&quote.bytes()).contains("sized in quote lots"));
+        for flags in [0x01, 0x40, 0xc0, 0xff] {
+            let p = Packet {
+                flags,
+                ..Packet::buy()
+            };
+            assert!(
+                refused(&p.bytes()).contains("only reduce-only (0x80) may be set"),
+                "{flags:#04x}"
+            );
+        }
+    }
+}
