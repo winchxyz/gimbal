@@ -5,6 +5,7 @@ import { Detail } from './Detail.tsx';
 import {
   arrange,
   bestEnterable,
+  deskMissing,
   failedScan,
   heldWindow,
   inTab,
@@ -127,6 +128,7 @@ export function WindowsScreen() {
   const failed = failedScan(scan, all);
   const notices = (
     <Notices
+      noDesk={deskMissing(all)}
       failed={failed}
       held={held}
       reached={reached(alerts, all)}

@@ -22,7 +22,7 @@ import {
 } from './model.ts';
 import { Side } from './Side.tsx';
 import { JournalEmpty, JournalError, JournalLoading } from './States.tsx';
-import { useJournal } from './useJournal.ts';
+import { useJournal, type JournalData } from './useJournal.ts';
 import { useScrolled } from './useScrolled.ts';
 import './journal.css';
 
@@ -30,6 +30,7 @@ import './journal.css';
 export function JournalScreen() {
   const journal = useJournal();
   const desk = useStream((s) => s.desk);
+  const engineMode = useStream((s) => s.mode);
 
   if (journal.status === 'loading') return <JournalLoading />;
   if (journal.status === 'error') {
@@ -42,8 +43,8 @@ export function JournalScreen() {
       />
     );
   }
-  if (journal.entries.length === 0) return <JournalEmpty mode={desk?.mode ?? null} />;
-  return <JournalPage entries={journal.entries} desk={desk} />;
+  if (journal.entries.length === 0) return <JournalEmpty mode={desk?.mode ?? engineMode} />;
+  return <JournalPage entries={journal.entries} desk={desk} paging={journal} />;
 }
 
 const money = (value: number | null): string => (value === null ? '—' : signedUsd(value));
@@ -60,7 +61,7 @@ function download(name: string, text: string): void {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-function JournalPage({ entries, desk }: { entries: readonly JournalEntry[]; desk: DeskState | null }) {
+function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry[]; desk: DeskState | null; paging: Pick<JournalData, 'more' | 'older' | 'loadOlder'> }) {
   const windows = useStream((s) => s.windows);
   const now = useNow(30_000);
   const [filter, setFilter] = useState<FilterId>('all');
@@ -152,10 +153,36 @@ function JournalPage({ entries, desk }: { entries: readonly JournalEntry[]; desk
             <button type="button" className="j-more" onClick={() => setExpanded(true)}>
               {fold.range} · {fold.summary}. <span>Show</span>
             </button>
-          ) : null}
+          ) : (
+            <Older {...paging} />
+          )}
         </section>
         <Side entries={entries} desk={desk} windows={windows} />
       </div>
     </div>
   );
+}
+
+/**
+ * The end of the feed, once every entry held is on the page: a button for the next 100 older ones while the engine may
+ * have more (`GET /journal?before=`), why a page failed, or that the engine has nothing older. A page that fails
+ * changes nothing already shown.
+ */
+function Older({ more, older, loadOlder }: Pick<JournalData, 'more' | 'older' | 'loadOlder'>) {
+  if (older.status === 'error') {
+    return (
+      <p className="j-none" role="status">
+        Couldn’t load earlier events{older.error ? ` (${older.error})` : ''}. What is shown is unchanged, and the desk is unaffected.{' '}
+        <button type="button" className="btn quiet" onClick={loadOlder}>Try again</button>
+      </p>
+    );
+  }
+  if (more) {
+    return (
+      <button type="button" className="j-more" disabled={older.status === 'loading'} onClick={loadOlder}>
+        {older.status === 'loading' ? 'Loading earlier events…' : <span>Load earlier events</span>}
+      </button>
+    );
+  }
+  return older.paged ? <p className="j-none">That is every entry the engine holds.</p> : null;
 }

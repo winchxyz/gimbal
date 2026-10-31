@@ -92,7 +92,7 @@ function older(now: number, mode: Mode): JournalEntry[] {
       id: 'fake-j-withdraw',
       t: before(now, 0, 45, 42),
       kind: 'withdraw',
-      summary: '$50.00 sent to demo-owner.near through NEAR Intents',
+      summary: '$50.00 sent to your wallet through NEAR Intents',
       numbers: { usd: -50, feeUsd: -0.14 },
       tx: [near('Pp1d', 'Z7aw')],
     },

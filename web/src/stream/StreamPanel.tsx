@@ -16,7 +16,7 @@ const count = (n: number) => n.toLocaleString('en-US');
 /** What has arrived on the stream so far. Shown on every screen until the real screens replace it. */
 export function StreamPanel() {
   const s = useStream((state) => state);
-  const now = useNow();
+  const now = useNow(1000, 'page');
   const connection = CONNECTION[s.connection];
   const source = s.source === 'fake' ? 'Fake stream (development)' : 'Engine stream /events';
 

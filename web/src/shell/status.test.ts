@@ -37,7 +37,7 @@ const OPEN = [leg('hyperliquid', 'short', 6.8), leg('phoenix', 'long', 31.9)];
 const desk = (overrides: Partial<DeskState> = {}): DeskState => ({
   deskId: 'desk-07',
   owner: 'owner.near',
-  contract: 'gimbal.near',
+  contract: '(test contract)',
   mode: 'mainnet',
   legs: OPEN,
   netDelta: 0,

@@ -70,6 +70,8 @@ h1, h2, h3, p { margin: 0; font-weight: 400; }
 .notice b { color: var(--watch); font-weight: 500; flex: none; }
 .notice span { color: var(--ink-2); flex: 1; min-width: 0; }
 .notice .btn { height: 28px; flex: none; }
+.notice.ok { background: none; }
+.notice.ok b { color: var(--ink); }
 
 /* ---------- placeholder body (until each screen is built) ---------- */
 .ph { display: grid; grid-template-columns: minmax(0, 1fr) 400px; column-gap: var(--s-8); padding: 40px var(--gutter) var(--s-8); }

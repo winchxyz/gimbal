@@ -1,8 +1,13 @@
-// The engine's HTTP reads the screens need (docs/interfaces.md §2): `GET /strategy`, `GET /windows/history?id=`
-// and `GET /state` (for the Journal's backlog). This is the seam: a screen only sees `EngineApi`, so swapping the
-// fake for the engine changes one place (`engineApi()` in start.ts). Pure apart from `fetch`, so the parsers are tested.
-import type { JournalEntry, StrategyConfig, WindowHistory } from '@gimbal/shared';
+// The engine's HTTP side (docs/interfaces.md §2) as the screens use it: `GET /strategy`, `GET /windows/history?id=`,
+// `GET /state`, `GET /journal?before=`, `POST /rotate` and `POST /close`. This is the seam: a screen only sees
+// `EngineApi`, so the fake and the engine look alike to it, and `engineApi()` in start.ts picks one. Pure apart from
+// `fetch`, so the parsers are tested.
+import type { EngineState, JournalEntry, Mode, StrategyConfig, WindowHistory } from '@gimbal/shared';
 import { KINDS } from '../journal/kinds.ts';
+import { isStreamData, type StreamType } from './store.ts';
+
+/** What `POST /rotate` and `POST /close` answer at once: done, or refused with the reason a check gave. */
+export type ActionResult = { ok: true } | { ok: false; reason: string };
 
 export interface EngineApi {
   /** The owner's engine rules, as `GET /strategy` returns them. */
@@ -11,7 +16,16 @@ export interface EngineApi {
   windowHistory(id: string): Promise<WindowHistory>;
   /** The most recent journal entries the engine holds (`EngineState.journal`), newest first, at most 100. */
   journal(): Promise<JournalEntry[]>;
+  /** Up to 100 entries older than `before`, newest first; `[]` past the oldest or for an id the engine no longer holds. */
+  journalBefore(before: string): Promise<JournalEntry[]>;
+  /** Manual override: close the held window and open this one. Rejects when the engine does not answer. */
+  rotate(windowId: string): Promise<ActionResult>;
+  /** Close both legs with reduce-only orders. Rejects when the engine does not answer. */
+  close(): Promise<ActionResult>;
 }
+
+/** How many entries the engine sends per page (`GET /state`, `GET /journal?before=`): a shorter page is the last. */
+export const JOURNAL_PAGE = 100;
 
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null;
 const isNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
@@ -53,13 +67,10 @@ export function parseHistory(value: unknown): WindowHistory {
 
 const CHAINS = ['near', 'hyperliquid', 'solana', 'arbitrum'] as const;
 
-/** Checks the `journal` of `GET /state`; throws with what is wrong, so the screen can say so. */
-export function parseJournal(value: unknown): JournalEntry[] {
-  if (!isObject(value)) throw new Error('GET /state: not an object');
-  const { journal } = value;
-  if (!Array.isArray(journal)) throw new Error('GET /state: journal is not an array');
-  return journal.map((item: unknown, at) => {
-    const where = `GET /state: journal[${at}]`;
+/** Checks a list of journal entries; `source` names where it came from, so an error says what to look at. */
+function parseEntries(list: unknown[], source: string): JournalEntry[] {
+  return list.map((item: unknown, at) => {
+    const where = `${source}[${at}]`;
     if (!isObject(item)) throw new Error(`${where} is not an object`);
     const { id, t, kind, summary, why, numbers, tx } = item;
     if (typeof id !== 'string' || id.length === 0) throw new Error(`${where} has no id`);
@@ -84,10 +95,97 @@ export function parseJournal(value: unknown): JournalEntry[] {
   });
 }
 
+/** Checks the `journal` of `GET /state`; throws with what is wrong, so the screen can say so. */
+export function parseJournal(value: unknown): JournalEntry[] {
+  if (!isObject(value)) throw new Error('GET /state: not an object');
+  const { journal } = value;
+  if (!Array.isArray(journal)) throw new Error('GET /state: journal is not an array');
+  return parseEntries(journal, 'GET /state: journal');
+}
+
+/** Checks the body of `GET /journal?before=`: a list of entries, possibly empty. */
+export function parseJournalPage(value: unknown): JournalEntry[] {
+  if (!Array.isArray(value)) throw new Error('GET /journal: not an array');
+  return parseEntries(value, 'GET /journal: entry');
+}
+
+const MODES: readonly string[] = ['replay', 'testnet', 'mainnet'] satisfies Mode[];
+const STATE_SLOTS = ['windows', 'scan', 'desk', 'rescue', 'setup', 'health'] as const satisfies readonly StreamType[];
+
+/**
+ * Checks the body of `GET /state`. The journal is read entry by entry and the strategy field by field; each of the
+ * other latest values only has its envelope checked (a list for `windows`, an object for the rest), as an SSE
+ * message does: the engine is typed against the same shared types. `null` is "not produced yet".
+ */
+export function parseEngineState(value: unknown): EngineState {
+  if (!isObject(value)) throw new Error('GET /state: not an object');
+  const { mode, strategy, at } = value;
+  if (typeof mode !== 'string' || !MODES.includes(mode)) throw new Error('GET /state: mode is not replay, testnet or mainnet');
+  if (!isNumber(at)) throw new Error('GET /state: at is not a number');
+  const slots: Record<string, unknown> = {};
+  for (const slot of STATE_SLOTS) {
+    const data = value[slot] ?? null;
+    if (data !== null && !isStreamData(slot, data)) {
+      throw new Error(`GET /state: ${slot} is not ${slot === 'windows' ? 'a list' : 'an object'}`);
+    }
+    slots[slot] = data;
+  }
+  return {
+    mode: mode as Mode,
+    at,
+    strategy: strategy === null || strategy === undefined ? null : parseStrategy(strategy),
+    journal: parseJournal(value),
+    ...slots,
+  } as EngineState;
+}
+
+const NO_REASON = 'the engine did not say why';
+
+/**
+ * Reads the answer to `POST /rotate` or `POST /close` (`{ ok: true }` or `{ ok: false, reason }`). The engine's own
+ * refusals of a request (`{ error }`: a foreign origin, a body that is not JSON) are read as refusals too. Anything
+ * else is not an answer, and throws.
+ */
+export function parseActionResult(status: number, body: unknown, route: string): ActionResult {
+  if (isObject(body)) {
+    if (body.ok === true && status < 300) return { ok: true };
+    if (body.ok === false) {
+      const reason = typeof body.reason === 'string' && body.reason.trim() !== '' ? body.reason.trim() : NO_REASON;
+      return { ok: false, reason };
+    }
+    if (typeof body.error === 'string' && body.error.trim() !== '') return { ok: false, reason: body.error.trim() };
+  }
+  throw new Error(`POST ${route}: ${status} and no { ok } in the answer`);
+}
+
+/** How long a request waits for the engine before it counts as not answering. */
+export const REQUEST_TIMEOUT_MS = 10_000;
+
 async function getJson(url: string): Promise<unknown> {
-  const response = await fetch(url, { headers: { accept: 'application/json' } });
+  const response = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
   if (!response.ok) throw new Error(`GET ${url.split('?')[0]}: ${response.status}`);
   return response.json();
+}
+
+async function postJson(url: string, body: unknown): Promise<ActionResult> {
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+  } catch {
+    throw new Error(`POST ${url}: the engine did not answer`);
+  }
+  const answer: unknown = await response.json().catch(() => null);
+  return parseActionResult(response.status, answer, url);
+}
+
+/** `GET /state`: what the stream seeds from each time it connects. */
+export async function readEngineState(base = ''): Promise<EngineState> {
+  return parseEngineState(await getJson(`${base}/state`));
 }
 
 /** The real engine, through the dev proxy or the same origin in production. */
@@ -96,5 +194,8 @@ export function httpApi(base = ''): EngineApi {
     strategy: async () => parseStrategy(await getJson(`${base}/strategy`)),
     windowHistory: async (id) => parseHistory(await getJson(`${base}/windows/history?id=${encodeURIComponent(id)}`)),
     journal: async () => parseJournal(await getJson(`${base}/state`)),
+    journalBefore: async (before) => parseJournalPage(await getJson(`${base}/journal?before=${encodeURIComponent(before)}`)),
+    rotate: (windowId) => postJson(`${base}/rotate`, { windowId }),
+    close: () => postJson(`${base}/close`, {}),
   };
 }

@@ -1,21 +1,21 @@
 import { useState } from 'react';
 import { cx } from '../ui/cx.ts';
 import { notify } from '../ui/notice.ts';
+import { sendManual } from '../windows/useEngine.ts';
 import type { ActionId, StatusActionsView } from './status.ts';
 
-// None of these is connected yet: pausing and resuming are the owner's wallet signing `set_paused`, closing is
-// `POST /close`, and adding margin is a transfer the owner signs. Each says so and changes nothing.
-const NOT_SENT: Record<ActionId, string> = {
+// None of these is connected yet: pausing and resuming are the owner's wallet signing `set_paused`, and adding margin
+// is a transfer the owner signs. Each says so and changes nothing. Closing is the engine's `POST /close`.
+const NOT_SENT: Record<Exclude<ActionId, 'close'>, string> = {
   auto: 'Changing Auto is not connected to the engine yet. Nothing changed.',
   pause: 'Pausing is signed in your wallet, and wallet signing is not connected yet. Nothing changed.',
   resume: 'Resuming is signed in your wallet, and wallet signing is not connected yet. Nothing changed.',
-  close: 'Closing is not connected to the engine yet. Both legs are still open.',
   'add-margin': 'Adding margin is not connected to your wallet yet. Nothing changed.',
 };
 
 /**
  * The owner's buttons for the current state. Closing asks first, in place, as the Windows screen does;
- * the others say "Not sent". `className` lets the status line and the phone's page share one component.
+ * the others say "Not sent", and Close sends `POST /close` and says what the engine answered. `className` lets the status line and the phone's page share one component.
  */
 export function StatusActions({ view, className, skip }: { view: StatusActionsView; className?: string; skip?: readonly ActionId[] }) {
   const [asking, setAsking] = useState(false);
@@ -32,7 +32,7 @@ export function StatusActions({ view, className, skip }: { view: StatusActionsVi
           className="btn primary"
           onClick={() => {
             setAsking(false);
-            notify(NOT_SENT.close);
+            void sendManual({ kind: 'close', symbol: null }).then((o) => notify(o.text, o.title, o.tone === 'sent' ? 'ok' : 'warn'));
           }}
         >
           Close position

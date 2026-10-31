@@ -21,7 +21,9 @@ const CONNECTING: Record<Connection, string> = {
 export function Header({ screen }: { screen: ScreenId }) {
   const desk = useStream((s) => s.desk);
   const connection = useStream((s) => s.connection);
-  const mode = desk?.mode ?? null;
+  const engineMode = useStream((s) => s.mode);
+  // The desk names its network; before a desk exists the engine still knows which one it runs on (`GET /state`).
+  const mode = desk?.mode ?? engineMode;
 
   return (
     <header className="hdr">

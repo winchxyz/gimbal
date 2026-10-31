@@ -92,6 +92,9 @@ export function list(items: readonly string[]): string {
   return `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
 }
 
+/** `no price` becomes `No price`. */
+export const capital = (text: string): string => text.charAt(0).toUpperCase() + text.slice(1);
+
 /** One sentence from a reason that may or may not end in a full stop. */
 export function sentence(text: string): string {
   const t = text.trim();

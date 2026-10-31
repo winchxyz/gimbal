@@ -1,10 +1,12 @@
-// The Windows screen's two engine reads, as hooks: the owner's strategy (`GET /strategy`) and the 7-day
-// histories (`GET /windows/history`). They go through `engineApi()`, so the fake and the engine look the same here.
+// The engine reads the screens make besides the stream, as hooks: the owner's strategy (`GET /strategy`) and the
+// 7-day histories (`GET /windows/history`); and the two manual overrides (`POST /rotate`, `POST /close`). They go
+// through `engineApi()`, so the fake and the engine look the same here.
 import type { StrategyConfig } from '@gimbal/shared';
 import { useEffect, useRef, useSyncExternalStore } from 'react';
-import { createStore } from '../stream/hub.ts';
+import { createStore, useStream } from '../stream/hub.ts';
 import { engineApi } from '../stream/start.ts';
 import { needsHistory, reduceHistory, type HistoryState } from './history.ts';
+import { outcomeOf, type ManualAction, type Outcome } from './manual.ts';
 
 // ---------- strategy ----------
 
@@ -28,6 +30,8 @@ const strategyStore = createStore<StrategyState, StrategyAction>(
 const STRATEGY_REFRESH_MS = 30_000;
 
 export function useStrategy(): StrategyState {
+  // Ask again when the stream (re)connects: a restarted engine has its own rules, and a failed read should not wait out the refresh.
+  const connected = useStream((s) => s.connection === 'open');
   useEffect(() => {
     let stopped = false;
     const load = async () => {
@@ -44,7 +48,7 @@ export function useStrategy(): StrategyState {
       stopped = true;
       clearInterval(timer);
     };
-  }, []);
+  }, [connected]);
   return useSyncExternalStore(strategyStore.subscribe, strategyStore.getState);
 }
 
@@ -85,4 +89,16 @@ export function useHistories(ids: readonly string[]): HistoryState {
 /** Asks again for one window's history now, from the chart's "Try again". */
 export function retryHistory(id: string): void {
   void loadHistory(id);
+}
+
+// ---------- manual overrides ----------
+
+/** Sends Rotate or Close to the engine and says what came of it; it never throws. */
+export async function sendManual(action: ManualAction): Promise<Outcome> {
+  try {
+    const api = await engineApi();
+    return outcomeOf(action, action.kind === 'rotate' ? await api.rotate(action.windowId) : await api.close());
+  } catch (error) {
+    return outcomeOf(action, error instanceof Error ? error : new Error(String(error)));
+  }
 }

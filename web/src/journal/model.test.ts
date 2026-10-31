@@ -195,6 +195,17 @@ test('new entries wait for a reader who has scrolled down, and show at once at t
   assert.deepEqual(visibleFeed([], seen), { shown: [], pending: 0 });
 });
 
+test('an older page the reader asked for shows at once, even while newer entries wait', () => {
+  const entries = MOCKUP.slice(0, 5);
+  const seen = new Set(entries.slice(2, 4).map((e) => e.id)); // x1 and r1 were on screen; f2 is the older page that just arrived
+  const held = visibleFeed(entries, seen);
+  assert.deepEqual(held.shown.map((e) => e.id), ['x1', 'r1', 'f2']);
+  assert.equal(held.pending, 2, 'f1 and v1 are newer than anything shown, so they still wait');
+  assert.deepEqual(visibleFeed(entries.slice(2), seen).pending, 0);
+  // nothing was on screen yet: every entry is new to the reader
+  assert.deepEqual(visibleFeed(entries, new Set()), { shown: [], pending: 5 });
+});
+
 test('the read and the stream merge by id, newest first, and the stream’s copy wins', () => {
   const a = entry({ id: 'a', t: at(27, 10), summary: 'read' });
   const b = entry({ id: 'b', t: at(27, 12) });
@@ -204,10 +215,14 @@ test('the read and the stream merge by id, newest first, and the stream’s copy
   assert.deepEqual(merged.map((e) => e.id), ['c', 'b', 'a']);
   assert.equal(merged[2]?.summary, 'stream');
   assert.deepEqual(mergeEntries([], []), []);
+});
+
+test('older pages are never cut away: a reader who asked for them keeps them', () => {
   const many = Array.from({ length: JOURNAL_LIMIT + 5 }, (_, i) => entry({ id: `m${i}`, t: i }));
-  const cut = mergeEntries(many, []);
-  assert.equal(cut.length, JOURNAL_LIMIT);
-  assert.equal(cut[0]?.id, `m${JOURNAL_LIMIT + 4}`);
+  const all = mergeEntries(many, []);
+  assert.equal(all.length, JOURNAL_LIMIT + 5);
+  assert.equal(all[0]?.id, `m${JOURNAL_LIMIT + 4}`);
+  assert.equal(all[all.length - 1]?.id, 'm0');
 });
 
 test('the counts: actions the contract signed, refusals and vetoes', () => {
@@ -262,7 +277,7 @@ test('the line under the net says where the held window stands against its entry
   const desk = (pnl: DeskState['pnl'], legs: DeskState['legs']): DeskState => ({
     deskId: 'desk-07',
     owner: 'o.testnet',
-    contract: 'c.testnet',
+    contract: '(test contract)',
     mode: 'mainnet',
     legs,
     netDelta: 0,

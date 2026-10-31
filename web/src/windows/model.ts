@@ -1,7 +1,7 @@
 // What the Windows list shows and in which order. Pure functions over the shared `Window` type, so the
 // rules in design/HANDOFF.md (Windows) are tested without a browser.
 import type { ScanStatus, Window as FundingWindow } from '@gimbal/shared';
-import { list, sentence, venueName } from './format.ts';
+import { capital, list, sentence, venueName } from './format.ts';
 
 export type Tab = 'tradable' | 'watch';
 
@@ -24,11 +24,23 @@ export const inTab = (windows: readonly FundingWindow[], tab: Tab): FundingWindo
 /** A window the desk could open now: tradable, and neither refused by the contract nor vetoed by NEAR AI. */
 export const isEnterable = (w: FundingWindow): boolean => w.tradable && !w.refused && w.veto?.verdict !== 'veto';
 
+/** The engine's refusal of every desk window while no desk (no policy) is loaded (docs/interfaces.md §2, `Window.refused`). */
+export const NO_DESK = 'E_NO_DESK';
+
+/** Refused only because there is no desk to trade it with: nothing is wrong with the window itself. */
+export const isNoDesk = (w: FundingWindow): boolean => w.refused?.code === NO_DESK;
+
+/**
+ * No desk is loaded: the engine says so on its windows, since `DeskState` stays null both before a desk exists and
+ * while the first one is still being read. Null windows (nothing scanned yet) say nothing.
+ */
+export const deskMissing = (windows: readonly FundingWindow[] | null): boolean => windows?.some(isNoDesk) ?? false;
+
 /** Under the owner's minimum: shown below the rule at 40% opacity. Watch-only rows have no net to compare. */
 export const isBelow = (w: FundingWindow, minimum: number | null): boolean =>
   w.tradable && minimum !== null && w.netAprPct < minimum;
 
-export type StatusKind = 'held' | 'refused' | 'veto' | 'watch' | 'none';
+export type StatusKind = 'held' | 'refused' | 'nodesk' | 'veto' | 'watch' | 'none';
 
 export interface RowStatus {
   kind: StatusKind;
@@ -55,6 +67,8 @@ const withReason = (word: string, reason: string): string => (reason ? `${word} 
 export function rowStatus(w: FundingWindow): RowStatus {
   const plainStatus = (kind: StatusKind, text: string): RowStatus => ({ kind, text, compact: text });
   if (w.held) return plainStatus('held', 'Held');
+  // Every desk window carries this one while no desk exists: a calm word, because the list explains it once above.
+  if (isNoDesk(w)) return { kind: 'nodesk', text: 'No desk yet', compact: 'No desk' };
   if (w.refused) {
     const text = withReason('Refused', w.refused.reason.trim());
     const short = REFUSAL_SHORT[w.refused.code];
@@ -123,6 +137,8 @@ export function bestEnterable(windows: readonly FundingWindow[]): FundingWindow 
  */
 export function isEmpty(windows: readonly FundingWindow[], minimum: number | null): boolean {
   if (minimum === null) return false;
+  // With no desk nothing can be entered, so "nothing clears your minimum" would be the wrong reason: show the list.
+  if (deskMissing(windows)) return false;
   if (windows.some((w) => w.held)) return false;
   return !windows.some((w) => isEnterable(w) && w.netAprPct >= minimum);
 }
@@ -192,8 +208,6 @@ export interface CheckLine {
   blocking: boolean;
 }
 
-const capital = (text: string): string => text.charAt(0).toUpperCase() + text.slice(1);
-
 /**
  * The lines under "Checks": NEAR AI's verdict, the contract's refusal if there is one, then what the engine
  * checked (`Window.checks`). The first failing line is marked as the reason the window is not entered.
@@ -208,7 +222,12 @@ export function checkLines(w: FundingWindow): CheckLine[] {
         : { ok: true, text: said ? `NEAR AI: ${said}` : 'NEAR AI passed it.' },
     );
   }
-  if (w.refused) lines.push({ ok: false, text: `The contract would refuse it (${w.refused.code}): ${capital(w.refused.reason)}` });
+  // No desk is not the contract's verdict on this window; the engine's own check line already says it.
+  if (isNoDesk(w)) {
+    if (!w.checks.some((c) => !c.ok)) lines.push({ ok: false, text: 'There is no desk to trade it with yet, so nothing can be entered.' });
+  } else if (w.refused) {
+    lines.push({ ok: false, text: `The contract would refuse it (${w.refused.code}): ${capital(w.refused.reason)}` });
+  }
   lines.push(...w.checks);
   const blocking = lines.findIndex((l) => !l.ok);
   return lines.map((l, i) => ({ ...l, blocking: i === blocking }));

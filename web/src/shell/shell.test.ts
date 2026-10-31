@@ -25,7 +25,7 @@ const leg = (venue: Leg['venue'], side: Leg['side'], distanceToLiqPct: number | 
 const desk = (health: DeskState['health'], legs: Leg[]): DeskState => ({
   deskId: 'd1',
   owner: 'o.testnet',
-  contract: 'c.testnet',
+  contract: '(test contract)',
   mode: 'testnet',
   legs,
   netDelta: 0,

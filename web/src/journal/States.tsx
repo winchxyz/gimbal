@@ -146,6 +146,7 @@ export interface ErrorProps {
 /** The journal could not be read (design/HANDOFF.md, Journal: Error): what failed, that the desk is unaffected, what to do. */
 export function JournalError({ error, at, contract, onRetry }: ErrorProps) {
   const when = at === null ? '' : ` at ${clock(at)} UTC`;
+  const explorer = contract ? contractUrl(contract.account, contract.mode) : null;
   const why = error ? ` (${error})` : '';
   return (
     <div className="j-state">
@@ -160,8 +161,8 @@ export function JournalError({ error, at, contract, onRetry }: ErrorProps) {
           <button type="button" className="btn primary" onClick={onRetry}>
             Try again
           </button>
-          {contract ? (
-            <a className="btn quiet" href={contractUrl(contract.account, contract.mode)} target="_blank" rel="noreferrer noopener">
+          {explorer ? (
+            <a className="btn quiet" href={explorer} target="_blank" rel="noreferrer noopener">
               Open the NEAR explorer
             </a>
           ) : null}

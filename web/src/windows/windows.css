@@ -12,15 +12,18 @@
 /* list header: tabs, then the live marker pushed to the right */
 .w-head { position: sticky; top: 0; z-index: 2; background: var(--bg); height: 64px; padding: 0 var(--s-6) 0 var(--gutter); display: flex; align-items: center; gap: var(--s-5); border-bottom: 1px solid var(--line); font: var(--t-s); }
 .w-title { display: none; }
-.w-tabs { display: flex; gap: var(--s-5); }
+.w-tabs { display: flex; gap: var(--s-5); flex: none; white-space: nowrap; }
 .w-tab { color: var(--ink-2); font: inherit; transition: color var(--dur) var(--ease); }
 .w-tab:hover, .w-tab.on { color: var(--ink); }
-.w-live { margin: 0 0 0 auto; color: var(--ink-2); white-space: nowrap; }
+.w-live { margin: 0 0 0 auto; color: var(--ink-2); white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 
 /* amber lines under the header: venues that did not answer, a fired alert, a minimum that could not be read */
 .w-notice { display: flex; gap: var(--s-4); align-items: baseline; padding: 14px var(--s-6) 14px var(--gutter); border-bottom: 1px solid var(--line); background: rgba(240, 165, 49, .08); font: var(--t-s); }
 .w-notice b { color: var(--watch); font-weight: 500; }
 .w-notice span { color: var(--ink-2); }
+/* A fact, not a risk: no desk is loaded. Colour is for state, so it is plain. */
+.w-notice.calm { background: none; }
+.w-notice.calm b { color: var(--ink); white-space: nowrap; flex: none; }
 
 /* ---------- rows ---------- */
 .w-rows { position: relative; }
