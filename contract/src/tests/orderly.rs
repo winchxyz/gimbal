@@ -41,7 +41,7 @@ fn u(v: &Value) -> u64 {
         .unwrap()
 }
 
-/// The vector symbols, unpriced (no prices are stored until C6), up to 10 units and 1000 USD.
+/// The vector symbols, unpriced (these tests store no prices), up to 10 units and 1000 USD.
 fn orderly_policy() -> Policy {
     let unpriced = |s: &str| UnpricedAsset {
         symbol: s.into(),
@@ -670,5 +670,168 @@ fn the_vector_signatures_pass_on_signed() {
             "signed",
             r#"{"desk_id":"alpha","request_id":11,"venue":"orderly","kind":"Withdraw","amount":"5","reason_sha256":null}"#
         )]
+    );
+}
+
+// --- the Orderly receiver and the key's IP list ---
+
+const RECEIVER: &str = "0xc48b812bb43401392c037381aca934f4069c0517";
+
+#[test]
+fn the_owner_pins_the_orderly_receiver_once() {
+    let mut g = orderly_desk();
+    for who in [operator(), stranger()] {
+        call(who, storage_deposit());
+        assert_refused("E_NOT_ALLOWED: ", || {
+            g.set_orderly_receiver("alpha".into(), RECEIVER.into())
+        });
+    }
+    called_by(owner());
+    assert_refused("E_NOT_ALLOWED: ", || {
+        g.set_orderly_receiver("alpha".into(), RECEIVER.into())
+    });
+    for bad in [
+        "0xC48b812bb43401392c037381aca934f4069c0517",
+        "c48b812bb43401392c037381aca934f4069c0517",
+        "0xc48b812bb43401392c037381aca934f4069c05",
+    ] {
+        call(owner(), storage_deposit());
+        assert_refused("E_ARGS: ", || {
+            g.set_orderly_receiver("alpha".into(), bad.into())
+        });
+    }
+    call(owner(), storage_deposit());
+    assert_refused(&format!("{E_NO_DESK}: "), || {
+        g.set_orderly_receiver("beta".into(), RECEIVER.into())
+    });
+    assert_eq!(g.get_desk("alpha".into()).unwrap().orderly_receiver, None);
+
+    call(owner(), storage_deposit());
+    let before = env::storage_usage();
+    g.set_orderly_receiver("alpha".into(), RECEIVER.into());
+    assert_eq!(
+        kept(storage_deposit()),
+        cost_of(env::storage_usage() - before).max(yocto(1))
+    );
+    assert_eq!(
+        get_logs(),
+        vec![event(
+            "orderly_receiver_set",
+            &format!(r#"{{"desk_id":"alpha","receiver":"{RECEIVER}"}}"#)
+        )]
+    );
+    assert_eq!(
+        g.get_desk("alpha".into())
+            .unwrap()
+            .orderly_receiver
+            .as_deref(),
+        Some(RECEIVER)
+    );
+    // Pinned for good: not even the same address again, and a pause changes nothing.
+    for receiver in [RECEIVER, OTHER_EVM] {
+        call(owner(), storage_deposit());
+        assert_refused(
+            "E_ARGS: desk alpha has its Orderly receiver pinned already",
+            || g.set_orderly_receiver("alpha".into(), receiver.into()),
+        );
+    }
+    // Short of its storage, on a fresh chain (the mock keeps what this one wrote).
+    std::thread::spawn(|| {
+        let mut g = orderly_desk();
+        call(owner(), yocto(1));
+        assert_refused("E_DEPOSIT: ", || {
+            g.set_orderly_receiver("alpha".into(), RECEIVER.into())
+        });
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn ip_restriction_signs_the_owners_list_and_passes_a_paused_desk() {
+    let mut g = orderly_desk();
+    let t = 1_793_491_260_000;
+    let req = |t: u64| -> OrderlyRequest {
+        serde_json::from_value(json!({ "kind": "ip_restriction", "timestamp_ms": t })).unwrap()
+    };
+    // No list yet: nothing to apply, and get_desk shows an empty one.
+    let msg = request(&mut g, operator(), req(t)).unwrap_err();
+    assert!(msg.starts_with("E_ARGS: the owner set no IP list"), "{msg}");
+    let view = serde_json::to_value(g.get_desk("alpha".into()).unwrap()).unwrap();
+    assert_eq!(view["orderly_ips"], json!([]));
+
+    let ips: Vec<String> = vec!["203.0.113.7".into(), "2001:db8::1".into()];
+    for who in [operator(), stranger()] {
+        call(who, storage_deposit());
+        assert_refused("E_NOT_ALLOWED: ", || {
+            g.set_orderly_ips("alpha".into(), ips.clone())
+        });
+    }
+    called_by(owner());
+    assert_refused("E_NOT_ALLOWED: ", || {
+        g.set_orderly_ips("alpha".into(), ips.clone())
+    });
+    for bad in [
+        vec![],
+        vec!["203.0.113.7".to_string(), "203.0.113.7".into()],
+        vec!["203.0.113.7/32".to_string()],
+        (0..11).map(|i| format!("10.0.0.{i}")).collect(),
+    ] {
+        call(owner(), storage_deposit());
+        assert_refused("E_ARGS: ", || g.set_orderly_ips("alpha".into(), bad));
+    }
+    call(owner(), storage_deposit());
+    let before = env::storage_usage();
+    g.set_orderly_ips("alpha".into(), ips.clone());
+    assert_eq!(
+        kept(storage_deposit()),
+        cost_of(env::storage_usage() - before).max(yocto(1))
+    );
+    assert_eq!(
+        get_logs(),
+        vec![event(
+            "orderly_ips_set",
+            r#"{"desk_id":"alpha","ips":["203.0.113.7","2001:db8::1"]}"#
+        )]
+    );
+    // get_desk returns the list next to orderly_receiver.
+    let view = serde_json::to_value(g.get_desk("alpha".into()).unwrap()).unwrap();
+    assert_eq!(view["orderly_ips"], json!(ips));
+    let text = serde_json::to_string(&g.get_desk("alpha".into()).unwrap()).unwrap();
+    let receiver = text.find(r#""orderly_receiver":"#).unwrap();
+    let list = text.find(r#""orderly_ips":"#).unwrap();
+    let ledger = text.find(r#""ledger":"#).unwrap();
+    assert!(receiver < list && list < ledger, "{text}");
+
+    g.desks.get_mut("alpha").unwrap().paused = true;
+    let got = request(&mut g, operator(), req(t)).unwrap();
+    let body = r#"{"orderly_key":"ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB","ip_restriction_list":"203.0.113.7,2001:db8::1"}"#;
+    let message = format!("{t}POST/v1/client/set_orderly_key_ip_restriction{body}");
+    assert_eq!(
+        (got.venue.as_str(), got.kind.as_str()),
+        ("orderly", "ip_restriction")
+    );
+    assert_eq!(
+        serde_json::to_value(&got.payload).unwrap(),
+        json!({
+            "method": "POST",
+            "path": "/v1/client/set_orderly_key_ip_restriction",
+            "body": body,
+            "timestamp": t,
+            "message": message,
+        })
+    );
+    assert_eq!(
+        got.sign_request,
+        crate::mpc::SignRequest::sol("alpha", message.as_bytes())
+    );
+
+    // A new list replaces the old one; the next request signs it.
+    call(owner(), storage_deposit());
+    g.set_orderly_ips("alpha".into(), vec!["198.51.100.1".into()]);
+    let got = request(&mut g, owner(), req(t + 1)).unwrap();
+    assert_eq!(
+        serde_json::to_value(&got.payload).unwrap()["body"],
+        r#"{"orderly_key":"ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB","ip_restriction_list":"198.51.100.1"}"#
     );
 }

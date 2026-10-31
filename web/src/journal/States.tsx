@@ -1,4 +1,5 @@
 import type { Mode } from '@gimbal/shared';
+import { ONBOARDING_HREF } from '../shell/routes.ts';
 import { notify } from '../ui/notice.ts';
 import { clock, contractUrl } from './entry.ts';
 import { Filters } from './Filters.tsx';
@@ -112,17 +113,13 @@ export function JournalEmpty({ mode }: { mode: Mode | null }) {
         </p>
         {mode === 'replay' ? null : (
           <div className="go">
-            <button
-              type="button"
-              className="btn primary"
-              onClick={() => notify('Adding funds opens with onboarding, which is not built yet. Nothing changed.')}
-            >
+            <a className="btn primary" href={ONBOARDING_HREF}>
               {mode === 'testnet' ? 'Get test USDC' : 'Add funds'}
-            </button>
+            </a>
             <button
               type="button"
               className="btn"
-              onClick={() => notify('A replay starts from onboarding, which is not built yet. Nothing changed.')}
+              onClick={() => notify('A replay is a mode of the engine, started where the engine runs. Nothing changed.')}
             >
               Watch a replay
             </button>

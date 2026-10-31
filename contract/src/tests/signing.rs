@@ -133,6 +133,30 @@ fn vector_order() -> (HlOrder, u64, Value, Value) {
     (order, c["nonce"].as_u64().unwrap(), signature, p.clone())
 }
 
+/// `action` asking for the vector order's own testnet digest, the one its fixed-key signature
+/// signs. The contract's order adds `expiresAfter`, so its digest differs from the vector's; these
+/// tests are about `on_signed` checking an answer against the request, whatever the request is.
+fn with_vector_digest(mut action: UnsignedAction) -> UnsignedAction {
+    let c = super::hl::vectors()["l1"]["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["kind"] == "order" && c["params"]["builder_fee_tenth_bps"] == 10)
+        .unwrap()
+        .clone();
+    let mut digest = [0u8; 32];
+    hex::decode_to_slice(
+        c["testnet"]["digest"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches("0x"),
+        &mut digest,
+    )
+    .unwrap();
+    action.sign_request = crate::mpc::SignRequest::evm("alpha", &digest);
+    action
+}
+
 #[test]
 fn an_action_call_asks_the_mpc_to_sign_then_calls_on_signed() {
     let mut g = hl_desk_with(hl_policy());
@@ -223,7 +247,8 @@ fn on_signed_returns_the_signed_hyperliquid_order_and_logs_it() {
     let mut g = hl_desk_with(vector_policy());
     let (order, nonce, sig, p) = vector_order();
     at(operator(), nonce, yocto(0));
-    let action = g.prepare_hl_order("alpha".into(), order, "vector order".into());
+    let action =
+        with_vector_digest(g.prepare_hl_order("alpha".into(), order, "vector order".into()));
     let pending = Pending {
         request_id: 41,
         signer: VECTOR_DESK_EVM.into(),
@@ -269,7 +294,8 @@ fn on_signed_returns_a_high_s_answer_with_the_low_s() {
     let mut g = hl_desk_with(vector_policy());
     let (order, nonce, sig, _) = vector_order();
     at(operator(), nonce, yocto(0));
-    let action = g.prepare_hl_order("alpha".into(), order, "vector order".into());
+    let action =
+        with_vector_digest(g.prepare_hl_order("alpha".into(), order, "vector order".into()));
     let pending = Pending {
         request_id: 41,
         signer: VECTOR_DESK_EVM.into(),
@@ -287,14 +313,23 @@ fn on_signed_returns_a_high_s_answer_with_the_low_s() {
     );
     let high_s = "9548482c5fd9ad1323f9fbe9959f02f4318f5d4110b24500255458eb89ace13a";
     let low = secp_answer(r, s, v);
+    // R of the high-s form is the negated point: the same x, the other y parity, so the other
+    // prefix byte, as the MPC network writes it.
     let mut high = low.clone();
     high["s"]["scalar"] = json!(high_s);
     high["recovery_id"] = json!(1 - (v - 27));
+    high["big_r"]["affine_point"] = json!(format!(
+        "{:02x}{}",
+        3 - (v - 27),
+        r.trim_start_matches("0x")
+    ));
+    assert_ne!(high["big_r"], low["big_r"]);
     let signed = run_on_signed(&g, &pending, ok(&high)).unwrap();
     assert_eq!(
         serde_json::to_value(&signed.signature).unwrap(),
         low,
-        "s = n − s and the recovery id flipped; big_r as the MPC wrote it"
+        "s = n − s, the recovery id flipped and big_r's prefix with it, so big_r stays the point \
+         that recovery_id describes"
     );
     // A low s passes as it is.
     let signed = run_on_signed(&g, &pending, ok(&low)).unwrap();
@@ -313,12 +348,18 @@ fn on_signed_returns_a_high_s_answer_with_the_low_s() {
     };
     let half = "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0";
     assert_eq!(low_s(with_s(half)), with_s(half));
-    let MpcSignature::Secp256k1 { s, recovery_id, .. } = low_s(with_s(
+    let MpcSignature::Secp256k1 {
+        s,
+        recovery_id,
+        big_r,
+    } = low_s(with_s(
         "7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a1",
-    )) else {
+    ))
+    else {
         unreachable!()
     };
     assert_eq!((s.scalar.as_str(), recovery_id), (half, 1));
+    assert_eq!(big_r.affine_point, "03".to_owned() + &"11".repeat(32));
     let n = "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141";
     assert_eq!(low_s(with_s(n)), with_s(n));
     let mut at_n = low.clone();
@@ -425,7 +466,8 @@ fn on_signed_refuses_anything_but_the_desks_signature_of_the_request() {
     let mut g = hl_desk_with(vector_policy());
     let (order, nonce, sig, _) = vector_order();
     at(operator(), nonce, yocto(0));
-    let action: UnsignedAction = g.prepare_hl_order("alpha".into(), order, "vector".into());
+    let action: UnsignedAction =
+        with_vector_digest(g.prepare_hl_order("alpha".into(), order, "vector".into()));
     let evm = Pending {
         request_id: 1,
         signer: VECTOR_DESK_EVM.into(),

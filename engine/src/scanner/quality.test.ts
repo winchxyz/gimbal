@@ -43,7 +43,7 @@ test('thin: under 0.1M USD of 24 h volume names the leg; without volume, open in
   // HMSTR on Hyperliquid in the recorded sweep: 1.7M USD of open interest, but 22,701 USD traded in 24 h.
   const hmstr = leg('hyperliquid', 'HMSTR', { markPx: 0.000142, openInterest: 11_804_639_080, volume24hUsd: 22_701 });
   const q = quality([hmstr]);
-  assert.deepEqual(q.legFindings(hmstr), ['Thin: hyperliquid HMSTR traded $23k in 24 h, under the $100k floor']);
+  assert.deepEqual(q.legFindings(hmstr), ['Thin: Hyperliquid HMSTR traded $23k in 24 h, under the $100k floor']);
   // Exactly at the floor passes.
   const atFloor = w('aster', 'GTCUSDT', 0, { volume24hUsd: 100_000 });
   assert.deepEqual(quality([atFloor]).legFindings(atFloor), []);
@@ -52,19 +52,42 @@ test('thin: under 0.1M USD of 24 h volume names the leg; without volume, open in
   assert.deepEqual(quality([okx]).legFindings(okx), []);
   // A price with neither volume nor open interest: nothing shows it trades.
   const bare = w('paradex', 'X-USD-PERP', BASE, { volume24hUsd: null, openInterest: null });
-  assert.deepEqual(quality([bare]).legFindings(bare), ['Thin: paradex X-USD-PERP publishes neither 24 h volume nor open interest: nothing shows it trades']);
+  assert.deepEqual(quality([bare]).legFindings(bare), ['Thin: Paradex X-USD-PERP publishes neither 24 h volume nor open interest: nothing shows it trades']);
   assert.equal(DEFAULT_QUALITY.minVolume24hUsd, 100_000);
 });
 
-test('at the cap: a venue\'s own cap or floor, from the sourced table only', () => {
+test('at the cap: the market\'s own cap or floor from its venue\'s answer, each side alone, before the sourced table', () => {
+  // Gate's AGRIPPA_USDT in the recorded sweep: 0.02 per 4 h, exactly its funding_rate_limit of 0.02.
+  const agrippa = w('gate', 'AGRIPPA_USDT', 0.02 / 4, { fundingCapPerHour: 0.02 / 4, fundingFloorPerHour: -0.02 / 4 }, 'cex');
+  assert.deepEqual(quality([agrippa]).legFindings(agrippa), ['At the cap: Gate AGRIPPA_USDT reads 0.5 % per hour, its market\'s funding cap of 0.5 % per hour']);
+  // MEXC's KMISTOCK_USDT: -0.002 per 8 h on its floor of -0.002, with a cap of only 0.0002.
+  const kmi = w('mexc', 'KMISTOCK_USDT', -0.002 / 8, { base: 'KMI', fundingCapPerHour: 0.0002 / 8, fundingFloorPerHour: -0.002 / 8 }, 'cex');
+  assert.deepEqual(quality([kmi], MON_NY_OPEN).legFindings(kmi), ['At the cap: MEXC KMISTOCK_USDT reads -0.025 % per hour, its market\'s funding floor of -0.025 % per hour']);
+  // Under its own cap, a rate the table would not know either.
+  const under = w('kucoin', 'XUSDTM', 0.0029 / 8, { fundingCapPerHour: 0.003 / 8 }, 'cex');
+  assert.deepEqual(quality([under]).legFindings(under), []);
+  // The market's own limit wins over the table: a Lighter market whose answer says 1 % per hour is not capped at
+  // the table's 0.5 %.
+  const own = w('lighter', 'ABC', -0.005, { fundingFloorPerHour: -0.01 });
+  assert.deepEqual(quality([own]).legFindings(own), []);
+  // One side given, the other still comes from the table: a cap of its own, the table's floor.
+  const half = w('lighter', 'ABC', -0.005, { fundingCapPerHour: 0.01 });
+  assert.deepEqual(quality([half]).legFindings(half), ['At the cap: Lighter ABC reads -0.5 % per hour, its venue\'s funding floor of -0.5 % per hour']);
+  // A cap at or below zero, or a floor at or above it, is no limit: a quiet market would read "at the cap".
+  const zero = leg('mexc', 'Z_USDT', { fundingCapPerHour: 0, fundingFloorPerHour: 0 }, 'cex');
+  assert.equal(zero.fundingCapPerHour, undefined);
+  assert.equal(zero.fundingFloorPerHour, undefined);
+});
+
+test('at the cap: a venue\'s own cap or floor from the sourced table, where its answer gives none', () => {
   assert.deepEqual(FUNDING_LIMITS.hyperliquid, { all: { capPerHour: 0.04, floorPerHour: -0.04 } });
   assert.deepEqual(FUNDING_LIMITS.lighter!.all, { capPerHour: 0.005, floorPerHour: -0.005 });
   assert.deepEqual(FUNDING_LIMITS.lighter!.bySymbol!.ARC, { capPerHour: 0.025, floorPerHour: -0.025 });
   assert.deepEqual(FUNDING_LIMITS.lighter!.bySymbol!.SAMSUNG, { capPerHour: 0.000025, floorPerHour: -0.000025 });
   const capped = leg('hyperliquid', 'XYZ', { ratePerHour: 0.04 });
-  assert.deepEqual(quality([capped]).legFindings(capped), ['At the cap: hyperliquid XYZ reads 4 % per hour, its venue\'s funding cap of 4 % per hour']);
+  assert.deepEqual(quality([capped]).legFindings(capped), ['At the cap: Hyperliquid XYZ reads 4 % per hour, its venue\'s funding cap of 4 % per hour']);
   const floored = w('lighter', 'ABC', -0.005);
-  assert.deepEqual(quality([floored]).legFindings(floored), ['At the cap: lighter ABC reads -0.5 % per hour, its venue\'s funding floor of -0.5 % per hour']);
+  assert.deepEqual(quality([floored]).legFindings(floored), ['At the cap: Lighter ABC reads -0.5 % per hour, its venue\'s funding floor of -0.5 % per hour']);
   // ARC's own clamp is 20 % per 8 h: 0.5 % per hour is not its cap.
   const arc = w('lighter', 'ARC', 0.005);
   assert.deepEqual(quality([arc]).legFindings(arc), []);
@@ -78,7 +101,7 @@ test('at the cap: Q at -2 % per 4 h on five venues at once is a shared floor, no
   const q5 = venues.map((v) => w(v, `Q_${v}`, -0.02 / 4, { base: 'Q', settlement: '4h' }));
   const free = w('extended', 'Q-USD', -0.000155, { base: 'Q' });
   const q = quality([...q5, free]);
-  const line = 'At the cap: aster, bitget, gate, kucoin and mexc all read Q at exactly -0.5 % per hour: 5 venues sharing one rate to the digit is a funding cap or floor, not the market\'s premium';
+  const line = 'At the cap: Aster, Bitget, Gate, KuCoin and MEXC all read Q at exactly -0.5 % per hour: 5 venues sharing one rate to the digit is a funding cap or floor, not the market\'s premium';
   for (const l of q5) assert.deepEqual(q.legFindings(l), [line]);
   assert.deepEqual(q.legFindings(free), []);
   // A window of two capped legs says it once.
@@ -100,7 +123,7 @@ test('unconfirmed: a relayed rate needs a second source with data of its own bef
   const bybit = relayed('bybit', 'NIL', -0.00054035);
   const far = w('gate', 'NIL_USDT', -0.000132, { base: 'NIL' });
   const q = quality([binance, bybit, far]);
-  assert.deepEqual(q.legFindings(binance), ['Unconfirmed: binance NIL has no mark, open interest or history of its own, and no venue with data of its own reads NIL near -0.0559 % per hour']);
+  assert.deepEqual(q.legFindings(binance), ['Unconfirmed: Binance NIL has no mark, open interest or history of its own, and no venue with data of its own reads NIL near -0.0559 % per hour']);
   // A venue whose history the scanner reads has data of its own.
   assert.deepEqual(quality([binance], T0, (v) => v === 'binance').legFindings(binance), []);
 });
@@ -114,7 +137,7 @@ test('lone baseline: a relayed baseline reading against a crowd that agrees (BLU
   const bybit = relayed('bybit', 'BLUR', BASE);
   const q = quality([bybit, ...crowd]);
   // The crowd's median: (-0.000537 - 0.00049789) / 2 per hour.
-  assert.deepEqual(q.legFindings(bybit), ['Lone baseline: bybit BLUR reads the quiet 0.00125 % per hour while 6 other venues agree near -0.0517 % per hour: more likely a default than the market\'s rate']);
+  assert.deepEqual(q.legFindings(bybit), ['Lone baseline: Bybit BLUR reads the quiet 0.00125 % per hour while 6 other venues agree near -0.0517 % per hour: more likely a default than the market\'s rate']);
   assert.equal(perHour(-0.000517445), '-0.0517 % per hour');
   // Hyperliquid's own TRX at the pin against negative CEX rates is real carry: no finding.
   const hlTrx = leg('hyperliquid', 'TRX', { ratePerHour: BASE, volume24hUsd: 3e7 });
@@ -122,7 +145,7 @@ test('lone baseline: a relayed baseline reading against a crowd that agrees (BLU
   assert.deepEqual(quality([hlTrx, ...trxCrowd]).legFindings(hlTrx), []);
   // Three venues are no crowd: the relayed reading is then only unconfirmed.
   const small = quality([bybit, ...crowd.slice(0, 3)]);
-  assert.match(small.legFindings(bybit)[0]!, /^Unconfirmed: bybit BLUR/);
+  assert.match(small.legFindings(bybit)[0]!, /^Unconfirmed: Bybit BLUR/);
 });
 
 test('market hours: each exchange\'s session in its own time zone, summer time included', () => {
@@ -135,6 +158,19 @@ test('market hours: each exchange\'s session in its own time zone, summer time i
   assert.equal(inSession(ny, Date.UTC(2026, 10, 2, 14, 30)), true);
   assert.equal(inSession(ny, Date.UTC(2026, 10, 2, 21, 0)), false);   // 16:00 EST: closed
   assert.deepEqual(localTime(Date.UTC(2026, 9, 31, 2, 9), 'Asia/Seoul'), { day: 6, minutes: 11 * 60 + 9 });
+  // The Asian lunch breaks are closed, local time, on Monday 2 Nov. Hong Kong (UTC+8): 12:00-13:00 = 04:00-05:00 UTC.
+  const at = (h: number, m: number) => Date.UTC(2026, 10, 2, h, m);
+  const open = (code: string, times: [number, number][]) => times.map(([h, m]) => inSession(DEFAULT_QUALITY.stockExchanges[code]!, at(h, m)));
+  assert.deepEqual(open('HKEX', [[1, 29], [1, 30], [3, 59], [4, 0], [4, 59], [5, 0], [7, 59], [8, 0]]), [false, true, true, false, false, true, true, false]);
+  // Tokyo (UTC+9): 11:30-12:30 = 02:30-03:30 UTC, and the 15:30 close = 06:30 UTC.
+  assert.deepEqual(open('TSE', [[0, 0], [2, 29], [2, 30], [3, 29], [3, 30], [6, 29], [6, 30]]), [true, true, false, false, true, true, false]);
+  // Shanghai and Shenzhen (UTC+8): 11:30-13:00 = 03:30-05:00 UTC.
+  assert.deepEqual(open('SSE', [[1, 30], [3, 29], [3, 30], [4, 59], [5, 0], [6, 59], [7, 0]]), [true, true, false, false, true, true, false]);
+  // Seoul and Taipei trade through lunch (12:00 local = 03:00 and 04:00 UTC).
+  assert.deepEqual([...open('KRX', [[3, 0]]), ...open('TWSE', [[4, 0]])], [true, true]);
+  // Mumbai is UTC+5:30, a half-hour offset all year: 09:15-15:30 IST = 03:45-10:00 UTC, and no lunch break.
+  assert.deepEqual(open('NSE', [[3, 44], [3, 45], [6, 30], [9, 59], [10, 0]]), [false, true, true, true, false]);
+  assert.deepEqual(localTime(at(3, 45), 'Asia/Kolkata'), { day: 1, minutes: 9 * 60 + 15 });
   // The futures weekend: Friday 17:00 to Sunday 18:00 New York time.
   const wk = DEFAULT_QUALITY.traditionalWeekend;
   assert.equal(inTraditionalWeekend(wk, Date.UTC(2026, 10, 6, 21, 59)), false);  // Fri 16:59 EST
@@ -149,7 +185,7 @@ test('market closed: a stock perp, named so by a venue\'s own symbol, read while
   const aster = w('aster', 'SAMSUNGUSDT', 0, { base: 'SAMSUNG' });
   const mexc = w('mexc', 'SAMSUNGSTOCK_USDT', 0, { base: 'SAMSUNG' }, 'cex');
   const legs = [kraken, aster, mexc];
-  const line = 'Market closed: SAMSUNG is a stock perp (mexc SAMSUNGSTOCK_USDT) and KRX (Seoul), whose hours it keeps, is not in session at Sat 10:30 UTC: its rates are not set by a live market';
+  const line = 'Market closed: SAMSUNG is a stock perp (MEXC SAMSUNGSTOCK_USDT) and KRX (Seoul), whose hours it keeps, is not in session at Sat 10:30 UTC: its rates are not set by a live market';
   const pair = pairLegs(legs).find((p) => p.long === kraken && p.short === aster)!;
   assert.deepEqual(quality(legs).checks(pair), [{ ok: false, text: line }], 'one line for the base, not one per leg');
   // KRX trades 09:00 to 15:30 Seoul time, 00:00 to 06:30 UTC: on Tuesday at 01:00 UTC the rate is a market's.
@@ -161,9 +197,9 @@ test('market closed: a stock perp, named so by a venue\'s own symbol, read while
   const coin = w('mexc', '4STOCK_USDT', 0.0003, { base: '4STOCK' }, 'cex');
   assert.deepEqual(quality([coin]).legFindings(coin), []);
   // Extended's 24/5 and Backpack's .US markets name stocks too.
-  for (const [venue, symbol] of [['extended', 'INTC_24_5-USD'], ['backpack', 'INTC.US_USDC_PERP'], ['bitget', 'INTCSTOCKUSDT']] as const) {
+  for (const [venue, symbol, name] of [['extended', 'INTC_24_5-USD', 'Extended'], ['backpack', 'INTC.US_USDC_PERP', 'Backpack'], ['bitget', 'INTCSTOCKUSDT', 'Bitget']] as const) {
     const l = w(venue, symbol, 0, { base: 'INTC' });
-    assert.match(quality([l]).legFindings(l)[0]!, new RegExp(`^Market closed: INTC is a stock perp \\(${venue} `), venue);
+    assert.match(quality([l]).legFindings(l)[0]!, new RegExp(`^Market closed: INTC is a stock perp \\(${name} `), venue);
   }
 });
 
@@ -172,7 +208,7 @@ test('market closed: a hl-xyz commodity, index or FX market over the futures wee
   const okx = w('okx', 'XAU-USDT-SWAP', 0, { base: 'XAU' }, 'cex');
   const pair = pairLegs([gold, okx]).find((p) => p.long === gold)!;
   assert.deepEqual(quality([gold, okx]).checks(pair), [{
-    ok: false, text: 'Market closed: XAU is a commodity, index or FX market (hl-xyz xyz:GOLD) and its futures are shut for the weekend at Sat 10:30 UTC: its rates are not set by a live market',
+    ok: false, text: 'Market closed: XAU is a commodity, index or FX market (trade.xyz xyz:GOLD) and its futures are shut for the weekend at Sat 10:30 UTC: its rates are not set by a live market',
   }]);
   assert.deepEqual(quality([gold, okx], TUE_NIGHT).checks(pair), []);
   for (const b of ['XAU', 'WTI', 'BRENT', 'SPX500', 'XYZ100', 'JP225', 'EUR']) assert.ok(DEFAULT_QUALITY.traditionalNonEquity.includes(b), b);
@@ -207,7 +243,17 @@ test('market closed: each stock keeps its own exchange\'s hours (Monday 02:00 an
   // Monday 15:00 UTC: New York trades, Seoul and Tokyo have closed.
   assert.deepEqual(closed(MON_1500), { TSLA: 'open', SAMSUNG: 'KRX (Seoul)', TOYOTA: 'the Tokyo Stock Exchange', SOXL: 'open', SMH: 'open', EWZ: 'open', XAU: 'open' });
   assert.match(quality(legs, MON_0200).legFindings(legs.find((l) => l.symbol === 'xyz:SOXL')!)[0]!,
-    /^Market closed: SOXL is a stock perp \(hl-xyz xyz:SOXL\) and NYSE and Nasdaq \(New York\), whose hours it keeps, is not in session at Mon 02:00 UTC/);
+    /^Market closed: SOXL is a stock perp \(trade\.xyz xyz:SOXL\) and NYSE and Nasdaq \(New York\), whose hours it keeps, is not in session at Mon 02:00 UTC/);
+});
+
+test('market closed: over an Asian lunch break a stock perp is closed (Tencent, Monday 04:30 UTC = 12:30 Hong Kong)', () => {
+  const legs = [w('mexc', 'TENCENTSTOCK_USDT', 0, { base: 'TENCENT' }, 'cex'), w('aster', 'TENCENTUSDT', 0.0001, { base: 'TENCENT' })];
+  const aster = legs[1]!;
+  assert.deepEqual(quality(legs, Date.UTC(2026, 10, 2, 4, 30)).legFindings(aster), [
+    'Market closed: TENCENT is a stock perp (MEXC TENCENTSTOCK_USDT) and HKEX (Hong Kong), whose hours it keeps, is not in session at Mon 04:30 UTC: its rates are not set by a live market',
+  ]);
+  assert.deepEqual(quality(legs, Date.UTC(2026, 10, 2, 3, 30)).legFindings(aster), []);   // 11:30, the morning session
+  assert.deepEqual(quality(legs, Date.UTC(2026, 10, 2, 5, 30)).legFindings(aster), []);   // 13:30, the afternoon one
 });
 
 test('stock exchanges: every exchange named has a session, and the names listed outside New York are sourced ones', () => {
@@ -259,12 +305,12 @@ test('market closed: a stock ticker never marks a coin of the same base: the mar
     now: T0, listed: [...coins, stock, binance], kept: [...coins, binance], dropped: [], maxMarkDeviation: MAX_DEV, hasHistory: () => false, config: DEFAULT_QUALITY,
   });
   for (const l of [...coins, binance]) assert.ok(!q.legFindings(l).some((t) => t.startsWith('Market closed:')), l.symbol);
-  assert.match(q.legFindings(stock).at(-1)!, /^Market closed: DASH is a stock perp \(mexc DASHSTOCK_USDT\)/);
+  assert.match(q.legFindings(stock).at(-1)!, /^Market closed: DASH is a stock perp \(MEXC DASHSTOCK_USDT\)/);
   // Samsung's marks agree, so the relayed leg is Samsung's too.
   const samsung = [w('aster', 'SAMSUNGUSDT', 0, { base: 'SAMSUNG', markPx: 162.86 }), w('mexc', 'SAMSUNGSTOCK_USDT', 0, { base: 'SAMSUNG', markPx: 162.64 }, 'cex')];
   const relayedSamsung = relayed('binance', 'SAMSUNG', BASE);
   const s = quality([...samsung, relayedSamsung]);
-  assert.match(s.legFindings(relayedSamsung).at(-1)!, /^Market closed: SAMSUNG is a stock perp \(mexc SAMSUNGSTOCK_USDT\)/);
+  assert.match(s.legFindings(relayedSamsung).at(-1)!, /^Market closed: SAMSUNG is a stock perp \(MEXC SAMSUNGSTOCK_USDT\)/);
 });
 
 // ---------- the recorded sweep ----------
@@ -290,14 +336,14 @@ test('the recorded sweep (Saturday 02:09 UTC): each finding of the audit, and cl
   const windows = await sweepScan();
   const byId = (id: string) => windows.find((x) => x.id === id);
   // Kraken's weekend rate on a stock against 0 elsewhere: 507 % gross, not a window.
-  assert.deepEqual(findings(byId('samsung-kraken-aster')), ['Market closed: SAMSUNG is a stock perp (mexc SAMSUNGSTOCK_USDT) and KRX (Seoul), whose hours it keeps, is not in session at Sat 02:09 UTC: its rates are not set by a live market']);
-  assert.match(findings(byId('snxx-hl-xyz-aster'))[0]!, /^Market closed: SNXX is a stock perp \(hl-xyz xyz:SNXX\) and NYSE and Nasdaq \(New York\)/);
-  assert.match(findings(byId('intc-hl-xyz-kraken'))[0]!, /^Market closed: INTC is a stock perp \(extended INTC_24_5-USD\)/);
+  assert.deepEqual(findings(byId('samsung-kraken-aster')), ['Market closed: SAMSUNG is a stock perp (MEXC SAMSUNGSTOCK_USDT) and KRX (Seoul), whose hours it keeps, is not in session at Sat 02:09 UTC: its rates are not set by a live market']);
+  assert.match(findings(byId('snxx-hl-xyz-aster'))[0]!, /^Market closed: SNXX is a stock perp \(trade\.xyz xyz:SNXX\) and NYSE and Nasdaq \(New York\)/);
+  assert.match(findings(byId('intc-hl-xyz-kraken'))[0]!, /^Market closed: INTC is a stock perp \(Extended INTC_24_5-USD\)/);
   // Bybit's relayed BLUR at the baseline while every other venue reads about -0.05 % per hour.
-  assert.match(findings(byId('blur-hyperliquid-bybit'))[0]!, /^Lone baseline: bybit BLUR reads the quiet 0.00125 % per hour while 7 other venues agree/);
+  assert.match(findings(byId('blur-hyperliquid-bybit'))[0]!, /^Lone baseline: Bybit BLUR reads the quiet 0.00125 % per hour while 7 other venues agree/);
   // Aster's thin GTC and NIL.
-  assert.deepEqual(findings(byId('gtc-aster-kucoin')), ['Thin: aster GTCUSDT traded $64k in 24 h, under the $100k floor']);
-  assert.deepEqual(findings(byId('nil-aster-hyperliquid')), ['Thin: aster NILUSDT traded $75k in 24 h, under the $100k floor']);
+  assert.deepEqual(findings(byId('gtc-aster-kucoin')), ['Thin: Aster GTCUSDT traded $64k in 24 h, under the $100k floor']);
+  assert.deepEqual(findings(byId('nil-aster-hyperliquid')), ['Thin: Aster NILUSDT traded $75k in 24 h, under the $100k floor']);
   // Real rates on venues with data of their own stay clean: Backpack's TRX against Hyperliquid's pin leads.
   assert.deepEqual(findings(byId('trx-backpack-hyperliquid')), []);
   assert.deepEqual(findings(byId('nil-binance-hyperliquid')), [], 'MEXC confirms Binance\'s NIL');
@@ -352,5 +398,5 @@ test('the recorded sweep read on Monday: each stock closed only while its own ex
   assert.ok(!nightLines.some((t) => /KRX|Tokyo|HKEX|TWSE|SSE/.test(t)));
   assert.deepEqual(findings(night.find((x) => x.id === 'samsung-kraken-aster')), []);
   assert.match(findings(night.find((x) => x.id === 'intc-hl-xyz-kraken'))[0]!, /^Market closed: INTC .* NYSE and Nasdaq \(New York\)/);
-  assert.match(findings(night.find((x) => x.id === 'snxx-hl-xyz-aster'))[0]!, /^Market closed: SNXX is a stock perp \(hl-xyz xyz:SNXX\)/);
+  assert.match(findings(night.find((x) => x.id === 'snxx-hl-xyz-aster'))[0]!, /^Market closed: SNXX is a stock perp \(trade\.xyz xyz:SNXX\)/);
 });

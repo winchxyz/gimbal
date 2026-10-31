@@ -162,8 +162,8 @@ fn core_refusal(r: &Refusal) -> String {
 
 // --- sol_sign ---
 
-/// The contract gives every vector message the core's answer without prices (the contract stores
-/// none until C6): each pass signs, and each refusal is the core's refusal, code and text.
+/// With no price stored the contract gives every vector message the core's answer without prices:
+/// each pass signs, and each refusal is the core's refusal, code and text.
 #[test]
 fn sol_sign_answers_every_vector_message_as_the_core_does_without_prices() {
     let mut g = sol_desk();

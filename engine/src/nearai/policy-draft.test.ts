@@ -8,7 +8,9 @@ import { DEFAULT_STRATEGY } from '../scanner/config.ts';
 import { NearAiClient, NearAiUnavailable } from './client.ts';
 import { PolicyDrafter, deskMarkets } from './draft-route.ts';
 import type { DeskMarkets } from './policy-draft.ts';
-import { ORACLE_ASSETS, SYSTEM_PROMPT, asksUnpriced, buildPolicyDraft, normalizeSymbol, parseDraftAnswer } from './policy-draft.ts';
+import {
+  MIN_ORACLE_AGE_S, ORACLE_ASSETS, SYSTEM_PROMPT, asksUnpriced, buildPolicyDraft, normalizeSymbol, parseDraftAnswer,
+} from './policy-draft.ts';
 import { ETH_BTC_SENTENCE, SYNTHETIC_ETH_BTC, ethBtcReplies } from './recorded.ts';
 import { ALL_MARKETS, BTC_BOOK, ETH_BOOK, MARKET_LISTS, completion, fixedFetch, fixtureBody, marketReaders } from './test-helpers.ts';
 
@@ -28,7 +30,7 @@ const ETH_BTC_POLICY: ContractPolicy = {
   orderly_symbols: ['PERP_ETH_USDC', 'PERP_BTC_USDC'],
   max_notional_usd: 500,
   price_band_bps: 100,
-  oracle_max_age_s: 120,
+  oracle_max_age_s: 900,
   rescue_cap_usd_per_hour: 500,
   unpriced: [],
   unpriced_max_notional_usd: 100,
@@ -153,6 +155,25 @@ test('out-of-range numbers are clamped or refused, and each says so in the notes
   assert.equal(draft.notes.length, expected.length, draft.notes.join('\n'));
   // Every u64 a draft holds is one JavaScript reads exactly.
   for (const v of [p.max_notional_usd, p.rescue_cap_usd_per_hour, p.max_transfer_cost_flat_e6, p.unpriced_max_notional_usd]) assert.ok(Number.isSafeInteger(v));
+});
+
+test('the oracle age: 900 s when unsaid, and a shorter one is raised to 900 s, since the oracle\'s own window is 10 min', () => {
+  assert.equal(MIN_ORACLE_AGE_S, 900);
+  assert.equal(draftOf({ symbols: ['ETH'] }).policy.oracle_max_age_s, 900);
+  for (const asked of [1, 60, 120, 599.6, 899]) {
+    const draft = draftOf({ symbols: ['ETH'], oracle_max_age_s: asked });
+    assert.equal(draft.policy.oracle_max_age_s, 900, `asked ${asked}`);
+    assert.deepEqual(draft.notes, [
+      `policy.oracle_max_age_s: ${asked} s is under 900 s, and the oracle's own window is 10 min: a stored price is already that old, `
+        + 'so every priced order would be refused; raised to 900.',
+    ]);
+  }
+  for (const asked of [900, 1_800, 3_600]) {
+    const draft = draftOf({ symbols: ['ETH'], oracle_max_age_s: asked });
+    assert.deepEqual([draft.policy.oracle_max_age_s, draft.notes], [asked, []]);
+  }
+  const zero = draftOf({ symbols: ['ETH'], oracle_max_age_s: 0 });
+  assert.deepEqual([zero.policy.oracle_max_age_s, zero.notes], [900, ['policy.oracle_max_age_s: 0 is not above 0 s; kept the default 900.']]);
 });
 
 test('small caps: a per-leg cap under the smallest order is raised, and the leg follows the cap', () => {

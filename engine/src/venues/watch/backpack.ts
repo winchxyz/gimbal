@@ -1,11 +1,12 @@
 // Backpack (CEX, reference only): `markPrices` has every perp's rate and mark, `openInterest` and `tickers` the
-// open interest and volume; `markets` (cached) each perp's funding interval and whether its book is open.
+// open interest and volume; `markets` (cached) each perp's funding interval, funding bounds and whether its book is
+// open.
 
 import type { MarketFunding, WatchReader } from '../venue.ts';
 import type { WatchReaderOptions } from './http.ts';
 import { LISTING_TTL_MS, TtlCache, WatchHttp, collect, list, num, optNum, optPrice } from './http.ts';
 import { baseFields } from './symbols.ts';
-import { HOUR_MS, backpackRatePerHour, nextAtOr, settlementForHours } from './units.ts';
+import { HOUR_MS, backpackRatePerHour, fundingLimitsPerHour, nextAtOr, settlementForHours } from './units.ts';
 
 export const BACKPACK_API_URL = 'https://api.backpack.exchange/api/v1';
 
@@ -34,9 +35,17 @@ export class BackpackReader implements WatchReader {
 interface BackpackMark { symbol: string; fundingRate: string; markPrice: string; indexPrice: string; nextFundingTimestamp: number }
 interface BackpackOi { symbol: string; openInterest: string }
 interface BackpackTicker { symbol: string; quoteVolume: string }
-interface BackpackMarket { symbol: string; baseSymbol: string; marketType: string; orderBookState: string; fundingInterval: number }
+interface BackpackMarket {
+  symbol: string; baseSymbol: string; marketType: string; orderBookState: string; fundingInterval: number;
+  fundingRateUpperBound?: string | null; fundingRateLowerBound?: string | null;
+}
 
-/** Open perps only; equities carry a `.US` suffix on the base ("NVDA.US"), dropped by the normaliser. */
+/**
+ * Open perps only; equities carry a `.US` suffix on the base ("NVDA.US"), dropped by the normaliser.
+ * `fundingRateUpperBound` / `fundingRateLowerBound` are basis points per funding interval (Backpack's market schema:
+ * "10 means 10bps"): 150 and -150 on most perps, 1.5 % per hour. No perp of the recorded sweep comes near them (TRX's
+ * -0.14 % per hour is the furthest); read as percentages they would be 150 % per hour.
+ */
 export function parseBackpack(marks: unknown, oi: unknown, tickers: unknown, markets: unknown, now: number): MarketFunding[] {
   const perps = new Map(list<BackpackMarket>('backpack', markets, 'markets').filter((m) => m.marketType === 'PERP' && m.orderBookState === 'Open').map((m) => [m.symbol, m]));
   const open = new Map(list<BackpackOi>('backpack', oi, 'openInterest').map((o) => [o.symbol, o.openInterest]));
@@ -56,6 +65,7 @@ export function parseBackpack(marks: unknown, oi: unknown, tickers: unknown, mar
       openInterest: optNum(open.get(p.symbol)),     // base units
       volume24hUsd: optNum(volume.get(p.symbol)),
       ...baseFields(m.baseSymbol),
+      ...fundingLimitsPerHour(m.fundingRateUpperBound, m.fundingRateLowerBound, hours, 10_000),
     };
   });
 }

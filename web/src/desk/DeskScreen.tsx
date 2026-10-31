@@ -357,7 +357,7 @@ function Waiting({ desk, windows, strategy, scan, now }: WaitingProps) {
           <button
             type="button"
             className="btn quiet"
-            onClick={() => notify('Your minimum is edited in the rules, which open with onboarding and are not built yet. Nothing changed.')}
+            onClick={() => notify('Your minimum is part of the rules. Changing a signed policy is not built yet. Nothing changed.')}
           >
             Change my minimum
           </button>

@@ -249,6 +249,63 @@ test('backpack: open perps, rate over the market fundingInterval, the venue next
   );
 });
 
+/** The raw recorded limit of one market, as the reader must pass it on: per interval in the venue's unit, per hour. */
+const LIMITS: readonly { venue: string; symbol: string; cap: number; floor: number }[] = [
+  { venue: 'aster', symbol: 'BTCUSDT', cap: 0.003 / 8, floor: -0.003 / 8 },                 // fundingFeeCap per 8 h
+  { venue: 'aster', symbol: 'TRXUSDT', cap: 0.004875 / 8, floor: -0.004875 / 8 },
+  { venue: 'okx', symbol: 'BTC-USDT-SWAP', cap: 0.00375 / 8, floor: -0.00375 / 8 },         // maxFundingRate per 8 h
+  { venue: 'bitget', symbol: 'BTCUSDT', cap: 0.003 / 8, floor: -0.003 / 8 },                // per fundingRateInterval
+  { venue: 'gate', symbol: 'AGRIPPA_USDT', cap: 0.02 / 4, floor: -0.02 / 4 },               // funding_rate_limit, both ways
+  { venue: 'gate', symbol: 'BTC_USDT', cap: 0.003 / 8, floor: -0.003 / 8 },
+  { venue: 'kucoin', symbol: 'XBTUSDTM', cap: 0.003 / 8, floor: -0.003 / 8 },               // per granularity
+  { venue: 'mexc', symbol: 'BTC_USDT', cap: 0.0018 / 8, floor: -0.0018 / 8 },               // per collectCycle
+  { venue: 'mexc', symbol: 'KMISTOCK_USDT', cap: 0.0002 / 8, floor: -0.002 / 8 },           // not mirrored
+  { venue: 'extended', symbol: 'BTC-USD', cap: 0.0025, floor: -0.0025 },                    // hourlyFundingRateCap "0.25" (%)
+  { venue: 'backpack', symbol: 'BTC_USDC_PERP', cap: 0.01, floor: -0.01 },                  // 100 bps per 1 h interval
+  { venue: 'backpack', symbol: 'WLD_USDC_PERP', cap: 0.015, floor: -0.015 },                // 150 bps, most perps
+];
+
+test('funding limits: each reader with per-market limits passes them on per hour, from the raw recorded fields', async () => {
+  const { reader } = replayed();
+  const byVenue = new Map<string, MarketFunding[]>();
+  for (const id of ['aster', 'okx', 'bitget', 'gate', 'kucoin', 'mexc', 'extended', 'backpack']) byVenue.set(id, await reader(id).funding());
+  for (const l of LIMITS) {
+    const m = market(byVenue.get(l.venue)!, l.symbol);
+    close(m.fundingCapPerHour, l.cap, `${l.venue} ${l.symbol} cap`);
+    close(m.fundingFloorPerHour, l.floor, `${l.venue} ${l.symbol} floor`);
+  }
+  // Every market of these readers carries both, except MEXC's US30_USDT: its 0 / 0 range is no limit.
+  for (const [id, markets] of byVenue) {
+    const without = markets.filter((m) => m.fundingCapPerHour === undefined || m.fundingFloorPerHour === undefined).map((m) => m.symbol);
+    assert.deepEqual(without, id === 'mexc' ? ['US30_USDT'] : [], id);
+    for (const m of markets) assert.ok(m.fundingCapPerHour === undefined || m.fundingCapPerHour > m.fundingFloorPerHour!, `${id} ${m.symbol}`);
+  }
+  // The rates that sit on their own limits: Gate's five (AGRIPPA_USDT at its cap), MEXC's 99; no other reader's.
+  const onLimit = (ms: readonly MarketFunding[]) => ms.filter((m) => m.ratePerHour >= m.fundingCapPerHour! * (1 - 1e-6) || m.ratePerHour <= m.fundingFloorPerHour! * (1 - 1e-6));
+  assert.deepEqual(onLimit(byVenue.get('gate')!).map((m) => m.symbol).sort(), ['AGRIPPA_USDT', 'HYGON_USDT', 'JUNZHENG_USDT', 'NAS100_USDT', 'VOLX_USDT']);
+  assert.equal(onLimit(byVenue.get('mexc')!).length, 99);
+  for (const id of ['aster', 'okx', 'bitget', 'kucoin', 'extended', 'backpack']) assert.deepEqual(onLimit(byVenue.get(id)!), [], id);
+  // The other watch readers' answers carry no per-market limits.
+  for (const [id, r] of replayed().readers) {
+    if (byVenue.has(id)) continue;
+    assert.ok((await r.funding()).every((m) => m.fundingCapPerHour === undefined && m.fundingFloorPerHour === undefined), id);
+  }
+});
+
+test('stock suffixes: MEXC and Bitget name one-letter tickers too (CSTOCK is Citigroup); Aster\'s GSTOCK is a coin', async () => {
+  const { reader } = replayed();
+  const mexc = await reader('mexc').funding();
+  const bitget = await reader('bitget').funding();
+  assert.deepEqual(
+    ['CSTOCK_USDT', 'TSTOCK_USDT', 'VSTOCK_USDT', 'FSTOCK_USDT', 'USTOCK_USDT', 'PSTOCK_USDT', '4STOCK_USDT', 'C_USDT'].map((s) => market(mexc, s).base),
+    ['C', 'T', 'V', 'F', 'U', 'P', '4STOCK', 'C'],
+  );
+  assert.deepEqual(['CSTOCKUSDT', 'TSTOCKUSDT', 'CUSDT'].map((s) => market(bitget, s).base), ['C', 'T', 'C']);
+  // Visa is V elsewhere too (OKX's V-USDT-SWAP at 414.57): the stock now pairs with the venues that list it plain.
+  assert.equal(market(await reader('okx').funding(), 'V-USDT-SWAP').base, 'V');
+  assert.equal(market(await reader('aster').funding(), 'GSTOCKUSDT').base, 'GSTOCK');
+});
+
 test('a sweep is 1-3 calls per venue: listing data is cached for 10 minutes', async () => {
   const { clock, calls, readers } = replayed();
   const sweep = async () => {

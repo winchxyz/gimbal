@@ -102,7 +102,7 @@ pub(super) fn order(asset: u32, px: &str, sz: &str) -> HlOrder {
     }
 }
 
-/// A priced order: refused (`E_ORACLE_STALE`) until the contract stores prices (C6).
+/// A priced order: refused (`E_ORACLE_STALE`) while no ETH price is stored.
 fn eth() -> HlOrder {
     order(1, "2500", "0.1")
 }
@@ -148,6 +148,44 @@ fn assert_signs_l1(got: &UnsignedAction, kind: &str, name: &str) {
     );
 }
 
+/// The L1 vector `name` on testnet as an order or cancel the contract builds at `block_ms`: the
+/// vector's body plus `expiresAfter` = block time + 60 s after `vaultAddress`, and the digest of
+/// that action with that expiry (the core pins the encoding against the venue SDK's layout,
+/// `expires_after_enters_the_l1_hash_as_the_sdk_writes_it`), never the vector's own digest.
+fn assert_signs_l1_expiring(got: &UnsignedAction, kind: &str, name: &str, block_ms: u64) {
+    let c = case("l1", name);
+    let expires = block_ms + gimbal_core::hl::EXPIRES_AFTER_MS;
+    let mut body = c["testnet"]["exchange_body"].clone();
+    body.as_object_mut().unwrap().remove("signature");
+    body["expiresAfter"] = json!(expires);
+    assert_eq!(
+        (got.desk_id.as_str(), got.venue.as_str(), got.kind.as_str()),
+        ("alpha", "hyperliquid", kind)
+    );
+    assert_eq!(serde_json::to_value(&got.payload).unwrap(), body);
+    let gimbal_core::msgpack::Value::Map(entries) = &got.payload else {
+        panic!("the payload is a map")
+    };
+    assert_eq!(
+        entries.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        ["action", "nonce", "vaultAddress", "expiresAfter"]
+    );
+    let want = gimbal_core::hl::prepare_l1(
+        crate::hl::keccak,
+        Network::Testnet,
+        "x",
+        got.payload.get("action").unwrap().clone(),
+        c["nonce"].as_u64().unwrap(),
+        Some(expires),
+    );
+    assert_eq!(
+        got.sign_request,
+        crate::mpc::SignRequest::evm("alpha", &want.digest)
+    );
+    let vector_digest = c["testnet"]["digest"].as_str().unwrap();
+    assert_ne!(format!("0x{}", hex::encode(want.digest)), vector_digest);
+}
+
 /// The user-signed vector `name`.
 fn assert_signs_user(got: &UnsignedAction, kind: &str, name: &str) {
     let c = case("user_signed", name);
@@ -163,8 +201,9 @@ fn nonce_of(desk_id: &str, g: &Gimbal) -> u64 {
 
 #[test]
 fn hl_order_signs_the_vector_bytes() {
-    // Until prices are stored (C6) only unpriced symbols sign, so the vectors' assets are listed
-    // as unpriced here, with caps none of their orders reach.
+    // The l1 vectors price their orders with no one oracle price in mind, so their assets are
+    // listed as unpriced here, with caps none of their orders reach; `tests::prices` runs the
+    // priced `order_policy` rows against stored prices.
     let mut p = hl_policy();
     p.unpriced = ["BTC", "ETH", "SOL", "DOGE"]
         .iter()
@@ -187,7 +226,8 @@ fn hl_order_signs_the_vector_bytes() {
         at(operator(), c["nonce"].as_u64().unwrap(), yocto(0));
         let reason = format!("vector {}", c["name"]);
         let got = g.prepare_hl_order("alpha".into(), order, reason.clone());
-        assert_signs_l1(&got, "order", c["name"].as_str().unwrap());
+        let nonce = c["nonce"].as_u64().unwrap();
+        assert_signs_l1_expiring(&got, "order", c["name"].as_str().unwrap(), nonce);
         assert_eq!(got.reason_sha256, Some(sha256_hex(&reason)));
         signed += 1;
     }
@@ -237,10 +277,10 @@ fn hl_order_refuses_what_the_policy_does_not_allow() {
     g.prepare_hl_order("alpha".into(), order(159, "33.33", "3"), String::new());
 }
 
-/// No prices are stored before C6, so every priced order is refused, whatever its size and side:
-/// the oversize order and the tiny-price sell of the C3 review included.
+/// With no price stored every priced order is refused, whatever its size and side: the oversize
+/// order and the tiny-price sell of the C3 review included.
 #[test]
-fn a_priced_order_is_refused_until_prices_are_stored() {
+fn a_priced_order_is_refused_without_a_stored_price() {
     let mut g = hl_desk();
     let mut tiny_sell = order(1, "1", "1000");
     tiny_sell.is_buy = false;
@@ -437,7 +477,8 @@ fn hl_cancel_signs_the_vector_bytes() {
             p["oid"].as_u64().unwrap(),
             "stale order".into(),
         );
-        assert_signs_l1(&got, "cancel", c["name"].as_str().unwrap());
+        let nonce = c["nonce"].as_u64().unwrap();
+        assert_signs_l1_expiring(&got, "cancel", c["name"].as_str().unwrap(), nonce);
         assert_eq!(got.reason_sha256, Some(sha256_hex("stale order")));
         signed += 1;
     }
@@ -458,6 +499,7 @@ fn hl_cancel_passes_a_paused_desk_and_takes_the_next_nonce() {
                 "action": { "type": "cancel", "cancels": [{ "a": 1, "o": 77 }] },
                 "nonce": n,
                 "vaultAddress": null,
+                "expiresAfter": T + 60_000,
             })
         );
     }

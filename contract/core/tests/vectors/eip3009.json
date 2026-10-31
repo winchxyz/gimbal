@@ -64,9 +64,9 @@
   },
   "onchain_note": "name/version/decimals/DOMAIN_SEPARATOR/TRANSFER_WITH_AUTHORIZATION_TYPEHASH read with eth_call; both match the locally computed values",
   "rules": {
-    "nonce": "keccak256(utf8(desk_id) || counter as u64 big-endian), counter stored per desk and incremented after each signature; never a relayer-chosen nonce",
+    "nonce": "keccak256(utf8(desk_id) || counter as u64 big-endian), counter stored per desk; the evm_usdc_to_intents call that signs takes the stored value and stores value + 1 in the same call, before the MPC answers, so a failed or late signature never frees its nonce; never a relayer-chosen nonce",
     "validAfter": "0",
-    "validBefore": "at most now + 1800 s (these vectors use exactly now + 1800)",
+    "validBefore": "the block time of the signing call + 300 s (contract_cases); the older `cases` use now + 1800 s and pin the digest arithmetic only",
     "value": "the verified quote amountIn (raw USDC, 6 decimals), within the rescue cap"
   },
   "nonce_cases": [
@@ -316,6 +316,93 @@
         "to": "0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d",
         "data": "0xe3ee160e0000000000000000000000001a642f0e3c3af545e7acbd38b07251b3990914f10000000000000000000000003325a78425f17a7e487eb5666b2bfd93abb06c70000000000000000000000000000000000000000000000000000000000007a1200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006ae688084fbd0b628f49820ffe3ccd88ef61aebece9810fe537a3fec82a46dd6c2630b52000000000000000000000000000000000000000000000000000000000000001c96b6d509ee795dd9283930ed4cc685502d2334acce132b22a28e89f904e263c41ee9a673e15bb9cb41697089b13fa35a5f325a3f082ff021c8391c998760c053",
         "value": "0"
+      }
+    }
+  ],
+  "contract_cases_note": "What the contract returns for evm_usdc_to_intents with the live quote named (oneclick-live.json) at block time now_s: the desk counter before the call, the typed message, its hashes (viem) and the payload (the fields of the message, then token and chainId), keys in that order. The second call on the same desk takes counter 1.",
+  "contract_cases": [
+    {
+      "name": "evm_usdc_to_intents, counter 0: the live quote \"Orderly money out: Arbitrum USDC (desk EVM) to Hyperliquid\" (oneclick-live.json), Arbitrum Sepolia",
+      "network": "testnet",
+      "desk_id": "alpha",
+      "counter": "0",
+      "now_s": 1793491200,
+      "quote": "Orderly money out: Arbitrum USDC (desk EVM) to Hyperliquid",
+      "message": {
+        "from": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+        "to": "0x1d5ed45fc6fdcca040abebb0b016bdf4962931be",
+        "value": "10000000",
+        "validAfter": "0",
+        "validBefore": "1793491500",
+        "nonce": "0xdcfd81f6f7cceaafdf1017ff09f36273ea6bcbe00937ac4f96fb810c76c4d580"
+      },
+      "struct_hash": "0x98eb7dbcc7c8c8dbd8adb27e9fbec029a48f731073de327f40f29ead881d0d8c",
+      "digest": "0x93041b792fba41ef5d68f6ab0fa5047520791d29ab44a169ad0c5f2f6ec08392",
+      "payload": {
+        "from": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+        "to": "0x1d5ed45fc6fdcca040abebb0b016bdf4962931be",
+        "value": "10000000",
+        "validAfter": "0",
+        "validBefore": "1793491500",
+        "nonce": "0xdcfd81f6f7cceaafdf1017ff09f36273ea6bcbe00937ac4f96fb810c76c4d580",
+        "token": "0x75faf114eafb1bdbe2f0316df893fd58ce46aa4d",
+        "chainId": 421614
+      }
+    },
+    {
+      "name": "evm_usdc_to_intents, counter 1: the live quote \"Orderly money out: Arbitrum USDC (desk EVM) to Hyperliquid\" (oneclick-live.json), Arbitrum Sepolia",
+      "network": "testnet",
+      "desk_id": "alpha",
+      "counter": "1",
+      "now_s": 1793491200,
+      "quote": "Orderly money out: Arbitrum USDC (desk EVM) to Hyperliquid",
+      "message": {
+        "from": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+        "to": "0x1d5ed45fc6fdcca040abebb0b016bdf4962931be",
+        "value": "10000000",
+        "validAfter": "0",
+        "validBefore": "1793491500",
+        "nonce": "0x0395841a70b96627d586701eed07b26176524bff8f953e4ea9d4e875373e69b6"
+      },
+      "struct_hash": "0xae8165f2305864a6a18f47768cf9c6271437f3b18f5da2dbd5d74bdb99c12612",
+      "digest": "0x9f4fd723e746268d2e3d951c1f8e6a4a9b7dc86f0ad9ce1b6ebc0e7afd859988",
+      "payload": {
+        "from": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+        "to": "0x1d5ed45fc6fdcca040abebb0b016bdf4962931be",
+        "value": "10000000",
+        "validAfter": "0",
+        "validBefore": "1793491500",
+        "nonce": "0x0395841a70b96627d586701eed07b26176524bff8f953e4ea9d4e875373e69b6",
+        "token": "0x75faf114eafb1bdbe2f0316df893fd58ce46aa4d",
+        "chainId": 421614
+      }
+    },
+    {
+      "name": "evm_usdc_to_intents, counter 0: the live quote \"Orderly money out: Arbitrum USDC (desk EVM) to Hyperliquid\" (oneclick-live.json), Arbitrum One",
+      "network": "mainnet",
+      "desk_id": "alpha",
+      "counter": "0",
+      "now_s": 1793491200,
+      "quote": "Orderly money out: Arbitrum USDC (desk EVM) to Hyperliquid",
+      "message": {
+        "from": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+        "to": "0x1d5ed45fc6fdcca040abebb0b016bdf4962931be",
+        "value": "10000000",
+        "validAfter": "0",
+        "validBefore": "1793491500",
+        "nonce": "0xdcfd81f6f7cceaafdf1017ff09f36273ea6bcbe00937ac4f96fb810c76c4d580"
+      },
+      "struct_hash": "0x98eb7dbcc7c8c8dbd8adb27e9fbec029a48f731073de327f40f29ead881d0d8c",
+      "digest": "0x3c73856ef090057f803eebaf487ae2cf3a5ff4c1fe78fc43af64169c66ed1e79",
+      "payload": {
+        "from": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+        "to": "0x1d5ed45fc6fdcca040abebb0b016bdf4962931be",
+        "value": "10000000",
+        "validAfter": "0",
+        "validBefore": "1793491500",
+        "nonce": "0xdcfd81f6f7cceaafdf1017ff09f36273ea6bcbe00937ac4f96fb810c76c4d580",
+        "token": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+        "chainId": 42161
       }
     }
   ]

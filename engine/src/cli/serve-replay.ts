@@ -39,6 +39,13 @@ export function scanLine(n: number, r: ScanResult): string {
 }
 
 /**
+ * How often a recording keeps a watch-only venue's sweep. One sweep of all 23 is about 7,400 markets, 240 KiB
+ * gzipped (the fixtures/watch-wire sweep of 2026-10-31), and gzip shares nothing between sweeps that far apart, so
+ * every 30 s would be 28 MB an hour. Their windows are reference only: every 10 min keeps an hour near 2 MB.
+ */
+export const WATCH_RECORD_GAPS: Partial<Record<VenueMethod, number>> = { funding: 10 * 60_000 };
+
+/**
  * A sink that writes a successful answer to the same call (venue, method, arguments) at most once per `minGapMs` of
  * its method; methods not listed are always written. Errors are always written, and so is the first success after
  * an error, so a replay shows an outage exactly as long as it lasted. Replay serves the latest answer at or before

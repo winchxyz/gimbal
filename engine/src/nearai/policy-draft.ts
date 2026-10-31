@@ -42,14 +42,21 @@ export const POLICY_LIMITS = {
 export const DRAFT_DEFAULTS = {
   /** An order may sit 1 % from the oracle price: room for an IOC through the book on the majors. */
   priceBandBps: 100,
-  /** Two minutes: the engine refreshes prices on demand before it orders. */
-  oracleMaxAgeS: 120,
+  /**
+   * 15 minutes, and the least a draft takes (MIN_ORACLE_AGE_S). The contract dates a stored price at the oracle's
+   * timestamp minus the oracle's own recency window (600 s on mainnet), so a price is already 10 min old when it is
+   * stored: under that, every priced order is refused. 900 s leaves 5 min for the order after a refresh.
+   */
+  oracleMaxAgeS: 900,
   /** docs/interfaces.md §1.2 defaults: 1 % or 0.5 USDC per transfer (1Click measured 0.21–0.32 on 4–7 USDC). */
   maxTransferCostBps: 100,
   maxTransferCostFlatE6: 500_000,
   /** docs/interfaces.md §1.2 default cap per leg for symbols without an oracle price. */
   unpricedMaxNotionalUsd: 100,
 } as const;
+
+/** The least oracle_max_age_s a draft takes: the default, for the reason given there. */
+export const MIN_ORACLE_AGE_S = DRAFT_DEFAULTS.oracleMaxAgeS;
 
 /** The desk venues, in policy order, with the names the notes use. */
 const VENUES: readonly { id: VenueId; name: string }[] = [
@@ -363,7 +370,14 @@ export function buildPolicyDraft(parsed: { answer: DraftAnswer; notes: string[] 
   let oracleAge: number = DRAFT_DEFAULTS.oracleMaxAgeS;
   if (n.oracle_max_age_s !== undefined) {
     if (n.oracle_max_age_s <= 0) refuse('policy.oracle_max_age_s', n.oracle_max_age_s, 'is not above 0 s', oracleAge, notes);
-    else oracleAge = clamp('policy.oracle_max_age_s', Math.max(1, Math.round(n.oracle_max_age_s)), 1, POLICY_LIMITS.maxOracleAgeS, notes);
+    else {
+      const asked = Math.round(n.oracle_max_age_s);
+      if (asked < MIN_ORACLE_AGE_S) {
+        notes.push(`policy.oracle_max_age_s: ${fmt(n.oracle_max_age_s)} s is under ${MIN_ORACLE_AGE_S} s, and the oracle's own window is 10 min: `
+          + `a stored price is already that old, so every priced order would be refused; raised to ${MIN_ORACLE_AGE_S}.`);
+        oracleAge = MIN_ORACLE_AGE_S;
+      } else oracleAge = clamp('policy.oracle_max_age_s', asked, MIN_ORACLE_AGE_S, POLICY_LIMITS.maxOracleAgeS, notes);
+    }
   }
 
   // Unpriced symbols: the owner's own words must ask for each one; the cap they gave goes to the notes, since the

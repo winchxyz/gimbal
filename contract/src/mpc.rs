@@ -169,8 +169,9 @@ fn bytes32(hex_digits: &str) -> [u8; 32] {
 /// (a malformed s or recovery id is left for [`check_signature`] to refuse). Circle's FiatToken
 /// (EIP-3009) and every EIP-2 check refuse a high s, so every consumer gets the canonical form.
 /// The MPC network already answers with a low s (each testnet signature seen had one, with the
-/// recovery id flipped to match), so this is a guard. `big_r` stays as the MPC wrote it:
-/// consumers take only its x coordinate, r.
+/// recovery id flipped to match), so this is a guard. The flip negates the point R as well (same
+/// x, the other y parity), so `big_r`'s `02`/`03` prefix is flipped with the recovery id and
+/// keeps naming the parity the recovery id names; r, its x coordinate, is unchanged.
 pub fn low_s(signature: MpcSignature) -> MpcSignature {
     let MpcSignature::Secp256k1 {
         big_r,
@@ -204,8 +205,15 @@ pub fn low_s(signature: MpcSignature) -> MpcSignature {
             ((have + 256 - take) as u8, 1)
         };
     }
+    // -R: the prefix byte 02 <-> 03. A big_r that is no compressed point is left for
+    // `check_signature` to refuse.
+    let affine_point = match big_r.affine_point.get(..2) {
+        Some("02") => format!("03{}", &big_r.affine_point[2..]),
+        Some("03") => format!("02{}", &big_r.affine_point[2..]),
+        _ => big_r.affine_point,
+    };
     MpcSignature::Secp256k1 {
-        big_r,
+        big_r: AffinePoint { affine_point },
         s: Scalar {
             scalar: hex::encode(low),
         },

@@ -3,8 +3,7 @@
 //! and the notional cap at the reference price. Hyperliquid and Phoenix orders both end here.
 //!
 //! The caller passes the reference price: the oracle price of the symbol if it is young enough
-//! ([`fresh_price`]), or `None`. Prices are stored on chain from day 6 (C6); until then the contract
-//! passes `None`, and every priced order is refused with `E_ORACLE_STALE`.
+//! ([`fresh_price`]), or `None`, and then every priced order is refused with `E_ORACLE_STALE`.
 
 use crate::decimal::format_e8;
 use crate::errors::{Refusal, E_ORACLE_STALE, E_PRICE_BAND, E_SIZE};

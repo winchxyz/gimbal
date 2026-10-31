@@ -8,9 +8,10 @@
 // One finding per leg and kind, at most:
 // - Thin: the leg traded under minVolume24hUsd in 24 h. Where the venue publishes no volume, its open interest
 //   (already held to the floor in filterLegs) stands in; a leg with a price but neither is thin too.
-// - At the cap: the rate sits on its venue's funding cap or floor (config FUNDING_LIMITS), or 3+ venues print the
-//   same rate, well off the baseline, to the digit: free premiums never agree that closely, a shared clamp does (Q
-//   settled at the -2 % per 4 h floor on five venues at once).
+// - At the cap: the rate sits on its market's funding cap or floor (the market's own, from the venue's answer, each
+//   side on its own; else config FUNDING_LIMITS), or 3+ venues print the same rate, well off the baseline, to the
+//   digit: free premiums never agree that closely, a shared clamp does (Q settled at the -2 % per 4 h floor on five
+//   venues at once).
 // - Unconfirmed: a leg with no mark, no open interest and no history of its own (Binance and Bybit, relayed by
 //   Hyperliquid's predictedFundings) whose rate no venue with data of its own reads too.
 // - Lone baseline: such a relayed leg at its venue's quiet pin (the rate most of its markets sit at, about 0.01 % per
@@ -25,8 +26,9 @@
 // Pure: the legs, the time and the tables come in as arguments.
 
 import type { ScanVenueId, Window as FundingWindow } from '@gimbal/shared';
+import { venueName, venueNames } from '../venues/names.ts';
 import { normalizeBase } from '../venues/watch/symbols.ts';
-import type { FundingLimit, MarketSession, QualityConfig } from './config.ts';
+import type { MarketSession, QualityConfig } from './config.ts';
 import type { LegDrop, Pair, ScanLeg } from './pairs.ts';
 import { usd } from './price.ts';
 
@@ -65,10 +67,6 @@ function median(xs: readonly number[]): number {
   return s.length % 2 === 1 ? s[mid]! : (s[mid - 1]! + s[mid]!) / 2;
 }
 
-function list(names: readonly string[]): string {
-  return names.length <= 1 ? names.join('') : `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`;
-}
-
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const formats = new Map<string, Intl.DateTimeFormat>();
 
@@ -87,7 +85,8 @@ const minutesOf = (hhmm: string) => Number(hhmm.slice(0, 2)) * 60 + Number(hhmm.
 
 export function inSession(s: MarketSession, t: number): boolean {
   const { day, minutes } = localTime(t, s.timeZone);
-  return day >= 1 && day <= 5 && minutes >= minutesOf(s.open) && minutes < minutesOf(s.close);
+  if (day < 1 || day > 5 || minutes < minutesOf(s.open) || minutes >= minutesOf(s.close)) return false;
+  return !(s.breaks ?? []).some((b) => minutes >= minutesOf(b.from) && minutes < minutesOf(b.to));
 }
 
 /** True from Friday `close` to Sunday `open` in the zone given (the futures and FX weekend). */
@@ -200,27 +199,36 @@ export class WatchQuality {
   #thin(leg: ScanLeg): string | null {
     const min = this.#input.config.minVolume24hUsd;
     if (leg.volume24hUsd !== null) {
-      return leg.volume24hUsd < min ? `Thin: ${leg.venue} ${leg.symbol} traded ${usd(leg.volume24hUsd)} in 24 h, under the ${usd(min)} floor` : null;
+      return leg.volume24hUsd < min ? `Thin: ${venueName(leg.venue)} ${leg.symbol} traded ${usd(leg.volume24hUsd)} in 24 h, under the ${usd(min)} floor` : null;
     }
     // A leg without volume, open interest or a mark is a bare relayed rate: #unconfirmed judges that one.
-    if (leg.oiUsd === null && leg.markPx !== null) return `Thin: ${leg.venue} ${leg.symbol} publishes neither 24 h volume nor open interest: nothing shows it trades`;
+    if (leg.oiUsd === null && leg.markPx !== null) return `Thin: ${venueName(leg.venue)} ${leg.symbol} publishes neither 24 h volume nor open interest: nothing shows it trades`;
     return null;
   }
 
-  #limit(leg: ScanLeg): FundingLimit | null {
+  /**
+   * One side of the limits a leg's rate is held to: the market's own where the venue's answer gives it, else the
+   * sourced table. Each side stands alone: a venue may give a cap and no floor.
+   */
+  #limit(leg: ScanLeg, side: 'cap' | 'floor'): { perHour: number; whose: string } | null {
+    const own = side === 'cap' ? leg.fundingCapPerHour : leg.fundingFloorPerHour;
+    if (own !== undefined) return { perHour: own, whose: "its market's" };
     const v = this.#input.config.fundingLimits[leg.venue];
-    return v === undefined ? null : v.bySymbol?.[leg.symbol] ?? v.all;
+    const lim = v === undefined ? null : v.bySymbol?.[leg.symbol] ?? v.all;
+    return lim === null ? null : { perHour: side === 'cap' ? lim.capPerHour : lim.floorPerHour, whose: "its venue's" };
   }
 
   #atCap(leg: ScanLeg): string | null {
     const r = leg.ratePerHour;
-    const lim = this.#limit(leg);
-    if (lim !== null && r >= lim.capPerHour * (1 - 1e-6)) return `At the cap: ${leg.venue} ${leg.symbol} reads ${perHour(r)}, its venue's funding cap of ${perHour(lim.capPerHour)}`;
-    if (lim !== null && r <= lim.floorPerHour * (1 - 1e-6)) return `At the cap: ${leg.venue} ${leg.symbol} reads ${perHour(r)}, its venue's funding floor of ${perHour(lim.floorPerHour)}`;
+    const where = `${venueName(leg.venue)} ${leg.symbol}`;
+    const cap = this.#limit(leg, 'cap');
+    if (cap !== null && r >= cap.perHour * (1 - 1e-6)) return `At the cap: ${where} reads ${perHour(r)}, ${cap.whose} funding cap of ${perHour(cap.perHour)}`;
+    const floor = this.#limit(leg, 'floor');
+    if (floor !== null && r <= floor.perHour * (1 - 1e-6)) return `At the cap: ${where} reads ${perHour(r)}, ${floor.whose} funding floor of ${perHour(floor.perHour)}`;
     if (Math.abs(r) < FAR_PER_HOUR) return null;
     const venues = [...new Set((this.#byBase.get(leg.base) ?? []).filter((o) => sameRate(o.ratePerHour, r)).map((o) => o.venue))].sort();
     if (venues.length < MIN_SAME_RATE) return null;
-    return `At the cap: ${list(venues)} all read ${leg.base} at exactly ${perHour(r)}: ${venues.length} venues sharing one rate to the digit is a funding cap or floor, not the market's premium`;
+    return `At the cap: ${venueNames(venues)} all read ${leg.base} at exactly ${perHour(r)}: ${venues.length} venues sharing one rate to the digit is a funding cap or floor, not the market's premium`;
   }
 
   #noData(leg: ScanLeg): boolean {
@@ -231,7 +239,7 @@ export class WatchQuality {
     if (!this.#noData(leg)) return null;
     const second = (this.#byBase.get(leg.base) ?? []).some((o) => o.venue !== leg.venue && !this.#noData(o) && agrees(o.ratePerHour, leg.ratePerHour));
     if (second) return null;
-    return `Unconfirmed: ${leg.venue} ${leg.symbol} has no mark, open interest or history of its own, and no venue with data of its own reads ${leg.base} near ${perHour(leg.ratePerHour)}`;
+    return `Unconfirmed: ${venueName(leg.venue)} ${leg.symbol} has no mark, open interest or history of its own, and no venue with data of its own reads ${leg.base} near ${perHour(leg.ratePerHour)}`;
   }
 
   #atBaseline(leg: ScanLeg): boolean {
@@ -251,7 +259,7 @@ export class WatchQuality {
     const agreeing = crowd.filter((r) => Math.sign(r) === Math.sign(m) && Math.abs(r) >= Math.abs(m) / 3 && Math.abs(r) <= 3 * Math.abs(m));
     const atBaseline = all.filter((o) => this.#atBaseline(o)).length;
     if (agreeing.length < MIN_CROWD || agreeing.length < 3 * atBaseline) return null;
-    return `Lone baseline: ${leg.venue} ${leg.symbol} reads the quiet ${perHour(leg.ratePerHour)} while ${agreeing.length} other venues agree near ${perHour(m)}: more likely a default than the market's rate`;
+    return `Lone baseline: ${venueName(leg.venue)} ${leg.symbol} reads the quiet ${perHour(leg.ratePerHour)} while ${agreeing.length} other venues agree near ${perHour(m)}: more likely a default than the market's rate`;
   }
 
   /**
@@ -274,11 +282,11 @@ export class WatchQuality {
       if (exchange === undefined) throw new Error(`quality: no session for the exchange of ${leg.base}`);
       return inSession(exchange, this.#input.now)
         ? null
-        : `Market closed: ${leg.base} is a stock perp (${stock.leg.venue} ${stock.leg.symbol}) and ${exchange.name}, whose hours it keeps, is not in session at ${when}: its rates are not set by a live market`;
+        : `Market closed: ${leg.base} is a stock perp (${venueName(stock.leg.venue)} ${stock.leg.symbol}) and ${exchange.name}, whose hours it keeps, is not in session at ${when}: its rates are not set by a live market`;
     }
     const traditional = this.#listing(leg, false);
     if (traditional !== null && this.#weekend) {
-      return `Market closed: ${leg.base} is a commodity, index or FX market (${traditional.leg.venue} ${traditional.leg.symbol}) and its futures are shut for the weekend at ${when}: its rates are not set by a live market`;
+      return `Market closed: ${leg.base} is a commodity, index or FX market (${venueName(traditional.leg.venue)} ${traditional.leg.symbol}) and its futures are shut for the weekend at ${when}: its rates are not set by a live market`;
     }
     return null;
   }
