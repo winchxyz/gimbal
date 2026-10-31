@@ -155,9 +155,10 @@ export function fakeHistory(spec: Spec, now: number): WindowHistory {
   return { windowId: specId(spec), points };
 }
 
-/** The fake engine API: the same two reads the real engine serves. */
-export function fakeApi(): EngineApi {
+/** The fake engine API: the same reads the real engine serves. The journal comes from fake-journal.ts, passed in by start.ts. */
+export function fakeApi(journal: EngineApi['journal'] = async () => []): EngineApi {
   return {
+    journal,
     strategy: async () => ({ ...FAKE_STRATEGY }),
     windowHistory: async (id) => {
       const spec = SPECS.find((s) => specId(s) === id);

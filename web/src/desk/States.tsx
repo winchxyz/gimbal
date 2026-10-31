@@ -12,6 +12,7 @@ const ROWS: { label: string; only?: 'd-desk' | 'd-phone' }[] = [
   { label: 'Margin', only: 'd-phone' },
   { label: 'Margin ratio', only: 'd-desk' },
   { label: 'Funding earned' },
+  { label: 'Fees paid' },
   { label: 'Unsettled funding' },
   { label: 'Next funding' },
 ];
