@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import type { HlClearinghouseState, HlFundingRow, HlL2Book, HlMetaAndAssetCtxs } from './hyperliquid.ts';
 import {
   HL_MAINNET_INFO_URL, HL_TESTNET_INFO_URL, HlHttpError, HyperliquidReader, parseAccount, parseBook, parseFunding,
-  parseFundingRow, parseMarkets,
+  hlBase, parseFundingHistoryRow, parseFundingRow, parseMarkets,
 } from './hyperliquid.ts';
 import { VirtualClock } from './replay.ts';
 
@@ -49,7 +49,7 @@ test('funding skips delisted assets and points nextAt at the next full hour', ()
   const rows = parseFunding(META_AND_CTXS[0], META_AND_CTXS[1], now);
   assert.deepEqual(rows.map((r) => r.symbol), ['BTC', 'HPOS']);
   assert.deepEqual(rows[0], {
-    venue: 'hyperliquid', symbol: 'BTC', ratePerHour: 0.0000125, settlement: 'hourly',
+    venue: 'hyperliquid', symbol: 'BTC', base: 'BTC', ratePerHour: 0.0000125, settlement: 'hourly',
     nextAt: Date.UTC(2026, 9, 30, 17), markPx: 77597, oraclePx: 77597, openInterest: 10.5, volume24hUsd: 123456.7,
   });
   assert.equal(rows[1]!.ratePerHour, -0.0003);
@@ -259,4 +259,39 @@ test('userFunding refuses bad arguments before asking the venue', async () => {
   await assert.rejects(hl.userFunding(ADDR, Number.NaN), RangeError);
   await assert.rejects(hl.userFunding(ADDR, 100, 99), RangeError);
   assert.equal(calls.length, 0);
+});
+
+test('base symbols: a k-market is 1000 of its base; anything else is its own base', () => {
+  assert.deepEqual(hlBase('kPEPE'), { base: 'PEPE', multiplier: 1000 });
+  assert.deepEqual(hlBase('kBONK'), { base: 'BONK', multiplier: 1000 });
+  assert.deepEqual(hlBase('BTC'), { base: 'BTC', multiplier: 1 });
+  // A plain name that starts with k is not cut, and neither is the bare letter.
+  assert.deepEqual(hlBase('kaito'), { base: 'kaito', multiplier: 1 });
+  assert.deepEqual(hlBase('k'), { base: 'k', multiplier: 1 });
+  const meta: HlMetaAndAssetCtxs = [{ universe: [{ name: 'kPEPE', szDecimals: 0, maxLeverage: 10 }] }, [ctx('0.0000125', '0.004969')]];
+  const [pepe] = parseFunding(meta[0], meta[1], Date.UTC(2026, 9, 31, 2, 30));
+  assert.equal(pepe!.base, 'PEPE');
+  assert.equal(pepe!.multiplier, 1000);
+  assert.equal(pepe!.symbol, 'kPEPE');
+});
+
+test('marketFundingHistory pages fundingHistory 500 rows at a time, oldest first, inside the window asked', async () => {
+  const H = 3_600_000;
+  const start = Date.UTC(2026, 9, 1);
+  // 700 hourly prints booked 59 ms after each hour, as the venue does.
+  const all = Array.from({ length: 700 }, (_, i) => ({ coin: 'SOL', fundingRate: (0.00001 * (i % 3)).toString(), premium: '0', time: start + i * H + 59 }));
+  const { f, calls } = fakeFetch((b) => {
+    assert.equal(b.type, 'fundingHistory');
+    return { json: all.filter((r) => r.time >= (b.startTime as number) && r.time <= (b.endTime as number)).slice(0, 500) };
+  });
+  const end = start + 600 * H;
+  const points = await new HyperliquidReader({ fetch: f }).marketFundingHistory('SOL', start, end);
+  assert.equal(points.length, 600);
+  assert.deepEqual(points[0], { time: start + 59, symbol: 'SOL', ratePerHour: 0, periodHours: 1 });
+  assert.equal(points[1]!.ratePerHour, 0.00001);
+  assert.equal(points.at(-1)!.time, start + 599 * H + 59);
+  assert.deepEqual(calls.map((c) => [c.coin, c.startTime, c.endTime]), [['SOL', start, end], ['SOL', start + 499 * H + 59, end]]);
+  assert.deepEqual(parseFundingHistoryRow({ coin: 'kPEPE', fundingRate: '-0.0000025', premium: '0', time: 5 }), { time: 5, symbol: 'kPEPE', ratePerHour: -0.0000025, periodHours: 1 });
+  assert.throws(() => parseFundingHistoryRow({ coin: 'SOL', fundingRate: 'x', premium: '0', time: 5 }), /fundingRate/);
+  await assert.rejects(new HyperliquidReader({ fetch: f }).marketFundingHistory('SOL', 10, 5), RangeError);
 });

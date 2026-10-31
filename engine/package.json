@@ -9,7 +9,8 @@
     "test": "node --test \"src/**/*.test.ts\"",
     "record": "node src/cli/record.ts",
     "capture": "node src/cli/capture.ts",
-    "smoke": "node src/cli/smoke.ts"
+    "smoke": "node src/cli/smoke.ts",
+    "serve": "node src/cli/serve.ts"
   },
   "dependencies": {
     "@ellipsis-labs/rise": "0.6.2",

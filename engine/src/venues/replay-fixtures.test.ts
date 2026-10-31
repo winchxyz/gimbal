@@ -1,4 +1,5 @@
-// Plays every committed recording in fixtures/replay/ and checks it twice gives the same results.
+// Plays every committed Hyperliquid recording (hl-*) in fixtures/replay/ and checks it twice gives the same results.
+// The scanner's multi-venue recordings (scan-*) are played by src/scanner/replay-hour.test.ts.
 
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -10,7 +11,7 @@ import { ReplayMissError, ReplayVenue, VirtualClock, readRecording } from './rep
 import type { Book } from './venue.ts';
 
 const FIXTURES = fileURLToPath(new URL('../../fixtures/replay/', import.meta.url));
-const files = readdirSync(FIXTURES).filter((f) => f.endsWith('.jsonl.gz')).sort();
+const files = readdirSync(FIXTURES).filter((f) => f.startsWith('hl-') && f.endsWith('.jsonl.gz')).sort();
 const STEP_MS = 5_000;
 const COINS = ['BTC', 'ETH', 'SOL'];
 

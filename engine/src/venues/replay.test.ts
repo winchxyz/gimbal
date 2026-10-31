@@ -9,7 +9,7 @@ import { JsonlGzWriter, RecordingVenue, recordingFetch, recordingWsRequester } f
 import {
   ReplayMissError, ReplayVenue, ScaledClock, VirtualClock, parseRecording, readRecording, readWireRecording, replayFetch, replayWsRequester,
 } from './replay.ts';
-import type { AccountState, Book, FundingPayment, Market, MarketFunding, VenueReader } from './venue.ts';
+import type { AccountState, Book, FundingPayment, Market, MarketFunding, MarketFundingPoint, VenueReader } from './venue.ts';
 
 const dir = mkdtempSync(join(tmpdir(), 'gimbal-replay-'));
 after(() => rmSync(dir, { recursive: true, force: true }));
@@ -252,6 +252,37 @@ test('userFunding is recorded with its window and replayed for the same window o
   await assert.rejects(replay.userFunding('0xabc', 1_000, 9_001), ReplayMissError);
   (await replay.userFunding('0xabc', 1_000))[0]!.fundingUsd = 99;
   assert.equal((await replay.userFunding('0xabc', 1_000))[0]!.fundingUsd, -1);
+});
+
+class HistoryFakeReader extends FakeReader {
+  async marketFundingHistory(symbol: string, startTime: number, endTime: number): Promise<MarketFundingPoint[]> {
+    if (symbol === 'BAD') throw new Error('hyperliquid fundingHistory: unknown coin BAD');
+    return [{ time: startTime + 59, symbol, ratePerHour: 0.00001, periodHours: 1 }, { time: endTime, symbol, ratePerHour: -0.00002, periodHours: 1 }];
+  }
+}
+
+test('market funding history is recorded with its exact window and replayed for that window only', async () => {
+  const path = join(dir, 'market-history.jsonl.gz');
+  const clock = new VirtualClock(T0);
+  const writer = new JsonlGzWriter(path);
+  const rec = new RecordingVenue(new HistoryFakeReader(clock), writer, clock);
+  const sol = await rec.marketFundingHistory('SOL', 1_000, 9_000);
+  await assert.rejects(rec.marketFundingHistory('BAD', 1_000, 9_000), /unknown coin BAD/);
+  // A reader without the method fails, and the failure is recorded like any other.
+  const plain = new RecordingVenue(new FakeReader(clock), writer, clock);
+  await assert.rejects(plain.marketFundingHistory('SOL', 1_000, 9_000), /hyperliquid: no public funding history/);
+  await writer.close();
+
+  const lines = readRecording(path);
+  assert.deepEqual(lines.map((l) => [l.method, l.args, l.error ?? 'ok']), [
+    ['marketFundingHistory', ['SOL', 1_000, 9_000], 'ok'],
+    ['marketFundingHistory', ['BAD', 1_000, 9_000], 'hyperliquid fundingHistory: unknown coin BAD'],
+    ['marketFundingHistory', ['SOL', 1_000, 9_000], lines[2]!.error!],
+  ]);
+  const replay = new ReplayVenue(lines.slice(0, 2), new VirtualClock(lines[1]!.t));
+  assert.deepEqual(await replay.marketFundingHistory('SOL', 1_000, 9_000), sol);
+  await assert.rejects(replay.marketFundingHistory('BAD', 1_000, 9_000), /unknown coin BAD/);
+  await assert.rejects(replay.marketFundingHistory('SOL', 1_000, 9_001), ReplayMissError);
 });
 
 test('every reader has a funding history (interfaces 3): an empty one is recorded and replayed as empty', async () => {

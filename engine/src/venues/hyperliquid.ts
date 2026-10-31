@@ -1,9 +1,11 @@
 // Hyperliquid reader over the public info endpoint. Everything here is a POST to /info; no keys.
 
 import type {
-  AccountState, Book, BookLevel, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, Position, VenueReader,
+  AccountState, Book, BookLevel, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, MarketFundingPoint,
+  MarketHistorySource, Position, VenueReader,
 } from './venue.ts';
 import { systemClock, trimBook } from './venue.ts';
+import { baseFields, kiloBase } from './base-symbol.ts';
 
 export type HlNetwork = 'mainnet' | 'testnet';
 
@@ -84,6 +86,13 @@ export interface HlFundingRow {
   };
 }
 
+export interface HlFundingHistoryRow {
+  coin: string;
+  fundingRate: string;           // per hour
+  premium: string;
+  time: number;                  // ms, when the hour's payment was booked (a few ms after the top of the hour)
+}
+
 export interface HyperliquidReaderOptions {
   network?: HlNetwork;           // picks the endpoint; default mainnet
   url?: string;                  // full /info URL; overrides the endpoint `network` picks (proxies, tests)
@@ -104,7 +113,7 @@ export class HlHttpError extends Error {
   }
 }
 
-export class HyperliquidReader implements VenueReader, FundingHistorySource {
+export class HyperliquidReader implements VenueReader, FundingHistorySource, MarketHistorySource {
   readonly id = 'hyperliquid' as const;
   readonly network: HlNetwork;
   readonly infoUrl: string;
@@ -192,6 +201,38 @@ export class HyperliquidReader implements VenueReader, FundingHistorySource {
     return out.sort((a, b) => a.time - b.time);
   }
 
+  /**
+   * Hourly funding prints of one market with `startTime <= time <= endTime` (ms), oldest first, from the public
+   * `fundingHistory`. It answers at most 500 rows a request (about three weeks of hours), so this pages forward.
+   */
+  async marketFundingHistory(symbol: string, startTime: number, endTime: number): Promise<MarketFundingPoint[]> {
+    if (!Number.isInteger(startTime) || !Number.isInteger(endTime) || startTime < 0 || endTime < startTime) {
+      throw new RangeError(`marketFundingHistory needs ms timestamps with start <= end, got ${startTime}, ${endTime}`);
+    }
+    const out: MarketFundingPoint[] = [];
+    const seen = new Set<number>();
+    let from = startTime;
+    for (let page = 0; ; page++) {
+      if (page >= FUNDING_MAX_PAGES) throw new Error(`hyperliquid fundingHistory: still more rows after ${FUNDING_MAX_PAGES} pages`);
+      const rows = await this.#info<HlFundingHistoryRow[]>({ type: 'fundingHistory', coin: symbol, startTime: from, endTime });
+      if (!Array.isArray(rows)) throw new Error('hyperliquid fundingHistory: expected a list of rows');
+      let last = from;
+      let fresh = 0;
+      for (const row of rows) {
+        const point = parseFundingHistoryRow(row);
+        last = Math.max(last, point.time);
+        if (seen.has(point.time) || point.time < startTime || point.time > endTime) continue;
+        seen.add(point.time);
+        fresh++;
+        out.push(point);
+      }
+      if (rows.length < FUNDING_PAGE_ROWS) break;
+      if (fresh === 0) throw new Error(`hyperliquid fundingHistory: a full page added nothing at ${last}; cannot page past it`);
+      from = last;
+    }
+    return out.sort((a, b) => a.time - b.time);
+  }
+
   async #info<T>(body: { type: string } & Record<string, unknown>): Promise<T> {
     const res = await this.#fetch(this.infoUrl, {
       method: 'POST',
@@ -241,6 +282,7 @@ export function parseFunding(meta: HlMeta, ctxs: HlAssetCtx[], now: number): Mar
     out.push({
       venue: 'hyperliquid',
       symbol: a.name,
+      ...baseFields(hlBase(a.name)),
       ratePerHour: num(c.funding, 'funding'),
       settlement: 'hourly',
       nextAt,
@@ -251,6 +293,18 @@ export function parseFunding(meta: HlMeta, ctxs: HlAssetCtx[], now: number): Mar
     });
   });
   return out;
+}
+
+/** The cross-venue key of a main-dex coin: "kPEPE" is 1000 PEPE; every other name is its own base. */
+export function hlBase(coin: string): { base: string; multiplier: number } {
+  return kiloBase(coin);
+}
+
+export function parseFundingHistoryRow(row: HlFundingHistoryRow): MarketFundingPoint {
+  if (typeof row?.time !== 'number' || typeof row.coin !== 'string') {
+    throw new Error(`hyperliquid fundingHistory: malformed row ${JSON.stringify(row).slice(0, 120)}`);
+  }
+  return { time: row.time, symbol: row.coin, ratePerHour: num(row.fundingRate, 'fundingRate'), periodHours: 1 };
 }
 
 export function parseBook(raw: HlL2Book): Book {
