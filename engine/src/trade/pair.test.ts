@@ -506,6 +506,21 @@ test('while an order has no answer, open is refused naming it; a reduce-only clo
   assert.deepEqual(g.a.orders.map((o) => [o.side, o.reduceOnly]), [['SELL', true], ['SELL', true], ['SELL', true]], 'no BUY on Hyperliquid');
   assert.match(r.notes.join(' '), /not re-hedged: hyperliquid has SELL \S+ reduce-only \(hyperliquid-1\) with no answer, which may still run until \S+; an order on it that is not reduce-only could double that/);
   assert.match(g.trader.unhedged ?? '', /^unhedged: hyperliquid holds 0\.002, orderly holds -0\.005, which do not offset each other$/);
+
+  // The pending order is on the leg hedged against: the old SELL runs after the second close read Hyperliquid, so the
+  // new reduce-only SELL is refused twice on a leg it already closed. Orderly is not reopened against it.
+  const h = setup({ pos: '0.005', script: ['unknown-none', 'fail', 'fail'] }, { pos: '-0.005' });
+  assert.equal((await h.trader.close({ reason: 'close' })).status, 'unhedged');
+  const order = h.a.order.bind(h.a);
+  h.a.order = async (side, size, reduceOnly, reason) => {
+    h.a.pos = 0n;                                     // the old SELL runs now
+    return order(side, size, reduceOnly, reason);
+  };
+  const h2 = await h.trader.close({ reason: 'close again' });
+  assert.equal(h2.status, 'unhedged', 'not stuck: Orderly would be open alone');
+  assert.deepEqual(h.b.orders.map((o) => [o.side, o.reduceOnly]), [['BUY', true]], 'Orderly not reopened');
+  assert.match(h2.notes.join(' '), /not re-hedged: hyperliquid has SELL \S+ reduce-only \(hyperliquid-1\) with no answer, which may still run until \S+; it may have run since hyperliquid was read, and orderly reopened against it would then be open alone/);
+  assert.notEqual(h.trader.unhedged, null);
 });
 
 test('an open whose Hyperliquid read failed: when the leg reads again unmoved, Orderly goes back as a first read would have sent it', async () => {
@@ -556,6 +571,55 @@ test('an open whose Hyperliquid read failed: when the leg reads again unmoved, O
   assert.equal(l.trader.unsettled(l.a), null);
 });
 
+test('a deferred unwind whose Orderly read fails waits, alerted once, and goes out on a later read', async () => {
+  const f = setup({ script: ['unknown-lost'] });
+  assert.equal((await f.trader.open({ size: '0.005', longIndex: 0, reason: 'open' })).status, 'unhedged');
+  f.a.unreadable = false;
+  f.b.unreadable = true;
+  await f.trader.positionPushed(f.a, 0n);
+  assert.deepEqual(f.watches.map((w) => w.status), ['unhedged']);
+  assert.match(f.watches[0]!.notes.join(' '), /orderly cannot be read, so its unwind to 0 waits; it is tried again on the next read of hyperliquid/);
+  assert.equal(f.b.orders.length, 1);
+  await f.trader.positionPushed(f.a, 0n);              // still unreadable: tried again, not alerted again
+  assert.equal(f.watches.length, 1);
+  f.b.unreadable = false;
+  await f.trader.positionPushed(f.a, 0n);
+  assert.deepEqual(f.watches.map((w) => w.status), ['unhedged', 'rehedged']);
+  assert.deepEqual(f.b.orders.map((o) => [o.side, o.reduceOnly]), [['SELL', false], ['BUY', true]]);
+  assert.deepEqual([f.a.pos, f.b.pos], [0n, 0n]);
+  assert.equal(f.trader.unhedged, null);
+
+  // At the end of the window: the entry stays while the unwind waits, and open stays refused.
+  const w = setup({ script: ['unknown-lost'] });
+  assert.equal((await w.trader.open({ size: '0.005', longIndex: 0, reason: 'open' })).status, 'unhedged');
+  w.shared.now = w.trader.unsettled(w.a)!.until + 1;
+  w.a.unreadable = false;
+  w.b.unreadable = true;
+  await w.trader.positionPushed(w.a, 0n);
+  assert.deepEqual(w.watches.map((x) => x.status), ['unhedged']);
+  assert.notEqual(w.trader.unsettled(w.a), null);
+  const blocked = await w.trader.open({ size: '0.005', longIndex: 0, reason: 'open' });
+  assert.equal(blocked.status, 'unhedged');
+  assert.match(blocked.notes[0]!, /^open refused, nothing sent: the hyperliquid BUY \S+ \(hyperliquid-1\) can no longer run, but orderly could not be read for the unwind that waits on it/);
+  w.b.unreadable = false;
+  await w.trader.positionPushed(w.a, 0n);
+  assert.deepEqual(w.watches.map((x) => x.status), ['unhedged', 'rehedged']);
+  assert.deepEqual([w.a.pos, w.b.pos], [0n, 0n]);
+  assert.equal(w.trader.unsettled(w.a), null);
+
+  // A close that finishes first ends the wait: a later read unwinds nothing.
+  const c = setup({ script: ['unknown-lost'] });
+  assert.equal((await c.trader.open({ size: '0.005', longIndex: 0, reason: 'open' })).status, 'unhedged');
+  c.a.unreadable = false;
+  c.b.unreadable = true;
+  await c.trader.positionPushed(c.a, 0n);
+  c.b.unreadable = false;
+  assert.equal((await c.trader.close({ reason: 'close' })).status, 'closed');
+  const sent = c.b.orders.length;
+  await c.trader.positionPushed(c.a, 0n);
+  assert.equal(c.b.orders.length, sent);
+});
+
 test('at the end of its window the leg is read once more: a landing in the last seconds is seen; an unreadable leg keeps the alert', async () => {
   const c = setup({ pos: '0.005', script: ['unknown-none'] }, { pos: '-0.005' });
   assert.equal((await c.trader.close({ reason: 'close' })).status, 'unhedged');
@@ -579,6 +643,18 @@ test('at the end of its window the leg is read once more: a landing in the last 
   assert.deepEqual(o.watches.map((w) => w.status), ['unhedged']);
   assert.match(o.trader.unhedged ?? '', /^unhedged: hyperliquid BUY \S+ \(hyperliquid-1\) had no answer; since \S+ it can no longer run, but hyperliquid cannot be read: whether it ran is unknown, and the leg counts as open$/);
   assert.equal(o.trader.unsettled(o.a), null);
+
+  // The last read shows a part-run, and the reduce-only close of the rest has no answer too: it is watched anew.
+  const t = setup({ pos: '0.005', script: ['unknown-none', 'unknown-none'] }, { pos: '-0.005' });
+  assert.equal((await t.trader.close({ reason: 'close' })).status, 'unhedged');
+  const end = t.trader.unsettled(t.a)!.until;
+  t.a.pos = q('0.002');                               // part of the SELL ran
+  t.shared.now = end + 1;
+  await t.trader.positionPushed(t.a, q('0.005'));
+  assert.deepEqual(t.watches.map((w) => w.status), ['unhedged']);
+  assert.deepEqual(t.a.orders.map((x) => [x.side, x.size, x.reduceOnly]), [['SELL', '0.005', true], ['SELL', '0.002', true]]);
+  assert.equal(t.trader.unsettled(t.a)?.until, end + 1 + UNSETTLED_WATCH_MS, 'the new SELL is watched for its own window');
+  assert.ok(t.trader.watching(t.a));
 });
 
 test('the unsettled watch reads Hyperliquid itself every 15 s (nothing pushes it) until the order runs or cannot', async () => {

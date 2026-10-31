@@ -133,7 +133,14 @@ interface Unsettled {
   refs: LegRef[];
   until: number;
   from: bigint;
-  unwind: { to: bigint; reason: string } | null;
+  unwind: Unwind | null;
+}
+
+/** An unwind of the other leg that waits for this one to read again unmoved; `failed`: the other leg's read failed. */
+interface Unwind {
+  to: bigint;
+  reason: string;
+  failed: boolean;
 }
 
 interface LegRun {
@@ -246,8 +253,9 @@ export class PairTrader {
       if (this.#unsettled.has(leg)) return this.#serial(() => this.#lapse(leg)).catch((err) => this.#log(`${leg.venue} ${leg.symbol}: ${errorText(err)}`));
       return Promise.resolve();
     }
-    const unsettled = this.#unsettled.has(leg);
-    if (unsettled ? this.#known.get(leg) === position : this.#intent.get(leg) === position) return Promise.resolve();
+    const unsettled = this.#unsettled.get(leg);
+    // An unmoved push is nothing new, unless an unwind waits on it (its other leg could not be read last time).
+    if (unsettled !== undefined ? this.#known.get(leg) === position && unsettled.unwind === null : this.#intent.get(leg) === position) return Promise.resolve();
     const queued = this.#pending.get(leg);
     if (queued !== undefined) return queued;
     // The push is the newest state: the check reads from it on, not from when its turn comes.
@@ -380,9 +388,17 @@ export class PairTrader {
     }
     const lighter = abs(exposure(a)) <= abs(exposure(b)) ? a : b;
     const hedgeTo = lighter.pos! - residual;
-    const pending = this.#unsettled.get(lighter.leg);
-    if (pending !== undefined) {
-      notes.push(`not re-hedged: ${lighter.leg.venue} has ${pendingText(pending)} with no answer, which may still run until ${iso(pending.until)}; an order on it that is not reduce-only could double that`);
+    // Either leg with an order that can still run: on this one, a reopen could double it; on the other, it may have
+    // run since its start was read (a reduce-only refused on a leg it already closed), and this one reopened against
+    // it would be open alone. Not re-hedged: unhedged, with the alert.
+    const heavier = lighter === a ? b : a;
+    const blocker = [lighter, heavier].find((r) => this.#pendingOn(r.leg) !== undefined);
+    if (blocker !== undefined) {
+      const pending = this.#pendingOn(blocker.leg)!;
+      const why = blocker === lighter
+        ? 'an order on it that is not reduce-only could double that'
+        : `it may have run since ${blocker.leg.venue} was read, and ${lighter.leg.venue} reopened against it would then be open alone`;
+      notes.push(`not re-hedged: ${blocker.leg.venue} has ${pendingText(pending)} with no answer, which may still run until ${iso(pending.until)}; ${why}`);
       return this.#stop(size, runs, notes, net);
     }
     notes.push(`re-hedging: ${lighter.leg.venue} back to ${signedQtyString(hedgeTo)} against the leg that stayed open`);
@@ -407,7 +423,7 @@ export class PairTrader {
       if (later) notes.push(`when ${lost[0]!.leg.venue} reads again unmoved, ${other.leg.venue} goes back to its start ${signedQtyString(other.start)} reduce-only`);
       const result = this.#stop(size, runs, notes, net);
       const u = later ? this.#unsettled.get(lost[0]!.leg) : undefined;
-      if (u !== undefined) u.unwind = { to: other!.start, reason };
+      if (u !== undefined) u.unwind = { to: other!.start, reason, failed: false };
       return result;
     }
     const others = runs.filter((r) => r.unsettled === null);
@@ -449,7 +465,9 @@ export class PairTrader {
     }
     const pending = this.legs.flatMap((leg) => {
       const u = this.#unsettled.get(leg);
-      return u === undefined ? [] : [`the ${leg.venue} ${pendingText(u)} ${u.refs.length === 1 ? 'has' : 'have'} no answer and may still run until ${iso(u.until)}`];
+      if (u === undefined) return [];
+      if (this.#clock.now() > u.until) return [`the ${leg.venue} ${pendingText(u)} can no longer run, but ${this.#partner(leg).venue} could not be read for the unwind that waits on it`];
+      return [`the ${leg.venue} ${pendingText(u)} ${u.refs.length === 1 ? 'has' : 'have'} no answer and may still run until ${iso(u.until)}`];
     });
     if (pending.length === 0) return null;
     return this.#refused(size, [
@@ -647,17 +665,20 @@ export class PairTrader {
       // Where the order left the leg: the last position read, or the one before the order when no read since worked.
       const known = this.#known.get(leg) ?? null;
       const was = known ?? unsettled.from;
-      if (pos === was && known !== null) return;   // the order has not run (the push was older than the venue's state)
       run.start = was;
       run.pos = pos;
       run.report.start = signedQtyString(was);
+      if (pos === was && known !== null) {
+        // The order has not run (the push was older than the venue's state). An unwind whose other leg could not be
+        // read last time is tried again.
+        if (unsettled.unwind !== null) return this.#unwindPartner(run, unsettled, notes);
+        return;
+      }
       if (pos === was) {
         // The leg reads again, and its order has not run (yet): its position is known again, the order still watched.
         this.#known.set(leg, pos);
         notes.push(`${leg.venue} ${leg.symbol} reads again: ${signedQtyString(pos)}, so ${unsettled.ref.side} ${unsettled.ref.size} (${refId(unsettled.ref)}) has not run; it may until ${iso(unsettled.until)}`);
-        const back = unsettled.unwind;
-        unsettled.unwind = null;
-        if (back !== null) return this.#unwindPartner(run, back, notes);
+        if (unsettled.unwind !== null) return this.#unwindPartner(run, unsettled, notes);
         if (this.#offsets()) return this.#watched('settled', [run], notes);
         const partner = this.#partner(leg);
         notes.push(`unhedged: ${leg.venue} holds ${signedQtyString(pos)}, ${partner.venue} holds ${knownText(this.#known.get(partner))}: the legs do not offset each other`);
@@ -743,12 +764,23 @@ export class PairTrader {
   /**
    * The leg of an open that stopped on a read that failed reads again, unmoved (`run`): its order had not run. The
    * other leg goes back to its start reduce-only (twice at most), as #halt would have sent it had the first read
-   * worked; the order may still run, and the leg's intent is now what offsets the other one.
+   * worked; the order may still run, and the leg's intent is now what offsets the other one. When the other leg
+   * cannot be read, the unwind waits: it is tried again on this leg's next read, until a later open or close.
    */
-  async #unwindPartner(run: LegRun, back: { to: bigint; reason: string }, notes: string[]): Promise<void> {
+  async #unwindPartner(run: LegRun, u: Unsettled, notes: string[]): Promise<void> {
+    const back = u.unwind!;
     const partner = this.#partner(run.leg);
     const from = await this.#read(partner, undefined, 'the unwind its partner waited for');
-    const p = this.#run(partner, from ?? back.to, back.to);
+    if (from === null) {
+      const waits = `${partner.venue} cannot be read, so its unwind to ${signedQtyString(back.to)} waits; it is tried again on the next read of ${run.leg.venue}`;
+      if (back.failed) return this.#log(`${run.leg.venue} ${run.leg.symbol}: ${waits}`);   // alerted already
+      back.failed = true;
+      notes.push(waits, `unhedged: ${run.leg.venue} holds ${signedQtyString(run.pos!)}, and ${partner.venue}, which an unwind waits for, cannot be read`);
+      this.unhedged = notes.at(-1)!;
+      return this.#watched('unhedged', [run], notes);
+    }
+    u.unwind = null;
+    const p = this.#run(partner, from, back.to);
     p.pos = from;
     notes.push(`as the first read would have: ${partner.venue} back to its start ${signedQtyString(back.to)} reduce-only`);
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -875,9 +907,9 @@ export class PairTrader {
   /**
    * The window of an unsettled order ended: it no longer can run. The last read can be a poll's, 15 s old, so the leg
    * is read once more: moved, the order ran, and the leg is reconciled (#check). Unmoved: not offset, the alert again;
-   * offset, an alert raised earlier is cleared, as a settled landing clears it; a leg that was never read since its
-   * open stopped gets its other leg unwound now (#unwindPartner). A read that fails keeps the alert: whether the order
-   * ran is unknown, and the leg counts as open.
+   * offset, an alert raised earlier is cleared, as a settled landing clears it; an unwind that waits on the leg goes
+   * out now (#unwindPartner), and while its other leg cannot be read the entry stays, to be tried again. A read that
+   * fails keeps the alert: whether the order ran is unknown, and the leg counts as open.
    */
   async #lapse(leg: TradeLeg): Promise<void> {
     const u = this.#unsettled.get(leg);
@@ -887,7 +919,9 @@ export class PairTrader {
     let pos = await this.#read(leg, undefined, 'at the end of the window of an order with no answer');
     if (pos !== null && pos !== was) {
       await this.#check(leg, pos, this.#clock.now());
-      if (!this.#unsettled.has(leg)) return;           // it ran, and #check reconciled the leg
+      // It ran and #check reconciled the leg; or the reconcile's own order has no answer, and is watched anew.
+      const after = this.#unsettled.get(leg);
+      if (after === undefined || after.until >= this.#clock.now()) return;
       pos = this.#known.get(leg) ?? null;
     }
     this.#unsettled.delete(leg);
@@ -904,7 +938,12 @@ export class PairTrader {
     }
     const note = u.refs.length === 1 ? `${what} and never ran; since ${iso(u.until)} it no longer can` : `${what} can no longer run since ${iso(u.until)}`;
     this.#known.set(leg, pos);
-    if (known === null && u.unwind !== null) return this.#unwindPartner(run, u.unwind, [note]);
+    if (u.unwind !== null) {
+      await this.#unwindPartner(run, u, [note]);
+      // The other leg could not be read: the entry stays past its window, and the next poll or push tries again.
+      if (u.unwind !== null) this.#unsettled.set(leg, u);
+      return;
+    }
     if (this.#offsets()) {
       this.#watched('lapsed', [run], [`${note}; the legs offset each other`]);
       return;
@@ -919,6 +958,12 @@ export class PairTrader {
     const a = this.#known.get(this.legs[0]) ?? null;
     const b = this.#known.get(this.legs[1]) ?? null;
     return a !== null && b !== null && a + b === this.#net;
+  }
+
+  /** The unsettled orders on a leg while one can still run (not an entry kept past its window for an unwind). */
+  #pendingOn(leg: TradeLeg): Unsettled | undefined {
+    const u = this.#unsettled.get(leg);
+    return u !== undefined && this.#clock.now() <= u.until ? u : undefined;
   }
 
   #partner(leg: TradeLeg): TradeLeg {
