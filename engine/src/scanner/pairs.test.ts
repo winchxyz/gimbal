@@ -2,7 +2,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { filterLegs, isDeskVenue, pairLegs, toLeg, windowId } from './pairs.ts';
+import { filterLegs, heldLegKeys, isDeskVenue, pairLegs, toLeg, windowId } from './pairs.ts';
 import { T0, leg, row } from './test-helpers.ts';
 
 const OPTS = { oiFloorUsd: 500_000, maxMarkDeviation: 0.1 };
@@ -110,6 +110,34 @@ test('pairs: both directions per base, never CEX against CEX; gross uses what th
     leg('hyperliquid', 'SOL'),
   ]).map((p) => p.id).sort();
   assert.deepEqual(unknown, ['sol-aster-hyperliquid', 'sol-bybit-hyperliquid', 'sol-hyperliquid-aster', 'sol-hyperliquid-bybit']);
+});
+
+test('the held window\'s legs are never dropped: kept with what they failed, and paired into that window only', () => {
+  const legs = [
+    leg('phoenix', 'SOL', { markPx: 100, openInterest: 400 }),             // 40,000 USD: under the floor
+    leg('hyperliquid', 'SOL', { markPx: 130, openInterest: 50_000 }),      // 30 % off the others
+    leg('orderly', 'PERP_SOL_USDC', { base: 'SOL', markPx: 100.1, openInterest: 50_000 }),
+    leg('pacifica', 'SOL', { markPx: 100.2, openInterest: 50_000 }),
+  ];
+  const heldId = 'sol-phoenix-hyperliquid';
+  const exempt = heldLegKeys(legs, heldId);
+  assert.deepEqual([...exempt].sort(), ['hyperliquid|SOL', 'phoenix|SOL']);
+  // Without the exemption both held legs go.
+  assert.deepEqual(filterLegs(legs, OPTS).dropped.map((d) => [d.venue, d.reason]), [['phoenix', 'under-oi-floor'], ['hyperliquid', 'mark-outlier']]);
+  const { kept, dropped } = filterLegs(legs, OPTS, exempt);
+  assert.deepEqual(dropped, []);
+  const by = new Map(kept.map((l) => [l.venue, l]));
+  assert.equal(by.get('phoenix')!.heldOnly, 'has $40,000 of open interest, under the $500,000 floor');
+  assert.equal(by.get('hyperliquid')!.heldOnly, 'marks 130, 29.9 % from the other venues\' 100.1');
+  assert.equal(by.get('orderly')!.heldOnly, undefined);
+  // The kept-only legs make the held window and nothing else; the other legs pair as usual.
+  const ids = pairLegs(kept, heldId).map((p) => p.id).sort();
+  assert.deepEqual(ids, ['sol-orderly-pacifica', 'sol-pacifica-orderly', 'sol-phoenix-hyperliquid']);
+  // A duplicate goes to the held leg, whatever the open interest says.
+  const dup = [leg('orderly', 'PERP_1000SOL_USDC', { base: 'SOL', multiplier: 1000, markPx: 100_000, openInterest: 9e6 }), legs[2]!];
+  assert.deepEqual(filterLegs(dup, OPTS, new Set(['orderly|PERP_SOL_USDC'])).kept.map((l) => l.symbol), ['PERP_SOL_USDC']);
+  // No held window: nothing exempt.
+  assert.equal(heldLegKeys(legs, null).size, 0);
 });
 
 test('window ids are lowercase base-long-short; desk venues are the three tradable ones', () => {

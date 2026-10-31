@@ -12,6 +12,7 @@ import { replayStart } from '../cli/serve-replay.ts';
 import { replayReaders } from '../readers.ts';
 import { VirtualClock, readRecording } from '../venues/replay.ts';
 import { DEFAULT_SCANNER_CONFIG, DEFAULT_STRATEGY } from './config.ts';
+import { isEnterable } from './price.ts';
 import { Scanner } from './scanner.ts';
 
 const FIXTURES = fileURLToPath(new URL('../../fixtures/replay/', import.meta.url));
@@ -34,6 +35,8 @@ async function play(file: string): Promise<Played> {
   for (let t = start; t <= end; t += STEP_MS) {
     clock.set(t);
     const r = await scanner.scan();
+    // History reads answer in the background; the live engine has them back long before its next scan, 5 s later.
+    await scanner.idle();
     scans.push({ windows: r.windows, scan: r.scan });
   }
   return { span: end - start, scans };
@@ -63,11 +66,16 @@ for (const file of files) {
     for (const { windows, scan } of scans) {
       assert.ok(windows.length > 0, `no windows at ${scan.at}`);
       assert.equal(new Set(windows.map((w) => w.id)).size, windows.length);
-      const tradable = windows.filter((w) => w.tradable);
-      assert.deepEqual(windows.slice(0, tradable.length), tradable, 'tradable windows first');
-      for (let i = 1; i < tradable.length; i++) assert.ok(tradable[i - 1]!.netAprPct >= tradable[i]!.netAprPct);
-      const rest = windows.slice(tradable.length);
-      for (let i = 1; i < rest.length; i++) assert.ok(rest[i - 1]!.grossAprPct >= rest[i]!.grossAprPct);
+      // Enterable first, then the other desk windows, each by net; then watch-only by gross. No desk policy is
+      // loaded here, so nothing is enterable and every desk window is refused E_NO_DESK.
+      const enterable = windows.filter(isEnterable);
+      const desk = windows.filter((w) => w.tradable && !isEnterable(w));
+      const watchOnly = windows.filter((w) => !w.tradable);
+      assert.deepEqual(windows, [...enterable, ...desk, ...watchOnly], 'enterable, then desk, then watch-only');
+      assert.equal(enterable.length, 0);
+      for (const group of [enterable, desk]) for (let i = 1; i < group.length; i++) assert.ok(group[i - 1]!.netAprPct >= group[i]!.netAprPct);
+      for (let i = 1; i < watchOnly.length; i++) assert.ok(watchOnly[i - 1]!.grossAprPct >= watchOnly[i]!.grossAprPct);
+      for (const w of desk) assert.equal(w.refused?.code, 'E_NO_DESK');
       for (const w of windows) {
         const numbers = [w.grossAprPct, w.netAprPct, w.usdPerDayPer1k, w.breakevenHours, w.depthUsd, w.intervalsAbove, w.updatedAt, ...Object.values(w.costs)];
         for (const n of numbers) assert.ok(Number.isFinite(n), `${w.id} at ${scan.at}: ${n}`);

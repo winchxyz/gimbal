@@ -12,7 +12,7 @@ export interface CostParams {
   transfers: TransferCosts;
   /** Rescues expected per hold; each moves rescueAmountUsd from the reserve into the squeezed leg's venue. */
   rescuesPerHold: number;
-  /** Where the rescue reserve sits. */
+  /** Where the rescue reserve sits, and where margin comes from and goes back to. */
   reserveAt: Place;
 }
 
@@ -26,8 +26,6 @@ export interface ScannerConfig {
   maxWatchWindows: number;
   /** The contract's policy for the desk, as get_desk returns it; null until a desk exists (nothing can be entered). */
   policy: ContractPolicy | null;
-  /** Base symbols the contract can price through its oracle (an asset without one is tradable only via policy.unpriced). */
-  oracleSymbols: readonly string[];
   intervalMs: number;
   /** A desk venue's book is read again once it is this old. */
   bookTtlMs: number;
@@ -40,18 +38,11 @@ export interface ScannerConfig {
   bookTimeoutMs: number;
   /** A venue that has not answered for this long drops out: its last good read is too old to show. */
   dropAfterMs: number;
-  /** Public funding-history reads per scan (7-day gross APR and window history); each is one market. */
+  /** Public funding-history reads started per scan (7-day gross APR and window history); each is one market. */
   historyPerScan: number;
   /** A failed history read waits this long before it is tried again. */
   historyRetryMs: number;
 }
-
-/**
- * Assets OutLayer's price-oracle.near lists in get_assets (checked on mainnet 2026-10-22), as base symbols: BTC (nBTC,
- * WBTC), ETH, SOL, NEAR, ZEC, and DOGE, XRP, ADA, XLM, LTC, whose reports were still empty then. Stablecoins and
- * NEAR-only tokens (REF, AURORA) have no perp. Replace with the contract's own list once the contract client exists.
- */
-export const DEFAULT_ORACLE_SYMBOLS: readonly string[] = ['BTC', 'ETH', 'SOL', 'NEAR', 'ZEC', 'DOGE', 'XRP', 'ADA', 'XLM', 'LTC'];
 
 export const DEFAULT_COSTS: CostParams = {
   holdHours: 168,
@@ -83,7 +74,6 @@ export const DEFAULT_SCANNER_CONFIG: ScannerConfig = {
   maxMarkDeviation: 0.1,
   maxWatchWindows: 150,
   policy: null,
-  oracleSymbols: DEFAULT_ORACLE_SYMBOLS,
   intervalMs: 5_000,
   bookTtlMs: 30_000,
   bookDepth: 20,
@@ -162,5 +152,61 @@ export function parseStrategyConfig(value: unknown, policy: ContractPolicy | nul
     auto, minNetAprPct, legUsd, maxLeverage, stopDrawdownPct,
     rotate: { minGainPts: rotate.minGainPts, forHours: rotate.forHours },
     risk: { watchDistancePct: risk.watchDistancePct, rescueDistancePct: risk.rescueDistancePct },
+  };
+}
+
+const isStr = (v: unknown): v is string => typeof v === 'string' && v !== '';
+const isInt = (v: unknown): v is number => Number.isInteger(v) && (v as number) >= 0;
+const DECIMAL = /^(0|[1-9][0-9]*)(\.[0-9]+)?$/;
+
+/**
+ * Checks a ContractPolicy read from a file (the desk's policy as get_desk returns it) with the shape its type
+ * implies, and returns a clean copy; throws with the first thing wrong. A policy without `unpriced` has none.
+ */
+export function parseContractPolicy(value: unknown): ContractPolicy {
+  if (!isObject(value)) throw new Error('policy: not an object');
+  const list = (name: string): unknown[] => {
+    const v = value[name];
+    if (!Array.isArray(v)) throw new Error(`policy: ${name} must be a list`);
+    return v;
+  };
+  const num = (name: string, positive = false): number => {
+    const v = value[name];
+    if (!isNum(v) || !(positive ? v > 0 : v >= 0)) throw new Error(`policy: ${name} must be a number ${positive ? '> 0' : '>= 0'}`);
+    return v;
+  };
+  const hl_assets = list('hl_assets').map((a, i) => {
+    if (!isObject(a) || !isInt(a.index) || !isStr(a.symbol) || !isInt(a.sz_decimals)) {
+      throw new Error(`policy: hl_assets[${i}] needs index, symbol and sz_decimals`);
+    }
+    return { index: a.index, symbol: a.symbol, sz_decimals: a.sz_decimals };
+  });
+  const phoenix_markets = list('phoenix_markets').map((m, i) => {
+    if (!isObject(m) || !isStr(m.symbol) || !isStr(m.orderbook) || !isInt(m.base_lot_e8) || !isInt(m.tick_e8)) {
+      throw new Error(`policy: phoenix_markets[${i}] needs symbol, orderbook, base_lot_e8 and tick_e8`);
+    }
+    return { symbol: m.symbol, orderbook: m.orderbook, base_lot_e8: m.base_lot_e8, tick_e8: m.tick_e8 };
+  });
+  const orderly_symbols = list('orderly_symbols').map((s, i) => {
+    if (!isStr(s)) throw new Error(`policy: orderly_symbols[${i}] must be a symbol`);
+    return s;
+  });
+  const unpricedRaw = value.unpriced === undefined ? [] : list('unpriced');
+  const unpriced = unpricedRaw.map((u, i) => {
+    if (!isObject(u) || !isStr(u.symbol) || typeof u.max_sz !== 'string' || !DECIMAL.test(u.max_sz)) {
+      throw new Error(`policy: unpriced[${i}] needs symbol and max_sz as a decimal string`);
+    }
+    return { symbol: u.symbol, max_sz: u.max_sz };
+  });
+  return {
+    hl_assets, phoenix_markets, orderly_symbols,
+    max_notional_usd: num('max_notional_usd', true),
+    price_band_bps: num('price_band_bps'),
+    oracle_max_age_s: num('oracle_max_age_s', true),
+    rescue_cap_usd_per_hour: num('rescue_cap_usd_per_hour'),
+    unpriced,
+    unpriced_max_notional_usd: value.unpriced_max_notional_usd === undefined && unpriced.length === 0 ? 0 : num('unpriced_max_notional_usd'),
+    max_transfer_cost_bps: num('max_transfer_cost_bps'),
+    max_transfer_cost_flat_e6: num('max_transfer_cost_flat_e6'),
   };
 }

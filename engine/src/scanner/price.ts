@@ -1,21 +1,38 @@
 // One pair priced as a Window: gross, every cost term, net, breakeven, capacity, and the checks the engine ran.
-// Pure: the books and the time come in as arguments.
+// Pure: the books, the oracle prices and the time come in as arguments.
 
 import type { ContractPolicy, StrategyConfig, VenueId, Window as FundingWindow } from '@gimbal/shared';
 import type { Book } from '../venues/venue.ts';
 import type { CostParams } from './config.ts';
 import {
-  HOURS_PER_YEAR, aprPct, basisCostUsd, breakevenHours, fillFeeBps, fundingTimingUsd, hoursUntil, legSlippage, moveCostUsd,
-  oneOffAprPct, paymentPeriodHours, rescueAmountUsd, rescueCostUsd, takerFeesUsd,
+  HOURS_PER_YEAR, aprPct, basisCostUsd, breakevenHours, fillFeeBps, fundingTimingUsd, hoursUntil, legSlippage,
+  marginRoundTripUsd, moveCostUsd, oneOffAprPct, paymentPeriodHours, rescueAmountUsd, rescueCostUsd, takerFeesUsd,
 } from './costs.ts';
+import type { LegSlippage } from './costs.ts';
 import { round } from './history.ts';
 import type { Pair, ScanLeg } from './pairs.ts';
 import { isDeskVenue } from './pairs.ts';
 
 export interface BookRead {
   book: Book;
-  readAt: number;                // ms, when it was read
+  readAt: number;                // ms, when the read answered
   stale: boolean;                // the last read failed: this is an older book
+}
+
+/** An oracle price as the contract stores it for one policy symbol: USD per unit of that symbol, and when. */
+export interface OraclePrice {
+  px: number;
+  at: number;                    // ms
+}
+
+/**
+ * Where the scanner learns the contract's stored oracle prices. The contract refuses a priced order unless its price
+ * for that symbol is at most policy.oracle_max_age_s old, so a leg passes only on a price and its time from here.
+ * The engine's contract client fills this in; until then there is no source and every priced desk leg is refused
+ * E_ORACLE_STALE, which is what the contract would answer.
+ */
+export interface OracleSource {
+  price(venue: VenueId, symbol: string): OraclePrice | null;
 }
 
 export interface PricingContext {
@@ -23,9 +40,11 @@ export interface PricingContext {
   strategy: StrategyConfig;
   costs: CostParams;
   policy: ContractPolicy | null;
-  oracleSymbols: ReadonlySet<string>;
+  oracle: OracleSource | null;
   /** The latest book of a desk leg, or null when none was ever read. */
   book(leg: ScanLeg): BookRead | null;
+  /** Desk venues that already hold the desk's margin: entering there moves nothing in or out. Default: none. */
+  marginHeldAt?: ReadonlySet<VenueId>;
 }
 
 /** What one fill of a leg costs, USD: its taker fee plus the slippage of that side on today's book. */
@@ -36,10 +55,11 @@ export interface LegFills {
 
 /** The terms behind a window's costs, USD, at strategy.legUsd. null where a term is not priced (watch-only legs). */
 export interface CostBreakdown {
-  feesUsd: number | null;
-  slippageUsd: number | null;
+  feesUsd: number | null;        // taker fees on the 4 fills
+  transferUsd: number | null;    // both legs' margin moved in and back out (1Click and venue fees); counted in feesPct
+  slippageUsd: number | null;    // of what the books could fill: a thin book fails a check instead
   basisUsd: number | null;
-  timingUsd: number;
+  timingUsd: number;             // funding lost to 4 h / 8 h payment schedules; counted in basisPct
   rescueUsd: number | null;
 }
 
@@ -64,10 +84,19 @@ export function usd(n: number): string {
 }
 
 /**
+ * Whether the desk could enter this window now: both legs on desk venues, nothing the contract would refuse, numbers
+ * from this scan, every engine check passed, and no NEAR AI veto.
+ */
+export function isEnterable(w: FundingWindow): boolean {
+  return w.tradable && w.refused === undefined && !w.stale && w.checks.every((c) => c.ok) && w.veto?.verdict !== 'veto';
+}
+
+/**
  * Prices one pair at the strategy's leg size. A desk pair (both legs on desk venues) needs both books: without one
- * ever read it is not priced (`no-book`), so a missing book never shows as zero slippage. A watch-only pair is
- * priced from what the scanner can know (gross, basis between marks, funding timing); its fees, slippage and rescue
- * reserve are not priced and its checks say so.
+ * ever read it is not priced (`no-book`), so a missing book never shows as zero slippage. A book too thin for the leg
+ * prices the slippage of what it fills and fails a check, so the window is never enterable or ranked as if filled.
+ * A watch-only pair is priced from what the scanner can know (gross, basis between marks, funding timing); its fees,
+ * slippage and rescue reserve are not priced and its checks say so.
  */
 export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
   const { long, short } = pair;
@@ -105,8 +134,14 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
     const longBps = fillFeeBps(ctx.costs.fees[lv]);
     const shortBps = fillFeeBps(ctx.costs.fees[sv]);
     const amount = rescueAmountUsd(L, ctx.strategy.risk.watchDistancePct, ctx.strategy.risk.rescueDistancePct);
+    const margin = L / ctx.strategy.maxLeverage;
+    // The desk keeps its money in the reserve between holds, so entering means moving each leg's margin onto its
+    // venue and leaving means moving it back: both trips are part of what the window costs.
+    const moving = [lv, sv].filter((v) => !(ctx.marginHeldAt?.has(v) ?? false));
+    const transferUsd = moving.reduce((s, v) => s + marginRoundTripUsd(v, margin, ctx.costs.reserveAt, ctx.costs.transfers), 0);
     breakdown = {
       feesUsd: takerFeesUsd(L, longBps, shortBps),
+      transferUsd,
       slippageUsd: ls.openUsd + ls.closeUsd + ss.openUsd + ss.closeUsd,
       basisUsd,
       timingUsd,
@@ -116,23 +151,30 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
       long: { openUsd: (L * longBps) / 1e4 + ls.openUsd, closeUsd: (L * longBps) / 1e4 + ls.closeUsd },
       short: { openUsd: (L * shortBps) / 1e4 + ss.openUsd, closeUsd: (L * shortBps) / 1e4 + ss.closeUsd },
     };
-    const thin = [[long, ls], [short, ss]].filter(([, s]) => (s as typeof ls).exhausted) as [ScanLeg, typeof ls][];
-    const bookAge = Math.round((ctx.now - Math.min(lb.readAt, sb.readAt)) / 1000);
-    checks.push(thin.length > 0
-      ? { ok: false, text: `Book too thin: ${thin[0]![0].venue} fills ${usd(thin[0]![1].filledUsd)} of ${usd(L)} within the levels read` }
-      : { ok: true, text: `Books ${bookAge} s old: slippage ${usd(breakdown.slippageUsd!)} on 4 fills at ${usd(L)} a leg` });
+    const thin = ([[long, ls, lb], [short, ss, sb]] as [ScanLeg, LegSlippage, BookRead][]).filter(([, s]) => s.exhausted);
+    for (const [leg, s, b] of thin) {
+      const levels = Math.min(b.book.bids.length, b.book.asks.length);
+      checks.push({ ok: false, text: `The ${leg.venue} book fills only ${usd(s.filledUsd)} of ${usd(L)} within the ${levels} level${levels === 1 ? '' : 's'} read: slippage counts the filled part only` });
+    }
+    if (thin.length === 0) {
+      const bookAge = Math.max(0, Math.round((ctx.now - Math.min(lb.readAt, sb.readAt)) / 1000));
+      checks.push({ ok: true, text: `Books ${bookAge} s old: slippage ${usd(breakdown.slippageUsd!)} on 4 fills at ${usd(L)} a leg` });
+    }
+    checks.push(moving.length === 0
+      ? { ok: true, text: 'Margin already sits on both venues: nothing to move in or out' }
+      : { ok: true, text: `Moving ${usd(margin)} of margin a leg onto ${moving.join(' and ')} and back costs ${usd(transferUsd)}` });
   } else {
-    breakdown = { feesUsd: null, slippageUsd: null, basisUsd, timingUsd, rescueUsd: null };
+    breakdown = { feesUsd: null, transferUsd: null, slippageUsd: null, basisUsd, timingUsd, rescueUsd: null };
   }
 
-  const feesPct = round(breakdown.feesUsd === null ? 0 : oneOffAprPct(breakdown.feesUsd, L, hold), 3);
+  const feesPct = round(breakdown.feesUsd === null ? 0 : oneOffAprPct(breakdown.feesUsd + (breakdown.transferUsd ?? 0), L, hold), 3);
   const slippagePct = round(breakdown.slippageUsd === null ? 0 : oneOffAprPct(breakdown.slippageUsd, L, hold), 3);
   const basisPct = round(oneOffAprPct((basisUsd ?? 0) + timingUsd, L, hold), 3);
   const rescueReservePct = round(breakdown.rescueUsd === null ? 0 : oneOffAprPct(breakdown.rescueUsd, L, hold), 3);
   const costsApr = round(feesPct + slippagePct + basisPct + rescueReservePct, 3);
   const netAprPct = round(grossAprPct - costsApr, 3);
 
-  const oneOffUsd = (breakdown.feesUsd ?? 0) + (breakdown.slippageUsd ?? 0) + (basisUsd ?? 0) + timingUsd;
+  const oneOffUsd = (breakdown.feesUsd ?? 0) + (breakdown.transferUsd ?? 0) + (breakdown.slippageUsd ?? 0) + (basisUsd ?? 0) + timingUsd;
   const be = breakevenHours(oneOffUsd, [
     schedule(long, -long.ratePerHour * L, ctx.now),
     schedule(short, short.shortRatePerHour * L, ctx.now),
@@ -143,9 +185,12 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
   const verdict = pair.desk ? deskVerdict(pair, ctx) : watchVerdict(pair);
   const head: FundingWindow['checks'] = [];
   if (staleVenues.length > 0) {
-    head.push({ ok: false, text: `${staleVenues.join(' and ')} did not answer: numbers from ${Math.round((ctx.now - oldest) / 1000)} s ago` });
+    head.push({ ok: false, text: `${staleVenues.join(' and ')} did not answer: numbers from ${Math.max(0, Math.round((ctx.now - oldest) / 1000))} s ago` });
   }
   const tail: FundingWindow['checks'] = [];
+  for (const leg of [long, short]) {
+    if (leg.heldOnly !== undefined) tail.push({ ok: false, text: `Kept only because the desk holds it: ${leg.venue} ${leg.symbol} ${leg.heldOnly}` });
+  }
   if (be === null) tail.push({ ok: false, text: 'Does not break even within a year at today\'s rates' });
   if (basisUsd === null) {
     const missing = [long, short].filter((l) => l.markPx === null).map((l) => l.venue);
@@ -174,7 +219,8 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
     depthUsd,
     intervalsAbove: 0,
     updatedAt: oldest,
-    tradable: verdict.tradable,
+    // Structural only: both legs on desk venues. What the contract would refuse goes in `refused`.
+    tradable: pair.desk,
     ...(verdict.refused === undefined ? {} : { refused: verdict.refused }),
     held: null,
     checks: [...head, ...verdict.checks, ...checks, ...tail],
@@ -190,7 +236,6 @@ function schedule(leg: ScanLeg, incomePerHourUsd: number, now: number) {
 }
 
 interface Verdict {
-  tradable: boolean;
   refused?: { code: string; reason: string };
   checks: FundingWindow['checks'];
 }
@@ -204,54 +249,80 @@ function inVenuePolicy(policy: ContractPolicy, leg: ScanLeg): boolean {
 }
 
 /**
- * Whether the desk could open this pair, and what the contract would say. `tradable` needs both legs on desk venues
- * and a price the contract trusts: an oracle price for the base, or an entry in policy.unpriced (matched on the base
- * or a leg's own symbol). A desk pair without either is not tradable and carries the refusal the contract would
- * give (E_ORACLE_STALE). Without a policy (no desk yet) a tradable pair is refused with E_NO_DESK. With a policy
- * loaded, a tradable pair is refused for a leg outside the policy's venue lists (E_ASSET) or a leg over a cap
- * (E_SIZE: max_notional_usd; unpriced also unpriced_max_notional_usd and max_sz in the venue's own units at its mark).
+ * What the contract would answer to a desk pair's orders, leg by leg, each on its own venue symbol. The first
+ * refusal found is the one reported; every leg still gets its check line.
+ * - no policy (no desk yet): E_NO_DESK;
+ * - a leg outside the policy's list for its venue: E_ASSET;
+ * - a leg in policy.unpriced needs no oracle, but its size in the venue's own units (legUsd at the venue mark) must
+ *   fit its own max_sz, and its notional the unpriced cap (E_SIZE; a leg without a mark cannot be sized: E_SIZE);
+ * - any other leg needs an oracle price no older than policy.oracle_max_age_s (E_ORACLE_STALE);
+ * - the notional the contract values, up to legUsd × (1 + price_band_bps / 10⁴) at a limit price inside the band,
+ *   must fit max_notional_usd, or the unpriced cap when a leg is unpriced (E_SIZE).
  */
-export function deskVerdict(pair: Pair, ctx: Pick<PricingContext, 'strategy' | 'policy' | 'oracleSymbols'>): Verdict {
-  const { long, short, base } = pair;
+export function deskVerdict(pair: Pair, ctx: Pick<PricingContext, 'strategy' | 'policy' | 'oracle' | 'now'>): Verdict {
   const L = ctx.strategy.legUsd;
   const policy = ctx.policy;
   const checks: FundingWindow['checks'] = [];
-  const priced = ctx.oracleSymbols.has(base);
-  const unpriced = priced ? undefined : policy?.unpriced.find((u) => u.symbol === base || u.symbol === long.symbol || u.symbol === short.symbol);
-  if (!priced && unpriced === undefined) {
-    const reason = 'no trusted price';
-    checks.push({ ok: false, text: `No trusted oracle price for ${base}, and it is not in policy.unpriced` });
-    return { tradable: false, refused: { code: 'E_ORACLE_STALE', reason }, checks };
-  }
-  checks.push(priced
-    ? { ok: true, text: `${base} has an oracle price: orders stay inside the price band` }
-    : { ok: true, text: `${base} has no oracle price; policy.unpriced allows up to ${unpriced!.max_sz} a leg, with no price protection` });
   if (policy === null) {
-    // No desk yet: the contract would answer E_NO_DESK, so the window is shown but cannot be entered.
     checks.push({ ok: false, text: 'No desk policy loaded yet: nothing can be entered' });
-    return { tradable: true, refused: { code: 'E_NO_DESK', reason: 'no desk policy loaded yet' }, checks };
+    return { refused: { code: 'E_NO_DESK', reason: 'no desk policy loaded yet' }, checks };
   }
-  const outside = [long, short].find((l) => !inVenuePolicy(policy, l));
-  if (outside !== undefined) {
-    checks.push({ ok: false, text: `${outside.symbol} is not in the desk policy on ${outside.venue}` });
-    return { tradable: true, refused: { code: 'E_ASSET', reason: `not in policy on ${outside.venue}` }, checks };
-  }
-  const cap = unpriced === undefined ? policy.max_notional_usd : Math.min(policy.max_notional_usd, policy.unpriced_max_notional_usd);
-  if (L > cap) {
-    checks.push({ ok: false, text: `A ${usd(L)} leg is over the policy cap of ${usd(cap)}` });
-    return { tradable: true, refused: { code: 'E_SIZE', reason: `leg over the ${usd(cap)} cap` }, checks };
-  }
-  if (unpriced !== undefined) {
-    const maxSz = Number(unpriced.max_sz);
-    const over = [long, short].find((l) => l.venueMarkPx !== null && L / l.venueMarkPx > maxSz);
-    if (over !== undefined) {
-      const sz = L / over.venueMarkPx!;
-      checks.push({ ok: false, text: `A ${usd(L)} leg is ${sz.toPrecision(4)} ${over.symbol} on ${over.venue}, over max_sz ${unpriced.max_sz}` });
-      return { tradable: true, refused: { code: 'E_SIZE', reason: `over max_sz ${unpriced.max_sz}` }, checks };
+  let refused: Verdict['refused'];
+  const refuse = (code: string, reason: string) => {
+    refused ??= { code, reason };
+  };
+  const legs = [pair.long, pair.short];
+  for (const leg of legs) {
+    if (!inVenuePolicy(policy, leg)) {
+      checks.push({ ok: false, text: `${leg.symbol} is not in the desk policy on ${leg.venue}` });
+      refuse('E_ASSET', `${leg.symbol} not in policy on ${leg.venue}`);
     }
   }
-  checks.push({ ok: true, text: `Passes the desk policy: both markets listed, a ${usd(L)} leg under the ${usd(cap)} cap` });
-  return { tradable: true, checks };
+  if (refused !== undefined) return { refused, checks };
+
+  const atBand = L * (1 + policy.price_band_bps / 1e4);
+  let cap = policy.max_notional_usd;
+  for (const leg of legs) {
+    const where = `${leg.symbol} on ${leg.venue}`;
+    const unpriced = policy.unpriced.find((u) => u.symbol === leg.symbol);
+    if (unpriced !== undefined) {
+      cap = Math.min(cap, policy.unpriced_max_notional_usd);
+      if (leg.venueMarkPx === null) {
+        checks.push({ ok: false, text: `${where} is unpriced and has no mark: its size cannot be checked against max_sz ${unpriced.max_sz}` });
+        refuse('E_SIZE', `no mark to size ${where}`);
+        continue;
+      }
+      // The order's size in the venue's own units (kPEPE, PERP_1000PEPE_USDC), which is what max_sz counts.
+      const sz = L / leg.venueMarkPx;
+      const size = `${Number(sz.toPrecision(6))} ${leg.symbol}`;
+      if (sz > Number(unpriced.max_sz)) {
+        checks.push({ ok: false, text: `${where} is unpriced: a ${usd(L)} leg is ${size}, over its max_sz ${unpriced.max_sz}` });
+        refuse('E_SIZE', `${where} over max_sz ${unpriced.max_sz}`);
+      } else {
+        checks.push({ ok: true, text: `${where} is unpriced, no price protection: a ${usd(L)} leg is ${size}, within its max_sz ${unpriced.max_sz}` });
+      }
+      continue;
+    }
+    const raw = ctx.oracle?.price(leg.venue as VenueId, leg.symbol) ?? null;
+    const o = raw !== null && Number.isFinite(raw.px) && raw.px > 0 && Number.isFinite(raw.at) ? raw : null;
+    const age = o === null ? null : Math.max(0, (ctx.now - o.at) / 1000);
+    if (age === null) {
+      checks.push({ ok: false, text: `No oracle price for ${where}: the contract refuses its orders` });
+      refuse('E_ORACLE_STALE', `no oracle price for ${where}`);
+    } else if (age > policy.oracle_max_age_s) {
+      checks.push({ ok: false, text: `The oracle price for ${where} is ${Math.round(age)} s old, over the ${policy.oracle_max_age_s} s limit: the contract refuses its orders` });
+      refuse('E_ORACLE_STALE', `oracle price for ${where} ${Math.round(age)} s old`);
+    } else {
+      checks.push({ ok: true, text: `The oracle price for ${where} is ${Math.round(age)} s old, within the ${policy.oracle_max_age_s} s limit` });
+    }
+  }
+  if (atBand > cap) {
+    checks.push({ ok: false, text: `A ${usd(L)} leg is up to ${usd(atBand)} at the edge of the price band, over the ${usd(cap)} cap` });
+    refuse('E_SIZE', `leg over the ${usd(cap)} cap`);
+  } else {
+    checks.push({ ok: true, text: `A ${usd(L)} leg (up to ${usd(atBand)} at the edge of the price band) fits the ${usd(cap)} cap` });
+  }
+  return refused === undefined ? { checks } : { refused, checks };
 }
 
 function watchVerdict(pair: Pair): Verdict {
@@ -259,10 +330,7 @@ function watchVerdict(pair: Pair): Verdict {
   const cex = watch.filter((l) => l.kind === 'cex').map((l) => l.venue);
   const dex = watch.filter((l) => l.kind !== 'cex').map((l) => l.venue);
   const who = [...(dex.length > 0 ? [`${dex.join(' and ')} cannot be traded by the desk`] : []), ...(cex.length > 0 ? [`${cex.join(' and ')} is a CEX, reference only`] : [])];
-  return {
-    tradable: false,
-    checks: [{ ok: false, text: `Watch-only: ${who.join('; ')}. Fees, slippage and the rescue reserve are not priced` }],
-  };
+  return { checks: [{ ok: false, text: `Watch-only: ${who.join('; ')}. Fees, slippage and the rescue reserve are not priced` }] };
 }
 
 /**

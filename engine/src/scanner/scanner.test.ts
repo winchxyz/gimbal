@@ -2,12 +2,15 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { VenueId, Window as FundingWindow } from '@gimbal/shared';
+import type { ContractPolicy, VenueId, Window as FundingWindow } from '@gimbal/shared';
+import { scanLine } from '../cli/serve-replay.ts';
 import { VirtualClock } from '../venues/replay.ts';
 import type { Book, MarketFunding, MarketFundingPoint, VenueReader, WatchReader } from '../venues/venue.ts';
 import { DEFAULT_SCANNER_CONFIG, DEFAULT_STRATEGY } from './config.ts';
 import type { ScannerConfig } from './config.ts';
 import { HOUR_MS } from './history.ts';
+import type { OracleSource } from './price.ts';
+import { isEnterable } from './price.ts';
 import { Scanner } from './scanner.ts';
 import type { HeldWindow, ScannerOptions } from './scanner.ts';
 import { T0, row } from './test-helpers.ts';
@@ -20,6 +23,8 @@ class FakeVenue {
   rows: MarketFunding[] | Error | 'hang';
   readonly books = new Map<string, Book | Error>();
   readonly bookCalls: string[] = [];
+  /** Runs inside every book read, before it answers (a test moves the clock there). */
+  onBook: (symbol: string) => void = () => {};
 
   constructor(id: VenueId, rows: MarketFunding[]) {
     this.id = id;
@@ -37,6 +42,7 @@ class FakeVenue {
 
   async book(symbol: string): Promise<Book> {
     this.bookCalls.push(symbol);
+    this.onBook(symbol);
     const set = this.books.get(symbol);
     if (set instanceof Error) throw set;
     if (set !== undefined) return set;
@@ -50,7 +56,7 @@ class FakeVenue {
 /** A desk venue with public funding history: `rate(symbol)` for every hour asked. */
 class HistoryVenue extends FakeVenue {
   readonly historyCalls: [string, number, number][] = [];
-  historyError: Error | null = null;
+  historyError: Error | 'hang' | null = null;
   readonly rate: (symbol: string) => number;
 
   constructor(id: VenueId, rows: MarketFunding[], rate: (symbol: string) => number) {
@@ -60,6 +66,7 @@ class HistoryVenue extends FakeVenue {
 
   async marketFundingHistory(symbol: string, start: number, end: number): Promise<MarketFundingPoint[]> {
     this.historyCalls.push([symbol, start, end]);
+    if (this.historyError === 'hang') return new Promise(() => {});
     if (this.historyError !== null) throw this.historyError;
     const points: MarketFundingPoint[] = [];
     for (let t = Math.ceil(start / HOUR_MS) * HOUR_MS; t <= end; t += HOUR_MS) points.push({ time: t + 59, symbol, ratePerHour: this.rate(symbol), periodHours: 1 });
@@ -97,6 +104,21 @@ function venues() {
   return { hl, phoenix, orderly, watchers };
 }
 
+/** SOL on all three desk venues and BTC on two; WIF is not listed. */
+const POLICY: ContractPolicy = {
+  hl_assets: [{ index: 5, symbol: 'SOL', sz_decimals: 2 }, { index: 0, symbol: 'BTC', sz_decimals: 5 }],
+  phoenix_markets: [
+    { symbol: 'SOL', orderbook: 'test-orderbook-sol', base_lot_e8: 1, tick_e8: 1 },
+    { symbol: 'BTC', orderbook: 'test-orderbook-btc', base_lot_e8: 1, tick_e8: 1 },
+  ],
+  orderly_symbols: ['PERP_SOL_USDC'],
+  max_notional_usd: 5000, price_band_bps: 100, oracle_max_age_s: 60, rescue_cap_usd_per_hour: 500,
+  unpriced: [], unpriced_max_notional_usd: 0, max_transfer_cost_bps: 50, max_transfer_cost_flat_e6: 2_000_000,
+};
+
+/** Fresh oracle prices for SOL on every venue, none for anything else. */
+const SOL_ORACLE: OracleSource = { price: (_venue, symbol) => (symbol.includes('SOL') ? { px: 100, at: T0 - 5_000 } : null) };
+
 function scanner(
   readers: { venues: FakeVenue[]; watch?: WatchReader[] }, clock: { now(): number },
   config: Partial<ScannerConfig> = {}, extra: Partial<ScannerOptions> = {},
@@ -114,23 +136,29 @@ function scanner(
 
 const byId = (ws: FundingWindow[], id: string) => ws.find((w) => w.id === id);
 
-test('one scan: tradable windows by net, then the rest by gross; CEX only against something else', async () => {
+test('one scan without a desk: desk windows by net, then watch-only by gross; CEX only against something else', async () => {
   const { hl, phoenix, orderly, watchers } = venues();
   const { scanner: s } = scanner({ venues: [hl, phoenix, orderly], watch: watchers }, new VirtualClock(T0));
-  const { windows, scan, notes } = await s.scan();
+  const r = await s.scan();
+  const { windows, scan, notes } = r;
   assert.deepEqual(scan, { venues: 6, failed: [], at: T0 });
 
-  // Desk, oracle-priced: three SOL directions with gross > 0, and BTC Phoenix -> Hyperliquid.
-  const tradable = windows.filter((w) => w.tradable);
-  assert.deepEqual(tradable.map((w) => w.id).sort(), ['btc-phoenix-hyperliquid', 'sol-orderly-hyperliquid', 'sol-phoenix-hyperliquid', 'sol-phoenix-orderly']);
-  assert.deepEqual(windows.slice(0, 4), tradable, 'tradable windows come first');
-  for (let i = 1; i < tradable.length; i++) assert.ok(tradable[i - 1]!.netAprPct >= tradable[i]!.netAprPct);
+  // tradable is structural: every desk pair with gross > 0, oracle price or not.
+  const desk = windows.filter((w) => w.tradable);
+  assert.deepEqual(desk.map((w) => w.id).sort(), [
+    'btc-phoenix-hyperliquid', 'sol-orderly-hyperliquid', 'sol-phoenix-hyperliquid', 'sol-phoenix-orderly', 'wif-phoenix-hyperliquid',
+  ]);
+  // No policy: nothing is enterable, and every desk window says why.
+  assert.equal(windows.filter(isEnterable).length, 0);
+  for (const w of desk) assert.deepEqual(w.refused, { code: 'E_NO_DESK', reason: 'no desk policy loaded yet' });
+  assert.deepEqual(windows.slice(0, 5), desk, 'desk windows come first');
+  for (let i = 1; i < desk.length; i++) assert.ok(desk[i - 1]!.netAprPct >= desk[i]!.netAprPct);
 
-  // The rest by gross: WIF (no oracle price) and 11 watch-only SOL windows.
-  const rest = windows.slice(4);
-  assert.equal(rest.length, 12);
+  // Then the 11 watch-only SOL windows by gross.
+  const rest = windows.slice(5);
+  assert.equal(rest.length, 11);
+  assert.ok(rest.every((w) => !w.tradable));
   for (let i = 1; i < rest.length; i++) assert.ok(rest[i - 1]!.grossAprPct >= rest[i]!.grossAprPct);
-  assert.deepEqual(byId(windows, 'wif-phoenix-hyperliquid')!.refused, { code: 'E_ORACLE_STALE', reason: 'no trusted price' });
   assert.ok(byId(windows, 'sol-okx-pacifica') !== undefined);
   assert.equal(byId(windows, 'sol-okx-binance'), undefined, 'never CEX against CEX');
   assert.equal(byId(windows, 'sol-hyperliquid-phoenix'), undefined, 'gross ≤ 0 is not listed');
@@ -146,10 +174,29 @@ test('one scan: tradable windows by net, then the rest by gross; CEX only agains
   assert.deepEqual(hl.bookCalls.sort(), ['BTC', 'SOL', 'WIF']);
   assert.deepEqual(orderly.bookCalls, ['PERP_SOL_USDC']);
   assert.deepEqual(notes.unpriced, []);
+  assert.match(scanLine(1, r), /^scan 1: 16 windows \(5 on desk venues, 0 enterable\), failed \[\], \d+ ms, no enterable window, 0 history reads$/);
 
   // At most maxWatchWindows watch-only windows are sent; desk windows are never cut.
   const { scanner: few } = scanner({ venues: [hl, phoenix, orderly], watch: watchers }, new VirtualClock(T0), { maxWatchWindows: 3 });
-  assert.equal((await few.scan()).windows.length, 4 + 1 + 3);
+  assert.equal((await few.scan()).windows.length, 5 + 3);
+});
+
+test('with a policy and fresh oracle prices: enterable windows first by net, ahead of a refused window that nets more', async () => {
+  const { hl, phoenix, orderly, watchers } = venues();
+  const { scanner: s } = scanner({ venues: [hl, phoenix, orderly], watch: watchers }, new VirtualClock(T0), { policy: POLICY }, { oracle: SOL_ORACLE });
+  const r = await s.scan();
+  const enterable = r.windows.filter(isEnterable);
+  assert.deepEqual(enterable.map((w) => w.id), ['sol-phoenix-hyperliquid', 'sol-orderly-hyperliquid', 'sol-phoenix-orderly']);
+  assert.deepEqual(r.windows.slice(0, 3), enterable);
+  // WIF nets far more (78.84 % gross) but is not in the policy: it ranks after every enterable window.
+  const wif = r.windows[3]!;
+  assert.equal(wif.id, 'wif-phoenix-hyperliquid');
+  assert.ok(wif.netAprPct > enterable[0]!.netAprPct);
+  assert.deepEqual(wif.refused, { code: 'E_ASSET', reason: 'WIF not in policy on phoenix' });
+  // BTC is listed but has no oracle price.
+  assert.deepEqual(r.windows[4]!.refused, { code: 'E_ORACLE_STALE', reason: 'no oracle price for BTC on phoenix' });
+  assert.ok(r.windows.slice(5).every((w) => !w.tradable));
+  assert.match(scanLine(12, r), /, best sol-phoenix-hyperliquid -?\d+\.\d\d % net, /);
 });
 
 test('a venue that does not answer: listed as failed, its last good numbers marked stale, gone after 10 minutes', async () => {
@@ -168,6 +215,14 @@ test('a venue that does not answer: listed as failed, its last good numbers mark
   assert.equal(byId(r2.windows, 'sol-orderly-hyperliquid')!.stale, false);
   assert.ok(notes.some((n) => n === 'phoenix funding failed: HTTP 502'));
 
+  // Its books fall due (30 s) while its funding still fails: they are not asked for, the venue is likely down.
+  const calls = phoenix.bookCalls.length;
+  clock.set(T0 + 40_000);
+  await s.scan();
+  assert.equal(phoenix.bookCalls.length, calls);
+  assert.ok(notes.includes('phoenix books not read: its funding read failed this scan'));
+  assert.ok(hl.bookCalls.length > 3, 'the other venues\' books are read again');
+
   clock.set(T0 + 11 * 60_000);
   const r3 = await s.scan();
   assert.deepEqual(r3.scan.failed, ['phoenix']);
@@ -181,19 +236,41 @@ test('a venue that does not answer: listed as failed, its last good numbers mark
   assert.equal(r4.windows.length, 0);
 });
 
+test('a book is dated when it answers, not when the scan started', async () => {
+  const { hl, phoenix } = venues();
+  const clock = new VirtualClock(T0);
+  // Phoenix's SOL book (read first) takes 2 s: every book of that scan answers at T0 + 2 s.
+  phoenix.onBook = (symbol) => {
+    if (symbol === 'SOL') clock.advance(2_000);
+  };
+  const { scanner: s } = scanner({ venues: [hl, phoenix] }, clock);
+  await s.scan();
+  phoenix.onBook = () => {};
+  clock.set(T0 + 7_000);
+  const w = byId((await s.scan()).windows, 'sol-phoenix-hyperliquid')!;
+  // 5 s old at T0 + 7 s, not the 7 s since the scan that read them began.
+  assert.ok(w.checks.some((c) => c.text.startsWith('Books 5 s old')), JSON.stringify(w.checks));
+});
+
 test('a read that outlives its scan is not asked again: the next scan waits on the same request and uses its answer', async () => {
   const { hl, phoenix } = venues();
   let calls = 0;
+  let answer: (rows: MarketFunding[]) => void = () => {};
   const slow = watch('pacifica', 'dex', []);
   slow.funding = () => {
     calls++;
-    return new Promise((resolve) => setTimeout(() => resolve([row('pacifica', 'SOL', { ratePerHour: 0.0002 })]), 60));
+    return new Promise((resolve) => {
+      answer = resolve;
+    });
   };
   const clock = new VirtualClock(T0);
   const { scanner: s } = scanner({ venues: [hl, phoenix], watch: [slow] }, clock, { readTimeoutMs: 40 });
   assert.deepEqual((await s.scan()).scan.failed, ['pacifica']);
   clock.set(T0 + 5_000);
-  const r2 = await s.scan();
+  // The second scan joins the read still out; it answers while that scan waits.
+  const second = s.scan();
+  answer([row('pacifica', 'SOL', { ratePerHour: 0.0002 })]);
+  const r2 = await second;
   assert.equal(calls, 1);
   assert.deepEqual(r2.scan.failed, []);
   assert.ok(byId(r2.windows, 'sol-phoenix-pacifica') !== undefined);
@@ -205,7 +282,9 @@ test('a read that outlives its scan is not asked again: the next scan waits on t
   assert.equal(w.stale, false);
   assert.equal(w.updatedAt, T0 + 5_000);
   clock.set(T0 + 35_000);
-  await s.scan();
+  const third = s.scan();
+  answer([row('pacifica', 'SOL', { ratePerHour: 0.0002 })]);
+  await third;
   assert.equal(calls, 2);
 });
 
@@ -262,7 +341,31 @@ test('the held window is marked and kept whatever its gross; the others carry th
   assert.equal(byId(r2.windows, 'sol-hyperliquid-phoenix'), undefined);
 });
 
-test('history: the 7-day gross from public history, intervalsAbove, the window history, and when it is read again', async () => {
+test('the held window survives the filters: its legs fail a check instead of being dropped, and switch costs stay', async () => {
+  const { hl, phoenix, orderly } = venues();
+  // Phoenix SOL falls to 400 SOL open (40,000 USD), under the 500k floor.
+  phoenix.rows = (phoenix.rows as MarketFunding[]).map((r) => (r.symbol === 'SOL' ? { ...r, openInterest: 400 } : r));
+  const clock = new VirtualClock(T0);
+  const held: HeldWindow = { windowId: 'sol-phoenix-hyperliquid', since: T0 - HOUR_MS };
+  const { scanner: free } = scanner({ venues: [hl, phoenix, orderly] }, clock);
+  const r0 = await free.scan();
+  assert.equal(byId(r0.windows, 'sol-phoenix-hyperliquid'), undefined, 'dropped when not held');
+  assert.equal(r0.notes.dropped['under-oi-floor'], 1);
+
+  const { scanner: s } = scanner({ venues: [hl, phoenix, orderly] }, clock, {}, { held: () => held });
+  const r = await s.scan();
+  const h = byId(r.windows, 'sol-phoenix-hyperliquid')!;
+  assert.deepEqual(h.held, { since: T0 - HOUR_MS });
+  assert.ok(h.checks.some((c) => !c.ok && c.text === 'Kept only because the desk holds it: phoenix SOL has $40,000 of open interest, under the $500,000 floor'), JSON.stringify(h.checks));
+  assert.equal(isEnterable(h), false);
+  assert.equal(r.notes.dropped['under-oi-floor'], undefined);
+  // The low-OI leg makes no other window, and the others still know what leaving the held one costs.
+  assert.equal(byId(r.windows, 'sol-phoenix-orderly'), undefined);
+  const other = byId(r.windows, 'sol-orderly-hyperliquid')!;
+  assert.ok(typeof other.switchCostUsd === 'number' && other.switchCostUsd > 0);
+});
+
+test('history: read in the background, then the 7-day gross, intervalsAbove, the window history, and when it is read again', async () => {
   const { orderly } = venues();
   const hl = new HistoryVenue('hyperliquid', [row('hyperliquid', 'SOL', { ratePerHour: 0.00005 })], () => 0.00005);
   const phoenix = new HistoryVenue('phoenix', [row('phoenix', 'SOL', { ratePerHour: 0.00001 })], () => 0.00001);
@@ -272,14 +375,20 @@ test('history: the 7-day gross from public history, intervalsAbove, the window h
   assert.equal(r1.notes.historyReads, 2);
   // From 176 h before this hour (8 h more than the week) to the end of this hour.
   assert.deepEqual(hl.historyCalls, [['SOL', CURRENT - 176 * HOUR_MS, CURRENT + HOUR_MS - 1]]);
+  // The scan did not wait for it: no 7-day figure yet.
+  assert.equal(byId(r1.windows, 'sol-phoenix-hyperliquid')!.grossApr7dPct, null);
+  await s.idle();
 
-  const w = byId(r1.windows, 'sol-phoenix-hyperliquid')!;
+  clock.set(T0 + 5_000);
+  const r2 = await s.scan();
+  assert.equal(r2.notes.historyReads, 0);
+  const w = byId(r2.windows, 'sol-phoenix-hyperliquid')!;
   // 0.00005 − 0.00001 = 0.00004/h every hour of the week: 35.04 % APR.
   assert.equal(w.grossApr7dPct, 35.04);
   assert.ok(w.netAprPct >= DEFAULT_STRATEGY.minNetAprPct);
   assert.equal(w.intervalsAbove, 168);
   // Orderly has no history source here: its windows show null, never a 0 that ranks.
-  const o = byId(r1.windows, 'sol-orderly-hyperliquid')!;
+  const o = byId(r2.windows, 'sol-orderly-hyperliquid')!;
   assert.equal(o.grossApr7dPct, null);
   assert.ok(o.intervalsAbove <= 1);
 
@@ -298,28 +407,83 @@ test('history: the 7-day gross from public history, intervalsAbove, the window h
   clock.set(CURRENT + HOUR_MS + 61_000);
   assert.equal((await s.scan()).notes.historyReads, 2);
   assert.deepEqual(hl.historyCalls.at(-1), ['SOL', CURRENT + HOUR_MS - 176 * HOUR_MS, CURRENT + 2 * HOUR_MS - 1]);
+  await s.idle();
 
   // A failed read is tried again after historyRetryMs (60 s), not every scan.
   hl.historyError = new Error('HTTP 429');
   clock.set(CURRENT + 2 * HOUR_MS + 61_000);
   await s.scan();
+  await s.idle();
   const calls = hl.historyCalls.length;
   assert.ok(notes.some((n) => n.startsWith('hyperliquid history SOL failed: HTTP 429')));
   clock.set(CURRENT + 2 * HOUR_MS + 100_000);
   await s.scan();
+  await s.idle();
   assert.equal(hl.historyCalls.length, calls);
   hl.historyError = null;
   clock.set(CURRENT + 2 * HOUR_MS + 125_000);
   await s.scan();
+  await s.idle();
   assert.equal(hl.historyCalls.length, calls + 1);
 });
 
-test('the scanner refuses two readers for one venue, and a clock that goes back', async () => {
-  const { hl } = venues();
+test('a history read that hangs never holds a scan up, and no second batch starts while it is out', async () => {
+  const hl = new HistoryVenue('hyperliquid', [row('hyperliquid', 'SOL', { ratePerHour: 0.00005 })], () => 0.00005);
+  const phoenix = new HistoryVenue('phoenix', [row('phoenix', 'SOL', { ratePerHour: 0.00001 })], () => 0.00001);
+  hl.historyError = 'hang';
+  phoenix.historyError = 'hang';
+  const clock = new VirtualClock(T0);
+  // History reads time out after 2 × readTimeoutMs = 100 ms.
+  const { scanner: s, notes } = scanner({ venues: [hl, phoenix] }, clock, { historyPerScan: 10, readTimeoutMs: 50 });
+  const r1 = await s.scan();
+  assert.equal(r1.notes.historyReads, 2);
+  assert.ok(r1.windows.length > 0);
+  clock.set(T0 + 5_000);
+  assert.equal((await s.scan()).notes.historyReads, 0, 'the first batch is still out');
+  assert.equal(hl.historyCalls.length, 1);
+  await s.idle();
+  assert.ok(notes.some((n) => n.startsWith('hyperliquid history SOL failed: hyperliquid history SOL: no answer within 100 ms')));
+});
+
+test('the short side keeps its own rate history: GMX shorts receive less than longs pay', async () => {
+  const { phoenix } = venues();
+  const gmx = watch('gmx', 'dex', [row('gmx', 'SOL', { ratePerHour: 0.0002, shortRatePerHour: 0.00005 })]);
+  const clock = new VirtualClock(T0);
+  const { scanner: s } = scanner({ venues: [phoenix], watch: [gmx] }, clock);
+  await s.scan();
+  clock.set(T0 + HOUR_MS);
+  await s.scan();
+  // Long Phoenix pays 0.00001, short GMX receives 0.00005: 0.00004/h = 35.04 % in the hour before, as now.
+  // (Its long rate, 0.0002, would make that hour 166.44 %.) Watch-only, same marks, hourly: no costs priced.
+  const hist = s.history('sol-phoenix-gmx')!;
+  assert.deepEqual(hist.points.slice(-2), [{ t: CURRENT, netAprPct: 35.04 }, { t: CURRENT + HOUR_MS, netAprPct: 35.04 }]);
+});
+
+test('two readers for one venue are refused; a clock that steps back is survived, not thrown on', async () => {
+  const { hl, phoenix } = venues();
   assert.throws(() => scanner({ venues: [hl, hl] }, new VirtualClock(T0)), /two readers for hyperliquid/);
   let t = T0;
-  const { scanner: s } = scanner({ venues: [hl] }, { now: () => t });
+  const pac = watch('pacifica', 'dex', [row('pacifica', 'SOL', { ratePerHour: 0.0002 })]);
+  let watchCalls = 0;
+  pac.funding = async () => {
+    watchCalls++;
+    return pac.rows;
+  };
+  const { scanner: s, notes } = scanner({ venues: [hl, phoenix], watch: [pac] }, { now: () => t });
   await s.scan();
-  t = T0 - 1;
-  await assert.rejects(s.scan(), /clock went back/);
+  const books = hl.bookCalls.length;
+  t = T0 - 60_000;
+  const r = await s.scan();
+  assert.ok(notes.some((n) => n.startsWith('the clock went back 60000 ms')));
+  // Books and the watch venue were read at "T0", now in the future: read again rather than aged negative.
+  assert.ok(hl.bookCalls.length > books);
+  assert.equal(watchCalls, 2);
+  assert.equal(r.scan.at, T0 - 60_000);
+  for (const w of r.windows) {
+    assert.equal(w.stale, false);
+    assert.equal(w.updatedAt, T0 - 60_000);
+  }
+  // And the scans after it go on as usual.
+  t = T0 - 55_000;
+  assert.ok((await s.scan()).windows.length > 0);
 });

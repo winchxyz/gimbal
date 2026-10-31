@@ -1,9 +1,9 @@
-// What PUT /strategy accepts: finite numbers inside sane bounds, nothing unknown.
+// What PUT /strategy and the policy file accept: finite numbers inside sane bounds, nothing unknown.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ContractPolicy } from '@gimbal/shared';
-import { DEFAULT_STRATEGY, STRATEGY_LIMITS, parseStrategyConfig } from './config.ts';
+import { DEFAULT_STRATEGY, STRATEGY_LIMITS, parseContractPolicy, parseStrategyConfig } from './config.ts';
 
 const POLICY: ContractPolicy = {
   hl_assets: [{ index: 5, symbol: 'SOL', sz_decimals: 2 }],
@@ -56,4 +56,31 @@ test('strategy: what a hostile page sent is refused, field by field', () => {
   // Without a policy the engine cap is the only one: 100k passes.
   assert.equal(parseStrategyConfig({ ...DEFAULT_STRATEGY, legUsd: STRATEGY_LIMITS.maxLegUsd }).legUsd, 100_000);
   assert.equal(parseStrategyConfig({ ...DEFAULT_STRATEGY, stopDrawdownPct: null }, POLICY).stopDrawdownPct, null);
+});
+
+test('policy file: a good one is copied; a policy without unpriced has none', () => {
+  assert.deepEqual(parseContractPolicy(POLICY), POLICY);
+  const { unpriced: _u, unpriced_max_notional_usd: _c, ...older } = POLICY;
+  const p = parseContractPolicy(older);
+  assert.deepEqual(p.unpriced, []);
+  assert.equal(p.unpriced_max_notional_usd, 0);
+});
+
+test('policy file: a misread policy is refused with the first thing wrong', () => {
+  const bad: [Record<string, unknown>, RegExp][] = [
+    [{ hl_assets: 'SOL' }, /hl_assets must be a list/],
+    [{ hl_assets: [{ index: -1, symbol: 'SOL', sz_decimals: 2 }] }, /hl_assets\[0\] needs index, symbol and sz_decimals/],
+    [{ phoenix_markets: [{ symbol: 'SOL' }] }, /phoenix_markets\[0\] needs symbol, orderbook/],
+    [{ orderly_symbols: [''] }, /orderly_symbols\[0\] must be a symbol/],
+    [{ unpriced: [{ symbol: 'WIF', max_sz: 5000 }] }, /unpriced\[0\] needs symbol and max_sz as a decimal string/],
+    [{ unpriced: [{ symbol: 'WIF', max_sz: '1e3' }] }, /max_sz as a decimal string/],
+    [{ unpriced: [{ symbol: 'WIF', max_sz: '-5' }] }, /max_sz as a decimal string/],
+    [{ unpriced_max_notional_usd: undefined }, /unpriced_max_notional_usd must be a number >= 0/],
+    [{ max_notional_usd: 0 }, /max_notional_usd must be a number > 0/],
+    [{ oracle_max_age_s: 0 }, /oracle_max_age_s must be a number > 0/],
+    [{ price_band_bps: -1 }, /price_band_bps must be a number >= 0/],
+    [{ max_transfer_cost_bps: '50' }, /max_transfer_cost_bps must be a number >= 0/],
+  ];
+  for (const [over, error] of bad) assert.throws(() => parseContractPolicy({ ...POLICY, ...over }), error, JSON.stringify(over));
+  assert.throws(() => parseContractPolicy([]), /policy: not an object/);
 });

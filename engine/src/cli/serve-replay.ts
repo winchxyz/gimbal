@@ -1,7 +1,42 @@
-// Helpers of the serve CLI's record and replay modes, kept apart so they are tested without a server.
+// Helpers of the serve CLI (its record and replay modes, its policy file, its scan log line), kept apart so they are
+// tested without a server.
 
+import { readFileSync } from 'node:fs';
+import type { ContractPolicy } from '@gimbal/shared';
+import { parseContractPolicy } from '../scanner/config.ts';
+import { isEnterable } from '../scanner/price.ts';
+import type { ScanResult } from '../scanner/scanner.ts';
+import { errorMessage } from '../venues/recorder.ts';
 import type { LineSink, RecordLine } from '../venues/recorder.ts';
 import type { VenueMethod } from '../venues/venue.ts';
+
+/**
+ * The desk policy from a JSON file (get_desk's policy), checked: a file that does not parse or does not match
+ * ContractPolicy throws, so the engine refuses to start rather than price windows against a policy it misread.
+ */
+export function loadPolicyFile(path: string): ContractPolicy {
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch (err) {
+    throw new Error(`policy file ${path}: ${errorMessage(err)}`);
+  }
+  try {
+    return parseContractPolicy(JSON.parse(text));
+  } catch (err) {
+    throw new Error(`policy file ${path}: ${errorMessage(err)}`);
+  }
+}
+
+/** One log line for a scan: counts, failed venues, and the best window the desk could enter now, if any. */
+export function scanLine(n: number, r: ScanResult): string {
+  const desk = r.windows.filter((w) => w.tradable);
+  const enterable = r.windows.filter(isEnterable);
+  const best = enterable[0];
+  return `scan ${n}: ${r.windows.length} windows (${desk.length} on desk venues, ${enterable.length} enterable), failed [${r.scan.failed.join(', ')}], ${r.notes.ms} ms`
+    + (best === undefined ? ', no enterable window' : `, best ${best.id} ${best.netAprPct.toFixed(2)} % net`)
+    + `${r.notes.unpriced.length > 0 ? `, ${r.notes.unpriced.length} unpriced` : ''}, ${r.notes.historyReads} history reads`;
+}
 
 /**
  * A sink that writes a successful answer to the same call (venue, method, arguments) at most once per `minGapMs` of

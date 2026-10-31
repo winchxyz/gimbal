@@ -62,6 +62,7 @@ export function takerFeesUsd(legUsd: number, longFeeBps: number, shortFeeBps: nu
 // ---------- slippage ----------
 
 export interface BookWalk {
+  // A walk that runs out of levels prices only what it filled: the caller must not rank that as a full fill.
   filledUsd: number;             // notional the levels could fill, ≤ the notional asked for
   avgPx: number | null;          // USD per venue unit; null when nothing filled
   costUsd: number;               // what the fill pays against the mid, USD (half the spread plus impact), ≥ 0
@@ -219,6 +220,15 @@ export function moveCostUsd(from: Place, to: Place, amountUsd: number, costs: Tr
   const amount = to === 'orderly' ? Math.max(amountUsd, costs.orderlyMinDepositUsd) : amountUsd;
   const exit = from === 'hyperliquid' ? costs.hlActivationUsd : from === 'orderly' ? costs.orderlyWithdrawUsd : 0;
   return exit + oneClickCostUsd(amount, costs.oneClickFlatUsd[chainOf(from)], costs.oneClickBps);
+}
+
+/**
+ * Moving one leg's margin onto its venue for a hold and back afterwards, USD: in from the reserve, out to it.
+ * Margin 333.33 USD (1000 USD at 3×) on Hyperliquid: in 0.32 + 0.6667 = 0.9867, out 1.00 + 0.21 + 0.6667 = 1.8767,
+ * 2.8633 USD in all. On Phoenix (the reserve's own wallet) it costs nothing.
+ */
+export function marginRoundTripUsd(venue: VenueId, marginUsd: number, reserveAt: Place, costs: TransferCosts): number {
+  return moveCostUsd(reserveAt, venue, marginUsd, costs) + moveCostUsd(venue, reserveAt, marginUsd, costs);
 }
 
 /**

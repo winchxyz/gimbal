@@ -29,6 +29,8 @@ export interface ScanLeg {
   oiUsd: number | null;          // open interest in USD
   readAt: number;                // ms, when this venue's funding was read
   stale: boolean;                // the venue did not answer this scan: this is its last good read
+  /** Set on a leg of the held window that the filters would have dropped: why. The window fails a check for it. */
+  heldOnly?: string;
 }
 
 export type DropReason = 'bad-rate' | 'duplicate' | 'no-mark' | 'mark-outlier' | 'no-oi' | 'under-oi-floor';
@@ -97,10 +99,16 @@ export interface FilterOptions {
  * 4. a leg under the open-interest floor is dropped. Open interest that is unknown (null: Aster, Binance, Bybit
  *    publish none) is not zero: a watch-only leg without it stays as a rate reference, but it cannot pass the floor on
  *    its own (pairLegs never pairs two such legs). A desk leg without it cannot be sized: dropped.
+ * A leg in `exempt` (`venue|symbol`: the legs of the window the desk holds) is never dropped by steps 2 to 4: the desk
+ * must still see what it holds and what leaving costs. It is kept with `heldOnly` saying what it failed, and wins a
+ * duplicate.
  */
-export function filterLegs(legs: readonly ScanLeg[], options: FilterOptions): { kept: ScanLeg[]; dropped: LegDrop[] } {
+export function filterLegs(
+  legs: readonly ScanLeg[], options: FilterOptions, exempt: ReadonlySet<string> = new Set(),
+): { kept: ScanLeg[]; dropped: LegDrop[] } {
   const dropped: LegDrop[] = [];
   const drop = (l: ScanLeg, reason: DropReason) => dropped.push({ venue: l.venue, symbol: l.symbol, reason });
+  const isExempt = (l: ScanLeg) => exempt.has(`${l.venue}|${l.symbol}`);
 
   const best = new Map<string, ScanLeg>();
   for (const leg of legs) {
@@ -110,7 +118,8 @@ export function filterLegs(legs: readonly ScanLeg[], options: FilterOptions): { 
       best.set(key, leg);
       continue;
     }
-    const better = (leg.oiUsd ?? -1) > (held.oiUsd ?? -1) || ((leg.oiUsd ?? -1) === (held.oiUsd ?? -1) && leg.symbol < held.symbol);
+    const byOi = (leg.oiUsd ?? -1) > (held.oiUsd ?? -1) || ((leg.oiUsd ?? -1) === (held.oiUsd ?? -1) && leg.symbol < held.symbol);
+    const better = isExempt(leg) !== isExempt(held) ? isExempt(leg) : byOi;
     if (better) {
       drop(held, 'duplicate');
       best.set(key, leg);
@@ -130,30 +139,62 @@ export function filterLegs(legs: readonly ScanLeg[], options: FilterOptions): { 
 
   const kept: ScanLeg[] = [];
   for (const leg of unique) {
-    if (leg.markPx === null) {
-      if (leg.kind !== 'cex') {
-        drop(leg, 'no-mark');
-        continue;
-      }
-    } else {
-      const others = (marksByBase.get(leg.base) ?? []).filter((o) => o !== leg).map((o) => o.markPx!);
-      if (others.length > 0 && Math.abs(leg.markPx / nearestMedian(others, leg.markPx) - 1) > options.maxMarkDeviation) {
-        drop(leg, 'mark-outlier');
-        continue;
-      }
-    }
-    if (leg.oiUsd === null) {
-      if (leg.kind === 'desk') {
-        drop(leg, 'no-oi');
-        continue;
-      }
-    } else if (leg.oiUsd < options.oiFloorUsd) {
-      drop(leg, 'under-oi-floor');
-      continue;
-    }
-    kept.push(leg);
+    const failed = failedFilter(leg, marksByBase.get(leg.base) ?? [], options);
+    if (failed === null) kept.push(leg);
+    else if (isExempt(leg)) kept.push({ ...leg, heldOnly: failed.why });
+    else drop(leg, failed.reason);
   }
   return { kept, dropped };
+}
+
+const money = (n: number): string => `$${Math.round(n).toLocaleString('en-US')}`;
+
+/** The first of steps 2 to 4 a leg fails, with a line for its check; null when it passes them all. */
+function failedFilter(leg: ScanLeg, marked: readonly ScanLeg[], options: FilterOptions): { reason: DropReason; why: string } | null {
+  if (leg.markPx === null) {
+    if (leg.kind !== 'cex') return { reason: 'no-mark', why: 'has no mark' };
+  } else {
+    const others = marked.filter((o) => o !== leg).map((o) => o.markPx!);
+    if (others.length > 0) {
+      const ref = nearestMedian(others, leg.markPx);
+      const off = leg.markPx / ref - 1;
+      if (Math.abs(off) > options.maxMarkDeviation) {
+        const px = (n: number) => String(Number(n.toPrecision(6)));
+        return { reason: 'mark-outlier', why: `marks ${px(leg.markPx)}, ${(off * 100).toFixed(1)} % from the other venues' ${px(ref)}` };
+      }
+    }
+  }
+  if (leg.oiUsd === null) {
+    if (leg.kind === 'desk') return { reason: 'no-oi', why: 'publishes no open interest' };
+  } else if (leg.oiUsd < options.oiFloorUsd) {
+    return { reason: 'under-oi-floor', why: `has ${money(leg.oiUsd)} of open interest, under the ${money(options.oiFloorUsd)} floor` };
+  }
+  return null;
+}
+
+/** The legs of the held window among `legs`, as `venue|symbol` keys for filterLegs' `exempt`. */
+export function heldLegKeys(legs: readonly ScanLeg[], heldId: string | null | undefined): Set<string> {
+  const out = new Set<string>();
+  if (heldId === null || heldId === undefined) return out;
+  const byBase = new Map<string, ScanLeg[]>();
+  for (const leg of legs) {
+    // Only bases that can start the id are worth pairing up.
+    if (!heldId.startsWith(`${leg.base.toLowerCase()}-`)) continue;
+    const list = byBase.get(leg.base);
+    if (list === undefined) byBase.set(leg.base, [leg]);
+    else list.push(leg);
+  }
+  for (const [base, list] of byBase) {
+    for (const a of list) {
+      for (const b of list) {
+        if (a.venue !== b.venue && windowId(base, a.venue, b.venue) === heldId) {
+          out.add(`${a.venue}|${a.symbol}`);
+          out.add(`${b.venue}|${b.symbol}`);
+        }
+      }
+    }
+  }
+  return out;
 }
 
 export interface Pair {
@@ -172,9 +213,10 @@ export function windowId(base: string, longVenue: ScanVenueId, shortVenue: ScanV
 /**
  * Every ordered pair of legs of the same base on two different venues, both directions, except CEX against CEX
  * (reference only on both sides: nothing to rank) and two legs whose open interest are both unknown (no leg has
- * passed the floor, and the window would have no capacity to show).
+ * passed the floor, and the window would have no capacity to show). A leg kept only for the held window (`heldOnly`)
+ * makes no pair but that one.
  */
-export function pairLegs(legs: readonly ScanLeg[]): Pair[] {
+export function pairLegs(legs: readonly ScanLeg[], heldId: string | null = null): Pair[] {
   const byBase = new Map<string, ScanLeg[]>();
   for (const leg of legs) {
     const list = byBase.get(leg.base);
@@ -187,9 +229,11 @@ export function pairLegs(legs: readonly ScanLeg[]): Pair[] {
       for (const short of list) {
         if (long.venue === short.venue) continue;
         if (long.kind === 'cex' && short.kind === 'cex') continue;
-        if (long.oiUsd === null && short.oiUsd === null) continue;
+        const id = windowId(base, long.venue, short.venue);
+        if ((long.heldOnly !== undefined || short.heldOnly !== undefined) && id !== heldId) continue;
+        if (long.oiUsd === null && short.oiUsd === null && id !== heldId) continue;
         out.push({
-          id: windowId(base, long.venue, short.venue),
+          id,
           base,
           long,
           short,
