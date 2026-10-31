@@ -198,8 +198,9 @@ fn sol_sign_answers_every_vector_message_as_the_core_does_without_prices() {
     }
     // 13 messages pass the vectors' policy with prices: 6 of them place priced orders and now
     // stop at the missing price, like the 3 the band or the cap refuses, 2 are rescues, and the
-    // review refuses the lone Approve (an allowance with no unwrap to spend it).
-    assert_eq!((signed, stale, refused), (4, 9, 49));
+    // review refuses the lone Approve (an allowance with no unwrap to spend it) and the
+    // withdrawal (an unwrap of an Approve with no Revoke after it).
+    assert_eq!((signed, stale, refused), (3, 9, 50));
 }
 
 /// Every review case gets the core's answer too; each one the vectors refuse is refused with the
@@ -271,8 +272,9 @@ fn sol_sign_signs_an_unpriced_order() {
 }
 
 /// A paused desk signs a message only if, besides the compute budget, it cancels, places
-/// reduce-only orders, revokes a delegate of a desk token account or moves tokens into one; every
-/// other message that passes the policy waits for a running desk.
+/// reduce-only orders, revokes a delegate of a desk token account or moves tokens into one, and
+/// pays a priority fee only to cancel or reduce; every other message that passes the policy waits
+/// for a running desk.
 #[test]
 fn a_paused_desk_signs_only_what_reduces_risk() {
     let mut p = sol_policy();
@@ -309,16 +311,21 @@ fn a_paused_desk_signs_only_what_reduces_risk() {
     };
     for prefix in [
         "cancel all ETH",
-        "review 2: lone Revoke of the desk PhUSD account",
+        "compute budget at the caps",
         "review 3: a reduce-only IOC sell",
-        "review 3: a Transfer into the desk PhUSD account",
-        "review 3: a TransferChecked into the desk PhUSD account",
+        "review 5: lone Revoke of the desk PhUSD account without a priority fee",
+        "review 5: lone Revoke of the desk PhUSD account at a unit price of 0",
+        "review 5: a Transfer into the desk PhUSD account without a priority fee",
+        "review 5: a TransferChecked into the desk PhUSD account without a priority fee",
     ] {
         assert!(signs(prefix), "{prefix}");
     }
     for prefix in [
         "deposit 15 USDC",
-        "withdraw 10 USDC",
+        "review 6: withdraw 10 USDC with a Revoke of the desk PhUSD account after the unwrap",
+        "review 2: lone Revoke of the desk PhUSD account",
+        "review 3: a Transfer into the desk PhUSD account",
+        "review 5: lone Revoke of the desk PhUSD account at the budget caps",
         "IOC sell 0.005 ETH, limit 2425.5",
         "review 3: cancel_all, then an IOC sell that is not reduce-only",
         "review 3: the desk PhUSD account created, nothing else",

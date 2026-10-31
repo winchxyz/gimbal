@@ -57,8 +57,9 @@ pub fn desk_accounts(desk: &Desk) -> Result<SolDesk, Refusal> {
 impl Gimbal {
     /// Signs a Solana transaction message for the desk's authority: compute budget (within the
     /// caps, a price only with a unit limit), creation of the desk's USDC and PhUSD token
-    /// accounts, an Approve to Ember for exactly the unwrap that follows it, Revokes, transfers
-    /// into the desk's own token accounts, Ember deposits and withdrawals between them, and
+    /// accounts, an Approve to Ember for exactly the unwrap that follows it with a Revoke of the
+    /// desk's PhUSD account after that unwrap, Revokes, transfers of more than 0 into the desk's
+    /// own token accounts from another account, Ember deposits and withdrawals between them, and
     /// Phoenix IOC orders on policy markets, `cancel_all`, deposits and withdrawals on the desk's
     /// trader account, each with its exact account list. A legacy message with the desk as its
     /// only signer and fee payer and something to do besides the compute budget
@@ -67,9 +68,9 @@ impl Gimbal {
     /// is checked as `hl_order` checks one: `E_ORACLE_STALE` for every priced order until prices
     /// are stored (C6), `E_PRICE_BAND`, `E_SIZE`. Owner or operator; on a paused desk only a
     /// message that reduces risk (besides the compute budget only `cancel_all`, reduce-only
-    /// orders, Revokes and transfers into the desk's token accounts), else `E_PAUSED`. `kind` is
-    /// `order`, else the first Phoenix action (`cancel_all`, `deposit`, `withdraw`), else
-    /// `transaction`.
+    /// orders, Revokes and transfers into the desk's token accounts, and a priority fee only with
+    /// a `cancel_all` or a reduce-only order), else `E_PAUSED`. `kind` is `order`, else the first
+    /// Phoenix action (`cancel_all`, `deposit`, `withdraw`), else `transaction`.
     #[deny_unknown_arguments]
     pub fn sol_sign(
         &mut self,

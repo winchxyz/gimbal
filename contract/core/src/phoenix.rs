@@ -180,8 +180,10 @@ pub struct CheckedMessage {
     pub orders: Vec<PhoenixOrder>,
     /// True when a paused desk may sign it: besides the compute budget, every instruction is a
     /// `cancel_all`, a reduce-only order, a `Revoke` of a desk token account or a token transfer
-    /// into a desk token account. Anything else (a deposit or withdrawal, Ember, a token account
-    /// created, an `Approve`, a rescue transfer, which moves money out) needs a running desk.
+    /// into a desk token account, and a priority fee (a unit price above 0) comes only with a
+    /// `cancel_all` or a reduce-only order, so a paused desk cannot be made to burn SOL on fees.
+    /// Anything else (a deposit or withdrawal, Ember, a token account created, an `Approve`, a
+    /// rescue transfer, which moves money out) needs a running desk.
     pub reduces_risk: bool,
 }
 
@@ -224,6 +226,28 @@ fn pinned(a: &[Pubkey], n: usize, layout: &[(usize, Pubkey, &str)]) -> Result<()
                 format!("account {i} is {}, not {what} {}", b58(&a[i]), b58(&key)),
             ));
         }
+    }
+    Ok(())
+}
+
+/// A token transfer's amount (`amount`, 8 little-endian bytes) is not 0 (`E_SOL_PROGRAM`): an
+/// empty transfer moves nothing and would only pass a paused desk's gate.
+fn moves_something(amount: &[u8], n: usize) -> Result<(), Refusal> {
+    if le_u64(amount) == 0 {
+        return Err(at(n, E_SOL_PROGRAM, "a token transfer of 0"));
+    }
+    Ok(())
+}
+
+/// A token transfer's source is not its destination (`E_SOL_ACCOUNT`): such a transfer moves
+/// nothing and would only pass a paused desk's gate.
+fn not_into_itself(source: &Pubkey, destination: &Pubkey, n: usize) -> Result<(), Refusal> {
+    if source == destination {
+        return Err(at(
+            n,
+            E_SOL_ACCOUNT,
+            format!("a transfer from {} into itself", b58(source)),
+        ));
     }
     Ok(())
 }
@@ -432,6 +456,11 @@ struct Walk<'a> {
     reduces_risk: bool,
     /// An `Approve` waiting for the Ember unwrap it is for: its instruction and amount.
     approval: Option<(usize, u64)>,
+    /// The Ember unwrap that spent an `Approve`, until a `Revoke` of the desk's PhUSD account
+    /// after it clears whatever allowance the unwrap left.
+    revoke_due: Option<usize>,
+    /// A `cancel_all` came.
+    cancel_all: bool,
 }
 
 impl<'a> Walk<'a> {
@@ -567,7 +596,11 @@ impl<'a> Walk<'a> {
                         format!("{} is not a desk token account", b58(&a[0])),
                     ));
                 }
-                pinned(a, n, &[(1, d.authority, "the desk authority")])
+                pinned(a, n, &[(1, d.authority, "the desk authority")])?;
+                if a[0] == d.phusd_ata {
+                    self.revoke_due = None;
+                }
+                Ok(())
             }
             Some(&TOKEN_TRANSFER) => {
                 if ix.data.len() != 9 {
@@ -575,10 +608,11 @@ impl<'a> Walk<'a> {
                 }
                 // source, destination, owner
                 let a = accounts(ix, n, 3)?;
+                moves_something(&ix.data[1..9], n)?;
                 if !d.is_token_account(&a[1]) {
                     return Err(self.foreign_destination(&a[1], n));
                 }
-                Ok(())
+                not_into_itself(&a[0], &a[1], n)
             }
             Some(&TOKEN_TRANSFER_CHECKED) => {
                 if ix.data.len() != 10 {
@@ -586,8 +620,9 @@ impl<'a> Walk<'a> {
                 }
                 // source, mint, destination, owner
                 let a = accounts(ix, n, 4)?;
+                moves_something(&ix.data[1..9], n)?;
                 if d.is_token_account(&a[2]) {
-                    return Ok(());
+                    return not_into_itself(&a[0], &a[2], n);
                 }
                 let Some(r) = self.rescue.filter(|r| r.deposit_account == a[2]) else {
                     return Err(self.foreign_destination(&a[2], n));
@@ -687,6 +722,7 @@ impl<'a> Walk<'a> {
                         ),
                     ));
                 }
+                self.revoke_due = Some(n);
             }
         }
         Ok(())
@@ -769,6 +805,7 @@ impl<'a> Walk<'a> {
                     let order = self.order(ix, market, n)?;
                     self.orders.push(order);
                 } else {
+                    self.cancel_all = true;
                     self.phoenix.get_or_insert("cancel_all");
                 }
             }
@@ -891,10 +928,12 @@ impl<'a> Walk<'a> {
 /// - token account program: `CreateIdempotent` paid by the desk for its own USDC or PhUSD account
 ///   (or, in a rescue, the deposit owner's USDC account);
 /// - SPL Token: `Approve` of the desk's PhUSD account to the Ember authority for exactly the
-///   amount of the Ember unwrap that follows it, before any other `Approve` (else
-///   `E_SOL_PROGRAM`); `Revoke` of a desk token account; `Transfer` and `TransferChecked` into a
-///   desk token account (in a rescue also exactly one `TransferChecked` of `amount_in` USDC into
-///   the deposit owner's account created before it, else `E_QUOTE_FIELDS`);
+///   amount of the Ember unwrap that follows it, before any other `Approve`, with a `Revoke` of
+///   the desk's PhUSD account after that unwrap (else `E_SOL_PROGRAM`); `Revoke` of a desk token
+///   account; `Transfer` and `TransferChecked` of more than 0 (else `E_SOL_PROGRAM`) into a desk
+///   token account other than the source (else `E_SOL_ACCOUNT`; in a rescue also exactly one
+///   `TransferChecked` of `amount_in` USDC into the deposit owner's account created before it,
+///   else `E_QUOTE_FIELDS`);
 /// - Ember deposit and withdraw (an unwrap of an amount, or of the whole balance) between the
 ///   desk's USDC and PhUSD accounts, with Ember's state and vault in their places;
 /// - Phoenix: `place_market_order` (immediate-or-cancel only, a market of the policy, a price
@@ -906,9 +945,9 @@ impl<'a> Walk<'a> {
 /// A program outside this list, another instruction of these programs or a value over a cap is
 /// `E_SOL_PROGRAM`, an account the desk does not own or out of its place `E_SOL_ACCOUNT`, a
 /// market outside the policy `E_ASSET`. After the walk: a price without a limit, then an
-/// `Approve` its unwrap never spent, is `E_SOL_PROGRAM`, and a message with nothing besides the
-/// compute budget `E_SOL_MESSAGE`. [`CheckedMessage::reduces_risk`] says whether a paused desk
-/// may sign the message.
+/// `Approve` its unwrap never spent, then an unwrap of an `Approve` with no `Revoke` after it, is
+/// `E_SOL_PROGRAM`, and a message with nothing besides the compute budget `E_SOL_MESSAGE`.
+/// [`CheckedMessage::reduces_risk`] says whether a paused desk may sign the message.
 pub fn check_message(
     sha256: Sha256,
     policy: &Policy,
@@ -940,6 +979,8 @@ pub fn check_message(
         actions: 0,
         reduces_risk: true,
         approval: None,
+        revoke_due: None,
+        cancel_all: false,
     };
     for (n, ix) in m.instructions.iter().enumerate() {
         walk.instruction(ix, n)?;
@@ -950,6 +991,14 @@ pub fn check_message(
             n,
             E_SOL_PROGRAM,
             format!("an Approve of {amount} with no Ember unwrap of that amount after it"),
+        ));
+    }
+    if let Some(n) = walk.revoke_due {
+        return Err(at(
+            n,
+            E_SOL_PROGRAM,
+            "an unwrap that spends an Approve needs a Revoke of the desk's PhUSD account after it, \
+             so no allowance outlives the message",
         ));
     }
     if walk.actions == 0 {
@@ -971,7 +1020,13 @@ pub fn check_message(
     } else {
         walk.phoenix.unwrap_or("transaction")
     };
-    let reduces_risk = walk.reduces_risk && walk.orders.iter().all(|o| o.reduce_only);
+    // A priority fee is spent whatever the message does, so a paused desk pays one only to cancel
+    // or to reduce a position.
+    let priority_fee = walk.budget.price.is_some_and(|(_, price)| price > 0);
+    let cancels_or_reduces = walk.cancel_all || walk.orders.iter().any(|o| o.reduce_only);
+    let reduces_risk = walk.reduces_risk
+        && walk.orders.iter().all(|o| o.reduce_only)
+        && (!priority_fee || cancels_or_reduces);
     Ok(CheckedMessage {
         kind,
         orders: walk.orders,
