@@ -61,7 +61,7 @@ export async function smokeSol(readers: SolReaders, log: (line: string) => void 
     }
   }));
   log('SOL funding, side by side. Rate per hour > 0: longs pay shorts. APR = rate per hour x 24 x 365.');
-  log(`${'venue'.padEnd(12)} ${'symbol'.padEnd(14)} ${'per hour'.padStart(13)} ${'APR'.padStart(9)}  ${'pays'.padEnd(7)} ${'mark'.padStart(9)}  ${'next payment'.padEnd(24)} rate`);
+  log(`${'venue'.padEnd(12)} ${'symbol'.padEnd(14)} ${'per hour'.padStart(13)} ${'APR'.padStart(9)}  ${'pays'.padEnd(7)} ${'mark'.padStart(9)}  ${'next payment'.padEnd(24)} basis`);
   for (const r of results) {
     if (r.f === null) {
       log(`${r.venue.padEnd(12)} ${r.symbol.padEnd(14)} error: ${r.error}`);
