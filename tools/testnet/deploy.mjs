@@ -6,11 +6,12 @@
 //
 // The account is created with the testnet faucet helper and its new key is written to
 // .keys/<account>.json (gitignored); no key value is printed. An account that exists already is only
-// deployed to when it has no code: the script never redeploys over a live contract.
+// deployed to when it has no code: the script never redeploys over a live contract. Testnet only:
+// the ids must end in .testnet and every RPC endpoint must serve chain "testnet" (see near.mjs).
 
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { ROOT, account, actions, loadKey, newKey, panicOf, rpc, send, sleep, view } from './near.mjs';
+import { ROOT, account, actions, loadKey, newKey, panicOf, rpc, send, sleep, testnetId, view } from './near.mjs';
 
 const KEPT = ['gimbal-fcf135.testnet', 'gimbal-c2-fcf135.testnet', 'gimbal-c2o-fcf135.testnet'];
 const MPC = 'v1.signer-prod.testnet';
@@ -25,6 +26,7 @@ if (!contract || !/^gimbal-[a-z0-9-]+\.testnet$/.test(contract)) {
   console.error('usage: node tools/testnet/deploy.mjs gimbal-<suffix>.testnet [--owner <account>]');
   process.exit(2);
 }
+testnetId(owner, 'owner');
 if (KEPT.includes(contract)) {
   console.error(`${contract} is kept as it is; deploy to a fresh account`);
   process.exit(2);

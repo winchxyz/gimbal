@@ -13,7 +13,11 @@
 //   faucet     POST the operator's testnet USDC faucet for the desk (no signature)
 //   order      orderly_request order (LIMIT buy, PERP_BTC_USDC, 3% under the mark), POST /v1/order;
 //              --take: IOC buy 0.5% over the mark; --close: reduce-only IOC sell; --qty <base units>
-//   read <kind> orderly_request of a kind without fields (receiver_address, settle_nonce, ...)
+//   replay     POSTs one signed order twice, unchanged: is a signed order good again? Default: a
+//              resting LIMIT (replayed while open, then after its cancel); --ioc: an IOC buy that
+//              fills, replayed after the fill, then the position read and closed (reduce-only IOC)
+//   read <kind> orderly_request of a kind without fields (receiver_address, settle_nonce,
+//              positions, holding, ...)
 //   cancel <order_id>  orderly_request cancel of one PERP_BTC_USDC order
 //   cancel-all orderly_request cancel_all PERP_BTC_USDC
 //   ws         orderly_ws_auth, log in to the private stream, subscribe to position and balance and
@@ -24,9 +28,10 @@
 //   settle     settle_nonce, orderly_settle_pnl, settle_pnl
 //   withdraw   withdraw_nonce, orderly_withdraw 1 USDC, withdraw_request (needs a balance)
 //
-// No key value is printed: signatures and public addresses only.
+// No key value is printed: signatures and public addresses only. Testnet only: every account id
+// must end in .testnet, the RPC must serve chain "testnet" and the contract's network be Testnet.
 
-import { actions, keccak256, loadKey, panicOf, send, sleep, view } from './near.mjs';
+import { actions, keccak256, loadKey, panicOf, send, sleep, testnetId, view } from './near.mjs';
 import { hlL1Digest, hlSignature, recoverAddress } from './evm.mjs';
 
 const HL_API = 'https://api.hyperliquid-testnet.xyz';
@@ -44,9 +49,12 @@ if (!contract || !deskId || !step) {
   process.exit(2);
 }
 
+testnetId(contract, 'contract');
+testnetId(owner, 'owner');
+const { orderly, network } = await view(contract, 'config');
+if (network !== 'Testnet') throw new Error(`${contract} is configured for ${network}: refusing`);
 const desk = await view(contract, 'get_desk', { desk_id: deskId });
 if (!desk) throw new Error(`no desk ${deskId} on ${contract}`);
-const { orderly } = await view(contract, 'config');
 const orderlyKey = `ed25519:${desk.solana.authority}`;
 const key = loadKey(owner);
 const show = (label, x) => console.log(label, typeof x === 'string' ? x : JSON.stringify(x));
@@ -221,12 +229,59 @@ switch (step) {
         price,
         quantity,
         reduce_only: close,
-        client_order_id: `c5-${Date.now()}`,
       },
       'C5 live check: testnet Orderly order',
     );
     show('SignedAction', action);
     await sendRest(action);
+    break;
+  }
+  case 'replay': {
+    // Anyone who reads the chain holds the signed request, so this POSTs the very same request
+    // (headers, timestamp, body) again and records what Orderly answers.
+    const ioc = args.includes('--ioc');
+    const fut = await http('GET', `${ORDERLY_API}/v1/public/futures/PERP_BTC_USDC`, { quiet: true });
+    const mark = Number(fut.data.mark_price);
+    const price = String(ioc ? Math.ceil(mark * 1.005) : Math.floor(mark * 0.97));
+    const quantity = (Math.ceil((12 / Number(price)) * 1e5) / 1e5).toFixed(5).replace(/0+$/, '');
+    show('order', { mark, price, quantity, type: ioc ? 'IOC' : 'LIMIT' });
+    const order = await request(
+      { kind: 'order', symbol: 'PERP_BTC_USDC', side: 'BUY', order_type: ioc ? 'IOC' : 'LIMIT', price, quantity },
+      `C5 live check: replay of a signed ${ioc ? 'IOC' : 'LIMIT'}`,
+    );
+    show('client_order_id', JSON.parse(order.payload.body).client_order_id);
+    const position = async () => {
+      const out = await sendRest(await request({ kind: 'positions' }, 'C5 live check: positions'));
+      return Number(out?.data?.rows?.find((r) => r.symbol === 'PERP_BTC_USDC')?.position_qty ?? 0);
+    };
+    const cancel = async (orderId) =>
+      sendRest(await request({ kind: 'cancel', symbol: 'PERP_BTC_USDC', order_id: orderId }, 'C5 live check: cancel'));
+    const before = ioc ? await position() : 0;
+    const first = await sendRest(order);
+    show('first POST', first?.success ? `accepted, order ${first.data?.order_id}` : `refused (${first?.code}: ${first?.message})`);
+    await sleep(3000);
+    const again = await sendRest(order);
+    const verdict = (r) => (r?.success ? `ACCEPTED, order ${r.data?.order_id}` : `refused (${r?.code}: ${r?.message})`);
+    show(ioc ? 'replay after the fill' : 'replay while open', verdict(again));
+    if (ioc) {
+      const after = await position();
+      show('PERP_BTC_USDC position', { before, after, filled_per_order: quantity });
+      if (after > 0) {
+        const close = await request(
+          { kind: 'order', symbol: 'PERP_BTC_USDC', side: 'SELL', order_type: 'IOC', price: String(Math.floor(mark * 0.99)), quantity: String(after), reduce_only: true },
+          'C5 live check: close after the replay',
+        );
+        await sendRest(close);
+      }
+    } else {
+      if (first?.data?.order_id) await cancel(first.data.order_id);
+      if (again?.data?.order_id) await cancel(again.data.order_id);
+      await sleep(3000);
+      const late = await sendRest(order);
+      show('replay after the cancel', verdict(late));
+      if (late?.data?.order_id) await cancel(late.data.order_id);
+    }
+    show('signed at', `${order.payload.timestamp}; last POST ${Date.now() - order.payload.timestamp} ms later`);
     break;
   }
   case 'read': {
@@ -262,7 +317,7 @@ switch (step) {
     show('PERP_BTC_USDC', { last_funding_rate: fut.data.last_funding_rate, sum_unitary_funding: fut.data.sum_unitary_funding });
     const price = String(Math.floor(Number(fut.data.mark_price) * 0.97));
     const order = await request(
-      { kind: 'order', symbol: 'PERP_BTC_USDC', side: 'BUY', order_type: 'LIMIT', price, quantity: '0.00017', client_order_id: `c5-${Date.now()}` },
+      { kind: 'order', symbol: 'PERP_BTC_USDC', side: 'BUY', order_type: 'LIMIT', price, quantity: '0.00017' },
       'C5 live check: a resting order to make Orderly push the position',
     );
     const placed = await sendRest(order);

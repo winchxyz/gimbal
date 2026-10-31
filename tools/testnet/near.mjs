@@ -13,6 +13,45 @@ export const RPC_URLS = [process.env.NEAR_RPC_URL, 'https://rpc.testnet.near.org
 export const TGAS = 10n ** 12n;
 export const YOCTO_PER_NEAR = 10n ** 24n;
 
+// --- testnet only ---
+// These scripts sign with real keys, so they refuse mainnet twice: every account id they touch
+// must end in `.testnet`, and every RPC endpoint must answer `status` with chain_id "testnet"
+// before the first call that goes through it (a NEAR_RPC_URL pointing at mainnet is refused).
+
+/** Returns `id` when it is a `.testnet` account id; throws otherwise. */
+export function testnetId(id, what = 'account') {
+  if (typeof id !== 'string' || !/^[a-z0-9_-]+(\.[a-z0-9_-]+)*\.testnet$/.test(id)) {
+    throw new Error(`${what} ${JSON.stringify(id)} is not a .testnet account: these scripts run on testnet only`);
+  }
+  return id;
+}
+
+const CHAIN_CHECKED = new Map();
+
+/** Resolves once `url` answered `status` with chain_id "testnet"; a fatal error otherwise. */
+function assertTestnet(url) {
+  if (!CHAIN_CHECKED.has(url)) {
+    const check = (async () => {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 'gimbal', method: 'status', params: [] }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      const chain = (await res.json()).result?.chain_id;
+      if (chain !== 'testnet') {
+        const err = new Error(`${new URL(url).host} serves chain ${JSON.stringify(chain)}, not testnet: refusing`);
+        err.fatal = true;
+        throw err;
+      }
+    })();
+    // A network error is retried on the next call; a wrong chain stays refused.
+    check.catch((e) => { if (!e.fatal) CHAIN_CHECKED.delete(url); });
+    CHAIN_CHECKED.set(url, check);
+  }
+  return CHAIN_CHECKED.get(url);
+}
+
 // --- base58 ---
 
 const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
@@ -169,7 +208,7 @@ const PKCS8_ED25519 = Buffer.from('302e020100300506032b657004220420', 'hex');
 
 /** A key file of .keys/ as a signer: its account, public key and a sign function. */
 export function loadKey(accountId) {
-  const file = join(KEYS, `${accountId}.json`);
+  const file = join(KEYS, `${testnetId(accountId)}.json`);
   const json = JSON.parse(readFileSync(file, 'utf8'));
   if (json.account_id !== accountId) throw new Error(`${file} is not the key of ${accountId}`);
   const raw = b58decode(json.private_key.replace(/^ed25519:/, ''));
@@ -182,7 +221,7 @@ export function loadKey(accountId) {
 
 /** Writes a new ed25519 key for `accountId` into .keys/ (refusing to overwrite) and returns its public key. */
 export function newKey(accountId) {
-  const file = join(KEYS, `${accountId}.json`);
+  const file = join(KEYS, `${testnetId(accountId)}.json`);
   if (existsSync(file)) throw new Error(`${file} exists`);
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
   const seed = Buffer.from(privateKey.export({ format: 'jwk' }).d, 'base64url');
@@ -200,6 +239,7 @@ export async function rpc(method, params) {
   for (let attempt = 0; attempt < 6; attempt++) {
     const url = RPC_URLS[attempt % RPC_URLS.length];
     try {
+      await assertTestnet(url);
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -222,7 +262,7 @@ export async function rpc(method, params) {
       }
       return json.result;
     } catch (e) {
-      if (e.rpc || e.timeout) throw e;
+      if (e.rpc || e.timeout || e.fatal) throw e;
       last = e;
       await sleep(1500);
     }
@@ -233,6 +273,7 @@ export async function rpc(method, params) {
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export async function view(contract, method, args = {}) {
+  testnetId(contract, 'contract');
   const r = await rpc('query', {
     request_type: 'call_function',
     finality: 'final',
@@ -245,6 +286,7 @@ export async function view(contract, method, args = {}) {
 }
 
 export async function account(accountId) {
+  testnetId(accountId);
   return rpc('query', { request_type: 'view_account', finality: 'final', account_id: accountId });
 }
 
@@ -274,6 +316,8 @@ export const actions = {
  * Returns { hash, value (the parsed SuccessValue or null), failure (the error or null), logs, burnt (TGas) }.
  */
 export async function send(key, receiverId, acts) {
+  testnetId(key.accountId, 'signer');
+  testnetId(receiverId, 'receiver');
   const access = await rpc('query', {
     request_type: 'view_access_key',
     finality: 'final',

@@ -6,10 +6,11 @@
 // The desk's addresses are derived the way create_desk checks them: the MPC contract's
 // derived_public_key for gimbal/<desk_id>/evm (domain 0) and gimbal/<desk_id>/sol (domain 1),
 // with the Gimbal contract as predecessor. Prints the desk's ids; no key value is printed.
+// Testnet only: the ids must end in .testnet and the contract's network be Testnet.
 
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { ROOT, YOCTO_PER_NEAR, actions, b58decode, evmAddress, loadKey, panicOf, send, solanaAccounts, view } from './near.mjs';
+import { ROOT, YOCTO_PER_NEAR, actions, b58decode, evmAddress, loadKey, panicOf, send, solanaAccounts, testnetId, view } from './near.mjs';
 
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 const PHUSD_MINT = 'PhUsd11YkbjSaWjFncfAAmatntsjx3MgDR9B6g1ks3A';
@@ -24,7 +25,10 @@ if (!contract || !deskId) {
   process.exit(2);
 }
 
-const { mpc } = await view(contract, 'config');
+testnetId(contract, 'contract');
+testnetId(owner, 'owner');
+const { mpc, network } = await view(contract, 'config');
+if (network !== 'Testnet') throw new Error(`${contract} is configured for ${network}: refusing`);
 
 /** The desk's addresses as create_desk expects them, from the MPC contract's derived keys. */
 export async function deskAddresses(mpcId, contractId, id) {
