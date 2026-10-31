@@ -1,12 +1,15 @@
 // The readers the engine scans, per mode: the three desk venues, plus the watch-only venues.
 
-import type { Mode, VenueId } from '@gimbal/shared';
+import type { Mode } from '@gimbal/shared';
 import { HyperliquidReader } from './venues/hyperliquid.ts';
 import { OrderlyReader } from './venues/orderly.ts';
 import { PhoenixReader } from './venues/phoenix.ts';
 import type { RecordLine } from './venues/recorder.ts';
-import { ReplayVenue } from './venues/replay.ts';
+import { ReplayVenue, ReplayWatch } from './venues/replay.ts';
 import type { Clock, VenueReader, WatchReader } from './venues/venue.ts';
+import { isDeskVenueId } from './venues/venue.ts';
+import type { WatchVenueId } from './venues/watch/index.ts';
+import { WATCH_VENUE_IDS, watchReaders } from './venues/watch/index.ts';
 
 export interface Readers {
   venues: VenueReader[];
@@ -33,8 +36,22 @@ export function liveReaders(mode: Exclude<Mode, 'replay'>, clock?: Clock, watch:
   };
 }
 
-/** One ReplayVenue per desk venue in a recording, on `clock`. Watch-only venues are not recorded yet. */
+/**
+ * One ReplayVenue per desk venue in a recording and one ReplayWatch per watch-only venue (recordings made before
+ * the watch venues were recorded have none), on `clock`. The watch venues come in the live order, DEX first.
+ */
 export function replayReaders(lines: readonly RecordLine[], clock: Clock): Readers {
-  const ids = [...new Set(lines.map((l) => l.venue))].sort() as VenueId[];
-  return { venues: ids.map((id) => new ReplayVenue(lines, clock, id)), watch: [], close: () => {} };
+  const ids = [...new Set(lines.map((l) => l.venue))].sort();
+  const desk = ids.filter(isDeskVenueId);
+  const kinds = new Map(watchReaders().map((r) => [r.id, r.kind]));
+  const watch = ids.filter((id) => !isDeskVenueId(id)).map((id) => {
+    const kind = kinds.get(id);
+    if (kind === undefined) throw new Error(`replay: ${id} in the recording is neither a desk nor a watch venue`);
+    return id;
+  }).sort((a, b) => WATCH_VENUE_IDS.indexOf(a as WatchVenueId) - WATCH_VENUE_IDS.indexOf(b as WatchVenueId));
+  return {
+    venues: desk.map((id) => new ReplayVenue(lines, clock, id)),
+    watch: watch.map((id) => new ReplayWatch(lines, clock, id, kinds.get(id)!)),
+    close: () => {},
+  };
 }

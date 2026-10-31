@@ -4,15 +4,15 @@
 
 import { readFileSync } from 'node:fs';
 import { constants, gunzipSync } from 'node:zlib';
-import type { VenueId } from '@gimbal/shared';
+import type { ScanVenueId, VenueId } from '@gimbal/shared';
 import type { RecordLine, WireLine } from './recorder.ts';
 import { requestUrl, wireRequest, withoutId } from './recorder.ts';
 import type { WsRequester } from './ws.ts';
 import type {
   AccountState, Book, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, MarketFundingPoint,
-  MarketHistorySource, VenueMethod, VenueReader,
+  MarketHistorySource, VenueMethod, VenueReader, WatchReader,
 } from './venue.ts';
-import { systemClock, trimBook } from './venue.ts';
+import { isDeskVenueId, systemClock, trimBook } from './venue.ts';
 
 const METHODS: readonly VenueMethod[] = ['markets', 'funding', 'book', 'account', 'userFunding', 'marketFundingHistory'];
 
@@ -190,8 +190,8 @@ export class ReplayVenue implements VenueReader, FundingHistorySource, MarketHis
   readonly #byCall = new Map<string, RecordLine[]>();
 
   constructor(lines: readonly RecordLine[], clock: Clock, venue?: VenueId) {
-    const id = venue ?? lines[0]?.venue;
-    if (id === undefined) throw new Error('replay: empty recording');
+    const id = venue ?? lines.find((l) => isDeskVenueId(l.venue))?.venue as VenueId | undefined;
+    if (id === undefined) throw new Error(lines.length === 0 ? 'replay: empty recording' : 'replay: no desk venue in the recording');
     const mine = lines.filter((l) => l.venue === id);
     if (mine.length === 0) throw new Error(`replay: no ${id} lines in the recording`);
     // Stable sort: two answers in the same ms keep file order, and the later one wins.
@@ -256,6 +256,36 @@ export class ReplayVenue implements VenueReader, FundingHistorySource, MarketHis
     if (line.error !== undefined) throw new Error(line.error);
     // A copy, so a caller that mutates an answer cannot change what the next call gets.
     return structuredClone(line.result) as T;
+  }
+}
+
+/**
+ * A watch-only venue played back from a recording (RecordingWatch's `funding` lines): each sweep answers with the
+ * latest recorded one at or before the clock, an outage with its recorded error. `kind` is not in the recording:
+ * it is the live reader's.
+ */
+export class ReplayWatch implements WatchReader {
+  readonly id: ScanVenueId;
+  readonly kind: WatchReader['kind'];
+  readonly #clock: Clock;
+  readonly #sweeps: RecordLine[];
+
+  constructor(lines: readonly RecordLine[], clock: Clock, venue: ScanVenueId, kind: WatchReader['kind']) {
+    if (isDeskVenueId(venue)) throw new Error(`replay: ${venue} is a desk venue, not a watch-only one`);
+    // Stable sort: two answers in the same ms keep file order, and the later one wins.
+    this.#sweeps = lines.filter((l) => l.venue === venue && l.method === 'funding').sort((a, b) => a.t - b.t);
+    if (this.#sweeps.length === 0) throw new Error(`replay: no ${venue} funding lines in the recording`);
+    this.id = venue;
+    this.kind = kind;
+    this.#clock = clock;
+  }
+
+  async funding(): Promise<MarketFunding[]> {
+    const now = this.#clock.now();
+    const line = latestAtOrBefore(this.#sweeps, now);
+    if (line === undefined) throw new ReplayMissError(`replay ${this.id}: no funding() at or before ${now}`);
+    if (line.error !== undefined) throw new Error(line.error);
+    return structuredClone(line.result) as MarketFunding[];
   }
 }
 

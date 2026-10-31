@@ -2,12 +2,13 @@
 
 import type { ScanVenueId, VenueId } from '@gimbal/shared';
 import type { MarketFunding } from '../venues/venue.ts';
+import { DESK_VENUE_IDS, isDeskVenueId } from '../venues/venue.ts';
 import { grossPerHour } from './costs.ts';
 
-export const DESK_VENUES: readonly VenueId[] = ['hyperliquid', 'phoenix', 'orderly'];
+export const DESK_VENUES: readonly VenueId[] = DESK_VENUE_IDS;
 
 export function isDeskVenue(venue: ScanVenueId): venue is VenueId {
-  return (DESK_VENUES as readonly string[]).includes(venue);
+  return isDeskVenueId(venue);
 }
 
 /** What a venue is to the scanner: a desk venue (VenueReader) or a watch-only one (WatchReader.kind). */
