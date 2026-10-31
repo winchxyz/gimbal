@@ -84,7 +84,8 @@ export interface SetupProgress {   // venue setup the engine runs through operat
   deskId: string;
   steps: {
     step: 'hl_set_referrer' | 'hl_approve_builder_fee' | 'orderly_register' | 'orderly_add_key'
-        | 'orderly_receiver_lookup' | 'orderly_referral_bind' | 'phoenix_register' | 'phoenix_referral';
+        | 'orderly_receiver_lookup' | 'orderly_referral_bind' | 'orderly_ip_restriction'   // skipped without an IP list
+        | 'phoenix_register' | 'phoenix_referral';
     status: 'pending' | 'running' | 'done' | 'skipped' | 'failed';
     detail?: string; tx: TxRef[];
   }[];
