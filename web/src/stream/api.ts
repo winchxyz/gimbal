@@ -1,5 +1,5 @@
 // The engine's HTTP side (docs/interfaces.md §2) as the screens use it: `GET /strategy`, `GET /windows/history?id=`,
-// `GET /state`, `GET /journal?before=`, `POST /rotate` and `POST /close`. This is the seam: a screen only sees
+// `GET /state`, `GET /journal?before=`, `POST /rotate`, `POST /close` and `POST /stress`. This is the seam: a screen only sees
 // `EngineApi`, so the fake and the engine look alike to it, and `engineApi()` in start.ts picks one. Pure apart from
 // `fetch`, so the parsers are tested.
 import type { EngineState, JournalEntry, Mode, StrategyConfig, WindowHistory } from '@gimbal/shared';
@@ -22,6 +22,8 @@ export interface EngineApi {
   rotate(windowId: string): Promise<ActionResult>;
   /** Close both legs with reduce-only orders. Rejects when the engine does not answer. */
   close(): Promise<ActionResult>;
+  /** Testnet and replay only: tighten the margin threshold so a leg crosses the rescue line. Rejects when the engine does not answer. */
+  stress(): Promise<ActionResult>;
 }
 
 /** How many entries the engine sends per page (`GET /state`, `GET /journal?before=`): a shorter page is the last. */
@@ -197,5 +199,6 @@ export function httpApi(base = ''): EngineApi {
     journalBefore: async (before) => parseJournalPage(await getJson(`${base}/journal?before=${encodeURIComponent(before)}`)),
     rotate: (windowId) => postJson(`${base}/rotate`, { windowId }),
     close: () => postJson(`${base}/close`, {}),
+    stress: () => postJson(`${base}/stress`, {}),
   };
 }

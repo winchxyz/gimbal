@@ -2,6 +2,7 @@ import { useEffect } from 'react';
 import { DeskScreen } from '../desk/DeskScreen.tsx';
 import { JournalScreen } from '../journal/JournalScreen.tsx';
 import { OnboardingScreen } from '../onboarding/OnboardingScreen.tsx';
+import { RescueScreen } from '../rescue/RescueScreen.tsx';
 import { Placeholder } from '../screens/Placeholder.tsx';
 import { SecurityScreen } from '../security/SecurityScreen.tsx';
 import { NoticeBar } from '../ui/NoticeBar.tsx';
@@ -47,6 +48,8 @@ export function Shell() {
           <WindowsScreen />
         ) : screen === 'journal' ? (
           <JournalScreen />
+        ) : screen === 'rescue' ? (
+          <RescueScreen />
         ) : screen === 'security' ? (
           <SecurityScreen />
         ) : (

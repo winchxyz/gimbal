@@ -1,7 +1,7 @@
 import { stream } from './hub.ts';
 import { connectSse } from './sse.ts';
 import { httpApi, readEngineState, type EngineApi } from './api.ts';
-import { pickFakeDesk, pickFakeDrift, pickFakeMode, pickFakeScenario, resolveSource } from './source.ts';
+import { pickFakeDesk, pickFakeDrift, pickFakeMode, pickFakeRescue, pickFakeScenario, resolveSource } from './source.ts';
 import type { Source } from './store.ts';
 
 /** How long the page waits for the engine to answer before it falls back to the fake (development only). */
@@ -37,8 +37,10 @@ export async function startStream(): Promise<() => void> {
     return startFakeStream(stream.dispatch, {
       mode: pickFakeMode(search),
       scenario,
-      desk: pickFakeDesk(search, scenario),
+      // Only when asked for by name: otherwise the desk follows `?state=` and the rescue (fake.ts).
+      ...(new URLSearchParams(search).has('desk') ? { desk: pickFakeDesk(search, scenario) } : {}),
       drift: pickFakeDrift(search),
+      rescue: pickFakeRescue(search),
     });
   }
   return connectSse(stream.dispatch, { url: '/events', readState: () => readEngineState() });
