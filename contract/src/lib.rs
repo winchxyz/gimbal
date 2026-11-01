@@ -10,6 +10,7 @@ pub mod deposit;
 pub mod desk;
 pub mod events;
 pub mod hl;
+pub mod money;
 pub mod mpc;
 pub mod orderly;
 pub mod prices;
@@ -32,6 +33,7 @@ use crate::config::{Config, FeeConfig, Network, OrderlyConfig, PriceSource, Trea
 use crate::deposit::{check_one_yocto, check_pause_deposit, check_some_deposit, refund_after};
 use crate::desk::{policy_sha256, Desk, Gate, Role, SolanaAccounts};
 use crate::events::{emit_signed, DeskCreated, Event, OperatorSet, Paused, PolicySet};
+use crate::money::DeskMoney;
 use crate::prices::StoredPrice;
 use crate::rescue::DeskCounters;
 
@@ -88,6 +90,7 @@ enum StorageKey {
     Prices,
     DeskCounters,
     OperatorCounts,
+    Money,
 }
 
 /// The contract's state. There is no `migrate` method and the layout carries no version: every
@@ -123,6 +126,9 @@ pub struct Gimbal {
     /// Desk id → its rescue window and EIP-3009 counter ([`rescue`]). Stored with the desk, like
     /// its nonce entry, so an action never adds storage.
     desk_counters: LookupMap<String, DeskCounters>,
+    /// Desk id → its owner, ledger and payout flag ([`money`]), apart from the desk record so
+    /// money in and out writes a few fixed bytes. Stored with the desk.
+    money: LookupMap<String, DeskMoney>,
 }
 
 #[near]
@@ -159,6 +165,7 @@ impl Gimbal {
             prices: LookupMap::new(StorageKey::Prices),
             price_asked_ms: [0; ORACLE_ASSETS.len()],
             desk_counters: LookupMap::new(StorageKey::DeskCounters),
+            money: LookupMap::new(StorageKey::Money),
         }
     }
 
@@ -382,9 +389,13 @@ impl Gimbal {
         .emit();
     }
 
-    /// The desk, or `null` when there is none with that id.
+    /// The desk, or `null` when there is none with that id, with its ledger.
     pub fn get_desk(&self, desk_id: String) -> Option<Desk> {
-        self.desks.get(&desk_id).cloned()
+        let mut desk = self.desks.get(&desk_id).cloned()?;
+        if let Some(money) = self.money.get(&desk_id) {
+            desk.ledger = money.ledger;
+        }
+        Some(desk)
     }
 
     /// The ids of the owner's desks, in creation order.
@@ -488,14 +499,16 @@ impl Gimbal {
         refund
     }
 
-    /// Stores the desk, its nonce entry and its counters and appends its id to the owner's ids;
-    /// returns the bytes that took.
+    /// Stores the desk, its nonce entry, its counters and its money record and appends its id to
+    /// the owner's ids; returns the bytes that took.
     fn write_desk(&mut self, desk_id: &str, desk: &Desk) -> u64 {
         let before = env::storage_usage();
         self.desks.insert(desk_id.to_owned(), desk.clone());
         self.hl_nonces.insert(desk_id.to_owned(), 0);
         self.desk_counters
             .insert(desk_id.to_owned(), DeskCounters::default());
+        self.money
+            .insert(desk_id.to_owned(), DeskMoney::new(desk.owner.clone()));
         let n = self.desk_counts.get(&desk.owner).copied().unwrap_or(0);
         self.desk_ids
             .insert((desk.owner.clone(), n), desk_id.to_owned());
@@ -510,6 +523,7 @@ impl Gimbal {
         self.desks.remove(desk_id);
         self.hl_nonces.remove(desk_id);
         self.desk_counters.remove(desk_id);
+        self.money.remove(desk_id);
         let count = self.desk_counts.get(owner).copied().unwrap_or(0);
         if let Some(last) = count.checked_sub(1) {
             self.desk_ids.remove(&(owner.clone(), last));
@@ -527,6 +541,7 @@ impl Gimbal {
         self.desks.flush();
         self.hl_nonces.flush();
         self.desk_counters.flush();
+        self.money.flush();
         self.desk_counts.flush();
         self.desk_ids.flush();
     }

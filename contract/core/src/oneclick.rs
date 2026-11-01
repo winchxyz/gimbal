@@ -77,7 +77,9 @@ pub enum Method {
     HlSendToIntents,
     /// From the desk's Arbitrum address, after an Orderly withdrawal (`refundTo` = the desk EVM).
     EvmUsdcToIntents,
-    /// From the contract's USDC on NEAR (`refundTo` = the contract), C8; no rescue cap.
+    /// From the contract's USDC on NEAR held for the desk (`refundTo` = the desk owner's NEAR
+    /// account); no rescue cap. A 1Click refund on NEAR is a plain `ft_transfer`, which calls
+    /// nothing in the receiver: to the contract it would credit no desk, so it goes to the owner.
     FundVenue,
 }
 
@@ -127,13 +129,15 @@ pub struct DeskAddresses<'a> {
     pub sol: &'a str,
     /// The pinned Orderly receiver on Arbitrum, lowercase, once set.
     pub orderly_receiver: Option<&'a str>,
+    /// The desk owner's NEAR account: `refundTo` of `fund_venue`.
+    pub owner: &'a str,
 }
 
 /// What a quote is checked against.
 #[derive(Clone, Copy, Debug)]
 pub struct Context<'a> {
     pub desk: DeskAddresses<'a>,
-    /// The contract's account id: `refundTo` of `fund_venue`, recipient of a payout.
+    /// The contract's account id: the recipient of a payout (venue → contract for the desk).
     pub contract: &'a str,
     /// The block time, ms: the deadline and the quote's age are checked against it.
     pub now_ms: u64,
@@ -291,11 +295,11 @@ pub fn verify_quote(
     let refund_to_ok = match method {
         Method::SolSignRescue => f.refund_to == ctx.desk.sol,
         Method::HlSendToIntents | Method::EvmUsdcToIntents => same_evm(&f.refund_to, ctx.desk.evm),
-        // TODO(C8 fund_venue): a 1Click refund to refundTo = the contract most likely arrives as
-        // a plain `ft_transfer` (no `ft_on_transfer`, no msg), which credits no desk: fund_venue
-        // must record the deposit address it paid per desk and credit a refund from it, or the
-        // owner's USDC sits in the contract unassigned.
-        Method::FundVenue => f.refund_to == ctx.contract,
+        // 1Click refunds USDC on NEAR with a plain `ft_transfer` (intents' `ft_withdraw` without
+        // a msg), which tells the receiver nothing. Refunded to the contract it would credit no
+        // desk, and the contract cannot tell whose it is: the refund goes to the owner instead,
+        // whose money it is (fund_venue spends the desk's idle USDC).
+        Method::FundVenue => f.refund_to == ctx.desk.owner,
     };
     if !refund_to_ok {
         return Err(fields(format!(

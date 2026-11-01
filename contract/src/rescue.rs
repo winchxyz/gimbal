@@ -144,12 +144,12 @@ pub fn ed25519_verify(signature: &[u8; 64], message: &[u8], public_key: &[u8; 32
     env::ed25519_verify(signature, message, public_key)
 }
 
-fn quote_fields(msg: impl AsRef<str>) -> Refusal {
+pub(crate) fn quote_fields(msg: impl AsRef<str>) -> Refusal {
     Refusal::new(E_QUOTE_FIELDS, msg.as_ref())
 }
 
 /// The verified deposit address, which a live quote always has.
-fn deposit_of(q: &VerifiedQuote) -> String {
+pub(crate) fn deposit_of(q: &VerifiedQuote) -> String {
     q.deposit_address
         .clone()
         .ok_or_else(|| quote_fields("the quote has no depositAddress"))
@@ -251,6 +251,7 @@ impl Gimbal {
                 evm: &desk.evm_address,
                 sol: &desk.solana.authority,
                 orderly_receiver: desk.orderly_receiver.as_deref(),
+                owner: desk.owner.as_str(),
             },
             contract: contract.as_str(),
             now_ms,
@@ -279,6 +280,14 @@ impl Gimbal {
     /// each build step stores the result once all its checks passed. Nothing is ever given back
     /// (module doc).
     pub fn counted_rescue(&self, desk_id: &str, q: &VerifiedQuote) -> DeskCounters {
+        self.counted_transfer(desk_id, q, true)
+    }
+
+    /// [`Self::counted_rescue`] for `fund_venue` too: with `capped` false (USDC from the
+    /// contract into the desk's own venues, a rescue out of the desk's reserve) the amount is
+    /// neither checked against nor added to the hourly cap, while the deposit ring and the cost
+    /// budget count it as for a rescue.
+    pub fn counted_transfer(&self, desk_id: &str, q: &VerifiedQuote, capped: bool) -> DeskCounters {
         let policy = &desk_ref(&self.desks, desk_id).policy;
         let now_ms = env::block_timestamp_ms();
         let mut counters = self.desk_counters.get(desk_id).copied().unwrap_or_default();
@@ -302,7 +311,7 @@ impl Gimbal {
             ));
         }
         let cap_left = counters.remaining_cap_e8(policy.rescue_cap_usd_per_hour, now_ms);
-        if q.amount_in_e8 > cap_left {
+        if capped && q.amount_in_e8 > cap_left {
             fail(Refusal::new(
                 E_RESCUE_CAP,
                 format!(
@@ -331,7 +340,8 @@ impl Gimbal {
                 ),
             ));
         }
-        counters.spend(q.amount_in_e8, cost, deposit_sha256, now_ms);
+        let amount_e8 = if capped { q.amount_in_e8 } else { 0 };
+        counters.spend(amount_e8, cost, deposit_sha256, now_ms);
         counters
     }
 

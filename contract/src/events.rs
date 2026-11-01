@@ -1,6 +1,7 @@
 //! NEP-297 events (docs/interfaces.md §1.6):
 //! `EVENT_JSON:{"standard":"gimbal","version":"1.0.0","event":"<name>","data":[{…}]}`.
 
+use near_sdk::json_types::{I128, U128};
 use near_sdk::serde::Serialize;
 use near_sdk::serde_json;
 use near_sdk::{env, AccountId};
@@ -135,6 +136,58 @@ pub struct OrderlyIpsSet<'a> {
 
 impl Event for OrderlyIpsSet<'_> {
     const NAME: &'static str = ORDERLY_IPS_SET;
+}
+
+/// USDC on NEAR arrived for a desk through `ft_on_transfer`. Amounts are USDC × 1e6 as decimal
+/// strings; `principal` is true when the sender is the desk owner (it then counts in
+/// `deposited_total`), false for 1Click returns and anyone else.
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct Deposit<'a> {
+    pub desk_id: &'a str,
+    pub sender: &'a AccountId,
+    pub amount: U128,
+    pub principal: bool,
+    pub deposited_total: U128,
+    pub idle_usdc: U128,
+}
+
+impl Event for Deposit<'_> {
+    const NAME: &'static str = DEPOSIT;
+}
+
+/// A payout reached the owner, logged once its transfers settled. `amount` is what it took from
+/// the desk's idle USDC, `fee` the performance fee in it (the owner received `amount − fee`),
+/// `profit` the desk's profit at it before fees (`withdrawn + amount − deposited`, negative after a
+/// loss) and `hwm` the high-water mark after it; USDC × 1e6 as decimal strings. When the fee
+/// transfer failed, `amount` is what the owner received, `fee` 0 and `hwm` the mark before.
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct PayoutEvent<'a> {
+    pub desk_id: &'a str,
+    pub to: &'a AccountId,
+    pub amount: U128,
+    pub fee: U128,
+    pub profit: I128,
+    pub hwm: U128,
+}
+
+impl Event for PayoutEvent<'_> {
+    const NAME: &'static str = PAYOUT;
+}
+
+/// A fee reached the treasury. `kind` is `performance`; amount USDC × 1e6 as a decimal string.
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct FeeCharged<'a> {
+    pub desk_id: &'a str,
+    pub kind: &'static str,
+    pub amount: U128,
+    pub treasury: &'a AccountId,
+}
+
+impl Event for FeeCharged<'_> {
+    const NAME: &'static str = FEE_CHARGED;
 }
 
 /// One item of `signed`: the action the MPC signed, one item per order it places (asset, side,

@@ -16,6 +16,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 /// The Hyperliquid methods, on these fixtures.
 mod hl;
+/// Money in and out on NEAR: deposits, fund_venue, payouts and the performance fee.
+mod money;
 /// The Orderly methods, on these fixtures.
 mod orderly;
 /// Oracle prices and orders against them.
@@ -432,7 +434,7 @@ fn attributes_of<'a>(source: &'a str, method: &str) -> Vec<&'a str> {
 /// build is proved on testnet (PR #8); this keeps the attribute from being dropped.
 #[test]
 fn mutating_methods_refuse_unknown_arguments() {
-    let sources: [(&str, &[&str]); 6] = [
+    let sources: [(&str, &[&str]); 7] = [
         (
             include_str!("lib.rs"),
             &[
@@ -480,6 +482,10 @@ fn mutating_methods_refuse_unknown_arguments() {
                 "evm_usdc_to_intents",
             ],
         ),
+        (
+            include_str!("money.rs"),
+            &["ft_on_transfer", "fund_venue", "withdraw_to_owner"],
+        ),
     ];
     for (source, methods) in sources {
         for method in methods {
@@ -498,12 +504,16 @@ fn mutating_methods_refuse_unknown_arguments() {
 /// `refuse` and `new` are the contract's own as well.
 #[test]
 fn callbacks_and_init_are_private() {
-    let sources: [(&str, &[&str]); 2] = [
+    let sources: [(&str, &[&str]); 3] = [
         (
             include_str!("lib.rs"),
             &["new", "on_desk_keys", "on_signed", "refuse"],
         ),
         (include_str!("prices.rs"), &["on_prices"]),
+        (
+            include_str!("money.rs"),
+            &["on_fund_venue", "on_payout_owner", "on_payout_fee"],
+        ),
     ];
     for (source, methods) in sources {
         for method in methods {

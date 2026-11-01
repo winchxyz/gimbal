@@ -1202,6 +1202,7 @@ fn hl_send_to_intents_sends_the_verified_amount_to_the_deposit_address() {
             evm: VECTOR_DESK_EVM,
             sol: &vector_solana().authority,
             orderly_receiver: Some(ORDERLY_RECEIVER),
+            owner: "owner.testnet",
         },
         contract: "gimbal.testnet",
         now_ms: fc["ctx"]["now_ms"].as_u64().unwrap(),
