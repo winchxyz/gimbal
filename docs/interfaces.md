@@ -34,9 +34,16 @@ struct FeeConfig {
 }
 ```
 
-Fees are fixed at `new` and visible in `config()`. Nothing is charged on deposits, rescues or losses.
+Fees are fixed at `new` and visible in `config()`. Nothing is charged on deposits, `fund_venue`, rescues or losses.
 
 MPC: `v1.signer` (mainnet), `v1.signer-prod.testnet` (testnet). OutLayer oracle: `price-oracle.near`.
+USDC on NEAR (Circle, 6 decimals), following `network`: `17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1`
+(mainnet; 1Click names it `nep141:<id>`), `3e2210e1184b45b64c8a434c0a7e7b23cc04ea7eb7a6c3c32520d03d4afcb8af` (testnet;
+1Click has no testnet, so there the contract only takes deposits and pays out).
+
+**Deploy note.** The treasury's NEAR account must be registered on USDC on NEAR (`storage_deposit`) before the
+first payout. Otherwise every fee transfer fails, and the fee stays with the desk (back in its `idle_usdc`, due again
+at the next payout).
 
 ### 1.2 Desks
 
@@ -63,6 +70,14 @@ account are derived from the authority and checked from day 4 (Solana parser). T
 Owner and operator can never be the contract itself, the MPC contract or the oracle (`E_ARGS`). The Solana key is also the desk's
 Orderly key; the contract builds every payload either key signs, so the two uses cannot be confused.
 
+**Desk storage.** `create_desk` charges the storage it writes (the desk record with its policy, its Hyperliquid
+nonce, two fixed-size counter records of about 1.3 KB each, one for rescues and one for `fund_venue`, and its money
+record), plus a 2,592-byte reserve (32 entries × 81 bytes) for the desk's share of the contract-wide map of deposit
+addresses `fund_venue` paid, so `fund_venue` never adds storage the owner did not pay for. Measured in the unit
+tests: 3,611 bytes written + 2,592 = 6,203 bytes (0.062 NEAR) with the fixtures' policy, 11,213 + 2,592 = 13,805
+bytes (0.138 NEAR) with the largest valid policy. The 0.5 NEAR the deploy guide attaches covers either; the rest is
+refunded.
+
 ```rust
 struct Policy {
     hl_assets: Vec<HlAsset>,                 // { index: u32, symbol: String, sz_decimals: u8 }
@@ -88,7 +103,9 @@ struct SolanaAccounts {                      // registered by the owner; Solana 
 }
 struct Ledger {                              // USDC in 1e-6; money in and out passes through the contract on NEAR
     deposited: u128,                         // principal: only the owner's own deposits (base of the high-water mark)
-    withdrawn: u128, fees_paid: u128, hwm: u128,
+    withdrawn: u128,                         // every payout whole, the fee included: withdrawn − fees_paid is
+                                             // what the owner received
+    fees_paid: u128, hwm: u128,
     idle_usdc: u128,                         // USDC on NEAR the contract holds for the desk: owner deposits not yet
                                              // sent out, plus 1Click returns and refunds; fund_venue and
                                              // withdraw_to_owner spend from it
@@ -101,8 +118,13 @@ adds to `idle_usdc` only, never to `deposited`. Any other token, a malformed `ms
 the whole amount is refunded (returned as unused). A 1Click quote that delivers to the contract sets
 `customRecipientMsg` to that same `msg`, so 1Click delivers with `ft_transfer_call`.
 
-Performance fee on a payout `x` to the owner: `profit = withdrawn + x − deposited`;
-`fee = performance_bps × max(0, profit − hwm) / 10000`; then `hwm = max(hwm, profit)`.
+Performance fee on a payout `x` to the owner (`x` comes out of `idle_usdc`, the fee included):
+`profit = withdrawn + x − deposited` (signed: negative after a loss). Fees are cumulative: the fees a mark stands for
+are `⌊bps × mark / 10⁴⌋` (`bps` = `performance_bps`), so the fee on a payout is
+`fee = ⌊bps × max(hwm, profit) / 10⁴⌋ − ⌊bps × hwm / 10⁴⌋`, and `hwm` rises to `max(hwm, profit)`. A fee is never
+more than `x`: when it is cut to the payout amount, `hwm` rises only to the highest mark that fee covers, and the rest
+stays due. A payout split into parts charges exactly the fee of the same payout unsplit, and rounding never favours
+the treasury.
 
 **Order size cap.** An order's notional is valued at a reference price, never at the caller's limit price
 alone (a sell at a tiny limit price would otherwise fit any size): `notional = sz × max(px, oracle_px)`, buys and
@@ -143,8 +165,9 @@ every owner call; more would stay in the contract and is refused (`E_DEPOSIT`).
 
 **Paused desks.** While a desk is paused every operator action method refuses `E_PAUSED`, except actions that
 only reduce risk, which `panic_close` and a rescue rely on: reduce-only orders (`hl_order` / an `orderly_request`
-order with `reduce_only: true`), cancels, and rescue transfers (`fund_venue`, `hl_send_to_intents`,
-`sol_sign_rescue`, `evm_usdc_to_intents`, within `rescue_cap_usd_per_hour`). A paused desk's `sol_sign_rescue` passes
+order with `reduce_only: true`), cancels, rescue transfers (`hl_send_to_intents`, `sol_sign_rescue`,
+`evm_usdc_to_intents`, within `rescue_cap_usd_per_hour`) and `fund_venue` (it only adds margin; within its own limits,
+"fund_venue" below). `withdraw_to_owner` and `clear_payout_lock` also work on a paused desk. A paused desk's `sol_sign_rescue` passes
 only what frees and pays out the quote's `amountIn`: Phoenix withdrawals and Ember unwraps of at most `amountIn` in
 all (with the unwrap's `Approve` and `Revoke`), the idempotent create of the deposit owner's USDC account and the one
 transfer; no priority fee, order, cancel, deposit, wrap or create of a desk account. On Solana a paused desk's `sol_sign` accepts only, besides
@@ -158,13 +181,14 @@ and `withdraw_request` need a running desk.
 **Gas.** Every action method (one that signs through the MPC) needs at least **85 TGas** prepaid, else `E_ARGS`:
 the MPC `sign` gets 50 TGas plus the unused gas, and `on_signed` 15. Measured on testnet 2026-10-31: a max-size
 (≈1,160-byte) `sol_sign` succeeds at exactly 85 TGas. The engine attaches 300. `set_paused` signs nothing; the
-engine sends it at 30 TGas.
+engine sends it at 30 TGas. The NEAR money methods sign nothing and have floors of their own (`E_ARGS` below them):
+`fund_venue` 115 TGas, `withdraw_to_owner` 150 TGas, `refresh_prices` 240 TGas; the engine attaches 300.
 `set_policy` and `set_operator` work on a paused desk.
 
 Mutating methods use `#[deny_unknown_arguments]`, so a misspelt argument is refused instead of read as `None`.
 
 The owner's wallet signs only what needs the owner: `create_desk`, `set_policy`, `set_operator`, adding the
-operator key, `set_orderly_receiver`, deposits and payouts. Venue setup runs from the engine through operator
+operator key, `set_orderly_receiver`, deposits, payouts and `clear_payout_lock`. Venue setup runs from the engine through operator
 methods, and its content is fixed by the policy, `Treasury`, `FeeConfig` and `OrderlyConfig`, so the operator
 chooses nothing:
 - Hyperliquid: `hl_set_referrer` (if a code is set), `hl_approve_builder_fee`.
@@ -185,14 +209,15 @@ chooses nothing:
 | `set_operator(desk_id, operator: Option<AccountId>)` | ✓ | | payable: storage deposit (≥ 1 yocto) |
 | `set_paused(desk_id, paused)` | ✓ | pause only | pausing: 0 or 1 yocto (more → `E_DEPOSIT`); unpausing needs exactly 1 yocto attached, so the operator key cannot unpause |
 | `ft_on_transfer(sender_id, amount, msg)` | any sender | | USDC on NEAR only (`ft_transfer_call`, msg `{"desk_id"}`): owner → `deposited` + `idle_usdc`; others → `idle_usdc`; unknown desk → full refund (§1.2) |
-| `fund_venue(desk_id, quote, quote_signature, reason)` | ✓ | ✓ | sends the desk's USDC on NEAR to a verified 1Click deposit address (recipient = a desk venue address or the pinned Orderly receiver) |
-| `withdraw_to_owner(desk_id, amount)` | ✓ | | pays USDC on NEAR the contract holds for the desk, minus the performance fee to the treasury |
+| `fund_venue(desk_id, quote, quote_signature, reason)` | ✓ | ✓ | sends `amountIn` (≤ `idle_usdc`, `E_SIZE`) of the desk's USDC on NEAR to a verified 1Click deposit address (recipient = a desk venue address or the pinned Orderly receiver; `refundTo` = the desk owner); own ring and hourly cost budget; ≥ 115 TGas; returns `bool` ("fund_venue" below) |
+| `withdraw_to_owner(desk_id, amount)` | ✓ | | pays `amount` (1 to `idle_usdc`, else `E_SIZE`) of the USDC on NEAR the contract holds for the desk: the owner's share first, the performance fee to the treasury after it lands; `E_ARGS` while a payout is in flight; ≥ 150 TGas; returns `bool` ("Payouts" below) |
+| `clear_payout_lock(desk_id)` | ✓ | | exactly 1 yocto; only once the payout lock is ≥ 1 h old; re-credits and rolls back nothing; event `payout_lock_cleared` ("Payouts" below) |
 | `hl_approve_builder_fee(desk_id)` | ✓ | ✓ | `ApproveBuilderFee` for the treasury builder at `maxFeeRate` from `FeeConfig` |
 | `hl_set_referrer(desk_id)` | ✓ | ✓ | L1 action `{type:"setReferrer", code}` with `code = treasury.referral_codes.hyperliquid`; setup calls it once per desk, before its first order (the contract does not refuse a repeat; Hyperliquid does); no other code can be signed; with no code configured it refuses (`E_ARGS`) and setup skips it |
 | `hl_withdraw(desk_id, amount)` | ✓ | | emergency only: to the desk's own EVM address |
 | `set_mock_price(asset, price_e8)` | contract owner | | only with `PriceSource::Mock` |
-| `refresh_prices(assets: Vec<String>)` | ✓ | ✓ | 1–5 symbols, each once. Callers: any desk owner (so its engine key), any desk's separate operator account and the contract account; anyone else `E_NOT_ALLOWED`, so strangers cannot spend the contract's deposit. Needs ≥ 285 TGas (`E_ARGS`). Asks the OutLayer oracle (`request_price_data`, falling back to `oracle_call`) and stores each price newer than the stored one; the oracle deposit (0.02 NEAR, mostly refunded) comes from the contract balance; event `prices`. The contract remembers when each symbol was last asked for: when every symbol asked for had a price stored, or was asked for by an earlier call, under 30 s before the block time, it asks nothing and returns `true` at once (a skip means "nothing to do now", not "priced": a caller that needs a newer price reads `prices()` again). Otherwise it asks the oracle for all of them and returns `true` only when every symbol got a price from that answer |
-| `oracle_on_call(…)` | the oracle only | | the OutLayer oracle's callback when `refresh_prices` uses `oracle_call`; argument shape from OutLayer's docs; any predecessor other than the configured oracle → `E_NOT_ALLOWED` |
+| `refresh_prices(assets: Vec<String>)` | ✓ | ✓ | 1–5 symbols, each once. Callers: any desk owner (so its engine key), any desk's separate operator account and the contract account; anyone else `E_NOT_ALLOWED`, so strangers cannot spend the contract's deposit. Needs ≥ 240 TGas (`E_ARGS`; the engine attaches 300). Asks the OutLayer oracle with `request_price_data`, which gets 200 TGas plus all the unused gas, while the callback `on_prices` gets a fixed 15 TGas; there is no `oracle_call` fallback (it would need as much gas again). It stores each price newer than the stored one; the oracle deposit (0.02 NEAR, mostly refunded) comes from the contract balance; event `prices`. The contract remembers when each symbol was last asked for: when every symbol asked for had a price stored, or was asked for by an earlier call, under 30 s before the block time, it asks nothing and returns `true` at once (a skip means "nothing to do now", not "priced": a caller that needs a newer price reads `prices()` again). Otherwise it asks the oracle for all of them and returns `true` only when every symbol got a price from that answer |
+| `oracle_on_call(sender_id, data, msg)` | the oracle only | | unused: `refresh_prices` no longer makes an `oracle_call`. The method stays for the interface; any predecessor other than the configured oracle, or a `sender_id` other than the contract, → `E_NOT_ALLOWED` |
 | `hl_order(desk_id, order: HlOrder, reason)` | ✓ | ✓ | price band vs stored oracle price; size cap at the reference price (§1.2); reduce-only passes a paused desk |
 | `hl_cancel(desk_id, asset: u32, oid: u64, reason)` | ✓ | ✓ | L1 action `{type:"cancel", cancels:[{a, o}]}`; passes a paused desk, so a pause can stop resting orders |
 | `hl_usd_class_transfer(desk_id, amount, to_perp, reason)` | ✓ | ✓ | |
@@ -254,6 +279,59 @@ treats "no quote" as a normal answer.
 
 A signature the MPC returns late still counts, so nothing is given back after `E_MPC`. A quote whose
 `destinationAsset` is its `originAsset` is refused (`E_QUOTE_FIELDS`): it moves nothing and only pays fees.
+
+**fund_venue.** `fund_venue(desk_id, quote, quote_signature, reason)` pays a live 1Click quote out of the desk's
+`idle_usdc`: origin USDC on NEAR, recipient the desk EVM address (HyperCore USDC), the desk Solana authority (Solana
+USDC) or the pinned Orderly receiver (Arbitrum USDC, `minAmountOut` ≥ 6 USDC), all other quote rules as above.
+Owner or operator, also on a paused desk. Rules of its own:
+- **refundTo** is the desk **owner's** NEAR account, not the contract (`E_QUOTE_FIELDS`). A 1Click refund on NEAR is a
+  plain `ft_transfer`, which calls nothing in the receiver, so a refund to the contract would credit no desk.
+  `fund_venue` registers the deposit address and the owner on USDC (`storage_deposit`) before the transfer, so the
+  refund can land.
+- **Room.** The quote must leave `amountOut − minAmountOut ≥ 0.5 % × amountOut` (`E_QUOTE_FIELDS`), so a quote cannot
+  be built to fail and refund. That room counts in the transfer cost (`amountIn − minAmountOut`), which is checked
+  against `max_transfer_cost_bps` / `max_transfer_cost_flat_e6` as for every quote. A policy therefore needs a cost
+  cap above 50 bps plus the 1Click fee, and whoever requests the quote must ask for a slippage inside that window
+  (at least 50 bps, at most the cap minus the fee).
+- **Amount.** `amountIn` ≤ `idle_usdc` (`E_SIZE`), taken from `idle_usdc` before the transfer goes out. There is no
+  hourly amount cap: it only moves the desk's money into the desk's own accounts.
+- **Limits of its own**, separate from the rescues' (funding can never block a rescue): a per-desk ring of 32 slots,
+  each held for 65 min after it paid (a 33rd `fund_venue` within 65 min is `E_RESCUE_CAP`), and an hourly cost budget
+  over the same sliding hour, `4 × max(max(max_notional_usd, unpriced_max_notional_usd) × max_transfer_cost_bps / 10⁴,
+  max_transfer_cost_flat_e6)` (both legs funded twice; `E_RESCUE_CAP`). Replay protection of deposit addresses is
+  contract-wide: a deposit address any desk's `fund_venue` paid within 65 min is `E_QUOTE_FIELDS`.
+- **Gas.** At least 115 TGas (`E_ARGS`).
+- **Result.** `true` once the transfer landed; `false` when it failed, and the amount is back in `idle_usdc`. The
+  deposit address stays in the ring and the cost stays counted either way.
+
+Residual: a genuine refund goes to the owner and leaves the books as spent, so if the owner deposits it again it
+counts as principal. That under-charges the treasury by at most `performance_bps` (10 %) of the refund; nobody but
+the owner can gain.
+
+**Payouts.** `withdraw_to_owner(desk_id, amount)`: owner only, exactly 1 yocto, also on a paused desk; `amount` from 1
+to `idle_usdc` (`E_SIZE` for 0 or more), one payout per desk in flight (`E_ARGS` while one is), at least 150 TGas
+(`E_ARGS`). The payout is booked at once (`idle_usdc` down by `amount`, `withdrawn` up by `amount`, `fees_paid` up by
+the fee, the new `hwm`). The owner's share (`amount − fee`) is sent first; the fee goes to the treasury only after
+that transfer landed (a payout that is all fee goes straight to the fee transfer). If the owner's transfer fails, the
+whole payout is taken back and the call returns `false`. If only the fee transfer fails, the fee goes back into
+`idle_usdc` (and out of `withdrawn` and `fees_paid`) and `hwm` goes back to where it was, so the next payout charges
+it once; the call returns `true` (`false` for a payout that was all fee). Events `payout` and `fee_charged` are emitted only after the transfers settled.
+Each payout carries a sequence number: a late callback of an older payout gives back only its own amounts and leaves
+`hwm` and the lock to the payout in flight.
+
+`clear_payout_lock(desk_id)` (owner only, exactly 1 yocto; `E_NOT_ALLOWED` otherwise) clears a payout lock that its
+callbacks never released, once the lock is at least 1 h old (`E_ARGS` before then or with no payout in flight). It
+re-credits nothing and rolls nothing back: the ledger stays as `withdraw_to_owner` booked it, because the contract
+cannot know whether the transfers landed. Event `payout_lock_cleared`. Residual: if an old payout fails late, after the
+owner cleared its lock, that payout's fee is forgiven (its amounts come back, the mark stays). This needs a receipt
+delayed more than 1 h, and only the treasury loses.
+
+**Accepted residuals of the NEAR money path.**
+- Each `fund_venue` pays 0.00125 NEAR from the contract's balance to register a new deposit address on USDC (the
+  owner's registration, when it exists already, comes back). Spammed, that is at most 32 per 65 min per desk, about
+  0.9 NEAR a day, and each attempt also costs the desk real 1Click fees.
+- A callback that panics (out of gas, say) leaves its USDC outside the sum of the desks' `idle_usdc`, and there is no
+  sweep to recover it. The callbacks get several times the gas they use.
 
 Views: `config()`, `get_desk(desk_id)`, `desks_of(owner)`, `prices()`, `version()`. `get_desk` also returns
 `orderly_account_id` (keccak of the desk EVM address and the broker hash, fixed at `create_desk`),
@@ -368,16 +446,16 @@ near-sdk before the method runs ("Failed to deserialize input from JSON"); clien
 | `E_NOT_ALLOWED` | caller is neither owner nor operator, operator called an owner method, an owner method came without exactly 1 yocto attached, or a storage method (`create_desk`, `set_policy`, `set_operator`, `set_orderly_receiver`, `set_orderly_ips`) came with no deposit (§1.3); `refresh_prices` from an account that owns and operates no desk |
 | `E_PAUSED` | desk paused |
 | `E_NO_DESK` / `E_DESK_EXISTS` | |
-| `E_ARGS` | malformed argument: desk_id outside `[a-z0-9-]{1,32}`, bad address or base58/hex, `reason` over 280 characters, a once-only setting set twice, `create_desk` with less prepaid gas than its floor (§1.2), an action method with less than 85 TGas (§1.3), an Orderly `client_order_id` from the caller, an Orderly timestamp outside [block − 300 s, block + 5 s], an `eip712_signature` that does not recover to the desk, `oracle_max_age_s` under 900 on a Mainnet contract |
+| `E_ARGS` | malformed argument: desk_id outside `[a-z0-9-]{1,32}`, bad address or base58/hex, `reason` over 280 characters, a once-only setting set twice, `create_desk` with less prepaid gas than its floor (§1.2), an action method with less than 85 TGas (§1.3), an Orderly `client_order_id` from the caller, an Orderly timestamp outside [block − 300 s, block + 5 s], an `eip712_signature` that does not recover to the desk, `oracle_max_age_s` under 900 on a Mainnet contract, `fund_venue` under 115 TGas, `withdraw_to_owner` under 150 TGas or while a payout of the desk is in flight, `refresh_prices` under 240 TGas, `clear_payout_lock` with no payout in flight or a lock under 1 h old |
 | `E_DEPOSIT` | attached deposit below the storage cost (`create_desk`, `set_policy`, `set_operator`, `set_orderly_receiver`, `set_orderly_ips`), or a pause carrying more than 1 yocto |
 | `E_ASSET` | asset, symbol or market not in the policy |
-| `E_SIZE` | notional at the reference price over `max_notional_usd`, an unpriced size over its `max_sz` or its notional over the unpriced cap (§1.2), or zero |
+| `E_SIZE` | notional at the reference price over `max_notional_usd`, an unpriced size over its `max_sz` or its notional over the unpriced cap (§1.2), or zero; a `fund_venue` `amountIn` over `idle_usdc`; a `withdraw_to_owner` amount of 0 or over `idle_usdc` |
 | `E_DECIMAL` | non-canonical decimal string |
 | `E_PRICE_BAND` | price outside `price_band_bps` of the oracle price |
 | `E_ORACLE_STALE` | no oracle price younger than `oracle_max_age_s` |
 | `E_QUOTE_SIGNATURE` | 1Click quote signature does not verify |
-| `E_QUOTE_FIELDS` | quote recipient / refundTo / assets / deadline not acceptable, a quote `timestamp` more than 1 h before or 5 min after the block time, a dry quote, a cost over the policy's transfer bound, a deposit address one of the desk's last 32 rescues paid, or a destination asset equal to the origin asset |
-| `E_RESCUE_CAP` | over what is left of `rescue_cap_usd_per_hour` or of the hourly cost budget in the sliding hour, or a 33rd rescue within 65 min (it would push out a deposit address whose quote may still be payable) (§1.3, "Rescue limits") |
+| `E_QUOTE_FIELDS` | quote recipient / refundTo / assets / deadline not acceptable, a quote `timestamp` more than 1 h before or 5 min after the block time, a dry quote, a cost over the policy's transfer bound, a deposit address one of the desk's last 32 rescues paid, or any desk's `fund_venue` paid within 65 min, a destination asset equal to the origin asset, a `fund_venue` quote whose `refundTo` is not the desk owner or that leaves less than 0.5 % between `amountOut` and `minAmountOut` |
+| `E_RESCUE_CAP` | over what is left of `rescue_cap_usd_per_hour` or of the hourly cost budget in the sliding hour, or a 33rd rescue within 65 min (it would push out a deposit address whose quote may still be payable) (§1.3, "Rescue limits"); for `fund_venue`, over what is left of its own hourly cost budget or a 33rd `fund_venue` within 65 min (§1.3, "fund_venue") |
 | `E_SOL_MESSAGE` | not the accepted message format (legacy; v0 without lookups only for referral activation), trailing bytes, wrong signer count or fee payer, no instruction besides the compute budget |
 | `E_SOL_PROGRAM` | instruction for a program outside the allowlist, or instruction data not accepted (extra bytes, an Approve without its matching unwrap, a Phoenix withdraw or Ember unwrap of 0, a priority fee without a unit limit or over the cap; changed registration arguments are `E_ARGS`). The code for each case is pinned in `contract/core/tests/vectors/solana*.json` |
 | `E_SOL_ACCOUNT` | wrong account count, or an account that is not the pinned one or the desk's own at its position |
@@ -398,10 +476,14 @@ near-sdk before the method runs ("Failed to deserialize input from JSON"); clien
 | `prices` | [{ asset, price_e8, at_ms }] |
 | `signed` | desk_id, request_id, venue, kind, asset?, side?, size?, px?, oracle_px?, amount?, deposit_address?, reason_sha256 |
 | `deposit` | desk_id, sender, amount, principal (true when the sender is the owner), deposited_total, idle_usdc |
-| `payout` | desk_id, to, amount, fee, profit, hwm |
+| `payout` | desk_id, to, amount (gross: the owner's share plus the fee), fee, profit (signed, before fees), hwm (after the payout) |
 | `fee_charged` | desk_id, kind (`performance`), amount, treasury |
+| `payout_lock_cleared` | desk_id, locked_since_ms, ledger (`"unchanged"`) |
 
-`signed` is emitted in `on_signed`, only when the MPC returned a signature.
+`signed` is emitted in `on_signed`, only when the MPC returned a signature. Amounts in `deposit`, `payout` and
+`fee_charged` (and `profit`, which may start with `-`) are decimal strings of USDC × 1e6; `locked_since_ms` is a
+number. `payout` and `fee_charged` are emitted only after the transfers settled: when only the fee transfer failed,
+`payout` says what the owner received, with `fee` "0" and `hwm` as before the payout, and no `fee_charged` follows.
 
 ## 2. Engine ↔ web (`shared/src/types.ts`)
 
@@ -588,8 +670,11 @@ export interface EngineState {
 
 HTTP (engine, `127.0.0.1:8790`; it refuses a Host other than localhost and a foreign Origin, and POST / PUT bodies must be `application/json`): `GET /events` (SSE, one `StreamEvent` per message), `GET /state` (`EngineState`),
 `GET /windows/history?id=<window id>` (`WindowHistory`, for the Windows chart; kept out of the stream because
-it is 168 points per window), `POST /stress` (testnet and replay only: tighten the margin threshold to force a rescue; 1Click has
-no testnet, so on testnet the rescue's 1Click steps are replayed from recorded mainnet responses),
+it is 168 points per window), `POST /stress` (testnet and replay only: raises the rescue line of the nearest leg above its distance to force a
+rescue; no body or `{}` turns it on, `{ "on": false }` off; it answers `{ ok: true }` or `{ ok: false, reason }`:
+403 on mainnet, whatever the request, 503 when no risk engine runs or after it stopped, 409 when no leg with a
+liquidation price is open, 400 for a bad body; 1Click has no testnet, so on testnet the rescue's 1Click steps are
+replayed from recorded mainnet responses),
 `GET /journal?before=<id>` (`JournalEntry[]`: up to 100 entries older than that id, newest first; `[]` past the
 oldest or for an id the engine no longer holds), `POST /policy/draft` `{ text }` → `PolicyDraft` (NEAR AI; nothing is applied until the owner signs `set_policy`
 and confirms the engine rules), `GET` / `PUT /strategy` (`StrategyConfig`), `POST /setup` `{ deskId }` (starts
@@ -598,6 +683,20 @@ window and open this one, with the same checks as auto; refused with the reason 
 `POST /close` (close both legs with reduce-only orders). Both answer `{ ok: true }` or `{ ok: false, reason }`
 at once; progress arrives as `journal` and `desk` events. Pause and Resume are not engine calls: the owner's
 wallet signs `set_paused` (§1.3).
+
+**Health** (`HealthMap`, published on change; `engine/src/risk/venue-health.ts`):
+- a desk venue is `down` when the last scan could not read it or the risk engine's last account read failed, `slow`
+  when the account read took over 5 s or withdrawals are reported paused there, else `ok`;
+- `intents` (1Click) is probed with `GET /v0/tokens`: an error or a non-2xx is `down`, an answer over 5 s `slow`;
+- `near` is the worse of the contract client's own health (the operator key's budget, slow MPC signatures) and the age
+  of the engine's `get_desk` read: `down` when it was never read or the last good read is 60 s old or more (the desk
+  then stays at watch at least), `slow` when the latest read failed or is late.
+
+"Withdrawals paused" is not something any venue API the engine reads states. It is set and cleared explicitly by the
+withdraw step (a venue refusing a withdraw because withdrawals are paused, and a withdraw that goes through) and
+expires after 15 min without news. `HealthMap` has no separate field for it yet: it shows only as `slow` for that
+venue. Nothing reports it yet either: the rescuer (E9) whose withdraw step will call `VenueHealth.withdrawals` is not
+merged.
 
 **NEAR AI rule:** the model drafts and refuses, never acts. A policy draft becomes real only through the
 owner's own `set_policy` transaction (and the engine rules only after the owner confirms them); a veto can
@@ -650,12 +749,39 @@ export interface WatchReader {           // a watch-only venue: public funding a
 }
 
 export interface ContractClient {                      // NearContractClient | ReplayContractClient
-  refreshPrices(assets: string[]): Promise<void>;
+  refreshPrices(assets: string[], options: { maxAgeS: number }): Promise<TxRef[]>;
+                                                       // maxAgeS required, > 0: a stored price that young counts as
+                                                       // refreshed (see below)
+  fundVenue(deskId: string, quote: SignedQuote, reason: string): Promise<TxRef[]>;
   hlOrder(deskId: string, order: HlOrder, reason: string): Promise<SignedAction>;
   solSign(deskId: string, messageB64: string, reason: string): Promise<SignedAction>;
   // … one method per contract action method
 }
 ```
+
+**refreshPrices.** `NearContractClient.refreshPrices(assets, { maxAgeS })` calls `refresh_prices`, throws when it
+returns `false`, and then reads `prices()` back: every asset asked for must show a newer stored price, or one younger
+than `maxAgeS` (there is no default, so an old price never counts as fresh by accident). When the contract skipped
+the oracle because an earlier call asked under 30 s ago, that answer may still be on its way, so `prices()` is polled
+every 1 s for up to 35 s before a price counts as missing (an error naming the assets). It returns the NEAR
+transaction's `TxRef`.
+
+**Risk engine** (`engine/src/risk/`). Every 5 s it reads the desk's legs from the venues and computes each leg's
+margin ratio and distance to liquidation (`margin.ts`). The leg uses the nearer of the venue's liquidation price and
+the one computed from its account; on an account with several positions the computed one does not apply, and when
+the venue gives none either the distance is the account basis, (equity − maintenance) ÷ the account's whole
+notional. Lines (`thresholds.ts`):
+- rescue line = `max(rescueDistancePct, (exp(4 σ √185 s) − 1) × 100)`, where σ is the leg's realised volatility per
+  √s over the last 30 min (at least 10 returns, else the owner's line alone) and 185 s is the slow rescue measured on
+  mainnet (a 120 s MPC signature plus a 65 s 1Click transfer);
+- watch line = `max(watchDistancePct, rescue line + (watchDistancePct − rescueDistancePct))`;
+- a leg leaves a level only once its distance clears the line by 1 point (hysteresis).
+
+Rescue triggers are per leg: a leg that reaches rescue is triggered once; while it stays in rescue it is triggered
+again only when its rescue failed or lapsed (no end within 370 s), after a backoff of 30 s doubling up to 10 min. A
+leg that leaves rescue starts afresh. ADL detection (`engine/src/risk/adl.ts`: a leg that shrank without an order of
+ours is re-hedged or unwound with reduce-only orders) exists but is **not active**: `serve` does not wire it into the
+risk engine yet (TODO day 10, once serve holds the strategy engine's pair trader).
 
 **Outcome unknown.** Signing and sending never guess. When the engine cannot prove an action did not run, it
 throws `OutcomeUnknown` (`engine/src/contract/types.ts`) with every id it knows: the NEAR tx hash, the HL cloid

@@ -78,6 +78,7 @@ export interface OwnerMethod {
  */
 export const OWNER_ONLY: readonly OwnerMethod[] = [
   { method: 'withdraw_to_owner', what: 'pay USDC out to you' },
+  { method: 'clear_payout_lock', what: 'free a payout that has been stuck for over an hour' },
   { method: 'set_policy', what: 'change the policy' },
   { method: 'set_operator', what: 'replace the operator' },
   { method: 'panic_close', what: 'pause the desk at once and have both legs closed' },
