@@ -156,6 +156,9 @@ pub struct DeskMoney {
     pub payout_pending: bool,
     /// Block time (ms) the pending payout was booked; 0 with none.
     pub payout_since_ms: u64,
+    /// The number of the desk's latest payout, from 1; its callbacks carry it, so a late callback
+    /// of a payout whose lock the owner cleared does not settle the next one.
+    pub payout_seq: u64,
 }
 
 impl DeskMoney {
@@ -165,6 +168,7 @@ impl DeskMoney {
             ledger: Ledger::default(),
             payout_pending: false,
             payout_since_ms: 0,
+            payout_seq: 0,
         }
     }
 
@@ -180,6 +184,11 @@ impl DeskMoney {
         self.payout_pending = false;
         self.payout_since_ms = 0;
     }
+
+    /// Whether the payout numbered `seq` is the one in flight.
+    fn settles(&self, seq: u64) -> bool {
+        self.payout_pending && self.payout_seq == seq
+    }
 }
 
 /// The `msg` of a USDC `ft_transfer_call` to the contract, `{"desk_id":"<id>"}`.
@@ -189,10 +198,12 @@ struct DeskMsg {
     desk_id: String,
 }
 
-/// A payout in flight, as its callbacks receive it: [`Payout`] in JSON.
+/// A payout in flight, as its callbacks receive it: [`Payout`] in JSON and its number
+/// ([`DeskMoney::payout_seq`]).
 #[near(serializers = [json])]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingPayout {
+    pub seq: u64,
     pub amount: U128,
     pub fee: U128,
     pub profit: I128,
@@ -200,9 +211,10 @@ pub struct PendingPayout {
     pub hwm_after: U128,
 }
 
-impl From<Payout> for PendingPayout {
-    fn from(p: Payout) -> Self {
+impl PendingPayout {
+    pub fn new(p: Payout, seq: u64) -> Self {
         Self {
+            seq,
             amount: U128(p.amount),
             fee: U128(p.fee),
             profit: I128(p.profit),
@@ -374,7 +386,10 @@ impl Gimbal {
 
     /// The callback of the owner's transfer. Failed: the payout is taken back whole and it returns
     /// `false`. Landed with no fee: `payout`, `true`. Landed with a fee: the fee transfer to the
-    /// treasury and [`Self::on_payout_fee`]. Never panics.
+    /// treasury and [`Self::on_payout_fee`]. Never panics. A callback of a payout that is no longer
+    /// the one in flight (the owner cleared its lock, then withdrew again) gives back only the
+    /// amounts a failed transfer did not send and leaves the high-water mark and the lock to the
+    /// payout in flight.
     #[private]
     pub fn on_payout_owner(
         &mut self,
@@ -386,9 +401,14 @@ impl Gimbal {
         if !transfer_succeeded() {
             if let Some(money) = self.money.get_mut(&desk_id) {
                 let mut books = money.books();
-                books.undo_payout(&p);
-                money.set_books(books);
-                money.unlock();
+                if money.settles(payout.seq) {
+                    books.undo_payout(&p);
+                    money.set_books(books);
+                    money.unlock();
+                } else {
+                    books.return_payout(&p);
+                    money.set_books(books);
+                }
             }
             env::log_str(&format!(
                 "the payout of {} to {owner} failed; desk {desk_id}'s ledger is as before",
@@ -397,7 +417,7 @@ impl Gimbal {
             return PromiseOrValue::Value(false);
         }
         if p.fee == 0 {
-            self.end_payout(&desk_id);
+            self.end_payout(&desk_id, payout.seq);
             emit_payout(&desk_id, &owner, &p);
             return PromiseOrValue::Value(true);
         }
@@ -418,7 +438,7 @@ impl Gimbal {
         let p = Payout::from(payout);
         let landed = transfer_succeeded();
         if landed {
-            self.end_payout(&desk_id);
+            self.end_payout(&desk_id, payout.seq);
             emit_payout(&desk_id, &owner, &p);
             FeeCharged {
                 desk_id: &desk_id,
@@ -431,9 +451,14 @@ impl Gimbal {
         }
         if let Some(money) = self.money.get_mut(&desk_id) {
             let mut books = money.books();
-            books.undo_fee(&p);
-            money.set_books(books);
-            money.unlock();
+            if money.settles(payout.seq) {
+                books.undo_fee(&p);
+                money.set_books(books);
+                money.unlock();
+            } else {
+                books.return_fee(&p);
+                money.set_books(books);
+            }
         }
         env::log_str(&format!(
             "the fee of {} for desk {desk_id} did not reach the treasury; it is back in the desk's \
@@ -708,7 +733,7 @@ impl Gimbal {
 
     /// Books a payout of `amount` and marks it in flight: `E_ARGS` while another one is,
     /// `E_SIZE` for 0 or more than `idle_usdc`.
-    pub fn book_payout(&mut self, desk_id: &str, amount: u128) -> Payout {
+    pub fn book_payout(&mut self, desk_id: &str, amount: u128) -> PendingPayout {
         let bps = self.config.fees.performance_bps;
         let money = self.money_mut(desk_id);
         if money.payout_pending {
@@ -735,26 +760,33 @@ impl Gimbal {
         money.set_books(books);
         money.payout_pending = true;
         money.payout_since_ms = env::block_timestamp_ms();
-        payout
+        money.payout_seq += 1;
+        PendingPayout::new(payout, money.payout_seq)
     }
 
     /// The owner's share to the owner, then [`Self::on_payout_owner`]; a payout that is all fee
     /// (the owner's share is 0) goes straight to the fee transfer.
-    pub fn send_payout(&self, desk_id: String, owner: AccountId, p: Payout) -> Promise {
-        if p.to_owner() == 0 {
-            return self.send_fee(desk_id, owner, p.into());
+    pub fn send_payout(
+        &self,
+        desk_id: String,
+        owner: AccountId,
+        pending: PendingPayout,
+    ) -> Promise {
+        let to_owner = Payout::from(pending).to_owner();
+        if to_owner == 0 {
+            return self.send_fee(desk_id, owner, pending);
         }
         ft_transfer(
             &self.usdc(),
             &owner,
-            p.to_owner(),
+            to_owner,
             format!("gimbal payout {desk_id}"),
         )
         .then(
             Self::ext(env::current_account_id())
                 .with_static_gas(ON_PAYOUT_OWNER_GAS)
                 .with_unused_gas_weight(0)
-                .on_payout_owner(desk_id, owner, p.into()),
+                .on_payout_owner(desk_id, owner, pending),
         )
     }
 
@@ -774,9 +806,12 @@ impl Gimbal {
         )
     }
 
-    fn end_payout(&mut self, desk_id: &str) {
+    /// Releases the lock when payout `seq` is the one in flight.
+    fn end_payout(&mut self, desk_id: &str, seq: u64) {
         if let Some(money) = self.money.get_mut(desk_id) {
-            money.unlock();
+            if money.settles(seq) {
+                money.unlock();
+            }
         }
     }
 }

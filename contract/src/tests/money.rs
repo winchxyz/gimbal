@@ -1064,6 +1064,110 @@ fn the_owner_clears_a_stuck_payout_lock_after_an_hour() {
     assert_eq!(g.money.get("alpha").unwrap().payout_since_ms, 0);
 }
 
+/// Re-review A: payout 1 (110 of 100 principal + 20 profit, fee 1, mark 10) is booked and its
+/// callbacks stall; the owner clears its lock an hour on and books payout 2 (10, fee 1, mark 10 to
+/// 20). Returns both.
+fn a_stale_payout_and_the_next() -> (Gimbal, PendingPayout, PendingPayout) {
+    let mut g = with_desk();
+    deposit_alpha(&mut g, owner(), 100 * USDC);
+    g.money.get_mut("alpha").unwrap().ledger.idle_usdc = 0;
+    deposit_alpha(&mut g, intents(), 120 * USDC);
+    at(owner(), NOW_MS, ONE_YOCTO);
+    g.withdraw_to_owner("alpha".into(), U128(110 * USDC))
+        .detach();
+    let (_, p1) = scheduled_payout();
+    at(owner(), NOW_MS + 3_600_000, ONE_YOCTO);
+    outcome(|| g.clear_payout_lock("alpha".into())).unwrap();
+    withdraw(&mut g, 10 * USDC).unwrap();
+    let (_, p2) = scheduled_payout();
+    assert_eq!((p1.seq, p2.seq), (1, 2));
+    assert_eq!((p1.fee.0, p1.hwm_after.0), (USDC, 10 * USDC));
+    assert_eq!(
+        (p2.fee.0, p2.hwm_before.0, p2.hwm_after.0),
+        (USDC, 10 * USDC, 20 * USDC)
+    );
+    let l = ledger(&g, "alpha");
+    assert_eq!(
+        (l.idle_usdc, l.withdrawn, l.fees_paid, l.hwm),
+        (0, 120 * USDC, 2 * USDC, 20 * USDC)
+    );
+    (g, p1, p2)
+}
+
+/// Payout 2 settles whole: the lock goes, the ledger is `want`.
+fn the_next_settles(g: &mut Gimbal, p2: PendingPayout, want: (u128, u128, u128, u128)) {
+    assert!(pending(g), "payout 2 is still in flight");
+    settled(true);
+    match g.on_payout_owner("alpha".into(), owner(), p2) {
+        PromiseOrValue::Promise(next) => next.detach(),
+        PromiseOrValue::Value(_) => panic!("payout 2 has a fee"),
+    }
+    settled(true);
+    assert!(g.on_payout_fee("alpha".into(), owner(), p2));
+    assert!(!pending(g));
+    let l = ledger(g, "alpha");
+    assert_eq!((l.idle_usdc, l.withdrawn, l.fees_paid, l.hwm), want);
+}
+
+/// A late failed owner transfer of payout 1 gives back its 110 and its fee, and leaves payout 2's
+/// mark and lock alone.
+#[test]
+fn a_late_failed_payout_gives_back_only_its_amounts() {
+    let (mut g, p1, p2) = a_stale_payout_and_the_next();
+    settled(false);
+    match g.on_payout_owner("alpha".into(), owner(), p1) {
+        PromiseOrValue::Value(paid) => assert!(!paid),
+        PromiseOrValue::Promise(_) => panic!("a failed transfer ends the payout"),
+    }
+    let l = ledger(&g, "alpha");
+    assert_eq!(
+        (l.idle_usdc, l.withdrawn, l.fees_paid, l.hwm),
+        (110 * USDC, 10 * USDC, USDC, 20 * USDC)
+    );
+    the_next_settles(&mut g, p2, (110 * USDC, 10 * USDC, USDC, 20 * USDC));
+}
+
+/// A late landed payout 1 sends its fee and settles without touching payout 2's lock; a late
+/// failed fee of payout 1 gives back the fee alone.
+#[test]
+fn a_late_landed_payout_leaves_the_next_locked() {
+    a_late_landed_payout(true);
+}
+
+#[test]
+fn a_late_failed_fee_gives_back_only_the_fee() {
+    a_late_landed_payout(false);
+}
+
+fn a_late_landed_payout(fee_ok: bool) {
+    {
+        let (mut g, p1, p2) = a_stale_payout_and_the_next();
+        settled(true);
+        match g.on_payout_owner("alpha".into(), owner(), p1) {
+            PromiseOrValue::Promise(next) => next.detach(),
+            PromiseOrValue::Value(_) => panic!("payout 1 has a fee"),
+        }
+        assert!(pending(&g));
+        settled(fee_ok);
+        assert!(
+            g.on_payout_fee("alpha".into(), owner(), p1),
+            "the owner got payout 1"
+        );
+        let want = if fee_ok {
+            (0, 120 * USDC, 2 * USDC, 20 * USDC)
+        } else {
+            (USDC, 119 * USDC, USDC, 20 * USDC)
+        };
+        let l = ledger(&g, "alpha");
+        assert_eq!(
+            (l.idle_usdc, l.withdrawn, l.fees_paid, l.hwm),
+            want,
+            "fee landed: {fee_ok}"
+        );
+        the_next_settles(&mut g, p2, want);
+    }
+}
+
 #[test]
 fn one_payout_at_a_time() {
     let mut g = with_desk();

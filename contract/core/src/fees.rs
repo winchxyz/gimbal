@@ -3,17 +3,18 @@
 //! fund moves between venues, rescues or losses.
 //!
 //! On a payout `x` (taken from the desk's idle USDC, the fee included):
-//! `profit = withdrawn + x − deposited`, `fee = performance_bps × max(0, profit − hwm) / 10⁴`,
-//! then the high-water mark rises by the profit that fee paid for (below). `withdrawn` counts every
-//! payout whole, the fee included, so `withdrawn − fees_paid` is what the owner received and
-//! `profit` is the desk's profit before fees.
+//! `profit = withdrawn + x − deposited`; the mark goes to `max(hwm, profit)` and the fee is what
+//! that adds to the fees the mark stands for, `⌊bps × mark / 10⁴⌋`: `fee = ⌊bps × max(hwm, profit)
+//! / 10⁴⌋ − ⌊bps × hwm / 10⁴⌋`, which is `performance_bps × max(0, profit − hwm) / 10⁴` up to the
+//! rounding. `withdrawn` counts every payout whole, the fee included, so `withdrawn − fees_paid` is
+//! what the owner received and `profit` is the desk's profit before fees.
 //!
-//! Rounding goes to the owner: the fee is rounded down, and it is never more than `x`. The mark
-//! rises only by the profit the charged fee covers, `fee × 10⁴ / bps` rounded up (at most to
-//! `profit`): a fee cut to `x` (a payout smaller than the fee due, after a failed fee transfer)
-//! leaves the rest of the profit above the mark, due at the next payout, and so does a fee rounded
-//! down, so splitting a payout never lowers the total fee below `bps` × the profit rounded down,
-//! and never raises it above.
+//! The fees telescope: whenever they all landed, the fees charged up to a mark are exactly
+//! `⌊bps × mark / 10⁴⌋`, so a payout split in any number of parts costs the owner exactly what it
+//! would unsplit, for every bps, and rounding never goes to the treasury. A fee is never more than
+//! `x`: when less than the fee due is charged (a payout smaller than the fee due, after a failed
+//! fee transfer), the mark rises only to the highest one that fee pays for, and the rest stays
+//! due.
 //!
 //! A payout is two transfers, the owner's share first and the fee after it. [`Books::undo_payout`]
 //! takes the whole payout back when the owner's transfer failed (nothing left the contract), and
@@ -59,14 +60,16 @@ impl Payout {
     }
 }
 
-/// The profit a fee of `fee` pays for at `performance_bps`: `fee × 10⁴ / bps`, rounded up (the
-/// owner's way: a higher mark). At 0 bps nothing is ever charged, so all profit counts as covered.
-fn covered(fee: u128, performance_bps: u16) -> u128 {
+/// The highest mark whose fees, `⌊bps × mark / 10⁴⌋`, are at most `fees`: ⌊((fees + 1) × 10⁴ − 1)
+/// / bps⌋. With bps ≤ 10⁴ the fees of a mark rise by at most 1 per unit, so that mark's fees are
+/// exactly `fees` whenever a higher mark's are more.
+fn mark_paid_by(fees: u128, performance_bps: u16) -> u128 {
     if performance_bps == 0 {
         return u128::MAX;
     }
-    fee.checked_mul(10_000)
-        .map_or(u128::MAX, |v| v.div_ceil(u128::from(performance_bps)))
+    fees.checked_add(1)
+        .and_then(|f| f.checked_mul(10_000))
+        .map_or(u128::MAX, |v| (v - 1) / u128::from(performance_bps))
 }
 
 /// `performance_bps × value / 10⁴`, rounded down, without the product overflowing.
@@ -90,12 +93,16 @@ impl Books {
     /// caller checked `amount ≤ idle_usdc`.
     pub fn payout(&self, amount: u128, performance_bps: u16) -> Payout {
         let paid = self.withdrawn.saturating_add(amount);
-        // max(0, profit − hwm) = max(0, withdrawn + x − deposited − hwm), all terms ≥ 0.
-        let above = paid.saturating_sub(self.deposited.saturating_add(self.hwm));
-        let fee = share_down(above, performance_bps).min(amount);
-        let hwm_after = self
-            .hwm
-            .saturating_add(covered(fee, performance_bps).min(above));
+        let target = self.hwm.max(paid.saturating_sub(self.deposited));
+        let charged = share_down(self.hwm, performance_bps);
+        let due = share_down(target, performance_bps) - charged;
+        let (fee, hwm_after) = if due <= amount {
+            (due, target)
+        } else {
+            // Cut to the payout: the mark rises only as far as the fee pays for.
+            let mark = mark_paid_by(charged + amount, performance_bps);
+            (amount, mark.clamp(self.hwm, target))
+        };
         Payout {
             amount,
             fee,
@@ -116,20 +123,32 @@ impl Books {
 
     /// Takes back payout `p` whole: the owner's transfer failed and the fee was not sent.
     pub fn undo_payout(&mut self, p: &Payout) {
+        self.return_payout(p);
+        self.hwm = p.hwm_before;
+    }
+
+    /// The amounts of [`Self::undo_payout`] alone, the high-water mark left as it is: for a payout
+    /// settled after a later one was booked, whose mark is that later payout's.
+    pub fn return_payout(&mut self, p: &Payout) {
         self.idle_usdc = self.idle_usdc.saturating_add(p.amount);
         self.withdrawn = self.withdrawn.saturating_sub(p.amount);
         self.fees_paid = self.fees_paid.saturating_sub(p.fee);
-        self.hwm = p.hwm_before;
     }
 
     /// Takes back the fee of payout `p`: the owner received `p.to_owner()`, the fee transfer
     /// failed. The ledger is then that of a payout of `p.to_owner()` that set no high-water mark,
     /// whose fee is still due: the fee stays in the desk's idle USDC and the next payout charges it.
     pub fn undo_fee(&mut self, p: &Payout) {
+        self.return_fee(p);
+        self.hwm = p.hwm_before;
+    }
+
+    /// The amounts of [`Self::undo_fee`] alone, the high-water mark left as it is (see
+    /// [`Self::return_payout`]).
+    pub fn return_fee(&mut self, p: &Payout) {
         self.idle_usdc = self.idle_usdc.saturating_add(p.fee);
         self.withdrawn = self.withdrawn.saturating_sub(p.fee);
         self.fees_paid = self.fees_paid.saturating_sub(p.fee);
-        self.hwm = p.hwm_before;
     }
 
     /// An owner deposit: principal and idle USDC.
@@ -264,7 +283,7 @@ mod tests {
         assert_eq!((b.fees_paid, b.hwm, b.idle_usdc), (0, 0, 0));
     }
 
-    /// The fee is rounded down at every payout, so splitting a payout never costs the owner more.
+    /// The fees telescope, so splitting a payout costs the owner exactly what it would unsplit.
     #[test]
     fn rounding_goes_to_the_owner() {
         let mut b = Books::default();
@@ -272,15 +291,12 @@ mod tests {
         venue_result(&mut b, 19);
         // Profit 19 base units: 10% is 1.9, charged 1.
         assert_eq!(b.payout(20, BPS).fee, 1);
-        // Paid in single units, each fee rounds to 0 until 10 units of profit are above the mark,
-        // which a fee of 1 covers: the total is the unsplit payout's, never more.
+        // Paid in single units: the fee of 1 comes when the mark reaches 10, the total is the
+        // unsplit payout's.
         let mut split = b;
         let total: u128 = (0..20).map(|_| pay(&mut split, 1)).sum();
         assert_eq!(total, 1);
-        assert_eq!(
-            split.hwm, 10,
-            "the 9 units the fee did not cover stay above the mark"
-        );
+        assert_eq!(split.hwm, 19);
         // A fee rounded down never charges the remainder twice: 15 then 5 is 1 + 1, as 20 at once.
         let mut e = Books::default();
         e.deposit_principal(100);
@@ -358,9 +374,84 @@ mod tests {
         b.apply(&p);
         b.undo_fee(&p);
         assert_eq!(pay(&mut b, USDC / 2), USDC / 2);
-        assert_eq!(b.hwm, 5 * USDC);
+        // The highest mark 0.5 pays for at 10 %: its fees are 0.5, the next unit's more.
+        assert_eq!(b.hwm, 5 * USDC + 9);
+        assert_eq!(share_down(b.hwm, BPS), USDC / 2);
+        assert_eq!(share_down(b.hwm + 1, BPS), USDC / 2 + 1);
         assert_eq!(pay(&mut b, USDC / 2), USDC / 2);
         assert_eq!((b.fees_paid, b.hwm, b.idle_usdc), (USDC, 10 * USDC, 0));
+    }
+
+    /// Re-review B: for every bps, a payout paid in parts (single units, uneven parts, or after a
+    /// failed fee in parts smaller than the fee due) charges exactly the unsplit fee,
+    /// ⌊bps × profit / 10⁴⌋, never more or less. The ceiling rule overshot at 3333 (2 for 3).
+    #[test]
+    fn split_payouts_charge_exactly_the_unsplit_fee_at_every_bps() {
+        for bps in [0u16, 1, 7, 1000, 2500, 3333, 6667, 9999, 10_000] {
+            for profit in [1u128, 3, 9, 10, 19, 31, 99, 1_234, 10_001] {
+                let fresh = || {
+                    let mut b = Books::default();
+                    b.deposit_principal(1_000);
+                    b.deposit_return(profit);
+                    b
+                };
+                let total = 1_000 + profit;
+                let want = share_down(profit, bps);
+                let pay_all = |b: &mut Books, parts: &[u128]| -> u128 {
+                    parts
+                        .iter()
+                        .map(|&x| {
+                            let p = b.payout(x, bps);
+                            assert!(p.fee <= x);
+                            b.apply(&p);
+                            p.fee
+                        })
+                        .sum()
+                };
+                let mut whole = fresh();
+                assert_eq!(pay_all(&mut whole, &[total]), want, "bps {bps}, {profit}");
+                // The principal back first, then the profit one unit at a time.
+                let mut units = fresh();
+                let mut parts = vec![1_000];
+                parts.extend(std::iter::repeat_n(1, profit as usize));
+                assert_eq!(
+                    pay_all(&mut units, &parts),
+                    want,
+                    "bps {bps}, {profit} in units"
+                );
+                // Uneven parts across the principal.
+                let mut uneven = fresh();
+                let mut left = total;
+                let mut parts = vec![];
+                for size in [997, 2, 5, 1, 13, 3].iter().cycle() {
+                    if left == 0 {
+                        break;
+                    }
+                    let x = (*size as u128).min(left);
+                    parts.push(x);
+                    left -= x;
+                }
+                assert_eq!(
+                    pay_all(&mut uneven, &parts),
+                    want,
+                    "bps {bps}, {profit} uneven"
+                );
+                // The fee transfer of the whole payout fails, then single units pay what is due.
+                let mut failed = fresh();
+                let p = failed.payout(total, bps);
+                failed.apply(&p);
+                failed.undo_fee(&p);
+                let rest = vec![1; failed.idle_usdc as usize];
+                assert_eq!(
+                    pay_all(&mut failed, &rest),
+                    want,
+                    "bps {bps}, {profit} after a failed fee"
+                );
+                for b in [whole, units, uneven, failed] {
+                    assert_eq!((b.fees_paid, b.idle_usdc), (want, 0), "bps {bps}, {profit}");
+                }
+            }
+        }
     }
 
     /// After a failed fee, a payout smaller than the fee due takes at most the payout.
