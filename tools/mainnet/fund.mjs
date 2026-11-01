@@ -15,8 +15,9 @@
 // amount in NEAR USDC base units, slippageTolerance = --slippage-bps), before anything is signed; then
 // fund_venue(desk_id, quote, quote_signature, reason) goes out, signed with the engine's operator key, 300 TGas.
 // After it: POST /deposit/submit, then 1Click's status and the venue balance are read until the transfer lands,
-// fails, or --timeout-s passes. "Landed" means 1Click SUCCESS and the venue's cash up by at least minAmountOut,
-// cash without unrealized PnL: Hyperliquid's totalRawUsd (not accountValue), the Solana USDC token account. Orderly
+// fails, or --timeout-s passes. "Landed" means 1Click SUCCESS and the venue's own record of the delivery:
+// Hyperliquid, an incoming entry to the desk address in its non-funding ledger since the fund_venue, of at least
+// minAmountOut (a balance moves with PnL too); Solana, the USDC token account up by at least minAmountOut. Orderly
 // holdings are not public, so there it says "unconfirmed".
 //
 // Default: a dry run with a DRY quote (dry: true reserves no deposit address and cannot be paid). Only --send asks
@@ -25,7 +26,7 @@
 // FunctionCall key for this contract, and refuses in a linked git worktree. It ends with one block to paste back.
 
 import { UsageError, envValues, isMain, parseFlags, run } from './cli.mjs';
-import { hyperliquidPerps, rpcUrls, solanaBalances } from './balances.mjs';
+import { hyperliquidLedger, hyperliquidPerps, rpcUrls, solanaBalances } from './balances.mjs';
 import { sendRefusal } from './checks.mjs';
 import { OPERATOR_METHODS, operatorKeyFile } from './desk.mjs';
 import {
@@ -142,8 +143,23 @@ async function venueBalanceE6(venue, desk, fetchImpl, urls) {
   if (venue === 'solana') return (await solanaBalances(fetchImpl, urls.solana, { authority: desk.solana.authority, tokenAccounts: { usdc: desk.solana.usdc_ata } })).tokens.usdc.amount;
   return null;
 }
-/** Polls after 1Click says SUCCESS while the venue balance has not moved yet. */
+/** Polls after 1Click says SUCCESS while the venue has not shown the delivery yet. */
 const POLLS_AFTER_SUCCESS = 30;
+/** Ledger entries this long before the fund_venue was sent still count (clock skew between this machine and HL). */
+const LEDGER_SLACK_MS = 60_000;
+/** Ledger entry types that bring USDC into an address. */
+export const HL_INCOMING = ['deposit', 'send', 'internalTransfer', 'spotTransfer'];
+
+/**
+ * The Hyperliquid ledger entry that is the 1Click delivery, or null: incoming (HL_INCOMING), booked since `since`,
+ * to the desk address (a `deposit` has no destination: the bridge credits the address itself), not sent by the
+ * desk, of at least `minOutE6` USDC.
+ */
+export function hlDelivery(entries, { desk, since, minOutE6 }) {
+  const me = desk.toLowerCase();
+  return entries.find((e) => e.time >= since && HL_INCOMING.includes(e.type) && e.usdcE6 !== null && e.usdcE6 >= minOutE6 && e.user !== me
+    && (e.destination === null ? e.type === 'deposit' : e.destination === me)) ?? null;
+}
 
 /**
  * Runs the funding; deps: near, fetch, say, now, tree, readKey(file, accountId), env (Map of ONECLICK_API_KEY),
@@ -251,6 +267,7 @@ export async function runFund(argv, deps = {}) {
 
   const lines = [`contract ${a.contract}, desk ${a.deskId}, venue ${a.venue}, SEND`];
   lines.push(`quote:    live, depositAddress ${q.depositAddress}, amountIn ${q.amountIn}, amountOut ${q.amountOut}, minAmountOut ${q.minAmountOut}, signed ${r.body.timestamp}`);
+  const sentAt = now();
   const out = await client.send(signer, a.contract, actions, { onSent: (h) => say(`\ntx sent ${h}; waiting for final`) });
   say(`tx final: ${txLink(out.hash)} (${out.burntTgas} TGas, ${nearText(out.burntYocto, 6)} NEAR burnt)`);
   for (const log of out.logs) say(`  log ${log}`);
@@ -272,12 +289,15 @@ export async function runFund(argv, deps = {}) {
   const submit = await submitDeposit(fetchImpl, out.hash, q.depositAddress, apiKey).catch((e) => ({ status: 0, body: { message: e.message } }));
   say(`1click    POST /deposit/submit {"txHash":"${out.hash}","depositAddress":"${q.depositAddress}"} -> HTTP ${submit.status}`);
   const deadline = now() + a.timeoutS * 1000;
-  // "Landed" needs both: 1Click SUCCESS and the venue's cash up by at least minAmountOut. The cash excludes
-  // unrealized PnL (Hyperliquid totalRawUsd, not accountValue), so a price move is never taken for the transfer.
+  // "Landed" needs both: 1Click SUCCESS and the venue's own record of the delivery. Hyperliquid: an incoming entry
+  // in the desk's non-funding ledger since the fund_venue, to the desk address, of at least minAmountOut (a balance
+  // can move for other reasons, PnL among them). Solana: the USDC token account up by at least minAmountOut.
+  // Orderly: not public, so unconfirmed.
   const minOutE6 = q.minAmountOutE8 / 100n;
   const balanceName = VENUE_BALANCE[a.venue];
   let last = null;
   let landed = null;
+  let delivery = null;
   let venueNow = venueBefore;
   let afterSuccess = 0;
   for (;;) {
@@ -286,8 +306,14 @@ export async function runFund(argv, deps = {}) {
     if (st !== last) say(`1click    status ${st} at ${at()}`);
     last = st;
     venueNow = await venueBalanceE6(a.venue, desk, fetchImpl, urls).catch(() => venueNow);
-    if (venueBefore !== null && venueNow !== null && venueNow - venueBefore >= minOutE6) landed = venueNow - venueBefore;
-    if (FINAL_STATUSES.includes(st) && (st !== 'SUCCESS' || venueBefore === null || landed !== null)) break;
+    if (a.venue === 'hyperliquid') {
+      const entries = await hyperliquidLedger(fetchImpl, desk.evm_address, sentAt - LEDGER_SLACK_MS).catch(() => []);
+      delivery = hlDelivery(entries, { desk: desk.evm_address, since: sentAt - LEDGER_SLACK_MS, minOutE6 });
+      if (delivery !== null) landed = delivery.usdcE6;
+    } else if (venueBefore !== null && venueNow !== null && venueNow - venueBefore >= minOutE6) {
+      landed = venueNow - venueBefore;
+    }
+    if (FINAL_STATUSES.includes(st) && (st !== 'SUCCESS' || a.venue === 'orderly' || landed !== null)) break;
     if (st === 'SUCCESS' && ++afterSuccess >= POLLS_AFTER_SUCCESS) break;
     if (now() >= deadline) break;
     await sleep(deps.pollMs ?? 10_000);
@@ -296,12 +322,16 @@ export async function runFund(argv, deps = {}) {
   const extra = [
     `1click:   status ${last}`,
     `venue:    ${a.venue} ${balanceName === null || venueBefore === null ? 'balance not public or not read' : `${balanceName} ${usdcText(venueBefore)} -> ${venueNow === null ? '?' : usdcText(venueNow)} USDC`}`
-      + `${a.venue === 'hyperliquid' && venueBefore !== null ? ' (cash, without unrealized PnL)' : ''}`,
+      + `${a.venue === 'hyperliquid' && venueBefore !== null ? ' (shown only: the landing is read from the ledger)' : ''}`,
   ];
   if (last !== 'SUCCESS') extra.push(`landed:   no: 1Click status ${last}`);
-  else if (landed !== null) extra.push(`landed:   yes: 1Click SUCCESS and ${a.venue} cash up ${usdcText(landed)} USDC (>= minAmountOut ${usdcText(minOutE6)})`);
+  else if (a.venue === 'hyperliquid') {
+    extra.push(delivery !== null
+      ? `landed:   yes: 1Click SUCCESS and a Hyperliquid ledger ${delivery.type} of ${usdcText(delivery.usdcE6)} USDC to the desk (>= minAmountOut ${usdcText(minOutE6)}), ${delivery.hash}`
+      : `landed:   unconfirmed: 1Click SUCCESS, but no Hyperliquid ledger entry to the desk of at least minAmountOut ${usdcText(minOutE6)} USDC since the fund_venue; check the desk's ledger before counting it`);
+  } else if (landed !== null) extra.push(`landed:   yes: 1Click SUCCESS and the ${a.venue} ${balanceName} up ${usdcText(landed)} USDC (>= minAmountOut ${usdcText(minOutE6)})`);
   else if (up === null) extra.push(`landed:   unconfirmed: 1Click SUCCESS; the ${a.venue} balance is not public or could not be read, so it is not checked here`);
-  else extra.push(`landed:   not seen: 1Click SUCCESS but ${a.venue} cash up ${usdcText(up)} USDC (< minAmountOut ${usdcText(minOutE6)}); check the venue before counting it`);
+  else extra.push(`landed:   not seen: 1Click SUCCESS but the ${a.venue} ${balanceName} is up ${usdcText(up)} USDC (< minAmountOut ${usdcText(minOutE6)}); check the venue before counting it`);
   if (last !== 'SUCCESS') extra.push(`open:     not finished within ${a.timeoutS} s or not a success: GET https://1click.chaindefuser.com/v0/status?depositAddress=${q.depositAddress}; a refund goes to ${desk.owner}`);
   const block = done(extra);
   if (last === 'REFUNDED' || last === 'FAILED') throw new Error(`1Click ended the transfer ${last}: the USDC goes back to the owner ${desk.owner}, not to the desk`);

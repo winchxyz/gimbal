@@ -130,21 +130,56 @@ export async function hyperliquidBalances(fetchImpl, address) {
   };
 }
 
+/** The lists of a Phoenix subaccount that the API leaves out when empty (the SDK's schema defaults them to []). */
+export const PHOENIX_LISTS = ['positions', 'orders', 'splines', 'triggers', 'escrowRequests', 'spotCollaterals'];
+
+/**
+ * Hyperliquid's non-funding ledger of an address since `startTime` (ms): deposits, withdrawals, transfers and sends,
+ * as [{ time, hash, type, usdcE6 (null when the entry carries no USDC amount), destination, user, delta }].
+ */
+export async function hyperliquidLedger(fetchImpl, address, startTime) {
+  const rows = await hlInfo(fetchImpl, { type: 'userNonFundingLedgerUpdates', user: address.toLowerCase(), startTime });
+  need(Array.isArray(rows), 'hyperliquid userNonFundingLedgerUpdates');
+  return rows.map((r) => {
+    need(isObject(r) && Number.isSafeInteger(r.time) && typeof r.hash === 'string' && isObject(r.delta) && typeof r.delta.type === 'string', 'hyperliquid ledger entry');
+    const d = r.delta;
+    const usdc = d.usdc !== undefined ? d.usdc : d.token === 'USDC' && d.amount !== undefined ? d.amount : null;
+    return {
+      time: r.time, hash: r.hash, type: d.type, usdcE6: usdc === null ? null : units(usdc, 6),
+      destination: typeof d.destination === 'string' ? d.destination.toLowerCase() : null, user: typeof d.user === 'string' ? d.user.toLowerCase() : null, delta: d,
+    };
+  });
+}
+
 /**
  * The Phoenix trader of an authority (trader PDA 0), from the public API: per subaccount its quote collateral
- * (USDC x 1e6), positions, orders and spot collateral. An authority never registered has no subaccounts.
+ * (USDC x 1e6), positions, limit orders, splines, triggers, escrow requests, the locked deposit and spot
+ * collateral. An authority never registered has no subaccounts. The live API leaves a list out when it is empty
+ * (Phoenix's own SDK schema reads a missing list as []), so a missing list is empty; a list that is present but
+ * not a list, a missing or non-integer collateral, or a lockedDeposit of another shape throws.
  */
 export async function phoenixTrader(fetchImpl, authority, apiUrl = PHOENIX_API) {
   const r = await getJson(fetchImpl, `${apiUrl}/v1/trader/state/${authority}?traderPdaIndex=0`, 'phoenix trader state');
   need(isObject(r) && r.authority === authority && isObject(r.snapshot) && Array.isArray(r.snapshot.subaccounts), 'phoenix trader state');
   return r.snapshot.subaccounts.map((s) => {
-    need(isObject(s) && Number.isInteger(s.subaccountIndex) && Array.isArray(s.positions ?? []) && Array.isArray(s.orders ?? []), 'phoenix subaccount');
+    need(isObject(s) && Number.isInteger(s.subaccountIndex), 'phoenix subaccount');
+    const lists = {};
+    for (const f of PHOENIX_LISTS) {
+      need(s[f] === undefined || Array.isArray(s[f]), `phoenix subaccount ${f}`);
+      lists[f] = s[f] ?? [];
+    }
+    const ld = s.lockedDeposit ?? { lockedQuoteLots: '0', consumedQuoteLots: '0' };
+    need(isObject(ld), 'phoenix lockedDeposit');
     return {
       index: s.subaccountIndex,
       collateralE6: integer(s.collateral, 'phoenix collateral'),
-      positions: (s.positions ?? []).length,
-      orders: (s.orders ?? []).length,
-      spot: (s.spotCollaterals ?? []).map((c) => {
+      positions: lists.positions.length,
+      orders: lists.orders.length,
+      splines: lists.splines.length,
+      triggers: lists.triggers.length,
+      escrow: lists.escrowRequests.length,
+      lockedE6: integer(ld.lockedQuoteLots, 'phoenix lockedQuoteLots') + integer(ld.consumedQuoteLots, 'phoenix consumedQuoteLots'),
+      spot: lists.spotCollaterals.map((c) => {
         need(isObject(c) && typeof c.symbol === 'string' && Number.isInteger(c.decimals), 'phoenix spot collateral');
         return { symbol: c.symbol, balance: integer(c.balance, 'phoenix spot collateral'), decimals: c.decimals };
       }),
@@ -200,8 +235,9 @@ export async function solanaTokenAccounts(fetchImpl, url, owner, programs = Obje
 export async function evmBalances(fetchImpl, url, { chainId, address, tokens }) {
   const rpc = async (method, params) => {
     const r = await postJson(fetchImpl, url, { jsonrpc: '2.0', id: 1, method, params }, `chain ${chainId} ${method}`);
-    if (r.error || typeof r.result !== 'string' || !/^0x[0-9a-fA-F]*$/.test(r.result)) throw new Error(`chain ${chainId} ${method}: ${JSON.stringify(r.error ?? r).slice(0, 200)}`);
-    return r.result === '0x' ? 0n : BigInt(r.result);
+    // "0x" is no number: an eth_call to an address without code, or an RPC that answered nothing. It refuses.
+    if (r.error || typeof r.result !== 'string' || !/^0x[0-9a-fA-F]+$/.test(r.result)) throw new Error(`chain ${chainId} ${method}: ${JSON.stringify(r.error ?? r).slice(0, 200)}`);
+    return BigInt(r.result);
   };
   const chain = await rpc('eth_chainId', []);
   if (chain !== BigInt(chainId)) throw new Error(`the RPC serves chain ${chain}, not ${chainId}`);

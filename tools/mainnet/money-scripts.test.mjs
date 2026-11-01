@@ -88,6 +88,7 @@ function world(o = {}) {
   let deleted = false;
   let hlValue = o.hl ?? '0.0';
   let hlRaw = o.hlRaw ?? null;
+  let hlLedger = o.hlLedger ?? [];
   const accounts = {
     [contract]: { amount: String(63n * NEAR / 10n), locked: '0', storage_usage: code.length + (o.dataBytes ?? 3_000), code_hash: 'Code111' },
     [OWNER]: { amount: String(2n * NEAR), locked: '0', storage_usage: 500, code_hash: '11111111111111111111111111111111' },
@@ -132,6 +133,7 @@ function world(o = {}) {
       }
       if (r.hl !== undefined) hlValue = r.hl;
       if (r.hlRaw !== undefined) hlRaw = r.hlRaw;
+      if (r.hlLedger !== undefined) hlLedger = r.hlLedger;
       return { hash, burntTgas: 5, burntYocto: 10n ** 20n, logs: r.logs ?? [], failure: r.failure ?? null, value: r.value ?? null };
     },
   };
@@ -166,6 +168,7 @@ function world(o = {}) {
         return json({ marginSummary: { accountValue: hlValue, totalRawUsd: hlRaw ?? hlValue }, withdrawable: hlValue, assetPositions: [] });
       }
       if (body.type === 'spotClearinghouseState') return json({ balances: [] });
+      if (body.type === 'userNonFundingLedgerUpdates') return json(hlLedger.filter((e) => e.time >= body.startTime));
     }
     if (u.includes('/v1/get_account')) return json(o.orderly ? { success: true, data: { account_id: desk.orderly_account_id } } : { success: false, code: -1607, message: 'Account not found.' });
     if (u.includes('/v1/get_orderly_key')) return json({ success: true, data: { key_status: 'ACTIVE' } });
@@ -206,7 +209,8 @@ test('--send refuses in a linked git worktree before anything is read, for every
     [runDeposit, [CONTRACT, DESK_ID, '10', '--key-file', 'k.json', '--send']],
     [runWithdraw, [CONTRACT, DESK_ID, '5', '--key-file', 'k.json', '--send']],
     [runFund, [CONTRACT, DESK_ID, 'hyperliquid', '12', '--send']],
-    [runRetire, [OLD, '--send']],
+    [runRetire, [OLD, '--send', '--engine-stopped']],
+    [runRetire, [OLD, '--unregister-usdc', '--send']],
   ];
   for (const [fn, argv] of cases) await assert.rejects(fn(argv, deps), /\/w\/tree is a linked git worktree: --send runs from the main checkout only/, argv.join(' '));
 });
@@ -380,14 +384,18 @@ test('fund refusals: Orderly without a pinned receiver, idle short (printed, the
   assert.match(o.error.message, /no pinned Orderly receiver/);
 });
 
-test('fund --send: a live quote checked, fund_venue signed with the operator key, then 1Click status and the venue balance', async () => {
+test('fund --send: a live quote checked, fund_venue signed with the operator key, then 1Click status and the Hyperliquid ledger', async () => {
   const live = fundQuote(LIVE);
   const bodies = [];
+  const at = Date.parse(live.response.timestamp) + 1000;
+  const HASH = `0x${'9a'.repeat(32)}`;
+  // How 1Click hands HyperCore USDC to the desk: an incoming ledger entry to the desk address (here a `send`).
+  const delivery = { time: at + 5_000, hash: HASH, delta: { type: 'send', user: '0x2222222222222222222222222222222222222222', destination: EVM, token: 'USDC', amount: '19.6', usdcValue: '19.6', fee: '0.0' } };
   const w = world({
     keyPublic: OP_PUBLIC,
-    now: Date.parse(live.response.timestamp) + 1000,
+    now: at,
     quote: (body) => { bodies.push(body); return json(live.response, 201); },
-    onSend: () => ({ value: true, hl: '19.6', hlRaw: '19.6', logs: ['EVENT_JSON:{"standard":"gimbal","version":"1.0.0","event":"fund_venue","data":[{"desk_id":"canary"}]}'] }),
+    onSend: () => ({ value: true, hl: '19.6', hlRaw: '19.6', hlLedger: [delivery], logs: ['EVENT_JSON:{"standard":"gimbal","version":"1.0.0","event":"fund_venue","data":[{"desk_id":"canary"}]}'] }),
   });
   const r = await capture(runFund, [CONTRACT, DESK_ID, 'hyperliquid', '20', '--send'], { ...w.deps, env: new Map() });
   assert.equal(r.error, null, r.error?.stack);
@@ -400,16 +408,18 @@ test('fund --send: a live quote checked, fund_venue signed with the operator key
   assert.equal(w.seen.sent[0].signer, OP_PUBLIC);
   assert.ok(w.seen.fetch.some((f) => f.includes('/v0/deposit/submit') && f.includes(live.response.quote.depositAddress)));
   assert.ok(r.block.includes('1click:   status SUCCESS'));
-  assert.ok(r.block.some((l) => /^venue: {4}hyperliquid totalRawUsd 0 -> 19\.6 USDC \(cash, without unrealized PnL\)$/.test(l)), r.block.join('\n'));
-  assert.ok(r.block.includes('landed:   yes: 1Click SUCCESS and hyperliquid cash up 19.6 USDC (>= minAmountOut 19.480951)'), r.block.join('\n'));
+  assert.ok(r.block.includes(`landed:   yes: 1Click SUCCESS and a Hyperliquid ledger send of 19.6 USDC to the desk (>= minAmountOut 19.480951), ${HASH}`), r.block.join('\n'));
 
-  // The account value rising (unrealized PnL) is not a landing: only cash counts.
-  const pnl = world({
-    keyPublic: OP_PUBLIC, now: Date.parse(live.response.timestamp) + 1000,
-    quote: () => json(live.response, 201), onSend: () => ({ value: true, hl: '25.0', hlRaw: '0.0' }),
-  });
+  // A balance that rises without a ledger entry (PnL, or a transfer from elsewhere) is not a landing.
+  const pnl = world({ keyPublic: OP_PUBLIC, now: at, quote: () => json(live.response, 201), onSend: () => ({ value: true, hl: '25.0', hlRaw: '25.0' }) });
   const p = await capture(runFund, [CONTRACT, DESK_ID, 'hyperliquid', '20', '--send', '--timeout-s', '60'], { ...pnl.deps, env: new Map() });
-  assert.ok(p.block.some((l) => /^landed: {3}not seen: 1Click SUCCESS but hyperliquid cash up 0 USDC/.test(l)), p.block?.join('\n') ?? p.error?.stack);
+  assert.ok(p.block.some((l) => /^landed: {3}unconfirmed: 1Click SUCCESS, but no Hyperliquid ledger entry to the desk of at least minAmountOut 19\.480951 USDC/.test(l)), p.block?.join('\n') ?? p.error?.stack);
+  // Too small, from the desk itself, or before the fund_venue: not the delivery.
+  for (const bad of [{ ...delivery, delta: { ...delivery.delta, amount: '1.0', usdcValue: '1.0' } }, { ...delivery, delta: { ...delivery.delta, destination: '0x3333333333333333333333333333333333333333' } }, { ...delivery, time: at - 120_000 }]) {
+    const x = world({ keyPublic: OP_PUBLIC, now: at, hlLedger: [bad], quote: () => json(live.response, 201), onSend: () => ({ value: true }) });
+    const y = await capture(runFund, [CONTRACT, DESK_ID, 'hyperliquid', '20', '--send', '--timeout-s', '60'], { ...x.deps, env: new Map() });
+    assert.ok(y.block.some((l) => /^landed: {3}unconfirmed/.test(l)), y.block?.join('\n') ?? y.error?.stack);
+  }
 
   const full = world({ keyPublic: PUBLIC, now: Date.parse(live.response.timestamp) + 1000, quote: () => json(live.response, 201) });
   const f = await capture(runFund, [CONTRACT, DESK_ID, 'hyperliquid', '20', '--send'], { ...full.deps, env: new Map() });
