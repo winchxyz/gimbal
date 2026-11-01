@@ -320,6 +320,64 @@ curl -sN http://127.0.0.1:8790/events
   - nearblocks.io/address/`<owner>.near` shows the operator key's calls to `<contract>.near`.
   - Later, once funded: every step is `done` or `skipped`, and solscan shows the Phoenix trader account.
 
+## 7. Canary checks without USDC
+
+```
+node tools/mainnet/checks.mjs <contract>.near <desk_id> [--step prices|orderly|quotes] [--env-file <file>]
+node tools/mainnet/checks.mjs <contract>.near <desk_id> [--step prices|orderly|quotes] --send
+```
+
+Three checks that move no funds. Without `--step` it runs all three, in this order. Each step can also run alone,
+and running it again is safe.
+
+- **prices:** one `refresh_prices` for BTC, ETH, SOL, DOGE and LTC, signed by the engine's operator key. This is
+  the first OutLayer price call. The contract attaches 0.02 NEAR to `price-oracle.near` from its own balance (most
+  of it comes back), and the caller pays the gas. The step prints every receipt with its gas and logs, the gas and
+  NEAR burnt, the change in the contract's balance, the caller's balance and the key's allowance, and `prices()`.
+  OutLayer answers asynchronously, so `prices()` is read every 5 s for up to 3 min until each asset has a newer
+  price. A second run within 30 s asks the oracle nothing (the contract's own skip).
+- **orderly:** under the contract's broker (`gimbal_dex`) on its chain (42161). The step uses the engine's own
+  setup code (`runSetup`, `OrderlyDeskClient`, `NearContractClient`) cut down to three steps:
+  - `orderly_register`, skipped when Orderly already has the account;
+  - `orderly_add_key`, skipped when the desk's key is active with the trading scope;
+  - the signed GET `/v1/client/asset/receiver_address?chain_id=42161&token=USDC`. The whole answer is printed.
+
+  It binds no referral code and sets no IP restriction. It does not pin the receiver: `set_orderly_receiver` is
+  the owner's call.
+- **quotes:** dry 1Click quotes (`dry: true`). They reserve no deposit address. The step asks two quotes out of
+  HyperCore: to the desk's Solana authority (Solana USDC), and to the contract with `{"desk_id":"<desk_id>"}`
+  (USDC on NEAR). It also asks one control quote into HyperCore. The question is whether 1Click still answers
+  "Quoting for this pair is not available". These quotes are reads, so the dry run asks them too.
+
+The dry run needs no key. It prints every call with its public values in full: signer, receiver, method, args,
+gas, the Orderly URLs and headers, and the quote bodies. It also prints the Orderly account's state and the
+balances.
+
+`--send` works like this:
+
+- It reads `.keys/engine-mainnet-<contract>.near.env` (or `--env-file`), and only at that point.
+- It checks the file against the chain before it signs anything: the network, the contract, the desk, the
+  owner or operator account, and the broker. The key must be on chain as the operator FunctionCall key.
+- It never prints the key.
+- It refuses in a linked git worktree.
+
+The script can make only these contract calls: `refresh_prices`, `orderly_register`, `orderly_add_key`, and
+`orderly_request` of kind `receiver_address`. It refuses any other call (a money method, another Orderly kind,
+another contract) before signing. It writes no file. It ends with one block, `=== gimbal canary checks ... ===`
+to `=== end ===`, to paste back.
+
+- **Cost:** each signed call reserves about 0.3 NEAR of gas against the key's allowance until the refund.
+  - `refresh_prices` burns at most the gas cap in the dry run's `gas` line (about 0.03 NEAR), and most of that is
+    refunded. On top of that, OutLayer keeps part of the 0.02 NEAR the contract attaches.
+  - The Orderly step makes at most three MPC calls, each about 0.001 NEAR plus 1 yoctoNEAR.
+  - The quotes are free.
+- **Check after:**
+  - `view.mjs <contract>.near prices` lists the five assets.
+  - `https://api.orderly.org/v1/get_account?address=<desk EVM>&broker_id=gimbal_dex` answers with the desk's
+    account id.
+  - Running the orderly step again prints `orderly_register done` and `orderly_add_key done` without signing
+    either.
+
 ## Files the scripts write
 
 All of them are gitignored and are written in the main checkout only (never in a linked worktree). None is ever
