@@ -211,6 +211,7 @@ chooses nothing:
 | `ft_on_transfer(sender_id, amount, msg)` | any sender | | USDC on NEAR only (`ft_transfer_call`, msg `{"desk_id"}`): owner → `deposited` + `idle_usdc`; others → `idle_usdc`; unknown desk → full refund (§1.2) |
 | `fund_venue(desk_id, quote, quote_signature, reason)` | ✓ | ✓ | sends `amountIn` (≤ `idle_usdc`, `E_SIZE`) of the desk's USDC on NEAR to a verified 1Click deposit address (recipient = a desk venue address or the pinned Orderly receiver; `refundTo` = the desk owner); own ring and hourly cost budget; ≥ 115 TGas; returns `bool` ("fund_venue" below) |
 | `withdraw_to_owner(desk_id, amount)` | ✓ | | pays `amount` (1 to `idle_usdc`, else `E_SIZE`) of the USDC on NEAR the contract holds for the desk: the owner's share first, the performance fee to the treasury after it lands; `E_ARGS` while a payout is in flight; ≥ 150 TGas; returns `bool` ("Payouts" below) |
+| `clear_payout_lock(desk_id)` | ✓ | | exactly 1 yocto; only once the payout lock is ≥ 1 h old; re-credits and rolls back nothing; event `payout_lock_cleared` ("Payouts" below) |
 | `hl_approve_builder_fee(desk_id)` | ✓ | ✓ | `ApproveBuilderFee` for the treasury builder at `maxFeeRate` from `FeeConfig` |
 | `hl_set_referrer(desk_id)` | ✓ | ✓ | L1 action `{type:"setReferrer", code}` with `code = treasury.referral_codes.hyperliquid`; setup calls it once per desk, before its first order (the contract does not refuse a repeat; Hyperliquid does); no other code can be signed; with no code configured it refuses (`E_ARGS`) and setup skips it |
 | `hl_withdraw(desk_id, amount)` | ✓ | | emergency only: to the desk's own EVM address |
@@ -323,8 +324,7 @@ callbacks never released, once the lock is at least 1 h old (`E_ARGS` before the
 re-credits nothing and rolls nothing back: the ledger stays as `withdraw_to_owner` booked it, because the contract
 cannot know whether the transfers landed. Event `payout_lock_cleared`. Residual: if an old payout fails late, after the
 owner cleared its lock, that payout's fee is forgiven (its amounts come back, the mark stays). This needs a receipt
-delayed more than 1 h, and only the treasury loses. (`clear_payout_lock` is not yet a row of the table above: the
-web's Security screen reads that table, and its owner-only list must gain the method in the same change.)
+delayed more than 1 h, and only the treasury loses.
 
 **Accepted residuals of the NEAR money path.**
 - Each `fund_venue` pays 0.00125 NEAR from the contract's balance to register a new deposit address on USDC (the

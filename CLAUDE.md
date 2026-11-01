@@ -154,6 +154,7 @@ Broker id and chain id are fixed in the contract (`OrderlyConfig`).
   (default 5 NEAR) is charged too: keep at most min(balance, allowance) / 0.3 NEAR signatures in flight.
 - USDC on NEAR comes in only through `ft_transfer_call` with `msg` `{"desk_id":"<id>"}`: the owner's deposits count
   as principal, everything else (1Click returns, refunds) lands in `idle_usdc`.
-- OutLayer `price-oracle.near`: use the on-demand path (`request_price_data`, or `oracle_call` →
-  `oracle_on_call`, which must check the caller is the oracle); the cached views are stale.
+- OutLayer `price-oracle.near`: use the on-demand path (`request_price_data`, given most of the gas: OutLayer
+  reserves 50 TGas for its own callback, and 21 TGas failed on mainnet); the cached views are stale. There is no
+  `oracle_call` fallback (`oracle_on_call` remains, unused, and checks the caller is the oracle).
   `price-oracle.testnet` returns null prices, so testnet and replay use the Mock price source.
