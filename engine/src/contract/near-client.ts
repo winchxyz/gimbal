@@ -30,6 +30,14 @@ import { ContractRefusal, MpcTimeoutError, OutcomeUnknown, isMpcTimeout, parseRe
  */
 export const PAUSE_TGAS = 30;
 
+/** How often prices() is read back after refresh_prices. */
+export const PRICE_POLL_MS = 1_000;
+/**
+ * How long prices() is read back before a price counts as missing: the contract skips an asset asked for under 30 s
+ * ago, so an earlier ask's oracle answer can take that long to land; 5 s more covers block lag.
+ */
+export const PRICE_POLL_WINDOW_MS = 35_000;
+
 export type NearNetwork = 'mainnet' | 'testnet';
 
 export type NearCallOutcome =
@@ -145,18 +153,35 @@ export class NearContractClient implements ContractClient {
 
   // ---- prices and pause ----
 
-  /** refresh_prices, then prices() must show a newer stored price for every asset asked for. */
-  async refreshPrices(assets: string[]): Promise<TxRef[]> {
+  /**
+   * refresh_prices, then prices() must show, for every asset asked for, a newer stored price or one younger than
+   * `maxAgeS`, which the caller must give (what its next call needs: under the desk's oracle_max_age_s, with room for
+   * that call; there is no default, so a 15-minute-old price is never "fresh" by accident). Age is against the local
+   * clock: the transport reads no block time, and NEAR's block time runs within a second or two of it. The contract answers `true` without asking the oracle when every asset had a
+   * price stored, or was asked for, under 30 s ago (interfaces §1.3): the first case is fresh at once; in the second
+   * the earlier ask's answer is still on its way, so prices() is polled every PRICE_POLL_MS for up to
+   * PRICE_POLL_WINDOW_MS (the contract's 30 s ask window plus a margin) before it counts as missing.
+   */
+  async refreshPrices(assets: string[], options: { maxAgeS: number }): Promise<TxRef[]> {
+    if (!(options.maxAgeS > 0)) throw new Error(`refreshPrices: maxAgeS must be > 0, got ${options.maxAgeS}`);
+    const maxAgeMs = options.maxAgeS * 1000;
     const before = new Map((await this.prices()).map((p) => [p.asset, p.at_ms]));
     const r = await this.#call('refresh_prices', () => ({ assets }), 'same');
     if (r.value === false) throw new Error(`refresh_prices returned false in ${r.txHash}`);
-    const stale = await this.#retryRead(async () => {
+    let missing: string[] = assets;
+    for (let i = 0; i <= PRICE_POLL_WINDOW_MS / PRICE_POLL_MS; i++) {
+      if (i > 0) await this.#sleep(PRICE_POLL_MS);
       const after = new Map((await this.prices()).map((p) => [p.asset, p.at_ms]));
-      const missing = assets.filter((a) => !after.has(a) || (before.has(a) && after.get(a)! <= before.get(a)!));
-      return missing.length === 0 ? null : missing;
-    });
-    if (stale !== null) throw new Error(`refresh_prices ran in ${r.txHash} but prices() has no newer price for ${stale.join(', ')}`);
-    return [nearTxRef(this.network, r.txHash)];
+      const now = this.#now();
+      missing = assets.filter((a) => {
+        const at = after.get(a);
+        if (at === undefined) return true;
+        const newer = !before.has(a) || at > before.get(a)!;
+        return !newer && now - at > maxAgeMs;
+      });
+      if (missing.length === 0) return [nearTxRef(this.network, r.txHash)];
+    }
+    throw new Error(`refresh_prices ran in ${r.txHash} but prices() has no newer price, nor one under ${maxAgeMs / 1000} s old, for ${missing.join(', ')} after ${PRICE_POLL_WINDOW_MS / 1000} s`);
   }
 
   /**

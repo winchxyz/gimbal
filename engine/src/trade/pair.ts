@@ -172,6 +172,8 @@ export class PairTrader {
   /** Ends the polls' unref'd timers early (stop()). */
   readonly #wakes = new Set<() => void>();
   #queue: Promise<unknown> = Promise.resolve();
+  /** Tasks queued or running on #queue. */
+  #active = 0;
   /**
    * What each leg should hold: the final position of the last open or close (null: it was unknown); for a leg with an
    * unsettled order, what offsets its partner.
@@ -235,8 +237,12 @@ export class PairTrader {
     return this.#serial(() => this.#open(request));
   }
 
-  /** Brings both legs to `targets` (default flat) with reduce-only orders. */
-  close(request: { reason: string; targets?: [bigint, bigint] }): Promise<PairResult> {
+  /**
+   * Brings both legs to `targets` (default flat) with reduce-only orders. A leg that stays open is normally re-hedged by
+   * reopening its partner against it (not reduce-only); `reduceOnly: true` forbids that step, so nothing this close
+   * sends can open or grow a position (the ADL response): the pair is then left stuck or unhedged, with the alert.
+   */
+  close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean }): Promise<PairResult> {
     return this.#serial(() => this.#close(request));
   }
 
@@ -291,6 +297,19 @@ export class PairTrader {
     return this.#intent.get(leg);
   }
 
+  /** What both legs together should hold: the sum of the last open's or close's targets (0 for a plain pair). */
+  get net(): bigint {
+    return this.#net;
+  }
+
+  /**
+   * An open, a close or a watch check is queued or running: the trader's own orders may be moving the legs now, so a
+   * position that differs from the intent is not news (the risk engine's ADL check waits until this is false).
+   */
+  get busy(): boolean {
+    return this.#active > 0;
+  }
+
   async #open(request: { size: bigint | number | string; longIndex: 0 | 1; reason: string }): Promise<PairResult> {
     const size = floorToLot(typeof request.size === 'bigint' ? request.size : toQty(request.size), this.lot);
     if (size === 0n) throw new LegCheckError(`size ${String(request.size)} is under one common lot ${qtyString(this.lot)}`);
@@ -336,7 +355,7 @@ export class PairTrader {
     return this.#result(hedged(runs, net) ? 'stuck' : 'unhedged', size, runs, notes, net);
   }
 
-  async #close(request: { reason: string; targets?: [bigint, bigint] }): Promise<PairResult> {
+  async #close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean }): Promise<PairResult> {
     const targets = request.targets ?? [0n, 0n];
     // Not refused while an order has no answer: a reduce-only close cannot double it, and its watch stays on.
     const starts = await Promise.all(this.legs.map((leg) => leg.position()));
@@ -385,6 +404,10 @@ export class PairTrader {
     if (residual === 0n) {
       notes.push('the legs that stayed open still offset each other: hedged, not closed');
       return this.#result('stuck', size, runs, notes, net);
+    }
+    if (request.reduceOnly === true) {
+      notes.push('not re-hedged: this close is reduce-only only, and a re-hedge would reopen a leg');
+      return this.#stop(size, runs, notes, net);
     }
     const lighter = abs(exposure(a)) <= abs(exposure(b)) ? a : b;
     const hedgeTo = lighter.pos! - residual;
@@ -971,7 +994,15 @@ export class PairTrader {
   }
 
   #serial<T>(task: () => Promise<T>): Promise<T> {
-    const next = this.#queue.then(task, task);
+    this.#active++;
+    const run = async (): Promise<T> => {
+      try {
+        return await task();
+      } finally {
+        this.#active--;
+      }
+    };
+    const next = this.#queue.then(run, run);
     this.#queue = next.catch(() => undefined);
     return next;
   }

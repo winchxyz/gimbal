@@ -25,13 +25,16 @@
 // only: serve signs nothing. Without it the live modes read no oracle prices, so every priced desk leg is refused
 // E_ORACLE_STALE, as the contract would refuse it, and the venue reads are public: no keys. Replay stands in the
 // contract's Mock prices: the recording's Hyperliquid oracle prices, dated by the replay clock the scanner runs on.
+// The risk engine (src/risk/) reads the desk every 5 s: with the contract, the desk's Hyperliquid and Phoenix accounts;
+// in replay, a scripted desk priced by the recording. It publishes `desk`, `health`, `journal` and `rescue`, and answers
+// POST /stress (testnet and replay; refused on mainnet). `health` is published in every mode: the venues the last
+// scan or account read missed, 1Click (probed every minute in the live modes) and NEAR.
 
 import { readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import type { ContractPolicy, HealthMap, Mode } from '@gimbal/shared';
-import type { NearHealth } from '../contract/budget.ts';
+import type { ContractPolicy, Mode, StreamEvent } from '@gimbal/shared';
 import { ReplayOracle } from '../contract/replay-oracle.ts';
 import { NearAiClient } from '../nearai/client.ts';
 import { PolicyDrafter, deskMarkets } from '../nearai/draft-route.ts';
@@ -41,15 +44,18 @@ import { liveReaders, replayReaders } from '../readers.ts';
 import type { Readers } from '../readers.ts';
 import { DEFAULT_STRATEGY, ORDERLY_BROKERS, scannerConfigFor } from '../scanner/config.ts';
 import { Scanner } from '../scanner/scanner.ts';
-import type { ScanResult } from '../scanner/scanner.ts';
 import { DEFAULT_ENGINE_HOST, DEFAULT_ENGINE_PORT, EngineServer } from '../server.ts';
 import type { RecordLine } from '../venues/recorder.ts';
 import { JsonlGzWriter, RecordingVenue, RecordingWatch, errorMessage } from '../venues/recorder.ts';
 import { ScaledClock, readRecording } from '../venues/replay.ts';
 import { watchReaders } from '../venues/watch/index.ts';
 import type { Clock } from '../venues/venue.ts';
+import { RiskEngine } from '../risk/engine.ts';
+import type { DeskSource } from '../risk/engine.ts';
+import { AccountsDeskSource, ReplayDesk } from '../risk/sources.ts';
+import { VenueHealth, probeIntents } from '../risk/venue-health.ts';
 import type { ContractSide } from './serve-contract.ts';
-import { connectContract, contractEnv, healthChanged, healthMap, marginVenues } from './serve-contract.ts';
+import { connectContract, contractEnv, marginVenues } from './serve-contract.ts';
 import { ThinningSink, WATCH_RECORD_GAPS, loadPolicyFile, replayStart, scanLine } from './serve-replay.ts';
 
 const { values } = parseArgs({
@@ -88,15 +94,16 @@ if (policyFile !== undefined && policyFile !== '') {
 // Before connectContract: its price cache can report a failed first read through noteOnce.
 const seenNotes = new Map<string, number>();
 let contract: ContractSide | null = null;
-let nearHealth: NearHealth = 'ok';
 let deskId: string | null = null;
+const venueHealth = new VenueHealth();
+let risk: RiskEngine | null = null;
 try {
   const cfg = contractEnv(envVar, mode);
   if (cfg !== null) {
     deskId = cfg.deskId;
     contract = await connectContract(cfg, {
       onHealth: (status, detail) => {
-        nearHealth = status;
+        venueHealth.near(status);
         log(`near ${status}: ${detail}`);
         publishHealth();
       },
@@ -178,15 +185,12 @@ const scanner = new Scanner(readers.venues, readers.watch, {
 });
 
 let scans = 0;
-let lastScan: ScanResult['scan'] | null = null;
-let health: HealthMap | null = null;
-/** With the contract set: a `health` event whenever NEAR's state or a desk venue's changes. */
+/** A `health` event whenever a desk venue's, 1Click's or NEAR's state changes (with the risk engine: and a journal line). */
 function publishHealth(): void {
-  if (contract === null || server === null) return;
-  const next = healthMap(lastScan, nearHealth);
-  if (!healthChanged(health, next)) return;
-  health = next;
-  server.publish({ type: 'health', data: next });
+  if (server === null) return;
+  if (risk !== null) return risk.healthChanged();
+  const next = venueHealth.changed();
+  if (next !== null) server.publish({ type: 'health', data: next });
 }
 // The confirmed engine rules survive a restart; a file that no longer passes the checks falls back to the defaults.
 const stateDir = values['state-dir'] ?? envVar('GIMBAL_STATE_DIR') ?? fileURLToPath(new URL('../../state/', import.meta.url));
@@ -203,6 +207,45 @@ const drafter = new PolicyDrafter({ client: new NearAiClient({ apiKey: envVar('N
 log(drafter.configured ? `policy drafts: NEAR AI ${drafter.model}` : 'policy drafts: off (NEAR_AI_API_KEY is not set), POST /policy/draft answers 503');
 const setup = await setupFromEnv(mode, envVar, log).catch((err: unknown) => fail(`setup: ${errorMessage(err)}`));
 
+const publish = (event: StreamEvent) => server?.publish(event);
+let deskSource: DeskSource | null = null;
+if (mode === 'replay') {
+  deskSource = new ReplayDesk({
+    venues: readers.venues, clock, strategy: () => server?.strategy ?? DEFAULT_STRATEGY,
+    onOpen: (summary) => {
+      log(summary);
+      publish({ type: 'journal', data: { id: `replay-desk-${clock.now().toString(36)}`, t: clock.now(), kind: 'enter', summary, numbers: {}, tx: [] } });
+    },
+  });
+} else if (contract !== null) {
+  const side = contract;
+  const reader = (id: string) => readers.venues.find((v) => v.id === id);
+  const accounts = [
+    { reader: reader('hyperliquid'), address: side.desk.evm_address },
+    { reader: reader('phoenix'), address: side.desk.solana.authority },
+  ].filter((a): a is { reader: NonNullable<typeof a.reader>; address: string } => a.reader !== undefined && a.address !== '');
+  // get_desk says only whether the desk is paused, not who paused it or when (that is in its `paused` event): `at` is
+  // when this engine first saw it paused, `by` is unknown.
+  let pausedSince: number | null = null;
+  deskSource = new AccountsDeskSource({
+    deskId: deskId!, owner: side.desk.owner, contract: side.client.contractId, accounts, log,
+    desk: async () => {
+      const view = await side.client.getDesk(deskId!);
+      if (view === null) throw new Error(`get_desk(${deskId}) answered null`);
+      pausedSince = view.paused ? (pausedSince ?? Date.now()) : null;
+      return { reserveUsd: Number(view.ledger.idle_usdc) / 1e6, paused: pausedSince === null ? null : { by: 'unknown', at: pausedSince } };
+    },
+  });
+  log(`risk: reading the desk's ${accounts.map((a) => a.reader.id).join(' and ')} accounts every 5 s (Orderly legs need its private stream, which serve does not open)`);
+}
+if (deskSource !== null) {
+  // TODO(day 10): pass `adl: new AdlWatch(pairTrader, ...)` once serve holds the strategy engine's PairTrader; until
+  // then nothing here trades, and ADL is checked only where a PairTrader runs.
+  risk = new RiskEngine({
+    mode, source: deskSource, strategy: () => server?.strategy ?? DEFAULT_STRATEGY, health: venueHealth, publish, clock, log,
+  });
+}
+
 server = new EngineServer({
   mode,
   scanner,
@@ -210,6 +253,7 @@ server = new EngineServer({
   saveStrategy: (s) => strategyStore.save(s),
   drafter,
   ...(setup === null ? {} : { setup }),
+  ...(risk === null ? {} : { stress: risk }),
   policy,
   intervalMs: scannerConfig.intervalMs,
   log,
@@ -217,12 +261,26 @@ server = new EngineServer({
     scans++;
     if (scans === 1 || scans % 12 === 0) log(scanLine(scans, r));
     if (writer !== null && scans % 12 === 0) void writer.flush();
-    lastScan = r.scan;
+    venueHealth.scan(r.scan);
     publishHealth();
   },
 });
 
 const listening = await server.start(port, host);
+risk?.start();
+publishHealth();
+let intentsTimer: ReturnType<typeof setInterval> | undefined;
+if (mode !== 'replay') {
+  // 1Click has no testnet: its mainnet API is probed in both live modes (a public GET, no key, nothing sent).
+  const probe = async () => {
+    const r = await probeIntents();
+    venueHealth.intents(r.status, r.detail);
+    publishHealth();
+  };
+  void probe();
+  intentsTimer = setInterval(() => void probe(), 60_000);
+  intentsTimer.unref();
+}
 const shown = host.includes(':') ? `[${host}]` : host;
 log(`engine ${mode} on http://${shown}:${listening}: GET /events /state /windows/history?id= /strategy /journal, PUT /strategy`);
 
@@ -231,6 +289,8 @@ async function shutdown(reason: string): Promise<void> {
   if (stopping) return;
   stopping = true;
   log(`stopping: ${reason}`);
+  clearInterval(intentsTimer);
+  await risk?.stop();
   await server!.stop();
   contract?.prices.stop();
   readers.close();
