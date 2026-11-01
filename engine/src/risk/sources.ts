@@ -21,19 +21,30 @@ export interface AccountsDeskSourceOptions {
   contract: string;
   accounts: { reader: Pick<VenueReader, 'id' | 'account'>; address: string }[];
   /**
-   * The desk's own state, read with every snapshot (serve: get_desk): the USDC held back for rescues (ledger.idle_usdc)
-   * and whether it is paused. A read that throws keeps the last answer (none yet: reserve 0, running) and is logged.
+   * The desk's own state (serve: get_desk): the USDC held back for rescues (ledger.idle_usdc) and whether it is
+   * paused. Read again with every snapshot, but off its path: one read at a time, and a snapshot waits for it at most
+   * DESK_VIEW_WAIT_MS (a slow NEAR RPC retries for minutes) and goes on with the last answer. A read that throws keeps
+   * the last answer and is logged. The snapshot says how old the answer is (deskView), and the risk engine marks NEAR
+   * slow or down and the desk unknown from it.
    */
   desk?: () => Promise<{ reserveUsd: number; paused: DeskState['paused'] }>;
   log?: (line: string) => void;
   /** Lot size per venue and symbol; default 10^-8 (unknown). */
   lotSize?: (venue: VenueId, symbol: string) => number;
   now?: () => number;
+  /** Default DESK_VIEW_WAIT_MS. */
+  deskWaitMs?: number;
 }
+
+/** A snapshot waits this long for the desk view (get_desk) before it goes on with the last answer. */
+export const DESK_VIEW_WAIT_MS = 5_000;
 
 export class AccountsDeskSource implements DeskSource {
   readonly #o: AccountsDeskSourceOptions;
   #desk: { reserveUsd: number; paused: DeskState['paused'] } = { reserveUsd: 0, paused: null };
+  #deskAt: number | null = null;
+  #deskError: string | null = null;
+  #deskRead: { promise: Promise<void>; since: number } | null = null;
 
   constructor(options: AccountsDeskSourceOptions) {
     this.#o = options;
@@ -41,10 +52,7 @@ export class AccountsDeskSource implements DeskSource {
 
   async read(): Promise<DeskSnapshot> {
     const now = this.#o.now ?? Date.now;
-    const deskRead = this.#o.desk?.().then(
-      (d) => { this.#desk = d; },
-      (err: unknown) => this.#o.log?.(`risk: the desk view could not be read, keeping the last one: ${errorMessage(err)}`),
-    );
+    const deskRead = this.#readDesk(now);
     const reads = await Promise.all(this.#o.accounts.map(async ({ reader, address }) => {
       const started = now();
       try {
@@ -66,13 +74,39 @@ export class AccountsDeskSource implements DeskSource {
       }
     }
     await deskRead;
+    const late = this.#deskRead === null ? null : `get_desk has not answered for ${Math.round((now() - this.#deskRead.since) / 1000)} s`;
     return {
       deskId: this.#o.deskId, owner: this.#o.owner, contract: this.#o.contract,
       reserveUsd: this.#desk.reserveUsd,
       paused: this.#desk.paused,
       legs,
       reads: reads.map(({ venue, ms, error }) => ({ venue, ms, error })),
+      ...(this.#o.desk === undefined ? {} : { deskView: { at: this.#deskAt, error: late ?? this.#deskError } }),
     };
+  }
+
+  /** Starts a desk view read unless one is out, and waits for it at most deskWaitMs (see the option). */
+  async #readDesk(now: () => number): Promise<void> {
+    const read = this.#o.desk;
+    if (read === undefined) return;
+    if (this.#deskRead === null) {
+      const since = now();
+      const promise = read().then(
+        (d) => { this.#desk = d; this.#deskAt = now(); this.#deskError = null; },
+        (err: unknown) => {
+          this.#deskError = errorMessage(err);
+          this.#o.log?.(`risk: the desk view could not be read, keeping the last one: ${this.#deskError}`);
+        },
+      ).finally(() => { this.#deskRead = null; });
+      this.#deskRead = { promise, since };
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const wait = new Promise<void>((r) => { timer = setTimeout(r, this.#o.deskWaitMs ?? DESK_VIEW_WAIT_MS); });
+    try {
+      await Promise.race([this.#deskRead.promise, wait]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }
 

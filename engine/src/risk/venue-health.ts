@@ -10,7 +10,8 @@
 // reason), and a withdraw that goes through clears it with withdrawals(venue, null). With no news a report expires
 // after WITHDRAWALS_PAUSED_TTL_MS, so one refusal does not mark a venue for good.
 // 1Click is probed (GET /v0/tokens, public, no key): an error or a non-2xx is down, an answer over SLOW_READ_MS slow.
-// NEAR comes from the contract client's own health (the operator key's budget, slow MPC signatures).
+// NEAR is the worse of the contract client's own health (the operator key's budget, slow MPC signatures) and the
+// desk view's (get_desk: slow when its latest read failed or is late, down when it was never read or is stale).
 
 import type { HealthMap, ScanStatus, VenueId } from '@gimbal/shared';
 import type { NearHealth } from '../contract/budget.ts';
@@ -42,6 +43,8 @@ export class VenueHealth {
   #intents: HealthStatus = 'ok';
   #intentsDetail: string | null = null;
   #near: NearHealth = 'ok';
+  #deskView: HealthStatus = 'ok';
+  #deskViewDetail: string | null = null;
   #last: HealthMap | null = null;
 
   constructor(options: { now?: () => number } = {}) {
@@ -88,6 +91,17 @@ export class VenueHealth {
     this.#near = status;
   }
 
+  /** The desk view's state (the risk engine sets it from its source's get_desk reads), and why. */
+  deskView(status: HealthStatus, detail: string | null = null): void {
+    this.#deskView = status;
+    this.#deskViewDetail = detail;
+  }
+
+  /** Why NEAR is not ok, when the desk view says so (null otherwise). */
+  get nearDetail(): string | null {
+    return this.#deskView === 'ok' ? null : this.#deskViewDetail;
+  }
+
   detail(venue: VenueId): VenueDetail {
     this.#expire();
     const d = this.#venues.get(venue)!;
@@ -100,7 +114,7 @@ export class VenueHealth {
 
   map(): HealthMap {
     this.#expire();
-    const map = { intents: this.#intents, near: this.#near } as HealthMap;
+    const map = { intents: this.#intents, near: worse(this.#near, this.#deskView) } as HealthMap;
     for (const [v, d] of this.#venues) map[v] = this.#status(d);
     return map;
   }
@@ -127,6 +141,12 @@ export class VenueHealth {
     if ((d.readMs !== null && d.readMs > SLOW_READ_MS) || d.withdrawalsPaused !== null) return 'slow';
     return 'ok';
   }
+}
+
+const RANK: Record<HealthStatus, number> = { ok: 0, slow: 1, down: 2 };
+
+function worse(a: HealthStatus, b: HealthStatus): HealthStatus {
+  return RANK[a] >= RANK[b] ? a : b;
 }
 
 /**

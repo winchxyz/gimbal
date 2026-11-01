@@ -121,3 +121,25 @@ test('two positions, no venue liquidation price, equity 2 % over maintenance: th
   const safe = legRisk({ venue: 'hyperliquid', account: { venue: 'hyperliquid', address: '', time: 1, equityUsd: 2500, freeMarginUsd: 0, maintenanceMarginUsd: 40, positions: [p] }, position: p, markPx: 2000 });
   assert.equal(safe.distanceBasis, 'none');
 });
+
+test('rescue amount on an account with other positions: maintenance plus the target distance of the whole notional, less equity', () => {
+  // The reviewer's case: ETH 10k and BTC 40k on one account, equity 3k, maintenance 2.5k: 1 % from liquidation.
+  const eth: Position = { symbol: 'ETH', size: 5, entryPx: 2000, liqPx: null, marginUsd: 0, unrealizedPnlUsd: 0, leverage: 1, fundingSinceOpenUsd: 0, unsettledFundingUsd: 0 };
+  const btc: Position = { symbol: 'BTC', size: 0.5, entryPx: 80000, liqPx: null, marginUsd: 0, unrealizedPnlUsd: 0, leverage: 1, fundingSinceOpenUsd: 0, unsettledFundingUsd: 0 };
+  const account: AccountState = { venue: 'hyperliquid', address: '0x', time: 1, equityUsd: 3000, freeMarginUsd: 0, maintenanceMarginUsd: 2500, positions: [eth, btc] };
+  const r = legRisk({ venue: 'hyperliquid', account, position: eth, markPx: 2000 });
+  assert.equal(r.distanceBasis, 'account');
+  near(r.distanceToLiqPct, 1, 1e-9);
+  // To 10 %: 2500 + 0.10 × 50000 − 3000 = 4500 USD (the lone-leg formula gave 0).
+  near(marginToReach(r, 'long', 10), 4500, 1e-9);
+  // Check: with 4500 more, (7500 − 2500) / 50000 = 10 %.
+  const after = legRisk({ venue: 'hyperliquid', account: { ...account, equityUsd: 7500 }, position: eth, markPx: 2000 });
+  near(after.distanceToLiqPct, 10, 1e-9);
+});
+
+test('rescue amount with no mark: null, never NaN', () => {
+  const p: Position = { symbol: 'ETH', size: 1, entryPx: 0, liqPx: null, marginUsd: 0, unrealizedPnlUsd: 0, leverage: 1, fundingSinceOpenUsd: 0, unsettledFundingUsd: 0 };
+  const r = legRisk({ venue: 'phoenix', account: { venue: 'phoenix', address: '', time: 1, equityUsd: 10, freeMarginUsd: 0, maintenanceMarginUsd: 40, positions: [p] }, position: p, markPx: null });
+  assert.ok(r.marginRatio >= 1);
+  assert.equal(marginToReach(r, 'long', 15), null);
+});

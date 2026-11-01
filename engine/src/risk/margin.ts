@@ -52,6 +52,12 @@ export interface LegRisk {
   /** Equity ÷ notional (e above). */
   equityFraction: number;
   notionalUsd: number;
+  /** The account's equity, maintenance and whole notional (every open position on it), for the account basis. */
+  equityUsd: number;
+  maintenanceUsd: number;
+  accountNotionalUsd: number;
+  /** Open positions on the account besides this one. */
+  otherPositions: number;
 }
 
 /** The mark: the given one, or entry + uPnL / size (every reader computes uPnL at the venue's own mark). */
@@ -129,16 +135,37 @@ export function legRisk(input: LegRiskInput): LegRisk {
     maintenanceFraction: m,
     equityFraction: notionalUsd > 0 ? equity / notionalUsd : Infinity,
     notionalUsd,
+    equityUsd: equity,
+    maintenanceUsd: maintenance,
+    accountNotionalUsd: accountNotional,
+    otherPositions: others,
   };
 }
 
 /**
- * The margin to add to a lone leg so its distance to liquidation becomes `targetPct` (0 when it already is that far).
- * From the header: a long needs e = D(1 − m) + m, a short e = D(1 + m) + m; the margin is (e − e_now) × notional.
+ * The margin to add so the leg's distance to liquidation becomes `targetPct` (0 when it already is that far); null when
+ * it cannot be told (no mark, so no notional).
+ *   - a lone leg (from the header): a long needs e = D(1 − m) + m, a short e = D(1 + m) + m; the margin is
+ *     (e − e_now) × notional;
+ *   - a leg on an account with other positions, on the account basis its distance came from: equity must cover the
+ *     maintenance plus D of the account's whole notional, so M + D × N_account − E. (A venue liquidation price on such
+ *     an account moves with every position on it too, so this is used whatever the distance's basis.)
  */
-export function marginToReach(risk: Pick<LegRisk, 'maintenanceFraction' | 'equityFraction' | 'notionalUsd'>, side: 'long' | 'short', targetPct: number): number {
+export function marginToReach(
+  risk: Pick<LegRisk, 'maintenanceFraction' | 'equityFraction' | 'notionalUsd' | 'equityUsd' | 'maintenanceUsd' | 'accountNotionalUsd' | 'otherPositions'>,
+  side: 'long' | 'short',
+  targetPct: number,
+): number | null {
   const d = targetPct / 100;
-  const m = risk.maintenanceFraction;
-  const e = side === 'long' ? d * (1 - m) + m : d * (1 + m) + m;
-  return Math.max(0, (e - risk.equityFraction) * risk.notionalUsd);
+  let usd: number;
+  if (risk.otherPositions > 0) {
+    if (!(risk.accountNotionalUsd > 0)) return null;
+    usd = risk.maintenanceUsd + d * risk.accountNotionalUsd - risk.equityUsd;
+  } else {
+    if (!(risk.notionalUsd > 0)) return null;
+    const m = risk.maintenanceFraction;
+    const e = side === 'long' ? d * (1 - m) + m : d * (1 + m) + m;
+    usd = (e - risk.equityFraction) * risk.notionalUsd;
+  }
+  return Number.isFinite(usd) ? Math.max(0, usd) : null;
 }

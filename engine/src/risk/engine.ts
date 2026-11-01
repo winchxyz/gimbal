@@ -14,6 +14,12 @@
 // The ADL check runs beside the reads, never inside them: its response trades (an MPC signature can take 120 s, a
 // close several), and reads, rescue triggers and POST /stress must go on meanwhile. One check runs at a time.
 //
+// The desk's own view (reserve, pause: get_desk on NEAR) is read by the source off the venue reads' path; a view that
+// was never read, or is older than DESK_VIEW_STALE_MS, marks NEAR down in the health map and keeps the desk at watch
+// at least (DeskState has no "unknown" reserve or pause, so the reserve reads 0 and the pause null until it is read).
+//
+// stop() is final: no tick, ADL check or stress runs after it.
+//
 // Stress (POST /stress, testnet and replay only): raises the rescue line of the nearest leg above its distance, so it
 // goes to rescue on the next read and its rescue starts; cleared with { "on": false }. On mainnet it is refused,
 // whatever the request: a stress there would move real money.
@@ -39,6 +45,8 @@ export const RESCUE_LAPSE_MS = 2 * RESCUE_HORIZON_S * 1000;
 /** A failed or lapsed rescue of a leg still in rescue is triggered again after this, doubling, up to the max. */
 export const RESCUE_RETRY_MS = 30_000;
 export const RESCUE_RETRY_MAX_MS = 10 * 60_000;
+/** The desk's view (get_desk) older than this marks NEAR down; any failed or late read in between marks it slow. */
+export const DESK_VIEW_STALE_MS = 60_000;
 
 /** One desk leg as a source read it: the venue account that holds it and the position. */
 export interface LegInput {
@@ -62,6 +70,11 @@ export interface DeskSnapshot {
   legs: LegInput[];
   /** Each venue read this time: how long it took, or why it failed. */
   reads: { venue: VenueId; ms: number; error: string | null }[];
+  /**
+   * The desk's own view (reserve, pause), when the source reads one: when it was last read (null: never) and why the
+   * latest read failed or is late (null: it answered). Absent: the source has no such view (replay), always known.
+   */
+  deskView?: { at: number | null; error: string | null };
 }
 
 export interface DeskSource {
@@ -76,8 +89,10 @@ export interface RescueTrigger {
   distancePct: number;
   rescuePct: number;
   watchPct: number;
-  /** Margin that brings the leg back to its watch line (marginToReach). */
+  /** Margin that brings the leg back to its watch line (marginToReach); 0 when amountKnown is false. */
   amountUsd: number;
+  /** false: there was neither a mark nor an entry price to size it by; E9 must size it itself. */
+  amountKnown: boolean;
   /** Where the margin would come from, by the simple rule here; E9 plans the real route. */
   from: VenueId | 'reserve';
   stress: boolean;
@@ -138,6 +153,7 @@ export class RiskEngine {
   #running = false;
   #ticking: Promise<DeskState | null> | null = null;
   #adlRun: Promise<void> | null = null;
+  #stopped = false;
   readonly #down = new Set<string>();
 
   constructor(options: RiskEngineOptions) {
@@ -164,7 +180,7 @@ export class RiskEngine {
   }
 
   start(): void {
-    if (this.#running) return;
+    if (this.#running || this.#stopped) return;
     this.#running = true;
     const loop = (): void => {
       if (!this.#running) return;
@@ -178,7 +194,9 @@ export class RiskEngine {
     loop();
   }
 
+  /** Final: nothing reads, triggers, checks ADL or stresses after it (a late POST /stress included). */
   async stop(): Promise<void> {
+    this.#stopped = true;
     this.#running = false;
     clearTimeout(this.#timer);
     await this.#ticking;
@@ -188,6 +206,7 @@ export class RiskEngine {
   /** One read of the desk, published. Ticks never overlap: a call during one waits for it and runs after. */
   async tick(): Promise<DeskState | null> {
     while (this.#ticking !== null) await this.#ticking;
+    if (this.#stopped) return this.#desk;
     this.#ticking = this.#tick();
     try {
       return await this.#ticking;
@@ -213,6 +232,7 @@ export class RiskEngine {
     if (this.#o.mode === 'mainnet') {
       throw new StressRefused('POST /stress is refused on mainnet: it would start a real rescue that moves real money. It runs on testnet and in replay only.', 403);
     }
+    if (this.#stopped) throw new StressRefused('the risk engine has stopped', 503);
     if (!on) {
       this.#stress = null;
       this.#log('stress off: the owner\'s lines again');
@@ -247,6 +267,13 @@ export class RiskEngine {
       if (r.error === null) this.#o.health.readOk(r.venue, r.ms);
       else this.#o.health.readFailed(r.venue, new Error(r.error));
     }
+    const view = snap.deskView;
+    const viewUnknown = view !== undefined && (view.at === null || t - view.at >= DESK_VIEW_STALE_MS);
+    if (view !== undefined) {
+      const status = viewUnknown ? 'down' : view.error !== null ? 'slow' : 'ok';
+      const age = view.at === null ? 'never read' : `${Math.round((t - view.at) / 1000)} s old`;
+      this.#o.health.deskView(status, status === 'ok' ? null : `the desk view (get_desk) is ${age}${view.error === null ? '' : `: ${view.error}`}`);
+    }
     this.#publishHealth(t);
 
     const unread = new Set(snap.reads.filter((r) => r.error !== null).map((r) => r.venue));
@@ -262,6 +289,8 @@ export class RiskEngine {
     }
     this.#views = views;
     const desk = this.#deskState(snap, views, t);
+    // Reserve and pause unknown: not shown as a level, running desk.
+    if (viewUnknown) desk.health = worst([desk.health, 'watch']);
     this.#desk = desk;
     this.#o.publish({ type: 'desk', data: desk });
     this.#triggers(views, t);
@@ -272,12 +301,12 @@ export class RiskEngine {
   /** Starts the ADL check beside the reads when none runs (see the header). */
   #startAdl(): void {
     const adl = this.#o.adl;
-    if (adl === undefined || this.#adlRun !== null) return;
+    if (adl === undefined || this.#adlRun !== null || this.#stopped) return;
     this.#adlRun = (async () => {
       try {
         const report = await adl.check();
         // One event, one journal line: a retry after a backoff is journaled only when it brought the pair level.
-        if (report !== null && (report.retry === 0 || report.result?.status === 'closed')) {
+        if (report !== null && (report.retry === 0 || report.reached)) {
           this.#journal({ ...adlJournal(report, this.#clock.now()) });
         }
       } catch (err) {
@@ -371,7 +400,8 @@ export class RiskEngine {
   #fire(v: LegView, views: LegView[], t: number, attempt: number): void {
     const distance = v.leg.distanceToLiqPct ?? 0;
     // Up to the cent (less a hair of float noise, so 180.6 stays 180.60).
-    const amountUsd = Math.ceil(marginToReach(v.risk!, v.leg.side, v.lines.watchPct) * 100 - 1e-6) / 100;
+    const sized = this.#amount(v);
+    const amountUsd = Math.max(0, Math.ceil(sized.usd * 100 - 1e-6) / 100);
     // Orderly is never a source (four signatures and several hops); the partner leg's venue when its free margin
     // covers the amount, else the reserve.
     const partner = views.find((o) => o !== v && o.leg.venue !== 'orderly' && o.leg.venue !== v.leg.venue && o.freeMarginUsd >= amountUsd);
@@ -381,30 +411,56 @@ export class RiskEngine {
       id: `rescue-${t.toString(36)}-${++this.#seq}`,
       venue: v.leg.venue, symbol: v.leg.symbol,
       distancePct: distance, rescuePct: v.lines.rescuePct, watchPct: v.lines.watchPct,
-      amountUsd, from: partner?.leg.venue ?? 'reserve', stress, attempt, at: t,
+      amountUsd, amountKnown: sized.known, from: partner?.leg.venue ?? 'reserve', stress, attempt, at: t,
     };
     this.#rescues.set(k, { trigger, endedAt: null, attempt });
     const volNote = v.lines.volPct > 0 ? `, volatility term ${v.lines.volPct.toFixed(2)} %` : '';
     const again = attempt > 0 ? ` (again: attempt ${attempt + 1})` : '';
+    const amountText = !sized.known
+      ? 'the amount is unknown (no mark, no entry price): the rescue must size it'
+      : `${amountUsd.toFixed(2)} USD from ${trigger.from}${sized.note} brings it back to ${trigger.watchPct.toFixed(2)} %`;
     this.#journal({
       t, kind: 'rescue',
-      summary: `health rescue${again}: ${v.leg.venue} ${v.leg.symbol} ${v.leg.side} is ${distance.toFixed(2)} % from liquidation, under the ${trigger.rescuePct.toFixed(2)} % rescue line${stress ? ' (stress test)' : ''}${volNote}; ${amountUsd.toFixed(2)} USD from ${trigger.from} brings it back to ${trigger.watchPct.toFixed(2)} %`,
+      summary: `health rescue${again}: ${v.leg.venue} ${v.leg.symbol} ${v.leg.side} is ${distance.toFixed(2)} % from liquidation, under the ${trigger.rescuePct.toFixed(2)} % rescue line${stress ? ' (stress test)' : ''}${volNote}; ${amountText}`,
       numbers: {
         venue: v.leg.venue, distancePct: round2(distance), rescuePct: round2(trigger.rescuePct),
-        watchPct: round2(trigger.watchPct), amountUsd: trigger.amountUsd, from: trigger.from,
+        watchPct: round2(trigger.watchPct), amountUsd: trigger.amountUsd, from: trigger.from, ...(sized.known ? {} : { amountKnown: 0 }),
         ...(stress ? { stress: 1 } : {}), ...(attempt > 0 ? { attempt: attempt + 1 } : {}),
       },
       tx: [],
     });
     this.#log(`rescue trigger ${trigger.id}: ${trigger.venue} ${trigger.symbol} at ${distance.toFixed(2)} % < ${trigger.rescuePct.toFixed(2)} %, ${amountUsd} USD from ${trigger.from}${again}`);
     if (this.#o.rescuer !== undefined) {
-      this.#o.rescuer(trigger);
+      // A rescuer that throws must not end the tick (the ADL check and the cleanup of legs that left rescue follow):
+      // the trigger counts as failed, so it is tried again after the backoff.
+      try {
+        this.#o.rescuer(trigger);
+      } catch (err) {
+        this.#rescues.get(k)!.endedAt = t;
+        this.#log(`rescue ${trigger.id}: the rescuer threw: ${errorMessage(err)}`);
+        this.#journal({ t, kind: 'error', summary: `rescue ${trigger.id} of ${v.leg.venue} ${v.leg.symbol} could not start: ${errorMessage(err)}`, numbers: { venue: v.leg.venue }, tx: [] });
+      }
       return;
     }
     const progress: RescueProgress = {
       id: trigger.id, from: trigger.from, to: trigger.venue, amountUsd, step: 'detect', startedAt: t, elapsedS: 0, tx: [],
     };
     this.#o.publish({ type: 'rescue', data: progress });
+  }
+
+  /**
+   * The margin a rescue adds (marginToReach to the watch line). With no mark it cannot be told: estimated on the
+   * entry price instead (maintenance plus the watch distance of the notional at entry, less equity), and unknown when
+   * there is no entry price either. Never NaN.
+   */
+  #amount(v: LegView): { usd: number; known: boolean; note: string } {
+    const exact = marginToReach(v.risk!, v.leg.side, v.lines.watchPct);
+    if (exact !== null) return { usd: exact, known: true, note: '' };
+    const r = v.risk!;
+    const notional = v.leg.size * v.leg.entry + (r.otherPositions > 0 ? r.accountNotionalUsd : 0);
+    const est = r.maintenanceUsd + (v.lines.watchPct / 100) * notional - r.equityUsd;
+    if (notional > 0 && Number.isFinite(est)) return { usd: Math.max(0, est), known: true, note: ' (estimated on the entry price: no mark)' };
+    return { usd: 0, known: false, note: '' };
   }
 
   #publishHealth(t: number): void {
@@ -414,7 +470,7 @@ export class RiskEngine {
     for (const [k, status] of Object.entries(map)) {
       if (status === 'down' && !this.#down.has(k)) {
         this.#down.add(k);
-        const why = k === 'intents' ? this.#o.health.intentsDetail : k === 'near' ? null : this.#o.health.detail(k as VenueId).readError;
+        const why = k === 'intents' ? this.#o.health.intentsDetail : k === 'near' ? this.#o.health.nearDetail : this.#o.health.detail(k as VenueId).readError;
         this.#journal({ t, kind: 'error', summary: `${k} not answering${why === null ? '' : `: ${why}`}`, numbers: { venue: k }, tx: [] });
       } else if (status !== 'down') {
         this.#down.delete(k);

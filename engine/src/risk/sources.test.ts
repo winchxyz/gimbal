@@ -53,3 +53,28 @@ test('the reserve and the pause are read again with every snapshot; a read that 
   assert.equal(reads, 3);
   assert.match(lines.join(' | '), /desk view could not be read, keeping the last one: near rpc: 502/);
 });
+
+test('a slow get_desk does not hold the snapshot: it waits at most deskWaitMs, says how late, and reads one at a time', async () => {
+  let calls = 0;
+  let answer!: (d: { reserveUsd: number; paused: DeskState['paused'] }) => void;
+  let t = 50_000;
+  const source = new AccountsDeskSource({
+    deskId: 'alpha', owner: 'owner.near', contract: 'gimbal.near', accounts: [], now: () => t, deskWaitMs: 20,
+    desk: () => { calls++; return calls === 1 ? new Promise((r) => { answer = r; }) : Promise.resolve({ reserveUsd: 31, paused: null }); },
+  });
+  const started = Date.now();
+  const first = await source.read();
+  assert.ok(Date.now() - started < 1_000, 'not stalled');
+  assert.deepEqual([first.reserveUsd, first.paused], [0, null]);
+  assert.deepEqual(first.deskView, { at: null, error: 'get_desk has not answered for 0 s' });
+  t += 7_000;
+  const second = await source.read();
+  assert.equal(calls, 1, 'no second read while one is out');
+  assert.match(second.deskView!.error!, /has not answered for 7 s/);
+  answer({ reserveUsd: 30, paused: null });
+  await new Promise((r) => setImmediate(r));
+  const third = await source.read();
+  assert.equal(calls, 2, 'a fresh read starts with the next snapshot');
+  assert.equal(third.reserveUsd, 31);
+  assert.deepEqual(third.deskView, { at: t, error: null });
+});
