@@ -5,8 +5,9 @@
 //   GET /strategy, PUT /strategy StrategyConfig (PUT takes the whole config, checked, and answers the new one)
 //   GET /journal?before=<id>     JournalEntry[]: up to 100 entries older than that id, newest first ([] past the
 //                                oldest, and for an id not in memory); without `before`, the newest 100
-// The scanner feeds it: every scan publishes a `scan` and a `windows` event. Routes other parts build later answer
-// 501 for now (POST /rotate and /close in their own { ok, reason } shape).
+// The scanner feeds it: every scan publishes a `scan` and a `windows` event; the risk engine (src/risk/) publishes
+// `desk`, `health`, `journal` and `rescue`, and answers POST /stress (testnet and replay only). Routes other parts
+// build later answer 501 for now (POST /rotate and /close in their own { ok, reason } shape).
 //
 // Only this machine's dashboard may use it. PUT /strategy changes what the desk trades, and a web page on any other
 // site could otherwise reach a local server (a cross-site form post, or DNS rebinding a name onto 127.0.0.1), so:
@@ -31,6 +32,8 @@ import { setupRoute } from './setup/route.ts';
 import type { SetupStarter } from './setup/route.ts';
 import { parseStrategyConfig } from './scanner/config.ts';
 import type { ScanResult, Scanner } from './scanner/scanner.ts';
+import type { RiskEngine } from './risk/engine.ts';
+import { stressRoute } from './risk/stress-route.ts';
 
 export const DEFAULT_ENGINE_PORT = 8790;
 export const DEFAULT_ENGINE_HOST = '127.0.0.1';
@@ -94,6 +97,8 @@ export interface EngineServerOptions {
   saveStrategy?: (strategy: StrategyConfig) => Promise<void>;
   /** POST /setup (src/setup/route.ts); none = 503, venue setup is off. */
   setup?: SetupStarter;
+  /** POST /stress (src/risk/stress-route.ts); none = 503 (mainnet is refused either way). */
+  stress?: Pick<RiskEngine, 'stress'>;
 }
 
 type Latest = {
@@ -261,7 +266,12 @@ export class EngineServer {
       return { status: 403, kind: 'origin', error: `origin ${JSON.stringify(origin)} is not the dashboard's` };
     }
     const method = req.method ?? 'GET';
-    if (method === 'POST' || method === 'PUT') {
+    // POST /stress takes no body (`curl -X POST localhost:8790/stress`); a cross-site page still cannot reach it, a
+    // browser sends its Origin with every POST and the Origin check above refuses it.
+    const bodyless = req.headers['content-length'] === undefined || req.headers['content-length'] === '0';
+    const noBodyStress = method === 'POST' && bodyless && req.headers['transfer-encoding'] === undefined
+      && new URL(req.url ?? '/', 'http://engine').pathname.replace(/\/+$/, '') === '/stress';
+    if ((method === 'POST' || method === 'PUT') && !noBodyStress) {
       const type = (req.headers['content-type'] ?? '').split(';')[0]!.trim().toLowerCase();
       if (type !== 'application/json') return { status: 415, kind: 'content-type', error: `${method} needs content-type application/json` };
     }
@@ -378,9 +388,10 @@ export class EngineServer {
       if (method !== 'POST') return notAllowed(res, 'POST');
       return json(res, 501, { ok: false, reason: 'the strategy engine is not running yet: nothing is entered or closed' });
     }
-    if (path === '/stress' || path === '/policy/draft') {
+    if (path === '/stress') {
       if (method !== 'POST') return notAllowed(res, 'POST');
-      return json(res, 501, { error: `POST ${path} is not built yet` });
+      const answer = await stressRoute(this.#options.mode, () => readBody(req), this.#options.stress ?? null);
+      return json(res, answer.status, answer.body);
     }
     return json(res, 404, { error: `no route ${method} ${path}` });
   }

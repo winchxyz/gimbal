@@ -159,12 +159,12 @@ test('GET /windows/history: 400 without an id, 404 for a window the last scan di
   assert.equal(h.points.at(-1)!.t, Date.UTC(2026, 9, 31, 10));
 });
 
-test('routes not built yet answer 501; wrong methods 405; unknown paths 404', async () => {
+test('routes not built yet answer 501 (stress 503 without a risk engine); wrong methods 405; unknown paths 404', async () => {
   const rotate = await call('POST', '/rotate', '{}');
   assert.equal(rotate.status, 501);
   assert.equal((rotate.json as { ok: boolean }).ok, false);
   assert.equal((await call('POST', '/close', '{}')).status, 501);
-  assert.equal((await call('POST', '/stress', '{}')).status, 501);
+  assert.equal((await call('POST', '/stress', '{}')).status, 503, 'no risk engine: stress is unavailable');
   const wrong = await call('GET', '/rotate');
   assert.equal(wrong.status, 405);
   assert.equal(wrong.headers.allow, 'POST');

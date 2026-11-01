@@ -1,0 +1,218 @@
+// The risk engine on a scripted desk: level → watch → rescue as the mark moves against a short, the rescue trigger
+// (journal + RescueProgress at `detect`) with its hand-computed amount, a venue that stops answering, and POST /stress:
+// it drives the desk to rescue on testnet and in replay, and is refused on mainnet (engine and HTTP).
+
+import assert from 'node:assert/strict';
+import { request } from 'node:http';
+import type { OutgoingHttpHeaders } from 'node:http';
+import { test } from 'node:test';
+import type { DeskState, JournalEntry, Mode, RescueProgress, StreamEvent } from '@gimbal/shared';
+import { DEFAULT_STRATEGY } from '../scanner/config.ts';
+import type { Scanner } from '../scanner/scanner.ts';
+import { EngineServer } from '../server.ts';
+import type { AccountState, Position } from '../venues/venue.ts';
+import type { DeskSnapshot, DeskSource, LegInput } from './engine.ts';
+import { RiskEngine, STRESS_MARGIN_PTS, StressRefused } from './engine.ts';
+import { STRESS_MAINNET_REASON } from './stress-route.ts';
+import { VenueHealth } from './venue-health.ts';
+
+/** Short 1 ETH on Hyperliquid opened at 2000 with 400 USD (m = 2 %), long 1 ETH on Phoenix with plenty. */
+class Desk implements DeskSource {
+  mark = 2000;
+  phoenixDown: string | null = null;
+  phoenixFree = 1000;
+
+  async read(): Promise<DeskSnapshot> {
+    const short: Position = { symbol: 'ETH', size: -1, entryPx: 2000, liqPx: null, marginUsd: 400, unrealizedPnlUsd: 2000 - this.mark, leverage: 5, fundingSinceOpenUsd: 1.5, unsettledFundingUsd: 0 };
+    const long: Position = { symbol: 'ETH', size: 1, entryPx: 2000, liqPx: null, marginUsd: 1000, unrealizedPnlUsd: this.mark - 2000, leverage: 2, fundingSinceOpenUsd: -1, unsettledFundingUsd: 0.25 };
+    const acct = (venue: 'hyperliquid' | 'phoenix', equity: number, free: number, p: Position): AccountState => ({
+      venue, address: venue, time: 1, equityUsd: equity, freeMarginUsd: free, maintenanceMarginUsd: 0.02 * this.mark, positions: [p],
+    });
+    const legs: LegInput[] = [
+      { venue: 'hyperliquid', symbol: 'ETH', lotSize: 1e-4, account: acct('hyperliquid', 400 + 2000 - this.mark, 0, short), position: short, markPx: this.mark, feesUsd: -0.4, unpriced: false },
+    ];
+    if (this.phoenixDown === null) {
+      legs.push({ venue: 'phoenix', symbol: 'ETH', lotSize: 1e-3, account: acct('phoenix', 1000 + this.mark - 2000, this.phoenixFree, long), position: long, markPx: this.mark, feesUsd: -0.7, unpriced: false });
+    }
+    return {
+      deskId: 'alpha', owner: 'owner.testnet', contract: 'gimbal.testnet', reserveUsd: 50, paused: null, legs,
+      reads: [{ venue: 'hyperliquid', ms: 120, error: null }, { venue: 'phoenix', ms: 90, error: this.phoenixDown }],
+    };
+  }
+}
+
+function engine(mode: Mode, desk = new Desk()) {
+  const events: StreamEvent[] = [];
+  let t = 1_000_000;
+  const risk = new RiskEngine({
+    mode, source: desk, strategy: () => DEFAULT_STRATEGY, health: new VenueHealth(), publish: (e) => events.push(e),
+    clock: { now: () => (t += 5_000) },
+  });
+  const of = <K extends StreamEvent['type']>(type: K) => events.filter((e) => e.type === type).map((e) => e.data) as Extract<StreamEvent, { type: K }>['data'][];
+  return { risk, desk, events, of };
+}
+
+test('level, watch, rescue as the mark rises against the short; one trigger with the margin back to the watch line', async () => {
+  const { risk, desk, of } = engine('testnet');
+  // 2000: e = 400 / 2000 = 0.2, distance (0.2 − 0.02) / 1.02 = 17.647 %: level.
+  let d = (await risk.tick())!;
+  assert.equal(d.health, 'level');
+  const hl = d.legs[0]!;
+  assert.equal(hl.side, 'short');
+  assert.ok(Math.abs(hl.distanceToLiqPct! - 0.18 / 1.02 * 100) < 1e-9);
+  assert.ok(Math.abs(hl.liqPx! - 2400 / 1.02) < 1e-9, '(400 + 2000) / 1.02');
+  assert.ok(Math.abs(hl.marginRatio - 0.1) < 1e-12, '40 / 400');
+  assert.equal(d.netDelta, 0);
+  assert.equal(d.equityUsd, 400 + 1000 + 50);
+  assert.deepEqual(d.pnl, { fundingUsd: 1.5 - 1 + 0.25, feesUsd: -0.4 - 0.7, priceUsd: 0, netUsd: 0.75 - 1.1 });
+
+  // 2100: equity 300, e = 300 / 2100, distance 12.045 %: watch.
+  desk.mark = 2100;
+  d = (await risk.tick())!;
+  assert.equal(d.health, 'watch');
+  assert.deepEqual(d.legs.map((l) => l.venue), ['hyperliquid', 'phoenix']);
+
+  // 2200: equity 200, e = 0.090909, distance 6.952 %: rescue. To 15 %: e = 0.15 × 1.02 + 0.02 = 0.173,
+  // 0.173 × 2200 − 200 = 180.60 USD, from Phoenix (1000 free).
+  desk.mark = 2200;
+  d = (await risk.tick())!;
+  assert.equal(d.health, 'rescue');
+  const rescues = of('rescue') as RescueProgress[];
+  assert.equal(rescues.length, 1);
+  assert.deepEqual({ ...rescues[0]!, id: '', startedAt: 0 }, { id: '', from: 'phoenix', to: 'hyperliquid', amountUsd: 180.6, step: 'detect', startedAt: 0, elapsedS: 0, tx: [] });
+  const journal = of('journal') as JournalEntry[];
+  assert.equal(journal.length, 1);
+  assert.equal(journal[0]!.kind, 'rescue');
+  assert.match(journal[0]!.summary, /^health rescue: hyperliquid ETH short is 6\.95 % from liquidation, under the 8\.00 % rescue line; 180\.60 USD from phoenix brings it back to 15\.00 %$/);
+  assert.deepEqual(journal[0]!.numbers, { venue: 'hyperliquid', distancePct: 6.95, rescuePct: 8, watchPct: 15, amountUsd: 180.6, from: 'phoenix' });
+
+  // Still in rescue: no second trigger. Back to 2000: one point of hysteresis, then level.
+  await risk.tick();
+  assert.equal(of('rescue').length, 1);
+  desk.mark = 2000;
+  assert.equal((await risk.tick())!.health, 'level');
+  // The desk events carry every read.
+  assert.deepEqual((of('desk') as DeskState[]).map((x) => x.health), ['level', 'watch', 'rescue', 'rescue', 'level']);
+});
+
+test('the partner\'s free margin does not cover the rescue: it comes from the reserve', async () => {
+  const desk = new Desk();
+  desk.phoenixFree = 100;
+  desk.mark = 2200;
+  const { risk, of } = engine('replay', desk);
+  await risk.tick();
+  assert.equal((of('rescue') as RescueProgress[])[0]!.from, 'reserve');
+});
+
+test('a venue that stops answering: health down (one journal line), its leg kept at its last numbers and watched', async () => {
+  const { risk, desk, of } = engine('testnet');
+  await risk.tick();
+  assert.deepEqual(of('health').at(-1), { intents: 'ok', near: 'ok', hyperliquid: 'ok', phoenix: 'ok', orderly: 'ok' });
+  desk.phoenixDown = 'phoenix account: fetch failed';
+  const d = (await risk.tick())!;
+  assert.equal(of('health').at(-1)!.phoenix, 'down');
+  assert.deepEqual(d.legs.map((l) => l.venue), ['hyperliquid', 'phoenix'], 'kept');
+  assert.equal(d.health, 'watch', 'a leg that cannot be seen is watched');
+  await risk.tick();
+  const errors = (of('journal') as JournalEntry[]).filter((j) => j.kind === 'error');
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0]!.summary, 'phoenix not answering: phoenix account: fetch failed');
+  desk.phoenixDown = null;
+  assert.equal((await risk.tick())!.health, 'level');
+  assert.equal(of('health').at(-1)!.phoenix, 'ok');
+  assert.equal(of('health').length, 3, 'published on change only');
+});
+
+test('stress on testnet: the rescue line goes 5 points over the nearest leg, the desk goes to rescue; off restores it', async () => {
+  const { risk, of } = engine('testnet');
+  await risk.tick();
+  const r = await risk.stress(true);
+  assert.equal(r.health, 'rescue');
+  // Nearest: the short at 17.647 %.
+  assert.ok(Math.abs(r.rescueDistancePct! - (0.18 / 1.02 * 100 + STRESS_MARGIN_PTS)) < 1e-9);
+  const j = (of('journal') as JournalEntry[])[0]!;
+  assert.equal(j.kind, 'rescue');
+  assert.match(j.summary, /\(stress test\)/);
+  assert.equal(j.numbers.stress, 1);
+  assert.equal(of('rescue').length, 1);
+  assert.equal(risk.lines()[0]!.lines.watchPct, r.rescueDistancePct! + 7, 'the watch line keeps its gap');
+  const off = await risk.stress(false);
+  assert.deepEqual(off, { health: 'level', rescueDistancePct: null });
+  assert.equal(risk.stressLine, null);
+});
+
+test('stress is refused on mainnet, and with no leg to stress', async () => {
+  const { risk, events } = engine('mainnet');
+  await risk.tick();
+  const before = events.length;
+  await assert.rejects(risk.stress(true), (err: unknown) => err instanceof StressRefused && err.status === 403 && /refused on mainnet/.test(err.message));
+  await assert.rejects(risk.stress(false), StressRefused);
+  assert.equal(events.length, before, 'nothing published');
+  assert.equal(risk.stressLine, null);
+
+  const empty = new RiskEngine({
+    mode: 'replay', strategy: () => DEFAULT_STRATEGY, health: new VenueHealth(), publish: () => {},
+    source: { read: async () => ({ deskId: 'd', owner: 'o', contract: 'c', reserveUsd: 0, paused: null, legs: [], reads: [] }) },
+  });
+  await assert.rejects(empty.stress(true), (err: unknown) => err instanceof StressRefused && err.status === 409 && /no leg is open/.test(err.message));
+});
+
+// ---- HTTP: POST /stress through the engine server ----
+
+const stubScanner = {
+  scan: async () => ({ scan: { venues: 0, failed: [], at: 1 }, windows: [], notes: { ms: 0, unpriced: [], historyReads: 0 } }),
+  history: () => null,
+} as unknown as Scanner;
+
+async function withServer(mode: Mode, fn: (call: (method: string, body?: string, headers?: OutgoingHttpHeaders) => Promise<{ status: number; json: Record<string, unknown> }>, server: EngineServer, risk: RiskEngine) => Promise<void>): Promise<void> {
+  const { risk } = engine(mode);
+  const server = new EngineServer({ mode, scanner: stubScanner, strategy: DEFAULT_STRATEGY, policy: null, intervalMs: 3_600_000, stress: risk });
+  const port = await server.start(0);
+  const call = (method: string, body?: string, headers?: OutgoingHttpHeaders) => new Promise<{ status: number; json: Record<string, unknown> }>((resolve, reject) => {
+    const req = request(`http://127.0.0.1:${port}/stress`, { method, headers: headers ?? {} }, (res) => {
+      let text = '';
+      res.setEncoding('utf8');
+      res.on('data', (c: string) => (text += c));
+      res.on('end', () => resolve({ status: res.statusCode!, json: text === '' ? {} : JSON.parse(text) }));
+    });
+    req.on('error', reject);
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+  try {
+    await fn(call, server, risk);
+  } finally {
+    await server.stop();
+  }
+}
+
+test('POST /stress in replay: a bare `curl -X POST` (no body, no content type) starts it; { on: false } ends it', async () => {
+  await withServer('replay', async (call, _server, risk) => {
+    // The same answer shape as POST /rotate and /close; what it led to arrives as events.
+    const on = await call('POST');
+    assert.equal(on.status, 200, JSON.stringify(on.json));
+    assert.deepEqual(on.json, { ok: true });
+    assert.equal(risk.desk!.health, 'rescue');
+    const off = await call('POST', '{"on":false}', { 'content-type': 'application/json' });
+    assert.deepEqual(off.json, { ok: true });
+    assert.equal(risk.desk!.health, 'level');
+    assert.equal(risk.stressLine, null);
+    assert.equal((await call('POST', '{"on":"yes"}', { 'content-type': 'application/json' })).status, 400);
+    assert.equal((await call('POST', '{"x":1}', { 'content-type': 'application/json' })).status, 400);
+    // A body still needs the JSON content type; GET is not a stress.
+    assert.equal((await call('POST', '{}', { 'content-type': 'text/plain' })).status, 415);
+    assert.equal((await call('GET')).status, 405);
+    // A browser page from another site sends its Origin: refused before the route.
+    assert.equal((await call('POST', undefined, { origin: 'https://evil.example' })).status, 403);
+  });
+});
+
+test('POST /stress on mainnet: 403 with the reason, nothing stressed', async () => {
+  await withServer('mainnet', async (call, server) => {
+    const r = await call('POST');
+    assert.equal(r.status, 403);
+    assert.deepEqual(r.json, { ok: false, reason: STRESS_MAINNET_REASON });
+    assert.equal((await call('POST', '{"on":true}', { 'content-type': 'application/json' })).status, 403);
+    assert.equal(server.state().desk, null);
+  });
+});

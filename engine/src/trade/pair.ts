@@ -172,6 +172,8 @@ export class PairTrader {
   /** Ends the polls' unref'd timers early (stop()). */
   readonly #wakes = new Set<() => void>();
   #queue: Promise<unknown> = Promise.resolve();
+  /** Tasks queued or running on #queue. */
+  #active = 0;
   /**
    * What each leg should hold: the final position of the last open or close (null: it was unknown); for a leg with an
    * unsettled order, what offsets its partner.
@@ -289,6 +291,14 @@ export class PairTrader {
   /** What the pair means each leg to hold now (null: unknown; undefined: no open or close yet). */
   intent(leg: TradeLeg): bigint | null | undefined {
     return this.#intent.get(leg);
+  }
+
+  /**
+   * An open, a close or a watch check is queued or running: the trader's own orders may be moving the legs now, so a
+   * position that differs from the intent is not news (the risk engine's ADL check waits until this is false).
+   */
+  get busy(): boolean {
+    return this.#active > 0;
   }
 
   async #open(request: { size: bigint | number | string; longIndex: 0 | 1; reason: string }): Promise<PairResult> {
@@ -971,7 +981,15 @@ export class PairTrader {
   }
 
   #serial<T>(task: () => Promise<T>): Promise<T> {
-    const next = this.#queue.then(task, task);
+    this.#active++;
+    const run = async (): Promise<T> => {
+      try {
+        return await task();
+      } finally {
+        this.#active--;
+      }
+    };
+    const next = this.#queue.then(run, run);
     this.#queue = next.catch(() => undefined);
     return next;
   }

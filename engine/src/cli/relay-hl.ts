@@ -159,7 +159,7 @@ async function freshPrice(maxAgeS: number): Promise<number> {
     }
     if (attempt > 0) throw new Error(`no stored ${coin} price younger than ${maxAgeS} s after refresh_prices`);
     log(p === undefined ? `no stored ${coin} price: refresh_prices` : `stored ${coin} price is ${Math.round(age)} s old: refresh_prices`);
-    log(`refresh_prices: ${refs(await client.refreshPrices([coin]))}`);
+    log(`refresh_prices: ${refs(await client.refreshPrices([coin], { maxAgeS: maxAgeS - 30 }))}`);
   }
 }
 
