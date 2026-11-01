@@ -12,7 +12,10 @@ import type { Scanner } from '../scanner/scanner.ts';
 import { EngineServer } from '../server.ts';
 import type { AccountState, Position } from '../venues/venue.ts';
 import type { DeskSnapshot, DeskSource, LegInput } from './engine.ts';
-import { RiskEngine, STRESS_MARGIN_PTS, StressRefused } from './engine.ts';
+import type { RescueTrigger } from './engine.ts';
+import { RESCUE_LAPSE_MS, RESCUE_RETRY_MS, RiskEngine, STRESS_MARGIN_PTS, StressRefused } from './engine.ts';
+import type { AdlReport, AdlWatch } from './adl.ts';
+import type { TradeLeg } from '../trade/legs.ts';
 import { STRESS_MAINNET_REASON } from './stress-route.ts';
 import { VenueHealth } from './venue-health.ts';
 
@@ -21,6 +24,8 @@ class Desk implements DeskSource {
   mark = 2000;
   phoenixDown: string | null = null;
   phoenixFree = 1000;
+  hlMargin = 400;
+  phoenixMargin = 1000;
 
   async read(): Promise<DeskSnapshot> {
     const short: Position = { symbol: 'ETH', size: -1, entryPx: 2000, liqPx: null, marginUsd: 400, unrealizedPnlUsd: 2000 - this.mark, leverage: 5, fundingSinceOpenUsd: 1.5, unsettledFundingUsd: 0 };
@@ -29,10 +34,10 @@ class Desk implements DeskSource {
       venue, address: venue, time: 1, equityUsd: equity, freeMarginUsd: free, maintenanceMarginUsd: 0.02 * this.mark, positions: [p],
     });
     const legs: LegInput[] = [
-      { venue: 'hyperliquid', symbol: 'ETH', lotSize: 1e-4, account: acct('hyperliquid', 400 + 2000 - this.mark, 0, short), position: short, markPx: this.mark, feesUsd: -0.4, unpriced: false },
+      { venue: 'hyperliquid', symbol: 'ETH', lotSize: 1e-4, account: acct('hyperliquid', this.hlMargin + 2000 - this.mark, 0, short), position: short, markPx: this.mark, feesUsd: -0.4, unpriced: false },
     ];
     if (this.phoenixDown === null) {
-      legs.push({ venue: 'phoenix', symbol: 'ETH', lotSize: 1e-3, account: acct('phoenix', 1000 + this.mark - 2000, this.phoenixFree, long), position: long, markPx: this.mark, feesUsd: -0.7, unpriced: false });
+      legs.push({ venue: 'phoenix', symbol: 'ETH', lotSize: 1e-3, account: acct('phoenix', this.phoenixMargin + this.mark - 2000, this.phoenixFree, long), position: long, markPx: this.mark, feesUsd: -0.7, unpriced: false });
     }
     return {
       deskId: 'alpha', owner: 'owner.testnet', contract: 'gimbal.testnet', reserveUsd: 50, paused: null, legs,
@@ -155,6 +160,116 @@ test('stress is refused on mainnet, and with no leg to stress', async () => {
     source: { read: async () => ({ deskId: 'd', owner: 'o', contract: 'c', reserveUsd: 0, paused: null, legs: [], reads: [] }) },
   });
   await assert.rejects(empty.stress(true), (err: unknown) => err instanceof StressRefused && err.status === 409 && /no leg is open/.test(err.message));
+});
+
+/** An engine on a clock the test moves, with a rescuer that records the triggers. */
+function rig(options: { adl?: AdlWatch; desk?: Desk } = {}) {
+  let t = 1_000_000;
+  const events: StreamEvent[] = [];
+  const triggers: RescueTrigger[] = [];
+  const desk = options.desk ?? new Desk();
+  const risk = new RiskEngine({
+    mode: 'testnet', source: desk, strategy: () => DEFAULT_STRATEGY, health: new VenueHealth(), publish: (e) => events.push(e),
+    clock: { now: () => t }, rescuer: (x) => triggers.push(x), ...(options.adl !== undefined ? { adl: options.adl } : {}),
+  });
+  const journal = () => events.filter((e) => e.type === 'journal').map((e) => e.data as JournalEntry);
+  return { risk, desk, triggers, journal, advance: (ms: number) => { t += ms; } };
+}
+
+async function within<T>(p: Promise<T>, ms = 1_000): Promise<T | 'hung'> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const hung = new Promise<'hung'>((r) => { timer = setTimeout(() => r('hung'), ms); });
+  try {
+    return await Promise.race([p, hung]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+test('rescue triggers are per leg: two legs in rescue are both triggered, the nearer its line first', async () => {
+  const desk = new Desk();
+  desk.hlMargin = 150;          // short: e = 0.075, (0.075 − 0.02) / 1.02 = 5.39 %
+  desk.phoenixMargin = 100;     // long:  e = 0.05,  (0.05 − 0.02) / 0.98 = 3.06 %
+  const { risk, triggers } = rig({ desk });
+  assert.equal((await risk.tick())!.health, 'rescue');
+  assert.deepEqual(triggers.map((x) => [x.venue, x.attempt]), [['phoenix', 0], ['hyperliquid', 0]]);
+  await risk.tick();
+  assert.equal(triggers.length, 2, 'still running: not again');
+});
+
+test('a failed rescue is triggered again after the backoff, a lapsed one (no end reported) too, each once', async () => {
+  const desk = new Desk();
+  desk.hlMargin = 150;
+  desk.phoenixMargin = 100;
+  const { risk, triggers, journal, advance } = rig({ desk });
+  await risk.tick();
+  const [phoenix, hl] = triggers;
+  risk.rescueEnded(phoenix!.id, false);
+  advance(5_000);
+  await risk.tick();
+  assert.equal(triggers.length, 2, 'inside the backoff');
+  advance(RESCUE_RETRY_MS);
+  await risk.tick();
+  assert.equal(triggers.length, 3);
+  assert.deepEqual([triggers[2]!.venue, triggers[2]!.attempt], ['phoenix', 1]);
+  assert.match(journal().at(-1)!.summary, /^health rescue \(again: attempt 2\): phoenix ETH long/);
+  assert.equal(journal().at(-1)!.numbers.attempt, 2);
+  await risk.tick();
+  assert.equal(triggers.length, 3);
+  // Hyperliquid's rescue never reported an end: it lapses after RESCUE_LAPSE_MS, then waits its backoff.
+  advance(RESCUE_LAPSE_MS + RESCUE_RETRY_MS);
+  await risk.tick();
+  assert.equal(triggers.length, 4);
+  assert.deepEqual([triggers[3]!.venue, triggers[3]!.attempt], ['hyperliquid', 1]);
+  assert.notEqual(triggers[3]!.id, hl!.id);
+  // Both legs back over their lines: the next rescue starts afresh.
+  desk.hlMargin = 400;
+  desk.phoenixMargin = 1000;
+  await risk.tick();
+  desk.hlMargin = 150;
+  await risk.tick();
+  assert.deepEqual([triggers.at(-1)!.venue, triggers.at(-1)!.attempt], ['hyperliquid', 0]);
+});
+
+test('an ADL response that hangs (a slow MPC signature) blocks neither the reads, the rescue triggers nor stress; one check at a time', async () => {
+  let calls = 0;
+  let release!: (r: AdlReport | null) => void;
+  const adl = { check: () => { calls++; return new Promise<AdlReport | null>((r) => { release = r; }); } } as unknown as AdlWatch;
+  const { risk, desk, triggers } = rig({ adl });
+  assert.notEqual(await within(risk.tick()), 'hung');
+  assert.equal(calls, 1);
+  desk.mark = 2200;
+  const d = await within(risk.tick());
+  assert.notEqual(d, 'hung', 'the tick does not wait on the ADL response');
+  assert.equal((d as DeskState).health, 'rescue');
+  assert.equal(triggers.length, 1);
+  desk.mark = 2000;
+  const stressed = await within(risk.stress(true));
+  assert.notEqual(stressed, 'hung');
+  assert.equal(calls, 1, 'no second check while one runs');
+  release(null);
+  await risk.adlRunning;
+  await risk.tick();
+  assert.equal(calls, 2);
+  release(null);
+  await risk.stop();
+});
+
+test('one ADL event, one journal line: retries that did not level the pair are not journaled, the one that did is', async () => {
+  const leg = { venue: 'hyperliquid', symbol: 'ETH' } as unknown as TradeLeg;
+  const report = (retry: number, closed: boolean): AdlReport => ({
+    findings: [{ index: 0, leg, intent: -500n, pos: -300n, change: 'shrank' }], action: 'rehedge', targets: [-300n, 300n],
+    result: closed ? ({ status: 'closed', tx: [], notes: [] } as unknown as AdlReport['result']) : null,
+    summary: `ADL try ${retry}`, retry,
+  });
+  const answers = [report(0, false), null, null, report(1, false), null, report(2, true), null];
+  const adl = { check: async () => answers.shift() ?? null } as unknown as AdlWatch;
+  const { risk, journal } = rig({ adl });
+  for (let i = 0; i < 7; i++) {
+    await risk.tick();
+    await risk.adlRunning;
+  }
+  assert.deepEqual(journal().filter((j) => j.kind === 'adl').map((j) => [j.summary, j.numbers.retry]), [['ADL try 0', undefined], ['ADL try 2', 2]]);
 });
 
 // ---- HTTP: POST /stress through the engine server ----

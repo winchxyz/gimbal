@@ -8,7 +8,8 @@ import type { VenueId } from '@gimbal/shared';
 import type { LegOutcome, LegSide, TradeLeg } from '../trade/legs.ts';
 import { toQty } from '../trade/lots.ts';
 import { PairTrader } from '../trade/pair.ts';
-import { AdlWatch, UNWIND_BELOW, adlJournal, legChange } from './adl.ts';
+import type { AdlTrader } from './adl.ts';
+import { AdlWatch, CONFIRM_MS, RETRY_MS, UNWIND_BELOW, adlJournal, legChange } from './adl.ts';
 
 class Leg implements TradeLeg {
   readonly venue: VenueId;
@@ -21,6 +22,10 @@ class Leg implements TradeLeg {
   hold: Promise<void> | null = null;
   /** Called after the next position read answers (a test's hook into the read). */
   onRead: (() => void) | null = null;
+  /** Answers to the next position reads, in place of `pos` (a bad read). */
+  reads: bigint[] = [];
+  /** An order this says yes to fails (the venue refused it: proof nothing ran). */
+  reject: (side: LegSide, reduceOnly: boolean) => boolean = () => false;
   readonly #now: () => number;
 
   constructor(venue: VenueId, now: () => number, replayable = false) {
@@ -33,7 +38,7 @@ class Leg implements TradeLeg {
     return toQty('1000');
   }
   async position(): Promise<bigint> {
-    const p = this.pos;
+    const p = this.reads.length > 0 ? this.reads.shift()! : this.pos;
     const hook = this.onRead;
     this.onRead = null;
     hook?.();
@@ -41,6 +46,13 @@ class Leg implements TradeLeg {
   }
   async order(side: LegSide, size: bigint, reduceOnly: boolean): Promise<LegOutcome> {
     this.orders.push({ side, size, reduceOnly });
+    const ref = { venue: this.venue, side, size: String(size), reduceOnly, orderId: null, clientId: null, tx: [], sentAt: this.#now() };
+    if (this.reject(side, reduceOnly)) return { kind: 'failed', error: new Error('refused'), ref };
+    if (reduceOnly) {
+      // A reduce-only order never grows a position.
+      const next = this.pos + (side === 'BUY' ? size : -size);
+      if ((this.pos >= 0n && next > this.pos) || (this.pos <= 0n && next < this.pos)) return { kind: 'failed', error: new Error('reduce-only would increase'), ref };
+    }
     if (this.hold !== null) {
       const h = this.hold;
       this.hold = null;
@@ -61,8 +73,9 @@ function setup(options: { replayable?: boolean } = {}) {
   const other = new Leg(options.replayable ? 'orderly' : 'phoenix', clock.now, options.replayable ?? false);
   const trader = new PairTrader({ legs: [hl, other], priceBandBps: 100, clock, unsettledPollMs: null });
   const lines: string[] = [];
-  const adl = new AdlWatch(trader, { log: (l) => lines.push(l) });
-  return { hl, other, trader, adl, lines, advance: (ms: number) => { now += ms; } };
+  const sleeps: number[] = [];
+  const adl = new AdlWatch(trader, { log: (l) => lines.push(l), clock, sleep: async (ms) => { sleeps.push(ms); now += ms; } });
+  return { hl, other, trader, adl, lines, sleeps, advance: (ms: number) => { now += ms; } };
 }
 
 test('legChange: shrank toward zero, grew, flipped', () => {
@@ -171,4 +184,115 @@ test('a position that grew or flipped is not ADL: reported, nothing traded; no o
   hl.pos = toQty('0.1');
   assert.equal((await adl.check())!.action, 'none');
   assert.equal(hl.orders.length + other.orders.length, sent);
+});
+
+test('one bad read is not ADL: the change must be confirmed by a second read 3 s later', async () => {
+  const { hl, other, trader, adl, sleeps, lines } = setup();
+  await trader.open({ size: '0.5', longIndex: 1, reason: 'enter' });
+  // Hyperliquid left the coin out of assetPositions once: the leg reads 0, then -0.5 again.
+  hl.reads = [0n];
+  assert.equal(await adl.check(), null);
+  assert.deepEqual(sleeps, [CONFIRM_MS]);
+  assert.ok(lines.some((l) => /not confirmed by a read 3 s later/.test(l)));
+  assert.equal(hl.orders.length + other.orders.length, 2, 'nothing traded');
+  assert.equal(other.pos, toQty('0.5'));
+});
+
+test('a pair that was not hedged before (intents do not offset): nothing traded, the owner must act', async () => {
+  // The reviewer's case: the open came back unhedged (HL +1, Phoenix 0), then HL dropped to 0.6.
+  const { hl, other, trader, adl } = setup();
+  other.reject = () => true;
+  hl.reject = (_side, reduceOnly) => reduceOnly;
+  const opened = await trader.open({ size: '1', longIndex: 0, reason: 'enter' });
+  assert.equal(opened.status, 'unhedged');
+  assert.deepEqual([trader.intent(hl), trader.intent(other)], [toQty('1'), 0n]);
+  other.reject = () => false;
+  hl.reject = () => false;
+  const sent = hl.orders.length + other.orders.length;
+  hl.pos = toQty('0.6');
+  const report = await adl.check();
+  assert.equal(report!.action, 'none');
+  assert.match(report!.summary, /the pair was not hedged before \(intents 1 and 0\): nothing traded, the owner must act/);
+  assert.equal(hl.orders.length + other.orders.length, sent);
+  assert.equal(hl.pos, toQty('0.6'));
+  assert.equal(other.pos, 0n);
+});
+
+test('the ADL close is reduce-only only: when the partner will not reduce, nothing reopens the shrunk leg', async () => {
+  const { hl, other, trader, adl } = setup();
+  await trader.open({ size: '0.5', longIndex: 1, reason: 'enter' });
+  const before = hl.orders.length;
+  other.reject = (_side, reduceOnly) => reduceOnly;       // Phoenix refuses every reduce-only order
+  hl.pos = toQty('-0.3');
+  const report = await adl.check();
+  assert.equal(report!.action, 'rehedge');
+  assert.notEqual(report!.result!.status, 'closed');
+  assert.match(report!.result!.notes.join('; '), /not re-hedged: this close is reduce-only only/);
+  assert.equal(hl.orders.length, before, 'no order on the shrunk leg (a re-hedge would have sold it back to -0.5)');
+  assert.ok(other.orders.slice(1).every((o) => o.reduceOnly), 'every ADL order is reduce-only');
+  assert.equal(hl.pos, toQty('-0.3'));
+  assert.equal(other.pos, toQty('0.5'));
+});
+
+test('one event, one response: a close that failed is answered once, retried only after the backoff, journaled once', async () => {
+  const { hl, other, trader, adl, advance } = setup();
+  await trader.open({ size: '0.5', longIndex: 1, reason: 'enter' });
+  hl.pos = toQty('-0.3');
+  const real = trader.close.bind(trader);
+  let calls = 0;
+  (trader as unknown as { close: typeof real }).close = async (request) => {
+    calls++;
+    if (calls === 1) throw new Error('phoenix position read failed');
+    return real(request);
+  };
+  const first = await adl.check();
+  assert.match(first!.summary, /failed: phoenix position read failed/);
+  assert.equal(first!.result, null);
+  assert.equal(first!.retry, 0);
+  assert.equal(adlJournal(first!, 1).numbers.retry, undefined);
+  // Every 5 s after: the same finding, nothing sent, nothing to journal.
+  for (let i = 0; i < 5; i++) {
+    advance(5_000);
+    assert.equal(await adl.check(), null);
+  }
+  assert.equal(calls, 1);
+  assert.equal(other.pos, toQty('0.5'));
+  advance(RETRY_MS);
+  const retry = await adl.check();
+  assert.equal(calls, 2);
+  assert.equal(retry!.retry, 1);
+  assert.equal(retry!.result!.status, 'closed');
+  assert.equal(adlJournal(retry!, 1).numbers.retry, 1);
+  assert.equal(other.pos, toQty('0.3'));
+  assert.equal(await adl.check(), null, 'level again: nothing more');
+});
+
+test('a reduce-only close the venue refuses: the trader takes the pair as unhedged, and the watch sends nothing more', async () => {
+  const { hl, other, trader, adl, advance } = setup();
+  await trader.open({ size: '0.5', longIndex: 1, reason: 'enter' });
+  other.reject = (_side, reduceOnly) => reduceOnly;
+  hl.pos = toQty('-0.3');
+  const report = await adl.check();
+  assert.notEqual(report!.result!.status, 'closed');
+  assert.notEqual(trader.unhedged, null);
+  const sent = other.orders.length;
+  advance(RETRY_MS * 4);
+  assert.equal(await adl.check(), null);
+  assert.equal(other.orders.length, sent);
+});
+
+test('a leg with an unsettled order, even one past its window that the trader has not closed out, is not checked', async () => {
+  const leg = (venue: VenueId, pos: bigint) => ({ venue, symbol: 'ETH', lot: 1n, replayable: false, position: async () => pos }) as unknown as TradeLeg;
+  const a = leg('hyperliquid', -30n);
+  const b = leg('phoenix', 50n);
+  let closes = 0;
+  const trader: AdlTrader = {
+    legs: [a, b], busy: false, net: 0n,
+    watching: () => false,                                                  // its window has ended...
+    unsettled: (l) => (l === a ? { ref: {}, refs: [], until: 0 } : null),   // ...but the trader has not closed it out
+    intent: (l) => (l === a ? -50n : 50n),
+    close: async () => { closes++; throw new Error('must not close'); },
+  };
+  assert.equal(await new AdlWatch(trader, { sleep: async () => {} }).check(), null);
+  assert.equal(closes, 0);
 });

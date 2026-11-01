@@ -3,12 +3,19 @@
 // (thresholds.ts), and publishes:
 //   - `desk`: DeskState with the legs and the desk's health (the worst leg's level);
 //   - `health`: the HealthMap, when a venue, 1Click or NEAR changes state (venue-health.ts);
-//   - `journal`: `rescue` when the desk enters rescue, `adl` when a leg shrank without an order of ours (adl.ts),
+//   - `journal`: `rescue` for each rescue trigger, `adl` when a leg shrank without an order of ours (adl.ts),
 //     `error` when a venue stops answering;
 //   - `rescue`: a RescueProgress at step `detect` for each rescue trigger, unless a rescuer (E9) takes the trigger.
 //
-// Stress (POST /stress, testnet and replay only): raises the rescue line above the nearest leg's distance, so the
-// desk goes to rescue on the next read and the rescue starts; cleared with { "on": false }. On mainnet it is refused,
+// Rescue triggers are per leg. A leg that reaches rescue is triggered once; while it stays in rescue it is triggered
+// again only when its rescue failed (rescueEnded(id, false)) or lapsed (no end reported within RESCUE_LAPSE_MS), after
+// a backoff of RESCUE_RETRY_MS doubling up to RESCUE_RETRY_MAX_MS. A leg that leaves rescue starts afresh.
+//
+// The ADL check runs beside the reads, never inside them: its response trades (an MPC signature can take 120 s, a
+// close several), and reads, rescue triggers and POST /stress must go on meanwhile. One check runs at a time.
+//
+// Stress (POST /stress, testnet and replay only): raises the rescue line of the nearest leg above its distance, so it
+// goes to rescue on the next read and its rescue starts; cleared with { "on": false }. On mainnet it is refused,
 // whatever the request: a stress there would move real money.
 
 import type { DeskState, JournalEntry, Leg, Mode, RescueProgress, StrategyConfig, StreamEvent, VenueId } from '@gimbal/shared';
@@ -21,12 +28,17 @@ import { adlJournal } from './adl.ts';
 import type { LegRisk } from './margin.ts';
 import { legRisk, marginToReach } from './margin.ts';
 import type { HealthLevel, Lines } from './thresholds.ts';
-import { Volatility, healthFor, riskLines, worst } from './thresholds.ts';
+import { RESCUE_HORIZON_S, Volatility, levelFor, riskLines, worst } from './thresholds.ts';
 import type { VenueHealth } from './venue-health.ts';
 
 /** The stress line sits this many points above the nearest leg's distance, so price noise does not end it. */
 export const STRESS_MARGIN_PTS = 5;
 export const RISK_INTERVAL_MS = 5_000;
+/** A rescue with no end reported this long after its trigger counts as lapsed: twice the slow case. */
+export const RESCUE_LAPSE_MS = 2 * RESCUE_HORIZON_S * 1000;
+/** A failed or lapsed rescue of a leg still in rescue is triggered again after this, doubling, up to the max. */
+export const RESCUE_RETRY_MS = 30_000;
+export const RESCUE_RETRY_MAX_MS = 10 * 60_000;
 
 /** One desk leg as a source read it: the venue account that holds it and the position. */
 export interface LegInput {
@@ -56,7 +68,7 @@ export interface DeskSource {
   read(): Promise<DeskSnapshot>;
 }
 
-/** What starts a rescue: the leg nearest liquidation under its rescue line, and the margin that brings it back. */
+/** What starts a rescue: a leg under its rescue line, and the margin that brings it back. */
 export interface RescueTrigger {
   id: string;
   venue: VenueId;
@@ -69,6 +81,8 @@ export interface RescueTrigger {
   /** Where the margin would come from, by the simple rule here; E9 plans the real route. */
   from: VenueId | 'reserve';
   stress: boolean;
+  /** 0 on the first trigger of this leg's rescue; n after n failed or lapsed ones. */
+  attempt: number;
   at: number;
 }
 
@@ -90,7 +104,7 @@ export interface RiskEngineOptions {
   clock?: Clock;
   intervalMs?: number;
   adl?: AdlWatch;
-  /** E9: takes a trigger and runs the rescue. Without it the engine publishes the trigger as a `detect` step. */
+  /** E9: takes a trigger and runs the rescue, then calls rescueEnded. Without it the trigger is published at `detect`. */
   rescuer?: (trigger: RescueTrigger) => void;
   log?: (line: string) => void;
 }
@@ -103,18 +117,27 @@ interface LegView {
   freeMarginUsd: number;
 }
 
+/** A leg's rescue: the last trigger, when it ended (null: running), and how many came before it. */
+interface LegRescue {
+  trigger: RescueTrigger;
+  endedAt: number | null;
+  attempt: number;
+}
+
 export class RiskEngine {
   readonly #o: RiskEngineOptions;
   readonly #clock: Clock;
   readonly #vol = new Map<string, Volatility>();
   readonly #levels = new Map<string, HealthLevel>();
+  readonly #rescues = new Map<string, LegRescue>();
   #views: LegView[] = [];
   #desk: DeskState | null = null;
-  #stress: { rescuePct: number; at: number } | null = null;
+  #stress: { key: string; rescuePct: number; at: number } | null = null;
   #seq = 0;
   #timer: ReturnType<typeof setTimeout> | undefined;
   #running = false;
   #ticking: Promise<DeskState | null> | null = null;
+  #adlRun: Promise<void> | null = null;
   readonly #down = new Set<string>();
 
   constructor(options: RiskEngineOptions) {
@@ -128,6 +151,11 @@ export class RiskEngine {
 
   get stressLine(): number | null {
     return this.#stress?.rescuePct ?? null;
+  }
+
+  /** The running ADL check, if any (tests wait on it). */
+  get adlRunning(): Promise<void> | null {
+    return this.#adlRun;
   }
 
   /** The lines each leg was last judged by. */
@@ -154,6 +182,7 @@ export class RiskEngine {
     this.#running = false;
     clearTimeout(this.#timer);
     await this.#ticking;
+    await this.#adlRun;
   }
 
   /** One read of the desk, published. Ticks never overlap: a call during one waits for it and runs after. */
@@ -167,9 +196,18 @@ export class RiskEngine {
     }
   }
 
+  /** E9: a rescue ended. Landed: the leg starts afresh; failed: it is triggered again after the backoff if still in rescue. */
+  rescueEnded(id: string, landed: boolean): void {
+    for (const [k, r] of this.#rescues) {
+      if (r.trigger.id !== id) continue;
+      if (landed) this.#rescues.delete(k);
+      else r.endedAt = this.#clock.now();
+    }
+  }
+
   /**
-   * POST /stress: on = raise the rescue line above the nearest leg; off = back to the owner's lines. Refused on
-   * mainnet and when no leg is open. Runs a tick, so the answer carries the health it led to.
+   * POST /stress: on = raise the nearest leg's rescue line above its distance; off = back to the owner's lines.
+   * Refused on mainnet and when no leg is open. Runs a tick, so the answer carries the health it led to.
    */
   async stress(on: boolean): Promise<{ health: HealthLevel; rescueDistancePct: number | null }> {
     if (this.#o.mode === 'mainnet') {
@@ -182,15 +220,16 @@ export class RiskEngine {
       return { health: desk?.health ?? 'level', rescueDistancePct: null };
     }
     if (this.#desk === null) await this.tick();
-    const nearest = this.#views.reduce<number | null>((m, v) => {
+    const nearest = this.#views.reduce<LegView | null>((m, v) => {
       const d = v.leg.distanceToLiqPct;
-      return d === null ? m : m === null || d < m ? d : m;
+      return d === null ? m : m === null || d < m.leg.distanceToLiqPct! ? v : m;
     }, null);
     if (nearest === null) {
       throw new StressRefused(this.#views.length === 0 ? 'no leg is open: there is no margin to stress' : 'no leg has a liquidation price: there is no margin to stress', 409);
     }
-    this.#stress = { rescuePct: nearest + STRESS_MARGIN_PTS, at: this.#clock.now() };
-    this.#log(`stress on: rescue line ${this.#stress.rescuePct.toFixed(2)} %, ${STRESS_MARGIN_PTS} points over the nearest leg's ${nearest.toFixed(2)} %`);
+    const d = nearest.leg.distanceToLiqPct!;
+    this.#stress = { key: key(nearest.leg.venue, nearest.leg.symbol), rescuePct: d + STRESS_MARGIN_PTS, at: this.#clock.now() };
+    this.#log(`stress on: ${nearest.leg.venue} ${nearest.leg.symbol} rescue line ${this.#stress.rescuePct.toFixed(2)} %, ${STRESS_MARGIN_PTS} points over its ${d.toFixed(2)} %`);
     const desk = await this.tick();
     return { health: desk?.health ?? 'level', rescueDistancePct: this.#stress.rescuePct };
   }
@@ -221,22 +260,32 @@ export class RiskEngine {
       views.push({ ...old, level });
       this.#levels.set(key(old.leg.venue, old.leg.symbol), level);
     }
-    const before = this.#desk?.health ?? 'level';
     this.#views = views;
     const desk = this.#deskState(snap, views, t);
     this.#desk = desk;
     this.#o.publish({ type: 'desk', data: desk });
-    if (desk.health === 'rescue' && before !== 'rescue') this.#trigger(views, t);
+    this.#triggers(views, t);
+    this.#startAdl();
+    return desk;
+  }
 
-    if (this.#o.adl !== undefined) {
+  /** Starts the ADL check beside the reads when none runs (see the header). */
+  #startAdl(): void {
+    const adl = this.#o.adl;
+    if (adl === undefined || this.#adlRun !== null) return;
+    this.#adlRun = (async () => {
       try {
-        const report = await this.#o.adl.check();
-        if (report !== null) this.#journal({ ...adlJournal(report, this.#clock.now()) });
+        const report = await adl.check();
+        // One event, one journal line: a retry after a backoff is journaled only when it brought the pair level.
+        if (report !== null && (report.retry === 0 || report.result?.status === 'closed')) {
+          this.#journal({ ...adlJournal(report, this.#clock.now()) });
+        }
       } catch (err) {
         this.#log(`adl check failed: ${errorMessage(err)}`);
+      } finally {
+        this.#adlRun = null;
       }
-    }
-    return desk;
+    })();
   }
 
   #view(input: LegInput, strategy: StrategyConfig, t: number): LegView {
@@ -246,12 +295,12 @@ export class RiskEngine {
     if (vol === undefined) this.#vol.set(k, (vol = new Volatility()));
     vol.add(t, risk.mark);
     const lines = riskLines(strategy.risk, vol.sigmaPerSqrtS());
-    if (this.#stress !== null && this.#stress.rescuePct > lines.rescuePct) {
+    if (this.#stress !== null && this.#stress.key === k && this.#stress.rescuePct > lines.rescuePct) {
       const gap = strategy.risk.watchDistancePct - strategy.risk.rescueDistancePct;
       lines.rescuePct = this.#stress.rescuePct;
       lines.watchPct = Math.max(lines.watchPct, lines.rescuePct + gap);
     }
-    const level = healthFor(risk.distanceToLiqPct, lines, this.#levels.get(k) ?? 'level');
+    const level = levelFor(risk, lines, this.#levels.get(k) ?? 'level');
     this.#levels.set(k, level);
     const p = input.position;
     const leg: Leg = {
@@ -294,34 +343,60 @@ export class RiskEngine {
     };
   }
 
-  /** The desk entered rescue: the leg nearest its line is rescued first. */
-  #trigger(views: LegView[], t: number): void {
-    const rescuing = views.filter((v) => v.level === 'rescue' && v.risk !== null && v.leg.distanceToLiqPct !== null);
-    if (rescuing.length === 0) return;
-    const v = rescuing.reduce((a, b) => (b.leg.distanceToLiqPct! - b.lines.rescuePct < a.leg.distanceToLiqPct! - a.lines.rescuePct ? b : a));
+  /** Per leg (see the header): a first trigger, or another after a failed or lapsed one and its backoff. */
+  #triggers(views: LegView[], t: number): void {
+    const inRescue = new Set<string>();
+    // Nearest its line first, so the leg that bites first is rescued first.
+    const due = views
+      .filter((v) => v.level === 'rescue' && v.risk !== null)
+      .sort((a, b) => gapToLine(a) - gapToLine(b));
+    for (const v of due) {
+      const k = key(v.leg.venue, v.leg.symbol);
+      inRescue.add(k);
+      const r = this.#rescues.get(k);
+      if (r === undefined) {
+        this.#fire(v, views, t, 0);
+        continue;
+      }
+      const backoff = Math.min(RESCUE_RETRY_MAX_MS, RESCUE_RETRY_MS * 2 ** r.attempt);
+      const ended = r.endedAt ?? (t - r.trigger.at >= RESCUE_LAPSE_MS ? r.trigger.at + RESCUE_LAPSE_MS : null);
+      if (ended !== null && t >= ended + backoff) {
+        this.#log(`rescue ${r.trigger.id} of ${k} ${r.endedAt === null ? 'lapsed (no end reported)' : 'failed'}; the leg is still in rescue: again`);
+        this.#fire(v, views, t, r.attempt + 1);
+      }
+    }
+    for (const k of this.#rescues.keys()) if (!inRescue.has(k)) this.#rescues.delete(k);
+  }
+
+  #fire(v: LegView, views: LegView[], t: number, attempt: number): void {
+    const distance = v.leg.distanceToLiqPct ?? 0;
     // Up to the cent (less a hair of float noise, so 180.6 stays 180.60).
     const amountUsd = Math.ceil(marginToReach(v.risk!, v.leg.side, v.lines.watchPct) * 100 - 1e-6) / 100;
     // Orderly is never a source (four signatures and several hops); the partner leg's venue when its free margin
     // covers the amount, else the reserve.
-    const partner = views.find((o) => o !== v && o.leg.venue !== 'orderly' && o.freeMarginUsd >= amountUsd);
-    const stress = this.#stress !== null && v.lines.rescuePct === this.#stress.rescuePct;
+    const partner = views.find((o) => o !== v && o.leg.venue !== 'orderly' && o.leg.venue !== v.leg.venue && o.freeMarginUsd >= amountUsd);
+    const k = key(v.leg.venue, v.leg.symbol);
+    const stress = this.#stress !== null && this.#stress.key === k && v.lines.rescuePct === this.#stress.rescuePct;
     const trigger: RescueTrigger = {
       id: `rescue-${t.toString(36)}-${++this.#seq}`,
       venue: v.leg.venue, symbol: v.leg.symbol,
-      distancePct: v.leg.distanceToLiqPct!, rescuePct: v.lines.rescuePct, watchPct: v.lines.watchPct,
-      amountUsd, from: partner?.leg.venue ?? 'reserve', stress, at: t,
+      distancePct: distance, rescuePct: v.lines.rescuePct, watchPct: v.lines.watchPct,
+      amountUsd, from: partner?.leg.venue ?? 'reserve', stress, attempt, at: t,
     };
+    this.#rescues.set(k, { trigger, endedAt: null, attempt });
     const volNote = v.lines.volPct > 0 ? `, volatility term ${v.lines.volPct.toFixed(2)} %` : '';
+    const again = attempt > 0 ? ` (again: attempt ${attempt + 1})` : '';
     this.#journal({
       t, kind: 'rescue',
-      summary: `health rescue: ${v.leg.venue} ${v.leg.symbol} ${v.leg.side} is ${trigger.distancePct.toFixed(2)} % from liquidation, under the ${trigger.rescuePct.toFixed(2)} % rescue line${stress ? ' (stress test)' : ''}${volNote}; ${amountUsd.toFixed(2)} USD from ${trigger.from} brings it back to ${trigger.watchPct.toFixed(2)} %`,
+      summary: `health rescue${again}: ${v.leg.venue} ${v.leg.symbol} ${v.leg.side} is ${distance.toFixed(2)} % from liquidation, under the ${trigger.rescuePct.toFixed(2)} % rescue line${stress ? ' (stress test)' : ''}${volNote}; ${amountUsd.toFixed(2)} USD from ${trigger.from} brings it back to ${trigger.watchPct.toFixed(2)} %`,
       numbers: {
-        venue: v.leg.venue, distancePct: round2(trigger.distancePct), rescuePct: round2(trigger.rescuePct),
-        watchPct: round2(trigger.watchPct), amountUsd: trigger.amountUsd, from: trigger.from, ...(stress ? { stress: 1 } : {}),
+        venue: v.leg.venue, distancePct: round2(distance), rescuePct: round2(trigger.rescuePct),
+        watchPct: round2(trigger.watchPct), amountUsd: trigger.amountUsd, from: trigger.from,
+        ...(stress ? { stress: 1 } : {}), ...(attempt > 0 ? { attempt: attempt + 1 } : {}),
       },
       tx: [],
     });
-    this.#log(`rescue trigger ${trigger.id}: ${trigger.venue} ${trigger.symbol} at ${trigger.distancePct.toFixed(2)} % < ${trigger.rescuePct.toFixed(2)} %, ${amountUsd} USD from ${trigger.from}`);
+    this.#log(`rescue trigger ${trigger.id}: ${trigger.venue} ${trigger.symbol} at ${distance.toFixed(2)} % < ${trigger.rescuePct.toFixed(2)} %, ${amountUsd} USD from ${trigger.from}${again}`);
     if (this.#o.rescuer !== undefined) {
       this.#o.rescuer(trigger);
       return;
@@ -363,6 +438,11 @@ export class RiskEngine {
 
 function key(venue: VenueId, symbol: string): string {
   return `${venue} ${symbol}`;
+}
+
+/** How far under its rescue line a leg is (more negative = nearer liquidation relative to its line). */
+function gapToLine(v: LegView): number {
+  return (v.leg.distanceToLiqPct ?? 0) - v.lines.rescuePct;
 }
 
 function round2(x: number): number {

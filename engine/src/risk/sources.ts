@@ -10,7 +10,7 @@
 // clock runs. The positions are a script; every price and funding rate is the recording's. Its first read journals
 // what it opened, saying so.
 
-import type { StrategyConfig, VenueId } from '@gimbal/shared';
+import type { DeskState, StrategyConfig, VenueId } from '@gimbal/shared';
 import { errorMessage } from '../venues/recorder.ts';
 import type { AccountState, Clock, MarketFunding, Position, VenueReader } from '../venues/venue.ts';
 import type { DeskSnapshot, DeskSource, LegInput } from './engine.ts';
@@ -20,9 +20,12 @@ export interface AccountsDeskSourceOptions {
   owner: string;
   contract: string;
   accounts: { reader: Pick<VenueReader, 'id' | 'account'>; address: string }[];
-  /** The desk's USDC held back for rescues (get_desk's ledger.idle_usdc), USD. */
-  reserveUsd?: () => number;
-  paused?: () => { by: string; at: number } | null;
+  /**
+   * The desk's own state, read with every snapshot (serve: get_desk): the USDC held back for rescues (ledger.idle_usdc)
+   * and whether it is paused. A read that throws keeps the last answer (none yet: reserve 0, running) and is logged.
+   */
+  desk?: () => Promise<{ reserveUsd: number; paused: DeskState['paused'] }>;
+  log?: (line: string) => void;
   /** Lot size per venue and symbol; default 10^-8 (unknown). */
   lotSize?: (venue: VenueId, symbol: string) => number;
   now?: () => number;
@@ -30,6 +33,7 @@ export interface AccountsDeskSourceOptions {
 
 export class AccountsDeskSource implements DeskSource {
   readonly #o: AccountsDeskSourceOptions;
+  #desk: { reserveUsd: number; paused: DeskState['paused'] } = { reserveUsd: 0, paused: null };
 
   constructor(options: AccountsDeskSourceOptions) {
     this.#o = options;
@@ -37,6 +41,10 @@ export class AccountsDeskSource implements DeskSource {
 
   async read(): Promise<DeskSnapshot> {
     const now = this.#o.now ?? Date.now;
+    const deskRead = this.#o.desk?.().then(
+      (d) => { this.#desk = d; },
+      (err: unknown) => this.#o.log?.(`risk: the desk view could not be read, keeping the last one: ${errorMessage(err)}`),
+    );
     const reads = await Promise.all(this.#o.accounts.map(async ({ reader, address }) => {
       const started = now();
       try {
@@ -57,10 +65,11 @@ export class AccountsDeskSource implements DeskSource {
         });
       }
     }
+    await deskRead;
     return {
       deskId: this.#o.deskId, owner: this.#o.owner, contract: this.#o.contract,
-      reserveUsd: this.#o.reserveUsd?.() ?? 0,
-      paused: this.#o.paused?.() ?? null,
+      reserveUsd: this.#desk.reserveUsd,
+      paused: this.#desk.paused,
       legs,
       reads: reads.map(({ venue, ms, error }) => ({ venue, ms, error })),
     };

@@ -30,8 +30,6 @@ import { ContractRefusal, MpcTimeoutError, OutcomeUnknown, isMpcTimeout, parseRe
  */
 export const PAUSE_TGAS = 30;
 
-/** A stored price at most this old counts as fresh after a refresh: the default (and mainnet minimum) oracle_max_age_s. */
-export const PRICE_FRESH_S = 900;
 /** How often prices() is read back after refresh_prices. */
 export const PRICE_POLL_MS = 1_000;
 /**
@@ -157,13 +155,16 @@ export class NearContractClient implements ContractClient {
 
   /**
    * refresh_prices, then prices() must show, for every asset asked for, a newer stored price or one younger than
-   * `maxAgeS` (default PRICE_FRESH_S). The contract answers `true` without asking the oracle when every asset had a
+   * `maxAgeS`, which the caller must give (what its next call needs: under the desk's oracle_max_age_s, with room for
+   * that call; there is no default, so a 15-minute-old price is never "fresh" by accident). Age is against the local
+   * clock: the transport reads no block time, and NEAR's block time runs within a second or two of it. The contract answers `true` without asking the oracle when every asset had a
    * price stored, or was asked for, under 30 s ago (interfaces §1.3): the first case is fresh at once; in the second
    * the earlier ask's answer is still on its way, so prices() is polled every PRICE_POLL_MS for up to
    * PRICE_POLL_WINDOW_MS (the contract's 30 s ask window plus a margin) before it counts as missing.
    */
-  async refreshPrices(assets: string[], options: { maxAgeS?: number } = {}): Promise<TxRef[]> {
-    const maxAgeMs = (options.maxAgeS ?? PRICE_FRESH_S) * 1000;
+  async refreshPrices(assets: string[], options: { maxAgeS: number }): Promise<TxRef[]> {
+    if (!(options.maxAgeS > 0)) throw new Error(`refreshPrices: maxAgeS must be > 0, got ${options.maxAgeS}`);
+    const maxAgeMs = options.maxAgeS * 1000;
     const before = new Map((await this.prices()).map((p) => [p.asset, p.at_ms]));
     const r = await this.#call('refresh_prices', () => ({ assets }), 'same');
     if (r.value === false) throw new Error(`refresh_prices returned false in ${r.txHash}`);

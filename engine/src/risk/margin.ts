@@ -14,7 +14,12 @@
 // Each venue also states a liquidation price (HL liquidationPx, Phoenix's SDK liquidationPriceUsd, Orderly
 // estLiqPrice). The leg uses the nearer of the venue's price and the computed one: both are estimates, and the
 // one closer to the mark is the one that would bite first. On an account with more than one position the computed
-// price does not apply (other positions move its equity), so only the venue's is used.
+// price does not apply (other positions move its equity), so only the venue's is used. When the venue gives none
+// either, the distance comes from the account's margin: (equity − maintenance) ÷ the account's whole notional, the
+// move that would take the account to its maintenance if every position on it moved against it together (for a lone
+// position this is (e − m), within a factor 1 ± m of the exact distance). An unknown distance never reads as safe:
+// `distanceBasis` says where the number came from, and only 'none' (a long that price alone cannot liquidate) means
+// there is no liquidation to watch.
 
 import type { VenueId } from '@gimbal/shared';
 import type { AccountState, Position } from '../venues/venue.ts';
@@ -35,8 +40,13 @@ export interface LegRisk {
   computedLiqPx: number | null;
   /** Maintenance ÷ equity: 1 = liquidation (and above, already past it). */
   marginRatio: number;
-  /** How far the mark must move to reach liqPx, in percent; 0 when it is already there; null without a liqPx. */
+  /**
+   * How far the mark must move to reach liqPx, in percent (0 when it is already there); without a liqPx on an account
+   * with other positions, the account-margin estimate (see the header); null only when there is no liquidation price.
+   */
   distanceToLiqPct: number | null;
+  /** 'price': from liqPx; 'account': the account-margin estimate; 'none': price cannot liquidate it; 'unknown': no mark. */
+  distanceBasis: 'price' | 'account' | 'none' | 'unknown';
   /** Maintenance ÷ notional (m above). */
   maintenanceFraction: number;
   /** Equity ÷ notional (e above). */
@@ -90,13 +100,32 @@ export function legRisk(input: LegRiskInput): LegRisk {
   else if (computedDist === null) liqPx = venueLiqPx;
   else liqPx = computedDist < venueDist ? computed : venueLiqPx;
   const marginRatio = equity > 0 ? maintenance / equity : maintenance > 0 ? 1 : 0;
+  let distanceToLiqPct: number | null;
+  let distanceBasis: LegRisk['distanceBasis'];
+  if (!(mark > 0)) {
+    distanceToLiqPct = null;
+    distanceBasis = 'unknown';
+  } else if (equity <= maintenance && maintenance > 0) {
+    distanceToLiqPct = 0;
+    distanceBasis = 'account';
+  } else if (liqPx !== null) {
+    distanceToLiqPct = distancePct(side, mark, liqPx);
+    distanceBasis = 'price';
+  } else if (others > 0) {
+    distanceToLiqPct = accountNotional > 0 ? Math.max(0, (equity - maintenance) / accountNotional) * 100 : null;
+    distanceBasis = accountNotional > 0 ? 'account' : 'unknown';
+  } else {
+    distanceToLiqPct = null;
+    distanceBasis = 'none';
+  }
   return {
     mark,
     liqPx,
     venueLiqPx,
     computedLiqPx: computed,
     marginRatio: Math.max(0, marginRatio),
-    distanceToLiqPct: equity <= maintenance && maintenance > 0 ? 0 : distancePct(side, mark, liqPx),
+    distanceToLiqPct,
+    distanceBasis,
     maintenanceFraction: m,
     equityFraction: notionalUsd > 0 ? equity / notionalUsd : Infinity,
     notionalUsd,

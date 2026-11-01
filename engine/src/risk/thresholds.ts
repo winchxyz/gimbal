@@ -67,6 +67,21 @@ export function healthFor(distancePct: number | null, lines: Pick<Lines, 'watchP
   return 'level';
 }
 
+/**
+ * A leg's level from its risk: healthFor on its distance, except that equity at or under maintenance (margin ratio
+ * ≥ 1) is rescue whatever the distance says, and a distance that is not known is watched, never level; only a leg
+ * that price alone cannot liquidate (basis 'none') is level without a distance.
+ */
+export function levelFor(
+  risk: { distanceToLiqPct: number | null; distanceBasis: 'price' | 'account' | 'none' | 'unknown'; marginRatio: number },
+  lines: Pick<Lines, 'watchPct' | 'rescuePct'>,
+  before: HealthLevel = 'level',
+): HealthLevel {
+  if (risk.marginRatio >= 1) return 'rescue';
+  if (risk.distanceToLiqPct === null) return risk.distanceBasis === 'none' ? 'level' : worst([before, 'watch']);
+  return healthFor(risk.distanceToLiqPct, lines, before);
+}
+
 const RANK: Record<HealthLevel, number> = { level: 0, watch: 1, rescue: 2 };
 
 export function worst(levels: readonly HealthLevel[]): HealthLevel {

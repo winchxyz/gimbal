@@ -1,9 +1,10 @@
-// Venue health: a scan miss or a failed account read is down, a slow read or paused withdrawals slow; 1Click's probe;
+// Venue health: a scan miss or a failed account read is down, a slow read or paused withdrawals (reported by the
+// withdraw step, lapsing after a TTL) slow; 1Click's probe;
 // changed() hands out a map only when something changed.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { SLOW_READ_MS, VenueHealth, probeIntents, saysWithdrawalsPaused } from './venue-health.ts';
+import { SLOW_READ_MS, VenueHealth, WITHDRAWALS_PAUSED_TTL_MS, probeIntents } from './venue-health.ts';
 
 test('a scan miss or a failed read is down, a slow read slow; each clears when the venue answers again', () => {
   const h = new VenueHealth();
@@ -20,19 +21,34 @@ test('a scan miss or a failed read is down, a slow read slow; each clears when t
   assert.deepEqual(h.changed(), { intents: 'ok', near: 'ok', hyperliquid: 'ok', phoenix: 'ok', orderly: 'ok' });
 });
 
-test('withdrawals paused: the venue still answers, so slow (it cannot be a rescue source), with its words in detail', () => {
-  assert.ok(saysWithdrawalsPaused('Withdrawals are temporarily paused for maintenance'));
-  assert.ok(saysWithdrawalsPaused('withdraw disabled'));
-  assert.ok(saysWithdrawalsPaused('Deposits and withdrawals suspended'));
-  assert.ok(!saysWithdrawalsPaused('Insufficient USDC balance for token transfer gas'));
-  assert.ok(!saysWithdrawalsPaused('rate limited, retry later'));
-  const h = new VenueHealth();
+test('withdrawals paused: the venue still answers, so slow (it cannot be a rescue source); a withdraw that goes through clears it', () => {
+  let t = 0;
+  const h = new VenueHealth({ now: () => t });
+  // A failed read is down whatever its words: nothing guesses "paused" from an error message any more.
   h.readFailed('hyperliquid', new Error('Withdrawals are temporarily paused'));
+  assert.equal(h.map().hyperliquid, 'down');
+  assert.equal(h.detail('hyperliquid').withdrawalsPaused, null);
+  h.readOk('hyperliquid', 100);
+  // The withdraw step reports what the venue said, and clears it once a withdraw goes through.
+  h.withdrawals('hyperliquid', 'Withdrawals are temporarily paused');
   assert.equal(h.map().hyperliquid, 'slow');
   assert.equal(h.detail('hyperliquid').withdrawalsPaused, 'Withdrawals are temporarily paused');
-  assert.equal(h.detail('hyperliquid').readError, null);
   h.withdrawals('hyperliquid', null);
   assert.equal(h.map().hyperliquid, 'ok');
+});
+
+test('a withdrawals-paused report with no news lapses after its TTL; a fresh report restarts it', () => {
+  let t = 0;
+  const h = new VenueHealth({ now: () => t });
+  h.withdrawals('phoenix', 'withdrawals suspended');
+  t += WITHDRAWALS_PAUSED_TTL_MS - 1;
+  assert.equal(h.map().phoenix, 'slow');
+  h.withdrawals('phoenix', 'withdrawals suspended');      // reported again: counts from now
+  t += WITHDRAWALS_PAUSED_TTL_MS - 1;
+  assert.equal(h.detail('phoenix').status, 'slow');
+  t += 1;
+  assert.equal(h.map().phoenix, 'ok');
+  assert.equal(h.detail('phoenix').withdrawalsPaused, null);
 });
 
 test('1Click and NEAR come in as given; the 1Click probe is down on an error or a non-2xx, slow over 5 s', async () => {

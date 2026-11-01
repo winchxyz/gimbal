@@ -243,7 +243,7 @@ export interface ContractClient extends OrderlySigner {
 
   // prices and pause
   /** `maxAgeS`: a stored price this young counts as refreshed (the contract skips an asset asked for under 30 s ago). */
-  refreshPrices(assets: string[], options?: { maxAgeS?: number }): Promise<TxRef[]>;
+  refreshPrices(assets: string[], options: { maxAgeS: number }): Promise<TxRef[]>;
   pause(deskId: string): Promise<TxRef[]>;
 
   // Hyperliquid

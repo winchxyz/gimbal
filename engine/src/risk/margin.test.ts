@@ -100,3 +100,24 @@ test('equity at or under maintenance: ratio ≥ 1 and distance 0; an over-collat
   // A short always has one: (2500 + 2000) / 1.02.
   near(computedLiqPx(-1, 2000, 2500, 0.02), 4500 / 1.02, 1e-9);
 });
+
+test('two positions, no venue liquidation price, equity 2 % over maintenance: the account margin gives the distance, not null', () => {
+  // The reviewer's case: this read as `level` (distance null) on a margin ratio of 0.98.
+  const eth: Position = { symbol: 'ETH', size: -10, entryPx: 2000, liqPx: null, marginUsd: 1000, unrealizedPnlUsd: 0, leverage: 20, fundingSinceOpenUsd: 0, unsettledFundingUsd: 0 };
+  const dust: Position = { symbol: 'SOL', size: 0.01, entryPx: 150, liqPx: null, marginUsd: 1, unrealizedPnlUsd: 0, leverage: 1, fundingSinceOpenUsd: 0, unsettledFundingUsd: 0 };
+  const account: AccountState = { venue: 'phoenix', address: 'x', time: 0, equityUsd: 510, freeMarginUsd: 0, maintenanceMarginUsd: 500, positions: [eth, dust] };
+  const r = legRisk({ venue: 'phoenix', account, position: eth, markPx: null });
+  near(r.marginRatio, 500 / 510, 1e-12);
+  assert.equal(r.liqPx, null);
+  assert.equal(r.distanceBasis, 'account');
+  // (510 - 500) / (20000 + 1.5) of the account's notional.
+  near(r.distanceToLiqPct, 10 / 20001.5 * 100, 1e-9);
+  // No mark at all: unknown, not "no liquidation price".
+  const blind = legRisk({ venue: 'phoenix', account, position: { ...eth, entryPx: 0 }, markPx: null });
+  assert.equal(blind.distanceToLiqPct, null);
+  assert.equal(blind.distanceBasis, 'unknown');
+  // A lone over-collateralised long: price alone cannot liquidate it, and that is known.
+  const p: Position = { symbol: 'ETH', size: 1, entryPx: 2000, liqPx: null, marginUsd: 40, unrealizedPnlUsd: 0, leverage: 50, fundingSinceOpenUsd: 0, unsettledFundingUsd: 0 };
+  const safe = legRisk({ venue: 'hyperliquid', account: { venue: 'hyperliquid', address: '', time: 1, equityUsd: 2500, freeMarginUsd: 0, maintenanceMarginUsd: 40, positions: [p] }, position: p, markPx: 2000 });
+  assert.equal(safe.distanceBasis, 'none');
+});

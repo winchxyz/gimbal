@@ -224,13 +224,23 @@ if (mode === 'replay') {
     { reader: reader('hyperliquid'), address: side.desk.evm_address },
     { reader: reader('phoenix'), address: side.desk.solana.authority },
   ].filter((a): a is { reader: NonNullable<typeof a.reader>; address: string } => a.reader !== undefined && a.address !== '');
+  // get_desk says only whether the desk is paused, not who paused it or when (that is in its `paused` event): `at` is
+  // when this engine first saw it paused, `by` is unknown.
+  let pausedSince: number | null = null;
   deskSource = new AccountsDeskSource({
-    deskId: deskId!, owner: side.desk.owner, contract: side.client.contractId, accounts,
-    reserveUsd: () => Number(side.desk.ledger.idle_usdc) / 1e6,
+    deskId: deskId!, owner: side.desk.owner, contract: side.client.contractId, accounts, log,
+    desk: async () => {
+      const view = await side.client.getDesk(deskId!);
+      if (view === null) throw new Error(`get_desk(${deskId}) answered null`);
+      pausedSince = view.paused ? (pausedSince ?? Date.now()) : null;
+      return { reserveUsd: Number(view.ledger.idle_usdc) / 1e6, paused: pausedSince === null ? null : { by: 'unknown', at: pausedSince } };
+    },
   });
   log(`risk: reading the desk's ${accounts.map((a) => a.reader.id).join(' and ')} accounts every 5 s (Orderly legs need its private stream, which serve does not open)`);
 }
 if (deskSource !== null) {
+  // TODO(day 10): pass `adl: new AdlWatch(pairTrader, ...)` once serve holds the strategy engine's PairTrader; until
+  // then nothing here trades, and ADL is checked only where a PairTrader runs.
   risk = new RiskEngine({
     mode, source: deskSource, strategy: () => server?.strategy ?? DEFAULT_STRATEGY, health: venueHealth, publish, clock, log,
   });

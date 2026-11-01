@@ -2,9 +2,13 @@
 //
 // A venue is the worst of what the engine has seen of it:
 //   - down: the last scan could not read it, or the risk engine's last account read failed (API error, timeout);
-//   - slow: the account read answered but took over SLOW_READ_MS, or the venue said withdrawals are paused (it still
-//     trades, but it cannot be a rescue source: E9 reads that from `detail()`, since HealthMap has no word for it);
+//   - slow: the account read answered but took over SLOW_READ_MS, or withdrawals are paused there (it still trades,
+//     but it cannot be a rescue source: E9 reads that from `detail()`, since HealthMap has no word for it);
 //   - ok otherwise.
+// Paused withdrawals: none of the readers can see them, no venue API the engine reads states it. What sets it is the
+// withdraw step itself (E9): a venue refusing a withdraw because withdrawals are paused calls withdrawals(venue,
+// reason), and a withdraw that goes through clears it with withdrawals(venue, null). With no news a report expires
+// after WITHDRAWALS_PAUSED_TTL_MS, so one refusal does not mark a venue for good.
 // 1Click is probed (GET /v0/tokens, public, no key): an error or a non-2xx is down, an answer over SLOW_READ_MS slow.
 // NEAR comes from the contract client's own health (the operator key's budget, slow MPC signatures).
 
@@ -19,6 +23,8 @@ export type HealthStatus = HealthMap[HealthKey];
 /** An account read slower than this marks the venue slow (venue reads usually answer in well under a second). */
 export const SLOW_READ_MS = 5_000;
 export const ONE_CLICK_URL = 'https://1click.chaindefuser.com/v0';
+/** A "withdrawals paused" report counts this long, unless reported again or cleared. */
+export const WITHDRAWALS_PAUSED_TTL_MS = 15 * 60_000;
 
 /** What the tracker knows of one venue beyond its HealthMap word. */
 export interface VenueDetail {
@@ -26,24 +32,20 @@ export interface VenueDetail {
   scanFailed: boolean;
   readError: string | null;
   readMs: number | null;
-  withdrawalsPaused: string | null;   // the venue's words, when it said so
+  withdrawalsPaused: string | null;   // the venue's words, while the report counts
 }
-
-/** A venue error that says withdrawals are paused (or disabled, halted, suspended). */
-export function saysWithdrawalsPaused(message: string): boolean {
-  return /withdraw\w*\b[^.]{0,40}\b(paused|disabled|halted|suspended|unavailable)|(paused|disabled|halted|suspended)\b[^.]{0,40}\bwithdraw/i.test(message);
-}
-
-const RANK: Record<HealthStatus, number> = { ok: 0, slow: 1, down: 2 };
 
 export class VenueHealth {
   readonly #venues = new Map<VenueId, VenueDetail>();
+  readonly #pausedAt = new Map<VenueId, number>();
+  readonly #now: () => number;
   #intents: HealthStatus = 'ok';
   #intentsDetail: string | null = null;
   #near: NearHealth = 'ok';
   #last: HealthMap | null = null;
 
-  constructor() {
+  constructor(options: { now?: () => number } = {}) {
+    this.#now = options.now ?? Date.now;
     for (const v of DESK_VENUE_IDS) this.#venues.set(v, { status: 'ok', scanFailed: false, readError: null, readMs: null, withdrawalsPaused: null });
   }
 
@@ -60,21 +62,21 @@ export class VenueHealth {
     d.readMs = ms;
   }
 
-  /** An account read (or any venue call) that failed; a message saying withdrawals are paused also sets that. */
+  /** An account read (or any venue call) that failed. */
   readFailed(venue: VenueId, err: unknown): void {
     const d = this.#venues.get(venue)!;
-    const message = errorMessage(err);
-    if (saysWithdrawalsPaused(message)) {
-      d.withdrawalsPaused = message;
-      return;                             // the venue answered: it is up, its withdrawals are not
-    }
-    d.readError = message;
+    d.readError = errorMessage(err);
     d.readMs = null;
   }
 
-  /** What a venue said about withdrawals; null clears it. */
+  /**
+   * What the withdraw step learnt (see the header): the venue's words when it refused a withdraw because withdrawals
+   * are paused; null after a withdraw went through.
+   */
   withdrawals(venue: VenueId, paused: string | null): void {
     this.#venues.get(venue)!.withdrawalsPaused = paused;
+    if (paused === null) this.#pausedAt.delete(venue);
+    else this.#pausedAt.set(venue, this.#now());
   }
 
   intents(status: HealthStatus, detail: string | null = null): void {
@@ -87,6 +89,7 @@ export class VenueHealth {
   }
 
   detail(venue: VenueId): VenueDetail {
+    this.#expire();
     const d = this.#venues.get(venue)!;
     return { ...d, status: this.#status(d) };
   }
@@ -96,6 +99,7 @@ export class VenueHealth {
   }
 
   map(): HealthMap {
+    this.#expire();
     const map = { intents: this.#intents, near: this.#near } as HealthMap;
     for (const [v, d] of this.#venues) map[v] = this.#status(d);
     return map;
@@ -110,15 +114,19 @@ export class VenueHealth {
     return next;
   }
 
+  #expire(): void {
+    for (const [venue, at] of this.#pausedAt) {
+      if (this.#now() - at < WITHDRAWALS_PAUSED_TTL_MS) continue;
+      this.#pausedAt.delete(venue);
+      this.#venues.get(venue)!.withdrawalsPaused = null;
+    }
+  }
+
   #status(d: VenueDetail): HealthStatus {
     if (d.scanFailed || d.readError !== null) return 'down';
     if ((d.readMs !== null && d.readMs > SLOW_READ_MS) || d.withdrawalsPaused !== null) return 'slow';
     return 'ok';
   }
-}
-
-export function worse(a: HealthStatus, b: HealthStatus): HealthStatus {
-  return RANK[a] >= RANK[b] ? a : b;
 }
 
 /**

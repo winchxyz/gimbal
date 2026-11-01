@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { AccountState, Position } from '../venues/venue.ts';
 import { legRisk } from './margin.ts';
-import { HYSTERESIS_PTS, MPC_SLOW_S, ONE_CLICK_SLOW_S, RESCUE_HORIZON_S, RESCUE_Z, Volatility, healthFor, riskLines, worst } from './thresholds.ts';
+import { HYSTERESIS_PTS, MPC_SLOW_S, ONE_CLICK_SLOW_S, RESCUE_HORIZON_S, RESCUE_Z, Volatility, healthFor, levelFor, riskLines, worst } from './thresholds.ts';
 
 const RISK = { watchDistancePct: 15, rescueDistancePct: 8 };
 
@@ -100,4 +100,15 @@ test('volatility: Σ squared log returns over the time they span, nothing under 
   const windowed = new Volatility({ windowMs: 10_000, minReturns: 2 });
   for (let i = 0; i <= 20; i++) windowed.add(i * 1000, i <= 10 ? (i % 2 === 0 ? 100 : 110) : 100);
   assert.equal(windowed.sigmaPerSqrtS(), 0, 'the jumpy first 10 s are out of the window');
+});
+
+test('level from a leg: margin ratio 1 or more is rescue; an unknown distance is never safe (watch at least); none is level', () => {
+  const lines = { watchPct: 15, rescuePct: 8 };
+  // The reviewer's case: 0.05 % from the account margin, ratio 0.98.
+  assert.equal(levelFor({ distanceToLiqPct: 0.05, distanceBasis: 'account', marginRatio: 0.98 }, lines), 'rescue');
+  assert.equal(levelFor({ distanceToLiqPct: null, distanceBasis: 'unknown', marginRatio: 0.2 }, lines), 'watch');
+  assert.equal(levelFor({ distanceToLiqPct: null, distanceBasis: 'unknown', marginRatio: 0.2 }, lines, 'rescue'), 'rescue', 'unknown does not clear a rescue');
+  assert.equal(levelFor({ distanceToLiqPct: null, distanceBasis: 'none', marginRatio: 0.02 }, lines), 'level');
+  assert.equal(levelFor({ distanceToLiqPct: 50, distanceBasis: 'price', marginRatio: 1 }, lines), 'rescue');
+  assert.equal(levelFor({ distanceToLiqPct: 12, distanceBasis: 'price', marginRatio: 0.3 }, lines), 'watch');
 });

@@ -237,8 +237,12 @@ export class PairTrader {
     return this.#serial(() => this.#open(request));
   }
 
-  /** Brings both legs to `targets` (default flat) with reduce-only orders. */
-  close(request: { reason: string; targets?: [bigint, bigint] }): Promise<PairResult> {
+  /**
+   * Brings both legs to `targets` (default flat) with reduce-only orders. A leg that stays open is normally re-hedged by
+   * reopening its partner against it (not reduce-only); `reduceOnly: true` forbids that step, so nothing this close
+   * sends can open or grow a position (the ADL response): the pair is then left stuck or unhedged, with the alert.
+   */
+  close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean }): Promise<PairResult> {
     return this.#serial(() => this.#close(request));
   }
 
@@ -291,6 +295,11 @@ export class PairTrader {
   /** What the pair means each leg to hold now (null: unknown; undefined: no open or close yet). */
   intent(leg: TradeLeg): bigint | null | undefined {
     return this.#intent.get(leg);
+  }
+
+  /** What both legs together should hold: the sum of the last open's or close's targets (0 for a plain pair). */
+  get net(): bigint {
+    return this.#net;
   }
 
   /**
@@ -346,7 +355,7 @@ export class PairTrader {
     return this.#result(hedged(runs, net) ? 'stuck' : 'unhedged', size, runs, notes, net);
   }
 
-  async #close(request: { reason: string; targets?: [bigint, bigint] }): Promise<PairResult> {
+  async #close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean }): Promise<PairResult> {
     const targets = request.targets ?? [0n, 0n];
     // Not refused while an order has no answer: a reduce-only close cannot double it, and its watch stays on.
     const starts = await Promise.all(this.legs.map((leg) => leg.position()));
@@ -395,6 +404,10 @@ export class PairTrader {
     if (residual === 0n) {
       notes.push('the legs that stayed open still offset each other: hedged, not closed');
       return this.#result('stuck', size, runs, notes, net);
+    }
+    if (request.reduceOnly === true) {
+      notes.push('not re-hedged: this close is reduce-only only, and a re-hedge would reopen a leg');
+      return this.#stop(size, runs, notes, net);
     }
     const lighter = abs(exposure(a)) <= abs(exposure(b)) ? a : b;
     const hedgeTo = lighter.pos! - residual;

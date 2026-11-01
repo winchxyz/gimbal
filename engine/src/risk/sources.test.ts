@@ -3,6 +3,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import type { DeskState } from '@gimbal/shared';
 import type { AccountState } from '../venues/venue.ts';
 import { AccountsDeskSource } from './sources.ts';
 
@@ -17,7 +18,7 @@ test('accounts: open positions become legs, a flat one does not, a failed read i
   };
   const asked: string[] = [];
   const source = new AccountsDeskSource({
-    deskId: 'alpha', owner: 'owner.near', contract: 'gimbal.near', reserveUsd: () => 12.5, now: () => t,
+    deskId: 'alpha', owner: 'owner.near', contract: 'gimbal.near', desk: async () => ({ reserveUsd: 12.5, paused: null }), now: () => t,
     lotSize: (venue, symbol) => (venue === 'hyperliquid' && symbol === 'ETH' ? 1e-4 : 1e-8),
     accounts: [
       { reader: { id: 'hyperliquid', account: async (a) => { asked.push(a); t += 150; return hl; } }, address: '0xdesk' },
@@ -29,4 +30,26 @@ test('accounts: open positions become legs, a flat one does not, a failed read i
   assert.deepEqual(snap.legs.map((l) => [l.venue, l.symbol, l.position.size, l.lotSize]), [['hyperliquid', 'ETH', -1, 1e-4]]);
   assert.equal(snap.reserveUsd, 12.5);
   assert.deepEqual(snap.reads.map((r) => [r.venue, r.error]), [['hyperliquid', null], ['phoenix', 'phoenix trader: 503']]);
+});
+
+test('the reserve and the pause are read again with every snapshot; a read that throws keeps the last answer', async () => {
+  const answers: (() => { reserveUsd: number; paused: DeskState['paused'] })[] = [
+    () => ({ reserveUsd: 20, paused: null }),
+    () => ({ reserveUsd: 5, paused: { by: 'owner', at: 7 } }),
+    () => { throw new Error('near rpc: 502'); },
+  ];
+  const lines: string[] = [];
+  let reads = 0;
+  const source = new AccountsDeskSource({
+    deskId: 'alpha', owner: 'owner.near', contract: 'gimbal.near', accounts: [], log: (l) => lines.push(l),
+    desk: async () => answers[reads++]!(),
+  });
+  const first = await source.read();
+  assert.deepEqual([first.reserveUsd, first.paused], [20, null]);
+  const second = await source.read();
+  assert.deepEqual([second.reserveUsd, second.paused], [5, { by: 'owner', at: 7 }]);
+  const third = await source.read();
+  assert.deepEqual([third.reserveUsd, third.paused], [5, { by: 'owner', at: 7 }]);
+  assert.equal(reads, 3);
+  assert.match(lines.join(' | '), /desk view could not be read, keeping the last one: near rpc: 502/);
 });

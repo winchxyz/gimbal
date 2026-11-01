@@ -326,11 +326,11 @@ test('refresh_prices is read back: every asset asked for needs a newer stored pr
   let at = 5;
   chain.live.set('prices {}', () => [{ asset: 'ETH', price_e8: 250_000_000_000, at_ms: at }]);
   chain.answers.push(() => { at = 9; return { txHash: '', ok: true, value: null }; });
-  assert.equal((await client(chain).refreshPrices(['ETH'])).length, 1);
+  assert.equal((await client(chain).refreshPrices(['ETH'], { maxAgeS: 900 })).length, 1);
   chain.answers.push(() => ({ txHash: '', ok: true, value: null }));
-  await assert.rejects(client(chain).refreshPrices(['ETH', 'BTC']), /prices\(\) has no newer price, nor one under 900 s old, for ETH, BTC after 35 s/);
+  await assert.rejects(client(chain).refreshPrices(['ETH', 'BTC'], { maxAgeS: 900 }), /prices\(\) has no newer price, nor one under 900 s old, for ETH, BTC after 35 s/);
   chain.answers.push(() => ({ txHash: '', ok: true, value: false }));
-  await assert.rejects(client(chain).refreshPrices(['ETH']), /returned false/);
+  await assert.rejects(client(chain).refreshPrices(['ETH'], { maxAgeS: 900 }), /returned false/);
 });
 
 test('refresh_prices that skipped (asked under 30 s ago): prices() is polled until the earlier ask lands, up to 35 s', async () => {
@@ -346,7 +346,7 @@ test('refresh_prices that skipped (asked under 30 s ago): prices() is polled unt
   });
   chain.answers.push(() => ({ txHash: '', ok: true, value: true }));
   const c = client(chain, { now: () => t, sleep: async (ms) => { t += ms; } });
-  assert.equal((await c.refreshPrices(['ETH'])).length, 1);
+  assert.equal((await c.refreshPrices(['ETH'], { maxAgeS: 900 })).length, 1);
   assert.equal(reads, 13);
   assert.equal(t, 1_000_000 + 11_000, 'polled once a second until it landed');
 
@@ -356,24 +356,34 @@ test('refresh_prices that skipped (asked under 30 s ago): prices() is polled unt
   never.answers.push(() => ({ txHash: '', ok: true, value: true }));
   let u = 5_000_000;
   const n = client(never, { now: () => u, sleep: async (ms) => { u += ms; } });
-  await assert.rejects(n.refreshPrices(['ETH']), /after 35 s/);
+  await assert.rejects(n.refreshPrices(['ETH'], { maxAgeS: 900 }), /after 35 s/);
   assert.equal(u, 5_000_000 + 35_000);
 });
 
-test('refresh_prices that skipped because the stored price is fresh succeeds at once, without a newer price', async () => {
+test('refresh_prices that skipped because the stored price is fresh enough for the caller succeeds at once', async () => {
   const chain = new FakeChain();
   const t = 10_000_000;
-  // Mainnet: an oracle price is up to 10 min old when stored; 700 s is fresh under the default 900 s.
+  // Mainnet: an oracle price is up to 10 min old when stored; 700 s is fresh for a caller that asks for 900 s.
   chain.live.set('prices {}', () => [{ asset: 'ETH', price_e8: 250_000_000_000, at_ms: t - 700_000 }]);
   chain.answers.push(() => ({ txHash: '', ok: true, value: true }));
   let slept = 0;
   const c = client(chain, { now: () => t, sleep: async (ms) => { slept += ms; } });
-  assert.equal((await c.refreshPrices(['ETH'])).length, 1);
+  assert.equal((await c.refreshPrices(['ETH'], { maxAgeS: 900 })).length, 1);
   assert.equal(slept, 0);
   // A caller that needs it younger (relay-hl asks for oracle_max_age_s - 30) waits for a newer one instead.
   chain.answers.push(() => ({ txHash: '', ok: true, value: true }));
   await assert.rejects(c.refreshPrices(['ETH'], { maxAgeS: 600 }), /nor one under 600 s old, for ETH/);
   assert.equal(slept, 35_000);
+});
+
+test('refreshPrices has no default freshness: a caller must say how fresh it needs the price, and more than 0 s', async () => {
+  const chain = new FakeChain();
+  const c = client(chain, { sleep: async () => {} });
+  const sent = chain.answers.length;
+  await assert.rejects(c.refreshPrices(['ETH'], { maxAgeS: 0 }), /maxAgeS must be > 0, got 0/);
+  await assert.rejects(c.refreshPrices(['ETH'], { maxAgeS: Number.NaN }), /maxAgeS must be > 0/);
+  await assert.rejects((c.refreshPrices as (a: string[]) => Promise<unknown>)(['ETH']), TypeError);
+  assert.equal(chain.answers.length, sent, 'nothing sent');
 });
 
 test('a refusal code is read before "timed out": E_ORACLE_STALE that mentions a timeout stays a refusal', async () => {
