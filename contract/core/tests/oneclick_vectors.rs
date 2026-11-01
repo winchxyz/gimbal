@@ -45,6 +45,9 @@ fn quote<'a>(doc: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("no quote {name}"))
 }
 
+/// The desk owner of a case whose `ctx.desk` names none.
+const DEFAULT_OWNER: &str = "owner.near";
+
 /// The context of a field case.
 fn context(ctx: &Value) -> Context<'_> {
     let desk = &ctx["desk"];
@@ -54,6 +57,8 @@ fn context(ctx: &Value) -> Context<'_> {
             evm: s(&desk["evm"]),
             sol: s(&desk["sol"]),
             orderly_receiver: desk["orderly_receiver"].as_str(),
+            // Only fund_venue reads it (its refundTo); the cases of other methods leave it out.
+            owner: desk["owner"].as_str().unwrap_or(DEFAULT_OWNER),
         },
         contract: s(&ctx["contract"]),
         now_ms: ctx["now_ms"].as_u64().unwrap(),
@@ -401,4 +406,80 @@ fn a_quote_into_its_own_origin_asset_is_refused() {
     )
     .unwrap_err();
     assert_eq!(r.code, E_QUOTE_SIGNATURE);
+}
+
+/// `fund_venue` into the pinned Orderly receiver needs `minAmountOut` of at least 6 USDC, as the
+/// rescues do: the recorded quote with its floor moved to just below and exactly 6 USDC.
+#[test]
+fn fund_venue_to_orderly_needs_six_usdc_out() {
+    let [_, (_, live)] = files();
+    let name = "fund_venue: USDC on NEAR (contract) to the pinned Orderly receiver";
+    let q = quote(&live, name);
+    let c = live["field_cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == format!("as quoted: {name}"))
+        .unwrap();
+    let ctx = context(&c["ctx"]);
+    let canonical = s(&q["canonical_json"]);
+    let floor = r#""minAmountOut":"9892852""#;
+    assert_eq!(canonical.matches(floor).count(), 1);
+    let at = |min_out: &str| {
+        verify_quote(
+            sha256,
+            any_signature,
+            &canonical.replace(floor, &format!(r#""minAmountOut":"{min_out}""#)),
+            s(&q["signature"]),
+            Method::FundVenue,
+            &ctx,
+        )
+    };
+    let r = at("5999999").unwrap_err();
+    assert_eq!(r.code, E_QUOTE_FIELDS, "{r}");
+    assert!(
+        r.msg.contains("below 6 USDC for the Orderly receiver"),
+        "{r}"
+    );
+    assert_eq!(at("6000000").unwrap().min_amount_out_e8, 600_000_000);
+}
+
+/// Review item 1: a `fund_venue` quote refunds to the owner, so it must not be built to fail. Its
+/// `minAmountOut` leaves at least 0.5 % of `amountOut` (9,992,780 in the recorded quote, so at most
+/// 9,942,816); a quote with no room, or one tighter by a single unit, is refused.
+#[test]
+fn fund_venue_needs_half_a_percent_of_room_below_amount_out() {
+    let [_, (_, live)] = files();
+    let name = "fund_venue: USDC on NEAR (contract) to the pinned Orderly receiver";
+    let q = quote(&live, name);
+    let c = live["field_cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == format!("as quoted: {name}"))
+        .unwrap();
+    let ctx = context(&c["ctx"]);
+    let canonical = s(&q["canonical_json"]);
+    let floor = r#""minAmountOut":"9892852""#;
+    assert_eq!(canonical.matches(floor).count(), 1);
+    assert_eq!(canonical.matches(r#""amountOut":"9992780""#).count(), 1);
+    let at = |min_out: &str| {
+        verify_quote(
+            sha256,
+            any_signature,
+            &canonical.replace(floor, &format!(r#""minAmountOut":"{min_out}""#)),
+            s(&q["signature"]),
+            Method::FundVenue,
+            &ctx,
+        )
+    };
+    at("9942816").unwrap();
+    for tight in ["9942817", "9992780", "9992781"] {
+        let r = at(tight).unwrap_err();
+        assert_eq!(r.code, E_QUOTE_FIELDS, "{tight}: {r}");
+        assert!(
+            r.msg.contains("less than 0.5% below amountOut"),
+            "{tight}: {r}"
+        );
+    }
 }

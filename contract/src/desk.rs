@@ -33,6 +33,10 @@ pub struct Desk {
     /// The relayer IPs the owner allows the desk's orderly key from (`set_orderly_ips`), which
     /// `orderly_request` kind `ip_restriction` applies at Orderly; empty until set.
     pub orderly_ips: Vec<String>,
+    /// The desk's money on NEAR. Kept apart, in the contract's `money` map with the owner
+    /// ([`crate::money::DeskMoney`]), so a deposit or a payout writes a few fixed bytes and never
+    /// the desk record with its policy; `get_desk` fills it in.
+    #[borsh(skip)]
     pub ledger: Ledger,
 }
 
@@ -48,14 +52,19 @@ pub struct SolanaAccounts {
     pub phoenix_trader: String,
 }
 
-/// USDC in 1e-6. Money in and out passes through the contract on NEAR.
+/// USDC in 1e-6. Money in and out passes through the contract on NEAR. The fee formula over it is
+/// `gimbal_core::fees`: `withdrawn` counts every payout whole, its fee included, so the owner
+/// received `withdrawn − fees_paid`.
 #[near(serializers = [borsh, json])]
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Ledger {
     /// Principal: only the owner's own deposits (the base of the high-water mark).
     pub deposited: u128,
+    /// Every payout to the owner, its performance fee included.
     pub withdrawn: u128,
+    /// Every performance fee the treasury received.
     pub fees_paid: u128,
+    /// The highest profit (`withdrawn − deposited` at a payout) any payout reached; 0 at first.
     pub hwm: u128,
     /// USDC on NEAR held for the desk: owner deposits not yet sent out, plus 1Click returns and
     /// refunds. `fund_venue` and `withdraw_to_owner` spend from it.
@@ -240,6 +249,30 @@ pub fn policy_sha256(policy: &Policy) -> String {
     // Serialising plain structs of strings and integers cannot fail.
     let json = serde_json::to_vec(policy).unwrap_or_else(|_| env::abort());
     hex::encode(env::sha256_array(json))
+}
+
+impl From<Ledger> for gimbal_core::fees::Books {
+    fn from(l: Ledger) -> Self {
+        Self {
+            deposited: l.deposited,
+            withdrawn: l.withdrawn,
+            fees_paid: l.fees_paid,
+            hwm: l.hwm,
+            idle_usdc: l.idle_usdc,
+        }
+    }
+}
+
+impl From<gimbal_core::fees::Books> for Ledger {
+    fn from(b: gimbal_core::fees::Books) -> Self {
+        Self {
+            deposited: b.deposited,
+            withdrawn: b.withdrawn,
+            fees_paid: b.fees_paid,
+            hwm: b.hwm,
+            idle_usdc: b.idle_usdc,
+        }
+    }
 }
 
 #[cfg(test)]

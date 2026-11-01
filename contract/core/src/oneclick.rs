@@ -43,6 +43,14 @@ pub const NEAR_USDC: &str =
 /// deposit under 5 USDC, and the margin covers the transfer's own cost.
 pub const ORDERLY_MIN_OUT_E6: u128 = 6_000_000;
 
+/// The least room a `fund_venue` quote leaves between `amountOut` and `minAmountOut`, in bps of
+/// `amountOut` (0.5 %). 1Click refunds a deposit whose swap cannot reach `minAmountOut`, and a
+/// `fund_venue` refund goes to the desk owner: a quote with no room, made to fail, would hand the
+/// owner the desk's idle USDC (profit included) without the performance fee. The rule reads the
+/// signed amounts rather than the signed `slippageTolerance`, since they are what the swap is held
+/// to; 1Click derives `minAmountOut` from that tolerance (100 bps in every recorded quote).
+pub const FUND_VENUE_MIN_ROOM_BPS: u128 = 50;
+
 /// How long after its signed `timestamp` a quote can still be paid, ms. A live quote's `deadline`
 /// is three days out (1Click sets it to the requested deadline + 72 h, `oneclick-live.json`); a
 /// contract remembers the deposit addresses it paid only for a bounded time ([`QUOTE_PAYABLE_MS`]
@@ -77,7 +85,9 @@ pub enum Method {
     HlSendToIntents,
     /// From the desk's Arbitrum address, after an Orderly withdrawal (`refundTo` = the desk EVM).
     EvmUsdcToIntents,
-    /// From the contract's USDC on NEAR (`refundTo` = the contract), C8; no rescue cap.
+    /// From the contract's USDC on NEAR held for the desk (`refundTo` = the desk owner's NEAR
+    /// account); no rescue cap. A 1Click refund on NEAR is a plain `ft_transfer`, which calls
+    /// nothing in the receiver: to the contract it would credit no desk, so it goes to the owner.
     FundVenue,
 }
 
@@ -127,13 +137,15 @@ pub struct DeskAddresses<'a> {
     pub sol: &'a str,
     /// The pinned Orderly receiver on Arbitrum, lowercase, once set.
     pub orderly_receiver: Option<&'a str>,
+    /// The desk owner's NEAR account: `refundTo` of `fund_venue`.
+    pub owner: &'a str,
 }
 
 /// What a quote is checked against.
 #[derive(Clone, Copy, Debug)]
 pub struct Context<'a> {
     pub desk: DeskAddresses<'a>,
-    /// The contract's account id: `refundTo` of `fund_venue`, recipient of a payout.
+    /// The contract's account id: the recipient of a payout (venue → contract for the desk).
     pub contract: &'a str,
     /// The block time, ms: the deadline and the quote's age are checked against it.
     pub now_ms: u64,
@@ -197,7 +209,7 @@ struct Fields {
     amount_in_formatted: IgnoredAny,
     amount_in_usd: IgnoredAny,
     min_amount_in: IgnoredAny,
-    amount_out: IgnoredAny,
+    amount_out: String,
     amount_out_formatted: IgnoredAny,
     amount_out_usd: IgnoredAny,
     min_amount_out: String,
@@ -291,11 +303,11 @@ pub fn verify_quote(
     let refund_to_ok = match method {
         Method::SolSignRescue => f.refund_to == ctx.desk.sol,
         Method::HlSendToIntents | Method::EvmUsdcToIntents => same_evm(&f.refund_to, ctx.desk.evm),
-        // TODO(C8 fund_venue): a 1Click refund to refundTo = the contract most likely arrives as
-        // a plain `ft_transfer` (no `ft_on_transfer`, no msg), which credits no desk: fund_venue
-        // must record the deposit address it paid per desk and credit a refund from it, or the
-        // owner's USDC sits in the contract unassigned.
-        Method::FundVenue => f.refund_to == ctx.contract,
+        // 1Click refunds USDC on NEAR with a plain `ft_transfer` (intents' `ft_withdraw` without
+        // a msg), which tells the receiver nothing. Refunded to the contract it would credit no
+        // desk, and the contract cannot tell whose it is: the refund goes to the owner instead,
+        // whose money it is (fund_venue spends the desk's idle USDC).
+        Method::FundVenue => f.refund_to == ctx.desk.owner,
     };
     if !refund_to_ok {
         return Err(fields(format!(
@@ -314,6 +326,9 @@ pub fn verify_quote(
 
     let min_amount_out = integer("minAmountOut", &f.min_amount_out)?;
     check_recipient(&f, min_amount_out, ctx)?;
+    if method == Method::FundVenue {
+        check_room(integer("amountOut", &f.amount_out)?, min_amount_out)?;
+    }
 
     // Rules of this contract besides the vectors' field rule.
     if f.swap_type != "EXACT_INPUT" {
@@ -452,6 +467,18 @@ fn check_recipient(f: &Fields, min_amount_out: u128, ctx: &Context) -> Result<()
     )))
 }
 
+/// [`FUND_VENUE_MIN_ROOM_BPS`]: `amountOut − minAmountOut ≥ amountOut × 0.5 %`, exactly
+/// (`E_QUOTE_FIELDS`).
+fn check_room(amount_out: u128, min_amount_out: u128) -> Result<(), Refusal> {
+    let room = amount_out.saturating_sub(min_amount_out);
+    if room.saturating_mul(10_000) < amount_out.saturating_mul(FUND_VENUE_MIN_ROOM_BPS) {
+        return Err(fields(format!(
+            "minAmountOut {min_amount_out} leaves less than 0.5% below amountOut {amount_out}: a              swap held that tight is likely to fail, and fund_venue's refund goes to the owner"
+        )));
+    }
+    Ok(())
+}
+
 /// The deposit address in the form the method pays: a 32-byte base58 Solana address, or an EVM
 /// address returned in lowercase.
 fn deposit_form(method: Method, address: &str) -> Result<String, Refusal> {
@@ -515,6 +542,14 @@ pub fn transfer_cost_e8(q: &VerifiedQuote) -> u128 {
 pub fn rescue_cost_budget_e8(cap_usd: u64, max_bps: u32, max_flat_e6: u64) -> u128 {
     let share = u128::from(cap_usd) * 100_000_000 * u128::from(max_bps) / 10_000;
     share.max(2 * u128::from(max_flat_e6) * 100)
+}
+
+/// What a desk's `fund_venue` transfers of an hour may cost together, USD × 1e8: four transfers
+/// (both legs funded twice) at the policy's per-transfer bound ([`check_cost`]) for the larger
+/// per-leg notional cap. Its own budget: funding never uses up what the rescues may cost.
+pub fn fund_cost_budget_e8(max_notional_usd: u64, max_bps: u32, max_flat_e6: u64) -> u128 {
+    let share = u128::from(max_notional_usd) * 100_000_000 * u128::from(max_bps) / 10_000;
+    4 * share.max(u128::from(max_flat_e6) * 100)
 }
 
 fn same_evm(a: &str, b: &str) -> bool {

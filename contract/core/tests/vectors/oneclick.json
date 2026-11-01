@@ -126,7 +126,7 @@
     "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
   },
   "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
-  "field_rule": "signature (E_QUOTE_SIGNATURE) -> live quote: dry refused unless ctx.dry_ok, live needs depositAddress (E_QUOTE_FIELDS) -> originAsset of the method: sol_sign_rescue Solana USDC, hl_send_to_intents HyperCore USDC, evm_usdc_to_intents Arbitrum USDC, fund_venue USDC on NEAR -> refundTo = desk Solana authority / desk EVM / desk EVM / the contract -> recipientType DESTINATION_CHAIN -> recipient: pinned Orderly receiver (Arbitrum USDC, minAmountOut >= 6000000), desk EVM (HyperCore USDC), desk Solana authority (Solana USDC), the contract (USDC on NEAR, customRecipientMsg exactly {\"desk_id\":\"<desk>\"}); anything else E_QUOTE_FIELDS -> deadline > now -> timestamp: signed at most 1 h before now and at most 5 min after it, both edges included (now - 3600000 <= timestamp <= now + 300000, ms) -> rescue methods: amountIn <= remaining_cap_usd * 10^decimals(origin) (E_RESCUE_CAP). EVM addresses compare case-insensitively, others exactly.",
+  "field_rule": "signature (E_QUOTE_SIGNATURE) -> live quote: dry refused unless ctx.dry_ok, live needs depositAddress (E_QUOTE_FIELDS) -> originAsset of the method: sol_sign_rescue Solana USDC, hl_send_to_intents HyperCore USDC, evm_usdc_to_intents Arbitrum USDC, fund_venue USDC on NEAR -> refundTo = desk Solana authority / desk EVM / desk EVM / the desk owner's NEAR account (ctx.desk.owner) -> recipientType DESTINATION_CHAIN -> recipient: pinned Orderly receiver (Arbitrum USDC, minAmountOut >= 6000000), desk EVM (HyperCore USDC), desk Solana authority (Solana USDC), the contract (USDC on NEAR, customRecipientMsg exactly {\"desk_id\":\"<desk>\"}); anything else E_QUOTE_FIELDS -> deadline > now -> timestamp: signed at most 1 h before now and at most 5 min after it, both edges included (now - 3600000 <= timestamp <= now + 300000, ms) -> rescue methods: amountIn <= remaining_cap_usd * 10^decimals(origin) (E_RESCUE_CAP). EVM addresses compare case-insensitively, others exactly.",
   "quotes": [
     {
       "name": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
@@ -1139,16 +1139,18 @@
           "desk_id": "alpha",
           "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
           "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
-          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517",
+          "owner": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c"
         },
-        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "contract": "gimbal.near",
         "now_ms": 1793073079059,
         "remaining_cap_usd": 50,
         "dry_ok": true
       },
       "expect": {
         "ok": true
-      }
+      },
+      "note": "C8: fund_venue refunds go to the desk owner (a 1Click refund on NEAR is a plain ft_transfer that credits no desk), so these cases read the recorded refundTo account (the contractNear key) as the desk owner and run the contract as gimbal.near; the quote bytes and signature are unchanged."
     },
     {
       "name": "as quoted: fund_venue: USDC on NEAR (contract) to the pinned Orderly receiver",
@@ -1159,16 +1161,18 @@
           "desk_id": "alpha",
           "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
           "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
-          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517",
+          "owner": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c"
         },
-        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "contract": "gimbal.near",
         "now_ms": 1793073079693,
         "remaining_cap_usd": 50,
         "dry_ok": true
       },
       "expect": {
         "ok": true
-      }
+      },
+      "note": "C8: fund_venue refunds go to the desk owner (a 1Click refund on NEAR is a plain ft_transfer that credits no desk), so these cases read the recorded refundTo account (the contractNear key) as the desk owner and run the contract as gimbal.near; the quote bytes and signature are unchanged."
     },
     {
       "name": "as quoted: owner payout leg: HyperCore USDC to the contract with customRecipientMsg",
@@ -1434,16 +1438,42 @@
           "desk_id": "alpha",
           "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
           "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
-          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517",
+          "owner": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c"
         },
-        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "contract": "gimbal.near",
         "now_ms": 1793073079059,
         "remaining_cap_usd": 3,
         "dry_ok": true
       },
       "expect": {
         "ok": true
-      }
+      },
+      "note": "C8: fund_venue refunds go to the desk owner (a 1Click refund on NEAR is a plain ft_transfer that credits no desk), so these cases read the recorded refundTo account (the contractNear key) as the desk owner and run the contract as gimbal.near; the quote bytes and signature are unchanged."
+    },
+    {
+      "name": "fund_venue refunding to the contract (refundTo must be the desk owner)",
+      "quote": "fund_venue: USDC on NEAR (contract) to Hyperliquid",
+      "method": "fund_venue",
+      "ctx": {
+        "desk": {
+          "desk_id": "alpha",
+          "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "orderly_receiver": "0xc48b812bb43401392c037381aca934f4069c0517",
+          "owner": "owner.near"
+        },
+        "contract": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "now_ms": 1793073079059,
+        "remaining_cap_usd": 50,
+        "dry_ok": true
+      },
+      "expect": {
+        "ok": false,
+        "code": "E_QUOTE_FIELDS",
+        "why": "refundTo"
+      },
+      "note": "C8: a refund to the contract would arrive as a plain ft_transfer and credit no desk."
     },
     {
       "name": "payout quote checked for another desk (customRecipientMsg names alpha)",

@@ -6,6 +6,7 @@ pub mod ed25519;
 pub mod eip3009;
 pub mod eip712;
 pub mod errors;
+pub mod fees;
 pub mod hl;
 pub mod ids;
 pub mod limits;

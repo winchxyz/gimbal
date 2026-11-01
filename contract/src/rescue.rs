@@ -144,12 +144,12 @@ pub fn ed25519_verify(signature: &[u8; 64], message: &[u8], public_key: &[u8; 32
     env::ed25519_verify(signature, message, public_key)
 }
 
-fn quote_fields(msg: impl AsRef<str>) -> Refusal {
+pub(crate) fn quote_fields(msg: impl AsRef<str>) -> Refusal {
     Refusal::new(E_QUOTE_FIELDS, msg.as_ref())
 }
 
 /// The verified deposit address, which a live quote always has.
-fn deposit_of(q: &VerifiedQuote) -> String {
+pub(crate) fn deposit_of(q: &VerifiedQuote) -> String {
     q.deposit_address
         .clone()
         .ok_or_else(|| quote_fields("the quote has no depositAddress"))
@@ -251,6 +251,7 @@ impl Gimbal {
                 evm: &desk.evm_address,
                 sol: &desk.solana.authority,
                 orderly_receiver: desk.orderly_receiver.as_deref(),
+                owner: desk.owner.as_str(),
             },
             contract: contract.as_str(),
             now_ms,
