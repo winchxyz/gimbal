@@ -1,5 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { MIN_TGAS, FUND_TGAS, WITHDRAW_TGAS, eventsOf, expectedPayout, ledgerOf, parseUsdc, usdcText } from './money.mjs';
 
 const USDC = 1_000_000n;
@@ -21,6 +23,9 @@ test('the gas the scripts attach is over the C8 contract\'s floors', () => {
   assert.ok(FUND_TGAS >= BigInt(MIN_TGAS.fund_venue));
   assert.ok(WITHDRAW_TGAS >= BigInt(MIN_TGAS.withdraw_to_owner));
   assert.ok(FUND_TGAS <= 300n && WITHDRAW_TGAS <= 300n, 'NEAR caps a transaction at 300 TGas');
+  const doc = readFileSync(fileURLToPath(new URL('../../docs/interfaces.md', import.meta.url)), 'utf8');
+  assert.match(doc, new RegExp(`\`fund_venue\` ${MIN_TGAS.fund_venue} TGas, \`withdraw_to_owner\` ${MIN_TGAS.withdraw_to_owner} TGas, \`refresh_prices\` ${MIN_TGAS.refresh_prices} TGas`),
+    'the floors of docs/interfaces.md §1.3');
 });
 
 /** Books of contract/core/src/fees.rs, as the tests there drive them. */
