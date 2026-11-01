@@ -90,9 +90,10 @@ export function eventsOf(logs) {
 
 /**
  * What every money script checks first: the contract exists with code, is a mainnet Gimbal contract, and its code
- * has `methods`; the desk exists. Returns { state, config, exported, desk } or throws with every problem.
+ * has every money method (MONEY_METHODS: a contract with only some of them is not C8, whichever one the script
+ * calls; `methods` are named first); the desk exists. Returns { state, config, exported, desk } or throws.
  */
-export async function moneyContext(client, contract, deskId, methods) {
+export async function moneyContext(client, contract, deskId, methods = []) {
   const state = await client.account(contract);
   if (state === null) throw new Error(`${contract} does not exist on mainnet`);
   if (state.code_hash === NO_CODE) throw new Error(`${contract} has no contract code`);
@@ -101,7 +102,7 @@ export async function moneyContext(client, contract, deskId, methods) {
   if (bad.length > 0) throw new Error(`${contract} is not a mainnet Gimbal contract:\n  ${bad.join('\n  ')}`);
   const code = await client.code(contract);
   const exported = code === null ? [] : wasmExports(code);
-  const missing = methods.filter((m) => !exported.includes(m));
+  const missing = [...new Set([...methods, ...MONEY_METHODS])].filter((m) => !exported.includes(m));
   if (missing.length > 0) {
     throw new Error(`${contract}'s code (code_hash ${state.code_hash}) has no ${missing.join(', ')}: it is not the C8 contract with the money methods `
       + `(${MONEY_METHODS.join(', ')}); nothing can be sent through it. Deploy the C8 code to a new account (README section 8)`);

@@ -58,6 +58,7 @@ Money paths that are **not available yet**:
 ```
 node tools/mainnet/retire.mjs <contract>.near            # dry run
 node tools/mainnet/retire.mjs <contract>.near --send     # from the main checkout
+node tools/mainnet/retire.mjs <contract>.near --beneficiary <funder>.near --creation-tx <hash>   # nearblocks has no record
 ```
 
 Retiring sends one **DeleteAccount** for `<contract>.near`, signed with `.keys/<contract>.near.json`. Its whole
@@ -66,29 +67,51 @@ NEAR balance, the NEAR held for the code's storage included, goes to the benefic
 **Why the checks.** After the deletion anyone can register `<contract>.near` again. Every desk address is an MPC
 key derived from the contract's name (`gimbal/<desk_id>/evm`, `gimbal/<desk_id>/sol` with the contract as
 predecessor), so whoever takes the name controls those addresses: the Hyperliquid account, the Solana authority
-and its token accounts, the EVM address on Arbitrum and Orderly. Anything left there, or sent there later, is
-theirs. So the script deletes only when every one of them holds at most dust, and **nothing may be sent to the
-old desk addresses afterwards**.
+and its token accounts, the EVM address on Arbitrum and HyperEVM, Phoenix and Orderly. Anything left there, or
+sent there later, is theirs. So the script deletes only when every one of them holds at most dust, and **nothing
+may be sent to the old desk addresses afterwards**.
+
+**Every read fails closed:** an HTTP error, a timeout, an answer of an unexpected shape or an amount that is not a
+number refuses the delete. Nothing is ever counted as 0 because it could not be read.
 
 What it does:
 
-- **Beneficiary:** the account that created `<contract>.near`. The script reads the creating transaction
-  (nearblocks' account record, confirmed on an archival RPC as a successful `near.create_account` of that account)
-  and takes its signer. It never guesses: when the creation cannot be read it prints `benefic. unknown` and
-  refuses until you pass `--beneficiary <funder>.near`; a `--beneficiary` that differs from a confirmed creator is
-  refused.
+- **Beneficiary:** the account that created `<contract>.near`. nearblocks names the creating transaction; the
+  archival RPC (`archival-rpc.mainnet.fastnear.com`) must confirm it is a `near.create_account` of exactly that
+  account by that signer, whose result is `true`. It never guesses: when nearblocks has no record (or is down) it
+  refuses unless you pass `--beneficiary <funder>.near --creation-tx <hash>`, which is confirmed the same way. A
+  `--beneficiary` that differs from the confirmed creator is refused.
 - **Desks:** every `create_desk` the contract received (nearblocks), the creator's `desks_of`, and `--desks a,b`.
   A desk list that cannot be read in full is a refusal.
-- **Balances, per desk:** the Hyperliquid account value on the main perps dex, open positions and every spot
-  balance; the Solana authority's SOL and its USDC and PhUSD token accounts; USDC and ETH of the EVM address on
-  Arbitrum; Orderly (registered, the key's state; the holding is not public, so `--send` first makes one signed
-  `orderly_request` of kind `holding` with the engine's operator key, and the script refuses any other call); the
-  desk's `idle_usdc` in the contract's books. And the contract's own USDC on NEAR.
-- **Dust:** 0.01 USDC, 0.001 SOL, 0.0001 ETH. Anything over it is listed and refused. NEAR also refuses to delete
-  an account with over 10 kB of data besides its code; the `state` line shows how much it has.
+- **Balances, per desk:**
+  - Hyperliquid: every perp dex `perpDexs` lists (main, `xyz`, ...: account value, cash, open positions), spot
+    balances, vault equities, staked HYPE (`delegatorSummary`: delegated, undelegated, pending withdrawals) and
+    sub-accounts;
+  - Phoenix: the trader (PDA 0) of the desk's Solana authority, every subaccount's collateral, positions, open
+    orders and spot collateral;
+  - Solana: the authority's SOL, its USDC and PhUSD token accounts (only "could not find account" counts as "never
+    created"), and every account it owns under SPL Token and Token-2022 (any non-zero balance refuses);
+  - EVM: USDC, USDC.e and ETH on Arbitrum, HYPE and USDC on HyperEVM;
+  - Orderly under the contract's broker: registered (only code -1607, "Account not found", means no; any other
+    `success: false` refuses), the key's state; the holding is not public, so `--send` makes one signed
+    `orderly_request` of kind `holding` with the engine's operator key (any other call is refused; a holding that
+    is not a number refuses);
+  - the contract: the desk's `idle_usdc` in the books, the rescue ring, and on C8 code the money record
+    (`payout_pending` or `idle_usdc` over 0 refuses; a missing record refuses) and the `fund_venue` ring (a slot
+    paid within the last 65 min means money may be in flight: refused, wait).
+- **The contract's own tokens:** USDC on NEAR, every NEP-141 token the nearblocks inventory lists, and its
+  `intents.near` balances (`mt_tokens_for_owner`).
+- **Not covered** (printed in every run): Orderly under any other broker; EVM chains other than Arbitrum and
+  HyperEVM; Phoenix trader PDAs other than 0; Solana stake accounts and NFTs; NEP-141 tokens nearblocks does not
+  index; NEAR NFTs.
+- **Dust:** 0.01 USDC, 0.001 SOL, 0.0001 ETH or HYPE on an EVM chain, 0.001 staked HYPE. Anything over it is
+  listed and refused. NEAR also refuses to delete an account with over 10 kB of data besides its code; the `state`
+  line shows how much it has.
 - `--send` reads `.keys/<contract>.near.json` (it must be the account's full-access key) and, for a desk
-  registered on Orderly, `.keys/engine-mainnet-<contract>.near.env`, reads every balance again, sends the
-  DeleteAccount, and checks that the account is gone and the beneficiary's balance went up.
+  registered on Orderly, `.keys/engine-mainnet-<contract>.near.env`; makes the signed Orderly read; then reads
+  **everything above again** (the contract's USDC and tokens, every desk's books, records and venues) and sends the
+  DeleteAccount right after, only when all of it is clean; then checks that the account is gone and the
+  beneficiary's balance went up.
 
 - **Cost:** the DeleteAccount's action fees (under 0.001 NEAR, paid from the deleted balance), and for an Orderly
   desk one operator call (about 0.001 NEAR; 0.3 NEAR of the key's allowance held until the refund).
@@ -114,8 +137,9 @@ What it does:
   | `ARBITRUM_RPC_URL` | relayer-wallet `--check` | optional; default `https://arb1.arbitrum.io/rpc` |
   | `ONECLICK_API_KEY` | fund | optional; sent as a header only, never printed; without it 1Click adds 0.2 % |
 
-  retire and fund read `SOLANA_RPC_URL` and `ARBITRUM_RPC_URL` from the shell environment only (defaults
-  `https://api.mainnet-beta.solana.com` and `https://arb1.arbitrum.io/rpc`) and print only their hosts.
+  retire and fund read `SOLANA_RPC_URL`, `ARBITRUM_RPC_URL` and `HYPEREVM_RPC_URL` from the shell environment
+  only (defaults `https://api.mainnet-beta.solana.com`, `https://arb1.arbitrum.io/rpc` and
+  `https://rpc.hyperliquid.xyz/evm`) and print only their hosts.
 
   `NEAR_RPC_URL` is read from the **shell environment only**, never from `.env`, because `.env` often holds a
   testnet RPC. It is optional and tried first, before the public `free.rpc.fastnear.com` and `near.drpc.org`.
@@ -529,8 +553,13 @@ about 6.3), 0.7 free on the owner for the desk, and 0.3 NEAR free on the owner p
    signature, the fields, at least 50 bps of room below `amountOut`, the cost bound, the hourly budget) and prints
    `fund_venue(desk_id, quote, quote_signature, reason)` in full, 300 TGas, signed by the operator key. Measured
    on 2026-11-01: 12 USDC may cost 0.44 USDC of the 1 USD allowed, with 102 bps of room. `--send` asks a **live**
-   quote only after every other check passed, checks it the same way, sends `fund_venue`, posts the deposit to
-   1Click and polls its status and the Hyperliquid account value until it lands (`--timeout-s`, default 900).
+   quote only after every other check passed, checks it the same way and against what you typed (the venue's
+   `recipient` and `destinationAsset`, `amountIn` = the amount in 6-decimal base units, `slippageTolerance` =
+   `--slippage-bps`; any mismatch refuses before signing), sends `fund_venue`, posts the deposit to 1Click and
+   polls its status and the venue balance (`--timeout-s`, default 900). `landed: yes` means 1Click SUCCESS **and**
+   the venue's cash up by at least `minAmountOut`, cash without unrealized PnL: Hyperliquid's `totalRawUsd` on
+   the main perps dex (not the account value), the Solana USDC token account. Orderly's holding is not public, so
+   there it says `landed: unconfirmed`.
    A refund goes to the owner on NEAR, not to the desk. After it lands, run POST /setup again (section 6) for
    `hl_set_referrer` and `hl_approve_builder_fee`. The same command with `solana 8` funds the Phoenix leg (the
    Solana authority also needs a little SOL, which 1Click does not send); `orderly` needs the pinned receiver and

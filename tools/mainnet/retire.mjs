@@ -2,33 +2,46 @@
 // Retires a canary: DeleteAccount for the contract account, its whole NEAR balance to the account that created it
 // (tools/mainnet/README.md, "Retiring a canary"):
 //
-//   node tools/mainnet/retire.mjs <contract> [--beneficiary <account>] [--desks <id,id>] [--key-file <contract key json>]
-//        [--env-file <engine env file>] [--send]
+//   node tools/mainnet/retire.mjs <contract> [--beneficiary <account> [--creation-tx <hash>]] [--desks <id,id>]
+//        [--key-file <contract key json>] [--env-file <engine env file>] [--send]
 //
 // Why the checks: after the deletion anyone can register <contract> again, and every desk address is an MPC key
-// derived from that name. Whoever holds the name then controls the desks' Hyperliquid, Solana, Arbitrum and Orderly
-// accounts and the USDC on NEAR the account held. So nothing may be left on any of them, and nothing may be sent
-// to them afterwards.
+// derived from that name. Whoever holds the name then controls the desks' Hyperliquid, Solana, EVM and Orderly
+// accounts and whatever the account held on NEAR. So nothing may be left on any of them, and nothing may be sent to
+// them afterwards.
 //
-// The beneficiary is the signer of the transaction that created the account (nearblocks' account record, confirmed
-// on an archival RPC), never a guess: --beneficiary must match it, and when the creation cannot be read the dry run
-// says so and --send needs --beneficiary from the human. The desks are every create_desk the contract received
-// (nearblocks), the creator's desks_of, and --desks; each that exists is checked:
-//   Hyperliquid main perps dex account value and every spot balance; the Solana authority's SOL and its USDC and
-//   PhUSD token accounts; USDC and ETH of the EVM address on Arbitrum; the Orderly account (public: registered, key;
-//   the holding needs a signed read, so --send makes one orderly_request of kind holding with the engine's operator
-//   key first, and nothing else); the desk's idle_usdc; and the contract's own USDC on NEAR.
-// Anything over dust is refused, and so is a desk list that cannot be read in full.
+// The beneficiary is the signer of the transaction that created the account, never a guess. nearblocks names the
+// transaction; the archival RPC must confirm it is a near.create_account of exactly this account by that signer
+// whose result is `true`. When nearblocks has no creation record, --beneficiary with --creation-tx <hash> is
+// confirmed the same way; anything else refuses. A --beneficiary that differs from the confirmed creator refuses.
+//
+// The desks are every create_desk the contract received (nearblocks), the creator's desks_of, and --desks. For each:
+//   Hyperliquid: every perp dex `perpDexs` lists (value, cash, positions), spot, vault equities, HYPE staking,
+//   sub-accounts; Phoenix: the trader's collateral, positions, orders and spot collateral on every subaccount;
+//   Solana: the authority's SOL, its USDC and PhUSD token accounts and every SPL Token and Token-2022 account it
+//   owns; EVM: USDC, USDC.e and ETH on Arbitrum, HYPE and USDC on HyperEVM; Orderly under the contract's broker
+//   (public: registered, key; the holding needs a signed read, so --send makes one orderly_request of kind holding
+//   with the engine's operator key and nothing else); the books' idle_usdc; and in the contract's own state the
+//   rescue ring and, for C8 code, the money record (payout_pending, idle_usdc) and the fund_venue ring (a slot paid
+//   within 65 min means money may be in flight). And the contract's own NEP-141 tokens (USDC, the nearblocks
+//   inventory) and intents.near balances.
+// Every read fails closed: an error, an unexpected answer or a non-number refuses, as does anything over dust or a
+// desk list that cannot be read in full.
 //
 // Default: a dry run that reads only. --send reads the contract's key file (and the engine env file for the
-// Orderly read), only then, never prints a key, refuses in a linked git worktree, reads every balance again, and
-// sends the DeleteAccount only when all of them are dust. It ends with one block to paste back.
+// Orderly read), only then, never prints a key, refuses in a linked git worktree, makes the Orderly read, then
+// reads everything above again and sends the DeleteAccount right after, only when all of it is clean. It ends with
+// one block to paste back.
 
 import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { UsageError, isMain, parseDotEnv, parseFlags, run } from './cli.mjs';
-import { arbitrumBalances, hyperliquidBalances, nearUsdcBalance, rpcUrls, solanaBalances, unitsText } from './balances.mjs';
+import {
+  NEARBLOCKS_API, NEAR_USDC, TOKEN_PROGRAMS, arbitrumBalances, hyperEvmBalances, hyperliquidBalances, intentsTokens, nearInventory, nearUsdcBalance,
+  phoenixTrader, rpcUrls, solanaBalances, solanaTokenAccounts, unitsText,
+} from './balances.mjs';
 import { engineEnvProblems, sendRefusal } from './checks.mjs';
+import { wasmExports } from './deploy.mjs';
 import { OPERATOR_METHODS, contractConfigProblems, engineEnvFile } from './desk.mjs';
 import {
   KEYS, ROOT, accountLink, act, createClient, describeTx, fullAccessVerdict, isFunctionCallKey, linkedWorktreeOf, mainnetId, near, nearText, nearTextUp,
@@ -37,17 +50,24 @@ import {
 import { DESK_ID, ledgerOf, summaryBlock, usdcText } from './money.mjs';
 import { ORDERLY_API } from './venues.mjs';
 
-export const NEARBLOCKS_API = 'https://api.nearblocks.io/v1';
+export { NEARBLOCKS_API };
 export const ARCHIVAL_RPC = 'https://archival-rpc.mainnet.fastnear.com';
 /** What counts as nothing left. */
-export const DUST = { usdcE6: 10_000n, lamports: 1_000_000n, wei: 100_000_000_000_000n };
+export const DUST = { usdcE6: 10_000n, lamports: 1_000_000n, wei: 100_000_000_000_000n, token18: 10_000_000_000_000_000n, hype18: 1_000_000_000_000_000n };
 /** NEAR's limit for DeleteAccount: the account's data besides its code, in bytes. */
 export const MAX_DELETE_STATE = 10_000;
+/** A ring slot paid more recently than this may still have money in flight (the contract's own 65 min window). */
+export const IN_FLIGHT_MS = 65 * 60_000;
+/** The contract's storage prefixes (contract/src/lib.rs StorageKey, borsh variant index). */
+export const STORAGE_PREFIX = { DeskCounters: 5, Money: 7, FundCounters: 8 };
+/** Orderly's answer for an address with no account under the broker. */
+export const ORDERLY_NOT_FOUND = -1607;
+const RING = 32;
 
-const USAGE = `usage: node tools/mainnet/retire.mjs <contract> [--beneficiary <account>] [--desks <id,id>] [--key-file <contract key json>]
-         [--env-file <engine env file>] [--send]
+const USAGE = `usage: node tools/mainnet/retire.mjs <contract> [--beneficiary <account> [--creation-tx <hash>]] [--desks <id,id>]
+         [--key-file <contract key json>] [--env-file <engine env file>] [--send]
   default: dry run (reads mainnet and the venues; signs nothing)`;
-const SPEC = { '--beneficiary': 'value', '--desks': 'value', '--key-file': 'value', '--env-file': 'value', '--send': 'switch' };
+const SPEC = { '--beneficiary': 'value', '--creation-tx': 'value', '--desks': 'value', '--key-file': 'value', '--env-file': 'value', '--send': 'switch' };
 
 export function parseRetireArgs(argv) {
   const { positional, values } = parseFlags(argv, SPEC);
@@ -62,10 +82,13 @@ export function parseRetireArgs(argv) {
     throw new UsageError(e.message);
   }
   if (beneficiary === contract) throw new UsageError('--beneficiary cannot be the account that is deleted');
+  const creationTx = values['--creation-tx'] ?? null;
+  if (creationTx !== null && !/^[1-9A-HJ-NP-Za-km-z]{1,64}$/.test(creationTx)) throw new UsageError('--creation-tx is not a base58 transaction hash');
+  if (creationTx !== null && beneficiary === null) throw new UsageError('--creation-tx needs --beneficiary: the signer it is checked against');
   const desks = values['--desks'] === undefined ? [] : values['--desks'].split(',');
   for (const d of desks) if (!DESK_ID.test(d)) throw new UsageError(`desk id ${JSON.stringify(d)} is not 1 to 32 characters of a-z, 0-9 and -`);
   return {
-    contract, beneficiary, desks, send: values['--send'] === true,
+    contract, beneficiary, creationTx, desks, send: values['--send'] === true,
     keyFile: values['--key-file'] === undefined ? join(KEYS, `${contract}.json`) : resolve(values['--key-file']),
     envFile: values['--env-file'] === undefined ? engineEnvFile(contract) : resolve(values['--env-file']),
   };
@@ -79,35 +102,68 @@ async function getJson(fetchImpl, url) {
 }
 
 /**
- * Who created `contract`: nearblocks' account record names the creating transaction, nearblocks' transaction its
- * signer; the archival RPC then confirms the transaction is a successful near.create_account of exactly this
- * account by that signer. Returns { creator, txHash, confirmed, note } (creator null when it cannot be read).
+ * Whether `txHash` is a near.create_account of exactly `contract`, signed by `signer`, whose result (the
+ * registrar's on_account_created callback) is `true`. Read from the archival RPC. Returns null or the problem.
  */
-export async function findCreator(fetchImpl, archive, contract) {
-  let txHash;
-  let creator;
+export async function creationProblem(archive, contract, txHash, signer) {
+  let r;
+  try {
+    r = await archive.rpc('tx', { tx_hash: txHash, sender_account_id: signer, wait_until: 'NONE' });
+  } catch (e) {
+    return `the archival RPC could not read ${txHash} (${e.message})`;
+  }
+  const t = r?.transaction;
+  const call = t?.actions?.length === 1 ? t.actions[0]?.FunctionCall : undefined;
+  let args = null;
+  try {
+    args = call ? JSON.parse(Buffer.from(call.args, 'base64').toString()) : null;
+  } catch {
+    args = null;
+  }
+  let result = null;
+  try {
+    result = typeof r?.status?.SuccessValue === 'string' ? JSON.parse(Buffer.from(r.status.SuccessValue, 'base64').toString()) : null;
+  } catch {
+    result = null;
+  }
+  if (t?.signer_id !== signer) return `${txHash} is signed by ${t?.signer_id ?? 'nobody'}, not ${signer}`;
+  if (t?.receiver_id !== 'near' || call?.method_name !== 'create_account' || args?.new_account_id !== contract) return `${txHash} is not near.create_account of ${contract}`;
+  if (result !== true) return `${txHash}'s create_account returned ${JSON.stringify(result)}, not true`;
+  return null;
+}
+
+/**
+ * Who created `contract`, confirmed: { creator, txHash, confirmed, note }. nearblocks names the transaction; when it
+ * has none, `fallback` ({ beneficiary, creationTx } from the human) is checked the same way.
+ */
+export async function findCreator(fetchImpl, archive, contract, fallback = {}) {
+  const host = new URL(ARCHIVAL_RPC).host;
+  const confirmed = (creator, txHash, via) => ({ creator, txHash, confirmed: true, note: `created by ${creator} in ${txLink(txHash)} (near.create_account returned true, confirmed on ${host}${via})` });
+  let txHash = null;
+  let creator = null;
+  let note;
   try {
     const acc = (await getJson(fetchImpl, `${NEARBLOCKS_API}/account/${contract}`)).account?.[0];
-    txHash = acc?.created?.transaction_hash;
-    if (typeof txHash !== 'string') return { creator: null, txHash: null, confirmed: false, note: 'nearblocks has no creation record' };
-    const tx = (await getJson(fetchImpl, `${NEARBLOCKS_API}/txns/${txHash}`)).txns?.[0];
-    creator = tx?.signer_account_id;
-    if (typeof creator !== 'string') return { creator: null, txHash, confirmed: false, note: 'nearblocks has no signer for the creation' };
+    txHash = typeof acc?.created?.transaction_hash === 'string' ? acc.created.transaction_hash : null;
+    if (txHash !== null) {
+      const tx = (await getJson(fetchImpl, `${NEARBLOCKS_API}/txns/${txHash}`)).txns?.[0];
+      creator = typeof tx?.signer_account_id === 'string' ? tx.signer_account_id : null;
+    }
+    note = txHash === null ? 'nearblocks has no creation record' : creator === null ? `nearblocks has no signer for ${txHash}` : null;
   } catch (e) {
-    return { creator: null, txHash: txHash ?? null, confirmed: false, note: `nearblocks could not be read (${e.message})` };
+    note = `nearblocks could not be read (${e.message})`;
   }
-  try {
-    const r = await archive.rpc('tx', { tx_hash: txHash, sender_account_id: creator, wait_until: 'NONE' });
-    const t = r.transaction;
-    const call = t?.actions?.[0]?.FunctionCall;
-    const args = call ? JSON.parse(Buffer.from(call.args, 'base64').toString()) : null;
-    const ok = t?.signer_id === creator && t?.receiver_id === 'near' && call?.method_name === 'create_account'
-      && args?.new_account_id === contract && r.status?.SuccessValue !== undefined;
-    if (!ok) return { creator: null, txHash, confirmed: false, note: `transaction ${txHash} is not a successful near.create_account of ${contract} by ${creator}` };
-    return { creator, txHash, confirmed: true, note: `created by ${creator} in ${txLink(txHash)} (near.create_account, confirmed on ${new URL(ARCHIVAL_RPC).host})` };
-  } catch (e) {
-    return { creator, txHash, confirmed: false, note: `nearblocks says ${creator} created it in ${txHash}; the archival RPC could not confirm it (${e.message})` };
+  if (txHash !== null && creator !== null) {
+    const p = await creationProblem(archive, contract, txHash, creator);
+    if (p === null) return confirmed(creator, txHash, '');
+    note = `nearblocks says ${creator} created it in ${txHash}, not confirmed: ${p}`;
   }
+  if (fallback.creationTx && fallback.beneficiary) {
+    const p = await creationProblem(archive, contract, fallback.creationTx, fallback.beneficiary);
+    if (p === null && (creator === null || creator === fallback.beneficiary)) return confirmed(fallback.beneficiary, fallback.creationTx, ', from --creation-tx');
+    note += `; --creation-tx not confirmed: ${p ?? `nearblocks names ${creator}`}`;
+  }
+  return { creator, txHash, confirmed: false, note };
 }
 
 /** The desk ids of every create_desk transaction nearblocks lists for the contract (all pages), or an error. */
@@ -117,7 +173,8 @@ export async function createDeskIds(fetchImpl, contract) {
   for (let page = 0; page < 40; page++) {
     const url = `${NEARBLOCKS_API}/account/${contract}/txns?method=create_desk&per_page=25${cursor === null ? '' : `&cursor=${encodeURIComponent(cursor)}`}`;
     const r = await getJson(fetchImpl, url);
-    for (const t of r.txns ?? []) {
+    if (!Array.isArray(r.txns)) throw new Error('nearblocks: no txns list');
+    for (const t of r.txns) {
       for (const a of t.actions ?? []) {
         if (a.method !== 'create_desk') continue;
         try {
@@ -128,77 +185,253 @@ export async function createDeskIds(fetchImpl, contract) {
         }
       }
     }
-    if (!r.cursor || (r.txns ?? []).length === 0) return [...ids];
+    if (!r.cursor || r.txns.length === 0) return [...ids];
     cursor = r.cursor;
   }
   throw new Error('nearblocks: more than 40 pages of create_desk');
 }
 
-/** Orderly's public view of the desk: registered under the broker, and the desk key's state. */
+// --- the contract's own records (borsh, as near-sdk stores them) ---
+
+class BorshReader {
+  constructor(buf, what) {
+    this.b = buf;
+    this.o = 0;
+    this.what = what;
+  }
+
+  take(n) {
+    if (this.o + n > this.b.length) throw new Error(`${this.what}: truncated`);
+    const s = this.b.subarray(this.o, this.o + n);
+    this.o += n;
+    return s;
+  }
+
+  u8() { return this.take(1)[0]; }
+  u64() { return this.take(8).readBigUInt64LE(); }
+  u128() { const s = this.take(16); return s.readBigUInt64LE(0) + (s.readBigUInt64LE(8) << 64n); }
+  string() { return this.take(this.take(4).readUInt32LE()).toString('utf8'); }
+  bool() {
+    const v = this.u8();
+    if (v > 1) throw new Error(`${this.what}: bad bool`);
+    return v === 1;
+  }
+
+  end() {
+    if (this.o !== this.b.length) throw new Error(`${this.what}: ${this.b.length - this.o} bytes left over`);
+  }
+}
+
+/** contract/src/money.rs DeskMoney: owner, ledger (5 x u128), payout_pending, payout_since_ms, payout_seq. */
+export function decodeDeskMoney(buf) {
+  const r = new BorshReader(buf, 'the money record');
+  const owner = r.string();
+  const ledger = { deposited: r.u128(), withdrawn: r.u128(), fees_paid: r.u128(), hwm: r.u128(), idle_usdc: r.u128() };
+  const out = { owner, ledger, payout_pending: r.bool(), payout_since_ms: r.u64(), payout_seq: r.u64() };
+  r.end();
+  return out;
+}
+
+/** contract/src/rescue.rs DeskCounters (1,329 bytes): the meters, the ring of 32 deposit hashes and their paid times. */
+export function decodeCounters(buf) {
+  const r = new BorshReader(buf, 'the counters record');
+  r.u64();
+  r.u128();
+  r.u128();
+  r.u64();
+  r.take(32 * RING);
+  const next = r.u8();
+  const paid = Array.from({ length: RING }, () => r.u64());
+  r.end();
+  return { deposit_next: next, deposit_paid_ms: paid };
+}
+
+const storageKey = (prefix, deskId) => {
+  const id = Buffer.from(deskId);
+  const len = Buffer.alloc(4);
+  len.writeUInt32LE(id.length);
+  return Buffer.concat([Buffer.from([prefix]), len, id]);
+};
+
+/** One record of the contract's state under `prefix` for `deskId` (a Buffer), or null when there is none. */
+async function readRecord(client, contract, prefix, deskId) {
+  const key = storageKey(prefix, deskId);
+  const rows = await client.state(contract, key);
+  const hit = rows.filter((row) => Buffer.from(row.key).equals(key));
+  if (hit.length > 1) throw new Error('two records under one key');
+  return hit.length === 0 ? null : Buffer.from(hit[0].value);
+}
+
+/** What the contract's own records of a desk say may still be in flight. */
+async function recordFindings({ client, contract, deskId, c8, now }) {
+  const lines = [];
+  const problems = [];
+  const ring = (name, counters) => {
+    if (counters === null) {
+      lines.push(`  ${`${name} ring`.padEnd(26)} none (never used)`);
+      return;
+    }
+    const d = decodeCounters(counters);
+    const recent = d.deposit_paid_ms.map((ms, i) => [i, ms]).filter(([, ms]) => ms > 0n && BigInt(now) - ms < BigInt(IN_FLIGHT_MS));
+    lines.push(`  ${`${name} ring`.padEnd(26)} ${recent.length === 0 ? 'no slot paid within 65 min' : `${recent.length} slot(s) paid within 65 min`}`);
+    for (const [i, ms] of recent) {
+      problems.push(`desk ${deskId}: ${name} ring slot ${i} was paid ${Math.floor(Number(BigInt(now) - ms) / 60_000)} min ago: money may be in flight; wait 65 min`);
+    }
+  };
+  try {
+    ring('rescue', await readRecord(client, contract, STORAGE_PREFIX.DeskCounters, deskId));
+  } catch (e) {
+    lines.push(`  ${'rescue ring'.padEnd(26)} could not be read (${e.message})`);
+    problems.push(`desk ${deskId}: the contract state could not be read (rescue ring)`);
+  }
+  if (!c8) {
+    lines.push(`  ${'money record'.padEnd(26)} none (code before C8: no payout or fund_venue can be in flight)`);
+    return { lines, problems };
+  }
+  try {
+    const raw = await readRecord(client, contract, STORAGE_PREFIX.Money, deskId);
+    if (raw === null) throw new Error('missing; create_desk writes it on C8');
+    const m = decodeDeskMoney(raw);
+    lines.push(`  ${'money record'.padEnd(26)} payout_pending ${m.payout_pending}, payout ${m.payout_seq}, idle_usdc ${usdcText(m.ledger.idle_usdc)} USDC`);
+    if (m.payout_pending) problems.push(`desk ${deskId}: a payout is in flight (payout_pending, since ${new Date(Number(m.payout_since_ms)).toISOString()}, payout ${m.payout_seq})`);
+    if (m.ledger.idle_usdc > 0n) problems.push(`desk ${deskId}: the money record idle_usdc holds ${usdcText(m.ledger.idle_usdc)} USDC`);
+  } catch (e) {
+    lines.push(`  ${'money record'.padEnd(26)} could not be read (${e.message})`);
+    problems.push(`desk ${deskId}: the C8 money record could not be read (${e.message})`);
+  }
+  try {
+    ring('fund_venue', await readRecord(client, contract, STORAGE_PREFIX.FundCounters, deskId));
+  } catch (e) {
+    lines.push(`  ${'fund_venue ring'.padEnd(26)} could not be read (${e.message})`);
+    problems.push(`desk ${deskId}: the contract state could not be read (fund_venue ring)`);
+  }
+  return { lines, problems };
+}
+
+// --- the venues ---
+
+/** Orderly's public view of the desk under the contract's broker: registered (only -1607 means no), the key's state. */
 async function orderlyPublic(fetchImpl, desk, brokerId) {
   const acc = await getJson(fetchImpl, `${ORDERLY_API}/v1/get_account?address=${desk.evm_address}&broker_id=${brokerId}`);
-  if (!acc.success) return { registered: false, key: null };
+  if (acc.success === false && acc.code === ORDERLY_NOT_FOUND) return { registered: false, key: null };
+  if (acc.success !== true || typeof acc.data?.account_id !== 'string') throw new Error(`get_account answered ${JSON.stringify(acc).slice(0, 200)}`);
   const key = await getJson(fetchImpl, `${ORDERLY_API}/v1/get_orderly_key?account_id=${desk.orderly_account_id}&orderly_key=ed25519:${desk.solana.authority}`);
-  return { registered: true, key: key.success ? key.data?.key_status ?? null : null };
+  return { registered: true, key: key.success === true ? key.data?.key_status ?? 'unknown' : `unread (code ${key.code})` };
+}
+
+/** A holding row's number (Orderly sends numbers; a decimal string is accepted); anything else throws. */
+function holdingNumber(deskId, field, v) {
+  const n = typeof v === 'number' ? v : typeof v === 'string' && /^-?\d+(\.\d+)?$/.test(v) ? Number(v) : NaN;
+  if (!Number.isFinite(n)) throw new Error(`Orderly holding of desk ${deskId} could not be read: ${field} ${JSON.stringify(v)} is not a number`);
+  return n;
 }
 
 /** Every balance of one desk, as { lines, problems, orderlyRegistered }. `orderlyHolding` is the signed read (or null). */
 export async function deskFindings({ fetchImpl, urls, desk, deskId, brokerId, orderlyHolding = null }) {
   const lines = [];
   const problems = [];
+  const show = (what, text) => lines.push(`  ${what.padEnd(26)} ${text}`);
   const over = (what, v, dust, text) => {
-    lines.push(`  ${what.padEnd(26)} ${text}`);
+    show(what, text);
     if (v > dust) problems.push(`desk ${deskId}: ${what} holds ${text}`);
   };
   const read = async (what, fn) => {
     try {
       await fn();
     } catch (e) {
-      lines.push(`  ${what.padEnd(26)} could not be read (${e.message})`);
+      show(what, `could not be read (${e.message})`);
       problems.push(`desk ${deskId}: ${what} could not be read`);
     }
   };
+  const abs = (v) => (v < 0n ? -v : v);
+
   await read('Hyperliquid', async () => {
     const hl = await hyperliquidBalances(fetchImpl, desk.evm_address);
-    over('Hyperliquid perps value', hl.accountValueE6 < 0n ? -hl.accountValueE6 : hl.accountValueE6, DUST.usdcE6, `${usdcText(hl.accountValueE6)} USDC (withdrawable ${usdcText(hl.withdrawableE6)}, ${hl.positions} positions)`);
-    if (hl.positions > 0) problems.push(`desk ${deskId}: ${hl.positions} open Hyperliquid position(s)`);
-    if (hl.spot.length === 0) lines.push(`  ${'Hyperliquid spot'.padEnd(26)} no balances`);
-    for (const b of hl.spot) {
-      const tiny = Number(b.total) <= 0.01;
-      lines.push(`  ${`Hyperliquid spot ${b.coin}`.padEnd(26)} ${b.total}`);
-      if (!tiny) problems.push(`desk ${deskId}: Hyperliquid spot ${b.coin} holds ${b.total}`);
+    for (const d of hl.dexes) {
+      const v = abs(d.accountValueE6) > abs(d.totalRawE6) ? abs(d.accountValueE6) : abs(d.totalRawE6);
+      over(`Hyperliquid perps ${d.dex}`, v, DUST.usdcE6, `${usdcText(d.accountValueE6)} USDC (cash ${usdcText(d.totalRawE6)}, ${d.positions} positions)`);
+      if (d.positions > 0) problems.push(`desk ${deskId}: ${d.positions} open Hyperliquid position(s) on ${d.dex}`);
+    }
+    if (hl.spot.length === 0) show('Hyperliquid spot', 'no balances');
+    for (const b of hl.spot) over(`Hyperliquid spot ${b.coin}`, b.total, DUST.token18, unitsText(b.total, 18));
+    if (hl.vaults.length === 0) show('Hyperliquid vaults', 'none');
+    for (const v of hl.vaults) over(`Hyperliquid vault ${v.vault}`, v.equityE6, DUST.usdcE6, `${usdcText(v.equityE6)} USDC`);
+    const staked = hl.staking.delegated + hl.staking.undelegated + hl.staking.pendingWithdrawal;
+    over('Hyperliquid staking', staked, DUST.hype18, `${unitsText(staked, 18)} HYPE (${hl.staking.nPending} pending withdrawals)`);
+    if (hl.staking.nPending > 0 && staked <= DUST.hype18) problems.push(`desk ${deskId}: ${hl.staking.nPending} pending Hyperliquid staking withdrawal(s)`);
+    show('Hyperliquid sub-accounts', hl.subAccounts.length === 0 ? 'none' : hl.subAccounts.join(', '));
+    if (hl.subAccounts.length > 0) problems.push(`desk ${deskId}: Hyperliquid has ${hl.subAccounts.length} sub-account(s): ${hl.subAccounts.join(', ')}`);
+  });
+
+  await read('Phoenix trader', async () => {
+    const subs = await phoenixTrader(fetchImpl, desk.solana.authority);
+    if (subs.length === 0) show('Phoenix trader', 'no subaccounts (not registered, or empty)');
+    for (const s of subs) {
+      const at = `Phoenix trader subaccount ${s.index}`;
+      show(at, `collateral ${usdcText(s.collateralE6)} USDC, ${s.positions} positions, ${s.orders} orders`);
+      if (s.collateralE6 > DUST.usdcE6) problems.push(`desk ${deskId}: ${at} holds ${usdcText(s.collateralE6)} USDC of collateral`);
+      if (s.positions > 0) problems.push(`desk ${deskId}: ${at} has ${s.positions} position(s)`);
+      if (s.orders > 0) problems.push(`desk ${deskId}: ${at} has ${s.orders} open order(s)`);
+      for (const c of s.spot) {
+        const dust = c.decimals === 9 ? DUST.lamports : 10n ** BigInt(Math.max(0, c.decimals - 2));
+        if (c.balance > dust) problems.push(`desk ${deskId}: ${at} holds ${unitsText(c.balance, c.decimals)} ${c.symbol}`);
+      }
     }
   });
-  await read('Solana', async () => {
-    const s = await solanaBalances(fetchImpl, urls.solana, { authority: desk.solana.authority, tokenAccounts: { usdc: desk.solana.usdc_ata, phusd: desk.solana.phusd_ata } });
+
+  await read('Solana authority SOL', async () => {
+    const s = await solanaBalances(fetchImpl, urls.solana, { authority: desk.solana.authority, tokenAccounts: {} });
     over('Solana authority SOL', s.lamports, DUST.lamports, `${unitsText(s.lamports, 9)} SOL`);
-    for (const [name, t] of Object.entries(s.tokens)) {
-      over(`Solana ${name === 'usdc' ? 'USDC' : 'PhUSD'} token account`, t.amount, DUST.usdcE6, t.exists ? `${unitsText(t.amount, t.decimals)}` : 'none (never created)');
-    }
   });
+  for (const [name, account] of [['USDC', desk.solana.usdc_ata], ['PhUSD', desk.solana.phusd_ata]]) {
+    const what = `Solana ${name} token account`;
+    await read(what, async () => {
+      const t = (await solanaBalances(fetchImpl, urls.solana, { authority: desk.solana.authority, tokenAccounts: { t: account } })).tokens.t;
+      over(what, t.amount, DUST.usdcE6, t.exists ? unitsText(t.amount, t.decimals) : 'none (never created)');
+    });
+  }
+  for (const program of Object.keys(TOKEN_PROGRAMS)) {
+    await read(`Solana ${program} accounts`, async () => {
+      const accounts = (await solanaTokenAccounts(fetchImpl, urls.solana, desk.solana.authority, [program]))[program];
+      show(`Solana ${program} accounts`, accounts.length === 0 ? 'none' : `${accounts.length}`);
+      for (const t of accounts) {
+        const text = unitsText(t.amount, t.decimals);
+        show(`  ${t.pubkey}`, `mint ${t.mint}: ${text}`);
+        if (t.amount > 0n) problems.push(`desk ${deskId}: Solana ${program} account ${t.pubkey} (mint ${t.mint}) holds ${text}`);
+      }
+    });
+  }
+
   await read('Arbitrum', async () => {
     const e = await arbitrumBalances(fetchImpl, urls.arbitrum, desk.evm_address);
     over('Arbitrum USDC', e.usdcE6, DUST.usdcE6, `${usdcText(e.usdcE6)} USDC`);
+    over('Arbitrum USDC.e', e.usdceE6, DUST.usdcE6, `${usdcText(e.usdceE6)} USDC`);
     over('Arbitrum ETH', e.wei, DUST.wei, `${unitsText(e.wei, 18)} ETH`);
   });
+  await read('HyperEVM', async () => {
+    const e = await hyperEvmBalances(fetchImpl, urls.hyperevm, desk.evm_address);
+    over('HyperEVM HYPE', e.wei, DUST.wei, `${unitsText(e.wei, 18)} HYPE`);
+    over('HyperEVM USDC', e.usdcE6, DUST.usdcE6, `${usdcText(e.usdcE6)} USDC`);
+  });
+
   let registered = null;
   await read('Orderly', async () => {
     const o = await orderlyPublic(fetchImpl, desk, brokerId);
     registered = o.registered;
     if (!o.registered) {
-      lines.push(`  ${'Orderly'.padEnd(26)} not registered under ${brokerId}: no account, no holding`);
+      show('Orderly', `not registered under ${brokerId} (code ${ORDERLY_NOT_FOUND}): no account, no holding`);
       return;
     }
     if (orderlyHolding === null) {
-      lines.push(`  ${'Orderly'.padEnd(26)} registered (${desk.orderly_account_id}), key ${o.key ?? 'none'}; holding not public: --send reads it signed first`);
+      show('Orderly', `registered (${desk.orderly_account_id}), key ${o.key}; holding not public: --send reads it signed first`);
       return;
     }
     for (const h of orderlyHolding) {
-      const total = Math.abs(Number(h.holding ?? 0)) + Math.abs(Number(h.frozen ?? 0)) + Math.abs(Number(h.pending_short ?? 0));
-      lines.push(`  ${`Orderly ${h.token}`.padEnd(26)} holding ${h.holding}, frozen ${h.frozen ?? 0}, pending_short ${h.pending_short ?? 0}`);
+      const total = Math.abs(h.holding) + Math.abs(h.frozen) + Math.abs(h.pending_short);
+      show(`Orderly ${h.token}`, `holding ${h.holding}, frozen ${h.frozen}, pending_short ${h.pending_short}`);
       if (total > 0.01) problems.push(`desk ${deskId}: Orderly ${h.token} holds ${total}`);
     }
-    if (orderlyHolding.length === 0) lines.push(`  ${'Orderly'.padEnd(26)} holding: none`);
+    if (orderlyHolding.length === 0) show('Orderly', 'holding: none');
   });
   const l = ledgerOf(desk);
   over('contract idle_usdc (books)', l.idle_usdc, 0n, `${usdcText(l.idle_usdc)} USDC`);
@@ -250,13 +483,22 @@ async function signedHolding({ a, deps, desk, deskId, brokerId, client, say }) {
   say(`orderly   desk ${deskId}: signing one orderly_request kind holding with ${publicKey} (${e.accountId})`);
   const data = await orderly.holding('retire: check that the Orderly holding is empty');
   const rows = data?.holding;
-  if (!Array.isArray(rows)) throw new Error(`Orderly holding answered ${JSON.stringify(data).slice(0, 300)}, not a holding list`);
-  return rows;
+  if (!Array.isArray(rows)) throw new Error(`Orderly holding of desk ${deskId} could not be read: ${JSON.stringify(data).slice(0, 300)} is not a holding list`);
+  return rows.map((h) => ({
+    token: String(h?.token ?? '?'),
+    holding: holdingNumber(deskId, 'holding', h?.holding),
+    frozen: holdingNumber(deskId, 'frozen', h?.frozen ?? 0),
+    pending_short: holdingNumber(deskId, 'pending_short', h?.pending_short ?? 0),
+  }));
 }
+
+/** What these checks do not read (said in every run, so nobody takes the list for more than it is). */
+export const NOT_COVERED = 'Orderly under any broker but the contract\'s; EVM chains other than Arbitrum and HyperEVM; Phoenix trader PDAs other than 0; '
+  + 'Solana stake accounts and NFTs; NEP-141 tokens nearblocks does not index; NEAR NFTs';
 
 /**
  * Runs the retirement; deps: near, archive (RPC client), fetch, say, now, tree, readKey(file, accountId), readEnv,
- * transport(options), engine(). Returns the summary block.
+ * transport(options), engine(), rpcEnv (the environment the RPC URLs come from). Returns the summary block.
  */
 export async function runRetire(argv, deps = {}) {
   const a = parseRetireArgs(argv);
@@ -285,23 +527,24 @@ export async function runRetire(argv, deps = {}) {
   const blockers = [];
   // NEAR refuses DeleteAccount for an account with more than 10 kB of data besides its code (DeleteAccountWithLargeState).
   const code = await client.code(a.contract);
+  const c8 = code !== null && wasmExports(code).includes('withdraw_to_owner');
   const dataBytes = state.storage_usage - (code === null ? 0 : code.length);
-  say(`state     about ${dataBytes.toLocaleString('en-US')} bytes besides the ${(code?.length ?? 0).toLocaleString('en-US')}-byte code (NEAR deletes accounts with up to ${MAX_DELETE_STATE.toLocaleString('en-US')})`);
+  say(`state     about ${dataBytes.toLocaleString('en-US')} bytes besides the ${(code?.length ?? 0).toLocaleString('en-US')}-byte code (NEAR deletes accounts with up to ${MAX_DELETE_STATE.toLocaleString('en-US')}); `
+    + `${c8 ? 'C8 code: the money record and the fund_venue ring are read' : 'code before C8'}`);
   if (dataBytes > MAX_DELETE_STATE) blockers.push(`${a.contract} stores about ${dataBytes} bytes besides its code: NEAR refuses DeleteAccount over ${MAX_DELETE_STATE} (DeleteAccountWithLargeState)`);
 
-  const made = await findCreator(fetchImpl, archive, a.contract);
+  const made = await findCreator(fetchImpl, archive, a.contract, { beneficiary: a.beneficiary, creationTx: a.creationTx });
   say(`creator   ${made.note}`);
-  let beneficiary = made.confirmed ? made.creator : null;
-  if (a.beneficiary !== null) {
-    if (made.creator !== null && a.beneficiary !== made.creator) {
-      throw new Error(`--beneficiary ${a.beneficiary} is not ${made.creator}, the account that created ${a.contract}: the NEAR goes back to the funder`);
-    }
-    beneficiary = a.beneficiary;
-    if (!made.confirmed) say(`warning   the beneficiary ${a.beneficiary} comes from --beneficiary, not from a confirmed creation record: check it is the funder`);
+  if (made.confirmed && a.beneficiary !== null && a.beneficiary !== made.creator) {
+    throw new Error(`--beneficiary ${a.beneficiary} is not ${made.creator}, the account that created ${a.contract}: the NEAR goes back to the funder`);
   }
-  if (beneficiary === null) blockers.push('the beneficiary is unknown: pass --beneficiary <the funder that created the account>');
-  else if ((await client.account(beneficiary)) === null) throw new Error(`the beneficiary ${beneficiary} does not exist: the NEAR would be lost`);
-  say(`benefic.  ${beneficiary ?? 'unknown (pass --beneficiary <funder>.near; never guessed)'}`);
+  const beneficiary = made.confirmed ? made.creator : null;
+  if (beneficiary === null) {
+    blockers.push('the beneficiary is unknown: no confirmed creation transaction (pass --beneficiary <funder> --creation-tx <hash of its near.create_account>)');
+  } else if ((await client.account(beneficiary)) === null) {
+    throw new Error(`the beneficiary ${beneficiary} does not exist: the NEAR would be lost`);
+  }
+  say(`benefic.  ${beneficiary ?? 'unknown (never guessed)'}`);
 
   const ids = new Set(a.desks);
   try {
@@ -309,32 +552,60 @@ export async function runRetire(argv, deps = {}) {
   } catch (e) {
     blockers.push(`the desk list could not be read in full (${e.message}): run again later`);
   }
-  if (made.creator !== null) for (const id of await client.view(a.contract, 'desks_of', { owner: made.creator })) ids.add(id);
-  const desks = [];
-  for (const id of [...ids].sort()) {
-    const d = await client.view(a.contract, 'get_desk', { desk_id: id });
-    if (d !== null) desks.push([id, d]);
+  for (const owner of new Set([made.creator, beneficiary].filter((x) => x !== null))) {
+    for (const id of await client.view(a.contract, 'desks_of', { owner })) ids.add(id);
   }
-  say(`desks     ${desks.length === 0 ? 'none' : desks.map(([id, d]) => `${id} (owner ${d.owner})`).join(', ')}`);
+  const deskIds = [...ids].sort();
 
-  const urls = rpcUrls();
-  say(`rpc       Solana ${urls.shown.solana}, Arbitrum ${urls.shown.arbitrum}`);
-  const contractUsdc = await nearUsdcBalance(client, a.contract);
-  const findings = async (holdings) => {
+  const urls = rpcUrls(deps.rpcEnv ?? process.env);
+  say(`rpc       Solana ${urls.shown.solana}, Arbitrum ${urls.shown.arbitrum}, HyperEVM ${urls.shown.hyperevm}`);
+  say(`not covered: ${NOT_COVERED}`);
+
+  /** Everything, read now: the contract's NEAR tokens, then each desk's books, records and venues. */
+  const readAll = async (holdings) => {
     const problems = [];
     const lines = [];
-    if (contractUsdc > DUST.usdcE6) problems.push(`${a.contract} holds ${usdcText(contractUsdc)} USDC on NEAR`);
-    lines.push(`${a.contract} USDC on NEAR: ${usdcText(contractUsdc)}`);
+    const contractRead = async (what, fn) => {
+      try {
+        await fn();
+      } catch (e) {
+        lines.push(`${a.contract} ${what} could not be read (${e.message})`);
+        problems.push(`${a.contract} ${what} could not be read`);
+      }
+    };
+    await contractRead('USDC on NEAR', async () => {
+      const u = await nearUsdcBalance(client, a.contract);
+      lines.push(`${a.contract} USDC on NEAR: ${usdcText(u)}`);
+      if (u > DUST.usdcE6) problems.push(`${a.contract} holds ${usdcText(u)} USDC on NEAR`);
+    });
+    await contractRead('NEP-141 tokens (nearblocks)', async () => {
+      const fts = (await nearInventory(fetchImpl, a.contract)).filter((t) => t.contract !== NEAR_USDC);
+      lines.push(`${a.contract} NEP-141 tokens (nearblocks): ${fts.length === 0 ? 'none' : fts.map((t) => `${t.contract} ${t.amount}`).join(', ')}`);
+      for (const t of fts) if (t.amount > 0n) problems.push(`${a.contract} holds ${t.contract} ${t.amount} (base units)`);
+    });
+    await contractRead('intents.near tokens', async () => {
+      const tokens = await intentsTokens(client, a.contract);
+      lines.push(`${a.contract} intents.near tokens: ${tokens.length === 0 ? 'none' : JSON.stringify(tokens).slice(0, 300)}`);
+      if (tokens.length > 0) problems.push(`${a.contract} holds tokens on intents.near: ${JSON.stringify(tokens).slice(0, 300)}`);
+    });
+    const desks = [];
+    for (const id of deskIds) {
+      const d = await client.view(a.contract, 'get_desk', { desk_id: id });
+      if (d !== null) desks.push([id, d]);
+    }
+    lines.push(`desks: ${desks.length === 0 ? 'none' : desks.map(([id, d]) => `${id} (owner ${d.owner})`).join(', ')}`);
     const registered = [];
     for (const [id, d] of desks) {
+      lines.push(`desk ${id}: EVM ${d.evm_address}, Solana ${d.solana.authority}, Orderly ${d.orderly_account_id}`);
       const f = await deskFindings({ fetchImpl, urls, desk: d, deskId: id, brokerId, orderlyHolding: holdings.get(id) ?? null });
-      lines.push(`desk ${id}: EVM ${d.evm_address}, Solana ${d.solana.authority}, Orderly ${d.orderly_account_id}`, ...f.lines);
-      problems.push(...f.problems);
+      const r = await recordFindings({ client, contract: a.contract, deskId: id, c8, now: now() });
+      lines.push(...f.lines, ...r.lines);
+      problems.push(...f.problems, ...r.problems);
       if (f.orderlyRegistered) registered.push([id, d]);
     }
     return { problems, lines, registered };
   };
-  let found = await findings(new Map());
+  let found = await readAll(new Map());
   say();
   say(found.lines.join('\n'));
 
@@ -349,8 +620,11 @@ export async function runRetire(argv, deps = {}) {
   say(`  returns   about ${nearText(BigInt(state.amount), 4)} NEAR to ${beneficiary ?? 'the beneficiary'}, the code's storage included`);
 
   const at = () => new Date(now()).toISOString();
-  const head = [`contract ${a.contract}, ${a.send ? 'SEND' : 'dry run'}; beneficiary ${beneficiary ?? 'unknown'} (${made.confirmed ? 'creation confirmed' : 'not confirmed'}); `
-    + `${nearText(BigInt(state.amount), 4)} NEAR, ${dataBytes} bytes of data`];
+  const head = [
+    `contract ${a.contract}, ${a.send ? 'SEND' : 'dry run'}; beneficiary ${beneficiary ?? 'unknown'} (${made.confirmed ? 'creation confirmed' : 'not confirmed'}); `
+      + `${nearText(BigInt(state.amount), 4)} NEAR, ${dataBytes} bytes of data`,
+    `not covered: ${NOT_COVERED}`,
+  ];
   const unread = found.registered.map(([id]) => `desk ${id}: Orderly holding unread (signed read at --send)`);
   if (!a.send) {
     const block = summaryBlock('retire', {
@@ -359,7 +633,7 @@ export async function runRetire(argv, deps = {}) {
     });
     say();
     say(block.join('\n'));
-    say('\ndry run: nothing was signed or sent. --send reads the Orderly holding with one signed read, every balance again, and deletes the account only when all are dust.');
+    say('\ndry run: nothing was signed or sent. --send reads the Orderly holding with one signed read, then everything again, and deletes the account only when all is clean.');
     const all = [...found.problems, ...blockers];
     if (all.length > 0) throw new Error(`--send would refuse:\n  ${all.join('\n  ')}`);
     return block;
@@ -372,9 +646,12 @@ export async function runRetire(argv, deps = {}) {
   }
   const holdings = new Map();
   for (const [id, d] of found.registered) holdings.set(id, await signedHolding({ a, deps, desk: d, deskId: id, brokerId, client, say }));
-  found = await findings(holdings);
+  // Everything again, after the Orderly read and right before the signature: money may have moved meanwhile.
+  say('\nrecheck   every balance, the books and the contract\'s records, read again after the Orderly read, just before signing');
+  found = await readAll(holdings);
   say(found.lines.join('\n'));
-  if (found.problems.length > 0) throw new Error(`not deleting ${a.contract}:\n  ${found.problems.join('\n  ')}`);
+  const missing = found.registered.filter(([id]) => !holdings.has(id)).map(([id]) => `desk ${id}: registered on Orderly since the first read; run again`);
+  if (found.problems.length > 0 || missing.length > 0) throw new Error(`not deleting ${a.contract}:\n  ${[...found.problems, ...missing].join('\n  ')}`);
 
   const before = BigInt((await client.account(beneficiary)).amount);
   const out = await client.send(signer, a.contract, actions, { onSent: (h) => say(`\nDeleteAccount sent ${h}; waiting for final`) });

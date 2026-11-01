@@ -8,7 +8,7 @@
 // on USDC yet (a new contract never is), a storage_deposit for it goes first, 0.00125 NEAR from the owner: without
 // it USDC refuses the transfer.
 //
-// Default: a dry run. It checks the contract (mainnet Gimbal, code with ft_on_transfer), the desk, the owner's USDC
+// Default: a dry run. It checks the contract (mainnet Gimbal, code with all four money methods), the desk, the owner's USDC
 // and NEAR, and prints every transaction in full. Nothing is signed. --send reads the owner's key file, only then,
 // checks it is a full-access key of the desk's owner, sends one transaction at a time, waits for final, and reads
 // get_desk after. --send refuses in a linked git worktree. It ends with one block to paste back.
@@ -87,7 +87,7 @@ export async function runDeposit(argv, deps = {}) {
   const { desk } = await moneyContext(client, a.contract, a.deskId, ['ft_on_transfer']);
   const owner = desk.owner;
   const before = ledgerOf(desk);
-  say(`contract  ${a.contract}: Mainnet Gimbal, its code has ft_on_transfer`);
+  say(`contract  ${a.contract}: Mainnet Gimbal, its code has the money methods (ft_on_transfer and the other three)`);
   say(`desk      ${a.deskId}: owner ${owner}, paused ${desk.paused}`);
   say(`ledger    ${ledgerText(before)}`);
 

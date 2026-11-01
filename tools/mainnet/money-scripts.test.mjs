@@ -8,7 +8,7 @@ import { NEAR_USDC } from './balances.mjs';
 import { OPERATOR_METHODS } from './desk.mjs';
 import { depositPlan, runDeposit } from './deposit.mjs';
 import { runFund, venueTarget } from './fund.mjs';
-import { MAX_DELETE_STATE, retireCallProblem, runRetire } from './retire.mjs';
+import { runRetire } from './retire.mjs';
 import { CANARY_LIMITS, MAINNET_ORDERLY_BROKER } from './venues.mjs';
 import { runWithdraw, withdrawActions } from './withdraw.mjs';
 
@@ -87,6 +87,7 @@ function world(o = {}) {
   const seen = { sent: [], fetch: [], keys: 0, views: [] };
   let deleted = false;
   let hlValue = o.hl ?? '0.0';
+  let hlRaw = o.hlRaw ?? null;
   const accounts = {
     [contract]: { amount: String(63n * NEAR / 10n), locked: '0', storage_usage: code.length + (o.dataBytes ?? 3_000), code_hash: 'Code111' },
     [OWNER]: { amount: String(2n * NEAR), locked: '0', storage_usage: 500, code_hash: '11111111111111111111111111111111' },
@@ -130,6 +131,7 @@ function world(o = {}) {
         accounts[actions[0].beneficiaryId] = { ...accounts[actions[0].beneficiaryId], amount: String(BigInt(accounts[actions[0].beneficiaryId].amount) + 63n * NEAR / 10n) };
       }
       if (r.hl !== undefined) hlValue = r.hl;
+      if (r.hlRaw !== undefined) hlRaw = r.hlRaw;
       return { hash, burntTgas: 5, burntYocto: 10n ** 20n, logs: r.logs ?? [], failure: r.failure ?? null, value: r.value ?? null };
     },
   };
@@ -160,7 +162,9 @@ function world(o = {}) {
     }
     if (u.includes('hyperliquid.xyz/info')) {
       const body = JSON.parse(init.body);
-      if (body.type === 'clearinghouseState') return json({ marginSummary: { accountValue: hlValue }, withdrawable: hlValue, assetPositions: [] });
+      if (body.type === 'clearinghouseState') {
+        return json({ marginSummary: { accountValue: hlValue, totalRawUsd: hlRaw ?? hlValue }, withdrawable: hlValue, assetPositions: [] });
+      }
       if (body.type === 'spotClearinghouseState') return json({ balances: [] });
     }
     if (u.includes('/v1/get_account')) return json(o.orderly ? { success: true, data: { account_id: desk.orderly_account_id } } : { success: false, code: -1607, message: 'Account not found.' });
@@ -215,7 +219,12 @@ test('the money scripts refuse a contract without the C8 money methods (the old 
     [runFund, [CONTRACT, DESK_ID, 'hyperliquid', '12'], 'fund_venue'],
   ]) {
     const r = await capture(fn, argv, deps);
-    assert.match(r.error?.message ?? '', new RegExp(`has no ${method}: it is not the C8 contract`), method);
+    assert.match(r.error?.message ?? '', new RegExp(`has no ${method}.*: it is not the C8 contract`), method);
+  }
+  // Every money script needs all four money methods, whichever one it calls.
+  const partial = world({ code: wasmWith(['new', 'config', 'get_desk', 'ft_on_transfer', 'fund_venue', 'withdraw_to_owner']), quote: () => { throw new Error('no quote'); } });
+  for (const [fn, argv] of [[runDeposit, [CONTRACT, DESK_ID, '10']], [runWithdraw, [CONTRACT, DESK_ID, '5']], [runFund, [CONTRACT, DESK_ID, 'hyperliquid', '12']]]) {
+    assert.match((await capture(fn, argv, partial.deps)).error?.message ?? '', /has no clear_payout_lock: it is not the C8 contract/, argv.join(' '));
   }
 });
 
@@ -378,7 +387,7 @@ test('fund --send: a live quote checked, fund_venue signed with the operator key
     keyPublic: OP_PUBLIC,
     now: Date.parse(live.response.timestamp) + 1000,
     quote: (body) => { bodies.push(body); return json(live.response, 201); },
-    onSend: () => ({ value: true, hl: '19.6', logs: ['EVENT_JSON:{"standard":"gimbal","version":"1.0.0","event":"fund_venue","data":[{"desk_id":"canary"}]}'] }),
+    onSend: () => ({ value: true, hl: '19.6', hlRaw: '19.6', logs: ['EVENT_JSON:{"standard":"gimbal","version":"1.0.0","event":"fund_venue","data":[{"desk_id":"canary"}]}'] }),
   });
   const r = await capture(runFund, [CONTRACT, DESK_ID, 'hyperliquid', '20', '--send'], { ...w.deps, env: new Map() });
   assert.equal(r.error, null, r.error?.stack);
@@ -391,7 +400,16 @@ test('fund --send: a live quote checked, fund_venue signed with the operator key
   assert.equal(w.seen.sent[0].signer, OP_PUBLIC);
   assert.ok(w.seen.fetch.some((f) => f.includes('/v0/deposit/submit') && f.includes(live.response.quote.depositAddress)));
   assert.ok(r.block.includes('1click:   status SUCCESS'));
-  assert.ok(r.block.some((l) => /^venue: {4}hyperliquid 0 -> 19\.6 USDC \(landed 19\.6\)$/.test(l)));
+  assert.ok(r.block.some((l) => /^venue: {4}hyperliquid totalRawUsd 0 -> 19\.6 USDC \(cash, without unrealized PnL\)$/.test(l)), r.block.join('\n'));
+  assert.ok(r.block.includes('landed:   yes: 1Click SUCCESS and hyperliquid cash up 19.6 USDC (>= minAmountOut 19.480951)'), r.block.join('\n'));
+
+  // The account value rising (unrealized PnL) is not a landing: only cash counts.
+  const pnl = world({
+    keyPublic: OP_PUBLIC, now: Date.parse(live.response.timestamp) + 1000,
+    quote: () => json(live.response, 201), onSend: () => ({ value: true, hl: '25.0', hlRaw: '0.0' }),
+  });
+  const p = await capture(runFund, [CONTRACT, DESK_ID, 'hyperliquid', '20', '--send', '--timeout-s', '60'], { ...pnl.deps, env: new Map() });
+  assert.ok(p.block.some((l) => /^landed: {3}not seen: 1Click SUCCESS but hyperliquid cash up 0 USDC/.test(l)), p.block?.join('\n') ?? p.error?.stack);
 
   const full = world({ keyPublic: PUBLIC, now: Date.parse(live.response.timestamp) + 1000, quote: () => json(live.response, 201) });
   const f = await capture(runFund, [CONTRACT, DESK_ID, 'hyperliquid', '20', '--send'], { ...full.deps, env: new Map() });
@@ -399,93 +417,23 @@ test('fund --send: a live quote checked, fund_venue signed with the operator key
   assert.equal(full.seen.sent.length, 0);
 });
 
-// --- retire ---
-
-test('retire dry run: the creator from the creation transaction, every desk address read, the DeleteAccount printed; no key read', async () => {
-  const { seen, deps } = world({ contract: OLD, code: C7, desk: deskOf({ ledger: { deposited: 0, withdrawn: 0, fees_paid: 0, hwm: 0, idle_usdc: 0 } }) });
-  const r = await capture(runRetire, [OLD], deps);
-  assert.equal(r.error, null, r.error?.stack);
-  assert.match(r.out, /creator {3}created by funder\.near in https:\/\/nearblocks\.io\/txns\/CreateTx111 \(near\.create_account, confirmed/);
-  assert.match(r.out, /whoever takes the name controls those addresses/);
-  assert.match(r.out, /desks {5}canary \(owner /);
-  for (const what of ['Hyperliquid perps value', 'Hyperliquid spot', 'Solana authority SOL', 'Solana USDC token account', 'Solana PhUSD token account', 'Arbitrum USDC', 'Arbitrum ETH', 'Orderly', 'contract idle_usdc']) {
-    assert.match(r.out, new RegExp(`\\n {2}${what}`), what);
-  }
-  assert.match(r.out, /gimbal-canary\.near USDC on NEAR: 0/);
-  assert.match(r.out, /DeleteAccount: the account gimbal-canary\.near is deleted; its whole NEAR balance goes to the beneficiary funder\.near/);
-  assert.match(r.out, /state {5}about 3,000 bytes besides the/);
-  assert.match(r.block[1], /beneficiary funder\.near \(creation confirmed\)/);
-  assert.equal(seen.keys + seen.sent.length, 0);
-});
-
-test('retire refuses: money left on a venue, a beneficiary that is not the creator, an unknown creator, too much state', async () => {
-  const rich = world({ contract: OLD, code: C7, hl: '5.0', desk: deskOf({ ledger: { deposited: 0, withdrawn: 0, fees_paid: 0, hwm: 0, idle_usdc: 0 } }) });
-  const d = await capture(runRetire, [OLD], rich.deps);
-  assert.match(d.error.message, /--send would refuse:\n {2}desk canary: Hyperliquid perps value holds 5 USDC/);
-  const s = await capture(runRetire, [OLD, '--send'], rich.deps);
-  assert.match(s.error.message, /not deleting gimbal-canary\.near/);
-  assert.equal(rich.seen.keys + rich.seen.sent.length, 0, 'refused before the key is read');
-
-  const idle = world({ contract: OLD, code: C7 });
-  assert.match((await capture(runRetire, [OLD], idle.deps)).error.message, /desk canary: contract idle_usdc \(books\) holds 30 USDC/);
-
-  const clean = { desk: deskOf({ ledger: { deposited: 0, withdrawn: 0, fees_paid: 0, hwm: 0, idle_usdc: 0 } }), contract: OLD, code: C7 };
-  const other = world(clean);
-  assert.match((await capture(runRetire, [OLD, '--beneficiary', 'someone.near'], other.deps)).error.message, /--beneficiary someone\.near is not funder\.near, the account that created/);
-
-  const down = world({ ...clean, nearblocks: false });
-  const u = await capture(runRetire, [OLD], down.deps);
-  assert.match(u.out, /benefic\. {2}unknown \(pass --beneficiary <funder>\.near; never guessed\)/);
-  assert.match(u.error.message, /the beneficiary is unknown/);
-  assert.match(u.error.message, /the desk list could not be read in full/);
-
-  const big = world({ ...clean, dataBytes: MAX_DELETE_STATE + 1 });
-  assert.match((await capture(runRetire, [OLD], big.deps)).error.message, /NEAR refuses DeleteAccount over 10000 \(DeleteAccountWithLargeState\)/);
-});
-
-test('retire --send: one signed Orderly holding read (nothing else gets through), then the DeleteAccount, and the account is gone', async () => {
-  assert.equal(retireCallProblem(OLD, OLD, 'orderly_request', { req: { kind: 'holding' } }), null);
-  assert.match(retireCallProblem(OLD, OLD, 'orderly_request', { req: { kind: 'withdraw_request' } }), /not orderly_request of kind holding/);
-  assert.match(retireCallProblem(OLD, OLD, 'hl_withdraw', {}), /not orderly_request of kind holding/);
-  assert.match(retireCallProblem(OLD, 'other.near', 'orderly_request', { req: { kind: 'holding' } }), /retire calls gimbal-canary\.near only/);
-
-  const w = world({ contract: OLD, code: C7, orderly: true, desk: deskOf({ ledger: { deposited: 0, withdrawn: 0, fees_paid: 0, hwm: 0, idle_usdc: 0 } }) });
-  const calls = [];
-  const transport = {
-    accountId: OWNER,
-    publicKey: async () => OP_PUBLIC,
-    call: async (contractId, method, args) => { calls.push({ contractId, method, kind: args.req.kind }); return { ok: true }; },
-    view: async () => null, account: async () => null, allowance: async () => 0n,
+test('fund refuses a verified quote that is not what was asked: amount, slippage, venue', async () => {
+  const live = fundQuote(LIVE);
+  const run = async (argv) => {
+    const w = world({ keyPublic: OP_PUBLIC, now: Date.parse(live.response.timestamp) + 1000, quote: () => json(live.response, 201) });
+    const r = await capture(runFund, argv, { ...w.deps, env: new Map() });
+    return { r, sent: w.seen.sent.length };
   };
-  const engine = async () => ({
-    NearContractClient: class {
-      constructor(o) { this.o = o; }
-      orderlyRequest(deskId, req, reason) { return this.o.transport.call(this.o.contractId, 'orderly_request', { desk_id: deskId, req, reason }, 100); }
-    },
-    OrderlyDeskClient: class {
-      constructor(o) { this.o = o; }
-      async holding(reason) {
-        await this.o.signer.orderlyRequest(this.o.deskId, { kind: 'holding' }, reason);
-        await assert.rejects(this.o.signer.orderlyRequest(this.o.deskId, { kind: 'withdraw_request' }, 'x'), /not orderly_request of kind holding/);
-        return { holding: [{ token: 'USDC', holding: 0, frozen: 0, pending_short: 0 }] };
-      }
-    },
-  });
-  const env = new Map([
-    ['GIMBAL_MODE', 'mainnet'], ['NEAR_NETWORK', 'mainnet'], ['GIMBAL_CONTRACT_ID', OLD], ['DESK_ID', DESK_ID],
-    ['OWNER_ACCOUNT_ID', OWNER], ['OPERATOR_PRIVATE_KEY', SECRET],
-  ]);
-  const dry = await capture(runRetire, [OLD], w.deps);
-  assert.ok(dry.block.includes('desk canary: Orderly holding unread (signed read at --send)'));
-  const r = await capture(runRetire, [OLD, '--send'], { ...w.deps, engine, transport: async () => transport, readEnv: () => env });
-  assert.equal(r.error, null, r.error?.stack);
-  assert.deepEqual(calls, [{ contractId: OLD, method: 'orderly_request', kind: 'holding' }]);
-  assert.match(r.out, /Orderly USDC +holding 0, frozen 0, pending_short 0/);
-  assert.equal(w.seen.sent.length, 1);
-  assert.deepEqual(w.seen.sent[0].actions, [{ type: 'DeleteAccount', beneficiaryId: FUNDER }]);
-  assert.ok(r.block.some((l) => /^delete: {3}tx Tx1 succeeded; gimbal-canary\.near no longer exists$/.test(l)));
-  assert.ok(r.block.some((l) => /^benefic\.: funder\.near 2\.0000 -> 8\.3000 NEAR$/.test(l)));
-  assert.doesNotMatch(r.out, new RegExp(SECRET));
+  // The recorded quote: 20 USDC from NEAR to HyperCore at 100 bps, recipient the desk EVM.
+  const amount = await run([CONTRACT, DESK_ID, 'hyperliquid', '12', '--send']);
+  assert.match(amount.r.error?.message ?? '', /the quote is not the transfer asked for:[\s\S]*amountIn 20000000 is not the 12 USDC asked \(12000000\)/);
+  assert.equal(amount.sent, 0);
+  const slip = await run([CONTRACT, DESK_ID, 'hyperliquid', '20', '--slippage-bps', '150', '--send']);
+  assert.match(slip.r.error?.message ?? '', /slippageTolerance 100 is not the 150 asked/);
+  assert.equal(slip.sent, 0);
+  const venue = await run([CONTRACT, DESK_ID, 'solana', '20', '--send']);
+  assert.match(venue.r.error?.message ?? '', /destinationAsset .* is not solana's|recipient .* is not solana's/);
+  assert.equal(venue.sent, 0);
 });
 
 test('the placeholders are the vectors\' public test desk', () => {

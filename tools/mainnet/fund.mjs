@@ -11,9 +11,13 @@
 // The quote: USDC on NEAR -> the venue, refundTo = the desk owner (a refund on NEAR is a plain ft_transfer and
 // must not go to the contract), recipient = the desk's venue address. It is checked here with the contract's own
 // rules (oneclick.mjs: signature, fields, >= 0.5 % room below amountOut, the policy's cost bound and the hourly
-// fund_venue budget) before anything is signed; then fund_venue(desk_id, quote, quote_signature, reason) goes out,
-// signed with the engine's operator key, 300 TGas. After it: POST /deposit/submit, then 1Click's status and the
-// venue balance are read until the transfer lands, fails, or --timeout-s passes.
+// fund_venue budget), and against what was typed (recipient and destinationAsset of this venue, amountIn = the
+// amount in NEAR USDC base units, slippageTolerance = --slippage-bps), before anything is signed; then
+// fund_venue(desk_id, quote, quote_signature, reason) goes out, signed with the engine's operator key, 300 TGas.
+// After it: POST /deposit/submit, then 1Click's status and the venue balance are read until the transfer lands,
+// fails, or --timeout-s passes. "Landed" means 1Click SUCCESS and the venue's cash up by at least minAmountOut,
+// cash without unrealized PnL: Hyperliquid's totalRawUsd (not accountValue), the Solana USDC token account. Orderly
+// holdings are not public, so there it says "unconfirmed".
 //
 // Default: a dry run with a DRY quote (dry: true reserves no deposit address and cannot be paid). Only --send asks
 // for a live quote, and only after every other check passed. ONECLICK_API_KEY (from the environment or .env) is
@@ -21,7 +25,7 @@
 // FunctionCall key for this contract, and refuses in a linked git worktree. It ends with one block to paste back.
 
 import { UsageError, envValues, isMain, parseFlags, run } from './cli.mjs';
-import { hyperliquidBalances, rpcUrls, solanaBalances } from './balances.mjs';
+import { hyperliquidPerps, rpcUrls, solanaBalances } from './balances.mjs';
 import { sendRefusal } from './checks.mjs';
 import { OPERATOR_METHODS, operatorKeyFile } from './desk.mjs';
 import {
@@ -112,12 +116,34 @@ export function checkFundQuote(response, { contract, deskId, desk, policy, now, 
   return { quote, signature: response.signature, q, cost, budget, allowed: allowedCostE8(q.amountInE8, policy.max_transfer_cost_bps, policy.max_transfer_cost_flat_e6), roomBps };
 }
 
-/** A venue's balance as USDC x 1e6 (null when it cannot be read from public data: Orderly). */
+/**
+ * Why a verified quote is not the transfer the human asked for (an empty list when it is): the venue's recipient
+ * and destination asset, the typed amount in NEAR USDC base units (6 decimals), the requested slippage, EXACT_INPUT.
+ */
+export function quoteMismatch(quote, { venue, amount, slippage, target }) {
+  const f = JSON.parse(quote);
+  const out = [];
+  const same = (x, y) => typeof x === 'string' && typeof y === 'string' && (x === y || (x.startsWith('0x') && x.toLowerCase() === y.toLowerCase()));
+  if (!same(f.recipient, target.recipient)) out.push(`recipient ${f.recipient} is not ${venue}'s (${target.recipient})`);
+  if (f.destinationAsset !== target.destinationAsset) out.push(`destinationAsset ${f.destinationAsset} is not ${venue}'s (${target.destinationAsset})`);
+  if (f.amountIn !== amount.toString()) out.push(`amountIn ${f.amountIn} is not the ${usdcText(amount)} USDC asked (${amount})`);
+  if (Number(f.slippageTolerance) !== slippage) out.push(`slippageTolerance ${f.slippageTolerance} is not the ${slippage} asked`);
+  if (f.swapType !== 'EXACT_INPUT') out.push(`swapType ${f.swapType} is not EXACT_INPUT`);
+  return out;
+}
+
+/**
+ * A venue's balance that only a transfer changes, USDC x 1e6, and its name: Hyperliquid's main perps totalRawUsd
+ * (cash: without unrealized PnL), the Solana USDC token account; null for Orderly (holdings need a signed read).
+ */
+export const VENUE_BALANCE = { hyperliquid: 'totalRawUsd', solana: 'USDC token account', orderly: null };
 async function venueBalanceE6(venue, desk, fetchImpl, urls) {
-  if (venue === 'hyperliquid') return (await hyperliquidBalances(fetchImpl, desk.evm_address)).accountValueE6;
+  if (venue === 'hyperliquid') return (await hyperliquidPerps(fetchImpl, desk.evm_address)).totalRawE6;
   if (venue === 'solana') return (await solanaBalances(fetchImpl, urls.solana, { authority: desk.solana.authority, tokenAccounts: { usdc: desk.solana.usdc_ata } })).tokens.usdc.amount;
   return null;
 }
+/** Polls after 1Click says SUCCESS while the venue balance has not moved yet. */
+const POLLS_AFTER_SUCCESS = 30;
 
 /**
  * Runs the funding; deps: near, fetch, say, now, tree, readKey(file, accountId), env (Map of ONECLICK_API_KEY),
@@ -185,7 +211,10 @@ export async function runFund(argv, deps = {}) {
     + `${qt.depositAddress ? `, depositAddress ${qt.depositAddress}` : ''}, signed ${r.body.timestamp}`);
   const checked = checkFundQuote(r.body, { contract: a.contract, deskId: a.deskId, desk, policy, now: now(), dry: !a.send });
   const q = checked.q;
+  const mismatch = quoteMismatch(checked.quote, { venue: a.venue, amount: a.amount, slippage: a.slippage, target });
+  if (mismatch.length > 0) throw new Error(`the quote is not the transfer asked for: nothing was signed\n  ${mismatch.join('\n  ')}`);
   say(`verified  1Click's signature over the canonical quote; fund_venue's field rules${a.send ? '' : ' (a dry quote passes here only; the contract takes live quotes)'}`);
+  say(`          what was asked: recipient ${target.recipient}, ${target.destinationAsset}, amountIn ${a.amount}, slippage ${a.slippage} bps, EXACT_INPUT`);
   say(`          cost ${usdE8Text(checked.cost)} USDC (amountIn - minAmountOut), allowed ${usdE8Text(checked.allowed)}; room below amountOut ${checked.roomBps} bps (>= 50); `
     + `hourly fund_venue budget ${usdE8Text(checked.budget)} USD (what earlier transfers used is not readable; the contract checks it)`);
 
@@ -243,24 +272,36 @@ export async function runFund(argv, deps = {}) {
   const submit = await submitDeposit(fetchImpl, out.hash, q.depositAddress, apiKey).catch((e) => ({ status: 0, body: { message: e.message } }));
   say(`1click    POST /deposit/submit {"txHash":"${out.hash}","depositAddress":"${q.depositAddress}"} -> HTTP ${submit.status}`);
   const deadline = now() + a.timeoutS * 1000;
+  // "Landed" needs both: 1Click SUCCESS and the venue's cash up by at least minAmountOut. The cash excludes
+  // unrealized PnL (Hyperliquid totalRawUsd, not accountValue), so a price move is never taken for the transfer.
+  const minOutE6 = q.minAmountOutE8 / 100n;
+  const balanceName = VENUE_BALANCE[a.venue];
   let last = null;
   let landed = null;
   let venueNow = venueBefore;
+  let afterSuccess = 0;
   for (;;) {
     const s = await quoteStatus(fetchImpl, q.depositAddress, apiKey).catch((e) => ({ status: 0, body: { status: `unread (${e.message})` } }));
     const st = s.body?.status ?? `HTTP ${s.status}`;
     if (st !== last) say(`1click    status ${st} at ${at()}`);
     last = st;
     venueNow = await venueBalanceE6(a.venue, desk, fetchImpl, urls).catch(() => venueNow);
-    if (venueBefore !== null && venueNow !== null && venueNow - venueBefore >= q.minAmountOutE8 / 100n) landed = venueNow - venueBefore;
+    if (venueBefore !== null && venueNow !== null && venueNow - venueBefore >= minOutE6) landed = venueNow - venueBefore;
     if (FINAL_STATUSES.includes(st) && (st !== 'SUCCESS' || venueBefore === null || landed !== null)) break;
+    if (st === 'SUCCESS' && ++afterSuccess >= POLLS_AFTER_SUCCESS) break;
     if (now() >= deadline) break;
     await sleep(deps.pollMs ?? 10_000);
   }
+  const up = venueBefore === null || venueNow === null ? null : venueNow - venueBefore;
   const extra = [
     `1click:   status ${last}`,
-    `venue:    ${a.venue} ${venueBefore === null ? 'balance not public' : `${usdcText(venueBefore)} -> ${venueNow === null ? '?' : usdcText(venueNow)} USDC`}${landed === null ? '' : ` (landed ${usdcText(landed)})`}`,
+    `venue:    ${a.venue} ${balanceName === null || venueBefore === null ? 'balance not public or not read' : `${balanceName} ${usdcText(venueBefore)} -> ${venueNow === null ? '?' : usdcText(venueNow)} USDC`}`
+      + `${a.venue === 'hyperliquid' && venueBefore !== null ? ' (cash, without unrealized PnL)' : ''}`,
   ];
+  if (last !== 'SUCCESS') extra.push(`landed:   no: 1Click status ${last}`);
+  else if (landed !== null) extra.push(`landed:   yes: 1Click SUCCESS and ${a.venue} cash up ${usdcText(landed)} USDC (>= minAmountOut ${usdcText(minOutE6)})`);
+  else if (up === null) extra.push(`landed:   unconfirmed: 1Click SUCCESS; the ${a.venue} balance is not public or could not be read, so it is not checked here`);
+  else extra.push(`landed:   not seen: 1Click SUCCESS but ${a.venue} cash up ${usdcText(up)} USDC (< minAmountOut ${usdcText(minOutE6)}); check the venue before counting it`);
   if (last !== 'SUCCESS') extra.push(`open:     not finished within ${a.timeoutS} s or not a success: GET https://1click.chaindefuser.com/v0/status?depositAddress=${q.depositAddress}; a refund goes to ${desk.owner}`);
   const block = done(extra);
   if (last === 'REFUNDED' || last === 'FAILED') throw new Error(`1Click ended the transfer ${last}: the USDC goes back to the owner ${desk.owner}, not to the desk`);

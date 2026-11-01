@@ -302,7 +302,15 @@ export function createClient({ urls = RPC_URLS, fetch: fetchImpl = (...a) => glo
     }
   }
 
-  return { rpc, view, account, accessKey, accessKeys, send, fees, code };
+  /** The contract's raw storage under `prefix` (view_state): [{ key, value }] as Buffers. Throws on any error. */
+  async function state(id, prefix) {
+    mainnetId(id);
+    const r = await rpc('query', { request_type: 'view_state', finality: 'final', account_id: id, prefix_base64: Buffer.from(prefix).toString('base64'), include_proof: false });
+    if (!Array.isArray(r?.values)) throw new Error(`view_state of ${id}: no values`);
+    return r.values.map((v) => ({ key: Buffer.from(v.key, 'base64'), value: Buffer.from(v.value, 'base64') }));
+  }
+
+  return { rpc, view, account, accessKey, accessKeys, send, fees, code, state };
 }
 
 // --- gas ---
