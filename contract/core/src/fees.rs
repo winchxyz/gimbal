@@ -4,10 +4,16 @@
 //!
 //! On a payout `x` (taken from the desk's idle USDC, the fee included):
 //! `profit = withdrawn + x − deposited`, `fee = performance_bps × max(0, profit − hwm) / 10⁴`,
-//! then `hwm = max(hwm, profit)`. `withdrawn` counts every payout whole, the fee included, so
-//! `withdrawn − fees_paid` is what the owner received and `profit` is the desk's profit before fees.
+//! then the high-water mark rises by the profit that fee paid for (below). `withdrawn` counts every
+//! payout whole, the fee included, so `withdrawn − fees_paid` is what the owner received and
+//! `profit` is the desk's profit before fees.
 //!
-//! Rounding goes to the owner: the fee is rounded down, and it is never more than `x`.
+//! Rounding goes to the owner: the fee is rounded down, and it is never more than `x`. The mark
+//! rises only by the profit the charged fee covers, `fee × 10⁴ / bps` rounded up (at most to
+//! `profit`): a fee cut to `x` (a payout smaller than the fee due, after a failed fee transfer)
+//! leaves the rest of the profit above the mark, due at the next payout, and so does a fee rounded
+//! down, so splitting a payout never lowers the total fee below `bps` × the profit rounded down,
+//! and never raises it above.
 //!
 //! A payout is two transfers, the owner's share first and the fee after it. [`Books::undo_payout`]
 //! takes the whole payout back when the owner's transfer failed (nothing left the contract), and
@@ -53,6 +59,16 @@ impl Payout {
     }
 }
 
+/// The profit a fee of `fee` pays for at `performance_bps`: `fee × 10⁴ / bps`, rounded up (the
+/// owner's way: a higher mark). At 0 bps nothing is ever charged, so all profit counts as covered.
+fn covered(fee: u128, performance_bps: u16) -> u128 {
+    if performance_bps == 0 {
+        return u128::MAX;
+    }
+    fee.checked_mul(10_000)
+        .map_or(u128::MAX, |v| v.div_ceil(u128::from(performance_bps)))
+}
+
 /// `performance_bps × value / 10⁴`, rounded down, without the product overflowing.
 pub fn share_down(value: u128, performance_bps: u16) -> u128 {
     let bps = u128::from(performance_bps);
@@ -77,7 +93,9 @@ impl Books {
         // max(0, profit − hwm) = max(0, withdrawn + x − deposited − hwm), all terms ≥ 0.
         let above = paid.saturating_sub(self.deposited.saturating_add(self.hwm));
         let fee = share_down(above, performance_bps).min(amount);
-        let hwm_after = self.hwm.max(paid.saturating_sub(self.deposited));
+        let hwm_after = self
+            .hwm
+            .saturating_add(covered(fee, performance_bps).min(above));
         Payout {
             amount,
             fee,
@@ -254,11 +272,25 @@ mod tests {
         venue_result(&mut b, 19);
         // Profit 19 base units: 10% is 1.9, charged 1.
         assert_eq!(b.payout(20, BPS).fee, 1);
-        // Paid in single units, every fee rounds to 0.
+        // Paid in single units, each fee rounds to 0 until 10 units of profit are above the mark,
+        // which a fee of 1 covers: the total is the unsplit payout's, never more.
         let mut split = b;
         let total: u128 = (0..20).map(|_| pay(&mut split, 1)).sum();
-        assert_eq!(total, 0);
-        assert_eq!(split.hwm, 19);
+        assert_eq!(total, 1);
+        assert_eq!(
+            split.hwm, 10,
+            "the 9 units the fee did not cover stay above the mark"
+        );
+        // A fee rounded down never charges the remainder twice: 15 then 5 is 1 + 1, as 20 at once.
+        let mut e = Books::default();
+        e.deposit_principal(100);
+        e.deposit_return(20);
+        assert_eq!(pay(&mut e, 115), 1);
+        assert_eq!(pay(&mut e, 5), 1);
+        let mut f = Books::default();
+        f.deposit_principal(100);
+        f.deposit_return(20);
+        assert_eq!(pay(&mut f, 120), 2);
         // At 33.33%: 1/3 of 10 is 3.33, charged 3.
         let mut c = Books::default();
         c.deposit_return(10);
@@ -313,6 +345,22 @@ mod tests {
         // Then nothing is due any more.
         venue_result(&mut b, 5 * USDC);
         assert_eq!(b.payout(5 * USDC, BPS).fee, USDC / 2);
+    }
+
+    /// Review item 4: after a failed fee transfer, payouts smaller than the fee due each take the
+    /// payout, and the mark rises only by what they covered, so the whole fee is still charged.
+    #[test]
+    fn a_fee_cut_to_the_payout_leaves_the_rest_due() {
+        let mut b = Books::default();
+        b.deposit_principal(100 * USDC);
+        venue_result(&mut b, 10 * USDC);
+        let p = b.payout(110 * USDC, BPS);
+        b.apply(&p);
+        b.undo_fee(&p);
+        assert_eq!(pay(&mut b, USDC / 2), USDC / 2);
+        assert_eq!(b.hwm, 5 * USDC);
+        assert_eq!(pay(&mut b, USDC / 2), USDC / 2);
+        assert_eq!((b.fees_paid, b.hwm, b.idle_usdc), (USDC, 10 * USDC, 0));
     }
 
     /// After a failed fee, a payout smaller than the fee due takes at most the payout.

@@ -91,6 +91,8 @@ enum StorageKey {
     DeskCounters,
     OperatorCounts,
     Money,
+    FundCounters,
+    FundPaid,
 }
 
 /// The contract's state. There is no `migrate` method and the layout carries no version: every
@@ -129,6 +131,16 @@ pub struct Gimbal {
     /// Desk id → its owner, ledger and payout flag ([`money`]), apart from the desk record so
     /// money in and out writes a few fixed bytes. Stored with the desk.
     money: LookupMap<String, DeskMoney>,
+    /// Desk id → its `fund_venue` meters and deposit ring ([`money`]): the same shape as
+    /// [`Self::desk_counters`] but its own, so funding never uses up what rescues may cost or how
+    /// many deposit addresses they may pay. Its amount meter and EIP-3009 counter stay 0. Stored
+    /// with the desk.
+    fund_counters: LookupMap<String, DeskCounters>,
+    /// sha256 of a deposit address any desk's `fund_venue` paid → when (ms), contract-wide: a
+    /// `fund_venue` quote refunds to the owner, so two desks of one owner with the same pinned
+    /// Orderly receiver could otherwise both pay one quote. Bounded: an entry leaves when the
+    /// desk's ring slot that holds it is reused, so there are at most 32 per desk.
+    fund_paid: LookupMap<[u8; 32], u64>,
 }
 
 #[near]
@@ -166,6 +178,8 @@ impl Gimbal {
             price_asked_ms: [0; ORACLE_ASSETS.len()],
             desk_counters: LookupMap::new(StorageKey::DeskCounters),
             money: LookupMap::new(StorageKey::Money),
+            fund_counters: LookupMap::new(StorageKey::FundCounters),
+            fund_paid: LookupMap::new(StorageKey::FundPaid),
         }
     }
 
@@ -499,8 +513,10 @@ impl Gimbal {
         refund
     }
 
-    /// Stores the desk, its nonce entry, its counters and its money record and appends its id to
-    /// the owner's ids; returns the bytes that took.
+    /// Stores the desk, its nonce entry, its counters, its money record and its fund counters, and
+    /// appends its id to the owner's ids; returns the bytes that took, plus the
+    /// [`money::FUND_PAID_RESERVE_BYTES`] its `fund_venue` entries in the contract-wide map may
+    /// take later, so the owner pays for those too.
     fn write_desk(&mut self, desk_id: &str, desk: &Desk) -> u64 {
         let before = env::storage_usage();
         self.desks.insert(desk_id.to_owned(), desk.clone());
@@ -509,12 +525,16 @@ impl Gimbal {
             .insert(desk_id.to_owned(), DeskCounters::default());
         self.money
             .insert(desk_id.to_owned(), DeskMoney::new(desk.owner.clone()));
+        self.fund_counters
+            .insert(desk_id.to_owned(), DeskCounters::default());
         let n = self.desk_counts.get(&desk.owner).copied().unwrap_or(0);
         self.desk_ids
             .insert((desk.owner.clone(), n), desk_id.to_owned());
         self.desk_counts.insert(desk.owner.clone(), n + 1);
         self.flush_desks();
-        env::storage_usage().saturating_sub(before)
+        env::storage_usage()
+            .saturating_sub(before)
+            .saturating_add(money::FUND_PAID_RESERVE_BYTES)
     }
 
     /// Undoes [`Self::write_desk`] in the same call. Desks are never deleted, so the owner's last
@@ -524,6 +544,7 @@ impl Gimbal {
         self.hl_nonces.remove(desk_id);
         self.desk_counters.remove(desk_id);
         self.money.remove(desk_id);
+        self.fund_counters.remove(desk_id);
         let count = self.desk_counts.get(owner).copied().unwrap_or(0);
         if let Some(last) = count.checked_sub(1) {
             self.desk_ids.remove(&(owner.clone(), last));
@@ -542,6 +563,8 @@ impl Gimbal {
         self.hl_nonces.flush();
         self.desk_counters.flush();
         self.money.flush();
+        self.fund_counters.flush();
+        self.fund_paid.flush();
         self.desk_counts.flush();
         self.desk_ids.flush();
     }

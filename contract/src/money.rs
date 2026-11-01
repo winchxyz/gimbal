@@ -8,22 +8,38 @@
 //!   addresses or its pinned Orderly receiver. Its `refundTo` is the desk owner's NEAR account: a
 //!   1Click refund on NEAR is a plain `ft_transfer`, which calls nothing in the receiver, so a
 //!   refund to the contract would land with no desk to credit. The owner gets it back directly.
-//!   A quote pays once: the deposit address goes into the desk's ring of the last 32 transfers
-//!   (shared with the rescues, [`crate::rescue::DEPOSIT_RING`]) and its cost into the hourly cost
-//!   budget. The amount is not capped beyond `idle_usdc`: it only moves the desk's money into the
-//!   desk's own accounts.
+//!   A quote pays once: the deposit address goes into the contract-wide `fund_paid` map and the
+//!   desk's own `fund_venue` ring of the last 32 transfers ([`crate::rescue::DEPOSIT_RING`], 65
+//!   min), and its cost into the desk's own hourly `fund_venue` cost budget
+//!   ([`fund_cost_budget_e8`]); the rescues' ring and budget are never touched, so funding cannot
+//!   block a rescue. The amount is not capped beyond `idle_usdc`: it only moves the desk's money
+//!   into the desk's own accounts.
+//!
+//!   What is left between the owner and the treasury: a refund goes to the owner and leaves the
+//!   books as spent, so idle USDC that held profit (1Click returns) reaches the owner without the
+//!   fee, and the owner re-depositing it counts as principal again (`deposited` up by the refund).
+//!   Either way the treasury is under-charged by at most `performance_bps` (10 %) of the refunded
+//!   amount, and nobody but the owner can gain. A deliberate refund is made hard: the quote must
+//!   leave 0.5 % between `amountOut` and `minAmountOut` (`FUND_VENUE_MIN_ROOM_BPS`), so it is not
+//!   built to fail; within that, refunds stay rare and cost the owner the round trip.
 //! - `withdraw_to_owner` sends the owner's share first and the fee to the treasury only once the
 //!   owner's transfer landed. One payout per desk is in flight at a time, so a failed transfer can
 //!   be taken back exactly: the whole payout when the owner's transfer failed, the fee alone
-//!   (back into `idle_usdc`, due again at the next payout) when only the fee transfer failed.
+//!   (back into `idle_usdc`, due again at the next payout) when only the fee transfer failed. The
+//!   callbacks get several times the gas they use; should one still fail, the owner can clear the
+//!   lock an hour later with `clear_payout_lock`, which changes nothing else.
 //!
 //! The contract pays the transfers' 1 yoctoNEAR and the USDC storage registration of the deposit
 //! address (0.00125 NEAR; the owner's registration, when it exists already, comes back).
 
+use gimbal_core::decimal::format_e8;
 use gimbal_core::errors::{shown, Refusal, E_ARGS, E_NO_DESK, E_SIZE};
+use gimbal_core::errors::{E_QUOTE_FIELDS, E_RESCUE_CAP};
 use gimbal_core::fees::{Books, Payout};
 use gimbal_core::ids::check_reason;
-use gimbal_core::oneclick::{Method, VerifiedQuote};
+use gimbal_core::oneclick::{
+    fund_cost_budget_e8, transfer_cost_e8, Method, VerifiedQuote, QUOTE_PAYABLE_MS,
+};
 use near_sdk::json_types::{I128, U128};
 use near_sdk::serde::Deserialize;
 use near_sdk::serde_json::{self, json};
@@ -31,9 +47,9 @@ use near_sdk::{env, near, AccountId, Gas, NearToken, Promise, PromiseError, Prom
 
 use crate::deposit::{check_one_yocto, ONE_YOCTO};
 use crate::desk::{Gate, Ledger};
-use crate::events::{Deposit, Event, FeeCharged, PayoutEvent};
-use crate::rescue::{deposit_of, quote_fields};
-use crate::{action_desk, fail, owner_desk, Gimbal, GimbalExt, OrFail};
+use crate::events::{Deposit, Event, FeeCharged, PayoutEvent, PayoutLockCleared};
+use crate::rescue::{deposit_of, quote_fields, DeskCounters, DEPOSIT_RING};
+use crate::{action_desk, desk_ref, fail, owner_desk, Gimbal, GimbalExt, OrFail};
 
 /// Gas for the USDC contract's `ft_transfer`: near-contract-standards burns about 3 TGas; Circle's
 /// token adds its pause and blocklist checks.
@@ -78,9 +94,11 @@ pub const FUND_VENUE_GAS: Gas = sum(&[
     WAIT_FEE,
     WAIT_FEE,
 ]);
-/// Gas for `on_fund_venue`: one result, one small write; it schedules nothing.
-pub const ON_FUND_VENUE_GAS: Gas = Gas::from_tgas(15);
-/// The least prepaid gas `fund_venue` accepts (`E_ARGS` below it), 110 TGas: its own cost, two
+/// Gas for `on_fund_venue`: one result, one small write; it schedules nothing. Far over what it
+/// uses (under 1 TGas with its wasm work): a callback that ran out would not re-credit a failed
+/// transfer.
+pub const ON_FUND_VENUE_GAS: Gas = Gas::from_tgas(20);
+/// The least prepaid gas `fund_venue` accepts (`E_ARGS` below it), 115 TGas: its own cost, two
 /// storage registrations, the transfer and the callback. The engine attaches 300.
 pub const FUND_VENUE_MIN_GAS: Gas = sum(&[
     FUND_VENUE_GAS,
@@ -93,10 +111,14 @@ pub const FUND_VENUE_MIN_GAS: Gas = sum(&[
 /// What `withdraw_to_owner` uses itself: its own work, and the fees of a transfer and its
 /// callback, 30 TGas.
 pub const WITHDRAW_GAS: Gas = sum(&[OWN_WORK_GAS, CALL_FEE, CALL_FEE, WAIT_FEE]);
-/// Gas for `on_payout_fee`: one result, one small write, two events; it schedules nothing.
-pub const ON_PAYOUT_FEE_GAS: Gas = Gas::from_tgas(15);
-/// Gas for `on_payout_owner`: its own work, the fee transfer and its callback, and their fees,
-/// 60 TGas. It must never run out: the payout lock is released in the callbacks.
+/// Gas for `on_payout_fee`: one result, one small write, two events; it schedules nothing. Far
+/// over what it uses (under 1 TGas with its wasm work).
+pub const ON_PAYOUT_FEE_GAS: Gas = Gas::from_tgas(20);
+/// Gas a callback that schedules calls gets beyond its estimate, so it has several times what it
+/// uses: the payout lock is released in the callbacks.
+pub const CALLBACK_MARGIN_GAS: Gas = Gas::from_tgas(40);
+/// Gas for `on_payout_owner`: its own work, the fee transfer and its callback and their fees, and
+/// [`CALLBACK_MARGIN_GAS`], 105 TGas.
 pub const ON_PAYOUT_OWNER_GAS: Gas = sum(&[
     OWN_WORK_GAS,
     CALL_FEE,
@@ -104,10 +126,22 @@ pub const ON_PAYOUT_OWNER_GAS: Gas = sum(&[
     WAIT_FEE,
     FT_TRANSFER_GAS,
     ON_PAYOUT_FEE_GAS,
+    CALLBACK_MARGIN_GAS,
 ]);
-/// The least prepaid gas `withdraw_to_owner` accepts (`E_ARGS` below it), 105 TGas. The fee-only
+/// How long a payout lock is held before the owner may clear it (`clear_payout_lock`): a callback
+/// runs within a few blocks of its transfer or never.
+pub const PAYOUT_LOCK_CLEAR_MS: u64 = 3_600_000;
+/// The least prepaid gas `withdraw_to_owner` accepts (`E_ARGS` below it), 150 TGas. The fee-only
 /// path (the owner's share is 0) schedules the fee transfer and `on_payout_fee` instead, less.
 pub const WITHDRAW_MIN_GAS: Gas = sum(&[WITHDRAW_GAS, FT_TRANSFER_GAS, ON_PAYOUT_OWNER_GAS]);
+
+/// The storage one entry of the contract-wide `fund_paid` map takes: the 1-byte map prefix and
+/// the 32-byte hash, the 8-byte time, and the 40 bytes the protocol counts per record.
+pub const FUND_PAID_ENTRY_BYTES: u64 = 1 + 32 + 8 + 40;
+/// What `create_desk` charges besides what it writes: the desk's share of the contract-wide map,
+/// at most one entry per slot of its fund ring, so `fund_venue` never adds storage the owner did
+/// not pay for.
+pub const FUND_PAID_RESERVE_BYTES: u64 = DEPOSIT_RING as u64 * FUND_PAID_ENTRY_BYTES;
 
 /// The desk's money on NEAR, apart from the desk record: a deposit or a payout reads and writes
 /// these bytes (81 plus the owner id and its length, 149 for an implicit account) whatever the
@@ -120,6 +154,8 @@ pub struct DeskMoney {
     pub ledger: Ledger,
     /// A `withdraw_to_owner` of this desk has transfers in flight; its callbacks clear it.
     pub payout_pending: bool,
+    /// Block time (ms) the pending payout was booked; 0 with none.
+    pub payout_since_ms: u64,
 }
 
 impl DeskMoney {
@@ -128,6 +164,7 @@ impl DeskMoney {
             owner,
             ledger: Ledger::default(),
             payout_pending: false,
+            payout_since_ms: 0,
         }
     }
 
@@ -137,6 +174,11 @@ impl DeskMoney {
 
     fn set_books(&mut self, books: Books) {
         self.ledger = books.into();
+    }
+
+    fn unlock(&mut self) {
+        self.payout_pending = false;
+        self.payout_since_ms = 0;
     }
 }
 
@@ -193,6 +235,15 @@ pub struct FundVenue {
     pub owner: AccountId,
     /// USDC × 1e6, the quote's `amountIn`.
     pub amount: u128,
+}
+
+/// A `fund_venue` counted on the desk's own meters: the new counters, the deposit address's hash
+/// for the contract-wide map, and the hash (with its paid time) the ring slot forgot, which leaves
+/// that map.
+pub struct CountedFund {
+    pub counters: DeskCounters,
+    pub deposit_sha256: [u8; 32],
+    pub forgotten: Option<([u8; 32], u64)>,
 }
 
 /// Whether the one promise the callback waits for succeeded. `ft_transfer` returns nothing, so
@@ -337,7 +388,7 @@ impl Gimbal {
                 let mut books = money.books();
                 books.undo_payout(&p);
                 money.set_books(books);
-                money.payout_pending = false;
+                money.unlock();
             }
             env::log_str(&format!(
                 "the payout of {} to {owner} failed; desk {desk_id}'s ledger is as before",
@@ -382,7 +433,7 @@ impl Gimbal {
             let mut books = money.books();
             books.undo_fee(&p);
             money.set_books(books);
-            money.payout_pending = false;
+            money.unlock();
         }
         env::log_str(&format!(
             "the fee of {} for desk {desk_id} did not reach the treasury; it is back in the desk's \
@@ -403,6 +454,46 @@ impl Gimbal {
         };
         emit_payout(&desk_id, &owner, &paid);
         true
+    }
+
+    /// The owner's way out of a payout lock that its callbacks never released (a callback that
+    /// failed, out of gas say): once the lock has been held for [`PAYOUT_LOCK_CLEAR_MS`] (1 h),
+    /// clears it (`E_ARGS` before then or with no lock). Owner only, exactly 1 yoctoNEAR
+    /// (`E_NOT_ALLOWED`). It re-credits nothing and rolls nothing back: the ledger stays as
+    /// `withdraw_to_owner` booked it (the whole amount out, the fee charged), because the contract
+    /// cannot know whether the transfers landed, and crediting a payout that did land would pay it
+    /// twice. Event `payout_lock_cleared`.
+    #[payable]
+    #[deny_unknown_arguments]
+    pub fn clear_payout_lock(&mut self, desk_id: String) {
+        owner_desk(&self.desks, &desk_id, "clear_payout_lock");
+        check_one_yocto("clear_payout_lock", env::attached_deposit()).or_fail();
+        let now_ms = env::block_timestamp_ms();
+        let money = self.money_mut(&desk_id);
+        if !money.payout_pending {
+            fail(Refusal::new(
+                E_ARGS,
+                format!("desk {desk_id} has no payout in flight"),
+            ));
+        }
+        let since_ms = money.payout_since_ms;
+        let free_at_ms = since_ms.saturating_add(PAYOUT_LOCK_CLEAR_MS);
+        if now_ms < free_at_ms {
+            fail(Refusal::new(
+                E_ARGS,
+                format!(
+                    "the payout of desk {desk_id} was booked at {since_ms} ms; its lock can be \
+                     cleared from {free_at_ms} ms"
+                ),
+            ));
+        }
+        money.unlock();
+        PayoutLockCleared {
+            desk_id: &desk_id,
+            locked_since_ms: since_ms,
+            ledger: "unchanged",
+        }
+        .emit();
     }
 }
 
@@ -483,6 +574,71 @@ impl Gimbal {
         self.build_fund_venue(desk_id, &q)
     }
 
+    /// The desk's `fund_venue` counters with the verified quote `q` counted at the block time, or
+    /// the refusal: `E_QUOTE_FIELDS` for a deposit address any desk's `fund_venue` paid within
+    /// [`QUOTE_PAYABLE_MS`] (a quote pays once, contract-wide), `E_RESCUE_CAP` for a 33rd
+    /// `fund_venue` of the desk within 65 min (its ring would forget an address a quote can still
+    /// pay) or a cost ([`transfer_cost_e8`]) over what is left of the desk's hourly `fund_venue`
+    /// cost budget ([`fund_cost_budget_e8`]). Writes nothing.
+    pub fn counted_fund_venue(&self, desk_id: &str, q: &VerifiedQuote) -> CountedFund {
+        let policy = &desk_ref(&self.desks, desk_id).policy;
+        let now_ms = env::block_timestamp_ms();
+        let mut counters = self.fund_counters.get(desk_id).copied().unwrap_or_default();
+        let deposit = deposit_of(q);
+        let deposit_sha256 = env::sha256_array(deposit.as_bytes());
+        if let Some(paid_ms) = self.fund_paid.get(&deposit_sha256) {
+            if now_ms.saturating_sub(*paid_ms) <= QUOTE_PAYABLE_MS {
+                fail(Refusal::new(
+                    E_QUOTE_FIELDS,
+                    format!(
+                        "deposit address {deposit} was paid by a fund_venue at {paid_ms} ms; a \
+                         quote pays once"
+                    ),
+                ));
+            }
+        }
+        if let Some(paid_ms) = counters.held(now_ms) {
+            fail(Refusal::new(
+                E_RESCUE_CAP,
+                format!(
+                    "this desk's last {DEPOSIT_RING} fund_venue transfers were paid within 65 min, \
+                     the oldest at {paid_ms} ms: the next one waits until after {} ms",
+                    paid_ms.saturating_add(QUOTE_PAYABLE_MS)
+                ),
+            ));
+        }
+        let cost = transfer_cost_e8(q);
+        let budget = fund_cost_budget_e8(
+            policy
+                .max_notional_usd
+                .max(policy.unpriced_max_notional_usd),
+            policy.max_transfer_cost_bps,
+            policy.max_transfer_cost_flat_e6,
+        );
+        let cost_left = counters.remaining_cost_e8(budget, now_ms);
+        if cost > cost_left {
+            fail(Refusal::new(
+                E_RESCUE_CAP,
+                format!(
+                    "the fund_venue may cost {} USD, over what is left of the hourly fund_venue \
+                     cost budget, {} of {} USD",
+                    format_e8(cost),
+                    format_e8(cost_left),
+                    format_e8(budget)
+                ),
+            ));
+        }
+        let slot = usize::from(counters.deposit_next) % DEPOSIT_RING;
+        let forgotten = (counters.deposits[slot] != [0; 32])
+            .then(|| (counters.deposits[slot], counters.deposit_paid_ms[slot]));
+        counters.spend(0, cost, deposit_sha256, now_ms);
+        CountedFund {
+            counters,
+            deposit_sha256,
+            forgotten,
+        }
+    }
+
     /// The transfer of a verified quote of USDC on NEAR: its deposit address counted in the
     /// desk's ring and its cost in the hourly budget, its amount taken from `idle_usdc`.
     pub fn build_fund_venue(&mut self, desk_id: String, q: &VerifiedQuote) -> FundVenue {
@@ -509,8 +665,15 @@ impl Gimbal {
                 ),
             ));
         }
-        let counters = self.counted_transfer(&desk_id, q, false);
-        self.desk_counters.insert(desk_id.clone(), counters);
+        let counted = self.counted_fund_venue(&desk_id, q);
+        self.fund_counters.insert(desk_id.clone(), counted.counters);
+        if let Some((old, old_ms)) = counted.forgotten {
+            if self.fund_paid.get(&old) == Some(&old_ms) {
+                self.fund_paid.remove(&old);
+            }
+        }
+        self.fund_paid
+            .insert(counted.deposit_sha256, env::block_timestamp_ms());
         let money = self.money_mut(&desk_id);
         money.ledger.idle_usdc -= q.amount_in;
         FundVenue {
@@ -571,6 +734,7 @@ impl Gimbal {
         books.apply(&payout);
         money.set_books(books);
         money.payout_pending = true;
+        money.payout_since_ms = env::block_timestamp_ms();
         payout
     }
 
@@ -612,7 +776,7 @@ impl Gimbal {
 
     fn end_payout(&mut self, desk_id: &str) {
         if let Some(money) = self.money.get_mut(desk_id) {
-            money.payout_pending = false;
+            money.unlock();
         }
     }
 }

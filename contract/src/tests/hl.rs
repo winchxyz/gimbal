@@ -450,7 +450,11 @@ fn a_new_desk_pays_for_its_nonce_entry_and_an_action_adds_no_storage() {
     // `write_desk` measures what `create_desk` charges for, the stored nonce entry included.
     let before = env::storage_usage();
     let added = g.write_desk("alpha", &desk);
-    assert_eq!(env::storage_usage(), before + added);
+    // It also charges for the desk's future share of the contract-wide fund_venue map.
+    assert_eq!(
+        env::storage_usage() + crate::money::FUND_PAID_RESERVE_BYTES,
+        before + added
+    );
     assert_eq!(g.hl_nonces.get("alpha"), Some(&0));
     let before = env::storage_usage();
     g.prepare_hl_order("alpha".into(), hype(), "a".into());

@@ -43,6 +43,14 @@ pub const NEAR_USDC: &str =
 /// deposit under 5 USDC, and the margin covers the transfer's own cost.
 pub const ORDERLY_MIN_OUT_E6: u128 = 6_000_000;
 
+/// The least room a `fund_venue` quote leaves between `amountOut` and `minAmountOut`, in bps of
+/// `amountOut` (0.5 %). 1Click refunds a deposit whose swap cannot reach `minAmountOut`, and a
+/// `fund_venue` refund goes to the desk owner: a quote with no room, made to fail, would hand the
+/// owner the desk's idle USDC (profit included) without the performance fee. The rule reads the
+/// signed amounts rather than the signed `slippageTolerance`, since they are what the swap is held
+/// to; 1Click derives `minAmountOut` from that tolerance (100 bps in every recorded quote).
+pub const FUND_VENUE_MIN_ROOM_BPS: u128 = 50;
+
 /// How long after its signed `timestamp` a quote can still be paid, ms. A live quote's `deadline`
 /// is three days out (1Click sets it to the requested deadline + 72 h, `oneclick-live.json`); a
 /// contract remembers the deposit addresses it paid only for a bounded time ([`QUOTE_PAYABLE_MS`]
@@ -201,7 +209,7 @@ struct Fields {
     amount_in_formatted: IgnoredAny,
     amount_in_usd: IgnoredAny,
     min_amount_in: IgnoredAny,
-    amount_out: IgnoredAny,
+    amount_out: String,
     amount_out_formatted: IgnoredAny,
     amount_out_usd: IgnoredAny,
     min_amount_out: String,
@@ -318,6 +326,9 @@ pub fn verify_quote(
 
     let min_amount_out = integer("minAmountOut", &f.min_amount_out)?;
     check_recipient(&f, min_amount_out, ctx)?;
+    if method == Method::FundVenue {
+        check_room(integer("amountOut", &f.amount_out)?, min_amount_out)?;
+    }
 
     // Rules of this contract besides the vectors' field rule.
     if f.swap_type != "EXACT_INPUT" {
@@ -456,6 +467,18 @@ fn check_recipient(f: &Fields, min_amount_out: u128, ctx: &Context) -> Result<()
     )))
 }
 
+/// [`FUND_VENUE_MIN_ROOM_BPS`]: `amountOut − minAmountOut ≥ amountOut × 0.5 %`, exactly
+/// (`E_QUOTE_FIELDS`).
+fn check_room(amount_out: u128, min_amount_out: u128) -> Result<(), Refusal> {
+    let room = amount_out.saturating_sub(min_amount_out);
+    if room.saturating_mul(10_000) < amount_out.saturating_mul(FUND_VENUE_MIN_ROOM_BPS) {
+        return Err(fields(format!(
+            "minAmountOut {min_amount_out} leaves less than 0.5% below amountOut {amount_out}: a              swap held that tight is likely to fail, and fund_venue's refund goes to the owner"
+        )));
+    }
+    Ok(())
+}
+
 /// The deposit address in the form the method pays: a 32-byte base58 Solana address, or an EVM
 /// address returned in lowercase.
 fn deposit_form(method: Method, address: &str) -> Result<String, Refusal> {
@@ -519,6 +542,14 @@ pub fn transfer_cost_e8(q: &VerifiedQuote) -> u128 {
 pub fn rescue_cost_budget_e8(cap_usd: u64, max_bps: u32, max_flat_e6: u64) -> u128 {
     let share = u128::from(cap_usd) * 100_000_000 * u128::from(max_bps) / 10_000;
     share.max(2 * u128::from(max_flat_e6) * 100)
+}
+
+/// What a desk's `fund_venue` transfers of an hour may cost together, USD × 1e8: four transfers
+/// (both legs funded twice) at the policy's per-transfer bound ([`check_cost`]) for the larger
+/// per-leg notional cap. Its own budget: funding never uses up what the rescues may cost.
+pub fn fund_cost_budget_e8(max_notional_usd: u64, max_bps: u32, max_flat_e6: u64) -> u128 {
+    let share = u128::from(max_notional_usd) * 100_000_000 * u128::from(max_bps) / 10_000;
+    4 * share.max(u128::from(max_flat_e6) * 100)
 }
 
 fn same_evm(a: &str, b: &str) -> bool {

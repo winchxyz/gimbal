@@ -332,7 +332,7 @@ fn storage_cost_of_alpha() -> NearToken {
         callback(mpc_answers());
         let before = env::storage_usage();
         run_callback(&mut g, id, desk, attached).unwrap();
-        cost_of(env::storage_usage() - before)
+        cost_of(env::storage_usage() - before + crate::money::FUND_PAID_RESERVE_BYTES)
     })
     .join()
     .unwrap()
@@ -484,7 +484,12 @@ fn mutating_methods_refuse_unknown_arguments() {
         ),
         (
             include_str!("money.rs"),
-            &["ft_on_transfer", "fund_venue", "withdraw_to_owner"],
+            &[
+                "ft_on_transfer",
+                "fund_venue",
+                "withdraw_to_owner",
+                "clear_payout_lock",
+            ],
         ),
     ];
     for (source, methods) in sources {
@@ -635,7 +640,11 @@ fn the_callback_keeps_exactly_the_storage_the_desk_adds() {
     run_callback(&mut g, id, desk, deposit).unwrap();
     let added = env::storage_usage() - before;
     assert!(added > 0);
-    assert_eq!(kept(attached), cost_of(added));
+    // What it wrote, and the desk's share of the contract-wide fund_venue map it may write later.
+    assert_eq!(
+        kept(attached),
+        cost_of(added + crate::money::FUND_PAID_RESERVE_BYTES)
+    );
 }
 
 #[test]
@@ -1310,13 +1319,13 @@ fn the_storage_each_owner_method_adds() {
             "create_desk (the fixtures' policy)",
             "small",
             policy(),
-            2_500,
+            4_000,
         ),
         (
             "create_desk (the largest valid policy)",
             "large",
             Policy::largest_valid(),
-            10_000,
+            12_000,
         ),
     ] {
         call(owner(), NearToken::from_near(1));

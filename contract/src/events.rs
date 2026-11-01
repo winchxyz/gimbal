@@ -23,6 +23,7 @@ pub const SIGNED: &str = "signed";
 pub const DEPOSIT: &str = "deposit";
 pub const PAYOUT: &str = "payout";
 pub const FEE_CHARGED: &str = "fee_charged";
+pub const PAYOUT_LOCK_CLEARED: &str = "payout_lock_cleared";
 
 /// Field order is the order the interface shows, which a struct keeps and a JSON map would not.
 #[derive(Serialize)]
@@ -188,6 +189,20 @@ pub struct FeeCharged<'a> {
 
 impl Event for FeeCharged<'_> {
     const NAME: &'static str = FEE_CHARGED;
+}
+
+/// The owner cleared a payout lock its callbacks never released (`clear_payout_lock`). `ledger` is
+/// always `unchanged`: nothing was re-credited or rolled back.
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct PayoutLockCleared<'a> {
+    pub desk_id: &'a str,
+    pub locked_since_ms: u64,
+    pub ledger: &'static str,
+}
+
+impl Event for PayoutLockCleared<'_> {
+    const NAME: &'static str = PAYOUT_LOCK_CLEARED;
 }
 
 /// One item of `signed`: the action the MPC signed, one item per order it places (asset, side,

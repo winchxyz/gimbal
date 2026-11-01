@@ -7,6 +7,7 @@ use super::hl::{at, VECTOR_DESK_EVM};
 use super::sol::{outcome, vector_solana};
 use super::*;
 use crate::desk::Ledger;
+use crate::money::FUND_PAID_ENTRY_BYTES;
 use crate::money::{
     DeskMoney, PendingPayout, FT_TRANSFER_GAS, FUND_VENUE_GAS, FUND_VENUE_MIN_GAS,
     ON_FUND_VENUE_GAS, ON_PAYOUT_FEE_GAS, ON_PAYOUT_OWNER_GAS, OWN_WORK_GAS, STORAGE_DEPOSIT_GAS,
@@ -16,6 +17,7 @@ use crate::rescue::{DeskCounters, DEPOSIT_RING};
 use gimbal_core::errors::{E_NO_DESK, E_QUOTE_FIELDS, E_QUOTE_SIGNATURE, E_RESCUE_CAP, E_SIZE};
 use gimbal_core::fees::Payout;
 use gimbal_core::network::{NEAR_USDC_MAINNET, NEAR_USDC_TESTNET};
+use gimbal_core::oneclick::QUOTE_PAYABLE_MS;
 use near_sdk::json_types::U128;
 
 const USDC: u128 = 1_000_000;
@@ -174,6 +176,8 @@ fn fund_desk_with(policy: Policy, idle: u128) -> Gimbal {
         .insert("alpha".into(), DeskCounters::default());
     g.money
         .insert("alpha".into(), DeskMoney::new(quote_owner()));
+    g.fund_counters
+        .insert("alpha".into(), DeskCounters::default());
     if idle > 0 {
         deposit_alpha(&mut g, quote_owner(), idle);
     }
@@ -189,7 +193,13 @@ fn fund(g: &mut Gimbal, who: AccountId, name: &str) -> Result<(), String> {
     })
 }
 
+/// The desk's `fund_venue` counters.
 fn counters(g: &Gimbal) -> DeskCounters {
+    *g.fund_counters.get("alpha").unwrap()
+}
+
+/// The desk's rescue counters, which `fund_venue` never touches.
+fn rescue_counters(g: &Gimbal) -> DeskCounters {
     *g.desk_counters.get("alpha").unwrap()
 }
 
@@ -399,11 +409,15 @@ fn fund_venue_pays_the_quotes_deposit_address_from_idle() {
     assert_eq!((c[3].gas, c[3].weight), (ON_FUND_VENUE_GAS, 0));
     assert_eq!(c[3].after.len(), 1);
 
-    // The deposit address is in the ring and the cost in the budget; the amount is not capped.
+    // The deposit address is in the desk's fund ring and the contract-wide map, and the cost in
+    // the fund budget; the amount is not capped, and the rescue counters are untouched.
     let k = counters(&g);
-    assert!(k.paid(&env::sha256_array(deposit.as_bytes())));
+    let hash = env::sha256_array(deposit.as_bytes());
+    assert!(k.paid(&hash));
+    assert_eq!(g.fund_paid.get(&hash), Some(&NOW_MS));
     assert_eq!(k.rescue_spent_e8, 0);
     assert_eq!(k.rescue_cost_e8, 2_000_000_000 - 1_948_095_100);
+    assert_eq!(rescue_counters(&g), DeskCounters::default());
     // No event, no fee.
     assert!(get_logs().is_empty());
     assert_eq!(ledger(&g, "alpha").fees_paid, 0);
@@ -458,60 +472,149 @@ fn a_replayed_fund_venue_quote_is_refused() {
         let got = fund(&mut g, who, HL_QUOTE).unwrap_err();
         assert!(
             got.starts_with(&format!(
-                "{E_QUOTE_FIELDS}: deposit address {} was paid by one of this desk's last {DEPOSIT_RING}",
+                "{E_QUOTE_FIELDS}: deposit address {} was paid by a fund_venue at {NOW_MS} ms",
                 quote(HL_QUOTE).2
             )),
             "{got}"
         );
         assert_eq!((ledger(&g, "alpha"), counters(&g)), after_first);
     }
-    // A rescue quote that paid an address first blocks the fund_venue of it too: one ring.
-    let mut g = fund_desk(50 * USDC);
-    let mut k = counters(&g);
-    k.spend(
-        0,
-        0,
-        env::sha256_array(quote(ORDERLY_QUOTE).2.as_bytes()),
-        NOW_MS,
-    );
-    g.desk_counters.insert("alpha".into(), k);
-    assert!(fund(&mut g, operator(), ORDERLY_QUOTE)
-        .unwrap_err()
-        .starts_with(E_QUOTE_FIELDS));
 }
 
-/// The 32-slot ring holds every address for the 65 min a quote stays payable: a 33rd transfer in
-/// that time is refused before anything is spent.
+/// Review item 5: a `fund_venue` quote refunds to the owner and may pay the pinned Orderly
+/// receiver, so two desks of one owner pinning the same receiver both accept it. The paid deposit
+/// address is remembered contract-wide: the second desk refuses it.
 #[test]
-fn fund_venue_shares_the_ring_limit() {
+fn a_fund_venue_quote_pays_once_across_desks() {
+    let mut g = fund_desk(10 * USDC);
+    let beta = g.desks.get("alpha").unwrap().clone();
+    g.desks.insert("beta".into(), beta);
+    g.desk_counters
+        .insert("beta".into(), DeskCounters::default());
+    g.fund_counters
+        .insert("beta".into(), DeskCounters::default());
+    g.money.insert("beta".into(), DeskMoney::new(quote_owner()));
+    called_by(usdc());
+    let _ = g.ft_on_transfer(
+        quote_owner(),
+        U128(10 * USDC),
+        r#"{"desk_id":"beta"}"#.into(),
+    );
+    fund(&mut g, operator(), ORDERLY_QUOTE).unwrap();
+    at(operator(), NOW_MS + 60_000, yocto(0));
+    let (q, sig, deposit) = quote(ORDERLY_QUOTE);
+    let got = outcome(|| {
+        g.fund_venue("beta".into(), q, sig, "margin in".into())
+            .detach()
+    })
+    .unwrap_err();
+    assert!(
+        got.starts_with(&format!(
+            "{E_QUOTE_FIELDS}: deposit address {deposit} was paid by a fund_venue"
+        )),
+        "{got}"
+    );
+    assert_eq!(ledger(&g, "beta").idle_usdc, 10 * USDC);
+}
+
+/// The contract-wide map stays bounded: when a desk's fund ring reuses a slot (its address paid
+/// more than 65 min ago), that address leaves the map.
+#[test]
+fn the_contract_wide_map_forgets_with_the_ring() {
+    let mut g = fund_desk(50 * USDC);
+    let mut k = counters(&g);
+    let old = [7u8; 32];
+    let long_ago = NOW_MS - QUOTE_PAYABLE_MS - 1;
+    k.spend(0, 0, old, long_ago);
+    for n in 1..DEPOSIT_RING {
+        k.spend(0, 0, [n as u8 + 100; 32], long_ago + 1);
+    }
+    g.fund_counters.insert("alpha".into(), k);
+    g.fund_paid.insert(old, long_ago);
+    fund(&mut g, operator(), HL_QUOTE).unwrap();
+    assert_eq!(
+        g.fund_paid.get(&old),
+        None,
+        "the reused slot's address left the map"
+    );
+    let (_, _, deposit) = quote(HL_QUOTE);
+    assert!(g
+        .fund_paid
+        .contains_key(&env::sha256_array(deposit.as_bytes())));
+}
+
+/// The desk's own 32-slot fund ring holds every address for the 65 min a quote stays payable: a
+/// 33rd fund_venue in that time is refused before anything is spent.
+#[test]
+fn fund_venue_has_its_own_ring_limit() {
     let mut g = fund_desk(50 * USDC);
     let mut k = counters(&g);
     for n in 0..DEPOSIT_RING {
         k.spend(0, 0, [n as u8 + 1; 32], NOW_MS - 1000);
     }
-    g.desk_counters.insert("alpha".into(), k);
+    g.fund_counters.insert("alpha".into(), k);
     let got = fund(&mut g, operator(), HL_QUOTE).unwrap_err();
-    assert!(got.starts_with(E_RESCUE_CAP), "{got}");
+    assert!(
+        got.starts_with(&format!(
+            "{E_RESCUE_CAP}: this desk's last {DEPOSIT_RING} fund_venue transfers"
+        )),
+        "{got}"
+    );
     assert_eq!(ledger(&g, "alpha").idle_usdc, 50 * USDC);
 }
 
+/// Review item 2: the rescues' ring and cost budget are not the fund_venue's. A desk whose rescue
+/// ring is full and whose rescue cost budget is spent still funds its venues, and 32 fund_venues
+/// leave the rescue counters as they were, so funding never blocks a rescue.
 #[test]
-fn fund_venue_counts_against_the_hourly_cost_budget() {
-    // Cap 20 USD: budget max(0.2, 2 × 0.6) = 1.2 USD; 0.7 of it spent already.
+fn fund_venue_and_rescues_never_block_each_other() {
+    let mut g = fund_desk(50 * USDC);
+    let mut r = rescue_counters(&g);
+    for n in 0..DEPOSIT_RING {
+        r.spend(0, 0, [n as u8 + 1; 32], NOW_MS - 1000);
+    }
+    r.rescue_cost_e8 = u128::MAX / 2;
+    g.desk_counters.insert("alpha".into(), r);
+    fund(&mut g, operator(), HL_QUOTE).unwrap();
+    assert_eq!(rescue_counters(&g), r);
+    // The other way: a full fund ring leaves a rescue's counting as it was.
+    let mut g = fund_desk(50 * USDC);
+    let mut k = counters(&g);
+    for n in 0..DEPOSIT_RING {
+        k.spend(0, 2_000_000_000, [n as u8 + 1; 32], NOW_MS - 1000);
+    }
+    g.fund_counters.insert("alpha".into(), k);
+    assert!(fund(&mut g, operator(), HL_QUOTE).is_err());
+    assert_eq!(rescue_counters(&g), DeskCounters::default());
+    at(operator(), NOW_MS, yocto(0));
+    assert_eq!(
+        rescue_counters(&g).held(NOW_MS),
+        None,
+        "a rescue may take its next slot"
+    );
+}
+
+#[test]
+fn fund_venue_counts_against_its_hourly_cost_budget() {
+    // Notional 20 USD a leg, 1 %, flat 0.6: budget 4 × max(0.2, 0.6) = 2.4 USD; 2 of it spent.
     let mut g = fund_desk_with(
         Policy {
-            rescue_cap_usd_per_hour: 20,
+            max_notional_usd: 20,
+            unpriced_max_notional_usd: 0,
             max_transfer_cost_flat_e6: 600_000,
             ..policy()
         },
         50 * USDC,
     );
     let mut k = counters(&g);
-    k.spend(0, 70_000_000, [9; 32], NOW_MS);
-    g.desk_counters.insert("alpha".into(), k);
+    k.spend(0, 200_000_000, [9; 32], NOW_MS);
+    g.fund_counters.insert("alpha".into(), k);
     let got = fund(&mut g, operator(), HL_QUOTE).unwrap_err();
     assert!(
-        got.starts_with(&format!("{E_RESCUE_CAP}: the rescue may cost 0.519049 USD")),
+        got.starts_with(&format!(
+            "{E_RESCUE_CAP}: the fund_venue may cost 0.519049 USD, over what is left of the hourly \
+             fund_venue cost budget, 0.4 of 2.4 USD"
+        )),
         "{got}"
     );
     assert_eq!(ledger(&g, "alpha").idle_usdc, 50 * USDC);
@@ -532,6 +635,35 @@ fn the_rescue_cap_does_not_bound_fund_venue() {
     );
     fund(&mut g, operator(), HL_QUOTE).unwrap();
     assert_eq!(counters(&g).rescue_spent_e8, 0);
+    assert_eq!(rescue_counters(&g), DeskCounters::default());
+}
+
+/// With the policy's own numbers, normal funding fits: both legs at the largest notional, twice
+/// in an hour, each at the per-quote cost limit.
+#[test]
+fn the_fund_budget_covers_both_legs_twice_an_hour() {
+    use gimbal_core::oneclick::fund_cost_budget_e8;
+    let p = Policy {
+        max_notional_usd: 1_000,
+        ..policy()
+    };
+    let notional = p.max_notional_usd.max(p.unpriced_max_notional_usd);
+    let per_quote = (u128::from(notional) * 100_000_000 * u128::from(p.max_transfer_cost_bps)
+        / 10_000)
+        .max(u128::from(p.max_transfer_cost_flat_e6) * 100);
+    assert_eq!(
+        fund_cost_budget_e8(
+            notional,
+            p.max_transfer_cost_bps,
+            p.max_transfer_cost_flat_e6
+        ),
+        4 * per_quote
+    );
+    assert_eq!(
+        4 * per_quote,
+        4_000_000_000,
+        "40 USD for 1,000 USD legs at 1 %"
+    );
 }
 
 #[test]
@@ -608,7 +740,7 @@ fn fund_venue_refusals() {
     })
     .unwrap_err();
     assert!(
-        got.starts_with("E_ARGS: fund_venue needs at least 110 TGas"),
+        got.starts_with("E_ARGS: fund_venue needs at least 115 TGas"),
         "{got}"
     );
     // A reason over 280 characters.
@@ -876,6 +1008,62 @@ fn a_failed_fee_transfer_keeps_the_fee_with_the_desk_due_once() {
     );
 }
 
+/// Review item 3: a payout whose callbacks never ran (one failed, say) keeps the desk locked until
+/// the owner clears it, an hour after it was booked. Clearing changes nothing in the ledger.
+#[test]
+fn the_owner_clears_a_stuck_payout_lock_after_an_hour() {
+    let mut g = with_desk();
+    deposit_alpha(&mut g, owner(), 100 * USDC);
+    at(owner(), NOW_MS, ONE_YOCTO);
+    g.withdraw_to_owner("alpha".into(), U128(10 * USDC))
+        .detach();
+    assert_eq!(g.money.get("alpha").unwrap().payout_since_ms, NOW_MS);
+    let booked = ledger(&g, "alpha");
+    // Its callback never runs. Withdrawing is refused, and so is clearing for the first hour.
+    let clear = |g: &mut Gimbal, who: AccountId, ms: u64, deposit: NearToken| {
+        at(who, ms, deposit);
+        outcome(|| g.clear_payout_lock("alpha".into()))
+    };
+    let free_at = NOW_MS + 3_600_000;
+    let got = clear(&mut g, owner(), free_at - 1, ONE_YOCTO).unwrap_err();
+    assert!(
+        got.starts_with(&format!(
+            "E_ARGS: the payout of desk alpha was booked at {NOW_MS} ms; its lock can be cleared \
+             from {free_at} ms"
+        )),
+        "{got}"
+    );
+    for who in [operator(), stranger()] {
+        let got = clear(&mut g, who, free_at, ONE_YOCTO).unwrap_err();
+        assert!(got.starts_with(E_NOT_ALLOWED), "{got}");
+    }
+    let got = clear(&mut g, owner(), free_at, yocto(0)).unwrap_err();
+    assert!(got.starts_with(E_NOT_ALLOWED), "{got}");
+    // An hour on: cleared, the ledger as the payout booked it, an event saying so.
+    clear(&mut g, owner(), free_at, ONE_YOCTO).unwrap();
+    assert_eq!(ledger(&g, "alpha"), booked);
+    let m = g.money.get("alpha").unwrap();
+    assert_eq!((m.payout_pending, m.payout_since_ms), (false, 0));
+    assert_eq!(
+        get_logs(),
+        vec![format!(
+            r#"EVENT_JSON:{{"standard":"gimbal","version":"1.0.0","event":"payout_lock_cleared","data":[{{"desk_id":"alpha","locked_since_ms":{NOW_MS},"ledger":"unchanged"}}]}}"#
+        )]
+    );
+    // Nothing left to clear; the owner can withdraw again.
+    let got = clear(&mut g, owner(), free_at, ONE_YOCTO).unwrap_err();
+    assert!(
+        got.starts_with("E_ARGS: desk alpha has no payout in flight"),
+        "{got}"
+    );
+    withdraw(&mut g, 10 * USDC).unwrap();
+    // A settled payout leaves no lock time behind.
+    let (_, p) = scheduled_payout();
+    settled(true);
+    let _ = g.on_payout_owner("alpha".into(), owner(), p);
+    assert_eq!(g.money.get("alpha").unwrap().payout_since_ms, 0);
+}
+
 #[test]
 fn one_payout_at_a_time() {
     let mut g = with_desk();
@@ -937,7 +1125,7 @@ fn withdraw_to_owner_refusals() {
         .attached_deposit(ONE_YOCTO)
         .prepaid_gas(Gas::from_gas(WITHDRAW_MIN_GAS.as_gas() - 1))
         .build());
-    assert_refused("E_ARGS: withdraw_to_owner needs at least 105 TGas", || {
+    assert_refused("E_ARGS: withdraw_to_owner needs at least 150 TGas", || {
         g.withdraw_to_owner("alpha".into(), U128(USDC)).detach();
     });
     assert_eq!(ledger(&g, "alpha").idle_usdc, 10 * USDC);
@@ -1034,7 +1222,11 @@ fn gas_and_storage_of_the_money_methods() {
         .detach();
     let fund_gas = own_gas(gas0);
     f.flush_desks();
-    assert_eq!(env::storage_usage(), storage, "fund_venue adds no storage");
+    assert_eq!(
+        env::storage_usage(),
+        storage + FUND_PAID_ENTRY_BYTES,
+        "fund_venue adds one entry to the contract-wide map, which create_desk charged for"
+    );
     settled(true);
     let gas0 = env::used_gas();
     assert!(f.on_fund_venue("alpha".into(), U128(20 * USDC)));
@@ -1059,18 +1251,23 @@ fn gas_and_storage_of_the_money_methods() {
     // Each method's host gas and receipt fees, plus the wasm work the mock does not meter, fit
     // the share its floor gives it; a callback that ran out would leave the payout lock held.
     let fits = |used: Gas, share: Gas| used.as_gas() + OWN_WORK_GAS.as_gas() <= share.as_gas();
+    // Review item 3: each callback gets at least three times what it uses, its wasm work
+    // included.
+    let roomy = |used: Gas, share: Gas| {
+        3 * (used.as_gas() + Gas::from_tgas(1).as_gas()) <= share.as_gas() && fits(used, share)
+    };
     assert!(fits(fund_gas, FUND_VENUE_GAS), "fund_venue {fund_gas}");
-    assert!(fits(fund_cb_gas, ON_FUND_VENUE_GAS), "{fund_cb_gas}");
+    assert!(roomy(fund_cb_gas, ON_FUND_VENUE_GAS), "{fund_cb_gas}");
     assert!(fits(withdraw_gas, WITHDRAW_GAS), "withdraw {withdraw_gas}");
     let attached = FT_TRANSFER_GAS.as_gas() + ON_PAYOUT_FEE_GAS.as_gas();
     assert!(
-        fits(
+        roomy(
             owner_cb_gas,
             Gas::from_gas(ON_PAYOUT_OWNER_GAS.as_gas() - attached)
         ),
         "on_payout_owner {owner_cb_gas}"
     );
-    assert!(fits(fee_cb_gas, ON_PAYOUT_FEE_GAS), "{fee_cb_gas}");
+    assert!(roomy(fee_cb_gas, ON_PAYOUT_FEE_GAS), "{fee_cb_gas}");
     assert!(deposit_gas < Gas::from_tgas(5), "{deposit_gas}");
     assert!(FUND_VENUE_MIN_GAS <= Gas::from_tgas(300));
     assert!(WITHDRAW_MIN_GAS <= Gas::from_tgas(300));
