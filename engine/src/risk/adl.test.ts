@@ -8,8 +8,8 @@ import type { VenueId } from '@gimbal/shared';
 import type { LegOutcome, LegSide, TradeLeg } from '../trade/legs.ts';
 import { toQty } from '../trade/lots.ts';
 import { PairTrader } from '../trade/pair.ts';
-import type { AdlTrader } from './adl.ts';
-import { AdlWatch, CONFIRM_MS, RETRY_MS, UNWIND_BELOW, adlJournal, legChange } from './adl.ts';
+import type { AdlReport, AdlTrader } from './adl.ts';
+import { AdlWatch, CONFIRM_MS, MAX_TRIES, RETRY_MAX_MS, RETRY_MS, UNWIND_BELOW, adlJournal, legChange } from './adl.ts';
 
 class Leg implements TradeLeg {
   readonly venue: VenueId;
@@ -376,7 +376,7 @@ test('a leg with an unsettled order, even one past its window that the trader ha
   const b = leg('phoenix', 50n);
   let closes = 0;
   const trader: AdlTrader = {
-    legs: [a, b], lot: 1n, busy: false, net: 0n,
+    legs: [a, b], lot: 1n, busy: false, net: 0n, unhedged: null,
     watching: () => false,                                                  // its window has ended...
     unsettled: (l) => (l === a ? { ref: {}, refs: [], until: 0 } : null),   // ...but the trader has not closed it out
     intent: (l) => (l === a ? -50n : 50n),
@@ -384,4 +384,123 @@ test('a leg with an unsettled order, even one past its window that the trader ha
   };
   assert.equal(await new AdlWatch(trader, { sleep: async () => {} }).check(), null);
   assert.equal(closes, 0);
+});
+
+test('one bad read of the remnant does not drop a kept unwind: "reached" needs the confirming read too', async () => {
+  // Step 2 closed Phoenix, HL refused: HL 0.3 alone. Then one HL answer leaves the coin out (reads 0).
+  const { hl, other, trader, adl, advance } = setup();
+  await trader.open({ size: '1', longIndex: 0, reason: 'enter' });
+  hl.pos = toQty('0.3');
+  hl.reject = (_side, reduceOnly) => reduceOnly;
+  const first = await adl.check();
+  assert.equal(first!.reached, false);
+  assert.deepEqual([hl.pos, other.pos], [toQty('0.3'), 0n]);
+  hl.reject = () => false;
+  hl.reads = [0n];
+  advance(10);
+  assert.equal(await adl.check(), null);
+  advance(RETRY_MS * 4);
+  const again = await adl.check();
+  assert.notEqual(again, null, 'still kept: retried');
+  assert.equal(again!.reached, true);
+  assert.deepEqual([hl.pos, other.pos], [0n, 0n]);
+});
+
+test('a new ADL while a response is kept is answered and journaled at once, decided afresh: HL 0.6 then 0 unwinds', async () => {
+  const { hl, other, trader, adl, advance } = setup();
+  await trader.open({ size: '1', longIndex: 0, reason: 'enter' });
+  hl.pos = toQty('0.6');
+  other.reject = (_side, reduceOnly) => reduceOnly;
+  const first = await adl.check();
+  assert.deepEqual([first!.action, first!.reached], ['rehedge', false]);
+  other.reject = () => false;
+  hl.pos = 0n;                                             // deleveraged again: Phoenix -1 alone
+  advance(1_000);                                          // well inside the backoff
+  const second = await adl.check();
+  assert.notEqual(second, null);
+  assert.equal(second!.retry, 0, 'a new event: journaled');
+  assert.equal(second!.action, 'unwind');
+  assert.equal(second!.reached, true);
+  assert.deepEqual([hl.pos, other.pos], [0n, 0n]);
+});
+
+test('every answer to a kept response is decided afresh: down to 20 % it unwinds; a leg that grew past its reference is not traded', async () => {
+  const { hl, other, trader, adl, advance } = setup();
+  await trader.open({ size: '1', longIndex: 0, reason: 'enter' });
+  hl.pos = toQty('0.6');
+  other.reject = (_side, reduceOnly) => reduceOnly;
+  await adl.check();
+  hl.pos = toQty('0.2');
+  advance(1_000);
+  const shrunk = await adl.check();
+  assert.equal(shrunk!.action, 'unwind');
+  assert.match(shrunk!.summary, /20 % kept, under 50 %/);
+  // Phoenix still refuses; now HL reads more than its reference (+1.2): not ADL, nothing sent, left to the owner.
+  hl.pos = toQty('1.2');
+  advance(1_000);
+  const sent = hl.orders.length + other.orders.length;
+  const grew = await adl.check();
+  assert.equal(grew!.action, 'none');
+  assert.match(grew!.summary, /not ADL, nothing traded: hyperliquid ETH grew 1 -> 1\.2/);
+  assert.equal(hl.orders.length + other.orders.length, sent);
+  assert.notEqual(trader.unhedged, null);
+});
+
+test('a close that reports done on a wrong start read is not "reached": the confirming read keeps it, flags it, retries', async () => {
+  const { hl, other, trader, adl, advance } = setup();
+  await trader.open({ size: '1', longIndex: 0, reason: 'enter' });
+  hl.pos = toQty('0.3');
+  // HL reads right for the check, its confirm and step 1's start, then 0 for step 2's start read: that close
+  // thinks HL is closed already and reports `closed`.
+  hl.reads = [toQty('0.3'), toQty('0.3'), toQty('0.3'), 0n];
+  const report = await adl.check();
+  assert.equal(report!.result!.status, 'closed');
+  assert.equal(report!.reached, false);
+  assert.match(report!.summary, /but the legs read 0\.3 and 0 3 s later, not 0 and 0/);
+  assert.notEqual(trader.unhedged, null);
+  assert.deepEqual([hl.pos, other.pos], [toQty('0.3'), 0n]);
+  advance(RETRY_MS);
+  const retry = await adl.check();
+  assert.equal(retry!.reached, true);
+  assert.deepEqual([hl.pos, other.pos], [0n, 0n]);
+});
+
+test(`after ${MAX_TRIES} failed tries the watch gives up: flagged unhedged, reported, nothing more sent`, async () => {
+  const { hl, other, trader, adl, advance } = setup();
+  await trader.open({ size: '0.5', longIndex: 1, reason: 'enter' });
+  other.reject = (_side, reduceOnly) => reduceOnly;
+  hl.pos = toQty('-0.3');
+  const reports: AdlReport[] = [];
+  for (let i = 0; i < MAX_TRIES + 3; i++) {
+    const r = await adl.check();
+    if (r !== null) reports.push(r);
+    advance(RETRY_MAX_MS);
+  }
+  assert.equal(reports.length, MAX_TRIES);
+  assert.deepEqual(reports.map((r) => r.gaveUp), [...Array(MAX_TRIES - 1).fill(false), true]);
+  assert.match(reports.at(-1)!.summary, /8 tries did not bring the pair level: no more tries, only the owner can act now/);
+  assert.notEqual(trader.unhedged, null);
+  const sent = other.orders.length;
+  advance(RETRY_MAX_MS * 3);
+  assert.equal(await adl.check(), null);
+  assert.equal(other.orders.length, sent);
+});
+
+test('stop() during a check waiting on its confirming read: nothing is sent', async () => {
+  let now = 1_000_000;
+  const clock = { now: () => now };
+  const hl = new Leg('hyperliquid', clock.now);
+  const other = new Leg('phoenix', clock.now);
+  const trader = new PairTrader({ legs: [hl, other], priceBandBps: 100, clock, unsettledPollMs: null });
+  let wake!: () => void;
+  const adl = new AdlWatch(trader, { clock, sleep: () => new Promise<void>((r) => { wake = r; now += 3_000; }) });
+  await trader.open({ size: '0.5', longIndex: 1, reason: 'enter' });
+  hl.pos = toQty('-0.3');
+  const checking = adl.check();
+  await new Promise((r) => setImmediate(r));
+  adl.stop();
+  wake();
+  assert.equal(await checking, null);
+  assert.equal(other.orders.length, 1, 'only the open');
+  assert.equal(await adl.check(), null);
 });

@@ -18,7 +18,8 @@
 // was never read, or is older than DESK_VIEW_STALE_MS, marks NEAR down in the health map and keeps the desk at watch
 // at least (DeskState has no "unknown" reserve or pause, so the reserve reads 0 and the pause null until it is read).
 //
-// stop() is final: no tick, ADL check or stress runs after it.
+// stop() is final: no tick, ADL check or stress starts after it; a tick in flight publishes and triggers nothing
+// once its read returns, and the ADL watch is stopped too (a check in flight sends nothing more, adl.ts).
 //
 // Stress (POST /stress, testnet and replay only): raises the rescue line of the nearest leg above its distance, so it
 // goes to rescue on the next read and its rescue starts; cleared with { "on": false }. On mainnet it is refused,
@@ -198,6 +199,7 @@ export class RiskEngine {
   async stop(): Promise<void> {
     this.#stopped = true;
     this.#running = false;
+    this.#o.adl?.stop?.();
     clearTimeout(this.#timer);
     await this.#ticking;
     await this.#adlRun;
@@ -262,6 +264,7 @@ export class RiskEngine {
       this.#log(`risk: the desk could not be read: ${errorMessage(err)}`);
       return this.#desk;
     }
+    if (this.#stopped) return this.#desk;
     const t = this.#clock.now();
     for (const r of snap.reads) {
       if (r.error === null) this.#o.health.readOk(r.venue, r.ms);
@@ -308,6 +311,10 @@ export class RiskEngine {
         // One event, one journal line: a retry after a backoff is journaled only when it brought the pair level.
         if (report !== null && (report.retry === 0 || report.reached)) {
           this.#journal({ ...adlJournal(report, this.#clock.now()) });
+        }
+        if (report?.gaveUp === true) {
+          const f = report.findings[0]!;
+          this.#journal({ t: this.#clock.now(), kind: 'error', summary: `ADL on ${f.leg.venue} ${f.leg.symbol}: no more tries, only the owner can act now (${report.summary})`, numbers: { venue: f.leg.venue, tries: report.retry + 1 }, tx: report.result?.tx ?? [] });
         }
       } catch (err) {
         this.#log(`adl check failed: ${errorMessage(err)}`);

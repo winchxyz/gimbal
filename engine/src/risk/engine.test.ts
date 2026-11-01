@@ -265,7 +265,7 @@ test('one ADL event, one journal line: retries that did not level the pair are n
   const report = (retry: number, closed: boolean): AdlReport => ({
     findings: [{ index: 0, leg, intent: -500n, pos: -300n, change: 'shrank' }], action: 'rehedge', targets: [-300n, 300n],
     result: closed ? ({ status: 'closed', tx: [], notes: [] } as unknown as AdlReport['result']) : null,
-    summary: `ADL try ${retry}`, retry, reached: closed,
+    summary: `ADL try ${retry}`, retry, reached: closed, gaveUp: false,
   });
   const answers = [report(0, false), null, null, report(1, false), null, report(2, true), null];
   const adl = { check: async () => answers.shift() ?? null } as unknown as AdlWatch;
@@ -336,6 +336,45 @@ test('stop() is final: no read, no ADL check and no stress after it', async () =
   assert.equal(desk.reads, reads);
   assert.equal(risk.adlRunning, null);
   assert.equal(checks, 1);
+});
+
+test('stop() during a tick whose read is out: that tick publishes and triggers nothing, and the ADL watch is stopped', async () => {
+  const desk = new Desk();
+  desk.mark = 2200;                                        // the read would be a rescue
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  let stops = 0;
+  const adl = { check: async () => null, stop: () => { stops++; } } as unknown as AdlWatch;
+  const { risk, triggers, journal } = rig({ adl, source: { read: async () => { await gate; return desk.read(); } } });
+  const ticking = risk.tick();
+  await new Promise((r) => setImmediate(r));
+  const stopping = risk.stop();
+  release();
+  assert.equal(await ticking, null);
+  await stopping;
+  assert.equal(triggers.length, 0);
+  assert.equal(journal().length, 0);
+  assert.equal(risk.desk, null);
+  assert.equal(stops, 1);
+});
+
+test('an ADL watch that gives up: an error line in the journal, only the owner can act', async () => {
+  const leg = { venue: 'phoenix', symbol: 'ETH' } as unknown as TradeLeg;
+  const report: AdlReport = {
+    findings: [{ index: 1, leg, intent: 500n, pos: 300n, change: 'shrank' }], action: 'rehedge', targets: [-300n, 300n],
+    result: null, summary: 'ADL on phoenix ETH 0.5 -> 0.3; 8 tries did not bring the pair level', retry: 7, reached: false, gaveUp: true,
+  };
+  let answers = [report];
+  const adl = { check: async () => answers.shift() ?? null } as unknown as AdlWatch;
+  const { risk, journal } = rig({ adl });
+  await risk.tick();
+  await risk.adlRunning;
+  answers = [];
+  const errors = journal().filter((j) => j.kind === 'error');
+  assert.equal(errors.length, 1);
+  assert.match(errors[0]!.summary, /^ADL on phoenix ETH: no more tries, only the owner can act now/);
+  assert.equal(errors[0]!.numbers.tries, 8);
+  assert.equal(journal().filter((j) => j.kind === 'adl').length, 0, 'a retry that did not reach is not journaled as adl');
 });
 
 test('the desk view: never read is NEAR down and the desk at watch; a late read slow; older than a minute down again', async () => {
