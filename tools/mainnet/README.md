@@ -34,24 +34,108 @@ Placeholders: `<funder>.near` pays for the contract account; `<contract>.near` i
 
 ## What this contract version can do
 
-The contract on main has **no `ft_on_transfer`, `fund_venue`, `withdraw_to_owner` or `panic_close` yet**. Those
-methods move money into a desk and back out; they come in later versions. This runbook therefore covers only:
+The contract on main (C8) has the money methods on NEAR: **`ft_on_transfer`** (an owner's USDC deposit),
+**`fund_venue`** (idle USDC to a venue through 1Click), **`withdraw_to_owner`** (idle USDC back to the owner, with
+the performance fee) and **`clear_payout_lock`** (the owner clears a payout stuck for over an hour). The deploy dry
+run lists which of the four the wasm exports (`methods ... money methods ...`) and warns when any is missing.
+Compare its code hash with `view_account`'s `code_hash` to know what is deployed.
 
-- deploying the contract;
-- creating the desk with its operator key;
-- the venue setup, which needs no funds except the first Hyperliquid deposit and a little SOL (step 4).
+The first canary, `gimbal-canary.near`, runs code from before C8, without these methods. **Send nothing to its
+desk's addresses**: the contract could not take it out. It is retired ("Retiring a canary"), and the second canary
+takes a new account with the C8 code (section 8). A canary is never redeployed or migrated in place: the deploy
+script refuses an account that exists and proposes the next free name.
 
-**Do not send funds to the canary desk's addresses until the deployed code has those methods.** Money sent there
-now could not be taken out by the contract. The deploy dry run lists which of the four methods the wasm exports
-(`methods ... money methods ...`) and warns when any is missing. Compare its code hash with
-`view_account`'s `code_hash` to know what is deployed.
+Money paths that are **not available yet**:
 
-To retire the canary, send a **DeleteAccount** transaction for `<contract>.near`, signed with
-`.keys/<contract>.near.json`, with beneficiary `<funder>.near` (for example with near CLI's
-`account delete-account`). This returns the account's whole balance to the funder, including the NEAR held for
-the code's storage. Do it only when nothing is left on any of the desk's addresses. After the deletion anyone
-can register `<contract>.near` again, and the desk's MPC-derived addresses belong to whoever holds that name:
-never send anything to them afterwards.
+- **Hyperliquid -> NEAR.** 1Click answers "Quoting for this pair is not available" for every quote out of
+  HyperCore (section 7, quotes step), so USDC funded to Hyperliquid cannot come back to the contract through
+  1Click for now. These tools do not build that return. Fund Hyperliquid only with what may stay there.
+- **Orderly.** `fund.mjs orderly` needs the receiver pinned with `set_orderly_receiver` (an owner call these tools
+  do not make) and at least 6 USDC out.
+
+## Retiring a canary
+
+```
+node tools/mainnet/retire.mjs <contract>.near                                # dry run
+node tools/mainnet/retire.mjs <contract>.near --unregister-usdc [--send]     # first, when it is registered on USDC
+node tools/mainnet/retire.mjs <contract>.near --send --engine-stopped        # from the main checkout
+node tools/mainnet/retire.mjs <contract>.near --beneficiary <funder>.near --creation-tx <hash>   # nearblocks has no record
+```
+
+Retiring sends one **DeleteAccount** for `<contract>.near`, signed with `.keys/<contract>.near.json`. Its whole
+NEAR balance, the NEAR held for the code's storage included, goes to the beneficiary.
+
+**Why the checks.** After the deletion anyone can register `<contract>.near` again. Every desk address is an MPC
+key derived from the contract's name (`gimbal/<desk_id>/evm`, `gimbal/<desk_id>/sol` with the contract as
+predecessor), so whoever takes the name controls those addresses: the Hyperliquid account, the Solana authority
+and its token accounts, the EVM address on Arbitrum and HyperEVM, Phoenix and Orderly. Anything left there, on its
+way there, or sent there later, is theirs. So the script deletes only when every one of them holds at most dust and
+nothing is in flight, and **nothing may be sent to the old desk addresses afterwards**.
+
+**Every read fails closed:** an HTTP error, a timeout, an answer of an unexpected shape or an amount that is not a
+number refuses the delete. Nothing is ever counted as 0 because it could not be read.
+
+What it does:
+
+- **Beneficiary:** the account that created `<contract>.near`. nearblocks names the creating transaction; the
+  archival RPC (`archival-rpc.mainnet.fastnear.com`) must confirm it is a `near.create_account` of exactly that
+  account by that signer, whose result is `true`. It never guesses: when nearblocks has no record (or is down) it
+  refuses unless you pass `--beneficiary <funder>.near --creation-tx <hash>`, which is confirmed the same way. A
+  `--beneficiary` that differs from the confirmed creator is refused.
+- **Desks:** the contract's own Desks map (`view_state`, prefix 0), read again at every pass, and `--desks a,b`.
+  A desk list that cannot be read is a refusal; a desk that appears between the venue reads and the NEAR reads
+  refuses (run again).
+- **Balances, per desk:**
+  - Hyperliquid: every perp dex `perpDexs` lists (main, `xyz`, ...: account value, cash, open positions), spot
+    balances, vault equities, staked HYPE (`delegatorSummary`: delegated, undelegated, pending withdrawals),
+    sub-accounts, and a `withdraw` in the non-funding ledger within the last 30 min (it may still be on its way to
+    Arbitrum);
+  - Phoenix: the trader (PDA 0) of the desk's Solana authority, every subaccount's collateral, positions, limit
+    orders, splines, triggers, escrow requests, locked deposit and spot collateral. The API leaves a list out when
+    it is empty (Phoenix's own SDK reads a missing list as empty), so a missing list is empty; one of another type
+    refuses;
+  - Solana: the authority's SOL, its USDC and PhUSD token accounts (only "could not find account" counts as "never
+    created"), and every account it owns under SPL Token and Token-2022 (any non-zero balance refuses);
+  - EVM: USDC, USDC.e and ETH on Arbitrum, HYPE and USDC on HyperEVM (an `eth_call` answer of `0x` refuses);
+  - Orderly under the contract's broker: registered (only code -1607, "Account not found", means no; any other
+    `success: false` refuses), the key's state; holding and positions are not public, so `--send` makes one signed
+    `orderly_request` of kind `holding` and one of kind `positions` with the engine's operator key (any other call
+    is refused; a position, a pending order, unsettled PnL over 0.01 USDC or a field that is not a number refuses);
+    and any `orderly_request` of kind `withdraw_request` the contract received within 30 min (nearblocks);
+  - the contract, measured against the latest final block (not this machine's clock): the desk's `idle_usdc` in
+    the books; the Hyperliquid nonce (an action signed within 30 min may be a withdraw in flight); the rescue ring;
+    on C8 code the money record (`payout_pending` or `idle_usdc` over 0 refuses) and the `fund_venue` ring (a slot
+    paid within 65 min means money may be in flight: refused, wait). A missing record refuses: `create_desk`
+    writes all of them.
+- **The contract's own tokens:** USDC on NEAR and whether it is registered on USDC, every NEP-141 token the
+  nearblocks inventory lists, and its `intents.near` balances (`mt_tokens_for_owner`).
+- **USDC registration:** while the contract is registered on USDC anyone can transfer USDC to it, also in the
+  seconds before the DeleteAccount, and that USDC would be lost. So retire refuses while it is registered.
+  `--unregister-usdc` is the separate step: a dry run prints `storage_unregister({"force":false})` on USDC with
+  1 yoctoNEAR, signed by the contract's own key; `--send` signs it (refused while the contract holds any USDC) and
+  checks the registration is gone. Its 0.00125 NEAR deposit comes back to the contract. Anyone can register it
+  again with `storage_deposit`, so retire reads the registration once more right before signing.
+- **Not covered** (printed in every run): Orderly under any other broker; Orderly's withdrawal history (no
+  `orderly_request` kind reads it: the contract's `withdraw_request` calls of the last 30 min are read from
+  nearblocks instead); EVM chains other than Arbitrum and HyperEVM; Phoenix trader PDAs other than 0; Solana stake
+  accounts and NFTs; NEP-141 tokens nearblocks does not index; NEAR NFTs; a transfer made in the seconds between
+  the last NEAR read and the DeleteAccount (the `window` line).
+- **Dust:** 0.01 USDC, 0.001 SOL, 0.0001 ETH or HYPE on an EVM chain, 0.001 staked HYPE. Anything over it is
+  listed and refused. NEAR also refuses to delete an account with over 10 kB of data besides its code; the `state`
+  line shows how much it has.
+- `--send` needs `--engine-stopped`: you stop the engine and any operator of these desks first and say so (nothing
+  of ours may move money during the retirement). It reads `.keys/<contract>.near.json` (it must be the account's
+  full-access key) and, for a desk registered on Orderly, `.keys/engine-mainnet-<contract>.near.env`; makes the
+  signed Orderly reads; then reads **everything above again**, the venues first (tens of seconds) and the NEAR
+  side last (the desk list, the books and records, the tokens, the USDC registration and balance), and sends the
+  DeleteAccount right after, only when all of it is clean. The `window` line prints the seconds from the first of
+  those last NEAR reads to the signature. Then it checks that the account is gone and the beneficiary's balance
+  went up.
+
+- **Cost:** the DeleteAccount's action fees (under 0.001 NEAR, paid from the deleted balance), and for an Orderly
+  desk two operator calls (about 0.001 NEAR each; 0.3 NEAR of the key's allowance held per call until the refund).
+- **Check after:** nearblocks.io/address/`<contract>.near` shows the deletion, and `view.mjs --keys
+  <contract>.near` answers that the account does not exist.
 
 ## 0. Before you start
 
@@ -70,6 +154,11 @@ never send anything to them afterwards.
   | `HL_REFERRAL_CODE`, `ORDERLY_REFERRAL_CODE`, `PHOENIX_REFERRAL_CODE` | deploy | empty → `null` (no code); fixed by `new()` |
   | `RELAYER_EVM_PRIVATE_KEY` | relayer-wallet | written by step 5 (`--write`) when empty |
   | `ARBITRUM_RPC_URL` | relayer-wallet `--check` | optional; default `https://arb1.arbitrum.io/rpc` |
+  | `ONECLICK_API_KEY` | fund | optional; sent as a header only, never printed; without it 1Click adds 0.2 % |
+
+  retire and fund read `SOLANA_RPC_URL`, `ARBITRUM_RPC_URL` and `HYPEREVM_RPC_URL` from the shell environment
+  only (defaults `https://api.mainnet-beta.solana.com`, `https://arb1.arbitrum.io/rpc` and
+  `https://rpc.hyperliquid.xyz/evm`) and print only their hosts.
 
   `NEAR_RPC_URL` is read from the **shell environment only**, never from `.env`, because `.env` often holds a
   testnet RPC. It is optional and tried first, before the public `free.rpc.fastnear.com` and `near.drpc.org`.
@@ -98,7 +187,16 @@ This rebuilds the canary policy from live Hyperliquid, Phoenix and Orderly data 
 `tools/mainnet-canary-policy.json`. The assets are the contract's oracle assets (BTC, ETH, SOL, DOGE, LTC):
 Hyperliquid index and szDecimals, Phoenix orderbook, lot and tick, and Orderly `PERP_<X>_USDC`. The limits are
 20 USD per leg, a 100 bps price band, a 900 s oracle age, a 20 USD per hour rescue cap, transfer cost at most
-100 bps / 0.5 USD, and nothing unpriced.
+300 bps / 1 USD, and nothing unpriced.
+
+Why 300 bps / 1 USD: the contract refuses a 1Click quote whose `amountIn - minAmountOut` is over
+max(`amountIn` x `max_transfer_cost_bps`, `max_transfer_cost_flat_e6`). That gap is 1Click's fee plus the
+slippage room, and `fund_venue` itself needs at least 0.5 % of room. Measured on mainnet quotes: 20 USDC from
+NEAR to Hyperliquid may cost 0.52 USDC (about 2.6 %, most of it the HyperCore withdraw fee), 10 USDC to the
+Orderly receiver 0.11 USDC, and without an API key 1Click adds 0.2 %. The old 100 bps / 0.5 USD refused the
+Hyperliquid route outright. At canary sizes (under 33 USDC) the flat 1 USD decides. The same numbers bound the
+hourly budgets: `fund_venue` may spend 4 x max(20 x 3 %, 1) = 4 USD an hour in transfer costs, the rescues
+max(20 x 3 %, 2 x 1) = 2 USD.
 
 - **Cost:** none (public reads).
 - **Check:** it ends with `tools/mainnet-canary-policy.json: matches live data` (exit 0). On a difference it
@@ -124,9 +222,14 @@ Read the dry run:
 Every value given to `new()` is permanent, so check each one now. The `env` lines show the broker id and
 the referral codes in full and say where each came from; a `warning` line means the shell environment set it
 over `.env`. The `methods` line shows whether the wasm has the money methods (see "What this contract version
-can do"). The script refuses in these cases:
+can do"). The `treasury` line is a read-only `storage_balance_of` on USDC on NEAR
+(`17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1`) for the treasury: it must be registered,
+else every fee transfer of `withdraw_to_owner` fails and the fee stays in the desk's `idle_usdc`, due again at the
+next payout. When the line says `NOT registered`, register it before the first payout with a profit:
+`storage_deposit({"account_id":"<treasury>","registration_only":true})` on that contract with 0.00125 NEAR
+(anyone may pay it). The script refuses in these cases:
 
-- the account exists (it never redeploys);
+- the account exists (it never redeploys or migrates; it names the first free `<stem><n>.near` after it);
 - `v1.signer`, `price-oracle.near` or the treasury does not exist;
 - the balance is under code size × 1e19 + 0.5 NEAR;
 - the funder cannot pay the balance + 0.2 NEAR;
@@ -152,12 +255,13 @@ happens. Without it nothing can sign for the account: no retry of tx 2, and no D
 back. If tx 1 went through and tx 2 failed, `--resume` (with the same arguments and `--send`) sends tx 2 only. It
 works only while the account has no code and `.keys/<contract>.near.json` is its full-access key.
 
-- **Cost:** the initial balance. The default is code size × 1e19 + 0.5 NEAR, rounded up to 0.1: **6.2 NEAR**
-  for the current 569,702-byte wasm. It moves from the funder to the contract and stays there: about 5.7 NEAR is
-  held for the code's storage, and the rest pays tx 2's gas and the state. The dry run's `gas` line gives the
-  most each transaction can burn, worked out from the live runtime fees:
-  - tx 1: about 101.2 TGas (100 prepaid + action fees), at most about 0.0102 NEAR.
-  - tx 2: about 142.3 TGas, at most about 0.0143 NEAR. That is 100 TGas prepaid for `new()`, about 41 TGas for
+- **Cost:** the initial balance. The default is code size × 1e19 + 0.5 NEAR, rounded up to 0.1: **6.8 NEAR**
+  for the C8 wasm (626,668 bytes). It moves from the funder to the contract and stays there until the account is
+  retired: about 6.27 NEAR is held for the code's storage, and the rest pays tx 2's gas and the state. The funder
+  needs the balance + 0.2 NEAR free, 7.0 NEAR. The dry run's `gas` line gives the most each transaction can burn,
+  worked out from the live runtime fees:
+  - tx 1: about 101.3 TGas (100 prepaid + action fees), at most about 0.0102 NEAR.
+  - tx 2: about 146.4 TGas, at most about 0.0147 NEAR. That is 100 TGas prepaid for `new()`, about 45.2 TGas for
     DeployContract (about 71.4 Mgas per byte of wasm), and about 1.2 TGas of action fees.
 
   The unused part is refunded.
@@ -231,11 +335,12 @@ already done (an existing desk, or an operator key already on chain), and when e
     19 methods.
   - `.keys/operator-<contract>.near.json` and `.keys/engine-mainnet-<contract>.near.env` exist.
 
-## 4. Funding (not covered yet, and not with this contract version)
+## 4. Funding
 
-Funding the desk is left for a later runbook. **Send nothing to the desk's addresses while the deployed code
-lacks the money methods** (see "What this contract version can do"). Until then, the setup steps in step 6 that
-depend on funding stay waiting or fail, and that is expected:
+Funding goes through the contract, never straight to a desk address: the owner deposits USDC on NEAR into the
+desk (`deposit.mjs`), and the engine's key sends it to a venue with `fund_venue` (`fund.mjs`). Section 8 has the
+commands. **Send nothing to the desk's addresses on a contract without the money methods.** Until a desk is
+funded, the setup steps in step 6 that depend on funding stay waiting or fail, and that is expected:
 
 - **Hyperliquid:** `hl_set_referrer` and `hl_approve_builder_fee` need the desk's EVM address to exist on
   Hyperliquid, which happens with its first USDC deposit. Until then those two steps wait; run POST /setup
@@ -313,9 +418,9 @@ curl -sN http://127.0.0.1:8790/events
   After the Hyperliquid deposit it makes up to two more. In total it costs well under 0.05 NEAR. Keep
   0.3 NEAR free per call in flight.
 - **Check after:**
-  - With this contract version and no funding, the Orderly steps should end `done` or `skipped`. The two
-    Hyperliquid steps wait for a deposit, and `phoenix_register` may fail for want of SOL. Both are expected
-    until the money methods are deployed.
+  - Before funding, the Orderly steps should end `done` or `skipped`. The two Hyperliquid steps wait for a
+    deposit, and `phoenix_register` may fail for want of SOL. Both are expected until the desk is funded
+    (section 8).
   - The Orderly `get_account` link printed in step 3 answers.
   - nearblocks.io/address/`<owner>.near` shows the operator key's calls to `<contract>.near`.
   - Later, once funded: every step is `done` or `skipped`, and solscan shows the Phoenix trader account.
@@ -377,6 +482,126 @@ to `=== end ===`, to paste back.
     account id.
   - Running the orderly step again prints `orderly_register done` and `orderly_add_key done` without signing
     either.
+
+## 8. Canary 2 with money
+
+The second canary: retire `gimbal-canary.near`, deploy the C8 code to a fresh account, **`gimbal-canary2.near`**
+(free on 2026-11-01; the deploy dry run checks it again), create its desk `canary`, and put a small amount of
+USDC through it: deposit, fund one venue, withdraw back to the owner. Run every command from the main checkout,
+in this order, the dry run first and `--send` only after reading it. Each script ends with one block,
+`=== gimbal <script> ... ===` to `=== end ===`: paste it back.
+
+What it takes, in all: **about 30 USDC on NEAR** on the owner for the first pair (12 to Hyperliquid, the rest
+stays idle or funds the second leg), and NEAR: 7.0 free on the funder for the deploy (the retirement returns
+about 6.3), 0.7 free on the owner for the desk, and 0.3 NEAR free on the owner per operator call in flight.
+
+1. **Retire the old canary** ("Retiring a canary"):
+
+   ```
+   node tools/mainnet/retire.mjs gimbal-canary.near
+   node tools/mainnet/retire.mjs gimbal-canary.near --send --engine-stopped
+   ```
+
+   The dry run prints the creator (the beneficiary), every desk balance (all 0 on 2026-11-01), the contract's
+   USDC (not registered on USDC on 2026-11-01, so no `--unregister-usdc` step) and the DeleteAccount. Stop the
+   engine first. `--send` reads the Orderly holding and positions with two signed calls, every balance again (NEAR
+   side last), and deletes. Returns about **6.30 NEAR** to the funder; costs under 0.001 NEAR.
+
+2. **Policy:** `node tools/mainnet/policy.mjs` must end `matches live data` (section 1; 300 bps / 1 USD).
+
+3. **Deploy** (section 2):
+
+   ```
+   node tools/mainnet/deploy.mjs gimbal-canary2.near --funder <funder>.near --key-file <funder key json> \
+        --treasury-near <treasury> --hl-builder 0x<40 hex>
+   node tools/mainnet/deploy.mjs <same arguments> --send
+   ```
+
+   Check `methods ... ft_on_transfer yes, fund_venue yes, withdraw_to_owner yes, clear_payout_lock yes`, the
+   `treasury ... is registered on USDC on NEAR` line, and `contract gimbal-canary2.near: does not exist: the name
+   is free`. Costs **6.8 NEAR** (stays in the contract) plus at most 0.025 NEAR of gas; the funder needs 7.0 free.
+   Back up `.keys/gimbal-canary2.near.json` right after tx 1.
+
+4. **Desk** (section 3):
+
+   ```
+   node tools/mainnet/desk.mjs gimbal-canary2.near canary --owner <owner>.near --key-file <owner key json> \
+        --policy tools/mainnet-canary-policy.json
+   node tools/mainnet/desk.mjs <same arguments> --send
+   ```
+
+   0.5 NEAR attached to `create_desk`; the C8 contract keeps what the desk's storage takes (about 0.04 to 0.12
+   NEAR) and refunds the rest. It writes `.keys/operator-gimbal-canary2.near.json` and
+   `.keys/engine-mainnet-gimbal-canary2.near.env`. New desk addresses: everything in sections 6 and 7 is for this
+   desk and must be run again.
+
+5. **Venue setup and checks for the new desk:** section 6 with `.keys/engine-mainnet-gimbal-canary2.near.env`
+   (Orderly `done`; the Hyperliquid steps wait for step 7), then section 7:
+
+   ```
+   node tools/mainnet/checks.mjs gimbal-canary2.near canary
+   node tools/mainnet/checks.mjs gimbal-canary2.near canary --send
+   ```
+
+   `refresh_prices` goes out at 300 TGas (the C8 contract refuses under 240). To fund Orderly later, the owner
+   pins the receiver that the orderly step prints with `set_orderly_receiver` (not in these tools).
+
+6. **Deposit** 30 USDC from the owner:
+
+   ```
+   node tools/mainnet/deposit.mjs gimbal-canary2.near canary 30
+   node tools/mainnet/deposit.mjs gimbal-canary2.near canary 30 --key-file <owner key json> --send
+   ```
+
+   The dry run prints, when the contract is not on USDC yet (a new one never is), tx 1:
+   `storage_deposit({"account_id":"gimbal-canary2.near","registration_only":true})` with 0.00125 NEAR; then
+   `ft_transfer_call` on USDC with `{"receiver_id":"gimbal-canary2.near","amount":"30000000","msg":"{\"desk_id\":\"canary\"}"}`,
+   1 yoctoNEAR, 150 TGas, and the ledger it expects (`deposited` and `idle_usdc` up by 30). It refuses while the
+   owner holds less than the amount on NEAR. `--key-file` must be the owner's full-access key (`.keys/` has none:
+   point it at the owner's wallet key file). After: the `deposit` event, `ft_transfer_call` returned the whole
+   amount, and the ledger. Costs about 0.00125 NEAR plus gas (keep 0.05 NEAR free).
+
+7. **Fund Hyperliquid** with 12 USDC:
+
+   ```
+   node tools/mainnet/fund.mjs gimbal-canary2.near canary hyperliquid 12
+   node tools/mainnet/fund.mjs gimbal-canary2.near canary hyperliquid 12 --send
+   ```
+
+   The dry run asks a **dry** 1Click quote (it reserves nothing): USDC on NEAR -> HyperCore USDC, `refundTo` the
+   owner, `recipient` the desk's EVM address, 100 bps slippage. It checks it with the contract's rules (1Click's
+   signature, the fields, at least 50 bps of room below `amountOut`, the cost bound, the hourly budget) and prints
+   `fund_venue(desk_id, quote, quote_signature, reason)` in full, 300 TGas, signed by the operator key. Measured
+   on 2026-11-01: 12 USDC may cost 0.44 USDC of the 1 USD allowed, with 102 bps of room. `--send` asks a **live**
+   quote only after every other check passed, checks it the same way and against what you typed (the venue's
+   `recipient` and `destinationAsset`, `amountIn` = the amount in 6-decimal base units, `slippageTolerance` =
+   `--slippage-bps`; any mismatch refuses before signing), sends `fund_venue`, posts the deposit to 1Click and
+   polls its status and the venue (`--timeout-s`, default 900). `landed: yes` means 1Click SUCCESS **and** the
+   venue's own record of the delivery: on Hyperliquid an incoming entry (`deposit`, `send`, `internalTransfer` or
+   `spotTransfer`) to the desk address in its non-funding ledger since the `fund_venue`, of at least
+   `minAmountOut` (a balance also moves with PnL, so it is shown only); on Solana the USDC token account up by at
+   least `minAmountOut`. Without such an entry, and always on Orderly (its holding is not public), it says
+   `landed: unconfirmed`.
+   A refund goes to the owner on NEAR, not to the desk. After it lands, run POST /setup again (section 6) for
+   `hl_set_referrer` and `hl_approve_builder_fee`. The same command with `solana 8` funds the Phoenix leg (the
+   Solana authority also needs a little SOL, which 1Click does not send); `orderly` needs the pinned receiver and
+   at least 7 USDC.
+
+8. **Withdraw** 5 USDC back to the owner:
+
+   ```
+   node tools/mainnet/withdraw.mjs gimbal-canary2.near canary 5
+   node tools/mainnet/withdraw.mjs gimbal-canary2.near canary 5 --key-file <owner key json> --send
+   ```
+
+   The dry run prints `withdraw_to_owner({"desk_id":"canary","amount":"5000000"})` with 1 yoctoNEAR and 300 TGas
+   (the contract refuses under 150) and the expected split before anything is sent: with no profit yet the fee is
+   0 and all 5 USDC go to the owner. It refuses an amount over `idle_usdc` (USDC on a venue must come back first)
+   and an owner not registered on USDC. `--send` prints the `payout` and `fee_charged` events and the ledger
+   after. `all` withdraws the whole `idle_usdc`.
+
+USDC on Hyperliquid stays there for now: the HyperCore -> NEAR route is not available through 1Click ("What this
+contract version can do"), and these tools do not build it.
 
 ## Files the scripts write
 

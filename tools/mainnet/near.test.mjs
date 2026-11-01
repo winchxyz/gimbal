@@ -178,7 +178,24 @@ const VECTORS = {
   addKey: '0a0000006f776e65722e6e65617200070707070707070707070707070707070707070707070707070707070707070707000000000000000a0000006f776e65722e6e656172010101010101010101010101010101010101010101010101010101010101010101000000050009090909090909090909090909090909090909090909090909090909090909090000000000000000000100000025a4000a8bca220400000000001200000067696d62616c2d63616e6172792e6e656172030000000a0000007365745f70617573656408000000686c5f6f726465720f0000006f726465726c795f72657175657374',
   createAccount: '0b00000066756e6465722e6e656172000707070707070707070707070707070707070707070707070707070707070707351cdcdf02000000040000006e656172010101010101010101010101010101010101010101010101010101010101010101000000020e0000006372656174655f6163636f756e746e0000007b226e65775f6163636f756e745f6964223a2267696d62616c2d63616e6172792e6e656172222c226e65775f7075626c69635f6b6579223a22656432353531393a634766486943364b6767334670465a7667774763737773435274703461425032667a7558525150697a754e227d00407a10f35a0000000000b3279068ace620050000000000',
   deployInit: '1200000067696d62616c2d63616e6172792e6e65617200070707070707070707070707070707070707070707070707070707070707070701000000000000001200000067696d62616c2d63616e6172792e6e656172010101010101010101010101010101010101010101010101010101010101010102000000010e0000000061736d2d66616b652d636f646502030000006e6577150000007b226e6574776f726b223a224d61696e6e6574227d00407a10f35a000000000000000000000000000000000000',
+  // near-api-js 7.3.1: createTransaction('gimbal-canary.near', <7 x 32>, 'gimbal-canary.near', 5n, [actions.deleteAccount('funder.near')], <1 x 32>).
+  deleteAccount: '1200000067696d62616c2d63616e6172792e6e65617200070707070707070707070707070707070707070707070707070707070707070705000000000000001200000067696d62616c2d63616e6172792e6e656172010101010101010101010101010101010101010101010101010101010101010101000000070b00000066756e6465722e6e656172',
 };
+
+test('DeleteAccount: borsh as near-api-js, its fee in the gas cap, the beneficiary printed; mainnet beneficiaries only', () => {
+  const bytes = encodeTransaction({ signerId: 'gimbal-canary.near', publicKey: SIGNER, nonce: 5n, receiverId: 'gimbal-canary.near', blockHash: BLOCK, actions: [act.deleteAccount('funder.near')] });
+  assert.equal(bytes.toString('hex'), VECTORS.deleteAccount);
+  assert.throws(() => act.deleteAccount('funder.testnet'), /beneficiary "funder\.testnet" is not a mainnet account/);
+  const del = { execution: 147489000000, send_not_sir: 147489000000, send_sir: 147489000000 };
+  const cfg = structuredClone(PROTOCOL_CONFIG);
+  assert.throws(() => txGasCap(feesOf(cfg), { signer: 'g.near', receiver: 'g.near', actions: [act.deleteAccount('f.near')] }), /no delete_account_cost/);
+  cfg.runtime_config.transaction_costs.action_creation_config.delete_account_cost = del;
+  const cap = txGasCap(feesOf(cfg), { signer: 'g.near', receiver: 'g.near', actions: [act.deleteAccount('f.near')] });
+  assert.equal(cap.prepaid, 0n);
+  assert.equal(cap.total, 108_059_500_000n * 2n + 147_489_000_000n * 2n);
+  const lines = describeTx('tx', { signer: 'g.near', signedBy: 'its key', receiver: 'g.near', actions: [act.deleteAccount('f.near')] }).join('\n');
+  assert.match(lines, /DeleteAccount: the account g\.near is deleted; its whole NEAR balance goes to the beneficiary f\.near/);
+});
 
 test('borsh transactions match near-api-js: an AddKey with a FunctionCall permission, create_account, deploy + new', () => {
   const tx = (signerId, receiverId, nonce, actions) => encodeTransaction({ signerId, publicKey: SIGNER, nonce, receiverId, blockHash: BLOCK, actions }).toString('hex');

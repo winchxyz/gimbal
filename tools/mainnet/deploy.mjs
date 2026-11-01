@@ -32,6 +32,9 @@ import {
 } from './near.mjs';
 import { HL_API, brokerIdProblem } from './venues.mjs';
 
+/** USDC on NEAR (native, Circle); balances.mjs has the same constant (a test compares). */
+export const NEAR_USDC = '17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1';
+
 export const WASM = join(ROOT, 'contract', 'target', 'near', 'gimbal.wasm');
 const WASM_SHOWN = 'contract/target/near/gimbal.wasm';
 /** Over the code's storage: the account, its key and the state `new` writes, and tx 2's gas. */
@@ -42,10 +45,27 @@ const CREATE_TGAS = 100n;
 const INIT_TGAS = 100n;
 const REFERRAL_ENV = { hyperliquid: 'HL_REFERRAL_CODE', orderly: 'ORDERLY_REFERRAL_CODE', phoenix: 'PHOENIX_REFERRAL_CODE' };
 /**
- * The methods that move money in and out of a desk (interfaces §1.3). The contract on main does not have them
- * yet; the dry run lists which of them the wasm exports, so nobody funds a desk whose code cannot take money out.
+ * The methods that move money in and out of a desk on NEAR (interfaces §1.3, contract/src/money.rs): the C8
+ * contract has all four. The dry run lists which of them the wasm exports, so nobody funds a desk whose code
+ * cannot take money out. (`panic_close` is not part of C8: money leaves through withdraw_to_owner.)
  */
-export const MONEY_METHODS = ['ft_on_transfer', 'fund_venue', 'withdraw_to_owner', 'panic_close'];
+export const MONEY_METHODS = ['ft_on_transfer', 'fund_venue', 'withdraw_to_owner', 'clear_payout_lock'];
+
+/**
+ * The first free name after `id` for a new contract account: `<stem>2.near`, `<stem>3.near`, ... where a trailing
+ * number of the stem counts up (gimbal-canary.near -> gimbal-canary2.near -> gimbal-canary3.near). A canary is never
+ * migrated: each deploy takes a fresh account. `exists(id)` reads the chain; at most `tries` names are asked.
+ */
+export async function nextFreeName(id, exists, tries = 20) {
+  const m = /^(.*?)(\d*)\.near$/.exec(id);
+  const stem = m[1];
+  let n = m[2] === '' ? 2 : Number(m[2]) + 1;
+  for (let i = 0; i < tries; i++, n++) {
+    const name = `${stem}${n}.near`;
+    if (!(await exists(name))) return name;
+  }
+  return null;
+}
 
 /** The function names a wasm module exports (a contract's methods), read from its export section. */
 export function wasmExports(code) {
@@ -117,6 +137,14 @@ export function parseDeployArgs(argv) {
   const resume = values['--resume'] === true;
   if (send && !resume && values['--key-file'] === undefined) throw new UsageError('--send needs --key-file: the funder signs tx 1');
   return { contract, funder, keyFile: values['--key-file'] ?? null, treasuryNear, hlBuilder, balance, send, resume };
+}
+
+/** The deploy dry run's line on the treasury's USDC registration (storage_balance_of; null: not registered). */
+export function treasuryUsdcLine(treasury, storageBalance) {
+  if (storageBalance !== null && storageBalance !== undefined) return `${treasury} is registered on USDC on NEAR: performance fees can reach it`;
+  return `warning: ${treasury} is NOT registered on USDC on NEAR (${NEAR_USDC} storage_balance_of is null): every fee transfer `
+    + 'of withdraw_to_owner would fail and the fee would stay in the desk\'s idle USDC. Register it before the first payout with a profit: '
+    + `${NEAR_USDC}.storage_deposit({"account_id":"${treasury}","registration_only":true}) with 0.00125 NEAR`;
 }
 
 /** The smallest initial balance: the code's bytes at 1e19 yoctoNEAR each, plus 0.5 NEAR. */
@@ -241,15 +269,24 @@ async function main() {
   for (const id of [MPC, ORACLE]) if ((await near.account(id)) === null) throw new Error(`${id} does not exist on this chain`);
   if ((await near.account(a.treasuryNear)) === null) throw new Error(`--treasury-near ${a.treasuryNear} does not exist on mainnet: the performance fee would have nowhere to go`);
   say(`accounts  ${MPC}, ${ORACLE} and the treasury ${a.treasuryNear} exist`);
+  // withdraw_to_owner sends the performance fee with ft_transfer: to a treasury USDC does not know, every fee
+  // transfer fails and the fee stays in the desk's idle USDC, due again at the next payout.
+  const treasuryOnUsdc = await near.view(NEAR_USDC, 'storage_balance_of', { account_id: a.treasuryNear });
+  say(`treasury  ${treasuryUsdcLine(a.treasuryNear, treasuryOnUsdc)}`);
 
   const state = await near.account(a.contract);
+  if (state !== null && !a.resume) {
+    const free = await nextFreeName(a.contract, async (id) => (await near.account(id)) !== null);
+    throw new Error(`${a.contract} exists already: a canary is never redeployed or migrated, it takes a fresh account. `
+      + `${free === null ? 'No free name found after it' : `The first free name after it is ${free}`} (or an earlier --send whose tx 2 failed? see --resume)`);
+  }
   let keyVerdict = null;
   if (state !== null && a.resume && existsSync(contractKeyFile)) {
     keyVerdict = fullAccessVerdict(await near.accessKey(a.contract, readKeyFile(contractKeyFile, a.contract).publicKeyString));
   }
   const plan = deployPlanFor(state, { resume: a.resume, keyVerdict });
   say(`contract  ${a.contract}: ${state === null
-    ? 'does not exist (a new account, as it must be)'
+    ? 'does not exist: the name is free (a new account, as it must be)'
     : `exists without code, ${nearText(BigInt(state.amount), 4)} NEAR; ${contractKeyFile} ${keyVerdict}`}`);
   if (plan === 'both' && existsSync(contractKeyFile)) {
     const msg = `${contractKeyFile} exists but the account does not: move it away or pick another name`;
@@ -261,12 +298,20 @@ async function main() {
   const fees = await near.fees();
   let funder = null;
   let verdict = null;
+  let funderShort = null;
   if (plan === 'both') {
     funder = await near.account(a.funder);
     if (funder === null) throw new Error(`--funder ${a.funder} does not exist on mainnet`);
     const free = freeBalance(funder);
     say(`funder    ${a.funder}: ${nearText(BigInt(funder.amount), 4)} NEAR, ${nearText(free, 4)} free to spend`);
-    checkFunder(free, balance);
+    // The dry run still prints the plan (the funder may be waiting for a retired canary's NEAR); --send refuses here.
+    try {
+      checkFunder(free, balance);
+    } catch (e) {
+      if (a.send) throw e;
+      funderShort = e.message;
+      say(`warning   ${e.message}: --send refuses until it can`);
+    }
     if (a.keyFile !== null) verdict = fullAccessVerdict(await near.accessKey(a.funder, readKeyFile(a.keyFile, a.funder).publicKeyString));
     say(`key       --key-file: ${verdict ?? 'check skipped (no --key-file)'}`);
     if (a.send && verdict !== 'matches') throw new Error('--send needs --key-file holding a full-access key of the funder');
@@ -315,6 +360,7 @@ async function main() {
   if (!a.send) {
     say('\ndry run: nothing was signed, sent or written. new() fixes every value in tx 2\'s args for the contract\'s life:');
     say('check them now. Add --send (and --key-file) to send tx 1, then tx 2, from the main checkout.');
+    if (funderShort !== null) throw new Error(`${funderShort} (the plan above is complete; send the funder NEAR first, e.g. by retiring the old canary)`);
     return;
   }
 

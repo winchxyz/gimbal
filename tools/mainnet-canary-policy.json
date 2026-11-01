@@ -18,8 +18,8 @@
   "price_band_bps": 100,
   "oracle_max_age_s": 900,
   "rescue_cap_usd_per_hour": 20,
-  "max_transfer_cost_bps": 100,
-  "max_transfer_cost_flat_e6": 500000,
+  "max_transfer_cost_bps": 300,
+  "max_transfer_cost_flat_e6": 1000000,
   "unpriced": [],
   "unpriced_max_notional_usd": 20
 }

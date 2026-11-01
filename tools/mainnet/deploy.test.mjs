@@ -4,7 +4,8 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { UsageError } from './cli.mjs';
 import {
-  MONEY_METHODS, canonical, checkFunder, deployPlanFor, initArgs, initialBalance, minInitialBalance, parseDeployArgs, referralCodes, wasmExports,
+  MONEY_METHODS, NEAR_USDC, canonical, checkFunder, deployPlanFor, initArgs, initialBalance, minInitialBalance, nextFreeName, parseDeployArgs, referralCodes,
+  treasuryUsdcLine, wasmExports,
 } from './deploy.mjs';
 import { NO_CODE } from './near.mjs';
 
@@ -100,7 +101,27 @@ test('the wasm\'s exported methods: read from its export section, functions only
   assert.deepEqual(wasmExports(wasm), ['new', 'config']);
   assert.throws(() => wasmExports(Buffer.from('not wasm at all')), /not a wasm module/);
   assert.throws(() => wasmExports(wasm.subarray(0, 20)), /truncated/);
-  assert.deepEqual(MONEY_METHODS, ['ft_on_transfer', 'fund_venue', 'withdraw_to_owner', 'panic_close']);
+  assert.deepEqual(MONEY_METHODS, ['ft_on_transfer', 'fund_venue', 'withdraw_to_owner', 'clear_payout_lock']);
+});
+
+test('a taken name is never reused: the next free one is proposed (stem + number)', async () => {
+  const taken = new Set(['gimbal-canary.near', 'gimbal-canary2.near', 'gimbal-canary3.near']);
+  const exists = async (id) => taken.has(id);
+  assert.equal(await nextFreeName('gimbal-canary.near', exists), 'gimbal-canary4.near');
+  assert.equal(await nextFreeName('gimbal-canary2.near', exists), 'gimbal-canary4.near');
+  assert.equal(await nextFreeName('desk9.near', async () => false), 'desk10.near');
+  assert.equal(await nextFreeName('x.near', async () => true, 3), null, 'gives up after the tries');
+});
+
+test('the treasury must be registered on USDC on NEAR, else every fee transfer fails', async () => {
+  const { NEAR_USDC: fromBalances } = await import('./balances.mjs');
+  assert.equal(NEAR_USDC, fromBalances, 'one USDC contract everywhere');
+  assert.equal(NEAR_USDC, '17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1');
+  assert.match(treasuryUsdcLine('treasury.near', { total: '1250000000000000000000', available: '0' }), /^treasury\.near is registered on USDC on NEAR/);
+  const line = treasuryUsdcLine('treasury.near', null);
+  assert.match(line, /^warning: treasury\.near is NOT registered/);
+  assert.match(line, /fee would stay in the desk's idle USDC/);
+  assert.match(line, /storage_deposit\(\{"account_id":"treasury\.near","registration_only":true\}\) with 0\.00125 NEAR/);
 });
 
 test('the script itself: a testnet id or a --send without a key ends with the usage, before any network read', () => {
