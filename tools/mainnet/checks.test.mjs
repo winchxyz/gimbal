@@ -27,7 +27,7 @@ const DESK = {
 };
 const CONFIG = {
   network: 'Mainnet', mpc: 'v1.signer', price_source: { OutLayer: { contract: 'price-oracle.near' } },
-  treasury: { near: 'treasury.near', hl_builder: '0x6a3c66eab3b1f5c31a253903ae4f4b957ccc3224', referral_codes: { hyperliquid: 'WINCH', orderly: null, phoenix: 'X' } },
+  treasury: { near: 'treasury.near', hl_builder: '0x1111111111111111111111111111111111111111', referral_codes: { hyperliquid: 'REF1', orderly: null, phoenix: 'X' } },
   fees: { performance_bps: 1000, hl_builder_tenth_bps: 10 },
   orderly: { broker_id: 'gimbal_dex', chain_id: 42161 },
 };
