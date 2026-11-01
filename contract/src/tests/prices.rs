@@ -1,12 +1,12 @@
 //! Oracle prices on the mocked chain: `set_mock_price`, `refresh_prices` and both oracle paths
-//! (`request_price_data` → `on_prices`, and the `oracle_call` fallback → `oracle_on_call`),
+//! (`request_price_data` → `on_prices`, and `oracle_on_call` for an `oracle_call`),
 //! `prices()`, and the `order_policy` rows of `core/tests/vectors/hl.json` against stored prices.
 
 use super::hl::{at, hl_desk_with, hl_policy, unpriced};
 use super::sol::outcome;
 use super::*;
 use crate::prices::{
-    answer_time_ms, OraclePriceData, PriceRow, ON_PRICES_GAS, ORACLE_CALL_GAS, ORACLE_DEPOSIT,
+    answer_time_ms, OraclePriceData, PriceRow, ON_PRICES_GAS, ORACLE_DEPOSIT,
     REFRESH_PRICES_MIN_GAS, REFRESH_SKIP_MS, REQUEST_PRICE_DATA_GAS,
 };
 use gimbal_core::errors::E_ORACLE_STALE;
@@ -265,7 +265,7 @@ fn refresh_prices_refuses_bad_symbols_strangers_little_gas_and_the_mock_source()
         owner(),
         REFRESH_PRICES_MIN_GAS.saturating_sub(Gas::from_gas(1)),
     );
-    assert_refused("E_ARGS: refresh_prices needs at least 285 TGas", || {
+    assert_refused("E_ARGS: refresh_prices needs at least 240 TGas", || {
         g.refresh_prices(vec!["ETH".into()]).detach();
     });
 
@@ -309,7 +309,7 @@ fn refresh_prices_takes_operators_and_skips_prices_stored_under_30_s_ago() {
     // asked for under 30 s ago skips too, stored or not (C6 review), and also returns true (PR 42
     // review): the engine reads `false` as a failed refresh, and the answer may be on its way.
     let answer = successful(&answer_at(ANSWER_NS));
-    assert!(value(on_prices_with(&mut g, answer, &["ETH", "BTC"])));
+    assert!(on_prices_with(&mut g, answer, &["ETH", "BTC"]));
     let stored = "every price asked for was stored under 30 s ago; no oracle call";
     let asked = "every price asked for was stored or asked for under 30 s ago; no oracle call";
     let t1 = BLOCK_MS + REFRESH_SKIP_MS - 1;
@@ -357,10 +357,8 @@ fn refresh_prices_asks_a_failing_oracle_once_per_30_s() {
     call_at(owner(), BLOCK_MS, Gas::from_tgas(300));
     g.refresh_prices(vec!["ETH".into()]).detach();
     assert_eq!(calls_with_deposits().len(), 2);
-    // `request_price_data` fails, and the `oracle_call` fallback never calls back: nothing stored.
-    let fallback = on_prices_with(&mut g, PromiseResult::Failed, &["ETH"]);
-    assert!(matches!(fallback, PromiseOrValue::Promise(_)));
-    drop(fallback);
+    // `request_price_data` fails: nothing stored, `false`.
+    assert!(!on_prices_with(&mut g, PromiseResult::Failed, &["ETH"]));
     assert_eq!(g.prices(), vec![]);
     for ms in [BLOCK_MS, BLOCK_MS + REFRESH_SKIP_MS - 1] {
         call_at(owner(), ms, Gas::from_tgas(300));
@@ -387,7 +385,7 @@ fn refresh_prices_asks_a_failing_oracle_once_per_30_s() {
 
 /// `on_prices` at [`BLOCK_MS`] with the oracle's answer `result`, prepaid what `refresh_prices`
 /// gives it.
-fn on_prices_with(g: &mut Gimbal, result: PromiseResult, assets: &[&str]) -> PromiseOrValue<bool> {
+fn on_prices_with(g: &mut Gimbal, result: PromiseResult, assets: &[&str]) -> bool {
     testing_env!(
         VMContextBuilder::new()
             .current_account_id(contract_id())
@@ -404,13 +402,6 @@ fn on_prices_with(g: &mut Gimbal, result: PromiseResult, assets: &[&str]) -> Pro
     g.on_prices(assets.iter().map(|s| s.to_string()).collect())
 }
 
-fn value(r: PromiseOrValue<bool>) -> bool {
-    match r {
-        PromiseOrValue::Value(v) => v,
-        PromiseOrValue::Promise(_) => panic!("a value, not a promise"),
-    }
-}
-
 fn successful(v: &Value) -> PromiseResult {
     PromiseResult::Successful(serde_json::to_vec(v).unwrap())
 }
@@ -419,7 +410,7 @@ fn successful(v: &Value) -> PromiseResult {
 fn on_prices_stores_the_usd_prices_of_the_answer_and_says_whether_all_came() {
     let mut g = outlayer();
     let answer = successful(&answer_at(ANSWER_NS));
-    assert!(value(on_prices_with(&mut g, answer, &["ETH", "BTC"])));
+    assert!(on_prices_with(&mut g, answer, &["ETH", "BTC"]));
     let at_ms = ANSWER_AT_MS;
     assert_eq!(
         g.prices(),
@@ -441,11 +432,11 @@ fn on_prices_stores_the_usd_prices_of_the_answer_and_says_whether_all_came() {
 
     // DOGE has no price in the answer, so the result is false; ETH is kept as it was.
     let answer = successful(&answer_at(ANSWER_NS));
-    assert!(!value(on_prices_with(&mut g, answer, &["ETH", "DOGE"])));
+    assert!(!on_prices_with(&mut g, answer, &["ETH", "DOGE"]));
     // An older answer never replaces a newer price, and logs no row.
     let mut old = answer_at(ANSWER_NS - 1_000_000);
     old["prices"][0]["price"]["multiplier"] = json!("1");
-    assert!(value(on_prices_with(&mut g, successful(&old), &["ETH"])));
+    assert!(on_prices_with(&mut g, successful(&old), &["ETH"]));
     assert_eq!(g.prices()[1], row("ETH", 250_000_000_000, at_ms));
     assert!(!get_logs()
         .iter()
@@ -453,22 +444,18 @@ fn on_prices_stores_the_usd_prices_of_the_answer_and_says_whether_all_came() {
     // A newer one does.
     let mut new = answer_at(ANSWER_NS + 60_000_000_000);
     new["prices"][0]["price"]["multiplier"] = json!("251000000000");
-    assert!(value(on_prices_with(&mut g, successful(&new), &["ETH"])));
+    assert!(on_prices_with(&mut g, successful(&new), &["ETH"]));
     assert_eq!(g.prices()[1], row("ETH", 251_000_000_000, at_ms + 60_000));
     // An answer that is not PriceData stores nothing; nor does one that leaves out how old its
     // reports may be.
     let junk = successful(&json!({ "prices": [] }));
-    let r = on_prices_with(&mut g, junk, &["ETH"]);
-    assert!(matches!(r, PromiseOrValue::Promise(_)), "falls back");
-    // Dropped here, the fallback is scheduled under this call's gas, not the next one's.
-    drop(r);
+    assert!(!on_prices_with(&mut g, junk, &["ETH"]));
     let mut ageless = answer_at(ANSWER_NS + 90_000_000_000);
     ageless
         .as_object_mut()
         .unwrap()
         .remove("recency_duration_sec");
-    let r = on_prices_with(&mut g, successful(&ageless), &["ETH"]);
-    assert!(matches!(r, PromiseOrValue::Promise(_)), "falls back");
+    assert!(!on_prices_with(&mut g, successful(&ageless), &["ETH"]));
     assert_eq!(g.prices()[1].at_ms, at_ms + 60_000);
 }
 
@@ -507,7 +494,7 @@ fn a_price_is_as_old_as_the_oldest_report_behind_it_and_never_from_the_future() 
     // An answer an hour ahead of the block is stored at the block time, and goes stale.
     let mut g = outlayer();
     let ahead = answer_at(BLOCK_MS * 1_000_000 + 3_600_000_000_000);
-    assert!(value(on_prices_with(&mut g, successful(&ahead), &["ETH"])));
+    assert!(on_prices_with(&mut g, successful(&ahead), &["ETH"]));
     assert_eq!(g.prices()[1].at_ms, BLOCK_MS);
     let eth = |g: &Gimbal, max_age_s: u32, now_ms: u64| {
         crate::prices::reference_price(&g.prices, "ETH", max_age_s, now_ms)
@@ -531,50 +518,56 @@ fn a_price_is_as_old_as_the_oldest_report_behind_it_and_never_from_the_future() 
         Default::default(),
         vec![successful(&next)]
     );
-    assert!(value(g.on_prices(vec!["ETH".into()])));
+    assert!(g.on_prices(vec!["ETH".into()]));
     assert_eq!(g.prices()[1], row("ETH", 251_000_000_000, BLOCK_MS + 1));
 }
 
+/// A failed `request_price_data` (or one with no readable answer) stores nothing, returns `false`
+/// and schedules nothing: there is no `oracle_call` fallback in the same transaction.
 #[test]
-fn when_request_price_data_fails_on_prices_falls_back_to_oracle_call() {
+fn when_request_price_data_fails_on_prices_ends_false() {
     let mut g = outlayer();
-    match on_prices_with(&mut g, PromiseResult::Failed, &["ETH", "SOL"]) {
-        PromiseOrValue::Promise(p) => p.detach(),
-        PromiseOrValue::Value(v) => panic!("a fallback, not {v}"),
-    }
-    let calls = calls_with_deposits();
-    assert_eq!(
-        calls,
-        vec![(
-            oracle_id(),
-            "oracle_call".into(),
-            json!({
-                "receiver_id": contract_id(),
-                "asset_ids": ["eth.bridge.near", "22.contract.portalbridge.near"],
-                "msg": "ETH,SOL",
-            }),
-            ORACLE_CALL_GAS,
-            0,
-            ORACLE_DEPOSIT,
-        )]
-    );
-    assert_eq!(ORACLE_CALL_GAS, Gas::from_tgas(200));
-    assert_eq!(g.prices(), vec![]);
-
-    // With too little gas left for the fallback the callback just ends false.
-    testing_env!(
-        VMContextBuilder::new()
-            .current_account_id(contract_id())
-            .predecessor_account_id(contract_id())
-            .prepaid_gas(Gas::from_tgas(204))
-            .build(),
-        near_sdk::test_vm_config(),
-        near_sdk::RuntimeFeesConfig::test(),
-        Default::default(),
-        vec![PromiseResult::Failed]
-    );
-    assert!(!value(g.on_prices(vec!["ETH".into()])));
+    assert!(!on_prices_with(
+        &mut g,
+        PromiseResult::Failed,
+        &["ETH", "SOL"]
+    ));
     assert!(calls_with_deposits().is_empty());
+    assert!(!on_prices_with(
+        &mut g,
+        PromiseResult::Successful(b"null".to_vec()),
+        &["ETH"]
+    ));
+    assert!(calls_with_deposits().is_empty());
+    assert_eq!(g.prices(), vec![]);
+}
+
+/// Review item 7: on mainnet the oracle got 76 TGas and forwarded 21 to OutLayer's
+/// `request_execution`, which needs 54 (50 reserved for its yield callback, 4 burnt) and failed
+/// with "Exceeded the prepaid gas". The oracle's split, from that run and a testnet one (281 in,
+/// 124 forwarded): 3 burnt, then about 20 plus half of what is over 70 to OutLayer. At the static
+/// gas alone OutLayer now gets about 83, and `on_prices` gets several times the 2.1 TGas it used.
+#[test]
+fn request_price_data_gets_the_gas_outlayer_needs() {
+    let forwarded = |received_tgas: u64| 20 + (received_tgas - 3).saturating_sub(70) / 2;
+    assert_eq!(forwarded(76), 21, "the failed mainnet split");
+    assert_eq!(forwarded(281), 124, "the testnet split");
+    let outlayer_needs = 50 + 4;
+    assert!(
+        forwarded(REQUEST_PRICE_DATA_GAS.as_tgas()) >= outlayer_needs + 25,
+        "{REQUEST_PRICE_DATA_GAS}"
+    );
+    assert!(ON_PRICES_GAS >= Gas::from_tgas(3 * 3));
+    assert!(ON_PRICES_GAS <= Gas::from_tgas(20), "a modest fixed amount");
+    assert_eq!(REFRESH_PRICES_MIN_GAS, Gas::from_tgas(240));
+    // With 300 attached, everything `refresh_prices` and `on_prices` do not take goes to the
+    // oracle (weight 1 against 0).
+    let mut g = outlayer_desk();
+    call_with_gas_by(owner(), Gas::from_tgas(300));
+    g.refresh_prices(vec!["ETH".into()]).detach();
+    let c = calls_with_deposits();
+    assert_eq!((c[0].3, c[0].4), (REQUEST_PRICE_DATA_GAS, 1));
+    assert_eq!((c[1].3, c[1].4), (ON_PRICES_GAS, 0));
 }
 
 #[test]

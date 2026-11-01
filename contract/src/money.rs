@@ -144,7 +144,7 @@ pub const FUND_PAID_ENTRY_BYTES: u64 = 1 + 32 + 8 + 40;
 pub const FUND_PAID_RESERVE_BYTES: u64 = DEPOSIT_RING as u64 * FUND_PAID_ENTRY_BYTES;
 
 /// The desk's money on NEAR, apart from the desk record: a deposit or a payout reads and writes
-/// these bytes (81 plus the owner id and its length, 149 for an implicit account) whatever the
+/// these bytes (89 plus the owner id and its length, 157 for an implicit account) whatever the
 /// size of the policy. Written by `create_desk`, never deleted.
 #[near(serializers = [borsh])]
 #[derive(Clone, Debug, PartialEq, Eq)]

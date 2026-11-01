@@ -7,8 +7,15 @@
 //! [`ORACLE_ASSETS`]; symbols outside it trade only through `policy.unpriced`.
 //!
 //! With `PriceSource::OutLayer`, `refresh_prices` asks the oracle (`price-oracle.near`) on the
-//! contract's own deposit: first `request_price_data` with a private callback, and when that call
-//! fails, `oracle_call` back into `oracle_on_call`. An answer's `timestamp` is the block time of
+//! contract's own deposit: `request_price_data` with a private callback, `on_prices`. The oracle
+//! burns about 3 TGas and splits the rest between OutLayer's `request_execution` (about 20 TGas
+//! plus half of what is over 70) and its own callback (about 50 plus the other half); measured:
+//! 76 TGas in gave OutLayer 21 (mainnet, 2026-11-01), 281 in gave it 124 (testnet). OutLayer
+//! reserves 50 TGas for its yield callback out of what it gets (`MIN_RESPONSE_GAS`) and burns
+//! about 4 itself, so the 21 failed with "Exceeded the prepaid gas". `request_price_data` now gets
+//! nearly all of the transaction's gas ([`REQUEST_PRICE_DATA_GAS`] and every unused TGas) and
+//! `on_prices` a small fixed amount. There is no `oracle_call` fallback in the same transaction: it
+//! would need as much gas again, which 300 TGas cannot hold beside a well-funded first call. An answer's `timestamp` is the block time of
 //! the oracle's read, and each price in it the median of reports at most the answer's
 //! `recency_duration_sec` older (600 s on mainnet), so a stored price's time is the oldest a
 //! report in it can be: `timestamp` − `recency_duration_sec`, and never later than the block
@@ -35,21 +42,21 @@ use crate::{fail, Gimbal, GimbalExt, OrFail};
 /// when its cache is fresh and passes it to OutLayer (0.01 NEAR at least) when it must fetch.
 pub const ORACLE_DEPOSIT: NearToken = NearToken::from_millinear(20);
 
-/// Static gas of `request_price_data`, which also gets the gas `refresh_prices` leaves unused.
-pub const REQUEST_PRICE_DATA_GAS: Gas = Gas::from_tgas(40);
+/// Static gas of `request_price_data`, which also gets all the gas `refresh_prices` leaves unused
+/// (281 TGas of 300 on testnet). At this floor alone the oracle forwards about 83 TGas to
+/// OutLayer, which needs 54 (its 50 TGas reserve and its own 4).
+pub const REQUEST_PRICE_DATA_GAS: Gas = Gas::from_tgas(200);
 
-/// Gas of the fallback `oracle_call`: the oracle, OutLayer when its cache is stale, and the
-/// oracle's call back into `oracle_on_call`.
-pub const ORACLE_CALL_GAS: Gas = Gas::from_tgas(200);
-
-/// Gas of `on_prices`: storing five prices, or scheduling the fallback with [`ORACLE_CALL_GAS`].
-pub const ON_PRICES_GAS: Gas = Gas::from_tgas(220);
+/// Gas of `on_prices`: one result read and five prices stored. It used 2.1 TGas on mainnet with
+/// five symbols; it schedules nothing.
+pub const ON_PRICES_GAS: Gas = Gas::from_tgas(15);
 
 /// What `refresh_prices` burns itself, with the fees of the two receipts it creates (19 TGas on the
-/// mocked chain for five symbols).
+/// mocked chain for five symbols; 2.8 TGas burnt on mainnet).
 pub const REFRESH_PRICES_GAS: Gas = Gas::from_tgas(25);
 
-/// The least prepaid gas `refresh_prices` accepts (`E_ARGS` below it): the engine attaches 300.
+/// The least prepaid gas `refresh_prices` accepts (`E_ARGS` below it), 240 TGas: the engine
+/// attaches 300.
 pub const REFRESH_PRICES_MIN_GAS: Gas = Gas::from_gas(
     REFRESH_PRICES_GAS.as_gas() + REQUEST_PRICE_DATA_GAS.as_gas() + ON_PRICES_GAS.as_gas(),
 );
@@ -239,42 +246,26 @@ impl Gimbal {
     }
 
     /// The callback of `request_price_data`: stores the answer and returns whether every symbol
-    /// asked for got a price. When the call failed it falls back to `oracle_call`, whose
-    /// `oracle_on_call` gives the transaction's result instead.
+    /// asked for got a price; `false` when the call failed or answered nothing readable (the next
+    /// `refresh_prices` asks again once [`REFRESH_SKIP_MS`] passed).
     #[private]
-    pub fn on_prices(&mut self, assets: Vec<String>) -> PromiseOrValue<bool> {
+    pub fn on_prices(&mut self, assets: Vec<String>) -> bool {
         let answer = env::promise_result_checked(0, PRICE_DATA_MAX_LEN)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<OraclePriceData>(&bytes).ok());
-        if let Some(data) = answer {
-            return PromiseOrValue::Value(self.store_prices(&data, &assets));
+        match answer {
+            Some(data) => self.store_prices(&data, &assets),
+            None => {
+                env::log_str("request_price_data failed or answered nothing readable");
+                false
+            }
         }
-        let Some(oracle) = self.config.oracle().cloned() else {
-            return PromiseOrValue::Value(false);
-        };
-        let left = env::prepaid_gas().saturating_sub(env::used_gas());
-        if left < ORACLE_CALL_GAS.saturating_add(Gas::from_tgas(5)) {
-            env::log_str("request_price_data failed and too little gas is left for oracle_call");
-            return PromiseOrValue::Value(false);
-        }
-        env::log_str("request_price_data failed; asking again through oracle_call");
-        let ids = check_symbols(&assets).or_fail();
-        let args = serde_json::json!({
-            "receiver_id": env::current_account_id(),
-            "asset_ids": ids,
-            "msg": assets.join(","),
-        });
-        PromiseOrValue::Promise(Promise::new(oracle).function_call(
-            "oracle_call",
-            args.to_string().into_bytes(),
-            ORACLE_DEPOSIT,
-            ORACLE_CALL_GAS,
-        ))
     }
 
-    /// The OutLayer oracle's callback after `oracle_call` (its `ext_price_receiver`): stores the
-    /// prices like `on_prices` and returns whether every symbol in `msg` (comma-separated, as
-    /// `refresh_prices` wrote it) got one. Only the configured oracle may call it, and only for
+    /// The OutLayer oracle's callback after an `oracle_call` (its `ext_price_receiver`): stores the
+    /// prices like `on_prices` and returns whether every symbol in `msg` (comma-separated) got
+    /// one. `refresh_prices` no longer makes an `oracle_call` (module doc); the method stays for
+    /// the interface and stores nothing an `oracle_call` of the contract did not ask for. Only the configured oracle may call it, and only for
     /// an `oracle_call` the contract made itself (`E_NOT_ALLOWED`). Not payable: the oracle's
     /// `oracle_call` calls it with no deposit on every path (its source, read 2026-10-31). The
     /// 0.02 NEAR the contract attached to `oracle_call` stays with the oracle's own handling: sent
