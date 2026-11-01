@@ -32,12 +32,13 @@ export const CREATE_DESK_NOTE = 'The contract keeps only the storage the desk us
 
 /**
  * Bytes `create_desk` may store beyond the JSON it is given. The desk is not its arguments: the contract also stores
- * the desk's meters and its ring of 32 deposit-address hashes (1,329 B), its Orderly account id, the owner's index
- * entries and 40 B of chain overhead for each of the five records. Measured by the contract's own test
- * (`the_storage_each_owner_method_adds`): 2,156 B with a small policy, 9,758 B with the largest valid one, and it caps
- * them at 2,500 and 10,000. The policy takes less in Borsh than its JSON takes in the arguments, so what is left over
- * is the fixed part, at most about 2,300 B (a 64-character owner and a 32-character desk id). 12,000 B is far over
- * that and over the largest desk in all (0.12 NEAR, returned). The old margin of 1,000 B was short of even a small desk:
+ * the desk's meters and its rings of deposit-address hashes (rescue and funding), its money record, a reserve for the
+ * contract-wide paid-address map, its Orderly account id, the owner's index entries and 40 B of chain overhead for
+ * each record. Measured by the contract's own test (`the_storage_each_owner_method_adds`): 3,611 B with a small
+ * policy, 11,213 B with the largest valid one, and it caps them at 4,000 and 12,000. The policy takes less in Borsh
+ * than its JSON takes in the arguments, so what is left over is the fixed part, at most about 3,800 B (a 64-character
+ * owner and a 32-character desk id). 12,000 B is far over that, and with the arguments over the largest desk in all
+ * (about 0.12 NEAR, returned). The old margin of 1,000 B was short of even a small desk:
  * `E_DEPOSIT: desk alpha takes 2068 bytes of storage: attach at least 0.02068 NEAR, not 0.01597`.
  */
 export const CREATE_DESK_EXTRA_BYTES = 12_000;
