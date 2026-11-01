@@ -3,6 +3,7 @@
 // the same seams it will read from the engine. The numbers follow design/screens/shared/data.js and are made up.
 import type { ScanStatus, StrategyConfig, Window as FundingWindow, WindowHistory } from '@gimbal/shared';
 import type { EngineApi } from './api.ts';
+import { requestFakeStress } from './fake-rescue.ts';
 
 /**
  * What the fake shows, chosen with `?state=` in development:
@@ -166,6 +167,11 @@ export function fakeApi(journal: EngineApi['journal'] = async () => []): EngineA
     journalBefore: async () => [],
     rotate: async () => ({ ok: true }),
     close: async () => ({ ok: true }),
+    // The fake stream starts a run of its own when asked (fake-rescue.ts).
+    stress: async () => {
+      requestFakeStress();
+      return { ok: true };
+    },
     strategy: async () => ({ ...FAKE_STRATEGY }),
     windowHistory: async (id) => {
       const spec = SPECS.find((s) => specId(s) === id);

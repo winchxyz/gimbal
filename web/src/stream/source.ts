@@ -4,11 +4,11 @@ import type { Scenario } from './fake-windows.ts';
 import type { Source } from './store.ts';
 
 /** What a design state of the fake needs in the address; with none of them (and no `?stream=`) the page looks for the engine. */
-const FAKE_PARAMS = ['state', 'desk', 'net', 'drift'] as const;
+const FAKE_PARAMS = ['state', 'desk', 'net', 'drift', 'rescue'] as const;
 
 /**
  * Production always reads the engine. In development `?stream=sse` and `?stream=fake` choose; the design-state
- * parameters (`?state=`, `?desk=`, `?net=`, `?drift=`) mean the fake. With none of them the answer is `auto`: the
+ * parameters (`?state=`, `?desk=`, `?net=`, `?drift=`, `?rescue=`) mean the fake. With none of them the answer is `auto`: the
  * engine when it answers, else the fake, so the shell still runs without one.
  */
 export function pickSource(search: string, dev: boolean): Source | 'auto' {
@@ -81,4 +81,22 @@ export function pickFakeDesk(search: string, scenario: Scenario): DeskScenario {
 /** `?drift=off` freezes the fake funding rates and marks, for a still picture (screenshots). */
 export function pickFakeDrift(search: string): boolean {
   return new URLSearchParams(search).get('drift') !== 'off';
+}
+
+/**
+ * What the fake Rescue screen shows (`?rescue=`; fake-rescue.ts has the data):
+ * - idle: no rescue yet, "Standing by". The Stress button starts one.
+ * - running: a rescue that starts now and plays in real time, detect to landed in 52 s.
+ * - failing: a rescue that starts now and fails at the quote after 9 s.
+ * - sign: a rescue 5 s in, held at the Sign step (a page opened in the middle of a run).
+ * - landed: a rescue that ended landed.
+ * - failed: a rescue that ended failed at the quote.
+ * The desk's status line follows the rescue unless `?desk=` is given.
+ */
+export const RESCUE_SCENARIOS = ['idle', 'running', 'failing', 'sign', 'landed', 'failed'] as const;
+export type RescueScenario = (typeof RESCUE_SCENARIOS)[number];
+
+export function pickFakeRescue(search: string): RescueScenario {
+  const value = new URLSearchParams(search).get('rescue');
+  return RESCUE_SCENARIOS.find((s) => s === value) ?? 'idle';
 }
