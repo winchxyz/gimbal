@@ -27,14 +27,25 @@ export function brokerIdProblem(id) {
   return null;
 }
 
-/** The canary's limits (CLAUDE.md: a capped canary, at most 20 USDC notional per leg). */
+/**
+ * The canary's limits (CLAUDE.md: a capped canary, at most 20 USDC notional per leg).
+ *
+ * Transfer cost: every quoted transfer must have minAmountOut >= amountIn - max(amountIn x bps, flat)
+ * (contract/core/src/oneclick.rs check_cost), and fund_venue also needs >= 0.5 % between amountOut and
+ * minAmountOut. The cost the check counts is therefore 1Click's fee plus the slippage room. Measured on
+ * mainnet 2026-10-31 (oneclick-live.json, keyed, 100 bps slippage): 20 USDC from NEAR to HyperCore 0.519 USDC,
+ * 10 USDC to the Orderly receiver 0.107; without an API key 1Click takes 0.2 % more. The old 100 bps / 0.5 USDC
+ * refuses the 20 USDC transfer (oneclick.rs test the_cost_bound). 1 USDC flat covers every canary-size transfer
+ * with room to spare (the bps share decides only above 33 USDC), and 300 bps bounds larger ones at 3 %.
+ * The hourly budgets follow: fund_venue 4 x max(20 x 3 %, 1) = 4 USD, rescues max(20 x 3 %, 2 x 1) = 2 USD.
+ */
 export const CANARY_LIMITS = {
   max_notional_usd: 20,
   price_band_bps: 100,
   oracle_max_age_s: 900,
   rescue_cap_usd_per_hour: 20,
-  max_transfer_cost_bps: 100,
-  max_transfer_cost_flat_e6: 500000,
+  max_transfer_cost_bps: 300,
+  max_transfer_cost_flat_e6: 1_000_000,
 };
 
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;

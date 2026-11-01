@@ -59,8 +59,8 @@ test('the canary policy from live data: the five oracle assets, the canary limit
   assert.equal(p.price_band_bps, 100);
   assert.equal(p.oracle_max_age_s, 900);
   assert.equal(p.rescue_cap_usd_per_hour, 20);
-  assert.equal(p.max_transfer_cost_bps, 100);
-  assert.equal(p.max_transfer_cost_flat_e6, 500000);
+  assert.equal(p.max_transfer_cost_bps, 300, 'fund_venue counts the 0.5 % room it requires as cost');
+  assert.equal(p.max_transfer_cost_flat_e6, 1_000_000);
   assert.deepEqual(p.unpriced, []);
   assert.equal(p.unpriced_max_notional_usd, 20);
   assert.deepEqual(policyShapeProblems(p), []);

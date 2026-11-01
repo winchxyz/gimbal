@@ -1,5 +1,6 @@
 // A NEAR mainnet client for the canary runbook (tools/mainnet/README.md): JSON-RPC, borsh transactions
-// (FunctionCall, DeployContract, AddKey with a FunctionCall permission), key files that are never printed, and a
+// (FunctionCall, DeployContract, AddKey with a FunctionCall permission, DeleteAccount for retire.mjs), key files
+// that are never printed, and a
 // printer for planned transactions. No dependencies: node:crypto signs, the rest is written out here or shared.
 //
 // This is a separate module from tools/testnet/near.mjs on purpose: that one refuses mainnet, this one refuses
@@ -289,7 +290,19 @@ export function createClient({ urls = RPC_URLS, fetch: fetchImpl = (...a) => glo
     return feesOf(await rpc('EXPERIMENTAL_protocol_config', { finality: 'final' }));
   }
 
-  return { rpc, view, account, accessKey, accessKeys, send, fees };
+  /** The account's contract code (view_code), or null when the account has none or does not exist. */
+  async function code(id) {
+    mainnetId(id);
+    try {
+      const r = await rpc('query', { request_type: 'view_code', finality: 'final', account_id: id });
+      return Buffer.from(r.code_base64, 'base64');
+    } catch (e) {
+      if (e.rpc && /NO_CONTRACT_CODE|UNKNOWN_ACCOUNT|CodeDoesNotExist/.test(JSON.stringify(e.rpc))) return null;
+      throw e;
+    }
+  }
+
+  return { rpc, view, account, accessKey, accessKeys, send, fees, code };
 }
 
 // --- gas ---
@@ -307,11 +320,12 @@ export function feesOf(protocolConfig) {
     addKey: a?.add_key_cost?.function_call_cost,
     addKeyByte: a?.add_key_cost?.function_call_cost_per_byte,
   };
+  const isFee = (f) => ['send_sir', 'send_not_sir', 'execution'].every((k) => Number.isSafeInteger(f?.[k]) || /^\d+$/.test(String(f?.[k])));
   for (const [name, f] of Object.entries(fees)) {
-    if (!['send_sir', 'send_not_sir', 'execution'].every((k) => Number.isSafeInteger(f?.[k]) || /^\d+$/.test(String(f?.[k])))) {
-      throw new Error(`EXPERIMENTAL_protocol_config: no ${name} fee`);
-    }
+    if (!isFee(f)) throw new Error(`EXPERIMENTAL_protocol_config: no ${name} fee`);
   }
+  // Only retire.mjs needs it; txGasCap refuses a DeleteAccount without it.
+  if (isFee(a?.delete_account_cost)) fees.deleteAccount = a.delete_account_cost;
   return fees;
 }
 
@@ -335,6 +349,9 @@ export function txGasCap(fees, { signer, receiver, actions }) {
     } else if (a.type === 'AddKey') {
       // Per byte of the method names, each counted with a terminating byte (as the runtime counts them).
       other += fee(fees.addKey) + fee(fees.addKeyByte, BigInt(a.methodNames.reduce((n, m) => n + Buffer.byteLength(m) + 1, 0)));
+    } else if (a.type === 'DeleteAccount') {
+      if (fees.deleteAccount === undefined) throw new Error('EXPERIMENTAL_protocol_config: no delete_account_cost fee');
+      other += fee(fees.deleteAccount);
     } else {
       throw new Error(`unknown action ${a.type}`);
     }
@@ -401,6 +418,8 @@ export const act = {
     if (methodNames.length === 0) throw new Error('an operator key needs its method names: an empty list allows every method');
     return { type: 'AddKey', publicKey, receiverId, methodNames: [...methodNames], allowance: BigInt(allowance) };
   },
+  /** Deletes the signer's own account; its whole balance goes to `beneficiaryId`. Only retire.mjs plans it. */
+  deleteAccount: (beneficiaryId) => ({ type: 'DeleteAccount', beneficiaryId: mainnetId(beneficiaryId, 'beneficiary') }),
 };
 
 const M64 = (1n << 64n) - 1n;
@@ -437,6 +456,8 @@ function encodeAction(w, a) {
       for (const m of a.methodNames) w.string(m);
       return w;
     }
+    case 'DeleteAccount':
+      return w.u8(7).string(a.beneficiaryId);
     default:
       throw new Error(`unknown action ${a.type}`);
   }
@@ -463,6 +484,8 @@ export function describeTx(label, { signer, signedBy, receiver, actions }) {
       lines.push(`${n}  AddKey ${a.publicKey}`);
       lines.push(`            permission FunctionCall: receiver ${a.receiverId}, allowance ${nearText(a.allowance)} NEAR, ${a.methodNames.length} methods`);
       lines.push(`            method_names ${JSON.stringify(a.methodNames)}`);
+    } else if (a.type === 'DeleteAccount') {
+      lines.push(`${n}  DeleteAccount: the account ${signer} is deleted; its whole NEAR balance goes to the beneficiary ${a.beneficiaryId}`);
     }
   });
   return lines;
