@@ -47,12 +47,12 @@ pub const ORACLE_DEPOSIT: NearToken = NearToken::from_millinear(20);
 /// OutLayer, which needs 54 (its 50 TGas reserve and its own 4).
 pub const REQUEST_PRICE_DATA_GAS: Gas = Gas::from_tgas(200);
 
-/// Gas of `on_prices`: one result read and five prices stored. It used 2.1 TGas on mainnet with
-/// five symbols; it schedules nothing.
+/// Gas of `on_prices`: one result read and up to seven prices stored. It used 2.1 TGas on mainnet
+/// with five symbols; it schedules nothing.
 pub const ON_PRICES_GAS: Gas = Gas::from_tgas(15);
 
-/// What `refresh_prices` burns itself, with the fees of the two receipts it creates (19 TGas on the
-/// mocked chain for five symbols; 2.8 TGas burnt on mainnet).
+/// What `refresh_prices` burns itself, with the fees of the two receipts it creates (19.3 TGas on
+/// the mocked chain for all seven symbols; 2.8 TGas burnt on mainnet for five).
 pub const REFRESH_PRICES_GAS: Gas = Gas::from_tgas(25);
 
 /// The least prepaid gas `refresh_prices` accepts (`E_ARGS` below it), 240 TGas: the engine
@@ -175,7 +175,7 @@ pub fn check_refresh_gas(prepaid: Gas) -> Result<(), Refusal> {
 #[near]
 impl Gimbal {
     /// Asks the OutLayer oracle for the prices of `assets` (policy symbols of [`ORACLE_ASSETS`],
-    /// 1 to 5, each once: `E_ARGS`, `E_ASSET`) and stores each that is newer than the stored one;
+    /// 1 to 7, each once: `E_ARGS`, `E_ASSET`) and stores each that is newer than the stored one;
     /// event `prices` with the rows stored. Takes no deposit: the oracle's 0.02 NEAR comes from the
     /// contract's balance and is mostly refunded. Callers are the owners of desks, whose engine
     /// key calls it, the desks' separate operator accounts and the contract account

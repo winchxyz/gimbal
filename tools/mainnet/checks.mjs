@@ -3,8 +3,8 @@
 //
 //   node tools/mainnet/checks.mjs <contract> <desk_id> [--step prices|orderly|quotes] [--env-file <file>] [--send]
 //
-//   prices   refresh_prices once for the oracle assets (the first OutLayer call): the transaction's gas, what the
-//            contract and the caller spent, and prices() read back until every asset has a newer price.
+//   prices   refresh_prices once for the desk policy's oracle assets (the first OutLayer call): the transaction's
+//            gas, what the contract and the caller spent, and prices() read back until every asset has a newer price.
 //   orderly  under the contract's broker on its chain: register the desk's EVM account, add the desk's orderly key,
 //            then the signed GET receiver_address, printed in full. The engine's own setup code does it
 //            (engine/src/setup/setup.ts runSetup, OrderlyDeskClient, NearContractClient): each step reads Orderly
@@ -40,7 +40,22 @@ export const ASSETS = {
 /** The oracle ids of the contract's assets (contract/core/src/oracle.rs ORACLE_ASSETS): what request_price_data gets. */
 export const ORACLE_IDS = {
   BTC: 'nbtc.bridge.near', DOGE: 'doge.omft.near', ETH: 'eth.bridge.near', LTC: 'ltc.omft.near', SOL: '22.contract.portalbridge.near',
+  XLM: 'xlm', ZEC: 'zec.omft.near',
 };
+
+/**
+ * The oracle assets the desk's policy trades (hl_assets, phoenix_markets, orderly_symbols, in that order, once
+ * each): what the prices step refreshes. The canary's policy names its five, the final's all seven, so each
+ * contract is asked only for symbols its own table prices.
+ */
+export function policyOracleSymbols(policy) {
+  const names = [
+    ...(policy?.hl_assets ?? []).map((a) => a.symbol),
+    ...(policy?.phoenix_markets ?? []).map((m) => m.symbol),
+    ...(policy?.orderly_symbols ?? []).map((s) => /^PERP_(.+)_USDC$/.exec(s)?.[1]),
+  ];
+  return [...new Set(names)].filter((s) => Object.hasOwn(ORACLE_IDS, s));
+}
 export const NOT_AVAILABLE = /Quoting for this pair is not available/i;
 /** The engine's gas for every operator call (engine/src/contract/budget.ts DEFAULT_CALL_TGAS; a test compares). */
 export const CALL_TGAS = 300;
@@ -355,7 +370,7 @@ export async function runChecks(argv, deps = {}) {
 
   for (const step of a.steps) {
     say();
-    if (step === 'prices') summary.push(...await pricesStep({ a, client, say, sleep, now, signerId, signedBy, signing, deps }));
+    if (step === 'prices') summary.push(...await pricesStep({ a, client, say, sleep, now, desk, signerId, signedBy, signing, deps }));
     if (step === 'orderly') summary.push(...await orderlyStep({ a, client, say, now, desk, brokerId, chainId, signerId, signedBy, signing, fetchImpl, deps }));
     if (step === 'quotes') summary.push(...await quotesStep({ a, say, now, desk, fetchImpl }));
   }
@@ -379,8 +394,9 @@ async function balances(client, ids) {
   return out;
 }
 
-async function pricesStep({ a, client, say, sleep, now, signerId, signedBy, signing, deps }) {
-  const assets = [...CANARY_SYMBOLS];
+async function pricesStep({ a, client, say, sleep, now, desk, signerId, signedBy, signing, deps }) {
+  const assets = policyOracleSymbols(desk.policy);
+  if (assets.length === 0) throw new Error(`desk ${a.deskId}'s policy trades no oracle asset (${Object.keys(ORACLE_IDS).join(', ')}): nothing to refresh`);
   const { actions, lines } = refreshPlan({ contract: a.contract, signer: signerId, signedBy, assets });
   say('prices');
   say(lines.join('\n'));

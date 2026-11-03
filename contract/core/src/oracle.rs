@@ -2,19 +2,23 @@
 //! symbols have one, the OutLayer oracle asset each comes from, and how an oracle price becomes a
 //! price in units of 1e-8 USD.
 //!
-//! The OutLayer oracle (`price-oracle.near`) lists 18 assets; five of them are the bases Gimbal
+//! The OutLayer oracle (`price-oracle.near`) lists 18 assets; seven of them are the bases Gimbal
 //! trades, keyed here by the policy's symbol (`ETH`, also the base of `PERP_ETH_USDC`). Any other
 //! symbol has no stored price and enters a policy only through `policy.unpriced`.
 
 use crate::errors::{shown, Refusal, E_ARGS, E_ASSET};
 
-/// Policy symbol → oracle asset id, sorted by symbol (the order `prices()` returns).
-pub const ORACLE_ASSETS: [(&str, &str); 5] = [
+/// Policy symbol → oracle asset id, sorted by symbol (the order `prices()` returns). XLM's id is
+/// the bare `xlm`, not an omft id: it and `zec.omft.near` answered `request_price_data` on
+/// mainnet (2026-11-03) with fresh prices at 8 decimals, within 0.03 % of Hyperliquid's.
+pub const ORACLE_ASSETS: [(&str, &str); 7] = [
     ("BTC", "nbtc.bridge.near"),
     ("DOGE", "doge.omft.near"),
     ("ETH", "eth.bridge.near"),
     ("LTC", "ltc.omft.near"),
     ("SOL", "22.contract.portalbridge.near"),
+    ("XLM", "xlm"),
+    ("ZEC", "zec.omft.near"),
 ];
 
 /// The decimals of every price the OutLayer oracle fetches on demand: `multiplier` is USD per whole
@@ -44,7 +48,7 @@ pub fn symbol_of(asset_id: &str) -> Option<&'static str> {
         .map(|(s, _)| *s)
 }
 
-/// The symbols a `refresh_prices` or `set_mock_price` may name: one to five of the table's, each
+/// The symbols a `refresh_prices` or `set_mock_price` may name: one to seven of the table's, each
 /// once (`E_ARGS`), none outside it (`E_ASSET`). Returns their oracle asset ids, in the given order.
 pub fn check_symbols(symbols: &[String]) -> Result<Vec<&'static str>, Refusal> {
     if symbols.is_empty() || symbols.len() > ORACLE_ASSETS.len() {
@@ -114,6 +118,9 @@ mod tests {
             assert_eq!(symbol_of(id), Some(symbol));
             assert_eq!(index_of(symbol), Some(i));
         }
+        assert_eq!(ORACLE_ASSETS.len(), 7);
+        assert_eq!(asset_of("XLM"), Some("xlm"));
+        assert_eq!(asset_of("ZEC"), Some("zec.omft.near"));
         assert_eq!(asset_of("HYPE"), None);
         assert_eq!(symbol_of("wrap.near"), None);
         assert_eq!(index_of("HYPE"), None);
@@ -131,8 +138,19 @@ mod tests {
         let r = check_symbols(&s(&["ETH", "HYPE"])).unwrap_err();
         assert_eq!(
             r.to_string(),
-            "E_ASSET: \"HYPE\" has no oracle price; the stored prices are BTC, DOGE, ETH, LTC, SOL \
-             (other symbols trade only through policy.unpriced)"
+            "E_ASSET: \"HYPE\" has no oracle price; the stored prices are BTC, DOGE, ETH, LTC, SOL, \
+             XLM, ZEC (other symbols trade only through policy.unpriced)"
+        );
+        let all = ["BTC", "DOGE", "ETH", "LTC", "SOL", "XLM", "ZEC"];
+        assert_eq!(check_symbols(&s(&all)).unwrap().len(), 7);
+        assert_eq!(
+            check_symbols(&s(&["ZEC", "XLM"])).unwrap(),
+            ["zec.omft.near", "xlm"]
+        );
+        let r = check_symbols(&s(&[&all[..], &["BTC"]].concat())).unwrap_err();
+        assert_eq!(
+            r.to_string(),
+            "E_ARGS: 8 symbols; name 1 to 7 of BTC, DOGE, ETH, LTC, SOL, XLM, ZEC"
         );
         assert_eq!(
             check_symbols(&s(&["BTC", "DOGE", "ETH", "LTC", "SOL", "BTC"]))
