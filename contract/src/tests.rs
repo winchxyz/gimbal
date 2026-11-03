@@ -14,6 +14,8 @@ use near_sdk::test_utils::{accounts, get_created_receipts, get_logs, VMContextBu
 use near_sdk::{testing_env, PromiseResult};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+/// The C10 meters and settings.
+mod c10;
 /// The Hyperliquid methods, on these fixtures.
 mod hl;
 /// Money in and out on NEAR: deposits, fund_venue, payouts and the performance fee.
@@ -166,6 +168,7 @@ fn policy() -> Policy {
         max_transfer_cost_flat_e6: 500_000,
         unpriced: vec![],
         unpriced_max_notional_usd: 100,
+        max_hourly_notional_usd: None,
     }
 }
 
@@ -1320,13 +1323,13 @@ fn the_storage_each_owner_method_adds() {
             "create_desk (the fixtures' policy)",
             "small",
             policy(),
-            4_000,
+            4_500,
         ),
         (
             "create_desk (the largest valid policy)",
             "large",
             Policy::largest_valid(),
-            12_000,
+            12_500,
         ),
     ] {
         call(owner(), NearToken::from_near(1));

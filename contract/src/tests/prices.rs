@@ -201,7 +201,8 @@ fn refresh_prices_asks_the_oracle_on_the_contracts_deposit_then_on_prices() {
         (
             oracle_id(),
             "request_price_data".into(),
-            json!({ "asset_ids": ["eth.bridge.near", "nbtc.bridge.near"] }),
+            // C10: every symbol of the table, whatever the caller names.
+            json!({ "asset_ids": ORACLE_ASSETS.iter().map(|(_, id)| *id).collect::<Vec<_>>() }),
             REQUEST_PRICE_DATA_GAS,
             1,
             ORACLE_DEPOSIT,
@@ -219,7 +220,8 @@ fn refresh_prices_asks_the_oracle_on_the_contracts_deposit_then_on_prices() {
             yocto(0),
         )
     );
-    // All seven symbols, each mapped to its OutLayer asset id.
+    // All seven symbols, each mapped to its OutLayer asset id, in the table's order whatever the
+    // caller's.
     call_with_gas_by(contract_id(), REFRESH_PRICES_MIN_GAS);
     g.refresh_prices(
         ["ZEC", "SOL", "LTC", "XLM", "DOGE", "ETH", "BTC"]
@@ -230,13 +232,13 @@ fn refresh_prices_asks_the_oracle_on_the_contracts_deposit_then_on_prices() {
     assert_eq!(
         calls_with_deposits()[0].2,
         json!({ "asset_ids": [
-            "zec.omft.near",
-            "22.contract.portalbridge.near",
-            "ltc.omft.near",
-            "xlm",
+            "nbtc.bridge.near",
             "doge.omft.near",
             "eth.bridge.near",
-            "nbtc.bridge.near",
+            "ltc.omft.near",
+            "22.contract.portalbridge.near",
+            "xlm",
+            "zec.omft.near",
         ] })
     );
 }
@@ -312,35 +314,36 @@ fn refresh_prices_takes_operators_and_skips_prices_stored_under_30_s_ago() {
         g.refresh_prices(vec!["ETH".into()]).detach();
     });
 
-    // ETH and BTC stored at BLOCK_MS: for 30 s a refresh of them returns true at once. A symbol
-    // asked for under 30 s ago skips too, stored or not (C6 review), and also returns true (PR 42
-    // review): the engine reads `false` as a failed refresh, and the answer may be on its way.
+    // The oracle was asked for every symbol at BLOCK_MS: for 30 s any refresh returns true at
+    // once (C10: one oracle call per 30 s contract-wide), whatever it names, stored or not; true
+    // also when nothing was stored (PR 42 review): the engine reads `false` as a failed refresh,
+    // and the answer may be on its way.
     let answer = successful(&answer_at(ANSWER_NS));
     assert!(on_prices_with(&mut g, answer, &["ETH", "BTC"]));
-    let stored = "every price asked for was stored under 30 s ago; no oracle call";
-    let asked = "every price asked for was stored or asked for under 30 s ago; no oracle call";
+    let skipped = |since: u64| {
+        format!(
+            "the oracle was asked for every price at {since} ms, under 30 s ago; no oracle call"
+        )
+    };
     let t1 = BLOCK_MS + REFRESH_SKIP_MS - 1;
     for (ms, assets, skips) in [
-        (t1, vec!["BTC", "ETH"], Some(stored)),
-        // SOL was never asked for: the oracle is asked for both, and both count as asked at t1.
-        (t1, vec!["ETH", "SOL"], None),
-        (t1 + 1, vec!["ETH"], Some(asked)),
-        (t1 + 1, vec!["SOL", "ETH"], Some(asked)),
-        // BTC was stored 30 s ago and never asked for.
-        (t1 + 1, vec!["BTC"], None),
-        (t1 + 1, vec!["BTC", "ETH"], Some(asked)),
-        (t1 + REFRESH_SKIP_MS - 1, vec!["SOL"], Some(asked)),
-        (t1 + REFRESH_SKIP_MS, vec!["ETH", "SOL"], None),
+        (t1, vec!["BTC", "ETH"], Some(BLOCK_MS)),
+        // SOL has no price, but it was asked for with every other symbol.
+        (t1, vec!["SOL"], Some(BLOCK_MS)),
+        (t1 + 1, vec!["ETH"], None),
+        (t1 + 1, vec!["SOL", "ETH"], Some(t1 + 1)),
+        (t1 + REFRESH_SKIP_MS, vec!["BTC"], Some(t1 + 1)),
+        (t1 + 1 + REFRESH_SKIP_MS, vec!["ETH", "SOL"], None),
     ] {
         call_at(owner(), ms, Gas::from_tgas(300));
         let got = g.refresh_prices(assets.iter().map(|s| s.to_string()).collect());
-        if let Some(log) = skips {
+        if let Some(since) = skips {
             assert!(
                 matches!(got, PromiseOrValue::Value(true)),
                 "{assets:?} at {ms}"
             );
             assert!(calls_with_deposits().is_empty());
-            assert_eq!(get_logs(), vec![log], "{assets:?} at {ms}");
+            assert_eq!(get_logs(), vec![skipped(since)], "{assets:?} at {ms}");
         } else {
             assert!(
                 matches!(got, PromiseOrValue::Promise(_)),
@@ -356,8 +359,9 @@ fn refresh_prices_takes_operators_and_skips_prices_stored_under_30_s_ago() {
 }
 
 /// A failed oracle round stores nothing, and still no second call within 30 s spends the
-/// contract's deposit again (C6 review): the asked time is what counts, per symbol. The skipped
-/// call returns `true` like every skip; only the call that asked the oracle reports the failure.
+/// contract's deposit again (C6 review): the asked time is what counts, for every symbol (C10).
+/// The skipped call returns `true` like every skip; only the call that asked the oracle reports
+/// the failure.
 #[test]
 fn refresh_prices_asks_a_failing_oracle_once_per_30_s() {
     let mut g = outlayer_desk();
@@ -367,25 +371,24 @@ fn refresh_prices_asks_a_failing_oracle_once_per_30_s() {
     // `request_price_data` fails: nothing stored, `false`.
     assert!(!on_prices_with(&mut g, PromiseResult::Failed, &["ETH"]));
     assert_eq!(g.prices(), vec![]);
-    for ms in [BLOCK_MS, BLOCK_MS + REFRESH_SKIP_MS - 1] {
+    for (ms, asset) in [
+        (BLOCK_MS, "ETH"),
+        (BLOCK_MS + 1, "BTC"),
+        (BLOCK_MS + REFRESH_SKIP_MS - 1, "ETH"),
+    ] {
         call_at(owner(), ms, Gas::from_tgas(300));
         assert!(matches!(
-            g.refresh_prices(vec!["ETH".into()]),
+            g.refresh_prices(vec![asset.into()]),
             PromiseOrValue::Value(true)
         ));
         assert!(calls_with_deposits().is_empty(), "{ms}");
     }
-    // Another symbol is asked for at once; ETH again 30 s after it was asked for.
-    for (ms, assets) in [
-        (BLOCK_MS + 1, vec!["BTC"]),
-        (BLOCK_MS + REFRESH_SKIP_MS, vec!["ETH"]),
-    ] {
-        call_at(owner(), ms, Gas::from_tgas(300));
-        let got = g.refresh_prices(assets.iter().map(|s| s.to_string()).collect());
-        assert!(matches!(got, PromiseOrValue::Promise(_)), "{assets:?}");
-        drop(got);
-        assert_eq!(calls_with_deposits()[0].1, "request_price_data");
-    }
+    // Any symbol again 30 s after the oracle was asked.
+    call_at(owner(), BLOCK_MS + REFRESH_SKIP_MS, Gas::from_tgas(300));
+    let got = g.refresh_prices(vec!["BTC".into()]);
+    assert!(matches!(got, PromiseOrValue::Promise(_)));
+    drop(got);
+    assert_eq!(calls_with_deposits()[0].1, "request_price_data");
 }
 
 // --- the oracle's answers ---

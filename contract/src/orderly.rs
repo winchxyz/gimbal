@@ -7,8 +7,9 @@
 //! method is its `prepare_*` followed by `Gimbal::sign`.
 
 use gimbal_core::errors::{Refusal, E_ARGS};
-use gimbal_core::hl::Address;
+use gimbal_core::hl::{check_usdc_amount, Address};
 use gimbal_core::ids::{check_base58_32, check_evm_address, check_reason};
+use gimbal_core::limits::notional_e8;
 use gimbal_core::orderly::{
     account_id, build_request, check_ip_list, orderly_key, ws_auth, Broker, Context, Message,
     OrderlyRequest, Signable,
@@ -16,7 +17,7 @@ use gimbal_core::orderly::{
 use near_sdk::{env, near, Promise};
 
 use crate::action::{OrderDetail, UnsignedAction};
-use crate::deposit::check_some_deposit;
+use crate::deposit::{check_some_deposit, check_withdraw_deposit, WithdrawPath};
 use crate::desk::{Desk, Gate};
 use crate::events::{Event, OrderlyIpsSet, OrderlyReceiverSet};
 use crate::hl::keccak;
@@ -136,7 +137,13 @@ impl Gimbal {
     /// EIP-712 `Withdraw` of `amount` USDC (canonical, at most 6 decimals: `E_DECIMAL`; not zero:
     /// `E_SIZE`) to the desk's own EVM address on Arbitrum, token USDC, with Orderly's
     /// `withdraw_nonce`, at the block time. The message carries the amount in raw units (1e-6), a
-    /// string in the JSON. Owner or operator, running desk.
+    /// string in the JSON. Running desk. Two paths, as for `hl_withdraw`, told apart by the
+    /// deposit: exactly 1 yoctoNEAR is the owner's wallet (`E_NOT_ALLOWED` for anyone else), no
+    /// limit; no deposit is the operator (or the owner's engine key): `amount` at least 10 ×
+    /// `max_transfer_cost_flat_e6` (`E_SIZE`), counted against what is left of
+    /// `rescue_cap_usd_per_hour` and Orderly's 1 USDC fee against the hourly rescue cost budget
+    /// (`E_RESCUE_CAP`). Any other deposit is `E_NOT_ALLOWED`.
+    #[payable]
     #[deny_unknown_arguments]
     pub fn orderly_withdraw(
         &mut self,
@@ -300,6 +307,16 @@ impl Gimbal {
         if let Some((digest, signature)) = &signable.eip712 {
             check_desk_signature(digest, signature, &desk.evm_address).or_fail();
         }
+        let counters = self.count_notional(
+            &desk_id,
+            self.counters_of(&desk_id),
+            signable
+                .order
+                .iter()
+                .filter(|o| !o.reduce_only)
+                .map(|o| notional_e8(o.px_e8, o.sz_e8, &o.valued)),
+        );
+        self.desk_counters.insert(desk_id.clone(), counters);
         rest_action(desk_id, &signable, Some(&reason))
     }
 
@@ -333,9 +350,19 @@ impl Gimbal {
         withdraw_nonce: u64,
     ) -> UnsignedAction {
         let (desk, _) = action_desk(&self.desks, &desk_id, Gate::Running);
+        let path = check_withdraw_deposit("orderly_withdraw", env::attached_deposit()).or_fail();
+        if path == WithdrawPath::Owner {
+            desk.check_owner(&desk_id, &env::predecessor_account_id(), "orderly_withdraw")
+                .or_fail();
+        }
         let evm = desk_evm(desk);
         let message =
             Message::withdraw(evm, &amount, withdraw_nonce, env::block_timestamp_ms()).or_fail();
+        if path == WithdrawPath::Operator {
+            let amount_e8 = check_usdc_amount(&amount).or_fail();
+            let counters = self.counted_withdraw(&desk_id, "orderly_withdraw", amount_e8);
+            self.desk_counters.insert(desk_id.clone(), counters);
+        }
         self.eip712_action(desk_id, &evm, &message)
             .with_amount(Some(amount))
     }

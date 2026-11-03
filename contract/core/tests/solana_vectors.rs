@@ -5,15 +5,17 @@
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use gimbal_core::ed25519::is_on_curve;
 use gimbal_core::errors::{
-    E_ASSET, E_ORACLE_STALE, E_PRICE_BAND, E_SIZE, E_SOL_ACCOUNT, E_SOL_MESSAGE, E_SOL_PROGRAM,
+    E_ARGS, E_ASSET, E_ORACLE_STALE, E_PRICE_BAND, E_SIZE, E_SOL_ACCOUNT, E_SOL_MESSAGE,
+    E_SOL_PROGRAM,
 };
 use gimbal_core::phoenix::{
-    check_message, check_onboarding, check_registration, Onboarding, Rescue, CANCEL_ALL,
-    DEPOSIT_FUNDS, EMBER_DEPOSIT, EMBER_WITHDRAW, MAX_COMPUTE_UNIT_LIMIT, MAX_COMPUTE_UNIT_PRICE,
-    MAX_PRIORITY_FEE_LAMPORTS, PHOENIX_ACTIVE_TRADER_BUFFER, PHOENIX_GLOBAL_CONFIGURATION,
-    PHOENIX_GLOBAL_TRADER_INDEX, PHOENIX_GLOBAL_VAULT, PHOENIX_LOG_AUTHORITY,
-    PHOENIX_ONBOARDING_PERMISSION, PHOENIX_PERP_ASSET_MAP, PHOENIX_RISK_AUTHORITY,
-    PHOENIX_WITHDRAW_QUEUE, PLACE_MARKET_ORDER, REGISTER_TRADER, SET_TRADER_CAPABILITIES_DELEGATED,
+    check_message, check_onboarding, check_registration, check_registration_in, Onboarding,
+    PhoenixAccounts, Rescue, CANCEL_ALL, DEPOSIT_FUNDS, EMBER_DEPOSIT, EMBER_WITHDRAW,
+    MAX_COMPUTE_UNIT_LIMIT, MAX_COMPUTE_UNIT_PRICE, MAX_PRIORITY_FEE_LAMPORTS,
+    PHOENIX_ACTIVE_TRADER_BUFFER, PHOENIX_GLOBAL_CONFIGURATION, PHOENIX_GLOBAL_TRADER_INDEX,
+    PHOENIX_GLOBAL_VAULT, PHOENIX_LOG_AUTHORITY, PHOENIX_ONBOARDING_PERMISSION,
+    PHOENIX_PERP_ASSET_MAP, PHOENIX_RISK_AUTHORITY, PHOENIX_WITHDRAW_QUEUE, PLACE_MARKET_ORDER,
+    REGISTER_TRADER, RESCUE_MAX_COMPUTE_UNIT_LIMIT, SET_TRADER_CAPABILITIES_DELEGATED,
     WITHDRAW_FUNDS,
 };
 use gimbal_core::policy::{PhoenixMarket, Policy, UnpricedAsset};
@@ -81,10 +83,11 @@ fn vector_policy(ctx: &Value) -> Policy {
         max_transfer_cost_flat_e6: 0,
         unpriced: vec![],
         unpriced_max_notional_usd: 0,
+        max_hourly_notional_usd: None,
     };
     policy.validate().unwrap();
     assert_eq!(ctx["max_cu_limit"], 600_000);
-    assert_eq!(ctx["max_cu_price"], 1_000_000);
+    assert_eq!(ctx["max_cu_price"], 200_000);
     policy
 }
 
@@ -395,10 +398,45 @@ fn a_paused_desk_signs_a_rescue_that_only_frees_and_pays_amount_in() {
     assert_eq!(lean.ixs.len(), full.ixs.len() - 3);
     let c = check(&lean);
     assert_eq!((c.kind, c.reduces_risk), ("rescue", true));
+    // C10: it may pay a priority fee within the price cap for at most 400,000 units, so it lands
+    // under congestion.
+    let fee = without(&full, desk_create);
+    assert_eq!(fee.ixs.len(), full.ixs.len() - 2);
+    let l = fee.find(COMPUTE_BUDGET_PROGRAM, &[2]);
+    let limit = u32::from_le_bytes(fee.ixs[l].2[1..5].try_into().unwrap());
+    assert!(u64::from(limit) <= RESCUE_MAX_COMPUTE_UNIT_LIMIT);
+    let c = check(&fee);
+    assert_eq!(
+        (c.kind, c.reduces_risk),
+        ("rescue", true),
+        "with the priority fee"
+    );
+    let mut at_cap = fee.clone();
+    let edge = u32::try_from(RESCUE_MAX_COMPUTE_UNIT_LIMIT).unwrap();
+    at_cap.ixs[l].2[1..5].copy_from_slice(&edge.to_le_bytes());
+    let p = at_cap.find(COMPUTE_BUDGET_PROGRAM, &[3]);
+    at_cap.ixs[p].2[1..9].copy_from_slice(&MAX_COMPUTE_UNIT_PRICE.to_le_bytes());
+    let c = check(&at_cap);
+    assert_eq!(
+        (c.kind, c.reduces_risk),
+        ("rescue", true),
+        "with the priority fee at both caps"
+    );
+    let mut wide = at_cap.clone();
+    wide.ixs[l].2[1..5].copy_from_slice(&(edge + 1).to_le_bytes());
+    let mut no_fee_wide = lean.clone();
+    let l2 = no_fee_wide.find(COMPUTE_BUDGET_PROGRAM, &[2]);
+    no_fee_wide.ixs[l2].2[1..5].copy_from_slice(&MAX_COMPUTE_UNIT_LIMIT.to_le_bytes());
+    let c = check(&no_fee_wide);
+    assert_eq!(
+        (c.kind, c.reduces_risk),
+        ("rescue", true),
+        "a wide unit limit with no price pays no priority fee"
+    );
 
     let mut needs_running: Vec<(&str, Draft)> = vec![
         ("as the SDK builds it", full.clone()),
-        ("with the priority fee", without(&full, desk_create)),
+        ("with the priority fee for 400,001 units", wide),
         (
             "with a create of a desk account",
             without(&full, unit_price),
@@ -429,6 +467,166 @@ fn a_paused_desk_signs_a_rescue_that_only_frees_and_pays_amount_in() {
         let c = check(d);
         assert_eq!((c.kind, c.reduces_risk), ("rescue", false), "{what}");
     }
+}
+
+/// C10: the rescue's one transfer out moves the desk's USDC account (accounts[0]) signed by the
+/// desk (accounts[3]) and names exactly 4 accounts; an ATA create names exactly 6, with the system
+/// and token programs at 4 and 5.
+#[test]
+fn the_rescue_transfer_and_the_ata_create_are_pinned() {
+    let doc = sol_doc();
+    let ctx = &doc["ctx"]["sol_sign"];
+    let (policy, desk, reference) = (vector_policy(ctx), vector_desk(&doc), reference_of(ctx));
+    let stranger = key(&doc["keys"]["strangerSol"]["public_key_b58"]);
+    let case = doc["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| name(c).starts_with("rescue in one transaction"))
+        .unwrap();
+    let rescue = rescue_of(case).unwrap();
+    let answer = |d: &Draft| {
+        check_message(
+            sha256,
+            &policy,
+            &desk,
+            &d.bytes(),
+            &reference,
+            Some(&rescue),
+        )
+        .map(|s| s.kind)
+    };
+    let mut full = Draft::of(&message(case));
+    full.push_revoke(desk.phusd_ata, desk.authority);
+    assert_eq!(answer(&full), Ok("rescue"));
+    let t = full.find(TOKEN_PROGRAM, &[12]);
+    let code = |d: &Draft| answer(d).unwrap_err().code;
+
+    let mut d = full.clone();
+    d.set_account(t, 0, desk.phusd_ata);
+    assert_eq!(
+        code(&d),
+        E_SOL_ACCOUNT,
+        "a transfer out of the PhUSD account"
+    );
+    let mut d = full.clone();
+    d.set_account(t, 3, stranger);
+    assert_eq!(code(&d), E_SOL_ACCOUNT, "a transfer signed by a stranger");
+    let mut d = full.clone();
+    d.push_account(t, stranger);
+    assert_eq!(code(&d), E_SOL_ACCOUNT, "a fifth transfer account");
+
+    let deposit_create = |d: &Draft| {
+        (0..d.ixs.len())
+            .find(|&i| {
+                d.keys[usize::from(d.ixs[i].0)] == ATA_PROGRAM
+                    && d.account(i, 2) == rescue.deposit_owner
+            })
+            .unwrap()
+    };
+    let a = deposit_create(&full);
+    let mut d = full.clone();
+    d.swap_accounts(a, 4, 5);
+    assert_eq!(code(&d), E_SOL_ACCOUNT, "the programs swapped");
+    let mut d = full.clone();
+    d.push_account(a, stranger);
+    assert_eq!(code(&d), E_SOL_ACCOUNT, "a seventh create account");
+}
+
+/// C1: Phoenix's and Ember's own accounts follow the desk's `infra`. A desk whose owner moved
+/// one refuses the vector message with the old one and passes it with the new one; the rules on
+/// what an owner may set ([`PhoenixAccounts::check`]).
+#[test]
+fn the_phoenix_accounts_are_the_desks_own() {
+    let doc = sol_doc();
+    let ctx = &doc["ctx"]["sol_sign"];
+    let (policy, desk, reference) = (vector_policy(ctx), vector_desk(&doc), reference_of(ctx));
+    assert_eq!(desk.infra, PhoenixAccounts::PINNED);
+    PhoenixAccounts::PINNED.check(&desk).unwrap();
+    let moved = find_program_address(sha256, &[b"moved"], &PHOENIX_PROGRAM)
+        .unwrap()
+        .0;
+    let mut infra = PhoenixAccounts::PINNED;
+    infra.log_authority = moved;
+    infra.check(&desk).unwrap();
+    let other = SolDesk { infra, ..desk };
+    let case = doc["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| name(c).starts_with("rescue in one transaction"))
+        .unwrap();
+    let rescue = rescue_of(case).unwrap();
+    let mut full = Draft::of(&message(case));
+    full.push_revoke(desk.phusd_ata, desk.authority);
+    let answer = |d: &SolDesk, m: &Draft| {
+        check_message(sha256, &policy, d, &m.bytes(), &reference, Some(&rescue)).map(|s| s.kind)
+    };
+    assert_eq!(answer(&desk, &full), Ok("rescue"));
+    assert_eq!(answer(&other, &full).unwrap_err().code, E_SOL_ACCOUNT);
+    let mut follows = full.clone();
+    let at = follows
+        .keys
+        .iter()
+        .position(|k| *k == PHOENIX_LOG_AUTHORITY)
+        .unwrap();
+    follows.keys[at] = moved;
+    assert_eq!(answer(&other, &follows), Ok("rescue"));
+    assert_eq!(answer(&desk, &follows).unwrap_err().code, E_SOL_ACCOUNT);
+
+    let mut ember = PhoenixAccounts::PINNED;
+    ember.ember_state = moved;
+    let ember_desk = SolDesk {
+        infra: ember,
+        ..desk
+    };
+    assert_eq!(answer(&ember_desk, &full).unwrap_err().code, E_SOL_ACCOUNT);
+
+    // Onboarding takes them too.
+    let onboarding = onboarding_doc();
+    let register = onboarding["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["expect"]["ok"] == true && c["type"] == "register")
+        .unwrap();
+    let auth = key(&onboarding["ctx"]["desk"]["authority"]);
+    let trader = key(&onboarding["ctx"]["desk"]["phoenix_trader"]);
+    let bytes = message(register);
+    check_registration_in(&PhoenixAccounts::PINNED, &auth, &trader, &bytes).unwrap();
+    assert_eq!(
+        check_registration_in(&infra, &auth, &trader, &bytes)
+            .unwrap_err()
+            .code,
+        E_SOL_ACCOUNT
+    );
+
+    let stranger = key(&doc["keys"]["strangerSol"]["public_key_b58"]);
+    let refused = |f: &dyn Fn(&mut PhoenixAccounts), why: &str| {
+        let mut a = PhoenixAccounts::PINNED;
+        f(&mut a);
+        let r = a.check(&desk).unwrap_err();
+        assert_eq!(r.code, E_ARGS, "{why}");
+        r.msg
+    };
+    assert!(refused(&|a| a.global_vault = TOKEN_PROGRAM, "a program").contains("the token program"));
+    assert!(refused(&|a| a.ember_vault = PHOENIX_PROGRAM, "a program").contains("Phoenix program"));
+    assert!(refused(&|a| a.perp_asset_map = USDC_MINT, "a mint").contains("USDC mint"));
+    assert!(refused(&|a| a.withdraw_queue = desk.usdc_ata, "the desk's").contains("USDC account"));
+    assert!(refused(&|a| a.global_trader_index = desk.trader, "the desk's").contains("trader"));
+    assert!(
+        refused(&|a| a.active_trader_buffer = desk.authority, "the desk").contains("authority")
+    );
+    assert!(
+        refused(&|a| a.withdraw_queue = PHOENIX_PERP_ASSET_MAP, "a repeat")
+            .contains("also perp_asset_map")
+    );
+    assert!(refused(&|a| a.ember_state = stranger, "on the curve").contains("curve"));
+    assert!(refused(&|a| a.log_authority = [0; 32], "zero").contains("system program"));
+    // Not every account must be a program address: Phoenix's index and buffer accounts are not.
+    let mut a = PhoenixAccounts::PINNED;
+    a.perp_asset_map = stranger;
+    a.check(&desk).unwrap();
 }
 
 /// The vector order message `prefix` with its order flags byte set to `flags`. The order is the
@@ -1376,7 +1574,7 @@ fn budget_cases(r: &mut Review<'_>) {
     d.ixs = vec![d.ixs[price].clone()];
     r.add(
         3,
-        "review 3: only SetComputeUnitPrice 1000000",
+        "review 3: only SetComputeUnitPrice 200000",
         cancel,
         &d,
         E_SOL_PROGRAM,
@@ -1717,16 +1915,22 @@ fn revoke_cases(r: &mut Review<'_>) {
     );
 }
 
-/// With the limit the price now needs, the priority fee is at most 0.0006 SOL; without one, the
-/// 1,400,000 units a message may burn at the top price would pay 0.0014 SOL.
+/// With the limit the price now needs, the priority fee is at most 0.00012 SOL (C10: the price
+/// cap is 200,000); without one, the 1,400,000 units a message may burn at the top price would
+/// pay 0.00028 SOL. A paused rescue pays at most 0.00008 SOL of it.
 #[test]
 fn the_priority_fee_is_capped_by_the_limit_and_the_price_together() {
     assert_eq!(
         MAX_PRIORITY_FEE_LAMPORTS,
         u64::from(MAX_COMPUTE_UNIT_LIMIT) * MAX_COMPUTE_UNIT_PRICE / 1_000_000
     );
-    assert_eq!(MAX_PRIORITY_FEE_LAMPORTS, 600_000);
-    assert_eq!(1_400_000 * MAX_COMPUTE_UNIT_PRICE / 1_000_000, 1_400_000);
+    assert_eq!(MAX_COMPUTE_UNIT_PRICE, 200_000);
+    assert_eq!(MAX_PRIORITY_FEE_LAMPORTS, 120_000);
+    assert_eq!(1_400_000 * MAX_COMPUTE_UNIT_PRICE / 1_000_000, 280_000);
+    assert_eq!(
+        RESCUE_MAX_COMPUTE_UNIT_LIMIT * MAX_COMPUTE_UNIT_PRICE / 1_000_000,
+        80_000
+    );
 }
 
 /// Review item 4: Phoenix's vault in a deposit and a withdrawal, and every account of an Ember

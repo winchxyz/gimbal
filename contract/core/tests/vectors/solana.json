@@ -127,7 +127,7 @@
         "BTC": "8125000000000"
       },
       "max_cu_limit": 600000,
-      "max_cu_price": 1000000
+      "max_cu_price": 200000
     },
     "sol_sign_rescue": {
       "method": "sol_sign_rescue",
@@ -171,7 +171,7 @@
         "BTC": "8125000000000"
       },
       "max_cu_limit": 600000,
-      "max_cu_price": 1000000,
+      "max_cu_price": 200000,
       "rescue": {
         "deposit_owner": "J2xccRtuG43drESLYznHhLhQkLTdfepcKYbiQ9BsJVaf",
         "amount_in": "10000000"
@@ -1690,7 +1690,7 @@
         "ok": false,
         "code": "E_SOL_PROGRAM"
       },
-      "why": "ix 1: priority fee over 1000000 micro-lamports",
+      "why": "ix 1: priority fee over 200000 micro-lamports",
       "parsed": {
         "header": {
           "num_required_signatures": 1,
@@ -2186,10 +2186,10 @@
       }
     },
     {
-      "name": "compute budget at the caps: limit 600000, price 1000000",
+      "name": "compute budget at the caps: limit 600000, price 200000",
       "group": "as-used",
       "method": "sol_sign",
-      "message_hex": "0100030bea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c1a7535d1dc09eee8f94e8d3e78aae72452acedd0d0ec9bdae5d03fd0332548d115c8aa923de3610f99612f3bf7b8644c370c90f1bbed89086617fea52e508e131daf2f5c33d26c9b55ff98f9377adc2fc612029fc9230d5925a8e1a45a4e47ca59433054c5b24ba8eaa8217fdff9036fb99c4bc19119a971aa4833ec604c231fa1cfb51a882e215caa5c9967198ea019f46190b908fce9977615d94a37596266c882468afa6805426a4c6cdd3251c5e730c82ff374e9a7330ef85447bd46a558f0c43928e821adfc8e9e46149a1e735be83e31f61fc8690f85d6ee4e22beb45a0306466fe5211732ffecadba72c39be7bc8ce5bbc5f7126b2c439b3a40000000ce70d6fb568e43ebfc964a90156c3be9563b0817067cab694ebc83efddb37e86e85726c0b2b5bcfaf6668b7c1b8369fb01c9985fcc167f0b4299bf1d7d1ec2a5bdc503e79b4a10cb2d223517f716bd1d06fb077e8cfb5e0d0c6dd5dc7a5fae9e0308000502c02709000800090340420f0000000000090a090a03000501070204060862bf4bdc732847ed",
+      "message_hex": "0100030bea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c1a7535d1dc09eee8f94e8d3e78aae72452acedd0d0ec9bdae5d03fd0332548d115c8aa923de3610f99612f3bf7b8644c370c90f1bbed89086617fea52e508e131daf2f5c33d26c9b55ff98f9377adc2fc612029fc9230d5925a8e1a45a4e47ca59433054c5b24ba8eaa8217fdff9036fb99c4bc19119a971aa4833ec604c231fa1cfb51a882e215caa5c9967198ea019f46190b908fce9977615d94a37596266c882468afa6805426a4c6cdd3251c5e730c82ff374e9a7330ef85447bd46a558f0c43928e821adfc8e9e46149a1e735be83e31f61fc8690f85d6ee4e22beb45a0306466fe5211732ffecadba72c39be7bc8ce5bbc5f7126b2c439b3a40000000ce70d6fb568e43ebfc964a90156c3be9563b0817067cab694ebc83efddb37e86e85726c0b2b5bcfaf6668b7c1b8369fb01c9985fcc167f0b4299bf1d7d1ec2a5bdc503e79b4a10cb2d223517f716bd1d06fb077e8cfb5e0d0c6dd5dc7a5fae9e0308000502c027090008000903400d030000000000090a090a03000501070204060862bf4bdc732847ed",
       "size": 430,
       "expect": {
         "ok": true
@@ -2228,7 +2228,7 @@
             "program": "ComputeBudget111111111111111111111111111111",
             "account_indexes": [],
             "accounts": [],
-            "data_hex": "0340420f0000000000"
+            "data_hex": "03400d030000000000"
           },
           {
             "program_index": 9,

@@ -3,9 +3,13 @@
 //! and token moves between the desk's own accounts) and the two Phoenix onboarding messages
 //! `sol_sign_register` takes.
 //!
-//! Every account the rules name is derived from the desk authority ([`SolDesk::derive`]) by the
-//! caller; nothing is taken from what an owner registered.
+//! Every account of the desk the rules name is derived from the desk authority
+//! ([`SolDesk::derive`]) by the caller; nothing is taken from what an owner registered. Phoenix's
+//! and Ember's own accounts (not their program ids) come from [`SolDesk::infra`]: the pinned
+//! [`PhoenixAccounts::PINNED`] unless the desk's owner replaced them ([`PhoenixAccounts::check`]),
+//! so a Phoenix that moves one of them does not lock the desk's collateral in for good.
 
+use crate::ed25519::is_on_curve;
 use crate::errors::{
     Refusal, E_ARGS, E_ASSET, E_PRICE_BAND, E_QUOTE_FIELDS, E_SOL_ACCOUNT, E_SOL_MESSAGE,
     E_SOL_PROGRAM,
@@ -22,12 +26,20 @@ use crate::solana::{
 
 /// The highest compute-unit limit a message may set.
 pub const MAX_COMPUTE_UNIT_LIMIT: u32 = 600_000;
-/// The highest priority fee a message may set, in micro-lamports per compute unit.
-pub const MAX_COMPUTE_UNIT_PRICE: u64 = 1_000_000;
-/// The most a message may pay in priority fees, in lamports: both caps together, 0.0006 SOL. A
+/// The highest priority fee a message may set, in micro-lamports per compute unit: twice what the
+/// engine sets (100,000 with 400k to 600k units), so a stolen operator key repeating a
+/// `cancel_all` with the most it may pay burns 0.000125 SOL a transaction (with the 5,000
+/// lamport base fee), not 0.000605.
+pub const MAX_COMPUTE_UNIT_PRICE: u64 = 200_000;
+/// The most a message may pay in priority fees, in lamports: both caps together, 0.00012 SOL. A
 /// price is taken only with a unit limit, which bounds the units it pays for.
 pub const MAX_PRIORITY_FEE_LAMPORTS: u64 =
     MAX_COMPUTE_UNIT_LIMIT as u64 * MAX_COMPUTE_UNIT_PRICE / 1_000_000;
+/// The highest compute-unit limit of a paused desk's rescue that pays a priority fee: a rescue
+/// needs a priority fee to land under congestion, and with this limit it pays at most 0.00008 SOL
+/// of it. Rescues are metered by the hourly rescue cap and the deposit ring (at most 32 in any
+/// 65 min), so a paused desk burns at most 32 × 0.000085 SOL in fees in that time.
+pub const RESCUE_MAX_COMPUTE_UNIT_LIMIT: u64 = 400_000;
 
 // Anchor discriminators, sha256("global:<name>")[0..8].
 /// Phoenix `place_market_order`.
@@ -101,6 +113,129 @@ pub const PHOENIX_WITHDRAW_QUEUE: Pubkey = [
     0x26, 0xb1, 0x61, 0xcc, 0x85, 0xc0, 0xe0, 0x4b, 0x39, 0xf7, 0x7e, 0xaf, 0xe4, 0x98, 0x0c, 0xad,
     0x32, 0x2f, 0x85, 0xc6, 0xd0, 0x36, 0xe7, 0x65, 0x4f, 0x63, 0x67, 0xaa, 0x8a, 0x64, 0x8c, 0xd2,
 ];
+
+/// Phoenix's and Ember's own accounts the desk's instructions name, which are not program ids
+/// and not the desk's (those are derived): what [`PhoenixAccounts::PINNED`] holds unless the
+/// desk's owner replaced them. If Phoenix moves its global configuration or one of these
+/// accounts, every withdrawal would fail with the pinned ones, so the owner can follow it.
+///
+/// The exact account count of each instruction stays fixed (10, 10, 12, 8): an instruction that
+/// gains an account still needs a new contract, an accepted residual.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PhoenixAccounts {
+    pub log_authority: Pubkey,
+    pub global_configuration: Pubkey,
+    pub perp_asset_map: Pubkey,
+    pub withdraw_queue: Pubkey,
+    pub global_vault: Pubkey,
+    pub global_trader_index: Pubkey,
+    pub active_trader_buffer: Pubkey,
+    /// Ember's state: accounts[1] of a wrap and an unwrap, and the only delegate an `Approve` of
+    /// the desk's PhUSD account may name.
+    pub ember_state: Pubkey,
+    pub ember_vault: Pubkey,
+}
+
+/// The accounts no [`PhoenixAccounts`] entry may be: programs, mints, Phoenix's onboarding keys.
+const NOT_INFRA: [(Pubkey, &str); 11] = [
+    (SYSTEM_PROGRAM, "the system program"),
+    (COMPUTE_BUDGET_PROGRAM, "the compute budget program"),
+    (TOKEN_PROGRAM, "the token program"),
+    (ATA_PROGRAM, "the associated token account program"),
+    (PHOENIX_PROGRAM, "the Phoenix program"),
+    (EMBER_PROGRAM, "the Ember program"),
+    (USDC_MINT, "the USDC mint"),
+    (PHUSD_MINT, "the PhUSD mint"),
+    (PHOENIX_ONBOARDER, "Phoenix's onboarder"),
+    (
+        PHOENIX_ONBOARDING_PERMISSION,
+        "Phoenix's onboarding permission",
+    ),
+    (PHOENIX_RISK_AUTHORITY, "Phoenix's risk authority"),
+];
+
+impl PhoenixAccounts {
+    /// The accounts as recorded on 2026-10-31 (the constants above).
+    pub const PINNED: PhoenixAccounts = PhoenixAccounts {
+        log_authority: PHOENIX_LOG_AUTHORITY,
+        global_configuration: PHOENIX_GLOBAL_CONFIGURATION,
+        perp_asset_map: PHOENIX_PERP_ASSET_MAP,
+        withdraw_queue: PHOENIX_WITHDRAW_QUEUE,
+        global_vault: PHOENIX_GLOBAL_VAULT,
+        global_trader_index: PHOENIX_GLOBAL_TRADER_INDEX,
+        active_trader_buffer: PHOENIX_ACTIVE_TRADER_BUFFER,
+        ember_state: EMBER_AUTHORITY,
+        ember_vault: EMBER_VAULT,
+    };
+
+    /// The names and values, in the order above (also the JSON field order).
+    pub fn entries(&self) -> [(&'static str, Pubkey); 9] {
+        [
+            ("log_authority", self.log_authority),
+            ("global_configuration", self.global_configuration),
+            ("perp_asset_map", self.perp_asset_map),
+            ("withdraw_queue", self.withdraw_queue),
+            ("global_vault", self.global_vault),
+            ("global_trader_index", self.global_trader_index),
+            ("active_trader_buffer", self.active_trader_buffer),
+            ("ember_state", self.ember_state),
+            ("ember_vault", self.ember_vault),
+        ]
+    }
+
+    /// What an owner may set for the desk `desk` (`E_ARGS`): no program id, mint or Phoenix
+    /// onboarding key; none of the desk's own derived accounts; no two entries alike; and the
+    /// program-derived ones (log authority, global configuration, the two vaults, Ember's state)
+    /// off the ed25519 curve, so no private key can sign for them. Ember's state is the only
+    /// delegate an `Approve` may name, and that allowance never outlives the message (the walk
+    /// requires the `Revoke`), so only Ember's own program can use it.
+    ///
+    /// Why the desk's money cannot be sent elsewhere through these: every account the desk's
+    /// money lands in (its USDC and PhUSD accounts, its trader account, a rescue's deposit
+    /// account) stays derived and pinned; these accounts are only ever passed to Phoenix's and
+    /// Ember's pinned programs, which must check them themselves, since anyone can call those
+    /// programs with any accounts. A wrong entry makes the desk's Phoenix instructions fail.
+    pub fn check(&self, desk: &SolDesk) -> Result<(), Refusal> {
+        let refuse = |name: &str, msg: String| {
+            Err(Refusal::new(
+                E_ARGS,
+                format!("phoenix accounts: {name} {msg}"),
+            ))
+        };
+        let entries = self.entries();
+        let own = [
+            (desk.authority, "the desk authority"),
+            (desk.usdc_ata, "the desk's USDC account"),
+            (desk.phusd_ata, "the desk's PhUSD account"),
+            (desk.trader, "the desk's trader account"),
+        ];
+        let off_curve = [
+            "log_authority",
+            "global_configuration",
+            "global_vault",
+            "ember_state",
+            "ember_vault",
+        ];
+        for (i, (name, key)) in entries.iter().enumerate() {
+            if let Some((_, what)) = NOT_INFRA.iter().chain(own.iter()).find(|(k, _)| k == key) {
+                return refuse(name, format!("{} is {what}", b58(key)));
+            }
+            if let Some((other, _)) = entries[..i].iter().find(|(_, k)| k == key) {
+                return refuse(name, format!("{} is also {other}", b58(key)));
+            }
+            if off_curve.contains(name) && is_on_curve(key) {
+                return refuse(
+                    name,
+                    format!(
+                        "{} is on the ed25519 curve; this account is a program-derived address",
+                        b58(key)
+                    ),
+                );
+            }
+        }
+        Ok(())
+    }
+}
 
 /// `register_trader` exactly as Phoenix builds it for the desk: max positions 128, preference
 /// bits 0, trader PDA index 0, subaccount 0.
@@ -514,7 +649,15 @@ impl<'a> Walk<'a> {
             ));
         }
         // payer, account, owner, mint, system program, token program
-        let a = accounts(ix, n, 6)?;
+        let a = exactly(ix, n, 6)?;
+        pinned(
+            a,
+            n,
+            &[
+                (4, SYSTEM_PROGRAM, "the system program"),
+                (5, TOKEN_PROGRAM, "the token program"),
+            ],
+        )?;
         let d = self.desk;
         if a[0] != d.authority {
             return Err(at(
@@ -584,7 +727,7 @@ impl<'a> Walk<'a> {
                     n,
                     &[
                         (0, d.phusd_ata, "the desk's PhUSD account"),
-                        (1, EMBER_AUTHORITY, "the Ember authority"),
+                        (1, d.infra.ember_state, "Ember's state"),
                         (2, d.authority, "the desk authority"),
                     ],
                 )?;
@@ -645,6 +788,15 @@ impl<'a> Walk<'a> {
                 let Some(r) = self.rescue.filter(|r| r.deposit_account == a[2]) else {
                     return Err(self.foreign_destination(&a[2], n));
                 };
+                // The one transfer out: from the desk's USDC account, signed by the desk.
+                pinned(
+                    exactly(ix, n, 4)?,
+                    n,
+                    &[
+                        (0, d.usdc_ata, "the desk's USDC account"),
+                        (3, d.authority, "the desk authority"),
+                    ],
+                )?;
                 if a[1] != USDC_MINT || !self.deposit_account_created {
                     return Err(at(
                         n,
@@ -717,12 +869,12 @@ impl<'a> Walk<'a> {
             n,
             &[
                 (0, d.authority, "the desk authority"),
-                (1, EMBER_AUTHORITY, "Ember's state"),
+                (1, d.infra.ember_state, "Ember's state"),
                 (2, USDC_MINT, "the USDC mint"),
                 (3, PHUSD_MINT, "the PhUSD mint"),
                 (4, d.usdc_ata, "the desk's USDC account"),
                 (5, d.phusd_ata, "the desk's PhUSD account"),
-                (6, EMBER_VAULT, "Ember's vault"),
+                (6, d.infra.ember_vault, "Ember's vault"),
                 (7, TOKEN_PROGRAM, "the token program"),
             ],
         )?;
@@ -786,10 +938,10 @@ impl<'a> Walk<'a> {
             .unwrap_or_default();
         let head = [
             (0, PHOENIX_PROGRAM, "the Phoenix program"),
-            (1, PHOENIX_LOG_AUTHORITY, "Phoenix's log authority"),
+            (1, d.infra.log_authority, "Phoenix's log authority"),
             (
                 2,
-                PHOENIX_GLOBAL_CONFIGURATION,
+                d.infra.global_configuration,
                 "Phoenix's global configuration",
             ),
             (3, d.authority, "the desk authority"),
@@ -820,9 +972,9 @@ impl<'a> Walk<'a> {
                     n,
                     &[
                         (4, d.trader, trader),
-                        (5, PHOENIX_PERP_ASSET_MAP, "Phoenix's perp asset map"),
-                        (6, PHOENIX_GLOBAL_TRADER_INDEX, index),
-                        (7, PHOENIX_ACTIVE_TRADER_BUFFER, buffer),
+                        (5, d.infra.perp_asset_map, "Phoenix's perp asset map"),
+                        (6, d.infra.global_trader_index, index),
+                        (7, d.infra.active_trader_buffer, buffer),
                     ],
                 )?;
                 let market = self.market(&a[8], n)?;
@@ -859,10 +1011,10 @@ impl<'a> Walk<'a> {
                     &[
                         (4, d.phusd_ata, phusd),
                         (5, d.trader, trader),
-                        (6, PHOENIX_GLOBAL_VAULT, vault),
+                        (6, d.infra.global_vault, vault),
                         (7, TOKEN_PROGRAM, "the token program"),
-                        (8, PHOENIX_GLOBAL_TRADER_INDEX, index),
-                        (9, PHOENIX_ACTIVE_TRADER_BUFFER, buffer),
+                        (8, d.infra.global_trader_index, index),
+                        (9, d.infra.active_trader_buffer, buffer),
                     ],
                 )?;
                 self.reduces_risk = false;
@@ -881,13 +1033,13 @@ impl<'a> Walk<'a> {
                     n,
                     &[
                         (4, d.trader, trader),
-                        (5, PHOENIX_PERP_ASSET_MAP, "Phoenix's perp asset map"),
-                        (6, PHOENIX_GLOBAL_VAULT, vault),
+                        (5, d.infra.perp_asset_map, "Phoenix's perp asset map"),
+                        (6, d.infra.global_vault, vault),
                         (7, d.phusd_ata, phusd),
                         (8, TOKEN_PROGRAM, "the token program"),
-                        (9, PHOENIX_GLOBAL_TRADER_INDEX, index),
-                        (10, PHOENIX_ACTIVE_TRADER_BUFFER, buffer),
-                        (11, PHOENIX_WITHDRAW_QUEUE, "Phoenix's withdraw queue"),
+                        (9, d.infra.global_trader_index, index),
+                        (10, d.infra.active_trader_buffer, buffer),
+                        (11, d.infra.withdraw_queue, "Phoenix's withdraw queue"),
                     ],
                 )?;
                 self.reduces_risk = false;
@@ -1071,8 +1223,15 @@ pub fn check_message(
     // or to reduce a position.
     let priority_fee = walk.budget.price.is_some_and(|(_, price)| price > 0);
     let cancels_or_reduces = walk.cancel_all || walk.orders.iter().any(|o| o.reduce_only);
+    // A paused desk's rescue may pay a priority fee (within the price cap) for at most
+    // RESCUE_MAX_COMPUTE_UNIT_LIMIT units, so it can land under congestion.
+    let rescue_fee_ok = !priority_fee
+        || walk
+            .budget
+            .limit
+            .is_some_and(|(_, limit)| limit <= RESCUE_MAX_COMPUTE_UNIT_LIMIT);
     let reduces_risk = if rescue.is_some() {
-        walk.rescue_pause_ok && !priority_fee
+        walk.rescue_pause_ok && rescue_fee_ok
     } else {
         walk.reduces_risk
             && walk.orders.iter().all(|o| o.reduce_only)
@@ -1126,14 +1285,14 @@ pub enum Onboarding {
 struct Step {
     disc: [u8; 8],
     data: &'static [u8],
-    accounts: fn(&Pubkey, &Pubkey) -> Vec<Pubkey>,
+    accounts: fn(&PhoenixAccounts, &Pubkey, &Pubkey) -> Vec<Pubkey>,
 }
 
-fn register_accounts(authority: &Pubkey, trader: &Pubkey) -> Vec<Pubkey> {
+fn register_accounts(infra: &PhoenixAccounts, authority: &Pubkey, trader: &Pubkey) -> Vec<Pubkey> {
     vec![
         PHOENIX_PROGRAM,
-        PHOENIX_LOG_AUTHORITY,
-        PHOENIX_GLOBAL_CONFIGURATION,
+        infra.log_authority,
+        infra.global_configuration,
         *authority, // payer of the rent, the only signer of the two
         *authority, // the trader authority, read-only
         *trader,
@@ -1141,16 +1300,20 @@ fn register_accounts(authority: &Pubkey, trader: &Pubkey) -> Vec<Pubkey> {
     ]
 }
 
-fn capability_accounts(_authority: &Pubkey, trader: &Pubkey) -> Vec<Pubkey> {
+fn capability_accounts(
+    infra: &PhoenixAccounts,
+    _authority: &Pubkey,
+    trader: &Pubkey,
+) -> Vec<Pubkey> {
     vec![
         PHOENIX_PROGRAM,
-        PHOENIX_LOG_AUTHORITY,
-        PHOENIX_GLOBAL_CONFIGURATION,
+        infra.log_authority,
+        infra.global_configuration,
         PHOENIX_ONBOARDER,
         PHOENIX_ONBOARDING_PERMISSION,
         *trader,
-        PHOENIX_GLOBAL_TRADER_INDEX,
-        PHOENIX_ACTIVE_TRADER_BUFFER,
+        infra.global_trader_index,
+        infra.active_trader_buffer,
     ]
 }
 
@@ -1214,23 +1377,42 @@ pub fn check_onboarding(
     which: Onboarding,
 ) -> Result<(), Refusal> {
     let m = parse_message(message)?;
-    check_shape(authority, trader, message.len(), &m, which)
+    check_shape(
+        &PhoenixAccounts::PINNED,
+        authority,
+        trader,
+        message.len(),
+        &m,
+        which,
+    )
 }
 
 /// `sol_sign_register`'s check: the message's type is the one its format stands for
-/// ([`Onboarding::of`]), and it is checked as [`check_onboarding`] checks that type.
+/// ([`Onboarding::of`]), and it is checked as [`check_onboarding`] checks that type, with the
+/// pinned Phoenix accounts.
 pub fn check_registration(
+    authority: &Pubkey,
+    trader: &Pubkey,
+    message: &[u8],
+) -> Result<Onboarding, Refusal> {
+    check_registration_in(&PhoenixAccounts::PINNED, authority, trader, message)
+}
+
+/// [`check_registration`] with the desk's Phoenix accounts `infra`.
+pub fn check_registration_in(
+    infra: &PhoenixAccounts,
     authority: &Pubkey,
     trader: &Pubkey,
     message: &[u8],
 ) -> Result<Onboarding, Refusal> {
     let m = parse_message(message)?;
     let which = Onboarding::of(m.format);
-    check_shape(authority, trader, message.len(), &m, which)?;
+    check_shape(infra, authority, trader, message.len(), &m, which)?;
     Ok(which)
 }
 
 fn check_shape(
+    infra: &PhoenixAccounts,
     authority: &Pubkey,
     trader: &Pubkey,
     len: usize,
@@ -1296,7 +1478,7 @@ fn check_shape(
                 "the instruction data is not what Phoenix builds for the desk",
             ));
         }
-        if ix.accounts != (step.accounts)(authority, trader) {
+        if ix.accounts != (step.accounts)(infra, authority, trader) {
             return Err(at(
                 n,
                 E_SOL_ACCOUNT,
@@ -1310,7 +1492,8 @@ fn check_shape(
             format!("a Phoenix {} message is missing instructions", which.kind()),
         ));
     }
-    Ok(())
+    // A unit price needs a unit limit here too, within the same caps as sol_sign.
+    budget.finish()
 }
 
 #[cfg(test)]

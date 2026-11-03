@@ -8,7 +8,8 @@
 
 use gimbal_core::errors::{Refusal, E_ARGS, E_SOL_MESSAGE};
 use gimbal_core::ids::{check_base58_32, check_reason};
-use gimbal_core::phoenix::{check_message, check_registration};
+use gimbal_core::limits::notional_e8;
+use gimbal_core::phoenix::{check_message, check_registration_in};
 use gimbal_core::solana::{SolDesk, MAX_TRANSACTION_BYTES};
 use near_sdk::base64::engine::general_purpose::STANDARD;
 use near_sdk::base64::Engine as _;
@@ -17,7 +18,7 @@ use near_sdk::{env, near, Promise};
 use crate::action::{OrderDetail, UnsignedAction};
 use crate::desk::{Desk, Gate};
 use crate::prices::reference_price;
-use crate::{action_desk, Gimbal, GimbalExt, OrFail};
+use crate::{action_desk, desk_ref, Gimbal, GimbalExt, OrFail};
 
 /// The host's SHA-256, which the core derivations take as a function.
 pub fn sha256(data: &[u8]) -> [u8; 32] {
@@ -48,10 +49,19 @@ pub fn decode_message(message_b64: &str) -> Result<Vec<u8>, Refusal> {
     })
 }
 
-/// The desk's Solana accounts, derived from its authority.
+/// The desk's Solana accounts, derived from its authority, with the pinned Phoenix accounts
+/// ([`Gimbal::sol_desk`] puts in the desk's own).
 pub fn desk_accounts(desk: &Desk) -> Result<SolDesk, Refusal> {
     let authority = check_base58_32("solana.authority", &desk.solana.authority)?;
     SolDesk::derive(sha256, authority)
+}
+
+impl Gimbal {
+    /// [`action_desk`] with `gate`, then the desk's Solana accounts with its Phoenix accounts.
+    fn sol_desk_checked(&self, desk_id: &str, gate: Gate) -> SolDesk {
+        action_desk(&self.desks, desk_id, gate);
+        self.sol_desk(desk_id)
+    }
 }
 
 #[near]
@@ -103,10 +113,10 @@ impl Gimbal {
         message_b64: String,
         reason: String,
     ) -> UnsignedAction {
-        let (desk, _) = action_desk(&self.desks, &desk_id, Gate::ReducesRisk);
+        let accounts = self.sol_desk_checked(&desk_id, Gate::ReducesRisk);
+        let desk = desk_ref(&self.desks, &desk_id);
         check_reason(&reason).or_fail();
         let message = decode_message(&message_b64).or_fail();
-        let accounts = desk_accounts(desk).or_fail();
         let max_age_s = desk.policy.oracle_max_age_s;
         let block_ms = env::block_timestamp_ms();
         let prices = &self.prices;
@@ -122,6 +132,16 @@ impl Gimbal {
             .iter()
             .map(|o| OrderDetail::new(&o.symbol, o.bid, o.size_e8, o.price_e8, o.valued))
             .collect();
+        let counters = self.count_notional(
+            &desk_id,
+            self.counters_of(&desk_id),
+            checked
+                .orders
+                .iter()
+                .filter(|o| !o.reduce_only)
+                .map(|o| notional_e8(o.price_e8, o.size_e8, &o.valued)),
+        );
+        self.desk_counters.insert(desk_id.clone(), counters);
         UnsignedAction::solana(desk_id, checked.kind, message_b64, &message, Some(&reason))
             .with_orders(orders)
     }
@@ -132,10 +152,15 @@ impl Gimbal {
         desk_id: String,
         message_b64: String,
     ) -> UnsignedAction {
-        let (desk, _) = action_desk(&self.desks, &desk_id, Gate::Running);
+        let accounts = self.sol_desk_checked(&desk_id, Gate::Running);
         let message = decode_message(&message_b64).or_fail();
-        let accounts = desk_accounts(desk).or_fail();
-        let which = check_registration(&accounts.authority, &accounts.trader, &message).or_fail();
+        let which = check_registration_in(
+            &accounts.infra,
+            &accounts.authority,
+            &accounts.trader,
+            &message,
+        )
+        .or_fail();
         UnsignedAction::solana(desk_id, which.kind(), message_b64, &message, None)
     }
 }

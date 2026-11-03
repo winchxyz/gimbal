@@ -97,6 +97,37 @@ pub fn check_value(
     })
 }
 
+/// The notional an order that passed [`check_value`] counts in the hourly notional meter, USD ×
+/// 1e8, rounded up: `sz × max(px, oracle)`, or `sz × px` for an unpriced symbol, the value the
+/// size cap read.
+pub fn notional_e8(px_e8: u128, sz_e8: u128, valued: &Valued) -> u128 {
+    let value_px = valued.oracle_e8.map_or(px_e8, |o| o.max(px_e8));
+    // check_value kept the product within a cap of at most 2^53 − 1 USD, so it fits.
+    value_px.saturating_mul(sz_e8).div_ceil(100_000_000)
+}
+
+/// What is left of the desk's hourly notional cap, `left_e8` (USD × 1e8), covers `notional_e8`,
+/// else `E_SIZE`. `what` names the orders in the message.
+pub fn check_hourly_notional(
+    notional_e8: u128,
+    left_e8: u128,
+    cap_usd: u64,
+    what: &str,
+) -> Result<(), Refusal> {
+    if notional_e8 <= left_e8 {
+        return Ok(());
+    }
+    Err(Refusal::new(
+        E_SIZE,
+        format!(
+            "{what}: {} USD of notional is over what is left of max_hourly_notional_usd \
+             {cap_usd} in the sliding hour, {} USD",
+            format_e8(notional_e8),
+            format_e8(left_e8)
+        ),
+    ))
+}
+
 /// `|px − oracle| × 10 000 ≤ band_bps × oracle`, else `E_PRICE_BAND`.
 pub fn check_band(px_e8: u128, oracle_e8: u128, band_bps: u32) -> Result<(), Refusal> {
     let diff = px_e8.abs_diff(oracle_e8);
@@ -191,6 +222,7 @@ mod tests {
                 max_sz: "2.5".into(),
             }],
             unpriced_max_notional_usd: 100,
+            max_hourly_notional_usd: None,
         }
     }
 
@@ -304,6 +336,27 @@ mod tests {
                 .unwrap_err()
                 .code,
             E_SIZE
+        );
+    }
+
+    #[test]
+    fn the_hourly_meter_counts_the_value_the_size_cap_read() {
+        let priced = Valued {
+            oracle_e8: Some(e8("2500")),
+        };
+        // A sell under the oracle counts at the oracle, a buy above it at its own price.
+        assert_eq!(notional_e8(e8("1"), e8("0.4"), &priced), e8("1000"));
+        assert_eq!(notional_e8(e8("2550"), e8("0.1"), &priced), e8("255"));
+        // Unpriced: its own price. Rounded up to 1e-8 USD.
+        let unpriced = Valued { oracle_e8: None };
+        assert_eq!(notional_e8(e8("39.9"), e8("2.5"), &unpriced), e8("99.75"));
+        assert_eq!(notional_e8(1, 1, &unpriced), 1);
+        check_hourly_notional(e8("300"), e8("300"), 300, "the order").unwrap();
+        let r = check_hourly_notional(e8("300.00000001"), e8("300"), 300, "the order").unwrap_err();
+        assert_eq!(
+            r.to_string(),
+            "E_SIZE: the order: 300.00000001 USD of notional is over what is left of \
+             max_hourly_notional_usd 300 in the sliding hour, 300 USD"
         );
     }
 

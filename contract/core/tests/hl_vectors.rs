@@ -536,6 +536,7 @@ fn vector_policy(p: &Value) -> Policy {
             })
             .collect(),
         unpriced_max_notional_usd: u(&p["unpriced_max_notional_usd"]),
+        max_hourly_notional_usd: None,
     }
 }
 

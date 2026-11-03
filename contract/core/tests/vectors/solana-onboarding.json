@@ -711,7 +711,7 @@
       }
     ],
     "max_cu_limit": 600000,
-    "max_cu_price": 1000000
+    "max_cu_price": 200000
   },
   "messages": {
     "register": {
@@ -860,7 +860,7 @@
       },
       "key_index_note": "message key indexes come from the compiler (web3.js sorts signers, then writable, then by base58); the contract must resolve keys through each instruction, never by a fixed message index",
       "fees": "5000 lamports per signature: the fee payer (desk) pays for both signatures plus any priority fee; rent for the trader account (128 positions) is taken from register_trader.accounts[3]",
-      "compute_budget": "optional, only before the Phoenix instructions: SetComputeUnitLimit <= 600000, SetComputeUnitPrice <= 1000000, each at most once",
+      "compute_budget": "optional, only before the Phoenix instructions: SetComputeUnitLimit <= 600000, SetComputeUnitPrice <= 200000, each at most once",
       "referral_code": "none (this path carries no code)",
       "http": {
         "endpoint": "POST /v1/exchange/send-register-ixs",
@@ -3054,7 +3054,7 @@
         "ok": false,
         "code": "E_SOL_PROGRAM"
       },
-      "why": "ix 1: priority fee over 1000000",
+      "why": "ix 1: priority fee over 200000",
       "parsed": {
         "version": "legacy",
         "header": {
@@ -4156,7 +4156,7 @@
         "ok": false,
         "code": "E_SOL_PROGRAM"
       },
-      "why": "ix 1: priority fee over 1000000",
+      "why": "ix 1: priority fee over 200000",
       "parsed": {
         "version": 0,
         "header": {

@@ -55,6 +55,7 @@ pub(super) fn hl_policy() -> Policy {
         oracle_max_age_s: 300,
         unpriced: vec![unpriced("HYPE", "3")],
         unpriced_max_notional_usd: 100,
+        max_hourly_notional_usd: None,
         ..policy()
     }
 }
@@ -748,8 +749,9 @@ fn hl_withdraw_has_an_owner_path_and_an_operator_path() {
     assert_eq!(counters_of(&g), Default::default());
 }
 
-/// The operator path counts `amount` against the desk's sliding hourly rescue cap (50 USD here),
-/// and nothing against the cost budget or the deposit ring; the owner's wallet is not limited.
+/// The operator path counts `amount` against the desk's sliding hourly rescue cap (50 USD here)
+/// and Hyperliquid's 1 USDC fee against the hourly cost budget (C10), nothing against the deposit
+/// ring, and takes at least 10 × `max_transfer_cost_flat_e6`; the owner's wallet is not limited.
 #[test]
 fn the_operators_hl_withdraw_counts_against_the_rescue_cap() {
     let mut g = hl_desk();
@@ -764,7 +766,7 @@ fn the_operators_hl_withdraw_counts_against_the_rescue_cap() {
     g.prepare_hl_withdraw("alpha".into(), "30".into());
     let c = counters_of(&g);
     assert_eq!((c.rescue_at_ms, c.rescue_spent_e8), (T, e8(30)));
-    assert_eq!(c.rescue_cost_e8, 0, "no quote, no cost");
+    assert_eq!(c.rescue_cost_e8, 100_000_000, "Hyperliquid's 1 USDC fee");
     assert_eq!(
         c.deposits,
         [[0; 32]; crate::rescue::DEPOSIT_RING],
@@ -778,10 +780,17 @@ fn the_operators_hl_withdraw_counts_against_the_rescue_cap() {
     for who in [operator(), owner()] {
         at(who, T + 1, yocto(0));
         assert_refused(
-            "E_RESCUE_CAP: hl_withdraw of 0.00002 USDC is over what is left of the hourly \
-             rescue cap, 0.00001388 USD",
+            "E_RESCUE_CAP: hl_withdraw of 5 USDC is over what is left of the hourly rescue cap, \
+             0.00001388 USD",
             || {
-                g.prepare_hl_withdraw("alpha".into(), "0.00002".into());
+                g.prepare_hl_withdraw("alpha".into(), "5".into());
+            },
+        );
+        assert_refused(
+            "E_SIZE: the operator's hl_withdraw of 4.999999 USDC is under its minimum of 5 USDC \
+             (10 × max_transfer_cost_flat_e6); the owner has none",
+            || {
+                g.prepare_hl_withdraw("alpha".into(), "4.999999".into());
             },
         );
     }
@@ -808,6 +817,27 @@ fn the_operators_hl_withdraw_counts_against_the_rescue_cap() {
     g.prepare_hl_withdraw("alpha".into(), "10".into());
     let c = counters_of(&g);
     assert_eq!((c.rescue_at_ms, c.rescue_spent_e8), (later, e8(50)));
+    // The cost meter: 2 USDC of fees a fifth of an hour ago weigh 1.6, plus this one's.
+    assert_eq!(c.rescue_cost_e8, 260_000_000);
+    // The budget (max(50 × 1%, 2 × 0.5) + 2 venue fees = 3 USD) stops a fourth fee in that
+    // stretch, however much cap is left.
+    let mut g = hl_desk_with(Policy {
+        rescue_cap_usd_per_hour: 1_000,
+        max_transfer_cost_bps: 0,
+        ..hl_policy()
+    });
+    g.desk_counters.insert("alpha".into(), Default::default());
+    at(operator(), T, yocto(0));
+    for _ in 0..3 {
+        g.prepare_hl_withdraw("alpha".into(), "5".into());
+    }
+    assert_refused(
+        "E_RESCUE_CAP: hl_withdraw pays the venue's 1 USDC fee, over what is left of the hourly \
+         rescue cost budget, 0 of 3 USD",
+        || {
+            g.prepare_hl_withdraw("alpha".into(), "5".into());
+        },
+    );
     // A lower cap applies at once.
     let mut g = hl_desk_with(Policy {
         rescue_cap_usd_per_hour: 9,

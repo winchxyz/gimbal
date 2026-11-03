@@ -67,8 +67,9 @@ pub enum WithdrawPath {
     Operator,
 }
 
-/// The [`WithdrawPath`] of `hl_withdraw` from its deposit; any other deposit is `E_NOT_ALLOWED`.
-pub fn check_withdraw_deposit(attached: NearToken) -> Result<WithdrawPath, Refusal> {
+/// The [`WithdrawPath`] of `method` (`hl_withdraw` or `orderly_withdraw`) from its deposit; any
+/// other deposit is `E_NOT_ALLOWED`.
+pub fn check_withdraw_deposit(method: &str, attached: NearToken) -> Result<WithdrawPath, Refusal> {
     if attached == ONE_YOCTO {
         Ok(WithdrawPath::Owner)
     } else if attached.is_zero() {
@@ -77,7 +78,7 @@ pub fn check_withdraw_deposit(attached: NearToken) -> Result<WithdrawPath, Refus
         Err(Refusal::new(
             E_NOT_ALLOWED,
             format!(
-                "hl_withdraw takes exactly 1 yoctoNEAR from the owner's wallet, or no deposit on the \
+                "{method} takes exactly 1 yoctoNEAR from the owner's wallet, or no deposit on the \
                  operator path; attached {}",
                 attached.as_yoctonear()
             ),
@@ -165,10 +166,16 @@ mod tests {
 
     #[test]
     fn the_deposit_tells_the_two_withdraw_paths_apart() {
-        assert_eq!(check_withdraw_deposit(ONE_YOCTO), Ok(WithdrawPath::Owner));
-        assert_eq!(check_withdraw_deposit(yocto(0)), Ok(WithdrawPath::Operator));
+        assert_eq!(
+            check_withdraw_deposit("hl_withdraw", ONE_YOCTO),
+            Ok(WithdrawPath::Owner)
+        );
+        assert_eq!(
+            check_withdraw_deposit("orderly_withdraw", yocto(0)),
+            Ok(WithdrawPath::Operator)
+        );
         for wrong in [2, 10u128.pow(24)] {
-            let r = check_withdraw_deposit(yocto(wrong)).unwrap_err();
+            let r = check_withdraw_deposit("hl_withdraw", yocto(wrong)).unwrap_err();
             assert_eq!(r.code, E_NOT_ALLOWED);
             assert_eq!(
                 r.msg,

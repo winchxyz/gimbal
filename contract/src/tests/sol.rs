@@ -251,6 +251,41 @@ fn sol_sign_returns_the_message_for_the_desk_key() {
     assert_eq!(serde_json::from_str::<UnsignedAction>(&json).unwrap(), got);
 }
 
+/// C1: the desk's Phoenix accounts are the ones its owner set. Moving Phoenix's log authority
+/// refuses the vector deposit, which names the pinned one, and passes it with the new one in its
+/// place.
+#[test]
+fn sol_sign_takes_the_desks_phoenix_accounts() {
+    use crate::settings::PhoenixAccountsJson;
+    use gimbal_core::phoenix::{PhoenixAccounts, PHOENIX_LOG_AUTHORITY};
+    use gimbal_core::solana::{find_program_address, PHOENIX_PROGRAM};
+    let mut g = sol_desk();
+    let deposit = bytes_of(&case(&vectors(), "deposit 15 USDC"));
+    sol_sign(&mut g, &deposit).unwrap();
+    let moved = find_program_address(sha256, &[b"moved"], &PHOENIX_PROGRAM)
+        .unwrap()
+        .0;
+    let mut infra = PhoenixAccounts::PINNED;
+    infra.log_authority = moved;
+    let mut ctx = VMContextBuilder::new();
+    ctx.current_account_id(contract_id())
+        .predecessor_account_id(owner())
+        .attached_deposit(crate::deposit::ONE_YOCTO);
+    testing_env!(ctx.build());
+    g.set_phoenix_accounts("alpha".into(), PhoenixAccountsJson::of(&infra));
+    assert!(sol_sign(&mut g, &deposit)
+        .unwrap_err()
+        .starts_with("E_SOL_ACCOUNT: "));
+    let at = deposit
+        .windows(32)
+        .position(|w| w == PHOENIX_LOG_AUTHORITY)
+        .unwrap();
+    let mut follows = deposit.clone();
+    follows[at..at + 32].copy_from_slice(&moved);
+    let got = sol_sign(&mut g, &follows).unwrap();
+    assert_eq!(got.kind, "deposit");
+}
+
 /// An order on a market the owner listed as unpriced signs without an oracle price, under its
 /// own caps.
 #[test]

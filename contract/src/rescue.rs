@@ -8,9 +8,11 @@
 //! - `evm_usdc_to_intents`: an EIP-3009 `TransferWithAuthorization` of the desk's Arbitrum USDC to
 //!   the deposit address, which the relayer submits (Arbitrum USDC origin).
 //!
-//! The operator's `hl_withdraw` (to the desk's own Arbitrum address, no quote) counts its amount
-//! against the same hourly cap ([`Gimbal::counted_hl_withdraw`]), but no cost and no deposit
-//! address.
+//! The operator's `hl_withdraw` and `orderly_withdraw` (to the desk's own Arbitrum address, no
+//! quote) count their amount against the same hourly cap and the venue's 1 USDC fee against the
+//! hourly cost budget ([`Gimbal::counted_withdraw`]), but no deposit address. Each also needs at
+//! least [`operator_min_withdraw_e8`], so a stolen operator key cannot burn the desk's USDC in
+//! many small fees.
 //!
 //! Each verifies the 1Click quote in `gimbal-core` (signature, then the field rules, then the cap,
 //! then the transfer cost the policy allows), builds the transfer from the verified quote alone
@@ -26,21 +28,25 @@
 
 use gimbal_core::decimal::format_e8;
 use gimbal_core::eip3009::{nonce as eip3009_nonce, Authorization, VALIDITY_S};
-use gimbal_core::errors::{Refusal, E_QUOTE_FIELDS, E_RESCUE_CAP};
+use gimbal_core::errors::{Refusal, E_QUOTE_FIELDS, E_RESCUE_CAP, E_SIZE};
 use gimbal_core::hl::{usdc_token, Address, UserAction};
 use gimbal_core::ids::{check_base58_32, check_reason};
+use gimbal_core::limits::{check_hourly_notional, notional_e8};
 use gimbal_core::oneclick::{
     check_cost, rescue_cost_budget_e8, transfer_cost_e8, verify_quote, Context, DeskAddresses,
-    Method, VerifiedQuote, QUOTE_PAYABLE_MS,
+    Method, VerifiedQuote, QUOTE_PAYABLE_MS, VENUE_FEE_E8,
 };
 use gimbal_core::phoenix::{check_message, Rescue};
+use gimbal_core::policy::Policy;
+use near_sdk::json_types::U128;
+use near_sdk::serde::{Deserialize, Serialize};
 use near_sdk::{env, near, Promise};
 
 use crate::action::{OrderDetail, UnsignedAction};
 use crate::desk::{Desk, Gate};
 use crate::hl::keccak;
 use crate::prices::reference_price;
-use crate::sol::{decode_message, desk_accounts, sha256};
+use crate::sol::{decode_message, sha256};
 use crate::{action_desk, desk_ref, fail, take_hl_nonce, Gimbal, GimbalExt, OrFail};
 
 /// How long a rescue weighs on the desk's meters: its weight falls linearly from its full amount
@@ -52,6 +58,18 @@ pub const RESCUE_WINDOW_MS: u64 = 3_600_000;
 /// more than [`QUOTE_PAYABLE_MS`] ago, when no quote can pay it any more ([`DeskCounters::held`]):
 /// a desk makes at most 32 rescues in any 65 min.
 pub const DEPOSIT_RING: usize = 32;
+
+/// How many times the policy's `max_transfer_cost_flat_e6` an operator withdrawal must move at
+/// least ([`operator_min_withdraw_e8`]).
+pub const OPERATOR_MIN_WITHDRAW_FLATS: u128 = 10;
+
+/// The least USDC × 1e8 the operator may withdraw from Hyperliquid or Orderly in one call:
+/// 10 × the policy's `max_transfer_cost_flat_e6` (5 USDC at the default 0.5). The venue's 1 USDC
+/// fee of each also counts against the hourly rescue cost budget, which bounds how many fees a
+/// stolen operator key can burn in an hour. The owner has no minimum.
+pub fn operator_min_withdraw_e8(policy: &Policy) -> u128 {
+    u128::from(policy.max_transfer_cost_flat_e6) * 100 * OPERATOR_MIN_WITHDRAW_FLATS
+}
 
 /// What the contract counts per desk besides its Hyperliquid nonce. Fixed size (1.3 KB), stored
 /// by `create_desk`, so an action rewrites it without adding storage.
@@ -79,6 +97,12 @@ pub struct DeskCounters {
     pub deposit_next: u8,
     /// Block time (ms) each slot's address was paid; 0 for an unused slot.
     pub deposit_paid_ms: [u64; DEPOSIT_RING],
+    /// Block time (ms) the notional meter was last brought to.
+    pub notional_at_ms: u64,
+    /// USD × 1e8: the weight of the notional of the orders the desk signed that are not
+    /// reduce-only, on all three venues, against `max_hourly_notional_usd`; decays like the
+    /// rescue meters ([`decayed`]).
+    pub notional_e8: u128,
 }
 
 /// `weight`, a meter's value at `since_ms`, at `now_ms`: falling linearly to 0 over
@@ -133,21 +157,113 @@ impl DeskCounters {
     /// Counts a rescue of `amount_e8` that may cost `cost_e8`, to the deposit address hashing to
     /// `deposit_sha256`, at `now_ms`. The caller checked [`Self::held`] first.
     pub fn spend(&mut self, amount_e8: u128, cost_e8: u128, deposit_sha256: [u8; 32], now_ms: u64) {
-        self.spend_amount(amount_e8, now_ms);
-        self.rescue_cost_e8 = self.rescue_cost_e8.saturating_add(cost_e8);
+        self.spend_amount(amount_e8, cost_e8, now_ms);
         let slot = usize::from(self.deposit_next) % DEPOSIT_RING;
         self.deposits[slot] = deposit_sha256;
         self.deposit_paid_ms[slot] = now_ms;
         self.deposit_next = u8::try_from((slot + 1) % DEPOSIT_RING).unwrap_or(0);
     }
 
-    /// Counts `amount_e8` against the amount meter alone at `now_ms`: the operator's
-    /// `hl_withdraw`, which pays no quote, so it has no cost and no deposit address. Both meters
-    /// are brought to `now_ms`, since they share `rescue_at_ms`.
-    pub fn spend_amount(&mut self, amount_e8: u128, now_ms: u64) {
+    /// Counts `amount_e8` against the amount meter and `cost_e8` against the cost meter at
+    /// `now_ms`: the operator's withdrawals, which pay no quote, so no deposit address. Both
+    /// meters are brought to `now_ms`, since they share `rescue_at_ms`.
+    pub fn spend_amount(&mut self, amount_e8: u128, cost_e8: u128, now_ms: u64) {
         self.rescue_spent_e8 = self.spent_e8(now_ms).saturating_add(amount_e8);
-        self.rescue_cost_e8 = self.cost_e8(now_ms);
+        self.rescue_cost_e8 = self.cost_e8(now_ms).saturating_add(cost_e8);
         self.rescue_at_ms = now_ms;
+    }
+
+    /// The notional meter's weight at `now_ms`, USD × 1e8.
+    pub fn notional_used_e8(&self, now_ms: u64) -> u128 {
+        decayed(self.notional_e8, self.notional_at_ms, now_ms)
+    }
+
+    /// Counts the orders' `notional_e8` at `now_ms`, or `E_SIZE` when it is over what is left of
+    /// `cap_usd` in the sliding hour ([`check_hourly_notional`]). The caller counts only orders
+    /// that are not reduce-only, and stores the counters only once every check passed.
+    pub fn spend_notional(
+        &mut self,
+        notional_e8: u128,
+        cap_usd: u64,
+        now_ms: u64,
+        what: &str,
+    ) -> Result<(), Refusal> {
+        let used = self.notional_used_e8(now_ms);
+        let left = (u128::from(cap_usd) * 100_000_000).saturating_sub(used);
+        check_hourly_notional(notional_e8, left, cap_usd, what)?;
+        self.notional_e8 = used.saturating_add(notional_e8);
+        self.notional_at_ms = now_ms;
+        Ok(())
+    }
+}
+
+/// `get_desk_counters`: a desk's [`DeskCounters`] as JSON, amounts USD × 1e8 as decimal strings,
+/// with each meter's weight and what is left of its bound at `now_ms`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(crate = "near_sdk::serde")]
+pub struct DeskCountersView {
+    /// The next EIP-3009 counter `evm_usdc_to_intents` takes: an authorization with counter `n`
+    /// was signed (or its `sign` call sent) once this is above `n`.
+    pub eip3009_next: u64,
+    pub rescue_at_ms: u64,
+    pub rescue_spent_e8: U128,
+    pub rescue_cost_e8: U128,
+    /// The amount meter's weight now, and what is left of `rescue_cap_usd_per_hour`.
+    pub rescue_spent_now_e8: U128,
+    pub rescue_cap_left_e8: U128,
+    /// The cost meter's weight now, and what is left of the hourly rescue cost budget.
+    pub rescue_cost_now_e8: U128,
+    pub rescue_cost_left_e8: U128,
+    pub rescue_cost_budget_e8: U128,
+    /// The deposit ring: sha256 hex of each slot's address (`null` for an unused slot), when it
+    /// was paid, and the slot the next rescue takes.
+    pub deposits: Vec<Option<String>>,
+    pub deposit_paid_ms: Vec<u64>,
+    pub deposit_next: u8,
+    pub notional_at_ms: u64,
+    pub notional_e8: U128,
+    /// The hourly notional cap in force, whole USD: `max_hourly_notional_usd`, or 15 ×
+    /// `max_notional_usd` while it is `null`.
+    pub notional_cap_usd: u64,
+    /// The notional meter's weight now, and what is left of the cap.
+    pub notional_now_e8: U128,
+    pub notional_left_e8: U128,
+}
+
+impl DeskCountersView {
+    pub fn of(c: &DeskCounters, policy: &Policy, now_ms: u64) -> Self {
+        let budget = rescue_cost_budget_e8(
+            policy.rescue_cap_usd_per_hour,
+            policy.max_transfer_cost_bps,
+            policy.max_transfer_cost_flat_e6,
+        );
+        let notional_now = c.notional_used_e8(now_ms);
+        Self {
+            eip3009_next: c.eip3009_next,
+            rescue_at_ms: c.rescue_at_ms,
+            rescue_spent_e8: U128(c.rescue_spent_e8),
+            rescue_cost_e8: U128(c.rescue_cost_e8),
+            rescue_spent_now_e8: U128(c.spent_e8(now_ms)),
+            rescue_cap_left_e8: U128(c.remaining_cap_e8(policy.rescue_cap_usd_per_hour, now_ms)),
+            rescue_cost_now_e8: U128(c.cost_e8(now_ms)),
+            rescue_cost_left_e8: U128(c.remaining_cost_e8(budget, now_ms)),
+            rescue_cost_budget_e8: U128(budget),
+            deposits: c
+                .deposits
+                .iter()
+                .map(|d| (*d != [0; 32]).then(|| hex::encode(d)))
+                .collect(),
+            deposit_paid_ms: c.deposit_paid_ms.to_vec(),
+            deposit_next: c.deposit_next,
+            notional_at_ms: c.notional_at_ms,
+            notional_e8: U128(c.notional_e8),
+            notional_cap_usd: policy.hourly_notional_cap_usd(),
+            notional_now_e8: U128(notional_now),
+            notional_left_e8: U128(
+                (u128::from(policy.hourly_notional_cap_usd()) * 100_000_000)
+                    .saturating_sub(notional_now),
+            ),
+        }
     }
 }
 
@@ -257,6 +373,7 @@ impl Gimbal {
         let now_ms = env::block_timestamp_ms();
         let counters = self.desk_counters.get(desk_id).copied().unwrap_or_default();
         let contract = env::current_account_id();
+        let second_key = self.accepted_oneclick_key(desk_id, now_ms);
         let ctx = Context {
             desk: DeskAddresses {
                 desk_id,
@@ -270,6 +387,7 @@ impl Gimbal {
             remaining_cap_e8: counters
                 .remaining_cap_e8(desk.policy.rescue_cap_usd_per_hour, now_ms),
             dry_ok: false,
+            second_key,
         };
         let q =
             verify_quote(sha256, ed25519_verify, quote, quote_signature, method, &ctx).or_fail();
@@ -348,27 +466,88 @@ impl Gimbal {
         counters
     }
 
-    /// The desk's counters with the operator's `hl_withdraw` of `amount_e8` counted at the block
-    /// time, or `E_RESCUE_CAP` for an amount over what is left of the hourly cap. Only the amount
-    /// counts: there is no quote, so no cost and no deposit address, and the destination is the
-    /// desk's own EVM address. Writes nothing, like [`Self::counted_rescue`].
-    pub fn counted_hl_withdraw(&self, desk_id: &str, amount_e8: u128) -> DeskCounters {
+    /// The desk's counters with the operator's `method` (`hl_withdraw` or `orderly_withdraw`) of
+    /// `amount_e8` counted at the block time, or the refusal: `E_SIZE` below
+    /// [`operator_min_withdraw_e8`], `E_RESCUE_CAP` for an amount over what is left of the hourly
+    /// cap or the venue's 1 USDC fee ([`VENUE_FEE_E8`]) over what is left of the hourly cost
+    /// budget. There is no quote, so no deposit address, and the destination is the desk's own EVM
+    /// address. Writes nothing, like [`Self::counted_rescue`].
+    pub fn counted_withdraw(&self, desk_id: &str, method: &str, amount_e8: u128) -> DeskCounters {
         let policy = &desk_ref(&self.desks, desk_id).policy;
         let now_ms = env::block_timestamp_ms();
         let mut counters = self.desk_counters.get(desk_id).copied().unwrap_or_default();
+        let min = operator_min_withdraw_e8(policy);
+        if amount_e8 < min {
+            fail(Refusal::new(
+                E_SIZE,
+                format!(
+                    "the operator's {method} of {} USDC is under its minimum of {} USDC (10 × \
+                     max_transfer_cost_flat_e6); the owner has none",
+                    format_e8(amount_e8),
+                    format_e8(min)
+                ),
+            ));
+        }
         let cap_left = counters.remaining_cap_e8(policy.rescue_cap_usd_per_hour, now_ms);
         if amount_e8 > cap_left {
             fail(Refusal::new(
                 E_RESCUE_CAP,
                 format!(
-                    "hl_withdraw of {} USDC is over what is left of the hourly rescue cap, {} USD",
+                    "{method} of {} USDC is over what is left of the hourly rescue cap, {} USD",
                     format_e8(amount_e8),
                     format_e8(cap_left)
                 ),
             ));
         }
-        counters.spend_amount(amount_e8, now_ms);
+        let budget = rescue_cost_budget_e8(
+            policy.rescue_cap_usd_per_hour,
+            policy.max_transfer_cost_bps,
+            policy.max_transfer_cost_flat_e6,
+        );
+        let cost_left = counters.remaining_cost_e8(budget, now_ms);
+        if VENUE_FEE_E8 > cost_left {
+            fail(Refusal::new(
+                E_RESCUE_CAP,
+                format!(
+                    "{method} pays the venue's 1 USDC fee, over what is left of the hourly rescue \
+                     cost budget, {} of {} USD",
+                    format_e8(cost_left),
+                    format_e8(budget)
+                ),
+            ));
+        }
+        counters.spend_amount(amount_e8, VENUE_FEE_E8, now_ms);
         counters
+    }
+
+    /// `counters` with the orders' notional counted against the desk's `max_hourly_notional_usd`
+    /// at the block time (`E_SIZE` over what is left), for the orders of one signed action that
+    /// are not reduce-only, each valued as the size cap values it ([`notional_e8`]).
+    pub fn count_notional(
+        &self,
+        desk_id: &str,
+        mut counters: DeskCounters,
+        orders: impl IntoIterator<Item = u128>,
+    ) -> DeskCounters {
+        let notional: u128 = orders.into_iter().fold(0, u128::saturating_add);
+        if notional == 0 {
+            return counters;
+        }
+        let policy = &desk_ref(&self.desks, desk_id).policy;
+        counters
+            .spend_notional(
+                notional,
+                policy.hourly_notional_cap_usd(),
+                env::block_timestamp_ms(),
+                "the order",
+            )
+            .or_fail();
+        counters
+    }
+
+    /// The desk's stored counters, or the default before `create_desk` stored them.
+    pub fn counters_of(&self, desk_id: &str) -> DeskCounters {
+        self.desk_counters.get(desk_id).copied().unwrap_or_default()
     }
 
     /// [`Self::hl_send_to_intents`] up to the signature.
@@ -449,8 +628,8 @@ impl Gimbal {
         let rescue = Rescue::new(sha256, owner, amount_in).or_fail();
         let counters = self.counted_rescue(&desk_id, q);
         let message = decode_message(&message_b64).or_fail();
+        let accounts = self.sol_desk(&desk_id);
         let desk: &Desk = desk_ref(&self.desks, &desk_id);
-        let accounts = desk_accounts(desk).or_fail();
         let max_age_s = desk.policy.oracle_max_age_s;
         let block_ms = env::block_timestamp_ms();
         let prices = &self.prices;
@@ -474,6 +653,15 @@ impl Gimbal {
             .iter()
             .map(|o| OrderDetail::new(&o.symbol, o.bid, o.size_e8, o.price_e8, o.valued))
             .collect();
+        let counters = self.count_notional(
+            &desk_id,
+            counters,
+            checked
+                .orders
+                .iter()
+                .filter(|o| !o.reduce_only)
+                .map(|o| notional_e8(o.price_e8, o.size_e8, &o.valued)),
+        );
         self.desk_counters.insert(desk_id.clone(), counters);
         UnsignedAction::solana(desk_id, checked.kind, message_b64, &message, Some(reason))
             .with_orders(orders)

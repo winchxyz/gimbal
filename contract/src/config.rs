@@ -81,6 +81,48 @@ pub struct Config {
     pub orderly: OrderlyConfig,
 }
 
+/// The MPC signer contract of each network.
+pub const MPC_MAINNET: &str = "v1.signer";
+pub const MPC_TESTNET: &str = "v1.signer-prod.testnet";
+/// The OutLayer price oracle on mainnet.
+pub const ORACLE_MAINNET: &str = "price-oracle.near";
+
+/// `new`'s MPC signer and oracle belong to `network` (`E_ARGS`): on mainnet exactly
+/// [`MPC_MAINNET`] and [`ORACLE_MAINNET`], on testnet [`MPC_TESTNET`] and a `.testnet` oracle. A
+/// mistyped id would freeze a contract whose signatures or prices come from the wrong account.
+pub fn check_network_ids(
+    network: Network,
+    mpc: &AccountId,
+    price_source: &PriceSource,
+) -> Result<(), Refusal> {
+    let want_mpc = match network {
+        Network::Mainnet => MPC_MAINNET,
+        Network::Testnet => MPC_TESTNET,
+    };
+    if mpc.as_str() != want_mpc {
+        return Err(Refusal::new(
+            E_ARGS,
+            format!("mpc {mpc} is not the {network:?} MPC signer {want_mpc}"),
+        ));
+    }
+    if let PriceSource::OutLayer { contract } = price_source {
+        let ok = match network {
+            Network::Mainnet => contract.as_str() == ORACLE_MAINNET,
+            Network::Testnet => contract.as_str().ends_with(".testnet"),
+        };
+        if !ok {
+            return Err(Refusal::new(
+                E_ARGS,
+                format!(
+                    "price oracle {contract} is not the {network:?} OutLayer oracle (mainnet: \
+                     {ORACLE_MAINNET}; testnet: a .testnet account)"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     /// The price oracle account, when prices come from one.
     pub fn oracle(&self) -> Option<&AccountId> {

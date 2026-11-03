@@ -563,6 +563,13 @@ pub struct Signable {
 
 impl Signable {
     /// What the key signs: timestamp + METHOD + path + body, no separators.
+    ///
+    /// The same Ed25519 key (the desk's Solana authority) signs these and Solana messages, so no
+    /// payload of one kind may read as the other. Every Orderly payload starts with the
+    /// timestamp's 13 ASCII digits ([`check_timestamp`] keeps it within minutes of the block
+    /// time, a 13-digit ms count until the year 2286), so its first byte is 0x31 to 0x39. A Solana
+    /// message the contract signs starts with its signer count, 1 or 2, or the version 0 prefix
+    /// 0x80 (`sol_sign`, `sol_sign_rescue`, `sol_sign_register`): never an ASCII digit.
     pub fn message(&self) -> String {
         format!(
             "{}{}{}{}",
@@ -998,6 +1005,16 @@ fn order(ctx: &Context, req: &OrderlyRequest) -> Result<Signable, Refusal> {
                 "Orderly symbol {} is not in the desk's policy",
                 shown(&symbol)
             ),
+        ));
+    }
+    // The replay above: on mainnet an order that can grow a position waits for the owner's IP
+    // list, which `ip_restriction` applies at Orderly so a copy posted from elsewhere is refused.
+    if ctx.broker.network == Network::Mainnet && !req.reduce_only && ctx.orderly_ips.is_none() {
+        return Err(Refusal::new(
+            E_ARGS,
+            "on mainnet an order that is not reduce-only needs the owner's relayer IP list first \
+             (set_orderly_ips, then orderly_request kind ip_restriction): anyone could post a copy \
+             of the signed order again",
         ));
     }
     let side = need("side", &req.side)?;

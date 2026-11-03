@@ -56,6 +56,7 @@ fn orderly_policy() -> Policy {
         max_notional_usd: 1000,
         unpriced: vec![unpriced("ETH"), unpriced("SOL"), unpriced("BTC")],
         unpriced_max_notional_usd: 1000,
+        max_hourly_notional_usd: None,
         ..policy()
     }
 }
@@ -246,18 +247,80 @@ fn orderly_settle_pnl_signs_the_vector() {
 #[test]
 fn orderly_withdraw_signs_the_vectors_to_the_desk_address() {
     let mut g = orderly_desk();
-    for (name, amount) in [
-        ("Withdraw 5 USDC to the desk address (testnet)", "5"),
-        ("Withdraw 1234.56789 USDC, nonce 42 (testnet)", "1234.56789"),
+    // The operator path within the hourly rescue cap, the owner's wallet past it.
+    for (name, amount, who, deposit) in [
+        (
+            "Withdraw 5 USDC to the desk address (testnet)",
+            "5",
+            operator(),
+            yocto(0),
+        ),
+        (
+            "Withdraw 1234.56789 USDC, nonce 42 (testnet)",
+            "1234.56789",
+            owner(),
+            ONE_YOCTO,
+        ),
     ] {
         let c = eip712_case(name);
         let m = &c["message_typed"];
         assert_eq!(m["receiver"], vectors()["keys"]["deskEvm"]["address"]);
-        at(operator(), u(&m["timestamp"]), yocto(0));
+        at(who, u(&m["timestamp"]), deposit);
         let got = g.prepare_orderly_withdraw("alpha".into(), amount.into(), u(&m["withdrawNonce"]));
         assert_signs_eip712(&got, &c);
         assert_eq!(got.amount.as_deref(), Some(amount));
     }
+}
+
+/// C10: `orderly_withdraw` has `hl_withdraw`'s two paths. The operator's (no deposit) takes at
+/// least 10 × `max_transfer_cost_flat_e6`, counts its amount against the hourly rescue cap and
+/// Orderly's 1 USDC fee against the cost budget; the owner's wallet (1 yoctoNEAR) is not limited;
+/// any other deposit is refused.
+#[test]
+fn orderly_withdraw_has_an_owner_path_and_an_operator_path() {
+    let mut g = orderly_desk();
+    g.desk_counters.insert("alpha".into(), Default::default());
+    let t = 1_793_491_200_000;
+    at(operator(), t, yocto(0));
+    let msg =
+        outcome(|| g.prepare_orderly_withdraw("alpha".into(), "4.999999".into(), 1)).unwrap_err();
+    assert_eq!(
+        msg,
+        "E_SIZE: the operator's orderly_withdraw of 4.999999 USDC is under its minimum of 5 USDC \
+         (10 × max_transfer_cost_flat_e6); the owner has none"
+    );
+    g.prepare_orderly_withdraw("alpha".into(), "5".into(), 1);
+    let c = g.counters_of("alpha");
+    assert_eq!(
+        (c.rescue_spent_e8, c.rescue_cost_e8),
+        (500_000_000, 100_000_000)
+    );
+    assert!(
+        outcome(|| g.prepare_orderly_withdraw("alpha".into(), "46".into(), 2))
+            .unwrap_err()
+            .starts_with("E_RESCUE_CAP: orderly_withdraw of 46 USDC is over what is left of the hourly rescue cap, 45 USD")
+    );
+    at(operator(), t, ONE_YOCTO);
+    assert!(
+        outcome(|| g.prepare_orderly_withdraw("alpha".into(), "5".into(), 2))
+            .unwrap_err()
+            .starts_with("E_NOT_ALLOWED: orderly_withdraw on desk alpha is for its owner")
+    );
+    for who in [owner(), operator()] {
+        at(who, t, yocto(2));
+        assert!(
+            outcome(|| g.prepare_orderly_withdraw("alpha".into(), "5".into(), 2))
+                .unwrap_err()
+                .starts_with("E_NOT_ALLOWED: orderly_withdraw takes exactly 1 yoctoNEAR")
+        );
+    }
+    at(owner(), t, ONE_YOCTO);
+    g.prepare_orderly_withdraw("alpha".into(), "1234.56789".into(), 2);
+    assert_eq!(
+        g.counters_of("alpha"),
+        c,
+        "the owner's wallet counts nothing"
+    );
 }
 
 #[test]
