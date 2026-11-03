@@ -6,8 +6,10 @@
 //   GET /journal?before=<id>     JournalEntry[]: up to 100 entries older than that id, newest first ([] past the
 //                                oldest, and for an id not in memory); without `before`, the newest 100
 // The scanner feeds it: every scan publishes a `scan` and a `windows` event; the risk engine (src/risk/) publishes
-// `desk`, `health`, `journal` and `rescue`, and answers POST /stress (testnet and replay only). Routes other parts
-// build later answer 501 for now (POST /rotate and /close in their own { ok, reason } shape).
+// `desk`, `health`, `journal` and `rescue`, and answers POST /stress (testnet and replay only). The strategy loop
+// (src/strategy/loop.ts) publishes `decision` and answers POST /rotate {windowId} and POST /close in their own
+// { ok, reason } shape: accepted (200) or refused with the reason (400 bad body, 409 refused, 503 no loop) at once,
+// the progress coming as journal and desk events.
 //
 // Only this machine's dashboard may use it. PUT /strategy changes what the desk trades, and a web page on any other
 // site could otherwise reach a local server (a cross-site form post, or DNS rebinding a name onto 127.0.0.1), so:
@@ -99,6 +101,16 @@ export interface EngineServerOptions {
   setup?: SetupStarter;
   /** POST /stress (src/risk/stress-route.ts); none = 503 (mainnet is refused either way). */
   stress?: Pick<RiskEngine, 'stress'>;
+  /** POST /rotate and /close (src/strategy/loop.ts); none = 503, nothing is entered or closed here. */
+  strategyLoop?: StrategyHands;
+  /** Called after a PUT /strategy took effect (the loop checks at once, so `auto` shows without waiting a scan). */
+  onStrategy?: (strategy: StrategyConfig) => void;
+}
+
+/** What POST /rotate and /close call: they answer at once, whether the act was started or why not. */
+export interface StrategyHands {
+  rotate(windowId: unknown): { ok: true } | { ok: false; reason: string };
+  close(): { ok: true } | { ok: false; reason: string };
 }
 
 type Latest = {
@@ -374,6 +386,7 @@ export class EngineServer {
       }
       this.#strategy = next;
       this.#log(`strategy set: ${JSON.stringify(this.#strategy)}`);
+      this.#options.onStrategy?.(next);
       return json(res, 200, this.#strategy);
     }
     if (path === '/policy/draft') {
@@ -388,7 +401,25 @@ export class EngineServer {
     }
     if (path === '/rotate' || path === '/close') {
       if (method !== 'POST') return notAllowed(res, 'POST');
-      return json(res, 501, { ok: false, reason: 'the strategy engine is not running yet: nothing is entered or closed' });
+      let body: unknown = {};
+      try {
+        const text = await readBody(req);
+        if (text.trim() !== '') body = JSON.parse(text);
+      } catch (err) {
+        return json(res, 400, { ok: false, reason: `POST ${path}: ${errorMessage(err)}` });
+      }
+      const loop = this.#options.strategyLoop;
+      if (loop === undefined) return json(res, 503, { ok: false, reason: 'no strategy loop in this engine: nothing is entered or closed here' });
+      let answer: { ok: true } | { ok: false; reason: string };
+      if (path === '/rotate') {
+        const windowId = body !== null && typeof body === 'object' ? (body as { windowId?: unknown }).windowId : undefined;
+        if (typeof windowId !== 'string' || windowId.trim() === '') return json(res, 400, { ok: false, reason: 'POST /rotate needs { "windowId": "<window id>" }' });
+        answer = loop.rotate(windowId);
+      } else {
+        answer = loop.close();
+      }
+      this.#log(`${path === '/rotate' ? 'POST /rotate' : 'POST /close'}: ${answer.ok ? 'started' : `refused, ${answer.reason}`}`);
+      return json(res, answer.ok ? 200 : 409, answer);
     }
     if (path === '/stress') {
       if (method !== 'POST') return notAllowed(res, 'POST');

@@ -15,7 +15,7 @@ import { toQty } from '../trade/lots.ts';
 import { newAdlState } from '../risk/adl.ts';
 import { TRADER_STATE_VERSION, TraderStateStore, traderLockPath, traderStateFile } from '../trade/trader-state.ts';
 import type { ContractSide } from './serve-contract.ts';
-import type { ServePairDeps, ServePairInput } from './serve-pair.ts';
+import type { CarryInput, ServePairDeps, ServePairInput, SlotCarry } from './serve-pair.ts';
 import { liveLines, servePair } from './serve-pair.ts';
 
 const CONTRACT = 'gimbal-test.near';
@@ -63,13 +63,15 @@ interface World {
   signed: number;
   cancels: { asset: number; oid: number }[];
   lines: string[];
+  /** What the stand-in carry refuses an open with. */
+  refuse: string[];
 }
 
 function world(symbol = 'XLM', env: Record<string, string> = {}): World {
   const dir = mkdtempSync(join(tmpdir(), 'gimbal-serve-pair-'));
   return {
     dir, env: { LOCALAPPDATA: dir, XDG_STATE_HOME: dir, ...env },
-    hl: new Leg('hyperliquid', symbol), px: new Leg('phoenix', symbol), openOrders: [], signed: 0, cancels: [], lines: [],
+    hl: new Leg('hyperliquid', symbol), px: new Leg('phoenix', symbol), openOrders: [], signed: 0, cancels: [], lines: [], refuse: [],
   };
 }
 
@@ -99,11 +101,24 @@ function input(w: World, extra: Partial<ServePairInput> = {}): ServePairInput {
       return { client: side().client, relayer };
     },
     buildLegs: async () => ({ hl: w.hl, phoenix: w.px, priced: false, mismatches: [] }),
+    carry: (c) => testCarry(c, w),
     close: () => {},
   };
   return {
     mode: 'mainnet', env: (n) => w.env[n], side: side(), deskId: DESK, clock: { now: () => Date.now() }, log: (l) => w.lines.push(l), publish: () => {},
     stateDir: w.dir, linkedWorktree: false, sleep: async () => {}, deps, ...extra,
+  };
+}
+
+/** pair-mainnet's open and close stood in for: one size per USD (the legs' price is 1), refusals from the world. */
+function testCarry(c: CarryInput, w: World): SlotCarry {
+  return {
+    open: async (request, out) => {
+      if (w.refuse.length > 0) return { refusals: [...w.refuse], results: [] };
+      out.say(`plan      ${c.symbol} ${request.legUsd} a leg at ${request.leverage}x`);
+      return { refusals: [], results: await c.pair.openInChunks({ size: toQty(String(request.legUsd)), longIndex: 1, reason: request.reason }) };
+    },
+    close: async (request) => ({ refusals: [], results: [await c.pair.close({ reason: request.reason })] }),
   };
 }
 
@@ -422,6 +437,56 @@ test('(C) stop() turns trading off first: no reducer, closes and guarded orders 
     const r = await p.pair!.legs[0].order('BUY', toQty('10'), true, 'rescue: reduce');
     assert.match(r.kind === 'failed' ? r.error.message : '', /serve is stopping and its trader lock is released; nothing signed/);
     assert.equal(w.hl.orders.length + w.px.orders.length, 0);
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+test('the hands (strategy loop): a flat desk opens through the pair, is held and protected at once, and closes reduce-only; refusals sign nothing', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
+  try {
+    const p = await servePair(input(w));
+    assert.ok(p.hands !== undefined, p.lines.join('\n'));
+    const hands = p.hands!;
+    assert.deepEqual([...hands.symbols].sort(), ['XLM', 'kPEPE']);
+    assert.equal(hands.heldSymbol(), null);
+    assert.equal(hands.blocked(), null);
+    // Not one of the pair's symbols: refused, nothing sent.
+    const eth = await hands.open({ symbol: 'ETH', legUsd: 10, leverage: 1.5, reason: 'test' });
+    assert.equal(eth.ok, false);
+    assert.equal(w.hl.orders.length + w.px.orders.length, 0);
+    // The carry plan refuses: nothing sent, the reason says why.
+    w.refuse = ['Hyperliquid leg 38 % from liquidation, under 40 %'];
+    const refused = await hands.open({ symbol: 'XLM', legUsd: 10, leverage: 1.5, reason: 'test' });
+    assert.equal(refused.ok, false);
+    assert.match(refused.reason, /38 % from liquidation/);
+    assert.equal(w.hl.orders.length + w.px.orders.length, 0);
+    w.refuse = [];
+    // The open: short Hyperliquid, long Phoenix, then held and protected as an adopted pair (ADL, reducer).
+    const opened = await hands.open({ symbol: 'XLM', legUsd: 10, leverage: 1.5, reason: 'strategy: enter xlm-phoenix-hyperliquid' });
+    assert.equal(opened.ok, true, opened.reason);
+    assert.equal(w.hl.pos, -toQty('10'));
+    assert.equal(w.px.pos, toQty('10'));
+    assert.equal(hands.heldSymbol(), 'XLM');
+    assert.equal(p.reducer(), p.pair);
+    assert.equal(p.pair?.live, true);
+    assert.ok(p.adl !== undefined);
+    // A second open while a pair is held: refused.
+    const twice = await hands.open({ symbol: 'XLM', legUsd: 10, leverage: 1.5, reason: 'test' });
+    assert.equal(twice.ok, false);
+    // Outside the loop's open, the guarded legs refuse anything that could grow a position.
+    const grow = await p.pair!.legs[0]!.order('SELL', toQty('1'), false, 'test');
+    assert.equal(grow.kind, 'failed');
+    assert.match(String((grow as { error: Error }).error.message), /reduce-only orders only, outside the strategy loop's open, and this one could open or grow a position; nothing signed/);
+    // The close: both legs reduce-only, flat.
+    const before = w.hl.orders.length;
+    const closed = await hands.close({ reason: 'strategy: exit' });
+    assert.equal(closed.ok, true, closed.reason);
+    assert.equal(w.hl.pos, 0n);
+    assert.equal(w.px.pos, 0n);
+    assert.ok(w.hl.orders.slice(before).every((o) => o.reduceOnly));
+    assert.equal(hands.heldSymbol(), null);
+    p.stop();
   } finally {
     rmSync(w.dir, { recursive: true, force: true });
   }
