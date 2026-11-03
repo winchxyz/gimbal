@@ -14,7 +14,7 @@ export type Tone = 'ink' | 'watch' | 'danger';
 export interface KindInfo {
   /** The word in the kind column. */
   label: string;
-  /** Rescue and Veto amber, Refused red, Open and Rotate in ink, everything else grey. */
+  /** Rescue and Risk check amber, Refused red, Open and Rotate in ink, everything else grey. */
   tone: Tone | null;
   /** The filter other than All that lists it; null = only All does. */
   filter: Exclude<FilterId, 'all'> | null;
@@ -33,7 +33,7 @@ export const KINDS: Record<Kind, KindInfo> = {
   rotate: { label: 'Rotate', tone: 'ink', filter: 'trades', signed: true, principal: false, noun: ['rotation', 'rotations'] },
   rescue: { label: 'Rescue', tone: 'watch', filter: 'rescue', signed: true, principal: false, noun: ['rescue', 'rescues'] },
   refused: { label: 'Refused', tone: 'danger', filter: 'refused', signed: false, principal: false, noun: ['refusal', 'refusals'] },
-  veto: { label: 'Veto', tone: 'watch', filter: 'refused', signed: false, principal: false, noun: ['veto', 'vetoes'] },
+  veto: { label: 'Risk check', tone: 'watch', filter: 'refused', signed: false, principal: false, noun: ['risk check refusal', 'risk check refusals'] },
   adl: { label: 'Deleveraged', tone: null, filter: 'trades', signed: false, principal: false, noun: ['forced close', 'forced closes'] },
   error: { label: 'Error', tone: null, filter: null, signed: false, principal: false, noun: ['error', 'errors'] },
   funding: { label: 'Funding', tone: null, filter: 'funding', signed: false, principal: false, noun: ['funding payment', 'funding payments'] },
@@ -57,7 +57,7 @@ export const FILTERS: readonly FilterInfo[] = [
   { id: 'funding', label: 'Funding', short: 'Funding' },
   { id: 'money', label: 'Money in and out', short: 'Money' },
   { id: 'rescue', label: 'Rescue', short: 'Rescue' },
-  { id: 'refused', label: 'Refused and vetoed', short: 'Refused' },
+  { id: 'refused', label: 'Refused (contract or risk check)', short: 'Refused' },
 ];
 
 export const filterLabel = (id: FilterId): string => FILTERS.find((f) => f.id === id)?.label ?? 'All';

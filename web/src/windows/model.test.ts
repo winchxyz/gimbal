@@ -78,7 +78,7 @@ test('a pinned row stays on its side of the rule: when it falls under the minimu
   assert.deepEqual(ids(arrange(windows, 'tradable', 5, { id: 'nope', slot: 0 }).rows), ['A', 'B', 'C', 'D']);
 });
 
-test('status word: held wins, then the contract refusal, then the NEAR AI veto, then watch-only', () => {
+test('status word: held wins, then the contract refusal, then the NEAR AI risk check, then watch-only', () => {
   const veto = { verdict: 'veto' as const, reasons: ['one-off spike', 'second'], model: 'm', at: 1 };
   const pass = { verdict: 'pass' as const, reasons: ['fine'], model: 'm', at: 1 };
   const refused = { code: 'E_ORACLE_STALE', reason: 'no trusted price' };
@@ -89,13 +89,13 @@ test('status word: held wins, then the contract refusal, then the NEAR AI veto, 
     compact: 'Refused · no price', // a known code has a short name for the phone
   });
   assert.equal(rowStatus(win({ refused: { code: 'E_NEW', reason: 'something else' } })).compact, 'Refused · something else');
-  assert.deepEqual(rowStatus(win({ veto })), { kind: 'veto', text: 'Veto · one-off spike', compact: 'Veto · one-off spike' });
+  assert.deepEqual(rowStatus(win({ veto })), { kind: 'veto', text: 'Risk check · one-off spike', compact: 'Risk check · one-off spike' });
   assert.deepEqual(rowStatus(win({ veto: pass })), { kind: 'none', text: '', compact: '' });
   assert.deepEqual(rowStatus(win({ tradable: false })), { kind: 'watch', text: 'Watch-only', compact: 'Watch-only' });
-  assert.equal(rowStatus(win({ veto: { ...veto, reasons: [] } })).text, 'Veto');
+  assert.equal(rowStatus(win({ veto: { ...veto, reasons: [] } })).text, 'Risk check');
 });
 
-test('empty: nothing open to the desk clears the minimum, however high a refused or vetoed row is', () => {
+test('empty: nothing open to the desk clears the minimum, however high a refused or risk-checked row is', () => {
   const refused = { code: 'E_ORACLE_STALE', reason: 'no trusted price' };
   const veto = { verdict: 'veto' as const, reasons: ['spike'], model: 'm', at: 1 };
   const rows = [net('ZRO', 35.2, { refused }), net('AVAX', 9.1, { veto }), net('BTC', 2.1), net('ETH', -2.4)];
@@ -160,7 +160,7 @@ test('checks: NEAR AI first, then the refusal, then the engine; the first failin
   );
   assert.deepEqual(lines.map((l) => l.ok), [false, false, true, false]);
   assert.deepEqual(lines.map((l) => l.blocking), [true, false, false, false]);
-  assert.equal(lines[0]?.text, 'NEAR AI vetoed it. One-off spike. The median gap is 1.2%.');
+  assert.equal(lines[0]?.text, 'The NEAR AI risk check refused it. One-off spike. The median gap is 1.2%.');
   assert.equal(lines[1]?.text, 'The contract would refuse it (E_ASSET): Not in your policy');
 
   const passing = checkLines(win({ veto: { verdict: 'pass', reasons: ['Deepest window on the list.'], model: 'm', at: 1 }, checks: [{ ok: true, text: 'Fine' }] }));

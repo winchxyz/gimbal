@@ -39,7 +39,7 @@ test('the current filter is what is exported', () => {
   const all = [entry({ id: '1', kind: 'veto' }), entry({ id: '2', kind: 'funding' }), entry({ id: '3', kind: 'refused' })];
   const rows = toCsv(entriesIn(all, 'refused')).trim().split('\r\n');
   assert.equal(rows.length, 3);
-  assert.deepEqual(rows.slice(1).map((r) => r.split(',')[1]), ['Refused', 'Veto']);
+  assert.deepEqual(rows.slice(1).map((r) => r.split(',')[1]), ['Refused', 'Risk check']);
 });
 
 test('times are ISO in UTC to the second, and the file is named after the filter and the day', () => {

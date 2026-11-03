@@ -78,7 +78,7 @@ export function Side({ entries, desk, windows }: { entries: readonly JournalEntr
           <b>
             <Flash value={counts.vetoed} />
           </b>
-          <span>vetoed by NEAR AI</span>
+          <span>refused by the NEAR AI risk check</span>
         </div>
       </div>
 
