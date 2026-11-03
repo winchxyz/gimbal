@@ -74,11 +74,18 @@ test('nothing held: auto enters the best window that clears the minimum', () => 
   const a = net('SOL', 8.6);
   const b = net('NEAR', 12);
   const c = net('BTC', 2.1);
-  assert.equal(decide({ selected: b, windows: [a, b, c], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters NEAR: it is the best window that clears your 5% minimum.');
-  assert.equal(decide({ selected: a, windows: [a, b, c], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters NEAR first: 12.0% against 8.6% here.');
-  assert.equal(decide({ selected: c, windows: [a, b, c], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. BTC is under your 5% minimum, so auto will not enter it.');
-  assert.match(decide({ selected: a, windows: [a, b, c], strategy: null, now: NOW }).text, /minimum could not be read/);
-  const none = decide({ selected: a, windows: [a, b, c], strategy: STRATEGY, now: NOW });
+  // In the engine's order, as the stream sends them.
+  const windows = [b, a, c];
+  assert.equal(decide({ selected: b, windows, strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters NEAR: it is the best window that clears your 5% minimum.');
+  assert.equal(decide({ selected: a, windows, strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters NEAR first: 12.0% against 8.6% here.');
+  assert.equal(decide({ selected: c, windows, strategy: STRATEGY, now: NOW }).text, 'Nothing is held. BTC is under your 5% minimum, so auto will not enter it.');
+  assert.match(decide({ selected: a, windows, strategy: null, now: NOW }).text, /minimum could not be read/);
+  // A window failing an engine check (the carry gate, the open-interest share) is never the one auto enters first,
+  // whatever its net; nor is one with stale numbers.
+  const gated = net('DOGE', 30, { checks: [{ ok: false, text: '14-day history loading' }] });
+  const stale = net('LTC', 25, { stale: true });
+  assert.equal(decide({ selected: a, windows: [gated, stale, a, c], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters SOL: it is the best window that clears your 5% minimum.');
+  const none = decide({ selected: a, windows, strategy: STRATEGY, now: NOW });
   assert.equal(none.rotate, null);
   assert.equal(none.close, false);
 });

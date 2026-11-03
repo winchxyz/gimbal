@@ -78,15 +78,24 @@ export function windowBlock(w: FundingWindow, c: WindowCarry): string[] {
   out.push(`    ${'gross (short - long)'.padEnd(22)}${cell(apr(e.gross.nowAprPct), 8)}${cell(apr(e.gross.d7AprPct), 8)}${cell(apr(e.gross.d14AprPct), 8)}`);
   out.push(`  round trip    ${money(rt.totalUsd)} = ${rt.bps.toFixed(1)} bps at ${usd(e.legUsd)} a leg `
     + `(4 fills ${money(rt.feesUsd)}, slippage ${money(rt.slippageUsd)}, basis buffer ${money(rt.basisBufferUsd)})`);
+  // Paid once a hold too, but never gated on: both are shown so neither is hidden.
   const moves = c.breakdown.transferUsd ?? 0;
-  out.push(`  one-off transfers: ${money(moves)} (not in the gate): both legs' margin moved in and out through 1Click`);
+  const rescue = c.breakdown.rescueUsd ?? 0;
+  out.push(`  one-off, not in the gate: transfers ${money(moves)} (both legs' margin moved in and out through 1Click), `
+    + `rescue reserve ${money(rescue)} over the hold`);
   const hold = `over a ${holdLabel(e.holdHours)} hold`;
-  if (e.expectedUsd === null || e.netUsd === null || e.basis === null) {
-    out.push(`  ${hold}  not known: no 7-day history on both legs`);
+  if (e.state === 'none') {
+    out.push(`  ${hold}  not known: no 7-day history on both legs; fails the gate`);
+  } else if (e.state === 'loading') {
+    out.push(`  ${hold}  not judged yet: 7 d ${apr(e.gross.d7AprPct)} %, the 14-day history is loading; fails the gate`);
+  } else if (e.state === 'mixed') {
+    out.push(`  ${hold}  not judged: 7 d ${apr(e.gross.d7AprPct)} % and 14 d ${apr(e.gross.d14AprPct)} % point opposite ways; fails the gate`);
   } else {
+    const which = e.gross.d14AprPct === null ? '7 d alone, no 14 d to be had' : `${e.basis === '14d' ? '14 d' : '7 d'}, the smaller of 7 d and 14 d`;
     const even = e.breakevenDays === null ? 'never breaks even' : `break-even ${e.breakevenDays.toFixed(1)} days`;
-    out.push(`  ${hold}  expected ${money(e.expectedUsd)} (${e.basis === '14d' ? '14 d' : '7 d'} average), `
-      + `${money(e.netUsd)} after the round trip, ${even}: ${e.ok ? 'passes' : 'fails'} the gate`);
+    out.push(`  ${hold}  expected ${money(e.expectedUsd!)} on ${apr(e.expectedAprPct)} % APR (${which}), `
+      + `${money(e.netUsd!)} after the round trip = ${apr(e.netAprPct)} % APR net (minimum ${e.minNetAprPct} %), ${even}: `
+      + `${e.ok ? 'passes' : 'fails'} the gate`);
   }
   const oi = (l: LegRates) => `${venueName(l.venue)} ${l.oiUsd === null ? 'no OI published' : usd(l.oiUsd)}`;
   out.push(`  depth         ${usd(w.depthUsd)} (the smaller leg's open interest: ${oi(c.short)}, ${oi(c.long)})`);

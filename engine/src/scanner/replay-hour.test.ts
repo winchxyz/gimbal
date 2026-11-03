@@ -50,8 +50,11 @@ interface Played {
   watch: boolean;
   /** Successful watch sweeps recorded after the play's start and served by it: the slice is past the first sweeps. */
   laterSweeps: number;
-  /** Per scan, each desk window's expected carry: the spread over the hold minus the round trip, and the APR used. */
-  scans: { windows: FundingWindow[]; scan: ScanStatus; carry: Record<string, { netUsd: number | null; aprPct: number | null }> }[];
+  /**
+   * Per scan, each desk window's expected carry: the spread over the hold minus the round trip, and the APR it is
+   * listed on (the multi-day figure, or the 7 days while the week before loads; null when this hour decides).
+   */
+  scans: { windows: FundingWindow[]; scan: ScanStatus; carry: Record<string, { netUsd: number | null; listedOn: number | null }> }[];
 }
 
 async function play(file: string): Promise<Played> {
@@ -73,7 +76,9 @@ async function play(file: string): Promise<Played> {
     const carry: Played['scans'][number]['carry'] = {};
     for (const w of r.windows) {
       const c = scanner.carry(w.id);
-      if (c !== null) carry[w.id] = { netUsd: c.estimate.netUsd, aprPct: c.estimate.expectedAprPct };
+      if (c === null) continue;
+      const e = c.estimate;
+      carry[w.id] = { netUsd: e.netUsd, listedOn: e.state === 'loading' ? e.gross.d7AprPct : e.expectedAprPct };
     }
     scans.push({ windows: r.windows, scan: r.scan, carry });
   }
@@ -141,7 +146,7 @@ for (const file of files) {
         const numbers = [w.grossAprPct, w.netAprPct, w.usdPerDayPer1k, w.breakevenHours, w.depthUsd, w.intervalsAbove, w.updatedAt, ...Object.values(w.costs)];
         for (const n of numbers) assert.ok(Number.isFinite(n), `${w.id} at ${scan.at}: ${n}`);
         // A watch window is listed on its gross now; a desk window on its multi-day spread once known.
-        const listedOn = w.tradable ? (carry[w.id]?.aprPct ?? w.grossAprPct) : w.grossAprPct;
+        const listedOn = w.tradable ? (carry[w.id]?.listedOn ?? w.grossAprPct) : w.grossAprPct;
         assert.ok(listedOn > 0, `${w.id}: only a positive spread is listed`);
         // Watch legs meet the floor; a desk leg holds the leg size within its share of the open interest.
         const minDepth = Math.min(DEFAULT_SCANNER_CONFIG.oiFloorUsd, DEFAULT_STRATEGY.legUsd / DEFAULT_SCANNER_CONFIG.deskMaxOiShare);

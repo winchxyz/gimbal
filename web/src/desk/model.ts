@@ -4,7 +4,7 @@ import type { DeskState, JournalEntry, Leg, StrategyConfig, VenueId, Window as F
 import { VENUE_NAMES } from '../shell/status.ts';
 import { amountUsd, clock, proofLinks, unprotectedText } from '../journal/entry.ts';
 import { dayMonthTime, hours, pct, plain, usd } from '../windows/format.ts';
-import { heldWindow, isEnterable, sortWindows, venuePair } from '../windows/model.ts';
+import { bestEnterable, heldWindow, venuePair } from '../windows/model.ts';
 import { perDayOnLegs } from '../windows/decision.ts';
 import { price, qty, ratioPct, signedQty, signedUsd } from './format.ts';
 
@@ -235,7 +235,7 @@ export interface NextBest {
 
 /** The best window open to the desk that is not held, and what the desk will do about it. */
 export function nextBest(windows: readonly FundingWindow[], strategy: StrategyConfig | null): NextBest | null {
-  const best = sortWindows(windows.filter((w) => isEnterable(w) && !w.held))[0];
+  const best = bestEnterable(windows.filter((w) => !w.held));
   if (!best) return null;
   const held = heldWindow(windows);
   const rule = !strategy

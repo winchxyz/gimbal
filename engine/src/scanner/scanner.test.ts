@@ -53,13 +53,13 @@ class FakeVenue {
   }
 }
 
-/** A desk venue with public funding history: `rate(symbol)` for every hour asked. */
+/** A desk venue with public funding history: `rate(symbol, hour)` for every hour asked (`hour`: its start, ms). */
 class HistoryVenue extends FakeVenue {
   readonly historyCalls: [string, number, number][] = [];
   historyError: Error | 'hang' | null = null;
-  readonly rate: (symbol: string) => number;
+  readonly rate: (symbol: string, hour: number) => number;
 
-  constructor(id: VenueId, rows: MarketFunding[], rate: (symbol: string) => number) {
+  constructor(id: VenueId, rows: MarketFunding[], rate: (symbol: string, hour: number) => number) {
     super(id, rows);
     this.rate = rate;
   }
@@ -69,7 +69,7 @@ class HistoryVenue extends FakeVenue {
     if (this.historyError === 'hang') return new Promise(() => {});
     if (this.historyError !== null) throw this.historyError;
     const points: MarketFundingPoint[] = [];
-    for (let t = Math.ceil(start / HOUR_MS) * HOUR_MS; t <= end; t += HOUR_MS) points.push({ time: t + 59, symbol, ratePerHour: this.rate(symbol), periodHours: 1 });
+    for (let t = Math.ceil(start / HOUR_MS) * HOUR_MS; t <= end; t += HOUR_MS) points.push({ time: t + 59, symbol, ratePerHour: this.rate(symbol, t), periodHours: 1 });
     return points.filter((p) => p.time <= end);
   }
 }
@@ -141,6 +141,7 @@ function scanner(
 }
 
 const byId = (ws: FundingWindow[], id: string) => ws.find((w) => w.id === id);
+const totalCosts = (w: FundingWindow) => Math.round((w.costs.feesPct + w.costs.slippagePct + w.costs.basisPct + w.costs.rescueReservePct) * 1000) / 1000;
 
 test('one scan without a desk: desk windows by net, then watch-only by gross; CEX only against something else', async () => {
   const { hl, phoenix, orderly, watchers } = venues();
@@ -222,7 +223,13 @@ test('with a policy and fresh oracle prices: enterable windows first by expected
   assert.equal(r0.windows.filter(isEnterable).length, 0);
   assert.ok(byId(r0.windows, 'sol-phoenix-hyperliquid')!.checks.some((c) => !c.ok && c.text.startsWith('No 7-day funding history on both legs yet')));
   await s.idle();
+  // With the week in, the week before it is read: until it is in, the gate fails as loading.
   clock.set(T0 + 5_000);
+  const loading = await s.scan();
+  assert.equal(loading.windows.filter(isEnterable).length, 0);
+  assert.ok(byId(loading.windows, 'sol-phoenix-hyperliquid')!.checks.some((c) => !c.ok && c.text.startsWith('14-day history loading')));
+  await s.idle();
+  clock.set(T0 + 10_000);
   const r = await s.scan();
   const enterable = r.windows.filter(isEnterable);
   assert.deepEqual(enterable.map((w) => w.id), ['sol-phoenix-hyperliquid', 'sol-orderly-hyperliquid']);
@@ -239,8 +246,9 @@ test('with a policy and fresh oracle prices: enterable windows first by expected
   assert.equal(po.id, 'sol-phoenix-orderly');
   assert.equal(po.refused, undefined);
   assert.deepEqual(po.checks.filter((c) => !c.ok).map((c) => c.text), [
-    'Over a 10-day hold (assumed: the engine rules set none), the 7-day spread of 8.76 % APR pays $2.40 at $1,000 a leg, '
-    + 'no more than the $2.40 round trip (4 fills $1.50, slippage $0.40, basis buffer $0.50; 24.0 bps): it takes 10.0 days to pay it back',
+    'Over a 10-day hold (assumed: the engine rules set none), the 7-day spread of 8.76 % APR (the smaller of the 7- and 14-day means) '
+    + 'pays $2.40 at $1,000 a leg, no more than the $2.40 round trip (4 fills $1.50, slippage $0.40, basis buffer $0.50; 24.0 bps): '
+    + 'it takes 10.0 days to pay it back',
   ]);
   // BTC is listed but has no oracle price.
   assert.deepEqual(r.windows[4]!.refused, { code: 'E_ORACLE_STALE', reason: 'no oracle price for BTC on phoenix' });
@@ -548,6 +556,8 @@ test('two readers for one venue are refused; a clock that steps back is survived
 const DOGE_HL = row('hyperliquid', 'DOGE', { ratePerHour: 0.0000121183, markPx: 0.074232, oraclePx: 0.074232, openInterest: 1010709058 });
 const DOGE_PH = row('phoenix', 'DOGE', { ratePerHour: 0.00001349600518246599, markPx: 0.074257, oraclePx: 0.074257, openInterest: 555491 });
 const LEG_20 = { ...DEFAULT_STRATEGY, legUsd: 20 };
+/** The same with no minimum: the gate is the round trip alone. */
+const LEG_20_ANY = { ...LEG_20, minNetAprPct: 0 };
 const DOGE_POLICY: ContractPolicy = {
   ...POLICY,
   hl_assets: [...POLICY.hl_assets, { index: 12, symbol: 'DOGE', sz_decimals: 0 }],
@@ -555,12 +565,16 @@ const DOGE_POLICY: ContractPolicy = {
 };
 const DOGE_ORACLE: OracleSource = { price: (_venue, symbol) => (symbol === 'DOGE' ? { px: 0.0742, at: T0 - 5_000 } : null) };
 
-test('a desk pair whose hour is reversed is listed in the direction 7 days pay, can be entered, then is judged on 14 days', async () => {
+/** Fresh DOGE oracle prices whenever asked: 5 s old on `clock`. */
+const dogeOracle = (clock: { now(): number }): OracleSource => ({ price: (_venue, symbol) => (symbol === 'DOGE' ? { px: 0.0742, at: clock.now() - 5_000 } : null) });
+
+test('a desk pair whose hour is reversed: listed in the direction the week paid, loading until the week before is in, then entered', async () => {
   // The history: Hyperliquid 0.000026/h, Phoenix 0.0000125/h every hour, so short HL / long PH has paid 11.826 % APR.
   const hl = new HistoryVenue('hyperliquid', [DOGE_HL], () => 0.000026);
   const phoenix = new HistoryVenue('phoenix', [DOGE_PH], () => 0.0000125);
   const clock = new VirtualClock(T0);
-  const { scanner: s } = scanner({ venues: [hl, phoenix] }, clock, { policy: DOGE_POLICY }, { strategy: () => LEG_20, oracle: DOGE_ORACLE });
+  let strategy = LEG_20_ANY;
+  const { scanner: s } = scanner({ venues: [hl, phoenix] }, clock, { policy: DOGE_POLICY }, { strategy: () => strategy, oracle: DOGE_ORACLE });
   const r1 = await s.scan();
   // A 20 USD leg is 0.048 % of Phoenix's 41k USD: well inside the 2 % share. Before its history is in, this hour
   // decides the direction, as for any desk pair; the gate is not passed yet.
@@ -571,34 +585,127 @@ test('a desk pair whose hour is reversed is listed in the direction 7 days pay, 
 
   clock.set(T0 + 5_000);
   const r2 = await s.scan();
-  // Listed in the direction the week paid, though this hour pays the other way; the reverse is not listed.
+  // Listed in the direction the week paid, though this hour pays the other way; the reverse is not listed. The week
+  // before is read now, and until it is in the gate fails as loading.
   assert.deepEqual(r2.windows.map((w) => w.id), ['doge-phoenix-hyperliquid']);
-  const w = r2.windows[0]!;
-  assert.equal(w.grossAprPct, -1.207);
-  assert.equal(w.grossApr7dPct, 11.826);
+  const w2 = r2.windows[0]!;
+  assert.equal(w2.grossAprPct, -1.207);
+  assert.equal(w2.grossApr7dPct, 11.826);
+  assert.equal(isEnterable(w2), false);
+  assert.equal(s.carry(w2.id)!.estimate.state, 'loading');
+  assert.ok(w2.checks.some((c) => !c.ok && c.text.startsWith('14-day history loading: the 7-day spread of 11.83 % APR is in')), JSON.stringify(w2.checks));
+  assert.equal(r2.notes.historyReads, 2);
+  assert.deepEqual(hl.historyCalls[1], ['DOGE', CURRENT - 344 * HOUR_MS, CURRENT - 168 * HOUR_MS]);
+  await s.idle();
+
+  clock.set(T0 + 10_000);
+  const r3 = await s.scan();
+  assert.deepEqual(r3.windows.map((w) => w.id), ['doge-phoenix-hyperliquid']);
+  const w = r3.windows[0]!;
   assert.equal(w.depthUsd, 41249);
-  // Every check passes: the break-even is judged on the 7-day spread too, not on this hour's -1.21 %.
+  // Every check passes: the break-even is judged on the multi-day spread too, not on this hour's -1.21 %.
   assert.deepEqual(w.checks.filter((c) => !c.ok), []);
   assert.equal(isEnterable(w), true);
   const carry = s.carry(w.id)!;
-  assert.equal(carry.estimate.basis, '7d');
+  assert.equal(carry.estimate.state, 'known');
+  assert.equal(carry.estimate.gross.d14AprPct, 11.826);
   assert.equal(carry.estimate.ok, true);
+  // The window's net APR is the multi-day spread minus its costs, not this hour's.
+  assert.equal(w.netAprPct, Math.round((11.826 - totalCosts(w)) * 1000) / 1000);
   assert.equal(w.breakevenHours, Math.round(carry.estimate.breakevenDays! * 24 * 10) / 10);
   assert.ok(w.breakevenHours < 240, String(w.breakevenHours));
   assert.deepEqual([carry.short.venue, carry.short.d7AprPct, carry.long.venue, carry.long.d7AprPct], ['hyperliquid', 22.776, 'phoenix', 10.95]);
   assert.equal(carry.long.oiUsd, 555491 * 0.074257);
   const lines = w.checks.map((c) => c.text);
-  assert.ok(lines.some((t) => t.startsWith('Over a 10-day hold (assumed: the engine rules set none), the 7-day spread of 11.83 % APR pays $0.06 at $20.00 a leg, more than the $0.06 round trip')), JSON.stringify(lines));
+  assert.ok(lines.some((t) => t.startsWith('Over a 10-day hold (assumed: the engine rules set none), the 7-day spread of 11.83 % APR '
+    + '(the smaller of the 7- and 14-day means) pays $0.06 at $20.00 a leg, more than the $0.06 round trip')), JSON.stringify(lines));
   assert.ok(lines.includes('Listed on the 7-day spread: this hour pays -1.21 % APR in this direction'));
-  // The week before is read next; with it the window is judged on 14 days.
-  assert.equal(r2.notes.historyReads, 2);
-  await s.idle();
-  clock.set(T0 + 10_000);
-  const r3 = await s.scan();
-  const c3 = s.carry('doge-phoenix-hyperliquid')!;
-  assert.equal(c3.estimate.basis, '14d');
-  assert.equal(c3.estimate.gross.d14AprPct, 11.826);
   assert.equal(r3.notes.historyReads, 0);
+
+  // Under the default 5 % minimum it is not entered: a few cents over the round trip are well under 5 % a year.
+  strategy = LEG_20;
+  clock.set(T0 + 15_000);
+  const r4 = await s.scan();
+  const w4 = r4.windows[0]!;
+  assert.equal(isEnterable(w4), false);
+  assert.deepEqual(w4.checks.filter((c) => !c.ok).map((c) => c.text.replace(/^.*, but /, '')), [
+    `it nets only ${s.carry(w4.id)!.estimate.netAprPct!.toFixed(2)} % APR over the hold, under your 5 % minimum`,
+  ]);
+});
+
+test('an older read that fails: loading while it may still answer, then the 7 days alone, then the 14 days once it answers', async () => {
+  const hl = new HistoryVenue('hyperliquid', [DOGE_HL], () => 0.000026);
+  const phoenix = new HistoryVenue('phoenix', [DOGE_PH], () => 0.0000125);
+  const clock = new VirtualClock(T0);
+  const { scanner: s, notes } = scanner({ venues: [hl, phoenix] }, clock, { policy: DOGE_POLICY }, { strategy: () => LEG_20_ANY, oracle: dogeOracle(clock) });
+  await s.scan();
+  await s.idle();
+  // The weeks are in; Hyperliquid fails every read from now on, the week before included.
+  hl.historyError = new Error('HTTP 429');
+  const at = async (t: number) => {
+    clock.set(t);
+    const r = await s.scan();
+    await s.idle();
+    const w = byId(r.windows, 'doge-phoenix-hyperliquid')!;
+    return { w, e: s.carry(w.id)!.estimate };
+  };
+  // Its first and second failures, each tried again after historyRetryMs (60 s): still loading.
+  for (const t of [T0 + 5_000, T0 + 66_000, T0 + 127_000]) {
+    const { w, e } = await at(t);
+    assert.equal(e.state, 'loading', String(t - T0));
+    assert.equal(isEnterable(w), false);
+  }
+  assert.equal(notes.filter((n) => n.startsWith('hyperliquid older history DOGE failed: HTTP 429')).length, 3);
+  // After the third failure it is judged on the 7 days alone, and says so.
+  const fallback = await at(T0 + 130_000);
+  assert.equal(fallback.e.state, 'known');
+  assert.equal(fallback.e.basis, '7d');
+  assert.ok(fallback.w.checks.some((c) => c.ok && c.text.includes('the 7-day spread of 11.83 % APR (the 14-day mean could not be had)')), JSON.stringify(fallback.w.checks));
+  assert.equal(isEnterable(fallback.w), true);
+  // Tried again an hour later (the scan after the new hour's own read): once it answers, the 14 days count.
+  hl.historyError = null;
+  await at(T0 + 127_000 + HOUR_MS + 1_000);
+  await at(T0 + 127_000 + HOUR_MS + 6_000);
+  const later = await at(T0 + 127_000 + HOUR_MS + 11_000);
+  assert.equal(later.e.state, 'known');
+  assert.equal(later.e.gross.d14AprPct, 11.826);
+  assert.ok(later.w.checks.some((c) => c.ok && c.text.includes('(the smaller of the 7- and 14-day means)')));
+});
+
+test('a desk pair whose 7 and 14 days disagree in sign is listed in neither direction; held, it keeps its direction and fails', async () => {
+  // This week Hyperliquid paid 0.000026/h and Phoenix 0.0000125/h; the week before, Hyperliquid nothing and Phoenix
+  // 0.00004/h. Short HL / long PH: 11.826 % APR over 7 days, -11.47 % over 14 (a print books the hour before it, so
+  // 169 of the 336 hours carry this week's rates: (169 × 11.826 - 167 × 35.04) / 336).
+  const weekAgo = CURRENT - 168 * HOUR_MS;
+  const rates = () => ({
+    hl: new HistoryVenue('hyperliquid', [DOGE_HL], (_s, t) => (t >= weekAgo ? 0.000026 : 0)),
+    phoenix: new HistoryVenue('phoenix', [DOGE_PH], (_s, t) => (t >= weekAgo ? 0.0000125 : 0.00004)),
+  });
+  const thirdScan = async (held: HeldWindow | null) => {
+    const { hl, phoenix } = rates();
+    const clock = new VirtualClock(T0);
+    const { scanner: s } = scanner({ venues: [hl, phoenix] }, clock, {}, { strategy: () => LEG_20_ANY, held: () => held });
+    await s.scan();
+    await s.idle();
+    clock.set(T0 + 5_000);
+    const loading = await s.scan();
+    await s.idle();
+    clock.set(T0 + 10_000);
+    return { s, loading, r: await s.scan() };
+  };
+  const free = await thirdScan(null);
+  // While the week before loads, the 7 days decide; once it is in, the spread has flipped: neither direction is listed.
+  assert.deepEqual(free.loading.windows.map((w) => w.id), ['doge-phoenix-hyperliquid']);
+  assert.deepEqual(free.r.windows.map((w) => w.id), []);
+
+  const held = await thirdScan({ windowId: 'doge-phoenix-hyperliquid', since: T0 - HOUR_MS });
+  assert.deepEqual(held.r.windows.map((w) => w.id), ['doge-phoenix-hyperliquid']);
+  const w = held.r.windows[0]!;
+  assert.equal(held.s.carry(w.id)!.estimate.state, 'mixed');
+  assert.ok(w.checks.some((c) => !c.ok && c.text === 'The 7-day spread (11.83 % APR) and the 14-day spread (-11.47 % APR) point opposite ways: '
+    + 'no steady carry in this direction'), JSON.stringify(w.checks));
+  // Its net APR stays this hour's: there is no multi-day figure to put in its place.
+  assert.equal(w.netAprPct, Math.round((w.grossAprPct - totalCosts(w)) * 1000) / 1000);
 });
 
 test('a desk leg over 2 % of its open interest: listed only on a multi-day spread that pays, with a failing check naming the share', async () => {
@@ -682,12 +789,18 @@ test('desk windows rank by the spread expected over the hold net of the round tr
   assert.ok(before.indexOf('sol-phoenix-hyperliquid') < before.indexOf('eth-phoenix-hyperliquid'));
   await s.idle();
   clock.set(T0 + 5_000);
+  await s.scan();
+  await s.idle();
+  clock.set(T0 + 10_000);
   const r2 = await s.scan();
   const ids = r2.windows.map((w) => w.id);
   assert.deepEqual(ids.slice(0, 2), ['eth-phoenix-hyperliquid', 'sol-phoenix-hyperliquid']);
   const [eth, sol] = [r2.windows[0]!, r2.windows[1]!];
-  assert.ok(sol.netAprPct > eth.netAprPct, 'SOL nets more this hour');
+  assert.ok(sol.grossAprPct > eth.grossAprPct, 'SOL pays more this hour');
   assert.ok(s.carry(eth.id)!.estimate.netUsd! > s.carry(sol.id)!.estimate.netUsd!);
+  // Their net APR is the multi-day spread minus costs: ETH's is the higher, as the web ranks and rotates on it.
+  assert.ok(eth.netAprPct > sol.netAprPct);
+  for (const w of [eth, sol]) assert.equal(w.netAprPct, Math.round((w.grossApr7dPct! - totalCosts(w)) * 1000) / 1000);
   // The Orderly window has no 7-day figure: it follows, though it nets far more this hour.
   const at = ids.indexOf('sol-orderly-hyperliquid');
   assert.ok(at > 1, ids.join(','));

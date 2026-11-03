@@ -69,13 +69,17 @@ test('the block for one window: legs now / 7 d / 14 d, round trip in USD and bps
   assert.deepEqual(r.windows.map((w) => w.id), ['xlm-phoenix-hyperliquid']);
   const w = r.windows[0]!;
   const c = s.carry(w.id)!;
-  // 0.000025/h apart for two weeks: 21.9 % APR; over 240 h on 20 USD that is 0.12 USD.
-  assert.equal(c.estimate.basis, '14d');
+  // 0.000025/h apart for two weeks: 21.9 % APR on both means (a tie is judged on the 7 days); over 240 h on 20 USD
+  // that is 0.12 USD.
+  assert.equal(c.estimate.state, 'known');
+  assert.equal(c.estimate.basis, '7d');
   assert.ok(Math.abs(c.estimate.expectedUsd! - 0.12) < 1e-9);
   // Fees 20 × 2 × 9 / 10⁴ = 0.036, slippage 4 × 20 × 1 bp = 0.008, no adverse gap (the long is the cheaper mark),
   // buffer 5 bps = 0.01: 0.054 USD = 27 bps.
   assert.ok(Math.abs(c.estimate.roundTrip.totalUsd - 0.054) < 1e-6, String(c.estimate.roundTrip.totalUsd));
   assert.ok(Math.abs(c.estimate.netUsd! - 0.066) < 1e-6);
+  // 0.066 / 20 × 8760 / 240 = 12.045 % APR net over the hold: over the default 5 % minimum.
+  assert.ok(Math.abs(c.estimate.netAprPct! - 12.045) < 1e-4);
   // 0.054 USD at 21.9 % on 20 USD (0.012 USD a day): 4.5 days.
   assert.ok(Math.abs(c.estimate.breakevenDays! - 4.5) < 1e-6);
   const g = legGross(c.long, c.short);
@@ -87,8 +91,9 @@ test('the block for one window: legs now / 7 d / 14 d, round trip in USD and bps
     '    Phoenix XLM long         10.81  -10.95  -10.95',
     '    gross (short - long)      0.14   21.90   21.90',
     '  round trip    $0.05 = 27.0 bps at $20.00 a leg (4 fills $0.04, slippage $0.0080, basis buffer $0.01)',
-    '  one-off transfers: $1.56 (not in the gate): both legs\' margin moved in and out through 1Click',
-    '  over a 10-day hold  expected $0.12 (14 d average), $0.07 after the round trip, break-even 4.5 days: passes the gate',
+    '  one-off, not in the gate: transfers $1.56 (both legs\' margin moved in and out through 1Click), rescue reserve $0.32 over the hold',
+    '  over a 10-day hold  expected $0.12 on 21.90 % APR (7 d, the smaller of 7 d and 14 d), $0.07 after the round trip = 12.04 % APR net '
+      + '(minimum 5 %), break-even 4.5 days: passes the gate',
     '  depth         $25k (the smaller leg\'s open interest: Hyperliquid $9.7M, Phoenix $25k)',
     '  refused       E_NO_DESK: no desk policy loaded yet',
     '  failing       No desk policy loaded yet: nothing can be entered',

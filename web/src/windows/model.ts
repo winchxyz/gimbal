@@ -21,8 +21,13 @@ export function sortWindows(windows: readonly FundingWindow[]): FundingWindow[] 
 export const inTab = (windows: readonly FundingWindow[], tab: Tab): FundingWindow[] =>
   windows.filter((w) => tabOf(w) === tab);
 
-/** A window the desk could open now: tradable, and neither refused by the contract nor vetoed by NEAR AI. */
-export const isEnterable = (w: FundingWindow): boolean => w.tradable && !w.refused && w.veto?.verdict !== 'veto';
+/**
+ * A window the desk could open now, as the engine judges it (engine/src/scanner/price.ts, isEnterable): tradable, not
+ * refused by the contract, numbers from this scan, every engine check passed (the carry gate and the open-interest
+ * share among them), and not vetoed by NEAR AI.
+ */
+export const isEnterable = (w: FundingWindow): boolean =>
+  w.tradable && !w.refused && !w.stale && w.checks.every((c) => c.ok) && w.veto?.verdict !== 'veto';
 
 /** The engine's refusal of every desk window while no desk (no policy) is loaded (docs/interfaces.md §2, `Window.refused`). */
 export const NO_DESK = 'E_NO_DESK';
@@ -126,9 +131,13 @@ export function arrange(
 
 const clamp = (n: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, n));
 
-/** The best window the desk could open, or null. */
+/**
+ * The window auto would open first, or null: the first enterable one in the engine's order. The engine ranks desk
+ * windows by the carry it expects over the hold, net of the round trip, which the web cannot recompute from a Window,
+ * so the list is not re-sorted here.
+ */
 export function bestEnterable(windows: readonly FundingWindow[]): FundingWindow | null {
-  return sortWindows(windows.filter(isEnterable))[0] ?? null;
+  return windows.find(isEnterable) ?? null;
 }
 
 /**

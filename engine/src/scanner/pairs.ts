@@ -36,8 +36,9 @@ export interface ScanLeg {
   /** Set on a leg of the held window that the filters would have dropped: why. The window fails a check for it. */
   heldOnly?: string;
   /**
-   * Set on a desk leg under the open-interest floor: why. It is kept for desk pairs only (never a watch window), which
-   * the scanner lists only on a multi-day spread that covers the fills, and which fail a check for it.
+   * Set on a desk leg whose leg size is over deskMaxOiShare of its open interest: why. It is kept for desk pairs only
+   * (never a watch window), which the scanner lists only on a multi-day spread that covers the fills, and which fail
+   * a check for it.
    */
   deskOnly?: string;
 }
