@@ -84,6 +84,11 @@ export interface TradeLeg {
    * The outcome sums every part; never throws.
    */
   makerOrder?(side: LegSide, size: bigint, reduceOnly: boolean, reason: string): Promise<LegOutcome>;
+  /**
+   * Starts one pair operation (an open with all its parts, or a close): from here the leg's maker orders share one
+   * budget of maxOrders post-only orders, until the next call.
+   */
+  beginMakerOperation?(): void;
 }
 
 /** How a maker order works the book: reprice at most every `repriceMs`, give up after `timeoutMs`, then IOC or not. */
@@ -95,8 +100,9 @@ export interface MakerSettings {
   /** How often a resting order's status is read (default 1 s). */
   pollMs?: number;
   /**
-   * The most post-only orders one maker order signs (default 6), a crossing refusal included: from C10 the contract
-   * meters signed notional that is not reduce-only per rolling hour, and every reprice is signed again.
+   * The most post-only orders signed per pair operation (default 6; per maker order when no operation was begun), a
+   * crossing refusal included: from C10 the contract meters signed notional that is not reduce-only per rolling hour,
+   * and every reprice is signed again. Two placements are always at least repriceMs apart, after a refusal too.
    */
   maxOrders?: number;
 }
@@ -175,6 +181,8 @@ export class HlLeg implements TradeLeg {
   readonly #clock: Clock;
   /** Post-only orders whose state a maker order could not settle (cancelPending tries them again). */
   readonly #pending: PendingMakerOrder[] = [];
+  /** Post-only orders the current pair operation may still sign (null: no operation begun, maxOrders per call). */
+  #makerLeft: number | null = null;
 
   constructor(options: HlLegOptions) {
     this.#o = options;
@@ -240,10 +248,11 @@ export class HlLeg implements TradeLeg {
    * Maker first: a post-only (Alo) limit at the touch (best bid for a buy, best ask for a sell), read every pollMs,
    * cancelled and placed again at the new touch every repriceMs, until the size filled or timeoutMs passed; then an
    * IOC for the rest when takerFallback is on. An Alo that would cross is refused by Hyperliquid (nothing ran) and is
-   * simply placed again. Each resting order's fill is read from orderStatus (origSz − sz) once it is no longer open,
+   * placed again repriceMs after it. Each resting order's fill is read from orderStatus (origSz − sz) once it is no longer open,
    * its price and fee from userFills. A post-only order whose state cannot be settled (no answer and no expiry, still
    * open after two cancels, or a status read that keeps failing) stops the whole order as unknown with no expiry: it
-   * may still fill, and it is kept for cancelPending. At most maxOrders post-only orders are signed. Never throws.
+   * may still fill, and it is kept for cancelPending. At most maxOrders post-only orders are signed (per pair
+   * operation once beginMakerOperation was called), each at least repriceMs after the one before. Never throws.
    */
   async makerOrder(side: LegSide, size: bigint, reduceOnly: boolean, reason: string): Promise<LegOutcome> {
     const s = { ...DEFAULT_MAKER, ...this.#o.maker };
@@ -258,6 +267,8 @@ export class HlLeg implements TradeLeg {
     let fee: number | null = 0;
     let refusedInARow = 0;
     let placed = 0;
+    let lastPlacedAt: number | null = null;
+    const budget = (): boolean => placed < maxOrders && (this.#makerLeft === null || this.#makerLeft > 0);
     /** The post-only order out now, until its final state is read. */
     let resting: { cloid: string; oid: number | null; size: string } | null = null;
     const stuck = (cloid: string, oid: number | null, sz: string): void => {
@@ -285,7 +296,14 @@ export class HlLeg implements TradeLeg {
     };
 
     try {
-      while (filled < size && this.#clock.now() < deadline && refusedInARow < 5 && placed < maxOrders) {
+      while (filled < size && this.#clock.now() < deadline && refusedInARow < 5 && budget()) {
+        // Never two placements less than repriceMs apart (a crossing refusal or an early cancel included): each one
+        // is signed and metered.
+        if (lastPlacedAt !== null) {
+          const next = lastPlacedAt + s.repriceMs;
+          if (next >= deadline) break;
+          if (this.#clock.now() < next) await sleep(next - this.#clock.now());
+        }
         const left = size - filled;
         const ref: LegRef = { venue: this.venue, side, size: qtyString(left), reduceOnly, orderId: null, clientId: null, tx: [], sentAt: this.#clock.now() };
         let order: HlOrder;
@@ -298,6 +316,8 @@ export class HlLeg implements TradeLeg {
         ref.clientId = order.cloid ?? null;
         let oid: number | null = null;
         placed++;
+        if (this.#makerLeft !== null) this.#makerLeft--;
+        lastPlacedAt = this.#clock.now();
         resting = { cloid: order.cloid!, oid: null, size: order.sz };
         try {
           const result = await this.#o.relayer.hlOrder(order, `${reason} (maker)`);
@@ -311,7 +331,6 @@ export class HlLeg implements TradeLeg {
             resting = null;
             total({ kind: 'failed', error: err as Error, ref });
             refusedInARow++;
-            await sleep(poll);
             continue;
           }
           const known = await this.#statusAfterUnknown(order.cloid!, err, sleep);
@@ -372,6 +391,10 @@ export class HlLeg implements TradeLeg {
       const ref: LegRef = { venue: this.venue, side, size: left, reduceOnly, orderId: resting?.oid === null || resting === null ? null : String(resting.oid), clientId: resting?.cloid ?? null, tx: [], sentAt: this.#clock.now() };
       return summary(parts.at(-1), { kind: 'unknown', error: new Error(`hyperliquid maker order: ${errorText(err)}`), ref, expiresAt: resting === null ? this.#clock.now() : null });
     }
+  }
+
+  beginMakerOperation(): void {
+    this.#makerLeft = { ...DEFAULT_MAKER, ...this.#o.maker }.maxOrders ?? 6;
   }
 
   /** Post-only orders a maker order could not settle; they may still rest and fill. */

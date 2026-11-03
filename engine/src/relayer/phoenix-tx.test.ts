@@ -134,6 +134,27 @@ test('the policy market against the live exchange market: orderbook, lot and tic
     'phoenix ETH: base_lot_e8 is 100000, the exchange\'s lot 10000', 'phoenix ETH: tick_e8 is 10000000, the exchange\'s tick 1000000000',
   ]);
   assert.match(marketMismatches(undefined, policy).join(), /no such market/);
+  // A market that is not active refuses an open; a close (reduce-only) ignores the status, never the lot or tick.
+  const paused = { ...live, marketStatus: 'maintenance' };
+  assert.match(marketMismatches(paused, policy, ETH.spline).join(), /the market is maintenance/);
+  assert.deepEqual(marketMismatches(paused, policy, ETH.spline, { ignoreStatus: true }), []);
+  assert.equal(marketMismatches({ ...paused, tickSize: 1000 }, policy, ETH.spline, { ignoreStatus: true }).length, 1);
+});
+
+test('the policy lot and tick of SOL, DOGE and BTC match the live exchange by the same formula', () => {
+  // From the live snapshot (/v1/exchange/snapshot): baseLotsDecimals and tickSize of each market.
+  const cases = [
+    { symbol: 'SOL', orderbook: '71Si24E4uc3oCaPbPZTozC1ptSNNqygjjebxSmErSsC2', tickSize: 100, baseLotsDecimals: 2, base_lot_e8: 1_000_000, tick_e8: 1_000_000 },
+    { symbol: 'DOGE', orderbook: 'Hqt5Vom5L3X3RcKysKnBmLAvjYgo6TGAwoheW658h5cz', tickSize: 1, baseLotsDecimals: 0, base_lot_e8: 100_000_000, tick_e8: 100 },
+    { symbol: 'BTC', orderbook: 'AXFz1MuzMUBHi5UKJuK3FDCQ73o3rSzubGU2mPr4LLU7', tickSize: 100, baseLotsDecimals: 4, base_lot_e8: 10_000, tick_e8: 100_000_000 },
+  ];
+  for (const c of cases) {
+    const live = { symbol: c.symbol, marketPubkey: c.orderbook, tickSize: c.tickSize, baseLotsDecimals: c.baseLotsDecimals, marketStatus: 'active' };
+    const policy = { symbol: c.symbol, orderbook: c.orderbook, base_lot_e8: c.base_lot_e8, tick_e8: c.tick_e8 };
+    assert.deepEqual(marketMismatches(live, policy), [], c.symbol);
+    assert.match(marketMismatches(live, { ...policy, tick_e8: c.tick_e8 * 10 }).join(), /tick_e8/, `${c.symbol}: a tick off by 10x`);
+    assert.match(marketMismatches(live, { ...policy, base_lot_e8: c.base_lot_e8 / 10 }).join(), /base_lot_e8/, `${c.symbol}: a lot off by 10x`);
+  }
 });
 
 test('an IOC with no lots or no price is refused before anything is built', () => {

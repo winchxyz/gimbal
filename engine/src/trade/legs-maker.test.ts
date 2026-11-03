@@ -106,7 +106,8 @@ test('a post-only buy rests at the best bid and fills: one part, the maker fee (
 
 test('repriced: a resting order is cancelled after repriceMs and placed again; the rest goes as an IOC after the timeout', async () => {
   // 1st Alo fills 0.004 then is cancelled; 2nd refused (would cross); 3rd fills nothing; then the IOC takes 0.006.
-  const v = venue([{ fills: '0.004' }, { fills: '0', refuse: 'cross' }, { fills: '0' }], undefined, '0.006');
+  // Each placement at least repriceMs (5 s) after the one before, the refused one included: at 0, 5 and 10 s.
+  const v = venue([{ fills: '0.004' }, { fills: '0', refuse: 'cross' }, { fills: '0' }], undefined, '0.006', { timeoutMs: 15_000 });
   const out = await v.leg.makerOrder('BUY', toQty('0.01'), false, 'open');
   assert.equal(out.kind, 'filled');
   assert.ok(out.kind === 'filled');
@@ -114,6 +115,7 @@ test('repriced: a resting order is cancelled after repriceMs and placed again; t
   assert.deepEqual(v.orders.map((o) => [o.tif, o.sz]), [['Alo', '0.01'], ['Alo', '0.006'], ['Alo', '0.006'], ['Ioc', '0.006']]);
   assert.equal(v.cancels.length, 2);
   assert.deepEqual(out.parts!.map((p) => p.kind), ['filled', 'failed', 'failed', 'filled']);
+  assert.deepEqual(out.parts!.slice(0, 3).map((p) => p.ref.sentAt - out.ref.sentAt), [0, 5_000, 10_000], 'the reprice floor holds after a refusal');
   // 0.004 at 2499 (rebate 0.0005) and 0.006 at 2500.5 (fee 0.06).
   assert.ok(Math.abs(out.fee! - 0.0595) < 1e-12);
   assert.ok(Math.abs(out.avgPx! - (0.004 * 2499 + 0.006 * 2500.5) / 0.01) < 1e-9);
@@ -157,4 +159,23 @@ test('at most maxOrders post-only orders are signed, crossing refusals included;
   assert.equal(out.kind, 'failed');
   assert.deepEqual(v.orders.map((o) => o.tif), ['Alo', 'Alo', 'Ioc']);
   assert.deepEqual([DEFAULT_MAKER.takerFallback, DEFAULT_MAKER.repriceMs, DEFAULT_MAKER.maxOrders], [false, 30_000, 6]);
+});
+
+test('a crossing refusal waits out the reprice floor: no placement inside repriceMs, none past the deadline', async () => {
+  // Refused at 0; the next placement would be at 5 s, which is the deadline: no second Alo, the IOC takes it.
+  const v = venue([{ fills: '0', refuse: 'cross' }], undefined, '0.005', { timeoutMs: 5_000 });
+  const out = await v.leg.makerOrder('BUY', toQty('0.005'), false, 'open');
+  assert.deepEqual(v.orders.map((o) => o.tif), ['Alo', 'Ioc']);
+  assert.equal(out.kind, 'filled');
+});
+
+test('one pair operation shares the maxOrders budget across its maker orders; the next operation starts a new one', async () => {
+  const v = venue([{ fills: '0' }, { fills: '0' }, { fills: '0' }, { fills: '0' }, { fills: '0' }], undefined, null, { maxOrders: 3, timeoutMs: 600_000, takerFallback: false });
+  v.leg.beginMakerOperation();
+  await v.leg.makerOrder('SELL', toQty('0.005'), true, 'close (part 1)');
+  await v.leg.makerOrder('SELL', toQty('0.005'), true, 'close (part 2)');
+  assert.deepEqual(v.orders.map((o) => o.tif), ['Alo', 'Alo', 'Alo'], 'three for the operation, not three per call');
+  v.leg.beginMakerOperation();
+  await v.leg.makerOrder('SELL', toQty('0.005'), true, 'close again');
+  assert.equal(v.orders.length, 6, 'a new operation: the budget of three starts again');
 });

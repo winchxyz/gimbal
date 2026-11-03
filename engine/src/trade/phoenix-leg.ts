@@ -10,10 +10,12 @@
 // Outcomes:
 //   - a local check, the contract's refusal, the signature budget: failed, nothing signed;
 //   - the transaction landed with an error, or its blockhash expired unseen (NothingExecuted): failed;
-//   - an MPC timeout the relayer hands on (only once the message's blockhash is proven expired): failed;
+//   - an MPC timeout: unknown, with expiresAt once the chain is past the message's lastValidBlockHeight (a late
+//     signature can still be posted while the blockhash lives);
 //   - it landed and the position did not move, read from a snapshot at or past the slot it landed in: failed (an IOC
-//     with nothing to match). Without that slot no snapshot can be proven to include it: unknown, never failed (a
-//     stale snapshot reads "did not move", and a retry would double the leg);
+//     with nothing to match). Without that slot (or the chain's confirmed slot after it, a lower bound) no snapshot
+//     can be proven to include it: unknown, never failed (a stale snapshot reads "did not move", and a retry would
+//     double the leg);
 //   - OutcomeUnknown (no proof either way): the leg waits until the chain is past the message's lastValidBlockHeight
 //     (after it no copy can land), takes the slot that height was read at as the oldest snapshot it trusts, and
 //     answers unknown with that time as expiresAt, so the pair reads the position once and knows; when that cannot
@@ -55,6 +57,8 @@ export interface PhoenixLegOptions {
   chain: {
     latestBlockhash(): Promise<{ blockhash: string; lastValidBlockHeight: number }>;
     signatureSlot(signature: string): Promise<number | null>;
+    /** The chain's confirmed slot now: a lower bound for a transaction already confirmed whose slot is not known. */
+    currentSlot?(): Promise<number>;
   };
   /** SolanaSubmitter.landedSlot: the slot of a transaction it saw confirmed (asked first, before the RPC). */
   landedSlot?: (signature: string) => number | null;
@@ -267,7 +271,11 @@ export class PhoenixLeg implements TradeLeg {
       if (provesNothingRan(err)) return { kind: 'failed', error: err as Error, ref };
       // The relayer hands on an MPC timeout only once the last message's blockhash is proven expired (and signs a
       // second one only after the first one's was): no signature of either can land any more.
-      if (err instanceof MpcTimeoutError) return { kind: 'failed', error: err, ref };
+      // A timeout is no proof: a late signature can still be posted while the blockhash lives, so the leg waits
+      // until the chain is past it, as for any order with no answer.
+      if (err instanceof MpcTimeoutError) {
+        return { kind: 'unknown', error: err, ref, expiresAt: await this.#expiry((built as { lastValidBlockHeight: number } | null)?.lastValidBlockHeight) };
+      }
       const height = err instanceof OutcomeUnknown ? err.ids.solLastValidBlockHeight ?? (built as { lastValidBlockHeight: number } | null)?.lastValidBlockHeight : undefined;
       return { kind: 'unknown', error: err instanceof Error ? err : new Error(String(err)), ref, expiresAt: await this.#expiry(height) };
     }
@@ -275,7 +283,15 @@ export class PhoenixLeg implements TradeLeg {
     const signature = tx.find((t) => t.chain === 'solana')?.id ?? null;
     ref.orderId = signature;
     // Landed: the fill is what the position moved by, read from a snapshot that includes the transaction's slot.
-    const slot = signature === null ? null : await this.#landedSlot(signature);
+    let slot = signature === null ? null : await this.#landedSlot(signature);
+    // The transaction is confirmed, so the chain's confirmed slot now is at or past the one it landed in.
+    if (slot === null && signature !== null && this.#o.chain.currentSlot !== undefined) {
+      try {
+        slot = await this.#o.chain.currentSlot();
+      } catch {
+        // no lower bound either: unknown below
+      }
+    }
     if (slot === null) {
       return {
         kind: 'unknown', ref, expiresAt: null,

@@ -48,6 +48,8 @@ export interface SolanaChain {
   simulate(message: Uint8Array): Promise<Simulation>;
   /** The slot a signature landed in, or null when the node has not seen it. */
   signatureSlot(signature: string): Promise<number | null>;
+  /** The chain's confirmed slot now (getSlot). */
+  currentSlot?(): Promise<number>;
 }
 
 export interface Simulation {
@@ -94,6 +96,7 @@ export function solanaChain(rpcUrl: string, fetchImpl: typeof fetch = fetch): So
       const slot = value[0]?.slot;
       return typeof slot === 'number' ? slot : null;
     },
+    currentSlot: () => rpc<number>('getSlot', [{ commitment: 'confirmed' }]),
   };
 }
 

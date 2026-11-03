@@ -7,7 +7,7 @@
 //     fund-phoenix <usdc>                   desk USDC account -> Ember wrap -> Phoenix deposit (one sol_sign)
 //     defund-phoenix <usdc|all>             Phoenix withdraw -> Ember unwrap -> desk USDC account (one sol_sign)
 //     open <symbol> <legUsd> --short hyperliquid --long phoenix [--leverage 2] [--hold-days 7] [--basis-bps 10]
-//          [--slippage-bps 50] [--reprice-s 30] [--maker-timeout-s 180] [--max-orders 6] [--taker-fallback]
+//          [--slippage-bps 50] [--reprice-s 30] [--maker-timeout-s 120] [--max-orders 6] [--taker-fallback]
 //          [--priority-microlamports 100000]
 //     close <symbol> [the same order options]
 //
@@ -15,12 +15,15 @@
 // NEAR_RPC_URL, HL_API_URL, PHOENIX_API_URL, SOLANA_RPC_URL); values are never printed, and the key is read only
 // with --send.
 //
-// Open goes maker first: the Hyperliquid short as post-only limits at the touch, repriced at most every --reprice-s
-// (30 s or more) and at most --max-orders times (6 or fewer: from C10 the contract meters signed notional that is not
-// reduce-only per rolling hour, and every reprice is signed again), for at most --maker-timeout-s; an IOC for the rest
-// only with --taker-fallback. Then the Phoenix long as one IOC for what filled. Close mirrors it, reduce-only (what
-// the maker leg leaves goes to the close's IOC retry). The stored price is refreshed before each part when it would
-// not outlive the maker timeout plus 240 s, and whenever an order (an unwind, a close) finds it stale.
+// Open goes maker first: the Hyperliquid short as post-only limits at the touch, placed at most every --reprice-s
+// (30 s or more, a crossing refusal included) and at most --max-orders times per open or close, over all its parts
+// (6 or fewer: from C10 the contract meters signed notional that is not reduce-only per rolling hour, and every
+// reprice is signed again), for at most --maker-timeout-s; an IOC for the rest only with --taker-fallback. Then the
+// Phoenix long as one IOC for what filled. Close mirrors it, reduce-only (what the maker leg leaves goes to the close's
+// IOC retry). A stored price is the oracle's timestamp less its 600 s recency, so one fresh from refresh_prices lives
+// oracle_max_age_s - 600 s (300 s at 900): the maker timeout plus 120 s must fit that. The price is refreshed (only
+// once the refusals are checked) before each part when it would not outlive that, and whenever an order (an unwind,
+// a close) finds it stale; never twice within 30 s.
 //
 // Before an open the plan prints both legs' funding now and over 7 days, the gross APR, the spread expected over the
 // hold against the round trip (taker fees, half spreads, basis buffer), the size, the leverage and liquidation
@@ -34,7 +37,9 @@
 // trades at the leverage its Hyperliquid account already has for the coin; what is checked is the effective leverage.
 //
 // An outcome that cannot be proven ends with `open:` lines naming what to reconcile and by which ids; exit code 3.
-// A post-only order left without a settled state is cancelled by its id once more before the process ends.
+// A post-only order left without a settled state is cancelled by its id once more before the process ends; both legs
+// are then read again, Phoenix is brought back against Hyperliquid by one IOC when a late fill left it off, and what
+// stays unhedged is printed exactly.
 
 import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -53,7 +58,7 @@ import {
 } from '../relayer/phoenix-money.ts';
 import type { SnapshotMarket } from '../relayer/phoenix-tx.ts';
 import {
-  MAX_PRIORITY_MICROLAMPORTS, ORDER_COMPUTE_UNITS, ORDER_PRIORITY_MICROLAMPORTS, ORDER_UNITS_REFUSE_ABOVE, exchangeMismatches, marketMismatches,
+  ORDER_COMPUTE_UNITS, ORDER_PRIORITY_MICROLAMPORTS, ORDER_UNITS_REFUSE_ABOVE, exchangeMismatches, marketMismatches,
   splineOf,
 } from '../relayer/phoenix-tx.ts';
 import type { DeskSolanaAccounts } from '../relayer/phoenix-withdraw.ts';
@@ -71,7 +76,11 @@ import { PhoenixLeg, parseTraderSnapshot, phoenixTraderApi } from '../trade/phoe
 import { HL_MAINNET_URL, HyperliquidReader } from '../venues/hyperliquid.ts';
 import { PHOENIX_API_URL, PhoenixReader, SOLANA_MAINNET_RPC_URL } from '../venues/phoenix.ts';
 import { errorMessage } from '../venues/recorder.ts';
-import type { Position } from '../venues/venue.ts';
+import type { Args, PriceDeps, StoredPrice } from './pair-mainnet-lib.ts';
+import {
+  PRICE_MARGIN_S, UsageError, ensureFresh, hlCross, newPriceState, num, oraclePxOf, orderOptions, parseArgs, phoenixCross, priceFitRefusal, priceLifeS,
+  residualHedge, withdrawKeepsLegs,
+} from './pair-mainnet-lib.ts';
 import { checkContractNetwork, contractEnv } from './serve-contract.ts';
 
 const USAGE = `usage: node --env-file=<engine env> engine/src/cli/pair-mainnet.ts <command> [--send]
@@ -79,67 +88,12 @@ const USAGE = `usage: node --env-file=<engine env> engine/src/cli/pair-mainnet.t
   fund-phoenix <usdc>
   defund-phoenix <usdc|all>
   open <symbol> <legUsd> --short hyperliquid --long phoenix [--leverage 2] [--hold-days 7] [--basis-bps 10] [--slippage-bps 50]
-       [--reprice-s 30] [--maker-timeout-s 180] [--max-orders 6] [--taker-fallback] [--priority-microlamports 100000]
-  close <symbol> [--slippage-bps 50] [--reprice-s 30] [--maker-timeout-s 180] [--max-orders 6] [--taker-fallback] [--priority-microlamports 100000]`;
+       [--reprice-s 30] [--maker-timeout-s 120] [--max-orders 6] [--taker-fallback] [--priority-microlamports 100000]
+  close <symbol> [--slippage-bps 50] [--reprice-s 30] [--maker-timeout-s 120] [--max-orders 6] [--taker-fallback] [--priority-microlamports 100000]`;
 
-const FLAGS: Record<string, 'value' | 'switch'> = {
-  '--send': 'switch', '--short': 'value', '--long': 'value', '--leverage': 'value', '--hold-days': 'value', '--basis-bps': 'value',
-  '--slippage-bps': 'value', '--reprice-s': 'value', '--maker-timeout-s': 'value', '--max-orders': 'value', '--taker-fallback': 'switch',
-  '--priority-microlamports': 'value',
-};
 /** Phoenix orders one pair part may take: the open, its retry, and two unwind orders. */
 const ORDERS_PER_PART = 4;
 const HL_TAKER_BPS = 5.5;
-/** The reprice floor and the post-only order cap of one maker order (the C10 meter counts every signed reprice). */
-const MIN_REPRICE_S = 30;
-const MAX_MAKER_ORDERS = 6;
-/** How long the stored price must still live after the maker timeout when a part starts: the IOC and an unwind. */
-const PRICE_MARGIN_S = 240;
-/** An order finding the stored price this close to oracle_max_age_s refreshes it first. */
-const PRICE_STALE_MARGIN_S = 30;
-
-class UsageError extends Error {}
-
-interface Args {
-  command: string;
-  positional: string[];
-  flags: Record<string, string | true>;
-  send: boolean;
-}
-
-function parseArgs(argv: string[]): Args {
-  const positional: string[] = [];
-  const flags: Record<string, string | true> = {};
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i]!;
-    if (!a.startsWith('--')) {
-      positional.push(a);
-      continue;
-    }
-    const kind = FLAGS[a];
-    if (kind === undefined) throw new UsageError(`unknown option ${a}`);
-    if (a in flags) throw new UsageError(`${a} is given twice`);
-    if (kind === 'switch') flags[a] = true;
-    else {
-      const v = argv[i + 1];
-      if (v === undefined || v.startsWith('--')) throw new UsageError(`${a} needs a value`);
-      flags[a] = v;
-      i++;
-    }
-  }
-  const command = positional.shift();
-  if (command === undefined) throw new UsageError('no command');
-  return { command, positional, flags, send: flags['--send'] === true };
-}
-
-function num(args: Args, flag: string, fallback: number): number {
-  const v = args.flags[flag];
-  if (v === undefined) return fallback;
-  const n = Number(v);
-  if (typeof v !== 'string' || !Number.isFinite(n) || n < 0) throw new UsageError(`${flag} must be a number of 0 or more`);
-  return n;
-}
-
 const say = (line = '') => console.log(line);
 const envVar = (name: string): string | undefined => {
   const v = process.env[name];
@@ -167,8 +121,9 @@ interface Ctx {
   solana: SolanaSubmitter;
   sol: DeskSolanaAccounts;
   relayer: Relayer | null;          // --send only
-  /** A refresh_prices in flight: the legs' price reads wait on it rather than send a second one. */
-  refreshing: Promise<void> | null;
+  prices: PriceDeps;
+  /** Set once an --send open or close has passed its refusals: only then may a price read send refresh_prices. */
+  trading: boolean;
 }
 
 try {
@@ -232,7 +187,12 @@ async function main(argv: string[]): Promise<void> {
     : null;
   const ctx: Ctx = {
     args, client, config, desk, deskId: cfg.deskId, hlUrl, hl: new HyperliquidReader({ network: 'mainnet', url: `${hlUrl}/info` }),
-    phoenix: new PhoenixReader({ apiUrl: phoenixUrl, rpcUrl: solRpcUrl }), phoenixUrl, chain: solanaChain(solRpcUrl), solana, sol, relayer, refreshing: null,
+    phoenix: new PhoenixReader({ apiUrl: phoenixUrl, rpcUrl: solRpcUrl }), phoenixUrl, chain: solanaChain(solRpcUrl), solana, sol, relayer,
+    prices: {
+      maxAgeS: desk.policy.oracle_max_age_s, send: args.send, read: (symbol) => storedPrice(client, symbol),
+      refresh: (symbol, maxAgeS) => client.refreshPrices([symbol], { maxAgeS }), now: () => Date.now(), log: say, ...newPriceState(),
+    },
+    trading: false,
   };
   if (args.command === 'status') return status(ctx);
   if (args.command === 'fund-phoenix' || args.command === 'defund-phoenix') return money(ctx);
@@ -294,32 +254,9 @@ async function traderState(ctx: Ctx): Promise<string | null> {
 }
 
 /** The contract's stored price of `symbol` and its age (s), or null. */
-async function storedPrice(ctx: Ctx, symbol: string): Promise<{ px: number; ageS: number } | null> {
-  const row = (await ctx.client.prices()).find((p) => p.asset === symbol);
+async function storedPrice(client: NearContractClient, symbol: string): Promise<StoredPrice | null> {
+  const row = (await client.prices()).find((p) => p.asset === symbol);
   return row === undefined ? null : { px: Number(row.price_e8) / 1e8, ageS: (Date.now() - row.at_ms) / 1000 };
-}
-
-/**
- * refresh_prices when the stored price would be older than oracle_max_age_s - `marginS` (one NEAR transaction; --send
- * only). Concurrent callers share one refresh.
- */
-async function ensureFresh(ctx: Ctx, symbol: string, marginS: number): Promise<{ px: number; ageS: number }> {
-  const maxAge = ctx.desk.policy.oracle_max_age_s;
-  const sp = await storedPrice(ctx, symbol);
-  if (sp !== null && sp.ageS <= maxAge - marginS) return sp;
-  if (!ctx.args.send || ctx.relayer === null) throw new Error(`the stored ${symbol} price is ${sp === null ? 'missing' : `${Math.round(sp.ageS)} s old`}`);
-  if (ctx.refreshing === null) {
-    say(`refresh   the stored ${symbol} price is ${sp === null ? 'missing' : `${Math.round(sp.ageS)} s old`}: refresh_prices`);
-    ctx.refreshing = ctx.client.refreshPrices([symbol], { maxAgeS: Math.max(1, maxAge - marginS) })
-      .then((tx) => say(`          ${refs(tx)}`))
-      .finally(() => {
-        ctx.refreshing = null;
-      });
-  }
-  await ctx.refreshing;
-  const fresh = await storedPrice(ctx, symbol);
-  if (fresh === null || fresh.ageS > maxAge - PRICE_STALE_MARGIN_S) throw new Error(`refresh_prices did not leave a fresh ${symbol} price`);
-  return fresh;
 }
 
 async function solReport(ctx: Ctx): Promise<number> {
@@ -330,10 +267,6 @@ async function solReport(ctx: Ctx): Promise<number> {
   return lamports;
 }
 
-function notionalAtEntry(positions: readonly Position[]): number {
-  return positions.reduce((acc, p) => acc + Math.abs(p.size) * p.entryPx, 0);
-}
-
 // ---- status ----
 
 async function status(ctx: Ctx): Promise<void> {
@@ -341,7 +274,7 @@ async function status(ctx: Ctx): Promise<void> {
   say(`policy    max_notional_usd ${p.max_notional_usd}, price_band_bps ${p.price_band_bps}, oracle_max_age_s ${p.oracle_max_age_s}`);
   say(`          hl_assets ${p.hl_assets.map((a) => a.symbol).join(', ') || 'none'}; phoenix_markets ${p.phoenix_markets.map((m) => m.symbol).join(', ') || 'none'}`);
   for (const symbol of new Set([...p.hl_assets.map((a) => a.symbol), ...p.phoenix_markets.map((m) => m.symbol)])) {
-    const sp = await storedPrice(ctx, symbol);
+    const sp = await storedPrice(ctx.client, symbol);
     say(`price     ${symbol}: ${sp === null ? 'none stored' : `${sp.px} USD, ${Math.round(sp.ageS)} s old${sp.ageS > p.oracle_max_age_s ? ` (stale: over ${p.oracle_max_age_s} s; --send refreshes it)` : ''}`}`);
   }
   say(`leverage  no update-leverage action in the contract; legs are held to ${MAX_LEVERAGE}x effective, ${venueMaxLeverage('phoenix')}x on Phoenix (no live rescue)`);
@@ -391,7 +324,10 @@ async function money(ctx: Ctx): Promise<void> {
     : await planDeposit(mctx, parseUsdc(amountText));
   for (const m of mismatches) plan.refusals.push(`the Phoenix exchange differs from the pinned accounts: ${m}`);
   if (ctx.desk.paused && plan.kind === 'deposit') plan.refusals.push('the desk is paused: sol_sign takes no deposit');
-  if (withdraw) plan.refusals.push(...await withdrawKeepsLegs(ctx, amountText === 'all', plan.amount));
+  if (withdraw) {
+    const reads = { state: () => traderState(ctx), account: () => ctx.phoenix.account(ctx.sol.authority) };
+    plan.refusals.push(...await withdrawKeepsLegs(reads, amountText === 'all', Number(plan.amount) / 1e6));
+  }
   printPlan(plan);
   if (!ctx.args.send) {
     for (const r of plan.refusals) say(`would refuse at --send: ${r}`);
@@ -411,28 +347,6 @@ async function money(ctx: Ctx): Promise<void> {
     }
     throw err;
   }
-}
-
-/**
- * A withdrawal must leave an open Phoenix leg its collateral: `all` is refused while a position is open, and an amount
- * must leave the leg at or under Phoenix's leverage cap and more than 40 % from liquidation.
- */
-async function withdrawKeepsLegs(ctx: Ctx, all: boolean, amount: bigint): Promise<string[]> {
-  const state = await traderState(ctx);
-  if (state === null || state === 'uninitialized') return [];
-  const pa = await ctx.phoenix.account(ctx.sol.authority);
-  const open = pa.positions.filter((p) => p.size !== 0);
-  if (open.length === 0) return [];
-  const names = open.map((p) => `${p.symbol} ${p.size}`).join(', ');
-  if (all) return [`Phoenix holds ${names}: defund-phoenix all would take the leg's collateral; close the pair first, or withdraw an amount`];
-  const notional = notionalAtEntry(open);
-  const left = pa.equityUsd - Number(amount) / 1e6;
-  const cap = venueMaxLeverage('phoenix');
-  const out: string[] = [];
-  if (!(left * cap >= notional)) out.push(`after it Phoenix would hold ${usd(left)} against ${usd(notional)} open (${names}): over ${cap}x; at most ${usd(Math.max(0, pa.equityUsd - notional / cap))} can go`);
-  const distance = (left - pa.maintenanceMarginUsd) / notional;
-  if (!(distance > 0.4)) out.push(`after it the Phoenix positions would be ${pct(distance)} from liquidation, not more than 40 %`);
-  return out;
 }
 
 function printPlan(plan: MoneyPlan): void {
@@ -468,21 +382,7 @@ interface Pair {
   microLamports: number;
 }
 
-function orderOptions(args: Args): { maker: MakerSettings; microLamports: number; slippageBps: number } {
-  const repriceS = num(args, '--reprice-s', MIN_REPRICE_S);
-  const timeoutS = num(args, '--maker-timeout-s', 180);
-  const maxOrders = num(args, '--max-orders', MAX_MAKER_ORDERS);
-  const microLamports = num(args, '--priority-microlamports', ORDER_PRIORITY_MICROLAMPORTS);
-  if (repriceS < MIN_REPRICE_S) throw new UsageError(`--reprice-s must be ${MIN_REPRICE_S} or more: every reprice is signed and metered`);
-  if (!Number.isInteger(maxOrders) || maxOrders < 1 || maxOrders > MAX_MAKER_ORDERS) throw new UsageError(`--max-orders must be 1..${MAX_MAKER_ORDERS}`);
-  if (!Number.isInteger(microLamports) || microLamports < 1 || microLamports > MAX_PRIORITY_MICROLAMPORTS) throw new UsageError(`--priority-microlamports must be 1..${MAX_PRIORITY_MICROLAMPORTS}`);
-  return {
-    maker: { repriceMs: repriceS * 1000, timeoutMs: timeoutS * 1000, takerFallback: args.flags['--taker-fallback'] === true, pollMs: 1000, maxOrders },
-    microLamports, slippageBps: num(args, '--slippage-bps', 50),
-  };
-}
-
-async function buildPair(ctx: Ctx, symbol: string): Promise<Pair> {
+async function buildPair(ctx: Ctx, symbol: string, closing = false): Promise<Pair> {
   const p: ContractPolicy = ctx.desk.policy;
   const asset = p.hl_assets.find((a) => a.symbol === symbol);
   const market = p.phoenix_markets.find((m) => m.symbol === symbol);
@@ -490,19 +390,13 @@ async function buildPair(ctx: Ctx, symbol: string): Promise<Pair> {
     throw new Error(`${symbol} must be in both policy.hl_assets (${p.hl_assets.map((a) => a.symbol).join(', ')}) and policy.phoenix_markets (${p.phoenix_markets.map((m) => m.symbol).join(', ')})`);
   }
   const { maker, microLamports, slippageBps } = orderOptions(ctx.args);
-  if ((maker.timeoutMs / 1000) + PRICE_MARGIN_S >= p.oracle_max_age_s) {
-    throw new UsageError(`--maker-timeout-s ${maker.timeoutMs / 1000} plus ${PRICE_MARGIN_S} s does not fit the policy's oracle_max_age_s ${p.oracle_max_age_s}`);
-  }
+  const fit = priceFitRefusal(maker.timeoutMs / 1000, p.oracle_max_age_s);
+  if (fit !== null) throw new UsageError(fit);
   const unpriced = p.unpriced.find((u) => u.symbol === symbol);
   const maxNotionalUsd = unpriced === undefined ? p.max_notional_usd : Math.min(p.max_notional_usd, p.unpriced_max_notional_usd);
-  // The dry run plans with the stored price as it is; --send refreshes one about to go stale before it prices an
-  // order, so an unwind or a close is never refused for a stale price.
-  const oraclePx = unpriced !== undefined ? async () => null : async (): Promise<number> => {
-    if (ctx.args.send) return (await ensureFresh(ctx, symbol, PRICE_STALE_MARGIN_S)).px;
-    const sp = await storedPrice(ctx, symbol);
-    if (sp === null) throw new Error(`the contract has no stored ${symbol} price`);
-    return sp.px;
-  };
+  // Planning (a dry run, or --send before its refusals pass) prices with the stored price as it is; once trading, one
+  // about to go stale is refreshed before an order is priced, so an unwind or a close is never refused for it.
+  const oraclePx = unpriced !== undefined ? async () => null : oraclePxOf(ctx.prices, symbol, () => ctx.args.send && ctx.trading);
   const relayer = ctx.relayer ?? dryRelayer();
   const evm = ctx.desk.evm_address.toLowerCase();
   const hl = new HlLeg({
@@ -540,7 +434,8 @@ async function buildPair(ctx: Ctx, symbol: string): Promise<Pair> {
   const { mismatches, markets } = await phoenixExchange(ctx);
   const marketConfig = markets.find((m) => m.symbol === symbol);
   if (marketConfig === undefined) throw new Error(`Phoenix has no ${symbol} market`);
-  const diffs = [...mismatches.map((m) => `the Phoenix exchange differs from the pinned accounts: ${m}`), ...marketMismatches(marketConfig, market, spline)];
+  // A close is reduce-only: a market in maintenance or suspended still takes it; the orderbook, lot and tick must match.
+  const diffs = [...mismatches.map((m) => `the Phoenix exchange differs from the pinned accounts: ${m}`), ...marketMismatches(marketConfig, market, spline, { ignoreStatus: closing })];
   return {
     symbol, hl, phoenix, trader, lot: commonLot(hl.lot, phoenix.lot), bandBps: p.price_band_bps, priced: unpriced === undefined, mismatches: diffs,
     marketConfig, maker, microLamports,
@@ -604,9 +499,9 @@ async function open(ctx: Ctx): Promise<void> {
   const since = Date.now() - 7 * 86_400_000;
   const evm = ctx.desk.evm_address.toLowerCase();
 
-  const [hlF, pxF, hlBook, pxBook, hlAccount, state, sp, lamports, assetData] = await Promise.all([
-    hlFunding(ctx, symbol, since), phoenixFunding(ctx, symbol, since), ctx.hl.book(symbol, 5), ctx.phoenix.book(symbol, 5), ctx.hl.account(evm),
-    traderState(ctx), storedPrice(ctx, symbol), ctx.chain.balance(ctx.sol.authority),
+  const [hlF, pxF, hlBook, pxBook, hlState, state, sp, lamports, assetData] = await Promise.all([
+    hlFunding(ctx, symbol, since), phoenixFunding(ctx, symbol, since), ctx.hl.book(symbol, 5), ctx.phoenix.book(symbol, 5),
+    hlInfo<unknown>(ctx, { type: 'clearinghouseState', user: evm }), traderState(ctx), storedPrice(ctx.client, symbol), ctx.chain.balance(ctx.sol.authority),
     hlInfo<{ leverage?: { type?: string; value?: number } }>(ctx, { type: 'activeAssetData', user: evm, coin: symbol }).catch(() => null),
   ]);
   const registered = state !== null && state !== 'uninitialized';
@@ -627,14 +522,17 @@ async function open(ctx: Ctx): Promise<void> {
   const size = floorToLot(toQty((legUsd / mid).toFixed(8)), pair.lot);
   if (size === 0n) refusals.push(`${usd(legUsd)} at ${mid.toFixed(4)} is under one common lot ${qtyString(pair.lot)}`);
   const builderBps = (ctx.config.fees?.hl_builder_tenth_bps ?? 0) / 10;
+  // Cross margin on both venues, open notional at the mark: what liquidation and the effective leverage run on.
+  const hlC = hlCross(hlState);
+  const pxC = pxAccount === null ? { equityUsd: 0, maintenanceUsd: 0, notionalUsd: 0 } : phoenixCross(pxAccount);
   const pxLotsAfter = (toQty(String(Math.abs(pxAccount?.positions.find((p) => p.symbol === symbol)?.size ?? 0))) + size) / pair.phoenix.lot;
   const short: CarryLegInput = {
     venue: 'hyperliquid', ratePerHour: hlF.now, rate7dPerHour: hlF.mean7d ?? hlF.now, takerBps: HL_TAKER_BPS + builderBps, halfSpreadBps: halfSpreadBps(hlBid, hlAsk),
-    equityUsd: hlAccount.equityUsd, maintenanceUsd: hlAccount.maintenanceMarginUsd, notionalUsd: notionalAtEntry(hlAccount.positions), maintenanceRate: 1 / (2 * hlF.maxLeverage),
+    equityUsd: hlC.equityUsd, maintenanceUsd: hlC.maintenanceUsd, notionalUsd: hlC.notionalUsd, maintenanceRate: 1 / (2 * hlF.maxLeverage),
   };
   const long: CarryLegInput = {
     venue: 'phoenix', ratePerHour: pxF.now ?? 0, rate7dPerHour: pxF.mean7d ?? pxF.now ?? 0, takerBps: pair.marketConfig.takerFee * 10_000, halfSpreadBps: halfSpreadBps(pxBid, pxAsk),
-    equityUsd: pxAccount?.equityUsd ?? 0, maintenanceUsd: pxAccount?.maintenanceMarginUsd ?? 0, notionalUsd: notionalAtEntry(pxAccount?.positions ?? []),
+    equityUsd: pxC.equityUsd, maintenanceUsd: pxC.maintenanceUsd, notionalUsd: pxC.notionalUsd,
     maintenanceRate: phoenixMaintenanceRate(pair.marketConfig, pxLotsAfter),
   };
   const plan = carryPlan({ symbol, legUsd, leverage, holdDays, basisBufferBps: basisBps, short, long });
@@ -660,10 +558,10 @@ async function open(ctx: Ctx): Promise<void> {
   say(`size      ${qtyString(size)} ${symbol} per leg (${usd(qtyNumber(size) * mid)} at ${mid.toFixed(4)}); common lot ${qtyString(pair.lot)}`);
   say(`          ${parts} pair part(s) of at most ${chunk === null ? '?' : qtyString(chunk)} (policy max_notional_usd ${policy.max_notional_usd} less the ${pair.bandBps} bps band)`);
   say(`leverage  Hyperliquid ${symbol}: ${assetData?.leverage === undefined ? 'unknown' : `${assetData.leverage.type} ${assetData.leverage.value}x`} on the account (the contract cannot set it); effective leverage is what is checked`);
-  say(`price     stored ${symbol} ${sp === null ? 'none' : `${sp.px}, ${Math.round(sp.ageS)} s old`}; --send refreshes it before each part when it would not live ${pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S} s more (of ${policy.oracle_max_age_s})`);
+  say(`price     stored ${symbol} ${sp === null ? 'none' : `${sp.px}, ${Math.round(sp.ageS)} s old`}; --send refreshes it before each part when it would not live ${pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S} s more (a fresh one lives ${priceLifeS(policy.oracle_max_age_s)} s of the ${policy.oracle_max_age_s})`);
   say(`solana    authority ${solText(lamports)}; up to ${solText(solNeed)} needed (unit price ${pair.microLamports} µlamports)`);
   for (const l of sim.lines) say(l);
-  say(`order     maker first: Hyperliquid SELL post-only at the ask, repriced every ${pair.maker.repriceMs / 1000} s, at most ${pair.maker.maxOrders} signed post-only orders (the C10 meter counts each), for ${pair.maker.timeoutMs / 1000} s${pair.maker.takerFallback ? ', then an IOC for the rest' : ', no taker fallback (--taker-fallback to add one)'}; then Phoenix BUY IOC for what filled`);
+  say(`order     maker first: Hyperliquid SELL post-only at the ask, repriced every ${pair.maker.repriceMs / 1000} s, at most ${pair.maker.maxOrders} signed post-only orders for the whole open (the C10 meter counts each), for ${pair.maker.timeoutMs / 1000} s${pair.maker.takerFallback ? ', then an IOC for the rest' : ', no taker fallback (--taker-fallback to add one)'}; then Phoenix BUY IOC for what filled`);
 
   if (!ctx.args.send) {
     for (const r of refusals) say(`would refuse at --send: ${r}`);
@@ -672,17 +570,18 @@ async function open(ctx: Ctx): Promise<void> {
     return;
   }
   if (refusals.length > 0) throw new Error(`open --send refused, nothing signed: ${refusals.join('; ')}`);
+  ctx.trading = true;
   await approveBuilderFee(ctx);
   try {
     const results = await pair.trader.openInChunks({
       size, longIndex: 1, reason: `pair-mainnet: carry ${symbol}, short hyperliquid, long phoenix`, maker: { index: 0 },
       beforePart: async () => {
-        if (pair.priced) await ensureFresh(ctx, symbol, pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S);
+        if (pair.priced) await ensureFresh(ctx.prices, symbol, pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S);
       },
     });
     for (const r of results) printResult('open', r);
   } finally {
-    await finish(pair);
+    await finish(ctx, pair);
   }
 }
 
@@ -690,10 +589,10 @@ async function close(ctx: Ctx): Promise<void> {
   const symbolArg = ctx.args.positional[0];
   if (symbolArg === undefined) throw new UsageError('close needs <symbol>');
   const symbol = symbolArg.toUpperCase();
-  const pair = await buildPair(ctx, symbol);
-  const [hlPos, pxPos, sp, lamports] = await Promise.all([pair.hl.position(), pair.phoenix.position(), storedPrice(ctx, symbol), ctx.chain.balance(ctx.sol.authority)]);
+  const pair = await buildPair(ctx, symbol, true);
+  const [hlPos, pxPos, sp, lamports] = await Promise.all([pair.hl.position(), pair.phoenix.position(), storedPrice(ctx.client, symbol), ctx.chain.balance(ctx.sol.authority)]);
   say(`positions hyperliquid ${symbol} ${signedQtyString(hlPos)}, phoenix ${symbol} ${signedQtyString(pxPos)}${hlPos + pxPos === 0n ? ' (hedged)' : ' (NOT offsetting)'}`);
-  say(`order     both reduce-only: Hyperliquid post-only at the touch (every ${pair.maker.repriceMs / 1000} s, at most ${pair.maker.maxOrders}, ${pair.maker.timeoutMs / 1000} s${pair.maker.takerFallback ? ', then IOC' : ''}), then Phoenix IOC for what it closed; the rest by IOC`);
+  say(`order     both reduce-only: Hyperliquid post-only at the touch (every ${pair.maker.repriceMs / 1000} s, at most ${pair.maker.maxOrders} for the close, ${pair.maker.timeoutMs / 1000} s${pair.maker.takerFallback ? ', then IOC' : ''}), then Phoenix IOC for what it closed; the rest by IOC`);
   say(`price     stored ${symbol} ${sp === null ? 'none' : `${sp.px}, ${Math.round(sp.ageS)} s old`}; --send refreshes it when an order finds it stale`);
   const refusals: string[] = [...pair.mismatches];
   if (hlPos === 0n && pxPos === 0n) refusals.push('nothing to close: both legs are flat');
@@ -706,12 +605,13 @@ async function close(ctx: Ctx): Promise<void> {
     return;
   }
   if (refusals.length > 0) throw new Error(`close --send refused, nothing signed: ${refusals.join('; ')}`);
+  ctx.trading = true;
   await approveBuilderFee(ctx);
   try {
-    if (pair.priced) await ensureFresh(ctx, symbol, pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S);
+    if (pair.priced) await ensureFresh(ctx.prices, symbol, pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S);
     printResult('close', await pair.trader.close({ reason: `pair-mainnet: close ${symbol}`, maker: { index: 0 } }));
   } finally {
-    await finish(pair);
+    await finish(ctx, pair);
   }
 }
 
@@ -759,20 +659,49 @@ function printResult(what: string, r: PairResult): void {
 }
 
 /**
- * What stays open when the process ends: a post-only order left unsettled (cancelled by its id once more first), an
+ * What stays open when the process ends: a post-only order left unsettled (cancelled by its id once more first; then
+ * both legs are read again, and Phoenix goes back against Hyperliquid by one IOC when a late fill left it off), an
  * unhedged pair, or an order with no answer that may still run.
  */
-async function finish(pair: Pair): Promise<void> {
+async function finish(ctx: Ctx, pair: Pair): Promise<void> {
   pair.trader.stop();
+  let unhedged = pair.trader.unhedged;
   if (pair.hl.pendingMakerOrders().length > 0) {
     for (const line of await pair.hl.cancelPending('pair-mainnet: exit')) say(`cancel    ${line}`);
-    for (const p of pair.hl.pendingMakerOrders()) {
+    const left = pair.hl.pendingMakerOrders();
+    for (const p of left) {
       openLines.push(`open:     hyperliquid post-only ${p.side} ${p.size} ${pair.symbol} (oid ${p.oid ?? 'unknown'}, cloid ${p.cloid}) may still rest and fill: cancel it on Hyperliquid and reconcile both legs`);
       process.exitCode = 3;
     }
+    const read = await readLegs(pair);
+    if (read === null) {
+      unhedged = `the legs cannot be read after the cancel: check hyperliquid and phoenix ${pair.symbol} by hand`;
+    } else {
+      say(`positions after the cancel: hyperliquid ${pair.symbol} ${signedQtyString(read.hl)}, phoenix ${pair.symbol} ${signedQtyString(read.px)}${read.hl + read.px === 0n ? ' (hedged)' : ' (NOT offsetting)'}`);
+      let now = read;
+      // Every post-only order settled and nothing on Phoenix with no answer: Phoenix can follow the late fill.
+      const hedge = residualHedge(read.hl, read.px, pair.phoenix.lot);
+      if (hedge !== null && left.length === 0 && pair.trader.unsettled(pair.phoenix) === null && ctx.args.send && ctx.trading) {
+        say(`hedge     phoenix ${hedge.side} ${qtyString(hedge.size)}${hedge.reduceOnly ? ' reduce-only' : ''}: back against hyperliquid ${signedQtyString(read.hl)}`);
+        const out = await pair.phoenix.order(hedge.side, hedge.size, hedge.reduceOnly, `pair-mainnet: hedge ${pair.symbol} after a late maker fill`);
+        say(`          ${out.kind}${out.kind === 'filled' ? ` ${qtyString(out.filled)}` : ` (${out.error.message})`}${out.ref.tx.length === 0 ? '' : ` ${refs(out.ref.tx)}`}`);
+        if (out.kind === 'unknown') {
+          openLines.push(`open:     the phoenix hedge ${hedge.side} ${qtyString(hedge.size)} ${pair.symbol} (${out.ref.orderId ?? 'no signature'}) has no proven outcome: check Phoenix by hand before sending another`);
+          process.exitCode = 3;
+        }
+        now = (await readLegs(pair)) ?? now;
+        say(`positions hyperliquid ${pair.symbol} ${signedQtyString(now.hl)}, phoenix ${pair.symbol} ${signedQtyString(now.px)}`);
+      }
+      const off = now.hl + now.px;
+      if (off !== 0n) {
+        unhedged = `unhedged: hyperliquid ${pair.symbol} ${signedQtyString(now.hl)}, phoenix ${pair.symbol} ${signedQtyString(now.px)}: ${qtyString(off > 0n ? off : -off)} ${pair.symbol} ${off > 0n ? 'long' : 'short'} is not offset`;
+      } else if (left.length === 0) {
+        unhedged = null;
+      }
+    }
   }
-  if (pair.trader.unhedged !== null) {
-    openLines.push(`open:     ${pair.trader.unhedged}`);
+  if (unhedged !== null) {
+    openLines.push(`open:     ${unhedged}`);
     process.exitCode = 3;
   }
   for (const leg of pair.trader.legs) {
@@ -781,6 +710,17 @@ async function finish(pair: Pair): Promise<void> {
     const orders = u.refs.map((ref) => `${ref.side} ${ref.size}${ref.reduceOnly ? ' reduce-only' : ''} (${ref.clientId ?? ref.orderId ?? 'no id'})`).join(' and ');
     openLines.push(`open:     ${leg.venue} ${orders} has no answer and may still run until ${new Date(u.until).toISOString()}: check ${leg.venue} ${leg.symbol} by hand until then`);
     process.exitCode = 3;
+  }
+}
+
+/** Both legs' positions now, or null (with the reason printed) when either cannot be read. */
+async function readLegs(pair: Pair): Promise<{ hl: bigint; px: bigint } | null> {
+  try {
+    const [hl, px] = await Promise.all([pair.hl.position(), pair.phoenix.position()]);
+    return { hl, px };
+  } catch (err) {
+    say(`positions cannot be read: ${errorMessage(err)}`);
+    return null;
   }
 }
 

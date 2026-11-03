@@ -169,6 +169,8 @@ interface LegRun {
    */
   unsettled: LegOutcome | null;
   unsettledFrom: bigint | null;
+  /** The hedge of a maker leg's known fill that an order with no answer stopped: #halt does not unwind it. */
+  keep?: boolean;
   report: LegReport;
 }
 
@@ -255,7 +257,10 @@ export class PairTrader {
    * (rounded down to the common lot; the first leg's excess is closed reduce-only), so the pair may open smaller.
    */
   open(request: { size: bigint | number | string; longIndex: 0 | 1; reason: string; maker?: MakerFirst }): Promise<PairResult> {
-    return this.#serial(() => this.#open(request));
+    return this.#serial(() => {
+      this.#beginMaker(request.maker);
+      return this.#open(request);
+    });
   }
 
   /**
@@ -284,7 +289,13 @@ export class PairTrader {
           break;
         }
       }
-      const r = await this.open({ longIndex: request.longIndex, ...(request.maker === undefined ? {} : { maker: request.maker }), size, reason: parts === 1 ? request.reason : `${request.reason} (part ${i} of ${parts})` });
+      const part = { longIndex: request.longIndex, ...(request.maker === undefined ? {} : { maker: request.maker }), size, reason: parts === 1 ? request.reason : `${request.reason} (part ${i} of ${parts})` };
+      // One maker budget for the whole open, every part and move included: begun with the first part.
+      const first = i === 1;
+      const r = await this.#serial(() => {
+        if (first) this.#beginMaker(request.maker);
+        return this.#open(part);
+      });
       results.push(r);
       const opened = toQty(r.size);
       if (r.status !== 'open' || opened < size) break;
@@ -315,7 +326,15 @@ export class PairTrader {
    * sends can open or grow a position (the ADL response): the pair is then left stuck or unhedged, with the alert.
    */
   close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean; maker?: MakerFirst }): Promise<PairResult> {
-    return this.#serial(() => this.#close(request));
+    return this.#serial(() => {
+      this.#beginMaker(request.maker);
+      return this.#close(request);
+    });
+  }
+
+  /** A pair operation with a maker leg starts that leg's budget of post-only orders (TradeLeg.beginMakerOperation). */
+  #beginMaker(maker: MakerFirst | undefined): void {
+    if (maker !== undefined) this.legs[maker.index].beginMakerOperation?.();
   }
 
   /**
@@ -441,14 +460,18 @@ export class PairTrader {
    * what the maker leg actually filled, rounded down to the common lot; a fill past that (a finer lot) is closed
    * reduce-only first. Both targets are set to the hedge, so the legging guard after it works on the real size.
    * Returns the hedge size (0: nothing to hedge), or null when the maker leg stopped on an unsettled order or a lost
-   * position (the caller halts: its partner has not moved).
+   * position (the caller halts). On an unsettled order, what its filled parts are known to have filled is hedged
+   * first (#hedgeKnownFill), and that hedge is kept; otherwise the partner has not moved.
    */
   async #makerFirstOpen(runs: [LegRun, LegRun], index: 0 | 1, size: bigint, reason: string, notes: string[]): Promise<bigint | null> {
     const first = runs[index];
     const second = runs[index === 0 ? 1 : 0];
     if (first.leg.makerOrder === undefined) throw new Error(`${first.leg.venue} has no maker order`);
     await this.#makerMove(first, first.target, false, `${reason} (maker)`, 'open');
-    if (this.#stopped([first], notes)) return null;
+    if (this.#stopped([first], notes)) {
+      await this.#hedgeKnownFill(first, second, false, reason, notes);
+      return null;
+    }
     const moved = first.pos! - first.start;
     const dir = first.target > first.start ? 1n : -1n;
     if (moved * dir < 0n) {
@@ -566,7 +589,11 @@ export class PairTrader {
     const second = runs[index === 0 ? 1 : 0];
     if (first.leg.makerOrder === undefined) throw new Error(`${first.leg.venue} has no maker order`);
     await this.#makerMove(first, first.target, true, `${reason} (maker)`, 'close');
-    if (this.#stopped([first], notes) || second.pos === null || second.pos === second.target) return;
+    if (this.#stopped([first], notes)) {
+      await this.#hedgeKnownFill(first, second, true, reason, notes);
+      return;
+    }
+    if (second.pos === null || second.pos === second.target) return;
     const closed = abs(first.pos! - first.start);
     if (first.pos === first.target) {
       await this.#move(second, second.target, true, reason, 'close');
@@ -581,6 +608,37 @@ export class PairTrader {
     const to = abs(second.target - second.start) <= match ? second.target : second.start + dir * match;
     notes.push(`the maker leg ${first.leg.venue} closed ${qtyString(closed)} of ${qtyString(abs(first.target - first.start))}: ${second.leg.venue} closes ${qtyString(abs(to - second.start))} to match`);
     await this.#move(second, to, true, reason, 'close');
+  }
+
+  /**
+   * A maker leg stopped by an order with no answer after parts of it filled: what those parts filled is known (the
+   * order with no answer can only add to it), so the partner goes as one IOC for that much, rounded down to the
+   * common lot on an open (reduce-only, in the partner's lots, on a close). The order with no answer stays watched,
+   * and its watch reconciles what it fills later. The hedge is marked kept: #halt does not unwind it.
+   */
+  async #hedgeKnownFill(first: LegRun, second: LegRun, closing: boolean, reason: string, notes: string[]): Promise<void> {
+    if (first.unsettled === null || first.pos === null || first.unsettledFrom === null) return;
+    if (second.pos === null || second.unsettled !== null) return;
+    const known = first.unsettledFrom - first.start;
+    const dir = first.target > first.start ? 1n : -1n;
+    if (known * dir <= 0n) return;
+    const hedge = floorToLot(abs(known), closing ? second.leg.lot : this.lot);
+    if (hedge === 0n) {
+      notes.push(`the maker leg ${first.leg.venue} filled ${qtyString(abs(known))} before an order with no answer, under one lot of the hedge: ${second.leg.venue} does not trade`);
+      return;
+    }
+    let to: bigint;
+    if (closing) {
+      const sdir = second.target > second.start ? 1n : -1n;
+      if (second.target === second.start) return;
+      to = abs(second.target - second.start) <= hedge ? second.target : second.start + sdir * hedge;
+    } else {
+      to = second.start - dir * hedge;
+      second.target = to;
+    }
+    second.keep = true;
+    notes.push(`the maker leg ${first.leg.venue} filled ${qtyString(abs(known))} before an order with no answer: ${second.leg.venue} ${closing ? 'closes' : 'hedges'} ${qtyString(abs(to - second.start))} of it now; the order with no answer stays watched`);
+    await this.#move(second, to, closing, `${reason} (hedge of the known fill)`, closing ? 'close' : 'open');
   }
 
   /**
@@ -601,7 +659,7 @@ export class PairTrader {
       if (u !== undefined) u.unwind = { to: other!.start, reason, failed: false };
       return result;
     }
-    const others = runs.filter((r) => r.unsettled === null);
+    const others = runs.filter((r) => r.unsettled === null && r.keep !== true);
     for (const r of others) r.target = r.start;
     for (let attempt = 0; attempt < 2; attempt++) {
       const off = others.filter((r) => r.pos !== null && r.pos !== r.start);
@@ -723,7 +781,7 @@ export class PairTrader {
         // A maker order is several orders, and the one that ended with no answer and no expiry may still rest and fill
         // after the parts that did: a position that moved by those parts does not show it ran. Always unsettled, from
         // where the filled parts left the leg, so the partner is never sized past what is known and the watch sees it.
-        if (out.kind === 'unknown' && out.expiresAt === null && r.unsettled === null) {
+        if (out.kind === 'unknown' && out.expiresAt === null) {
           const partsFilled = (out.parts ?? []).reduce((acc, p) => acc + (p.kind === 'filled' ? p.filled : 0n), 0n);
           r.unsettled = out;
           r.unsettledFrom = from + (side === 'BUY' ? partsFilled : -partsFilled);

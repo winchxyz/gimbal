@@ -872,26 +872,37 @@ node --env-file=... engine/src/cli/pair-mainnet.ts close ETH
   command says how much more to send.
 - Before the first deposit the desk's Phoenix trader must be registered (`phoenix_register` in the venue setup,
   signed with `sol_sign_register`). `defund-phoenix all` refuses while Phoenix holds a position; an amount must leave
-  the open leg under its leverage cap and more than 40 % from liquidation.
+  the cross subaccount under the leverage cap and more than 40 % from liquidation, valued at the mark. Only a trader
+  proven unregistered skips the check: a trader state or account that cannot be read refuses the withdrawal.
 - `open` prints both legs' funding (now and the 7-day mean), the gross APR, the spread expected over `--hold-days`
   against the round trip (taker fees, half spreads, `--basis-bps`), the size, the effective leverage and the
   liquidation distance per leg, and simulates the Phoenix IOC unsigned. It refuses when the spread does not cover the
   round trip, a leg is 40 % or less from liquidation, legUsd is over `max_notional_usd` less the band (19.80 at 20 and
   100 bps), the IOC simulation fails or uses more than 560k units, the policy's Phoenix market differs from the
-  exchange's (orderbook, spline, lot, tick), or the Hyperliquid coin is not in cross margin.
+  exchange's (orderbook, spline, lot, tick) or the market is not active, or the Hyperliquid coin is not in cross
+  margin. Equity, maintenance and open notional are the cross margin of each venue, notional at the mark. `close`
+  takes a market in maintenance or suspended (its orders are reduce-only), never an orderbook, lot or tick mismatch.
 - Leverage: the contract has no update-leverage action, so Hyperliquid keeps the account's own setting. What is
   checked is each leg's effective leverage, (notional already open + legUsd) / equity: at most `--leverage` (2 or
   less), and at most 1.5 on a venue without a live rescue (`LIVE_RESCUE` in `engine/src/trade/carry-plan.ts`:
   Phoenix until the Phoenix -> Hyperliquid rescue merges).
-- The Hyperliquid short goes first as post-only limits at the touch: repriced every `--reprice-s` (30 or more), at
-  most `--max-orders` signed post-only orders (6 or fewer: from C10 the contract meters signed notional that is not
-  reduce-only per rolling hour, and every reprice counts), for `--maker-timeout-s` (default 180); an IOC for the rest
-  only with `--taker-fallback`. The Phoenix long follows as one IOC for what filled. `close` does the same
-  reduce-only, and what the maker leg leaves goes to the close's IOC retry.
-- The stored price is refreshed (`refresh_prices`) before each part when it would not live the maker timeout plus
-  240 s more, and whenever an order (an unwind, a close) finds it within 30 s of `oracle_max_age_s`.
+- The Hyperliquid short goes first as post-only limits at the touch: placed at most every `--reprice-s` (30 or more,
+  after a crossing refusal too), at most `--max-orders` signed post-only orders for the whole open or close, over all
+  its parts (6 or fewer: from C10 the contract meters signed notional that is not reduce-only per rolling hour, and
+  every reprice counts), for `--maker-timeout-s` (default 120); an IOC for the rest only with `--taker-fallback`. The
+  Phoenix long follows as one IOC for what filled. When the maker order ends with a post-only order that has no
+  answer, Phoenix still buys what the settled parts filled (whole common lots), and the watch keeps the rest. `close`
+  does the same reduce-only, and what the maker leg leaves goes to the close's IOC retry.
+- A stored price's `at_ms` is the oracle's timestamp less its 600 s recency, so a price fresh from `refresh_prices`
+  lives `oracle_max_age_s` - 600 s (300 s at 900). The maker timeout plus 120 s must fit that, or the command
+  refuses (`--maker-timeout-s 180` at most with 900). The price is refreshed only after the refusals are checked:
+  before each part when it would not live the maker timeout plus 120 s more (and checked against the same margin
+  after), and whenever an order (an unwind, a close) finds it within 30 s of `oracle_max_age_s`; never twice within
+  30 s, since the contract skips that refresh.
 - An outcome that cannot be proven ends with `open:` lines (exit code 3): reconcile those before running again. A
-  post-only order whose state could not be settled is cancelled by its id once more before the process ends.
+  post-only order whose state could not be settled is cancelled by its id once more before the process ends; both
+  legs are then read again and printed, Phoenix is brought back against Hyperliquid by one IOC when a late fill left
+  it off by a whole lot, and what stays unhedged is printed exactly.
 
 ## Files the scripts write
 

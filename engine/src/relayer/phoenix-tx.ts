@@ -232,10 +232,13 @@ export interface SnapshotMarket {
  * Where a policy market differs from the live exchange's: its orderbook and spline, and its lot and tick. Phoenix
  * prices in quote lots of 1e-6 USD per base lot of 10^-baseLotsDecimals units, so base_lot_e8 must be
  * 10^(8 - baseLotsDecimals) and tick_e8 (USD x 1e8 per base unit per tick) tickSize x 10^(baseLotsDecimals + 2):
- * ETH, 3 decimals and tickSize 100, is 0.001 ETH a lot and 0.1 USD a tick. Empty when they agree.
+ * ETH, 3 decimals and tickSize 100, is 0.001 ETH a lot and 0.1 USD a tick. A market that is not active is named
+ * too, unless `ignoreStatus` (a close: reduce-only orders are what a market in maintenance or suspended still
+ * needs to take). Empty when they agree.
  */
 export function marketMismatches(
   live: SnapshotMarket | undefined, policy: { symbol: string; orderbook: string; base_lot_e8: number; tick_e8: number }, spline?: string,
+  options: { ignoreStatus?: boolean } = {},
 ): string[] {
   const name = `phoenix ${policy.symbol}`;
   if (live === undefined) return [`${name}: the exchange lists no such market`];
@@ -252,6 +255,6 @@ export function marketMismatches(
   const tickE8 = tickSize * 10 ** (decimals + 2);
   if (policy.base_lot_e8 !== lotE8) out.push(`${name}: the policy's base_lot_e8 is ${policy.base_lot_e8}, the exchange's lot ${lotE8}`);
   if (policy.tick_e8 !== tickE8) out.push(`${name}: the policy's tick_e8 is ${policy.tick_e8}, the exchange's tick ${tickE8}`);
-  if (live.marketStatus !== undefined && live.marketStatus !== 'active') out.push(`${name}: the market is ${String(live.marketStatus)}`);
+  if (options.ignoreStatus !== true && live.marketStatus !== undefined && live.marketStatus !== 'active') out.push(`${name}: the market is ${String(live.marketStatus)}`);
   return out;
 }

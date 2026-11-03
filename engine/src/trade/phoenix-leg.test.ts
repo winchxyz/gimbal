@@ -62,6 +62,7 @@ interface Fake {
   sign?: (build: SolanaMessageBuilder) => Promise<TxRef[]>;
   slot?: number | null;
   landed?: number | null;
+  current?: number;
   pastHeight?: boolean;
   oracle?: number | null;
   best?: { BUY: number; SELL: number };
@@ -85,7 +86,8 @@ function leg(f: Fake) {
   const waits: number[] = [];
   const l = new PhoenixLeg({
     relayer,
-    chain: { latestBlockhash: async () => ({ blockhash: BLOCKHASH, lastValidBlockHeight: 900 }), signatureSlot: async () => (f.slot === undefined ? 500 : f.slot) },
+    chain: { latestBlockhash: async () => ({ blockhash: BLOCKHASH, lastValidBlockHeight: 900 }), signatureSlot: async () => (f.slot === undefined ? 500 : f.slot),
+      ...(f.current === undefined ? {} : { currentSlot: async () => f.current! }) },
     ...(f.landed === undefined ? {} : { landedSlot: () => f.landed ?? null }),
     waitPastLastValidHeight: async (h) => {
       waits.push(h);
@@ -194,7 +196,12 @@ test('outcomes: a refusal and a failed transaction are failed; a landed IOC that
 
   const timeout = leg({ states: [stateWith(null, 400)], sign: async () => { throw new MpcTimeoutError('sol_sign', 'no signature in 60 s'); } });
   const g = await timeout.leg.order('BUY', toQty('0.005'), false, 'open');
-  assert.ok(g.kind === 'failed' && g.error instanceof MpcTimeoutError, 'the relayer hands a timeout on only past the blockhash: failed');
+  // A late signature can still be posted while the blockhash lives: unknown until the chain is past it.
+  assert.ok(g.kind === 'unknown' && g.error instanceof MpcTimeoutError && g.expiresAt !== null, 'a timeout is no proof: unknown, read past the blockhash');
+  assert.deepEqual(timeout.waits, [900], 'the wait is on the lastValidBlockHeight of the signed message');
+  const stuck = leg({ states: [stateWith(null, 400)], sign: async () => { throw new MpcTimeoutError('sol_sign', 'no signature in 60 s'); }, pastHeight: false });
+  const h = await stuck.leg.order('BUY', toQty('0.005'), false, 'open');
+  assert.ok(h.kind === 'unknown' && h.expiresAt === null, 'not proven past the blockhash: unsettled');
 });
 
 test('a landed IOC whose slot is unknown is unknown with no expiry, never failed: a stale snapshot shows no move', async () => {
@@ -208,6 +215,10 @@ test('a landed IOC whose slot is unknown is unknown with no expiry, never failed
   const g = leg({ states: [stateWith(null, 400), stateWith(null, 400), stateWith(null, 640), stateWith('5', 700)], slot: null, landed: 700 });
   const filled = await g.leg.order('BUY', toQty('0.005'), false, 'open');
   assert.deepEqual([filled.kind, filled.kind === 'filled' && filled.filled], ['filled', toQty('0.005')]);
+  // No slot from either, but the chain's confirmed slot now is a lower bound: a snapshot at or past it shows the fill.
+  const c = leg({ states: [stateWith(null, 400), stateWith(null, 700), stateWith('5', 800)], slot: null, current: 800 });
+  const bounded = await c.leg.order('BUY', toQty('0.005'), false, 'open');
+  assert.deepEqual([bounded.kind, bounded.kind === 'filled' && bounded.filled], ['filled', toQty('0.005')], 'the snapshot at 700 is before the bound: skipped');
 });
 
 test('after an order with no answer, the slot where its blockhash expired is the oldest snapshot trusted', async () => {

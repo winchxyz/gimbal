@@ -20,6 +20,7 @@ class Leg implements TradeLeg {
   readonly lot: bigint;
   readonly replayable = false;
   pos = 0n;
+  begins = 0;
   readonly log: string[];
   readonly iocs: Answer[];
   readonly makers: Answer[];
@@ -44,6 +45,9 @@ class Leg implements TradeLeg {
   }
   order(side: LegSide, size: bigint, reduceOnly: boolean): Promise<LegOutcome> {
     return this.#answer('ioc', this.iocs.shift() ?? { fill: 'all' }, side, size, reduceOnly);
+  }
+  beginMakerOperation(): void {
+    this.begins++;
   }
   makerOrder(side: LegSide, size: bigint, reduceOnly: boolean): Promise<LegOutcome> {
     return this.#answer('maker', this.makers.shift() ?? { fill: 'all' }, side, size, reduceOnly);
@@ -136,18 +140,44 @@ test('an open over the cap is split into whole pairs under the cap less the band
   const results = await p.trader.openInChunks({ size: '0.012', longIndex: 1, reason: 'carry', maker: { index: 0 } });
   assert.deepEqual(results.map((r) => [r.status, r.size]), [['open', '0.007'], ['open', '0.005']]);
   assert.deepEqual([p.a.pos, p.b.pos], [toQty('-0.012'), toQty('0.012')]);
+  assert.deepEqual([p.a.begins, p.b.begins], [1, 0], 'one maker budget for the whole open, on the maker leg');
+  await p.trader.close({ reason: 'close', maker: { index: 0 } });
+  assert.equal(p.a.begins, 2, 'a close is an operation of its own');
 });
 
-test('a maker leg that partly filled, then lost an order with no expiry: unsettled whatever it reads, the partner never trades', async () => {
-  for (const late of [undefined, '0.001']) {
+test('a maker leg that partly filled, then lost an order with no expiry: the known fill is hedged, the lost order watched', async () => {
+  // Hyperliquid filled 0.002 in parts, then an order with no answer: Phoenix buys the known 0.002 (whole common lots).
+  // Read with nothing more: hedged, stuck. Read when the lost order already filled 0.001 more: that 0.001 is open.
+  for (const [late, status] of [[undefined, 'stuck'], ['0.001', 'unhedged']] as const) {
     const p = pair({ makers: [{ partial: '0.002', ...(late === undefined ? {} : { late }) }] }, {});
     const r = await p.trader.open({ size: '0.005', longIndex: 1, reason: 'carry', maker: { index: 0 } });
-    assert.equal(r.status, 'unhedged', `late ${late}`);
-    assert.deepEqual(p.log, ['hyperliquid maker SELL 0.005'], 'Phoenix is not sized to a fill that may still grow');
+    assert.equal(r.status, status, `late ${late}`);
+    assert.deepEqual(p.log, ['hyperliquid maker SELL 0.005', 'phoenix ioc BUY 0.002'], 'Phoenix is sized to the known fill, never to what may still grow');
+    assert.equal(p.b.pos, toQty('0.002'), 'the hedge is kept, not unwound');
     assert.notEqual(p.trader.unsettled(p.a), null, 'watched: the lost order may still fill');
     assert.ok(r.notes.some((n) => /no answer and no expiry/.test(n)));
-    assert.notEqual(p.trader.unhedged, null);
+    assert.ok(r.notes.some((n) => /filled 0\.002 before an order with no answer/.test(n)));
+    assert.equal(p.trader.unhedged === null, status === 'stuck');
   }
+});
+
+test('a known maker fill under one common lot is not hedged: unhedged, and the partner never trades', async () => {
+  const p = pair({ makers: [{ partial: '0.0004' }] }, {});
+  const r = await p.trader.open({ size: '0.005', longIndex: 1, reason: 'carry', maker: { index: 0 } });
+  assert.equal(r.status, 'unhedged');
+  assert.deepEqual(p.log, ['hyperliquid maker SELL 0.005']);
+  assert.ok(r.notes.some((n) => /under one lot of the hedge/.test(n)));
+});
+
+test('a maker close that partly closed, then lost an order: the partner closes the known part reduce-only', async () => {
+  const p = pair({ makers: [{ partial: '0.002' }] }, {});
+  p.a.pos = toQty('-0.005');
+  p.b.pos = toQty('0.005');
+  const r = await p.trader.close({ reason: 'close', maker: { index: 0 } });
+  assert.deepEqual(p.log, ['hyperliquid maker BUY 0.005 ro', 'phoenix ioc SELL 0.002 ro']);
+  assert.deepEqual([p.a.pos, p.b.pos], [toQty('-0.003'), toQty('0.003')]);
+  assert.equal(r.status, 'stuck', 'hedged: what is left offsets, the lost order watched');
+  assert.notEqual(p.trader.unsettled(p.a), null);
 });
 
 test('a stale price mid-pair: the hook before each part refreshes it; one that fails stops the open before that part', async () => {
