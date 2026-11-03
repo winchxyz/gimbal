@@ -1027,6 +1027,31 @@ private API, which serve does not open). Not built: Hyperliquid → Orderly (Arb
 signing; about 1.65 USDC sent). `npm run rescue-dry -w engine -- --mainnet --contract <id> --desk <id>` prints both
 Phoenix routes for a desk, keyless: the plan, 1Click's dry quote, the message simulated unsigned and every refusal.
 
+**Rescuer state** (`engine/src/rescue/state.ts`). On mainnet the rescuer keeps its holds, an OutcomeUnknown, the USDC
+its own `hl_withdraw`s left on Arbitrum, a withdraw on its way, the rescue cap's sliding hour and the ledger entries
+and logs already matched in one file per desk: `rescue-mainnet-<contract>-<desk>-<desk evm>.json` in
+`GIMBAL_STATE_DIR` (default the per-user state directory, `%LOCALAPPDATA%/gimbal/state`, else
+`$XDG_STATE_HOME/gimbal` or `~/.local/state/gimbal`). It is written atomically before every signature and withdraw
+(no save, no signature) and after every change; it holds nothing secret. serve prints the path at start (`holds and
+the cap meter kept in ...`) and, when it loads the file, `rescuer state loaded from ...: N held transfer(s), an unknown
+outcome, ...`. Off mainnet the recorded worlds keep their holds in memory.
+- **A persisted OutcomeUnknown** (`"unknown"` in the file: a sentence naming the rescue and what to reconcile) is
+  saved when a rescue's `hl_withdraw`, or the Phoenix deposit after a reserve → Phoenix delivery, ends with no proven
+  outcome. It survives restarts and holds every transfer (reduces still run) until the owner clears it: reconcile
+  first (for a withdraw, the Hyperliquid ledger and the desk's Arbitrum address; for a deposit, the desk's Solana USDC
+  account and its Phoenix collateral, then `pair-mainnet fund-phoenix` if the USDC still waits), stop serve, set
+  `"unknown"` to `null` in that file and start serve again. A hold is cleared the same way, by deleting its entry
+  from `"holds"`. Do not delete the file to clear either: a missing file holds every transfer (below).
+- **A missing or unusable file** (unreadable, another contract, desk or EVM address, a field a save would not write,
+  a version 1 file) is never taken as "no holds": every transfer is held, reduces still run, nothing is written
+  there, and the start line says `rescuer state missing` or `rescuer state unusable: ...`. After reconciling, the owner
+  repairs the file, or moves it aside and starts once with `GIMBAL_RESCUE_FRESH=<contract>/<desk>`, which writes an
+  empty one (any other value is ignored, and so is the right one over a usable file). serve refuses it while the
+  contract counted a rescue or a `fund_venue` of the desk in the last 65 min, or while the state directory holds a
+  trace of the desk's rescuers (a state file of any EVM address, a temporary file, a copy, or the `.fresh` marker the
+  first refused FRESH writes) under 65 min old: a NEAR call an earlier rescuer sent may land until its quote's
+  signed time + 65 min. A first run counts the rescue cap as used in full, freeing over its first hour.
+
 **The pair in serve (mainnet).** `serve` adopts the carry pair `pair-mainnet open` made from the venues at start
 (`engine/src/cli/serve-pair.ts`: the Hyperliquid and Phoenix legs and the relayer of `pair-mainnet-lib.ts`) and
 holds it in a `PairTrader` behind `ProtectedPair` (`engine/src/trade/protected-pair.ts`). Every order it sends is
@@ -1112,6 +1137,8 @@ retries or rebuilds. In particular:
 - Orderly orders and `withdraw_request`: a timeout, a 5xx or an unclear body is unknown, and `success:false` under
   500 is a refusal.
 - `set_paused` goes out at 30 TGas, outside the signature budget, and is never refused for budget.
+- The rescuer saves an OutcomeUnknown of its own (an `hl_withdraw`, a Phoenix deposit) in its state file, so it
+  survives restarts and holds every transfer until the owner sets `"unknown"` to `null` there ("Rescuer state").
 
 **Record / replay.** `engine/fixtures/replay/<name>.jsonl.gz`, one line per call:
 `{"t": <ms>, "venue": "hyperliquid", "method": "funding", "args": [], "ms": <how long the venue took>, "result": …}`,
