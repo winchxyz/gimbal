@@ -4,8 +4,8 @@
 //   - the signature must verify against keys[0] (the desk authority), or nothing is sent;
 //   - the message must set a compute-unit limit and a priority fee: Phoenix orders need ~190k CU, and public RPCs
 //     drop transactions without a fee. The engine builds messages with computeBudgetInstructions() (400k, 100,000
-//     µlamports per CU). One exception: a paused desk's rescue (kind 'rescue') carries no fee, as the contract
-//     signs none for a paused desk, and is rebroadcast every 500 ms instead;
+//     µlamports per CU). One exception: a rescue (kind 'rescue') may carry no fee (the engine's lean paused-desk
+//     rescue sets none; the contract would sign one for at most 400,000 units) and is then rebroadcast every 500 ms;
 //   - sent with skipPreflight and maxRetries 0, then rebroadcast every 2 s while the status is polled;
 //   - NothingExecuted only with proof: the transaction landed with an error (confirmed), or the chain is past the
 //     message's lastValidBlockHeight (getEpochInfo: a block height and its slot, from one node) AND a history
@@ -148,7 +148,7 @@ export interface SolanaSubmitterOptions {
   fetch?: typeof fetch;
   /** Between rebroadcasts and status polls; default 2 s. */
   rebroadcastMs?: number;
-  /** The same for a rescue with no priority fee (a paused desk's), which RPCs drop more often; default 500 ms. */
+  /** The same for a message with no priority fee (the lean paused rescue), which RPCs drop more often; default 500 ms. */
   feelessRebroadcastMs?: number;
   /** Hard stop even if the RPC never says the blockhash expired; default 150 s. */
   maxWaitMs?: number;
@@ -223,7 +223,8 @@ export class SolanaSubmitter {
     if (!verifyEd25519(parsed.keys[0]!, message, bytes.subarray(1, 65))) {
       throw new Error(`solana ${signed.kind}: the signature does not verify for ${parsed.keys[0]}; nothing sent`);
     }
-    // A paused desk's rescue has no priority fee (the contract signs none for a paused desk): it goes more often.
+    // A rescue may come without a priority fee (the contract signs one on a paused desk too, for at most 400,000
+    // units, but does not require it); a feeless message is rebroadcast more often.
     const feeless = parsed.computeUnitPrice === null || parsed.computeUnitPrice === 0n;
     if (parsed.computeUnitLimit === null || (feeless && signed.kind !== 'rescue')) {
       throw new Error(`solana ${signed.kind}: the message sets no compute-unit limit${signed.kind === 'rescue' ? '' : ' and priority fee'}; public RPCs drop it, nothing sent`);

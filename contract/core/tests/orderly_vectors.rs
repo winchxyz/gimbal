@@ -269,6 +269,7 @@ fn vector_policy() -> Policy {
         max_transfer_cost_flat_e6: 0,
         unpriced: vec![],
         unpriced_max_notional_usd: 0,
+        max_hourly_notional_usd: None,
     }
 }
 
@@ -307,6 +308,7 @@ fn context<'a>(
         reference,
         orderly_key: DESK_ORDERLY_KEY,
         orderly_ips: None,
+        ips_applied: false,
     }
 }
 
@@ -542,6 +544,7 @@ fn ctx_at<'a>(policy: &'a Policy, referral_code: Option<&'a str>) -> Context<'a>
         reference: &vector_price,
         orderly_key: DESK_ORDERLY_KEY,
         orderly_ips: None,
+        ips_applied: false,
     }
 }
 
@@ -1144,4 +1147,57 @@ fn ip_restriction_applies_the_owners_list() {
     ] {
         assert_eq!(refused(check_ip_list(&bad)).code, E_ARGS, "{bad:?}");
     }
+}
+
+/// C10 (B4): on mainnet an order that is not reduce-only needs the owner's IP list (`E_ARGS`),
+/// so no copy of it can be posted from elsewhere once `ip_restriction` applied it; a reduce-only
+/// order and testnet are not held back. C10 round 2: the list set is not enough, the contract
+/// must have signed `ip_restriction` for it (`ips_applied`).
+#[test]
+fn a_mainnet_order_that_grows_a_position_needs_the_ip_list() {
+    let policy = vector_policy();
+    let mainnet = Broker {
+        network: Network::Mainnet,
+        ..testnet()
+    };
+    let ctx = Context {
+        broker: mainnet,
+        ..ctx_at(&policy, None)
+    };
+    let r = build_request(&ctx, &req(eth_buy())).unwrap_err();
+    assert_eq!(r.code, "E_ARGS");
+    assert!(r.msg.contains("set_orderly_ips"), "{}", r.msg);
+    let mut reduce = eth_buy();
+    reduce["reduce_only"] = json!(true);
+    let s = build_request(&ctx, &req(reduce)).unwrap();
+    assert!(s.reduces_risk);
+    let ips = vec!["203.0.113.7".to_string()];
+    let with_ips = Context {
+        orderly_ips: Some(&ips),
+        ..ctx_at(&policy, None)
+    };
+    let with_ips = Context {
+        broker: Broker {
+            network: Network::Mainnet,
+            ..testnet()
+        },
+        ..with_ips
+    };
+    let r = build_request(&with_ips, &req(eth_buy())).unwrap_err();
+    assert_eq!(r.code, "E_ARGS");
+    assert!(r.msg.contains("applied first"), "{}", r.msg);
+    let applied = Context {
+        ips_applied: true,
+        ..with_ips
+    };
+    assert_eq!(
+        build_request(&applied, &req(eth_buy())).unwrap().kind,
+        "order"
+    );
+    assert_eq!(
+        build_request(&ctx_at(&policy, None), &req(eth_buy()))
+            .unwrap()
+            .kind,
+        "order"
+    );
 }

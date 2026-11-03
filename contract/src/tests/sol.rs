@@ -251,6 +251,41 @@ fn sol_sign_returns_the_message_for_the_desk_key() {
     assert_eq!(serde_json::from_str::<UnsignedAction>(&json).unwrap(), got);
 }
 
+/// C1: the desk's Phoenix accounts are the ones its owner set. Moving Phoenix's log authority
+/// refuses the vector deposit, which names the pinned one, and passes it with the new one in its
+/// place.
+#[test]
+fn sol_sign_takes_the_desks_phoenix_accounts() {
+    use crate::settings::PhoenixAccountsJson;
+    use gimbal_core::phoenix::{PhoenixAccounts, PHOENIX_LOG_AUTHORITY};
+    use gimbal_core::solana::{find_program_address, PHOENIX_PROGRAM};
+    let mut g = sol_desk();
+    let deposit = bytes_of(&case(&vectors(), "deposit 15 USDC"));
+    sol_sign(&mut g, &deposit).unwrap();
+    let moved = find_program_address(sha256, &[b"moved"], &PHOENIX_PROGRAM)
+        .unwrap()
+        .0;
+    let mut infra = PhoenixAccounts::PINNED;
+    infra.log_authority = moved;
+    let mut ctx = VMContextBuilder::new();
+    ctx.current_account_id(contract_id())
+        .predecessor_account_id(owner())
+        .attached_deposit(crate::deposit::ONE_YOCTO);
+    testing_env!(ctx.build());
+    g.set_phoenix_accounts("alpha".into(), PhoenixAccountsJson::of(&infra));
+    assert!(sol_sign(&mut g, &deposit)
+        .unwrap_err()
+        .starts_with("E_SOL_ACCOUNT: "));
+    let at = deposit
+        .windows(32)
+        .position(|w| w == PHOENIX_LOG_AUTHORITY)
+        .unwrap();
+    let mut follows = deposit.clone();
+    follows[at..at + 32].copy_from_slice(&moved);
+    let got = sol_sign(&mut g, &follows).unwrap();
+    assert_eq!(got.kind, "deposit");
+}
+
 /// An order on a market the owner listed as unpriced signs without an oracle price, under its
 /// own caps.
 #[test]
@@ -542,4 +577,110 @@ fn sol_methods_refuse_unknown_arguments_and_take_no_deposit() {
             "{method}: {attributes:?}"
         );
     }
+}
+
+/// The vectors' policy with ETH unpriced (max_sz 0.005, 50 USD) and an hourly notional cap.
+fn metered_desk(cap: u64) -> Gimbal {
+    let mut p = sol_policy();
+    p.unpriced = vec![UnpricedAsset {
+        symbol: "ETH".into(),
+        max_sz: "0.005".into(),
+    }];
+    p.unpriced_max_notional_usd = 50;
+    p.max_hourly_notional_usd = Some(cap);
+    let mut g = sol_desk_with(p);
+    // The mock keeps this thread's storage: start the desk's meters from zero.
+    g.desk_counters.insert("alpha".into(), Default::default());
+    g
+}
+
+/// C10 round 2 (item 15): a Phoenix order that is not reduce-only counts against
+/// `max_hourly_notional_usd` (here at the unpriced floor, 50 USD for 0.005 ETH of a 0.005 max_sz)
+/// and is `E_SIZE` over it, counting nothing; a reduce-only one counts nothing and passes a full
+/// meter.
+#[test]
+fn phoenix_orders_that_open_count_against_the_hourly_notional_cap() {
+    let mut g = metered_desk(120);
+    let buy = bytes_of(&case(&vectors(), "IOC buy 0.005 ETH, limit 2474.5"));
+    for n in 1..=2 {
+        sol_sign(&mut g, &buy).unwrap();
+        assert_eq!(g.counters_of("alpha").notional_e8, n * 5_000_000_000);
+    }
+    let before = g.counters_of("alpha");
+    let msg = sol_sign(&mut g, &buy).unwrap_err();
+    assert!(
+        msg.starts_with("E_SIZE: ")
+            && msg.contains(
+                "over what is left of max_hourly_notional_usd 120 in the sliding hour, 20 USD"
+            ),
+        "{msg}"
+    );
+    assert_eq!(g.counters_of("alpha"), before, "a refusal counts nothing");
+    let close = bytes_of(&case(&review(), "review 3: a reduce-only IOC sell"));
+    assert_eq!(sol_sign(&mut g, &close).unwrap().kind, "order");
+    assert_eq!(g.counters_of("alpha"), before, "reduce-only counts nothing");
+}
+
+/// C10 round 2 (item 2): an unpriced order at a far-off limit, 1 tick (0.1 USD) here, still
+/// counts its share of the unpriced cap, so a sell at a dust price cannot slip past the hourly
+/// meter: 0.005 ETH of a 0.005 max_sz counts 50 USD, not 0.0005.
+#[test]
+fn a_one_tick_unpriced_phoenix_sell_counts_its_share_of_the_unpriced_cap() {
+    let mut g = metered_desk(1_000);
+    let mut sell = bytes_of(&case(&vectors(), "IOC sell 0.005 ETH, limit 2425.5"));
+    let limit = [&[1u8][..], &24_255u64.to_le_bytes()].concat();
+    let at: Vec<usize> = (0..=sell.len() - limit.len())
+        .filter(|&i| sell[i..i + limit.len()] == limit[..])
+        .collect();
+    assert_eq!(at.len(), 1, "the order's Some(priceInTicks)");
+    sell[at[0] + 1..at[0] + 9].copy_from_slice(&1u64.to_le_bytes());
+    let got = sol_sign(&mut g, &sell).unwrap();
+    assert_eq!(got.orders[0].px, "0.1");
+    assert_eq!(g.counters_of("alpha").notional_e8, 5_000_000_000);
+}
+
+/// C10 round 2 (item 15, C3): a registration message's priority fee needs a unit limit too, as
+/// `sol_sign`'s does.
+#[test]
+fn a_registration_with_a_price_and_no_limit_is_refused() {
+    let mut g = sol_desk();
+    let with_both = bytes_of(&case(
+        &onboarding(),
+        "register: with ComputeBudget limit 400000 + price 100000 first",
+    ));
+    sol_sign_register(&mut g, &with_both).unwrap();
+    let price_only = super::rescue::rewritten(&with_both, |ixs| {
+        ixs.retain(|(program, _, data)| {
+            !(*program == gimbal_core::solana::COMPUTE_BUDGET_PROGRAM && data.first() == Some(&2))
+        })
+    });
+    let msg = sol_sign_register(&mut g, &price_only).unwrap_err();
+    assert!(
+        msg.starts_with("E_SOL_PROGRAM: ")
+            && msg.contains("a priority fee needs a SetComputeUnitLimit in the same message"),
+        "{msg}"
+    );
+}
+
+/// C10 round 2b: a priced Phoenix order counts `sz × max(px, oracle)` on the hourly notional
+/// meter: the buy at 2474.5 its own price (12.3725 USD), the sell at 2425.5 the oracle's 2450
+/// (12.25 USD).
+#[test]
+fn priced_phoenix_orders_count_at_the_larger_of_their_price_and_the_oracles() {
+    let mut p = sol_policy();
+    p.max_hourly_notional_usd = Some(1_000);
+    let mut g = sol_desk_with(p);
+    g.desk_counters.insert("alpha".into(), Default::default());
+    call(contract_id(), ONE_YOCTO);
+    g.set_mock_price("ETH".into(), 245_000_000_000);
+    let buy = bytes_of(&case(&vectors(), "IOC buy 0.005 ETH, limit 2474.5"));
+    let got = sol_sign(&mut g, &buy).unwrap();
+    assert!(!got.orders[0].unpriced && got.orders[0].oracle_px.is_some());
+    assert_eq!(g.counters_of("alpha").notional_e8, 1_237_250_000);
+    let sell = bytes_of(&case(&vectors(), "IOC sell 0.005 ETH, limit 2425.5"));
+    sol_sign(&mut g, &sell).unwrap();
+    assert_eq!(
+        g.counters_of("alpha").notional_e8,
+        1_237_250_000 + 1_225_000_000
+    );
 }

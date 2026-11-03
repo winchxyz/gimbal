@@ -94,7 +94,7 @@ test('the owner-only list is the table of docs/interfaces.md §1.3: owner ✓, n
   const fromTable = table()
     .filter((r) => r.owner === '✓' && r.operator === '')
     .map((r) => r.method);
-  assert.equal(fromTable.length, 7);
+  assert.equal(fromTable.length, 10);
   assert.deepEqual(OWNER_ONLY.map((o) => o.method).sort(), fromTable.sort());
 });
 

@@ -15,13 +15,13 @@ pub mod mpc;
 pub mod orderly;
 pub mod prices;
 pub mod rescue;
+pub mod settings;
 pub mod sol;
 
 pub use gimbal_core::Refusal;
 
 use gimbal_core::errors::{shown, E_ARGS, E_DESK_EXISTS, E_NO_DESK};
 use gimbal_core::ids::{check_desk_id, check_evm_address, decode_base58_32, MPC_DOMAIN_SECP256K1};
-use gimbal_core::oracle::ORACLE_ASSETS;
 use gimbal_core::policy::Policy;
 use near_sdk::store::LookupMap;
 use near_sdk::{
@@ -35,7 +35,8 @@ use crate::desk::{policy_sha256, Desk, Gate, Role, SolanaAccounts};
 use crate::events::{emit_signed, DeskCreated, Event, OperatorSet, PanicClose, Paused, PolicySet};
 use crate::money::DeskMoney;
 use crate::prices::StoredPrice;
-use crate::rescue::DeskCounters;
+use crate::rescue::{DeskCounters, DeskCountersView};
+use crate::settings::DeskSettings;
 
 /// Gas `on_desk_keys` gets besides its share of what `create_desk` leaves unused: it reads two keys,
 /// hashes one, and writes the desk, or schedules the refund and [`Gimbal::refuse`].
@@ -93,6 +94,7 @@ enum StorageKey {
     Money,
     FundCounters,
     FundPaid,
+    DeskSettings,
 }
 
 /// The contract's state. There is no `migrate` method and the layout carries no version: every
@@ -121,10 +123,10 @@ pub struct Gimbal {
     next_request_id: u64,
     /// Policy symbol → its last stored oracle price ([`prices`]).
     prices: LookupMap<String, StoredPrice>,
-    /// The block time `refresh_prices` last asked the oracle for each symbol of [`ORACLE_ASSETS`],
-    /// in the table's order, ms (0 before the first), so asking again within
-    /// [`prices::REFRESH_SKIP_MS`] spends nothing even when no answer was stored.
-    price_asked_ms: [u64; ORACLE_ASSETS.len()],
+    /// The block time `refresh_prices` last asked the oracle (ms, 0 before the first). It always
+    /// asks for every symbol of [`ORACLE_ASSETS`], and not again within
+    /// [`prices::REFRESH_SKIP_MS`], so the contract spends one oracle call per 30 s at most.
+    prices_asked_ms: u64,
     /// Desk id → its rescue window and EIP-3009 counter ([`rescue`]). Stored with the desk, like
     /// its nonce entry, so an action never adds storage.
     desk_counters: LookupMap<String, DeskCounters>,
@@ -141,6 +143,15 @@ pub struct Gimbal {
     /// Orderly receiver could otherwise both pay one quote. Bounded: an entry leaves when the
     /// desk's ring slot that holds it is reused, so there are at most 32 per desk.
     fund_paid: LookupMap<[u8; 32], u64>,
+    /// Desk id → its Phoenix accounts and accepted second 1Click key ([`settings`]). Fixed size,
+    /// stored with the desk.
+    desk_settings: LookupMap<String, DeskSettings>,
+    /// The second 1Click quote-signing key the treasury account proposed ([`settings`]); all zero
+    /// for none.
+    oneclick_key_proposal: [u8; 32],
+    /// How many proposals the treasury made, the latest one's number: a desk's acceptance holds
+    /// only for the proposal it accepted ([`settings`]).
+    oneclick_proposal_seq: u64,
 }
 
 #[near]
@@ -159,15 +170,26 @@ impl Gimbal {
         orderly: OrderlyConfig,
     ) -> Self {
         config::check(network, &price_source, &treasury, &fees, &orderly).or_fail();
+        config::check_network_ids(network, &mpc, &price_source).or_fail();
+        let config = Config {
+            network,
+            mpc,
+            price_source,
+            treasury,
+            fees,
+            orderly,
+        };
+        // The treasury proposes 1Click keys and receives fees: as one of the accounts that call
+        // in on their own it would be both (C10 round 2).
+        config
+            .check_not_reserved(
+                &env::current_account_id(),
+                "treasury.near",
+                &config.treasury.near,
+            )
+            .or_fail();
         Self {
-            config: Config {
-                network,
-                mpc,
-                price_source,
-                treasury,
-                fees,
-                orderly,
-            },
+            config,
             desks: LookupMap::new(StorageKey::Desks),
             desk_counts: LookupMap::new(StorageKey::DeskCounts),
             operator_counts: LookupMap::new(StorageKey::OperatorCounts),
@@ -175,11 +197,14 @@ impl Gimbal {
             hl_nonces: LookupMap::new(StorageKey::HlNonces),
             next_request_id: 0,
             prices: LookupMap::new(StorageKey::Prices),
-            price_asked_ms: [0; ORACLE_ASSETS.len()],
+            prices_asked_ms: 0,
             desk_counters: LookupMap::new(StorageKey::DeskCounters),
             money: LookupMap::new(StorageKey::Money),
             fund_counters: LookupMap::new(StorageKey::FundCounters),
             fund_paid: LookupMap::new(StorageKey::FundPaid),
+            desk_settings: LookupMap::new(StorageKey::DeskSettings),
+            oneclick_key_proposal: [0; 32],
+            oneclick_proposal_seq: 0,
         }
     }
 
@@ -446,6 +471,16 @@ impl Gimbal {
         Some(desk)
     }
 
+    /// The desk's meters as they are stored, or `null` when there is no such desk: the rescue
+    /// meters, the next EIP-3009 counter (a crash-safe engine reads it to tell whether an
+    /// authorization it asked for was signed: the counter moved past it), the deposit ring and the
+    /// hourly notional meter, each meter also as its weight at the block time.
+    pub fn get_desk_counters(&self, desk_id: String) -> Option<DeskCountersView> {
+        let c = self.desk_counters.get(&desk_id)?;
+        let policy = &self.desks.get(&desk_id)?.policy;
+        Some(DeskCountersView::of(c, policy, env::block_timestamp_ms()))
+    }
+
     /// The ids of the owner's desks, in creation order.
     pub fn desks_of(&self, owner: AccountId) -> Vec<String> {
         let count = self.desk_counts.get(&owner).copied().unwrap_or(0);
@@ -561,6 +596,8 @@ impl Gimbal {
             .insert(desk_id.to_owned(), DeskMoney::new(desk.owner.clone()));
         self.fund_counters
             .insert(desk_id.to_owned(), DeskCounters::default());
+        self.desk_settings
+            .insert(desk_id.to_owned(), DeskSettings::default());
         let n = self.desk_counts.get(&desk.owner).copied().unwrap_or(0);
         self.desk_ids
             .insert((desk.owner.clone(), n), desk_id.to_owned());
@@ -579,6 +616,7 @@ impl Gimbal {
         self.desk_counters.remove(desk_id);
         self.money.remove(desk_id);
         self.fund_counters.remove(desk_id);
+        self.desk_settings.remove(desk_id);
         let count = self.desk_counts.get(owner).copied().unwrap_or(0);
         if let Some(last) = count.checked_sub(1) {
             self.desk_ids.remove(&(owner.clone(), last));
@@ -598,6 +636,7 @@ impl Gimbal {
         self.desk_counters.flush();
         self.money.flush();
         self.fund_counters.flush();
+        self.desk_settings.flush();
         self.fund_paid.flush();
         self.desk_counts.flush();
         self.desk_ids.flush();

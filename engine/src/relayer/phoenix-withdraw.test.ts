@@ -162,17 +162,31 @@ test('a paused rescue is the contract\'s lean rescue: the full one without the p
   assert.throws(() => pausedRescueInstructions(EXCHANGE, DESK, 0n, DEPOSIT), /more than 0/);
 });
 
-test('a paused desk refuses the rescue as the SDK builds it: the priority fee and both desk-account creates', () => {
+test('a paused desk refuses the rescue as the SDK builds it: both desk-account creates (its priority fee is for 400,000 units)', () => {
   const full = refusals(rescueInstructions(EXCHANGE, DESK, AMOUNT, DEPOSIT));
-  assert.equal(full.length, 3, full.join('; '));
-  assert.match(full[0]!, /^instruction 1: a priority fee of 100000 µlamports per CU$/);
-  assert.match(full[1]!, new RegExp(`^instruction 2: a create of the desk's own token account ${DESK.phusdAta}$`));
-  assert.match(full[2]!, new RegExp(`^instruction 4: a create of the desk's own token account ${DESK.usdcAta}$`));
+  assert.equal(full.length, 2, full.join('; '));
+  assert.match(full[0]!, new RegExp(`^instruction 2: a create of the desk's own token account ${DESK.phusdAta}$`));
+  assert.match(full[1]!, new RegExp(`^instruction 4: a create of the desk's own token account ${DESK.usdcAta}$`));
+});
+
+test('a paused rescue may pay a priority fee for at most 400,000 units, at most 1,000,000 µlamports per CU', () => {
+  const priced = (units: number, price: number) => {
+    const [limit, fee] = asSolInstructions(computeBudgetInstructions(units, price));
+    return [limit!, fee!, ...LEAN.slice(1)];
+  };
+  assert.deepEqual(refusals(priced(400_000, 100_000)), []);
+  assert.deepEqual(refusals(priced(400_000, 1_000_000)), []);
+  assert.deepEqual(refusals(priced(400_001, 100_000)), ['instruction 1: a priority fee of 100000 µlamports per CU with a limit of 400001 units, over 400000']);
+  assert.deepEqual(refusals(priced(400_000, 1_000_001)), ['instruction 1: a priority fee of 1000001 µlamports per CU, over 1000000']);
+  assert.deepEqual(refusals([asSolInstructions(computeBudgetInstructions())[1]!, ...LEAN.slice(1)]), ['instruction 0: a priority fee of 100000 µlamports per CU with no compute-unit limit']);
 });
 
 // One case per thing a paused rescue may not carry, each the lean rescue with that one thing put back or made larger.
 const REFUSED: [string, () => SolInstruction[], RegExp][] = [
-  ['a compute-unit price', () => [LEAN[0]!, asSolInstructions(computeBudgetInstructions())[1]!, ...LEAN.slice(1)], /a priority fee of 100000/],
+  ['a compute-unit price over 400,000 units', () => {
+    const [limit, fee] = asSolInstructions(computeBudgetInstructions(400_001));
+    return [limit!, fee!, ...LEAN.slice(1)];
+  }, /a priority fee of 100000 µlamports per CU with a limit of 400001 units/],
   ['a create of the desk USDC account', () => [...LEAN.slice(0, 1), rescueInstructions(EXCHANGE, DESK, AMOUNT, DEPOSIT)[4]!, ...LEAN.slice(1)], /a create of the desk's own token account/],
   ['an order', () => [...LEAN, vectorIx('market sell 0.005 ETH', PHOENIX, '5a76c0fcc0632791')], /a Phoenix place_market_order/],
   ['a cancel', () => [...LEAN, vectorIx('cancel all ETH', PHOENIX, '62bf4bdc732847ed')], /a Phoenix cancel_all/],

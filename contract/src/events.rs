@@ -7,6 +7,7 @@ use near_sdk::serde_json;
 use near_sdk::{env, AccountId};
 
 use crate::action::{OrderDetail, Pending};
+use crate::settings::PhoenixAccountsJson;
 
 pub const STANDARD: &str = "gimbal";
 pub const VERSION: &str = "1.0.0";
@@ -25,6 +26,10 @@ pub const DEPOSIT: &str = "deposit";
 pub const PAYOUT: &str = "payout";
 pub const FEE_CHARGED: &str = "fee_charged";
 pub const PAYOUT_LOCK_CLEARED: &str = "payout_lock_cleared";
+pub const PHOENIX_ACCOUNTS_SET: &str = "phoenix_accounts_set";
+pub const ONECLICK_KEY_PROPOSED: &str = "oneclick_key_proposed";
+pub const ONECLICK_KEY_ACCEPTED: &str = "oneclick_key_accepted";
+pub const PINNED_ONECLICK_KEY_DISTRUSTED: &str = "pinned_oneclick_key_distrusted";
 
 /// Field order is the order the interface shows, which a struct keeps and a JSON map would not.
 #[derive(Serialize)]
@@ -151,6 +156,55 @@ pub struct OrderlyIpsSet<'a> {
 
 impl Event for OrderlyIpsSet<'_> {
     const NAME: &'static str = ORDERLY_IPS_SET;
+}
+
+/// The owner replaced the desk's Phoenix and Ember accounts (`set_phoenix_accounts`).
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct PhoenixAccountsSet<'a> {
+    pub desk_id: &'a str,
+    pub accounts: &'a PhoenixAccountsJson,
+}
+
+impl Event for PhoenixAccountsSet<'_> {
+    const NAME: &'static str = PHOENIX_ACCOUNTS_SET;
+}
+
+/// The treasury account proposed a second 1Click key for every desk, or withdrew it (`null`).
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct OneclickKeyProposed<'a> {
+    pub key: Option<&'a str>,
+}
+
+impl Event for OneclickKeyProposed<'_> {
+    const NAME: &'static str = ONECLICK_KEY_PROPOSED;
+}
+
+/// The owner accepted the proposed 1Click key for the desk from `from_ms`, or cleared it (`null`,
+/// `from_ms` 0).
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct OneclickKeyAccepted<'a> {
+    pub desk_id: &'a str,
+    pub key: Option<&'a str>,
+    pub from_ms: u64,
+}
+
+impl Event for OneclickKeyAccepted<'_> {
+    const NAME: &'static str = ONECLICK_KEY_ACCEPTED;
+}
+
+/// The desk owner distrusted 1Click's pinned quote key for the desk (`distrust_pinned_oneclick_key`):
+/// from now on only an accepted second key verifies its quotes.
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct PinnedOneclickKeyDistrusted<'a> {
+    pub desk_id: &'a str,
+}
+
+impl Event for PinnedOneclickKeyDistrusted<'_> {
+    const NAME: &'static str = PINNED_ONECLICK_KEY_DISTRUSTED;
 }
 
 /// USDC on NEAR arrived for a desk through `ft_on_transfer`. Amounts are USDC × 1e6 as decimal

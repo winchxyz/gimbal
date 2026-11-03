@@ -25,7 +25,7 @@
 
 use gimbal_core::errors::{shown, Refusal, E_ARGS, E_NOT_ALLOWED};
 use gimbal_core::limits::fresh_price;
-use gimbal_core::oracle::{check_symbols, index_of, price_e8, symbol_of, ORACLE_ASSETS};
+use gimbal_core::oracle::{check_symbols, price_e8, symbol_of, ORACLE_ASSETS};
 use gimbal_core::policy::MAX_SAFE_INTEGER;
 use near_sdk::serde::{Deserialize, Deserializer, Serialize};
 use near_sdk::store::LookupMap;
@@ -64,9 +64,9 @@ pub const REFRESH_PRICES_MIN_GAS: Gas = Gas::from_gas(
 /// The longest oracle answer `on_prices` reads.
 pub const PRICE_DATA_MAX_LEN: usize = 8 * 1024;
 
-/// How recently every price `refresh_prices` is asked for must have been stored, or asked the
-/// oracle for, for the call to skip the oracle, ms: within it a second call spends nothing from the
-/// contract's balance, also while the oracle answers nothing.
+/// How recently the oracle must have been asked (for every price) for `refresh_prices` to skip
+/// it, ms: within it a second call spends nothing from the contract's balance, also while the
+/// oracle answers nothing, whoever calls and whatever symbols they name.
 pub const REFRESH_SKIP_MS: u64 = 30_000;
 
 /// One stored price: USD per whole token × 1e8, and its time, ms: the oldest a report in it can
@@ -174,22 +174,22 @@ pub fn check_refresh_gas(prepaid: Gas) -> Result<(), Refusal> {
 
 #[near]
 impl Gimbal {
-    /// Asks the OutLayer oracle for the prices of `assets` (policy symbols of [`ORACLE_ASSETS`],
-    /// 1 to 7, each once: `E_ARGS`, `E_ASSET`) and stores each that is newer than the stored one;
-    /// event `prices` with the rows stored. Takes no deposit: the oracle's 0.02 NEAR comes from the
-    /// contract's balance and is mostly refunded. Callers are the owners of desks, whose engine
-    /// key calls it, the desks' separate operator accounts and the contract account
-    /// (`E_NOT_ALLOWED` for anyone else, so strangers cannot spend the contract's deposit);
-    /// `E_ARGS` with the Mock source or under [`REFRESH_PRICES_MIN_GAS`]. When for every symbol
-    /// asked for a price was stored, or the oracle was asked, less than [`REFRESH_SKIP_MS`] ago
-    /// (by an earlier call: its answer may still be on the way) it asks nothing and returns `true`
-    /// at once. Otherwise it asks the oracle for all of them and the transaction's result is
-    /// `true` when every symbol asked for got a price from the oracle's answer, `false` when one
-    /// did not.
+    /// Asks the OutLayer oracle for the prices of every symbol of [`ORACLE_ASSETS`] and stores
+    /// each that is newer than the stored one; event `prices` with the rows stored. `assets` (1
+    /// to 7 symbols of the table, each once: `E_ARGS`, `E_ASSET`) only names what the caller
+    /// waits for. Takes no deposit: the oracle's 0.02 NEAR comes from the contract's balance and
+    /// is mostly refunded. Callers are the owners of desks, whose engine key calls it, the desks'
+    /// separate operator accounts and the contract account (`E_NOT_ALLOWED` for anyone else, so
+    /// strangers cannot spend the contract's deposit); `E_ARGS` with the Mock source or under
+    /// [`REFRESH_PRICES_MIN_GAS`]. When anyone asked the oracle less than [`REFRESH_SKIP_MS`] ago
+    /// (its answer may still be on the way) it asks nothing and returns `true` at once, so the
+    /// contract makes at most one oracle call per 30 s however many desks and symbols there are.
+    /// Otherwise the transaction's result is `true` when every symbol of `assets` got a price from
+    /// the oracle's answer, `false` when one did not.
     #[deny_unknown_arguments]
     pub fn refresh_prices(&mut self, assets: Vec<String>) -> PromiseOrValue<bool> {
         let oracle = self.oracle_or_fail();
-        let ids = check_symbols(&assets).or_fail();
+        check_symbols(&assets).or_fail();
         let caller = env::predecessor_account_id();
         let owns_a_desk = self.desk_counts.get(&caller).is_some_and(|n| *n > 0);
         let operates_a_desk = self.operator_counts.get(&caller).is_some_and(|n| *n > 0);
@@ -204,30 +204,16 @@ impl Gimbal {
         }
         check_refresh_gas(env::prepaid_gas()).or_fail();
         let now_ms = env::block_timestamp_ms();
-        let recent = |ms: u64| now_ms.saturating_sub(ms) < REFRESH_SKIP_MS;
-        let stored_recently = |a: &String| self.prices.get(a).is_some_and(|p| recent(p.stored_ms));
-        // `check_symbols` passed, so every symbol has its row; 0 is "never asked".
-        let rows: Vec<usize> = assets.iter().filter_map(|a| index_of(a)).collect();
-        let asked_recently = |row: usize| {
-            let asked = self.price_asked_ms[row];
-            asked != 0 && recent(asked)
-        };
-        if assets
-            .iter()
-            .zip(&rows)
-            .all(|(a, row)| stored_recently(a) || asked_recently(*row))
-        {
-            env::log_str(if assets.iter().all(stored_recently) {
-                "every price asked for was stored under 30 s ago; no oracle call"
-            } else {
-                "every price asked for was stored or asked for under 30 s ago; no oracle call"
-            });
+        let asked = self.prices_asked_ms;
+        if asked != 0 && now_ms.saturating_sub(asked) < REFRESH_SKIP_MS {
+            env::log_str(&format!(
+                "the oracle was asked for every price at {asked} ms, under 30 s ago; no oracle call"
+            ));
             return PromiseOrValue::Value(true);
         }
-        for row in rows {
-            self.price_asked_ms[row] = now_ms;
-        }
-        let args = serde_json::json!({ "asset_ids": ids });
+        self.prices_asked_ms = now_ms;
+        let all: Vec<&str> = ORACLE_ASSETS.iter().map(|(_, id)| *id).collect();
+        let args = serde_json::json!({ "asset_ids": all });
         let call = Promise::new(oracle)
             .function_call_weight(
                 "request_price_data",
@@ -245,9 +231,9 @@ impl Gimbal {
         PromiseOrValue::Promise(call)
     }
 
-    /// The callback of `request_price_data`: stores the answer and returns whether every symbol
-    /// asked for got a price; `false` when the call failed or answered nothing readable (the next
-    /// `refresh_prices` asks again once [`REFRESH_SKIP_MS`] passed).
+    /// The callback of `request_price_data`: stores every price of the answer and returns whether
+    /// every symbol of `assets` (the caller's) got one; `false` when the call failed or answered
+    /// nothing readable (the next `refresh_prices` asks again once [`REFRESH_SKIP_MS`] passed).
     #[private]
     pub fn on_prices(&mut self, assets: Vec<String>) -> bool {
         let answer = env::promise_result_checked(0, PRICE_DATA_MAX_LEN)
@@ -264,9 +250,10 @@ impl Gimbal {
 
     /// The OutLayer oracle's callback after an `oracle_call` (its `ext_price_receiver`): stores the
     /// prices like `on_prices` and returns whether every symbol in `msg` (comma-separated) got
-    /// one. `refresh_prices` no longer makes an `oracle_call` (module doc); the method stays for
-    /// the interface and stores nothing an `oracle_call` of the contract did not ask for. Only the configured oracle may call it, and only for
-    /// an `oracle_call` the contract made itself (`E_NOT_ALLOWED`). Not payable: the oracle's
+    /// one. `refresh_prices` no longer makes an `oracle_call` (module doc), so in practice the
+    /// method answers nothing: it stays for the interface. Only the configured oracle may call
+    /// it, and only for an `oracle_call` the contract made itself (`E_NOT_ALLOWED`), so it stores
+    /// no price the contract did not ask for. Not payable: the oracle's
     /// `oracle_call` calls it with no deposit on every path (its source, read 2026-10-31). The
     /// 0.02 NEAR the contract attached to `oracle_call` stays with the oracle's own handling: sent
     /// back to the contract when the oracle's cache was fresh, else passed to OutLayer.

@@ -9,6 +9,18 @@ edition = "2021"
 description = "Gimbal NEAR contract: desks, policy, MPC signing requests and events"
 license = "BUSL-1.1"
 publish = false
+# NEP-330 source metadata: `cargo near build reproducible-wasm` records the repository, the commit
+# and the image below in the wasm's `contract_source_metadata`, so anyone can rebuild the deployed
+# code byte for byte and compare its hash.
+repository = "https://github.com/winchxyz/gimbal"
+
+# The pinned build environment of `cargo near build reproducible-wasm` (cargo-near 0.22.0 with
+# Rust 1.99.1, the local toolchain). The tag only describes it; the digest identifies the image.
+[package.metadata.near.reproducible_build]
+image = "sourcescan/cargo-near:0.22.0-rust-1.99.1"
+image_digest = "sha256:c9655eaf7436b90c87ea8b25739f91063032c5c30ba24cfeafe72c142943b5bb"
+passed_env = []
+container_build_command = ["cargo", "near", "build", "non-reproducible-wasm", "--locked"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]

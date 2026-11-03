@@ -77,6 +77,7 @@ export interface ContractPolicy {  // the contract's Policy (§1.2), same snake_
   unpriced: { symbol: string; max_sz: string }[];   // no oracle price: max_sz caps the size in base units (canonical decimal)
   unpriced_max_notional_usd: number;
   max_transfer_cost_bps: number; max_transfer_cost_flat_e6: number;
+  max_hourly_notional_usd?: number;   // rolling-hour cap on orders that are not reduce-only; absent = 15 × max_notional_usd
 }
 
 export interface StrategyConfig {  // engine rules, off-chain: the contract never sees or enforces them

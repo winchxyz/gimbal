@@ -5,16 +5,18 @@
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use gimbal_core::ed25519::is_on_curve;
 use gimbal_core::errors::{
-    E_ASSET, E_ORACLE_STALE, E_PRICE_BAND, E_SIZE, E_SOL_ACCOUNT, E_SOL_MESSAGE, E_SOL_PROGRAM,
+    E_ARGS, E_ASSET, E_ORACLE_STALE, E_PRICE_BAND, E_SIZE, E_SOL_ACCOUNT, E_SOL_MESSAGE,
+    E_SOL_PROGRAM,
 };
 use gimbal_core::phoenix::{
-    check_message, check_onboarding, check_registration, Onboarding, Rescue, CANCEL_ALL,
-    DEPOSIT_FUNDS, EMBER_DEPOSIT, EMBER_WITHDRAW, MAX_COMPUTE_UNIT_LIMIT, MAX_COMPUTE_UNIT_PRICE,
-    MAX_PRIORITY_FEE_LAMPORTS, PHOENIX_ACTIVE_TRADER_BUFFER, PHOENIX_GLOBAL_CONFIGURATION,
-    PHOENIX_GLOBAL_TRADER_INDEX, PHOENIX_GLOBAL_VAULT, PHOENIX_LOG_AUTHORITY,
-    PHOENIX_ONBOARDING_PERMISSION, PHOENIX_PERP_ASSET_MAP, PHOENIX_RISK_AUTHORITY,
-    PHOENIX_WITHDRAW_QUEUE, PLACE_MARKET_ORDER, REGISTER_TRADER, SET_TRADER_CAPABILITIES_DELEGATED,
-    WITHDRAW_FUNDS,
+    check_message, check_onboarding, check_registration, check_registration_in, Onboarding,
+    PhoenixAccounts, Rescue, CANCEL_ALL, DEPOSIT_FUNDS, EMBER_DEPOSIT, EMBER_WITHDRAW,
+    MAX_COMPUTE_UNIT_LIMIT, MAX_COMPUTE_UNIT_PRICE, MAX_PRIORITY_FEE_LAMPORTS,
+    PHOENIX_ACTIVE_TRADER_BUFFER, PHOENIX_GLOBAL_CONFIGURATION, PHOENIX_GLOBAL_TRADER_INDEX,
+    PHOENIX_GLOBAL_VAULT, PHOENIX_LOG_AUTHORITY, PHOENIX_ONBOARDING_PERMISSION,
+    PHOENIX_PERP_ASSET_MAP, PHOENIX_RISK_AUTHORITY, PHOENIX_WITHDRAW_QUEUE, PLACE_MARKET_ORDER,
+    REGISTER_TRADER, RESCUE_MAX_COMPUTE_UNIT_LIMIT, SET_TRADER_CAPABILITIES_DELEGATED,
+    URGENT_MAX_COMPUTE_UNIT_PRICE, URGENT_MAX_PRIORITY_FEE_LAMPORTS, WITHDRAW_FUNDS,
 };
 use gimbal_core::policy::{PhoenixMarket, Policy, UnpricedAsset};
 use gimbal_core::solana::{
@@ -81,10 +83,11 @@ fn vector_policy(ctx: &Value) -> Policy {
         max_transfer_cost_flat_e6: 0,
         unpriced: vec![],
         unpriced_max_notional_usd: 0,
+        max_hourly_notional_usd: None,
     };
     policy.validate().unwrap();
     assert_eq!(ctx["max_cu_limit"], 600_000);
-    assert_eq!(ctx["max_cu_price"], 1_000_000);
+    assert_eq!(ctx["max_cu_price"], 200_000);
     policy
 }
 
@@ -395,10 +398,69 @@ fn a_paused_desk_signs_a_rescue_that_only_frees_and_pays_amount_in() {
     assert_eq!(lean.ixs.len(), full.ixs.len() - 3);
     let c = check(&lean);
     assert_eq!((c.kind, c.reduces_risk), ("rescue", true));
+    // C10: it may pay a priority fee within the price cap for at most 400,000 units, so it lands
+    // under congestion.
+    let fee = without(&full, desk_create);
+    assert_eq!(fee.ixs.len(), full.ixs.len() - 2);
+    let l = fee.find(COMPUTE_BUDGET_PROGRAM, &[2]);
+    let limit = u32::from_le_bytes(fee.ixs[l].2[1..5].try_into().unwrap());
+    assert!(u64::from(limit) <= RESCUE_MAX_COMPUTE_UNIT_LIMIT);
+    let c = check(&fee);
+    assert_eq!(
+        (c.kind, c.reduces_risk),
+        ("rescue", true),
+        "with the priority fee"
+    );
+    let mut at_cap = fee.clone();
+    let edge = u32::try_from(RESCUE_MAX_COMPUTE_UNIT_LIMIT).unwrap();
+    at_cap.ixs[l].2[1..5].copy_from_slice(&edge.to_le_bytes());
+    let p = at_cap.find(COMPUTE_BUDGET_PROGRAM, &[3]);
+    at_cap.ixs[p].2[1..9].copy_from_slice(&MAX_COMPUTE_UNIT_PRICE.to_le_bytes());
+    let c = check(&at_cap);
+    assert_eq!(
+        (c.kind, c.reduces_risk),
+        ("rescue", true),
+        "with the priority fee at both caps"
+    );
+    // C10 round 2: a rescue may pay the urgent price for at most 400,000 units, on a paused desk too.
+    let mut urgent = at_cap.clone();
+    urgent.ixs[p].2[1..9].copy_from_slice(&URGENT_MAX_COMPUTE_UNIT_PRICE.to_le_bytes());
+    let c = check(&urgent);
+    assert_eq!(
+        (c.kind, c.reduces_risk),
+        ("rescue", true),
+        "at the urgent price"
+    );
+    let mut urgent_wide = urgent.clone();
+    urgent_wide.ixs[l].2[1..5].copy_from_slice(&(edge + 1).to_le_bytes());
+    let r = check_message(
+        sha256,
+        &policy,
+        &desk,
+        &urgent_wide.bytes(),
+        &reference,
+        Some(&rescue),
+    )
+    .unwrap_err();
+    assert_eq!(
+        r.code, E_SOL_PROGRAM,
+        "the urgent price for 400,001 units: {r}"
+    );
+    let mut wide = at_cap.clone();
+    wide.ixs[l].2[1..5].copy_from_slice(&(edge + 1).to_le_bytes());
+    let mut no_fee_wide = lean.clone();
+    let l2 = no_fee_wide.find(COMPUTE_BUDGET_PROGRAM, &[2]);
+    no_fee_wide.ixs[l2].2[1..5].copy_from_slice(&MAX_COMPUTE_UNIT_LIMIT.to_le_bytes());
+    let c = check(&no_fee_wide);
+    assert_eq!(
+        (c.kind, c.reduces_risk),
+        ("rescue", true),
+        "a wide unit limit with no price pays no priority fee"
+    );
 
     let mut needs_running: Vec<(&str, Draft)> = vec![
         ("as the SDK builds it", full.clone()),
-        ("with the priority fee", without(&full, desk_create)),
+        ("with the priority fee for 400,001 units", wide),
         (
             "with a create of a desk account",
             without(&full, unit_price),
@@ -431,6 +493,176 @@ fn a_paused_desk_signs_a_rescue_that_only_frees_and_pays_amount_in() {
     }
 }
 
+/// C10: the rescue's one transfer out moves the desk's USDC account (accounts[0]) signed by the
+/// desk (accounts[3]) and names exactly 4 accounts; an ATA create names exactly 6, with the system
+/// and token programs at 4 and 5.
+#[test]
+fn the_rescue_transfer_and_the_ata_create_are_pinned() {
+    let doc = sol_doc();
+    let ctx = &doc["ctx"]["sol_sign"];
+    let (policy, desk, reference) = (vector_policy(ctx), vector_desk(&doc), reference_of(ctx));
+    let stranger = key(&doc["keys"]["strangerSol"]["public_key_b58"]);
+    let case = doc["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| name(c).starts_with("rescue in one transaction"))
+        .unwrap();
+    let rescue = rescue_of(case).unwrap();
+    let answer = |d: &Draft| {
+        check_message(
+            sha256,
+            &policy,
+            &desk,
+            &d.bytes(),
+            &reference,
+            Some(&rescue),
+        )
+        .map(|s| s.kind)
+    };
+    let mut full = Draft::of(&message(case));
+    full.push_revoke(desk.phusd_ata, desk.authority);
+    assert_eq!(answer(&full), Ok("rescue"));
+    let t = full.find(TOKEN_PROGRAM, &[12]);
+    let code = |d: &Draft| answer(d).unwrap_err().code;
+
+    let mut d = full.clone();
+    d.set_account(t, 0, desk.phusd_ata);
+    assert_eq!(
+        code(&d),
+        E_SOL_ACCOUNT,
+        "a transfer out of the PhUSD account"
+    );
+    let mut d = full.clone();
+    d.set_account(t, 3, stranger);
+    assert_eq!(code(&d), E_SOL_ACCOUNT, "a transfer signed by a stranger");
+    let mut d = full.clone();
+    d.push_account(t, stranger);
+    assert_eq!(code(&d), E_SOL_ACCOUNT, "a fifth transfer account");
+
+    let deposit_create = |d: &Draft| {
+        (0..d.ixs.len())
+            .find(|&i| {
+                d.keys[usize::from(d.ixs[i].0)] == ATA_PROGRAM
+                    && d.account(i, 2) == rescue.deposit_owner
+            })
+            .unwrap()
+    };
+    let a = deposit_create(&full);
+    let mut d = full.clone();
+    d.swap_accounts(a, 4, 5);
+    assert_eq!(code(&d), E_SOL_ACCOUNT, "the programs swapped");
+    let mut d = full.clone();
+    d.push_account(a, stranger);
+    assert_eq!(code(&d), E_SOL_ACCOUNT, "a seventh create account");
+}
+
+/// C1: Phoenix's and Ember's own accounts follow the desk's `infra`. A desk whose owner moved
+/// one refuses the vector message with the old one and passes it with the new one; the rules on
+/// what an owner may set ([`PhoenixAccounts::check`]).
+#[test]
+fn the_phoenix_accounts_are_the_desks_own() {
+    let doc = sol_doc();
+    let ctx = &doc["ctx"]["sol_sign"];
+    let (policy, desk, reference) = (vector_policy(ctx), vector_desk(&doc), reference_of(ctx));
+    assert_eq!(desk.infra, PhoenixAccounts::PINNED);
+    PhoenixAccounts::PINNED.check(&desk).unwrap();
+    let moved = find_program_address(sha256, &[b"moved"], &PHOENIX_PROGRAM)
+        .unwrap()
+        .0;
+    let mut infra = PhoenixAccounts::PINNED;
+    infra.log_authority = moved;
+    infra.check(&desk).unwrap();
+    let other = SolDesk { infra, ..desk };
+    let case = doc["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| name(c).starts_with("rescue in one transaction"))
+        .unwrap();
+    let rescue = rescue_of(case).unwrap();
+    let mut full = Draft::of(&message(case));
+    full.push_revoke(desk.phusd_ata, desk.authority);
+    let answer = |d: &SolDesk, m: &Draft| {
+        check_message(sha256, &policy, d, &m.bytes(), &reference, Some(&rescue)).map(|s| s.kind)
+    };
+    assert_eq!(answer(&desk, &full), Ok("rescue"));
+    assert_eq!(answer(&other, &full).unwrap_err().code, E_SOL_ACCOUNT);
+    let mut follows = full.clone();
+    let at = follows
+        .keys
+        .iter()
+        .position(|k| *k == PHOENIX_LOG_AUTHORITY)
+        .unwrap();
+    follows.keys[at] = moved;
+    assert_eq!(answer(&other, &follows), Ok("rescue"));
+    assert_eq!(answer(&desk, &follows).unwrap_err().code, E_SOL_ACCOUNT);
+
+    let mut ember = PhoenixAccounts::PINNED;
+    ember.ember_state = moved;
+    let ember_desk = SolDesk {
+        infra: ember,
+        ..desk
+    };
+    assert_eq!(answer(&ember_desk, &full).unwrap_err().code, E_SOL_ACCOUNT);
+
+    // Onboarding takes them too.
+    let onboarding = onboarding_doc();
+    let register = onboarding["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["expect"]["ok"] == true && c["type"] == "register")
+        .unwrap();
+    let auth = key(&onboarding["ctx"]["desk"]["authority"]);
+    let trader = key(&onboarding["ctx"]["desk"]["phoenix_trader"]);
+    let bytes = message(register);
+    check_registration_in(&PhoenixAccounts::PINNED, &auth, &trader, &bytes).unwrap();
+    assert_eq!(
+        check_registration_in(&infra, &auth, &trader, &bytes)
+            .unwrap_err()
+            .code,
+        E_SOL_ACCOUNT
+    );
+
+    let stranger = key(&doc["keys"]["strangerSol"]["public_key_b58"]);
+    let refused = |f: &dyn Fn(&mut PhoenixAccounts), why: &str| {
+        let mut a = PhoenixAccounts::PINNED;
+        f(&mut a);
+        let r = a.check(&desk).unwrap_err();
+        assert_eq!(r.code, E_ARGS, "{why}");
+        r.msg
+    };
+    assert!(refused(&|a| a.global_vault = TOKEN_PROGRAM, "a program").contains("the token program"));
+    assert!(refused(&|a| a.ember_vault = PHOENIX_PROGRAM, "a program").contains("Phoenix program"));
+    assert!(refused(&|a| a.perp_asset_map = USDC_MINT, "a mint").contains("USDC mint"));
+    assert!(refused(&|a| a.withdraw_queue = desk.usdc_ata, "the desk's").contains("USDC account"));
+    assert!(refused(&|a| a.global_trader_index = desk.trader, "the desk's").contains("trader"));
+    assert!(
+        refused(&|a| a.active_trader_buffer = desk.authority, "the desk").contains("authority")
+    );
+    assert!(
+        refused(&|a| a.withdraw_queue = PHOENIX_PERP_ASSET_MAP, "a repeat")
+            .contains("also perp_asset_map")
+    );
+    assert!(refused(&|a| a.ember_state = stranger, "on the curve").contains("curve"));
+    assert!(refused(&|a| a.log_authority = [0; 32], "zero").contains("system program"));
+    // Not every account must be a program address: Phoenix's index and buffer accounts are not.
+    let mut a = PhoenixAccounts::PINNED;
+    a.perp_asset_map = stranger;
+    a.check(&desk).unwrap();
+    // C10 round 2: nor the two vaults, token accounts that may be made from a keypair.
+    assert!(is_on_curve(&stranger));
+    let mut a = PhoenixAccounts::PINNED;
+    a.global_vault = stranger;
+    a.check(&desk).unwrap();
+    let mut a = PhoenixAccounts::PINNED;
+    a.ember_vault = stranger;
+    a.check(&desk).unwrap();
+    assert!(refused(&|a| a.log_authority = stranger, "on the curve").contains("curve"));
+    assert!(refused(&|a| a.global_configuration = stranger, "on the curve").contains("curve"));
+}
+
 /// The vector order message `prefix` with its order flags byte set to `flags`. The order is the
 /// last instruction and its packet ends with orderFlags u8, cancelExisting bool.
 fn with_flags(doc: &Value, prefix: &str, flags: u8) -> Vec<u8> {
@@ -445,6 +677,143 @@ fn with_flags(doc: &Value, prefix: &str, flags: u8) -> Vec<u8> {
     assert_eq!(bytes[at], 0);
     bytes[at] = flags;
     bytes
+}
+
+/// C10 round 2: the urgent price (up to 1,000,000 micro-lamports for at most 400,000 units) is
+/// for a reduce-only order; an order that opens risk keeps 200,000.
+#[test]
+fn the_urgent_price_is_for_messages_that_only_cancel_or_reduce() {
+    let doc = sol_doc();
+    let ctx = &doc["ctx"]["sol_sign"];
+    let (policy, desk, reference) = (vector_policy(ctx), vector_desk(&doc), reference_of(ctx));
+    let at = |flags: u8, limit: u32, price: u64| {
+        let mut d = Draft::of(&with_flags(&doc, "IOC sell 0.005 ETH", flags));
+        let l = d.find(COMPUTE_BUDGET_PROGRAM, &[2]);
+        d.ixs[l].2[1..5].copy_from_slice(&limit.to_le_bytes());
+        let p = d.find(COMPUTE_BUDGET_PROGRAM, &[3]);
+        d.ixs[p].2[1..9].copy_from_slice(&price.to_le_bytes());
+        check_message(sha256, &policy, &desk, &d.bytes(), &reference, None)
+    };
+    let edge = u32::try_from(RESCUE_MAX_COMPUTE_UNIT_LIMIT).unwrap();
+    let c = at(0x80, edge, URGENT_MAX_COMPUTE_UNIT_PRICE).unwrap();
+    assert!(c.orders[0].reduce_only && c.reduces_risk);
+    for (flags, limit, price) in [
+        (0x80, edge + 1, URGENT_MAX_COMPUTE_UNIT_PRICE),
+        (0x80, edge, URGENT_MAX_COMPUTE_UNIT_PRICE + 1),
+        (0, edge, URGENT_MAX_COMPUTE_UNIT_PRICE),
+        (0, edge, MAX_COMPUTE_UNIT_PRICE + 1),
+    ] {
+        let r = at(flags, limit, price).unwrap_err();
+        assert_eq!(r.code, E_SOL_PROGRAM, "{flags:#04x} {limit} {price}: {r}");
+    }
+    let c = at(0, edge, MAX_COMPUTE_UNIT_PRICE).unwrap();
+    assert!(!c.reduces_risk);
+}
+
+/// `d` with its unit limit set to `limit` and its unit price to `price` (both instructions must
+/// be there).
+fn with_budget(d: &Draft, limit: u32, price: u64) -> Draft {
+    let mut d = d.clone();
+    let l = d.find(COMPUTE_BUDGET_PROGRAM, &[2]);
+    d.ixs[l].2[1..5].copy_from_slice(&limit.to_le_bytes());
+    let p = d.find(COMPUTE_BUDGET_PROGRAM, &[3]);
+    d.ixs[p].2[1..9].copy_from_slice(&price.to_le_bytes());
+    d
+}
+
+/// C10 round 2b: a `cancel_all` does not make a message urgent when the message also opens a
+/// position: an opening order with a cancel_all keeps the 200,000 cap, a reduce-only one with a
+/// cancel_all may pay the urgent price.
+#[test]
+fn a_cancel_all_with_an_opening_order_keeps_the_normal_price_cap() {
+    let doc = sol_doc();
+    let ctx = &doc["ctx"]["sol_sign"];
+    let (policy, desk, reference) = (vector_policy(ctx), vector_desk(&doc), reference_of(ctx));
+    let cancel = Draft::of(&message(
+        doc["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| name(c).starts_with("cancel all ETH"))
+            .unwrap(),
+    ));
+    let c = cancel.find(PHOENIX_PROGRAM, &CANCEL_ALL);
+    let edge = u32::try_from(RESCUE_MAX_COMPUTE_UNIT_LIMIT).unwrap();
+    for (flags, urgent_ok) in [(0x80, true), (0, false)] {
+        let mut d = Draft::of(&with_flags(&doc, "IOC sell 0.005 ETH", flags));
+        d.push_ix_of(&cancel, c);
+        let check = |price: u64| {
+            check_message(
+                sha256,
+                &policy,
+                &desk,
+                &with_budget(&d, edge, price).bytes(),
+                &reference,
+                None,
+            )
+        };
+        let normal = check(MAX_COMPUTE_UNIT_PRICE).unwrap();
+        assert_eq!(normal.orders.len(), 1);
+        assert_eq!(normal.reduces_risk, urgent_ok, "{flags:#04x}");
+        let urgent = check(URGENT_MAX_COMPUTE_UNIT_PRICE);
+        if urgent_ok {
+            urgent.unwrap();
+        } else {
+            let r = urgent.unwrap_err();
+            assert_eq!(r.code, E_SOL_PROGRAM, "{r}");
+            assert!(r.msg.contains("priority fee 1000000"), "{r}");
+        }
+    }
+}
+
+/// C10 round 2b: a rescue may pay the urgent price only while it opens no position: with no order
+/// or a reduce-only one it may, with an opening order it keeps the 200,000 cap (`E_SOL_PROGRAM`
+/// over it). On a running desk, since an order in a rescue needs one.
+#[test]
+fn a_rescue_with_an_opening_order_keeps_the_normal_price_cap() {
+    let doc = sol_doc();
+    let ctx = &doc["ctx"]["sol_sign"];
+    let (policy, desk, reference) = (vector_policy(ctx), vector_desk(&doc), reference_of(ctx));
+    let case = doc["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| name(c).starts_with("rescue in one transaction"))
+        .unwrap();
+    let rescue = rescue_of(case).unwrap();
+    let mut full = Draft::of(&message(case));
+    full.push_revoke(desk.phusd_ata, desk.authority);
+    // Without the creates of the desk's own accounts, so the order fits the transaction size.
+    let base = without(&full, |p, a, _| p == ATA_PROGRAM && a[2] == desk.authority);
+    let edge = u32::try_from(RESCUE_MAX_COMPUTE_UNIT_LIMIT).unwrap();
+    let check = |d: &Draft, price: u64| {
+        check_message(
+            sha256,
+            &policy,
+            &desk,
+            &with_budget(d, edge, price).bytes(),
+            &reference,
+            Some(&rescue),
+        )
+    };
+    let plain = check(&base, URGENT_MAX_COMPUTE_UNIT_PRICE).unwrap();
+    assert_eq!((plain.kind, plain.orders.len()), ("rescue", 0), "no order");
+    for (flags, urgent_ok) in [(0x80, true), (0, false)] {
+        let order = Draft::of(&with_flags(&doc, "IOC sell 0.005 ETH", flags));
+        let mut d = base.clone();
+        d.push_ix_of(&order, order.ixs.len() - 1);
+        let normal = check(&d, MAX_COMPUTE_UNIT_PRICE).unwrap();
+        assert_eq!((normal.kind, normal.orders.len()), ("rescue", 1));
+        assert_eq!(normal.orders[0].reduce_only, urgent_ok);
+        let urgent = check(&d, URGENT_MAX_COMPUTE_UNIT_PRICE);
+        if urgent_ok {
+            assert_eq!(urgent.unwrap().kind, "rescue");
+        } else {
+            let r = urgent.unwrap_err();
+            assert_eq!(r.code, E_SOL_PROGRAM, "{r}");
+            assert!(r.msg.contains("priority fee 1000000"), "{r}");
+        }
+    }
 }
 
 #[test]
@@ -900,6 +1269,38 @@ impl Draft {
         let owner = self.index(owner);
         let program = self.index(TOKEN_PROGRAM);
         self.ixs.push((program, vec![source, owner], vec![5]));
+        self
+    }
+
+    /// Appends instruction `ix` of `other` (same fee payer), each account added with the
+    /// writability it has in `other`.
+    fn push_ix_of(&mut self, other: &Draft, ix: usize) -> &mut Self {
+        let (program, accounts, data) = other.ixs[ix].clone();
+        let [signers, readonly_signed, readonly_unsigned] = other.header.map(usize::from);
+        let n = other.keys.len();
+        for &a in &accounts {
+            let i = usize::from(a);
+            let key = other.keys[i];
+            if i < signers {
+                assert_eq!(key, self.keys[0], "only the fee payer signs");
+            } else if i < n - readonly_unsigned {
+                self.writable(key);
+            } else {
+                self.index(key);
+            }
+        }
+        assert!(signers >= readonly_signed);
+        self.index(other.keys[usize::from(program)]);
+        // Indexes only now: `writable` moves the read-only keys up.
+        let at = |d: &Draft, key: Pubkey| {
+            u8::try_from(d.keys.iter().position(|k| *k == key).unwrap()).unwrap()
+        };
+        let mapped = accounts
+            .iter()
+            .map(|&a| at(self, other.keys[usize::from(a)]))
+            .collect();
+        let program = at(self, other.keys[usize::from(program)]);
+        self.ixs.push((program, mapped, data));
         self
     }
 
@@ -1376,7 +1777,7 @@ fn budget_cases(r: &mut Review<'_>) {
     d.ixs = vec![d.ixs[price].clone()];
     r.add(
         3,
-        "review 3: only SetComputeUnitPrice 1000000",
+        "review 3: only SetComputeUnitPrice 200000",
         cancel,
         &d,
         E_SOL_PROGRAM,
@@ -1479,6 +1880,69 @@ fn budget_cases(r: &mut Review<'_>) {
         &d,
         "order running",
     );
+    // C10 round 2: up to URGENT_MAX_COMPUTE_UNIT_PRICE for a message that only cancels or
+    // reduces, with at most RESCUE_MAX_COMPUTE_UNIT_LIMIT units; 200,000 for anything else.
+    let units = |d: &mut Draft, limit: u64, price: u64| {
+        let l = d.find(COMPUTE_BUDGET_PROGRAM, &[2]);
+        let limit = u32::try_from(limit).unwrap();
+        d.ixs[l].2[1..5].copy_from_slice(&limit.to_le_bytes());
+        let p = d.find(COMPUTE_BUDGET_PROGRAM, &[3]);
+        d.ixs[p].2[1..9].copy_from_slice(&price.to_le_bytes());
+    };
+    let urgent = URGENT_MAX_COMPUTE_UNIT_PRICE;
+    let edge = RESCUE_MAX_COMPUTE_UNIT_LIMIT;
+    for (case, limit, price, answer) in [
+        (
+            "at the urgent price",
+            edge,
+            urgent,
+            "cancel_all reduces_risk",
+        ),
+        ("over the urgent price", edge, urgent + 1, E_SOL_PROGRAM),
+        (
+            "at the urgent price over 400,000 units",
+            edge + 1,
+            urgent,
+            E_SOL_PROGRAM,
+        ),
+    ] {
+        let mut d = r.draft(cancel);
+        units(&mut d, limit, price);
+        r.add(
+            3,
+            &format!("C10 round 2: a cancel_all {case}"),
+            cancel,
+            &d,
+            answer,
+        );
+    }
+    let (mut d, _) = reduce_only(r);
+    units(&mut d, edge, urgent);
+    r.add(
+        3,
+        "C10 round 2: a reduce-only IOC sell at the urgent price",
+        sell,
+        &d,
+        "order reduces_risk",
+    );
+    // A deposit moves money: 200,000 at most (no price needed, so the contract's replay without
+    // prices answers the same; an opening order is in the_urgent_price_is_for_..., below).
+    let deposit = "deposit 15 USDC";
+    for (case, price, answer) in [
+        ("at 200,000", MAX_COMPUTE_UNIT_PRICE, "deposit running"),
+        ("at 200,001", MAX_COMPUTE_UNIT_PRICE + 1, E_SOL_PROGRAM),
+        ("at the urgent price", urgent, E_SOL_PROGRAM),
+    ] {
+        let mut d = r.draft(deposit);
+        units(&mut d, edge, price);
+        r.add(
+            3,
+            &format!("C10 round 2: a deposit {case}"),
+            deposit,
+            &d,
+            answer,
+        );
+    }
     // The lone Approve turned into a transfer from an account the desk may move (a stranger's,
     // with the desk as its delegate) into the desk's PhUSD account.
     let lone = "Token Approve of the desk PhUSD account to the Ember authority";
@@ -1717,16 +2181,25 @@ fn revoke_cases(r: &mut Review<'_>) {
     );
 }
 
-/// With the limit the price now needs, the priority fee is at most 0.0006 SOL; without one, the
-/// 1,400,000 units a message may burn at the top price would pay 0.0014 SOL.
+/// With the limit the price now needs, the priority fee is at most 0.00012 SOL (C10: the price
+/// cap is 200,000); without one, the 1,400,000 units a message may burn at the top price would
+/// pay 0.00028 SOL. An urgent message (it only cancels or reduces, or a rescue) may pay up to
+/// 1,000,000 for at most 400,000 units: 0.0004 SOL (C10 round 2).
 #[test]
 fn the_priority_fee_is_capped_by_the_limit_and_the_price_together() {
+    assert_eq!(URGENT_MAX_COMPUTE_UNIT_PRICE, 1_000_000);
+    assert_eq!(URGENT_MAX_PRIORITY_FEE_LAMPORTS, 400_000);
     assert_eq!(
         MAX_PRIORITY_FEE_LAMPORTS,
         u64::from(MAX_COMPUTE_UNIT_LIMIT) * MAX_COMPUTE_UNIT_PRICE / 1_000_000
     );
-    assert_eq!(MAX_PRIORITY_FEE_LAMPORTS, 600_000);
-    assert_eq!(1_400_000 * MAX_COMPUTE_UNIT_PRICE / 1_000_000, 1_400_000);
+    assert_eq!(MAX_COMPUTE_UNIT_PRICE, 200_000);
+    assert_eq!(MAX_PRIORITY_FEE_LAMPORTS, 120_000);
+    assert_eq!(1_400_000 * MAX_COMPUTE_UNIT_PRICE / 1_000_000, 280_000);
+    assert_eq!(
+        RESCUE_MAX_COMPUTE_UNIT_LIMIT * MAX_COMPUTE_UNIT_PRICE / 1_000_000,
+        80_000
+    );
 }
 
 /// Review item 4: Phoenix's vault in a deposit and a withdrawal, and every account of an Ember

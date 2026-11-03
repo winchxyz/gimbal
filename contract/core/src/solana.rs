@@ -9,6 +9,7 @@
 
 use crate::ed25519::is_on_curve;
 use crate::errors::{Refusal, E_ARGS, E_SOL_MESSAGE};
+use crate::phoenix::PhoenixAccounts;
 
 /// sha256, which the derivations take as a function (the contract passes the host's).
 pub type Sha256 = fn(&[u8]) -> [u8; 32];
@@ -141,6 +142,9 @@ pub struct SolDesk {
     pub usdc_ata: Pubkey,
     pub phusd_ata: Pubkey,
     pub trader: Pubkey,
+    /// Phoenix's and Ember's own accounts this desk's instructions must name:
+    /// [`PhoenixAccounts::PINNED`] from [`SolDesk::derive`], or what the desk's owner set.
+    pub infra: PhoenixAccounts,
 }
 
 impl SolDesk {
@@ -167,6 +171,7 @@ impl SolDesk {
             )?,
             trader: derived("Phoenix trader", phoenix_trader_address(sha256, &authority))?,
             authority,
+            infra: PhoenixAccounts::PINNED,
         })
     }
 

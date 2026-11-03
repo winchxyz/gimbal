@@ -601,6 +601,7 @@ fn fund_venue_counts_against_its_hourly_cost_budget() {
         Policy {
             max_notional_usd: 20,
             unpriced_max_notional_usd: 0,
+            max_hourly_notional_usd: None,
             max_transfer_cost_flat_e6: 600_000,
             ..policy()
         },

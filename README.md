@@ -94,7 +94,36 @@ Hyperliquid pays the code's owner 10% of the fees the desk pays.
 
 ## Security model
 
-<!-- fill: what the contract refuses (link to tests), what the operator can and cannot do, trust assumptions -->
+The contract builds every payload the desk's MPC keys sign and refuses anything outside the owner's policy;
+[docs/interfaces.md](docs/interfaces.md) §1.3 and §1.5 list each rule and its refusal code, and the contract's unit
+tests pin them. The operator key (a FunctionCall key on the owner's account) can trade inside the policy and move
+margin between the desk's own venue accounts; it cannot pay anyone else, change the policy or resume a paused desk.
+
+Bounds and accepted residuals, at the default policy:
+
+- **Wash trading.** An operator trading against itself at the band's edges loses about
+  2 × `max_hourly_notional_usd` × `price_band_bps` / 10⁴ per sliding hour on average, up to about 4 × in a single
+  hour, plus closing the positions held at its start and the venue fees. The causes: reduce-only closes are free
+  (not counted), and the meter decays linearly.
+- **Transfer fees.** 1Click's `appFees` are not in the signed quote; each quote's fee is bounded by 1 USDC + 25 bps
+  and all quotes of a sliding hour by the hourly cost budget's quote share (1 USD), with its own room for four
+  1 USDC venue fees.
+- **Paused rescues.** A paused desk still signs rescues; their Solana fees and the rent of each deposit owner's new
+  token account are lost to the desk: at most about 0.078 SOL per 65 min, about 0.01 SOL an hour after that.
+- **Urgent Solana fees.** Urgent `cancel_all` and reduce-only `sol_sign` messages have no count limit, on running and
+  paused desks: up to 0.000405 SOL each, bounded only by the operator key's NEAR allowance.
+- **Orderly replay.** A signed Orderly order can be posted again within its 300 s window; on mainnet opening orders
+  need the key's IP restriction signed first. The contract marks the list applied when it prepares that request,
+  before the signature returns, and cannot see whether the relayer posted it.
+- **Spot after a pause.** Spot pairs take no reduce-only orders, so after `panic_close` a spot holding is sold only
+  once the desk resumes. Gimbal trades no spot today.
+- **1Click key rotation.** A second quote key needs the treasury's proposal, the owner's acceptance and a day, so a
+  rotation pauses quoted transfers for at least a day; the treasury should be a multisig. An owner can distrust
+  1Click's pinned key for a desk, for good.
+- **Prices.** The seven oracle ids are fixed and asked together; if one breaks, owners move symbols to `unpriced`.
+  `refresh_prices` costs the contract up to 29–58 NEAR a day if spammed, so its balance is watched.
+- **Frozen venues.** A new Phoenix or Ember program id, PhUSD mint, onboarder or permission account needs a new
+  contract.
 
 ## Limits
 

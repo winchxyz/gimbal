@@ -44,7 +44,7 @@ test('the policy in words: assets per exchange, size, band, age, rescue, cost, p
     'Orders within 1% of the oracle price',
     'Oracle price no older than 15 minutes',
     'Margin moves out of an exchange: up to $500 an hour',
-    'A move may cost at most 1% of its amount, or $0.50 if that is more; $5.00 an hour in all',
+    'A move may cost at most 1% of its amount, or $0.50 if that is more; $5.00 an hour in all, plus up to 4 USDC of venue fees',
     'No assets without a trusted price',
     'Money out only to ada.testnet',
   ]);

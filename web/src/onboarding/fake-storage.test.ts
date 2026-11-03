@@ -76,7 +76,7 @@ test('the largest valid policy of the model is the one the contract caps its tes
   const start = tests.indexOf('fn the_storage_each_owner_method_adds');
   assert.ok(start >= 0, 'the contract’s measurement test exists');
   const body = tests.slice(start, tests.indexOf('\n}\n', start));
-  // The caps it asserts: 4,000 and 12,000 bytes for a desk, 8,000 for set_policy, 100 for the receiver, 500 for the IP list.
-  for (const cap of ['4_000', '12_000', '8_000', '100', '500']) assert.match(body, new RegExp(`\\b${cap}\\b`), `the contract's cap ${cap}`);
+  // The caps it asserts: 4,500 and 12,500 bytes for a desk, 8,000 for set_policy, 100 for the receiver, 500 for the IP list.
+  for (const cap of ['4_500', '12_500', '8_000', '100', '500']) assert.match(body, new RegExp(`\\b${cap}\\b`), `the contract's cap ${cap}`);
   assert.match(body, /Policy::largest_valid\(\)/);
 });

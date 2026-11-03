@@ -325,6 +325,7 @@ impl Targets {
             max_transfer_cost_flat_e6: 0,
             unpriced: vec![],
             unpriced_max_notional_usd: 0,
+            max_hourly_notional_usd: None,
         };
         policy.validate().unwrap();
         let prices = ctx["reference_prices_e8"]

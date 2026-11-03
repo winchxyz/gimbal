@@ -42,7 +42,9 @@ pub struct Policy {
     pub phoenix_markets: Vec<PhoenixMarket>,
     /// Orderly symbols, e.g. `PERP_SOL_USDC`.
     pub orderly_symbols: Vec<String>,
-    /// Per leg, whole USD.
+    /// Per order, whole USD: each order's notional at the reference price (`limits::check_value`).
+    /// One Phoenix message may carry several orders, each within it; what all signed orders of an
+    /// hour add up to is bounded by [`Policy::max_hourly_notional_usd`].
     pub max_notional_usd: u64,
     /// Order price against the oracle price.
     pub price_band_bps: u32,
@@ -58,7 +60,21 @@ pub struct Policy {
     /// Their own cap per leg; an unpriced order must fit [`Policy::unpriced_cap_usd`] at its own
     /// price.
     pub unpriced_max_notional_usd: u64,
+    /// Whole USD: the most notional the desk's signed orders that are not reduce-only may add up to
+    /// over a sliding hour, on all three venues together (the contract's hourly notional meter).
+    /// Optional in the JSON; `null` (or left out) means [`Policy::default_hourly_notional_usd`],
+    /// 15 × `max_notional_usd` ([`Policy::hourly_notional_cap_usd`]). Like the other caps it may
+    /// be 0, which refuses every order that is not reduce-only. It bounds what a stolen operator
+    /// key can lose by trading at the band's edge against its own counterparty: about 2 × this ×
+    /// `price_band_bps` / 10⁴ per sliding hour (the meter decays, so a full hour's worth is back
+    /// within the hour), plus the venues' fees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_hourly_notional_usd: Option<u64>,
 }
+
+/// The default hourly notional cap, in multiples of `max_notional_usd`: room for both legs opened
+/// and closed, a rotation, and the engine's maker repricing on Hyperliquid.
+pub const DEFAULT_HOURLY_NOTIONAL_MULTIPLE: u64 = 15;
 
 /// A symbol without a trusted price that the owner allowed. Its orders skip the price band, so the
 /// size is capped in base units: a notional cap at the caller's own limit price alone would let a
@@ -96,6 +112,21 @@ pub struct PhoenixMarket {
 }
 
 impl Policy {
+    /// [`DEFAULT_HOURLY_NOTIONAL_MULTIPLE`] × `max_notional_usd`, at most 2^53 − 1.
+    pub fn default_hourly_notional_usd(&self) -> u64 {
+        self.max_notional_usd
+            .saturating_mul(DEFAULT_HOURLY_NOTIONAL_MULTIPLE)
+            .min(MAX_SAFE_INTEGER)
+    }
+
+    /// The hourly notional cap in whole USD: `max_hourly_notional_usd`, or while it is `null`
+    /// (left out at `create_desk` or `set_policy`) [`Policy::default_hourly_notional_usd`], which
+    /// follows `max_notional_usd`.
+    pub fn hourly_notional_cap_usd(&self) -> u64 {
+        self.max_hourly_notional_usd
+            .unwrap_or_else(|| self.default_hourly_notional_usd())
+    }
+
     /// The notional cap per leg of an order for an `unpriced` symbol: both caps apply.
     pub fn unpriced_cap_usd(&self) -> u64 {
         self.max_notional_usd.min(self.unpriced_max_notional_usd)
@@ -232,6 +263,10 @@ impl Policy {
             ("rescue_cap_usd_per_hour", self.rescue_cap_usd_per_hour),
             ("max_transfer_cost_flat_e6", self.max_transfer_cost_flat_e6),
             ("unpriced_max_notional_usd", self.unpriced_max_notional_usd),
+            (
+                "max_hourly_notional_usd",
+                self.max_hourly_notional_usd.unwrap_or(0),
+            ),
         ] {
             safe_integer(field, value)?;
         }
@@ -298,6 +333,7 @@ impl Policy {
                 })
                 .collect(),
             unpriced_max_notional_usd: MAX_SAFE_INTEGER,
+            max_hourly_notional_usd: Some(MAX_SAFE_INTEGER),
         }
     }
 }
@@ -395,6 +431,7 @@ mod tests {
             max_transfer_cost_flat_e6: 500_000,
             unpriced: vec![unpriced("HYPE", "2.5")],
             unpriced_max_notional_usd: 100,
+            max_hourly_notional_usd: None,
         }
     }
 
@@ -439,6 +476,38 @@ mod tests {
         );
         assert_ne!(json, SHARED_JSON);
         assert!(serde_json::from_str::<Policy>(&json).is_err());
+    }
+
+    /// C10: the hourly notional cap defaults to 15 × the per-order cap, saturating at 2^53 − 1,
+    /// and an explicit value must be a safe integer.
+    #[test]
+    fn the_hourly_notional_cap_defaults_to_15_orders() {
+        let p = sample();
+        assert_eq!(p.max_hourly_notional_usd, None);
+        assert_eq!(p.hourly_notional_cap_usd(), 15 * p.max_notional_usd);
+        let set = Policy {
+            max_hourly_notional_usd: Some(7),
+            ..sample()
+        };
+        assert_eq!(set.hourly_notional_cap_usd(), 7);
+        let huge = Policy {
+            max_notional_usd: MAX_SAFE_INTEGER,
+            ..sample()
+        };
+        assert_eq!(huge.hourly_notional_cap_usd(), MAX_SAFE_INTEGER);
+        accepted(|p| p.max_hourly_notional_usd = Some(0));
+        accepted(|p| p.max_hourly_notional_usd = Some(MAX_SAFE_INTEGER));
+        assert!(
+            refused(|p| p.max_hourly_notional_usd = Some(MAX_SAFE_INTEGER + 1))
+                .contains("max_hourly_notional_usd")
+        );
+        let json: Policy = serde_json::from_value({
+            let mut v = serde_json::to_value(sample()).unwrap();
+            v.as_object_mut().unwrap().remove("max_hourly_notional_usd");
+            v
+        })
+        .unwrap();
+        assert_eq!(json, sample());
     }
 
     /// The refusal of a policy changed by `edit`: always `E_ARGS`, message starting `policy.`.

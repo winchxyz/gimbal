@@ -12,7 +12,7 @@ use gimbal_core::hl::{
     referral_code, set_referrer_action, Address, HlOrder, UserAction, EXPIRES_AFTER_MS,
 };
 use gimbal_core::ids::check_reason;
-use gimbal_core::limits::Valued;
+use gimbal_core::limits::notional_e8;
 use near_sdk::{env, near, Promise};
 
 use crate::action::{OrderDetail, UnsignedAction};
@@ -91,8 +91,10 @@ impl Gimbal {
     /// - exactly 1 yoctoNEAR: the owner's wallet (`E_NOT_ALLOWED` for anyone else), no limit, for
     ///   emergencies;
     /// - no deposit: the operator, or the owner's engine key, the way a rescue leaves Hyperliquid
-    ///   while 1Click quotes nothing out of HyperCore. `amount` counts against what is left of
-    ///   `rescue_cap_usd_per_hour` (`E_RESCUE_CAP`), not the cost budget or the deposit ring.
+    ///   while 1Click quotes nothing out of HyperCore. `amount` is at least 10 ×
+    ///   `max_transfer_cost_flat_e6` (`E_SIZE`) and counts against what is left of
+    ///   `rescue_cap_usd_per_hour`, and Hyperliquid's 1 USDC fee against what is left of the
+    ///   hourly rescue cost budget (`E_RESCUE_CAP`); not the deposit ring.
     ///
     /// Any other deposit is `E_NOT_ALLOWED`. `amount` as for [`Self::hl_usd_class_transfer`];
     /// Hyperliquid takes its withdrawal fee out of it, and the whole `amount` counts.
@@ -129,14 +131,18 @@ impl Gimbal {
                 )
             });
         let checked = check_order(&desk.policy, &order, reference).or_fail();
+        let valued = checked.valued;
+        let counters = self.count_notional(
+            &desk_id,
+            self.counters_of(&desk_id),
+            (!order.reduce_only).then(|| notional_e8(checked.px_e8, checked.sz_e8, &valued)),
+        );
         let detail = OrderDetail::new(
             &checked.symbol,
             order.is_buy,
             checked.sz_e8,
             checked.px_e8,
-            Valued {
-                oracle_e8: checked.oracle_e8,
-            },
+            valued,
         );
         let builder = treasury_builder(&self.config);
         let action = order_action(
@@ -153,6 +159,7 @@ impl Gimbal {
             nonce,
             Some(block_ms + EXPIRES_AFTER_MS),
         );
+        self.desk_counters.insert(desk_id.clone(), counters);
         UnsignedAction::hyperliquid(desk_id, prepared, Some(&reason)).with_orders(vec![detail])
     }
 
@@ -240,15 +247,15 @@ impl Gimbal {
         // The role first, so a stranger learns nothing from the deposit rule; a withdrawal only
         // moves money between the desk's own accounts, so it passes a pause either way.
         let (desk, _) = action_desk(&self.desks, &desk_id, Gate::ReducesRisk);
-        let path = check_withdraw_deposit(env::attached_deposit()).or_fail();
+        let path = check_withdraw_deposit("hl_withdraw", env::attached_deposit()).or_fail();
         if path == WithdrawPath::Owner {
             desk.check_owner(&desk_id, &env::predecessor_account_id(), "hl_withdraw")
                 .or_fail();
         }
         let amount_e8 = check_usdc_amount(&amount).or_fail();
         let destination = Address::parse("evm_address", &desk.evm_address).or_fail();
-        let counters =
-            (path == WithdrawPath::Operator).then(|| self.counted_hl_withdraw(&desk_id, amount_e8));
+        let counters = (path == WithdrawPath::Operator)
+            .then(|| self.counted_withdraw(&desk_id, "hl_withdraw", amount_e8));
         let time = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
         let action = UserAction::Withdraw {
             destination,
