@@ -41,6 +41,9 @@ export interface MarketFunding extends FundingRate {
                                  // funding plus borrow); absent = the same as ratePerHour
   fundingCapPerHour?: number;    // the venue's own per-market rate limits, per hour, from the same answer where it
   fundingFloorPerHour?: number;  // gives them; absent = unknown (the scanner falls back to its sourced caps)
+  rateReadAt?: number;           // ms: the rate is from this earlier read, because the venue's latest refresh of it
+                                 // failed (Phoenix serves its last hourly overview a few minutes); the scanner counts
+                                 // the row stale. Absent = read now
 }
 
 /**

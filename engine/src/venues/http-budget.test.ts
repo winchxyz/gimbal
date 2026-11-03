@@ -1,11 +1,13 @@
 // The per-host request budget on fake requests: the rate cap and the concurrency limit, critical reads ahead of the
-// scanner's, Retry-After, the backoff without it, the cool-down that skips scanner reads, waits that run out, and a
-// request that times out freeing its slot.
+// scanner's, Retry-After (an hour of it cut to the cap), the backoff without it, the cool-down that skips scanner reads,
+// waits that run out, a caller's deadline (readBy), and a request that times out freeing its slot.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { HostBudgetOptions, ReadKind } from './http-budget.ts';
-import { HostBudget, PHOENIX_BUDGET, ReadSkipped, isReadSkipped, readClass, retryAfterMs, scanRead } from './http-budget.ts';
+import {
+  HostBudget, PHOENIX_BUDGET, ReadSkipped, isReadSkipped, readBy, readClass, requestTimeoutMs, retryAfterMs, scanRead,
+} from './http-budget.ts';
 
 const FAST: HostBudgetOptions = {
   ...PHOENIX_BUDGET,
@@ -193,4 +195,44 @@ test('a request that times out frees its slot: the next one is sent', async () =
   assert.equal(res.status, 200);
   assert.ok(Date.now() - t0 < 1_000);
   assert.equal(b.state().inFlight, 0);
+});
+
+test('a Retry-After of an hour is cut to retryAfterMaxMs: a critical read probes the host after the capped wait', async () => {
+  const b = new HostBudget('test', { ...FAST, retryAfterMaxMs: 200, random: () => 0 });
+  let sent = 0;
+  const t0 = Date.now();
+  const res = await b.run('critical', async () => (++sent === 1 ? limited('3600') : ok()));
+  assert.equal(res.status, 200);
+  assert.equal(sent, 2);
+  const waited = Date.now() - t0;
+  assert.ok(waited >= 190 && waited < 2_000, `${waited} ms`);
+  // An HTTP date an hour away is cut the same way.
+  const b2 = new HostBudget('test', { ...FAST, retryAfterMaxMs: 200, random: () => 0 });
+  await b2.run('book', async () => limited(new Date(Date.now() + 3_600_000).toUTCString()));
+  assert.ok(b2.state().retryAt - Date.now() <= 200, `${b2.state().retryAt - Date.now()} ms`);
+  // Phoenix's cap, with its 15 % spread, ends inside a critical read's wait.
+  assert.ok(PHOENIX_BUDGET.retryAfterMaxMs * 1.15 < PHOENIX_BUDGET.maxWaitMs.critical);
+});
+
+test('readBy: a critical read waits for the budget only until the caller\'s deadline, and its request timeout ends there', async () => {
+  // One token, half a second to the next.
+  const b = new HostBudget('test', { ...FAST, ratePerSec: 2, burst: 1 });
+  assert.equal((await b.run('critical', async () => ok())).status, 200);
+  let sent = 0;
+  const t0 = Date.now();
+  await assert.rejects(readBy(Date.now() + 100, () => b.run(readClass('account'), async () => {
+    sent++;
+    return ok();
+  })), (err: unknown) => isReadSkipped(err) && err.reason === 'budget');
+  assert.equal(sent, 0);
+  assert.ok(Date.now() - t0 < 400, `gave up after ${Date.now() - t0} ms`);
+  // Without a deadline the same read waits for the token and is sent.
+  assert.equal((await b.run(readClass('account'), async () => ok())).status, 200);
+
+  assert.equal(requestTimeoutMs(10_000), 10_000);
+  const inside = await readBy(Date.now() + 50, async () => requestTimeoutMs(10_000));
+  assert.ok(inside <= 50 && inside >= 1, `${inside}`);
+  // A deadline inside another keeps the earlier; a past one skips at once.
+  assert.ok(await readBy(Date.now() + 50, () => readBy(Date.now() + 5_000, async () => requestTimeoutMs(10_000))) <= 50);
+  await assert.rejects(readBy(Date.now() - 1, () => b.run('critical', async () => ok())), (err: unknown) => isReadSkipped(err) && err.reason === 'budget');
 });

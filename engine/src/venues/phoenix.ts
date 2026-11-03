@@ -14,7 +14,8 @@ import type {
   TraderStateSnapshotResponse,
 } from '@ellipsis-labs/rise';
 import type { HostBudget, ReadKind } from './http-budget.ts';
-import { PHOENIX_BUDGET, hostBudget, readClass } from './http-budget.ts';
+import { PHOENIX_BUDGET, hostBudget, readClass, requestTimeoutMs } from './http-budget.ts';
+import { errorMessage } from './recorder.ts';
 import type {
   AccountState, Book, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, MarketFundingPoint,
   MarketHistorySource, Position, VenueReader,
@@ -40,12 +41,14 @@ const CONFIG_TTL_MS = 10 * 60_000;
 const HISTORY_MAX_POINTS = 31 * 24 + 2;
 // The rates funding() reports are the last booked hour's: the overview behind them changes once an hour, so it is
 // read again after a minute, not on every scan (the marks and open interest still are). A refresh that fails falls
-// back on the last overview while it is this young: an hourly rate a few minutes old is still this hour's.
+// back on the last overview while it is this young: an hourly rate a few minutes old is still this hour's. Rows
+// served that way carry rateReadAt (the scanner counts them stale) until a refresh is answered again.
 const OVERVIEW_TTL_MS = 60_000;
 const OVERVIEW_FALLBACK_MS = 10 * 60_000;
-// History reads of one window (the scanner asks every leg for the same aligned hours) share one all-market overview
-// request: one answer of about 2.3 MB for a week of 104 markets (measured 2026-11-03) instead of a request per
-// market. Kept this long, so a booking that lands late in the hour is picked up by legs read later.
+// The scanner's history reads of one window (it asks every leg for the same aligned hours) share one all-market
+// overview request: one answer of about 2.3 MB for a week of 104 markets (measured 2026-11-03) instead of a request
+// per market. Kept this long, so a booking that lands late in the hour is picked up by legs read later. A read from
+// outside the scanner (one symbol, pair-mainnet) asks for that symbol alone.
 const HISTORY_BATCH_TTL_MS = 10 * 60_000;
 const HISTORY_BATCHES_KEPT = 2;
 
@@ -94,10 +97,10 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
   readonly #traderPdaIndex: number;
   readonly #budget: HostBudget | null;
   #clients = new Map<ReadKind, Clients>();
-  #configs: { at: number; value: Promise<ExchangeMarketConfig[]> } | null = null;
-  #overview: { at: number; value: Promise<FundingOverviewResponse> } | null = null;
-  #lastOverview: { at: number; value: FundingOverviewResponse } | null = null;
-  #historyBatches = new Map<string, { at: number; value: Promise<FundingOverviewResponse> }>();
+  #configs: SharedRead<ExchangeMarketConfig[]> | null = null;
+  #overview: SharedRead<Dated<FundingOverviewResponse>> | null = null;
+  #lastOverview: Dated<FundingOverviewResponse> | null = null;
+  #historyBatches = new Map<string, SharedRead<FundingOverviewResponse>>();
 
   constructor(options: PhoenixReaderOptions = {}) {
     this.apiUrl = (options.apiUrl ?? PHOENIX_API_URL).replace(/\/+$/, '');
@@ -127,7 +130,9 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
       c.markets.getLatestMarketsStats(),
       this.#marketConfigs(false, 'funding'),
     ]);
-    return parseFunding(overview, stats, configs, this.#clock.now());
+    const rows = parseFunding(overview.value, stats, configs, this.#clock.now());
+    // The refresh failed and the last overview stands in: every rate says how old it is.
+    return overview.failed === null ? rows : rows.map((r) => ({ ...r, rateReadAt: overview.at }));
   }
 
   async book(symbol: string, depth?: number): Promise<Book> {
@@ -208,17 +213,20 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
     }
     const limit = Math.ceil((endTime - startTime) / HOUR_MS) + 2;
     if (limit > HISTORY_MAX_POINTS) throw new RangeError(`phoenix marketFundingHistory: ${limit} hours asked, at most ${HISTORY_MAX_POINTS}`);
-    // Every market's series of these hours in one request, shared by the legs that ask for the same hours; a market
-    // the batch does not carry (listed since, or left out) is asked for on its own, as before.
-    const batch = await this.#historyBatch(startTime, endTime, limit);
-    let series = batch.series.find((s) => s.symbol === symbol);
-    if (series === undefined) {
-      try {
-        series = await this.#api('history').funding.getFundingOverviewBySymbol(symbol, { startTime, endTime, perMarketLimit: limit });
-      } catch (err) {
-        if (err instanceof PhoenixHttpError && err.status === 404) throw new Error(`phoenix funding overview: unknown symbol ${symbol}`);
-        throw err;
-      }
+    // The scanner: every market's series of these hours in one request, shared by the legs that ask for the same
+    // hours. A market the batch does not carry (listed since, or left out), or carries fewer hours of than the batch's
+    // newest booking says there are (cut short), is asked for on its own; so is any read from outside the scanner.
+    if (readClass('history') !== 'critical') {
+      const batch = await this.#historyBatch(startTime, endTime, limit);
+      const found = batch.series.find((s) => s.symbol === symbol);
+      if (found !== undefined && coversBatch(found, batch, startTime, endTime)) return parseFundingSeries(found, startTime, endTime);
+    }
+    let series: FundingOverviewSeries;
+    try {
+      series = await this.#api('history').funding.getFundingOverviewBySymbol(symbol, { startTime, endTime, perMarketLimit: limit });
+    } catch (err) {
+      if (err instanceof PhoenixHttpError && err.status === 404) throw new Error(`phoenix funding overview: unknown symbol ${symbol}`);
+      throw err;
     }
     return parseFundingSeries(series, startTime, endTime);
   }
@@ -233,9 +241,10 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
 
   #marketConfigs(fresh: boolean, kind: ReadKind): Promise<ExchangeMarketConfig[]> {
     const now = this.#clock.now();
-    if (!fresh && this.#configs !== null && now - this.#configs.at < CONFIG_TTL_MS) return this.#configs.value;
+    const cached = this.#configs;
+    if (!fresh && cached !== null && now - cached.at < CONFIG_TTL_MS) return shared(cached, () => this.#marketConfigs(false, kind));
     const value = this.#api(kind).exchange.getMarkets();
-    const entry = { at: now, value };
+    const entry = { at: now, value, critical: readClass(kind) === 'critical' };
     this.#configs = entry;
     // A failed read is not kept: the next call asks again.
     value.catch(() => {
@@ -244,36 +253,47 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
     return value;
   }
 
-  /** The last booked hour of every market, read again once OVERVIEW_TTL_MS old; a failed refresh serves the last one. */
-  #fundingOverview(): Promise<FundingOverviewResponse> {
+  /**
+   * The last booked hour of every market, read again once OVERVIEW_TTL_MS old. A failed refresh serves the last one
+   * while it is OVERVIEW_FALLBACK_MS young, saying why (`failed`).
+   */
+  async #fundingOverview(): Promise<Dated<FundingOverviewResponse> & { failed: string | null }> {
+    try {
+      return { ...(await this.#overviewRead()), failed: null };
+    } catch (err) {
+      const now = this.#clock.now();
+      const last = this.#lastOverview;
+      if (last !== null && now >= last.at && now - last.at <= OVERVIEW_FALLBACK_MS) return { ...last, failed: errorMessage(err) };
+      throw err;
+    }
+  }
+
+  #overviewRead(): Promise<Dated<FundingOverviewResponse>> {
     const now = this.#clock.now();
     const cached = this.#overview;
-    if (cached !== null && now >= cached.at && now - cached.at < OVERVIEW_TTL_MS) return cached.value;
-    const read = this.#api('funding').funding.getFundingOverview({ perMarketLimit: 1 });
-    const entry = { at: now, value: read };
+    if (cached !== null && now >= cached.at && now - cached.at < OVERVIEW_TTL_MS) return shared(cached, () => this.#overviewRead());
+    const value = this.#api('funding').funding.getFundingOverview({ perMarketLimit: 1 }).then((v) => ({ at: now, value: v }));
+    const entry = { at: now, value, critical: readClass('funding') === 'critical' };
     this.#overview = entry;
-    read.then(
-      (value) => {
-        this.#lastOverview = { at: now, value };
+    value.then(
+      (d) => {
+        if (this.#lastOverview === null || d.at >= this.#lastOverview.at) this.#lastOverview = d;
       },
       () => {
         if (this.#overview === entry) this.#overview = null;
       },
     );
-    return read.catch((err: unknown) => {
-      const last = this.#lastOverview;
-      if (last !== null && now >= last.at && now - last.at <= OVERVIEW_FALLBACK_MS) return last.value;
-      throw err;
-    });
+    return value;
   }
 
+  /** The scanner's all-market history request of these hours; only scanner reads share it. */
   #historyBatch(startTime: number, endTime: number, limit: number): Promise<FundingOverviewResponse> {
     const now = this.#clock.now();
     const key = `${startTime}|${endTime}|${limit}`;
     const cached = this.#historyBatches.get(key);
     if (cached !== undefined && now >= cached.at && now - cached.at < HISTORY_BATCH_TTL_MS) return cached.value;
     const value = this.#api('history').funding.getFundingOverview({ startTime, endTime, perMarketLimit: limit });
-    const entry = { at: now, value };
+    const entry = { at: now, value, critical: false };
     this.#historyBatches.delete(key);
     this.#historyBatches.set(key, entry);
     while (this.#historyBatches.size > HISTORY_BATCHES_KEPT) this.#historyBatches.delete(this.#historyBatches.keys().next().value!);
@@ -301,6 +321,42 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
   }
 }
 
+/** An answer and when it was asked for (ms). */
+interface Dated<T> {
+  at: number;
+  value: T;
+}
+
+/** A read every caller of the reader shares while it is fresh, and whether a critical read started it. */
+interface SharedRead<T> {
+  at: number;
+  value: Promise<T>;
+  critical: boolean;
+}
+
+/**
+ * `entry`'s answer for a caller here. A critical caller does not take the failure of a read the scanner started
+ * (skipped by the budget, a 429 it did not retry, a timeout): it reads again as itself (`again`, which joins the
+ * read of another critical caller that got there first).
+ */
+function shared<T>(entry: SharedRead<T>, again: () => Promise<T>): Promise<T> {
+  if (entry.critical || readClass('account') !== 'critical') return entry.value;
+  return entry.value.catch(() => again());
+}
+
+/**
+ * Whether the all-market batch carries every hour of `series` it should: as many points in [startTime, endTime] as
+ * hours from startTime to the batch's newest booking in that range. Fewer means the market was listed since or its
+ * series came back cut short; either way the per-symbol answer is the one to trust.
+ */
+function coversBatch(series: FundingOverviewSeries, batch: FundingOverviewResponse, startTime: number, endTime: number): boolean {
+  const inRange = (s: FundingOverviewSeries) => s.points.map((p) => phoenixTimeMs(p.timestamp)).filter((t) => t >= startTime && t <= endTime);
+  let newest = -Infinity;
+  for (const s of batch.series) for (const t of inRange(s)) newest = Math.max(newest, t);
+  if (newest === -Infinity) return true;
+  return new Set(inRange(series)).size >= Math.floor((newest - startTime) / HOUR_MS) + 1;
+}
+
 interface Clients {
   exchange: InstanceType<typeof api.V1ExchangeClient>;
   funding: InstanceType<typeof api.V1FundingClient>;
@@ -313,7 +369,7 @@ interface Clients {
  * The SDK's HTTP surface over a plain `fetch`, so tests can replay recorded answers and capture can record them.
  * GET only: a reader never writes. The query is built the way the SDK builds it (null and undefined left out).
  * With a budget, every request waits for it as a `kind` read (its class set by where it is called from, see
- * http-budget.ts); the timeout runs from when the request is sent.
+ * http-budget.ts); the timeout runs from when the request is sent, and ends at the caller's deadline (readBy) if sooner.
  */
 export class FetchTransport implements HttpTransport {
   readonly #baseUrl: string;
@@ -337,7 +393,7 @@ export class FetchTransport implements HttpTransport {
     const send = () => this.#fetch(url.href, {
       method: 'GET',
       headers: { accept: 'application/json', ...options?.headers },
-      signal: AbortSignal.timeout(this.#timeoutMs),
+      signal: AbortSignal.timeout(requestTimeoutMs(this.#timeoutMs)),
     });
     if (this.#gate === undefined) return send();
     return this.#gate.budget.run(readClass(this.#gate.kind), send);

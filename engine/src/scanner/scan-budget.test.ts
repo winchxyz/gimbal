@@ -1,6 +1,7 @@
 // The scanner when a venue's request budget says no: books asked for in priority order, a skipped read stops the
-// venue's other books for the scan, cool-down skips count as failed with stale windows, budget skips do not, and a
-// scan on a Phoenix reader that answers 429 to everything resolves with stale windows instead of throwing.
+// venue's other books for the scan, cool-down skips count as failed and budget skips do not, either way a due book
+// left unread is stale; rates a venue could not refresh are stale; and a scan on a Phoenix reader that answers 429 to
+// everything resolves with stale windows instead of throwing.
 
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
@@ -122,10 +123,10 @@ test('a cool-down skip: the venue\'s other books are not asked for, it is failed
   assert.ok(phoenixWindows(r3.windows).every((w) => !w.stale));
 });
 
-test('a budget skip: the venue is not failed and its last book stands until twice bookTtlMs old, then it is stale', async () => {
+test('a budget skip: the venue is not failed, but a due book it could not read is stale at once, so its windows cannot be entered', async () => {
   const { hl, phoenix } = venues();
   const clock = new VirtualClock(T0);
-  const { scanner: s } = scanner([hl, phoenix], clock, null, POLICY);
+  const { scanner: s, notes } = scanner([hl, phoenix], clock, null, POLICY);
   await s.scan();
   // Only the first book of each scan is answered: the budget is spent after it.
   let answered = 0;
@@ -133,17 +134,50 @@ test('a budget skip: the venue is not failed and its last book stands until twic
   clock.set(T0 + 40_000);
   const r2 = await s.scan();
   assert.deepEqual(r2.scan.failed, []);
-  // BTC (the policy market) was read; the others are 40 s old, under 60 s: not stale.
-  assert.ok(phoenixWindows(r2.windows).every((w) => !w.stale), JSON.stringify(phoenixWindows(r2.windows).map((w) => [w.id, w.stale])));
+  const staleBases = (ws: FundingWindow[]) => [...new Set(ws.filter((w) => w.stale).map((w) => w.symbol))].sort();
+  // BTC (the policy market) was read; SOL, ETH and WIF were due and not read: their 40 s old books are stale.
+  assert.deepEqual(staleBases(phoenixWindows(r2.windows)), ['ETH', 'SOL', 'WIF']);
+  for (const w of phoenixWindows(r2.windows).filter((x) => x.stale)) {
+    assert.deepEqual(w.checks[0], { ok: false, text: 'Phoenix did not answer: numbers from 40 s ago' }, w.id);
+  }
+  assert.ok(phoenixWindows(r2.windows).some((w) => w.symbol === 'BTC' && !w.stale));
+  assert.ok(notes.some((n) => n.startsWith('phoenix books: 3 not read this scan (perp-api.phoenix.trade book read skipped: request budget spent')), notes.join('\n'));
 
+  // A scan later the best by gross of the stale ones (SOL) is read; BTC is 25 s old, not due; ETH and WIF stay stale.
   answered = 0;
   clock.set(T0 + 65_000);
   const r3 = await s.scan();
   assert.deepEqual(r3.scan.failed, []);
-  const ws = phoenixWindows(r3.windows);
-  // This scan read the best by gross that was due (SOL); BTC was read 25 s ago; ETH and WIF are 65 s old: stale.
-  const staleBases = [...new Set(ws.filter((w) => w.stale).map((w) => w.symbol))].sort();
-  assert.deepEqual(staleBases, ['ETH', 'WIF']);
+  assert.deepEqual(staleBases(phoenixWindows(r3.windows)), ['ETH', 'WIF']);
+});
+
+test('rates a venue could not refresh (rateReadAt): its legs are stale, dated that read, noted; the venue is not failed and its books are read', async () => {
+  const { hl, phoenix } = venues();
+  const clock = new VirtualClock(T0);
+  const { scanner: s, notes } = scanner([hl, phoenix], clock, null, POLICY);
+  const r1 = await s.scan();
+  assert.ok(phoenixWindows(r1.windows).every((w) => !w.stale));
+  const asked = phoenix.bookCalls.length;
+
+  clock.set(T0 + 40_000);
+  const fresh = phoenix.rows;
+  phoenix.rows = fresh.map((r) => ({ ...r, rateReadAt: T0 - 20_000 }));
+  const r2 = await s.scan();
+  assert.deepEqual(r2.scan.failed, []);
+  const ws = phoenixWindows(r2.windows);
+  assert.equal(ws.length, phoenixWindows(r1.windows).length);
+  for (const w of ws) {
+    assert.equal(w.stale, true, w.id);
+    assert.deepEqual(w.checks[0], { ok: false, text: 'Phoenix did not answer: numbers from 60 s ago' });
+  }
+  assert.ok(notes.includes('phoenix funding: the rates are from 60 s ago, its refresh of them failed'), notes.join('\n'));
+  assert.ok(phoenix.bookCalls.length > asked, 'its books are still read');
+
+  // Refreshed again: fresh windows.
+  phoenix.rows = fresh;
+  clock.set(T0 + 45_000);
+  const r3 = await s.scan();
+  assert.ok(phoenixWindows(r3.windows).every((w) => !w.stale));
 });
 
 test('a scan on a Phoenix reader that answers 429 to everything resolves: failed [phoenix], its windows stale with the last good numbers', async () => {

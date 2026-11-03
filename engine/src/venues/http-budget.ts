@@ -8,6 +8,9 @@
 // other read (an account or trader state for the risk engine, a rescue or the pair trader, a trader's book before a
 // close) is critical: it goes first, keeps a token and a slot no scanner read may take, waits out a cool-down and is
 // retried after a 429. The scanner marks its reads by running them inside scanRead(); a read outside it is critical.
+// A caller with a deadline of its own (the risk engine's account read) runs inside readBy(): its reads wait for the
+// budget and run at most until then. A Retry-After longer than retryAfterMaxMs is cut to it, so a host that asks for
+// an hour cannot lock critical reads out: they probe it again after the capped wait.
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 
@@ -49,6 +52,30 @@ export function scanRead<T>(fn: () => Promise<T>): Promise<T> {
   return scanReads.run(true, fn);
 }
 
+const deadlines = new AsyncLocalStorage<number>();
+
+/**
+ * Runs `fn` with a deadline (ms on the system clock): a budgeted read started in it waits for a token and a slot, and
+ * for a cool-down to end, at most until then, is not retried past it, and its request times out then (a transport
+ * that asks requestTimeoutMs). A deadline inside another keeps the earlier.
+ */
+export function readBy<T>(deadline: number, fn: () => Promise<T>): Promise<T> {
+  const outer = deadlines.getStore();
+  return deadlines.run(outer === undefined ? deadline : Math.min(outer, deadline), fn);
+}
+
+/** ms left before the deadline of the readBy() this runs in (0 once past); null outside one. */
+export function readTimeLeft(): number | null {
+  const d = deadlines.getStore();
+  return d === undefined ? null : Math.max(0, d - Date.now());
+}
+
+/** A request's timeout: `ms`, or less inside readBy() when the caller's deadline comes first (at least 1 ms). */
+export function requestTimeoutMs(ms: number): number {
+  const left = readTimeLeft();
+  return Math.max(1, left === null ? ms : Math.min(ms, left));
+}
+
 /** The queue class of a read of `kind` started here. */
 export function readClass(kind: ReadKind): ReadClass {
   if (scanReads.getStore() !== true) return 'critical';
@@ -73,6 +100,8 @@ export interface HostBudgetOptions {
   /** The wait after a 429 without Retry-After: base doubling per 429 in a row, up to max, with jitter. */
   backoffBaseMs: number;
   backoffMaxMs: number;
+  /** A Retry-After longer than this is cut to it: below maxWaitMs.critical, so a waiting critical read probes after it. */
+  retryAfterMaxMs: number;
   /** After a 429 scanner books and history stand aside at least this long, doubling per 429 in a row, up to max. */
   quietBaseMs: number;
   quietMaxMs: number;
@@ -96,6 +125,9 @@ export const PHOENIX_BUDGET: HostBudgetOptions = {
   retries: { critical: 3, funding: 1, book: 0, history: 0 },
   backoffBaseMs: 1_000,
   backoffMaxMs: 30_000,
+  // Phoenix asks for 1 s; anything past 10 s is not believed (with the 15 % spread it still ends inside a critical
+  // read's 15 s wait).
+  retryAfterMaxMs: 10_000,
   quietBaseMs: 5_000,
   quietMaxMs: 60_000,
 };
@@ -171,10 +203,13 @@ export class HostBudget {
   /**
    * Sends one request through the budget. `send` is called when a token and a slot are free (again after a 429 the
    * class may retry); a 429 that is not retried is returned as it came, for the caller to raise. Rejects with
-   * ReadSkipped when nothing was sent.
+   * ReadSkipped when nothing was sent. Inside readBy() the wait ends at the caller's deadline when that comes first.
    */
   async run(cls: ReadClass, send: () => Promise<Response>): Promise<Response> {
-    const deadline = this.#now() + this.#o.maxWaitMs[cls];
+    const left = readTimeLeft();
+    const now = this.#now();
+    if (left === 0) throw new ReadSkipped(this.host, cls, 'budget', null, now);
+    const deadline = now + Math.min(this.#o.maxWaitMs[cls], left ?? Infinity);
     for (let attempt = 0; ; attempt++) {
       await this.#acquire(cls, deadline);
       let res: Response;
@@ -198,9 +233,10 @@ export class HostBudget {
     const now = this.#now();
     this.#rateLimited++;
     const n = this.#rateLimited;
-    const said = retryAfterMs(res.headers.get('retry-after'), now);
-    // Retry-After is honoured as given, plus up to 15 % so that waiting callers do not all come back at once; without
-    // it, an exponential backoff with jitter (half to all of the step).
+    const given = retryAfterMs(res.headers.get('retry-after'), now);
+    const said = given === null ? null : Math.min(given, this.#o.retryAfterMaxMs);
+    // Retry-After is honoured as given up to retryAfterMaxMs, plus up to 15 % so that waiting callers do not all come
+    // back at once; without it, an exponential backoff with jitter (half to all of the step).
     const pause = said !== null
       ? Math.round(said * (1 + 0.15 * this.#random()))
       : Math.round(Math.min(this.#o.backoffMaxMs, this.#o.backoffBaseMs * 2 ** (n - 1)) * (0.5 + 0.5 * this.#random()));

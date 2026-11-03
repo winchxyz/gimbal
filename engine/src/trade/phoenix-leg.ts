@@ -31,6 +31,8 @@ import {
 } from '../relayer/phoenix-tx.ts';
 import type { DeskSolanaAccounts, PhoenixExchangeAccounts } from '../relayer/phoenix-withdraw.ts';
 import { NothingExecuted } from '../relayer/tx.ts';
+import type { HostBudget } from '../venues/http-budget.ts';
+import { PHOENIX_BUDGET, hostBudget, readClass, requestTimeoutMs } from '../venues/http-budget.ts';
 import type { Clock } from '../venues/venue.ts';
 import { systemClock } from '../venues/venue.ts';
 import type { LegOutcome, LegRef, LegSide, TradeLeg } from './legs.ts';
@@ -387,10 +389,21 @@ export class PhoenixLeg implements TradeLeg {
   }
 }
 
-/** The Phoenix trader API over fetch (GET only). */
-export function phoenixTraderApi(apiUrl: string, fetchImpl: typeof fetch = fetch, traderPdaIndex = 0): PhoenixTraderApi {
+/**
+ * The Phoenix trader API over fetch (GET only). Every request goes through `budget`: by default the one every Phoenix
+ * reader of this API host in the process shares (venues/http-budget.ts), so in serve it counts against the same host
+ * limit as the scanner's reads. Called outside the scanner its reads are critical: ahead of the scanner's, never
+ * skipped for them, retried after a 429 once Retry-After (capped) has passed. null: no budget.
+ */
+export function phoenixTraderApi(
+  apiUrl: string, fetchImpl: typeof fetch = fetch, traderPdaIndex = 0, budget: HostBudget | null = hostBudget(apiUrl, PHOENIX_BUDGET),
+): PhoenixTraderApi {
+  const base = apiUrl.replace(/\/+$/, '');
   const get = async (path: string): Promise<unknown> => {
-    const res = await fetchImpl(`${apiUrl.replace(/\/+$/, '')}${path}`, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(10_000) });
+    const send = () => fetchImpl(`${base}${path}`, {
+      method: 'GET', headers: { accept: 'application/json' }, signal: AbortSignal.timeout(requestTimeoutMs(10_000)),
+    });
+    const res = budget === null ? await send() : await budget.run(readClass('account'), send);
     const body = await res.json().catch(() => null) as unknown;
     if (!res.ok) throw new Error(`phoenix GET ${path}: HTTP ${res.status} ${JSON.stringify(body)?.slice(0, 160)}`);
     return body;

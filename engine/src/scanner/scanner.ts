@@ -3,7 +3,8 @@
 //
 // What a scan does, in order:
 // 1. funding() of every reader at once; a reader that fails or times out is listed in ScanStatus.failed and its last
-//    good read (if not older than dropAfterMs) is used, marked stale;
+//    good read (if not older than dropAfterMs) is used, marked stale; a reader that answers with rates from an
+//    earlier read (rateReadAt: its refresh of them failed) is used marked stale too, dated that read, and noted;
 // 2. legs: one per venue and base, marks checked against the other venues; a watch leg needs the open-interest floor,
 //    a desk leg at most deskMaxOiShare of its open interest (pairs.ts); the held window's legs are never dropped, they
 //    fail a check instead;
@@ -16,10 +17,10 @@
 //    book, marked stale, and lists the venue as failed); a venue whose funding failed this scan is not asked for
 //    books; a desk pair with no book ever read is left out. They are asked for in order: the held window's legs, the
 //    policy's markets, then the other legs by the gross funding of their best pair, so that a venue's request budget
-//    (venues/http-budget.ts: Phoenix) goes to them first. A read the budget skips is not sent: in a cool-down after a
-//    429 the venue counts as failed and its last books are stale; when only this scan's budget is spent, the last
-//    book stands until it is twice bookTtlMs old, then it is stale. Either way the venue's other books wait for the
-//    next scan;
+//    (venues/http-budget.ts: Phoenix) goes to them first. A read the budget skips is not sent and its last book is
+//    stale (the numbers are from the last good read, so its windows cannot be entered on it); in a cool-down after a
+//    429 the venue also counts as failed, while a skip because only this scan's budget is spent does not. Either way
+//    the venue's other books wait for the next scan;
 // 5. each window priced (price.ts); the 7-day gross and intervalsAbove from the hourly rate store, which a few
 //    public history reads per scan fill in the background (a scan never waits on them);
 // 6. ranked: enterable windows, then the other desk windows, each by the spread expected over the hold minus the
@@ -304,8 +305,13 @@ export class Scanner {
       try {
         const rows = await withTimeout(this.#once(`funding ${s.id}`, () => scanRead(() => s.funding())), config.readTimeoutMs, `${s.id} funding`);
         if (!Array.isArray(rows)) throw new Error(`${s.id} funding: not a list`);
-        this.#lastGood.set(s.id, { rows, at: now });
-        return { source: s, rows, at: now, stale: false };
+        // Rates the venue could not refresh: the answer is as old as its oldest rate, and stale.
+        const ratesAt = rows.reduce((m: number, r: MarketFunding) => (typeof r.rateReadAt === 'number' && Number.isFinite(r.rateReadAt) ? Math.min(m, r.rateReadAt) : m), Infinity);
+        const at = Math.min(now, ratesAt);
+        this.#lastGood.set(s.id, { rows, at });
+        if (ratesAt === Infinity) return { source: s, rows, at, stale: false };
+        this.#note(`${s.id} funding: the rates are from ${Math.max(0, Math.round((now - at) / 1000))} s ago, its refresh of them failed`);
+        return { source: s, rows, at, stale: true };
       } catch (err) {
         failed.add(s.id);
         this.#note(`${s.id} funding failed: ${errorMessage(err)}`);
@@ -377,7 +383,7 @@ export class Scanner {
       const d = deferred.get(w.leg.venue);
       if (d === undefined) deferred.set(w.leg.venue, { first: why, count: 1 });
       else d.count++;
-      this.#deferBook(w.key, why, now);
+      this.#deferBook(w.key, now);
     };
     await pool(due.map((w) => async () => {
       const { key, leg } = w;
@@ -731,11 +737,11 @@ export class Scanner {
   }
 
   /**
-   * A due book whose read the venue's budget did not send. A book never read stays missing (its pairs are left out).
-   * In a cool-down after a 429 the last book is stale at once; when only the budget was spent it stands until it is
-   * twice bookTtlMs old: the read is due again next scan, and a long list of books needs a few scans to go round.
+   * A due book whose read the venue's budget did not send, for a cool-down or a spent budget alike. A book never
+   * read stays missing (its pairs are left out); the last one is stale, so the windows on it show their numbers but
+   * cannot be entered, until a read is answered (it is due again next scan).
    */
-  #deferBook(key: string, why: ReadSkipped, now: number): void {
+  #deferBook(key: string, now: number): void {
     const { config } = this.#options;
     const last = this.#books.get(key);
     if (last === undefined) return;
@@ -743,8 +749,7 @@ export class Scanner {
       this.#books.delete(key);
       return;
     }
-    const stale = last.stale || why.reason === 'cooling' || last.readAt > now || now - last.readAt >= 2 * config.bookTtlMs;
-    if (stale !== last.stale) this.#books.set(key, { ...last, stale });
+    if (!last.stale) this.#books.set(key, { ...last, stale: true });
   }
 
   /**

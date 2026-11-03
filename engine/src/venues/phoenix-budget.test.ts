@@ -1,14 +1,16 @@
 // The Phoenix reader under its request budget, on a fake fetch that answers from the mainnet wire recording
 // (fixtures/phoenix-wire) unless a test says otherwise: 429 bursts, Retry-After, timeouts, account reads ahead of the
 // scanner's book reads, and the requests it no longer makes (the funding overview once a minute, one history request
-// for every market).
+// for every market); shared reads a critical caller does not inherit a scanner failure from; and the pair trader's
+// and rescuer's trader API (phoenixTraderApi) on the same budget.
 
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { PhoenixHttpError } from '@ellipsis-labs/rise';
-import { HostBudget, PHOENIX_BUDGET, isReadSkipped, scanRead } from './http-budget.ts';
+import { phoenixTraderApi } from '../trade/phoenix-leg.ts';
+import { HostBudget, PHOENIX_BUDGET, hostBudget, isReadSkipped, scanRead } from './http-budget.ts';
 import type { HostBudgetOptions } from './http-budget.ts';
 import { PhoenixReader } from './phoenix.ts';
 import { VirtualClock, readWireRecording } from './replay.ts';
@@ -127,12 +129,13 @@ test('account reads go ahead of the scanner\'s queued book reads', async () => {
   assert.equal(order.filter((o) => o === 'book').length, 6, 'the books are read too, after');
 });
 
-test('funding: the overview is read once a minute (rates book hourly), the marks on every call; a failed refresh serves the last one', async () => {
+test('funding: the overview is read once a minute (rates book hourly), the marks on every call; a failed refresh serves the last one, dated', async () => {
   let overviewDown = false;
   const { f, count } = fakeFetch((url) => (overviewDown && url.pathname === '/v1/funding/overview' ? new Response('{}', { status: 502 }) : undefined));
   const clock = new VirtualClock(AT);
   const { reader: r } = reader(f, {}, clock);
   const first = await scanRead(() => r.funding());
+  assert.ok(first.every((x) => x.rateReadAt === undefined));
   clock.set(AT + 5_000);
   await scanRead(() => r.funding());
   assert.equal(count('/v1/funding/overview'), 1);
@@ -140,37 +143,177 @@ test('funding: the overview is read once a minute (rates book hourly), the marks
   clock.set(AT + 61_000);
   await scanRead(() => r.funding());
   assert.equal(count('/v1/funding/overview'), 2);
-  // The overview fails: the one from a minute ago stands, the marks are read as ever.
+  // The overview fails: the one from a minute ago stands, every rate dated when it was read (the scanner counts the
+  // rows stale); the marks are read as ever.
   overviewDown = true;
   clock.set(AT + 125_000);
   const later = await scanRead(() => r.funding());
   assert.equal(count('/v1/funding/overview'), 3);
   assert.deepEqual(later.map((x) => [x.symbol, x.ratePerHour]), first.map((x) => [x.symbol, x.ratePerHour]));
+  assert.ok(later.length > 0 && later.every((x) => x.rateReadAt === AT + 61_000));
+  // The next scan asks again (a failed refresh is not cached); answered, the rates are fresh.
+  overviewDown = false;
+  clock.set(AT + 130_000);
+  const again = await scanRead(() => r.funding());
+  assert.equal(count('/v1/funding/overview'), 4);
+  assert.ok(again.every((x) => x.rateReadAt === undefined));
   // Past ten minutes the old overview is not served.
-  clock.set(AT + 61_000 + 11 * 60_000);
+  overviewDown = true;
+  clock.set(AT + 130_000 + 11 * 60_000);
   await assert.rejects(scanRead(() => r.funding()), PhoenixHttpError);
 });
 
-test('history: the legs of one window share one all-market request; a market it lacks is asked for alone', async () => {
-  const overview = LINES.find((l) => l.url.includes('/v1/funding/overview'))!.response as { series: { symbol: string; points: { timestamp: number }[] }[] };
+test('a critical read that joins a shared read the scanner started, which fails, reads again as itself', async () => {
+  let configsDown = 1;
+  let overviewDown = 1;
   const { f, count } = fakeFetch((url) => {
-    if (url.pathname === '/v1/funding/overview' && url.searchParams.has('startTime')) return new Response(JSON.stringify(overview), { status: 200 });
-    if (url.pathname.startsWith('/v1/funding/overview/')) return new Response('{"error":"not found"}', { status: 404 });
+    if (url.pathname === '/v1/view/exchange/markets' && configsDown-- > 0) return new Response('{}', { status: 502 });
+    if (url.pathname === '/v1/funding/overview' && overviewDown-- > 0) return new Response('{}', { status: 502 });
     return undefined;
   });
   const { reader: r } = reader(f);
-  const sol = overview.series.find((s) => s.symbol === 'SOL')!.points.at(-1)!.timestamp * 1000;
-  const start = sol - 3_600_000;
-  const end = sol + 3_600_000;
+  // The scanner starts the market configs and the overview; pair-mainnet's funding() and the risk engine's account
+  // read join them while they run.
+  const scan = scanRead(() => r.funding());
+  const pair = r.funding();
+  const risk = r.account(AUTHORITY);
+  await assert.rejects(scan, PhoenixHttpError);
+  const rows = await pair;
+  assert.ok(rows.length > 0 && rows.every((x) => x.rateReadAt === undefined));
+  assert.equal((await risk).address, AUTHORITY);
+  // One read again of each, shared by both critical callers.
+  assert.equal(count('/v1/view/exchange/markets'), 2);
+  assert.equal(count('/v1/funding/overview'), 2);
+
+  // The other way round, a scanner read that joins a critical one takes its answer as it is.
+  const { f: f2, count: count2 } = fakeFetch();
+  const { reader: r2 } = reader(f2);
+  await Promise.all([r2.account(AUTHORITY), scanRead(() => r2.funding())]);
+  assert.equal(count2('/v1/view/exchange/markets'), 1);
+});
+
+test('a scanner read skipped by the budget does not fail a critical read that shares it', async () => {
+  const { f, count } = fakeFetch();
+  // A cool-down after a 429 on a scanner book: the scanner's funding read (here waiting at most 100 ms) is skipped, the
+  // cool-down running longer; the account read (15 s) waits it out.
+  const { reader: r, budget } = reader(f, { maxWaitMs: { ...PHOENIX_BUDGET.maxWaitMs, funding: 100 } });
+  await budget.run('book', async () => new Response('{}', { status: 429, headers: { 'retry-after': '0.3' } }));
+  const scan = scanRead(() => r.funding());
+  const risk = r.account(AUTHORITY);
+  await assert.rejects(scan, (err: unknown) => isReadSkipped(err));
+  assert.equal((await risk).address, AUTHORITY);
+  assert.equal(count('/v1/view/exchange/markets'), 1, 'sent once, by the account read');
+});
+
+test('history: the scanner\'s legs of one window share one all-market request; a market it lacks or cuts short is asked for alone', async () => {
+  type Series = { symbol: string; points: { timestamp: number }[] };
+  const recorded = LINES.find((l) => l.url.includes('/v1/funding/overview'))!.response as { series: Series[] };
+  const last = recorded.series.find((s) => s.symbol === 'SOL')!.points.at(-1)!.timestamp;
+  // Three booked hours of a market (the recording has the last one; the two before are copies of it).
+  const hours = (s: Series): Series => ({ ...s, points: [2, 1, 0].map((k) => ({ ...s.points.at(-1)!, timestamp: last - k * 3600 })) });
+  // The batch carries three hours of every market but BTC, cut to its last one.
+  const batch = { series: recorded.series.map((s) => (s.symbol === 'BTC' ? { ...s, points: s.points.slice(-1) } : hours(s))) };
+  const { f, count } = fakeFetch((url) => {
+    if (url.pathname === '/v1/funding/overview' && url.searchParams.has('startTime')) return new Response(JSON.stringify(batch), { status: 200 });
+    if (url.pathname.startsWith('/v1/funding/overview/')) {
+      const one = recorded.series.find((s) => s.symbol === decodeURIComponent(url.pathname.split('/').at(-1)!));
+      return one === undefined ? new Response('{"error":"not found"}', { status: 404 }) : new Response(JSON.stringify(hours(one)), { status: 200 });
+    }
+    return undefined;
+  });
+  const { reader: r } = reader(f);
+  const start = (last - 2 * 3600) * 1000;
+  const end = last * 1000 + 1_800_000;
   const [a, b] = await Promise.all([
     scanRead(() => r.marketFundingHistory('SOL', start, end)),
     scanRead(() => r.marketFundingHistory('ETH', start, end)),
   ]);
-  assert.equal(a.length, 1);
-  assert.equal(a[0]!.symbol, 'SOL');
-  assert.equal(b[0]!.symbol, 'ETH');
-  await scanRead(() => r.marketFundingHistory('BTC', start, end));
+  assert.deepEqual(a.map((p) => [p.symbol, p.time]), [0, 1, 2].map((k) => ['SOL', start + k * 3_600_000]));
+  assert.equal(b.length, 3);
   assert.equal(count('/v1/funding/overview?'), 1, 'one request for every market of that window');
-  await assert.rejects(r.marketFundingHistory('NOPE', start, end), /unknown symbol NOPE/);
+  assert.equal(count('/v1/funding/overview/'), 0);
+  // BTC's series in the batch is short of the batch's hours: its own answer is used.
+  const btc = await scanRead(() => r.marketFundingHistory('BTC', start, end));
+  assert.equal(btc.length, 3);
+  assert.equal(count('/v1/funding/overview/BTC'), 1);
+  assert.equal(count('/v1/funding/overview?'), 1);
+  // A market the batch lacks is asked for alone.
+  await assert.rejects(scanRead(() => r.marketFundingHistory('NOPE', start, end)), /unknown symbol NOPE/);
   assert.equal(count('/v1/funding/overview/NOPE'), 1);
+});
+
+test('history outside the scanner (pair-mainnet, one symbol): asked for alone, the all-market batch never downloaded', async () => {
+  const recorded = LINES.find((l) => l.url.includes('/v1/funding/overview'))!.response as { series: { symbol: string; points: { timestamp: number }[] }[] };
+  const sol = recorded.series.find((s) => s.symbol === 'SOL')!;
+  const { f, count } = fakeFetch((url) => {
+    if (url.pathname === '/v1/funding/overview/SOL') return new Response(JSON.stringify(sol), { status: 200 });
+    return undefined;
+  });
+  const { reader: r } = reader(f);
+  const at = sol.points.at(-1)!.timestamp * 1000;
+  const points = await r.marketFundingHistory('SOL', at - 7 * 86_400_000, at + 1_000);
+  assert.deepEqual(points.map((p) => p.time), [at]);
+  assert.equal(count('/v1/funding/overview/SOL'), 1);
+  assert.equal(count('/v1/funding/overview?'), 0);
+});
+
+const TRADER_STATE = `/v1/trader/state/${AUTHORITY}`;
+
+test('phoenixTraderApi: a 429 on the trader state is retried after Retry-After, then answered', async () => {
+  let states = 0;
+  const { f } = fakeFetch((url) => (url.pathname === TRADER_STATE && ++states === 1 ? limited('0.2') : undefined));
+  const budget = new HostBudget('phoenix-test', { ...PHOENIX_BUDGET, random: () => 0 });
+  const t0 = Date.now();
+  const raw = await phoenixTraderApi('https://perp-api.phoenix.trade/', f, 0, budget).traderState(AUTHORITY);
+  assert.equal(states, 2);
+  assert.ok(Date.now() - t0 >= 190, `answered after ${Date.now() - t0} ms`);
+  assert.equal(typeof raw, 'object');
+  assert.equal(budget.state().rateLimited, 1);
+  assert.equal(budget.state().sent, 2);
+
+  // An hour of Retry-After is cut to the cap: the read probes after it instead of failing for an hour.
+  states = 0;
+  const capped = new HostBudget('phoenix-test', { ...PHOENIX_BUDGET, retryAfterMaxMs: 200, random: () => 0 });
+  const { f: f2 } = fakeFetch((url) => (url.pathname === TRADER_STATE && ++states === 1 ? limited('3600') : undefined));
+  const t1 = Date.now();
+  await phoenixTraderApi('https://perp-api.phoenix.trade', f2, 0, capped).traderState(AUTHORITY);
+  assert.equal(states, 2);
+  assert.ok(Date.now() - t1 < 2_000, `${Date.now() - t1} ms`);
+});
+
+test('phoenixTraderApi under scanner load: its reads go first and are never skipped, in a cool-down too', async () => {
+  let booksLimited = false;
+  const { f, urls } = fakeFetch((url) => (booksLimited && url.pathname.startsWith('/v1/view/orderbook/') ? limited('0.3') : undefined));
+  // The scanner's reader and the trader API on one budget: 20 a second, a burst of 2, one token kept for critical reads.
+  const { reader: r, budget } = reader(f, { ratePerSec: 20, burst: 2 });
+  const api = phoenixTraderApi('https://perp-api.phoenix.trade', f, 0, budget);
+  const symbols = ['SOL', 'ETH', 'BTC', 'SOL', 'ETH', 'BTC', 'SOL', 'ETH'];
+  const books = Promise.allSettled(symbols.map((s) => scanRead(() => r.book(s))));
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await api.traderState(AUTHORITY);
+  await books;
+  const order = urls.map((u) => (u.pathname === TRADER_STATE ? 'state' : 'book'));
+  assert.ok(order.indexOf('state') <= 2, order.join(' '));
+
+  // A scanner book draws a 429: the scanner's next books are skipped unsent for the cool-down, the trader state is
+  // sent after it and answered.
+  booksLimited = true;
+  await assert.rejects(scanRead(() => r.book('SOL')), (err: unknown) => err instanceof PhoenixHttpError && err.status === 429);
+  const sent = urls.length;
+  await assert.rejects(scanRead(() => r.book('ETH')), (err: unknown) => isReadSkipped(err) && err.reason === 'cooling');
+  assert.equal(urls.length, sent);
+  const t0 = Date.now();
+  await api.traderState(AUTHORITY);
+  assert.ok(Date.now() - t0 >= 250, `answered after ${Date.now() - t0} ms`);
+  assert.equal(urls.at(-1)!.pathname, TRADER_STATE);
+});
+
+test('phoenixTraderApi with no budget given shares the process\'s budget for that host with the Phoenix reader', async () => {
+  const origin = 'https://phoenix-shared.test';
+  const { f } = fakeFetch(() => new Response('{"ok":true}', { status: 200 }));
+  const shared = hostBudget(origin, PHOENIX_BUDGET);
+  const before = shared.state().sent;
+  await phoenixTraderApi(`${origin}/`, f).traderState(AUTHORITY);
+  await new PhoenixReader({ apiUrl: origin, fetch: f }).book('SOL').catch(() => {});
+  assert.equal(shared.state().sent, before + 2);
 });
