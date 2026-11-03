@@ -35,6 +35,12 @@
 // has not settled (SUCCESS, REFUNDED, or expired unused); for what nearblocks has not indexed, the desk's EIP-3009
 // counter (contract state) and authorizationState on Arbitrum USDC stand in. Anything unreadable refuses.
 // --again sends anyway; the dry run lists the same reasons.
+//
+// The rescuer's lock: --send takes the live rescuer's lock of the contract and desk (engine/src/rescue/lock.ts) for
+// the whole run and refuses, before anything is signed, while a live rescuer holds it. Both sign with the desk's
+// EIP-3009 counter, spend its Arbitrum USDC and count against its rescue cap, so a rescuer running beside this
+// script would read the script's payment as its own (or miss it) and could pay twice. --again does not lift this;
+// stop the rescuer first. The dry run only says whether the lock is held.
 
 import { UsageError, envValues, isMain, parseFlags, run } from './cli.mjs';
 import {
@@ -638,16 +644,45 @@ const defaultEngine = async () => ({
   ...(await import('../../engine/src/relayer/arbitrum.ts')),
 });
 
+/** The rescuer's lock functions (engine/src/rescue/lock.ts). */
+const defaultLock = () => import('../../engine/src/rescue/lock.ts');
+
+/** The --send refusal while the desk's live rescuer holds its lock. */
+export const lockRefusal = (shown) => `--send refused, nothing was signed: the desk's live rescuer holds ${shown}; this script signs with the same EIP-3009 counter, `
+  + 'spends the same Arbitrum USDC and counts against the same rescue cap, so the two must not run together: stop the rescuer first (--again does not lift this)';
+
 /**
  * Runs one stage. deps: near, fetch, say, now, tree, readKey(file, accountId), env (Map of ONECLICK_API_KEY and
- * RELAYER_EVM_PRIVATE_KEY), urls (rpcUrls()), engine() (the engine modules), sleep, pollMs, checkQuote (tests).
- * Returns the block.
+ * RELAYER_EVM_PRIVATE_KEY), urls (rpcUrls()), engine() (the engine modules), lock() (the rescuer's lock functions),
+ * sleep, pollMs, checkQuote (tests). Returns the block.
  */
 export async function runHlReturn(argv, deps = {}) {
   const a = parseHlReturnArgs(argv);
   const tree = deps.tree === undefined ? linkedWorktreeOf(ROOT) : deps.tree;
   const refusal = sendRefusal(a.send, tree);
   if (refusal !== null) throw new Error(refusal);
+  const locks = await (deps.lock ?? defaultLock)();
+  const name = locks.rescueLockName((k) => process.env[k], 'mainnet', a.contract, a.deskId);
+  const shown = locks.lockText(name);
+  if (!a.send) {
+    const held = await locks.lockHeld(name);
+    return runStage(a, tree, deps, held ? `warning   the desk's live rescuer holds ${shown}: --send refuses while it runs` : `lock      ${shown} is free (--send takes it for the run)`);
+  }
+  let lock;
+  try {
+    lock = await locks.acquireRescueLock(name);
+  } catch (e) {
+    if (/holds/.test(e.message)) throw new Error(lockRefusal(shown));
+    throw new Error(`--send refused, nothing was signed: ${e.message}`);
+  }
+  try {
+    return await runStage(a, tree, deps, `lock      ${shown} taken for this run: no live rescuer of the desk can start until it ends`);
+  } finally {
+    await lock.release();
+  }
+}
+
+async function runStage(a, tree, deps, lockLine) {
   const ctx = {
     a,
     tree,
@@ -663,6 +698,7 @@ export async function runHlReturn(argv, deps = {}) {
   ctx.at = () => new Date(ctx.now()).toISOString();
   ctx.say(`gimbal hl-return ${a.stage} ${a.amount === null ? 'all' : `${usdcText(a.amount)} USDC`} for ${a.contract} desk ${a.deskId}: ${a.send ? 'SEND' : 'dry run'}`);
   if (tree !== null) ctx.say(`warning   ${tree} is a linked git worktree: --send refuses here; run it from the main checkout`);
+  ctx.say(lockLine);
   const status = await ctx.client.rpc('status', []);
   ctx.say(`chain     ${status.chain_id}, block ${status.sync_info.latest_block_height}`);
   const method = ALLOWED_CALLS[a.stage][0];

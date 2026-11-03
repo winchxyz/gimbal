@@ -2,9 +2,10 @@
 // unexpected shape or a non-number refuses the DeleteAccount. Every id is a placeholder or a public test key.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { NEAR_USDC, evmBalances, phoenixTrader, solanaBalances } from './balances.mjs';
 import { OPERATOR_METHODS } from './desk.mjs';
-import { MAX_DELETE_STATE, decodeCounters, decodeDeskMoney, retireCallProblem, runRetire } from './retire.mjs';
+import { COUNTERS_BYTES, MAX_DELETE_STATE, decodeCounters, decodeDeskMoney, retireCallProblem, runRetire } from './retire.mjs';
 import { MAINNET_ORDERLY_BROKER } from './venues.mjs';
 
 const OLD = 'gimbal-canary.near';
@@ -47,11 +48,14 @@ const str = (s) => { const b = Buffer.from(s); const l = Buffer.alloc(4); l.writ
 function money({ idle = 0, pending = false, since = 0, seq = 0 } = {}) {
   return Buffer.concat([str(OWNER), u128(0), u128(0), u128(0), u128(0), u128(idle), Buffer.from([pending ? 1 : 0]), u64(since), u64(seq)]);
 }
-function counters(paidMs = []) {
+/** A DeskCounters record: the C8 canary's layout (1,329 bytes), or with `final` the final contract's (1,369 bytes). */
+function counters(paidMs = [], { final = false, next = 0 } = {}) {
   const deposits = Buffer.alloc(32 * 32);
   const paid = Buffer.concat(Array.from({ length: 32 }, (_, i) => u64(paidMs[i] ?? 0)));
   paidMs.forEach((_, i) => deposits.fill(i + 1, i * 32, i * 32 + 32));
-  return Buffer.concat([u64(0), u128(0), u128(0), u64(0), deposits, Buffer.from([paidMs.length]), paid]);
+  const meters = final ? [u64(0), u128(0), u128(0), u128(0)] : [u64(0), u128(0), u128(0)];
+  const notional = final ? [u64(0), u128(0)] : [];
+  return Buffer.concat([...meters, u64(next), deposits, Buffer.from([paidMs.length]), paid, ...notional]);
 }
 const recordKey = (prefix, id) => Buffer.concat([Buffer.from([prefix]), str(id)]);
 
@@ -395,6 +399,35 @@ test('MEDIUM: C8 money in flight: a pending payout, a fund_venue or rescue slot 
   });
   assert.equal(decodeCounters(counters([1, 2])).deposit_paid_ms.slice(0, 3).join(), '1,2,0');
   assert.equal(counters().length, 1329, 'the 1,329 bytes of the ring');
+});
+
+test('the counters record in both layouts: the C8 canary\'s (1,329 bytes) and the final contract\'s (1,369 bytes); any other length refuses', async () => {
+  // The bytes the contracts wrote: the canary's records read from mainnet, a final record from the contract's own test.
+  const fx = JSON.parse(readFileSync(new URL('../../engine/fixtures/near/counters-records.json', import.meta.url), 'utf8'));
+  const canary = decodeCounters(Buffer.from(fx.canary.deskCounters.value, 'base64'));
+  assert.equal(Buffer.from(fx.canary.deskCounters.value, 'base64').length, COUNTERS_BYTES.canary);
+  assert.equal(canary.deposit_next, 2);
+  assert.deepEqual(canary.deposit_paid_ms.slice(0, 3), [1793670752854n, 1793670925206n, 0n]);
+  assert.equal(canary.rescue_at_ms, 1793670925206n);
+  assert.equal(decodeCounters(Buffer.from(fx.canary.fundCounters.value, 'base64')).deposit_next, 1);
+  const finalBytes = Buffer.from(fx.final.record, 'base64');
+  assert.equal(finalBytes.length, COUNTERS_BYTES.final);
+  const final = decodeCounters(finalBytes);
+  const f = fx.final.fields;
+  assert.deepEqual(
+    [final.rescue_at_ms, final.eip3009_next, final.deposit_next, final.deposit_paid_ms.slice(0, 3)],
+    [BigInt(f.rescue_at_ms), BigInt(f.eip3009_next), f.deposit_next, [...f.deposit_paid_ms.map(BigInt), 0n]],
+  );
+  assert.equal(counters([], { final: true }).length, COUNTERS_BYTES.final, 'the helper writes the final layout');
+  for (const n of [0, 1328, 1330, 1368, 1370]) {
+    assert.throws(() => decodeCounters(Buffer.alloc(n)), new RegExp(`the counters record is ${n} bytes, neither 1329 \\(C8\\) nor 1369 \\(C10\\)$`), String(n));
+  }
+  // A final contract's rings count like the canary's; a record of neither length refuses (fails closed).
+  const fin = { code: C8, records: { 5: counters([], { final: true }), 8: counters([], { final: true }) } };
+  await clean(fin, 'a clean final contract retires');
+  await refusal({ ...fin, records: { ...fin.records, 8: counters([NOW - 10 * MIN], { final: true }) } }, /desk canary: fund_venue ring slot 0 was paid 10 min ago/);
+  await refusal({ ...fin, records: { ...fin.records, 5: counters([NOW - 64 * MIN], { final: true }) } }, /desk canary: rescue ring slot 0 was paid 64 min ago/);
+  await refusal({ ...fin, records: { ...fin.records, 5: Buffer.alloc(1_340) } }, /the contract state could not be read \(rescue ring: the counters record is 1340 bytes, neither 1329 \(C8\) nor 1369 \(C10\)\)/);
 });
 
 test('LOW F: a missing rescue or fund_venue ring refuses; ring ages count from the latest block, not this machine\'s clock', async () => {

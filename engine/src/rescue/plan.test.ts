@@ -3,9 +3,14 @@
 // each pass a source over with a note.
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import type { PlanInput } from './plan.ts';
-import { CapLedger, HL_WITHDRAW_FEE_USD, MAX_FEE_SHARE, amountInFor, expectedFeeUsd, planRescue } from './plan.ts';
+import { CapLedger, HL_WITHDRAW_FEE_USD, MAX_FEE_SHARE, amountInFor, bridgeMinUsd, expectedFeeUsd, planRescue, rescueSizes, sizeText } from './plan.ts';
+
+const FINAL_POLICY = JSON.parse(readFileSync(new URL('../../../tools/mainnet-final-policy.json', import.meta.url), 'utf8')) as {
+  rescue_cap_usd_per_hour: number; max_transfer_cost_bps: number; max_transfer_cost_flat_e6: number;
+};
 
 const base = (over: Partial<PlanInput> = {}): PlanInput => ({
   target: { venue: 'hyperliquid', symbol: 'ETH', amountUsd: 40, marginUsd: 200 },
@@ -64,9 +69,14 @@ test('the cap: a source over what is left of the hour is passed over; Hyperliqui
   assert.match(tooBig.notes.join(' '), /hl_withdraw and the bridge both count/);
 });
 
-test('Hyperliquid keeps amount + 1 USDC within the withdrawable', () => {
-  const amountIn = amountInFor('hyperliquid', 'phoenix', 40, true);
+test('Hyperliquid keeps amount + 1 USDC within the withdrawable; the 1 USDC fee goes on the withdraw, not into the bridge', () => {
+  // The bridge is sized as a bridge (no withdraw fee in it); the withdraw is what arrives plus Hyperliquid's 1 USDC.
+  const amountIn = Math.ceil(amountInFor('hyperliquid', 'phoenix', 40, true, false) * 100 - 1e-6) / 100;
   const withdraw = Math.ceil((amountIn + 1) * 100 - 1e-6) / 100;
+  const plan = planRescue(base({ target: { venue: 'phoenix', symbol: 'ETH', amountUsd: 40, marginUsd: 200 }, reserveUsd: 0, freeMargin: { hyperliquid: 500 } }));
+  assert.ok(plan.kind === 'transfer' && plan.from === 'hyperliquid');
+  assert.equal(plan.amountInUsd, amountIn);
+  assert.equal(plan.withdrawUsd, withdraw);
   const just = planRescue(base({ target: { venue: 'phoenix', symbol: 'ETH', amountUsd: 40, marginUsd: 200 }, reserveUsd: 0, freeMargin: { hyperliquid: withdraw + 1 } }));
   assert.equal(just.kind, 'transfer');
   const short = planRescue(base({ target: { venue: 'phoenix', symbol: 'ETH', amountUsd: 40, marginUsd: 200 }, reserveUsd: 0, freeMargin: { hyperliquid: withdraw + 0.99 } }));
@@ -124,11 +134,84 @@ test('stranded Arbitrum USDC: no withdraw fee in its fee share, spent in part wh
   const partial = into({ arbitrumUsd: 3.456, hlWithdrawHeld: 'an earlier withdraw' });
   assert.ok(partial.kind === 'transfer' && partial.withdrawUsd === null && partial.amountInUsd === 3.45 && partial.capUsd === 3.45);
   assert.match(partial.notes.join(' '), /only 3.45 of the 5.\d\d USD is on Arbitrum/);
-  // Dust under the fee share falls through to the withdraw rule.
+  // Dust under what a bridge takes alone, while a withdraw is on its way: nothing to bridge now, the next withdraw takes it.
   const dust = into({ arbitrumUsd: 0.2, hlWithdrawHeld: 'an earlier withdraw', target: { venue: 'phoenix', symbol: 'ETH', amountUsd: 40, marginUsd: 200 } });
   assert.equal(dust.kind, 'reduce');
-  assert.match(dust.notes.join(' '), /the 0.20 USDC on Arbitrum\): fees of about 0.05.*no new hl_withdraw: an earlier withdraw/);
+  assert.match(dust.notes.join(' '), /no new hl_withdraw: an earlier withdraw.*the 0.20 USDC on Arbitrum is under the 0.50 a bridge into phoenix takes alone/);
   const unread = into({ arbitrumUsd: null, target: { venue: 'phoenix', symbol: 'ETH', amountUsd: 40, marginUsd: 200 } });
   assert.equal(unread.kind, 'reduce');
   assert.match(unread.notes.join(' '), /hyperliquid: the desk's Arbitrum USDC could not be read/);
+});
+
+test('a withdraw tops up USDC already on Arbitrum, so no amount left there ever blocks one (it is bridged along)', () => {
+  const into = (over: Partial<PlanInput>) => planRescue(base({ target: { venue: 'phoenix', symbol: 'ETH', amountUsd: 40, marginUsd: 200 }, reserveUsd: 0, freeMargin: { hyperliquid: 500 }, ...over }));
+  const alone = into({});
+  assert.ok(alone.kind === 'transfer' && alone.withdrawUsd !== null && alone.arbitrumUsd === 0);
+  // 2 USDC is there (under what a bridge into HyperCore takes alone, 3.20): it does not hold the withdraw, which tops it up.
+  const topUp = into({ arbitrumUsd: 2 });
+  assert.ok(topUp.kind === 'transfer' && topUp.withdrawUsd !== null && alone.kind === 'transfer');
+  assert.equal(topUp.arbitrumUsd, 2);
+  assert.equal(topUp.amountInUsd, alone.amountInUsd, 'the same bridge');
+  assert.ok(Math.abs(topUp.withdrawUsd! - (alone.withdrawUsd! - 2)) < 0.011, 'the withdraw is short by what is there');
+  assert.ok(Math.abs(topUp.capUsd - (topUp.withdrawUsd! + topUp.amountInUsd)) < 1e-9);
+  // Just short of a bridge alone: a small top-up (at least 1 USDC arrives), everything bridged together.
+  const bridgeNeed = amountInFor('hyperliquid', 'phoenix', 40, true, false);
+  const near = into({ arbitrumUsd: bridgeNeed - 0.01 });
+  assert.ok(near.kind === 'transfer' && near.withdrawUsd !== null && near.withdrawUsd >= 2 && near.withdrawUsd < 3.1);
+  assert.ok(near.kind === 'transfer' && near.amountInUsd >= alone.amountInUsd && near.arbitrumUsd === Math.round((bridgeNeed - 0.01) * 100) / 100);
+  // Held (a withdraw on its way): 2 USDC is bridged alone into Phoenix (it takes 0.50 and up), the rest later.
+  const held = into({ arbitrumUsd: 2, hlWithdrawHeld: 'on its way' });
+  assert.ok(held.kind === 'transfer' && held.withdrawUsd === null && held.amountInUsd === 2);
+});
+
+test('the least a bridge of Arbitrum USDC takes alone: the route minimum and the fee share, with and without a key', () => {
+  assert.equal(bridgeMinUsd('hyperliquid', true), 3.2);
+  assert.equal(bridgeMinUsd('hyperliquid', false), 3.27);
+  assert.equal(bridgeMinUsd('phoenix', true), 0.5);
+  assert.equal(bridgeMinUsd('orderly', true), 6.2);
+  for (const keyed of [true, false]) {
+    for (const to of ['hyperliquid', 'phoenix', 'orderly'] as const) {
+      const x = bridgeMinUsd(to, keyed);
+      assert.ok(expectedFeeUsd('hyperliquid', to, x, keyed, false) <= MAX_FEE_SHARE * x, `${to} ${keyed}: within the share`);
+      assert.ok(x - 0.01 < 1 || expectedFeeUsd('hyperliquid', to, x - 0.01, keyed, false) > MAX_FEE_SHARE * (x - 0.01) || to === 'orderly', `${to} ${keyed}: the least`);
+    }
+  }
+});
+
+test('the cap ledger lists what still weighs, so a restart can count it again', () => {
+  const c = new CapLedger();
+  c.add(40, 0);
+  c.add(10, 50 * 60_000);
+  assert.deepEqual(c.entries(30 * 60_000), [{ usd: 40, at: 0 }, { usd: 10, at: 50 * 60_000 }]);
+  assert.deepEqual(c.entries(3_600_000), [{ usd: 10, at: 50 * 60_000 }]);
+  const again = new CapLedger();
+  for (const e of c.entries(3_600_000)) again.add(e.usd, e.at);
+  assert.equal(again.used(3_600_000), c.used(3_600_000));
+});
+
+test('the rescue sizes at the final mainnet policy, per route (printed): Hyperliquid out fits between its withdraw fee and the 50 USD cap', (t) => {
+  assert.deepEqual([FINAL_POLICY.rescue_cap_usd_per_hour, FINAL_POLICY.max_transfer_cost_bps, FINAL_POLICY.max_transfer_cost_flat_e6], [50, 300, 1_000_000]);
+  for (const keyed of [true, false]) {
+    const sizes = rescueSizes(FINAL_POLICY, keyed);
+    for (const r of sizes) t.diagnostic(`final policy, ${keyed ? 'with' : 'without'} a 1Click key: ${r.from} -> ${r.to} ${sizeText(r)}`);
+    if (!keyed) continue;
+    const text = Object.fromEntries(sizes.map((r) => [`${r.from}->${r.to}`, sizeText(r)]));
+    // The numbers in plan.ts's header.
+    assert.deepEqual(text, {
+      'reserve->hyperliquid': 'from 2.86 USD', 'reserve->orderly': 'from 0.01 USD', 'reserve->phoenix': 'from 0.44 USD',
+      'phoenix->hyperliquid': 'from 2.86 to 49.40 USD', 'phoenix->orderly': 'from 0.01 to 49.67 USD', 'hyperliquid->phoenix': 'from 10.39 to 24.31 USD',
+    });
+  }
+  // The smallest passes, a cent less does not (the fee share), and the largest is the cap's.
+  const plan = (amountUsd: number) => planRescue(base({
+    target: { venue: 'phoenix', symbol: 'ETH', amountUsd, marginUsd: 200 }, reserveUsd: 0, freeMargin: { hyperliquid: 1000 }, legVenues: ['phoenix', 'hyperliquid'],
+    capUsd: 50, maxCostBps: 300, maxCostFlatE6: 1_000_000, arbitrumUsd: 0, reduce: 'none',
+  }));
+  assert.equal(plan(10.39).kind, 'transfer');
+  assert.match(plan(10.38).notes.join(' '), /hyperliquid: fees of about .* over the 10 %.*rescue sizes at this policy: .*hyperliquid -> phoenix from 10\.39 to 24\.31 USD/);
+  const top = plan(24.31);
+  assert.ok(top.kind === 'transfer' && top.capUsd <= 50, 'withdraw and bridge both within the cap');
+  assert.match(plan(24.32).notes.join(' '), /hyperliquid: over the rescue cap/);
+  // At the old 20 USD cap no rescue out of Hyperliquid fits.
+  assert.equal(rescueSizes({ ...FINAL_POLICY, rescue_cap_usd_per_hour: 20 }, true).find((r) => r.from === 'hyperliquid')!.minUsd, null);
 });

@@ -233,16 +233,34 @@ export function decodeDeskMoney(buf) {
   return out;
 }
 
-/** contract/src/rescue.rs DeskCounters (1,329 bytes): the meters, the ring of 32 deposit hashes and their paid times. */
+/** The two DeskCounters layouts on mainnet: the C8 canary's and the final contract's (C10). */
+export const COUNTERS_BYTES = { canary: 1_329, final: 1_369 };
+
+/**
+ * contract/src/rescue.rs DeskCounters: the meters, the ring of 32 deposit hashes and their paid times. The C8 canary
+ * stores 1,329 bytes; the final contract adds rescue_quote_e8 (u128) before eip3009_next, and notional_at_ms (u64)
+ * plus notional_e8 (u128) after the paid times: 1,369 bytes. The layout is picked by length, and any other length is
+ * an error, never a guess. engine/fixtures/near/counters-records.json pins both (a canary record read from mainnet, a
+ * final one the contract's own test wrote).
+ */
 export function decodeCounters(buf) {
+  const final = buf.length === COUNTERS_BYTES.final;
+  if (!final && buf.length !== COUNTERS_BYTES.canary) {
+    throw new Error(`the counters record is ${buf.length} bytes, neither ${COUNTERS_BYTES.canary} (C8) nor ${COUNTERS_BYTES.final} (C10)`);
+  }
   const r = new BorshReader(buf, 'the counters record');
   const rescueAt = r.u64();
   r.u128();
   r.u128();
+  if (final) r.u128();
   const eip3009Next = r.u64();
   r.take(32 * RING);
   const next = r.u8();
   const paid = Array.from({ length: RING }, () => r.u64());
+  if (final) {
+    r.u64();
+    r.u128();
+  }
   r.end();
   return { rescue_at_ms: rescueAt, eip3009_next: eip3009Next, deposit_next: next, deposit_paid_ms: paid };
 }

@@ -1581,3 +1581,71 @@ fn an_order_in_a_rescue_message_counts_against_the_hourly_notional_cap() {
     // The rescue alone still signs.
     sol_rescue(&mut g, &simple, &q).unwrap();
 }
+
+// --- the stored record, as the engine and the tools read it ---
+
+/// The engine (engine/src/rescue/near-chain.ts) and tools/mainnet/retire.mjs read the desk's
+/// DeskCounters and fund_venue counters straight from the contract state with `view_state`: the
+/// key is the StorageKey byte (5 and 8) and the desk id as a borsh string, the value the borsh
+/// record. This pins both to the bytes in engine/fixtures/near/counters-records.json: `create_desk`
+/// writes both records under those keys, and a record with every field set serializes to exactly
+/// the fixture's 1369 bytes.
+#[test]
+fn counters_record_bytes_are_the_engine_fixture() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../engine/fixtures/near/counters-records.json"
+    ))
+    .unwrap();
+    let mut g = testnet();
+    at(owner(), NOW_MS, yocto(0));
+    let desk = Desk::new(
+        owner(),
+        rescue_policy(),
+        VECTOR_DESK_EVM.into(),
+        vector_solana(),
+        "woofi_dex",
+    );
+    g.write_desk("alpha", &desk);
+    g.desk_counters.flush();
+    g.fund_counters.flush();
+    let key = |prefix: u8| {
+        let mut k = vec![prefix];
+        k.extend_from_slice(&5u32.to_le_bytes());
+        k.extend_from_slice(b"alpha");
+        k
+    };
+    let empty = near_sdk::borsh::to_vec(&DeskCounters::default()).unwrap();
+    assert_eq!(empty.len(), 1369);
+    assert_eq!(
+        env::storage_read(&key(5)),
+        Some(empty.clone()),
+        "DeskCounters"
+    );
+    assert_eq!(env::storage_read(&key(8)), Some(empty), "FundCounters");
+
+    let mut deposits = [[0u8; 32]; DEPOSIT_RING];
+    deposits[0] = sha256(b"0x00000000000000000000000000000000000000d1");
+    deposits[1] = sha256(b"0x00000000000000000000000000000000000000d2");
+    let mut deposit_paid_ms = [0u64; DEPOSIT_RING];
+    deposit_paid_ms[0] = NOW_MS - 60_000;
+    deposit_paid_ms[1] = NOW_MS;
+    let record = DeskCounters {
+        rescue_at_ms: NOW_MS,
+        rescue_spent_e8: 4_100_000_000,
+        rescue_cost_e8: 210_000_000,
+        rescue_quote_e8: 70_000_000,
+        eip3009_next: 7,
+        deposits,
+        deposit_next: 2,
+        deposit_paid_ms,
+        notional_at_ms: NOW_MS - 5_000,
+        notional_e8: 12_345_000_000,
+    };
+    let bytes = near_sdk::borsh::to_vec(&record).unwrap();
+    assert_eq!(bytes.len(), 1369);
+    assert_eq!(
+        STANDARD.encode(&bytes),
+        fixture["final"]["record"].as_str().unwrap(),
+        "the engine fixture's final record"
+    );
+}

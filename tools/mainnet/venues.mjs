@@ -50,6 +50,17 @@ export const CANARY_LIMITS = {
   max_transfer_cost_flat_e6: 1_000_000,
 };
 
+/**
+ * The final contract's limits: the canary's with rescue_cap_usd_per_hour 50. The contract counts both a Hyperliquid
+ * rescue's hl_withdraw and its bridge against the cap, so at 20 no rescue out of Hyperliquid fits: its 1 USDC
+ * withdraw fee needs about 10.5 USDC sent to stay within the engine's 10 % fee share, which weighs about 21 USD.
+ * Every rescue pays only the desk's own pinned addresses, so the cap bounds what rescues may cost in fees, not what
+ * could be taken. The engine's rescue sizes per route at these limits are in engine/src/rescue/plan.ts (out of
+ * Hyperliquid 10.39 to 24.31 USD). The hourly rescue cost budget is 2 + 4 x 1 = 6 USD after C10 round 2:
+ * max(50 x 3 %, 2 x 1) = 2, plus RESCUE_VENUE_FEES_PER_HOUR (4) fees of 1 USD each.
+ */
+export const FINAL_LIMITS = { ...CANARY_LIMITS, rescue_cap_usd_per_hour: 50 };
+
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 const POLICY_KEYS = [
   'hl_assets', 'phoenix_markets', 'orderly_symbols', 'max_notional_usd', 'price_band_bps', 'oracle_max_age_s',
@@ -112,10 +123,10 @@ export function phoenixUnits(baseLotsDecimals, tickSize) {
 }
 
 /**
- * A policy from live data with the canary's limits: every one of `symbols` (oracle assets) on Hyperliquid, and on
- * Phoenix and Orderly where listed (Orderly as PERP_<X>_USDC exactly).
+ * A policy from live data with `limits` (the canary's by default): every one of `symbols` (oracle assets) on
+ * Hyperliquid, and on Phoenix and Orderly where listed (Orderly as PERP_<X>_USDC exactly).
  */
-export function buildPolicy(live, symbols = CANARY_SYMBOLS) {
+export function buildPolicy(live, symbols = CANARY_SYMBOLS, limits = CANARY_LIMITS) {
   const hl_assets = symbols.map((s) => {
     const a = live.hl.find((x) => x.symbol === s && !x.delisted);
     if (a === undefined) throw new Error(`hyperliquid mainnet lists no active ${s} perp`);
@@ -130,7 +141,7 @@ export function buildPolicy(live, symbols = CANARY_SYMBOLS) {
     hl_assets,
     phoenix_markets,
     orderly_symbols,
-    ...CANARY_LIMITS,
+    ...limits,
     unpriced: [],
     unpriced_max_notional_usd: 20,
   };

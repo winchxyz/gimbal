@@ -188,8 +188,14 @@ function world(o = {}) {
     seen.keys++;
     return { accountId, publicKeyString: o.keyPublic ?? PUBLIC };
   };
-  return { seen, deps: { near: client, archive, fetch: fetchImpl, now: () => o.now ?? Date.parse('2026-11-01T12:00:00Z'), tree: null, readKey, sleep: async () => {}, pollMs: 0 } };
+  return { seen, deps: { near: client, archive, fetch: fetchImpl, now: () => o.now ?? Date.parse('2026-11-01T12:00:00Z'), tree: null, readKey, sleep: async () => {}, pollMs: 0, lock: async () => freeLock } };
 }
+
+/** The rescuer's lock (fund.mjs takes it), always free: the real one is tested once, below. */
+const freeLock = {
+  rescueLockName: (_env, mode, contract, desk) => `fake-${mode}-${contract}-${desk}`, lockText: (n) => n, lockHeld: async () => false,
+  acquireRescueLock: async (name) => ({ name, release: async () => {} }),
+};
 
 async function capture(fn, argv, deps) {
   const lines = [];
@@ -429,6 +435,51 @@ test('fund --send: a live quote checked, fund_venue signed with the operator key
   const f = await capture(runFund, [CONTRACT, DESK_ID, 'hyperliquid', '20', '--send'], { ...full.deps, env: new Map() });
   assert.match(f.error.message, /is not .*'s operator key for gimbal-canary2\.near/);
   assert.equal(full.seen.sent.length, 0);
+});
+
+test('fund and the rescuer\'s lock: held by a live rescuer, --send refuses before anything is read or signed (the dry run says so); free, --send holds it for the run', async () => {
+  // The real lock (engine/src/rescue/lock.ts) under the name fund.mjs derives, for a desk id of this process's own: the
+  // plain name is the live canary desk's, and a Windows pipe name is machine-wide, so a running rescuer, hl-return's
+  // test or another test run would collide with a fixed one.
+  const real = await import('../../engine/src/rescue/lock.ts');
+  const run = `${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  const locks = { ...real, rescueLockName: (env, mode, contract, desk) => real.rescueLockName(env, mode, contract, `${desk}-fund-test-${run}`) };
+  const name = locks.rescueLockName((k) => process.env[k], 'mainnet', CONTRACT, DESK_ID);
+  const live = fundQuote(LIVE);
+  const at = Date.parse(live.response.timestamp) + 1000;
+  const rescuer = await locks.acquireRescueLock(name);
+  try {
+    const w = world({ keyPublic: OP_PUBLIC, now: at, quote: () => json(live.response, 201), onSend: () => ({ value: true }) });
+    const deps = { ...w.deps, lock: async () => locks, env: new Map() };
+    const s = await capture(runFund, [CONTRACT, DESK_ID, 'hyperliquid', '20', '--send'], deps);
+    assert.match(s.error?.message ?? '', /^--send refused, nothing was signed: the desk's live rescuer holds .*gimbal-rescue-mainnet-gimbal-canary2\.near-canary-fund-test.*fund_venue ring and hourly cost budget.*stop the rescuer first$/);
+    assert.equal(s.out, '', 'refused before the first read');
+    assert.equal(w.seen.sent.length, 0);
+    assert.equal(w.seen.keys, 0, 'no key file read');
+    const d = await capture(runFund, [CONTRACT, DESK_ID, 'hyperliquid', '20'], { ...world({ quote: () => json(fundQuote(DRY).response, 201) }).deps, lock: async () => locks, env: new Map() });
+    assert.match(d.out, /\nwarning {3}the desk's live rescuer holds .*: --send refuses while it runs\n/);
+  } finally {
+    await rescuer.release();
+  }
+
+  // Free: taken for the run (a rescuer starting meanwhile is refused), released when it ends, also on a failure.
+  for (const value of [true, false]) {
+    let during = null;
+    const w = world({ keyPublic: OP_PUBLIC, now: at, quote: () => json(live.response, 201), onSend: () => ({ value }) });
+    const send = w.deps.near.send;
+    w.deps.near.send = async (...x) => {
+      during = await locks.acquireRescueLock(name).then(async (l) => { await l.release(); return 'taken'; }, (e) => e.message);
+      return send(...x);
+    };
+    const r = await capture(runFund, [CONTRACT, DESK_ID, 'hyperliquid', '20', '--send', '--timeout-s', '60'], { ...w.deps, lock: async () => locks, env: new Map() });
+    assert.ok(r.out !== '', r.error?.stack);
+    assert.match(r.out, /\nlock {6}.* taken for this run: no live rescuer of the desk can start until it ends\n/);
+    assert.match(during ?? '', /holds/, String(value));
+    assert.equal(w.seen.sent.length, 1);
+    if (!value) assert.match(r.error?.message ?? '', /the transfer failed and the USDC is back in idle_usdc/);
+    const after = await locks.acquireRescueLock(name);
+    await after.release();
+  }
 });
 
 test('fund refuses a verified quote that is not what was asked: amount, slippage, venue', async () => {

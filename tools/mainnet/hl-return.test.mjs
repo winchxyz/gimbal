@@ -69,13 +69,18 @@ const deskOf = (over = {}) => ({
   ...over,
 });
 
-/** A DeskCounters record (contract/src/rescue.rs, borsh, 1,329 bytes): `next` the EIP-3009 counter, `paid` the ring's paid times. */
-function countersRecord({ next = 0, paid = [] }) {
-  const buf = Buffer.alloc(8 + 16 + 16 + 8 + 32 * 32 + 1 + 32 * 8);
+/**
+ * A DeskCounters record (contract/src/rescue.rs, borsh): `next` the EIP-3009 counter, `paid` the ring's paid times. The
+ * C8 canary's layout (1,329 bytes), or with `final` the final contract's (1,369 bytes: rescue_quote_e8 before the
+ * counter, the notional meter after the paid times).
+ */
+function countersRecord({ next = 0, paid = [], final = false }) {
+  const at = final ? 56 : 40;
+  const buf = Buffer.alloc(final ? 1369 : 1329);
   buf.writeBigUInt64LE(BigInt(Math.max(0, ...paid)), 0);
-  buf.writeBigUInt64LE(BigInt(next), 40);
-  buf.writeUInt8(paid.length % 32, 48 + 1024);
-  paid.forEach((ms, i) => buf.writeBigUInt64LE(BigInt(ms), 48 + 1024 + 1 + 8 * i));
+  buf.writeBigUInt64LE(BigInt(next), at);
+  buf.writeUInt8(paid.length % 32, at + 8 + 1024);
+  paid.forEach((ms, i) => buf.writeBigUInt64LE(BigInt(ms), at + 8 + 1024 + 1 + 8 * i));
   return buf;
 }
 
@@ -224,11 +229,17 @@ function world(o = {}) {
   return {
     seen,
     deps: {
-      near: client, fetch: fetchImpl, now: () => o.now ?? AT, tree: null, readKey, env, engine, sleep: async () => {}, pollMs: 0,
+      near: client, fetch: fetchImpl, now: () => o.now ?? AT, tree: null, readKey, env, engine, sleep: async () => {}, pollMs: 0, lock: async () => freeLock,
       urls: { arbitrum: 'https://arb.test/rpc', shown: { arbitrum: 'arb.test' } },
     },
   };
 }
+
+/** The rescuer's lock, always free: the real one is tested once, below. */
+const freeLock = {
+  rescueLockName: (_env, mode, contract, desk) => `fake-${mode}-${contract}-${desk}`, lockText: (n) => n, lockHeld: async () => false,
+  acquireRescueLock: async (name) => ({ name, release: async () => {} }),
+};
 
 async function capture(argv, deps) {
   const lines = [];
@@ -803,11 +814,16 @@ test('counterGuards: the last authorization unused and possibly valid refuses; a
 });
 
 test('bridge --send: an authorization nearblocks has not indexed yet (contract counter, authorizationState) refuses before the quote; unreadable state refuses', async () => {
-  // Signed a minute ago (a rerun after a lost outcome), not used on Arbitrum, not on nearblocks yet.
+  // Signed a minute ago (a rerun after a lost outcome), not used on Arbitrum, not on nearblocks yet. The same in the
+  // final contract's record layout as in the canary's.
+  for (const final of [true, false]) {
+    const f = world({ ...ready, counters: { next: 3, paid: [AT - 7_200_000, AT - 60_000], final }, authUsed: false });
+    const r = await capture(BRIDGE_SEND, await liveLike(f.deps));
+    assert.match(r.error?.message ?? '', /the desk's last authorization \(counter 2, nonce 0x[0-9a-f]{64}\) is not used on Arbitrum USDC and may be valid until about/, String(final));
+    assert.equal(f.seen.quotes.length + f.seen.keys + f.seen.sent.length, 0);
+  }
   const w = world({ ...ready, counters: { next: 3, paid: [AT - 7_200_000, AT - 60_000] }, authUsed: false });
-  const r = await capture(BRIDGE_SEND, await liveLike(w.deps));
-  assert.match(r.error?.message ?? '', /the desk's last authorization \(counter 2, nonce 0x[0-9a-f]{64}\) is not used on Arbitrum USDC and may be valid until about/);
-  assert.equal(w.seen.quotes.length + w.seen.keys + w.seen.sent.length, 0);
+  await capture(BRIDGE_SEND, await liveLike(w.deps));
   // authorizationState(desk EVM, nonce of counter 2) on Circle USDC.
   assert.deepEqual(w.seen.authChecks, [{ to: ARB_USDC, data: `0xe94a0102${EVM.slice(2).toLowerCase().padStart(64, '0')}${eip3009NonceOf(DESK_ID, 2n).slice(2)}` }]);
   // The dry run prints the counter lines.
@@ -847,4 +863,57 @@ test('withdraw: an unreadable Hyperliquid nonce refuses; one ledger entry books 
   // With an entry each, both are booked.
   const both = withdrawGuards({ calls: [call('Second', t + 1500), call('First', t)], entries: [entry, { ...entry, hash: '0xtwo', delta: { ...entry.delta, nonce: t * 1000 } }], hlNonce: BigInt(t + 1500), nowMs: AT });
   assert.deepEqual(both.refusals, []);
+});
+
+test('the rescuer\'s lock: held by a live rescuer, --send refuses before anything is read or signed (the dry run says so); free, --send holds it for the run', async () => {
+  // The real lock (engine/src/rescue/lock.ts) under the name the script derives, for a desk id of this process's own:
+  // the plain name is the live canary desk's, and a Windows pipe name is machine-wide, so a running rescuer (or another
+  // test run) would collide with it.
+  const real = await import('../../engine/src/rescue/lock.ts');
+  const run = `${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  const locks = { ...real, rescueLockName: (env, mode, contract, desk) => real.rescueLockName(env, mode, contract, `${desk}-hl-test-${run}`) };
+  const name = locks.rescueLockName((k) => process.env[k], 'mainnet', CONTRACT, DESK_ID);
+  const rescuer = await locks.acquireRescueLock(name);
+  try {
+    const w = world();
+    const live = { ...w.deps, lock: async () => locks };
+    for (const argv of [WITHDRAW_SEND, [...WITHDRAW_SEND, '--again'], [CONTRACT, DESK_ID, 'bridge', 'all', '--send']]) {
+      const s = await capture(argv, live);
+      assert.match(s.error?.message ?? '', /^--send refused, nothing was signed: the desk's live rescuer holds .*gimbal-rescue-mainnet-gimbal-canary2\.near-canary-hl-test-.*same EIP-3009 counter.*stop the rescuer first \(--again does not lift this\)$/, argv.join(' '));
+      assert.equal(s.out, '', 'refused before the first read');
+    }
+    assert.equal(w.seen.sent.length, 0);
+    assert.equal(w.seen.keys, 0, 'no key file read');
+    const d = await capture([CONTRACT, DESK_ID, 'withdraw', 'all'], live);
+    assert.equal(d.error, null, d.error?.stack);
+    assert.match(d.out, /\nwarning {3}the desk's live rescuer holds .*: --send refuses while it runs\n/);
+  } finally {
+    await rescuer.release();
+  }
+
+  const w = world({
+    onSend: () => ({ value: withdrawSigned() }),
+    hlSubmit: ({ setLedger, arb }) => {
+      setLedger([{ time: AT + 1000, hash: '0xhlw', delta: { type: 'withdraw', usdc: '10.682396', nonce: (AT + 2000) * 1000, fee: '1.0' } }]);
+      arb.set(EVM.toLowerCase(), 10_682_396n);
+      return { confirmed: true, tx: [{ chain: 'hyperliquid', id: '0xhlw' }] };
+    },
+  });
+  // A rescuer starting while the script is about to sign is refused.
+  let during = null;
+  const s = await capture(WITHDRAW_SEND, {
+    ...w.deps,
+    lock: async () => locks,
+    engine: async () => {
+      during = await locks.acquireRescueLock(name).then(async (l) => { await l.release(); return 'taken'; }, (e) => e.message);
+      return w.deps.engine();
+    },
+  });
+  assert.equal(s.error, null, s.error?.stack);
+  assert.match(s.out, /\nlock {6}.* taken for this run: no live rescuer of the desk can start until it ends\n/);
+  assert.match(during ?? '', /another live rescuer \(or tools\/mainnet\/hl-return\.mjs or fund\.mjs\) holds/);
+  assert.equal(w.seen.sent.length, 1);
+  // Released when the run ends.
+  const after = await locks.acquireRescueLock(name);
+  await after.release();
 });

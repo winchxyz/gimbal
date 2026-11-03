@@ -6,7 +6,17 @@
 //   mainnet   live only with GIMBAL_RESCUE=1, since it is the part of serve that moves money: it loads the operator
 //             key (OPERATOR_PRIVATE_KEY) and the relayer's gas wallet (RELAYER_EVM_PRIVATE_KEY) by name, never printed,
 //             and calls 1Click (ONECLICK_API_KEY optional: it only lowers the fee). Without it the risk engine only
-//             detects (the trigger is published at `detect`) and the owner acts.
+//             detects (the trigger is published at `detect`) and the owner acts. Its holds and cap meter are kept in
+//             GIMBAL_STATE_DIR, by default the per-user state directory (lock.ts: %LOCALAPPDATA%/gimbal/state, else
+//             ~/.local/state/gimbal), outside any checkout, in rescue-mainnet-<contract>-<desk>-<evm>.json (state.ts).
+//             A missing file holds every transfer; GIMBAL_RESCUE_FRESH=<contract>/<desk> starts a first run with an
+//             empty one (any other value is ignored, so one left in an env file never re-arms another desk), refused
+//             while the contract counted a rescue or a fund_venue of the desk, or the state directory shows a
+//             trace of its rescuers, in the last 65 min (freshStart). Only one live rescuer runs per contract and desk
+//             on this machine: it starts only with the lock (lock.ts), which hl-return.mjs and fund.mjs take too.
+//             The deposit rings, the time of a final NEAR block and a fund_venue's final transaction outcome
+//             (near-chain.ts) tell whether a held payment was ever signed or paid. Off mainnet nothing real can be
+//             held, so the recorded worlds keep theirs in memory.
 //
 // Live routes wired here: the reserve (fund_venue) and Hyperliquid (hl_withdraw, then evm_usdc_to_intents). Phoenix
 // as a source needs sol_sign_rescue's message (Phoenix withdraw + Ember unwrap + the transfer) built from Phoenix's
@@ -19,6 +29,7 @@ import type { Hex } from 'viem';
 import { NearContractClient } from '../contract/near-client.ts';
 import { NearApiTransport } from '../contract/near-transport.ts';
 import type { DeskView } from '../contract/types.ts';
+import { errorMessage } from '../venues/recorder.ts';
 import { checkContractNetwork, contractEnv } from '../cli/serve-contract.ts';
 import { ArbitrumSubmitter } from '../relayer/arbitrum.ts';
 import { HyperliquidSubmitter } from '../relayer/hyperliquid.ts';
@@ -26,14 +37,21 @@ import { sleep } from '../relayer/tx.ts';
 import type { RiskEngine } from '../risk/engine.ts';
 import type { ReplayDesk } from '../risk/sources.ts';
 import type { Clock } from '../venues/venue.ts';
+import { ViemArbitrumReads } from './arbitrum-chain.ts';
 import { ClosingWatch } from './closing.ts';
 import type { ClosingWatchOptions } from './closing.ts';
 import { HlLedgerLanding } from './hl-ledger.ts';
 import { HttpOneClick } from './oneclick.ts';
 import type { VerifiedQuote } from './oneclick.ts';
+import { acquireRescueLock, lockText, rescueLockName, userStateDir } from './lock.ts';
+import { FRESH_WAIT_MS, NearDeskReads, recentRescue } from './near-chain.ts';
 import { RecordedOneClick, SimulatedMoney, loadRescueRecording, steadyClock } from './recorded.ts';
 import type { Payer, Reducer, RescueDesk, RescuerOptions } from './rescuer.ts';
 import { Rescuer } from './rescuer.ts';
+import type { Eip3009Ref } from './state.ts';
+import type { FreshEvidence } from './state.ts';
+import { RescueStateStore, freshEvidence, rescueStateFile } from './state.ts';
+import type { NearRead } from './near-chain.ts';
 
 export interface ServeRescueInput {
   mode: Mode;
@@ -52,6 +70,8 @@ export interface ServeRescueInput {
   /** The policy serve runs with (replay: the policy file, else the recording's). */
   policy: ContractPolicy | null;
   reducer?: () => Reducer | null;
+  /** --state-dir or GIMBAL_STATE_DIR when set: where a live rescuer keeps its holds and counters (default: userStateDir). */
+  stateDir?: string;
 }
 
 export interface ServeRescue {
@@ -77,6 +97,56 @@ function policyOf(p: ContractPolicy | null, fallback: RescueDesk['policy']): Res
   return p === null ? fallback : { rescue_cap_usd_per_hour: p.rescue_cap_usd_per_hour, max_transfer_cost_bps: p.max_transfer_cost_bps, max_transfer_cost_flat_e6: p.max_transfer_cost_flat_e6 };
 }
 
+/**
+ * Whether GIMBAL_RESCUE_FRESH starts a first run. Only when it names this desk exactly (`<contract>/<desk>`), and
+ * refused (logged; the rescuer then holds every transfer) while:
+ *   - the contract counted a rescue or a fund_venue of the desk in the last FRESH_WAIT_MS (a payment of an earlier
+ *     run may still be held), or NEAR or the fund_venue ring cannot be read;
+ *   - the state directory shows a trace of one of the desk's rescuers in the last FRESH_WAIT_MS (state.ts
+ *     freshEvidence): a NEAR call sent before it stopped may still land, and nothing on chain shows it yet. With no
+ *     trace at all, when the last rescuer stopped cannot be told here: the first FRESH writes a marker and is
+ *     refused, and a FRESH FRESH_WAIT_MS after that marker is allowed (the strictest rule that still lets a desk start
+ *     with no state file at all; no rescuer of the desk may run anywhere meanwhile, which the refusal says).
+ * With this desk's state file present it returns true and the rescuer loads the file (and says FRESH is ignored).
+ */
+export async function freshStart(value: string | undefined, want: string, read: () => Promise<NearRead>, log: (line: string) => void, evidence: FreshEvidence, nowMs: number): Promise<boolean> {
+  if (value === undefined || value === '') return false;
+  if (value !== want) {
+    log(`GIMBAL_RESCUE_FRESH=${JSON.stringify(value)} is ignored: a first run is asked for by naming the desk, GIMBAL_RESCUE_FRESH=${want}`);
+    return false;
+  }
+  if (evidence.stateExists) return true;
+  let n: NearRead;
+  try {
+    n = await read();
+  } catch (err) {
+    log(`GIMBAL_RESCUE_FRESH is refused: the desk's counters on NEAR could not be read (${errorMessage(err)}); start again once they can`);
+    return false;
+  }
+  const recent = recentRescue(n);
+  if (recent !== null) {
+    log(`GIMBAL_RESCUE_FRESH is refused: ${recent}`);
+    return false;
+  }
+  const waitMin = Math.round(FRESH_WAIT_MS / 60_000);
+  const last = evidence.last;
+  if (last === null) {
+    evidence.mark();
+    log(`GIMBAL_RESCUE_FRESH is refused: ${evidence.dir} holds no trace of when a rescuer of this desk last ran (no state file, no marker), so a NEAR call it sent before it stopped `
+      + `cannot be ruled out (one may land until its quote is ${waitMin} min old, and nothing on chain shows it before then). A marker was written now: start again with `
+      + `GIMBAL_RESCUE_FRESH=${want} after ${new Date(nowMs + FRESH_WAIT_MS).toISOString()}, and run no rescuer of this desk anywhere until then`);
+    return false;
+  }
+  if (nowMs - last.ms < FRESH_WAIT_MS) {
+    log(`GIMBAL_RESCUE_FRESH is refused: ${last.file} was written at ${new Date(last.ms).toISOString()}, under ${waitMin} min ago, so a NEAR call of the rescuer that wrote it may still land: `
+      + `start again with GIMBAL_RESCUE_FRESH=${want} after ${new Date(last.ms + FRESH_WAIT_MS).toISOString()}`);
+    return false;
+  }
+  if (n.counters === null) log('GIMBAL_RESCUE_FRESH: the contract has no get_desk_counters yet, so a rescue of the last hour cannot be ruled out on chain here; reconcile by hand first');
+  evidence.clear();
+  return true;
+}
+
 export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue> {
   const { mode, env, log } = input;
   const reducer = input.reducer ?? (() => null);
@@ -95,7 +165,7 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
     // The replay clock stops at the end of its recording; a rescue's waits must still end.
     const clock = steadyClock(input.clock);
     const oneClick = new RecordedOneClick(recording, clock);
-    const money = new SimulatedMoney(oneClick, clock);
+    const money = new SimulatedMoney(oneClick, clock, recording.desk);
     if (input.replayDesk !== undefined) {
       const desk = input.replayDesk;
       money.onCredit = (venue, usd) => desk.credit(venue, usd);
@@ -120,7 +190,7 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
       },
       landing: money.landing(),
       payers: { reserve: money.payer('fund_venue', targetOf), phoenix: money.payer('sol_sign_rescue', targetOf), arbitrum: money.payer('evm_usdc_to_intents', targetOf) },
-      hlWithdraw: money.hlWithdraw(),
+      hlWithdraw: money.hlWithdraw(), arbitrum: money.arbitrum, near: () => money.near.read(), nearTx: (h) => money.near.txFacts(h), solana: money.solana,
       credit: { phoenix: money.credit() },
       fixedAmountUsd: (from, to) => oneClick.fixedAmountUsd(from, to),
       label: `${mode}: ${oneClick.source}, no funds moved`,
@@ -156,7 +226,13 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
     view = d;
     return d;
   };
-  const evm = async () => (view ?? await readDesk()).evm_address;
+  // The desk's EVM address names the state file; one failed read at start (an RPC hiccup) is tried once more.
+  const first = await readDesk().catch(async (err: unknown) => {
+    log(`rescue: get_desk failed at start (${errorMessage(err)}); trying once more in 2 s`);
+    await sleep(2_000);
+    return readDesk();
+  });
+  const evm = async () => (view ?? first).evm_address;
   const reserve: Payer = {
     method: 'fund_venue',
     // fund_venue is one call: the contract pays the deposit address itself, so signing is sending.
@@ -169,14 +245,12 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
     method: 'evm_usdc_to_intents',
     sign: async (q, reason) => {
       const signed = await contract.evmUsdcToIntents(deskId, { quote: q.quote, quote_signature: q.signature }, reason);
+      const authorization: Eip3009Ref = { from: signed.payload.from, nonce: signed.payload.nonce, validBefore: Number(signed.payload.validBefore) };
       return {
         tx: signed.nearTx === undefined ? [] : [signed.nearTx],
         // The authorization is public once signed and anyone may submit it until validBefore.
-        usableUntilMs: Number(signed.payload.validBefore) * 1000,
-        // It can never run once validBefore has passed (by this clock, less a minute for skew) and USDC still reads it
-        // unused; a read error is not taken as unused.
-        neverRuns: async () => input.clock.now() > Number(signed.payload.validBefore) * 1000 + 60_000
-          && !(await arb.authorizationUsed(signed.payload.from, signed.payload.nonce)),
+        usableUntilMs: authorization.validBefore * 1000,
+        authorization,
         send: async () => {
           const tx = await arb.submit(signed, await evm());
           return { tx, depositTx: tx.find((x) => x.chain === 'arbitrum')?.id ?? '' };
@@ -184,8 +258,17 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
       };
     },
   };
+  // get_desk_counters comes with C10; until it is deployed only the block time is read and the no-view bounds apply.
+  const nearReads = new NearDeskReads({ network: cfg.network, contractId: cfg.contractId, deskId, signerId: cfg.accountId!, ...(cfg.rpcUrl === undefined ? {} : { rpcUrl: cfg.rpcUrl }) });
+  const stateDir = input.stateDir ?? userStateDir(env);
+  const identity = { contractId: cfg.contractId, deskId, evm: first.evm_address.toLowerCase() };
+  const store = new RescueStateStore(rescueStateFile(stateDir, mode, identity), identity);
+  // One live rescuer per contract and desk: two would each take the other's payments as not held.
+  const lock = await acquireRescueLock(rescueLockName(env, mode, cfg.contractId, deskId));
+  const fresh = await freshStart(env('GIMBAL_RESCUE_FRESH'), `${cfg.contractId}/${deskId}`, () => nearReads.read(), log, freshEvidence(stateDir, mode, identity), input.clock.now());
   const rescuer = new Rescuer({
     ...common, clock: input.clock, sleep, oneClick, keyed: apiKey !== null,
+    store, fresh, near: () => nearReads.read(), nearTx: (h) => nearReads.txFacts(h), arbitrum: new ViemArbitrumReads(arbitrumRpc === undefined ? {} : { rpcUrl: arbitrumRpc }),
     desk: async () => {
       const d = await readDesk();
       return {
@@ -210,12 +293,12 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
         const r = await hl.submit(await contract.hlWithdraw(deskId, usdcDecimal(amountE6)), await evm());
         return { tx: r.tx };
       },
-      arbitrumUsdcE6: async () => arb.usdcBalance(await evm()),
     },
     withdrawals: (venue, paused) => log(`rescue: ${venue} withdrawals ${paused === null ? 'ran' : `refused: ${paused}`}`),
   });
   return {
     rescuer: (t) => rescuer.take(t), closing, running: () => rescuer.runningId,
-    summary: `rescue: LIVE on mainnet (GIMBAL_RESCUE=1), operator ${cfg.accountId}, 1Click ${apiKey === null ? 'without a key (+0.2 %)' : 'with a key'}; sources: reserve, Hyperliquid via Arbitrum (Phoenix not wired)`,
+    summary: `rescue: LIVE on mainnet (GIMBAL_RESCUE=1), operator ${cfg.accountId}, 1Click ${apiKey === null ? 'without a key (+0.2 %)' : 'with a key'}; sources: reserve, Hyperliquid via Arbitrum (Phoenix not wired); `
+      + `holds and the cap meter kept in ${store.path}, lock ${lockText(lock.name)}${fresh ? ' (GIMBAL_RESCUE_FRESH: a first run)' : ''}`,
   };
 }
