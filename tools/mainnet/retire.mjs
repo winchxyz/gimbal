@@ -283,6 +283,17 @@ async function readRecord(client, contract, prefix, deskId) {
   return hit.length === 0 ? null : Buffer.from(hit[0].value);
 }
 
+/**
+ * The desk's last Hyperliquid nonce (HlNonces, prefix 3), BigInt ms: every Hyperliquid action the contract signed
+ * for the desk has a nonce or time at or before it. 0n when the record is missing (no action signed).
+ */
+export async function hlNonceOf(client, contract, deskId) {
+  const raw = await readRecord(client, contract, STORAGE_PREFIX.HlNonces, deskId);
+  if (raw === null) return 0n;
+  if (raw.length !== 8) throw new Error(`the Hyperliquid nonce record is ${raw.length} bytes, not a u64`);
+  return raw.readBigUInt64LE();
+}
+
 const minutesAgo = (nowMs, ms) => Math.max(0, Math.floor(Number(BigInt(nowMs) - BigInt(ms)) / 60_000));
 
 /** What the contract's own records of a desk say may still be in flight, measured against the latest block. */
