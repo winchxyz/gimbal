@@ -7,7 +7,7 @@ import type { JournalEntry, StrategyConfig, StrategyDecision, StreamEvent, Windo
 import { DEFAULT_STRATEGY } from '../scanner/config.ts';
 import type { DecideInput, Decision } from './decide.ts';
 import { LOOP_RULES, NO_COUNTERS } from './decide.ts';
-import type { ActOutcome, BookRecord, HandsHeld, LoopHands, StrategyLoopOptions } from './loop.ts';
+import type { ActOutcome, BookFill, BookRecord, HandsHeld, LoopHands, StrategyLoopOptions } from './loop.ts';
 import { HOUR_GRACE_MS, LoopStore, RETRY_AFTER_MS, StrategyLoop, loopStateFile, notEnterable } from './loop.ts';
 import type { VetoSource } from './veto.ts';
 
@@ -618,6 +618,38 @@ test('F1: each check asks the hands to check their record against the venues fir
   // The same check closes the single leg, reduce-only.
   assert.equal(w.closes.length, 1);
   assert.match(w.closes[0]!, /one leg open: hyperliquid -5/);
+});
+
+test('a gated part 2: the journal and the held size report what filled (part 1), not what was asked', async () => {
+  const records: BookRecord[] = [];
+  const fills: BookFill[] = [
+    { venue: 'hyperliquid', side: 'SELL', qty: '2.5', avgPx: 100, feeUsd: 0.1 },
+    { venue: 'phoenix', side: 'BUY', qty: '2.5', avgPx: 100.2, feeUsd: 0.12 },
+  ];
+  const w = world();
+  w.openAnswer = () => ({ ...OK('sol opened: 2.5 a leg (the last part ended stuck)'), fills, filledQty: '2.5' });
+  const loop = makeLoop(w, tmpStore(), { book: (r) => records.push(r) });
+  w.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  await loop.check();
+  assert.equal(loop.held?.legUsd, 250, 'held as filled');
+  const enter = journal(w).find((j) => j.kind === 'enter')!;
+  assert.match(enter.summary, /^enter sol-phoenix-hyperliquid, SOL short hyperliquid, long phoenix, 2\.5 SOL \(250 USD\) a leg filled of the 5 \(500 USD\) asked at 1\.5x/);
+  assert.equal(enter.numbers.qty, '2.5');
+  assert.equal(enter.numbers.legUsd, 250);
+  assert.equal(enter.numbers.usd, 250);
+  assert.equal(enter.numbers.askedQty, '5');
+  assert.equal(enter.numbers.askedLegUsd, 500);
+  assert.deepEqual(records.map((r) => [r.kind, r.legs]), [['enter', fills]], 'the book takes the fills');
+  // All of it filled: as before, the asked size.
+  const v = world();
+  const full = makeLoop(v);
+  v.openAnswer = () => ({ ...OK('sol opened: 5 a leg'), filledQty: '5' });
+  v.next = w.next;
+  await full.check();
+  assert.equal(full.held?.legUsd, 500);
+  const e = journal(v).find((j) => j.kind === 'enter')!;
+  assert.match(e.summary, /, at most 5 SOL \(500 USD\) a leg at 1\.5x/);
+  assert.deepEqual([e.numbers.qty, e.numbers.usd, e.numbers.askedQty], ['5', 500, undefined]);
 });
 
 test('F2: an open its own gate stopped (nothing sent, a rescue now running) is tried again next check, no hold-off', async () => {

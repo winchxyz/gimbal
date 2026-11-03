@@ -920,7 +920,6 @@ function phoenixHeld(raw: unknown): string[] {
   return [...out];
 }
 
-/** Both legs read twice START_CONFIRM_MS apart until two reads agree (START_READ_TRIES at most); throws otherwise. */
 /** What both legs hold, in words: both flat, one leg open, both open; null when either is unknown. */
 export function legsShape(a: bigint | null | undefined, b: bigint | null | undefined): 'flat' | 'one leg' | 'pair' | null {
   const x = a === undefined ? 0n : a;
@@ -938,7 +937,10 @@ export function legsShape(a: bigint | null | undefined, b: bigint | null | undef
  * reads (`known`) decide: when they say one leg or flat and the record does not, two venue reads a few seconds apart
  * must agree with each other and with that shape, and are then adopted as the record (the unhedged alert stays set
  * when they do not offset). Anything else (an order that may run, reads that differ, the venues holding a pair after
- * all, an order of ours meanwhile) changes nothing.
+ * all, an order of ours meanwhile) changes nothing. Before the first read each leg is synced to its chain
+ * (TradeLeg.syncToChain): after a restart a lagging Phoenix snapshot from before our last transaction would otherwise
+ * read as current (Phoenix 0 while it holds the long), and the adopted single leg would be the wrong one. A sync or a
+ * read that fails leaves the record as it is (thrown; the loop logs it).
  */
 export async function reconcileWithVenues(p: {
   trader: PairTrader; symbol: string; sleep: (ms: number) => Promise<void>; confirmMs: number;
@@ -956,6 +958,7 @@ export async function reconcileWithVenues(p: {
   if (live === null || live === record || live === 'pair') return null;
   const epoch = trader.baselineEpoch;
   const signed = p.signed();
+  await syncToChain(trader.legs);
   const first = await Promise.all(trader.legs.map((l) => l.position()));
   await p.sleep(p.confirmMs);
   const second = await Promise.all(trader.legs.map((l) => l.position()));
@@ -970,10 +973,21 @@ export async function reconcileWithVenues(p: {
   return `${p.symbol} record reconciled with the venues: it said ${record ?? 'unknown'} (${was}), two reads agree on ${live} (${text(read)}) and are adopted${live === 'one leg' ? '; the single leg is closed reduce-only next' : ''}`;
 }
 
+/** Each leg's oldest trusted snapshot raised to its chain's confirmed slot now (TradeLeg.syncToChain); throws. */
+async function syncToChain(legs: readonly TradeLeg[]): Promise<void> {
+  await Promise.all(legs.map((l) => l.syncToChain?.()));
+}
+
+/**
+ * Both legs read twice START_CONFIRM_MS apart until two reads agree (START_READ_TRIES at most); throws otherwise.
+ * Each try first syncs the legs to their chains: the start plan (and the settles after it) must not adopt a lagging
+ * snapshot from before the last transaction of the run that stopped.
+ */
 async function readTwice(legs: [TradeLeg, TradeLeg], sleep: (ms: number) => Promise<void>, log: (line: string) => void): Promise<[bigint, bigint]> {
   let last = '';
   for (let i = 0; i < START_READ_TRIES; i++) {
     try {
+      await syncToChain(legs);
       const a = await Promise.all(legs.map((l) => l.position()));
       await sleep(START_CONFIRM_MS);
       const b = await Promise.all(legs.map((l) => l.position()));

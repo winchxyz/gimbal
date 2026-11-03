@@ -76,6 +76,12 @@ export interface ActOutcome {
   open: string[];
   /** What filled, per leg (none when nothing was sent). */
   fills?: BookFill[];
+  /**
+   * An open only: the leg size the pair holds from it, the sum of its parts that went out and opened (canonical base
+   * units). Less than the qty asked when a later part was stopped before it sent (the open's gate, a refusal).
+   * Absent: as asked.
+   */
+  filledQty?: string;
 }
 
 /** One leg's fills in an open or a close: summed size, size-weighted price, summed fee. */
@@ -805,11 +811,17 @@ export class StrategyLoop {
       const passing = this.#gate() !== null;
       return p.fromId === null ? { end: 'skipped', sent: opened.sent, passing } : { end: 'flat', sent: true, passing };
     }
-    // Held from now: an entry's time, or the rotation's.
-    this.#setHeld({ windowId: w.id, symbol: sym.symbol, since: now, legUsd: p.legUsd, entryNetAprPct: w.netAprPct });
+    // Held from now: an entry's time, or the rotation's. What filled, not what was asked: a later part its gate
+    // stopped holds nothing.
+    const filled = filledLeg(p, opened.filledQty);
+    this.#setHeld({ windowId: w.id, symbol: sym.symbol, since: now, legUsd: filled.usd, entryNetAprPct: w.netAprPct });
     this.#record('enter', { windowId: w.id, symbol: sym.symbol, outcome: opened, forecastNetAprPct: w.netAprPct, exitReason: null, rotation: p.fromId === null ? null : { fromId: p.fromId, toId: w.id }, manual: p.manual, startedAt: openAt });
-    this.#journal(kind, `${kind === 'rotate' ? `rotate ${p.fromId} -> ${w.id}` : `enter ${w.id}`}, ${sym.symbol} short hyperliquid, long phoenix, at most ${p.qty} ${sym.symbol} (${p.legUsd} USD) a leg at ${p.leverage}x, ${round(w.netAprPct)} % net (${who})${p.reason === undefined ? '' : `: ${p.reason}`}; ${opened.reason}`,
-      { ...base, usd: p.legUsd, feeUsd: opened.feeUsd, ...(p.fromId === null ? {} : { from: p.fromId }) }, opened.tx);
+    const size = filled.partial
+      ? `${filled.qty} ${sym.symbol} (${round(filled.usd)} USD) a leg filled of the ${p.qty} (${p.legUsd} USD) asked`
+      : `at most ${p.qty} ${sym.symbol} (${p.legUsd} USD) a leg`;
+    const sizeNumbers: Record<string, number | string> = filled.partial ? { legUsd: round(filled.usd), qty: filled.qty, usd: round(filled.usd), askedLegUsd: p.legUsd, askedQty: p.qty } : { usd: p.legUsd };
+    this.#journal(kind, `${kind === 'rotate' ? `rotate ${p.fromId} -> ${w.id}` : `enter ${w.id}`}, ${sym.symbol} short hyperliquid, long phoenix, ${size} at ${p.leverage}x, ${round(w.netAprPct)} % net (${who})${p.reason === undefined ? '' : `: ${p.reason}`}; ${opened.reason}`,
+      { ...base, ...sizeNumbers, feeUsd: opened.feeUsd, ...(p.fromId === null ? {} : { from: p.fromId }) }, opened.tx);
     return { end: 'done', sent: true, passing: false };
   }
 
@@ -1029,4 +1041,15 @@ function symbolIs(s: { symbol: string } | { refused: string }, symbol: string): 
 
 function round(v: number): number {
   return Math.round(v * 100) / 100;
+}
+
+/**
+ * The leg an open filled: ActOutcome.filledQty, and its USD at the price the asked size was valued at (the asked USD
+ * pro rata); as asked when the hands did not say, or filled all of it.
+ */
+export function filledLeg(asked: { legUsd: number; qty: string }, filledQty: string | undefined): { qty: string; usd: number; partial: boolean } {
+  const want = Number(asked.qty);
+  const got = filledQty === undefined ? want : Number(filledQty);
+  if (filledQty === undefined || !Number.isFinite(got) || !(want > 0) || got === want) return { qty: asked.qty, usd: asked.legUsd, partial: false };
+  return { qty: filledQty, usd: asked.legUsd * (got / want), partial: true };
 }

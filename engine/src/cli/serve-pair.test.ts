@@ -33,6 +33,12 @@ class Leg implements TradeLeg {
   hold: (() => Promise<void>) | null = null;
   /** Every position read (a test counts them). */
   reads = 0;
+  /** Phoenix's trader snapshot when set: read in place of `pos`, its slot gated as PhoenixLeg gates it. */
+  snap: { slot: number; pos: bigint } | null = null;
+  /** The chain's confirmed slot that syncToChain takes (null: syncToChain changes nothing). */
+  chainSlot: number | null = null;
+  /** The oldest snapshot slot trusted: 0 after a restart, raised by syncToChain. */
+  minSlot = 0;
   constructor(venue: VenueId, symbol: string) {
     this.venue = venue;
     this.symbol = symbol;
@@ -43,7 +49,12 @@ class Leg implements TradeLeg {
   }
   async position(): Promise<bigint> {
     this.reads++;
-    return this.pos;
+    if (this.snap === null) return this.pos;
+    if (this.snap.slot < this.minSlot) throw new Error(`${this.venue}: the trader snapshot is at slot ${this.snap.slot}, still before slot ${this.minSlot}: the position is unknown`);
+    return this.snap.pos;
+  }
+  async syncToChain(): Promise<void> {
+    if (this.chainSlot !== null) this.minSlot = Math.max(this.minSlot, this.chainSlot);
   }
   async order(side: LegSide, size: bigint, reduceOnly: boolean): Promise<LegOutcome> {
     if (this.hold !== null) await this.hold();
@@ -561,6 +572,59 @@ test('F1: a pair recorded while both venues are flat is cleared after two agreei
     assert.equal(hands.heldSymbol(), null);
     const again = await hands.open({ symbol: 'XLM', legUsd: 10, leverage: 1.5, reason: 'strategy: enter' });
     assert.equal(again.ok, true, again.reason);
+    p.stop();
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+test('Phoenix settlement lag after a restart: a stale snapshot showing Phoenix 0 is never adopted as one leg; reconcile syncs to the chain first', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
+  try {
+    const p = await servePair(input(w));
+    const hands = p.hands!;
+    assert.equal((await hands.open({ symbol: 'XLM', legUsd: 10, leverage: 1.5, reason: 'strategy: enter' })).ok, true);
+    // As after a restart: the Phoenix leg trusts any snapshot again (slot 0), and Phoenix's snapshot (slot 100) is from
+    // before the long landed (the chain is at 120), so it shows 0. The live reads already say one leg (HL -10, PX 0).
+    w.px.minSlot = 0;
+    w.px.snap = { slot: 100, pos: 0n };
+    w.px.chainSlot = 120;
+    liveReads(p, [-toQty('10'), 0n]);
+    assert.equal(await hands.reconcile(), null);
+    assert.ok(w.lines.some((l) => /not reconciled: phoenix: the trader snapshot is at slot 100, still before slot 120: the position is unknown/.test(l)), w.lines.join('\n'));
+    assert.deepEqual(hands.heldLegs().map((l) => l.qty), [-toQty('10'), toQty('10')], 'nothing adopted: the pair stays recorded');
+    // The snapshot reaches the chain's slot: the venues hold the pair after all, so nothing changes.
+    w.px.snap = { slot: 121, pos: toQty('10') };
+    assert.equal(await hands.reconcile(), null);
+    assert.deepEqual(hands.heldLegs().map((l) => l.qty), [-toQty('10'), toQty('10')]);
+    assert.deepEqual([w.hl.pos, w.px.pos], [-toQty('10'), toQty('10')], 'no leg was closed');
+    p.stop();
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+test('Phoenix settlement lag at start: the start plan reads Phoenix only at or past the chain\'s confirmed slot', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1' });
+  try {
+    const identity = { contractId: CONTRACT, deskId: DESK, evm: EVM };
+    const store = new TraderStateStore(traderStateFile(w.dir, 'mainnet', identity), identity);
+    store.save({
+      version: TRADER_STATE_VERSION, savedAt: 1, symbol: 'XLM',
+      trader: { intents: [toQty('-50'), toQty('50')], baselines: [toQty('-50'), toQty('50')], known: [toQty('-50'), toQty('50')], net: 0n, unhedged: null, unsettled: [] }, pendingMaker: [],
+      inFlight: [], adl: newAdlState(),
+    });
+    w.hl.pos = toQty('-50');
+    w.px.pos = toQty('50');
+    w.px.snap = { slot: 100, pos: 0n };
+    w.px.chainSlot = 120;
+    await assert.rejects(servePair(input(w)), /the legs could not be read twice alike at start \(phoenix: the trader snapshot is at slot 100, still before slot 120: the position is unknown\); nothing is adopted/);
+    w.px.minSlot = 0;
+    w.px.snap = { slot: 120, pos: toQty('50') };
+    const p = await servePair(input(w));
+    assert.equal(p.pair?.live, true);
+    assert.deepEqual(p.pair!.legs.map((l) => p.pair!.trader.baseline(l)), [toQty('-50'), toQty('50')]);
+    assert.deepEqual(p.pair!.legs.map((l) => p.pair!.trader.known(l)), [toQty('-50'), toQty('50')]);
     p.stop();
   } finally {
     rmSync(w.dir, { recursive: true, force: true });

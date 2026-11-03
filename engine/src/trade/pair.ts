@@ -821,12 +821,14 @@ export class PairTrader {
 
   /**
    * An open waits while an order on the pair has no answer and can still run: it would reopen a leg that the order
-   * could then double, or close alone. A watch whose window ended is closed out first.
+   * could then double, or close alone. A watch whose window ended is closed out first, outside the open's scope
+   * (open-scope.ts): the lapse settles an older order, and what it sends (a reconcile, an unwind) is not part of this
+   * open, so a guarded leg treats it as any watch check (reduce-only only).
    */
   async #blocked(size: bigint): Promise<PairResult | null> {
     for (const leg of this.legs) {
       const u = this.#unsettled.get(leg);
-      if (u !== undefined && this.#clock.now() > u.until) await this.#lapse(leg);
+      if (u !== undefined && this.#clock.now() > u.until) await outsideOpen(() => this.#lapse(leg));
     }
     const pending = this.legs.flatMap((leg) => {
       const u = this.#unsettled.get(leg);

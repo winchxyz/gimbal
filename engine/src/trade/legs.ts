@@ -89,6 +89,13 @@ export interface TradeLeg {
    * maker orders share one budget of maxOrders post-only orders and one reprice floor (repriceMs between placements).
    */
   beginMakerOperation?(): () => void;
+  /**
+   * A venue whose state is read from a snapshot that can lag the chain (Phoenix): the chain's confirmed slot now
+   * becomes the oldest snapshot position() trusts, so a read after a restart cannot show the legs as they were before
+   * the last landed transaction (an older snapshot is waited for, then thrown: unknown). Throws when the chain's slot
+   * cannot be read; the read that needed it is then unknown too.
+   */
+  syncToChain?(): Promise<void>;
 }
 
 /** How a maker order works the book: reprice at most every `repriceMs`, give up after `timeoutMs`, then IOC or not. */
