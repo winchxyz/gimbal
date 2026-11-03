@@ -18,7 +18,7 @@ import type { AccountState, Clock, Market, VenueReader } from '../venues/venue.t
 import type { DecideInput, Decision } from '../strategy/decide.ts';
 import type { ActOutcome, BookFill, BookSink, HandsHeld, LoopHands, WindowFacts } from '../strategy/loop.ts';
 import type { PairResult } from '../trade/pair.ts';
-import { qtyString, toQty } from '../trade/lots.ts';
+import { qtyString, signedQtyString, toQty } from '../trade/lots.ts';
 import { LoopStore, StrategyLoop, loopStateFile } from '../strategy/loop.ts';
 import type { VetoSource } from '../strategy/veto.ts';
 import type { HandsResult, PairHands, ServePair } from './serve-pair.ts';
@@ -69,7 +69,7 @@ export interface ServeLoopInput {
 export function serveLoop(input: ServeLoopInput): StrategyLoop {
   const trade = input.env('GIMBAL_TRADE') === '1' && !input.once;
   const pairHands = input.pair?.hands;
-  const hands = input.hands !== undefined ? input.hands : pairHands === undefined ? null : loopHands(pairHands, input.lastDesk, input.log);
+  const hands = input.hands !== undefined ? input.hands : pairHands === undefined ? null : loopHands(pairHands, input.lastDesk, input.log, input.busy);
   const handsWhy = hands !== null ? undefined
     : input.pair === null ? (input.mode === 'mainnet' ? 'no contract desk is set (GIMBAL_CONTRACT_ID, DESK_ID)' : `serve holds a pair on mainnet only, this is ${input.mode}`)
     : input.pair.notTrading() ?? 'the pair is alert only';
@@ -136,29 +136,48 @@ export function policySymbols(policy: ContractPolicy | null): string[] {
   return policy.hl_assets.map((a) => a.symbol).filter((s) => px.has(s));
 }
 
-/** serve-pair's hands as the loop takes them: windows mapped to policy symbols, the desk's numbers for the held pair. */
-export function loopHands(hands: PairHands, lastDesk: () => DeskState | null, log: (line: string) => void): LoopHands {
+/**
+ * serve-pair's hands as the loop takes them: windows mapped to policy symbols, the desk's numbers for the held pair
+ * (its symbol's legs only), a single leg named, and `busy` (a rescue running, fund_venue included; an ADL unwind;
+ * panic_close) refusing before the hands' own reasons.
+ */
+export function loopHands(hands: PairHands, lastDesk: () => DeskState | null, log: (line: string) => void, busy: () => string | null = () => null): LoopHands {
   const outcome = (r: HandsResult): ActOutcome => {
     for (const line of r.lines) log(`strategy loop: ${line}`);
-    return { ok: r.ok, reason: r.reason, sent: r.results.length > 0 || r.tx.length > 0, tx: r.tx, feeUsd: r.feeUsd, open: r.open, fills: fillsOf(r.results) };
+    return { ok: r.ok, reason: r.reason, sent: r.sent ?? (r.results.length > 0 || r.tx.length > 0), tx: r.tx, feeUsd: r.feeUsd, open: r.open, fills: fillsOf(r.results) };
   };
   return {
-    blocked: () => hands.blocked(),
+    blocked: () => busy() ?? hands.blocked(),
     held: (): HandsHeld | null => {
       const symbol = hands.heldSymbol();
       if (symbol === null) return null;
-      const desk = lastDesk();
-      const legs = desk?.legs ?? [];
+      const legs = (lastDesk()?.legs ?? []).filter((l) => sameSymbol(l.symbol, symbol));
       const legUsd = legs.length === 0 ? 0 : Math.max(...legs.map((l) => l.size * l.mark));
+      let pnlUsd = 0;
       // What closing each leg frees on its venue: its margin plus its P&L.
       const freed: Record<string, number> = {};
-      for (const l of legs) freed[l.venue] = (freed[l.venue] ?? 0) + Math.max(0, l.marginUsd + (l.mark - l.entry) * l.size * (l.side === 'long' ? 1 : -1));
-      return { symbol, legUsd, pnlUsd: desk?.pnl.netUsd ?? 0, ...(legs.length === 0 ? {} : { freedMarginUsd: freed }) };
+      for (const l of legs) {
+        const price = (l.mark - l.entry) * l.size * (l.side === 'long' ? 1 : -1);
+        pnlUsd += price + l.fundingEarnedUsd + l.unsettledFundingUsd + l.feesUsd;
+        freed[l.venue] = (freed[l.venue] ?? 0) + Math.max(0, l.marginUsd + price);
+      }
+      const known = hands.heldLegs();
+      const open = known.filter((l) => l.qty !== 0n);
+      // One leg: one venue holds a position and the other is known flat (an unknown leg is not called flat).
+      const oneLeg = open.length === 1 && open[0]!.qty !== null && known.length === 2 && known.every((l) => l.qty !== null)
+        ? { venue: open[0]!.venue, qty: signedQtyString(open[0]!.qty!) } : null;
+      return { symbol, legUsd, pnlUsd, oneLeg, ...(legs.length === 0 ? {} : { freedMarginUsd: freed }) };
     },
     symbolOf: (w) => windowSymbol(w, hands.symbols),
-    open: async (r) => outcome(await hands.open({ symbol: r.symbol, legUsd: r.legUsd, leverage: r.leverage, reason: r.reason, ...(r.qty === undefined ? {} : { qty: r.qty }) })),
+    open: async (r) => outcome(await hands.open({ symbol: r.symbol, legUsd: r.legUsd, leverage: r.leverage, reason: r.reason, qty: r.qty })),
     close: async (r) => outcome(await hands.close({ reason: r.reason })),
   };
+}
+
+/** A desk leg's symbol and a policy symbol name the same market (kPEPE and PEPE, case aside). */
+function sameSymbol(a: string, b: string): boolean {
+  const n = (s: string) => kiloBase(s).base.toUpperCase();
+  return a.toUpperCase() === b.toUpperCase() || n(a) === n(b);
 }
 
 /** The policy symbol (a Hyperliquid asset Phoenix also lists) a window trades here, or why serve cannot trade it. */

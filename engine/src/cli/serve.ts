@@ -43,8 +43,11 @@
 // The strategy loop (src/strategy/loop.ts, serve-loop.ts): after each funding payment and each scan it runs decide()
 // and, with GIMBAL_TRADE=1 and auto on (PUT /strategy; off by default and kept as the owner set it), carries the act
 // out through the pair (mainnet: pair-mainnet's open and close, pair-ops.ts); otherwise it publishes `off`. POST
-// /rotate {windowId} and POST /close go the same way (with auto off too, still only with GIMBAL_TRADE=1). Its counters
-// and the pair it entered are kept next to the trader state, loop-<mode>-<contract>-<desk>.json.
+// /rotate {windowId} goes the same way and needs auto on ("auto is off" otherwise: nothing new opens until the owner
+// sets auto=true); POST /close works with auto on or off. Both only with GIMBAL_TRADE=1 and only while the engine
+// listens on loopback. Nothing is sent while a rescue (its fund_venue step too), an ADL unwind or panic_close runs:
+// checked at each decision and again right before every close and open. Its counters and the pair it entered are
+// kept next to the trader state, loop-<mode>-<contract>-<desk>.json.
 // The monitor (src/risk/monitor.ts): every 30 min the legs, their distance to liquidation and the net; an alert to the
 // journal and the console when a leg is under 25 % from liquidation. `npm run monitor -w engine -- --mainnet` is the
 // one-shot form.

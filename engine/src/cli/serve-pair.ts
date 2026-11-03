@@ -67,7 +67,7 @@ import type { Clock } from '../venues/venue.ts';
 import type { PriceDeps, StoredPrice } from './pair-mainnet-lib.ts';
 import { PRICE_MARGIN_S, ensureFresh, newPriceState, oraclePxOf, priceFitRefusal, priceLifeS, refreshLanded } from './pair-mainnet-lib.ts';
 import type { OpsCtx, PairRunner } from './pair-ops.ts';
-import { pairOf, planClose, planOpen, sendClose, sendOpen } from './pair-ops.ts';
+import { pairOf, planClose, planOpen, recheckOpenSize, sendClose, sendOpen } from './pair-ops.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { checkContractNetwork, contractEnv } from './serve-contract.ts';
 
@@ -181,6 +181,11 @@ export interface HandsResult {
   tx: TxRef[];
   /** The fills' fees, USD (≤ 0 as the journal counts costs). */
   feeUsd: number;
+  /**
+   * Orders went out (or may have): set when the operation threw after the trader recorded a fill or the pair holds
+   * a position; absent = judge by `results` and `tx`.
+   */
+  sent?: boolean;
 }
 
 /** The strategy loop's hands on the desk's pair (strategy/loop.ts). */
@@ -191,6 +196,8 @@ export interface PairHands {
   blocked(): string | null;
   /** The symbol the trader holds open (a leg not flat, or unknown), or null when flat or no pair. */
   heldSymbol(): string | null;
+  /** Each leg's venue and position the trader holds (its baseline), signed; null = not known; none when no pair. */
+  heldLegs(): { venue: string; qty: bigint | null }[];
   /** pair-mainnet open on `symbol`, short Hyperliquid and long Phoenix: refusals first, then maker first. */
   open(request: { symbol: string; legUsd: number; leverage: number; reason: string; qty?: string }): Promise<HandsResult>;
   /** pair-mainnet close of the pair held, reduce-only, maker first. */
@@ -616,7 +623,14 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
     const exclusive = (run: () => Promise<HandsResult>): Promise<HandsResult> => {
       const why = blocked();
       if (why !== null) return Promise.resolve(result(false, why));
-      const op = run().catch((err: unknown) => result(false, `not done: ${errorMessage(err)}`)).finally(() => {
+      // A throw after orders went out is not "nothing signed": the trader's record moved, or the pair holds a position.
+      const trader = current?.trader ?? null;
+      const epoch = trader?.baselineEpoch ?? null;
+      const heldBefore = heldSymbol();
+      const op = run().catch((err: unknown) => {
+        const moved = (trader !== null && trader.baselineEpoch !== epoch) || (current !== null && current.trader !== trader) || heldSymbol() !== heldBefore;
+        return result(false, `${moved ? 'stopped with orders out' : 'not done'}: ${errorMessage(err)}`, moved ? { sent: true } : {});
+      }).finally(() => {
         operation = null;
       });
       operation = op;
@@ -626,6 +640,13 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       symbols: common,
       blocked,
       heldSymbol,
+      heldLegs: () => {
+        const s = current;
+        return s === null ? [] : s.trader.legs.map((l) => {
+          const b = s.trader.baseline(l);
+          return { venue: l.venue, qty: b === undefined ? 0n : b };
+        });
+      },
       open: (request) => exclusive(async () => {
         const sym = request.symbol;
         if (!common.includes(sym)) return result(false, `${sym} is not in both policy.hl_assets and policy.phoenix_markets (${common.join(', ') || 'none'})`);
@@ -779,6 +800,13 @@ function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string; phoen
       const fit = p.legs.priced ? priceFitRefusal(SERVE_MAKER.timeoutMs / 1000, ctx.desk.policy.oracle_max_age_s) : null;
       if (fit !== null) refusals.push(fit);
       if (refusals.length > 0) return { refusals, results: [] };
+      // The exact size decide() took is a maximum: held to the cap at the prices of the moment, before either leg.
+      if (request.qty !== undefined) {
+        const held = await recheckOpenSize(ctx, pair, plan.size, SERVE_SLIPPAGE_BPS);
+        if ('refused' in held) return { refusals: [held.refused], results: [] };
+        out.say(held.line);
+        plan = { ...plan, size: held.qty };
+      }
       return { refusals: [], results: await sendOpen(ctx, pair, plan, request.reason) };
     },
     close: async (request, out) => {

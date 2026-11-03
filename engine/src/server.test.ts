@@ -11,7 +11,7 @@ import { VirtualClock } from './venues/replay.ts';
 import type { Book, MarketFunding, VenueReader } from './venues/venue.ts';
 import { DEFAULT_SCANNER_CONFIG, DEFAULT_STRATEGY } from './scanner/config.ts';
 import { Scanner } from './scanner/scanner.ts';
-import { EngineServer } from './server.ts';
+import { EngineServer, isLoopback } from './server.ts';
 
 const T0 = Date.UTC(2026, 9, 31, 10, 30);
 
@@ -170,6 +170,35 @@ test('without a strategy loop /rotate and /close answer 503 { ok: false } (stres
   assert.equal(wrong.headers.allow, 'POST');
   assert.equal((await call('POST', '/state', '{}')).status, 405);
   assert.equal((await call('GET', '/nope')).status, 404);
+});
+
+test('POST /close takes an empty body without a content type; /rotate and /close answer only on a loopback address', async () => {
+  // No body, no content type: through the guard, to the loop (503 here: none).
+  assert.equal((await call('POST', '/close', undefined, {})).status, 503);
+  assert.equal((await call('POST', '/rotate', undefined, {})).status, 415, '/rotate needs its JSON body');
+  assert.deepEqual(['127.0.0.1', '127.1.2.3', '::1', '[::1]', 'localhost', '::ffff:127.0.0.1'].map(isLoopback), [true, true, true, true, true, true]);
+  assert.deepEqual(['0.0.0.0', '::', '10.0.0.5', '192.168.1.2', 'engine.example'].map(isLoopback), [false, false, false, false, false]);
+  const scanner = new Scanner([reader('hyperliquid', 0.00005)], [], { config: DEFAULT_SCANNER_CONFIG, clock: new VirtualClock(T0), strategy: () => DEFAULT_STRATEGY });
+  const wide = new EngineServer({ mode: 'replay', scanner, strategy: DEFAULT_STRATEGY, policy: null, intervalMs: 3_600_000, log: () => {} });
+  const port = await wide.start(0, '0.0.0.0');
+  try {
+    const post = (path: string, body: string) => new Promise<{ status: number; json: { ok: boolean; reason: string } }>((resolve, reject) => {
+      const req = request(`http://127.0.0.1:${port}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' } }, (res) => {
+        let text = '';
+        res.setEncoding('utf8');
+        res.on('data', (c: string) => (text += c));
+        res.on('end', () => resolve({ status: res.statusCode!, json: JSON.parse(text) }));
+      });
+      req.on('error', reject);
+      req.end(body);
+    });
+    const rot = await post('/rotate', '{"windowId":"sol-phoenix-hyperliquid"}');
+    assert.equal(rot.status, 403);
+    assert.match(rot.json.reason, /only while the engine listens on loopback.*it listens on 0\.0\.0\.0/);
+    assert.equal((await post('/close', '{}')).status, 403);
+  } finally {
+    await wide.stop();
+  }
 });
 
 test('publish keeps the latest of each type for /state, and the journal newest first', async () => {

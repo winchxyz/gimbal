@@ -7,7 +7,7 @@ import type { JournalEntry, StrategyConfig, StrategyDecision, StreamEvent, Windo
 import { DEFAULT_STRATEGY } from '../scanner/config.ts';
 import type { DecideInput, Decision } from './decide.ts';
 import { LOOP_RULES, NO_COUNTERS } from './decide.ts';
-import type { ActOutcome, BookRecord, LoopHands, StrategyLoopOptions } from './loop.ts';
+import type { ActOutcome, BookRecord, HandsHeld, LoopHands, StrategyLoopOptions } from './loop.ts';
 import { HOUR_GRACE_MS, LoopStore, RETRY_AFTER_MS, StrategyLoop, loopStateFile, notEnterable } from './loop.ts';
 import type { VetoSource } from './veto.ts';
 
@@ -35,10 +35,10 @@ const REFUSED = (reason: string): ActOutcome => ({ ok: false, reason, sent: fals
 
 interface World {
   now: number;
-  held: { symbol: string; legUsd: number; pnlUsd: number } | null;
+  held: (Omit<HandsHeld, 'oneLeg'> & { oneLeg?: HandsHeld['oneLeg'] }) | null;
   blocked: string | null;
   busy: string | null;
-  opens: { symbol: string; legUsd: number; leverage: number; reason: string }[];
+  opens: { symbol: string; legUsd: number; leverage: number; qty: string; reason: string }[];
   closes: string[];
   openAnswer: (symbol: string) => ActOutcome;
   closeAnswer: () => ActOutcome;
@@ -62,10 +62,10 @@ function world(over: Partial<World> = {}): World {
 function fakeHands(w: World): LoopHands {
   return {
     blocked: () => w.blocked,
-    held: () => w.held,
+    held: () => (w.held === null ? null : { ...w.held, oneLeg: w.held.oneLeg ?? null }),
     symbolOf: (x) => (x.longVenue === 'phoenix' && x.shortVenue === 'hyperliquid' ? { symbol: x.symbol } : { refused: 'short hyperliquid, long phoenix only' }),
     open: async (r) => {
-      w.opens.push({ symbol: r.symbol, legUsd: r.legUsd, leverage: r.leverage, reason: r.reason });
+      w.opens.push({ symbol: r.symbol, legUsd: r.legUsd, leverage: r.leverage, qty: r.qty, reason: r.reason });
       const a = w.openAnswer(r.symbol);
       if (a.ok) w.held = { symbol: r.symbol, legUsd: r.legUsd, pnlUsd: 0 };
       return a;
@@ -126,9 +126,10 @@ test('off: without GIMBAL_TRADE=1 decide() never runs; with auto off it runs (it
   assert.equal(w.inputs.length, 0);
   assert.deepEqual(decisions(w).map((d) => d.action), ['off']);
   assert.match(decisions(w)[0]!.reason, /GIMBAL_TRADE is not 1/);
+  assert.deepEqual(journal(w).map((j) => [j.kind, j.numbers.action]), [['wait', 'off']], 'off is journaled once, on the transition');
 
   const w2 = world({ strategy: { ...DEFAULT_STRATEGY, auto: false } });
-  w2.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5 } };
+  w2.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
   const loop2 = makeLoop(w2);
   await loop2.check();
   assert.equal(w2.inputs.length, 1);
@@ -176,17 +177,26 @@ test('decision events only when the decision changes; a wait is journaled only w
   const waits = journal(w).filter((j) => j.kind === 'wait');
   assert.deepEqual(waits.map((j) => j.summary), ['nothing clears the bar', 'sol-phoenix-hyperliquid above the bar 1 of 3 checks']);
   assert.equal(loop.counters.lastWaitReason, 'sol-phoenix-hyperliquid above the bar 1 of 3 checks');
+  // Every wait carries the top window's net, the minimum, k/N checks and what blocks it.
+  const n = waits[1]!.numbers;
+  assert.equal(n.action, 'wait');
+  assert.equal(n.window, 'sol-phoenix-hyperliquid');
+  assert.equal(n.netAprPct, 24);
+  assert.equal(n.minNetAprPct, DEFAULT_STRATEGY.minNetAprPct);
+  assert.equal(n.checks, `0/${LOOP_RULES.enterAfterChecks}`);
+  assert.equal(typeof n.block, 'string');
 });
 
 test('enter: the veto (none: "no veto check"), then the open; journaled with numbers and tx; held saved and reloaded', async () => {
   const w = world();
   const store = tmpStore();
   const loop = makeLoop(w, store);
-  w.next = { decision: { action: 'enter', reason: '3 checks above the bar', windowId: 'sol-phoenix-hyperliquid' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5 } };
+  w.next = { decision: { action: 'enter', reason: '3 checks above the bar', windowId: 'sol-phoenix-hyperliquid' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
   await loop.check();
-  assert.deepEqual(w.opens.map((o) => [o.symbol, o.legUsd, o.leverage]), [['SOL', 500, 1.5]]);
+  assert.deepEqual(w.opens.map((o) => [o.symbol, o.legUsd, o.leverage, o.qty]), [['SOL', 500, 1.5, '5']], 'the exact qty decide() sized');
   const enter = journal(w).find((j) => j.kind === 'enter')!;
-  assert.match(enter.summary, /enter sol-phoenix-hyperliquid, SOL short hyperliquid, long phoenix, 500 USD a leg at 1.5x/);
+  assert.match(enter.summary, /enter sol-phoenix-hyperliquid, SOL short hyperliquid, long phoenix, at most 5 SOL \(500 USD\) a leg at 1.5x/);
+  assert.equal(enter.numbers.qty, '5');
   assert.match(String(enter.numbers.veto), /^no veto check on SOL: NEAR_AI_API_KEY is not set/);
   assert.equal(enter.numbers.legUsd, 500);
   assert.equal(enter.tx[0]!.id, 'h1');
@@ -205,12 +215,12 @@ test('enter: the veto (none: "no veto check"), then the open; journaled with num
   assert.equal(w.inputs.at(-1)!.held?.entryNetAprPct, 24);
 });
 
-test('a veto drops the window: journaled, nothing opened, and decide() sees the veto for an hour', async () => {
+test('a veto drops the window: journaled, nothing opened, held out by counters.vetoedUntil (saved), shown on the window', async () => {
   const w = world();
   const reply = (content: string) => ({ content, raw: { choices: [{ message: { content } }] } });
   const veto: VetoSource = { model: 'test-model', configured: true, complete: async () => reply('{"verdict":"veto","reasons":["delisting announced"]}') };
   const loop = makeLoop(w, tmpStore(), { veto });
-  w.next = { decision: { action: 'enter', reason: 'go', windowId: 'sol-phoenix-hyperliquid' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5 } };
+  w.next = { decision: { action: 'enter', reason: 'go', windowId: 'sol-phoenix-hyperliquid' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
   await loop.check();
   assert.equal(w.opens.length, 0);
   const v = journal(w).find((j) => j.kind === 'veto')!;
@@ -220,18 +230,20 @@ test('a veto drops the window: journaled, nothing opened, and decide() sees the 
   // The verdict is put on the window and republished, so the web shows it.
   const shown = w.events.filter((e) => e.type === 'windows').at(-1)!.data as FundingWindow[];
   assert.equal(shown.find((x) => x.id === 'sol-phoenix-hyperliquid')!.veto?.verdict, 'veto');
+  // The hold is the counters' (decide() reads it), on disk; decide() gets the scan's windows as they are.
+  assert.equal(loop.counters.vetoedUntil['sol-phoenix-hyperliquid'], T0 + LOOP_RULES.vetoHoldHours * HOUR);
   w.next = {};
   w.now += 60_000;
   await loop.check();
-  assert.equal(w.inputs.at(-1)!.windows.find((x) => x.id === 'sol-phoenix-hyperliquid')!.veto?.verdict, 'veto');
-  w.now += HOUR;
-  await loop.check();
+  assert.equal(w.inputs.at(-1)!.counters.vetoedUntil['sol-phoenix-hyperliquid'], T0 + LOOP_RULES.vetoHoldHours * HOUR);
   assert.equal(w.inputs.at(-1)!.windows.find((x) => x.id === 'sol-phoenix-hyperliquid')!.veto, undefined);
+  // A manual rotate into it is refused while it is held out.
+  assert.match((loop.rotate('sol-phoenix-hyperliquid') as { reason: string }).reason, /vetoed by NEAR AI: held out until/);
   // A veto that does not answer in time is a pass.
   const w2 = world();
   const slow: VetoSource = { model: 'test-model', configured: true, complete: () => new Promise(() => {}) };
   const loop2 = makeLoop(w2, tmpStore(), { veto: slow });
-  w2.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5 } };
+  w2.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
   await loop2.check();
   assert.equal(w2.opens.length, 1);
   assert.match(String(journal(w2).find((j) => j.kind === 'enter')!.numbers.veto), /no veto check on SOL: no answer within/);
@@ -242,7 +254,7 @@ test('rotate: close the held pair, then open the new one; a refused open is jour
   const loop = makeLoop(w);
   await loop.check();                                    // adopts the venues' SOL pair as its desk window
   assert.equal(loop.held?.windowId, 'sol-phoenix-hyperliquid');
-  w.next = { decision: { action: 'rotate', reason: 'eth better by 5 pts for 4 h' }, act: { kind: 'rotate', fromId: 'sol-phoenix-hyperliquid', toId: 'eth-phoenix-hyperliquid', legUsd: 500, leverage: 1.5 } };
+  w.next = { decision: { action: 'rotate', reason: 'eth better by 5 pts for 4 h' }, act: { kind: 'rotate', fromId: 'sol-phoenix-hyperliquid', toId: 'eth-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
   w.now += 60_000;
   await loop.check();
   assert.equal(w.closes.length, 1);
@@ -254,7 +266,7 @@ test('rotate: close the held pair, then open the new one; a refused open is jour
 
   // The next rotate's open is refused: the close stands, nothing is held, and the journal says the desk is flat.
   w.openAnswer = () => REFUSED('the spread does not cover the round trip');
-  w.next = { decision: { action: 'rotate', reason: 'sol back' }, act: { kind: 'rotate', fromId: 'eth-phoenix-hyperliquid', toId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5 } };
+  w.next = { decision: { action: 'rotate', reason: 'sol back' }, act: { kind: 'rotate', fromId: 'eth-phoenix-hyperliquid', toId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
   w.now += 60_000;
   await loop.check();
   assert.equal(w.held, null);
@@ -280,7 +292,7 @@ test('exit: both legs closed, held cleared, the cooldown starts', async () => {
 test('a refused act is journaled once and not tried again before RETRY_AFTER_MS; no hands refuse every act', async () => {
   const w = world({ openAnswer: () => REFUSED('Hyperliquid leg 38 % from liquidation, under 40 %') });
   const loop = makeLoop(w);
-  w.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5 } };
+  w.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
   await loop.check();
   w.now += 60_000;
   await loop.check();
@@ -289,7 +301,7 @@ test('a refused act is journaled once and not tried again before RETRY_AFTER_MS;
   await loop.check();
   assert.equal(w.opens.length, 2);
   // A direction serve does not open: refused once, with the reason, however many checks ask for it.
-  w.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'btc-hyperliquid-phoenix', legUsd: 500, leverage: 1.5 } };
+  w.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'btc-hyperliquid-phoenix', legUsd: 500, leverage: 1.5, qty: '5' } };
   await loop.check();
   w.now += RETRY_AFTER_MS;
   await loop.check();
@@ -297,7 +309,7 @@ test('a refused act is journaled once and not tried again before RETRY_AFTER_MS;
 
   const w2 = world();
   const loop2 = makeLoop(w2, tmpStore(), { hands: null, handsWhy: 'serve holds a pair on mainnet only, this is testnet' });
-  w2.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5 } };
+  w2.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
   await loop2.check();
   w2.now += 60_000;
   await loop2.check();
@@ -318,8 +330,8 @@ test('no decision while a rescue or an ADL unwind runs; the hourly check is take
   assert.deepEqual(w.inputs.map((i) => i.hourly), [true]);
 });
 
-test('POST /rotate and /close: refused at once with the reason, or started through the same path as auto', async () => {
-  const w = world({ strategy: { ...DEFAULT_STRATEGY, auto: false }, held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 } });
+test('POST /rotate (auto on only) and /close (always): refused at once with the reason, or started through the same path as auto', async () => {
+  const w = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 } });
   const loop = makeLoop(w);
   await loop.check();                                    // the facts and free margin a manual rotate is sized on
   assert.deepEqual(loop.rotate(''), { ok: false, reason: 'POST /rotate needs { "windowId": "<window id>" }' });
@@ -331,16 +343,23 @@ test('POST /rotate and /close: refused at once with the reason, or started throu
   assert.deepEqual(loop.rotate('eth-phoenix-hyperliquid'), { ok: false, reason: 'an ADL unwind runs' });
   w.busy = null;
 
-  // With auto off: a manual rotate, SOL -> ETH, at strategy.legUsd capped by the policy.
+  // Auto off: nothing new opens, a rotate is refused.
+  w.strategy = { ...DEFAULT_STRATEGY, auto: false };
+  assert.match((loop.rotate('eth-phoenix-hyperliquid') as { reason: string }).reason, /^auto is off/);
+  w.strategy = { ...DEFAULT_STRATEGY, auto: true };
+
+  // A manual rotate, SOL -> ETH, at strategy.legUsd capped by the policy, sized again when it runs.
   assert.deepEqual(loop.rotate('eth-phoenix-hyperliquid'), { ok: true });
   assert.match((loop.close() as { reason: string }).reason, /the strategy loop is acting \(POST \/rotate eth-phoenix-hyperliquid\)/);
   await loop.idle(1000);
   assert.equal(w.closes.length, 1);
-  assert.deepEqual(w.opens.map((o) => [o.symbol, o.legUsd]), [['ETH', 1000]]);
+  assert.deepEqual(w.opens.map((o) => [o.symbol, o.legUsd, o.qty]), [['ETH', 1000, '10']]);
   assert.equal(loop.held?.windowId, 'eth-phoenix-hyperliquid');
-  assert.equal(loop.counters.rotationsAt.length, 0, 'a manual rotate is not one of the loop\'s own');
+  assert.equal(loop.counters.rotationsAt.length, 1, 'a manual rotation counts toward the day\'s');
   assert.equal(journal(w).find((j) => j.kind === 'rotate')!.numbers.by, 'POST /rotate (manual)');
 
+  // POST /close works with auto off.
+  w.strategy = { ...DEFAULT_STRATEGY, auto: false };
   assert.deepEqual(loop.close(), { ok: true });
   await loop.idle(1000);
   assert.equal(w.held, null);
@@ -361,6 +380,8 @@ test('the loop file: atomic JSON next to the trader state; an unusable one start
   assert.equal(bad.state.counters.rotationsAt.length, LOOP_RULES.maxRotationsPerDay);
   store.save({ version: 1, counters: { ...NO_COUNTERS, badChecks: 2 }, held: null });
   assert.equal(store.load(T0).state.counters.badChecks, 2);
+  store.save({ version: 1, counters: { ...NO_COUNTERS, vetoedUntil: { 'sol-phoenix-hyperliquid': T0 + HOUR } }, held: null });
+  assert.deepEqual(store.load(T0).state.counters.vetoedUntil, { 'sol-phoenix-hyperliquid': T0 + HOUR });
   assert.throws(() => loopStateFile('/x', 'mainnet', 'Bad/Id', 'd'));
 });
 
@@ -376,9 +397,9 @@ test('the book: every carried-out enter and exit, a rotation as its exit then it
   const w = world();
   w.openAnswer = () => ({ ...OK('opened'), fills });
   const loop = makeLoop(w, tmpStore(), { book: (r) => records.push(r) });
-  w.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5 } };
+  w.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
   await loop.check();
-  w.next = { decision: { action: 'rotate', reason: 'eth better' }, act: { kind: 'rotate', fromId: 'sol-phoenix-hyperliquid', toId: 'eth-phoenix-hyperliquid', legUsd: 500, leverage: 1.5 } };
+  w.next = { decision: { action: 'rotate', reason: 'eth better' }, act: { kind: 'rotate', fromId: 'sol-phoenix-hyperliquid', toId: 'eth-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
   w.now += 60_000;
   await loop.check();
   w.next = { decision: { action: 'exit', reason: 'time stop' }, act: { kind: 'exit', reason: 'time stop' } };
@@ -398,8 +419,179 @@ test('the book: every carried-out enter and exit, a rotation as its exit then it
   // A refused open adds nothing.
   const before = records.length;
   w.openAnswer = () => REFUSED('no');
-  w.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5 } };
+  w.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
   w.now += 60_000;
   await loop.check();
   assert.equal(records.length, before);
+});
+
+const ENTER_SOL = { kind: 'enter' as const, windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' };
+
+test('a rescue that starts after the check began: re-checked right before the open; refused, tried again next check (no hold-off)', async () => {
+  const w = world();
+  // The rescue starts while NEAR AI is asked (after the check's own busy() read), once.
+  let asked = 0;
+  const veto: VetoSource = {
+    model: 'test-model', configured: true,
+    complete: async () => {
+      if (++asked === 1) w.busy = 'rescue r-2 runs';
+      const content = '{"verdict":"pass","reasons":[]}';
+      return { content, raw: { choices: [{ message: { content } }] } };
+    },
+  };
+  const loop = makeLoop(w, tmpStore(), { veto });
+  w.next = { decision: { action: 'enter', reason: 'go' }, act: ENTER_SOL };
+  await loop.check();
+  assert.equal(w.opens.length, 0);
+  assert.match(journal(w).filter((j) => j.kind === 'refused').at(-1)!.summary, /enter sol-phoenix-hyperliquid not carried out: rescue r-2 runs/);
+  w.busy = null;
+  w.now += 60_000;
+  await loop.check();
+  assert.equal(w.opens.length, 1, 'tried again on the next check, not after RETRY_AFTER_MS');
+
+  // hands.blocked() is the same gate (a close in flight).
+  const w2 = world();
+  const loop2 = makeLoop(w2);
+  w2.blocked = 'a close runs on SOL';
+  w2.next = { decision: { action: 'enter', reason: 'go' }, act: ENTER_SOL };
+  await loop2.check();
+  assert.equal(w2.opens.length, 0);
+  w2.blocked = null;
+  w2.now += 60_000;
+  await loop2.check();
+  assert.equal(w2.opens.length, 1);
+});
+
+test('a rotate whose open meets a running rescue: the close stands, nothing opens, the desk stays flat', async () => {
+  const w = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 } });
+  const loop = makeLoop(w);
+  await loop.check();
+  w.closeAnswer = () => {
+    w.busy = 'rescue r-3 runs';
+    return OK('closed both legs, flat');
+  };
+  w.next = { decision: { action: 'rotate', reason: 'eth better' }, act: { kind: 'rotate', fromId: 'sol-phoenix-hyperliquid', toId: 'eth-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  w.now += 60_000;
+  await loop.check();
+  assert.equal(w.closes.length, 1);
+  assert.equal(w.opens.length, 0);
+  assert.equal(loop.held, null);
+  assert.match(journal(w).at(-1)!.summary, /rotate eth-phoenix-hyperliquid not carried out: rescue r-3 runs; sol-phoenix-hyperliquid was closed, so the desk stays flat/);
+  assert.equal(loop.counters.lastExitAt, w.now, 'flat: the cooldown starts');
+});
+
+test('an open that failed after orders went out: the venues\' position is held, booked and journaled as an error', async () => {
+  const records: BookRecord[] = [];
+  const w = world();
+  w.openAnswer = (symbol) => {
+    w.held = { symbol, legUsd: 300, pnlUsd: 0 };
+    return { ok: false, reason: 'stopped with orders out: socket closed', sent: true, tx: [], feeUsd: 0.2, open: [] };
+  };
+  const loop = makeLoop(w, tmpStore(), { book: (r) => records.push(r) });
+  w.next = { decision: { action: 'enter', reason: 'go' }, act: ENTER_SOL };
+  await loop.check();
+  assert.equal(loop.held?.windowId, 'sol-phoenix-hyperliquid');
+  assert.equal(loop.held?.legUsd, 300);
+  assert.deepEqual(records.map((r) => [r.kind, r.windowId]), [['enter', 'sol-phoenix-hyperliquid']]);
+  const e = journal(w).find((j) => j.kind === 'error')!;
+  assert.match(e.summary, /stopped with orders out: socket closed; the venues hold SOL \(300 USD a leg\): held from now/);
+  assert.equal(journal(w).filter((j) => j.kind === 'refused').length, 0, 'not "refused, nothing signed"');
+});
+
+test('an exit that sent orders and did not end flat is tried again on the next check (no hold-off)', async () => {
+  const w = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 } });
+  w.closeAnswer = () => ({ ok: false, reason: 'one leg did not fill', sent: true, tx: [], feeUsd: 0.1, open: [] });
+  const loop = makeLoop(w);
+  w.next = { decision: { action: 'exit', reason: 'below the bar' }, act: { kind: 'exit', reason: 'below the bar' } };
+  await loop.check();
+  assert.equal(journal(w).filter((j) => j.kind === 'error').length, 1);
+  w.closeAnswer = () => OK('closed both legs, flat');
+  w.now += 60_000;
+  await loop.check();
+  assert.equal(w.closes.length, 2);
+  assert.equal(loop.held, null);
+});
+
+test('one leg is never held: closed reduce-only at once (auto off too), retried every check, journaled and published as exit', async () => {
+  const w = world({ strategy: { ...DEFAULT_STRATEGY, auto: false }, held: { symbol: 'SOL', legUsd: 250, pnlUsd: 0, oneLeg: { venue: 'phoenix', qty: '2.5' } } });
+  w.closeAnswer = () => ({ ok: false, reason: 'Phoenix did not answer', sent: false, tx: [], feeUsd: 0, open: [] });
+  const loop = makeLoop(w);
+  await loop.check();
+  assert.equal(w.inputs.length, 0, 'no decide() while one leg is open');
+  assert.equal(w.closes.length, 1);
+  assert.match(w.closes[0]!, /one leg open: phoenix 2.5, closed reduce-only/);
+  const d = decisions(w).at(-1)!;
+  assert.equal(d.action, 'exit');
+  assert.match(d.reason, /^one leg open: phoenix 2.5/);
+  assert.equal(journal(w).at(-1)!.kind, 'error');
+  assert.match(journal(w).at(-1)!.summary, /^one leg open: phoenix 2.5: the close did not end flat: Phoenix did not answer/);
+  w.now += 60_000;
+  await loop.check();
+  assert.equal(w.closes.length, 2, 'retried every check');
+  assert.equal(journal(w).filter((j) => j.kind === 'error').length, 1, 'the same line is journaled once');
+  w.closeAnswer = () => OK('closed, flat');
+  w.now += 60_000;
+  await loop.check();
+  assert.equal(w.held, null);
+  assert.equal(journal(w).at(-1)!.kind, 'exit');
+  assert.equal(loop.counters.lastExitAt, w.now);
+});
+
+test('a manual close accepted while a check runs: the check\'s act waits for it; a queued manual task does nothing after stop()', async () => {
+  const w = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 } });
+  let release: () => void = () => {};
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  let first = true;
+  const loop = makeLoop(w, tmpStore(), {
+    freeMargin: async () => {
+      if (first) {
+        first = false;
+        await gate;
+      }
+      return { hyperliquid: 900, phoenix: 800 };
+    },
+  });
+  w.next = { decision: { action: 'exit', reason: 'below the bar' }, act: { kind: 'exit', reason: 'below the bar' } };
+  const running = loop.check();
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(loop.close(), { ok: true });
+  release();
+  await running;
+  await loop.idle(1000);
+  assert.equal(w.closes.length, 1, 'only the manual close ran');
+  assert.match(w.closes[0]!, /POST \/close \(manual\)/);
+
+  const w2 = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 } });
+  const loop2 = makeLoop(w2);
+  assert.deepEqual(loop2.close(), { ok: true });
+  loop2.stop();
+  await loop2.idle(1000);
+  assert.equal(w2.closes.length, 0);
+});
+
+test('hold: journaled on a change of category and once per hourly check, with the held net, P&L, hours held and bad checks', async () => {
+  const w = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 1.5 } });
+  const loop = makeLoop(w);
+  w.next = { decision: { action: 'hold', reason: 'held: 24 % net, above the bar' } };
+  await loop.check();                                    // 10:05, hourly
+  w.now += 60_000;
+  await loop.check();                                    // not hourly, same category
+  w.next = { decision: { action: 'hold', reason: 'held: 23.5 % net, above the bar' } };
+  w.now += 60_000;
+  await loop.check();                                    // only the numbers changed
+  w.now = Date.UTC(2026, 10, 3, 11, 2);
+  await loop.check();                                    // the next hourly check
+  const holds = journal(w).filter((j) => j.numbers.action === 'hold');
+  assert.equal(holds.length, 2);
+  const n = holds[1]!.numbers;
+  assert.equal(n.window, 'sol-phoenix-hyperliquid');
+  assert.equal(n.pnlUsd, 1.5);
+  assert.equal(n.hoursHeld, Math.round(((w.now - T0) / HOUR) * 100) / 100);
+  assert.equal(typeof n.heldNetAprPct, 'number');
+  assert.equal(n.badChecks, 0);
+  assert.equal(n.hourly, 1);
+  // The adoption says since=now is an assumption.
+  assert.match(journal(w).find((j) => j.numbers.action === 'adopt')!.summary, /held since now is an assumption/);
 });

@@ -424,6 +424,61 @@ export async function sendOpen(ctx: OpsCtx, pair: Pair, plan: OpenPlan, reason =
   }
 }
 
+/** Hyperliquid refuses an order under 10 USD of value: a leg smaller than this is not sent. */
+export const MIN_ORDER_USD = 10;
+
+/**
+ * The open's size held to the contract's cap at order time (review S2). The contract values an order at
+ * sz × max(limit, oracle) against the policy cap (contract/core/src/hl.rs), so a price that rose after the size was
+ * taken would be refused with E_SIZE, possibly after one leg filled. Before either leg is sent: when qty × worstPx is
+ * over the cap, qty is rounded down to whole common lots under it, the same on both legs (it is only ever lowered);
+ * under one lot, or under MIN_ORDER_USD at the mid, nothing is sent.
+ */
+export function capQtyAtOrder(p: { qty: bigint; lot: bigint; worstPx: number; midPx: number; capUsd: number }): { qty: bigint; cut: boolean } | { refused: string } {
+  if (!(p.worstPx > 0) || !Number.isFinite(p.worstPx) || !(p.capUsd > 0)) return { refused: `no price to hold the size to the cap (worst ${p.worstPx}, cap ${p.capUsd})` };
+  let qty = p.qty;
+  let cut = false;
+  if (qtyNumber(qty) * p.worstPx > p.capUsd) {
+    const most = floorToLot(toQty((p.capUsd / p.worstPx).toFixed(8)), p.lot);
+    qty = most < qty ? most : qty;
+    // Rounding in toFixed must never leave it over: one lot less until it fits.
+    while (qty > 0n && qtyNumber(qty) * p.worstPx > p.capUsd) qty -= p.lot;
+    cut = true;
+  }
+  const at = `${qtyString(p.qty)} asked, ${qtyString(qty)} fits ${p.capUsd} USD at ${p.worstPx.toFixed(6)}`;
+  if (qty < p.lot) return { refused: `the price moved: under one common lot ${qtyString(p.lot)} fits the cap (${at}); nothing sent` };
+  if (qtyNumber(qty) * p.midPx < MIN_ORDER_USD) return { refused: `the price moved: ${qtyString(qty)} is ${(qtyNumber(qty) * p.midPx).toFixed(2)} USD, under the ${MIN_ORDER_USD} USD minimum order (${at}); nothing sent` };
+  return { qty, cut };
+}
+
+/**
+ * capQtyAtOrder on fresh numbers: the stored price (refreshed when it would not outlive the order, as the order
+ * itself would) and both books. The highest price an order of the open may carry: the Phoenix buy's IOC limit
+ * (the ask plus `slippageBps`, at most the band over the stored price), the Hyperliquid sell's maker price (at most
+ * the ask) and the stored price itself.
+ */
+export async function recheckOpenSize(ctx: OpsCtx, pair: Pair, size: bigint, slippageBps: number): Promise<{ qty: bigint; cut: boolean; line: string } | { refused: string }> {
+  const policy = ctx.desk.policy;
+  const symbol = pair.symbol;
+  const sp = pair.priced ? await ensureFresh(ctx.prices, symbol, pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S) : null;
+  const [hlBook, pxBook] = await Promise.all([ctx.hl.book(symbol, 5), ctx.phoenix.book(symbol, 5)]);
+  const hlAsk = hlBook.asks[0]?.px ?? 0;
+  const pxAsk = pxBook.asks[0]?.px ?? 0;
+  const mid = (hlAsk + (hlBook.bids[0]?.px ?? 0) + pxAsk + (pxBook.bids[0]?.px ?? 0)) / 4;
+  if (!(hlAsk > 0 && pxAsk > 0 && mid > 0)) return { refused: `no ${symbol} book to hold the size to the cap; nothing sent` };
+  let buyLimit = pxAsk * (1 + slippageBps / 10_000);
+  if (sp !== null) buyLimit = Math.min(buyLimit, sp.px * (1 + policy.price_band_bps / 10_000));
+  const worstPx = Math.max(buyLimit, hlAsk, sp?.px ?? 0);
+  const unpriced = policy.unpriced.find((u) => u.symbol === symbol);
+  const capUsd = unpriced === undefined ? policy.max_notional_usd : Math.min(policy.max_notional_usd, policy.unpriced_max_notional_usd);
+  const r = capQtyAtOrder({ qty: size, lot: pair.lot, worstPx, midPx: mid, capUsd });
+  if ('refused' in r) return r;
+  const line = r.cut
+    ? `size      ${qtyString(size)} -> ${qtyString(r.qty)} ${symbol} a leg: ${qtyString(size)} at ${worstPx.toFixed(6)} is over the ${capUsd} USD cap (the price rose since it was sized)`
+    : `size      ${qtyString(r.qty)} ${symbol} a leg at ${worstPx.toFixed(6)} is within the ${capUsd} USD cap`;
+  return { ...r, line };
+}
+
 /** What a close checks before anything is signed (printed); the refusals are returned, not thrown. */
 export async function planClose(ctx: OpsCtx, pair: Pair): Promise<{ refusals: string[]; hl: bigint; px: bigint }> {
   const { symbol } = pair;

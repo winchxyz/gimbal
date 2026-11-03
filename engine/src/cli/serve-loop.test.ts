@@ -8,16 +8,20 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import type { EngineState, JournalEntry, StrategyDecision, StreamEvent, Window as FundingWindow } from '@gimbal/shared';
+import type { DeskState, EngineState, JournalEntry, Leg, StrategyDecision, StreamEvent, Window as FundingWindow } from '@gimbal/shared';
 import { replayReaders } from '../readers.ts';
 import { DEFAULT_SCANNER_CONFIG, DEFAULT_STRATEGY } from '../scanner/config.ts';
 import { Scanner } from '../scanner/scanner.ts';
 import { EngineServer } from '../server.ts';
 import type { DecideInput, Decision } from '../strategy/decide.ts';
 import type { ActOutcome, LoopHands, StrategyLoop } from '../strategy/loop.ts';
+import { sizeFor } from '../strategy/decide.ts';
+import { STRATEGY, T0, win as deskWin } from '../strategy/test-helpers.ts';
 import { VirtualClock, readRecording } from '../venues/replay.ts';
 import { replayStart } from './serve-replay.ts';
-import { fillsOf, serveLoop, windowFacts, windowSymbol } from './serve-loop.ts';
+import { fillsOf, loopHands, serveLoop, windowFacts, windowSymbol } from './serve-loop.ts';
+import type { PairHands } from './serve-pair.ts';
+import { toQty } from '../trade/lots.ts';
 import type { PairResult } from '../trade/pair.ts';
 import type { VenueReader } from '../venues/venue.ts';
 import type { WindowCarry } from '../scanner/scanner.ts';
@@ -27,20 +31,21 @@ after(() => {
   for (const d of dirs) rmSync(d, { recursive: true, force: true });
 });
 
+const HOUR_MS = 3_600_000;
 const RECORDING = fileURLToPath(new URL('../../fixtures/replay/scan-mainnet-2026-10-31.jsonl.gz', import.meta.url));
 
 /** The fake executor: what an open and a close would do, recorded; the held pair is what it opened. */
 function fakeExecutor() {
   const calls: string[] = [];
-  let held: { symbol: string; legUsd: number; pnlUsd: number } | null = null;
+  let held: { symbol: string; legUsd: number; pnlUsd: number; oneLeg: null } | null = null;
   const tx = (id: string) => [{ chain: 'hyperliquid' as const, id, url: `https://app.hyperliquid-testnet.xyz/explorer/tx/${id}` }];
   const hands: LoopHands = {
     blocked: () => null,
     held: () => held,
     symbolOf: (w) => ({ symbol: w.symbol }),
     open: async (r): Promise<ActOutcome> => {
-      calls.push(`open ${r.symbol} ${r.legUsd} ${r.leverage}x`);
-      held = { symbol: r.symbol, legUsd: r.legUsd, pnlUsd: 0 };
+      calls.push(`open ${r.symbol} ${r.legUsd} ${r.leverage}x ${r.qty}`);
+      held = { symbol: r.symbol, legUsd: r.legUsd, pnlUsd: 0, oneLeg: null };
       return { ok: true, reason: 'opened both legs maker first, net 0', sent: true, tx: tx('0xopen'), feeUsd: 0.4, open: [] };
     },
     close: async (r): Promise<ActOutcome> => {
@@ -67,7 +72,7 @@ test('replay: scan -> decide -> act (fake executor) -> journal and decision even
     if (!input.strategy.auto) return { ...base, act: null, decision: { action: 'off', reason: 'Auto is off', windowId: null, heldId: input.held?.windowId ?? null, at: input.now } };
     if (input.held !== null) return { ...base, act: null, decision: { action: 'hold', reason: `holding ${input.held.windowId}`, windowId: null, heldId: input.held.windowId, at: input.now } };
     return {
-      ...base, act: { kind: 'enter', windowId: best.id, legUsd: 200, leverage: 1.5 },
+      ...base, act: { kind: 'enter', windowId: best.id, legUsd: 200, leverage: 1.5, qty: '2' },
       decision: { action: 'enter', reason: `${best.id} cleared the bar`, windowId: best.id, heldId: null, at: input.now },
     };
   };
@@ -115,7 +120,7 @@ test('replay: scan -> decide -> act (fake executor) -> journal and decision even
     await strategyLoop.idle(2000);
     assert.equal(decided.length, 2);
     const best = decided[1]!.windows.filter((w) => w.tradable).sort((a, b) => b.netAprPct - a.netAprPct)[0]!;
-    assert.deepEqual(exec.calls, [`open ${best.symbol} 200 1.5x`]);
+    assert.deepEqual(exec.calls, [`open ${best.symbol} 200 1.5x 2`]);
     state = (await call('GET', '/state')).json as unknown as EngineState;
     assert.equal(state.decision?.action, 'enter');
     const enter = state.journal.find((j) => j.kind === 'enter')!;
@@ -142,8 +147,9 @@ test('replay: scan -> decide -> act (fake executor) -> journal and decision even
     assert.deepEqual(close, { status: 200, json: { ok: true } });
     await strategyLoop.idle(2000);
     assert.match(exec.calls.at(-1)!, /close \(strategy: exit .* \(POST \/close \(manual\)\)/);
-    const kinds = events.filter((e) => e.type === 'journal').map((e) => (e.data as JournalEntry).kind);
-    assert.deepEqual(kinds, ['enter', 'exit']);
+    const entries = events.filter((e) => e.type === 'journal').map((e) => e.data as JournalEntry);
+    // off on its transition and hold on its change of category are `wait` entries whose numbers.action says which.
+    assert.deepEqual(entries.map((j) => (j.kind === 'wait' ? `wait ${String(j.numbers.action)}` : j.kind)), ['wait off', 'enter', 'wait hold', 'exit']);
     const actions = events.filter((e) => e.type === 'decision').map((e) => (e.data as StrategyDecision).action);
     assert.deepEqual(actions, ['off', 'enter', 'hold']);
     assert.equal(strategyLoop.held, null);
@@ -211,4 +217,91 @@ test('fillsOf: each leg summed over its orders, size-weighted price, a fee not r
     { venue: 'hyperliquid', side: 'SELL', qty: '3', avgPx: 102, feeUsd: 0.15000000000000002 },
     { venue: 'phoenix', side: 'BUY', qty: '3', avgPx: 101, feeUsd: null },
   ]);
+});
+
+test('the real decide(): three hourly checks above the bar, then the exact qty it sized reaches the hands', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gimbal-serve-loop-'));
+  dirs.push(dir);
+  const window = deskWin('sol-phoenix-hyperliquid', { netAprPct: 15 });
+  const opens: { symbol: string; legUsd: number; qty: string }[] = [];
+  let held: { symbol: string; legUsd: number; pnlUsd: number; oneLeg: null } | null = null;
+  const hands: LoopHands = {
+    blocked: () => null,
+    held: () => held,
+    symbolOf: (w) => windowSymbol(w, ['SOL']),
+    open: async (r) => {
+      opens.push({ symbol: r.symbol, legUsd: r.legUsd, qty: r.qty });
+      held = { symbol: r.symbol, legUsd: r.legUsd, pnlUsd: 0, oneLeg: null };
+      return { ok: true, reason: 'opened', sent: true, tx: [], feeUsd: 0.01, open: [] };
+    },
+    close: async () => ({ ok: true, reason: 'closed', sent: true, tx: [], feeUsd: 0, open: [] }),
+  };
+  const book = { bids: [{ px: 99, sz: 100 }], asks: [{ px: 101, sz: 100 }] };
+  const reader = (id: string) => ({ id, markets: async () => [{ symbol: 'SOL', lotSize: 0.01 }], book: async () => book }) as unknown as VenueReader;
+  const carry = () => ({ estimate: { gross: { d14AprPct: 18 } }, long: { oiUsd: 1e6 }, short: { oiUsd: 1e6 } }) as unknown as WindowCarry;
+  const policy = { max_notional_usd: 20, price_band_bps: 100, hl_assets: [{ symbol: 'SOL' }], phoenix_markets: [{ symbol: 'SOL' }] } as never;
+  const clock = new VirtualClock(T0 + 5 * 60_000);
+  const events: StreamEvent[] = [];
+  const loop = serveLoop({
+    mode: 'replay', env: (n) => (n === 'GIMBAL_TRADE' ? '1' : undefined), once: false, stateDir: dir, contractId: null, deskId: null,
+    pair: null, lastDesk: () => null, rescueLive: true, busy: () => null, windows: () => [window],
+    accounts: [{ venue: 'hyperliquid', read: async () => ({ freeMarginUsd: 50 }) as never }, { venue: 'phoenix', read: async () => ({ freeMarginUsd: 50 }) as never }],
+    strategy: () => STRATEGY, policy: () => policy, publish: (e) => events.push(e), clock, log: () => {},
+    carry, venues: [reader('hyperliquid'), reader('phoenix')], hands,
+  });
+  for (let h = 0; h < 6 && opens.length === 0; h++) {
+    clock.set(T0 + h * HOUR_MS + 5 * 60_000);
+    await loop.check();
+  }
+  assert.equal(opens.length, 1, 'decide() entered');
+  // The qty decide() sized: 12 USD a leg at a mid of 100 on lots of 0.01, whole lots only, never re-derived.
+  const sized = sizeFor(window, {
+    strategy: STRATEGY, maxNotionalUsd: 20, freeMarginUsd: { hyperliquid: 50, phoenix: 50 }, liveRescue: { hyperliquid: true, phoenix: false, orderly: false },
+    priceBandBps: 100, lots: { [window.id]: { longLot: 0.01, shortLot: 0.01, px: 100 } },
+  });
+  assert.equal(sized.ok, true);
+  assert.equal(opens[0]!.qty, (sized as { qty: string }).qty);
+  assert.equal(opens[0]!.qty, '0.12');
+  const enter = events.filter((e) => e.type === 'journal').map((e) => e.data as JournalEntry).find((j) => j.kind === 'enter')!;
+  assert.equal(enter.numbers.qty, '0.12');
+  loop.stop();
+});
+
+test('loopHands: the held symbol\'s legs only, one leg named, busy() refusing first, sent as the hands report it', async () => {
+  let legs: { venue: string; qty: bigint | null }[] = [{ venue: 'hyperliquid', qty: toQty('-0.12') }, { venue: 'phoenix', qty: toQty('0.12') }];
+  let busy: string | null = null;
+  const pair: PairHands = {
+    symbols: ['SOL'],
+    blocked: () => null,
+    heldSymbol: () => 'SOL',
+    heldLegs: () => legs,
+    open: async () => ({ ok: false, reason: 'stopped with orders out: socket closed', results: [], lines: [], open: [], tx: [], feeUsd: 0, sent: true }),
+    close: async () => ({ ok: false, reason: 'refused', results: [], lines: [], open: [], tx: [], feeUsd: 0 }),
+  };
+  const leg = (venue: Leg['venue'], symbol: string, side: Leg['side'], size: number, entry: number, mark: number): Leg => ({
+    venue, symbol, side, size, lotSize: 0.01, entry, mark, liqPx: null, marginUsd: 6, marginRatio: 0.1, distanceToLiqPct: 50,
+    fundingEarnedUsd: 0.05, unsettledFundingUsd: 0.01, feesUsd: -0.02, unpriced: false,
+  });
+  const desk = {
+    legs: [leg('hyperliquid', 'SOL', 'short', 0.12, 100, 101), leg('phoenix', 'SOL', 'long', 0.12, 100, 101), leg('orderly', 'ETH', 'long', 1, 3000, 3100)],
+    pnl: { fundingUsd: 0, feesUsd: 0, priceUsd: 0, netUsd: 999 },
+  } as unknown as DeskState;
+  const h = loopHands(pair, () => desk, () => {}, () => busy);
+  const held = h.held()!;
+  assert.equal(held.symbol, 'SOL');
+  assert.equal(Math.round(held.legUsd * 100) / 100, 12.12, 'the SOL legs, not the ETH one');
+  // Price P&L (-0.12 + 0.12) plus funding (0.06 a leg) plus fees (-0.02 a leg); never the desk's whole net.
+  assert.equal(Math.round(held.pnlUsd * 100) / 100, 0.08);
+  assert.deepEqual(Object.keys(held.freedMarginUsd!).sort(), ['hyperliquid', 'phoenix']);
+  assert.equal(held.oneLeg, null);
+  legs = [{ venue: 'hyperliquid', qty: 0n }, { venue: 'phoenix', qty: toQty('0.12') }];
+  assert.deepEqual(h.held()!.oneLeg, { venue: 'phoenix', qty: '0.12' });
+  legs = [{ venue: 'hyperliquid', qty: null }, { venue: 'phoenix', qty: toQty('0.12') }];
+  assert.equal(h.held()!.oneLeg, null, 'a leg not known is not called flat');
+  assert.equal(h.blocked(), null);
+  busy = 'rescue r-1 runs';
+  assert.equal(h.blocked(), 'rescue r-1 runs');
+  const opened = await h.open({ window: deskWin('sol-phoenix-hyperliquid'), symbol: 'SOL', legUsd: 12, leverage: 1, qty: '0.12', reason: 'test' });
+  assert.equal(opened.sent, true, 'a throw after orders went out is reported as sent');
+  assert.equal((await h.close({ reason: 'test' })).sent, false);
 });
