@@ -1,5 +1,6 @@
 // send's nonce handling against a fake RPC: InvalidNonce signs again with a higher nonce, a timeout or no answer
-// never does (the transaction is looked up by hash instead). No network, no key file.
+// never does (the transaction is looked up by hash instead); and send returns only once the outcome is FINAL, so a
+// finality-"final" read right after it sees the change. No network, no key file.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -15,7 +16,10 @@ function testKey() {
 }
 
 const BLOCK_HASH = b58encode(Buffer.alloc(32, 7));
-const FINAL = { final_execution_status: 'EXECUTED_OPTIMISTIC', status: { SuccessValue: Buffer.from('true').toString('base64') }, transaction_outcome: { outcome: { gas_burnt: 2_000_000_000_000 } }, receipts_outcome: [] };
+const outcomeAt = (final_execution_status) => ({ final_execution_status, status: { SuccessValue: Buffer.from('true').toString('base64') }, transaction_outcome: { outcome: { gas_burnt: 2_000_000_000_000 } }, receipts_outcome: [] });
+const FINAL = outcomeAt('FINAL');
+/** Every receipt ran, but its blocks are not final: a read with finality "final" does not see it yet. */
+const OPTIMISTIC = outcomeAt('EXECUTED_OPTIMISTIC');
 const rpcError = (method, error) => Object.assign(new Error(`${method}: ${JSON.stringify(error)}`), { rpc: error });
 const invalidNonce = (tx, ak) => rpcError('send_tx', {
   name: 'HANDLER_ERROR', cause: { name: 'INVALID_TRANSACTION', info: {} },
@@ -110,6 +114,30 @@ test('no answer at all to send_tx is treated like a timeout: looked up, not rese
   const out = await send(testKey(), 'c.testnet', ACTS, fast(f.rpc));
   assert.equal(f.sent().length, 1);
   assert.equal(out.value, true);
+});
+
+test('an EXECUTED_OPTIMISTIC answer is polled until FINAL, so the read-back right after send sees the change', async () => {
+  // A fake chain whose finality-"final" view (what deploy.mjs and desk.mjs read back) sees the transaction only once
+  // its outcome is FINAL: send_tx answers EXECUTED_OPTIMISTIC, the first tx look too, the second FINAL.
+  let finalized = false;
+  const f = fakeRpc({
+    sends: [OPTIMISTIC],
+    looks: [OPTIMISTIC, () => { finalized = true; return FINAL; }],
+  });
+  const readBack = () => (finalized ? { owner: 'o.testnet' } : null);
+  const out = await send(testKey(), 'c.testnet', ACTS, fast(f.rpc));
+  assert.deepEqual(readBack(), { owner: 'o.testnet' }, 'send returned only after the transaction was final');
+  const looks = f.calls.filter((c) => c.method === 'tx');
+  assert.equal(looks.length, 2);
+  assert.ok(looks.every((c) => c.params.wait_until === 'FINAL' && c.params.tx_hash === out.hash));
+  assert.equal(f.sent().length, 1, 'waiting never sends again');
+  assert.equal(out.value, true);
+});
+
+test('an outcome that never becomes FINAL is an error after the polls, not a result', async () => {
+  const f = fakeRpc({ sends: [OPTIMISTIC], looks: Array.from({ length: 10 }, () => OPTIMISTIC) });
+  await assert.rejects(send(testKey(), 'c.testnet', ACTS, fast(f.rpc)), /did not finish after 4 looks/);
+  assert.equal(f.sent().length, 1);
 });
 
 test('any other refusal of send_tx is thrown as it is, with no retry', async () => {

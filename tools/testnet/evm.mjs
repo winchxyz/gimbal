@@ -127,12 +127,23 @@ const EXCHANGE_DOMAIN = keccak256(Buffer.concat([
   Buffer.alloc(32),
 ]));
 
-/** The EIP-712 digest of an L1 action body `{action, nonce, vaultAddress: null}` on testnet ("b"). */
+const u64be = (n) => {
+  const b = Buffer.alloc(8);
+  b.writeBigUInt64BE(BigInt(n));
+  return b;
+};
+
+/**
+ * The EIP-712 digest of an L1 action body `{action, nonce, vaultAddress: null[, expiresAfter]}` on testnet ("b").
+ * The connection id hashes msgpack(action) ‖ nonce (u64 BE) ‖ `0x00` (no vault), and with `expiresAfter` also
+ * `0x00` ‖ expiresAfter (u64 BE), as the contract (contract/core/src/hl.rs `expiring_connection_id`) and
+ * Hyperliquid's Python SDK (`action_hash`) write it. The contract sets `expiresAfter` on orders and cancels.
+ */
 export function hlL1Digest(body, source = 'b') {
   if (body.vaultAddress !== null && body.vaultAddress !== undefined) throw new Error('vault actions are not used');
-  const nonce = Buffer.alloc(8);
-  nonce.writeBigUInt64BE(BigInt(body.nonce));
-  const connectionId = keccak256(Buffer.concat([msgpack(body.action), nonce, Buffer.from([0])]));
+  const parts = [msgpack(body.action), u64be(body.nonce), Buffer.from([0])];
+  if (body.expiresAfter !== null && body.expiresAfter !== undefined) parts.push(Buffer.from([0]), u64be(body.expiresAfter));
+  const connectionId = keccak256(Buffer.concat(parts));
   const struct = keccak256(Buffer.concat([AGENT_TYPEHASH, keccak256(Buffer.from(source)), connectionId]));
   return keccak256(Buffer.concat([Buffer.from([0x19, 0x01]), EXCHANGE_DOMAIN, struct]));
 }

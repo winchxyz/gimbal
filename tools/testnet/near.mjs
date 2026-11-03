@@ -348,7 +348,8 @@ export function akNonceOf(e) {
 const maxOf = (...xs) => xs.reduce((a, b) => (b > a ? b : a));
 
 /**
- * Signs and sends a transaction from `key` to `receiverId` and waits until every receipt ran.
+ * Signs and sends a transaction from `key` to `receiverId` and waits until every receipt ran and is final
+ * (`final_execution_status` FINAL), so a `view` or `account` read right after it (finality "final") sees its effects.
  * Returns { hash, value (the parsed SuccessValue or null), failure (the error or null), logs, burnt (TGas) }.
  *
  * Nonces: each transaction gets max(the chain's nonce, the last one this process used) + 1. InvalidNonce (the node
@@ -403,9 +404,13 @@ export async function send(key, receiverId, acts, o = {}) {
   }
 }
 
-const isFinal = (outcome) => Boolean(outcome?.final_execution_status) && outcome.final_execution_status !== 'INCLUDED' && Boolean(outcome.status);
+/**
+ * FINAL only: an EXECUTED_OPTIMISTIC outcome has run, but its blocks are not final yet, and the scripts read back
+ * with finality "final" (deploy.mjs read `version` and got CodeDoesNotExist; desk.mjs read `get_desk` and got null).
+ */
+const isFinal = (outcome) => outcome?.final_execution_status === 'FINAL' && Boolean(outcome.status);
 
-/** Polls `tx` by hash until the outcome is final; never sends anything. */
+/** Polls `tx` by hash until the outcome is FINAL; never sends anything. */
 async function finished(call, pause, sender, txHash, outcome, polls, pollMs) {
   let seen = Boolean(outcome);
   for (let i = 0; !isFinal(outcome); i++) {
@@ -419,7 +424,7 @@ async function finished(call, pause, sender, txHash, outcome, polls, pollMs) {
     }
     await pause(pollMs);
     try {
-      outcome = await call('tx', { tx_hash: txHash, sender_account_id: sender, wait_until: 'EXECUTED_OPTIMISTIC' });
+      outcome = await call('tx', { tx_hash: txHash, sender_account_id: sender, wait_until: 'FINAL' });
       seen = true;
     } catch (e) {
       if (!e.timeout && !/UNKNOWN_TRANSACTION/.test(e.message)) throw e;

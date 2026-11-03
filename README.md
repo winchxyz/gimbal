@@ -106,7 +106,20 @@ node tools/testnet/desk.mjs gimbal-final-fcf135.testnet <desk_id> --owner <accou
 ```
 
 It derives the desk's addresses from the MPC contract, as `create_desk` checks them, and attaches 0.5 NEAR for
-storage (the rest is refunded). 1Click has no testnet, so rescues run live only on mainnet.
+storage (the rest is refunded).
+
+Check the desk's signing (one MPC signature per step, from the desk owner's account, 300 TGas):
+
+```bash
+node tools/testnet/live.mjs gimbal-final-fcf135.testnet <desk_id> hl --owner <account>.testnet
+```
+
+The contract signs an unpriced BTC order far under the mid. The script recomputes the EIP-712 digest itself,
+without trusting the contract, and prints `recovers to 0x… (the desk EVM address)`. Then it posts the order to
+Hyperliquid testnet, which names the address it recovered. A desk with no funds there is refused with
+`User or API Wallet 0x… does not exist.`, which shows the same address. The other steps (`register`, `add-key`,
+`faucet`, `order`, `ws`, `settle`, ...) are listed at the top of `tools/testnet/live.mjs`. 1Click has no
+testnet, so rescues run live only on mainnet.
 
 ### 4. Mainnet evidence
 
