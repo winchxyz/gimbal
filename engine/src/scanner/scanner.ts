@@ -26,7 +26,7 @@ import { errorMessage } from '../venues/recorder.ts';
 import type { ScannerConfig } from './config.ts';
 import type { CarryEstimate } from './carry.ts';
 import { carryChecks, carryEstimate, multiDayApr, roundTrip, spreadOverHoldUsd } from './carry.ts';
-import { aprPct, basisCostUsd, fillFeeBps, takerFeesUsd } from './costs.ts';
+import { HOURS_PER_YEAR, aprPct, basisCostUsd, fillFeeBps, takerFeesUsd } from './costs.ts';
 import {
   FORTNIGHT_HOURS, HOUR_MS, RateStore, WEEK_HOURS, grossApr14d, grossApr7d, grossAprOver, hourStart, intervalsAbove, legAprOver,
   netAprSeries, round,
@@ -34,7 +34,7 @@ import {
 import type { DropReason, LegKind, Pair, ScanLeg } from './pairs.ts';
 import { filterLegs, heldLegKeys, pairLegs, toLeg } from './pairs.ts';
 import type { BookRead, CostBreakdown, OracleSource, PricedWindow, PricingContext } from './price.ts';
-import { isEnterable, priceWindow, switchCostUsd } from './price.ts';
+import { NO_BREAKEVEN_TEXT, isEnterable, priceWindow, switchCostUsd } from './price.ts';
 import { WatchQuality } from './quality.ts';
 
 export interface HeldWindow {
@@ -238,7 +238,9 @@ export class Scanner {
         if (leg !== null) legs.push(leg);
       }
     }
-    const filter = { oiFloorUsd: config.oiFloorUsd, maxMarkDeviation: config.maxMarkDeviation };
+    const filter = {
+      oiFloorUsd: config.oiFloorUsd, maxMarkDeviation: config.maxMarkDeviation, deskLegUsd: strategy.legUsd, deskMaxOiShare: config.deskMaxOiShare,
+    };
     const { kept, dropped } = filterLegs(legs, filter, heldLegKeys(legs, heldId));
     const sourceById = new Map(this.#sources.map((s) => [s.id, s]));
     const quality = new WatchQuality({
@@ -335,6 +337,18 @@ export class Scanner {
         gross7dAprPct: w.grossApr7dPct, gross14dAprPct: g14 === null ? null : round(g14, 3), roundTrip: rt,
       });
       w.checks.push(...carryChecks(estimate));
+      // Break-even on the same multi-day spread as the gate, against the same round trip (the 1Click margin moves are
+      // one-off costs shown apart, never gated on): this hour alone says little about a hold of days.
+      if (estimate.expectedAprPct !== null) {
+        const days = estimate.breakevenDays;
+        const hours = days === null ? null : days * 24;
+        w.checks = w.checks.filter((c) => c.text !== NO_BREAKEVEN_TEXT);
+        if (hours === null || hours > HOURS_PER_YEAR) {
+          const label = estimate.basis === '14d' ? '14-day' : '7-day';
+          w.checks.push({ ok: false, text: `Does not break even within a year on its ${label} spread` });
+        }
+        w.breakevenHours = hours === null ? HOURS_PER_YEAR : round(Math.min(hours, HOURS_PER_YEAR), 1);
+      }
       carry.set(pw.pair.id, {
         estimate, breakdown: b,
         long: this.#legRates(pw.pair.long, longKey, pw.pair.long.ratePerHour, now),

@@ -79,7 +79,7 @@ export function windowBlock(w: FundingWindow, c: WindowCarry): string[] {
   out.push(`  round trip    ${money(rt.totalUsd)} = ${rt.bps.toFixed(1)} bps at ${usd(e.legUsd)} a leg `
     + `(4 fills ${money(rt.feesUsd)}, slippage ${money(rt.slippageUsd)}, basis buffer ${money(rt.basisBufferUsd)})`);
   const moves = c.breakdown.transferUsd ?? 0;
-  if (moves > 0) out.push(`  margin moves  ${money(moves)} to move both legs' margin in and out (1Click), not in the round trip`);
+  out.push(`  one-off transfers: ${money(moves)} (not in the gate): both legs' margin moved in and out through 1Click`);
   const hold = `over a ${holdLabel(e.holdHours)} hold`;
   if (e.expectedUsd === null || e.netUsd === null || e.basis === null) {
     out.push(`  ${hold}  not known: no 7-day history on both legs`);

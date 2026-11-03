@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import { filterLegs, heldLegKeys, isDeskVenue, pairLegs, toLeg, windowId } from './pairs.ts';
 import { T0, leg, row } from './test-helpers.ts';
 
-const OPTS = { oiFloorUsd: 500_000, maxMarkDeviation: 0.1 };
+const OPTS = { oiFloorUsd: 500_000, maxMarkDeviation: 0.1, deskLegUsd: 1000, deskMaxOiShare: 0.02 };
 
 test('a funding row as a leg: base and multiplier, mark per base unit, open interest in USD', () => {
   // HL kPEPE at 0.012 per 1000 PEPE, 1e9 kPEPE open: mark 0.000012 per PEPE, OI 1e9 × 0.012 = 12 M USD.
@@ -82,10 +82,10 @@ test('marks: a leg more than 10 % from the median of the same base elsewhere is 
   assert.deepEqual(filterLegs(wrong, OPTS).dropped, [{ venue: 'hyperliquid', symbol: 'kPEPE', reason: 'mark-outlier' }]);
 });
 
-test('open interest: under the floor is dropped, a desk leg kept for desk pairs only; unknown OI is no zero, but only a watch-only leg may lack it', () => {
+test('open interest: a watch leg under the floor is dropped; a desk leg is held to 2 % of it, kept for desk pairs if over; unknown OI is no zero', () => {
   const legs = [
-    leg('hyperliquid', 'X', { markPx: 100, openInterest: 4_999 }),     // 499,900 USD: under 500k, a desk leg
-    leg('phoenix', 'X', { markPx: 100, openInterest: 5_000 }),         // exactly 500k: kept
+    leg('hyperliquid', 'X', { markPx: 100, openInterest: 450 }),       // 45,000 USD: a 1000 USD leg is 2.2 % of it
+    leg('phoenix', 'X', { markPx: 100, openInterest: 500 }),           // 50,000 USD: exactly 2 %, under the 500k floor: kept
     leg('orderly', 'PERP_X_USDC', { base: 'X', markPx: 100, openInterest: null }),   // a desk leg must be sized
     leg('okx', 'X', { markPx: null, openInterest: null }, 'cex'),
     leg('aster', 'X', { markPx: 100.2, openInterest: null }),         // a DEX that publishes no OI: rate reference
@@ -94,11 +94,13 @@ test('open interest: under the floor is dropped, a desk leg kept for desk pairs 
   ];
   const { kept, dropped } = filterLegs(legs, OPTS);
   assert.deepEqual(kept.map((l) => l.venue), ['hyperliquid', 'phoenix', 'okx', 'aster']);
-  assert.equal(kept[0]!.deskOnly, 'has $499,900 of open interest, under the $500,000 floor');
+  assert.equal(kept[0]!.deskOnly, 'has $45,000 of open interest: a $1,000 leg is 2.2 % of it, over the 2 % limit');
   assert.ok(kept.slice(1).every((l) => l.deskOnly === undefined));
   assert.deepEqual(dropped.map((d) => [d.venue, d.reason]), [
     ['orderly', 'no-oi'], ['pacifica', 'no-mark'], ['lighter', 'under-oi-floor'],
   ]);
+  // At a 20 USD leg the 45,000 USD market is 0.044 %: a desk leg like any other.
+  assert.equal(filterLegs(legs, { ...OPTS, deskLegUsd: 20 }).kept.find((l) => l.venue === 'hyperliquid')!.deskOnly, undefined);
   // The thin desk leg pairs with the other desk venue only: never into a watch window.
   assert.deepEqual(pairLegs(kept).map((p) => p.id).sort(), [
     'x-aster-phoenix', 'x-hyperliquid-phoenix', 'x-okx-phoenix', 'x-phoenix-aster', 'x-phoenix-hyperliquid', 'x-phoenix-okx',
@@ -149,11 +151,11 @@ test('the held window\'s legs are never dropped: kept with what they failed, and
   // Without the exemption the mark outlier goes, and the thin desk leg is kept for desk pairs only.
   const free = filterLegs(legs, OPTS);
   assert.deepEqual(free.dropped.map((d) => [d.venue, d.reason]), [['hyperliquid', 'mark-outlier']]);
-  assert.equal(free.kept.find((l) => l.venue === 'phoenix')!.deskOnly, 'has $40,000 of open interest, under the $500,000 floor');
+  assert.equal(free.kept.find((l) => l.venue === 'phoenix')!.deskOnly, 'has $40,000 of open interest: a $1,000 leg is 2.5 % of it, over the 2 % limit');
   const { kept, dropped } = filterLegs(legs, OPTS, exempt);
   assert.deepEqual(dropped, []);
   const by = new Map(kept.map((l) => [l.venue, l]));
-  assert.equal(by.get('phoenix')!.heldOnly, 'has $40,000 of open interest, under the $500,000 floor');
+  assert.equal(by.get('phoenix')!.heldOnly, 'has $40,000 of open interest: a $1,000 leg is 2.5 % of it, over the 2 % limit');
   assert.equal(by.get('hyperliquid')!.heldOnly, 'marks 130, 29.9 % from the other venues\' 100.1');
   assert.equal(by.get('orderly')!.heldOnly, undefined);
   // The kept-only legs make the held window and nothing else; the other legs pair as usual.

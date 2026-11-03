@@ -1,5 +1,6 @@
-// One window priced by hand: every cost term at a 1000 USD leg held 168 h, the verdicts, and the switch cost.
-// APR is percentage points a year on one leg's notional; a one-off cost of C USD is C / 1000 × (8760 / 168) × 100.
+// One window priced by hand: every cost term at a 1000 USD leg held 240 h (the default 10-day hold), the verdicts,
+// and the switch cost. APR is percentage points a year on one leg's notional; a one-off cost of C USD is
+// C / 1000 × (8760 / 240) × 100 = C × 3.65.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -35,8 +36,6 @@ function oracleAged(ageS: number, only?: (venue: VenueId, symbol: string) => boo
   return { price: (venue, symbol) => (only === undefined || only(venue, symbol) ? { px: 100, at: T0 - ageS * 1000 } : null) };
 }
 const FRESH = oracleAged(5);
-/** The hand figures below spread one-off costs over 168 h, whatever the default hold. */
-const COSTS_168H = { ...DEFAULT_COSTS, holdHours: 168 };
 
 // Long Phoenix SOL paying 0.00001/h at mark 100.005; short Hyperliquid SOL receiving 0.000055/h at mark 99.995.
 const LONG = leg('phoenix', 'SOL', { ratePerHour: 0.00001, markPx: 100.005, openInterest: 20_000 });
@@ -56,7 +55,7 @@ function ctx(over: Partial<PricingContext> = {}, books: Record<string, BookRead 
   return {
     now: T0,
     strategy: DEFAULT_STRATEGY,
-    costs: COSTS_168H,
+    costs: DEFAULT_COSTS,
     policy: null,
     oracle: null,
     book: (l) => (l.venue in books ? books[l.venue]! : BOOKS[l.venue] === undefined ? null : { book: BOOKS[l.venue]!, readAt: T0, stale: false }),
@@ -72,7 +71,7 @@ function priced(long: ScanLeg, short: ScanLeg, c: PricingContext = ctx()): Price
 
 const verdictCtx = (over: Partial<PricingContext> = {}) => ({ now: T0, strategy: DEFAULT_STRATEGY, policy: POLICY, oracle: null, ...over });
 
-test('a desk window by hand: gross 39.42 %, costs 29.322 %, net 10.098 %, breakeven 114.5 h', () => {
+test('a desk window by hand: gross 39.42 %, costs 20.525 %, net 18.895 %, breakeven 114.5 h', () => {
   const { window: w, breakdown, costsApr, fills } = priced(LONG, SHORT);
   // Gross: 0.000055 − 0.00001 = 0.000045/h × 8760 × 100.
   assert.equal(w.grossAprPct, 39.42);
@@ -81,24 +80,24 @@ test('a desk window by hand: gross 39.42 %, costs 29.322 %, net 10.098 %, breake
   // Margin 1000 / 3 = 333.33 USD a leg, from the Solana reserve and back. Phoenix is the reserve's own wallet: free.
   // Hyperliquid in: 0.32 + 20 bps (0.6667) = 0.9867; out: 1.00 activation + 0.21 + 0.6667 = 1.8767. 2.8633 USD.
   near(breakdown.transferUsd, 0.32 + 1.0 + 0.21 + 2 * (1000 / 3) * 0.002, 1e-9);
-  // feesPct carries both: 4.6633 USD -> 24.316 %.
-  assert.equal(w.costs.feesPct, 24.316);
+  // feesPct carries both: 4.6633 USD -> 17.021 %.
+  assert.equal(w.costs.feesPct, 17.021);
   // Slippage: each buy at 100.01 costs 0.01 × 1000 / 100.01, each sell at 99.99 costs 0.01 × 1000 / 99.99; two of
-  // each over the 4 fills = 0.400000004 USD -> 2.086 %.
+  // each over the 4 fills = 0.400000004 USD -> 1.46 %.
   near(breakdown.slippageUsd, 2 * (10 / 100.01 + 10 / 99.99));
-  assert.equal(w.costs.slippagePct, 2.086);
-  // Basis: long 0.01 above the short at mid 100: 0.0001 × 1000 = 0.10 USD -> 0.521 %. Both legs hourly: no timing.
+  assert.equal(w.costs.slippagePct, 1.46);
+  // Basis: long 0.01 above the short at mid 100: 0.0001 × 1000 = 0.10 USD -> 0.365 %. Both legs hourly: no timing.
   near(breakdown.basisUsd, 0.1, 1e-9);
   assert.equal(breakdown.timingUsd, 0);
-  assert.equal(w.costs.basisPct, 0.521);
+  assert.equal(w.costs.basisPct, 0.365);
   // Rescue: 1000 × (15 − 8) % = 70 USD from the Solana reserve; to Phoenix free, to Hyperliquid 0.32 + 0.14 = 0.46 USD
-  // -> 2.399 %.
+  // -> 1.679 %.
   near(breakdown.rescueUsd, 0.46);
-  assert.equal(w.costs.rescueReservePct, 2.399);
-  assert.equal(costsApr, 29.322);
-  assert.equal(w.netAprPct, 10.098);
-  // 10.098 % a year on 1000 USD = 0.2767 USD a day.
-  assert.equal(w.usdPerDayPer1k, 0.2767);
+  assert.equal(w.costs.rescueReservePct, 1.679);
+  assert.equal(costsApr, 20.525);
+  assert.equal(w.netAprPct, 18.895);
+  // 18.895 % a year on 1000 USD = 0.5177 USD a day.
+  assert.equal(w.usdPerDayPer1k, 0.5177);
   // Breakeven on the one-off 1.80 + 2.8633 + 0.40 + 0.10 = 5.1633 USD: 0.045 USD each hour from 0.5 h, so the 115th
   // payment (5.175 USD) covers it: 0.5 + 114 = 114.5 h.
   assert.equal(w.breakevenHours, 114.5);
@@ -130,8 +129,8 @@ test('a desk window by hand: gross 39.42 %, costs 29.322 %, net 10.098 %, breake
 test('margin already on a venue moves nothing: feesPct is the taker fees alone', () => {
   const { window: w, breakdown } = priced(LONG, SHORT, ctx({ marginHeldAt: new Set<VenueId>(['phoenix', 'hyperliquid']) }));
   assert.equal(breakdown.transferUsd, 0);
-  // 1.80 USD -> 9.386 %.
-  assert.equal(w.costs.feesPct, 9.386);
+  // 1.80 USD -> 6.57 %.
+  assert.equal(w.costs.feesPct, 6.57);
   assert.ok(w.checks.some((c) => c.ok && c.text === 'Margin already sits on both venues: nothing to move in or out'));
 });
 
@@ -233,7 +232,7 @@ test('watch-only pairs: gross and basis priced, fees, slippage and reserve not, 
   const pac = leg('pacifica', 'SOL', { ratePerHour: 0.00001, markPx: 100.005, openInterest: 20_000 });
   const { window: w, breakdown, fills } = priced(pac, SHORT);
   assert.equal(w.grossAprPct, 39.42);
-  assert.deepEqual(w.costs, { feesPct: 0, slippagePct: 0, basisPct: 0.521, rescueReservePct: 0 });
+  assert.deepEqual(w.costs, { feesPct: 0, slippagePct: 0, basisPct: 0.365, rescueReservePct: 0 });
   assert.equal(breakdown.feesUsd, null);
   assert.equal(breakdown.transferUsd, null);
   assert.equal(breakdown.slippageUsd, null);

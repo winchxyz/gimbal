@@ -85,6 +85,12 @@ export interface PricedWindow {
 
 export type PriceResult = { ok: true; priced: PricedWindow } | { ok: false; reason: 'no-book' | 'empty-book'; venue: VenueId };
 
+/**
+ * The check a window fails when today's rates never pay its one-off costs within a year. On a desk window whose
+ * multi-day spread is known the scanner replaces it with the same test on that spread (carry.ts).
+ */
+export const NO_BREAKEVEN_TEXT = 'Does not break even within a year at today\'s rates';
+
 /** Money for a check line: cents under $100, whole dollars to $10k, then k and M. */
 export function usd(n: number): string {
   const a = Math.abs(n);
@@ -204,7 +210,7 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
     if (leg.heldOnly !== undefined) tail.push({ ok: false, text: `Kept only because the desk holds it: ${venueName(leg.venue)} ${leg.symbol} ${leg.heldOnly}` });
     else if (leg.deskOnly !== undefined) tail.push({ ok: false, text: `Shown for its multi-day spread, not entered: ${venueName(leg.venue)} ${leg.symbol} ${leg.deskOnly}` });
   }
-  if (be === null) tail.push({ ok: false, text: 'Does not break even within a year at today\'s rates' });
+  if (be === null) tail.push({ ok: false, text: NO_BREAKEVEN_TEXT });
   if (basisUsd === null) {
     const missing = [long, short].filter((l) => l.markPx === null).map((l) => l.venue);
     tail.push({ ok: false, text: `No mark on ${venueNames(missing)}: basis not priced` });

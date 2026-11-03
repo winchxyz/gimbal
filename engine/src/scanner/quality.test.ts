@@ -28,7 +28,7 @@ function quality(legs: ScanLeg[], now = T0, hasHistory: (v: ScanVenueId) => bool
 
 /** As the scanner builds it: the legs through filterLegs first. */
 function filtered(legs: ScanLeg[], now = T0): { q: WatchQuality; kept: ScanLeg[] } {
-  const { kept, dropped } = filterLegs(legs, { oiFloorUsd: DEFAULT_SCANNER_CONFIG.oiFloorUsd, maxMarkDeviation: MAX_DEV });
+  const { kept, dropped } = filterLegs(legs, { oiFloorUsd: DEFAULT_SCANNER_CONFIG.oiFloorUsd, maxMarkDeviation: MAX_DEV, deskLegUsd: 1000, deskMaxOiShare: 0.02 });
   return { q: new WatchQuality({ now, listed: legs, kept, dropped, maxMarkDeviation: MAX_DEV, hasHistory: () => false, config: DEFAULT_QUALITY }), kept };
 }
 

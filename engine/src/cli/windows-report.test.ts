@@ -87,12 +87,13 @@ test('the block for one window: legs now / 7 d / 14 d, round trip in USD and bps
     '    Phoenix XLM long         10.81  -10.95  -10.95',
     '    gross (short - long)      0.14   21.90   21.90',
     '  round trip    $0.05 = 27.0 bps at $20.00 a leg (4 fills $0.04, slippage $0.0080, basis buffer $0.01)',
-    '  margin moves  $1.56 to move both legs\' margin in and out (1Click), not in the round trip',
+    '  one-off transfers: $1.56 (not in the gate): both legs\' margin moved in and out through 1Click',
     '  over a 10-day hold  expected $0.12 (14 d average), $0.07 after the round trip, break-even 4.5 days: passes the gate',
     '  depth         $25k (the smaller leg\'s open interest: Hyperliquid $9.7M, Phoenix $25k)',
     '  refused       E_NO_DESK: no desk policy loaded yet',
     '  failing       No desk policy loaded yet: nothing can be entered',
-    '  failing       Shown for its multi-day spread, not entered: Phoenix XLM has $25,256 of open interest, under the $500,000 floor',
-    '  failing       Does not break even within a year at today\'s rates',
   ]);
+  // A 20 USD leg is 0.079 % of Phoenix's 25k USD: no share check fails, and the break-even (4.5 days on the 14-day
+  // spread) is well inside a year.
+  assert.equal(w.breakevenHours, 108);
 });

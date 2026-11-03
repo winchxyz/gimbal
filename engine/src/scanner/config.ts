@@ -26,8 +26,16 @@ export interface CostParams {
 
 export interface ScannerConfig {
   costs: CostParams;
-  /** A leg whose open interest is under this many USD is not ranked; the smaller leg's open interest is the capacity. */
+  /**
+   * A watch-only leg whose open interest is under this many USD is not ranked; the smaller leg's open interest is the
+   * capacity. Desk legs are held to deskMaxOiShare instead.
+   */
   oiFloorUsd: number;
+  /**
+   * A desk leg may be at most this share of its market's open interest (USD); a larger one is shown on its multi-day
+   * spread with a failing check, never entered. The book check at the leg size applies on top.
+   */
+  deskMaxOiShare: number;
   /** A leg whose mark (÷ multiplier) is further than this fraction from the median of the same base elsewhere is dropped. */
   maxMarkDeviation: number;
   /** Watch-only windows are many; at most this many (in rank order) are sent. Desk windows are never cut. */
@@ -280,6 +288,8 @@ export function scannerConfigFor(mode: Mode): ScannerConfig {
 export const DEFAULT_SCANNER_CONFIG: ScannerConfig = {
   costs: DEFAULT_COSTS,
   oiFloorUsd: 500_000,
+  // The owner's rule (2026-11-03): a desk leg at most 2 % of its market's open interest.
+  deskMaxOiShare: 0.02,
   maxMarkDeviation: 0.1,
   maxWatchWindows: 150,
   quality: DEFAULT_QUALITY,

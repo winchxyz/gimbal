@@ -143,7 +143,9 @@ for (const file of files) {
         // A watch window is listed on its gross now; a desk window on its multi-day spread once known.
         const listedOn = w.tradable ? (carry[w.id]?.aprPct ?? w.grossAprPct) : w.grossAprPct;
         assert.ok(listedOn > 0, `${w.id}: only a positive spread is listed`);
-        assert.ok(w.depthUsd >= DEFAULT_SCANNER_CONFIG.oiFloorUsd, `${w.id}: capacity ${w.depthUsd}`);
+        // Watch legs meet the floor; a desk leg holds the leg size within its share of the open interest.
+        const minDepth = Math.min(DEFAULT_SCANNER_CONFIG.oiFloorUsd, DEFAULT_STRATEGY.legUsd / DEFAULT_SCANNER_CONFIG.deskMaxOiShare);
+        assert.ok(w.depthUsd >= minDepth, `${w.id}: capacity ${w.depthUsd}`);
         assert.ok(w.updatedAt <= scan.at);
         assert.ok(w.grossApr7dPct === null || Number.isFinite(w.grossApr7dPct));
         assert.ok(w.checks.length > 0);
