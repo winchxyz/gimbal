@@ -24,6 +24,12 @@
 // for a live quote, and only after every other check passed. ONECLICK_API_KEY (from the environment or .env) is
 // sent as a header and never printed. --send reads the operator key file, only then, checks it is the operator
 // FunctionCall key for this contract, and refuses in a linked git worktree. It ends with one block to paste back.
+//
+// The rescuer's lock: --send takes the live rescuer's lock of the contract and desk (engine/src/rescue/lock.ts) for
+// the whole run and refuses, before anything is read or signed, while a live rescuer holds it, as hl-return.mjs does.
+// The rescuer's reserve route is fund_venue too: both spend the desk's idle USDC on NEAR and its fund_venue ring and
+// hourly cost budget, so a rescuer planning beside this script would count on USDC the script is sending. The dry
+// run only says whether the lock is held.
 
 import { UsageError, envValues, isMain, parseFlags, run } from './cli.mjs';
 import { hyperliquidLedger, hyperliquidPerps, rpcUrls, solanaBalances } from './balances.mjs';
@@ -161,23 +167,53 @@ export function hlDelivery(entries, { desk, since, minOutE6 }) {
     && (e.destination === null ? e.type === 'deposit' : e.destination === me)) ?? null;
 }
 
+/** The rescuer's lock functions (engine/src/rescue/lock.ts). */
+const defaultLock = () => import('../../engine/src/rescue/lock.ts');
+
+/** The --send refusal while the desk's live rescuer holds its lock. */
+export const fundLockRefusal = (shown) => `--send refused, nothing was signed: the desk's live rescuer holds ${shown}; its reserve route is fund_venue too `
+  + '(the same idle USDC, fund_venue ring and hourly cost budget), so the two must not run together: stop the rescuer first';
+
 /**
  * Runs the funding; deps: near, fetch, say, now, tree, readKey(file, accountId), env (Map of ONECLICK_API_KEY),
- * sleep, pollMs. Returns the summary block.
+ * lock() (the rescuer's lock functions), sleep, pollMs. Returns the summary block.
  */
 export async function runFund(argv, deps = {}) {
   const a = parseFundArgs(argv);
+  const tree = deps.tree === undefined ? linkedWorktreeOf(ROOT) : deps.tree;
+  const refusal = sendRefusal(a.send, tree);
+  if (refusal !== null) throw new Error(refusal);
+  const locks = await (deps.lock ?? defaultLock)();
+  const name = locks.rescueLockName((k) => process.env[k], 'mainnet', a.contract, a.deskId);
+  const shown = locks.lockText(name);
+  if (!a.send) {
+    const held = await locks.lockHeld(name);
+    return fundStage(a, tree, deps, held ? `warning   the desk's live rescuer holds ${shown}: --send refuses while it runs` : `lock      ${shown} is free (--send takes it for the run)`);
+  }
+  let lock;
+  try {
+    lock = await locks.acquireRescueLock(name);
+  } catch (e) {
+    if (/holds/.test(e.message)) throw new Error(fundLockRefusal(shown));
+    throw new Error(`--send refused, nothing was signed: ${e.message}`);
+  }
+  try {
+    return await fundStage(a, tree, deps, `lock      ${shown} taken for this run: no live rescuer of the desk can start until it ends`);
+  } finally {
+    await lock.release();
+  }
+}
+
+async function fundStage(a, tree, deps, lockLine) {
   const client = deps.near ?? near;
   const fetchImpl = deps.fetch ?? ((...x) => globalThis.fetch(...x));
   const say = deps.say ?? ((s = '') => console.log(s));
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? pause;
-  const tree = deps.tree === undefined ? linkedWorktreeOf(ROOT) : deps.tree;
-  const refusal = sendRefusal(a.send, tree);
-  if (refusal !== null) throw new Error(refusal);
 
   say(`gimbal fund ${a.venue} with ${usdcText(a.amount)} USDC from ${a.contract} desk ${a.deskId}: ${a.send ? 'SEND' : 'dry run'}`);
   if (tree !== null) say(`warning   ${tree} is a linked git worktree: --send refuses here; run it from the main checkout`);
+  say(lockLine);
   const status = await client.rpc('status', []);
   say(`chain     ${status.chain_id}, block ${status.sync_info.latest_block_height}`);
   const { desk } = await moneyContext(client, a.contract, a.deskId, ['fund_venue']);

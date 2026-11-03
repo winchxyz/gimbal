@@ -1,18 +1,21 @@
 // The Arbitrum reads: the live reader's head (5 blocks behind the latest, with that block's own time) and its getLogs
-// ranges (chunked, every block once, halved down to 100 blocks when a provider refuses a range), on a viem transport
-// that answers like an RPC; and the simulated chain answering each read at the block asked.
+// ranges (chunked, every block once, halved down to 100 blocks when a provider refuses a range, a rate limit asked
+// again), on a viem transport that answers like an RPC; and the simulated chain answering each read at the block asked.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { custom, encodeAbiParameters, encodeEventTopics, numberToHex, parseAbiItem } from 'viem';
 import { ARBITRUM_USDC } from '../relayer/arbitrum.ts';
-import { ARBITRUM_CONFIRMATIONS, HL_BRIDGE2, LOG_CHUNK_BLOCKS, MIN_LOG_CHUNK_BLOCKS, SimulatedArbitrum, ViemArbitrumReads } from './arbitrum-chain.ts';
+import { ARBITRUM_CONFIRMATIONS, HL_BRIDGE2, LOG_CHUNK_BLOCKS, MIN_LOG_CHUNK_BLOCKS, RATE_LIMIT_TRIES, SimulatedArbitrum, ViemArbitrumReads } from './arbitrum-chain.ts';
 
 const DESK = '0x1a642f0e3c3af545e7acbd38b07251b3990914f1';
 const TRANSFER = parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 value)');
 
-/** An RPC on viem's custom transport: getLogs ranges are recorded, refused over `maxRange`, one log at `logAt`. */
-function rpc(o: { latest: bigint; maxRange?: bigint; refusal?: string; logAt?: bigint }) {
+/**
+ * An RPC on viem's custom transport: getLogs ranges are recorded, refused over `maxRange`, one log at `logAt`; the
+ * first `limited.times` getLogs calls are rate limited with `limited.text` (again `rearm` times after each range answered).
+ */
+function rpc(o: { latest: bigint; maxRange?: bigint; refusal?: string; logAt?: bigint; limited?: { times: number; text: string; rearm?: number } }) {
   const ranges: [bigint, bigint][] = [];
   const blocks: bigint[] = [];
   const transport = custom({
@@ -30,8 +33,13 @@ function rpc(o: { latest: bigint; maxRange?: bigint; refusal?: string; logAt?: b
         const f = params![0] as { fromBlock: string; toBlock: string; address: string };
         const a = BigInt(f.fromBlock);
         const b = BigInt(f.toBlock);
+        if (o.limited !== undefined && o.limited.times > 0) {
+          o.limited.times--;
+          throw Object.assign(new Error(o.limited.text), { code: -32005 });
+        }
         if (o.maxRange !== undefined && b - a + 1n > o.maxRange) throw Object.assign(new Error(o.refusal ?? 'query exceeds max block range'), { code: -32602 });
         ranges.push([a, b]);
+        if (o.limited?.rearm !== undefined) o.limited.times = o.limited.rearm;
         assert.equal(f.address.toLowerCase(), ARBITRUM_USDC.mainnet.token.toLowerCase());
         if (o.logAt === undefined || o.logAt < a || o.logAt > b) return [];
         return [{
@@ -91,6 +99,31 @@ test('getLogs: a range the provider refuses is halved (and stays halved) down to
   const d = new ViemArbitrumReads({ transport: down.transport });
   await assert.rejects(d.transfers(HL_BRIDGE2, DESK, 0n, 999n), /connection reset/);
   assert.equal(d.chunkBlocks, LOG_CHUNK_BLOCKS, 'not a range refusal: not halved');
+});
+
+test('getLogs: a rate limit (HTTP 429, "too many requests", "exceeded ... limit") is asked again after a pause, never halved; still limited after the last try, the read fails', async () => {
+  for (const text of ['HTTP request failed. Status: 429', 'Too Many Requests', 'your app has exceeded its compute units per second capacity', 'daily request limit reached: rate limited']) {
+    const pauses: number[] = [];
+    const r = rpc({ latest: 100_000n, logAt: 4_000n, limited: { times: RATE_LIMIT_TRIES - 1, text } });
+    const reads = new ViemArbitrumReads({ transport: r.transport, sleep: async (ms) => { pauses.push(ms); } });
+    const logs = await reads.transfers(HL_BRIDGE2, DESK, 0n, 14_999n);
+    assert.equal(logs.length, 1, text);
+    assert.equal(reads.chunkBlocks, LOG_CHUNK_BLOCKS, `${text}: not halved`);
+    assert.deepEqual(r.ranges, [[0n, 9_999n], [10_000n, 14_999n]], text);
+    assert.deepEqual(pauses, [1000, 2000, 4000], `${text}: backoff`);
+  }
+  const pauses: number[] = [];
+  const stuck = rpc({ latest: 100_000n, limited: { times: RATE_LIMIT_TRIES, text: 'Status: 429' } });
+  const s = new ViemArbitrumReads({ transport: stuck.transport, sleep: async (ms) => { pauses.push(ms); } });
+  await assert.rejects(s.transfers(HL_BRIDGE2, DESK, 0n, 999n), /429/);
+  assert.equal(s.chunkBlocks, LOG_CHUNK_BLOCKS);
+  assert.equal(pauses.length, RATE_LIMIT_TRIES - 1);
+  // The tries count per chunk: limits on every chunk never add up to a failure.
+  const limited = { times: RATE_LIMIT_TRIES - 1, text: 'Status: 429', rearm: RATE_LIMIT_TRIES - 1 };
+  const each = rpc({ latest: 100_000n, limited });
+  const e = new ViemArbitrumReads({ transport: each.transport, sleep: async () => {} });
+  assert.deepEqual(await e.transfers(HL_BRIDGE2, DESK, 0n, 49_999n), [], 'limited three times before each of five chunks');
+  assert.equal(each.ranges.length, 5);
 });
 
 test('the simulated chain answers balance, logs and authorizationState at the block asked; its head trails the latest by 5 blocks', async () => {

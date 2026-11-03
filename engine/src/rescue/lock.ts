@@ -1,6 +1,7 @@
 // One live rescuer per mode, contract and desk on this machine (E9). Two engines on the same desk would each think the
 // other's payments are not held and could pay twice; tools/mainnet/hl-return.mjs shares the desk's EIP-3009 counter,
-// its Arbitrum address and the rescue cap, so it takes the same lock for its run.
+// its Arbitrum address and the rescue cap, and tools/mainnet/fund.mjs the desk's idle USDC, fund_venue ring and cost
+// budget (the reserve route), so each takes the same lock for its run.
 //
 // The lock is a listening socket the operating system gives to one process only and takes back when that process
 // dies, however it dies: on Windows the named pipe \\.\pipe\gimbal-rescue-<mode>-<contract>-<desk>; on Linux the same
@@ -97,7 +98,7 @@ export async function acquireRescueLock(name: string): Promise<RescueLock> {
     if (code !== 'EADDRINUSE') throw new Error(`the rescuer lock ${lockText(name)} could not be taken: ${(err as Error).message}`);
     // A socket file nobody listens on is what a killed process left (Windows and Linux leave nothing).
     if (!isFileSocket(name) || await lockHeld(name)) {
-      throw new Error(`another live rescuer (or tools/mainnet/hl-return.mjs) holds ${lockText(name)}: one per desk; stop it first`);
+      throw new Error(`another live rescuer (or tools/mainnet/hl-return.mjs or fund.mjs) holds ${lockText(name)}: one per desk; stop it first`);
     }
     unlinkSync(name);
     try {

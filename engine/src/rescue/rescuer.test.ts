@@ -19,6 +19,8 @@ import type { TradeLeg } from '../trade/legs.ts';
 import { eip3009Nonce } from '../contract/replay-client.ts';
 import { HL_BRIDGE2, SimulatedArbitrum } from './arbitrum-chain.ts';
 import { SimulatedNear } from './near-chain.ts';
+import type { NearTxFacts } from './near-chain.ts';
+import { SimulatedSolana } from './solana-chain.ts';
 import type { OneClickApi, QuoteAnswer, QuoteRequest, StatusAnswer, VerifiedQuote } from './oneclick.ts';
 import { ASSETS } from './oneclick.ts';
 import { RecordedOneClick, SimulatedMoney, loadRescueRecording } from './recorded.ts';
@@ -168,6 +170,8 @@ interface Synthetic {
   authorizations: Eip3009Ref[];
   /** NEAR: the block time is the clock; each rescue signature writes the deposit ring; `view` false: before C10. */
   near: SimulatedNear;
+  /** Solana: a sent sol_sign_rescue's signature lands. */
+  solana: SimulatedSolana;
   /** Replaces 1Click's status answers from now on. */
   status: ((n: number, depositAddress: string) => StatusAnswer) | null;
   legs: Leg[];
@@ -204,6 +208,7 @@ function synthetic(o: SyntheticOptions = {}): Synthetic {
   const s: Synthetic = {
     w: undefined as unknown as World, quotes: [], sent: [], withdrawn: [], credited: [], closes: [], ledger: [],
     chain: undefined as unknown as SimulatedArbitrum, hlArrives: true, late: [], signed: [], authorizations: [], near: undefined as unknown as SimulatedNear,
+    solana: undefined as unknown as SimulatedSolana,
     status: null, legs: o.legs ?? [leg('hyperliquid', 200), leg('phoenix', 200)], signer: testSigner(),
   };
   const signer = s.signer;
@@ -212,6 +217,7 @@ function synthetic(o: SyntheticOptions = {}): Synthetic {
   s.w = world(({ clock }) => {
     s.chain = new SimulatedArbitrum(clock);
     s.near = new SimulatedNear(clock);
+    s.solana = new SimulatedSolana(clock);
     const oneClick: OneClickApi = {
       source: 'test', publicKey: signer.publicKey,
       quote: async (body) => {
@@ -227,9 +233,12 @@ function synthetic(o: SyntheticOptions = {}): Synthetic {
     };
     const payer = (method: Payer['method']): Payer => ({
       method,
+      // A Solana message's recent blockhash, good for 150 blocks (60 s).
+      ...(method === 'sol_sign_rescue' ? { prepare: async () => ({ solana: { lastValidBlockHeight: s.solana.heightNow() + 150 } }) } : {}),
       sign: async (q) => {
         await o.sign?.();
         s.signed.push(q);
+        const n = s.signed.length;
         const validBefore = Math.floor((clock.now() + (o.usableForMs ?? 300_000)) / 1000);
         let authorization: Eip3009Ref | undefined;
         if (method === 'evm_usdc_to_intents') {
@@ -237,14 +246,24 @@ function synthetic(o: SyntheticOptions = {}): Synthetic {
           authorization = { from: EVM, nonce: eip3009Nonce(rec.desk.deskId, s.near.eip3009Next), validBefore };
           s.authorizations.push(authorization);
         }
-        // The rescue methods' signature writes the desk's deposit ring (fund_venue's own ring has no view).
-        if (method !== 'fund_venue') s.near.spend(method, q.depositAddress);
+        // The rescue methods' signature writes the desk's deposit ring; fund_venue writes its own and transfers in the
+        // same transaction (final at once here).
+        const hash = `near-${method}-${n}`;
+        if (method === 'fund_venue') {
+          s.near.fundSpend(q.depositAddress);
+          s.near.txs.set(hash, { final: true, ftTransfers: [{ from: rec.desk.contract, to: q.depositAddress, amount: q.amountIn }] });
+        } else {
+          s.near.spend(method, q.depositAddress);
+        }
+        const solanaSignature = method === 'sol_sign_rescue' ? `solana-sig-${n}` : undefined;
         return {
-          tx: [{ chain: 'near', id: `near-${method}`, url: 'https://nearblocks.io/x' }] as TxRef[],
+          tx: [{ chain: 'near', id: hash, url: 'https://nearblocks.io/x' }] as TxRef[],
           ...(o.usableForMs === undefined ? {} : { usableUntilMs: clock.now() + o.usableForMs }),
           ...(authorization === undefined ? {} : { authorization }),
+          ...(solanaSignature === undefined ? {} : { solanaSignature }),
           send: async () => {
             await o.send?.();
+            if (solanaSignature !== undefined) s.solana.land(solanaSignature);
             s.sent.push(q);
             if (authorization !== undefined) {
               s.chain.transfer(EVM, q.depositAddress, q.amountIn);
@@ -295,7 +314,8 @@ function synthetic(o: SyntheticOptions = {}): Synthetic {
       mode: 'mainnet', oneClick, keyed: true, ...(o.seedCap === undefined && o.store !== undefined ? {} : { seedCap: o.seedCap ?? false }),
       ...(o.store === undefined ? {} : { store: o.store }),
       ...(o.fresh === undefined ? {} : { fresh: o.fresh }),
-      ...(o.near === false ? {} : { near: () => s.near.read() }),
+      ...(o.near === false ? {} : { near: () => s.near.read(), nearTx: (h: string) => s.near.txFacts(h) }),
+      solana: s.solana,
       desk: async () => ({ addresses: rec.desk, policy: rec.policy, reserveUsd: 100, closing: false, ...o.desk }),
       view: () => ({ legs: s.legs, freeMargin: o.freeMargin ?? { phoenix: 100 } }),
       landing,
@@ -521,32 +541,72 @@ test('a dead authorization is read again before it is released: one used meanwhi
   assert.equal(s.sent.length, 0);
 });
 
-test('a Phoenix payment that failed to send: with the ring, dead 10 min after the contract counted it; without the view, 15 min past the quote\'s pay bound; then 1Click gets 10 more minutes', async () => {
+test('a Phoenix payment that failed to send: dead once Solana\'s finalized height is past its lastValidBlockHeight and its signature is unknown there; then 1Click gets 10 more minutes', async () => {
   for (const view of [true, false]) {
     let sendFails = true;
     // A cap that a second rescue 20 min later fits in.
     const s = synthetic({ desk: { reserveUsd: 0, policy: { ...rec.policy, rescue_cap_usd_per_hour: 1000 } }, reducer: true, send: async () => { if (sendFails) throw new Error('solana rpc: blockhash not found'); } });
     s.near.view = view;
-    const signedAt = s.w.t;
+    const lastValid = s.solana.heightNow() + 150;
     await run(s.w, trigger({ id: 'a', amountUsd: 30 }));
     assert.match(s.w.rescuer.held!, /the signed sol_sign_rescue of rescue a was not sent/);
     sendFails = false;
     const q = s.signed[0]!;
     s.status = (_n, addr) => ({ status: addr === q.depositAddress ? 'PENDING_DEPOSIT' : 'SUCCESS', body: null });
-    // In the ring, paid at signing: its blockhash is from before then. No view: the quote's 30 min deadline here.
-    const dead = view ? signedAt + 10 * 60_000 : Math.min(q.deadlineMs, q.signedAtMs + 3_600_000) + 15 * 60_000;
-    s.w.t = dead - 60_000;
+    // Finalized height reaches lastValidBlockHeight: the message may still land.
+    s.w.t = (lastValid + 32) * 400;
     await run(s.w, trigger({ id: 'b', amountUsd: 30 }));
     assert.match(s.w.rescuer.held!, /rescue a/, `${view}: not dead yet`);
-    s.w.t = dead;
+    // Past it, but Solana cannot be read: not taken as dead.
+    s.w.t = (lastValid + 33) * 400;
+    s.solana.down = 'solana rpc: 503';
     await run(s.w, trigger({ id: 'c', amountUsd: 30 }));
-    assert.match(s.w.rescuer.held!, /rescue a/, `${view}: 1Click still gets its 10 minutes`);
+    s.solana.down = null;
     s.w.t += 10 * 60_000;
     await run(s.w, trigger({ id: 'd', amountUsd: 30 }));
+    assert.match(s.w.rescuer.held!, /rescue a/, `${view}: 1Click gets its 10 minutes from the first dead read`);
+    s.w.t += 10 * 60_000;
+    await run(s.w, trigger({ id: 'e', amountUsd: 30 }));
     assert.ok(s.w.journal().some((j) => /rescue a's signed payment can no longer run .*expired unused/.test(j)), String(view));
-    assert.deepEqual(s.w.ended.at(-1), ['d', true]);
-    assert.equal(s.sent.length, 1, 'd paid');
+    assert.deepEqual(s.w.ended.at(-1), ['e', true]);
+    assert.equal(s.sent.length, 1, 'e paid');
   }
+});
+
+test('a Phoenix payment whose signature landed on Solana, or whose signature is not known, is held however long', async () => {
+  // Sent with an unknown outcome: it landed.
+  const sig = synthetic({ desk: { reserveUsd: 0 }, reducer: true, send: async () => { throw new OutcomeUnknown('solana send', 'no answer', {} as OutcomeIds); } });
+  await run(sig.w, trigger({ id: 'a', amountUsd: 30 }));
+  sig.solana.land('solana-sig-1');
+  const q = sig.signed[0]!;
+  sig.status = (_n, addr) => ({ status: addr === q.depositAddress ? 'PENDING_DEPOSIT' : 'SUCCESS', body: null });
+  for (const hours of [1, 5]) {
+    sig.w.t += hours * 3_600_000;
+    await run(sig.w, trigger({ id: `b${hours}`, amountUsd: 30 }));
+    assert.match(sig.w.rescuer.held!, /rescue a/, `landed: held ${hours} h later`);
+  }
+  assert.equal(sig.sent.length, 0);
+
+  // A crash while signing: no signature known; the contract counted it (the call landed after the crash).
+  const store = tmpStore();
+  let crashed = false;
+  const s = synthetic({ store, fresh: true, seedCap: false, desk: { reserveUsd: 0 }, reducer: true, sign: () => (crashed ? Promise.resolve() : new Promise<void>(() => {})) });
+  s.w.rescuer.take(trigger({ id: 'a', amountUsd: 30 }));
+  await until(() => s.w.steps('a').includes('sign'));
+  const hold = onDisk(store).holds[0]!;
+  assert.equal(hold.quote.method, 'sol_sign_rescue');
+  assert.equal(hold.solana!.signature, null);
+  assert.ok(hold.solana!.lastValidBlockHeight > 0, 'saved before signing');
+  crashed = true;
+  s.w.restart();
+  s.near.spend('sol_sign_rescue', hold.quote.depositAddress);
+  s.status = (_n, addr) => ({ status: addr === hold.quote.depositAddress ? 'PENDING_DEPOSIT' : 'SUCCESS', body: null });
+  for (const hours of [1, 5]) {
+    s.w.t += hours * 3_600_000;
+    await run(s.w, trigger({ id: `b${hours}`, amountUsd: 30 }));
+    assert.match(s.w.rescuer.held!, /rescue a/, `no signature: held ${hours} h later`);
+  }
+  assert.equal(s.quotes.length, 1, 'no second payment');
 });
 
 test('an EIP-3009 send whose outcome is unknown is parked like an unsent one: released once Arbitrum shows it never ran, held while it ran', async () => {
@@ -587,7 +647,7 @@ test('a SUCCESS the ledger never shows is held; after 30 min it is journaled onc
   await run(s.w, trigger({ id: 'c', amountUsd: 30 }));
   const lines = s.w.journal().filter((j) => /reconcile needed/.test(j));
   assert.equal(lines.length, 1, 'said once');
-  assert.match(lines[0]!, /reconcile needed: rescue a's deposit \S+ \(fund_venue, \d+\.\d+ USDC in, at least \d+\.\d+ out to hyperliquid\) is SUCCESS at 1Click after \d+ min; transfers stay held/);
+  assert.match(lines[0]!, /reconcile needed: rescue a's deposit \S+ \(fund_venue, \d+\.\d+ USDC in, at least \d+\.\d+ out to hyperliquid, NEAR tx \S+\) is SUCCESS at 1Click after \d+ min; transfers stay held/);
   assert.match(s.w.rescuer.held!, /rescue a/);
   assert.ok(s.w.logs.some((l) => /reconcile needed/.test(l)));
 });
@@ -852,7 +912,11 @@ const ID: RescueIdentity = { contractId: rec.desk.contract, deskId: rec.desk.des
 const tmpPath = () => join(mkdtempSync(join(tmpdir(), 'gimbal-rescue-')), 'rescue-mainnet-alpha.json');
 const tmpStore = () => new RescueStateStore(tmpPath(), ID);
 interface OnDisk {
-  holds: { paying: boolean; status: string | null; authorization: unknown; arbBlock: string | null; scannedTo: string | null; paidLog: string | null; quote: { depositAddress: string; deadlineMs: number; signedAtMs: number } }[];
+  holds: {
+    paying: boolean; status: string | null; authorization: unknown; arbBlock: string | null; scannedTo: string | null; paidLog: string | null;
+    counter: string | null; nearTx: string | null; solana: { lastValidBlockHeight: number; signature: string | null } | null;
+    quote: { method: string; depositAddress: string; deadlineMs: number; signedAtMs: number };
+  }[];
   unknown: string | null;
   hl: { strandedE6: string; inFlight: { tx: TxRef[] } | null; expired: { rescueId: string; tx: TxRef[] }[] };
   cap: unknown[];
@@ -965,7 +1029,7 @@ test('state: the unknown outcome, the rescuer\'s own Arbitrum USDC and a withdra
   assert.equal(u.quotes.length, 1, 'still held after the restart: only a reduce ran');
 });
 
-test('state: a crash while signing fund_venue leaves it held after the restart, until NEAR time is 15 min past the quote\'s pay bound and 1Click\'s grace has passed', async () => {
+test('state: a crash while signing fund_venue: held after the restart; released only once NEAR time is past the pay bound and the fund_venue ring lacks it', async () => {
   const store = tmpStore();
   let crashed = false;
   const s = synthetic({ store, fresh: true, seedCap: false, reducer: true, sign: () => (crashed ? Promise.resolve() : new Promise<void>(() => {})) });
@@ -974,23 +1038,89 @@ test('state: a crash while signing fund_venue leaves it held after the restart, 
   const saved = onDisk(store);
   assert.equal(saved.holds.length, 1, 'saved before the signature was asked for');
   assert.equal(saved.holds[0]!.paying, true);
+  assert.equal(saved.holds[0]!.nearTx, null, 'no transaction known');
   // The engine dies here; a new one starts on the same file.
   crashed = true;
   const again = s.w.restart();
   assert.match(again.held!, /rescue a was paying \S+ \(fund_venue\) when the engine stopped: it may have been signed or sent/);
-  const aAddress = saved.holds[0]!.quote.depositAddress;
-  s.status = (_n, addr) => ({ status: addr === aAddress ? 'PENDING_DEPOSIT' : 'SUCCESS', body: null });
+  const q = saved.holds[0]!.quote;
+  const payable = Math.min(q.deadlineMs, q.signedAtMs + 3_600_000);
+  s.status = (_n, addr) => ({ status: addr === q.depositAddress ? 'PENDING_DEPOSIT' : 'SUCCESS', body: null });
   await run(s.w, trigger({ id: 'b', amountUsd: 30 }));
   assert.equal(s.quotes.length, 1, 'no second payment');
   assert.deepEqual(s.w.ended.at(-1), ['b', true]);
-  s.w.t += 70 * 60_000;
+  // Before the pay bound the call may still land: held.
+  s.w.t = payable - 60_000;
   await run(s.w, trigger({ id: 'c', amountUsd: 30 }));
-  assert.match(s.w.rescuer.held!, /rescue a was paying/, '1Click still gets its 10 minutes');
-  s.w.t += 10 * 60_000;
+  assert.match(s.w.rescuer.held!, /rescue a was paying/);
+  s.w.t = payable + 61_000;
   await run(s.w, trigger({ id: 'd', amountUsd: 30 }));
-  assert.ok(s.w.journal().some((j) => /rescue a's signed payment can no longer run .*expired unused/.test(j)));
+  assert.ok(s.w.journal().some((j) => /rescue a's fund_venue was never signed: the desk's fund_venue ring on NEAR does not hold/.test(j)));
   assert.deepEqual(s.w.ended.at(-1), ['d', true]);
   assert.equal(s.quotes.length, 2, 'd paid');
+});
+
+test('state: a fund_venue the ring counted, with no transaction known, stays held however long: time alone never releases it', async () => {
+  const store = tmpStore();
+  let crashed = false;
+  const s = synthetic({ store, fresh: true, seedCap: false, reducer: true, sign: () => (crashed ? Promise.resolve() : new Promise<void>(() => {})) });
+  s.w.rescuer.take(trigger({ id: 'a', amountUsd: 30 }));
+  await until(() => s.w.steps('a').includes('sign'));
+  const q = onDisk(store).holds[0]!.quote;
+  crashed = true;
+  s.w.restart();
+  // The call sent before the crash lands: the ring counts it, its transfer may run late.
+  s.near.fundSpend(q.depositAddress);
+  s.status = (_n, addr) => ({ status: addr === q.depositAddress ? 'PENDING_DEPOSIT' : 'SUCCESS', body: null });
+  for (const [i, hours] of [1, 3, 30].entries()) {
+    s.w.t = q.signedAtMs + hours * 3_600_000;
+    await run(s.w, trigger({ id: `b${i}`, amountUsd: 30 }));
+    assert.match(s.w.rescuer.held!, /rescue a was paying/, `held ${hours} h later`);
+  }
+  assert.equal(s.quotes.length, 1, 'no second payment');
+  assert.ok(s.w.journal().some((j) => /reconcile needed: rescue a's deposit/.test(j)));
+});
+
+test('state: an unknown fund_venue outcome with its transaction known: decided by the final transaction, never by time', async () => {
+  const cases: { name: string; facts: (addr: string, amount: bigint) => NearTxFacts | null; released: boolean }[] = [
+    { name: 'final, nothing transferred', facts: () => ({ final: true, ftTransfers: [] }), released: true },
+    { name: 'final, a transfer of another amount', facts: (addr) => ({ final: true, ftTransfers: [{ from: 'c', to: addr, amount: 1n }] }), released: true },
+    { name: 'final, the transfer to the deposit', facts: (addr, amount) => ({ final: true, ftTransfers: [{ from: 'c', to: addr, amount }] }), released: false },
+    { name: 'not final yet', facts: () => ({ final: false, ftTransfers: [] }), released: false },
+  ];
+  for (const c of cases) {
+    const store = tmpStore();
+    const s = synthetic({ store, fresh: true, seedCap: false, reducer: true, sign: async () => {
+      throw new OutcomeUnknown('fund_venue', 'sent, no answer', {} as OutcomeIds, [{ chain: 'near', id: 'tx-lost', url: 'https://nearblocks.io/x' }]);
+    } });
+    await run(s.w, trigger({ id: 'a', amountUsd: 30 }));
+    const hold = onDisk(store).holds[0]!;
+    assert.equal(hold.nearTx, 'tx-lost', c.name);
+    const q = hold.quote;
+    const f = c.facts(q.depositAddress, BigInt(s.quotes[0]!.amount));
+    if (f !== null) s.near.txs.set('tx-lost', f);
+    s.status = (_n, addr) => ({ status: addr === q.depositAddress ? 'PENDING_DEPOSIT' : 'SUCCESS', body: null });
+    s.w.t = c.released ? q.signedAtMs + 60_000 : q.signedAtMs + 30 * 3_600_000;
+    await run(s.w, trigger({ id: 'b', amountUsd: 30 }));
+    if (c.released) {
+      assert.ok(s.w.journal().some((j) => /rescue a's fund_venue transaction tx-lost is final and transferred nothing to/.test(j)), c.name);
+      assert.equal(s.quotes.length, 2, `${c.name}: b paid`);
+    } else {
+      assert.match(s.w.rescuer.held!, /fund_venue of rescue a may have been signed or paid|rescue a was paying/, c.name);
+      assert.equal(s.quotes.length, 1, `${c.name}: no second payment`);
+    }
+  }
+  // Its transaction unknown to NEAR (never included): the ring decides, past the pay bound.
+  const store = tmpStore();
+  const s = synthetic({ store, fresh: true, seedCap: false, reducer: true, sign: async () => {
+    throw new OutcomeUnknown('fund_venue', 'sent, no answer', {} as OutcomeIds, [{ chain: 'near', id: 'tx-never', url: 'https://nearblocks.io/x' }]);
+  } });
+  await run(s.w, trigger({ id: 'a', amountUsd: 30 }));
+  const q = onDisk(store).holds[0]!.quote;
+  s.status = (_n, addr) => ({ status: addr === q.depositAddress ? 'PENDING_DEPOSIT' : 'SUCCESS', body: null });
+  s.w.t = Math.min(q.deadlineMs, q.signedAtMs + 3_600_000) + 61_000;
+  await run(s.w, trigger({ id: 'b', amountUsd: 30 }));
+  assert.ok(s.w.journal().some((j) => /rescue a's fund_venue was never signed/.test(j)));
 });
 
 /** Hyperliquid -> Phoenix on a state file, the EIP-3009 sign never answering (a crash while signing), then a restart. */
@@ -1112,6 +1242,61 @@ test('state: a ring that turned over since the hold (32 later rescues) proves no
   s.w.t += 10 * 60_000;
   await run(s.w, trigger({ id: 'd', venue: 'phoenix', amountUsd: 20 }));
   assert.ok(s.w.journal().some((j) => /rescue a's signed payment can no longer run .*expired unused/.test(j)));
+});
+
+test('a withdraw that never showed, with no room left under the cap for a cent more: the next withdraw is a cent less', async () => {
+  for (const [spare, bump] of [[0.005, -10_000n], [0.025, 10_000n]] as const) {
+    const desk = { reserveUsd: 0, policy: { ...rec.policy, rescue_cap_usd_per_hour: 1000 } };
+    const { s } = hlWorld({ desk });
+    s.hlArrives = false;
+    await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
+    const first = s.withdrawn[0]!;
+    s.w.t += 30 * 60_000;
+    s.hlArrives = true;
+    // b plans what a planned: the withdraw plus the bridge of what it brings (1 USDC less) count, and `spare` is left
+    // over; a cent more fits only in 0.025.
+    const cap = s.w.rescuer.capUsed() + (2 * Number(first) / 1e6 - 1) + spare;
+    desk.policy = { ...desk.policy, rescue_cap_usd_per_hour: cap };
+    await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
+    assert.equal(s.withdrawn.length, 2, s.w.failures.at(-1)?.reason);
+    assert.equal(s.withdrawn[1], first + bump, `${spare} USD spare`);
+    assert.ok(s.w.rescuer.capUsed() <= cap + 1e-9, 'the cap holds');
+  }
+});
+
+test('INCOMPLETE_DEPOSIT keeps the hold: what arrived waits at 1Click for its refund, and only a refund ends it', async () => {
+  const s = synthetic({ reducer: true, status: () => ({ status: 'INCOMPLETE_DEPOSIT', body: null }) });
+  await run(s.w, trigger({ id: 'a', amountUsd: 30 }));
+  assert.deepEqual(s.w.ended, [['a', false]]);
+  assert.match(s.w.rescuer.held!, /rescue a's deposit \S+ is INCOMPLETE_DEPOSIT at 1Click/);
+  // Read again at the next plan: still INCOMPLETE_DEPOSIT, still held.
+  s.w.t += 40 * 60_000;
+  await run(s.w, trigger({ id: 'b', amountUsd: 30 }));
+  assert.deepEqual(s.w.ended.at(-1), ['b', true]);
+  assert.equal(s.sent.length, 1, 'no second payment');
+  assert.match(s.w.rescuer.held!, /rescue a/);
+  assert.ok(!s.w.journal().some((j) => /rescue a's transfer ended/.test(j)));
+  s.status = () => ({ status: 'REFUNDED', body: null });
+  await run(s.w, trigger({ id: 'c', amountUsd: 30 }));
+  assert.ok(s.w.journal().some((j) => /rescue a's transfer ended REFUNDED at 1Click/.test(j)));
+  assert.equal(s.sent.length, 2, 'c paid');
+});
+
+test('state: an EIP-3009 hold with no authorization in hand stays held while any nonce from its counter read before signing up to eip3009_next is used', async () => {
+  for (const used of [true, false]) {
+    const { s, saved, payable } = await crashWhileSigning();
+    assert.equal(saved.counter, '0', 'eip3009_next read before signing');
+    // The ring turned over (it proves nothing) and the counter moved: the logs alone would say nothing ran.
+    for (let i = 0; i < 32; i++) s.near.spend('evm_usdc_to_intents', `0x${(i + 1).toString(16).padStart(40, '0')}`, s.w.t + 1_000);
+    if (used) s.chain.markUsed(EVM, eip3009Nonce(rec.desk.deskId, 7n));
+    s.w.t = payable + 15 * 60_000 + 2_000;
+    await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
+    s.w.t += 10 * 60_000;
+    await run(s.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 20 }));
+    const expired = s.w.journal().some((j) => /rescue a's signed payment can no longer run .*expired unused/.test(j));
+    assert.equal(expired, !used, `nonce used: ${used}`);
+    if (used) assert.match(s.w.rescuer.held!, /rescue a/);
+  }
 });
 
 test('state: a signed EIP-3009 authorization saved before a crash is told dead after the restart from Arbitrum; its USDC is the rescuer\'s again', async () => {

@@ -61,18 +61,27 @@ const USDC_VIEWS = parseAbi([
 
 /** A getLogs refusal that names the range or the result size (each provider words it its own way). */
 const RANGE_REFUSAL = /block range|range (is )?too (large|wide|big)|exceed|too many|more than \d+|limit|response size|-32005|-32602/i;
+/**
+ * A rate limit, which says nothing of the range: HTTP 429 and the providers' wordings (Infura's -32005 is used for
+ * both, so the text decides). Checked before RANGE_REFUSAL, whose "limit" and "too many" it would otherwise match.
+ */
+const RATE_LIMITED = /\b429\b|rate.?limit|too many requests|request rate|requests? per (second|minute)|\brps\b|compute units|throughput|quota/i;
+/** A rate-limited getLogs is asked again this many times, after 1 s, 2 s, 4 s..., then the read fails. */
+export const RATE_LIMIT_TRIES = 4;
 
 export class ViemArbitrumReads implements ArbitrumReads {
   readonly #client: PublicClient;
   readonly #token: Hex;
   readonly #rpcUrl: string | undefined;
+  readonly #sleep: (ms: number) => Promise<void>;
   /** The range getLogs is asked for: halved when a provider refuses one, kept for the next reads. */
   #chunk = LOG_CHUNK_BLOCKS;
 
-  constructor(options: { rpcUrl?: string; transport?: Transport } = {}) {
+  constructor(options: { rpcUrl?: string; transport?: Transport; sleep?: (ms: number) => Promise<void> } = {}) {
     this.#client = createPublicClient({ chain: arbitrum, transport: options.transport ?? http(options.rpcUrl) }) as PublicClient;
     this.#token = ARBITRUM_USDC.mainnet.token;
     this.#rpcUrl = options.rpcUrl;
+    this.#sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   }
 
   /** The range getLogs is asked for now, blocks. */
@@ -106,14 +115,22 @@ export class ViemArbitrumReads implements ArbitrumReads {
   async transfers(from: string, to: string, fromBlock: bigint, toBlock: bigint): Promise<UsdcTransfer[]> {
     const out: UsdcTransfer[] = [];
     let a = fromBlock;
+    let limited = 0;
     while (a <= toBlock) {
       const b = a + this.#chunk - 1n < toBlock ? a + this.#chunk - 1n : toBlock;
       let logs;
       try {
         logs = await this.#safe(this.#client.getLogs({ address: this.#token, event: TRANSFER, args: { from: from as Hex, to: to as Hex }, fromBlock: a, toBlock: b }));
       } catch (err) {
+        const why = errorMessage(err);
+        // Rate limited: the same range again after a pause; the chunk stays as it is.
+        if (RATE_LIMITED.test(why)) {
+          if (++limited >= RATE_LIMIT_TRIES) throw err;
+          await this.#sleep(1000 * 2 ** (limited - 1));
+          continue;
+        }
         // A range the provider will not serve: the same start again with half of it, never below the floor.
-        if (!RANGE_REFUSAL.test(errorMessage(err)) || this.#chunk <= MIN_LOG_CHUNK_BLOCKS) throw err;
+        if (!RANGE_REFUSAL.test(why) || this.#chunk <= MIN_LOG_CHUNK_BLOCKS) throw err;
         const half = this.#chunk / 2n;
         this.#chunk = half < MIN_LOG_CHUNK_BLOCKS ? MIN_LOG_CHUNK_BLOCKS : half;
         continue;
@@ -123,6 +140,7 @@ export class ViemArbitrumReads implements ArbitrumReads {
         out.push({ id: `${l.transactionHash}:${l.logIndex}`, from: String(l.args.from).toLowerCase(), to: String(l.args.to).toLowerCase(), value: l.args.value ?? 0n, block: l.blockNumber });
       }
       a = b + 1n;
+      limited = 0;
     }
     return out;
   }

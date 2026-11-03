@@ -26,26 +26,34 @@
 // Paying twice is the failure this guards against. Money that may still move holds every later transfer (only reduces
 // run) until it is settled. A payment is held from just before it is signed (so a crash while signing leaves it held):
 //   - sent, and not settled by 1Click in time, or settled but not yet seen in the ledger: held until its deposit
-//     address reaches a final 1Click status and, on SUCCESS, the delivery is found (journaled late);
+//     address reaches a final 1Click status and, on SUCCESS, the delivery is found (journaled late). INCOMPLETE_DEPOSIT
+//     is not final here: part of the money is at 1Click, which may still refund it, so it stays held;
 //   - not known to be sent (the send failed, a crash, or an OutcomeUnknown while signing or sending): its signature
 //     may be public and usable, so it is held until 1Click settles it, or until the chain proves it can never run
 //     (#canNeverRun). Only chain facts count, never how long ago it was asked: a congested NEAR call stays valid for
 //     about a day and may land long after the engine gave up on it. The bound is the quote's: the contract signs it
 //     only before payableUntilMs (the earlier of its deadline and an hour after 1Click signed it), whenever the call
-//     lands. A USDC Transfer from the desk to the deposit address since the block before signing proves it ran (held
-//     until 1Click settles it). Otherwise:
-//       never signed (released at once): get_desk_counters' deposit ring, read at a final NEAR block whose time is
-//         past payableUntilMs + CHAIN_MARGIN_S, does not hold the deposit address, and still has a slot empty or
-//         older than the hold (so it was not pushed out by 32 later rescues);
-//       signed, and dead (released once 1Click, UNUSED_GRACE_MS later and with the chain read again, still saw no
-//         deposit): the ring holds it, paid at P: EIP-3009 is valid until P + 300 s, so the Arbitrum head (whose logs
-//         were read) past that plus CHAIN_MARGIN_S; a Solana transaction carries a blockhash of before P, so NEAR time
-//         past P + SIGN_SETTLE_MS. A signed EIP-3009 authorization the rescuer has: the head past its validBefore +
-//         CHAIN_MARGIN_S and authorizationState there false;
-//       without the view (before C10), a ring that turned over, or fund_venue (whose ring has no view): the latest
-//         possible signature is just before payableUntilMs, so Arbitrum time (EIP-3009, with no Transfer to the
-//         deposit address) or NEAR time (the others) past payableUntilMs + NO_VIEW_SETTLE_MS (the 300 s validity, the
-//         MPC network's answer and margin) is dead;
+//     lands. Otherwise, per method:
+//       never signed, any method (released at once): the deposit ring of that method (get_desk_counters' for the
+//         rescues, the fund_venue record read from the contract state for fund_venue), read at a final NEAR block
+//         whose time is past payableUntilMs + CHAIN_MARGIN_S, does not hold the deposit address, and still has a slot
+//         empty or older than the hold (so it was not pushed out by 32 later payments);
+//       fund_venue: the contract sends the USDC in a later receipt, which can run long after the call under
+//         congestion, so time never releases it. With its NEAR transaction known: final (every receipt executed) and
+//         no ft_transfer to the deposit address in it is never paid (released at once); a transfer in it is paid,
+//         held until 1Click settles it. In the ring with no transaction known: held until the owner reconciles it;
+//       evm_usdc_to_intents: a USDC Transfer from the desk to the deposit address since the block before signing
+//         proves it ran (held until 1Click settles it). Dead (released once 1Click, UNUSED_GRACE_MS later and with
+//         the chain read again, still saw no deposit): a signed authorization the rescuer has, with the Arbitrum head
+//         past its validBefore + CHAIN_MARGIN_S and authorizationState there false; or the ring holds it, paid at P
+//         (valid until P + 300 s), with the head (whose logs were read) past that plus CHAIN_MARGIN_S; or, without
+//         the view or with a ring that turned over, the head past payableUntilMs + NO_VIEW_SETTLE_MS (the 300 s
+//         validity, the MPC network's answer and margin). Without the authorization, every nonce from the counter
+//         read before signing up to eip3009_next must also be unused at that head (authorizationState), so a release
+//         never rests on the logs alone;
+//       sol_sign_rescue: its message's lastValidBlockHeight is saved before signing. Dead once Solana's finalized
+//         height is past it (no later block can include it) and the cluster does not know its signature; with no
+//         signature known it is held until the owner reconciles it;
 //   - an OutcomeUnknown of an hl_withdraw or of a Phoenix credit: held until the owner reconciles it and clears
 //     `unknown` in the state file (MANUAL_CLEAR) and restarts.
 // A hold still open after RECONCILE_AFTER_MS is journaled once as "reconcile needed" with its deposit address,
@@ -70,7 +78,8 @@
 // neither is asked for; a later save that fails is logged, and what it held stays held in memory. A missing state
 // file is never a first run: like an unusable one, every transfer is then held (reduces still run) and the cap starts
 // full, until the owner reconciles and starts once with `fresh` (GIMBAL_RESCUE_FRESH=<contract>/<desk>, refused by
-// serve while the contract counted a rescue of the desk in the last hour), which writes an empty state. The state
+// serve while the contract counted a rescue or a fund_venue of the desk, or the state directory shows a trace of
+// one of its rescuers, in the last 65 min), which writes an empty state. The state
 // belongs to one desk EVM address: when get_desk names another one mid-run, every transfer is held until a restart.
 // The cap meter is this process's: when nothing is loaded (or without a store, on mainnet) it starts as if the whole
 // hourly cap were used just before the engine started, and the first line of the run says so.
@@ -93,8 +102,10 @@ import { errorMessage } from '../venues/recorder.ts';
 import type { Clock } from '../venues/venue.ts';
 import type { ArbitrumHead, ArbitrumReads } from './arbitrum-chain.ts';
 import { HL_BRIDGE2 } from './arbitrum-chain.ts';
-import type { NearRead } from './near-chain.ts';
+import { eip3009Nonce } from '../contract/replay-client.ts';
+import type { NearDeskCounters, NearRead, NearTxFacts } from './near-chain.ts';
 import { depositKey, ringEntry, ringHolds } from './near-chain.ts';
+import type { SolanaReads } from './solana-chain.ts';
 import type { DeskAddresses, OneClickApi, QuoteRequest, QuotedMethod, QuoteResponse, VerifiedQuote } from './oneclick.ts';
 import { ASSETS, FINAL_STATUSES, deliveryHashes, e8Text, payableUntilMs, unitsOf, verifyQuote } from './oneclick.ts';
 import type { Plan, Source } from './plan.ts';
@@ -122,8 +133,10 @@ export const WITHDRAW_IN_FLIGHT_MS = 30 * 60_000;
 export const SEEN_KEPT = 500;
 /** The contract's EIP-3009 authorization is valid until its signing block's time plus this, s. */
 export const EIP3009_VALIDITY_S = 300;
-/** A Solana rescue the ring shows paid at P carries a blockhash of before P: long expired at NEAR time P + this. */
-export const SIGN_SETTLE_MS = 10 * 60_000;
+/** At most this many EIP-3009 nonces (pre-sign counter up to eip3009_next) are read before a release; more: held. */
+export const NONCES_READ = 32n;
+/** 1Click statuses that settle a deposit: INCOMPLETE_DEPOSIT is final at 1Click but leaves money there to refund. */
+const SETTLED_STATUSES = FINAL_STATUSES.filter((s) => s !== 'INCOMPLETE_DEPOSIT');
 /**
  * With no ring to read: past the quote's payableUntilMs by this, on Arbitrum (EIP-3009) or NEAR time, a signature
  * the contract made just before then can no longer run (validBefore is its block time + 300 s, then the MPC
@@ -156,12 +169,21 @@ export interface SignedPayment {
   usableUntilMs?: number;
   /** The EIP-3009 authorization signed: saved with the hold, so whether it can still run is read on Arbitrum. */
   authorization?: Eip3009Ref;
+  /** sol_sign_rescue: the Solana transaction's signature, read on Solana while the payment is held. */
+  solanaSignature?: string;
+}
+
+/** What a payer fixes before the contract signs, saved with the hold first (sol_sign_rescue: its blockhash's bound). */
+export interface PreparedPayment {
+  solana?: { lastValidBlockHeight: number };
 }
 
 /** Pays a verified quote from one source: fund_venue, sol_sign_rescue or evm_usdc_to_intents. */
 export interface Payer {
   readonly method: QuotedMethod;
-  sign(quote: VerifiedQuote, reason: string): Promise<SignedPayment>;
+  /** sol_sign_rescue must have it: the message (and its recent blockhash) is built here, before the hold is saved. */
+  prepare?(quote: VerifiedQuote): Promise<PreparedPayment>;
+  sign(quote: VerifiedQuote, reason: string, prepared?: PreparedPayment): Promise<SignedPayment>;
 }
 
 /** Hyperliquid's way out: hl_withdraw to the desk's EVM address on Arbitrum (its arrival is read in ArbitrumReads). */
@@ -221,6 +243,10 @@ export interface RescuerOptions {
    * (the recorded worlds): the clock is NEAR time and there is no ring.
    */
   near?: () => Promise<NearRead>;
+  /** A NEAR transaction's final outcome (near-chain.ts): whether a held fund_venue paid. Absent: a held fund_venue is cleared only by the ring or by hand. */
+  nearTx?: (hash: string) => Promise<NearTxFacts>;
+  /** Solana's finalized height and signature statuses: whether a held sol_sign_rescue can still land. Absent: held. */
+  solana?: SolanaReads;
   credit?: Partial<Record<VenueId, CreditPort>>;
   /** The pair trader holding both legs; absent: no reduce. */
   reducer?: () => Reducer | null;
@@ -294,6 +320,25 @@ interface DepositHold {
   reservedE6: bigint;
   /** 1Click's last status for it. */
   status: string | null;
+  /** EIP-3009: the desk's eip3009_next before signing (null: no view). */
+  counter: bigint | null;
+  /** The NEAR transaction of its call, once known. */
+  nearTx: string | null;
+  /** sol_sign_rescue: lastValidBlockHeight of its message, and its signature once known. */
+  solana: { lastValidBlockHeight: number; signature: string | null } | null;
+}
+
+/** What a hold is opened with, before the signature is asked for. */
+interface HoldStart {
+  rescueId: string;
+  venue: VenueId;
+  q: VerifiedQuote;
+  sinceMs: number;
+  reservedE6: bigint;
+  arbBlock: bigint | null;
+  counter: bigint | null;
+  solana: { lastValidBlockHeight: number } | null;
+  why: string;
 }
 
 /** An hl_withdraw accepted (or perhaps sent) and not yet seen on Arbitrum. */
@@ -343,6 +388,8 @@ export class Rescuer {
   #expired: InFlight[] = [];
   /** The desk EVM address the Arbitrum state belongs to: the state file's, else the first get_desk's. */
   #evm: string | null;
+  /** The desk id the EIP-3009 nonces are derived from: the state file's, else get_desk's. */
+  #deskId: string | null;
   /** get_desk named another EVM address: every transfer is held until a restart. */
   #evmProblem: string | null = null;
   #minimumsSaid = false;
@@ -361,6 +408,7 @@ export class Rescuer {
     this.#o = options;
     this.#startedAt = options.clock.now();
     this.#evm = options.store?.identity.evm ?? null;
+    this.#deskId = options.store?.identity.deskId ?? null;
     const seed = options.seedCap ?? options.mode === 'mainnet';
     const store = options.store;
     const capLine = seed ? ' The rescue cap counts as used in full for the first hour (the contract\'s counters have no view)' : '';
@@ -482,6 +530,7 @@ export class Rescuer {
     // The Arbitrum state (the rescuer's own USDC, the withdraws, the holds' logs) belongs to one desk address.
     const evmNow = desk.addresses.evm.toLowerCase();
     if (this.#evm === null) this.#evm = evmNow;
+    this.#deskId ??= desk.addresses.deskId;
     if (evmNow !== this.#evm && this.#evmProblem === null) {
       this.#evmProblem = `get_desk names the desk EVM address ${evmNow}, not ${this.#evm} that this rescuer's Arbitrum state belongs to; every transfer is held until the engine is restarted (a new address starts a new state file)`;
       this.#log(this.#evmProblem);
@@ -593,10 +642,22 @@ export class Rescuer {
     const arb = this.#o.arbitrum!;
     const evm = desk.addresses.evm;
     const t = run.trigger;
-    let amountE6 = BigInt(Math.round(plan.withdrawUsd! * 1e6));
-    // A Bridge2 Transfer names no withdraw: never the exact amount of one that never showed (a cent more instead).
-    while (this.#expired.some((e) => e.amountE6 === amountE6 - BigInt(HL_WITHDRAW_FEE_USD * 1e6))) amountE6 += 10_000n;
-    const expectE6 = amountE6 - BigInt(HL_WITHDRAW_FEE_USD * 1e6);
+    const feeE6 = BigInt(HL_WITHDRAW_FEE_USD * 1e6);
+    const planned = BigInt(Math.round(plan.withdrawUsd! * 1e6));
+    let amountE6 = planned;
+    // A Bridge2 Transfer names no withdraw: never the exact amount of one that never showed. A cent more while the
+    // plan's room under the rescue cap allows it (the withdraw counts against the cap), else a cent less.
+    const taken = (x: bigint) => this.#expired.some((e) => e.amountE6 === x - feeE6);
+    if (taken(amountE6)) {
+      const roomE6 = BigInt(Math.floor(Math.max(0, desk.policy.rescue_cap_usd_per_hour - this.capUsed() - plan.capUsd) * 1e6));
+      let up = amountE6;
+      while (taken(up)) up += 10_000n;
+      let down = amountE6;
+      while (taken(down)) down -= 10_000n;
+      amountE6 = up - planned <= roomE6 ? up : down;
+      if (amountE6 <= feeE6) throw new StepFailed('source', `no hl_withdraw near ${usdc(planned)} USDC both fits the rescue cap and differs from a withdraw that never showed`);
+    }
+    const expectE6 = amountE6 - feeE6;
     const withdrawUsd = Number(amountE6) / 1e6;
     let fromBlock: bigint;
     try {
@@ -699,14 +760,27 @@ export class Rescuer {
     if (reserveE6 > this.#strandedE6) {
       throw new StepFailed('verify', `the quote spends ${usdc(reserveE6)} USDC of the desk's Arbitrum address, more than the ${usdc(this.#strandedE6)} the rescuer's own hl_withdraws left there`);
     }
-    // Where a payment's Transfer log would start on Arbitrum: what proves later whether a signature that may exist ran.
+    // What tells later whether a signature that may exist ran, read before signing: where a payment's Transfer log
+    // would start on Arbitrum and the desk's EIP-3009 counter (EIP-3009); the message's blockhash bound (Solana).
     let arbBlock: bigint | null = null;
+    let counter: bigint | null = null;
     if (eip3009) {
       try {
         arbBlock = (await this.#o.arbitrum!.head()).number;
+        counter = (await this.#readNear()).counters?.eip3009Next ?? null;
       } catch (err) {
-        throw new StepFailed('sign', `the Arbitrum head could not be read before signing, so nothing was signed: ${errorMessage(err)}`);
+        throw new StepFailed('sign', `the Arbitrum head or the desk's counters on NEAR could not be read before signing, so nothing was signed: ${errorMessage(err)}`);
       }
+    }
+    let prepared: PreparedPayment | undefined;
+    if (payer.method === 'sol_sign_rescue') {
+      try {
+        prepared = await payer.prepare?.(q);
+      } catch (err) {
+        throw new StepFailed('sign', `the Solana message could not be built, so nothing was signed: ${errorMessage(err)}`);
+      }
+      // Without its blockhash's bound a signed Solana payment could never be shown dead: never signed then.
+      if (prepared?.solana === undefined) throw new StepFailed('sign', 'sol_sign_rescue gives no lastValidBlockHeight before signing, so nothing was signed');
     }
     this.#progress(run, 'sign');
     const signStart = this.#o.clock.now();
@@ -714,7 +788,10 @@ export class Rescuer {
     if (payer.method !== 'fund_venue') this.#cap.add(Number(q.amountInE8) / 1e8, signStart);
     this.#strandedE6 -= reserveE6;
     // Held from before the signature: a crash while signing or sending leaves it held after a restart.
-    const hold = this.#openHold(id, to, q, since, reserveE6, arbBlock, `rescue ${id} is paying ${q.depositAddress} (${payer.method}); it may be signed or sent`);
+    const hold = this.#openHold({
+      rescueId: id, venue: to, q, sinceMs: since, reservedE6: reserveE6, arbBlock, counter, solana: prepared?.solana ?? null,
+      why: `rescue ${id} is paying ${q.depositAddress} (${payer.method}); it may be signed or sent`,
+    });
     if (!this.#persist()) {
       this.#dropHold(hold);
       this.#strandedE6 += reserveE6;
@@ -722,10 +799,12 @@ export class Rescuer {
     }
     let signed: SignedPayment;
     try {
-      signed = await payer.sign(q, reason);
+      signed = await payer.sign(q, reason, prepared);
     } catch (err) {
       if (err instanceof OutcomeUnknown) {
         // It may have been signed: held, with what was set aside, until the chain shows it can never run.
+        hold.nearTx = err.tx.find((x) => x.chain === 'near')?.id ?? err.ids.nearTx ?? null;
+        if (hold.solana !== null) hold.solana.signature = err.ids.solSignature ?? null;
         this.#park(hold, `the ${payer.method} of rescue ${id} may have been signed or paid (${errorMessage(err)}); held until it is shown never to run or 1Click settles it`, { deadAt: null });
       } else {
         this.#dropHold(hold);
@@ -735,6 +814,8 @@ export class Rescuer {
       throw new StepFailed('sign', `${payer.method}: ${errorMessage(err)}`);
     }
     hold.authorization = signed.authorization ?? null;
+    hold.nearTx = signed.tx.find((x) => x.chain === 'near')?.id ?? null;
+    if (hold.solana !== null) hold.solana.signature = signed.solanaSignature ?? null;
     hold.why = `rescue ${id}'s signed ${payer.method} to ${q.depositAddress} is being sent`;
     this.#persist();
     run.tx.push(...signed.tx);
@@ -749,6 +830,7 @@ export class Rescuer {
       if (err instanceof OutcomeUnknown) {
         // No receipt, or the authorization already used: it may have run. Settled by 1Click, or once the chain shows
         // it never ran (an EIP-3009 authorization unused past validBefore).
+        if (hold.solana !== null) hold.solana.signature ??= err.ids.solSignature ?? null;
         this.#park(hold, `the ${payer.method} of rescue ${id} may have paid ${q.depositAddress} (${errorMessage(err)}); held until 1Click settles it or it is shown never to run`, { deadAt: null });
         this.#persist();
         throw new StepFailed('deposit', `${payer.method} deposit: ${errorMessage(err)}`);
@@ -781,7 +863,13 @@ export class Rescuer {
       last = s.status;
       if (!s.status.startsWith('unread')) hold.status = s.status;
       if (s.status === 'SUCCESS') return { q, deliveryTx: deliveryHashes(s.body), hold };
-      if (FINAL_STATUSES.includes(s.status)) {
+      if (s.status === 'INCOMPLETE_DEPOSIT') {
+        // Part of the money is at 1Click, which refunds it or waits for the rest: held until it settles.
+        this.#park(hold, `rescue ${id}'s deposit ${q.depositAddress} is INCOMPLETE_DEPOSIT at 1Click: what arrived is held there until 1Click refunds it`, null);
+        this.#persist();
+        throw new StepFailed('deposit', `1Click says INCOMPLETE_DEPOSIT: less than the quote's ${e8Text(q.amountInE8)} USDC reached ${q.depositAddress}; held until 1Click refunds it`);
+      }
+      if (SETTLED_STATUSES.includes(s.status)) {
         this.#dropHold(hold);
         this.#persist();
         const back = payer.method === 'fund_venue' ? 'the desk owner on NEAR'
@@ -877,10 +965,11 @@ export class Rescuer {
 
   // ---- holds ----
 
-  #openHold(rescueId: string, venue: VenueId, q: VerifiedQuote, sinceMs: number, reservedE6: bigint, arbBlock: bigint | null, why: string): DepositHold {
+  #openHold(h: HoldStart): DepositHold {
     const hold: DepositHold = {
-      why, rescueId, venue, q, sinceMs, heldAt: this.#o.clock.now(), reconcileSaid: false, paying: true, unsent: null, authorization: null,
-      arbBlock, scannedTo: null, paidLog: null, reservedE6, status: null,
+      why: h.why, rescueId: h.rescueId, venue: h.venue, q: h.q, sinceMs: h.sinceMs, heldAt: this.#o.clock.now(), reconcileSaid: false, paying: true,
+      unsent: null, authorization: null, arbBlock: h.arbBlock, scannedTo: null, paidLog: null, reservedE6: h.reservedE6, status: null,
+      counter: h.counter, nearTx: null, solana: h.solana === null ? null : { lastValidBlockHeight: h.solana.lastValidBlockHeight, signature: null },
     };
     this.#deposits.push(hold);
     return hold;
@@ -902,7 +991,7 @@ export class Rescuer {
   /** A final NEAR block's time and the desk's counters there; without a reader, the clock and no ring. */
   async #readNear(): Promise<NearRead> {
     const f = this.#o.near;
-    return f === undefined ? { height: 0, timeMs: this.#o.clock.now(), counters: null } : f();
+    return f === undefined ? { height: 0, timeMs: this.#o.clock.now(), counters: null, fund: null, fundError: 'no NEAR reader here' } : f();
   }
 
   /**
@@ -923,36 +1012,75 @@ export class Rescuer {
 
   /**
    * Whether a payment not known to be sent can never run, read on chain now (see the header): 'never-signed' (the
-   * contract never signed it and no longer can), 'dead' (it was or may have been signed, and can no longer run), or
-   * null (it may still run, or ran, or the chain could not tell).
+   * contract never counted it and no longer can), 'never-paid' (its NEAR transaction is final and paid nothing),
+   * 'dead' (it was or may have been signed, and can no longer run), or null (it may still run, or ran, or the chain
+   * could not tell). Time alone never answers.
    */
-  async #canNeverRun(d: DepositHold, evm: string): Promise<'never-signed' | 'dead' | null> {
+  async #canNeverRun(d: DepositHold, evm: string): Promise<'never-signed' | 'never-paid' | 'dead' | null> {
     const payable = payableUntilMs(d.q);
-    const near = await this.#readNear();
-    const c = near.counters;
-    // The ring answers only while it cannot have pushed this address out; fund_venue pays from a ring of its own.
-    const ring = c !== null && d.q.method !== 'fund_venue' && ringHolds(c, d.heldAt - CLOCK_SKEW_MS) ? c : null;
-    const entry = ring === null ? null : ringEntry(ring, depositKey(d.q.method, d.q.depositAddress));
-    const unsignable = near.timeMs >= payable + CHAIN_MARGIN_S * 1000;
-    if (d.q.method === 'evm_usdc_to_intents') {
-      const arb = this.#o.arbitrum;
-      if (arb === undefined) return null;
-      const head = await arb.head();
-      if (await this.#paid(d, evm, head)) return null;
-      const a = d.authorization;
-      if (a !== null) {
-        if (head.timestampS < a.validBefore + CHAIN_MARGIN_S) return null;
-        return (await arb.authorizationUsed(a.from, a.nonce, head.number)) ? null : 'dead';
+    const method = d.q.method;
+    // fund_venue: its transaction, known and found, says it all. Not found (never included, or the RPC cannot tell):
+    // the ring below, which releases only what was never counted.
+    if (method === 'fund_venue' && d.nearTx !== null && this.#o.nearTx !== undefined) {
+      const f = await this.#o.nearTx(d.nearTx).catch(() => null);
+      if (f !== null) {
+        if (!f.final) return null;
+        return f.ftTransfers.some((t) => t.to === d.q.depositAddress && t.amount === d.q.amountIn) ? null : 'never-paid';
       }
-      if (ring !== null && entry === null) return unsignable ? 'never-signed' : null;
-      // Neither a Transfer since the block before signing nor a time it could still run proves nothing without both.
-      if (d.arbBlock === null) return null;
-      if (entry !== null) return head.timestampS >= Math.floor(entry.paidMs / 1000) + EIP3009_VALIDITY_S + CHAIN_MARGIN_S ? 'dead' : null;
-      return head.timestampS * 1000 >= payable + NO_VIEW_SETTLE_MS ? 'dead' : null;
     }
-    if (ring !== null && entry === null) return unsignable ? 'never-signed' : null;
-    if (entry !== null) return near.timeMs >= entry.paidMs + SIGN_SETTLE_MS ? 'dead' : null;
-    return near.timeMs >= payable + NO_VIEW_SETTLE_MS ? 'dead' : null;
+    const near = await this.#readNear();
+    // Each method's own ring, which answers only while it cannot have pushed this address out.
+    const c = method === 'fund_venue' ? near.fund : near.counters;
+    const ring = c !== null && ringHolds(c, d.heldAt - CLOCK_SKEW_MS) ? c : null;
+    const entry = ring === null ? null : ringEntry(ring, depositKey(method, d.q.depositAddress));
+    if (ring !== null && entry === null) return near.timeMs >= payable + CHAIN_MARGIN_S * 1000 ? 'never-signed' : null;
+    if (method === 'fund_venue') {
+      // Counted (or not known not to be), with no transaction to read: its transfer may run late. Held for the owner.
+      return null;
+    }
+    if (method === 'sol_sign_rescue') return this.#solanaDead(d);
+    if (method !== 'evm_usdc_to_intents') return null;
+    const arb = this.#o.arbitrum;
+    if (arb === undefined) return null;
+    const head = await arb.head();
+    if (await this.#paid(d, evm, head)) return null;
+    const a = d.authorization;
+    if (a !== null) {
+      if (head.timestampS < a.validBefore + CHAIN_MARGIN_S) return null;
+      return (await arb.authorizationUsed(a.from, a.nonce, head.number)) ? null : 'dead';
+    }
+    // Neither a Transfer since the block before signing nor a time it could still run proves nothing without both.
+    if (d.arbBlock === null) return null;
+    const past = entry !== null
+      ? head.timestampS >= Math.floor(entry.paidMs / 1000) + EIP3009_VALIDITY_S + CHAIN_MARGIN_S
+      : head.timestampS * 1000 >= payable + NO_VIEW_SETTLE_MS;
+    if (!past) return null;
+    return (await this.#noncesUnused(near.counters, d, evm, head)) ? 'dead' : null;
+  }
+
+  /**
+   * An EIP-3009 hold with no authorization in hand: every nonce the contract may have signed since the counter read
+   * before signing (up to eip3009_next) is unused at `head`, so no authorization of it ran whatever the logs show.
+   * True with nothing to read (no counter or no view: the bound alone); false with too many to read or no desk id.
+   */
+  async #noncesUnused(c: NearDeskCounters | null, d: DepositHold, evm: string, head: ArbitrumHead): Promise<boolean> {
+    if (d.counter === null || c === null) return true;
+    if (this.#deskId === null || c.eip3009Next - d.counter > NONCES_READ) return false;
+    for (let n = d.counter; n < c.eip3009Next; n++) {
+      if (await this.#o.arbitrum!.authorizationUsed(evm, eip3009Nonce(this.#deskId, n), head.number)) return false;
+    }
+    return true;
+  }
+
+  /** A sol_sign_rescue that may be signed: dead once Solana's finalized height is past its blockhash's and its signature is unknown there. */
+  async #solanaDead(d: DepositHold): Promise<'dead' | null> {
+    const s = d.solana;
+    const sol = this.#o.solana;
+    // No bound or no signature to look for: only the owner can tell.
+    if (s === null || s.signature === null || sol === undefined) return null;
+    // Height first: past it, no later block can include the transaction, so a status read after is the last word.
+    if ((await sol.finalizedHeight()) <= s.lastValidBlockHeight) return null;
+    return (await sol.signatureKnown(s.signature)) ? null : 'dead';
   }
 
   /** The desk's Arbitrum address at the latest block: the head, then the balance at that block. */
@@ -1055,7 +1183,7 @@ export class Rescuer {
           this.#seen.add(entry.id);
           settled = `rescue ${d.rescueId}'s ${entry.usd.toFixed(2)} USD landed on ${d.venue} late (after its rescue was failed)`;
         }
-      } else if (FINAL_STATUSES.includes(s.status)) {
+      } else if (SETTLED_STATUSES.includes(s.status)) {
         settled = `rescue ${d.rescueId}'s transfer ended ${s.status} at 1Click: refunded, nothing landed`
           + `${d.q.method === 'evm_usdc_to_intents' ? ' (the refund on the desk\'s Arbitrum address is not counted as the rescuer\'s own: the owner moves it)' : ''}`;
       } else if (s.status === 'PENDING_DEPOSIT' && d.unsent !== null) {
@@ -1064,8 +1192,12 @@ export class Rescuer {
         const verdict = await this.#canNeverRun(d, evm).catch(() => null);
         const now = this.#o.clock.now();
         if (verdict === 'never-signed') {
-          settled = `rescue ${d.rescueId}'s ${d.q.method} was never signed: the desk's deposit ring on NEAR does not hold ${d.q.depositAddress}, `
+          settled = `rescue ${d.rescueId}'s ${d.q.method} was never signed: the desk's ${d.q.method === 'fund_venue' ? 'fund_venue' : 'deposit'} ring on NEAR does not hold ${d.q.depositAddress}, `
             + `and the contract signs that quote only until ${new Date(payableUntilMs(d.q)).toISOString()}, so nothing can pay it`;
+          giveBack = true;
+        } else if (verdict === 'never-paid') {
+          settled = `rescue ${d.rescueId}'s fund_venue transaction ${d.nearTx} is final and transferred nothing to ${d.q.depositAddress}: `
+            + 'nothing can pay it (any USDC it took is back in the desk\'s idle USDC)';
           giveBack = true;
         } else if (verdict === null) {
           d.unsent.deadAt = null;
@@ -1085,7 +1217,8 @@ export class Rescuer {
         const t = this.#o.clock.now();
         if (!d.reconcileSaid && t - d.heldAt >= RECONCILE_AFTER_MS) {
           d.reconcileSaid = true;
-          const line = `reconcile needed: rescue ${d.rescueId}'s deposit ${d.q.depositAddress} (${d.q.method}, ${e8Text(d.q.amountInE8)} USDC in, at least ${e8Text(d.q.minAmountOutE8)} out to ${d.venue}) `
+          const ids = `${d.nearTx === null ? '' : `, NEAR tx ${d.nearTx}`}${d.solana?.signature == null ? '' : `, Solana signature ${d.solana.signature}`}`;
+          const line = `reconcile needed: rescue ${d.rescueId}'s deposit ${d.q.depositAddress} (${d.q.method}, ${e8Text(d.q.amountInE8)} USDC in, at least ${e8Text(d.q.minAmountOutE8)} out to ${d.venue}${ids}) `
             + `is ${s === null ? 'unread' : s.status} at 1Click after ${Math.round((t - d.heldAt) / 60_000)} min; transfers stay held until it is settled. To clear it by hand once reconciled: ${this.#clearHow()}`;
           this.#log(line);
           this.#journalLine(line, d.venue);
@@ -1123,6 +1256,7 @@ export class Rescuer {
         unsent: h.paying ? { deadAt: null } : h.unsent === null ? null : { deadAt: h.unsent.deadAt },
         authorization: h.authorization, arbBlock: h.arbBlock === null ? null : BigInt(h.arbBlock), scannedTo: h.scannedTo === null ? null : BigInt(h.scannedTo),
         paidLog: h.paidLog, reservedE6: BigInt(h.reservedE6), status: h.status,
+        counter: h.counter === null ? null : BigInt(h.counter), nearTx: h.nearTx, solana: h.solana === null ? null : { ...h.solana },
       });
     }
     this.#strandedE6 = BigInt(s.hl.strandedE6);
@@ -1144,6 +1278,7 @@ export class Rescuer {
         paying: d.paying, unsent: d.unsent === null ? null : { deadAt: d.unsent.deadAt }, authorization: d.authorization,
         arbBlock: d.arbBlock === null ? null : d.arbBlock.toString(), scannedTo: d.scannedTo === null ? null : d.scannedTo.toString(), paidLog: d.paidLog,
         reservedE6: d.reservedE6.toString(), status: d.status,
+        counter: d.counter === null ? null : d.counter.toString(), nearTx: d.nearTx, solana: d.solana === null ? null : { ...d.solana },
       })),
       hl: { strandedE6: this.#strandedE6.toString(), inFlight: f === null ? null : saveWithdraw(f), expired: this.#expired.map(saveWithdraw) },
       cap: this.#cap.entries(now),

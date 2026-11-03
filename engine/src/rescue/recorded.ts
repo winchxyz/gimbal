@@ -16,6 +16,7 @@ import { DECIMALS, parseTimeMs } from './oneclick.ts';
 import { eip3009Nonce } from '../contract/replay-client.ts';
 import { HL_BRIDGE2, SimulatedArbitrum } from './arbitrum-chain.ts';
 import { SimulatedNear } from './near-chain.ts';
+import { SimulatedSolana } from './solana-chain.ts';
 import type { Source } from './plan.ts';
 import type { CreditPort, HlWithdrawPort, LandingPort, Payer, RescueDesk, SignedPayment } from './rescuer.ts';
 
@@ -132,6 +133,9 @@ export class SimulatedMoney {
   readonly arbitrum: SimulatedArbitrum;
   /** The desk's counters on NEAR as the rescuer reads them (RescuerOptions.near): a signature writes the ring. */
   readonly near: SimulatedNear;
+  /** Solana as the rescuer reads it (RescuerOptions.solana): a sent sol_sign_rescue lands its signature. */
+  readonly solana: SimulatedSolana;
+  #signatures = 0;
   /** Called once a delivery shows (replay raises the scripted leg's margin by it). */
   onCredit: ((venue: VenueId, usd: number) => void) | null = null;
   readonly #credited = new Set<string>();
@@ -145,6 +149,7 @@ export class SimulatedMoney {
     this.#deskId = desk.deskId;
     this.arbitrum = new SimulatedArbitrum(clock);
     this.near = new SimulatedNear(clock);
+    this.solana = new SimulatedSolana(clock);
   }
 
   get reserveSpentUsd(): number {
@@ -154,15 +159,21 @@ export class SimulatedMoney {
   payer(method: QuotedMethod, targetOf: (q: VerifiedQuote) => VenueId): Payer {
     return {
       method,
+      // A Solana message's recent blockhash is good for about 150 blocks (60 s), as on mainnet.
+      ...(method === 'sol_sign_rescue' ? { prepare: async () => ({ solana: { lastValidBlockHeight: this.solana.heightNow() + 150 } }) } : {}),
       sign: async (q: VerifiedQuote): Promise<SignedPayment> => {
         const eip3009 = method === 'evm_usdc_to_intents';
         const authorization = eip3009 ? { from: this.#deskEvm, nonce: eip3009Nonce(this.#deskId, this.#nonces++), validBefore: Math.floor(this.#clock.now() / 1000) + 300 } : undefined;
-        // fund_venue's ring has no view; the rescue methods' signature writes the desk's deposit ring.
-        if (method !== 'fund_venue') this.near.spend(method, q.depositAddress);
+        // fund_venue writes its own ring; the rescue methods' signature writes the desk's deposit ring.
+        if (method === 'fund_venue') this.near.fundSpend(q.depositAddress);
+        else this.near.spend(method, q.depositAddress);
+        const signature = method === 'sol_sign_rescue' ? `simulated-solana-${++this.#signatures}` : undefined;
         return {
           tx: [],
           ...(authorization === undefined ? {} : { authorization, usableUntilMs: authorization.validBefore * 1000 }),
+          ...(signature === undefined ? {} : { solanaSignature: signature }),
           send: async () => {
+            if (signature !== undefined) this.solana.land(signature);
             if (authorization !== undefined) {
               this.arbitrum.transfer(this.#deskEvm, q.depositAddress, q.amountIn);
               this.arbitrum.markUsed(authorization.from, authorization.nonce);

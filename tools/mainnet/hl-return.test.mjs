@@ -897,7 +897,7 @@ test('the rescuer\'s lock: held by a live rescuer, --send refuses before anythin
   });
   assert.equal(s.error, null, s.error?.stack);
   assert.match(s.out, /\nlock {6}.* taken for this run: no live rescuer of the desk can start until it ends\n/);
-  assert.match(during ?? '', /another live rescuer \(or tools\/mainnet\/hl-return\.mjs\) holds/);
+  assert.match(during ?? '', /another live rescuer \(or tools\/mainnet\/hl-return\.mjs or fund\.mjs\) holds/);
   assert.equal(w.seen.sent.length, 1);
   // Released when the run ends.
   const after = await locks.acquireRescueLock(name);

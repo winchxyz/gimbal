@@ -609,6 +609,10 @@ about 6.3), 0.7 free on the owner for the desk, and 0.3 NEAR free on the owner p
    `hl_set_referrer` and `hl_approve_builder_fee`. The same command with `solana 8` funds the Phoenix leg (the
    Solana authority also needs a little SOL, which 1Click does not send); `orderly` needs the pinned receiver and
    at least 7 USDC.
+   `--send` takes the live rescuer's lock of the contract and desk for its whole run, as `hl-return.mjs` does
+   (step 9), and refuses before reading anything or signing while a rescuer holds it: the rescuer's reserve route
+   is `fund_venue` too, with the same idle USDC, `fund_venue` ring and hourly cost budget. Stop the rescuer first;
+   one started meanwhile refuses to start. The dry run prints whether the lock is held.
 
 8. **Withdraw** 5 USDC back to the owner:
 

@@ -10,13 +10,18 @@
 // Arbitrum, a withdraw still on its way and those that never showed (their Hyperliquid transactions and amounts), the
 // cap meter's sliding hour, and the ledger entries and Arbitrum logs already matched. Everything in it is public on
 // chain or at 1Click once signed: no key, no secret. Version 2 (the quote's deadline, the scanned blocks, the
-// withdraws' transactions); a version 1 file is unusable like any other and is reconciled by hand.
+// withdraws' transactions, a hold's pre-sign EIP-3009 counter, NEAR transaction and Solana lastValidBlockHeight and
+// signature); a version 1 file is unusable like any other and is reconciled by hand.
 //
 // A file that is missing, cannot be read, names another contract, desk or EVM address, or does not pass
 // parseRescueState is never taken as "no holds": the rescuer then holds every transfer and says so (rescuer.ts).
-// A first run needs GIMBAL_RESCUE_FRESH=<contract>/<desk>, which writes an empty state.
+// A first run needs GIMBAL_RESCUE_FRESH=<contract>/<desk>, which writes an empty state. Serve allows it only
+// FRESH_WAIT_MS (65 min) after the desk's last trace in the state directory (freshEvidence): a state file of the desk
+// (any EVM address, a crash's temp file) or the marker the first refused FRESH writes. A NEAR call a stopped rescuer
+// sent may still land until its quote's signedAt + 65 min, and nothing on chain shows it before it lands, so with no
+// trace at all the wait starts at that first FRESH. The marker is removed once a first run is allowed.
 
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 import type { TxRef } from '@gimbal/shared';
 import type { Mode, VenueId } from '@gimbal/shared';
@@ -97,6 +102,12 @@ export interface SavedHold {
   reservedE6: string;
   /** 1Click's last status for the deposit address (null: not read yet). */
   status: string | null;
+  /** EIP-3009: the desk's eip3009_next before signing (null: no view); every nonce from it on is read before a release. */
+  counter: string | null;
+  /** The NEAR transaction of the payment's call, once known: a fund_venue's final outcome says whether it paid. */
+  nearTx: string | null;
+  /** sol_sign_rescue: its message's lastValidBlockHeight (saved before signing) and the transaction's signature once known. */
+  solana: { lastValidBlockHeight: number; signature: string | null } | null;
 }
 
 export interface SavedWithdraw {
@@ -220,6 +231,13 @@ function parseHold(v: unknown, path: string): SavedHold {
     arbBlock: nullable(h.arbBlock, `${path}.arbBlock`, units), scannedTo: nullable(h.scannedTo, `${path}.scannedTo`, units),
     paidLog: nullable(h.paidLog, `${path}.paidLog`, nonEmpty),
     reservedE6: units(h.reservedE6, `${path}.reservedE6`), status: nullable(h.status, `${path}.status`, str),
+    counter: nullable(h.counter, `${path}.counter`, units), nearTx: nullable(h.nearTx, `${path}.nearTx`, nonEmpty),
+    solana: nullable(h.solana, `${path}.solana`, (v, p) => {
+      const s = obj(v, p);
+      const lv = s.lastValidBlockHeight;
+      if (typeof lv !== 'number' || !Number.isSafeInteger(lv) || lv < 0) bad(`${p}.lastValidBlockHeight`, 'not a block height');
+      return { lastValidBlockHeight: lv, signature: nullable(s.signature, `${p}.signature`, nonEmpty) };
+    }),
   };
 }
 
@@ -362,8 +380,7 @@ export class RescueStateStore {
       for (let attempt = 1; ; attempt++) {
         try {
           this.#rename(tmp, this.path);
-          syncDir(dirname(this.path));
-          return;
+          break;
         } catch (err) {
           if (attempt >= this.#tries || !RETRIED_RENAME.has((err as NodeJS.ErrnoException).code ?? '')) throw err;
           pause(50 * attempt);
@@ -377,6 +394,8 @@ export class RescueStateStore {
       }
       throw err;
     }
+    // After the rename, never inside its retry: a failed directory fsync must not rename again a temp file that is gone.
+    syncDir(dirname(this.path));
   }
 
   /** Temporary files a crash left next to the state file (only one engine runs per desk: lock.ts). */
@@ -397,4 +416,56 @@ export class RescueStateStore {
       }
     }
   }
+}
+
+/** What the state directory shows of a desk's earlier rescuers, for serve's GIMBAL_RESCUE_FRESH check (see the header). */
+export interface FreshEvidence {
+  /** The directory looked in. */
+  dir: string;
+  /** This identity's own state file exists (a first run is then not one: the rescuer loads it). */
+  stateExists: boolean;
+  /** The newest trace: a state file of the desk (any EVM address, or a temp file), or the marker; null: none. */
+  last: { ms: number; file: string } | null;
+  /** Writes the marker now, unless one is there (its time is when the wait began). */
+  mark(): void;
+  /** Removes the marker. */
+  clear(): void;
+}
+
+/** The desk's traces in `dir` (see FreshEvidence). Unreadable entries count as no trace only when they are gone. */
+export function freshEvidence(dir: string, mode: Mode, id: RescueIdentity): FreshEvidence {
+  const own = rescueStateFile(dir, mode, id);
+  const stem = `rescue-${mode}-${id.contractId}-${id.deskId}-0x`;
+  const marker = join(dir, `rescue-${mode}-${id.contractId}-${id.deskId}.fresh`);
+  let names: string[] = [];
+  try {
+    names = readdirSync(dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+  let last: FreshEvidence['last'] = null;
+  for (const n of names) {
+    const desk = n.startsWith(stem) && /^0x[0-9a-f]{40}\.json(\.\d+\.tmp)?$/.test(n.slice(stem.length - 2));
+    if (!desk && join(dir, n) !== marker) continue;
+    const ms = statSync(join(dir, n)).mtimeMs;
+    if (last === null || ms > last.ms) last = { ms, file: join(dir, n) };
+  }
+  return {
+    dir, stateExists: names.includes(basename(own)), last,
+    mark: () => {
+      mkdirSync(dir, { recursive: true });
+      try {
+        writeFileSync(marker, 'Gimbal: the first GIMBAL_RESCUE_FRESH of this desk was refused at this file\'s time; a first run may start 65 min later.\n', { flag: 'wx' });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      }
+    },
+    clear: () => {
+      try {
+        unlinkSync(marker);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      }
+    },
+  };
 }

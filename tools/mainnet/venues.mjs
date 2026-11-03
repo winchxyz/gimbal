@@ -56,7 +56,8 @@ export const CANARY_LIMITS = {
  * withdraw fee needs about 10.5 USDC sent to stay within the engine's 10 % fee share, which weighs about 21 USD.
  * Every rescue pays only the desk's own pinned addresses, so the cap bounds what rescues may cost in fees, not what
  * could be taken. The engine's rescue sizes per route at these limits are in engine/src/rescue/plan.ts (out of
- * Hyperliquid 10.39 to 24.31 USD). The hourly rescue cost budget stays max(50 x 3 %, 2 x 1) = 2 USD.
+ * Hyperliquid 10.39 to 24.31 USD). The hourly rescue cost budget is 2 + 4 x 1 = 6 USD after C10 round 2:
+ * max(50 x 3 %, 2 x 1) = 2, plus RESCUE_VENUE_FEES_PER_HOUR (4) fees of 1 USD each.
  */
 export const FINAL_LIMITS = { ...CANARY_LIMITS, rescue_cap_usd_per_hour: 50 };
 

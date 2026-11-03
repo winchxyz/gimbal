@@ -53,7 +53,7 @@ test('two processes: the second is refused while the first holds the lock, and t
   const name = testName();
   const lock = await acquireRescueLock(name);
   assert.equal(await lockHeld(name), true);
-  await assert.rejects(acquireRescueLock(name), /another live rescuer \(or tools\/mainnet\/hl-return\.mjs\) holds .*one per desk/, 'refused in this process too');
+  await assert.rejects(acquireRescueLock(name), /another live rescuer \(or tools\/mainnet\/hl-return\.mjs or fund\.mjs\) holds .*one per desk/, 'refused in this process too');
   assert.match(otherProcess(name), /^refused: another live rescuer .* holds /);
   await lock.release();
   assert.equal(await lockHeld(name), false, 'free on release');

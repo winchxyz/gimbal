@@ -23,6 +23,17 @@ const snapshot = (): RescueSnapshot => ({
     },
     sinceMs: 1_700_000_000_000, heldAt: 1_700_000_100_000, reconcileSaid: false, paying: false, unsent: { deadAt: null },
     authorization: { from: '0xabc', nonce: '0x01', validBefore: 1_700_000_300 }, arbBlock: '123456', scannedTo: '123500', paidLog: null, reservedE6: '20000000', status: 'PROCESSING',
+    counter: '4', nearTx: 'NearTx111', solana: null,
+  }, {
+    why: 'rescue p was paying dep-2 (sol_sign_rescue) when the engine stopped', rescueId: 'p', venue: 'hyperliquid',
+    quote: {
+      method: 'sol_sign_rescue', quote: '{"amount":"5000000"}', signature: 'ed25519:def', depositAddress: 'dep-2', amountIn: '5000000', amountInE8: '500000000',
+      amountOut: '490000000', minAmountOut: '480000000', minAmountOutE8: '480000000', destinationAsset: 'x', recipient: '0xabc', costE8: '10000000',
+      signedAtMs: 1_700_000_000_000, deadlineMs: 1_700_001_800_000, timeEstimateS: null,
+    },
+    sinceMs: 1_700_000_000_000, heldAt: 1_700_000_100_000, reconcileSaid: true, paying: false, unsent: { deadAt: 1_700_000_200_000 },
+    authorization: null, arbBlock: null, scannedTo: null, paidLog: null, reservedE6: '0', status: null,
+    counter: null, nearTx: null, solana: { lastValidBlockHeight: 350_000_000, signature: '5sig' },
   }],
   hl: {
     strandedE6: '1060000',
@@ -137,6 +148,11 @@ test('anything a save does not write makes the file unusable, never "no holds"',
     ['a withdraw with no block', (s) => { delete ((s.hl as Record<string, unknown>).inFlight as Record<string, unknown>).fromBlock; }, /inFlight\.fromBlock/],
     ['no cap list', (s) => { delete s.cap; }, /state\.cap/],
     ['a cap entry with no time', (s) => { (s.cap as Record<string, unknown>[])[0]!.at = 'soon'; }, /cap\[0\]\.at/],
+    ['a pre-sign counter that is not a count', (s) => { hold0(s).counter = '-2'; }, /holds\[0\]\.counter/],
+    ['no counter field', (s) => { delete hold0(s).counter; }, /holds\[0\]\.counter/],
+    ['an empty NEAR transaction', (s) => { hold0(s).nearTx = ''; }, /holds\[0\]\.nearTx/],
+    ['a Solana hold with no lastValidBlockHeight', (s) => { delete ((s.holds as Record<string, unknown>[])[1]!.solana as Record<string, unknown>).lastValidBlockHeight; }, /holds\[1\]\.solana\.lastValidBlockHeight/],
+    ['a Solana block height that is not an integer', (s) => { ((s.holds as Record<string, unknown>[])[1]!.solana as Record<string, unknown>).lastValidBlockHeight = 1.5; }, /solana\.lastValidBlockHeight/],
   ];
   for (const [name, spoil, why] of bad) {
     const s = full();
