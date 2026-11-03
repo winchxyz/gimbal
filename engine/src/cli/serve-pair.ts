@@ -42,8 +42,8 @@
 // chains, read twice alike. The transitions are journaled and the venue's health says slow or down meanwhile. Only
 // a ConfigError (a bad env, a contract on another network) stops the start. The trader lock is part of the start:
 // one held by a live other process degrades the pair the same way and is tried again (never an exit, which would
-// crash-loop under the host's restart policy), and a stale one (its process gone, or this pid before a container
-// restart) is taken over and journaled. While the start is not confirmed a pair may be open with nothing protecting it:
+// crash-loop under the host's restart policy), and a stale one (its process gone, an earlier boot, or this pid with no
+// heartbeat for LOCK_STALE_MS: a killed container) is taken over and journaled. The holder's lock beats until stop(). While the start is not confirmed a pair may be open with nothing protecting it:
 // serve's monitor asks `monitor()` every 30 min for the "pair unprotected" line, journaled at most hourly.
 
 import type { ContractPolicy, Mode, StreamEvent, TxRef } from '@gimbal/shared';
