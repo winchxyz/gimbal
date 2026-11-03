@@ -102,7 +102,8 @@ export interface CarryResult {
 
 /** pair-mainnet's open and close (pair-ops.ts) on one pair's legs, sending through its ProtectedPair. */
 export interface SlotCarry {
-  open(request: { legUsd: number; leverage: number; reason: string; qty?: string }, out: CarryOut): Promise<CarryResult>;
+  /** `gate`: why nothing may be sent now (a rescue, an ADL unwind or panic_close running), checked again before each part. */
+  open(request: { legUsd: number; leverage: number; reason: string; qty?: string; gate?: () => string | null }, out: CarryOut): Promise<CarryResult>;
   close(request: { reason: string }, out: CarryOut): Promise<CarryResult>;
 }
 
@@ -198,8 +199,16 @@ export interface PairHands {
   heldSymbol(): string | null;
   /** Each leg's venue and position the trader holds (its baseline), signed; null = not known; none when no pair. */
   heldLegs(): { venue: string; qty: bigint | null }[];
-  /** pair-mainnet open on `symbol`, short Hyperliquid and long Phoenix: refusals first, then maker first. */
-  open(request: { symbol: string; legUsd: number; leverage: number; reason: string; qty?: string }): Promise<HandsResult>;
+  /**
+   * pair-mainnet open on `symbol`, short Hyperliquid and long Phoenix: refusals first, then maker first. `gate` is
+   * asked again right before the first order and before each later part: a reason refuses (or stops) the open there.
+   */
+  open(request: { symbol: string; legUsd: number; leverage: number; reason: string; qty?: string; gate?: () => string | null }): Promise<HandsResult>;
+  /**
+   * The trader's record against its last live reads (reconcileWithVenues): when they disagree on one leg or flat, two
+   * agreeing venue reads that confirm it are adopted as the record. The line says what changed; null: nothing did.
+   */
+  reconcile(): Promise<string | null>;
   /** pair-mainnet close of the pair held, reduce-only, maker first. */
   close(request: { reason: string }): Promise<HandsResult>;
 }
@@ -258,6 +267,10 @@ interface Slot {
   suspend(on: boolean): void;
   /** After an open: legs moved outside the trader (finish()'s residual hedge) are adopted when they offset. */
   readopt(): Promise<string | null>;
+  /** The trader's record against its last live reads; see PairHands.reconcile. */
+  reconcile(): Promise<string | null>;
+  /** Orders added to the in-flight book since the pair started (a throw is judged by it moving). */
+  signedOrders(): number;
   /** Ends this pair's trader, watch and timers (the lock and readers stay with serve). */
   end(): void;
 }
@@ -399,14 +412,14 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       let pp: ProtectedPair | null = null;
       let watch: AdlWatch | null = null;
       const guard = (index: 0 | 1) => ({
-        index, live: trades, stopped: () => stopped, now: () => input.clock.now(), opening: () => pp?.opening === true,
+        index, live: trades, stopped: () => stopped, now: () => input.clock.now(), opening: () => pp?.openingHere === true,
         beforeSign: (o: Parameters<InFlightBook['add']>[0]) => book.add(o, save),
       });
       const trader = new PairTrader({
         legs: [new GuardedLeg(legs.hl, guard(0)), new GuardedLeg(legs.phoenix, guard(1))],
         priceBandBps: policy.price_band_bps, clock: input.clock, log: (line) => log(`pair      ${line}`),
         // Only the strategy loop's open opens (ProtectedPair.openInChunks), and never while the pair is paused after an ADL.
-        openBlocked: () => (pp?.opening !== true ? 'serve opens a pair only through the strategy loop (auto, or POST /rotate)' : watch?.paused ?? null),
+        openBlocked: () => (pp?.openingHere !== true ? 'serve opens a pair only through the strategy loop (auto, or POST /rotate)' : watch?.paused ?? null),
         onWatch: (w) => {
           // The check's orders are in the trader's state now: they leave the book in the same save.
           book.watchRecorded();
@@ -514,6 +527,14 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           pq.adopt(now);
           return `adopted ${signedQtyString(now[0])} and ${signedQtyString(now[1])} ${sym} after the residual hedge`;
         },
+        reconcile: () => reconcileWithVenues({
+          trader, symbol: sym, sleep, confirmMs: START_CONFIRM_MS,
+          idle: () => (pq.closing || stopped || !trades() ? 'not idle' : book.orders.length > 0 ? 'orders in flight'
+            : trader.legs.some((l) => trader.unsettled(l) !== null) || legs.hl.pendingMakerOrders().length > 0 ? 'an order may still run' : null),
+          signed: () => book.signed,
+          adopt: (read) => pq.adopt(read),
+        }),
+        signedOrders: () => book.signed,
         end: () => {
           ended = true;
           live = false;
@@ -624,11 +645,15 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       const why = blocked();
       if (why !== null) return Promise.resolve(result(false, why));
       // A throw after orders went out is not "nothing signed": the trader's record moved, or the pair holds a position.
-      const trader = current?.trader ?? null;
+      // An order the trader signed whose result was never recorded moves the book's count, not the epoch (review S4).
+      const slot = current;
+      const trader = slot?.trader ?? null;
       const epoch = trader?.baselineEpoch ?? null;
+      const signed = slot?.signedOrders() ?? 0;
       const heldBefore = heldSymbol();
       const op = run().catch((err: unknown) => {
-        const moved = (trader !== null && trader.baselineEpoch !== epoch) || (current !== null && current.trader !== trader) || heldSymbol() !== heldBefore;
+        const moved = (trader !== null && trader.baselineEpoch !== epoch) || current !== slot || (slot !== null && slot.signedOrders() !== signed)
+          || heldSymbol() !== heldBefore;
         return result(false, `${moved ? 'stopped with orders out' : 'not done'}: ${errorMessage(err)}`, moved ? { sent: true } : {});
       }).finally(() => {
         operation = null;
@@ -678,7 +703,10 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         }
         if (!slot.live()) return result(false, `alert only: ${slot.pp.why ?? 'not live'}`);
         const { lines: said, opens, out } = collect();
-        const r = await slot.carry.open({ legUsd: request.legUsd, leverage: request.leverage, reason: request.reason, ...(request.qty === undefined ? {} : { qty: request.qty }) }, out);
+        const r = await slot.carry.open({
+          legUsd: request.legUsd, leverage: request.leverage, reason: request.reason,
+          ...(request.qty === undefined ? {} : { qty: request.qty }), ...(request.gate === undefined ? {} : { gate: request.gate }),
+        }, out);
         if (r.refusals.length > 0) return result(false, `open refused, nothing signed: ${r.refusals.join('; ')}`, { lines: said, open: opens });
         const again = await slot.readopt().catch((err: unknown) => `not adopted after the residual hedge: ${errorMessage(err)}`);
         if (again !== null) log(`pair      ${again}`);
@@ -688,8 +716,27 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         const reason = ok
           ? `${sym} opened: ${opened.map((x) => x.size).join(' + ')} a leg${last !== undefined && last.status !== 'open' ? ` (the last part ended ${last.status})` : ''}`
           : `${sym} not opened: ${last === undefined ? 'no part was sent' : `${last.status}${last.notes.length > 0 ? ` (${last.notes.join('; ')})` : ''}`}`;
-        return result(ok, reason, { results: r.results, lines: said, open: opens, ...summarise(r.results) });
+        // Orders went out when a part sent any (a part the gate stopped before its first order sent none).
+        const sent = r.results.some((x) => x.legs.some((l) => l.orders.length > 0)) || heldSymbol() !== null;
+        return result(ok, reason, { results: r.results, lines: said, open: opens, sent, ...summarise(r.results) });
       }),
+      reconcile: async () => {
+        const slot = current;
+        if (slot === null || blocked() !== null) return null;
+        // One at a time with the loop's open and close: nothing of the loop is sent while the legs are read.
+        let line: string | null = null;
+        const op = slot.reconcile().then((l) => {
+          line = l;
+          return result(true, l ?? 'the record and the venues agree');
+        }).catch((err: unknown) => result(false, `not reconciled: ${errorMessage(err)}`)).finally(() => {
+          operation = null;
+        });
+        operation = op;
+        const r = await op;
+        if (!r.ok) log(`pair      ${r.reason}`);
+        if (line !== null) log(`pair      ${line}`);
+        return line;
+      },
       close: (request) => exclusive(async () => {
         const slot = current;
         if (slot === null || heldSymbol() === null) return result(false, 'no pair is held: nothing to close');
@@ -807,7 +854,11 @@ function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string; phoen
         out.say(held.line);
         plan = { ...plan, size: held.qty };
       }
-      return { refusals: [], results: await sendOpen(ctx, pair, plan, request.reason) };
+      // Review F2: the reads and plans above take seconds after the loop's gate; a rescue that started meanwhile
+      // refuses the open here, before the first order, and stops it before each later part (sendOpen's beforePart).
+      const gated = request.gate?.() ?? null;
+      if (gated !== null) return { refusals: [`${gated}: nothing sent`], results: [] };
+      return { refusals: [], results: await sendOpen(ctx, pair, plan, request.reason, request.gate === undefined ? {} : { gate: request.gate }) };
     },
     close: async (request, out) => {
       const ctx = await ctxFor(out);
@@ -870,6 +921,55 @@ function phoenixHeld(raw: unknown): string[] {
 }
 
 /** Both legs read twice START_CONFIRM_MS apart until two reads agree (START_READ_TRIES at most); throws otherwise. */
+/** What both legs hold, in words: both flat, one leg open, both open; null when either is unknown. */
+export function legsShape(a: bigint | null | undefined, b: bigint | null | undefined): 'flat' | 'one leg' | 'pair' | null {
+  const x = a === undefined ? 0n : a;
+  const y = b === undefined ? 0n : b;
+  if (x === null || y === null) return null;
+  const open = Number(x !== 0n) + Number(y !== 0n);
+  return open === 0 ? 'flat' : open === 1 ? 'one leg' : 'pair';
+}
+
+/**
+ * Review F1. The record (the baselines: what the last open, close or adoption left each leg meaning to hold) can say
+ * "pair" while the venues hold one leg (an IOC with no answer lapses as never run, then the unwind of its partner
+ * fails), or while both are flat. heldSymbol and heldLegs read the record, so such a pair would be held and never
+ * closed, or every exit refused "nothing to close". When no order of ours can still move a leg, the trader's last live
+ * reads (`known`) decide: when they say one leg or flat and the record does not, two venue reads a few seconds apart
+ * must agree with each other and with that shape, and are then adopted as the record (the unhedged alert stays set
+ * when they do not offset). Anything else (an order that may run, reads that differ, the venues holding a pair after
+ * all, an order of ours meanwhile) changes nothing.
+ */
+export async function reconcileWithVenues(p: {
+  trader: PairTrader; symbol: string; sleep: (ms: number) => Promise<void>; confirmMs: number;
+  /** Why the legs may move by an order of ours now (nothing is reconciled then), or null. */
+  idle: () => string | null;
+  /** The in-flight book's count of orders added: one sent while the legs were read voids the reads. */
+  signed: () => number;
+  adopt: (read: [bigint, bigint]) => void;
+}): Promise<string | null> {
+  const { trader } = p;
+  if (p.idle() !== null || trader.busy) return null;
+  const [a, b] = trader.legs;
+  const record = legsShape(trader.baseline(a), trader.baseline(b));
+  const live = legsShape(trader.known(a), trader.known(b));
+  if (live === null || live === record || live === 'pair') return null;
+  const epoch = trader.baselineEpoch;
+  const signed = p.signed();
+  const first = await Promise.all(trader.legs.map((l) => l.position()));
+  await p.sleep(p.confirmMs);
+  const second = await Promise.all(trader.legs.map((l) => l.position()));
+  if (first[0] !== second[0] || first[1] !== second[1]) return null;
+  const read: [bigint, bigint] = [second[0]!, second[1]!];
+  if (legsShape(read[0], read[1]) !== live) return null;
+  // An order of ours, a result or an adopt meanwhile: the reads may hold it.
+  if (p.idle() !== null || trader.busy || trader.baselineEpoch !== epoch || p.signed() !== signed) return null;
+  const text = (q: readonly (bigint | null | undefined)[]) => q.map((x) => (x === null || x === undefined ? 'unknown' : signedQtyString(x))).join(' and ');
+  const was = text([trader.baseline(a), trader.baseline(b)]);
+  p.adopt(read);
+  return `${p.symbol} record reconciled with the venues: it said ${record ?? 'unknown'} (${was}), two reads agree on ${live} (${text(read)}) and are adopted${live === 'one leg' ? '; the single leg is closed reduce-only next' : ''}`;
+}
+
 async function readTwice(legs: [TradeLeg, TradeLeg], sleep: (ms: number) => Promise<void>, log: (line: string) => void): Promise<[bigint, bigint]> {
   let last = '';
   for (let i = 0; i < START_READ_TRIES; i++) {

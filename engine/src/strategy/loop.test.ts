@@ -595,3 +595,45 @@ test('hold: journaled on a change of category and once per hourly check, with th
   // The adoption says since=now is an assumption.
   assert.match(journal(w).find((j) => j.numbers.action === 'adopt')!.summary, /held since now is an assumption/);
 });
+
+test('F1: each check asks the hands to check their record against the venues first; a correction is journaled and acted on', async () => {
+  const w = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 } });
+  const hands = fakeHands(w);
+  let fix: string | null = null;
+  hands.reconcile = async () => {
+    const line = fix;
+    if (line !== null) w.held = { symbol: 'SOL', legUsd: 500, pnlUsd: 0, oneLeg: { venue: 'hyperliquid', qty: '-5' } };
+    fix = null;
+    return line;
+  };
+  const loop = makeLoop(w, tmpStore(), { hands });
+  await loop.check();
+  assert.equal(journal(w).filter((j) => j.numbers.action === 'reconcile').length, 0);
+  fix = 'SOL record reconciled with the venues: it said pair (-5 and 5), two reads agree on one leg (-5 and 0) and are adopted';
+  w.now += 60_000;
+  await loop.check();
+  const r = journal(w).find((j) => j.numbers.action === 'reconcile')!;
+  assert.equal(r.kind, 'error');
+  assert.match(r.summary, /two reads agree on one leg/);
+  // The same check closes the single leg, reduce-only.
+  assert.equal(w.closes.length, 1);
+  assert.match(w.closes[0]!, /one leg open: hyperliquid -5/);
+});
+
+test('F2: an open its own gate stopped (nothing sent, a rescue now running) is tried again next check, no hold-off', async () => {
+  const w = world();
+  w.openAnswer = () => {
+    w.busy = 'rescue r-4 runs';
+    return { ok: false, reason: 'open refused, nothing signed: rescue r-4 runs: nothing sent', sent: false, tx: [], feeUsd: 0, open: [] };
+  };
+  const loop = makeLoop(w);
+  w.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  await loop.check();
+  assert.equal(w.opens.length, 1);
+  w.busy = null;
+  w.openAnswer = () => OK('opened both legs');
+  w.now += 60_000;
+  await loop.check();
+  assert.equal(w.opens.length, 2, 'not held off for RETRY_AFTER_MS');
+  assert.equal(loop.held?.windowId, 'sol-phoenix-hyperliquid');
+});
