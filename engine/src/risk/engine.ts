@@ -122,8 +122,11 @@ export interface RiskEngineOptions {
   intervalMs?: number;
   /** The ADL watch (serve's pair may change under it: serve-pair.ts passes one that follows the pair held now). */
   adl?: Pick<AdlWatch, 'check' | 'stop'>;
-  /** E9: takes a trigger and runs the rescue, then calls rescueEnded. Without it the trigger is published at `detect`. */
-  rescuer?: (trigger: RescueTrigger) => void;
+  /**
+   * E9: takes a trigger and runs the rescue, then calls rescueEnded. Without it, or when it answers false (not taken:
+   * serve's live rescuer is not running yet, rescue-retry.ts), the trigger is published at `detect`.
+   */
+  rescuer?: (trigger: RescueTrigger) => void | boolean;
   /** E9: the id of the rescue the rescuer is running now; a running rescue never lapses (a real one can take 10 min). */
   rescuerRunning?: () => string | null;
   log?: (line: string) => void;
@@ -458,14 +461,16 @@ export class RiskEngine {
     if (this.#o.rescuer !== undefined) {
       // A rescuer that throws must not end the tick (the ADL check and the cleanup of legs that left rescue follow):
       // the trigger counts as failed, so it is tried again after the backoff.
+      let taken = true;
       try {
-        this.#o.rescuer(trigger);
+        taken = this.#o.rescuer(trigger) !== false;
       } catch (err) {
         this.#rescues.get(k)!.endedAt = t;
         this.#log(`rescue ${trigger.id}: the rescuer threw: ${errorMessage(err)}`);
         this.#journal({ t, kind: 'error', summary: `rescue ${trigger.id} of ${v.leg.venue} ${v.leg.symbol} could not start: ${errorMessage(err)}`, numbers: { venue: v.leg.venue }, tx: [] });
+        return;
       }
-      return;
+      if (taken) return;
     }
     const progress: RescueProgress = {
       id: trigger.id, from: trigger.from, to: trigger.venue, amountUsd, step: 'detect', startedAt: t, elapsedS: 0, tx: [],

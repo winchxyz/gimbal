@@ -47,8 +47,11 @@ export interface ServeLoopInput {
   lastDesk: () => DeskState | null;
   /** The desk's venue accounts, for free margin (none in replay without a contract). */
   accounts: { venue: string; read: () => Promise<AccountState> }[];
-  /** A live rescuer runs (mainnet with GIMBAL_RESCUE=1): the venues LIVE_RESCUE names have a route. */
-  rescueLive: boolean;
+  /**
+   * A live rescuer runs (mainnet with GIMBAL_RESCUE=1): the venues LIVE_RESCUE names have a route. A function in serve:
+   * the live rescuer may start late, after a failed start read (rescue-retry.ts).
+   */
+  rescueLive: boolean | (() => boolean);
   busy: () => string | null;
   /**
    * Why no order may go out now, for an open already past the loop's gate (a rescue, fund_venue included; an ADL
@@ -105,7 +108,7 @@ export function serveLoop(input: ServeLoopInput): StrategyLoop {
       }));
       return out;
     },
-    liveRescue: () => Object.fromEntries(LOOP_VENUES.map((v) => [v, input.rescueLive && LIVE_RESCUE[v] === true])),
+    liveRescue: () => Object.fromEntries(LOOP_VENUES.map((v) => [v, (typeof input.rescueLive === 'function' ? input.rescueLive() : input.rescueLive) && LIVE_RESCUE[v] === true])),
     ...(facts === undefined ? {} : { facts }),
     busy, store, publish: input.publish, clock: input.clock, log: input.log,
     ...(input.decide === undefined ? {} : { decide: input.decide }),
