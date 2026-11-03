@@ -3,7 +3,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { JournalEntry } from '@gimbal/shared';
 import { proofLinks } from '../journal/entry.ts';
-import { DAYS_SHOWN, countsOf, filterCounts, foldOlder, groupByDay, mergeEntries, rowOf } from '../journal/model.ts';
+import { KINDS } from '../journal/kinds.ts';
+import { DAYS_SHOWN, countsOf, filterCounts, foldOlder, groupByDay, mergeEntries, pageCounts, rowOf, visibleFeed } from '../journal/model.ts';
 import { parseJournal } from './api.ts';
 import { fakeDesk, fakeLatest } from './fake-desk.ts';
 import { fakeTx } from './fake-explorer.ts';
@@ -77,6 +78,34 @@ test('the fake entries pass the parser the engine’s read goes through', async 
   const read = await fakeJournalRead('normal', 'mainnet')();
   assert.equal(read.length, 20);
   assert.deepEqual(parseJournal({ journal: JSON.parse(JSON.stringify(read)) }), read);
+});
+
+test('the page the fake shows (read + stream, rescues on as by default): the header counts exactly the signed entries the filters list', async () => {
+  const actions: StreamAction[] = [];
+  startFakeStream((a) => actions.push(a), { mode: 'mainnet', intervalMs: 60_000, drift: false, rescue: 'idle' })();
+  const live = actions.reduce(reduceStream, initialStreamState()).journal;
+  const page = mergeEntries(await fakeJournalRead('normal', 'mainnet')(), live);
+  // The journal's $120 rescue is the stream's newest earlier rescue: listed once.
+  assert.equal(page.filter((e) => e.summary.startsWith('Moved $120.00')).length, 1);
+  const { shown } = visibleFeed(page, null);
+  const { filters, signed } = pageCounts(shown);
+  const signedIds = shown.filter((e) => KINDS[e.kind].signed).map((e) => e.id);
+  assert.equal(signed, signedIds.length);
+  assert.equal(filters.all, shown.length);
+  assert.deepEqual([filters.all, signed], [22, 8]);
+  assert.deepEqual(signedIds, [
+    'fake-j-rescue', 'fake-j-withdraw', 'fake-latest-open', 'fake-latest-rotate',
+    'fake-rescue-earlier-2', 'fake-rescue-earlier-3', 'fake-j-ltc-open', 'fake-j-deposit',
+  ]);
+  // Every signed entry sits under a filter: Trades, Money in and out or Rescue.
+  assert.equal(signed, filters.trades + filters.money + filters.rescue);
+
+  // A reader scrolled down: a new signed entry waits, and the header waits with the filters.
+  const frozen = new Set(shown.map((e) => e.id));
+  const open = shown.find((e) => e.id === 'fake-latest-open') as JournalEntry;
+  const held = visibleFeed(mergeEntries(page, [{ ...open, id: 'fake-new-open', t: Date.now() + 60_000 }]), frozen);
+  assert.equal(held.pending, 1);
+  assert.deepEqual(pageCounts(held.shown), { filters, signed });
 });
 
 test('the scenarios: empty reads nothing, error fails like a timeout, loading never answers', async () => {

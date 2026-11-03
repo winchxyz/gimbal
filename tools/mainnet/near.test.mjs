@@ -197,6 +197,25 @@ test('DeleteAccount: borsh as near-api-js, its fee in the gas cap, the beneficia
   assert.match(lines, /DeleteAccount: the account g\.near is deleted; its whole NEAR balance goes to the beneficiary f\.near/);
 });
 
+test('DeleteKey: borsh as near-api-js, its fee in the gas cap, the key printed; only an ed25519 key', () => {
+  // near-api-js 7.3.1: createTransaction('owner.near', <7 x 32>, 'owner.near', 5n, [actions.deleteKey(<9 x 32>)], <1 x 32>).
+  const vector = '0a0000006f776e65722e6e65617200070707070707070707070707070707070707070707070707070707070707070705000000000000000a0000006f776e65722e6e65617201010101010101010101010101010101010101010101010101010101010101010100000006000909090909090909090909090909090909090909090909090909090909090909';
+  const bytes = encodeTransaction({ signerId: 'owner.near', publicKey: SIGNER, nonce: 5n, receiverId: 'owner.near', blockHash: BLOCK, actions: [act.deleteKey(OP_KEY)] });
+  assert.equal(bytes.toString('hex'), vector);
+  assert.throws(() => act.deleteKey('ed25519:short'), /is not an ed25519 public key/);
+  assert.throws(() => act.deleteKey(`secp256k1:${b58encode(Buffer.alloc(64, 9))}`), /is not an ed25519 public key/);
+  // The mainnet fee, EXPERIMENTAL_protocol_config on 2026-11-03 (protocol 86).
+  const del = { execution: 94946625000, send_not_sir: 94946625000, send_sir: 94946625000 };
+  const cfg = structuredClone(PROTOCOL_CONFIG);
+  assert.throws(() => txGasCap(feesOf(cfg), { signer: 'o.near', receiver: 'o.near', actions: [act.deleteKey(OP_KEY)] }), /no delete_key_cost/);
+  cfg.runtime_config.transaction_costs.action_creation_config.delete_key_cost = del;
+  const cap = txGasCap(feesOf(cfg), { signer: 'o.near', receiver: 'o.near', actions: [act.deleteKey(OP_KEY)] });
+  assert.equal(cap.prepaid, 0n);
+  assert.equal(cap.total, 108_059_500_000n * 2n + 94_946_625_000n * 2n);
+  const lines = describeTx('tx', { signer: 'o.near', signedBy: 'its key', receiver: 'o.near', actions: [act.deleteKey(OP_KEY)] }).join('\n');
+  assert.ok(lines.includes(`action 1  DeleteKey ${OP_KEY}: the access key is removed from o.near`), lines);
+});
+
 test('borsh transactions match near-api-js: an AddKey with a FunctionCall permission, create_account, deploy + new', () => {
   const tx = (signerId, receiverId, nonce, actions) => encodeTransaction({ signerId, publicKey: SIGNER, nonce, receiverId, blockHash: BLOCK, actions }).toString('hex');
   assert.equal(tx('owner.near', 'owner.near', 7n, [act.functionCallKey(OP_KEY, 'gimbal-canary.near', ['set_paused', 'hl_order', 'orderly_request'], 5n * NEAR)]), VECTORS.addKey);

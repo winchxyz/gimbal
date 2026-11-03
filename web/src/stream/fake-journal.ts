@@ -1,11 +1,13 @@
 // Development only: the Journal's fake data, shaped exactly like the shared types. The entries follow the mockup
 // (design/screens/desktop/journal.html): the days, the kinds, the reasons, the amounts, the links. Every value is
 // made up. The three newest entries come from fake-desk.ts, which the Desk's "Latest" shows as well; this file adds
-// the older ones, dated from `now` the way the mockup dates them from 27 Oct 14:02.
+// the older ones, dated from `now` the way the mockup dates them from 27 Oct 14:02. The rescue is fake-rescue.ts's
+// newest earlier rescue, which the fake stream sends too: the page merges the two by id, so it lists it once.
 import type { JournalEntry, Mode } from '@gimbal/shared';
 import type { EngineApi } from './api.ts';
 import { fakeLatest } from './fake-desk.ts';
 import { fakeTx } from './fake-explorer.ts';
+import { fakeJournalRescue } from './fake-rescue.ts';
 
 const MIN = 60_000;
 const HOUR = 3_600_000;
@@ -72,14 +74,7 @@ function older(now: number, mode: Mode): JournalEntry[] {
       numbers: { symbol: 'ZRO', code: 'E_ORACLE_STALE' },
       tx: [near('Cw7r', 'bE9n')],
     },
-    {
-      id: 'fake-j-rescue',
-      t: before(now, 0, 19, 18),
-      kind: 'rescue',
-      summary: 'Moved $120.00 to Hyperliquid margin. The short had come within 13.8% of liquidation after DOGE rose 4.1%.',
-      numbers: { usd: -0.31, from: 'reserve', signedS: 6.1, landedS: 52 },
-      tx: [near('Lq3v', '8kRd'), solana('4uZp', 'Qe1x')],
-    },
+    fakeJournalRescue(now, mode),
     {
       id: 'fake-j-settle-26',
       t: before(now, 0, 38, 2),

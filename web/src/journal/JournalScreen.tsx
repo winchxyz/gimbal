@@ -12,11 +12,10 @@ import {
   actionsText,
   attributionOf,
   costsUsd,
-  countsOf,
   entriesIn,
-  filterCounts,
   foldOlder,
   groupByDay,
+  pageCounts,
   sinceLabel,
   visibleFeed,
 } from './model.ts';
@@ -78,13 +77,13 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
   }, [scrolled]);
 
   const { shown, pending } = useMemo(() => visibleFeed(entries, frozen), [entries, frozen]);
-  const counts = useMemo(() => filterCounts(shown), [shown]);
+  // The header, the filters and the side column all count the same entries: the ones on the page (pageCounts).
+  const { filters: counts, signed } = useMemo(() => pageCounts(shown), [shown]);
   const listed = useMemo(() => entriesIn(shown, filter), [shown, filter]);
   const groups = useMemo(() => groupByDay(listed, now), [listed, now]);
   const { shown: days, fold } = useMemo(() => (expanded ? { shown: groups, fold: null } : foldOlder(groups)), [groups, expanded]);
 
-  const signed = countsOf(entries).signed;
-  const attribution = attributionOf(desk?.pnl ?? null, entries);
+  const attribution = attributionOf(desk?.pnl ?? null, shown);
   const costs = costsUsd(attribution);
 
   const showNew = () => {
@@ -121,7 +120,7 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
 
       <div className="j-summary j-phone">
         <div>
-          <span>{sinceLabel(entries)}</span>
+          <span>{sinceLabel(shown)}</span>
           <span>{money(attribution.netUsd)}</span>
         </div>
         <div>
@@ -157,7 +156,7 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
             <Older {...paging} />
           )}
         </section>
-        <Side entries={entries} desk={desk} windows={windows} />
+        <Side entries={shown} desk={desk} windows={windows} />
       </div>
     </div>
   );

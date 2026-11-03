@@ -61,6 +61,10 @@ export const NOT_AVAILABLE = /Quoting for this pair is not available/i;
 export const CALL_TGAS = 300;
 /** What refresh_prices attaches to the oracle from the contract's balance (contract/src/prices.rs ORACLE_DEPOSIT). */
 export const ORACLE_DEPOSIT = 20n * 10n ** 21n;
+/** The gas refresh_prices gives request_price_data and on_prices, and its skip window (contract/src/prices.rs). */
+export const REQUEST_PRICE_DATA_TGAS = 200;
+export const ON_PRICES_TGAS = 15;
+export const REFRESH_SKIP_MS = 30_000;
 /** AddOrderlyKey's lifetime the engine asks for (engine/src/venues/orderly-actions.ts ORDERLY_KEY_LIFETIME_MS). */
 export const KEY_LIFETIME_MS = 364 * 86_400_000;
 export const RECEIVER_REASON = 'look up the Orderly receiver address';
@@ -158,9 +162,11 @@ export function refreshPlan({ contract, signer, signedBy, assets = CANARY_SYMBOL
   const actions = [act.call('refresh_prices', { assets }, CALL_TGAS, 0n)];
   const lines = describeTx('tx: refresh_prices (operator key)', { signer, signedBy, receiver: contract, actions });
   lines.push(`  then      ${contract} -> ${ORACLE} request_price_data ${JSON.stringify({ asset_ids: assets.map((a) => ORACLE_IDS[a]) })}`
-    + `, deposit ${nearText(ORACLE_DEPOSIT)} NEAR from the contract's balance (the oracle refunds it when its cache is fresh)`);
-  lines.push(`            -> ${contract}.on_prices ${JSON.stringify({ assets })} stores each newer price (there is no oracle_call fallback: `
-    + 'if request_price_data fails, nothing new is stored and the call returns false)');
+    + `, ${REQUEST_PRICE_DATA_TGAS} TGas plus all unused gas, deposit ${nearText(ORACLE_DEPOSIT)} NEAR from the contract's balance`
+    + ' (the oracle refunds it when its cache is fresh)');
+  lines.push(`            -> ${contract}.on_prices ${JSON.stringify({ assets })}, ${ON_PRICES_TGAS} TGas: stores each newer price; returns true when every`
+    + ' asset got one, false when one did not or request_price_data failed');
+  lines.push(`            (no oracle call, and true at once, when every asset was stored or asked for under ${REFRESH_SKIP_MS / 1000} s ago)`);
   return { actions, lines };
 }
 

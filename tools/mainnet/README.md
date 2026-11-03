@@ -697,6 +697,16 @@ about 6.3), 0.7 free on the owner for the desk, and 0.3 NEAR free on the owner p
      late authorization is valid until block time + 300 s: do not rerun before then. The contract's deposit ring
      refuses a deposit address paid before, and USDC refuses an authorization used before.
 
+## Access keys
+
+`node tools/mainnet/keys.mjs list <owner>.near` prints every access key of an account with its permission: FullAccess,
+or FunctionCall with the receiver (and whether that account exists and has code), the methods and the allowance left.
+It only reads. `node tools/mainnet/keys.mjs delete <owner>.near <public_key> --key-file <owner key json>` plans one
+DeleteKey and signs nothing; add `--send`, from the main checkout, to send it. It refuses a key the account does not
+have, a full-access key, and at `--send` a key file that is not a full-access key of the account or that is the key
+to delete. Use it to remove an operator key whose contract was retired (receiver `gimbal-canary.near`): a retired
+name can be registered again by anyone.
+
 ## Files the scripts write
 
 All of them are gitignored and are written in the main checkout only (never in a linked worktree). None is ever

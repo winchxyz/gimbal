@@ -23,6 +23,8 @@ export const ORACLE_ASSETS: Readonly<Record<string, string>> = {
   SOL: '22.contract.portalbridge.near',
   DOGE: 'doge.omft.near',
   LTC: 'ltc.omft.near',
+  XLM: 'xlm',
+  ZEC: 'zec.omft.near',
 };
 const PRICED = Object.keys(ORACLE_ASSETS);
 
@@ -75,7 +77,7 @@ The desk is delta-neutral: it holds one long and one short perpetual leg of the 
 
 Answer with one JSON object and nothing else, with these keys. Use null for anything the owner did not say. Never guess a number they did not give. Percentages are plain numbers without the % sign.
 
-- "symbols": the assets the owner wants to trade, as upper-case tickers ("ETH", "BTC"). Write only assets they name. Only ETH, BTC, SOL, DOGE and LTC have an oracle price.
+- "symbols": the assets the owner wants to trade, as upper-case tickers ("ETH", "BTC"). Write only assets they name. Only ETH, BTC, SOL, DOGE, LTC, XLM and ZEC have an oracle price.
 - "venues": the venues the owner limits trading to, from "hyperliquid", "phoenix", "orderly"; null when they do not limit them.
 - "max_notional_usd": the most USD per leg.
 - "leg_usd": the USD size of each leg to open. When the owner gives one amount per leg ("at most $500 per leg", "$500 legs"), put it in both max_notional_usd and leg_usd.
@@ -238,7 +240,7 @@ export interface BuildContext {
 }
 
 const ALIASES: Readonly<Record<string, string>> = {
-  BITCOIN: 'BTC', XBT: 'BTC', ETHER: 'ETH', ETHEREUM: 'ETH', SOLANA: 'SOL', DOGECOIN: 'DOGE', LITECOIN: 'LTC',
+  BITCOIN: 'BTC', XBT: 'BTC', ETHER: 'ETH', ETHEREUM: 'ETH', SOLANA: 'SOL', DOGECOIN: 'DOGE', LITECOIN: 'LTC', STELLAR: 'XLM', ZCASH: 'ZEC',
 };
 
 /** A ticker from the model: "$eth", "ETH-PERP", "PERP_ETH_USDC" and "Ethereum" are all ETH; null if it is no ticker. */

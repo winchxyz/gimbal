@@ -67,7 +67,12 @@ test('the fixed sentence, against its recorded reply, becomes the ETH/BTC draft 
 test('only the contract\'s oracle assets can be priced', () => {
   assert.deepEqual(ORACLE_ASSETS, {
     ETH: 'eth.bridge.near', BTC: 'nbtc.bridge.near', SOL: '22.contract.portalbridge.near', DOGE: 'doge.omft.near', LTC: 'ltc.omft.near',
+    XLM: 'xlm', ZEC: 'zec.omft.near',
   });
+  // The prompt names the same seven (contract/core/src/oracle.rs ORACLE_ASSETS).
+  assert.ok(SYSTEM_PROMPT.includes('Only ETH, BTC, SOL, DOGE, LTC, XLM and ZEC have an oracle price.'));
+  assert.equal(normalizeSymbol('Stellar'), 'XLM');
+  assert.equal(normalizeSymbol('zcash'), 'ZEC');
   assert.equal(normalizeSymbol(' $eth '), 'ETH');
   assert.equal(normalizeSymbol('Bitcoin'), 'BTC');
   assert.equal(normalizeSymbol('PERP_SOL_USDC'), 'SOL');
