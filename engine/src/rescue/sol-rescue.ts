@@ -39,7 +39,7 @@ import { solanaTxRef } from '../relayer/tx.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { Clock } from '../venues/venue.ts';
 import type { VerifiedQuote } from './oneclick.ts';
-import type { CreditPort, LandingPort, LedgerEntry, Payer, PreparedPayment, SignedPayment } from './rescuer.ts';
+import type { CreditOptions, CreditPort, LandingPort, LedgerEntry, Payer, PreparedPayment, SignedPayment } from './rescuer.ts';
 
 /** Solana's largest transaction, bytes: one signature (65) and the message. */
 const MAX_TX_BYTES = 1232;
@@ -55,7 +55,11 @@ export interface PhoenixDesk {
 export interface PhoenixRescueOptions {
   chain: SolanaChain;
   desk: () => Promise<PhoenixDesk>;
-  /** Phoenix collateral the trader may withdraw now, USDC base units (throws when the trader cannot be read). */
+  /**
+   * Phoenix collateral the trader may withdraw now, USDC base units (throws when the trader cannot be read). Serve
+   * passes the reader's freeMarginUsd, an approximation: a withdraw it overstates fails the unsigned simulation below,
+   * and a failed simulation is a refusal, so nothing is signed on it.
+   */
   withdrawable: () => Promise<bigint>;
   exchange?: PhoenixExchangeAccounts;
 }
@@ -269,7 +273,21 @@ export class PhoenixDeskCredit implements CreditPort {
     return null;
   }
 
-  async credit(amountE6: bigint, reason: string, deliveryTx: readonly string[] = []): Promise<{ tx: TxRef[] }> {
+  /** The desk's Solana USDC now (0 when its account does not exist yet), read before a rescue's payment. */
+  async baseline(): Promise<bigint> {
+    const desk = await this.#o.desk();
+    return (await this.#o.chain.tokenBalance(desk.accounts.usdcAta)) ?? 0n;
+  }
+
+  /** The owner's command that deposits USDC left on the desk's Solana wallet into Phoenix margin. */
+  manual(amountE6: bigint): string {
+    return `stop serve if it trades this desk (it holds the trader lock), then from the main checkout run pair-mainnet fund-phoenix ${usdcText(amountE6)} (dry), then again with --send`;
+  }
+
+  async credit(amountE6: bigint, reason: string, options: CreditOptions = {}): Promise<{ tx: TxRef[] }> {
+    const deliveryTx = options.deliveryTx ?? [];
+    // The delivery counts above what the account held before the payment (dust or an earlier delivery is not it).
+    const base = options.baseE6 ?? 0n;
     const desk = await this.#o.desk();
     const a = desk.accounts;
     // 1Click's SUCCESS names the delivery on Solana: it must be there, then the USDC on the desk's account.
@@ -281,9 +299,10 @@ export class PhoenixDeskCredit implements CreditPort {
     const until = this.#o.clock.now() + (this.#o.deliveryTimeoutMs ?? 120_000);
     for (;;) {
       const held = await this.#o.chain.tokenBalance(a.usdcAta).catch(() => null);
-      if (held !== null && held >= amountE6) break;
+      if (held !== null && held >= base + amountE6) break;
+      if (options.stopping?.() === true) throw new Error('the engine is stopping while the delivery was awaited: nothing was deposited');
       if (this.#o.clock.now() >= until) {
-        throw new Error(`the desk USDC account ${a.usdcAta} holds ${held === null ? 'nothing (or could not be read)' : `${usdcText(held)} USDC`}, under the ${usdcText(amountE6)} delivered: nothing was deposited`);
+        throw new Error(`the desk USDC account ${a.usdcAta} holds ${held === null ? 'nothing (or could not be read)' : `${usdcText(held)} USDC`}, under the ${usdcText(base)} before the payment plus the ${usdcText(amountE6)} delivered: nothing was deposited`);
       }
       await this.#o.sleep(this.#o.pollMs ?? 3_000);
     }

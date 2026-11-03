@@ -991,6 +991,11 @@ transaction history: a held `sol_sign_rescue` is released on it. serve probes it
 and the other routes still run. Into HyperCore 1Click delivers at least 1.31 USDC, so about 1.65 USDC is the least
 sent there.
 
+A reserve -> Phoenix delivery that reaches the desk's Solana USDC account with no deposit after it (serve stopped
+while 1Click was still working, or the deposit failed) waits there, outside margin. The journal says so in an
+`owner: rescue ... waits on the desk's phoenix wallet` line with the amount; the rescuer never deposits it later.
+Stop serve, run `pair-mainnet fund-phoenix <usdc>` (dry, then `--send`), start serve again.
+
 Before the Phoenix routes can run on a desk (the owner runs each step; the dry run below says which are still
 missing):
 

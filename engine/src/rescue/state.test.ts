@@ -33,7 +33,7 @@ const snapshot = (): RescueSnapshot => ({
     },
     sinceMs: 1_700_000_000_000, heldAt: 1_700_000_100_000, reconcileSaid: true, paying: false, unsent: { deadAt: 1_700_000_200_000 },
     authorization: null, arbBlock: null, scannedTo: null, paidLog: null, reservedE6: '0', status: null,
-    counter: null, nearTx: null, solana: { lastValidBlockHeight: 350_000_000, signature: '5sig' },
+    counter: null, nearTx: null, solana: { lastValidBlockHeight: 350_000_000, signature: '5sig' }, creditBaseE6: '400000',
   }],
   hl: {
     strandedE6: '1060000',
@@ -70,6 +70,20 @@ test('a save is read back exactly with its identity, says how to clear a hold, a
   assert.deepEqual(readdirSync(join(dir, 'sub')), ['rescue.json']);
   const raw = JSON.parse(readFileSync(store.path, 'utf8')) as { _readme: string };
   assert.ok(raw._readme.includes(MANUAL_CLEAR) && /a missing file holds every transfer/.test(raw._readme));
+});
+
+test('a hold saved before creditBaseE6 existed loads without it; a wrong one makes the file unusable', () => {
+  const dir = tmp();
+  const store = new RescueStateStore(join(dir, 'rescue.json'), ID);
+  store.save(snapshot());
+  const loaded = store.load();
+  assert.ok(loaded.kind === 'loaded');
+  assert.equal(loaded.state.holds[0]!.creditBaseE6, undefined, 'an older hold: no baseline');
+  assert.equal(loaded.state.holds[1]!.creditBaseE6, '400000');
+  const raw = JSON.parse(readFileSync(store.path, 'utf8')) as { holds: { creditBaseE6?: unknown }[] };
+  raw.holds[1]!.creditBaseE6 = -1;
+  writeFileSync(store.path, JSON.stringify(raw));
+  assert.equal(store.load().kind, 'unusable');
 });
 
 test('a file of another contract, desk or desk EVM address is unusable, never "no holds"', () => {

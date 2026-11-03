@@ -99,6 +99,7 @@ import { OutcomeUnknown } from '../contract/types.ts';
 import type { RescueTrigger } from '../risk/engine.ts';
 import type { PairResult } from '../trade/pair.ts';
 import type { TradeLeg } from '../trade/legs.ts';
+import { NothingExecuted } from '../relayer/tx.ts';
 import { abs, floorToLot, qtyString } from '../trade/lots.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { Clock } from '../venues/venue.ts';
@@ -201,8 +202,21 @@ export interface CreditPort {
    * that lands where no deposit can follow is not started.
    */
   ready?(): Promise<string | null>;
-  /** `deliveryTx`: the delivery's transactions as 1Click's SUCCESS names them (destinationChainTxHashes). */
-  credit(amountE6: bigint, reason: string, deliveryTx?: readonly string[]): Promise<{ tx: TxRef[] }>;
+  /** What the venue's wallet holds now, x 1e6: read just before a hold opens and saved with it (the delivery counts above it). */
+  baseline?(): Promise<bigint>;
+  /** How the owner moves `amountE6` left waiting on the venue's wallet into margin (the rescuer never does it late). */
+  manual?(amountE6: bigint): string;
+  credit(amountE6: bigint, reason: string, options?: CreditOptions): Promise<{ tx: TxRef[] }>;
+}
+
+/** What a credit is told besides the amount. */
+export interface CreditOptions {
+  /** The delivery's transactions as 1Click's SUCCESS names them (destinationChainTxHashes). */
+  deliveryTx?: readonly string[];
+  /** What the venue's wallet held before the payment (null: not read): the delivery counts above it. */
+  baseE6?: bigint | null;
+  /** True once serve is stopping: a credit still waiting for the delivery gives up with nothing signed. */
+  stopping?: () => boolean;
 }
 
 /** A delivery as the target venue's ledger booked it. */
@@ -218,8 +232,9 @@ export interface LandingPort {
   /** Why a landing on `venue` cannot be confirmed here, or null. */
   confirms(venue: VenueId): string | null;
   /**
-   * The entry that is this delivery: on `venue`, booked since `sinceMs`, at least minAmountOut, not one of `seen`;
-   * the one whose hash is among `deliveryTx` (1Click's destinationChainTxHashes) first, when 1Click names it.
+   * The entry that is this delivery: on `venue`, booked since `sinceMs` (when the payment's hold opened, just before
+   * its signature), at least minAmountOut, not one of `seen`; the one whose hash is among `deliveryTx` (1Click's
+   * destinationChainTxHashes) first, when 1Click names it.
    */
   find(venue: VenueId, q: VerifiedQuote, sinceMs: number, seen: ReadonlySet<string>, deliveryTx?: readonly string[]): Promise<LedgerEntry | null>;
 }
@@ -336,6 +351,8 @@ interface DepositHold {
   nearTx: string | null;
   /** sol_sign_rescue: lastValidBlockHeight of its message, and its signature once known. */
   solana: { lastValidBlockHeight: number; signature: string | null } | null;
+  /** Into a venue with a credit (Phoenix): what the desk's wallet there held before the payment, x 1e6 (null: not read). */
+  creditBaseE6: bigint | null;
   /** fund_venue: the proof its transaction paid nothing, as last read (for the journal; not saved). */
   noPay?: string;
 }
@@ -350,6 +367,7 @@ interface HoldStart {
   arbBlock: bigint | null;
   counter: bigint | null;
   solana: { lastValidBlockHeight: number } | null;
+  creditBaseE6: bigint | null;
   why: string;
 }
 
@@ -843,6 +861,19 @@ export class Rescuer {
       // Without its blockhash's bound a signed Solana payment could never be shown dead: never signed then.
       if (prepared?.solana === undefined) throw new StepFailed('sign', 'sol_sign_rescue gives no lastValidBlockHeight before signing, so nothing was signed');
     }
+    // Into a venue with a credit, the delivery is counted above what the desk's wallet there holds now (USDC already
+    // on it is not the delivery). Saved with the hold, so it survives a restart.
+    let creditBaseE6: bigint | null = null;
+    const credit = this.#o.credit?.[to];
+    if (credit?.baseline !== undefined) {
+      try {
+        creditBaseE6 = await credit.baseline();
+      } catch (err) {
+        throw new StepFailed('sign', `the desk's ${to} wallet could not be read before signing, so nothing was signed: ${errorMessage(err)}`);
+      }
+    }
+    // Read again after the awaits above: nothing is held or signed once the engine is stopping.
+    if (this.#stopping) throw new StepFailed('sign', 'the engine is stopping: nothing was signed');
     this.#progress(run, 'sign');
     const signStart = this.#o.clock.now();
     // The contract counts a rescue transfer once the MPC network signs, even if it is never sent.
@@ -850,7 +881,7 @@ export class Rescuer {
     this.#strandedE6 -= reserveE6;
     // Held from before the signature: a crash while signing or sending leaves it held after a restart.
     const hold = this.#openHold({
-      rescueId: id, venue: to, q, sinceMs: since, reservedE6: reserveE6, arbBlock, counter, solana: prepared?.solana ?? null,
+      rescueId: id, venue: to, q, sinceMs: since, reservedE6: reserveE6, arbBlock, counter, solana: prepared?.solana ?? null, creditBaseE6,
       why: `rescue ${id} is paying ${q.depositAddress} (${payer.method}); it may be signed or sent`,
     });
     if (!this.#persist()) {
@@ -895,6 +926,13 @@ export class Rescuer {
         this.#park(hold, `the ${payer.method} of rescue ${id} may have paid ${q.depositAddress} (${errorMessage(err)}); held until 1Click settles it or it is shown never to run`, { deadAt: null });
         this.#persist();
         throw new StepFailed('deposit', `${payer.method} deposit: ${errorMessage(err)}`);
+      }
+      if (err instanceof NothingExecuted && payer.method === 'sol_sign_rescue') {
+        // The submitter's proof: the transaction landed and failed, or its blockhash expired with the signature not on
+        // chain. That signed message can never run again, and the deposit ring takes the quote once: released.
+        this.#dropHold(hold);
+        this.#persist();
+        throw new StepFailed('deposit', `${payer.method} can never pay ${q.depositAddress} (${errorMessage(err)}): its hold is released`);
       }
       // Signed is enough to pay: the signature is public (in the NEAR receipt) and anyone may send it while it is valid.
       const until = signed.usableUntilMs ?? this.#o.clock.now() + SIGNED_USABLE_MS;
@@ -961,24 +999,28 @@ export class Rescuer {
       // Signing the deposit now could be cut off by the exit: the USDC waits on the venue's wallet instead.
       this.#dropHold(hold);
       this.#persist();
+      this.#ownerLine(this.#waitingOnWallet(run.trigger.id, to, q, 'the engine stopped before the deposit'), to);
       throw new StepFailed('deposit', `the engine is stopping: 1Click delivered at least ${e8Text(q.minAmountOutE8)} USDC to the desk's ${to} wallet, not moved into margin (a deposit moves it)`);
     }
     if (credit !== undefined) {
       try {
-        const { tx } = await credit.credit(q.minAmountOut, `rescue ${run.trigger.id}: the delivered USDC into ${to} margin`, deliveryTx);
+        const { tx } = await credit.credit(q.minAmountOut, `rescue ${run.trigger.id}: the delivered USDC into ${to} margin`, {
+          deliveryTx, baseE6: hold.creditBaseE6, stopping: () => this.#stopping,
+        });
         run.tx.push(...tx);
       } catch (err) {
         // 1Click delivered: nothing more of this payment can move.
         this.#dropHold(hold);
         if (err instanceof OutcomeUnknown) this.#unknown ??= `the ${to} credit of rescue ${run.trigger.id}: ${errorMessage(err)}; reconcile it, then ${this.#clearHow()}`;
         this.#persist();
+        if (!(err instanceof OutcomeUnknown)) this.#ownerLine(this.#waitingOnWallet(run.trigger.id, to, q, `the deposit did not run: ${errorMessage(err)}`), to);
         throw new StepFailed('deposit', `1Click delivered, but moving it into ${to} margin failed: ${errorMessage(err)}`);
       }
     }
     const timeout = this.#o.landingTimeoutMs ?? LANDING_TIMEOUT_MS;
     const until = this.#o.clock.now() + timeout;
     for (;;) {
-      const entry = await this.#o.landing.find(to, q, since, this.#seen, deliveryTx).catch(() => null);
+      const entry = await this.#o.landing.find(to, q, hold.heldAt, this.#seen, deliveryTx).catch(() => null);
       if (entry !== null) {
         this.#seen.add(entry.id);
         this.#dropHold(hold);
@@ -1042,6 +1084,7 @@ export class Rescuer {
       why: h.why, rescueId: h.rescueId, venue: h.venue, q: h.q, sinceMs: h.sinceMs, heldAt: this.#o.clock.now(), reconcileSaid: false, paying: true,
       unsent: null, authorization: null, arbBlock: h.arbBlock, scannedTo: null, paidLog: null, reservedE6: h.reservedE6, status: null,
       counter: h.counter, nearTx: null, solana: h.solana === null ? null : { lastValidBlockHeight: h.solana.lastValidBlockHeight, signature: null },
+      creditBaseE6: h.creditBaseE6,
     };
     this.#deposits.push(hold);
     return hold;
@@ -1147,18 +1190,24 @@ export class Rescuer {
     return true;
   }
 
-  /** A sol_sign_rescue that may be signed: dead once Solana's finalized height is past its blockhash's and its signature is unknown there. */
+  /**
+   * A sol_sign_rescue that may be signed: dead once Solana's finalized height is past its blockhash's and its signature
+   * is unknown there, or once its transaction is finalized with an error (it ran, paid nothing, and the same signature
+   * can never run again), whatever the height.
+   */
   async #solanaDead(d: DepositHold): Promise<'dead' | null> {
     const s = d.solana;
     const sol = this.#o.solana;
     // No bound or no signature to look for: only the owner can tell.
     if (s === null || s.signature === null || sol === undefined) return null;
     // Height first: past it, no later block can include the transaction, so a status read after is the last word, if
-    // its node had reached the slot the height was read at (a lagging node's "unknown" proves nothing).
+    // its node had reached the slot the height was read at (a lagging node's "unknown" proves nothing). The same slot
+    // rule holds for a failed status.
     const f = await sol.finalized();
-    if (f.height <= s.lastValidBlockHeight) return null;
     const st = await sol.signatureStatus(s.signature);
-    return !st.known && st.slot !== null && st.slot >= f.slot ? 'dead' : null;
+    if (st.slot === null || st.slot < f.slot) return null;
+    if (st.known) return st.failed ? 'dead' : null;
+    return f.height > s.lastValidBlockHeight ? 'dead' : null;
   }
 
   /** The desk's Arbitrum address at the latest block: the head, then the balance at that block. */
@@ -1256,10 +1305,17 @@ export class Rescuer {
       if (s === null) {
         // Unread: still held.
       } else if (s.status === 'SUCCESS') {
-        const entry = await this.#o.landing.find(d.venue, d.q, d.sinceMs, this.#seen, deliveryHashes(s.body)).catch(() => null);
+        const entry = await this.#o.landing.find(d.venue, d.q, d.heldAt, this.#seen, deliveryHashes(s.body)).catch(() => null);
         if (entry !== null) {
           this.#seen.add(entry.id);
           settled = `rescue ${d.rescueId}'s ${entry.usd.toFixed(2)} USD landed on ${d.venue} late (after its rescue was failed)`;
+        } else if (this.#o.credit?.[d.venue] !== undefined) {
+          // A venue with a credit (Phoenix): 1Click delivered to the desk's wallet there and the rescue that paid it
+          // stopped, timed out or was cut off by a restart before its deposit. Settled as waiting on that wallet, with
+          // the owner's command: never deposited late from here.
+          const line = this.#waitingOnWallet(d.rescueId, d.venue, d.q, '1Click says SUCCESS and no deposit of it was made by this run');
+          this.#log(line);
+          settled = line;
         }
       } else if (SETTLED_STATUSES.includes(s.status)) {
         settled = `rescue ${d.rescueId}'s transfer ended ${s.status} at 1Click: refunded, nothing landed`
@@ -1335,6 +1391,7 @@ export class Rescuer {
         authorization: h.authorization, arbBlock: h.arbBlock === null ? null : BigInt(h.arbBlock), scannedTo: h.scannedTo === null ? null : BigInt(h.scannedTo),
         paidLog: h.paidLog, reservedE6: BigInt(h.reservedE6), status: h.status,
         counter: h.counter === null ? null : BigInt(h.counter), nearTx: h.nearTx, solana: h.solana === null ? null : { ...h.solana },
+        creditBaseE6: h.creditBaseE6 == null ? null : BigInt(h.creditBaseE6),
       });
     }
     this.#strandedE6 = BigInt(s.hl.strandedE6);
@@ -1357,6 +1414,7 @@ export class Rescuer {
         arbBlock: d.arbBlock === null ? null : d.arbBlock.toString(), scannedTo: d.scannedTo === null ? null : d.scannedTo.toString(), paidLog: d.paidLog,
         reservedE6: d.reservedE6.toString(), status: d.status,
         counter: d.counter === null ? null : d.counter.toString(), nearTx: d.nearTx, solana: d.solana === null ? null : { ...d.solana },
+        creditBaseE6: d.creditBaseE6 === null ? null : d.creditBaseE6.toString(),
       })),
       hl: { strandedE6: this.#strandedE6.toString(), inFlight: f === null ? null : saveWithdraw(f), expired: this.#expired.map(saveWithdraw) },
       cap: this.#cap.entries(now),
@@ -1442,6 +1500,18 @@ export class Rescuer {
       type: 'journal',
       data: { id: `rescue-${t.toString(36)}-${++this.#seq}`, t, kind: 'rescue', summary: this.#labelled(summary), numbers, tx: [...tx] },
     });
+  }
+
+  /** The owner's line for USDC 1Click delivered to a venue's wallet that no deposit moved into margin. */
+  #waitingOnWallet(rescueId: string, venue: VenueId, q: VerifiedQuote, why: string): string {
+    const how = this.#o.credit?.[venue]?.manual?.(q.minAmountOut) ?? `deposit it into ${venue} margin by hand`;
+    return `owner: rescue ${rescueId}'s delivery of at least ${e8Text(q.minAmountOutE8)} USDC waits on the desk's ${venue} wallet, not in margin (${why}); to move it: ${how}`;
+  }
+
+  /** An owner line, in the log and the journal. */
+  #ownerLine(line: string, venue: VenueId): void {
+    this.#log(line);
+    this.#journalLine(line, venue);
   }
 
   /** A journal line of no run (a hold settled, reconcile needed). */

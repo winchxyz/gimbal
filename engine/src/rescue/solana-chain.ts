@@ -16,10 +16,18 @@ export interface SolanaReads {
   /** The cluster's finalized block height, and the slot it was read at. */
   finalized(): Promise<{ height: number; slot: number }>;
   /**
-   * Whether the cluster knows the transaction signature (landed, ok or failed), searching its history, and the slot
-   * the answering node read it at (null: its answer gave none).
+   * Whether the cluster knows the transaction signature (landed, ok or failed), searching its history, the slot the
+   * answering node read it at (null: its answer gave none), and whether it is finalized with an error (`failed`): such
+   * a transaction ran and moved nothing, and its signature can never run again.
    */
-  signatureStatus(signature: string): Promise<{ known: boolean; slot: number | null }>;
+  signatureStatus(signature: string): Promise<SignatureStatusRead>;
+}
+
+export interface SignatureStatusRead {
+  known: boolean;
+  slot: number | null;
+  /** Finalized with an error (a landed but failed transaction): it can never pay. */
+  failed: boolean;
 }
 
 /**
@@ -61,11 +69,14 @@ export class RpcSolanaReads implements SolanaReads {
     return { height: blockHeight as number, slot: absoluteSlot as number };
   }
 
-  async signatureStatus(signature: string): Promise<{ known: boolean; slot: number | null }> {
+  async signatureStatus(signature: string): Promise<SignatureStatusRead> {
     const r = await this.#call('getSignatureStatuses', [[signature], { searchTransactionHistory: true }]) as { context?: { slot?: unknown }; value?: unknown };
     if (!Array.isArray(r?.value) || r.value.length !== 1) throw new Error('getSignatureStatuses: not one status');
     const slot = r.context?.slot;
-    return { known: r.value[0] !== null, slot: Number.isSafeInteger(slot) ? slot as number : null };
+    const v = r.value[0] as { err?: unknown; confirmationStatus?: unknown } | null;
+    if (v !== null && (typeof v !== 'object' || !('err' in v))) throw new Error('getSignatureStatuses: a status without err');
+    const failed = v !== null && v.err !== null && v.err !== undefined && v.confirmationStatus === 'finalized';
+    return { known: v !== null, slot: Number.isSafeInteger(slot) ? slot as number : null, failed };
   }
 
   /**
@@ -108,6 +119,7 @@ export const HISTORY_PROBE_MIN_AGE_SLOTS = 10_000;
 export class SimulatedSolana implements SolanaReads {
   readonly #clock: Clock;
   readonly #landed = new Set<string>();
+  readonly #failed = new Set<string>();
   /** Reads fail while set. */
   down: string | null = null;
 
@@ -124,6 +136,12 @@ export class SimulatedSolana implements SolanaReads {
     this.#landed.add(signature);
   }
 
+  /** The transaction landed and failed (finalized with an error). */
+  fail(signature: string): void {
+    this.#landed.add(signature);
+    this.#failed.add(signature);
+  }
+
   /** The slot the status answers come from, relative to the finalized one (a lagging node: negative). */
   statusLag = 0;
 
@@ -132,8 +150,8 @@ export class SimulatedSolana implements SolanaReads {
     return { height: this.heightNow() - 32, slot: this.heightNow() - 32 };
   }
 
-  async signatureStatus(signature: string): Promise<{ known: boolean; slot: number | null }> {
+  async signatureStatus(signature: string): Promise<SignatureStatusRead> {
     if (this.down !== null) throw new Error(this.down);
-    return { known: this.#landed.has(signature), slot: this.heightNow() - 32 + this.statusLag };
+    return { known: this.#landed.has(signature), slot: this.heightNow() - 32 + this.statusLag, failed: this.#failed.has(signature) };
   }
 }

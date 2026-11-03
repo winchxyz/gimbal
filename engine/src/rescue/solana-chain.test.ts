@@ -26,12 +26,26 @@ test('the live reader: the finalized height with its slot, and a signature searc
     return { body: { jsonrpc: '2.0', id: 2, result: { context: { slot: 380_000_510 }, value: [sig === 'landed' ? { slot: 9, confirmationStatus: 'finalized', err: null } : null] } } };
   });
   assert.deepEqual(await reads.finalized(), { height: 350_000_123, slot: 380_000_500 });
-  assert.deepEqual(await reads.signatureStatus('landed'), { known: true, slot: 380_000_510 });
-  assert.deepEqual(await reads.signatureStatus('never'), { known: false, slot: 380_000_510 });
+  assert.deepEqual(await reads.signatureStatus('landed'), { known: true, slot: 380_000_510, failed: false });
+  assert.deepEqual(await reads.signatureStatus('never'), { known: false, slot: 380_000_510, failed: false });
   assert.deepEqual(asked[0], { method: 'getEpochInfo', params: [{ commitment: 'finalized' }] });
   assert.deepEqual(asked[2], { method: 'getSignatureStatuses', params: [['never'], { searchTransactionHistory: true }] });
   const { reads: noSlot } = rpc(() => ({ body: { result: { value: [null] } } }));
-  assert.deepEqual(await noSlot.signatureStatus('x'), { known: false, slot: null }, 'no context: no slot (no proof)');
+  assert.deepEqual(await noSlot.signatureStatus('x'), { known: false, slot: null, failed: false }, 'no context: no slot (no proof)');
+});
+
+test('the live reader: a signature finalized with an error is failed (it can never run again); a failure not yet finalized is not', async () => {
+  const { reads } = rpc((_method, params) => {
+    const sig = (params[0] as string[])[0];
+    const v = sig === 'final-err' ? { slot: 9, confirmationStatus: 'finalized', err: { InstructionError: [2, { Custom: 1 }] } }
+      : sig === 'confirmed-err' ? { slot: 9, confirmationStatus: 'confirmed', err: { InstructionError: [2, { Custom: 1 }] } }
+      : sig === 'no-err-key' ? { slot: 9, confirmationStatus: 'finalized' }
+      : null;
+    return { body: { result: { context: { slot: 500 }, value: [v] } } };
+  });
+  assert.deepEqual(await reads.signatureStatus('final-err'), { known: true, slot: 500, failed: true });
+  assert.deepEqual(await reads.signatureStatus('confirmed-err'), { known: true, slot: 500, failed: false });
+  await assert.rejects(reads.signatureStatus('no-err-key'), /a status without err/);
 });
 
 test('the live reader: an HTTP error, an RPC error or an answer of another shape is an error, never a height or "unknown"; the URL is redacted', async () => {
@@ -56,7 +70,7 @@ test('the simulated cluster: the height grows with the clock (finalized 32 behin
   assert.deepEqual(await sol.finalized(), { height: 968, slot: 968 });
   now += 4_000;
   assert.equal((await sol.finalized()).height, 978);
-  assert.deepEqual(await sol.signatureStatus('s'), { known: false, slot: 978 });
+  assert.deepEqual(await sol.signatureStatus('s'), { known: false, slot: 978, failed: false });
   sol.land('s');
   assert.equal((await sol.signatureStatus('s')).known, true);
   sol.statusLag = -3;

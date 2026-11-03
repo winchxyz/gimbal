@@ -989,10 +989,14 @@ mainnet with `GIMBAL_RESCUE=1`:
 - reserve → Hyperliquid: `fund_venue` into HyperCore USDC; the landing is an incoming entry in the desk's Hyperliquid
   ledger (`userNonFundingLedgerUpdates`), 1Click's delivery hash first, never the equity.
 - reserve → Phoenix: `fund_venue` into Solana USDC for the desk Solana authority; once 1Click's delivery is on Solana
-  and the desk's USDC account holds `minAmountOut`, a plain `sol_sign` deposit (Ember wrap + `deposit_funds`, 400,000
+  and the desk's USDC account holds `minAmountOut` more than it held before the payment (the balance is read just
+  before the hold opens and saved with it, so USDC already there is never taken for the delivery), a plain `sol_sign` deposit (Ember wrap + `deposit_funds`, 400,000
   units at 100,000 micro-lamports, under the 200,000 cap of a message that is not a rescue); the landing is that
   deposit, confirmed. Before anything is paid the engine checks a deposit could follow (a registered trader, a
-  running desk, SOL for the fee), else the rescue is refused.
+  running desk, SOL for the fee), else the rescue is refused. A delivery that reaches the desk's USDC account with no
+  deposit after it (serve stopped first, the deposit failed, or the rescue was parked and 1Click's SUCCESS is read
+  after a restart) is settled as waiting there: the hold is released and the journal says, as an `owner:` line, how
+  much waits and the `pair-mainnet fund-phoenix` command that deposits it. The engine never deposits it late.
 - Phoenix → Hyperliquid: one `sol_sign_rescue` transaction to the 1Click deposit address (Solana USDC for HyperCore
   USDC), the landing in the Hyperliquid ledger. The message is one of three, built and simulated unsigned before the
   hold is saved: spare USDC already on the desk's USDC account (the deposit owner's account and the
@@ -1003,7 +1007,8 @@ mainnet with `GIMBAL_RESCUE=1`:
   once and never rebuilt: the deposit ring takes the quote once.
 - Both Phoenix routes need a Solana RPC (`SOLANA_RPC_URL`, default the public mainnet RPC) that serves
   `getSignatureStatuses` with `searchTransactionHistory`, which the Solana hold rule reads (a held `sol_sign_rescue`
-  is released once the finalized height is past its `lastValidBlockHeight` and the signature is unknown). serve
+  is released once the finalized height is past its `lastValidBlockHeight` and the signature is unknown, or once the
+  signature is finalized with an error; a send that proves nothing ran, `NothingExecuted`, releases it at once). serve
   probes it at start with a finalized signature at least 10,000 slots old (the oldest of the last 1,000 naming
   Phoenix's withdraw queue); without history both Phoenix routes are refused, the start line says why, and Solana
   holds stay held.

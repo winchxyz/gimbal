@@ -209,7 +209,7 @@ test('Phoenix credit: the delivery confirmed on Solana and on the desk USDC acco
   c.tokens.set(DESK.usdcAta, 10_500_000n);
   c.landed.set('5'.repeat(88), 123);
   const { k, signedMessages } = credit(c);
-  const { tx } = await k.credit(10_000_000n, 'rescue r2: into Phoenix', ['5'.repeat(88)]);
+  const { tx } = await k.credit(10_000_000n, 'rescue r2: into Phoenix', { deliveryTx: ['5'.repeat(88)] });
   assert.deepEqual(tx.map((x) => x.id), ['NEARDEP', 'DEPSIG']);
   assert.equal(signedMessages.length, 1);
   const m = parseMessage(signedMessages[0]!);
@@ -228,9 +228,35 @@ test('Phoenix credit: the delivery confirmed on Solana and on the desk USDC acco
 test('Phoenix credit: no deposit when 1Click\'s delivery is not on Solana, or the USDC never shows on the desk account', async () => {
   const c = chain();
   c.tokens.set(DESK.usdcAta, 10_500_000n);
-  await assert.rejects(credit(c).k.credit(10_000_000n, 'r', ['4'.repeat(88)]), /is not on Solana: nothing was deposited/);
+  await assert.rejects(credit(c).k.credit(10_000_000n, 'r', { deliveryTx: ['4'.repeat(88)] }), /is not on Solana: nothing was deposited/);
   const empty = chain();
   const { k, signedMessages } = credit(empty);
-  await assert.rejects(k.credit(10_000_000n, 'r'), /holds 0.000000 USDC, under the 10.000000 delivered: nothing was deposited/);
+  await assert.rejects(k.credit(10_000_000n, 'r'), /holds 0.000000 USDC, under the 0.000000 before the payment plus the 10.000000 delivered: nothing was deposited/);
+  assert.equal(signedMessages.length, 0);
+});
+
+test('Phoenix credit: USDC already on the desk account (dust) is not the delivery: the wait counts above the baseline saved before the payment', async () => {
+  const c = chain();
+  c.tokens.set(DESK.usdcAta, 400_000n);
+  const { k, signedMessages } = credit(c);
+  assert.equal(await k.baseline(), 400_000n);
+  // 10 USDC on the account is not 10 delivered on top of the 0.4 dust.
+  c.tokens.set(DESK.usdcAta, 10_000_000n);
+  await assert.rejects(k.credit(10_000_000n, 'r', { baseE6: 400_000n }), /holds 10.000000 USDC, under the 0.400000 before the payment plus the 10.000000 delivered: nothing was deposited/);
+  assert.equal(signedMessages.length, 0);
+  c.tokens.set(DESK.usdcAta, 10_400_000n);
+  await k.credit(10_000_000n, 'r', { baseE6: 400_000n });
+  assert.equal(signedMessages.length, 1, 'deposited once the delivery is there');
+  // No account yet: the baseline is zero.
+  assert.equal(await credit(chain()).k.baseline(), 0n);
+  assert.match(k.manual(10_000_000n), /pair-mainnet fund-phoenix 10.000000 \(dry\), then again with --send/);
+});
+
+test('Phoenix credit: a stop while the delivery is awaited gives up at once with nothing signed', async () => {
+  const c = chain();
+  const { k, signedMessages } = credit(c);
+  let polls = 0;
+  await assert.rejects(k.credit(10_000_000n, 'r', { stopping: () => ++polls >= 2 }), /the engine is stopping while the delivery was awaited: nothing was deposited/);
+  assert.equal(polls, 2);
   assert.equal(signedMessages.length, 0);
 });

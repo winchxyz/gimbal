@@ -344,6 +344,8 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
   const traderState = async () => parseTraderSnapshot(await phoenixTraderApi(phoenixApi).traderState((view ?? first).solana.authority), '').state;
   const phoenixPayer = new PhoenixRescuePayer({
     deskId, chain, desk: phoenixDesk, contract, sender: solSubmitter, log,
+    // Approximate: Phoenix's free margin in USD as the reader computes it, not the exchange's own withdraw check. A
+    // withdraw it overstates fails the unsigned simulation in planPhoenixRescue, so nothing is signed on it.
     withdrawable: async () => BigInt(Math.floor((await phoenixReader.account((view ?? first).solana.authority)).freeMarginUsd * 1e6)),
   });
   const relayer = new Relayer({ contract, deskId, solana: solSubmitter });

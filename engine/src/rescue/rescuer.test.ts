@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import type { Leg, RescueFailure, RescueProgress, StreamEvent, TxRef, VenueId } from '@gimbal/shared';
 import { OutcomeUnknown } from '../contract/types.ts';
+import { NothingExecuted } from '../relayer/tx.ts';
 import type { OutcomeIds } from '../contract/types.ts';
 import type { RescueTrigger } from '../risk/engine.ts';
 import type { PairResult } from '../trade/pair.ts';
@@ -923,7 +924,7 @@ const tmpStore = () => new RescueStateStore(tmpPath(), ID);
 interface OnDisk {
   holds: {
     paying: boolean; status: string | null; authorization: unknown; arbBlock: string | null; scannedTo: string | null; paidLog: string | null;
-    counter: string | null; nearTx: string | null; solana: { lastValidBlockHeight: number; signature: string | null } | null;
+    counter: string | null; nearTx: string | null; solana: { lastValidBlockHeight: number; signature: string | null } | null; creditBaseE6?: string | null;
     quote: { method: string; depositAddress: string; deadlineMs: number; signedAtMs: number };
   }[];
   unknown: string | null;
@@ -1453,4 +1454,101 @@ test('a route limit refuses a wired route by name (mainnet: Hyperliquid -> Phoen
   assert.equal(s.withdrawn.length, 0);
   assert.equal(s.quotes.length, 0);
   assert.match(JSON.stringify(s.w.failures.at(-1)) + s.w.journal().join('\n'), /Hyperliquid -> Phoenix runs only in replay/);
+});
+
+// ---- review fixes: a Solana payment that can never run, a delivery left on the Phoenix wallet, the baseline ----
+
+test('a sol_sign_rescue whose send proves nothing ran (NothingExecuted: failed on chain or expired) releases its hold at once', async () => {
+  let fails = true;
+  const s = synthetic({ desk: { reserveUsd: 0, policy: { ...rec.policy, rescue_cap_usd_per_hour: 1000 } }, reducer: true, send: async () => { if (fails) throw new NothingExecuted('solana', 'the transaction failed on chain: custom program error 0x1'); } });
+  await run(s.w, trigger({ id: 'a', amountUsd: 30 }));
+  assert.equal(s.w.rescuer.held, null, 'nothing held');
+  assert.match(JSON.stringify(s.w.failures.at(-1)), /sol_sign_rescue can never pay .*custom program error 0x1.*its hold is released/);
+  // The next rescue pays.
+  fails = false;
+  await run(s.w, trigger({ id: 'b', amountUsd: 30 }));
+  assert.deepEqual(s.w.ended.at(-1), ['b', true]);
+  assert.equal(s.sent.length, 1);
+});
+
+test('a Phoenix payment that landed and failed (finalized with an error) is dead; 1Click then gets its 10 minutes; one only confirmed with an error is not', async () => {
+  let unknown = true;
+  const s = synthetic({ desk: { reserveUsd: 0, policy: { ...rec.policy, rescue_cap_usd_per_hour: 1000 } }, reducer: true, send: async () => { if (unknown) throw new OutcomeUnknown('solana send', 'no answer', {} as OutcomeIds); } });
+  await run(s.w, trigger({ id: 'a', amountUsd: 30 }));
+  unknown = false;
+  assert.match(s.w.rescuer.held!, /rescue a/);
+  const q = s.signed[0]!;
+  s.status = (_n, addr) => ({ status: addr === q.depositAddress ? 'PENDING_DEPOSIT' : 'SUCCESS', body: null });
+  // Landed, no error: held however long.
+  s.solana.land('solana-sig-1');
+  s.w.t += 3_600_000;
+  await run(s.w, trigger({ id: 'b', amountUsd: 30 }));
+  assert.match(s.w.rescuer.held!, /rescue a/, 'landed and ok: held');
+  // Finalized with an error, read from a lagging node: no proof yet.
+  s.solana.fail('solana-sig-1');
+  s.solana.statusLag = -1;
+  s.w.t += 11 * 60_000;
+  await run(s.w, trigger({ id: 'c', amountUsd: 30 }));
+  assert.match(s.w.rescuer.held!, /rescue a/, 'a lagging read is no proof');
+  s.solana.statusLag = 0;
+  await run(s.w, trigger({ id: 'd', amountUsd: 30 }));
+  assert.match(s.w.rescuer.held!, /rescue a/, '1Click gets 10 minutes from the first dead read');
+  s.w.t += 10 * 60_000;
+  await run(s.w, trigger({ id: 'e', amountUsd: 30 }));
+  assert.ok(s.w.journal().some((j) => /rescue a's signed payment can no longer run .*expired unused/.test(j)));
+  assert.deepEqual(s.w.ended.at(-1), ['e', true]);
+});
+
+test('state: a Phoenix delivery parked before its credit (stopped while 1Click was PROCESSING): after a restart, SUCCESS settles it as waiting on the wallet with the owner\'s command, never a late deposit', async () => {
+  const store = tmpStore();
+  let stopped: Promise<void> | null = null;
+  const credited: bigint[] = [];
+  const phoenix: CreditPort = {
+    baseline: async () => 400_000n,
+    manual: (e6) => `pair-mainnet fund-phoenix ${Number(e6) / 1e6} --send`,
+    credit: async (e6) => (credited.push(e6), { tx: [] }),
+  };
+  const s = synthetic({
+    store, fresh: true, seedCap: false, noLanding: true, reducer: true, legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 0 },
+    send: async () => { stopped = s.w.rescuer.stop(); }, status: () => ({ status: 'PROCESSING', body: null }),
+  });
+  s.w.restart({ store, fresh: true, credit: { phoenix } });
+  await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
+  await stopped;
+  assert.match(s.w.rescuer.held ?? '', /PROCESSING at 1Click; the engine stopped before it settled/);
+  assert.equal(onDisk(store).holds[0]!.creditBaseE6, '400000', 'the baseline is saved with the hold');
+  // The restart: 1Click now says SUCCESS; the deposit this rescue would have made is not in this run's memory.
+  s.status = () => ({ status: 'SUCCESS', body: null });
+  s.w.restart({ store, credit: { phoenix } });
+  await run(s.w, trigger({ id: 'b', venue: 'hyperliquid', amountUsd: 20 }));
+  assert.doesNotMatch(s.w.rescuer.held ?? '', /rescue a/, 'settled');
+  const line = s.w.journal().find((j) => /owner: rescue a's delivery of at least .* USDC waits on the desk's phoenix wallet, not in margin/.test(j));
+  assert.ok(line !== undefined, s.w.journal().join('\n'));
+  assert.match(line, /pair-mainnet fund-phoenix .* --send/);
+  assert.ok(s.w.logs.some((l) => /^owner: rescue a's delivery/.test(l)));
+  assert.equal(credited.length, 0, 'never deposited from the restart path');
+});
+
+test('the credit gets the baseline read before the hold; a stop during that read signs nothing; a credit that fails leaves an owner line', async () => {
+  const seen: (bigint | null | undefined)[] = [];
+  const s = synthetic({ legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 0 } });
+  s.w.restart({ credit: { phoenix: { baseline: async () => 250_000n, credit: async (_e6, _r, o) => (seen.push(o?.baseE6), { tx: [] }) } } });
+  await run(s.w, trigger({ venue: 'phoenix', amountUsd: 10 }));
+  assert.deepEqual(seen, [250_000n]);
+  assert.deepEqual(s.w.ended, [['rescue-1', true]]);
+
+  const f = synthetic({ legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 0 } });
+  f.w.restart({ credit: { phoenix: { baseline: async () => 0n, manual: () => 'run the deposit by hand', credit: async () => { throw new Error('the desk USDC account holds 0.000000 USDC'); } } } });
+  await run(f.w, trigger({ venue: 'phoenix', amountUsd: 10 }));
+  assert.equal(f.w.rescuer.held, null);
+  assert.ok(f.w.journal().some((j) => /owner: rescue rescue-1's delivery .* waits on the desk's phoenix wallet, not in margin \(the deposit did not run: .*\); to move it: run the deposit by hand/.test(j)));
+
+  let stopped: Promise<void> | null = null;
+  const t = synthetic({ legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 0 } });
+  t.w.restart({ credit: { phoenix: { baseline: async () => { stopped = t.w.rescuer.stop(); return 0n; }, credit: async () => ({ tx: [] }) } } });
+  await run(t.w, trigger({ venue: 'phoenix', amountUsd: 10 }));
+  await stopped;
+  assert.equal(t.signed.length, 0, 'nothing signed');
+  assert.equal(t.w.rescuer.held, null, 'no hold opened');
+  assert.match(JSON.stringify(t.w.failures.at(-1)), /the engine is stopping: nothing was signed/);
 });
