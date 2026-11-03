@@ -21,13 +21,17 @@
 // per-user path, which pair-mainnet --send takes too, for its whole run. A lock file that holds no pid (its holder is
 // between creating and writing it) counts as held. The lock names its process by pid, start time, a random id and the
 // host's boot id: in a container node runs as pid 1 every time, so after a kill the next container finds a lock of
-// "pid 1" on the volume. A lock of this pid that predates this process, or of a host boot that is over, is stale and
-// taken over (said in the TraderLock's `tookOver`); one of a live other process is held.
+// "pid 1" on the volume. Its holder touches it every LOCK_HEARTBEAT_MS (the file's mtime is the heartbeat). A lock
+// of a host boot that is over, or of a pid that is not running, is stale at once; one of this very pid (a container
+// restarted, or another container in its own pid namespace on the same volume) only once its heartbeat is older than
+// LOCK_STALE_MS, so an overlapping container waits rather than taking over. A stale lock is taken over under a second
+// exclusive file (`<lock>.takeover`), so two starters that read the same stale lock cannot both take it; the
+// takeover is said in the TraderLock's `tookOver`. One of a live other process is held.
 //
 // The conventions (and userStateDir, the lock) follow the rescuer's state of PR #63 (rescue/state.ts, rescue/lock.ts);
 // TODO(dedupe): once both are merged, share userStateDir, the atomic save and the lock with those files.
 
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, utimesSync, writeSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -472,23 +476,43 @@ export function parseLockText(text: string): LockOwner | null {
   };
 }
 
+/** How often the holder touches its lock (the mtime is the heartbeat). */
+export const LOCK_HEARTBEAT_MS = 30_000;
+/** A lock of this pid (or of another pid namespace) is stale only once its heartbeat is older than this: 3 beats. */
+export const LOCK_STALE_MS = 3 * LOCK_HEARTBEAT_MS;
+/** A takeover guard (`<lock>.takeover`) older than this was left by a starter that died while taking over. */
+const TAKEOVER_GUARD_STALE_MS = LOCK_HEARTBEAT_MS;
+
 /**
  * Whose a lock is, from `me`'s side: `mine` (this very process), `held` (a live other process, or one that cannot be
- * told apart from one), or `stale` with why (its process is gone: safe to take over).
+ * told apart from one), or `stale` with why (its process is gone: safe to take over). `beatAgeMs` is how long ago its
+ * holder last touched it (null: unknown, read as fresh).
  */
-export function lockStatus(owner: LockOwner, me: LockOwner = THIS_PROCESS, isAlive: (pid: number) => boolean = alive): { kind: 'mine' } | { kind: 'held'; why: string } | { kind: 'stale'; why: string } {
+export function lockStatus(
+  owner: LockOwner, me: LockOwner = THIS_PROCESS, isAlive: (pid: number) => boolean = alive, beatAgeMs: number | null = null,
+): { kind: 'mine' } | { kind: 'held'; why: string } | { kind: 'stale'; why: string } {
   if (owner.id !== null && owner.id === me.id) return { kind: 'mine' };
   if (owner.boot !== null && me.boot !== null && owner.boot !== me.boot) return { kind: 'stale', why: `it was taken during an earlier boot of this host (boot ${owner.boot}), so its process is gone` };
   if (owner.pid === me.pid) {
-    // This pid is this process: the lock's process ran before it (a restart in a container, where node is pid 1 each
-    // time), unless it says it started after this one, which only another pid namespace on the same volume can.
-    if (owner.startedMs === null) return { kind: 'stale', why: `it names pid ${owner.pid}, this process's own pid, without a start time (an older serve's lock), so its process is gone` };
-    if (me.startedMs !== null && owner.startedMs < me.startedMs) {
-      return { kind: 'stale', why: `it names pid ${owner.pid}, this process's own pid, started ${new Date(owner.startedMs).toISOString()}, before this process started: that process is gone (a restart)` };
+    // This pid is this process, so the lock's holder is another process with the same pid: one that ran before this
+    // one (a container restart: node is pid 1 each time) or one in another pid namespace on the same volume (an
+    // overlapping container). Which, cannot be told from here: it is stale only once it stopped beating.
+    const beat = beatAgeMs === null ? 'no heartbeat time' : `its last heartbeat ${Math.round(beatAgeMs / 1000)} s ago`;
+    if (beatAgeMs !== null && beatAgeMs > LOCK_STALE_MS) {
+      return { kind: 'stale', why: `it names pid ${owner.pid}, this process's own pid (a restart, or another container), and ${beat}, over ${LOCK_STALE_MS / 1000} s: that process is gone` };
     }
-    return { kind: 'held', why: `pid ${owner.pid} (this pid, in another pid namespace: it started at ${new Date(owner.startedMs).toISOString()}, after this process)` };
+    return { kind: 'held', why: `pid ${owner.pid}, this process's own pid in another process (an overlapping container?), ${beat}: taken over only after ${LOCK_STALE_MS / 1000} s without one` };
   }
   return isAlive(owner.pid) ? { kind: 'held', why: `pid ${owner.pid}` } : { kind: 'stale', why: `its process (pid ${owner.pid}) is gone` };
+}
+
+/** How long ago the lock at `path` was last touched by its holder, or null when that cannot be read. */
+function beatAge(path: string, now: number): number | null {
+  try {
+    return Math.max(0, now - statSync(path).mtimeMs);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -505,7 +529,7 @@ export function lockHolder(path: string): number | 'unknown' | null {
   }
   const owner = parseLockText(text);
   if (owner === null) return 'unknown';
-  return lockStatus(owner).kind === 'stale' ? null : owner.pid;
+  return lockStatus(owner, THIS_PROCESS, alive, beatAge(path, Date.now())).kind === 'stale' ? null : owner.pid;
 }
 
 /** The directory entry of a renamed file reaches the disk too (POSIX; Windows cannot open a directory for that). */
@@ -526,53 +550,170 @@ export interface TraderLock {
   readonly path: string;
   /** A stale lock this one replaced: whose it was and why it was stale (serve journals it); null when none was there. */
   readonly tookOver: string | null;
+  /** Touches the lock now (the timer does every LOCK_HEARTBEAT_MS); false once the lock is not this holder's any more. */
+  beat(): boolean;
+  /** Whether the heartbeat runs (until release(), or until the lock is found not to be this holder's). */
+  beating(): boolean;
   release(): void;
 }
 
-/** Takes the lock or throws why not; `onExit` false leaves removing it to the caller (tests); `me` is for tests. */
-export function acquireTraderLock(path: string, options: { onExit?: boolean; me?: LockOwner; alive?: (pid: number) => boolean } = {}): TraderLock {
+export interface LockTimers {
+  setInterval(fn: () => void, ms: number): unknown;
+  clearInterval(t: unknown): void;
+}
+
+const lockTimers: LockTimers = {
+  setInterval: (fn, ms) => {
+    const t = setInterval(fn, ms);
+    t.unref();
+    return t;
+  },
+  clearInterval: (t) => clearInterval(t as NodeJS.Timeout),
+};
+
+/** Heartbeats running in this process (tests: a stopped serve leaves none). */
+let heartbeats = 0;
+export function lockHeartbeats(): number {
+  return heartbeats;
+}
+
+export interface AcquireOptions {
+  /** false leaves removing it to the caller (tests). */
+  onExit?: boolean;
+  /** Tests: another process, its clock, its pid check and its timers. */
+  me?: LockOwner;
+  alive?: (pid: number) => boolean;
+  now?: () => number;
+  timers?: LockTimers;
+  /** Tests: called when a stale lock was read (`read`) and once the takeover guard is held (`guarded`). */
+  onTakeover?: (stage: 'read' | 'guarded') => void;
+}
+
+/** Writes the lock file `path` (made with O_EXCL: `fd`) for `me`, and makes it reach the disk. */
+function writeLock(fd: number, path: string, me: LockOwner): void {
+  try {
+    writeSync(fd, lockText(me));
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  syncDir(dirname(path));
+}
+
+/** Takes the lock or throws why not. */
+export function acquireTraderLock(path: string, options: AcquireOptions = {}): TraderLock {
   const me = options.me ?? THIS_PROCESS;
+  const now = options.now ?? (() => Date.now());
+  const guardPath = `${path}.takeover`;
   mkdirSync(dirname(path), { recursive: true });
   let tookOver: string | null = null;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    let fd: number;
+  let made: number | null = null;
+  for (let attempt = 0; attempt < 4 && made === null; attempt++) {
     try {
-      fd = openSync(path, 'wx');
+      made = openSync(path, 'wx');
+      break;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw new Error(`the trader lock ${path} could not be made: ${(err as Error).message}`);
-      let text = '';
-      try {
-        text = readFileSync(path, 'utf8');
-      } catch {
-        continue;      // removed meanwhile: try again
-      }
-      const owner = parseLockText(text);
-      if (owner === null) throw new Error(`the trader lock ${path} holds no pid (${JSON.stringify(text.trim().slice(0, 40))}): another process may be taking it now, so it counts as held; if no serve or pair-mainnet runs for this desk, delete this file and start again (tools/mainnet/README.md, "Clear a lock file")`);
-      const status = lockStatus(owner, me, options.alive);
-      if (status.kind === 'mine') throw new Error(`this process (pid ${me.pid}) already trades this desk and holds ${path}: one trader per desk`);
-      if (status.kind === 'held') throw new Error(`another process (${status.why}) trades this desk and holds ${path}: one trader per desk; stop it first`);
-      try {
-        unlinkSync(path);       // stale: its process is gone
-        tookOver = `the trader lock ${path} of pid ${owner.pid} was stale (${status.why}) and is taken over`;
-      } catch {
-        // Someone else took it over first; the next open says who.
-      }
-      continue;
     }
-    writeSync(fd, lockText(me));
-    closeSync(fd);
-    let released = false;
-    const release = () => {
-      if (released) return;
-      released = true;
+    let text = '';
+    try {
+      text = readFileSync(path, 'utf8');
+    } catch {
+      continue;      // removed meanwhile: try again
+    }
+    const owner = parseLockText(text);
+    if (owner === null) throw new Error(`the trader lock ${path} holds no pid (${JSON.stringify(text.trim().slice(0, 40))}): another process may be taking it now, so it counts as held; if no serve or pair-mainnet runs for this desk, delete this file and start again (tools/mainnet/README.md, "Clear a lock file")`);
+    const status = lockStatus(owner, me, options.alive, beatAge(path, now()));
+    if (status.kind === 'mine') throw new Error(`this process (pid ${me.pid}) already trades this desk and holds ${path}: one trader per desk`);
+    if (status.kind === 'held') throw new Error(`another process (${status.why}) trades this desk and holds ${path}: one trader per desk; stop it first`);
+    options.onTakeover?.('read');
+    // Stale. Only one starter takes it over: the one that makes the guard. Under it, the lock is read again (another
+    // starter may have taken it over since this one read it) before it is replaced.
+    let guard: number;
+    try {
+      guard = openSync(guardPath, 'wx');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw new Error(`the trader lock's takeover guard ${guardPath} could not be made: ${(err as Error).message}`);
+      const age = beatAge(guardPath, now());
+      if (age !== null && age > TAKEOVER_GUARD_STALE_MS) {
+        try {
+          unlinkSync(guardPath);     // left by a starter that died while taking over
+        } catch {
+          // Someone else removed it first.
+        }
+        continue;
+      }
+      throw new Error(`another process is taking over the stale trader lock ${path} now (${guardPath}): one trader per desk; tried again`);
+    }
+    try {
+      options.onTakeover?.('guarded');
+      let again: string | null;
       try {
-        if (parseLockText(readFileSync(path, 'utf8'))?.id === me.id) unlinkSync(path);
+        again = readFileSync(path, 'utf8');
+      } catch {
+        again = null;
+      }
+      if (again !== text) continue;    // it changed (taken over, or let go) since it was read: judged again
+      unlinkSync(path);
+      try {
+        made = openSync(path, 'wx');
+      } catch {
+        continue;                      // a starter without a stale lock to read made it meanwhile: judged again
+      }
+      tookOver = `the trader lock ${path} of pid ${owner.pid} was stale (${status.why}) and is taken over`;
+    } finally {
+      closeSync(guard);
+      try {
+        unlinkSync(guardPath);
       } catch {
         // Already gone.
       }
-    };
-    if (options.onExit !== false) process.once('exit', release);
-    return { path, tookOver, release };
+    }
   }
-  throw new Error(`the trader lock ${path} could not be taken`);
+  if (made === null) throw new Error(`the trader lock ${path} could not be taken`);
+  writeLock(made, path, me);
+
+  const timers = options.timers ?? lockTimers;
+  let released = false;
+  let timer: unknown = null;
+  const mine = (): boolean => {
+    try {
+      return parseLockText(readFileSync(path, 'utf8'))?.id === me.id;
+    } catch {
+      return false;
+    }
+  };
+  const stopBeat = () => {
+    if (timer === null) return;
+    timers.clearInterval(timer);
+    timer = null;
+    heartbeats--;
+  };
+  const beat = (): boolean => {
+    if (released || !mine()) {
+      stopBeat();
+      return false;
+    }
+    const t = new Date(now());
+    try {
+      utimesSync(path, t, t);
+      return true;
+    } catch {
+      return false;      // tried again at the next beat
+    }
+  };
+  timer = timers.setInterval(() => void beat(), LOCK_HEARTBEAT_MS);
+  heartbeats++;
+  const release = () => {
+    if (released) return;
+    released = true;
+    stopBeat();
+    try {
+      if (mine()) unlinkSync(path);
+    } catch {
+      // Already gone.
+    }
+  };
+  if (options.onExit !== false) process.once('exit', release);
+  return { path, tookOver, beat, beating: () => timer !== null, release };
 }

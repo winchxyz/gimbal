@@ -3,7 +3,7 @@
 // file is not a fresh start), the per-desk lock, the PairTrader's adopt/export/import, and the 25 % monitor.
 
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
@@ -18,7 +18,8 @@ import type { PairTraderState } from './pair.ts';
 import type { OutgoingOrder, ProtectionCloseReport } from './protected-pair.ts';
 import { GuardedLeg, IN_FLIGHT_LIFE_MS, InFlightBook, ProtectedPair, inFlightUnexplained, startPlan } from './protected-pair.ts';
 import type { InFlightOrder, LoadedTraderState, TraderFileState } from './trader-state.ts';
-import { TRADER_STATE_VERSION, TraderStateStore, acquireTraderLock, lockHolder, lockStatus, lockText, parseLockText, parseTraderState, traderStateFile, traderStateJson } from './trader-state.ts';
+import { LOCK_HEARTBEAT_MS, LOCK_STALE_MS, TRADER_STATE_VERSION, TraderStateStore, acquireTraderLock, lockHeartbeats, lockHolder, lockStatus, lockText, parseLockText, parseTraderState, traderStateFile, traderStateJson } from './trader-state.ts';
+import type { TraderLock } from './trader-state.ts';
 
 class Leg implements TradeLeg {
   readonly venue: VenueId;
@@ -567,33 +568,140 @@ test('the per-desk lock: one holder; a stale lock is taken over; lockHolder name
   }
 });
 
-test('the lock at pid 1 (node in a container): a lock of this pid from before this process, or of another boot, is stale; a later or live one is held', () => {
+/** Sets the lock file's heartbeat (its mtime) `agoMs` before now. */
+function beatAgo(path: string, agoMs: number): void {
+  const t = new Date(Date.now() - agoMs);
+  utimesSync(path, t, t);
+}
+
+const noTimers = { setInterval: () => 0, clearInterval: () => {} };
+
+test('the lock at pid 1 (node in a container): this pid is taken over only once its heartbeat is over 90 s old; another boot or a dead pid at once', () => {
   const dir = tempDir();
   try {
     const path = join(dir, 'locks', 'trader.lock');
     const me = { pid: 1, startedMs: 2_000_000, id: 'container-2', boot: 'boot-a' };
     const nobody = () => false;
     mkdirSync(dirname(path), { recursive: true });
-    // The container before this one was killed (OOM, SIGKILL): its lock still says pid 1.
+    // Another container's lock, still beating (an overlap during a redeploy, or the one before, killed a moment ago).
     writeFileSync(path, lockText({ pid: 1, startedMs: 1_000_000, id: 'container-1', boot: 'boot-a' }));
-    const lock = acquireTraderLock(path, { onExit: false, me, alive: nobody });
-    assert.match(lock.tookOver ?? '', /of pid 1 was stale \(it names pid 1, this process's own pid, started .* before this process started: that process is gone \(a restart\)\)/);
+    beatAgo(path, LOCK_STALE_MS - 10_000);
+    assert.throws(() => acquireTraderLock(path, { onExit: false, me, alive: nobody, timers: noTimers }), /another process \(pid 1, this process's own pid in another process .*its last heartbeat 80 s ago: taken over only after 90 s without one\)/);
+    assert.equal(lockStatus({ pid: 1, startedMs: 3_000_000, id: 'other-ns', boot: 'boot-a' }, me, nobody, 1_000).kind, 'held', 'a fresh beat holds, whatever its start time');
+    // Its heartbeat stopped over 3 beats ago: the container was killed (OOM, SIGKILL). Taken over.
+    beatAgo(path, LOCK_STALE_MS + 1_000);
+    const lock = acquireTraderLock(path, { onExit: false, me, alive: nobody, timers: noTimers });
+    assert.match(lock.tookOver ?? '', /of pid 1 was stale \(it names pid 1, this process's own pid .*its last heartbeat 91 s ago, over 90 s: that process is gone\)/);
     assert.deepEqual(parseLockText(readFileSync(path, 'utf8')), me);
-    assert.throws(() => acquireTraderLock(path, { onExit: false, me, alive: nobody }), /this process \(pid 1\) already trades this desk/);
+    assert.equal(existsSync(`${path}.takeover`), false, 'the takeover guard is removed');
+    assert.throws(() => acquireTraderLock(path, { onExit: false, me, alive: nobody, timers: noTimers }), /this process \(pid 1\) already trades this desk/);
     lock.release();
     assert.equal(existsSync(path), false);
-    // An older serve's lock: a bare pid 1, no start time.
+    // An older serve's lock: a bare pid 1, no heartbeat for over 90 s.
     writeFileSync(path, '1\n');
-    acquireTraderLock(path, { onExit: false, me, alive: nobody }).release();
-    // Another boot of the host: whatever its pid, its process is gone.
+    beatAgo(path, LOCK_STALE_MS + 1_000);
+    acquireTraderLock(path, { onExit: false, me, alive: nobody, timers: noTimers }).release();
+    // Another boot of the host: whatever its pid and its beat, its process is gone.
     writeFileSync(path, lockText({ pid: 7, startedMs: 5_000_000, id: 'x', boot: 'boot-b' }));
-    assert.match(acquireTraderLock(path, { onExit: false, me, alive: () => true }).tookOver ?? '', /an earlier boot of this host/);
-    rmSync(path);
-    // Held: pid 1 that started after this process (another pid namespace on the same volume), and a live other pid.
-    assert.equal(lockStatus({ pid: 1, startedMs: 3_000_000, id: 'other-ns', boot: 'boot-a' }, me, nobody).kind, 'held');
+    const rebooted = acquireTraderLock(path, { onExit: false, me, alive: () => true, timers: noTimers });
+    assert.match(rebooted.tookOver ?? '', /an earlier boot of this host/);
+    rebooted.release();
+    // Another pid: held while it runs, stale at once when it does not (no wait for the beat).
     writeFileSync(path, lockText({ pid: 42, startedMs: 1, id: 'pair-mainnet', boot: 'boot-a' }));
-    assert.throws(() => acquireTraderLock(path, { onExit: false, me, alive: (pid) => pid === 42 }), /another process \(pid 42\) trades this desk/);
-    assert.equal(lockStatus({ pid: 42, startedMs: 1, id: 'pair-mainnet', boot: null }, me, () => false).kind, 'stale');
+    assert.throws(() => acquireTraderLock(path, { onExit: false, me, alive: (pid) => pid === 42, timers: noTimers }), /another process \(pid 42\) trades this desk/);
+    assert.equal(lockStatus({ pid: 42, startedMs: 1, id: 'pair-mainnet', boot: null }, me, nobody, 0).kind, 'stale');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the heartbeat: the holder touches its lock every 30 s, stops when the lock is not its own any more, and on release()', () => {
+  const dir = tempDir();
+  try {
+    const path = join(dir, 'locks', 'trader.lock');
+    let tick: (() => void) | null = null;
+    let every = 0;
+    let cleared = 0;
+    let now = Date.now() + 45_000;
+    const timers = { setInterval: (fn: () => void, ms: number) => { tick = fn; every = ms; return 1; }, clearInterval: () => { cleared++; } };
+    const before = lockHeartbeats();
+    const lock = acquireTraderLock(path, { onExit: false, now: () => now, timers });
+    assert.equal(every, LOCK_HEARTBEAT_MS);
+    assert.equal(lockHeartbeats(), before + 1);
+    assert.equal(lock.beating(), true);
+    tick!();
+    assert.ok(Math.abs(statSync(path).mtimeMs - now) < 2_000, 'touched at the beat');
+    now += LOCK_HEARTBEAT_MS;
+    assert.equal(lock.beat(), true);
+    assert.ok(Math.abs(statSync(path).mtimeMs - now) < 2_000);
+    lock.release();
+    assert.deepEqual([lock.beating(), cleared, lockHeartbeats()], [false, 1, before]);
+    assert.equal(lock.beat(), false, 'released: nothing touched');
+    // A lock that another process took over (this one was judged dead): the beat stops and leaves it alone.
+    const lost = acquireTraderLock(path, { onExit: false, timers });
+    writeFileSync(path, lockText({ pid: 77, startedMs: 1, id: 'the-new-holder', boot: null }));
+    beatAgo(path, 5_000);
+    const mtime = statSync(path).mtimeMs;
+    assert.equal(lost.beat(), false);
+    assert.equal(lost.beating(), false);
+    assert.equal(lockHeartbeats(), before);
+    assert.equal(statSync(path).mtimeMs, mtime, 'not touched');
+    lost.release();
+    assert.equal(parseLockText(readFileSync(path, 'utf8'))?.id, 'the-new-holder', 'release removes only its own lock');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('two starters that read the same stale lock: only one takes it over; the other sees the new holder as held', () => {
+  const dir = tempDir();
+  try {
+    const path = join(dir, 'locks', 'trader.lock');
+    const nobody = () => false;
+    const a = { pid: 1, startedMs: 3_000_000, id: 'starter-a', boot: null };
+    const b = { pid: 1, startedMs: 3_000_001, id: 'starter-b', boot: null };
+    const stale = () => {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, lockText({ pid: 1, startedMs: 1, id: 'killed', boot: null }));
+      beatAgo(path, LOCK_STALE_MS + 60_000);
+    };
+    // B runs its whole takeover between A's read of the stale lock and A's takeover (the read, unlink, create race).
+    stale();
+    let bLock: TraderLock | null = null;
+    assert.throws(() => acquireTraderLock(path, {
+      onExit: false, me: a, alive: nobody, timers: noTimers,
+      onTakeover: (stage) => {
+        if (stage === 'read' && bLock === null) bLock = acquireTraderLock(path, { onExit: false, me: b, alive: nobody, timers: noTimers });
+      },
+    }), /another process \(pid 1, this process's own pid in another process .*last heartbeat 0 s ago/);
+    assert.match(bLock!.tookOver ?? '', /was stale/);
+    assert.equal(parseLockText(readFileSync(path, 'utf8'))?.id, 'starter-b', 'B holds it; A did not unlink it');
+    bLock!.release();
+    // B starts while A holds the takeover guard: B is refused (its start is tried again), A takes it over.
+    stale();
+    let bSaid = '';
+    const aLock = acquireTraderLock(path, {
+      onExit: false, me: a, alive: nobody, timers: noTimers,
+      onTakeover: (stage) => {
+        if (stage !== 'guarded') return;
+        try {
+          acquireTraderLock(path, { onExit: false, me: b, alive: nobody, timers: noTimers });
+        } catch (err) {
+          bSaid = (err as Error).message;
+        }
+      },
+    });
+    assert.match(bSaid, /another process is taking over the stale trader lock .* now/);
+    assert.equal(parseLockText(readFileSync(path, 'utf8'))?.id, 'starter-a');
+    assert.equal(existsSync(`${path}.takeover`), false);
+    aLock.release();
+    // A guard left by a starter that died while taking over is removed once it is old.
+    stale();
+    writeFileSync(`${path}.takeover`, '');
+    beatAgo(`${path}.takeover`, LOCK_HEARTBEAT_MS + 5_000);
+    const cLock = acquireTraderLock(path, { onExit: false, me: b, alive: nobody, timers: noTimers });
+    assert.match(cLock.tookOver ?? '', /was stale/);
+    cLock.release();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
