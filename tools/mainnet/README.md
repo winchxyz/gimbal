@@ -66,7 +66,8 @@ node tools/mainnet/retire.mjs <contract>.near --beneficiary <funder>.near --crea
 ```
 
 Retiring sends one **DeleteAccount** for `<contract>.near`, signed with `.keys/<contract>.near.json`. Its whole
-NEAR balance, the NEAR held for the code's storage included, goes to the beneficiary.
+NEAR balance, the NEAR held for the code's storage included, goes to the beneficiary. A **locked** contract (the
+final deploy, section 8, "Final deploy") has no key left and can never be retired; a canary is never locked.
 
 **Why the checks.** After the deletion anyone can register `<contract>.near` again. Every desk address is an MPC
 key derived from the contract's name (`gimbal/<desk_id>/evm`, `gimbal/<desk_id>/sol` with the contract as
@@ -227,6 +228,9 @@ Read the dry run:
   - the treasury: the NEAR account, the HL builder lowercased, the referral codes from `.env`;
   - fees: 1000 bps performance, 10 tenth-bps builder fee;
   - Orderly: the broker from `.env` on chain 42161.
+- **tx 3**, printed as its own later run: the **DeleteKey** that locks the account (final deploy only, section 8,
+  "Final deploy"). `--send` never sends it. For a name with `canary` in it the dry run prints `tx 3: none: a
+  canary is never locked (it gets retired)`.
 
 Every value given to `new()` is permanent, so check each one now. The `env` lines show the broker id and
 the referral codes in full and say where each came from; a `warning` line means the shell environment set it
@@ -257,7 +261,8 @@ node tools/mainnet/deploy.mjs <same arguments> --send
 ```
 
 This sends tx 1, waits for final, sends tx 2, waits for final, then prints both hashes (nearblocks links) and
-`config()`, which it compares with the init args. The new full-access key is written to
+`config()`, which it compares with the init args, and (not for a canary) the lock command. The new full-access
+key is written to
 `.keys/<contract>.near.json` (the script prints its absolute path). It is the contract account's only key.
 **Back it up right after tx 1** (the script says `back up ... now` at that point), before anything else
 happens. Without it nothing can sign for the account: no retry of tx 2, and no DeleteAccount to get the NEAR
@@ -697,6 +702,146 @@ about 6.3), 0.7 free on the owner for the desk, and 0.3 NEAR free on the owner p
      late authorization is valid until block time + 300 s: do not rerun before then. The contract's deposit ring
      refuses a deposit address paid before, and USDC refuses an authorization used before.
 
+### Final deploy: deploy, check, lock
+
+The final reviewed deploy ends with **no access key on the contract account**, so no key, ours included, can
+deploy new code to it, sign for it or retire it. No key can move its NEAR either; only the contract's own methods
+spend it (`refresh_prices`' oracle deposit, refunds). The canaries are never locked (they get retired): `--lock`
+refuses any name with `canary` in it. Lock before any USDC goes in, and only after the checks below. Run every
+command from the main checkout, the dry run first:
+
+1. **Policy:** `node tools/mainnet/policy.mjs` ends `matches live data`.
+2. **Reproducible build** of the reviewed commit, from a clean checkout whose commit is pushed:
+
+   ```
+   cd contract && cargo near build reproducible-wasm
+   ```
+
+   It builds inside the Docker image pinned in `contract/Cargo.toml` and writes the image, the command and the
+   source (`git+<repo>?rev=<commit>`) into the wasm's NEP-330 metadata (`contract_source_metadata()`'s
+   `build_info`), so anyone with that commit and the image can build the same bytes and compare the code hash.
+   It needs:
+   - **Docker's engine running** (start Docker Desktop; `docker version` must show a Server section);
+   - a `[package.metadata.near.reproducible_build]` section in `contract/Cargo.toml` (the image, its digest and
+     the build command). **On 2026-11-03 the section is missing** (a contract PR adds it), and Docker Desktop is
+     installed but its engine was not running.
+
+   The lock reads which kind of build the wasm is, and refuses a non-reproducible one unless `--non-reproducible`
+   (step 5). The repo is public from the hackathon submission; the commit is named so anyone can rebuild it then.
+3. **Deploy** (section 2) to a fresh `<contract>.near`:
+
+   ```
+   node tools/mainnet/deploy.mjs <contract>.near --funder <funder>.near --key-file <funder key json> \
+        --treasury-near <treasury> --hl-builder 0x<40 hex>
+   node tools/mainnet/deploy.mjs <same arguments> --send
+   ```
+
+   The dry run's `build` line says `reproducible` (with the image and the source) or `non-reproducible`; it
+   prints tx 1, tx 2 and tx 3 (the DeleteKey) as its own later run. `--send` sends tx 1 and tx 2 only, and ends
+   with the lock command (`--lock`, then the same with `--send --confirm-lock <contract>.near`).
+4. **Check the deployed contract** before locking it: `view.mjs <contract>.near config` and `version`,
+   `view.mjs --keys <contract>.near` (exactly one FullAccess key, the one the deploy printed), and both
+   transactions on nearblocks.io/address/`<contract>.near`. After the lock nothing can be fixed: a wrong treasury,
+   referral code or broker stays for good.
+5. **Lock** (tx 3):
+
+   ```
+   node tools/mainnet/deploy.mjs <contract>.near --lock --treasury-near <treasury> --hl-builder 0x<40 hex>
+   node tools/mainnet/deploy.mjs <contract>.near --lock --treasury-near <treasury> --hl-builder 0x<40 hex> \
+        --send --confirm-lock <contract>.near
+   ```
+
+   `--lock` is its own run on an account deployed earlier: it takes no `--funder`, `--key-file`, `--balance` or
+   `--resume`, so it also works as the resume after a lock whose outcome was not seen. It refuses any name with
+   `canary` in it. `--lock --send` needs `--treasury-near`, `--hl-builder` and `--confirm-lock` with the contract
+   account typed again exactly; the dry run may leave out the treasury and the builder (then `config()`'s are taken
+   as they are, with a warning). It reads `.env` for the broker and the referral codes, like the deploy. Before
+   signing it checks, and the dry run prints each check:
+   - the checkout: clean (`git status --porcelain` empty) and its commit on a branch of `origin`
+     (`refs/remotes/origin/*`, no other remote), read after `git fetch --prune origin` (a failed fetch counts as
+     not pushed);
+   - the build: the wasm's NEP-330 `build_info` is filled (a reproducible build), its snapshot names
+     `https://github.com/winchxyz/gimbal`, and the commit it names is the checkout's `HEAD` (else it refuses:
+     check out that commit and lock from there). The lock does not rebuild a reproducible wasm in Docker: the
+     evidence says what its `build_info` names, and anyone can rebuild that to compare. A non-reproducible wasm is
+     refused, with why `reproducible-wasm` cannot run here now (Docker not installed, Docker's engine not running:
+     "start Docker Desktop", or the missing `Cargo.toml` section), unless `--non-reproducible`, which rebuilds it
+     first (below);
+   - the wasm exports every method a locked contract needs, since its code never changes again: every method
+     of the table in `docs/interfaces.md` §1.3 (owner, operator and public ones), every view on its `Views:` line
+     (`config`, `get_desk`, `desks_of`, `prices`, `version`) and every `#[private]` callback in `contract/src`
+     (`on_signed`, the payout callbacks, ...; 44 in all on 2026-11-03). The list is read from this checkout, not
+     kept by hand, so a method the table, the views or the contract gains is required from then on; a missing one
+     is named and refused. The reading refuses rather than guesses: a table row whose method is not
+     `` `name(args)` `` in lowercase, a `#[private]` it cannot match to a `pub fn`, no contract source, or a table
+     without the money methods, `panic_close`, `hl_withdraw`, `hl_send_to_intents`, `evm_usdc_to_intents` or the
+     five views;
+   - `code_hash` (`view_account`) equals the base58 sha256 of `contract/target/near/gimbal.wasm`;
+   - `version()` equals the `[package]` version in `contract/Cargo.toml` (and the version in the wasm's metadata);
+   - `config()` is exactly what `new()` was given on mainnet: Mainnet, `v1.signer`, OutLayer `price-oracle.near`,
+     fees 1000 / 10, Orderly `gimbal_dex` on 42161, the referral codes from `.env`, the treasury and the builder
+     (every differing field is printed);
+   - the treasury exists and is registered on USDC on NEAR (as the deploy checks it);
+   - `view_access_key_list` is exactly one key, the FullAccess key in `.keys/<contract>.near.json`. Any other key
+     is printed and refused: whoever holds it could still deploy code after the lock.
+
+   The `balance` line prints the NEAR free above storage: after the lock no key can move it; only the contract's
+   own methods spend it (`refresh_prices`' oracle deposit, refunds).
+
+   **`--non-reproducible`** (while the reproducible build cannot run): the wasm on disk may be any earlier build,
+   so the lock deletes `contract/target/near/gimbal.wasm`, rebuilds it in the clean checkout (`cd contract &&
+   cargo near build non-reproducible-wasm --no-abi`, minutes), reads the checkout again (the build must not change
+   it: commit what it writes), and only those bytes are compared with the deployed `code_hash`. It refuses a dirty
+   checkout, a set `CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET_DIR`, a wasm still there after the deletion, a failed
+   build, a build that wrote no file (a file time older than the rebuild is only a warning: the file did not exist
+   before the build, and a copy keeps its source's time), a file that cargo-near says it wrote elsewhere (its
+   `- Binary:` line, colours stripped), a rebuilt file with a non-null `build_info` (not what
+   non-reproducible-wasm writes, so a stale file) and a different hash. The evidence then says exactly that:
+   rebuilt from that clean commit, with that cargo-near and rustc, the sha256 equals the deployed code; another
+   machine may not rebuild the same bytes. The dry run rebuilds too.
+
+   It refuses when any check fails, when the account does not exist or has no code, and on any chain but mainnet
+   (testnet contracts stay upgradeable; there is no flag for testnet). `--send` sends one DeleteKey of that key,
+   signed by that key itself, waits for final, then reads `view_access_key_list` (it must be empty) and
+   `code_hash` (unchanged). If the DeleteKey fails, read the key list (rerun the `--lock` dry run) before anything
+   else.
+
+   - **Cost:** the DeleteKey's action fees, at most about 0.5 TGas (under 0.0001 NEAR) from the contract's balance.
+   - **After:** `.keys/<contract>.near.json` is on no account any more and can sign nothing: you can delete it.
+     No key can move the contract's NEAR; only its own methods spend it (anyone can still send it NEAR).
+   - **Rerun:** an account that has no keys already prints `nothing to send` and the evidence block below
+     without the hash: take the DeleteKey's hash from nearblocks.io/address/`<contract>.near`.
+
+6. **Evidence:** `--send` ends with a block to paste back:
+
+   ```
+   === gimbal lock <time> ===
+   contract:  <contract>.near https://nearblocks.io/address/<contract>.near
+   DeleteKey: tx <hash> https://nearblocks.io/txns/<hash>
+   code_hash: <base58>
+   sha256:    <hex> (contract/target/near/gimbal.wasm, <bytes> bytes)
+   version:   <version> (contract/Cargo.toml, version() on chain)
+   checkout:  commit <commit>, clean, on a branch of origin after git fetch --prune origin
+   build:     reproducible: its NEP-330 build_info names cargo near build reproducible-wasm, image <image@digest>, source git+https://github.com/winchxyz/gimbal?rev=<commit> (not rebuilt by this run)
+   keys:      view_access_key_list is empty
+   README:
+   Contract has no access keys: DeleteKey tx <hash> (https://nearblocks.io/txns/<hash>), code_hash <base58> (sha256 <hex>); its NEP-330 build_info names a reproducible build (<image@digest>) of git+https://github.com/winchxyz/gimbal?rev=<commit>.
+   === end ===
+   ```
+
+   The last line goes into the project README (the mainnet evidence and security sections). Anyone can check the
+   lock: `view.mjs --keys <contract>.near` lists no key and nearblocks shows the DeleteKey. With a reproducible
+   build anyone can also rebuild the named commit in the named image and get the same `code_hash`.
+
+   With `--non-reproducible` the `build` line and the README line say only what the run verified:
+   `Contract has no access keys: DeleteKey tx <hash> (<link>), code_hash <base58>. Its code is a non-reproducible
+   build of commit <commit> (cargo-near <version>, rustc <version>): rebuilt from that clean commit when it was
+   locked, its sha256 <hex> equals the deployed code; another machine may not rebuild the same bytes.` The repo
+   is public from the hackathon submission; the commit is named so anyone can rebuild it then.
+
+Then the desk and the money steps (steps 4 to 9 above) run as for the canary: none of them needs the contract
+account's key.
+
 ## Access keys
 
 `node tools/mainnet/keys.mjs list <owner>.near` prints every access key of an account with its permission: FullAccess,
@@ -714,7 +859,7 @@ overwritten, and each is printed with its absolute path when written:
 
 | file | written by | content |
 |---|---|---|
-| `.keys/<contract>.near.json` | deploy `--send` | the contract account's only full-access key: back it up right after tx 1 |
+| `.keys/<contract>.near.json` | deploy `--send` | the contract account's only full-access key: back it up right after tx 1; after `--lock --send` it is on no account and can be deleted |
 | `.keys/operator-<contract>.near.json` | desk `--send` | the engine's FunctionCall key on the owner's account |
 | `.keys/engine-mainnet-<contract>.near.env` | desk `--send` | the engine settings below |
 | `.env` `RELAYER_EVM_PRIVATE_KEY` | relayer-wallet `--write` | the Arbitrum gas wallet's key, only into an empty entry |
