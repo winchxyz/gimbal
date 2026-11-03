@@ -15,8 +15,11 @@
 //                       books at most every 30 s per market, each watch-only venue's sweep every 10 min, so an hour
 //                       stays a few MB)
 //   --minutes <n>       with --record: stop after n minutes and close the file
-//   --state-dir <dir>   GIMBAL_STATE_DIR: where the confirmed engine rules (PUT /strategy) are kept across restarts,
-//                       one file per mode and desk; default engine/state/ (gitignored)
+//   --state-dir <dir>   GIMBAL_STATE_DIR: where the confirmed engine rules (PUT /strategy) and the pair trader's state
+//                       are kept across restarts, one file per mode and desk; default engine/state/ (gitignored) for
+//                       the rules, and for the pair trader the per-user state directory outside any checkout
+//                       (trade/trader-state.ts userStateDir), so another worktree or a clean cannot lose it
+//   --once              start, adopt the pair, print what is live, read the desk once, and exit (no HTTP server)
 // NEAR_AI_API_KEY turns on POST /policy/draft (src/nearai/); without it the route answers 503, drafting unavailable.
 // GIMBAL_SETUP=1 turns on POST /setup (src/setup/): venue setup signs through the operator key (OPERATOR_PRIVATE_KEY).
 // The contract (testnet and mainnet, src/cli/serve-contract.ts): with GIMBAL_CONTRACT_ID and DESK_ID set (and
@@ -25,16 +28,24 @@
 // only: serve signs nothing. Without it the live modes read no oracle prices, so every priced desk leg is refused
 // E_ORACLE_STALE, as the contract would refuse it, and the venue reads are public: no keys. Replay stands in the
 // contract's Mock prices: the recording's Hyperliquid oracle prices, dated by the replay clock the scanner runs on.
+// The pair (mainnet, src/cli/serve-pair.ts): the carry pair pair-mainnet opened is adopted from the venues at start and
+// held by a PairTrader whose orders are all reduce-only: panic_close closes both legs, a rescue's reduce makes both
+// smaller, a confirmed ADL pauses the pair and unwinds both (risk/adl.ts). It trades only with GIMBAL_TRADE=1 (the
+// operator key, the per-desk lock, never in a linked worktree); otherwise it only alerts. GIMBAL_TRADER_FRESH=1 starts
+// its state anew from the venues' positions (a missing state file is not a fresh start).
+// The monitor (src/risk/monitor.ts): every 30 min the legs, their distance to liquidation and the net; an alert to the
+// journal and the console when a leg is under 25 % from liquidation. `npm run monitor -w engine -- --mainnet` is the
+// one-shot form.
 // The risk engine (src/risk/) reads the desk every 5 s: with the contract, the desk's Hyperliquid and Phoenix accounts;
 // in replay, a scripted desk priced by the recording. It publishes `desk`, `health`, `journal` and `rescue`, and answers
 // POST /stress (testnet and replay; refused on mainnet). `health` is published in every mode: the venues the last
 // scan or account read missed, 1Click (probed every minute in the live modes) and NEAR.
 
-import { readdirSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import type { ContractPolicy, Mode, StreamEvent } from '@gimbal/shared';
+import type { ContractPolicy, DeskState, Mode, StreamEvent } from '@gimbal/shared';
 import { ReplayOracle } from '../contract/replay-oracle.ts';
 import { NearAiClient } from '../nearai/client.ts';
 import { PolicyDrafter, deskMarkets } from '../nearai/draft-route.ts';
@@ -56,6 +67,9 @@ import { AccountsDeskSource, ReplayDesk } from '../risk/sources.ts';
 import type { ClosingWatch } from '../rescue/closing.ts';
 import { serveRescue } from '../rescue/serve-rescue.ts';
 import { VenueHealth, probeIntents } from '../risk/venue-health.ts';
+import { ALERT_DISTANCE_PCT, LiquidationAlert, MONITOR_EVERY_MS, monitorLines } from '../risk/monitor.ts';
+import type { ServePair } from './serve-pair.ts';
+import { liveLines, servePair } from './serve-pair.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { connectContract, contractEnv, marginVenues } from './serve-contract.ts';
 import { ThinningSink, WATCH_RECORD_GAPS, loadPolicyFile, replayStart, scanLine } from './serve-replay.ts';
@@ -70,6 +84,7 @@ const { values } = parseArgs({
     record: { type: 'string' },
     minutes: { type: 'string' },
     'state-dir': { type: 'string' },
+    once: { type: 'boolean' },
   },
 });
 
@@ -195,7 +210,8 @@ function publishHealth(): void {
   if (next !== null) server.publish({ type: 'health', data: next });
 }
 // The confirmed engine rules survive a restart; a file that no longer passes the checks falls back to the defaults.
-const stateDir = values['state-dir'] ?? envVar('GIMBAL_STATE_DIR') ?? fileURLToPath(new URL('../../state/', import.meta.url));
+const stateDirSet = values['state-dir'] ?? envVar('GIMBAL_STATE_DIR');
+const stateDir = stateDirSet ?? fileURLToPath(new URL('../../state/', import.meta.url));
 let strategyStore: StrategyStore;
 try {
   strategyStore = new StrategyStore(strategyFile(resolve(stateDir), mode, deskId));
@@ -209,7 +225,18 @@ const drafter = new PolicyDrafter({ client: new NearAiClient({ apiKey: envVar('N
 log(drafter.configured ? `policy drafts: NEAR AI ${drafter.model}` : 'policy drafts: off (NEAR_AI_API_KEY is not set), POST /policy/draft answers 503');
 const setup = await setupFromEnv(mode, envVar, log).catch((err: unknown) => fail(`setup: ${errorMessage(err)}`));
 
-const publish = (event: StreamEvent) => server?.publish(event);
+// The 25 % liquidation alert rides on every `desk` event the risk engine publishes (risk/monitor.ts).
+const liquidation = new LiquidationAlert();
+let lastDesk: DeskState | null = null;
+let monitorSeq = 0;
+const publish = (event: StreamEvent) => {
+  server?.publish(event);
+  if (event.type !== 'desk') return;
+  lastDesk = event.data;
+  const alert = liquidation.observe(event.data, clock.now());
+  for (const line of alert.console) log(line);
+  for (const j of alert.journal) server?.publish({ type: 'journal', data: { id: `monitor-${j.t.toString(36)}-${++monitorSeq}`, ...j } });
+};
 let deskSource: DeskSource | null = null;
 let replayDesk: ReplayDesk | null = null;
 // panic_close: every get_desk read tells it whether the desk is closing (rescue/closing.ts).
@@ -244,15 +271,21 @@ if (mode === 'replay') {
   });
   log(`risk: reading the desk's ${accounts.map((a) => a.reader.id).join(' and ')} accounts every 5 s (Orderly legs need its private stream, which serve does not open)`);
 }
+let pair: ServePair | null = null;
+if (contract !== null && deskId !== null) {
+  const side = contract;
+  const id = deskId;
+  pair = await servePair({
+    mode, env: envVar, side, deskId: id, clock, log, publish, linkedWorktree: linkedWorktree(),
+    ...(stateDirSet === undefined ? {} : { stateDir: resolve(stateDirSet) }),
+  }).catch((err: unknown) => fail(`pair: ${errorMessage(err)}`));
+}
 if (deskSource !== null) {
-  // TODO(day 10): pass `adl: new AdlWatch(pairTrader, ...)` once serve holds the strategy engine's PairTrader; until
-  // then nothing here trades, and ADL is checked only where a PairTrader runs.
   // E9: the rescue executor takes the risk engine's triggers (recorded 1Click answers off mainnet, live only with
-  // GIMBAL_RESCUE=1 on mainnet). TODO(day 10): pass the PairTrader as `reducer` so a rescue can reduce both legs and
-  // panic_close can close them.
+  // GIMBAL_RESCUE=1 on mainnet); its reduce and panic_close trade through the pair when it trades.
   const side = contract;
   const rescue = await serveRescue({
-    mode, env: envVar, clock, publish, log, risk: () => risk, policy,
+    mode, env: envVar, clock, publish, log, risk: () => risk, policy, reducer: () => pair?.reducer() ?? null,
     ...(replayDesk === null ? {} : { replayDesk }),
     ...(side === null ? {} : {
       getDesk: async () => {
@@ -267,7 +300,27 @@ if (deskSource !== null) {
   risk = new RiskEngine({
     mode, source: deskSource, strategy: () => server?.strategy ?? DEFAULT_STRATEGY, health: venueHealth, publish, clock, log,
     ...(rescue.rescuer === undefined ? {} : { rescuer: rescue.rescuer, rescuerRunning: rescue.running }),
+    ...(pair?.adl === undefined ? {} : { adl: pair.adl }),
   });
+  if (pair !== null) {
+    const lines = liveLines({
+      pair, rescueSummary: rescue.summary, rescueLive: mode === 'mainnet' && rescue.rescuer !== undefined, mode,
+      alertPct: ALERT_DISTANCE_PCT, monitorMin: MONITOR_EVERY_MS / 60_000,
+    });
+    for (const line of lines) log(line);
+  }
+}
+if (values.once === true) {
+  // One read of the desk (the alert included), the monitor lines, and out: nothing listens, nothing is left running.
+  await risk?.tick();
+  await risk?.adlRunning;
+  for (const line of lastDesk === null ? ['monitor   no desk read'] : monitorLines(lastDesk)) log(line);
+  await risk?.stop();
+  pair?.stop();
+  contract?.prices.stop();
+  readers.close();
+  log('--once: done');
+  process.exit(0);
 }
 
 server = new EngineServer({
@@ -305,6 +358,11 @@ if (mode !== 'replay') {
   intentsTimer = setInterval(() => void probe(), 60_000);
   intentsTimer.unref();
 }
+// The monitor: the legs, their distance to liquidation and the net, every 30 min (read-only).
+const monitorTimer = setInterval(() => {
+  for (const line of lastDesk === null ? ['monitor   no desk read yet'] : monitorLines(lastDesk)) log(line);
+}, MONITOR_EVERY_MS);
+monitorTimer.unref();
 const shown = host.includes(':') ? `[${host}]` : host;
 log(`engine ${mode} on http://${shown}:${listening}: GET /events /state /windows/history?id= /strategy /journal, PUT /strategy`);
 
@@ -314,7 +372,9 @@ async function shutdown(reason: string): Promise<void> {
   stopping = true;
   log(`stopping: ${reason}`);
   clearInterval(intentsTimer);
+  clearInterval(monitorTimer);
   await risk?.stop();
+  pair?.stop();
   await server!.stop();
   contract?.prices.stop();
   readers.close();
@@ -335,6 +395,12 @@ function noteOnce(note: string): void {
   if ((seenNotes.get(kind) ?? 0) > at - 60_000) return;
   seenNotes.set(kind, at);
   log(note);
+}
+
+/** The repo root's .git is a file in a linked worktree (GIMBAL_TRADE=1 refuses there, as pair-mainnet --send does). */
+function linkedWorktree(): boolean {
+  const git = fileURLToPath(new URL('../../../.git', import.meta.url));
+  return existsSync(git) && statSync(git).isFile();
 }
 
 function newestRecording(): string {

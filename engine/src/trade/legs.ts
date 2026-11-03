@@ -417,6 +417,11 @@ export class HlLeg implements TradeLeg {
     return this.#pending;
   }
 
+  /** Post-only orders an earlier process could not settle (a saved state): cancelPending tries them like its own. */
+  adoptPending(orders: readonly PendingMakerOrder[]): void {
+    for (const p of orders) if (!this.#pending.some((x) => x.cloid === p.cloid)) this.#pending.push({ ...p });
+  }
+
   /**
    * Tries each post-only order a maker order could not settle once more: its status by oid (or cloid), a cancel while
    * it rests, and what it filled. One line each; an order whose state is settled here leaves the list. Never throws.

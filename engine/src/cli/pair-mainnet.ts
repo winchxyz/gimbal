@@ -74,6 +74,7 @@ import { commonLot, floorToLot, qtyNumber, qtyString, signedQtyString, toQty } f
 import type { PairResult } from '../trade/pair.ts';
 import { PairTrader } from '../trade/pair.ts';
 import { PhoenixLeg, parseTraderSnapshot, phoenixTraderApi } from '../trade/phoenix-leg.ts';
+import { lockHolder, traderLockPath } from '../trade/trader-state.ts';
 import { HL_MAINNET_URL, HyperliquidReader } from '../venues/hyperliquid.ts';
 import { PHOENIX_API_URL, PhoenixReader, SOLANA_MAINNET_RPC_URL } from '../venues/phoenix.ts';
 import { errorMessage } from '../venues/recorder.ts';
@@ -159,6 +160,9 @@ async function main(argv: string[]): Promise<void> {
   if (cfg === null) throw new Error('GIMBAL_CONTRACT_ID is not set: pass the engine env file with node --env-file');
   if (cfg.network !== 'mainnet') throw new Error('mainnet only');
   if (args.send && (cfg.privateKey === undefined || cfg.accountId === undefined)) throw new Error('--send needs OPERATOR_ACCOUNT_ID and OPERATOR_PRIVATE_KEY in the env file');
+  // One trader per desk: a serve with GIMBAL_TRADE=1 holds this lock and trades the same legs (trade/trader-state.ts).
+  const serving = args.send ? lockHolder(traderLockPath(envVar, 'mainnet', cfg.contractId, cfg.deskId)) : null;
+  if (serving !== null) throw new Error(`serve (pid ${serving}) trades desk ${cfg.deskId}: stop it first, run this, then start serve again (it adopts the legs from the venues)`);
   const hlUrl = (envVar('HL_API_URL') ?? HL_MAINNET_URL).replace(/\/+$/, '').replace(/\/info$/, '');
   if (/testnet/.test(hlUrl)) throw new Error(`HL_API_URL ${hlUrl} is a testnet URL; this is the mainnet pair`);
   const phoenixUrl = (envVar('PHOENIX_API_URL') ?? PHOENIX_API_URL).replace(/\/+$/, '');

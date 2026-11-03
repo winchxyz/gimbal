@@ -261,21 +261,23 @@ test('an ADL response that hangs (a slow MPC signature) blocks neither the reads
   await risk.stop();
 });
 
-test('one ADL event, one journal line: retries that did not level the pair are not journaled, the one that did is', async () => {
+test('every ADL report is journaled: each attempt that failed and the one that unwound (bug C: no end without a line)', async () => {
   const leg = { venue: 'hyperliquid', symbol: 'ETH' } as unknown as TradeLeg;
-  const report = (retry: number, closed: boolean): AdlReport => ({
-    findings: [{ index: 0, leg, intent: -500n, pos: -300n, change: 'shrank' }], action: 'rehedge', targets: [-300n, 300n],
-    result: closed ? ({ status: 'closed', tx: [], notes: [] } as unknown as AdlReport['result']) : null,
-    summary: `ADL try ${retry}`, retry, reached: closed, gaveUp: false,
+  const report = (attempt: number, stage: AdlReport['stage']): AdlReport => ({
+    stage, findings: [{ index: 0, leg, baseline: -500n, pos: -300n, change: 'shrank' }],
+    result: null, tx: [], summary: `ADL attempt ${attempt} ${stage}`, attempt, attemptsLeft: 3 - attempt, ownerAlert: false,
   });
-  const answers = [report(0, false), null, null, report(1, false), null, report(2, true), null];
+  const answers = [report(1, 'failed'), null, null, report(2, 'failed'), null, report(3, 'unwound'), null];
   const adl = { check: async () => answers.shift() ?? null } as unknown as AdlWatch;
   const { risk, journal } = rig({ adl });
   for (let i = 0; i < 7; i++) {
     await risk.tick();
     await risk.adlRunning;
   }
-  assert.deepEqual(journal().filter((j) => j.kind === 'adl').map((j) => [j.summary, j.numbers.retry]), [['ADL try 0', undefined], ['ADL try 2', 2]]);
+  assert.deepEqual(journal().filter((j) => j.kind === 'adl').map((j) => [j.summary, j.numbers.attempt, j.numbers.stage]), [
+    ['ADL attempt 1 failed', 1, 'failed'], ['ADL attempt 2 failed', 2, 'failed'], ['ADL attempt 3 unwound', 3, 'unwound'],
+  ]);
+  assert.equal(journal().filter((j) => j.kind === 'error').length, 0);
 });
 
 /** One leg in rescue (ratio 4) whose mark cannot be told; `entryPx` 0 leaves no price at all. */
@@ -362,8 +364,8 @@ test('stop() during a tick whose read is out: that tick publishes and triggers n
 test('an ADL watch that gives up: an error line in the journal, only the owner can act', async () => {
   const leg = { venue: 'phoenix', symbol: 'ETH' } as unknown as TradeLeg;
   const report: AdlReport = {
-    findings: [{ index: 1, leg, intent: 500n, pos: 300n, change: 'shrank' }], action: 'rehedge', targets: [-300n, 300n],
-    result: null, summary: 'ADL on phoenix ETH 0.5 -> 0.3; 8 tries did not bring the pair level', retry: 7, reached: false, gaveUp: true,
+    stage: 'gave-up', findings: [{ index: 1, leg, baseline: 500n, pos: 300n, change: 'shrank' }],
+    result: null, tx: [], summary: 'ADL on phoenix ETH 0.5 -> 0.3: the pair\'s unwind attempts are spent', attempt: 3, attemptsLeft: 0, ownerAlert: true,
   };
   let answers = [report];
   const adl = { check: async () => answers.shift() ?? null } as unknown as AdlWatch;
@@ -373,9 +375,9 @@ test('an ADL watch that gives up: an error line in the journal, only the owner c
   answers = [];
   const errors = journal().filter((j) => j.kind === 'error');
   assert.equal(errors.length, 1);
-  assert.match(errors[0]!.summary, /^ADL on phoenix ETH: no more tries, only the owner can act now/);
-  assert.equal(errors[0]!.numbers.tries, 8);
-  assert.equal(journal().filter((j) => j.kind === 'adl').length, 0, 'a retry that did not reach is not journaled as adl');
+  assert.match(errors[0]!.summary, /^owner: ADL on phoenix ETH 0\.5 -> 0\.3: the pair's unwind attempts are spent/);
+  assert.equal(errors[0]!.numbers.stage, 'gave-up');
+  assert.deepEqual(journal().filter((j) => j.kind === 'adl').map((j) => j.numbers.attemptsLeft), [0], 'the attempt is journaled as adl too');
 });
 
 test('the desk view: never read is NEAR down and the desk at watch; a late read slow; older than a minute down again', async () => {

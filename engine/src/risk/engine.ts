@@ -3,8 +3,8 @@
 // (thresholds.ts), and publishes:
 //   - `desk`: DeskState with the legs and the desk's health (the worst leg's level);
 //   - `health`: the HealthMap, when a venue, 1Click or NEAR changes state (venue-health.ts);
-//   - `journal`: `rescue` for each rescue trigger, `adl` when a leg shrank without an order of ours (adl.ts),
-//     `error` when a venue stops answering;
+//   - `journal`: `rescue` for each rescue trigger, `adl` for every end of an ADL check (adl.ts: confirmed, each unwind
+//     attempt, the budget spent, the event ended), `error` when a venue stops answering or only the owner can act;
 //   - `rescue`: a RescueProgress at step `detect` for each rescue trigger, unless a rescuer (E9) takes the trigger.
 //
 // Rescue triggers are per leg. A leg that reaches rescue is triggered once; while it stays in rescue it is triggered
@@ -328,14 +328,8 @@ export class RiskEngine {
     this.#adlRun = (async () => {
       try {
         const report = await adl.check();
-        // One event, one journal line: a retry after a backoff is journaled only when it brought the pair level.
-        if (report !== null && (report.retry === 0 || report.reached)) {
-          this.#journal({ ...adlJournal(report, this.#clock.now()) });
-        }
-        if (report?.gaveUp === true) {
-          const f = report.findings[0]!;
-          this.#journal({ t: this.#clock.now(), kind: 'error', summary: `ADL on ${f.leg.venue} ${f.leg.symbol}: no more tries, only the owner can act now (${report.summary})`, numbers: { venue: f.leg.venue, tries: report.retry + 1 }, tx: report.result?.tx ?? [] });
-        }
+        // Every report is an end (adl.ts): journaled, with an `error` line too when only the owner can act.
+        if (report !== null) for (const entry of adlJournal(report, this.#clock.now())) this.#journal(entry);
       } catch (err) {
         this.#log(`adl check failed: ${errorMessage(err)}`);
       } finally {

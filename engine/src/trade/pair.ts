@@ -139,6 +139,20 @@ export interface PairTraderOptions {
 }
 
 /**
+ * What a trader keeps across a restart (trade/trader-state.ts writes it to disk): what each leg should hold and what
+ * the last open, close or adoption left it meaning to hold (the ADL baseline), where it last knew each leg to be, the
+ * pair's net, the alert, and every order with no answer that may still run. Index 0 and 1 are `legs`.
+ */
+export interface PairTraderState {
+  intents: [bigint | null, bigint | null];
+  baselines: [bigint | null, bigint | null];
+  known: [bigint | null, bigint | null];
+  net: bigint;
+  unhedged: string | null;
+  unsettled: { index: 0 | 1; refs: LegRef[]; until: number; from: bigint; unwind: { to: bigint; reason: string; failed: boolean } | null }[];
+}
+
+/**
  * The unsettled orders on a leg (`ref` the latest of `refs`): one can still run until `until` (local ms); `from` is the
  * leg's position before the latest. `unwind`: an open stopped by a read that failed; when the leg reads again unmoved,
  * the other leg goes back to `to`.
@@ -197,6 +211,12 @@ export class PairTrader {
    * unsettled order, what offsets its partner.
    */
   readonly #intent = new Map<TradeLeg, bigint | null>();
+  /**
+   * What the last open, close or adoption left each leg meaning to hold. Unlike #intent, a watch check (a replayed copy
+   * reconciled, a deficit matched) never moves it: the ADL watch compares the venues with this, so nothing but the
+   * trader's own results can make a leg that shrank look expected.
+   */
+  readonly #baseline = new Map<TradeLeg, bigint | null>();
   /** Where the trader last knew each leg to be (a result or a check); an unsettled leg that moves from it ran its order. */
   readonly #known = new Map<TradeLeg, bigint | null>();
   /** What both legs together should hold: the sum of the last open's or close's targets (0 for a plain pair). */
@@ -410,6 +430,65 @@ export class PairTrader {
   /** What both legs together should hold: the sum of the last open's or close's targets (0 for a plain pair). */
   get net(): bigint {
     return this.#net;
+  }
+
+  /** What the last open, close or adoption left the leg meaning to hold (null: unknown; undefined: none yet). */
+  baseline(leg: TradeLeg): bigint | null | undefined {
+    return this.#baseline.get(leg);
+  }
+
+  /**
+   * Takes the venues' positions as the pair (a trader that starts next to a pair opened elsewhere, or legs found flat):
+   * intent, baseline and known position of each leg, and the net they should hold together. The alert is cleared when
+   * they offset each other and set when they do not. Unsettled orders stay watched.
+   */
+  adopt(positions: readonly [bigint, bigint], net = 0n): void {
+    this.#net = net;
+    for (const [i, leg] of this.legs.entries()) {
+      this.#intent.set(leg, positions[i]!);
+      this.#baseline.set(leg, positions[i]!);
+      this.#known.set(leg, positions[i]!);
+    }
+    const off = positions[0] + positions[1] - net;
+    this.unhedged = off === 0n
+      ? null
+      : `unhedged: adopted ${this.legs.map((l, i) => `${l.venue} ${l.symbol} ${signedQtyString(positions[i]!)}`).join(', ')}, which do not offset each other`;
+    this.#log(`adopted ${this.legs.map((l, i) => `${l.venue} ${l.symbol} ${signedQtyString(positions[i]!)}`).join(', ')}${off === 0n ? '' : ' (NOT offsetting)'}`);
+  }
+
+  /** The state a restart needs (see PairTraderState). */
+  exportState(): PairTraderState {
+    const pair = <T>(m: Map<TradeLeg, T>): [T | null, T | null] => [m.get(this.legs[0]) ?? null, m.get(this.legs[1]) ?? null];
+    const unsettled: PairTraderState['unsettled'] = [];
+    for (const [i, leg] of this.legs.entries()) {
+      const u = this.#unsettled.get(leg);
+      if (u === undefined) continue;
+      unsettled.push({ index: i as 0 | 1, refs: u.refs.map((r) => ({ ...r, tx: [...r.tx] })), until: u.until, from: u.from, unwind: u.unwind === null ? null : { ...u.unwind } });
+    }
+    return { intents: pair(this.#intent), baselines: pair(this.#baseline), known: pair(this.#known), net: this.#net, unhedged: this.unhedged, unsettled };
+  }
+
+  /**
+   * A saved state back in a new trader, before it trades: each order with no answer is watched again until its own
+   * window ends (its poll starts), and the intents are the saved ones, not what the venues hold now.
+   */
+  importState(s: PairTraderState): void {
+    if (this.#active > 0) throw new Error('importState: the trader is busy');
+    this.#net = s.net;
+    for (const [i, leg] of this.legs.entries()) {
+      this.#intent.set(leg, s.intents[i] ?? null);
+      this.#baseline.set(leg, s.baselines[i] ?? null);
+      this.#known.set(leg, s.known[i] ?? null);
+    }
+    this.unhedged = s.unhedged;
+    for (const u of s.unsettled) {
+      const leg = this.legs[u.index];
+      const ref = u.refs.at(-1);
+      if (ref === undefined) continue;
+      this.#unsettled.set(leg, { ref, refs: [...u.refs], until: u.until, from: u.from, unwind: u.unwind });
+      this.#log(`${leg.venue} ${leg.symbol}: ${u.refs.length === 1 ? 'an order' : `${u.refs.length} orders`} with no answer from before the restart (${u.refs.map(refId).join(', ')}): watched until ${iso(u.until)}`);
+      this.#poll(leg);
+    }
   }
 
   /**
@@ -1140,6 +1219,7 @@ export class PairTrader {
       if (partner.pos !== null && partner.unsettled === null) this.#intent.set(r.leg, net - partner.pos);
       this.#armUnsettled(r);
     }
+    for (const r of runs) this.#baseline.set(r.leg, this.#intent.get(r.leg) ?? null);
     this.unhedged = status === 'unhedged' ? notes.at(-1) ?? 'unhedged' : null;
     const tx = runs.flatMap((r) => r.report.orders.flatMap((o) => o.ref.tx));
     const fills = runs.flatMap((r) => r.report.orders.filter((o) => o.outcome === 'filled'));
