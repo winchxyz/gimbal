@@ -1748,7 +1748,7 @@ test('state: a drop whose save fails gives no command (a restart reads the hold 
   wallet.e6 = 400_000n + q.minAmountOut;
   store.fail = true;
   const line = await settleAfterRestart(s, store, phoenixWallet(wallet, []));
-  assert.match(line, /the engine deposited nothing, but the rescuer state could not be saved \(.*ENOSPC.*\), so a restart reads this hold again: check the wallet, then phoenix margin, before depositing/);
+  assert.match(line, /the engine deposited nothing, but the rescuer state could not be saved \(.*ENOSPC.*\), so a restart may read this hold again: check the wallet, then phoenix margin, before depositing/);
   store.fail = false;
   assert.equal(onDisk(store).holds.length, 1, 'still on disk');
 });

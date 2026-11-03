@@ -1565,7 +1565,7 @@ export class Rescuer {
       return `${lead}: the deposit may have run (it was about to be signed): check ${margin} (and the desk's Solana transactions) before depositing`;
     }
     if (!saved) {
-      return `${lead}: the engine deposited nothing, but the rescuer state could not be saved (${this.#saveProblem ?? 'unknown'}), so a restart reads this hold again: `
+      return `${lead}: the engine deposited nothing, but the rescuer state could not be saved (${this.#saveProblem ?? 'unknown'}), so a restart may read this hold again: `
         + `check the wallet, then ${margin}, before depositing`;
     }
     const { held } = read;
