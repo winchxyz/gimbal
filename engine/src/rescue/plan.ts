@@ -65,8 +65,11 @@ export interface PlanInput {
   fixedAmountUsd?: (from: Source, to: VenueId) => number | null;
   /** Transfers are held (an earlier one's outcome is unknown): only a reduce may run. */
   transfersHeld?: string | null;
-  /** USDC already on the desk's Arbitrum address (a Hyperliquid withdraw that was not bridged): spent before any new withdraw. */
-  arbitrumUsd?: number;
+  /**
+   * USDC already on the desk's Arbitrum address (a Hyperliquid withdraw that was not bridged): spent before any new
+   * withdraw, in part when it is less than the rescue needs. null: it could not be read, so Hyperliquid is no source.
+   */
+  arbitrumUsd?: number | null;
   /** Why no new hl_withdraw may go out (an earlier one's USDC is still on Arbitrum or on its way); the Arbitrum USDC may still be spent. */
   hlWithdrawHeld?: string | null;
 }
@@ -76,19 +79,41 @@ export type Plan =
   | { kind: 'reduce'; fraction: number; notes: string[] }
   | { kind: 'none'; reason: string; notes: string[] };
 
-/** The fees a transfer is expected to cost (USD), from the measured flat fees. */
-export function expectedFeeUsd(from: Source, to: VenueId, amountInUsd: number, keyed: boolean): number {
+/** The fees a transfer is expected to cost (USD), from the measured flat fees; `withdraw` false: Hyperliquid's USDC already on Arbitrum. */
+export function expectedFeeUsd(from: Source, to: VenueId, amountInUsd: number, keyed: boolean, withdraw = true): number {
   const into = to === 'hyperliquid' ? INTO_HYPERCORE_FEE_USD : INTO_EVM_OR_SOLANA_FEE_USD;
-  const hops = from === 'hyperliquid' ? HL_WITHDRAW_FEE_USD : 0;
+  const hops = from === 'hyperliquid' && withdraw ? HL_WITHDRAW_FEE_USD : 0;
   return into + hops + (keyed ? 0 : NO_KEY_FEE_SHARE * amountInUsd);
 }
 
 /** What a transfer sends so `amountUsd` arrives: the amount, its fees and the slippage room, at least the route's minimum. */
-export function amountInFor(from: Source, to: VenueId, amountUsd: number, keyed: boolean): number {
+export function amountInFor(from: Source, to: VenueId, amountUsd: number, keyed: boolean, withdraw = true): number {
   let x = amountUsd;
-  for (let i = 0; i < 3; i++) x = amountUsd + expectedFeeUsd(from, to, x, keyed) + (x * SLIPPAGE_BPS) / 10_000;
-  const min = to === 'orderly' ? ORDERLY_MIN_IN_USD : to === 'hyperliquid' ? HYPERCORE_MIN_IN_USD : 0;
-  return Math.ceil(Math.max(x, min) * 100 - 1e-6) / 100;
+  for (let i = 0; i < 3; i++) x = amountUsd + expectedFeeUsd(from, to, x, keyed, withdraw) + (x * SLIPPAGE_BPS) / 10_000;
+  return Math.ceil(Math.max(x, routeMinUsd(to)) * 100 - 1e-6) / 100;
+}
+
+/** The least a route into `to` sends (1Click's minimums). */
+function routeMinUsd(to: VenueId): number {
+  return to === 'orderly' ? ORDERLY_MIN_IN_USD : to === 'hyperliquid' ? HYPERCORE_MIN_IN_USD : 0;
+}
+
+/**
+ * Why a transfer of `amountIn` with expected fees `fee` (of which `hopFee` is in 1Click's quote) is passed over, or
+ * null: the fee share, then the policy's cost bound, which must leave the slippage a quote needs.
+ */
+function costProblem(from: Source, amountIn: number, fee: number, hopFee: number, input: PlanInput): string | null {
+  void from;
+  if (fee > MAX_FEE_SHARE * amountIn) {
+    return `fees of about ${fee.toFixed(2)} USD are ${Math.round((fee / amountIn) * 100)} % of the ${amountIn.toFixed(2)} USD it would send, over the ${MAX_FEE_SHARE * 100} % this desk accepts`;
+  }
+  // The quote's cost (amountIn − minAmountOut) is the fee plus the slippage room: it must fit the policy's bound.
+  const allowed = Math.max((amountIn * input.maxCostBps) / 10_000, input.maxCostFlatE6 / 1e6);
+  const roomBps = ((allowed - hopFee) / amountIn) * 10_000;
+  if (roomBps < SLIPPAGE_BPS) {
+    return `the policy's transfer cost bound (${allowed.toFixed(2)} USD on ${amountIn.toFixed(2)}) leaves ${Math.max(0, Math.floor(roomBps))} bps after the fee, under the ${SLIPPAGE_BPS} bps of slippage a quote needs`;
+  }
+  return null;
 }
 
 /**
@@ -112,19 +137,37 @@ export function planRescue(input: PlanInput): Plan {
       notes.push(`${from}: ${routeProblem}`);
       continue;
     }
-    const fixed = input.fixedAmountUsd?.(from, to) ?? null;
-    const amountIn = fixed ?? amountInFor(from, to, target.amountUsd, input.keyed);
-    const fee = expectedFeeUsd(from, to, amountIn, input.keyed);
-    if (fee > MAX_FEE_SHARE * amountIn) {
-      notes.push(`${from}: fees of about ${fee.toFixed(2)} USD are ${Math.round((fee / amountIn) * 100)} % of the ${amountIn.toFixed(2)} USD it would send, over the ${MAX_FEE_SHARE * 100} % this desk accepts`);
+    if (from === 'hyperliquid' && input.arbitrumUsd === null) {
+      notes.push('hyperliquid: the desk\'s Arbitrum USDC could not be read, so neither a withdraw nor a bridge of what is there runs');
       continue;
     }
-    // The quote's cost (amountIn − minAmountOut) is the fee plus the slippage room: it must fit the policy's bound.
-    const allowed = Math.max((amountIn * input.maxCostBps) / 10_000, input.maxCostFlatE6 / 1e6);
+    const fixed = input.fixedAmountUsd?.(from, to) ?? null;
+    const amountIn = fixed ?? amountInFor(from, to, target.amountUsd, input.keyed);
+    // Hyperliquid: USDC already on the desk's Arbitrum address goes first, with no withdraw (its fee was paid), all of
+    // it when it is less than the rescue needs but still at least the route's minimum.
+    const onArbitrum = from === 'hyperliquid' ? Math.floor((input.arbitrumUsd ?? 0) * 100 + 1e-6) / 100 : 0;
+    const strandedIn = Math.min(onArbitrum, fixed ?? amountInFor(from, to, target.amountUsd, input.keyed, false));
+    if (from === 'hyperliquid' && strandedIn > 0 && strandedIn >= routeMinUsd(to)) {
+      const fee = expectedFeeUsd(from, to, strandedIn, input.keyed, false);   // no withdraw: no withdraw fee
+      const problem = costProblem(from, strandedIn, fee, fee, input)
+        ?? (strandedIn > capLeft ? `over the rescue cap: it would count ${strandedIn.toFixed(2)} USD, and ${capLeft.toFixed(2)} of the ${input.capUsd} USD an hour is left` : null);
+      if (problem === null) {
+        const need = fixed ?? amountInFor(from, to, target.amountUsd, input.keyed, false);
+        if (strandedIn < need) notes.push(`hyperliquid: only ${strandedIn.toFixed(2)} of the ${need.toFixed(2)} USD is on Arbitrum; it is bridged first, a later rescue takes the rest`);
+        return { kind: 'transfer', from, to, amountInUsd: strandedIn, feeUsd: fee, capUsd: strandedIn, withdrawUsd: null, notes };
+      }
+      // Not worth bridging alone: a withdraw may still pay, unless withdraws are held.
+      notes.push(`hyperliquid (the ${onArbitrum.toFixed(2)} USDC on Arbitrum): ${problem}`);
+    }
+    if (from === 'hyperliquid' && input.hlWithdrawHeld !== undefined && input.hlWithdrawHeld !== null) {
+      notes.push(`hyperliquid: no new hl_withdraw: ${input.hlWithdrawHeld}`);
+      continue;
+    }
+    const fee = expectedFeeUsd(from, to, amountIn, input.keyed);
     const hopFee = from === 'hyperliquid' ? fee - HL_WITHDRAW_FEE_USD : fee;   // Hyperliquid's own fee is not in the quote
-    const roomBps = ((allowed - hopFee) / amountIn) * 10_000;
-    if (roomBps < SLIPPAGE_BPS) {
-      notes.push(`${from}: the policy's transfer cost bound (${allowed.toFixed(2)} USD on ${amountIn.toFixed(2)}) leaves ${Math.max(0, Math.floor(roomBps))} bps after the fee, under the ${SLIPPAGE_BPS} bps of slippage a quote needs`);
+    const problem = costProblem(from, amountIn, fee, hopFee, input);
+    if (problem !== null) {
+      notes.push(`${from}: ${problem}`);
       continue;
     }
     if (from === 'reserve') {
@@ -135,19 +178,6 @@ export function planRescue(input: PlanInput): Plan {
       return { kind: 'transfer', from, to, amountInUsd: amountIn, feeUsd: fee, capUsd: 0, withdrawUsd: null, notes };
     }
     const free = input.freeMargin[from];
-    // Hyperliquid: USDC already on the desk's Arbitrum address goes first, with no withdraw (its fee was paid).
-    const stranded = from === 'hyperliquid' && (input.arbitrumUsd ?? 0) >= amountIn;
-    if (from === 'hyperliquid' && !stranded && input.hlWithdrawHeld !== undefined && input.hlWithdrawHeld !== null) {
-      notes.push(`hyperliquid: no new hl_withdraw: ${input.hlWithdrawHeld}`);
-      continue;
-    }
-    if (stranded) {
-      if (amountIn > capLeft) {
-        notes.push(`hyperliquid: over the rescue cap: it would count ${amountIn.toFixed(2)} USD, and ${capLeft.toFixed(2)} of the ${input.capUsd} USD an hour is left`);
-        continue;
-      }
-      return { kind: 'transfer', from, to, amountInUsd: amountIn, feeUsd: fee - HL_WITHDRAW_FEE_USD, capUsd: amountIn, withdrawUsd: null, notes };
-    }
     // Hyperliquid: hl_withdraw takes amountIn plus its own fee, and must keep amount + 1 USDC within the withdrawable.
     const withdraw = from === 'hyperliquid' ? Math.ceil((amountIn + HL_WITHDRAW_FEE_USD) * 100 - 1e-6) / 100 : null;
     const needFree = withdraw === null ? amountIn : withdraw + HL_WITHDRAW_FEE_USD;

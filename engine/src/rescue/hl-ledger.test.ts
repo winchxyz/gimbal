@@ -46,3 +46,12 @@ test('HlLedgerLanding reads userNonFundingLedgerUpdates and confirms only Hyperl
   assert.deepEqual(asked, [{ type: 'userNonFundingLedgerUpdates', user: DESK, startTime: SINCE - LEDGER_SLACK_MS }]);
   assert.equal(await landing.find('orderly', q, SINCE, new Set()), null);
 });
+
+test('when 1Click names the delivery transaction, that entry is matched before an earlier one that also fits', () => {
+  const minOutE8 = 1_948_095_100n;
+  const two = [...rows, row('0xnamed', SINCE + 6, { type: 'send', usdc: '19.70', destination: DESK, user: '0xsolver' })];
+  assert.equal(hlDelivery(two, { desk: DESK, sinceMs: SINCE, minOutE8, seen: new Set() })?.hash, '0xit');
+  assert.equal(hlDelivery(two, { desk: DESK, sinceMs: SINCE, minOutE8, seen: new Set(), deliveryTx: ['0xNAMED'] })?.hash, '0xnamed');
+  // A named hash that does not fit the rules is not taken: the rule still decides.
+  assert.equal(hlDelivery(two, { desk: DESK, sinceMs: SINCE, minOutE8, seen: new Set(), deliveryTx: ['0xsmall'] })?.hash, '0xit');
+});

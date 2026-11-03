@@ -170,6 +170,10 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
         tx: signed.nearTx === undefined ? [] : [signed.nearTx],
         // The authorization is public once signed and anyone may submit it until validBefore.
         usableUntilMs: Number(signed.payload.validBefore) * 1000,
+        // It can never run once validBefore has passed (by this clock, less a minute for skew) and USDC still reads it
+        // unused; a read error is not taken as unused.
+        neverRuns: async () => input.clock.now() > Number(signed.payload.validBefore) * 1000 + 60_000
+          && !(await arb.authorizationUsed(signed.payload.from, signed.payload.nonce)),
         send: async () => {
           const tx = await arb.submit(signed, await evm());
           return { tx, depositTx: tx.find((x) => x.chain === 'arbitrum')?.id ?? '' };

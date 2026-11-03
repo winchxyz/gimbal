@@ -107,6 +107,11 @@ export class ArbitrumSubmitter {
     return this.#safe(this.#public.readContract({ address: this.#token, abi: USDC_EIP3009_ABI, functionName: 'balanceOf', args: [address as Hex] }));
   }
 
+  /** USDC's authorizationState: whether the EIP-3009 authorization `nonce` of `authorizer` was used. */
+  async authorizationUsed(authorizer: string, nonce: string): Promise<boolean> {
+    return this.#safe(this.#public.readContract({ address: this.#token, abi: USDC_EIP3009_ABI, functionName: 'authorizationState', args: [authorizer as Hex, nonce as Hex] }));
+  }
+
   /** Checks, submits and confirms one authorization from the desk at `deskAddress`. */
   async submit(signed: Eip3009SignedAction, deskAddress: string): Promise<TxRef[]> {
     const nearTx = signed.nearTx === undefined ? [] : [signed.nearTx];

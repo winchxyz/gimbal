@@ -30,10 +30,18 @@ function e8(s: unknown): bigint | null {
 /**
  * The entry that is the 1Click delivery, or null: incoming, booked since `sinceMs` (less the slack), to the desk (a
  * `deposit` has no destination: the bridge credits the address itself), not sent by the desk, of at least
- * `minOutE8`, and not already matched to another transfer (`seen`, by hash).
+ * `minOutE8`, and not already matched to another transfer (`seen`, by hash). When 1Click names the delivery's
+ * transactions (`deliveryTx`), the entry with one of those hashes is taken first.
  */
-export function hlDelivery(rows: readonly HlLedgerRow[], o: { desk: string; sinceMs: number; minOutE8: bigint; seen: ReadonlySet<string> }): { hash: string; usdE8: bigint } | null {
+export function hlDelivery(rows: readonly HlLedgerRow[], o: { desk: string; sinceMs: number; minOutE8: bigint; seen: ReadonlySet<string>; deliveryTx?: readonly string[] }): { hash: string; usdE8: bigint } | null {
+  const named = new Set((o.deliveryTx ?? []).map((h) => h.toLowerCase()));
+  const matches = deliveries(rows, o);
+  return matches.find((m) => named.has(m.hash.toLowerCase())) ?? matches[0] ?? null;
+}
+
+function deliveries(rows: readonly HlLedgerRow[], o: { desk: string; sinceMs: number; minOutE8: bigint; seen: ReadonlySet<string> }): { hash: string; usdE8: bigint }[] {
   const me = o.desk.toLowerCase();
+  const out: { hash: string; usdE8: bigint }[] = [];
   for (const r of rows) {
     const d = r.delta;
     const usdc = d.usdc !== undefined ? d.usdc : d.token === 'USDC' ? d.amount : undefined;
@@ -42,9 +50,9 @@ export function hlDelivery(rows: readonly HlLedgerRow[], o: { desk: string; sinc
     const from = typeof d.user === 'string' ? d.user.toLowerCase() : null;
     if (r.time < o.sinceMs - LEDGER_SLACK_MS || !HL_INCOMING.includes(d.type) || amount === null || amount < o.minOutE8) continue;
     if (from === me || (to === null ? d.type !== 'deposit' : to !== me) || o.seen.has(r.hash)) continue;
-    return { hash: r.hash, usdE8: amount };
+    out.push({ hash: r.hash, usdE8: amount });
   }
-  return null;
+  return out;
 }
 
 export interface HlLedgerLandingOptions {
@@ -72,7 +80,7 @@ export class HlLedgerLanding implements LandingPort {
     return this.#o.others?.[venue] ?? `a landing on ${venue} cannot be confirmed here`;
   }
 
-  async find(venue: VenueId, q: VerifiedQuote, sinceMs: number, seen: ReadonlySet<string>): Promise<LedgerEntry | null> {
+  async find(venue: VenueId, q: VerifiedQuote, sinceMs: number, seen: ReadonlySet<string>, deliveryTx?: readonly string[]): Promise<LedgerEntry | null> {
     if (venue !== 'hyperliquid') return null;
     const desk = await this.#o.desk();
     const res = await this.#fetch(`${(this.#o.apiUrl ?? HL_MAINNET_URL).replace(/\/+$/, '')}/info`, {
@@ -85,7 +93,7 @@ export class HlLedgerLanding implements LandingPort {
     if (!Array.isArray(rows)) throw new Error('hyperliquid userNonFundingLedgerUpdates: not a list');
     const ok = rows.filter((r): r is HlLedgerRow => typeof r === 'object' && r !== null && Number.isSafeInteger((r as HlLedgerRow).time)
       && typeof (r as HlLedgerRow).hash === 'string' && typeof (r as HlLedgerRow).delta?.type === 'string');
-    const hit = hlDelivery(ok, { desk, sinceMs, minOutE8: q.minAmountOutE8, seen });
+    const hit = hlDelivery(ok, { desk, sinceMs, minOutE8: q.minAmountOutE8, seen, ...(deliveryTx === undefined ? {} : { deliveryTx }) });
     return hit === null ? null : { id: hit.hash, usd: Number(hit.usdE8) / 1e8, tx: [hyperliquidTxRef(this.#o.network, hit.hash)] };
   }
 }

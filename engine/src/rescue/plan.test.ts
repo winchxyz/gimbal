@@ -110,3 +110,25 @@ test('the cap ledger is a sliding hour', () => {
   assert.equal(c.used(30 * 60_000), 20);
   assert.equal(c.used(3_600_000), 0);
 });
+
+test('stranded Arbitrum USDC: no withdraw fee in its fee share, spent in part when short, and an unread balance stops Hyperliquid', () => {
+  const into = (over: Partial<PlanInput>) => planRescue(base({ target: { venue: 'phoenix', symbol: 'ETH', amountUsd: 5, marginUsd: 200 }, reserveUsd: 0, freeMargin: { hyperliquid: 500 }, ...over }));
+  // 5 USD: with the 1 USDC withdraw fee it is about 21 %, over the share; from Arbitrum it is about 1 %.
+  const withdraw = into({});
+  assert.equal(withdraw.kind, 'reduce');
+  assert.match(withdraw.notes.join(' '), /hyperliquid: fees of about 1.05 USD/);
+  const stranded = into({ arbitrumUsd: 20 });
+  assert.ok(stranded.kind === 'transfer' && stranded.withdrawUsd === null && stranded.from === 'hyperliquid');
+  assert.ok(stranded.kind === 'transfer' && Math.abs(stranded.feeUsd - 0.05) < 1e-9, 'no withdraw fee');
+  // Short: what is there is bridged first, even while withdraws are held.
+  const partial = into({ arbitrumUsd: 3.456, hlWithdrawHeld: 'an earlier withdraw' });
+  assert.ok(partial.kind === 'transfer' && partial.withdrawUsd === null && partial.amountInUsd === 3.45 && partial.capUsd === 3.45);
+  assert.match(partial.notes.join(' '), /only 3.45 of the 5.\d\d USD is on Arbitrum/);
+  // Dust under the fee share falls through to the withdraw rule.
+  const dust = into({ arbitrumUsd: 0.2, hlWithdrawHeld: 'an earlier withdraw', target: { venue: 'phoenix', symbol: 'ETH', amountUsd: 40, marginUsd: 200 } });
+  assert.equal(dust.kind, 'reduce');
+  assert.match(dust.notes.join(' '), /the 0.20 USDC on Arbitrum\): fees of about 0.05.*no new hl_withdraw: an earlier withdraw/);
+  const unread = into({ arbitrumUsd: null, target: { venue: 'phoenix', symbol: 'ETH', amountUsd: 40, marginUsd: 200 } });
+  assert.equal(unread.kind, 'reduce');
+  assert.match(unread.notes.join(' '), /hyperliquid: the desk's Arbitrum USDC could not be read/);
+});

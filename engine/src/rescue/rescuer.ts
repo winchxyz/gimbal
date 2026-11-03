@@ -25,13 +25,21 @@
 // Paying twice is the failure this guards against. Money that may still move holds every later transfer (only reduces
 // run) until it is settled:
 //   - a payment signed but not sent (its signature is public and stays usable: an EIP-3009 authorization until its
-//     validBefore), or sent and not settled by 1Click in time, or settled but not yet seen in the ledger: held until
-//     its deposit address reaches a final 1Click status and, on SUCCESS, the delivery is found (journaled late);
-//   - an OutcomeUnknown: held until the owner restarts the engine after reconciling.
-// A Hyperliquid withdraw whose USDC was not bridged holds new withdraws (not the Arbitrum USDC, which goes first),
-// until a bridge from Arbitrum lands. The cap meter is this process's: on mainnet it starts as if the whole hourly cap
-// were used just before the engine started (the contract's counters have no view), the conservative bound of what
-// the contract may still count.
+//     validBefore): held until 1Click settles it, or until the payment reads as one that can never run
+//     (SignedPayment.neverRuns: past validBefore and authorizationState false) and 1Click, UNUSED_GRACE_MS after
+//     that, still saw no deposit. A payer that cannot tell (no neverRuns) is held until 1Click settles it;
+//   - sent and not settled by 1Click in time, or settled but not yet seen in the ledger: held until its deposit
+//     address reaches a final 1Click status and, on SUCCESS, the delivery is found (journaled late);
+//   - an OutcomeUnknown (the send or a signature may have run): held until the owner restarts the engine after
+//     reconciling.
+// A hold still open after RECONCILE_AFTER_MS is journaled once as "reconcile needed" with its deposit address,
+// amounts and 1Click status, and stays held. Holds live in memory: on mainnet the first line of a run says a restart
+// dropped any earlier holds and the cap meter starts full, so the owner reconciles before trusting it.
+// A Hyperliquid withdraw whose USDC was not bridged holds new withdraws (not the Arbitrum USDC, which goes first,
+// whole or in part), until a bridge from Arbitrum lands, or the Arbitrum address reads empty with no withdraw on its
+// way. An Arbitrum balance that cannot be read stops the Hyperliquid source. The cap meter is this process's: on
+// mainnet it starts as if the whole hourly cap were used just before the engine started (the contract's counters have
+// no view), the conservative bound of what the contract may still count.
 //
 // One rescue runs at a time: a trigger that comes while one runs ends at once as failed (tried again after the
 // backoff); runningId tells the risk engine not to count a running rescue as lapsed. A desk that is closing
@@ -46,7 +54,7 @@ import { abs, floorToLot, qtyString } from '../trade/lots.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { Clock } from '../venues/venue.ts';
 import type { DeskAddresses, OneClickApi, QuoteRequest, QuotedMethod, QuoteResponse, VerifiedQuote } from './oneclick.ts';
-import { ASSETS, FINAL_STATUSES, e8Text, unitsOf, verifyQuote } from './oneclick.ts';
+import { ASSETS, FINAL_STATUSES, deliveryHashes, e8Text, unitsOf, verifyQuote } from './oneclick.ts';
 import type { Plan, Source } from './plan.ts';
 import { CapLedger, HL_WITHDRAW_FEE_USD, SLIPPAGE_BPS, planRescue } from './plan.ts';
 
@@ -60,6 +68,14 @@ export const WITHDRAW_TIMEOUT_MS = 15 * 60_000;
 export const LANDING_TIMEOUT_MS = 5 * 60_000;
 /** A signed payment with no validity of its own is taken as usable this long (a 1Click deposit address lives 30 min). */
 export const SIGNED_USABLE_MS = 35 * 60_000;
+/** After a signed payment can no longer run, 1Click gets this long to index a deposit before PENDING_DEPOSIT is final. */
+export const UNUSED_GRACE_MS = 10 * 60_000;
+/** A hold still open after this is journaled once as "reconcile needed" (it stays held). */
+export const RECONCILE_AFTER_MS = 30 * 60_000;
+/** An hl_withdraw that did not arrive in time is taken as still on its way for this long after it was accepted. */
+export const WITHDRAW_IN_FLIGHT_MS = 30 * 60_000;
+/** The desk's Arbitrum address counts as empty under this, USDC: too little to bridge, so it does not hold withdraws. */
+export const ARBITRUM_EMPTY_USD = 1;
 
 export type RescueStep = RescueProgress['step'];
 
@@ -77,6 +93,11 @@ export interface SignedPayment {
   send(): Promise<{ tx: TxRef[]; depositTx: string }>;
   /** Until when anyone holding the signature could still send it, ms (EIP-3009 validBefore); absent: SIGNED_USABLE_MS. */
   usableUntilMs?: number;
+  /**
+   * True once no copy of this payment can ever run (EIP-3009: past validBefore and authorizationState still false).
+   * Absent: the payer cannot tell, and a payment that failed to send stays held until 1Click settles it.
+   */
+  neverRuns?: () => Promise<boolean>;
 }
 
 /** Pays a verified quote from one source: fund_venue, sol_sign_rescue or evm_usdc_to_intents. */
@@ -110,8 +131,11 @@ export interface LedgerEntry {
 export interface LandingPort {
   /** Why a landing on `venue` cannot be confirmed here, or null. */
   confirms(venue: VenueId): string | null;
-  /** The entry that is this delivery: on `venue`, booked since `sinceMs`, at least minAmountOut, not one of `seen`. */
-  find(venue: VenueId, q: VerifiedQuote, sinceMs: number, seen: ReadonlySet<string>): Promise<LedgerEntry | null>;
+  /**
+   * The entry that is this delivery: on `venue`, booked since `sinceMs`, at least minAmountOut, not one of `seen`;
+   * the one whose hash is among `deliveryTx` (1Click's destinationChainTxHashes) first, when 1Click names it.
+   */
+  find(venue: VenueId, q: VerifiedQuote, sinceMs: number, seen: ReadonlySet<string>, deliveryTx?: readonly string[]): Promise<LedgerEntry | null>;
 }
 
 /** The pair trader's close, as a reduce uses it. */
@@ -187,8 +211,10 @@ interface DepositHold {
   venue: VenueId;
   q: VerifiedQuote;
   sinceMs: number;
-  /** A deposit address still PENDING_DEPOSIT after this was never paid (null: it was sent, so wait for a final status). */
-  unusedAfterMs: number | null;
+  /** A payment that failed to send: what tells it can never run (null: it was sent, so wait for a final status). */
+  unsent: { neverRuns: (() => Promise<boolean>) | null; deadAt: number | null } | null;
+  heldAt: number;
+  reconcileSaid: boolean;
 }
 
 export class Rescuer {
@@ -200,6 +226,8 @@ export class Rescuer {
   #unknown: string | null = null;
   readonly #deposits: DepositHold[] = [];
   #hlHeld: string | null = null;
+  /** An hl_withdraw accepted but not seen on Arbitrum: on its way until this time. */
+  #withdrawInFlightUntil: number | null = null;
   readonly #seen = new Set<string>();
   #seq = 0;
   #closingSaid = false;
@@ -213,6 +241,9 @@ export class Rescuer {
     }
     this.#o = options;
     this.#startedAt = options.clock.now();
+    if (options.seedCap ?? options.mode === 'mainnet') {
+      this.#log("rescuer started: holds live in memory, so any transfer held before this restart is no longer held; reconcile earlier rescues' 1Click deposits and the Hyperliquid ledger. The rescue cap counts as used in full for the first hour (the contract's counters have no view)");
+    }
   }
 
   /** What the rescues of the last hour still weigh against the cap, USD. */
@@ -264,7 +295,9 @@ export class Rescuer {
       this.#capSeeded = true;
       if (this.#o.seedCap ?? this.#o.mode === 'mainnet') {
         this.#cap.add(desk.policy.rescue_cap_usd_per_hour, this.#startedAt);
-        this.#log(`rescue cap: counted as used in full at start (${desk.policy.rescue_cap_usd_per_hour} USD), freeing over the first hour: the contract's counters have no view`);
+        const note = `rescuer started at ${new Date(this.#startedAt).toISOString()}: holds live in memory, so any held transfer of an earlier run was dropped by the restart; `
+          + `reconcile earlier rescues' 1Click deposits and the Hyperliquid ledger. The rescue cap counts as used in full (${desk.policy.rescue_cap_usd_per_hour} USD), freeing over the first hour: the contract's counters have no view`;
+        this.#journal(run, note, {});
       }
     }
     if (desk.closing) {
@@ -281,7 +314,9 @@ export class Rescuer {
       return this.#land(run, 0, null);
     }
     await this.#settleHolds();
-    const arbitrumUsd = this.#o.hlWithdraw === undefined ? undefined : await this.#o.hlWithdraw.arbitrumUsdcE6().then((e6) => Number(e6) / 1e6, () => undefined);
+    // null: not read. It then stops the Hyperliquid source, and never counts as an empty address.
+    const arbitrumUsd = this.#o.hlWithdraw === undefined ? undefined : await this.#o.hlWithdraw.arbitrumUsdcE6().then((e6) => Number(e6) / 1e6, () => null);
+    this.#settleHlHold(arbitrumUsd);
     const view = this.#o.view();
     const leg = view.legs.find((l) => l.venue === t.venue && l.symbol === t.symbol);
     const plan = planRescue({
@@ -346,15 +381,15 @@ export class Rescuer {
     if (plan.from === 'hyperliquid') {
       const amountE6 = plan.withdrawUsd === null ? BigInt(Math.round(plan.amountInUsd * 1e6)) : await this.#hlOut(run, plan);
       if (plan.withdrawUsd === null) this.#journal(run, `rescue ${t.id}: source hyperliquid, ${plan.amountInUsd.toFixed(2)} USDC already on the desk's Arbitrum address (an earlier withdraw), no new withdraw`, { from: 'hyperliquid' });
-      const q = await this.#hop(run, 'arbitrum', to, Number(amountE6) / 1e6, desk, `rescue ${t.id}: Hyperliquid -> Arbitrum -> ${to}`, since);
-      await this.#landing(run, q, since, plan);
+      const hop = await this.#hop(run, 'arbitrum', to, Number(amountE6) / 1e6, desk, `rescue ${t.id}: Hyperliquid -> Arbitrum -> ${to}`, since);
+      await this.#landing(run, hop, since, plan);
       // The Arbitrum USDC is bridged: Hyperliquid may be withdrawn from again.
       this.#hlHeld = null;
       return;
     }
     const payer = plan.from === 'reserve' ? 'reserve' : 'phoenix';
-    const q = await this.#hop(run, payer, to, plan.amountInUsd, desk, `rescue ${t.id}: ${plan.from} -> ${to}`, since);
-    return this.#landing(run, q, since, plan);
+    const hop = await this.#hop(run, payer, to, plan.amountInUsd, desk, `rescue ${t.id}: ${plan.from} -> ${to}`, since);
+    return this.#landing(run, hop, since, plan);
   }
 
   /** Hyperliquid -> the desk's Arbitrum address: hl_withdraw, then the USDC seen there. Returns what arrived (× 1e6). */
@@ -391,9 +426,13 @@ export class Rescuer {
     this.#journal(run, `rescue ${t.id}: source hyperliquid, hl_withdraw ${(Number(amountE6) / 1e6).toFixed(2)} USDC to the desk's Arbitrum address (1 USDC fee)`, { from: 'hyperliquid', usd: 0, feeUsd: -HL_WITHDRAW_FEE_USD, signedS: round1(run.signedS) }, tx);
     this.#progress(run, 'deposit');
     const until = this.#o.clock.now() + (this.#o.withdrawTimeoutMs ?? WITHDRAW_TIMEOUT_MS);
+    this.#withdrawInFlightUntil = signStart + WITHDRAW_IN_FLIGHT_MS;
     for (;;) {
       const now = await port.arbitrumUsdcE6().catch(() => null);
-      if (now !== null && now - baseE6 >= expectE6) return now - baseE6;
+      if (now !== null && now - baseE6 >= expectE6) {
+        this.#withdrawInFlightUntil = null;
+        return now - baseE6;
+      }
       if (this.#o.clock.now() >= until) {
         throw new StepFailed('deposit', `hl_withdraw's ${(Number(expectE6) / 1e6).toFixed(2)} USDC did not reach the desk's Arbitrum address within ${Math.round((this.#o.withdrawTimeoutMs ?? WITHDRAW_TIMEOUT_MS) / 1000)} s (measured 231 s)`);
       }
@@ -402,7 +441,7 @@ export class Rescuer {
   }
 
   /** One 1Click transfer of `amountInUsd` from a payer into `to`: quote, verify, sign, deposit, until 1Click's SUCCESS. */
-  async #hop(run: Run, payerKey: 'reserve' | 'phoenix' | 'arbitrum', to: VenueId, amountInUsd: number, desk: RescueDesk, reason: string, since: number): Promise<VerifiedQuote> {
+  async #hop(run: Run, payerKey: 'reserve' | 'phoenix' | 'arbitrum', to: VenueId, amountInUsd: number, desk: RescueDesk, reason: string, since: number): Promise<{ q: VerifiedQuote; deliveryTx: string[] }> {
     const payer = this.#o.payers[payerKey]!;
     const a = desk.addresses;
     const id = run.trigger.id;
@@ -465,9 +504,14 @@ export class Rescuer {
       run.tx.push(...sent.tx.filter((x) => !run.tx.some((y) => y.chain === x.chain && y.id === x.id)));
       depositTx = sent.depositTx;
     } catch (err) {
+      if (err instanceof OutcomeUnknown) {
+        // No receipt, or the authorization already used: the payment may have run. Only the owner can settle it.
+        this.#unknown ??= `the ${payer.method} of rescue ${id} may have paid ${q.depositAddress} (${errorMessage(err)}); reconcile it before any other transfer`;
+        throw new StepFailed('deposit', `${payer.method} deposit: ${errorMessage(err)}`);
+      }
       // Signed is enough to pay: the signature is public (in the NEAR receipt) and anyone may send it while it is valid.
       const until = signed.usableUntilMs ?? this.#o.clock.now() + SIGNED_USABLE_MS;
-      this.#holdDeposit(id, to, q, since, until, `the signed ${payer.method} of rescue ${id} was not sent but stays usable until ${new Date(until).toISOString()}: it may still pay ${q.depositAddress}`);
+      this.#holdDeposit(id, to, q, since, { neverRuns: signed.neverRuns ?? null, deadAt: null }, `the signed ${payer.method} of rescue ${id} was not sent but stays usable until ${new Date(until).toISOString()}: it may still pay ${q.depositAddress}`);
       throw new StepFailed('deposit', `${payer.method} deposit: ${errorMessage(err)}`);
     }
     const inUsd = Number(q.amountInE8) / 1e8;
@@ -486,7 +530,7 @@ export class Rescuer {
     for (;;) {
       const s = await this.#o.oneClick.status(q.depositAddress).catch((err: unknown) => ({ status: `unread (${errorMessage(err)})`, body: null }));
       last = s.status;
-      if (s.status === 'SUCCESS') return q;
+      if (s.status === 'SUCCESS') return { q, deliveryTx: deliveryHashes(s.body) };
       if (FINAL_STATUSES.includes(s.status)) {
         throw new StepFailed('deposit', `1Click ended the transfer ${s.status}: the refund goes back to ${payer.method === 'fund_venue' ? 'the desk owner on NEAR' : `the desk's ${payer.method === 'sol_sign_rescue' ? 'Solana' : 'Arbitrum'} address`}`);
       }
@@ -499,7 +543,8 @@ export class Rescuer {
   }
 
   /** After 1Click's SUCCESS: the credit (Phoenix), then the delivery found in the target's ledger. */
-  async #landing(run: Run, q: VerifiedQuote, since: number, plan: Extract<Plan, { kind: 'transfer' }>): Promise<void> {
+  async #landing(run: Run, hop: { q: VerifiedQuote; deliveryTx: string[] }, since: number, plan: Extract<Plan, { kind: 'transfer' }>): Promise<void> {
+    const { q, deliveryTx } = hop;
     const to = plan.to;
     const credit = this.#o.credit?.[to];
     if (credit !== undefined) {
@@ -514,7 +559,7 @@ export class Rescuer {
     const timeout = this.#o.landingTimeoutMs ?? LANDING_TIMEOUT_MS;
     const until = this.#o.clock.now() + timeout;
     for (;;) {
-      const entry = await this.#o.landing.find(to, q, since, this.#seen).catch(() => null);
+      const entry = await this.#o.landing.find(to, q, since, this.#seen, deliveryTx).catch(() => null);
       if (entry !== null) {
         this.#seen.add(entry.id);
         run.tx.push(...entry.tx.filter((x) => !run.tx.some((y) => y.chain === x.chain && y.id === x.id)));
@@ -570,29 +615,56 @@ export class Rescuer {
 
   // ---- holds ----
 
-  #holdDeposit(rescueId: string, venue: VenueId, q: VerifiedQuote, sinceMs: number, unusedAfterMs: number | null, why: string): void {
+  #holdDeposit(rescueId: string, venue: VenueId, q: VerifiedQuote, sinceMs: number, unsent: DepositHold['unsent'], why: string): void {
     if (this.#deposits.some((d) => d.q.depositAddress === q.depositAddress && d.rescueId === rescueId)) return;
-    this.#deposits.push({ why, rescueId, venue, q, sinceMs, unusedAfterMs });
+    this.#deposits.push({ why, rescueId, venue, q, sinceMs, unsent, heldAt: this.#o.clock.now(), reconcileSaid: false });
+  }
+
+  /** The hl_withdraw hold ends once the desk's Arbitrum address reads empty (under ARBITRUM_EMPTY_USD) and no withdraw is on its way to it. */
+  #settleHlHold(arbitrumUsd: number | null | undefined): void {
+    if (this.#hlHeld === null || arbitrumUsd === null || arbitrumUsd === undefined || arbitrumUsd >= ARBITRUM_EMPTY_USD) return;
+    const t = this.#o.clock.now();
+    if (this.#withdrawInFlightUntil !== null && t < this.#withdrawInFlightUntil) return;
+    this.#withdrawInFlightUntil = null;
+    this.#hlHeld = null;
+    this.#o.publish({ type: 'journal', data: { id: `rescue-${t.toString(36)}-${++this.#seq}`, t, kind: 'rescue', summary: this.#labelled('the desk\'s Arbitrum address reads empty and no hl_withdraw is on its way: Hyperliquid may be withdrawn from again'), numbers: { venue: 'hyperliquid' }, tx: [] } });
   }
 
   /** Reads each held deposit again; drops those 1Click settled (refunded, or delivered and seen in the ledger). */
   async #settleHolds(): Promise<void> {
     for (const d of [...this.#deposits]) {
       const s = await this.#o.oneClick.status(d.q.depositAddress).catch(() => null);
-      if (s === null) continue;
       let settled: string | null = null;
-      if (s.status === 'SUCCESS') {
-        const entry = await this.#o.landing.find(d.venue, d.q, d.sinceMs, this.#seen).catch(() => null);
+      if (s === null) {
+        // Unread: still held.
+      } else if (s.status === 'SUCCESS') {
+        const entry = await this.#o.landing.find(d.venue, d.q, d.sinceMs, this.#seen, deliveryHashes(s.body)).catch(() => null);
         if (entry !== null) {
           this.#seen.add(entry.id);
           settled = `rescue ${d.rescueId}'s ${entry.usd.toFixed(2)} USD landed on ${d.venue} late (after its rescue was failed)`;
         }
       } else if (FINAL_STATUSES.includes(s.status)) {
         settled = `rescue ${d.rescueId}'s transfer ended ${s.status} at 1Click: refunded, nothing landed`;
-      } else if (s.status === 'PENDING_DEPOSIT' && d.unusedAfterMs !== null && this.#o.clock.now() > d.unusedAfterMs) {
-        settled = `rescue ${d.rescueId}'s signed payment expired unused (1Click never saw a deposit)`;
+      } else if (s.status === 'PENDING_DEPOSIT' && d.unsent !== null && d.unsent.neverRuns !== null) {
+        // It can never run once neverRuns reads true; 1Click then gets UNUSED_GRACE_MS to index a deposit it missed.
+        const now = this.#o.clock.now();
+        const unsent = d.unsent;
+        if (unsent.deadAt === null && await d.unsent.neverRuns().catch(() => false)) unsent.deadAt = now;
+        if (unsent.deadAt !== null && now - unsent.deadAt >= UNUSED_GRACE_MS) {
+          settled = `rescue ${d.rescueId}'s signed payment can no longer run and 1Click saw no deposit ${Math.round(UNUSED_GRACE_MS / 60_000)} min later: expired unused`;
+        }
       }
-      if (settled === null) continue;
+      if (settled === null) {
+        const t = this.#o.clock.now();
+        if (!d.reconcileSaid && t - d.heldAt >= RECONCILE_AFTER_MS) {
+          d.reconcileSaid = true;
+          const line = `reconcile needed: rescue ${d.rescueId}'s deposit ${d.q.depositAddress} (${e8Text(d.q.amountInE8)} USDC in, at least ${e8Text(d.q.minAmountOutE8)} out to ${d.venue}) `
+            + `is ${s === null ? 'unread' : s.status} at 1Click after ${Math.round((t - d.heldAt) / 60_000)} min; transfers stay held until it is settled`;
+          this.#log(line);
+          this.#o.publish({ type: 'journal', data: { id: `rescue-${t.toString(36)}-${++this.#seq}`, t, kind: 'rescue', summary: this.#labelled(line), numbers: { venue: d.venue }, tx: [] } });
+        }
+        continue;
+      }
       this.#deposits.splice(this.#deposits.indexOf(d), 1);
       const t = this.#o.clock.now();
       this.#o.publish({ type: 'journal', data: { id: `rescue-${t.toString(36)}-${++this.#seq}`, t, kind: 'rescue', summary: this.#labelled(`${settled}; transfers are no longer held by it`), numbers: { venue: d.venue }, tx: [] } });

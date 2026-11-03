@@ -43,19 +43,20 @@ interface World {
   ended: [string, boolean][];
   failures: (RescueFailure | null)[];
   rescuer: Rescuer;
+  logs: string[];
   steps(id?: string): RescueProgress['step'][];
   journal(): string[];
 }
 
 function world(make: (w: Pick<World, 'clock'> & { sleep: (ms: number) => Promise<void> }) => Omit<RescuerOptions, 'publish' | 'clock' | 'sleep' | 'ended' | 'failure'>): World {
-  const w = { t: START, events: [], ended: [], failures: [] } as unknown as World;
+  const w = { t: START, events: [], ended: [], failures: [], logs: [] } as unknown as World;
   w.clock = { now: () => w.t };
   const sleep = async (ms: number) => {
     w.t += ms;
   };
   const o = make({ clock: w.clock, sleep });
   w.rescuer = new Rescuer({
-    ...o, clock: w.clock, sleep, publish: (e) => w.events.push(e),
+    log: (line) => w.logs.push(line), ...o, clock: w.clock, sleep, publish: (e) => w.events.push(e),
     ended: (id, landed) => w.ended.push([id, landed]), failure: (f) => w.failures.push(f),
   });
   w.steps = (id = 'rescue-1') => w.events.filter((e): e is Extract<StreamEvent, { type: 'rescue' }> => e.type === 'rescue' && e.data.id === id).map((e) => e.data.step);
@@ -148,6 +149,8 @@ interface Synthetic {
   legs: Leg[];
   /** The key 1Click's quotes are signed with here. */
   signer: ReturnType<typeof testSigner>;
+  /** The desk's Arbitrum balance cannot be read. */
+  arbDown: boolean;
 }
 
 interface SyntheticOptions {
@@ -164,6 +167,8 @@ interface SyntheticOptions {
   signer?: ReturnType<typeof testSigner>;
   /** EIP-3009 validity of the signed payments, ms from signing. */
   usableForMs?: number;
+  /** What the signed payments say when asked whether they can still run. */
+  neverRuns?: () => Promise<boolean>;
   seedCap?: boolean;
   confirms?: (venue: VenueId) => string | null;
 }
@@ -173,7 +178,7 @@ const venueOf = (q: VerifiedQuote): VenueId => (q.destinationAsset === ASSETS.hy
 function synthetic(o: SyntheticOptions = {}): Synthetic {
   const s: Synthetic = {
     w: undefined as unknown as World, quotes: [], sent: [], withdrawn: [], credited: [], closes: [], ledger: [],
-    arb: { e6: 0n, arriving: [] }, status: null, legs: o.legs ?? [leg('hyperliquid', 200), leg('phoenix', 200)], signer: testSigner(),
+    arb: { e6: 0n, arriving: [] }, status: null, legs: o.legs ?? [leg('hyperliquid', 200), leg('phoenix', 200)], signer: testSigner(), arbDown: false,
   };
   const signer = s.signer;
   const quoteSigner = o.signer ?? signer;
@@ -199,6 +204,7 @@ function synthetic(o: SyntheticOptions = {}): Synthetic {
         return {
           tx: [{ chain: 'near', id: `near-${method}`, url: 'https://nearblocks.io/x' }] as TxRef[],
           ...(o.usableForMs === undefined ? {} : { usableUntilMs: clock.now() + o.usableForMs }),
+          ...(o.neverRuns === undefined ? {} : { neverRuns: o.neverRuns }),
           send: async () => {
             await o.send?.();
             s.sent.push(q);
@@ -224,7 +230,10 @@ function synthetic(o: SyntheticOptions = {}): Synthetic {
         s.arb.arriving.push({ at: clock.now() + 230_000, e6: amountE6 - 1_000_000n });
         return { tx: [{ chain: 'hyperliquid', id: '0xwithdraw', url: 'https://app.hyperliquid.xyz/explorer/tx/0xwithdraw' }] };
       },
-      arbitrumUsdcE6: async () => arrived(),
+      arbitrumUsdcE6: async () => {
+        if (s.arbDown) throw new Error('arbitrum rpc: connection reset');
+        return arrived();
+      },
     };
     const credit: CreditPort = {
       credit: async (e6) => {
@@ -427,24 +436,86 @@ test('a delivery 1Click calls SUCCESS but the ledger does not show is held too; 
   assert.ok(s.w.journal().some((j) => /rescue a's transfer ended REFUNDED at 1Click: refunded, nothing landed/.test(j)));
 });
 
-test('a signed EIP-3009 authorization that failed to send holds transfers until it expires unused', async () => {
+test('a signed EIP-3009 authorization that failed to send is held until it can never run, and 1Click had 10 more minutes', async () => {
   let sendFails = true;
+  let dead = false;
+  const asked: number[] = [];
   const s = synthetic({
     desk: { reserveUsd: 0 }, legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 100 }, reducer: true,
     usableForMs: 300_000, send: async () => { if (sendFails) throw new Error('arbitrum rpc: connection reset'); },
+    neverRuns: async () => { asked.push(s.w.t); return dead; },
   });
   await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
   assert.deepEqual(s.w.ended, [['a', false]]);
   assert.match(s.w.rescuer.held!, /the signed evm_usdc_to_intents of rescue a was not sent but stays usable until/);
   sendFails = false;
   s.status = () => ({ status: 'PENDING_DEPOSIT', body: null });
-  await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
-  assert.equal(s.sent.length, 0, 'still valid: no second authorization');
-  assert.equal(s.closes.length, 1);
+  // Past validBefore, but authorizationState is not read as unused yet (or the read failed): still held.
   s.w.t += 300_001;
+  await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
+  assert.equal(s.sent.length, 0, 'no second authorization');
+  assert.match(s.w.rescuer.held!, /rescue a/);
+  // It reads as one that can never run: 1Click still gets 10 minutes to index a deposit it missed.
+  dead = true;
   await run(s.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 20 }));
-  assert.ok(s.w.journal().some((j) => /rescue a's signed payment expired unused/.test(j)));
+  assert.match(s.w.rescuer.held!, /rescue a/, 'PENDING_DEPOSIT is not final yet');
+  s.w.t += 10 * 60_000;
+  await run(s.w, trigger({ id: 'd', venue: 'phoenix', amountUsd: 20 }));
+  assert.ok(s.w.journal().some((j) => /rescue a's signed payment can no longer run and 1Click saw no deposit 10 min later: expired unused/.test(j)));
   assert.equal(s.w.rescuer.held, null);
+  assert.ok(asked.length >= 2);
+});
+
+test('a payer that cannot tell whether its signed payment may still run keeps it held past its validity', async () => {
+  const s = synthetic({
+    desk: { reserveUsd: 0 }, legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 100 }, reducer: true,
+    usableForMs: 300_000, send: async () => { throw new Error('arbitrum rpc: connection reset'); },
+  });
+  await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
+  s.status = () => ({ status: 'PENDING_DEPOSIT', body: null });
+  s.w.t += 3_600_000;
+  await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
+  assert.match(s.w.rescuer.held!, /rescue a/);
+  assert.equal(s.sent.length, 0);
+});
+
+test('an EIP-3009 send whose outcome is unknown (no receipt, or the authorization already used) is held until a restart', async () => {
+  const s = synthetic({
+    desk: { reserveUsd: 0 }, legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 100 }, reducer: true,
+    usableForMs: 300_000, neverRuns: async () => true,
+    send: async () => { throw new OutcomeUnknown('arbitrum transferWithAuthorization', 'no receipt for 0xabc', { arbitrumTx: '0xabc' } as OutcomeIds); },
+  });
+  await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
+  assert.deepEqual(s.w.ended, [['a', false]]);
+  assert.match(s.w.rescuer.held!, /the evm_usdc_to_intents of rescue a may have paid .*no receipt for 0xabc.*reconcile it before any other transfer/);
+  // Past validBefore, 1Click still PENDING_DEPOSIT, the authorization read as unused: none of it ends this hold.
+  s.status = () => ({ status: 'PENDING_DEPOSIT', body: null });
+  s.w.t += 3_600_000;
+  await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
+  assert.match(s.w.rescuer.held!, /may have paid/);
+  assert.equal(s.closes.length, 1, 'only a reduce ran');
+});
+
+test('a SUCCESS the ledger never shows is held; after 30 min it is journaled once as reconcile needed and stays held', async () => {
+  const s = synthetic({ reducer: true, noLanding: true });
+  await run(s.w, trigger({ id: 'a', amountUsd: 30 }));
+  assert.match(s.w.rescuer.held!, /SUCCESS at 1Click but not yet/);
+  s.w.t += 31 * 60_000;
+  await run(s.w, trigger({ id: 'b', amountUsd: 30 }));
+  await run(s.w, trigger({ id: 'c', amountUsd: 30 }));
+  const lines = s.w.journal().filter((j) => /reconcile needed/.test(j));
+  assert.equal(lines.length, 1, 'said once');
+  assert.match(lines[0]!, /reconcile needed: rescue a's deposit \S+ \(\d+\.\d+ USDC in, at least \d+\.\d+ out to hyperliquid\) is SUCCESS at 1Click after \d+ min; transfers stay held/);
+  assert.match(s.w.rescuer.held!, /rescue a/);
+  assert.ok(s.w.logs.some((l) => /reconcile needed/.test(l)));
+});
+
+test('mainnet says at start that a restart dropped any holds and the cap meter starts full', async () => {
+  const s = synthetic({ seedCap: true });
+  assert.ok(s.w.logs.some((l) => /rescuer started: holds live in memory, so any transfer held before this restart is no longer held/.test(l)));
+  await run(s.w, trigger({ amountUsd: 30 }));
+  assert.match(s.w.journal()[0]!, /rescuer started at .*held transfer of an earlier run was dropped by the restart.*cap counts as used in full/);
+  assert.ok(!synthetic().w.logs.some((l) => /rescuer started/.test(l)), 'not without the seeded cap');
 });
 
 test('Hyperliquid USDC left on Arbitrum by a failed rescue is spent first; no second hl_withdraw meanwhile', async () => {
@@ -464,6 +535,57 @@ test('Hyperliquid USDC left on Arbitrum by a failed rescue is spent first; no se
   assert.equal(s.withdrawn.length, 1, 'no second withdraw');
   assert.match(s.w.journal().join('\n'), /already on the desk's Arbitrum address \(an earlier withdraw\), no new withdraw/);
   assert.equal(s.w.rescuer.hlWithdrawHeld, null, 'bridged: Hyperliquid may be withdrawn from again');
+});
+
+test('the hl_withdraw hold: less on Arbitrum than needed is bridged in part; it ends once Arbitrum reads empty with no withdraw on its way', async () => {
+  let refuse = true;
+  const s = synthetic({
+    desk: { reserveUsd: 0 }, legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 100 },
+    quote: async (body, now) => (refuse ? { ok: false, status: 400, message: 'Quoting for this pair is not available' } : { ok: true, response: testQuote(s.signer, body, now) }),
+  });
+  await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 10 }));
+  assert.match(s.w.rescuer.hlWithdrawHeld!, /left its USDC/);
+  const stranded = s.arb.e6;
+  refuse = false;
+  // A bigger rescue: what is on Arbitrum is bridged first, all of it, and no second withdraw.
+  await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 40 }));
+  assert.deepEqual(s.w.ended.at(-1), ['b', true]);
+  assert.equal(s.withdrawn.length, 1);
+  assert.equal(BigInt(s.quotes.at(-1)!.amount), stranded / 10_000n * 10_000n, 'the whole stranded balance (to the cent)');
+  assert.match(s.w.journal().join('\n'), /only \d+\.\d\d of the \d+\.\d\d USD is on Arbitrum/);
+  assert.equal(s.w.rescuer.hlWithdrawHeld, null);
+
+  // A withdraw that never arrives: held while it may still be on its way, then Arbitrum reads empty and it ends.
+  const t = synthetic({ desk: { reserveUsd: 0 }, legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 100 } });
+  const realPush = t.arb.arriving.push.bind(t.arb.arriving);
+  t.arb.arriving.push = () => 0;   // Hyperliquid accepted the withdraw; it never shows on Arbitrum
+  await run(t.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
+  assert.match(t.w.failures.at(-1)!.reason, /did not reach the desk's Arbitrum address/);
+  assert.ok(t.w.rescuer.hlWithdrawHeld !== null);
+  t.arb.arriving.push = realPush;
+  await run(t.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
+  assert.equal(t.withdrawn.length, 1, 'still on its way: no second withdraw');
+  t.w.t += 30 * 60_000;
+  await run(t.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 20 }));
+  assert.ok(t.w.journal().some((j) => /Arbitrum address reads empty and no hl_withdraw is on its way/.test(j)));
+  assert.equal(t.withdrawn.length, 2, 'withdraws run again');
+});
+
+test('an Arbitrum balance that cannot be read stops the Hyperliquid source and keeps the hl_withdraw hold', async () => {
+  let refuse = true;
+  const s = synthetic({
+    desk: { reserveUsd: 0 }, legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 100 }, reducer: true,
+    quote: async (body, now) => (refuse ? { ok: false, status: 400, message: 'Quoting for this pair is not available' } : { ok: true, response: testQuote(s.signer, body, now) }),
+  });
+  await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
+  refuse = false;
+  s.arbDown = true;
+  s.w.t += 3_600_000;
+  await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
+  assert.match(s.w.journal().join('\n'), /hyperliquid: the desk's Arbitrum USDC could not be read/);
+  assert.equal(s.withdrawn.length, 1);
+  assert.equal(s.quotes.length, 1, 'no bridge either');
+  assert.ok(s.w.rescuer.hlWithdrawHeld !== null, 'an unread balance is not an empty one');
 });
 
 test('mainnet starts its cap meter full: no rescue out of a venue in the first hour after a restart, the reserve still pays', async () => {
