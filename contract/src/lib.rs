@@ -32,7 +32,7 @@ use crate::action::{Pending, SignedAction, UnsignedAction};
 use crate::config::{Config, FeeConfig, Network, OrderlyConfig, PriceSource, Treasury};
 use crate::deposit::{check_one_yocto, check_pause_deposit, check_some_deposit, refund_after};
 use crate::desk::{policy_sha256, Desk, Gate, Role, SolanaAccounts};
-use crate::events::{emit_signed, DeskCreated, Event, OperatorSet, Paused, PolicySet};
+use crate::events::{emit_signed, DeskCreated, Event, OperatorSet, PanicClose, Paused, PolicySet};
 use crate::money::DeskMoney;
 use crate::prices::StoredPrice;
 use crate::rescue::DeskCounters;
@@ -376,8 +376,8 @@ impl Gimbal {
 
     /// Pauses or unpauses the desk. The owner may do both, the operator only pause. Pausing takes no
     /// deposit (or 1 yoctoNEAR), so the engine's key can pause; unpausing needs exactly 1 yoctoNEAR,
-    /// so only the owner's wallet can. Setting the state the desk is already in changes nothing and
-    /// logs nothing.
+    /// so only the owner's wallet can. Unpausing also clears `closing` ([`Self::panic_close`]).
+    /// Setting the state the desk is already in changes nothing and logs nothing.
     #[payable]
     #[deny_unknown_arguments]
     pub fn set_paused(&mut self, desk_id: String, paused: bool) {
@@ -386,7 +386,7 @@ impl Gimbal {
         let desk = desk_mut(&mut self.desks, &desk_id);
         desk.check_set_paused(&desk_id, &by, paused).or_fail();
         if paused {
-            check_pause_deposit(attached)
+            check_pause_deposit("pausing", attached)
         } else {
             check_one_yocto("set_paused(false)", attached)
         }
@@ -395,9 +395,43 @@ impl Gimbal {
             return;
         }
         desk.paused = paused;
+        if !paused {
+            desk.closing = false;
+        }
         Paused {
             desk_id: &desk_id,
             paused,
+            by: &by,
+        }
+        .emit();
+    }
+
+    /// Pauses the desk and marks it `closing`: the engine, reading that, cancels resting orders
+    /// and closes every leg reduce-only, which the paused-desk rules let through. Owner or operator
+    /// (`E_NOT_ALLOWED` for anyone else), no deposit or 1 yoctoNEAR (more is `E_DEPOSIT`), so the
+    /// engine's key can call it. Logs `paused` when the desk was running, then `panic_close` on
+    /// every call; on a paused desk it only sets `closing`. Only the owner's `set_paused(false)`
+    /// clears it. Adds no storage.
+    #[payable]
+    #[deny_unknown_arguments]
+    pub fn panic_close(&mut self, desk_id: String) {
+        let by = env::predecessor_account_id();
+        let attached = env::attached_deposit();
+        let desk = desk_mut(&mut self.desks, &desk_id);
+        desk.check_set_paused(&desk_id, &by, true).or_fail();
+        check_pause_deposit("panic_close", attached).or_fail();
+        if !desk.paused {
+            desk.paused = true;
+            Paused {
+                desk_id: &desk_id,
+                paused: true,
+                by: &by,
+            }
+            .emit();
+        }
+        desk.closing = true;
+        PanicClose {
+            desk_id: &desk_id,
             by: &by,
         }
         .emit();

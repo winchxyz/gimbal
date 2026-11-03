@@ -17,10 +17,10 @@ use near_sdk::{env, near, Promise};
 
 use crate::action::{OrderDetail, UnsignedAction};
 use crate::config::Config;
-use crate::deposit::check_one_yocto;
+use crate::deposit::{check_withdraw_deposit, WithdrawPath};
 use crate::desk::Gate;
 use crate::prices::reference_price;
-use crate::{action_desk, owner_desk, take_hl_nonce, Gimbal, GimbalExt, OrFail};
+use crate::{action_desk, take_hl_nonce, Gimbal, GimbalExt, OrFail};
 
 /// The host's keccak256, which the core builders take as a function.
 pub fn keccak(data: &[u8]) -> [u8; 32] {
@@ -85,10 +85,17 @@ impl Gimbal {
         self.sign(action)
     }
 
-    /// Emergency only: withdraws `amount` USDC from Hyperliquid to the desk's own EVM address on
-    /// Arbitrum. Owner only, exactly 1 yoctoNEAR attached (`E_NOT_ALLOWED`), also on a paused
-    /// desk. `amount` as for [`Self::hl_usd_class_transfer`]; Hyperliquid takes its withdrawal fee
-    /// out of it.
+    /// Withdraws `amount` USDC from Hyperliquid (`withdraw3`) to the desk's own EVM address on
+    /// Arbitrum, and nowhere else; also on a paused desk. Two paths, told apart by the deposit,
+    /// since the engine's key on the owner's account looks like the owner:
+    /// - exactly 1 yoctoNEAR: the owner's wallet (`E_NOT_ALLOWED` for anyone else), no limit, for
+    ///   emergencies;
+    /// - no deposit: the operator, or the owner's engine key, the way a rescue leaves Hyperliquid
+    ///   while 1Click quotes nothing out of HyperCore. `amount` counts against what is left of
+    ///   `rescue_cap_usd_per_hour` (`E_RESCUE_CAP`), not the cost budget or the deposit ring.
+    ///
+    /// Any other deposit is `E_NOT_ALLOWED`. `amount` as for [`Self::hl_usd_class_transfer`];
+    /// Hyperliquid takes its withdrawal fee out of it, and the whole `amount` counts.
     #[payable]
     #[deny_unknown_arguments]
     pub fn hl_withdraw(&mut self, desk_id: String, amount: String) -> Promise {
@@ -230,16 +237,27 @@ impl Gimbal {
 
     /// [`Self::hl_withdraw`] up to the signature.
     pub fn prepare_hl_withdraw(&mut self, desk_id: String, amount: String) -> UnsignedAction {
-        let desk = owner_desk(&self.desks, &desk_id, "hl_withdraw");
-        check_one_yocto("hl_withdraw", env::attached_deposit()).or_fail();
-        check_usdc_amount(&amount).or_fail();
+        // The role first, so a stranger learns nothing from the deposit rule; a withdrawal only
+        // moves money between the desk's own accounts, so it passes a pause either way.
+        let (desk, _) = action_desk(&self.desks, &desk_id, Gate::ReducesRisk);
+        let path = check_withdraw_deposit(env::attached_deposit()).or_fail();
+        if path == WithdrawPath::Owner {
+            desk.check_owner(&desk_id, &env::predecessor_account_id(), "hl_withdraw")
+                .or_fail();
+        }
+        let amount_e8 = check_usdc_amount(&amount).or_fail();
         let destination = Address::parse("evm_address", &desk.evm_address).or_fail();
+        let counters =
+            (path == WithdrawPath::Operator).then(|| self.counted_hl_withdraw(&desk_id, amount_e8));
         let time = take_hl_nonce(&mut self.hl_nonces, &desk_id, env::block_timestamp_ms());
         let action = UserAction::Withdraw {
             destination,
             amount: amount.clone(),
             time,
         };
+        if let Some(counters) = counters {
+            self.desk_counters.insert(desk_id.clone(), counters);
+        }
         UnsignedAction::hyperliquid(desk_id, action.prepare(keccak, self.config.network), None)
             .with_amount(Some(amount))
     }

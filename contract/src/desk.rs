@@ -17,6 +17,10 @@ pub struct Desk {
     /// Optional separate account that may call operator methods.
     pub operator: Option<AccountId>,
     pub paused: bool,
+    /// Set by `panic_close` (which pauses the desk too), cleared when the owner unpauses: the
+    /// engine, reading it, cancels resting orders and closes every leg reduce-only. Only ever true
+    /// while `paused` is.
+    pub closing: bool,
     pub policy: Policy,
     /// Hyperliquid master, Orderly account owner and EIP-3009 `from`: the MPC secp256k1 key at
     /// `gimbal/<desk_id>/evm`, lowercase `0x` address. Never changes.
@@ -104,7 +108,7 @@ impl Gate {
 }
 
 impl Desk {
-    /// A new, running desk with no operator, no Orderly receiver and an empty ledger, its Orderly
+    /// A new, running desk (not closing) with no operator, no Orderly receiver and an empty ledger, its Orderly
     /// account id that of `evm_address` (checked by the caller) under `broker_id`.
     pub fn new(
         owner: AccountId,
@@ -117,6 +121,7 @@ impl Desk {
             owner,
             operator: None,
             paused: false,
+            closing: false,
             policy,
             orderly_account_id: crate::orderly::orderly_account_id(&evm_address, broker_id),
             evm_address,
