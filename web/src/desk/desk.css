@@ -11,6 +11,19 @@
 /* ---------- desktop: two legs facing each other, the desk value between them ---------- */
 /* Columns: left leg | desk value (500 px) | right leg. Extra width goes to the sides, away from the middle.
    The first row is 300 px: legs and desk value start 32 px under the status line, their rows 300 px below that. */
+/* the strategy loop's decision, then the owner's Close: one quiet line under the status line */
+.d-decision { display: flex; align-items: center; gap: var(--s-4); padding: var(--s-3) var(--gutter); border-bottom: 1px solid var(--line); font: var(--t-s); color: var(--ink-2); min-height: 52px; }
+.d-decision .say { margin: 0; min-width: 0; flex: 1; }
+.d-decision .word { color: var(--ink); margin-right: var(--s-3); }
+.d-decision .reason { color: var(--ink-2); }
+.d-decision .when { margin-left: var(--s-3); white-space: nowrap; }
+.d-decision .end { flex: none; display: inline-flex; align-items: center; justify-content: flex-end; gap: var(--s-3); max-width: 60%; }
+.d-decision .end .out, .d-decision .end .ink { text-align: right; }
+.d-decision .end .ink { color: var(--ink); }
+.d-decision .end .out.ok { color: var(--ink); }
+.d-decision .end .btn { height: 32px; }
+.d-page > .d-empty { min-height: 0; flex: 1; }
+
 .d-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(380px, 500px) minmax(0, 1fr);
@@ -127,6 +140,9 @@
 /* ---------- phone: up to 1023 px, one column ---------- */
 @media (max-width: 1023px) {
   .d-page { min-height: 0; }
+  .d-decision { flex-direction: column; align-items: stretch; gap: var(--s-3); }
+  .d-decision .end { max-width: none; flex-wrap: wrap; justify-content: flex-start; }
+  .d-decision .end .btn { height: 44px; }
   .d-grid { display: flex; flex-direction: column; padding-top: 0; }
 
   .d-hero { order: 1; text-align: left; padding: var(--s-5) var(--gutter) 0; }

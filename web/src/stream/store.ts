@@ -109,6 +109,7 @@ export function reduceStream(state: StreamState, action: StreamAction): StreamSt
         rescue: engine.rescue,
         setup: engine.setup,
         health: engine.health,
+        decision: engine.decision ?? null,
       };
     }
     case 'event': {

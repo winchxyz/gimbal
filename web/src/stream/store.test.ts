@@ -152,7 +152,7 @@ test('the fake stream emits valid StreamEvents into the store', () => {
 
   const s = actions.reduce(reduceStream, initialStreamState());
   // the three events the Desk's "Latest" shows come with the first tick
-  assert.deepEqual(s.counts, { windows: 1, scan: 1, desk: 1, journal: 3, rescue: 0, setup: 1, health: 1, decision: 0 });
+  assert.deepEqual(s.counts, { windows: 1, scan: 1, desk: 1, journal: 3, rescue: 0, setup: 1, health: 1, decision: 1 });
   assert.equal(s.desk?.mode, 'replay');
   assert.equal(s.desk?.legs.length, 2);
   assert.equal(s.windows?.length, 13);
