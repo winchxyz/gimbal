@@ -110,6 +110,7 @@ export class ReplayContractClient implements ContractClient {
   readonly #keys: Record<string, ReplayKeys>;
   readonly #now: () => number;
   readonly #hlNonces = new Map<string, number>();
+  readonly #rescueSpent = new Map<string, { e8: bigint; at: number }>();
   readonly #evmCounters = new Map<string, bigint>();
   #requestId = 0;
   /** Every action method call, in order: what a test asserts on. */
@@ -227,7 +228,8 @@ export class ReplayContractClient implements ContractClient {
   async hlWithdraw(deskId: string, amount: string): Promise<HlSignedAction> {
     this.calls.push({ method: 'hl_withdraw', args: { desk_id: deskId, amount } });
     const desk = this.#gate(deskId, 'reduces-risk');
-    checkUsdcAmount(amount);
+    // The operator's hl_withdraw counts against the hourly rescue cap, as the contract counts it (C9).
+    this.#countRescue(deskId, desk, checkUsdcAmount(amount), 'hl_withdraw');
     const nonce = this.#hlNonce(deskId);
     return this.#hlUser(deskId, 'withdraw3', {
       type: 'withdraw3', signatureChainId: HL_SIGNATURE_CHAIN_ID, hyperliquidChain: this.#hlChain(), destination: desk.evm_address.toLowerCase(), amount, time: nonce,
@@ -269,7 +271,7 @@ export class ReplayContractClient implements ContractClient {
     this.calls.push({ method: 'sol_sign_rescue', args: { desk_id: deskId, message_b64: messageB64, quote, reason } });
     const desk = this.#gate(deskId, 'reduces-risk');
     checkReason(reason);
-    quoteFields(quote);
+    this.#countRescue(deskId, desk, BigInt(quoteFields(quote).amountIn) * 100n, 'sol_sign_rescue');
     return this.#sol(deskId, desk, 'rescue', messageB64, 1);
   }
 
@@ -341,6 +343,7 @@ export class ReplayContractClient implements ContractClient {
     const desk = this.#gate(deskId, 'reduces-risk');
     checkReason(reason);
     const q = quoteFields(quote);
+    this.#countRescue(deskId, desk, BigInt(q.amountIn) * 100n, 'evm_usdc_to_intents');
     const counter = this.#evmCounters.get(deskId) ?? 0n;
     this.#evmCounters.set(deskId, counter + 1n);
     const usdc = USDC_ARBITRUM[this.#config.network];
@@ -376,6 +379,19 @@ export class ReplayContractClient implements ContractClient {
   }
 
   // ---- internals ----
+
+  /** The contract's hourly rescue meter: what was spent decays linearly over an hour (rescue.rs DeskCounters). */
+  #countRescue(deskId: string, desk: DeskView, amountE8: bigint, method: string): void {
+    const now = this.#now();
+    const cap = BigInt(Math.round(desk.policy.rescue_cap_usd_per_hour * 1e6)) * 100n;
+    const prev = this.#rescueSpent.get(deskId);
+    const left = prev === undefined ? 0n : BigInt(Math.max(0, 3_600_000 - (now - prev.at)));
+    const spent = prev === undefined ? 0n : (prev.e8 * left) / 3_600_000n;
+    if (spent + amountE8 > cap) {
+      throw new ContractRefusal('E_RESCUE_CAP', `${method} of ${amountE8} (USD × 1e8) is over what is left of the hourly rescue cap (${cap - spent})`);
+    }
+    this.#rescueSpent.set(deskId, { e8: spent + amountE8, at: now });
+  }
 
   #desk(deskId: string): DeskView {
     checkDeskId(deskId);

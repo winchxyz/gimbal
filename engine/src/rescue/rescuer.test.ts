@@ -14,7 +14,7 @@ import type { TradeLeg } from '../trade/legs.ts';
 import type { OneClickApi, QuoteAnswer, QuoteRequest, StatusAnswer, VerifiedQuote } from './oneclick.ts';
 import { ASSETS } from './oneclick.ts';
 import { RecordedOneClick, SimulatedMoney, loadRescueRecording } from './recorded.ts';
-import type { CreditPort, HlWithdrawPort, Payer, Reducer, RescueDesk, RescuerOptions } from './rescuer.ts';
+import type { CreditPort, HlWithdrawPort, LandingPort, Payer, Reducer, RescueDesk, RescuerOptions } from './rescuer.ts';
 import { Rescuer } from './rescuer.ts';
 import { testQuote, testSigner } from './test-quotes.ts';
 
@@ -74,7 +74,7 @@ function recorded(desk: Partial<RescueDesk> = {}, legs: Leg[] = [leg('hyperliqui
     const target = (q: VerifiedQuote): VenueId => (q.destinationAsset === ASSETS.hypercoreUsdc ? 'hyperliquid' : 'orderly');
     return {
       mode: 'testnet', oneClick, desk: async () => recordedDesk(desk), view: () => ({ legs, freeMargin }),
-      margin: (v) => money.margin(v),
+      landing: money.landing(),
       payers: { reserve: money.payer('fund_venue', target), phoenix: money.payer('sol_sign_rescue', target), arbitrum: money.payer('evm_usdc_to_intents', target) },
       hlWithdraw: money.hlWithdraw(), fixedAmountUsd: (from, to) => oneClick.fixedAmountUsd(from, to), label: 'testnet: recorded',
     };
@@ -139,6 +139,15 @@ interface Synthetic {
   withdrawn: bigint[];
   credited: bigint[];
   closes: { targets?: [bigint, bigint]; reduceOnly?: boolean }[];
+  /** The target venues' ledgers: one entry per delivery (the test may add or hold them). */
+  ledger: { venue: VenueId; usd: number; id: string }[];
+  /** USDC on the desk's Arbitrum address, × 1e6, and withdraws on their way to it. */
+  arb: { e6: bigint; arriving: { at: number; e6: bigint }[] };
+  /** Replaces 1Click's status answers from now on. */
+  status: ((n: number, depositAddress: string) => StatusAnswer) | null;
+  legs: Leg[];
+  /** The key 1Click's quotes are signed with here. */
+  signer: ReturnType<typeof testSigner>;
 }
 
 interface SyntheticOptions {
@@ -149,19 +158,26 @@ interface SyntheticOptions {
   status?: (n: number) => StatusAnswer;
   sign?: () => Promise<void>;
   send?: () => Promise<void>;
-  /** The target's margin never moves. */
+  /** A sent payment never shows in the target's ledger. */
   noLanding?: boolean;
   reducer?: boolean;
   signer?: ReturnType<typeof testSigner>;
+  /** EIP-3009 validity of the signed payments, ms from signing. */
+  usableForMs?: number;
+  seedCap?: boolean;
+  confirms?: (venue: VenueId) => string | null;
 }
 
+const venueOf = (q: VerifiedQuote): VenueId => (q.destinationAsset === ASSETS.hypercoreUsdc ? 'hyperliquid' : q.destinationAsset === ASSETS.solanaUsdc ? 'phoenix' : 'orderly');
+
 function synthetic(o: SyntheticOptions = {}): Synthetic {
-  const s: Synthetic = { w: undefined as unknown as World, quotes: [], sent: [], withdrawn: [], credited: [], closes: [] };
-  const signer = testSigner();
+  const s: Synthetic = {
+    w: undefined as unknown as World, quotes: [], sent: [], withdrawn: [], credited: [], closes: [], ledger: [],
+    arb: { e6: 0n, arriving: [] }, status: null, legs: o.legs ?? [leg('hyperliquid', 200), leg('phoenix', 200)], signer: testSigner(),
+  };
+  const signer = s.signer;
   const quoteSigner = o.signer ?? signer;
-  let landed = 0;
   let statusN = 0;
-  let arbE6 = 7_000_000n;
   s.w = world(({ clock }) => {
     const oneClick: OneClickApi = {
       source: 'test', publicKey: signer.publicKey,
@@ -170,7 +186,11 @@ function synthetic(o: SyntheticOptions = {}): Synthetic {
         return o.quote?.(body, clock.now()) ?? { ok: true, response: testQuote(quoteSigner, body, clock.now()) };
       },
       submitDeposit: async () => ({ status: 200 }),
-      status: async () => o.status?.(++statusN) ?? { status: ++statusN > 2 ? 'SUCCESS' : 'PROCESSING', body: null },
+      status: async (addr) => {
+        statusN++;
+        if (s.status !== null) return s.status(statusN, addr);
+        return o.status?.(statusN) ?? { status: statusN > 2 ? 'SUCCESS' : 'PROCESSING', body: null };
+      },
     };
     const payer = (method: Payer['method']): Payer => ({
       method,
@@ -178,55 +198,65 @@ function synthetic(o: SyntheticOptions = {}): Synthetic {
         await o.sign?.();
         return {
           tx: [{ chain: 'near', id: `near-${method}`, url: 'https://nearblocks.io/x' }] as TxRef[],
+          ...(o.usableForMs === undefined ? {} : { usableUntilMs: clock.now() + o.usableForMs }),
           send: async () => {
             await o.send?.();
             s.sent.push(q);
-            if (o.noLanding !== true && method !== 'evm_usdc_to_intents') landed += Number(q.minAmountOutE8) / 1e8;
+            if (method === 'evm_usdc_to_intents') s.arb.e6 -= q.amountIn;
+            if (o.noLanding !== true) s.ledger.push({ venue: venueOf(q), usd: Number(q.minAmountOutE8) / 1e8, id: `ledger-${q.depositAddress}` });
             return { tx: [], depositTx: `deposit-${q.depositAddress}` };
           },
         };
       },
     });
+    const arrived = () => {
+      for (const a of [...s.arb.arriving]) {
+        if (clock.now() < a.at) continue;
+        s.arb.e6 += a.e6;
+        s.arb.arriving.splice(s.arb.arriving.indexOf(a), 1);
+      }
+      return s.arb.e6;
+    };
     const hlWithdraw: HlWithdrawPort = {
       withdraw: async (amountE6) => {
         s.withdrawn.push(amountE6);
-        const t0 = clock.now();
-        const arrive = amountE6 - 1_000_000n;
-        const old = arbE6;
-        // Shows on Arbitrum 230 s later.
-        hlWithdraw.arbitrumUsdcE6 = async () => (clock.now() - t0 >= 230_000 ? old + arrive : old);
+        // Shows on Arbitrum 230 s later, less Hyperliquid's 1 USDC.
+        s.arb.arriving.push({ at: clock.now() + 230_000, e6: amountE6 - 1_000_000n });
         return { tx: [{ chain: 'hyperliquid', id: '0xwithdraw', url: 'https://app.hyperliquid.xyz/explorer/tx/0xwithdraw' }] };
       },
-      arbitrumUsdcE6: async () => arbE6,
+      arbitrumUsdcE6: async () => arrived(),
     };
-    void arbE6;
-    arbE6 = 7_000_000n;
     const credit: CreditPort = {
       credit: async (e6) => {
         s.credited.push(e6);
-        if (o.noLanding !== true) landed += Number(e6) / 1e6;
         return { tx: [] };
       },
     };
-    const legs = o.legs ?? [leg('hyperliquid', 200), leg('phoenix', 200)];
+    const landing: LandingPort = {
+      confirms: (venue) => o.confirms?.(venue) ?? null,
+      find: async (venue, q, _since, seen) => {
+        const e = s.ledger.find((x) => x.venue === venue && !seen.has(x.id) && x.usd >= Number(q.minAmountOutE8) / 1e8);
+        return e === undefined ? null : { id: e.id, usd: e.usd, tx: [] };
+      },
+    };
     const pos: bigint[] = [100_000_000n, -100_000_000n];
     const reducer: Reducer = {
-      legs: legs.map((l, i) => ({ venue: l.venue, symbol: l.symbol, lot: 10_000n, replayable: false, position: async () => pos[i]! }) as unknown as TradeLeg) as unknown as [TradeLeg, TradeLeg],
+      legs: s.legs.map((l, i) => ({ venue: l.venue, symbol: l.symbol, lot: 10_000n, replayable: false, position: async () => pos[i]! }) as unknown as TradeLeg) as unknown as [TradeLeg, TradeLeg],
       lot: 10_000n,
       close: async (req) => {
         s.closes.push(req);
         const r: PairResult = {
           status: 'closed', size: '0', notes: [], tx: [],
-          legs: legs.map((l, i) => ({ venue: l.venue, symbol: l.symbol, start: String(pos[i]), target: String(req.targets?.[i]), final: String(req.targets?.[i]), orders: [] })) as unknown as PairResult['legs'],
+          legs: s.legs.map((l, i) => ({ venue: l.venue, symbol: l.symbol, start: String(pos[i]), target: String(req.targets?.[i]), final: String(req.targets?.[i]), orders: [] })) as unknown as PairResult['legs'],
         };
         return r;
       },
     };
     return {
-      mode: 'mainnet', oneClick, keyed: true,
+      mode: 'mainnet', oneClick, keyed: true, seedCap: o.seedCap ?? false,
       desk: async () => ({ addresses: rec.desk, policy: rec.policy, reserveUsd: 100, closing: false, ...o.desk }),
-      view: () => ({ legs, freeMargin: o.freeMargin ?? { phoenix: 100 } }),
-      margin: async () => landed,
+      view: () => ({ legs: s.legs, freeMargin: o.freeMargin ?? { phoenix: 100 } }),
+      landing,
       payers: { reserve: payer('fund_venue'), phoenix: payer('sol_sign_rescue'), arbitrum: payer('evm_usdc_to_intents') },
       hlWithdraw, credit: { phoenix: credit },
       ...(o.reducer === true ? { reducer: () => reducer } : {}),
@@ -246,7 +276,7 @@ test('Hyperliquid -> Phoenix: hl_withdraw to the desk\'s Arbitrum, then evm_usdc
   assert.equal(q.destinationAsset, ASSETS.solanaUsdc);
   assert.equal(q.recipient, rec.desk.sol);
   assert.equal(q.refundTo, rec.desk.evm);
-  assert.equal(q.slippageTolerance, 50);
+  assert.equal(q.slippageTolerance, 55);
   assert.equal(BigInt(q.amount), s.withdrawn[0]! - 1_000_000n, 'what arrived on Arbitrum is bridged');
   assert.equal(s.credited.length, 1, 'the delivery is deposited into Phoenix');
   const capWeight = Number(s.withdrawn[0]!) / 1e6 + Number(q.amount) / 1e6;
@@ -283,7 +313,7 @@ const failures: [string, SyntheticOptions, RescueProgress['step'], RegExp][] = [
   ['the payment cannot be sent', { send: async () => { throw new Error('rpc down'); } }, 'deposit', /fund_venue deposit: rpc down/],
   ['1Click refunds', { status: () => ({ status: 'REFUNDED', body: null }) }, 'deposit', /1Click ended the transfer REFUNDED: the refund goes back to the desk owner on NEAR/],
   ['1Click never settles', { status: () => ({ status: 'PROCESSING', body: null }) }, 'deposit', /1Click says PROCESSING after 600 s/],
-  ['the margin never shows', { noLanding: true }, 'deposit', /1Click says SUCCESS but hyperliquid's margin is up 0.00 USD/],
+  ['the delivery never shows in the ledger', { noLanding: true }, 'deposit', /1Click says SUCCESS but hyperliquid's ledger shows no delivery of at least/],
 ];
 
 for (const [name, options, step, reason] of failures) {
@@ -350,7 +380,7 @@ test('the rescue runs live only on mainnet: a live 1Click is refused on testnet 
     assert.throws(() => new Rescuer({
       mode, publish: () => {}, clock: { now: () => 0 }, sleep: async () => {},
       oneClick: { source: 'live', quote: async () => ({ ok: false, status: 0, message: '' }), submitDeposit: async () => ({ status: 0 }), status: async () => ({ status: '', body: null }) },
-      desk: async () => recordedDesk(), view: () => ({ legs: [], freeMargin: {} }), margin: async () => 0, payers: {}, ended: () => {},
+      desk: async () => recordedDesk(), view: () => ({ legs: [], freeMargin: {} }), landing: { confirms: () => null, find: async () => null }, payers: {}, ended: () => {},
     }), /runs live only on mainnet/);
   }
 });
@@ -363,4 +393,103 @@ test('recorded: a second rescue on the same recorded route is its own transfer: 
   assert.deepEqual(w.ended, [['a', true], ['b', true]]);
   assert.ok(w.t - t1 >= 60_000, 'the second waited for its own timeline');
   assert.match(w.journal().at(-1)!, /rescue b landed in \d{2,} s: 19.48 USD/);
+});
+
+// ---- paying twice ----
+
+test('a transfer 1Click has not settled in time is held: only reduces run until it settles, then it is journaled late', async () => {
+  const s = synthetic({ reducer: true, status: () => ({ status: 'PROCESSING', body: null }), noLanding: true });
+  await run(s.w, trigger({ id: 'a', amountUsd: 30 }));
+  assert.deepEqual(s.w.ended, [['a', false]]);
+  assert.match(s.w.failures[0]!.next, /only reduces run/);
+  assert.match(s.w.rescuer.held!, /is PROCESSING at 1Click: it may still deliver/);
+  // Still processing: the next rescue reduces, it does not pay again.
+  await run(s.w, trigger({ id: 'b', amountUsd: 30 }));
+  assert.deepEqual(s.w.ended.at(-1), ['b', true]);
+  assert.equal(s.sent.length, 1);
+  assert.equal(s.closes.length, 1);
+  // 1Click delivers late and the ledger shows it: the hold ends, and transfers run again.
+  s.status = () => ({ status: 'SUCCESS', body: null });
+  s.ledger.push({ venue: 'hyperliquid', usd: 31, id: 'late-delivery' });
+  await run(s.w, trigger({ id: 'c', amountUsd: 30 }));
+  assert.doesNotMatch(s.w.rescuer.held ?? '', /rescue a/, "a's hold ended");
+  assert.ok(s.w.journal().some((j) => /rescue a's 31.00 USD landed on hyperliquid late/.test(j)));
+  assert.equal(s.sent.length, 2, 'c paid: nothing is held any more');
+});
+
+test('a delivery 1Click calls SUCCESS but the ledger does not show is held too; a refund ends the hold', async () => {
+  const s = synthetic({ reducer: true, noLanding: true });
+  await run(s.w, trigger({ id: 'a', amountUsd: 30 }));
+  assert.match(s.w.rescuer.held!, /SUCCESS at 1Click but not yet in hyperliquid's ledger/);
+  s.status = () => ({ status: 'REFUNDED', body: null });
+  await run(s.w, trigger({ id: 'b', amountUsd: 30 }));
+  assert.equal(s.w.rescuer.held, null);
+  assert.ok(s.w.journal().some((j) => /rescue a's transfer ended REFUNDED at 1Click: refunded, nothing landed/.test(j)));
+});
+
+test('a signed EIP-3009 authorization that failed to send holds transfers until it expires unused', async () => {
+  let sendFails = true;
+  const s = synthetic({
+    desk: { reserveUsd: 0 }, legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 100 }, reducer: true,
+    usableForMs: 300_000, send: async () => { if (sendFails) throw new Error('arbitrum rpc: connection reset'); },
+  });
+  await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
+  assert.deepEqual(s.w.ended, [['a', false]]);
+  assert.match(s.w.rescuer.held!, /the signed evm_usdc_to_intents of rescue a was not sent but stays usable until/);
+  sendFails = false;
+  s.status = () => ({ status: 'PENDING_DEPOSIT', body: null });
+  await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
+  assert.equal(s.sent.length, 0, 'still valid: no second authorization');
+  assert.equal(s.closes.length, 1);
+  s.w.t += 300_001;
+  await run(s.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 20 }));
+  assert.ok(s.w.journal().some((j) => /rescue a's signed payment expired unused/.test(j)));
+  assert.equal(s.w.rescuer.held, null);
+});
+
+test('Hyperliquid USDC left on Arbitrum by a failed rescue is spent first; no second hl_withdraw meanwhile', async () => {
+  let refuse = true;
+  const s = synthetic({
+    desk: { reserveUsd: 0 }, legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 100 },
+    quote: async (body, now) => (refuse ? { ok: false, status: 400, message: 'Quoting for this pair is not available' } : { ok: true, response: testQuote(s.signer, body, now) }),
+  });
+  await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
+  assert.deepEqual(s.w.ended, [['a', false]]);
+  assert.equal(s.withdrawn.length, 1);
+  assert.match(s.w.rescuer.hlWithdrawHeld!, /left its USDC on the desk's Arbitrum address/);
+  assert.ok(s.arb.e6 > 0n, 'stranded on Arbitrum');
+  refuse = false;
+  await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
+  assert.deepEqual(s.w.ended.at(-1), ['b', true]);
+  assert.equal(s.withdrawn.length, 1, 'no second withdraw');
+  assert.match(s.w.journal().join('\n'), /already on the desk's Arbitrum address \(an earlier withdraw\), no new withdraw/);
+  assert.equal(s.w.rescuer.hlWithdrawHeld, null, 'bridged: Hyperliquid may be withdrawn from again');
+});
+
+test('mainnet starts its cap meter full: no rescue out of a venue in the first hour after a restart, the reserve still pays', async () => {
+  const s = synthetic({ seedCap: true, desk: { reserveUsd: 0 } });
+  await run(s.w, trigger({ id: 'a', amountUsd: 30 }));
+  assert.deepEqual(s.w.ended, [['a', false]]);
+  assert.match(s.w.failures[0]!.reason, /phoenix: over the rescue cap/);
+  const reserve = synthetic({ seedCap: true });
+  await run(reserve.w, trigger({ amountUsd: 30 }));
+  assert.deepEqual(reserve.w.ended, [['rescue-1', true]], 'fund_venue is not in the cap');
+  s.w.t += 3_600_000;
+  await run(s.w, trigger({ id: 'b', amountUsd: 30 }));
+  assert.deepEqual(s.w.ended.at(-1), ['b', true]);
+});
+
+test('a reduce is refused when the leg\'s margin is not read (it would size the cut at the whole leg)', async () => {
+  const s = synthetic({ reducer: true, desk: { reserveUsd: 0 }, freeMargin: {}, legs: [leg('phoenix', 200), leg('orderly', 200)] });
+  await run(s.w, trigger({ amountUsd: 30 }));
+  assert.deepEqual(s.w.ended, [['rescue-1', false]]);
+  assert.match(s.w.failures[0]!.reason, /margin is not read, so the cut cannot be sized/);
+  assert.equal(s.closes.length, 0);
+});
+
+test('a target whose landing cannot be confirmed takes no transfer', async () => {
+  const s = synthetic({ legs: [leg('orderly', 200), leg('phoenix', 200)], confirms: (v) => (v === 'orderly' ? 'a landing on Orderly cannot be confirmed here' : null) });
+  await run(s.w, trigger({ venue: 'orderly', symbol: 'PERP_ETH_USDC', amountUsd: 30 }));
+  assert.equal(s.quotes.length, 0);
+  assert.match(s.w.failures[0]!.reason, /reserve: a landing on Orderly cannot be confirmed here/);
 });

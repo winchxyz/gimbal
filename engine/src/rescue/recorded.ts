@@ -14,7 +14,7 @@ import type { Clock } from '../venues/venue.ts';
 import type { DeskAddresses, OneClickApi, QuoteAnswer, QuoteRequest, QuoteResponse, QuotedMethod, StatusAnswer, VerifiedQuote } from './oneclick.ts';
 import { DECIMALS, parseTimeMs } from './oneclick.ts';
 import type { Source } from './plan.ts';
-import type { CreditPort, HlWithdrawPort, Payer, RescueDesk, SignedPayment } from './rescuer.ts';
+import type { CreditPort, HlWithdrawPort, LandingPort, Payer, RescueDesk, SignedPayment } from './rescuer.ts';
 
 export const RECORDED_RESCUE_FIXTURE = new URL('../../fixtures/oneclick/rescue-mainnet-2026-10-31.json', import.meta.url);
 
@@ -25,7 +25,7 @@ export interface RecordedRoute {
   name: string;
   response: QuoteResponse;
   statuses: { afterS: number; status: string }[];
-  /** When the delivery shows in the target's margin, s after the deposit (Orderly credits 1–2 min after arrival). */
+  /** When the delivery shows in the target's ledger, s after the deposit (Orderly credits 1–2 min after arrival). */
   creditAfterS: number;
 }
 
@@ -114,7 +114,7 @@ export class RecordedOneClick implements OneClickApi {
 
 /**
  * The money side of a recorded rescue: simulated payers that sign and send nothing, the reserve they spend, and each
- * venue's margin as the deliveries add to it. margin() is only ever compared with itself (the rescue checks it went up).
+ * venue's ledger as the deliveries reach it (one entry per delivery, at its recorded credit time).
  */
 export class SimulatedMoney {
   readonly #oneClick: RecordedOneClick;
@@ -144,6 +144,7 @@ export class SimulatedMoney {
       sign: async (q: VerifiedQuote): Promise<SignedPayment> => ({
         tx: [],
         send: async () => {
+          if (method === 'evm_usdc_to_intents') this.#arbitrumE6 -= q.amountIn;
           if (method === 'fund_venue') {
             this.#reserveSpent += Number(q.amountInE8) / 1e8;
             this.onReserveSpend?.(Number(q.amountInE8) / 1e8);
@@ -175,22 +176,25 @@ export class SimulatedMoney {
     return { credit: async () => ({ tx: [] }) };
   }
 
-  /** The deliveries that have shown on `venue` so far, USD. */
-  async margin(venue: VenueId): Promise<number> {
-    const now = this.#clock.now();
-    let sum = 0;
-    for (const d of this.#deliveries) {
-      if (d.to !== venue) continue;
-      const at = this.#oneClick.creditAt(d.depositAddress, d.n);
-      if (at === null || now < at) continue;
-      sum += d.usd;
-      const key = `${d.depositAddress}#${d.n}`;
-      if (!this.#credited.has(key)) {
-        this.#credited.add(key);
-        this.onCredit?.(venue, d.usd);
-      }
-    }
-    return sum;
+  /** Every delivery shows as one ledger entry on its target once its recorded credit time has passed. */
+  landing(): LandingPort {
+    return {
+      confirms: () => null,
+      find: async (venue, q, sinceMs, seen) => {
+        const now = this.#clock.now();
+        for (const d of this.#deliveries) {
+          const id = `replayed-${d.depositAddress}#${d.n}`;
+          const at = this.#oneClick.creditAt(d.depositAddress, d.n);
+          if (d.to !== venue || seen.has(id) || at === null || now < at || at < sinceMs || d.usd < Number(q.minAmountOutE8) / 1e8) continue;
+          if (!this.#credited.has(id)) {
+            this.#credited.add(id);
+            this.onCredit?.(venue, d.usd);
+          }
+          return { id, usd: d.usd, tx: [] };
+        }
+        return null;
+      },
+    };
   }
 }
 

@@ -25,9 +25,9 @@ import { HyperliquidSubmitter } from '../relayer/hyperliquid.ts';
 import { sleep } from '../relayer/tx.ts';
 import type { RiskEngine } from '../risk/engine.ts';
 import type { ReplayDesk } from '../risk/sources.ts';
-import type { VenueReader } from '../venues/venue.ts';
 import type { Clock } from '../venues/venue.ts';
 import { ClosingWatch } from './closing.ts';
+import { HlLedgerLanding } from './hl-ledger.ts';
 import { HttpOneClick } from './oneclick.ts';
 import type { VerifiedQuote } from './oneclick.ts';
 import { RecordedOneClick, SimulatedMoney, loadRescueRecording, steadyClock } from './recorded.ts';
@@ -46,7 +46,6 @@ export interface ServeRescueInput {
   contractId?: string;
   deskId?: string;
   replayDesk?: ReplayDesk;
-  readers: readonly VenueReader[];
   /** The policy serve runs with (replay: the policy file, else the recording's). */
   policy: ContractPolicy | null;
   reducer?: () => Reducer | null;
@@ -58,6 +57,8 @@ export interface ServeRescue {
   closing: ClosingWatch;
   /** One line for serve's log. */
   summary: string;
+  /** The rescue running now (RiskEngine's rescuerRunning). */
+  running: () => string | null;
 }
 
 const targetOf = (q: VerifiedQuote): VenueId => (q.destinationAsset.startsWith('1cs_v1:hypercore') ? 'hyperliquid' : q.destinationAsset.includes('arb-') ? 'orderly' : 'phoenix');
@@ -114,7 +115,7 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
         }
         return { addresses: recording.desk, policy, reserveUsd: Math.max(0, reserveUsd), closing: isClosing || closing.blocked() !== null };
       },
-      margin: (venue) => money.margin(venue),
+      landing: money.landing(),
       payers: { reserve: money.payer('fund_venue', targetOf), phoenix: money.payer('sol_sign_rescue', targetOf), arbitrum: money.payer('evm_usdc_to_intents', targetOf) },
       hlWithdraw: money.hlWithdraw(),
       credit: { phoenix: money.credit() },
@@ -122,13 +123,13 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
       label: `${mode}: ${oneClick.source}, no funds moved`,
     });
     return {
-      rescuer: (t) => rescuer.take(t), closing,
+      rescuer: (t) => rescuer.take(t), closing, running: () => rescuer.runningId,
       summary: `rescue: ${mode}, 1Click steps from ${oneClick.source} (fixtures/oneclick), payments simulated: nothing is signed or sent`,
     };
   }
 
   if (env('GIMBAL_RESCUE') !== '1') {
-    return { rescuer: undefined, closing, summary: 'rescue: detect only on mainnet (GIMBAL_RESCUE=1 runs it live: it moves real money)' };
+    return { rescuer: undefined, closing, running: () => null, summary: 'rescue: detect only on mainnet (GIMBAL_RESCUE=1 runs it live: it moves real money)' };
   }
   const cfg = contractEnv(env, mode, { signing: true });
   if (cfg === null) throw new Error('GIMBAL_RESCUE=1 needs GIMBAL_CONTRACT_ID, GIMBAL_DESK_ID and the operator key');
@@ -167,6 +168,8 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
       const signed = await contract.evmUsdcToIntents(deskId, { quote: q.quote, quote_signature: q.signature }, reason);
       return {
         tx: signed.nearTx === undefined ? [] : [signed.nearTx],
+        // The authorization is public once signed and anyone may submit it until validBefore.
+        usableUntilMs: Number(signed.payload.validBefore) * 1000,
         send: async () => {
           const tx = await arb.submit(signed, await evm());
           return { tx, depositTx: tx.find((x) => x.chain === 'arbitrum')?.id ?? '' };
@@ -174,7 +177,6 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
       };
     },
   };
-  const reader = (id: VenueId) => input.readers.find((r) => r.id === id);
   const rescuer = new Rescuer({
     ...common, clock: input.clock, sleep, oneClick, keyed: apiKey !== null,
     desk: async () => {
@@ -186,14 +188,15 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
         closing: d.closing === true || closing.blocked() !== null,
       };
     },
-    // Orderly's account needs its private API, which serve does not open: a landing there cannot be confirmed yet.
-    margin: async (venue) => {
-      const d = view ?? await readDesk();
-      const r = reader(venue);
-      const address = venue === 'hyperliquid' ? d.evm_address : venue === 'phoenix' ? d.solana.authority : null;
-      if (r === undefined || address === null) throw new Error(`${venue}'s margin is not read here`);
-      return (await r.account(address)).equityUsd;
-    },
+    // Landings are confirmed in the target's ledger. Orderly's needs its private API, which serve does not open, and
+    // Phoenix takes no transfer until a deposit into it is built: both are refused as targets.
+    landing: new HlLedgerLanding({
+      network: 'mainnet', desk: evm,
+      others: {
+        orderly: 'a landing on Orderly cannot be confirmed here (its ledger needs the private API, which serve does not open)',
+        phoenix: 'a landing on Phoenix cannot be confirmed here (no Phoenix deposit is built)',
+      },
+    }),
     payers: { reserve, arbitrum },
     hlWithdraw: {
       withdraw: async (amountE6) => {
@@ -205,7 +208,7 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
     withdrawals: (venue, paused) => log(`rescue: ${venue} withdrawals ${paused === null ? 'ran' : `refused: ${paused}`}`),
   });
   return {
-    rescuer: (t) => rescuer.take(t), closing,
+    rescuer: (t) => rescuer.take(t), closing, running: () => rescuer.runningId,
     summary: `rescue: LIVE on mainnet (GIMBAL_RESCUE=1), operator ${cfg.accountId}, 1Click ${apiKey === null ? 'without a key (+0.2 %)' : 'with a key'}; sources: reserve, Hyperliquid via Arbitrum (Phoenix not wired)`,
   };
 }

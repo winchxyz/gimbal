@@ -29,8 +29,8 @@ export const DECIMALS: Record<string, number> = {
 
 /** The least minAmountOut into the Orderly receiver, USDC × 1e6 (Orderly loses a deposit under 5). */
 export const ORDERLY_MIN_OUT_E6 = 6_000_000n;
-/** The least a transfer into HyperCore may deliver, USDC × 1e6 (1Click's minimum there). */
-export const HYPERCORE_MIN_E6 = 500_000n;
+/** The least a transfer into HyperCore may deliver: 0.5 USDC in HyperCore's 8 decimals (1Click's minimum there). */
+export const HYPERCORE_MIN_E8 = 50_000_000n;
 /** fund_venue: amountOut − minAmountOut ≥ this share of amountOut, bps. */
 export const FUND_VENUE_MIN_ROOM_BPS = 50n;
 export const QUOTE_MAX_AGE_MS = 3_600_000;
@@ -85,8 +85,8 @@ export interface StatusAnswer {
   body: Record<string, unknown> | null;
 }
 
-/** Statuses that end a transfer. */
-export const FINAL_STATUSES: readonly string[] = ['SUCCESS', 'REFUNDED', 'FAILED'];
+/** Statuses that end a transfer (INCOMPLETE_DEPOSIT: less than amountIn arrived; 1Click refunds it). */
+export const FINAL_STATUSES: readonly string[] = ['SUCCESS', 'REFUNDED', 'FAILED', 'INCOMPLETE_DEPOSIT'];
 
 export interface OneClickApi {
   /** Where the answers come from, for the journal: 'live' or a recording's name. */
@@ -262,6 +262,9 @@ export function verifyQuote(response: QuoteResponse, method: QuotedMethod, ctx: 
     if (minAmountOut < ORDERLY_MIN_OUT_E6) throw fields(`minAmountOut ${e8Text(minAmountOut * 100n)} is below 6 USDC for the Orderly receiver (Orderly loses a deposit under 5)`);
   } else if (!((sameEvm(to, d.evm) && dest === ASSETS.hypercoreUsdc) || (to === d.sol && dest === ASSETS.solanaUsdc))) {
     throw fields(`recipient ${JSON.stringify(to)} with ${JSON.stringify(dest)} is not a desk address`);
+  } else if (dest === ASSETS.hypercoreUsdc && minAmountOut < HYPERCORE_MIN_E8) {
+    // The engine's own rule (the contract does not have it): under 1Click's minimum the delivery fails and refunds.
+    throw fields(`minAmountOut ${e8Text(minAmountOut)} is below the 0.5 USDC HyperCore takes`);
   }
   const amountOut = amount('amountOut', f.amountOut);
   if (method === 'fund_venue') {

@@ -8,7 +8,8 @@
 //   - `rescue`: a RescueProgress at step `detect` for each rescue trigger, unless a rescuer (E9) takes the trigger.
 //
 // Rescue triggers are per leg. A leg that reaches rescue is triggered once; while it stays in rescue it is triggered
-// again only when its rescue failed (rescueEnded(id, false)) or lapsed (no end reported within RESCUE_LAPSE_MS), after
+// again only when its rescue failed (rescueEnded(id, false)) or lapsed (no end reported within RESCUE_LAPSE_MS while the
+// rescuer is not running it: a real rescue can outlast the lapse, and its end then counts), after
 // a backoff of RESCUE_RETRY_MS doubling up to RESCUE_RETRY_MAX_MS. A leg that leaves rescue starts afresh.
 //
 // The ADL check runs beside the reads, never inside them: its response trades (an MPC signature can take 120 s, a
@@ -122,6 +123,8 @@ export interface RiskEngineOptions {
   adl?: AdlWatch;
   /** E9: takes a trigger and runs the rescue, then calls rescueEnded. Without it the trigger is published at `detect`. */
   rescuer?: (trigger: RescueTrigger) => void;
+  /** E9: the id of the rescue the rescuer is running now; a running rescue never lapses (a real one can take 10 min). */
+  rescuerRunning?: () => string | null;
   log?: (line: string) => void;
 }
 
@@ -413,7 +416,9 @@ export class RiskEngine {
         continue;
       }
       const backoff = Math.min(RESCUE_RETRY_MAX_MS, RESCUE_RETRY_MS * 2 ** r.attempt);
-      const ended = r.endedAt ?? (t - r.trigger.at >= RESCUE_LAPSE_MS ? r.trigger.at + RESCUE_LAPSE_MS : null);
+      // Lapsed: no end reported in time, and the rescuer is not still running it (it reports its end when it ends).
+      const lapsed = t - r.trigger.at >= RESCUE_LAPSE_MS && (this.#o.rescuerRunning?.() ?? null) !== r.trigger.id;
+      const ended = r.endedAt ?? (lapsed ? r.trigger.at + RESCUE_LAPSE_MS : null);
       if (ended !== null && t >= ended + backoff) {
         this.#log(`rescue ${r.trigger.id} of ${k} ${r.endedAt === null ? 'lapsed (no end reported)' : 'failed'}; the leg is still in rescue: again`);
         this.#fire(v, views, t, r.attempt + 1);

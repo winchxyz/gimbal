@@ -29,6 +29,8 @@ export class ClosingWatch {
   #closing = false;
   #done = false;
   #lastTry: number | null = null;
+  /** Bumped by every unpause: a close still in flight from before it must not mark the next panic_close done. */
+  #gen = 0;
   #seq = 0;
   /** The close in flight (tests wait on it). */
   current: Promise<void> | null = null;
@@ -45,28 +47,43 @@ export class ClosingWatch {
   /** Every read of get_desk: whether it says `closing`. */
   observe(closing: boolean): void {
     if (!closing) {
-      if (this.#closing) this.#log('closing cleared (set_paused false): opens and rescues may run again');
+      if (this.#closing) {
+        this.#log('closing cleared (set_paused false): opens and rescues may run again');
+        this.#gen++;
+      }
       this.#closing = false;
       this.#done = false;
       this.#lastTry = null;
       return;
     }
-    const first = !this.#closing;
     this.#closing = true;
-    if (this.#done || this.current !== null) return;
+    if (this.#done) return;
+    // A close in flight from before an unpause: this panic_close's close starts once it ends (the next read).
+    if (this.current !== null) return;
     const now = this.#o.clock.now();
-    if (!first && this.#lastTry !== null && now - this.#lastTry < (this.#o.retryMs ?? CLOSE_RETRY_MS)) return;
+    const fresh = this.#announced !== this.#gen;
+    if (!fresh && this.#lastTry !== null && now - this.#lastTry < (this.#o.retryMs ?? CLOSE_RETRY_MS)) return;
     this.#lastTry = now;
-    this.current = this.#close(first).finally(() => {
+    const gen = this.#gen;
+    this.current = this.#close(fresh, gen).finally(() => {
       this.current = null;
     });
   }
 
-  async #close(first: boolean): Promise<void> {
+  /** The panic_close (#gen) whose close was announced in the journal. */
+  #announced = -1;
+
+  async #close(first: boolean, gen: number): Promise<void> {
+    // Whatever this close finds, it counts only for the panic_close it was started for.
+    const current = () => gen === this.#gen;
+    const done = () => {
+      if (current()) this.#done = true;
+    };
+    this.#announced = gen;
     if (first) this.#journal('exit', 'panic_close read from get_desk: cancelling resting orders, then closing both legs reduce-only; no rescue or open starts', {});
     const reducer = this.#o.reducer();
     if (reducer === null) {
-      this.#done = true;
+      done();
       this.#journal('error', 'panic_close: no pair trader holds the legs here, so nothing was cancelled or closed; close them from the venues', {});
       return;
     }
@@ -83,7 +100,7 @@ export class ClosingWatch {
       const r = await reducer.close({ reason: 'panic_close: the owner closed the desk', reduceOnly: true });
       const legs = r.legs.map((l) => `${l.venue} ${l.symbol} ${l.start} -> ${l.final ?? '?'}`).join(', ');
       if (r.status === 'closed' || r.status === 'flat') {
-        this.#done = true;
+        done();
         this.#journal('exit', `panic_close: both legs closed reduce-only (${legs})`, {}, r.tx);
       } else {
         this.#journal('error', `panic_close: the reduce-only close ended ${r.status} (${legs}): ${r.notes.join('; ') || 'no notes'}; tried again in ${Math.round((this.#o.retryMs ?? CLOSE_RETRY_MS) / 1000)} s`, {}, r.tx);

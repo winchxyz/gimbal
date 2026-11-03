@@ -27,8 +27,8 @@ export const INTO_HYPERCORE_FEE_USD = 0.32;
 export const INTO_EVM_OR_SOLANA_FEE_USD = 0.05;
 /** 1Click adds this without an API key (CLAUDE.md: +0.2 %). */
 export const NO_KEY_FEE_SHARE = 0.002;
-/** Slippage asked of 1Click: the least fund_venue's room rule takes (amountOut − minAmountOut ≥ 0.5 %). */
-export const SLIPPAGE_BPS = 50;
+/** Slippage asked of 1Click: 5 bps over fund_venue's room rule (amountOut − minAmountOut ≥ 0.5 %), so rounding never lands on it. */
+export const SLIPPAGE_BPS = 55;
 /** The least sent into the Orderly receiver: 6 USDC must arrive (below 5 it is lost); room for slippage and fees. */
 export const ORDERLY_MIN_IN_USD = 6.2;
 /** The least sent into HyperCore: 1Click's 0.5 USDC minimum plus its fee. */
@@ -42,8 +42,8 @@ export type Source = VenueId | 'reserve';
 export type RouteCheck = (from: Source, to: VenueId) => string | null;
 
 export interface PlanInput {
-  /** The leg in rescue: its venue, and the margin that brings it back to its watch line. */
-  target: { venue: VenueId; symbol: string; amountUsd: number; marginUsd: number };
+  /** The leg in rescue: its venue, the margin that brings it back to its watch line, and what it holds (null: not read). */
+  target: { venue: VenueId; symbol: string; amountUsd: number; marginUsd: number | null };
   reserveUsd: number;
   /** Free (withdrawable) margin by venue, from the risk engine's last read; absent: not read. */
   freeMargin: Partial<Record<VenueId, number>>;
@@ -65,6 +65,10 @@ export interface PlanInput {
   fixedAmountUsd?: (from: Source, to: VenueId) => number | null;
   /** Transfers are held (an earlier one's outcome is unknown): only a reduce may run. */
   transfersHeld?: string | null;
+  /** USDC already on the desk's Arbitrum address (a Hyperliquid withdraw that was not bridged): spent before any new withdraw. */
+  arbitrumUsd?: number;
+  /** Why no new hl_withdraw may go out (an earlier one's USDC is still on Arbitrum or on its way); the Arbitrum USDC may still be spent. */
+  hlWithdrawHeld?: string | null;
 }
 
 export type Plan =
@@ -131,6 +135,19 @@ export function planRescue(input: PlanInput): Plan {
       return { kind: 'transfer', from, to, amountInUsd: amountIn, feeUsd: fee, capUsd: 0, withdrawUsd: null, notes };
     }
     const free = input.freeMargin[from];
+    // Hyperliquid: USDC already on the desk's Arbitrum address goes first, with no withdraw (its fee was paid).
+    const stranded = from === 'hyperliquid' && (input.arbitrumUsd ?? 0) >= amountIn;
+    if (from === 'hyperliquid' && !stranded && input.hlWithdrawHeld !== undefined && input.hlWithdrawHeld !== null) {
+      notes.push(`hyperliquid: no new hl_withdraw: ${input.hlWithdrawHeld}`);
+      continue;
+    }
+    if (stranded) {
+      if (amountIn > capLeft) {
+        notes.push(`hyperliquid: over the rescue cap: it would count ${amountIn.toFixed(2)} USD, and ${capLeft.toFixed(2)} of the ${input.capUsd} USD an hour is left`);
+        continue;
+      }
+      return { kind: 'transfer', from, to, amountInUsd: amountIn, feeUsd: fee - HL_WITHDRAW_FEE_USD, capUsd: amountIn, withdrawUsd: null, notes };
+    }
     // Hyperliquid: hl_withdraw takes amountIn plus its own fee, and must keep amount + 1 USDC within the withdrawable.
     const withdraw = from === 'hyperliquid' ? Math.ceil((amountIn + HL_WITHDRAW_FEE_USD) * 100 - 1e-6) / 100 : null;
     const needFree = withdraw === null ? amountIn : withdraw + HL_WITHDRAW_FEE_USD;
@@ -147,6 +164,10 @@ export function planRescue(input: PlanInput): Plan {
     return { kind: 'transfer', from, to, amountInUsd: amountIn, feeUsd: fee, capUsd: capWeight, withdrawUsd: withdraw, notes };
   }
   if (input.reduce !== null) return { kind: 'none', reason: `no source can pay and the legs cannot be reduced: ${input.reduce}`, notes };
+  // Unknown margin would size the cut at the whole leg: refused instead.
+  if (target.marginUsd === null || !(target.marginUsd >= 0)) {
+    return { kind: 'none', reason: `no source can pay, and the legs are not reduced: ${target.venue} ${target.symbol}'s margin is not read, so the cut cannot be sized`, notes };
+  }
   const fraction = Math.min(1, (target.amountUsd * REDUCE_HEADROOM) / Math.max(1e-9, target.marginUsd + target.amountUsd * REDUCE_HEADROOM));
   return { kind: 'reduce', fraction, notes };
 }

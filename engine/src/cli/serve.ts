@@ -252,7 +252,7 @@ if (deskSource !== null) {
   // panic_close can close them.
   const side = contract;
   const rescue = await serveRescue({
-    mode, env: envVar, clock, publish, log, risk: () => risk, readers: readers.venues, policy,
+    mode, env: envVar, clock, publish, log, risk: () => risk, policy,
     ...(replayDesk === null ? {} : { replayDesk }),
     ...(side === null ? {} : {
       getDesk: async () => {
@@ -266,7 +266,7 @@ if (deskSource !== null) {
   log(rescue.summary);
   risk = new RiskEngine({
     mode, source: deskSource, strategy: () => server?.strategy ?? DEFAULT_STRATEGY, health: venueHealth, publish, clock, log,
-    ...(rescue.rescuer === undefined ? {} : { rescuer: rescue.rescuer }),
+    ...(rescue.rescuer === undefined ? {} : { rescuer: rescue.rescuer, rescuerRunning: rescue.running }),
   });
 }
 
