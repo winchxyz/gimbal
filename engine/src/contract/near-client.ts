@@ -167,21 +167,27 @@ export class NearContractClient implements ContractClient {
     const maxAgeMs = options.maxAgeS * 1000;
     const before = new Map((await this.prices()).map((p) => [p.asset, p.at_ms]));
     const r = await this.#call('refresh_prices', () => ({ assets }), 'same');
-    if (r.value === false) throw new Error(`refresh_prices returned false in ${r.txHash}`);
-    let missing: string[] = assets;
-    for (let i = 0; i <= PRICE_POLL_WINDOW_MS / PRICE_POLL_MS; i++) {
-      if (i > 0) await this.#sleep(PRICE_POLL_MS);
-      const after = new Map((await this.prices()).map((p) => [p.asset, p.at_ms]));
-      const now = this.#now();
-      missing = assets.filter((a) => {
-        const at = after.get(a);
-        if (at === undefined) return true;
-        const newer = !before.has(a) || at > before.get(a)!;
-        return !newer && now - at > maxAgeMs;
-      });
-      if (missing.length === 0) return [nearTxRef(this.network, r.txHash)];
+    // From here the call is on chain (the contract recorded the ask and skips another for 30 s): every error says so,
+    // in one form a caller can tell from an error before or in the call (pair-mainnet-lib refreshLanded).
+    try {
+      if (r.value === false) throw new Error('it returned false (the oracle answered no price for an asset asked for)');
+      let missing: string[] = assets;
+      for (let i = 0; i <= PRICE_POLL_WINDOW_MS / PRICE_POLL_MS; i++) {
+        if (i > 0) await this.#sleep(PRICE_POLL_MS);
+        const after = new Map((await this.prices()).map((p) => [p.asset, p.at_ms]));
+        const now = this.#now();
+        missing = assets.filter((a) => {
+          const at = after.get(a);
+          if (at === undefined) return true;
+          const newer = !before.has(a) || at > before.get(a)!;
+          return !newer && now - at > maxAgeMs;
+        });
+        if (missing.length === 0) return [nearTxRef(this.network, r.txHash)];
+      }
+      throw new Error(`prices() has no newer price, nor one under ${maxAgeMs / 1000} s old, for ${missing.join(', ')} after ${PRICE_POLL_WINDOW_MS / 1000} s`);
+    } catch (err) {
+      throw new Error(`refresh_prices ran in ${r.txHash}: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
     }
-    throw new Error(`refresh_prices ran in ${r.txHash} but prices() has no newer price, nor one under ${maxAgeMs / 1000} s old, for ${missing.join(', ')} after ${PRICE_POLL_WINDOW_MS / 1000} s`);
   }
 
   /**

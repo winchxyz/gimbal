@@ -244,7 +244,8 @@ export class PairTrader {
 
   /**
    * Ends the unsettled orders' polls (a CLI calls it before it exits). What they watch stays as it was: unsettled()
-   * still names each order, open and close still refuse while one can run, and positionPushed still checks a leg.
+   * still names each order, and open and close still refuse while one can run. A push after it (or a check queued
+   * before it) trades nothing: the process is ending, and finish() reads the legs itself.
    */
   stop(): void {
     this.#ended = true;
@@ -257,9 +258,13 @@ export class PairTrader {
    * (rounded down to the common lot; the first leg's excess is closed reduce-only), so the pair may open smaller.
    */
   open(request: { size: bigint | number | string; longIndex: 0 | 1; reason: string; maker?: MakerFirst }): Promise<PairResult> {
-    return this.#serial(() => {
-      this.#beginMaker(request.maker);
-      return this.#open(request);
+    return this.#serial(async () => {
+      const end = this.#beginMaker(request.maker);
+      try {
+        return await this.#open(request);
+      } finally {
+        end();
+      }
     });
   }
 
@@ -279,27 +284,33 @@ export class PairTrader {
     if (parts > MAX_CLOSE_ORDERS) throw new LegCheckError(`an open of ${qtyString(total)} needs ${parts} pairs of at most ${qtyString(chunk)}, over ${MAX_CLOSE_ORDERS}`);
     const results: PairResult[] = [];
     let left = total;
-    for (let i = 1; left > 0n; i++) {
-      const size = left > chunk ? chunk : left;
-      if (request.beforePart !== undefined) {
-        try {
-          await request.beforePart(i, parts);
-        } catch (err) {
-          results.push(this.#refused(size, [`part ${i} of ${parts} not sent: ${errorText(err)}`]));
-          break;
+    let endMaker = (): void => {};
+    try {
+      for (let i = 1; left > 0n; i++) {
+        const size = left > chunk ? chunk : left;
+        if (request.beforePart !== undefined) {
+          try {
+            await request.beforePart(i, parts);
+          } catch (err) {
+            results.push(this.#refused(size, [`part ${i} of ${parts} not sent: ${errorText(err)}`]));
+            break;
+          }
         }
+        const part = { longIndex: request.longIndex, ...(request.maker === undefined ? {} : { maker: request.maker }), size, reason: parts === 1 ? request.reason : `${request.reason} (part ${i} of ${parts})` };
+        // One maker budget for the whole open, every part and move included: begun with the first part, ended after
+        // the last (the operation's own end function: a later operation's budget is not touched).
+        const first = i === 1;
+        const r = await this.#serial(() => {
+          if (first) endMaker = this.#beginMaker(request.maker);
+          return this.#open(part);
+        });
+        results.push(r);
+        const opened = toQty(r.size);
+        if (r.status !== 'open' || opened < size) break;
+        left -= opened;
       }
-      const part = { longIndex: request.longIndex, ...(request.maker === undefined ? {} : { maker: request.maker }), size, reason: parts === 1 ? request.reason : `${request.reason} (part ${i} of ${parts})` };
-      // One maker budget for the whole open, every part and move included: begun with the first part.
-      const first = i === 1;
-      const r = await this.#serial(() => {
-        if (first) this.#beginMaker(request.maker);
-        return this.#open(part);
-      });
-      results.push(r);
-      const opened = toQty(r.size);
-      if (r.status !== 'open' || opened < size) break;
-      left -= opened;
+    } finally {
+      endMaker();
     }
     return results;
   }
@@ -326,15 +337,22 @@ export class PairTrader {
    * sends can open or grow a position (the ADL response): the pair is then left stuck or unhedged, with the alert.
    */
   close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean; maker?: MakerFirst }): Promise<PairResult> {
-    return this.#serial(() => {
-      this.#beginMaker(request.maker);
-      return this.#close(request);
+    return this.#serial(async () => {
+      const end = this.#beginMaker(request.maker);
+      try {
+        return await this.#close(request);
+      } finally {
+        end();
+      }
     });
   }
 
-  /** A pair operation with a maker leg starts that leg's budget of post-only orders (TradeLeg.beginMakerOperation). */
-  #beginMaker(maker: MakerFirst | undefined): void {
-    if (maker !== undefined) this.legs[maker.index].beginMakerOperation?.();
+  /**
+   * A pair operation with a maker leg starts that leg's budget of post-only orders (TradeLeg.beginMakerOperation);
+   * the function returned ends it.
+   */
+  #beginMaker(maker: MakerFirst | undefined): () => void {
+    return (maker === undefined ? undefined : this.legs[maker.index].beginMakerOperation?.()) ?? (() => {});
   }
 
   /**
@@ -345,6 +363,7 @@ export class PairTrader {
    * handled; never rejects.
    */
   positionPushed(leg: TradeLeg, position: bigint): Promise<void> {
+    if (this.#ended) return Promise.resolve();
     if (!this.watching(leg)) {
       this.#until.delete(leg);
       if (this.#unsettled.has(leg)) return this.#serial(() => this.#lapse(leg)).catch((err) => this.#log(`${leg.venue} ${leg.symbol}: ${errorText(err)}`));
@@ -915,6 +934,7 @@ export class PairTrader {
    * reconciled like any other. A leg that could not be read reads again here: unmoved, its position is known again.
    */
   async #check(leg: TradeLeg, pushed: bigint, seenAt: number): Promise<void> {
+    if (this.#ended) return;
     const notes: string[] = [];
     const intent = this.#intent.get(leg) ?? null;
     const unsettled = this.#unsettled.get(leg);

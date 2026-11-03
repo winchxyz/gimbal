@@ -879,15 +879,16 @@ node --env-file=... engine/src/cli/pair-mainnet.ts close ETH
   liquidation distance per leg, and simulates the Phoenix IOC unsigned. It refuses when the spread does not cover the
   round trip, a leg is 40 % or less from liquidation, legUsd is over `max_notional_usd` less the band (19.80 at 20 and
   100 bps), the IOC simulation fails or uses more than 560k units, the policy's Phoenix market differs from the
-  exchange's (orderbook, spline, lot, tick) or the market is not active, or the Hyperliquid coin is not in cross
-  margin. Equity, maintenance and open notional are the cross margin of each venue, notional at the mark. `close`
+  exchange's (orderbook, spline, lot, tick) or the market is not active, the Hyperliquid coin is not in cross
+  margin, or Hyperliquid has a resting order for the coin (an earlier run's post-only order could fill outside the
+  pair; an open-orders read that fails refuses too). Equity, maintenance and open notional are the cross margin of each venue, notional at the mark. `close`
   takes a market in maintenance or suspended (its orders are reduce-only), never an orderbook, lot or tick mismatch.
 - Leverage: the contract has no update-leverage action, so Hyperliquid keeps the account's own setting. What is
   checked is each leg's effective leverage, (notional already open + legUsd) / equity: at most `--leverage` (2 or
   less), and at most 1.5 on a venue without a live rescue (`LIVE_RESCUE` in `engine/src/trade/carry-plan.ts`:
   Phoenix until the Phoenix -> Hyperliquid rescue merges).
 - The Hyperliquid short goes first as post-only limits at the touch: placed at most every `--reprice-s` (30 or more,
-  after a crossing refusal too), at most `--max-orders` signed post-only orders for the whole open or close, over all
+  after a crossing refusal too, and across the parts of one open), at most `--max-orders` signed post-only orders for the whole open or close, over all
   its parts (6 or fewer: from C10 the contract meters signed notional that is not reduce-only per rolling hour, and
   every reprice counts), for `--maker-timeout-s` (default 120); an IOC for the rest only with `--taker-fallback`. The
   Phoenix long follows as one IOC for what filled. When the maker order ends with a post-only order that has no
@@ -897,12 +898,20 @@ node --env-file=... engine/src/cli/pair-mainnet.ts close ETH
   lives `oracle_max_age_s` - 600 s (300 s at 900). The maker timeout plus 120 s must fit that, or the command
   refuses (`--maker-timeout-s 180` at most with 900). The price is refreshed only after the refusals are checked:
   before each part when it would not live the maker timeout plus 120 s more (and checked against the same margin
-  after), and whenever an order (an unwind, a close) finds it within 30 s of `oracle_max_age_s`; never twice within
-  30 s, since the contract skips that refresh.
+  after), and whenever an order (an unwind, a close) finds it within 30 s of `oracle_max_age_s`; never within 30 s
+  of one that went on chain (it ran, or it was sent with no final outcome), since the contract skips that refresh.
+  One refused, failed on chain (reverted) or failed before the chain is retried.
 - An outcome that cannot be proven ends with `open:` lines (exit code 3): reconcile those before running again. A
   post-only order whose state could not be settled is cancelled by its id once more before the process ends; both
-  legs are then read again and printed, Phoenix is brought back against Hyperliquid by one IOC when a late fill left
-  it off by a whole lot, and what stays unhedged is printed exactly.
+  legs are then read again and printed, Phoenix is brought back to the operation's target net by one IOC when a late
+  fill left it off by a whole lot, and what stays off is printed exactly. The target net is the sum of the
+  operation's targets: for `open`, hl + px as the open found them (an older imbalance stays as it was); for `close`,
+  0 (both legs flat), so a close that found the legs off sells or buys Phoenix back against a flat Hyperliquid.
+- Risk in the open's target net: it is read from Phoenix when the open starts, and a fresh process reads the Phoenix
+  trader snapshot with no slot floor, so a snapshot that lags an earlier run's last Phoenix IOC by a few seconds sets
+  the target wrong, and the residual hedge then trades toward it. The script keeps no state between runs, so it
+  cannot see how the last one ended: after a run that ended with `open:` lines, reconcile both legs with `status`
+  (and wait a few seconds after the last Phoenix order) before the next `open`.
 
 ## Files the scripts write
 

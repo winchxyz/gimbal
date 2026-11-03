@@ -30,7 +30,8 @@
 // distance per leg, and simulates the Phoenix IOC unsigned. It refuses when the spread does not cover the round trip,
 // a leg is 40 % or less from liquidation, a leg's effective leverage ((open notional + legUsd) / equity) is over the
 // asked leverage (at most 2x) or its venue's cap (1.5x without a live rescue, carry-plan.ts LIVE_RESCUE), the
-// Hyperliquid coin is in isolated margin, legUsd is over the policy cap less the band, or the simulation fails.
+// Hyperliquid coin is in isolated margin or has a resting order (an earlier run's could fill outside the pair), legUsd
+// is over the policy cap less the band, or the simulation fails.
 //
 // Hyperliquid leverage: the contract has no update-leverage action (its Hyperliquid actions are hl_order, hl_cancel,
 // hl_set_referrer, hl_approve_builder_fee, hl_usd_class_transfer, hl_withdraw, hl_send_to_intents), so the desk
@@ -79,7 +80,7 @@ import { errorMessage } from '../venues/recorder.ts';
 import type { Args, PriceDeps, StoredPrice } from './pair-mainnet-lib.ts';
 import {
   PRICE_MARGIN_S, UsageError, ensureFresh, hlCross, newPriceState, num, oraclePxOf, orderOptions, parseArgs, phoenixCross, priceFitRefusal, priceLifeS,
-  residualHedge, withdrawKeepsLegs,
+  refreshLanded, restingOrdersRefusal, settleResidual, withdrawKeepsLegs,
 } from './pair-mainnet-lib.ts';
 import { checkContractNetwork, contractEnv } from './serve-contract.ts';
 
@@ -191,6 +192,7 @@ async function main(argv: string[]): Promise<void> {
     prices: {
       maxAgeS: desk.policy.oracle_max_age_s, send: args.send, read: (symbol) => storedPrice(client, symbol),
       refresh: (symbol, maxAgeS) => client.refreshPrices([symbol], { maxAgeS }), now: () => Date.now(), log: say, ...newPriceState(),
+      landed: refreshLanded,
     },
     trading: false,
   };
@@ -380,6 +382,11 @@ interface Pair {
   marketConfig: PhoenixMarketConfig;
   maker: MakerSettings;
   microLamports: number;
+  /**
+   * The sum of the operation's targets, what finish() brings the pair back to (PairTrader.net after it): hl + px as an
+   * open found them, 0 for a close (both legs to flat).
+   */
+  targetNet: bigint | null;
 }
 
 async function buildPair(ctx: Ctx, symbol: string, closing = false): Promise<Pair> {
@@ -390,9 +397,10 @@ async function buildPair(ctx: Ctx, symbol: string, closing = false): Promise<Pai
     throw new Error(`${symbol} must be in both policy.hl_assets (${p.hl_assets.map((a) => a.symbol).join(', ')}) and policy.phoenix_markets (${p.phoenix_markets.map((m) => m.symbol).join(', ')})`);
   }
   const { maker, microLamports, slippageBps } = orderOptions(ctx.args);
-  const fit = priceFitRefusal(maker.timeoutMs / 1000, p.oracle_max_age_s);
-  if (fit !== null) throw new UsageError(fit);
   const unpriced = p.unpriced.find((u) => u.symbol === symbol);
+  // An unpriced symbol has no stored price to outlive (no band, max_sz instead).
+  const fit = unpriced === undefined ? priceFitRefusal(maker.timeoutMs / 1000, p.oracle_max_age_s) : null;
+  if (fit !== null) throw new UsageError(fit);
   const maxNotionalUsd = unpriced === undefined ? p.max_notional_usd : Math.min(p.max_notional_usd, p.unpriced_max_notional_usd);
   // Planning (a dry run, or --send before its refusals pass) prices with the stored price as it is; once trading, one
   // about to go stale is refreshed before an order is priced, so an unwind or a close is never refused for it.
@@ -438,7 +446,7 @@ async function buildPair(ctx: Ctx, symbol: string, closing = false): Promise<Pai
   const diffs = [...mismatches.map((m) => `the Phoenix exchange differs from the pinned accounts: ${m}`), ...marketMismatches(marketConfig, market, spline, { ignoreStatus: closing })];
   return {
     symbol, hl, phoenix, trader, lot: commonLot(hl.lot, phoenix.lot), bandBps: p.price_band_bps, priced: unpriced === undefined, mismatches: diffs,
-    marketConfig, maker, microLamports,
+    marketConfig, maker, microLamports, targetNet: null,
   };
 }
 
@@ -499,10 +507,11 @@ async function open(ctx: Ctx): Promise<void> {
   const since = Date.now() - 7 * 86_400_000;
   const evm = ctx.desk.evm_address.toLowerCase();
 
-  const [hlF, pxF, hlBook, pxBook, hlState, state, sp, lamports, assetData] = await Promise.all([
+  const [hlF, pxF, hlBook, pxBook, hlState, state, sp, lamports, assetData, hlOpen] = await Promise.all([
     hlFunding(ctx, symbol, since), phoenixFunding(ctx, symbol, since), ctx.hl.book(symbol, 5), ctx.phoenix.book(symbol, 5),
     hlInfo<unknown>(ctx, { type: 'clearinghouseState', user: evm }), traderState(ctx), storedPrice(ctx.client, symbol), ctx.chain.balance(ctx.sol.authority),
     hlInfo<{ leverage?: { type?: string; value?: number } }>(ctx, { type: 'activeAssetData', user: evm, coin: symbol }).catch(() => null),
+    hlInfo<unknown>(ctx, { type: 'openOrders', user: evm }).catch((err: unknown) => errorMessage(err)),
   ]);
   const registered = state !== null && state !== 'uninitialized';
   const pxAccount = registered ? await ctx.phoenix.account(ctx.sol.authority) : null;
@@ -513,6 +522,8 @@ async function open(ctx: Ctx): Promise<void> {
   if (legUsd > legCap + 1e-9) refusals.push(`legUsd ${usd(legUsd)} is over ${usd(legCap)}, the policy's ${policy.max_notional_usd} USD cap less the ${policy.price_band_bps} bps band`);
   const marginMode = assetData?.leverage?.type ?? null;
   if (marginMode !== 'cross') refusals.push(`Hyperliquid ${symbol} is in ${marginMode ?? 'an unreadable'} margin mode: only cross is planned (its liquidation is the account's); set it to cross on Hyperliquid`);
+  const resting = restingOrdersRefusal(hlOpen, symbol);
+  if (resting !== null) refusals.push(resting);
 
   const hlBid = hlBook.bids[0]?.px ?? 0;
   const hlAsk = hlBook.asks[0]?.px ?? 0;
@@ -570,6 +581,10 @@ async function open(ctx: Ctx): Promise<void> {
     return;
   }
   if (refusals.length > 0) throw new Error(`open --send refused, nothing signed: ${refusals.join('; ')}`);
+  // The open's targets keep hl + px as they are. A fresh process reads Phoenix from slot 0, so a snapshot that lags
+  // an earlier run's last IOC would set this wrong (README, the residual hedge).
+  const [hlStart, pxStart] = await Promise.all([pair.hl.position(), pair.phoenix.position()]);
+  pair.targetNet = hlStart + pxStart;
   ctx.trading = true;
   await approveBuilderFee(ctx);
   try {
@@ -605,6 +620,9 @@ async function close(ctx: Ctx): Promise<void> {
     return;
   }
   if (refusals.length > 0) throw new Error(`close --send refused, nothing signed: ${refusals.join('; ')}`);
+  // The close targets flat on both legs ([0, 0], trader.net after it), whatever hl + px were: the residual hedge
+  // brings Phoenix back against Hyperliquid's flat, not to an older imbalance.
+  pair.targetNet = 0n;
   ctx.trading = true;
   await approveBuilderFee(ctx);
   try {
@@ -673,32 +691,19 @@ async function finish(ctx: Ctx, pair: Pair): Promise<void> {
       openLines.push(`open:     hyperliquid post-only ${p.side} ${p.size} ${pair.symbol} (oid ${p.oid ?? 'unknown'}, cloid ${p.cloid}) may still rest and fill: cancel it on Hyperliquid and reconcile both legs`);
       process.exitCode = 3;
     }
-    const read = await readLegs(pair);
-    if (read === null) {
-      unhedged = `the legs cannot be read after the cancel: check hyperliquid and phoenix ${pair.symbol} by hand`;
-    } else {
-      say(`positions after the cancel: hyperliquid ${pair.symbol} ${signedQtyString(read.hl)}, phoenix ${pair.symbol} ${signedQtyString(read.px)}${read.hl + read.px === 0n ? ' (hedged)' : ' (NOT offsetting)'}`);
-      let now = read;
-      // Every post-only order settled and nothing on Phoenix with no answer: Phoenix can follow the late fill.
-      const hedge = residualHedge(read.hl, read.px, pair.phoenix.lot);
-      if (hedge !== null && left.length === 0 && pair.trader.unsettled(pair.phoenix) === null && ctx.args.send && ctx.trading) {
-        say(`hedge     phoenix ${hedge.side} ${qtyString(hedge.size)}${hedge.reduceOnly ? ' reduce-only' : ''}: back against hyperliquid ${signedQtyString(read.hl)}`);
-        const out = await pair.phoenix.order(hedge.side, hedge.size, hedge.reduceOnly, `pair-mainnet: hedge ${pair.symbol} after a late maker fill`);
-        say(`          ${out.kind}${out.kind === 'filled' ? ` ${qtyString(out.filled)}` : ` (${out.error.message})`}${out.ref.tx.length === 0 ? '' : ` ${refs(out.ref.tx)}`}`);
-        if (out.kind === 'unknown') {
-          openLines.push(`open:     the phoenix hedge ${hedge.side} ${qtyString(hedge.size)} ${pair.symbol} (${out.ref.orderId ?? 'no signature'}) has no proven outcome: check Phoenix by hand before sending another`);
+    unhedged = pair.targetNet === null
+      ? `the target net is unknown: check hyperliquid and phoenix ${pair.symbol} by hand`
+      : await settleResidual({
+        left: left.length, phoenixUnsettled: pair.trader.unsettled(pair.phoenix) !== null, send: ctx.args.send, trading: ctx.trading,
+        lot: pair.phoenix.lot, targetNet: pair.targetNet, symbol: pair.symbol, unhedged,
+      }, {
+        readLegs: () => readLegs(pair), say,
+        hedge: (side, size, reduceOnly) => pair.phoenix.order(side, size, reduceOnly, `pair-mainnet: hedge ${pair.symbol} after a late maker fill`),
+        open: (line) => {
+          openLines.push(`open:     ${line}`);
           process.exitCode = 3;
-        }
-        now = (await readLegs(pair)) ?? now;
-        say(`positions hyperliquid ${pair.symbol} ${signedQtyString(now.hl)}, phoenix ${pair.symbol} ${signedQtyString(now.px)}`);
-      }
-      const off = now.hl + now.px;
-      if (off !== 0n) {
-        unhedged = `unhedged: hyperliquid ${pair.symbol} ${signedQtyString(now.hl)}, phoenix ${pair.symbol} ${signedQtyString(now.px)}: ${qtyString(off > 0n ? off : -off)} ${pair.symbol} ${off > 0n ? 'long' : 'short'} is not offset`;
-      } else if (left.length === 0) {
-        unhedged = null;
-      }
-    }
+        },
+      });
   }
   if (unhedged !== null) {
     openLines.push(`open:     ${unhedged}`);
