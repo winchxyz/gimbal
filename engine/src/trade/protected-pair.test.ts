@@ -558,9 +558,11 @@ test('the per-desk lock: one holder; a stale lock is taken over; lockHolder name
     lock.release();
     assert.equal(existsSync(path), false);
     writeFileSync(path, '999999999\n');
+    assert.equal(lockHolder(path), 999999999, 'not running here, but still beating: maybe another container');
+    beatAgo(path, LOCK_STALE_MS + 1_000);
     assert.equal(lockHolder(path), null, 'its process is gone');
     const again = acquireTraderLock(path, { onExit: false });
-    assert.match(again.tookOver ?? '', /of pid 999999999 was stale \(its process \(pid 999999999\) is gone\) and is taken over/);
+    assert.match(again.tookOver ?? '', /of pid 999999999 was stale \(its process \(pid 999999999\) does not run here and its last heartbeat 91 s ago, over 90 s: it is gone\) and is taken over/);
     assert.equal(parseLockText(readFileSync(path, 'utf8'))?.pid, process.pid);
     again.release();
   } finally {
@@ -576,7 +578,7 @@ function beatAgo(path: string, agoMs: number): void {
 
 const noTimers = { setInterval: () => 0, clearInterval: () => {} };
 
-test('the lock at pid 1 (node in a container): this pid is taken over only once its heartbeat is over 90 s old; another boot or a dead pid at once', () => {
+test('the lock at pid 1 (node in a container): this pid is taken over only once its heartbeat is over 90 s old; another boot or a dead pid too', () => {
   const dir = tempDir();
   try {
     const path = join(dir, 'locks', 'trader.lock');
@@ -601,15 +603,26 @@ test('the lock at pid 1 (node in a container): this pid is taken over only once 
     writeFileSync(path, '1\n');
     beatAgo(path, LOCK_STALE_MS + 1_000);
     acquireTraderLock(path, { onExit: false, me, alive: nobody, timers: noTimers }).release();
-    // Another boot of the host: whatever its pid and its beat, its process is gone.
+    // Another boot id: an earlier boot of this host, or a container that has a boot id of its own. Beating: held
+    // (an overlapping container must not be judged gone by it); silent over 90 s: taken over.
     writeFileSync(path, lockText({ pid: 7, startedMs: 5_000_000, id: 'x', boot: 'boot-b' }));
+    beatAgo(path, 5_000);
+    assert.throws(() => acquireTraderLock(path, { onExit: false, me, alive: nobody, timers: noTimers }), /another process \(pid 7 under another boot id \(boot-b: another container\?\), its last heartbeat 5 s ago: taken over only after 90 s without one\)/);
+    beatAgo(path, LOCK_STALE_MS + 1_000);
     const rebooted = acquireTraderLock(path, { onExit: false, me, alive: () => true, timers: noTimers });
-    assert.match(rebooted.tookOver ?? '', /an earlier boot of this host/);
+    assert.match(rebooted.tookOver ?? '', /taken under another boot id \(boot-b: an earlier boot of this host, or another container\) and its last heartbeat 91 s ago/);
     rebooted.release();
-    // Another pid: held while it runs, stale at once when it does not (no wait for the beat).
+    // Another pid: held while it runs here, whatever its beat. Not running here (gone, or in another pid namespace):
+    // held while it beats, stale once silent over 90 s.
     writeFileSync(path, lockText({ pid: 42, startedMs: 1, id: 'pair-mainnet', boot: 'boot-a' }));
+    beatAgo(path, LOCK_STALE_MS + 1_000);
     assert.throws(() => acquireTraderLock(path, { onExit: false, me, alive: (pid) => pid === 42, timers: noTimers }), /another process \(pid 42\) trades this desk/);
-    assert.equal(lockStatus({ pid: 42, startedMs: 1, id: 'pair-mainnet', boot: null }, me, nobody, 0).kind, 'stale');
+    const other = { pid: 42, startedMs: 1, id: 'pair-mainnet', boot: null };
+    assert.equal(lockStatus(other, me, nobody, 1_000).kind, 'held', 'not running here, but beating: another container');
+    assert.match((lockStatus(other, me, nobody, 1_000) as { why: string }).why, /not running here but maybe in another container/);
+    assert.equal(lockStatus(other, me, nobody, null).kind, 'held', 'no heartbeat time: read as fresh');
+    assert.equal(lockStatus(other, me, nobody, LOCK_STALE_MS + 1).kind, 'stale');
+    assert.equal(lockStatus({ ...other, boot: 'boot-z' }, me, () => true, LOCK_STALE_MS + 1).kind, 'stale', 'another boot, silent: gone even if a pid 42 runs here now');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -702,6 +715,89 @@ test('two starters that read the same stale lock: only one takes it over; the ot
     const cLock = acquireTraderLock(path, { onExit: false, me: b, alive: nobody, timers: noTimers });
     assert.match(cLock.tookOver ?? '', /was stale/);
     cLock.release();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the takeover guard: removed only by its maker, and a stale one only while it is still the one read', () => {
+  const dir = tempDir();
+  try {
+    const path = join(dir, 'locks', 'trader.lock');
+    const guard = `${path}.takeover`;
+    const nobody = () => false;
+    const me = { pid: 1, startedMs: 1, id: 'starter-a', boot: null };
+    mkdirSync(dirname(path), { recursive: true });
+    const stale = () => {
+      writeFileSync(path, lockText({ pid: 1, startedMs: 1, id: 'killed', boot: null }));
+      beatAgo(path, LOCK_STALE_MS + 60_000);
+    };
+    // While this starter holds the guard, another one removes it as stale and makes its own: this starter's finally
+    // must leave that one alone.
+    stale();
+    const lock = acquireTraderLock(path, {
+      onExit: false, me, alive: nobody, timers: noTimers,
+      onTakeover: (stage) => {
+        if (stage !== 'guarded') return;
+        assert.match(readFileSync(guard, 'utf8'), /^1 starter-a [0-9a-f-]{36}\n$/, 'the guard names this attempt');
+        writeFileSync(guard, 'another starter\n');
+      },
+    });
+    assert.equal(readFileSync(guard, 'utf8'), 'another starter\n', 'not this attempt\'s guard: kept');
+    lock.release();
+    rmSync(guard);
+    // A stale guard is removed only while it is still the one read: one replaced meanwhile is a live starter's.
+    stale();
+    writeFileSync(guard, 'dead starter\n');
+    beatAgo(guard, LOCK_HEARTBEAT_MS + 5_000);
+    const taken = acquireTraderLock(path, { onExit: false, me, alive: nobody, timers: noTimers });
+    assert.match(taken.tookOver ?? '', /was stale/);
+    assert.equal(existsSync(guard), false);
+    taken.release();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a stale lock let go between the re-read and the unlink is judged again, not an error', () => {
+  const dir = tempDir();
+  try {
+    const path = join(dir, 'locks', 'trader.lock');
+    const me = { pid: 1, startedMs: 1, id: 'starter-a', boot: null };
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, lockText({ pid: 1, startedMs: 1, id: 'killed', boot: null }));
+    beatAgo(path, LOCK_STALE_MS + 60_000);
+    let removed = 0;
+    const lock = acquireTraderLock(path, {
+      onExit: false, me, alive: () => false, timers: noTimers,
+      onTakeover: (stage) => {
+        if (stage === 'unlink' && removed++ === 0) rmSync(path);     // let go right before this starter's unlink
+      },
+    });
+    assert.equal(removed, 1, 'the next try found no lock and made one');
+    assert.equal(lock.tookOver, null);
+    assert.deepEqual(parseLockText(readFileSync(path, 'utf8')), me);
+    lock.release();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a lock whose write fails is removed: this process does not read it as its own (or as held) afterwards', () => {
+  const dir = tempDir();
+  try {
+    const path = join(dir, 'locks', 'trader.lock');
+    const me = { pid: 1, startedMs: 1, id: 'starter-a', boot: null };
+    assert.throws(() => acquireTraderLock(path, {
+      onExit: false, me, timers: noTimers,
+      onTakeover: (stage) => {
+        if (stage === 'write') throw new Error('ENOSPC: no space left on device');
+      },
+    }), /the trader lock .* could not be written: ENOSPC/);
+    assert.equal(existsSync(path), false, 'no half-written lock is left');
+    const lock = acquireTraderLock(path, { onExit: false, me, timers: noTimers });
+    assert.equal(lock.tookOver, null);
+    lock.release();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
