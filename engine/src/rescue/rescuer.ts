@@ -196,7 +196,13 @@ export interface HlWithdrawPort {
 
 /** After 1Click delivered to a venue's wallet: what moves it into that venue's margin (Phoenix: a deposit). */
 export interface CreditPort {
-  credit(amountE6: bigint, reason: string): Promise<{ tx: TxRef[] }>;
+  /**
+   * Why the venue could not take the USDC into margin now (null: it can), asked before anything is paid: a transfer
+   * that lands where no deposit can follow is not started.
+   */
+  ready?(): Promise<string | null>;
+  /** `deliveryTx`: the delivery's transactions as 1Click's SUCCESS names them (destinationChainTxHashes). */
+  credit(amountE6: bigint, reason: string, deliveryTx?: readonly string[]): Promise<{ tx: TxRef[] }>;
 }
 
 /** A delivery as the target venue's ledger booked it. */
@@ -250,6 +256,8 @@ export interface RescuerOptions {
   /** Solana's finalized height and signature statuses: whether a held sol_sign_rescue can still land. Absent: held. */
   solana?: SolanaReads;
   credit?: Partial<Record<VenueId, CreditPort>>;
+  /** Why a route whose parts are all wired is still not run here (mainnet: not yet dry-run end to end), or null. */
+  routeLimit?: (from: Source, to: VenueId) => string | null;
   /** The pair trader holding both legs; absent: no reduce. */
   reducer?: () => Reducer | null;
   /** RiskEngine.rescueEnded. */
@@ -410,8 +418,10 @@ export class Rescuer {
   readonly #seen = new Set<string>();
   #seq = 0;
   #closingSaid = false;
-  /** The run in flight (tests wait on it). */
+  /** The run in flight (tests and serve's shutdown wait on it). */
   current: Promise<void> | null = null;
+  /** serve is shutting down (stop): no rescue starts and nothing new is signed. */
+  #stopping = false;
 
   constructor(options: RescuerOptions) {
     // 1Click has no testnet: a live 1Click off mainnet would move real mainnet money for a test desk.
@@ -492,10 +502,24 @@ export class Rescuer {
     return this.#running?.trigger.id ?? null;
   }
 
+  /**
+   * serve's shutdown: no rescue starts from now on, a running one signs nothing new, and one whose payment is already
+   * signed or sent stops waiting for 1Click and the ledger once that payment is saved (its hold keeps it for the next
+   * start, which reads it again at 1Click and on chain). Resolves when the running rescue has ended; never rejects.
+   */
+  stop(): Promise<void> {
+    this.#stopping = true;
+    return this.#running === null ? Promise.resolve() : (this.current ?? Promise.resolve());
+  }
+
   /** The risk engine's rescuer: starts the rescue and returns at once. */
   take(trigger: RescueTrigger): void {
     const run: Run = { trigger, from: trigger.from, amountUsd: trigger.amountUsd, startedAt: this.#o.clock.now(), tx: [], step: 'detect', ended: false, signedS: null };
     this.#progress(run, 'detect');
+    if (this.#stopping) {
+      this.#fail(run, 'source', 'the engine is stopping: no rescue starts', 'tried again after the next start');
+      return;
+    }
     if (this.#running !== null) {
       this.#fail(run, 'source', `rescue ${this.#running.trigger.id} of ${this.#running.trigger.venue} ${this.#running.trigger.symbol} is still running; one runs at a time`, 'tried again after the backoff');
       return;
@@ -612,6 +636,8 @@ export class Rescuer {
 
   #routeProblem(from: Source, to: VenueId, desk: RescueDesk): string | null {
     if (from === 'orderly') return 'Orderly is never a source (settle, withdraw and an EIP-3009 transfer: four signatures)';
+    const limited = this.#o.routeLimit?.(from, to) ?? null;
+    if (limited !== null) return limited;
     if (to === 'orderly' && desk.addresses.orderlyReceiver === null) return 'no Orderly receiver is pinned (set_orderly_receiver)';
     if (to === 'phoenix' && this.#o.credit?.phoenix === undefined) return 'into Phoenix the USDC lands on the desk\'s Solana account, and no Phoenix deposit is wired to move it into margin';
     if (from === 'hyperliquid' && to === 'orderly') return 'Hyperliquid\'s USDC leaves through Arbitrum, and Arbitrum USDC into the Orderly receiver is the same asset, which 1Click does not quote';
@@ -634,6 +660,13 @@ export class Rescuer {
     const t = run.trigger;
     const to = plan.to;
     const since = this.#o.clock.now();
+    // A venue that cannot take the delivery into margin (Phoenix: no registered trader, no SOL, a paused desk) is
+    // found out before anything is paid, not after 1Click delivered.
+    const credit = this.#o.credit?.[to];
+    if (credit?.ready !== undefined) {
+      const why = await credit.ready().catch((err: unknown) => `its readiness could not be read (${errorMessage(err)})`);
+      if (why !== null) throw new StepFailed('source', `${to} cannot take the USDC into margin now, so nothing was paid: ${why}`);
+    }
     if (plan.from === 'hyperliquid') {
       if (plan.withdrawUsd !== null) await this.#hlOut(run, plan, desk);
       else this.#journal(run, `rescue ${t.id}: source hyperliquid, ${plan.amountInUsd.toFixed(2)} USDC already on the desk's Arbitrum address (an earlier withdraw), no new withdraw`, { from: 'hyperliquid' });
@@ -688,6 +721,7 @@ export class Rescuer {
     } catch (err) {
       throw new StepFailed('source', `the Arbitrum head could not be read before hl_withdraw: ${errorMessage(err)}`);
     }
+    if (this.#stopping) throw new StepFailed('sign', 'the engine is stopping: hl_withdraw was not signed');
     this.#progress(run, 'sign');
     const signStart = this.#o.clock.now();
     let tx: TxRef[];
@@ -727,6 +761,9 @@ export class Rescuer {
       if (head !== null && await this.#withdrawArrived(evm, head).catch(() => false)) {
         this.#persist();
         return;
+      }
+      if (this.#stopping) {
+        throw new StepFailed('deposit', `the engine is stopping: hl_withdraw's ${usdc(expectE6)} USDC is not yet on the desk's Arbitrum address; it stays on its way (saved) and the next start looks for it`);
       }
       if (this.#o.clock.now() >= until) {
         throw new StepFailed('deposit', `hl_withdraw's ${usdc(expectE6)} USDC did not reach the desk's Arbitrum address within ${Math.round((this.#o.withdrawTimeoutMs ?? WITHDRAW_TIMEOUT_MS) / 1000)} s (measured 231 s)`);
@@ -795,6 +832,7 @@ export class Rescuer {
         throw new StepFailed('sign', `the Arbitrum head or the desk's counters on NEAR could not be read before signing, so nothing was signed: ${errorMessage(err)}`);
       }
     }
+    if (this.#stopping) throw new StepFailed('sign', 'the engine is stopping: nothing was signed');
     let prepared: PreparedPayment | undefined;
     if (payer.method === 'sol_sign_rescue') {
       try {
@@ -900,6 +938,11 @@ export class Rescuer {
           : 'the desk\'s Arbitrum address (not counted as the rescuer\'s own to spend: the owner moves it)';
         throw new StepFailed('deposit', `1Click ended the transfer ${s.status}: the refund goes back to ${back}`);
       }
+      if (this.#stopping) {
+        this.#park(hold, `rescue ${id}'s transfer to ${q.depositAddress} was sent and is ${last} at 1Click; the engine stopped before it settled`, null);
+        this.#persist();
+        throw new StepFailed('deposit', `the engine is stopping: the transfer to ${q.depositAddress} was sent and saved as held (${last} at 1Click); the next start reads it again`);
+      }
       if (this.#o.clock.now() >= until) {
         this.#park(hold, `rescue ${id}'s transfer to ${q.depositAddress} is ${last} at 1Click: it may still deliver`, null);
         this.#persist();
@@ -914,9 +957,15 @@ export class Rescuer {
     const { q, deliveryTx, hold } = hop;
     const to = plan.to;
     const credit = this.#o.credit?.[to];
+    if (credit !== undefined && this.#stopping) {
+      // Signing the deposit now could be cut off by the exit: the USDC waits on the venue's wallet instead.
+      this.#dropHold(hold);
+      this.#persist();
+      throw new StepFailed('deposit', `the engine is stopping: 1Click delivered at least ${e8Text(q.minAmountOutE8)} USDC to the desk's ${to} wallet, not moved into margin (a deposit moves it)`);
+    }
     if (credit !== undefined) {
       try {
-        const { tx } = await credit.credit(q.minAmountOut, `rescue ${run.trigger.id}: the delivered USDC into ${to} margin`);
+        const { tx } = await credit.credit(q.minAmountOut, `rescue ${run.trigger.id}: the delivered USDC into ${to} margin`, deliveryTx);
         run.tx.push(...tx);
       } catch (err) {
         // 1Click delivered: nothing more of this payment can move.
@@ -937,7 +986,7 @@ export class Rescuer {
         run.tx.push(...entry.tx.filter((x) => !run.tx.some((y) => y.chain === x.chain && y.id === x.id)));
         return this.#land(run, entry.usd, q, plan);
       }
-      if (this.#o.clock.now() >= until) {
+      if (this.#o.clock.now() >= until || this.#stopping) {
         this.#park(hold, `rescue ${run.trigger.id}'s delivery is SUCCESS at 1Click but not yet in ${to}'s ledger`, null);
         this.#persist();
         throw new StepFailed('deposit', `1Click says SUCCESS but ${to}'s ledger shows no delivery of at least ${e8Text(q.minAmountOutE8)} USDC after ${Math.round(timeout / 1000)} s`);

@@ -133,7 +133,8 @@ Broker id and chain id are fixed in the contract (`OrderlyConfig`).
 
 **NEAR Intents 1Click** (`https://1click.chaindefuser.com/v0`)
 - HyperCore USDC: `1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054` (8 decimals; lands in perps;
-  0.2 USDC fee; minimum 0.5). Solana USDC: `nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near`.
+  a flat withdraw fee of about 0.32 USDC; minAmountOut at least 1.31, so about 1.65 sent, as 1Click's quotes said
+  on 2026-11-03). Solana USDC: `nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near`.
 - Quotes are signed: Ed25519 key `reYaWhvwu8Jzo3WUM3zhn6VrhuMEF4eADL17qtRVifc` over the UTF-8 of
   `base58(sha256(json-stable-stringify(request fields ∪ quote fields ∪ timestamp)))`.
 - After depositing, POST `/deposit/submit` `{txHash, depositAddress}`; poll `/status?depositAddress=`.

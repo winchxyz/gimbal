@@ -67,7 +67,42 @@ export class RpcSolanaReads implements SolanaReads {
     const slot = r.context?.slot;
     return { known: r.value[0] !== null, slot: Number.isSafeInteger(slot) ? slot as number : null };
   }
+
+  /**
+   * Why this RPC cannot back the Solana hold rule, or null when it can: it must find, with searchTransactionHistory,
+   * a finalized signature at least HISTORY_PROBE_MIN_AGE_SLOTS old, far past any node's recent status cache (300
+   * slots). The signature is the oldest of the last 1,000 that name `probeAddress` (default Phoenix's withdraw queue:
+   * a few hundred a day, so the oldest is days old); a node without history answers null for it.
+   */
+  async historyProblem(probeAddress = HISTORY_PROBE_ADDRESS): Promise<string | null> {
+    try {
+      const f = await this.finalized();
+      let before: string | undefined;
+      for (let page = 0; page < 3; page++) {
+        const list = await this.#call('getSignaturesForAddress', [probeAddress, { limit: 1000, commitment: 'finalized', ...(before === undefined ? {} : { before }) }]);
+        if (!Array.isArray(list) || list.length === 0) return `getSignaturesForAddress(${probeAddress}) gave no signatures to probe the history with`;
+        const oldest = list.at(-1) as { signature?: unknown; slot?: unknown };
+        if (typeof oldest.signature !== 'string' || !Number.isSafeInteger(oldest.slot)) return 'getSignaturesForAddress: not a signature and slot';
+        const age = f.slot - (oldest.slot as number);
+        if (age < HISTORY_PROBE_MIN_AGE_SLOTS) {
+          before = oldest.signature;
+          continue;
+        }
+        const st = await this.signatureStatus(oldest.signature);
+        if (!st.known) return `getSignatureStatuses with searchTransactionHistory does not find ${oldest.signature} (${age} slots old): this RPC serves no transaction history`;
+        return null;
+      }
+      return `no signature of ${probeAddress} at least ${HISTORY_PROBE_MIN_AGE_SLOTS} slots old among its last 3,000: the history could not be probed`;
+    } catch (err) {
+      return `the history probe failed: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
 }
+
+/** Phoenix's withdraw queue (phoenix-tx.ts PHOENIX_MAINNET.withdrawQueue): the history probe's address. */
+export const HISTORY_PROBE_ADDRESS = '3c3NTwpg7yW91FxijkHBXwVH1xUifun3Z8TC5eW5Si3K';
+/** How old the probed signature must be, slots (about 67 min): far past a node's recent status cache. */
+export const HISTORY_PROBE_MIN_AGE_SLOTS = 10_000;
 
 /** Solana in memory: a block height (and slot) that grows with the clock (one per 400 ms, finalized 32 behind) and landed signatures. */
 export class SimulatedSolana implements SolanaReads {

@@ -1402,3 +1402,55 @@ test('state: a save that fails before a signature or a withdraw (a full disk, a 
   assert.equal(h.w.rescuer.hlWithdrawHeld, null);
   assert.ok(h.w.logs.some((l) => /rescuer state not saved .*EPERM.*no signature or withdraw is asked for until a save before it succeeds/.test(l)));
 });
+
+// ---- serve's shutdown and a target that cannot take the delivery ----
+
+test('stop before signing: the running rescue signs nothing and ends failed; no rescue starts after it', async () => {
+  const s = synthetic();
+  s.w.rescuer.take(trigger());
+  await s.w.rescuer.stop();
+  assert.equal(s.signed.length, 0, 'nothing signed');
+  assert.deepEqual(s.w.ended, [['rescue-1', false]]);
+  assert.match(JSON.stringify(s.w.failures), /the engine is stopping: nothing was signed/);
+  await run(s.w, trigger({ id: 'rescue-2' }));
+  assert.equal(s.quotes.length, 1, 'no second quote');
+  assert.match(JSON.stringify(s.w.failures.at(-1)), /the engine is stopping: no rescue starts/);
+  assert.equal(await Promise.race([s.w.rescuer.stop().then(() => 'done'), new Promise((r) => setTimeout(() => r('hung'), 50))]), 'done', 'nothing running: stop resolves');
+});
+
+test('stop while the payment is sent: it is sent and saved as held, then the rescue stops waiting for 1Click', async () => {
+  let stopped: Promise<void> | null = null;
+  const s = synthetic({
+    send: async () => {
+      stopped = s.w.rescuer.stop();
+    },
+    status: () => ({ status: 'PROCESSING', body: null }),
+  });
+  await run(s.w);
+  await stopped;
+  assert.equal(s.sent.length, 1, 'the signed payment went out');
+  assert.deepEqual(s.w.ended, [['rescue-1', false]]);
+  assert.match(JSON.stringify(s.w.failures.at(-1)), /the engine is stopping: the transfer to .* was sent and saved as held/);
+  assert.match(s.w.rescuer.held ?? '', /was sent and is PROCESSING at 1Click; the engine stopped before it settled/);
+});
+
+test('a target whose credit is not ready (Phoenix: no registered trader) is refused before any quote or payment', async () => {
+  const s = synthetic({ legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 0 } });
+  let credited = 0;
+  s.w.restart({ credit: { phoenix: { ready: async () => 'the desk\'s Phoenix trader is not registered', credit: async () => (credited++, { tx: [] }) } } });
+  await run(s.w, trigger({ venue: 'phoenix', amountUsd: 10 }));
+  assert.equal(s.quotes.length, 0);
+  assert.equal(s.signed.length, 0);
+  assert.equal(credited, 0);
+  assert.deepEqual(s.w.ended, [['rescue-1', false]]);
+  assert.match(JSON.stringify(s.w.failures.at(-1)), /phoenix cannot take the USDC into margin now, so nothing was paid: the desk's Phoenix trader is not registered/);
+});
+
+test('a route limit refuses a wired route by name (mainnet: Hyperliquid -> Phoenix is replay-only)', async () => {
+  const s = synthetic({ desk: { reserveUsd: 0 }, legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 100 } });
+  s.w.restart({ routeLimit: (from, to) => (from === 'hyperliquid' && to === 'phoenix' ? 'Hyperliquid -> Phoenix runs only in replay' : null) });
+  await run(s.w, trigger({ venue: 'phoenix', amountUsd: 20 }));
+  assert.equal(s.withdrawn.length, 0);
+  assert.equal(s.quotes.length, 0);
+  assert.match(JSON.stringify(s.w.failures.at(-1)) + s.w.journal().join('\n'), /Hyperliquid -> Phoenix runs only in replay/);
+});

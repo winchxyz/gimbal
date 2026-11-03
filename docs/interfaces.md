@@ -984,6 +984,37 @@ Rescue triggers are per leg: a leg that reaches rescue is triggered once; while 
 again only when its rescue failed or lapsed (no end within 370 s), after a backoff of 30 s doubling up to 10 min. A
 leg that leaves rescue starts afresh.
 
+**Rescue routes (engine, `engine/src/rescue/serve-rescue.ts` `MAINNET_ROUTES`).** serve prints them at start. Live on
+mainnet with `GIMBAL_RESCUE=1`:
+- reserve → Hyperliquid: `fund_venue` into HyperCore USDC; the landing is an incoming entry in the desk's Hyperliquid
+  ledger (`userNonFundingLedgerUpdates`), 1Click's delivery hash first, never the equity.
+- reserve → Phoenix: `fund_venue` into Solana USDC for the desk Solana authority; once 1Click's delivery is on Solana
+  and the desk's USDC account holds `minAmountOut`, a plain `sol_sign` deposit (Ember wrap + `deposit_funds`, 400,000
+  units at 100,000 micro-lamports, under the 200,000 cap of a message that is not a rescue); the landing is that
+  deposit, confirmed. Before anything is paid the engine checks a deposit could follow (a registered trader, a
+  running desk, SOL for the fee), else the rescue is refused.
+- Phoenix → Hyperliquid: one `sol_sign_rescue` transaction to the 1Click deposit address (Solana USDC for HyperCore
+  USDC), the landing in the Hyperliquid ledger. The message is one of three, built and simulated unsigned before the
+  hold is saved: spare USDC already on the desk's USDC account (the deposit owner's account and the
+  `TransferChecked`, 100,000 units at 100,000 micro-lamports); a Phoenix `withdraw_funds` + Ember unwrap of what the
+  account lacks, the transfer of `amountIn` and the `Revoke` (400,000 at 100,000); a paused desk's lean rescue (no
+  price, no create of a desk account). It is refused before signing when the authority lacks the SOL (fee, token
+  account rents, the 890,880-lamport reserve), Phoenix lets less be withdrawn, or the simulation fails. It is signed
+  once and never rebuilt: the deposit ring takes the quote once.
+- Both Phoenix routes need a Solana RPC (`SOLANA_RPC_URL`, default the public mainnet RPC) that serves
+  `getSignatureStatuses` with `searchTransactionHistory`, which the Solana hold rule reads (a held `sol_sign_rescue`
+  is released once the finalized height is past its `lastValidBlockHeight` and the signature is unknown). serve
+  probes it at start with a finalized signature at least 10,000 slots old (the oldest of the last 1,000 naming
+  Phoenix's withdraw queue); without history both Phoenix routes are refused, the start line says why, and Solana
+  holds stay held.
+
+Replay only (wired, run in the recorded worlds): Hyperliquid → Phoenix (`hl_withdraw`, `evm_usdc_to_intents`, then
+the `sol_sign` deposit; not yet dry-run on mainnet), and reserve or Phoenix → Orderly (an Orderly landing needs its
+private API, which serve does not open). Not built: Hyperliquid → Orderly (Arbitrum USDC into Arbitrum USDC, which
+1Click does not quote). Into HyperCore 1Click delivers at least 1.31 USDC (`minAmountOut` under it is refused before
+signing; about 1.65 USDC sent). `npm run rescue-dry -w engine -- --mainnet --contract <id> --desk <id>` prints both
+Phoenix routes for a desk, keyless: the plan, 1Click's dry quote, the message simulated unsigned and every refusal.
+
 **The pair in serve (mainnet).** `serve` adopts the carry pair `pair-mainnet open` made from the venues at start
 (`engine/src/cli/serve-pair.ts`: the Hyperliquid and Phoenix legs and the relayer of `pair-mainnet-lib.ts`) and
 holds it in a `PairTrader` behind `ProtectedPair` (`engine/src/trade/protected-pair.ts`). Every order it sends is
@@ -1000,7 +1031,8 @@ the other holds it; a lock file with no pid in it counts as held). The lock is
 `pair-mainnet` runs for this desk (Task Manager or `ps`), then delete that one file and start again. Otherwise every
 protection only alerts, says so, and holds no lock. A resting order on the pair's coin at start also makes it alert
 only (it could fill under the trader). On SIGINT or SIGTERM serve starts no new trigger, waits up to 180 s in all
-(the risk engine's ADL attempt and a close in flight), then turns trading off before it releases the lock: from then
+(the risk engine's ADL attempt, a close in flight, and a running rescue: it signs nothing new, one already signing or
+sending goes on until its payment is sent and saved as held, then it stops waiting for 1Click), then turns trading off before it releases the lock: from then
 on every close, order and cancel is refused, nothing signed. At start
 serve prints which legs are live, which protections trade, which only alert (ADL too, while it is held or the
 baselines do not offset), and which rescue routes run on mainnet.

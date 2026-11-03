@@ -37,8 +37,9 @@
 // operator key, the per-desk lock, never in a linked worktree, never with --once); otherwise it only alerts.
 // GIMBAL_TRADER_FRESH=<contract>/<desk> starts its state anew from the venues' positions when the state file is
 // missing or unusable (a missing file is not a fresh start without it; a usable file is always used). On SIGINT or
-// SIGTERM serve waits up to SHUTDOWN_WAIT_MS, in all, for the risk engine and a close in flight (panic_close, a
-// rescue's reduce, an ADL unwind) before it releases the lock and exits.
+// SIGTERM serve waits up to SHUTDOWN_WAIT_MS, in all, for the risk engine, a close in flight (panic_close, a
+// rescue's reduce, an ADL unwind) and a running rescue (it signs nothing new, and one already signing goes on until its
+// payment is sent and saved as held) before it releases the locks and exits.
 // The monitor (src/risk/monitor.ts): every 30 min the legs, their distance to liquidation and the net; an alert to the
 // journal and the console when a leg is under 25 % from liquidation. `npm run monitor -w engine -- --mainnet` is the
 // one-shot form.
@@ -247,6 +248,9 @@ let deskSource: DeskSource | null = null;
 let replayDesk: ReplayDesk | null = null;
 // panic_close: every get_desk read tells it whether the desk is closing (rescue/closing.ts).
 let closingWatch: ClosingWatch | null = null;
+// The rescuer's shutdown (serve-rescue.ts stop) and the id of the rescue running, for the shutdown's wait.
+let rescueStop: (() => Promise<void>) | null = null;
+let rescueRunning: (() => string | null) | null = null;
 if (mode === 'replay') {
   deskSource = replayDesk = new ReplayDesk({
     venues: readers.venues, clock, strategy: () => server?.strategy ?? DEFAULT_STRATEGY,
@@ -310,7 +314,10 @@ if (deskSource !== null) {
     }),
   }).catch((err: unknown) => fail(`rescue: ${errorMessage(err)}`));
   closingWatch = rescue.closing;
+  rescueStop = rescue.stop;
+  rescueRunning = rescue.running;
   log(rescue.summary);
+  for (const line of rescue.routes) log(line);
   risk = new RiskEngine({
     mode, source: deskSource, strategy: () => server?.strategy ?? DEFAULT_STRATEGY, health: venueHealth, publish, clock, log,
     ...(rescue.rescuer === undefined ? {} : { rescuer: rescue.rescuer, rescuerRunning: rescue.running }),
@@ -398,6 +405,11 @@ async function shutdown(reason: string): Promise<void> {
   if (pair?.pair?.closing === true || closingWatch?.current != null || risk?.adlRunning != null) {
     log(`stopping: waiting up to ${SHUTDOWN_WAIT_MS / 1000} s for the close in flight before the trader lock is released`);
   }
+  // A running rescue signs nothing new from here; one that is signing or sending goes on until its payment is saved
+  // (the hold keeps it for the next start), then stops waiting for 1Click. Asked before risk.stop(), which waits too.
+  const rescueId = rescueRunning?.() ?? null;
+  const rescueDone = rescueStop?.() ?? Promise.resolve();
+  if (rescueId !== null) log(`stopping: waiting up to ${SHUTDOWN_WAIT_MS / 1000} s for rescue ${rescueId} to save its payment before the rescue lock is released`);
   const drained = await Promise.race([
     (async () => {
       try {
@@ -405,12 +417,14 @@ async function shutdown(reason: string): Promise<void> {
       } catch (err) {
         log(`stopping: the risk engine stopped with an error (${err instanceof Error ? err.message : String(err)})`);
       }
-      await Promise.allSettled([closingWatch?.current ?? Promise.resolve(), pair?.drain(SHUTDOWN_WAIT_MS) ?? Promise.resolve(true)]);
-      return pair?.pair?.closing !== true;
+      await Promise.allSettled([closingWatch?.current ?? Promise.resolve(), pair?.drain(SHUTDOWN_WAIT_MS) ?? Promise.resolve(true), rescueDone]);
+      return pair?.pair?.closing !== true && rescueRunning?.() == null;
     })(),
     deadline,
   ]);
-  if (!drained) log(`stopping: a close is still running after ${SHUTDOWN_WAIT_MS / 1000} s; exiting anyway: its orders are saved as in flight (the next start only alerts on ADL until a close result); check both legs by hand`);
+  const stillRescuing = rescueRunning?.() ?? null;
+  if (!drained && stillRescuing !== null) log(`stopping: rescue ${stillRescuing} is still running after ${SHUTDOWN_WAIT_MS / 1000} s; exiting anyway: a payment it signed was saved as held before signing, and the next start reads it at 1Click and on chain`);
+  if (!drained && (stillRescuing === null || pair?.pair?.closing === true)) log(`stopping: a close is still running after ${SHUTDOWN_WAIT_MS / 1000} s; exiting anyway: its orders are saved as in flight (the next start only alerts on ADL until a close result); check both legs by hand`);
   pair?.stop();
   await server!.stop();
   contract?.prices.stop();

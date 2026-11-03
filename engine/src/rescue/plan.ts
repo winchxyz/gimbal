@@ -42,8 +42,11 @@ export const NO_KEY_FEE_SHARE = 0.002;
 export const SLIPPAGE_BPS = 55;
 /** The least sent into the Orderly receiver: 6 USDC must arrive (below 5 it is lost); room for slippage and fees. */
 export const ORDERLY_MIN_IN_USD = 6.2;
-/** The least sent into HyperCore: 1Click's 0.5 USDC minimum plus its fee. */
-export const HYPERCORE_MIN_IN_USD = 1;
+/**
+ * The least sent into HyperCore: 1Click's 1.31 USDC minimum out (oneclick.ts HYPERCORE_MIN_E8) plus its 0.3153 fee
+ * and the slippage room (measured: 1.64 refused, 1.66 taken at 1 %), with a margin.
+ */
+export const HYPERCORE_MIN_IN_USD = 1.7;
 /** The least an hl_withdraw brings to Arbitrum when it tops up USDC already there (it takes HL_WITHDRAW_FEE_USD more). */
 export const HL_TOP_UP_MIN_USD = 1;
 /** rescueSizes looks for each route's sizes up to this amount, USD. */

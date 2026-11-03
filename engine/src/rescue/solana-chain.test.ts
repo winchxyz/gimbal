@@ -65,3 +65,29 @@ test('the simulated cluster: the height grows with the clock (finalized 32 behin
   await assert.rejects(sol.finalized(), /503/);
   await assert.rejects(sol.signatureStatus('s'), /503/);
 });
+
+test('the history probe: an old signature of the probe address found with searchTransactionHistory, else the reason', async () => {
+  const world = (opts: { known: boolean; pages: number[][] }) => rpc((method, params) => {
+    if (method === 'getEpochInfo') return { body: { result: { absoluteSlot: 400_000_000, blockHeight: 380_000_000 } } };
+    if (method === 'getSignaturesForAddress') {
+      const before = (params[1] as { before?: string }).before;
+      const page = opts.pages[before === undefined ? 0 : Number(before.slice(1)) + 1] ?? [];
+      return { body: { result: page.map((slot, i) => ({ signature: `p${before === undefined ? 0 : Number(before.slice(1)) + 1}-${i}`, slot })).map((x, i, all) => (i === all.length - 1 ? { ...x, signature: `p${before === undefined ? 0 : Number(before.slice(1)) + 1}` } : x)) } };
+    }
+    return { body: { result: { context: { slot: 400_000_001 }, value: [opts.known ? { slot: 1, err: null } : null] } } };
+  });
+  const ok = world({ known: true, pages: [[399_999_990, 399_000_000]] });
+  assert.equal(await ok.reads.historyProblem(), null);
+  assert.deepEqual(ok.asked[1]!.params, ['3c3NTwpg7yW91FxijkHBXwVH1xUifun3Z8TC5eW5Si3K', { limit: 1000, commitment: 'finalized' }]);
+  assert.deepEqual(ok.asked[2], { method: 'getSignatureStatuses', params: [['p0'], { searchTransactionHistory: true }] });
+  // A node with only its recent status cache: the old signature is not found.
+  assert.match((await world({ known: false, pages: [[399_000_000]] }).reads.historyProblem())!, /does not find p0 \(1000000 slots old\): this RPC serves no transaction history/);
+  // The first page is all recent: the next page (before its oldest) is read.
+  const paged = world({ known: true, pages: [[399_999_999], [399_000_000]] });
+  assert.equal(await paged.reads.historyProblem(), null);
+  assert.deepEqual(paged.asked[2]!.params, ['3c3NTwpg7yW91FxijkHBXwVH1xUifun3Z8TC5eW5Si3K', { limit: 1000, commitment: 'finalized', before: 'p0' }]);
+  assert.match((await world({ known: true, pages: [[399_999_999], [399_999_998], [399_999_997]] }).reads.historyProblem())!, /could not be probed/);
+  assert.match((await world({ known: true, pages: [] }).reads.historyProblem())!, /gave no signatures/);
+  const down = rpc(() => ({ status: 503, body: {} }));
+  assert.match((await down.reads.historyProblem())!, /the history probe failed: getEpochInfo: HTTP 503/);
+});

@@ -9,9 +9,10 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import type { DeskSolanaAccounts, PhoenixExchangeAccounts, RescueDeposit } from './phoenix-withdraw.ts';
 import {
-  ATA_PROGRAM, pausedRescueInstructions, pausedRescueMessage, pausedRescueRefusals, rescueInstructions, rescueMessage, withdrawInstructions,
-  withdrawMessage,
+  ATA_PROGRAM, pausedRescueInstructions, pausedRescueMessage, pausedRescueRefusals, rescueInstructions, rescueMessage, spareRescueInstructions,
+  spareRescueMessage, withdrawInstructions, withdrawMessage,
 } from './phoenix-withdraw.ts';
+import { usdcAccountOf } from '../rescue/sol-rescue.ts';
 import type { SolInstruction } from './solana-message.ts';
 import { TOKEN_PROGRAM, asSolInstructions, compileLegacyMessage, tokenTransferChecked } from './solana-message.ts';
 import { COMPUTE_BUDGET_PROGRAM, computeBudgetInstructions, parseMessage } from './solana.ts';
@@ -232,4 +233,27 @@ for (const [what, build, refusal] of REFUSED) {
 test('a TransferChecked of nothing is refused before it is built: the contract refuses empty transfers', () => {
   assert.throws(() => tokenTransferChecked(DESK.usdcAta, EXCHANGE.usdcMint, DESK.phusdAta, DESK.authority, 0n, 6), /not a u64 above 0/);
   assert.throws(() => tokenTransferChecked(DESK.usdcAta, EXCHANGE.usdcMint, DESK.phusdAta, DESK.authority, 1n << 64n, 6), /not a u64 above 0/);
+});
+
+// ---- A rescue paid from spare USDC on the desk's USDC account ----
+
+const SPARE = byName(SOL, 'rescue: USDC to the verified 1Click deposit owner (ATA create + TransferChecked)');
+
+test('a spare-USDC rescue is the vector one byte for byte: the unit limit, the deposit owner account, the TransferChecked', async () => {
+  assert.equal(SPARE.expect.ok, true);
+  const r = SPARE.rescue!;
+  // The deposit owner's USDC account is derived here exactly as the contract's walk expects it.
+  const usdcAta = await usdcAccountOf(r.deposit_owner);
+  assert.equal(usdcAta, SPARE.parsed!.instructions.at(-1)!.accounts[2]);
+  const deposit: RescueDeposit = { owner: r.deposit_owner, usdcAta, amountIn: BigInt(r.amount_in) };
+  const built = spareRescueMessage(EXCHANGE, DESK, deposit, SPARE.parsed!.recent_blockhash, 400_000, 0);
+  assert.equal(hex(built), SPARE.message_hex);
+  // With a priority fee: the same plus SetComputeUnitPrice, within the rescue's urgent caps.
+  const fee = parseMessage(spareRescueMessage(EXCHANGE, DESK, deposit, SPARE.parsed!.recent_blockhash, 100_000, 100_000));
+  assert.deepEqual([fee.computeUnitLimit, fee.computeUnitPrice, fee.instructions.length], [100_000, 100_000n, 4]);
+  assert.deepEqual(spareRescueInstructions(EXCHANGE, DESK, deposit).map((ix) => ix.programAddress.slice(0, 8)), ['ComputeB', 'ATokenGP', 'Tokenkeg']);
+  assert.throws(() => spareRescueInstructions(EXCHANGE, DESK, deposit, 600_000, 1), /at most 400000 units/);
+  assert.throws(() => spareRescueInstructions(EXCHANGE, DESK, deposit, 400_000, 1_000_001), /at most 1000000/);
+  // The spare rescue is something a paused desk signs too: no desk account created, no withdrawal.
+  assert.deepEqual(pausedRescueRefusals(built, EXCHANGE, DESK, deposit), []);
 });

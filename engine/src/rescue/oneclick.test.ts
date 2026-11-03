@@ -51,3 +51,20 @@ test('a changed quote, another method, a stranger\'s refund, the cap, the cost b
   const f = rec.routes.find((x) => x.from === 'reserve' && x.to === 'hyperliquid')!;
   assert.doesNotThrow(() => verifyQuote(f.response, 'fund_venue', ctx(f.response, { remainingCapE8: 0n })));
 });
+
+test('into HyperCore minAmountOut must be at least 1.31 USDC, 1Click\'s minimum (dry quotes 2026-11-03)', async () => {
+  const { testQuote, testSigner } = await import('./test-quotes.ts');
+  const { ASSETS, HYPERCORE_MIN_E8 } = await import('./oneclick.ts');
+  assert.equal(HYPERCORE_MIN_E8, 131_000_000n);
+  const signer = testSigner();
+  const now = Date.parse('2026-11-03T12:00:00Z');
+  const body = (amount: string) => ({
+    dry: false, swapType: 'EXACT_INPUT' as const, slippageTolerance: 55, originAsset: ASSETS.solanaUsdc, depositType: 'ORIGIN_CHAIN' as const,
+    destinationAsset: ASSETS.hypercoreUsdc, amount, refundTo: rec.desk.sol, refundType: 'ORIGIN_CHAIN' as const, recipient: rec.desk.evm,
+    recipientType: 'DESTINATION_CHAIN' as const, deadline: new Date(now + 30 * 60_000).toISOString(),
+  });
+  const check = (r: QuoteResponse) => verifyQuote(r, 'sol_sign_rescue', ctx(r, { publicKey: signer.publicKey }));
+  // 1.50 sent at a 20 % cost: about 1.19 arrives at least, under 1.31.
+  assert.throws(() => check(testQuote(signer, body('1500000'), now, 0.2)), /minAmountOut 1\.19\d* is below the 1\.31 USDC 1Click delivers into HyperCore/);
+  assert.equal(check(testQuote(signer, body('1700000'), now, 0.2)).minAmountOutE8 >= HYPERCORE_MIN_E8, true);
+});
