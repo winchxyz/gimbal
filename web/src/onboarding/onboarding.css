@@ -170,6 +170,11 @@ textarea.ob-input:focus { border-color: var(--ink-2); }
   .ob-hdr.has-acct .lbl { display: none; }   /* the dot keeps the network; the account is what the phone has room for */
   .ob-hdr.has-acct .dot.net::before { margin-right: 0; }
   .ob-hdr .acct { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .ob-hdr .right .btn.quiet { height: 44px; }
+  .ob-input { min-height: 44px; }
+  .ob-num .ob-input { padding: 10px 0; }
+  .ob-chips .btn, .ob-add .btn, .ob-unpriced .btn { height: 44px; min-width: 44px; }
+  .ob-unpriced { align-items: center; }
 
   .ob-welcome { min-height: calc(100dvh - 56px); }
   .hero-copy { left: var(--gutter); right: var(--gutter); width: auto; max-width: none; top: max(364px, 44vh); }

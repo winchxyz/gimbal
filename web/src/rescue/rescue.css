@@ -102,6 +102,8 @@
   .r-steps p { grid-column: 2 / -1; margin-top: 3px; min-height: 0; }
   .r-steps .tx { grid-column: 2 / -1; flex-direction: row; flex-wrap: wrap; gap: 0 var(--s-3); }
   .r-steps .tx .hash { display: none; }
+  .r-steps .tx a { padding: 13px 0; margin: -13px 0; }   /* 44 px tap target, same layout */
+  .r-page p a, .r-empty p a { padding: 14px 0; }   /* a link inside a sentence: a taller hit area, no change to the line */
   .r-steps .now b { color: var(--watch); }
 
   .r-bottom { display: block; border-top: 1px solid var(--line); margin-top: var(--s-5); }

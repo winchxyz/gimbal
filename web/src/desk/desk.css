@@ -168,7 +168,8 @@
   .d-bottom { display: block; margin-top: var(--s-5); border-top: 0; }
   .d-bottom > section { padding: var(--s-5) var(--gutter) 0; border-top: 1px solid var(--line); }
   .d-bottom > section + section { border-left: 0; margin-top: var(--s-5); }
-  .d-bottom h3 { margin-bottom: 0; }
+  .d-bottom h3 { margin-bottom: 0; align-items: center; }
+  .d-bottom h3 a { padding: 13px 0; margin: -13px 0; }   /* 44 px tap target, same layout */
 
   .ev { grid-template-columns: 1fr auto; grid-template-areas: 't right' 'what what'; row-gap: 6px; column-gap: var(--s-3); padding: var(--s-3) 0; border-bottom: 1px solid var(--line); }
   .ev:last-child { border-bottom: 0; }
