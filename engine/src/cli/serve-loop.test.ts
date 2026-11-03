@@ -270,13 +270,18 @@ test('the real decide(): three hourly checks above the bar, then the exact qty i
 test('loopHands: the held symbol\'s legs only, one leg named, busy() refusing first, sent as the hands report it', async () => {
   let legs: { venue: string; qty: bigint | null }[] = [{ venue: 'hyperliquid', qty: toQty('-0.12') }, { venue: 'phoenix', qty: toQty('0.12') }];
   let busy: string | null = null;
+  let gateSeen: (() => string | null) | undefined;
   const pair: PairHands = {
     symbols: ['SOL'],
     blocked: () => null,
     heldSymbol: () => 'SOL',
     heldLegs: () => legs,
-    open: async () => ({ ok: false, reason: 'stopped with orders out: socket closed', results: [], lines: [], open: [], tx: [], feeUsd: 0, sent: true }),
+    open: async (r) => {
+      gateSeen = r.gate;
+      return { ok: false, reason: 'stopped with orders out: socket closed', results: [], lines: [], open: [], tx: [], feeUsd: 0, sent: true };
+    },
     close: async () => ({ ok: false, reason: 'refused', results: [], lines: [], open: [], tx: [], feeUsd: 0 }),
+    reconcile: async () => 'SOL record reconciled with the venues',
   };
   const leg = (venue: Leg['venue'], symbol: string, side: Leg['side'], size: number, entry: number, mark: number): Leg => ({
     venue, symbol, side, size, lotSize: 0.01, entry, mark, liqPx: null, marginUsd: 6, marginRatio: 0.1, distanceToLiqPct: 50,
@@ -303,5 +308,7 @@ test('loopHands: the held symbol\'s legs only, one leg named, busy() refusing fi
   assert.equal(h.blocked(), 'rescue r-1 runs');
   const opened = await h.open({ window: deskWin('sol-phoenix-hyperliquid'), symbol: 'SOL', legUsd: 12, leverage: 1, qty: '0.12', reason: 'test' });
   assert.equal(opened.sent, true, 'a throw after orders went out is reported as sent');
+  assert.equal(gateSeen?.(), 'rescue r-1 runs', 'the open carries the gate, asked again before its orders');
+  assert.equal(await h.reconcile!(), 'SOL record reconciled with the venues');
   assert.equal((await h.close({ reason: 'test' })).sent, false);
 });

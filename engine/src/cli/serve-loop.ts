@@ -50,6 +50,12 @@ export interface ServeLoopInput {
   /** A live rescuer runs (mainnet with GIMBAL_RESCUE=1): the venues LIVE_RESCUE names have a route. */
   rescueLive: boolean;
   busy: () => string | null;
+  /**
+   * Why no order may go out now, for an open already past the loop's gate (a rescue, fund_venue included; an ADL
+   * unwind; panic_close): asked again right before its first order and before each later part. Unlike `busy` it does
+   * not count the pair's own operation (the open itself). None: `busy`.
+   */
+  orderGate?: () => string | null;
   windows: () => readonly FundingWindow[] | null;
   strategy: () => StrategyConfig;
   policy: () => ContractPolicy | null;
@@ -71,7 +77,7 @@ export interface ServeLoopInput {
 export function serveLoop(input: ServeLoopInput): StrategyLoop {
   const trade = input.env('GIMBAL_TRADE') === '1' && !input.once;
   const pairHands = input.pair?.hands;
-  const hands = input.hands !== undefined ? input.hands : pairHands === undefined ? null : loopHands(pairHands, input.lastDesk, input.log, input.busy);
+  const hands = input.hands !== undefined ? input.hands : pairHands === undefined ? null : loopHands(pairHands, input.lastDesk, input.log, input.busy, input.orderGate ?? input.busy);
   const handsWhy = hands !== null ? undefined
     : input.pair === null ? (input.mode === 'mainnet' ? 'no contract desk is set (GIMBAL_CONTRACT_ID, DESK_ID)' : `serve holds a pair on mainnet only, this is ${input.mode}`)
     : input.pair.notTrading() ?? 'the pair is alert only';
@@ -141,9 +147,11 @@ export function policySymbols(policy: ContractPolicy | null): string[] {
 /**
  * serve-pair's hands as the loop takes them: windows mapped to policy symbols, the desk's numbers for the held pair
  * (its symbol's legs only), a single leg named, and `busy` (a rescue running, fund_venue included; an ADL unwind;
- * panic_close) refusing before the hands' own reasons.
+ * panic_close) refusing before the hands' own reasons. `gate` goes with every open, asked again before its orders.
  */
-export function loopHands(hands: PairHands, lastDesk: () => DeskState | null, log: (line: string) => void, busy: () => string | null = () => null): LoopHands {
+export function loopHands(
+  hands: PairHands, lastDesk: () => DeskState | null, log: (line: string) => void, busy: () => string | null = () => null, gate: () => string | null = busy,
+): LoopHands {
   const outcome = (r: HandsResult): ActOutcome => {
     for (const line of r.lines) log(`strategy loop: ${line}`);
     return { ok: r.ok, reason: r.reason, sent: r.sent ?? (r.results.length > 0 || r.tx.length > 0), tx: r.tx, feeUsd: r.feeUsd, open: r.open, fills: fillsOf(r.results) };
@@ -171,7 +179,8 @@ export function loopHands(hands: PairHands, lastDesk: () => DeskState | null, lo
       return { symbol, legUsd, pnlUsd, oneLeg, ...(legs.length === 0 ? {} : { freedMarginUsd: freed }) };
     },
     symbolOf: (w) => windowSymbol(w, hands.symbols),
-    open: async (r) => outcome(await hands.open({ symbol: r.symbol, legUsd: r.legUsd, leverage: r.leverage, reason: r.reason, qty: r.qty })),
+    open: async (r) => outcome(await hands.open({ symbol: r.symbol, legUsd: r.legUsd, leverage: r.leverage, reason: r.reason, qty: r.qty, gate })),
+    reconcile: () => hands.reconcile(),
     close: async (r) => outcome(await hands.close({ reason: r.reason })),
   };
 }

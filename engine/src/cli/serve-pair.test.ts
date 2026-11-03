@@ -29,6 +29,10 @@ class Leg implements TradeLeg {
   readonly replayable = false;
   pos = 0n;
   orders: { side: LegSide; size: bigint; reduceOnly: boolean }[] = [];
+  /** Awaited before an order fills (a test holds an open there). */
+  hold: (() => Promise<void>) | null = null;
+  /** Every position read (a test counts them). */
+  reads = 0;
   constructor(venue: VenueId, symbol: string) {
     this.venue = venue;
     this.symbol = symbol;
@@ -38,9 +42,11 @@ class Leg implements TradeLeg {
     return toQty('1000');
   }
   async position(): Promise<bigint> {
+    this.reads++;
     return this.pos;
   }
   async order(side: LegSide, size: bigint, reduceOnly: boolean): Promise<LegOutcome> {
+    if (this.hold !== null) await this.hold();
     this.orders.push({ side, size, reduceOnly });
     this.pos += side === 'BUY' ? size : -size;
     return { kind: 'filled', filled: size, avgPx: 1, ref: { venue: this.venue, side, size: String(size), reduceOnly, orderId: `o${this.orders.length}`, clientId: null, tx: [], sentAt: 1 } };
@@ -65,13 +71,15 @@ interface World {
   lines: string[];
   /** What the stand-in carry refuses an open with. */
   refuse: string[];
+  /** The stand-in carry signs one order outside the trader, then throws (an open that dies before its result). */
+  throwAfterOrder: boolean;
 }
 
 function world(symbol = 'XLM', env: Record<string, string> = {}): World {
   const dir = mkdtempSync(join(tmpdir(), 'gimbal-serve-pair-'));
   return {
     dir, env: { LOCALAPPDATA: dir, XDG_STATE_HOME: dir, ...env },
-    hl: new Leg('hyperliquid', symbol), px: new Leg('phoenix', symbol), openOrders: [], signed: 0, cancels: [], lines: [], refuse: [],
+    hl: new Leg('hyperliquid', symbol), px: new Leg('phoenix', symbol), openOrders: [], signed: 0, cancels: [], lines: [], refuse: [], throwAfterOrder: false,
   };
 }
 
@@ -115,6 +123,10 @@ function testCarry(c: CarryInput, w: World): SlotCarry {
   return {
     open: async (request, out) => {
       if (w.refuse.length > 0) return { refusals: [...w.refuse], results: [] };
+      if (w.throwAfterOrder) {
+        await c.pair.hedge(0, 'SELL', toQty('1'), false, 'test: an order signed inside the open', true);
+        throw new Error('the open died before its result was recorded');
+      }
       out.say(`plan      ${c.symbol} ${request.legUsd} a leg at ${request.leverage}x`);
       return { refusals: [], results: await c.pair.openInChunks({ size: toQty(String(request.legUsd)), longIndex: 1, reason: request.reason }) };
     },
@@ -486,6 +498,127 @@ test('the hands (strategy loop): a flat desk opens through the pair, is held and
     assert.equal(w.px.pos, 0n);
     assert.ok(w.hl.orders.slice(before).every((o) => o.reduceOnly));
     assert.equal(hands.heldSymbol(), null);
+    p.stop();
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+/** A trader whose last live reads say `known` while its record (baselines) says what the open left. */
+function liveReads(p: Awaited<ReturnType<typeof servePair>>, known: [bigint, bigint]): void {
+  const t = p.pair!.trader;
+  const s = t.exportState();
+  t.importState({ ...s, known });
+}
+
+test('F1: a pair recorded while the venues hold one leg (an IOC lapsed, its unwind failed): two agreeing reads adopt it, and the leg is named to close', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
+  try {
+    const p = await servePair(input(w));
+    const hands = p.hands!;
+    const opened = await hands.open({ symbol: 'XLM', legUsd: 10, leverage: 1.5, reason: 'strategy: enter' });
+    assert.equal(opened.ok, true, opened.reason);
+    // Nothing differs: no read, nothing changes.
+    const reads = w.hl.reads + w.px.reads;
+    assert.equal(await hands.reconcile(), null);
+    assert.equal(w.hl.reads + w.px.reads, reads, 'record and live reads agree: no venue read');
+    // Phoenix's IOC never ran (its lapse read 0) and the Hyperliquid unwind failed: the record still says a pair.
+    w.px.pos = 0n;
+    liveReads(p, [-toQty('10'), 0n]);
+    assert.deepEqual(hands.heldLegs().map((l) => l.qty), [-toQty('10'), toQty('10')], 'the record before');
+    const line = await hands.reconcile();
+    assert.match(line ?? '', /XLM record reconciled with the venues: it said pair \(-10 and 10\), two reads agree on one leg \(-10 and 0\) and are adopted; the single leg is closed reduce-only next/);
+    assert.deepEqual(hands.heldLegs().map((l) => l.qty), [-toQty('10'), 0n]);
+    assert.equal(hands.heldSymbol(), 'XLM');
+    // The loop's close of the one leg: reduce-only, flat.
+    const before = w.hl.orders.length;
+    const closed = await hands.close({ reason: 'strategy: one leg open: hyperliquid -10, closed reduce-only' });
+    assert.equal(closed.ok, true, closed.reason);
+    assert.equal(w.hl.pos, 0n);
+    assert.ok(w.hl.orders.slice(before).every((o) => o.reduceOnly));
+    assert.equal(w.px.orders.length, 1, 'nothing sent on the flat Phoenix leg');
+    p.stop();
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+test('F1: a pair recorded while both venues are flat is cleared after two agreeing reads; reads that do not confirm change nothing', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
+  try {
+    const p = await servePair(input(w));
+    const hands = p.hands!;
+    assert.equal((await hands.open({ symbol: 'XLM', legUsd: 10, leverage: 1.5, reason: 'strategy: enter' })).ok, true);
+    // The live reads say flat but the venues still hold the pair: not confirmed, nothing adopted.
+    liveReads(p, [0n, 0n]);
+    assert.equal(await hands.reconcile(), null);
+    assert.equal(hands.heldSymbol(), 'XLM');
+    // Both legs closed outside the trader: every exit would be refused "nothing to close" and every open "a pair is held".
+    w.hl.pos = 0n;
+    w.px.pos = 0n;
+    liveReads(p, [0n, 0n]);
+    assert.match(await hands.reconcile() ?? '', /record reconciled with the venues: it said pair \(-10 and 10\), two reads agree on flat \(0 and 0\) and are adopted$/);
+    assert.equal(hands.heldSymbol(), null);
+    const again = await hands.open({ symbol: 'XLM', legUsd: 10, leverage: 1.5, reason: 'strategy: enter' });
+    assert.equal(again.ok, true, again.reason);
+    p.stop();
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+test('S4: an open that dies after an order was signed but before any result is recorded is reported sent, not "not done"', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
+  try {
+    const p = await servePair(input(w));
+    const hands = p.hands!;
+    // The XLM pair exists already (opened and closed): the slot, the epoch and the held symbol do not move below.
+    assert.equal((await hands.open({ symbol: 'XLM', legUsd: 10, leverage: 1.5, reason: 'strategy: enter' })).ok, true);
+    assert.equal((await hands.close({ reason: 'strategy: exit' })).ok, true);
+    const before = w.hl.orders.length;
+    w.throwAfterOrder = true;
+    const r = await hands.open({ symbol: 'XLM', legUsd: 10, leverage: 1.5, reason: 'strategy: enter' });
+    assert.equal(w.hl.orders.length - before, 1, 'one order went out');
+    assert.equal(r.ok, false);
+    assert.equal(r.sent, true);
+    assert.match(r.reason, /^stopped with orders out: the open died before its result was recorded/);
+    p.stop();
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+test('the open\'s scope: during the loop\'s open, an order that could grow a position from anything but that open is refused', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
+  try {
+    const p = await servePair(input(w));
+    const hands = p.hands!;
+    // Hold the open at its Phoenix order, after the Hyperliquid leg went out.
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    let reached: () => void = () => {};
+    const atPhoenix = new Promise<void>((r) => {
+      reached = r;
+    });
+    w.px.hold = async () => {
+      reached();
+      await held;
+    };
+    const opening = hands.open({ symbol: 'XLM', legUsd: 10, leverage: 1.5, reason: 'strategy: enter' });
+    await atPhoenix;
+    assert.equal(p.pair!.opening, true, 'the open runs');
+    // A watch check, a protection or anything else meanwhile: not part of the open, refused before signing.
+    const outside = await p.pair!.legs[0]!.order('SELL', toQty('1'), false, 'test: outside the open');
+    assert.equal(outside.kind, 'failed');
+    assert.match(String((outside as { error: Error }).error.message), /reduce-only orders only, outside the strategy loop's open/);
+    // Reduce-only still goes out.
+    w.px.hold = null;
+    release();
+    const r = await opening;
+    assert.equal(r.ok, true, r.reason);
+    assert.equal(w.hl.orders.filter((o) => !o.reduceOnly).length, 1, 'only the open\'s own order grew Hyperliquid');
     p.stop();
   } finally {
     rmSync(w.dir, { recursive: true, force: true });

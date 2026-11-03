@@ -374,6 +374,15 @@ if (values.once === true) {
   process.exit(0);
 }
 
+/** A protection runs (a rescue, its fund_venue step included; an ADL unwind; panic_close): no order of the loop goes out. */
+function protectionRunning(): string | null {
+  const rescuing = rescueRunning?.() ?? null;
+  if (rescuing !== null) return `rescue ${rescuing} runs`;
+  if (risk?.adlRunning != null) return 'an ADL unwind runs';
+  if (closingWatch?.current != null) return 'panic_close runs';
+  return null;
+}
+
 // The position book: next to the loop state. An unreadable book file is never started over: serve runs without the
 // book (the loop trades as before) and says so, until the owner fixes or moves the file.
 let book: PositionBook | null = null;
@@ -398,14 +407,8 @@ loop = serveLoop({
   strategy: () => server?.strategy ?? saved.strategy ?? DEFAULT_STRATEGY, policy: () => policy, publish: booked?.publish ?? publish, clock, log,
   ...(booked === null ? {} : { book: booked.sink }),
   ...(stateDirSet === undefined ? {} : { stateDir: resolve(stateDirSet) }),
-  busy: () => {
-    const rescuing = rescueRunning?.() ?? null;
-    if (rescuing !== null) return `rescue ${rescuing} runs`;
-    if (risk?.adlRunning != null) return 'an ADL unwind runs';
-    if (closingWatch?.current != null) return 'panic_close runs';
-    if (pair?.pair?.closing === true) return 'a close of the pair runs';
-    return null;
-  },
+  busy: () => protectionRunning() ?? (pair?.pair?.closing === true ? 'a close of the pair runs' : null),
+  orderGate: protectionRunning,
 });
 log(loop.startLine());
 booked?.adopt(loop.held);
