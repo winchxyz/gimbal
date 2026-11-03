@@ -84,10 +84,15 @@ export const OWNER_ONLY: readonly OwnerMethod[] = [
   { method: 'set_orderly_receiver', what: 'pin the Orderly deposit address' },
   { method: 'set_orderly_ips', what: 'set where the Orderly key may be used from' },
   { method: 'create_desk', what: 'create a desk' },
+  { method: 'set_phoenix_accounts', what: 'replace the Phoenix and Ember accounts the desk uses' },
+  { method: 'accept_oneclick_key', what: 'accept the treasury’s second 1Click key for the desk (it signs quotes a day later)' },
 ];
 
 /** The one call of the operator's own method that it cannot make: resuming. Pausing needs no deposit, resuming needs 1 yoctoNEAR. */
 export const RESUME: OwnerMethod = { method: 'set_paused', what: 'resume a paused desk (it may only pause one)' };
 
-/** Rows of §1.3 that no desk owner calls: a deposit hook, the contract owner's mock price, the oracle's callback. */
-export const OTHER_CALLERS: readonly string[] = ['ft_on_transfer', 'set_mock_price', 'oracle_on_call'];
+/**
+ * Rows of §1.3 that no desk owner calls: a deposit hook, the contract owner's mock price, the oracle's callback, the
+ * treasury's 1Click key proposal.
+ */
+export const OTHER_CALLERS: readonly string[] = ['ft_on_transfer', 'set_mock_price', 'oracle_on_call', 'propose_oneclick_key'];

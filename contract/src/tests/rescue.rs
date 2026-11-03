@@ -348,7 +348,12 @@ fn get_desk_counters_shows_the_eip3009_counter_and_the_meters() {
     assert_eq!(json["eip3009_next"], 1);
     assert_eq!(json["rescue_spent_e8"], "1000000000");
     // Every field of the stored record and the derived meters, by name (docs/interfaces.md §1.3).
-    let mut keys: Vec<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
+    let mut keys: Vec<&str> = json
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
     keys.sort_unstable();
     assert_eq!(
         keys,

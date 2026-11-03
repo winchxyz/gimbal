@@ -362,10 +362,11 @@ test('the methods a locked contract must export: every method and view of interf
   const rowCount = section.split('\n').filter((l) => l.startsWith('| `')).length;
   const privateCount = realSources.join('\n').split('\n').filter((l) => l.trim().startsWith('#[private]')).length;
   assert.equal(privateCount, 8, 'eight #[private] attributes in contract/src today');
-  assert.equal(LOCK_METHODS.length, rowCount + 5 + privateCount, 'every row, the five views and every callback, each once');
+  assert.equal(LOCK_METHODS.length, rowCount + 8 + privateCount, 'every row, the eight views and every callback, each once');
   for (const m of ['ft_on_transfer', 'fund_venue', 'withdraw_to_owner', 'clear_payout_lock', 'panic_close', 'hl_withdraw', 'hl_send_to_intents', 'evm_usdc_to_intents',
     'sol_sign_rescue', 'orderly_withdraw', 'orderly_settle_pnl', 'sol_sign', 'set_paused', 'hl_usd_class_transfer', 'create_desk', 'refresh_prices',
-    'config', 'get_desk', 'desks_of', 'prices', 'version',
+    'config', 'get_desk', 'desks_of', 'prices', 'version', 'get_desk_counters', 'get_desk_settings', 'oneclick_key_proposal',
+    'set_phoenix_accounts', 'propose_oneclick_key', 'accept_oneclick_key',
     'new', 'on_desk_keys', 'on_fund_venue', 'on_payout_fee', 'on_payout_owner', 'on_prices', 'on_signed', 'refuse']) {
     assert.ok(LOCK_METHODS.includes(m), m);
   }
