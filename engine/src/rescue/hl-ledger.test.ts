@@ -55,3 +55,12 @@ test('when 1Click names the delivery transaction, that entry is matched before a
   // A named hash that does not fit the rules is not taken: the rule still decides.
   assert.equal(hlDelivery(two, { desk: DESK, sinceMs: SINCE, minOutE8, seen: new Set(), deliveryTx: ['0xsmall'] })?.hash, '0xit');
 });
+
+test('without a named hash, only an entry booked after the hold opened counts; a named one may be up to the slack earlier (clock skew)', () => {
+  const minOutE8 = 1_948_095_100n;
+  const early = [row('0xearly', SINCE - 1_000, { type: 'send', usdc: '19.70', destination: DESK, user: '0xsolver' })];
+  assert.equal(hlDelivery(early, { desk: DESK, sinceMs: SINCE, minOutE8, seen: new Set() }), null, 'before the hold opened: not the delivery');
+  assert.equal(hlDelivery(early, { desk: DESK, sinceMs: SINCE, minOutE8, seen: new Set(), deliveryTx: ['0xearly'] })?.hash, '0xearly', '1Click named it');
+  const both = [...early, row('0xlater', SINCE + 10, { type: 'send', usdc: '19.70', destination: DESK, user: '0xsolver' })];
+  assert.equal(hlDelivery(both, { desk: DESK, sinceMs: SINCE, minOutE8, seen: new Set() })?.hash, '0xlater');
+});

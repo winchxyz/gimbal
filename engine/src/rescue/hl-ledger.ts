@@ -28,20 +28,29 @@ function e8(s: unknown): bigint | null {
 }
 
 /**
- * The entry that is the 1Click delivery, or null: incoming, booked since `sinceMs` (less the slack), to the desk (a
- * `deposit` has no destination: the bridge credits the address itself), not sent by the desk, of at least
- * `minOutE8`, and not already matched to another transfer (`seen`, by hash). When 1Click names the delivery's
- * transactions (`deliveryTx`), the entry with one of those hashes is taken first.
+ * The entry that is the 1Click delivery, or null: incoming, to the desk (a `deposit` has no destination: the bridge
+ * credits the address itself), not sent by the desk, of at least `minOutE8`, and not already matched to another
+ * transfer (`seen`, by hash). `sinceMs` is when the rescue's hold opened (just before the payment was signed).
+ *
+ * When 1Click names the delivery's transactions (`deliveryTx`), the entry with one of those hashes is taken, booked
+ * since `sinceMs` less the slack (clock skew). Without a named match, only an entry booked at or after `sinceMs`
+ * counts: the delivery cannot come before its payment was signed.
+ *
+ * Residual without a named hash: the state keeps no record of the owner's fund.mjs top-ups, so one booked after the
+ * hold opened, of at least `minOutE8`, would be taken for the delivery. fund.mjs takes the rescuer's lock, so the two
+ * do not run together; only a late fund.mjs delivery could match. 1Click names destinationChainTxHashes on SUCCESS,
+ * so this fallback is the rare path.
  */
 export function hlDelivery(rows: readonly HlLedgerRow[], o: { desk: string; sinceMs: number; minOutE8: bigint; seen: ReadonlySet<string>; deliveryTx?: readonly string[] }): { hash: string; usdE8: bigint } | null {
   const named = new Set((o.deliveryTx ?? []).map((h) => h.toLowerCase()));
   const matches = deliveries(rows, o);
-  return matches.find((m) => named.has(m.hash.toLowerCase())) ?? matches[0] ?? null;
+  const hit = matches.find((m) => named.has(m.hash.toLowerCase())) ?? matches.find((m) => m.time >= o.sinceMs);
+  return hit === undefined ? null : { hash: hit.hash, usdE8: hit.usdE8 };
 }
 
-function deliveries(rows: readonly HlLedgerRow[], o: { desk: string; sinceMs: number; minOutE8: bigint; seen: ReadonlySet<string> }): { hash: string; usdE8: bigint }[] {
+function deliveries(rows: readonly HlLedgerRow[], o: { desk: string; sinceMs: number; minOutE8: bigint; seen: ReadonlySet<string> }): { hash: string; usdE8: bigint; time: number }[] {
   const me = o.desk.toLowerCase();
-  const out: { hash: string; usdE8: bigint }[] = [];
+  const out: { hash: string; usdE8: bigint; time: number }[] = [];
   for (const r of rows) {
     const d = r.delta;
     const usdc = d.usdc !== undefined ? d.usdc : d.token === 'USDC' ? d.amount : undefined;
@@ -50,7 +59,7 @@ function deliveries(rows: readonly HlLedgerRow[], o: { desk: string; sinceMs: nu
     const from = typeof d.user === 'string' ? d.user.toLowerCase() : null;
     if (r.time < o.sinceMs - LEDGER_SLACK_MS || !HL_INCOMING.includes(d.type) || amount === null || amount < o.minOutE8) continue;
     if (from === me || (to === null ? d.type !== 'deposit' : to !== me) || o.seen.has(r.hash)) continue;
-    out.push({ hash: r.hash, usdE8: amount });
+    out.push({ hash: r.hash, usdE8: amount, time: r.time });
   }
   return out;
 }

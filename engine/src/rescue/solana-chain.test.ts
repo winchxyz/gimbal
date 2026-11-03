@@ -26,12 +26,26 @@ test('the live reader: the finalized height with its slot, and a signature searc
     return { body: { jsonrpc: '2.0', id: 2, result: { context: { slot: 380_000_510 }, value: [sig === 'landed' ? { slot: 9, confirmationStatus: 'finalized', err: null } : null] } } };
   });
   assert.deepEqual(await reads.finalized(), { height: 350_000_123, slot: 380_000_500 });
-  assert.deepEqual(await reads.signatureStatus('landed'), { known: true, slot: 380_000_510 });
-  assert.deepEqual(await reads.signatureStatus('never'), { known: false, slot: 380_000_510 });
+  assert.deepEqual(await reads.signatureStatus('landed'), { known: true, slot: 380_000_510, failed: false });
+  assert.deepEqual(await reads.signatureStatus('never'), { known: false, slot: 380_000_510, failed: false });
   assert.deepEqual(asked[0], { method: 'getEpochInfo', params: [{ commitment: 'finalized' }] });
   assert.deepEqual(asked[2], { method: 'getSignatureStatuses', params: [['never'], { searchTransactionHistory: true }] });
   const { reads: noSlot } = rpc(() => ({ body: { result: { value: [null] } } }));
-  assert.deepEqual(await noSlot.signatureStatus('x'), { known: false, slot: null }, 'no context: no slot (no proof)');
+  assert.deepEqual(await noSlot.signatureStatus('x'), { known: false, slot: null, failed: false }, 'no context: no slot (no proof)');
+});
+
+test('the live reader: a signature finalized with an error is failed (it can never run again); a failure not yet finalized is not', async () => {
+  const { reads } = rpc((_method, params) => {
+    const sig = (params[0] as string[])[0];
+    const v = sig === 'final-err' ? { slot: 9, confirmationStatus: 'finalized', err: { InstructionError: [2, { Custom: 1 }] } }
+      : sig === 'confirmed-err' ? { slot: 9, confirmationStatus: 'confirmed', err: { InstructionError: [2, { Custom: 1 }] } }
+      : sig === 'no-err-key' ? { slot: 9, confirmationStatus: 'finalized' }
+      : null;
+    return { body: { result: { context: { slot: 500 }, value: [v] } } };
+  });
+  assert.deepEqual(await reads.signatureStatus('final-err'), { known: true, slot: 500, failed: true });
+  assert.deepEqual(await reads.signatureStatus('confirmed-err'), { known: true, slot: 500, failed: false });
+  await assert.rejects(reads.signatureStatus('no-err-key'), /a status without err/);
 });
 
 test('the live reader: an HTTP error, an RPC error or an answer of another shape is an error, never a height or "unknown"; the URL is redacted', async () => {
@@ -56,7 +70,7 @@ test('the simulated cluster: the height grows with the clock (finalized 32 behin
   assert.deepEqual(await sol.finalized(), { height: 968, slot: 968 });
   now += 4_000;
   assert.equal((await sol.finalized()).height, 978);
-  assert.deepEqual(await sol.signatureStatus('s'), { known: false, slot: 978 });
+  assert.deepEqual(await sol.signatureStatus('s'), { known: false, slot: 978, failed: false });
   sol.land('s');
   assert.equal((await sol.signatureStatus('s')).known, true);
   sol.statusLag = -3;
@@ -64,4 +78,30 @@ test('the simulated cluster: the height grows with the clock (finalized 32 behin
   sol.down = 'solana rpc: 503';
   await assert.rejects(sol.finalized(), /503/);
   await assert.rejects(sol.signatureStatus('s'), /503/);
+});
+
+test('the history probe: an old signature of the probe address found with searchTransactionHistory, else the reason', async () => {
+  const world = (opts: { known: boolean; pages: number[][] }) => rpc((method, params) => {
+    if (method === 'getEpochInfo') return { body: { result: { absoluteSlot: 400_000_000, blockHeight: 380_000_000 } } };
+    if (method === 'getSignaturesForAddress') {
+      const before = (params[1] as { before?: string }).before;
+      const page = opts.pages[before === undefined ? 0 : Number(before.slice(1)) + 1] ?? [];
+      return { body: { result: page.map((slot, i) => ({ signature: `p${before === undefined ? 0 : Number(before.slice(1)) + 1}-${i}`, slot })).map((x, i, all) => (i === all.length - 1 ? { ...x, signature: `p${before === undefined ? 0 : Number(before.slice(1)) + 1}` } : x)) } };
+    }
+    return { body: { result: { context: { slot: 400_000_001 }, value: [opts.known ? { slot: 1, err: null } : null] } } };
+  });
+  const ok = world({ known: true, pages: [[399_999_990, 399_000_000]] });
+  assert.equal(await ok.reads.historyProblem(), null);
+  assert.deepEqual(ok.asked[1]!.params, ['3c3NTwpg7yW91FxijkHBXwVH1xUifun3Z8TC5eW5Si3K', { limit: 1000, commitment: 'finalized' }]);
+  assert.deepEqual(ok.asked[2], { method: 'getSignatureStatuses', params: [['p0'], { searchTransactionHistory: true }] });
+  // A node with only its recent status cache: the old signature is not found.
+  assert.match((await world({ known: false, pages: [[399_000_000]] }).reads.historyProblem())!, /does not find p0 \(1000000 slots old\): this RPC serves no transaction history/);
+  // The first page is all recent: the next page (before its oldest) is read.
+  const paged = world({ known: true, pages: [[399_999_999], [399_000_000]] });
+  assert.equal(await paged.reads.historyProblem(), null);
+  assert.deepEqual(paged.asked[2]!.params, ['3c3NTwpg7yW91FxijkHBXwVH1xUifun3Z8TC5eW5Si3K', { limit: 1000, commitment: 'finalized', before: 'p0' }]);
+  assert.match((await world({ known: true, pages: [[399_999_999], [399_999_998], [399_999_997]] }).reads.historyProblem())!, /could not be probed/);
+  assert.match((await world({ known: true, pages: [] }).reads.historyProblem())!, /gave no signatures/);
+  const down = rpc(() => ({ status: 503, body: {} }));
+  assert.match((await down.reads.historyProblem())!, /the history probe failed: getEpochInfo: HTTP 503/);
 });

@@ -29,8 +29,12 @@ export const DECIMALS: Record<string, number> = {
 
 /** The least minAmountOut into the Orderly receiver, USDC × 1e6 (Orderly loses a deposit under 5). */
 export const ORDERLY_MIN_OUT_E6 = 6_000_000n;
-/** The least a transfer into HyperCore may deliver: 0.5 USDC in HyperCore's 8 decimals (1Click's minimum there). */
-export const HYPERCORE_MIN_E8 = 50_000_000n;
+/**
+ * The least a transfer into HyperCore may deliver: 1.31 USDC in HyperCore's 8 decimals. 1Click refuses a quote whose
+ * minAmountOut is under it ("minimum is 131000000", dry quotes from Solana USDC, 2026-11-03); with its flat 0.3153
+ * withdraw fee and the slippage room that is about 1.65 USDC sent.
+ */
+export const HYPERCORE_MIN_E8 = 131_000_000n;
 /** fund_venue: amountOut − minAmountOut ≥ this share of amountOut, bps. */
 export const FUND_VENUE_MIN_ROOM_BPS = 50n;
 export const QUOTE_MAX_AGE_MS = 3_600_000;
@@ -266,7 +270,7 @@ export function verifyQuote(response: QuoteResponse, method: QuotedMethod, ctx: 
     throw fields(`recipient ${JSON.stringify(to)} with ${JSON.stringify(dest)} is not a desk address`);
   } else if (dest === ASSETS.hypercoreUsdc && minAmountOut < HYPERCORE_MIN_E8) {
     // The engine's own rule (the contract does not have it): under 1Click's minimum the delivery fails and refunds.
-    throw fields(`minAmountOut ${e8Text(minAmountOut)} is below the 0.5 USDC HyperCore takes`);
+    throw fields(`minAmountOut ${e8Text(minAmountOut)} is below the ${e8Text(HYPERCORE_MIN_E8)} USDC 1Click delivers into HyperCore at least`);
   }
   const amountOut = amount('amountOut', f.amountOut);
   if (method === 'fund_venue') {

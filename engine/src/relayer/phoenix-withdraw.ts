@@ -12,7 +12,8 @@
 // limit without a price, the Approve, withdraw_funds and Ember unwrap of at most amountIn, the deposit
 // owner's account and the TransferChecked, the Revoke; not the creates of the desk's own token accounts (they exist:
 // every deposit went through them). pausedRescueRefusals is that rule on the engine's side, checked before signing.
-// Not wired into a flow yet: the withdrawal and rescue callers build their messages here once they exist.
+// A rescue paid from USDC already on the desk's USDC account needs no withdrawal: spareRescueMessage (the deposit
+// owner's account and the transfer). The live Phoenix rescue (rescue/sol-rescue.ts) picks one of the three.
 
 import { buildCreateAssociatedTokenAccountIdempotentSync, buildWithdrawIxsResolved } from '@ellipsis-labs/rise';
 import type { BuildWithdrawIxsResolvedInput } from '@ellipsis-labs/rise';
@@ -104,6 +105,26 @@ export function pausedRescueInstructions(exchange: PhoenixExchangeAccounts, desk
     ...payDeposit(exchange, desk, deposit),
     tokenRevoke(desk.phusdAta, desk.authority),
   ];
+}
+
+/**
+ * A rescue paid from USDC already on the desk's USDC account (spare: a refund, an earlier delivery, a withdrawal that
+ * was not deposited again): the compute budget, the deposit owner's account and the TransferChecked of amountIn, no
+ * Phoenix withdrawal. `price` 0 sets the unit limit alone (the vector shape, solana.json "rescue: USDC to the verified
+ * 1Click deposit owner"); a price needs a limit of at most 400,000 units, which a rescue may pay up to 1,000,000
+ * µlamports per unit for, paused desk or not (phoenix.rs Budget::finish, urgent).
+ */
+export function spareRescueInstructions(exchange: PhoenixExchangeAccounts, desk: DeskSolanaAccounts, deposit: RescueDeposit, units = PAUSED_RESCUE_FEE_MAX_UNITS, price = 0): SolInstruction[] {
+  if (units > PAUSED_RESCUE_FEE_MAX_UNITS && price > 0) throw new Error(`a rescue pays a priority fee only for at most ${PAUSED_RESCUE_FEE_MAX_UNITS} units`);
+  if (BigInt(price) > URGENT_MAX_MICROLAMPORTS) throw new Error(`a rescue pays at most ${URGENT_MAX_MICROLAMPORTS} µlamports per unit`);
+  const budget = asSolInstructions(computeBudgetInstructions(units, price));
+  return [...(price === 0 ? budget.slice(0, 1) : budget), ...payDeposit(exchange, desk, deposit)];
+}
+
+export function spareRescueMessage(
+  exchange: PhoenixExchangeAccounts, desk: DeskSolanaAccounts, deposit: RescueDeposit, recentBlockhash: string, units?: number, price?: number,
+): Uint8Array {
+  return compileLegacyMessage(desk.authority, spareRescueInstructions(exchange, desk, deposit, units, price), recentBlockhash);
 }
 
 /** The deposit owner's USDC account (the idempotent create, paid by the desk) and the TransferChecked of amountIn. */

@@ -948,8 +948,8 @@ before any `pair-mainnet --send`.
    no `ADL -> alert only` line.
 4. Remove `GIMBAL_TRADER_FRESH` from the env. Every later start:
    `GIMBAL_MODE=mainnet GIMBAL_TRADE=1 npm run serve -w engine`.
-5. Stop with Ctrl-C: serve starts no new trigger, waits up to 180 s for the ADL attempt or close in flight, then
-   turns trading off and releases the lock.
+5. Stop with Ctrl-C: serve starts no new trigger, waits up to 180 s for the ADL attempt, a close or a rescue in
+   flight, then turns trading off and releases the lock.
 
 **Reconcile an ADL hold.** After a crash in the middle of a close, or a stop that passed 180 s, the state file still
 holds orders in flight and ADL only alerts. Serve settles them itself once they are 10 min old (at start, or on a
@@ -970,6 +970,58 @@ an `owner:` journal line), and the owner:
 over by itself. When serve or `pair-mainnet --send` refuses with "the trader lock ... holds no pid" (an empty or
 partly written file, left by a crash while it was being made): check that no serve and no `pair-mainnet` runs for
 this desk (Task Manager or `ps`), then delete that one file and start again.
+
+### The live rescue (GIMBAL_RESCUE=1)
+
+With `GIMBAL_RESCUE=1` serve's rescuer moves real money (`engine/src/rescue/serve-rescue.ts`; the routes in detail in
+`docs/interfaces.md`, "Rescue routes"). The start lines name them:
+
+| route | on mainnet | how |
+|---|---|---|
+| reserve -> Hyperliquid | live | `fund_venue` into HyperCore USDC, the landing in the Hyperliquid ledger |
+| reserve -> Phoenix | live | `fund_venue` into the desk authority's Solana USDC, then a `sol_sign` deposit into Phoenix |
+| Phoenix -> Hyperliquid | live | one `sol_sign_rescue` transaction to the 1Click deposit address, the landing in the Hyperliquid ledger |
+| Hyperliquid -> Phoenix | replay only | wired (`hl_withdraw`, `evm_usdc_to_intents`, the deposit), not yet dry-run on mainnet |
+| reserve or Phoenix -> Orderly | replay only | an Orderly landing needs its private API, which serve does not open |
+| Hyperliquid -> Orderly | not built | Arbitrum USDC into Arbitrum USDC, which 1Click does not quote |
+
+The two Phoenix routes run only when the Solana RPC (`SOLANA_RPC_URL`, else the public mainnet RPC) serves
+transaction history: a held `sol_sign_rescue` is released on it. serve probes it at start; without it the line
+`rescue routes REFUSED on mainnet: reserve -> Phoenix and Phoenix -> Hyperliquid, because ...` names the reason
+and the other routes still run. Into HyperCore 1Click delivers at least 1.31 USDC, so about 1.65 USDC is the least
+sent there.
+
+A reserve -> Phoenix delivery that reaches the desk's Solana USDC account with no deposit after it (serve stopped
+while 1Click was still working, or the deposit failed) waits there, outside margin. The journal says so in an
+`owner: rescue ... waits on the desk's phoenix wallet` line with the amount; the rescuer never deposits it later.
+Stop serve, run `pair-mainnet fund-phoenix <usdc>` (dry, then `--send`), start serve again.
+
+Before the Phoenix routes can run on a desk (the owner runs each step; the dry run below says which are still
+missing):
+
+1. The operator key is set on the desk (section 3): the rescuer signs with it.
+2. SOL on the desk Solana authority (`get_desk` `solana.authority`; 1Click sends none): a Phoenix rescue needs up to
+   about 0.0071 SOL (the fee, the 1Click deposit owner's USDC account rent, and on the first one the desk's USDC and
+   PhUSD account rents, plus the 0.00089 SOL rent-exempt reserve), a deposit about 0.003 SOL. Send 0.05 SOL to cover
+   both, the registration and several rescues.
+3. The Phoenix registration: POST /setup (section 6), step `phoenix_register` (`sol_sign_register`), until solscan
+   shows the trader account.
+4. For Phoenix -> Hyperliquid, collateral on Phoenix (`pair-mainnet fund-phoenix`, section 9) or spare USDC on the
+   desk's Solana USDC account.
+
+The dry run, keyless and read-only (it signs and sends nothing; a dry quote opens no deposit address):
+
+```
+npm run rescue-dry -w engine -- --mainnet --contract <contract>.near --desk <desk_id> [--need 5]
+```
+
+It prints the desk's Solana side, the history probe, the route lines, then per Phoenix route the plan (what is sent
+for `--need` USD of margin), 1Click's dry quote, the message built and simulated unsigned (for a placeholder
+deposit owner: a dry quote has none), and a `refused` line for everything still in the way, or `verdict   would run`.
+
+Stop with Ctrl-C: a running rescue signs nothing new; one that is signing or sending goes on until its payment is
+sent and saved as held, then stops waiting for 1Click. The 180 s shutdown wait covers it; the next start reads every
+held payment again at 1Click and on chain.
 
 ## Files the scripts write
 
@@ -997,7 +1049,7 @@ does not need them for setup.
 | `OPERATOR_ACCOUNT_ID` | empty, so the engine uses `OWNER_ACCOUNT_ID` |
 | `OPERATOR_PRIVATE_KEY` | the FunctionCall key from `.keys/operator-<contract>.near.json` |
 | `HL_API_URL`, `ORDERLY_API_URL` | `https://api.hyperliquid.xyz`, `https://api.orderly.org` |
-| `SOLANA_RPC_URL` | `https://api.mainnet-beta.solana.com` (Phoenix registration on mainnet); a private RPC can replace it |
+| `SOLANA_RPC_URL` | `https://api.mainnet-beta.solana.com` (Phoenix registration, the Phoenix rescue routes); a private RPC can replace it, and for the rescue it must serve transaction history (`getSignatureStatuses` with `searchTransactionHistory`) |
 | `ORDERLY_BROKER_ID` | the contract's broker id (`config().orderly.broker_id`) |
 | `OPERATOR_ALLOWANCE_NEAR` | the allowance set in step 3 (the engine reads what is left on chain) |
 | `PHOENIX_API_URL` | `https://perp-api.phoenix.trade` |

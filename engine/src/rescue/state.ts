@@ -109,6 +109,11 @@ export interface SavedHold {
   nearTx: string | null;
   /** sol_sign_rescue: its message's lastValidBlockHeight (saved before signing) and the transaction's signature once known. */
   solana: { lastValidBlockHeight: number; signature: string | null } | null;
+  /**
+   * Into a venue with a credit (Phoenix): what the desk's wallet there held before the payment, x 1e6; the delivery
+   * counts above it. Absent in files written before it existed (read as null).
+   */
+  creditBaseE6?: string | null;
 }
 
 export interface SavedWithdraw {
@@ -239,6 +244,7 @@ function parseHold(v: unknown, path: string): SavedHold {
       if (typeof lv !== 'number' || !Number.isSafeInteger(lv) || lv < 0) bad(`${p}.lastValidBlockHeight`, 'not a block height');
       return { lastValidBlockHeight: lv, signature: nullable(s.signature, `${p}.signature`, nonEmpty) };
     }),
+    ...(h.creditBaseE6 === undefined ? {} : { creditBaseE6: nullable(h.creditBaseE6, `${path}.creditBaseE6`, units) }),
   };
 }
 
