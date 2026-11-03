@@ -25,7 +25,7 @@ import type { OneClickApi, QuoteAnswer, QuoteRequest, StatusAnswer, VerifiedQuot
 import { ASSETS } from './oneclick.ts';
 import { RecordedOneClick, SimulatedMoney, loadRescueRecording } from './recorded.ts';
 import type { CreditPort, HlWithdrawPort, LandingPort, Payer, Reducer, RescueDesk, RescuerOptions } from './rescuer.ts';
-import { Rescuer } from './rescuer.ts';
+import { Rescuer, operatorMinWithdrawE6 } from './rescuer.ts';
 import type { Eip3009Ref, RescueIdentity } from './state.ts';
 import { RescueStateStore } from './state.ts';
 import { testQuote, testSigner } from './test-quotes.ts';
@@ -251,7 +251,7 @@ function synthetic(o: SyntheticOptions = {}): Synthetic {
         const hash = `near-${method}-${n}`;
         if (method === 'fund_venue') {
           s.near.fundSpend(q.depositAddress);
-          s.near.txs.set(hash, { final: true, ftTransfers: [{ from: rec.desk.contract, to: q.depositAddress, amount: q.amountIn }] });
+          s.near.txs.set(hash, { final: true, paidTo: [q.depositAddress], noPay: null });
         } else {
           s.near.spend(method, q.depositAddress);
         }
@@ -557,8 +557,17 @@ test('a Phoenix payment that failed to send: dead once Solana\'s finalized heigh
     s.w.t = (lastValid + 32) * 400;
     await run(s.w, trigger({ id: 'b', amountUsd: 30 }));
     assert.match(s.w.rescuer.held!, /rescue a/, `${view}: not dead yet`);
-    // Past it, but Solana cannot be read: not taken as dead.
+    // Past it, but the status answer comes from a node behind the slot where the height passed: its "unknown"
+    // proves nothing.
     s.w.t = (lastValid + 33) * 400;
+    s.solana.statusLag = -1;
+    await run(s.w, trigger({ id: 'b2', amountUsd: 30 }));
+    assert.match(s.w.rescuer.held!, /rescue a/, `${view}: a lagging status read is no proof`);
+    s.w.t += 11 * 60_000;
+    await run(s.w, trigger({ id: 'b3', amountUsd: 30 }));
+    assert.match(s.w.rescuer.held!, /rescue a/, `${view}: nor did it start 1Click's 10 minutes`);
+    s.solana.statusLag = 0;
+    // Past it, but Solana cannot be read: not taken as dead.
     s.solana.down = 'solana rpc: 503';
     await run(s.w, trigger({ id: 'c', amountUsd: 30 }));
     s.solana.down = null;
@@ -1081,12 +1090,14 @@ test('state: a fund_venue the ring counted, with no transaction known, stays hel
   assert.ok(s.w.journal().some((j) => /reconcile needed: rescue a's deposit/.test(j)));
 });
 
-test('state: an unknown fund_venue outcome with its transaction known: decided by the final transaction, never by time', async () => {
-  const cases: { name: string; facts: (addr: string, amount: bigint) => NearTxFacts | null; released: boolean }[] = [
-    { name: 'final, nothing transferred', facts: () => ({ final: true, ftTransfers: [] }), released: true },
-    { name: 'final, a transfer of another amount', facts: (addr) => ({ final: true, ftTransfers: [{ from: 'c', to: addr, amount: 1n }] }), released: true },
-    { name: 'final, the transfer to the deposit', facts: (addr, amount) => ({ final: true, ftTransfers: [{ from: 'c', to: addr, amount }] }), released: false },
-    { name: 'not final yet', facts: () => ({ final: false, ftTransfers: [] }), released: false },
+test('state: an unknown fund_venue outcome with its transaction known: released only on proof it paid nothing, never on a missing log or on time', async () => {
+  const proof = 'on_fund_venue returned false: the transfer failed and the USDC is back in idle_usdc';
+  const cases: { name: string; facts: (addr: string) => NearTxFacts | null; released: boolean }[] = [
+    { name: 'final, on_fund_venue false', facts: () => ({ final: true, paidTo: [], noPay: proof }), released: true },
+    { name: 'final, no transfer log and no proof', facts: () => ({ final: true, paidTo: [], noPay: null }), released: false },
+    { name: 'final, a transfer to the deposit (any amount)', facts: (addr) => ({ final: true, paidTo: [addr], noPay: null }), released: false },
+    { name: 'final, a transfer to the deposit beside a proof', facts: (addr) => ({ final: true, paidTo: [addr], noPay: proof }), released: false },
+    { name: 'not final yet, with a proof so far', facts: () => ({ final: false, paidTo: [], noPay: proof }), released: false },
   ];
   for (const c of cases) {
     const store = tmpStore();
@@ -1097,13 +1108,13 @@ test('state: an unknown fund_venue outcome with its transaction known: decided b
     const hold = onDisk(store).holds[0]!;
     assert.equal(hold.nearTx, 'tx-lost', c.name);
     const q = hold.quote;
-    const f = c.facts(q.depositAddress, BigInt(s.quotes[0]!.amount));
+    const f = c.facts(q.depositAddress);
     if (f !== null) s.near.txs.set('tx-lost', f);
     s.status = (_n, addr) => ({ status: addr === q.depositAddress ? 'PENDING_DEPOSIT' : 'SUCCESS', body: null });
     s.w.t = c.released ? q.signedAtMs + 60_000 : q.signedAtMs + 30 * 3_600_000;
     await run(s.w, trigger({ id: 'b', amountUsd: 30 }));
     if (c.released) {
-      assert.ok(s.w.journal().some((j) => /rescue a's fund_venue transaction tx-lost is final and transferred nothing to/.test(j)), c.name);
+      assert.ok(s.w.journal().some((j) => /rescue a's fund_venue transaction tx-lost is final and paid nothing to \S+ \(on_fund_venue returned false/.test(j)), c.name);
       assert.equal(s.quotes.length, 2, `${c.name}: b paid`);
     } else {
       assert.match(s.w.rescuer.held!, /fund_venue of rescue a may have been signed or paid|rescue a was paying/, c.name);
@@ -1262,6 +1273,30 @@ test('a withdraw that never showed, with no room left under the cap for a cent m
     assert.equal(s.withdrawn[1], first + bump, `${spare} USD spare`);
     assert.ok(s.w.rescuer.capUsed() <= cap + 1e-9, 'the cap holds');
   }
+});
+
+test('a withdraw that never showed, no room for a cent more and a cent less under the operator minimum: not bumped down, the rescue fails at source and says why', async () => {
+  const desk = { reserveUsd: 0, policy: { ...rec.policy, rescue_cap_usd_per_hour: 1000 } };
+  const { s } = hlWorld({ desk });
+  s.hlArrives = false;
+  await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
+  const first = s.withdrawn[0]!;
+  s.w.t += 30 * 60_000;
+  s.hlArrives = true;
+  // The minimum is 10 x the flat cost: a flat cost of a tenth of the first withdraw puts a cent less under it.
+  const cap = s.w.rescuer.capUsed() + (2 * Number(first) / 1e6 - 1) + 0.005;
+  desk.policy = { ...desk.policy, rescue_cap_usd_per_hour: cap, max_transfer_cost_flat_e6: Number(first) / 10 };
+  await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
+  assert.equal(s.withdrawn.length, 1, 'no second hl_withdraw');
+  assert.equal(s.w.failures.at(-1)?.step, 'source');
+  assert.match(s.w.failures.at(-1)!.reason, /under the operator's minimum of \d+\.\d\d USDC, so it is not bumped down/);
+  assert.ok(s.w.logs.some((l) => /^rescue b: no hl_withdraw near .* so it is not bumped down$/.test(l)));
+});
+
+test('the operator minimum withdraw is max(10 x the flat cost, 10 USDC)', () => {
+  assert.equal(operatorMinWithdrawE6(1_000_000), 10_000_000n);
+  assert.equal(operatorMinWithdrawE6(500_000), 10_000_000n);
+  assert.equal(operatorMinWithdrawE6(2_500_000), 25_000_000n);
 });
 
 test('INCOMPLETE_DEPOSIT keeps the hold: what arrived waits at 1Click for its refund, and only a refund ends it', async () => {

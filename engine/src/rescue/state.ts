@@ -16,8 +16,9 @@
 // A file that is missing, cannot be read, names another contract, desk or EVM address, or does not pass
 // parseRescueState is never taken as "no holds": the rescuer then holds every transfer and says so (rescuer.ts).
 // A first run needs GIMBAL_RESCUE_FRESH=<contract>/<desk>, which writes an empty state. Serve allows it only
-// FRESH_WAIT_MS (65 min) after the desk's last trace in the state directory (freshEvidence): a state file of the desk
-// (any EVM address, a crash's temp file) or the marker the first refused FRESH writes. A NEAR call a stopped rescuer
+// FRESH_WAIT_MS (65 min) after the desk's last trace in the state directory (freshEvidence): any file named with the
+// desk's stem (a state file of any EVM address, a crash's temp file, a copy) or the marker the first refused FRESH
+// writes. A NEAR call a stopped rescuer
 // sent may still land until its quote's signedAt + 65 min, and nothing on chain shows it before it lands, so with no
 // trace at all the wait starts at that first FRESH. The marker is removed once a first run is allowed.
 
@@ -424,7 +425,11 @@ export interface FreshEvidence {
   dir: string;
   /** This identity's own state file exists (a first run is then not one: the rescuer loads it). */
   stateExists: boolean;
-  /** The newest trace: a state file of the desk (any EVM address, or a temp file), or the marker; null: none. */
+  /**
+   * The newest trace: any file whose name starts with the desk's stem `rescue-<mode>-<contract>-<desk>` (a state file
+   * of any EVM address, a temp file, a copy such as `.json.bak`, the marker); null: none. A desk whose id extends this
+   * one's matches too, which only makes the wait longer, never shorter.
+   */
   last: { ms: number; file: string } | null;
   /** Writes the marker now, unless one is there (its time is when the wait began). */
   mark(): void;
@@ -435,8 +440,8 @@ export interface FreshEvidence {
 /** The desk's traces in `dir` (see FreshEvidence). Unreadable entries count as no trace only when they are gone. */
 export function freshEvidence(dir: string, mode: Mode, id: RescueIdentity): FreshEvidence {
   const own = rescueStateFile(dir, mode, id);
-  const stem = `rescue-${mode}-${id.contractId}-${id.deskId}-0x`;
-  const marker = join(dir, `rescue-${mode}-${id.contractId}-${id.deskId}.fresh`);
+  const stem = `rescue-${mode}-${id.contractId}-${id.deskId}`;
+  const marker = join(dir, `${stem}.fresh`);
   let names: string[] = [];
   try {
     names = readdirSync(dir);
@@ -445,9 +450,15 @@ export function freshEvidence(dir: string, mode: Mode, id: RescueIdentity): Fres
   }
   let last: FreshEvidence['last'] = null;
   for (const n of names) {
-    const desk = n.startsWith(stem) && /^0x[0-9a-f]{40}\.json(\.\d+\.tmp)?$/.test(n.slice(stem.length - 2));
-    if (!desk && join(dir, n) !== marker) continue;
-    const ms = statSync(join(dir, n)).mtimeMs;
+    if (!n.startsWith(stem)) continue;
+    let ms: number;
+    try {
+      ms = statSync(join(dir, n)).mtimeMs;
+    } catch (err) {
+      // Gone between the listing and the stat (a save's rename): its replacement is listed too.
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw err;
+    }
     if (last === null || ms > last.ms) last = { ms, file: join(dir, n) };
   }
   return {

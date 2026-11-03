@@ -3,7 +3,8 @@
 // that blockhash's lastValidBlockHeight. Once the finalized height is past it, the transaction can never be included
 // in a later block; if the cluster then does not know its signature (searching its history), it never landed and
 // never will. The rescuer saves lastValidBlockHeight before it asks the contract to sign (the payer's prepare) and the
-// signature once it has it. Read-only.
+// signature once it has it. The status must come from a node at or past the slot the height was read at (its answer's
+// context slot), as relayer/solana.ts checks: a lagging node's "unknown" is no proof. Read-only.
 //
 // RpcSolanaReads is the live reader on a Solana JSON-RPC URL; SimulatedSolana is the same in memory for the recorded
 // worlds and the tests.
@@ -12,14 +13,17 @@ import { redactError } from '../redact.ts';
 import type { Clock } from '../venues/venue.ts';
 
 export interface SolanaReads {
-  /** The cluster's finalized block height. */
-  finalizedHeight(): Promise<number>;
-  /** Whether the cluster knows the transaction signature (landed, ok or failed), searching its history. */
-  signatureKnown(signature: string): Promise<boolean>;
+  /** The cluster's finalized block height, and the slot it was read at. */
+  finalized(): Promise<{ height: number; slot: number }>;
+  /**
+   * Whether the cluster knows the transaction signature (landed, ok or failed), searching its history, and the slot
+   * the answering node read it at (null: its answer gave none).
+   */
+  signatureStatus(signature: string): Promise<{ known: boolean; slot: number | null }>;
 }
 
 /**
- * Solana JSON-RPC (getBlockHeight, getSignatureStatuses); every answer that is not the expected shape is an error.
+ * Solana JSON-RPC (getEpochInfo, getSignatureStatuses); every answer that is not the expected shape is an error.
  * The URL must serve transaction history (searchTransactionHistory): a node that keeps only its recent status cache
  * answers null for an older signature that did land, which would read as never landed.
  */
@@ -48,20 +52,24 @@ export class RpcSolanaReads implements SolanaReads {
     }
   }
 
-  async finalizedHeight(): Promise<number> {
-    const h = await this.#call('getBlockHeight', [{ commitment: 'finalized' }]);
-    if (typeof h !== 'number' || !Number.isSafeInteger(h) || h < 0) throw new Error('getBlockHeight: not a block height');
-    return h;
+  async finalized(): Promise<{ height: number; slot: number }> {
+    const r = await this.#call('getEpochInfo', [{ commitment: 'finalized' }]) as { blockHeight?: unknown; absoluteSlot?: unknown } | null;
+    const { blockHeight, absoluteSlot } = r ?? {};
+    if (!Number.isSafeInteger(blockHeight) || !Number.isSafeInteger(absoluteSlot) || (blockHeight as number) < 0) {
+      throw new Error('getEpochInfo: not a block height and slot');
+    }
+    return { height: blockHeight as number, slot: absoluteSlot as number };
   }
 
-  async signatureKnown(signature: string): Promise<boolean> {
-    const r = await this.#call('getSignatureStatuses', [[signature], { searchTransactionHistory: true }]) as { value?: unknown };
+  async signatureStatus(signature: string): Promise<{ known: boolean; slot: number | null }> {
+    const r = await this.#call('getSignatureStatuses', [[signature], { searchTransactionHistory: true }]) as { context?: { slot?: unknown }; value?: unknown };
     if (!Array.isArray(r?.value) || r.value.length !== 1) throw new Error('getSignatureStatuses: not one status');
-    return r.value[0] !== null;
+    const slot = r.context?.slot;
+    return { known: r.value[0] !== null, slot: Number.isSafeInteger(slot) ? slot as number : null };
   }
 }
 
-/** Solana in memory: a block height that grows with the clock (one per 400 ms, finalized 32 behind) and landed signatures. */
+/** Solana in memory: a block height (and slot) that grows with the clock (one per 400 ms, finalized 32 behind) and landed signatures. */
 export class SimulatedSolana implements SolanaReads {
   readonly #clock: Clock;
   readonly #landed = new Set<string>();
@@ -81,13 +89,16 @@ export class SimulatedSolana implements SolanaReads {
     this.#landed.add(signature);
   }
 
-  async finalizedHeight(): Promise<number> {
+  /** The slot the status answers come from, relative to the finalized one (a lagging node: negative). */
+  statusLag = 0;
+
+  async finalized(): Promise<{ height: number; slot: number }> {
     if (this.down !== null) throw new Error(this.down);
-    return this.heightNow() - 32;
+    return { height: this.heightNow() - 32, slot: this.heightNow() - 32 };
   }
 
-  async signatureKnown(signature: string): Promise<boolean> {
+  async signatureStatus(signature: string): Promise<{ known: boolean; slot: number | null }> {
     if (this.down !== null) throw new Error(this.down);
-    return this.#landed.has(signature);
+    return { known: this.#landed.has(signature), slot: this.heightNow() - 32 + this.statusLag };
   }
 }

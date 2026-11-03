@@ -4,7 +4,17 @@
 // each was paid, the rescue window's start and the next EIP-3009 counter; and the desk's fund_venue ring (the same
 // record shape, kept apart by the contract so funding never uses up the rescues' ring), read from the contract state
 // (view_state, FundCounters) because no view method returns it. And, for a fund_venue whose transaction is known, that
-// transaction's final outcome: whether a USDC transfer to the deposit address ran in it. Read-only.
+// transaction's final outcome: whether a USDC transfer to the deposit address ran in it, or proof that none can.
+// Read-only.
+//
+// The records are read in the contract's own borsh layout, told apart by length: 1329 bytes on the C8 code (the
+// canary), 1369 on C10 and later (rescue_quote_e8 before eip3009_next, the notional meter after the paid times); any
+// other length is an error. engine/fixtures/near/counters-records.json holds both as the contract wrote them (the
+// canary's from mainnet, the final one pinned by a contract test). write_desk stores both records for every desk, so
+// a missing one is an error, never an empty ring; the desk's DeskCounters record (prefix 5) is read beside the
+// fund_venue one (prefix 8) at the same block, which confirms the key encoding. view_state is refused by the RPC for
+// an account whose state is over about 50 kB: as desks are added the ring becomes unreadable, and every reader of it
+// then fails closed (FRESH refused, fund_venue holds kept).
 //
 // A ring is written when the contract counts a payment (rescue signed, fund_venue sent), and a quote pays once: an
 // address in the ring was counted exactly once, at its paid time. A slot is reused only by a later payment, in ring
@@ -23,10 +33,17 @@ import type { Clock } from '../venues/venue.ts';
 
 /** A first run waits this long after the desk's last payment or rescuer trace: a NEAR call sent before then lands by signedAt + 65 min (the contract's QUOTE_PAYABLE_MS). */
 export const FRESH_WAIT_MS = 65 * 60_000;
-/** The contract's storage prefix of the fund_venue counters (contract/src/lib.rs StorageKey::FundCounters). */
+/** The contract's storage prefixes (contract/src/lib.rs StorageKey): DeskCounters and the fund_venue counters. */
+export const DESK_COUNTERS_PREFIX = 5;
 export const FUND_COUNTERS_PREFIX = 8;
-/** The borsh size of one DeskCounters record (contract/src/rescue.rs). */
-export const COUNTERS_RECORD_BYTES = 1329;
+/** The borsh size of one DeskCounters record (contract/src/rescue.rs) on the C8 code (the canary) and on C10. */
+export const CANARY_COUNTERS_BYTES = 1329;
+export const FINAL_COUNTERS_BYTES = 1369;
+/** Where each layout keeps eip3009_next, the 32 deposit hashes and the 32 paid times (rescue_at_ms is at 0 in both). */
+const LAYOUTS: Record<number, { next: number; deposits: number; paid: number }> = {
+  [CANARY_COUNTERS_BYTES]: { next: 40, deposits: 48, paid: 1073 },
+  [FINAL_COUNTERS_BYTES]: { next: 56, deposits: 64, paid: 1089 },
+};
 
 /** A desk's counters as the rescue reads them: get_desk_counters, or the fund_venue record. */
 export interface NearDeskCounters {
@@ -45,24 +62,23 @@ export interface NearRead {
   timeMs: number;
   /** get_desk_counters; null: the contract has no such view (before C10). A desk with no counters yet reads as an empty ring. */
   counters: NearDeskCounters | null;
-  /** The fund_venue ring; null: it could not be read (fundError says why). A desk with no fund_venue yet reads as an empty ring. */
+  /** The fund_venue ring; null: it could not be read (fundError says why). */
   fund: NearDeskCounters | null;
   fundError: string | null;
 }
 
-/** One USDC (NEP-141) transfer a NEAR transaction made, from its receipts' ft_transfer events. */
-export interface FtTransfer {
-  from: string;
-  to: string;
-  amount: bigint;
-}
-
-/** A NEAR transaction's outcome as the rescue needs it. */
+/** A fund_venue transaction's outcome as the rescue needs it. */
 export interface NearTxFacts {
   /** Every receipt of it executed and final: nothing more of it can run. */
   final: boolean;
-  /** The ft_transfer events of its receipts that succeeded. */
-  ftTransfers: FtTransfer[];
+  /** Who its successful receipts' nep141 ft_transfer events paid, whatever the amount. */
+  paidTo: string[];
+  /**
+   * Positive proof that it paid nothing, or null: the fund_venue call failed (the contract refused it, so nothing was
+   * counted or sent), the USDC ft_transfer receipt failed, or on_fund_venue returned false (the USDC is back in
+   * idle_usdc). A missing transfer log alone is no proof.
+   */
+  noPay: string | null;
 }
 
 const EMPTY = (): NearDeskCounters => ({ eip3009Next: 0n, rescueAtMs: 0, deposits: [], depositPaidMs: [] });
@@ -133,11 +149,14 @@ export function parseDeskCounters(raw: unknown): NearDeskCounters {
 }
 
 /**
- * One DeskCounters record as the contract stores it (borsh, contract/src/rescue.rs): rescue_at_ms u64, two u128
- * meters, eip3009_next u64, 32 sha256 deposits (all zero: unused), deposit_next u8, 32 paid times u64.
+ * One DeskCounters record as the contract stores it (borsh, contract/src/rescue.rs), told apart by length. C8 (1329
+ * bytes): rescue_at_ms u64, two u128 meters, eip3009_next u64, 32 sha256 deposits (all zero: unused), deposit_next
+ * u8, 32 paid times u64. C10 (1369): a third u128 meter (rescue_quote_e8) before eip3009_next, and notional_at_ms u64
+ * and notional_e8 u128 after the paid times.
  */
 export function decodeCountersRecord(buf: Uint8Array): NearDeskCounters {
-  if (buf.length !== COUNTERS_RECORD_BYTES) throw new Error(`a counters record is ${buf.length} bytes, not ${COUNTERS_RECORD_BYTES}`);
+  const at = LAYOUTS[buf.length];
+  if (at === undefined) throw new Error(`a counters record is ${buf.length} bytes, neither ${CANARY_COUNTERS_BYTES} (C8) nor ${FINAL_COUNTERS_BYTES} (C10)`);
   const v = Buffer.from(buf.buffer, buf.byteOffset, buf.length);
   const time = (n: bigint, what: string): number => {
     if (n > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error(`a counters record's ${what} ${n} is not a time in ms`);
@@ -146,11 +165,11 @@ export function decodeCountersRecord(buf: Uint8Array): NearDeskCounters {
   const deposits: (string | null)[] = [];
   const depositPaidMs: number[] = [];
   for (let i = 0; i < 32; i++) {
-    const h = v.subarray(48 + 32 * i, 80 + 32 * i);
+    const h = v.subarray(at.deposits + 32 * i, at.deposits + 32 * (i + 1));
     deposits.push(h.every((b) => b === 0) ? null : h.toString('hex'));
-    depositPaidMs.push(time(v.readBigUInt64LE(1073 + 8 * i), `deposit_paid_ms[${i}]`));
+    depositPaidMs.push(time(v.readBigUInt64LE(at.paid + 8 * i), `deposit_paid_ms[${i}]`));
   }
-  return { eip3009Next: v.readBigUInt64LE(40), rescueAtMs: time(v.readBigUInt64LE(0), 'rescue_at_ms'), deposits, depositPaidMs };
+  return { eip3009Next: v.readBigUInt64LE(at.next), rescueAtMs: time(v.readBigUInt64LE(0), 'rescue_at_ms'), deposits, depositPaidMs };
 }
 
 /** The contract-state key of a desk's record under `prefix`: the prefix byte, then the desk id as a borsh string. */
@@ -161,17 +180,61 @@ export function deskRecordKey(prefix: number, deskId: string): Buffer {
   return Buffer.concat([Buffer.from([prefix]), len, id]);
 }
 
-/** A NEAR transaction's final outcome (the `tx` RPC answer) as NearTxFacts. */
-export function txFactsOf(raw: unknown): NearTxFacts {
-  const r = (raw ?? {}) as { final_execution_status?: unknown; receipts_outcome?: unknown };
+interface RpcReceipt {
+  receipt_id?: unknown;
+  receiver_id?: unknown;
+  predecessor_id?: unknown;
+  receipt?: { Action?: { actions?: { FunctionCall?: { method_name?: unknown } }[] } };
+}
+interface RpcOutcome {
+  id?: unknown;
+  outcome?: { status?: unknown; logs?: unknown; executor_id?: unknown };
+}
+
+const failed = (status: unknown): boolean => typeof status === 'object' && status !== null && 'Failure' in status;
+const succeeded = (status: unknown): boolean => typeof status === 'object' && status !== null && ('SuccessValue' in status || 'SuccessReceiptId' in status);
+const short = (status: unknown): string => JSON.stringify(status).slice(0, 200);
+
+/**
+ * A fund_venue transaction's final outcome (the EXPERIMENTAL_tx_status answer, with its receipts) as NearTxFacts, for
+ * the contract `contractId`. engine/fixtures/near/fund-venue-tx-mainnet.json is the canary's, as the RPC gave it.
+ */
+export function txFactsOf(raw: unknown, contractId: string): NearTxFacts {
+  const r = (raw ?? {}) as {
+    final_execution_status?: unknown; receipts_outcome?: unknown; receipts?: unknown;
+    transaction?: { actions?: { FunctionCall?: { method_name?: unknown } }[] }; transaction_outcome?: { outcome?: { status?: unknown } };
+  };
   if (!Array.isArray(r.receipts_outcome)) throw new Error('the transaction outcome has no receipts_outcome');
-  const ftTransfers: FtTransfer[] = [];
-  for (const ro of r.receipts_outcome as { outcome?: { status?: unknown; logs?: unknown } }[]) {
+  if (!Array.isArray(r.receipts)) throw new Error('the transaction outcome has no receipts (EXPERIMENTAL_tx_status gives them)');
+  // Each receipt's receiver, sender and called methods, by id.
+  const receipts = new Map<string, { receiver: unknown; predecessor: unknown; methods: unknown[] }>();
+  for (const rc of r.receipts as RpcReceipt[]) {
+    if (typeof rc.receipt_id !== 'string') continue;
+    receipts.set(rc.receipt_id, { receiver: rc.receiver_id, predecessor: rc.predecessor_id, methods: (rc.receipt?.Action?.actions ?? []).map((a) => a.FunctionCall?.method_name) });
+  }
+  // The transaction's own receipt (the fund_venue call) is the one its outcome points at.
+  const first = (r.transaction_outcome?.outcome?.status as { SuccessReceiptId?: unknown } | undefined)?.SuccessReceiptId;
+  const proofs: string[] = [];
+  if (failed(r.transaction_outcome?.outcome?.status)) proofs.push(`the transaction failed before any receipt (${short(r.transaction_outcome?.outcome?.status)}): nothing ran`);
+  const paidTo: string[] = [];
+  for (const ro of r.receipts_outcome as RpcOutcome[]) {
     const status = ro.outcome?.status;
+    const rc = typeof ro.id === 'string' ? receipts.get(ro.id) : undefined;
+    const methods = rc?.methods ?? (ro.id === first ? (r.transaction?.actions ?? []).map((a) => a.FunctionCall?.method_name) : []);
+    const atContract = ro.outcome?.executor_id === contractId;
+    if (atContract && methods.includes('fund_venue') && failed(status)) {
+      proofs.push(`the fund_venue call failed (${short(status)}): the contract refused it, so nothing was counted or sent`);
+    }
+    if (methods.includes('ft_transfer') && rc?.predecessor === contractId && failed(status)) {
+      proofs.push(`its USDC ft_transfer receipt ${String(ro.id)} failed (${short(status)})`);
+    }
+    if (atContract && methods.includes('on_fund_venue') && succeeded(status)) {
+      const v = (status as { SuccessValue?: unknown }).SuccessValue;
+      if (typeof v === 'string' && Buffer.from(v, 'base64').toString('utf8') === 'false') proofs.push('on_fund_venue returned false: the transfer failed and the USDC is back in idle_usdc');
+    }
     // A receipt that failed changed nothing, whatever it logged before it failed.
-    const ok = typeof status === 'object' && status !== null && ('SuccessValue' in status || 'SuccessReceiptId' in status);
     const logs = ro.outcome?.logs;
-    if (!ok || !Array.isArray(logs)) continue;
+    if (!succeeded(status) || !Array.isArray(logs)) continue;
     for (const log of logs) {
       if (typeof log !== 'string' || !log.startsWith('EVENT_JSON:')) continue;
       let e: { standard?: unknown; event?: unknown; data?: unknown };
@@ -182,12 +245,11 @@ export function txFactsOf(raw: unknown): NearTxFacts {
       }
       if (e.standard !== 'nep141' || e.event !== 'ft_transfer' || !Array.isArray(e.data)) continue;
       for (const d of e.data as Record<string, unknown>[]) {
-        if (typeof d.old_owner_id !== 'string' || typeof d.new_owner_id !== 'string' || typeof d.amount !== 'string' || !/^\d+$/.test(d.amount)) continue;
-        ftTransfers.push({ from: d.old_owner_id, to: d.new_owner_id, amount: BigInt(d.amount) });
+        if (typeof d.new_owner_id === 'string') paidTo.push(d.new_owner_id);
       }
     }
   }
-  return { final: r.final_execution_status === 'FINAL', ftTransfers };
+  return { final: r.final_execution_status === 'FINAL', paidTo, noPay: proofs.length === 0 ? null : proofs.join('; ') };
 }
 
 /** view_state, which the transports' provider type leaves out (JsonRpcProvider has it as query). */
@@ -239,21 +301,40 @@ export class NearDeskReads extends NearViewTransport {
     return { height, timeMs, counters, fund, fundError };
   }
 
-  /** The desk's fund_venue record at `height`, from the contract state; none yet: an empty ring. */
-  async #fundRing(height: number): Promise<NearDeskCounters> {
-    const key = deskRecordKey(FUND_COUNTERS_PREFIX, this.#deskId);
+  /** The desk's record under `prefix` at `height`, from the contract state, or null when there is none. */
+  async #record(prefix: number, height: number, what: string): Promise<Buffer | null> {
+    const key = deskRecordKey(prefix, this.#deskId);
     const q = this.provider as unknown as StateQuery;
     const r = await this.safe(q.query({ request_type: 'view_state', account_id: this.#contractId, prefix_base64: key.toString('base64'), block_id: height }));
     if (!Array.isArray(r.values)) throw new Error('view_state answered no values');
     const hit = r.values.filter((v) => Buffer.from(v.key, 'base64').equals(key));
-    if (hit.length > 1) throw new Error('view_state answered two fund_venue records for one desk');
-    return hit.length === 0 ? EMPTY() : decodeCountersRecord(Buffer.from(hit[0]!.value, 'base64'));
+    if (hit.length > 1) throw new Error(`view_state answered two ${what} records for one desk`);
+    return hit.length === 0 ? null : Buffer.from(hit[0]!.value, 'base64');
   }
 
-  /** The final outcome of a transaction the operator sent (waits for FINAL; an RPC timeout is an error, never "not final"). */
+  /**
+   * The desk's fund_venue record at `height`. write_desk stores it, and the DeskCounters record (prefix 5) beside it,
+   * for every desk: the latter is read too, so a key encoding this reader got wrong (or no such desk) is an error.
+   */
+  async #fundRing(height: number): Promise<NearDeskCounters> {
+    const desk = await this.#record(DESK_COUNTERS_PREFIX, height, 'DeskCounters');
+    if (desk === null) throw new Error(`the contract state has no DeskCounters record of desk ${this.#deskId} at block ${height} (no such desk, or a key encoding this reader does not know)`);
+    const fund = await this.#record(FUND_COUNTERS_PREFIX, height, 'fund_venue');
+    if (fund === null) throw new Error(`the contract state has the desk's DeskCounters but no fund_venue record at block ${height}: write_desk stores both`);
+    if (fund.length !== desk.length) throw new Error(`the desk's DeskCounters record is ${desk.length} bytes and its fund_venue record ${fund.length}: not one layout`);
+    decodeCountersRecord(desk);
+    return decodeCountersRecord(fund);
+  }
+
+  /**
+   * The final outcome of a transaction the operator sent, with its receipts (EXPERIMENTAL_tx_status, waits for FINAL;
+   * an RPC timeout is an error, never "not final"). An RPC without the history of an older transaction answers a
+   * timeout too: the caller then decides by the ring.
+   */
   async txFacts(hash: string): Promise<NearTxFacts> {
     if (this.#signerId === null) throw new Error('no signer account to read its transactions by');
-    return txFactsOf(await this.safe(this.provider.viewTransactionStatus({ txHash: hash, accountId: this.#signerId, waitUntil: 'FINAL' })));
+    const p = this.provider as unknown as { viewTransactionStatusWithReceipts(a: { txHash: string; accountId: string; waitUntil: string }): Promise<unknown> };
+    return txFactsOf(await this.safe(p.viewTransactionStatusWithReceipts({ txHash: hash, accountId: this.#signerId, waitUntil: 'FINAL' })), this.#contractId);
   }
 }
 

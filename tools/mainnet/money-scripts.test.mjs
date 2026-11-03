@@ -438,10 +438,12 @@ test('fund --send: a live quote checked, fund_venue signed with the operator key
 });
 
 test('fund and the rescuer\'s lock: held by a live rescuer, --send refuses before anything is read or signed (the dry run says so); free, --send holds it for the run', async () => {
-  // The real lock (engine/src/rescue/lock.ts) under the name fund.mjs derives, for a desk id of its own: hl-return's
-  // test takes this contract and desk's name, and node runs test files in parallel.
+  // The real lock (engine/src/rescue/lock.ts) under the name fund.mjs derives, for a desk id of this process's own: the
+  // plain name is the live canary desk's, and a Windows pipe name is machine-wide, so a running rescuer, hl-return's
+  // test or another test run would collide with a fixed one.
   const real = await import('../../engine/src/rescue/lock.ts');
-  const locks = { ...real, rescueLockName: (env, mode, contract, desk) => real.rescueLockName(env, mode, contract, `${desk}-fund-test`) };
+  const run = `${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  const locks = { ...real, rescueLockName: (env, mode, contract, desk) => real.rescueLockName(env, mode, contract, `${desk}-fund-test-${run}`) };
   const name = locks.rescueLockName((k) => process.env[k], 'mainnet', CONTRACT, DESK_ID);
   const live = fundQuote(LIVE);
   const at = Date.parse(live.response.timestamp) + 1000;

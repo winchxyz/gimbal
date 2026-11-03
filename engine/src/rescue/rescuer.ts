@@ -39,9 +39,11 @@
 //         whose time is past payableUntilMs + CHAIN_MARGIN_S, does not hold the deposit address, and still has a slot
 //         empty or older than the hold (so it was not pushed out by 32 later payments);
 //       fund_venue: the contract sends the USDC in a later receipt, which can run long after the call under
-//         congestion, so time never releases it. With its NEAR transaction known: final (every receipt executed) and
-//         no ft_transfer to the deposit address in it is never paid (released at once); a transfer in it is paid,
-//         held until 1Click settles it. In the ring with no transaction known: held until the owner reconciles it;
+//         congestion, so time never releases it. With its NEAR transaction known and final (every receipt executed):
+//         released at once only on positive proof it paid nothing (the call failed, its USDC ft_transfer receipt
+//         failed, or on_fund_venue returned false); a transfer to the deposit address in it, of any amount, is paid,
+//         held until 1Click settles it; neither: held for the owner (a missing log is no proof). In the ring with no
+//         transaction known: held until the owner reconciles it;
 //       evm_usdc_to_intents: a USDC Transfer from the desk to the deposit address since the block before signing
 //         proves it ran (held until 1Click settles it). Dead (released once 1Click, UNUSED_GRACE_MS later and with
 //         the chain read again, still saw no deposit): a signed authorization the rescuer has, with the Arbitrum head
@@ -326,6 +328,8 @@ interface DepositHold {
   nearTx: string | null;
   /** sol_sign_rescue: lastValidBlockHeight of its message, and its signature once known. */
   solana: { lastValidBlockHeight: number; signature: string | null } | null;
+  /** fund_venue: the proof its transaction paid nothing, as last read (for the journal; not saved). */
+  noPay?: string;
 }
 
 /** What a hold is opened with, before the signature is asked for. */
@@ -365,6 +369,15 @@ interface ArbitrumRead {
 type Start = 'memory' | 'loaded' | 'fresh' | 'missing' | 'unusable';
 
 const usdc = (e6: bigint) => (Number(e6) / 1e6).toFixed(2);
+
+/**
+ * The least USDC × 1e6 the operator's hl_withdraw may move (contract/src/rescue.rs operator_min_withdraw_e8):
+ * max(10 × the policy's max_transfer_cost_flat_e6, 10 USDC). The contract refuses less with E_SIZE.
+ */
+export function operatorMinWithdrawE6(maxTransferCostFlatE6: number): bigint {
+  const tenFlats = 10n * BigInt(maxTransferCostFlatE6);
+  return tenFlats > 10_000_000n ? tenFlats : 10_000_000n;
+}
 
 export class Rescuer {
   readonly #o: RescuerOptions;
@@ -646,16 +659,26 @@ export class Rescuer {
     const planned = BigInt(Math.round(plan.withdrawUsd! * 1e6));
     let amountE6 = planned;
     // A Bridge2 Transfer names no withdraw: never the exact amount of one that never showed. A cent more while the
-    // plan's room under the rescue cap allows it (the withdraw counts against the cap), else a cent less.
+    // plan's room under the rescue cap allows it (the withdraw counts against the cap), else a cent less, but never
+    // under the contract's operator minimum (operatorMinWithdrawE6), which would refuse it.
     const taken = (x: bigint) => this.#expired.some((e) => e.amountE6 === x - feeE6);
     if (taken(amountE6)) {
       const roomE6 = BigInt(Math.floor(Math.max(0, desk.policy.rescue_cap_usd_per_hour - this.capUsed() - plan.capUsd) * 1e6));
+      const minE6 = operatorMinWithdrawE6(desk.policy.max_transfer_cost_flat_e6);
       let up = amountE6;
       while (taken(up)) up += 10_000n;
       let down = amountE6;
       while (taken(down)) down -= 10_000n;
-      amountE6 = up - planned <= roomE6 ? up : down;
-      if (amountE6 <= feeE6) throw new StepFailed('source', `no hl_withdraw near ${usdc(planned)} USDC both fits the rescue cap and differs from a withdraw that never showed`);
+      if (up - planned <= roomE6) {
+        amountE6 = up;
+      } else if (down >= minE6 && down > feeE6) {
+        amountE6 = down;
+      } else {
+        const why = `no hl_withdraw near ${usdc(planned)} USDC both fits the rescue cap and differs from a withdraw that never showed: `
+          + `${usdc(up)} is over the cap's room and ${usdc(down)} is under the operator's minimum of ${usdc(minE6)} USDC, so it is not bumped down`;
+        this.#log(`rescue ${t.id}: ${why}`);
+        throw new StepFailed('source', why);
+      }
     }
     const expectE6 = amountE6 - feeE6;
     const withdrawUsd = Number(amountE6) / 1e6;
@@ -1019,13 +1042,16 @@ export class Rescuer {
   async #canNeverRun(d: DepositHold, evm: string): Promise<'never-signed' | 'never-paid' | 'dead' | null> {
     const payable = payableUntilMs(d.q);
     const method = d.q.method;
-    // fund_venue: its transaction, known and found, says it all. Not found (never included, or the RPC cannot tell):
-    // the ring below, which releases only what was never counted.
+    // fund_venue: its transaction, known and found, decides only on positive proof. Any transfer to the deposit
+    // address (whatever the amount) is a payment; released only when the call failed, its USDC ft_transfer receipt
+    // failed or on_fund_venue returned false. Final with neither: held for the owner. Not found (never included, or
+    // the RPC cannot tell): the ring below, which releases only what was never counted.
     if (method === 'fund_venue' && d.nearTx !== null && this.#o.nearTx !== undefined) {
       const f = await this.#o.nearTx(d.nearTx).catch(() => null);
       if (f !== null) {
-        if (!f.final) return null;
-        return f.ftTransfers.some((t) => t.to === d.q.depositAddress && t.amount === d.q.amountIn) ? null : 'never-paid';
+        if (!f.final || f.paidTo.includes(d.q.depositAddress) || f.noPay === null) return null;
+        d.noPay = f.noPay;
+        return 'never-paid';
       }
     }
     const near = await this.#readNear();
@@ -1078,9 +1104,12 @@ export class Rescuer {
     const sol = this.#o.solana;
     // No bound or no signature to look for: only the owner can tell.
     if (s === null || s.signature === null || sol === undefined) return null;
-    // Height first: past it, no later block can include the transaction, so a status read after is the last word.
-    if ((await sol.finalizedHeight()) <= s.lastValidBlockHeight) return null;
-    return (await sol.signatureKnown(s.signature)) ? null : 'dead';
+    // Height first: past it, no later block can include the transaction, so a status read after is the last word, if
+    // its node had reached the slot the height was read at (a lagging node's "unknown" proves nothing).
+    const f = await sol.finalized();
+    if (f.height <= s.lastValidBlockHeight) return null;
+    const st = await sol.signatureStatus(s.signature);
+    return !st.known && st.slot !== null && st.slot >= f.slot ? 'dead' : null;
   }
 
   /** The desk's Arbitrum address at the latest block: the head, then the balance at that block. */
@@ -1196,7 +1225,7 @@ export class Rescuer {
             + `and the contract signs that quote only until ${new Date(payableUntilMs(d.q)).toISOString()}, so nothing can pay it`;
           giveBack = true;
         } else if (verdict === 'never-paid') {
-          settled = `rescue ${d.rescueId}'s fund_venue transaction ${d.nearTx} is final and transferred nothing to ${d.q.depositAddress}: `
+          settled = `rescue ${d.rescueId}'s fund_venue transaction ${d.nearTx} is final and paid nothing to ${d.q.depositAddress} (${d.noPay ?? 'proof read'}): `
             + 'nothing can pay it (any USDC it took is back in the desk\'s idle USDC)';
           giveBack = true;
         } else if (verdict === null) {
