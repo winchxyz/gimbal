@@ -1,15 +1,18 @@
-// The rescuer's state file: one per mode and desk, written atomically, read back exactly, and refused (never taken as
-// "no holds") when any field is not what a save writes.
+// The rescuer's state file: one per mode, contract, desk and desk EVM address, written atomically (fsync, then a
+// rename retried on EPERM / EBUSY / EACCES), read back exactly, and refused (never taken as "no holds") when any field
+// is not what a save writes or the file belongs to another contract, desk or address.
 
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import type { RescueState } from './state.ts';
-import { RescueStateStore, parseRescueState, rescueStateFile } from './state.ts';
+import type { RescueIdentity, RescueSnapshot } from './state.ts';
+import { MANUAL_CLEAR, RescueStateStore, parseRescueState, rescueStateFile } from './state.ts';
 
-const state = (): RescueState => ({
+const ID: RescueIdentity = { contractId: 'gimbal.near', deskId: 'alpha', evm: '0x1a642f0e3c3af545e7acbd38b07251b3990914f1' };
+
+const snapshot = (): RescueSnapshot => ({
   version: 1, savedAt: 1_700_000_000_000, unknown: null,
   holds: [{
     why: 'rescue a\'s transfer to dep-1 is PROCESSING at 1Click: it may still deliver', rescueId: 'a', venue: 'hyperliquid',
@@ -19,47 +22,119 @@ const state = (): RescueState => ({
       signedAtMs: 1_700_000_000_000, timeEstimateS: 30,
     },
     sinceMs: 1_700_000_000_000, heldAt: 1_700_000_100_000, reconcileSaid: false, paying: false, unsent: { deadAt: null },
-    authorization: { from: '0xabc', nonce: '0x01', validBefore: 1_700_000_300 }, reservedE6: '20000000', status: 'PROCESSING',
+    authorization: { from: '0xabc', nonce: '0x01', validBefore: 1_700_000_300 }, counter: '7', arbBlock: '123456', reservedE6: '20000000', status: 'PROCESSING',
   }],
-  hl: { strandedE6: '1060000', inFlight: { rescueId: 'b', amountE6: '40000000', baseE6: '1060000', acceptedAt: 1_700_000_000_000, untilMs: 1_700_001_800_000 } },
+  hl: { strandedE6: '1060000', inFlight: { rescueId: 'b', amountE6: '40000000', fromBlock: '123400', acceptedAt: 1_700_000_000_000, untilMs: 1_700_001_800_000 } },
   cap: [{ usd: 41.5, at: 1_700_000_000_000 }],
-  seen: ['ledger-1'],
+  seen: ['ledger-1', 'arb:0xabc:3'],
 });
 
-test('one file per mode and desk; a desk id that is not [a-z0-9-] is refused', () => {
-  assert.equal(rescueStateFile('/s', 'mainnet', 'alpha'), join('/s', 'rescue-mainnet-alpha.json'));
-  assert.notEqual(rescueStateFile('/s', 'mainnet', 'alpha'), rescueStateFile('/s', 'testnet', 'alpha'));
-  assert.throws(() => rescueStateFile('/s', 'mainnet', '../x'), /not \[a-z0-9-\]/);
+const tmp = () => mkdtempSync(join(tmpdir(), 'gimbal-state-'));
+
+test('one file per mode, contract, desk and desk EVM address; ids that are not safe in a file name are refused', () => {
+  assert.equal(rescueStateFile('/s', 'mainnet', ID), join('/s', 'rescue-mainnet-gimbal.near-alpha-0x1a642f0e3c3af545e7acbd38b07251b3990914f1.json'));
+  assert.notEqual(rescueStateFile('/s', 'mainnet', ID), rescueStateFile('/s', 'testnet', ID));
+  assert.notEqual(rescueStateFile('/s', 'mainnet', ID), rescueStateFile('/s', 'mainnet', { ...ID, contractId: 'gimbal2.near' }));
+  assert.notEqual(rescueStateFile('/s', 'mainnet', ID), rescueStateFile('/s', 'mainnet', { ...ID, evm: '0x'.padEnd(42, '2') }));
+  assert.throws(() => rescueStateFile('/s', 'mainnet', { ...ID, deskId: '../x' }), /not \[a-z0-9-\]/);
+  assert.throws(() => rescueStateFile('/s', 'mainnet', { ...ID, contractId: 'a/b' }), /contract id/);
+  assert.throws(() => rescueStateFile('/s', 'mainnet', { ...ID, evm: '0xABC' }), /EVM address/);
 });
 
-test('a save is read back exactly, written through a temporary file that does not stay', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'gimbal-state-'));
-  const store = new RescueStateStore(join(dir, 'sub', 'rescue-mainnet-alpha.json'));
+test('a save is read back exactly with its identity, says how to clear a hold, and leaves no temporary file', () => {
+  const dir = tmp();
+  const store = new RescueStateStore(join(dir, 'sub', 'rescue.json'), ID);
   assert.deepEqual(store.load(), { kind: 'none' });
-  store.save(state());
-  const second = { ...state(), unknown: 'the hl_withdraw of rescue c may have gone out' };
+  store.save(snapshot());
+  const second = { ...snapshot(), unknown: 'the hl_withdraw of rescue c may have gone out' };
   store.save(second);
-  assert.deepEqual(store.load(), { kind: 'loaded', state: second });
-  assert.deepEqual(readdirSync(join(dir, 'sub')), ['rescue-mainnet-alpha.json']);
+  assert.deepEqual(store.load(), { kind: 'loaded', state: { ...second, identity: ID } });
+  assert.deepEqual(readdirSync(join(dir, 'sub')), ['rescue.json']);
+  const raw = JSON.parse(readFileSync(store.path, 'utf8')) as { _readme: string };
+  assert.ok(raw._readme.includes(MANUAL_CLEAR) && /a missing file holds every transfer/.test(raw._readme));
+});
+
+test('a file of another contract, desk or desk EVM address is unusable, never "no holds"', () => {
+  const dir = tmp();
+  const path = join(dir, 'rescue.json');
+  new RescueStateStore(path, ID).save(snapshot());
+  for (const other of [{ ...ID, deskId: 'beta' }, { ...ID, contractId: 'gimbal2.near' }, { ...ID, evm: '0x'.padEnd(42, '2') }]) {
+    const loaded = new RescueStateStore(path, other).load();
+    assert.equal(loaded.kind, 'unusable');
+    assert.match(loaded.kind === 'unusable' ? loaded.problem : '', /belongs to contract gimbal\.near, desk alpha, EVM 0x1a64/);
+  }
+  assert.equal(new RescueStateStore(path, { ...ID, evm: ID.evm.toUpperCase().replace('0X', '0x') }).load().kind, 'loaded', 'the address in any case');
+});
+
+test('a rename Windows refuses for a moment (EBUSY, EPERM, EACCES) is tried again; one that keeps failing throws and keeps the old file', () => {
+  const dir = tmp();
+  const path = join(dir, 'rescue.json');
+  let fails = 2;
+  const busy = new RescueStateStore(path, ID, {
+    rename: (a, b) => {
+      if (fails-- > 0) throw Object.assign(new Error('EBUSY: resource busy or locked, rename'), { code: 'EBUSY' });
+      renameSync(a, b);
+    },
+  });
+  busy.save(snapshot());
+  assert.equal(busy.load().kind, 'loaded', 'saved on the third try');
+  const before = readFileSync(path, 'utf8');
+  let tries = 0;
+  const denied = new RescueStateStore(path, ID, {
+    rename: () => {
+      tries++;
+      throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' });
+    },
+    renameTries: 3,
+  });
+  assert.throws(() => denied.save({ ...snapshot(), unknown: 'x' }), /EPERM/);
+  assert.equal(tries, 3);
+  assert.equal(readFileSync(path, 'utf8'), before, 'the last good state stays');
+  assert.deepEqual(readdirSync(dir), ['rescue.json'], 'no temporary file left');
+  let other = 0;
+  const full = new RescueStateStore(path, ID, {
+    rename: () => {
+      other++;
+      throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+    },
+  });
+  assert.throws(() => full.save(snapshot()), /ENOSPC/);
+  assert.equal(other, 1, 'not a passing refusal: not tried again');
+});
+
+test('a temporary file a crash left next to the state file is removed at load', () => {
+  const dir = tmp();
+  const path = join(dir, 'rescue.json');
+  const store = new RescueStateStore(path, ID);
+  store.save(snapshot());
+  writeFileSync(`${path}.4242.tmp`, '{"half":', 'utf8');
+  writeFileSync(join(dir, 'other.json.1.tmp'), 'not ours', 'utf8');
+  assert.equal(store.load().kind, 'loaded');
+  assert.deepEqual(readdirSync(dir).sort(), ['other.json.1.tmp', 'rescue.json']);
 });
 
 test('anything a save does not write makes the file unusable, never "no holds"', () => {
+  const full = () => JSON.parse(JSON.stringify({ ...snapshot(), identity: ID })) as Record<string, unknown>;
+  const hold0 = (s: Record<string, unknown>) => (s.holds as Record<string, unknown>[])[0]!;
   const bad: [string, (s: Record<string, unknown>) => void, RegExp][] = [
     ['another version', (s) => { s.version = 2; }, /state\.version/],
+    ['no identity', (s) => { delete s.identity; }, /state\.identity/],
     ['a negative amount', (s) => { (s.hl as Record<string, unknown>).strandedE6 = '-1'; }, /strandedE6/],
-    ['a hold with no quote', (s) => { delete (s.holds as Record<string, unknown>[])[0]!.quote; }, /holds\[0\]\.quote/],
-    ['an unknown venue', (s) => { (s.holds as Record<string, unknown>[])[0]!.venue = 'binance'; }, /holds\[0\]\.venue/],
-    ['an authorization without a nonce', (s) => { delete ((s.holds as Record<string, unknown>[])[0]!.authorization as Record<string, unknown>).nonce; }, /authorization\.nonce/],
+    ['a hold with no quote', (s) => { delete hold0(s).quote; }, /holds\[0\]\.quote/],
+    ['an unknown venue', (s) => { hold0(s).venue = 'binance'; }, /holds\[0\]\.venue/],
+    ['an authorization without a nonce', (s) => { delete (hold0(s).authorization as Record<string, unknown>).nonce; }, /authorization\.nonce/],
+    ['a counter that is not an integer', (s) => { hold0(s).counter = 7; }, /holds\[0\]\.counter/],
+    ['a withdraw with no block', (s) => { delete ((s.hl as Record<string, unknown>).inFlight as Record<string, unknown>).fromBlock; }, /inFlight\.fromBlock/],
     ['no cap list', (s) => { delete s.cap; }, /state\.cap/],
     ['a cap entry with no time', (s) => { (s.cap as Record<string, unknown>[])[0]!.at = 'soon'; }, /cap\[0\]\.at/],
   ];
   for (const [name, spoil, why] of bad) {
-    const s = JSON.parse(JSON.stringify(state())) as Record<string, unknown>;
+    const s = full();
     spoil(s);
     assert.throws(() => parseRescueState(s), why, name);
   }
-  const dir = mkdtempSync(join(tmpdir(), 'gimbal-state-'));
-  const store = new RescueStateStore(join(dir, 'rescue-mainnet-alpha.json'));
+  const dir = tmp();
+  const store = new RescueStateStore(join(dir, 'rescue.json'), ID);
   writeFileSync(store.path, '{"version":1,', 'utf8');
   const loaded = store.load();
   assert.equal(loaded.kind, 'unusable');

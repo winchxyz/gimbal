@@ -64,9 +64,14 @@ test('the cap: a source over what is left of the hour is passed over; Hyperliqui
   assert.match(tooBig.notes.join(' '), /hl_withdraw and the bridge both count/);
 });
 
-test('Hyperliquid keeps amount + 1 USDC within the withdrawable', () => {
-  const amountIn = amountInFor('hyperliquid', 'phoenix', 40, true);
+test('Hyperliquid keeps amount + 1 USDC within the withdrawable; the 1 USDC fee goes on the withdraw, not into the bridge', () => {
+  // The bridge is sized as a bridge (no withdraw fee in it); the withdraw is what arrives plus Hyperliquid's 1 USDC.
+  const amountIn = Math.ceil(amountInFor('hyperliquid', 'phoenix', 40, true, false) * 100 - 1e-6) / 100;
   const withdraw = Math.ceil((amountIn + 1) * 100 - 1e-6) / 100;
+  const plan = planRescue(base({ target: { venue: 'phoenix', symbol: 'ETH', amountUsd: 40, marginUsd: 200 }, reserveUsd: 0, freeMargin: { hyperliquid: 500 } }));
+  assert.ok(plan.kind === 'transfer' && plan.from === 'hyperliquid');
+  assert.equal(plan.amountInUsd, amountIn);
+  assert.equal(plan.withdrawUsd, withdraw);
   const just = planRescue(base({ target: { venue: 'phoenix', symbol: 'ETH', amountUsd: 40, marginUsd: 200 }, reserveUsd: 0, freeMargin: { hyperliquid: withdraw + 1 } }));
   assert.equal(just.kind, 'transfer');
   const short = planRescue(base({ target: { venue: 'phoenix', symbol: 'ETH', amountUsd: 40, marginUsd: 200 }, reserveUsd: 0, freeMargin: { hyperliquid: withdraw + 0.99 } }));

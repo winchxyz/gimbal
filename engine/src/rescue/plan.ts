@@ -150,9 +150,9 @@ function fromHyperliquid(to: VenueId, fixed: number | null, capLeft: number, inp
   if (input.hlWithdrawHeld !== undefined && input.hlWithdrawHeld !== null) {
     notes.push(`hyperliquid: no new hl_withdraw: ${input.hlWithdrawHeld}`);
   } else {
-    // A withdraw tops up the shortfall; what arrives is bridged together with what was there.
-    const total = fixed ?? amountInFor('hyperliquid', to, input.target.amountUsd, keyed, true);
-    const arrive = ceilCents(Math.max(total - onArb, onArb > 0 ? HL_TOP_UP_MIN_USD : 0));
+    // A withdraw tops up the shortfall; what arrives is bridged together with what was there. The bridge is sized as
+    // a bridge (its own fees and slippage); Hyperliquid's 1 USDC goes on the withdraw only, never into the bridge.
+    const arrive = ceilCents(Math.max(bridgeNeed - onArb, onArb > 0 ? HL_TOP_UP_MIN_USD : 0));
     const withdraw = ceilCents(arrive + HL_WITHDRAW_FEE_USD);
     const amountIn = Math.round((onArb + arrive) * 100) / 100;
     const fee = expectedFeeUsd('hyperliquid', to, amountIn, keyed, true);

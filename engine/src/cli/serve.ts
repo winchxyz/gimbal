@@ -17,9 +17,9 @@
 //   --minutes <n>       with --record: stop after n minutes and close the file
 //   --state-dir <dir>   GIMBAL_STATE_DIR: where the confirmed engine rules (PUT /strategy), the pair trader's state
 //                       and a live rescuer's holds and cap meter are kept across restarts, one file per mode and desk;
-//                       default engine/state/ (gitignored) for the rules and the rescuer, and for the pair trader the
-//                       per-user state directory outside any checkout (trade/trader-state.ts userStateDir), so another
-//                       worktree or a clean cannot lose it
+//                       default engine/state/ (gitignored) for the rules, and for the pair trader and the live rescuer
+//                       the per-user state directory outside any checkout (trade/trader-state.ts and rescue/lock.ts
+//                       userStateDir), so another worktree or a clean cannot lose them
 //   --once              start, adopt the pair, print what is live, read the desk once, and exit (no HTTP server);
 //                       always alert only: GIMBAL_TRADE and GIMBAL_RESCUE are ignored (it exits after one read, and
 //                       must not leave a close or a transfer half done)
@@ -294,7 +294,8 @@ if (deskSource !== null) {
   const side = contract;
   const servedPair = pair;
   const rescue = await serveRescue({
-    mode, env: rescueEnv, clock, publish, log, risk: () => risk, policy, reducer: () => pair?.reducer() ?? null, stateDir: resolve(stateDir),
+    mode, env: rescueEnv, clock, publish, log, risk: () => risk, policy, reducer: () => pair?.reducer() ?? null,
+    ...(stateDirSet === undefined ? {} : { stateDir: resolve(stateDirSet) }),
     closing: {
       notTrading: () => servedPair?.notTrading() ?? null,
       ...(servedPair?.cancelResting === undefined ? {} : { cancelResting: servedPair.cancelResting }),

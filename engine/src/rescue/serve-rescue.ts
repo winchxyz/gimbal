@@ -7,8 +7,11 @@
 //             key (OPERATOR_PRIVATE_KEY) and the relayer's gas wallet (RELAYER_EVM_PRIVATE_KEY) by name, never printed,
 //             and calls 1Click (ONECLICK_API_KEY optional: it only lowers the fee). Without it the risk engine only
 //             detects (the trigger is published at `detect`) and the owner acts. Its holds and cap meter are kept in
-//             GIMBAL_STATE_DIR (rescue-mainnet-<desk>.json, state.ts); off mainnet nothing real can be held, so the
-//             recorded worlds keep theirs in memory.
+//             GIMBAL_STATE_DIR, by default the per-user state directory (lock.ts: %LOCALAPPDATA%/gimbal/state, else
+//             ~/.local/state/gimbal), outside any checkout, in rescue-mainnet-<contract>-<desk>-<evm>.json (state.ts).
+//             A missing file holds every transfer; GIMBAL_RESCUE_FRESH=1 starts a first run with an empty one. Only one
+//             live rescuer runs per contract and desk on this machine: it starts only with the exclusive lock. Off
+//             mainnet nothing real can be held, so the recorded worlds keep theirs in memory.
 //
 // Live routes wired here: the reserve (fund_venue) and Hyperliquid (hl_withdraw, then evm_usdc_to_intents). Phoenix
 // as a source needs sol_sign_rescue's message (Phoenix withdraw + Ember unwrap + the transfer) built from Phoenix's
@@ -21,6 +24,7 @@ import type { Hex } from 'viem';
 import { NearContractClient } from '../contract/near-client.ts';
 import { NearApiTransport } from '../contract/near-transport.ts';
 import type { DeskView } from '../contract/types.ts';
+import { errorMessage } from '../venues/recorder.ts';
 import { checkContractNetwork, contractEnv } from '../cli/serve-contract.ts';
 import { ArbitrumSubmitter } from '../relayer/arbitrum.ts';
 import { HyperliquidSubmitter } from '../relayer/hyperliquid.ts';
@@ -28,13 +32,15 @@ import { sleep } from '../relayer/tx.ts';
 import type { RiskEngine } from '../risk/engine.ts';
 import type { ReplayDesk } from '../risk/sources.ts';
 import type { Clock } from '../venues/venue.ts';
+import { ViemArbitrumReads } from './arbitrum-chain.ts';
 import { ClosingWatch } from './closing.ts';
 import type { ClosingWatchOptions } from './closing.ts';
 import { HlLedgerLanding } from './hl-ledger.ts';
 import { HttpOneClick } from './oneclick.ts';
 import type { VerifiedQuote } from './oneclick.ts';
+import { acquireRescueLock, rescueLockPath, userStateDir } from './lock.ts';
 import { RecordedOneClick, SimulatedMoney, loadRescueRecording, steadyClock } from './recorded.ts';
-import type { Payer, Reducer, RescueDesk, RescuerOptions } from './rescuer.ts';
+import type { DeskCounters, Payer, Reducer, RescueDesk, RescuerOptions } from './rescuer.ts';
 import { Rescuer } from './rescuer.ts';
 import type { Eip3009Ref } from './state.ts';
 import { RescueStateStore, rescueStateFile } from './state.ts';
@@ -56,7 +62,7 @@ export interface ServeRescueInput {
   /** The policy serve runs with (replay: the policy file, else the recording's). */
   policy: ContractPolicy | null;
   reducer?: () => Reducer | null;
-  /** GIMBAL_STATE_DIR: where a live rescuer keeps its holds and counters across restarts (state.ts). */
+  /** --state-dir or GIMBAL_STATE_DIR when set: where a live rescuer keeps its holds and counters (default: userStateDir). */
   stateDir?: string;
 }
 
@@ -101,7 +107,7 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
     // The replay clock stops at the end of its recording; a rescue's waits must still end.
     const clock = steadyClock(input.clock);
     const oneClick = new RecordedOneClick(recording, clock);
-    const money = new SimulatedMoney(oneClick, clock);
+    const money = new SimulatedMoney(oneClick, clock, recording.desk);
     if (input.replayDesk !== undefined) {
       const desk = input.replayDesk;
       money.onCredit = (venue, usd) => desk.credit(venue, usd);
@@ -126,7 +132,7 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
       },
       landing: money.landing(),
       payers: { reserve: money.payer('fund_venue', targetOf), phoenix: money.payer('sol_sign_rescue', targetOf), arbitrum: money.payer('evm_usdc_to_intents', targetOf) },
-      hlWithdraw: money.hlWithdraw(),
+      hlWithdraw: money.hlWithdraw(), arbitrum: money.arbitrum,
       credit: { phoenix: money.credit() },
       fixedAmountUsd: (from, to) => oneClick.fixedAmountUsd(from, to),
       label: `${mode}: ${oneClick.source}, no funds moved`,
@@ -162,7 +168,13 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
     view = d;
     return d;
   };
-  const evm = async () => (view ?? await readDesk()).evm_address;
+  // The desk's EVM address names the state file; one failed read at start (an RPC hiccup) is tried once more.
+  const first = await readDesk().catch(async (err: unknown) => {
+    log(`rescue: get_desk failed at start (${errorMessage(err)}); trying once more in 2 s`);
+    await sleep(2_000);
+    return readDesk();
+  });
+  const evm = async () => (view ?? first).evm_address;
   const reserve: Payer = {
     method: 'fund_venue',
     // fund_venue is one call: the contract pays the deposit address itself, so signing is sending.
@@ -171,10 +183,6 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
       return { tx, send: async () => ({ tx: [], depositTx: tx[0]?.id ?? '' }) };
     },
   };
-  // An authorization can never run once validBefore has passed (by this clock, less a minute for skew) and USDC still
-  // reads it unused; a read error is not taken as unused.
-  const authorizationNeverRuns = async (a: Eip3009Ref): Promise<boolean> => input.clock.now() > a.validBefore * 1000 + 60_000
-    && !(await arb.authorizationUsed(a.from, a.nonce));
   const arbitrum: Payer = {
     method: 'evm_usdc_to_intents',
     sign: async (q, reason) => {
@@ -185,7 +193,6 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
         // The authorization is public once signed and anyone may submit it until validBefore.
         usableUntilMs: authorization.validBefore * 1000,
         authorization,
-        neverRuns: () => authorizationNeverRuns(authorization),
         send: async () => {
           const tx = await arb.submit(signed, await evm());
           return { tx, depositTx: tx.find((x) => x.chain === 'arbitrum')?.id ?? '' };
@@ -193,10 +200,25 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
       };
     },
   };
-  const store = input.stateDir === undefined ? undefined : new RescueStateStore(rescueStateFile(input.stateDir, mode, deskId));
+  // get_desk_counters comes with C10; until it is deployed the view is absent and the rescuer uses the time bound.
+  const deskCounters = async (): Promise<DeskCounters | null> => {
+    try {
+      const c = await transport.view<{ eip3009_next?: string | number } | null>(cfg.contractId, 'get_desk_counters', { desk_id: deskId });
+      return c === null || c.eip3009_next === undefined ? null : { eip3009Next: BigInt(String(c.eip3009_next)) };
+    } catch (err) {
+      if (/MethodNotFound|MethodResolveError/.test(errorMessage(err))) return null;
+      throw err;
+    }
+  };
+  const stateDir = input.stateDir ?? userStateDir(env);
+  const identity = { contractId: cfg.contractId, deskId, evm: first.evm_address.toLowerCase() };
+  const store = new RescueStateStore(rescueStateFile(stateDir, mode, identity), identity);
+  // One live rescuer per contract and desk: two would each take the other's payments as not held.
+  const lock = acquireRescueLock(rescueLockPath(env, mode, cfg.contractId, deskId));
+  const fresh = env('GIMBAL_RESCUE_FRESH') === '1';
   const rescuer = new Rescuer({
     ...common, clock: input.clock, sleep, oneClick, keyed: apiKey !== null,
-    ...(store === undefined ? {} : { store }), authorizationNeverRuns,
+    store, fresh, deskCounters, arbitrum: new ViemArbitrumReads(arbitrumRpc === undefined ? {} : { rpcUrl: arbitrumRpc }),
     desk: async () => {
       const d = await readDesk();
       return {
@@ -221,13 +243,12 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
         const r = await hl.submit(await contract.hlWithdraw(deskId, usdcDecimal(amountE6)), await evm());
         return { tx: r.tx };
       },
-      arbitrumUsdcE6: async () => arb.usdcBalance(await evm()),
     },
     withdrawals: (venue, paused) => log(`rescue: ${venue} withdrawals ${paused === null ? 'ran' : `refused: ${paused}`}`),
   });
   return {
     rescuer: (t) => rescuer.take(t), closing, running: () => rescuer.runningId,
     summary: `rescue: LIVE on mainnet (GIMBAL_RESCUE=1), operator ${cfg.accountId}, 1Click ${apiKey === null ? 'without a key (+0.2 %)' : 'with a key'}; sources: reserve, Hyperliquid via Arbitrum (Phoenix not wired); `
-      + `holds and the cap meter ${store === undefined ? 'in memory only' : `kept in ${store.path}`}`,
+      + `holds and the cap meter kept in ${store.path}, lock ${lock.path}${fresh ? ' (GIMBAL_RESCUE_FRESH=1)' : ''}`,
   };
 }
