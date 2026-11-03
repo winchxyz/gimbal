@@ -362,21 +362,26 @@ export function loopBook(book: LoopBookPort, publish: (event: StreamEvent) => vo
     protectionClose: (c) => {
       const by = c.by === 'panic_close' ? 'manual' : 'auto';
       const lookup = { reason: c.by, by, startedAt: c.startedAt, at: c.at, symbol: c.symbol } as const;
+      // Nothing in here may throw out of the setImmediate: an uncaught exception there would stop serve.
       setImmediate(() => {
-        const r = c.result;
-        if (r === null) {
-          log(`book: the ${c.by} close left no result (${c.error ?? 'no error'}); the next sync reads its fills from the venues`);
-          book.queueCloseLookup(lookup);
-          return;
-        }
-        const flat = r.legs.every((l) => l.final !== null && toQty(l.final) === 0n);
         try {
-          book.recordOutside({
-            reason: c.by, by, startedAt: c.startedAt, at: c.at, fills: fillsOf([r]), feeUsd: r.feeUsd, tx: r.tx, flat, symbol: r.legs[0].symbol,
-          });
+          const r = c.result;
+          if (r === null) {
+            log(`book: the ${c.by} close left no result (${c.error ?? 'no error'}); the next sync reads its fills from the venues`);
+            book.queueCloseLookup(lookup);
+            return;
+          }
+          try {
+            const flat = r.legs.every((l) => l.final !== null && toQty(l.final) === 0n);
+            book.recordOutside({
+              reason: c.by, by, startedAt: c.startedAt, at: c.at, fills: fillsOf([r]), feeUsd: r.feeUsd, tx: r.tx, flat, symbol: r.legs[0].symbol,
+            });
+          } catch (err) {
+            log(`book: the ${c.by} close was not booked (${errorMessage(err)}); the next sync reads its fills from the venues`);
+            book.queueCloseLookup(lookup);
+          }
         } catch (err) {
-          log(`book: the ${c.by} close was not booked (${errorMessage(err)}); the next sync reads its fills from the venues`);
-          book.queueCloseLookup(lookup);
+          log(`book: the ${c.by} close was not booked and its fills are not looked for (${errorMessage(err)}); check the book by hand (npm run report)`);
         }
       });
     },

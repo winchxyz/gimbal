@@ -481,7 +481,9 @@ export class PositionBook {
         continue;
       }
       const now = this.#clock.now();
-      const r = await this.#readCloseFills(sources, p, l.startedAt - FILL_WINDOW_SLACK_MS, l.at + FILL_WINDOW_SLACK_MS);
+      // Never before the position's last record: fills already booked with it are not counted again.
+      const from = Math.max(l.startedAt - FILL_WINDOW_SLACK_MS, lastRecordAt(p) + 1);
+      const r = await this.#readCloseFills(sources, p, from, l.at + FILL_WINDOW_SLACK_MS);
       if (r.failed.length > 0) {
         const since = l.failingSince ?? now;
         if (now - since >= FILL_READ_GIVE_UP_MS) {

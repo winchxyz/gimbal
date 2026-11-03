@@ -344,6 +344,60 @@ test('a close found outside the loop whose fills cannot be read waits for the ne
   assert.match(fin.summary, /the exit's fills were never read: price and close fees unknown, estimated; final as of/);
 });
 
+test('a booking that throws inside the protection\'s callback is logged, never an uncaught exception (serve survives)', async () => {
+  const log: string[] = [];
+  const uncaught: unknown[] = [];
+  const onUncaught = (err: unknown) => uncaught.push(err);
+  process.on('uncaughtException', onUncaught);
+  try {
+    const port = {
+      record: () => ({ positionId: null, numbers: {} }), adopt: () => '', openWindow: () => null,
+      recordOutside: () => {
+        throw new Error('disk full');
+      },
+      queueCloseLookup: () => {
+        throw new Error('lookup queue broken');
+      },
+    };
+    const w = loopBook(port, () => {}, (l) => log.push(l));
+    // No result: queueCloseLookup throws. A result: recordOutside throws, then queueCloseLookup too. A malformed leg size.
+    w.protectionClose(report('panic_close', null, T0 + 4 * H));
+    w.protectionClose(report('rescue reduce', result('closed', ['0', '0'], [
+      { venue: 'hyperliquid', side: 'BUY', filled: '4000', px: 0.249, fee: 0.15 },
+    ]), T0 + 4 * H));
+    w.protectionClose(report('ADL unwind', result('closed', ['not a size', '0'], []), T0 + 4 * H));
+    await tick();
+    await tick();
+    assert.deepEqual(uncaught, []);
+    const failed = log.filter((l) => /close was not booked and its fills are not looked for \(lookup queue broken\)/.test(l));
+    assert.equal(failed.length, 3, log.join('\n'));
+  } finally {
+    process.off('uncaughtException', onUncaught);
+  }
+});
+
+test('a close lookup never reads before the position\'s last record: fills booked with it are not counted twice', async () => {
+  const at = T0 + 4 * H;
+  const v = venueFills([
+    { venue: 'hyperliquid', side: 'BUY', qty: '1000', avgPx: 0.2495, feeUsd: 0.04, at: at - 20_000 },
+    { venue: 'phoenix', side: 'SELL', qty: '1000', avgPx: 0.2497, feeUsd: 0.01, at: at - 10_000 },
+  ]);
+  const s = bookAt(tempDir(dirs), enterXlm().at, { loopHeld: () => ({ windowId: XLM }), closeFills: v.closeFills });
+  s.book.record(enterXlm());
+  // The close's first fill was booked already (a fill record at its time); the lookup reads after it.
+  s.book.record({
+    kind: 'fill', windowId: XLM, symbol: 'XLM', at: at - 20_000, legs: [{ venue: 'hyperliquid', side: 'BUY', qty: '1000', avgPx: 0.2495, feeUsd: 0.04 }],
+    feeUsd: 0.04, tx: [], forecastNetAprPct: 20, exitReason: 'rescue reduce', rotation: null, by: 'auto', marginMoves: [],
+  });
+  s.book.queueCloseLookup({ reason: 'rescue reduce', by: 'auto', startedAt: at - 30_000, at, symbol: 'XLM' });
+  s.clock.set(at + 30 * 60_000);
+  await s.book.sync();
+  assert.equal(v.asked[0]!.from, at - 20_000 + 1);
+  const p = s.book.summary().positions[0]!;
+  assert.equal(p.partialFills, 2);
+  close(p.feesUsd, -0.25, 'each fill once');
+});
+
 test('the detector checks the position again after its reads: a close booked meanwhile is not booked twice', async () => {
   let book: PositionBook | null = null;
   const closeFills: NonNullable<BookSources['closeFills']> = async (q) => {
