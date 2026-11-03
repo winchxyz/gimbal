@@ -33,7 +33,7 @@ const snapshot = (): RescueSnapshot => ({
     },
     sinceMs: 1_700_000_000_000, heldAt: 1_700_000_100_000, reconcileSaid: true, paying: false, unsent: { deadAt: 1_700_000_200_000 },
     authorization: null, arbBlock: null, scannedTo: null, paidLog: null, reservedE6: '0', status: null,
-    counter: null, nearTx: null, solana: { lastValidBlockHeight: 350_000_000, signature: '5sig' }, creditBaseE6: '400000',
+    counter: null, nearTx: null, solana: { lastValidBlockHeight: 350_000_000, signature: '5sig' }, creditBaseE6: '400000', creditStarted: true,
   }],
   hl: {
     strandedE6: '1060000',
@@ -80,6 +80,8 @@ test('a hold saved before creditBaseE6 existed loads without it; a wrong one mak
   assert.ok(loaded.kind === 'loaded');
   assert.equal(loaded.state.holds[0]!.creditBaseE6, undefined, 'an older hold: no baseline');
   assert.equal(loaded.state.holds[1]!.creditBaseE6, '400000');
+  assert.equal(loaded.state.holds[0]!.creditStarted, undefined, 'an older hold: no credit marker');
+  assert.equal(loaded.state.holds[1]!.creditStarted, true);
   const raw = JSON.parse(readFileSync(store.path, 'utf8')) as { holds: { creditBaseE6?: unknown }[] };
   raw.holds[1]!.creditBaseE6 = -1;
   writeFileSync(store.path, JSON.stringify(raw));

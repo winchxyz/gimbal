@@ -260,3 +260,20 @@ test('Phoenix credit: a stop while the delivery is awaited gives up at once with
   assert.equal(polls, 2);
   assert.equal(signedMessages.length, 0);
 });
+
+test('Phoenix credit: beforeSign runs once, after the delivery and the refusals and before the sign; false means nothing is signed', async () => {
+  const c = chain();
+  c.tokens.set(DESK.usdcAta, 10_000_000n);
+  const { k, signedMessages } = credit(c);
+  const calls: number[] = [];
+  await assert.rejects(k.credit(10_000_000n, 'r', { beforeSign: () => (calls.push(signedMessages.length), false) }), /could not be saved before the deposit: nothing was deposited/);
+  assert.deepEqual(calls, [0]);
+  assert.equal(signedMessages.length, 0);
+  await k.credit(10_000_000n, 'r', { beforeSign: () => (calls.push(signedMessages.length), true) });
+  assert.deepEqual(calls, [0, 0], 'called before the sign');
+  assert.equal(signedMessages.length, 1);
+  // Not reached when the delivery never shows.
+  const empty = credit(chain());
+  await assert.rejects(empty.k.credit(10_000_000n, 'r', { beforeSign: () => (calls.push(-1), true) }), /nothing was deposited/);
+  assert.deepEqual(calls, [0, 0]);
+});

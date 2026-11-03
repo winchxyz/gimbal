@@ -993,8 +993,13 @@ sent there.
 
 A reserve -> Phoenix delivery that reaches the desk's Solana USDC account with no deposit after it (serve stopped
 while 1Click was still working, or the deposit failed) waits there, outside margin. The journal says so in an
-`owner: rescue ... waits on the desk's phoenix wallet` line with the amount; the rescuer never deposits it later.
-Stop serve, run `pair-mainnet fund-phoenix <usdc>` (dry, then `--send`), start serve again.
+`owner: rescue ... is not seen in margin` line with the amount; the rescuer never deposits it later. When that line
+gives the command, stop serve, run `pair-mainnet fund-phoenix <usdc>` (dry, then `--send`), start serve again. The
+command is given only when the deposit was never about to be signed (or Solana proved it ran nothing,
+`NothingExecuted`), the wallet answered within 10 s and still holds the delivery above its baseline, and the state
+was saved. Otherwise the line says "check": "the deposit may have run" means check Phoenix margin and the desk's
+Solana transactions; "the wallet could not be read" (an error or no answer in time), "not on the wallet yet" or "the
+rescuer state could not be saved" mean check the wallet, then Phoenix margin, before depositing anything.
 
 Before the Phoenix routes can run on a desk (the owner runs each step; the dry run below says which are still
 missing):
