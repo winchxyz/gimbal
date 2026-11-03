@@ -970,6 +970,25 @@ anywhere the policy does not allow.
   publishes `decision` events and journals `enter` / `exit` / `rotate` / `veto` / `wait` with numbers and tx links,
   and saves `LoopCounters` next to the trader state. `POST /rotate` and `POST /close` go through the same path.
 
+**Position book** (`engine/src/book/`, serve with a contract desk). Every carried-out enter and exit comes in through
+the loop's `book` sink (`BookRecord`); a pair the loop holds that the book never saw enter is adopted from the loop's
+own `since`. Funding is the venues' own ledgers for the desk's addresses (Hyperliquid and Phoenix `userFunding`),
+never a rate times a size: synced at start (a catch-up from the last read less 6 h) and every hour 5 min after the
+top of the hour; each payment stored once (venue, time, symbol) and counted only on its position's symbol between its
+entry (less 10 min, never before the previous exit there) and its exit, on the leg side its signed size matches. Fill
+fees come from the record, else the venue's fills (`userFillsByTime`, Phoenix trades-history); margin-move fees and
+`addTransfer()` (rescue, fund scripts) are transfer costs; the desk's Hyperliquid `userNonFundingLedgerUpdates` are
+booked to the desk, not a position. Per position: funding per leg and in total, fees, transfers, price (exit fills
+against entry fills, once closed), net, hours held, and the actual APR next to the forecast net APR: (funding + fees +
+price) / leg notional, annualised over the hold (an open one to the last ledger read), transfers left out as the
+forecast leaves margin moves out. Journal: `funding` once per hour per position (each leg and the total in `usd`; an
+hour a leg did not pay is journaled 3 h later with that leg `missing`, a later booking as `late`), `fee` for fees the
+loop's entries do not carry, `deposit` / `withdraw` from the Hyperliquid ledger; the loop's own `enter` / `rotate` /
+`exit` entries get the book's numbers (position, legs, signed `feeUsd`, forecast; at an exit funding, net, actual APR).
+On disk in `GIMBAL_STATE_DIR`: `book-<mode>-<contract>-<desk>.jsonl` (append-only events, each write atomic: a
+temporary file, fsync, rename) and `.summary.json` derived from it. `npm run report [-- --state <dir>] [--sync]` prints
+it; `--sync` reads the ledgers (read only) into that report alone.
+
 ```ts
 export interface VenueReader {           // engine/src/venues/venue.ts; readers only read
   readonly id: VenueId;
