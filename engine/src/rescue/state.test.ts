@@ -13,18 +13,25 @@ import { MANUAL_CLEAR, RescueStateStore, parseRescueState, rescueStateFile } fro
 const ID: RescueIdentity = { contractId: 'gimbal.near', deskId: 'alpha', evm: '0x1a642f0e3c3af545e7acbd38b07251b3990914f1' };
 
 const snapshot = (): RescueSnapshot => ({
-  version: 1, savedAt: 1_700_000_000_000, unknown: null,
+  version: 2, savedAt: 1_700_000_000_000, unknown: null,
   holds: [{
     why: 'rescue a\'s transfer to dep-1 is PROCESSING at 1Click: it may still deliver', rescueId: 'a', venue: 'hyperliquid',
     quote: {
       method: 'evm_usdc_to_intents', quote: '{"amount":"20000000"}', signature: 'ed25519:abc', depositAddress: 'dep-1', amountIn: '20000000', amountInE8: '2000000000',
       amountOut: '1990000000', minAmountOut: '1980000000', minAmountOutE8: '1980000000', destinationAsset: 'x', recipient: '0xabc', costE8: '20000000',
-      signedAtMs: 1_700_000_000_000, timeEstimateS: 30,
+      signedAtMs: 1_700_000_000_000, deadlineMs: 1_700_001_800_000, timeEstimateS: 30,
     },
     sinceMs: 1_700_000_000_000, heldAt: 1_700_000_100_000, reconcileSaid: false, paying: false, unsent: { deadAt: null },
-    authorization: { from: '0xabc', nonce: '0x01', validBefore: 1_700_000_300 }, counter: '7', arbBlock: '123456', reservedE6: '20000000', status: 'PROCESSING',
+    authorization: { from: '0xabc', nonce: '0x01', validBefore: 1_700_000_300 }, arbBlock: '123456', scannedTo: '123500', paidLog: null, reservedE6: '20000000', status: 'PROCESSING',
   }],
-  hl: { strandedE6: '1060000', inFlight: { rescueId: 'b', amountE6: '40000000', fromBlock: '123400', acceptedAt: 1_700_000_000_000, untilMs: 1_700_001_800_000 } },
+  hl: {
+    strandedE6: '1060000',
+    inFlight: {
+      rescueId: 'b', amountE6: '40000000', fromBlock: '123400', acceptedAt: 1_700_000_000_000, untilMs: 1_700_001_800_000, scannedTo: '123450',
+      tx: [{ chain: 'hyperliquid', id: '0xwithdraw', url: 'https://app.hyperliquid.xyz/explorer/tx/0xwithdraw' }],
+    },
+    expired: [{ rescueId: 'z', amountE6: '13000000', fromBlock: '120000', acceptedAt: 1_699_990_000_000, untilMs: 1_699_991_800_000, scannedTo: null, tx: [] }],
+  },
   cap: [{ usd: 41.5, at: 1_700_000_000_000 }],
   seen: ['ledger-1', 'arb:0xabc:3'],
 });
@@ -117,13 +124,16 @@ test('anything a save does not write makes the file unusable, never "no holds"',
   const full = () => JSON.parse(JSON.stringify({ ...snapshot(), identity: ID })) as Record<string, unknown>;
   const hold0 = (s: Record<string, unknown>) => (s.holds as Record<string, unknown>[])[0]!;
   const bad: [string, (s: Record<string, unknown>) => void, RegExp][] = [
-    ['another version', (s) => { s.version = 2; }, /state\.version/],
+    ['another version (a version 1 file)', (s) => { s.version = 1; }, /state\.version/],
+    ['a quote with no deadline', (s) => { delete (hold0(s).quote as Record<string, unknown>).deadlineMs; }, /quote\.deadlineMs/],
     ['no identity', (s) => { delete s.identity; }, /state\.identity/],
     ['a negative amount', (s) => { (s.hl as Record<string, unknown>).strandedE6 = '-1'; }, /strandedE6/],
     ['a hold with no quote', (s) => { delete hold0(s).quote; }, /holds\[0\]\.quote/],
     ['an unknown venue', (s) => { hold0(s).venue = 'binance'; }, /holds\[0\]\.venue/],
     ['an authorization without a nonce', (s) => { delete (hold0(s).authorization as Record<string, unknown>).nonce; }, /authorization\.nonce/],
-    ['a counter that is not an integer', (s) => { hold0(s).counter = 7; }, /holds\[0\]\.counter/],
+    ['a scanned block that is not an integer', (s) => { hold0(s).scannedTo = 7; }, /holds\[0\]\.scannedTo/],
+    ['a withdraw tx on an unknown chain', (s) => { (((s.hl as Record<string, unknown>).inFlight as Record<string, unknown>).tx as Record<string, unknown>[])[0]!.chain = 'btc'; }, /inFlight\.tx\[0\]\.chain/],
+    ['no expired list', (s) => { delete (s.hl as Record<string, unknown>).expired; }, /hl\.expired/],
     ['a withdraw with no block', (s) => { delete ((s.hl as Record<string, unknown>).inFlight as Record<string, unknown>).fromBlock; }, /inFlight\.fromBlock/],
     ['no cap list', (s) => { delete s.cap; }, /state\.cap/],
     ['a cap entry with no time', (s) => { (s.cap as Record<string, unknown>[])[0]!.at = 'soon'; }, /cap\[0\]\.at/],

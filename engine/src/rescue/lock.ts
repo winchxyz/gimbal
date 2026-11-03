@@ -1,10 +1,19 @@
 // One live rescuer per mode, contract and desk on this machine (E9). Two engines on the same desk would each think the
-// other's payments are not held and could pay twice; so the live rescuer starts only with an exclusive lock file at
-// a fixed per-user path (not in a checkout, not in GIMBAL_STATE_DIR, so another worktree or state dir finds the same
-// lock). The file holds the owner's pid: a lock whose pid no longer runs is stale and taken over; any other lock
-// refuses the start. It is removed when the process exits.
+// other's payments are not held and could pay twice; tools/mainnet/hl-return.mjs shares the desk's EIP-3009 counter,
+// its Arbitrum address and the rescue cap, so it takes the same lock for its run.
+//
+// The lock is a listening socket the operating system gives to one process only and takes back when that process
+// dies, however it dies: on Windows the named pipe \\.\pipe\gimbal-rescue-<mode>-<contract>-<desk>; on Linux the same
+// name in the abstract socket namespace (no file); on other POSIX systems a unix socket file in
+// <userStateDir>/locks, named by a hash so the path fits their 104-byte limit. Its name is fixed per user and machine
+// (not in a checkout or in GIMBAL_STATE_DIR), so another worktree or state dir finds the same lock. There is no pid
+// to go stale and no takeover: a second listen fails while the first process lives. The socket file a killed process
+// leaves on those other systems is removed only after a connect to it is refused, i.e. nobody listens there.
 
-import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdirSync, unlinkSync } from 'node:fs';
+import { createConnection, createServer } from 'node:net';
+import type { Server } from 'node:net';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { Mode } from '@gimbal/shared';
@@ -20,71 +29,92 @@ export function userStateDir(env: (name: string) => string | undefined, platform
 }
 
 const SAFE = /^[a-z0-9._-]{1,64}$/;
+const PIPE = '\\\\.\\pipe\\';
 
-/** The lock of `mode`'s live rescuer for one contract and desk. */
-export function rescueLockPath(env: (name: string) => string | undefined, mode: Mode, contractId: string, deskId: string): string {
+/** The lock's name for `mode`'s live rescuer of one contract and desk (see the header). */
+export function rescueLockName(env: (name: string) => string | undefined, mode: Mode, contractId: string, deskId: string, platform: NodeJS.Platform = process.platform): string {
   for (const [what, v] of [['contract id', contractId], ['desk id', deskId]] as const) {
     if (!SAFE.test(v)) throw new Error(`${what} ${JSON.stringify(v)} is not [a-z0-9._-]{1,64}`);
   }
-  return join(userStateDir(env), 'locks', `rescue-${mode}-${contractId}-${deskId}.lock`);
+  const name = `gimbal-rescue-${mode}-${contractId}-${deskId}`;
+  if (platform === 'win32') return `${PIPE}${name}`;
+  if (platform === 'linux') return `\0${name}`;
+  const hash = createHash('sha256').update(name).digest('hex').slice(0, 24);
+  return join(userStateDir(env, platform), 'locks', `rescue-${hash}.sock`);
 }
 
-/** Whether `pid` runs (EPERM: it runs as another user). */
-function alive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === 'EPERM';
-  }
+/** The name as a person reads it (the abstract namespace's leading NUL shown as @). */
+export function lockText(name: string): string {
+  return name.startsWith('\0') ? `@${name.slice(1)} (abstract socket)` : name;
 }
 
 export interface RescueLock {
-  readonly path: string;
-  release(): void;
+  readonly name: string;
+  release(): Promise<void>;
 }
 
-/** Takes the lock or throws why not; `onExit` false leaves removing it to the caller (tests). */
-export function acquireRescueLock(path: string, options: { onExit?: boolean } = {}): RescueLock {
-  mkdirSync(join(path, '..'), { recursive: true });
-  for (let attempt = 0; attempt < 2; attempt++) {
-    let fd: number;
-    try {
-      fd = openSync(path, 'wx');
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw new Error(`the rescuer lock ${path} could not be made: ${(err as Error).message}`);
-      let text = '';
-      try {
-        text = readFileSync(path, 'utf8').trim();
-      } catch {
-        // Removed meanwhile: try again.
-        continue;
-      }
-      const pid = /^\d+$/.test(text) ? Number(text) : null;
-      if (pid === null) throw new Error(`the rescuer lock ${path} holds no pid (${JSON.stringify(text.slice(0, 40))}); if no engine runs for this desk, remove it`);
-      if (pid === process.pid || alive(pid)) throw new Error(`another live rescuer (pid ${pid}) holds ${path}: one engine per desk; stop it first`);
-      // Stale: its process is gone.
-      try {
-        unlinkSync(path);
-      } catch {
-        // Someone else took it over first; the next open says who.
-      }
-      continue;
+const isFileSocket = (name: string) => !name.startsWith('\0') && !name.startsWith(PIPE);
+
+function listen(server: Server, name: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onError = (err: Error) => {
+      server.off('listening', onListening);
+      reject(err);
+    };
+    const onListening = () => {
+      server.off('error', onError);
+      resolve();
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(name);
+  });
+}
+
+/** Whether a process listens on `name`: a connect that is accepted (or that does not answer in time). */
+export function lockHeld(name: string, timeoutMs = 2_000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = createConnection(name);
+    const done = (held: boolean) => {
+      sock.destroy();
+      resolve(held);
+    };
+    sock.setTimeout(timeoutMs, () => done(true));
+    sock.once('connect', () => done(true));
+    sock.once('error', (err: NodeJS.ErrnoException) => done(err.code !== 'ENOENT' && err.code !== 'ECONNREFUSED'));
+  });
+}
+
+/** Takes the lock or throws why not. It is the process's until release() or its death. */
+export async function acquireRescueLock(name: string): Promise<RescueLock> {
+  if (isFileSocket(name)) mkdirSync(join(name, '..'), { recursive: true });
+  // A connection is only someone asking whether the lock is held: it is closed at once.
+  const server = createServer((sock) => sock.destroy());
+  try {
+    await listen(server, name);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== 'EADDRINUSE') throw new Error(`the rescuer lock ${lockText(name)} could not be taken: ${(err as Error).message}`);
+    // A socket file nobody listens on is what a killed process left (Windows and Linux leave nothing).
+    if (!isFileSocket(name) || await lockHeld(name)) {
+      throw new Error(`another live rescuer (or tools/mainnet/hl-return.mjs) holds ${lockText(name)}: one per desk; stop it first`);
     }
-    writeSync(fd, `${process.pid}\n`);
-    closeSync(fd);
-    let released = false;
-    const release = () => {
+    unlinkSync(name);
+    try {
+      await listen(server, name);
+    } catch (again) {
+      throw new Error(`the rescuer lock ${lockText(name)} could not be taken: ${(again as Error).message}`);
+    }
+  }
+  // The lock never keeps the process alive on its own.
+  server.unref();
+  let released = false;
+  return {
+    name,
+    release: async () => {
       if (released) return;
       released = true;
-      try {
-        if (readFileSync(path, 'utf8').trim() === String(process.pid)) unlinkSync(path);
-      } catch {
-        // Already gone.
-      }
-    };
-    if (options.onExit !== false) process.once('exit', release);
-    return { path, release };
-  }
-  throw new Error(`the rescuer lock ${path} could not be taken`);
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
 }

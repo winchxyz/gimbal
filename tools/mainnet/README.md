@@ -194,7 +194,8 @@ Hyperliquid index and szDecimals, Phoenix orderbook, lot and tick, and Orderly `
 300 bps / 1 USD, and nothing unpriced.
 
 `node tools/mainnet/policy.mjs --final` does the same for the final contract, whose oracle assets add XLM
-(OutLayer id `xlm`) and ZEC (`zec.omft.near`), against `tools/mainnet-final-policy.json`, with the same limits.
+(OutLayer id `xlm`) and ZEC (`zec.omft.near`), against `tools/mainnet-final-policy.json`, with the same limits
+but a 50 USD per hour rescue cap (`FINAL_LIMITS` in `venues.mjs`).
 Phoenix lists both; Orderly lists `PERP_ZEC_USDC` but not `PERP_XLM_USDC` (only `PERP_XLM_USDC_mythos`, another
 market), so the final policy trades XLM on Hyperliquid and Phoenix only. The prices step of `checks.mjs` refreshes
 the oracle assets the desk's own policy trades, so it never asks the canary for XLM or ZEC.
@@ -206,7 +207,15 @@ NEAR to Hyperliquid may cost 0.52 USDC (about 2.6 %, most of it the HyperCore wi
 Orderly receiver 0.11 USDC, and without an API key 1Click adds 0.2 %. The old 100 bps / 0.5 USD refused the
 Hyperliquid route outright. At canary sizes (under 33 USDC) the flat 1 USD decides. The same numbers bound the
 hourly budgets: `fund_venue` may spend 4 x max(20 x 3 %, 1) = 4 USD an hour in transfer costs, the rescues
-max(20 x 3 %, 2 x 1) = 2 USD.
+max(20 x 3 %, 2 x 1) = 2 USD (also at the final 50 USD cap: max(50 x 3 %, 2 x 1) = 2 USD).
+
+Why the final cap is 50 USD: the contract counts a Hyperliquid rescue twice, its `hl_withdraw` and then its
+bridge, and Hyperliquid's 1 USDC withdraw fee means the engine sends at least about 10.5 USDC to keep the fees
+under 10 % of what it moves; at 20 USD no rescue out of Hyperliquid fits. Every rescue pays only the desk's own
+pinned addresses, so the cap bounds what rescues may cost in fees, not what could be taken. The smallest rescue
+per route at the final policy, with a 1Click key, in USD of margin the leg needs (engine/src/rescue/plan.ts):
+reserve -> Hyperliquid 2.86, reserve -> Orderly any (it sends at least 6.20), Phoenix -> Hyperliquid 2.86 (up to
+49.40), Hyperliquid -> Phoenix 10.39 (up to 24.31, the cap). A smaller rescue reduces both legs instead.
 
 - **Cost:** none (public reads).
 - **Check:** it ends with `tools/mainnet-canary-policy.json: matches live data` (exit 0). On a difference it
@@ -692,6 +701,12 @@ about 6.3), 0.7 free on the owner for the desk, and 0.3 NEAR free on the owner p
        - bridge, for 24 h, when a 1Click deposit address of an earlier `evm_usdc_to_intents` never got its deposit
          and 1Click does not answer `PENDING_DEPOSIT` for it after the authorization expired (any other status or
          no answer counts as not settled).
+     - **A live rescuer of the desk** (the engine's, `engine/src/rescue/lock.ts`): `--send` of either stage takes
+       the rescuer's lock of the contract and desk for its whole run (on Windows the named pipe
+       `\\.\pipe\gimbal-rescue-mainnet-<contract>-<desk>`) and refuses, before reading anything or signing, while a
+       rescuer holds it. Both sign with the desk's EIP-3009 counter, spend its Arbitrum USDC and count against its
+       rescue cap, so they must not run together; `--again` does not lift this: stop the rescuer first. A rescuer
+       started meanwhile refuses to start. The dry run prints whether the lock is held.
 
      The bridge moves only USDC that is on Arbitrum: with some still in flight, `all` takes what arrived, and a
      typed amount over the balance refuses at `--send`. If the relayer's outcome is unknown, the block names the

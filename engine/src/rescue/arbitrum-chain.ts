@@ -4,22 +4,29 @@
 // The rescuer counts as its own only USDC it can prove came from its hl_withdraws: a Transfer log from Hyperliquid's
 // Bridge2 contract to the desk address, of exactly the amount it expects. A payment of a held deposit is proven by a
 // Transfer log from the desk to the 1Click deposit address. Both are read with the balance at the same block number,
-// so a stale RPC answer can never make one look absent and the other present.
+// so a stale RPC answer can never make one look absent and the other present. The head is ARBITRUM_CONFIRMATIONS
+// blocks behind the latest, with that block's own timestamp: logs of the newest blocks, which a provider may not have
+// indexed yet, are read on the next pass, and a time bound is never judged on a block whose logs were not read.
 //
 // ViemArbitrumReads is the live reader (ARBITRUM_RPC_URL); SimulatedArbitrum is the same chain in memory for the
 // recorded worlds (testnet, replay) and the tests.
 
-import { createPublicClient, http, keccak256, parseAbi, parseAbiItem } from 'viem';
+import { createPublicClient, http, parseAbi, parseAbiItem } from 'viem';
 import type { Hex, PublicClient, Transport } from 'viem';
 import { arbitrum } from 'viem/chains';
 import { redactError } from '../redact.ts';
 import { ARBITRUM_USDC } from '../relayer/arbitrum.ts';
+import { errorMessage } from '../venues/recorder.ts';
 import type { Clock } from '../venues/venue.ts';
 
 /** Hyperliquid's bridge on Arbitrum: every withdraw3 pays out of it. */
 export const HL_BRIDGE2 = '0x2df1c51e09aecf9cacb7bc98cb1742757f163df7';
-/** getLogs asks for at most this many blocks at a time (providers cap the range). */
+/** getLogs asks for at most this many blocks at a time to begin with (providers cap the range). */
 export const LOG_CHUNK_BLOCKS = 10_000n;
+/** A range a provider refuses is halved down to this many blocks; refused below it, the read fails. */
+export const MIN_LOG_CHUNK_BLOCKS = 100n;
+/** The head the rescue reads is this many blocks behind the latest (about 1.25 s of Arbitrum). */
+export const ARBITRUM_CONFIRMATIONS = 5n;
 
 export interface ArbitrumHead {
   number: bigint;
@@ -37,6 +44,7 @@ export interface UsdcTransfer {
 }
 
 export interface ArbitrumReads {
+  /** The block ARBITRUM_CONFIRMATIONS behind the latest, with its timestamp. */
   head(): Promise<ArbitrumHead>;
   usdcBalance(address: string, block: bigint): Promise<bigint>;
   /** USDC Transfer logs from `from` to `to`, blocks fromBlock..toBlock inclusive. */
@@ -45,30 +53,31 @@ export interface ArbitrumReads {
   authorizationUsed(authorizer: string, nonce: string, block: bigint): Promise<boolean>;
 }
 
-/** The contract's EIP-3009 nonce for a desk's `counter`: keccak256(utf8(desk_id) ‖ counter as u64 big-endian). */
-export function eip3009Nonce(deskId: string, counter: bigint): string {
-  const id = new TextEncoder().encode(deskId);
-  const pre = new Uint8Array(id.length + 8);
-  pre.set(id, 0);
-  new DataView(pre.buffer).setBigUint64(id.length, counter, false);
-  return keccak256(pre);
-}
-
 const TRANSFER = parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 value)');
 const USDC_VIEWS = parseAbi([
   'function balanceOf(address account) view returns (uint256)',
   'function authorizationState(address authorizer, bytes32 nonce) view returns (bool)',
 ]);
 
+/** A getLogs refusal that names the range or the result size (each provider words it its own way). */
+const RANGE_REFUSAL = /block range|range (is )?too (large|wide|big)|exceed|too many|more than \d+|limit|response size|-32005|-32602/i;
+
 export class ViemArbitrumReads implements ArbitrumReads {
   readonly #client: PublicClient;
   readonly #token: Hex;
   readonly #rpcUrl: string | undefined;
+  /** The range getLogs is asked for: halved when a provider refuses one, kept for the next reads. */
+  #chunk = LOG_CHUNK_BLOCKS;
 
   constructor(options: { rpcUrl?: string; transport?: Transport } = {}) {
     this.#client = createPublicClient({ chain: arbitrum, transport: options.transport ?? http(options.rpcUrl) }) as PublicClient;
     this.#token = ARBITRUM_USDC.mainnet.token;
     this.#rpcUrl = options.rpcUrl;
+  }
+
+  /** The range getLogs is asked for now, blocks. */
+  get chunkBlocks(): bigint {
+    return this.#chunk;
   }
 
   async #safe<T>(p: Promise<T>): Promise<T> {
@@ -80,9 +89,10 @@ export class ViemArbitrumReads implements ArbitrumReads {
   }
 
   async head(): Promise<ArbitrumHead> {
-    const b = await this.#safe(this.#client.getBlock({ blockTag: 'latest' }));
-    if (b.number === null) throw new Error('arbitrum: the latest block has no number');
-    return { number: b.number, timestampS: Number(b.timestamp) };
+    const latest = await this.#safe(this.#client.getBlockNumber({ cacheTime: 0 }));
+    const number = latest > ARBITRUM_CONFIRMATIONS ? latest - ARBITRUM_CONFIRMATIONS : 0n;
+    const b = await this.#safe(this.#client.getBlock({ blockNumber: number }));
+    return { number, timestampS: Number(b.timestamp) };
   }
 
   usdcBalance(address: string, block: bigint): Promise<bigint> {
@@ -95,28 +105,44 @@ export class ViemArbitrumReads implements ArbitrumReads {
 
   async transfers(from: string, to: string, fromBlock: bigint, toBlock: bigint): Promise<UsdcTransfer[]> {
     const out: UsdcTransfer[] = [];
-    for (let a = fromBlock; a <= toBlock; a += LOG_CHUNK_BLOCKS) {
-      const b = a + LOG_CHUNK_BLOCKS - 1n < toBlock ? a + LOG_CHUNK_BLOCKS - 1n : toBlock;
-      const logs = await this.#safe(this.#client.getLogs({ address: this.#token, event: TRANSFER, args: { from: from as Hex, to: to as Hex }, fromBlock: a, toBlock: b }));
+    let a = fromBlock;
+    while (a <= toBlock) {
+      const b = a + this.#chunk - 1n < toBlock ? a + this.#chunk - 1n : toBlock;
+      let logs;
+      try {
+        logs = await this.#safe(this.#client.getLogs({ address: this.#token, event: TRANSFER, args: { from: from as Hex, to: to as Hex }, fromBlock: a, toBlock: b }));
+      } catch (err) {
+        // A range the provider will not serve: the same start again with half of it, never below the floor.
+        if (!RANGE_REFUSAL.test(errorMessage(err)) || this.#chunk <= MIN_LOG_CHUNK_BLOCKS) throw err;
+        const half = this.#chunk / 2n;
+        this.#chunk = half < MIN_LOG_CHUNK_BLOCKS ? MIN_LOG_CHUNK_BLOCKS : half;
+        continue;
+      }
       for (const l of logs) {
         if (l.blockNumber === null || l.transactionHash === null || l.logIndex === null) continue;
         out.push({ id: `${l.transactionHash}:${l.logIndex}`, from: String(l.args.from).toLowerCase(), to: String(l.args.to).toLowerCase(), value: l.args.value ?? 0n, block: l.blockNumber });
       }
+      a = b + 1n;
     }
     return out;
   }
 }
 
+const ZERO = '0x0000000000000000000000000000000000000000';
+
 /**
- * Arbitrum in memory: a block every 250 ms of the clock, USDC balances, Transfer logs and used authorizations. A
- * transfer may be scheduled for a later time (a withdraw that shows 231 s after it was accepted).
+ * Arbitrum in memory: a block every 250 ms of the clock, USDC balances with their history, Transfer logs and used
+ * authorizations, each read at the block asked. A transfer may be scheduled for a later time (a withdraw that shows
+ * 231 s after it was accepted).
  */
 export class SimulatedArbitrum implements ArbitrumReads {
   readonly #clock: Clock;
-  readonly #balances = new Map<string, bigint>();
+  /** Per address, its balance after each change, oldest first. */
+  readonly #balances = new Map<string, { block: bigint; value: bigint }[]>();
   readonly #logs: UsdcTransfer[] = [];
   readonly #scheduled: { at: number; from: string; to: string; value: bigint }[] = [];
-  readonly used = new Set<string>();
+  /** `${authorizer}:${nonce}` -> the block it was used in. */
+  readonly #used = new Map<string, bigint>();
   #n = 0;
   /** Reads fail while set (an RPC that is down). */
   down: string | null = null;
@@ -131,29 +157,52 @@ export class SimulatedArbitrum implements ArbitrumReads {
 
   /** A USDC transfer now (`from` null: minted, as from another chain), or at `atMs`. */
   transfer(from: string | null, to: string, value: bigint, atMs?: number): void {
-    const f = (from ?? '0x0000000000000000000000000000000000000000').toLowerCase();
+    const f = (from ?? ZERO).toLowerCase();
     if (atMs !== undefined && atMs > this.#clock.now()) {
       this.#scheduled.push({ at: atMs, from: f, to: to.toLowerCase(), value });
       return;
     }
+    this.#settle();
     this.#apply(f, to.toLowerCase(), value, this.#clock.now());
   }
 
   /** Sets an address's balance with no log (USDC moved by a flow the test does not model). */
   setBalance(address: string, value: bigint): void {
     this.#settle();
-    this.#balances.set(address.toLowerCase(), value);
+    this.#set(address.toLowerCase(), value, this.blockAt(this.#clock.now()));
+  }
+
+  /** The EIP-3009 authorization was used (transferWithAuthorization ran), now or at `atMs`. */
+  markUsed(authorizer: string, nonce: string, atMs?: number): void {
+    this.#used.set(`${authorizer.toLowerCase()}:${nonce.toLowerCase()}`, this.blockAt(atMs ?? this.#clock.now()));
   }
 
   balanceNow(address: string): bigint {
     this.#settle();
-    return this.#balances.get(address.toLowerCase()) ?? 0n;
+    return this.#balanceAt(address.toLowerCase(), this.blockAt(this.#clock.now()));
+  }
+
+  #balanceAt(address: string, block: bigint): bigint {
+    const h = this.#balances.get(address) ?? [];
+    let v = 0n;
+    for (const e of h) {
+      if (e.block > block) break;
+      v = e.value;
+    }
+    return v;
+  }
+
+  #set(address: string, value: bigint, block: bigint): void {
+    const h = this.#balances.get(address) ?? [];
+    h.push({ block, value });
+    this.#balances.set(address, h);
   }
 
   #apply(from: string, to: string, value: bigint, at: number): void {
-    if (from !== '0x0000000000000000000000000000000000000000' && from !== HL_BRIDGE2) this.#balances.set(from, (this.#balances.get(from) ?? 0n) - value);
-    this.#balances.set(to, (this.#balances.get(to) ?? 0n) + value);
-    this.#logs.push({ id: `0xsim${++this.#n}:0`, from, to, value, block: this.blockAt(at) });
+    const block = this.blockAt(at);
+    if (from !== ZERO && from !== HL_BRIDGE2) this.#set(from, this.#balanceAt(from, block) - value, block);
+    this.#set(to, this.#balanceAt(to, block) + value, block);
+    this.#logs.push({ id: `0xsim${++this.#n}:0`, from, to, value, block });
   }
 
   #settle(): void {
@@ -172,13 +221,14 @@ export class SimulatedArbitrum implements ArbitrumReads {
 
   async head(): Promise<ArbitrumHead> {
     this.#check();
-    const now = this.#clock.now();
-    return { number: this.blockAt(now), timestampS: Math.floor(now / 1000) };
+    const latest = this.blockAt(this.#clock.now());
+    const number = latest - ARBITRUM_CONFIRMATIONS;
+    return { number, timestampS: Math.floor(Number(number * 250n) / 1000) };
   }
 
-  async usdcBalance(address: string): Promise<bigint> {
+  async usdcBalance(address: string, block: bigint): Promise<bigint> {
     this.#check();
-    return this.#balances.get(address.toLowerCase()) ?? 0n;
+    return this.#balanceAt(address.toLowerCase(), block);
   }
 
   async transfers(from: string, to: string, fromBlock: bigint, toBlock: bigint): Promise<UsdcTransfer[]> {
@@ -186,8 +236,9 @@ export class SimulatedArbitrum implements ArbitrumReads {
     return this.#logs.filter((l) => l.from === from.toLowerCase() && l.to === to.toLowerCase() && l.block >= fromBlock && l.block <= toBlock);
   }
 
-  async authorizationUsed(authorizer: string, nonce: string): Promise<boolean> {
+  async authorizationUsed(authorizer: string, nonce: string, block: bigint): Promise<boolean> {
     this.#check();
-    return this.used.has(`${authorizer.toLowerCase()}:${nonce.toLowerCase()}`);
+    const at = this.#used.get(`${authorizer.toLowerCase()}:${nonce.toLowerCase()}`);
+    return at !== undefined && at <= block;
   }
 }

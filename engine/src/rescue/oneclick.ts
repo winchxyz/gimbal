@@ -211,6 +211,8 @@ export interface VerifiedQuote {
   /** amountIn − minAmountOut, USD × 1e8: what the contract counts as the transfer's cost. */
   costE8: bigint;
   signedAtMs: number;
+  /** The quote's deadline, ms: the contract refuses it from then on, as it does an hour after signedAtMs (payableUntilMs). */
+  deadlineMs: number;
   /** 1Click's own estimate, s. */
   timeEstimateS: number | null;
 }
@@ -293,8 +295,17 @@ export function verifyQuote(response: QuoteResponse, method: QuotedMethod, ctx: 
   const te = response.quote.timeEstimate;
   return {
     method, quote, signature: response.signature, depositAddress: f.depositAddress, amountIn, amountInE8, amountOut, minAmountOut, minAmountOutE8,
-    destinationAsset: String(dest), recipient: String(to), costE8, signedAtMs, timeEstimateS: typeof te === 'number' ? te : null,
+    destinationAsset: String(dest), recipient: String(to), costE8, signedAtMs, deadlineMs, timeEstimateS: typeof te === 'number' ? te : null,
   };
+}
+
+/**
+ * Until when the contract pays a verified quote, ms of NEAR block time: the earlier of its deadline and an hour after
+ * 1Click signed it (verify_quote and check_quote_age in contract/core/src/oneclick.rs). From then on no call, however
+ * late it lands, gets it signed.
+ */
+export function payableUntilMs(q: Pick<VerifiedQuote, 'deadlineMs' | 'signedAtMs'>): number {
+  return Math.min(q.deadlineMs, q.signedAtMs + QUOTE_MAX_AGE_MS);
 }
 
 /** The most one transfer may cost under the policy, USD × 1e8: max(amountIn × bps, flat). */

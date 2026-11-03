@@ -28,16 +28,24 @@
 //   - sent, and not settled by 1Click in time, or settled but not yet seen in the ledger: held until its deposit
 //     address reaches a final 1Click status and, on SUCCESS, the delivery is found (journaled late);
 //   - not known to be sent (the send failed, a crash, or an OutcomeUnknown while signing or sending): its signature
-//     may be public and usable, so it is held until 1Click settles it, or until the chain shows it can never run
-//     (#canNeverRun) and 1Click, UNUSED_GRACE_MS later and with the chain read again, still saw no deposit:
-//       EIP-3009, authorization known: the latest Arbitrum block is past validBefore and authorizationState, read at
-//         that block, is false;
-//       EIP-3009, authorization not known: the desk's eip3009_next (get_desk_counters) read before signing has not
-//         moved (never signed, released SIGN_SETTLE_MS after); or it moved and authorizationState of that nonce is
-//         false, or the view is absent; then also no USDC Transfer from the desk to the deposit address since the block
-//         before signing, and the latest Arbitrum block past the quote's 1 h age bound plus the 300 s validity;
-//       fund_venue and sol_sign_rescue: the contract signs nothing on a quote over 1 h old, and a Solana blockhash
-//         lasts about a minute: past the quote's age bound plus SIGN_SETTLE_MS;
+//     may be public and usable, so it is held until 1Click settles it, or until the chain proves it can never run
+//     (#canNeverRun). Only chain facts count, never how long ago it was asked: a congested NEAR call stays valid for
+//     about a day and may land long after the engine gave up on it. The bound is the quote's: the contract signs it
+//     only before payableUntilMs (the earlier of its deadline and an hour after 1Click signed it), whenever the call
+//     lands. A USDC Transfer from the desk to the deposit address since the block before signing proves it ran (held
+//     until 1Click settles it). Otherwise:
+//       never signed (released at once): get_desk_counters' deposit ring, read at a final NEAR block whose time is
+//         past payableUntilMs + CHAIN_MARGIN_S, does not hold the deposit address, and still has a slot empty or
+//         older than the hold (so it was not pushed out by 32 later rescues);
+//       signed, and dead (released once 1Click, UNUSED_GRACE_MS later and with the chain read again, still saw no
+//         deposit): the ring holds it, paid at P: EIP-3009 is valid until P + 300 s, so the Arbitrum head (whose logs
+//         were read) past that plus CHAIN_MARGIN_S; a Solana transaction carries a blockhash of before P, so NEAR time
+//         past P + SIGN_SETTLE_MS. A signed EIP-3009 authorization the rescuer has: the head past its validBefore +
+//         CHAIN_MARGIN_S and authorizationState there false;
+//       without the view (before C10), a ring that turned over, or fund_venue (whose ring has no view): the latest
+//         possible signature is just before payableUntilMs, so Arbitrum time (EIP-3009, with no Transfer to the
+//         deposit address) or NEAR time (the others) past payableUntilMs + NO_VIEW_SETTLE_MS (the 300 s validity, the
+//         MPC network's answer and margin) is dead;
 //   - an OutcomeUnknown of an hl_withdraw or of a Phoenix credit: held until the owner reconciles it and clears
 //     `unknown` in the state file (MANUAL_CLEAR) and restarts.
 // A hold still open after RECONCILE_AFTER_MS is journaled once as "reconcile needed" with its deposit address,
@@ -50,18 +58,26 @@
 // payment can never run; the count never exceeds the address's balance, read at the same block as the logs. A
 // withdraw only tops up what is there, so no amount left on Arbitrum blocks a withdraw. A withdraw accepted but not
 // yet seen holds new withdraws (not bridges of what is there) until it arrives or WITHDRAW_IN_FLIGHT_MS after it was
-// accepted; then it is journaled once as "reconcile needed" and no longer taken as on its way. Arbitrum that cannot be
-// read stops the Hyperliquid source.
+// accepted; then it is journaled once as "reconcile needed" (with its Hyperliquid transactions) and no longer taken as
+// on its way. A Bridge2 Transfer names no withdraw, so for EXPIRED_KEPT_MS no new withdraw brings the exact amount of
+// one that never showed (it takes a cent more): a late Transfer of the old one is never taken for the new one.
+// Arbitrum that cannot be read stops the Hyperliquid source. Logs are read only past the last block read (per hold
+// and per withdraw), so a long wait does not read the same range again.
 //
-// With a state store (mainnet) the holds, the OutcomeUnknown, the Arbitrum USDC and the withdraw in flight, the cap
-// meter and the matched ledger entries and logs are saved (state.ts) after every change and loaded at start; each
-// loaded hold is read again at 1Click and on chain before any new plan. The save before a signature or a withdraw
-// must succeed or neither is asked for; a later save that fails is logged, and what it held stays held in memory. A
-// missing state file is never a first run: like an unusable one, every transfer is then held (reduces still run) and
-// the cap starts full, until the owner reconciles and starts once with `fresh` (GIMBAL_RESCUE_FRESH=1), which writes
-// an empty state. The cap meter is this process's: when nothing is loaded (or without a store, on mainnet) it starts
-// as if the whole hourly cap were used just before the engine started (the contract's counters have no view), and
-// the first line of the run says so.
+// With a state store (mainnet) the holds, the OutcomeUnknown, the Arbitrum USDC and the withdraws, the cap meter and
+// the matched ledger entries and logs are saved (state.ts) after every change and loaded at start; each loaded hold is
+// read again at 1Click and on chain before any new plan. The save before a signature or a withdraw must succeed or
+// neither is asked for; a later save that fails is logged, and what it held stays held in memory. A missing state
+// file is never a first run: like an unusable one, every transfer is then held (reduces still run) and the cap starts
+// full, until the owner reconciles and starts once with `fresh` (GIMBAL_RESCUE_FRESH=<contract>/<desk>, refused by
+// serve while the contract counted a rescue of the desk in the last hour), which writes an empty state. The state
+// belongs to one desk EVM address: when get_desk names another one mid-run, every transfer is held until a restart.
+// The cap meter is this process's: when nothing is loaded (or without a store, on mainnet) it starts as if the whole
+// hourly cap were used just before the engine started, and the first line of the run says so.
+//
+// The rescue sizes each route takes at the desk's policy (plan.ts rescueSizes) are logged at the first rescue and
+// named in the journal when a rescue ends in a reduce or in nothing. At the final mainnet policy (a 50 USD cap) with a
+// 1Click key: from 2.86 USD into Hyperliquid, 10.39 to 24.31 USD out of Hyperliquid (none at a 20 USD cap).
 //
 // One rescue runs at a time: a trigger that comes while one runs ends at once as failed (tried again after the
 // backoff); runningId tells the risk engine not to count a running rescue as lapsed. A desk that is closing
@@ -76,12 +92,14 @@ import { abs, floorToLot, qtyString } from '../trade/lots.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { Clock } from '../venues/venue.ts';
 import type { ArbitrumHead, ArbitrumReads } from './arbitrum-chain.ts';
-import { HL_BRIDGE2, eip3009Nonce } from './arbitrum-chain.ts';
+import { HL_BRIDGE2 } from './arbitrum-chain.ts';
+import type { NearRead } from './near-chain.ts';
+import { depositKey, ringEntry, ringHolds } from './near-chain.ts';
 import type { DeskAddresses, OneClickApi, QuoteRequest, QuotedMethod, QuoteResponse, VerifiedQuote } from './oneclick.ts';
-import { ASSETS, FINAL_STATUSES, QUOTE_MAX_AGE_MS, deliveryHashes, e8Text, unitsOf, verifyQuote } from './oneclick.ts';
+import { ASSETS, FINAL_STATUSES, deliveryHashes, e8Text, payableUntilMs, unitsOf, verifyQuote } from './oneclick.ts';
 import type { Plan, Source } from './plan.ts';
-import { CapLedger, HL_WITHDRAW_FEE_USD, SLIPPAGE_BPS, planRescue } from './plan.ts';
-import type { Eip3009Ref, RescueSnapshot, RescueState, RescueStateStore } from './state.ts';
+import { CapLedger, HL_WITHDRAW_FEE_USD, SLIPPAGE_BPS, planRescue, rescueSizes, sizeText } from './plan.ts';
+import type { Eip3009Ref, RescueSnapshot, RescueState, RescueStateStore, SavedWithdraw } from './state.ts';
 import { MANUAL_CLEAR, RESCUE_STATE_VERSION, loadQuote, saveQuote } from './state.ts';
 
 /** How often 1Click's status, the Arbitrum logs and the target's ledger are read while a rescue waits. */
@@ -104,13 +122,21 @@ export const WITHDRAW_IN_FLIGHT_MS = 30 * 60_000;
 export const SEEN_KEPT = 500;
 /** The contract's EIP-3009 authorization is valid until its signing block's time plus this, s. */
 export const EIP3009_VALIDITY_S = 300;
-/**
- * A NEAR call sent before a crash has run or been dropped by then, and a Solana transaction's blockhash has expired:
- * how long after the age bound (or after asking, for an unmoved counter) nothing more of a payment can start.
- */
+/** A Solana rescue the ring shows paid at P carries a blockhash of before P: long expired at NEAR time P + this. */
 export const SIGN_SETTLE_MS = 10 * 60_000;
-/** Arbitrum time is compared with this margin (block timestamps against clocks elsewhere, a short reorg). */
+/**
+ * With no ring to read: past the quote's payableUntilMs by this, on Arbitrum (EIP-3009) or NEAR time, a signature
+ * the contract made just before then can no longer run (validBefore is its block time + 300 s, then the MPC
+ * network's answer and margin).
+ */
+export const NO_VIEW_SETTLE_MS = 15 * 60_000;
+/** Chain times are compared with this margin (block timestamps against each other and against clocks elsewhere). */
 export const CHAIN_MARGIN_S = 60;
+/** The engine's clock against NEAR block time, at most: a ring slot older than a hold by this was paid before it. */
+export const CLOCK_SKEW_MS = 5 * 60_000;
+/** A withdraw that never showed blocks a new withdraw of its exact amount this long, and at most EXPIRED_KEPT of them. */
+export const EXPIRED_KEPT_MS = 24 * 3_600_000;
+export const EXPIRED_KEPT = 10;
 
 export type RescueStep = RescueProgress['step'];
 
@@ -142,11 +168,6 @@ export interface Payer {
 export interface HlWithdrawPort {
   /** Signs and posts withdraw3 of `amountE6` (USDC × 1e6); resolves once Hyperliquid accepted it. */
   withdraw(amountE6: bigint, reason: string): Promise<{ tx: TxRef[] }>;
-}
-
-/** The contract's per-desk counters (get_desk_counters, C10): the next EIP-3009 counter it signs with. */
-export interface DeskCounters {
-  eip3009Next: bigint;
 }
 
 /** After 1Click delivered to a venue's wallet: what moves it into that venue's margin (Phoenix: a deposit). */
@@ -195,8 +216,11 @@ export interface RescuerOptions {
   hlWithdraw?: HlWithdrawPort;
   /** The desk's Arbitrum address as the Hyperliquid route and the EIP-3009 holds read it; absent: no Hyperliquid source. */
   arbitrum?: ArbitrumReads;
-  /** get_desk_counters; resolves null while the contract has no such view (then the time bound is used). */
-  deskCounters?: () => Promise<DeskCounters | null>;
+  /**
+   * A final NEAR block's time and get_desk_counters at that block (near-chain.ts; counters null before C10). Absent
+   * (the recorded worlds): the clock is NEAR time and there is no ring.
+   */
+  near?: () => Promise<NearRead>;
   credit?: Partial<Record<VenueId, CreditPort>>;
   /** The pair trader holding both legs; absent: no reduce. */
   reducer?: () => Reducer | null;
@@ -214,7 +238,7 @@ export interface RescuerOptions {
   seedCap?: boolean;
   /** Where the holds and counters are kept across restarts (see the header); absent: in memory only. */
   store?: RescueStateStore;
-  /** A first run (GIMBAL_RESCUE_FRESH=1): with no state file, start from an empty one. Ignored when a file exists. */
+  /** A first run (GIMBAL_RESCUE_FRESH, checked by serve): with no state file, start from an empty one. Ignored when a file exists. */
   fresh?: boolean;
   /** Said in every journal line of a rescue that moves nothing real (testnet, replay). */
   label?: string | null;
@@ -260,10 +284,12 @@ interface DepositHold {
   /** Not known to be sent: bounded by #canNeverRun; deadAt is when the chain last began to read it as never able to run. */
   unsent: { deadAt: number | null } | null;
   authorization: Eip3009Ref | null;
-  /** The desk's eip3009_next before signing (EIP-3009 only; null: not read). */
-  counter: bigint | null;
   /** The Arbitrum head before signing, where a payment's Transfer log would start (EIP-3009 only). */
   arbBlock: bigint | null;
+  /** The last block its Transfer logs were read up to; the next read starts after it. */
+  scannedTo: bigint | null;
+  /** The Transfer log of its payment, once seen: it ran, so only 1Click settles it. */
+  paidLog: string | null;
   /** The rescuer's own Arbitrum USDC set aside for it, × 1e6: given back if it can never run. */
   reservedE6: bigint;
   /** 1Click's last status for it. */
@@ -279,6 +305,10 @@ interface InFlight {
   fromBlock: bigint;
   acceptedAt: number;
   untilMs: number;
+  /** The last block its Bridge2 Transfer was looked for up to. */
+  scannedTo: bigint | null;
+  /** Its Hyperliquid transactions, for the owner's reconcile. */
+  tx: TxRef[];
 }
 
 /** The desk's Arbitrum address at one block. */
@@ -309,6 +339,13 @@ export class Rescuer {
   /** Arbitrum USDC the rescuer's own hl_withdraws brought and it has not bridged or set aside, × 1e6. */
   #strandedE6 = 0n;
   #inFlight: InFlight | null = null;
+  /** Withdraws that never showed (newest last): no new withdraw brings one's exact amount (see the header). */
+  #expired: InFlight[] = [];
+  /** The desk EVM address the Arbitrum state belongs to: the state file's, else the first get_desk's. */
+  #evm: string | null;
+  /** get_desk named another EVM address: every transfer is held until a restart. */
+  #evmProblem: string | null = null;
+  #minimumsSaid = false;
   /** Ledger entry ids and Arbitrum log ids (`arb:` + id) already matched. */
   readonly #seen = new Set<string>();
   #seq = 0;
@@ -323,6 +360,7 @@ export class Rescuer {
     }
     this.#o = options;
     this.#startedAt = options.clock.now();
+    this.#evm = options.store?.identity.evm ?? null;
     const seed = options.seedCap ?? options.mode === 'mainnet';
     const store = options.store;
     const capLine = seed ? ' The rescue cap counts as used in full for the first hour (the contract\'s counters have no view)' : '';
@@ -343,11 +381,11 @@ export class Rescuer {
         + `${this.#unknown === null ? '' : ', an unknown outcome'}, ${usdc(this.#strandedE6)} USDC of its own on Arbitrum`
         + `${this.#inFlight === null ? '' : `, an hl_withdraw of rescue ${this.#inFlight.rescueId} on its way`}, ${this.capUsed().toFixed(2)} USD of the rescue cap used; `
         + 'each hold is read again at 1Click and on chain before the next plan'
-        + `${options.fresh === true ? '. GIMBAL_RESCUE_FRESH=1 is ignored: a state file exists' : ''}`);
+        + `${options.fresh === true ? '. GIMBAL_RESCUE_FRESH is ignored: a state file exists' : ''}`);
     } else if (loaded.kind === 'none' && options.fresh === true) {
       this.#start = 'fresh';
       this.#seedFull = seed;
-      this.#log(`rescuer first run (GIMBAL_RESCUE_FRESH=1): there is no state file at ${store.path}, so an empty one is written now; anything an earlier run held is not known here.${capLine}`);
+      this.#log(`rescuer first run (GIMBAL_RESCUE_FRESH): there is no state file at ${store.path}, so an empty one is written now; anything an earlier run held is not known here.${capLine}`);
       this.#persist();
     } else {
       this.#start = loaded.kind === 'none' ? 'missing' : 'unusable';
@@ -357,8 +395,8 @@ export class Rescuer {
         ? `rescuer state missing: there is no file at ${store.path}. A missing file is not taken as a first run (another checkout, a cleaned directory or a lost file may hide a parked payment)`
         : `rescuer state unusable: ${loaded.problem}. It is not taken as "no holds"`;
       const fix = loaded.kind === 'none'
-        ? 'then start once with GIMBAL_RESCUE_FRESH=1 to begin with an empty state'
-        : 'then repair the file, or move it aside and start once with GIMBAL_RESCUE_FRESH=1';
+        ? `then start once with ${this.#freshEnv()} to begin with an empty state`
+        : `then repair the file, or move it aside and start once with ${this.#freshEnv()}`;
       this.#log(`${what}: every transfer is held (only reduces run) and nothing is written there; ${reconcile}, ${fix}.${capLine}`);
     }
   }
@@ -371,8 +409,8 @@ export class Rescuer {
   /** Why transfers are held, or null. */
   get held(): string | null {
     const state = this.#stateProblem === null ? null
-      : `the rescuer's state file could not be used (${this.#stateProblem}), so what an earlier run held is unknown; reconcile, then repair it or start once with GIMBAL_RESCUE_FRESH=1`;
-    const all = [state, this.#unknown, ...this.#deposits.map((d) => d.why)].filter((x): x is string => x !== null);
+      : `the rescuer's state file could not be used (${this.#stateProblem}), so what an earlier run held is unknown; reconcile, then repair it or start once with ${this.#freshEnv()}`;
+    const all = [state, this.#evmProblem, this.#unknown, ...this.#deposits.map((d) => d.why)].filter((x): x is string => x !== null);
     return all.length === 0 ? null : all.join('; ');
   }
 
@@ -427,8 +465,8 @@ export class Rescuer {
       if (this.#seedFull) {
         this.#cap.add(desk.policy.rescue_cap_usd_per_hour, this.#startedAt);
         const why = this.#start === 'memory' ? 'holds live in memory, so any held transfer of an earlier run was dropped by the restart'
-          : this.#start === 'fresh' ? 'a first run (GIMBAL_RESCUE_FRESH=1), so any held transfer of an earlier run is not known here'
-          : this.#start === 'missing' ? `there is no state file (${this.#o.store!.path}), so every transfer is held until the owner starts once with GIMBAL_RESCUE_FRESH=1`
+          : this.#start === 'fresh' ? `a first run (${this.#freshEnv()}), so any held transfer of an earlier run is not known here`
+          : this.#start === 'missing' ? `there is no state file (${this.#o.store!.path}), so every transfer is held until the owner starts once with ${this.#freshEnv()}`
           : 'its state file could not be used, so every transfer is held until the owner repairs it';
         const note = `rescuer started at ${new Date(this.#startedAt).toISOString()}: ${why}; `
           + `reconcile earlier rescues' 1Click deposits and the Hyperliquid ledger. The rescue cap counts as used in full (${desk.policy.rescue_cap_usd_per_hour} USD), freeing over the first hour: the contract's counters have no view`;
@@ -436,6 +474,20 @@ export class Rescuer {
         this.#persist();
       }
     }
+    if (!this.#minimumsSaid) {
+      this.#minimumsSaid = true;
+      this.#log(`rescue sizes at this desk's policy (${desk.policy.rescue_cap_usd_per_hour} USD an hour, ${desk.policy.max_transfer_cost_bps} bps, `
+        + `${(desk.policy.max_transfer_cost_flat_e6 / 1e6).toFixed(2)} USD flat): ${minimumsText(desk.policy, this.#o.keyed === true)}; a smaller rescue reduces both legs instead`);
+    }
+    // The Arbitrum state (the rescuer's own USDC, the withdraws, the holds' logs) belongs to one desk address.
+    const evmNow = desk.addresses.evm.toLowerCase();
+    if (this.#evm === null) this.#evm = evmNow;
+    if (evmNow !== this.#evm && this.#evmProblem === null) {
+      this.#evmProblem = `get_desk names the desk EVM address ${evmNow}, not ${this.#evm} that this rescuer's Arbitrum state belongs to; every transfer is held until the engine is restarted (a new address starts a new state file)`;
+      this.#log(this.#evmProblem);
+      this.#journal(run, this.#evmProblem, {});
+    }
+    const evm = this.#evm;
     if (desk.closing) {
       const say = !this.#closingSaid;
       this.#closingSaid = true;
@@ -449,12 +501,12 @@ export class Rescuer {
       this.#journal(run, `rescue ${t.id}: ${t.venue} ${t.symbol} needs no margin to reach its watch line; nothing to move`, {});
       return this.#land(run, 0, null);
     }
-    await this.#settleHolds(desk);
+    await this.#settleHolds(evm);
     // undefined: no Hyperliquid route here; null: not read. Unread stops the Hyperliquid source, never counts as empty.
     let read: ArbitrumRead | null | undefined;
     if (this.#o.hlWithdraw !== undefined && this.#o.arbitrum !== undefined) {
-      read = await this.#readArbitrum(desk.addresses.evm).catch(() => null);
-      await this.#settleHl(read, desk.addresses.evm);
+      read = await this.#readArbitrum(evm).catch(() => null);
+      await this.#settleHl(read, evm);
     }
     // Only the rescuer's own USDC on that address is offered to the plan.
     const arbitrumUsd = read === undefined || read === null ? read : Number(read.balanceE6 < this.#strandedE6 ? read.balanceE6 : this.#strandedE6) / 1e6;
@@ -541,8 +593,11 @@ export class Rescuer {
     const arb = this.#o.arbitrum!;
     const evm = desk.addresses.evm;
     const t = run.trigger;
-    const amountE6 = BigInt(Math.round(plan.withdrawUsd! * 1e6));
+    let amountE6 = BigInt(Math.round(plan.withdrawUsd! * 1e6));
+    // A Bridge2 Transfer names no withdraw: never the exact amount of one that never showed (a cent more instead).
+    while (this.#expired.some((e) => e.amountE6 === amountE6 - BigInt(HL_WITHDRAW_FEE_USD * 1e6))) amountE6 += 10_000n;
     const expectE6 = amountE6 - BigInt(HL_WITHDRAW_FEE_USD * 1e6);
+    const withdrawUsd = Number(amountE6) / 1e6;
     let fromBlock: bigint;
     try {
       fromBlock = (await arb.head()).number;
@@ -553,9 +608,9 @@ export class Rescuer {
     const signStart = this.#o.clock.now();
     let tx: TxRef[];
     // Counted before it is sent: the contract counts the operator's hl_withdraw whatever happens after.
-    this.#cap.add(plan.withdrawUsd!, signStart);
+    this.#cap.add(withdrawUsd, signStart);
     // On its way from now until it is seen: saved first, so a crash mid-withdraw still holds the next one.
-    this.#inFlight = { rescueId: t.id, amountE6: expectE6, fromBlock, acceptedAt: signStart, untilMs: signStart + WITHDRAW_IN_FLIGHT_MS };
+    this.#inFlight = { rescueId: t.id, amountE6: expectE6, fromBlock, acceptedAt: signStart, untilMs: signStart + WITHDRAW_IN_FLIGHT_MS, scannedTo: null, tx: [] };
     if (!this.#persist()) {
       this.#inFlight = null;
       throw new StepFailed('sign', `the rescuer state could not be saved, so hl_withdraw was not sent: ${this.#saveProblem ?? 'unknown'}`);
@@ -563,6 +618,7 @@ export class Rescuer {
     try {
       ({ tx } = await port.withdraw(amountE6, `rescue ${t.id}: Hyperliquid margin to the desk's Arbitrum address for ${t.venue}`));
       this.#o.withdrawals?.('hyperliquid', null);
+      if (this.#inFlight !== null) this.#inFlight.tx = [...tx];
     } catch (err) {
       const why = errorMessage(err);
       if (/withdraw\w*\s+(are\s+|is\s+)?(paused|disabled|suspended)/i.test(why)) this.#o.withdrawals?.('hyperliquid', why);
@@ -577,6 +633,7 @@ export class Rescuer {
     }
     run.signedS = (this.#o.clock.now() - signStart) / 1000;
     run.tx.push(...tx);
+    this.#persist();
     const topUp = plan.arbitrumUsd > 0 ? `, topping up the ${plan.arbitrumUsd.toFixed(2)} USDC an earlier withdraw left there` : '';
     this.#journal(run, `rescue ${t.id}: source hyperliquid, hl_withdraw ${usdc(amountE6)} USDC to the desk's Arbitrum address (1 USDC fee)${topUp}`, { from: 'hyperliquid', usd: 0, feeUsd: -HL_WITHDRAW_FEE_USD, signedS: round1(run.signedS) }, tx);
     this.#progress(run, 'deposit');
@@ -642,17 +699,14 @@ export class Rescuer {
     if (reserveE6 > this.#strandedE6) {
       throw new StepFailed('verify', `the quote spends ${usdc(reserveE6)} USDC of the desk's Arbitrum address, more than the ${usdc(this.#strandedE6)} the rescuer's own hl_withdraws left there`);
     }
-    // What tells later whether a signature that may exist can still run: the Arbitrum block where its Transfer would
-    // start, and the desk's EIP-3009 counter before it moves (null while get_desk_counters is absent).
+    // Where a payment's Transfer log would start on Arbitrum: what proves later whether a signature that may exist ran.
     let arbBlock: bigint | null = null;
-    let counter: bigint | null = null;
     if (eip3009) {
       try {
         arbBlock = (await this.#o.arbitrum!.head()).number;
       } catch (err) {
         throw new StepFailed('sign', `the Arbitrum head could not be read before signing, so nothing was signed: ${errorMessage(err)}`);
       }
-      counter = await this.#readCounter();
     }
     this.#progress(run, 'sign');
     const signStart = this.#o.clock.now();
@@ -660,7 +714,7 @@ export class Rescuer {
     if (payer.method !== 'fund_venue') this.#cap.add(Number(q.amountInE8) / 1e8, signStart);
     this.#strandedE6 -= reserveE6;
     // Held from before the signature: a crash while signing or sending leaves it held after a restart.
-    const hold = this.#openHold(id, to, q, since, reserveE6, counter, arbBlock, `rescue ${id} is paying ${q.depositAddress} (${payer.method}); it may be signed or sent`);
+    const hold = this.#openHold(id, to, q, since, reserveE6, arbBlock, `rescue ${id} is paying ${q.depositAddress} (${payer.method}); it may be signed or sent`);
     if (!this.#persist()) {
       this.#dropHold(hold);
       this.#strandedE6 += reserveE6;
@@ -823,10 +877,10 @@ export class Rescuer {
 
   // ---- holds ----
 
-  #openHold(rescueId: string, venue: VenueId, q: VerifiedQuote, sinceMs: number, reservedE6: bigint, counter: bigint | null, arbBlock: bigint | null, why: string): DepositHold {
+  #openHold(rescueId: string, venue: VenueId, q: VerifiedQuote, sinceMs: number, reservedE6: bigint, arbBlock: bigint | null, why: string): DepositHold {
     const hold: DepositHold = {
       why, rescueId, venue, q, sinceMs, heldAt: this.#o.clock.now(), reconcileSaid: false, paying: true, unsent: null, authorization: null,
-      counter, arbBlock, reservedE6, status: null,
+      arbBlock, scannedTo: null, paidLog: null, reservedE6, status: null,
     };
     this.#deposits.push(hold);
     return hold;
@@ -845,45 +899,60 @@ export class Rescuer {
     if (i !== -1) this.#deposits.splice(i, 1);
   }
 
-  /** get_desk_counters' eip3009_next; null when the view is absent or could not be read (the time bound is used then). */
-  async #readCounter(): Promise<bigint | null> {
-    const f = this.#o.deskCounters;
-    if (f === undefined) return null;
-    try {
-      return (await f())?.eip3009Next ?? null;
-    } catch {
-      return null;
+  /** A final NEAR block's time and the desk's counters there; without a reader, the clock and no ring. */
+  async #readNear(): Promise<NearRead> {
+    const f = this.#o.near;
+    return f === undefined ? { height: 0, timeMs: this.#o.clock.now(), counters: null } : f();
+  }
+
+  /**
+   * Whether the payment of a hold ran: a USDC Transfer from the desk to its deposit address since the block before
+   * signing. Reads only the blocks after the last read, up to `head`, and keeps the log once seen.
+   */
+  async #paid(d: DepositHold, evm: string, head: ArbitrumHead): Promise<boolean> {
+    if (d.paidLog !== null) return true;
+    if (d.arbBlock === null) return false;
+    const from = d.scannedTo === null ? d.arbBlock : d.scannedTo + 1n;
+    if (from <= head.number) {
+      const logs = await this.#o.arbitrum!.transfers(evm, d.q.depositAddress, from, head.number);
+      d.scannedTo = head.number;
+      if (logs.length > 0) d.paidLog = logs[0]!.id;
     }
+    return d.paidLog !== null;
   }
 
   /**
    * Whether a payment not known to be sent can never run, read on chain now (see the header): 'never-signed' (the
-   * EIP-3009 counter did not move), 'dead', or null (it may still run, or the chain could not tell).
+   * contract never signed it and no longer can), 'dead' (it was or may have been signed, and can no longer run), or
+   * null (it may still run, or ran, or the chain could not tell).
    */
-  async #canNeverRun(d: DepositHold, desk: RescueDesk): Promise<'never-signed' | 'dead' | null> {
-    const now = this.#o.clock.now();
-    // The contract signs and pays nothing on a quote older than QUOTE_MAX_AGE_MS; heldAt (just before signing was
-    // asked) is the later bound when the quote's own time is earlier.
-    const ageBound = Math.max(d.heldAt, d.q.signedAtMs) + QUOTE_MAX_AGE_MS;
-    if (d.q.method !== 'evm_usdc_to_intents') return now >= ageBound + SIGN_SETTLE_MS ? 'dead' : null;
-    const arb = this.#o.arbitrum;
-    if (arb === undefined) return null;
-    const head = await arb.head();
-    const a = d.authorization;
-    if (a !== null) {
-      if (head.timestampS < a.validBefore + CHAIN_MARGIN_S) return null;
-      return (await arb.authorizationUsed(a.from, a.nonce, head.number)) ? null : 'dead';
+  async #canNeverRun(d: DepositHold, evm: string): Promise<'never-signed' | 'dead' | null> {
+    const payable = payableUntilMs(d.q);
+    const near = await this.#readNear();
+    const c = near.counters;
+    // The ring answers only while it cannot have pushed this address out; fund_venue pays from a ring of its own.
+    const ring = c !== null && d.q.method !== 'fund_venue' && ringHolds(c, d.heldAt - CLOCK_SKEW_MS) ? c : null;
+    const entry = ring === null ? null : ringEntry(ring, depositKey(d.q.method, d.q.depositAddress));
+    const unsignable = near.timeMs >= payable + CHAIN_MARGIN_S * 1000;
+    if (d.q.method === 'evm_usdc_to_intents') {
+      const arb = this.#o.arbitrum;
+      if (arb === undefined) return null;
+      const head = await arb.head();
+      if (await this.#paid(d, evm, head)) return null;
+      const a = d.authorization;
+      if (a !== null) {
+        if (head.timestampS < a.validBefore + CHAIN_MARGIN_S) return null;
+        return (await arb.authorizationUsed(a.from, a.nonce, head.number)) ? null : 'dead';
+      }
+      if (ring !== null && entry === null) return unsignable ? 'never-signed' : null;
+      // Neither a Transfer since the block before signing nor a time it could still run proves nothing without both.
+      if (d.arbBlock === null) return null;
+      if (entry !== null) return head.timestampS >= Math.floor(entry.paidMs / 1000) + EIP3009_VALIDITY_S + CHAIN_MARGIN_S ? 'dead' : null;
+      return head.timestampS * 1000 >= payable + NO_VIEW_SETTLE_MS ? 'dead' : null;
     }
-    // Not known whether (or with which authorization) it was signed.
-    if (d.arbBlock === null) return null;
-    const evm = desk.addresses.evm;
-    if ((await arb.transfers(evm, d.q.depositAddress, d.arbBlock, head.number)).length > 0) return null;
-    if (d.counter !== null) {
-      const next = await this.#readCounter();
-      if (next === d.counter) return now - d.heldAt >= SIGN_SETTLE_MS ? 'never-signed' : null;
-      if (next !== null && await arb.authorizationUsed(evm, eip3009Nonce(desk.addresses.deskId, d.counter), head.number)) return null;
-    }
-    return head.timestampS * 1000 >= ageBound + (EIP3009_VALIDITY_S + CHAIN_MARGIN_S) * 1000 ? 'dead' : null;
+    if (ring !== null && entry === null) return unsignable ? 'never-signed' : null;
+    if (entry !== null) return near.timeMs >= entry.paidMs + SIGN_SETTLE_MS ? 'dead' : null;
+    return near.timeMs >= payable + NO_VIEW_SETTLE_MS ? 'dead' : null;
   }
 
   /** The desk's Arbitrum address at the latest block: the head, then the balance at that block. */
@@ -897,13 +966,26 @@ export class Rescuer {
   async #withdrawArrived(evm: string, head: ArbitrumHead): Promise<boolean> {
     const f = this.#inFlight;
     if (f === null) return false;
-    const logs = await this.#o.arbitrum!.transfers(HL_BRIDGE2, evm, f.fromBlock, head.number);
-    const hit = logs.find((l) => l.value === f.amountE6 && !this.#seen.has(`arb:${l.id}`));
-    if (hit === undefined) return false;
-    this.#seen.add(`arb:${hit.id}`);
+    const hit = await this.#bridgeLog(f, evm, head);
+    if (hit === null) return false;
     this.#strandedE6 += f.amountE6;
     this.#inFlight = null;
     return true;
+  }
+
+  /**
+   * A Bridge2 Transfer of exactly a withdraw's amount to the desk, not matched before, in the blocks after the last
+   * read up to `head`; marked seen when found.
+   */
+  async #bridgeLog(f: InFlight, evm: string, head: ArbitrumHead): Promise<string | null> {
+    const from = f.scannedTo === null ? f.fromBlock : f.scannedTo + 1n;
+    if (from > head.number) return null;
+    const logs = await this.#o.arbitrum!.transfers(HL_BRIDGE2, evm, from, head.number);
+    f.scannedTo = head.number;
+    const hit = logs.find((l) => l.value === f.amountE6 && !this.#seen.has(`arb:${l.id}`));
+    if (hit === undefined) return null;
+    this.#seen.add(`arb:${hit.id}`);
+    return hit.id;
   }
 
   /**
@@ -922,12 +1004,32 @@ export class Rescuer {
         changed = true;
       } else if (t >= f.untilMs) {
         this.#inFlight = null;
-        const line = `reconcile needed: rescue ${f.rescueId}'s hl_withdraw (${usdc(f.amountE6)} USDC to arrive, accepted at ${new Date(f.acceptedAt).toISOString()}) is not on the desk's Arbitrum address `
-          + `after ${Math.round((t - f.acceptedAt) / 60_000)} min; it is no longer taken as on its way, so Hyperliquid may be withdrawn from again. Check the Hyperliquid ledger: USDC of it that arrives later is not counted as the rescuer's own`;
+        this.#expired.push(f);
+        const line = `reconcile needed: rescue ${f.rescueId}'s hl_withdraw (${usdc(f.amountE6)} USDC to arrive, accepted at ${new Date(f.acceptedAt).toISOString()}${txText(f.tx)}) is not on the desk's Arbitrum address `
+          + `after ${Math.round((t - f.acceptedAt) / 60_000)} min; it is no longer taken as on its way, so Hyperliquid may be withdrawn from again. Check the Hyperliquid ledger: USDC of it that arrives later is not counted as the rescuer's own, `
+          + `and for ${Math.round(EXPIRED_KEPT_MS / 3_600_000)} h no new withdraw brings that exact amount`;
         this.#log(line);
         this.#journalLine(line, 'hyperliquid');
         changed = true;
       }
+    }
+    // Withdraws that never showed: one that shows now is said once and no longer reserves its amount.
+    for (const e of [...this.#expired]) {
+      if (t - e.acceptedAt >= EXPIRED_KEPT_MS) {
+        this.#expired.splice(this.#expired.indexOf(e), 1);
+        changed = true;
+        continue;
+      }
+      const before = e.scannedTo;
+      const hit = await this.#bridgeLog(e, evm, read.head).catch(() => null);
+      if (e.scannedTo !== before) changed = true;
+      if (hit === null) continue;
+      this.#expired.splice(this.#expired.indexOf(e), 1);
+      this.#journalLine(`rescue ${e.rescueId}'s hl_withdraw (${usdc(e.amountE6)} USDC) reached the desk's Arbitrum address after it was given up (log ${hit}): not counted as the rescuer's own; the owner moves it`, 'hyperliquid');
+    }
+    while (this.#expired.length > EXPIRED_KEPT) {
+      this.#expired.shift();
+      changed = true;
     }
     if (this.#strandedE6 > read.balanceE6) {
       this.#journalLine(`the desk's Arbitrum address holds ${usdc(read.balanceE6)} USDC, less than the ${usdc(this.#strandedE6)} the rescuer counted as its own (moved by someone else): it counts ${usdc(read.balanceE6)} from now on`, 'hyperliquid');
@@ -938,7 +1040,7 @@ export class Rescuer {
   }
 
   /** Reads each held deposit again; drops those settled (refunded, delivered and seen, or shown never to run). */
-  async #settleHolds(desk: RescueDesk): Promise<void> {
+  async #settleHolds(evm: string): Promise<void> {
     if (this.#deposits.length === 0) return;
     for (const d of [...this.#deposits]) {
       const s = await this.#o.oneClick.status(d.q.depositAddress).catch(() => null);
@@ -959,10 +1061,11 @@ export class Rescuer {
       } else if (s.status === 'PENDING_DEPOSIT' && d.unsent !== null) {
         // Read on chain at every pass: dead only while the chain still says so, and 1Click then gets UNUSED_GRACE_MS
         // to index a deposit it missed.
-        const verdict = await this.#canNeverRun(d, desk).catch(() => null);
+        const verdict = await this.#canNeverRun(d, evm).catch(() => null);
         const now = this.#o.clock.now();
         if (verdict === 'never-signed') {
-          settled = `rescue ${d.rescueId}'s ${d.q.method} was never signed (the desk's EIP-3009 counter did not move since before it was asked for): nothing can pay ${d.q.depositAddress}`;
+          settled = `rescue ${d.rescueId}'s ${d.q.method} was never signed: the desk's deposit ring on NEAR does not hold ${d.q.depositAddress}, `
+            + `and the contract signs that quote only until ${new Date(payableUntilMs(d.q)).toISOString()}, so nothing can pay it`;
           giveBack = true;
         } else if (verdict === null) {
           d.unsent.deadAt = null;
@@ -995,6 +1098,12 @@ export class Rescuer {
     this.#persist();
   }
 
+  /** The setting that starts a first run of this desk's state (it names the desk, so one left in an env file never re-arms). */
+  #freshEnv(): string {
+    const id = this.#o.store?.identity;
+    return id === undefined ? 'GIMBAL_RESCUE_FRESH' : `GIMBAL_RESCUE_FRESH=${id.contractId}/${id.deskId}`;
+  }
+
   /** How a hold or an unknown outcome is cleared by hand. */
   #clearHow(): string {
     const store = this.#o.store;
@@ -1012,13 +1121,13 @@ export class Rescuer {
         why: h.paying ? `rescue ${h.rescueId} was paying ${q.depositAddress} (${q.method}) when the engine stopped: it may have been signed or sent` : h.why,
         rescueId: h.rescueId, venue: h.venue, q, sinceMs: h.sinceMs, heldAt: h.heldAt, reconcileSaid: h.reconcileSaid, paying: false,
         unsent: h.paying ? { deadAt: null } : h.unsent === null ? null : { deadAt: h.unsent.deadAt },
-        authorization: h.authorization, counter: h.counter === null ? null : BigInt(h.counter), arbBlock: h.arbBlock === null ? null : BigInt(h.arbBlock),
-        reservedE6: BigInt(h.reservedE6), status: h.status,
+        authorization: h.authorization, arbBlock: h.arbBlock === null ? null : BigInt(h.arbBlock), scannedTo: h.scannedTo === null ? null : BigInt(h.scannedTo),
+        paidLog: h.paidLog, reservedE6: BigInt(h.reservedE6), status: h.status,
       });
     }
     this.#strandedE6 = BigInt(s.hl.strandedE6);
-    const f = s.hl.inFlight;
-    this.#inFlight = f === null ? null : { rescueId: f.rescueId, amountE6: BigInt(f.amountE6), fromBlock: BigInt(f.fromBlock), acceptedAt: f.acceptedAt, untilMs: f.untilMs };
+    this.#inFlight = s.hl.inFlight === null ? null : loadWithdraw(s.hl.inFlight);
+    this.#expired = s.hl.expired.map(loadWithdraw);
     for (const c of s.cap) this.#cap.add(c.usd, c.at);
     for (const id of s.seen) this.#seen.add(id);
   }
@@ -1033,13 +1142,10 @@ export class Rescuer {
       holds: this.#deposits.map((d) => ({
         why: d.why, rescueId: d.rescueId, venue: d.venue, quote: saveQuote(d.q), sinceMs: d.sinceMs, heldAt: d.heldAt, reconcileSaid: d.reconcileSaid,
         paying: d.paying, unsent: d.unsent === null ? null : { deadAt: d.unsent.deadAt }, authorization: d.authorization,
-        counter: d.counter === null ? null : d.counter.toString(), arbBlock: d.arbBlock === null ? null : d.arbBlock.toString(),
+        arbBlock: d.arbBlock === null ? null : d.arbBlock.toString(), scannedTo: d.scannedTo === null ? null : d.scannedTo.toString(), paidLog: d.paidLog,
         reservedE6: d.reservedE6.toString(), status: d.status,
       })),
-      hl: {
-        strandedE6: this.#strandedE6.toString(),
-        inFlight: f === null ? null : { rescueId: f.rescueId, amountE6: f.amountE6.toString(), fromBlock: f.fromBlock.toString(), acceptedAt: f.acceptedAt, untilMs: f.untilMs },
-      },
+      hl: { strandedE6: this.#strandedE6.toString(), inFlight: f === null ? null : saveWithdraw(f), expired: this.#expired.map(saveWithdraw) },
       cap: this.#cap.entries(now),
       seen: [...this.#seen].slice(-SEEN_KEPT),
     };
@@ -1051,7 +1157,7 @@ export class Rescuer {
     if (store === undefined) return true;
     if (this.#stateProblem !== null) {
       // The missing or unusable file is left as it is for the owner to look at.
-      this.#saveProblem = `${this.#stateProblem}; nothing is written there until the owner repairs it or starts with GIMBAL_RESCUE_FRESH=1`;
+      this.#saveProblem = `${this.#stateProblem}; nothing is written there until the owner repairs it or starts with ${this.#freshEnv()}`;
       return false;
     }
     try {
@@ -1143,6 +1249,30 @@ function planText(plan: Plan): string {
     : plan.withdrawUsd === null ? ` (the USDC already on the desk's Arbitrum address, then evm_usdc_to_intents; ${plan.capUsd.toFixed(2)} USD of the rescue cap)`
     : ` (hl_withdraw ${plan.withdrawUsd.toFixed(2)} USDC to Arbitrum${plan.arbitrumUsd > 0 ? `, with the ${plan.arbitrumUsd.toFixed(2)} already there` : ''}, then evm_usdc_to_intents; ${plan.capUsd.toFixed(2)} USD of the rescue cap)`;
   return `from ${plan.from}: ${plan.amountInUsd.toFixed(2)} USD, about ${plan.feeUsd.toFixed(2)} USD in fees${via}`;
+}
+
+/** The smallest (and, where the cap bounds it, the largest) rescue each route takes, for the log. */
+function minimumsText(policy: RescueDesk['policy'], keyed: boolean): string {
+  return rescueSizes(policy, keyed).map((r) => `${r.from} -> ${r.to} ${sizeText(r)}`).join(', ');
+}
+
+function loadWithdraw(f: SavedWithdraw): InFlight {
+  return {
+    rescueId: f.rescueId, amountE6: BigInt(f.amountE6), fromBlock: BigInt(f.fromBlock), acceptedAt: f.acceptedAt, untilMs: f.untilMs,
+    scannedTo: f.scannedTo === null ? null : BigInt(f.scannedTo), tx: [...f.tx],
+  };
+}
+
+function saveWithdraw(f: InFlight): SavedWithdraw {
+  return {
+    rescueId: f.rescueId, amountE6: f.amountE6.toString(), fromBlock: f.fromBlock.toString(), acceptedAt: f.acceptedAt, untilMs: f.untilMs,
+    scannedTo: f.scannedTo === null ? null : f.scannedTo.toString(), tx: [...f.tx],
+  };
+}
+
+/** A withdraw's Hyperliquid transactions, for a reconcile line. */
+function txText(tx: readonly TxRef[]): string {
+  return tx.length === 0 ? '' : `, Hyperliquid tx ${tx.map((x) => x.id).join(', ')}`;
 }
 
 function round1(x: number): number {

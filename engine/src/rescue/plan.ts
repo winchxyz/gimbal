@@ -15,6 +15,16 @@
 // Hyperliquid on 12; Hyperliquid's withdraw takes 1 USDC more), so a small rescue loses a large share of what it
 // moves. A route whose expected fees are over MAX_FEE_SHARE (10 %) of the amount it sends is skipped, and the legs are
 // reduced instead: a 10 % fee on margin is worse than giving up 10 % of a funding carry's size.
+//
+// So each route takes rescues from a smallest amount, and the cap bounds the largest (rescueSizes; a plan that ends in
+// a reduce or in nothing names them in its notes, so the journal says it). At the final mainnet policy
+// (rescue_cap_usd_per_hour 50, 300 bps, 1 USD flat), with a 1Click key and nothing on Arbitrum yet, in USD of margin
+// the target needs:
+//   reserve -> Hyperliquid from 2.86      reserve -> Orderly any (it sends at least 6.20)    reserve -> Phoenix from 0.44
+//   Phoenix -> Hyperliquid 2.86 to 49.40  Phoenix -> Orderly up to 49.67
+//   Hyperliquid -> Phoenix 10.39 to 24.31: the withdraw's 1 USDC fee sets the floor, the cap the ceiling (the withdraw
+//   and the bridge both count, about twice the rescue); at a 20 USD cap no Hyperliquid rescue fits at all.
+// Without a key 1Click adds 0.2 %, which moves each floor up a little.
 
 import type { VenueId } from '@gimbal/shared';
 
@@ -36,6 +46,8 @@ export const ORDERLY_MIN_IN_USD = 6.2;
 export const HYPERCORE_MIN_IN_USD = 1;
 /** The least an hl_withdraw brings to Arbitrum when it tops up USDC already there (it takes HL_WITHDRAW_FEE_USD more). */
 export const HL_TOP_UP_MIN_USD = 1;
+/** rescueSizes looks for each route's sizes up to this amount, USD. */
+export const SIZE_SCAN_MAX_USD = 200;
 /** A reduce asks for this much more than the amount it replaces, so the leg clears its watch line. */
 export const REDUCE_HEADROOM = 1.1;
 
@@ -201,6 +213,73 @@ function costProblem(from: Source, amountIn: number, fee: number, hopFee: number
  * what was tried.
  */
 export function planRescue(input: PlanInput): Plan {
+  const plan = planOnce(input);
+  if (plan.kind === 'transfer') return plan;
+  // Why no transfer, in sizes: the smallest rescue each route tried takes at this policy.
+  const to = input.target.venue;
+  const tried = (['reserve', ...input.legVenues] as Source[]).filter((f, i, all) => f !== to && f !== 'orderly' && all.indexOf(f) === i && input.route(f, to) === null);
+  if (tried.length > 0) {
+    const sizes = tried.map((from) => rescueSize(from, to, input)).map((r) => `${r.from} -> ${r.to} ${sizeText(r)}`);
+    plan.notes.push(`rescue sizes at this policy: ${sizes.join(', ')}`);
+  }
+  return plan;
+}
+
+/** A route's rescue sizes, in USD of margin needed on the target: null minUsd: none fits; null maxUsd: no bound up to SIZE_SCAN_MAX_USD. */
+export interface RescueSize {
+  from: Source;
+  to: VenueId;
+  minUsd: number | null;
+  maxUsd: number | null;
+}
+
+export function sizeText(r: RescueSize): string {
+  if (r.minUsd === null) return `takes no rescue up to ${SIZE_SCAN_MAX_USD} USD`;
+  return r.maxUsd === null ? `from ${r.minUsd.toFixed(2)} USD` : `from ${r.minUsd.toFixed(2)} to ${r.maxUsd.toFixed(2)} USD`;
+}
+
+/** The routes the rescuer sizes (Orderly is never a source; Hyperliquid -> Orderly is not quoted). */
+export const SIZED_ROUTES: readonly (readonly [Source, VenueId])[] = [
+  ['reserve', 'hyperliquid'], ['reserve', 'orderly'], ['reserve', 'phoenix'], ['phoenix', 'hyperliquid'], ['phoenix', 'orderly'], ['hyperliquid', 'phoenix'],
+];
+
+const sizes = new Map<string, RescueSize>();
+
+/**
+ * The smallest and largest rescue (USD of margin on the target, to the cent) the route `from -> to` plans as a
+ * transfer under the policy's cap and cost bounds, with the source holding plenty, a full cap and nothing on
+ * Arbitrum. Remembered per policy.
+ */
+export function rescueSize(from: Source, to: VenueId, p: Pick<PlanInput, 'capUsd' | 'keyed' | 'maxCostBps' | 'maxCostFlatE6'>): RescueSize {
+  const key = `${from}|${to}|${p.capUsd}|${p.keyed}|${p.maxCostBps}|${p.maxCostFlatE6}`;
+  const known = sizes.get(key);
+  if (known !== undefined) return known;
+  let minUsd: number | null = null;
+  let maxUsd: number | null = null;
+  const top = SIZE_SCAN_MAX_USD * 100;
+  for (let cents = 1; cents <= top; cents++) {
+    const plan = planOnce({
+      target: { venue: to, symbol: 'X', amountUsd: cents / 100, marginUsd: 1e9 }, reserveUsd: from === 'reserve' ? 1e9 : 0,
+      freeMargin: from === 'reserve' ? {} : { [from]: 1e9 }, legVenues: from === 'reserve' ? [to] : [to, from],
+      capUsd: p.capUsd, capUsedUsd: 0, route: () => null, reduce: 'sizing', keyed: p.keyed, maxCostBps: p.maxCostBps, maxCostFlatE6: p.maxCostFlatE6,
+      arbitrumUsd: 0,
+    });
+    if (plan.kind !== 'transfer' || plan.from !== from) continue;
+    minUsd ??= cents / 100;
+    maxUsd = cents / 100;
+  }
+  const r: RescueSize = { from, to, minUsd, maxUsd: maxUsd === null || maxUsd * 100 >= top ? null : maxUsd };
+  sizes.set(key, r);
+  return r;
+}
+
+/** Each sized route's rescue sizes at a desk's policy. */
+export function rescueSizes(policy: { rescue_cap_usd_per_hour: number; max_transfer_cost_bps: number; max_transfer_cost_flat_e6: number }, keyed: boolean): RescueSize[] {
+  const p = { capUsd: policy.rescue_cap_usd_per_hour, keyed, maxCostBps: policy.max_transfer_cost_bps, maxCostFlatE6: policy.max_transfer_cost_flat_e6 };
+  return SIZED_ROUTES.map(([from, to]) => rescueSize(from, to, p));
+}
+
+function planOnce(input: PlanInput): Plan {
   const { target } = input;
   const notes: string[] = [];
   const to = target.venue;

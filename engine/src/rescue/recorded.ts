@@ -13,7 +13,9 @@ import type { VenueId } from '@gimbal/shared';
 import type { Clock } from '../venues/venue.ts';
 import type { DeskAddresses, OneClickApi, QuoteAnswer, QuoteRequest, QuoteResponse, QuotedMethod, StatusAnswer, VerifiedQuote } from './oneclick.ts';
 import { DECIMALS, parseTimeMs } from './oneclick.ts';
-import { HL_BRIDGE2, SimulatedArbitrum, eip3009Nonce } from './arbitrum-chain.ts';
+import { eip3009Nonce } from '../contract/replay-client.ts';
+import { HL_BRIDGE2, SimulatedArbitrum } from './arbitrum-chain.ts';
+import { SimulatedNear } from './near-chain.ts';
 import type { Source } from './plan.ts';
 import type { CreditPort, HlWithdrawPort, LandingPort, Payer, RescueDesk, SignedPayment } from './rescuer.ts';
 
@@ -128,6 +130,8 @@ export class SimulatedMoney {
   #nonces = 0n;
   /** The desk's Arbitrum address as the rescuer reads it (RescuerOptions.arbitrum). */
   readonly arbitrum: SimulatedArbitrum;
+  /** The desk's counters on NEAR as the rescuer reads them (RescuerOptions.near): a signature writes the ring. */
+  readonly near: SimulatedNear;
   /** Called once a delivery shows (replay raises the scripted leg's margin by it). */
   onCredit: ((venue: VenueId, usd: number) => void) | null = null;
   readonly #credited = new Set<string>();
@@ -140,6 +144,7 @@ export class SimulatedMoney {
     this.#deskEvm = desk.evm.toLowerCase();
     this.#deskId = desk.deskId;
     this.arbitrum = new SimulatedArbitrum(clock);
+    this.near = new SimulatedNear(clock);
   }
 
   get reserveSpentUsd(): number {
@@ -152,13 +157,15 @@ export class SimulatedMoney {
       sign: async (q: VerifiedQuote): Promise<SignedPayment> => {
         const eip3009 = method === 'evm_usdc_to_intents';
         const authorization = eip3009 ? { from: this.#deskEvm, nonce: eip3009Nonce(this.#deskId, this.#nonces++), validBefore: Math.floor(this.#clock.now() / 1000) + 300 } : undefined;
+        // fund_venue's ring has no view; the rescue methods' signature writes the desk's deposit ring.
+        if (method !== 'fund_venue') this.near.spend(method, q.depositAddress);
         return {
           tx: [],
           ...(authorization === undefined ? {} : { authorization, usableUntilMs: authorization.validBefore * 1000 }),
           send: async () => {
             if (authorization !== undefined) {
               this.arbitrum.transfer(this.#deskEvm, q.depositAddress, q.amountIn);
-              this.arbitrum.used.add(`${authorization.from}:${authorization.nonce.toLowerCase()}`);
+              this.arbitrum.markUsed(authorization.from, authorization.nonce);
             }
             if (method === 'fund_venue') {
               this.#reserveSpent += Number(q.amountInE8) / 1e8;

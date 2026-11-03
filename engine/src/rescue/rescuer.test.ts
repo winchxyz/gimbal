@@ -2,7 +2,8 @@
 // recorded mainnet 1Click answers, Hyperliquid via Arbitrum on quotes signed by a test key), the cap refusal, the fee
 // share falling back to a reduce of both legs, a failure at every step ending the rescue failed, and rescueEnded
 // called exactly once per trigger. Then paying twice: holds read again on a simulated Arbitrum (Bridge2 Transfers,
-// authorizationState, the latest block's time) and get_desk_counters, and the state file across restarts.
+// authorizationState and block times, each read at the block asked) and on a simulated NEAR (get_desk_counters'
+// deposit ring and the block time), and the state file across restarts.
 
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -15,7 +16,9 @@ import type { OutcomeIds } from '../contract/types.ts';
 import type { RescueTrigger } from '../risk/engine.ts';
 import type { PairResult } from '../trade/pair.ts';
 import type { TradeLeg } from '../trade/legs.ts';
-import { HL_BRIDGE2, SimulatedArbitrum, eip3009Nonce } from './arbitrum-chain.ts';
+import { eip3009Nonce } from '../contract/replay-client.ts';
+import { HL_BRIDGE2, SimulatedArbitrum } from './arbitrum-chain.ts';
+import { SimulatedNear } from './near-chain.ts';
 import type { OneClickApi, QuoteAnswer, QuoteRequest, StatusAnswer, VerifiedQuote } from './oneclick.ts';
 import { ASSETS } from './oneclick.ts';
 import { RecordedOneClick, SimulatedMoney, loadRescueRecording } from './recorded.ts';
@@ -163,10 +166,8 @@ interface Synthetic {
   /** Every quote signed (sent or not), and every EIP-3009 authorization signed, in order. */
   signed: VerifiedQuote[];
   authorizations: Eip3009Ref[];
-  /** The desk's eip3009_next: each EIP-3009 signature moves it. */
-  counter: bigint;
-  /** get_desk_counters: false while the view is absent (before C10). */
-  countersView: boolean;
+  /** NEAR: the block time is the clock; each rescue signature writes the deposit ring; `view` false: before C10. */
+  near: SimulatedNear;
   /** Replaces 1Click's status answers from now on. */
   status: ((n: number, depositAddress: string) => StatusAnswer) | null;
   legs: Leg[];
@@ -191,10 +192,10 @@ interface SyntheticOptions {
   seedCap?: boolean;
   confirms?: (venue: VenueId) => string | null;
   store?: RescueStateStore;
-  /** GIMBAL_RESCUE_FRESH=1. */
+  /** GIMBAL_RESCUE_FRESH, as serve checked it. */
   fresh?: boolean;
-  /** get_desk_counters is wired (it answers null while `countersView` is false). */
-  counters?: boolean;
+  /** false: no NEAR reader is wired (the clock stands in for NEAR time, with no ring). */
+  near?: boolean;
 }
 
 const venueOf = (q: VerifiedQuote): VenueId => (q.destinationAsset === ASSETS.hypercoreUsdc ? 'hyperliquid' : q.destinationAsset === ASSETS.solanaUsdc ? 'phoenix' : 'orderly');
@@ -202,7 +203,7 @@ const venueOf = (q: VerifiedQuote): VenueId => (q.destinationAsset === ASSETS.hy
 function synthetic(o: SyntheticOptions = {}): Synthetic {
   const s: Synthetic = {
     w: undefined as unknown as World, quotes: [], sent: [], withdrawn: [], credited: [], closes: [], ledger: [],
-    chain: undefined as unknown as SimulatedArbitrum, hlArrives: true, late: [], signed: [], authorizations: [], counter: 0n, countersView: true,
+    chain: undefined as unknown as SimulatedArbitrum, hlArrives: true, late: [], signed: [], authorizations: [], near: undefined as unknown as SimulatedNear,
     status: null, legs: o.legs ?? [leg('hyperliquid', 200), leg('phoenix', 200)], signer: testSigner(),
   };
   const signer = s.signer;
@@ -210,6 +211,7 @@ function synthetic(o: SyntheticOptions = {}): Synthetic {
   let statusN = 0;
   s.w = world(({ clock }) => {
     s.chain = new SimulatedArbitrum(clock);
+    s.near = new SimulatedNear(clock);
     const oneClick: OneClickApi = {
       source: 'test', publicKey: signer.publicKey,
       quote: async (body) => {
@@ -232,9 +234,11 @@ function synthetic(o: SyntheticOptions = {}): Synthetic {
         let authorization: Eip3009Ref | undefined;
         if (method === 'evm_usdc_to_intents') {
           // The contract signs with the desk's next counter and moves it, as evm_usdc_to_intents does.
-          authorization = { from: EVM, nonce: eip3009Nonce(rec.desk.deskId, s.counter++), validBefore };
+          authorization = { from: EVM, nonce: eip3009Nonce(rec.desk.deskId, s.near.eip3009Next), validBefore };
           s.authorizations.push(authorization);
         }
+        // The rescue methods' signature writes the desk's deposit ring (fund_venue's own ring has no view).
+        if (method !== 'fund_venue') s.near.spend(method, q.depositAddress);
         return {
           tx: [{ chain: 'near', id: `near-${method}`, url: 'https://nearblocks.io/x' }] as TxRef[],
           ...(o.usableForMs === undefined ? {} : { usableUntilMs: clock.now() + o.usableForMs }),
@@ -244,7 +248,7 @@ function synthetic(o: SyntheticOptions = {}): Synthetic {
             s.sent.push(q);
             if (authorization !== undefined) {
               s.chain.transfer(EVM, q.depositAddress, q.amountIn);
-              s.chain.used.add(`${EVM}:${authorization.nonce}`);
+              s.chain.markUsed(EVM, authorization.nonce);
             }
             if (o.noLanding !== true) s.ledger.push({ venue: venueOf(q), usd: Number(q.minAmountOutE8) / 1e8, id: `ledger-${q.depositAddress}` });
             return { tx: [], depositTx: `deposit-${q.depositAddress}` };
@@ -291,7 +295,7 @@ function synthetic(o: SyntheticOptions = {}): Synthetic {
       mode: 'mainnet', oneClick, keyed: true, ...(o.seedCap === undefined && o.store !== undefined ? {} : { seedCap: o.seedCap ?? false }),
       ...(o.store === undefined ? {} : { store: o.store }),
       ...(o.fresh === undefined ? {} : { fresh: o.fresh }),
-      ...(o.counters === true ? { deskCounters: async () => (s.countersView ? { eip3009Next: s.counter } : null) } : {}),
+      ...(o.near === false ? {} : { near: () => s.near.read() }),
       desk: async () => ({ addresses: rec.desk, policy: rec.policy, reserveUsd: 100, closing: false, ...o.desk }),
       view: () => ({ legs: s.legs, freeMargin: o.freeMargin ?? { phoenix: 100 } }),
       landing,
@@ -482,7 +486,7 @@ test('a signed EIP-3009 authorization that failed to send is held until Arbitrum
   const aAddress = s.signed[0]!.depositAddress;
   s.status = (_n, addr) => ({ status: addr === aAddress ? 'PENDING_DEPOSIT' : 'SUCCESS', body: null });
   // Past validBefore, but Arbitrum cannot be read: not taken as dead.
-  s.w.t += 361_000;
+  s.w.t += 362_000;
   s.chain.down = 'arbitrum rpc: connection reset';
   await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
   assert.equal(s.sent.length, 0, 'no second authorization');
@@ -504,12 +508,12 @@ test('a dead authorization is read again before it is released: one used meanwhi
   const s = unsentWorld(async () => { throw new Error('arbitrum rpc: connection reset'); });
   await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
   s.status = () => ({ status: 'PENDING_DEPOSIT', body: null });
-  s.w.t += 361_000;
+  s.w.t += 362_000;
   await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
   assert.match(s.w.rescuer.held!, /rescue a/, 'read dead: the grace starts');
   // The signature was public: someone submits it after all (a reorged block, a slow relayer).
   const a = s.authorizations[0]!;
-  s.chain.used.add(`${a.from}:${a.nonce}`);
+  s.chain.markUsed(a.from, a.nonce);
   s.w.t += 10 * 60_000;
   await run(s.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 20 }));
   assert.match(s.w.rescuer.held!, /rescue a/, 'not released on the first dead read');
@@ -517,25 +521,32 @@ test('a dead authorization is read again before it is released: one used meanwhi
   assert.equal(s.sent.length, 0);
 });
 
-test('a Phoenix payment that failed to send is held until the quote\'s 1 h age bound has passed, then 1Click gets 10 more minutes', async () => {
-  let sendFails = true;
-  const s = synthetic({ desk: { reserveUsd: 0 }, reducer: true, send: async () => { if (sendFails) throw new Error('solana rpc: blockhash not found'); } });
-  await run(s.w, trigger({ id: 'a', amountUsd: 30 }));
-  assert.match(s.w.rescuer.held!, /the signed sol_sign_rescue of rescue a was not sent/);
-  sendFails = false;
-  const aAddress = s.signed[0]!.depositAddress;
-  s.status = (_n, addr) => ({ status: addr === aAddress ? 'PENDING_DEPOSIT' : 'SUCCESS', body: null });
-  s.w.t += 3_600_000;
-  await run(s.w, trigger({ id: 'b', amountUsd: 30 }));
-  assert.match(s.w.rescuer.held!, /rescue a/, 'within the age bound and the settle time');
-  s.w.t += 10 * 60_000;
-  await run(s.w, trigger({ id: 'c', amountUsd: 30 }));
-  assert.match(s.w.rescuer.held!, /rescue a/, '1Click still gets its 10 minutes');
-  s.w.t += 10 * 60_000;
-  await run(s.w, trigger({ id: 'd', amountUsd: 30 }));
-  assert.ok(s.w.journal().some((j) => /rescue a's signed payment can no longer run .*expired unused/.test(j)));
-  assert.deepEqual(s.w.ended.at(-1), ['d', true]);
-  assert.equal(s.sent.length, 1, 'd paid');
+test('a Phoenix payment that failed to send: with the ring, dead 10 min after the contract counted it; without the view, 15 min past the quote\'s pay bound; then 1Click gets 10 more minutes', async () => {
+  for (const view of [true, false]) {
+    let sendFails = true;
+    // A cap that a second rescue 20 min later fits in.
+    const s = synthetic({ desk: { reserveUsd: 0, policy: { ...rec.policy, rescue_cap_usd_per_hour: 1000 } }, reducer: true, send: async () => { if (sendFails) throw new Error('solana rpc: blockhash not found'); } });
+    s.near.view = view;
+    const signedAt = s.w.t;
+    await run(s.w, trigger({ id: 'a', amountUsd: 30 }));
+    assert.match(s.w.rescuer.held!, /the signed sol_sign_rescue of rescue a was not sent/);
+    sendFails = false;
+    const q = s.signed[0]!;
+    s.status = (_n, addr) => ({ status: addr === q.depositAddress ? 'PENDING_DEPOSIT' : 'SUCCESS', body: null });
+    // In the ring, paid at signing: its blockhash is from before then. No view: the quote's 30 min deadline here.
+    const dead = view ? signedAt + 10 * 60_000 : Math.min(q.deadlineMs, q.signedAtMs + 3_600_000) + 15 * 60_000;
+    s.w.t = dead - 60_000;
+    await run(s.w, trigger({ id: 'b', amountUsd: 30 }));
+    assert.match(s.w.rescuer.held!, /rescue a/, `${view}: not dead yet`);
+    s.w.t = dead;
+    await run(s.w, trigger({ id: 'c', amountUsd: 30 }));
+    assert.match(s.w.rescuer.held!, /rescue a/, `${view}: 1Click still gets its 10 minutes`);
+    s.w.t += 10 * 60_000;
+    await run(s.w, trigger({ id: 'd', amountUsd: 30 }));
+    assert.ok(s.w.journal().some((j) => /rescue a's signed payment can no longer run .*expired unused/.test(j)), String(view));
+    assert.deepEqual(s.w.ended.at(-1), ['d', true]);
+    assert.equal(s.sent.length, 1, 'd paid');
+  }
 });
 
 test('an EIP-3009 send whose outcome is unknown is parked like an unsent one: released once Arbitrum shows it never ran, held while it ran', async () => {
@@ -545,7 +556,7 @@ test('an EIP-3009 send whose outcome is unknown is parked like an unsent one: re
   assert.deepEqual(s.w.ended, [['a', false]]);
   assert.match(s.w.rescuer.held!, /the evm_usdc_to_intents of rescue a may have paid .*no receipt for 0xabc.*held until 1Click settles it or it is shown never to run/);
   s.status = () => ({ status: 'PENDING_DEPOSIT', body: null });
-  s.w.t += 361_000;
+  s.w.t += 362_000;
   await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
   assert.match(s.w.rescuer.held!, /may have paid/);
   s.w.t += 10 * 60_000;
@@ -556,7 +567,7 @@ test('an EIP-3009 send whose outcome is unknown is parked like an unsent one: re
   const ran = unsentWorld(async () => unknown());
   await run(ran.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
   const a = ran.authorizations[0]!;
-  ran.chain.used.add(`${a.from}:${a.nonce}`);
+  ran.chain.markUsed(a.from, a.nonce);
   ran.status = () => ({ status: 'PENDING_DEPOSIT', body: null });
   ran.w.t += 30 * 60_000;
   await run(ran.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
@@ -674,6 +685,7 @@ test('a withdraw on its way that shows up late counts as the rescuer\'s own then
   assert.equal(s.w.rescuer.arbitrumOwnUsd, 0);
   s.hlArrives = true;
   s.chain.transfer(HL_BRIDGE2, EVM, s.late[0]!);   // it lands now, 15 min late
+  s.w.t += 2_000;   // the head the rescuer reads trails the latest block by 5
   await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
   assert.ok(s.w.journal().some((j) => /rescue a's hl_withdraw reached the desk's Arbitrum address late/.test(j)));
   assert.deepEqual(s.w.ended.at(-1), ['b', true]);
@@ -684,6 +696,7 @@ test('USDC of other flows on the desk\'s Arbitrum address is never spent; the ow
   const { s, refuse } = hlWorld();
   // 50 USDC of an Orderly money-out (or the owner's return) sits on the address before any rescue.
   s.chain.transfer(ONECLICK_ARB, EVM, 50_000_000n);
+  s.w.t += 2_000;   // the head the rescuer reads trails the latest block by 5
   await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
   assert.deepEqual(s.w.ended, [['a', true]]);
   assert.equal(s.withdrawn.length, 1, 'withdrawn, though 50 USDC was there');
@@ -695,6 +708,7 @@ test('USDC of other flows on the desk\'s Arbitrum address is never spent; the ow
   await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
   assert.ok(s.w.rescuer.arbitrumOwnUsd > 20);
   s.chain.setBalance(EVM, 2_000_000n);
+  s.w.t += 2_000;   // the head the rescuer reads trails the latest block by 5
   refuse(false);
   await run(s.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 20 }));
   assert.ok(s.w.journal().some((j) => /holds 2.00 USDC, less than the \d+\.\d\d the rescuer counted as its own \(moved by someone else\)/.test(j)));
@@ -712,6 +726,7 @@ test('a 1Click refund landing back on Arbitrum is never the rescuer\'s own: not 
   assert.match(s.w.failures.at(-1)!.reason, /1Click ended the transfer REFUNDED: the refund goes back to the desk's Arbitrum address \(not counted as the rescuer's own/);
   const refunded = BigInt(s.quotes[0]!.amount);
   s.chain.transfer(ONECLICK_ARB, EVM, refunded);
+  s.w.t += 2_000;   // the head the rescuer reads trails the latest block by 5
   s.status = null;
   await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
   assert.deepEqual(s.w.ended.at(-1), ['b', true]);
@@ -727,11 +742,13 @@ test('a 1Click refund landing back on Arbitrum is never the rescuer\'s own: not 
   assert.match(f.w.rescuer.hlWithdrawHeld!, /rescue a's hl_withdraw/);
   const expected = f.late[0]!;
   f.chain.transfer(ONECLICK_ARB, EVM, expected);
+  f.w.t += 2_000;   // the head the rescuer reads trails the latest block by 5
   await run(f.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
   assert.match(f.w.rescuer.hlWithdrawHeld!, /rescue a's hl_withdraw/, 'the same amount from 1Click is not the withdraw');
   assert.equal(f.w.rescuer.arbitrumOwnUsd, 0);
   // The withdraw's own Bridge2 Transfer lands: only that counts.
   f.chain.transfer(HL_BRIDGE2, EVM, expected);
+  f.w.t += 2_000;   // the head the rescuer reads trails the latest block by 5
   refuse(false);
   await run(f.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 20 }));
   assert.ok(f.w.journal().some((j) => /rescue a's hl_withdraw reached the desk's Arbitrum address late/.test(j)));
@@ -770,6 +787,50 @@ test('mainnet starts its cap meter full: no rescue out of a venue in the first h
   assert.deepEqual(s.w.ended.at(-1), ['b', true]);
 });
 
+test('a withdraw that never showed: its Hyperliquid tx in the reconcile line, and no new withdraw brings its exact amount, so its late Transfer is never taken for the new one', async () => {
+  const { s } = hlWorld();
+  s.hlArrives = false;
+  await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
+  const first = s.withdrawn[0]!;
+  s.w.t += 30 * 60_000;
+  s.hlArrives = true;
+  await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
+  const line = s.w.journal().find((j) => /reconcile needed: rescue a's hl_withdraw/.test(j))!;
+  assert.match(line, /accepted at \S+, Hyperliquid tx 0xwithdraw\)/);
+  assert.match(line, /for 24 h no new withdraw brings that exact amount/);
+  assert.equal(s.withdrawn.length, 2);
+  assert.equal(s.withdrawn[1], first + 10_000n, 'a cent more than the one that never showed');
+  assert.deepEqual(s.w.ended.at(-1), ['b', true]);
+  // a's Transfer shows at last: said once, not the rescuer's own, and no longer reserving its amount.
+  s.chain.transfer(HL_BRIDGE2, EVM, s.late[0]!);
+  s.w.t += 2_000;
+  await run(s.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 20 }));
+  assert.ok(s.w.journal().some((j) => /rescue a's hl_withdraw \(\d+\.\d\d USDC\) reached the desk's Arbitrum address after it was given up \(log \S+\): not counted as the rescuer's own/.test(j)));
+  assert.deepEqual(s.w.ended.at(-1), ['c', true]);
+  assert.ok(s.w.rescuer.arbitrumOwnUsd < 0.01, 'c bridged only its own withdraw');
+  assert.ok(s.chain.balanceNow(EVM) >= s.late[0]!, 'a\'s late USDC stays for the owner');
+});
+
+test('get_desk naming another desk EVM address mid-run holds every transfer until a restart (the Arbitrum state is the old address\'s)', async () => {
+  let evm = rec.desk.evm;
+  const s = synthetic({ reducer: true, desk: { get addresses() { return { ...rec.desk, evm }; } } });
+  await run(s.w, trigger({ id: 'a', amountUsd: 30 }));
+  assert.deepEqual(s.w.ended.at(-1), ['a', true]);
+  evm = '0x00000000000000000000000000000000000000e2';
+  await run(s.w, trigger({ id: 'b', amountUsd: 30 }));
+  assert.match(s.w.rescuer.held!, /get_desk names the desk EVM address 0x0+e2, not 0x[0-9a-f]{40} that this rescuer's Arbitrum state belongs to; every transfer is held until the engine is restarted/);
+  assert.equal(s.sent.length, 1, 'b only reduced');
+  assert.deepEqual(s.w.ended.at(-1), ['b', true]);
+  assert.equal(s.w.logs.filter((l) => /get_desk names the desk EVM address/.test(l)).length, 1);
+});
+
+test('the rescue sizes: logged at the first rescue, and named in the journal when a rescue ends in a reduce', async () => {
+  const s = synthetic({ reducer: true });
+  await run(s.w, trigger({ amountUsd: 1.5 }));
+  assert.ok(s.w.logs.some((l) => /^rescue sizes at this desk's policy \(50 USD an hour, \d+ bps, \d+\.\d\d USD flat\): reserve -> hyperliquid from \d+\.\d\d USD, .*hyperliquid -> phoenix .*; a smaller rescue reduces both legs instead$/.test(l)));
+  assert.match(s.w.journal()[0]!, /rescue sizes at this policy: reserve -> hyperliquid from \d+\.\d\d USD, phoenix -> hyperliquid from \d+\.\d\d to \d+\.\d\d USD\)$/);
+});
+
 test('a reduce is refused when the leg\'s margin is not read (it would size the cut at the whole leg)', async () => {
   const s = synthetic({ reducer: true, desk: { reserveUsd: 0 }, freeMargin: {}, legs: [leg('phoenix', 200), leg('orderly', 200)] });
   await run(s.w, trigger({ amountUsd: 30 }));
@@ -791,9 +852,9 @@ const ID: RescueIdentity = { contractId: rec.desk.contract, deskId: rec.desk.des
 const tmpPath = () => join(mkdtempSync(join(tmpdir(), 'gimbal-rescue-')), 'rescue-mainnet-alpha.json');
 const tmpStore = () => new RescueStateStore(tmpPath(), ID);
 interface OnDisk {
-  holds: { paying: boolean; status: string | null; authorization: unknown; counter: string | null; arbBlock: string | null; quote: { depositAddress: string } }[];
+  holds: { paying: boolean; status: string | null; authorization: unknown; arbBlock: string | null; scannedTo: string | null; paidLog: string | null; quote: { depositAddress: string; deadlineMs: number; signedAtMs: number } }[];
   unknown: string | null;
-  hl: { strandedE6: string; inFlight: unknown };
+  hl: { strandedE6: string; inFlight: { tx: TxRef[] } | null; expired: { rescueId: string; tx: TxRef[] }[] };
   cap: unknown[];
 }
 const onDisk = (store: RescueStateStore) => JSON.parse(readFileSync(store.path, 'utf8')) as OnDisk;
@@ -804,13 +865,13 @@ async function until(done: () => boolean): Promise<void> {
   assert.ok(done(), 'the run got there');
 }
 
-test('state: a first run (GIMBAL_RESCUE_FRESH=1) writes an empty state and starts the cap full; a held transfer and the cap meter survive a restart, and the loaded hold is read again before the next plan', async () => {
+test('state: a first run (GIMBAL_RESCUE_FRESH) writes an empty state and starts the cap full; a held transfer and the cap meter survive a restart, and the loaded hold is read again before the next plan', async () => {
   const store = tmpStore();
   const s = synthetic({ store, fresh: true, reducer: true, noLanding: true, status: () => ({ status: 'PROCESSING', body: null }) });
-  assert.ok(s.w.logs.some((l) => /rescuer first run \(GIMBAL_RESCUE_FRESH=1\): there is no state file at .*rescue-mainnet-alpha\.json, so an empty one is written now.*cap counts as used in full/.test(l)));
+  assert.ok(s.w.logs.some((l) => /rescuer first run \(GIMBAL_RESCUE_FRESH\): there is no state file at .*rescue-mainnet-alpha\.json, so an empty one is written now.*cap counts as used in full/.test(l)));
   assert.ok(existsSync(store.path), 'written at once');
   await run(s.w, trigger({ id: 'a', amountUsd: 30 }));
-  assert.match(s.w.journal()[0]!, /rescuer started at .*a first run \(GIMBAL_RESCUE_FRESH=1\).*cap counts as used in full \(50 USD\)/);
+  assert.match(s.w.journal()[0]!, /rescuer started at .*a first run \(GIMBAL_RESCUE_FRESH=\S+\/alpha\).*cap counts as used in full \(50 USD\)/);
   assert.match(s.w.rescuer.held!, /rescue a's transfer to \S+ is PROCESSING at 1Click/);
   const saved = onDisk(store);
   assert.equal(saved.holds.length, 1);
@@ -820,7 +881,7 @@ test('state: a first run (GIMBAL_RESCUE_FRESH=1) writes an empty state and start
   assert.ok(capBefore > 40);
 
   const again = s.w.restart();
-  assert.ok(s.w.logs.some((l) => /rescuer state loaded from .*: 1 held transfer\(s\), 0\.00 USDC of its own on Arbitrum, \d+\.\d\d USD of the rescue cap used; each hold is read again.*GIMBAL_RESCUE_FRESH=1 is ignored: a state file exists/.test(l)));
+  assert.ok(s.w.logs.some((l) => /rescuer state loaded from .*: 1 held transfer\(s\), 0\.00 USDC of its own on Arbitrum, \d+\.\d\d USD of the rescue cap used; each hold is read again.*GIMBAL_RESCUE_FRESH is ignored: a state file exists/.test(l)));
   assert.match(again.held!, /rescue a's transfer to \S+ is PROCESSING at 1Click/);
   assert.ok(Math.abs(again.capUsed() - capBefore) < 1e-6, 'the cap meter is the saved one, not seeded full again');
   // Still processing: only a reduce runs, and no second "cap counts as used in full".
@@ -836,7 +897,7 @@ test('state: a first run (GIMBAL_RESCUE_FRESH=1) writes an empty state and start
   assert.equal(s.sent.length, 2, 'c paid');
 });
 
-test('state: a missing file after a hold existed (another checkout, a git clean) holds every transfer, reduces still run; a fresh start only on GIMBAL_RESCUE_FRESH=1', async () => {
+test('state: a missing file after a hold existed (another checkout, a git clean) holds every transfer, reduces still run; a fresh start only on GIMBAL_RESCUE_FRESH', async () => {
   const store = tmpStore();
   const s = synthetic({ store, fresh: true, seedCap: false, reducer: true, noLanding: true, status: () => ({ status: 'PROCESSING', body: null }) });
   await run(s.w, trigger({ id: 'a', amountUsd: 30 }));
@@ -844,12 +905,12 @@ test('state: a missing file after a hold existed (another checkout, a git clean)
   unlinkSync(store.path);
   // Started again without the file, and without FRESH: nothing is known, so nothing pays.
   const again = s.w.restart({ fresh: false, seedCap: true });
-  assert.ok(s.w.logs.some((l) => /rescuer state missing: there is no file at .*rescue-mainnet-alpha\.json\. A missing file is not taken as a first run.*every transfer is held \(only reduces run\).*start once with GIMBAL_RESCUE_FRESH=1/.test(l)));
-  assert.match(again.held!, /state file could not be used \(there is no state file at .*\).*GIMBAL_RESCUE_FRESH=1/);
+  assert.ok(s.w.logs.some((l) => /rescuer state missing: there is no file at .*rescue-mainnet-alpha\.json\. A missing file is not taken as a first run.*every transfer is held \(only reduces run\).*start once with GIMBAL_RESCUE_FRESH=\S+\/alpha/.test(l)));
+  assert.match(again.held!, /state file could not be used \(there is no state file at .*\).*GIMBAL_RESCUE_FRESH=\S+\/alpha/);
   await run(s.w, trigger({ id: 'b', amountUsd: 30 }));
   assert.equal(s.quotes.length, 1, 'no second payment');
   assert.deepEqual(s.w.ended.at(-1), ['b', true], 'a reduce ran');
-  assert.match(s.w.journal().find((j) => /rescuer started at/.test(j))!, /there is no state file .*every transfer is held until the owner starts once with GIMBAL_RESCUE_FRESH=1/);
+  assert.match(s.w.journal().find((j) => /rescuer started at/.test(j))!, /there is no state file .*every transfer is held until the owner starts once with GIMBAL_RESCUE_FRESH=\S+\/alpha/);
   assert.ok(!existsSync(store.path), 'nothing written in its place');
   // The owner reconciled: FRESH starts from an empty state.
   const fresh = s.w.restart({ fresh: true, seedCap: false });
@@ -892,6 +953,7 @@ test('state: the unknown outcome, the rescuer\'s own Arbitrum USDC and a withdra
   assert.ok(s.w.logs.some((l) => /an hl_withdraw of rescue b on its way/.test(l)));
   // Its Bridge2 Transfer shows after the restart: found from the saved block.
   s.chain.transfer(HL_BRIDGE2, EVM, s.late[0]!);
+  s.w.t += 2_000;   // the head the rescuer reads trails the latest block by 5
   await run(s.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 20 }));
   assert.ok(s.w.journal().some((j) => /rescue b's hl_withdraw reached the desk's Arbitrum address late/.test(j)));
 
@@ -903,7 +965,7 @@ test('state: the unknown outcome, the rescuer\'s own Arbitrum USDC and a withdra
   assert.equal(u.quotes.length, 1, 'still held after the restart: only a reduce ran');
 });
 
-test('state: a crash while signing fund_venue leaves it held after the restart, until the quote\'s age bound and 1Click\'s grace have passed', async () => {
+test('state: a crash while signing fund_venue leaves it held after the restart, until NEAR time is 15 min past the quote\'s pay bound and 1Click\'s grace has passed', async () => {
   const store = tmpStore();
   let crashed = false;
   const s = synthetic({ store, fresh: true, seedCap: false, reducer: true, sign: () => (crashed ? Promise.resolve() : new Promise<void>(() => {})) });
@@ -931,39 +993,60 @@ test('state: a crash while signing fund_venue leaves it held after the restart, 
   assert.equal(s.quotes.length, 2, 'd paid');
 });
 
-test('state: a crash while signing an EIP-3009 payment clears both ways: the counter did not move, or (no counter view) Arbitrum is past the age bound', async () => {
+/** Hyperliquid -> Phoenix on a state file, the EIP-3009 sign never answering (a crash while signing), then a restart. */
+async function crashWhileSigning(view = true) {
+  const store = tmpStore();
+  let crashed = false;
+  const { s } = hlWorld({ store, fresh: true, seedCap: false, reducer: true, sign: () => (crashed ? Promise.resolve() : new Promise<void>(() => {})) });
+  s.near.view = view;
+  s.w.rescuer.take(trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
+  await until(() => s.w.steps('a').filter((x) => x === 'sign').length === 2);
+  const saved = onDisk(store).holds[0]!;
+  crashed = true;
+  const again = s.w.restart();
+  const q = saved.quote;
+  s.status = (_n, addr) => ({ status: addr === q.depositAddress ? 'PENDING_DEPOSIT' : 'SUCCESS', body: null });
+  return { s, store, saved, again, payable: Math.min(q.deadlineMs, q.signedAtMs + 3_600_000) };
+}
+
+test('state: a crash while signing an EIP-3009 payment: never signed once NEAR time is past the quote\'s pay bound and the ring lacks it; without the view, dead 15 min after on Arbitrum', async () => {
   for (const view of [true, false]) {
-    const store = tmpStore();
-    let crashed = false;
-    const { s } = hlWorld({ store, fresh: true, seedCap: false, reducer: true, counters: true, sign: () => (crashed ? Promise.resolve() : new Promise<void>(() => {})) });
-    s.countersView = view;
-    s.w.rescuer.take(trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
-    await until(() => s.w.steps('a').filter((x) => x === 'sign').length === 2);
-    const saved = onDisk(store).holds[0]!;
+    const { s, store, saved, again, payable } = await crashWhileSigning(view);
     assert.equal(saved.paying, true);
-    assert.equal(saved.counter, view ? '0' : null, 'the counter before signing');
     assert.ok(saved.arbBlock !== null, 'the Arbitrum block before signing');
     assert.equal(BigInt(onDisk(store).hl.strandedE6), 0n, 'its Arbitrum USDC set aside');
-    crashed = true;
-    const again = s.w.restart();
     assert.match(again.held!, /rescue a was paying \S+ \(evm_usdc_to_intents\)/);
-    const aAddress = saved.quote.depositAddress;
-    s.status = (_n, addr) => ({ status: addr === aAddress ? 'PENDING_DEPOSIT' : 'SUCCESS', body: null });
+    const ranges: [bigint, bigint][] = [];
+    const read = s.chain.transfers.bind(s.chain);
+    s.chain.transfers = async (from, to, a, b) => {
+      if (to.toLowerCase() === saved.quote.depositAddress.toLowerCase()) ranges.push([a, b]);
+      return read(from, to, a, b);
+    };
     await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
     assert.match(again.held!, /rescue a/, 'too soon either way');
     if (view) {
-      // eip3009_next is still 0: never signed. Released once a NEAR call sent before the crash would have run.
-      s.w.t += 10 * 60_000;
+      // A NEAR call sent before the crash may land until the pay bound: held up to a minute past it.
+      s.w.t = payable + 30_000;
       await run(s.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 20 }));
-      assert.ok(s.w.journal().some((j) => /rescue a's evm_usdc_to_intents was never signed \(the desk's EIP-3009 counter did not move.*its \d+\.\d\d USDC on Arbitrum is the rescuer's to spend again/.test(j)));
-    } else {
-      // No counter: the 1 h quote age, the 300 s validity and a minute of margin on Arbitrum time, no Transfer to the deposit.
-      s.w.t += 3_600_000 + 300_000 + 60_000;
-      await run(s.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 20 }));
-      assert.match(again.held!, /rescue a/, '1Click still gets its 10 minutes');
-      s.w.t += 10 * 60_000;
+      assert.match(s.w.rescuer.held!, /rescue a/, 'within the margin');
+      s.w.t = payable + 61_000;
       await run(s.w, trigger({ id: 'c2', venue: 'phoenix', amountUsd: 20 }));
+      assert.ok(s.w.journal().some((j) => /rescue a's evm_usdc_to_intents was never signed: the desk's deposit ring on NEAR does not hold \S+, and the contract signs that quote only until .*its \d+\.\d\d USDC on Arbitrum is the rescuer's to spend again/.test(j)));
+    } else {
+      // No ring: the latest signature possible is just before the pay bound, so 15 min past it on Arbitrum, no Transfer.
+      s.w.t = payable + 14 * 60_000;
+      await run(s.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 20 }));
+      assert.match(s.w.rescuer.held!, /rescue a/);
+      s.w.t = payable + 15 * 60_000 + 2_000;
+      await run(s.w, trigger({ id: 'c2', venue: 'phoenix', amountUsd: 20 }));
+      assert.match(s.w.rescuer.held!, /rescue a/, '1Click still gets its 10 minutes');
+      s.w.t += 10 * 60_000;
+      await run(s.w, trigger({ id: 'c3', venue: 'phoenix', amountUsd: 20 }));
       assert.ok(s.w.journal().some((j) => /rescue a's signed payment can no longer run .*expired unused; its \d+\.\d\d USDC on Arbitrum is the rescuer's to spend again/.test(j)));
+      // Each pass read only the blocks after the last one.
+      assert.ok(ranges.length >= 3, `${ranges.length} reads`);
+      for (let i = 1; i < ranges.length; i++) assert.equal(ranges[i]![0], ranges[i - 1]![1] + 1n, 'from the block after the last read');
+      assert.equal(ranges[0]![0], BigInt(saved.arbBlock!));
     }
     assert.equal(s.w.rescuer.held, null);
     assert.deepEqual(s.w.ended.at(-1)![1], true, s.w.failures.at(-1)?.reason);
@@ -971,24 +1054,64 @@ test('state: a crash while signing an EIP-3009 payment clears both ways: the cou
   }
 });
 
-test('state: a crash-while-signing hold whose counter moved and whose authorization was used stays held', async () => {
-  const store = tmpStore();
-  let crashed = false;
-  const { s } = hlWorld({ store, fresh: true, seedCap: false, reducer: true, counters: true, sign: () => (crashed ? Promise.resolve() : new Promise<void>(() => {})) });
-  s.w.rescuer.take(trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
-  await until(() => s.w.steps('a').filter((x) => x === 'sign').length === 2);
-  // The contract did sign (counter 0 -> 1), and the authorization was sent by someone (it is public in the receipt).
-  s.counter = 1n;
-  s.chain.used.add(`${EVM}:${eip3009Nonce(rec.desk.deskId, 0n)}`);
-  crashed = true;
-  s.w.restart();
-  s.status = () => ({ status: 'PENDING_DEPOSIT', body: null });
-  s.w.t += 2 * 3_600_000;
+test('state: a sign that lands late (a congested NEAR call, after the engine gave up): held while it may, then by the ring; once it ran, held for 1Click', async () => {
+  // Lands before the pay bound and is never sent: dead 300 s + 60 s after the ring says it was signed.
+  const quiet = await crashWhileSigning();
+  quiet.s.w.t = quiet.payable - 5 * 60_000;
+  await run(quiet.s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
+  assert.match(quiet.s.w.rescuer.held!, /rescue a/, 'it may still land');
+  const paidAt = quiet.s.w.t;
+  quiet.s.near.spend('evm_usdc_to_intents', quiet.saved.quote.depositAddress);
+  quiet.s.w.t = paidAt + 362_000;
+  await run(quiet.s.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 20 }));
+  assert.match(quiet.s.w.rescuer.held!, /rescue a/, 'past the pay bound, but the ring holds it: signed, so 1Click gets its 10 minutes');
+  assert.ok(!quiet.s.w.journal().some((j) => /never signed/.test(j)));
+  quiet.s.w.t += 10 * 60_000;
+  await run(quiet.s.w, trigger({ id: 'd', venue: 'phoenix', amountUsd: 20 }));
+  assert.ok(quiet.s.w.journal().some((j) => /rescue a's signed payment can no longer run .*expired unused/.test(j)));
+
+  // Lands, and someone submits the public authorization: the Transfer to the deposit address holds it however late.
+  const ran = await crashWhileSigning();
+  ran.s.w.t = ran.payable - 5 * 60_000;
+  ran.s.near.spend('evm_usdc_to_intents', ran.saved.quote.depositAddress);
+  ran.s.chain.transfer(EVM, ran.saved.quote.depositAddress, 20_000_000n);
+  ran.s.w.t += 3 * 3_600_000;
+  await run(ran.s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
+  ran.s.w.t += 3_600_000;
+  await run(ran.s.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 20 }));
+  assert.match(ran.s.w.rescuer.held!, /rescue a was paying/);
+  assert.ok(onDisk(ran.store).holds[0]!.paidLog !== null, 'the Transfer is kept on disk');
+  assert.equal(ran.s.quotes.length, 1, 'no second payment');
+  assert.ok(ran.s.w.journal().some((j) => /reconcile needed: rescue a's deposit/.test(j)));
+});
+
+test('state: another signer moving the EIP-3009 counter (and using that nonce) decides nothing: the ring and the Transfer logs do', async () => {
+  const { s, payable } = await crashWhileSigning();
+  // hl-return (or another engine) signed and used counter 0 for another deposit address.
+  s.near.spend('evm_usdc_to_intents', '0x00000000000000000000000000000000000000d1');
+  s.chain.markUsed(EVM, eip3009Nonce(rec.desk.deskId, 0n));
+  s.chain.transfer(EVM, '0x00000000000000000000000000000000000000d1', 1_000_000n);
+  s.w.t += 2_000;   // the head the rescuer reads trails the latest block by 5
+  s.w.t = payable - 60_000;
   await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
-  s.w.t += 20 * 60_000;
+  assert.match(s.w.rescuer.held!, /rescue a/);
+  s.w.t = payable + 61_000;
   await run(s.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 20 }));
-  assert.match(s.w.rescuer.held!, /rescue a was paying/);
-  assert.equal(s.quotes.length, 1, 'no second payment');
+  assert.ok(s.w.journal().some((j) => /rescue a's evm_usdc_to_intents was never signed/.test(j)), 'its address is not in the ring');
+  assert.deepEqual(s.w.ended.at(-1), ['c', true]);
+});
+
+test('state: a ring that turned over since the hold (32 later rescues) proves nothing: the no-view bound applies', async () => {
+  const { s, payable } = await crashWhileSigning();
+  for (let i = 0; i < 32; i++) s.near.spend('evm_usdc_to_intents', `0x${(i + 1).toString(16).padStart(40, '0')}`, s.w.t + 1_000);
+  s.w.t = payable + 61_000;
+  await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
+  assert.match(s.w.rescuer.held!, /rescue a/, 'not taken as never signed');
+  s.w.t = payable + 15 * 60_000 + 2_000;
+  await run(s.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 20 }));
+  s.w.t += 10 * 60_000;
+  await run(s.w, trigger({ id: 'd', venue: 'phoenix', amountUsd: 20 }));
+  assert.ok(s.w.journal().some((j) => /rescue a's signed payment can no longer run .*expired unused/.test(j)));
 });
 
 test('state: a signed EIP-3009 authorization saved before a crash is told dead after the restart from Arbitrum; its USDC is the rescuer\'s again', async () => {
@@ -1008,7 +1131,7 @@ test('state: a signed EIP-3009 authorization saved before a crash is told dead a
   // a's deposit address never sees a deposit; any later transfer settles.
   const aAddress = saved.holds[0]!.quote.depositAddress;
   s.status = (_n, addr) => ({ status: addr === aAddress ? 'PENDING_DEPOSIT' : 'SUCCESS', body: null });
-  s.w.t += 361_000;
+  s.w.t += 362_000;
   await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
   assert.match(again.held!, /rescue a/, 'PENDING_DEPOSIT is not final for 10 more minutes');
   s.w.t += 10 * 60_000;

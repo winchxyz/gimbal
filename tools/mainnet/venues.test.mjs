@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { CANARY_POLICY_FILE, FINAL_POLICY_FILE, policyDiff, policyTarget } from './policy.mjs';
 import {
-  CANARY_SYMBOLS, FINAL_SYMBOLS, MAINNET_ORDERLY_BROKER, brokerIdProblem, buildPolicy, formatPolicy, livePolicyProblems, phoenixUnits,
+  CANARY_LIMITS, CANARY_SYMBOLS, FINAL_LIMITS, FINAL_SYMBOLS, MAINNET_ORDERLY_BROKER, brokerIdProblem, buildPolicy, formatPolicy, livePolicyProblems, phoenixUnits,
   policyShapeProblems, readLive,
 } from './venues.mjs';
 
@@ -91,11 +91,12 @@ test('tools/mainnet-canary-policy.json is the policy built from the recorded dat
   assert.equal(readFileSync(CANARY_POLICY_FILE, 'utf8'), formatPolicy(file));
 });
 
-test('the final policy: the seven oracle assets with the canary limits; XLM on Hyperliquid and Phoenix only', () => {
+test('the final policy: the seven oracle assets with the canary limits and a 50 USD rescue cap; XLM on Hyperliquid and Phoenix only', () => {
   assert.deepEqual(FINAL_SYMBOLS, ['BTC', 'ETH', 'SOL', 'DOGE', 'LTC', 'XLM', 'ZEC']);
   assert.deepEqual(policyTarget(false).symbols, CANARY_SYMBOLS);
-  assert.deepEqual(policyTarget(true), { name: 'final', symbols: FINAL_SYMBOLS, rel: 'tools/mainnet-final-policy.json', file: FINAL_POLICY_FILE });
-  const p = buildPolicy(live, FINAL_SYMBOLS);
+  assert.deepEqual(policyTarget(true), { name: 'final', symbols: FINAL_SYMBOLS, limits: FINAL_LIMITS, rel: 'tools/mainnet-final-policy.json', file: FINAL_POLICY_FILE });
+  assert.equal(policyTarget(false).limits, CANARY_LIMITS);
+  const p = buildPolicy(live, FINAL_SYMBOLS, FINAL_LIMITS);
   assert.deepEqual(p.hl_assets.slice(5), [{ index: 154, symbol: 'XLM', sz_decimals: 0 }, { index: 214, symbol: 'ZEC', sz_decimals: 2 }]);
   assert.deepEqual(p.phoenix_markets.slice(5), [
     { symbol: 'XLM', orderbook: 'AXewQALSfgppjhfsZ6w5pqV7wNR5ShDRXPPTy7yx7yuE', base_lot_e8: 100_000_000, tick_e8: 1_000 },   // 1 XLM, $0.00001
@@ -104,7 +105,10 @@ test('the final policy: the seven oracle assets with the canary limits; XLM on H
   assert.deepEqual(p.orderly_symbols, ['PERP_BTC_USDC', 'PERP_ETH_USDC', 'PERP_SOL_USDC', 'PERP_DOGE_USDC', 'PERP_LTC_USDC', 'PERP_ZEC_USDC']);
   const { hl_assets, phoenix_markets, orderly_symbols, ...limits } = p;
   const { hl_assets: _h, phoenix_markets: _p, orderly_symbols: _o, ...canaryLimits } = buildPolicy(live);
-  assert.deepEqual(limits, canaryLimits, 'the same limits as the canary');
+  // A Hyperliquid rescue counts its withdraw and its bridge: at 20 USD none fits (engine/src/rescue/plan.ts rescueSizes).
+  assert.deepEqual(limits, { ...canaryLimits, rescue_cap_usd_per_hour: 50 }, 'the canary limits with a 50 USD rescue cap');
+  assert.equal(FINAL_LIMITS.rescue_cap_usd_per_hour, 50);
+  assert.equal(CANARY_LIMITS.rescue_cap_usd_per_hour, 20, 'the canary keeps 20');
   assert.equal(hl_assets.length + phoenix_markets.length + orderly_symbols.length, 20);
 
   const file = JSON.parse(readFileSync(FINAL_POLICY_FILE, 'utf8'));

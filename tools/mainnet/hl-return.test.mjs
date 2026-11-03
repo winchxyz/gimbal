@@ -224,11 +224,17 @@ function world(o = {}) {
   return {
     seen,
     deps: {
-      near: client, fetch: fetchImpl, now: () => o.now ?? AT, tree: null, readKey, env, engine, sleep: async () => {}, pollMs: 0,
+      near: client, fetch: fetchImpl, now: () => o.now ?? AT, tree: null, readKey, env, engine, sleep: async () => {}, pollMs: 0, lock: async () => freeLock,
       urls: { arbitrum: 'https://arb.test/rpc', shown: { arbitrum: 'arb.test' } },
     },
   };
 }
+
+/** The rescuer's lock, always free: the real one is tested once, below. */
+const freeLock = {
+  rescueLockName: (_env, mode, contract, desk) => `fake-${mode}-${contract}-${desk}`, lockText: (n) => n, lockHeld: async () => false,
+  acquireRescueLock: async (name) => ({ name, release: async () => {} }),
+};
 
 async function capture(argv, deps) {
   const lines = [];
@@ -847,4 +853,53 @@ test('withdraw: an unreadable Hyperliquid nonce refuses; one ledger entry books 
   // With an entry each, both are booked.
   const both = withdrawGuards({ calls: [call('Second', t + 1500), call('First', t)], entries: [entry, { ...entry, hash: '0xtwo', delta: { ...entry.delta, nonce: t * 1000 } }], hlNonce: BigInt(t + 1500), nowMs: AT });
   assert.deepEqual(both.refusals, []);
+});
+
+test('the rescuer\'s lock: held by a live rescuer, --send refuses before anything is read or signed (the dry run says so); free, --send holds it for the run', async () => {
+  // The real lock (engine/src/rescue/lock.ts), under the name a mainnet rescuer of this contract and desk takes.
+  const locks = await import('../../engine/src/rescue/lock.ts');
+  const name = locks.rescueLockName((k) => process.env[k], 'mainnet', CONTRACT, DESK_ID);
+  const rescuer = await locks.acquireRescueLock(name);
+  try {
+    const w = world();
+    const real = { ...w.deps, lock: undefined };
+    for (const argv of [WITHDRAW_SEND, [...WITHDRAW_SEND, '--again'], [CONTRACT, DESK_ID, 'bridge', 'all', '--send']]) {
+      const s = await capture(argv, real);
+      assert.match(s.error?.message ?? '', /^--send refused, nothing was signed: the desk's live rescuer holds .*gimbal-rescue-mainnet-gimbal-canary2\.near-canary.*same EIP-3009 counter.*stop the rescuer first \(--again does not lift this\)$/, argv.join(' '));
+      assert.equal(s.out, '', 'refused before the first read');
+    }
+    assert.equal(w.seen.sent.length, 0);
+    assert.equal(w.seen.keys, 0, 'no key file read');
+    const d = await capture([CONTRACT, DESK_ID, 'withdraw', 'all'], real);
+    assert.equal(d.error, null, d.error?.stack);
+    assert.match(d.out, /\nwarning {3}the desk's live rescuer holds .*: --send refuses while it runs\n/);
+  } finally {
+    await rescuer.release();
+  }
+
+  const w = world({
+    onSend: () => ({ value: withdrawSigned() }),
+    hlSubmit: ({ setLedger, arb }) => {
+      setLedger([{ time: AT + 1000, hash: '0xhlw', delta: { type: 'withdraw', usdc: '10.682396', nonce: (AT + 2000) * 1000, fee: '1.0' } }]);
+      arb.set(EVM.toLowerCase(), 10_682_396n);
+      return { confirmed: true, tx: [{ chain: 'hyperliquid', id: '0xhlw' }] };
+    },
+  });
+  // A rescuer starting while the script is about to sign is refused.
+  let during = null;
+  const s = await capture(WITHDRAW_SEND, {
+    ...w.deps,
+    lock: undefined,
+    engine: async () => {
+      during = await locks.acquireRescueLock(name).then(async (l) => { await l.release(); return 'taken'; }, (e) => e.message);
+      return w.deps.engine();
+    },
+  });
+  assert.equal(s.error, null, s.error?.stack);
+  assert.match(s.out, /\nlock {6}.* taken for this run: no live rescuer of the desk can start until it ends\n/);
+  assert.match(during ?? '', /another live rescuer \(or tools\/mainnet\/hl-return\.mjs\) holds/);
+  assert.equal(w.seen.sent.length, 1);
+  // Released when the run ends.
+  const after = await locks.acquireRescueLock(name);
+  await after.release();
 });

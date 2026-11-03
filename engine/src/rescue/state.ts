@@ -5,22 +5,25 @@
 // saves before it signs or withdraws, and asks for no signature and sends no withdraw unless that save succeeded.
 //
 // What it keeps: the transfer holds (deposit address, the verified quote, amounts, a signed EIP-3009 authorization's
-// from / nonce / validBefore, the desk's EIP-3009 counter and the Arbitrum block before signing, 1Click's last
-// status), an OutcomeUnknown, the USDC the rescuer's own hl_withdraws left on Arbitrum and a withdraw still on its
-// way, the cap meter's sliding hour, and the ledger entries and Arbitrum logs already matched. Everything in it is
-// public on chain or at 1Click once signed: no key, no secret.
+// from / nonce / validBefore, the Arbitrum block before signing and how far its Transfer logs were read, the payment's
+// Transfer once seen, 1Click's last status), an OutcomeUnknown, the USDC the rescuer's own hl_withdraws left on
+// Arbitrum, a withdraw still on its way and those that never showed (their Hyperliquid transactions and amounts), the
+// cap meter's sliding hour, and the ledger entries and Arbitrum logs already matched. Everything in it is public on
+// chain or at 1Click once signed: no key, no secret. Version 2 (the quote's deadline, the scanned blocks, the
+// withdraws' transactions); a version 1 file is unusable like any other and is reconciled by hand.
 //
 // A file that is missing, cannot be read, names another contract, desk or EVM address, or does not pass
 // parseRescueState is never taken as "no holds": the rescuer then holds every transfer and says so (rescuer.ts).
-// A first run needs GIMBAL_RESCUE_FRESH=1, which writes an empty state.
+// A first run needs GIMBAL_RESCUE_FRESH=<contract>/<desk>, which writes an empty state.
 
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
+import type { TxRef } from '@gimbal/shared';
 import type { Mode, VenueId } from '@gimbal/shared';
 import { errorMessage } from '../venues/recorder.ts';
 import type { QuotedMethod, VerifiedQuote } from './oneclick.ts';
 
-export const RESCUE_STATE_VERSION = 1;
+export const RESCUE_STATE_VERSION = 2;
 
 /** How a held transfer or an unknown outcome is cleared by hand once reconciled (also in the file's `_readme`). */
 export const MANUAL_CLEAR = 'stop the engine, delete that hold from "holds" (or set "unknown" to null) in the state file, and start it again';
@@ -67,6 +70,7 @@ export interface SavedQuote {
   recipient: string;
   costE8: string;
   signedAtMs: number;
+  deadlineMs: number;
   timeEstimateS: number | null;
 }
 
@@ -83,10 +87,12 @@ export interface SavedHold {
   /** The payment failed to send (null: sent, or not known to be unsent); deadAt: when it read as never able to run. */
   unsent: { deadAt: number | null } | null;
   authorization: Eip3009Ref | null;
-  /** The desk's eip3009_next before signing (null: not read, or not an EIP-3009 payment). */
-  counter: string | null;
   /** The Arbitrum head before signing, where a payment's Transfer log would start (null: not read). */
   arbBlock: string | null;
+  /** The last Arbitrum block its Transfer logs were read up to (null: none yet); later reads start after it. */
+  scannedTo: string | null;
+  /** The Transfer log (tx:index) from the desk to its deposit address, once seen: it ran. */
+  paidLog: string | null;
   /** The rescuer's Arbitrum USDC set aside for this payment, × 1e6 (given back if it can never run). */
   reservedE6: string;
   /** 1Click's last status for the deposit address (null: not read yet). */
@@ -101,6 +107,10 @@ export interface SavedWithdraw {
   fromBlock: string;
   acceptedAt: number;
   untilMs: number;
+  /** The last Arbitrum block its Bridge2 Transfer was looked for up to (null: none yet). */
+  scannedTo: string | null;
+  /** Its Hyperliquid transactions (withdraw3), for the owner's reconcile. */
+  tx: TxRef[];
 }
 
 /** What a save writes, less the identity and the readme the store adds. */
@@ -109,7 +119,8 @@ export interface RescueSnapshot {
   savedAt: number;
   unknown: string | null;
   holds: SavedHold[];
-  hl: { strandedE6: string; inFlight: SavedWithdraw | null };
+  /** expired: withdraws that never showed, kept so a new one never takes an amount a late Transfer of theirs could have. */
+  hl: { strandedE6: string; inFlight: SavedWithdraw | null; expired: SavedWithdraw[] };
   cap: { usd: number; at: number }[];
   /** Ledger entry ids and Arbitrum log ids (`arb:` + tx:index) already matched to a delivery or a withdraw. */
   seen: string[];
@@ -123,7 +134,7 @@ export function saveQuote(q: VerifiedQuote): SavedQuote {
   return {
     method: q.method, quote: q.quote, signature: q.signature, depositAddress: q.depositAddress, amountIn: q.amountIn.toString(), amountInE8: q.amountInE8.toString(),
     amountOut: q.amountOut.toString(), minAmountOut: q.minAmountOut.toString(), minAmountOutE8: q.minAmountOutE8.toString(), destinationAsset: q.destinationAsset,
-    recipient: q.recipient, costE8: q.costE8.toString(), signedAtMs: q.signedAtMs, timeEstimateS: q.timeEstimateS,
+    recipient: q.recipient, costE8: q.costE8.toString(), signedAtMs: q.signedAtMs, deadlineMs: q.deadlineMs, timeEstimateS: q.timeEstimateS,
   };
 }
 
@@ -131,7 +142,7 @@ export function loadQuote(q: SavedQuote): VerifiedQuote {
   return {
     method: q.method, quote: q.quote, signature: q.signature, depositAddress: q.depositAddress, amountIn: BigInt(q.amountIn), amountInE8: BigInt(q.amountInE8),
     amountOut: BigInt(q.amountOut), minAmountOut: BigInt(q.minAmountOut), minAmountOutE8: BigInt(q.minAmountOutE8), destinationAsset: q.destinationAsset,
-    recipient: q.recipient, costE8: BigInt(q.costE8), signedAtMs: q.signedAtMs, timeEstimateS: q.timeEstimateS,
+    recipient: q.recipient, costE8: BigInt(q.costE8), signedAtMs: q.signedAtMs, deadlineMs: q.deadlineMs, timeEstimateS: q.timeEstimateS,
   };
 }
 
@@ -139,6 +150,7 @@ export function loadQuote(q: SavedQuote): VerifiedQuote {
 
 const METHODS: readonly QuotedMethod[] = ['sol_sign_rescue', 'hl_send_to_intents', 'evm_usdc_to_intents', 'fund_venue'];
 const VENUES: readonly VenueId[] = ['hyperliquid', 'phoenix', 'orderly'];
+const CHAINS: readonly TxRef['chain'][] = ['near', 'hyperliquid', 'solana', 'arbitrum'];
 
 function bad(path: string, what: string): never {
   throw new Error(`${path}: ${what}`);
@@ -186,7 +198,7 @@ function parseQuote(v: unknown, path: string): SavedQuote {
     depositAddress: nonEmpty(q.depositAddress, `${path}.depositAddress`), amountIn: units(q.amountIn, `${path}.amountIn`), amountInE8: units(q.amountInE8, `${path}.amountInE8`),
     amountOut: units(q.amountOut, `${path}.amountOut`), minAmountOut: units(q.minAmountOut, `${path}.minAmountOut`), minAmountOutE8: units(q.minAmountOutE8, `${path}.minAmountOutE8`),
     destinationAsset: nonEmpty(q.destinationAsset, `${path}.destinationAsset`), recipient: nonEmpty(q.recipient, `${path}.recipient`), costE8: units(q.costE8, `${path}.costE8`),
-    signedAtMs: time(q.signedAtMs, `${path}.signedAtMs`), timeEstimateS: te as number | null,
+    signedAtMs: time(q.signedAtMs, `${path}.signedAtMs`), deadlineMs: time(q.deadlineMs, `${path}.deadlineMs`), timeEstimateS: te as number | null,
   };
 }
 
@@ -205,7 +217,8 @@ function parseHold(v: unknown, path: string): SavedHold {
     reconcileSaid: bool(h.reconcileSaid, `${path}.reconcileSaid`), paying: bool(h.paying, `${path}.paying`),
     unsent: nullable(h.unsent, `${path}.unsent`, (u, p) => ({ deadAt: nullable(obj(u, p).deadAt, `${p}.deadAt`, time) })),
     authorization: nullable(h.authorization, `${path}.authorization`, parseAuthorization),
-    counter: nullable(h.counter, `${path}.counter`, units), arbBlock: nullable(h.arbBlock, `${path}.arbBlock`, units),
+    arbBlock: nullable(h.arbBlock, `${path}.arbBlock`, units), scannedTo: nullable(h.scannedTo, `${path}.scannedTo`, units),
+    paidLog: nullable(h.paidLog, `${path}.paidLog`, nonEmpty),
     reservedE6: units(h.reservedE6, `${path}.reservedE6`), status: nullable(h.status, `${path}.status`, str),
   };
 }
@@ -215,7 +228,19 @@ function parseWithdraw(v: unknown, path: string): SavedWithdraw {
   return {
     rescueId: nonEmpty(w.rescueId, `${path}.rescueId`), amountE6: units(w.amountE6, `${path}.amountE6`), fromBlock: units(w.fromBlock, `${path}.fromBlock`),
     acceptedAt: time(w.acceptedAt, `${path}.acceptedAt`), untilMs: time(w.untilMs, `${path}.untilMs`),
+    scannedTo: nullable(w.scannedTo, `${path}.scannedTo`, units),
+    tx: list(w.tx, `${path}.tx`).map((t, i) => parseTx(t, `${path}.tx[${i}]`)),
   };
+}
+
+function list(v: unknown, path: string): unknown[] {
+  if (!Array.isArray(v)) bad(path, 'not a list');
+  return v;
+}
+
+function parseTx(v: unknown, path: string): TxRef {
+  const t = obj(v, path);
+  return { chain: oneOf(t.chain, `${path}.chain`, CHAINS), id: nonEmpty(t.id, `${path}.id`), url: str(t.url, `${path}.url`) };
 }
 
 /** The state as a save wrote it; throws, naming the field, on anything else. */
@@ -233,7 +258,10 @@ export function parseRescueState(v: unknown): RescueState {
     savedAt: time(s.savedAt, 'state.savedAt'),
     unknown: nullable(s.unknown, 'state.unknown', nonEmpty),
     holds: s.holds.map((h, i) => parseHold(h, `state.holds[${i}]`)),
-    hl: { strandedE6: units(hl.strandedE6, 'state.hl.strandedE6'), inFlight: nullable(hl.inFlight, 'state.hl.inFlight', parseWithdraw) },
+    hl: {
+      strandedE6: units(hl.strandedE6, 'state.hl.strandedE6'), inFlight: nullable(hl.inFlight, 'state.hl.inFlight', parseWithdraw),
+      expired: list(hl.expired, 'state.hl.expired').map((w, i) => parseWithdraw(w, `state.hl.expired[${i}]`)),
+    },
     cap: s.cap.map((c, i) => {
       const e = obj(c, `state.cap[${i}]`);
       if (typeof e.usd !== 'number' || !Number.isFinite(e.usd) || e.usd < 0) bad(`state.cap[${i}].usd`, 'not a non-negative number');
@@ -247,6 +275,20 @@ export type LoadedState =
   | { kind: 'none' }
   | { kind: 'loaded'; state: RescueState }
   | { kind: 'unusable'; problem: string };
+
+/**
+ * The rename itself made durable: on POSIX a rename is in the directory, which is fsynced too (a crash right after
+ * would otherwise leave the old file). Windows cannot open a directory for fsync, and NTFS journals the rename.
+ */
+function syncDir(dir: string): void {
+  if (process.platform === 'win32') return;
+  const fd = openSync(dir, 'r');
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
 
 /** Blocks the thread for `ms`: a save is synchronous so that nothing is signed before it is on disk. */
 function pause(ms: number): void {
@@ -320,6 +362,7 @@ export class RescueStateStore {
       for (let attempt = 1; ; attempt++) {
         try {
           this.#rename(tmp, this.path);
+          syncDir(dirname(this.path));
           return;
         } catch (err) {
           if (attempt >= this.#tries || !RETRIED_RENAME.has((err as NodeJS.ErrnoException).code ?? '')) throw err;

@@ -3,9 +3,14 @@
 // each pass a source over with a note.
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import type { PlanInput } from './plan.ts';
-import { CapLedger, HL_WITHDRAW_FEE_USD, MAX_FEE_SHARE, amountInFor, bridgeMinUsd, expectedFeeUsd, planRescue } from './plan.ts';
+import { CapLedger, HL_WITHDRAW_FEE_USD, MAX_FEE_SHARE, amountInFor, bridgeMinUsd, expectedFeeUsd, planRescue, rescueSizes, sizeText } from './plan.ts';
+
+const FINAL_POLICY = JSON.parse(readFileSync(new URL('../../../tools/mainnet-final-policy.json', import.meta.url), 'utf8')) as {
+  rescue_cap_usd_per_hour: number; max_transfer_cost_bps: number; max_transfer_cost_flat_e6: number;
+};
 
 const base = (over: Partial<PlanInput> = {}): PlanInput => ({
   target: { venue: 'hyperliquid', symbol: 'ETH', amountUsd: 40, marginUsd: 200 },
@@ -182,4 +187,31 @@ test('the cap ledger lists what still weighs, so a restart can count it again', 
   const again = new CapLedger();
   for (const e of c.entries(3_600_000)) again.add(e.usd, e.at);
   assert.equal(again.used(3_600_000), c.used(3_600_000));
+});
+
+test('the rescue sizes at the final mainnet policy, per route (printed): Hyperliquid out fits between its withdraw fee and the 50 USD cap', (t) => {
+  assert.deepEqual([FINAL_POLICY.rescue_cap_usd_per_hour, FINAL_POLICY.max_transfer_cost_bps, FINAL_POLICY.max_transfer_cost_flat_e6], [50, 300, 1_000_000]);
+  for (const keyed of [true, false]) {
+    const sizes = rescueSizes(FINAL_POLICY, keyed);
+    for (const r of sizes) t.diagnostic(`final policy, ${keyed ? 'with' : 'without'} a 1Click key: ${r.from} -> ${r.to} ${sizeText(r)}`);
+    if (!keyed) continue;
+    const text = Object.fromEntries(sizes.map((r) => [`${r.from}->${r.to}`, sizeText(r)]));
+    // The numbers in plan.ts's header.
+    assert.deepEqual(text, {
+      'reserve->hyperliquid': 'from 2.86 USD', 'reserve->orderly': 'from 0.01 USD', 'reserve->phoenix': 'from 0.44 USD',
+      'phoenix->hyperliquid': 'from 2.86 to 49.40 USD', 'phoenix->orderly': 'from 0.01 to 49.67 USD', 'hyperliquid->phoenix': 'from 10.39 to 24.31 USD',
+    });
+  }
+  // The smallest passes, a cent less does not (the fee share), and the largest is the cap's.
+  const plan = (amountUsd: number) => planRescue(base({
+    target: { venue: 'phoenix', symbol: 'ETH', amountUsd, marginUsd: 200 }, reserveUsd: 0, freeMargin: { hyperliquid: 1000 }, legVenues: ['phoenix', 'hyperliquid'],
+    capUsd: 50, maxCostBps: 300, maxCostFlatE6: 1_000_000, arbitrumUsd: 0, reduce: 'none',
+  }));
+  assert.equal(plan(10.39).kind, 'transfer');
+  assert.match(plan(10.38).notes.join(' '), /hyperliquid: fees of about .* over the 10 %.*rescue sizes at this policy: .*hyperliquid -> phoenix from 10\.39 to 24\.31 USD/);
+  const top = plan(24.31);
+  assert.ok(top.kind === 'transfer' && top.capUsd <= 50, 'withdraw and bridge both within the cap');
+  assert.match(plan(24.32).notes.join(' '), /hyperliquid: over the rescue cap/);
+  // At the old 20 USD cap no rescue out of Hyperliquid fits.
+  assert.equal(rescueSizes({ ...FINAL_POLICY, rescue_cap_usd_per_hour: 20 }, true).find((r) => r.from === 'hyperliquid')!.minUsd, null);
 });
