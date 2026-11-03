@@ -924,17 +924,35 @@ windows pass without a veto check.
 the contract still decides what is possible, so the loop can lose money on a bad trade but cannot move money
 anywhere the policy does not allow.
 
-- `decide.ts` (pure): `decide(DecideInput) → Decision` with the shapes in that file. Entry: the best enterable
-  window (`isEnterable`, `netAprPct ≥ minNetAprPct`) that held for `LOOP_RULES.enterAfterChecks` hourly checks in a
-  row, the 7 d and 14 d spread signs agreeing with this hour's, depth on both legs; size `legUsd` capped by the
-  policy's `max_notional_usd` less the band and by free margin; leverage ≤ `maxLeverage`, ≤ 1.5 on a leg without a
-  live rescue. Exit: expected net over the rest of the hold < 0 or under the threshold, or a sign flip, for
-  `exitAfterChecks` checks; the time stop; drawdown ≥ `stopDrawdownPct`; then `cooldownHours`. Rotation: another
-  window beats the held one by `rotate.minGainPts` for `rotate.forHours` and `switchCostUsd` pays back within the
-  hold; windows on venues that already hold the margin first; at most `maxRotationsPerDay`. Every decision carries a
-  one-line reason with the numbers; a `wait` is journaled only when its reason changes.
-- `veto.ts`: the NEAR AI veto before an enter or a rotate (the client behind `POST /policy/draft`); no answer in
-  `vetoTimeoutMs` = pass, journaled "no veto check". A veto drops the window and writes a `veto` entry.
+- `decide.ts` (pure): `decide(DecideInput) → Decision` with the shapes in that file. Entry: the top of the
+  scanner's ranked list among the windows passing the entry rules (`isEnterable`, `netAprPct ≥ minNetAprPct`, the
+  7 d and 14 d spread signs agreeing with this hour's, depth on both legs), once it has passed them for
+  `LOOP_RULES.enterAfterChecks` hourly checks in a row; until then the loop waits on it ("k of N hours") and never
+  enters a lower window instead. Size: `legUsd` capped by the policy's `max_notional_usd` less the band, by free
+  margin at the leverage and by depth, rounded down to whole common lots; a cap that is not a finite number or is
+  ≤ 0 sizes nothing. Leverage ≤ `maxLeverage`, ≤ 1.5 on a leg without a live rescue. Exit: the held window's net
+  without the opening fills it already paid (exit costs kept in) over the rest of the hold < 0 or under
+  `minNetAprPct`, or a sign flip, for `exitAfterChecks` checks; the time stop; drawdown ≥ `stopDrawdownPct`, where
+  drawdown is `HeldPair.pnlUsd` against one leg's notional `HeldPair.legUsd`; then `cooldownHours`. A held pair whose
+  P&L, leg size (≤ 0 included) or net is not a finite number gets no act: a `wait`, "held pair numbers unknown",
+  never counted healthy. Rotation: another window beats the held one by `rotate.minGainPts` for `rotate.forHours`
+  and `switchCostUsd` pays back within the hold at that gain on the new leg's sized `legUsd` (the switch cost is not
+  scaled); the new legs are sized on free margin plus `DecideInput.freedMarginUsd` (loop.ts measures it: the held
+  legs' margin plus that leg's P&L, per venue; absent = none); windows on venues that already hold the margin first;
+  at most `maxRotationsPerDay`. Every decision carries a one-line reason with the numbers; a `wait` is journaled only
+  when its reason or failure category changes.
+  - `qty` on an `enter` or `rotate` act is the base units a leg, whole common lots of both venues. The executor
+    opens exactly `qty` and never derives a size again from `legUsd` (which is `qty` at the price it was sized at).
+  - On a `rotate`, loop.ts sets `HeldPair.since` to the rotation time: the time stop and the payback horizon start
+    again.
+  - A veto or a failed act: loop.ts saves `skipAct(input, decision)` instead of `decision.counters`; on a NEAR AI veto,
+    `skipAct(input, decision, { vetoed: true })` holds that window out of entries and rotations for
+    `LOOP_RULES.vetoHoldHours` (6 h, `LoopCounters.vetoedUntil`) and starts its counts again, and the wait says so.
+    Saved counters without `vetoedUntil` read as none vetoed.
+- `veto.ts`: the NEAR AI veto before an enter or a rotate (the client behind `POST /policy/draft`). No key, no
+  answer in `vetoTimeoutMs`, or a transport/HTTP error = pass, journaled "no veto check". A reply that came but is
+  not a readable verdict (no JSON object, not "pass" or "veto" after trimming and lowercasing, cut off at its token
+  limit) fails closed: a veto, "unreadable reply". A veto drops the window and writes a `veto` entry.
 - `loop.ts` (serve): runs `decide` after each funding payment (the hourly check) and on each scan event, only with
   `GIMBAL_TRADE=1` and `strategy.auto`, one decision at a time under the per-desk trader lock, never while a rescue
   or an ADL unwind runs. It carries `act` out with the same open and close code as `pair-mainnet` (maker first),

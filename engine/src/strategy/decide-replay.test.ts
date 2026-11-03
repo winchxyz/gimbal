@@ -7,7 +7,7 @@
 // Where the recording does not contain the case, the windows are changed, and the test says so in its output:
 // - the recording has no second week of history (every desk window is "14-day history loading", a failing check):
 //   that check is replaced by a passing one, so the 7-day net decides, as it would once the week is in;
-// - from hour 3 NEAR compresses to 2 % net (the exit case); from hour 4 SOL long Orderly / short Phoenix nets 8 %
+// - from hour 3 NEAR compresses to 2 % net of the exit (the exit case); from hour 4 SOL long Orderly / short Phoenix nets 8 %
 //   (somewhere else to enter); from hour 12 ETH long Phoenix / short Orderly nets 30 % and SOL long Orderly / short
 //   Hyperliquid 40 % (the rotation case: ETH on the venues that hold the margin, SOL needing Hyperliquid margin
 //   moved in, which its recorded switch cost never pays back on a 12 USD leg);
@@ -32,6 +32,7 @@ import { NO_BREAKEVEN_TEXT } from '../scanner/price.ts';
 import type { OracleSource } from '../scanner/price.ts';
 import { Scanner } from '../scanner/scanner.ts';
 import { LIVE_RESCUE } from '../trade/carry-plan.ts';
+import { commonLot, toQty } from '../trade/lots.ts';
 import { VirtualClock, readRecording } from '../venues/replay.ts';
 import { NO_COUNTERS, decide, skipAct } from './decide.ts';
 import type { DecideInput, Decision, HeldPair, LoopCounters } from './decide.ts';
@@ -79,7 +80,8 @@ function shape(h: number, windows: readonly FundingWindow[]): FundingWindow[] {
       .filter((c) => !(loading && c.text === NO_BREAKEVEN_TEXT))
       .map((c) => (LOADING.test(c.text) ? { ok: true, text: '[test] the recording has no second week: judged on its 7 days' } : c));
     let netAprPct = w.netAprPct;
-    if (w.id === NEAR && h >= 3) netAprPct = 2;
+    // Held, NEAR is judged without its opening fills (heldNetAprPct): 2 % net of the exit.
+    if (w.id === NEAR && h >= 3) netAprPct = 2 - (w.costs.feesPct + w.costs.slippagePct) / 2;
     if (w.id === SOL && h >= 4) netAprPct = 8;
     if (w.id === ETH && h >= 12) netAprPct = 30;
     if (w.id === SOL_HL && h >= 12) netAprPct = 40;
@@ -87,7 +89,7 @@ function shape(h: number, windows: readonly FundingWindow[]): FundingWindow[] {
   });
 }
 
-interface Step { h: number; d: Decision; veto: string | null }
+interface Step { h: number; d: Decision; veto: string | null; px: Map<string, number> }
 
 async function run(): Promise<Step[]> {
   const lines = readRecording(RECORDING);
@@ -133,6 +135,8 @@ async function run(): Promise<Step[]> {
       now: simStart + h * HOUR, hourly: true, windows, held, strategy: STRAT, maxNotionalUsd: POLICY.max_notional_usd,
       priceBandBps: POLICY.price_band_bps, freeMarginUsd: { hyperliquid: 20, phoenix: 20, orderly: 20 }, liveRescue: LIVE_RESCUE, counters,
       gross14dAprPct: Object.fromEntries(windows.map((w) => [w.id, scanner.carry(w.id)?.estimate.gross.d14AprPct ?? null])),
+      // What loop.ts measures: the held legs' margin at 1.5x (their P&L is 0 here).
+      freedMarginUsd: held === null ? {} : Object.fromEntries([...heldVenues].map((v) => [v, held!.legUsd / 1.5])),
     };
     const d = decide(input);
     let line: string | null = null;
@@ -151,7 +155,7 @@ async function run(): Promise<Step[]> {
       if (process.env.E10_DUMP_FACTS === '1') console.error(`FACTS ${JSON.stringify(facts)}`);
       const r = await checkVeto(veto, facts, { now: input.now });
       line = r.line;
-      if (r.veto.verdict === 'veto') counted = skipAct(input, d);
+      if (r.veto.verdict === 'veto') counted = skipAct(input, d, { vetoed: true });
     }
     // loop.ts carries the act out; here it simply happens.
     if (counted === d.counters && d.act !== null) {
@@ -166,7 +170,7 @@ async function run(): Promise<Step[]> {
       }
     }
     counters = counted;
-    steps.push({ h, d, veto: line });
+    steps.push({ h, d, veto: line, px: new Map([...marks].filter((e): e is [string, number] => e[1] != null)) });
   }
   return steps;
 }
@@ -184,16 +188,23 @@ test('a recorded hour of mainnet scans, one an hour: enter, compression, exit, c
   ]);
   const at = (h: number) => steps[h]!.d;
   // Sizes: at most the 12 USD leg, rounded down to whole lots at the recorded mark, never under 10 USD.
+  // The qty is whole common lots of the two venues, and legUsd is that qty at the price it was sized at.
   const sized = (h: number, kind: 'enter' | 'rotate', id: string) => {
-    const a = at(h).act as { kind: string; legUsd: number; leverage: number; windowId?: string; toId?: string };
+    const a = at(h).act as { kind: string; legUsd: number; leverage: number; qty: string; windowId?: string; toId?: string };
     assert.equal(a.kind, kind);
     assert.equal(a.windowId ?? a.toId, id);
     assert.equal(a.leverage, 1.5, 'Phoenix has no live rescue');
     assert.ok(a.legUsd >= 10 && a.legUsd <= 12, `${a.legUsd}`);
+    const [symbol, longVenue, shortVenue] = id.split('-') as [string, VenueId, VenueId];
+    const lots = LOTS[symbol.toUpperCase()]!;
+    const q = toQty(a.qty);
+    assert.ok(q > 0n && q % commonLot(toQty(lots[longVenue]), toQty(lots[shortVenue])) === 0n, `${a.qty} in whole lots`);
+    const px = steps[h]!.px.get(symbol.toUpperCase())!;
+    assert.ok(Math.abs(Number(a.qty) * px - a.legUsd) < 0.01, `${a.qty} at ${px} is ${a.legUsd}`);
   };
   sized(2, 'enter', NEAR);
   assert.match(at(2).decision.reason, /^Enter NEAR \(long Hyperliquid, short Phoenix\): \d+\.\d % net, 3 of 3 hours above 5 %/);
-  assert.match(at(5).decision.reason, /^Exit NEAR: 2\.0 % net, under your 5 % minimum, 3 of 3 hours in a row$/);
+  assert.match(at(5).decision.reason, /^Exit NEAR: 2\.0 % net of the exit, under your 5 % minimum, 3 of 3 hours in a row$/);
   assert.match(at(6).decision.reason, /^Cooling down after the exit, 5\.0 h left/);
   sized(11, 'enter', SOL);
   // SOL long Orderly / short Hyperliquid nets more, but its switch moves margin onto Hyperliquid and never pays back on

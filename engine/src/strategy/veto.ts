@@ -1,9 +1,10 @@
 // The NEAR AI veto before an enter or a rotate (docs/interfaces.md §3 "Strategy loop"): the window's facts go to the
 // same client, endpoint, key and model as POST /policy/draft, and the model answers {verdict: 'pass' | 'veto',
 // reasons}, before every enter and every rotate. A veto can only remove a window: nothing the model says changes the
-// window, the size or the leverage, or is sent to the contract or a venue. No key, no
-// answer within LOOP_RULES.vetoTimeoutMs, NEAR AI down, or a reply that is not a verdict: the window passes, and the
-// journal line says "no veto check".
+// window, the size or the leverage, or is sent to the contract or a venue. No key, no answer within
+// LOOP_RULES.vetoTimeoutMs, or NEAR AI down (a transport or HTTP error): the window passes, and the journal line says
+// "no veto check". A reply that came but cannot be read as a verdict (not JSON, no verdict, cut off at its token
+// limit) fails closed: it is a veto, "unreadable reply".
 //
 // The prompt is built from the facts alone (no clock, no ids that change between runs), so a recorded exchange is
 // found again by its prompt: RecordedVeto plays a recording back without a key (replay mode, tests). checkVeto returns
@@ -131,7 +132,7 @@ export interface VetoExchange {
 
 export interface VetoResult {
   veto: Veto;
-  /** false = no veto check: the window passes unchecked, and `line` says why. */
+  /** false = no veto check (no answer came): the window passes unchecked, and `line` says why. */
   checked: boolean;
   /** One line for the journal: "NEAR AI passed …", "NEAR AI vetoed …: <reason>", or "no veto check: <why>". */
   line: string;
@@ -158,9 +159,34 @@ export function promptKey(messages: readonly ChatMessage[]): string {
   return createHash('sha256').update(JSON.stringify(messages)).digest('hex').slice(0, 24);
 }
 
-/** The model's answer as a verdict; NearAiUnavailable when it is not one. */
+/**
+ * The first JSON object in a model's text: ``` fences and any words around it are dropped. NearAiUnavailable when
+ * there is none, or it is not closed (a reply cut short).
+ */
+export function firstJsonObject(text: string): Record<string, unknown> {
+  const start = text.indexOf('{');
+  if (start < 0) throw new NearAiUnavailable('the model\'s reply has no JSON object');
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}' && --depth === 0) return parseJsonObject(text.slice(start, i + 1));
+  }
+  throw new NearAiUnavailable('the model\'s reply has a JSON object that is never closed');
+}
+
+/** The model's answer as a verdict (trimmed, any case); NearAiUnavailable when it is not one. */
 export function parseVerdict(value: Record<string, unknown>): { verdict: 'pass' | 'veto'; reasons: string[] } {
-  const v = value.verdict;
+  const v = typeof value.verdict === 'string' ? value.verdict.trim().toLowerCase() : value.verdict;
   if (v !== 'pass' && v !== 'veto') throw new NearAiUnavailable('the reply is not a verdict ("pass" or "veto")');
   const raw = Array.isArray(value.reasons) ? value.reasons : [];
   const reasons = raw
@@ -172,8 +198,16 @@ export function parseVerdict(value: Record<string, unknown>): { verdict: 'pass' 
   return { verdict: v, reasons: v === 'veto' && reasons.length === 0 ? ['no reason given'] : reasons };
 }
 
+/** NearAiUnavailable messages that mean no reply came at all (transport, HTTP, no key, nothing recorded). */
+const NO_ANSWER = ['NEAR_AI_API_KEY is not set', 'NEAR AI did not answer', 'NEAR AI answered HTTP', 'no recorded veto reply'];
+
+/** The reason a veto that fails closed carries. */
+export const UNREADABLE_REPLY = 'unreadable reply';
+
 /**
- * Asks for a verdict on `facts`. Never throws: every way it cannot get one is a pass with "no veto check".
+ * Asks for a verdict on `facts`. Never throws. A timeout or a transport/HTTP error passes with "no veto check"; a
+ * reply that came but is not a readable verdict (including one cut off at its token limit) is a veto, "unreadable
+ * reply".
  */
 export async function checkVeto(
   source: VetoSource, facts: VetoFacts, options: { now: number; timeoutMs?: number },
@@ -185,6 +219,12 @@ export async function checkVeto(
     line: `no veto check on ${facts.symbol}: ${why}`,
     exchange: null,
   });
+  const unreadable = (why: string, exchange: VetoExchange): VetoResult => ({
+    veto: { verdict: 'veto', reasons: [UNREADABLE_REPLY], model: source.model, at: options.now },
+    checked: true,
+    line: `NEAR AI vetoed ${facts.symbol}: ${UNREADABLE_REPLY} (${why})`,
+    exchange,
+  });
   if (!source.configured) return unchecked('NEAR_AI_API_KEY is not set');
   const messages = vetoMessages(facts);
   const asked: VetoExchange = { key: promptKey(messages), model: source.model, messages, response: null };
@@ -192,15 +232,22 @@ export async function checkVeto(
   try {
     completion = await withTimeout(source.complete(messages, { json: true, maxTokens: MAX_TOKENS }), timeoutMs, 'NEAR AI veto');
   } catch (err) {
-    const why = err instanceof NearAiUnavailable ? err.message : /no answer within/.test(errorMessage(err)) ? `no answer within ${timeoutMs / 1000} s` : errorMessage(err);
-    return { ...unchecked(why), exchange: asked };
+    const message = errorMessage(err);
+    if (!(err instanceof NearAiUnavailable) && /no answer within/.test(message)) {
+      return { ...unchecked(`no answer within ${timeoutMs / 1000} s`), exchange: asked };
+    }
+    if (err instanceof NearAiUnavailable && NO_ANSWER.some((p) => message.startsWith(p))) {
+      return { ...unchecked(message), exchange: asked };
+    }
+    // A reply came and could not be read (cut off, not a chat completion, not JSON): fail closed.
+    return unreadable(message, asked);
   }
   const exchange: VetoExchange = { ...asked, response: completion.raw };
   let verdict: ReturnType<typeof parseVerdict>;
   try {
-    verdict = parseVerdict(parseJsonObject(completion.content));
+    verdict = parseVerdict(firstJsonObject(completion.content));
   } catch (err) {
-    return { ...unchecked(errorMessage(err)), exchange };
+    return unreadable(errorMessage(err), exchange);
   }
   const veto: Veto = { verdict: verdict.verdict, reasons: verdict.reasons, model: source.model, at: options.now };
   const line = verdict.verdict === 'veto'

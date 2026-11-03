@@ -1,14 +1,14 @@
 // The NEAR AI veto: the request (same client, endpoint, key and model as POST /policy/draft), the verdict, every way
-// it falls back to "no veto check", and the recorded exchanges played back without a key.
+// it falls back to "no veto check" or fails closed, and the recorded exchanges played back without a key.
 
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
-import { NEAR_AI_MODEL, NEAR_AI_URL, NearAiClient } from '../nearai/client.ts';
+import { NEAR_AI_MODEL, NEAR_AI_URL, NearAiClient, NearAiUnavailable } from '../nearai/client.ts';
 import { completion, fixedFetch } from '../nearai/test-helpers.ts';
 import { LOOP_RULES } from './decide.ts';
 import { PASS_FACTS, T0, VETO_FACTS, VETO_FIXTURE, win } from './test-helpers.ts';
-import { RecordedVeto, checkVeto, parseVerdict, promptKey, vetoFacts, vetoJournalNumbers, vetoMessages } from './veto.ts';
+import { RecordedVeto, UNREADABLE_REPLY, checkVeto, parseVerdict, promptKey, vetoFacts, vetoJournalNumbers, vetoMessages } from './veto.ts';
 import type { VetoSource } from './veto.ts';
 
 const KEY = 'test-key-not-real';
@@ -76,16 +76,54 @@ test('the exchange goes into a journal entry as strings: model, key, the facts s
   assert.deepEqual(played.veto, r.veto);
 });
 
-test('NEAR AI down, or a reply that is not a verdict: pass, "no veto check"', async () => {
-  const down = await checkVeto(new NearAiClient({ apiKey: KEY, fetch: fixedFetch({ error: { message: 'overloaded' } }, 503).fetch }), PASS_FACTS, { now: T0 });
+const ask = (body: unknown, status = 200) =>
+  checkVeto(new NearAiClient({ apiKey: KEY, fetch: fixedFetch(body, status).fetch }), PASS_FACTS, { now: T0 });
+
+test('NEAR AI down (HTTP or transport error): pass, "no veto check"', async () => {
+  const down = await ask({ error: { message: 'overloaded' } }, 503);
   assert.equal(down.line, 'no veto check on NEAR: NEAR AI answered HTTP 503: overloaded');
   assert.equal(down.veto.verdict, 'pass');
-  const odd = await checkVeto(new NearAiClient({ apiKey: KEY, fetch: fixedFetch(completion({ verdict: 'maybe' })).fetch }), PASS_FACTS, { now: T0 });
-  assert.equal(odd.checked, false);
-  assert.equal(odd.line, 'no veto check on NEAR: the reply is not a verdict ("pass" or "veto")');
-  assert.notEqual(odd.exchange, null, 'what was answered is still kept for the record');
-  const prose = await checkVeto(new NearAiClient({ apiKey: KEY, fetch: fixedFetch(completion('looks fine to me')).fetch }), PASS_FACTS, { now: T0 });
-  assert.equal(prose.line, 'no veto check on NEAR: the model\'s reply is not JSON');
+  assert.equal(down.checked, false);
+  const broken: VetoSource = {
+    model: NEAR_AI_MODEL, configured: true,
+    complete: async () => { throw new NearAiUnavailable('NEAR AI did not answer: connection reset'); },
+  };
+  const reset = await checkVeto(broken, PASS_FACTS, { now: T0 });
+  assert.equal(reset.veto.verdict, 'pass');
+  assert.equal(reset.line, 'no veto check on NEAR: NEAR AI did not answer: connection reset');
+});
+
+test('a verdict in any case, padded, fenced or after words is read', async () => {
+  const veto = await ask(completion('{"verdict": "Veto", "reasons": ["a spike"]}'));
+  assert.equal(veto.veto.verdict, 'veto');
+  assert.equal(veto.line, 'NEAR AI vetoed NEAR: a spike');
+  assert.equal((await ask(completion('{"verdict": "VETO ", "reasons": ["a spike"]}'))).veto.verdict, 'veto');
+  assert.equal((await ask(completion('{"verdict": " Pass\\n"}'))).veto.verdict, 'pass');
+  const fenced = await ask(completion('```json\n{"verdict": "veto", "reasons": ["the 14-day spread is {negative}"]}\n```'));
+  assert.deepEqual(fenced.veto.reasons, ['the 14-day spread is {negative}']);
+  const after = await ask(completion('Here is my answer: {"verdict": "pass", "reasons": []} Thanks.'));
+  assert.equal(after.veto.verdict, 'pass');
+  assert.equal(after.checked, true);
+});
+
+test('a reply that cannot be read fails closed: a veto, "unreadable reply"', async () => {
+  const cases: [unknown, RegExp][] = [
+    [completion({ verdict: 'maybe' }), /the reply is not a verdict/],
+    [completion('looks fine to me'), /has no JSON object/],
+    [completion('{"verdict": "pass", "reasons": ["the spread'), /never closed/],
+    [completion('{"verdict": "pass"}', 'length'), /cut off at its token limit/],
+    [{ choices: [] }, /not a chat completion/],
+  ];
+  for (const [body, why] of cases) {
+    const r = await ask(body);
+    assert.deepEqual(r.veto, { verdict: 'veto', reasons: [UNREADABLE_REPLY], model: NEAR_AI_MODEL, at: T0 });
+    assert.equal(r.checked, true);
+    assert.match(r.line, /^NEAR AI vetoed NEAR: unreadable reply \(/);
+    assert.match(r.line, why);
+    assert.notEqual(r.exchange, null, 'what was asked is still kept for the record');
+  }
+  const thrown: VetoSource = { model: NEAR_AI_MODEL, configured: true, complete: async () => { throw new TypeError('boom'); } };
+  assert.equal((await checkVeto(thrown, PASS_FACTS, { now: T0 })).veto.verdict, 'veto');
 });
 
 test('parseVerdict keeps at most 3 one-line reasons of at most 200 characters; a veto always has one', () => {
