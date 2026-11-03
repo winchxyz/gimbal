@@ -34,6 +34,13 @@
 // pair-mainnet run). One resting on the pair's coin at start makes the pair alert only (it could fill under the trader,
 // and the ADL watch would read the fill as a shrink or a growth of ours), with a line naming it; cancel it, reconcile
 // and start again. panic_close cancels every resting order on the policy's Hyperliquid coins first (cancelResting).
+//
+// A start that cannot read what it needs (review S1: Hyperliquid info, the Phoenix API, Solana's slot, NEAR RPC, or
+// a Phoenix snapshot that stays behind the chain's confirmed slot) does not stop serve: the pair starts alert only
+// with its legs unknown (nothing adopted, `unconfirmed` says why, the hands refuse every act), the reads are tried
+// again on a timer with backoff up to START_RETRY_MAX_MS, and the pair goes live once both legs, synced to their
+// chains, read twice alike. The transitions are journaled and the venue's health says slow or down meanwhile. Only
+// a ConfigError (a bad env, a contract on another network) stops the start.
 
 import type { ContractPolicy, Mode, StreamEvent, TxRef } from '@gimbal/shared';
 import type { NearTransport } from '../contract/near-client.ts';
@@ -71,6 +78,7 @@ import type { OpsCtx, PairRunner } from './pair-ops.ts';
 import { pairOf, planClose, planOpen, recheckOpenSize, sendClose, sendOpen } from './pair-ops.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { checkContractNetwork, contractEnv } from './serve-contract.ts';
+import { ConfigError, START_RETRY_MAX_MS, startBackoffMs } from './start-errors.ts';
 
 /** The IOC slippage of serve's closes, as pair-mainnet's default. */
 export const SERVE_SLIPPAGE_BPS = 50;
@@ -154,6 +162,8 @@ export interface ServePairInput {
   once?: boolean;
   sleep?: (ms: number) => Promise<void>;
   deps?: Partial<ServePairDeps>;
+  /** What the start could read of each venue it needs (serve's health map): slow or down until the start is confirmed. */
+  health?: (venue: StartVenue, status: 'ok' | 'slow' | 'down', detail: string | null) => void;
   /** A protection's close (panic_close, a rescue's reduce, an ADL unwind) as it ended: serve's position book takes it. */
   onProtectionClose?: (report: ProtectionCloseReport) => void;
 }
@@ -234,6 +244,10 @@ export interface ServePair {
   drain(timeoutMs: number): Promise<boolean>;
   /** Settles the orders in flight from before the restart from the venues (serve runs it on a timer; tests call it). */
   settleInFlight?: () => Promise<string | null>;
+  /** Why the start is not confirmed (a read it needs failed; the legs are unknown, nothing trades), or null once it is. */
+  unconfirmed?(): string | null;
+  /** Tries the start again now while it is not confirmed (serve runs it on a timer; tests call it); the line when it was. */
+  retryStart?: () => Promise<string | null>;
   /** Turns trading off first (every order and close refused from then on), then stops the watch and the trader, closes the readers and releases the lock. */
   stop(): void;
 }
@@ -241,6 +255,32 @@ export interface ServePair {
 const none = (lines: string[], why: string, stop: () => void = () => {}): ServePair => ({
   pair: null, adl: undefined, reducer: () => null, notTrading: () => why, lines, drain: async () => true, stop,
 });
+
+/** What a start reads from: the two venues and NEAR (the signing client). */
+export type StartVenue = 'hyperliquid' | 'phoenix' | 'near';
+
+/** A start read that failed (a timeout, an HTTP error, a lagging snapshot): tried again, never a reason to exit. */
+export class StartReadError extends Error {
+  readonly venue: StartVenue;
+  /** What it says of the venue's health; null: nothing (two reads that differ). */
+  readonly status: 'slow' | 'down' | null;
+  constructor(venue: StartVenue, status: 'slow' | 'down' | null, message: string) {
+    super(message);
+    this.name = 'StartReadError';
+    this.venue = venue;
+    this.status = status;
+  }
+}
+
+/** `run`, its failure a StartReadError of `venue` (a ConfigError or a StartReadError is passed on as it is). */
+async function startRead<T>(venue: StartVenue, run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (err) {
+    if (err instanceof ConfigError || err instanceof StartReadError) throw err;
+    throw new StartReadError(venue, 'down', `${venue}: ${errorMessage(err)}`);
+  }
+}
 
 /** Resting Hyperliquid orders of `coin` in an openOrders answer; a string when the answer cannot be read. */
 export function restingOn(raw: unknown, coin: string): { side: LegSide | string; sz: string; oid: unknown }[] | string {
@@ -317,44 +357,14 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
   try {
     const identity = { contractId, deskId: input.deskId, evm };
     const store = new TraderStateStore(traderStateFile(input.stateDir ?? userStateDir(env), input.mode, identity), identity);
-    const saved = store.load();
     const freshWant = `${contractId}/${input.deskId}`;
-
-    // ---- which pair ----
     const common = policy.hl_assets.map((a) => a.symbol).filter((s) => policy.phoenix_markets.some((m) => m.symbol === s));
-    const held = [...new Set([...(await deps.hlHeld(evm)), ...(await deps.phoenixHeld(desk.solana.authority))])];
-    const lines: string[] = [];
-    const outside = held.filter((s) => !common.includes(s));
-    if (outside.length > 0) lines.push(`pair      not protected (not in both policy lists): ${outside.join(', ')}`);
-    const open = held.filter((s) => common.includes(s));
-    if (open.length > 1) {
-      stopNone();
-      return none([...lines, `pair      NONE: ${open.join(' and ')} are both open; serve protects one pair: close one with pair-mainnet first`], 'two pairs are open: serve protects none');
-    }
-    const savedSymbol = saved.kind === 'loaded' ? saved.state.symbol : null;
-    const symbol = open[0] ?? env('GIMBAL_PAIR_SYMBOL')?.trim() ?? savedSymbol ?? (common.length === 1 ? common[0]! : null);
     const flatWhy = `both legs flat and no GIMBAL_PAIR_SYMBOL (policy pairs: ${common.join(', ') || 'none'})`;
-    if (symbol === null) {
-      // Nothing held: a trading serve still keeps the lock when the state allows trading, so the loop may open one.
-      const fresh = env('GIMBAL_TRADER_FRESH');
-      const stateWhy = saved.kind === 'loaded' || fresh === freshWant ? null
-        : saved.kind === 'none' ? `no trader state at ${store.path}: a missing file is not a fresh start; after checking both legs on the venues, start once with GIMBAL_TRADER_FRESH=${freshWant}`
-        : `${saved.problem}; after reconciling both legs, start once with GIMBAL_TRADER_FRESH=${freshWant}`;
-      if (!wantLive || stateWhy !== null || common.length === 0) {
-        stopNone();
-        const why = !wantLive ? 'nothing to protect' : stateWhy ?? 'the policy lists no symbol in both hl_assets and phoenix_markets';
-        return none([...lines, `pair      none: ${flatWhy}; ${why}`], 'no pair is open');
-      }
-    }
-    if (symbol !== null && !common.includes(symbol)) {
-      stopNone();
-      return none([...lines, `pair      none: ${symbol} is not in both policy.hl_assets and policy.phoenix_markets (${common.join(', ') || 'none'})`], `${symbol} is not a policy pair`);
-    }
 
-    // ---- the signing side ----
+    // ---- the signing side: loaded by the first start attempt that gets that far, then kept ----
     let relayer: Relayer | null = null;
     let client: NearContractClient = input.side.client;
-    if (wantLive) ({ client, relayer } = await deps.signing());
+    let signing = false;
     const prices: PriceDeps = {
       maxAgeS: policy.oracle_max_age_s, send: wantLive, read: (s) => storedPrice(client, s),
       refresh: (s, maxAgeS) => client.refreshPrices([s], { maxAgeS }), now: () => input.clock.now(), log: (l) => log(`pair ${l.trim()}`),
@@ -377,19 +387,21 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
     };
 
     /** `symbol`'s pair, built and adopted as the start does (see the header); `start` false: a later open's new pair. */
-    const makeSlot = async (sym: string, start: boolean): Promise<Slot> => {
+    const makeSlot = async (sym: string): Promise<Slot> => {
       let live = false;
       let suspended = false;
       let planning = false;
-      const legs = await deps.buildLegs({ symbol: sym, client, relayer, prices, trading: () => live && !suspended && !planning });
+      // The Phoenix exchange snapshot (and the market's spline) are read here: a failure is a start read that failed.
+      const legs = await startRead('phoenix', () => deps.buildLegs({ symbol: sym, client, relayer, prices, trading: () => live && !suspended && !planning }));
       const why: string[] = [];
       why.push(...legs.mismatches);
       if (!(priceLifeS(policy.oracle_max_age_s) > PRICE_MARGIN_S)) {
         why.push(`oracle_max_age_s ${policy.oracle_max_age_s} leaves a fresh price ${priceLifeS(policy.oracle_max_age_s)} s, not more than the ${PRICE_MARGIN_S} s an IOC and its retry need`);
       }
+      // Open orders that cannot be read are a read that failed (tried again), not a reason to stay alert only.
       const resting = restingOn(await deps.openOrders(evm).catch((err: unknown) => errorMessage(err)), sym);
       if (typeof resting === 'string') {
-        why.push(`${resting}: a resting ${sym} order could fill under the trader`);
+        throw new StartReadError('hyperliquid', 'down', `${resting}: a resting ${sym} order could fill under the trader`);
       } else if (resting.length > 0) {
         const names = resting.map((o) => `${o.side} ${o.sz} (oid ${String(o.oid)})`).join(', ');
         why.push(`Hyperliquid has ${resting.length} resting ${sym} order(s) (${names}), left by an earlier pair-mainnet run: one could fill under the trader and the ADL watch would misread it; cancel it on Hyperliquid, reconcile both legs, then start serve again`);
@@ -397,7 +409,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
 
       // ---- what the trader holds ----
       const read = await readTwice([legs.hl, legs.phoenix], sleep, log);
-      const plan = startPlan({ symbol: sym, read, saved: start ? saved : store.load(), fresh: env('GIMBAL_TRADER_FRESH'), freshWant, path: store.path, now: input.clock.now() });
+      const plan = startPlan({ symbol: sym, read, saved: store.load(), fresh: env('GIMBAL_TRADER_FRESH'), freshWant, path: store.path, now: input.clock.now() });
       if (!plan.stateOk && plan.why !== null) why.push(plan.why);
       if (input.once === true) why.unshift(`serve --once is alert only${asksTrade ? ' (GIMBAL_TRADE=1 is ignored: it exits after one read, maybe in the middle of a close)' : ''}`);
       else if (!asksTrade) why.unshift('GIMBAL_TRADE is not 1');
@@ -551,15 +563,184 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       };
     };
 
+    /** What one start attempt found: nothing to protect (`why`), or the pair (`slot` null: none held, the loop may open one). */
+    type Started = { kind: 'none'; lines: string[]; why: string } | { kind: 'pair'; lines: string[]; slot: Slot | null };
+    /**
+     * Which pair, the signing side, then the pair's slot (its legs synced to their chains and read twice alike).
+     * Throws a ConfigError (serve stops) or a read that failed (the start is not confirmed and is tried again).
+     */
+    const attempt = async (): Promise<Started> => {
+      const saved = store.load();
+      const held = [...new Set([
+        ...(await startRead('hyperliquid', () => deps.hlHeld(evm))),
+        ...(await startRead('phoenix', () => deps.phoenixHeld(desk.solana.authority))),
+      ])];
+      const lines: string[] = [];
+      const outside = held.filter((s) => !common.includes(s));
+      if (outside.length > 0) lines.push(`pair      not protected (not in both policy lists): ${outside.join(', ')}`);
+      const open = held.filter((s) => common.includes(s));
+      if (open.length > 1) {
+        return { kind: 'none', lines: [...lines, `pair      NONE: ${open.join(' and ')} are both open; serve protects one pair: close one with pair-mainnet first`], why: 'two pairs are open: serve protects none' };
+      }
+      const savedSymbol = saved.kind === 'loaded' ? saved.state.symbol : null;
+      const symbol = open[0] ?? env('GIMBAL_PAIR_SYMBOL')?.trim() ?? savedSymbol ?? (common.length === 1 ? common[0]! : null);
+      if (symbol === null) {
+        // Nothing held: a trading serve still keeps the lock when the state allows trading, so the loop may open one.
+        const fresh = env('GIMBAL_TRADER_FRESH');
+        const stateWhy = saved.kind === 'loaded' || fresh === freshWant ? null
+          : saved.kind === 'none' ? `no trader state at ${store.path}: a missing file is not a fresh start; after checking both legs on the venues, start once with GIMBAL_TRADER_FRESH=${freshWant}`
+          : `${saved.problem}; after reconciling both legs, start once with GIMBAL_TRADER_FRESH=${freshWant}`;
+        if (!wantLive || stateWhy !== null || common.length === 0) {
+          const why = !wantLive ? 'nothing to protect' : stateWhy ?? 'the policy lists no symbol in both hl_assets and phoenix_markets';
+          return { kind: 'none', lines: [...lines, `pair      none: ${flatWhy}; ${why}`], why: 'no pair is open' };
+        }
+      }
+      if (symbol !== null && !common.includes(symbol)) {
+        return { kind: 'none', lines: [...lines, `pair      none: ${symbol} is not in both policy.hl_assets and policy.phoenix_markets (${common.join(', ') || 'none'})`], why: `${symbol} is not a policy pair` };
+      }
+      if (wantLive && !signing) {
+        try {
+          ({ client, relayer } = await deps.signing());
+        } catch (err) {
+          throw err instanceof ConfigError ? err : new StartReadError('near', 'down', `the signing contract client: ${errorMessage(err)}`);
+        }
+        signing = true;
+      }
+      if (symbol === null) {
+        lines.push(`pair      none held: ${flatWhy}; the strategy loop may open one of ${common.join(', ')} (state ${store.path}, lock ${(lock as TraderLock | null)?.path ?? 'none'})`);
+        return { kind: 'pair', lines, slot: null };
+      }
+      const slot = await makeSlot(symbol);
+      return { kind: 'pair', lines: [...lines, ...slot.lines], slot };
+    };
+
     let current: Slot | null = null;
-    if (symbol !== null) {
-      current = await makeSlot(symbol, true);
-      lines.push(...current.lines);
-    } else {
-      lines.push(`pair      none held: ${flatWhy}; the strategy loop may open one of ${common.join(', ')} (state ${store.path}, lock ${(lock as TraderLock | null)?.path ?? 'none'})`);
+    /** A start attempt after a failed one found nothing to protect: no pair from then on (the readers and lock are let go). */
+    let noneWhy: string | null = null;
+    /** Why the start is not confirmed (review S1): a read it needs failed. Null once two synced reads agreed. */
+    let pending: string | null = null;
+    let failures = 0;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let attempting: Promise<string | null> | null = null;
+    /** A retry found a configuration error: the start is not tried again (serve must be restarted). */
+    let refused = false;
+    const lines: string[] = [];
+    const journal = (kind: 'error' | 'wait', summary: string, numbers: Record<string, string | number>) => {
+      const t = input.clock.now();
+      input.publish({ type: 'journal', data: { id: `pair-start-${t.toString(36)}-${failures}`, t, kind, summary, numbers, tx: [] } });
+    };
+    const healthOk = () => {
+      for (const key of ['hyperliquid', 'phoenix', 'near'] as const) input.health?.(key, 'ok', null);
+    };
+    /** The start's result taken: a slot that does not trade lets the lock go (pair-mainnet must be able to fix it). */
+    const land = (s: Started): string[] => {
+      if (s.kind === 'none') {
+        noneWhy = s.why;
+        stopNone();
+        return s.lines;
+      }
+      current = s.slot;
+      if (current !== null && !current.live()) release();
+      return s.lines;
+    };
+    const unconfirmed = (): string | null => (pending === null ? null : `legs unknown, start not confirmed: ${pending}`);
+    const schedule = (ms: number) => {
+      if (stopped) return;
+      if (retryTimer !== null) clearTimeout(retryTimer);
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        void retryStart();
+      }, ms);
+      retryTimer.unref?.();
+    };
+    const sameKind = (a: string, b: string) => a.replace(/\d+(\.\d+)?/g, '#') === b.replace(/\d+(\.\d+)?/g, '#');
+    /** A start attempt failed on a read: alert only, legs unknown, tried again with backoff; the owner hears of changes. */
+    const failed = (err: unknown): void => {
+      failures++;
+      const why = errorMessage(err);
+      const read = err instanceof StartReadError ? err : null;
+      // The start's own word on each venue: the one that failed slow or down, the others ok (the risk engine's reads
+      // and the scan add theirs).
+      for (const key of ['hyperliquid', 'phoenix', 'near'] as const) {
+        const bad = read !== null && read.venue === key && read.status !== null;
+        input.health?.(key, bad ? read.status! : 'ok', bad ? why : null);
+      }
+      const was = pending;
+      pending = why;
+      const wait = startBackoffMs(failures);
+      log(`pair      start not confirmed (try ${failures}): ${why}; alert only, legs unknown, nothing adopted; trying again in ${wait / 1000} s`);
+      if (was === null || !sameKind(was, why)) {
+        journal('error', `pair start not confirmed: ${why}. Alert only until two synced reads of both legs agree: the legs are unknown, nothing is adopted and the strategy loop acts on nothing; the risk engine, the liquidation monitor, ADL alerts and panic_close's journal run. Tried again with backoff up to ${START_RETRY_MAX_MS / 1000} s`, {
+          stage: 'start', ...(read === null ? {} : { venue: read.venue }),
+        });
+      }
+      schedule(wait);
+    };
+    /** One more start attempt while the start is not confirmed (the timer runs it; tests call it); the line when it ended. */
+    const retryStart = (): Promise<string | null> => {
+      if (pending === null || stopped || refused || noneWhy !== null) return Promise.resolve(null);
+      if (attempting !== null) return attempting;
+      const run = async (): Promise<string | null> => {
+        try {
+          const s = await attempt();
+          if (stopped) {
+            if (s.kind === 'pair') s.slot?.end();
+            return null;
+          }
+          const tries = failures;
+          pending = null;
+          failures = 0;
+          if (retryTimer !== null) clearTimeout(retryTimer);
+          retryTimer = null;
+          healthOk();
+          for (const l of land(s)) log(l);
+          const now = s.kind === 'none' ? `nothing to protect: ${s.why}`
+            : current === null ? 'no pair held; the strategy loop may open one'
+            : current.live() ? `${current.symbol} trades` : `${current.symbol} alert only: ${current.pp.why ?? 'not live'}`;
+          const line = `pair start confirmed after ${tries} failed attempt(s): both legs synced to their chains and read twice alike; ${now}`;
+          log(`pair      ${line}`);
+          journal('wait', line, { stage: 'start' });
+          return line;
+        } catch (err) {
+          if (!(err instanceof ConfigError)) {
+            failed(err);
+            return null;
+          }
+          // A configuration error: no retry fixes it. Alert only for good; the lock goes so pair-mainnet can run.
+          refused = true;
+          pending = `${errorMessage(err)} (a configuration error: fix it and restart serve; not tried again)`;
+          if (retryTimer !== null) clearTimeout(retryTimer);
+          retryTimer = null;
+          release();
+          log(`pair      start refused: ${pending}`);
+          journal('error', `pair start refused: ${pending}`, { stage: 'start' });
+          return null;
+        }
+      };
+      attempting = run().finally(() => {
+        attempting = null;
+      });
+      return attempting;
+    };
+
+    // ---- the first start attempt: a read that fails degrades the pair instead of stopping serve (review S1) ----
+    let first: Started | null = null;
+    try {
+      first = await attempt();
+    } catch (err) {
+      if (err instanceof ConfigError) throw err;
+      failed(err);
     }
-    // An alert-only pair holds no lock: pair-mainnet must be able to fix what made it alert only.
-    if (current !== null && !current.live()) release();
+    if (first !== null) {
+      healthOk();
+      if (first.kind === 'none') {
+        stopNone();
+        return none(first.lines, first.why);
+      }
+      lines.push(...land(first));
+    } else {
+      lines.push(`pair      start NOT confirmed: ${pending ?? 'unknown'}; alert only, legs unknown, nothing adopted: serve tries again with backoff (up to ${START_RETRY_MAX_MS / 1000} s) and goes live once two synced reads of both legs agree`);
+    }
     const trading = () => !stopped && lock !== null;
 
     // The strategy loop's operation in flight (one at a time).
@@ -567,6 +748,8 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
 
     const cancelResting = async (): Promise<CancelResult> => {
       if (stopped) throw new Error('serve is stopping and its trader lock is released: nothing is cancelled');
+      const unsure = unconfirmed() ?? noneWhy;
+      if (unsure !== null || relayer === null) throw new Error(`${unsure ?? 'no signing relayer'}: nothing is cancelled`);
       const coin = current?.symbol ?? null;
       const raw = await deps.openOrders(evm);
       if (!Array.isArray(raw)) throw new Error(restingOn(raw, coin ?? '') as string);
@@ -614,6 +797,9 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
     };
     const blocked = (): string | null => {
       if (stopped) return 'serve is stopping: nothing is signed';
+      const unsure = unconfirmed();
+      if (unsure !== null) return unsure;
+      if (noneWhy !== null) return `no pair trader: ${noneWhy}`;
       if (!trading()) return current === null ? 'no pair trader' : `alert only: ${current.pp.why ?? 'not live'}`;
       if (operation !== null) return 'an open or close of the strategy loop is running';
       if (current !== null) {
@@ -690,7 +876,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           old?.suspend(true);
           let next: Slot;
           try {
-            next = await makeSlot(sym, false);
+            next = await makeSlot(sym);
           } catch (err) {
             old?.suspend(false);
             return result(false, `the ${sym} pair could not be built: ${errorMessage(err)}`);
@@ -766,16 +952,21 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         return current?.adl.state ?? newAdlState();
       },
     };
-    const live = trading() && (current === null || current.live());
+    // A start not confirmed yet keeps the hands (they refuse until it is) and the ADL watch: it may go live later.
+    const started = current as Slot | null;       // set by land(), which TypeScript does not follow
+    const live = trading() && (pending !== null || started === null || started.live());
     return {
       get pair() {
         return current?.pp ?? null;
       },
-      adl: current !== null || live ? adl : undefined,
+      adl: current !== null || live || pending !== null ? adl : undefined,
       lines,
       reducer: () => (current !== null && current.live() && !stopped ? current.pp : null),
       notTrading: () => {
         if (stopped) return 'serve is stopping: nothing is signed';
+        const unsure = unconfirmed();
+        if (unsure !== null) return unsure;
+        if (noneWhy !== null) return noneWhy;
         if (current === null) return 'no pair is open';
         return current.live() ? null : `alert only: ${current.pp.why ?? 'not live'}`;
       },
@@ -789,10 +980,14 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         return current === null ? true : current.pp.whenIdle(Math.max(0, until - Date.now()));
       },
       settleInFlight: () => current?.settle() ?? Promise.resolve(null),
+      unconfirmed,
+      retryStart,
       stop: () => {
         // First: nothing is signed from here on (a rescue between its read and its reduce must not sign after the
         // lock is released), and nothing is saved.
         stopped = true;
+        if (retryTimer !== null) clearTimeout(retryTimer);
+        retryTimer = null;
         current?.end();
         deps.close();
         release();
@@ -891,7 +1086,7 @@ function defaultDeps(p: { input: ServePairInput; hlUrl: string; phoenixUrl: stri
     openOrders: (evm) => hlInfo(hlUrl, { type: 'openOrders', user: evm }),
     signing: async () => {
       const cfg = contractEnv(input.env, input.mode, { signing: true });
-      if (cfg === null) throw new Error('GIMBAL_TRADE=1 needs GIMBAL_CONTRACT_ID, DESK_ID and the operator key');
+      if (cfg === null) throw new ConfigError('GIMBAL_TRADE=1 needs GIMBAL_CONTRACT_ID, DESK_ID and the operator key');
       const transport: NearTransport = new NearApiTransport({ network: cfg.network, accountId: cfg.accountId!, privateKey: cfg.privateKey!, ...(cfg.rpcUrl === undefined ? {} : { rpcUrl: cfg.rpcUrl }) });
       const client = new NearContractClient({ contractId: cfg.contractId, network: cfg.network, transport, onHealth: (s, d) => input.log(`pair near ${s}: ${d}`) });
       checkContractNetwork(cfg.contractId, await client.config(), cfg.network);
@@ -985,25 +1180,33 @@ async function syncToChain(legs: readonly TradeLeg[]): Promise<void> {
 /**
  * Both legs read twice START_CONFIRM_MS apart until two reads agree (START_READ_TRIES at most); throws otherwise.
  * Each try first syncs the legs to their chains: the start plan (and the settles after it) must not adopt a lagging
- * snapshot from before the last transaction of the run that stopped.
+ * snapshot from before the last transaction of the run that stopped. The error says which venue failed and how (a
+ * StartReadError): the chain's slot not read is down, a snapshot that stays behind it slow, any other read down.
  */
 async function readTwice(legs: [TradeLeg, TradeLeg], sleep: (ms: number) => Promise<void>, log: (line: string) => void): Promise<[bigint, bigint]> {
-  let last = '';
+  let last: StartReadError | null = null;
+  const venueOf = (l: TradeLeg): StartVenue => (l.venue === 'phoenix' ? 'phoenix' : 'hyperliquid');
+  const read = () => Promise.all(legs.map((l) => l.position().catch((err: unknown) => {
+    const text = errorMessage(err);
+    throw new StartReadError(venueOf(l), /still before slot/.test(text) ? 'slow' : 'down', text);
+  })));
   for (let i = 0; i < START_READ_TRIES; i++) {
     try {
-      await syncToChain(legs);
-      const a = await Promise.all(legs.map((l) => l.position()));
+      await Promise.all(legs.map((l) => (l.syncToChain?.() ?? Promise.resolve()).catch((err: unknown) => {
+        throw new StartReadError(venueOf(l), 'down', `${l.venue} ${l.symbol}: the chain's confirmed slot was not read (${errorMessage(err)}), so no snapshot can be proven current`);
+      })));
+      const a = await read();
       await sleep(START_CONFIRM_MS);
-      const b = await Promise.all(legs.map((l) => l.position()));
+      const b = await read();
       if (a[0] === b[0] && a[1] === b[1]) return [a[0]!, a[1]!];
-      last = `two reads differ: ${a.map(String).join(',')} then ${b.map(String).join(',')}`;
+      last = new StartReadError(venueOf(legs[a[0] === b[0] ? 1 : 0]), null, `two reads differ: ${a.map(String).join(',')} then ${b.map(String).join(',')}`);
     } catch (err) {
-      last = errorMessage(err);
+      last = err instanceof StartReadError ? err : new StartReadError('phoenix', 'down', errorMessage(err));
     }
-    log(`pair      the legs could not be read twice alike at start (${last}); trying again`);
+    log(`pair      the legs could not be read twice alike at start (${last.message}); trying again`);
     await sleep(START_CONFIRM_MS);
   }
-  throw new Error(`pair: the legs could not be read twice alike at start (${last}); nothing is adopted`);
+  throw new StartReadError(last!.venue, last!.status, `the legs could not be read twice alike (${last!.message}); nothing is adopted`);
 }
 
 /** The contract's stored price of `symbol` and its age (s), or null. */
@@ -1108,7 +1311,10 @@ export function liveLines(p: { pair: ServePair; rescueSummary: string; rescueLiv
   const out: string[] = [...p.pair.lines];
   const tradeVia = 'reduce-only IOCs through the PairTrader (legging guard, price refreshed before each close, open: lines)';
   const adlWhy = pp === null ? null : pp.adlHold ?? pp.adlOff();
-  if (pp === null) {
+  const unconfirmed = p.pair.unconfirmed?.() ?? null;
+  if (unconfirmed !== null) {
+    out.push(`live      trades: NOTHING yet, ${unconfirmed}; the start is tried again and goes live once two synced reads of both legs agree`);
+  } else if (pp === null) {
     out.push('live      trades: nothing (no pair trader)');
   } else if (pp.live) {
     const adl = adlWhy === null

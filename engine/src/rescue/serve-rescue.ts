@@ -39,6 +39,7 @@ import { NearApiTransport } from '../contract/near-transport.ts';
 import type { DeskView } from '../contract/types.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import { checkContractNetwork, contractEnv } from '../cli/serve-contract.ts';
+import { ConfigError } from '../cli/start-errors.ts';
 import { ArbitrumSubmitter } from '../relayer/arbitrum.ts';
 import { HyperliquidSubmitter } from '../relayer/hyperliquid.ts';
 import { solanaChain } from '../relayer/phoenix-money.ts';
@@ -81,6 +82,8 @@ export interface ServeRescueInput {
   getDesk?: () => Promise<DeskView>;
   /** panic_close's resting-order cancel and why nothing trades here (serve-pair.ts), for the ClosingWatch. */
   closing?: Pick<ClosingWatchOptions, 'cancelResting' | 'notTrading'>;
+  /** The panic_close watch to keep (rescue-retry.ts: a live start after a detect-only fallback); default a new one. */
+  closingWatch?: ClosingWatch;
   contractId?: string;
   deskId?: string;
   replayDesk?: ReplayDesk;
@@ -211,7 +214,7 @@ export async function freshStart(value: string | undefined, want: string, read: 
 export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue> {
   const { mode, env, log } = input;
   const reducer = input.reducer ?? (() => null);
-  const closing = new ClosingWatch({ publish: input.publish, clock: input.clock, reducer, log, ...input.closing });
+  const closing = input.closingWatch ?? new ClosingWatch({ publish: input.publish, clock: input.clock, reducer, log, ...input.closing });
   const common = {
     mode, publish: input.publish,
     view: () => input.risk()?.legView() ?? { legs: [], freeMargin: {} },
@@ -269,9 +272,9 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
     };
   }
   const cfg = contractEnv(env, mode, { signing: true });
-  if (cfg === null) throw new Error('GIMBAL_RESCUE=1 needs GIMBAL_CONTRACT_ID, GIMBAL_DESK_ID and the operator key');
+  if (cfg === null) throw new ConfigError('GIMBAL_RESCUE=1 needs GIMBAL_CONTRACT_ID, GIMBAL_DESK_ID and the operator key');
   const relayerKey = env('RELAYER_EVM_PRIVATE_KEY');
-  if (relayerKey === undefined) throw new Error('GIMBAL_RESCUE=1 needs RELAYER_EVM_PRIVATE_KEY (the gas wallet that submits evm_usdc_to_intents)');
+  if (relayerKey === undefined) throw new ConfigError('GIMBAL_RESCUE=1 needs RELAYER_EVM_PRIVATE_KEY (the gas wallet that submits evm_usdc_to_intents)');
   const transport = new NearApiTransport({
     network: cfg.network, accountId: cfg.accountId!, privateKey: cfg.privateKey!, ...(cfg.rpcUrl === undefined ? {} : { rpcUrl: cfg.rpcUrl }),
   });
@@ -329,67 +332,76 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
   const store = new RescueStateStore(rescueStateFile(stateDir, mode, identity), identity);
   // One live rescuer per contract and desk: two would each take the other's payments as not held.
   const lock = await acquireRescueLock(rescueLockName(env, mode, cfg.contractId, deskId));
-  const fresh = await freshStart(env('GIMBAL_RESCUE_FRESH'), `${cfg.contractId}/${deskId}`, () => nearReads.read(), log, freshEvidence(stateDir, mode, identity), input.clock.now());
-  // The Phoenix routes: only on a Solana RPC that serves transaction history (a held sol_sign_rescue is released on it).
-  const solRpcUrl = env('SOLANA_RPC_URL') ?? SOLANA_MAINNET_RPC_URL;
-  const solRpcName = env('SOLANA_RPC_URL') === undefined ? 'the public Solana mainnet RPC' : 'the Solana RPC of SOLANA_RPC_URL';
-  const solanaReads = new RpcSolanaReads({ rpcUrl: solRpcUrl });
-  const history = await solanaReads.historyProblem();
-  const phoenixProblem = history === null ? null : `${solRpcName} cannot back the Solana hold rule: ${history}`;
-  const chain = solanaChain(solRpcUrl);
-  const phoenixApi = env('PHOENIX_API_URL') ?? PHOENIX_API_URL;
-  const phoenixReader = new PhoenixReader({ apiUrl: phoenixApi, rpcUrl: solRpcUrl });
-  const phoenixDesk = async () => phoenixDeskOf(await readDesk());
-  const solSubmitter = new SolanaSubmitter({ rpcUrl: solRpcUrl, network: 'mainnet' });
-  const traderState = async () => parseTraderSnapshot(await phoenixTraderApi(phoenixApi).traderState((view ?? first).solana.authority), '').state;
-  const phoenixPayer = new PhoenixRescuePayer({
-    deskId, chain, desk: phoenixDesk, contract, sender: solSubmitter, log,
-    // Approximate: Phoenix's free margin in USD as the reader computes it, not the exchange's own withdraw check. A
-    // withdraw it overstates fails the unsigned simulation in planPhoenixRescue, so nothing is signed on it.
-    withdrawable: async () => BigInt(Math.floor((await phoenixReader.account((view ?? first).solana.authority)).freeMarginUsd * 1e6)),
-  });
-  const relayer = new Relayer({ contract, deskId, solana: solSubmitter });
-  const phoenixCredit = new PhoenixDeskCredit({
-    network: 'mainnet', chain, desk: phoenixDesk, traderState, clock: input.clock, sleep,
-    solSign: (build, reason) => relayer.solSign(build, reason),
-  });
-  const hlLanding = new HlLedgerLanding({ network: 'mainnet', desk: evm });
-  const refusedLandings = {
-    orderly: 'a landing on Orderly cannot be confirmed here (its ledger needs the private API, which serve does not open)',
-    ...(phoenixProblem === null ? {} : { phoenix: `Phoenix is refused: ${phoenixProblem}` }),
-  };
-  const rescuer = new Rescuer({
-    ...common, clock: input.clock, sleep, oneClick, keyed: apiKey !== null,
-    store, fresh, near: () => nearReads.read(), nearTx: (h) => nearReads.txFacts(h), arbitrum: new ViemArbitrumReads(arbitrumRpc === undefined ? {} : { rpcUrl: arbitrumRpc }),
-    // Without history a landed signature could read as never landed: no Solana reads, so a Solana hold stays held.
-    ...(phoenixProblem === null ? { solana: solanaReads, credit: { phoenix: phoenixCredit } } : {}),
-    routeLimit: (from, to) => mainnetRouteLimit(from, to)
-      ?? (phoenixProblem !== null && (from === 'phoenix' || to === 'phoenix') ? `Phoenix is refused: ${phoenixProblem}` : null),
-    desk: async () => {
-      const d = await readDesk();
-      return {
-        addresses: { deskId, contract: cfg.contractId, owner: d.owner, evm: d.evm_address, sol: d.solana.authority, orderlyReceiver: d.orderly_receiver },
-        policy: policyOf(d.policy, d.policy),
-        reserveUsd: Number(d.ledger.idle_usdc) / 1e6,
-        closing: d.closing === true || closing.blocked() !== null,
-      };
-    },
-    // Landings are confirmed in the target's ledger (Hyperliquid) or by the confirmed deposit (Phoenix). Orderly's
-    // needs its private API, which serve does not open: refused as a target.
-    landing: new VenueLandings({ hyperliquid: hlLanding, ...(phoenixProblem === null ? { phoenix: phoenixCredit.landing() } : {}) }, refusedLandings),
-    payers: { reserve, arbitrum, ...(phoenixProblem === null ? { phoenix: phoenixPayer } : {}) },
-    hlWithdraw: {
-      withdraw: async (amountE6) => {
-        const r = await hl.submit(await contract.hlWithdraw(deskId, usdcDecimal(amountE6)), await evm());
-        return { tx: r.tx };
+  const liveAfterLock = async (): Promise<ServeRescue> => {
+    const fresh = await freshStart(env('GIMBAL_RESCUE_FRESH'), `${cfg.contractId}/${deskId}`, () => nearReads.read(), log, freshEvidence(stateDir, mode, identity), input.clock.now());
+    // The Phoenix routes: only on a Solana RPC that serves transaction history (a held sol_sign_rescue is released on it).
+    const solRpcUrl = env('SOLANA_RPC_URL') ?? SOLANA_MAINNET_RPC_URL;
+    const solRpcName = env('SOLANA_RPC_URL') === undefined ? 'the public Solana mainnet RPC' : 'the Solana RPC of SOLANA_RPC_URL';
+    const solanaReads = new RpcSolanaReads({ rpcUrl: solRpcUrl });
+    const history = await solanaReads.historyProblem();
+    const phoenixProblem = history === null ? null : `${solRpcName} cannot back the Solana hold rule: ${history}`;
+    const chain = solanaChain(solRpcUrl);
+    const phoenixApi = env('PHOENIX_API_URL') ?? PHOENIX_API_URL;
+    const phoenixReader = new PhoenixReader({ apiUrl: phoenixApi, rpcUrl: solRpcUrl });
+    const phoenixDesk = async () => phoenixDeskOf(await readDesk());
+    const solSubmitter = new SolanaSubmitter({ rpcUrl: solRpcUrl, network: 'mainnet' });
+    const traderState = async () => parseTraderSnapshot(await phoenixTraderApi(phoenixApi).traderState((view ?? first).solana.authority), '').state;
+    const phoenixPayer = new PhoenixRescuePayer({
+      deskId, chain, desk: phoenixDesk, contract, sender: solSubmitter, log,
+      // Approximate: Phoenix's free margin in USD as the reader computes it, not the exchange's own withdraw check. A
+      // withdraw it overstates fails the unsigned simulation in planPhoenixRescue, so nothing is signed on it.
+      withdrawable: async () => BigInt(Math.floor((await phoenixReader.account((view ?? first).solana.authority)).freeMarginUsd * 1e6)),
+    });
+    const relayer = new Relayer({ contract, deskId, solana: solSubmitter });
+    const phoenixCredit = new PhoenixDeskCredit({
+      network: 'mainnet', chain, desk: phoenixDesk, traderState, clock: input.clock, sleep,
+      solSign: (build, reason) => relayer.solSign(build, reason),
+    });
+    const hlLanding = new HlLedgerLanding({ network: 'mainnet', desk: evm });
+    const refusedLandings = {
+      orderly: 'a landing on Orderly cannot be confirmed here (its ledger needs the private API, which serve does not open)',
+      ...(phoenixProblem === null ? {} : { phoenix: `Phoenix is refused: ${phoenixProblem}` }),
+    };
+    const rescuer = new Rescuer({
+      ...common, clock: input.clock, sleep, oneClick, keyed: apiKey !== null,
+      store, fresh, near: () => nearReads.read(), nearTx: (h) => nearReads.txFacts(h), arbitrum: new ViemArbitrumReads(arbitrumRpc === undefined ? {} : { rpcUrl: arbitrumRpc }),
+      // Without history a landed signature could read as never landed: no Solana reads, so a Solana hold stays held.
+      ...(phoenixProblem === null ? { solana: solanaReads, credit: { phoenix: phoenixCredit } } : {}),
+      routeLimit: (from, to) => mainnetRouteLimit(from, to)
+        ?? (phoenixProblem !== null && (from === 'phoenix' || to === 'phoenix') ? `Phoenix is refused: ${phoenixProblem}` : null),
+      desk: async () => {
+        const d = await readDesk();
+        return {
+          addresses: { deskId, contract: cfg.contractId, owner: d.owner, evm: d.evm_address, sol: d.solana.authority, orderlyReceiver: d.orderly_receiver },
+          policy: policyOf(d.policy, d.policy),
+          reserveUsd: Number(d.ledger.idle_usdc) / 1e6,
+          closing: d.closing === true || closing.blocked() !== null,
+        };
       },
-    },
-    withdrawals: (venue, paused) => log(`rescue: ${venue} withdrawals ${paused === null ? 'ran' : `refused: ${paused}`}`),
-  });
-  return {
-    rescuer: (t) => rescuer.take(t), closing, running: () => rescuer.runningId, stop: () => rescuer.stop(), routes: routeLines(mode, true, phoenixProblem),
-    summary: `rescue: LIVE on mainnet (GIMBAL_RESCUE=1), operator ${cfg.accountId}, 1Click ${apiKey === null ? 'without a key (+0.2 %)' : 'with a key'}; `
-      + `Solana holds read on ${solRpcName} (${history === null ? 'serves transaction history' : 'NO transaction history: Phoenix routes refused'}); `
-      + `holds and the cap meter kept in ${store.path}, lock ${lockText(lock.name)}${fresh ? ' (GIMBAL_RESCUE_FRESH: a first run)' : ''}`,
+      // Landings are confirmed in the target's ledger (Hyperliquid) or by the confirmed deposit (Phoenix). Orderly's
+      // needs its private API, which serve does not open: refused as a target.
+      landing: new VenueLandings({ hyperliquid: hlLanding, ...(phoenixProblem === null ? { phoenix: phoenixCredit.landing() } : {}) }, refusedLandings),
+      payers: { reserve, arbitrum, ...(phoenixProblem === null ? { phoenix: phoenixPayer } : {}) },
+      hlWithdraw: {
+        withdraw: async (amountE6) => {
+          const r = await hl.submit(await contract.hlWithdraw(deskId, usdcDecimal(amountE6)), await evm());
+          return { tx: r.tx };
+        },
+      },
+      withdrawals: (venue, paused) => log(`rescue: ${venue} withdrawals ${paused === null ? 'ran' : `refused: ${paused}`}`),
+    });
+    return {
+      rescuer: (t) => rescuer.take(t), closing, running: () => rescuer.runningId, stop: () => rescuer.stop(), routes: routeLines(mode, true, phoenixProblem),
+      summary: `rescue: LIVE on mainnet (GIMBAL_RESCUE=1), operator ${cfg.accountId}, 1Click ${apiKey === null ? 'without a key (+0.2 %)' : 'with a key'}; `
+        + `Solana holds read on ${solRpcName} (${history === null ? 'serves transaction history' : 'NO transaction history: Phoenix routes refused'}); `
+        + `holds and the cap meter kept in ${store.path}, lock ${lockText(lock.name)}${fresh ? ' (GIMBAL_RESCUE_FRESH: a first run)' : ''}`,
+    };
   };
+  try {
+    return await liveAfterLock();
+  } catch (err) {
+    // A start that fails after the lock lets it go: the background retry (rescue-retry.ts) takes it again.
+    await lock.release();
+    throw err;
+  }
 }

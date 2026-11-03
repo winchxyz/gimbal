@@ -24,7 +24,7 @@ export const inTab = (windows: readonly FundingWindow[], tab: Tab): FundingWindo
 /**
  * A window the desk could open now, as the engine judges it (engine/src/scanner/price.ts, isEnterable): tradable, not
  * refused by the contract, numbers from this scan, every engine check passed (the carry gate and the open-interest
- * share among them), and not vetoed by NEAR AI.
+ * share among them), and not refused by the NEAR AI risk check.
  */
 export const isEnterable = (w: FundingWindow): boolean =>
   w.tradable && !w.refused && !w.stale && w.checks.every((c) => c.ok) && w.veto?.verdict !== 'veto';
@@ -49,7 +49,7 @@ export type StatusKind = 'held' | 'refused' | 'nodesk' | 'veto' | 'watch' | 'non
 
 export interface RowStatus {
   kind: StatusKind;
-  /** The word on the row: `Held`, `Refused · no trusted price`, `Veto · one-off spike`, `Watch-only` */
+  /** The word on the row: `Held`, `Refused · no trusted price`, `Risk check · one-off spike`, `Watch-only` */
   text: string;
   /** The same for a phone row, where there is less room: a refusal is named by its code (`Refused · no price`). */
   compact: string;
@@ -68,7 +68,7 @@ const REFUSAL_SHORT: Readonly<Record<string, string>> = {
 const firstReason = (reasons: readonly string[]): string => reasons[0]?.trim() ?? '';
 const withReason = (word: string, reason: string): string => (reason ? `${word} · ${reason}` : word);
 
-// Held wins: the desk is in it. Then the contract's refusal (a hard stop), then NEAR AI's veto.
+// Held wins: the desk is in it. Then the contract's refusal (a hard stop), then the NEAR AI risk check.
 export function rowStatus(w: FundingWindow): RowStatus {
   const plainStatus = (kind: StatusKind, text: string): RowStatus => ({ kind, text, compact: text });
   if (w.held) return plainStatus('held', 'Held');
@@ -79,7 +79,7 @@ export function rowStatus(w: FundingWindow): RowStatus {
     const short = REFUSAL_SHORT[w.refused.code];
     return { kind: 'refused', text, compact: short ? `Refused · ${short}` : text };
   }
-  if (w.veto?.verdict === 'veto') return plainStatus('veto', withReason('Veto', firstReason(w.veto.reasons)));
+  if (w.veto?.verdict === 'veto') return plainStatus('veto', withReason('Risk check', firstReason(w.veto.reasons)));
   if (!w.tradable) return plainStatus('watch', 'Watch-only');
   return plainStatus('none', '');
 }
@@ -142,7 +142,7 @@ export function bestEnterable(windows: readonly FundingWindow[]): FundingWindow 
 
 /**
  * Nothing to enter: no window that is open to the desk clears the minimum, and nothing is held.
- * Refused and vetoed windows do not count, however high they are.
+ * Windows refused by the contract or the risk check do not count, however high they are.
  */
 export function isEmpty(windows: readonly FundingWindow[], minimum: number | null): boolean {
   if (minimum === null) return false;
@@ -227,7 +227,7 @@ export function checkLines(w: FundingWindow): CheckLine[] {
     const said = w.veto.reasons.map((r) => sentence(capital(r))).join(' ');
     lines.push(
       w.veto.verdict === 'veto'
-        ? { ok: false, text: `NEAR AI vetoed it. ${said}`.trim() }
+        ? { ok: false, text: `The NEAR AI risk check refused it. ${said}`.trim() }
         : { ok: true, text: said ? `NEAR AI: ${said}` : 'NEAR AI passed it.' },
     );
   }
