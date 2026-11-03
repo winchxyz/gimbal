@@ -935,12 +935,12 @@ anywhere the policy does not allow.
   `legUsd` > 0 and a finite stop), where drawdown is `HeldPair.pnlUsd` against one leg's notional `HeldPair.legUsd`;
   no other unknown number keeps them from firing. Past the stops, a held pair whose P&L, leg size (≤ 0 included),
   window numbers or rules are not finite gets no act: a `wait`, "held pair numbers unknown", never counted healthy.
-  The held window is measured forward in USD on its leg (`heldForward`): its multi-day gross (`netAprPct` plus the
-  costs the scanner took off) over the hours left, less the exit still to pay (half the fees and slippage plus the
-  basis buffer, which the scanner spread over `config.costs.holdHours`, passed in as `DecideInput.holdHours`), as APR
-  over the hours left; the opening fills are sunk. Exit: that forward figure < 0 or under `minNetAprPct`, or a sign
-  flip, for `exitAfterChecks` checks; then `cooldownHours`. Rotation: another window's `netAprPct` beats the held
-  window's forward figure by `rotate.minGainPts` for `rotate.forHours`
+  The held window is judged from here (`heldForwardAprPct`): its multi-day gross (`netAprPct` plus the costs the
+  scanner took off) less the exit still to pay (half the fees and slippage plus the basis buffer), in the constant
+  points the scanner spread them over its hold, never re-spread over the hours left (the exit is paid whenever the
+  pair leaves, so it never times the exit); the opening fills are sunk. Exit: that figure under `minNetAprPct`, or a sign
+  flip, for `exitAfterChecks` checks; then `cooldownHours`. Rotation: another window's `netAprPct` beats that held
+  figure by `rotate.minGainPts` for `rotate.forHours`
   and `switchCostUsd` pays back within the hold at that gain on the new leg's sized `legUsd` (the switch cost is not
   scaled); the new legs are sized on free margin plus `DecideInput.freedMarginUsd` (loop.ts measures it: the held
   legs' margin plus that leg's P&L, per venue; absent = none); windows on venues that already hold the margin first;
@@ -953,6 +953,7 @@ anywhere the policy does not allow.
     lots, the same on both legs, before either leg is sent.
   - On a `rotate`, loop.ts sets `HeldPair.since` to the rotation time: the time stop and the payback horizon start
     again.
+  - The hours left for payback are clamped to the whole hold: a `since` in the future (clock skew) never adds hours.
   - A veto or a failed act: loop.ts saves `skipAct(input, decision)` instead of `decision.counters`; on a NEAR AI veto,
     `skipAct(input, decision, { vetoed: true })` holds that window out of entries and rotations for
     `LOOP_RULES.vetoHoldHours` (6 h, `LoopCounters.vetoedUntil`) and starts its counts again, and the wait says so.
@@ -960,8 +961,8 @@ anywhere the policy does not allow.
 - `veto.ts`: the NEAR AI veto before an enter or a rotate (the client behind `POST /policy/draft`). No key, no
   answer in `vetoTimeoutMs`, or a transport/HTTP error = pass, journaled "no veto check" (a 401 or 403 says "NEAR AI
   key rejected", so a bad key shows on every decision). The whole reply is read; one that is not exactly one readable
-  verdict (no JSON object, more than one, not "pass" or "veto" after trimming and lowercasing, a "veto" inside a
-  "pass", cut off at its token limit) fails closed: a veto, "unreadable reply". A veto drops the window and writes a
+  verdict (no JSON object, more than one, text around it other than ``` fences, a key given twice, not "pass" or
+  "veto" after trimming and lowercasing, a "veto" inside a "pass", cut off at its token limit) fails closed: a veto, "unreadable reply". A veto drops the window and writes a
   `veto` entry.
 - `loop.ts` (serve): runs `decide` after each funding payment (the hourly check) and on each scan event, only with
   `GIMBAL_TRADE=1` and `strategy.auto`, one decision at a time under the per-desk trader lock, never while a rescue

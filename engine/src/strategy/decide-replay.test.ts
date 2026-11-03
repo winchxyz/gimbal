@@ -80,7 +80,7 @@ function shape(h: number, windows: readonly FundingWindow[]): FundingWindow[] {
       .filter((c) => !(loading && c.text === NO_BREAKEVEN_TEXT))
       .map((c) => (LOADING.test(c.text) ? { ok: true, text: '[test] the recording has no second week: judged on its 7 days' } : c));
     let netAprPct = w.netAprPct;
-    // NEAR's gross falls to 7 %: measured forward (heldForward), less the exit still to pay, it is under 5 %.
+    // NEAR's gross falls to 7 %: held (heldForwardAprPct), less the exit still to pay, it is under 5 %.
     if (w.id === NEAR && h >= 3) netAprPct = 7 - (w.costs.feesPct + w.costs.slippagePct + w.costs.basisPct + w.costs.rescueReservePct);
     if (w.id === SOL && h >= 4) netAprPct = 8;
     if (w.id === ETH && h >= 12) netAprPct = 30;
@@ -133,7 +133,7 @@ async function run(): Promise<Step[]> {
     const input: DecideInput = {
       lots,
       now: simStart + h * HOUR, hourly: true, windows, held, strategy: STRAT, maxNotionalUsd: POLICY.max_notional_usd,
-      priceBandBps: POLICY.price_band_bps, holdHours: DEFAULT_SCANNER_CONFIG.costs.holdHours, freeMarginUsd: { hyperliquid: 20, phoenix: 20, orderly: 20 }, liveRescue: LIVE_RESCUE, counters,
+      priceBandBps: POLICY.price_band_bps, freeMarginUsd: { hyperliquid: 20, phoenix: 20, orderly: 20 }, liveRescue: LIVE_RESCUE, counters,
       gross14dAprPct: Object.fromEntries(windows.map((w) => [w.id, scanner.carry(w.id)?.estimate.gross.d14AprPct ?? null])),
       // What loop.ts measures: the held legs' margin at 1.5x (their P&L is 0 here).
       freedMarginUsd: held === null ? {} : Object.fromEntries([...heldVenues].map((v) => [v, held!.legUsd / 1.5])),
@@ -209,7 +209,7 @@ test('a recorded hour of mainnet scans, one an hour: enter, compression, exit, c
   sized(11, 'enter', SOL);
   // SOL long Orderly / short Hyperliquid nets more, but its switch moves margin onto Hyperliquid and never pays back on
   // a 12 USD leg; ETH sits on the venues that hold the margin.
-  // The gain is over SOL measured forward (about 12.5 %), not its 8 % entry net.
+  // The gain is over SOL as held (its gross less the exit), not its 8 % entry net.
   assert.match(at(14).decision.reason, /ETH beats it by 1\d\.\d pts, 3 of 4 hours$/);
   sized(15, 'rotate', ETH);
   assert.equal((at(15).act as { fromId: string }).fromId, SOL);

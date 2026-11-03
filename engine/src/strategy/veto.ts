@@ -4,8 +4,8 @@
 // window, the size or the leverage, or is sent to the contract or a venue. No key, no answer within
 // LOOP_RULES.vetoTimeoutMs, or NEAR AI down (a transport or HTTP error): the window passes, and the journal line says
 // "no veto check" (a 401 or 403 says "NEAR AI key rejected", so a bad key shows on every decision). A reply that
-// came but cannot be read as one verdict (not JSON, no verdict, more than one JSON object, a "veto" inside a "pass",
-// cut off at its token limit) fails closed: it is a veto, "unreadable reply".
+// came but cannot be read as one verdict (not JSON, no verdict, more than one JSON object, text around it, a key
+// given twice, a "veto" inside a "pass", cut off at its token limit) fails closed: it is a veto, "unreadable reply".
 //
 // The prompt is built from the facts alone (no clock, no ids that change between runs), so a recorded exchange is
 // found again by its prompt: RecordedVeto plays a recording back without a key (replay mode, tests). checkVeto returns
@@ -160,9 +160,12 @@ export function promptKey(messages: readonly ChatMessage[]): string {
   return createHash('sha256').update(JSON.stringify(messages)).digest('hex').slice(0, 24);
 }
 
-/** Every top-level `{…}` in a text, in order; NearAiUnavailable when one is never closed (a reply cut short). */
-function topLevelObjects(text: string): string[] {
-  const found: string[] = [];
+/**
+ * Every top-level `{…}` in a text, in order, with where it starts and ends; NearAiUnavailable when one is never
+ * closed (a reply cut short).
+ */
+function topLevelObjects(text: string): { start: number; end: number }[] {
+  const found: { start: number; end: number }[] = [];
   let start = -1;
   let depth = 0;
   let inString = false;
@@ -184,11 +187,40 @@ function topLevelObjects(text: string): string[] {
     }
     if (ch === '"') inString = true;
     else if (ch === '{') depth++;
-    else if (ch === '}' && --depth === 0) found.push(text.slice(start, i + 1));
+    else if (ch === '}' && --depth === 0) found.push({ start, end: i + 1 });
   }
   if (depth !== 0) throw new NearAiUnavailable('the model\'s reply has a JSON object that is never closed');
   return found;
 }
+
+/** The first key that appears twice in one object of a JSON text, or null. JSON.parse would keep only the last. */
+function duplicateKey(json: string): string | null {
+  const stack: (Set<string> | null)[] = [];
+  for (let i = 0; i < json.length; i++) {
+    const ch = json[i];
+    if (ch === '{') stack.push(new Set());
+    else if (ch === '[') stack.push(null);
+    else if (ch === '}' || ch === ']') stack.pop();
+    else if (ch === '"') {
+      let j = i + 1;
+      while (j < json.length && json[j] !== '"') j += json[j] === '\\' ? 2 : 1;
+      const literal = json.slice(i, j + 1);
+      i = j;
+      let k = j + 1;
+      while (k < json.length && /\s/.test(json[k]!)) k++;
+      const keys = stack.at(-1);
+      if (json[k] === ':' && keys !== null && keys !== undefined) {
+        const key = JSON.parse(literal) as string;
+        if (keys.has(key)) return key;
+        keys.add(key);
+      }
+    }
+  }
+  return null;
+}
+
+/** A reply's text around its JSON object: only whitespace and ``` fences (```json) may be there. */
+const FENCE_ONLY = /^(?:\s|```[A-Za-z0-9_-]*)*$/;
 
 /** Whether any object below `value` (not `value` itself) carries a verdict that reads "veto". */
 function nestedVeto(value: unknown, root = true): boolean {
@@ -200,15 +232,23 @@ function nestedVeto(value: unknown, root = true): boolean {
 }
 
 /**
- * The verdict in a model's whole reply: ``` fences and words around the JSON are dropped, but the whole text is
- * read. NearAiUnavailable (so: a veto, "unreadable reply") when it holds no JSON object, more than one, one never
- * closed, an object that is not a verdict, or a verdict of "veto" anywhere inside a "pass".
+ * The verdict in a model's whole reply: one JSON object, with nothing around it but whitespace and ``` fences.
+ * NearAiUnavailable (so: a veto, "unreadable reply") when it holds no JSON object, more than one, one never closed,
+ * other text around it, a key twice in one object, an object that is not a verdict, or a verdict of "veto" anywhere
+ * inside a "pass".
  */
 export function verdictFromReply(text: string): { verdict: 'pass' | 'veto'; reasons: string[] } {
   const objects = topLevelObjects(text);
   if (objects.length === 0) throw new NearAiUnavailable('the model\'s reply has no JSON object');
   if (objects.length > 1) throw new NearAiUnavailable(`the model's reply holds ${objects.length} JSON objects`);
-  const value = parseJsonObject(objects[0]!);
+  const { start, end } = objects[0]!;
+  if (!FENCE_ONLY.test(text.slice(0, start)) || !FENCE_ONLY.test(text.slice(end))) {
+    throw new NearAiUnavailable('the model\'s reply has text outside its JSON object');
+  }
+  const json = text.slice(start, end);
+  const value = parseJsonObject(json);
+  const twice = duplicateKey(json);
+  if (twice !== null) throw new NearAiUnavailable(`the model's reply gives "${twice}" twice`);
   const verdict = parseVerdict(value);
   if (verdict.verdict === 'pass' && nestedVeto(value)) throw new NearAiUnavailable('the model\'s "pass" holds a "veto" inside it');
   return verdict;

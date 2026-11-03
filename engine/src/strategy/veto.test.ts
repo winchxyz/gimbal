@@ -103,7 +103,7 @@ test('a key NEAR AI rejects (401, 403) passes unchecked, and the line says the k
   }
 });
 
-test('a verdict in any case, padded, fenced or after words is read', async () => {
+test('a verdict in any case, padded or fenced is read', async () => {
   const veto = await ask(completion('{"verdict": "Veto", "reasons": ["a spike"]}'));
   assert.equal(veto.veto.verdict, 'veto');
   assert.equal(veto.line, 'NEAR AI vetoed NEAR: a spike');
@@ -111,9 +111,11 @@ test('a verdict in any case, padded, fenced or after words is read', async () =>
   assert.equal((await ask(completion('{"verdict": " Pass\\n"}'))).veto.verdict, 'pass');
   const fenced = await ask(completion('```json\n{"verdict": "veto", "reasons": ["the 14-day spread is {negative}"]}\n```'));
   assert.deepEqual(fenced.veto.reasons, ['the 14-day spread is {negative}']);
-  const after = await ask(completion('Here is my answer: {"verdict": "pass", "reasons": []} Thanks.'));
-  assert.equal(after.veto.verdict, 'pass');
-  assert.equal(after.checked, true);
+  const bare = await ask(completion('```\n{"verdict": "pass", "reasons": []}\n```\n'));
+  assert.equal(bare.veto.verdict, 'pass');
+  assert.equal(bare.checked, true);
+  // A key in a string that only looks like a duplicate is not one.
+  assert.equal((await ask(completion('{"verdict": "pass", "reasons": ["\\"verdict\\": twice"]}'))).veto.verdict, 'pass');
 });
 
 test('a reply that cannot be read fails closed: a veto, "unreadable reply"', async () => {
@@ -127,6 +129,10 @@ test('a reply that cannot be read fails closed: a veto, "unreadable reply"', asy
     [completion('I could say {"verdict":"pass"} but no: {"verdict":"veto"}'), /holds 2 JSON objects/],
     [completion('{"verdict":"pass"} {"verdict":"pass"}'), /holds 2 JSON objects/],
     [completion('{"verdict":"pass","reasons":[],"draft":{"verdict":"Veto"}}'), /"pass" holds a "veto" inside it/],
+    // Words outside the one object, or a key given twice (JSON.parse would keep only the last), are unreadable too.
+    [completion('Verdict: veto. {"verdict":"pass"}'), /text outside its JSON object/],
+    [completion('Here is my answer: {"verdict": "pass", "reasons": []} Thanks.'), /text outside its JSON object/],
+    [completion('{"verdict":"veto","verdict":"pass"}'), /gives "verdict" twice/],
   ];
   for (const [body, why] of cases) {
     const r = await ask(body);
