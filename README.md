@@ -96,7 +96,8 @@ cd contract && cargo test --workspace
 
 The final contract code (main at `b73beb5`) runs on NEAR testnet at
 [`gimbal-final-fcf135.testnet`](https://testnet.nearblocks.io/address/gimbal-final-fcf135.testnet), deployed
-2026-11-03. It is the same wasm the mainnet final deploy uses (that deploy is not made yet):
+2026-11-03. Mainnet ([§6](#6-mainnet-evidence)) runs the same contract code from a later commit (only tests
+were added since), built reproducibly; that build embeds its build info, so the wasm hash differs.
 
 | | |
 |---|---|
@@ -248,6 +249,22 @@ FunctionCall key for the 21 operator methods, with 1 NEAR allowance
 The hourly-meter row was not part of this run (`--meter` not given).
 
 ### 6. Mainnet evidence
+
+The contract is [`gimbal_dex.near`](https://nearblocks.io/address/gimbal_dex.near). It has no access keys, so
+nobody can change its code, sign for it or move its NEAR; only the contract's own methods run.
+
+| Action | Time (UTC) | NEAR tx |
+| --- | --- | --- |
+| account created | 2026-11-03 19:34:31 | [GwzYcqsg…](https://nearblocks.io/txns/GwzYcqsgQMZ4Tv6DV79Hhz4Nj9uLjwerpMfHvrjMWHGr) |
+| code deployed, `new()` called | 2026-11-03 19:34:37 | [5xJqg6NR…](https://nearblocks.io/txns/5xJqg6NRApFngnzTDM12ZNH6r2sT5G2zqwrd8Co9MZP9) |
+| last key deleted (locked) | 2026-11-03 19:37:15 | [C3vpb1cv…](https://nearblocks.io/txns/C3vpb1cvqJMG8ivPJV9nTeJX9XGGGTfQzH7QVYYuMY4E) |
+
+The code on chain has code_hash `8SJ968Gyuwx9PAkU3v2ujJcdC7As4KX5SrqE8eqaQKaR` (sha256
+`6e7cb556b86ab64414196d76243bce6e04bd9a5da0ce49b7093a0d279cc15482`, 675,664 bytes). Its NEP-330 `build_info`
+names a reproducible build of commit
+[`eed9a99`](https://github.com/winchxyz/gimbal/tree/eed9a9930306cd61f6219f53a2c34afd5e7c731c) in the image
+`sourcescan/cargo-near:0.22.0-rust-1.99.1@sha256:c9655eaf7436b90c87ea8b25739f91063032c5c30ba24cfeafe72c142943b5bb`.
+To check it, run `cargo near build reproducible-wasm` in `contract/` at that commit and compare the sha256.
 
 <!-- fill: table — action · time · NEAR tx · venue tx — for: desk created, both legs opened, funding paid,
 rescue through Intents (with measured seconds), four refusals -->
