@@ -14,7 +14,12 @@
 //    share of the open interest only on a multi-day spread that pays its fees over the hold (carry.ts);
 // 4. books of the desk legs those pairs need, read again once older than bookTtlMs (a failed read keeps the last
 //    book, marked stale, and lists the venue as failed); a venue whose funding failed this scan is not asked for
-//    books; a desk pair with no book ever read is left out;
+//    books; a desk pair with no book ever read is left out. They are asked for in order: the held window's legs, the
+//    policy's markets, then the other legs by the gross funding of their best pair, so that a venue's request budget
+//    (venues/http-budget.ts: Phoenix) goes to them first. A read the budget skips is not sent: in a cool-down after a
+//    429 the venue counts as failed and its last books are stale; when only this scan's budget is spent, the last
+//    book stands until it is twice bookTtlMs old, then it is stale. Either way the venue's other books wait for the
+//    next scan;
 // 5. each window priced (price.ts); the 7-day gross and intervalsAbove from the hourly rate store, which a few
 //    public history reads per scan fill in the background (a scan never waits on them);
 // 6. ranked: enterable windows, then the other desk windows, each by the spread expected over the hold minus the
@@ -22,8 +27,12 @@
 //    windows by gross APR (their net is not complete), the best maxWatchWindows of them: within those, first the
 //    windows whose legs pass every quality check (quality.ts), then the rest.
 
-import type { ScanStatus, ScanVenueId, StrategyConfig, VenueId, Window as FundingWindow, WindowHistory } from '@gimbal/shared';
+import type {
+  ContractPolicy, ScanStatus, ScanVenueId, StrategyConfig, VenueId, Window as FundingWindow, WindowHistory,
+} from '@gimbal/shared';
 import type { Book, Clock, MarketFunding, MarketHistorySource, VenueReader, WatchReader } from '../venues/venue.ts';
+import type { ReadSkipped } from '../venues/http-budget.ts';
+import { isReadSkipped, scanRead } from '../venues/http-budget.ts';
 import { venueName } from '../venues/names.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { ScannerConfig } from './config.ts';
@@ -151,6 +160,26 @@ export function isRefusal(err: unknown): boolean {
 }
 
 const legKey = (leg: Pick<ScanLeg, 'venue' | 'symbol'>): string => `${leg.venue}|${leg.symbol}`;
+
+/** A desk leg whose book a listed pair needs: tier 0 the held window's, 1 a policy market, 2 the rest. */
+interface BookWant {
+  key: string;
+  leg: ScanLeg;
+  tier: number;
+  /** The largest |gross per hour| of a listed pair it is a leg of. */
+  gross: number;
+}
+
+/** The leg keys (venue|symbol) of the markets the desk's policy allows, on each desk venue. */
+function policyLegKeys(policy: ContractPolicy | null): Set<string> {
+  if (policy === null) return new Set();
+  return new Set([
+    ...policy.hl_assets.map((a) => legKey({ venue: 'hyperliquid', symbol: a.symbol })),
+    ...policy.phoenix_markets.map((m) => legKey({ venue: 'phoenix', symbol: m.symbol })),
+    ...policy.orderly_symbols.map((s) => legKey({ venue: 'orderly', symbol: s })),
+  ]);
+}
+
 /**
  * The rate store keeps each side of a leg apart: on GMX a short receives a different rate from what a long pays.
  * A history point carries one rate, which is both sides' on every venue that publishes history.
@@ -273,7 +302,7 @@ export class Scanner {
         return { source: s, rows: recent.rows, at: recent.at, stale: false };
       }
       try {
-        const rows = await withTimeout(this.#once(`funding ${s.id}`, () => s.funding()), config.readTimeoutMs, `${s.id} funding`);
+        const rows = await withTimeout(this.#once(`funding ${s.id}`, () => scanRead(() => s.funding())), config.readTimeoutMs, `${s.id} funding`);
         if (!Array.isArray(rows)) throw new Error(`${s.id} funding: not a list`);
         this.#lastGood.set(s.id, { rows, at: now });
         return { source: s, rows, at: now, stale: false };
@@ -316,11 +345,22 @@ export class Scanner {
     for (const p of all) if (p.desk) multi.set(p.id, this.#deskHistory(p, now));
     const pairs = all.filter((p) => this.#listed(p, heldId, multi.get(p.id) ?? null, strategy.legUsd));
 
-    // 4. books
-    const wanted = new Map<string, ScanLeg>();
-    for (const p of pairs) if (p.desk) for (const leg of [p.long, p.short]) wanted.set(legKey(leg), leg);
+    // 4. books, the ones that matter first: the held window's legs, the policy's markets, then by gross funding.
+    const wanted = new Map<string, BookWant>();
+    const policyLegs = policyLegKeys(config.policy);
+    for (const p of pairs) {
+      if (!p.desk) continue;
+      for (const leg of [p.long, p.short]) {
+        const key = legKey(leg);
+        const tier = p.id === heldId ? 0 : policyLegs.has(key) ? 1 : 2;
+        const gross = Math.abs(p.grossPerHour);
+        const w = wanted.get(key);
+        if (w === undefined) wanted.set(key, { key, leg, tier, gross });
+        else wanted.set(key, { ...w, tier: Math.min(w.tier, tier), gross: Math.max(w.gross, gross) });
+      }
+    }
     const skipped = new Set<ScanVenueId>();
-    const due = [...wanted.entries()].filter(([key, leg]) => {
+    const due = [...wanted.values()].filter(({ key, leg }) => {
       const b = this.#books.get(key);
       if (!(b === undefined || b.stale || b.readAt > now || now - b.readAt >= config.bookTtlMs)) return false;
       // A venue that did not answer for funding is likely down: its book reads would only hold the scan up.
@@ -329,17 +369,29 @@ export class Scanner {
         return false;
       }
       return true;
-    });
+    }).sort((a, b) => a.tier - b.tier || b.gross - a.gross || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
     for (const v of skipped) this.#note(`${v} books not read: its funding read failed this scan`);
-    await pool(due.map(([key, leg]) => async () => {
+    // The first read a venue's budget skips this scan; its later books are not asked for until the next scan.
+    const deferred = new Map<ScanVenueId, { first: ReadSkipped; count: number }>();
+    const defer = (w: BookWant, why: ReadSkipped) => {
+      const d = deferred.get(w.leg.venue);
+      if (d === undefined) deferred.set(w.leg.venue, { first: why, count: 1 });
+      else d.count++;
+      this.#deferBook(w.key, why, now);
+    };
+    await pool(due.map((w) => async () => {
+      const { key, leg } = w;
       const src = sourceById.get(leg.venue);
       if (src?.book === undefined) return;
+      const held = deferred.get(leg.venue);
+      if (held !== undefined) return defer(w, held.first);
       try {
-        const read = this.#once(`book ${key}`, () => src.book!(leg.symbol, config.bookDepth));
+        const read = this.#once(`book ${key}`, () => scanRead(() => src.book!(leg.symbol, config.bookDepth)));
         const book = await withTimeout(read, config.bookTimeoutMs, `${leg.venue} book ${leg.symbol}`);
         // Dated when it answered: a book read late in a slow scan is that much younger than the scan's start.
         this.#books.set(key, { book, readAt: clock.now(), stale: false });
       } catch (err) {
+        if (isReadSkipped(err)) return defer(w, err);
         failed.add(leg.venue);
         this.#note(`${leg.venue} book ${leg.symbol} failed: ${errorMessage(err)}`);
         const last = this.#books.get(key);
@@ -349,6 +401,11 @@ export class Scanner {
         }
       }
     }), 6);
+    for (const [venue, d] of deferred) {
+      // A cool-down means the venue refused us a moment ago: it did not answer this scan.
+      if (d.first.reason === 'cooling') failed.add(venue);
+      this.#note(`${venue} books: ${d.count} not read this scan (${d.first.message})`);
+    }
 
     // 5. price
     const ctx: PricingContext = {
@@ -629,7 +686,7 @@ export class Scanner {
       // Aborted when the scanner stops waiting, so a read that timed out does not run on in the background.
       const abort = new AbortController();
       try {
-        const read = src.history!(leg.symbol, older ? olderStart : start, older ? olderEnd : end, abort.signal);
+        const read = scanRead(() => src.history!(leg.symbol, older ? olderStart : start, older ? olderEnd : end, abort.signal));
         const points = await withTimeout(read, config.readTimeoutMs * 2, what).catch((err: unknown) => {
           abort.abort(err);
           throw err;
@@ -671,6 +728,23 @@ export class Scanner {
     });
     this.#historyRun = run;
     return todo.length;
+  }
+
+  /**
+   * A due book whose read the venue's budget did not send. A book never read stays missing (its pairs are left out).
+   * In a cool-down after a 429 the last book is stale at once; when only the budget was spent it stands until it is
+   * twice bookTtlMs old: the read is due again next scan, and a long list of books needs a few scans to go round.
+   */
+  #deferBook(key: string, why: ReadSkipped, now: number): void {
+    const { config } = this.#options;
+    const last = this.#books.get(key);
+    if (last === undefined) return;
+    if (now - last.readAt > config.dropAfterMs) {
+      this.#books.delete(key);
+      return;
+    }
+    const stale = last.stale || why.reason === 'cooling' || last.readAt > now || now - last.readAt >= 2 * config.bookTtlMs;
+    if (stale !== last.stale) this.#books.set(key, { ...last, stale });
   }
 
   /**
