@@ -359,47 +359,96 @@ test('(A) inFlightUnexplained: a leg is explained by its baseline moved by none,
   assert.deepEqual(inFlightUnexplained([], [null, toQty('50')], [toQty('-50'), toQty('50')]), ['hyperliquid reads -50 and its saved baseline is unknown']);
 });
 
-test('(A) start: orders in flight that can no longer run are settled from the venues; explained reads are adopted, others keep the hold with what to run', () => {
-  const saved = (extra: Partial<TraderFileState> = {}) => loaded(fileState(traderState([toQty('-50'), toQty('50')]), { inFlight: [flight({ side: 'BUY', size: '20' })], ...extra }));
+const UNSETTLED_REF = { venue: 'hyperliquid' as const, side: 'BUY' as const, size: '20', reduceOnly: true, orderId: null, clientId: '0xab', tx: [], sentAt: 1 };
+const closeFlight = () => [flight({ side: 'BUY', size: '20' }), flight({ index: 1, venue: 'phoenix', side: 'SELL', size: '20' })];
+
+test('(A) start: orders in flight that can no longer run: offsetting explained reads are adopted; one leg moved alone keeps the baselines for the ADL watch', async () => {
+  const saved = (extra: Partial<TraderFileState> = {}, trader = traderState([toQty('-50'), toQty('50')])) => loaded(fileState(trader, { inFlight: [flight({ side: 'BUY', size: '20' })], ...extra }));
   const old = IN_FLIGHT_LIFE_MS;
-  for (const hl of ['-30', '-50']) {
-    const p = plan([toQty(hl), toQty('50')], saved(), undefined, old);
-    assert.equal(p.stateOk, true);
-    assert.deepEqual(p.restore?.baselines, [toQty('-50'), toQty('50')], 'the saved state (ADL budget, unsettled) is kept');
-    assert.deepEqual([p.adopt, p.inFlight, p.adlHold], [[toQty(hl), toQty('50')], [], null], hl);
-    assert.match(p.notes.at(-1) ?? '', /signed more than 10 min ago and can no longer run; the venues read hyperliquid .*, as the saved baselines and those orders explain: adopted, the ADL hold ends/);
-  }
+  // Both legs of a close ran (or neither did): the reads offset, so they are adopted.
+  const both = plan([toQty('-30'), toQty('30')], saved({ inFlight: closeFlight() }), undefined, old);
+  assert.deepEqual([both.adopt, both.inFlight, both.adlHold, both.owner], [[toQty('-30'), toQty('30')], [], null, []]);
+  assert.match(both.notes.at(-1) ?? '', /signed more than 10 min ago and can no longer run; the venues read hyperliquid -30, phoenix 30, as the saved baselines and those orders explain, offsetting each other: adopted, the ADL hold ends/);
+  assert.deepEqual(plan([toQty('-50'), toQty('50')], saved(), undefined, old).adopt, [toQty('-50'), toQty('50')], 'the order did not run');
+  // Hyperliquid alone moved by the BUY 20: an order of ours that ran, or one that never went out and an ADL of 20.
+  const alone = plan([toQty('-30'), toQty('50')], saved(), undefined, old);
+  assert.equal(alone.adopt, null, 'not adopted: that would hide an ADL');
+  assert.deepEqual([alone.inFlight, alone.adlHold], [[], null], 'the hold ends');
+  assert.deepEqual(alone.restore?.baselines, [toQty('-50'), toQty('50')], 'the saved baselines stay');
+  assert.equal(alone.owner.length, 1);
+  assert.match(alone.owner[0]!, /each leg is explained by its baseline and those orders, but together they do not offset each other \(the pair's net is 0\).*not adopted; the ADL hold ends and the saved baselines stay, so the ADL watch takes the shrink/);
+  // ... and the ADL watch takes it: two reads, the pause, both legs unwound reduce-only.
+  const s = pair(true, { restored: alone.inFlight, ...(alone.adlHold === null ? {} : { adlHold: alone.adlHold }) });
+  s.trader.importState(alone.restore!);
+  s.hl.pos = toQty('-30');
+  s.px.pos = toQty('50');
+  const adl = new AdlWatch(s.p, { hold: () => s.p.adlHold, sleep: async () => {}, confirmMs: 0 });
+  const r = await adl.check();
+  assert.notEqual(r?.stage, 'alert');
+  assert.notEqual(adl.state.paused, null);
+  assert.deepEqual([s.hl.pos, s.px.pos], [0n, 0n]);
+  assert.ok([...s.hl.orders, ...s.px.orders].every((o) => o.reduceOnly));
+  // A leg the baselines and the orders do not explain: the hold stays and says what to run.
   const off = plan([toQty('-40'), toQty('50')], saved(), undefined, old);
   assert.equal(off.adopt, null);
   assert.equal(off.inFlight.length, 1);
   assert.match(off.adlHold ?? '', /1 order\(s\) were in flight when the engine stopped \(hyperliquid BUY 20\) and can no longer run, but hyperliquid reads -40, but its saved baseline -50 with BUY 20 does not reach it \(an ADL, a partial fill or a trade elsewhere\): ADL only alerts until the owner reconciles; /);
   assert.match(off.adlHold ?? '', /check both legs \(npm run monitor -w engine -- --mainnet\); to close them: stop serve, then pair-mainnet close XLM --send, then start serve again; if the legs are right as they are: stop serve, move trader\.json aside, then start serve once with GIMBAL_TRADER_FRESH=gimbal-test\.near\/canary$/);
-  assert.match(off.notes.at(-1) ?? '', /^ADL hold: /);
-  const resting = plan([toQty('-30'), toQty('50')], saved({ pendingMaker: [{ cloid: '0xc', oid: 5, side: 'BUY', size: '1' }] }), undefined, old);
+  assert.match(off.owner[0] ?? '', /^ADL hold stays: /);
+  const resting = plan([toQty('-30'), toQty('30')], saved({ inFlight: closeFlight(), pendingMaker: [{ cloid: '0xc', oid: 5, side: 'BUY', size: '1' }] }), undefined, old);
   assert.match(resting.adlHold ?? '', /1 Hyperliquid post-only order\(s\) are not settled and may still fill/);
-  const young = plan([toQty('-30'), toQty('50')], saved(), undefined, old - 1);
-  assert.deepEqual([young.adopt, young.inFlight.length], [null, 1], 'one that can still run is not settled at start');
+  const young = plan([toQty('-30'), toQty('30')], saved({ inFlight: closeFlight() }), undefined, old - 1);
+  assert.deepEqual([young.adopt, young.inFlight.length, young.owner], [null, 2, []], 'orders that can still run are not settled at start');
 });
 
-test('(A) resolveInFlight: once the orders can no longer run, explained reads are adopted; unexplained ones keep the hold with what to run', () => {
-  const restored = [flight({ side: 'BUY', size: '20' })];
-  const s = pair(true, { restored, adlHold: 'held' });
+test('(A) start: nothing is adopted while a leg has an order with no answer: the hold stays over the intent its result set', () => {
+  const t = traderState([toQty('-50'), toQty('50')], { unsettled: [{ index: 0, refs: [UNSETTLED_REF], until: 4_000_000_000_000, from: toQty('-50'), unwind: null }] });
+  const p = plan([toQty('-30'), toQty('30')], loaded(fileState(t, { inFlight: closeFlight() })), undefined, IN_FLIGHT_LIFE_MS);
+  assert.equal(p.adopt, null);
+  assert.deepEqual(p.restore?.baselines, [toQty('-50'), toQty('50')]);
+  assert.equal(p.inFlight.length, 2);
+  assert.match(p.adlHold ?? '', /1 leg\(s\) have an order with no answer that may still run: ADL only alerts until its watch ends or a close result sets the baselines/);
+  assert.match(p.owner[0] ?? '', /an order with no answer may still run: not adopted, the ADL hold stays/);
+});
+
+test('(A) resolveInFlight: offsetting explained reads are adopted; one leg moved alone keeps the baselines; unexplained or unanswered ones keep the hold', async () => {
+  const read: [bigint, bigint] = [toQty('-30'), toQty('30')];
+  const s = pair(true, { restored: closeFlight(), adlHold: 'held' });
   s.trader.importState(traderState([toQty('-50'), toQty('50')]));
-  const read: [bigint, bigint] = [toQty('-30'), toQty('50')];
   const early = s.p.resolveInFlight(read, IN_FLIGHT_LIFE_MS - 1);
-  assert.equal(early?.again, true);
-  assert.equal(s.p.adlHold, 'held');
+  assert.deepEqual([early?.again, early?.owner, s.p.adlHold], [true, false, 'held']);
   const done = s.p.resolveInFlight(read, IN_FLIGHT_LIFE_MS);
-  assert.equal(done?.again, false);
-  assert.match(done?.line ?? '', /as the saved baselines and those orders explain: adopted, the ADL hold ends/);
+  assert.deepEqual([done?.again, done?.owner], [false, false]);
+  assert.match(done?.line ?? '', /offsetting each other: adopted, the ADL hold ends/);
   assert.deepEqual([s.p.adlHold, s.book.orders, s.trader.baseline(s.trader.legs[0])], [null, [], toQty('-30')]);
   assert.equal(s.p.resolveInFlight(read, IN_FLIGHT_LIFE_MS), null, 'nothing left to settle');
-  const t = pair(true, { restored, adlHold: 'held' });
+
+  const alone = pair(true, { restored: [flight({ side: 'BUY', size: '20' })], adlHold: 'held' });
+  alone.trader.importState(traderState([toQty('-50'), toQty('50')]));
+  alone.hl.pos = toQty('-30');
+  alone.px.pos = toQty('50');
+  const kept = alone.p.resolveInFlight([toQty('-30'), toQty('50')], IN_FLIGHT_LIFE_MS);
+  assert.deepEqual([kept?.again, kept?.owner, alone.p.adlHold, alone.book.orders], [false, true, null, []]);
+  assert.equal(alone.trader.baseline(alone.trader.legs[0]), toQty('-50'), 'the baseline stays: the shrink is not hidden');
+  assert.deepEqual(alone.saves.at(-1)?.inFlight, [], 'saved');
+  const adl = new AdlWatch(alone.p, { hold: () => alone.p.adlHold, sleep: async () => {}, confirmMs: 0 });
+  assert.notEqual((await adl.check())?.stage, 'alert');
+  assert.deepEqual([alone.hl.pos, alone.px.pos], [0n, 0n], 'both legs unwound reduce-only');
+
+  const t = pair(true, { restored: [flight({ side: 'BUY', size: '20' })], adlHold: 'held' });
   t.trader.importState(traderState([toQty('-50'), toQty('50')]));
-  const kept = t.p.resolveInFlight([toQty('-45'), toQty('50')], IN_FLIGHT_LIFE_MS);
-  assert.equal(kept?.again, false);
+  const off = t.p.resolveInFlight([toQty('-45'), toQty('50')], IN_FLIGHT_LIFE_MS);
+  assert.deepEqual([off?.again, off?.owner], [false, true]);
   assert.match(t.p.adlHold ?? '', /can no longer run, but hyperliquid reads -45.*ADL only alerts until the owner reconciles; check both legs by hand$/);
   assert.equal(t.book.orders.length, 1);
+
+  const u = pair(true, { restored: closeFlight(), adlHold: 'held' });
+  u.trader.importState(traderState([toQty('-50'), toQty('50')], { unsettled: [{ index: 0, refs: [UNSETTLED_REF], until: 4_000_000_000_000, from: toQty('-50'), unwind: null }] }));
+  const wait = u.p.resolveInFlight(read, IN_FLIGHT_LIFE_MS);
+  assert.deepEqual([wait?.again, wait?.owner], [true, true]);
+  assert.match(u.p.adlHold ?? '', /have an order with no answer that may still run/);
+  assert.equal(u.trader.baseline(u.trader.legs[0]), toQty('-50'), 'not adopted over the unsettled watch');
+  u.trader.stop();
 });
 
 test('(C) stop() is final: a close and every guarded order are refused after it, nothing signed', async () => {

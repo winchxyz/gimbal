@@ -7,7 +7,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import type { VenueId } from '@gimbal/shared';
+import type { StreamEvent, VenueId } from '@gimbal/shared';
 import type { NearContractClient } from '../contract/near-client.ts';
 import type { Relayer } from '../relayer/relayer.ts';
 import type { LegOutcome, LegSide, PendingMakerOrder, TradeLeg } from '../trade/legs.ts';
@@ -306,37 +306,60 @@ test('the start lines: ADL alert only while orders saved in flight hold it, and 
   }
 });
 
-/** A crash in the middle of a reduce: the state holds the pair as before it (-50/50) and a Hyperliquid BUY 10 in flight. */
-function crashed(w: World, at: number): void {
+/**
+ * A crash in the middle of a reduce: the state holds the pair as before it (-50/50) and the reduce's orders in flight
+ * (both legs by 10, or the Hyperliquid BUY 10 alone when `both` is false).
+ */
+function crashed(w: World, at: number, both = true): void {
   const identity = { contractId: CONTRACT, deskId: DESK, evm: EVM };
   const store = new TraderStateStore(traderStateFile(w.dir, 'mainnet', identity), identity);
+  const hl = { index: 0 as const, venue: 'hyperliquid' as const, side: 'BUY' as const, size: '10', reduceOnly: true, reason: 'rescue r1: reduce', at, op: 'close' as const };
+  const px = { ...hl, index: 1 as const, venue: 'phoenix' as const, side: 'SELL' as const };
   store.save({
     version: TRADER_STATE_VERSION, savedAt: 1, symbol: 'XLM',
     trader: { intents: [toQty('-50'), toQty('50')], baselines: [toQty('-50'), toQty('50')], known: [toQty('-50'), toQty('50')], net: 0n, unhedged: null, unsettled: [] }, pendingMaker: [],
-    inFlight: [{ index: 0, venue: 'hyperliquid', side: 'BUY', size: '10', reduceOnly: true, reason: 'rescue r1: reduce', at, op: 'close' }], adl: newAdlState(),
+    inFlight: both ? [hl, px] : [hl], adl: newAdlState(),
   });
 }
 
-test('(A) orders saved in flight that can no longer run are settled at start: explained legs are adopted, others keep the hold and say what to run', async () => {
+const ownerEntries = (events: StreamEvent[]) => events.flatMap((e) => (e.type === 'journal' && e.data.kind === 'error' && e.data.summary.startsWith('owner: ') ? [e.data.summary] : []));
+
+test('(A) orders saved in flight that can no longer run are settled at start: offsetting reads adopted, a leg moved alone keeps the baselines, others keep the hold; the owner is journaled', async () => {
   const w = world('XLM', { GIMBAL_TRADE: '1' });
   try {
+    const events: StreamEvent[] = [];
     crashed(w, Date.now() - 11 * 60_000);
-    w.hl.pos = toQty('-40');      // our reduce landed, its result was never saved
-    w.px.pos = toQty('50');
-    const p = await servePair(input(w));
+    w.hl.pos = toQty('-40');      // the reduce landed on both legs, its result was never saved
+    w.px.pos = toQty('40');
+    const p = await servePair(input(w, { publish: (e) => events.push(e) }));
     assert.equal(p.pair?.live, true);
     assert.equal(p.pair?.adlHold, null);
     assert.equal(p.pair?.trader.baseline(p.pair.legs[0]), toQty('-40'));
-    assert.ok(p.lines.some((l) => /can no longer run.*as the saved baselines and those orders explain: adopted, the ADL hold ends/.test(l)), p.lines.join('\n'));
+    assert.ok(p.lines.some((l) => /offsetting each other: adopted, the ADL hold ends/.test(l)), p.lines.join('\n'));
+    assert.deepEqual(ownerEntries(events), [], 'an adopt is no news for the owner');
     p.stop();
+    // Hyperliquid alone moved by its BUY 10: an ADL while serve was down looks the same as the reduce never sent.
+    crashed(w, Date.now() - 11 * 60_000, false);
+    w.px.pos = toQty('50');
+    const q = await servePair(input(w, { publish: (e) => events.push(e) }));
+    assert.equal(q.pair?.adlHold, null);
+    assert.equal(q.pair?.trader.baseline(q.pair.legs[0]), toQty('-50'), 'not adopted: the ADL watch sees the shrink');
+    assert.match(ownerEntries(events).join('\n'), /^owner: .*do not offset each other .*not adopted; the ADL hold ends and the saved baselines stay/);
+    const r = await q.adl!.check();
+    assert.notEqual(r?.stage, 'alert');
+    assert.deepEqual([w.hl.pos, w.px.pos], [0n, 0n], 'both legs unwound reduce-only');
+    q.stop();
     crashed(w, Date.now() - 11 * 60_000);
     w.hl.pos = toQty('-45');      // neither the baseline nor the order: an ADL, a partial fill, a trade elsewhere
-    const q = await servePair(input(w));
-    assert.equal(q.pair?.live, true, 'panic_close and a rescue reduce still trade');
-    const out = lines(q);
-    assert.ok(out.some((l) => /ADL -> alert only: 1 order\(s\) were in flight .* can no longer run, but hyperliquid reads -45, .*npm run monitor -w engine -- --mainnet.*pair-mainnet close XLM --send.*move .*trader-mainnet-.*\.json aside, then start serve once with GIMBAL_TRADER_FRESH=gimbal-test\.near\/canary/.test(l)), out.join('\n'));
-    assert.equal(q.pair?.trader.baseline(q.pair.legs[0]), toQty('-50'), 'not adopted: the shrink stays visible');
-    q.stop();
+    w.px.pos = toQty('50');
+    events.length = 0;
+    const u = await servePair(input(w, { publish: (e) => events.push(e) }));
+    assert.equal(u.pair?.live, true, 'panic_close and a rescue reduce still trade');
+    const out = lines(u);
+    assert.ok(out.some((l) => /ADL -> alert only: 2 order\(s\) were in flight .* can no longer run, but hyperliquid reads -45, .*npm run monitor -w engine -- --mainnet.*pair-mainnet close XLM --send.*move .*trader-mainnet-.*\.json aside, then start serve once with GIMBAL_TRADER_FRESH=gimbal-test\.near\/canary/.test(l)), out.join('\n'));
+    assert.equal(u.pair?.trader.baseline(u.pair.legs[0]), toQty('-50'));
+    assert.match(ownerEntries(events)[0] ?? '', /^owner: ADL hold stays: /);
+    u.stop();
   } finally {
     rmSync(w.dir, { recursive: true, force: true });
   }
@@ -348,13 +371,13 @@ test('(A) orders in flight that could still run at start are settled from the ve
     let now = Date.now();
     crashed(w, now - 1_000);
     w.hl.pos = toQty('-40');
-    w.px.pos = toQty('50');
+    w.px.pos = toQty('40');
     const p = await servePair(input(w, { clock: { now: () => now } }));
     assert.match(p.pair?.adlHold ?? '', /or until they can no longer run \(.*\) and serve settles them from the venues/);
     assert.match((await p.settleInFlight!()) ?? '', /they can run until .*, settled from the venues then/);
     assert.notEqual(p.pair?.adlHold, null);
     now += 10 * 60_000;
-    assert.match((await p.settleInFlight!()) ?? '', /as the saved baselines and those orders explain: adopted, the ADL hold ends/);
+    assert.match((await p.settleInFlight!()) ?? '', /offsetting each other: adopted, the ADL hold ends/);
     assert.equal(p.pair?.adlHold, null);
     assert.equal(p.pair?.trader.baseline(p.pair.legs[0]), toQty('-40'));
     assert.equal(await p.settleInFlight!(), null);

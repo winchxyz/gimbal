@@ -838,8 +838,13 @@ shrink starts no event: it is journaled once for the owner and nothing is traded
 sets the baselines again, or the orders are settled from the venues. An order cannot run more than 10 min after it
 was signed (a Hyperliquid IOC answers at once, a Phoenix blockhash lasts about 2 min), so once the youngest is that
 old (at start, or on a timer serve sets for it) both legs are read twice alike: when each reads its saved baseline
-moved by none, some or all of its orders in flight (each in full), the reads are adopted and the hold ends; otherwise
-the hold stays, and the start line `ADL -> alert only: ...` says what the owner runs (**reconcile**): check both legs
+moved by none, some or all of its orders in flight (each in full) and the two reads offset each other as the pair's
+net, they are adopted and the hold ends. Explained leg by leg but not offsetting (one leg moved alone: an ADL while
+serve was down looks the same as an order of ours that never went out), they are not adopted: the hold ends and the
+saved baselines stay, so the ADL watch takes the shrink (two reads, then both legs unwound reduce-only; a reduce that
+never went out is over-unwound, which is safe). While a leg has an order with no answer, nothing is adopted (the hold
+stays; tried again each minute). Every outcome but an adopt is also journaled for the owner (`error`, `owner: ...`).
+Otherwise the hold stays, and the start line `ADL -> alert only: ...` says what the owner runs (**reconcile**): check both legs
 (`npm run monitor -w engine -- --mainnet`); to close them, stop serve, `pair-mainnet close <SYM> --send`, start serve
 again (a close result clears the hold); if the legs are right as they are, stop serve, move the trader state file
 aside and start serve once with `GIMBAL_TRADER_FRESH=<contract>/<desk>`. A close clamped to the legs as read (a

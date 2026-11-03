@@ -298,6 +298,15 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
     save();
 
     for (const n of plan.notes) lines.push(`pair      ${n}`);
+    // Orders in flight settled at start without an adopt: the owner hears of it in the journal, not only the log.
+    let ownerSaid: string | null = null;
+    const ownerAlert = (line: string) => {
+      if (line === ownerSaid) return;
+      ownerSaid = line;
+      const t = input.clock.now();
+      input.publish({ type: 'journal', data: { id: `pair-owner-${t.toString(36)}`, t, kind: 'error', summary: `owner: ${line}`, numbers: { stage: 'in-flight' }, tx: [] } });
+    };
+    for (const line of plan.owner) ownerAlert(line);
     const heldLock = lock as TraderLock | null;
     lines.push(`pair      ${symbol}: hyperliquid ${signedQtyString(read[0])} (${read[0] < 0n ? 'short' : read[0] > 0n ? 'long' : 'flat'}), phoenix ${signedQtyString(read[1])} (${read[1] > 0n ? 'long' : read[1] < 0n ? 'short' : 'flat'})`
       + `${read[0] + read[1] === 0n ? '' : ' NOT offsetting'}; state ${store.path}${live ? '' : ' (read only)'}${heldLock === null ? '' : `, lock ${heldLock.path}`}`);
@@ -316,7 +325,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       if (stopped || pp.adlHold === null || book.restored.length === 0) return null;
       const epoch = trader.baselineEpoch;
       const sent = book.orders.length;
-      let out: { line: string; again: boolean } | null;
+      let out: { line: string; again: boolean; owner?: boolean } | null;
       try {
         const now = await readTwice(trader.legs, sleep, log);
         // A close or a watch check of ours ran meanwhile: the reads may hold its orders, so they settle nothing.
@@ -328,13 +337,17 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       }
       if (out === null) return null;
       log(`pair      ${out.line}`);
+      if (out.owner === true) ownerAlert(out.line);
       if (out.again) settleLater(Math.max(SETTLE_RETRY_MS, (inFlightEnds(book.restored) ?? 0) - input.clock.now()));
       return out.line;
     };
-    // Only orders that could still run at start: those that could not were settled by startPlan (adopted, or the hold
-    // names what the owner runs).
+    // Orders that could still run at start, or that wait for an order with no answer: the others were settled by
+    // startPlan (adopted, the baselines kept for the ADL watch, or a hold that names what the owner runs).
     const ends = inFlightEnds(book.restored);
-    if (live && pp.adlHold !== null && ends !== null && ends > input.clock.now()) settleLater(ends - input.clock.now() + START_CONFIRM_MS);
+    const noAnswer = trader.legs.some((l) => trader.unsettled(l) !== null);
+    if (live && pp.adlHold !== null && ends !== null && (ends > input.clock.now() || noAnswer)) {
+      settleLater(ends > input.clock.now() ? ends - input.clock.now() + START_CONFIRM_MS : SETTLE_RETRY_MS);
+    }
 
     const cancelResting = async (): Promise<CancelResult> => {
       if (stopped) throw new Error('serve is stopping and its trader lock is released: nothing is cancelled');

@@ -934,8 +934,11 @@ before any `pair-mainnet --send`.
 
 **Reconcile an ADL hold.** After a crash in the middle of a close, or a stop that passed 180 s, the state file still
 holds orders in flight and ADL only alerts. Serve settles them itself once they are 10 min old (at start, or on a
-timer): when both legs read their saved baselines moved by those orders, the reads are adopted and the hold ends. When
-they do not, the start line `ADL -> alert only: ... can no longer run, but <leg> reads ...` stays, and the owner:
+timer): when both legs read their saved baselines moved by those orders and offset each other, the reads are adopted
+and the hold ends. When only one leg moved (an ADL looks the same as an order that never went out), the hold ends but
+the saved baselines stay, so the ADL watch unwinds both legs reduce-only; the journal gets an `owner:` line. When a
+leg is not explained at all, the start line `ADL -> alert only: ... can no longer run, but <leg> reads ...` stays (and
+an `owner:` journal line), and the owner:
 
 - checks both legs: `npm run monitor -w engine -- --mainnet`;
 - to close them: stops serve, runs `pair-mainnet close <SYM> --send`, starts serve again (the close result clears it);

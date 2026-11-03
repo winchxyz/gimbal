@@ -33,9 +33,13 @@
 // then only alerts (the `adlHold`) until a close result or an adopt sets the baselines again, or until the orders are
 // resolved from the venues. An order cannot run longer than IN_FLIGHT_LIFE_MS after it was signed (a Hyperliquid IOC
 // answers at once; a Phoenix transaction's blockhash lasts about 2 min), so once every one is that old, two agreeing
-// reads of the legs settle them: when each leg reads its saved baseline moved by some of those orders (none, some or
-// all of them, each in full), the reads are adopted and the hold ends; otherwise the hold stays and says what to run
-// (reconcileHow). startPlan does this at start; serve calls resolveInFlight when the youngest order passes that age.
+// reads of the legs settle them (settleInFlight): when each leg reads its saved baseline moved by some of those orders
+// (none, some or all of them, each in full) and the reads offset each other as the pair's net, they are adopted and the
+// hold ends; explained leg by leg but not offsetting (a leg that moved alone: an ADL looks the same as an order of ours
+// that never went out), the hold ends and the saved baselines stay, so the ADL watch takes the shrink; otherwise the
+// hold stays and says what to run (reconcileHow). Nothing is adopted while a leg has an order with no answer (its
+// result set the intent the trader watches). Every outcome but an adopt is journaled for the owner. startPlan does
+// this at start; serve calls resolveInFlight when the youngest order passes that age.
 //
 // stop() (serve's shutdown, before its lock is released) is final: every order and close is refused after it.
 
@@ -146,6 +150,52 @@ export function inFlightUnexplained(orders: readonly InFlightOrder[], baselines:
     }
   }
   return out;
+}
+
+/**
+ * How orders in flight that can no longer run are settled from two agreeing reads (see the header):
+ *   adopt    every leg explained, no order with no answer, and the reads offset as the pair's net: adopted, hold ends
+ *   restore  every leg explained, but the reads do not offset (one leg moved alone: an order of ours that never went
+ *            out and an ADL look the same): not adopted; the hold ends and the saved baselines stay, so the ADL watch
+ *            takes the shrink (two reads, then both legs unwound reduce-only; a stopped reduce is over-unwound, safely)
+ *   hold     a leg the baselines and the orders do not explain, or a post-only order not settled: the hold stays and
+ *            says what the owner runs
+ *   wait     a leg has an order with no answer that may still run (the trader's unsettled watch): nothing is adopted
+ *            over the intent its result set; tried again later
+ * Every outcome but adopt is for the owner (journaled).
+ */
+export type InFlightSettle =
+  | { kind: 'adopt'; line: string }
+  | { kind: 'restore'; line: string }
+  | { kind: 'hold'; hold: string; line: string }
+  | { kind: 'wait'; hold: string; line: string };
+
+export function settleInFlight(p: {
+  orders: readonly InFlightOrder[];
+  baselines: readonly (bigint | null)[];
+  net: bigint;
+  read: readonly [bigint, bigint];
+  unsettled: number;
+  pendingMaker: number;
+  reconcile: string;
+}): InFlightSettle {
+  const { orders, read } = p;
+  const reads = `hyperliquid ${signedQtyString(read[0])}, phoenix ${signedQtyString(read[1])}`;
+  const head = `the ${orders.length} order(s) in flight when the engine stopped were signed more than ${IN_FLIGHT_LIFE_MS / 60_000} min ago and can no longer run; the venues read ${reads}`;
+  const off = inFlightUnexplained(orders, p.baselines, read);
+  if (p.pendingMaker > 0) off.push(`${p.pendingMaker} Hyperliquid post-only order(s) are not settled and may still fill (cancel them on Hyperliquid)`);
+  if (off.length > 0) {
+    const hold = holdText(orders, off, p.reconcile);
+    return { kind: 'hold', hold, line: `ADL hold stays: ${hold}` };
+  }
+  if (p.unsettled > 0) {
+    const hold = `${orders.length} order(s) were in flight when the engine stopped and can no longer run, but ${p.unsettled} leg(s) have an order with no answer that may still run: ADL only alerts until its watch ends or a close result sets the baselines; ${p.reconcile}`;
+    return { kind: 'wait', hold, line: `${head}, but an order with no answer may still run: not adopted, the ADL hold stays (tried again later)` };
+  }
+  if (read[0] + read[1] !== p.net) {
+    return { kind: 'restore', line: `${head}: each leg is explained by its baseline and those orders, but together they do not offset each other (the pair's net is ${signedQtyString(p.net)}), as a leg that moved alone would (an ADL, or an order of ours that never went out): not adopted; the ADL hold ends and the saved baselines stay, so the ADL watch takes the shrink (two reads, then both legs unwound reduce-only)` };
+  }
+  return { kind: 'adopt', line: `${head}, as the saved baselines and those orders explain, offsetting each other: adopted, the ADL hold ends` };
 }
 
 /** What the owner runs when orders in flight cannot be settled from the venues (the ADL hold's text ends with it). */
@@ -339,26 +389,36 @@ export class ProtectedPair {
 
   /**
    * The orders in flight from before the restart, once the youngest can no longer run (IN_FLIGHT_LIFE_MS), settled
-   * from `read` (two agreeing reads of both legs): explained by the baselines and those orders, the legs are adopted
-   * and the ADL hold ends; else the hold stays and says what to run. Null when there is nothing to settle (no hold, no
-   * restored order left, or stopped); `again` true when it could not be decided now (a close runs, the trader is busy,
-   * or an order can still run): the caller tries again later.
+   * from `read` (two agreeing reads of both legs) as settleInFlight decides. Null when there is nothing to settle (no
+   * hold, no restored order left, or stopped); `again` true when it could not be decided now (a close runs, the trader
+   * is busy, an order can still run, or one has no answer): the caller tries again later; `owner` true when the owner
+   * must hear of it (anything but an adopt).
    */
-  resolveInFlight(read: readonly [bigint, bigint], now: number): { line: string; again: boolean } | null {
+  resolveInFlight(read: readonly [bigint, bigint], now: number): { line: string; again: boolean; owner: boolean } | null {
     const restored = this.inFlight.restored;
     if (this.#adlHold === null || restored.length === 0 || this.#stopped) return null;
-    if (this.closing) return { line: 'orders in flight from before the restart: not settled now, a close is running (a close result settles them)', again: true };
+    if (this.closing) return { line: 'orders in flight from before the restart: not settled now, a close is running (a close result settles them)', again: true, owner: false };
     const ends = inFlightEnds(restored)!;
-    if (now < ends) return { line: `orders in flight from before the restart: they can run until ${new Date(ends).toISOString()}, settled from the venues then`, again: true };
-    const off = inFlightUnexplained(restored, this.trader.legs.map((l) => this.trader.baseline(l) ?? null), read);
-    const resting = this.#o.pendingMaker?.() ?? [];
-    if (resting.length > 0) off.push(`${resting.length} Hyperliquid post-only order(s) are not settled and may still fill (cancel them on Hyperliquid)`);
-    if (off.length === 0) {
+    if (now < ends) return { line: `orders in flight from before the restart: they can run until ${new Date(ends).toISOString()}, settled from the venues then`, again: true, owner: false };
+    const legs = this.trader.legs;
+    const r = settleInFlight({
+      orders: restored, baselines: legs.map((l) => this.trader.baseline(l) ?? null), net: this.trader.net, read,
+      unsettled: legs.filter((l) => this.trader.unsettled(l) !== null).length, pendingMaker: (this.#o.pendingMaker?.() ?? []).length,
+      reconcile: this.#o.reconcile ?? 'check both legs by hand',
+    });
+    if (r.kind === 'adopt') {
       this.adopt(read);
-      return { line: `the ${restored.length} order(s) in flight from before the restart can no longer run, and the venues read hyperliquid ${signedQtyString(read[0])}, phoenix ${signedQtyString(read[1])}, as the saved baselines and those orders explain: adopted, the ADL hold ends`, again: false };
+      return { line: r.line, again: false, owner: false };
     }
-    this.#adlHold = holdText(restored, off, this.#o.reconcile ?? 'check both legs by hand');
-    return { line: `ADL hold stays: ${this.#adlHold}`, again: false };
+    if (r.kind === 'restore') {
+      // The baselines stay as they are: the ADL watch compares the legs with them from now on.
+      this.inFlight.allRecorded();
+      this.#adlHold = null;
+      this.#save();
+      return { line: r.line, again: false, owner: true };
+    }
+    this.#adlHold = r.hold;
+    return { line: r.line, again: r.kind === 'wait', owner: true };
   }
 
   /** A protection's close: always reduce-only (see the header); throws, with nothing sent, when it cannot start. */
@@ -498,6 +558,8 @@ export interface StartPlan {
   adlHold: string | null;
   /** What was decided, one line each. */
   notes: string[];
+  /** Lines the owner must hear of (journaled): orders in flight settled from the venues without an adopt. */
+  owner: string[];
 }
 
 const flat = (p: readonly (bigint | null)[]): boolean => p.every((x) => x === 0n);
@@ -532,7 +594,7 @@ export function startPlan(input: StartInput): StartPlan {
       fresh = true;
     }
   }
-  const plan = (p: Omit<StartPlan, 'notes'> & { notes: string[] }): StartPlan => ({ ...p, notes: [...freshNotes, ...p.notes] });
+  const plan = (p: Omit<StartPlan, 'notes' | 'owner'> & { notes: string[]; owner?: string[] }): StartPlan => ({ ...p, notes: [...freshNotes, ...p.notes], owner: p.owner ?? [] });
   const adopted = (stateOk: boolean, why: string | null, notes: string[], adl: AdlState = newAdlState(), pendingMaker: PendingMakerOrder[] = [], inFlight: InFlightOrder[] = [], adlHold: string | null = null): StartPlan => plan({
     stateOk, why, restore: null, adopt: read, adl, pendingMaker, inFlight, adlHold, notes,
   });
@@ -572,13 +634,11 @@ export function startPlan(input: StartInput): StartPlan {
   const restore = (note: string): StartPlan => {
     const restored = { stateOk: true, why: null, restore: t, adl: s.adl, pendingMaker: s.pendingMaker };
     if (!settled) return plan({ ...restored, adopt: null, inFlight, adlHold: hold, notes: [note] });
-    const off = inFlightUnexplained(inFlight, base, read);
-    if (s.pendingMaker.length > 0) off.push(`${s.pendingMaker.length} Hyperliquid post-only order(s) are not settled and may still fill (cancel them on Hyperliquid)`);
-    if (off.length === 0) {
-      return plan({ ...restored, adopt: read, inFlight: [], adlHold: null, notes: [note, `${settledNote()}, as the saved baselines and those orders explain: adopted, the ADL hold ends`] });
-    }
-    const why = holdText(inFlight, off, reconcile);
-    return plan({ ...restored, adopt: null, inFlight, adlHold: why, notes: [note, `ADL hold: ${why}`] });
+    const r = settleInFlight({ orders: inFlight, baselines: base, net: t.net, read, unsettled: t.unsettled.length, pendingMaker: s.pendingMaker.length, reconcile });
+    if (r.kind === 'adopt') return plan({ ...restored, adopt: read, inFlight: [], adlHold: null, notes: [note, r.line] });
+    // The baselines stay as saved: the ADL watch compares the legs with them.
+    if (r.kind === 'restore') return plan({ ...restored, adopt: null, inFlight: [], adlHold: null, notes: [note, r.line], owner: [r.line] });
+    return plan({ ...restored, adopt: null, inFlight, adlHold: r.hold, notes: [note, r.line], owner: [r.line] });
   };
   if (t.unsettled.length > 0 || s.adl.event !== null || s.pendingMaker.length > 0) {
     return restore(`restored from ${input.path}: baselines ${text(base)}, venues ${text(read)}${t.unsettled.length > 0 ? `, ${t.unsettled.length} leg(s) with an order that may still run` : ''}${s.adl.event !== null ? ', an ADL event in progress' : ''}${s.pendingMaker.length > 0 ? `, ${s.pendingMaker.length} post-only order(s) not settled` : ''}`);
