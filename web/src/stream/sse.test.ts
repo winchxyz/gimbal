@@ -39,6 +39,7 @@ const state = (overrides: Partial<EngineState> = {}): EngineState => ({
   rescue: null,
   setup: null,
   health: null,
+  decision: null,
   at: 1,
   ...overrides,
 });

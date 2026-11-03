@@ -41,7 +41,7 @@ test('events count per type and keep the latest of each', () => {
     { type: 'health', data: { hyperliquid: 'ok', phoenix: 'slow', orderly: 'ok', intents: 'ok', near: 'down' } },
   ]);
   assert.equal(s.received, 4);
-  assert.deepEqual(s.counts, { windows: 1, scan: 0, desk: 2, journal: 0, rescue: 0, setup: 0, health: 1 });
+  assert.deepEqual(s.counts, { windows: 1, scan: 0, desk: 2, journal: 0, rescue: 0, setup: 0, health: 1, decision: 0 });
   assert.equal(s.desk?.equityUsd, 101);
   assert.deepEqual(s.windows, []);
   assert.equal(s.health?.near, 'down');
@@ -152,7 +152,7 @@ test('the fake stream emits valid StreamEvents into the store', () => {
 
   const s = actions.reduce(reduceStream, initialStreamState());
   // the three events the Desk's "Latest" shows come with the first tick
-  assert.deepEqual(s.counts, { windows: 1, scan: 1, desk: 1, journal: 3, rescue: 0, setup: 1, health: 1 });
+  assert.deepEqual(s.counts, { windows: 1, scan: 1, desk: 1, journal: 3, rescue: 0, setup: 1, health: 1, decision: 0 });
   assert.equal(s.desk?.mode, 'replay');
   assert.equal(s.desk?.legs.length, 2);
   assert.equal(s.windows?.length, 13);

@@ -23,7 +23,7 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type {
   ContractPolicy, DeskState, EngineState, HealthMap, JournalEntry, Mode, RescueProgress, ScanStatus, SetupProgress,
-  StrategyConfig, StreamEvent, Window as FundingWindow,
+  StrategyConfig, StrategyDecision, StreamEvent, Window as FundingWindow,
 } from '@gimbal/shared';
 import { errorMessage } from './venues/recorder.ts';
 import { policyDraftRoute } from './nearai/draft-route.ts';
@@ -108,13 +108,14 @@ type Latest = {
   rescue: RescueProgress | null;
   setup: SetupProgress | null;
   health: HealthMap | null;
+  decision: StrategyDecision | null;
 };
 
 export class EngineServer {
   readonly #options: EngineServerOptions;
   readonly #server: Server;
   readonly #clients = new Set<ServerResponse>();
-  readonly #latest: Latest = { windows: null, scan: null, desk: null, rescue: null, setup: null, health: null };
+  readonly #latest: Latest = { windows: null, scan: null, desk: null, rescue: null, setup: null, health: null, decision: null };
   readonly #journal: JournalEntry[] = [];
   #strategy: StrategyConfig;
   #timer: ReturnType<typeof setTimeout> | undefined;
@@ -207,6 +208,7 @@ export class EngineServer {
       rescue: this.#latest.rescue,
       setup: this.#latest.setup,
       health: this.#latest.health,
+      decision: this.#latest.decision,
       at: (this.#options.now ?? Date.now)(),
     };
   }
@@ -406,7 +408,7 @@ export class EngineServer {
     });
     this.#clients.add(res);
     this.#send(res, 'retry: 5000\n\n');
-    for (const type of ['scan', 'windows', 'desk', 'health', 'setup', 'rescue'] as const) {
+    for (const type of ['scan', 'windows', 'desk', 'health', 'setup', 'rescue', 'decision'] as const) {
       const data = this.#latest[type];
       if (data !== null && this.#clients.has(res)) this.#send(res, `data: ${JSON.stringify({ type, data })}\n\n`);
     }

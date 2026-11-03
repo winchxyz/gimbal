@@ -112,7 +112,7 @@ export function parseJournalPage(value: unknown): JournalEntry[] {
 }
 
 const MODES: readonly string[] = ['replay', 'testnet', 'mainnet'] satisfies Mode[];
-const STATE_SLOTS = ['windows', 'scan', 'desk', 'rescue', 'setup', 'health'] as const satisfies readonly StreamType[];
+const STATE_SLOTS = ['windows', 'scan', 'desk', 'rescue', 'setup', 'health', 'decision'] as const satisfies readonly StreamType[];
 
 /**
  * Checks the body of `GET /state`. The journal is read entry by entry and the strategy field by field; each of the
