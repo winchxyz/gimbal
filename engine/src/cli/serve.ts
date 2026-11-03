@@ -40,6 +40,14 @@
 // SIGTERM serve waits up to SHUTDOWN_WAIT_MS, in all, for the risk engine, a close in flight (panic_close, a
 // rescue's reduce, an ADL unwind) and a running rescue (it signs nothing new, and one already signing goes on until its
 // payment is sent and saved as held) before it releases the locks and exits.
+// The strategy loop (src/strategy/loop.ts, serve-loop.ts): after each funding payment and each scan it runs decide()
+// and, with GIMBAL_TRADE=1 and auto on (PUT /strategy; off by default and kept as the owner set it), carries the act
+// out through the pair (mainnet: pair-mainnet's open and close, pair-ops.ts); otherwise it publishes `off`. POST
+// /rotate {windowId} goes the same way and needs auto on ("auto is off" otherwise: nothing new opens until the owner
+// sets auto=true); POST /close works with auto on or off. Both only with GIMBAL_TRADE=1 and only while the engine
+// listens on loopback. Nothing is sent while a rescue (its fund_venue step too), an ADL unwind or panic_close runs:
+// checked at each decision and again right before every close and open. Its counters and the pair it entered are
+// kept next to the trader state, loop-<mode>-<contract>-<desk>.json.
 // The monitor (src/risk/monitor.ts): every 30 min the legs, their distance to liquidation and the net; an alert to the
 // journal and the console when a leg is under 25 % from liquidation. `npm run monitor -w engine -- --mainnet` is the
 // one-shot form.
@@ -67,7 +75,7 @@ import type { RecordLine } from '../venues/recorder.ts';
 import { JsonlGzWriter, RecordingVenue, RecordingWatch, errorMessage } from '../venues/recorder.ts';
 import { ScaledClock, readRecording } from '../venues/replay.ts';
 import { watchReaders } from '../venues/watch/index.ts';
-import type { Clock } from '../venues/venue.ts';
+import type { AccountState, Clock } from '../venues/venue.ts';
 import { RiskEngine } from '../risk/engine.ts';
 import type { DeskSource } from '../risk/engine.ts';
 import { AccountsDeskSource, ReplayDesk } from '../risk/sources.ts';
@@ -79,6 +87,8 @@ import type { ServePair } from './serve-pair.ts';
 import { liveLines, servePair } from './serve-pair.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { connectContract, contractEnv, marginVenues } from './serve-contract.ts';
+import { serveLoop } from './serve-loop.ts';
+import type { StrategyLoop } from '../strategy/loop.ts';
 import { ThinningSink, WATCH_RECORD_GAPS, loadPolicyFile, replayStart, scanLine } from './serve-replay.ts';
 
 const { values } = parseArgs({
@@ -206,7 +216,9 @@ const scanner = new Scanner(readers.venues, readers.watch, {
   marginHeldAt: () => marginVenues(server?.state().desk ?? null),
   strategy: () => server?.strategy ?? DEFAULT_STRATEGY,
   onNote: (note) => noteOnce(note),
+  held: () => loop?.heldWindow() ?? null,
 });
+let loop: StrategyLoop | null = null;
 
 let scans = 0;
 /** A `health` event whenever a desk venue's, 1Click's or NEAR's state changes (with the risk engine: and a journal line). */
@@ -228,7 +240,9 @@ try {
 const saved = strategyStore.load(policy);
 if (saved.problem !== null) log(`engine rules not loaded, starting from the defaults (auto off): ${saved.problem}`);
 else if (saved.strategy !== null) log(`engine rules from ${strategyStore.path}`);
-const drafter = new PolicyDrafter({ client: new NearAiClient({ apiKey: envVar('NEAR_AI_API_KEY') }), markets: deskMarkets(readers.venues) });
+// One NEAR AI client: policy drafts, and the strategy loop's veto before an enter or a rotate.
+const nearAi = new NearAiClient({ apiKey: envVar('NEAR_AI_API_KEY') });
+const drafter = new PolicyDrafter({ client: nearAi, markets: deskMarkets(readers.venues) });
 log(drafter.configured ? `policy drafts: NEAR AI ${drafter.model}` : 'policy drafts: off (NEAR_AI_API_KEY is not set), POST /policy/draft answers 503');
 const setup = await setupFromEnv(mode, envVar, log).catch((err: unknown) => fail(`setup: ${errorMessage(err)}`));
 
@@ -251,6 +265,9 @@ let closingWatch: ClosingWatch | null = null;
 // The rescuer's shutdown (serve-rescue.ts stop) and the id of the rescue running, for the shutdown's wait.
 let rescueStop: (() => Promise<void>) | null = null;
 let rescueRunning: (() => string | null) | null = null;
+let rescueLive = false;
+// The desk's venue accounts, for the strategy loop's free margin.
+const loopAccounts: { venue: string; read: () => Promise<AccountState> }[] = [];
 if (mode === 'replay') {
   deskSource = replayDesk = new ReplayDesk({
     venues: readers.venues, clock, strategy: () => server?.strategy ?? DEFAULT_STRATEGY,
@@ -266,6 +283,7 @@ if (mode === 'replay') {
     { reader: reader('hyperliquid'), address: side.desk.evm_address },
     { reader: reader('phoenix'), address: side.desk.solana.authority },
   ].filter((a): a is { reader: NonNullable<typeof a.reader>; address: string } => a.reader !== undefined && a.address !== '');
+  for (const a of accounts) loopAccounts.push({ venue: a.reader.id, read: () => a.reader.account(a.address) });
   // get_desk says only whether the desk is paused, not who paused it or when (that is in its `paused` event): `at` is
   // when this engine first saw it paused, `by` is unknown.
   let pausedSince: number | null = null;
@@ -316,6 +334,7 @@ if (deskSource !== null) {
   closingWatch = rescue.closing;
   rescueStop = rescue.stop;
   rescueRunning = rescue.running;
+  rescueLive = mode === 'mainnet' && rescue.rescuer !== undefined;
   log(rescue.summary);
   for (const line of rescue.routes) log(line);
   risk = new RiskEngine({
@@ -346,9 +365,29 @@ if (values.once === true) {
   process.exit(0);
 }
 
+loop = serveLoop({
+  mode, env: envVar, once: false, contractId: contract?.client.contractId ?? null, deskId, pair, lastDesk: () => lastDesk,
+  accounts: loopAccounts, rescueLive, windows: () => server?.state().windows ?? null,
+  carry: (id) => scanner.carry(id), venues: readers.venues, veto: nearAi,
+  strategy: () => server?.strategy ?? saved.strategy ?? DEFAULT_STRATEGY, policy: () => policy, publish, clock, log,
+  ...(stateDirSet === undefined ? {} : { stateDir: resolve(stateDirSet) }),
+  busy: () => {
+    const rescuing = rescueRunning?.() ?? null;
+    if (rescuing !== null) return `rescue ${rescuing} runs`;
+    if (risk?.adlRunning != null) return 'an ADL unwind runs';
+    if (closingWatch?.current != null) return 'panic_close runs';
+    if (pair?.pair?.closing === true) return 'a close of the pair runs';
+    return null;
+  },
+});
+log(loop.startLine());
+const strategyLoop = loop;
+
 server = new EngineServer({
   mode,
   scanner,
+  strategyLoop,
+  onStrategy: () => strategyLoop.onScan(),
   strategy: saved.strategy ?? DEFAULT_STRATEGY,
   saveStrategy: (s) => strategyStore.save(s),
   drafter,
@@ -363,6 +402,7 @@ server = new EngineServer({
     if (writer !== null && scans % 12 === 0) void writer.flush();
     venueHealth.scan(r.scan);
     publishHealth();
+    strategyLoop.onScan();
   },
 });
 
@@ -387,7 +427,7 @@ const monitorTimer = setInterval(() => {
 }, MONITOR_EVERY_MS);
 monitorTimer.unref();
 const shown = host.includes(':') ? `[${host}]` : host;
-log(`engine ${mode} on http://${shown}:${listening}: GET /events /state /windows/history?id= /strategy /journal, PUT /strategy`);
+log(`engine ${mode} on http://${shown}:${listening}: GET /events /state /windows/history?id= /strategy /journal, PUT /strategy, POST /rotate /close`);
 
 let stopping = false;
 /** How long a shutdown waits for a close in flight: one MPC signature can take 120 s, and a close is one per leg plus a retry. */
@@ -398,6 +438,8 @@ async function shutdown(reason: string): Promise<void> {
   log(`stopping: ${reason}`);
   clearInterval(intentsTimer);
   clearInterval(monitorTimer);
+  // The loop starts nothing new; an open or close it runs is waited for with the rest, under the same deadline.
+  strategyLoop.stop();
   // No new trigger or desk read after this; a close already running (panic_close, a rescue's reduce, an ADL unwind)
   // is waited for, bounded, before the lock is released: pair-mainnet must not start next to it. One deadline covers
   // it all: risk.stop() (it waits for an ADL attempt that is running) and the closes.
@@ -417,7 +459,7 @@ async function shutdown(reason: string): Promise<void> {
       } catch (err) {
         log(`stopping: the risk engine stopped with an error (${err instanceof Error ? err.message : String(err)})`);
       }
-      await Promise.allSettled([closingWatch?.current ?? Promise.resolve(), pair?.drain(SHUTDOWN_WAIT_MS) ?? Promise.resolve(true), rescueDone]);
+      await Promise.allSettled([closingWatch?.current ?? Promise.resolve(), strategyLoop.idle(SHUTDOWN_WAIT_MS), pair?.drain(SHUTDOWN_WAIT_MS) ?? Promise.resolve(true), rescueDone]);
       return pair?.pair?.closing !== true && rescueRunning?.() == null;
     })(),
     deadline,

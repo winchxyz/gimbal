@@ -120,7 +120,8 @@ export interface RiskEngineOptions {
   publish: (event: StreamEvent) => void;
   clock?: Clock;
   intervalMs?: number;
-  adl?: AdlWatch;
+  /** The ADL watch (serve's pair may change under it: serve-pair.ts passes one that follows the pair held now). */
+  adl?: Pick<AdlWatch, 'check' | 'stop'>;
   /** E9: takes a trigger and runs the rescue, then calls rescueEnded. Without it the trigger is published at `detect`. */
   rescuer?: (trigger: RescueTrigger) => void;
   /** E9: the id of the rescue the rescuer is running now; a running rescue never lapses (a real one can take 10 min). */

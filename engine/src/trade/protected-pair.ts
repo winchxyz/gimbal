@@ -1,13 +1,15 @@
-// serve's pair: the open carry pair the engine protects next to it, 24/7. It never opens. What it sends are the
-// protections' closes, all reduce-only, through the PairTrader (its legging guard, its unsettled-order watch):
+// serve's pair: the open carry pair the engine protects next to it, 24/7. What it sends are the protections' closes,
+// all reduce-only, through the PairTrader (its legging guard, its unsettled-order watch):
 //   - panic_close (rescue/closing.ts): both legs to zero;
 //   - a rescue's reduce (rescue/rescuer.ts): both legs smaller by the same size;
-//   - an ADL unwind (risk/adl.ts): both legs to zero.
+//   - an ADL unwind (risk/adl.ts): both legs to zero;
+// and the strategy loop's own operations (strategy/loop.ts through serve-pair.ts, pair-mainnet's code in pair-ops.ts):
+// its exit (a close, reduce-only like the others) and its open (openInChunks, and the residual hedge after it).
 //
-// GuardedLeg wraps each venue leg: an order that is not reduce-only is refused before anything is signed, so nothing
-// serve sends can open or grow a position (a PairTrader close re-hedges by reopening a leg unless reduceOnly is set;
-// every close here sets it, and the leg refuses one anyway). While the pair does not trade (alert only) every order is
-// refused the same way. Before an order is signed it is added to the InFlightBook and the state is saved
+// GuardedLeg wraps each venue leg: an order that is not reduce-only is refused before anything is signed unless the
+// strategy loop's open runs (ProtectedPair.openInChunks, or a hedge it allows to open), so no protection can open or
+// grow a position (a PairTrader close re-hedges by reopening a leg unless reduceOnly is set; every close here sets it,
+// and the leg refuses one anyway). While the pair does not trade (alert only) every order is refused the same way. Before an order is signed it is added to the InFlightBook and the state is saved
 // (trader-state.ts); a save that fails refuses the order, so no order goes out that the state on disk does not name.
 //
 // An order leaves the book only once the trader has recorded its outcome and that is saved, in one write: a close's
@@ -49,7 +51,7 @@ import { ADL_ATTEMPTS, newAdlState } from '../risk/adl.ts';
 import type { LegOutcome, LegRef, LegSide, PendingMakerOrder, TradeLeg } from './legs.ts';
 import { LegCheckError } from './legs.ts';
 import { qtyString, signedQtyString, toQty } from './lots.ts';
-import type { PairResult, PairTrader, PairTraderState } from './pair.ts';
+import type { MakerFirst, PairResult, PairTrader, PairTraderState } from './pair.ts';
 import type { InFlightOrder, LoadedTraderState } from './trader-state.ts';
 
 /** An order as GuardedLeg names it before it is signed (the book adds `op`). */
@@ -210,6 +212,8 @@ export interface GuardedLegOptions {
   live: () => boolean;
   /** serve is stopping (its lock is being released): every order is refused from then on. */
   stopped?: () => boolean;
+  /** The strategy loop's open runs (ProtectedPair.opening): an order that is not reduce-only may go out then. */
+  opening?: () => boolean;
   /** Adds the order to the book and saves it; throws when it could not (the order is then refused). */
   beforeSign: (order: OutgoingOrder) => void;
   now?: () => number;
@@ -265,7 +269,7 @@ export class GuardedLeg implements TradeLeg {
     };
     if (this.#o.stopped?.() === true) return refuse('serve is stopping and its trader lock is released');
     if (!this.#o.live()) return refuse('alert only: this engine does not trade');
-    if (!reduceOnly) return refuse('serve sends reduce-only orders only, and this one could open or grow a position');
+    if (!reduceOnly && this.#o.opening?.() !== true) return refuse('serve sends reduce-only orders only, outside the strategy loop\'s open, and this one could open or grow a position');
     try {
       this.#o.beforeSign({ index: this.#o.index, venue: this.venue, side, size: qtyString(size), reduceOnly, reason, at });
     } catch (err) {
@@ -314,6 +318,8 @@ export class ProtectedPair {
   /** Closes running now (queued in the trader or past it). */
   #running = 0;
   #stopped = false;
+  /** The strategy loop's open (or the hedge it allows) runs: the guarded legs let orders that are not reduce-only out. */
+  #opening = 0;
 
   constructor(options: ProtectedPairOptions) {
     this.#o = options;
@@ -421,8 +427,58 @@ export class ProtectedPair {
     return { line: r.line, again: r.kind === 'wait', owner: true };
   }
 
+  /** The strategy loop's open runs now (GuardedLegOptions.opening reads it). */
+  get opening(): boolean {
+    return this.#opening > 0;
+  }
+
+  /**
+   * The strategy loop's open (pair-ops.ts sendOpen through serve-pair.ts): the trader's openInChunks, with the guarded
+   * legs letting orders that are not reduce-only out while it runs. Every order is still saved in flight before it is
+   * signed, and leaves the book with the trader's result; what stays open afterwards comes out as `open:` lines. Throws,
+   * with nothing sent, when the pair does not trade or serve is stopping.
+   */
+  async openInChunks(request: Parameters<PairTrader['openInChunks']>[0]): Promise<PairResult[]> {
+    return this.#operation(true, async () => {
+      const epoch = this.trader.baselineEpoch;
+      try {
+        return await this.trader.openInChunks(request);
+      } finally {
+        // Each part's result is in the trader: its orders leave the book in the same save that writes it.
+        if (this.trader.baselineEpoch !== epoch) this.#recorded();
+      }
+    });
+  }
+
+  /**
+   * One order on leg `index` outside the trader (pair-ops.ts finish()'s residual hedge after a late maker fill):
+   * `allowOpen` only from the loop's open. It stays in the book (no trader result holds it) until a close result or an
+   * adopt. Never throws for the order itself (a refusal comes back as a failed outcome).
+   */
+  async hedge(index: 0 | 1, side: LegSide, size: bigint, reduceOnly: boolean, reason: string, allowOpen: boolean): Promise<LegOutcome> {
+    return this.#operation(allowOpen, () => this.trader.legs[index].order(side, size, reduceOnly, reason));
+  }
+
+  async #operation<T>(opening: boolean, run: () => Promise<T>): Promise<T> {
+    if (this.#stopped) throw new Error('serve is stopping and its trader lock is released: nothing is signed');
+    if (!this.live) throw new Error(`alert only (${this.why ?? 'this engine does not trade'}): nothing is signed`);
+    this.#running++;
+    if (opening) this.#opening++;
+    const end = this.inFlight.beginClose();
+    try {
+      return await run();
+    } finally {
+      this.#save();
+      const open = this.openLines();
+      if (open.length > 0) this.#o.onOpen?.(open);
+      if (opening) this.#opening--;
+      end();
+      this.#running--;
+    }
+  }
+
   /** A protection's close: always reduce-only (see the header); throws, with nothing sent, when it cannot start. */
-  async close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean }): Promise<PairResult> {
+  async close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean; maker?: MakerFirst }): Promise<PairResult> {
     if (this.#stopped) throw new Error('serve is stopping and its trader lock is released: nothing is signed');
     if (!this.live) {
       throw new Error(`alert only (${this.why ?? 'this engine does not trade'}): nothing is signed; close the legs by hand (stop serve, then pair-mainnet close ${this.symbol} --send)`);
