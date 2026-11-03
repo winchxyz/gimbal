@@ -1,16 +1,16 @@
 // pair-mainnet's decisions without a network: the order options a bare command line gets (the taker fallback is off),
 // a maker timeout that must fit the life of a fresh stored price, when the stored price is refreshed (once for
-// concurrent callers, per symbol, never within 30 s of the last, never while planning) and checked after, what a
-// Phoenix withdrawal must leave, both venues' cross margin, and the Phoenix IOC that follows a late maker fill.
+// concurrent callers, per symbol, never within 30 s of the last that landed, never while planning) and checked after,
+// what a Phoenix withdrawal must leave, both venues' cross margin, and what finish() does after a late maker fill.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { TxRef } from '@gimbal/shared';
 import { toQty } from '../trade/lots.ts';
-import type { PhoenixCrossView, PriceDeps, StoredPrice } from './pair-mainnet-lib.ts';
+import type { PhoenixCrossView, PriceDeps, ResidualInput, StoredPrice } from './pair-mainnet-lib.ts';
 import {
   DEFAULT_MAKER_TIMEOUT_S, PRICE_MARGIN_S, UsageError, ensureFresh, hlCross, newPriceState, oraclePxOf, orderOptions, parseArgs, phoenixCross,
-  priceFitRefusal, priceLifeS, residualHedge, withdrawKeepsLegs,
+  priceFitRefusal, priceLifeS, residualHedge, residualPlan, withdrawKeepsLegs,
 } from './pair-mainnet-lib.ts';
 
 const OPEN = ['open', 'ETH', '15', '--short', 'hyperliquid', '--long', 'phoenix'];
@@ -97,6 +97,27 @@ test('ensureFresh: one refresh in flight per symbol, and none within 30 s of the
   assert.equal(p.refreshes.length, 3);
 });
 
+test('ensureFresh: a refresh that failed before the chain does not block the next; one that landed does', async () => {
+  const p = prices({ ages: { ETH: [700] } });
+  const ok = p.d.refresh;
+  p.d.refresh = async () => { throw new Error('NEAR RPC: HTTP 503'); };
+  await assert.rejects(ensureFresh(p.d, 'ETH', 240), /HTTP 503/);
+  assert.equal(p.d.lastRefreshAt.has('ETH'), false, 'a failed refresh starts no gap');
+  p.tick(1_000);
+  p.d.refresh = ok;
+  assert.equal((await ensureFresh(p.d, 'ETH', 240)).ageS, 610, 'retried at once, and it went through');
+  assert.deepEqual(p.refreshes, ['ETH 660']);
+  // One that ran but the poll threw: it landed, so the next one within 30 s is not sent.
+  const landed = prices({ ages: { ETH: [700] } });
+  landed.d.landed = (err) => /ran in/.test(String(err));
+  landed.d.refresh = async () => { throw new Error('refresh_prices ran in T but prices() has no newer price'); };
+  await assert.rejects(ensureFresh(landed.d, 'ETH', 240), /ran in/);
+  assert.equal(landed.d.lastRefreshAt.has('ETH'), true);
+  landed.d.refresh = async () => { throw new Error('must not be sent'); };
+  await assert.rejects(ensureFresh(landed.d, 'ETH', 240), /700 s old/);
+  assert.ok(landed.logs.some((l) => /not sent again/.test(l)));
+});
+
 test('the legs\' price read refreshes only once trading: planning reads the stored price as it is', async () => {
   const p = prices({ ages: { ETH: [895] } });
   let trading = false;
@@ -143,14 +164,51 @@ test('cross margin: Hyperliquid from crossMarginSummary and cross positionValue;
   };
   assert.deepEqual(hlCross(raw), { equityUsd: 60.5, maintenanceUsd: 1.25, notionalUsd: 30 });
   assert.throws(() => hlCross({ assetPositions: [] }), /crossMarginSummary/);
+  // null reads as 0 through Number(): refused, as is an empty string.
+  assert.throws(() => hlCross({ ...raw, crossMarginSummary: { accountValue: null } }), /crossMarginSummary/);
+  assert.throws(() => hlCross({ ...raw, crossMaintenanceMarginUsed: '' }), /crossMaintenanceMarginUsed/);
+  assert.throws(() => hlCross({ ...raw, assetPositions: [{ position: { positionValue: null, leverage: { type: 'cross' } } }] }), /positionValue null/);
+  assert.equal(hlCross({ ...raw, crossMaintenanceMarginUsed: 2 }).maintenanceUsd, 2, 'a number is taken as it is');
   assert.deepEqual(phoenixCross(ACCOUNT), { equityUsd: 30, maintenanceUsd: 1, notionalUsd: 20 });
 });
 
-test('the Phoenix IOC after a late maker fill: back to minus Hyperliquid in whole lots, reduce-only when it only shrinks', () => {
+test('the Phoenix IOC after a late maker fill: back to the starting net in whole lots, reduce-only when it only shrinks', () => {
   const lot = toQty('0.001');
-  assert.deepEqual(residualHedge(toQty('-0.003'), toQty('0.002'), lot), { side: 'BUY', size: toQty('0.001'), reduceOnly: false });
-  assert.deepEqual(residualHedge(toQty('-0.001'), toQty('0.002'), lot), { side: 'SELL', size: toQty('0.001'), reduceOnly: true });
-  assert.equal(residualHedge(toQty('-0.0024'), toQty('0.002'), lot), null, 'under one Phoenix lot off: nothing to send');
-  assert.equal(residualHedge(toQty('-0.002'), toQty('0.002'), lot), null);
-  assert.deepEqual(residualHedge(toQty('0.001'), toQty('0.002'), lot), { side: 'SELL', size: toQty('0.003'), reduceOnly: false }, 'past zero: not reduce-only');
+  assert.deepEqual(residualHedge(toQty('-0.003'), toQty('0.002'), lot, 0n), { side: 'BUY', size: toQty('0.001'), reduceOnly: false });
+  assert.deepEqual(residualHedge(toQty('-0.001'), toQty('0.002'), lot, 0n), { side: 'SELL', size: toQty('0.001'), reduceOnly: true });
+  assert.equal(residualHedge(toQty('-0.0024'), toQty('0.002'), lot, 0n), null, 'under one Phoenix lot off: nothing to send');
+  assert.equal(residualHedge(toQty('-0.002'), toQty('0.002'), lot, 0n), null);
+  assert.deepEqual(residualHedge(toQty('0.001'), toQty('0.002'), lot, 0n), { side: 'SELL', size: toQty('0.003'), reduceOnly: false }, 'past zero: not reduce-only');
+  // An older run left the pair 0.001 long net: that stays; only this run's late fill is matched.
+  assert.equal(residualHedge(toQty('-0.005'), toQty('0.006'), lot, toQty('0.001')), null, 'at the starting net: nothing to trade away');
+  assert.deepEqual(residualHedge(toQty('-0.006'), toQty('0.006'), lot, toQty('0.001')), { side: 'BUY', size: toQty('0.001'), reduceOnly: false });
+});
+
+test('finish() after cancelPending: the hedge goes only when every condition holds; the alert clears only when the legs offset', () => {
+  const base: ResidualInput = {
+    left: 0, phoenixUnsettled: false, send: true, trading: true, hl: toQty('-0.003'), px: toQty('0.002'), lot: toQty('0.001'),
+    startNet: 0n, symbol: 'ETH', unhedged: 'unhedged: from the pair',
+  };
+  const go = residualPlan(base);
+  assert.deepEqual(go.hedge, { side: 'BUY', size: toQty('0.001'), reduceOnly: false });
+  assert.equal(go.held, null);
+  assert.equal(go.unhedged, 'unhedged: hyperliquid ETH -0.003, phoenix ETH 0.002 against a starting net of 0: 0.001 ETH short is not offset');
+  const held = (over: Partial<ResidualInput>, why: RegExp) => {
+    const p = residualPlan({ ...base, ...over });
+    assert.equal(p.hedge, null, String(why));
+    assert.match(p.held ?? '', why);
+    assert.match(p.unhedged ?? '', /0\.00(1|04) ETH short is not offset$/, 'still off: the exact amount is the alert');
+  };
+  held({ left: 1 }, /1 post-only order\(s\) are still unsettled/);
+  held({ phoenixUnsettled: true }, /Phoenix has an order with no answer/);
+  held({ send: false }, /outside a trading --send run/);
+  held({ trading: false }, /outside a trading --send run/);
+  held({ hl: toQty('-0.0024') }, /under one Phoenix lot/);
+  // Offset (net of the start): nothing to send; the alert clears only with no post-only order left to fill.
+  const even = residualPlan({ ...base, hl: toQty('-0.002') });
+  assert.deepEqual([even.hedge, even.held, even.unhedged], [null, null, null]);
+  const evenLeft = residualPlan({ ...base, hl: toQty('-0.002'), left: 1 });
+  assert.equal(evenLeft.unhedged, 'unhedged: from the pair', 'a post-only order left may still fill: the alert stands');
+  const older = residualPlan({ ...base, hl: toQty('-0.005'), px: toQty('0.006'), startNet: toQty('0.001') });
+  assert.deepEqual([older.hedge, older.unhedged], [null, null], 'an older imbalance is the start, not something to fix');
 });

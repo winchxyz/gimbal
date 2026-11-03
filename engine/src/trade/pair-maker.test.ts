@@ -46,8 +46,12 @@ class Leg implements TradeLeg {
   order(side: LegSide, size: bigint, reduceOnly: boolean): Promise<LegOutcome> {
     return this.#answer('ioc', this.iocs.shift() ?? { fill: 'all' }, side, size, reduceOnly);
   }
-  beginMakerOperation(): void {
+  ends = 0;
+  beginMakerOperation(): () => void {
     this.begins++;
+    return () => {
+      this.ends++;
+    };
   }
   makerOrder(side: LegSide, size: bigint, reduceOnly: boolean): Promise<LegOutcome> {
     return this.#answer('maker', this.makers.shift() ?? { fill: 'all' }, side, size, reduceOnly);
@@ -122,6 +126,11 @@ test('a maker leg with no answer and no expiry halts the open before its partner
   assert.notEqual(r.status, 'open');
   assert.deepEqual(p.log, ['hyperliquid maker SELL 0.005']);
   assert.notEqual(p.trader.unsettled(p.a), null);
+  // Once stopped (the CLI is ending), a push that shows the order ran trades nothing.
+  p.trader.stop();
+  p.a.pos = toQty('-0.005');
+  await p.trader.positionPushed(p.a, p.a.pos);
+  assert.deepEqual(p.log, ['hyperliquid maker SELL 0.005'], 'nothing after stop()');
 });
 
 test('maker-first close: Hyperliquid closes as a maker order, Phoenix matches what it closed, the retry takes the rest', async () => {
@@ -140,9 +149,9 @@ test('an open over the cap is split into whole pairs under the cap less the band
   const results = await p.trader.openInChunks({ size: '0.012', longIndex: 1, reason: 'carry', maker: { index: 0 } });
   assert.deepEqual(results.map((r) => [r.status, r.size]), [['open', '0.007'], ['open', '0.005']]);
   assert.deepEqual([p.a.pos, p.b.pos], [toQty('-0.012'), toQty('0.012')]);
-  assert.deepEqual([p.a.begins, p.b.begins], [1, 0], 'one maker budget for the whole open, on the maker leg');
+  assert.deepEqual([p.a.begins, p.a.ends, p.b.begins], [1, 1, 0], 'one maker budget for the whole open, on the maker leg, ended after it');
   await p.trader.close({ reason: 'close', maker: { index: 0 } });
-  assert.equal(p.a.begins, 2, 'a close is an operation of its own');
+  assert.deepEqual([p.a.begins, p.a.ends], [2, 2], 'a close is an operation of its own');
 });
 
 test('a maker leg that partly filled, then lost an order with no expiry: the known fill is hedged, the lost order watched', async () => {

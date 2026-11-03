@@ -85,10 +85,10 @@ export interface TradeLeg {
    */
   makerOrder?(side: LegSide, size: bigint, reduceOnly: boolean, reason: string): Promise<LegOutcome>;
   /**
-   * Starts one pair operation (an open with all its parts, or a close): from here the leg's maker orders share one
-   * budget of maxOrders post-only orders, until the next call.
+   * Starts one pair operation (an open with all its parts, or a close): until the returned function ends it, the leg's
+   * maker orders share one budget of maxOrders post-only orders and one reprice floor (repriceMs between placements).
    */
-  beginMakerOperation?(): void;
+  beginMakerOperation?(): () => void;
 }
 
 /** How a maker order works the book: reprice at most every `repriceMs`, give up after `timeoutMs`, then IOC or not. */
@@ -181,8 +181,11 @@ export class HlLeg implements TradeLeg {
   readonly #clock: Clock;
   /** Post-only orders whose state a maker order could not settle (cancelPending tries them again). */
   readonly #pending: PendingMakerOrder[] = [];
-  /** Post-only orders the current pair operation may still sign (null: no operation begun, maxOrders per call). */
-  #makerLeft: number | null = null;
+  /**
+   * The pair operation in progress (null: none begun, maxOrders and the reprice floor per call): the post-only orders
+   * it may still sign, and when it placed its last one.
+   */
+  #op: { left: number; lastPlacedAt: number | null } | null = null;
 
   constructor(options: HlLegOptions) {
     this.#o = options;
@@ -267,8 +270,10 @@ export class HlLeg implements TradeLeg {
     let fee: number | null = 0;
     let refusedInARow = 0;
     let placed = 0;
-    let lastPlacedAt: number | null = null;
-    const budget = (): boolean => placed < maxOrders && (this.#makerLeft === null || this.#makerLeft > 0);
+    const op = this.#op;
+    let lastPlacedAt: number | null = op?.lastPlacedAt ?? null;
+    const budget = (): boolean => placed < maxOrders && (op === null || op.left > 0);
+    let spent = false;
     /** The post-only order out now, until its final state is read. */
     let resting: { cloid: string; oid: number | null; size: string } | null = null;
     const stuck = (cloid: string, oid: number | null, sz: string): void => {
@@ -291,7 +296,9 @@ export class HlLeg implements TradeLeg {
       };
       if (unknown !== null && unknown.kind === 'unknown') return { kind: 'unknown', error: unknown.error, ref, expiresAt: unknown.expiresAt, parts };
       if (filled > 0n) return { kind: 'filled', filled, avgPx: notional > 0 ? notional / qtyNumber(filled) : null, fee, ref, parts };
-      const error = last !== undefined && last.kind !== 'filled' ? last.error : new NothingExecuted('hyperliquid', `the maker order ${side} ${qtyString(size)} did not fill`, ref.tx);
+      const error = spent
+        ? new NothingExecuted('hyperliquid', `the maker order ${side} ${qtyString(size)} did not fill: the budget of ${op === null ? maxOrders : s.maxOrders ?? 6} post-only orders ${op === null ? 'per maker order' : 'for this open or close'} is spent`, ref.tx)
+        : last !== undefined && last.kind !== 'filled' ? last.error : new NothingExecuted('hyperliquid', `the maker order ${side} ${qtyString(size)} did not fill`, ref.tx);
       return { kind: 'failed', error, ref, parts };
     };
 
@@ -316,8 +323,11 @@ export class HlLeg implements TradeLeg {
         ref.clientId = order.cloid ?? null;
         let oid: number | null = null;
         placed++;
-        if (this.#makerLeft !== null) this.#makerLeft--;
         lastPlacedAt = this.#clock.now();
+        if (op !== null) {
+          op.left--;
+          op.lastPlacedAt = lastPlacedAt;
+        }
         resting = { cloid: order.cloid!, oid: null, size: order.sz };
         try {
           const result = await this.#o.relayer.hlOrder(order, `${reason} (maker)`);
@@ -378,6 +388,7 @@ export class HlLeg implements TradeLeg {
         total({ kind: 'filled', filled: got, avgPx: fills.avgPx ?? final.limitPx, fee: fills.fee, ref });
       }
 
+      spent = filled < size && !budget();
       if (filled < size && s.takerFallback) {
         const out = await this.order(side, size - filled, reduceOnly, `${reason} (taker fallback)`);
         total(out);
@@ -393,8 +404,12 @@ export class HlLeg implements TradeLeg {
     }
   }
 
-  beginMakerOperation(): void {
-    this.#makerLeft = { ...DEFAULT_MAKER, ...this.#o.maker }.maxOrders ?? 6;
+  beginMakerOperation(): () => void {
+    const op = { left: { ...DEFAULT_MAKER, ...this.#o.maker }.maxOrders ?? 6, lastPlacedAt: null };
+    this.#op = op;
+    return () => {
+      if (this.#op === op) this.#op = null;
+    };
   }
 
   /** Post-only orders a maker order could not settle; they may still rest and fill. */

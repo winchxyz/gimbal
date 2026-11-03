@@ -171,11 +171,28 @@ test('a crossing refusal waits out the reprice floor: no placement inside repric
 
 test('one pair operation shares the maxOrders budget across its maker orders; the next operation starts a new one', async () => {
   const v = venue([{ fills: '0' }, { fills: '0' }, { fills: '0' }, { fills: '0' }, { fills: '0' }], undefined, null, { maxOrders: 3, timeoutMs: 600_000, takerFallback: false });
-  v.leg.beginMakerOperation();
+  const end = v.leg.beginMakerOperation();
   await v.leg.makerOrder('SELL', toQty('0.005'), true, 'close (part 1)');
-  await v.leg.makerOrder('SELL', toQty('0.005'), true, 'close (part 2)');
+  const second = await v.leg.makerOrder('SELL', toQty('0.005'), true, 'close (part 2)');
   assert.deepEqual(v.orders.map((o) => o.tif), ['Alo', 'Alo', 'Alo'], 'three for the operation, not three per call');
+  assert.ok(second.kind === 'failed');
+  assert.match(second.error.message, /the budget of 3 post-only orders for this open or close is spent/, 'the outcome names the budget');
+  end();
   v.leg.beginMakerOperation();
   await v.leg.makerOrder('SELL', toQty('0.005'), true, 'close again');
   assert.equal(v.orders.length, 6, 'a new operation: the budget of three starts again');
+});
+
+test('the reprice floor holds across the maker orders of one operation, and ends with it', async () => {
+  // repriceMs 5 s: part 1 fills at once at t0; part 2 of the same operation places no sooner than t0 + 5 s.
+  const v = venue([{ fills: '0', fillAtOnce: true }, { fills: '0', fillAtOnce: true }, { fills: '0', fillAtOnce: true }]);
+  const end = v.leg.beginMakerOperation();
+  const a = await v.leg.makerOrder('BUY', toQty('0.005'), false, 'open (part 1)');
+  const b = await v.leg.makerOrder('BUY', toQty('0.005'), false, 'open (part 2)');
+  assert.ok(a.kind === 'filled' && b.kind === 'filled');
+  assert.equal(b.parts![0]!.ref.sentAt - a.parts![0]!.ref.sentAt, 5_000, 'part 2 waits out the floor from part 1');
+  end();
+  end();      // ending twice, or after a later operation began, touches nothing
+  const c = await v.leg.makerOrder('BUY', toQty('0.005'), false, 'another open');
+  assert.equal(c.parts![0]!.ref.sentAt, c.ref.sentAt, 'no operation: no floor carried over, placed at once');
 });

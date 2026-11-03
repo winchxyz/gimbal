@@ -79,7 +79,7 @@ import { errorMessage } from '../venues/recorder.ts';
 import type { Args, PriceDeps, StoredPrice } from './pair-mainnet-lib.ts';
 import {
   PRICE_MARGIN_S, UsageError, ensureFresh, hlCross, newPriceState, num, oraclePxOf, orderOptions, parseArgs, phoenixCross, priceFitRefusal, priceLifeS,
-  residualHedge, withdrawKeepsLegs,
+  residualPlan, withdrawKeepsLegs,
 } from './pair-mainnet-lib.ts';
 import { checkContractNetwork, contractEnv } from './serve-contract.ts';
 
@@ -191,6 +191,8 @@ async function main(argv: string[]): Promise<void> {
     prices: {
       maxAgeS: desk.policy.oracle_max_age_s, send: args.send, read: (symbol) => storedPrice(client, symbol),
       refresh: (symbol, maxAgeS) => client.refreshPrices([symbol], { maxAgeS }), now: () => Date.now(), log: say, ...newPriceState(),
+      // On chain after all: it ran and the poll saw no newer price (near-client refreshPrices), or no proof either way.
+      landed: (err) => err instanceof OutcomeUnknown || /refresh_prices (ran|returned false) in /.test(errorMessage(err)),
     },
     trading: false,
   };
@@ -380,6 +382,8 @@ interface Pair {
   marketConfig: PhoenixMarketConfig;
   maker: MakerSettings;
   microLamports: number;
+  /** hl + px before the open or close began: what finish() brings the pair back to, never zero by default. */
+  startNet: bigint | null;
 }
 
 async function buildPair(ctx: Ctx, symbol: string, closing = false): Promise<Pair> {
@@ -390,9 +394,10 @@ async function buildPair(ctx: Ctx, symbol: string, closing = false): Promise<Pai
     throw new Error(`${symbol} must be in both policy.hl_assets (${p.hl_assets.map((a) => a.symbol).join(', ')}) and policy.phoenix_markets (${p.phoenix_markets.map((m) => m.symbol).join(', ')})`);
   }
   const { maker, microLamports, slippageBps } = orderOptions(ctx.args);
-  const fit = priceFitRefusal(maker.timeoutMs / 1000, p.oracle_max_age_s);
-  if (fit !== null) throw new UsageError(fit);
   const unpriced = p.unpriced.find((u) => u.symbol === symbol);
+  // An unpriced symbol has no stored price to outlive (no band, max_sz instead).
+  const fit = unpriced === undefined ? priceFitRefusal(maker.timeoutMs / 1000, p.oracle_max_age_s) : null;
+  if (fit !== null) throw new UsageError(fit);
   const maxNotionalUsd = unpriced === undefined ? p.max_notional_usd : Math.min(p.max_notional_usd, p.unpriced_max_notional_usd);
   // Planning (a dry run, or --send before its refusals pass) prices with the stored price as it is; once trading, one
   // about to go stale is refreshed before an order is priced, so an unwind or a close is never refused for it.
@@ -438,7 +443,7 @@ async function buildPair(ctx: Ctx, symbol: string, closing = false): Promise<Pai
   const diffs = [...mismatches.map((m) => `the Phoenix exchange differs from the pinned accounts: ${m}`), ...marketMismatches(marketConfig, market, spline, { ignoreStatus: closing })];
   return {
     symbol, hl, phoenix, trader, lot: commonLot(hl.lot, phoenix.lot), bandBps: p.price_band_bps, priced: unpriced === undefined, mismatches: diffs,
-    marketConfig, maker, microLamports,
+    marketConfig, maker, microLamports, startNet: null,
   };
 }
 
@@ -570,6 +575,8 @@ async function open(ctx: Ctx): Promise<void> {
     return;
   }
   if (refusals.length > 0) throw new Error(`open --send refused, nothing signed: ${refusals.join('; ')}`);
+  const [hlStart, pxStart] = await Promise.all([pair.hl.position(), pair.phoenix.position()]);
+  pair.startNet = hlStart + pxStart;
   ctx.trading = true;
   await approveBuilderFee(ctx);
   try {
@@ -605,6 +612,7 @@ async function close(ctx: Ctx): Promise<void> {
     return;
   }
   if (refusals.length > 0) throw new Error(`close --send refused, nothing signed: ${refusals.join('; ')}`);
+  pair.startNet = hlPos + pxPos;
   ctx.trading = true;
   await approveBuilderFee(ctx);
   try {
@@ -674,30 +682,34 @@ async function finish(ctx: Ctx, pair: Pair): Promise<void> {
       process.exitCode = 3;
     }
     const read = await readLegs(pair);
-    if (read === null) {
+    if (read === null || pair.startNet === null) {
       unhedged = `the legs cannot be read after the cancel: check hyperliquid and phoenix ${pair.symbol} by hand`;
     } else {
-      say(`positions after the cancel: hyperliquid ${pair.symbol} ${signedQtyString(read.hl)}, phoenix ${pair.symbol} ${signedQtyString(read.px)}${read.hl + read.px === 0n ? ' (hedged)' : ' (NOT offsetting)'}`);
-      let now = read;
-      // Every post-only order settled and nothing on Phoenix with no answer: Phoenix can follow the late fill.
-      const hedge = residualHedge(read.hl, read.px, pair.phoenix.lot);
-      if (hedge !== null && left.length === 0 && pair.trader.unsettled(pair.phoenix) === null && ctx.args.send && ctx.trading) {
-        say(`hedge     phoenix ${hedge.side} ${qtyString(hedge.size)}${hedge.reduceOnly ? ' reduce-only' : ''}: back against hyperliquid ${signedQtyString(read.hl)}`);
+      say(`positions after the cancel: hyperliquid ${pair.symbol} ${signedQtyString(read.hl)}, phoenix ${pair.symbol} ${signedQtyString(read.px)} (net ${signedQtyString(read.hl + read.px)}, ${signedQtyString(pair.startNet)} at the start)`);
+      const input = {
+        left: left.length, phoenixUnsettled: pair.trader.unsettled(pair.phoenix) !== null, send: ctx.args.send, trading: ctx.trading,
+        hl: read.hl, px: read.px, lot: pair.phoenix.lot, startNet: pair.startNet, symbol: pair.symbol, unhedged,
+      };
+      let plan = residualPlan(input);
+      if (plan.held !== null) say(`hedge     not sent: ${plan.held}`);
+      if (plan.hedge !== null) {
+        const hedge = plan.hedge;
+        say(`hedge     phoenix ${hedge.side} ${qtyString(hedge.size)}${hedge.reduceOnly ? ' reduce-only' : ''}: back to the starting net against hyperliquid ${signedQtyString(read.hl)}`);
         const out = await pair.phoenix.order(hedge.side, hedge.size, hedge.reduceOnly, `pair-mainnet: hedge ${pair.symbol} after a late maker fill`);
         say(`          ${out.kind}${out.kind === 'filled' ? ` ${qtyString(out.filled)}` : ` (${out.error.message})`}${out.ref.tx.length === 0 ? '' : ` ${refs(out.ref.tx)}`}`);
         if (out.kind === 'unknown') {
           openLines.push(`open:     the phoenix hedge ${hedge.side} ${qtyString(hedge.size)} ${pair.symbol} (${out.ref.orderId ?? 'no signature'}) has no proven outcome: check Phoenix by hand before sending another`);
           process.exitCode = 3;
         }
-        now = (await readLegs(pair)) ?? now;
-        say(`positions hyperliquid ${pair.symbol} ${signedQtyString(now.hl)}, phoenix ${pair.symbol} ${signedQtyString(now.px)}`);
+        const now = await readLegs(pair);
+        if (now === null) {
+          plan = { ...plan, unhedged: `the legs cannot be read after the hedge: check hyperliquid and phoenix ${pair.symbol} by hand` };
+        } else {
+          say(`positions hyperliquid ${pair.symbol} ${signedQtyString(now.hl)}, phoenix ${pair.symbol} ${signedQtyString(now.px)}`);
+          plan = residualPlan({ ...input, hl: now.hl, px: now.px, phoenixUnsettled: out.kind === 'unknown' || input.phoenixUnsettled });
+        }
       }
-      const off = now.hl + now.px;
-      if (off !== 0n) {
-        unhedged = `unhedged: hyperliquid ${pair.symbol} ${signedQtyString(now.hl)}, phoenix ${pair.symbol} ${signedQtyString(now.px)}: ${qtyString(off > 0n ? off : -off)} ${pair.symbol} ${off > 0n ? 'long' : 'short'} is not offset`;
-      } else if (left.length === 0) {
-        unhedged = null;
-      }
+      unhedged = plan.unhedged;
     }
   }
   if (unhedged !== null) {

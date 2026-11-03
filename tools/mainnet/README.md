@@ -887,7 +887,7 @@ node --env-file=... engine/src/cli/pair-mainnet.ts close ETH
   less), and at most 1.5 on a venue without a live rescue (`LIVE_RESCUE` in `engine/src/trade/carry-plan.ts`:
   Phoenix until the Phoenix -> Hyperliquid rescue merges).
 - The Hyperliquid short goes first as post-only limits at the touch: placed at most every `--reprice-s` (30 or more,
-  after a crossing refusal too), at most `--max-orders` signed post-only orders for the whole open or close, over all
+  after a crossing refusal too, and across the parts of one open), at most `--max-orders` signed post-only orders for the whole open or close, over all
   its parts (6 or fewer: from C10 the contract meters signed notional that is not reduce-only per rolling hour, and
   every reprice counts), for `--maker-timeout-s` (default 120); an IOC for the rest only with `--taker-fallback`. The
   Phoenix long follows as one IOC for what filled. When the maker order ends with a post-only order that has no
@@ -897,12 +897,13 @@ node --env-file=... engine/src/cli/pair-mainnet.ts close ETH
   lives `oracle_max_age_s` - 600 s (300 s at 900). The maker timeout plus 120 s must fit that, or the command
   refuses (`--maker-timeout-s 180` at most with 900). The price is refreshed only after the refusals are checked:
   before each part when it would not live the maker timeout plus 120 s more (and checked against the same margin
-  after), and whenever an order (an unwind, a close) finds it within 30 s of `oracle_max_age_s`; never twice within
-  30 s, since the contract skips that refresh.
+  after), and whenever an order (an unwind, a close) finds it within 30 s of `oracle_max_age_s`; never within 30 s
+  of one that went on chain, since the contract skips that refresh (one that failed before the chain is retried).
 - An outcome that cannot be proven ends with `open:` lines (exit code 3): reconcile those before running again. A
   post-only order whose state could not be settled is cancelled by its id once more before the process ends; both
-  legs are then read again and printed, Phoenix is brought back against Hyperliquid by one IOC when a late fill left
-  it off by a whole lot, and what stays unhedged is printed exactly.
+  legs are then read again and printed, Phoenix is brought back to the pair's starting net (hl + px before the
+  command, so an older imbalance stays as it was) by one IOC when a late fill left it off by a whole lot, and what
+  stays off is printed exactly.
 
 ## Files the scripts write
 

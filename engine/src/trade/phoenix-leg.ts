@@ -274,7 +274,10 @@ export class PhoenixLeg implements TradeLeg {
       // A timeout is no proof: a late signature can still be posted while the blockhash lives, so the leg waits
       // until the chain is past it, as for any order with no answer.
       if (err instanceof MpcTimeoutError) {
-        return { kind: 'unknown', error: err, ref, expiresAt: await this.#expiry((built as { lastValidBlockHeight: number } | null)?.lastValidBlockHeight) };
+        // No message was ever built: nothing was handed to MPC to sign, so nothing can land.
+        const signed = built as { lastValidBlockHeight: number } | null;
+        if (signed === null) return { kind: 'failed', error: err, ref };
+        return { kind: 'unknown', error: err, ref, expiresAt: await this.#expiry(signed.lastValidBlockHeight) };
       }
       const height = err instanceof OutcomeUnknown ? err.ids.solLastValidBlockHeight ?? (built as { lastValidBlockHeight: number } | null)?.lastValidBlockHeight : undefined;
       return { kind: 'unknown', error: err instanceof Error ? err : new Error(String(err)), ref, expiresAt: await this.#expiry(height) };
@@ -285,9 +288,12 @@ export class PhoenixLeg implements TradeLeg {
     // Landed: the fill is what the position moved by, read from a snapshot that includes the transaction's slot.
     let slot = signature === null ? null : await this.#landedSlot(signature);
     // The transaction is confirmed, so the chain's confirmed slot now is at or past the one it landed in.
+    // A bound from getSlot may come from a node behind the one that confirmed it: only a move proves anything then.
+    let bounded = false;
     if (slot === null && signature !== null && this.#o.chain.currentSlot !== undefined) {
       try {
         slot = await this.#o.chain.currentSlot();
+        bounded = true;
       } catch {
         // no lower bound either: unknown below
       }
@@ -302,6 +308,12 @@ export class PhoenixLeg implements TradeLeg {
     try {
       const after = await this.position();
       const moved = after - before;
+      if (moved === 0n && bounded) {
+        return {
+          kind: 'unknown', ref, expiresAt: null,
+          error: new Error(`phoenix ${this.symbol}: the IOC ${signature} landed, its slot is unknown, and no move shows under the chain's slot ${slot} (a node that may lag): not proven unfilled`),
+        };
+      }
       if (moved === 0n) return { kind: 'failed', error: new NothingExecuted('phoenix', `the IOC ${signature} landed at slot ${slot} but did not fill`, tx), ref };
       if ((side === 'BUY') !== (moved > 0n)) {
         return { kind: 'unknown', error: new Error(`phoenix ${this.symbol}: the position moved ${signedQtyString(moved)} against a ${side} (something else traded it)`), ref, expiresAt: this.#clock.now() };
