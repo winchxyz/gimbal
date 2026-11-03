@@ -205,7 +205,7 @@ export class HyperliquidReader implements VenueReader, FundingHistorySource, Mar
    * Hourly funding prints of one market with `startTime <= time <= endTime` (ms), oldest first, from the public
    * `fundingHistory`. It answers at most 500 rows a request (about three weeks of hours), so this pages forward.
    */
-  async marketFundingHistory(symbol: string, startTime: number, endTime: number): Promise<MarketFundingPoint[]> {
+  async marketFundingHistory(symbol: string, startTime: number, endTime: number, signal?: AbortSignal): Promise<MarketFundingPoint[]> {
     if (!Number.isInteger(startTime) || !Number.isInteger(endTime) || startTime < 0 || endTime < startTime) {
       throw new RangeError(`marketFundingHistory needs ms timestamps with start <= end, got ${startTime}, ${endTime}`);
     }
@@ -214,7 +214,7 @@ export class HyperliquidReader implements VenueReader, FundingHistorySource, Mar
     let from = startTime;
     for (let page = 0; ; page++) {
       if (page >= FUNDING_MAX_PAGES) throw new Error(`hyperliquid fundingHistory: still more rows after ${FUNDING_MAX_PAGES} pages`);
-      const rows = await this.#info<HlFundingHistoryRow[]>({ type: 'fundingHistory', coin: symbol, startTime: from, endTime });
+      const rows = await this.#info<HlFundingHistoryRow[]>({ type: 'fundingHistory', coin: symbol, startTime: from, endTime }, signal);
       if (!Array.isArray(rows)) throw new Error('hyperliquid fundingHistory: expected a list of rows');
       let last = from;
       let fresh = 0;
@@ -233,12 +233,13 @@ export class HyperliquidReader implements VenueReader, FundingHistorySource, Mar
     return out.sort((a, b) => a.time - b.time);
   }
 
-  async #info<T>(body: { type: string } & Record<string, unknown>): Promise<T> {
+  async #info<T>(body: { type: string } & Record<string, unknown>, signal?: AbortSignal): Promise<T> {
+    const timeout = AbortSignal.timeout(this.#timeoutMs);
     const res = await this.#fetch(this.infoUrl, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.#timeoutMs),
+      signal: signal === undefined ? timeout : AbortSignal.any([timeout, signal]),
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');

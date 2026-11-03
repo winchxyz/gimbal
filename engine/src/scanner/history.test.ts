@@ -40,9 +40,12 @@ test('the store: a booked rate wins over the scanner\'s own read of the same hou
   assert.equal(s.rate(LONG, CURRENT), 0.00003);
   assert.equal(s.rate(LONG, CURRENT - HOUR_MS), null);
   assert.equal(s.rate('nobody|X', CURRENT), null);
-  s.recordLive(LONG, CURRENT - 200 * HOUR_MS, 0.1);
+  s.recordLive(LONG, CURRENT - 400 * HOUR_MS, 0.1);
+  s.recordLive(LONG, CURRENT - 340 * HOUR_MS, 0.2);
   s.prune(NOW);
-  assert.equal(s.rate(LONG, CURRENT - 200 * HOUR_MS), null);
+  // Two weeks and 12 h are kept, for the 14-day average.
+  assert.equal(s.rate(LONG, CURRENT - 400 * HOUR_MS), null);
+  assert.equal(s.rate(LONG, CURRENT - 340 * HOUR_MS), 0.2);
   assert.equal(s.rate(LONG, CURRENT), 0.00003);
 });
 

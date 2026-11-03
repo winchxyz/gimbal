@@ -4,6 +4,7 @@
 import type { ScanStatus, StrategyConfig, Window as FundingWindow, WindowHistory } from '@gimbal/shared';
 import type { EngineApi } from './api.ts';
 import { requestFakeStress } from './fake-rescue.ts';
+import { isEnterable } from '../windows/model.ts';
 
 /**
  * What the fake shows, chosen with `?state=` in development:
@@ -79,7 +80,18 @@ export interface WindowsOptions {
   drift: boolean;
 }
 
+/**
+ * The fake windows in the engine's order (engine/src/scanner/scanner.ts, step 6): the enterable ones, then the other
+ * desk windows, each by net APR (the engine ranks them by expected carry, which follows the same multi-day spread),
+ * then watch-only by gross.
+ */
 export function fakeWindows(now: number, tick: number, options: WindowsOptions): FundingWindow[] {
+  const group = (w: FundingWindow) => (isEnterable(w) ? 0 : w.tradable ? 1 : 2);
+  const rank = (w: FundingWindow) => (w.tradable ? w.netAprPct : w.grossAprPct);
+  return unordered(now, tick, options).sort((a, b) => group(a) - group(b) || rank(b) - rank(a) || a.id.localeCompare(b.id));
+}
+
+function unordered(now: number, tick: number, options: WindowsOptions): FundingWindow[] {
   return specsFor(options.scenario).map((spec): FundingWindow => {
     const stale = options.scenario === 'error' && (FAKE_FAILED_VENUES.includes(spec.long) || FAKE_FAILED_VENUES.includes(spec.short));
     const swing = options.drift && !stale ? 1.2 * Math.sin((tick + spec.phase) / 9) : 0;

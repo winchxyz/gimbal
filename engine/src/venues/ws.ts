@@ -47,6 +47,8 @@ interface Connection {
   queue: string[];                 // frames waiting for the socket to open
   pending: Map<string, Pending>;
   idle: ReturnType<typeof setTimeout> | null;
+  /** Frames of any kind (answers, keep-alives) received so far: a connection that never hears back is dead. */
+  heard: number;
 }
 
 export class WsRequestClient {
@@ -70,11 +72,20 @@ export class WsRequestClient {
       clearTimeout(conn.idle);
       conn.idle = null;
     }
+    const heardBefore = conn.heard;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         conn.pending.delete(frame.id);
-        reject(new WsTimeoutError(`ws ${url}: no answer to ${frame.id} within ${this.#timeoutMs} ms`));
-        this.#scheduleIdle(url, conn);
+        const err = new WsTimeoutError(`ws ${url}: no answer to ${frame.id} within ${this.#timeoutMs} ms`);
+        reject(err);
+        // A socket that never opened, or has said nothing at all since this frame went out, is dead: drop it, so the
+        // next request opens a new one instead of queueing behind it until the OS gives up on the connection.
+        if (conn.ws.readyState !== 1 || conn.heard === heardBefore) {
+          const why = conn.ws.readyState !== 1 ? 'never opened' : 'silent';
+          this.#drop(url, conn, new WsTimeoutError(`ws ${url}: dropped, ${why} for ${this.#timeoutMs} ms`));
+        } else {
+          this.#scheduleIdle(url, conn);
+        }
       }, this.#timeoutMs);
       conn.pending.set(frame.id, { resolve, reject, timer });
       const text = JSON.stringify(frame);
@@ -92,12 +103,13 @@ export class WsRequestClient {
     const existing = this.#connections.get(url);
     if (existing !== undefined && existing.ws.readyState <= 1) return existing;
     const ws = this.#factory(url);
-    const conn: Connection = { ws, queue: [], pending: new Map(), idle: null };
+    const conn: Connection = { ws, queue: [], pending: new Map(), idle: null, heard: 0 };
     this.#connections.set(url, conn);
     ws.addEventListener('open', () => {
       for (const text of conn.queue.splice(0)) ws.send(text);
     });
     ws.addEventListener('message', (ev) => {
+      conn.heard++;
       let msg: unknown;
       try {
         msg = JSON.parse(String(ev.data));

@@ -5,8 +5,16 @@ import type { ContractPolicy, Mode, StrategyConfig, VenueId } from '@gimbal/shar
 import type { FillFee, Place, TransferCosts } from './costs.ts';
 
 export interface CostParams {
-  /** Hours a window is expected to be held: one-off costs (fills, slippage, basis, rescues) are spread over it. */
+  /**
+   * Hours a window is expected to be held: one-off costs (fills, slippage, basis, rescues) are spread over it, and a
+   * desk window's expected spread (carry.ts) is counted over it. StrategyConfig has no hold of its own.
+   */
   holdHours: number;
+  /**
+   * What the round trip of a desk window sets aside for the marks moving apart by the exit, bps of the leg, on top of
+   * the adverse gap paid at entry (basisCostUsd).
+   */
+  basisBufferBps: number;
   /** Cost of one taker fill per desk venue. */
   fees: Record<VenueId, FillFee>;
   transfers: TransferCosts;
@@ -18,8 +26,16 @@ export interface CostParams {
 
 export interface ScannerConfig {
   costs: CostParams;
-  /** A leg whose open interest is under this many USD is not ranked; the smaller leg's open interest is the capacity. */
+  /**
+   * A watch-only leg whose open interest is under this many USD is not ranked; the smaller leg's open interest is the
+   * capacity. Desk legs are held to deskMaxOiShare instead.
+   */
   oiFloorUsd: number;
+  /**
+   * A desk leg may be at most this share of its market's open interest (USD); a larger one is shown on its multi-day
+   * spread with a failing check, never entered. The book check at the leg size applies on top.
+   */
+  deskMaxOiShare: number;
   /** A leg whose mark (÷ multiplier) is further than this fraction from the median of the same base elsewhere is dropped. */
   maxMarkDeviation: number;
   /** Watch-only windows are many; at most this many (in rank order) are sent. Desk windows are never cut. */
@@ -224,7 +240,11 @@ export const ORDERLY_BROKERS = {
 
 /** Costs on mainnet, and in replay, which plays recorded mainnet answers. */
 export const MAINNET_COSTS: CostParams = {
-  holdHours: 168,
+  // A stated assumption: 10 days. The owner's engine rules carry no hold to take it from.
+  holdHours: 240,
+  // A stated assumption. Hyperliquid and Phoenix marks differed by 0.6 to 7.8 bps on 2026-11-03 (XLM, LTC, SOL, DOGE,
+  // NEAR), so an exit can lose a few bps to the gap whatever it was at entry.
+  basisBufferBps: 5,
   fees: {
     // Hyperliquid tier-0 taker 4.5 bps, plus the treasury builder fee on every order (FeeConfig.hl_builder_tenth_bps
     // 10 = 1 bp). The referral discount is not counted.
@@ -268,6 +288,8 @@ export function scannerConfigFor(mode: Mode): ScannerConfig {
 export const DEFAULT_SCANNER_CONFIG: ScannerConfig = {
   costs: DEFAULT_COSTS,
   oiFloorUsd: 500_000,
+  // The owner's rule (2026-11-03): a desk leg at most 2 % of its market's open interest.
+  deskMaxOiShare: 0.02,
   maxMarkDeviation: 0.1,
   maxWatchWindows: 150,
   quality: DEFAULT_QUALITY,

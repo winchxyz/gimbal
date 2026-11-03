@@ -35,9 +35,15 @@ export interface ScanLeg {
   fundingFloorPerHour?: number;  // it gives none (quality.ts then falls back to the sourced FUNDING_LIMITS)
   /** Set on a leg of the held window that the filters would have dropped: why. The window fails a check for it. */
   heldOnly?: string;
+  /**
+   * Set on a desk leg whose leg size is over deskMaxOiShare of its open interest: why. It is kept for desk pairs only
+   * (never a watch window), which the scanner lists only on a multi-day spread that covers the fills, and which fail
+   * a check for it.
+   */
+  deskOnly?: string;
 }
 
-export type DropReason = 'bad-rate' | 'duplicate' | 'no-mark' | 'mark-outlier' | 'no-oi' | 'under-oi-floor';
+export type DropReason = 'bad-rate' | 'duplicate' | 'no-mark' | 'mark-outlier' | 'no-oi' | 'under-oi-floor' | 'over-oi-share';
 
 export interface LegDrop {
   venue: ScanVenueId;
@@ -95,8 +101,10 @@ function nearestMedian(xs: readonly number[], x: number): number {
 }
 
 export interface FilterOptions {
-  oiFloorUsd: number;
+  oiFloorUsd: number;            // watch-only legs
   maxMarkDeviation: number;      // fraction: 0.1 = 10 %
+  deskLegUsd: number;            // the desk's leg size now (strategy.legUsd)
+  deskMaxOiShare: number;        // a desk leg may be at most this share of its market's open interest: 0.02 = 2 %
 }
 
 /**
@@ -107,12 +115,17 @@ export interface FilterOptions {
  * 2. a leg without a mark cannot be checked against the others or priced: dropped, except a CEX leg (reference only);
  * 3. a leg whose mark is more than `maxMarkDeviation` from the median mark of the same base on the other venues is
  *    another asset under the same name, or a wrong multiplier: dropped (with two venues that disagree, both go);
- * 4. a leg under the open-interest floor is dropped. Open interest that is unknown (null: Aster, Binance, Bybit
- *    publish none) is not zero: a watch-only leg without it stays as a rate reference, but it cannot pass the floor on
- *    its own (pairLegs never pairs two such legs). A desk leg without it cannot be sized: dropped.
+ * 4. a watch-only leg under the open-interest floor is dropped. A desk leg is held to its own size instead: the leg
+ *    may be at most deskMaxOiShare of the market's open interest (a 20 USD leg fits a Phoenix market with 30k USD
+ *    open; the floor is sized for ranking the whole market). Open interest that is unknown (null: Aster, Binance,
+ *    Bybit publish none) is not zero: a watch-only leg without it stays as a rate reference, but it cannot pass the
+ *    floor on its own (pairLegs never pairs two such legs). A desk leg without it cannot be sized: dropped.
  * A leg in `exempt` (`venue|symbol`: the legs of the window the desk holds) is never dropped by steps 2 to 4: the desk
  * must still see what it holds and what leaving costs. It is kept with `heldOnly` saying what it failed, and wins a
  * duplicate.
+ * A desk leg whose only failure is its share of the open interest is kept too, with `deskOnly` saying so: its windows
+ * are shown (on a multi-day spread that pays) and fail a check for it, so the limit still keeps them from being
+ * entered.
  */
 export function filterLegs(
   legs: readonly ScanLeg[], options: FilterOptions, exempt: ReadonlySet<string> = new Set(),
@@ -168,12 +181,15 @@ export function filterLegs(
     const failed = failedFilter(leg, marksByBase.get(leg.base) ?? [], options);
     if (failed === null) kept.push(leg);
     else if (isExempt(leg)) kept.push({ ...leg, heldOnly: failed.why });
+    else if (failed.reason === 'over-oi-share') kept.push({ ...leg, deskOnly: failed.why });
     else drop(leg, failed.reason);
   }
   return { kept, dropped };
 }
 
 const money = (n: number): string => `$${Math.round(n).toLocaleString('en-US')}`;
+/** A share as a percentage, two significant figures: 0.0485 -> "4.8 %", 0.0004849 -> "0.048 %", 0.02 -> "2 %". */
+const sharePct = (x: number): string => (Number.isFinite(x) ? `${Number((x * 100).toPrecision(2))} %` : 'all');
 
 /** The first of steps 2 to 4 a leg fails, with a line for its check; null when it passes them all. */
 function failedFilter(leg: ScanLeg, marked: readonly ScanLeg[], options: FilterOptions): { reason: DropReason; why: string } | null {
@@ -192,6 +208,14 @@ function failedFilter(leg: ScanLeg, marked: readonly ScanLeg[], options: FilterO
   }
   if (leg.oiUsd === null) {
     if (leg.kind === 'desk') return { reason: 'no-oi', why: 'publishes no open interest' };
+  } else if (leg.kind === 'desk') {
+    const share = leg.oiUsd > 0 ? options.deskLegUsd / leg.oiUsd : Infinity;
+    if (share > options.deskMaxOiShare) {
+      return {
+        reason: 'over-oi-share',
+        why: `has ${money(leg.oiUsd)} of open interest: a ${money(options.deskLegUsd)} leg is ${sharePct(share)} of it, over the ${sharePct(options.deskMaxOiShare)} limit`,
+      };
+    }
   } else if (leg.oiUsd < options.oiFloorUsd) {
     return { reason: 'under-oi-floor', why: `has ${money(leg.oiUsd)} of open interest, under the ${money(options.oiFloorUsd)} floor` };
   }
@@ -240,7 +264,7 @@ export function windowId(base: string, longVenue: ScanVenueId, shortVenue: ScanV
  * Every ordered pair of legs of the same base on two different venues, both directions, except CEX against CEX
  * (reference only on both sides: nothing to rank) and two legs whose open interest are both unknown (no leg has
  * passed the floor, and the window would have no capacity to show). A leg kept only for the held window (`heldOnly`)
- * makes no pair but that one.
+ * makes no pair but that one; a leg kept for desk pairs only (`deskOnly`) makes desk pairs only.
  */
 export function pairLegs(legs: readonly ScanLeg[], heldId: string | null = null): Pair[] {
   const byBase = new Map<string, ScanLeg[]>();
@@ -258,13 +282,15 @@ export function pairLegs(legs: readonly ScanLeg[], heldId: string | null = null)
         const id = windowId(base, long.venue, short.venue);
         if ((long.heldOnly !== undefined || short.heldOnly !== undefined) && id !== heldId) continue;
         if (long.oiUsd === null && short.oiUsd === null && id !== heldId) continue;
+        const desk = long.kind === 'desk' && short.kind === 'desk';
+        if ((long.deskOnly !== undefined || short.deskOnly !== undefined) && !desk && id !== heldId) continue;
         out.push({
           id,
           base,
           long,
           short,
           grossPerHour: grossPerHour(long.ratePerHour, short.shortRatePerHour),
-          desk: long.kind === 'desk' && short.kind === 'desk',
+          desk,
         });
       }
     }

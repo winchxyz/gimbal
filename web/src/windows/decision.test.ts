@@ -74,11 +74,27 @@ test('nothing held: auto enters the best window that clears the minimum', () => 
   const a = net('SOL', 8.6);
   const b = net('NEAR', 12);
   const c = net('BTC', 2.1);
-  assert.equal(decide({ selected: b, windows: [a, b, c], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters NEAR: it is the best window that clears your 5% minimum.');
-  assert.equal(decide({ selected: a, windows: [a, b, c], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters NEAR first: 12.0% against 8.6% here.');
-  assert.equal(decide({ selected: c, windows: [a, b, c], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. BTC is under your 5% minimum, so auto will not enter it.');
-  assert.match(decide({ selected: a, windows: [a, b, c], strategy: null, now: NOW }).text, /minimum could not be read/);
-  const none = decide({ selected: a, windows: [a, b, c], strategy: STRATEGY, now: NOW });
+  // In the engine's order, as the stream sends them: it ranks by the carry it expects, which can differ from net APR.
+  const windows = [b, a, c];
+  const carryFirst = [a, b, c];
+  assert.equal(decide({ selected: b, windows: carryFirst, strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters SOL first: 8.6% against 12.0% here.');
+  assert.equal(decide({ selected: b, windows, strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters NEAR: it is the best window that clears your 5% minimum.');
+  assert.equal(decide({ selected: a, windows, strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters NEAR first: 12.0% against 8.6% here.');
+  assert.equal(decide({ selected: c, windows, strategy: STRATEGY, now: NOW }).text, 'Nothing is held. BTC is under your 5% minimum, so auto will not enter it.');
+  assert.match(decide({ selected: a, windows, strategy: null, now: NOW }).text, /minimum could not be read/);
+  // A window failing an engine check (the carry gate, the open-interest share) is never the one auto enters first,
+  // whatever its net; nor is one with stale numbers.
+  const gated = net('DOGE', 30, { checks: [{ ok: false, text: '14-day history loading' }] });
+  const stale = net('LTC', 25, { stale: true });
+  assert.equal(decide({ selected: a, windows: [gated, stale, a, c], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters SOL: it is the best window that clears your 5% minimum.');
+  // Selected, such a window says why auto will not enter it, held window or not.
+  assert.equal(decide({ selected: gated, windows: [gated, a], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto will not enter DOGE: 14-day history loading.');
+  assert.equal(decide({ selected: stale, windows: [stale, a], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto will not enter LTC: its numbers are from an older read.');
+  const holding = net('ETH', 6, { held: { since: NOW - 3_600_000 } });
+  const over = decide({ selected: gated, windows: [holding, gated], strategy: STRATEGY, now: NOW });
+  assert.equal(over.text, 'ETH stays: auto will not enter DOGE: 14-day history loading.');
+  assert.equal(over.rotate, null);
+  const none = decide({ selected: a, windows, strategy: STRATEGY, now: NOW });
   assert.equal(none.rotate, null);
   assert.equal(none.close, false);
 });

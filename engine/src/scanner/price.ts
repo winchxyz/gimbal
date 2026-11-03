@@ -85,6 +85,12 @@ export interface PricedWindow {
 
 export type PriceResult = { ok: true; priced: PricedWindow } | { ok: false; reason: 'no-book' | 'empty-book'; venue: VenueId };
 
+/**
+ * The check a window fails when today's rates never pay its one-off costs within a year. On a desk window whose
+ * multi-day spread is known the scanner replaces it with the same test on that spread (carry.ts).
+ */
+export const NO_BREAKEVEN_TEXT = 'Does not break even within a year at today\'s rates';
+
 /** Money for a check line: cents under $100, whole dollars to $10k, then k and M. */
 export function usd(n: number): string {
   const a = Math.abs(n);
@@ -202,8 +208,9 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
   const tail: FundingWindow['checks'] = [];
   for (const leg of [long, short]) {
     if (leg.heldOnly !== undefined) tail.push({ ok: false, text: `Kept only because the desk holds it: ${venueName(leg.venue)} ${leg.symbol} ${leg.heldOnly}` });
+    else if (leg.deskOnly !== undefined) tail.push({ ok: false, text: `Shown for its multi-day spread, not entered: ${venueName(leg.venue)} ${leg.symbol} ${leg.deskOnly}` });
   }
-  if (be === null) tail.push({ ok: false, text: 'Does not break even within a year at today\'s rates' });
+  if (be === null) tail.push({ ok: false, text: NO_BREAKEVEN_TEXT });
   if (basisUsd === null) {
     const missing = [long, short].filter((l) => l.markPx === null).map((l) => l.venue);
     tail.push({ ok: false, text: `No mark on ${venueNames(missing)}: basis not priced` });
@@ -356,13 +363,10 @@ function watchVerdict(pair: Pair): Verdict {
 
 /**
  * What it costs to rotate from the held window into another at the same leg size, USD: close the held legs that
- * change and open the new ones (taker fee and slippage of each of those fills). A leg that stays (same venue, market
- * and side) costs nothing.
- *
- * Margin moves are not in it. Each window's feesPct already counts moving its margin onto its venues and back
- * (none where marginHeldAt says the desk's margin already sits), so a rotation judged on the next window's net APR
- * plus this cost would pay for the same move twice. Moving margin from the venue the desk leaves rather than from
- * the reserve costs about the same, and the held window's own trip back is saved.
+ * change and open the new ones (taker fee and slippage of each of those fills; a leg that stays, same venue, market
+ * and side, costs nothing), plus moving margin onto the new window's venues and back (its transferUsd: none where
+ * marginHeldAt says the desk's margin already sits). A desk window's net APR leaves its margin moves out (they are a
+ * one-off cost shown apart), so this is where the rotation gap and its payback pay for them.
  */
 export function switchCostUsd(held: PricedWindow, next: PricedWindow): number | null {
   if (held.fills === null || next.fills === null) return null;
@@ -373,5 +377,5 @@ export function switchCostUsd(held: PricedWindow, next: PricedWindow): number | 
     if (a.venue === b.venue && a.symbol === b.symbol) continue;
     total += held.fills[side].closeUsd + next.fills[side].openUsd;
   }
-  return round(total, 4);
+  return round(total + (next.breakdown.transferUsd ?? 0), 4);
 }
