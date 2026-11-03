@@ -28,7 +28,12 @@
 // result, the budget spent, the end.
 //
 // Without trading (serve's trader not live), a confirmed ADL is journaled with the owner alert and the event is kept
-// so it is not reported again; it ends the same way, when both legs read flat.
+// so it is not reported again; it ends the same way, when both legs read flat. While `hold` says why a shrink may be
+// an order of ours whose result was never saved (serve restarted with orders in flight), a shrink starts no event at
+// all: it is journaled once for the owner, and nothing is traded until a close result or adopt sets the baselines.
+//
+// The pause stops opens only (the pair trader's open). It does not stop a rescue (its transfers, or its reduce, which
+// is reduce-only like the unwind and queues behind it in the trader) or panic_close.
 //
 // stop() is final: a check in flight sends nothing after it (the flag is read after every wait).
 
@@ -137,6 +142,12 @@ export interface AdlWatchOptions {
   onChange?: (state: AdlState) => void;
   /** false: confirmed ADL is only alerted (serve's trader not live). */
   trade?: boolean;
+  /**
+   * Why a shrink cannot be told from an order of ours now (serve: orders were in flight when the engine stopped, and
+   * no close result or adopt has set the baselines since), or null. While it says why, a confirmed shrink starts no
+   * event: it is alerted to the owner once and nothing is traded. An event already in progress goes on.
+   */
+  hold?: () => string | null;
   log?: (line: string) => void;
   clock?: Clock;
   sleep?: (ms: number) => Promise<void>;
@@ -151,6 +162,7 @@ export class AdlWatch {
   readonly #confirmMs: number;
   readonly #trade: boolean;
   readonly #onChange: (state: AdlState) => void;
+  readonly #hold: () => string | null;
   readonly state: AdlState;
   /** The last finding reported as not ADL: not reported again while the legs read the same. */
   #reported: string | null = null;
@@ -166,6 +178,7 @@ export class AdlWatch {
     this.#confirmMs = options.confirmMs ?? CONFIRM_MS;
     this.#trade = options.trade ?? true;
     this.#onChange = options.onChange ?? (() => {});
+    this.#hold = options.hold ?? (() => null);
     this.state = options.state ?? newAdlState();
   }
 
@@ -208,6 +221,11 @@ export class AdlWatch {
     if (this.#trader.net !== 0n || ref[0] + ref[1] !== 0n) {
       this.#reported = second.key;
       return this.#report('not-adl', `${describe(seen)} shrank without an order of ours, but the pair was not hedged before (baselines ${ref.map(signedQtyString).join(' and ')}): nothing traded, the owner must act`, seen, { ownerAlert: true });
+    }
+    const hold = this.#hold();
+    if (hold !== null) {
+      this.#reported = second.key;
+      return this.#report('alert', `${describe(seen)} shrank against the baselines, not taken as ADL (${hold}): no event, nothing traded; the owner must check both legs`, seen, { ownerAlert: true });
     }
     const event: AdlEvent = { at: this.#clock.now(), reference: ref, seen: pos, attempts: 0, nextAt: null, alerted: false };
     this.state.event = event;

@@ -19,11 +19,20 @@ export function legLine(l: Leg): string {
     + (d !== null && d < ALERT_DISTANCE_PCT ? ` (UNDER ${ALERT_DISTANCE_PCT} %)` : '');
 }
 
+/**
+ * The legs offset each other: the net delta (a float sum of leg sizes) is zero within a millionth of the largest leg,
+ * and at most 1e-9 in base units, so the float sum's rounding never reads as an unhedged pair.
+ */
+export function isHedged(desk: Pick<DeskState, 'netDelta' | 'legs'>): boolean {
+  const largest = desk.legs.reduce((m, l) => Math.max(m, Math.abs(l.size)), 0);
+  return Math.abs(desk.netDelta) <= Math.max(1e-9, largest * 1e-9);
+}
+
 /** The monitor's lines for a desk state: each leg, then the net. */
 export function monitorLines(desk: DeskState): string[] {
   if (desk.legs.length === 0) return [`monitor   ${desk.deskId}: no open legs (equity ${desk.equityUsd.toFixed(2)} USD, reserve ${desk.reserveUsd.toFixed(2)} USD)`];
   const out = desk.legs.map((l) => `monitor   ${legLine(l)}`);
-  out.push(`monitor   net delta ${desk.netDelta}${desk.netDelta === 0 ? ' (hedged)' : ' (NOT hedged)'}, health ${desk.health}${desk.paused === null ? '' : ', PAUSED'}, `
+  out.push(`monitor   net delta ${desk.netDelta}${isHedged(desk) ? ' (hedged)' : ' (NOT hedged)'}, health ${desk.health}${desk.paused === null ? '' : ', PAUSED'}, `
     + `funding ${desk.pnl.fundingUsd.toFixed(4)} USD, equity ${desk.equityUsd.toFixed(2)} USD`);
   return out;
 }
@@ -58,13 +67,14 @@ export class LiquidationAlert {
       seen.add(k);
       const d = l.distanceToLiqPct;
       const last = this.#under.get(k);
+      // A distance that cannot be read (null) is no recovery: a leg under the line stays under until one reads above.
       if (d !== null && d < this.linePct) {
         if (last !== undefined && now - last < this.#everyMs) continue;
         this.#under.set(k, now);
         const summary = `liquidation alert: ${legLine(l)}, under the ${this.linePct} % line${last === undefined ? '' : ' (still)'}`;
         out.journal.push({ t: now, kind: 'error', summary, numbers: { venue: l.venue, distancePct: Math.round(d * 100) / 100, alertPct: this.linePct }, tx: [] });
         out.console.push(`ALERT     ${summary}`);
-      } else if (last !== undefined && (d === null || d >= this.linePct + ALERT_HYSTERESIS_PTS)) {
+      } else if (last !== undefined && d !== null && d >= this.linePct + ALERT_HYSTERESIS_PTS) {
         this.#under.delete(k);
         out.console.push(`monitor   ${k} is back above the ${this.linePct} % liquidation line: ${legLine(l)}`);
       }

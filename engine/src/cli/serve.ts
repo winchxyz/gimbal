@@ -19,7 +19,9 @@
 //                       are kept across restarts, one file per mode and desk; default engine/state/ (gitignored) for
 //                       the rules, and for the pair trader the per-user state directory outside any checkout
 //                       (trade/trader-state.ts userStateDir), so another worktree or a clean cannot lose it
-//   --once              start, adopt the pair, print what is live, read the desk once, and exit (no HTTP server)
+//   --once              start, adopt the pair, print what is live, read the desk once, and exit (no HTTP server);
+//                       always alert only: GIMBAL_TRADE and GIMBAL_RESCUE are ignored (it exits after one read, and
+//                       must not leave a close or a transfer half done)
 // NEAR_AI_API_KEY turns on POST /policy/draft (src/nearai/); without it the route answers 503, drafting unavailable.
 // GIMBAL_SETUP=1 turns on POST /setup (src/setup/): venue setup signs through the operator key (OPERATOR_PRIVATE_KEY).
 // The contract (testnet and mainnet, src/cli/serve-contract.ts): with GIMBAL_CONTRACT_ID and DESK_ID set (and
@@ -31,8 +33,10 @@
 // The pair (mainnet, src/cli/serve-pair.ts): the carry pair pair-mainnet opened is adopted from the venues at start and
 // held by a PairTrader whose orders are all reduce-only: panic_close closes both legs, a rescue's reduce makes both
 // smaller, a confirmed ADL pauses the pair and unwinds both (risk/adl.ts). It trades only with GIMBAL_TRADE=1 (the
-// operator key, the per-desk lock, never in a linked worktree); otherwise it only alerts. GIMBAL_TRADER_FRESH=1 starts
-// its state anew from the venues' positions (a missing state file is not a fresh start).
+// operator key, the per-desk lock, never in a linked worktree, never with --once); otherwise it only alerts.
+// GIMBAL_TRADER_FRESH=<contract>/<desk> starts its state anew from the venues' positions, for one start (a missing
+// state file is not a fresh start). On SIGINT or SIGTERM serve waits up to SHUTDOWN_WAIT_MS for a close in flight
+// (panic_close, a rescue's reduce, an ADL unwind) before it releases the lock and exits.
 // The monitor (src/risk/monitor.ts): every 30 min the legs, their distance to liquidation and the net; an alert to the
 // journal and the console when a leg is under 25 % from liquidation. `npm run monitor -w engine -- --mainnet` is the
 // one-shot form.
@@ -276,16 +280,23 @@ if (contract !== null && deskId !== null) {
   const side = contract;
   const id = deskId;
   pair = await servePair({
-    mode, env: envVar, side, deskId: id, clock, log, publish, linkedWorktree: linkedWorktree(),
+    mode, env: envVar, side, deskId: id, clock, log, publish, linkedWorktree: linkedWorktree(), once: values.once === true,
     ...(stateDirSet === undefined ? {} : { stateDir: resolve(stateDirSet) }),
   }).catch((err: unknown) => fail(`pair: ${errorMessage(err)}`));
 }
+// --once is alert only: nothing it starts may be cut off by its exit (a rescue's transfer included).
+const rescueEnv = values.once === true ? (name: string) => (name === 'GIMBAL_RESCUE' ? undefined : envVar(name)) : envVar;
 if (deskSource !== null) {
   // E9: the rescue executor takes the risk engine's triggers (recorded 1Click answers off mainnet, live only with
   // GIMBAL_RESCUE=1 on mainnet); its reduce and panic_close trade through the pair when it trades.
   const side = contract;
+  const servedPair = pair;
   const rescue = await serveRescue({
-    mode, env: envVar, clock, publish, log, risk: () => risk, policy, reducer: () => pair?.reducer() ?? null,
+    mode, env: rescueEnv, clock, publish, log, risk: () => risk, policy, reducer: () => pair?.reducer() ?? null,
+    closing: {
+      notTrading: () => servedPair?.notTrading() ?? null,
+      ...(servedPair?.cancelResting === undefined ? {} : { cancelResting: servedPair.cancelResting }),
+    },
     ...(replayDesk === null ? {} : { replayDesk }),
     ...(side === null ? {} : {
       getDesk: async () => {
@@ -312,8 +323,10 @@ if (deskSource !== null) {
 }
 if (values.once === true) {
   // One read of the desk (the alert included), the monitor lines, and out: nothing listens, nothing is left running.
+  // Nothing trades either (servePair and serveRescue were started alert only), so the exit cuts nothing off.
   await risk?.tick();
   await risk?.adlRunning;
+  await closingWatch?.current;
   for (const line of lastDesk === null ? ['monitor   no desk read'] : monitorLines(lastDesk)) log(line);
   await risk?.stop();
   pair?.stop();
@@ -367,13 +380,25 @@ const shown = host.includes(':') ? `[${host}]` : host;
 log(`engine ${mode} on http://${shown}:${listening}: GET /events /state /windows/history?id= /strategy /journal, PUT /strategy`);
 
 let stopping = false;
+/** How long a shutdown waits for a close in flight: one MPC signature can take 120 s, and a close is one per leg plus a retry. */
+const SHUTDOWN_WAIT_MS = 180_000;
 async function shutdown(reason: string): Promise<void> {
   if (stopping) return;
   stopping = true;
   log(`stopping: ${reason}`);
   clearInterval(intentsTimer);
   clearInterval(monitorTimer);
+  // No new trigger or desk read after this; a close already running (panic_close, a rescue's reduce, an ADL unwind)
+  // is waited for, bounded, before the lock is released: pair-mainnet must not start next to it.
   await risk?.stop();
+  if (pair?.pair?.closing === true || closingWatch?.current != null) {
+    log(`stopping: waiting up to ${SHUTDOWN_WAIT_MS / 1000} s for the close in flight before the trader lock is released`);
+  }
+  const drained = await Promise.race([
+    Promise.allSettled([closingWatch?.current ?? Promise.resolve(), pair?.drain(SHUTDOWN_WAIT_MS) ?? Promise.resolve(true)]).then(() => pair?.pair?.closing !== true),
+    new Promise<boolean>((r) => setTimeout(() => r(false), SHUTDOWN_WAIT_MS).unref()),
+  ]);
+  if (!drained) log(`stopping: a close is still running after ${SHUTDOWN_WAIT_MS / 1000} s; exiting anyway: its orders are saved as in flight (the next start only alerts on ADL until a close result); check both legs by hand`);
   pair?.stop();
   await server!.stop();
   contract?.prices.stop();

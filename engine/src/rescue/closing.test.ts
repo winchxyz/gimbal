@@ -132,3 +132,19 @@ test('closing race: an unpause during a close in flight, then a new panic_close:
   assert.deepEqual(s.calls, ['cancel', 'close', 'cancel', 'close']);
   assert.equal(s.journal().filter((j) => /panic_close read from get_desk/.test(j)).length, 2);
 });
+
+test('closing with no reducer: the journal says why (alert only), and nothing is cancelled or closed', async () => {
+  const events: StreamEvent[] = [];
+  let cancels = 0;
+  const watch = new ClosingWatch({
+    publish: (e) => events.push(e), clock: { now: () => 1 }, reducer: () => null,
+    cancelResting: async () => { cancels++; return { cancelled: 0, tx: [], notes: [] }; },
+    notTrading: () => 'alert only: GIMBAL_TRADE is not 1',
+  });
+  watch.observe(true);
+  await watch.current;
+  const lines = events.flatMap((e) => (e.type === 'journal' ? [`${e.data.kind}: ${e.data.summary}`] : []));
+  assert.equal(cancels, 0);
+  assert.equal(lines[0], 'exit: panic_close read from get_desk: no rescue or open starts');
+  assert.match(lines[1] ?? '', /^error: panic_close: this engine is alert only: GIMBAL_TRADE is not 1: nothing was cancelled or closed; cancel the resting orders and close both legs by hand/);
+});

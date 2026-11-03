@@ -103,6 +103,15 @@ export interface MakerFirst {
   index: 0 | 1;
 }
 
+/** PairTrader.close's request (see there). */
+export interface CloseRequest {
+  reason: string;
+  targets?: [bigint, bigint];
+  reduceOnly?: boolean;
+  maker?: MakerFirst;
+  clampTargets?: boolean;
+}
+
 /** What one push check did: the watched leg first, then its partner when a deficit moved it. */
 export interface WatchReport {
   status:
@@ -233,6 +242,11 @@ export class PairTrader {
   /** The last push check that found a leg off its intent (for logs and tests). */
   lastWatch: WatchReport | null = null;
   /**
+   * Counts the times the baselines were set from the venues: every open or close result and every adopt (not a
+   * refusal that sent nothing, nor importState). A caller compares it before and after an operation.
+   */
+  baselineEpoch = 0;
+  /**
    * Why the pair is exposed: set by an unhedged result or watch check; cleared by the next open or close, or by a watch
    * check that leaves the legs offsetting each other again.
    */
@@ -355,8 +369,10 @@ export class PairTrader {
    * Brings both legs to `targets` (default flat) with reduce-only orders. A leg that stays open is normally re-hedged by
    * reopening its partner against it (not reduce-only); `reduceOnly: true` forbids that step, so nothing this close
    * sends can open or grow a position (the ADL response): the pair is then left stuck or unhedged, with the alert.
+   * `clampTargets`: each target is brought between 0 and the leg's position as read when the close runs (a target
+   * computed from an older read, queued behind another close, must not ask a leg to grow or cross zero).
    */
-  close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean; maker?: MakerFirst }): Promise<PairResult> {
+  close(request: CloseRequest): Promise<PairResult> {
     return this.#serial(async () => {
       const end = this.#beginMaker(request.maker);
       try {
@@ -443,6 +459,7 @@ export class PairTrader {
    * they offset each other and set when they do not. Unsettled orders stay watched.
    */
   adopt(positions: readonly [bigint, bigint], net = 0n): void {
+    this.baselineEpoch++;
     this.#net = net;
     for (const [i, leg] of this.legs.entries()) {
       this.#intent.set(leg, positions[i]!);
@@ -597,13 +614,17 @@ export class PairTrader {
     return hedge;
   }
 
-  async #close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean; maker?: MakerFirst }): Promise<PairResult> {
-    const targets = request.targets ?? [0n, 0n];
+  async #close(request: CloseRequest): Promise<PairResult> {
     // Not refused while an order has no answer: a reduce-only close cannot double it, and its watch stays on.
     const starts = await Promise.all(this.legs.map((leg) => leg.position()));
+    const asked = request.targets ?? [0n, 0n];
+    const targets: [bigint, bigint] = request.clampTargets === true ? [towardZero(starts[0]!, asked[0]), towardZero(starts[1]!, asked[1])] : asked;
     const runs = this.legs.map((leg, i) => this.#run(leg, starts[i]!, targets[i]!)) as [LegRun, LegRun];
     const size = abs(starts[0]! - targets[0]!) > abs(starts[1]! - targets[1]!) ? abs(starts[0]! - targets[0]!) : abs(starts[1]! - targets[1]!);
     const notes: string[] = [];
+    for (const i of [0, 1] as const) {
+      if (targets[i] !== asked[i]) notes.push(`${this.legs[i].venue} target ${signedQtyString(asked[i])} is past its position ${signedQtyString(starts[i]!)} read now (toward zero only): ${signedQtyString(targets[i])}`);
+    }
     const net = targets[0] + targets[1];
     if (runs.every((r) => r.pos === r.target)) {
       notes.push('both legs were already at their close targets');
@@ -1198,6 +1219,7 @@ export class PairTrader {
   }
 
   #result(status: PairStatus, size: bigint, runs: [LegRun, LegRun], notes: string[], net: bigint): PairResult {
+    this.baselineEpoch++;
     this.#net = net;
     // A newer open or close decides what each leg should hold: an unwind left from an older open no longer applies.
     for (const u of this.#unsettled.values()) u.unwind = null;
@@ -1389,6 +1411,13 @@ export function reducedTarget(pos: bigint, target: bigint): bigint | null {
 
 function crossesZero(from: bigint, to: bigint): boolean {
   return (from > 0n && to < 0n) || (from < 0n && to > 0n);
+}
+
+/** `target` brought between 0 and `pos` (both ends included): a close may only shrink the leg. */
+function towardZero(pos: bigint, target: bigint): bigint {
+  const lo = pos < 0n ? pos : 0n;
+  const hi = pos > 0n ? pos : 0n;
+  return target < lo ? lo : target > hi ? hi : target;
 }
 
 /** The legs offset each other: together they hold what the pair's targets add up to (0 for a pair). */

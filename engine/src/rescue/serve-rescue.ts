@@ -27,6 +27,7 @@ import type { RiskEngine } from '../risk/engine.ts';
 import type { ReplayDesk } from '../risk/sources.ts';
 import type { Clock } from '../venues/venue.ts';
 import { ClosingWatch } from './closing.ts';
+import type { ClosingWatchOptions } from './closing.ts';
 import { HlLedgerLanding } from './hl-ledger.ts';
 import { HttpOneClick } from './oneclick.ts';
 import type { VerifiedQuote } from './oneclick.ts';
@@ -43,6 +44,8 @@ export interface ServeRescueInput {
   risk: () => RiskEngine | null;
   /** serve's read-only contract client (testnet, mainnet): get_desk. */
   getDesk?: () => Promise<DeskView>;
+  /** panic_close's resting-order cancel and why nothing trades here (serve-pair.ts), for the ClosingWatch. */
+  closing?: Pick<ClosingWatchOptions, 'cancelResting' | 'notTrading'>;
   contractId?: string;
   deskId?: string;
   replayDesk?: ReplayDesk;
@@ -77,7 +80,7 @@ function policyOf(p: ContractPolicy | null, fallback: RescueDesk['policy']): Res
 export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue> {
   const { mode, env, log } = input;
   const reducer = input.reducer ?? (() => null);
-  const closing = new ClosingWatch({ publish: input.publish, clock: input.clock, reducer, log });
+  const closing = new ClosingWatch({ publish: input.publish, clock: input.clock, reducer, log, ...input.closing });
   const common = {
     mode, publish: input.publish,
     view: () => input.risk()?.legView() ?? { legs: [], freeMargin: {} },

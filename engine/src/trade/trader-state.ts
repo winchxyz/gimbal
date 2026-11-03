@@ -2,19 +2,24 @@
 // attempts the pair has left. One JSON file per mode, contract, desk and desk EVM address, in GIMBAL_STATE_DIR (by
 // default the per-user state directory, outside any checkout, so another worktree or a `git clean` cannot lose it).
 // A save writes a temporary file, fsyncs it and renames it over the old one, synchronously: the trader saves before
-// every order (the order in flight) and after it, and sends no order unless the save before it succeeded.
+// every order (the order in flight) and again once the trader has recorded the order's result, and sends no order
+// unless the save before it succeeded.
 //
 // What it keeps: the pair's symbol; the trader's intents, baselines, known positions, net and alert, and every order
 // with no answer that may still run (its ids and window: PairTraderState); Hyperliquid post-only orders a maker order
-// could not settle; the order in flight when the process stopped; the ADL state (attempts left, pause, an event in
-// progress). Everything in it is public on chain or at the venues once signed: no key, no secret.
+// could not settle; the orders in flight (each order sent since the trader last recorded a result, one entry per
+// order, so each leg has its own); the ADL state (attempts left, pause, an event in progress). Everything in it is
+// public on chain or at the venues once signed: no key, no secret.
 //
 // A file that is missing, cannot be read, names another contract, desk or EVM address, or does not pass
 // parseTraderState is never taken as "nothing in flight": serve's trader then does not trade (alert only) and says
-// so. A first run needs GIMBAL_TRADER_FRESH=1, which adopts the venues' positions and writes a new state.
+// so. A first run needs GIMBAL_TRADER_FRESH=<contract>/<desk>, which adopts the venues' positions and writes a new
+// state (trade/protected-pair.ts startPlan: any other value is ignored, and it is refused over a usable state that
+// holds anything a restart must not forget).
 //
 // One trader per mode, contract and desk on this machine: it trades only with an exclusive lock file at a fixed
-// per-user path (pair-mainnet --send refuses while it is held).
+// per-user path, which pair-mainnet --send takes too, for its whole run. A lock file that holds no pid (its holder is
+// between creating and writing it) counts as held.
 //
 // The conventions (and userStateDir, the lock) follow the rescuer's state of PR #63 (rescue/state.ts, rescue/lock.ts);
 // TODO(dedupe): once both are merged, share userStateDir, the atomic save and the lock with those files.
@@ -33,7 +38,7 @@ export const TRADER_STATE_VERSION = 1;
 
 const README = 'Gimbal pair trader state (serve): orders that may still run, the ADL unwind budget and pause. '
   + 'Never delete this file to clear something: a missing file stops serve from trading. To start over after '
-  + 'reconciling both legs on the venues, stop the engine and start it once with GIMBAL_TRADER_FRESH=1.';
+  + 'reconciling both legs on the venues, stop the engine and start it once with GIMBAL_TRADER_FRESH=<contract>/<desk>.';
 
 /** Whose state it is: the file is refused for any other contract, desk or desk EVM address. */
 export interface TraderIdentity {
@@ -43,7 +48,11 @@ export interface TraderIdentity {
   evm: string;
 }
 
-/** An order the trader was sending when it last saved: it may have gone out with no answer recorded. */
+/**
+ * An order sent since the trader last recorded a result: its outcome may be known only in memory. `op`: sent while a
+ * protection's close ran (`close`: that close's result records it) or by one of the trader's watch checks (`watch`:
+ * the check's report records it).
+ */
 export interface InFlightOrder {
   index: 0 | 1;
   venue: VenueId;
@@ -52,6 +61,7 @@ export interface InFlightOrder {
   reduceOnly: boolean;
   reason: string;
   at: number;
+  op: 'close' | 'watch';
 }
 
 export interface TraderFileState {
@@ -61,7 +71,8 @@ export interface TraderFileState {
   symbol: string | null;
   trader: PairTraderState | null;
   pendingMaker: PendingMakerOrder[];
-  inFlight: InFlightOrder | null;
+  /** Orders whose outcome no saved result holds yet; empty: none. */
+  inFlight: InFlightOrder[];
   adl: AdlState;
 }
 
@@ -136,7 +147,7 @@ export function traderStateJson(s: TraderFileState): Record<string, unknown> {
       })),
     },
     pendingMaker: s.pendingMaker.map((p) => ({ cloid: p.cloid, oid: p.oid, side: p.side, size: p.size })),
-    inFlight: s.inFlight,
+    inFlight: s.inFlight.map((f) => ({ ...f })),
     adl: { attemptsLeft: s.adl.attemptsLeft, paused: s.adl.paused, event: s.adl.event === null ? null : eventJson(s.adl.event) },
   };
 }
@@ -146,6 +157,7 @@ export function traderStateJson(s: TraderFileState): Record<string, unknown> {
 const VENUES: readonly VenueId[] = ['hyperliquid', 'phoenix', 'orderly'];
 const SIDES: readonly LegSide[] = ['BUY', 'SELL'];
 const CHAINS: readonly TxRef['chain'][] = ['near', 'hyperliquid', 'solana', 'arbitrum'];
+const OPS: readonly InFlightOrder['op'][] = ['close', 'watch'];
 
 function bad(path: string, what: string): never {
   throw new Error(`${path}: ${what}`);
@@ -169,6 +181,12 @@ function time(v: unknown, path: string): number {
 function bool(v: unknown, path: string): boolean {
   if (typeof v !== 'boolean') bad(path, 'not a boolean');
   return v;
+}
+/** A size as qtyString writes it: a positive decimal with at most 8 decimals and no trailing zero. */
+function size(v: unknown, path: string): string {
+  const s = str(v, path);
+  if (!/^(0|[1-9]\d{0,29})(\.\d{0,7}[1-9])?$/.test(s) || s === '0') bad(path, 'not a size (a positive decimal quantity as a save writes it)');
+  return s;
 }
 function int(v: unknown, path: string): bigint {
   const s = str(v, path);
@@ -200,7 +218,7 @@ function parseTx(v: unknown, path: string): TxRef {
 function parseRef(v: unknown, path: string): LegRef {
   const r = obj(v, path);
   const ref: LegRef = {
-    venue: oneOf(r.venue, `${path}.venue`, VENUES), side: oneOf(r.side, `${path}.side`, SIDES), size: str(r.size, `${path}.size`),
+    venue: oneOf(r.venue, `${path}.venue`, VENUES), side: oneOf(r.side, `${path}.side`, SIDES), size: size(r.size, `${path}.size`),
     reduceOnly: bool(r.reduceOnly, `${path}.reduceOnly`), orderId: nullable(r.orderId, `${path}.orderId`, str), clientId: nullable(r.clientId, `${path}.clientId`, str),
     tx: list(r.tx, `${path}.tx`).map((t, i) => parseTx(t, `${path}.tx[${i}]`)), sentAt: time(r.sentAt, `${path}.sentAt`),
   };
@@ -259,13 +277,14 @@ export function parseTraderState(v: unknown): LoadedTraderFile {
       const p = obj(x, `state.pendingMaker[${i}]`);
       const oid = p.oid;
       if (oid !== null && (typeof oid !== 'number' || !Number.isSafeInteger(oid) || oid < 0)) bad(`state.pendingMaker[${i}].oid`, 'not an oid or null');
-      return { cloid: str(p.cloid, `state.pendingMaker[${i}].cloid`), oid: oid as number | null, side: oneOf(p.side, `state.pendingMaker[${i}].side`, SIDES), size: str(p.size, `state.pendingMaker[${i}].size`) };
+      return { cloid: str(p.cloid, `state.pendingMaker[${i}].cloid`), oid: oid as number | null, side: oneOf(p.side, `state.pendingMaker[${i}].side`, SIDES), size: size(p.size, `state.pendingMaker[${i}].size`) };
     }),
-    inFlight: nullable(s.inFlight, 'state.inFlight', (x, p) => {
+    inFlight: list(s.inFlight, 'state.inFlight').map((x, i) => {
+      const p = `state.inFlight[${i}]`;
       const f = obj(x, p);
       return {
-        index: index(f.index, `${p}.index`), venue: oneOf(f.venue, `${p}.venue`, VENUES), side: oneOf(f.side, `${p}.side`, SIDES), size: str(f.size, `${p}.size`),
-        reduceOnly: bool(f.reduceOnly, `${p}.reduceOnly`), reason: str(f.reason, `${p}.reason`), at: time(f.at, `${p}.at`),
+        index: index(f.index, `${p}.index`), venue: oneOf(f.venue, `${p}.venue`, VENUES), side: oneOf(f.side, `${p}.side`, SIDES), size: size(f.size, `${p}.size`),
+        reduceOnly: bool(f.reduceOnly, `${p}.reduceOnly`), reason: str(f.reason, `${p}.reason`), at: time(f.at, `${p}.at`), op: oneOf(f.op, `${p}.op`, OPS),
       };
     }),
     adl: { attemptsLeft: left, paused: nullable(adl.paused, 'state.adl.paused', str), event: nullable(adl.event, 'state.adl.event', parseEvent) },
@@ -345,6 +364,7 @@ export class TraderStateStore {
       for (let attempt = 1; ; attempt++) {
         try {
           this.#rename(tmp, this.path);
+          syncDir(dirname(this.path));
           return;
         } catch (err) {
           if (attempt >= this.#tries || !RETRIED_RENAME.has((err as NodeJS.ErrnoException).code ?? '')) throw err;
@@ -361,7 +381,11 @@ export class TraderStateStore {
     }
   }
 
-  /** Temporary files a crash left next to the state file (only one trader runs per desk: the lock). */
+  /**
+   * Temporary files a crash left next to the state file: this process's own, and those of a pid that no longer runs.
+   * Readers load too (monitor, an alert-only serve), and none may remove a live trader's file between its fsync and
+   * its rename.
+   */
   #cleanTemps(): void {
     let names: string[];
     try {
@@ -371,7 +395,10 @@ export class TraderStateStore {
     }
     const base = basename(this.path);
     for (const n of names) {
-      if (!n.startsWith(`${base}.`) || !n.endsWith('.tmp')) continue;
+      const m = n.startsWith(`${base}.`) ? /^\.(\d+)\.tmp$/.exec(n.slice(base.length)) : null;
+      if (m === null) continue;
+      const pid = Number(m[1]);
+      if (pid !== process.pid && alive(pid)) continue;
       try {
         unlinkSync(join(dirname(this.path), n));
       } catch {
@@ -393,16 +420,35 @@ function alive(pid: number): boolean {
   }
 }
 
-/** The pid of a running process that holds the lock at `path`, or null (no lock, or a stale one). */
-export function lockHolder(path: string): number | null {
+/**
+ * Who holds the lock at `path`: a running process's pid; 'unknown' for a file with no pid in it (its holder is between
+ * creating and writing it, or crashed there: held until removed by hand) or one that cannot be read; null when there
+ * is no lock or its process is gone.
+ */
+export function lockHolder(path: string): number | 'unknown' | null {
   let text: string;
   try {
     text = readFileSync(path, 'utf8').trim();
-  } catch {
-    return null;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ENOENT' ? null : 'unknown';
   }
-  const pid = /^\d+$/.test(text) ? Number(text) : null;
-  return pid !== null && alive(pid) ? pid : null;
+  if (!/^\d+$/.test(text)) return 'unknown';
+  const pid = Number(text);
+  return alive(pid) ? pid : null;
+}
+
+/** The directory entry of a renamed file reaches the disk too (POSIX; Windows cannot open a directory for that). */
+function syncDir(dir: string): void {
+  if (process.platform === 'win32') return;
+  let fd: number | null = null;
+  try {
+    fd = openSync(dir, 'r');
+    fsyncSync(fd);
+  } catch {
+    // Some file systems refuse fsync on a directory; the rename itself is done.
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
 }
 
 export interface TraderLock {
@@ -426,7 +472,7 @@ export function acquireTraderLock(path: string, options: { onExit?: boolean } = 
         continue;      // removed meanwhile: try again
       }
       const pid = /^\d+$/.test(text) ? Number(text) : null;
-      if (pid === null) throw new Error(`the trader lock ${path} holds no pid (${JSON.stringify(text.slice(0, 40))}); if no engine runs for this desk, remove it`);
+      if (pid === null) throw new Error(`the trader lock ${path} holds no pid (${JSON.stringify(text.slice(0, 40))}): another process may be taking it now, so it counts as held; if no serve or pair-mainnet runs for this desk, remove it`);
       if (pid === process.pid || alive(pid)) throw new Error(`another process (pid ${pid}) trades this desk and holds ${path}: one trader per desk; stop it first`);
       try {
         unlinkSync(path);       // stale: its process is gone

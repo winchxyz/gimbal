@@ -20,6 +20,8 @@ export interface ClosingWatchOptions {
   cancelResting?: () => Promise<{ cancelled: number; tx: TxRef[]; notes: string[] }>;
   /** The pair trader holding both legs; null: none here (nothing is traded, the owner is told). */
   reducer: () => Reducer | null;
+  /** Why no reducer trades here (serve: "alert only: ..."), for the journal line; default none given. */
+  notTrading?: () => string | null;
   log?: (line: string) => void;
   retryMs?: number;
 }
@@ -80,12 +82,18 @@ export class ClosingWatch {
       if (current()) this.#done = true;
     };
     this.#announced = gen;
-    if (first) this.#journal('exit', 'panic_close read from get_desk: cancelling resting orders, then closing both legs reduce-only; no rescue or open starts', {});
     const reducer = this.#o.reducer();
     if (reducer === null) {
       done();
-      this.#journal('error', 'panic_close: no pair trader holds the legs here, so nothing was cancelled or closed; close them from the venues', {});
+      const why = this.#o.notTrading?.() ?? null;
+      if (first) this.#journal('exit', 'panic_close read from get_desk: no rescue or open starts', {});
+      this.#journal('error', why === null
+        ? 'panic_close: no pair trader holds the legs here, so nothing was cancelled or closed; close them from the venues'
+        : `panic_close: this engine is ${why}: nothing was cancelled or closed; cancel the resting orders and close both legs by hand (stop serve, then pair-mainnet close --send)`, {});
       return;
+    }
+    if (first) {
+      this.#journal('exit', `panic_close read from get_desk: ${this.#o.cancelResting === undefined ? 'closing both legs reduce-only (no resting-order cancel here)' : 'cancelling resting orders, then closing both legs reduce-only'}; no rescue or open starts`, {});
     }
     if (this.#o.cancelResting !== undefined) {
       try {

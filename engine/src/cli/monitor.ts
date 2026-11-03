@@ -15,7 +15,7 @@ import { NearContractClient } from '../contract/near-client.ts';
 import { NearViewTransport } from '../contract/near-transport.ts';
 import { DEFAULT_STRATEGY } from '../scanner/config.ts';
 import { RiskEngine } from '../risk/engine.ts';
-import { ALERT_DISTANCE_PCT, LiquidationAlert, legsUnder, monitorLines } from '../risk/monitor.ts';
+import { ALERT_DISTANCE_PCT, LiquidationAlert, isHedged, legsUnder, monitorLines } from '../risk/monitor.ts';
 import { AccountsDeskSource } from '../risk/sources.ts';
 import { VenueHealth } from '../risk/venue-health.ts';
 import { TraderStateStore, traderStateFile, userStateDir } from '../trade/trader-state.ts';
@@ -93,10 +93,11 @@ async function main(): Promise<number> {
       + `${s.adl.event === null ? '' : `, an ADL event since ${new Date(s.adl.event.at).toISOString()} (${s.adl.event.attempts} attempt(s))`}; saved ${new Date(s.savedAt).toISOString()}`);
     for (const u of s.trader?.unsettled ?? []) say(`open:     ${u.refs.map((r) => `${r.venue} ${r.side} ${r.size} (${r.clientId ?? r.orderId ?? 'no id'})`).join(' and ')} has no answer and may still run until ${new Date(u.until).toISOString()}`);
     for (const p of s.pendingMaker) say(`open:     hyperliquid post-only ${p.side} ${p.size} (oid ${p.oid ?? 'unknown'}, cloid ${p.cloid}) may still rest`);
+    for (const f of s.inFlight) say(`open:     ${f.venue} ${f.side} ${f.size}${f.reduceOnly ? ' reduce-only' : ''} (${f.reason}) was sent at ${new Date(f.at).toISOString()} and no saved result holds its outcome`);
     if (s.trader?.unhedged != null) say(`open:     ${s.trader.unhedged}`);
   }
   const under = legsUnder(d);
-  const off = d.legs.length > 0 && d.netDelta !== 0;
+  const off = d.legs.length > 0 && !isHedged(d);
   say(under.length === 0 && !off
     ? `ok        ${d.legs.length === 0 ? 'no open legs' : `every leg is ${ALERT_DISTANCE_PCT} % or more from liquidation, and the legs offset each other`}`
     : `ALERT     ${[...under.map((l) => `${l.venue} ${l.symbol} under ${ALERT_DISTANCE_PCT} % from liquidation`), ...(off ? [`net delta ${d.netDelta}: the legs do not offset`] : [])].join('; ')}`);
