@@ -6,7 +6,8 @@
 // The owner signs withdraw_to_owner(desk_id, amount) with 1 yoctoNEAR and 300 TGas (the contract refuses under
 // 150). The contract sends the owner's share first and the performance fee to the treasury once that landed
 // (contract/src/money.rs). The dry run prints the fee the ledger gives (contract/core/src/fees.rs, ported) before
-// anything is sent; --send prints the payout and fee_charged events after.
+// anything is sent; --send prints the events after: payout, and fee_charged only when a fee above 0 reached the
+// treasury (a payout with no fee logs payout alone).
 //
 // Default: a dry run that reads mainnet and signs nothing. --send reads the owner's key file, only then, checks it is
 // a full-access key of the desk's owner and refuses in a linked git worktree. It ends with one block to paste back.
@@ -113,7 +114,9 @@ export async function runWithdraw(argv, deps = {}) {
   say(describeTx(`tx: withdraw ${usdcText(amount)} USDC to the owner`, { signer: owner, signedBy, receiver: a.contract, actions }).join('\n'));
   say(`  gas       at most ${tgasText(cap.total)} TGas, ${nearTextUp(cap.total * gasPrice, 4)} NEAR (the contract needs at least ${MIN_TGAS.withdraw_to_owner}); the unused part is refunded`);
   say(`  then      USDC ft_transfer of ${usdcText(p.toOwner)} to ${owner}${p.fee > 0n ? `, then of ${usdcText(p.fee)} to ${treasury}` : ' (no fee: no profit over the high-water mark)'}; `
-    + 'events payout and fee_charged once settled');
+    + (p.fee > 0n
+      ? 'events payout and fee_charged once the fee transfer landed (payout alone, with the fee back in idle_usdc, if it failed)'
+      : 'event payout once settled (no fee_charged: the contract logs it only for a fee above 0 that reached the treasury)'));
 
   const at = () => new Date(now()).toISOString();
   if (!a.send) {

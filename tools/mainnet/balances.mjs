@@ -255,6 +255,18 @@ export async function arbitrumBalances(fetchImpl, url, address) {
   return { wei: r.wei, usdcE6: r.tokens.usdc, usdceE6: r.tokens.usdce };
 }
 
+/** Arbitrum's gas price now (eth_gasPrice, wei per gas). The RPC must be chain 42161. */
+export async function arbitrumGasPrice(fetchImpl, url) {
+  const rpc = async (method) => {
+    const r = await postJson(fetchImpl, url, { jsonrpc: '2.0', id: 1, method, params: [] }, `chain 42161 ${method}`);
+    if (r.error || typeof r.result !== 'string' || !/^0x[0-9a-fA-F]+$/.test(r.result)) throw new Error(`chain 42161 ${method}: ${JSON.stringify(r.error ?? r).slice(0, 200)}`);
+    return BigInt(r.result);
+  };
+  const chain = await rpc('eth_chainId');
+  if (chain !== 42161n) throw new Error(`the RPC serves chain ${chain}, not 42161`);
+  return rpc('eth_gasPrice');
+}
+
 /** HyperEVM: the address's HYPE (wei) and USDC (x 1e6). The RPC must be chain 999. */
 export async function hyperEvmBalances(fetchImpl, url, address) {
   const r = await evmBalances(fetchImpl, url, { chainId: 999, address, tokens: { usdc: HYPEREVM_USDC } });

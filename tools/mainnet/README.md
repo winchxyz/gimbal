@@ -47,9 +47,12 @@ script refuses an account that exists and proposes the next free name.
 
 Money paths that are **not available yet**:
 
-- **Hyperliquid -> NEAR.** 1Click answers "Quoting for this pair is not available" for every quote out of
-  HyperCore (section 7, quotes step), so USDC funded to Hyperliquid cannot come back to the contract through
-  1Click for now. These tools do not build that return. Fund Hyperliquid only with what may stay there.
+- **Hyperliquid -> NEAR in one hop.** 1Click answers "Quoting for this pair is not available" for every quote out
+  of HyperCore (section 7, quotes step), so `hl_send_to_intents` cannot bring USDC back. The return goes through
+  Arbitrum instead, in two stages (section 8, step 9, `hl-return.mjs`): `hl_withdraw` (owner) to the desk's own
+  EVM address on Arbitrum, then `evm_usdc_to_intents` (operator) and 1Click from Arbitrum USDC to the contract.
+  It costs Hyperliquid's 1 USDC withdrawal fee, the 1Click cost and the relayer's Arbitrum gas, so the fixed
+  1 USDC weighs on small amounts.
 - **Orderly.** `fund.mjs orderly` needs the receiver pinned with `set_orderly_receiver` (an owner call these tools
   do not make) and at least 6 USDC out.
 
@@ -367,7 +370,7 @@ node tools/mainnet/relayer-wallet.mjs --check
   for the Orderly money path (it submits the EIP-3009 transfers the contract signed) and never holds desk money.
 - `--check` confirms that the RPC answers chain 42161 and prints the wallet's ETH balance.
 
-Venue setup (step 6) does not use this wallet.
+Venue setup (step 6) does not use this wallet; the bridge stage of `hl-return.mjs` (section 8, step 9) does.
 
 - **Cost:** the ETH you send (a few dollars).
 - **Check after:** `--check` shows the balance, and arbiscan.io/address/`<address>` shows the transfer.
@@ -597,11 +600,56 @@ about 6.3), 0.7 free on the owner for the desk, and 0.3 NEAR free on the owner p
    The dry run prints `withdraw_to_owner({"desk_id":"canary","amount":"5000000"})` with 1 yoctoNEAR and 300 TGas
    (the contract refuses under 150) and the expected split before anything is sent: with no profit yet the fee is
    0 and all 5 USDC go to the owner. It refuses an amount over `idle_usdc` (USDC on a venue must come back first)
-   and an owner not registered on USDC. `--send` prints the `payout` and `fee_charged` events and the ledger
-   after. `all` withdraws the whole `idle_usdc`.
+   and an owner not registered on USDC. `--send` prints the events and the ledger after: `payout`, and
+   `fee_charged` only when a fee above 0 reached the treasury (a payout with no fee logs `payout` alone). `all`
+   withdraws the whole `idle_usdc`.
 
-USDC on Hyperliquid stays there for now: the HyperCore -> NEAR route is not available through 1Click ("What this
-contract version can do"), and these tools do not build it.
+9. **Return from Hyperliquid** to the desk on NEAR, through Arbitrum (1Click quotes nothing out of HyperCore,
+   "What this contract version can do"). Two stages, each with its dry run first:
+
+   ```
+   node tools/mainnet/hl-return.mjs gimbal-canary2.near canary withdraw all
+   node tools/mainnet/hl-return.mjs gimbal-canary2.near canary withdraw all --key-file <owner key json> --send
+   node tools/mainnet/hl-return.mjs gimbal-canary2.near canary bridge all
+   node tools/mainnet/hl-return.mjs gimbal-canary2.near canary bridge all --send
+   ```
+
+   - **withdraw** (owner): reads the desk's Hyperliquid perps `withdrawable` and its Arbitrum USDC, and prints
+     `hl_withdraw({"desk_id":"canary","amount":"11.682396"})` (the amount as a decimal string with at most 6
+     decimals, as `hl_usd_class_transfer` takes it) with 1 yoctoNEAR and 300 TGas (an action method needs 85). It
+     refuses an amount over the withdrawable or not above Hyperliquid's 1 USDC fee; `all` is the withdrawable.
+     `--send` needs the owner's full-access key: the contract signs a Hyperliquid `withdraw3` to the desk's own
+     EVM address, the script posts it to `/exchange` (the engine's Hyperliquid submitter), confirms the
+     `withdraw` in Hyperliquid's non-funding ledger, then polls the desk EVM's Arbitrum USDC until it is up by
+     amount - 1 (`--timeout-s`, default 900; Hyperliquid's bridge usually takes a few minutes): `arrived: yes` or
+     `not yet`. Dry run on 2026-11-03: 11.682396 withdrawable, 10.682396 expected on Arbitrum.
+   - **bridge** (the operator key, default `.keys/operator-<contract>.json`, and the relayer wallet of section 5):
+     reads the desk EVM's Arbitrum USDC (`all` = the whole balance), asks a dry 1Click quote Arbitrum USDC ->
+     USDC on NEAR, `recipient` the contract with `customRecipientMsg` `{"desk_id":"canary"}`, `refundTo` the desk
+     EVM address, 100 bps (`--slippage-bps`), and checks it with the contract's rules (signature, fields, the
+     policy's cost bound, the hourly rescue cap and cost budget: 20 USD and 2 USD an hour on the canary, so more
+     than 20 USDC goes in parts an hour apart). It checks that the relayer wallet exists and holds ETH for one
+     transfer. The dry run shows the quote even when the USDC is not on Arbitrum yet, then lists what `--send`
+     would refuse. `--send` refuses a short balance or a missing or empty relayer before it asks a live quote,
+     checks the live quote the same way and against what was asked, sends `evm_usdc_to_intents` (an EIP-3009
+     authorization from the desk EVM to the deposit address, valid 300 s), has the relayer submit it on Arbitrum
+     (the engine's Arbitrum submitter; the relayer pays the gas), posts the deposit to 1Click and polls its status
+     and the desk's ledger. `landed: yes` means 1Click SUCCESS **and** `idle_usdc` up by at least
+     `minAmountOut`; it also prints the contract's `deposit` event. 1Click delivers from its own account, not the
+     owner's, so the credit is `idle_usdc` only (`principal: false`, `deposited` unchanged): at a payout it counts
+     toward profit only once the owner's withdrawals pass what they deposited. A refund goes to the desk EVM
+     address on Arbitrum: bridge again. Dry run on 2026-11-03 for 10.6 USDC: `amountOut` 10.598642,
+     `minAmountOut` 10.492655, may cost 0.107 of the 1 USD allowed, 25 s.
+   - **Cost:** the 1 USDC Hyperliquid fee, the 1Click cost (at most `amountIn` - `minAmountOut`; about 0.01 %
+     expected on 2026-11-03), and the relayer's Arbitrum gas for one transfer (a fraction of a cent). Then step 8
+     pays the `idle_usdc` out to the owner.
+   - **Rerun midway:** each stage reads the chain again first. After a withdraw, Hyperliquid's withdrawable is
+     already down, so a second `withdraw all` refuses (at most the 1 USDC fee left); both stages list Hyperliquid
+     withdrawals of the last 24 h and mark those under 30 min old as possibly in flight. The bridge moves only
+     USDC that is on Arbitrum: with some still in flight, `all` takes what arrived, and a typed amount over the
+     balance refuses at `--send`. If the relayer's outcome is unknown, the block names the authorization and its
+     expiry: do not bridge again before then (it may still execute); afterwards the balance tells. The contract's
+     deposit ring refuses a deposit address paid before, and USDC refuses an authorization used before.
 
 ## Files the scripts write
 
