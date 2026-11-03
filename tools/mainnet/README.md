@@ -66,7 +66,8 @@ node tools/mainnet/retire.mjs <contract>.near --beneficiary <funder>.near --crea
 ```
 
 Retiring sends one **DeleteAccount** for `<contract>.near`, signed with `.keys/<contract>.near.json`. Its whole
-NEAR balance, the NEAR held for the code's storage included, goes to the beneficiary.
+NEAR balance, the NEAR held for the code's storage included, goes to the beneficiary. A **locked** contract (the
+final deploy, section 8, "Final deploy") has no key left and can never be retired; a canary is never locked.
 
 **Why the checks.** After the deletion anyone can register `<contract>.near` again. Every desk address is an MPC
 key derived from the contract's name (`gimbal/<desk_id>/evm`, `gimbal/<desk_id>/sol` with the contract as
@@ -227,6 +228,8 @@ Read the dry run:
   - the treasury: the NEAR account, the HL builder lowercased, the referral codes from `.env`;
   - fees: 1000 bps performance, 10 tenth-bps builder fee;
   - Orderly: the broker from `.env` on chain 42161.
+- **tx 3**, printed as its own later run: the **DeleteKey** that locks the account (final deploy only, section 8,
+  "Final deploy"). `--send` never sends it.
 
 Every value given to `new()` is permanent, so check each one now. The `env` lines show the broker id and
 the referral codes in full and say where each came from; a `warning` line means the shell environment set it
@@ -257,7 +260,8 @@ node tools/mainnet/deploy.mjs <same arguments> --send
 ```
 
 This sends tx 1, waits for final, sends tx 2, waits for final, then prints both hashes (nearblocks links) and
-`config()`, which it compares with the init args. The new full-access key is written to
+`config()`, which it compares with the init args, and the lock command for the final deploy. The new full-access
+key is written to
 `.keys/<contract>.near.json` (the script prints its absolute path). It is the contract account's only key.
 **Back it up right after tx 1** (the script says `back up ... now` at that point), before anything else
 happens. Without it nothing can sign for the account: no retry of tx 2, and no DeleteAccount to get the NEAR
@@ -697,6 +701,77 @@ about 6.3), 0.7 free on the owner for the desk, and 0.3 NEAR free on the owner p
      late authorization is valid until block time + 300 s: do not rerun before then. The contract's deposit ring
      refuses a deposit address paid before, and USDC refuses an authorization used before.
 
+### Final deploy: deploy, check, lock
+
+The final reviewed deploy ends with **no access key on the contract account**, so nobody, us included, can deploy
+new code to it, sign for it, retire it or move its NEAR. The canaries stay unlocked (they get retired). Lock before
+any USDC goes in, and only after the checks below. Run every command from the main checkout, the dry run first:
+
+1. **Policy and wasm:** `node tools/mainnet/policy.mjs` ends `matches live data`; build the reviewed code
+   (`cd contract && cargo near build non-reproducible-wasm --no-abi`) and keep its sha256 from the dry run.
+2. **Deploy** (section 2) to a fresh `<contract>.near`:
+
+   ```
+   node tools/mainnet/deploy.mjs <contract>.near --funder <funder>.near --key-file <funder key json> \
+        --treasury-near <treasury> --hl-builder 0x<40 hex>
+   node tools/mainnet/deploy.mjs <same arguments> --send
+   ```
+
+   The dry run prints tx 1, tx 2 and tx 3 (the DeleteKey) as its own later run; `--send` sends tx 1 and tx 2
+   only, and ends with the lock command.
+3. **Check the deployed contract** before locking it: `view.mjs <contract>.near config` and `version`,
+   `view.mjs --keys <contract>.near` (exactly one FullAccess key, the one the deploy printed), and both
+   transactions on nearblocks.io/address/`<contract>.near`. After the lock nothing can be fixed: a wrong treasury,
+   referral code or broker stays for good.
+4. **Lock** (tx 3):
+
+   ```
+   node tools/mainnet/deploy.mjs <contract>.near --lock --treasury-near <treasury> --hl-builder 0x<40 hex>
+   node tools/mainnet/deploy.mjs <contract>.near --lock --treasury-near <treasury> --hl-builder 0x<40 hex> --send
+   ```
+
+   `--lock` is its own run on an account deployed earlier: it takes no `--funder`, `--key-file`, `--balance` or
+   `--resume`, so it also works as the resume after a deploy whose last step was interrupted. `--treasury-near`
+   and `--hl-builder` are optional; without them `config()`'s treasury and builder are taken as they are, with a
+   warning. It reads `.env` for the broker and the referral codes, like the deploy. Before signing it checks on
+   chain, and the dry run prints each check:
+   - `code_hash` (`view_account`) equals the base58 sha256 of `contract/target/near/gimbal.wasm`;
+   - `config()` is exactly what `new()` was given on mainnet: Mainnet, `v1.signer`, OutLayer `price-oracle.near`,
+     fees 1000 / 10, Orderly `gimbal_dex` on 42161, the referral codes from `.env`, and the treasury and builder
+     when given (every differing field is printed);
+   - `view_access_key_list` is exactly one key, the FullAccess key in `.keys/<contract>.near.json`. Any other key
+     is printed and refused: whoever holds it could still deploy code after the lock.
+
+   It refuses when any check fails, when the account does not exist or has no code, and on any chain but mainnet
+   (testnet only with `--allow-testnet-lock`; these scripts refuse testnet ids and RPCs anyway, and testnet
+   deploys stay upgradeable). `--send` sends one DeleteKey of that key, signed by that key itself, waits for
+   final, then reads `view_access_key_list` (it must be empty) and `code_hash` (unchanged). An account with no
+   keys already prints `nothing to send`.
+
+   - **Cost:** the DeleteKey's action fees, at most about 0.5 TGas (under 0.0001 NEAR) from the contract's balance.
+   - **After:** `.keys/<contract>.near.json` is on no account any more and can sign nothing: you can delete it.
+     The contract's NEAR stays where it is for good (anyone can still send it NEAR).
+
+5. **Evidence:** `--send` ends with a block to paste back:
+
+   ```
+   === gimbal lock <time> ===
+   contract:  <contract>.near https://nearblocks.io/address/<contract>.near
+   DeleteKey: tx <hash> https://nearblocks.io/txns/<hash>
+   code_hash: <base58> (base58 of sha256 <hex>, contract/target/near/gimbal.wasm, <bytes> bytes)
+   keys:      view_access_key_list is empty
+   README:
+   Contract has no access keys: DeleteKey tx <hash> (https://nearblocks.io/txns/<hash>), code_hash <base58>.
+   === end ===
+   ```
+
+   The last line goes into the project README (the mainnet evidence and security sections). Anyone can check it:
+   `view.mjs --keys <contract>.near` lists no key, nearblocks shows the DeleteKey, and `view_account`'s
+   `code_hash` is the sha256 of the reviewed wasm.
+
+Then the desk and the money steps (steps 4 to 9 above) run as for the canary: none of them needs the contract
+account's key.
+
 ## Access keys
 
 `node tools/mainnet/keys.mjs list <owner>.near` prints every access key of an account with its permission: FullAccess,
@@ -714,7 +789,7 @@ overwritten, and each is printed with its absolute path when written:
 
 | file | written by | content |
 |---|---|---|
-| `.keys/<contract>.near.json` | deploy `--send` | the contract account's only full-access key: back it up right after tx 1 |
+| `.keys/<contract>.near.json` | deploy `--send` | the contract account's only full-access key: back it up right after tx 1; after `--lock --send` it is on no account and can be deleted |
 | `.keys/operator-<contract>.near.json` | desk `--send` | the engine's FunctionCall key on the owner's account |
 | `.keys/engine-mainnet-<contract>.near.env` | desk `--send` | the engine settings below |
 | `.env` `RELAYER_EVM_PRIVATE_KEY` | relayer-wallet `--write` | the Arbitrum gas wallet's key, only into an empty entry |

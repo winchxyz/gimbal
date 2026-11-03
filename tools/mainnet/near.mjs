@@ -1,6 +1,6 @@
 // A NEAR mainnet client for the canary runbook (tools/mainnet/README.md): JSON-RPC, borsh transactions
-// (FunctionCall, DeployContract, AddKey with a FunctionCall permission, DeleteKey for keys.mjs, DeleteAccount for
-// retire.mjs), key files that are never printed, and a printer for planned transactions. No dependencies: node:crypto signs, the rest is written out here or shared.
+// (FunctionCall, DeployContract, AddKey with a FunctionCall permission, DeleteKey for keys.mjs and
+// deploy.mjs --lock, DeleteAccount for retire.mjs), key files that are never printed, and a printer for planned transactions. No dependencies: node:crypto signs, the rest is written out here or shared.
 //
 // This is a separate module from tools/testnet/near.mjs on purpose: that one refuses mainnet, this one refuses
 // testnet, and neither has a network switch, so the testnet guards stay exactly as they are. Only pure helpers
@@ -331,7 +331,7 @@ export function feesOf(protocolConfig) {
   for (const [name, f] of Object.entries(fees)) {
     if (!isFee(f)) throw new Error(`EXPERIMENTAL_protocol_config: no ${name} fee`);
   }
-  // Only retire.mjs and keys.mjs need them; txGasCap refuses a DeleteAccount or a DeleteKey without its fee.
+  // Only retire.mjs, keys.mjs and deploy.mjs --lock need them; txGasCap refuses a DeleteAccount or a DeleteKey without its fee.
   if (isFee(a?.delete_account_cost)) fees.deleteAccount = a.delete_account_cost;
   if (isFee(a?.delete_key_cost)) fees.deleteKey = a.delete_key_cost;
   return fees;
@@ -431,7 +431,8 @@ export const act = {
   },
   /** Deletes the signer's own account; its whole balance goes to `beneficiaryId`. Only retire.mjs plans it. */
   deleteAccount: (beneficiaryId) => ({ type: 'DeleteAccount', beneficiaryId: mainnetId(beneficiaryId, 'beneficiary') }),
-  /** Deletes one access key of the signer's account. Only keys.mjs plans it, and never for a full-access key. */
+  /** Deletes one access key of the signer's account. keys.mjs plans it for a function-call key only;
+   * deploy.mjs --lock for the contract account's last full-access key (the lock). */
   deleteKey: (publicKey) => {
     publicKeyBytes(publicKey);
     return { type: 'DeleteKey', publicKey };
