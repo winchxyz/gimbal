@@ -30,9 +30,9 @@ function methodsInTable() {
 
 test('the operator key may call exactly the methods marked in the Operator column of interfaces §1.3', () => {
   const fromTable = methodsInTable();
-  assert.equal(fromTable.length, 19);
+  assert.equal(fromTable.length, 21);
   assert.deepEqual(OPERATOR_METHODS, fromTable, 'the same methods, in the table\'s order');
-  for (const owner of ['create_desk', 'set_policy', 'set_operator', 'withdraw_to_owner', 'hl_withdraw', 'panic_close', 'set_orderly_receiver', 'set_orderly_ips', 'set_mock_price']) {
+  for (const owner of ['create_desk', 'set_policy', 'set_operator', 'withdraw_to_owner', 'set_orderly_receiver', 'set_orderly_ips', 'set_mock_price']) {
     assert.equal(OPERATOR_METHODS.includes(owner), false, `${owner} is the owner's alone`);
   }
 });

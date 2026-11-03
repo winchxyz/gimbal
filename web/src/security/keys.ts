@@ -81,8 +81,6 @@ export const OWNER_ONLY: readonly OwnerMethod[] = [
   { method: 'clear_payout_lock', what: 'free a payout that has been stuck for over an hour' },
   { method: 'set_policy', what: 'change the policy' },
   { method: 'set_operator', what: 'replace the operator' },
-  { method: 'panic_close', what: 'pause the desk at once and have both legs closed' },
-  { method: 'hl_withdraw', what: 'withdraw from Hyperliquid in an emergency, to the desk’s own address' },
   { method: 'set_orderly_receiver', what: 'pin the Orderly deposit address' },
   { method: 'set_orderly_ips', what: 'set where the Orderly key may be used from' },
   { method: 'create_desk', what: 'create a desk' },

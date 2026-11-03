@@ -288,7 +288,7 @@ The dry run also works before the contract exists, and without `--key-file`. It 
   addresses come from `v1.signer.derived_public_key` for `gimbal/<desk_id>/evm` and `gimbal/<desk_id>/sol`, with
   the contract as predecessor, exactly as the testnet script derives them.
 - **tx 2** (signed by the owner): AddKey on the owner's account. This is a new **FunctionCall** key for the
-  engine, with receiver `<contract>.near`, allowance `--allowance` NEAR, and only the 19 operator methods
+  engine, with receiver `<contract>.near`, allowance `--allowance` NEAR, and only the 21 operator methods
   (docs/interfaces.md §1.3, plus `set_paused`, which the engine may only use to pause). It is never a full-access
   key.
 - The engine env file `.keys/engine-mainnet-<contract>.near.env` (names below; no value is printed).
@@ -335,7 +335,7 @@ already done (an existing desk, or an operator key already on chain), and when e
   - The same dry-run command now prints `nothing to send`.
   - `view.mjs <contract>.near get_desk '{"desk_id":"<desk_id>"}'` shows the policy and the addresses above.
   - `view.mjs --keys <owner>.near` lists the new FunctionCall key: receiver `<contract>.near`, the allowance and
-    19 methods.
+    21 methods.
   - `.keys/operator-<contract>.near.json` and `.keys/engine-mainnet-<contract>.near.env` exist.
 
 ## 4. Funding
