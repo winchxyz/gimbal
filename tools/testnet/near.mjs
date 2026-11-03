@@ -9,7 +9,8 @@ import { fileURLToPath } from 'node:url';
 
 export const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const KEYS = join(ROOT, '.keys');
-export const RPC_URLS = [process.env.NEAR_RPC_URL, 'https://rpc.testnet.near.org', 'https://test.rpc.fastnear.com'].filter(Boolean);
+/** NEAR_RPC_URL, then FastNEAR (as the engine uses), then the deprecated, rate-limited near.org endpoint as a fallback. */
+export const RPC_URLS = [process.env.NEAR_RPC_URL, 'https://test.rpc.fastnear.com', 'https://rpc.testnet.near.org'].filter(Boolean);
 export const TGAS = 10n ** 12n;
 export const YOCTO_PER_NEAR = 10n ** 24n;
 
@@ -234,18 +235,31 @@ export function newKey(accountId) {
 
 // --- JSON-RPC ---
 
-export async function rpc(method, params) {
+/**
+ * One JSON-RPC call, over the endpoints in turn. A network error or a rate limit is asked again, except with
+ * `{ once: true }` (send_tx): there a request that may have reached the node (no answer, an unreadable answer) throws
+ * with `unknown` set instead, because the caller must look the transaction up rather than guess. A rate limit (429)
+ * was not taken, so it is still asked again.
+ */
+export async function rpc(method, params, { once = false } = {}) {
   let last;
   for (let attempt = 0; attempt < 6; attempt++) {
     const url = RPC_URLS[attempt % RPC_URLS.length];
+    let asked = false;
     try {
       await assertTestnet(url);
+      asked = true;
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ jsonrpc: '2.0', id: 'gimbal', method, params }),
         signal: AbortSignal.timeout(60_000),
       });
+      if (res.status === 429) {
+        last = new Error(`${method}: HTTP 429`);
+        await sleep(2000);
+        continue;
+      }
       const json = await res.json();
       if (json.error) {
         const cause = json.error.cause?.name ?? json.error.name;
@@ -263,6 +277,11 @@ export async function rpc(method, params) {
       return json.result;
     } catch (e) {
       if (e.rpc || e.timeout || e.fatal) throw e;
+      if (once && asked) {
+        const err = new Error(`${method}: no answer from ${new URL(url).host} (${e.message}): the request may have arrived`);
+        err.unknown = true;
+        throw err;
+      }
       last = e;
       await sleep(1500);
     }
@@ -311,46 +330,105 @@ export const actions = {
   transfer: (deposit) => (w) => w.u8(3).u128(deposit),
 };
 
+/** How many times `send` signs again after an InvalidNonce answer. */
+export const NONCE_RETRIES = 3;
+
+/** The highest nonce this process signed with, per `account/public key`: an RPC can serve an access key from before it. */
+const lastNonce = new Map();
+
+/** Whether an RPC error is InvalidNonce: the node refused the transaction while validating it, so it never ran. */
+export const isInvalidNonce = (e) => Boolean(e?.rpc) && /InvalidNonce/.test(JSON.stringify(e.rpc));
+
+/** The access key's nonce an InvalidNonce answer reports (`ak_nonce`), or null. */
+export function akNonceOf(e) {
+  const m = JSON.stringify(e?.rpc ?? '').match(/"ak_nonce":\s*"?(\d+)/);
+  return m ? BigInt(m[1]) : null;
+}
+
+const maxOf = (...xs) => xs.reduce((a, b) => (b > a ? b : a));
+
 /**
  * Signs and sends a transaction from `key` to `receiverId` and waits until every receipt ran.
  * Returns { hash, value (the parsed SuccessValue or null), failure (the error or null), logs, burnt (TGas) }.
+ *
+ * Nonces: each transaction gets max(the chain's nonce, the last one this process used) + 1. InvalidNonce (the node
+ * refused the transaction, it never ran) reads the key again and signs a new transaction, at most NONCE_RETRIES times.
+ * A timeout or no answer to send_tx never signs again, since the first one may land and a second would run too:
+ * the transaction is looked up by its hash, and when it is not found the error says its outcome is unknown.
+ * `o.rpc`, `o.pause`, `o.polls` and `o.pollMs` are for tests (a fake RPC, no waiting).
  */
-export async function send(key, receiverId, acts) {
+export async function send(key, receiverId, acts, o = {}) {
+  const call = o.rpc ?? rpc;
+  const pause = o.pause ?? sleep;
+  const polls = o.polls ?? 40;
+  const pollMs = o.pollMs ?? 3000;
   testnetId(key.accountId, 'signer');
   testnetId(receiverId, 'receiver');
-  const access = await rpc('query', {
-    request_type: 'view_access_key',
-    finality: 'final',
-    account_id: key.accountId,
-    public_key: key.publicKeyString,
-  });
-  const w = new Writer()
-    .string(key.accountId)
-    .u8(0).bytes(key.publicKey)
-    .u64(BigInt(access.nonce) + 1n)
-    .string(receiverId)
-    .bytes(b58decode(access.block_hash))
-    .u32(acts.length);
-  for (const a of acts) a(w);
-  const tx = w.done();
-  const hash = sha256(tx);
-  const signed = Buffer.concat([tx, Buffer.from([0]), key.sign(hash)]);
-  const txHash = b58encode(hash);
-  let outcome;
-  try {
-    outcome = await rpc('send_tx', { signed_tx_base64: signed.toString('base64'), wait_until: 'EXECUTED_OPTIMISTIC' });
-  } catch (e) {
-    if (!e.timeout) throw e;
-  }
-  for (let i = 0; !outcome?.final_execution_status || outcome.final_execution_status === 'INCLUDED' || !outcome.status; i++) {
-    if (i > 40) throw new Error(`transaction ${txHash} did not finish`);
-    await sleep(3000);
+  const keyId = `${key.accountId}/${key.publicKeyString}`;
+  let refusedAt = 0n;
+  for (let attempt = 0; ; attempt++) {
+    const access = await call('query', {
+      request_type: 'view_access_key',
+      finality: 'final',
+      account_id: key.accountId,
+      public_key: key.publicKeyString,
+    });
+    const nonce = maxOf(BigInt(access.nonce), lastNonce.get(keyId) ?? 0n, refusedAt) + 1n;
+    lastNonce.set(keyId, nonce);
+    const w = new Writer()
+      .string(key.accountId)
+      .u8(0).bytes(key.publicKey)
+      .u64(nonce)
+      .string(receiverId)
+      .bytes(b58decode(access.block_hash))
+      .u32(acts.length);
+    for (const a of acts) a(w);
+    const tx = w.done();
+    const hash = sha256(tx);
+    const signed = Buffer.concat([tx, Buffer.from([0]), key.sign(hash)]);
+    const txHash = b58encode(hash);
+    let outcome;
     try {
-      outcome = await rpc('tx', { tx_hash: txHash, sender_account_id: key.accountId, wait_until: 'EXECUTED_OPTIMISTIC' });
+      outcome = await call('send_tx', { signed_tx_base64: signed.toString('base64'), wait_until: 'EXECUTED_OPTIMISTIC' }, { once: true });
+    } catch (e) {
+      if (isInvalidNonce(e)) {
+        if (attempt >= NONCE_RETRIES) throw new Error(`InvalidNonce ${attempt + 1} times in a row (last nonce ${nonce}): ${e.message}`);
+        refusedAt = maxOf(refusedAt, akNonceOf(e) ?? 0n);
+        await pause(1000);
+        continue;
+      }
+      if (!e.timeout && !e.unknown) throw e;
+    }
+    return result(await finished(call, pause, key.accountId, txHash, outcome, polls, pollMs), txHash);
+  }
+}
+
+const isFinal = (outcome) => Boolean(outcome?.final_execution_status) && outcome.final_execution_status !== 'INCLUDED' && Boolean(outcome.status);
+
+/** Polls `tx` by hash until the outcome is final; never sends anything. */
+async function finished(call, pause, sender, txHash, outcome, polls, pollMs) {
+  let seen = Boolean(outcome);
+  for (let i = 0; !isFinal(outcome); i++) {
+    if (i >= polls) {
+      const err = new Error(seen
+        ? `transaction ${txHash} did not finish after ${polls} looks`
+        : `transaction ${txHash} was not found after ${polls} looks: its outcome is unknown, so it was not sent again; look it up before sending anything else`);
+      err.unknown = true;
+      err.hash = txHash;
+      throw err;
+    }
+    await pause(pollMs);
+    try {
+      outcome = await call('tx', { tx_hash: txHash, sender_account_id: sender, wait_until: 'EXECUTED_OPTIMISTIC' });
+      seen = true;
     } catch (e) {
       if (!e.timeout && !/UNKNOWN_TRANSACTION/.test(e.message)) throw e;
     }
   }
+  return outcome;
+}
+
+function result(outcome, txHash) {
   const all = [outcome.transaction_outcome, ...outcome.receipts_outcome];
   const logs = outcome.receipts_outcome.flatMap((r) => r.outcome.logs);
   const burnt = all.reduce((s, o) => s + BigInt(o.outcome.gas_burnt), 0n);

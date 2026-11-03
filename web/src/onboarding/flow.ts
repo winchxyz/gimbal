@@ -17,7 +17,7 @@ import {
   type ChainDesk,
 } from './chain.ts';
 import type { OnboardingConfig } from './config.ts';
-import { createDeskTx, depositTx, isDeskId, isEvmAddress, isIp, setOrderlyIpsTx, setOrderlyReceiverTx, setPolicyTx, splitIps } from './desk-actions.ts';
+import { createDeskTx, depositTx, isDeskId, isEvmAddress, setOrderlyIpsTx, setOrderlyReceiverTx, setPolicyTx, splitIps } from './desk-actions.ts';
 import type { DerivedAddresses } from './derive.ts';
 import { DraftUnavailable, EngineError, type OnboardingEngine } from './engine.ts';
 import { dollars, formatUsdc, ORIGINS, usdcUnits, type IntentsApi, type IntentsQuote, type IntentsStatus, MIN_FUND_USDC } from './intents.ts';
@@ -458,11 +458,8 @@ export class OnboardingFlow {
     await this.run('ips', async () => {
       const { deskId, config, ipsText } = this.state;
       if (config.network !== 'mainnet') throw new Error('The IP list is for mainnet. Orderly’s testnet takes none.');
-      const ips = splitIps(ipsText);
-      if (ips.length < 1 || ips.length > 10) throw new Error('Type 1 to 10 IP addresses.');
-      const bad = ips.find((ip) => !isIp(ip));
-      if (bad !== undefined) throw new Error(`“${bad}” is not an IP address.`);
-      await this.sign('ips', setOrderlyIpsTx(config.contractId!, deskId, ips));
+      // setOrderlyIpsTx refuses a list without the engine's IP; its reason is the error the owner sees.
+      await this.sign('ips', setOrderlyIpsTx(config.contractId!, deskId, splitIps(ipsText), config.relayerIps));
     });
   }
 

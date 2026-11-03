@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { deriveAddresses, desksOf, parseDesk, readConfig, readDesk, rpcChain, tokenBalance } from './chain.ts';
+import { deriveAddresses, desksOf, parseDesk, readConfig, readDesk, RPC_URLS, rpcChain, tokenBalance } from './chain.ts';
 import { FakeWorld } from './fakes.ts';
 import { addressesFrom } from './derive.ts';
 
@@ -114,4 +114,12 @@ test('deriveAddresses asks the MPC contract for both keys with the gimbal contra
   assert.deepEqual(got, addressesFrom(evm, sol));
   assert.match(got.evm_address, /^0x[0-9a-f]{40}$/);
   await assert.rejects(deriveAddresses({ ...world.chain, view: async () => 5 }, world.mpc, world.contractId, 'd'), /did not answer with keys/);
+});
+
+test('FastNEAR is asked first on both networks; the near.org endpoints are only the fallback', async () => {
+  assert.deepEqual(RPC_URLS.testnet, ['https://test.rpc.fastnear.com', 'https://rpc.testnet.near.org']);
+  assert.deepEqual(RPC_URLS.mainnet, ['https://free.rpc.fastnear.com', 'https://rpc.mainnet.near.org']);
+  const { fetcher, urls } = fakeFetch([new Error('fetch failed'), { jsonrpc: '2.0', result: { keys: [] } }]);
+  await rpcChain('testnet', undefined, fetcher).accessKeys('a.testnet');
+  assert.deepEqual(urls, ['https://test.rpc.fastnear.com', 'https://rpc.testnet.near.org']);
 });

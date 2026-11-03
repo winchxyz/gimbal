@@ -7,7 +7,9 @@ import {
   DEPOSIT_GAS,
   isDeskId,
   isEvmAddress,
+  canonicalIp,
   isIp,
+  orderlyIpsProblem,
   OWNER_CALL_GAS,
   setOrderlyIpsTx,
   setOrderlyReceiverTx,
@@ -87,7 +89,7 @@ test('set_policy, the receiver and the IP list cover what the contract measures,
 
   // Ten IPv6 addresses of 39 characters, on a desk with a one-character id: the JSON is closest to the storage there.
   const ips = Array.from({ length: 10 }, (_, i) => `1111:2222:3333:4444:5555:6666:7777:${(0x8880 + i).toString(16)}`);
-  const list = depositOf(setOrderlyIpsTx('c.testnet', 'a', ips));
+  const list = depositOf(setOrderlyIpsTx('c.testnet', 'a', ips, [ips[0]!]));
   assert.equal(depositRefusal('set_orderly_ips', 'x', setIpsBytes([], ips), list), null);
   assert.ok(list >= STORAGE_BYTE_COST * 500n, 'over the contract’s own cap for it, 500 B');
 });
@@ -99,7 +101,7 @@ test('set_policy, set_orderly_receiver and set_orderly_ips carry a storage depos
   const rec = setOrderlyReceiverTx('c.testnet', 'd', '0x' + 'A'.repeat(40)).actions[0]!;
   assert.deepEqual(rec.type === 'FunctionCall' && [rec.params.methodName, rec.params.args], ['set_orderly_receiver', { desk_id: 'd', receiver: '0x' + 'a'.repeat(40) }], 'the receiver goes lowercase');
   assert.ok(rec.type === 'FunctionCall' && BigInt(rec.params.deposit) > 1n && BigInt(rec.params.deposit) < YOCTO);
-  const ips = setOrderlyIpsTx('c.testnet', 'd', ['203.0.113.7']).actions[0]!;
+  const ips = setOrderlyIpsTx('c.testnet', 'd', ['203.0.113.7'], ['203.0.113.7']).actions[0]!;
   assert.equal(ips.type === 'FunctionCall' && ips.params.methodName, 'set_orderly_ips');
   assert.ok(ips.type === 'FunctionCall' && BigInt(ips.params.deposit) > 1n && BigInt(ips.params.deposit) < YOCTO);
 });
@@ -120,7 +122,36 @@ test('desk ids, addresses and IPs', () => {
   assert.equal(isEvmAddress('0x' + 'a'.repeat(39)), false);
   assert.deepEqual(splitIps('1.2.3.4, 5.6.7.8\n9.9.9.9  '), ['1.2.3.4', '5.6.7.8', '9.9.9.9']);
   for (const ok of ['203.0.113.7', '0.0.0.0', '255.255.255.255', '2001:db8::1']) assert.equal(isIp(ok), true, ok);
-  for (const bad of ['256.1.1.1', '01.2.3.4', '1.2.3', 'example.com', '']) assert.equal(isIp(bad), false, bad);
+  for (const bad of ['256.1.1.1', '01.2.3.4', '1.2.3', 'example.com', '', '2001:db8::1::2']) assert.equal(isIp(bad), false, bad);
+  assert.equal(canonicalIp('2001:DB8:0:0:0:0:0:1'), '2001:db8::1');
+});
+
+const ENGINE_IP = '198.51.100.20';
+
+test('an Orderly IP list must hold the engine’s IP: the builder refuses one without it, naming the IP and why', () => {
+  assert.equal(orderlyIpsProblem(['203.0.113.7', ENGINE_IP], [ENGINE_IP]), null);
+  const missing = orderlyIpsProblem(['203.0.113.7'], [ENGINE_IP])!;
+  assert.match(missing, /leaves out 198\.51\.100\.20, the engine’s IP address/);
+  assert.match(missing, /could not close a position or run a rescue/);
+  assert.throws(() => setOrderlyIpsTx('c.near', 'd', ['203.0.113.7'], [ENGINE_IP]), /leaves out 198\.51\.100\.20/);
+  // Both of the engine's IPs (an IPv4 and an IPv6 route) must be there.
+  assert.match(orderlyIpsProblem([ENGINE_IP], [ENGINE_IP, '2001:db8::20'])!, /leaves out 2001:db8::20/);
+});
+
+test('an engine IP the page does not know refuses the list rather than guess', () => {
+  assert.match(orderlyIpsProblem(['203.0.113.7'], [])!, /does not know the engine’s IP address \(VITE_RELAYER_IP\)/);
+  assert.throws(() => setOrderlyIpsTx('c.near', 'd', ['203.0.113.7'], []), /VITE_RELAYER_IP/);
+});
+
+test('the IP list: 1 to 10 distinct IPs, sent in the canonical form the contract takes', () => {
+  assert.match(orderlyIpsProblem([], [ENGINE_IP])!, /1 to 10/);
+  assert.match(orderlyIpsProblem(Array.from({ length: 11 }, (_, i) => `203.0.113.${i}`), [ENGINE_IP])!, /1 to 10/);
+  assert.match(orderlyIpsProblem([ENGINE_IP, '999.1.1.1'], [ENGINE_IP])!, /999\.1\.1\.1/);
+  assert.match(orderlyIpsProblem(['2001:db8::1', '2001:DB8:0::1', ENGINE_IP], [ENGINE_IP])!, /2001:db8::1 is in the list twice/);
+  // An IPv6 written another way still counts as the engine's, and goes out canonical.
+  const tx = setOrderlyIpsTx('c.near', 'd', ['2001:DB8:0:0:0:0:0:20'], ['2001:db8::20']);
+  const a = tx.actions[0]!;
+  assert.deepEqual(a.type === 'FunctionCall' && a.params.args, { desk_id: 'd', ips: ['2001:db8::20'] });
 });
 
 test('NEAR amounts are exact', () => {

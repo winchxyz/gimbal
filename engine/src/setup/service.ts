@@ -11,6 +11,7 @@ import { errorMessage } from '../venues/recorder.ts';
 import { OrderlyDeskClient } from '../venues/orderly-actions.ts';
 import type { OrderlySigner } from '../venues/orderly-signer.ts';
 import { PhoenixOnboarding, solanaReads } from './phoenix.ts';
+import { publicIpLookup, type PublicIps } from './public-ip.ts';
 import type { HlSetup, SetupPlan } from './setup.ts';
 import { runSetup } from './setup.ts';
 import type { RouteAnswer, SetupStarter } from './route.ts';
@@ -28,6 +29,8 @@ export interface SetupServiceOptions {
   solanaRpcUrl?: string;
   phoenixApiUrl?: string;
   fetch?: typeof fetch;
+  /** This engine's public IPs, checked against a desk's IP list before it is applied; default: the lookup in public-ip.ts. */
+  publicIps?: PublicIps;
   log?: (line: string) => void;
   /** Passed to runSetup (tests make them instant). */
   depositPollMs?: number;
@@ -38,10 +41,12 @@ export interface SetupServiceOptions {
 
 export class SetupService implements SetupStarter {
   readonly #o: SetupServiceOptions;
+  readonly #publicIps: PublicIps;
   readonly #running = new Map<string, Promise<SetupProgress | null>>();
 
   constructor(options: SetupServiceOptions) {
     this.#o = options;
+    this.#publicIps = options.publicIps ?? publicIpLookup(options.fetch === undefined ? {} : { fetch: options.fetch });
   }
 
   /** Starts a run in the background and answers at once; progress goes to `publish`. */
@@ -131,6 +136,7 @@ export class SetupService implements SetupStarter {
       }, o.fetch ?? fetch),
       orderly,
       phoenix,
+      relayerIps: this.#publicIps,
       takeOrderlyTx: collected.take,
       publish,
       ...(o.log === undefined ? {} : { log: o.log }),

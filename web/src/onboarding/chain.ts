@@ -14,10 +14,13 @@ export interface Chain {
 
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 
-/** Public RPC endpoints, tried in order; a failed one is skipped. */
+/**
+ * Public RPC endpoints, tried in order; a failed one is skipped. FastNEAR first on both networks, as the engine uses:
+ * the near.org endpoints are deprecated and rate-limited, and stay only as the fallback for these reads.
+ */
 export const RPC_URLS: Record<NearNetwork, readonly string[]> = {
-  mainnet: ['https://rpc.mainnet.near.org', 'https://free.rpc.fastnear.com'],
-  testnet: ['https://rpc.testnet.near.org', 'https://test.rpc.fastnear.com'],
+  mainnet: ['https://free.rpc.fastnear.com', 'https://rpc.mainnet.near.org'],
+  testnet: ['https://test.rpc.fastnear.com', 'https://rpc.testnet.near.org'],
 };
 
 /** The real chain, over JSON-RPC. `fetcher` is injectable for tests. */

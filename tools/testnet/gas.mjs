@@ -14,7 +14,7 @@
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { ROOT, actions, b58decode, loadKey, panicOf, rpc, send, sleep, testnetId, view } from './near.mjs';
+import { ROOT, actions, b58decode, loadKey, panicOf, rpc, send, testnetId, view } from './near.mjs';
 import { hlSignature } from './evm.mjs';
 
 const args = process.argv.slice(2);
@@ -206,23 +206,9 @@ async function methods(hash) {
   return out;
 }
 
-/**
- * `send`, again after 3 s when the RPC still served the access key's nonce from before the last
- * transaction (an `InvalidNonce` transaction never ran, so sending it again cannot repeat it).
- */
-async function sendFresh(key, receiverId, acts) {
-  for (let attempt = 0; ; attempt++) {
-    try {
-      return await send(key, receiverId, acts);
-    } catch (e) {
-      if (attempt >= 5 || !/InvalidNonce/.test(e.message)) throw e;
-      await sleep(3000);
-    }
-  }
-}
-
+// `send` itself signs again on InvalidNonce (near.mjs), so a stale access key from the RPC needs nothing here.
 async function measure(label, method, callArgs, deposit = 0n) {
-  const out = await sendFresh(ownerKey, contract, [actions.call(method, callArgs, 300n, deposit)]);
+  const out = await send(ownerKey, contract, [actions.call(method, callArgs, 300n, deposit)]);
   const names = await methods(out.hash);
   const parts = [{ where: 'tx -> receipt', on: ownerKey.accountId, tgas: 0 }];
   // The transaction's own conversion, then each receipt in order.
@@ -252,7 +238,7 @@ async function measure(label, method, callArgs, deposit = 0n) {
 
 const contractKey = loadKey(contract);
 for (const [asset, price] of Object.entries(PRICES_E8)) {
-  const out = await sendFresh(contractKey, contract, [actions.call('set_mock_price', { asset, price_e8: price }, 30n, 1n)]);
+  const out = await send(contractKey, contract, [actions.call('set_mock_price', { asset, price_e8: price }, 30n, 1n)]);
   if (out.failure) throw new Error(`set_mock_price ${asset}: ${panicOf(out.failure)}`);
   console.log(`set_mock_price ${asset} ${price}: ${out.burntTgas} TGas`);
 }
