@@ -74,7 +74,52 @@ cd contract && cargo test --workspace
 
 ### 3. Testnet
 
-<!-- fill: deployed contract id, how to create a desk, what to watch -->
+The final contract code (main at `b73beb5`) runs on NEAR testnet at
+[`gimbal-final-fcf135.testnet`](https://testnet.nearblocks.io/address/gimbal-final-fcf135.testnet), deployed
+2026-11-03. It is the same wasm the mainnet final deploy uses (that deploy is not made yet):
+
+| | |
+|---|---|
+| wasm sha256 | `da4bff79edb36baec4a4c5a636a267abe9c0505fa30790a2771584a14b2e30fa` (`cargo near build non-reproducible-wasm --no-abi`) |
+| code hash (`view_account`) | `Fh96HRMGw6RcZDzFLnbjgoUZXMa2W4pGMbj8eRuZZ6Uh` |
+| deploy + `new` | [`EjKZNnRjS8AUkuL9s3kMtVmLFHLbQTW8WdrkeTrdSsTD`](https://testnet.nearblocks.io/txns/EjKZNnRjS8AUkuL9s3kMtVmLFHLbQTW8WdrkeTrdSsTD) |
+| config | network `Testnet`, MPC `v1.signer-prod.testnet`, price source `Mock` (`price-oracle.testnet` returns null prices), Orderly broker `woofi_dex` on chain 421614, no referral codes |
+| desk `final-1` | [`create_desk` `5MLj2NfSMYh54kYWvjLDM9DBuXndRgqkRPyGge4DLJtw`](https://testnet.nearblocks.io/txns/5MLj2NfSMYh54kYWvjLDM9DBuXndRgqkRPyGge4DLJtw), policy `tools/testnet-policy.json` |
+| desk EVM address (Hyperliquid, Orderly) | `0x6dc11a853ca5afaa44fb926bf26ff0b3950928cb` |
+| desk Solana authority | `3CfwbY27qA1UBukpcqEYfjCxHYkU6dpA3dkUraLdHcTB` |
+| first signature | [`hl_order` `9RgCHtyJ4g8PBoHd4fMPivaJrckoBQMPRPTVbnzC3ARQ`](https://testnet.nearblocks.io/txns/9RgCHtyJ4g8PBoHd4fMPivaJrckoBQMPRPTVbnzC3ARQ): an unpriced BTC order signed by the MPC network; Hyperliquid testnet recovered the desk's address from it and refused the order because that address holds no funds yet |
+
+Read it without keys (NEAR CLI):
+
+```bash
+near contract call-function as-read-only gimbal-final-fcf135.testnet config json-args '{}' network-config testnet now
+near contract call-function as-read-only gimbal-final-fcf135.testnet get_desk json-args '{"desk_id":"final-1"}' network-config testnet now
+```
+
+The other views: `version`, `prices`, `desks_of {"owner"}`, `get_desk_counters {"desk_id"}`,
+`get_desk_settings {"desk_id"}`.
+
+Create your own desk from a testnet account whose full-access key file is in `.keys/<account>.json`:
+
+```bash
+node tools/testnet/desk.mjs gimbal-final-fcf135.testnet <desk_id> --owner <account>.testnet
+```
+
+It derives the desk's addresses from the MPC contract, as `create_desk` checks them, and attaches 0.5 NEAR for
+storage (the rest is refunded).
+
+Check the desk's signing (one MPC signature per step, from the desk owner's account, 300 TGas):
+
+```bash
+node tools/testnet/live.mjs gimbal-final-fcf135.testnet <desk_id> hl --owner <account>.testnet
+```
+
+The contract signs an unpriced BTC order far under the mid. The script recomputes the EIP-712 digest itself,
+without trusting the contract, and prints `recovers to 0x… (the desk EVM address)`. Then it posts the order to
+Hyperliquid testnet, which names the address it recovered. A desk with no funds there is refused with
+`User or API Wallet 0x… does not exist.`, which shows the same address. The other steps (`register`, `add-key`,
+`faucet`, `order`, `ws`, `settle`, ...) are listed at the top of `tools/testnet/live.mjs`. 1Click has no
+testnet, so rescues run live only on mainnet.
 
 ### 4. Mainnet evidence
 
