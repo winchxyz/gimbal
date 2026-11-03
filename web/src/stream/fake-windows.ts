@@ -8,7 +8,7 @@ import { isEnterable } from '../windows/model.ts';
 
 /**
  * What the fake shows, chosen with `?state=` in development:
- * - normal: the mockup's list, with a held, a vetoed and a refused window and five watch-only ones.
+ * - normal: the mockup's list, with a held, a risk-check-refused and a refused window and five watch-only ones.
  * - loading: no windows event is ever sent.
  * - empty: nothing open to the desk clears the minimum.
  * - error: three venues did not answer, and the windows that need them are stale.

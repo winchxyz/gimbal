@@ -64,7 +64,7 @@ test('every kind is described, and each filter lists the kinds the mockup puts u
   assert.equal(filterLabel('money'), 'Money in and out');
 });
 
-test('kind colours: Rescue and Veto amber, Refused red, Open and Rotate in ink, the rest grey', () => {
+test('kind colours: Rescue and Risk check amber, Refused red, Open and Rotate in ink, the rest grey', () => {
   const tone = (kind: JournalEntry['kind']) => KINDS[kind].tone;
   assert.equal(tone('rescue'), 'watch');
   assert.equal(tone('veto'), 'watch');
@@ -225,9 +225,9 @@ test('older pages are never cut away: a reader who asked for them keeps them', (
   assert.equal(all[all.length - 1]?.id, 'm0');
 });
 
-test('the counts: actions the contract signed, refusals and vetoes', () => {
+test('the counts: actions the contract signed, refusals and risk check refusals', () => {
   const counts = countsOf(MOCKUP);
-  // the rescue, the withdrawal, the open and the rotation are signed; funding, refusals and vetoes are not
+  // the rescue, the withdrawal, the open and the rotation are signed; funding, refusals and risk check refusals are not
   assert.deepEqual(counts, { signed: 4, refused: 1, vetoed: 1 });
   assert.deepEqual(countsOf([]), { signed: 0, refused: 0, vetoed: 0 });
   assert.equal(actionsText(23), '23 actions signed');

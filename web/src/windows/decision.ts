@@ -75,7 +75,7 @@ export function decide({ selected, windows, strategy, now }: DecisionInput): Dec
   if (selected.veto?.verdict === 'veto') {
     const why = selected.veto.reasons[0];
     return none(
-      `NEAR AI vetoed it${why ? `: ${sentence(why)}` : '.'} A veto only removes a window, so auto will not enter it.`,
+      `The NEAR AI risk check refused it${why ? `: ${sentence(why)}` : '.'} It can only remove a window, so auto will not enter it.`,
     );
   }
 

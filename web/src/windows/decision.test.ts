@@ -49,7 +49,7 @@ test('a window above the held one: the numbers, the payback, and whether it clea
   assert.equal(noCost.text, 'NEAR is 2.0 points above DOGE. That is under auto’s rule of 3 points of net APR for 4 hours in a row, so it stays in DOGE.');
 });
 
-test('refused and vetoed windows cannot be rotated into', () => {
+test('refused windows cannot be rotated into', () => {
   const refused = net('ZRO', 35.2, { refused: { code: 'E_ORACLE_STALE', reason: 'no trusted price' }, switchCostUsd: 1.1 });
   const d = decide({ selected: refused, windows: [doge, refused], strategy: STRATEGY, now: NOW });
   assert.equal(d.text, 'The contract would refuse this window under your policy: no trusted price. Auto will not enter it.');
@@ -57,7 +57,7 @@ test('refused and vetoed windows cannot be rotated into', () => {
 
   const vetoed = net('AVAX', 9.1, { veto: { verdict: 'veto', reasons: ['one-off spike'], model: 'm', at: 1 } });
   const v = decide({ selected: vetoed, windows: [doge, vetoed], strategy: STRATEGY, now: NOW });
-  assert.equal(v.text, 'NEAR AI vetoed it: one-off spike. A veto only removes a window, so auto will not enter it.');
+  assert.equal(v.text, 'The NEAR AI risk check refused it: one-off spike. It can only remove a window, so auto will not enter it.');
   assert.equal(v.rotate, null);
   assert.equal(v.alert, null);
 });

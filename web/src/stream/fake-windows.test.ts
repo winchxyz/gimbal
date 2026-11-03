@@ -11,7 +11,7 @@ import { initialStreamState, parseStreamEvent, reduceStream, type StreamAction }
 const T0 = Date.UTC(2026, 9, 27, 14, 0);
 const make = (scenario: Scenario, tick = 0, drift = false) => fakeWindows(T0, tick, { scenario, startedAt: T0, drift });
 
-test('normal: a held, a vetoed and a refused window, watch-only rows and a missing 7-day figure', () => {
+test('normal: a held, a risk-check-refused and a refused window, watch-only rows and a missing 7-day figure', () => {
   const ws = make('normal');
   assert.equal(ws.filter((w) => w.held).length, 1);
   assert.equal(ws.filter((w) => w.veto?.verdict === 'veto').length, 1);
@@ -22,7 +22,7 @@ test('normal: a held, a vetoed and a refused window, watch-only rows and a missi
   assert.equal(new Set(ws.map((w) => w.id)).size, ws.length, 'ids are unique, even for the same symbol on other venues');
   assert.equal(rowStatus(ws.find((w) => w.held)!).text, 'Held');
   assert.equal(rowStatus(ws.find((w) => w.refused)!).text, 'Refused · no trusted price');
-  assert.equal(rowStatus(ws.find((w) => w.veto?.verdict === 'veto')!).text, 'Veto · one-off spike');
+  assert.equal(rowStatus(ws.find((w) => w.veto?.verdict === 'veto')!).text, 'Risk check · one-off spike');
 });
 
 test('normal: net is gross minus costs, rotation costs are set while something is held, and it matches the mockup order', () => {
