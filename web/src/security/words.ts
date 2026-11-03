@@ -41,7 +41,10 @@ const assetsLine = (key: string, venue: string, symbols: readonly string[]): Pol
   text: symbols.length === 0 ? `${venue}: nothing allowed` : `${venue}: ${symbols.join(', ')}`,
 });
 
-/** What `Policy::transfer_cost_budget` allows per hour, in USD: the larger of the bps share of the cap and twice the flat part. */
+/**
+ * What the quotes of the hourly rescue cost budget may cost per hour, in USD (the contract's `rescue_quote_budget_e8`): the
+ * larger of the bps share of the cap and twice the flat part. The whole budget adds room for 4 venue fees of 1 USDC.
+ */
 export function hourlyCostBudgetUsd(p: ContractPolicy): number {
   return Math.max((p.rescue_cap_usd_per_hour * p.max_transfer_cost_bps) / 10_000, (2 * p.max_transfer_cost_flat_e6) / 1e6);
 }
@@ -63,7 +66,7 @@ export function policyLines(p: ContractPolicy, owner: string): PolicyLine[] {
     lines.push({ key: 'rescue', text: `Margin moves out of an exchange: up to ${usd(p.rescue_cap_usd_per_hour, 0)} an hour` });
     lines.push({
       key: 'cost',
-      text: `A move may cost at most ${bpsPct(p.max_transfer_cost_bps)} of its amount, or ${usd(p.max_transfer_cost_flat_e6 / 1e6)} if that is more; ${usd(hourlyCostBudgetUsd(p))} an hour in all`,
+      text: `A move may cost at most ${bpsPct(p.max_transfer_cost_bps)} of its amount, or ${usd(p.max_transfer_cost_flat_e6 / 1e6)} if that is more; ${usd(hourlyCostBudgetUsd(p))} an hour in all, plus up to 4 USDC of venue fees`,
     });
   }
 

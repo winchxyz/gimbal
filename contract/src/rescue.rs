@@ -33,8 +33,8 @@ use gimbal_core::hl::{usdc_token, Address, UserAction};
 use gimbal_core::ids::{check_base58_32, check_reason};
 use gimbal_core::limits::{check_hourly_notional, notional_e8};
 use gimbal_core::oneclick::{
-    check_cost, rescue_cost_budget_e8, transfer_cost_e8, verify_quote, Context, DeskAddresses,
-    Method, VerifiedQuote, QUOTE_PAYABLE_MS, VENUE_FEE_E8,
+    check_cost, quote_cost_e8, rescue_cost_budget_e8, rescue_quote_budget_e8, transfer_cost_e8,
+    verify_quote, Context, DeskAddresses, Method, VerifiedQuote, QUOTE_PAYABLE_MS, VENUE_FEE_E8,
 };
 use gimbal_core::phoenix::{check_message, Rescue};
 use gimbal_core::policy::Policy;
@@ -63,12 +63,18 @@ pub const DEPOSIT_RING: usize = 32;
 /// least ([`operator_min_withdraw_e8`]).
 pub const OPERATOR_MIN_WITHDRAW_FLATS: u128 = 10;
 
+/// The least an operator withdrawal moves whatever the policy, USDC × 1e8: 10 USDC, ten venue
+/// fees, so a policy with `max_transfer_cost_flat_e6` 0 cannot turn the minimum off.
+pub const OPERATOR_MIN_WITHDRAW_FLOOR_E8: u128 = 10 * VENUE_FEE_E8;
+
 /// The least USDC × 1e8 the operator may withdraw from Hyperliquid or Orderly in one call:
-/// 10 × the policy's `max_transfer_cost_flat_e6` (5 USDC at the default 0.5). The venue's 1 USDC
-/// fee of each also counts against the hourly rescue cost budget, which bounds how many fees a
-/// stolen operator key can burn in an hour. The owner has no minimum.
+/// max(10 × the policy's `max_transfer_cost_flat_e6`, [`OPERATOR_MIN_WITHDRAW_FLOOR_E8`]), 10 USDC
+/// at the default 0.5. The venue's 1 USDC fee of each also counts against the hourly rescue cost
+/// budget, which bounds how many fees a stolen operator key can burn in an hour. The owner has no
+/// minimum.
 pub fn operator_min_withdraw_e8(policy: &Policy) -> u128 {
-    u128::from(policy.max_transfer_cost_flat_e6) * 100 * OPERATOR_MIN_WITHDRAW_FLATS
+    (u128::from(policy.max_transfer_cost_flat_e6) * 100 * OPERATOR_MIN_WITHDRAW_FLATS)
+        .max(OPERATOR_MIN_WITHDRAW_FLOOR_E8)
 }
 
 /// What the contract counts per desk besides its Hyperliquid nonce. Fixed size (1.3 KB), stored
@@ -88,6 +94,9 @@ pub struct DeskCounters {
     /// USD × 1e8: the weight of what they may cost ([`transfer_cost_e8`]), against
     /// [`rescue_cost_budget_e8`].
     pub rescue_cost_e8: u128,
+    /// USD × 1e8: the part of `rescue_cost_e8` that is the quotes' own costs ([`quote_cost_e8`],
+    /// no venue fee), against [`rescue_quote_budget_e8`]. Always 0 in the `fund_venue` counters.
+    pub rescue_quote_e8: u128,
     /// The counter of the desk's next EIP-3009 nonce, from 0.
     pub eip3009_next: u64,
     /// sha256 of the deposit addresses of the desk's last [`DEPOSIT_RING`] rescues, as the
@@ -124,6 +133,11 @@ impl DeskCounters {
     /// The cost meter's weight at `now_ms`, USD × 1e8.
     pub fn cost_e8(&self, now_ms: u64) -> u128 {
         decayed(self.rescue_cost_e8, self.rescue_at_ms, now_ms)
+    }
+
+    /// The quote part of the cost meter at `now_ms`, USD × 1e8.
+    pub fn quote_cost_used_e8(&self, now_ms: u64) -> u128 {
+        decayed(self.rescue_quote_e8, self.rescue_at_ms, now_ms)
     }
 
     /// USDC × 1e8 the desk can still rescue at `now_ms` under a cap of `cap_usd` an hour.
@@ -164,12 +178,28 @@ impl DeskCounters {
         self.deposit_next = u8::try_from((slot + 1) % DEPOSIT_RING).unwrap_or(0);
     }
 
+    /// [`Self::spend`] of a rescue whose cost `cost_e8` holds `quote_e8` of the quote's own,
+    /// which the quote meter counts too.
+    pub fn spend_rescue(
+        &mut self,
+        amount_e8: u128,
+        cost_e8: u128,
+        quote_e8: u128,
+        deposit_sha256: [u8; 32],
+        now_ms: u64,
+    ) {
+        self.spend(amount_e8, cost_e8, deposit_sha256, now_ms);
+        // spend brought the quote meter to now_ms with the others.
+        self.rescue_quote_e8 = self.rescue_quote_e8.saturating_add(quote_e8);
+    }
+
     /// Counts `amount_e8` against the amount meter and `cost_e8` against the cost meter at
-    /// `now_ms`: the operator's withdrawals, which pay no quote, so no deposit address. Both
-    /// meters are brought to `now_ms`, since they share `rescue_at_ms`.
+    /// `now_ms`: the operator's withdrawals, which pay no quote, so no deposit address. Every
+    /// rescue meter is brought to `now_ms`, since they share `rescue_at_ms`.
     pub fn spend_amount(&mut self, amount_e8: u128, cost_e8: u128, now_ms: u64) {
         self.rescue_spent_e8 = self.spent_e8(now_ms).saturating_add(amount_e8);
         self.rescue_cost_e8 = self.cost_e8(now_ms).saturating_add(cost_e8);
+        self.rescue_quote_e8 = self.quote_cost_used_e8(now_ms);
         self.rescue_at_ms = now_ms;
     }
 
@@ -215,6 +245,11 @@ pub struct DeskCountersView {
     pub rescue_cost_now_e8: U128,
     pub rescue_cost_left_e8: U128,
     pub rescue_cost_budget_e8: U128,
+    /// The quote part of the cost meter: its weight at `rescue_at_ms`, what is left of the
+    /// quotes' share of the budget now, and that share (the budget without the venue-fee room).
+    pub rescue_quote_cost_e8: U128,
+    pub rescue_quote_cost_left_e8: U128,
+    pub rescue_quote_budget_e8: U128,
     /// The deposit ring: sha256 hex of each slot's address (`null` for an unused slot), when it
     /// was paid, and the slot the next rescue takes.
     pub deposits: Vec<Option<String>>,
@@ -237,6 +272,11 @@ impl DeskCountersView {
             policy.max_transfer_cost_bps,
             policy.max_transfer_cost_flat_e6,
         );
+        let quote_budget = rescue_quote_budget_e8(
+            policy.rescue_cap_usd_per_hour,
+            policy.max_transfer_cost_bps,
+            policy.max_transfer_cost_flat_e6,
+        );
         let notional_now = c.notional_used_e8(now_ms);
         Self {
             eip3009_next: c.eip3009_next,
@@ -248,6 +288,11 @@ impl DeskCountersView {
             rescue_cost_now_e8: U128(c.cost_e8(now_ms)),
             rescue_cost_left_e8: U128(c.remaining_cost_e8(budget, now_ms)),
             rescue_cost_budget_e8: U128(budget),
+            rescue_quote_cost_e8: U128(c.rescue_quote_e8),
+            rescue_quote_cost_left_e8: U128(
+                quote_budget.saturating_sub(c.quote_cost_used_e8(now_ms)),
+            ),
+            rescue_quote_budget_e8: U128(quote_budget),
             deposits: c
                 .deposits
                 .iter()
@@ -294,10 +339,11 @@ impl Gimbal {
     /// desk's EVM address, signed at most 1 h before the block time (5 min after it), before its
     /// deadline, a deposit address none of the desk's last 32 rescues paid, within the
     /// policy's transfer cost, with an `amountIn` Hyperliquid's perp balance can send (at most 6
-    /// decimals) (`E_QUOTE_FIELDS`), within what is left of the hourly cap and of the hourly cost
-    /// budget, which counts the quote's cost, not Hyperliquid's 1 USDC send fee
-    /// ([`transfer_cost_e8`]), and not a 33rd rescue within 65 min ([`DEPOSIT_RING`])
-    /// (`E_RESCUE_CAP`). Owner or operator, also on a paused desk. `kind`
+    /// decimals) (`E_QUOTE_FIELDS`), within what is left of the hourly cap, of the quotes' share
+    /// of the hourly cost budget (the quote's own cost) and of the whole budget, which counts the
+    /// quote's cost and Hyperliquid's 1 USDC send fee ([`transfer_cost_e8`]), and not a 33rd
+    /// rescue within 65 min ([`DEPOSIT_RING`]) (`E_RESCUE_CAP`). Owner or operator, also on a
+    /// paused desk. `kind`
     /// `sendAsset`; a user-signed action, so no
     /// `expiresAfter`: the nonce window bounds a late signature.
     #[deny_unknown_arguments]
@@ -374,6 +420,7 @@ impl Gimbal {
         let counters = self.desk_counters.get(desk_id).copied().unwrap_or_default();
         let contract = env::current_account_id();
         let second_key = self.accepted_oneclick_key(desk_id, now_ms);
+        let pinned_key = self.pinned_oneclick_key_trusted(desk_id);
         let ctx = Context {
             desk: DeskAddresses {
                 desk_id,
@@ -388,6 +435,7 @@ impl Gimbal {
                 .remaining_cap_e8(desk.policy.rescue_cap_usd_per_hour, now_ms),
             dry_ok: false,
             second_key,
+            pinned_key,
         };
         let q =
             verify_quote(sha256, ed25519_verify, quote, quote_signature, method, &ctx).or_fail();
@@ -404,9 +452,12 @@ impl Gimbal {
     /// refusal: `E_QUOTE_FIELDS` for a deposit address one of the desk's last [`DEPOSIT_RING`]
     /// rescues paid (a quote pays once), `E_RESCUE_CAP` for a 33rd rescue within 65 min (it would
     /// forget an address a quote can still pay, [`DeskCounters::held`]), an amount over what is
-    /// left of the hourly cap or a cost ([`transfer_cost_e8`]) over what is left of the hourly
-    /// cost budget ([`rescue_cost_budget_e8`] of the policy's cap and transfer cost bounds), each
-    /// a limit on how much the desk rescues in a stretch of time. Writes nothing:
+    /// left of the hourly cap, the quote's own cost ([`quote_cost_e8`]) over what is left of the
+    /// quotes' share of the hourly cost budget ([`rescue_quote_budget_e8`]: the venue-fee room is
+    /// not theirs, so `appFees` within the 1Click fee bound cannot spend it), or the whole cost
+    /// ([`transfer_cost_e8`]) over what is left of the hourly cost budget
+    /// ([`rescue_cost_budget_e8`] of the policy's cap and transfer cost bounds), each a limit on
+    /// how much the desk rescues in a stretch of time. Writes nothing:
     /// each build step stores the result once all its checks passed. Nothing is ever given back
     /// (module doc).
     pub fn counted_rescue(&self, desk_id: &str, q: &VerifiedQuote) -> DeskCounters {
@@ -443,6 +494,26 @@ impl Gimbal {
                 ),
             ));
         }
+        let quote_cost = quote_cost_e8(q);
+        let quote_budget = rescue_quote_budget_e8(
+            policy.rescue_cap_usd_per_hour,
+            policy.max_transfer_cost_bps,
+            policy.max_transfer_cost_flat_e6,
+        );
+        let quote_left = quote_budget.saturating_sub(counters.quote_cost_used_e8(now_ms));
+        if quote_cost > quote_left {
+            fail(Refusal::new(
+                E_RESCUE_CAP,
+                format!(
+                    "the quote may cost {} USD (amountIn − minAmountOut), over what is left of the \
+                     quotes' share of the hourly rescue cost budget, {} of {} USD (the rest is \
+                     for venue fees)",
+                    format_e8(quote_cost),
+                    format_e8(quote_left),
+                    format_e8(quote_budget)
+                ),
+            ));
+        }
         let cost = transfer_cost_e8(q);
         let budget = rescue_cost_budget_e8(
             policy.rescue_cap_usd_per_hour,
@@ -462,7 +533,7 @@ impl Gimbal {
                 ),
             ));
         }
-        counters.spend(q.amount_in_e8, cost, deposit_sha256, now_ms);
+        counters.spend_rescue(q.amount_in_e8, cost, quote_cost, deposit_sha256, now_ms);
         counters
     }
 
@@ -482,7 +553,7 @@ impl Gimbal {
                 E_SIZE,
                 format!(
                     "the operator's {method} of {} USDC is under its minimum of {} USDC (10 × \
-                     max_transfer_cost_flat_e6); the owner has none",
+                     max_transfer_cost_flat_e6, at least 10 USDC); the owner has none",
                     format_e8(amount_e8),
                     format_e8(min)
                 ),

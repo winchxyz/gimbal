@@ -127,7 +127,11 @@ impl Gimbal {
     }
 
     /// EIP-712 `SettlePnl` with Orderly's `settle_nonce`, at the block time; every withdrawal needs
-    /// it first. Owner or operator, running desk.
+    /// it first. Two paths, as for [`Self::orderly_withdraw`]: exactly 1 yoctoNEAR is the owner's
+    /// wallet (`E_NOT_ALLOWED` for anyone else), also on a paused desk, so the owner can take
+    /// money out after `panic_close` without resuming; no deposit is the operator (or the owner's
+    /// engine key), running desk. Any other deposit is `E_NOT_ALLOWED`.
+    #[payable]
     #[deny_unknown_arguments]
     pub fn orderly_settle_pnl(&mut self, desk_id: String, settle_nonce: u64) -> Promise {
         let action = self.prepare_orderly_settle_pnl(desk_id, settle_nonce);
@@ -137,12 +141,12 @@ impl Gimbal {
     /// EIP-712 `Withdraw` of `amount` USDC (canonical, at most 6 decimals: `E_DECIMAL`; not zero:
     /// `E_SIZE`) to the desk's own EVM address on Arbitrum, token USDC, with Orderly's
     /// `withdraw_nonce`, at the block time. The message carries the amount in raw units (1e-6), a
-    /// string in the JSON. Running desk. Two paths, as for `hl_withdraw`, told apart by the
-    /// deposit: exactly 1 yoctoNEAR is the owner's wallet (`E_NOT_ALLOWED` for anyone else), no
-    /// limit; no deposit is the operator (or the owner's engine key): `amount` at least 10 ×
-    /// `max_transfer_cost_flat_e6` (`E_SIZE`), counted against what is left of
-    /// `rescue_cap_usd_per_hour` and Orderly's 1 USDC fee against the hourly rescue cost budget
-    /// (`E_RESCUE_CAP`). Any other deposit is `E_NOT_ALLOWED`.
+    /// string in the JSON. Two paths, as for `hl_withdraw`, told apart by the deposit: exactly 1
+    /// yoctoNEAR is the owner's wallet (`E_NOT_ALLOWED` for anyone else), no limit, also on a
+    /// paused desk; no deposit is the operator (or the owner's engine key), running desk:
+    /// `amount` at least max(10 × `max_transfer_cost_flat_e6`, 10 USDC) (`E_SIZE`), counted
+    /// against what is left of `rescue_cap_usd_per_hour` and Orderly's 1 USDC fee against the
+    /// hourly rescue cost budget (`E_RESCUE_CAP`). Any other deposit is `E_NOT_ALLOWED`.
     #[payable]
     #[deny_unknown_arguments]
     pub fn orderly_withdraw(
@@ -192,9 +196,11 @@ impl Gimbal {
     /// Sets the relayer IPs the desk's orderly key may be used from, replacing any earlier list:
     /// 1 to 10 distinct IPv4 or IPv6 addresses in canonical form (`E_ARGS`). The operator applies
     /// it at Orderly with `orderly_request` kind `ip_restriction`; `get_desk` shows it as
-    /// `orderly_ips`, next to `orderly_receiver` (empty until set); nothing else reads it. Owner
-    /// only. Attach the storage a longer list adds (at least 1 yoctoNEAR); the rest is refunded.
-    /// Event `orderly_ips_set`.
+    /// `orderly_ips`, next to `orderly_receiver` (empty until set). A new list is not applied
+    /// until the contract signs that `ip_restriction` (`get_desk_settings`'s
+    /// `orderly_ips_applied`), and on mainnet no Orderly order that is not reduce-only is signed
+    /// before. Owner only. Attach the storage a longer list adds (at least 1 yoctoNEAR); the rest
+    /// is refunded. Event `orderly_ips_set`.
     #[payable]
     #[deny_unknown_arguments]
     pub fn set_orderly_ips(&mut self, desk_id: String, ips: Vec<String>) {
@@ -210,6 +216,10 @@ impl Gimbal {
             &format!("set_orderly_ips on desk {desk_id}"),
             attached,
         );
+        // The prepaid settings record, rewritten at its size.
+        let mut settings = self.settings_of(&desk_id);
+        settings.orderly_ips_applied = false;
+        self.desk_settings.insert(desk_id.clone(), settings);
         OrderlyIpsSet {
             desk_id: &desk_id,
             ips: &ips,
@@ -219,6 +229,24 @@ impl Gimbal {
 }
 
 impl Gimbal {
+    /// The desk of an Orderly money-out call (`orderly_settle_pnl`, `orderly_withdraw`) and its
+    /// path, told apart by the deposit ([`check_withdraw_deposit`]): the owner's wallet passes a
+    /// paused desk (C10 round 2: after `panic_close` the owner takes money out without
+    /// resuming), the operator path needs a running one (`E_PAUSED`). The role first, so a
+    /// stranger learns nothing from the deposit rule.
+    fn withdraw_desk(&self, desk_id: &str, method: &str) -> (&Desk, WithdrawPath) {
+        let (desk, _) = action_desk(&self.desks, desk_id, Gate::ReducesRisk);
+        let path = check_withdraw_deposit(method, env::attached_deposit()).or_fail();
+        let caller = env::predecessor_account_id();
+        match path {
+            WithdrawPath::Owner => desk.check_owner(desk_id, &caller, method).or_fail(),
+            WithdrawPath::Operator => {
+                desk.check_action(desk_id, &caller, Gate::Running).or_fail();
+            }
+        }
+        (desk, path)
+    }
+
     /// The broker every Orderly message names.
     fn broker(&self) -> Broker<'_> {
         Broker {
@@ -287,6 +315,7 @@ impl Gimbal {
         let reference = |symbol: &str| reference_price(prices, symbol, max_age_s, block_ms);
         let authority = check_base58_32("solana.authority", &desk.solana.authority).or_fail();
         let key = orderly_key(&authority);
+        let mut settings = self.settings_of(&desk_id);
         let ctx = Context {
             keccak,
             broker: self.broker(),
@@ -298,9 +327,14 @@ impl Gimbal {
             reference: &reference,
             orderly_key: &key,
             orderly_ips: (!desk.orderly_ips.is_empty()).then_some(desk.orderly_ips.as_slice()),
+            ips_applied: settings.orderly_ips_applied,
         };
         let signable = build_request(&ctx, &req).or_fail();
-        if !signable.reduces_risk {
+        // C10 round 2: `settle_pnl` and `withdraw_request` only post an EIP-712 message the desk
+        // signed (checked below), which `orderly_settle_pnl` / `orderly_withdraw` gated already:
+        // on a paused desk only the owner's wallet gets one. So they pass a paused desk, or the
+        // owner's money could not leave Orderly after `panic_close`.
+        if !signable.reduces_risk && signable.eip712.is_none() {
             desk.check_action(&desk_id, &env::predecessor_account_id(), Gate::Running)
                 .or_fail();
         }
@@ -317,6 +351,12 @@ impl Gimbal {
                 .map(|o| notional_e8(o.px_e8, o.sz_e8, &o.valued)),
         );
         self.desk_counters.insert(desk_id.clone(), counters);
+        // C10 round 2 (B S4): the signed ip_restriction is what applies the list at Orderly.
+        // Signed is as far as the contract sees; the relayer posts it.
+        if signable.kind == "ip_restriction" && !settings.orderly_ips_applied {
+            settings.orderly_ips_applied = true;
+            self.desk_settings.insert(desk_id.clone(), settings);
+        }
         rest_action(desk_id, &signable, Some(&reason))
     }
 
@@ -333,7 +373,7 @@ impl Gimbal {
         desk_id: String,
         settle_nonce: u64,
     ) -> UnsignedAction {
-        let (desk, _) = action_desk(&self.desks, &desk_id, Gate::Running);
+        let desk = self.withdraw_desk(&desk_id, "orderly_settle_pnl").0;
         let evm = desk_evm(desk);
         let message = Message::SettlePnl {
             settle_nonce,
@@ -349,12 +389,7 @@ impl Gimbal {
         amount: String,
         withdraw_nonce: u64,
     ) -> UnsignedAction {
-        let (desk, _) = action_desk(&self.desks, &desk_id, Gate::Running);
-        let path = check_withdraw_deposit("orderly_withdraw", env::attached_deposit()).or_fail();
-        if path == WithdrawPath::Owner {
-            desk.check_owner(&desk_id, &env::predecessor_account_id(), "orderly_withdraw")
-                .or_fail();
-        }
+        let (desk, path) = self.withdraw_desk(&desk_id, "orderly_withdraw");
         let evm = desk_evm(desk);
         let message =
             Message::withdraw(evm, &amount, withdraw_nonce, env::block_timestamp_ms()).or_fail();

@@ -621,6 +621,9 @@ pub struct Context<'a> {
     pub orderly_key: &'a str,
     /// The relayer IPs the owner set with `set_orderly_ips`, if any: what `ip_restriction` applies.
     pub orderly_ips: Option<&'a [String]>,
+    /// Whether the contract signed an `ip_restriction` for the current list (`set_orderly_ips`
+    /// clears it): what a mainnet order that is not reduce-only waits for.
+    pub ips_applied: bool,
 }
 
 /// The base asset of `PERP_<BASE>_USDC`: the symbol prices and `policy.unpriced` use (`ETH`).
@@ -1008,13 +1011,14 @@ fn order(ctx: &Context, req: &OrderlyRequest) -> Result<Signable, Refusal> {
         ));
     }
     // The replay above: on mainnet an order that can grow a position waits for the owner's IP
-    // list, which `ip_restriction` applies at Orderly so a copy posted from elsewhere is refused.
-    if ctx.broker.network == Network::Mainnet && !req.reduce_only && ctx.orderly_ips.is_none() {
+    // list and for the contract to have signed `ip_restriction` of that list (C10 round 2: a list
+    // that was only set changes nothing at Orderly), so a copy posted from elsewhere is refused.
+    if ctx.broker.network == Network::Mainnet && !req.reduce_only && !ctx.ips_applied {
         return Err(Refusal::new(
             E_ARGS,
-            "on mainnet an order that is not reduce-only needs the owner's relayer IP list first \
-             (set_orderly_ips, then orderly_request kind ip_restriction): anyone could post a copy \
-             of the signed order again",
+            "on mainnet an order that is not reduce-only needs the owner's relayer IP list \
+             applied first (set_orderly_ips, then orderly_request kind ip_restriction for that \
+             list): anyone could post a copy of the signed order again",
         ));
     }
     let side = need("side", &req.side)?;

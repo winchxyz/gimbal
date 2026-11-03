@@ -247,13 +247,13 @@ fn orderly_settle_pnl_signs_the_vector() {
 #[test]
 fn orderly_withdraw_signs_the_vectors_to_the_desk_address() {
     let mut g = orderly_desk();
-    // The operator path within the hourly rescue cap, the owner's wallet past it.
+    // The owner's wallet: 5 USDC is under the operator's 10 USDC minimum (C10 round 2).
     for (name, amount, who, deposit) in [
         (
             "Withdraw 5 USDC to the desk address (testnet)",
             "5",
-            operator(),
-            yocto(0),
+            owner(),
+            ONE_YOCTO,
         ),
         (
             "Withdraw 1234.56789 USDC, nonce 42 (testnet)",
@@ -273,9 +273,9 @@ fn orderly_withdraw_signs_the_vectors_to_the_desk_address() {
 }
 
 /// C10: `orderly_withdraw` has `hl_withdraw`'s two paths. The operator's (no deposit) takes at
-/// least 10 × `max_transfer_cost_flat_e6`, counts its amount against the hourly rescue cap and
-/// Orderly's 1 USDC fee against the cost budget; the owner's wallet (1 yoctoNEAR) is not limited;
-/// any other deposit is refused.
+/// least max(10 × `max_transfer_cost_flat_e6`, 10 USDC), counts its amount against the hourly
+/// rescue cap and Orderly's 1 USDC fee against the cost budget; the owner's wallet (1 yoctoNEAR)
+/// is not limited; any other deposit is refused.
 #[test]
 fn orderly_withdraw_has_an_owner_path_and_an_operator_path() {
     let mut g = orderly_desk();
@@ -283,22 +283,22 @@ fn orderly_withdraw_has_an_owner_path_and_an_operator_path() {
     let t = 1_793_491_200_000;
     at(operator(), t, yocto(0));
     let msg =
-        outcome(|| g.prepare_orderly_withdraw("alpha".into(), "4.999999".into(), 1)).unwrap_err();
+        outcome(|| g.prepare_orderly_withdraw("alpha".into(), "9.999999".into(), 1)).unwrap_err();
     assert_eq!(
         msg,
-        "E_SIZE: the operator's orderly_withdraw of 4.999999 USDC is under its minimum of 5 USDC \
-         (10 × max_transfer_cost_flat_e6); the owner has none"
+        "E_SIZE: the operator's orderly_withdraw of 9.999999 USDC is under its minimum of 10 USDC \
+         (10 × max_transfer_cost_flat_e6, at least 10 USDC); the owner has none"
     );
-    g.prepare_orderly_withdraw("alpha".into(), "5".into(), 1);
+    g.prepare_orderly_withdraw("alpha".into(), "10".into(), 1);
     let c = g.counters_of("alpha");
     assert_eq!(
-        (c.rescue_spent_e8, c.rescue_cost_e8),
-        (500_000_000, 100_000_000)
+        (c.rescue_spent_e8, c.rescue_cost_e8, c.rescue_quote_e8),
+        (1_000_000_000, 100_000_000, 0)
     );
     assert!(
-        outcome(|| g.prepare_orderly_withdraw("alpha".into(), "46".into(), 2))
+        outcome(|| g.prepare_orderly_withdraw("alpha".into(), "41".into(), 2))
             .unwrap_err()
-            .starts_with("E_RESCUE_CAP: orderly_withdraw of 46 USDC is over what is left of the hourly rescue cap, 45 USD")
+            .starts_with("E_RESCUE_CAP: orderly_withdraw of 41 USDC is over what is left of the hourly rescue cap, 40 USD")
     );
     at(operator(), t, ONE_YOCTO);
     assert!(
@@ -538,6 +538,9 @@ fn a_paused_desk_signs_only_orderly_calls_that_reduce_risk() {
         "funding_fee_history of one symbol, one day, page 1 of 60 rows (testnet)",
         "positions (testnet)",
         "holding (testnet)",
+        // C10 round 2: they post an EIP-712 message only the owner's wallet gets on a paused desk.
+        "settle_pnl POST (testnet)",
+        "withdraw_request POST (testnet)",
     ] {
         let req = request_of(&request_case(name));
         request(&mut g, owner(), req.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -547,12 +550,7 @@ fn a_paused_desk_signs_only_orderly_calls_that_reduce_risk() {
     at(operator(), t, yocto(0));
     g.prepare_orderly_ws_auth("alpha".into(), t);
 
-    for name in [
-        "order LIMIT BUY",
-        "settle_pnl POST (testnet)",
-        "withdraw_request POST (testnet)",
-        "referral_bind (testnet)",
-    ] {
+    for name in ["order LIMIT BUY", "referral_bind (testnet)"] {
         let req = request_of(&request_case(name));
         let msg = request(&mut g, operator(), req).unwrap_err();
         assert!(
@@ -575,7 +573,7 @@ fn a_paused_desk_signs_only_orderly_calls_that_reduce_risk() {
         ),
         (
             "orderly_withdraw",
-            Box::new(|g| g.prepare_orderly_withdraw("alpha".into(), "5".into(), 1)),
+            Box::new(|g| g.prepare_orderly_withdraw("alpha".into(), "10".into(), 1)),
         ),
     ];
     for (name, f) in refused {
@@ -583,6 +581,42 @@ fn a_paused_desk_signs_only_orderly_calls_that_reduce_risk() {
         let msg = outcome(|| f(&mut g)).unwrap_err();
         assert!(msg.starts_with("E_PAUSED"), "{name}: {msg}");
     }
+    // C10 round 2 (A N6): the owner's wallet settles and withdraws on a paused desk, so money
+    // comes out after panic_close without a resume; the operator's 1 yocto is still not the
+    // owner's.
+    at(owner(), t, ONE_YOCTO);
+    assert_eq!(
+        g.prepare_orderly_settle_pnl("alpha".into(), 1).kind,
+        "SettlePnl"
+    );
+    let w = g.prepare_orderly_withdraw("alpha".into(), "5".into(), 1);
+    assert_eq!(w.amount.as_deref(), Some("5"));
+    at(operator(), t, ONE_YOCTO);
+    for (name, f) in [
+        (
+            "orderly_settle_pnl",
+            Box::new(|g: &mut Gimbal| g.prepare_orderly_settle_pnl("alpha".into(), 1)) as Call,
+        ),
+        (
+            "orderly_withdraw",
+            Box::new(|g: &mut Gimbal| g.prepare_orderly_withdraw("alpha".into(), "5".into(), 1))
+                as Call,
+        ),
+    ] {
+        let msg = outcome(|| f(&mut g)).unwrap_err();
+        assert!(
+            msg.starts_with(&format!(
+                "E_NOT_ALLOWED: {name} on desk alpha is for its owner"
+            )),
+            "{name}: {msg}"
+        );
+    }
+    at(owner(), t, yocto(2));
+    let msg = outcome(|| g.prepare_orderly_settle_pnl("alpha".into(), 1)).unwrap_err();
+    assert!(
+        msg.starts_with("E_NOT_ALLOWED: orderly_settle_pnl takes exactly 1 yoctoNEAR"),
+        "{msg}"
+    );
 }
 
 /// After `panic_close`, through the method itself: either order of the vectors, buy or sell,
@@ -651,7 +685,7 @@ fn orderly_methods_are_for_the_owner_and_the_operator() {
         ),
         (
             "orderly_withdraw",
-            Box::new(|g, d| g.prepare_orderly_withdraw(d.into(), "5".into(), 1)),
+            Box::new(|g, d| g.prepare_orderly_withdraw(d.into(), "10".into(), 1)),
         ),
     ];
     for (name, f) in &calls {
@@ -741,10 +775,10 @@ fn the_vector_signatures_pass_on_signed() {
         )]
     );
 
-    // A withdrawal names its amount.
+    // A withdrawal names its amount (the owner's wallet: 5 USDC is under the operator's minimum).
     let c = eip712_case("Withdraw 5 USDC to the desk address (testnet)");
     let m = &c["message_typed"];
-    at(operator(), u(&m["timestamp"]), yocto(0));
+    at(owner(), u(&m["timestamp"]), ONE_YOCTO);
     let action = g.prepare_orderly_withdraw("alpha".into(), "5".into(), u(&m["withdrawNonce"]));
     let sig = &c["signature"];
     let v = u(&sig["v"]);
@@ -932,4 +966,75 @@ fn ip_restriction_signs_the_owners_list_and_passes_a_paused_desk() {
         serde_json::to_value(&got.payload).unwrap()["body"],
         r#"{"orderly_key":"ed25519:GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB","ip_restriction_list":"198.51.100.1"}"#
     );
+}
+
+/// C10 round 2 (item 11): on mainnet an Orderly order that is not reduce-only needs the owner's
+/// IP list applied, which the contract knows as having signed `ip_restriction` for the current
+/// list (`get_desk_settings`'s `orderly_ips_applied`); `set_orderly_ips` clears it again.
+#[test]
+fn a_mainnet_opening_order_needs_the_ip_list_applied() {
+    called_by(contract_id());
+    let mut g = Gimbal::new(
+        Network::Mainnet,
+        "v1.signer".parse().unwrap(),
+        PriceSource::OutLayer {
+            contract: "price-oracle.near".parse().unwrap(),
+        },
+        treasury(),
+        fees(),
+        OrderlyConfig {
+            broker_id: "gimbal_dex".into(),
+            chain_id: ARBITRUM_MAINNET,
+        },
+    );
+    let mut desk = Desk::new(
+        owner(),
+        orderly_policy(),
+        VECTOR_DESK_EVM.into(),
+        vector_solana(),
+        "gimbal_dex",
+    );
+    desk.operator = Some(operator());
+    g.desks.insert("alpha".into(), desk);
+    g.desk_counters.insert("alpha".into(), Default::default());
+    let order = request_of(&request_case("order LIMIT BUY"));
+    let t = order.timestamp_ms;
+    let ip_restriction = |t: u64| -> OrderlyRequest {
+        serde_json::from_value(json!({ "kind": "ip_restriction", "timestamp_ms": t })).unwrap()
+    };
+    let applied = |g: &Gimbal| {
+        called_by(owner());
+        g.get_desk_settings("alpha".into())
+            .unwrap()
+            .orderly_ips_applied
+    };
+
+    let msg = request(&mut g, operator(), order.clone()).unwrap_err();
+    assert!(
+        msg.starts_with("E_ARGS: ") && msg.contains("set_orderly_ips"),
+        "{msg}"
+    );
+    call(owner(), storage_deposit());
+    g.set_orderly_ips("alpha".into(), vec!["203.0.113.7".into()]);
+    assert!(!applied(&g));
+    let msg = request(&mut g, operator(), order.clone()).unwrap_err();
+    assert!(msg.contains("applied first"), "{msg}");
+    // A reduce-only order is not held back.
+    let mut reduce = order.clone();
+    reduce.reduce_only = true;
+    request(&mut g, operator(), reduce).unwrap();
+
+    request(&mut g, operator(), ip_restriction(t)).unwrap();
+    assert!(applied(&g));
+    let got = request(&mut g, operator(), order.clone()).unwrap();
+    assert_eq!(got.kind, "order");
+
+    // A new list is not applied until the contract signs it.
+    call(owner(), storage_deposit());
+    g.set_orderly_ips("alpha".into(), vec!["198.51.100.1".into()]);
+    assert!(!applied(&g));
+    let msg = request(&mut g, operator(), order.clone()).unwrap_err();
+    assert!(msg.contains("applied first"), "{msg}");
+    request(&mut g, owner(), ip_restriction(t + 1)).unwrap();
+    assert!(applied(&g));
 }

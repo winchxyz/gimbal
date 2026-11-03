@@ -1305,8 +1305,8 @@ fn owner_sets_and_clears_the_operator() {
 
 /// The storage each owner method that adds some adds, in bytes and in NEAR at the chain's price
 /// (10^19 yoctoNEAR a byte), from the fixtures' desk to the largest one: the table of the C7 PR
-/// (`--nocapture` prints it). The caps hold every case with room; the numbers are printed, not
-/// pinned.
+/// (`--nocapture` prints it). The caps hold every case with room; `create_desk`'s two numbers are
+/// pinned as well (docs/interfaces.md §1.2 quotes them), so a change to what a desk stores shows.
 #[test]
 fn the_storage_each_owner_method_adds() {
     /// The bytes `act` adds in the current call (each `testing_env!` restarts the mock's count).
@@ -1371,6 +1371,9 @@ fn the_storage_each_owner_method_adds() {
         bytes,
         500,
     ));
+    // C10 round 2: + 10 bytes of settings (the 1Click proposal seq, the pinned-key distrust and
+    // the Orderly IPs-applied flag) and + 16 bytes in each counter record (the quotes' cost meter).
+    assert_eq!((rows[0].1, rows[1].1), (4_081, 11_691));
     for (what, bytes, cap) in rows {
         let near = bytes as f64 * 1e-5;
         eprintln!("{what}: {bytes} bytes, {near:.5} NEAR");

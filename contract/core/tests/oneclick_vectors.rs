@@ -6,8 +6,8 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use gimbal_core::errors::{E_QUOTE_FIELDS, E_QUOTE_SIGNATURE, E_RESCUE_CAP};
 use gimbal_core::oneclick::{
     check_cost, check_quote_age, check_signature, decimals, parse_time_ms, verify_quote, Context,
-    DeskAddresses, Method, ARB_USDC, HL_USDC, NEAR_USDC, ONECLICK_PUBLIC_KEY_B58, QUOTE_MAX_AGE_MS,
-    QUOTE_MAX_AHEAD_MS, SOL_USDC,
+    DeskAddresses, Method, ARB_USDC, HL_USDC, NEAR_USDC, ONECLICK_FEE_MAX_FLAT_E8,
+    ONECLICK_PUBLIC_KEY_B58, QUOTE_MAX_AGE_MS, QUOTE_MAX_AHEAD_MS, SOL_USDC,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -64,6 +64,7 @@ fn context(ctx: &Value) -> Context<'_> {
         now_ms: ctx["now_ms"].as_u64().unwrap(),
         remaining_cap_e8: u128::from(ctx["remaining_cap_usd"].as_u64().unwrap()) * 100_000_000,
         second_key: None,
+        pinned_key: true,
         dry_ok: ctx["dry_ok"].as_bool().unwrap(),
     }
 }
@@ -494,7 +495,7 @@ fn field_of<'a>(canonical: &'a str, key: &str) -> &'a str {
     &canonical[start..start + len]
 }
 
-/// C10, B1: a quote whose `amountIn − amountOut` is over 0.5 USDC + 25 bps of `amountIn` pays
+/// C10, B1: a quote whose `amountIn − amountOut` is over 1 USDC + 25 bps of `amountIn` pays
 /// someone a fee besides 1Click (`appFees`) and is refused, on every method. Each recorded live
 /// quote with `amountOut` (and `minAmountOut`, so fund_venue's room and the Orderly minimum still
 /// hold) moved to the bound passes; one unit lower is `E_QUOTE_FIELDS`.
@@ -515,7 +516,7 @@ fn a_quote_paying_more_than_oneclicks_own_fee_is_refused_on_every_method() {
         let scale_in = 10u128.pow(8 - decimals(method.origin_asset()).unwrap());
         let scale_out = 10u128.pow(8 - decimals(field_of(canonical, "destinationAsset")).unwrap());
         let in_e8 = amount_in * scale_in;
-        let edge_e8 = in_e8 - (50_000_000 + in_e8 * 25 / 10_000);
+        let edge_e8 = in_e8 - (ONECLICK_FEE_MAX_FLAT_E8 + in_e8 * 25 / 10_000);
         let edge = edge_e8.div_ceil(scale_out);
         let at = |out: u128| {
             let quoted = canonical
@@ -556,7 +557,7 @@ fn a_quote_paying_more_than_oneclicks_own_fee_is_refused_on_every_method() {
         .unwrap();
         assert!(
             v.amount_in_e8 - v.amount_out_e8.min(v.amount_in_e8)
-                <= 50_000_000 + in_e8 * 25 / 10_000
+                <= ONECLICK_FEE_MAX_FLAT_E8 + in_e8 * 25 / 10_000
         );
         methods.insert(method.name());
     }
@@ -585,7 +586,7 @@ fn a_hypercore_quote_paying_more_than_oneclicks_own_fee_is_refused() {
         let ctx = context(&c["ctx"]);
         let in_e8: u128 = field_of(canonical, "amountIn").parse().unwrap();
         let scale_out = 10u128.pow(8 - decimals(field_of(canonical, "destinationAsset")).unwrap());
-        let edge = (in_e8 - (50_000_000 + in_e8 * 25 / 10_000)).div_ceil(scale_out);
+        let edge = (in_e8 - (ONECLICK_FEE_MAX_FLAT_E8 + in_e8 * 25 / 10_000)).div_ceil(scale_out);
         let at = |out: u128| {
             let quoted = canonical
                 .replace(

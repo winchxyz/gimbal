@@ -35,7 +35,7 @@ export const CREATE_DESK_NOTE = 'The contract keeps only the storage the desk us
  * the desk's meters and its rings of deposit-address hashes (rescue and funding), its money record, a reserve for the
  * contract-wide paid-address map, its Orderly account id, the owner's index entries and 40 B of chain overhead for
  * each record, and its settings (Phoenix accounts, second 1Click key). Measured by the contract's own test
- * (`the_storage_each_owner_method_adds`): 4,039 B with a small policy, 11,649 B with the largest valid one, and it caps
+ * (`the_storage_each_owner_method_adds`): 4,081 B with a small policy, 11,691 B with the largest valid one, and it caps
  * them at 4,500 and 12,500. The policy takes less in Borsh than its JSON takes in the arguments, so what is left over
  * is the fixed part, at most about 4,300 B (a 64-character owner and a 32-character desk id). 12,000 B is far over that, and with the arguments over the largest desk in all
  * (about 0.12 NEAR, returned). The old margin of 1,000 B was short of even a small desk:

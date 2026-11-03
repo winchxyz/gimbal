@@ -26,20 +26,27 @@ use crate::solana::{
 
 /// The highest compute-unit limit a message may set.
 pub const MAX_COMPUTE_UNIT_LIMIT: u32 = 600_000;
-/// The highest priority fee a message may set, in micro-lamports per compute unit: twice what the
-/// engine sets (100,000 with 400k to 600k units), so a stolen operator key repeating a
-/// `cancel_all` with the most it may pay burns 0.000125 SOL a transaction (with the 5,000
-/// lamport base fee), not 0.000605.
+/// The highest priority fee a message that opens risk or moves money may set, in micro-lamports
+/// per compute unit: twice what the engine sets (100,000 with 400k to 600k units).
 pub const MAX_COMPUTE_UNIT_PRICE: u64 = 200_000;
-/// The most a message may pay in priority fees, in lamports: both caps together, 0.00012 SOL. A
-/// price is taken only with a unit limit, which bounds the units it pays for.
+/// The most such a message may pay in priority fees, in lamports: both caps together,
+/// 0.00012 SOL. A price is taken only with a unit limit, which bounds the units it pays for.
 pub const MAX_PRIORITY_FEE_LAMPORTS: u64 =
     MAX_COMPUTE_UNIT_LIMIT as u64 * MAX_COMPUTE_UNIT_PRICE / 1_000_000;
-/// The highest compute-unit limit of a paused desk's rescue that pays a priority fee: a rescue
-/// needs a priority fee to land under congestion, and with this limit it pays at most 0.00008 SOL
-/// of it. Rescues are metered by the hourly rescue cap and the deposit ring (at most 32 in any
-/// 65 min), so a paused desk burns at most 32 × 0.000085 SOL in fees in that time.
+/// The highest priority fee of an urgent message (C10 round 2): one that only cancels or reduces
+/// (what a paused desk may sign) or a rescue, with a unit limit of at most
+/// [`RESCUE_MAX_COMPUTE_UNIT_LIMIT`]. Under a fee spike these are the messages that must land; at
+/// most 0.0004 SOL of priority fee each ([`URGENT_MAX_PRIORITY_FEE_LAMPORTS`]).
+pub const URGENT_MAX_COMPUTE_UNIT_PRICE: u64 = 1_000_000;
+/// The highest compute-unit limit of an urgent message above [`MAX_COMPUTE_UNIT_PRICE`], and of a
+/// paused desk's rescue that pays a priority fee: a rescue needs a priority fee to land under
+/// congestion. Rescues are metered by the hourly rescue cap and the deposit ring (at most 32 in
+/// any 65 min).
 pub const RESCUE_MAX_COMPUTE_UNIT_LIMIT: u64 = 400_000;
+/// The most an urgent message may pay in priority fees, in lamports: 400,000 units at
+/// 1,000,000 micro-lamports, 0.0004 SOL.
+pub const URGENT_MAX_PRIORITY_FEE_LAMPORTS: u64 =
+    RESCUE_MAX_COMPUTE_UNIT_LIMIT * URGENT_MAX_COMPUTE_UNIT_PRICE / 1_000_000;
 
 // Anchor discriminators, sha256("global:<name>")[0..8].
 /// Phoenix `place_market_order`.
@@ -185,10 +192,13 @@ impl PhoenixAccounts {
 
     /// What an owner may set for the desk `desk` (`E_ARGS`): no program id, mint or Phoenix
     /// onboarding key; none of the desk's own derived accounts; no two entries alike; and the
-    /// program-derived ones (log authority, global configuration, the two vaults, Ember's state)
-    /// off the ed25519 curve, so no private key can sign for them. Ember's state is the only
-    /// delegate an `Approve` may name, and that allowance never outlives the message (the walk
-    /// requires the `Revoke`), so only Ember's own program can use it.
+    /// program-derived ones (log authority, global configuration, Ember's state) off the ed25519
+    /// curve, so no private key can sign for them. Ember's state is the only delegate an
+    /// `Approve` may name, and that allowance never outlives the message (the walk requires the
+    /// `Revoke`), so only Ember's own program can use it. The two vaults are token accounts:
+    /// what moves their tokens is the token account's owner field, not a key for the address, so
+    /// the curve says nothing about them, and a vault made from a keypair must stay settable
+    /// (C10 round 2).
     ///
     /// Why the desk's money cannot be sent elsewhere through these: every account the desk's
     /// money lands in (its USDC and PhUSD accounts, its trader account, a rescue's deposit
@@ -209,13 +219,7 @@ impl PhoenixAccounts {
             (desk.phusd_ata, "the desk's PhUSD account"),
             (desk.trader, "the desk's trader account"),
         ];
-        let off_curve = [
-            "log_authority",
-            "global_configuration",
-            "global_vault",
-            "ember_state",
-            "ember_vault",
-        ];
+        let off_curve = ["log_authority", "global_configuration", "ember_state"];
         for (i, (name, key)) in entries.iter().enumerate() {
             if let Some((_, what)) = NOT_INFRA.iter().chain(own.iter()).find(|(k, _)| k == key) {
                 return refuse(name, format!("{} is {what}", b58(key)));
@@ -315,8 +319,9 @@ pub struct CheckedMessage {
     pub orders: Vec<PhoenixOrder>,
     /// True when a paused desk may sign it: besides the compute budget, every instruction is a
     /// `cancel_all`, a reduce-only order, a `Revoke` of a desk token account or a token transfer
-    /// into a desk token account, and a priority fee (a unit price above 0) comes only with a
-    /// `cancel_all` or a reduce-only order, so a paused desk cannot be made to burn SOL on fees.
+    /// into a desk token account, every order is reduce-only, and a priority fee (a unit price
+    /// above 0) comes only with a `cancel_all` or a reduce-only order, so a paused desk cannot be
+    /// made to burn SOL on fees for anything else.
     /// Anything else (a deposit or withdrawal, Ember, a token account created, an `Approve`, a
     /// rescue transfer, which moves money out) needs a running desk.
     ///
@@ -324,9 +329,9 @@ pub struct CheckedMessage {
     /// frees and pays out the quote's `amountIn`: Phoenix withdrawals of at most `amountIn` in
     /// all, Ember unwraps of an amount, at most `amountIn` in all (with the `Approve` each spends
     /// and the `Revoke` after it, which the walk requires), `Revoke`s, the create of the deposit
-    /// owner's account and the one transfer to it. No order, `cancel_all` (`sol_sign` signs
-    /// those on a paused desk), deposit, wrap, other token transfer, create of a desk account or
-    /// priority fee.
+    /// owner's account and the one transfer to it, with a priority fee only for a unit limit of
+    /// at most [`RESCUE_MAX_COMPUTE_UNIT_LIMIT`]. No order, `cancel_all` (`sol_sign` signs those
+    /// on a paused desk), deposit, wrap, other token transfer or create of a desk account.
     pub reduces_risk: bool,
 }
 
@@ -418,13 +423,15 @@ fn check_compute_budget(data: &[u8], n: usize) -> Result<(u8, u64), Refusal> {
             Ok((SET_COMPUTE_UNIT_LIMIT, u64::from(limit)))
         }
         (Some(&SET_COMPUTE_UNIT_PRICE), 9) => {
+            // Over MAX_COMPUTE_UNIT_PRICE only an urgent message: Budget::finish knows which.
             let price = le_u64(&data[1..]);
-            if price > MAX_COMPUTE_UNIT_PRICE {
+            if price > URGENT_MAX_COMPUTE_UNIT_PRICE {
                 return Err(at(
                     n,
                     E_SOL_PROGRAM,
                     format!(
-                        "priority fee {price} micro-lamports per unit is over {MAX_COMPUTE_UNIT_PRICE}"
+                        "priority fee {price} micro-lamports per unit is over \
+                         {URGENT_MAX_COMPUTE_UNIT_PRICE}"
                     ),
                 ));
             }
@@ -466,8 +473,9 @@ impl Budget {
 
     /// A price needs a limit: without one every instruction may burn 200,000 units, up to
     /// 1,400,000, each paying the price. With both, the priority fee is at most
-    /// [`MAX_PRIORITY_FEE_LAMPORTS`].
-    fn finish(&self) -> Result<(), Refusal> {
+    /// [`MAX_PRIORITY_FEE_LAMPORTS`]. A price over [`MAX_COMPUTE_UNIT_PRICE`] is for an `urgent`
+    /// message alone, with a limit of at most [`RESCUE_MAX_COMPUTE_UNIT_LIMIT`].
+    fn finish(&self, urgent: bool) -> Result<(), Refusal> {
         let Some((n, price)) = self.price else {
             return Ok(());
         };
@@ -478,12 +486,29 @@ impl Budget {
                 "a priority fee needs a SetComputeUnitLimit in the same message",
             ));
         };
-        let fee = (u128::from(limit) * u128::from(price)).div_ceil(1_000_000);
-        if fee > u128::from(MAX_PRIORITY_FEE_LAMPORTS) {
+        if price > MAX_COMPUTE_UNIT_PRICE && !(urgent && limit <= RESCUE_MAX_COMPUTE_UNIT_LIMIT) {
             return Err(at(
                 n,
                 E_SOL_PROGRAM,
-                format!("a priority fee of {fee} lamports is over {MAX_PRIORITY_FEE_LAMPORTS}"),
+                format!(
+                    "priority fee {price} micro-lamports per unit is over \
+                     {MAX_COMPUTE_UNIT_PRICE}; up to {URGENT_MAX_COMPUTE_UNIT_PRICE} only for a \
+                     message that only cancels or reduces, or a rescue, with a compute unit limit \
+                     of at most {RESCUE_MAX_COMPUTE_UNIT_LIMIT}"
+                ),
+            ));
+        }
+        let fee = (u128::from(limit) * u128::from(price)).div_ceil(1_000_000);
+        let max = if urgent {
+            MAX_PRIORITY_FEE_LAMPORTS.max(URGENT_MAX_PRIORITY_FEE_LAMPORTS)
+        } else {
+            MAX_PRIORITY_FEE_LAMPORTS
+        };
+        if fee > u128::from(max) {
+            return Err(at(
+                n,
+                E_SOL_PROGRAM,
+                format!("a priority fee of {fee} lamports is over {max}"),
             ));
         }
         Ok(())
@@ -1120,7 +1145,9 @@ impl<'a> Walk<'a> {
 /// first refusal being the answer:
 ///
 /// - compute budget: a unit limit up to [`MAX_COMPUTE_UNIT_LIMIT`] and a price up to
-///   [`MAX_COMPUTE_UNIT_PRICE`], once each, a price only with a limit;
+///   [`MAX_COMPUTE_UNIT_PRICE`], once each, a price only with a limit; up to
+///   [`URGENT_MAX_COMPUTE_UNIT_PRICE`] for a rescue or a message that only cancels or reduces,
+///   with a limit of at most [`RESCUE_MAX_COMPUTE_UNIT_LIMIT`] (C10 round 2);
 /// - token account program: `CreateIdempotent` paid by the desk for its own USDC or PhUSD account
 ///   (or, in a rescue, the deposit owner's USDC account);
 /// - SPL Token: `Approve` of the desk's PhUSD account to the Ember authority for exactly the
@@ -1184,7 +1211,12 @@ pub fn check_message(
     for (n, ix) in m.instructions.iter().enumerate() {
         walk.instruction(ix, n)?;
     }
-    walk.budget.finish()?;
+    // Urgent: a rescue, or a message that only cancels or reduces, as a paused desk's gate reads
+    // it (below).
+    let cancels_or_reduces = walk.cancel_all || walk.orders.iter().any(|o| o.reduce_only);
+    let urgent = rescue.is_some()
+        || (walk.reduces_risk && walk.orders.iter().all(|o| o.reduce_only) && cancels_or_reduces);
+    walk.budget.finish(urgent)?;
     if let Some((n, amount)) = walk.approval {
         return Err(at(
             n,
@@ -1222,7 +1254,6 @@ pub fn check_message(
     // A priority fee is spent whatever the message does, so a paused desk pays one only to cancel
     // or to reduce a position.
     let priority_fee = walk.budget.price.is_some_and(|(_, price)| price > 0);
-    let cancels_or_reduces = walk.cancel_all || walk.orders.iter().any(|o| o.reduce_only);
     // A paused desk's rescue may pay a priority fee (within the price cap) for at most
     // RESCUE_MAX_COMPUTE_UNIT_LIMIT units, so it can land under congestion.
     let rescue_fee_ok = !priority_fee
@@ -1492,8 +1523,9 @@ fn check_shape(
             format!("a Phoenix {} message is missing instructions", which.kind()),
         ));
     }
-    // A unit price needs a unit limit here too, within the same caps as sol_sign.
-    budget.finish()
+    // A unit price needs a unit limit here too, within sol_sign's caps for a message that is
+    // not urgent.
+    budget.finish(false)
 }
 
 #[cfg(test)]

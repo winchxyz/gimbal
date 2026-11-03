@@ -334,7 +334,23 @@ fn get_desk_counters_shows_the_eip3009_counter_and_the_meters() {
     assert_eq!(v.rescue_spent_now_e8.0, 5 * 100_000_000);
     assert_eq!(v.rescue_cap_left_e8.0, 45 * 100_000_000);
     assert_eq!(v.rescue_cost_e8.0, stored.rescue_cost_e8);
-    assert_eq!(v.rescue_cost_budget_e8.0, 300_000_000);
+    assert_eq!(v.rescue_cost_budget_e8.0, 500_000_000);
+    // C10 round 2: the quotes' share, the budget without the four venue fees.
+    assert_eq!(v.rescue_quote_budget_e8.0, 100_000_000);
+    assert_eq!(v.rescue_quote_cost_e8.0, stored.rescue_quote_e8);
+    assert_eq!(
+        stored.rescue_quote_e8, stored.rescue_cost_e8,
+        "no venue fee"
+    );
+    assert_eq!(
+        v.rescue_quote_cost_left_e8.0,
+        100_000_000
+            - decayed(
+                stored.rescue_quote_e8,
+                NOW_MS,
+                NOW_MS + RESCUE_WINDOW_MS / 2
+            )
+    );
     assert_eq!(
         v.deposits[0].as_deref(),
         Some(hex::encode(stored.deposits[0]).as_str())
@@ -373,6 +389,9 @@ fn get_desk_counters_shows_the_eip3009_counter_and_the_meters() {
             "rescue_cost_e8",
             "rescue_cost_left_e8",
             "rescue_cost_now_e8",
+            "rescue_quote_budget_e8",
+            "rescue_quote_cost_e8",
+            "rescue_quote_cost_left_e8",
             "rescue_spent_e8",
             "rescue_spent_now_e8",
         ]
@@ -437,21 +456,26 @@ fn the_operators_hl_withdraw_shares_the_rescue_cap_but_not_the_cost_or_the_ring(
         "the ring holds the one quote's address"
     );
     assert!(
-        outcome(|| g.prepare_hl_withdraw("alpha".into(), "5".into()))
+        outcome(|| g.prepare_hl_withdraw("alpha".into(), "10".into()))
             .unwrap_err()
-            .starts_with("E_RESCUE_CAP: hl_withdraw of 5 USDC is over ")
+            .starts_with("E_RESCUE_CAP: hl_withdraw of 10 USDC is over ")
     );
-    // Later, the withdrawal brings the cost meter down to its time as well, as a rescue does.
+    // Later, the withdrawal brings the cost meters down to its time as well, as a rescue does;
+    // its fee is no quote cost.
     let later = NOW_MS + RESCUE_WINDOW_MS / 2;
     at(operator(), later, yocto(0));
-    g.prepare_hl_withdraw("alpha".into(), "5".into());
+    g.prepare_hl_withdraw("alpha".into(), "10".into());
     let c = counters(&g);
     assert_eq!(c.rescue_at_ms, later);
     assert_eq!(
         c.rescue_cost_e8,
         decayed(after_rescue.rescue_cost_e8 + 100_000_000, NOW_MS, later) + 100_000_000
     );
-    assert_eq!(c.rescue_spent_e8, decayed(5 * ten, NOW_MS, later) + ten / 2);
+    assert_eq!(
+        c.rescue_quote_e8,
+        decayed(after_rescue.rescue_quote_e8, NOW_MS, later)
+    );
+    assert_eq!(c.rescue_spent_e8, decayed(5 * ten, NOW_MS, later) + ten);
 }
 
 #[test]
@@ -472,9 +496,11 @@ fn a_meter_falls_linearly_over_the_hour_and_rounds_up() {
 
 /// The skim the review found (round 2, item 1): rescues that each cost what `check_cost` allows,
 /// the flat 0.5 USDC on any amount, could pay most of the cap away in fees an hour, on a paused
-/// desk too. The hourly cost budget stops it: max(cap × bps / 10⁴, 2 × flat) plus two venue fees
-/// of 1 USDC (C10), 3 USD at the defaults. Hyperliquid's 1 USDC send fee and the venues'
-/// withdrawal fees count in it too (`transfer_cost_e8`, `counted_withdraw`).
+/// desk too. The hourly cost budget stops it: max(cap × bps / 10⁴, 2 × flat) plus four venue
+/// fees of 1 USDC (C10, round 2), 5 USD at the defaults. The quotes' own costs may use only the
+/// first part, 1 USD at the defaults (C10 round 2: `appFees` cannot spend the venue-fee room);
+/// Hyperliquid's 1 USDC send fee and the venues' withdrawal fees count in the whole
+/// (`transfer_cost_e8`, `counted_withdraw`).
 #[test]
 fn the_hourly_cost_budget_stops_skimming_the_cap_through_fees() {
     let mut g = rescue_desk();
@@ -487,32 +513,39 @@ fn the_hourly_cost_budget_stops_skimming_the_cap_through_fees() {
         outcome(|| g.build_evm_usdc_to_intents("alpha".into(), q, "out"))
     };
     at(operator(), NOW_MS, yocto(0));
-    for n in 1..=6 {
+    for n in 1..=2 {
         build(&mut g, &skim(n)).unwrap();
     }
     let before = counters(&g);
     assert_eq!(
-        build(&mut g, &skim(7)).unwrap_err(),
-        "E_RESCUE_CAP: the rescue may cost 0.5 USD, over what is left of the hourly rescue cost \
-         budget, 0 of 3 USD"
+        build(&mut g, &skim(3)).unwrap_err(),
+        "E_RESCUE_CAP: the quote may cost 0.5 USD (amountIn − minAmountOut), over what is left \
+         of the quotes' share of the hourly rescue cost budget, 0 of 1 USD (the rest is for \
+         venue fees)"
     );
     assert_eq!(counters(&g), before, "a refused rescue counts nothing");
     assert_eq!(
-        (before.rescue_spent_e8, before.rescue_cost_e8),
-        (6 * 100_000_000, 300_000_000)
+        (
+            before.rescue_spent_e8,
+            before.rescue_cost_e8,
+            before.rescue_quote_e8
+        ),
+        (2 * 100_000_000, 100_000_000, 100_000_000)
     );
-    // The cap alone would have let 44 more through: 22 USDC of fees an hour.
-    assert_eq!(before.remaining_cap_e8(50, NOW_MS), 44 * 100_000_000);
-    // A twelfth of an hour later a twelfth of the budget is back, too little; at a sixth, enough.
+    // The cap alone would have let 48 more through: 24 USDC of fees an hour; the whole budget
+    // (5 USD) 8 more.
+    assert_eq!(before.remaining_cap_e8(50, NOW_MS), 48 * 100_000_000);
+    // A twelfth of an hour later a twelfth of the quotes' share is back, too little; at half an
+    // hour, enough.
     at(operator(), NOW_MS + RESCUE_WINDOW_MS / 12, yocto(0));
-    assert!(build(&mut g, &skim(7))
+    assert!(build(&mut g, &skim(3))
         .unwrap_err()
-        .contains("0.25 of 3 USD"));
-    at(operator(), NOW_MS + RESCUE_WINDOW_MS / 6, yocto(0));
-    build(&mut g, &skim(7)).unwrap();
+        .contains("0.08333333 of 1 USD"));
+    at(operator(), NOW_MS + RESCUE_WINDOW_MS / 2, yocto(0));
+    build(&mut g, &skim(3)).unwrap();
 
-    // The live quote through the public method on the paused desk: 0.415247 USDC each, seven
-    // fit (a 100 USD cap with no share, so the budget is 3 USD and the cap is not the limit).
+    // The live quote through the public method on the paused desk: 0.415247 USDC each, two fit
+    // (a 100 USD cap with no share, so the quotes' share is 1 USD and the cap is not the limit).
     let mut g = rescue_desk_with(Policy {
         rescue_cap_usd_per_hour: 100,
         max_transfer_cost_bps: 0,
@@ -522,7 +555,7 @@ fn the_hourly_cost_budget_stops_skimming_the_cap_through_fees() {
         .insert("alpha".into(), DeskCounters::default());
     g.desks.get_mut("alpha").unwrap().paused = true;
     let q = quote(&live(), ARB_QUOTE);
-    for _ in 0..7 {
+    for _ in 0..2 {
         forget_deposits(&mut g);
         at(operator(), NOW_MS, yocto(0));
         evm_to_intents(&mut g, &q).unwrap();
@@ -530,12 +563,14 @@ fn the_hourly_cost_budget_stops_skimming_the_cap_through_fees() {
     forget_deposits(&mut g);
     assert_eq!(
         evm_to_intents(&mut g, &q).unwrap_err(),
-        "E_RESCUE_CAP: the rescue may cost 0.415247 USD, over what is left of the hourly rescue \
-         cost budget, 0.093271 of 3 USD"
+        "E_RESCUE_CAP: the quote may cost 0.415247 USD (amountIn − minAmountOut), over what is \
+         left of the quotes' share of the hourly rescue cost budget, 0.169506 of 1 USD (the rest \
+         is for venue fees)"
     );
 
-    // Hyperliquid on a 20 USD cap desk (c6-desk's): the 3 USD budget counts the quote's 0.355657
-    // and the 1 USDC send fee, so two sends with a normal quote cost fit, and a third does not.
+    // Hyperliquid on a 20 USD cap desk (c6-desk's): the 5 USD budget counts the quote's 0.355657
+    // and the 1 USDC send fee; the quotes' 1 USD share lets two sends with a normal quote cost
+    // through, not a third. Sends whose quotes cost nothing use the venue-fee room, up to 5 USD.
     let mut g = rescue_desk_with(Policy {
         rescue_cap_usd_per_hour: 20,
         ..rescue_policy()
@@ -561,17 +596,24 @@ fn the_hourly_cost_budget_stops_skimming_the_cap_through_fees() {
     let nonces = g.hl_nonces.get("alpha").copied();
     assert_eq!(
         send(&mut g, hl(3, 364_434_300)).unwrap_err(),
-        "E_RESCUE_CAP: the rescue may cost 1.355657 USD, over what is left of the hourly rescue \
-         cost budget, 0.288686 of 3 USD"
+        "E_RESCUE_CAP: the quote may cost 0.355657 USD (amountIn − minAmountOut), over what is \
+         left of the quotes' share of the hourly rescue cost budget, 0.288686 of 1 USD (the rest \
+         is for venue fees)"
     );
     assert_eq!(g.hl_nonces.get("alpha").copied(), nonces, "no nonce taken");
-    // A send costing nothing through its quote still pays the 1 USDC send fee: no room.
+    // A send costing nothing through its quote still pays the 1 USDC send fee, from the room.
+    send(&mut g, hl(4, 400_000_000)).unwrap();
+    send(&mut g, hl(5, 400_000_000)).unwrap();
     assert_eq!(
-        send(&mut g, hl(4, 400_000_000)).unwrap_err(),
+        send(&mut g, hl(6, 400_000_000)).unwrap_err(),
         "E_RESCUE_CAP: the rescue may cost 1 USD, over what is left of the hourly rescue cost \
-         budget, 0.288686 of 3 USD"
+         budget, 0.288686 of 5 USD"
     );
-    assert_eq!(counters(&g).rescue_cost_e8, 2 * 135_565_700);
+    let c = counters(&g);
+    assert_eq!(
+        (c.rescue_cost_e8, c.rescue_quote_e8),
+        (2 * 135_565_700 + 200_000_000, 2 * 35_565_700)
+    );
 }
 
 /// A quote pays once (review round 2, item 2): a rescue to a deposit address one of the desk's
@@ -1043,7 +1085,7 @@ fn sol_sign_rescue_refuses_a_quote_that_does_not_match_the_message() {
 }
 
 /// An instruction by its addresses: program, accounts, data.
-type Ix = ([u8; 32], Vec<[u8; 32]>, Vec<u8>);
+pub(super) type Ix = ([u8; 32], Vec<[u8; 32]>, Vec<u8>);
 
 /// The legacy message `m` with `extra` appended to its instructions.
 fn appended(m: &[u8], extra: Vec<Ix>) -> Vec<u8> {
@@ -1052,7 +1094,7 @@ fn appended(m: &[u8], extra: Vec<Ix>) -> Vec<u8> {
 
 /// The legacy message `m` with its instructions edited by `edit`, the keys the new ones lack
 /// appended as read-only (the contract does not read writability); unused keys stay.
-fn rewritten(m: &[u8], edit: impl FnOnce(&mut Vec<Ix>)) -> Vec<u8> {
+pub(super) fn rewritten(m: &[u8], edit: impl FnOnce(&mut Vec<Ix>)) -> Vec<u8> {
     let a = parse_message(m).unwrap();
     let mut list: Vec<Ix> = a
         .instructions
@@ -1366,6 +1408,7 @@ fn hl_send_to_intents_sends_the_verified_amount_to_the_deposit_address() {
         now_ms: fc["ctx"]["now_ms"].as_u64().unwrap(),
         remaining_cap_e8: 50 * 100_000_000,
         second_key: None,
+        pinned_key: true,
         dry_ok: true,
     };
     let mut verified = verify_quote(
@@ -1421,4 +1464,120 @@ fn hl_send_to_intents_refuses_quotes_of_other_origins() {
     }
     assert_eq!(g.hl_nonces.get("alpha").copied(), None, "no nonce taken");
     assert_eq!(counters(&g), DeskCounters::default());
+}
+
+/// C10 round 2 (item 10): the owner distrusts 1Click's pinned key for the desk, for good. Owner
+/// only, exactly 1 yoctoNEAR, an event; afterwards a quote the pinned key signed is refused and
+/// nothing is counted (every method verifies quotes through `verified_quote`).
+#[test]
+fn the_owner_distrusts_the_pinned_oneclick_key_for_good() {
+    let mut g = rescue_desk();
+    let q = quote(&live(), ARB_QUOTE);
+    for who in [operator(), stranger()] {
+        at(who, NOW_MS, ONE_YOCTO);
+        let got = outcome(|| g.distrust_pinned_oneclick_key("alpha".into())).unwrap_err();
+        assert!(
+            got.starts_with(
+                "E_NOT_ALLOWED: distrust_pinned_oneclick_key on desk alpha is for its owner"
+            ),
+            "{got}"
+        );
+    }
+    for deposit in [yocto(0), yocto(2)] {
+        at(owner(), NOW_MS, deposit);
+        let got = outcome(|| g.distrust_pinned_oneclick_key("alpha".into())).unwrap_err();
+        assert!(
+            got.starts_with("E_NOT_ALLOWED: distrust_pinned_oneclick_key"),
+            "{got}"
+        );
+    }
+    at(owner(), NOW_MS, yocto(0));
+    assert!(
+        g.get_desk_settings("alpha".into())
+            .unwrap()
+            .pinned_key_trusted
+    );
+    at(owner(), NOW_MS, ONE_YOCTO);
+    let usage = env::storage_usage();
+    g.distrust_pinned_oneclick_key("alpha".into());
+    assert_eq!(env::storage_usage(), usage, "the record is prepaid");
+    assert_eq!(
+        get_logs(),
+        vec![event(
+            "pinned_oneclick_key_distrusted",
+            r#"{"desk_id":"alpha"}"#
+        )]
+    );
+    at(owner(), NOW_MS, yocto(0));
+    assert!(
+        !g.get_desk_settings("alpha".into())
+            .unwrap()
+            .pinned_key_trusted
+    );
+
+    at(operator(), NOW_MS, yocto(0));
+    let got = evm_to_intents(&mut g, &q).unwrap_err();
+    assert!(got.starts_with(E_QUOTE_SIGNATURE), "{got}");
+    assert!(
+        got.contains("the desk's owner distrusted the pinned key"),
+        "{got}"
+    );
+    assert_eq!(counters(&g), DeskCounters::default());
+    // Calling it again changes nothing.
+    at(owner(), NOW_MS, ONE_YOCTO);
+    g.distrust_pinned_oneclick_key("alpha".into());
+    at(owner(), NOW_MS, yocto(0));
+    assert!(
+        !g.get_desk_settings("alpha".into())
+            .unwrap()
+            .pinned_key_trusted
+    );
+}
+
+/// C10 round 2 (item 15): an order a running desk's rescue message carries counts against the
+/// hourly notional meter as `sol_sign`'s do, at the unpriced floor here (0.005 ETH of a 0.005
+/// max_sz at a 50 USD cap: 50 USD); over the cap the whole rescue is `E_SIZE` and nothing counts.
+#[test]
+fn an_order_in_a_rescue_message_counts_against_the_hourly_notional_cap() {
+    let order = {
+        let c = named(
+            &solana_vectors()["cases"],
+            "IOC buy 0.005 ETH, limit 2474.5 (+1%)",
+        )
+        .clone();
+        hex::decode(c["message_hex"].as_str().unwrap()).unwrap()
+    };
+    let (simple, _) = rescue_message("rescue: USDC to the verified 1Click deposit owner");
+    let with_order = merged(&simple, &order);
+    let q = quote(&live(), SOL_ORDERLY_QUOTE);
+    let policy = |cap| Policy {
+        unpriced: vec![UnpricedAsset {
+            symbol: "ETH".into(),
+            max_sz: "0.005".into(),
+        }],
+        unpriced_max_notional_usd: 50,
+        max_hourly_notional_usd: Some(cap),
+        ..rescue_policy()
+    };
+    let mut g = rescue_desk_with(policy(60));
+    at(operator(), NOW_MS, yocto(0));
+    let got = sol_rescue(&mut g, &with_order, &q).unwrap();
+    assert_eq!(got.kind, "rescue");
+    assert_eq!(got.orders.len(), 1);
+    let c = counters(&g);
+    assert_eq!(
+        (c.notional_at_ms, c.notional_e8, c.rescue_spent_e8),
+        (NOW_MS, 50 * 100_000_000, 10 * 100_000_000)
+    );
+
+    let mut g = rescue_desk_with(policy(40));
+    at(operator(), NOW_MS, yocto(0));
+    let got = sol_rescue(&mut g, &with_order, &q).unwrap_err();
+    assert!(
+        got.starts_with("E_SIZE: ") && got.contains("max_hourly_notional_usd 40"),
+        "{got}"
+    );
+    assert_eq!(counters(&g), DeskCounters::default());
+    // The rescue alone still signs.
+    sol_rescue(&mut g, &simple, &q).unwrap();
 }

@@ -12,7 +12,7 @@ use gimbal_core::hl::{
     referral_code, set_referrer_action, Address, HlOrder, UserAction, EXPIRES_AFTER_MS,
 };
 use gimbal_core::ids::check_reason;
-use gimbal_core::limits::{notional_e8, Valued};
+use gimbal_core::limits::notional_e8;
 use near_sdk::{env, near, Promise};
 
 use crate::action::{OrderDetail, UnsignedAction};
@@ -131,9 +131,7 @@ impl Gimbal {
                 )
             });
         let checked = check_order(&desk.policy, &order, reference).or_fail();
-        let valued = Valued {
-            oracle_e8: checked.oracle_e8,
-        };
+        let valued = checked.valued;
         let counters = self.count_notional(
             &desk_id,
             self.counters_of(&desk_id),
@@ -144,9 +142,7 @@ impl Gimbal {
             order.is_buy,
             checked.sz_e8,
             checked.px_e8,
-            Valued {
-                oracle_e8: checked.oracle_e8,
-            },
+            valued,
         );
         let builder = treasury_builder(&self.config);
         let action = order_action(

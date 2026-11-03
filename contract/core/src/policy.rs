@@ -64,8 +64,10 @@ pub struct Policy {
     /// over a sliding hour, on all three venues together (the contract's hourly notional meter).
     /// Optional in the JSON; `null` (or left out) means [`Policy::default_hourly_notional_usd`],
     /// 15 × `max_notional_usd` ([`Policy::hourly_notional_cap_usd`]). Like the other caps it may
-    /// be 0, which refuses every order that is not reduce-only. It bounds what a stolen operator key can lose by trading at the band's edge against its
-    /// own counterparty: at most this × `price_band_bps` / 10⁴ an hour, plus the venues' fees.
+    /// be 0, which refuses every order that is not reduce-only. It bounds what a stolen operator
+    /// key can lose by trading at the band's edge against its own counterparty: about 2 × this ×
+    /// `price_band_bps` / 10⁴ per sliding hour (the meter decays, so a full hour's worth is back
+    /// within the hour), plus the venues' fees.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_hourly_notional_usd: Option<u64>,
 }
@@ -476,7 +478,6 @@ mod tests {
         assert!(serde_json::from_str::<Policy>(&json).is_err());
     }
 
-    /// The refusal of a policy changed by `edit`: always `E_ARGS`, message starting `policy.`.
     /// C10: the hourly notional cap defaults to 15 × the per-order cap, saturating at 2^53 − 1,
     /// and an explicit value must be a safe integer.
     #[test]
@@ -509,6 +510,7 @@ mod tests {
         assert_eq!(json, sample());
     }
 
+    /// The refusal of a policy changed by `edit`: always `E_ARGS`, message starting `policy.`.
     fn refused(edit: impl FnOnce(&mut Policy)) -> String {
         let mut p = sample();
         edit(&mut p);

@@ -149,6 +149,9 @@ pub struct Gimbal {
     /// The second 1Click quote-signing key the treasury account proposed ([`settings`]); all zero
     /// for none.
     oneclick_key_proposal: [u8; 32],
+    /// How many proposals the treasury made, the latest one's number: a desk's acceptance holds
+    /// only for the proposal it accepted ([`settings`]).
+    oneclick_proposal_seq: u64,
 }
 
 #[near]
@@ -168,15 +171,25 @@ impl Gimbal {
     ) -> Self {
         config::check(network, &price_source, &treasury, &fees, &orderly).or_fail();
         config::check_network_ids(network, &mpc, &price_source).or_fail();
+        let config = Config {
+            network,
+            mpc,
+            price_source,
+            treasury,
+            fees,
+            orderly,
+        };
+        // The treasury proposes 1Click keys and receives fees: as one of the accounts that call
+        // in on their own it would be both (C10 round 2).
+        config
+            .check_not_reserved(
+                &env::current_account_id(),
+                "treasury.near",
+                &config.treasury.near,
+            )
+            .or_fail();
         Self {
-            config: Config {
-                network,
-                mpc,
-                price_source,
-                treasury,
-                fees,
-                orderly,
-            },
+            config,
             desks: LookupMap::new(StorageKey::Desks),
             desk_counts: LookupMap::new(StorageKey::DeskCounts),
             operator_counts: LookupMap::new(StorageKey::OperatorCounts),
@@ -191,6 +204,7 @@ impl Gimbal {
             fund_paid: LookupMap::new(StorageKey::FundPaid),
             desk_settings: LookupMap::new(StorageKey::DeskSettings),
             oneclick_key_proposal: [0; 32],
+            oneclick_proposal_seq: 0,
         }
     }
 

@@ -1,7 +1,7 @@
 //! The C10 fixes on the mocked chain: the hourly notional meter, the Phoenix accounts and second
 //! 1Click key settings, and `new`'s network ids.
 
-use super::hl::{at, hl_desk_with, hl_policy, hype};
+use super::hl::{at, hl_desk_with, hl_policy, hype, order};
 use super::*;
 use crate::rescue::RESCUE_WINDOW_MS;
 use crate::settings::{PhoenixAccountsJson, ONECLICK_KEY_DELAY_MS};
@@ -306,4 +306,118 @@ fn new_takes_the_networks_own_mpc_and_oracle() {
             );
         });
     }
+}
+
+/// C10 round 2 (item 3): every proposal is numbered, so the treasury cannot bring back a key the
+/// owner accepted earlier by proposing another and then the old one again: the old acceptance
+/// stays dead, and the key takes a new acceptance and a new day.
+#[test]
+fn proposing_an_accepted_key_again_needs_a_new_acceptance_and_a_new_day() {
+    let mut g = hl_desk_with(hl_policy());
+    let treasury = treasury().near;
+    at(treasury.clone(), T, ONE_YOCTO);
+    g.propose_oneclick_key(Some(key_b58(7)));
+    at(owner(), T, ONE_YOCTO);
+    g.accept_oneclick_key("alpha".into(), Some(key_b58(7)));
+    let live = T + ONECLICK_KEY_DELAY_MS;
+    assert_eq!(g.accepted_oneclick_key("alpha", live), Some([7; 32]));
+
+    at(treasury.clone(), live, ONE_YOCTO);
+    g.propose_oneclick_key(Some(key_b58(8)));
+    g.propose_oneclick_key(Some(key_b58(7)));
+    assert_eq!(g.oneclick_key_proposal(), Some(key_b58(7)));
+    for t in [
+        live,
+        live + ONECLICK_KEY_DELAY_MS,
+        live + 365 * ONECLICK_KEY_DELAY_MS,
+    ] {
+        assert_eq!(g.accepted_oneclick_key("alpha", t), None, "at {t}");
+    }
+    at(owner(), live, yocto(0));
+    assert!(
+        !g.get_desk_settings("alpha".into())
+            .unwrap()
+            .oneclick_key_active
+    );
+
+    // A new acceptance, then a new day.
+    let again = live + 1_000;
+    at(owner(), again, ONE_YOCTO);
+    g.accept_oneclick_key("alpha".into(), Some(key_b58(7)));
+    assert_eq!(
+        g.accepted_oneclick_key("alpha", again + ONECLICK_KEY_DELAY_MS - 1),
+        None
+    );
+    assert_eq!(
+        g.accepted_oneclick_key("alpha", again + ONECLICK_KEY_DELAY_MS),
+        Some([7; 32])
+    );
+    // The same key proposed again, even with nothing in between, is a new proposal too.
+    at(treasury, again, ONE_YOCTO);
+    g.propose_oneclick_key(Some(key_b58(7)));
+    assert_eq!(
+        g.accepted_oneclick_key("alpha", again + ONECLICK_KEY_DELAY_MS),
+        None
+    );
+}
+
+/// C10 round 2 (item 5): `new` refuses a treasury account that is the contract itself, the MPC
+/// contract or the price oracle, as `set_operator` refuses those as operators.
+#[test]
+fn new_refuses_a_treasury_that_is_a_reserved_account() {
+    for (account, what) in [
+        (contract_id(), "the contract itself"),
+        (mpc_id(), "the MPC contract"),
+        (oracle_id(), "the price oracle"),
+    ] {
+        called_by(contract_id());
+        assert_refused(
+            &format!("E_ARGS: treasury.near {account} is {what}"),
+            || {
+                Gimbal::new(
+                    Network::Testnet,
+                    mpc_id(),
+                    PriceSource::OutLayer {
+                        contract: oracle_id(),
+                    },
+                    Treasury {
+                        near: account.clone(),
+                        ..treasury()
+                    },
+                    fees(),
+                    OrderlyConfig {
+                        broker_id: "woofi_dex".into(),
+                        chain_id: ARBITRUM_SEPOLIA,
+                    },
+                );
+            },
+        );
+    }
+}
+
+/// C10 round 2 (item 2): an unpriced order at a dust price counts its share of
+/// `unpriced_max_notional_usd`, not its own tiny notional: a sell of all of HYPE's max_sz (3) at
+/// 0.0001 counts the whole 100 USD, a third of it 33.33333334 (rounded up).
+#[test]
+fn a_one_tick_unpriced_hl_sell_counts_its_share_of_the_unpriced_cap() {
+    let mut g = notional_desk(Some(250));
+    at(operator(), T, yocto(0));
+    let mut sell = order(159, "0.0001", "3");
+    sell.is_buy = false;
+    g.prepare_hl_order("alpha".into(), sell, "open".into());
+    assert_eq!(g.counters_of("alpha").notional_e8, 10_000_000_000);
+    let mut third = order(159, "0.0001", "1");
+    third.is_buy = false;
+    g.prepare_hl_order("alpha".into(), third, "open".into());
+    assert_eq!(
+        g.counters_of("alpha").notional_e8,
+        10_000_000_000 + 3_333_333_334
+    );
+    // Two more full ones are over the 250 USD cap.
+    let mut sell = order(159, "0.0001", "3");
+    sell.is_buy = false;
+    g.prepare_hl_order("alpha".into(), sell.clone(), "open".into());
+    assert_refused("E_SIZE: the order: 100 USD of notional is over", || {
+        g.prepare_hl_order("alpha".into(), sell, "open".into());
+    });
 }

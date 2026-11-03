@@ -751,7 +751,8 @@ fn hl_withdraw_has_an_owner_path_and_an_operator_path() {
 
 /// The operator path counts `amount` against the desk's sliding hourly rescue cap (50 USD here)
 /// and Hyperliquid's 1 USDC fee against the hourly cost budget (C10), nothing against the deposit
-/// ring, and takes at least 10 × `max_transfer_cost_flat_e6`; the owner's wallet is not limited.
+/// ring, and takes at least max(10 × `max_transfer_cost_flat_e6`, 10 USDC); the owner's wallet is
+/// not limited.
 #[test]
 fn the_operators_hl_withdraw_counts_against_the_rescue_cap() {
     let mut g = hl_desk();
@@ -780,17 +781,18 @@ fn the_operators_hl_withdraw_counts_against_the_rescue_cap() {
     for who in [operator(), owner()] {
         at(who, T + 1, yocto(0));
         assert_refused(
-            "E_RESCUE_CAP: hl_withdraw of 5 USDC is over what is left of the hourly rescue cap, \
+            "E_RESCUE_CAP: hl_withdraw of 10 USDC is over what is left of the hourly rescue cap, \
              0.00001388 USD",
             || {
-                g.prepare_hl_withdraw("alpha".into(), "5".into());
+                g.prepare_hl_withdraw("alpha".into(), "10".into());
             },
         );
+        // C10 round 2: 10 × 0.5 USDC is 5, under the 10 USDC floor.
         assert_refused(
-            "E_SIZE: the operator's hl_withdraw of 4.999999 USDC is under its minimum of 5 USDC \
-             (10 × max_transfer_cost_flat_e6); the owner has none",
+            "E_SIZE: the operator's hl_withdraw of 9.999999 USDC is under its minimum of 10 USDC \
+             (10 × max_transfer_cost_flat_e6, at least 10 USDC); the owner has none",
             || {
-                g.prepare_hl_withdraw("alpha".into(), "4.999999".into());
+                g.prepare_hl_withdraw("alpha".into(), "9.999999".into());
             },
         );
     }
@@ -819,7 +821,7 @@ fn the_operators_hl_withdraw_counts_against_the_rescue_cap() {
     assert_eq!((c.rescue_at_ms, c.rescue_spent_e8), (later, e8(50)));
     // The cost meter: 2 USDC of fees a fifth of an hour ago weigh 1.6, plus this one's.
     assert_eq!(c.rescue_cost_e8, 260_000_000);
-    // The budget (max(50 × 1%, 2 × 0.5) + 2 venue fees = 3 USD) stops a fourth fee in that
+    // The budget (max(1000 × 0%, 2 × 0.5) + 4 venue fees = 5 USD) stops a sixth fee in that
     // stretch, however much cap is left.
     let mut g = hl_desk_with(Policy {
         rescue_cap_usd_per_hour: 1_000,
@@ -828,14 +830,14 @@ fn the_operators_hl_withdraw_counts_against_the_rescue_cap() {
     });
     g.desk_counters.insert("alpha".into(), Default::default());
     at(operator(), T, yocto(0));
-    for _ in 0..3 {
-        g.prepare_hl_withdraw("alpha".into(), "5".into());
+    for _ in 0..5 {
+        g.prepare_hl_withdraw("alpha".into(), "10".into());
     }
     assert_refused(
         "E_RESCUE_CAP: hl_withdraw pays the venue's 1 USDC fee, over what is left of the hourly \
-         rescue cost budget, 0 of 3 USD",
+         rescue cost budget, 0 of 5 USD",
         || {
-            g.prepare_hl_withdraw("alpha".into(), "5".into());
+            g.prepare_hl_withdraw("alpha".into(), "10".into());
         },
     );
     // A lower cap applies at once.
@@ -879,12 +881,12 @@ fn a_closing_desk_signs_reduce_only_orders_and_refuses_opening_ones() {
             });
         }
         g.prepare_hl_cancel("alpha".into(), 159, 7, "panic close".into());
-        g.prepare_hl_withdraw("alpha".into(), "5".into());
+        g.prepare_hl_withdraw("alpha".into(), "10".into());
         assert_refused("E_PAUSED: desk alpha is paused", || {
             g.prepare_hl_usd_class_transfer("alpha".into(), "5".into(), true, "margin".into());
         });
     }
-    assert_eq!(counters_of(&g).rescue_spent_e8, 10 * 100_000_000);
+    assert_eq!(counters_of(&g).rescue_spent_e8, 20 * 100_000_000);
 }
 
 // --- the returned shape ---

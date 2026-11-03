@@ -7,8 +7,9 @@
 // rescue with the Revoke appended, solana-review.json review 6).
 //
 // A paused desk's rescue is leaner (pausedRescueMessage): sol_sign_rescue signs one for a paused desk only when it
-// frees and pays amountIn and nothing else, with no priority fee (phoenix.rs check_message, rescue mode). So: the
-// compute-unit limit without a price, the Approve, withdraw_funds and Ember unwrap of at most amountIn, the deposit
+// frees and pays amountIn and nothing else, with a priority fee only for a compute-unit limit of at most 400,000 units
+// (at most 1,000,000 µlamports per CU; phoenix.rs check_message, rescue mode). The builder takes: the compute-unit
+// limit without a price, the Approve, withdraw_funds and Ember unwrap of at most amountIn, the deposit
 // owner's account and the TransferChecked, the Revoke; not the creates of the desk's own token accounts (they exist:
 // every deposit went through them). pausedRescueRefusals is that rule on the engine's side, checked before signing.
 // Not wired into a flow yet: the withdrawal and rescue callers build their messages here once they exist.
@@ -18,6 +19,11 @@ import type { BuildWithdrawIxsResolvedInput } from '@ellipsis-labs/rise';
 import type { SolInstruction } from './solana-message.ts';
 import { TOKEN_PROGRAM, asSolInstructions, compileLegacyMessage, tokenRevoke, tokenTransferChecked } from './solana-message.ts';
 import { COMPUTE_BUDGET_PROGRAM, computeBudgetInstructions, parseMessage } from './solana.ts';
+
+/** The most compute units a paused rescue may pay a priority fee for (the contract's RESCUE_MAX_COMPUTE_UNIT_LIMIT). */
+export const PAUSED_RESCUE_FEE_MAX_UNITS = 400_000;
+/** The most a rescue may pay per unit (the contract's URGENT_MAX_COMPUTE_UNIT_PRICE). */
+export const URGENT_MAX_MICROLAMPORTS = 1_000_000n;
 
 /** USDC's decimals: the rescue's TransferChecked states them. */
 const USDC_DECIMALS = 6;
@@ -116,8 +122,9 @@ function payDeposit(exchange: PhoenixExchangeAccounts, desk: DeskSolanaAccounts,
 
 /**
  * Why a paused desk's sol_sign_rescue would refuse `message`, by the contract's rule for it (phoenix.rs check_message
- * in rescue mode: reduces_risk is rescue_pause_ok and no priority fee); empty when it signs it. Refused on a paused
- * desk: a priority fee, a create of the desk's own token account, a Phoenix order, cancel or deposit, an Ember wrap,
+ * in rescue mode: reduces_risk is rescue_pause_ok and a priority fee only for at most 400,000 units); empty when it
+ * signs it. Refused on a paused desk: a priority fee with no compute-unit limit, a limit over 400,000 or a price over
+ * 1,000,000 µlamports, a create of the desk's own token account, a Phoenix order, cancel or deposit, an Ember wrap,
  * an unwrap of the whole balance, a Transfer or a TransferChecked into a desk account, and withdrawals or unwraps that
  * add up to more than amountIn. The checks every rescue gets (accounts in their places, the one TransferChecked of
  * amountIn) stay the contract's; an instruction outside the rescue's kinds is named here too.
@@ -126,13 +133,16 @@ export function pausedRescueRefusals(message: Uint8Array, exchange: PhoenixExcha
   const refused: string[] = [];
   let withdrawn = 0n;
   let unwrapped = 0n;
+  let limit: number | null = null;
+  let fee: { n: number; price: bigint } | null = null;
   const deskAccount = (a: string | undefined) => a === desk.usdcAta || a === desk.phusdAta;
   for (const [n, ix] of parseMessage(message).instructions.entries()) {
     const no = (what: string) => refused.push(`instruction ${n}: ${what}`);
     const data = Buffer.from(ix.data);
     const disc = data.subarray(0, 8).toString('hex');
     if (ix.program === COMPUTE_BUDGET_PROGRAM) {
-      if (data[0] === 3 && data.length === 9 && data.readBigUInt64LE(1) > 0n) no(`a priority fee of ${data.readBigUInt64LE(1)} µlamports per CU`);
+      if (data[0] === 2 && data.length === 5) limit = data.readUInt32LE(1);
+      if (data[0] === 3 && data.length === 9 && data.readBigUInt64LE(1) > 0n) fee = { n, price: data.readBigUInt64LE(1) };
     } else if (ix.program === ATA_PROGRAM) {
       if (ix.accounts[2] === desk.authority) no(`a create of the desk's own token account ${ix.accounts[1]}`);
       else if (ix.accounts[2] !== deposit.owner) no(`a create of a token account for ${ix.accounts[2]}, not the deposit owner`);
@@ -152,6 +162,11 @@ export function pausedRescueRefusals(message: Uint8Array, exchange: PhoenixExcha
     } else {
       no(`program ${ix.program}`);
     }
+  }
+  if (fee !== null && (limit === null || limit > PAUSED_RESCUE_FEE_MAX_UNITS)) {
+    refused.unshift(`instruction ${fee.n}: a priority fee of ${fee.price} µlamports per CU with ${limit === null ? 'no compute-unit limit' : `a limit of ${limit} units, over ${PAUSED_RESCUE_FEE_MAX_UNITS}`}`);
+  } else if (fee !== null && fee.price > URGENT_MAX_MICROLAMPORTS) {
+    refused.unshift(`instruction ${fee.n}: a priority fee of ${fee.price} µlamports per CU, over ${URGENT_MAX_MICROLAMPORTS}`);
   }
   if (withdrawn > deposit.amountIn) refused.push(`Phoenix withdrawals of ${withdrawn} in all, over amountIn ${deposit.amountIn}`);
   if (unwrapped > deposit.amountIn) refused.push(`Ember unwraps of ${unwrapped} in all, over amountIn ${deposit.amountIn}`);

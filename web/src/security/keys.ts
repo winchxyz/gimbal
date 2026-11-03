@@ -86,6 +86,7 @@ export const OWNER_ONLY: readonly OwnerMethod[] = [
   { method: 'create_desk', what: 'create a desk' },
   { method: 'set_phoenix_accounts', what: 'replace the Phoenix and Ember accounts the desk uses' },
   { method: 'accept_oneclick_key', what: 'accept the treasury’s second 1Click key for the desk (it signs quotes a day later)' },
+  { method: 'distrust_pinned_oneclick_key', what: 'stop 1Click’s pinned key from signing the desk’s quotes, for good' },
 ];
 
 /** The one call of the operator's own method that it cannot make: resuming. Pausing needs no deposit, resuming needs 1 yoctoNEAR. */

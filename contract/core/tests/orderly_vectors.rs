@@ -308,6 +308,7 @@ fn context<'a>(
         reference,
         orderly_key: DESK_ORDERLY_KEY,
         orderly_ips: None,
+        ips_applied: false,
     }
 }
 
@@ -543,6 +544,7 @@ fn ctx_at<'a>(policy: &'a Policy, referral_code: Option<&'a str>) -> Context<'a>
         reference: &vector_price,
         orderly_key: DESK_ORDERLY_KEY,
         orderly_ips: None,
+        ips_applied: false,
     }
 }
 
@@ -1149,7 +1151,8 @@ fn ip_restriction_applies_the_owners_list() {
 
 /// C10 (B4): on mainnet an order that is not reduce-only needs the owner's IP list (`E_ARGS`),
 /// so no copy of it can be posted from elsewhere once `ip_restriction` applied it; a reduce-only
-/// order and testnet are not held back.
+/// order and testnet are not held back. C10 round 2: the list set is not enough, the contract
+/// must have signed `ip_restriction` for it (`ips_applied`).
 #[test]
 fn a_mainnet_order_that_grows_a_position_needs_the_ip_list() {
     let policy = vector_policy();
@@ -1180,8 +1183,15 @@ fn a_mainnet_order_that_grows_a_position_needs_the_ip_list() {
         },
         ..with_ips
     };
+    let r = build_request(&with_ips, &req(eth_buy())).unwrap_err();
+    assert_eq!(r.code, "E_ARGS");
+    assert!(r.msg.contains("applied first"), "{}", r.msg);
+    let applied = Context {
+        ips_applied: true,
+        ..with_ips
+    };
     assert_eq!(
-        build_request(&with_ips, &req(eth_buy())).unwrap().kind,
+        build_request(&applied, &req(eth_buy())).unwrap().kind,
         "order"
     );
     assert_eq!(

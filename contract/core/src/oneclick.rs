@@ -31,13 +31,15 @@ pub const ONECLICK_PUBLIC_KEY_B58: &str = "reYaWhvwu8Jzo3WUM3zhn6VrhuMEF4eADL17q
 /// The share part of the bound on 1Click's own fee, in bps of `amountIn` ([`check_oneclick_fee`]):
 /// 1Click charges about 1 bp with an API key and 20 bps without one.
 pub const ONECLICK_FEE_MAX_BPS: u128 = 25;
-/// The flat part of that bound, USDC × 1e8 (0.50 USDC), added to the share. 1Click's fee is
+/// The flat part of that bound, USDC × 1e8 (1.00 USDC), added to the share. 1Click's fee is
 /// near-flat: a `withdrawFee` of 0.3153 USDC plus about 1 bp on Solana USDC → HyperCore USDC
 /// (dry quotes 2026-11-03: 0.3155 on 2 USDC, 0.3173 on 20), 0.21 to 0.32 USDC measured on other
-/// routes. The contract is frozen, so the bound leaves room for 1Click to move its fee a little;
-/// the price is what an operator could skim through `appFees` within it, (0.50 USDC + 25 bps) −
-/// the real fee per transfer, which the rescue cost budget and the deposit ring bound per hour.
-pub const ONECLICK_FEE_MAX_FLAT_E8: u128 = 50_000_000;
+/// routes. The contract is frozen, so the bound leaves room for 1Click to raise its fee about
+/// threefold before rescues stop (C10 round 2: 0.50 left too little); the price is what an
+/// operator could skim through `appFees` within it, (1.00 USDC + 25 bps) − the real fee per
+/// transfer. The skim is bounded per hour by the quote part of the rescue cost budget
+/// ([`rescue_quote_budget_e8`], which the venue-fee room does not widen) and by the deposit ring.
+pub const ONECLICK_FEE_MAX_FLAT_E8: u128 = 100_000_000;
 
 /// What a venue burns to let USDC out, USDC × 1e8: Hyperliquid's `withdraw3` fee, its `sendAsset`
 /// activation fee to an address it has not seen (every 1Click deposit address), and Orderly's
@@ -47,8 +49,9 @@ pub const VENUE_FEE_E8: u128 = 100_000_000;
 
 /// How many venue fees an hour the rescue cost budget has room for besides the quotes' costs
 /// ([`rescue_cost_budget_e8`]): Hyperliquid's way out is two steps (`hl_withdraw`, then the
-/// Arbitrum transfer) or one `sendAsset`.
-pub const RESCUE_VENUE_FEES_PER_HOUR: u128 = 2;
+/// Arbitrum transfer) or one `sendAsset`; 4 leaves room for one retry of either (C10 round 2).
+/// Only venue fees use this room ([`rescue_quote_budget_e8`]).
+pub const RESCUE_VENUE_FEES_PER_HOUR: u128 = 4;
 
 /// Whether `signature` is `public_key`'s Ed25519 signature of `message`: the host's
 /// `ed25519_verify` in the contract.
@@ -179,6 +182,9 @@ pub struct Context<'a> {
     /// A second 1Click signing key the desk accepts besides [`ONECLICK_PUBLIC_KEY_B58`], once its
     /// time lock passed (the contract decides that); `None` for none.
     pub second_key: Option<[u8; 32]>,
+    /// Whether [`ONECLICK_PUBLIC_KEY_B58`] signs quotes for the desk: false once its owner
+    /// distrusted it, and then only `second_key` does.
+    pub pinned_key: bool,
     /// Accept a dry quote, which has no deposit address. Only the tests of the recorded dry quotes
     /// set it; the contract never does.
     pub dry_ok: bool,
@@ -269,16 +275,18 @@ pub fn check_signature(
     quote: &str,
     quote_signature: &str,
 ) -> Result<(), Refusal> {
-    check_signature_by(sha256, verify, quote, quote_signature, None)
+    check_signature_by(sha256, verify, quote, quote_signature, true, None)
 }
 
 /// [`check_signature`] that also accepts a signature by `second_key`, the desk's second 1Click
-/// key. The quote's bytes and fields are held to the same rules whichever key signed them.
+/// key, and accepts the pinned key's only while `pinned_key`. The quote's bytes and fields are
+/// held to the same rules whichever key signed them.
 pub fn check_signature_by(
     sha256: Sha256,
     verify: Ed25519Verify,
     quote: &str,
     quote_signature: &str,
+    pinned_key: bool,
     second_key: Option<&[u8; 32]>,
 ) -> Result<(), Refusal> {
     let bad = |msg: &str| Refusal::new(E_QUOTE_SIGNATURE, msg);
@@ -292,11 +300,17 @@ pub fn check_signature_by(
     let key = decode_base58_32(ONECLICK_PUBLIC_KEY_B58).ok_or_else(|| bad("1Click key"))?;
     let message = bs58::encode(sha256(quote.as_bytes())).into_string();
     let by_second = second_key.is_some_and(|k| verify(&signature, message.as_bytes(), k));
-    if verify(&signature, message.as_bytes(), &key) || by_second {
+    let by_pinned = pinned_key && verify(&signature, message.as_bytes(), &key);
+    if by_pinned || by_second {
         Ok(())
-    } else {
+    } else if pinned_key {
         Err(bad(
             "quote_signature is not 1Click's signature of this quote (it covers the exact string)",
+        ))
+    } else {
+        Err(bad(
+            "quote_signature is not the desk's accepted second 1Click key's signature of this \
+             quote: the desk's owner distrusted the pinned key",
         ))
     }
 }
@@ -316,6 +330,7 @@ pub fn verify_quote(
         verify,
         quote,
         quote_signature,
+        ctx.pinned_key,
         ctx.second_key.as_ref(),
     )?;
     let f: Fields = serde_json::from_str(quote)
@@ -468,11 +483,12 @@ pub fn check_oneclick_fee(amount_in_e8: u128, amount_out_e8: u128) -> Result<(),
         .saturating_add(amount_in_e8.saturating_mul(ONECLICK_FEE_MAX_BPS) / 10_000);
     if fee > allowed {
         return Err(fields(format!(
-            "amountIn − amountOut is {} USDC, over 1Click's own fee of at most {} USDC (0.5 \
+            "amountIn − amountOut is {} USDC, over 1Click's own fee of at most {} USDC ({} \
              USDC + {ONECLICK_FEE_MAX_BPS} bps of amountIn): the quote pays someone else a fee \
              (appFees)",
             format_e8(fee),
-            format_e8(allowed)
+            format_e8(allowed),
+            format_e8(ONECLICK_FEE_MAX_FLAT_E8)
         )));
     }
     Ok(())
@@ -607,7 +623,7 @@ pub fn check_cost(q: &VerifiedQuote, max_bps: u32, max_flat_e6: u64) -> Result<(
 /// Hyperliquid, so each send burns it. The rescue cost budget counts it, so repeated sends cannot
 /// burn the desk's money faster than the budget allows.
 pub fn transfer_cost_e8(q: &VerifiedQuote) -> u128 {
-    let quote_cost = q.amount_in_e8.saturating_sub(q.min_amount_out_e8);
+    let quote_cost = quote_cost_e8(q);
     if q.method == Method::HlSendToIntents {
         quote_cost.saturating_add(VENUE_FEE_E8)
     } else {
@@ -615,15 +631,30 @@ pub fn transfer_cost_e8(q: &VerifiedQuote) -> u128 {
     }
 }
 
-/// What the rescues of an hour may cost together, USD × 1e8: max(`cap_usd` × `max_bps` / 10⁴,
-/// 2 × `max_flat_e6`), the policy's per-transfer bound applied once to the whole hourly cap, or
-/// two transfers at the flat bound, plus [`RESCUE_VENUE_FEES_PER_HOUR`] venue fees
-/// ([`VENUE_FEE_E8`], which Hyperliquid's and Orderly's ways out burn). Without it many small
-/// rescues, each within [`check_cost`] (the flat part allows 0.5 USDC on any amount), or many
-/// small venue withdrawals, could pay most of the cap away in fees.
+/// What the rescues of an hour may cost together, USD × 1e8: [`rescue_quote_budget_e8`] plus
+/// [`RESCUE_VENUE_FEES_PER_HOUR`] venue fees ([`VENUE_FEE_E8`], which Hyperliquid's and Orderly's
+/// ways out burn). Without it many small rescues, each within [`check_cost`] (the flat part allows
+/// 0.5 USDC on any amount at the default), or many small venue withdrawals, could pay most of the
+/// cap away in fees.
 pub fn rescue_cost_budget_e8(cap_usd: u64, max_bps: u32, max_flat_e6: u64) -> u128 {
+    rescue_quote_budget_e8(cap_usd, max_bps, max_flat_e6)
+        + RESCUE_VENUE_FEES_PER_HOUR * VENUE_FEE_E8
+}
+
+/// The part of [`rescue_cost_budget_e8`] the quotes' own costs ([`quote_cost_e8`]: what fees,
+/// slippage and any `appFees` may take) may use in an hour, USD × 1e8: max(`cap_usd` × `max_bps`
+/// / 10⁴, 2 × `max_flat_e6`), the policy's per-transfer bound applied once to the whole hourly
+/// cap, or two transfers at the flat bound. The venue-fee room on top of it is for venue fees
+/// alone (C10 round 2): no quote can spend it.
+pub fn rescue_quote_budget_e8(cap_usd: u64, max_bps: u32, max_flat_e6: u64) -> u128 {
     let share = u128::from(cap_usd) * 100_000_000 * u128::from(max_bps) / 10_000;
-    share.max(2 * u128::from(max_flat_e6) * 100) + RESCUE_VENUE_FEES_PER_HOUR * VENUE_FEE_E8
+    share.max(2 * u128::from(max_flat_e6) * 100)
+}
+
+/// The quote's own part of [`transfer_cost_e8`], USD × 1e8: `amountIn` − `minAmountOut`, 0 for
+/// a quote that pays out at least what it takes; what [`rescue_quote_budget_e8`] bounds.
+pub fn quote_cost_e8(q: &VerifiedQuote) -> u128 {
+    q.amount_in_e8.saturating_sub(q.min_amount_out_e8)
 }
 
 /// What a desk's `fund_venue` transfers of an hour may cost together, USD × 1e8: four transfers
@@ -866,39 +897,43 @@ mod tests {
             };
             assert_eq!(transfer_cost_e8(&q), 35_577_700, "{method:?}");
         }
-        // The defaults (100 bp, 0.5 USDC): 1 USD an hour up to a 100 USD cap (two flat
-        // transfers), then 1% of the cap, each with room for two 1 USDC venue fees.
-        assert_eq!(rescue_cost_budget_e8(50, 100, 500_000), 300_000_000);
-        assert_eq!(rescue_cost_budget_e8(100, 100, 500_000), 300_000_000);
-        assert_eq!(rescue_cost_budget_e8(1000, 100, 500_000), 1_200_000_000);
-        assert_eq!(rescue_cost_budget_e8(0, 100, 0), 200_000_000);
+        // The defaults (100 bp, 0.5 USDC): 1 USD an hour of quote costs up to a 100 USD cap (two
+        // flat transfers), then 1% of the cap, each with room for four 1 USDC venue fees.
+        assert_eq!(rescue_quote_budget_e8(50, 100, 500_000), 100_000_000);
+        assert_eq!(rescue_cost_budget_e8(50, 100, 500_000), 500_000_000);
+        assert_eq!(rescue_cost_budget_e8(100, 100, 500_000), 500_000_000);
+        assert_eq!(rescue_quote_budget_e8(1000, 100, 500_000), 1_000_000_000);
+        assert_eq!(rescue_cost_budget_e8(1000, 100, 500_000), 1_400_000_000);
+        assert_eq!(rescue_quote_budget_e8(0, 100, 0), 0);
+        assert_eq!(rescue_cost_budget_e8(0, 100, 0), 400_000_000);
         assert_eq!(
             rescue_cost_budget_e8(u64::MAX, u32::MAX, u64::MAX),
-            u128::from(u64::MAX) * 100_000_000 * u128::from(u32::MAX) / 10_000 + 200_000_000
+            u128::from(u64::MAX) * 100_000_000 * u128::from(u32::MAX) / 10_000 + 400_000_000
         );
     }
 
-    /// 1Click's own fee, 0.5 USDC + 25 bps, edges allowed; more is someone's appFees.
+    /// 1Click's own fee, 1 USDC + 25 bps, edges allowed; more is someone's appFees.
     #[test]
     fn the_oneclick_fee_bound() {
-        // 4 USDC: up to 0.51. The recorded quotes: 0.315714 passes, and so does 0.355314 (1%
-        // appFees to a stranger: the skim the bound leaves, about 0.19 USDC here).
+        // 4 USDC: up to 1.01. The recorded quotes: 0.315714 passes, and so does 0.355314 (1%
+        // appFees to a stranger: the skim the bound leaves, about 0.69 USDC here, which the
+        // quote part of the hourly rescue cost budget bounds).
         check_oneclick_fee(400_000_000, 368_428_600).unwrap();
         check_oneclick_fee(400_000_000, 364_468_600).unwrap();
-        check_oneclick_fee(400_000_000, 349_000_000).unwrap();
-        let r = check_oneclick_fee(400_000_000, 348_999_999).unwrap_err();
+        check_oneclick_fee(400_000_000, 299_000_000).unwrap();
+        let r = check_oneclick_fee(400_000_000, 298_999_999).unwrap_err();
         assert_eq!(r.code, E_QUOTE_FIELDS);
         assert_eq!(
             r.msg,
-            "amountIn − amountOut is 0.51000001 USDC, over 1Click's own fee of at most 0.51 USDC \
-             (0.5 USDC + 25 bps of amountIn): the quote pays someone else a fee (appFees)"
+            "amountIn − amountOut is 1.01000001 USDC, over 1Click's own fee of at most 1.01 USDC \
+             (1 USDC + 25 bps of amountIn): the quote pays someone else a fee (appFees)"
         );
         // The dry quotes of 2026-11-03, Solana USDC → HyperCore USDC: 0.3155 on 2, 0.3173 on 20.
         check_oneclick_fee(200_000_000, 168_450_000).unwrap();
         check_oneclick_fee(2_000_000_000, 1_968_270_000).unwrap();
-        // 1000 USDC: 0.5 + 2.5 USDC.
-        check_oneclick_fee(100_000_000_000, 99_700_000_000).unwrap();
-        assert!(check_oneclick_fee(100_000_000_000, 99_699_999_999).is_err());
+        // 1000 USDC: 1 + 2.5 USDC.
+        check_oneclick_fee(100_000_000_000, 99_650_000_000).unwrap();
+        assert!(check_oneclick_fee(100_000_000_000, 99_649_999_999).is_err());
         // Paying out more than it takes is no fee; nothing overflows.
         check_oneclick_fee(400_000_000, 500_000_000).unwrap();
         check_oneclick_fee(0, 0).unwrap();
@@ -919,7 +954,7 @@ mod tests {
         }
         let sig = format!("ed25519:{}", bs58::encode([1u8; 64]).into_string());
         let by = |verify: Ed25519Verify, second: Option<&[u8; 32]>| {
-            check_signature_by(sha, verify, "{}", &sig, second)
+            check_signature_by(sha, verify, "{}", &sig, true, second)
         };
         assert_eq!(by(only_key_7, None).unwrap_err().code, E_QUOTE_SIGNATURE);
         assert_eq!(
@@ -929,6 +964,18 @@ mod tests {
         by(only_key_7, Some(&[7; 32])).unwrap();
         by(only_oneclick, None).unwrap();
         by(only_oneclick, Some(&[7; 32])).unwrap();
+        // C10 round 2: once the owner distrusted the pinned key, only the second key signs.
+        let distrusted = |verify: Ed25519Verify, second: Option<&[u8; 32]>| {
+            check_signature_by(sha, verify, "{}", &sig, false, second)
+        };
+        let r = distrusted(only_oneclick, Some(&[7; 32])).unwrap_err();
+        assert_eq!(r.code, E_QUOTE_SIGNATURE);
+        assert!(r.msg.contains("distrusted the pinned key"), "{r}");
+        assert_eq!(
+            distrusted(only_oneclick, None).unwrap_err().code,
+            E_QUOTE_SIGNATURE
+        );
+        distrusted(only_key_7, Some(&[7; 32])).unwrap();
         assert_eq!(
             check_signature(sha, only_key_7, "{}", &sig)
                 .unwrap_err()

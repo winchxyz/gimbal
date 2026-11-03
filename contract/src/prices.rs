@@ -250,9 +250,10 @@ impl Gimbal {
 
     /// The OutLayer oracle's callback after an `oracle_call` (its `ext_price_receiver`): stores the
     /// prices like `on_prices` and returns whether every symbol in `msg` (comma-separated) got
-    /// one. `refresh_prices` no longer makes an `oracle_call` (module doc); the method stays for
-    /// the interface and stores nothing an `oracle_call` of the contract did not ask for. Only the configured oracle may call it, and only for
-    /// an `oracle_call` the contract made itself (`E_NOT_ALLOWED`). Not payable: the oracle's
+    /// one. `refresh_prices` no longer makes an `oracle_call` (module doc), so in practice the
+    /// method answers nothing: it stays for the interface. Only the configured oracle may call
+    /// it, and only for an `oracle_call` the contract made itself (`E_NOT_ALLOWED`), so it stores
+    /// no price the contract did not ask for. Not payable: the oracle's
     /// `oracle_call` calls it with no deposit on every path (its source, read 2026-10-31). The
     /// 0.02 NEAR the contract attached to `oracle_call` stays with the oracle's own handling: sent
     /// back to the contract when the oracle's cache was fresh, else passed to OutLayer.

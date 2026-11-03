@@ -35,13 +35,21 @@ pub const AGENT_TYPE: &str = "Agent(string source,bytes32 connectionId)";
 pub const SIGNATURE_CHAIN_ID: u64 = 0x66eee;
 pub const SIGNATURE_CHAIN_ID_HEX: &str = "0x66eee";
 /// Prices: at most 5 significant figures (integers exempt) and `6 − szDecimals` decimals on a
-/// perp, `8 − szDecimals` on a spot pair ([`px_max_decimals`]).
+/// perp (HIP-3 perps included), `8 − szDecimals` on a spot pair ([`px_max_decimals`]).
 pub const PX_MAX_SIG_FIGS: usize = 5;
 pub const PX_MAX_DECIMALS: u8 = 6;
 /// The decimals rule of a spot pair's price: `8 − szDecimals`.
 pub const SPOT_PX_MAX_DECIMALS: u8 = 8;
 /// Hyperliquid's order asset of spot pair `n` is `10000 + n`; below it is a perp.
 pub const SPOT_ASSET_FROM: u32 = 10_000;
+/// From here on the asset ids are builder-deployed (HIP-3) perps, `100000 + 10000 × dex + n`
+/// (`xyz:` and the like): perps again, under the perp price rule.
+pub const SPOT_ASSET_UNTIL: u32 = 100_000;
+
+/// Whether Hyperliquid order asset `asset` is a spot pair: `10000..100000`.
+pub const fn is_spot(asset: u32) -> bool {
+    asset >= SPOT_ASSET_FROM && asset < SPOT_ASSET_UNTIL
+}
 /// USDC amounts on Hyperliquid's perp side have 6 decimals.
 pub const USDC_DECIMALS: usize = 6;
 /// Referral codes are 1 to 20 characters.
@@ -218,10 +226,14 @@ pub struct CheckedOrder {
     pub oracle_e8: Option<u128>,
     /// In `policy.unpriced`: no price band, and capped by its `max_sz` and the smaller notional cap.
     pub unpriced: bool,
+    /// How [`limits::check_value`] valued it, which the hourly meter counts.
+    pub valued: limits::Valued,
 }
 
 /// The order checks, in this order: the asset is in the policy (`E_ASSET`); tif and cloid
-/// (`E_ARGS`); px and sz strings (`E_DECIMAL`, a zero size `E_SIZE`); then
+/// (`E_ARGS`); no `reduce_only` on a spot pair (`E_ARGS`: Hyperliquid may ignore `r` on spot, and
+/// a reduce-only order passes a pause and the hourly meter); px and sz strings (`E_DECIMAL`, a
+/// zero size `E_SIZE`); then
 /// [`limits::check_value`]: an unpriced symbol within its `max_sz` and the unpriced cap at its own
 /// price, any other symbol a reference price (`E_ORACLE_STALE`), the band around it
 /// (`E_PRICE_BAND`) and `sz × max(px, reference)` within `max_notional_usd` (`E_SIZE`).
@@ -246,6 +258,15 @@ pub fn check_order(
             )
         })?;
     let wire = OrderWire::from_order(order)?;
+    if order.reduce_only && is_spot(order.asset) {
+        return Err(Refusal::new(
+            E_ARGS,
+            format!(
+                "Hyperliquid asset {} is a spot pair, which has no reduce-only orders",
+                order.asset
+            ),
+        ));
+    }
     let px_e8 = check_px_of(&order.px, asset.sz_decimals, px_max_decimals(order.asset))?;
     let sz_e8 = check_sz(&order.sz, asset.sz_decimals)?;
     let valued = limits::check_value(policy, &asset.symbol, px_e8, sz_e8, reference_e8)?;
@@ -256,13 +277,14 @@ pub fn check_order(
         sz_e8,
         oracle_e8: valued.oracle_e8,
         unpriced: valued.unpriced(),
+        valued,
     })
 }
 
 /// The decimals rule's base for an order on Hyperliquid asset `asset`: 6 for a perp, 8 for a
-/// spot pair (`asset` ≥ [`SPOT_ASSET_FROM`]).
+/// spot pair ([`is_spot`]; a HIP-3 perp, from [`SPOT_ASSET_UNTIL`], is a perp).
 pub fn px_max_decimals(asset: u32) -> u8 {
-    if asset >= SPOT_ASSET_FROM {
+    if is_spot(asset) {
         SPOT_PX_MAX_DECIMALS
     } else {
         PX_MAX_DECIMALS
@@ -766,6 +788,40 @@ mod tests {
         r.expect_err("should be refused")
     }
 
+    /// C10 round 2: a spot pair takes no reduce-only order (Hyperliquid may ignore `r` there, and
+    /// a reduce-only order passes a pause and the hourly meter); a HIP-3 perp does.
+    #[test]
+    fn spot_pairs_take_no_reduce_only_orders() {
+        let mut p = policy();
+        for (index, symbol) in [(10_107, "PURR"), (110_005, "xyz:XYZ100")] {
+            p.hl_assets.push(HlAsset {
+                index,
+                symbol: symbol.into(),
+                sz_decimals: 0,
+            });
+            p.unpriced.push(UnpricedAsset {
+                symbol: symbol.into(),
+                max_sz: "10".into(),
+            });
+        }
+        let mut spot = order(10_107, "0.1", "1");
+        spot.reduce_only = true;
+        let r = refused(check_order(&p, &spot, None));
+        assert_eq!(
+            r.to_string(),
+            "E_ARGS: Hyperliquid asset 10107 is a spot pair, which has no reduce-only orders"
+        );
+        spot.reduce_only = false;
+        check_order(&p, &spot, None).unwrap();
+        let mut hip3 = order(110_005, "0.1", "1");
+        hip3.reduce_only = true;
+        check_order(&p, &hip3, None).unwrap();
+        // The perp rule: 6 − szDecimals decimals, so 0.0000001 is one too many on xyz:.
+        let r = refused(check_order(&p, &order(110_005, "0.0000001", "1"), None));
+        assert_eq!(r.code, E_DECIMAL);
+        check_order(&p, &order(10_107, "0.0000001", "1"), None).unwrap();
+    }
+
     #[test]
     fn notional_cap_messages_name_the_cap() {
         let r = refused(check_order(&policy(), &order(1, "2500", "0.4001"), ETH_E8));
@@ -910,6 +966,11 @@ mod tests {
         // C10 (B6): a spot pair's price has up to 8 − szDecimals decimals.
         assert_eq!(px_max_decimals(4), 6);
         assert_eq!(px_max_decimals(10_107), 8);
+        // C10 round 2: a HIP-3 perp (`xyz:` is dex 1, so 110000 + n) is a perp again.
+        assert_eq!(px_max_decimals(99_999), 8);
+        assert_eq!(px_max_decimals(100_000), 6);
+        assert_eq!(px_max_decimals(110_005), 6);
+        assert!(check_px_of("0.0012345", 1, px_max_decimals(110_005)).is_err());
         assert_eq!(
             check_px_of("0.0012345", 1, px_max_decimals(10_107)).unwrap(),
             123_450
