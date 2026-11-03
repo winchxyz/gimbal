@@ -190,7 +190,7 @@ export interface HandsResult {
   /** What the owner must reconcile (`open:` lines without the prefix). */
   open: string[];
   tx: TxRef[];
-  /** The fills' fees, USD (≤ 0 as the journal counts costs). */
+  /** The fills' fees, USD: what the venues charged, > 0 for a cost (< 0 a maker rebate). */
   feeUsd: number;
   /**
    * Orders went out (or may have): set when the operation threw after the trader recorded a fill or the pair holds

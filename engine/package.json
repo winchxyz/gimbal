@@ -18,7 +18,8 @@
     "monitor": "node src/cli/monitor.ts",
     "rescue-dry": "node src/cli/rescue-dry.ts",
     "mcp": "node src/mcp/server.ts",
-    "attack": "node src/mcp/attack-cli.ts"
+    "attack": "node src/mcp/attack-cli.ts",
+    "report": "node src/cli/report.ts"
   },
   "dependencies": {
     "@ellipsis-labs/rise": "0.6.2",

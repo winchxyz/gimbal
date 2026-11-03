@@ -16,7 +16,9 @@ import { kiloBase } from '../venues/base-symbol.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { AccountState, Clock, Market, VenueReader } from '../venues/venue.ts';
 import type { DecideInput, Decision } from '../strategy/decide.ts';
-import type { ActOutcome, BookFill, BookSink, HandsHeld, LoopHands, WindowFacts } from '../strategy/loop.ts';
+import type { ActOutcome, BookFill, BookSink, HandsHeld, LoopHands, LoopHeld, WindowFacts } from '../strategy/loop.ts';
+import type { AdoptInput } from '../book/book.ts';
+import type { BookRecord } from '../book/types.ts';
 import type { PairResult } from '../trade/pair.ts';
 import { qtyString, signedQtyString, toQty } from '../trade/lots.ts';
 import { LoopStore, StrategyLoop, loopStateFile } from '../strategy/loop.ts';
@@ -292,5 +294,57 @@ export function windowFacts(p: {
       }
     }
     return { gross14dAprPct, openInterest, lots };
+  };
+}
+
+/** The book calls loopBook uses (book/book.ts PositionBook). */
+export interface LoopBookPort {
+  record(record: BookRecord): { positionId: string | null; numbers: Record<string, number | string>; note?: string | null };
+  adopt(input: AdoptInput): string;
+  openWindow(): string | null;
+}
+
+/**
+ * The position book on the strategy loop. `sink` is the loop's `book` option. The loop records a carried-out enter or
+ * exit and then, synchronously, journals it (`enter`, `rotate`, `exit`, or `error` when the venues hold a pair the open
+ * did not finish): `publish` merges the book's numbers (position id, legs, fees, the forecast; at an exit its funding,
+ * net and actual APR) into that next journal entry, the book's keys over the loop's (the book's `feeUsd` is signed, a
+ * cost < 0), and the book's note (an exit: `funding read to 14:00, settling`) to its summary. `adopt` books the pair the loop holds when the book has no open position for it (opened outside the
+ * loop, or before the book existed), from the loop's own `since`; serve calls it at start and on every decision.
+ */
+export function loopBook(book: LoopBookPort, publish: (event: StreamEvent) => void, log: (line: string) => void, held: () => LoopHeld | null = () => null): {
+  sink: BookSink; publish: (event: StreamEvent) => void; adopt: (held: LoopHeld | null) => void;
+} {
+  let pending: { numbers: Record<string, number | string>; note: string | null } | null = null;
+  const adopt = (held: LoopHeld | null) => {
+    if (held === null || book.openWindow() === held.windowId) return;
+    try {
+      const id = book.adopt({
+        windowId: held.windowId, symbol: held.symbol, since: held.since, legUsd: held.legUsd, forecastNetAprPct: held.entryNetAprPct,
+        legs: [{ venue: 'hyperliquid', side: 'short' }, { venue: 'phoenix', side: 'long' }], by: 'manual',
+      });
+      log(`book: holds ${held.symbol} as ${id} (adopted from the strategy loop, from ${new Date(held.since).toISOString()})`);
+    } catch (err) {
+      log(`book: ${held.windowId} not adopted (${errorMessage(err)})`);
+    }
+  };
+  return {
+    sink: (record) => {
+      pending = null;
+      const r = book.record(record);
+      if (r.positionId !== null) pending = { numbers: r.numbers, note: r.note ?? null };
+    },
+    publish: (event) => {
+      if (event.type === 'journal' && pending !== null) {
+        const { numbers, note } = pending;
+        pending = null;
+        const summary = note === null ? event.data.summary : `${event.data.summary}; ${note}`;
+        publish({ type: 'journal', data: { ...event.data, summary, numbers: { ...event.data.numbers, ...numbers } } });
+        return;
+      }
+      publish(event);
+      if (event.type === 'decision') adopt(held());
+    },
+    adopt,
   };
 }

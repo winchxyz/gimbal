@@ -48,6 +48,11 @@
 // listens on loopback. Nothing is sent while a rescue (its fund_venue step too), an ADL unwind or panic_close runs:
 // checked at each decision and again right before every close and open. Its counters and the pair it entered are
 // kept next to the trader state, loop-<mode>-<contract>-<desk>.json.
+// The position book (src/book/, with a contract desk): every position the loop enters and exits (or holds from before:
+// adopted from the loop's own record), its funding from the venues' own ledgers (synced at start, with a catch-up from
+// the last read, and every hour after the funding time), fees and transfers, in book-<mode>-<contract>-<desk>.jsonl
+// plus a .summary.json next to the loop state. Read only: the sync calls public ledger endpoints and signs nothing. The
+// loop's enter and exit journal entries carry the book's numbers; `npm run report` prints it.
 // The monitor (src/risk/monitor.ts): every 30 min the legs, their distance to liquidation and the net; an alert to the
 // journal and the console when a leg is under 25 % from liquidation. `npm run monitor -w engine -- --mainnet` is the
 // one-shot form.
@@ -87,8 +92,12 @@ import type { ServePair } from './serve-pair.ts';
 import { liveLines, servePair } from './serve-pair.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { connectContract, contractEnv, marginVenues } from './serve-contract.ts';
-import { serveLoop } from './serve-loop.ts';
+import { loopBook, serveLoop } from './serve-loop.ts';
 import { ConfigError, retryStart } from './start-errors.ts';
+import type { PositionBook } from '../book/book.ts';
+import { createBook } from '../book/book.ts';
+import { liveBookSources } from '../book/sources.ts';
+import { userStateDir } from '../trade/trader-state.ts';
 import type { StrategyLoop } from '../strategy/loop.ts';
 import { ThinningSink, WATCH_RECORD_GAPS, loadPolicyFile, replayStart, scanLine } from './serve-replay.ts';
 
@@ -400,16 +409,38 @@ function protectionRunning(): string | null {
   return null;
 }
 
+// The position book: next to the loop state. An unreadable book file is never started over: serve runs without the
+// book (the loop trades as before) and says so, until the owner fixes or moves the file. It does not wait for the
+// pair (review S1): with the pair's start not confirmed the book still loads, holds what the loop's own record holds,
+// and syncs the venue ledgers on its own timer (a failed sync is logged and tried at the next one).
+let book: PositionBook | null = null;
+if (contract !== null && deskId !== null) {
+  try {
+    book = createBook({
+      dir: stateDirSet === undefined ? userStateDir(envVar) : resolve(stateDirSet), mode, contractId: contract.client.contractId, deskId,
+      addresses: { hyperliquid: contract.desk.evm_address, phoenix: contract.desk.solana.authority },
+      sources: mode === 'replay' ? null : liveBookSources({ network: mode === 'mainnet' ? 'mainnet' : 'testnet' }),
+      publish: (entry) => publish({ type: 'journal', data: entry }), clock, log,
+    });
+    log(`book: positions kept in ${book.path}; venue ledgers synced now and every hour (read only); npm run report prints it`);
+  } catch (err) {
+    log(`book: NOT kept (${errorMessage(err)}); the loop runs without it until that file is fixed or moved and serve restarts`);
+  }
+}
+const booked = book === null ? null : loopBook(book, publish, log, () => loop?.held ?? null);
 loop = serveLoop({
   mode, env: envVar, once: false, contractId: contract?.client.contractId ?? null, deskId, pair, lastDesk: () => lastDesk,
   accounts: loopAccounts, rescueLive, windows: () => server?.state().windows ?? null,
   carry: (id) => scanner.carry(id), venues: readers.venues, veto: nearAi,
-  strategy: () => server?.strategy ?? saved.strategy ?? DEFAULT_STRATEGY, policy: () => policy, publish, clock, log,
+  strategy: () => server?.strategy ?? saved.strategy ?? DEFAULT_STRATEGY, policy: () => policy, publish: booked?.publish ?? publish, clock, log,
+  ...(booked === null ? {} : { book: booked.sink }),
   ...(stateDirSet === undefined ? {} : { stateDir: resolve(stateDirSet) }),
   busy: () => protectionRunning() ?? (pair?.pair?.closing === true ? 'a close of the pair runs' : null),
   orderGate: protectionRunning,
 });
 log(loop.startLine());
+booked?.adopt(loop.held);
+book?.start();
 const strategyLoop = loop;
 
 server = new EngineServer({
@@ -473,6 +504,7 @@ async function shutdown(reason: string): Promise<void> {
   clearInterval(monitorTimer);
   // The loop starts nothing new; an open or close it runs is waited for with the rest, under the same deadline.
   strategyLoop.stop();
+  book?.stop();
   // No new trigger or desk read after this; a close already running (panic_close, a rescue's reduce, an ADL unwind)
   // is waited for, bounded, before the lock is released: pair-mainnet must not start next to it. One deadline covers
   // it all: risk.stop() (it waits for an ADL attempt that is running) and the closes.
