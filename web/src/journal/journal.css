@@ -114,13 +114,13 @@
   .j-summary > div > span:first-child { color: var(--ink-2); }
 
   /* the six filters do not fit in 390 px: the row scrolls sideways instead of cutting them off */
-  .j-filters { gap: 18px; padding: 0 var(--gutter); margin-top: var(--s-4); border-bottom: 0; overflow-x: auto; scrollbar-width: none; font: var(--t-s); }
+  .j-filters { gap: 18px; padding: 0 var(--gutter); margin-top: 3px; border-bottom: 0; overflow-x: auto; scrollbar-width: none; font: var(--t-s); }
   .j-filters::-webkit-scrollbar { display: none; }
-  .j-filters button { padding-bottom: 0; }
+  .j-filters button { flex: none; padding: 13px 0; min-width: 44px; text-align: left; }   /* 44 px tap target */
   .j-filters button[aria-pressed='true'] { box-shadow: none; }
   .j-filters button .n { color: inherit; margin-left: 4px; }
 
-  .j-grid { display: block; margin-top: 20px; }
+  .j-grid { display: block; margin-top: 7px; }
   .j-feed { padding: 0 0 var(--s-5); border-right: 0; }
   .j-day { padding: 20px var(--gutter) var(--s-2); }
 
@@ -135,6 +135,7 @@
   .j-evt .proof { grid-area: proof; flex-direction: row; justify-content: flex-start; margin-top: var(--s-2); gap: 0; }
   .j-evt .proof .hash { display: none; }
   .j-evt .proof .sep { display: inline; margin: 0 var(--s-2); }
+  .j-evt .proof a { padding: 13px 0; margin: -13px 0; }   /* 44 px tap target, same layout */
   .j-steps { margin-top: var(--s-2); }
   .j-more { padding: 20px var(--gutter); }
   .j-none { padding: var(--s-5) var(--gutter); }
@@ -142,6 +143,7 @@
   .j-side { display: none; }
 
   .j-new { top: var(--s-2); }
+  .j-new .btn { height: 44px; }
 
   .j-state { min-height: calc(100dvh - 56px - 96px); }
   .j-state-msg { width: auto; transform: none; padding: var(--s-5) var(--gutter); text-align: left; }

@@ -341,6 +341,40 @@ fn a_paused_desk_signs_only_what_reduces_risk() {
         .starts_with("E_SOL_PROGRAM: "));
 }
 
+/// After `panic_close`, through the method itself: Phoenix reduce-only orders and `cancel_all`
+/// still sign, an order that is not reduce-only signs on the running desk and is `E_PAUSED` on
+/// the closing one.
+#[test]
+fn a_closing_desk_signs_reduce_only_phoenix_orders_and_refuses_opening_ones() {
+    let mut p = sol_policy();
+    p.unpriced = vec![UnpricedAsset {
+        symbol: "ETH".into(),
+        max_sz: "0.005".into(),
+    }];
+    p.unpriced_max_notional_usd = 50;
+    let mut g = sol_desk_with(p);
+    let open = bytes_of(&case(&vectors(), "IOC sell 0.005 ETH, limit 2425.5"));
+    let closes = [
+        bytes_of(&case(&review(), "review 3: a reduce-only IOC sell")),
+        bytes_of(&case(
+            &review(),
+            "review 3: a reduce-only IOC sell, then cancel_all",
+        )),
+        bytes_of(&case(&vectors(), "cancel all ETH")),
+    ];
+    sol_sign(&mut g, &open).unwrap();
+    called_by(owner());
+    g.panic_close("alpha".into());
+    let desk = g.get_desk("alpha".into()).unwrap();
+    assert!(desk.paused && desk.closing);
+    for close in &closes {
+        sol_sign(&mut g, close).unwrap();
+    }
+    assert!(sol_sign(&mut g, &open)
+        .unwrap_err()
+        .starts_with("E_PAUSED: desk alpha is paused"));
+}
+
 #[test]
 fn sol_sign_is_for_the_owner_and_the_operator() {
     let mut g = sol_desk();

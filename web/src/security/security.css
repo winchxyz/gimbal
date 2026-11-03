@@ -128,6 +128,7 @@ a.s-ext.mono:hover { text-decoration: underline; text-underline-offset: 3px; }
   .s-arow > span:first-child { color: var(--ink-2); }
   .s-arow.sub > span:first-child { padding-left: 0; }
   .s-arow .mono { text-align: right; font-size: 12px; }
+  .s-ext:not(.btn), .s-link { padding: 14px 0; margin: -14px 0; }   /* 44 px tap target, same layout */
   .s-full { display: none; }
   .s-short { display: inline; }
 
@@ -135,4 +136,11 @@ a.s-ext.mono:hover { text-decoration: underline; text-underline-offset: 3px; }
   .s-ref-row { grid-template-columns: 1fr; row-gap: 2px; }
   .s-ref-links { justify-content: flex-start; flex-wrap: wrap; row-gap: 2px; margin-top: 4px; }
   .s-refusals, .s-trust { margin-top: 24px; }
+
+  .s-state { min-height: calc(100dvh - 56px - 96px); }
+  .s-state-msg { width: auto; transform: none; padding: var(--s-5) var(--gutter); text-align: left; }
+  .s-state-msg h1 { font: 400 32px/1.1 var(--display); letter-spacing: var(--track-xl); }
+  .s-state-msg p { margin-left: 0; }
+  .s-state-msg .go { flex-direction: column; justify-content: stretch; }
+  .s-state-msg .go .btn { width: 100%; }
 }

@@ -40,7 +40,8 @@ export async function startStream(): Promise<() => void> {
       // Only when asked for by name: otherwise the desk follows `?state=` and the rescue (fake.ts).
       ...(new URLSearchParams(search).has('desk') ? { desk: pickFakeDesk(search, scenario) } : {}),
       drift: pickFakeDrift(search),
-      rescue: pickFakeRescue(search),
+      // A desk with nothing yet has no rescues either, unless the address asks for one: the Journal's empty state needs an empty feed.
+      ...(scenario === 'empty' && !new URLSearchParams(search).has('rescue') ? {} : { rescue: pickFakeRescue(search) }),
     });
   }
   return connectSse(stream.dispatch, { url: '/events', readState: () => readEngineState() });

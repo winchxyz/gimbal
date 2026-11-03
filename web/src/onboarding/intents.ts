@@ -109,6 +109,9 @@ export function formatUsdc(units: bigint): string {
   return frac === '' ? whole.toString() : `${whole}.${frac}`;
 }
 
+/** A balance for reading, as the rest of the page shows money: `1,050.00 USDC`. Cents are cut off, as in `dollars`. */
+export const balanceText = (units: bigint): string => `${dollars(units).slice(1)} USDC`;
+
 /** USDC units as money for reading: "$1,050.00". Cents are cut off, not rounded, so the page never shows more than the desk holds. */
 export function dollars(units: bigint): string {
   const cents = units / 10_000n;

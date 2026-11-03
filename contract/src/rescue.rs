@@ -8,6 +8,10 @@
 //! - `evm_usdc_to_intents`: an EIP-3009 `TransferWithAuthorization` of the desk's Arbitrum USDC to
 //!   the deposit address, which the relayer submits (Arbitrum USDC origin).
 //!
+//! The operator's `hl_withdraw` (to the desk's own Arbitrum address, no quote) counts its amount
+//! against the same hourly cap ([`Gimbal::counted_hl_withdraw`]), but no cost and no deposit
+//! address.
+//!
 //! Each verifies the 1Click quote in `gimbal-core` (signature, then the field rules, then the cap,
 //! then the transfer cost the policy allows), builds the transfer from the verified quote alone
 //! and counts it in the desk's [`DeskCounters`] in the same call: its amount against the hourly
@@ -129,13 +133,21 @@ impl DeskCounters {
     /// Counts a rescue of `amount_e8` that may cost `cost_e8`, to the deposit address hashing to
     /// `deposit_sha256`, at `now_ms`. The caller checked [`Self::held`] first.
     pub fn spend(&mut self, amount_e8: u128, cost_e8: u128, deposit_sha256: [u8; 32], now_ms: u64) {
-        self.rescue_spent_e8 = self.spent_e8(now_ms).saturating_add(amount_e8);
-        self.rescue_cost_e8 = self.cost_e8(now_ms).saturating_add(cost_e8);
-        self.rescue_at_ms = now_ms;
+        self.spend_amount(amount_e8, now_ms);
+        self.rescue_cost_e8 = self.rescue_cost_e8.saturating_add(cost_e8);
         let slot = usize::from(self.deposit_next) % DEPOSIT_RING;
         self.deposits[slot] = deposit_sha256;
         self.deposit_paid_ms[slot] = now_ms;
         self.deposit_next = u8::try_from((slot + 1) % DEPOSIT_RING).unwrap_or(0);
+    }
+
+    /// Counts `amount_e8` against the amount meter alone at `now_ms`: the operator's
+    /// `hl_withdraw`, which pays no quote, so it has no cost and no deposit address. Both meters
+    /// are brought to `now_ms`, since they share `rescue_at_ms`.
+    pub fn spend_amount(&mut self, amount_e8: u128, now_ms: u64) {
+        self.rescue_spent_e8 = self.spent_e8(now_ms).saturating_add(amount_e8);
+        self.rescue_cost_e8 = self.cost_e8(now_ms);
+        self.rescue_at_ms = now_ms;
     }
 }
 
@@ -333,6 +345,29 @@ impl Gimbal {
             ));
         }
         counters.spend(q.amount_in_e8, cost, deposit_sha256, now_ms);
+        counters
+    }
+
+    /// The desk's counters with the operator's `hl_withdraw` of `amount_e8` counted at the block
+    /// time, or `E_RESCUE_CAP` for an amount over what is left of the hourly cap. Only the amount
+    /// counts: there is no quote, so no cost and no deposit address, and the destination is the
+    /// desk's own EVM address. Writes nothing, like [`Self::counted_rescue`].
+    pub fn counted_hl_withdraw(&self, desk_id: &str, amount_e8: u128) -> DeskCounters {
+        let policy = &desk_ref(&self.desks, desk_id).policy;
+        let now_ms = env::block_timestamp_ms();
+        let mut counters = self.desk_counters.get(desk_id).copied().unwrap_or_default();
+        let cap_left = counters.remaining_cap_e8(policy.rescue_cap_usd_per_hour, now_ms);
+        if amount_e8 > cap_left {
+            fail(Refusal::new(
+                E_RESCUE_CAP,
+                format!(
+                    "hl_withdraw of {} USDC is over what is left of the hourly rescue cap, {} USD",
+                    format_e8(amount_e8),
+                    format_e8(cap_left)
+                ),
+            ));
+        }
+        counters.spend_amount(amount_e8, now_ms);
         counters
     }
 

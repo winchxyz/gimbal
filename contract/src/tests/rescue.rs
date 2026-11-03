@@ -309,6 +309,67 @@ fn every_rescue_method_counts_against_one_sliding_hourly_cap() {
     assert_eq!(counters(&g), DeskCounters::default());
 }
 
+/// A rescue out of Hyperliquid is the operator's `hl_withdraw`, then `evm_usdc_to_intents` from
+/// Arbitrum: both count their amounts in the one hourly cap, so it moves about half the cap. The
+/// withdrawal adds no cost and takes no slot of the deposit ring.
+#[test]
+fn the_operators_hl_withdraw_shares_the_rescue_cap_but_not_the_cost_or_the_ring() {
+    let ten = 10 * 100_000_000;
+    let q = quote(&live(), ARB_QUOTE);
+    // 45 of the 50 USD withdrawn: the 10 USDC authorization no longer fits.
+    let mut g = rescue_desk();
+    at(operator(), NOW_MS, yocto(0));
+    g.prepare_hl_withdraw("alpha".into(), "45".into());
+    assert_eq!(
+        evm_to_intents(&mut g, &q).unwrap_err(),
+        "E_RESCUE_CAP: amountIn 10 USDC is over what is left of the hourly rescue cap, 5 USD"
+    );
+    let c = counters(&g);
+    assert_eq!((c.rescue_spent_e8, c.rescue_cost_e8), (45 * 100_000_000, 0));
+    assert_eq!(c.deposit_next, 0);
+    assert_eq!(c.eip3009_next, 0);
+    // The other way round: the authorization first, then the withdrawal up to what is left.
+    let mut g = rescue_desk();
+    at(operator(), NOW_MS, yocto(0));
+    evm_to_intents(&mut g, &q).unwrap();
+    let after_rescue = counters(&g);
+    g.prepare_hl_withdraw("alpha".into(), "40".into());
+    let c = counters(&g);
+    assert_eq!(c.rescue_spent_e8, 5 * ten);
+    assert_eq!(
+        c.rescue_cost_e8, after_rescue.rescue_cost_e8,
+        "no cost added"
+    );
+    assert_eq!(
+        (c.deposits, c.deposit_paid_ms, c.deposit_next),
+        (
+            after_rescue.deposits,
+            after_rescue.deposit_paid_ms,
+            after_rescue.deposit_next
+        ),
+        "the ring holds the one quote's address"
+    );
+    assert!(
+        outcome(|| g.prepare_hl_withdraw("alpha".into(), "0.000001".into()))
+            .unwrap_err()
+            .starts_with("E_RESCUE_CAP: hl_withdraw of 0.000001 USDC is over ")
+    );
+    // Later, the withdrawal brings the cost meter down to its time as well, as a rescue does.
+    let later = NOW_MS + RESCUE_WINDOW_MS / 2;
+    at(operator(), later, yocto(0));
+    g.prepare_hl_withdraw("alpha".into(), "1".into());
+    let c = counters(&g);
+    assert_eq!(c.rescue_at_ms, later);
+    assert_eq!(
+        c.rescue_cost_e8,
+        decayed(after_rescue.rescue_cost_e8, NOW_MS, later)
+    );
+    assert_eq!(
+        c.rescue_spent_e8,
+        decayed(5 * ten, NOW_MS, later) + ten / 10
+    );
+}
+
 #[test]
 fn a_meter_falls_linearly_over_the_hour_and_rounds_up() {
     let w = RESCUE_WINDOW_MS;

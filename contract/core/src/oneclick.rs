@@ -473,7 +473,8 @@ fn check_room(amount_out: u128, min_amount_out: u128) -> Result<(), Refusal> {
     let room = amount_out.saturating_sub(min_amount_out);
     if room.saturating_mul(10_000) < amount_out.saturating_mul(FUND_VENUE_MIN_ROOM_BPS) {
         return Err(fields(format!(
-            "minAmountOut {min_amount_out} leaves less than 0.5% below amountOut {amount_out}: a              swap held that tight is likely to fail, and fund_venue's refund goes to the owner"
+            "minAmountOut {min_amount_out} leaves less than 0.5% below amountOut {amount_out}: a \
+             swap held that tight is likely to fail, and fund_venue's refund goes to the owner"
         )));
     }
     Ok(())
@@ -798,5 +799,17 @@ mod tests {
         }
         assert!(!Method::FundVenue.is_rescue());
         assert_eq!(Method::parse("hl_withdraw"), None);
+    }
+
+    #[test]
+    fn the_room_refusal_is_one_sentence() {
+        check_room(1_000_000, 995_000).unwrap();
+        let r = check_room(1_000_000, 995_001).unwrap_err();
+        assert_eq!(r.code, E_QUOTE_FIELDS);
+        assert_eq!(
+            r.msg,
+            "minAmountOut 995001 leaves less than 0.5% below amountOut 1000000: a swap held that \
+             tight is likely to fail, and fund_venue's refund goes to the owner"
+        );
     }
 }
