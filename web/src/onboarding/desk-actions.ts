@@ -77,8 +77,16 @@ export function setOrderlyReceiverTx(contractId: string, deskId: string, receive
   };
 }
 
-export function setOrderlyIpsTx(contractId: string, deskId: string, ips: string[]): WalletTx {
-  const args = { desk_id: deskId, ips };
+/**
+ * `set_orderly_ips`. `engineIps` are the engine's public IPs (the config's `relayerIps`): the engine sends every Orderly
+ * request from there, so a list without them would lock it out of the desk's Orderly account once setup applies the
+ * list (no closes, no rescue). Throws with the reason for any list the owner must not sign (`orderlyIpsProblem`).
+ * No restriction at all is no call: the contract takes 1 to 10 IPs and setup skips the step while none are set.
+ */
+export function setOrderlyIpsTx(contractId: string, deskId: string, ips: string[], engineIps: readonly string[]): WalletTx {
+  const problem = orderlyIpsProblem(ips, engineIps);
+  if (problem !== null) throw new Error(problem);
+  const args = { desk_id: deskId, ips: ips.map((ip) => canonicalIp(ip)!) };
   return {
     receiverId: contractId,
     actions: [{ type: 'FunctionCall', params: { methodName: 'set_orderly_ips', args, gas: OWNER_CALL_GAS, deposit: storageDeposit(JSON.stringify(args), STORAGE_MARGIN_BYTES).toString() } }],
@@ -97,8 +105,46 @@ export const isEvmAddress = (text: string): boolean => /^0x[0-9a-fA-F]{40}$/.tes
 /** The IPs of the list, one per line or separated by commas: trimmed and without blanks. */
 export const splitIps = (text: string): string[] => text.split(/[\s,]+/).filter((ip) => ip !== '');
 
-/** IPv4 in canonical form (no leading zeros), or IPv6 with colons; the contract does the final check (`E_ARGS`). */
-export function isIp(text: string): boolean {
-  const v4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/.test(text);
-  return v4 || (/^[0-9a-f:]+$/.test(text) && text.includes(':') && text.length <= 39);
+const V4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+
+/**
+ * An IP in the canonical form the contract takes (Rust's `IpAddr` display: IPv4 without leading zeros, IPv6 lowercase
+ * and compressed as RFC 5952 says), or null when the text is not an IP. The URL parser does the IPv6 part.
+ */
+export function canonicalIp(text: string): string | null {
+  const t = text.trim();
+  if (V4.test(t)) return t;
+  if (!/^[0-9A-Fa-f:.]+$/.test(t) || !t.includes(':')) return null;
+  try {
+    const host = new URL(`http://[${t}]/`).hostname;
+    return host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** An IPv4 or IPv6 address; the contract does the final check (`E_ARGS`). */
+export const isIp = (text: string): boolean => canonicalIp(text) !== null;
+
+/**
+ * Why the owner must not sign this Orderly IP list, or null when it is fine: 1 to 10 distinct IPs (the contract's
+ * rule), and every one of the engine's public IPs among them. An engine IP the page does not know refuses too: a list
+ * signed on a guess can lock the engine out.
+ */
+export function orderlyIpsProblem(ips: readonly string[], engineIps: readonly string[]): string | null {
+  if (ips.length < 1 || ips.length > 10) return 'Type 1 to 10 IP addresses.';
+  const bad = ips.find((ip) => !isIp(ip));
+  if (bad !== undefined) return `“${bad}” is not an IP address.`;
+  const list = ips.map((ip) => canonicalIp(ip)!);
+  const twice = list.find((ip, i) => list.indexOf(ip) !== i);
+  if (twice !== undefined) return `${twice} is in the list twice.`;
+  const engine = engineIps.map((ip) => canonicalIp(ip)).filter((ip): ip is string => ip !== null);
+  if (engine.length === 0) {
+    return 'This page does not know the engine’s IP address (VITE_RELAYER_IP), so it cannot check that the list lets the engine in. Leave the list empty, or set VITE_RELAYER_IP.';
+  }
+  const missing = engine.filter((ip) => !list.includes(ip));
+  if (missing.length > 0) {
+    return `The list leaves out ${missing.join(' and ')}, the engine’s IP address. Orderly would refuse every request the engine sends from there, so it could not close a position or run a rescue. Add it to the list.`;
+  }
+  return null;
 }

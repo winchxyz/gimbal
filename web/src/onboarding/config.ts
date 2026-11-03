@@ -1,7 +1,9 @@
 // What onboarding needs to know that the chain and the engine do not say: which gimbal contract and which USDC token
-// this page talks to, the engine's operator public key, and the operator key's allowance. They come from the page's
+// this page talks to, the engine's operator public key, the operator key's allowance and the engine's public IP (for
+// the Orderly IP list). They come from the page's
 // environment (`VITE_*` variables, set when the page is built or served); the engine's mode says which network.
 import type { Mode } from '@gimbal/shared';
+import { canonicalIp, splitIps } from './desk-actions.ts';
 import { DEFAULT_ALLOWANCE_NEAR } from './operator.ts';
 import { nearToYocto } from './near.ts';
 import type { NearNetwork } from './wallet.ts';
@@ -16,6 +18,11 @@ export interface OnboardingConfig {
   operatorKey: string | null;
   /** NEAR the operator key may spend on gas over its life. */
   allowanceNear: string;
+  /**
+   * The engine's public IPs (`VITE_RELAYER_IP`, canonical form): it sends every Orderly request from there, so an
+   * Orderly IP list must hold them. Empty when the page does not know them: then it signs no IP list at all.
+   */
+  relayerIps: string[];
 }
 
 /** The deployed testnet contract (C6, 2026-10-31). Mainnet has none until the canary is deployed. */
@@ -42,5 +49,13 @@ export function onboardingConfig(network: NearNetwork, env: Env): OnboardingConf
     usdcToken: text(env, 'VITE_USDC_TOKEN') ?? (network === 'mainnet' ? MAINNET_USDC_TOKEN : null),
     operatorKey: text(env, 'VITE_OPERATOR_PUBLIC_KEY'),
     allowanceNear: allowance !== null && nearToYocto(allowance) !== null ? allowance : DEFAULT_ALLOWANCE_NEAR,
+    relayerIps: relayerIpsOf(text(env, 'VITE_RELAYER_IP')),
   };
+}
+
+/** One or more IPs, separated by commas or spaces; one that is not an IP makes the whole value unknown (empty). */
+function relayerIpsOf(value: string | null): string[] {
+  if (value === null) return [];
+  const ips = splitIps(value).map(canonicalIp);
+  return ips.every((ip): ip is string => ip !== null) ? [...new Set(ips)] : [];
 }

@@ -3,6 +3,6 @@
   "private": true,
   "license": "BUSL-1.1",
   "scripts": {
-    "test": "node --test \"mainnet/*.test.mjs\""
+    "test": "node --test \"mainnet/*.test.mjs\" \"testnet/*.test.mjs\""
   }
 }

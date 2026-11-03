@@ -8,6 +8,7 @@ import { NearApiTransport } from '../contract/near-transport.ts';
 import { checkContractNetwork, contractEnv } from '../cli/serve-contract.ts';
 import { HL_MAINNET_URL, HL_TESTNET_URL } from '../venues/hyperliquid.ts';
 import { ORDERLY_ENDPOINTS } from '../venues/orderly-http.ts';
+import { publicIpLookup } from './public-ip.ts';
 import { SetupService } from './service.ts';
 
 export async function setupFromEnv(mode: Mode, env: (name: string) => string | undefined, log: (line: string) => void): Promise<SetupService | null> {
@@ -29,9 +30,11 @@ export async function setupFromEnv(mode: Mode, env: (name: string) => string | u
   const config = await contract.config();
   checkContractNetwork(cfg.contractId, config, network);
   const solanaRpcUrl = env('SOLANA_RPC_URL');
+  // Checked against a desk's Orderly IP list before setup applies it; a bad GIMBAL_PUBLIC_IP stops serve here.
+  const publicIps = publicIpLookup({ override: env('GIMBAL_PUBLIC_IP') });
   log(`venue setup: on (POST /setup), operator ${cfg.accountId}, ${network}`);
   return new SetupService({
-    network, contract, operatorAccount: cfg.accountId!, config, hlUrl, orderlyUrl, log,
+    network, contract, operatorAccount: cfg.accountId!, config, hlUrl, orderlyUrl, log, publicIps,
     ...(solanaRpcUrl === undefined ? {} : { solanaRpcUrl }),
   });
 }

@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { addressesFrom } from './derive.ts';
 import { CREATE_DESK_GAS, DEPOSIT_GAS, OWNER_CALL_GAS } from './desk-actions.ts';
-import { FakeWorld, FAKE_ENGINE_KEY, FAKE_RECEIVER } from './fakes.ts';
+import { FakeWorld, FAKE_ENGINE_KEY, FAKE_RECEIVER, FAKE_RELAYER_IP } from './fakes.ts';
 import { currentStep, OnboardingFlow, receiverFound, rulesProblems, setupView, stepsOf, type FlowState } from './flow.ts';
 import { OPERATOR_METHODS } from './operator.ts';
 import type { WalletAction } from './wallet.ts';
@@ -309,6 +309,47 @@ test('mainnet: the IP list takes 1 to 10 addresses and carries a storage deposit
   await flow.startSetup();
   world.finishSetup();
   assert.equal(flow.state.setup?.steps.find((s) => s.step === 'orderly_ip_restriction')?.status, 'done');
+});
+
+/** A mainnet world with a desk, and a flow whose page knows the engine's IP as `relayerIps`. */
+async function mainnetDesk(relayerIps?: string[]) {
+  const world = new FakeWorld({ network: 'mainnet', contractId: 'gimbal.near', usdcToken: 'usdc.mainnet' });
+  const { flow } = start(world, relayerIps === undefined ? world.config() : { ...world.config(), relayerIps });
+  await flow.connect();
+  await flow.setDeskId('desk-07');
+  await flow.createDesk();
+  return { world, flow };
+}
+
+test('mainnet: an IP list without the engine’s IP is refused before the wallet opens, naming the IP', async () => {
+  const { world, flow } = await mainnetDesk();
+  const before = world.sent.length;
+  flow.setIpsText('203.0.113.7');
+  await flow.setIps();
+  assert.match(flow.state.errors.ips!, new RegExp(`leaves out ${FAKE_RELAYER_IP.replace(/\./g, '\\.')}, the engine’s IP address`));
+  assert.match(flow.state.errors.ips!, /could not close a position or run a rescue/);
+  assert.equal(world.sent.length, before, 'nothing signed');
+  assert.equal(flow.state.txs.ips, undefined);
+});
+
+test('mainnet: a page that does not know the engine’s IP signs no IP list', async () => {
+  const { world, flow } = await mainnetDesk([]);
+  const before = world.sent.length;
+  flow.setIpsText(`203.0.113.7\n${FAKE_RELAYER_IP}`);
+  await flow.setIps();
+  assert.match(flow.state.errors.ips!, /does not know the engine’s IP address/);
+  assert.equal(world.sent.length, before, 'nothing signed');
+});
+
+test('mainnet: the fake engine, like the real one, fails the IP step for a stored list without its IP', async () => {
+  const { world, flow } = await mainnetDesk();
+  world.desks.get('desk-07')!.ips = ['203.0.113.7'];
+  await flow.addEngineKey();
+  await flow.startSetup();
+  world.finishSetup();
+  const ip = flow.state.setup?.steps.find((s) => s.step === 'orderly_ip_restriction');
+  assert.equal(ip?.status, 'failed');
+  assert.match(ip?.detail ?? '', /leaves out 198\.51\.100\.20/);
 });
 
 test('testnet has no IP list', async () => {

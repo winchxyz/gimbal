@@ -19,6 +19,13 @@ const PLAN: { step: Step['step']; title: string; what: string }[] = [
   { step: 'phoenix_referral', title: 'Phoenix: referral', what: 'Activates Gimbal’s referral code when one is set.' },
 ];
 
+/** The IP list's hint: the engine's own IP must be on it, or Orderly refuses the engine (closes and rescue too). */
+function ipsHint(engineIps: readonly string[]): string {
+  const base = 'Up to 10 addresses, one per line. Orderly then accepts the desk’s trading key only from them. Leave it empty for no limit.';
+  if (engineIps.length === 0) return `${base} This page does not know the engine’s IP address, so it signs no list.`;
+  return `${base} Include the engine’s IP address, ${engineIps.join(' and ')}: the engine trades, closes and rescues from there.`;
+}
+
 const STATUS_TEXT: Record<Step['status'], string> = { done: 'Done', running: 'Working…', pending: 'Waiting', skipped: 'Skipped', failed: 'Failed' };
 
 interface Props {
@@ -60,8 +67,8 @@ export function SetupPanel({ flow, s, steps }: Props) {
       <div className="ob-body">
         {mainnet && view === 'not-started' ? (
           <div className="ob-block">
-            <Field label="Orderly IP list (optional)" htmlFor="ips" hint="Up to 10 addresses, one per line. Orderly then accepts the desk’s trading key only from them. Leave it empty for no limit.">
-              <textarea id="ips" className="ob-input" rows={3} value={s.ipsText} placeholder="203.0.113.7" onChange={(e) => flow.setIpsText(e.target.value)} />
+            <Field label="Orderly IP list (optional)" htmlFor="ips" hint={ipsHint(s.config.relayerIps)}>
+              <textarea id="ips" className="ob-input" rows={3} value={s.ipsText} placeholder={s.config.relayerIps[0] ?? '203.0.113.7'} onChange={(e) => flow.setIpsText(e.target.value)} />
             </Field>
             <p className="ob-row">
               <Act busy={s.busy} mine="ips" quiet disabled={s.ipsText.trim() === '' || ipsSigned} onClick={() => void flow.setIps()}>

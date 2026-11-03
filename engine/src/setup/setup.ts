@@ -6,7 +6,8 @@
 //                unfunded desk waits for its first deposit and retries then
 //   orderly      register -> add key (an expired key is reported, never added again: Orderly refuses a key it holds)
 //                -> receiver_address lookup (the owner pins it; a pinned one must match) -> referral_bind (no code:
-//                skipped) -> ip_restriction (no set_orderly_ips list: skipped)
+//                skipped) -> ip_restriction (no set_orderly_ips list: skipped; a list without the engine's own
+//                public IP, or an IP that cannot be told: failed, nothing signed)
 //   phoenix      register (build-register-ixs, sol_sign_register, send-register-ixs; done once the trader account
 //                exists; with none, every run first looks for one for as long as an earlier run's registration could
 //                still land) -> referral (no code: skipped; already activated: done without signing; not activated on
@@ -19,6 +20,7 @@ import type { DeskView } from '../contract/types.ts';
 import { OutcomeUnknown } from '../contract/types.ts';
 import { sleep as realSleep } from '../relayer/tx.ts';
 import { errorMessage } from '../venues/recorder.ts';
+import { missingIps, type PublicIps } from './public-ip.ts';
 
 export type SetupStep = SetupProgress['steps'][number];
 export type SetupStepName = SetupStep['step'];
@@ -74,6 +76,11 @@ export interface SetupPlan {
   orderly: OrderlySetup;
   /** null: Phoenix is not set up on this network (testnet; Phoenix runs on mainnet only). */
   phoenix: PhoenixSetup | null;
+  /**
+   * The public IPs this engine sends its Orderly requests from (public-ip.ts); rejects when they cannot be told.
+   * Absent: unknown, so a desk with an IP list is not restricted (the step fails, nothing is signed).
+   */
+  relayerIps?: PublicIps;
   /** The NEAR transactions of the Orderly signatures since the last call (the Orderly client returns none itself). */
   takeOrderlyTx?: () => TxRef[];
   publish(progress: SetupProgress): void;
@@ -296,6 +303,18 @@ async function orderly(plan: SetupPlan, run: Run, waits: (name: SetupStepName, o
   await run('orderly_ip_restriction', async () => {
     const ips = (await plan.desk()).orderly_ips ?? [];
     if (ips.length === 0) return { status: 'skipped', detail: 'no IP list is set (set_orderly_ips)' };
+    // The engine sends every Orderly request from its own IP: a list without it would lock the engine out of the
+    // account (no orders, no closes, no rescue reads). An IP that cannot be told refuses too (relayerIps rejects).
+    if (plan.relayerIps === undefined) throw new Error('the engine does not know its public IP, so it does not apply the IP list: set GIMBAL_PUBLIC_IP');
+    const missing = missingIps(ips, await plan.relayerIps());
+    if (missing.length > 0) {
+      return {
+        status: 'failed',
+        detail: `the desk's IP list (${ips.join(', ')}) leaves out ${missing.join(', ')}, the IP this engine sends its Orderly requests from: `
+          + 'Orderly would refuse every request of the engine, so it could not trade, close or rescue. Nothing was signed; '
+          + 'add it with set_orderly_ips and run setup again',
+      };
+    }
     // Setting the same list again changes nothing, so this step simply applies the stored list every run.
     await o.restrictKeyIps();
     return { status: 'done', detail: `key limited to ${ips.join(', ')}` };

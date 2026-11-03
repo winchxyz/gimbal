@@ -33,6 +33,8 @@ const fakeSecp256k1 = (seed: string): string => `secp256k1:${b58encode(bytes(see
 
 export const FAKE_ENGINE_KEY = fakeEd25519('fake engine operator key');
 export const FAKE_RECEIVER = '0x00000000000000000000000000000000000f4ce1';
+/** The fake engine's public IP: an address of a documentation range (RFC 5737), never a real host. */
+export const FAKE_RELAYER_IP = '198.51.100.20';
 
 const SETUP_STEPS: SetupProgress['steps'][number]['step'][] = [
   'hl_set_referrer',
@@ -352,8 +354,13 @@ export class FakeWorld {
     const steps = now.steps.map((s) => ({ ...s }));
     if (running >= 0) {
       const s = steps[running]!;
-      if (s.step === 'orderly_ip_restriction' && (this.network === 'testnet' || (this.desks.get(deskId)?.ips.length ?? 0) === 0)) s.status = 'skipped';
-      else s.status = 'done';
+      const ips = this.desks.get(deskId)?.ips ?? [];
+      if (s.step === 'orderly_ip_restriction' && (this.network === 'testnet' || ips.length === 0)) s.status = 'skipped';
+      else if (s.step === 'orderly_ip_restriction' && !ips.includes(FAKE_RELAYER_IP)) {
+        // As the engine's setup: a list without the engine's own IP is not applied, nothing is signed.
+        s.status = 'failed';
+        s.detail = `the desk's IP list (${ips.join(', ')}) leaves out ${FAKE_RELAYER_IP}, the IP this engine sends its Orderly requests from: Orderly would refuse every request of the engine, so it could not trade, close or rescue. Nothing was signed; add it with set_orderly_ips and run setup again`;
+      } else s.status = 'done';
       if (s.step === 'orderly_receiver_lookup') s.detail = FAKE_RECEIVER;
     }
     const next = steps.findIndex((s) => s.status === 'pending');
@@ -420,9 +427,12 @@ export class FakeWorld {
     return FAKE_ENGINE_KEY;
   }
 
-  /** The page's configuration for this world: its contract, its USDC token and the engine's key. */
+  /** The page's configuration for this world: its contract, its USDC token, the engine's key and its public IP. */
   config(): OnboardingConfig {
-    return { network: this.network, contractId: this.contractId, usdcToken: this.usdcToken, operatorKey: FAKE_ENGINE_KEY, allowanceNear: DEFAULT_ALLOWANCE_NEAR };
+    return {
+      network: this.network, contractId: this.contractId, usdcToken: this.usdcToken, operatorKey: FAKE_ENGINE_KEY, allowanceNear: DEFAULT_ALLOWANCE_NEAR,
+      relayerIps: [FAKE_RELAYER_IP],
+    };
   }
 
   /** Everything the controller needs, wired to this world. */

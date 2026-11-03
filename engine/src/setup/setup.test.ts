@@ -156,6 +156,7 @@ test('with codes and an IP list: the referrer before the builder fee, the bind, 
   const { plan: p } = plan({
     hl: hl.hl, orderly: ob.orderly, referralCodes: { hyperliquid: 'GIMBAL', orderly: 'GIMBAL', phoenix: null },
     desk: async () => testDesk({ orderly_ips: ['203.0.113.7'] }),
+    relayerIps: async () => ['203.0.113.7'],
   });
   const final = await runSetup(p);
   assert.deepEqual(hl.calls, ['setReferrer', 'approveBuilderFee']);
@@ -163,6 +164,66 @@ test('with codes and an IP list: the referrer before the builder fee, the bind, 
   assert.equal(status(final).orderly_referral_bind, 'done');
   assert.match(step(final, 'orderly_referral_bind').detail!, /already bound/);
   assert.equal(step(final, 'orderly_ip_restriction').detail, 'key limited to 203.0.113.7');
+});
+
+test('an IP list without the engine’s own public IP is not applied: the step fails with the missing IP, nothing signed', async () => {
+  const ob = fakeOrderly({ registered: true, key: true });
+  const { plan: p } = plan({
+    hl: fakeHl({ approved: 10 }).hl, orderly: ob.orderly,
+    desk: async () => testDesk({ orderly_ips: ['203.0.113.7', '2001:db8::1'] }),
+    relayerIps: async () => ['198.51.100.4'],
+  });
+  const final = await runSetup(p);
+  assert.deepEqual(ob.calls, ['receiverAddress']);
+  assert.equal(status(final).orderly_ip_restriction, 'failed');
+  const detail = step(final, 'orderly_ip_restriction').detail!;
+  assert.match(detail, /leaves out 198\.51\.100\.4, the IP this engine sends its Orderly requests from/);
+  assert.match(detail, /could not trade, close or rescue/);
+  assert.match(detail, /Nothing was signed/);
+});
+
+test('the IP check compares canonical forms, so an IPv6 written another way still counts', async () => {
+  const ob = fakeOrderly({ registered: true, key: true });
+  const { plan: p } = plan({
+    hl: fakeHl({ approved: 10 }).hl, orderly: ob.orderly,
+    desk: async () => testDesk({ orderly_ips: ['2001:db8::1'] }),
+    relayerIps: async () => ['2001:DB8:0:0:0:0:0:1'],
+  });
+  const final = await runSetup(p);
+  assert.equal(status(final).orderly_ip_restriction, 'done');
+  assert.deepEqual(ob.calls, ['receiverAddress', 'restrictKeyIps']);
+});
+
+test('an engine that cannot tell its public IP refuses to apply a list rather than guess', async () => {
+  const unknown = async (): Promise<string[]> => {
+    throw new Error("the engine's public IP is unknown (lookup failed); set GIMBAL_PUBLIC_IP to it");
+  };
+  for (const relayerIps of [undefined, unknown]) {
+    const ob = fakeOrderly({ registered: true, key: true });
+    const { plan: p } = plan({
+      hl: fakeHl({ approved: 10 }).hl, orderly: ob.orderly,
+      desk: async () => testDesk({ orderly_ips: ['203.0.113.7'] }),
+      ...(relayerIps === undefined ? {} : { relayerIps }),
+    });
+    const final = await runSetup(p);
+    assert.equal(status(final).orderly_ip_restriction, 'failed');
+    assert.match(step(final, 'orderly_ip_restriction').detail!, /GIMBAL_PUBLIC_IP/);
+    assert.deepEqual(ob.calls, ['receiverAddress']);
+  }
+});
+
+test('without an IP list the public IP is never looked up', async () => {
+  let asked = 0;
+  const { plan: p } = plan({
+    hl: fakeHl({ approved: 10 }).hl, orderly: fakeOrderly({ registered: true, key: true }).orderly,
+    relayerIps: async () => {
+      asked++;
+      return [];
+    },
+  });
+  const final = await runSetup(p);
+  assert.equal(status(final).orderly_ip_restriction, 'skipped');
+  assert.equal(asked, 0);
 });
 
 test('an unfunded desk signs nothing on Hyperliquid, and stays pending when no deposit comes', async () => {
