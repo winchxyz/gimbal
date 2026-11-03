@@ -114,6 +114,8 @@ export interface SavedHold {
    * counts above it. Absent in files written before it existed (read as null).
    */
   creditBaseE6?: string | null;
+  /** The credit's deposit was about to be signed when this was saved (absent in older files: false). */
+  creditStarted?: boolean;
 }
 
 export interface SavedWithdraw {
@@ -245,6 +247,7 @@ function parseHold(v: unknown, path: string): SavedHold {
       return { lastValidBlockHeight: lv, signature: nullable(s.signature, `${p}.signature`, nonEmpty) };
     }),
     ...(h.creditBaseE6 === undefined ? {} : { creditBaseE6: nullable(h.creditBaseE6, `${path}.creditBaseE6`, units) }),
+    ...(h.creditStarted === undefined ? {} : { creditStarted: bool(h.creditStarted, `${path}.creditStarted`) }),
   };
 }
 

@@ -314,6 +314,9 @@ export class PhoenixDeskCredit implements CreditPort {
     if (desk.paused) plan.refusals.push('the desk is paused: sol_sign takes no deposit');
     const price = parseMessage(plan.message).computeUnitPrice;
     if (price !== null && price > BigInt(MAX_PRIORITY_MICROLAMPORTS)) plan.refusals.push(`the deposit's priority price ${price} is over the ${MAX_PRIORITY_MICROLAMPORTS} µlamports sol_sign takes`);
+    if (plan.refusals.length > 0) throw new Error(`the deposit is refused, nothing signed: ${plan.refusals.join('; ')}`);
+    // The hold says the deposit may run from here on: a restart then never tells the owner to deposit it again.
+    if (options.beforeSign?.() === false) throw new Error('the rescuer state could not be saved before the deposit: nothing was deposited');
     const tx = await sendPlan(plan, ctx, { solSign: this.#o.solSign }, reason);
     const sig = tx.find((x) => x.chain === 'solana')?.id;
     if (sig === undefined) throw new Error('the Phoenix deposit returned no Solana transaction');

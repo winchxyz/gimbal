@@ -995,8 +995,11 @@ mainnet with `GIMBAL_RESCUE=1`:
   deposit, confirmed. Before anything is paid the engine checks a deposit could follow (a registered trader, a
   running desk, SOL for the fee), else the rescue is refused. A delivery that reaches the desk's USDC account with no
   deposit after it (serve stopped first, the deposit failed, or the rescue was parked and 1Click's SUCCESS is read
-  after a restart) is settled as waiting there: the hold is released and the journal says, as an `owner:` line, how
-  much waits and the `pair-mainnet fund-phoenix` command that deposits it. The engine never deposits it late.
+  after a restart) is settled: the hold is released and the journal says, as an `owner:` line, how much was
+  delivered. It gives the `pair-mainnet fund-phoenix` command only when no deposit was ever about to be signed (the
+  hold saves a "credit started" marker first) and the wallet still holds the baseline plus the delivery; otherwise
+  it says the deposit may have run: check Phoenix margin and the desk's Solana transactions first. The engine never
+  deposits it late.
 - Phoenix → Hyperliquid: one `sol_sign_rescue` transaction to the 1Click deposit address (Solana USDC for HyperCore
   USDC), the landing in the Hyperliquid ledger. The message is one of three, built and simulated unsigned before the
   hold is saved: spare USDC already on the desk's USDC account (the deposit owner's account and the
