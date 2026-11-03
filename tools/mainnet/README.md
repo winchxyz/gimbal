@@ -951,6 +951,27 @@ before any `pair-mainnet --send`.
 5. Stop with Ctrl-C: serve starts no new trigger, waits up to 180 s for the ADL attempt, a close or a rescue in
    flight, then turns trading off and releases the lock.
 
+**panic_close lines** (`engine/src/rescue/closing.ts`). serve reads `get_desk` every 5 s. The first read of
+`closing: true` journals `panic_close read from get_desk: cancelling resting orders, then closing both legs
+reduce-only; no rescue or open starts`. Each attempt then journals two lines (also printed as `[engine <time>] ...`):
+
+- `panic_close: cancelled N resting orders (...)`: the desk's resting Hyperliquid orders on the policy's coins,
+  the pair's coin first; the notes always end with `Phoenix: the leg sends IOCs only, nothing rests there`;
+- `panic_close: both legs closed reduce-only (<venue> <symbol> <start> -> <final>, ...)`: done, nothing repeats; or
+  `panic_close: the reduce-only close ended <status> (...): <notes>; tried again in 60 s`, or `panic_close: the
+  reduce-only close failed: <error>; tried again in 60 s` (journal `error`).
+
+While `closing` stays true and the legs are not flat, the attempt repeats on the first `get_desk` read 60 s or more
+after the last attempt started (and after it ended), so the cancel line and the `tried again in 60 s` line come back
+about once a minute, each time with the pair trader's own `pair      close: ...` and order lines. The first line is
+not repeated, except once after a restart of serve. Repeats mean the legs are still open: each one signs new reduce-only orders (MPC signatures on the
+operator key's NEAR allowance, Solana fees for Phoenix IOCs), and nothing opens or is rescued meanwhile. Read the
+notes; check both legs with `npm run monitor -w engine -- --mainnet`; if the same reason keeps coming back (a market
+suspended, a leg that cannot be read), stop serve and close by hand with `pair-mainnet close <SYM> --send`. The
+repeats end when a close reads both legs closed, or when the owner unpauses (`set_paused` false; serve logs `closing
+cleared`). An engine that does not trade (alert only, or no pair) journals one `error` line per panic_close instead,
+`... nothing was cancelled or closed; ...`, and never repeats it: the owner closes both legs by hand.
+
 **Reconcile an ADL hold.** After a crash in the middle of a close, or a stop that passed 180 s, the state file still
 holds orders in flight and ADL only alerts. Serve settles them itself once they are 10 min old (at start, or on a
 timer): when both legs read their saved baselines moved by those orders and offset each other, the reads are adopted
@@ -1027,6 +1048,31 @@ deposit owner: a dry quote has none), and a `refused` line for everything still 
 Stop with Ctrl-C: a running rescue signs nothing new; one that is signing or sending goes on until its payment is
 sent and saved as held, then stops waiting for 1Click. The 180 s shutdown wait covers it; the next start reads every
 held payment again at 1Click and on chain.
+
+**The rescuer's state file.** Holds, an unknown outcome and the rescue cap's last hour are kept in
+`rescue-mainnet-<contract>-<desk>-<evm>.json` in `GIMBAL_STATE_DIR` (default `%LOCALAPPDATA%/gimbal/state` or
+`$XDG_STATE_HOME/gimbal`); the start line `holds and the cap meter kept in ...` prints its path
+(`docs/interfaces.md`, "Rescuer state").
+
+- First start: there is no file yet, and a missing file holds every transfer. Start once with
+  `GIMBAL_RESCUE_FRESH=<contract>/<desk>`, which writes an empty one, then remove it from the env. serve refuses it
+  while the contract counted a rescue or a `fund_venue` of the desk in the last 65 min, or the state directory shows
+  a rescuer trace of the desk under 65 min old; with no trace at all the first try writes a marker and is refused,
+  and a try 65 min later is allowed. The refusal line names the time to start again. A first run counts the rescue
+  cap as used in full, freeing over its first hour: Phoenix -> Hyperliquid can wait up to an hour, the reserve routes
+  do not.
+- An unknown outcome (the start line says `an unknown outcome`; the journal names the rescue): an `hl_withdraw` or a
+  Phoenix deposit with no proven result. It survives restarts and holds every transfer; reduces still run. Reconcile
+  it (for a withdraw, the Hyperliquid ledger and the desk's Arbitrum address; for a deposit, the desk's Solana USDC
+  and its Phoenix collateral, then `pair-mainnet fund-phoenix` if the USDC still waits), stop serve, set `"unknown"`
+  to `null` in the file, start serve again.
+- A hold still open after 30 min is journaled once as `reconcile needed` with its deposit address, amounts and 1Click
+  status, and stays held. Once reconciled (1Click status, the Arbitrum and NEAR transactions): stop serve, delete
+  that entry from `"holds"`, start again.
+- Never delete the file to clear a hold or an unknown outcome. A missing or unusable file (`rescuer state missing`
+  or `rescuer state unusable: ...` at start) holds every transfer, reduces still run, and nothing is written there.
+  Repair it, or move it aside and start once with `GIMBAL_RESCUE_FRESH=<contract>/<desk>` (the 65 min rule above
+  applies).
 
 ## Files the scripts write
 
