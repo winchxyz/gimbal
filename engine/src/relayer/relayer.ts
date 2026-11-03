@@ -95,6 +95,11 @@ export class Relayer {
     return this.submitHl(await this.#contract.hlSendToIntents(this.deskId, quote, reason));
   }
 
+  /** hl_withdraw to the desk's own Arbitrum address, posted and confirmed in the ledger. Never retried here. */
+  async hlWithdraw(amount: string): Promise<HlSubmitResult> {
+    return this.submitHl(await this.#contract.hlWithdraw(this.deskId, amount));
+  }
+
   async submitHl(signed: HlSignedAction): Promise<HlSubmitResult> {
     if (this.#hl === undefined) throw new Error('relayer: no Hyperliquid submitter configured');
     return this.#hl.submit(signed, (await this.desk()).evm_address);

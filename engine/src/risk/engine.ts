@@ -148,6 +148,7 @@ export class RiskEngine {
   readonly #rescues = new Map<string, LegRescue>();
   #views: LegView[] = [];
   #desk: DeskState | null = null;
+  #failure: DeskState['rescueFailure'] = null;
   #stress: { key: string; rescuePct: number; at: number } | null = null;
   #seq = 0;
   #timer: ReturnType<typeof setTimeout> | undefined;
@@ -173,6 +174,22 @@ export class RiskEngine {
   /** The running ADL check, if any (tests wait on it). */
   get adlRunning(): Promise<void> | null {
     return this.#adlRun;
+  }
+
+  /** E9: the legs and each leg venue's free margin, as last read (the rescue plans its sources on them). */
+  legView(): { legs: Leg[]; freeMargin: Partial<Record<VenueId, number>> } {
+    const freeMargin: Partial<Record<VenueId, number>> = {};
+    for (const v of this.#views) freeMargin[v.leg.venue] = v.freeMarginUsd;
+    return { legs: this.#views.map((v) => v.leg), freeMargin };
+  }
+
+  /** E9: a rescue failed and the owner must act (null: it landed). Shown in DeskState until no leg is in rescue. */
+  setRescueFailure(f: DeskState['rescueFailure']): void {
+    this.#failure = f;
+    if (this.#desk !== null) {
+      this.#desk = { ...this.#desk, rescueFailure: f };
+      this.#o.publish({ type: 'desk', data: this.#desk });
+    }
   }
 
   /** The lines each leg was last judged by. */
@@ -374,7 +391,8 @@ export class RiskEngine {
       pnl: { fundingUsd, feesUsd, priceUsd, netUsd: fundingUsd + feesUsd + priceUsd },
       health: worst(views.map((v) => v.level)),
       paused: snap.paused,
-      rescueFailure: this.#desk?.rescueFailure ?? null,
+      // A failure stays shown while a leg is in rescue; once none is, margin is safe again and it clears.
+      rescueFailure: views.some((v) => v.level === 'rescue') ? this.#failure : (this.#failure = null),
       updatedAt: t,
     };
   }

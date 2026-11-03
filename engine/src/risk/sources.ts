@@ -143,6 +143,8 @@ export class ReplayDesk implements DeskSource {
   readonly #o: ReplayDeskOptions;
   #legs: ScriptLeg[] | null = null;
   #opening: Promise<ScriptLeg[]> | null = null;
+  /** The reserve, fixed when the script opens, less what replayed rescues took from it. */
+  #reserve: number | null = null;
 
   constructor(options: ReplayDeskOptions) {
     this.#o = options;
@@ -178,10 +180,21 @@ export class ReplayDesk implements DeskSource {
     }
     const failed = new Set(reads.filter((r) => r.error !== null).map((r) => r.venue));
     const legs = this.#legs.filter((l) => !failed.has(l.venue)).map((l) => this.#input(l, now));
-    const margin = this.#legs.reduce((s, l) => s + l.marginUsd, 0);
+    this.#reserve ??= this.#legs.reduce((s, l) => s + l.marginUsd, 0) * REPLAY_RESERVE_SHARE;
     return {
-      deskId: 'replay', owner: 'replay', contract: 'replay', reserveUsd: margin * REPLAY_RESERVE_SHARE, paused: null, legs, reads,
+      deskId: 'replay', owner: 'replay', contract: 'replay', reserveUsd: Math.max(0, this.#reserve), paused: null, legs, reads,
     };
+  }
+
+  /** A replayed rescue landed `usd` on `venue`: the scripted leg there holds that much more margin. */
+  credit(venue: VenueId, usd: number): void {
+    const leg = this.#legs?.find((l) => l.venue === venue);
+    if (leg !== undefined) leg.marginUsd += usd;
+  }
+
+  /** A replayed rescue took `usd` from the reserve. */
+  spendReserve(usd: number): void {
+    if (this.#reserve !== null) this.#reserve -= usd;
   }
 
   #input(l: ScriptLeg, now: number): LegInput {

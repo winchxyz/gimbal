@@ -53,6 +53,8 @@ import type { Clock } from '../venues/venue.ts';
 import { RiskEngine } from '../risk/engine.ts';
 import type { DeskSource } from '../risk/engine.ts';
 import { AccountsDeskSource, ReplayDesk } from '../risk/sources.ts';
+import type { ClosingWatch } from '../rescue/closing.ts';
+import { serveRescue } from '../rescue/serve-rescue.ts';
 import { VenueHealth, probeIntents } from '../risk/venue-health.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { connectContract, contractEnv, marginVenues } from './serve-contract.ts';
@@ -209,8 +211,11 @@ const setup = await setupFromEnv(mode, envVar, log).catch((err: unknown) => fail
 
 const publish = (event: StreamEvent) => server?.publish(event);
 let deskSource: DeskSource | null = null;
+let replayDesk: ReplayDesk | null = null;
+// panic_close: every get_desk read tells it whether the desk is closing (rescue/closing.ts).
+let closingWatch: ClosingWatch | null = null;
 if (mode === 'replay') {
-  deskSource = new ReplayDesk({
+  deskSource = replayDesk = new ReplayDesk({
     venues: readers.venues, clock, strategy: () => server?.strategy ?? DEFAULT_STRATEGY,
     onOpen: (summary) => {
       log(summary);
@@ -233,6 +238,7 @@ if (mode === 'replay') {
       const view = await side.client.getDesk(deskId!);
       if (view === null) throw new Error(`get_desk(${deskId}) answered null`);
       pausedSince = view.paused ? (pausedSince ?? Date.now()) : null;
+      closingWatch?.observe(view.closing === true);
       return { reserveUsd: Number(view.ledger.idle_usdc) / 1e6, paused: pausedSince === null ? null : { by: 'unknown', at: pausedSince } };
     },
   });
@@ -241,8 +247,26 @@ if (mode === 'replay') {
 if (deskSource !== null) {
   // TODO(day 10): pass `adl: new AdlWatch(pairTrader, ...)` once serve holds the strategy engine's PairTrader; until
   // then nothing here trades, and ADL is checked only where a PairTrader runs.
+  // E9: the rescue executor takes the risk engine's triggers (recorded 1Click answers off mainnet, live only with
+  // GIMBAL_RESCUE=1 on mainnet). TODO(day 10): pass the PairTrader as `reducer` so a rescue can reduce both legs and
+  // panic_close can close them.
+  const side = contract;
+  const rescue = await serveRescue({
+    mode, env: envVar, clock, publish, log, risk: () => risk, readers: readers.venues, policy,
+    ...(replayDesk === null ? {} : { replayDesk }),
+    ...(side === null ? {} : {
+      getDesk: async () => {
+        const view = await side.client.getDesk(deskId!);
+        if (view === null) throw new Error(`get_desk(${deskId}) answered null`);
+        return view;
+      },
+    }),
+  }).catch((err: unknown) => fail(`rescue: ${errorMessage(err)}`));
+  closingWatch = rescue.closing;
+  log(rescue.summary);
   risk = new RiskEngine({
     mode, source: deskSource, strategy: () => server?.strategy ?? DEFAULT_STRATEGY, health: venueHealth, publish, clock, log,
+    ...(rescue.rescuer === undefined ? {} : { rescuer: rescue.rescuer }),
   });
 }
 

@@ -960,3 +960,18 @@ test('reducedTarget: excess on the target side, the other side closes to 0, defi
   assert.equal(reducedTarget(q('0.003'), 0n), 0n);
   assert.equal(reducedTarget(q('0.005'), q('0.005')), null);
 });
+
+test('openBlocked: a closing desk refuses every open before anything is signed; a close still runs', async () => {
+  let closing: string | null = 'the desk is closing (panic_close)';
+  const s = setup({ pos: '0.005' }, { pos: '-0.005' }, { openBlocked: () => closing });
+  const refused = await s.trader.open({ size: '0.005', longIndex: 0, reason: 'open ETH' });
+  assert.equal(refused.status, 'stuck');
+  assert.match(refused.notes.join(' '), /open refused, nothing sent: the desk is closing/);
+  assert.equal(s.a.orders.length + s.b.orders.length, 0);
+  const closed = await s.trader.close({ reason: 'panic_close', reduceOnly: true });
+  assert.equal(closed.status, 'closed');
+  assert.deepEqual([s.a.pos, s.b.pos], [0n, 0n]);
+  assert.ok([...s.a.orders, ...s.b.orders].every((o) => o.reduceOnly));
+  closing = null;
+  assert.equal((await s.trader.open({ size: '0.005', longIndex: 0, reason: 'open ETH' })).status, 'open');
+});

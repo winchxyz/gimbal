@@ -223,6 +223,17 @@ export class ReplayContractClient implements ContractClient {
     }, nonce);
   }
 
+  /** withdraw3 to the desk's own EVM address; allowed on a paused desk (it reduces nothing, but a rescue needs it). */
+  async hlWithdraw(deskId: string, amount: string): Promise<HlSignedAction> {
+    this.calls.push({ method: 'hl_withdraw', args: { desk_id: deskId, amount } });
+    const desk = this.#gate(deskId, 'reduces-risk');
+    checkUsdcAmount(amount);
+    const nonce = this.#hlNonce(deskId);
+    return this.#hlUser(deskId, 'withdraw3', {
+      type: 'withdraw3', signatureChainId: HL_SIGNATURE_CHAIN_ID, hyperliquidChain: this.#hlChain(), destination: desk.evm_address.toLowerCase(), amount, time: nonce,
+    }, nonce);
+  }
+
   /** sendAsset to the quote's deposit address; the 1Click quote signature is not verified in replay. */
   async hlSendToIntents(deskId: string, quote: SignedQuote, reason: string): Promise<HlSignedAction> {
     this.calls.push({ method: 'hl_send_to_intents', args: { desk_id: deskId, quote, reason } });
@@ -539,7 +550,9 @@ function checkOrderlyTimestamp(field: string, timestamp: number, blockMs: number
 }
 
 function quoteFields(quote: SignedQuote): { depositAddress: string; amountIn: string } {
-  const q = (quote.quote ?? {}) as { quote?: { depositAddress?: unknown; amountIn?: unknown }; depositAddress?: unknown; amountIn?: unknown };
+  // The contract takes the canonical JSON string 1Click signed; older callers pass the object.
+  const raw = typeof quote.quote === 'string' ? (() => { try { return JSON.parse(quote.quote as string) as unknown; } catch { return {}; } })() : quote.quote;
+  const q = (raw ?? {}) as { quote?: { depositAddress?: unknown; amountIn?: unknown }; depositAddress?: unknown; amountIn?: unknown };
   const inner = (q.quote ?? q) as { depositAddress?: unknown; amountIn?: unknown };
   if (typeof inner.depositAddress !== 'string' || typeof inner.amountIn !== 'string' || !/^\d+$/.test(inner.amountIn)) {
     throw new ContractRefusal('E_QUOTE_FIELDS', 'the quote has no depositAddress or amountIn');

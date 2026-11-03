@@ -121,6 +121,8 @@ export interface PairTraderOptions {
    * The poll sleeps on `sleep` when one is given, else on an unref'd timer that stop() ends.
    */
   unsettledPollMs?: number | null;
+  /** Why no open may go out now (a desk closing after panic_close), or null; read before every open. */
+  openBlocked?: () => string | null;
 }
 
 /**
@@ -166,6 +168,7 @@ export class PairTrader {
   readonly #onWatch: (report: WatchReport) => void;
   readonly #bandBps: number;
   readonly #pollMs: number | null;
+  readonly #openBlocked: () => string | null;
   readonly #pollSleep: (ms: number) => Promise<void>;
   /** stop() was called: no poll runs or starts any more. */
   #ended = false;
@@ -209,6 +212,7 @@ export class PairTrader {
     this.#log = options.log ?? (() => {});
     this.#onWatch = options.onWatch ?? (() => {});
     this.#bandBps = options.priceBandBps;
+    this.#openBlocked = options.openBlocked ?? (() => null);
     this.#pollMs = options.unsettledPollMs === undefined ? UNSETTLED_POLL_MS : options.unsettledPollMs;
     // A watch that lasts 2 days must not keep a CLI alive: its timer is unref'd, and stop() ends it.
     this.#pollSleep = options.sleep ?? ((ms) => new Promise<void>((resolve) => {
@@ -313,6 +317,8 @@ export class PairTrader {
   async #open(request: { size: bigint | number | string; longIndex: 0 | 1; reason: string }): Promise<PairResult> {
     const size = floorToLot(typeof request.size === 'bigint' ? request.size : toQty(request.size), this.lot);
     if (size === 0n) throw new LegCheckError(`size ${String(request.size)} is under one common lot ${qtyString(this.lot)}`);
+    const closing = this.#openBlocked();
+    if (closing !== null) return this.#refused(size, [`open refused, nothing sent: ${closing}`]);
     const blocked = await this.#blocked(size);
     if (blocked !== null) return blocked;
     // Nothing is signed until both venues and the policy accept the size and both starts are known.

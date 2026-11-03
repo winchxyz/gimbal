@@ -88,6 +88,8 @@ export interface DeskView {
   evm_address: string;
   solana: { authority: string; usdc_ata: string; phusd_ata: string; phoenix_trader: string };
   orderly_receiver: string | null;
+  /** true from panic_close until set_paused(false): the engine closes every leg reduce-only and opens nothing. */
+  closing?: boolean;
   /** keccak of the desk EVM address and the broker hash, fixed at create_desk (interfaces 1.3). */
   orderly_account_id?: string;
   /** The relayer IPs the owner set with set_orderly_ips (C6); absent or null when none are set. */
@@ -253,6 +255,8 @@ export interface ContractClient extends OrderlySigner {
   hlApproveBuilderFee(deskId: string): Promise<HlSignedAction>;
   hlUsdClassTransfer(deskId: string, amount: string, toPerp: boolean, reason: string): Promise<HlSignedAction>;
   hlSendToIntents(deskId: string, quote: SignedQuote, reason: string): Promise<HlSignedAction>;
+  /** withdraw3 of `amount` (canonical USDC decimal; Hyperliquid's 1 USDC fee comes out of it) to the desk's own EVM address on Arbitrum; the operator's counts against the rescue cap. */
+  hlWithdraw(deskId: string, amount: string): Promise<HlSignedAction>;
 
   // Solana
   solSign(deskId: string, messageB64: string, reason: string): Promise<SolSignedAction>;

@@ -1,0 +1,415 @@
+{
+  "about": "Recorded mainnet 1Click quotes for the rescue executor (engine/src/rescue/recorded.ts), copied from contract/core/tests/vectors/oneclick-live.json (quoted 2026-10-31, real 1Click signatures). 1Click has no testnet, so testnet and replay take these answers instead of calling it. No /deposit/submit or /status answer was recorded: the status timelines below are shaped like the API answers, timed from the measured mainnet transfers (45-95 s to SUCCESS; Orderly credits a deposit 1-2 min after it arrives). Nothing here moves money.",
+  "source": "contract/core/tests/vectors/oneclick-live.json",
+  "desk": {
+    "deskId": "alpha",
+    "contract": "gimbal.near",
+    "owner": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+    "evm": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+    "sol": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+    "orderlyReceiver": "0xc48b812bb43401392c037381aca934f4069c0517"
+  },
+  "policy": {
+    "rescue_cap_usd_per_hour": 50,
+    "max_transfer_cost_bps": 100,
+    "max_transfer_cost_flat_e6": 1000000
+  },
+  "routes": [
+    {
+      "from": "reserve",
+      "to": "hyperliquid",
+      "method": "fund_venue",
+      "name": "fund_venue: USDC on NEAR (contract) to Hyperliquid",
+      "response": {
+        "quote": {
+          "amountIn": "20000000",
+          "amountInFormatted": "20.0",
+          "amountInUsd": "19.997480000000",
+          "minAmountIn": "20000000",
+          "amountOut": "1968086000",
+          "amountOutFormatted": "19.68086",
+          "amountOutUsd": "19.678380211640",
+          "minAmountOut": "1948095100",
+          "timeEstimate": 30,
+          "refundFee": "5551",
+          "withdrawFee": "31530000",
+          "deadline": "2026-11-03T15:59:13.224Z",
+          "timeWhenInactive": "2026-11-03T15:59:13.224Z",
+          "depositAddress": "5a35e664068487b81f18a8aa38af2dfbc0984244296988bed60774ae2354d626"
+        },
+        "quoteRequest": {
+          "dry": false,
+          "depositMode": "SIMPLE",
+          "swapType": "EXACT_INPUT",
+          "slippageTolerance": 100,
+          "originAsset": "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
+          "depositType": "ORIGIN_CHAIN",
+          "destinationAsset": "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054",
+          "amount": "20000000",
+          "refundTo": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+          "refundType": "ORIGIN_CHAIN",
+          "recipient": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "recipientType": "DESTINATION_CHAIN",
+          "deadline": "2026-10-31T15:59:13.224Z",
+          "confidentiality": "public",
+          "quoteWaitingTimeMs": 0,
+          "insured": false,
+          "appFees": [
+            {
+              "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+              "fee": 1,
+              "limitOrderId": null
+            }
+          ]
+        },
+        "signature": "ed25519:52uVqJpL6gdRUr6jQ2YSA1TFP54iv4i47WrH9TSnxCYNUvTmSfeEbrzv1LWMg2M7qjBeJ6ZpBapqTVbRPv65F7nn",
+        "timestamp": "2026-10-31T15:29:12.781Z"
+      },
+      "statuses": [
+        {
+          "afterS": 0,
+          "status": "PENDING_DEPOSIT"
+        },
+        {
+          "afterS": 6,
+          "status": "KNOWN_DEPOSIT_TX"
+        },
+        {
+          "afterS": 18,
+          "status": "PROCESSING"
+        },
+        {
+          "afterS": 60,
+          "status": "SUCCESS"
+        }
+      ],
+      "creditAfterS": 60
+    },
+    {
+      "from": "reserve",
+      "to": "orderly",
+      "method": "fund_venue",
+      "name": "fund_venue: USDC on NEAR (contract) to the pinned Orderly receiver",
+      "response": {
+        "quote": {
+          "amountIn": "10000000",
+          "amountInFormatted": "10.0",
+          "amountInUsd": "9.998740000000",
+          "minAmountIn": "10000000",
+          "amountOut": "9992780",
+          "amountOutFormatted": "9.99278",
+          "amountOutUsd": "9.991520909720",
+          "minAmountOut": "9892852",
+          "timeEstimate": 19,
+          "refundFee": "5551",
+          "withdrawFee": "5300",
+          "deadline": "2026-11-03T15:59:13.896Z",
+          "timeWhenInactive": "2026-11-03T15:59:13.896Z",
+          "depositAddress": "d8d315f9fe45dbd7a287cce8df148cf71cc890dbf51ebc80e01aa302fe548c48"
+        },
+        "quoteRequest": {
+          "dry": false,
+          "depositMode": "SIMPLE",
+          "swapType": "EXACT_INPUT",
+          "slippageTolerance": 100,
+          "originAsset": "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
+          "depositType": "ORIGIN_CHAIN",
+          "destinationAsset": "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+          "amount": "10000000",
+          "refundTo": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+          "refundType": "ORIGIN_CHAIN",
+          "recipient": "0xc48b812bb43401392c037381aca934f4069c0517",
+          "recipientType": "DESTINATION_CHAIN",
+          "deadline": "2026-10-31T15:59:13.896Z",
+          "confidentiality": "public",
+          "quoteWaitingTimeMs": 0,
+          "insured": false,
+          "appFees": [
+            {
+              "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+              "fee": 1,
+              "limitOrderId": null
+            }
+          ]
+        },
+        "signature": "ed25519:2VhkyFzAaN2zPw3FWbxr6wN5hpdDzVXYzpSVyhx6X7BLGwCiEuFa7us7nQqnxyxqRkVzbfa3pPrYkkEUczVJQnbJ",
+        "timestamp": "2026-10-31T15:29:13.455Z"
+      },
+      "statuses": [
+        {
+          "afterS": 0,
+          "status": "PENDING_DEPOSIT"
+        },
+        {
+          "afterS": 6,
+          "status": "KNOWN_DEPOSIT_TX"
+        },
+        {
+          "afterS": 18,
+          "status": "PROCESSING"
+        },
+        {
+          "afterS": 45,
+          "status": "SUCCESS"
+        }
+      ],
+      "creditAfterS": 135
+    },
+    {
+      "from": "phoenix",
+      "to": "hyperliquid",
+      "method": "sol_sign_rescue",
+      "name": "rescue Phoenix -> Hyperliquid: Solana USDC to the desk EVM address",
+      "response": {
+        "quote": {
+          "amountIn": "4000000",
+          "amountInFormatted": "4.0",
+          "amountInUsd": "3.999496000000",
+          "minAmountIn": "4000000",
+          "amountOut": "368428600",
+          "amountOutFormatted": "3.684286",
+          "amountOutUsd": "3.683821779964",
+          "minAmountOut": "364434300",
+          "timeEstimate": 30,
+          "refundFee": "10024",
+          "withdrawFee": "31530000",
+          "deadline": "2026-11-03T15:59:10.605Z",
+          "timeWhenInactive": "2026-11-03T15:59:10.605Z",
+          "depositAddress": "68EsiRwMfMkTKNUqFmJoYHx3rH2wt3mg49B5sPuAMR36"
+        },
+        "quoteRequest": {
+          "dry": false,
+          "depositMode": "SIMPLE",
+          "swapType": "EXACT_INPUT",
+          "slippageTolerance": 100,
+          "originAsset": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+          "depositType": "ORIGIN_CHAIN",
+          "destinationAsset": "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054",
+          "amount": "4000000",
+          "refundTo": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "refundType": "ORIGIN_CHAIN",
+          "recipient": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+          "recipientType": "DESTINATION_CHAIN",
+          "deadline": "2026-10-31T15:59:10.605Z",
+          "confidentiality": "public",
+          "quoteWaitingTimeMs": 0,
+          "insured": false,
+          "appFees": [
+            {
+              "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+              "fee": 1,
+              "limitOrderId": null
+            }
+          ]
+        },
+        "signature": "ed25519:mgcZ229L6CSSbTAR97mi2ADHSmjiRePyKFhHrQ6y1GyQLJ9M9aiaAysoQ2PGtkY45nj7FethNm8MQaPaq2RufJT",
+        "timestamp": "2026-10-31T15:29:10.251Z"
+      },
+      "statuses": [
+        {
+          "afterS": 0,
+          "status": "PENDING_DEPOSIT"
+        },
+        {
+          "afterS": 6,
+          "status": "KNOWN_DEPOSIT_TX"
+        },
+        {
+          "afterS": 18,
+          "status": "PROCESSING"
+        },
+        {
+          "afterS": 60,
+          "status": "SUCCESS"
+        }
+      ],
+      "creditAfterS": 60
+    },
+    {
+      "from": "phoenix",
+      "to": "orderly",
+      "method": "sol_sign_rescue",
+      "name": "Solana USDC to the pinned Orderly receiver, 10 USDC",
+      "response": {
+        "quote": {
+          "amountIn": "10000000",
+          "amountInFormatted": "10.0",
+          "amountInUsd": "9.998740000000",
+          "minAmountIn": "10000000",
+          "amountOut": "9993665",
+          "amountOutFormatted": "9.993665",
+          "amountOutUsd": "9.992405798210",
+          "minAmountOut": "9893728",
+          "timeEstimate": 19,
+          "refundFee": "10024",
+          "withdrawFee": "5300",
+          "deadline": "2026-11-03T15:59:11.543Z",
+          "timeWhenInactive": "2026-11-03T15:59:11.543Z",
+          "depositAddress": "3c4FLYTWuAbDVwi1Xpz4kFryXW2GudrmXUzLq4W17oxi"
+        },
+        "quoteRequest": {
+          "dry": false,
+          "depositMode": "SIMPLE",
+          "swapType": "EXACT_INPUT",
+          "slippageTolerance": 100,
+          "originAsset": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+          "depositType": "ORIGIN_CHAIN",
+          "destinationAsset": "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+          "amount": "10000000",
+          "refundTo": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+          "refundType": "ORIGIN_CHAIN",
+          "recipient": "0xc48b812bb43401392c037381aca934f4069c0517",
+          "recipientType": "DESTINATION_CHAIN",
+          "deadline": "2026-10-31T15:59:11.543Z",
+          "confidentiality": "public",
+          "quoteWaitingTimeMs": 0,
+          "insured": false,
+          "appFees": [
+            {
+              "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+              "fee": 1,
+              "limitOrderId": null
+            }
+          ]
+        },
+        "signature": "ed25519:3mrGwAT7Y22zymj3qmpXHGQidLmi7mw294tsPsGM1E8EZiATAiQh8TAFRE47GyASfr4nPm45rgmThPDwQY8gszKK",
+        "timestamp": "2026-10-31T15:29:11.125Z"
+      },
+      "statuses": [
+        {
+          "afterS": 0,
+          "status": "PENDING_DEPOSIT"
+        },
+        {
+          "afterS": 6,
+          "status": "KNOWN_DEPOSIT_TX"
+        },
+        {
+          "afterS": 18,
+          "status": "PROCESSING"
+        },
+        {
+          "afterS": 45,
+          "status": "SUCCESS"
+        }
+      ],
+      "creditAfterS": 135
+    }
+  ],
+  "refused": {
+    "name": "Solana USDC to the pinned Orderly receiver, 5 USDC (minAmountOut below 6)",
+    "method": "sol_sign_rescue",
+    "response": {
+      "quote": {
+        "amountIn": "5000000",
+        "amountInFormatted": "5.0",
+        "amountInUsd": "4.999370000000",
+        "minAmountIn": "5000000",
+        "amountOut": "4994183",
+        "amountOutFormatted": "4.994183",
+        "amountOutUsd": "4.993553732942",
+        "minAmountOut": "4944241",
+        "timeEstimate": 19,
+        "refundFee": "10024",
+        "withdrawFee": "5300",
+        "deadline": "2026-11-03T15:59:12.242Z",
+        "timeWhenInactive": "2026-11-03T15:59:12.242Z",
+        "depositAddress": "AAgow2yoSuNdWu9S9GJrVfGNME9si4CNqTQS9vwwepTo"
+      },
+      "quoteRequest": {
+        "dry": false,
+        "depositMode": "SIMPLE",
+        "swapType": "EXACT_INPUT",
+        "slippageTolerance": 100,
+        "originAsset": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+        "depositType": "ORIGIN_CHAIN",
+        "destinationAsset": "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+        "amount": "5000000",
+        "refundTo": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+        "refundType": "ORIGIN_CHAIN",
+        "recipient": "0xc48b812bb43401392c037381aca934f4069c0517",
+        "recipientType": "DESTINATION_CHAIN",
+        "deadline": "2026-10-31T15:59:12.242Z",
+        "confidentiality": "public",
+        "quoteWaitingTimeMs": 0,
+        "insured": false,
+        "appFees": [
+          {
+            "recipient": "5880ad2b362620fadf759cbceb1cd5737ce8c6ed7fb8e9942881e6731f9247dd",
+            "fee": 1,
+            "limitOrderId": null
+          }
+        ]
+      },
+      "signature": "ed25519:44CACr763xKXNMSEpLhbuUpVJPoe8xau25pR8sAPbGY48XfT52JNCiwycc3pNTAdUzfjStPwBu3Bc8yt9Vs9WT1T",
+      "timestamp": "2026-10-31T15:29:11.796Z"
+    },
+    "why": "minAmountOut below 6 USDC for the Orderly receiver"
+  },
+  "unavailable": [
+    {
+      "name": "rescue Hyperliquid -> Phoenix: HyperCore USDC to the desk Solana authority",
+      "method": "hl_send_to_intents",
+      "request_body": {
+        "dry": false,
+        "swapType": "EXACT_INPUT",
+        "slippageTolerance": 100,
+        "depositType": "ORIGIN_CHAIN",
+        "refundType": "ORIGIN_CHAIN",
+        "recipientType": "DESTINATION_CHAIN",
+        "deadline": "2026-10-31T15:59:11.331Z",
+        "originAsset": "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054",
+        "destinationAsset": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+        "amount": "400000000",
+        "refundTo": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+        "recipient": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB"
+      },
+      "status": 400,
+      "message": "Quoting for this pair is not available",
+      "timestamp": "2026-10-31T15:29:10.937Z"
+    },
+    {
+      "name": "owner payout leg: HyperCore USDC to the contract with customRecipientMsg",
+      "method": "hl_send_to_intents",
+      "request_body": {
+        "dry": false,
+        "swapType": "EXACT_INPUT",
+        "slippageTolerance": 100,
+        "depositType": "ORIGIN_CHAIN",
+        "refundType": "ORIGIN_CHAIN",
+        "recipientType": "DESTINATION_CHAIN",
+        "deadline": "2026-10-31T15:59:14.538Z",
+        "originAsset": "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054",
+        "destinationAsset": "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
+        "amount": "1000000000",
+        "refundTo": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+        "recipient": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "customRecipientMsg": "{\"desk_id\":\"alpha\"}"
+      },
+      "status": 400,
+      "message": "Quoting for this pair is not available",
+      "timestamp": "2026-10-31T15:29:14.119Z"
+    },
+    {
+      "name": "HyperCore USDC to a stranger on Solana",
+      "method": "hl_send_to_intents",
+      "request_body": {
+        "dry": false,
+        "swapType": "EXACT_INPUT",
+        "slippageTolerance": 100,
+        "depositType": "ORIGIN_CHAIN",
+        "refundType": "ORIGIN_CHAIN",
+        "recipientType": "DESTINATION_CHAIN",
+        "deadline": "2026-10-31T15:59:15.403Z",
+        "originAsset": "1cs_v1:hypercore:hip1:0x6d1e7cde53ba9467b783cb7c530ce054",
+        "destinationAsset": "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+        "amount": "400000000",
+        "refundTo": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+        "recipient": "7v54NWdBtkjuAFJrLGsS2SXnuk8nKam81mZJeeYxVFi9"
+      },
+      "status": 400,
+      "message": "Quoting for this pair is not available",
+      "timestamp": "2026-10-31T15:29:14.971Z"
+    }
+  ]
+}
