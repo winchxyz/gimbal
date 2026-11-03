@@ -80,7 +80,23 @@ export function fakeDeskFor(step: RescueProgress['step'] | null): 'rescuing' | '
   return step === 'landed' ? 'level' : 'rescuing';
 }
 
-/** Earlier rescues for the Journal-backed list, newest first (the mockup's three). */
+/**
+ * The Journal mockup's rescue, 19 h 18 min before `now`: the newest of the earlier rescues and the one the fake
+ * journal read lists (fake-journal.ts). One entry, one id, so the page that merges the read and the stream lists
+ * it once and every count over the journal counts it once.
+ */
+export function fakeJournalRescue(now: number, mode: Mode): JournalEntry {
+  return {
+    id: 'fake-j-rescue',
+    t: now - (19 * 60 + 18) * 60_000,
+    kind: 'rescue',
+    summary: 'Moved $120.00 to Hyperliquid margin. The short had come within 13.8% of liquidation after DOGE rose 4.1%.',
+    numbers: { usd: -0.31, from: 'reserve', signedS: 6.1, landedS: LANDED_AFTER_S },
+    tx: [fakeTx('near', 'Lq3v', '8kRd', mode), fakeTx('solana', '4uZp', 'Qe1x', mode)],
+  };
+}
+
+/** Earlier rescues for the Journal-backed list, newest first (the mockup's three; the first is the journal's own). */
 export function fakeEarlierRescues(now: number, mode: Mode): JournalEntry[] {
   const day = 86_400_000;
   const rescue = (id: string, daysAgo: number, summary: string, fee: number, from: string, landedS: number): JournalEntry => ({
@@ -92,7 +108,7 @@ export function fakeEarlierRescues(now: number, mode: Mode): JournalEntry[] {
     tx: [fakeTx('near', id.slice(-4), 'Ea2f', mode)],
   });
   return [
-    rescue('fake-rescue-earlier-1', 1, 'Moved $120.00 to Hyperliquid margin from the reserve', 0.32, 'reserve', 52),
+    fakeJournalRescue(now, mode),
     rescue('fake-rescue-earlier-2', 5, 'Moved $20.00 to Phoenix margin from the reserve', 0.21, 'reserve', 107),
     rescue('fake-rescue-earlier-3', 5.4, 'Moved $25.00 to Hyperliquid margin from Phoenix free margin', 0.28, 'phoenix', 51),
   ];

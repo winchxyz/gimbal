@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { UsageError } from './cli.mjs';
 import {
-  ALLOWED_CALLS, ASSETS, CALL_TGAS, KEY_LIFETIME_MS, ORACLE_DEPOSIT, ORACLE_IDS, callProblem, engineEnvProblems, guardedTransport,
+  ALLOWED_CALLS, ASSETS, CALL_TGAS, KEY_LIFETIME_MS, ON_PRICES_TGAS, ORACLE_DEPOSIT, ORACLE_IDS, REFRESH_SKIP_MS, REQUEST_PRICE_DATA_TGAS, callProblem, engineEnvProblems, guardedTransport,
   parseChecksArgs, policyOracleSymbols, quoteRequests, quoteVerdict, runChecks, sendRefusal, stalePrices, txCosts,
 } from './checks.mjs';
 import { OPERATOR_METHODS, orderlyAccountId } from './desk.mjs';
@@ -160,6 +160,12 @@ test('prices: costs over every receipt, and which assets got no newer price', ()
   assert.equal(ORACLE_IDS.XLM, 'xlm', 'the bare id, not an omft one');
   assert.equal(ORACLE_IDS.ZEC, 'zec.omft.near');
   assert.equal(ORACLE_DEPOSIT, 20n * 10n ** 21n);
+  // What the dry run says of the oracle call is what contract/src/prices.rs does.
+  const prices = readFileSync(new URL('../../contract/src/prices.rs', import.meta.url), 'utf8');
+  assert.match(prices, /pub const ORACLE_DEPOSIT: NearToken = NearToken::from_millinear\(20\);/);
+  assert.match(prices, new RegExp(`pub const REQUEST_PRICE_DATA_GAS: Gas = Gas::from_tgas\\(${REQUEST_PRICE_DATA_TGAS}\\);`));
+  assert.match(prices, new RegExp(`pub const ON_PRICES_GAS: Gas = Gas::from_tgas\\(${ON_PRICES_TGAS}\\);`));
+  assert.match(prices, new RegExp(`pub const REFRESH_SKIP_MS: u64 = ${REFRESH_SKIP_MS.toLocaleString('en-US').replaceAll(',', '_')};`));
 });
 
 test('the prices step refreshes the oracle assets the desk\'s policy trades, so the canary never asks for XLM or ZEC', () => {
@@ -291,7 +297,10 @@ test('the dry run prints every call of the three steps in full, signs nothing, r
   assert.ok(!f.seen.rpc.includes('send_tx') && !f.seen.rpc.includes('broadcast_tx_commit'));
   // prices
   assert.match(out, /FunctionCall refresh_prices {2}gas 300 TGas {2}deposit 0 NEAR\n {12}args {"assets":\["BTC","ETH","SOL","DOGE","LTC"\]}/);
-  assert.match(out, /price-oracle\.near request_price_data {"asset_ids":\["nbtc\.bridge\.near","eth\.bridge\.near","22\.contract\.portalbridge\.near","doge\.omft\.near","ltc\.omft\.near"\]}, deposit 0\.02 NEAR/);
+  assert.match(out, /price-oracle\.near request_price_data {"asset_ids":\["nbtc\.bridge\.near","eth\.bridge\.near","22\.contract\.portalbridge\.near","doge\.omft\.near","ltc\.omft\.near"\]}, 200 TGas plus all unused gas, deposit 0\.02 NEAR/);
+  assert.match(out, /on_prices {"assets":\[[^\]]+\]}, 15 TGas: stores each newer price; returns true when every asset got one, false when one did not or request_price_data failed/);
+  assert.match(out, /\(no oracle call, and true at once, when every asset was stored or asked for under 30 s ago\)/);
+  assert.doesNotMatch(out, /oracle_call/);
   assert.match(out, new RegExp(`signer {4}${OWNER} {2}\\(the operator key from the engine env file, read at --send\\)`));
   assert.match(out, /gas {7}at most 300\.1 TGas/);
   // orderly

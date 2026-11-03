@@ -10,7 +10,7 @@ import { depositPlan, runDeposit } from './deposit.mjs';
 import { runFund, venueTarget } from './fund.mjs';
 import { runRetire } from './retire.mjs';
 import { CANARY_LIMITS, MAINNET_ORDERLY_BROKER } from './venues.mjs';
-import { runWithdraw, withdrawActions } from './withdraw.mjs';
+import { runWithdraw, withdrawActions, withdrawEventsText } from './withdraw.mjs';
 
 const vectors = (file) => JSON.parse(readFileSync(fileURLToPath(new URL(`../../contract/core/tests/vectors/${file}`, import.meta.url)), 'utf8'));
 const LIVE = vectors('oneclick-live.json');
@@ -297,6 +297,9 @@ test('withdraw dry run: withdraw_to_owner with 1 yocto and 300 TGas, the expecte
   assert.match(r.out, /expected {2}payout 5 USDC: 5 to the owner, fee 0 to the treasury treasury\.near/);
   assert.match(r.out, /the contract needs at least 150/);
   assert.match(r.out, /the treasury treasury\.near is registered/);
+  // No profit over the high-water mark: fee 0, so the contract emits payout only.
+  assert.match(r.out, /\n {2}events {4}payout only, once the owner's transfer landed \(fee 0: no fee transfer, no fee_charged\)\n/);
+  assert.doesNotMatch(r.out, /payout and fee_charged/);
   assert.equal(seen.keys + seen.sent.length, 0);
   assert.deepEqual(withdrawActions(DESK_ID, 1n)[0].args, { desk_id: DESK_ID, amount: '1' });
 });
@@ -313,19 +316,20 @@ test('withdraw refusals: over idle_usdc (E_SIZE), nothing idle, an owner not on 
   assert.match(r.out, /payout 30 USDC: 29 to the owner, fee 1 to the treasury/);
   assert.match(r.out, /treasury treasury\.near is NOT registered/);
   assert.match(r.out, /warning {3}the fee transfer would fail and the fee 1 would stay in the desk's idle USDC/);
+  // A fee above 0: payout, then fee_charged once the fee landed; payout only if it did not.
+  assert.match(r.out, /\n {2}events {4}payout, then fee_charged, once the fee transfer landed; payout only \(fee 0, the fee back in idle_usdc\) if it failed\n/);
+  assert.equal(withdrawEventsText(0n), 'payout only, once the owner\'s transfer landed (fee 0: no fee transfer, no fee_charged)');
 });
 
-test('withdraw --send: the events after; a false return is a refusal', async () => {
-  const logs = [
-    'EVENT_JSON:{"standard":"gimbal","version":"1.0.0","event":"payout","data":[{"desk_id":"canary","amount":"5000000","to_owner":"5000000"}]}',
-    'EVENT_JSON:{"standard":"gimbal","version":"1.0.0","event":"fee_charged","data":[{"desk_id":"canary","fee":"0"}]}',
-  ];
+test('withdraw --send: the events after (fee 0: payout only, as the contract emits); a false return is a refusal', async () => {
+  const payout = `{"desk_id":"canary","to":"${OWNER}","amount":"5000000","fee":"0","profit":"0","hwm":"0"}`;
+  const logs = [`EVENT_JSON:{"standard":"gimbal","version":"1.0.0","event":"payout","data":[${payout}]}`];
   const ok = world({ onSend: () => ({ value: true, logs }) });
   const r = await capture(runWithdraw, [CONTRACT, DESK_ID, '5', '--key-file', 'k.json', '--send'], ok.deps);
   assert.equal(r.error, null, r.error?.stack);
   assert.equal(ok.seen.sent[0].actions[0].method, 'withdraw_to_owner');
-  assert.ok(r.block.includes('event:    payout {"desk_id":"canary","amount":"5000000","to_owner":"5000000"}'));
-  assert.ok(r.block.includes('event:    fee_charged {"desk_id":"canary","fee":"0"}'));
+  assert.ok(r.block.includes(`event:    payout ${payout}`));
+  assert.ok(!r.block.some((l) => l.startsWith('event:    fee_charged')));
   const no = world({ onSend: () => ({ value: false }) });
   assert.match((await capture(runWithdraw, [CONTRACT, DESK_ID, '5', '--key-file', 'k.json', '--send'], no.deps)).error.message, /returned false: nothing reached the owner/);
 });

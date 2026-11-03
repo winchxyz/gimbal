@@ -240,6 +240,14 @@ export function countsOf(entries: readonly JournalEntry[]): Counts {
   return { signed, refused, vetoed };
 }
 
+/**
+ * The counts over the entries on the page (`visibleFeed`'s `shown`): the number beside each filter and the
+ * header's "N actions signed". One set for both, so the header never counts an entry the filters do not.
+ */
+export function pageCounts(shown: readonly JournalEntry[]): { filters: Record<FilterId, number>; signed: number } {
+  return { filters: filterCounts(shown), signed: countsOf(shown).signed };
+}
+
 /** `Since 21 Oct`: the oldest entry the page holds. */
 export function sinceLabel(entries: readonly JournalEntry[]): string | null {
   const oldest = entries[entries.length - 1];

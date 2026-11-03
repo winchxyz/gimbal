@@ -57,6 +57,17 @@ export function payoutLines(p, treasury) {
   ];
 }
 
+/**
+ * The events withdraw_to_owner emits once its transfers settled (contract/src/money.rs on_payout_owner,
+ * on_payout_fee): with no fee, `payout` only; with a fee, `payout` then `fee_charged` when the fee landed, or
+ * `payout` only (fee 0, the fee back in idle_usdc) when it did not. A failed owner transfer emits nothing.
+ */
+export function withdrawEventsText(fee) {
+  return fee > 0n
+    ? 'payout, then fee_charged, once the fee transfer landed; payout only (fee 0, the fee back in idle_usdc) if it failed'
+    : 'payout only, once the owner\'s transfer landed (fee 0: no fee transfer, no fee_charged)';
+}
+
 /** Runs the withdrawal; deps: near, say, now, tree, readKey(file, accountId). Returns the summary block. */
 export async function runWithdraw(argv, deps = {}) {
   const a = parseWithdrawArgs(argv);
@@ -113,10 +124,8 @@ export async function runWithdraw(argv, deps = {}) {
   say();
   say(describeTx(`tx: withdraw ${usdcText(amount)} USDC to the owner`, { signer: owner, signedBy, receiver: a.contract, actions }).join('\n'));
   say(`  gas       at most ${tgasText(cap.total)} TGas, ${nearTextUp(cap.total * gasPrice, 4)} NEAR (the contract needs at least ${MIN_TGAS.withdraw_to_owner}); the unused part is refunded`);
-  say(`  then      USDC ft_transfer of ${usdcText(p.toOwner)} to ${owner}${p.fee > 0n ? `, then of ${usdcText(p.fee)} to ${treasury}` : ' (no fee: no profit over the high-water mark)'}; `
-    + (p.fee > 0n
-      ? 'events payout and fee_charged once the fee transfer landed (payout alone, with the fee back in idle_usdc, if it failed)'
-      : 'event payout once settled (no fee_charged: the contract logs it only for a fee above 0 that reached the treasury)'));
+  say(`  then      USDC ft_transfer of ${usdcText(p.toOwner)} to ${owner}${p.fee > 0n ? `, then of ${usdcText(p.fee)} to ${treasury}` : ' (no fee: no profit over the high-water mark)'}`);
+  say(`  events    ${withdrawEventsText(p.fee)}`);
 
   const at = () => new Date(now()).toISOString();
   if (!a.send) {

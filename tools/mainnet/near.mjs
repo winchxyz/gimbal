@@ -1,7 +1,6 @@
 // A NEAR mainnet client for the canary runbook (tools/mainnet/README.md): JSON-RPC, borsh transactions
-// (FunctionCall, DeployContract, AddKey with a FunctionCall permission, DeleteAccount for retire.mjs), key files
-// that are never printed, and a
-// printer for planned transactions. No dependencies: node:crypto signs, the rest is written out here or shared.
+// (FunctionCall, DeployContract, AddKey with a FunctionCall permission, DeleteKey for keys.mjs, DeleteAccount for
+// retire.mjs), key files that are never printed, and a printer for planned transactions. No dependencies: node:crypto signs, the rest is written out here or shared.
 //
 // This is a separate module from tools/testnet/near.mjs on purpose: that one refuses mainnet, this one refuses
 // testnet, and neither has a network switch, so the testnet guards stay exactly as they are. Only pure helpers
@@ -332,8 +331,9 @@ export function feesOf(protocolConfig) {
   for (const [name, f] of Object.entries(fees)) {
     if (!isFee(f)) throw new Error(`EXPERIMENTAL_protocol_config: no ${name} fee`);
   }
-  // Only retire.mjs needs it; txGasCap refuses a DeleteAccount without it.
+  // Only retire.mjs and keys.mjs need them; txGasCap refuses a DeleteAccount or a DeleteKey without its fee.
   if (isFee(a?.delete_account_cost)) fees.deleteAccount = a.delete_account_cost;
+  if (isFee(a?.delete_key_cost)) fees.deleteKey = a.delete_key_cost;
   return fees;
 }
 
@@ -360,6 +360,9 @@ export function txGasCap(fees, { signer, receiver, actions }) {
     } else if (a.type === 'DeleteAccount') {
       if (fees.deleteAccount === undefined) throw new Error('EXPERIMENTAL_protocol_config: no delete_account_cost fee');
       other += fee(fees.deleteAccount);
+    } else if (a.type === 'DeleteKey') {
+      if (fees.deleteKey === undefined) throw new Error('EXPERIMENTAL_protocol_config: no delete_key_cost fee');
+      other += fee(fees.deleteKey);
     } else {
       throw new Error(`unknown action ${a.type}`);
     }
@@ -428,6 +431,11 @@ export const act = {
   },
   /** Deletes the signer's own account; its whole balance goes to `beneficiaryId`. Only retire.mjs plans it. */
   deleteAccount: (beneficiaryId) => ({ type: 'DeleteAccount', beneficiaryId: mainnetId(beneficiaryId, 'beneficiary') }),
+  /** Deletes one access key of the signer's account. Only keys.mjs plans it, and never for a full-access key. */
+  deleteKey: (publicKey) => {
+    publicKeyBytes(publicKey);
+    return { type: 'DeleteKey', publicKey };
+  },
 };
 
 const M64 = (1n << 64n) - 1n;
@@ -464,6 +472,9 @@ function encodeAction(w, a) {
       for (const m of a.methodNames) w.string(m);
       return w;
     }
+    case 'DeleteKey':
+      // DeleteKey(6) { public_key: ED25519(0) + 32 bytes }.
+      return w.u8(6).u8(0).bytes(publicKeyBytes(a.publicKey));
     case 'DeleteAccount':
       return w.u8(7).string(a.beneficiaryId);
     default:
@@ -492,6 +503,8 @@ export function describeTx(label, { signer, signedBy, receiver, actions }) {
       lines.push(`${n}  AddKey ${a.publicKey}`);
       lines.push(`            permission FunctionCall: receiver ${a.receiverId}, allowance ${nearText(a.allowance)} NEAR, ${a.methodNames.length} methods`);
       lines.push(`            method_names ${JSON.stringify(a.methodNames)}`);
+    } else if (a.type === 'DeleteKey') {
+      lines.push(`${n}  DeleteKey ${a.publicKey}: the access key is removed from ${signer}`);
     } else if (a.type === 'DeleteAccount') {
       lines.push(`${n}  DeleteAccount: the account ${signer} is deleted; its whole NEAR balance goes to the beneficiary ${a.beneficiaryId}`);
     }
