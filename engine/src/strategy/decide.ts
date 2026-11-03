@@ -4,16 +4,19 @@
 //
 // The rules, in the order decide() applies them:
 // - off: strategy.auto false. The counters still move, so turning auto on does not wait out the hours again.
-// - held, numbers unknown: a P&L, leg size, net or stop that is not a finite number (or a leg size <= 0) means no
-//   act at all: wait, "held pair numbers unknown", and the held window is never counted healthy that hour.
-// - held, at once: drawdown at stopDrawdownPct, or the maxHoldDays time stop: exit. Drawdown is the held pair's P&L
-//   (held.pnlUsd) against one leg's notional (held.legUsd): -1.20 USD on a 12 USD leg is 10 %.
+// - held, at once, first: the maxHoldDays time stop (needs only a finite held.since), or drawdown at stopDrawdownPct
+//   (needs a finite held.pnlUsd, held.legUsd > 0 and a finite stop): exit. Drawdown is the held pair's P&L
+//   (held.pnlUsd) against one leg's notional (held.legUsd): -1.20 USD on a 12 USD leg is 10 %. No other number,
+//   known or not, keeps a stop from firing.
+// - held, numbers unknown: past the stops, a P&L, leg size, net or rule that is not a finite number (or a leg size
+//   <= 0) means no act: wait, "held pair numbers unknown", and the held window is never counted healthy that hour.
 // - held, counted: rotate into another window that beat the held one by rotate.minGainPts for rotate.forHours hourly
 //   checks in a row and whose switchCostUsd pays back within the rest of the hold at that gain on the new leg's size
 //   (windows on the held pair's venues first, at most maxRotationsPerDay in 24 h); else exit after exitAfterChecks
-//   hourly checks in a row of compression or a flipped spread; else hold. Compression judges the held window's net
-//   without the opening fills it already paid (heldNetAprPct): what is left to earn, net of the exit, against
-//   minNetAprPct.
+//   hourly checks in a row of compression or a flipped spread; else hold. The held window is measured forward
+//   (heldForward): its multi-day gross over the hours left, less the exit (half the fills and slippage plus the basis
+//   buffer, in USD as the scanner priced them over holdHours), as APR over the hours left; the opening fills are sunk.
+//   Compression holds that to minNetAprPct; a challenger's gain is its net APR less that.
 // - flat: after an exit, nothing for cooldownHours; then the top of the scanner's ranked list among the windows that
 //   pass the entry rules now: once it has passed them for enterAfterChecks hourly checks in a row, enter it, sized by
 //   sizeFor; until then, or if it cannot be sized, wait. A lower window is never entered in its place.
@@ -25,8 +28,11 @@
 // reached, never add to them. The counters a Decision returns assume its `act` is carried out; when the veto refuses
 // it or it fails, save skipAct(input, decision, ...) instead.
 //
-// The executor (loop.ts) opens exactly `qty` base units a leg, as given: it never derives a size again from legUsd.
-// On a rotate it sets HeldPair.since to the rotation time, so the time stop and the payback horizon start again.
+// The executor (loop.ts) opens `qty` base units a leg, as given: it never derives a size again from legUsd. `qty` is
+// a maximum: the contract values an order at sz x max(limit, oracle), so at order time the executor checks that
+// against the cap again and, if a price rise put it over, rounds `qty` down (never up) to whole common lots, the
+// same on both legs, before either leg is sent. On a rotate it sets HeldPair.since to the rotation time, so the time
+// stop and the payback horizon start again.
 
 import type { StrategyConfig, StrategyDecision, Window as FundingWindow } from '@gimbal/shared';
 import { DEFAULT_SCANNER_CONFIG } from '../scanner/config.ts';
@@ -106,14 +112,20 @@ export interface DecideInput {
    * loop.ts. A rotation sizes the new legs on free margin plus this. Absent = none counted.
    */
   freedMarginUsd?: Record<string, number>;
+  /**
+   * The hours the scanner spread each window's one-off costs over (its config.costs.holdHours): the held pair's exit
+   * cost is taken back to USD with it. Absent = DEFAULT_SCANNER_CONFIG.costs.holdHours.
+   */
+  holdHours?: number;
 }
 
 export interface Decision {
   decision: StrategyDecision;              // published as the `decision` event when it changes
   counters: LoopCounters;                  // to save
   act:                                     // what loop.ts carries out; null = nothing to sign
-    // qty: base units a leg, whole common lots of both venues (canonical decimal). The executor opens exactly this
-    // and never derives a size again from legUsd, which is qty at the price it was sized at.
+    // qty: base units a leg, whole common lots of both venues (canonical decimal), a maximum. The executor never
+    // derives a size again from legUsd (qty at the price it was sized at); at order time it re-checks
+    // qty x max(limit, oracle) <= the cap and only rounds qty down, the same on both legs, before either is sent.
     | { kind: 'enter'; windowId: string; legUsd: number; leverage: number; qty: string }
     | { kind: 'exit'; reason: string }
     | { kind: 'rotate'; fromId: string; toId: string; legUsd: number; leverage: number; qty: string }
@@ -199,26 +211,55 @@ export function entryFailure(w: FundingWindow, input: GateInput): string | null 
 
 // ---- the held pair ----
 
-/**
- * The held window's net APR without the opening fills the desk already paid: Window.netAprPct spreads the whole
- * round trip (4 fills) over the hold, and half of the fees and slippage is the open. The exit and the basis buffer
- * stay in.
- */
-export function heldNetAprPct(w: FundingWindow): number {
-  return w.netAprPct + (w.costs.feesPct + w.costs.slippagePct) / 2;
+/** The hours the scanner spread one-off costs over: DecideInput.holdHours, else its default config's. */
+function scannerHoldHours(input: Pick<DecideInput, 'holdHours'>): number {
+  return input.holdHours ?? DEFAULT_SCANNER_CONFIG.costs.holdHours;
 }
 
-/** What about the held pair is not a number decide() can act on, or null. */
-function heldUnknown(held: HeldPair, heldW: FundingWindow | null, strategy: StrategyConfig): string | null {
+/** The hours left before the time stop (at least one, for the APR). */
+function restHoursOf(held: HeldPair, now: number): number {
+  return Math.max(1, LOOP_RULES.maxHoldDays * 24 - (now - held.since) / HOUR_MS);
+}
+
+/**
+ * The held window measured forward, in USD on the held leg: its multi-day gross (Window.netAprPct plus the costs the
+ * scanner took off it) over the hours left, less the exit still to pay (half the fills and slippage, and the basis
+ * buffer, which the scanner spread over `holdHours`: taken back to USD with the same hours). The opening fills are
+ * sunk. `aprPct` is `usd` as APR on the leg over the hours left: what compression holds to minNetAprPct and what a
+ * challenger's net APR is compared with.
+ */
+export function heldForward(
+  w: FundingWindow, held: HeldPair, input: Pick<DecideInput, 'now' | 'holdHours'>,
+): { usd: number; aprPct: number; restHours: number } {
+  const c = w.costs;
+  const grossAprPct = w.netAprPct + c.feesPct + c.slippagePct + c.basisPct + c.rescueReservePct;
+  const exitAprPct = (c.feesPct + c.slippagePct) / 2 + c.basisPct;
+  const exitUsd = (exitAprPct / 100) * held.legUsd * (scannerHoldHours(input) / HOURS_PER_YEAR);
+  const restHours = restHoursOf(held, input.now);
+  const usd = (grossAprPct / 100) * held.legUsd * (restHours / HOURS_PER_YEAR) - exitUsd;
+  return { usd, aprPct: (usd / held.legUsd) * (HOURS_PER_YEAR / restHours) * 100, restHours };
+}
+
+/** Whether a stop can be judged: the time stop needs a finite `since`; the drawdown stop needs these. */
+function drawdownKnown(held: HeldPair, stop: number | null): stop is number {
+  return stop !== null && finite(stop) && finite(held.pnlUsd) && finite(held.legUsd) && held.legUsd > 0;
+}
+
+/** What about the held pair is not a number decide() can measure it by (past the stops), or null. */
+function heldUnknown(held: HeldPair, heldW: FundingWindow | null, input: Pick<DecideInput, 'strategy' | 'holdHours'>): string | null {
+  const { strategy } = input;
   if (!finite(held.pnlUsd)) return `${held.symbol} P&L is not a number (${String(held.pnlUsd)})`;
   if (!finite(held.legUsd) || held.legUsd <= 0) return `${held.symbol} leg size is not a positive number (${String(held.legUsd)})`;
   if (!finite(held.since)) return `${held.symbol} entry time is not a number`;
   if (strategy.stopDrawdownPct !== null && !finite(strategy.stopDrawdownPct)) return `your drawdown stop is not a number (${String(strategy.stopDrawdownPct)})`;
   if (!finite(strategy.minNetAprPct)) return `your minimum is not a number (${String(strategy.minNetAprPct)})`;
+  const hold = scannerHoldHours(input);
+  if (!finite(hold) || hold <= 0) return `the scanner's hold is not a positive number (${String(hold)})`;
   if (heldW === null) return null;
   const numbers: [string, unknown][] = [
     ['net APR', heldW.netAprPct], ['gross APR this hour', heldW.grossAprPct], ['fees', heldW.costs.feesPct],
-    ['slippage', heldW.costs.slippagePct], ['7-day spread', heldW.grossApr7dPct ?? 0],
+    ['slippage', heldW.costs.slippagePct], ['basis buffer', heldW.costs.basisPct], ['rescue reserve', heldW.costs.rescueReservePct],
+    ['7-day spread', heldW.grossApr7dPct ?? 0],
   ];
   for (const [name, v] of numbers) if (!finite(v)) return `${held.symbol} ${name} is not a number (${String(v)})`;
   return null;
@@ -226,14 +267,12 @@ function heldUnknown(held: HeldPair, heldW: FundingWindow | null, strategy: Stra
 
 /** Whether the held window compressed or flipped this check, and how, for the hold and exit lines. */
 export function heldTrouble(
-  w: FundingWindow, held: HeldPair, input: Pick<DecideInput, 'now' | 'strategy' | 'gross14dAprPct'>,
+  w: FundingWindow, held: HeldPair, input: Pick<DecideInput, 'now' | 'strategy' | 'gross14dAprPct' | 'holdHours'>,
 ): string | null {
   const min = input.strategy.minNetAprPct;
-  const net = heldNetAprPct(w);
-  const restHours = Math.max(0, LOOP_RULES.maxHoldDays * 24 - (input.now - held.since) / HOUR_MS);
-  const restUsd = (net / 100) * held.legUsd * (restHours / HOURS_PER_YEAR);
-  if (restUsd < 0) return `${pct(net)} net of the exit, ${usd(restUsd)} over the ${Math.round(restHours)} h left`;
-  if (net < min) return `${pct(net)} net of the exit, under your ${minimum(min)} minimum`;
+  const f = heldForward(w, held, input);
+  if (f.usd < 0) return `${pct(f.aprPct)} net of the exit, ${usd(f.usd)} over the ${Math.round(f.restHours)} h left`;
+  if (f.aprPct < min) return `${pct(f.aprPct)} net of the exit, under your ${minimum(min)} minimum`;
   if (w.grossAprPct < 0) return `the spread flipped: this hour pays ${pct(w.grossAprPct)}`;
   if (w.grossApr7dPct !== null && !(w.grossApr7dPct > 0)) return `the spread flipped: the 7-day spread is ${pct(w.grossApr7dPct)}`;
   const d14 = input.gross14dAprPct?.[w.id] ?? null;
@@ -333,10 +372,11 @@ function count(input: DecideInput, hourly: boolean, heldW: FundingWindow | null)
   let badChecks = 0;
   let betterByWindow: Record<string, number> = {};
   const held = input.held;
-  if (held !== null && heldW !== null && !heldW.stale && heldUnknown(held, heldW, input.strategy) === null) {
+  if (held !== null && heldW !== null && !heldW.stale && heldUnknown(held, heldW, input) === null) {
     badChecks = heldTrouble(heldW, held, input) === null ? 0 : (broken ? 0 : c.badChecks) + 1;
     const gainPts = input.strategy.rotate.minGainPts;
-    const better = finite(gainPts) ? passing.filter((w) => w.id !== held.windowId && w.netAprPct - heldW.netAprPct >= gainPts) : [];
+    const heldApr = heldForward(heldW, held, input).aprPct;
+    const better = finite(gainPts) ? passing.filter((w) => w.id !== held.windowId && w.netAprPct - heldApr >= gainPts) : [];
     betterByWindow = bump(c.betterByWindow, better.map((w) => w.id), broken);
   } else if (held !== null) {
     // The held window's numbers are missing, old or not numbers this hour: neither for nor against it.
@@ -371,35 +411,40 @@ type Out = (action: StrategyDecision['action'], reason: string, windowId: string
 
 function decideHeld(input: DecideInput, held: HeldPair, heldW: FundingWindow | null, counters: LoopCounters, out: Out): Decision {
   const { strategy, now } = input;
-  // Nothing is decided on a number that is not one: no exit, no rotation, no "healthy".
-  const unknown = heldUnknown(held, heldW !== null && !heldW.stale ? heldW : null, strategy);
-  if (unknown !== null) {
-    return out('wait', `Held pair numbers unknown: ${unknown}; nothing is decided on ${held.symbol}`, held.windowId, null, `held-unknown:${held.windowId}`);
-  }
   const heldHours = (now - held.since) / HOUR_MS;
-  const day = `day ${Math.floor(heldHours / 24) + 1} of ${LOOP_RULES.maxHoldDays}`;
 
-  // At once, whatever the counts. Drawdown: the pair's P&L against one leg's notional.
+  // The stops first, at once, whatever the counts: each needs only its own numbers, so nothing else that is unknown
+  // (a scan number, the minimum) keeps a losing or overdue pair open. Drawdown: the pair's P&L against one leg.
   const stop = strategy.stopDrawdownPct;
-  const downPct = (-held.pnlUsd / held.legUsd) * 100;
-  if (stop !== null && held.pnlUsd < 0 && downPct >= stop) {
-    const reason = `Exit ${held.symbol}: down ${usd(-held.pnlUsd)}, ${downPct.toFixed(1)} % of the ${usd(held.legUsd)} leg, at your ${minimum(stop)} stop`;
-    return out('exit', reason, held.windowId, { kind: 'exit', reason });
+  if (drawdownKnown(held, stop)) {
+    const downPct = (-held.pnlUsd / held.legUsd) * 100;
+    if (held.pnlUsd < 0 && downPct >= stop) {
+      const reason = `Exit ${held.symbol}: down ${usd(-held.pnlUsd)}, ${downPct.toFixed(1)} % of the ${usd(held.legUsd)} leg, at your ${minimum(stop)} stop`;
+      return out('exit', reason, held.windowId, { kind: 'exit', reason });
+    }
   }
-  if (heldHours >= LOOP_RULES.maxHoldDays * 24) {
+  if (finite(held.since) && heldHours >= LOOP_RULES.maxHoldDays * 24) {
     const reason = `Exit ${held.symbol}: held ${(heldHours / 24).toFixed(1)} days, the ${LOOP_RULES.maxHoldDays}-day time stop`;
     return out('exit', reason, held.windowId, { kind: 'exit', reason });
   }
+
+  // Past the stops, nothing is decided on a number that is not one: no compression, no rotation, no "healthy".
+  const unknown = heldUnknown(held, heldW !== null && !heldW.stale ? heldW : null, input);
+  if (unknown !== null) {
+    return out('wait', `Held pair numbers unknown: ${unknown}; nothing is decided on ${held.symbol}`, held.windowId, null, `held-unknown:${held.windowId}`);
+  }
+  const day = `day ${Math.floor(heldHours / 24) + 1} of ${LOOP_RULES.maxHoldDays}`;
   if (heldW === null) return out('hold', `Hold ${held.symbol}: its window is not in this scan, so nothing is decided on it; ${day}`, held.windowId);
   if (heldW.stale) return out('hold', `Hold ${held.symbol}: its numbers are stale this scan, so nothing is decided on them; ${day}`, held.windowId);
 
-  // Rotation.
+  // Rotation, against the held window measured forward.
   const restHours = Math.max(0, LOOP_RULES.maxHoldDays * 24 - heldHours);
-  const rot = rotation(input, held, heldW, counters, restHours);
+  const forward = heldForward(heldW, held, input);
+  const rot = rotation(input, held, heldW, forward.aprPct, counters, restHours);
   if (rot.kind === 'rotate') {
     const { w, size, gain, paybackHours } = rot;
     const n = counters.betterByWindow[w.id] ?? 0;
-    const reason = `Rotate ${held.symbol} -> ${pair(w)}: ${pct(w.netAprPct)} net vs ${pct(heldW.netAprPct)}, +${gain.toFixed(1)} pts for `
+    const reason = `Rotate ${held.symbol} -> ${pair(w)}: ${pct(w.netAprPct)} net vs ${pct(forward.aprPct)} held, +${gain.toFixed(1)} pts for `
       + `${n} of ${strategy.rotate.forHours} hours; the ${usd(w.switchCostUsd!)} switch pays back in ${(paybackHours / 24).toFixed(1)} of the `
       + `${(restHours / 24).toFixed(1)} days left; ${usd(size.legUsd)} a leg at ${lev(size.leverage)}`;
     return out('rotate', reason, w.id, {
@@ -414,7 +459,7 @@ function decideHeld(input: DecideInput, held: HeldPair, heldW: FundingWindow | n
     return out('exit', reason, held.windowId, { kind: 'exit', reason });
   }
   const status = trouble === null
-    ? `${pct(heldNetAprPct(heldW))} net of the exit, at least your ${minimum(strategy.minNetAprPct)} minimum`
+    ? `${pct(forward.aprPct)} net of the exit, at least your ${minimum(strategy.minNetAprPct)} minimum`
     : `${trouble}, ${counters.badChecks} of ${hours(LOOP_RULES.exitAfterChecks)} before exit`;
   return out('hold', `Hold ${held.symbol}: ${status}; ${day}${rot.note === null ? '' : `; ${rot.note}`}`, held.windowId);
 }
@@ -424,7 +469,7 @@ type Rotation =
   | { kind: 'none'; note: string | null };
 
 /** The rotation to make now, or a note on the closest challenger for the hold line. */
-function rotation(input: DecideInput, held: HeldPair, heldW: FundingWindow, counters: LoopCounters, restHours: number): Rotation {
+function rotation(input: DecideInput, held: HeldPair, heldW: FundingWindow, heldAprPct: number, counters: LoopCounters, restHours: number): Rotation {
   const { strategy } = input;
   const { minGainPts, forHours } = strategy.rotate;
   if (!finite(minGainPts) || !finite(forHours)) return { kind: 'none', note: 'your rotation rule is not a number: no rotation' };
@@ -433,7 +478,7 @@ function rotation(input: DecideInput, held: HeldPair, heldW: FundingWindow, coun
   const gated = { ...input, counters };
   const challengers = input.windows
     .filter((w) => w.id !== held.windowId && (counters.betterByWindow[w.id] ?? 0) > 0 && gate(w, gated) === null)
-    .map((w) => ({ w, gain: w.netAprPct - heldW.netAprPct }))
+    .map((w) => ({ w, gain: w.netAprPct - heldAprPct }))
     .filter((c) => c.gain >= minGainPts)
     // Windows on the venues that already hold the margin first, then in the scanner's rank (a stable sort).
     .sort((a, b) => Number(same(b.w)) - Number(same(a.w)));

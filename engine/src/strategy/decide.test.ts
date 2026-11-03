@@ -2,7 +2,8 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { LOOP_RULES, NO_COUNTERS, decide, entryFailure, heldNetAprPct, journalWait, sizeFor, skipAct } from './decide.ts';
+import { DEFAULT_SCANNER_CONFIG } from '../scanner/config.ts';
+import { LOOP_RULES, NO_COUNTERS, decide, entryFailure, heldForward, journalWait, sizeFor, skipAct } from './decide.ts';
 import type { Decision, LoopCounters } from './decide.ts';
 import { HOUR, STRATEGY, T0, held, hours, input, win } from './test-helpers.ts';
 
@@ -205,23 +206,43 @@ test('auto off: action off, nothing to sign, the counters still move', () => {
 
 // ---- exit ----
 
-test('a held pair is judged without the opening fills it already paid: the exit costs stay in', () => {
-  // Window.netAprPct spreads 4 fills (2 % fees + 0.5 % slippage) over the hold; the open half is sunk.
-  assert.equal(heldNetAprPct(win(XLM, { netAprPct: 9 })), 10.25);
-  // 9 % net for a new entry is under the 10 % minimum; held, it is 10.25 % net of the exit: no compression.
-  const ds = hours(input({ held: held(XLM) }), 4, () => [win(XLM, { netAprPct: 9 })]);
+test('a held pair is measured forward in USD: its gross over the hours left less the exit, the open sunk', () => {
+  const hold = DEFAULT_SCANNER_CONFIG.costs.holdHours;
+  // 9 % net is 12 % gross less 3 % of costs over the scanner's hold. The exit still to pay is half the 2 % fees and
+  // 0.5 % slippage plus the 0.5 % basis buffer: 1.75 % over the scanner's hold, in USD on the 12 USD leg.
+  const w = win(XLM, { netAprPct: 9 });
+  const exitUsd = 0.0175 * 12 * (hold / 8760);
+  const day1 = heldForward(w, held(XLM), { now: T0 });
+  assert.equal(day1.restHours, 336);
+  assert.ok(Math.abs(day1.usd - (0.12 * 12 * (336 / 8760) - exitUsd)) < 1e-12);
+  assert.ok(Math.abs(day1.aprPct - (day1.usd / 12) * (8760 / 336) * 100) < 1e-9);
+  // Day 1: 9 % net for a new entry is under the 10 % minimum, but held it nets more than 10 % forward: no compression.
+  const ds = hours(input({ held: held(XLM) }), 4, () => [w]);
   assert.deepEqual(actions(ds), ['hold', 'hold', 'hold', 'hold']);
-  assert.equal(ds[3]!.decision.reason, 'Hold XLM: 10.3 % net of the exit, at least your 10 % minimum; day 1 of 14');
+  assert.match(ds[3]!.decision.reason, /^Hold XLM: 10\.\d % net of the exit, at least your 10 % minimum; day 1 of 14$/);
   assert.equal(ds[3]!.counters.badChecks, 0);
+  // Day 12: 72 h left carry the whole exit, not 72/336 of it: the same window is compression now.
+  const since = T0 - 11 * 24 * HOUR;
+  const day12 = heldForward(w, held(XLM, { since }), { now: T0 });
+  assert.equal(day12.restHours, 72);
+  assert.ok(Math.abs(day12.usd - (0.12 * 12 * (72 / 8760) - exitUsd)) < 1e-12);
+  assert.equal(day12.aprPct.toFixed(1), '6.2');
+  const late = hours(input({ held: held(XLM, { since }) }), 3, () => [w]);
+  assert.deepEqual(actions(late), ['hold', 'hold', 'exit']);
+  assert.match(late[0]!.decision.reason, /^Hold XLM: 6\.\d % net of the exit, under your 10 % minimum, 1 of 3 hours before exit; day 12 of 14$/);
+  // The scanner's hold comes in as DecideInput.holdHours: half the hold, half the exit in USD.
+  const half = heldForward(w, held(XLM, { since }), { now: T0, holdHours: hold / 2 });
+  assert.ok(Math.abs(half.usd - (0.12 * 12 * (72 / 8760) - exitUsd / 2)) < 1e-12);
+  assert.equal(decide(input({ held: held(XLM, { since }), windows: [w], holdHours: NaN })).decision.action, 'wait');
 });
 
 test('exit after 3 hourly checks in a row under the minimum; a good hour in between starts the count again', () => {
-  // Held nets: 7.25 + 1.25 = 8.5 %, and 11.75 + 1.25 = 13 %.
+  // Forward, 10.25 % and 14.75 % gross less the 1.75 % exit over the scanner's hold, spread over about 335 h left.
   const ds = hours(input({ held: held(XLM) }), 6, (h) => [win(XLM, { netAprPct: h === 1 ? 11.75 : 7.25 })], (h) => (h <= 4 ? held(XLM) : null));
   assert.deepEqual(actions(ds), ['hold', 'hold', 'hold', 'hold', 'exit', 'wait']);
-  assert.equal(ds[0]!.decision.reason, 'Hold XLM: 8.5 % net of the exit, under your 10 % minimum, 1 of 3 hours before exit; day 1 of 14');
-  assert.equal(ds[1]!.decision.reason, 'Hold XLM: 13.0 % net of the exit, at least your 10 % minimum; day 1 of 14');
-  assert.equal(ds[4]!.decision.reason, 'Exit XLM: 8.5 % net of the exit, under your 10 % minimum, 3 of 3 hours in a row');
+  assert.equal(ds[0]!.decision.reason, 'Hold XLM: 9.0 % net of the exit, under your 10 % minimum, 1 of 3 hours before exit; day 1 of 14');
+  assert.equal(ds[1]!.decision.reason, 'Hold XLM: 13.5 % net of the exit, at least your 10 % minimum; day 1 of 14');
+  assert.equal(ds[4]!.decision.reason, 'Exit XLM: 9.0 % net of the exit, under your 10 % minimum, 3 of 3 hours in a row');
   assert.deepEqual(ds[4]!.act, { kind: 'exit', reason: ds[4]!.decision.reason });
   assert.equal(ds[4]!.vetoCandidate, null);
   assert.equal(ds[4]!.counters.lastExitAt, T0 + 4 * HOUR);
@@ -230,7 +251,7 @@ test('exit after 3 hourly checks in a row under the minimum; a good hour in betw
 
 test('exit when the rest of the hold nets below zero, or the spread flipped this hour or over 7 or 14 days', () => {
   const neg = hours(input({ held: held(XLM) }), 3, () => [win(XLM, { netAprPct: -5 })]);
-  assert.equal(neg[2]!.decision.reason, 'Exit XLM: -3.8 % net of the exit, -$0.02 over the 334 h left, 3 of 3 hours in a row');
+  assert.equal(neg[2]!.decision.reason, 'Exit XLM: -3.3 % net of the exit, -$0.01 over the 334 h left, 3 of 3 hours in a row');
   const flip = hours(input({ held: held(XLM) }), 3, () => [win(XLM, { grossAprPct: -6 })]);
   assert.equal(flip[2]!.decision.reason, 'Exit XLM: the spread flipped: this hour pays -6.0 %, 3 of 3 hours in a row');
   const d7 = hours(input({ held: held(XLM) }), 3, () => [win(XLM, { grossApr7dPct: -1 })]);
@@ -281,6 +302,29 @@ test('held pair numbers unknown: no act, a wait that says so, never counted heal
   assert.deepEqual(ds[4]!.counters.betterByWindow, {});
 });
 
+test('the stops come first: no unknown number keeps a losing or overdue pair open', () => {
+  const nanFees = win(XLM, { costs: { feesPct: NaN, slippagePct: 0.5, basisPct: 0.5, rescueReservePct: 0 } });
+  // P&L -3 on a 12 USD leg, 10 % stop, a NaN in the scan: the drawdown stop exits.
+  const down = decide(input({ held: held(XLM, { pnlUsd: -3 }), windows: [nanFees] }));
+  assert.equal(down.decision.action, 'exit');
+  assert.equal(down.decision.reason, 'Exit XLM: down $3.00, 25.0 % of the $12.00 leg, at your 10 % stop');
+  assert.deepEqual(down.act, { kind: 'exit', reason: down.decision.reason });
+  // An unknown P&L held 20 days: the time stop exits.
+  const old = decide(input({ held: held(XLM, { pnlUsd: NaN, since: T0 - 20 * 24 * HOUR }), windows: [win(XLM)] }));
+  assert.equal(old.decision.action, 'exit');
+  assert.equal(old.decision.reason, 'Exit XLM: held 20.0 days, the 14-day time stop');
+  // The same with an unknown minimum, 7-day spread or net in the scan.
+  const noMin = { ...STRATEGY, minNetAprPct: NaN };
+  assert.equal(decide(input({ held: held(XLM, { pnlUsd: -3 }), windows: [win(XLM)], strategy: noMin })).decision.action, 'exit');
+  assert.equal(decide(input({ held: held(XLM, { since: T0 - 15 * 24 * HOUR }), windows: [win(XLM, { grossApr7dPct: NaN })] })).decision.action, 'exit');
+  assert.equal(decide(input({ held: held(XLM, { pnlUsd: -3 }), windows: [win(XLM, { netAprPct: NaN })] })).decision.action, 'exit');
+  // Each stop needs only its own numbers: an unknown P&L does not stop the time stop, an unknown entry time does
+  // not stop the drawdown stop.
+  assert.equal(decide(input({ held: held(XLM, { pnlUsd: -3, since: NaN }), windows: [win(XLM)] })).decision.action, 'exit');
+  // Short of both stops, the unknown number is a wait.
+  assert.equal(decide(input({ held: held(XLM, { pnlUsd: -1 }), windows: [nanFees] })).decision.action, 'wait');
+});
+
 test('a held window missing from the scan or stale is held, its count kept', () => {
   const counters = { ...NO_COUNTERS, badChecks: 2, lastHourlyAt: T0 - HOUR };
   const gone = decide(input({ held: held(XLM), windows: [], counters }));
@@ -306,38 +350,52 @@ test('cooldown: no entry for 6 h after an exit, then the ready window is entered
 
 const ZEC = 'zec-phoenix-hyperliquid';
 const SOL_X = 'sol-orderly-phoenix';
+/** The held XLM window with no costs: measured forward it nets its netAprPct, so the gains below read plainly. */
+const heldWin = (netAprPct: number) => win(XLM, { netAprPct, costs: { feesPct: 0, slippagePct: 0, basisPct: 0, rescueReservePct: 0 } });
+
+test('a challenger\'s gain is over the held window measured forward, as compression measures it', () => {
+  // XLM at 15 % net with costs is about 16.7 % forward (the open is sunk); ZEC at 18.5 % beats the 15 by 3.5 pts
+  // but the forward figure by under 3: no rotation, not even a count.
+  const ds = hours(input({ held: held(XLM) }), 5, () => [win(XLM, { netAprPct: 15 }), win(ZEC, { netAprPct: 18.5, switchCostUsd: 0.001 })]);
+  assert.ok(ds.every((d) => d.decision.action === 'hold'));
+  assert.deepEqual(ds[4]!.counters.betterByWindow, {});
+  // At 20 % it beats the forward figure by 3.3 pts and rotates; the line names the held window's forward net.
+  const r = hours(input({ held: held(XLM) }), 4, () => [win(XLM, { netAprPct: 15 }), win(ZEC, { netAprPct: 20, switchCostUsd: 0.001 })]);
+  assert.equal(r[3]!.decision.action, 'rotate');
+  assert.match(r[3]!.decision.reason, /20\.0 % net vs 16\.7 % held, \+3\.3 pts for 4 of 4 hours/);
+});
 
 test('rotate once another window beat the held one by 3 pts for 4 hourly checks and the switch pays back', () => {
   // +10 pts on 12 USD is 0.000137 USD an hour: a 0.01 USD switch pays back in 73 h.
-  const ds = hours(input({ held: held(XLM) }), 5, () => [win(XLM, { netAprPct: 15 }), win(ZEC, { netAprPct: 25, switchCostUsd: 0.01 })]);
+  const ds = hours(input({ held: held(XLM) }), 5, () => [heldWin(15), win(ZEC, { netAprPct: 25, switchCostUsd: 0.01 })]);
   assert.deepEqual(actions(ds), ['hold', 'hold', 'hold', 'rotate', 'hold']);
-  assert.equal(ds[2]!.decision.reason, 'Hold XLM: 16.3 % net of the exit, at least your 10 % minimum; day 1 of 14; ZEC beats it by 10.0 pts, 3 of 4 hours');
+  assert.equal(ds[2]!.decision.reason, 'Hold XLM: 15.0 % net of the exit, at least your 10 % minimum; day 1 of 14; ZEC beats it by 10.0 pts, 3 of 4 hours');
   const r = ds[3]!;
   assert.deepEqual(r.act, { kind: 'rotate', fromId: XLM, toId: ZEC, legUsd: 12, leverage: 1.5, qty: '12' });
   assert.equal(r.vetoCandidate, ZEC);
   assert.equal(r.decision.windowId, ZEC);
   assert.equal(r.decision.heldId, XLM);
-  assert.equal(r.decision.reason, 'Rotate XLM -> ZEC (long Phoenix, short Hyperliquid): 25.0 % net vs 15.0 %, +10.0 pts for 4 of 4 hours; '
+  assert.equal(r.decision.reason, 'Rotate XLM -> ZEC (long Phoenix, short Hyperliquid): 25.0 % net vs 15.0 % held, +10.0 pts for 4 of 4 hours; '
     + 'the $0.01 switch pays back in 3.0 of the 13.9 days left; $12.00 a leg at 1.5x');
   assert.deepEqual(r.counters.rotationsAt, [T0 + 3 * HOUR]);
   assert.deepEqual(r.counters.betterByWindow, {});
 });
 
 test('a gain under minGainPts, or a switch that does not pay back within the rest of the hold, does not rotate', () => {
-  const small = hours(input({ held: held(XLM) }), 6, () => [win(XLM, { netAprPct: 15 }), win(ZEC, { netAprPct: 17.9, switchCostUsd: 0.01 })]);
+  const small = hours(input({ held: held(XLM) }), 6, () => [heldWin(15), win(ZEC, { netAprPct: 17.9, switchCostUsd: 0.01 })]);
   assert.ok(small.every((d) => d.decision.action === 'hold'));
   assert.deepEqual(small[5]!.counters.betterByWindow, {});
   // +4 pts on 12 USD over 13.9 days pays 0.0183 USD: a 0.03 USD switch does not pay back.
-  const slow = hours(input({ held: held(XLM) }), 5, () => [win(XLM, { netAprPct: 15 }), win(ZEC, { netAprPct: 19, switchCostUsd: 0.03 })]);
+  const slow = hours(input({ held: held(XLM) }), 5, () => [heldWin(15), win(ZEC, { netAprPct: 19, switchCostUsd: 0.03 })]);
   assert.ok(slow.every((d) => d.decision.action === 'hold'));
-  assert.equal(slow[4]!.decision.reason, 'Hold XLM: 16.3 % net of the exit, at least your 10 % minimum; day 1 of 14; '
+  assert.equal(slow[4]!.decision.reason, 'Hold XLM: 15.0 % net of the exit, at least your 10 % minimum; day 1 of 14; '
     + 'ZEC beats it by 4.0 pts, but the $0.03 switch takes 22.8 days to pay back, 13.8 are left');
-  const unknown = hours(input({ held: held(XLM) }), 5, () => [win(XLM), win(ZEC, { netAprPct: 30 })]);
+  const unknown = hours(input({ held: held(XLM) }), 5, () => [heldWin(15), win(ZEC, { netAprPct: 30 })]);
   assert.match(unknown[4]!.decision.reason, /ZEC beats it by 15\.0 pts, but its switch cost is not known$/);
 });
 
 test('payback is the gain on the leg actually sized; the switch cost is not scaled down with it', () => {
-  const windows = (cost: number) => () => [win(XLM, { netAprPct: 15 }), win(ZEC, { netAprPct: 25, switchCostUsd: cost })];
+  const windows = (cost: number) => () => [heldWin(15), win(ZEC, { netAprPct: 25, switchCostUsd: cost })];
   // 7 USD free on each venue at 1.5x sizes 10.50: +10 pts on 10.50 is 0.000120 USD an hour.
   const free = { hyperliquid: 7, phoenix: 7 };
   const small = hours(input({ held: held(XLM), freeMarginUsd: free }), 4, windows(0.01));
@@ -352,22 +410,22 @@ test('payback is the gain on the leg actually sized; the switch cost is not scal
 
 test('prefers a window on the venues that hold the margin; a cross-venue switch must pay its transfers', () => {
   // SOL long Orderly / short Phoenix nets more, but moving margin onto Orderly makes its switch 1.60 USD.
-  const windows = [win(XLM, { netAprPct: 12 }), win(ZEC, { netAprPct: 24, switchCostUsd: 0.04 }), win(SOL_X, { netAprPct: 30, switchCostUsd: 1.6 })];
+  const windows = [heldWin(12), win(ZEC, { netAprPct: 24, switchCostUsd: 0.04 }), win(SOL_X, { netAprPct: 30, switchCostUsd: 1.6 })];
   const ds = hours(input({ held: held(XLM) }), 4, () => windows);
   assert.deepEqual(ds[3]!.act, { kind: 'rotate', fromId: XLM, toId: ZEC, legUsd: 12, leverage: 1.5, qty: '12' });
   // Even when the cross-venue switch would pay back, the same venues come first.
-  const cheap = [win(XLM, { netAprPct: 12 }), win(ZEC, { netAprPct: 24, switchCostUsd: 0.04 }), win(SOL_X, { netAprPct: 30, switchCostUsd: 0.05 })];
+  const cheap = [heldWin(12), win(ZEC, { netAprPct: 24, switchCostUsd: 0.04 }), win(SOL_X, { netAprPct: 30, switchCostUsd: 0.05 })];
   assert.deepEqual(hours(input({ held: held(XLM) }), 4, () => cheap)[3]!.act, { kind: 'rotate', fromId: XLM, toId: ZEC, legUsd: 12, leverage: 1.5, qty: '12' });
   // Alone, the cross-venue one rotates only when its transfers pay back.
-  const alone = hours(input({ held: held(XLM) }), 4, () => [win(XLM, { netAprPct: 12 }), win(SOL_X, { netAprPct: 30, switchCostUsd: 1.6 })]);
+  const alone = hours(input({ held: held(XLM) }), 4, () => [heldWin(12), win(SOL_X, { netAprPct: 30, switchCostUsd: 1.6 })]);
   assert.equal(alone[3]!.decision.action, 'hold');
   assert.match(alone[3]!.decision.reason, /SOL beats it by 18\.0 pts, but the \$1\.60 switch takes 270\.4 days to pay back/);
-  const paid = hours(input({ held: held(XLM) }), 4, () => [win(XLM, { netAprPct: 12 }), win(SOL_X, { netAprPct: 30, switchCostUsd: 0.05 })]);
+  const paid = hours(input({ held: held(XLM) }), 4, () => [heldWin(12), win(SOL_X, { netAprPct: 30, switchCostUsd: 0.05 })]);
   assert.deepEqual(paid[3]!.act, { kind: 'rotate', fromId: XLM, toId: SOL_X, legUsd: 12, leverage: 1.5, qty: '12' });
 });
 
 test('at most 2 rotations in 24 h', () => {
-  const windows = [win(XLM, { netAprPct: 12 }), win(ZEC, { netAprPct: 30, switchCostUsd: 0.04 })];
+  const windows = [heldWin(12), win(ZEC, { netAprPct: 30, switchCostUsd: 0.04 })];
   const counters = { ...NO_COUNTERS, rotationsAt: [T0 - 20 * HOUR, T0 - 2 * HOUR] };
   const ds = hours(input({ held: held(XLM), counters }), 6, () => windows);
   assert.deepEqual(actions(ds), ['hold', 'hold', 'hold', 'hold', 'rotate', 'hold']);
@@ -377,7 +435,7 @@ test('at most 2 rotations in 24 h', () => {
 });
 
 test('a rotation sizes the new legs with the margin loop.ts says the held legs free, and none when it does not say', () => {
-  const windows = [win(XLM, { netAprPct: 12 }), win(ZEC, { netAprPct: 30, switchCostUsd: 0.04 })];
+  const windows = [heldWin(12), win(ZEC, { netAprPct: 30, switchCostUsd: 0.04 })];
   const free = { hyperliquid: 3, phoenix: 3 };
   // 3 USD free on each venue plus 6 USD freed is 9 USD: 13.50 at 1.5x, capped at 12.
   const ds = hours(input({ held: held(XLM), freeMarginUsd: free, freedMarginUsd: { hyperliquid: 6, phoenix: 6 } }), 4, () => windows);
@@ -416,7 +474,7 @@ test('skipAct: a failed act leaves this check\'s counts and none of the act\'s m
   const retry = decide({ ...lastIn, hourly: false, now: lastIn.now + 5_000, counters: failed });
   assert.equal(retry.decision.action, 'exit');
 
-  const windows = [win(XLM, { netAprPct: 12 }), win(ZEC, { netAprPct: 30, switchCostUsd: 0.04 })];
+  const windows = [heldWin(12), win(ZEC, { netAprPct: 30, switchCostUsd: 0.04 })];
   const rs = hours(input({ held: held(XLM) }), 4, () => windows);
   const rIn = input({ held: held(XLM), now: T0 + 3 * HOUR, windows, counters: rs[2]!.counters });
   const notDone = skipAct(rIn, rs[3]!);
@@ -465,7 +523,7 @@ test('a vetoed window drops out: the next one in the scanner\'s rank is entered,
 });
 
 test('a vetoed rotation target is not rotated into again for 6 h', () => {
-  const windows = [win(XLM, { netAprPct: 12 }), win(ZEC, { netAprPct: 30, switchCostUsd: 0.04 })];
+  const windows = [heldWin(12), win(ZEC, { netAprPct: 30, switchCostUsd: 0.04 })];
   const rs = hours(input({ held: held(XLM) }), 4, () => windows);
   assert.equal(rs[3]!.decision.action, 'rotate');
   const rIn = input({ held: held(XLM), now: T0 + 3 * HOUR, windows, counters: rs[2]!.counters });

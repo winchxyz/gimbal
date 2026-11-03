@@ -93,6 +93,16 @@ test('NEAR AI down (HTTP or transport error): pass, "no veto check"', async () =
   assert.equal(reset.line, 'no veto check on NEAR: NEAR AI did not answer: connection reset');
 });
 
+test('a key NEAR AI rejects (401, 403) passes unchecked, and the line says the key was rejected', async () => {
+  for (const status of [401, 403]) {
+    const r = await ask({ error: { message: 'invalid api key' } }, status);
+    assert.equal(r.veto.verdict, 'pass');
+    assert.equal(r.checked, false);
+    assert.equal(r.line, `no veto check on NEAR: NEAR AI key rejected (HTTP ${status}: invalid api key)`);
+    assert.deepEqual(r.veto.reasons, [`no veto check: NEAR AI key rejected (HTTP ${status}: invalid api key)`]);
+  }
+});
+
 test('a verdict in any case, padded, fenced or after words is read', async () => {
   const veto = await ask(completion('{"verdict": "Veto", "reasons": ["a spike"]}'));
   assert.equal(veto.veto.verdict, 'veto');
@@ -113,6 +123,10 @@ test('a reply that cannot be read fails closed: a veto, "unreadable reply"', asy
     [completion('{"verdict": "pass", "reasons": ["the spread'), /never closed/],
     [completion('{"verdict": "pass"}', 'length'), /cut off at its token limit/],
     [{ choices: [] }, /not a chat completion/],
+    // The whole reply is read: a later object, or a veto anywhere, is never lost behind a first "pass".
+    [completion('I could say {"verdict":"pass"} but no: {"verdict":"veto"}'), /holds 2 JSON objects/],
+    [completion('{"verdict":"pass"} {"verdict":"pass"}'), /holds 2 JSON objects/],
+    [completion('{"verdict":"pass","reasons":[],"draft":{"verdict":"Veto"}}'), /"pass" holds a "veto" inside it/],
   ];
   for (const [body, why] of cases) {
     const r = await ask(body);

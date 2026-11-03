@@ -3,8 +3,9 @@
 // reasons}, before every enter and every rotate. A veto can only remove a window: nothing the model says changes the
 // window, the size or the leverage, or is sent to the contract or a venue. No key, no answer within
 // LOOP_RULES.vetoTimeoutMs, or NEAR AI down (a transport or HTTP error): the window passes, and the journal line says
-// "no veto check". A reply that came but cannot be read as a verdict (not JSON, no verdict, cut off at its token
-// limit) fails closed: it is a veto, "unreadable reply".
+// "no veto check" (a 401 or 403 says "NEAR AI key rejected", so a bad key shows on every decision). A reply that
+// came but cannot be read as one verdict (not JSON, no verdict, more than one JSON object, a "veto" inside a "pass",
+// cut off at its token limit) fails closed: it is a veto, "unreadable reply".
 //
 // The prompt is built from the facts alone (no clock, no ids that change between runs), so a recorded exchange is
 // found again by its prompt: RecordedVeto plays a recording back without a key (replay mode, tests). checkVeto returns
@@ -159,18 +160,22 @@ export function promptKey(messages: readonly ChatMessage[]): string {
   return createHash('sha256').update(JSON.stringify(messages)).digest('hex').slice(0, 24);
 }
 
-/**
- * The first JSON object in a model's text: ``` fences and any words around it are dropped. NearAiUnavailable when
- * there is none, or it is not closed (a reply cut short).
- */
-export function firstJsonObject(text: string): Record<string, unknown> {
-  const start = text.indexOf('{');
-  if (start < 0) throw new NearAiUnavailable('the model\'s reply has no JSON object');
+/** Every top-level `{…}` in a text, in order; NearAiUnavailable when one is never closed (a reply cut short). */
+function topLevelObjects(text: string): string[] {
+  const found: string[] = [];
+  let start = -1;
   let depth = 0;
   let inString = false;
   let escaped = false;
-  for (let i = start; i < text.length; i++) {
+  for (let i = 0; i < text.length; i++) {
     const ch = text[i];
+    if (depth === 0) {
+      if (ch === '{') {
+        start = i;
+        depth = 1;
+      }
+      continue;
+    }
     if (inString) {
       if (escaped) escaped = false;
       else if (ch === '\\') escaped = true;
@@ -179,9 +184,34 @@ export function firstJsonObject(text: string): Record<string, unknown> {
     }
     if (ch === '"') inString = true;
     else if (ch === '{') depth++;
-    else if (ch === '}' && --depth === 0) return parseJsonObject(text.slice(start, i + 1));
+    else if (ch === '}' && --depth === 0) found.push(text.slice(start, i + 1));
   }
-  throw new NearAiUnavailable('the model\'s reply has a JSON object that is never closed');
+  if (depth !== 0) throw new NearAiUnavailable('the model\'s reply has a JSON object that is never closed');
+  return found;
+}
+
+/** Whether any object below `value` (not `value` itself) carries a verdict that reads "veto". */
+function nestedVeto(value: unknown, root = true): boolean {
+  if (Array.isArray(value)) return value.some((x) => nestedVeto(x, false));
+  if (typeof value !== 'object' || value === null) return false;
+  const v = (value as Record<string, unknown>).verdict;
+  if (!root && typeof v === 'string' && v.trim().toLowerCase() === 'veto') return true;
+  return Object.values(value).some((x) => nestedVeto(x, false));
+}
+
+/**
+ * The verdict in a model's whole reply: ``` fences and words around the JSON are dropped, but the whole text is
+ * read. NearAiUnavailable (so: a veto, "unreadable reply") when it holds no JSON object, more than one, one never
+ * closed, an object that is not a verdict, or a verdict of "veto" anywhere inside a "pass".
+ */
+export function verdictFromReply(text: string): { verdict: 'pass' | 'veto'; reasons: string[] } {
+  const objects = topLevelObjects(text);
+  if (objects.length === 0) throw new NearAiUnavailable('the model\'s reply has no JSON object');
+  if (objects.length > 1) throw new NearAiUnavailable(`the model's reply holds ${objects.length} JSON objects`);
+  const value = parseJsonObject(objects[0]!);
+  const verdict = parseVerdict(value);
+  if (verdict.verdict === 'pass' && nestedVeto(value)) throw new NearAiUnavailable('the model\'s "pass" holds a "veto" inside it');
+  return verdict;
 }
 
 /** The model's answer as a verdict (trimmed, any case); NearAiUnavailable when it is not one. */
@@ -237,7 +267,9 @@ export async function checkVeto(
       return { ...unchecked(`no answer within ${timeoutMs / 1000} s`), exchange: asked };
     }
     if (err instanceof NearAiUnavailable && NO_ANSWER.some((p) => message.startsWith(p))) {
-      return { ...unchecked(message), exchange: asked };
+      // A bad key is no answer too, but it never heals by itself: it says so on every decision.
+      const rejected = /^NEAR AI answered (HTTP 40[13]\b.*)$/s.exec(message);
+      return { ...unchecked(rejected === null ? message : `NEAR AI key rejected (${rejected[1]})`), exchange: asked };
     }
     // A reply came and could not be read (cut off, not a chat completion, not JSON): fail closed.
     return unreadable(message, asked);
@@ -245,7 +277,7 @@ export async function checkVeto(
   const exchange: VetoExchange = { ...asked, response: completion.raw };
   let verdict: ReturnType<typeof parseVerdict>;
   try {
-    verdict = parseVerdict(firstJsonObject(completion.content));
+    verdict = verdictFromReply(completion.content);
   } catch (err) {
     return unreadable(errorMessage(err), exchange);
   }

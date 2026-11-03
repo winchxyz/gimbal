@@ -7,7 +7,7 @@
 // Where the recording does not contain the case, the windows are changed, and the test says so in its output:
 // - the recording has no second week of history (every desk window is "14-day history loading", a failing check):
 //   that check is replaced by a passing one, so the 7-day net decides, as it would once the week is in;
-// - from hour 3 NEAR compresses to 2 % net of the exit (the exit case); from hour 4 SOL long Orderly / short Phoenix nets 8 %
+// - from hour 3 NEAR's multi-day gross falls to 7 % (the exit case); from hour 4 SOL long Orderly / short Phoenix nets 8 %
 //   (somewhere else to enter); from hour 12 ETH long Phoenix / short Orderly nets 30 % and SOL long Orderly / short
 //   Hyperliquid 40 % (the rotation case: ETH on the venues that hold the margin, SOL needing Hyperliquid margin
 //   moved in, which its recorded switch cost never pays back on a 12 USD leg);
@@ -80,8 +80,8 @@ function shape(h: number, windows: readonly FundingWindow[]): FundingWindow[] {
       .filter((c) => !(loading && c.text === NO_BREAKEVEN_TEXT))
       .map((c) => (LOADING.test(c.text) ? { ok: true, text: '[test] the recording has no second week: judged on its 7 days' } : c));
     let netAprPct = w.netAprPct;
-    // Held, NEAR is judged without its opening fills (heldNetAprPct): 2 % net of the exit.
-    if (w.id === NEAR && h >= 3) netAprPct = 2 - (w.costs.feesPct + w.costs.slippagePct) / 2;
+    // NEAR's gross falls to 7 %: measured forward (heldForward), less the exit still to pay, it is under 5 %.
+    if (w.id === NEAR && h >= 3) netAprPct = 7 - (w.costs.feesPct + w.costs.slippagePct + w.costs.basisPct + w.costs.rescueReservePct);
     if (w.id === SOL && h >= 4) netAprPct = 8;
     if (w.id === ETH && h >= 12) netAprPct = 30;
     if (w.id === SOL_HL && h >= 12) netAprPct = 40;
@@ -133,7 +133,7 @@ async function run(): Promise<Step[]> {
     const input: DecideInput = {
       lots,
       now: simStart + h * HOUR, hourly: true, windows, held, strategy: STRAT, maxNotionalUsd: POLICY.max_notional_usd,
-      priceBandBps: POLICY.price_band_bps, freeMarginUsd: { hyperliquid: 20, phoenix: 20, orderly: 20 }, liveRescue: LIVE_RESCUE, counters,
+      priceBandBps: POLICY.price_band_bps, holdHours: DEFAULT_SCANNER_CONFIG.costs.holdHours, freeMarginUsd: { hyperliquid: 20, phoenix: 20, orderly: 20 }, liveRescue: LIVE_RESCUE, counters,
       gross14dAprPct: Object.fromEntries(windows.map((w) => [w.id, scanner.carry(w.id)?.estimate.gross.d14AprPct ?? null])),
       // What loop.ts measures: the held legs' margin at 1.5x (their P&L is 0 here).
       freedMarginUsd: held === null ? {} : Object.fromEntries([...heldVenues].map((v) => [v, held!.legUsd / 1.5])),
@@ -204,12 +204,13 @@ test('a recorded hour of mainnet scans, one an hour: enter, compression, exit, c
   };
   sized(2, 'enter', NEAR);
   assert.match(at(2).decision.reason, /^Enter NEAR \(long Hyperliquid, short Phoenix\): \d+\.\d % net, 3 of 3 hours above 5 %/);
-  assert.match(at(5).decision.reason, /^Exit NEAR: 2\.0 % net of the exit, under your 5 % minimum, 3 of 3 hours in a row$/);
+  assert.match(at(5).decision.reason, /^Exit NEAR: [0-4]\.\d % net of the exit, under your 5 % minimum, 3 of 3 hours in a row$/);
   assert.match(at(6).decision.reason, /^Cooling down after the exit, 5\.0 h left/);
   sized(11, 'enter', SOL);
   // SOL long Orderly / short Hyperliquid nets more, but its switch moves margin onto Hyperliquid and never pays back on
   // a 12 USD leg; ETH sits on the venues that hold the margin.
-  assert.match(at(14).decision.reason, /ETH beats it by 22\.0 pts, 3 of 4 hours$/);
+  // The gain is over SOL measured forward (about 12.5 %), not its 8 % entry net.
+  assert.match(at(14).decision.reason, /ETH beats it by 1\d\.\d pts, 3 of 4 hours$/);
   sized(15, 'rotate', ETH);
   assert.equal((at(15).act as { fromId: string }).fromId, SOL);
   for (const s of steps) {
