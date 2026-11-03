@@ -229,6 +229,24 @@ The attack's dry run against `final-1` (BTC/ETH/SOL unpriced, ledger zero) build
 the contract would answer. A live run ends with `N USDC moved (NEAR ledger + Hyperliquid account)`; when the desk
 holds, every row is PASS and that is `0 USDC moved`.
 
+**Recorded live run**, 2026-11-03 16:05 UTC, desk `final-1` on `gimbal-final-fcf135.testnet`. The operator key is a
+FunctionCall key for the 21 operator methods, with 1 NEAR allowance
+([AddKey](https://testnet.nearblocks.io/txns/496dM6TPyYggn37UJ4yBf7dPsyyfcriH3TTFfJGuvygY)). Result: 8 of 8 PASS,
+`0 USDC moved (NEAR ledger + Hyperliquid account)`.
+
+| Attack | Method | Refusal | NEAR tx |
+| --- | --- | --- | --- |
+| an order 20x over the size cap | `hl_order` | `E_SIZE` | [74qDfhFW…](https://testnet.nearblocks.io/txns/74qDfhFW27u8FzW2B4MGjy3U3wD1dZV4ZG1Y7XxZ938n) |
+| an asset outside the policy | `hl_order` | `E_ASSET` | [GRD7CqNC…](https://testnet.nearblocks.io/txns/GRD7CqNCwPQPoMKLLUCRa5BPzVSBXR8jLnAn6uZoxEEi) |
+| `hl_withdraw` to the attacker's address | `hl_withdraw` | `E_ARGS` (unknown field `destination`) | [7shw8Vtj…](https://testnet.nearblocks.io/txns/7shw8VtjKqP55CMhWvQG9Jx4t9Dx4mHbhhXXR9mAZEz3) |
+| a made-up quote paying the attacker | `fund_venue` | `E_QUOTE_SIGNATURE` | [R3JguFEX…](https://testnet.nearblocks.io/txns/R3JguFEXBoaGrjUASBKiBierDFsHf3RrZHMUbpW3WJP) |
+| a real 1Click quote for another desk | `evm_usdc_to_intents` | `E_QUOTE_FIELDS` | [6ySbdhLq…](https://testnet.nearblocks.io/txns/6ySbdhLqBnd81HTt6VpoVWCWQ5zJ5YdJMP9BBYDFxhVt) |
+| raise its own caps | `set_policy` | rejected by the node (not in the key's methods) | no tx |
+| resume a desk the owner paused | `set_paused` | `E_NOT_ALLOWED` (needs 1 yoctoNEAR) | [2NR9UKQk…](https://testnet.nearblocks.io/txns/2NR9UKQk752b1QcD9UL3UW2tRYyCT3iPJsUAwrSWrWH6) |
+| an Orderly `MARKET` order | `orderly_request` | `E_PRICE_BAND` | [CryW9jNZ…](https://testnet.nearblocks.io/txns/CryW9jNZKyDEgRYaDcG58kM1yvi6kvgQnRUSN8gmvQBi) |
+
+The hourly-meter row was not part of this run (`--meter` not given).
+
 ### 6. Mainnet evidence
 
 <!-- fill: table — action · time · NEAR tx · venue tx — for: desk created, both legs opened, funding paid,
