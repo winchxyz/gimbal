@@ -89,7 +89,8 @@ cargo +stable-x86_64-pc-windows-msvc test --workspace   # plain `cargo test` run
   still run. The owner clears it after reconciling: stop serve, set `"unknown"` to `null` in that file, start again
   (docs/interfaces.md, "Rescuer state"). Never delete the file to clear it: a missing or unusable state file also
   holds every transfer (reduces still run) until the owner starts once with `GIMBAL_RESCUE_FRESH=<contract>/<desk>`,
-  which serve refuses for 65 min after the desk's last rescue or rescuer trace.
+  which serve refuses for 65 min after the desk's last rescue or `fund_venue` counted on chain, and after the last
+  trace of the desk's rescuers in the state directory.
 
 ## Venue facts that bite
 

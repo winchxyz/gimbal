@@ -969,8 +969,9 @@ operator key's NEAR allowance, Solana fees for Phoenix IOCs), and nothing opens 
 notes; check both legs with `npm run monitor -w engine -- --mainnet`; if the same reason keeps coming back (a market
 suspended, a leg that cannot be read), stop serve and close by hand with `pair-mainnet close <SYM> --send`. The
 repeats end when a close reads both legs closed, or when the owner unpauses (`set_paused` false; serve logs `closing
-cleared`). An engine that does not trade (alert only, or no pair) journals one `error` line per panic_close instead,
-`... nothing was cancelled or closed; ...`, and never repeats it: the owner closes both legs by hand.
+cleared`). An engine that does not trade (alert only, or no pair) journals `panic_close read from get_desk: no rescue
+or open starts` and one `error` line, `... nothing was cancelled or closed; ...`, once per panic_close, and never
+repeats them: the owner closes both legs by hand.
 
 **Reconcile an ADL hold.** After a crash in the middle of a close, or a stop that passed 180 s, the state file still
 holds orders in flight and ADL only alerts. Serve settles them itself once they are 10 min old (at start, or on a
