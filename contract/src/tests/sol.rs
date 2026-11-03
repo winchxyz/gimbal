@@ -661,3 +661,26 @@ fn a_registration_with_a_price_and_no_limit_is_refused() {
         "{msg}"
     );
 }
+
+/// C10 round 2b: a priced Phoenix order counts `sz × max(px, oracle)` on the hourly notional
+/// meter: the buy at 2474.5 its own price (12.3725 USD), the sell at 2425.5 the oracle's 2450
+/// (12.25 USD).
+#[test]
+fn priced_phoenix_orders_count_at_the_larger_of_their_price_and_the_oracles() {
+    let mut p = sol_policy();
+    p.max_hourly_notional_usd = Some(1_000);
+    let mut g = sol_desk_with(p);
+    g.desk_counters.insert("alpha".into(), Default::default());
+    call(contract_id(), ONE_YOCTO);
+    g.set_mock_price("ETH".into(), 245_000_000_000);
+    let buy = bytes_of(&case(&vectors(), "IOC buy 0.005 ETH, limit 2474.5"));
+    let got = sol_sign(&mut g, &buy).unwrap();
+    assert!(!got.orders[0].unpriced && got.orders[0].oracle_px.is_some());
+    assert_eq!(g.counters_of("alpha").notional_e8, 1_237_250_000);
+    let sell = bytes_of(&case(&vectors(), "IOC sell 0.005 ETH, limit 2425.5"));
+    sol_sign(&mut g, &sell).unwrap();
+    assert_eq!(
+        g.counters_of("alpha").notional_e8,
+        1_237_250_000 + 1_225_000_000
+    );
+}

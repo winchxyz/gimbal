@@ -493,8 +493,8 @@ impl Budget {
                 format!(
                     "priority fee {price} micro-lamports per unit is over \
                      {MAX_COMPUTE_UNIT_PRICE}; up to {URGENT_MAX_COMPUTE_UNIT_PRICE} only for a \
-                     message that only cancels or reduces, or a rescue, with a compute unit limit \
-                     of at most {RESCUE_MAX_COMPUTE_UNIT_LIMIT}"
+                     message that only cancels or reduces, or a rescue with no opening order, \
+                     with a compute unit limit of at most {RESCUE_MAX_COMPUTE_UNIT_LIMIT}"
                 ),
             ));
         }
@@ -1146,8 +1146,8 @@ impl<'a> Walk<'a> {
 ///
 /// - compute budget: a unit limit up to [`MAX_COMPUTE_UNIT_LIMIT`] and a price up to
 ///   [`MAX_COMPUTE_UNIT_PRICE`], once each, a price only with a limit; up to
-///   [`URGENT_MAX_COMPUTE_UNIT_PRICE`] for a rescue or a message that only cancels or reduces,
-///   with a limit of at most [`RESCUE_MAX_COMPUTE_UNIT_LIMIT`] (C10 round 2);
+///   [`URGENT_MAX_COMPUTE_UNIT_PRICE`] for a rescue with no opening order or a message that only
+///   cancels or reduces, with a limit of at most [`RESCUE_MAX_COMPUTE_UNIT_LIMIT`] (C10 round 2);
 /// - token account program: `CreateIdempotent` paid by the desk for its own USDC or PhUSD account
 ///   (or, in a rescue, the deposit owner's USDC account);
 /// - SPL Token: `Approve` of the desk's PhUSD account to the Ember authority for exactly the
@@ -1211,11 +1211,13 @@ pub fn check_message(
     for (n, ix) in m.instructions.iter().enumerate() {
         walk.instruction(ix, n)?;
     }
-    // Urgent: a rescue, or a message that only cancels or reduces, as a paused desk's gate reads
-    // it (below).
+    // Urgent: a rescue that opens no position, or a message that only cancels or reduces, as a
+    // paused desk's gate reads it (below). A rescue carrying an opening order keeps the normal cap
+    // (C10 round 2b).
     let cancels_or_reduces = walk.cancel_all || walk.orders.iter().any(|o| o.reduce_only);
-    let urgent = rescue.is_some()
-        || (walk.reduces_risk && walk.orders.iter().all(|o| o.reduce_only) && cancels_or_reduces);
+    let only_reduce_only = walk.orders.iter().all(|o| o.reduce_only);
+    let urgent = (rescue.is_some() && only_reduce_only)
+        || (walk.reduces_risk && only_reduce_only && cancels_or_reduces);
     walk.budget.finish(urgent)?;
     if let Some((n, amount)) = walk.approval {
         return Err(at(

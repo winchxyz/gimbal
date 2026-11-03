@@ -101,15 +101,22 @@ margin between the desk's own venue accounts; it cannot pay anyone else, change 
 
 Bounds and accepted residuals, at the default policy:
 
-- **Wash trading.** An operator trading against itself at the band's edge loses at most about
-  2 × `max_hourly_notional_usd` × `price_band_bps` / 10⁴ per sliding hour, plus venue fees.
+- **Wash trading.** An operator trading against itself at the band's edges loses about
+  2 × `max_hourly_notional_usd` × `price_band_bps` / 10⁴ per sliding hour on average, up to about 4 × in a single
+  hour, plus closing the positions held at its start and the venue fees. The causes: reduce-only closes are free
+  (not counted), and the meter decays linearly.
 - **Transfer fees.** 1Click's `appFees` are not in the signed quote; each quote's fee is bounded by 1 USDC + 25 bps
   and all quotes of a sliding hour by the hourly cost budget's quote share (1 USD), with its own room for four
   1 USDC venue fees.
 - **Paused rescues.** A paused desk still signs rescues; their Solana fees and the rent of each deposit owner's new
   token account are lost to the desk: at most about 0.078 SOL per 65 min, about 0.01 SOL an hour after that.
+- **Urgent Solana fees.** Urgent `cancel_all` and reduce-only `sol_sign` messages have no count limit, on running and
+  paused desks: up to 0.000405 SOL each, bounded only by the operator key's NEAR allowance.
 - **Orderly replay.** A signed Orderly order can be posted again within its 300 s window; on mainnet opening orders
-  need the key's IP restriction signed first.
+  need the key's IP restriction signed first. The contract marks the list applied when it prepares that request,
+  before the signature returns, and cannot see whether the relayer posted it.
+- **Spot after a pause.** Spot pairs take no reduce-only orders, so after `panic_close` a spot holding is sold only
+  once the desk resumes. Gimbal trades no spot today.
 - **1Click key rotation.** A second quote key needs the treasury's proposal, the owner's acceptance and a day, so a
   rotation pauses quoted transfers for at least a day; the treasury should be a multisig. An owner can distrust
   1Click's pinned key for a desk, for good.

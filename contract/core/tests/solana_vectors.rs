@@ -710,6 +710,112 @@ fn the_urgent_price_is_for_messages_that_only_cancel_or_reduce() {
     assert!(!c.reduces_risk);
 }
 
+/// `d` with its unit limit set to `limit` and its unit price to `price` (both instructions must
+/// be there).
+fn with_budget(d: &Draft, limit: u32, price: u64) -> Draft {
+    let mut d = d.clone();
+    let l = d.find(COMPUTE_BUDGET_PROGRAM, &[2]);
+    d.ixs[l].2[1..5].copy_from_slice(&limit.to_le_bytes());
+    let p = d.find(COMPUTE_BUDGET_PROGRAM, &[3]);
+    d.ixs[p].2[1..9].copy_from_slice(&price.to_le_bytes());
+    d
+}
+
+/// C10 round 2b: a `cancel_all` does not make a message urgent when the message also opens a
+/// position: an opening order with a cancel_all keeps the 200,000 cap, a reduce-only one with a
+/// cancel_all may pay the urgent price.
+#[test]
+fn a_cancel_all_with_an_opening_order_keeps_the_normal_price_cap() {
+    let doc = sol_doc();
+    let ctx = &doc["ctx"]["sol_sign"];
+    let (policy, desk, reference) = (vector_policy(ctx), vector_desk(&doc), reference_of(ctx));
+    let cancel = Draft::of(&message(
+        doc["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| name(c).starts_with("cancel all ETH"))
+            .unwrap(),
+    ));
+    let c = cancel.find(PHOENIX_PROGRAM, &CANCEL_ALL);
+    let edge = u32::try_from(RESCUE_MAX_COMPUTE_UNIT_LIMIT).unwrap();
+    for (flags, urgent_ok) in [(0x80, true), (0, false)] {
+        let mut d = Draft::of(&with_flags(&doc, "IOC sell 0.005 ETH", flags));
+        d.push_ix_of(&cancel, c);
+        let check = |price: u64| {
+            check_message(
+                sha256,
+                &policy,
+                &desk,
+                &with_budget(&d, edge, price).bytes(),
+                &reference,
+                None,
+            )
+        };
+        let normal = check(MAX_COMPUTE_UNIT_PRICE).unwrap();
+        assert_eq!(normal.orders.len(), 1);
+        assert_eq!(normal.reduces_risk, urgent_ok, "{flags:#04x}");
+        let urgent = check(URGENT_MAX_COMPUTE_UNIT_PRICE);
+        if urgent_ok {
+            urgent.unwrap();
+        } else {
+            let r = urgent.unwrap_err();
+            assert_eq!(r.code, E_SOL_PROGRAM, "{r}");
+            assert!(r.msg.contains("priority fee 1000000"), "{r}");
+        }
+    }
+}
+
+/// C10 round 2b: a rescue may pay the urgent price only while it opens no position: with no order
+/// or a reduce-only one it may, with an opening order it keeps the 200,000 cap (`E_SOL_PROGRAM`
+/// over it). On a running desk, since an order in a rescue needs one.
+#[test]
+fn a_rescue_with_an_opening_order_keeps_the_normal_price_cap() {
+    let doc = sol_doc();
+    let ctx = &doc["ctx"]["sol_sign"];
+    let (policy, desk, reference) = (vector_policy(ctx), vector_desk(&doc), reference_of(ctx));
+    let case = doc["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| name(c).starts_with("rescue in one transaction"))
+        .unwrap();
+    let rescue = rescue_of(case).unwrap();
+    let mut full = Draft::of(&message(case));
+    full.push_revoke(desk.phusd_ata, desk.authority);
+    // Without the creates of the desk's own accounts, so the order fits the transaction size.
+    let base = without(&full, |p, a, _| p == ATA_PROGRAM && a[2] == desk.authority);
+    let edge = u32::try_from(RESCUE_MAX_COMPUTE_UNIT_LIMIT).unwrap();
+    let check = |d: &Draft, price: u64| {
+        check_message(
+            sha256,
+            &policy,
+            &desk,
+            &with_budget(d, edge, price).bytes(),
+            &reference,
+            Some(&rescue),
+        )
+    };
+    let plain = check(&base, URGENT_MAX_COMPUTE_UNIT_PRICE).unwrap();
+    assert_eq!((plain.kind, plain.orders.len()), ("rescue", 0), "no order");
+    for (flags, urgent_ok) in [(0x80, true), (0, false)] {
+        let order = Draft::of(&with_flags(&doc, "IOC sell 0.005 ETH", flags));
+        let mut d = base.clone();
+        d.push_ix_of(&order, order.ixs.len() - 1);
+        let normal = check(&d, MAX_COMPUTE_UNIT_PRICE).unwrap();
+        assert_eq!((normal.kind, normal.orders.len()), ("rescue", 1));
+        assert_eq!(normal.orders[0].reduce_only, urgent_ok);
+        let urgent = check(&d, URGENT_MAX_COMPUTE_UNIT_PRICE);
+        if urgent_ok {
+            assert_eq!(urgent.unwrap().kind, "rescue");
+        } else {
+            let r = urgent.unwrap_err();
+            assert_eq!(r.code, E_SOL_PROGRAM, "{r}");
+            assert!(r.msg.contains("priority fee 1000000"), "{r}");
+        }
+    }
+}
+
 #[test]
 fn a_reduce_only_order_reduces_risk_and_no_other_flag_passes() {
     let doc = sol_doc();
@@ -1163,6 +1269,38 @@ impl Draft {
         let owner = self.index(owner);
         let program = self.index(TOKEN_PROGRAM);
         self.ixs.push((program, vec![source, owner], vec![5]));
+        self
+    }
+
+    /// Appends instruction `ix` of `other` (same fee payer), each account added with the
+    /// writability it has in `other`.
+    fn push_ix_of(&mut self, other: &Draft, ix: usize) -> &mut Self {
+        let (program, accounts, data) = other.ixs[ix].clone();
+        let [signers, readonly_signed, readonly_unsigned] = other.header.map(usize::from);
+        let n = other.keys.len();
+        for &a in &accounts {
+            let i = usize::from(a);
+            let key = other.keys[i];
+            if i < signers {
+                assert_eq!(key, self.keys[0], "only the fee payer signs");
+            } else if i < n - readonly_unsigned {
+                self.writable(key);
+            } else {
+                self.index(key);
+            }
+        }
+        assert!(signers >= readonly_signed);
+        self.index(other.keys[usize::from(program)]);
+        // Indexes only now: `writable` moves the read-only keys up.
+        let at = |d: &Draft, key: Pubkey| {
+            u8::try_from(d.keys.iter().position(|k| *k == key).unwrap()).unwrap()
+        };
+        let mapped = accounts
+            .iter()
+            .map(|&a| at(self, other.keys[usize::from(a)]))
+            .collect();
+        let program = at(self, other.keys[usize::from(program)]);
+        self.ixs.push((program, mapped, data));
         self
     }
 

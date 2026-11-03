@@ -145,7 +145,8 @@ sells alike, and it must fit `max_notional_usd` (`E_SIZE`). The same rule holds 
 max(price, oracle_px)) and Orderly orders. A Hyperliquid price has at most 5 significant figures (or is an integer)
 and at most `6 − sz_decimals` decimals on a perp, `8 − sz_decimals` on a spot pair (asset ids 10,000 to 99,999)
 (`E_DECIMAL`); HIP-3 perps (asset ids from 100,000, e.g. `xyz:` markets) take the perp rule. A spot pair has no
-reduce-only orders: `reduce_only: true` on a spot asset id is `E_ARGS`.
+reduce-only orders: `reduce_only: true` on a spot asset id is `E_ARGS`. So after `panic_close` a spot holding can only
+be sold once the desk resumes; Gimbal trades no spot today.
 
 **Hourly notional cap.** Every order that is not reduce-only, on all three venues, also adds its notional (the value
 the size cap read, rounded up; each order of a Phoenix message on its own) to a meter of the desk's rescue counter
@@ -153,17 +154,22 @@ record. The meter decays over a sliding hour like the rescue meters, and an orde
 `max_hourly_notional_usd` (15 × `max_notional_usd` while that is null) is refused (`E_SIZE`) and counts nothing.
 Reduce-only orders and cancels are not counted, so `panic_close` and a closing leg never meet the cap. Why: each
 order may sit up to `price_band_bps` off the oracle, so an operator trading against itself could lose about
-`notional × price_band_bps / 10⁴` per order. With the cap, that wash loss is at most about
-2 × `max_hourly_notional_usd` × `price_band_bps` / 10⁴ per sliding hour (the meter decays, so a full cap at the
-start of an hour and the room that comes back during it can both be spent; default 15 × `max_notional_usd`; with a
-1,000 USD order cap and a 50 bps band, about 150 USD) plus the venues' trading fees on the same notional. The engine's
+`notional × price_band_bps / 10⁴` per order. With the cap, that wash loss is about
+2 × `max_hourly_notional_usd` × `price_band_bps` / 10⁴ per sliding hour on average, and up to about 4 × in a single
+hour, plus closing the positions held at its start, plus the venues' trading fees on the same notional. Two causes
+make the factors: each counted opening order can be closed reduce-only at the other edge of the band for free (the
+close is not counted), which doubles the loss per counted notional; and the meter decays linearly, so a full cap
+spent at the start of an hour and the room that comes back during it can both be used within that hour, which
+doubles it again for a single hour. Default cap 15 × `max_notional_usd`; with a 1,000 USD order cap and a 50 bps
+band, about 150 USD an hour on average, up to about 300 USD in one hour. The engine's
 maker repricing on Hyperliquid (cancel and place again) counts each new order, so it must fit the cap: at the
 default it can open 15 full-size orders an hour.
 
 **Unpriced assets.** An order for a symbol in `unpriced` skips the oracle band (there is no trusted price), so
 its size is capped in base units instead: `sz ≤ max_sz` of that symbol, and `sz × px` must also fit
 min(`max_notional_usd`, `unpriced_max_notional_usd`) (`E_SIZE`). The hourly notional meter counts an unpriced order
-at max(`px`, `unpriced_max_notional_usd` × 1e8 / `max_sz`) per unit, its share of the unpriced cap at least, so a
+at max(`px`, min(`max_notional_usd`, `unpriced_max_notional_usd`) × 1e8 / `max_sz`) per unit, its share of that
+unpriced cap at least, so a
 sell at a far-off limit (1 tick, say) cannot pass the meter for nothing. The `signed` event carries `oracle_px: null,
 unpriced: true`. Only the owner can add a symbol to `unpriced` (it is part of `set_policy`); the UI asks for the
 cap in USD, converts it to `max_sz` at the current price, and shows such symbols as "no price protection". Any
@@ -210,8 +216,11 @@ to 1,000,000 micro-lamports per unit, so at most 0.0004 SOL of priority fee plus
 rescue. Each rescue also pays the rent of the deposit owner's new USDC account (0.00204 SOL), which goes to that
 account, not back to the desk. Residual: with at most 32 rescues in 65 min (the deposit ring) an operator can burn at
 most 32 × (0.00204 + 0.0004 + 0.000005) ≈ 0.078 SOL of the desk's SOL per 65 min that way; the quotes' share of the
-hourly cost budget (1 USD at the defaults, against 1Click's 0.2–0.4 USDC a quote) holds it to about 3–5 rescues an
-hour after that, about 0.007–0.012 SOL an hour. On Solana a paused desk's `sol_sign` accepts only, besides
+hourly cost budget (1 USD at the defaults, against 1Click's 0.2–0.3 USDC a Solana quote) holds Solana rescues to
+about 3–5 an hour after that, about 0.007–0.012 SOL an hour ("Rescue limits"). Residual: an urgent `cancel_all` or
+reduce-only `sol_sign` message has no count limit, on a running or a paused desk: each may pay up to 0.000405 SOL
+(0.0004 SOL of priority fee and the base fee), bounded only by the operator key's NEAR allowance (each call costs
+gas). On Solana a paused desk's `sol_sign` accepts only, besides
 the compute budget: Phoenix `cancel_all`, reduce-only Phoenix orders, a token `Revoke` of a desk token account and a
 `Transfer` / `TransferChecked` into a desk token account; deposits, withdrawals, Ember, ATA creates and Approves
 need a running desk. A paused desk's message may carry a priority fee only when it cancels or reduces. On Orderly a
@@ -268,9 +277,9 @@ chooses nothing:
 | `hl_cancel(desk_id, asset: u32, oid: u64, reason)` | ✓ | ✓ | L1 action `{type:"cancel", cancels:[{a, o}]}`; passes a paused desk, so a pause can stop resting orders |
 | `hl_usd_class_transfer(desk_id, amount, to_perp, reason)` | ✓ | ✓ | |
 | `hl_send_to_intents(desk_id, quote, quote_signature, reason)` | ✓ | ✓ | rescue out of Hyperliquid |
-| `sol_sign(desk_id, message_b64, reason)` | ✓ | ✓ | Phoenix / Ember / own transfers, legacy messages, one signer (the desk). Every Phoenix and Ember instruction has an exact account list with its fixed accounts pinned: an order or cancel has 10 accounts, the orderbook at [8] (a policy market) and its spline PDA `["spline", book]` at [9]; deposit 10, withdraw 12, Ember wrap / unwrap 8. A token Approve only on the desk PhUSD account to Ember, for exactly the amount an unwrap after it takes; a Revoke of the desk PhUSD account must follow that unwrap (`E_SOL_PROGRAM`), so no allowance outlives the message. No empty (zero-amount) or self transfers; a Phoenix withdraw of 0 or an Ember unwrap of 0 is `E_SOL_PROGRAM` here and in `sol_sign_rescue` (an unwrap of the whole balance, no amount, still passes `sol_sign`). A compute-unit price needs a unit limit; unit limit ≤ 600,000, price ≤ 200,000 micro-lamports per unit, so a priority fee ≤ 120,000 lamports (0.00012 SOL). A message that only cancels or reduces (a `cancel_all` or reduce-only orders, every order reduce-only, nothing that needs a running desk), and every `sol_sign_rescue` message, may pay the urgent price, up to 1,000,000 micro-lamports per unit, with a unit limit of at most 400,000: a priority fee ≤ 400,000 lamports (0.0004 SOL). On a paused desk a priority fee comes only with a cancel or a reduce (§1.3). Phoenix's and Ember's own accounts at their positions are the desk's settings (`set_phoenix_accounts`), Phoenix's published ones until the owner replaces them. A message of compute budget only is refused |
+| `sol_sign(desk_id, message_b64, reason)` | ✓ | ✓ | Phoenix / Ember / own transfers, legacy messages, one signer (the desk). Every Phoenix and Ember instruction has an exact account list with its fixed accounts pinned: an order or cancel has 10 accounts, the orderbook at [8] (a policy market) and its spline PDA `["spline", book]` at [9]; deposit 10, withdraw 12, Ember wrap / unwrap 8. A token Approve only on the desk PhUSD account to Ember, for exactly the amount an unwrap after it takes; a Revoke of the desk PhUSD account must follow that unwrap (`E_SOL_PROGRAM`), so no allowance outlives the message. No empty (zero-amount) or self transfers; a Phoenix withdraw of 0 or an Ember unwrap of 0 is `E_SOL_PROGRAM` here and in `sol_sign_rescue` (an unwrap of the whole balance, no amount, still passes `sol_sign`). A compute-unit price needs a unit limit; unit limit ≤ 600,000, price ≤ 200,000 micro-lamports per unit, so a priority fee ≤ 120,000 lamports (0.00012 SOL). A message that only cancels or reduces (a `cancel_all` or reduce-only orders, every order reduce-only, nothing that needs a running desk), and a `sol_sign_rescue` message with no opening order, may pay the urgent price, up to 1,000,000 micro-lamports per unit, with a unit limit of at most 400,000: a priority fee ≤ 400,000 lamports (0.0004 SOL). On a paused desk a priority fee comes only with a cancel or a reduce (§1.3). Phoenix's and Ember's own accounts at their positions are the desk's settings (`set_phoenix_accounts`), Phoenix's published ones until the owner replaces them. A message of compute budget only is refused |
 | `sol_sign_register(desk_id, message_b64)` | ✓ | ✓ | Phoenix onboarding only, two shapes: registration (`register_trader` + `set_trader_capabilities_delegated`) and referral activation (`set_trader_capabilities_delegated` alone); registration is a legacy message, referral activation a v0 message with no address-table lookups (the other format → `E_SOL_MESSAGE`); two signers, keys[0] = the desk as fee payer and Phoenix's pinned onboarder (the desk authority itself is not a signer of `register_trader`); accounts are checked through each instruction's positions, instruction data is pinned |
-| `sol_sign_rescue(desk_id, message_b64, quote, quote_signature, reason)` | ✓ | ✓ | rescue out of Solana; an order it carries (running desk only) counts against the hourly notional meter as `sol_sign`'s do |
+| `sol_sign_rescue(desk_id, message_b64, quote, quote_signature, reason)` | ✓ | ✓ | rescue out of Solana; an order it carries (running desk only) counts against the hourly notional meter as `sol_sign`'s do, and an opening order keeps the message at the 200,000 price cap |
 | `orderly_register(desk_id, registration_nonce)` | ✓ | ✓ | EIP-712 `Registration` (nonce from `GET /v1/registration_nonce`, block time as timestamp, broker and chain from `OrderlyConfig`) |
 | `orderly_add_key(desk_id, expiration_ms)` | ✓ | ✓ | EIP-712 `AddOrderlyKey`: the desk's Ed25519 MPC key as orderly key, scope `read,trading`, ≤ 365 days |
 | `set_orderly_receiver(desk_id, receiver)` | ✓ | | payable: storage deposit (≥ 1 yocto). Pins the Orderly account's exclusive receiver address on Arbitrum (below), a lowercase `0x` address; once (`E_ARGS` the second time); event `orderly_receiver_set`. Owner only: a wrong receiver would redirect every deposit into Orderly |
@@ -356,8 +365,10 @@ treats "no quote" as a normal answer.
   quotes' costs alone may use only the quotes' share (1 USD at the defaults; a separate meter, `E_RESCUE_CAP`), so
   `appFees` someone adds to a quote can never spend the venue-fee room. `hl_send_to_intents` adds Hyperliquid's 1 USDC
   `sendAsset` fee (every 1Click deposit address is new to Hyperliquid); the operator's `hl_withdraw` and
-  `orderly_withdraw` cost the venue's 1 USDC fee each; those fees use the whole budget. At the defaults that is about
-  2 rescues an hour at a normal 1Click fee (0.3–0.4 USDC), plus what comes back as the meters decay.
+  `orderly_withdraw` cost the venue's 1 USDC fee each; those fees use the whole budget. At the defaults the rate
+  depends on the route: `hl_send_to_intents` (a quote of about 0.36 USDC plus the 1 USDC send fee) about 2–3 an
+  hour, Solana rescues (`sol_sign_rescue`, quotes of 0.2–0.3 USDC) about 3–5 an hour, counting what comes back as
+  the meters decay. A desk policy with `max_transfer_cost_flat_e6` = 1,000,000 (1.0 USDC) doubles the quotes' share.
 - **Deposit addresses.** The last 32 deposit addresses a desk paid, each with the time it was paid; a quote pays once,
   so a quote to one of them is refused (`E_QUOTE_FIELDS`). A rescue that would push out an address paid 65 min ago or
   less (a quote's whole payable window) is refused (`E_RESCUE_CAP`) and counts nothing, so a desk makes at most 32
@@ -581,7 +592,9 @@ Every action method returns a `SignedAction` (from the `on_signed` callback) tha
   halves as far as it can see: on a Mainnet contract an Orderly order that is not reduce-only is refused (`E_ARGS`)
   until the desk has an IP list and the contract signed `ip_restriction` for it (`orderly_ips_applied`; a new list
   clears it). The contract sees the signature, not Orderly's answer, so a relayer that never posts it leaves the key
-  unrestricted. Reduce-only orders, cancels and reads always pass, so a desk without one can still close. EIP-712 actions
+  unrestricted. The flag is set when the `ip_restriction` request is prepared, before the MPC signature returns, so a
+  failed signature also leaves it set (a new `set_orderly_ips` clears it). Reduce-only orders, cancels and reads
+  always pass, so a desk without one can still close. EIP-712 actions
   (`Registration`, `AddOrderlyKey`, `SettlePnl`, `Withdraw`) come back as secp256k1 signatures like Hyperliquid's,
   with `payload = { "message": { <the typed fields, including timestamp> }, "userAddress": "<desk EVM address>" }`;
   the relayer posts `{ message, signature, userAddress }` (e.g. `POST /v1/register_account`, `/v1/orderly_key`), and
@@ -617,7 +630,7 @@ near-sdk before the method runs ("Failed to deserialize input from JSON"); clien
 | `E_QUOTE_FIELDS` | quote recipient / refundTo / assets / deadline not acceptable, a quote `timestamp` more than 1 h before or 5 min after the block time, a dry quote, a cost over the policy's transfer bound, a fee (`amountIn − amountOut`) over 1 USDC + 25 bps, a deposit address one of the desk's last 32 rescues paid, or any desk's `fund_venue` paid within 65 min, a destination asset equal to the origin asset, a `fund_venue` quote whose `refundTo` is not the desk owner or that leaves less than 0.5 % between `amountOut` and `minAmountOut` |
 | `E_RESCUE_CAP` | over what is left of `rescue_cap_usd_per_hour`, of the hourly cost budget or of its quotes' share in the sliding hour (an operator `hl_withdraw` / `orderly_withdraw` included, with its 1 USDC venue fee), or a 33rd rescue within 65 min (it would push out a deposit address whose quote may still be payable) (§1.3, "Rescue limits"); for `fund_venue`, over what is left of its own hourly cost budget or a 33rd `fund_venue` within 65 min (§1.3, "fund_venue") |
 | `E_SOL_MESSAGE` | not the accepted message format (legacy; v0 without lookups only for referral activation), trailing bytes, wrong signer count or fee payer, no instruction besides the compute budget |
-| `E_SOL_PROGRAM` | instruction for a program outside the allowlist, or instruction data not accepted (extra bytes, an Approve without its matching unwrap, a Phoenix withdraw or Ember unwrap of 0, a priority fee without a unit limit or over the caps (200,000 micro-lamports per unit and 120,000 lamports; for a rescue or a message that only cancels or reduces 1,000,000 micro-lamports per unit with a unit limit of at most 400,000, and 400,000 lamports); changed registration arguments are `E_ARGS`). The code for each case is pinned in `contract/core/tests/vectors/solana*.json` |
+| `E_SOL_PROGRAM` | instruction for a program outside the allowlist, or instruction data not accepted (extra bytes, an Approve without its matching unwrap, a Phoenix withdraw or Ember unwrap of 0, a priority fee without a unit limit or over the caps (200,000 micro-lamports per unit and 120,000 lamports; for a rescue with no opening order or a message that only cancels or reduces 1,000,000 micro-lamports per unit with a unit limit of at most 400,000, and 400,000 lamports); changed registration arguments are `E_ARGS`). The code for each case is pinned in `contract/core/tests/vectors/solana*.json` |
 | `E_SOL_ACCOUNT` | wrong account count, or an account that is not the pinned one or the desk's own at its position |
 | `E_MPC` | the MPC network did not return a signature |
 
