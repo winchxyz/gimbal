@@ -19,7 +19,7 @@ export interface Connected {
 
 /** The keyed transport and the desk tools for `env`. `fetch` and `oneClickApiKey` are optional. */
 export function connectDesk(env: DeskEnv, options: { fetch?: typeof fetch; oneClickApiKey?: string | null } = {}): Connected {
-  const key = loadOperatorKey(env.keyFile);
+  const key = loadOperatorKey(env.keyFile, env.network);
   const transport = new NearApiTransport({
     network: env.network, accountId: key.accountId, privateKey: key.privateKey,
     ...(env.rpcUrl === undefined ? {} : { rpcUrl: env.rpcUrl }),

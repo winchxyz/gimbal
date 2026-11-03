@@ -1,10 +1,16 @@
 // A scripted list of malicious operator requests against one desk, for `npm run attack` and the MCP try_attack tool.
 // Each attack is a request an agent holding the operator key could send; the contract (or the NEAR node, for a
 // method outside the key's list) must refuse it. Nothing here checks the request itself: the point is to show what
-// the chain answers. A request that comes back signed is the failure this script exists to catch.
+// the chain answers.
+//
+// A row passes only on exactly the expected answer: the contract's refusal with the expected code (and, where a code
+// is shared, the expected message), or for the method outside the key's list the node's MethodNameMismatch. Anything
+// else fails with the code or error it got, so a paused desk (E_PAUSED on every row), an exhausted allowance, a
+// deleted key or an RPC error never reads as "the desk held".
 
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
+import { AccessKeyMethodNameMismatchActionError } from 'near-api-js/rpc-errors';
 import type { NearContractClient, NearNetwork, NearTransport } from '../contract/near-client.ts';
 import { formatE8, parseE8 } from '../contract/replay-checks.ts';
 import type { DeskView, HlOrder } from '../contract/types.ts';
@@ -19,7 +25,12 @@ export const RECORDED_QUOTES = new URL('../../../contract/core/tests/vectors/one
 export const ATTACKER_EVM = '0x000000000000000000000000000000000000dead';
 
 const REASON = 'attack demo: this request must be refused';
-const METER_MAX_ORDERS = 20;
+/** The contract's default hourly notional cap while max_hourly_notional_usd is null (policy.rs). */
+export const DEFAULT_HOURLY_NOTIONAL_MULTIPLE = 15;
+/** The code of a node refusal for a method outside the FunctionCall key's list. */
+export const NODE_METHOD = 'NODE_METHOD';
+/** The meter attack never signs more than this, whatever the cap says. */
+const METER_HARD_STOP = 60;
 
 export type AttackContract = Pick<NearContractClient, 'getDesk' | 'prices' | 'hlOrder' | 'fundVenue' | 'evmUsdcToIntents' | 'orderlyRequest'>;
 
@@ -28,8 +39,10 @@ export interface AttackDeps {
   contractId: string;
   deskId: string;
   contract: AttackContract;
-  /** For the two requests the client has no method for (an extra argument, a method outside the key). */
-  transport: Pick<NearTransport, 'call'>;
+  /** For the requests the client has no method for, and the desk's counters view. */
+  transport: Pick<NearTransport, 'call' | 'view'>;
+  /** A keyless Hyperliquid /info read: the meter's market price and the account-value check. Without it both are skipped. */
+  hlInfo?: (body: object) => Promise<unknown>;
   now?: () => number;
   /** Where the recorded 1Click quote is read from (tests point it elsewhere). */
   recordedQuotes?: URL | string;
@@ -39,9 +52,15 @@ export interface AttackDeps {
 export interface AttackPlan {
   method: string;
   args: Record<string, unknown>;
-  /** The code the chain should answer; NODE for a transaction the node refuses before it runs. */
+  /** The code the chain should answer; NODE_METHOD for a method the operator key's list does not allow. */
   expect: string;
+  /** Where a code is shared (E_SIZE, E_ARGS, E_NOT_ALLOWED), the refusal's message must match this too. */
+  expectDetail?: RegExp;
   note?: string;
+  /** Prepaid gas; default 300 TGas. */
+  tgas?: number;
+  /** The meter attack: orders that fit the room left, plus the one that must be refused. */
+  maxOrders?: number;
 }
 
 export type Outcome =
@@ -61,6 +80,11 @@ export interface AttackResult {
   code: string | null;
   tx: string | null;
   detail: string;
+  /**
+   * true only for exactly the expected answer: the expected code (and message, where given), or for the
+   * out-of-list method the node's MethodNameMismatch. null when nothing was sent (dry, skipped).
+   */
+  pass: boolean | null;
   /** The meter attack: how many orders were signed before the refusal. */
   signed?: number;
 }
@@ -134,7 +158,7 @@ export const ATTACKS: Attack[] = [
       if (u !== null) {
         const sz = formatE8(u.maxSzE8 * 20n);
         return {
-          method: 'hl_order', expect: 'E_SIZE',
+          method: 'hl_order', expect: 'E_SIZE', expectDetail: /is over its max_sz|USD is over (max_notional_usd|the unpriced cap)/,
           args: { desk_id: d.deskId, order: { asset: u.asset.index, is_buy: true, px: u.px, sz, reduce_only: false, tif: 'Ioc', cloid: null }, reason: REASON },
           note: `${u.asset.symbol} is unpriced: max_sz ${u.maxSz}, this asks ${sz}`,
         };
@@ -146,7 +170,7 @@ export const ATTACKS: Attack[] = [
       const px = Number(p.price_e8) / 1e8;
       const sz = ((desk.policy.max_notional_usd * 20) / px).toFixed(a.sz_decimals).replace(/\.?0+$/, '');
       return {
-        method: 'hl_order', expect: 'E_SIZE',
+        method: 'hl_order', expect: 'E_SIZE', expectDetail: /is over its max_sz|USD is over (max_notional_usd|the unpriced cap)/,
         args: { desk_id: d.deskId, order: { asset: a.index, is_buy: true, px: hlPx(px, a.sz_decimals), sz, reduce_only: false, tif: 'Ioc', cloid: null }, reason: REASON },
         note: `${a.symbol} at the oracle price, 20x max_notional_usd ${desk.policy.max_notional_usd}`,
       };
@@ -173,7 +197,7 @@ export const ATTACKS: Attack[] = [
     title: 'hl_withdraw to the attacker\'s address',
     async plan(_desk, d) {
       return {
-        method: 'hl_withdraw', expect: 'E_ARGS',
+        method: 'hl_withdraw', expect: 'E_ARGS', expectDetail: /unknown field `destination`/,
         args: { desk_id: d.deskId, amount: '10', destination: ATTACKER_EVM },
         note: 'hl_withdraw has no destination: the contract denies unknown arguments (a deserialize failure, read as E_ARGS)',
       };
@@ -212,9 +236,22 @@ export const ATTACKS: Attack[] = [
     title: 'set_policy: raise its own caps',
     async plan(desk, d) {
       return {
-        method: 'set_policy', expect: 'NODE',
+        method: 'set_policy', expect: NODE_METHOD,
         args: { desk_id: d.deskId, policy: { ...desk.policy, max_notional_usd: 1_000_000 } },
         note: 'set_policy is not in the operator key\'s method list: the node refuses the transaction before it runs',
+      };
+    },
+    send: (p, d) => rawCall(p, d),
+  },
+  {
+    id: 'unpause',
+    title: 'resume a desk the owner paused',
+    async plan(_desk, d) {
+      return {
+        method: 'set_paused', expect: 'E_NOT_ALLOWED',
+        expectDetail: /set_paused\(false\) needs exactly 1 yoctoNEAR|may pause desk \S+ but never unpause it/,
+        args: { desk_id: d.deskId, paused: false }, tgas: 30,
+        note: 'unpausing needs exactly 1 yoctoNEAR, which a FunctionCall key cannot attach: the agent cannot undo a pause by the owner',
       };
     },
     send: (p, d) => rawCall(p, d),
@@ -227,6 +264,7 @@ export const ATTACKS: Attack[] = [
       if (symbol === undefined) return { skip: 'the policy has no Orderly symbol' };
       return {
         method: 'orderly_request', expect: d.network === 'testnet' ? 'E_PRICE_BAND' : 'E_ARGS',
+        expectDetail: d.network === 'testnet' ? /MARKET order/ : /relayer IP list/,
         args: {
           desk_id: d.deskId, reason: REASON,
           req: { kind: 'order', symbol, side: 'BUY', order_type: 'MARKET', price: null, quantity: '0.001', reduce_only: false, timestamp_ms: (d.now ?? Date.now)() },
@@ -243,14 +281,29 @@ export const ATTACKS: Attack[] = [
     title: 'more orders than the hourly notional cap',
     meter: true,
     async plan(desk, d) {
+      if (d.network === 'mainnet') return { skip: 'the meter attack signs real orders: never on mainnet' };
       const u = unpricedAsset(desk);
       if (u === null) return { skip: 'the meter attack uses an unpriced asset; the policy has none' };
-      const cap = desk.policy.max_notional_usd * 15;
+      if (d.hlInfo === undefined) return { skip: 'no Hyperliquid read to price the post-only orders far from the market' };
+      const mids = await d.hlInfo({ type: 'allMids' }) as Record<string, string> | null;
+      const mid = Number(mids?.[u.asset.symbol]);
+      if (!(mid > 0)) return { skip: `no Hyperliquid mid for ${u.asset.symbol}` };
+      // A post-only buy under half the mid and under half the unpriced cap's price: it can only rest (Hyperliquid
+      // cancels a post-only order that would cross), never fill, so its public signature is harmless. sz = max_sz.
+      const px = hlPx(Math.min(mid / 2, u.cap / (Number(u.maxSzE8) / 1e8) / 2), u.asset.sz_decimals);
+      // The meter counts an unpriced order at max(px, unpriced cap / max_sz) per unit (interfaces §1.2): with
+      // sz = max_sz and px under that floor, each order counts exactly the unpriced cap.
+      const perOrder = u.cap;
+      const counters = await d.transport.view<Record<string, unknown> | null>(d.contractId, 'get_desk_counters', { desk_id: d.deskId }).catch(() => null);
+      const capUsd = Number(counters?.notional_cap_usd ?? desk.policy.max_hourly_notional_usd ?? desk.policy.max_notional_usd * DEFAULT_HOURLY_NOTIONAL_MULTIPLE);
+      const leftUsd = counters?.notional_left_e8 === undefined ? capUsd : Number(String(counters.notional_left_e8)) / 1e8;
+      const fit = Math.floor(leftUsd / perOrder);
+      if (fit < 1) return { skip: `${leftUsd} USD of the hourly cap is left, under one order: the cap refusal could not be told from the size check; run it later` };
       return {
-        method: 'hl_order', expect: 'E_SIZE',
-        args: { desk_id: d.deskId, order: { asset: u.asset.index, is_buy: true, px: u.px, sz: u.maxSz, reduce_only: false, tif: 'Ioc', cloid: null }, reason: REASON },
-        note: `${u.asset.symbol} ${u.maxSz} at ${u.px} = ${u.cap} USD each; the hourly cap is 15 x ${desk.policy.max_notional_usd} = ${cap} USD. `
-          + 'It signs orders until the contract refuses (none is posted)',
+        method: 'hl_order', expect: 'E_SIZE', expectDetail: /max_hourly_notional_usd/, maxOrders: fit + 1,
+        args: { desk_id: d.deskId, order: { asset: u.asset.index, is_buy: true, px, sz: u.maxSz, reduce_only: false, tif: 'Alo', cloid: null }, reason: REASON },
+        note: `${u.asset.symbol} ${u.maxSz}, post-only buy at ${px} (mid ${mid}), counted ${perOrder} USD each; hourly cap ${capUsd} USD, ${leftUsd} left: `
+          + `${fit} should sign, order ${fit + 1} must be refused. None is posted`,
       };
     },
     send: (p, d) => d.contract.hlOrder(d.deskId, order(p.args), REASON),
@@ -258,25 +311,48 @@ export const ATTACKS: Attack[] = [
 ];
 
 async function rawCall(p: AttackPlan, d: AttackDeps): Promise<unknown> {
-  const out = await d.transport.call(d.contractId, p.method, p.args, 300);
+  const out = await d.transport.call(d.contractId, p.method, p.args, p.tgas ?? 300);
   if (out.ok) return out.value;
   const refusal = parseRefusal(out.failure);
   if (refusal !== null) throw new ContractRefusal(refusal.code, refusal.message, out.txHash);
   throw new Error(`${p.method} failed in transaction ${out.txHash}: ${out.failure.slice(0, 300)}`);
 }
 
-/** A transaction the node refused while validating it: the access key does not allow it, so nothing ran. */
+const errName = (err: unknown) => `${(err as { name?: string })?.name ?? ''} ${(err as { constructor?: { name?: string } })?.constructor?.name ?? ''}`;
+const errMessage = (err: unknown) => String((err as Error)?.message ?? err);
+
+/**
+ * The code of a transaction the node refused while validating it (nothing ran, no tx), or null when the error is
+ * not such a refusal. NODE_METHOD only for a method outside the FunctionCall key's list (MethodNameMismatch); any
+ * other access-key refusal (allowance, a deleted key, a wrong receiver) gets its own NODE_<kind> code, which no
+ * attack expects. The name is read as well as the class: the transport may rebuild the error to redact its URL.
+ */
+export function nodeRejection(err: unknown): string | null {
+  if (err instanceof AccessKeyMethodNameMismatchActionError) return NODE_METHOD;
+  const text = `${errName(err)} ${errMessage(err)}`;
+  if (/MethodNameMismatch/i.test(text)) return NODE_METHOD;
+  const kind = /(AccessKey\w*|NotEnoughAllowance\w*|InvalidAccessKey\w*)/.exec(text)?.[1];
+  return kind === undefined ? null : `NODE_${kind.replace(/(ActionError|Error)$/, '')}`;
+}
+
+/** Whether the node refused the transaction before it ran, for any access-key reason. */
 export function isNodeRejection(err: unknown): boolean {
-  const name = (err as { constructor?: { name?: string } })?.constructor?.name ?? '';
-  const text = `${name} ${String((err as Error)?.message ?? err)}`;
-  return /AccessKey|MethodNameMismatch|ReceiverMismatch|method name/i.test(text);
+  return nodeRejection(err) !== null;
 }
 
 function classify(err: unknown): Pick<AttackResult, 'outcome' | 'code' | 'tx' | 'detail'> {
   if (err instanceof ContractRefusal) return { outcome: 'refused', code: err.code, tx: err.txHash, detail: err.message };
-  if (isNodeRejection(err)) return { outcome: 'rejected', code: 'NODE', tx: null, detail: String((err as Error).message ?? err).slice(0, 300) };
+  const node = nodeRejection(err);
+  if (node !== null) return { outcome: 'rejected', code: node, tx: null, detail: errMessage(err).slice(0, 300) };
   if (err instanceof OutcomeUnknown) return { outcome: 'error', code: null, tx: err.ids.nearTx ?? null, detail: err.message };
-  return { outcome: 'error', code: null, tx: null, detail: String((err as Error)?.message ?? err).slice(0, 300) };
+  return { outcome: 'error', code: null, tx: null, detail: errMessage(err).slice(0, 300) };
+}
+
+/** Exactly the expected answer, or not: the strict rule every row is judged by. */
+export function judge(plan: Pick<AttackPlan, 'expect' | 'expectDetail'>, r: Pick<AttackResult, 'outcome' | 'code' | 'detail'>): boolean {
+  if (plan.expect === NODE_METHOD) return r.outcome === 'rejected' && r.code === NODE_METHOD;
+  if (r.outcome !== 'refused' || r.code !== plan.expect) return false;
+  return plan.expectDetail === undefined || plan.expectDetail.test(r.detail);
 }
 
 function signedTx(value: unknown): string | null {
@@ -291,36 +367,58 @@ export async function runAttack(attack: Attack, desk: DeskView, d: AttackDeps, o
   try {
     plan = await attack.plan(desk, d);
   } catch (err) {
-    return { ...base, method: '?', expect: '?', ...classify(err) };
+    return { ...base, method: '?', expect: '?', ...classify(err), pass: false };
   }
-  if ('skip' in plan) return { ...base, method: '-', expect: '-', outcome: 'skipped', code: null, tx: null, detail: plan.skip };
+  if ('skip' in plan) return { ...base, method: '-', expect: '-', outcome: 'skipped', code: null, tx: null, detail: plan.skip, pass: null };
   const head = { ...base, method: plan.method, expect: plan.expect };
-  if (options.dry) return { ...head, outcome: 'dry', code: null, tx: null, detail: `${plan.note ?? ''}\n    args ${JSON.stringify(plan.args)}` };
+  if (options.dry) return { ...head, outcome: 'dry', code: null, tx: null, detail: `${plan.note ?? ''}\n    args ${JSON.stringify(plan.args)}`, pass: null };
   if (attack.meter === true) {
     let signed = 0;
-    for (let i = 0; i < METER_MAX_ORDERS; i++) {
+    const stop = Math.min(plan.maxOrders ?? METER_HARD_STOP, METER_HARD_STOP);
+    for (let i = 0; i < stop; i++) {
       try {
         await attack.send(plan, d);
         signed++;
       } catch (err) {
-        return { ...head, ...classify(err), signed, detail: `${signed} orders signed (not posted), then: ${classify(err).detail}` };
+        const c = classify(err);
+        // E_SIZE is shared with the per-order size check: the meter passes only once it let orders through first.
+        return { ...head, ...c, signed, detail: `${signed} orders signed (post-only, far from the market, not posted), then: ${c.detail}`, pass: signed > 0 && judge(plan, c) };
       }
     }
-    return { ...head, outcome: 'signed', code: null, tx: null, signed, detail: `${signed} orders signed and none refused: the meter did not hold` };
+    return { ...head, outcome: 'signed', code: null, tx: null, signed, detail: `${signed} orders signed and none refused: the meter did not hold`, pass: false };
   }
   try {
     const value = await attack.send(plan, d);
-    return { ...head, outcome: 'signed', code: null, tx: signedTx(value), detail: 'THE CONTRACT SIGNED IT: the attack got through' };
+    return { ...head, outcome: 'signed', code: null, tx: signedTx(value), detail: 'THE CONTRACT SIGNED IT: the attack got through', pass: false };
   } catch (err) {
-    return { ...head, ...classify(err) };
+    const c = classify(err);
+    return { ...head, ...c, pass: judge(plan, c) };
   }
 }
 
 export interface LedgerCheck {
+  /** The contract's NEAR-side ledger of the desk (get_desk). */
   before: DeskView['ledger'];
   after: DeskView['ledger'];
-  /** Sum of |change| over the ledger fields, USDC × 1e6. */
+  /** The desk's Hyperliquid account value, USDC × 1e6 (clearinghouseState); null when it could not be read. */
+  hlBeforeE6: bigint | null;
+  hlAfterE6: bigint | null;
+  /** Sum of |change| over the NEAR ledger fields and the Hyperliquid account value, USDC × 1e6. */
   movedE6: bigint;
+}
+
+/** The desk's Hyperliquid perps account value in USDC × 1e6, or null when the read fails. */
+export async function hlAccountValueE6(d: Pick<AttackDeps, 'hlInfo'>, evm: string): Promise<bigint | null> {
+  if (d.hlInfo === undefined) return null;
+  try {
+    const s = await d.hlInfo({ type: 'clearinghouseState', user: evm }) as { marginSummary?: { accountValue?: string } } | null;
+    const v = s?.marginSummary?.accountValue;
+    if (typeof v !== 'string' || !/^\d+(\.\d+)?$/.test(v)) return null;
+    const [i, f = ''] = v.split('.');
+    return BigInt(i!) * 1_000_000n + BigInt((f + '000000').slice(0, 6));
+  } catch {
+    return null;
+  }
 }
 
 export function ledgerMoved(before: DeskView['ledger'], after: DeskView['ledger']): bigint {
@@ -345,17 +443,21 @@ export async function runAttacks(d: AttackDeps, options: { dry: boolean; meter: 
     return desk;
   };
   const desk = await read();
+  const hlBeforeE6 = options.dry ? null : await hlAccountValueE6(d, desk.evm_address);
   const results: AttackResult[] = [];
   for (const a of ATTACKS) {
     if (options.only !== undefined && !options.only.includes(a.id)) continue;
     if (a.meter === true && !options.meter) {
-      results.push({ id: a.id, title: a.title, method: 'hl_order', expect: 'E_SIZE', outcome: 'skipped', code: null, tx: null, detail: 'only with --meter (it signs up to 16 orders first)' });
+      results.push({ id: a.id, title: a.title, method: 'hl_order', expect: 'E_SIZE', outcome: 'skipped', code: null, tx: null, pass: null, detail: 'only with --meter (it signs post-only orders up to the hourly cap first; testnet only)' });
       continue;
     }
     results.push(await runAttack(a, desk, d, options));
   }
   const after = options.dry ? desk : await read();
-  return { results, ledger: { before: desk.ledger, after: after.ledger, movedE6: ledgerMoved(desk.ledger, after.ledger) } };
+  const hlAfterE6 = options.dry ? null : await hlAccountValueE6(d, desk.evm_address);
+  let movedE6 = ledgerMoved(desk.ledger, after.ledger);
+  if (hlBeforeE6 !== null && hlAfterE6 !== null) movedE6 += hlAfterE6 > hlBeforeE6 ? hlAfterE6 - hlBeforeE6 : hlBeforeE6 - hlAfterE6;
+  return { results, ledger: { before: desk.ledger, after: after.ledger, hlBeforeE6, hlAfterE6, movedE6 } };
 }
 
 const usdc = (e6: bigint) => {
@@ -375,28 +477,60 @@ function got(r: AttackResult, network: NearNetwork): string {
   }
 }
 
-/** The run as printed lines: one row per attack, then the ledger check. */
-export function report(run: AttackRun, d: Pick<AttackDeps, 'network' | 'contractId' | 'deskId'>, dry: boolean): string[] {
-  const lines = [`${dry ? 'DRY RUN, nothing is sent. ' : ''}desk ${d.deskId} on ${d.contractId} (${d.network})`, ''];
+/** The run as printed lines: one row per attack (PASS / FAIL), the ledger check, the verdict. */
+export function report(run: AttackRun, d: Pick<AttackDeps, 'network' | 'contractId' | 'deskId'>, dry: boolean, problems: string[] = []): string[] {
+  const lines = [`${dry && problems.length === 0 ? 'DRY RUN, nothing is sent. ' : ''}desk ${d.deskId} on ${d.contractId} (${d.network})`, ''];
+  for (const p of problems) lines.push(`FAIL: ${p}`);
+  if (problems.length > 0) lines.push('');
   const w = Math.max(...run.results.map((r) => r.title.length), 6);
-  lines.push(`${'attack'.padEnd(w)}  ${'method'.padEnd(20)}  ${'expect'.padEnd(17)}  answer`);
+  lines.push(`${'    '}  ${'attack'.padEnd(w)}  ${'method'.padEnd(20)}  ${'expect'.padEnd(17)}  answer`);
   for (const r of run.results) {
-    const expect = r.expect === 'NODE' ? 'node rejects' : r.expect;
-    lines.push(`${r.title.padEnd(w)}  ${r.method.padEnd(20)}  ${expect.padEnd(17)}  ${got(r, d.network)}`);
-    if (r.outcome === 'dry') lines.push(`    ${r.detail}`);
-    if (r.outcome === 'refused' && r.code !== r.expect) lines.push(`    note: expected ${r.expect}; ${r.detail}`);
+    const mark = r.pass === null ? '    ' : r.pass ? 'PASS' : 'FAIL';
+    const expect = r.expect === NODE_METHOD ? 'node: not in key' : r.expect;
+    lines.push(`${mark}  ${r.title.padEnd(w)}  ${r.method.padEnd(20)}  ${expect.padEnd(17)}  ${got(r, d.network)}`);
+    if (r.outcome === 'dry') lines.push(`      ${r.detail}`);
+    if (r.pass === false) {
+      const code = r.code ?? r.outcome;
+      lines.push(`      got ${code}: ${r.detail.startsWith(`${code}:`) ? r.detail.slice(code.length + 1).trimStart() : r.detail}`);
+    }
   }
   const l = run.ledger;
+  const near = (x: DeskView['ledger']) => `idle ${usdc(BigInt(String(x.idle_usdc)))}  deposited ${usdc(BigInt(String(x.deposited)))}  withdrawn ${usdc(BigInt(String(x.withdrawn)))}  fees ${usdc(BigInt(String(x.fees_paid)))} USDC`;
   lines.push('');
-  lines.push(`ledger before  idle ${usdc(BigInt(String(l.before.idle_usdc)))}  deposited ${usdc(BigInt(String(l.before.deposited)))}  withdrawn ${usdc(BigInt(String(l.before.withdrawn)))}  fees ${usdc(BigInt(String(l.before.fees_paid)))} USDC`);
-  if (!dry) lines.push(`ledger after   idle ${usdc(BigInt(String(l.after.idle_usdc)))}  deposited ${usdc(BigInt(String(l.after.deposited)))}  withdrawn ${usdc(BigInt(String(l.after.withdrawn)))}  fees ${usdc(BigInt(String(l.after.fees_paid)))} USDC`);
-  lines.push(dry ? 'ledger check runs after a live run' : `${usdc(l.movedE6)} USDC moved`);
-  const through = run.results.filter((r) => r.outcome === 'signed');
-  if (through.length > 0) lines.push(`${through.length} attack(s) got through: ${through.map((r) => r.id).join(', ')}`);
+  lines.push(`NEAR ledger before        ${near(l.before)}`);
+  if (dry) {
+    lines.push('the ledger check (NEAR ledger and Hyperliquid account value) runs after a live run');
+    return lines;
+  }
+  lines.push(`NEAR ledger after         ${near(l.after)}`);
+  lines.push(l.hlBeforeE6 === null || l.hlAfterE6 === null
+    ? 'Hyperliquid account value not read: the check covers the NEAR ledger only'
+    : `Hyperliquid account value ${usdc(l.hlBeforeE6)} -> ${usdc(l.hlAfterE6)} USDC`);
+  lines.push(`${usdc(l.movedE6)} USDC moved (NEAR ledger${l.hlBeforeE6 === null || l.hlAfterE6 === null ? '' : ' + Hyperliquid account'})`);
+  const failed = run.results.filter((r) => r.pass === false);
+  if (failed.length > 0) lines.push(`${failed.length} row(s) failed: ${failed.map((r) => r.id).join(', ')}`);
   return lines;
 }
 
-/** True when no attack got signed and no USDC moved. */
-export function held(run: AttackRun): boolean {
-  return run.results.every((r) => r.outcome !== 'signed') && run.ledger.movedE6 === 0n;
+/**
+ * The desk held: no problem before the run, at least one row ran, every row that ran got exactly its expected
+ * answer, the Hyperliquid account was read before and after when a reader was given, and nothing moved.
+ */
+export function held(run: AttackRun, problems: string[] = [], hlExpected = false): boolean {
+  const ran = run.results.filter((r) => r.pass !== null);
+  const hlRead = !hlExpected || (run.ledger.hlBeforeE6 !== null && run.ledger.hlAfterE6 !== null);
+  return problems.length === 0 && ran.length > 0 && ran.every((r) => r.pass === true) && hlRead && run.ledger.movedE6 === 0n;
+}
+
+/** Why a live run cannot prove anything, from the operator key's remaining allowance (null: unlimited or full access). */
+export async function keyProblems(allowance: () => Promise<bigint | null>, minYocto = 3n * 10n ** 23n): Promise<string[]> {
+  let left: bigint | null;
+  try {
+    left = await allowance();
+  } catch (err) {
+    return [`the operator key is not on chain or cannot be read: ${errMessage(err).slice(0, 200)}`];
+  }
+  if (left === null) return ['the key has no allowance: it is full-access or unlimited, not an operator key'];
+  if (left < minYocto) return [`the operator key's allowance is ${Number(left / 10n ** 21n) / 1000} NEAR, under ${Number(minYocto / 10n ** 21n) / 1000} NEAR for one call`];
+  return [];
 }

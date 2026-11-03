@@ -254,7 +254,11 @@ export class DeskTools {
   async tryAttack(input: { attack: string; dry?: boolean | undefined }): Promise<ToolAnswer> {
     const attack = ATTACKS.find((a) => a.id === input.attack);
     if (attack === undefined) {
-      return { ok: false, refused: false, method: 'try_attack', error: `no attack ${input.attack}; one of ${ATTACKS.map((a) => a.id).join(', ')}`, tx: null, explorer: null };
+      return { ok: false, refused: false, method: 'try_attack', error: `no attack ${input.attack}; one of ${ATTACKS.filter((a) => a.meter !== true).map((a) => a.id).join(', ')}`, tx: null, explorer: null };
+    }
+    if (attack.meter === true) {
+      // Refused here, whatever schema the caller used: the meter attack signs real orders, so only a human runs it (npm run attack -- --meter).
+      return { ok: false, refused: false, method: 'try_attack', error: `${attack.id} signs real orders before the refusal; run it from the attack CLI with --meter, not through the agent`, tx: null, explorer: null };
     }
     try {
       const desk = await this.#desk();
@@ -266,7 +270,7 @@ export class DeskTools {
         ok: true, attack: r.id, title: r.title, method: r.method, expected: r.expect, outcome: r.outcome, code: r.code,
         tx: r.tx, explorer: this.#explorer(r.tx), no_tx_reason: r.outcome === 'rejected' ? 'rejected before the chain, no tx' : null,
         detail: r.detail, ...(r.signed === undefined ? {} : { signed_before_refusal: r.signed }),
-        got_through: r.outcome === 'signed',
+        pass: r.pass, got_through: r.outcome === 'signed',
       };
     } catch (err) {
       return this.failure(attack.id, err);

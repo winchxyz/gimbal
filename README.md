@@ -164,12 +164,32 @@ tools are `read_desk`, `place_hl_order`, `fund_venue`, `withdraw` and `try_attac
 
 ### 5. Try to make the agent steal
 
-`npm run attack` runs a scripted list of malicious operator requests against a desk and prints a table — attack →
-refusal code → NEAR transaction or "rejected before the chain, no tx" — then a before/after ledger check. The
-attacks: an over-size order (`E_SIZE`), an asset outside the policy (`E_ASSET`), `hl_withdraw` with an extra
-`destination` argument (`E_ARGS`), a made-up `fund_venue` quote paying the attacker (`E_QUOTE_SIGNATURE`), a real
-recorded 1Click quote for another desk (`E_QUOTE_FIELDS`), a method outside the key's list (rejected by the node, no
-tx), an Orderly `MARKET` order (`E_PRICE_BAND`), and the hourly meter behind `--meter`.
+`npm run attack` runs a scripted list of malicious operator requests against a desk and prints a table — PASS/FAIL →
+attack → refusal code → NEAR transaction or "rejected before the chain, no tx" — then a before/after check of the
+desk's NEAR ledger and its Hyperliquid account value. The attacks: an over-size order (`E_SIZE`), an asset outside
+the policy (`E_ASSET`), `hl_withdraw` with an extra `destination` argument (`E_ARGS`, unknown field `destination`), a
+made-up `fund_venue` quote paying the attacker (`E_QUOTE_SIGNATURE`), a real recorded 1Click quote for another desk
+(`E_QUOTE_FIELDS`), a method outside the key's list (rejected by the node as a method mismatch, no tx), resuming a
+paused desk with `set_paused(false)` (`E_NOT_ALLOWED`: it needs exactly 1 yoctoNEAR, which a FunctionCall key cannot
+attach), an Orderly `MARKET` order (`E_PRICE_BAND`), and the hourly meter behind `--meter`.
+
+A row passes only when it gets exactly its expected refusal (code, and for shared codes the message). Anything
+else — another code, an RPC error, a spent allowance, a signature — is FAIL with what came back. A missing operator
+key or an allowance under 0.3 NEAR is a FAIL before any row runs.
+
+| Flag | What it does |
+| --- | --- |
+| `--contract <id>`, `--desk <id>` | the desk (or `GIMBAL_CONTRACT_ID`, `DESK_ID`) |
+| `--network testnet\|mainnet` | the network (or `NEAR_NETWORK`; default testnet) |
+| `--mainnet` | required for mainnet; without it a mainnet target is refused |
+| `--key-file <path>` | the operator key file (or `OPERATOR_KEY_FILE`; default `.keys/operator-<contract>.json`); its `network` must match |
+| `--env-file <path>` | load these variables from a file first |
+| `--dry` | build every request, send nothing (the default when no key file exists) |
+| `--only a,b` | run only these attack ids (`over-size`, `asset`, `withdraw-destination`, `fake-quote`, `foreign-quote`, `owner-method`, `unpause`, `orderly-market`, `hourly-meter`) |
+| `--meter` | testnet only: also run the hourly-meter attack. It signs post-only buys far below the market, sized to the cap left in the hour (`get_desk_counters`), until the contract refuses; none is posted |
+
+The MCP server takes the same guard: it refuses mainnet unless started with `--mainnet` (or `GIMBAL_ALLOW_MAINNET=1`),
+and its `try_attack` tool never runs the meter.
 
 ```bash
 # the attack: dry (default when no operator key exists) prints every request and the code it expects, sends nothing
@@ -185,9 +205,9 @@ npm run rescue-dry -w engine -- --mainnet --contract <mainnet-contract> --desk <
 node tools/testnet/live.mjs gimbal-final-fcf135.testnet final-1 hl --owner gimbal-owner-fcf135.testnet
 ```
 
-The attack's dry run against `final-1` (BTC/ETH/SOL unpriced, hourly cap 15 × 50 = 750 USD, ledger zero) builds every
-request and names the code the contract would answer. A live run ends with `N USDC moved`; when the desk holds, that
-is `0 USDC moved` and no attack got through.
+The attack's dry run against `final-1` (BTC/ETH/SOL unpriced, ledger zero) builds every request and names the code
+the contract would answer. A live run ends with `N USDC moved (NEAR ledger + Hyperliquid account)`; when the desk
+holds, every row is PASS and that is `0 USDC moved`.
 
 ### 6. Mainnet evidence
 

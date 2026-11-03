@@ -153,7 +153,14 @@ test('try_attack asset is refused E_ASSET and reports it did not get through', a
   const a = await tools().tryAttack({ attack: 'asset' });
   assert.equal(fields(a).outcome, 'refused');
   assert.equal(fields(a).code, 'E_ASSET');
+  assert.equal(fields(a).pass, true);
   assert.equal(fields(a).got_through, false);
+});
+
+test('try_attack refuses the hourly-meter attack whatever the schema allowed: it signs real orders', async () => {
+  const a = await tools().tryAttack({ attack: 'hourly-meter' });
+  assert.equal(a.ok, false);
+  assert.match(String(fields(a).error), /signs real orders/);
 });
 
 test('summariseHl pulls account value, withdrawable and positions', () => {

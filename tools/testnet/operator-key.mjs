@@ -149,6 +149,10 @@ async function main(argv) {
   if (outcome?.status?.Failure !== undefined) throw new Error(`AddKey ${txHash} failed: ${JSON.stringify(outcome.status.Failure).slice(0, 400)}`);
   const view = await accessKey(a.owner, opPublicKey);
   if (!isFunctionCallKey(view, a.contract, OPERATOR_METHODS)) throw new Error(`the key on ${a.owner} is not the operator key it should be (${JSON.stringify(view?.permission)}): delete it at once`);
+  const onChain = view?.permission?.FunctionCall?.allowance;
+  if (onChain === null || onChain === undefined || BigInt(String(onChain)) !== a.allowance) {
+    throw new Error(`the key on ${a.owner} has allowance ${onChain ?? 'unlimited'}, not ${a.allowance}: delete it at once`);
+  }
   say(`AddKey final: https://testnet.nearblocks.io/txns/${txHash}`);
   say(`operator key on chain: FunctionCall, receiver ${a.contract}, ${OPERATOR_METHODS.length} methods, allowance ${nearText(a.allowance)} NEAR`);
   return 0;

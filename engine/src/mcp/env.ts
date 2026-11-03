@@ -24,10 +24,16 @@ export const defaultKeyFile = (contractId: string) => join(REPO_ROOT, '.keys', `
 /**
  * NEAR_NETWORK (default testnet), GIMBAL_CONTRACT_ID, DESK_ID, OPERATOR_KEY_FILE (default
  * .keys/operator-<contract>.json at the repo root), NEAR_RPC_URL. Errors name variables, never values.
+ * Mainnet is refused unless `allowMainnet` (the --mainnet flag) is set: a stray NEAR_NETWORK=mainnet never reaches real money.
  */
-export function deskEnv(env: (name: string) => string | undefined, overrides: Partial<Record<'network' | 'contract' | 'desk' | 'keyFile', string>> = {}): DeskEnv {
+export function deskEnv(
+  env: (name: string) => string | undefined,
+  overrides: Partial<Record<'network' | 'contract' | 'desk' | 'keyFile', string>> = {},
+  options: { allowMainnet?: boolean } = {},
+): DeskEnv {
   const network = overrides.network ?? env('NEAR_NETWORK') ?? 'testnet';
   if (network !== 'testnet' && network !== 'mainnet') throw new Error(`NEAR_NETWORK must be testnet or mainnet, got ${network}`);
+  if (network === 'mainnet' && options.allowMainnet !== true) throw new Error('refusing mainnet without --mainnet');
   const contractId = overrides.contract ?? env('GIMBAL_CONTRACT_ID');
   const deskId = overrides.desk ?? env('DESK_ID');
   const missing = [contractId === undefined ? 'GIMBAL_CONTRACT_ID (--contract)' : null, deskId === undefined ? 'DESK_ID (--desk)' : null].filter((m) => m !== null);
@@ -40,8 +46,11 @@ export function deskEnv(env: (name: string) => string | undefined, overrides: Pa
   return { network, contractId: contractId!, deskId: deskId!, rpcUrl: env('NEAR_RPC_URL'), keyFile, keyExists: existsSync(keyFile) };
 }
 
-/** The account and private key of an operator key file. The error never quotes the file's content. */
-export function loadOperatorKey(file: string): { accountId: string; privateKey: string; publicKey: string | null } {
+/**
+ * The account and private key of an operator key file, for `network`: the file's `network` field (when present) or
+ * else its account's suffix must name the same network. The error never quotes the file's secret.
+ */
+export function loadOperatorKey(file: string, network: NearNetwork): { accountId: string; privateKey: string; publicKey: string | null } {
   let json: unknown;
   try {
     json = JSON.parse(readFileSync(file, 'utf8'));
@@ -52,6 +61,10 @@ export function loadOperatorKey(file: string): { accountId: string; privateKey: 
   const secret = o.private_key ?? o.secret_key;
   if (typeof o.account_id !== 'string' || o.account_id === '') throw new Error(`${file}: no account_id`);
   if (typeof secret !== 'string' || !secret.startsWith('ed25519:')) throw new Error(`${file}: no ed25519 private_key`);
+  const suffix = /\.(near|testnet)$/.exec(o.account_id)?.[1];
+  const fileNetwork = typeof o.network === 'string' ? o.network : suffix === 'near' ? 'mainnet' : suffix === 'testnet' ? 'testnet' : null;
+  if (fileNetwork === null) throw new Error(`${file}: no network field and ${o.account_id} names no network; add "network": "${network}"`);
+  if (fileNetwork !== network) throw new Error(`${file} is a ${fileNetwork} key, but the target network is ${network}`);
   return { accountId: o.account_id, privateKey: secret, publicKey: typeof o.public_key === 'string' ? o.public_key : null };
 }
 

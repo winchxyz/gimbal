@@ -4,6 +4,8 @@
 // and only the methods that key allows (tools/testnet/operator-key.mjs adds it). Configure it with env:
 //   GIMBAL_CONTRACT_ID, DESK_ID, NEAR_NETWORK (default testnet), OPERATOR_KEY_FILE (default
 //   .keys/operator-<contract>.json), NEAR_RPC_URL (optional), ONECLICK_API_KEY (optional).
+// Mainnet is refused unless the server is started with --mainnet (or GIMBAL_ALLOW_MAINNET=1), and the key file's
+// network must match.
 //
 //   node engine/src/mcp/server.ts        # or: npm run mcp -w engine
 
@@ -27,16 +29,11 @@ const json = (answer: ToolAnswer): ToolResult => ({
   structuredContent: answer as Record<string, unknown>,
 });
 
-/**
- * registerTool, typed against the engine's zod. The MCP SDK carries its own zod copy, so the two are nominally
- * incompatible to the type checker though identical at runtime; this wrapper is the one cast that bridges them.
- */
-type RegisterTool = (name: string, config: { title?: string; description?: string; inputSchema?: Record<string, z.ZodTypeAny> }, cb: (input: Record<string, unknown>) => Promise<ToolResult>) => void;
-
 /** Registers the five tools on `server`. Exposed so a test can list and call them without a transport. */
 export function registerDeskTools(server: McpServer, tools: DeskTools): void {
   const where = `desk ${tools.deskId} on ${tools.contractId} (${tools.network})`;
-  const register = server.registerTool.bind(server) as unknown as RegisterTool;
+  // The engine pins the zod the MCP SDK uses (4.4.3), so the schemas type-check against registerTool directly.
+  const register = server.registerTool.bind(server);
 
   register('read_desk', {
     title: 'Read the desk',
@@ -82,16 +79,16 @@ export function registerDeskTools(server: McpServer, tools: DeskTools): void {
 
   register('try_attack', {
     title: 'Try to make the desk steal',
-    description: 'Send one deliberately bad request and return the contract\'s refusal. attacks: over-size (E_SIZE), asset (E_ASSET), withdraw-destination (E_ARGS), fake-quote (E_QUOTE_SIGNATURE), foreign-quote (E_QUOTE_FIELDS), owner-method (node rejects, no tx), orderly-market (E_PRICE_BAND). dry: true builds the request and returns what would be sent without sending it.',
+    description: 'Send one deliberately bad request and return the contract\'s refusal. attacks: over-size (E_SIZE), asset (E_ASSET), withdraw-destination (E_ARGS), fake-quote (E_QUOTE_SIGNATURE), foreign-quote (E_QUOTE_FIELDS), owner-method (node rejects, no tx), unpause (E_NOT_ALLOWED: resuming a paused desk needs 1 yoctoNEAR from the owner), orderly-market (E_PRICE_BAND on testnet). The hourly-meter attack signs real orders, so it is not offered here. dry: true builds the request and returns what would be sent without sending it.',
     inputSchema: {
-      attack: z.enum(['over-size', 'asset', 'withdraw-destination', 'fake-quote', 'foreign-quote', 'owner-method', 'orderly-market']),
+      attack: z.enum(['over-size', 'asset', 'withdraw-destination', 'fake-quote', 'foreign-quote', 'owner-method', 'unpause', 'orderly-market']),
       dry: z.boolean().optional(),
     },
   }, async (input) => json(await tools.tryAttack(input as unknown as { attack: string; dry?: boolean })));
 }
 
 export async function main(): Promise<void> {
-  const env = deskEnv(processEnv);
+  const env = deskEnv(processEnv, {}, { allowMainnet: process.argv.includes('--mainnet') || processEnv('GIMBAL_ALLOW_MAINNET') === '1' });
   if (!env.keyExists) {
     throw new Error(`no operator key file at ${env.keyFile}. Add it with: node tools/testnet/operator-key.mjs ${env.contractId} --owner <owner>.testnet --send`);
   }
