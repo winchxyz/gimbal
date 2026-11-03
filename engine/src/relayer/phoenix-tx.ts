@@ -40,6 +40,10 @@ export const PHOENIX_MAINNET: PhoenixExchangeAccounts = {
 /** The unit limit and price an order message sets: the contract's caps on the limit, 60,000 lamports of fee. */
 export const ORDER_COMPUTE_UNITS = 600_000;
 export const ORDER_PRIORITY_MICROLAMPORTS = 100_000;
+/** The highest unit price the engine sets: the contract's cap drops to 200,000 µlamports in C10. */
+export const MAX_PRIORITY_MICROLAMPORTS = 200_000;
+/** A simulated order over this many units is refused: measured 532k on mainnet, and the limit is 600k. */
+export const ORDER_UNITS_REFUSE_ABOVE = 560_000;
 /** Deposits and withdrawals: computeBudgetInstructions()'s defaults (400k units, 100,000 µlamports). */
 export const MONEY_COMPUTE_UNITS = 400_000;
 
@@ -211,5 +215,43 @@ export function exchangeMismatches(live: ExchangeSnapshotAccounts, pinned: Phoen
   same('activeTraderBuffer', live.activeTraderBuffer, pinned.activeTraderBuffer);
   same('withdrawQueue', live.withdrawQueue, pinned.withdrawQueue);
   if (live.active !== true) out.push(`the exchange is not active (active ${String(live.active)})`);
+  return out;
+}
+
+/** One market of /v1/exchange/snapshot, the fields an order's lots and ticks come from. */
+export interface SnapshotMarket {
+  symbol?: unknown;
+  marketPubkey?: unknown;
+  splinePubkey?: unknown;
+  tickSize?: unknown;
+  baseLotsDecimals?: unknown;
+  marketStatus?: unknown;
+}
+
+/**
+ * Where a policy market differs from the live exchange's: its orderbook and spline, and its lot and tick. Phoenix
+ * prices in quote lots of 1e-6 USD per base lot of 10^-baseLotsDecimals units, so base_lot_e8 must be
+ * 10^(8 - baseLotsDecimals) and tick_e8 (USD x 1e8 per base unit per tick) tickSize x 10^(baseLotsDecimals + 2):
+ * ETH, 3 decimals and tickSize 100, is 0.001 ETH a lot and 0.1 USD a tick. Empty when they agree.
+ */
+export function marketMismatches(
+  live: SnapshotMarket | undefined, policy: { symbol: string; orderbook: string; base_lot_e8: number; tick_e8: number }, spline?: string,
+): string[] {
+  const name = `phoenix ${policy.symbol}`;
+  if (live === undefined) return [`${name}: the exchange lists no such market`];
+  const out: string[] = [];
+  if (live.marketPubkey !== policy.orderbook) out.push(`${name}: the exchange's orderbook is ${String(live.marketPubkey)}, the policy's ${policy.orderbook}`);
+  if (spline !== undefined && live.splinePubkey !== undefined && live.splinePubkey !== spline) out.push(`${name}: the exchange's spline is ${String(live.splinePubkey)}, derived ${spline}`);
+  const decimals = live.baseLotsDecimals;
+  const tickSize = live.tickSize;
+  if (typeof decimals !== 'number' || !Number.isInteger(decimals) || decimals < 0 || decimals > 8 || typeof tickSize !== 'number' || !Number.isInteger(tickSize) || tickSize < 1) {
+    out.push(`${name}: the exchange's baseLotsDecimals ${String(decimals)} or tickSize ${String(tickSize)} cannot be read`);
+    return out;
+  }
+  const lotE8 = 10 ** (8 - decimals);
+  const tickE8 = tickSize * 10 ** (decimals + 2);
+  if (policy.base_lot_e8 !== lotE8) out.push(`${name}: the policy's base_lot_e8 is ${policy.base_lot_e8}, the exchange's lot ${lotE8}`);
+  if (policy.tick_e8 !== tickE8) out.push(`${name}: the policy's tick_e8 is ${policy.tick_e8}, the exchange's tick ${tickE8}`);
+  if (live.marketStatus !== undefined && live.marketStatus !== 'active') out.push(`${name}: the market is ${String(live.marketStatus)}`);
   return out;
 }

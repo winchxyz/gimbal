@@ -262,7 +262,11 @@ export class PairTrader {
    * An open split into pairs under the policy cap (openChunk), each one a whole open with its own legging guard. Stops
    * at the first part that does not end open, or that opened less than asked (a maker leg that did not fill).
    */
-  async openInChunks(request: { size: bigint | number | string; longIndex: 0 | 1; reason: string; maker?: MakerFirst }): Promise<PairResult[]> {
+  async openInChunks(request: {
+    size: bigint | number | string; longIndex: 0 | 1; reason: string; maker?: MakerFirst;
+    /** Runs before each part (a CLI refreshes the stored price there); a throw stops the open before that part. */
+    beforePart?: (part: number, parts: number) => Promise<void>;
+  }): Promise<PairResult[]> {
     const total = floorToLot(typeof request.size === 'bigint' ? request.size : toQty(request.size), this.lot);
     if (total === 0n) throw new LegCheckError(`size ${String(request.size)} is under one common lot ${qtyString(this.lot)}`);
     const chunk = await this.openChunk(request.longIndex);
@@ -272,7 +276,15 @@ export class PairTrader {
     let left = total;
     for (let i = 1; left > 0n; i++) {
       const size = left > chunk ? chunk : left;
-      const r = await this.open({ ...request, size, reason: parts === 1 ? request.reason : `${request.reason} (part ${i} of ${parts})` });
+      if (request.beforePart !== undefined) {
+        try {
+          await request.beforePart(i, parts);
+        } catch (err) {
+          results.push(this.#refused(size, [`part ${i} of ${parts} not sent: ${errorText(err)}`]));
+          break;
+        }
+      }
+      const r = await this.open({ longIndex: request.longIndex, ...(request.maker === undefined ? {} : { maker: request.maker }), size, reason: parts === 1 ? request.reason : `${request.reason} (part ${i} of ${parts})` });
       results.push(r);
       const opened = toQty(r.size);
       if (r.status !== 'open' || opened < size) break;
@@ -708,6 +720,14 @@ export class PairTrader {
         r.pos = read ?? from + (side === 'BUY' ? out.filled : -out.filled);
       } else {
         await this.#settle(r, from, side, out);
+        // A maker order is several orders, and the one that ended with no answer and no expiry may still rest and fill
+        // after the parts that did: a position that moved by those parts does not show it ran. Always unsettled, from
+        // where the filled parts left the leg, so the partner is never sized past what is known and the watch sees it.
+        if (out.kind === 'unknown' && out.expiresAt === null && r.unsettled === null) {
+          const partsFilled = (out.parts ?? []).reduce((acc, p) => acc + (p.kind === 'filled' ? p.filled : 0n), 0n);
+          r.unsettled = out;
+          r.unsettledFrom = from + (side === 'BUY' ? partsFilled : -partsFilled);
+        }
       }
       if (size === want || out.kind !== 'filled' || out.filled !== size) return;
     }

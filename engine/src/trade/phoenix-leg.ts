@@ -10,17 +10,23 @@
 // Outcomes:
 //   - a local check, the contract's refusal, the signature budget: failed, nothing signed;
 //   - the transaction landed with an error, or its blockhash expired unseen (NothingExecuted): failed;
-//   - it landed and the position did not move: failed (an IOC with nothing to match);
+//   - an MPC timeout the relayer hands on (only once the message's blockhash is proven expired): failed;
+//   - it landed and the position did not move, read from a snapshot at or past the slot it landed in: failed (an IOC
+//     with nothing to match). Without that slot no snapshot can be proven to include it: unknown, never failed (a
+//     stale snapshot reads "did not move", and a retry would double the leg);
 //   - OutcomeUnknown (no proof either way): the leg waits until the chain is past the message's lastValidBlockHeight
-//     (after it no copy can land) and answers unknown with that time as expiresAt, so the pair reads the position
-//     once and knows; when that cannot be proven, expiresAt is null and the pair treats the order as unsettled.
+//     (after it no copy can land), takes the slot that height was read at as the oldest snapshot it trusts, and
+//     answers unknown with that time as expiresAt, so the pair reads the position once and knows; when that cannot
+//     be proven, expiresAt is null and the pair treats the order as unsettled.
 // A signed Solana transaction executes at most once and dies with its blockhash, so the leg is not replayable.
 
 import type { TxRef } from '@gimbal/shared';
-import { OutcomeUnknown } from '../contract/types.ts';
+import { MpcTimeoutError, OutcomeUnknown } from '../contract/types.ts';
 import type { SolanaMessageBuilder } from '../relayer/relayer.ts';
-import type { PhoenixMarketAccounts } from '../relayer/phoenix-tx.ts';
-import { PHOENIX_MAINNET, cancelAllMessage, orderMessage } from '../relayer/phoenix-tx.ts';
+import type { ComputeBudget, PhoenixMarketAccounts } from '../relayer/phoenix-tx.ts';
+import {
+  MAX_PRIORITY_MICROLAMPORTS, ORDER_COMPUTE_UNITS, ORDER_PRIORITY_MICROLAMPORTS, PHOENIX_MAINNET, cancelAllMessage, orderMessage,
+} from '../relayer/phoenix-tx.ts';
 import type { DeskSolanaAccounts, PhoenixExchangeAccounts } from '../relayer/phoenix-withdraw.ts';
 import { NothingExecuted } from '../relayer/tx.ts';
 import type { Clock } from '../venues/venue.ts';
@@ -50,8 +56,17 @@ export interface PhoenixLegOptions {
     latestBlockhash(): Promise<{ blockhash: string; lastValidBlockHeight: number }>;
     signatureSlot(signature: string): Promise<number | null>;
   };
-  /** SolanaSubmitter.waitPastLastValidHeight: true once the chain is proven past that height. */
-  waitPastLastValidHeight: (lastValidBlockHeight: number) => Promise<boolean>;
+  /** SolanaSubmitter.landedSlot: the slot of a transaction it saw confirmed (asked first, before the RPC). */
+  landedSlot?: (signature: string) => number | null;
+  /**
+   * SolanaSubmitter.waitPastLastValidHeightSlot: the slot at which the chain was proven past that height, or null
+   * when it was not proven in time.
+   */
+  waitPastLastValidHeight: (lastValidBlockHeight: number) => Promise<number | null>;
+  /** The orders' unit price (default 100,000 µlamports, at most 200,000); the unit limit is the 600k cap. */
+  microLamports?: number;
+  /** How long a landed transaction's slot is looked up before the order is answered unknown (default 15 s). */
+  slotWaitMs?: number;
   api: PhoenixTraderApi;
   desk: DeskSolanaAccounts;
   market: PhoenixLegMarket;
@@ -135,6 +150,7 @@ export class PhoenixLeg implements TradeLeg {
   readonly #clock: Clock;
   readonly #sleep: (ms: number) => Promise<void>;
   readonly #exchange: PhoenixExchangeAccounts;
+  readonly #budget: ComputeBudget;
   /** The slot of the last transaction of this leg that landed: a snapshot older than it does not show it. */
   #minSlot = 0;
 
@@ -147,6 +163,11 @@ export class PhoenixLeg implements TradeLeg {
     this.#clock = options.clock ?? systemClock;
     this.#sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.#exchange = options.exchange ?? PHOENIX_MAINNET;
+    const price = options.microLamports ?? ORDER_PRIORITY_MICROLAMPORTS;
+    if (!Number.isSafeInteger(price) || price < 1 || price > MAX_PRIORITY_MICROLAMPORTS) {
+      throw new Error(`phoenix: the unit price ${price} µlamports is outside 1..${MAX_PRIORITY_MICROLAMPORTS}`);
+    }
+    this.#budget = { units: ORDER_COMPUTE_UNITS, microLamports: price };
   }
 
   async check(size: bigint, reduceOnly: boolean): Promise<void> {
@@ -159,8 +180,9 @@ export class PhoenixLeg implements TradeLeg {
   async maxSize(side: LegSide): Promise<bigint> {
     const plan = await this.plan(side, this.lot, true);
     const oracle = await this.#o.oraclePx();
-    const capPx = oracle === null ? plan.px : Math.max(plan.px, oracle);
-    let lots = BigInt(Math.floor(this.#o.maxNotionalUsd / (capPx * qtyNumber(this.lot)) + 1e-9));
+    // In integers, as the contract counts: lots × lot × max(limit, oracle) ≤ the cap, never rounded up.
+    const lotUsdE16 = this.lot * maxE8(plan.ticks * BigInt(this.#o.market.tickE8), oracle);
+    let lots = usdE16(this.#o.maxNotionalUsd) / lotUsdE16;
     if (this.#o.maxSz !== undefined) {
       const bySz = toQty(this.#o.maxSz) / this.lot;
       if (bySz < lots) lots = bySz;
@@ -202,13 +224,18 @@ export class PhoenixLeg implements TradeLeg {
       if (buy ? ticks < bestTicks : ticks > bestTicks) {
         throw new LegCheckError(`${name}: the best ${buy ? 'ask' : 'bid'} ${best} is outside ${(band * 100).toFixed(2)} % of the contract's price ${oracle}: nothing to match inside the band`);
       }
+      // The contract checks |limit - oracle| both ways: a buy limit far under the price (or a sell far over) is
+      // refused too, so it is checked here before anything is signed.
+      const far = buy ? Math.ceil((oracle * (1 - band)) / tick) : Math.floor((oracle * (1 + band)) / tick);
+      if (buy ? ticks < far : ticks > far) {
+        throw new LegCheckError(`${name}: the ${buy ? 'buy' : 'sell'} limit ${ticks * tick} is ${buy ? 'under' : 'over'} ${(band * 100).toFixed(2)} % of the contract's price ${oracle}`);
+      }
     }
     if (ticks < 1) throw new LegCheckError(`${name}: a limit under one tick`);
     const px = ticks * tick;
-    const capPx = oracle === null ? px : Math.max(px, oracle);
-    const notional = qtyNumber(size) * capPx;
-    if (notional > this.#o.maxNotionalUsd + 1e-9) {
-      throw new LegCheckError(`${name}: ${qtyString(size)} at ${capPx} is ${notional.toFixed(2)} USD, over the policy's ${this.#o.maxNotionalUsd} USD`);
+    const capE8 = maxE8(BigInt(ticks) * BigInt(this.#o.market.tickE8), oracle);
+    if (size * capE8 > usdE16(this.#o.maxNotionalUsd)) {
+      throw new LegCheckError(`${name}: ${qtyString(size)} at ${Number(capE8) / 1e8} is ${(qtyNumber(size) * Number(capE8) / 1e8).toFixed(2)} USD, over the policy's ${this.#o.maxNotionalUsd} USD`);
     }
     if (this.#o.maxSz !== undefined && size > toQty(this.#o.maxSz)) throw new LegCheckError(`${name}: ${qtyString(size)} is over the unpriced symbol's max_sz ${this.#o.maxSz}`);
     return { side, lots: size / this.lot, ticks: BigInt(ticks), px, reduceOnly };
@@ -226,10 +253,9 @@ export class PhoenixLeg implements TradeLeg {
     }
     let built: { lastValidBlockHeight: number } | null = null;
     const build: SolanaMessageBuilder = async () => {
-      const { blockhash, lastValidBlockHeight } = await this.#o.chain.latestBlockhash();
-      built = { lastValidBlockHeight };
-      const message = orderMessage(this.#exchange, this.#o.desk, this.#o.market, { side, priceInTicks: plan.ticks, numBaseLots: plan.lots, reduceOnly }, blockhash);
-      return { messageB64: Buffer.from(message).toString('base64'), lastValidBlockHeight };
+      const m = await this.message(plan);
+      built = { lastValidBlockHeight: m.lastValidBlockHeight };
+      return { messageB64: Buffer.from(m.message).toString('base64'), lastValidBlockHeight: m.lastValidBlockHeight };
     };
     ref.sentAt = this.#clock.now();
     let tx: TxRef[];
@@ -239,6 +265,9 @@ export class PhoenixLeg implements TradeLeg {
       if (err instanceof NothingExecuted || err instanceof OutcomeUnknown) ref.tx = err.tx;
       if (err instanceof OutcomeUnknown) ref.orderId = err.ids.solSignature ?? null;
       if (provesNothingRan(err)) return { kind: 'failed', error: err as Error, ref };
+      // The relayer hands on an MPC timeout only once the last message's blockhash is proven expired (and signs a
+      // second one only after the first one's was): no signature of either can land any more.
+      if (err instanceof MpcTimeoutError) return { kind: 'failed', error: err, ref };
       const height = err instanceof OutcomeUnknown ? err.ids.solLastValidBlockHeight ?? (built as { lastValidBlockHeight: number } | null)?.lastValidBlockHeight : undefined;
       return { kind: 'unknown', error: err instanceof Error ? err : new Error(String(err)), ref, expiresAt: await this.#expiry(height) };
     }
@@ -246,21 +275,51 @@ export class PhoenixLeg implements TradeLeg {
     const signature = tx.find((t) => t.chain === 'solana')?.id ?? null;
     ref.orderId = signature;
     // Landed: the fill is what the position moved by, read from a snapshot that includes the transaction's slot.
+    const slot = signature === null ? null : await this.#landedSlot(signature);
+    if (slot === null) {
+      return {
+        kind: 'unknown', ref, expiresAt: null,
+        error: new Error(`phoenix ${this.symbol}: the IOC ${signature ?? '(no signature)'} landed, but the slot it landed in is unknown: no snapshot can be proven to show it`),
+      };
+    }
+    this.#minSlot = Math.max(this.#minSlot, slot);
     try {
-      const slot = signature === null ? null : await this.#o.chain.signatureSlot(signature);
-      if (slot !== null) this.#minSlot = Math.max(this.#minSlot, slot);
       const after = await this.position();
       const moved = after - before;
-      if (moved === 0n) return { kind: 'failed', error: new NothingExecuted('phoenix', `the IOC ${signature} landed but did not fill`, tx), ref };
+      if (moved === 0n) return { kind: 'failed', error: new NothingExecuted('phoenix', `the IOC ${signature} landed at slot ${slot} but did not fill`, tx), ref };
       if ((side === 'BUY') !== (moved > 0n)) {
         return { kind: 'unknown', error: new Error(`phoenix ${this.symbol}: the position moved ${signedQtyString(moved)} against a ${side} (something else traded it)`), ref, expiresAt: this.#clock.now() };
       }
       const filled = moved > 0n ? moved : -moved;
-      const fills = signature === null ? null : await this.#fills(signature);
+      const fills = await this.#fills(signature!);
       return { kind: 'filled', filled, avgPx: fills?.avgPx ?? null, fee: fills?.feeUsd ?? null, ref };
     } catch (err) {
-      // The transaction is final; only its effect is unread. The pair reads the position again.
+      // The transaction is final; only its effect is unread. The pair reads the position again (past the slot).
       return { kind: 'unknown', error: new Error(`phoenix ${this.symbol}: the IOC ${signature} landed, but the position could not be read after it: ${errorText(err)}`), ref, expiresAt: this.#clock.now() };
+    }
+  }
+
+  /** The unsigned IOC message of `plan` on a fresh blockhash: what order() signs, and what a dry run simulates. */
+  async message(plan: PhoenixIocPlan): Promise<{ message: Uint8Array; lastValidBlockHeight: number }> {
+    const { blockhash, lastValidBlockHeight } = await this.#o.chain.latestBlockhash();
+    const order = { side: plan.side, priceInTicks: plan.ticks, numBaseLots: plan.lots, reduceOnly: plan.reduceOnly };
+    return { message: orderMessage(this.#exchange, this.#o.desk, this.#o.market, order, blockhash, this.#budget), lastValidBlockHeight };
+  }
+
+  /** The slot a landed transaction is in: the submitter's confirmed status, else the RPC, polled for slotWaitMs. */
+  async #landedSlot(signature: string): Promise<number | null> {
+    const known = this.#o.landedSlot?.(signature) ?? null;
+    if (known !== null) return known;
+    const until = this.#clock.now() + (this.#o.slotWaitMs ?? 15_000);
+    for (;;) {
+      try {
+        const slot = await this.#o.chain.signatureSlot(signature);
+        if (slot !== null) return slot;
+      } catch {
+        // an RPC read that failed: tried again
+      }
+      if (this.#clock.now() >= until) return null;
+      await this.#sleep(1_000);
     }
   }
 
@@ -268,15 +327,21 @@ export class PhoenixLeg implements TradeLeg {
   async cancelAll(reason: string): Promise<TxRef[]> {
     const build: SolanaMessageBuilder = async () => {
       const { blockhash, lastValidBlockHeight } = await this.#o.chain.latestBlockhash();
-      return { messageB64: Buffer.from(cancelAllMessage(this.#exchange, this.#o.desk, this.#o.market, blockhash)).toString('base64'), lastValidBlockHeight };
+      return { messageB64: Buffer.from(cancelAllMessage(this.#exchange, this.#o.desk, this.#o.market, blockhash, this.#budget)).toString('base64'), lastValidBlockHeight };
     };
     return this.#o.relayer.solSign(build, reason);
   }
 
-  /** When no copy of an order with no answer can land: once the chain is proven past its lastValidBlockHeight. */
+  /**
+   * When no copy of an order with no answer can land: once the chain is proven past its lastValidBlockHeight. The
+   * slot that height was read at becomes the oldest snapshot the leg trusts: one before it may miss a late landing.
+   */
   async #expiry(height: number | undefined): Promise<number | null> {
     if (height === undefined) return null;
-    return (await this.#o.waitPastLastValidHeight(height)) ? this.#clock.now() : null;
+    const slot = await this.#o.waitPastLastValidHeight(height);
+    if (slot === null) return null;
+    this.#minSlot = Math.max(this.#minSlot, slot);
+    return this.#clock.now();
   }
 
   /** The transaction's fills from trades-history; the API indexes a few seconds behind the chain. */
@@ -314,6 +379,18 @@ export function phoenixTraderApi(apiUrl: string, fetchImpl: typeof fetch = fetch
       }
     },
   };
+}
+
+/** max(limit, oracle) in USD × 1e8: the price the contract values an order's notional at. */
+function maxE8(limitE8: bigint, oracle: number | null): bigint {
+  if (oracle === null) return limitE8;
+  const o = BigInt(Math.round(oracle * 1e8));
+  return o > limitE8 ? o : limitE8;
+}
+
+/** A USD amount in the units of size (1e-8) × price (1e-8): 1e-16 USD. */
+function usdE16(usd: number): bigint {
+  return BigInt(Math.round(usd * 1e8)) * 100_000_000n;
 }
 
 function errorText(err: unknown): string {

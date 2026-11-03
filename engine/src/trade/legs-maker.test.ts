@@ -1,6 +1,7 @@
 // Hyperliquid's maker order against a fake venue: a post-only (Alo) limit at the touch, read by orderStatus, cancelled
 // and placed again at the new touch after repriceMs, an Alo refused for crossing placed again, an IOC for what is left
-// after timeoutMs, fees from userFills, and a post-only order whose state cannot be settled reported unknown.
+// after timeoutMs, fees from userFills, and a post-only order whose state cannot be settled reported unknown. A status
+// read that throws never leaves the order resting: it is cancelled and read again; at most maxOrders are signed.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -9,7 +10,8 @@ import { OutcomeUnknown } from '../contract/types.ts';
 import type { HlOrder } from '../contract/types.ts';
 import type { HlFill, HlSubmitResult } from '../relayer/hyperliquid.ts';
 import { NothingExecuted } from '../relayer/tx.ts';
-import { HlLeg } from './legs.ts';
+import type { MakerSettings } from './legs.ts';
+import { DEFAULT_MAKER, HlLeg } from './legs.ts';
 import { toQty } from './lots.ts';
 
 const NEAR_TX: TxRef = { chain: 'near', id: 'NEARTX', url: 'https://nearblocks.io/txns/NEARTX' };
@@ -20,14 +22,16 @@ interface Rest {
   fillAtOnce?: boolean;          // filled in full at the first status read
   refuse?: 'cross';              // Hyperliquid refuses the Alo: it would have crossed
   lost?: boolean;                // the submission's answer is lost (no expiry)
+  statusErrors?: number;         // this many orderStatus reads of it throw first (a 429)
+  statusDown?: boolean;          // every orderStatus read of it throws
 }
 
-function venue(rests: Rest[], book = { bid: 2499, ask: 2500 }, ioc: string | null = null) {
+function venue(rests: Rest[], book = { bid: 2499, ask: 2500 }, ioc: string | null = null, maker: Partial<MakerSettings> = {}) {
   let now = 1_000_000;
   let oid = 100;
   const orders: HlOrder[] = [];
   const cancels: number[] = [];
-  const status = new Map<number, { sz: string; origSz: string; status: string; limitPx: string; full: boolean; fill: string }>();
+  const status = new Map<number, { sz: string; origSz: string; status: string; limitPx: string; full: boolean; fill: string; errors: number; down: boolean }>();
   const fills: HlFill[] = [];
   const result = (o: number, filled: { totalSz: string; avgPx: string } | null, resting: boolean): HlSubmitResult => ({
     kind: 'order', statuses: [], oid: o, filled, resting, fills: [], tx: [NEAR_TX], confirmed: true, expiresAfter: now + 60_000,
@@ -47,7 +51,7 @@ function venue(rests: Rest[], book = { bid: 2499, ask: 2500 }, ioc: string | nul
         if (rest.refuse === 'cross') throw new NothingExecuted('hyperliquid', 'Post only order would have immediately matched', [NEAR_TX]);
         if (rest.lost) throw new OutcomeUnknown('hyperliquid order', 'no answer', { hlCloid: order.cloid! });
         const o = ++oid;
-        status.set(o, { sz: order.sz, origSz: order.sz, status: 'open', limitPx: order.px, full: rest.fillAtOnce === true, fill: rest.fills });
+        status.set(o, { sz: order.sz, origSz: order.sz, status: 'open', limitPx: order.px, full: rest.fillAtOnce === true, fill: rest.fills, errors: rest.statusErrors ?? 0, down: rest.statusDown === true });
         return result(o, null, true);
       },
       hlCancel: async (_asset, o) => {
@@ -64,6 +68,11 @@ function venue(rests: Rest[], book = { bid: 2499, ask: 2500 }, ioc: string | nul
       if (body.type === 'orderStatus') {
         const st = status.get(Number(body.oid));
         if (st === undefined) return { status: 'unknownOid' };
+        if (st.down) throw new Error('hyperliquid /info: HTTP 429');
+        if (st.errors > 0) {
+          st.errors--;
+          throw new Error('hyperliquid /info: HTTP 502');
+        }
         if (st.full && st.status === 'open') {
           st.status = 'filled';
           fills.push({ coin: 'ETH', px: st.limitPx, sz: st.origSz, side: 'B', time: now, hash: '0x3', oid: Number(body.oid), fee: '-0.001' });
@@ -76,7 +85,7 @@ function venue(rests: Rest[], book = { bid: 2499, ask: 2500 }, ioc: string | nul
     },
     user: '0xABC', coin: 'ETH', asset: 1, szDecimals: 4, oraclePx: async () => 2500, bandBps: 100, maxNotionalUsd: 50,
     bestPx: async (side) => (side === 'BUY' ? book.ask : book.bid),
-    maker: { repriceMs: 5_000, timeoutMs: 10_000, takerFallback: true, pollMs: 1_000 },
+    maker: { repriceMs: 5_000, timeoutMs: 10_000, takerFallback: true, pollMs: 1_000, ...maker },
     clock: { now: () => now },
     sleep: async (ms) => {
       now += ms;
@@ -122,4 +131,30 @@ test('no fill and no fallback taker fill: failed with proof; a post-only order w
   assert.equal(u.kind, 'unknown');
   assert.ok(u.kind === 'unknown' && u.expiresAt === null);
   assert.equal(lost.orders.length, 1, 'nothing more is sent after an order that may still rest');
+});
+
+test('a status read that throws: the order is cancelled and read again, never left resting; one that keeps throwing is unknown', async () => {
+  // The first read fails (a 502): cancelled at once, then read: it had filled 0.005 by then.
+  const flaky = venue([{ fills: '0.005', statusErrors: 1 }]);
+  const out = await flaky.leg.makerOrder('BUY', toQty('0.005'), false, 'open');
+  assert.equal(out.kind, 'filled');
+  assert.equal(flaky.cancels.length, 1);
+
+  const down = venue([{ fills: '0', statusDown: true }]);
+  const u = await down.leg.makerOrder('BUY', toQty('0.005'), false, 'open');
+  assert.ok(u.kind === 'unknown' && u.expiresAt === null, 'cannot be settled: it may still rest');
+  assert.equal(down.cancels.length, 2, 'cancelled twice anyway');
+  assert.equal(down.orders.length, 1, 'nothing more is sent');
+  assert.equal(u.ref.clientId, down.orders[0]!.cloid, 'the summary names the order to reconcile');
+  assert.deepEqual(down.leg.pendingMakerOrders().map((p) => p.cloid), [down.orders[0]!.cloid]);
+  const lines = await down.leg.cancelPending('exit');
+  assert.match(lines[0]!, /status cannot be read .*by hand/);
+});
+
+test('at most maxOrders post-only orders are signed, crossing refusals included; the taker fallback is off by default', async () => {
+  const v = venue([{ fills: '0', refuse: 'cross' }, { fills: '0' }, { fills: '0' }, { fills: '0' }], undefined, null, { maxOrders: 2, timeoutMs: 600_000 });
+  const out = await v.leg.makerOrder('SELL', toQty('0.005'), false, 'open');
+  assert.equal(out.kind, 'failed');
+  assert.deepEqual(v.orders.map((o) => o.tif), ['Alo', 'Alo', 'Ioc']);
+  assert.deepEqual([DEFAULT_MAKER.takerFallback, DEFAULT_MAKER.repriceMs, DEFAULT_MAKER.maxOrders], [false, 30_000, 6]);
 });

@@ -866,18 +866,32 @@ node --env-file=... engine/src/cli/pair-mainnet.ts close ETH
 ```
 
 - Every Phoenix transaction is one legacy message signed by `sol_sign` (compute budget first, fee at most 600,000
-  lamports); the money moves print the message, its instructions and a simulation. The desk authority pays the
-  Solana fees, so it needs SOL: `status` prints the balance and every command says how much more to send.
-- Before the first deposit the desk's Phoenix trader must be registered (`phoenix_register` in the venue setup, signed with `sol_sign_register`).
+  lamports; orders at the 600k unit limit and `--priority-microlamports`, default 100,000, at most 200,000). The money
+  moves print the message, its instructions and a simulation, and refuse at `--send` when the simulation fails or
+  did not run. The desk authority pays the Solana fees, so it needs SOL: `status` prints the balance and every
+  command says how much more to send.
+- Before the first deposit the desk's Phoenix trader must be registered (`phoenix_register` in the venue setup,
+  signed with `sol_sign_register`). `defund-phoenix all` refuses while Phoenix holds a position; an amount must leave
+  the open leg under its leverage cap and more than 40 % from liquidation.
 - `open` prints both legs' funding (now and the 7-day mean), the gross APR, the spread expected over `--hold-days`
-  against the round trip (taker fees, half spreads, `--basis-bps`), the size, and the liquidation distance per leg,
-  and refuses when the spread does not cover the round trip or a leg is 40 % or less from liquidation. The
-  Hyperliquid short goes first as post-only limits at the touch (`--reprice-s`, `--maker-timeout-s`, then an IOC
-  unless `--no-taker-fallback`); the Phoenix long follows as one IOC for what filled. A pair over
-  `max_notional_usd` is opened in whole parts. `close` does the same reduce-only.
-- The contract has no update-leverage action: Hyperliquid keeps the account's own leverage for the coin, and
-  `--leverage` is the collateral each leg must hold (legUsd / leverage), checked, not set.
-- An outcome that cannot be proven ends with `open:` lines (exit code 3): reconcile those before running again.
+  against the round trip (taker fees, half spreads, `--basis-bps`), the size, the effective leverage and the
+  liquidation distance per leg, and simulates the Phoenix IOC unsigned. It refuses when the spread does not cover the
+  round trip, a leg is 40 % or less from liquidation, legUsd is over `max_notional_usd` less the band (19.80 at 20 and
+  100 bps), the IOC simulation fails or uses more than 560k units, the policy's Phoenix market differs from the
+  exchange's (orderbook, spline, lot, tick), or the Hyperliquid coin is not in cross margin.
+- Leverage: the contract has no update-leverage action, so Hyperliquid keeps the account's own setting. What is
+  checked is each leg's effective leverage, (notional already open + legUsd) / equity: at most `--leverage` (2 or
+  less), and at most 1.5 on a venue without a live rescue (`LIVE_RESCUE` in `engine/src/trade/carry-plan.ts`:
+  Phoenix until the Phoenix -> Hyperliquid rescue merges).
+- The Hyperliquid short goes first as post-only limits at the touch: repriced every `--reprice-s` (30 or more), at
+  most `--max-orders` signed post-only orders (6 or fewer: from C10 the contract meters signed notional that is not
+  reduce-only per rolling hour, and every reprice counts), for `--maker-timeout-s` (default 180); an IOC for the rest
+  only with `--taker-fallback`. The Phoenix long follows as one IOC for what filled. `close` does the same
+  reduce-only, and what the maker leg leaves goes to the close's IOC retry.
+- The stored price is refreshed (`refresh_prices`) before each part when it would not live the maker timeout plus
+  240 s more, and whenever an order (an unwind, a close) finds it within 30 s of `oracle_max_age_s`.
+- An outcome that cannot be proven ends with `open:` lines (exit code 3): reconcile those before running again. A
+  post-only order whose state could not be settled is cancelled by its id once more before the process ends.
 
 ## Files the scripts write
 

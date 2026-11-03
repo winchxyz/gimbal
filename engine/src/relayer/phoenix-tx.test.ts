@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import type { DeskSolanaAccounts } from './phoenix-withdraw.ts';
 import type { PhoenixMarketAccounts } from './phoenix-tx.ts';
 import {
-  ORDER_COMPUTE_UNITS, PHOENIX_MAINNET, REDUCE_ONLY_FLAG, cancelAllMessage, depositMessage, exchangeMismatches, iocPacket, orderMessage,
+  ORDER_COMPUTE_UNITS, PHOENIX_MAINNET, REDUCE_ONLY_FLAG, cancelAllMessage, depositMessage, exchangeMismatches, iocPacket, marketMismatches, orderMessage,
   priorityFeeLamports, splineOf,
 } from './phoenix-tx.ts';
 import { parseMessage } from './solana.ts';
@@ -105,6 +105,35 @@ test('an order message takes the contract\'s 600k unit cap at a fee the contract
   assert.deepEqual([m.version, m.signers, m.keys[0], m.computeUnitLimit, m.computeUnitPrice], ['legacy', 1, DESK.authority, ORDER_COMPUTE_UNITS, 100_000n]);
   assert.equal(priorityFeeLamports({ units: ORDER_COMPUTE_UNITS, microLamports: 100_000 }), 60_000);
   assert.ok(priorityFeeLamports({ units: ORDER_COMPUTE_UNITS, microLamports: 100_000 }) <= 600_000);
+});
+
+test('with the production budget (600k units) every order is the vector order but for its unit limit', () => {
+  // SetComputeUnitLimit is 02 + u32 LE: 400,000 = 80 1a 06 00, 600,000 = c0 27 09 00. Nothing else may differ.
+  const at600k = (vectorHex: string) => {
+    assert.equal(vectorHex.split('02801a0600').length, 2, 'one unit limit of 400k in the vector');
+    return vectorHex.replace('02801a0600', '02c0270900');
+  };
+  const cases: [VectorCase, PhoenixMarketAccounts, 'BUY' | 'SELL', bigint, bigint, boolean][] = [
+    [byName(SOL.cases, 'IOC buy 0.005 ETH, limit 2474.5 (+1%)'), ETH, 'BUY', 24_745n, 5n, false],
+    [byName(SOL.cases, 'IOC sell 0.005 ETH, limit 2425.5 (-1%)'), ETH, 'SELL', 24_255n, 5n, false],
+    [byName(SOL.cases, 'IOC buy 0.1 SOL, limit 104.84'), SOL_MARKET, 'BUY', 10_484n, 10n, false],
+    [byName(REVIEW.cases, 'review 3: a reduce-only IOC sell'), ETH, 'SELL', 24_255n, 5n, true],
+  ];
+  for (const [c, market, side, ticks, lots, reduceOnly] of cases) {
+    assert.equal(hex(orderMessage(PHOENIX_MAINNET, DESK, market, { side, priceInTicks: ticks, numBaseLots: lots, reduceOnly }, BLOCKHASH)), at600k(c.message_hex), c.name);
+  }
+  assert.equal(hex(cancelAllMessage(PHOENIX_MAINNET, DESK, ETH, BLOCKHASH)), at600k(byName(SOL.cases, 'cancel all ETH').message_hex));
+});
+
+test('the policy market against the live exchange market: orderbook, lot and tick', () => {
+  const live = { symbol: 'ETH', marketPubkey: ETH.orderbook, splinePubkey: ETH.spline, tickSize: 100, baseLotsDecimals: 3, marketStatus: 'active' };
+  const policy = { symbol: 'ETH', orderbook: ETH.orderbook, base_lot_e8: 100_000, tick_e8: 10_000_000 };
+  assert.deepEqual(marketMismatches(live, policy, ETH.spline), []);
+  const moved = marketMismatches({ ...live, tickSize: 1000, baseLotsDecimals: 4 }, policy);
+  assert.deepEqual(moved.map((m) => m.replace(/:.*?(base_lot_e8|tick_e8)/, ': $1')), [
+    'phoenix ETH: base_lot_e8 is 100000, the exchange\'s lot 10000', 'phoenix ETH: tick_e8 is 10000000, the exchange\'s tick 1000000000',
+  ]);
+  assert.match(marketMismatches(undefined, policy).join(), /no such market/);
 });
 
 test('an IOC with no lots or no price is refused before anything is built', () => {

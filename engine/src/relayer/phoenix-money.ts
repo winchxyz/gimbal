@@ -197,10 +197,15 @@ async function finish(plan: MoneyPlan, ctx: MoneyContext): Promise<MoneyPlan> {
   const m = parseMessage(plan.message);
   if (m.signers !== 1 || m.keys[0] !== ctx.desk.authority) throw new Error(`the ${plan.kind} message is not signed by the desk authority alone`);
   // A simulation of a step that is refused anyway still shows what the chain says; it never signs anything.
+  // A step whose simulation fails, or could not be run, is refused: the chain would most likely fail it too, and the
+  // fee would be paid for nothing.
   try {
     plan.simulation = await ctx.chain.simulate(plan.message);
   } catch (err) {
-    plan.notes.push(`simulation not run: ${(err as Error).message}`);
+    plan.refusals.push(`the ${plan.kind} could not be simulated (${(err as Error).message}): nothing is signed unsimulated`);
+  }
+  if (plan.simulation !== null && plan.simulation.err !== null) {
+    plan.refusals.push(`the ${plan.kind} fails in simulation (${JSON.stringify(plan.simulation.err)}): see the logs`);
   }
   return plan;
 }

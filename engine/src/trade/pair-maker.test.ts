@@ -12,7 +12,7 @@ import type { LegOutcome, LegRef, LegSide, TradeLeg } from './legs.ts';
 import { lotQty, toQty } from './lots.ts';
 import { PairTrader } from './pair.ts';
 
-type Answer = { fill: string; fee?: number } | 'fail' | 'unknown-none';
+type Answer = { fill: string; fee?: number } | 'fail' | 'unknown-none' | { partial: string; late?: string };
 
 class Leg implements TradeLeg {
   readonly venue: VenueId;
@@ -54,6 +54,14 @@ class Leg implements TradeLeg {
     const ref: LegRef = { venue: this.venue, side, size: String(size), reduceOnly, orderId: `${this.venue}-${++this.#seq}`, clientId: null, tx: [], sentAt: 0 };
     if (a === 'fail') return { kind: 'failed', error: new NothingExecuted(this.venue, 'no match'), ref };
     if (a === 'unknown-none') return { kind: 'unknown', error: new OutcomeUnknown(this.venue, 'no answer', {}), ref, expiresAt: null };
+    if ('partial' in a) {
+      // A maker order whose first post-only order filled `partial`, and whose second has no answer and no expiry:
+      // it may have filled `late` already when the leg is read.
+      const p = toQty(a.partial) + (a.late === undefined ? 0n : toQty(a.late));
+      this.pos += side === 'BUY' ? p : -p;
+      const part: LegOutcome = { kind: 'filled', filled: toQty(a.partial), avgPx: 2500, fee: 0.001, ref: { ...ref, orderId: `${this.venue}-p` } };
+      return { kind: 'unknown', error: new OutcomeUnknown(this.venue, 'no answer', {}), ref, expiresAt: null, parts: [part, { kind: 'unknown', error: new Error('x'), ref, expiresAt: null }] };
+    }
     const filled = a.fill === 'all' ? size : toQty(a.fill);
     this.pos += side === 'BUY' ? filled : -filled;
     return { kind: 'filled', filled, avgPx: 2500, fee: a.fee ?? 0.01, ref };
@@ -128,4 +136,32 @@ test('an open over the cap is split into whole pairs under the cap less the band
   const results = await p.trader.openInChunks({ size: '0.012', longIndex: 1, reason: 'carry', maker: { index: 0 } });
   assert.deepEqual(results.map((r) => [r.status, r.size]), [['open', '0.007'], ['open', '0.005']]);
   assert.deepEqual([p.a.pos, p.b.pos], [toQty('-0.012'), toQty('0.012')]);
+});
+
+test('a maker leg that partly filled, then lost an order with no expiry: unsettled whatever it reads, the partner never trades', async () => {
+  for (const late of [undefined, '0.001']) {
+    const p = pair({ makers: [{ partial: '0.002', ...(late === undefined ? {} : { late }) }] }, {});
+    const r = await p.trader.open({ size: '0.005', longIndex: 1, reason: 'carry', maker: { index: 0 } });
+    assert.equal(r.status, 'unhedged', `late ${late}`);
+    assert.deepEqual(p.log, ['hyperliquid maker SELL 0.005'], 'Phoenix is not sized to a fill that may still grow');
+    assert.notEqual(p.trader.unsettled(p.a), null, 'watched: the lost order may still fill');
+    assert.ok(r.notes.some((n) => /no answer and no expiry/.test(n)));
+    assert.notEqual(p.trader.unhedged, null);
+  }
+});
+
+test('a stale price mid-pair: the hook before each part refreshes it; one that fails stops the open before that part', async () => {
+  const p = pair({}, { cap: '0.008' });
+  const calls: string[] = [];
+  const results = await p.trader.openInChunks({
+    size: '0.012', longIndex: 1, reason: 'carry', maker: { index: 0 },
+    beforePart: async (part, parts) => {
+      calls.push(`${part}/${parts}`);
+      if (part === 2) throw new Error('refresh_prices did not leave a fresh ETH price');
+    },
+  });
+  assert.deepEqual(calls, ['1/2', '2/2']);
+  assert.deepEqual(results.map((r) => r.status), ['open', 'stuck']);
+  assert.match(results[1]!.notes.join(), /part 2 of 2 not sent: refresh_prices did not leave a fresh ETH price/);
+  assert.deepEqual([p.a.pos, p.b.pos], [toQty('-0.007'), toQty('0.007')], 'the first part stays hedged');
 });

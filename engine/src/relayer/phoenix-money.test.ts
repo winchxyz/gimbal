@@ -76,6 +76,15 @@ test('a withdrawal of all takes what Phoenix lets the trader withdraw; over it i
   assert.match(over.refusals.join(), /lets the trader withdraw 10\.000000 now/);
 });
 
+test('a step whose simulation fails, or cannot be run, is refused', async () => {
+  const failing = { ...chain({ sol: 10_000_000, usdc: 20_000_000n, phusd: 0n, trader: true }), simulate: async () => ({ err: { InstructionError: [4, 'Custom'] }, unitsConsumed: 9, logs: [] }) };
+  assert.match((await planDeposit(ctx(failing), 15_000_000n)).refusals.join(), /fails in simulation \({"InstructionError":\[4,"Custom"\]}\)/);
+  const down = { ...chain({ sol: 10_000_000, usdc: 20_000_000n, phusd: 0n, trader: true }), simulate: async () => { throw new Error('HTTP 503'); } };
+  const plan = await planWithdraw(ctx(down, { withdrawable: async () => 10_000_000n }), 'all');
+  assert.match(plan.refusals.join(), /could not be simulated \(HTTP 503\)/);
+  await assert.rejects(sendPlan(plan, ctx(down), { solSign: async () => [] }, 'defund'), /refused, nothing signed/);
+});
+
 test('sending a plan: the planned message first, a fresh one on the relayer\'s second ask', async () => {
   const c = chain({ sol: 10_000_000, usdc: 20_000_000n, phusd: 0n, trader: true });
   const plan = await planDeposit(ctx(c), 15_000_000n);

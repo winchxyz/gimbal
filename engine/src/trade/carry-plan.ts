@@ -10,10 +10,27 @@
 //   liquidation distance per leg = (equity − maintenance already used − legUsd × maintenance rate) / legUsd: how far
 //     the price may move against the new leg before the venue's maintenance is reached, with the leg's cross equity
 //     as it is now (approximate: other positions are held still).
-// The open is refused when the spread does not cover the round trip, a leg's distance is 40 % or less, or a leg's
-// equity is under legUsd / leverage (the collateral the operator asked for).
+//   effective leverage per leg = (notional the account already holds + legUsd) / equity.
+// The open is refused when the spread does not cover the round trip, a leg's distance is 40 % or less, the asked
+// leverage is over MAX_LEVERAGE, or a leg's effective leverage is over the asked leverage or its venue's cap
+// (venueMaxLeverage).
 
 export const MIN_LIQUIDATION_DISTANCE = 0.4;
+/** The most leverage any leg may run at, whatever is asked. */
+export const MAX_LEVERAGE = 2;
+/** The cap of a leg on a venue without a live rescue. */
+export const NO_RESCUE_MAX_LEVERAGE = 1.5;
+/**
+ * Whether the contract can rescue a venue's collateral to the other leg's venue in an emergency. A venue without a
+ * live rescue is held to NO_RESCUE_MAX_LEVERAGE: Phoenix until the Phoenix -> Hyperliquid rescue merges, Orderly after
+ * it. Flip an entry to true when its rescue is live on the contract the desk runs.
+ */
+export const LIVE_RESCUE: Record<string, boolean> = { hyperliquid: true, phoenix: false, orderly: false };
+
+/** The most leverage a leg on `venue` may run at. */
+export function venueMaxLeverage(venue: string): number {
+  return LIVE_RESCUE[venue] === true ? MAX_LEVERAGE : NO_RESCUE_MAX_LEVERAGE;
+}
 const HOURS_PER_YEAR = 8760;
 
 export interface CarryLegInput {
@@ -28,6 +45,8 @@ export interface CarryLegInput {
   /** The venue account's equity and the maintenance margin its positions use now, USD. */
   equityUsd: number;
   maintenanceUsd: number;
+  /** The notional of every position the account holds now, USD (its effective leverage counts them). */
+  notionalUsd: number;
   /** Maintenance margin as a fraction of notional for this market (Hyperliquid: 1 / (2 × max leverage)). */
   maintenanceRate: number;
 }
@@ -47,6 +66,8 @@ export interface CarryLegPlan {
   side: 'short' | 'long';
   collateralUsd: number;         // legUsd / leverage
   liquidationDistance: number;   // fraction of the price
+  effectiveLeverage: number;     // (notionalUsd + legUsd) / equity; Infinity with no equity
+  maxLeverage: number;           // min(asked, the venue's cap)
 }
 
 export interface CarryPlan {
@@ -72,15 +93,21 @@ export function carryPlan(input: CarryInput): CarryPlan {
   const leg = (l: CarryLegInput, side: 'short' | 'long'): CarryLegPlan => ({
     venue: l.venue, side, collateralUsd: input.legUsd / input.leverage,
     liquidationDistance: (l.equityUsd - l.maintenanceUsd - input.legUsd * l.maintenanceRate) / input.legUsd,
+    effectiveLeverage: l.equityUsd > 0 ? (l.notionalUsd + input.legUsd) / l.equityUsd : Infinity,
+    maxLeverage: Math.min(input.leverage, venueMaxLeverage(l.venue)),
   });
   const legs: [CarryLegPlan, CarryLegPlan] = [leg(short, 'short'), leg(long, 'long')];
   const refusals: string[] = [];
   if (!(expectedSpreadUsd > roundTripUsd)) {
     refusals.push(`the expected spread over ${input.holdDays} days, ${usd(expectedSpreadUsd)}, does not cover the round trip ${usd(roundTripUsd)} (${roundTripBps.toFixed(1)} bps)`);
   }
+  if (input.leverage > MAX_LEVERAGE) refusals.push(`--leverage ${input.leverage} is over the ${MAX_LEVERAGE}x every leg is held to`);
   for (const [i, l] of legs.entries()) {
     const src = i === 0 ? short : long;
-    if (src.equityUsd < l.collateralUsd) refusals.push(`${l.venue} holds ${usd(src.equityUsd)} of equity, under the ${usd(l.collateralUsd)} a ${input.leverage}x leg of ${usd(input.legUsd)} needs: fund it first`);
+    if (!(l.effectiveLeverage <= l.maxLeverage)) {
+      const cap = l.maxLeverage < input.leverage ? `its venue's ${l.maxLeverage}x cap (${LIVE_RESCUE[l.venue] === true ? 'live rescue' : 'no live rescue'})` : `the ${input.leverage}x asked`;
+      refusals.push(`${l.venue}: ${usd(src.notionalUsd)} already open plus the ${usd(input.legUsd)} leg on ${usd(src.equityUsd)} of equity is ${Number.isFinite(l.effectiveLeverage) ? `${l.effectiveLeverage.toFixed(2)}x` : 'unbounded (no equity)'}, over ${cap}: fund it with at least ${usd((src.notionalUsd + input.legUsd) / l.maxLeverage - src.equityUsd)} more`);
+    }
     if (!(l.liquidationDistance > MIN_LIQUIDATION_DISTANCE)) {
       refusals.push(`${l.venue}: the ${l.side} leg would be liquidated ${pct(l.liquidationDistance)} away, not more than ${pct(MIN_LIQUIDATION_DISTANCE)}`);
     }
