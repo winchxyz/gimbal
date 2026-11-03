@@ -242,6 +242,33 @@ test('history: the scanner\'s legs of one window share one all-market request; a
   assert.equal(count('/v1/funding/overview/NOPE'), 1);
 });
 
+test('history: a batch whose every series was cut short from the newest end is not trusted: each market is asked for alone', async () => {
+  type Series = { symbol: string; points: { timestamp: number }[] };
+  const recorded = LINES.find((l) => l.url.includes('/v1/funding/overview'))!.response as { series: Series[] };
+  const last = recorded.series.find((s) => s.symbol === 'SOL')!.points.at(-1)!.timestamp;
+  const hoursBack = (s: Series, ks: number[]): Series => ({ ...s, points: ks.map((k) => ({ ...s.points.at(-1)!, timestamp: last - k * 3600 })) });
+  // Six hours asked; every series in the batch holds only the oldest two of them, so each looks complete up to the
+  // batch's newest booking, four hours before the end.
+  const batch = { series: recorded.series.map((s) => hoursBack(s, [5, 4])) };
+  const { f, count } = fakeFetch((url) => {
+    if (url.pathname === '/v1/funding/overview' && url.searchParams.has('startTime')) return new Response(JSON.stringify(batch), { status: 200 });
+    if (url.pathname.startsWith('/v1/funding/overview/')) {
+      const one = recorded.series.find((s) => s.symbol === decodeURIComponent(url.pathname.split('/').at(-1)!))!;
+      return new Response(JSON.stringify(hoursBack(one, [5, 4, 3, 2, 1, 0])), { status: 200 });
+    }
+    return undefined;
+  });
+  const { reader: r } = reader(f, {}, new VirtualClock(last * 1000 + 1_800_000));
+  const start = (last - 5 * 3600) * 1000;
+  const end = last * 1000 + 1_800_000;
+  const [sol, eth] = await Promise.all(['SOL', 'ETH'].map((s) => scanRead(() => r.marketFundingHistory(s, start, end))));
+  assert.equal(sol!.length, 6);
+  assert.equal(eth!.length, 6);
+  assert.equal(count('/v1/funding/overview?'), 1);
+  assert.equal(count('/v1/funding/overview/SOL'), 1);
+  assert.equal(count('/v1/funding/overview/ETH'), 1);
+});
+
 test('history outside the scanner (pair-mainnet, one symbol): asked for alone, the all-market batch never downloaded', async () => {
   const recorded = LINES.find((l) => l.url.includes('/v1/funding/overview'))!.response as { series: { symbol: string; points: { timestamp: number }[] }[] };
   const sol = recorded.series.find((s) => s.symbol === 'SOL')!;

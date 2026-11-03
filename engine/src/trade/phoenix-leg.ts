@@ -32,7 +32,8 @@ import {
 import type { DeskSolanaAccounts, PhoenixExchangeAccounts } from '../relayer/phoenix-withdraw.ts';
 import { NothingExecuted } from '../relayer/tx.ts';
 import type { HostBudget } from '../venues/http-budget.ts';
-import { PHOENIX_BUDGET, hostBudget, readClass, requestTimeoutMs } from '../venues/http-budget.ts';
+import { PHOENIX_BUDGET, hostBudget } from '../venues/http-budget.ts';
+import { phoenixGet } from '../venues/phoenix.ts';
 import type { Clock } from '../venues/venue.ts';
 import { systemClock } from '../venues/venue.ts';
 import type { LegOutcome, LegRef, LegSide, TradeLeg } from './legs.ts';
@@ -398,16 +399,7 @@ export class PhoenixLeg implements TradeLeg {
 export function phoenixTraderApi(
   apiUrl: string, fetchImpl: typeof fetch = fetch, traderPdaIndex = 0, budget: HostBudget | null = hostBudget(apiUrl, PHOENIX_BUDGET),
 ): PhoenixTraderApi {
-  const base = apiUrl.replace(/\/+$/, '');
-  const get = async (path: string): Promise<unknown> => {
-    const send = () => fetchImpl(`${base}${path}`, {
-      method: 'GET', headers: { accept: 'application/json' }, signal: AbortSignal.timeout(requestTimeoutMs(10_000)),
-    });
-    const res = budget === null ? await send() : await budget.run(readClass('account'), send);
-    const body = await res.json().catch(() => null) as unknown;
-    if (!res.ok) throw new Error(`phoenix GET ${path}: HTTP ${res.status} ${JSON.stringify(body)?.slice(0, 160)}`);
-    return body;
-  };
+  const get = (path: string): Promise<unknown> => phoenixGet(apiUrl, path, { fetch: fetchImpl, budget });
   return {
     traderState: (authority) => get(`/v1/trader/state/${encodeURIComponent(authority)}?traderPdaIndex=${traderPdaIndex}`),
     tradesHistory: async (authority, limit) => {

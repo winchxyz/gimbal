@@ -13,6 +13,8 @@ import type { TxRef } from '@gimbal/shared';
 import type { SolSignedAction } from '../contract/types.ts';
 import { base58Decode, parseMessage, verifyEd25519 } from '../relayer/solana.ts';
 import { solanaTxRef } from '../relayer/tx.ts';
+import type { HostBudget } from '../venues/http-budget.ts';
+import { PHOENIX_BUDGET, hostBudget, readClass, requestTimeoutMs } from '../venues/http-budget.ts';
 
 export const PHOENIX_API = 'https://perp-api.phoenix.trade';
 /** register_trader's max_positions: the contract pins 128 (solana-onboarding.json). */
@@ -46,6 +48,8 @@ export interface PhoenixOnboardingOptions {
   apiUrl?: string;
   fetch?: typeof fetch;
   timeoutMs?: number;
+  /** Its GETs wait for this request budget; default the one every Phoenix reader of this API host shares; null: none. */
+  budget?: HostBudget | null;
 }
 
 export interface PhoenixRegisterResult {
@@ -140,10 +144,15 @@ export class PhoenixOnboarding {
     return { signature, nearTx: signed.nearTx === undefined ? [] : [signed.nearTx] };
   }
 
+  /** A GET through the host's budget, as a critical read (retried after a 429). */
   async #get<T>(path: string): Promise<T> {
-    return this.#answer<T>(await this.#fetch(`${this.#api}${path}`, { signal: AbortSignal.timeout(this.#o.timeoutMs ?? 15_000) }), `GET ${path}`);
+    const send = () => this.#fetch(`${this.#api}${path}`, { signal: AbortSignal.timeout(requestTimeoutMs(this.#o.timeoutMs ?? 15_000)) });
+    const budget = this.#o.budget === undefined ? hostBudget(this.#api, PHOENIX_BUDGET) : this.#o.budget;
+    return this.#answer<T>(budget === null ? await send() : await budget.run(readClass('account'), send), `GET ${path}`);
   }
 
+  // A POST is not budgeted: it is a one-off write of venue setup (build and send a register transaction, activate a
+  // referral), run once per desk by the owner's setup, and a write is never sent again on its own after a 429.
   async #post<T>(path: string, body: unknown): Promise<T> {
     const res = await this.#fetch(`${this.#api}${path}`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(this.#o.timeoutMs ?? 30_000),

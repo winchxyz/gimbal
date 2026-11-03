@@ -51,6 +51,9 @@ const OVERVIEW_FALLBACK_MS = 10 * 60_000;
 // outside the scanner (one symbol, pair-mainnet) asks for that symbol alone.
 const HISTORY_BATCH_TTL_MS = 10 * 60_000;
 const HISTORY_BATCHES_KEPT = 2;
+// The batch's newest booking must be at most this far before min(endTime, now): Phoenix books every hour, so an older
+// newest point means every series came back cut short from the newest end, and none of them is trusted.
+const BATCH_NEWEST_SLACK_MS = 2 * HOUR_MS;
 
 /** A Phoenix market, with what the desk's policy and fee model need on top of the shared shape. */
 export interface PhoenixMarket extends Market {
@@ -219,7 +222,7 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
     if (readClass('history') !== 'critical') {
       const batch = await this.#historyBatch(startTime, endTime, limit);
       const found = batch.series.find((s) => s.symbol === symbol);
-      if (found !== undefined && coversBatch(found, batch, startTime, endTime)) return parseFundingSeries(found, startTime, endTime);
+      if (found !== undefined && coversBatch(found, batch, startTime, endTime, this.#clock.now())) return parseFundingSeries(found, startTime, endTime);
     }
     let series: FundingOverviewSeries;
     try {
@@ -345,16 +348,48 @@ function shared<T>(entry: SharedRead<T>, again: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Whether the all-market batch carries every hour of `series` it should: as many points in [startTime, endTime] as
- * hours from startTime to the batch's newest booking in that range. Fewer means the market was listed since or its
- * series came back cut short; either way the per-symbol answer is the one to trust.
+ * Whether the all-market batch carries every hour of `series` it should. The batch's newest booking in [startTime,
+ * endTime] must be within BATCH_NEWEST_SLACK_MS of min(endTime, now) (older: every series was cut short from the
+ * newest end), and `series` must have as many points as there are hours from startTime to that booking (fewer: the
+ * market was listed since, or its series was cut short). Otherwise the per-symbol answer is the one to trust.
  */
-function coversBatch(series: FundingOverviewSeries, batch: FundingOverviewResponse, startTime: number, endTime: number): boolean {
+function coversBatch(series: FundingOverviewSeries, batch: FundingOverviewResponse, startTime: number, endTime: number, now: number): boolean {
   const inRange = (s: FundingOverviewSeries) => s.points.map((p) => phoenixTimeMs(p.timestamp)).filter((t) => t >= startTime && t <= endTime);
   let newest = -Infinity;
   for (const s of batch.series) for (const t of inRange(s)) newest = Math.max(newest, t);
-  if (newest === -Infinity) return true;
+  const due = Math.min(endTime, now) - BATCH_NEWEST_SLACK_MS;
+  if (newest === -Infinity) return due < startTime;
+  if (newest < due) return false;
   return new Set(inRange(series)).size >= Math.floor((newest - startTime) / HOUR_MS) + 1;
+}
+
+export interface PhoenixGetOptions {
+  /** Default the global fetch. */
+  fetch?: typeof fetch;
+  /** Default the budget every Phoenix reader of this API host in the process shares; null: none. */
+  budget?: HostBudget | null;
+  /** Per request (from when it is sent); default 10 s. */
+  timeoutMs?: number;
+}
+
+/**
+ * One GET of the Phoenix API, answered as JSON, for callers outside PhoenixReader (the trader API, the exchange
+ * snapshot pair-mainnet and serve check the pinned accounts against). It goes through the host's request budget as an
+ * `account` read: critical outside the scanner, so ahead of the scanner's reads, never skipped for them, retried after
+ * a 429 once Retry-After (capped) has passed, within the caller's deadline (readBy). A non-2xx throws
+ * `phoenix GET <path>: HTTP <status> <body>`.
+ */
+export async function phoenixGet<T = unknown>(apiUrl: string, path: string, options: PhoenixGetOptions = {}): Promise<T> {
+  const base = apiUrl.replace(/\/+$/, '');
+  const fetchImpl = options.fetch ?? ((input: string | URL | Request, init?: RequestInit) => globalThis.fetch(input, init));
+  const budget = options.budget === undefined ? hostBudget(base, PHOENIX_BUDGET) : options.budget;
+  const send = () => fetchImpl(`${base}${path}`, {
+    method: 'GET', headers: { accept: 'application/json' }, signal: AbortSignal.timeout(requestTimeoutMs(options.timeoutMs ?? 10_000)),
+  });
+  const res = budget === null ? await send() : await budget.run(readClass('account'), send);
+  const body = await res.json().catch(() => null) as unknown;
+  if (!res.ok) throw new Error(`phoenix GET ${path}: HTTP ${res.status} ${JSON.stringify(body)?.slice(0, 160)}`);
+  return body as T;
 }
 
 interface Clients {

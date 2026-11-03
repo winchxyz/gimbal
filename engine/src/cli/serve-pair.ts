@@ -51,7 +51,8 @@ import { GuardedLeg, InFlightBook, ProtectedPair, inFlightEnds, reconcileHow, st
 import type { TraderFileState, TraderLock } from '../trade/trader-state.ts';
 import { TRADER_STATE_VERSION, TraderStateStore, acquireTraderLock, traderLockPath, traderStateFile, userStateDir } from '../trade/trader-state.ts';
 import { HL_MAINNET_URL, HyperliquidReader } from '../venues/hyperliquid.ts';
-import { PHOENIX_API_URL, PhoenixReader, SOLANA_MAINNET_RPC_URL } from '../venues/phoenix.ts';
+import type { HostBudget } from '../venues/http-budget.ts';
+import { PHOENIX_API_URL, PhoenixReader, SOLANA_MAINNET_RPC_URL, phoenixGet } from '../venues/phoenix.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { Clock } from '../venues/venue.ts';
 import type { PriceDeps, StoredPrice } from './pair-mainnet-lib.ts';
@@ -506,6 +507,10 @@ export interface LiveLegsInput {
   maker: MakerSettings;
   slippageBps: number;
   microLamports: number;
+  /** Phoenix API requests (tests); default the global fetch, through the host's shared budget. */
+  phoenixFetch?: typeof fetch;
+  /** Default the budget every Phoenix reader of this API host in the process shares. */
+  phoenixBudget?: HostBudget | null;
 }
 
 export interface LiveLegs {
@@ -543,15 +548,19 @@ export async function buildLiveLegs(input: LiveLegsInput): Promise<LiveLegs> {
   const sol: DeskSolanaAccounts = { authority: desk.solana.authority, traderAccount: desk.solana.phoenix_trader, usdcAta: desk.solana.usdc_ata, phusdAta: desk.solana.phusd_ata };
   const phoenix = new PhoenixLeg({
     relayer, chain: input.chain, landedSlot: (sig) => input.solana.landedSlot(sig), waitPastLastValidHeight: (h) => input.solana.waitPastLastValidHeightSlot(h),
-    api: phoenixTraderApi(input.phoenixUrl), desk: sol,
+    api: phoenixTraderApi(input.phoenixUrl, input.phoenixFetch, 0, input.phoenixBudget),
+    desk: sol,
     market: { symbol, orderbook: market.orderbook, spline, baseLotE8: market.base_lot_e8, tickE8: market.tick_e8 },
     oraclePx, bandBps: p.price_band_bps, maxNotionalUsd, ...(unpriced === undefined ? {} : { maxSz: unpriced.max_sz }),
     bestPx: async (side) => best(await input.phoenix.book(symbol, 5), side, 'Phoenix'),
     slippageBps: input.slippageBps, microLamports: input.microLamports,
   });
-  const res = await fetch(`${input.phoenixUrl}/v1/exchange/snapshot`, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(20_000) });
-  if (!res.ok) throw new Error(`phoenix GET /v1/exchange/snapshot: HTTP ${res.status}`);
-  const snap = await res.json() as { exchange: Parameters<typeof exchangeMismatches>[0]; markets: (Parameters<typeof marketMismatches>[0] & { symbol: string })[] };
+  // Through the host's budget, retried after a 429: serve reads it once at startup, and a failure there stops serve.
+  const snap = await phoenixGet<{ exchange: Parameters<typeof exchangeMismatches>[0]; markets: (Parameters<typeof marketMismatches>[0] & { symbol: string })[] }>(
+    input.phoenixUrl, '/v1/exchange/snapshot', {
+      timeoutMs: 20_000, ...(input.phoenixFetch === undefined ? {} : { fetch: input.phoenixFetch }), ...(input.phoenixBudget === undefined ? {} : { budget: input.phoenixBudget }),
+    },
+  );
   const mismatches = [
     ...exchangeMismatches(snap.exchange).map((m) => `the Phoenix exchange differs from the pinned accounts: ${m}`),
     ...marketMismatches(snap.markets.find((m) => m.symbol === symbol), market, spline, { ignoreStatus: true }),
