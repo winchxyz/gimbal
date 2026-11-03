@@ -515,6 +515,7 @@ const monitorTimer = setInterval(() => {
   for (const line of lastDesk === null ? ['monitor   no desk read yet'] : monitorLines(lastDesk)) log(line);
   const unprotected = pair?.monitor?.() ?? null;
   if (unprotected !== null) log(`monitor   ${unprotected}`);
+  if (book?.readOnly() != null) log(`monitor   position book READ ONLY until restart: ${book.readOnly()}`);
 }, MONITOR_EVERY_MS);
 monitorTimer.unref();
 const shown = host.includes(':') ? `[${host}]` : host;

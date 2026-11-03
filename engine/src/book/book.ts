@@ -18,6 +18,7 @@ import {
   HOUR_MS, indexBook, openPosition, positionIdOf, positionResult, positionsOf, summarize, unsettledJournals,
 } from './derive.ts';
 import { entryNumbers, exitNumbers, feeJournal, fundingJournal, settledJournal, settlingNote, transferJournal } from './journal.ts';
+import { FILL_WINDOW_SLACK_MS } from './sources.ts';
 import type { StoreHooks } from './store.ts';
 import { BookStore, bookFile } from './store.ts';
 import type { BookSources, SyncLine } from './sync.ts';
@@ -84,6 +85,24 @@ export interface OutsideClose {
 /** A position open in the book this long after its last record, while the loop holds nothing, is looked for as closed. */
 export const OUTSIDE_CLOSE_GRACE_MS = 2 * 60_000;
 
+/** How long the book retries a venue fills read it needs (a close lookup, a close found outside the loop) before it gives up. */
+export const FILL_READ_GIVE_UP_MS = 24 * HOUR_MS;
+
+/** A protection's close whose fills were not booked (it threw, or its booking failed): read from the venues at the next sync. */
+export interface CloseLookup {
+  /** The protection: 'panic_close', 'rescue reduce', 'ADL unwind'. */
+  reason: string;
+  by: 'auto' | 'manual';
+  /** ms, before its first order. */
+  startedAt: number;
+  /** ms, when it ended (threw). */
+  at: number;
+  /** The pair's symbol: the open position on it. */
+  symbol?: string;
+}
+
+type BookPosition = ReturnType<typeof positionsOf>[number];
+
 export interface AdoptInput {
   windowId: string;
   symbol: string;
@@ -120,6 +139,11 @@ export class PositionBook {
   #timer: unknown = null;
   #summaryDue: NodeJS.Immediate | null = null;
   #stopped = false;
+  /** Protection closes whose fills the next sync reads (memory only: a restart drops them, the venues keep the fills). */
+  #lookups: (CloseLookup & { positionId: string; failingSince: number | null })[] = [];
+  /** Position id -> when the read of its closing fills first failed (the detector retries until FILL_READ_GIVE_UP_MS). */
+  readonly #detectFailing = new Map<string, number>();
+  #readOnlyJournaled = false;
 
   constructor(o: BookOptions) {
     this.#o = o;
@@ -167,6 +191,19 @@ export class PositionBook {
     const added: BookEvent[] = [];
     const copy = structuredClone(record);
     if (record.kind === 'enter') {
+      // An entry into a window the book still holds open: that one was closed outside the loop, unseen. Closed first.
+      const stale = openPosition(positions, record.windowId);
+      if (stale !== null) {
+        const before = Math.max(lastRecordAt(stale), (record.startedAt ?? record.at) - 1);
+        added.push({
+          v: 1, type: 'exit', at: now, positionId: stale.id, record: {
+            kind: 'exit', windowId: stale.windowId, symbol: stale.symbol, at: before, legs: [], feeUsd: 0, tx: [],
+            forecastNetAprPct: stale.enter.record.forecastNetAprPct, exitReason: 'closed outside the loop (fills unread)',
+            rotation: null, by: 'manual', marginMoves: [], fillsUnread: true,
+          },
+        });
+        this.#log(`book: ${stale.id} was still open when ${record.windowId} was entered again: closed outside the loop first (its fills unread)`);
+      }
       positionId = this.#newId(record.windowId, record.at, positions);
       added.push({ v: 1, type: 'enter', at: now, positionId, record: copy, adopted: false });
     } else if (record.kind === 'exit') {
@@ -273,8 +310,11 @@ export class PositionBook {
     const lines: SyncLine[] = [];
     let added = 0;
     if (sources === undefined || sources === null) return { lines: [{ ledger: 'book', ok: false, text: 'no ledgers to read' }], added };
+    const readOnly = this.readOnly();
+    if (readOnly !== null) return { lines: [{ ledger: 'book', ok: false, text: `read only until restart (${readOnly}): nothing synced` }], added };
     // The book's reads are background reads: below the risk engine's account reads, skipped (not retried) when the
     // venue's budget is short. A skipped read is a failed one: the next sync starts from the last good read.
+    lines.push(...await this.#lookupCloses(sources));
     lines.push(...await this.#closedOutside(sources));
     const venues = [...new Set(positionsOf(this.events).flatMap((p) => p.legs.map((l) => l.venue)))].sort();
     for (const venue of venues) {
@@ -378,47 +418,154 @@ export class PositionBook {
     return r;
   }
 
-  /** Open positions the loop no longer holds (see BookOptions.loopHeld): booked as exits from the venues' closing fills. */
-  async #closedOutside(sources: BookSources): Promise<SyncLine[]> {
-    const held = this.#o.loopHeld?.();
-    if (held === undefined) return [];
-    const lines: SyncLine[] = [];
-    const now = this.#clock.now();
-    for (const p of positionsOf(this.events)) {
-      if (p.exit !== null || (held !== null && held.windowId === p.windowId)) continue;
-      const last = Math.max(p.enter.record.at, ...p.fills.map((f) => f.record.at));
-      if (now - last < OUTSIDE_CLOSE_GRACE_MS) continue;
-      const fills: BookFill[] = [];
-      let at = 0;
-      for (const leg of p.legs) {
-        const address = this.address(leg.venue);
-        if (sources.closeFills === undefined || address === null) continue;
-        try {
-          const f = await scanRead(() => sources.closeFills!({
-            venue: leg.venue, address, symbol: p.symbol, side: leg.side === 'long' ? 'SELL' : 'BUY', from: last, to: now,
-          }));
-          if (f !== null) {
-            fills.push(f.fill);
-            at = Math.max(at, f.at);
-          }
-        } catch (err) {
-          lines.push(failedLine(`${leg.venue}-fills`, err));
-        }
+  /**
+   * A protection's close whose fills were not booked (it threw after it may have filled, or its booking failed): the
+   * next sync reads the venues' fills over [startedAt, at] and books them as a `fill` record with its reason. Memory
+   * only. With no position open there is nothing to look for.
+   */
+  queueCloseLookup(c: CloseLookup): void {
+    const open = positionsOf(this.events).filter((p) => p.exit === null);
+    const on = c.symbol === undefined ? [] : open.filter((p) => p.symbol.toUpperCase() === c.symbol!.toUpperCase());
+    const target = on.at(-1) ?? open.at(-1) ?? null;
+    if (target === null) {
+      this.#log(`book: the ${c.reason} close's fills are not looked for: no position is open`);
+      return;
+    }
+    this.#lookups.push({ ...c, positionId: target.id, failingSince: null });
+    this.#log(`book: the ${c.reason} close's fills on ${target.id} are read from the venues at the next sync`);
+  }
+
+  /** The closing fills of each leg of `p` in [from, to]; `failed` names each leg whose read failed or cannot be made. */
+  async #readCloseFills(sources: BookSources, p: BookPosition, from: number, to: number): Promise<{ fills: BookFill[]; at: number; failed: string[] }> {
+    const fills: BookFill[] = [];
+    const failed: string[] = [];
+    let at = 0;
+    for (const leg of p.legs) {
+      const address = this.address(leg.venue);
+      if (sources.closeFills === undefined || address === null) {
+        failed.push(`${leg.venue}: ${address === null ? 'no desk address' : 'no fills reader'}`);
+        continue;
       }
-      let r: Recorded;
       try {
-        r = this.record({
-          kind: 'exit', windowId: p.windowId, symbol: p.symbol, at: at > 0 ? at : now, legs: fills,
-          feeUsd: fills.reduce((a, f) => a + (f.feeUsd ?? 0), 0), tx: [], forecastNetAprPct: p.enter.record.forecastNetAprPct,
-          exitReason: 'closed outside the loop', rotation: null, by: 'manual', marginMoves: [],
+        const f = await scanRead(() => sources.closeFills!({
+          venue: leg.venue, address, symbol: p.symbol, side: leg.side === 'long' ? 'SELL' : 'BUY', from, to,
+        }));
+        if (f !== null) {
+          fills.push(f.fill);
+          at = Math.max(at, f.at);
+        }
+      } catch (err) {
+        failed.push(`${leg.venue}: ${errorMessage(err)}`);
+      }
+    }
+    return { fills, at, failed };
+  }
+
+  /** The queued close lookups (queueCloseLookup): each read once per sync until it books, finds nothing, or gives up. */
+  async #lookupCloses(sources: BookSources): Promise<SyncLine[]> {
+    const lines: SyncLine[] = [];
+    const due = this.#lookups;
+    this.#lookups = [];
+    const keep: typeof due = [];
+    for (const l of due) {
+      const what = `the ${l.reason} close's fills on ${l.positionId}`;
+      const p = positionsOf(this.events).find((q) => q.id === l.positionId);
+      if (p === undefined || p.exit !== null) {
+        lines.push({ ledger: 'book', ok: true, text: `${what}: not read, the position is closed` });
+        continue;
+      }
+      const held = this.#o.loopHeld?.();
+      if (held !== undefined && (held === null || held.windowId !== p.windowId)) {
+        // The loop holds nothing there: the close-outside detector books the exit from every fill since the last record.
+        lines.push({ ledger: 'book', ok: true, text: `${what}: the loop no longer holds it, so they go with its exit` });
+        continue;
+      }
+      const now = this.#clock.now();
+      // Never before the position's last record: fills already booked with it are not counted again.
+      const from = Math.max(l.startedAt - FILL_WINDOW_SLACK_MS, lastRecordAt(p) + 1);
+      const r = await this.#readCloseFills(sources, p, from, l.at + FILL_WINDOW_SLACK_MS);
+      if (r.failed.length > 0) {
+        const since = l.failingSince ?? now;
+        if (now - since >= FILL_READ_GIVE_UP_MS) {
+          lines.push({ ledger: 'book', ok: false, text: `${what}: not read for 24 h (${r.failed.join('; ')}); given up, they are not booked` });
+          continue;
+        }
+        keep.push({ ...l, failingSince: since });
+        lines.push({ ledger: 'book', ok: false, text: `${what}: not read (${r.failed.join('; ')}); tried again at the next sync` });
+        continue;
+      }
+      if (r.fills.length === 0) {
+        lines.push({ ledger: 'book', ok: true, text: `${what}: the venues show none, it filled nothing` });
+        continue;
+      }
+      if (positionsOf(this.events).find((q) => q.id === p.id)?.exit !== null) continue;
+      try {
+        this.record({
+          kind: 'fill', windowId: p.windowId, symbol: p.symbol, startedAt: l.startedAt, at: r.at > 0 ? r.at : l.at, legs: r.fills,
+          feeUsd: r.fills.reduce((a, f) => a + (f.feeUsd ?? 0), 0), tx: [], forecastNetAprPct: p.enter.record.forecastNetAprPct,
+          exitReason: l.reason, rotation: null, by: l.by, marginMoves: [],
+        });
+      } catch (err) {
+        keep.push(l);
+        lines.push({ ledger: 'book', ok: false, text: `${what}: read, but not written (${errorMessage(err)}); tried again at the next sync` });
+        continue;
+      }
+      lines.push({ ledger: 'book', ok: true, text: `${what}: ${r.fills.length} venue fill(s) booked as a partial fill` });
+    }
+    this.#lookups.push(...keep);
+    return lines;
+  }
+
+  /**
+   * Open positions the loop no longer holds (see BookOptions.loopHeld): booked as exits from the venues' closing fills
+   * since their last record. A leg whose read fails holds the position for the next sync; after FILL_READ_GIVE_UP_MS of
+   * failures the exit is booked with what was read, marked `fillsUnread` (price and close fees unknown, estimated).
+   */
+  async #closedOutside(sources: BookSources): Promise<SyncLine[]> {
+    const lines: SyncLine[] = [];
+    for (const p of positionsOf(this.events)) {
+      const held = this.#o.loopHeld?.();
+      if (held === undefined) break;
+      if (p.exit !== null || (held !== null && held.windowId === p.windowId)) {
+        this.#detectFailing.delete(p.id);
+        continue;
+      }
+      const now = this.#clock.now();
+      const last = lastRecordAt(p);
+      if (now - last < OUTSIDE_CLOSE_GRACE_MS) continue;
+      // From just after the last record: fills booked with it (a lookup's partial fill) are not counted again.
+      const r = await this.#readCloseFills(sources, p, last + 1, now);
+      let unread: string | null = null;
+      if (r.failed.length > 0) {
+        const since = this.#detectFailing.get(p.id) ?? now;
+        this.#detectFailing.set(p.id, since);
+        if (now - since < FILL_READ_GIVE_UP_MS) {
+          lines.push({ ledger: 'book', ok: false, text: `${p.id} looks closed outside the loop, but its closing fills were not read (${r.failed.join('; ')}); tried again at the next sync` });
+          continue;
+        }
+        unread = r.failed.join('; ');
+      }
+      // Checked again after the reads: a close booked meanwhile (a protection's report), or the loop holds it again.
+      const again = this.#o.loopHeld?.();
+      const still = positionsOf(this.events).find((q) => q.id === p.id);
+      if (still === undefined || still.exit !== null || again === undefined || (again !== null && again.windowId === p.windowId)) continue;
+      let booked: Recorded;
+      try {
+        booked = this.record({
+          kind: 'exit', windowId: p.windowId, symbol: p.symbol, at: r.at > 0 ? r.at : now, legs: r.fills,
+          feeUsd: r.fills.reduce((a, f) => a + (f.feeUsd ?? 0), 0), tx: [], forecastNetAprPct: p.enter.record.forecastNetAprPct,
+          exitReason: unread === null ? 'closed outside the loop' : 'closed outside the loop (fills unread)', rotation: null, by: 'manual',
+          marginMoves: [], ...(unread === null ? {} : { fillsUnread: true }),
         });
       } catch (err) {
         lines.push({ ledger: 'book', ok: false, text: `${p.id} closed outside the loop, but its exit was not written (${errorMessage(err)}); the next sync tries again` });
         continue;
       }
+      this.#detectFailing.delete(p.id);
       lines.push({
-        ledger: 'book', ok: true,
-        text: `${r.positionId} closed outside the loop (the loop holds ${held === null ? 'nothing' : held.windowId}): exit booked from ${fills.length} venue fill(s)`,
+        ledger: 'book', ok: unread === null,
+        text: `${booked.positionId} closed outside the loop (the loop holds ${again === null ? 'nothing' : again.windowId}): exit booked from ${r.fills.length} venue fill(s)`
+          + `${unread === null ? '' : `; fills unread for 24 h (${unread}): price and close fees unknown, estimated`}`,
       });
     }
     return lines;
@@ -507,8 +654,31 @@ export class PositionBook {
   /** Appends (fsynced when persisting); `summary` true schedules the summary (a sync schedules it once, at its end). */
   #append(events: readonly BookEvent[], summary = true): void {
     if (events.length === 0) return;
-    this.#store.append(events, this.#persist);
+    try {
+      this.#store.append(events, this.#persist);
+    } catch (err) {
+      this.#noteReadOnly();
+      throw err;
+    }
     if (summary) this.#scheduleSummary();
+  }
+
+  /** Why the book refuses writes until the process restarts (a failed write it could not cut back), or null. */
+  readOnly(): string | null {
+    return this.#store.readOnly;
+  }
+
+  /** Once the store went read only: logged and journaled as an error, once. */
+  #noteReadOnly(): void {
+    const why = this.#store.readOnly;
+    if (why === null || this.#readOnlyJournaled) return;
+    this.#readOnlyJournaled = true;
+    const now = this.#clock.now();
+    this.#log(`book: READ ONLY until restart (${why})`);
+    this.#o.publish?.({
+      id: `book-read-only-${now}`, t: now, kind: 'error', numbers: { stage: 'book' }, tx: [],
+      summary: `position book read only until serve restarts: ${why}. Nothing more is booked until then; the next start reads the funding again from its last good read`,
+    });
   }
 
   /** The summary is derived from everything: written once the current call has returned, coalesced. */
@@ -536,6 +706,11 @@ export class PositionBook {
   #log(line: string): void {
     this.#o.log?.(line);
   }
+}
+
+/** When a position's last record was made: its entry, or its latest partial fill. */
+function lastRecordAt(p: BookPosition): number {
+  return Math.max(p.enter.record.at, ...p.fills.map((f) => f.record.at));
 }
 
 /** The next hourly sync: HOUR_SYNC_DELAY_MS past the next top of the hour (or this one, when it is still ahead). */

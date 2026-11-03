@@ -977,10 +977,15 @@ the loop's `book` sink (`BookRecord`, with `startedAt`: when the act began), and
 that did not end as asked (kind `fill`); a pair the loop holds that the book never saw enter is adopted from the loop's
 own `since` (never one the book closed after that `since`). Closes made outside the loop are booked from what they
 return (ProtectedPair's `onProtectionClose`, for a close that names itself `by`): `panic_close`, `rescue reduce` and
-`ADL unwind` book an exit with that reason when both legs ended flat, else their fills as a `fill` record. One that
-left no result (it threw) is found at the next sync: an open position the loop no longer holds (`loopHeld()` null, 2
-min after its last record) gets an exit "closed outside the loop" from the venues' closing fills since then
-(`userFillsByTime`, Phoenix trades-history). Funding is the venues' own ledgers for the desk's addresses (Hyperliquid and Phoenix `userFunding`),
+`ADL unwind` book an exit with that reason when both legs ended flat, else their fills as a `fill` record (booked on
+the next turn of the event loop, so the protection never waits on the book's fsync). One that left no result (it
+threw), or whose booking failed, is read at the next sync: the venues' fills over its own time (`userFillsByTime`,
+Phoenix trades-history) are booked as a `fill` with its reason while the loop still holds the pair. An open position
+the loop no longer holds (`loopHeld()` null, 2 min after its last record; unknown without hands or before the start
+is confirmed) gets an exit "closed outside the loop" from the venues' closing fills since its last record, checked
+again after the reads. A leg whose fills cannot be read holds that exit for the next sync; after 24 h it is booked
+with what was read, "closed outside the loop (fills unread)", `fillsUnread` and `estimated` 1 in the final entry. An
+entry into a window the book still holds open closes that stale position first the same way (fills unread). Funding is the venues' own ledgers for the desk's addresses (Hyperliquid and Phoenix `userFunding`),
 never a rate times a size: synced at start (a catch-up from the last read less 24 h) and every hour 5 min after the
 top of the hour, as background reads below the risk engine's account reads, and read until 24 h after an exit; each
 payment stored once (venue, time, symbol; a Phoenix hour whose sum changes later is stored again as the difference)
@@ -1003,7 +1008,8 @@ summary). Once every leg's ledger is read past the exit + 2 h, one settled entry
 and the report; a payment booked after it is a late entry with `afterFinal` 1, an adjustment against the final, and
 the report shows it. On disk in `GIMBAL_STATE_DIR`:
 `book-<mode>-<contract>-<desk>.jsonl` (append-only events, each append fsynced; a write that fails, short or in its fsync, is cut
-back to the size before it and thrown; a torn last line from a crash is dropped on load, and so is a second copy of
+back to the size before it and thrown; if that cut fails too, the book is read only until restart, journals one
+`error` and says so in the monitor line; a torn last line from a crash is dropped on load, and so is a second copy of
 an event, said in the log; a read that stored nothing adds no line) and `.summary.json` derived from it (written atomically after
 the call that changed the book). `npm run report [-- --state <dir>] [--sync]` prints it; `--sync` reads the ledgers
 (read only) into that report alone.

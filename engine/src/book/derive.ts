@@ -99,6 +99,8 @@ export interface PositionResult {
   by: 'auto' | 'manual';
   exitBy: 'auto' | 'manual' | null;
   exitReason: string | null;
+  /** The exit's closing fills were never read (BookRecord.fillsUnread): its price and close fees are unknown. */
+  fillsUnread: boolean;
   /** The position this one was rotated out of / into (position ids; a window id when the other side is not booked). */
   rotatedFrom: string | null;
   rotatedTo: string | null;
@@ -480,7 +482,7 @@ export function positionResult(p: Position, ix: BookIndex, now: number): Positio
     finalAt: ix.finals.get(p.id) ?? null,
     afterFinalUsd: ix.finals.has(p.id) ? sum(payments.filter((f) => f.at > ix.finals.get(p.id)!).map((f) => f.usd)) : 0,
     estimatedUsd: sum(legs.map((l) => l.estimatedUsd)),
-    by: enter.by, exitBy: exit?.by ?? null, exitReason: exit?.exitReason ?? null, rotatedFrom, rotatedTo,
+    by: enter.by, exitBy: exit?.by ?? null, exitReason: exit?.exitReason ?? null, fillsUnread: exit?.fillsUnread === true, rotatedFrom, rotatedTo,
     entryTx: enter.tx, exitTx: exit?.tx ?? [], partialFills: p.fills.length,
     forecastNetAprPct: finiteOrNull(enter.forecastNetAprPct), legUsd, leverage: positiveOrNull(enter.leverage), marginUsd,
     fundingUsd, entryFeesUsd, exitFeesUsd, feesUsd, unknownFees,

@@ -17,6 +17,8 @@ export interface BookRecord extends LoopBookRecord {
   leverage?: number | null;
   /** Margin posted for the pair (both legs), USD. */
   marginUsd?: number | null;
+  /** An exit the book inferred whose closing fills it could not read: price and close fees unknown (estimated). */
+  fillsUnread?: boolean;
 }
 
 /** The loop's sink. PositionBook.record takes the loop's record as is (the extra fields are optional). */
