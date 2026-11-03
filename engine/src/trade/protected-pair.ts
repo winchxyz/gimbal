@@ -301,6 +301,8 @@ export type ProtectionCloseBy = 'panic_close' | 'rescue reduce' | 'ADL unwind';
 export interface ProtectionCloseReport {
   by: ProtectionCloseBy;
   reason: string;
+  /** The pair's symbol. */
+  symbol: string;
   /** ms, before its first order. */
   startedAt: number;
   at: number;
@@ -541,7 +543,7 @@ export class ProtectedPair {
       throw err;
     } finally {
       try {
-        this.#o.onProtectionClose?.({ by, reason: request.reason, startedAt, at: now(), result, error });
+        this.#o.onProtectionClose?.({ by, reason: request.reason, symbol: this.symbol, startedAt, at: now(), result, error });
       } catch (err) {
         this.#log(`book: the ${by} close was not booked (${err instanceof Error ? err.message : String(err)})`);
       }

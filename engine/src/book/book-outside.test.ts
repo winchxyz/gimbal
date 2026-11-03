@@ -1,10 +1,10 @@
-// The position book, second round: writes that fail (a short write, a failed fsync, a copy that could not be cut
-// back), closes made outside the strategy loop (panic_close, a rescue's reduce, an ADL unwind, and one with no
-// result), amounts from Hyperliquid's daily aggregates marked as estimated, late entries' ids and "final as of".
-// No network.
+// The position book, second and third rounds: writes that fail (a short write, a failed fsync, a cut that fails too:
+// read only), closes made outside the strategy loop (panic_close, a rescue's reduce, an ADL unwind, one that threw, one
+// with no report at all, a stale open position entered again), amounts from Hyperliquid's daily aggregates marked as
+// estimated, late entries' ids and "final as of". No network.
 
 import assert from 'node:assert/strict';
-import { appendFileSync, readFileSync, rmSync, writeSync } from 'node:fs';
+import { appendFileSync, ftruncateSync, readFileSync, rmSync, writeSync } from 'node:fs';
 import { after, test } from 'node:test';
 import type { JournalEntry } from '@gimbal/shared';
 import { loopBook } from '../cli/serve-loop.ts';
@@ -19,7 +19,7 @@ import { bookReport } from './report.ts';
 import { phoenixCloseFills, sumFills } from './sources.ts';
 import { BookStore } from './store.ts';
 import type { BookSources, CloseFillQuery } from './sync.ts';
-import type { FundingEvent } from './types.ts';
+import type { BookEvent, FundingEvent } from './types.ts';
 import { H, T0, XLM, enterXlm, exitXlm, fixtureSources, tempDir } from './test-helpers.ts';
 
 const dirs: string[] = [];
@@ -27,6 +27,7 @@ after(() => {
   for (const d of dirs) rmSync(d, { recursive: true, force: true });
 });
 
+const tick = () => new Promise<void>((r) => setImmediate(r));
 const close = (a: number, b: number, what: string) => assert.ok(Math.abs(a - b) < 1e-9, `${what}: ${a} vs ${b}`);
 const DESK = { mode: 'mainnet', contractId: 'gimbal-test.near', deskId: 'desk-1' } as const;
 
@@ -36,6 +37,7 @@ interface BookAtExtra {
   closeFills?: BookSources['closeFills'];
   write?: (fd: number, text: string, position: number) => number;
   fsync?: (fd: number) => void;
+  truncate?: (fd: number, size: number) => void;
 }
 
 function bookAt(dir: string, at: number, extra: BookAtExtra = {}) {
@@ -48,7 +50,10 @@ function bookAt(dir: string, at: number, extra: BookAtExtra = {}) {
     sources: { ...src.sources, ...(extra.closeFills === undefined ? {} : { closeFills: extra.closeFills }) },
     clock, publish: (e) => journal.push(e), log: (l) => log.push(l),
     ...(extra.loopHeld === undefined ? {} : { loopHeld: extra.loopHeld }),
-    hooks: { ...(extra.write === undefined ? {} : { write: extra.write }), ...(extra.fsync === undefined ? {} : { fsync: extra.fsync }) },
+    hooks: {
+      ...(extra.write === undefined ? {} : { write: extra.write }), ...(extra.fsync === undefined ? {} : { fsync: extra.fsync }),
+      ...(extra.truncate === undefined ? {} : { truncate: extra.truncate }),
+    },
   });
   return { book, clock, journal, log, sources: src };
 }
@@ -145,7 +150,7 @@ function result(status: PairResult['status'], final: [string | null, string | nu
 }
 
 const report = (by: ProtectionCloseReport['by'], r: PairResult | null, at: number): ProtectionCloseReport => ({
-  by, reason: by, startedAt: at - 30_000, at, result: r, error: r === null ? 'socket closed' : null,
+  by, reason: by, symbol: 'XLM', startedAt: at - 30_000, at, result: r, error: r === null ? 'socket closed' : null,
 });
 
 function wired(dir: string) {
@@ -158,13 +163,17 @@ function wired(dir: string) {
   return { ...s, w, log, held: () => held };
 }
 
-test('panic_close: both legs flat is the position\'s exit, with its fills and fees; the loop does not adopt it again', () => {
+test('panic_close: both legs flat is the position\'s exit, with its fills and fees; the loop does not adopt it again', async () => {
   const s = wired(tempDir(dirs));
   s.clock.set(T0 + 4 * H);
+  const before = s.book.events.length;
   s.w.protectionClose(report('panic_close', result('closed', ['0', '0'], [
     { venue: 'hyperliquid', side: 'BUY', filled: '4000', px: 0.249, fee: 0.15 },
     { venue: 'phoenix', side: 'SELL', filled: '4000', px: 0.2493, fee: 0.05 },
   ]), T0 + 4 * H));
+  // Booked on the next turn: the protection's path does not wait on the book's write.
+  assert.equal(s.book.events.length, before);
+  await tick();
   const p = s.book.summary().positions[0]!;
   assert.deepEqual([p.open, p.exitReason, p.exitBy, p.exitedAt], [false, 'panic_close', 'manual', T0 + 4 * H]);
   close(p.exitFeesUsd, -0.2, 'close fees');
@@ -177,13 +186,14 @@ test('panic_close: both legs flat is the position\'s exit, with its fills and fe
   assert.ok(!s.log.some((l) => /adopted/.test(l)), s.log.join('\n'));
 });
 
-test('a rescue\'s reduce is a partial fill of the open position; an ADL unwind that ends flat is its exit', () => {
+test('a rescue\'s reduce is a partial fill of the open position; an ADL unwind that ends flat is its exit', async () => {
   const s = wired(tempDir(dirs));
   s.clock.set(T0 + 3 * H);
   s.w.protectionClose(report('rescue reduce', result('closed', ['-3000', '3000'], [
     { venue: 'hyperliquid', side: 'BUY', filled: '1000', px: 0.2495, fee: 0.04 },
     { venue: 'phoenix', side: 'SELL', filled: '1000', px: 0.2497, fee: 0.01 },
   ]), T0 + 3 * H));
+  await tick();
   let p = s.book.summary().positions[0]!;
   assert.equal(p.open, true);
   assert.equal(p.partialFills, 1);
@@ -193,6 +203,7 @@ test('a rescue\'s reduce is a partial fill of the open position; an ADL unwind t
     { venue: 'hyperliquid', side: 'BUY', filled: '3000', px: 0.249, fee: 0.11 },
     { venue: 'phoenix', side: 'SELL', filled: '3000', px: 0.2493, fee: 0.04 },
   ]), T0 + 6 * H));
+  await tick();
   p = s.book.summary().positions[0]!;
   assert.deepEqual([p.open, p.exitReason, p.exitBy], [false, 'ADL unwind', 'auto']);
   close(p.feesUsd, -0.4, 'every fill');
@@ -201,48 +212,154 @@ test('a rescue\'s reduce is a partial fill of the open position; an ADL unwind t
   // A close that filled nothing and did not end flat (its reads failed) books nothing.
   const before = s.book.events.length;
   s.w.protectionClose(report('rescue reduce', result('stuck', [null, null], []), T0 + 7 * H));
+  await tick();
   assert.equal(s.book.events.length, before);
 });
 
-test('a protection close with no result is found at the next sync: the loop holds nothing, the venues\' fills close it', async () => {
-  const dir = tempDir(dirs);
-  let held: { windowId: string } | null | undefined = { windowId: XLM };
+/** Fake venue fills: each read sums the ones on its venue, side and window (as the real readers do); `fail` throws. */
+function venueFills(
+  list: { venue: string; side: 'BUY' | 'SELL'; qty: string; avgPx: number; feeUsd: number; at: number }[],
+  fail: (venue: string) => string | null = () => null,
+) {
   const asked: CloseFillQuery[] = [];
-  const s = bookAt(dir, enterXlm().at, {
-    loopHeld: () => held,
-    closeFills: async (q) => {
-      asked.push(q);
-      return q.venue === 'hyperliquid'
-        ? { fill: { venue: 'hyperliquid', side: 'BUY', qty: '4000', avgPx: 0.249, feeUsd: 0.15 }, at: T0 + 4 * H }
-        : { fill: { venue: 'phoenix', side: 'SELL', qty: '4000', avgPx: 0.2493, feeUsd: 0.05 }, at: T0 + 4 * H + 2_000 };
-    },
-  });
+  const closeFills: NonNullable<BookSources['closeFills']> = async (q) => {
+    asked.push(q);
+    const why = fail(q.venue);
+    if (why !== null) throw new Error(why);
+    const mine = list.filter((f) => f.venue === q.venue && f.side === q.side && f.at >= q.from && f.at <= q.to);
+    return sumFills(q.venue, q.side, mine.map((f) => ({ size: Number(f.qty), px: f.avgPx, fee: f.feeUsd, time: f.at })));
+  };
+  return { asked, closeFills };
+}
+
+const CLOSED_AT = T0 + 4 * H;
+const closingFills = () => [
+  { venue: 'hyperliquid', side: 'BUY' as const, qty: '4000', avgPx: 0.249, feeUsd: 0.15, at: CLOSED_AT },
+  { venue: 'phoenix', side: 'SELL' as const, qty: '4000', avgPx: 0.2493, feeUsd: 0.05, at: CLOSED_AT + 2_000 },
+];
+
+test('a protection close that threw after a partial fill: the next sync reads its fills over its own time and books them as a fill', async () => {
+  const at = T0 + 4 * H;
+  let fail: string | null = 'HTTP 502';
+  const v = venueFills([
+    { venue: 'hyperliquid', side: 'BUY', qty: '1000', avgPx: 0.2495, feeUsd: 0.04, at: at - 20_000 },
+    { venue: 'phoenix', side: 'SELL', qty: '1000', avgPx: 0.2497, feeUsd: 0.01, at: at - 10_000 },
+    { venue: 'hyperliquid', side: 'BUY', qty: '50', avgPx: 0.25, feeUsd: 0.01, at: T0 + 2 * H },   // earlier: not this close's
+  ], (venue) => (venue === 'phoenix' ? fail : null));
+  const s = bookAt(tempDir(dirs), enterXlm().at, { loopHeld: () => ({ windowId: XLM }), closeFills: v.closeFills });
   const log: string[] = [];
   const w = loopBook(s.book, () => {}, (l) => log.push(l));
   w.sink(enterXlm());
-  w.protectionClose(report('panic_close', null, T0 + 4 * H));
-  assert.ok(log.some((l) => /left no result \(socket closed\); the next sync looks for it/.test(l)), log.join('\n'));
-  assert.equal(s.book.summary().positions[0]!.open, true);
+  w.protectionClose(report('rescue reduce', null, at));
+  await tick();
+  assert.ok(log.some((l) => /left no result \(socket closed\); the next sync reads its fills from the venues/.test(l)), log.join('\n'));
+  // The loop keeps holding the pair (the legs are not flat): the detector has nothing to do, the lookup does it.
+  s.clock.set(at + 30 * 60_000);
+  let r = await s.book.sync();
+  assert.ok(r.lines.some((l) => !l.ok && /rescue reduce close's fills on \S+: not read \(phoenix: HTTP 502\); tried again at the next sync/.test(l.text)), JSON.stringify(r.lines));
+  assert.equal(s.book.summary().positions[0]!.partialFills, 0);
+  fail = null;
+  s.clock.set(at + 90 * 60_000);
+  r = await s.book.sync();
+  assert.ok(r.lines.some((l) => /2 venue fill\(s\) booked as a partial fill/.test(l.text)), JSON.stringify(r.lines));
+  assert.deepEqual([v.asked.at(-1)!.from, v.asked.at(-1)!.to], [at - 30_000 - 5_000, at + 5_000], 'its own time, with the fill slack');
+  const p = s.book.summary().positions[0]!;
+  assert.equal(p.open, true);
+  assert.equal(p.partialFills, 1);
+  close(p.feesUsd, -0.25, 'the open\'s fees and the reduce\'s');
+  const fill = s.book.events.find((e) => e.type === 'fill') as Extract<BookEvent, { type: 'fill' }>;
+  assert.deepEqual([fill.record.exitReason, fill.record.by, fill.record.startedAt, fill.record.at], ['rescue reduce', 'auto', at - 30_000, at - 10_000]);
+  // Once: the next sync does not read it again.
+  const reads = v.asked.length;
+  await s.book.sync();
+  assert.equal(v.asked.length, reads);
+});
+
+test('a close with no report: once the loop holds nothing, the next sync books the exit from the venues\' fills since the last record', async () => {
+  let held: { windowId: string } | null | undefined = { windowId: XLM };
+  const v = venueFills(closingFills());
+  const s = bookAt(tempDir(dirs), enterXlm().at, { loopHeld: () => held, closeFills: v.closeFills });
+  const log: string[] = [];
+  const w = loopBook(s.book, () => {}, (l) => log.push(l));
+  w.sink(enterXlm());
   // The loop still holds it: nothing to find.
-  s.clock.set(T0 + 4 * H + 30 * 60_000);
+  s.clock.set(CLOSED_AT + 30 * 60_000);
   await s.book.sync();
   assert.equal(s.book.summary().positions[0]!.open, true);
-  // The loop cannot tell (no hands): nothing either.
+  // The loop cannot tell (no hands, or its start not confirmed): nothing either.
   held = undefined;
   await s.book.sync();
   assert.equal(s.book.summary().positions[0]!.open, true);
-  assert.equal(asked.length, 0);
-  // The loop holds nothing now: the exit is booked from the venues' closing fills since the entry.
+  assert.equal(v.asked.length, 0);
+  // A panic_close that threw, and the loop then holds nothing: its lookup leaves the fills to the exit.
+  w.protectionClose(report('panic_close', null, CLOSED_AT + 3_000));
+  await tick();
   held = null;
   const r = await s.book.sync();
-  assert.ok(r.lines.some((l) => /closed outside the loop/.test(l.text)), JSON.stringify(r.lines));
-  assert.deepEqual(asked.map((q) => [q.venue, q.side, q.from]), [['hyperliquid', 'BUY', enterXlm().at], ['phoenix', 'SELL', enterXlm().at]]);
+  assert.ok(r.lines.some((l) => /panic_close close's fills on \S+: the loop no longer holds it, so they go with its exit/.test(l.text)), JSON.stringify(r.lines));
+  assert.ok(r.lines.some((l) => l.ok && /closed outside the loop \(the loop holds nothing\): exit booked from 2 venue fill\(s\)$/.test(l.text)), JSON.stringify(r.lines));
+  assert.deepEqual(v.asked.map((q) => [q.venue, q.side, q.from]), [['hyperliquid', 'BUY', enterXlm().at + 1], ['phoenix', 'SELL', enterXlm().at + 1]]);
   const p = s.book.summary().positions[0]!;
-  assert.deepEqual([p.open, p.exitReason, p.exitBy, p.exitedAt], [false, 'closed outside the loop', 'manual', T0 + 4 * H + 2_000]);
+  assert.deepEqual([p.open, p.exitReason, p.exitBy, p.exitedAt, p.fillsUnread], [false, 'closed outside the loop', 'manual', CLOSED_AT + 2_000, false]);
   close(p.priceUsd!, 0.4, 'price');
   close(p.exitFeesUsd, -0.2, 'fees');
   await s.book.sync();
   assert.equal(s.book.events.filter((e) => e.type === 'exit').length, 1, 'once');
+});
+
+test('a close found outside the loop whose fills cannot be read waits for the next sync; after 24 h it is booked as fills unread', async () => {
+  // A read that fails once: the position stays open, the next sync books it as usual.
+  let fail: string | null = 'HTTP 429';
+  const v = venueFills(closingFills(), (venue) => (venue === 'phoenix' ? fail : null));
+  const s = bookAt(tempDir(dirs), enterXlm().at, { loopHeld: () => null, closeFills: v.closeFills });
+  s.book.record(enterXlm());
+  s.clock.set(T0 + 5 * H);
+  let r = await s.book.sync();
+  assert.ok(r.lines.some((l) => !l.ok && /looks closed outside the loop, but its closing fills were not read \(phoenix: HTTP 429\); tried again at the next sync/.test(l.text)), JSON.stringify(r.lines));
+  assert.equal(s.book.summary().positions[0]!.open, true);
+  fail = null;
+  s.clock.set(T0 + 6 * H);
+  await s.book.sync();
+  let p = s.book.summary().positions[0]!;
+  assert.deepEqual([p.open, p.exitReason, p.fillsUnread], [false, 'closed outside the loop', false]);
+  close(p.priceUsd!, 0.4, 'price');
+
+  // Never readable: retried for 24 h, then booked with what was read, marked.
+  const never = venueFills(closingFills(), (venue) => (venue === 'phoenix' ? 'HTTP 502' : null));
+  const t = bookAt(tempDir(dirs), enterXlm().at, { loopHeld: () => null, closeFills: never.closeFills });
+  t.book.record(enterXlm());
+  for (const h of [5, 6, 28]) {
+    t.clock.set(T0 + h * H);
+    await t.book.sync();
+    assert.equal(t.book.summary().positions[0]!.open, true, `still waiting at +${h} h`);
+  }
+  t.clock.set(T0 + 29 * H);
+  r = await t.book.sync();
+  assert.ok(r.lines.some((l) => !l.ok && /exit booked from 1 venue fill\(s\); fills unread for 24 h \(phoenix: HTTP 502\): price and close fees unknown, estimated$/.test(l.text)), JSON.stringify(r.lines));
+  p = t.book.summary().positions[0]!;
+  assert.deepEqual([p.open, p.exitReason, p.fillsUnread, p.priceUsd], [false, 'closed outside the loop (fills unread)', true, null]);
+  assert.match(bookReport(t.book.summary()), /exit {7}closed outside the loop \(fills unread\) \(its fills were never read: price and close fees unknown, the numbers are estimated\)/);
+  const fin = t.journal.find((j) => j.id.startsWith('book-settled-'))!;
+  assert.deepEqual([fin.numbers.fillsUnread, fin.numbers.estimated], [1, 1]);
+  assert.match(fin.summary, /the exit's fills were never read: price and close fees unknown, estimated; final as of/);
+});
+
+test('the detector checks the position again after its reads: a close booked meanwhile is not booked twice', async () => {
+  let book: PositionBook | null = null;
+  const closeFills: NonNullable<BookSources['closeFills']> = async (q) => {
+    // A protection's report lands while the venues are read.
+    if (q.venue === 'hyperliquid') {
+      book!.recordOutside({ reason: 'panic_close', by: 'manual', startedAt: CLOSED_AT - 5_000, at: CLOSED_AT, fills: [], feeUsd: 0, tx: [], flat: true, symbol: 'XLM' });
+    }
+    return null;
+  };
+  const s = bookAt(tempDir(dirs), enterXlm().at, { loopHeld: () => null, closeFills });
+  book = s.book;
+  s.book.record(enterXlm());
+  s.clock.set(T0 + 5 * H);
+  await s.book.sync();
+  assert.equal(s.book.events.filter((e) => e.type === 'exit').length, 1);
+  assert.equal(s.book.summary().positions[0]!.exitReason, 'panic_close');
 });
 
 test('closing fills from the venues are summed per side and window (Phoenix trades-history by time and sign)', async () => {
@@ -339,4 +456,54 @@ test('late entries: an adjustment names its adjN in the id; a booking after the 
   close(p.afterFinalUsd, -0.01, 'after the final');
   assert.match(bookReport(s.book.summary()), /final as of 2026-11-02 22:25 UTC; booked late after it: -0\.0100 \(an adjustment to the final, in the numbers here\)/);
   assert.equal(s.journal.filter((j) => j.id.startsWith('book-settled-')).length, 1, 'still one final entry');
+});
+
+// ---- round three: a store that cannot cut back, a stale open position ----
+
+test('a short write whose cut fails too: the book goes read only until restart, journals one error, and a restart repairs it', async () => {
+  const dir = tempDir(dirs);
+  let broken = false;
+  const s = bookAt(dir, enterXlm().at, {
+    write: (fd, text, position) => writeSync(fd, broken ? text.slice(0, 10) : text, position),
+    truncate: (fd, size) => {
+      if (broken) throw new Error('EIO: truncate failed');
+      ftruncateSync(fd, size);
+    },
+  });
+  s.book.record(enterXlm());
+  broken = true;
+  s.clock.set(exitXlm().at);
+  assert.throws(() => s.book.record(exitXlm()), /short write: 10 of \d+ bytes.*cutting it back failed too \(EIO: truncate failed\): the book is read only until restart/);
+  assert.match(s.book.readOnly() ?? '', /^short write/);
+  broken = false;
+  assert.throws(() => s.book.record(exitXlm()), /the book is read only until restart/);
+  const errors = s.journal.filter((j) => j.kind === 'error');
+  assert.equal(errors.length, 1, 'journaled once');
+  assert.match(errors[0]!.summary, /^position book read only until serve restarts: short write/);
+  assert.ok(s.log.some((l) => /book: READ ONLY until restart/.test(l)), s.log.join('\n'));
+  const r = await s.book.sync();
+  assert.equal(r.lines.length, 1);
+  assert.match(r.lines[0]!.text, /^read only until restart .*: nothing synced$/);
+  // A restart: load cuts the torn bytes, and the book writes again.
+  const log: string[] = [];
+  const again = new PositionBook({ dir, ...DESK, clock: s.clock, log: (l) => log.push(l) });
+  assert.equal(again.readOnly(), null);
+  assert.ok(log.some((l) => /torn last line \(10 bytes/.test(l)), log.join('\n'));
+  again.record(exitXlm());
+  assert.equal(again.summary().positions[0]!.open, false);
+});
+
+test('an entry into a window the book still holds open closes that stale position first, as closed outside the loop', () => {
+  const s = bookAt(tempDir(dirs), enterXlm().at);
+  s.book.record(enterXlm());
+  s.clock.set(T0 + 6 * H);
+  s.book.record({ ...enterXlm(), at: T0 + 6 * H, startedAt: T0 + 6 * H - 60_000, by: 'manual', marginMoves: [] });
+  const [stale, fresh] = s.book.summary().positions;
+  assert.deepEqual(
+    [stale!.open, stale!.exitReason, stale!.exitBy, stale!.exitedAt, stale!.fillsUnread],
+    [false, 'closed outside the loop (fills unread)', 'manual', T0 + 6 * H - 60_001, true],
+  );
+  assert.equal(fresh!.open, true);
+  assert.notEqual(stale!.id, fresh!.id);
+  assert.ok(s.log.some((l) => /was still open when \S+ was entered again: closed outside the loop first/.test(l)), s.log.join('\n'));
 });

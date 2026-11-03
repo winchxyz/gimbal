@@ -46,7 +46,7 @@ export function positionBlock(p: PositionResult): string[] {
   if (p.open) out.push(`  held       ${hoursText(p.heldHours)} so far (running numbers)`);
   else {
     out.push(`  held       ${hoursText(p.heldHours)}, exited ${when(p.exitedAt!)} by ${p.exitBy ?? '?'}${p.rotatedTo === null ? '' : `, rotated out to ${p.rotatedTo}`}`);
-    out.push(`  exit       ${p.exitReason ?? 'no reason recorded'}`);
+    out.push(`  exit       ${p.exitReason ?? 'no reason recorded'}${p.fillsUnread ? ' (its fills were never read: price and close fees unknown, the numbers are estimated)' : ''}`);
     out.push(`  settled    ${settledText(p)}`);
   }
   out.push(`  legs       ${p.legs.map((l) => legLine(l, p.open)).join('; ')}`);

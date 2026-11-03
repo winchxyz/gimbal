@@ -506,6 +506,7 @@ if (mode !== 'replay') {
 // The monitor: the legs, their distance to liquidation and the net, every 30 min (read-only).
 const monitorTimer = setInterval(() => {
   for (const line of lastDesk === null ? ['monitor   no desk read yet'] : monitorLines(lastDesk)) log(line);
+  if (book?.readOnly() != null) log(`monitor   position book READ ONLY until restart: ${book.readOnly()}`);
 }, MONITOR_EVERY_MS);
 monitorTimer.unref();
 const shown = host.includes(':') ? `[${host}]` : host;

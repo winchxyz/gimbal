@@ -7,9 +7,10 @@
 //
 // A write that fails is undone: the file's size is taken before it, and a short write (a full disk) or a failed fsync
 // cuts the file back to that size and throws. So the next append never lands after torn bytes, and what the caller
-// takes as not written (and writes again) is not on disk. Should the cut fail too, load keeps the first copy of an
-// event with the same identity (a funding key, a fee's fill, a transfer id, a journal entry id, a position's enter or
-// exit, a fill record) and says how many it dropped.
+// takes as not written (and writes again) is not on disk. Should the cut fail too, the store goes read only until
+// the process restarts (every later append throws, `readOnly` says why): torn bytes may sit at the end, and only a
+// load cuts them. Load also keeps the first copy of an event with the same identity (a funding key, a fee's fill, a
+// transfer id, a journal entry id, a position's enter or exit, a fill record) and says how many it dropped.
 //
 // The summary is written atomically (the whole content to a temporary file, fsync, rename, then the directory's
 // fsync): a crash before the rename leaves the old summary whole. It is always derived again from the JSONL, so a
@@ -61,6 +62,8 @@ export interface StoreHooks {
   /** Writes `text` to the JSONL at byte `position`; returns the bytes written. */
   write?: (fd: number, text: string, position: number) => number;
   fsync?: (fd: number) => void;
+  /** Cuts the JSONL back to `size` after a failed write (default ftruncateSync). */
+  truncate?: (fd: number, size: number) => void;
 }
 
 const messageOf = (err: unknown) => (err instanceof Error ? err.message : String(err));
@@ -178,6 +181,8 @@ export class BookStore {
   #needsNewline = false;
   /** What load() repaired, for the log. */
   repaired: string | null = null;
+  /** Why appends are refused until restart (a failed write that could not be cut back), or null. */
+  #readOnly: string | null = null;
 
   constructor(path: string, hooks: StoreHooks = {}) {
     this.path = path;
@@ -217,6 +222,11 @@ export class BookStore {
     return this.#events;
   }
 
+  /** Why the store refuses appends until the process restarts, or null when it writes. */
+  get readOnly(): string | null {
+    return this.#readOnly;
+  }
+
   /**
    * Appends events in one write, fsynced; memory moves only once the write went through. A write that fails (short,
    * or its fsync) is cut back off the file and thrown (see the header). `persist` false: memory only (a reader that
@@ -228,6 +238,7 @@ export class BookStore {
       this.#events.push(...events);
       return;
     }
+    if (this.#readOnly !== null) throw new Error(`the book is read only until restart (${this.#readOnly})`);
     const text = `${this.#needsNewline ? '\n' : ''}${events.map((e) => `${JSON.stringify(e)}\n`).join('')}`;
     mkdirSync(dirname(this.path), { recursive: true });
     let created = false;
@@ -252,10 +263,11 @@ export class BookStore {
       } catch (err) {
         // Undo: nothing of this write stays, so the next one starts on a whole line and nothing is booked twice.
         try {
-          ftruncateSync(fd, size);
+          (this.#hooks.truncate ?? ftruncateSync)(fd, size);
           fsyncSync(fd);
         } catch (cut) {
-          throw new Error(`${messageOf(err)}; cutting it back failed too (${messageOf(cut)}): load drops what it repeats`);
+          this.#readOnly = `${messageOf(err)}; cutting it back failed too (${messageOf(cut)})`;
+          throw new Error(`${this.#readOnly}: the book is read only until restart, and load drops what it repeats`);
         }
         throw err;
       }

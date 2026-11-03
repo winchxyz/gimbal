@@ -189,11 +189,16 @@ export function settledJournal(r: PositionResult, now: number): JournalEvent {
     numbers.estimated = 1;
     numbers.estimatedUsd = round6(r.estimatedUsd);
   }
+  if (r.fillsUnread) {
+    numbers.estimated = 1;
+    numbers.fillsUnread = 1;
+  }
   const apr = r.actualAprPct === null ? 'n/a' : `${r.actualAprPct.toFixed(2)} %`;
   const summary = `settled ${r.symbol} ${r.id}: funding ${signed(r.fundingUsd)}, fees ${signed(r.feesUsd)}`
     + `${r.priceUsd === null ? '' : `, price ${signed(r.priceUsd)}`}, net ${signed(r.netUsd)} USD; actual APR ${apr}`
     + ` over ${r.aprHours.toFixed(1)} h, funding read to ${r.fundingThrough === null ? 'none' : hhmm(r.fundingThrough)}`
-    + `${r.estimatedUsd === 0 ? '' : ` (${signed(r.estimatedUsd)} of the funding estimated from daily aggregates)`}; final as of ${hhmm(now)}`;
+    + `${r.estimatedUsd === 0 ? '' : ` (${signed(r.estimatedUsd)} of the funding estimated from daily aggregates)`}`
+    + `${r.fillsUnread ? "; the exit's fills were never read: price and close fees unknown, estimated" : ''}; final as of ${hhmm(now)}`;
   return {
     v: 1, type: 'journal', at: now, positionId: r.id, settled: true,
     entry: entry(`book-settled-${r.id}`, now, 'funding', summary, numbers),

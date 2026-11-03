@@ -17,7 +17,7 @@ import { errorMessage } from '../venues/recorder.ts';
 import type { AccountState, Clock, Market, VenueReader } from '../venues/venue.ts';
 import type { DecideInput, Decision } from '../strategy/decide.ts';
 import type { ActOutcome, BookFill, BookSink, HandsHeld, LoopHands, LoopHeld, WindowFacts } from '../strategy/loop.ts';
-import type { AdoptInput, OutsideClose } from '../book/book.ts';
+import type { AdoptInput, CloseLookup, OutsideClose } from '../book/book.ts';
 import type { ProtectionCloseReport } from '../trade/protected-pair.ts';
 import type { BookRecord } from '../book/types.ts';
 import type { PairResult } from '../trade/pair.ts';
@@ -307,6 +307,7 @@ export interface LoopBookPort {
   adopt(input: AdoptInput): string;
   openWindow(): string | null;
   recordOutside(close: OutsideClose): { positionId: string | null };
+  queueCloseLookup(lookup: CloseLookup): void;
 }
 
 /**
@@ -317,8 +318,10 @@ export interface LoopBookPort {
  * cost < 0), and the book's note (an exit: `funding read to 14:00, settling`) to its summary. `adopt` books the pair the loop holds when the book has no open position for it (opened outside the
  * loop, or before the book existed), from the loop's own `since`; serve calls it at start and on every decision.
  * `protectionClose` books a protection's close (panic_close, a rescue's reduce, an ADL unwind: ProtectedPair's
- * onProtectionClose) from its result: an exit when both legs ended flat, else its fills as a partial fill. One that
- * threw left no result: the book's next sync finds that close from the loop's held state and the venues' fills.
+ * onProtectionClose) from its result: an exit when both legs ended flat, else its fills as a partial fill; booked on
+ * the next turn of the event loop, so the protection's path never waits on the book's fsync. One that threw (no
+ * result), or whose booking failed: the book's next sync reads its fills over its own time from the venues
+ * (queueCloseLookup), and the close-outside detector books the exit when the loop no longer holds the pair.
  */
 export function loopBook(book: LoopBookPort, publish: (event: StreamEvent) => void, log: (line: string) => void, held: () => LoopHeld | null = () => null): {
   sink: BookSink; publish: (event: StreamEvent) => void; adopt: (held: LoopHeld | null) => void;
@@ -357,20 +360,25 @@ export function loopBook(book: LoopBookPort, publish: (event: StreamEvent) => vo
     },
     adopt,
     protectionClose: (c) => {
-      const r = c.result;
-      if (r === null) {
-        log(`book: the ${c.by} close left no result (${c.error ?? 'no error'}); the next sync looks for it in the venues' fills`);
-        return;
-      }
-      const flat = r.legs.every((l) => l.final !== null && toQty(l.final) === 0n);
-      try {
-        book.recordOutside({
-          reason: c.by, by: c.by === 'panic_close' ? 'manual' : 'auto', startedAt: c.startedAt, at: c.at,
-          fills: fillsOf([r]), feeUsd: r.feeUsd, tx: r.tx, flat, symbol: r.legs[0].symbol,
-        });
-      } catch (err) {
-        log(`book: the ${c.by} close was not booked (${errorMessage(err)})`);
-      }
+      const by = c.by === 'panic_close' ? 'manual' : 'auto';
+      const lookup = { reason: c.by, by, startedAt: c.startedAt, at: c.at, symbol: c.symbol } as const;
+      setImmediate(() => {
+        const r = c.result;
+        if (r === null) {
+          log(`book: the ${c.by} close left no result (${c.error ?? 'no error'}); the next sync reads its fills from the venues`);
+          book.queueCloseLookup(lookup);
+          return;
+        }
+        const flat = r.legs.every((l) => l.final !== null && toQty(l.final) === 0n);
+        try {
+          book.recordOutside({
+            reason: c.by, by, startedAt: c.startedAt, at: c.at, fills: fillsOf([r]), feeUsd: r.feeUsd, tx: r.tx, flat, symbol: r.legs[0].symbol,
+          });
+        } catch (err) {
+          log(`book: the ${c.by} close was not booked (${errorMessage(err)}); the next sync reads its fills from the venues`);
+          book.queueCloseLookup(lookup);
+        }
+      });
     },
   };
 }
