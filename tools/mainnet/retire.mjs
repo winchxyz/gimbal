@@ -236,15 +236,15 @@ export function decodeDeskMoney(buf) {
 /** contract/src/rescue.rs DeskCounters (1,329 bytes): the meters, the ring of 32 deposit hashes and their paid times. */
 export function decodeCounters(buf) {
   const r = new BorshReader(buf, 'the counters record');
-  r.u64();
+  const rescueAt = r.u64();
   r.u128();
   r.u128();
-  r.u64();
+  const eip3009Next = r.u64();
   r.take(32 * RING);
   const next = r.u8();
   const paid = Array.from({ length: RING }, () => r.u64());
   r.end();
-  return { deposit_next: next, deposit_paid_ms: paid };
+  return { rescue_at_ms: rescueAt, eip3009_next: eip3009Next, deposit_next: next, deposit_paid_ms: paid };
 }
 
 const storageKey = (prefix, deskId) => {
@@ -281,6 +281,23 @@ async function readRecord(client, contract, prefix, deskId) {
   const hit = rows.filter((row) => Buffer.from(row.key).equals(key));
   if (hit.length > 1) throw new Error('two records under one key');
   return hit.length === 0 ? null : Buffer.from(hit[0].value);
+}
+
+/**
+ * The desk's last Hyperliquid nonce (HlNonces, prefix 3), BigInt ms: every Hyperliquid action the contract signed
+ * for the desk has a nonce or time at or before it. 0n when the record is missing (no action signed).
+ */
+export async function hlNonceOf(client, contract, deskId) {
+  const raw = await readRecord(client, contract, STORAGE_PREFIX.HlNonces, deskId);
+  if (raw === null) return 0n;
+  if (raw.length !== 8) throw new Error(`the Hyperliquid nonce record is ${raw.length} bytes, not a u64`);
+  return raw.readBigUInt64LE();
+}
+
+/** The desk's DeskCounters record (decodeCounters, prefix 5), or null when it is missing (no rescue counted). */
+export async function deskCountersOf(client, contract, deskId) {
+  const raw = await readRecord(client, contract, STORAGE_PREFIX.DeskCounters, deskId);
+  return raw === null ? null : decodeCounters(raw);
 }
 
 const minutesAgo = (nowMs, ms) => Math.max(0, Math.floor(Number(BigInt(nowMs) - BigInt(ms)) / 60_000));

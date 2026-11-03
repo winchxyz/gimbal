@@ -181,11 +181,8 @@ export class HyperliquidSubmitter {
     }
   }
 
-  /** The ledger entry a transfer made: matched by type and amount, booked after it was posted. */
+  /** The ledger entry a transfer made (ledgerMatches), booked after it was posted. */
   async #ledgerHash(user: string, action: Record<string, unknown>, postedAt: number): Promise<string | null> {
-    const want: Record<string, string> = { usdClassTransfer: 'accountClassTransfer', sendAsset: 'send', withdraw3: 'withdraw' };
-    const type = want[String(action.type)]!;
-    const amount = Number(action.amount);
     const until = this.#clock.now() + this.#confirmMs;
     for (;;) {
       let rows: { time: number; hash: string; delta: Record<string, unknown> }[] = [];
@@ -194,8 +191,7 @@ export class HyperliquidSubmitter {
       } catch {
         // as in #fillsOf: an /info failure only delays the confirmation
       }
-      const hit = (Array.isArray(rows) ? rows : []).find((r) => r.delta?.type === type
-        && Math.abs(Number(r.delta.usdc ?? r.delta.amount) - amount) < 1e-9 && !ZERO_HASH.test(r.hash));
+      const hit = (Array.isArray(rows) ? rows : []).find((r) => ledgerMatches(action, r.delta) && !ZERO_HASH.test(r.hash));
       if (hit !== undefined) return hit.hash;
       if (this.#clock.now() >= until) return null;
       await this.#sleep(this.#pollMs);
@@ -221,6 +217,41 @@ export class HyperliquidSubmitter {
       throw new HlExchangeError(`hyperliquid ${path}: not JSON: ${text.slice(0, 200)}`, res.status, text);
     }
   }
+}
+
+const LEDGER_TYPE: Record<string, string> = { usdClassTransfer: 'accountClassTransfer', sendAsset: 'send', withdraw3: 'withdraw' };
+
+/** USDC text (at most 6 decimals, as Hyperliquid writes it) as an integer of 1e-6 units, or null. */
+function usdcMicros(value: unknown): bigint | null {
+  const m = /^(\d+)(?:\.(\d{1,6}))?$/.exec(String(value ?? '').trim());
+  return m === null ? null : BigInt(m[1]!) * 1_000_000n + BigInt((m[2] ?? '').padEnd(6, '0'));
+}
+
+/**
+ * Whether a userNonFundingLedgerUpdates delta is the entry `action` made. usdClassTransfer and sendAsset: type and
+ * amount. withdraw3: Hyperliquid books the action's `time` x 1000 as the entry's `nonce` (the bare time is accepted
+ * too) and the amount less its fee as `usdc` ({"usdc":"10.682396","nonce":1793669928713000,"fee":"1.0"} for a
+ * withdraw3 of 11.682396 at time 1793669928713); an entry without a nonce matches on usdc + fee == amount.
+ */
+export function ledgerMatches(action: Record<string, unknown>, delta: Record<string, unknown> | undefined): boolean {
+  const type = LEDGER_TYPE[String(action.type)];
+  if (type === undefined || delta?.type !== type) return false;
+  if (action.type !== 'withdraw3') return Math.abs(Number(delta.usdc ?? delta.amount) - Number(action.amount)) < 1e-9;
+  if (delta.nonce !== undefined && delta.nonce !== null) {
+    let nonce: bigint;
+    let time: bigint;
+    try {
+      nonce = BigInt(String(delta.nonce));
+      time = BigInt(String(action.time));
+    } catch {
+      return false;
+    }
+    return nonce === time * 1000n || nonce === time;
+  }
+  const usdc = usdcMicros(delta.usdc);
+  const fee = usdcMicros(delta.fee ?? '0');
+  const amount = usdcMicros(action.amount);
+  return usdc !== null && fee !== null && amount !== null && usdc + fee === amount;
 }
 
 /** What reconciles a Hyperliquid action: the NEAR transaction, the first order's cloid, the action's nonce. */

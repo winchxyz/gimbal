@@ -3,11 +3,14 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { HlOrder } from '../contract/types.ts';
+import { sign as secpSign } from 'viem/accounts';
+import { toMpc } from '../contract/replay-client.ts';
+import type { HlOrder, HlSignedAction } from '../contract/types.ts';
 import { OutcomeUnknown } from '../contract/types.ts';
-import { HlExchangeError, HyperliquidSubmitter } from './hyperliquid.ts';
+import { userSignedDigest } from './hl-wire.ts';
+import { HlExchangeError, HyperliquidSubmitter, ledgerMatches } from './hyperliquid.ts';
 import type { StubCall } from './test-helpers.ts';
-import { TEST_EVM_ADDRESS, fakeTime, stubFetch, testContract } from './test-helpers.ts';
+import { TEST_EVM_ADDRESS, TEST_EVM_KEY, fakeTime, stubFetch, testContract } from './test-helpers.ts';
 import { NothingExecuted } from './tx.ts';
 
 const T0 = 1_793_491_200_000;
@@ -99,6 +102,53 @@ test('usdClassTransfer: user-signed, confirmed by its ledger entry', async () =>
   // A user-signed action for the other network is refused before anything is posted.
   const mainnet = new HyperliquidSubmitter({ network: 'mainnet', fetch: stubFetch(() => ({})).fetch });
   await assert.rejects(mainnet.submit(signed, TEST_EVM_ADDRESS), /Testnet/);
+});
+
+/** A withdraw3 signed with the public test key, as the contract's hl_withdraw signs it (the replay client has no hl_withdraw). */
+async function signedWithdraw3(contract: ReturnType<typeof testContract>, amount: string, time: number): Promise<HlSignedAction> {
+  const base = await contract.hlUsdClassTransfer('alpha', '1', true, 'shape only');
+  const action = { type: 'withdraw3', signatureChainId: '0x66eee', hyperliquidChain: 'Testnet', destination: TEST_EVM_ADDRESS.toLowerCase(), amount, time };
+  const signature = toMpc(await secpSign({ hash: userSignedDigest(action), privateKey: TEST_EVM_KEY, to: 'hex' }));
+  return { ...base, kind: 'withdraw3', payload: { action, nonce: time }, signature } as HlSignedAction;
+}
+
+test('withdraw3: confirmed by the ledger entry whose nonce is the action time x 1000 (usdc is the amount less the fee)', async () => {
+  const LEDGER_HASH = `0x${'ef'.repeat(32)}`;
+  const time = T0 + 5;
+  const { contract, hl } = setup((call) => {
+    if (call.url.endsWith('/exchange')) return { status: 'ok', response: { type: 'default' } };
+    return [
+      // another desk action's withdraw of the same size, and a send: neither is this withdraw3
+      { time: T0 + 100, hash: `0x${'aa'.repeat(32)}`, delta: { type: 'withdraw', usdc: '10.682396', nonce: (time - 1) * 1000, fee: '1.0' } },
+      { time: T0 + 150, hash: `0x${'bb'.repeat(32)}`, delta: { type: 'send', amount: '11.682396', usdcValue: '11.682396', nonce: time * 1000 } },
+      // what mainnet booked for a withdraw3 of 11.682396 (2026-11-03)
+      { time: T0 + 231_000, hash: LEDGER_HASH, delta: { type: 'withdraw', usdc: '10.682396', nonce: time * 1000, fee: '1.0' } },
+    ];
+  });
+  const result = await hl.submit(await signedWithdraw3(contract, '11.682396', time), TEST_EVM_ADDRESS);
+  assert.equal(result.confirmed, true);
+  assert.deepEqual(result.tx.map((t) => t.id).slice(-1), [LEDGER_HASH]);
+});
+
+test('ledgerMatches: withdraw3 by nonce (time x 1000 or time), else usdc + fee; other types unchanged', () => {
+  const w = { type: 'withdraw3', amount: '11.682396', time: 1793669928713 };
+  assert.equal(ledgerMatches(w, { type: 'withdraw', usdc: '10.682396', nonce: 1793669928713000, fee: '1.0' }), true);
+  assert.equal(ledgerMatches(w, { type: 'withdraw', usdc: '10.682396', nonce: '1793669928713000', fee: '1.0' }), true);
+  assert.equal(ledgerMatches(w, { type: 'withdraw', usdc: '10.682396', nonce: 1793669928713, fee: '1.0' }), true);
+  assert.equal(ledgerMatches(w, { type: 'withdraw', usdc: '10.682396', nonce: 1793669928714000, fee: '1.0' }), false);
+  // no nonce: the amount less the entry's own fee
+  assert.equal(ledgerMatches(w, { type: 'withdraw', usdc: '10.682396', fee: '1.0' }), true);
+  assert.equal(ledgerMatches(w, { type: 'withdraw', usdc: '10.182396', fee: '1.5' }), true);
+  assert.equal(ledgerMatches(w, { type: 'withdraw', usdc: '11.682396', fee: '1.0' }), false);
+  assert.equal(ledgerMatches(w, { type: 'withdraw', usdc: '11.682396' }), true);
+  assert.equal(ledgerMatches(w, { type: 'withdraw', usdc: 'x', fee: '1.0' }), false);
+  assert.equal(ledgerMatches(w, { type: 'send', amount: '11.682396', nonce: 1793669928713000 }), false);
+  assert.equal(ledgerMatches(w, undefined), false);
+  // usdClassTransfer and sendAsset: type and amount, as before (a send's own nonce is not the action's)
+  assert.equal(ledgerMatches({ type: 'usdClassTransfer', amount: '25' }, { type: 'accountClassTransfer', usdc: '25.0', toPerp: true }), true);
+  assert.equal(ledgerMatches({ type: 'usdClassTransfer', amount: '25' }, { type: 'accountClassTransfer', usdc: '24.0' }), false);
+  assert.equal(ledgerMatches({ type: 'sendAsset', amount: '11.682396' }, { type: 'send', amount: '11.682396', nonce: 5156247 }), true);
+  assert.equal(ledgerMatches({ type: 'order' }, { type: 'withdraw', usdc: '1' }), false);
 });
 
 test('cancel: an error status is NothingExecuted', async () => {

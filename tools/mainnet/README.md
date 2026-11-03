@@ -619,10 +619,15 @@ about 6.3), 0.7 free on the owner for the desk, and 0.3 NEAR free on the owner p
      decimals, as `hl_usd_class_transfer` takes it) with 1 yoctoNEAR and 300 TGas (an action method needs 85). It
      refuses an amount over the withdrawable or not above Hyperliquid's 1 USDC fee; `all` is the withdrawable.
      `--send` needs the owner's full-access key: the contract signs a Hyperliquid `withdraw3` to the desk's own
-     EVM address, the script posts it to `/exchange` (the engine's Hyperliquid submitter), confirms the
-     `withdraw` in Hyperliquid's non-funding ledger, then polls the desk EVM's Arbitrum USDC until it is up by
-     amount - 1 (`--timeout-s`, default 900; Hyperliquid's bridge usually takes a few minutes): `arrived: yes` or
-     `not yet`. Dry run on 2026-11-03: 11.682396 withdrawable, 10.682396 expected on Arbitrum.
+     EVM address (checked: destination, amount, `hyperliquidChain` `Mainnet`, `signatureChainId` `0x66eee`), the
+     script posts it to `/exchange` (the engine's Hyperliquid submitter, which waits 5 s for the ledger), then says
+     what it waits for and reads, together until `--timeout-s` (default 900), Hyperliquid's non-funding ledger for
+     the `withdraw` and the desk EVM's Arbitrum USDC until it is up by amount - 1, with a progress line each minute:
+     `arrived: yes` or `not yet`. Hyperliquid books the withdraw with `nonce` = the withdraw3 `time` x 1000 and
+     `usdc` = amount - fee (mainnet, 2026-11-03: `{"type":"withdraw","usdc":"10.682396","nonce":1793669928713000,
+     "fee":"1.0"}` about 231 s after time 1793669928713). The dry run warns when what arrives is over the desk's
+     hourly rescue cap (the bridge then goes in parts). Dry run on 2026-11-03: 11.682396 withdrawable, 10.682396
+     expected on Arbitrum.
    - **bridge** (the operator key, default `.keys/operator-<contract>.json`, and the relayer wallet of section 5):
      reads the desk EVM's Arbitrum USDC (`all` = the whole balance), asks a dry 1Click quote Arbitrum USDC ->
      USDC on NEAR, `recipient` the contract with `customRecipientMsg` `{"desk_id":"canary"}`, `refundTo` the desk
@@ -639,17 +644,52 @@ about 6.3), 0.7 free on the owner for the desk, and 0.3 NEAR free on the owner p
      owner's, so the credit is `idle_usdc` only (`principal: false`, `deposited` unchanged): at a payout it counts
      toward profit only once the owner's withdrawals pass what they deposited. A refund goes to the desk EVM
      address on Arbitrum: bridge again. Dry run on 2026-11-03 for 10.6 USDC: `amountOut` 10.598642,
-     `minAmountOut` 10.492655, may cost 0.107 of the 1 USD allowed, 25 s.
+     `minAmountOut` 10.492655, may cost 0.107 of the 1 USD allowed, 25 s. On mainnet the same day, bridge 2 and
+     bridge all (8.682396) each landed in about 45 s, delivered by `ft_transfer_call` from `intents.near`
+     (`deposit` event with `principal: false`).
    - **Cost:** the 1 USDC Hyperliquid fee, the 1Click cost (at most `amountIn` - `minAmountOut`; about 0.01 %
      expected on 2026-11-03), and the relayer's Arbitrum gas for one transfer (a fraction of a cent). Then step 8
      pays the `idle_usdc` out to the owner.
    - **Rerun midway:** each stage reads the chain again first. After a withdraw, Hyperliquid's withdrawable is
      already down, so a second `withdraw all` refuses (at most the 1 USDC fee left); both stages list Hyperliquid
-     withdrawals of the last 24 h and mark those under 30 min old as possibly in flight. The bridge moves only
-     USDC that is on Arbitrum: with some still in flight, `all` takes what arrived, and a typed amount over the
-     balance refuses at `--send`. If the relayer's outcome is unknown, the block names the authorization and its
-     expiry: do not bridge again before then (it may still execute); afterwards the balance tells. The contract's
-     deposit ring refuses a deposit address paid before, and USDC refuses an authorization used before.
+     withdrawals of the last 24 h and mark those under 30 min old as possibly in flight. Before signing anything,
+     `--send` also refuses (the dry run lists the same lines as `would refuse at --send`):
+     - **withdraw**, while a Hyperliquid withdrawal under 30 min old exists, or while an earlier `hl_withdraw` of
+       the desk (nearblocks, the last 2 days; the desk's Hyperliquid nonce from the contract state covers the
+       last minutes nearblocks may not have indexed, and stands in when nearblocks cannot be read) has no
+       `withdraw` in the ledger with its nonce: Hyperliquid takes a withdraw3 until about its time + 2 days (its
+       nonce window), and the line prints that end. Each ledger entry books at most one call. Each earlier call
+       prints as `booked` or `not in the Hyperliquid ledger`.
+     - **bridge**, while an earlier `evm_usdc_to_intents` of the desk (nearblocks, the last 24 h) may still be
+       used or has not settled: its authorization is valid until its block time + 300 s, and its deposit address
+       (the quote's own `depositAddress`) must be 1Click `SUCCESS` or `REFUNDED`, or expired and still
+       `PENDING_DEPOSIT`. `PROCESSING`, `KNOWN_DEPOSIT_TX`, `INCOMPLETE_DEPOSIT`, `FAILED` or an unreadable status
+       refuse. For what nearblocks has not indexed yet, it also reads the desk's counters from the contract state:
+       the EIP-3009 counter gives the last authorization's nonce (keccak256 of the desk id and the counter as a
+       big-endian u64), and Arbitrum USDC's `authorizationState(desk EVM, nonce)` tells whether it was used. An
+       unused one refuses until the newest rescue in the deposit ring is 300 s + 60 s old (the latest its
+       validBefore can be). A used one refuses for 10 min when it is newer than every call nearblocks lists. This
+       check runs before the live quote.
+     - Anything unreadable refuses (fails closed): nearblocks, the contract state (the desk's Hyperliquid nonce
+       or counters), or `authorizationState`. `--again` sends anyway and prints each overridden reason as
+       `override:` in the block: use it only after reading the ledger or the 1Click status yourself.
+     - Cases that refuse although nothing is wrong, and need `--again` once you have checked:
+       - withdraw, for 10 min after any newer Hyperliquid action of the desk that nearblocks does not list as an
+         `hl_withdraw` (an engine order, a transfer): the desk's nonce cannot tell which action it was;
+       - bridge, for 10 min after any newer rescue of the desk (`hl_send_to_intents`, a Solana rescue) while the
+         last authorization was used: the deposit ring is shared by all rescues;
+       - bridge, for 24 h, when a 1Click deposit address of an earlier `evm_usdc_to_intents` never got its deposit
+         and 1Click does not answer `PENDING_DEPOSIT` for it after the authorization expired (any other status or
+         no answer counts as not settled).
+
+     The bridge moves only USDC that is on Arbitrum: with some still in flight, `all` takes what arrived, and a
+     typed amount over the balance refuses at `--send`. If the relayer's outcome is unknown, the block names the
+     authorization and its expiry: do not bridge again before then (it may still execute); afterwards the balance
+     tells. When the NEAR transaction itself fails (or its outcome or SignedAction cannot be read), the block ends
+     with an `open:` line: a signature may already be public. For withdraw, a late withdraw3 can still be posted
+     within Hyperliquid's nonce window: check the ledger before any rerun. For bridge, the rescue is counted and a
+     late authorization is valid until block time + 300 s: do not rerun before then. The contract's deposit ring
+     refuses a deposit address paid before, and USDC refuses an authorization used before.
 
 ## Files the scripts write
 

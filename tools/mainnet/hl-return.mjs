@@ -3,9 +3,9 @@
 // "Return from Hyperliquid"). 1Click quotes nothing out of HyperCore, so the route goes through Arbitrum:
 //
 //   node tools/mainnet/hl-return.mjs <contract> <desk_id> withdraw <amount USDC | all>
-//        [--key-file <owner key json>] [--timeout-s <s, default 900>] [--send]
+//        [--key-file <owner key json>] [--timeout-s <s, default 900>] [--again] [--send]
 //   node tools/mainnet/hl-return.mjs <contract> <desk_id> bridge <amount USDC | all>
-//        [--key-file <operator key json>] [--slippage-bps <n, default 100>] [--timeout-s <s, default 900>] [--send]
+//        [--key-file <operator key json>] [--slippage-bps <n, default 100>] [--timeout-s <s, default 900>] [--again] [--send]
 //
 //   withdraw  Hyperliquid perps -> the desk's own EVM address on Arbitrum. The owner signs hl_withdraw(desk_id,
 //             amount) with 1 yoctoNEAR (owner only: --key-file is a full-access key of the desk owner); the contract
@@ -27,10 +27,18 @@
 // The script makes only hl_withdraw (withdraw) and evm_usdc_to_intents (bridge); any other contract call is
 // refused before it is signed. No key or .env value is printed. ARBITRUM_RPC_URL (shell environment) replaces the
 // public Arbitrum RPC, printed as its host. Every read fails closed. It ends with one block to paste back.
+//
+// Reruns: withdraw --send refuses while a Hyperliquid withdrawal under 30 min old exists, or while an earlier
+// hl_withdraw's withdraw3 (nearblocks, checked against the desk's Hyperliquid nonce) is not booked in the ledger
+// and still inside Hyperliquid's nonce window (its time + 2 days). bridge --send refuses while an earlier
+// evm_usdc_to_intents's authorization (valid until its block time + 300 s) may still be used or its 1Click deposit
+// has not settled (SUCCESS, REFUNDED, or expired unused); for what nearblocks has not indexed, the desk's EIP-3009
+// counter (contract state) and authorizationState on Arbitrum USDC stand in. Anything unreadable refuses.
+// --again sends anyway; the dry run lists the same reasons.
 
 import { UsageError, envValues, isMain, parseFlags, run } from './cli.mjs';
 import {
-  arbitrumBalances, arbitrumGasPrice, hyperliquidLedger, hyperliquidPerps, rpcUrls, unitsText,
+  NEARBLOCKS_API, arbitrumBalances, arbitrumGasPrice, hyperliquidLedger, hyperliquidPerps, rpcUrls, unitsText,
 } from './balances.mjs';
 import { sendRefusal } from './checks.mjs';
 import { OPERATOR_METHODS, operatorKeyFile } from './desk.mjs';
@@ -44,6 +52,8 @@ import {
   transferCostE8, usdE8Text, verifyQuote,
 } from './oneclick.mjs';
 import { ENTRY as RELAYER_ENTRY, ethText, evmAddressOf } from './relayer-wallet.mjs';
+import { deskCountersOf, hlNonceOf } from './retire.mjs';
+import { keccak256 } from '../testnet/near.mjs';
 import { OWNER_GAS_MARGIN } from './withdraw.mjs';
 
 export const STAGES = ['withdraw', 'bridge'];
@@ -68,10 +78,25 @@ const LEDGER_SLACK_MS = 60_000;
 /** Polls after 1Click says SUCCESS while the ledger has not shown the credit yet. */
 const POLLS_AFTER_SUCCESS = 30;
 
-const USAGE = `usage: node tools/mainnet/hl-return.mjs <contract> <desk_id> withdraw <amount USDC | all> [--key-file <owner key json>] [--timeout-s <s>] [--send]
-       node tools/mainnet/hl-return.mjs <contract> <desk_id> bridge <amount USDC | all> [--key-file <operator key json>] [--slippage-bps <n>] [--timeout-s <s>] [--send]
-  default: dry run (reads mainnet and asks a dry 1Click quote; signs nothing, no key needed)`;
-const SPEC = { '--key-file': 'value', '--slippage-bps': 'value', '--timeout-s': 'value', '--send': 'switch' };
+/** Hyperliquid takes a user-signed action (withdraw3) until about 2 days after its time: its nonce window. */
+export const HL_REPLAY_MS = 2 * 86_400_000;
+/** evm_usdc_to_intents signs validBefore = block time + 300 s; a minute of slack for clocks and the receipt's block. */
+export const AUTH_VALID_MS = 300_000;
+const AUTH_SLACK_MS = 60_000;
+/** The bridge stage looks this far back for earlier authorizations (1Click's own deposit window is far shorter). */
+export const BRIDGE_LOOKBACK_MS = 24 * 3_600_000;
+/** A Hyperliquid signature this recent may not be indexed by nearblocks yet. */
+const INDEX_LAG_MS = 10 * 60_000;
+/** An earlier hl_withdraw's withdraw3 time is the receipt block's (or a little later, when the desk's nonce was ahead). */
+const NONCE_AHEAD_MS = 3_000n;
+/** The Hyperliquid submitter's own wait for the ledger entry, before this script's announced wait takes over. */
+const SUBMIT_CONFIRM_MS = 5_000;
+
+const USAGE = `usage: node tools/mainnet/hl-return.mjs <contract> <desk_id> withdraw <amount USDC | all> [--key-file <owner key json>] [--timeout-s <s>] [--again] [--send]
+       node tools/mainnet/hl-return.mjs <contract> <desk_id> bridge <amount USDC | all> [--key-file <operator key json>] [--slippage-bps <n>] [--timeout-s <s>] [--again] [--send]
+  default: dry run (reads mainnet and asks a dry 1Click quote; signs nothing, no key needed)
+  --again: send although an earlier withdrawal or authorization of the stage may still land (read the printed reasons first)`;
+const SPEC = { '--key-file': 'value', '--slippage-bps': 'value', '--timeout-s': 'value', '--send': 'switch', '--again': 'switch' };
 
 export function parseHlReturnArgs(argv) {
   const { positional, values } = parseFlags(argv, SPEC);
@@ -95,7 +120,7 @@ export function parseHlReturnArgs(argv) {
   const timeoutS = values['--timeout-s'] === undefined ? 900 : Number(values['--timeout-s']);
   if (!Number.isInteger(timeoutS) || timeoutS < 60 || timeoutS > 3600) throw new UsageError('--timeout-s must be a whole number from 60 to 3600');
   return {
-    contract, deskId, stage, amount, slippage, timeoutS, send,
+    contract, deskId, stage, amount, slippage, timeoutS, send, again: values['--again'] === true,
     keyFile: values['--key-file'] ?? (stage === 'bridge' ? operatorKeyFile(contract) : null),
   };
 }
@@ -141,25 +166,359 @@ export function withdrawPlan(asked, withdrawableE6) {
 export const hlWithdrawActions = (deskId, amountE6) => [act.call('hl_withdraw', { desk_id: deskId, amount: usdcText(amountE6) }, ACTION_TGAS, ONE_YOCTO)];
 
 /** Why the SignedAction hl_withdraw returned is not the withdrawal asked for (an empty list when it is). */
-export function withdrawActionProblems(signed, { deskId, evm, amountText }) {
+/** The signatureChainId the contract signs user-signed Hyperliquid actions with (contract/core/src/hl.rs). */
+export const HL_SIGNATURE_CHAIN_ID = '0x66eee';
+
+export function withdrawActionProblems(signed, { deskId, evm, amountText, hyperliquidChain = 'Mainnet' }) {
   const out = [];
   const action = signed?.payload?.action ?? {};
   if (signed?.desk_id !== deskId) out.push(`signed for desk ${signed?.desk_id}, not ${deskId}`);
   if (signed?.venue !== 'hyperliquid') out.push(`venue ${signed?.venue}, not hyperliquid`);
   if (action.type !== 'withdraw3') out.push(`action type ${action.type}, not withdraw3`);
+  if (action.hyperliquidChain !== hyperliquidChain) out.push(`hyperliquidChain ${JSON.stringify(action.hyperliquidChain)} is not ${JSON.stringify(hyperliquidChain)}`);
+  if (typeof action.signatureChainId !== 'string' || action.signatureChainId.toLowerCase() !== HL_SIGNATURE_CHAIN_ID) {
+    out.push(`signatureChainId ${JSON.stringify(action.signatureChainId)} is not ${JSON.stringify(HL_SIGNATURE_CHAIN_ID)}`);
+  }
   if (typeof action.destination !== 'string' || action.destination.toLowerCase() !== evm.toLowerCase()) out.push(`destination ${action.destination} is not the desk EVM address ${evm}`);
   if (action.amount !== amountText) out.push(`amount ${JSON.stringify(action.amount)} is not ${JSON.stringify(amountText)}`);
+  if (!Number.isSafeInteger(Number(action.time)) || Number(action.time) <= 0) out.push(`time ${JSON.stringify(action.time)} is not a time in ms`);
   return out;
 }
 
+/** USDC text as Hyperliquid writes it ("1.0", "10.682396") in 1e-6 units, or null. */
+function micros(value) {
+  const m = /^(\d+)(?:\.(\d{1,6}))?$/.exec(String(value ?? '').trim());
+  return m === null ? null : BigInt(m[1]) * 1_000_000n + BigInt((m[2] ?? '').padEnd(6, '0'));
+}
+
 /**
- * The Hyperliquid ledger entry of this withdrawal, or null: a `withdraw` booked since `since`, with the action's
- * nonce (its `time`) when the entry carries one, otherwise of the amount (or the amount less the fee).
+ * The withdraw3 time (ms, BigInt) a ledger `withdraw` entry's nonce names, or null when it has none. Hyperliquid
+ * books the action's time x 1000 ({"usdc":"10.682396","nonce":1793669928713000,"fee":"1.0"} for time
+ * 1793669928713); a bare ms time is read as itself, in case that changes.
  */
-export function hlWithdrawEntry(entries, { since, nonce, amountE6 }) {
-  return entries.find((e) => e.type === 'withdraw' && e.time >= since && (e.delta.nonce !== undefined
-    ? Number(e.delta.nonce) === Number(nonce)
-    : e.usdcE6 !== null && (e.usdcE6 === amountE6 || e.usdcE6 === amountE6 - HL_WITHDRAW_FEE_E6))) ?? null;
+export function withdrawNonceMs(delta) {
+  if (delta?.nonce === undefined || delta.nonce === null) return null;
+  let n;
+  try {
+    n = BigInt(String(delta.nonce));
+  } catch {
+    return -1n;
+  }
+  if (n >= 10n ** 14n) return n % 1000n === 0n ? n / 1000n : -1n;
+  return n;
+}
+
+/** Whether a ledger entry without a nonce is a withdrawal of `amountE6`: its usdc plus its own fee. */
+const isWithdrawOf = (e, amountE6) => {
+  const fee = micros(e.delta?.fee ?? '0');
+  return e.usdcE6 !== null && fee !== null && e.usdcE6 + fee === amountE6;
+};
+
+/**
+ * The Hyperliquid ledger entry of this withdrawal, or null: a `withdraw` booked since `since` whose nonce is the
+ * action's `time` (withdrawNonceMs), or, for an entry without a nonce, whose usdc + fee is the amount.
+ */
+export function hlWithdrawEntry(entries, { since, time, amountE6 }) {
+  return entries.find((e) => {
+    if (e.type !== 'withdraw' || e.time < since) return false;
+    const ms = withdrawNonceMs(e.delta);
+    return ms === null ? isWithdrawOf(e, amountE6) : ms === BigInt(time);
+  }) ?? null;
+}
+
+const iso = (ms) => new Date(Number(ms)).toISOString();
+
+/** A nearblocks transaction's receipt block time, ms (the contract's block_timestamp_ms for the call), or null. */
+function receiptMs(t) {
+  const rb = t?.receipt_block?.block_timestamp;
+  if (typeof rb === 'number' && Number.isFinite(rb)) return Math.floor(rb / 1e6);
+  if (typeof rb === 'string' && /^\d+$/.test(rb)) return Number(BigInt(rb) / 1_000_000n);
+  const tb = t?.block_timestamp;
+  if (typeof tb === 'string' && /^\d+$/.test(tb)) return Number(BigInt(tb) / 1_000_000n);
+  return null;
+}
+
+/**
+ * A quote string as nearblocks gives it inside a call's args, as an object, or null. nearblocks escapes the
+ * quote's own quotes once more ({\\\"amount\\\":... once the args are parsed), so each level of escaping is
+ * removed until it parses as an object.
+ */
+export function quoteObjectOf(text) {
+  let s = text;
+  for (let i = 0; i < 4 && typeof s === 'string'; i++) {
+    try {
+      const v = JSON.parse(s);
+      if (v !== null && typeof v === 'object') return v;
+      s = v;
+      continue;
+    } catch {
+      // not JSON yet: one level of escaping to remove
+    }
+    try {
+      s = JSON.parse(`"${s}"`);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * The deposit address of an evm_usdc_to_intents call: the quote's own depositAddress (the args JSON, then the
+ * quote JSON). Only when the quote cannot be parsed, the first address after "depositAddress" in the quote's text;
+ * when the args are not JSON either, in the args text before `reason`. Never an address inside `reason`.
+ */
+export function depositAddressOf(args, raw) {
+  const quote = typeof args?.quote === 'string' ? args.quote : null;
+  const parsed = quote === null ? null : quoteObjectOf(quote);
+  if (typeof parsed?.depositAddress === 'string' && /^0x[0-9a-fA-F]{40}$/.test(parsed.depositAddress)) return parsed.depositAddress;
+  if (parsed !== null) return null;
+  const text = quote ?? (args === null ? String(raw ?? '').split('reason')[0] : '');
+  return /depositAddress[^0-9a-zA-Z]*(0x[0-9a-fA-F]{40})/.exec(text)?.[1] ?? null;
+}
+
+/**
+ * The contract's calls of `method` for `deskId` since `sinceMs`, newest first, from nearblocks:
+ * { hash, ms (the receipt block's), accepted (false when the contract refused it: nothing was signed), args }.
+ * A call whose desk cannot be read is kept (it may be this desk's). Throws when nearblocks cannot be read.
+ */
+export async function deskCalls(fetchImpl, contract, method, deskId, sinceMs) {
+  const out = [];
+  let cursor = null;
+  for (let page = 0; page < 20; page++) {
+    const url = `${NEARBLOCKS_API}/account/${contract}/txns?method=${method}&per_page=25${cursor === null ? '' : `&cursor=${encodeURIComponent(cursor)}`}`;
+    const res = await fetchImpl(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(30_000) });
+    const body = await res.json().catch(() => null);
+    if (!res.ok || !Array.isArray(body?.txns)) throw new Error(`nearblocks ${method} calls: HTTP ${res.status}`);
+    let older = false;
+    for (const t of body.txns) {
+      const ms = receiptMs(t);
+      if (ms === null) throw new Error(`nearblocks: ${t?.transaction_hash} has no block time`);
+      if (ms < sinceMs) {
+        older = true;
+        continue;
+      }
+      for (const x of t.actions ?? []) {
+        if (x?.method !== method) continue;
+        const raw = typeof x.args === 'string' ? x.args : JSON.stringify(x.args ?? null);
+        let args = null;
+        try {
+          args = JSON.parse(raw);
+        } catch {
+          // read the fields below from the text
+        }
+        const desk = typeof args?.desk_id === 'string' ? args.desk_id : (/desk_id[^a-z0-9-]*([a-z0-9-]{1,32})/.exec(raw)?.[1] ?? null);
+        if (desk !== null && desk !== deskId) continue;
+        out.push({
+          hash: t.transaction_hash, ms, accepted: t.receipt_outcome?.status !== false, args, deskKnown: desk !== null,
+          amount: typeof args?.amount === 'string' ? args.amount : null,
+          depositAddress: depositAddressOf(args, raw),
+        });
+      }
+    }
+    if (older || !body.cursor || body.txns.length === 0) return out.sort((x, y) => y.ms - x.ms);
+    cursor = body.cursor;
+  }
+  throw new Error(`nearblocks: more than 20 pages of ${method} calls`);
+}
+
+/**
+ * What stops withdraw --send (without --again): a Hyperliquid withdrawal under 30 min old (it may still be on its
+ * way to Arbitrum), or an hl_withdraw whose withdraw3 the ledger has not booked (Hyperliquid would still take it
+ * until its time + 2 days). `calls` (deskCalls of hl_withdraw, or the Error nearblocks gave), `entries` (the
+ * ledger since now - 2 days), `hlNonce` (the desk's last Hyperliquid nonce, BigInt ms, or null if unread).
+ * Returns { lines, refusals }.
+ */
+export function withdrawGuards({ calls, entries, hlNonce, nowMs }) {
+  const lines = [];
+  const refusals = [];
+  const withdraws = entries.filter((e) => e.type === 'withdraw');
+  for (const w of recentWithdraws(withdraws, nowMs).filter((x) => x.inFlight)) {
+    refusals.push(`a Hyperliquid withdrawal of ${w.usdcE6 === null ? '?' : usdcText(w.usdcE6)} USDC booked at ${iso(w.time)} is under 30 min old: it may still be on its way to Arbitrum (bridge it first)`);
+  }
+  // How well a ledger entry fits a signature at `ms` (smaller is closer), or null: by nonce within the window,
+  // else (no nonce) by amount, ranked after every nonce match.
+  const fit = (e, ms, amountText) => {
+    const n = withdrawNonceMs(e.delta);
+    if (n !== null) {
+      if (n < BigInt(ms) - 1n || n > BigInt(ms) + NONCE_AHEAD_MS) return null;
+      return n >= BigInt(ms) ? n - BigInt(ms) : BigInt(ms) - n;
+    }
+    const amount = amountText === null ? null : micros(amountText);
+    return amount !== null && e.time >= ms - LEDGER_SLACK_MS && isWithdrawOf(e, amount) ? 10n ** 15n + BigInt(Math.abs(e.time - ms)) : null;
+  };
+  const taken = new Set();
+  const bookedAt = (ms, amountText) => withdraws.find((e) => !taken.has(e) && fit(e, ms, amountText) !== null) ?? null;
+  const replayEnd = (ms) => iso(Number(ms) + HL_REPLAY_MS);
+  if (calls instanceof Error) {
+    lines.push(`hl_withdraw calls not read: ${calls.message}`);
+    if (hlNonce === null) refusals.push(`nearblocks (${calls.message}) and the desk's Hyperliquid nonce could not be read: an earlier hl_withdraw signature cannot be ruled out`);
+    else if (hlNonce > 0n && nowMs - Number(hlNonce) < HL_REPLAY_MS && bookedAt(Number(hlNonce), null) === null) {
+      refusals.push(`nearblocks could not be read (${calls.message}) and the desk signed a Hyperliquid action at ${iso(hlNonce)} that the ledger does not show as a withdraw: `
+        + `if it was an hl_withdraw, Hyperliquid takes it until ${replayEnd(hlNonce)}`);
+    }
+    return { lines, refusals };
+  }
+  // One to one: each ledger entry books at most one signature, the closest pairs first, so two hl_withdraw calls
+  // a moment apart are never both booked by one withdraw.
+  const pairs = [];
+  for (const c of calls.filter((x) => x.accepted)) {
+    for (const e of withdraws) {
+      const f = fit(e, c.ms, c.amount);
+      if (f !== null) pairs.push({ c, e, f });
+    }
+  }
+  pairs.sort((x, y) => (x.f < y.f ? -1 : x.f > y.f ? 1 : 0));
+  const booking = new Map();
+  for (const p of pairs) {
+    if (booking.has(p.c) || taken.has(p.e)) continue;
+    booking.set(p.c, p.e);
+    taken.add(p.e);
+  }
+  for (const c of calls) {
+    if (!c.accepted) {
+      lines.push(`hl_withdraw ${c.hash} at ${iso(c.ms)}: refused by the contract (nothing signed)`);
+      continue;
+    }
+    const hit = booking.get(c) ?? null;
+    if (hit !== null) {
+      lines.push(`hl_withdraw ${c.hash} (${c.amount ?? '?'} USDC) at ${iso(c.ms)}: booked, ledger ${hit.hash}${hit.delta.nonce === undefined ? '' : ` (nonce ${hit.delta.nonce})`}`);
+      continue;
+    }
+    const open = nowMs < c.ms + HL_REPLAY_MS;
+    lines.push(`hl_withdraw ${c.hash} (${c.amount ?? '?'} USDC) at ${iso(c.ms)}: not in the Hyperliquid ledger${open ? `; its withdraw3 can still be posted until about ${replayEnd(c.ms)}` : ''}`);
+    if (open) {
+      refusals.push(`hl_withdraw ${c.hash} (${c.amount ?? '?'} USDC${c.deskKnown ? '' : ', desk not readable'}) signed a withdraw3 at about ${iso(c.ms)} that the Hyperliquid ledger does not show: `
+        + `Hyperliquid takes it until about ${replayEnd(c.ms)} (its nonce window); read userNonFundingLedgerUpdates before withdrawing again`);
+    }
+  }
+  if (hlNonce === null) {
+    refusals.push('the desk\'s Hyperliquid nonce (contract state) could not be read: an hl_withdraw signed in the last minutes, before nearblocks lists it, cannot be ruled out');
+  } else if (hlNonce > 0n) {
+    const newest = Math.max(0, ...calls.filter((c) => c.accepted).map((c) => c.ms));
+    lines.push(`desk Hyperliquid nonce ${hlNonce} (${iso(hlNonce)}): the time of the last Hyperliquid action the contract signed for the desk`);
+    if (Number(hlNonce) > newest + Number(NONCE_AHEAD_MS) && nowMs - Number(hlNonce) < INDEX_LAG_MS && bookedAt(Number(hlNonce), null) === null) {
+      refusals.push(`the desk signed a Hyperliquid action at ${iso(hlNonce)} that nearblocks does not list yet: if it is an hl_withdraw it is not checked here; wait ${INDEX_LAG_MS / 60_000} min`);
+    }
+  }
+  return { lines, refusals };
+}
+
+/**
+ * Why an earlier evm_usdc_to_intents (deskCalls) stops bridge --send, or null: its authorization can still be
+ * used (validBefore = its block time + 300 s) or 1Click has not settled its deposit. `status` is the 1Click
+ * status text (or 'unread ...'). Settled: SUCCESS, REFUNDED, or expired while still PENDING_DEPOSIT.
+ */
+export function authorizationProblem(c, status, nowMs) {
+  const until = c.ms + AUTH_VALID_MS + AUTH_SLACK_MS;
+  if (status === 'SUCCESS' || status === 'REFUNDED') return null;
+  if (nowMs >= until && status === 'PENDING_DEPOSIT') return null;
+  const what = `evm_usdc_to_intents ${c.hash} at ${iso(c.ms)} (deposit address ${c.depositAddress ?? 'not readable'})`;
+  if (nowMs < until) return `${what}: its authorization is valid until about ${iso(until)} and 1Click says ${status}: do not bridge again before then`;
+  if (status === 'FAILED') return `${what}: 1Click says FAILED; read GET /v0/status for it (a refund goes to the desk EVM address) before bridging again`;
+  return `${what}: 1Click says ${status}: its deposit has not settled`;
+}
+
+/** The EIP-3009 nonce the contract signs for counter `counter` of a desk: keccak256(desk_id ‖ counter as u64 big-endian). */
+export function eip3009NonceOf(deskId, counter) {
+  const n = Buffer.alloc(8);
+  n.writeBigUInt64BE(BigInt(counter));
+  return `0x${Buffer.from(keccak256(Buffer.concat([Buffer.from(deskId), n]))).toString('hex')}`;
+}
+
+/** authorizationState(address,bytes32) on Arbitrum USDC: whether the authorizer used (or canceled) that nonce. */
+export async function authorizationUsed(fetchImpl, url, authorizer, nonce) {
+  const call = async (method, params) => {
+    const res = await fetchImpl(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal: AbortSignal.timeout(30_000) });
+    const body = await res.json().catch(() => null);
+    if (!res.ok || typeof body?.result !== 'string' || !/^0x[0-9a-fA-F]*$/.test(body.result)) throw new Error(`chain 42161 ${method}: HTTP ${res.status} ${JSON.stringify(body?.error ?? body).slice(0, 200)}`);
+    return body.result;
+  };
+  if (BigInt(await call('eth_chainId', [])) !== BigInt(ARBITRUM_ONE)) throw new Error('the Arbitrum RPC is not chain 42161');
+  if (!/^0x[0-9a-fA-F]{40}$/.test(authorizer) || !/^0x[0-9a-f]{64}$/.test(nonce)) throw new Error('authorizationState: bad authorizer or nonce');
+  const data = `0xe94a0102${authorizer.slice(2).toLowerCase().padStart(64, '0')}${nonce.slice(2)}`;
+  const out = await call('eth_call', [{ to: ARBITRUM_USDC, data }, 'latest']);
+  if (out.length !== 66) throw new Error(`authorizationState answered ${out.slice(0, 80)}, not one word`);
+  return BigInt(out) !== 0n;
+}
+
+/**
+ * What the contract's own record says of the desk's authorizations, without nearblocks: `counters` (DeskCounters:
+ * eip3009_next, the deposit ring's paid times; null when no rescue was ever counted), `lastUsed` (the last
+ * authorization's authorizationState, or null when there is none), `listedMs` (the receipt times nearblocks lists
+ * for accepted evm_usdc_to_intents). The ring's newest paid time bounds every authorization's block time, so its
+ * validBefore is at most that + 300 s. Returns { lines, refusals }.
+ */
+export function counterGuards({ deskId, counters, lastUsed, listedMs, nowMs }) {
+  const lines = [];
+  const refusals = [];
+  if (counters === null) {
+    lines.push('no rescue counter record: the contract never counted a rescue for the desk');
+    return { lines, refusals };
+  }
+  const next = BigInt(counters.eip3009_next);
+  const newest = counters.deposit_paid_ms.reduce((m, x) => (BigInt(x) > m ? BigInt(x) : m), 0n);
+  const newestMs = Number(newest);
+  lines.push(`desk EIP-3009 counter ${next} (the next nonce's); the last rescue counted at ${newest === 0n ? 'never' : iso(newestMs)}`);
+  if (next === 0n) return { lines, refusals };
+  const nonce = eip3009NonceOf(deskId, next - 1n);
+  const until = newestMs + AUTH_VALID_MS + AUTH_SLACK_MS;
+  lines.push(`last authorization (counter ${next - 1n}, nonce ${nonce}): ${lastUsed ? 'used on Arbitrum USDC' : 'not used on Arbitrum USDC'}`);
+  if (!lastUsed && nowMs < until) {
+    refusals.push(`the desk's last authorization (counter ${next - 1n}, nonce ${nonce}) is not used on Arbitrum USDC and may be valid until about ${iso(until)} `
+      + '(its rescue\'s block time + 300 s at most): do not bridge again before then');
+  }
+  // A rescue newer than every listed call: if it is an evm_usdc_to_intents it is the last authorization, so only
+  // a used one (money sent to a deposit address nearblocks does not show yet) needs its 1Click status.
+  const newestListed = Math.max(0, ...listedMs);
+  if (lastUsed && newestMs > newestListed + Number(NONCE_AHEAD_MS) && nowMs - newestMs < INDEX_LAG_MS) {
+    refusals.push(`the desk counted a rescue at ${iso(newestMs)} that nearblocks does not list as an evm_usdc_to_intents yet: if it is one, its 1Click deposit is not checked here; `
+      + `wait ${INDEX_LAG_MS / 60_000} min`);
+  }
+  return { lines, refusals };
+}
+
+/**
+ * The desk's earlier authorizations: nearblocks' calls and what 1Click says of each, then the contract's own
+ * counter and the last nonce's state on Arbitrum (counterGuards), for what nearblocks has not indexed yet.
+ * { lines, refusals }. Fails closed: anything unreadable refuses.
+ */
+async function bridgeGuards({ fetchImpl, client, urls, contract, deskId, evm, nowMs, apiKey }) {
+  const lines = [];
+  const refusals = [];
+  let calls;
+  try {
+    calls = await deskCalls(fetchImpl, contract, 'evm_usdc_to_intents', deskId, nowMs - BRIDGE_LOOKBACK_MS);
+  } catch (e) {
+    refusals.push(`earlier evm_usdc_to_intents calls could not be read (${e.message}): an authorization still valid cannot be ruled out`);
+    return { lines, refusals };
+  }
+  try {
+    const counters = await deskCountersOf(client, contract, deskId);
+    const next = counters === null ? 0n : BigInt(counters.eip3009_next);
+    const lastUsed = next === 0n ? null : await authorizationUsed(fetchImpl, urls.arbitrum, evm, eip3009NonceOf(deskId, next - 1n));
+    const g = counterGuards({ deskId, counters, lastUsed, listedMs: calls.filter((c) => c.accepted).map((c) => c.ms), nowMs });
+    lines.push(...g.lines);
+    refusals.push(...g.refusals);
+  } catch (e) {
+    refusals.push(`the desk's EIP-3009 counter or its last nonce on Arbitrum could not be read (${e.message}): an authorization nearblocks has not indexed cannot be ruled out`);
+  }
+  if (calls.length === 0) lines.push('no evm_usdc_to_intents for the desk in the last 24 h');
+  for (const c of calls) {
+    if (!c.accepted) {
+      lines.push(`evm_usdc_to_intents ${c.hash} at ${iso(c.ms)}: refused by the contract (nothing signed)`);
+      continue;
+    }
+    let status = 'unread (no deposit address in its quote)';
+    if (c.depositAddress !== null) {
+      const s = await quoteStatus(fetchImpl, c.depositAddress, apiKey).catch((e) => ({ status: 0, body: { status: `unread (${e.message})` } }));
+      status = s.body?.status ?? `unread (HTTP ${s.status})`;
+    }
+    lines.push(`evm_usdc_to_intents ${c.hash} at ${iso(c.ms)} to ${c.depositAddress ?? '?'}: 1Click ${status}`);
+    const p = authorizationProblem(c, status, nowMs);
+    if (p !== null) refusals.push(p);
+  }
+  return { lines, refusals };
 }
 
 /** The Hyperliquid ledger's withdrawals, each with whether it may still be on its way to Arbitrum. */
@@ -307,8 +666,9 @@ export async function runHlReturn(argv, deps = {}) {
   const status = await ctx.client.rpc('status', []);
   ctx.say(`chain     ${status.chain_id}, block ${status.sync_info.latest_block_height}`);
   const method = ALLOWED_CALLS[a.stage][0];
-  const { desk } = await moneyContext(ctx.client, a.contract, a.deskId, [method]);
+  const { desk, config } = await moneyContext(ctx.client, a.contract, a.deskId, [method]);
   ctx.desk = desk;
+  ctx.hyperliquidChain = config?.network === 'Testnet' ? 'Testnet' : 'Mainnet';
   ctx.say(`contract  ${a.contract}: Mainnet Gimbal, its code has ${method}`);
   ctx.say(`desk      ${a.deskId}: owner ${desk.owner}, operator ${desk.operator ?? 'none (the operator key is on the owner\'s account)'}, paused ${desk.paused}, EVM ${desk.evm_address}`);
   ctx.say(`ledger    ${ledgerText(ledgerOf(desk))}`);
@@ -323,18 +683,55 @@ async function gasLine(client, signer, receiver, actions) {
   return `  gas       at most ${tgasText(cap.total)} TGas, ${nearTextUp(cap.total * gasPrice, 4)} NEAR (an action method needs at least ${ACTION_MIN_TGAS}); the unused part is refunded`;
 }
 
-async function withdrawStage({ a, client, fetchImpl, say, now, sleep, pollMs, urls, desk, at, deps }) {
+/** The `open:` line after hl_withdraw failed on NEAR (near-client.ts signatureMayBePublic, for withdraw3). */
+export const withdrawOpenLine = (hash, nowMs) => `open:     hl_withdraw ${hash} failed on NEAR, but a signature of its withdraw3 may be public (the failure can come after the MPC network signed): `
+  + `a late withdraw3 can still be posted within Hyperliquid's nonce window (until about ${iso(nowMs + HL_REPLAY_MS)}); check the ledger (userNonFundingLedgerUpdates) before any rerun`;
+/** The `open:` line after evm_usdc_to_intents failed on NEAR: the same, for an EIP-3009 authorization. */
+export const bridgeOpenLine = (hash, nowMs) => `open:     evm_usdc_to_intents ${hash} failed on NEAR, but a signature of its authorization may be public (the failure can come after the MPC network signed): `
+  + `the rescue is counted, and a late authorization is valid until block time + 300 s (about ${iso(nowMs + AUTH_VALID_MS + AUTH_SLACK_MS)}); do not rerun bridge before then`;
+
+/** Guard refusals: refused at --send (and listed by the dry run) unless --again, which only prints them. */
+function applyGuard(a, say, refusals, lines, found) {
+  for (const r of found) {
+    if (a.again) {
+      say(`override  ${r} (--again)`);
+      lines.push(`override: ${r} (--again)`);
+    } else {
+      refusals.push(`${r} (--again sends anyway)`);
+    }
+  }
+}
+
+async function withdrawStage({ a, client, fetchImpl, say, now, sleep, pollMs, urls, desk, at, deps, hyperliquidChain }) {
   const evm = desk.evm_address;
   // Every read fails closed: nothing here is taken as 0 because it could not be read.
   const perps = await hyperliquidPerps(fetchImpl, evm);
   const arb = await arbitrumBalances(fetchImpl, urls.arbitrum, evm);
-  const withdraws = recentWithdraws(await hyperliquidLedger(fetchImpl, evm, now() - LEDGER_LOOKBACK_MS), now());
+  const since = now() - HL_REPLAY_MS - 3_600_000;
+  const entries = await hyperliquidLedger(fetchImpl, evm, since);
+  const withdraws = recentWithdraws(entries.filter((e) => e.type === 'withdraw' && now() - e.time <= LEDGER_LOOKBACK_MS), now());
   say(`hyperliq  perps withdrawable ${usdcText(perps.withdrawableE6)} USDC, account value ${usdcText(perps.accountValueE6)}, ${perps.positions} open position(s)`);
   say(`arbitrum  desk EVM ${evm} (RPC ${urls.shown.arbitrum}): ${usdcText(arb.usdcE6)} USDC, ${ethText(arb.wei)} ETH`);
   for (const w of withdraws) say(`earlier   ${withdrawLine(w)}`);
   if (withdraws.length === 0) say('earlier   no Hyperliquid withdrawal in the last 24 h');
+  // Earlier signatures: the contract's hl_withdraw calls (nearblocks) against the ledger, and the desk's nonce.
+  const calls = await deskCalls(fetchImpl, a.contract, 'hl_withdraw', a.deskId, since).catch((e) => e);
+  const hlNonce = await hlNonceOf(client, a.contract, a.deskId).catch(() => null);
+  const guard = withdrawGuards({ calls, entries, hlNonce, nowMs: now() });
+  for (const l of guard.lines) say(`signed    ${l}`);
+  if (!(calls instanceof Error) && calls.length === 0) say('signed    no hl_withdraw for the desk in the last 2 days');
+  const refusals = [];
+  const overrides = [];
+  applyGuard(a, say, refusals, overrides, guard.refusals);
+  for (const r of refusals) say(`refuses   ${r}`);
+  if (a.send && refusals.length > 0) throw new Error(`withdraw --send refused, nothing was signed: ${refusals.join('; ')}`);
   const plan = withdrawPlan(a.amount, perps.withdrawableE6);
   if (perps.positions > 0) say(`warning   the desk has ${perps.positions} open position(s): withdrawing margin raises their liquidation risk`);
+  const capE8 = BigInt(desk.policy.rescue_cap_usd_per_hour) * 100_000_000n;
+  const overCap = plan.arrival * 100n > capE8;
+  const capWarning = `${usdcText(plan.arrival)} USDC arriving is over the desk's hourly rescue cap of ${desk.policy.rescue_cap_usd_per_hour} USD: `
+    + `the bridge stage takes it in parts an hour apart (at most ${desk.policy.rescue_cap_usd_per_hour} USDC each)`;
+  if (overCap) say(`warning   ${capWarning}`);
 
   const owner = desk.owner;
   const free = freeBalance(await client.account(owner));
@@ -365,12 +762,16 @@ async function withdrawStage({ a, client, fetchImpl, say, now, sleep, pollMs, ur
   lines.push(`hyperliquid: perps withdrawable ${usdcText(perps.withdrawableE6)} USDC, account value ${usdcText(perps.accountValueE6)}, positions ${perps.positions}`);
   lines.push(`arbitrum: desk EVM ${evm} ${usdcText(arb.usdcE6)} USDC`);
   for (const w of withdraws.filter((x) => x.inFlight)) lines.push(`earlier:  ${withdrawLine(w)}`);
+  lines.push(...overrides);
+  if (overCap) lines.push(`warning:  ${capWarning}`);
   if (!a.send) {
     lines.push(`withdraw: hl_withdraw ${JSON.stringify(actions[0].args)} planned; ${usdcText(plan.arrival)} USDC expected on Arbitrum (amount - ${usdcText(HL_WITHDRAW_FEE_E6)} USDC fee)`);
+    for (const x of refusals) lines.push(`would refuse at --send: ${x}`);
     const block = summaryBlock('hl-return', { at: at(), lines });
     say();
     say(block.join('\n'));
     say('\ndry run: nothing was signed or sent. Add --send and --key-file <owner key json>, from the main checkout, to send it.');
+    if (refusals.length > 0) throw new Error(`--send would refuse: ${refusals.join('; ')}`);
     return block;
   }
 
@@ -382,55 +783,88 @@ async function withdrawStage({ a, client, fetchImpl, say, now, sleep, pollMs, ur
   };
   const engine = await (deps.engine ?? defaultEngine)();
   const sentAt = now();
-  const out = await guardedSend(client, 'withdraw', a.contract)(signer, a.contract, actions, { onSent: (h) => say(`\ntx sent ${h}; waiting for final`) });
+  let sentHash = null;
+  let out;
+  try {
+    out = await guardedSend(client, 'withdraw', a.contract)(signer, a.contract, actions, { onSent: (h) => { sentHash = h; say(`\ntx sent ${h}; waiting for final`); } });
+  } catch (e) {
+    if (sentHash !== null) done([`near:     hl_withdraw tx ${sentHash}: no final outcome (${e.message})`, withdrawOpenLine(sentHash, now())]);
+    throw e;
+  }
   say(`tx final: ${txLink(out.hash)} (${out.burntTgas} TGas, ${nearText(out.burntYocto, 6)} NEAR burnt)`);
   for (const log of out.logs) say(`  log ${log}`);
   lines.push(`near:     hl_withdraw tx ${out.hash} ${out.failure === null ? 'returned a SignedAction' : `FAILED ${panicOf(out.failure)}`}`);
   if (out.failure !== null) {
-    done();
+    done([withdrawOpenLine(out.hash, now())]);
     throw new Error(`hl_withdraw ${out.hash}: ${panicOf(out.failure)} (${txLink(out.hash)})`);
   }
   let signed;
   try {
     signed = engine.parseSignedAction('hl_withdraw', out.value, a.deskId);
   } catch (e) {
-    done([`open:     the transaction ran but its SignedAction cannot be read: ${e.message}; look it up before running anything again`]);
+    done([`open:     the transaction ran but its SignedAction cannot be read: ${e.message}; a withdraw3 may still have been signed `
+      + `(Hyperliquid takes it until about ${iso(now() + HL_REPLAY_MS)}): look it up and check the ledger before running anything again`]);
     throw e;
   }
-  const problems = withdrawActionProblems(signed, { deskId: a.deskId, evm, amountText });
+  const problems = withdrawActionProblems(signed, { deskId: a.deskId, evm, amountText, hyperliquidChain });
   if (problems.length > 0) {
     done([`refused:  the signed action is not the withdrawal asked for; not posted: ${problems.join('; ')}`]);
     throw new Error(`the signed action is not the withdrawal asked for; nothing was posted:\n  ${problems.join('\n  ')}`);
   }
-  const nonce = signed.payload.action.time ?? signed.payload.nonce;
-  say(`signed    withdraw3 to ${signed.payload.action.destination}, amount "${signed.payload.action.amount}", time ${nonce}; posting to Hyperliquid`);
-  const submitter = new engine.HyperliquidSubmitter({ network: 'mainnet', fetch: fetchImpl, clock: { now }, confirmMs: 60_000, pollMs: 3_000, sleep });
+  const time = Number(signed.payload.action.time);
+  const replayEnd = iso(time + HL_REPLAY_MS);
+  say(`signed    withdraw3 to ${signed.payload.action.destination}, amount "${signed.payload.action.amount}", time ${time}`);
+  say(`posting   to https://api.hyperliquid.xyz/exchange; then up to ${SUBMIT_CONFIRM_MS / 1000} s for its ledger entry (withdraw, nonce ${time}000)`);
+  const submitter = new engine.HyperliquidSubmitter({
+    network: hyperliquidChain === 'Testnet' ? 'testnet' : 'mainnet', fetch: fetchImpl, clock: { now }, confirmMs: SUBMIT_CONFIRM_MS, pollMs: 2_500, sleep,
+  });
   try {
     const r = await submitter.submit(signed, evm);
-    lines.push(`hyperliquid: /exchange accepted withdraw3 (time ${nonce})${r.confirmed ? `; ledger ${r.tx.filter((t) => t.chain === 'hyperliquid').map((t) => t.id).join(', ')}` : ''}`);
+    lines.push(`hyperliquid: /exchange accepted withdraw3 (time ${time})${r.confirmed ? `; ledger ${r.tx.filter((t) => t.chain === 'hyperliquid').map((t) => t.id).join(', ')}` : ''}`);
   } catch (e) {
-    done([`hyperliquid: ${e.name ?? 'error'}: ${e.message}`, `open:     withdraw3 time ${nonce}: read the Hyperliquid ledger (userNonFundingLedgerUpdates) before running withdraw again`]);
+    const refused = e.name === 'HlExchangeError';
+    done([
+      `hyperliquid: ${e.name ?? 'error'}${refused ? ' (Hyperliquid refused it)' : ' (no answer: it may have been taken)'}: ${e.message}`,
+      `open:     withdraw3 time ${time} is signed and was sent to Hyperliquid: it can still be posted until about ${replayEnd} (Hyperliquid's nonce window); `
+        + `read the ledger (userNonFundingLedgerUpdates, a withdraw with nonce ${time}000) before any rerun; the next withdraw dry run checks it`,
+    ]);
     throw e;
   }
-  // Hyperliquid's own record: a `withdraw` in the desk's non-funding ledger with this action's nonce.
-  let entry = null;
-  for (let i = 0; i < 20 && entry === null; i++) {
-    const entries = await hyperliquidLedger(fetchImpl, evm, sentAt - LEDGER_SLACK_MS).catch(() => []);
-    entry = hlWithdrawEntry(entries, { since: sentAt - LEDGER_SLACK_MS, nonce, amountE6: plan.amount });
-    if (entry === null) await sleep(Math.min(pollMs, 3_000));
-  }
-  lines.push(entry === null
-    ? 'ledger:   no Hyperliquid withdraw entry for this action yet: check userNonFundingLedgerUpdates before counting it'
-    : `ledger:   Hyperliquid withdraw ${entry.usdcE6 === null ? '' : `${usdcText(entry.usdcE6)} USDC `}${entry.delta.fee === undefined ? '' : `fee ${entry.delta.fee} `}at ${new Date(entry.time).toISOString()}, ${entry.hash}`);
-  // Then the bridge to Arbitrum: the desk EVM's USDC up by at least amount - fee.
+  // Hyperliquid's own record (a `withdraw` with nonce time x 1000) and the bridge to Arbitrum (the desk EVM's
+  // USDC up by at least amount - fee), read together until --timeout-s; the wait is announced, then reported.
   const deadline = now() + a.timeoutS * 1000;
+  say(`waiting   up to ${a.timeoutS} s (--timeout-s) for Hyperliquid's ledger entry (withdraw, nonce ${time}000) and +${usdcText(plan.arrival)} USDC `
+    + `at the desk EVM on Arbitrum (usually a few minutes), reading both every ${Math.round(pollMs / 1000)} s`);
+  let entry = null;
   let arbNow = arb.usdcE6;
+  let arrived = false;
+  let pollsAfterArrival = 0;
+  let lastNote = now();
   for (;;) {
-    arbNow = await arbitrumBalances(fetchImpl, urls.arbitrum, evm).then((b) => b.usdcE6).catch(() => arbNow);
-    if (arbNow - arb.usdcE6 >= plan.arrival || now() >= deadline) break;
+    if (entry === null) {
+      const rows = await hyperliquidLedger(fetchImpl, evm, sentAt - LEDGER_SLACK_MS).catch(() => null);
+      entry = rows === null ? null : hlWithdrawEntry(rows, { since: sentAt - LEDGER_SLACK_MS, time, amountE6: plan.amount });
+      if (entry !== null) say(`ledger    Hyperliquid booked the withdraw at ${iso(entry.time)}: usdc ${entry.delta.usdc ?? '?'}, fee ${entry.delta.fee ?? '?'}, ${entry.hash}`);
+    }
+    if (!arrived) {
+      arbNow = await arbitrumBalances(fetchImpl, urls.arbitrum, evm).then((b) => b.usdcE6).catch(() => arbNow);
+      arrived = arbNow - arb.usdcE6 >= plan.arrival;
+      if (arrived) say(`arbitrum  the desk EVM holds ${usdcText(arbNow)} USDC (+${usdcText(arbNow - arb.usdcE6)}) at ${at()}`);
+    }
+    if (entry !== null && arrived) break;
+    // Arrived without a matching ledger entry: a few more reads, not the whole timeout.
+    if (arrived && ++pollsAfterArrival > 6) break;
+    if (now() >= deadline) break;
+    if (now() - lastNote >= 60_000) {
+      say(`waiting   ${Math.max(0, Math.round((deadline - now()) / 1000))} s left: ledger entry ${entry === null ? 'not yet' : 'seen'}, Arbitrum ${usdcText(arbNow)} USDC`);
+      lastNote = now();
+    }
     await sleep(pollMs);
   }
-  const arrived = arbNow - arb.usdcE6 >= plan.arrival;
+  lines.push(entry === null
+    ? `ledger:   no Hyperliquid withdraw with nonce ${time}000 seen: read userNonFundingLedgerUpdates before counting it (Hyperliquid takes the withdraw3 until about ${replayEnd})`
+    : `ledger:   Hyperliquid withdraw ${entry.usdcE6 === null ? '' : `${usdcText(entry.usdcE6)} USDC `}${entry.delta.fee === undefined ? '' : `fee ${entry.delta.fee} `}`
+      + `nonce ${entry.delta.nonce ?? '-'} at ${iso(entry.time)}, ${entry.hash}`);
   const block = done([
     `arbitrum: desk EVM USDC ${usdcText(arb.usdcE6)} -> ${usdcText(arbNow)} (expected +${usdcText(plan.arrival)})`,
     `arrived:  ${arrived ? 'yes' : `not yet (after ${a.timeoutS} s): Hyperliquid's bridge can take longer; rerun the bridge stage's dry run to read the balance`}`,
@@ -478,10 +912,15 @@ async function bridgeStage({ a, client, fetchImpl, say, now, sleep, pollMs, urls
       + `${ethText(g.need)} ETH (${RELAYER_GAS_UNITS.toLocaleString('en-US')} gas at ${unitsText(gasPrice, 9)} gwei)`);
     if (!g.ok) refusals.push(`the relayer wallet ${address} holds ${ethText(wallet.wei)} ETH on Arbitrum, under the ${ethText(g.need)} ETH one transfer may need: send it a little ETH`);
   }
-  // A live quote reserves a deposit address and the transfer counts against the cap: --send asks one only when it can pay it.
-  if (a.send && refusals.length > 0) throw new Error(refusals.join('; '));
   const apiKey = env.get('ONECLICK_API_KEY')?.value ?? null;
   say(`1click    ${apiKey === null ? 'no ONECLICK_API_KEY: 1Click adds 0.2 % to the fee' : `ONECLICK_API_KEY set (from ${env.get('ONECLICK_API_KEY').from}; not shown)`}`);
+  // Earlier authorizations: none may still be usable or its deposit unsettled (each is a counted rescue).
+  const guard = await bridgeGuards({ fetchImpl, client, urls, contract: a.contract, deskId: a.deskId, evm, nowMs: now(), apiKey });
+  for (const l of guard.lines) say(`earlier   ${l}`);
+  const overrides = [];
+  applyGuard(a, say, refusals, overrides, guard.refusals);
+  // A live quote reserves a deposit address and the transfer counts against the cap: --send asks one only when it can pay it.
+  if (a.send && refusals.length > 0) throw new Error(refusals.join('; '));
 
   const signerId = desk.operator ?? desk.owner;
   let signer = null;
@@ -529,6 +968,8 @@ async function bridgeStage({ a, client, fetchImpl, say, now, sleep, pollMs, urls
   const lines = [`contract ${a.contract}, desk ${a.deskId}, bridge, ${a.send ? 'SEND' : 'dry run'}`];
   lines.push(`arbitrum: desk EVM ${evm} ${usdcText(arb.usdcE6)} USDC; bridge ${usdcText(amount)}`);
   for (const w of withdraws.filter((x) => x.inFlight)) lines.push(`earlier:  Hyperliquid ${withdrawLine(w)}`);
+  for (const l of guard.lines) lines.push(`earlier:  ${l}`);
+  lines.push(...overrides);
   lines.push(`quote:    ${a.send ? `live, depositAddress ${q.depositAddress}` : 'dry'}, amountIn ${q.amountIn}, amountOut ${q.amountOut}, minAmountOut ${q.minAmountOut}; `
     + `cost ${usdE8Text(checked.cost)} of ${usdE8Text(checked.allowed)} allowed, room ${checked.roomBps ?? '?'} bps`);
   lines.push(relayer === null ? 'relayer:  none (RELAYER_EVM_PRIVATE_KEY not set)' : `relayer:  ${relayer.address} ${ethText(relayer.wei)} ETH, one transfer needs at most ${ethText(relayer.need)}`);
@@ -551,19 +992,27 @@ async function bridgeStage({ a, client, fetchImpl, say, now, sleep, pollMs, urls
     return block;
   };
   const engine = await (deps.engine ?? defaultEngine)();
-  const out = await guardedSend(client, 'bridge', a.contract)(signer, a.contract, actions, { onSent: (h) => say(`\ntx sent ${h}; waiting for final`) });
+  let sentHash = null;
+  let out;
+  try {
+    out = await guardedSend(client, 'bridge', a.contract)(signer, a.contract, actions, { onSent: (h) => { sentHash = h; say(`\ntx sent ${h}; waiting for final`); } });
+  } catch (e) {
+    if (sentHash !== null) done([`near:     evm_usdc_to_intents tx ${sentHash}: no final outcome (${e.message})`, bridgeOpenLine(sentHash, now())]);
+    throw e;
+  }
   say(`tx final: ${txLink(out.hash)} (${out.burntTgas} TGas, ${nearText(out.burntYocto, 6)} NEAR burnt)`);
   for (const log of out.logs) say(`  log ${log}`);
   lines.push(`near:     evm_usdc_to_intents tx ${out.hash} ${out.failure === null ? 'returned a SignedAction' : `FAILED ${panicOf(out.failure)}`}`);
   if (out.failure !== null) {
-    done();
+    done([bridgeOpenLine(out.hash, now())]);
     throw new Error(`evm_usdc_to_intents ${out.hash}: ${panicOf(out.failure)} (${txLink(out.hash)})`);
   }
   let signed;
   try {
     signed = engine.parseSignedAction('evm_usdc_to_intents', out.value, a.deskId);
   } catch (e) {
-    done([`open:     the transaction ran but its SignedAction cannot be read: ${e.message}; the rescue is counted; look it up before running anything again`]);
+    done([`open:     the transaction ran but its SignedAction cannot be read: ${e.message}; the rescue is counted, and an authorization it signed is valid until `
+      + `about ${iso(now() + AUTH_VALID_MS + AUTH_SLACK_MS)} (block time + 300 s): do not rerun bridge before then; look it up first`]);
     throw e;
   }
   const problems = transferActionProblems(signed, { deskId: a.deskId, evm, depositAddress: q.depositAddress, amountIn: q.amountIn });
