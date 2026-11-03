@@ -1,0 +1,39 @@
+{
+  "note": "A dry 1Click quote (dry: true, reserves nothing), asked 2026-11-03: 10.6 Arbitrum USDC -> USDC on NEAR, recipient the test contract with customRecipientMsg {\"desk_id\":\"canary\"}, refundTo the public test desk EVM address of contract/core/tests/vectors (never funded). Fields 1Click does not sign (appFees, correlationId) are left out; the signature covers the canonical quote only.",
+  "response": {
+    "quote": {
+      "amountIn": "10600000",
+      "amountInFormatted": "10.6",
+      "amountInUsd": "10.592484600000",
+      "minAmountIn": "10600000",
+      "amountOut": "10597964",
+      "amountOutFormatted": "10.597964",
+      "amountOutUsd": "10.590450043524",
+      "minAmountOut": "10491984",
+      "timeEstimate": 25,
+      "refundFee": "5300",
+      "withdrawFee": "0"
+    },
+    "quoteRequest": {
+      "dry": true,
+      "depositMode": "SIMPLE",
+      "swapType": "EXACT_INPUT",
+      "slippageTolerance": 100,
+      "originAsset": "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+      "depositType": "ORIGIN_CHAIN",
+      "destinationAsset": "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
+      "amount": "10600000",
+      "refundTo": "0x1a642f0e3c3af545e7acbd38b07251b3990914f1",
+      "refundType": "ORIGIN_CHAIN",
+      "recipient": "gimbal-canary2.near",
+      "customRecipientMsg": "{\"desk_id\":\"canary\"}",
+      "recipientType": "DESTINATION_CHAIN",
+      "deadline": "2026-11-03T01:45:26.700Z",
+      "confidentiality": "public",
+      "quoteWaitingTimeMs": 0,
+      "insured": false
+    },
+    "signature": "ed25519:31SPfdUQL1qRmJw6coi5uwhaGZ7ceEiwp1N5oh3ugy6aMhAqvCQqwhEMjBsDbQShBtbsAhCXnL6zmT3v25sGVVTk",
+    "timestamp": "2026-11-03T01:15:26.491Z"
+  }
+}

@@ -144,8 +144,8 @@ export function refreshPlan({ contract, signer, signedBy, assets = CANARY_SYMBOL
   const lines = describeTx('tx: refresh_prices (operator key)', { signer, signedBy, receiver: contract, actions });
   lines.push(`  then      ${contract} -> ${ORACLE} request_price_data ${JSON.stringify({ asset_ids: assets.map((a) => ORACLE_IDS[a]) })}`
     + `, deposit ${nearText(ORACLE_DEPOSIT)} NEAR from the contract's balance (the oracle refunds it when its cache is fresh)`);
-  lines.push(`            -> ${contract}.on_prices ${JSON.stringify({ assets })} stores each newer price; if request_price_data fails, `
-    + `${ORACLE}.oracle_call -> ${contract}.oracle_on_call instead`);
+  lines.push(`            -> ${contract}.on_prices ${JSON.stringify({ assets })} stores each newer price (there is no oracle_call fallback: `
+    + 'if request_price_data fails, nothing new is stored and the call returns false)');
   return { actions, lines };
 }
 
