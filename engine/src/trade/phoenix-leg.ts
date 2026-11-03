@@ -158,7 +158,10 @@ export class PhoenixLeg implements TradeLeg {
   readonly #sleep: (ms: number) => Promise<void>;
   readonly #exchange: PhoenixExchangeAccounts;
   readonly #budget: ComputeBudget;
-  /** The slot of the last transaction of this leg that landed: a snapshot older than it does not show it. */
+  /**
+   * The slot of the last transaction of this leg that landed, or the chain's confirmed slot at the last syncToChain:
+   * a snapshot older than it may not show every transaction of ours. 0 after a restart until the first sync.
+   */
   #minSlot = 0;
 
   constructor(options: PhoenixLegOptions) {
@@ -207,9 +210,22 @@ export class PhoenixLeg implements TradeLeg {
     for (;;) {
       const snap = parseTraderSnapshot(await this.#o.api.traderState(this.#o.desk.authority), this.symbol);
       if (snap.slot >= this.#minSlot) return snap;
-      if (this.#clock.now() >= until) throw new Error(`phoenix ${this.symbol}: the trader snapshot is at slot ${snap.slot}, still before the last transaction's slot ${this.#minSlot}`);
+      if (this.#clock.now() >= until) throw new Error(`phoenix ${this.symbol}: the trader snapshot is at slot ${snap.slot}, still before slot ${this.#minSlot} (the last transaction's, or the chain's when last synced): the position is unknown`);
       await this.#sleep(500);
     }
+  }
+
+  /**
+   * After a restart #minSlot is 0, so a lagging snapshot from before our last landed transaction would read as current.
+   * The chain's confirmed slot now becomes the oldest snapshot trusted (TradeLeg.syncToChain); throws when it cannot
+   * be read.
+   */
+  async syncToChain(): Promise<void> {
+    const chain = this.#o.chain;
+    if (chain.currentSlot === undefined) throw new Error(`phoenix ${this.symbol}: the chain's confirmed slot cannot be read here, so no snapshot can be proven current`);
+    const slot = await chain.currentSlot();
+    if (!Number.isSafeInteger(slot) || slot < 0) throw new Error(`phoenix ${this.symbol}: the chain's confirmed slot is ${String(slot)}`);
+    this.#minSlot = Math.max(this.#minSlot, slot);
   }
 
   /** The IOC this leg would send now (throws LegCheckError when the venue or the policy would refuse it). */

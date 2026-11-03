@@ -19,7 +19,7 @@ import { sizeFor } from '../strategy/decide.ts';
 import { STRATEGY, T0, win as deskWin } from '../strategy/test-helpers.ts';
 import { VirtualClock, readRecording } from '../venues/replay.ts';
 import { replayStart } from './serve-replay.ts';
-import { fillsOf, loopHands, serveLoop, windowFacts, windowSymbol } from './serve-loop.ts';
+import { fillsOf, loopHands, openedQty, serveLoop, windowFacts, windowSymbol } from './serve-loop.ts';
 import type { PairHands } from './serve-pair.ts';
 import { toQty } from '../trade/lots.ts';
 import type { PairResult } from '../trade/pair.ts';
@@ -217,6 +217,18 @@ test('fillsOf: each leg summed over its orders, size-weighted price, a fee not r
     { venue: 'hyperliquid', side: 'SELL', qty: '3', avgPx: 102, feeUsd: 0.15000000000000002 },
     { venue: 'phoenix', side: 'BUY', qty: '3', avgPx: 101, feeUsd: null },
   ]);
+});
+
+test('openedQty: the parts that went out and opened; a part its gate stopped, or one that ended unwound, adds nothing', () => {
+  const order = { ref: { venue: 'hyperliquid', side: 'SELL', size: '5', reduceOnly: false, orderId: null, clientId: null, tx: [], sentAt: 0 }, outcome: 'filled', filled: '5', avgPx: 100, fee: 0, error: null, purpose: 'open' };
+  const part = (status: string, size: string, sent: boolean) => ({
+    status, size, notes: [], tx: [], feeUsd: 0, feeUnknown: 0,
+    legs: [{ venue: 'hyperliquid', symbol: 'SOL', start: '0', target: '0', final: '0', orders: sent ? [order] : [] }, { venue: 'phoenix', symbol: 'SOL', start: '0', target: '0', final: '0', orders: [] }],
+  }) as unknown as PairResult;
+  assert.equal(openedQty([part('open', '5', true), part('stuck', '5', false)]), '5', 'part 2 gated before its first order');
+  assert.equal(openedQty([part('open', '5', true), part('open', '2.5', true)]), '7.5');
+  assert.equal(openedQty([part('open', '5', true), part('stuck', '5', true)]), '5', 'a part that went out and was unwound holds nothing');
+  assert.equal(openedQty([]), '0');
 });
 
 test('the real decide(): three hourly checks above the bar, then the exact qty it sized reaches the hands', async () => {

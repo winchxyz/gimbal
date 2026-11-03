@@ -15,6 +15,7 @@ import { NothingExecuted } from '../relayer/tx.ts';
 import type { LegOutcome, LegRef, LegSide, TradeLeg } from './legs.ts';
 import { HlLeg, LegCheckError } from './legs.ts';
 import { floorToLot, lotQty, toQty } from './lots.ts';
+import { OPEN_SCOPE } from './open-scope.ts';
 import type { PairTraderOptions, WatchReport } from './pair.ts';
 import { MAX_CLOSE_ORDERS, PairTrader, REPLAY_WINDOW_MS, UNSETTLED_POLL_MS, UNSETTLED_WATCH_MS, reducedTarget } from './pair.ts';
 
@@ -437,6 +438,32 @@ test('a window that ends with the legs offset clears an alert raised meanwhile, 
   assert.deepEqual(s.watches.map((w) => w.status), ['unhedged', 'lapsed']);
   assert.equal(s.trader.unhedged, null);
   assert.equal(s.a.orders.length, 1);
+});
+
+test('a lapse that an open closes out first runs outside the open\'s scope: what it sends is not part of the open', async () => {
+  // A stuck open: Hyperliquid's BUY has no answer, Orderly went back to 0, Hyperliquid's intent is 0.
+  const s = setup({ script: ['unknown-none'] });
+  assert.equal((await s.trader.open({ size: '0.005', longIndex: 0, reason: 'open 1' })).status, 'stuck');
+  // Every order records whether it ran inside an open's scope (OPEN_SCOPE, as ProtectedPair runs the loop's open).
+  const scoped: string[] = [];
+  for (const leg of [s.a, s.b]) {
+    const send = leg.order.bind(leg);
+    leg.order = (side, size, reduceOnly, reason) => {
+      scoped.push(`${leg.venue} ${reduceOnly ? 'reduce-only' : 'open'} ${OPEN_SCOPE.getStore() === undefined ? 'outside' : 'inside'}: ${reason}`);
+      return send(side, size, reduceOnly, reason);
+    };
+  }
+  // The BUY ran late, and its window ended: the next open closes it out first (#blocked), and the leg is reconciled
+  // back to its intent by a reduce-only close. That close belongs to the lapse, not to the open.
+  s.a.pos = q('0.005');
+  s.shared.now = s.trader.unsettled(s.a)!.until + 1;
+  const r = await OPEN_SCOPE.run({ owner: s.trader }, () => s.trader.open({ size: '0.005', longIndex: 0, reason: 'open 2' }));
+  assert.equal(r.status, 'open');
+  assert.deepEqual(scoped, [
+    'hyperliquid reduce-only outside: reconcile ETH: close 0.005 over the target',
+    'hyperliquid open inside: open 2',
+    'orderly open inside: open 2',
+  ]);
 });
 
 test('a deficit while the partner\'s order has no answer: where that order would leave the partner moves, so its landing is hedged', async () => {

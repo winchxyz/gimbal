@@ -271,6 +271,10 @@ export class GuardedLeg implements TradeLeg {
     return this.inner.beginMakerOperation?.() ?? (() => {});
   }
 
+  async syncToChain(): Promise<void> {
+    await this.inner.syncToChain?.();
+  }
+
   async #guard(side: LegSide, size: bigint, reduceOnly: boolean, reason: string, send: () => Promise<LegOutcome>): Promise<LegOutcome> {
     const at = (this.#o.now ?? Date.now)();
     const refuse = (why: string): LegOutcome => {
