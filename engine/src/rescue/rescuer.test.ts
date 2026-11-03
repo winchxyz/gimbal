@@ -255,7 +255,7 @@ function synthetic(o: SyntheticOptions = {}): Synthetic {
       close: async (req) => {
         s.closes.push(req);
         const r: PairResult = {
-          status: 'closed', size: '0', notes: [], tx: [],
+          status: 'closed', size: '0', notes: [], tx: [], feeUsd: 0, feeUnknown: 0,
           legs: s.legs.map((l, i) => ({ venue: l.venue, symbol: l.symbol, start: String(pos[i]), target: String(req.targets?.[i]), final: String(req.targets?.[i]), orders: [] })) as unknown as PairResult['legs'],
         };
         return r;

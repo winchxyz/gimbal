@@ -852,6 +852,33 @@ have, a full-access key, and at `--send` a key file that is not a full-access ke
 to delete. Use it to remove an operator key whose contract was retired (receiver `gimbal-canary.near`): a retired
 name can be registered again by anyone.
 
+## 9. The carry pair: short Hyperliquid, long Phoenix
+
+`engine/src/cli/pair-mainnet.ts` (`npm run pair-mainnet -w engine -- ...`) is a dry run unless `--send` is given,
+and `--send` refuses in a linked worktree. Pass the engine env file by path:
+
+```
+node --env-file=.keys/engine-mainnet-<contract>.near.env engine/src/cli/pair-mainnet.ts status
+node --env-file=... engine/src/cli/pair-mainnet.ts fund-phoenix 15            # USDC -> Ember wrap -> Phoenix deposit
+node --env-file=... engine/src/cli/pair-mainnet.ts defund-phoenix all         # Phoenix withdraw -> Ember unwrap -> USDC
+node --env-file=... engine/src/cli/pair-mainnet.ts open ETH 15 --short hyperliquid --long phoenix --leverage 2
+node --env-file=... engine/src/cli/pair-mainnet.ts close ETH
+```
+
+- Every Phoenix transaction is one legacy message signed by `sol_sign` (compute budget first, fee at most 600,000
+  lamports); the money moves print the message, its instructions and a simulation. The desk authority pays the
+  Solana fees, so it needs SOL: `status` prints the balance and every command says how much more to send.
+- Before the first deposit the desk's Phoenix trader must be registered (`phoenix_register` in the venue setup, signed with `sol_sign_register`).
+- `open` prints both legs' funding (now and the 7-day mean), the gross APR, the spread expected over `--hold-days`
+  against the round trip (taker fees, half spreads, `--basis-bps`), the size, and the liquidation distance per leg,
+  and refuses when the spread does not cover the round trip or a leg is 40 % or less from liquidation. The
+  Hyperliquid short goes first as post-only limits at the touch (`--reprice-s`, `--maker-timeout-s`, then an IOC
+  unless `--no-taker-fallback`); the Phoenix long follows as one IOC for what filled. A pair over
+  `max_notional_usd` is opened in whole parts. `close` does the same reduce-only.
+- The contract has no update-leverage action: Hyperliquid keeps the account's own leverage for the coin, and
+  `--leverage` is the collateral each leg must hold (legUsd / leverage), checked, not set.
+- An outcome that cannot be proven ends with `open:` lines (exit code 3): reconcile those before running again.
+
 ## Files the scripts write
 
 All of them are gitignored and are written in the main checkout only (never in a linked worktree). None is ever

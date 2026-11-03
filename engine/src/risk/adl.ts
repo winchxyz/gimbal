@@ -372,7 +372,7 @@ function errorText(err: unknown): string {
 
 /** A response with nothing to send (the legs were already at its targets). */
 function closedNothing(): PairResult {
-  return { status: 'closed', size: '0', legs: [] as unknown as PairResult['legs'], notes: ['both legs were already at their targets'], tx: [] };
+  return { status: 'closed', size: '0', legs: [] as unknown as PairResult['legs'], notes: ['both legs were already at their targets'], tx: [], feeUsd: 0, feeUnknown: 0 };
 }
 
 function describe(findings: AdlFinding[]): string {
