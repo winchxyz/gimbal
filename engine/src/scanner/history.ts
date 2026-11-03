@@ -10,9 +10,11 @@ import { aprPct } from './costs.ts';
 
 export const HOUR_MS = 3_600_000;
 export const WEEK_HOURS = 168;
-/** A 7-day figure needs at least this share of the week's hours on both legs; a newer market shows null. */
+/** Two weeks: the 14-day average a desk window's expected carry prefers when the store holds it. */
+export const FORTNIGHT_HOURS = 2 * WEEK_HOURS;
+/** A 7-day (or 14-day) figure needs at least this share of its hours on both legs; a newer market shows null. */
 export const WEEK_COVERAGE = 0.9;
-const KEEP_HOURS = WEEK_HOURS + 12;
+const KEEP_HOURS = FORTNIGHT_HOURS + 12;
 
 export function hourStart(t: number): number {
   return Math.floor(t / HOUR_MS) * HOUR_MS;
@@ -59,7 +61,7 @@ export class RateStore {
     return leg.booked.get(hour) ?? leg.live.get(hour) ?? null;
   }
 
-  /** Forgets hours older than the week (plus a margin) before `now`. */
+  /** Forgets hours older than two weeks (plus a margin) before `now`. */
   prune(now: number): void {
     const oldest = hourStart(now) - KEEP_HOURS * HOUR_MS;
     for (const leg of this.#legs.values()) {
@@ -77,20 +79,44 @@ export function hourlyGrossApr(store: RateStore, longKey: string, shortKey: stri
 }
 
 /**
- * Mean hourly gross APR over the 168 complete hours before the current one; null when fewer than 90 % of them
- * have both legs' rates (a market listed this week, or history not loaded yet).
+ * Mean hourly gross APR over the `hours` complete hours before the current one; null when fewer than 90 % of them
+ * have both legs' rates (a market listed since, or history not loaded yet).
  */
-export function grossApr7d(store: RateStore, longKey: string, shortKey: string, now: number): number | null {
+export function grossAprOver(store: RateStore, longKey: string, shortKey: string, now: number, hours: number): number | null {
   const current = hourStart(now);
   let sum = 0;
   let n = 0;
-  for (let i = 1; i <= WEEK_HOURS; i++) {
+  for (let i = 1; i <= hours; i++) {
     const g = hourlyGrossApr(store, longKey, shortKey, current - i * HOUR_MS);
     if (g === null) continue;
     sum += g;
     n++;
   }
-  return n >= Math.ceil(WEEK_HOURS * WEEK_COVERAGE) ? sum / n : null;
+  return n >= Math.ceil(hours * WEEK_COVERAGE) ? sum / n : null;
+}
+
+/** grossAprOver the 168 hours of the last week. */
+export function grossApr7d(store: RateStore, longKey: string, shortKey: string, now: number): number | null {
+  return grossAprOver(store, longKey, shortKey, now, WEEK_HOURS);
+}
+
+/** grossAprOver the 336 hours of the last two weeks. */
+export function grossApr14d(store: RateStore, longKey: string, shortKey: string, now: number): number | null {
+  return grossAprOver(store, longKey, shortKey, now, FORTNIGHT_HOURS);
+}
+
+/** One leg's mean rate over the `hours` complete hours before the current one, as APR; null under 90 % coverage. */
+export function legAprOver(store: RateStore, key: string, now: number, hours: number): number | null {
+  const current = hourStart(now);
+  let sum = 0;
+  let n = 0;
+  for (let i = 1; i <= hours; i++) {
+    const r = store.rate(key, current - i * HOUR_MS);
+    if (r === null) continue;
+    sum += r;
+    n++;
+  }
+  return n >= Math.ceil(hours * WEEK_COVERAGE) ? aprPct(sum / n) : null;
 }
 
 /**

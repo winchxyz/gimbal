@@ -35,6 +35,8 @@ function oracleAged(ageS: number, only?: (venue: VenueId, symbol: string) => boo
   return { price: (venue, symbol) => (only === undefined || only(venue, symbol) ? { px: 100, at: T0 - ageS * 1000 } : null) };
 }
 const FRESH = oracleAged(5);
+/** The hand figures below spread one-off costs over 168 h, whatever the default hold. */
+const COSTS_168H = { ...DEFAULT_COSTS, holdHours: 168 };
 
 // Long Phoenix SOL paying 0.00001/h at mark 100.005; short Hyperliquid SOL receiving 0.000055/h at mark 99.995.
 const LONG = leg('phoenix', 'SOL', { ratePerHour: 0.00001, markPx: 100.005, openInterest: 20_000 });
@@ -54,7 +56,7 @@ function ctx(over: Partial<PricingContext> = {}, books: Record<string, BookRead 
   return {
     now: T0,
     strategy: DEFAULT_STRATEGY,
-    costs: DEFAULT_COSTS,
+    costs: COSTS_168H,
     policy: null,
     oracle: null,
     book: (l) => (l.venue in books ? books[l.venue]! : BOOKS[l.venue] === undefined ? null : { book: BOOKS[l.venue]!, readAt: T0, stale: false }),

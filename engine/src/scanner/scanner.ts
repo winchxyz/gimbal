@@ -6,13 +6,17 @@
 //    good read (if not older than dropAfterMs) is used, marked stale;
 // 2. legs: one per venue and base, marks checked against the other venues, open-interest floor (pairs.ts); the held
 //    window's legs are never dropped, they fail a check instead;
-// 3. pairs in both directions; kept: gross > 0, and the held window whatever its sign;
+// 3. pairs in both directions; kept: the held window whatever its sign; a watch pair with gross > 0 now; a desk pair in
+//    the direction its multi-day spread pays (14-day mean when known, else 7-day), whatever this hour says, or with
+//    gross > 0 now until its history is known; a desk pair with a leg under the open-interest floor only on a
+//    multi-day spread that pays its fees over the hold (carry.ts);
 // 4. books of the desk legs those pairs need, read again once older than bookTtlMs (a failed read keeps the last
 //    book, marked stale, and lists the venue as failed); a venue whose funding failed this scan is not asked for
 //    books; a desk pair with no book ever read is left out;
 // 5. each window priced (price.ts); the 7-day gross and intervalsAbove from the hourly rate store, which a few
 //    public history reads per scan fill in the background (a scan never waits on them);
-// 6. ranked: enterable windows by net APR, then the other desk windows by net APR, then watch-only windows by gross
+// 6. ranked: enterable windows, then the other desk windows, each by the spread expected over the hold minus the
+//    round trip (carry.ts; windows without a multi-day average after those with one, by net APR), then watch-only windows by gross
 //    APR (their net is not complete), the best maxWatchWindows of them: within those, first the windows whose legs
 //    pass every quality check (quality.ts), then the rest.
 
@@ -20,10 +24,16 @@ import type { ScanStatus, ScanVenueId, StrategyConfig, VenueId, Window as Fundin
 import type { Book, Clock, MarketFunding, MarketHistorySource, VenueReader, WatchReader } from '../venues/venue.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { ScannerConfig } from './config.ts';
-import { HOUR_MS, RateStore, WEEK_HOURS, grossApr7d, hourStart, intervalsAbove, netAprSeries, round } from './history.ts';
-import type { DropReason, LegKind, ScanLeg } from './pairs.ts';
+import type { CarryEstimate } from './carry.ts';
+import { carryChecks, carryEstimate, multiDayApr, roundTrip, spreadOverHoldUsd } from './carry.ts';
+import { aprPct, basisCostUsd, fillFeeBps, takerFeesUsd } from './costs.ts';
+import {
+  FORTNIGHT_HOURS, HOUR_MS, RateStore, WEEK_HOURS, grossApr14d, grossApr7d, grossAprOver, hourStart, intervalsAbove, legAprOver,
+  netAprSeries, round,
+} from './history.ts';
+import type { DropReason, LegKind, Pair, ScanLeg } from './pairs.ts';
 import { filterLegs, heldLegKeys, pairLegs, toLeg } from './pairs.ts';
-import type { BookRead, OracleSource, PricedWindow, PricingContext } from './price.ts';
+import type { BookRead, CostBreakdown, OracleSource, PricedWindow, PricingContext } from './price.ts';
 import { isEnterable, priceWindow, switchCostUsd } from './price.ts';
 import { WatchQuality } from './quality.ts';
 
@@ -79,6 +89,27 @@ interface HistoryState {
   retryAt: number;
 }
 
+/** One leg of a desk window: the venue's rate now and its 7- and 14-day means, APR (> 0 means longs pay shorts). */
+export interface LegRates {
+  venue: ScanVenueId;
+  symbol: string;
+  nowAprPct: number;
+  d7AprPct: number | null;
+  d14AprPct: number | null;
+  oiUsd: number | null;          // open interest in USD
+}
+
+/** What the last scan expects of a desk window over the hold, with the legs' rates behind it. */
+export interface WindowCarry {
+  estimate: CarryEstimate;
+  long: LegRates;
+  short: LegRates;
+  breakdown: CostBreakdown;
+}
+
+/** The second week of a desk leg's history is read once (its hours never change), and retried after this. */
+const OLDER_RETRY_MS = HOUR_MS;
+
 const legKey = (leg: Pick<ScanLeg, 'venue' | 'symbol'>): string => `${leg.venue}|${leg.symbol}`;
 /**
  * The rate store keeps each side of a leg apart: on GMX a short receives a different rate from what a long pays.
@@ -117,6 +148,8 @@ export class Scanner {
   readonly #books = new Map<string, BookRead>();
   readonly #rates = new RateStore();
   readonly #history = new Map<string, HistoryState>();
+  readonly #older = new Map<string, { done: boolean; retryAt: number }>();
+  #carry = new Map<string, WindowCarry>();
   readonly #inFlight = new Map<string, Promise<unknown>>();
   #historyRun: Promise<void> | null = null;
   #priced = new Map<string, PricedWindow>();
@@ -216,7 +249,8 @@ export class Scanner {
     for (const d of dropped) droppedCount[d.reason] = (droppedCount[d.reason] ?? 0) + 1;
 
     // 3. pairs
-    const pairs = pairLegs(kept, heldId).filter((p) => p.grossPerHour > 0 || p.id === heldId);
+    const all = pairLegs(kept, heldId);
+    const pairs = all.filter((p) => this.#listed(p, heldId, now, strategy.legUsd));
 
     // 4. books
     const wanted = new Map<string, ScanLeg>();
@@ -280,10 +314,11 @@ export class Scanner {
           this.#rates.recordLive(shortSide(leg), now, leg.shortRatePerHour);
         }
       }
-      historyReads = this.#loadHistory(priced, now);
+      historyReads = this.#loadHistory(priced, all.filter((p) => p.desk), now);
     }
     this.#rates.prune(now);
 
+    const carry = new Map<string, WindowCarry>();
     for (const pw of priced) {
       const w = pw.window;
       const longKey = longSide(pw.pair.long);
@@ -291,7 +326,22 @@ export class Scanner {
       const g7 = grossApr7d(this.#rates, longKey, shortKey, now);
       w.grossApr7dPct = g7 === null ? null : round(g7, 3);
       w.intervalsAbove = intervalsAbove(this.#rates, longKey, shortKey, now, w.grossAprPct, pw.costsApr, strategy.minNetAprPct);
+      if (!pw.pair.desk) continue;
+      const b = pw.breakdown;
+      const rt = roundTrip(strategy.legUsd, b.feesUsd ?? 0, b.slippageUsd ?? 0, b.basisUsd ?? 0, b.timingUsd, config.costs.basisBufferBps);
+      const g14 = grossApr14d(this.#rates, longKey, shortKey, now);
+      const estimate = carryEstimate({
+        legUsd: strategy.legUsd, holdHours: config.costs.holdHours, grossNowAprPct: w.grossAprPct,
+        gross7dAprPct: w.grossApr7dPct, gross14dAprPct: g14 === null ? null : round(g14, 3), roundTrip: rt,
+      });
+      w.checks.push(...carryChecks(estimate));
+      carry.set(pw.pair.id, {
+        estimate, breakdown: b,
+        long: this.#legRates(pw.pair.long, longKey, pw.pair.long.ratePerHour, now),
+        short: this.#legRates(pw.pair.short, shortKey, pw.pair.short.shortRatePerHour, now),
+      });
     }
+    this.#carry = carry;
 
     const heldPriced = heldNow === null ? undefined : priced.find((pw) => pw.pair.id === heldNow.windowId);
     if (heldNow !== null && heldPriced !== undefined) heldPriced.window.held = { since: heldNow.since };
@@ -305,8 +355,17 @@ export class Scanner {
     // 6. rank
     const byId = (a: PricedWindow, b: PricedWindow) => (a.pair.id < b.pair.id ? -1 : a.pair.id > b.pair.id ? 1 : 0);
     const byNet = (a: PricedWindow, b: PricedWindow) => b.window.netAprPct - a.window.netAprPct || byId(a, b);
-    const enterable = priced.filter((pw) => isEnterable(pw.window)).sort(byNet);
-    const deskOther = priced.filter((pw) => pw.pair.desk && !isEnterable(pw.window)).sort(byNet);
+    // A desk window with a multi-day average ranks by what it is expected to earn over the hold, net of the round
+    // trip; one still without (its history loading) follows, by net APR.
+    const byCarry = (a: PricedWindow, b: PricedWindow) => {
+      const x = carry.get(a.pair.id)?.estimate.netUsd ?? null;
+      const y = carry.get(b.pair.id)?.estimate.netUsd ?? null;
+      if (x !== null && y !== null) return y - x || byNet(a, b);
+      if (x !== null || y !== null) return x !== null ? -1 : 1;
+      return byNet(a, b);
+    };
+    const enterable = priced.filter((pw) => isEnterable(pw.window)).sort(byCarry);
+    const deskOther = priced.filter((pw) => pw.pair.desk && !isEnterable(pw.window)).sort(byCarry);
     // The watch windows sent are the maxWatchWindows best by gross, whatever their checks say: a finding ranks a
     // window, it never keeps it from the reader. Inside that cut a window with a quality finding (a thin leg, a capped
     // or unconfirmed rate, a closed market) never leads a clean one, however large its gross.
@@ -331,55 +390,118 @@ export class Scanner {
     return { windowId, points };
   }
 
+  /** The expected carry of a desk window the last scan listed, with its legs' rates; null for any other id. */
+  carry(windowId: string): WindowCarry | null {
+    return this.#carry.get(windowId) ?? null;
+  }
+
+  /**
+   * Whether a pair is listed this scan (step 3). A desk pair goes by its multi-day spread, so the direction shown is
+   * the one that has paid over days, not the one this hour happens to favour; the reverse direction's average is
+   * this one's negative, so at most one of the two is listed once history is in.
+   */
+  #listed(p: Pair, heldId: string | null, now: number, legUsd: number): boolean {
+    if (p.id === heldId) return true;
+    if (!p.desk) return p.grossPerHour > 0;
+    const longKey = longSide(p.long);
+    const shortKey = shortSide(p.short);
+    const { aprPct: m } = multiDayApr(
+      grossAprOver(this.#rates, longKey, shortKey, now, WEEK_HOURS), grossAprOver(this.#rates, longKey, shortKey, now, FORTNIGHT_HOURS),
+    );
+    const thin = p.long.deskOnly !== undefined || p.short.deskOnly !== undefined;
+    if (m === null) return !thin && p.grossPerHour > 0;
+    if (!(m > 0)) return false;
+    if (!thin) return true;
+    // A leg under the floor has its book read only when its spread can pay what is known before any book: the fees
+    // on the 4 fills, the adverse gap between the marks and the exit buffer.
+    const c = this.#options.config.costs;
+    const fees = takerFeesUsd(legUsd, fillFeeBps(c.fees[p.long.venue as VenueId]), fillFeeBps(c.fees[p.short.venue as VenueId]));
+    const gap = p.long.markPx !== null && p.short.markPx !== null ? basisCostUsd(p.long.markPx, p.short.markPx, legUsd) : 0;
+    return spreadOverHoldUsd(m, legUsd, c.holdHours) > fees + gap + (legUsd * c.basisBufferBps) / 1e4;
+  }
+
+  #legRates(leg: ScanLeg, key: string, ratePerHour: number, now: number): LegRates {
+    const d7 = legAprOver(this.#rates, key, now, WEEK_HOURS);
+    const d14 = legAprOver(this.#rates, key, now, FORTNIGHT_HOURS);
+    return {
+      venue: leg.venue, symbol: leg.symbol, nowAprPct: round(aprPct(ratePerHour), 3),
+      d7AprPct: d7 === null ? null : round(d7, 3), d14AprPct: d14 === null ? null : round(d14, 3), oiUsd: leg.oiUsd,
+    };
+  }
+
   /** Resolves once the history reads started so far have answered or failed. */
   async idle(): Promise<void> {
     while (this.#historyRun !== null) await this.#historyRun;
   }
 
   /**
-   * Starts public funding history reads for the legs that need them, in the background: desk windows first, best net
-   * first, at most historyPerScan reads, and no new batch while one is still out (a slow venue never has reads piling
-   * up). A leg is read again once a new hour has begun (and a minute has passed, so the venue has booked it); the
-   * window asked for is aligned to the hour, so a replay asks exactly what the recording asked. Until a leg's history
-   * arrives its windows show grossApr7dPct null. Returns how many reads it started.
+   * Starts public funding history reads for the legs that need them, in the background: the listed desk windows'
+   * legs first (best net first), then the legs of every other desk pair (a pair whose direction or listing waits on
+   * its history), then the watch windows', at most historyPerScan reads, and no new batch while one is still out (a
+   * slow venue never has reads piling up). A leg is read again once a new hour has begun (and a minute has passed, so
+   * the venue has booked it); the window asked for is aligned to the hour, so a replay asks exactly what the
+   * recording asked. Once a desk leg's week is in, the week before it is read once too, for the 14-day average. Until
+   * a leg's history arrives its windows show grossApr7dPct null. Returns how many reads it started.
    */
-  #loadHistory(priced: readonly PricedWindow[], now: number): number {
+  #loadHistory(priced: readonly PricedWindow[], deskPairs: readonly Pair[], now: number): number {
     if (this.#historyRun !== null) return 0;
     const { config } = this.#options;
     const current = hourStart(now);
     const order = [...priced].sort((a, b) => Number(b.pair.desk) - Number(a.pair.desk) || b.window.netAprPct - a.window.netAprPct);
-    const todo: { leg: ScanLeg; src: Source }[] = [];
+    const legs: ScanLeg[] = [];
+    for (const pw of order) if (pw.pair.desk) legs.push(pw.pair.long, pw.pair.short);
+    for (const p of deskPairs) legs.push(p.long, p.short);
+    for (const pw of order) if (!pw.pair.desk) legs.push(pw.pair.long, pw.pair.short);
+    const unique: { leg: ScanLeg; src: Source }[] = [];
     const seen = new Set<string>();
-    for (const pw of order) {
-      for (const leg of [pw.pair.long, pw.pair.short]) {
-        const key = legKey(leg);
-        if (seen.has(key)) continue;
-        seen.add(key);
-        const src = this.#sources.find((s) => s.id === leg.venue);
-        if (src?.history === undefined) continue;
-        const st = this.#history.get(key);
-        if (st !== undefined && (st.loadedHour === current || now < st.retryAt)) continue;
-        if (st !== undefined && st.loadedHour !== null && now - current < 60_000) continue;
-        todo.push({ leg, src });
-        if (todo.length >= config.historyPerScan) break;
-      }
+    for (const leg of legs) {
+      const key = legKey(leg);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const src = this.#sources.find((s) => s.id === leg.venue);
+      if (src?.history !== undefined) unique.push({ leg, src });
+    }
+    const todo: { leg: ScanLeg; src: Source; older: boolean }[] = [];
+    for (const { leg, src } of unique) {
       if (todo.length >= config.historyPerScan) break;
+      const st = this.#history.get(legKey(leg));
+      if (st !== undefined && (st.loadedHour === current || now < st.retryAt)) continue;
+      if (st !== undefined && st.loadedHour !== null && now - current < 60_000) continue;
+      todo.push({ leg, src, older: false });
+    }
+    for (const { leg, src } of unique) {
+      if (todo.length >= config.historyPerScan) break;
+      if (leg.kind !== 'desk' || todo.some((t) => t.leg === leg)) continue;
+      const key = legKey(leg);
+      if ((this.#history.get(key)?.loadedHour ?? null) === null) continue;
+      const o = this.#older.get(key);
+      if (o !== undefined && (o.done || now < o.retryAt)) continue;
+      todo.push({ leg, src, older: true });
     }
     if (todo.length === 0) return 0;
-    // From 8 h before the week (Orderly's 8 h prints cover the hours before them) to the end of the current hour.
+    // From 8 h before the week (Orderly's 8 h prints cover the hours before them) to the end of the current hour; for
+    // the older read, the week before that, overlapping it by 8 h.
     const start = current - (WEEK_HOURS + 8) * HOUR_MS;
     const end = current + HOUR_MS - 1;
-    const run: Promise<void> = pool(todo.map(({ leg, src }) => async () => {
+    const olderStart = current - (FORTNIGHT_HOURS + 8) * HOUR_MS;
+    const olderEnd = current - WEEK_HOURS * HOUR_MS;
+    const run: Promise<void> = pool(todo.map(({ leg, src, older }) => async () => {
       const key = legKey(leg);
+      const what = `${leg.venue} ${older ? 'older history' : 'history'} ${leg.symbol}`;
       try {
-        const points = await withTimeout(src.history!(leg.symbol, start, end), config.readTimeoutMs * 2, `${leg.venue} history ${leg.symbol}`);
+        const points = await withTimeout(src.history!(leg.symbol, older ? olderStart : start, older ? olderEnd : end), config.readTimeoutMs * 2, what);
         this.#rates.recordBooked(longSide(leg), points);
         this.#rates.recordBooked(shortSide(leg), points);
-        this.#history.set(key, { loadedHour: current, retryAt: 0 });
+        if (older) this.#older.set(key, { done: true, retryAt: 0 });
+        else this.#history.set(key, { loadedHour: current, retryAt: 0 });
       } catch (err) {
-        this.#note(`${leg.venue} history ${leg.symbol} failed: ${errorMessage(err)}`);
-        const st = this.#history.get(key);
-        this.#history.set(key, { loadedHour: st?.loadedHour ?? null, retryAt: now + config.historyRetryMs });
+        this.#note(`${what} failed: ${errorMessage(err)}`);
+        if (older) {
+          this.#older.set(key, { done: false, retryAt: now + OLDER_RETRY_MS });
+        } else {
+          const st = this.#history.get(key);
+          this.#history.set(key, { loadedHour: st?.loadedHour ?? null, retryAt: now + config.historyRetryMs });
+        }
       }
     }), 2).then(() => {
       if (this.#historyRun === run) this.#historyRun = null;

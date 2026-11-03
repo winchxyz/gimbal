@@ -12,7 +12,8 @@
     "capture": "node src/cli/capture.ts",
     "smoke": "node src/cli/smoke.ts",
     "serve": "node src/cli/serve.ts",
-    "relay-hl": "node src/cli/relay-hl.ts"
+    "relay-hl": "node src/cli/relay-hl.ts",
+    "windows": "node src/cli/windows.ts"
   },
   "dependencies": {
     "@ellipsis-labs/rise": "0.6.2",

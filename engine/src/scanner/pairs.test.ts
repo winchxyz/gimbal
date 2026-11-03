@@ -82,19 +82,26 @@ test('marks: a leg more than 10 % from the median of the same base elsewhere is 
   assert.deepEqual(filterLegs(wrong, OPTS).dropped, [{ venue: 'hyperliquid', symbol: 'kPEPE', reason: 'mark-outlier' }]);
 });
 
-test('open interest: under the floor is dropped; unknown OI is no zero, but only a watch-only leg may lack it', () => {
+test('open interest: under the floor is dropped, a desk leg kept for desk pairs only; unknown OI is no zero, but only a watch-only leg may lack it', () => {
   const legs = [
-    leg('hyperliquid', 'X', { markPx: 100, openInterest: 4_999 }),     // 499,900 USD: under 500k
+    leg('hyperliquid', 'X', { markPx: 100, openInterest: 4_999 }),     // 499,900 USD: under 500k, a desk leg
     leg('phoenix', 'X', { markPx: 100, openInterest: 5_000 }),         // exactly 500k: kept
     leg('orderly', 'PERP_X_USDC', { base: 'X', markPx: 100, openInterest: null }),   // a desk leg must be sized
     leg('okx', 'X', { markPx: null, openInterest: null }, 'cex'),
     leg('aster', 'X', { markPx: 100.2, openInterest: null }),         // a DEX that publishes no OI: rate reference
     leg('pacifica', 'X', { markPx: null, openInterest: 9e9 }),        // a DEX leg without a mark cannot be priced
+    leg('lighter', 'X', { markPx: 100, openInterest: 100 }),          // 10,000 USD on a watch venue: dropped
   ];
   const { kept, dropped } = filterLegs(legs, OPTS);
-  assert.deepEqual(kept.map((l) => l.venue), ['phoenix', 'okx', 'aster']);
+  assert.deepEqual(kept.map((l) => l.venue), ['hyperliquid', 'phoenix', 'okx', 'aster']);
+  assert.equal(kept[0]!.deskOnly, 'has $499,900 of open interest, under the $500,000 floor');
+  assert.ok(kept.slice(1).every((l) => l.deskOnly === undefined));
   assert.deepEqual(dropped.map((d) => [d.venue, d.reason]), [
-    ['hyperliquid', 'under-oi-floor'], ['orderly', 'no-oi'], ['pacifica', 'no-mark'],
+    ['orderly', 'no-oi'], ['pacifica', 'no-mark'], ['lighter', 'under-oi-floor'],
+  ]);
+  // The thin desk leg pairs with the other desk venue only: never into a watch window.
+  assert.deepEqual(pairLegs(kept).map((p) => p.id).sort(), [
+    'x-aster-phoenix', 'x-hyperliquid-phoenix', 'x-okx-phoenix', 'x-phoenix-aster', 'x-phoenix-hyperliquid', 'x-phoenix-okx',
   ]);
 });
 
@@ -139,8 +146,10 @@ test('the held window\'s legs are never dropped: kept with what they failed, and
   const heldId = 'sol-phoenix-hyperliquid';
   const exempt = heldLegKeys(legs, heldId);
   assert.deepEqual([...exempt].sort(), ['hyperliquid|SOL', 'phoenix|SOL']);
-  // Without the exemption both held legs go.
-  assert.deepEqual(filterLegs(legs, OPTS).dropped.map((d) => [d.venue, d.reason]), [['phoenix', 'under-oi-floor'], ['hyperliquid', 'mark-outlier']]);
+  // Without the exemption the mark outlier goes, and the thin desk leg is kept for desk pairs only.
+  const free = filterLegs(legs, OPTS);
+  assert.deepEqual(free.dropped.map((d) => [d.venue, d.reason]), [['hyperliquid', 'mark-outlier']]);
+  assert.equal(free.kept.find((l) => l.venue === 'phoenix')!.deskOnly, 'has $40,000 of open interest, under the $500,000 floor');
   const { kept, dropped } = filterLegs(legs, OPTS, exempt);
   assert.deepEqual(dropped, []);
   const by = new Map(kept.map((l) => [l.venue, l]));

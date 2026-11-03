@@ -50,7 +50,8 @@ interface Played {
   watch: boolean;
   /** Successful watch sweeps recorded after the play's start and served by it: the slice is past the first sweeps. */
   laterSweeps: number;
-  scans: { windows: FundingWindow[]; scan: ScanStatus }[];
+  /** Per scan, each desk window's expected carry: the spread over the hold minus the round trip, and the APR used. */
+  scans: { windows: FundingWindow[]; scan: ScanStatus; carry: Record<string, { netUsd: number | null; aprPct: number | null }> }[];
 }
 
 async function play(file: string): Promise<Played> {
@@ -69,7 +70,12 @@ async function play(file: string): Promise<Played> {
     const r = await scanner.scan();
     // History reads answer in the background; the live engine has them back long before its next scan, 5 s later.
     await scanner.idle();
-    scans.push({ windows: r.windows, scan: r.scan });
+    const carry: Played['scans'][number]['carry'] = {};
+    for (const w of r.windows) {
+      const c = scanner.carry(w.id);
+      if (c !== null) carry[w.id] = { netUsd: c.estimate.netUsd, aprPct: c.estimate.expectedAprPct };
+    }
+    scans.push({ windows: r.windows, scan: r.scan, carry });
   }
   return { span: end - start, step, watch: readers.watch.length > 0, laterSweeps, scans };
 }
@@ -106,17 +112,25 @@ for (const file of files) {
     let setChanges = 0;
     let previous = '';
     let watchServed = 0;
-    for (const { windows, scan } of scans) {
+    for (const { windows, scan, carry } of scans) {
       assert.ok(windows.length > 0, `no windows at ${scan.at}`);
       assert.equal(new Set(windows.map((w) => w.id)).size, windows.length);
-      // Enterable first, then the other desk windows, each by net; then watch-only. No desk policy is loaded here,
+      // Enterable first, then the other desk windows, each by expected carry (those without one after, by net); then
+      // watch-only. No desk policy is loaded here,
       // so nothing is enterable and every desk window is refused E_NO_DESK.
       const enterable = windows.filter(isEnterable);
       const desk = windows.filter((w) => w.tradable && !isEnterable(w));
       const watchOnly = windows.filter((w) => !w.tradable);
       assert.deepEqual(windows, [...enterable, ...desk, ...watchOnly], 'enterable, then desk, then watch-only');
       assert.equal(enterable.length, 0);
-      for (const group of [enterable, desk]) for (let i = 1; i < group.length; i++) assert.ok(group[i - 1]!.netAprPct >= group[i]!.netAprPct);
+      for (const group of [enterable, desk]) {
+        for (let i = 1; i < group.length; i++) {
+          const [a, b] = [carry[group[i - 1]!.id]?.netUsd ?? null, carry[group[i]!.id]?.netUsd ?? null];
+          if (a !== null && b !== null) assert.ok(a >= b, `${group[i - 1]!.id} before ${group[i]!.id}`);
+          else if (a === null && b === null) assert.ok(group[i - 1]!.netAprPct >= group[i]!.netAprPct);
+          else assert.ok(a !== null, `${group[i]!.id} has a carry estimate but ranks after one without`);
+        }
+      }
       // Watch-only: the clean ones, then those with a quality finding, each by gross.
       const clean = watchOnly.filter((w) => !hasQualityFinding(w));
       const flagged = watchOnly.filter(hasQualityFinding);
@@ -126,7 +140,9 @@ for (const file of files) {
       for (const w of windows) {
         const numbers = [w.grossAprPct, w.netAprPct, w.usdPerDayPer1k, w.breakevenHours, w.depthUsd, w.intervalsAbove, w.updatedAt, ...Object.values(w.costs)];
         for (const n of numbers) assert.ok(Number.isFinite(n), `${w.id} at ${scan.at}: ${n}`);
-        assert.ok(w.grossAprPct > 0, `${w.id}: only positive gross is listed`);
+        // A watch window is listed on its gross now; a desk window on its multi-day spread once known.
+        const listedOn = w.tradable ? (carry[w.id]?.aprPct ?? w.grossAprPct) : w.grossAprPct;
+        assert.ok(listedOn > 0, `${w.id}: only a positive spread is listed`);
         assert.ok(w.depthUsd >= DEFAULT_SCANNER_CONFIG.oiFloorUsd, `${w.id}: capacity ${w.depthUsd}`);
         assert.ok(w.updatedAt <= scan.at);
         assert.ok(w.grossApr7dPct === null || Number.isFinite(w.grossApr7dPct));

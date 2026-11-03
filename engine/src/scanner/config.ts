@@ -5,8 +5,16 @@ import type { ContractPolicy, Mode, StrategyConfig, VenueId } from '@gimbal/shar
 import type { FillFee, Place, TransferCosts } from './costs.ts';
 
 export interface CostParams {
-  /** Hours a window is expected to be held: one-off costs (fills, slippage, basis, rescues) are spread over it. */
+  /**
+   * Hours a window is expected to be held: one-off costs (fills, slippage, basis, rescues) are spread over it, and a
+   * desk window's expected spread (carry.ts) is counted over it. StrategyConfig has no hold of its own.
+   */
   holdHours: number;
+  /**
+   * What the round trip of a desk window sets aside for the marks moving apart by the exit, bps of the leg, on top of
+   * the adverse gap paid at entry (basisCostUsd).
+   */
+  basisBufferBps: number;
   /** Cost of one taker fill per desk venue. */
   fees: Record<VenueId, FillFee>;
   transfers: TransferCosts;
@@ -224,7 +232,11 @@ export const ORDERLY_BROKERS = {
 
 /** Costs on mainnet, and in replay, which plays recorded mainnet answers. */
 export const MAINNET_COSTS: CostParams = {
-  holdHours: 168,
+  // A stated assumption: 10 days. The owner's engine rules carry no hold to take it from.
+  holdHours: 240,
+  // A stated assumption. Hyperliquid and Phoenix marks differed by 0.6 to 7.8 bps on 2026-11-03 (XLM, LTC, SOL, DOGE,
+  // NEAR), so an exit can lose a few bps to the gap whatever it was at entry.
+  basisBufferBps: 5,
   fees: {
     // Hyperliquid tier-0 taker 4.5 bps, plus the treasury builder fee on every order (FeeConfig.hl_builder_tenth_bps
     // 10 = 1 bp). The referral discount is not counted.

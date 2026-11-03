@@ -202,6 +202,7 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
   const tail: FundingWindow['checks'] = [];
   for (const leg of [long, short]) {
     if (leg.heldOnly !== undefined) tail.push({ ok: false, text: `Kept only because the desk holds it: ${venueName(leg.venue)} ${leg.symbol} ${leg.heldOnly}` });
+    else if (leg.deskOnly !== undefined) tail.push({ ok: false, text: `Shown for its multi-day spread, not entered: ${venueName(leg.venue)} ${leg.symbol} ${leg.deskOnly}` });
   }
   if (be === null) tail.push({ ok: false, text: 'Does not break even within a year at today\'s rates' });
   if (basisUsd === null) {

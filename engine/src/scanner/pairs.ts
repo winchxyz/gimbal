@@ -35,6 +35,11 @@ export interface ScanLeg {
   fundingFloorPerHour?: number;  // it gives none (quality.ts then falls back to the sourced FUNDING_LIMITS)
   /** Set on a leg of the held window that the filters would have dropped: why. The window fails a check for it. */
   heldOnly?: string;
+  /**
+   * Set on a desk leg under the open-interest floor: why. It is kept for desk pairs only (never a watch window), which
+   * the scanner lists only on a multi-day spread that covers the fills, and which fail a check for it.
+   */
+  deskOnly?: string;
 }
 
 export type DropReason = 'bad-rate' | 'duplicate' | 'no-mark' | 'mark-outlier' | 'no-oi' | 'under-oi-floor';
@@ -113,6 +118,9 @@ export interface FilterOptions {
  * A leg in `exempt` (`venue|symbol`: the legs of the window the desk holds) is never dropped by steps 2 to 4: the desk
  * must still see what it holds and what leaving costs. It is kept with `heldOnly` saying what it failed, and wins a
  * duplicate.
+ * A desk leg whose only failure is the open-interest floor is kept too, with `deskOnly` saying so: the floor is sized
+ * for ranking the whole market, while a desk leg of tens or hundreds of USD on a Phoenix market with 30k USD open is
+ * still worth showing. Its windows fail a check for it, so the floor still keeps it from being entered.
  */
 export function filterLegs(
   legs: readonly ScanLeg[], options: FilterOptions, exempt: ReadonlySet<string> = new Set(),
@@ -168,6 +176,7 @@ export function filterLegs(
     const failed = failedFilter(leg, marksByBase.get(leg.base) ?? [], options);
     if (failed === null) kept.push(leg);
     else if (isExempt(leg)) kept.push({ ...leg, heldOnly: failed.why });
+    else if (failed.reason === 'under-oi-floor' && leg.kind === 'desk') kept.push({ ...leg, deskOnly: failed.why });
     else drop(leg, failed.reason);
   }
   return { kept, dropped };
@@ -240,7 +249,7 @@ export function windowId(base: string, longVenue: ScanVenueId, shortVenue: ScanV
  * Every ordered pair of legs of the same base on two different venues, both directions, except CEX against CEX
  * (reference only on both sides: nothing to rank) and two legs whose open interest are both unknown (no leg has
  * passed the floor, and the window would have no capacity to show). A leg kept only for the held window (`heldOnly`)
- * makes no pair but that one.
+ * makes no pair but that one; a leg kept for desk pairs only (`deskOnly`) makes desk pairs only.
  */
 export function pairLegs(legs: readonly ScanLeg[], heldId: string | null = null): Pair[] {
   const byBase = new Map<string, ScanLeg[]>();
@@ -258,13 +267,15 @@ export function pairLegs(legs: readonly ScanLeg[], heldId: string | null = null)
         const id = windowId(base, long.venue, short.venue);
         if ((long.heldOnly !== undefined || short.heldOnly !== undefined) && id !== heldId) continue;
         if (long.oiUsd === null && short.oiUsd === null && id !== heldId) continue;
+        const desk = long.kind === 'desk' && short.kind === 'desk';
+        if ((long.deskOnly !== undefined || short.deskOnly !== undefined) && !desk && id !== heldId) continue;
         out.push({
           id,
           base,
           long,
           short,
           grossPerHour: grossPerHour(long.ratePerHour, short.shortRatePerHour),
-          desk: long.kind === 'desk' && short.kind === 'desk',
+          desk,
         });
       }
     }
