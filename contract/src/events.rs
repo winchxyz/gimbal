@@ -17,6 +17,7 @@ pub const OPERATOR_SET: &str = "operator_set";
 pub const ORDERLY_RECEIVER_SET: &str = "orderly_receiver_set";
 pub const ORDERLY_IPS_SET: &str = "orderly_ips_set";
 pub const PAUSED: &str = "paused";
+pub const PANIC_CLOSE: &str = "panic_close";
 pub const PRICES: &str = "prices";
 /// Emitted in `on_signed`, only when the MPC returned a signature.
 pub const SIGNED: &str = "signed";
@@ -113,6 +114,19 @@ pub struct Paused<'a> {
 
 impl Event for Paused<'_> {
     const NAME: &'static str = PAUSED;
+}
+
+/// `panic_close` marked the desk closing, and by which account. Logged on every call, after the
+/// `paused` it logs when the desk was still running.
+#[derive(Serialize)]
+#[serde(crate = "near_sdk::serde")]
+pub struct PanicClose<'a> {
+    pub desk_id: &'a str,
+    pub by: &'a AccountId,
+}
+
+impl Event for PanicClose<'_> {
+    const NAME: &'static str = PANIC_CLOSE;
 }
 
 /// The owner pinned the desk's Orderly receiver on Arbitrum (once).
@@ -367,6 +381,19 @@ mod tests {
         assert_eq!(
             line,
             r#"EVENT_JSON:{"standard":"gimbal","version":"1.0.0","event":"paused","data":[{"desk_id":"alpha","paused":false,"by":"owner.testnet"}]}"#
+        );
+    }
+
+    #[test]
+    fn panic_close_json() {
+        let by = account("engine.testnet");
+        let line = logged(PanicClose {
+            desk_id: "alpha",
+            by: &by,
+        });
+        assert_eq!(
+            line,
+            r#"EVENT_JSON:{"standard":"gimbal","version":"1.0.0","event":"panic_close","data":[{"desk_id":"alpha","by":"engine.testnet"}]}"#
         );
     }
 }

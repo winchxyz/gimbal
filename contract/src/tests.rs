@@ -443,6 +443,7 @@ fn mutating_methods_refuse_unknown_arguments() {
                 "set_policy",
                 "set_operator",
                 "set_paused",
+                "panic_close",
             ],
         ),
         (
@@ -1583,6 +1584,161 @@ fn a_stranger_may_not_pause_and_an_unknown_desk_is_refused() {
     assert!(!g.get_desk("alpha".into()).unwrap().paused);
     called_by(owner());
     assert_refused("E_NO_DESK: no desk ", || g.set_paused("bravo".into(), true));
+}
+
+// --- panic_close ---
+
+fn panic_close_log(by: &str) -> String {
+    event(
+        "panic_close",
+        &format!(r#"{{"desk_id":"alpha","by":"{by}"}}"#),
+    )
+}
+
+fn desk_flags(g: &Gimbal) -> (bool, bool) {
+    let desk = g.get_desk("alpha".into()).unwrap();
+    (desk.paused, desk.closing)
+}
+
+/// The owner (wallet or engine key) and the operator, with no deposit or 1 yocto: a running desk
+/// is paused and marked closing, `paused` logged before `panic_close`. It adds no storage.
+#[test]
+fn panic_close_pauses_the_desk_and_marks_it_closing() {
+    let mut g = with_desk();
+    for (who, name, deposit) in [
+        (owner(), "alice", yocto(0)),
+        (owner(), "alice", ONE_YOCTO),
+        (operator(), "bob", yocto(0)),
+        (operator(), "bob", ONE_YOCTO),
+    ] {
+        assert_eq!(desk_flags(&g), (false, false));
+        call(who, deposit);
+        let before = env::storage_usage();
+        g.panic_close("alpha".into());
+        g.desks.flush();
+        assert_eq!(env::storage_usage(), before, "adds no storage");
+        assert_eq!(desk_flags(&g), (true, true));
+        assert_eq!(
+            get_logs(),
+            vec![paused_log(true, name), panic_close_log(name)],
+            "{name}"
+        );
+        assert!(transfers().is_empty(), "nothing to refund");
+        call(owner(), ONE_YOCTO);
+        g.set_paused("alpha".into(), false);
+    }
+}
+
+/// On a paused desk `panic_close` only sets `closing`: no second `paused`, and the account that
+/// paused stays the one its event named. A repeat logs `panic_close` again and changes nothing.
+#[test]
+fn panic_close_on_a_paused_desk_only_sets_closing() {
+    let mut g = with_desk();
+    called_by(operator());
+    g.set_paused("alpha".into(), true);
+    assert_eq!(
+        desk_flags(&g),
+        (true, false),
+        "a pause alone is not a close"
+    );
+    called_by(owner());
+    g.panic_close("alpha".into());
+    assert_eq!(desk_flags(&g), (true, true));
+    assert_eq!(get_logs(), vec![panic_close_log("alice")]);
+    called_by(operator());
+    g.panic_close("alpha".into());
+    assert_eq!(desk_flags(&g), (true, true));
+    assert_eq!(get_logs(), vec![panic_close_log("bob")]);
+}
+
+#[test]
+fn panic_close_refuses_strangers_deposits_and_unknown_desks() {
+    let mut g = with_desk();
+    for deposit in [yocto(0), ONE_YOCTO] {
+        call(stranger(), deposit);
+        assert_refused(
+            "E_NOT_ALLOWED: charlie is neither the owner nor the operator of desk alpha",
+            || g.panic_close("alpha".into()),
+        );
+    }
+    for (who, deposit, shown) in [
+        (operator(), yocto(2), "2"),
+        (
+            owner(),
+            NearToken::from_near(1),
+            "1000000000000000000000000",
+        ),
+    ] {
+        call(who, deposit);
+        assert_refused(
+            &format!(
+                "E_DEPOSIT: panic_close takes no deposit (0 or 1 yoctoNEAR); attached {shown}"
+            ),
+            || g.panic_close("alpha".into()),
+        );
+    }
+    called_by(operator());
+    assert_refused("E_NO_DESK: no desk ", || g.panic_close("bravo".into()));
+    // The mock keeps what a refused call wrote, but these refuse before writing anything.
+    assert_eq!(desk_flags(&g), (false, false));
+}
+
+/// Only the owner's wallet ends a close: `set_paused(false)` with 1 yocto clears `closing` with
+/// the pause. The operator, the engine key and a second pause leave it set.
+#[test]
+fn unpausing_clears_closing() {
+    let mut g = with_desk();
+    called_by(operator());
+    g.panic_close("alpha".into());
+    call(operator(), ONE_YOCTO);
+    assert_refused("E_NOT_ALLOWED: the operator may pause desk alpha", || {
+        g.set_paused("alpha".into(), false)
+    });
+    called_by(owner());
+    assert_refused(
+        "E_NOT_ALLOWED: set_paused(false) needs exactly 1 yoctoNEAR attached",
+        || g.set_paused("alpha".into(), false),
+    );
+    g.set_paused("alpha".into(), true);
+    assert!(get_logs().is_empty());
+    assert_eq!(desk_flags(&g), (true, true));
+    call(owner(), ONE_YOCTO);
+    g.set_paused("alpha".into(), false);
+    assert_eq!(desk_flags(&g), (false, false));
+    assert_eq!(get_logs(), vec![paused_log(false, "alice")]);
+    // A later pause is a pause, not a close.
+    called_by(operator());
+    g.set_paused("alpha".into(), true);
+    assert_eq!(desk_flags(&g), (true, false));
+}
+
+/// `get_desk` carries `closing`, false on a new desk, after `paused`.
+#[test]
+fn get_desk_returns_closing() {
+    let mut g = with_desk();
+    let view = |g: &Gimbal| serde_json::to_value(g.get_desk("alpha".into()).unwrap()).unwrap();
+    assert_eq!(view(&g)["closing"], false);
+    let json = serde_json::to_string(&g.get_desk("alpha".into()).unwrap()).unwrap();
+    assert!(
+        json.contains(r#""paused":false,"closing":false,"policy":"#),
+        "{json}"
+    );
+    called_by(operator());
+    g.panic_close("alpha".into());
+    assert_eq!(view(&g)["closing"], true);
+    assert_eq!(view(&g)["paused"], true);
+}
+
+/// `panic_close` is what the engine's key calls: payable for the yocto a wallet may attach, with
+/// unknown arguments refused like every mutating method.
+#[test]
+fn panic_close_is_payable_and_refuses_unknown_arguments() {
+    let attributes = attributes_of(include_str!("lib.rs"), "panic_close");
+    assert!(attributes.contains(&"#[payable]"), "{attributes:?}");
+    assert!(
+        attributes.contains(&"#[deny_unknown_arguments]"),
+        "{attributes:?}"
+    );
 }
 
 // --- the action guard ---

@@ -522,6 +522,41 @@ fn a_paused_desk_signs_only_orderly_calls_that_reduce_risk() {
     }
 }
 
+/// After `panic_close`, through the method itself: either order of the vectors, buy or sell,
+/// signs reduce-only (and says so in the signed body) and is `E_PAUSED` otherwise; cancels pass.
+#[test]
+fn a_closing_desk_signs_reduce_only_orderly_orders_and_refuses_opening_ones() {
+    let mut g = orderly_desk();
+    called_by(operator());
+    g.panic_close("alpha".into());
+    let desk = g.get_desk("alpha".into()).unwrap();
+    assert!(desk.paused && desk.closing);
+    for name in ["order LIMIT BUY", "order IOC SELL reduce-only"] {
+        for who in [owner(), operator()] {
+            let mut req = request_of(&request_case(name));
+            req.reduce_only = true;
+            let got =
+                request(&mut g, who.clone(), req.clone()).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let payload = serde_json::to_value(&got.payload).unwrap();
+            let body = payload["body"].as_str().unwrap();
+            assert!(body.ends_with(r#","reduce_only":true}"#), "{name}: {body}");
+            req.reduce_only = false;
+            let msg = request(&mut g, who, req).unwrap_err();
+            assert!(
+                msg.starts_with("E_PAUSED: desk alpha is paused"),
+                "{name}: {msg}"
+            );
+        }
+    }
+    for name in [
+        "cancel one order (query string is signed)",
+        "cancel all orders of a symbol",
+    ] {
+        let req = request_of(&request_case(name));
+        request(&mut g, operator(), req).unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
+}
+
 #[test]
 fn orderly_methods_are_for_the_owner_and_the_operator() {
     let mut g = orderly_desk();

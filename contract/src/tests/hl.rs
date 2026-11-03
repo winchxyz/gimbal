@@ -653,8 +653,45 @@ fn hl_withdraw_pays_the_desks_own_address() {
     assert_eq!(got.reason_sha256, None);
 }
 
+/// The desk's rescue counters, all zero before its first rescue.
+fn counters_of(g: &Gimbal) -> crate::rescue::DeskCounters {
+    g.desk_counters.get("alpha").copied().unwrap_or_default()
+}
+
+/// The operator path (no deposit) signs the same `withdraw3` as the owner's wallet: the vector's
+/// bytes, to the desk's own address, which no argument can change.
 #[test]
-fn hl_withdraw_is_for_the_owners_wallet_only() {
+fn the_operators_hl_withdraw_signs_the_same_withdraw3_to_the_desks_own_address() {
+    let c = case(
+        "user_signed",
+        "withdraw3 10 USDC to the desk's own address (testnet)",
+    );
+    let time = c["action"]["time"].as_u64().unwrap();
+    for who in [operator(), owner()] {
+        // A thread each: the mock's storage, and so the desk's nonce, lives as long as its thread.
+        std::thread::spawn(move || {
+            let mut g = hl_desk();
+            at(who, time, yocto(0));
+            let got = g.prepare_hl_withdraw("alpha".into(), "10".into());
+            assert_signs_user(
+                &got,
+                "withdraw3",
+                "withdraw3 10 USDC to the desk's own address (testnet)",
+            );
+            let payload = serde_json::to_value(&got.payload).unwrap();
+            assert_eq!(payload["action"]["destination"], VECTOR_DESK_EVM);
+            assert_eq!(got.amount.as_deref(), Some("10"));
+        })
+        .join()
+        .unwrap();
+    }
+}
+
+/// The deposit picks the path. 1 yocto is the owner's wallet: the owner alone. None is the
+/// operator path: the operator, or the owner's engine key (a FunctionCall key on the owner's
+/// account, which looks like the owner and cannot attach a deposit). Anything else is refused.
+#[test]
+fn hl_withdraw_has_an_owner_path_and_an_operator_path() {
     let mut g = hl_desk();
     at(operator(), T, ONE_YOCTO);
     assert_refused(
@@ -663,23 +700,161 @@ fn hl_withdraw_is_for_the_owners_wallet_only() {
             g.prepare_hl_withdraw("alpha".into(), "10".into());
         },
     );
-    for wrong in [yocto(0), yocto(2), NearToken::from_near(1)] {
-        at(owner(), T, wrong);
+    for deposit in [yocto(0), ONE_YOCTO, yocto(2)] {
+        at(stranger(), T, deposit);
         assert_refused(
-            "E_NOT_ALLOWED: hl_withdraw needs exactly 1 yoctoNEAR attached",
+            "E_NOT_ALLOWED: charlie is neither the owner nor the operator of desk alpha",
             || {
                 g.prepare_hl_withdraw("alpha".into(), "10".into());
             },
         );
     }
-    at(owner(), T, ONE_YOCTO);
-    assert_refused("E_SIZE: amount is zero", || {
-        g.prepare_hl_withdraw("alpha".into(), "0".into());
+    for who in [owner(), operator()] {
+        for wrong in [yocto(2), NearToken::from_near(1)] {
+            at(who.clone(), T, wrong);
+            assert_refused(
+                "E_NOT_ALLOWED: hl_withdraw takes exactly 1 yoctoNEAR from the owner's wallet, \
+                 or no deposit on the operator path; attached ",
+                || {
+                    g.prepare_hl_withdraw("alpha".into(), "10".into());
+                },
+            );
+        }
+        for deposit in [yocto(0), ONE_YOCTO] {
+            if who == operator() && deposit == ONE_YOCTO {
+                continue;
+            }
+            at(who.clone(), T, deposit);
+            assert_refused("E_SIZE: amount is zero", || {
+                g.prepare_hl_withdraw("alpha".into(), "0".into());
+            });
+            assert_refused("E_DECIMAL: amount ", || {
+                g.prepare_hl_withdraw("alpha".into(), "10.0".into());
+            });
+            let msg = refusal(|| {
+                g.prepare_hl_withdraw("alpha".into(), "0.0000001".into());
+            });
+            assert!(
+                msg.contains("E_DECIMAL: amount ") && msg.contains("has 7 decimals; USDC has 6"),
+                "{msg}"
+            );
+        }
+    }
+    at(operator(), T, yocto(0));
+    assert_refused("E_NO_DESK: no desk ", || {
+        g.prepare_hl_withdraw("bravo".into(), "10".into());
     });
-    assert_refused("E_DECIMAL: amount ", || {
-        g.prepare_hl_withdraw("alpha".into(), "10.0".into());
+    assert_eq!(nonce_of("alpha", &g), 0, "a refused call takes no nonce");
+    assert_eq!(counters_of(&g), Default::default());
+}
+
+/// The operator path counts `amount` against the desk's sliding hourly rescue cap (50 USD here),
+/// and nothing against the cost budget or the deposit ring; the owner's wallet is not limited.
+#[test]
+fn the_operators_hl_withdraw_counts_against_the_rescue_cap() {
+    let mut g = hl_desk();
+    let cap = g
+        .get_desk("alpha".into())
+        .unwrap()
+        .policy
+        .rescue_cap_usd_per_hour;
+    assert_eq!(cap, 50);
+    let e8 = |usd: u128| usd * 100_000_000;
+    at(operator(), T, yocto(0));
+    g.prepare_hl_withdraw("alpha".into(), "30".into());
+    let c = counters_of(&g);
+    assert_eq!((c.rescue_at_ms, c.rescue_spent_e8), (T, e8(30)));
+    assert_eq!(c.rescue_cost_e8, 0, "no quote, no cost");
+    assert_eq!(
+        c.deposits,
+        [[0; 32]; crate::rescue::DEPOSIT_RING],
+        "no deposit address"
+    );
+    assert_eq!(c.deposit_next, 0);
+    // The owner's engine key takes the same path and the same cap.
+    at(owner(), T, yocto(0));
+    g.prepare_hl_withdraw("alpha".into(), "20".into());
+    assert_eq!(counters_of(&g).rescue_spent_e8, e8(50));
+    for who in [operator(), owner()] {
+        at(who, T + 1, yocto(0));
+        assert_refused(
+            "E_RESCUE_CAP: hl_withdraw of 0.00002 USDC is over what is left of the hourly \
+             rescue cap, 0.00001388 USD",
+            || {
+                g.prepare_hl_withdraw("alpha".into(), "0.00002".into());
+            },
+        );
+    }
+    assert_eq!(
+        nonce_of("alpha", &g),
+        T + 1,
+        "the refused calls took no nonce"
+    );
+    assert_eq!(counters_of(&g).rescue_spent_e8, e8(50));
+    // The owner's wallet withdraws without a limit and counts nothing.
+    at(owner(), T + 1, ONE_YOCTO);
+    g.prepare_hl_withdraw("alpha".into(), "1000".into());
+    assert_eq!(counters_of(&g).rescue_spent_e8, e8(50));
+    assert_eq!(counters_of(&g).rescue_at_ms, T);
+    // A fifth of an hour later a fifth of the cap is back: 10 USDC, then nothing.
+    let later = T + crate::rescue::RESCUE_WINDOW_MS / 5;
+    at(operator(), later, yocto(0));
+    assert_refused(
+        "E_RESCUE_CAP: hl_withdraw of 10.000001 USDC is over ",
+        || {
+            g.prepare_hl_withdraw("alpha".into(), "10.000001".into());
+        },
+    );
+    g.prepare_hl_withdraw("alpha".into(), "10".into());
+    let c = counters_of(&g);
+    assert_eq!((c.rescue_at_ms, c.rescue_spent_e8), (later, e8(50)));
+    // A lower cap applies at once.
+    let mut g = hl_desk_with(Policy {
+        rescue_cap_usd_per_hour: 9,
+        ..hl_policy()
     });
-    assert_eq!(nonce_of("alpha", &g), 0);
+    // The mock keeps this thread's storage: start the new desk's meters from zero.
+    g.desk_counters.insert("alpha".into(), Default::default());
+    at(operator(), T, yocto(0));
+    assert_refused(
+        "E_RESCUE_CAP: hl_withdraw of 10 USDC is over what is left of the hourly rescue cap, 9 USD",
+        || {
+            g.prepare_hl_withdraw("alpha".into(), "10".into());
+        },
+    );
+}
+
+/// After `panic_close` the desk closes: reduce-only orders, cancels and the operator's
+/// withdrawal sign; anything that opens or grows a position is `E_PAUSED`.
+#[test]
+fn a_closing_desk_signs_reduce_only_orders_and_refuses_opening_ones() {
+    let mut g = hl_desk();
+    at(operator(), T, yocto(0));
+    g.panic_close("alpha".into());
+    let desk = g.get_desk("alpha".into()).unwrap();
+    assert!(desk.paused && desk.closing);
+    for who in [owner(), operator()] {
+        at(who, T, yocto(0));
+        for is_buy in [true, false] {
+            let mut close = hype();
+            close.is_buy = is_buy;
+            close.reduce_only = true;
+            let got = g.prepare_hl_order("alpha".into(), close, "panic close".into());
+            let payload = serde_json::to_value(&got.payload).unwrap();
+            assert_eq!(payload["action"]["orders"][0]["r"], true);
+            let mut open = hype();
+            open.is_buy = is_buy;
+            assert_refused("E_PAUSED: desk alpha is paused", || {
+                g.prepare_hl_order("alpha".into(), open, "open".into());
+            });
+        }
+        g.prepare_hl_cancel("alpha".into(), 159, 7, "panic close".into());
+        g.prepare_hl_withdraw("alpha".into(), "5".into());
+        assert_refused("E_PAUSED: desk alpha is paused", || {
+            g.prepare_hl_usd_class_transfer("alpha".into(), "5".into(), true, "margin".into());
+        });
+    }
+    assert_eq!(counters_of(&g).rescue_spent_e8, 10 * 100_000_000);
 }
 
 // --- the returned shape ---
