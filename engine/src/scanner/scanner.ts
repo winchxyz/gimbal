@@ -24,10 +24,11 @@
 
 import type { ScanStatus, ScanVenueId, StrategyConfig, VenueId, Window as FundingWindow, WindowHistory } from '@gimbal/shared';
 import type { Book, Clock, MarketFunding, MarketHistorySource, VenueReader, WatchReader } from '../venues/venue.ts';
+import { venueName } from '../venues/names.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { ScannerConfig } from './config.ts';
 import type { CarryEstimate, MultiDay } from './carry.ts';
-import { carryChecks, carryEstimate, listingApr, multiDay, roundTrip, spreadOverHoldUsd } from './carry.ts';
+import { DEAD_BAND_APR_PCT, carryChecks, carryEstimate, listingApr, multiDay, roundTrip, spreadOverHoldUsd } from './carry.ts';
 import { HOURS_PER_YEAR, aprPct, basisCostUsd, fillFeeBps, oneOffAprPct, takerFeesUsd } from './costs.ts';
 import {
   FORTNIGHT_HOURS, HOUR_MS, RateStore, WEEK_HOURS, grossApr7d, grossAprOver, hourStart, intervalsAbove, legAprOver,
@@ -98,6 +99,8 @@ interface DeskHistory {
   d7: number | null;
   d14: number | null;
   m: MultiDay;
+  /** Why no 14-day mean is coming, when none is: said on the 7-day line. */
+  why: string | null;
 }
 
 /** One leg of a desk window: the venue's rate now and its 7- and 14-day means, APR (> 0 means longs pay shorts). */
@@ -120,26 +123,31 @@ export interface WindowCarry {
 
 /**
  * The second week of a desk leg's history is read once (its hours never change). A failed read is tried again after
- * historyRetryMs, doubling up to OLDER_RETRY_MAX_MS. It has failed for good, and the leg's windows are judged on their
- * 7 days alone, once the venue has said no for OLDER_GIVE_UP_MS: a rate limit or a timeout is not the venue saying no,
- * so a burst of 429s at startup never lets a window in on 7 days. Still tried after that, in case it answers.
+ * historyRetryMs, doubling up to OLDER_RETRY_MAX_MS, and is still tried after it has failed for good, in case it
+ * answers. It fails for good, and the leg's windows are judged on their 7 days alone, saying why, when the venue has
+ * refused it (an HTTP 4xx other than 408 and 429) without a break for OLDER_REFUSED_MS, or when it has failed in any
+ * way (5xx, network, timeout, 429) for OLDER_FAILING_MS: a burst of 429s at startup never lets a window in on 7 days.
  */
-const OLDER_GIVE_UP_MS = HOUR_MS;
+const OLDER_REFUSED_MS = HOUR_MS;
+const OLDER_FAILING_MS = 24 * HOUR_MS;
 const OLDER_RETRY_MAX_MS = 15 * 60_000;
 
 interface OlderState {
   done: boolean;
   failures: number;
-  /** When the venue first said no in the current run of failures (not a rate limit or timeout); null = it has not. */
+  /** Since when the venue has refused it, with no other failure or any successful read of the leg since; else null. */
   refusedSince: number | null;
-  /** A refusal came at least OLDER_GIVE_UP_MS after the first: judged on 7 days until the read answers. */
-  givenUp: boolean;
+  /** Since when it has failed, in any way; null once it answers. */
+  failingSince: number | null;
+  /** Why it failed for good: judged on 7 days until the read answers. */
+  givenUp: 'refused' | 'failing' | null;
   retryAt: number;
 }
 
-/** A failure that says nothing about whether the venue has the hours: a rate limit, a timeout, an aborted request. */
-export function isTransientReadError(message: string): boolean {
-  return /\b429\b|rate.?limit|too many requests|time(d)?.?out|no answer within|abort/i.test(message);
+/** The venue saying no: an HTTP status 4xx other than 408 (timeout) and 429 (rate limit). Anything else may pass. */
+export function isRefusal(err: unknown): boolean {
+  const status = (err as { status?: unknown } | null)?.status;
+  return typeof status === 'number' && status >= 400 && status < 500 && status !== 408 && status !== 429;
 }
 
 const legKey = (leg: Pick<ScanLeg, 'venue' | 'symbol'>): string => `${leg.venue}|${leg.symbol}`;
@@ -230,11 +238,23 @@ export class Scanner {
         if (st.retryAt > now + config.historyRetryMs) this.#history.set(key, { ...st, retryAt: 0 });
       }
       for (const [key, o] of this.#older) {
-        // A wait or a refusal dated in the future: from now instead, so neither outlasts what it was meant to.
+        // A wait or a give-up clock dated in the future: from now instead, so none outlasts what it was meant to.
         this.#older.set(key, {
           ...o,
           retryAt: o.retryAt > now + OLDER_RETRY_MAX_MS ? 0 : o.retryAt,
           refusedSince: o.refusedSince !== null && o.refusedSince > now ? now : o.refusedSince,
+          failingSince: o.failingSince !== null && o.failingSince > now ? now : o.failingSince,
+        });
+      }
+    }
+    // A jump forward of an hour or more (a machine waking from sleep) is no evidence the venue kept failing: the
+    // older reads' give-up clocks start again from now.
+    if (this.#lastAt > 0 && now - this.#lastAt >= HOUR_MS) {
+      this.#note(`the clock went forward ${Math.round((now - this.#lastAt) / 60_000)} min: the older history reads' give-up clocks start again`);
+      for (const [key, o] of this.#older) {
+        if (o.done || o.givenUp !== null) continue;
+        this.#older.set(key, {
+          ...o, refusedSince: o.refusedSince === null ? null : now, failingSince: o.failingSince === null ? null : now,
         });
       }
     }
@@ -358,7 +378,7 @@ export class Scanner {
           this.#rates.recordLive(shortSide(leg), now, leg.shortRatePerHour);
         }
       }
-      historyReads = this.#loadHistory(priced, all.filter((p) => p.desk), now);
+      historyReads = this.#loadHistory(priced, all.filter((p) => p.desk), now, heldId);
     }
     this.#rates.prune(now);
 
@@ -383,6 +403,7 @@ export class Scanner {
       const estimate = carryEstimate({
         legUsd: strategy.legUsd, holdHours: config.costs.holdHours, grossNowAprPct: w.grossAprPct,
         gross7dAprPct: dh.d7, gross14dAprPct: dh.d14, multiDay: dh.m, roundTrip: rt, minNetAprPct: strategy.minNetAprPct,
+        noFortnightWhy: dh.why,
       });
       w.checks.push(...carryChecks(estimate));
       // Once its 7 days are in, a desk window's figures are days of funding against the round trip, the numbers the
@@ -499,9 +520,27 @@ export class Scanner {
     const shortKey = shortSide(p.short);
     const g7 = grossAprOver(this.#rates, longKey, shortKey, now, WEEK_HOURS);
     const g14 = grossAprOver(this.#rates, longKey, shortKey, now, FORTNIGHT_HOURS);
-    const d7 = g7 === null ? null : round(g7, 3);
+    // The dead band too, so the 7 days shown and the check lines are what the pair was judged on.
+    const d7 = g7 === null ? null : Math.abs(g7) < DEAD_BAND_APR_PCT ? 0 : round(g7, 3);
     const d14 = g14 === null ? null : round(g14, 3);
-    return { d7, d14, m: multiDay(d7, d14, this.#fortnightPending(p.long) || this.#fortnightPending(p.short)) };
+    const pending = this.#fortnightPending(p.long) || this.#fortnightPending(p.short);
+    const why = d14 !== null || pending ? null : (this.#noFortnightWhy(p.long, now) ?? this.#noFortnightWhy(p.short, now));
+    return { d7, d14, m: multiDay(d7, d14, pending), why };
+  }
+
+  /** Why a leg has no 14-day mean coming, or null when it may still come (or has come). */
+  #noFortnightWhy(leg: ScanLeg, now: number): string | null {
+    // A leg with its own 14 days is not the reason.
+    if (legAprOver(this.#rates, longSide(leg), now, FORTNIGHT_HOURS) !== null) return null;
+    const venue = venueName(leg.venue);
+    if (this.#sources.find((s) => s.id === leg.venue)?.history === undefined) return `${venue} publishes no funding history`;
+    if ((this.#history.get(legKey(leg))?.loadedHour ?? null) === null) return `${venue}'s week of history has not loaded`;
+    const o = this.#older.get(legKey(leg));
+    if (o === undefined) return null;
+    if (o.done) return `${venue} ${leg.symbol} is younger than 14 days`;
+    if (o.givenUp === 'refused') return `${venue} has refused the week before for an hour`;
+    if (o.givenUp === 'failing') return `reading the week before from ${venue} has failed for 24 h`;
+    return null;
   }
 
   /**
@@ -514,7 +553,7 @@ export class Scanner {
     // The older read follows the week's: while the week has never loaded it is not coming, as with no history.
     if ((this.#history.get(legKey(leg))?.loadedHour ?? null) === null) return false;
     const o = this.#older.get(legKey(leg));
-    return o === undefined || (!o.done && !o.givenUp);
+    return o === undefined || (!o.done && o.givenUp === null);
   }
 
   #legRates(leg: ScanLeg, key: string, ratePerHour: number, now: number): LegRates {
@@ -540,11 +579,12 @@ export class Scanner {
    * recording asked. Once a desk leg's week is in, the week before it is read once too, for the 14-day average. Until
    * a leg's history arrives its windows show grossApr7dPct null. Returns how many reads it started.
    */
-  #loadHistory(priced: readonly PricedWindow[], deskPairs: readonly Pair[], now: number): number {
+  #loadHistory(priced: readonly PricedWindow[], deskPairs: readonly Pair[], now: number, heldId: string | null): number {
     if (this.#historyRun !== null) return 0;
     const { config } = this.#options;
     const current = hourStart(now);
-    const order = [...priced].sort((a, b) => Number(b.pair.desk) - Number(a.pair.desk) || b.window.netAprPct - a.window.netAprPct);
+    const held = (pw: PricedWindow) => Number(pw.pair.id === heldId);
+    const order = [...priced].sort((a, b) => held(b) - held(a) || Number(b.pair.desk) - Number(a.pair.desk) || b.window.netAprPct - a.window.netAprPct);
     const legs: ScanLeg[] = [];
     for (const pw of order) if (pw.pair.desk) legs.push(pw.pair.long, pw.pair.short);
     for (const p of deskPairs) legs.push(p.long, p.short);
@@ -569,7 +609,7 @@ export class Scanner {
     for (const { leg, src } of unique) {
       if (todo.length >= config.historyPerScan) break;
       // Due alongside the leg's week read if need be: a week read that keeps failing must not starve it.
-      if (leg.kind !== 'desk' || todo.some((t) => t.leg === leg && t.older)) continue;
+      if (leg.kind !== 'desk') continue;
       const key = legKey(leg);
       if ((this.#history.get(key)?.loadedHour ?? null) === null) continue;
       const o = this.#older.get(key);
@@ -586,29 +626,41 @@ export class Scanner {
     const run: Promise<void> = pool(todo.map(({ leg, src, older }) => async () => {
       const key = legKey(leg);
       const what = `${leg.venue} ${older ? 'older history' : 'history'} ${leg.symbol}`;
+      // Aborted when the scanner stops waiting, so a read that timed out does not run on in the background.
+      const abort = new AbortController();
       try {
-        const points = await withTimeout(src.history!(leg.symbol, older ? olderStart : start, older ? olderEnd : end), config.readTimeoutMs * 2, what);
+        const read = src.history!(leg.symbol, older ? olderStart : start, older ? olderEnd : end, abort.signal);
+        const points = await withTimeout(read, config.readTimeoutMs * 2, what).catch((err: unknown) => {
+          abort.abort(err);
+          throw err;
+        });
         this.#rates.recordBooked(longSide(leg), points);
         this.#rates.recordBooked(shortSide(leg), points);
         if (older) {
-          this.#older.set(key, { done: true, failures: 0, refusedSince: null, givenUp: false, retryAt: 0 });
+          this.#older.set(key, { done: true, failures: 0, refusedSince: null, failingSince: null, givenUp: null, retryAt: 0 });
           const week = this.#history.get(key)?.points ?? 0;
           if (points.length < 0.5 * week) {
             this.#note(`${what}: ${points.length} prints against ${week} for the week after it: a market younger than 14 days`);
           }
         } else {
           this.#history.set(key, { loadedHour: current, retryAt: 0, points: points.length });
+          // The venue answers for this leg after all: its refusals of the week before start counting again.
+          const o = this.#older.get(key);
+          if (o !== undefined && o.refusedSince !== null) this.#older.set(key, { ...o, refusedSince: null });
         }
       } catch (err) {
         this.#note(`${what} failed: ${errorMessage(err)}`);
         if (older) {
           const o = this.#older.get(key);
           const failures = (o?.failures ?? 0) + 1;
-          const refused = !isTransientReadError(errorMessage(err));
-          const refusedSince = refused ? (o?.refusedSince ?? now) : (o?.refusedSince ?? null);
-          const givenUp = (o?.givenUp ?? false) || (refused && refusedSince !== null && now - refusedSince >= OLDER_GIVE_UP_MS);
+          // A refusal clock runs only through refusals: any other failure starts it again at the next refusal.
+          const refusedSince = isRefusal(err) ? (o?.refusedSince ?? now) : null;
+          const failingSince = o?.failingSince ?? now;
+          const givenUp = o?.givenUp
+            ?? (refusedSince !== null && now - refusedSince >= OLDER_REFUSED_MS ? 'refused'
+              : now - failingSince >= OLDER_FAILING_MS ? 'failing' : null);
           const backoff = Math.min(OLDER_RETRY_MAX_MS, config.historyRetryMs * 2 ** (failures - 1));
-          this.#older.set(key, { done: false, failures, refusedSince, givenUp, retryAt: now + backoff });
+          this.#older.set(key, { done: false, failures, refusedSince, failingSince, givenUp, retryAt: now + backoff });
         } else {
           const st = this.#history.get(key);
           this.#history.set(key, { loadedHour: st?.loadedHour ?? null, retryAt: now + config.historyRetryMs, points: st?.points ?? 0 });

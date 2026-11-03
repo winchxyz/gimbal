@@ -91,7 +91,8 @@ export function windowBlock(w: FundingWindow, c: WindowCarry): string[] {
   } else if (e.state === 'mixed') {
     out.push(`  ${hold}  not judged: 7 d ${apr(e.gross.d7AprPct)} % and 14 d ${apr(e.gross.d14AprPct)} % point opposite ways; fails the gate`);
   } else {
-    const which = e.gross.d14AprPct === null ? '7 d alone, no 14 d to be had' : `${e.basis === '14d' ? '14 d' : '7 d'}, the smaller of 7 d and 14 d`;
+    const which = e.gross.d14AprPct === null
+      ? `7 d alone: ${e.noFortnightWhy ?? 'no 14 d to be had'}` : `${e.basis === '14d' ? '14 d' : '7 d'}, the smaller of 7 d and 14 d`;
     const even = e.breakevenDays === null ? 'never breaks even' : `break-even ${e.breakevenDays.toFixed(1)} days`;
     out.push(`  ${hold}  expected ${money(e.expectedUsd!)} on ${apr(e.expectedAprPct)} % APR (${which}), `
       + `${money(e.netUsd!)} after the round trip = ${apr(e.netAprPct)} % APR net (minimum ${e.minNetAprPct} %), ${even}: `

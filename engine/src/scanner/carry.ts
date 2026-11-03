@@ -105,6 +105,8 @@ export interface CarryEstimate {
   netAprPct: number | null;
   /** StrategyConfig.minNetAprPct. */
   minNetAprPct: number;
+  /** Why there is no 14-day mean, when judged on the 7 days alone. */
+  noFortnightWhy: string | null;
   /** Days of the expected spread that pay the round trip. */
   breakevenDays: number | null;
   /** The gate: the expected spread over the hold pays the round trip and nets at least the owner's minimum. */
@@ -113,7 +115,7 @@ export interface CarryEstimate {
 
 export function carryEstimate(input: {
   legUsd: number; holdHours: number; grossNowAprPct: number; gross7dAprPct: number | null; gross14dAprPct: number | null;
-  multiDay: MultiDay; roundTrip: RoundTrip; minNetAprPct: number;
+  multiDay: MultiDay; roundTrip: RoundTrip; minNetAprPct: number; noFortnightWhy?: string | null;
 }): CarryEstimate {
   const { legUsd, holdHours, roundTrip: rt, multiDay: m, minNetAprPct } = input;
   const known = m.state === 'known' ? m : null;
@@ -125,6 +127,7 @@ export function carryEstimate(input: {
     legUsd, holdHours,
     gross: { nowAprPct: input.grossNowAprPct, d7AprPct: input.gross7dAprPct, d14AprPct: input.gross14dAprPct },
     state: m.state, basis: known?.basis ?? null, expectedAprPct: aprPct, expectedUsd, roundTrip: rt, netUsd, netAprPct, minNetAprPct,
+    noFortnightWhy: input.gross14dAprPct === null ? (input.noFortnightWhy ?? null) : null,
     breakevenDays: aprPct === null ? null : breakevenDays(rt.totalUsd, aprPct, legUsd),
     ok: netUsd !== null && netAprPct !== null && netUsd > 0 && netAprPct >= minNetAprPct,
   };
@@ -171,7 +174,7 @@ export function carryChecks(e: CarryEstimate): FundingWindow['checks'] {
     return [{ ok: false, text: `The 7-day spread (${pct(d7!)} APR) and the 14-day spread (${pct(d14!)} APR) point opposite ways: no steady carry in this direction` }];
   }
   const label = e.basis === '14d' ? '14-day' : '7-day';
-  const which = d14 === null ? 'the 14-day mean could not be had' : 'the smaller of the 7- and 14-day means';
+  const which = d14 === null ? `no 14-day mean: ${e.noFortnightWhy ?? 'it could not be had'}` : 'the smaller of the 7- and 14-day means';
   const head = `Over ${hold}, the ${label} spread of ${pct(e.expectedAprPct!)} APR (${which}) pays ${money(e.expectedUsd!)} at ${usd(e.legUsd)} a leg`;
   const nets = `${pct(e.netAprPct!)} APR over the hold`;
   const out: FundingWindow['checks'] = [];

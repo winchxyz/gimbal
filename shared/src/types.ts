@@ -49,7 +49,8 @@ export interface Window {
                                              // first failing one is why it is not entered. Enterable = tradable, not
                                              // refused, not stale, every check ok, no veto
   switchCostUsd: number | null;     // cost to rotate from the held window into this one at strategy.legUsd:
-                                    // the fills only; the margin moves are a one-off cost of their own;
+                                    // the fills that change, plus moving margin onto this window's venues and
+                                    // back (its net APR leaves those moves out);
                                     // null when nothing is held or this is the held one
   stale: boolean;                   // a venue it needs did not answer: the numbers are from the last good read
 }

@@ -127,7 +127,8 @@ export interface MarketFundingPoint {
 
 /** Public funding history of one market, oldest first, with `startTime <= time <= endTime` (ms). */
 export interface MarketHistorySource {
-  marketFundingHistory(symbol: string, startTime: number, endTime: number): Promise<MarketFundingPoint[]>;
+  /** `signal` aborts the request (the scanner's timeout); a reader that cannot abort still ends at its own timeout. */
+  marketFundingHistory(symbol: string, startTime: number, endTime: number, signal?: AbortSignal): Promise<MarketFundingPoint[]>;
 }
 
 export type VenueMethod = 'markets' | 'funding' | 'book' | 'account' | 'userFunding' | 'marketFundingHistory';

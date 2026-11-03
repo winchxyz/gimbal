@@ -320,21 +320,22 @@ test('verdicts with a policy: a market outside it is E_ASSET, before any oracle 
   assert.deepEqual(deskVerdict(pairOf(LONG, SHORT), verdictCtx({ policy: null })).refused, { code: 'E_NO_DESK', reason: 'no desk policy loaded yet' });
 });
 
-test('switch cost: close the legs that change and open the new ones; the margin move is the next window\'s, counted once', () => {
+test('switch cost: close the legs that change and open the new ones, and move margin onto the new venues', () => {
   // The desk holds long Phoenix / short Hyperliquid, so its margin sits on those two venues.
   const heldAt = ctx({ marginHeldAt: new Set<VenueId>(['phoenix', 'hyperliquid']) });
   const held = priced(LONG, SHORT, heldAt);
   // Short moves Hyperliquid -> Orderly (4 bps under gimbal_dex). Fills: close the HL short 0.55 + 0.09999, open the
   // Orderly short 0.40 + 0.10001 = 1.150000002 USD.
   const toOrderly = priced(LONG, leg('orderly', 'PERP_SOL_USDC', { base: 'SOL', ratePerHour: 0.00006 }), heldAt);
-  assert.equal(switchCostUsd(held, toOrderly), 1.15);
-  // Moving the 333.33 USD of margin onto Orderly and back is already in that window's feesPct, at 0.32 + 0.6667 in
-  // and 1.00 + 0.32 + 0.6667 out = 2.9733 USD (the review found the switch cost adding the move a second time).
+  // Plus moving the 333.33 USD of margin onto Orderly and back, 0.32 + 0.6667 in and 1.00 + 0.32 + 0.6667 out =
+  // 2.9733 USD: a desk window's net APR leaves its margin moves out, so the rotation pays for them here.
   near(toOrderly.breakdown.transferUsd, 0.32 + 1.0 + 0.32 + 2 * (1000 / 3) * 0.002, 1e-9);
+  assert.equal(switchCostUsd(held, toOrderly), Math.round((1.150000002 + toOrderly.breakdown.transferUsd!) * 1e4) / 1e4);
+  assert.equal(switchCostUsd(held, toOrderly), 4.1233);
   assert.ok(toOrderly.window.checks.some((c) => c.text === 'Moving $333 of margin a leg onto Orderly and back costs $2.97'), JSON.stringify(toOrderly.window.checks));
-  // Long moves Phoenix -> Orderly: close 0.35 + 0.10001, open 0.40 + 0.09999 = 0.950000002 USD.
+  // Long moves Phoenix -> Orderly: close 0.35 + 0.10001, open 0.40 + 0.09999 = 0.950000002 USD, and the same move.
   const longOrderly = priced(leg('orderly', 'PERP_SOL_USDC', { base: 'SOL', ratePerHour: 0 }), SHORT, heldAt);
-  assert.equal(switchCostUsd(held, longOrderly), 0.95);
+  assert.equal(switchCostUsd(held, longOrderly), Math.round((0.950000002 + longOrderly.breakdown.transferUsd!) * 1e4) / 1e4);
   // The same two venues the other way round: all four fills, and no margin moves in either window:
   // 0.4500 + 0.6500 + 0.6500 + 0.4500 = 2.2.
   const swapped = priced(leg('hyperliquid', 'SOL'), leg('phoenix', 'SOL', { ratePerHour: 0.0001 }), heldAt);

@@ -363,13 +363,10 @@ function watchVerdict(pair: Pair): Verdict {
 
 /**
  * What it costs to rotate from the held window into another at the same leg size, USD: close the held legs that
- * change and open the new ones (taker fee and slippage of each of those fills). A leg that stays (same venue, market
- * and side) costs nothing.
- *
- * Margin moves are not in it. Each window's feesPct already counts moving its margin onto its venues and back
- * (none where marginHeldAt says the desk's margin already sits), so a rotation judged on the next window's net APR
- * plus this cost would pay for the same move twice. Moving margin from the venue the desk leaves rather than from
- * the reserve costs about the same, and the held window's own trip back is saved.
+ * change and open the new ones (taker fee and slippage of each of those fills; a leg that stays, same venue, market
+ * and side, costs nothing), plus moving margin onto the new window's venues and back (its transferUsd: none where
+ * marginHeldAt says the desk's margin already sits). A desk window's net APR leaves its margin moves out (they are a
+ * one-off cost shown apart), so this is where the rotation gap and its payback pay for them.
  */
 export function switchCostUsd(held: PricedWindow, next: PricedWindow): number | null {
   if (held.fills === null || next.fills === null) return null;
@@ -380,5 +377,5 @@ export function switchCostUsd(held: PricedWindow, next: PricedWindow): number | 
     if (a.venue === b.venue && a.symbol === b.symbol) continue;
     total += held.fills[side].closeUsd + next.fills[side].openUsd;
   }
-  return round(total, 4);
+  return round(total + (next.breakdown.transferUsd ?? 0), 4);
 }

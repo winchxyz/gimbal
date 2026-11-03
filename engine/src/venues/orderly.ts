@@ -300,18 +300,18 @@ export class OrderlyReader implements VenueReader, FundingHistorySource, MarketH
   }
 
   /** Funding prints of one market with `startTime <= time <= endTime` (ms), oldest first, from public REST. */
-  async marketFundingHistory(symbol: string, startTime: number, endTime: number): Promise<OrderlyMarketFundingPoint[]> {
+  async marketFundingHistory(symbol: string, startTime: number, endTime: number, signal?: AbortSignal): Promise<OrderlyMarketFundingPoint[]> {
     if (!Number.isInteger(startTime) || !Number.isInteger(endTime) || endTime < startTime) {
       throw new RangeError(`marketFundingHistory needs ms timestamps with start <= end, got ${startTime}, ${endTime}`);
     }
-    const info = await this.#get<OrderlyInfoRow>(`/v1/public/info/${encodeURIComponent(symbol)}`, 'public/info');
+    const info = await this.#get<OrderlyInfoRow>(`/v1/public/info/${encodeURIComponent(symbol)}`, 'public/info', signal);
     const rows: OrderlyRateHistoryRow[] = [];
     for (let page = 1; ; page++) {
       if (page > RATE_HISTORY_MAX_PAGES) throw new Error(`orderly funding_rate_history: still more rows after ${RATE_HISTORY_MAX_PAGES} pages`);
       const q = new URLSearchParams({
         symbol, start_t: String(startTime), end_t: String(endTime), page: String(page), size: String(RATE_HISTORY_PAGE_ROWS),
       });
-      const res = await this.#get<{ rows: OrderlyRateHistoryRow[]; meta?: OrderlyPageMeta }>(`/v1/public/funding_rate_history?${q}`, 'funding_rate_history');
+      const res = await this.#get<{ rows: OrderlyRateHistoryRow[]; meta?: OrderlyPageMeta }>(`/v1/public/funding_rate_history?${q}`, 'funding_rate_history', signal);
       rows.push(...res.rows);
       if (!morePages(res.rows.length, RATE_HISTORY_PAGE_ROWS, rows.length, res.meta)) break;
     }
@@ -395,8 +395,9 @@ export class OrderlyReader implements VenueReader, FundingHistorySource, MarketH
     return value;
   }
 
-  async #get<T>(path: string, what: string): Promise<T> {
-    const res = await this.#fetch(`${this.apiUrl}${path}`, { method: 'GET', signal: AbortSignal.timeout(this.#timeoutMs) });
+  async #get<T>(path: string, what: string, signal?: AbortSignal): Promise<T> {
+    const timeout = AbortSignal.timeout(this.#timeoutMs);
+    const res = await this.#fetch(`${this.apiUrl}${path}`, { method: 'GET', signal: signal === undefined ? timeout : AbortSignal.any([timeout, signal]) });
     return readOrderlyData<T>(res, what);
   }
 }

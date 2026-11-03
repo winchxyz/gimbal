@@ -91,7 +91,7 @@ test('the gate: a 14-day spread that a weaker 7 days undercut fails; the spread 
   const alone = estimate(12, null, false, 0, 3);
   assert.equal(alone.basis, '7d');
   assert.equal(alone.ok, true);
-  assert.match(carryChecks(alone)[0]!.text, /the 7-day spread of 12\.00 % APR \(the 14-day mean could not be had\) pays/);
+  assert.match(carryChecks(alone)[0]!.text, /the 7-day spread of 12\.00 % APR \(no 14-day mean: it could not be had\) pays/);
   assert.equal(carryChecks(alone).length, 1, 'this hour pays in this direction too: no note');
 });
 
