@@ -1172,11 +1172,12 @@ both. Serve never opens or grows a pair. It trades only with `GIMBAL_TRADE=1`, f
 the other holds it; a lock file with no pid in it counts as held). The lock is
 `locks/trader-<mode>-<contract>-<desk>.lock` in the per-user state directory (`%LOCALAPPDATA%/gimbal/state/locks/` or
 `$XDG_STATE_HOME/gimbal/locks/`, not `GIMBAL_STATE_DIR`). It names its process by pid, start time, a random id and
-the host's boot id, and its holder touches it every 30 s (the file's mtime is the heartbeat). A lock whose pid is not
-running or of an earlier boot is stale at once; one of this very pid (node is pid 1 in every container, so a killed
-container leaves "pid 1" behind, and an overlapping container is pid 1 too) only once its heartbeat is over 90 s old.
-A stale lock is taken over under a second exclusive file, `<lock>.takeover`, so that of two starters that read the
-same stale lock only one takes it; the takeover is journaled. A lock held by a live other process does not stop serve: the pair starts alert only with its legs unknown
+the host's boot id, and its holder touches it every 30 s (the file's mtime is the heartbeat). A lock of a pid that
+runs here is held. Any other lock is stale only once its heartbeat is over 90 s old: one of another boot id, of a pid
+not running here, or of this very pid (node is pid 1 in every container, so a killed container leaves "pid 1"
+behind), since a container may have a boot id and a pid namespace of its own and an overlapping one must wait. A stale
+lock is taken over under a second exclusive file, `<lock>.takeover` (it holds its maker's token, and only its maker
+removes it), so that of two starters that read the same stale lock only one takes it; the takeover is journaled. A lock held by a live other process does not stop serve: the pair starts alert only with its legs unknown
 and the lock is tried again with the start's backoff (the same as a start read that failed). When the acquire error says the lock
 "holds no pid" (empty or partly written: a crash while it was being made), first check that no serve and no
 `pair-mainnet` runs for this desk (Task Manager or `ps`), then delete that one file and start again. Otherwise every
