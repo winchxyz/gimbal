@@ -180,7 +180,16 @@ const VECTORS = {
   deployInit: '1200000067696d62616c2d63616e6172792e6e65617200070707070707070707070707070707070707070707070707070707070707070701000000000000001200000067696d62616c2d63616e6172792e6e656172010101010101010101010101010101010101010101010101010101010101010102000000010e0000000061736d2d66616b652d636f646502030000006e6577150000007b226e6574776f726b223a224d61696e6e6574227d00407a10f35a000000000000000000000000000000000000',
   // near-api-js 7.3.1: createTransaction('gimbal-canary.near', <7 x 32>, 'gimbal-canary.near', 5n, [actions.deleteAccount('funder.near')], <1 x 32>).
   deleteAccount: '1200000067696d62616c2d63616e6172792e6e65617200070707070707070707070707070707070707070707070707070707070707070705000000000000001200000067696d62616c2d63616e6172792e6e656172010101010101010101010101010101010101010101010101010101010101010101000000070b00000066756e6465722e6e656172',
+  // near-api-js 7.3.1: createTransaction('gimbal-canary.near', <7 x 32>, 'gimbal-canary.near', 5n, [actions.deleteKey(<9 x 32>)], <1 x 32>).
+  deleteKey: '1200000067696d62616c2d63616e6172792e6e65617200070707070707070707070707070707070707070707070707070707070707070705000000000000001200000067696d62616c2d63616e6172792e6e65617201010101010101010101010101010101010101010101010101010101010101010100000006000909090909090909090909090909090909090909090909090909090909090909',
 };
+
+test('DeleteKey: borsh as near-api-js 7.3.1 (action 6, ed25519 tag 0, the 32 key bytes); ed25519 keys only', () => {
+  const bytes = encodeTransaction({ signerId: 'gimbal-canary.near', publicKey: SIGNER, nonce: 5n, receiverId: 'gimbal-canary.near', blockHash: BLOCK, actions: [act.deleteKey(OP_KEY)] });
+  assert.equal(bytes.toString('hex'), VECTORS.deleteKey);
+  assert.deepEqual(act.deleteKey(OP_KEY), { type: 'DeleteKey', publicKey: OP_KEY });
+  assert.throws(() => act.deleteKey(`secp256k1:${b58encode(Buffer.alloc(64, 1))}`), /not an ed25519 public key/);
+});
 
 test('DeleteAccount: borsh as near-api-js, its fee in the gas cap, the beneficiary printed; mainnet beneficiaries only', () => {
   const bytes = encodeTransaction({ signerId: 'gimbal-canary.near', publicKey: SIGNER, nonce: 5n, receiverId: 'gimbal-canary.near', blockHash: BLOCK, actions: [act.deleteAccount('funder.near')] });

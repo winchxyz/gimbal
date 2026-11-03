@@ -24,17 +24,22 @@
 // The lock, its own run after the human checked the deployed contract (the final deploy; a canary stays unlocked so
 // it can be retired):
 //
-//   node tools/mainnet/deploy.mjs <contract>.near --lock [--treasury-near <account>] [--hl-builder <0x...>] [--send]
+//   node tools/mainnet/deploy.mjs <contract>.near --lock --treasury-near <account> --hl-builder <0x...> [--send]
+//        [--non-reproducible]
 //
 // tx 3, signed by the contract account's own key: DeleteKey of that key, the account's only key. Before it, on
-// chain: code_hash = base58(sha256(the built wasm)), config() = new()'s args (the treasury and the builder only
-// when given), and view_access_key_list = exactly the full-access key in .keys/<contract>.json (any other key is
-// printed and refused). After it: view_access_key_list is empty, and a block with the tx hash, its nearblocks link
-// and the code hash goes into the README. Then nobody, us included, can deploy code to the account, sign for it,
-// retire it or move its NEAR. The dry run prints all of it and signs nothing; --lock alone works on an account
-// deployed earlier, so it is also the resume. Mainnet only: a testnet chain is refused unless --allow-testnet-lock
-// (these scripts refuse testnet ids and RPCs anyway; testnet deploys stay upgradeable).
+// chain: code_hash = base58(sha256(the built wasm)), config() = new()'s args, version() = contract/Cargo.toml's
+// version, the treasury exists and is registered on USDC, and view_access_key_list = exactly the full-access key
+// in .keys/<contract>.json (any other key is printed and refused). The checkout must be clean and its commit
+// pushed, and the wasm built by `cargo near build reproducible-wasm` (its NEP-330 build_info names the image and
+// the commit); --non-reproducible accepts another build and the evidence says so. After it: view_access_key_list
+// is empty, and a block with the tx hash, its nearblocks link, the code hash, the sha256, the commit and the build
+// goes into the README. Then nobody, us included, can deploy code to the account, sign for it, retire it or move
+// its NEAR. The dry run prints all of it and signs nothing (it may leave out --treasury-near and --hl-builder);
+// --lock alone works on an account deployed earlier, so it is also the resume. Mainnet only, like every script
+// here: testnet contracts stay upgradeable.
 
+import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { b58encode, sha256 } from '../testnet/near.mjs';
@@ -52,6 +57,9 @@ export const NEAR_USDC = '17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad20
 export const WASM = join(ROOT, 'contract', 'target', 'near', 'gimbal.wasm');
 const WASM_SHOWN = 'contract/target/near/gimbal.wasm';
 const BUILD = 'cd contract && cargo near build non-reproducible-wasm --no-abi';
+/** The final deploy's build: Docker, a clean tree, the commit pushed, and the Cargo.toml section it reads. */
+const REPRO_BUILD = 'cd contract && cargo near build reproducible-wasm';
+export const CARGO_TOML = join(ROOT, 'contract', 'Cargo.toml');
 /** Over the code's storage: the account, its key and the state `new` writes, and tx 2's gas. */
 export const STORAGE_MARGIN = YOCTO_PER_NEAR / 2n;
 /** Over the initial balance: tx 1's gas and the funder's own storage. */
@@ -119,13 +127,16 @@ export function wasmExports(code) {
 
 const USAGE = `usage: node tools/mainnet/deploy.mjs <contract>.near --funder <account> --key-file <funder key json>
          --treasury-near <account> --hl-builder <0x...> [--balance <NEAR>] [--send] [--resume]
-       node tools/mainnet/deploy.mjs <contract>.near --lock [--treasury-near <account>] [--hl-builder <0x...>] [--send]
-  default: dry run (reads mainnet, prints the transactions; --key-file optional)
-  --lock: deletes the deployed contract account's only full-access key (no upgrade, no undo); its own run`;
+       node tools/mainnet/deploy.mjs <contract>.near --lock --treasury-near <account> --hl-builder <0x...> [--send]
+         [--non-reproducible]
+  default: dry run (reads mainnet, prints the transactions; --key-file optional; the lock's dry run may leave out
+  --treasury-near and --hl-builder)
+  --lock: deletes the deployed contract account's only full-access key (no upgrade, no undo); its own run, mainnet
+  only; --non-reproducible accepts a wasm not built by cargo near build reproducible-wasm`;
 
 const SPEC = {
   '--funder': 'value', '--key-file': 'value', '--treasury-near': 'value', '--hl-builder': 'value', '--balance': 'value',
-  '--send': 'switch', '--resume': 'switch', '--lock': 'switch', '--allow-testnet-lock': 'switch',
+  '--send': 'switch', '--resume': 'switch', '--lock': 'switch', '--non-reproducible': 'switch',
 };
 /** Deploy-only flags: --lock is its own run on an account deployed earlier. */
 const DEPLOY_ONLY = ['--funder', '--key-file', '--balance', '--resume'];
@@ -140,20 +151,21 @@ const asUsage = (fn) => {
 
 /**
  * The command line, checked: ids are mainnet ids, the builder is 0x + 40 hex (lowercased), --send has a key.
- * --lock takes no deploy flag; its --treasury-near and --hl-builder are optional (config() is checked against them
- * when given), and a .testnet contract is refused by name unless --allow-testnet-lock.
+ * --lock takes no deploy flag; its dry run may leave out --treasury-near and --hl-builder (config() is checked
+ * against them when given), --lock --send needs both; a .testnet contract is refused by name.
  */
 export function parseDeployArgs(argv) {
   const { positional, values } = parseFlags(argv, SPEC);
   if (positional.length === 0) throw new UsageError('the contract account is missing');
   if (positional.length > 1) throw new UsageError(`unexpected argument ${positional[1]}`);
   const lock = values['--lock'] === true;
-  const allowTestnetLock = values['--allow-testnet-lock'] === true;
-  if (allowTestnetLock && !lock) throw new UsageError('--allow-testnet-lock goes with --lock only');
+  const nonReproducible = values['--non-reproducible'] === true;
+  if (nonReproducible && !lock) throw new UsageError('--non-reproducible goes with --lock only');
   if (lock) {
     for (const f of DEPLOY_ONLY) if (values[f] !== undefined) throw new UsageError(`--lock is its own run on an account deployed earlier: drop ${f} (it is for the deploy)`);
-    if (/\.testnet$/.test(positional[0]) && !allowTestnetLock) {
-      throw new UsageError(`--lock refuses testnet (${positional[0]}): a testnet contract may want an upgrade; --allow-testnet-lock overrides that, but these scripts run on mainnet only`);
+    if (/\.testnet$/.test(positional[0])) throw new UsageError(`--lock refuses testnet (${positional[0]}): testnet contracts stay upgradeable, and these scripts run on mainnet only`);
+    if (values['--send'] === true) {
+      for (const f of ['--treasury-near', '--hl-builder']) if (values[f] === undefined) throw new UsageError(`--lock --send needs ${f}: config() is checked against it before the lock`);
     }
   } else {
     for (const f of ['--funder', '--treasury-near', '--hl-builder']) if (values[f] === undefined) throw new UsageError(`${f} is required`);
@@ -169,7 +181,7 @@ export function parseDeployArgs(argv) {
   const send = values['--send'] === true;
   const resume = values['--resume'] === true;
   if (send && !lock && !resume && values['--key-file'] === undefined) throw new UsageError('--send needs --key-file: the funder signs tx 1');
-  return { contract, funder, keyFile: values['--key-file'] ?? null, treasuryNear, hlBuilder, balance, send, resume, lock, allowTestnetLock };
+  return { contract, funder, keyFile: values['--key-file'] ?? null, treasuryNear, hlBuilder, balance, send, resume, lock, nonReproducible };
 }
 
 /** The deploy dry run's line on the treasury's USDC registration (storage_balance_of; null: not registered). */
@@ -249,13 +261,136 @@ export function canonical(v) {
 
 // --- the lock (tx 3) ---
 
-/** Why --lock refuses the chain the RPC serves, or null: mainnet only, testnet only with --allow-testnet-lock. */
-export function lockNetworkProblem(chainId, allowTestnetLock = false) {
+/** Why --lock refuses the chain the RPC serves, or null: mainnet only (testnet contracts stay upgradeable). */
+export function lockNetworkProblem(chainId) {
   if (chainId === 'mainnet') return null;
-  if (chainId === 'testnet') {
-    return allowTestnetLock ? null : 'the RPC serves testnet: --lock refuses testnet (a testnet contract may want an upgrade); --allow-testnet-lock overrides';
-  }
+  if (chainId === 'testnet') return 'the RPC serves testnet: --lock never runs there (testnet contracts stay upgradeable)';
   return `the RPC serves chain ${JSON.stringify(chainId)}: --lock runs on mainnet only`;
+}
+
+/** The JSON value that starts at byte `start` of `buf` (an object or array), as text; null when it does not close. */
+function jsonTextAt(buf, start) {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let j = start; j < buf.length; j++) {
+    const c = buf[j];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === 0x5c) escaped = true;
+      else if (c === 0x22) inString = false;
+    } else if (c === 0x22) {
+      inString = true;
+    } else if (c === 0x7b || c === 0x5b) {
+      depth++;
+    } else if (c === 0x7d || c === 0x5d) {
+      if (--depth === 0) return buf.subarray(start, j + 1).toString('utf8');
+    } else if (c < 0x20 && c !== 0x0a && c !== 0x0d && c !== 0x09) {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * The NEP-330 metadata near-sdk compiles into the wasm as a JSON literal (what `contract_source_metadata()`
+ * returns): {version, link, standards, build_info}. null when the wasm has none.
+ */
+export function wasmSourceMetadata(code) {
+  const buf = Buffer.from(code);
+  const marker = Buffer.from('"standard":"nep330"');
+  for (let i = buf.indexOf(marker); i >= 0; i = buf.indexOf(marker, i + 1)) {
+    const start = buf.lastIndexOf(Buffer.from('{"version":'), i);
+    if (start < 0) continue;
+    const text = jsonTextAt(buf, start);
+    try {
+      const v = text === null ? null : JSON.parse(text);
+      if (v !== null && typeof v === 'object' && Array.isArray(v.standards)) return v;
+    } catch {
+      // not this literal; look further
+    }
+  }
+  return null;
+}
+
+/**
+ * How the wasm was built, from its NEP-330 metadata: cargo near build reproducible-wasm fills build_info (the
+ * Docker image, the command, the source snapshot `git+<repo>?rev=<commit>`); any other build leaves it null.
+ */
+export function buildProvenance(meta) {
+  const b = meta?.build_info;
+  if (b === null || b === undefined || typeof b !== 'object') return { reproducible: false, version: meta?.version ?? null };
+  const snapshot = typeof b.source_code_snapshot === 'string' ? b.source_code_snapshot : null;
+  return {
+    reproducible: true,
+    version: meta.version ?? null,
+    rev: /[?&]rev=([0-9a-f]{40})(?![0-9a-f])/.exec(snapshot ?? '')?.[1] ?? null,
+    snapshot,
+    environment: typeof b.build_environment === 'string' ? b.build_environment : null,
+    command: Array.isArray(b.build_command) ? b.build_command.join(' ') : null,
+  };
+}
+
+/** contract/Cargo.toml's [package] version and whether it has the section reproducible-wasm reads. */
+export function cargoPackageInfo(text) {
+  let section = null;
+  let version = null;
+  let reproducible = false;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    const header = /^\[([^\]]+)\]\s*(#.*)?$/.exec(line);
+    if (header) {
+      section = header[1].trim();
+      if (section === 'package.metadata.near.reproducible_build') reproducible = true;
+    } else if (section === 'package') {
+      const m = /^version\s*=\s*"([^"]+)"/.exec(line);
+      if (m) version = m[1];
+    }
+  }
+  return { version, reproducible };
+}
+
+/**
+ * Why `cargo near build reproducible-wasm` cannot run here now ([] when it can): it reads
+ * [package.metadata.near.reproducible_build] from contract/Cargo.toml and builds inside Docker.
+ */
+export function reproducibleBuildProblems({ cargo, docker }) {
+  const out = [];
+  if (!cargo.reproducible) {
+    out.push('contract/Cargo.toml has no [package.metadata.near.reproducible_build] section (the image, its digest and the build command '
+      + 'cargo near reads): it comes in through a contract PR');
+  }
+  if (!docker.ok) out.push(`Docker's engine is not running (docker version: ${docker.detail}): start Docker Desktop, then build again`);
+  return out;
+}
+
+/** The checkout's state for the evidence: { head, clean, changed (lines), pushed }. */
+function gitState() {
+  const git = (...args) => execFileSync('git', ['-C', ROOT, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trimEnd();
+  const head = git('rev-parse', 'HEAD').trim();
+  // Not trimmed at the start: porcelain lines begin with a status column that may be a space.
+  const changed = git('status', '--porcelain').split(/\r?\n/).filter((l) => l.trim() !== '');
+  const pushed = git('branch', '-r', '--contains', 'HEAD') !== '';
+  return { head, clean: changed.length === 0, changed, pushed };
+}
+
+/** Docker's engine: { ok, version } or { ok: false, detail } (the first line of the error). */
+function dockerEngine() {
+  try {
+    return { ok: true, version: execFileSync('docker', ['version', '--format', '{{.Server.Version}}'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 20_000 }).trim() };
+  } catch (e) {
+    const detail = String(e.stderr || e.message || e).split(/\r?\n/).find((l) => l.trim() !== '') ?? 'no answer';
+    return { ok: false, detail: detail.trim() };
+  }
+}
+
+/** The installed cargo-near version (`cargo near --version`), or null. */
+function cargoNearVersion() {
+  try {
+    return execFileSync('cargo', ['near', '--version'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30_000 }).trim().replace(/^cargo-near(-near)?\s*/, '');
+  } catch {
+    return null;
+  }
 }
 
 /** Every leaf where `actual` differs from `expected`, as `path: expected X, on chain Y`. [] when equal. */
@@ -321,16 +456,34 @@ export function lockTxLines({ label, contract, publicKey, keyFile }) {
   ];
 }
 
-/** The block to paste back after the lock, with the README's evidence line. */
-export function lockEvidence({ at, contract, hash, codeHash, wasmSha256, wasmBytes }) {
+/**
+ * The block to paste back after the lock, with the README's evidence line. `hash` null: the account had no keys
+ * when this run read it (a rerun after a lock whose outcome this script did not see), so the hash comes from
+ * nearblocks. `build` is buildProvenance(); `cargoNear` the installed version, said for a non-reproducible build.
+ */
+export function lockEvidence({ at, contract, hash, codeHash, wasmSha256, wasmBytes, version, commit, build, cargoNear = null }) {
+  const tx = hash === null ? `<the DeleteKey's hash from ${accountLink(contract)}>` : `${hash} (${txLink(hash)})`;
+  const buildLine = build.reproducible
+    ? `reproducible: ${build.command ?? 'cargo near build reproducible-wasm'}, image ${build.environment}, source ${build.snapshot}`
+    : `non-reproducible (build_info null), cargo-near ${cargoNear ?? 'version unknown'} installed here: nobody can rebuild these bytes; the sha256 identifies the exact file`;
+  const readme = build.reproducible
+    ? `Contract has no access keys: DeleteKey tx ${tx}, code_hash ${codeHash} (sha256 ${wasmSha256}), a reproducible build (${build.environment}) of ${build.snapshot}.`
+    : `Contract has no access keys: DeleteKey tx ${tx}, code_hash ${codeHash}. Built from commit ${commit} with cargo-near ${cargoNear ?? '<version>'}, `
+      + `non-reproducible: the sha256 ${wasmSha256} identifies the exact file.`;
   return [
     `=== gimbal lock ${at} ===`,
     `contract:  ${contract} ${accountLink(contract)}`,
-    `DeleteKey: tx ${hash} ${txLink(hash)}`,
-    `code_hash: ${codeHash} (base58 of sha256 ${wasmSha256}, ${WASM_SHOWN}, ${wasmBytes.toLocaleString('en-US')} bytes)`,
+    hash === null
+      ? `DeleteKey: not seen by this run (the account had no keys when it was read): take its hash from ${accountLink(contract)}`
+      : `DeleteKey: tx ${hash} ${txLink(hash)}`,
+    `code_hash: ${codeHash}`,
+    `sha256:    ${wasmSha256} (${WASM_SHOWN}, ${wasmBytes.toLocaleString('en-US')} bytes)`,
+    `version:   ${version} (contract/Cargo.toml, version() on chain)`,
+    `checkout:  commit ${commit}, clean, on the remote`,
+    `build:     ${buildLine}`,
     'keys:      view_access_key_list is empty',
     'README:',
-    `Contract has no access keys: DeleteKey tx ${hash} (${txLink(hash)}), code_hash ${codeHash}.`,
+    readme,
     '=== end ===',
   ];
 }
@@ -373,6 +526,10 @@ async function deploy(a, { client, say, readWasm, envOf, readKey, keyExists, fet
     say(`warning   this code cannot ${missing.length === MONEY_METHODS.length ? 'take money in or out' : `run ${missing.join(', ')}`}: send no funds to the desk's addresses `
       + 'while it is deployed (tools/mainnet/README.md, "What this contract version can do")');
   }
+  const build = buildProvenance(wasmSourceMetadata(wasm));
+  say(`build     ${build.reproducible ? `reproducible: image ${build.environment}, source ${build.snapshot}`
+    : 'non-reproducible (build_info null): fine for a canary; the final deploy, which gets locked, is built with '
+      + `\`${REPRO_BUILD}\` (tools/mainnet/README.md, section 8, "Final deploy")`}`);
   const { min, balance } = initialBalance(wasm.length, a.balance);
   say(`balance   ${nearText(balance)} NEAR initial${a.balance === null ? ' (the default)' : ''}; at least ${nearText(min)}: ${wasm.length.toLocaleString('en-US')} bytes x 1e19 yoctoNEAR + 0.5 NEAR`);
 
@@ -525,18 +682,50 @@ async function deploy(a, { client, say, readWasm, envOf, readKey, keyExists, fet
   say('          (a dry run), then the same with --send. A canary stays unlocked, so it can be retired.');
 }
 
-async function lock(a, { client, say, readWasm, envOf, readKey, keyExists, at }) {
+async function lock(a, { client, say, readWasm, envOf, readKey, keyExists, at, git, docker, cargoNear, readCargoToml }) {
   say(`gimbal mainnet lock of ${a.contract}: ${a.send ? 'SEND' : 'dry run'} (DeleteKey of its last full-access key: no upgrade, no undo)`);
   const status = await client.rpc('status', []);
   say(`chain     ${status.chain_id}, block ${status.sync_info.latest_block_height}`);
-  const network = lockNetworkProblem(status.chain_id, a.allowTestnetLock);
+  const network = lockNetworkProblem(status.chain_id);
   if (network !== null) throw new Error(network);
 
   const wasm = readWasm();
-  if (wasm === null) throw new Error(`${WASM_SHOWN} is missing: build the code that was deployed (${BUILD}), its hash is compared with the account's`);
+  if (wasm === null) throw new Error(`${WASM_SHOWN} is missing: build the code that was deployed (${REPRO_BUILD}), its hash is compared with the account's`);
   const hash = sha256(wasm);
   const codeHash = b58encode(hash);
   say(`wasm      ${WASM_SHOWN}: ${wasm.length.toLocaleString('en-US')} bytes, sha256 ${hash.toString('hex')} (code_hash ${codeHash})`);
+
+  const problems = [];
+  // Where the code comes from, for the evidence: the checkout (clean, pushed), the crate version, the build.
+  const repo = git();
+  say(`checkout  commit ${repo.head}, ${repo.clean ? 'clean' : `${repo.changed.length} uncommitted change${repo.changed.length === 1 ? '' : 's'}`}, `
+    + `${repo.pushed ? 'on the remote' : 'NOT on the remote'}`);
+  for (const l of repo.changed.slice(0, 10)) say(`          ${l}`);
+  if (!repo.clean) problems.push(`the checkout has uncommitted changes: commit or stash them (the evidence names commit ${repo.head})`);
+  if (!repo.pushed) problems.push(`commit ${repo.head} is on no remote branch: push it, so the evidence points at code others can read`);
+  const cargo = cargoPackageInfo(readCargoToml());
+  const meta = wasmSourceMetadata(wasm);
+  const build = buildProvenance(meta);
+  say(`version   contract/Cargo.toml ${JSON.stringify(cargo.version)}; the wasm's NEP-330 metadata ${JSON.stringify(build.version)}`);
+  if (cargo.version === null) problems.push('contract/Cargo.toml has no [package] version');
+  else if (build.version !== null && build.version !== cargo.version) problems.push(`the wasm says version ${build.version}, contract/Cargo.toml ${cargo.version}: build this checkout`);
+  let cargoNearInstalled = null;
+  if (build.reproducible) {
+    say(`build     reproducible: ${build.command ?? '(no command)'}, image ${build.environment}, source ${build.snapshot}`);
+    if (build.rev === null) problems.push(`the wasm's build_info has no commit in source_code_snapshot (${JSON.stringify(build.snapshot)})`);
+    else if (build.rev !== repo.head) say(`warning   the wasm was built from commit ${build.rev}, this checkout is at ${repo.head}: the evidence names the wasm's commit`);
+  } else {
+    cargoNearInstalled = cargoNear();
+    say(`build     non-reproducible (build_info null in the wasm's NEP-330 metadata); cargo-near ${cargoNearInstalled ?? 'not found'} installed here`);
+    if (a.nonReproducible) {
+      say('warning   --non-reproducible: nobody can rebuild these bytes; the evidence says so, and the sha256 identifies the exact file');
+    } else {
+      const blockers = reproducibleBuildProblems({ cargo, docker: docker() });
+      problems.push(`the wasm was not built with \`${REPRO_BUILD}\` (the final deploy's build: a clean, pushed commit, then deploy a fresh account and lock it). `
+        + `${blockers.length > 0 ? `It cannot run here now: ${blockers.join('; ')}.` : 'Docker and contract/Cargo.toml are ready for it.'} `
+        + '--non-reproducible locks this build anyway, and the evidence then says non-reproducible');
+    }
+  }
 
   // What new() was given, from the same sources the deploy used: the broker and the referral codes (.env or the
   // shell), and the treasury and the builder from the command line when given.
@@ -546,7 +735,6 @@ async function lock(a, { client, say, readWasm, envOf, readKey, keyExists, at })
   if (brokerEnv !== null && brokerIdProblem(brokerEnv) !== null) throw new Error(brokerIdProblem(brokerEnv));
   const codes = referralCodes(env);
 
-  const problems = [];
   const keyFile = join(KEYS, `${a.contract}.json`);
   const ownKey = keyExists(keyFile) ? readKey(keyFile, a.contract).publicKeyString : null;
   say(`key file  ${keyFile}: ${ownKey === null ? 'missing (run from the main checkout, where deploy --send wrote it)' : ownKey}`);
@@ -564,7 +752,18 @@ async function lock(a, { client, say, readWasm, envOf, readKey, keyExists, at })
       else problems.push(`code_hash ${state.code_hash} on chain is not ${codeHash}, the base58 sha256 of ${WASM_SHOWN}: build exactly the code that was deployed, or stop`);
       const config = await client.view(a.contract, 'config');
       say(`config()  ${JSON.stringify(config)}`);
-      say(`version() ${JSON.stringify(await client.view(a.contract, 'version'))}`);
+      const version = await client.view(a.contract, 'version');
+      say(`version() ${JSON.stringify(version)}`);
+      if (version !== cargo.version) problems.push(`version() is ${JSON.stringify(version)}, contract/Cargo.toml says ${JSON.stringify(cargo.version)}`);
+      // As the deploy checks it: the fee of every payout goes there for good.
+      const treasury = a.treasuryNear ?? config?.treasury?.near;
+      if (typeof treasury !== 'string' || (await client.account(treasury)) === null) {
+        problems.push(`the treasury ${JSON.stringify(treasury)} does not exist on mainnet: the performance fee would have nowhere to go`);
+      } else {
+        const onUsdc = await client.view(NEAR_USDC, 'storage_balance_of', { account_id: treasury });
+        say(`treasury  ${treasuryUsdcLine(treasury, onUsdc)}`);
+        if (onUsdc === null || onUsdc === undefined) problems.push(`the treasury ${treasury} is not registered on USDC on NEAR: register it first (the treasury line above)`);
+      }
       const diff = lockConfigProblems(config, { treasuryNear: a.treasuryNear, hlBuilder: a.hlBuilder, codes, brokerId: MAINNET_ORDERLY_BROKER });
       if (diff.length > 0) problems.push(`config() is not what new() was given on mainnet:\n    ${diff.join('\n    ')}`);
       else say('config   matches: Mainnet, v1.signer, OutLayer price-oracle.near, fees 1000 bps / 10 tenth-bps, Orderly gimbal_dex on 42161, the referral codes above');
@@ -578,9 +777,15 @@ async function lock(a, { client, say, readWasm, envOf, readKey, keyExists, at })
     say(`keys      ${keys.length} access key${keys.length === 1 ? '' : 's'} on chain${keys.length === 0 ? '' : ':'}`);
     for (const k of keys) say(`          ${accessKeyLine(k)}${k.public_key === ownKey ? ' (the key file)' : ''}`);
     if (keys.length === 0) {
-      say(`\nnothing to send: ${a.contract} has no access keys, it is locked already (code_hash ${state.code_hash}). Its DeleteKey is on ${accountLink(a.contract)}.`);
-      if (problems.length > 0) throw new Error(`but:\n  ${problems.join('\n  ')}`);
-      return null;
+      // A rerun after a lock whose outcome this script did not see (a timeout): the evidence, without the hash.
+      say(`\nnothing to send: ${a.contract} has no access keys, it is locked already (code_hash ${state.code_hash}).`);
+      if (problems.length > 0) throw new Error(`no evidence block, because:\n  ${problems.join('\n  ')}`);
+      const block = lockEvidence({ at: at(), contract: a.contract, hash: null, codeHash, wasmSha256: hash.toString('hex'), wasmBytes: wasm.length, version: cargo.version,
+        commit: build.reproducible ? build.rev : repo.head, build, cargoNear: cargoNearInstalled });
+      say();
+      say(block.join('\n'));
+      say(`\nhash      take the DeleteKey's transaction hash from ${accountLink(a.contract)} and put it in the README line above`);
+      return block;
     }
     problems.push(...lockKeyProblems(keys, ownKey));
   }
@@ -608,7 +813,8 @@ async function lock(a, { client, say, readWasm, envOf, readKey, keyExists, at })
   const after = await client.account(a.contract);
   if (after?.code_hash !== codeHash) throw new Error(`${a.contract}'s code_hash is ${after?.code_hash} after the lock, not ${codeHash}: look at ${accountLink(a.contract)}`);
   say(`keys      view_access_key_list of ${a.contract} is empty; code_hash ${after.code_hash}`);
-  const block = lockEvidence({ at: at(), contract: a.contract, hash: out.hash, codeHash, wasmSha256: hash.toString('hex'), wasmBytes: wasm.length });
+  const block = lockEvidence({ at: at(), contract: a.contract, hash: out.hash, codeHash, wasmSha256: hash.toString('hex'), wasmBytes: wasm.length, version: cargo.version,
+    commit: build.reproducible ? build.rev : repo.head, build, cargoNear: cargoNearInstalled });
   say();
   say(block.join('\n'));
   say(`\nkey file  ${keyFile} is now useless: its key is on no account any more and can sign nothing. You can delete it.`);
@@ -618,7 +824,8 @@ async function lock(a, { client, say, readWasm, envOf, readKey, keyExists, at })
 /**
  * The script: --lock runs the lock, anything else the deploy. `deps` replaces the mainnet client (`client`), the
  * printer (`say`), the wasm (`readWasm`, null when missing), the env reader (`envOf`), key files (`readKey`,
- * `keyExists`), fetch and the clock (`at`), for tests.
+ * `keyExists`), fetch, the clock (`at`), and the lock's local reads: `git` (gitState), `docker` (dockerEngine),
+ * `cargoNear` (the installed version) and `readCargoToml`, for tests.
  */
 export async function runDeploy(argv, deps = {}) {
   const a = parseDeployArgs(argv);
@@ -631,6 +838,10 @@ export async function runDeploy(argv, deps = {}) {
     keyExists: deps.keyExists ?? existsSync,
     fetchImpl: deps.fetch ?? ((...x) => globalThis.fetch(...x)),
     at: deps.at ?? (() => new Date().toISOString()),
+    git: deps.git ?? gitState,
+    docker: deps.docker ?? dockerEngine,
+    cargoNear: deps.cargoNear ?? cargoNearVersion,
+    readCargoToml: deps.readCargoToml ?? (() => readFileSync(CARGO_TOML, 'utf8')),
   };
   return a.lock ? lock(a, ctx) : deploy(a, ctx);
 }

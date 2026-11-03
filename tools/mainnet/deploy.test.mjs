@@ -5,11 +5,11 @@ import { fileURLToPath } from 'node:url';
 import { b58encode, sha256 } from '../testnet/near.mjs';
 import { UsageError } from './cli.mjs';
 import {
-  MONEY_METHODS, NEAR_USDC, accessKeyLine, canonical, checkFunder, configDiff, deployPlanFor, initArgs, initialBalance, lockConfigProblems,
-  lockEvidence, lockKeyProblems, lockNetworkProblem, minInitialBalance, nextFreeName, parseDeployArgs, referralCodes, runDeploy,
-  treasuryUsdcLine, wasmExports,
+  MONEY_METHODS, NEAR_USDC, accessKeyLine, buildProvenance, canonical, cargoPackageInfo, checkFunder, configDiff, deployPlanFor, initArgs, initialBalance, lockConfigProblems,
+  lockEvidence, lockKeyProblems, lockNetworkProblem, minInitialBalance, nextFreeName, parseDeployArgs, referralCodes, reproducibleBuildProblems, runDeploy,
+  treasuryUsdcLine, wasmExports, wasmSourceMetadata,
 } from './deploy.mjs';
-import { NO_CODE, act, describeTx, encodeTransaction, feesOf, txGasCap } from './near.mjs';
+import { NO_CODE, act, describeTx, feesOf, txGasCap } from './near.mjs';
 
 const NEAR = 10n ** 24n;
 const OK = ['gimbal-canary.near', '--funder', 'funder.near', '--treasury-near', 'treasury.near', '--hl-builder', '0x00000000000000000000000000000000000000AB'];
@@ -19,7 +19,7 @@ test('deploy arguments: a dry run needs no key file; the builder is lowercased',
   const a = parseDeployArgs(OK);
   assert.deepEqual(a, {
     contract: 'gimbal-canary.near', funder: 'funder.near', keyFile: null, treasuryNear: 'treasury.near',
-    hlBuilder: '0x00000000000000000000000000000000000000ab', balance: null, send: false, resume: false, lock: false, allowTestnetLock: false,
+    hlBuilder: '0x00000000000000000000000000000000000000ab', balance: null, send: false, resume: false, lock: false, nonReproducible: false,
   });
   assert.equal(parseDeployArgs([...OK, '--balance', '7.5']).balance, 75n * 10n ** 23n);
   assert.equal(parseDeployArgs([...OK, '--send', '--key-file', 'k.json']).send, true);
@@ -135,26 +135,53 @@ test('the script itself: a testnet id or a --send without a key ends with the us
   }
 });
 
+
 // --- the lock (tx 3) ---
 
 const CONTRACT = 'gimbal.near';
 const BUILDER = '0x00000000000000000000000000000000000000ab';
 const OWN_KEY = `ed25519:${b58encode(Buffer.alloc(32, 9))}`;
 const OTHER_KEY = `ed25519:${b58encode(Buffer.alloc(32, 5))}`;
-// A wasm module with no sections: enough for the hash and the export reader.
-const WASM_BYTES = Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
-const CODE_HASH = b58encode(sha256(WASM_BYTES));
+const REV = 'a'.repeat(40);
+const IMAGE = 'sourcescan/cargo-near:0.22.0-rust-1.86.0@sha256:' + 'b'.repeat(64);
+const SNAPSHOT = `git+https://github.com/example/gimbal?rev=${REV}`;
+/** A wasm module whose only section is a custom one holding `json` (as near-sdk's NEP-330 literal sits in data). */
+function wasmWith(json) {
+  const leb = (n) => {
+    const out = [];
+    do {
+      let byte = n & 0x7f;
+      n >>>= 7;
+      if (n !== 0) byte |= 0x80;
+      out.push(byte);
+    } while (n !== 0);
+    return out;
+  };
+  const payload = [1, 0x78, ...Buffer.from(`\0\0${json}\0E_ARGS`)];
+  return Buffer.from([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x00, ...leb(payload.length), ...payload]);
+}
+const META = (buildInfo) => JSON.stringify({ version: '0.1.0', link: null, standards: [{ standard: 'nep330', version: '1.3.0' }], build_info: buildInfo });
+const REPRO_WASM = wasmWith(META({
+  build_environment: IMAGE, build_command: ['cargo', 'near', 'build', 'reproducible-wasm'], contract_path: 'contract', source_code_snapshot: SNAPSHOT, output_wasm_path: null,
+}));
+const PLAIN_WASM = wasmWith(META(null));
+const shaOf = (w) => sha256(w).toString('hex');
+const hashOf = (w) => b58encode(sha256(w));
+const CARGO = '[package]\nname = "gimbal"\nversion = "0.1.0"\n\n[package.metadata.near.reproducible_build]\nimage = "sourcescan/cargo-near:0.22.0"\n';
+const CARGO_PLAIN = '[package]\nname = "gimbal"\nversion = "0.1.0"\n\n[dependencies]\nnear-sdk = "~5.29"\n';
 const NO_CODES = { hyperliquid: null, orderly: null, phoenix: null };
 const CONFIG = initArgs({ treasuryNear: 'treasury.near', hlBuilder: BUILDER, codes: NO_CODES, brokerId: 'gimbal_dex' });
 const FEE = { send_sir: 100, send_not_sir: 100, execution: 100 };
 const FEES = { receipt: FEE, deploy: FEE, deployByte: FEE, call: FEE, callByte: FEE, addKey: FEE, addKeyByte: FEE, deleteAccount: FEE, deleteKey: FEE };
 const fullAccess = (public_key) => ({ public_key, access_key: { nonce: 1, permission: 'FullAccess' } });
 const LOCK = [CONTRACT, '--lock', '--treasury-near', 'treasury.near', '--hl-builder', BUILDER];
+const AT = '2026-11-03T12:00:00.000Z';
 
-/** A deployed contract with its one key (`o` changes it); `run(argv)` runs the script against it. */
+/** A deployed contract with its one key, built reproducibly from a clean pushed checkout (`o` changes it). */
 function lockWorld(o = {}) {
-  const st = { keys: o.keys ?? [fullAccess(OWN_KEY)], sent: [], readKeys: 0 };
-  const exists = new Set(['v1.signer', 'price-oracle.near', 'treasury.near', 'funder.near', ...(o.exists ?? [])]);
+  const wasm = o.wasm ?? REPRO_WASM;
+  const st = { keys: o.keys ?? [fullAccess(OWN_KEY)], sent: [], dockerAsked: 0 };
+  const exists = new Set(['v1.signer', 'price-oracle.near', 'funder.near', ...(o.treasuryMissing ? [] : ['treasury.near'])]);
   const client = {
     rpc: async (method) => {
       if (method === 'status') return { chain_id: o.chain ?? 'mainnet', sync_info: { latest_block_height: 1 } };
@@ -162,13 +189,13 @@ function lockWorld(o = {}) {
       throw new Error(`unexpected rpc ${method}`);
     },
     account: async (id) => {
-      if (id === CONTRACT) return o.account === null ? null : { amount: String(7n * NEAR), locked: '0', storage_usage: 700_000, code_hash: o.codeHash ?? CODE_HASH };
+      if (id === CONTRACT) return o.account === null ? null : { amount: String(7n * NEAR), locked: '0', storage_usage: 700_000, code_hash: o.codeHash ?? hashOf(wasm) };
       return exists.has(id) ? { amount: String(8n * NEAR), locked: '0', storage_usage: 500, code_hash: NO_CODE } : null;
     },
     view: async (id, method) => {
       if (id === CONTRACT && method === 'config') return o.config ?? CONFIG;
-      if (id === CONTRACT && method === 'version') return '0.1.0';
-      if (id === NEAR_USDC && method === 'storage_balance_of') return { total: '1250000000000000000000', available: '0' };
+      if (id === CONTRACT && method === 'version') return o.version ?? '0.1.0';
+      if (id === NEAR_USDC && method === 'storage_balance_of') return o.treasuryUnregistered ? null : { total: '1250000000000000000000', available: '0' };
       throw new Error(`unexpected view ${id}.${method}`);
     },
     accessKey: async () => null,
@@ -188,15 +215,19 @@ function lockWorld(o = {}) {
   const deps = {
     client,
     say: (s = '') => out.push(s),
-    readWasm: () => WASM_BYTES,
+    readWasm: () => wasm,
     envOf: (names) => new Map(names.map((n) => [n, n === 'ORDERLY_BROKER_ID' ? { value: 'gimbal_dex', from: '.env' } : { value: null, from: null }])),
-    readKey: (file, accountId) => {
-      st.readKeys++;
-      return { accountId, file, publicKeyString: OWN_KEY, publicKey: Buffer.alloc(32, 9), sign: () => Buffer.alloc(64) };
-    },
+    readKey: (file, accountId) => ({ accountId, file, publicKeyString: OWN_KEY, publicKey: Buffer.alloc(32, 9), sign: () => Buffer.alloc(64) }),
     keyExists: () => o.keyFile !== false,
     fetch: async () => new Response(JSON.stringify({ marginSummary: { accountValue: '150.0' } }), { headers: { 'content-type': 'application/json' } }),
-    at: () => '2026-11-03T12:00:00.000Z',
+    at: () => AT,
+    git: () => ({ head: o.head ?? REV, clean: o.dirty === undefined, changed: o.dirty ?? [], pushed: o.pushed !== false }),
+    docker: () => {
+      st.dockerAsked++;
+      return o.docker ?? { ok: true, version: '29.5.3' };
+    },
+    cargoNear: () => '0.22.0',
+    readCargoToml: () => o.cargo ?? CARGO,
   };
   const run = async (argv) => {
     let error = null;
@@ -211,35 +242,51 @@ function lockWorld(o = {}) {
   return { st, run };
 }
 
-test('lock arguments: its own run, the treasury and builder optional, no deploy flag, testnet only with --allow-testnet-lock', () => {
+test('lock arguments: its own run; the dry run may leave out the treasury and builder, --send needs both; mainnet only', () => {
   assert.deepEqual(parseDeployArgs([CONTRACT, '--lock']), {
-    contract: CONTRACT, funder: null, keyFile: null, treasuryNear: null, hlBuilder: null, balance: null, send: false, resume: false, lock: true, allowTestnetLock: false,
+    contract: CONTRACT, funder: null, keyFile: null, treasuryNear: null, hlBuilder: null, balance: null, send: false, resume: false, lock: true, nonReproducible: false,
   });
-  const a = parseDeployArgs([...LOCK, '--send']);
+  const a = parseDeployArgs([...LOCK, '--send', '--non-reproducible']);
   assert.equal(a.send, true, '--lock --send needs no --key-file: the contract key signs');
-  assert.equal(a.treasuryNear, 'treasury.near');
+  assert.equal(a.nonReproducible, true);
+  usage([CONTRACT, '--lock', '--send'], /--lock --send needs --treasury-near: config\(\) is checked against it/);
+  usage([CONTRACT, '--lock', '--send', '--treasury-near', 'treasury.near'], /--lock --send needs --hl-builder/);
   for (const f of [['--funder', 'funder.near'], ['--key-file', 'k.json'], ['--balance', '7'], ['--resume']]) {
     usage([CONTRACT, '--lock', ...f], new RegExp(`--lock is its own run on an account deployed earlier: drop ${f[0]}`));
   }
-  usage([...OK, '--allow-testnet-lock'], /--allow-testnet-lock goes with --lock only/);
-  usage(['gimbal.testnet', '--lock'], /--lock refuses testnet \(gimbal\.testnet\).*--allow-testnet-lock/);
-  usage(['gimbal.testnet', '--lock', '--allow-testnet-lock'], /not a mainnet account/);
+  usage([...OK, '--non-reproducible'], /--non-reproducible goes with --lock only/);
+  usage([...OK, '--allow-testnet-lock'], /unknown option --allow-testnet-lock/);
+  usage(['gimbal.testnet', '--lock'], /--lock refuses testnet \(gimbal\.testnet\): testnet contracts stay upgradeable/);
   usage([CONTRACT, '--lock', '--hl-builder', '0x12'], /not 0x and 40 hex digits/);
 });
 
-test('the lock refuses a testnet chain unless --allow-testnet-lock, and any chain but mainnet and testnet', async () => {
+test('the lock refuses every chain but mainnet', async () => {
   assert.equal(lockNetworkProblem('mainnet'), null);
-  assert.match(lockNetworkProblem('testnet'), /--lock refuses testnet .*--allow-testnet-lock overrides/);
-  assert.equal(lockNetworkProblem('testnet', true), null);
-  assert.match(lockNetworkProblem('localnet', true), /chain "localnet": --lock runs on mainnet only/);
+  assert.match(lockNetworkProblem('testnet'), /--lock never runs there \(testnet contracts stay upgradeable\)/);
+  assert.match(lockNetworkProblem('localnet'), /chain "localnet": --lock runs on mainnet only/);
   const w = lockWorld({ chain: 'testnet' });
   const r = await w.run([...LOCK, '--send']);
-  assert.match(r.error.message, /--lock refuses testnet/);
+  assert.match(r.error.message, /--lock never runs there/);
   assert.deepEqual(w.st.sent, []);
 });
 
+test('the build: NEP-330 metadata read from the wasm, reproducible only with build_info; Cargo.toml version and section', () => {
+  assert.deepEqual(buildProvenance(wasmSourceMetadata(REPRO_WASM)), {
+    reproducible: true, version: '0.1.0', rev: REV, snapshot: SNAPSHOT, environment: IMAGE, command: 'cargo near build reproducible-wasm',
+  });
+  assert.deepEqual(buildProvenance(wasmSourceMetadata(PLAIN_WASM)), { reproducible: false, version: '0.1.0' });
+  assert.equal(wasmSourceMetadata(Buffer.from([0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0])), null);
+  assert.deepEqual(cargoPackageInfo(CARGO), { version: '0.1.0', reproducible: true });
+  assert.deepEqual(cargoPackageInfo(CARGO_PLAIN), { version: '0.1.0', reproducible: false });
+  const down = { ok: false, detail: 'failed to connect to the docker API' };
+  assert.deepEqual(reproducibleBuildProblems({ cargo: { reproducible: true }, docker: { ok: true } }), []);
+  const both = reproducibleBuildProblems({ cargo: { reproducible: false }, docker: down }).join('\n');
+  assert.match(both, /contract\/Cargo\.toml has no \[package\.metadata\.near\.reproducible_build\] section/);
+  assert.match(both, /Docker's engine is not running \(docker version: failed to connect to the docker API\): start Docker Desktop, then build again/);
+});
+
 test('plan without --lock: the deploy dry run prints tx 1, tx 2 and tx 3 (the DeleteKey) as its own later run, and sends nothing', async () => {
-  const w = lockWorld({ account: null });
+  const w = lockWorld({ account: null, wasm: PLAIN_WASM });
   const r = await w.run(OK);
   assert.equal(r.error, null, r.error?.message);
   assert.match(r.out, /^tx 1: create the account$/m);
@@ -247,6 +294,7 @@ test('plan without --lock: the deploy dry run prints tx 1, tx 2 and tx 3 (the De
   assert.match(r.out, /^tx 3, its own run \(--lock\), after you checked the deployed contract: lock the account$/m);
   assert.match(r.out, /action 1 {2}DeleteKey ed25519:<the key in .*gimbal-canary\.near\.json>: the key is removed from gimbal-canary\.near/);
   assert.match(r.out, /node tools\/mainnet\/deploy\.mjs gimbal-canary\.near --lock --treasury-near treasury\.near --hl-builder 0x0{38}ab, then the same with --send/);
+  assert.match(r.out, /build {5}non-reproducible \(build_info null\): fine for a canary; the final deploy, which gets locked, is built with `cd contract && cargo near build reproducible-wasm`/);
   assert.match(r.out, /--send never sends tx 3/);
   assert.deepEqual(w.st.sent, []);
 });
@@ -256,8 +304,11 @@ test('plan with --lock: only the DeleteKey of the key file\'s key, after every c
   const r = await w.run(LOCK);
   assert.equal(r.error, null, r.error?.message);
   assert.doesNotMatch(r.out, /^tx [12]/m);
-  assert.match(r.out, new RegExp(`code {6}the code on chain is the built wasm: code_hash ${CODE_HASH}`));
+  assert.match(r.out, new RegExp(`checkout  commit ${REV}, clean, on the remote`));
+  assert.match(r.out, new RegExp(`build {5}reproducible: cargo near build reproducible-wasm, image ${IMAGE.replace(/[.+]/g, '\\$&')}, source ${SNAPSHOT.replace(/[.?+/]/g, '\\$&')}`));
+  assert.match(r.out, new RegExp(`code {6}the code on chain is the built wasm: code_hash ${hashOf(REPRO_WASM)}`));
   assert.match(r.out, /config {3}matches/);
+  assert.match(r.out, /treasury  treasury\.near is registered on USDC on NEAR/);
   assert.match(r.out, new RegExp(`keys {6}1 access key on chain:\\n {10}${OWN_KEY} FullAccess \\(the key file\\)`));
   assert.match(r.out, /^tx 3: lock the account\n {2}signer {4}gimbal\.near {2}\(the key itself, .*gimbal\.near\.json\)\n {2}receiver {2}gimbal\.near$/m);
   assert.match(r.out, new RegExp(`action 1 {2}DeleteKey ${OWN_KEY}: the key is removed from gimbal\\.near`));
@@ -265,7 +316,12 @@ test('plan with --lock: only the DeleteKey of the key file\'s key, after every c
   assert.match(r.out, /gas {7}at most 0\.1 TGas \(action fees only\)/);
   assert.match(r.out, /dry run: nothing was signed or sent/);
   assert.doesNotMatch(r.out, /private_key|secret/);
+  assert.equal(w.st.dockerAsked, 0, 'a reproducible wasm needs no Docker check');
   assert.deepEqual(w.st.sent, []);
+  // The dry run may leave out --treasury-near and --hl-builder: they are taken from config() with a warning.
+  const unchecked = await lockWorld().run([CONTRACT, '--lock']);
+  assert.equal(unchecked.error, null, unchecked.error?.message);
+  assert.match(unchecked.out, /warning {3}treasury "treasury\.near" and builder "0x0{38}ab" are taken as they are: pass --treasury-near and --hl-builder to check them/);
 });
 
 test('--lock on a name that does not exist: the plan with a placeholder key, and --send would refuse', async () => {
@@ -284,12 +340,11 @@ test('refused: another key on the account (printed), and the --send never signs'
     const r = await w.run([...LOCK, '--send']);
     assert.match(r.error.message, /not locking gimbal\.near:\n {2}the account has 1 other access key; a lock leaves no key at all/);
     assert.ok(r.error.message.includes(accessKeyLine(other)), r.error.message);
-    assert.match(r.out, new RegExp(`keys {6}2 access keys on chain:`));
+    assert.match(r.out, /keys {6}2 access keys on chain:/);
     assert.ok(r.out.includes(`          ${accessKeyLine(other)}`), 'every key on chain is printed');
     assert.deepEqual(w.st.sent, []);
   }
   assert.equal(accessKeyLine(fc), `${OTHER_KEY} FunctionCall receiver gimbal.near, allowance 0.25 NEAR, methods ["set_paused"]`);
-  // Only the other key, or the key file's key not full access, or no key file: refused too.
   assert.match(lockKeyProblems([fullAccess(OTHER_KEY)], OWN_KEY).join('\n'), /the key file's key .* is not on the account[\s\S]*1 other access key/);
   assert.match(lockKeyProblems([{ ...fc, public_key: OWN_KEY }], OWN_KEY).join('\n'), /not full access on chain/);
   assert.deepEqual(lockKeyProblems([fullAccess(OWN_KEY)], null), [`the key file is missing, so the key that signs the DeleteKey is unknown (on chain: ${OWN_KEY} FullAccess)`]);
@@ -299,7 +354,7 @@ test('refused: another key on the account (printed), and the --send never signs'
 test('refused: the code on chain is not the built wasm', async () => {
   const w = lockWorld({ codeHash: 'E8Zp9eM2Jh2DRx31Ez9M9bKMRaXbDkJcZ3sVkjnTBgcs' });
   const r = await w.run([...LOCK, '--send']);
-  assert.match(r.error.message, new RegExp(`code_hash E8Zp9eM2Jh2DRx31Ez9M9bKMRaXbDkJcZ3sVkjnTBgcs on chain is not ${CODE_HASH}, the base58 sha256 of contract/target/near/gimbal\\.wasm`));
+  assert.match(r.error.message, new RegExp(`code_hash E8Zp9eM2Jh2DRx31Ez9M9bKMRaXbDkJcZ3sVkjnTBgcs on chain is not ${hashOf(REPRO_WASM)}, the base58 sha256 of contract/target/near/gimbal\\.wasm`));
   assert.deepEqual(w.st.sent, []);
   const none = await lockWorld({ codeHash: NO_CODE }).run(LOCK);
   assert.match(none.error.message, /has no code: deploy it first/);
@@ -312,12 +367,53 @@ test('refused: config() is not what new() was given (every differing field named
   assert.match(r.error.message, /config\.fees\.performance_bps: expected 1000, on chain 2000/);
   assert.match(r.error.message, /config\.treasury\.near: expected "treasury\.near", on chain "someone\.near"/);
   assert.deepEqual(w.st.sent, []);
-  // Without --treasury-near and --hl-builder those two are taken from config() and a warning says so.
   assert.deepEqual(lockConfigProblems({ ...CONFIG, treasury: { ...CONFIG.treasury, near: 'someone.near' } }, { codes: NO_CODES, brokerId: 'gimbal_dex' }), []);
-  const unchecked = await lockWorld().run([CONTRACT, '--lock']);
-  assert.match(unchecked.out, /warning {3}treasury "treasury\.near" and builder "0x0{38}ab" are taken as they are: pass --treasury-near and --hl-builder to check them/);
   assert.deepEqual(configDiff({ a: 1, b: { c: 'x' } }, { a: 1, b: { c: 'x' } }), []);
   assert.deepEqual(configDiff({ a: 1 }, { a: 1, b: null }), ['config.b: expected null, on chain missing']);
+});
+
+test('refused: a treasury that does not exist or is not on USDC, and version() other than contract/Cargo.toml', async () => {
+  const missing = await lockWorld({ treasuryMissing: true }).run([...LOCK, '--send']);
+  assert.match(missing.error.message, /the treasury "treasury\.near" does not exist on mainnet/);
+  const unregistered = await lockWorld({ treasuryUnregistered: true }).run([...LOCK, '--send']);
+  assert.match(unregistered.error.message, /the treasury treasury\.near is not registered on USDC on NEAR: register it first/);
+  const version = await lockWorld({ version: '0.2.0' }).run([...LOCK, '--send']);
+  assert.match(version.error.message, /version\(\) is "0\.2\.0", contract\/Cargo\.toml says "0\.1\.0"/);
+  const crate = await lockWorld({ cargo: CARGO.replace('version = "0.1.0"', 'version = "0.3.0"') }).run([...LOCK, '--send']);
+  assert.match(crate.error.message, /the wasm says version 0\.1\.0, contract\/Cargo\.toml 0\.3\.0: build this checkout/);
+});
+
+test('refused: a dirty or unpushed checkout', async () => {
+  const w = lockWorld({ dirty: [' M contract/src/lib.rs'] });
+  const r = await w.run([...LOCK, '--send']);
+  assert.match(r.out, /checkout  commit a{40}, 1 uncommitted change, on the remote\n {10} M contract\/src\/lib\.rs/);
+  assert.match(r.error.message, /the checkout has uncommitted changes: commit or stash them/);
+  assert.deepEqual(w.st.sent, []);
+  const unpushed = await lockWorld({ pushed: false }).run([...LOCK, '--send']);
+  assert.match(unpushed.error.message, /commit a{40} is on no remote branch: push it/);
+});
+
+test('refused: a non-reproducible wasm, with why reproducible-wasm cannot run here; --non-reproducible locks it with honest evidence', async () => {
+  const down = { ok: false, detail: 'failed to connect to the docker API at npipe:////./pipe/dockerDesktopLinuxEngine' };
+  const w = lockWorld({ wasm: PLAIN_WASM, docker: down, cargo: CARGO_PLAIN });
+  const r = await w.run([...LOCK, '--send']);
+  assert.match(r.error.message, /the wasm was not built with `cd contract && cargo near build reproducible-wasm`/);
+  assert.match(r.error.message, /Docker's engine is not running \(docker version: failed to connect.*\): start Docker Desktop, then build again/);
+  assert.match(r.error.message, /no \[package\.metadata\.near\.reproducible_build\] section/);
+  assert.match(r.error.message, /--non-reproducible locks this build anyway/);
+  assert.match(r.out, /build {5}non-reproducible \(build_info null in the wasm's NEP-330 metadata\); cargo-near 0\.22\.0 installed here/);
+  assert.deepEqual(w.st.sent, []);
+  const ready = await lockWorld({ wasm: PLAIN_WASM }).run([...LOCK, '--send']);
+  assert.match(ready.error.message, /Docker and contract\/Cargo\.toml are ready for it/);
+
+  const forced = lockWorld({ wasm: PLAIN_WASM, docker: down, cargo: CARGO_PLAIN });
+  const f = await forced.run([...LOCK, '--send', '--non-reproducible']);
+  assert.equal(f.error, null, f.error?.message);
+  assert.equal(forced.st.sent.length, 1);
+  assert.equal(forced.st.dockerAsked, 0, '--non-reproducible asks Docker nothing');
+  assert.ok(f.result.includes(`build:     non-reproducible (build_info null), cargo-near 0.22.0 installed here: nobody can rebuild these bytes; the sha256 identifies the exact file`));
+  assert.ok(f.result.includes(`Contract has no access keys: DeleteKey tx LockTx111 (https://nearblocks.io/txns/LockTx111), code_hash ${hashOf(PLAIN_WASM)}. `
+    + `Built from commit ${REV} with cargo-near 0.22.0, non-reproducible: the sha256 ${shaOf(PLAIN_WASM)} identifies the exact file.`));
 });
 
 test('--lock --send: one DeleteKey signed by that key, the key list read empty after, the evidence block and the key file called useless', async () => {
@@ -326,36 +422,50 @@ test('--lock --send: one DeleteKey signed by that key, the key list read empty a
   assert.equal(r.error, null, r.error?.message);
   assert.equal(w.st.sent.length, 1);
   assert.deepEqual(w.st.sent[0], { signer: CONTRACT, receiver: CONTRACT, actions: [{ type: 'DeleteKey', publicKey: OWN_KEY }] });
-  const evidence = lockEvidence({ at: '2026-11-03T12:00:00.000Z', contract: CONTRACT, hash: 'LockTx111', codeHash: CODE_HASH, wasmSha256: sha256(WASM_BYTES).toString('hex'), wasmBytes: 8 });
+  const build = buildProvenance(wasmSourceMetadata(REPRO_WASM));
+  const evidence = lockEvidence({ at: AT, contract: CONTRACT, hash: 'LockTx111', codeHash: hashOf(REPRO_WASM), wasmSha256: shaOf(REPRO_WASM), wasmBytes: REPRO_WASM.length, version: '0.1.0', commit: REV, build });
   assert.deepEqual(r.result, evidence);
   assert.ok(r.out.includes(evidence.join('\n')));
-  assert.equal(evidence[0], '=== gimbal lock 2026-11-03T12:00:00.000Z ===');
-  assert.equal(evidence.at(-1), '=== end ===');
-  assert.ok(evidence.includes('DeleteKey: tx LockTx111 https://nearblocks.io/txns/LockTx111'));
-  assert.ok(evidence.includes(`Contract has no access keys: DeleteKey tx LockTx111 (https://nearblocks.io/txns/LockTx111), code_hash ${CODE_HASH}.`));
+  assert.deepEqual(evidence, [
+    `=== gimbal lock ${AT} ===`,
+    'contract:  gimbal.near https://nearblocks.io/address/gimbal.near',
+    'DeleteKey: tx LockTx111 https://nearblocks.io/txns/LockTx111',
+    `code_hash: ${hashOf(REPRO_WASM)}`,
+    `sha256:    ${shaOf(REPRO_WASM)} (contract/target/near/gimbal.wasm, ${REPRO_WASM.length} bytes)`,
+    'version:   0.1.0 (contract/Cargo.toml, version() on chain)',
+    `checkout:  commit ${REV}, clean, on the remote`,
+    `build:     reproducible: cargo near build reproducible-wasm, image ${IMAGE}, source ${SNAPSHOT}`,
+    'keys:      view_access_key_list is empty',
+    'README:',
+    `Contract has no access keys: DeleteKey tx LockTx111 (https://nearblocks.io/txns/LockTx111), code_hash ${hashOf(REPRO_WASM)} (sha256 ${shaOf(REPRO_WASM)}), `
+      + `a reproducible build (${IMAGE}) of ${SNAPSHOT}.`,
+    '=== end ===',
+  ]);
   assert.match(r.out, /key file {2}.*gimbal\.near\.json is now useless: its key is on no account any more and can sign nothing\. You can delete it\./);
   assert.doesNotMatch(r.out, /private_key|secret/);
 });
 
-test('--lock --send: a key still listed after the DeleteKey, or a failed DeleteKey, is an error; an account with no keys has nothing to send', async () => {
+test('--lock --send: a key still listed after the DeleteKey, or a failed DeleteKey, is an error', async () => {
   const still = await lockWorld({ keysAfter: [fullAccess(OWN_KEY)] }).run([...LOCK, '--send']);
   assert.match(still.error.message, /still has access keys after LockTx111/);
   const failed = await lockWorld({ failure: { ActionError: { kind: 'DeleteKeyDoesNotExist' } } }).run([...LOCK, '--send']);
   assert.match(failed.error.message, /DeleteKey LockTx111: .*the key is still on the account/);
-  const w = lockWorld({ keys: [] });
-  const done = await w.run([...LOCK, '--send']);
-  assert.equal(done.error, null, done.error?.message);
-  assert.match(done.out, /nothing to send: gimbal\.near has no access keys, it is locked already/);
-  assert.deepEqual(w.st.sent, []);
 });
 
-test('DeleteKey: borsh as near-api-js 7.3.1, its fee in the gas cap, printed with its key', () => {
-  // near-api-js 7.3.1: createTransaction('gimbal-canary.near', <7 x 32>, 'gimbal-canary.near', 5n, [actions.deleteKey(<9 x 32>)], <1 x 32>).
-  const vector = '1200000067696d62616c2d63616e6172792e6e65617200070707070707070707070707070707070707070707070707070707070707070705000000000000001200000067696d62616c2d63616e6172792e6e65617201010101010101010101010101010101010101010101010101010101010101010100000006000909090909090909090909090909090909090909090909090909090909090909';
-  const bytes = encodeTransaction({
-    signerId: 'gimbal-canary.near', publicKey: Buffer.alloc(32, 7), nonce: 5n, receiverId: 'gimbal-canary.near', blockHash: Buffer.alloc(32, 1), actions: [act.deleteKey(OWN_KEY)],
-  });
-  assert.equal(bytes.toString('hex'), vector);
+test('a rerun that finds no keys (a lock whose outcome was not seen): the evidence block without the hash, and the hash from nearblocks', async () => {
+  const w = lockWorld({ keys: [] });
+  const r = await w.run([...LOCK, '--send']);
+  assert.equal(r.error, null, r.error?.message);
+  assert.deepEqual(w.st.sent, []);
+  assert.match(r.out, /nothing to send: gimbal\.near has no access keys, it is locked already/);
+  assert.ok(r.result.includes('DeleteKey: not seen by this run (the account had no keys when it was read): take its hash from https://nearblocks.io/address/gimbal.near'));
+  assert.ok(r.result.at(-2).startsWith('Contract has no access keys: DeleteKey tx <the DeleteKey\'s hash from https://nearblocks.io/address/gimbal.near>, code_hash '));
+  assert.match(r.out, /hash {6}take the DeleteKey's transaction hash from https:\/\/nearblocks\.io\/address\/gimbal\.near/);
+  const wrong = await lockWorld({ keys: [], codeHash: 'E8Zp9eM2Jh2DRx31Ez9M9bKMRaXbDkJcZ3sVkjnTBgcs' }).run(LOCK);
+  assert.match(wrong.error.message, /no evidence block, because:\n {2}code_hash E8Zp/);
+});
+
+test('DeleteKey: its fee in the gas cap, printed with its key', () => {
   assert.throws(() => act.deleteKey('ed25519:short'), /not an ed25519 public key/);
   const cfg = { runtime_config: { transaction_costs: { action_receipt_creation_config: FEE, action_creation_config: {
     deploy_contract_cost: FEE, deploy_contract_cost_per_byte: FEE, function_call_cost: FEE, function_call_cost_per_byte: FEE,
