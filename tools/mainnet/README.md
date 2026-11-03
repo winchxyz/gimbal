@@ -768,10 +768,14 @@ command from the main checkout, the dry run first:
      "start Docker Desktop", or the missing `Cargo.toml` section), unless `--non-reproducible`, which rebuilds it
      first (below);
    - the wasm exports every method a locked contract needs, since its code never changes again: every method
-     of the table in `docs/interfaces.md` §1.3 (owner, operator and public ones) and every `#[private]` callback
-     in `contract/src` (`on_signed`, the payout callbacks, ...). The list is read from this checkout, not kept by
-     hand, so a method the table or the contract gains is required from then on; a missing one is named and
-     refused;
+     of the table in `docs/interfaces.md` §1.3 (owner, operator and public ones), every view on its `Views:` line
+     (`config`, `get_desk`, `desks_of`, `prices`, `version`) and every `#[private]` callback in `contract/src`
+     (`on_signed`, the payout callbacks, ...; 44 in all on 2026-11-03). The list is read from this checkout, not
+     kept by hand, so a method the table, the views or the contract gains is required from then on; a missing one
+     is named and refused. The reading refuses rather than guesses: a table row whose method is not
+     `` `name(args)` `` in lowercase, a `#[private]` it cannot match to a `pub fn`, no contract source, or a table
+     without the money methods, `panic_close`, `hl_withdraw`, `hl_send_to_intents`, `evm_usdc_to_intents` or the
+     five views;
    - `code_hash` (`view_account`) equals the base58 sha256 of `contract/target/near/gimbal.wasm`;
    - `version()` equals the `[package]` version in `contract/Cargo.toml` (and the version in the wasm's metadata);
    - `config()` is exactly what `new()` was given on mainnet: Mainnet, `v1.signer`, OutLayer `price-oracle.near`,
@@ -788,8 +792,10 @@ command from the main checkout, the dry run first:
    so the lock deletes `contract/target/near/gimbal.wasm`, rebuilds it in the clean checkout (`cd contract &&
    cargo near build non-reproducible-wasm --no-abi`, minutes), reads the checkout again (the build must not change
    it: commit what it writes), and only those bytes are compared with the deployed `code_hash`. It refuses a dirty
-   checkout, a set `CARGO_TARGET_DIR`, a failed build, a build that wrote no file, a file older than the rebuild,
-   a file that cargo-near says it wrote elsewhere, a rebuilt file with a non-null `build_info` (not what
+   checkout, a set `CARGO_TARGET_DIR` or `CARGO_BUILD_TARGET_DIR`, a wasm still there after the deletion, a failed
+   build, a build that wrote no file (a file time older than the rebuild is only a warning: the file did not exist
+   before the build, and a copy keeps its source's time), a file that cargo-near says it wrote elsewhere (its
+   `- Binary:` line, colours stripped), a rebuilt file with a non-null `build_info` (not what
    non-reproducible-wasm writes, so a stale file) and a different hash. The evidence then says exactly that:
    rebuilt from that clean commit, with that cargo-near and rustc, the sha256 equals the deployed code; another
    machine may not rebuild the same bytes. The dry run rebuilds too.

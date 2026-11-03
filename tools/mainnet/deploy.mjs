@@ -145,31 +145,63 @@ const SPEC = {
 /** A canary is never locked: it gets retired (tools/mainnet/README.md, "Retiring a canary"). */
 export const isCanary = (id) => /canary/.test(id);
 /**
+ * A floor under the derived list: the lock refuses when the table lacks any of these (it then did not parse, or
+ * someone removed a way money leaves a desk). The views are required as well as listed on §1.3's "Views:" line.
+ */
+export const LOCK_FLOOR = [...MONEY_METHODS, 'panic_close', 'hl_withdraw', 'hl_send_to_intents', 'evm_usdc_to_intents'];
+export const LOCK_VIEW_FLOOR = ['config', 'get_desk', 'desks_of', 'prices', 'version'];
+
+// A `#[private]` attribute at the start of a line, then on the same line further attributes, then (on later
+// lines) blank, attribute or comment lines (`///` docs included), then the `pub fn`; or all of it on one line.
+const PRIVATE_FN = new RegExp(String.raw`^[ \t]*#\[private\](?:[ \t]*#\[[^\]\n]*\])*[ \t]*`
+  + String.raw`(?:(?:\/\/[^\n]*)?\r?\n(?:[ \t]*(?:#\[[^\]\n]*\][ \t]*)*(?:\/\/[^\n]*)?\r?\n)*[ \t]*)?pub fn ([a-z_0-9]+)`, 'gm');
+const PRIVATE_ATTR = /^[ \t]*#\[private\]/gm;
+
+/**
  * What a locked contract must export, since its code never changes again: every method of the table in
  * docs/interfaces.md §1.3 (owner, operator and public ones, in the table's order; desk.test.mjs and the contract's
- * tests pin the contract to that table), then the contract's `#[private]` callbacks (from contract/src, sorted).
- * Not hand-kept: a method added to the table or a callback added to the contract is required from then on.
- * `doc` is the text of docs/interfaces.md, `sources` the text of each file of contract/src.
+ * tests pin the contract to that table), then the views of §1.3's "Views:" line, then the contract's `#[private]`
+ * callbacks (from contract/src, sorted). Not hand-kept: a method added to the table or the views, or a callback
+ * added to the contract, is required from then on. It refuses instead of guessing: a table row whose first cell is
+ * not `` `name(args)` `` (lowercase), a `#[private]` with no `pub fn` it could match, no sources, or a floor
+ * (LOCK_FLOOR, LOCK_VIEW_FLOOR) missing. `doc` is the text of docs/interfaces.md, `sources` the text of each file of
+ * contract/src.
  */
 export function lockMethodsFrom({ doc, sources }) {
+  const unknown = 'the methods a locked contract needs are unknown';
   const start = doc.indexOf('### 1.3 Who may call what');
   const end = doc.indexOf('\n### 1.4', start);
-  if (start < 0 || end < 0) throw new Error('docs/interfaces.md has no §1.3 "Who may call what" before §1.4: the methods a locked contract needs are unknown');
+  if (start < 0 || end < 0) throw new Error(`docs/interfaces.md has no §1.3 "Who may call what" before §1.4: ${unknown}`);
+  const lines = doc.slice(start, end).split(/\r?\n/);
+  const isSeparator = (l) => /^\|(\s*:?-{3,}:?\s*\|)+\s*$/.test(l);
   const table = [];
-  for (const line of doc.slice(start, end).split('\n')) {
-    const method = /^`([a-z_0-9]+)\(/.exec(line.split('|')[1]?.trim() ?? '')?.[1];
-    if (method !== undefined && !table.includes(method)) table.push(method);
-  }
-  // Each `#[private]` attribute on a line of its own, then any other attributes, then the `pub fn`.
-  const callbacks = new Set();
+  lines.forEach((line, i) => {
+    if (!line.startsWith('|')) return;
+    // A table's header (the row above its separator) and the separator itself carry no method.
+    if (isSeparator(line) || isSeparator(lines[i + 1] ?? '')) return;
+    const cell = line.split('|')[1].trim();
+    const method = /^`([a-z_][a-z0-9_]*)\([^`]*\)`$/.exec(cell)?.[1];
+    if (method === undefined) throw new Error(`docs/interfaces.md §1.3 has a row whose method does not parse (\`name(args)\`, lowercase): ${JSON.stringify(cell)}: ${unknown}`);
+    if (!table.includes(method)) table.push(method);
+  });
+  const viewsLine = lines.find((l) => l.startsWith('Views:'));
+  if (viewsLine === undefined) throw new Error(`docs/interfaces.md §1.3 has no "Views:" line: ${unknown}`);
+  // The list ends at the line's first full stop.
+  const views = [...viewsLine.slice('Views:'.length).split(/\.(\s|$)/)[0].matchAll(/`([a-z_][a-z0-9_]*)\([^`]*\)`/g)].map((m) => m[1]);
+  if (sources.length === 0) throw new Error(`no contract/src file was read, so its #[private] callbacks are unknown: ${unknown}`);
+  const callbacks = [];
+  let attributes = 0;
   for (const text of sources) {
-    for (const m of text.matchAll(/^[ \t]*#\[private\][ \t]*\r?\n(?:[ \t]*#\[[^\]\n]*\][ \t]*\r?\n)*[ \t]*pub fn ([a-z_0-9]+)/gm)) callbacks.add(m[1]);
+    attributes += [...text.matchAll(PRIVATE_ATTR)].length;
+    for (const m of text.matchAll(PRIVATE_FN)) callbacks.push(m[1]);
   }
-  const methods = [...table, ...[...callbacks].filter((m) => !table.includes(m)).sort()];
-  const missing = MONEY_METHODS.filter((m) => !methods.includes(m));
-  if (table.length < 20 || missing.length > 0) {
-    throw new Error(`docs/interfaces.md §1.3 lists ${table.length} methods${missing.length > 0 ? `, without ${missing.join(', ')}` : ''}: the table did not parse, so the methods a locked contract needs are unknown`);
+  if (callbacks.length !== attributes) {
+    throw new Error(`contract/src has ${attributes} #[private] attributes, and ${callbacks.length} of them were matched to a pub fn (${callbacks.join(', ')}): ${unknown}`);
   }
+  const methods = [];
+  for (const m of [...table, ...views, ...[...new Set(callbacks)].sort()]) if (!methods.includes(m)) methods.push(m);
+  const missing = [...LOCK_FLOOR.filter((m) => !table.includes(m)), ...LOCK_VIEW_FLOOR.filter((m) => !views.includes(m))];
+  if (missing.length > 0) throw new Error(`docs/interfaces.md §1.3 does not list ${missing.join(', ')} (the table and its "Views:" line): ${unknown}`);
   return methods;
 }
 
@@ -469,7 +501,9 @@ function rustcVersion() {
  * contract is built), or null when the output has none.
  */
 export function cargoNearBinary(output) {
-  return /^\s*-\s*Binary:\s*(.+?\.wasm)\s*$/m.exec(output ?? '')?.[1] ?? null;
+  // Its colours first: ANSI escape sequences (CSI ... letter, OSC ... BEL or ST).
+  const plain = String(output ?? '').replace(/\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '');
+  return /^\s*-\s*Binary:\s*(.+?\.wasm)\s*$/m.exec(plain)?.[1] ?? null;
 }
 
 /**
@@ -840,14 +874,16 @@ async function lock(a, {
   // clean checkout, and only a file this rebuild wrote is compared with the deployed code.
   let rebuilt = null;
   if (a.nonReproducible) {
-    const targetDir = processEnv.CARGO_TARGET_DIR;
+    const targetDir = ['CARGO_TARGET_DIR', 'CARGO_BUILD_TARGET_DIR'].find((n) => typeof processEnv[n] === 'string' && processEnv[n] !== '');
     if (!repo.clean) {
       problems.push(`--non-reproducible rebuilds the wasm from a clean checkout, and this one is not: the wasm on disk was not rebuilt, so nothing ties it to commit ${repo.head}`);
-    } else if (typeof targetDir === 'string' && targetDir !== '') {
-      problems.push(`CARGO_TARGET_DIR is set (${targetDir}): cargo would build somewhere else than ${WASM_SHOWN}, which the lock compares; unset it and run --lock again`);
+    } else if (targetDir !== undefined) {
+      problems.push(`${targetDir} is set (${processEnv[targetDir]}): cargo would build somewhere else than ${WASM_SHOWN}, which the lock compares; unset it and run --lock again`);
     } else {
       say(`rebuild   --non-reproducible: \`${BUILD}\` from commit ${repo.head}, after deleting ${WASM_SHOWN} (minutes; nothing is sent meanwhile)`);
       removeWasm();
+      // The deletion, then the file's existence after the build, is what proves the file is this build's.
+      if (wasmWrittenAt() !== null) throw new Error(`${WASM_SHOWN} is still there after deleting it, so a stale file could be compared: delete it yourself and run --lock again; nothing was checked or sent`);
       const started = now();
       const r = rebuild();
       if (!r.ok) throw new Error(`the rebuild failed (${r.detail}): nothing was checked or sent; fix the build and run --lock again`);
@@ -855,12 +891,12 @@ async function lock(a, {
       if (r.binary !== null && r.binary !== undefined && !same(r.binary, WASM)) {
         throw new Error(`cargo near wrote ${r.binary}, not ${WASM_SHOWN} (a target-dir in a .cargo/config.toml?): build into contract/target and run --lock again; nothing was checked or sent`);
       }
-      // Up to 2 s of slack for file systems that store coarse times.
       const written = wasmWrittenAt();
       if (written === null) throw new Error(`the rebuild wrote no ${WASM_SHOWN}: nothing was checked or sent`);
+      // Only a warning: the file did not exist before the build, and a copy may keep its source's time.
       if (written < started - 2000) {
-        throw new Error(`${WASM_SHOWN} is older than this rebuild (written ${new Date(written).toISOString()}, the rebuild started ${new Date(started).toISOString()}): `
-          + 'a stale file, not this build; nothing was checked or sent');
+        say(`warning   ${WASM_SHOWN} carries a time before this rebuild (${new Date(written).toISOString()}, the rebuild started ${new Date(started).toISOString()}); `
+          + 'it did not exist before the build, so it is taken as this build (a copied file keeps its source\'s time)');
       }
       const after = git({ fetch: false });
       if (!after.clean || after.head !== repo.head) {
@@ -882,10 +918,10 @@ async function lock(a, {
   const lockMethods = lockMethodsFrom(lockSources());
   const exported = new Set(wasmExports(wasm));
   const missing = lockMethods.filter((m) => !exported.has(m));
-  if (missing.length === 0) say(`exports   all ${lockMethods.length} methods of docs/interfaces.md §1.3 and the contract's #[private] callbacks`);
+  if (missing.length === 0) say(`exports   all ${lockMethods.length} methods and views of docs/interfaces.md §1.3 and the contract's #[private] callbacks`);
   else {
     problems.push(`the wasm does not export ${missing.join(', ')}: a locked contract can never get ${missing.length === 1 ? 'it' : 'them'}, so build and deploy code that `
-      + `has every method of docs/interfaces.md §1.3 and every #[private] callback of contract/src (${lockMethods.length} in all)`);
+      + `has every method and view of docs/interfaces.md §1.3 and every #[private] callback of contract/src (${lockMethods.length} in all)`);
   }
 
   const cargo = cargoPackageInfo(readCargoToml());

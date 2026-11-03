@@ -264,7 +264,7 @@ function lockWorld(o = {}) {
       if (o.rebuildFails) return { ok: false, detail: o.rebuildFails };
       if (!o.writesNothing) {
         wasm = o.rebuilt ?? wasm;
-        writtenAt = T0 + 61_000;
+        writtenAt = o.oldTime ? T0 - 3_600_000 : T0 + 61_000;
       }
       return { ok: true, binary: o.binary ?? null };
     },
@@ -339,6 +339,8 @@ test('the build: NEP-330 metadata read from the wasm, reproducible only with bui
   assert.equal(cargoNearBinary('Compiling...\nContract successfully built!\n     - Binary: /src/contract/target/near/gimbal.wasm\n     - SHA-256 checksum hex : ab\n'),
     '/src/contract/target/near/gimbal.wasm');
   assert.equal(cargoNearBinary('error: could not compile'), null);
+  assert.equal(cargoNearBinary('\x1b[1m\x1b[32mContract successfully built!\x1b[0m\n     \x1b[2m-\x1b[0m \x1b[1mBinary:\x1b[0m \x1b[36m/src/contract/target/near/gimbal.wasm\x1b[0m\n'),
+    '/src/contract/target/near/gimbal.wasm', 'colours stripped first');
   assert.deepEqual(buildProvenance(wasmSourceMetadata(PLAIN_WASM)), { reproducible: false, version: '0.1.0' });
   assert.equal(wasmSourceMetadata(Buffer.from([0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0])), null);
   assert.deepEqual(wasmExports(REPRO_WASM), LOCK_METHODS);
@@ -353,31 +355,54 @@ test('the build: NEP-330 metadata read from the wasm, reproducible only with bui
   ]);
 });
 
-test('the methods a locked contract must export: every method of interfaces §1.3, then the #[private] callbacks, derived and not hand-kept', () => {
-  // The real ones, from this checkout's docs and contract sources.
-  for (const m of [...MONEY_METHODS, 'panic_close', 'hl_withdraw', 'hl_send_to_intents', 'evm_usdc_to_intents', 'sol_sign_rescue', 'orderly_withdraw',
-    'orderly_settle_pnl', 'sol_sign', 'set_paused', 'hl_usd_class_transfer', 'create_desk', 'refresh_prices', 'on_signed', 'on_payout_owner', 'on_payout_fee',
-    'on_fund_venue', 'on_prices', 'on_desk_keys', 'refuse', 'new']) {
+test('the methods a locked contract must export: every method and view of interfaces §1.3, then the #[private] callbacks, derived and not hand-kept', () => {
+  // The real ones, from this checkout's docs and contract sources, counted here without the parser.
+  const { doc: realDoc, sources: realSources } = lockMethodSources();
+  const section = realDoc.slice(realDoc.indexOf('### 1.3 Who may call what'), realDoc.indexOf('\n### 1.4'));
+  const rowCount = section.split('\n').filter((l) => l.startsWith('| `')).length;
+  const privateCount = realSources.join('\n').split('\n').filter((l) => l.trim().startsWith('#[private]')).length;
+  assert.equal(privateCount, 8, 'eight #[private] attributes in contract/src today');
+  assert.equal(LOCK_METHODS.length, rowCount + 5 + privateCount, 'every row, the five views and every callback, each once');
+  for (const m of ['ft_on_transfer', 'fund_venue', 'withdraw_to_owner', 'clear_payout_lock', 'panic_close', 'hl_withdraw', 'hl_send_to_intents', 'evm_usdc_to_intents',
+    'sol_sign_rescue', 'orderly_withdraw', 'orderly_settle_pnl', 'sol_sign', 'set_paused', 'hl_usd_class_transfer', 'create_desk', 'refresh_prices',
+    'config', 'get_desk', 'desks_of', 'prices', 'version',
+    'new', 'on_desk_keys', 'on_fund_venue', 'on_payout_fee', 'on_payout_owner', 'on_prices', 'on_signed', 'refuse']) {
     assert.ok(LOCK_METHODS.includes(m), m);
   }
   assert.equal(new Set(LOCK_METHODS).size, LOCK_METHODS.length, 'each method once');
   assert.equal(LOCK_METHODS[0], 'create_desk', 'the table first, in its order');
-  const callbacks = LOCK_METHODS.slice(LOCK_METHODS.indexOf('panic_close') + 1);
-  assert.deepEqual(callbacks, [...callbacks].sort(), 'then the callbacks, sorted');
-  assert.ok(callbacks.every((m) => m === 'new' || m === 'refuse' || m.startsWith('on_')), callbacks.join(' '));
 
-  // A row added to the table, or a callback added to the contract, is required from then on.
-  const rows = Array.from({ length: 20 }, (_, i) => `| \`m${i}(desk_id)\` | ✓ | | |`);
-  const doc = ['### 1.3 Who may call what', '', '| Method | Owner | Operator | Notes |', '|---|---|---|---|',
-    ...MONEY_METHODS.map((m) => `| \`${m}(desk_id)\` | ✓ | | |`), ...rows, '| `new_setter(desk_id, x)` | ✓ | | added later |', '', '### 1.4 What an action method returns',
-    '| `not_here(x)` | ✓ | | |'].join('\n');
+  // A row or a view added to §1.3, or a callback added to the contract, is required from then on.
+  const row = (m) => `| \`${m}\` | ✓ | | |`;
+  const table = ['ft_on_transfer(sender_id, amount, msg)', 'fund_venue(desk_id)', 'withdraw_to_owner(desk_id, amount)', 'clear_payout_lock(desk_id)',
+    'panic_close(desk_id)', 'hl_withdraw(desk_id, amount)', 'hl_send_to_intents(desk_id)', 'evm_usdc_to_intents(desk_id)', 'new_setter(desk_id, x)'];
+  const views = 'Views: `config()`, `get_desk(desk_id)`, `desks_of(owner)`, `prices()`, `version()`, `get_desk_counters(desk_id)`. `later(x)` is not a view.';
+  const docOf = (rows, viewsLine = views) => ['### 1.3 Who may call what', '', '| Method | Owner | Operator | Notes |', '|---|---|---|---|', ...rows.map(row), '',
+    viewsLine, '', '### 1.4 What an action method returns', '| `not_here(x)` | ✓ | | |'].join('\n');
+  const doc = docOf(table);
   const src = [
     '    #[private]\n    pub fn on_b(&self) {}\n    #[init]\n    #[private]\n    #[deny_unknown_arguments]\n    pub fn new(x: u8) -> Self {}\n',
     '    /// `#[private]` in a comment is not an attribute\n    pub fn not_private(&self) {}\r\n    #[private]\r\n    pub fn on_a(&self) {}\r\n',
+    '    #[private]\n    /// A doc comment between the attribute and the fn.\n\n    // and a plain one\n    pub fn on_c(&self) {}\n',
+    '    #[private] pub fn on_d(&self) {}\n    #[private] #[payable]\n    pub fn on_e(&mut self) {}\n',
   ];
-  assert.deepEqual(lockMethodsFrom({ doc, sources: src }), [...MONEY_METHODS, ...rows.map((_, i) => `m${i}`), 'new_setter', 'new', 'on_a', 'on_b']);
+  assert.deepEqual(lockMethodsFrom({ doc, sources: src }), [
+    'ft_on_transfer', 'fund_venue', 'withdraw_to_owner', 'clear_payout_lock', 'panic_close', 'hl_withdraw', 'hl_send_to_intents', 'evm_usdc_to_intents', 'new_setter',
+    'config', 'get_desk', 'desks_of', 'prices', 'version', 'get_desk_counters',
+    'new', 'on_a', 'on_b', 'on_c', 'on_d', 'on_e',
+  ]);
+
+  // Refused instead of guessed: a row that does not parse, a #[private] without its pub fn, no sources, a floor gone.
+  for (const bad of ['**`bold_name(desk_id)`**', '`no_parens`', '`setX(desk_id)`']) {
+    const d = doc.replace('| `new_setter(desk_id, x)` |', `| ${bad} |`);
+    assert.throws(() => lockMethodsFrom({ doc: d, sources: src }), /§1\.3 has a row whose method does not parse/, bad);
+  }
+  assert.throws(() => lockMethodsFrom({ doc, sources: [...src, '    #[private]\n    fn helper(&self) {}\n'] }), /contract\/src has 7 #\[private\] attributes, and 6 of them were matched/);
+  assert.throws(() => lockMethodsFrom({ doc, sources: [] }), /no contract\/src file was read/);
   assert.throws(() => lockMethodsFrom({ doc: '# no table', sources: src }), /no §1\.3 "Who may call what"/);
-  assert.throws(() => lockMethodsFrom({ doc: doc.replace(/\| `m\d+\(desk_id\)` .*\n/g, ''), sources: src }), /lists 5 methods: the table did not parse/);
+  assert.throws(() => lockMethodsFrom({ doc: docOf(table, 'No views here.'), sources: src }), /no "Views:" line/);
+  assert.throws(() => lockMethodsFrom({ doc: docOf(table.filter((m) => !m.startsWith('panic_close'))), sources: src }), /does not list panic_close/);
+  assert.throws(() => lockMethodsFrom({ doc: docOf(table, views.replace('`prices()`, ', '')), sources: src }), /does not list prices/);
 });
 
 test('plan without --lock: a canary\'s deploy prints no tx 3; the final deploy prints tx 3 (the DeleteKey) as its own later run with --confirm-lock', async () => {
@@ -408,7 +433,7 @@ test('plan with --lock: only the DeleteKey of the key file\'s key, after every c
   assert.doesNotMatch(r.out, /^tx [12]/m);
   assert.match(r.out, new RegExp(`checkout  commit ${REV}, clean, on a branch of origin \\(after git fetch --prune origin\\)`));
   assert.deepEqual(w.st.gitCalls, [{}], 'one checkout read, with the fetch');
-  assert.ok(r.out.includes(`exports   all ${LOCK_METHODS.length} methods of docs/interfaces.md §1.3 and the contract's #[private] callbacks`), r.out);
+  assert.ok(r.out.includes(`exports   all ${LOCK_METHODS.length} methods and views of docs/interfaces.md §1.3 and the contract's #[private] callbacks`), r.out);
   assert.match(r.out, new RegExp(`build {5}reproducible: its NEP-330 build_info names cargo near build reproducible-wasm, image ${IMAGE.replace(/[.+]/g, '\\$&')}, source ${SNAPSHOT.replace(/[.?+/]/g, '\\$&')}`));
   assert.match(r.out, new RegExp(`code {6}the code on chain is the built wasm: code_hash ${hashOf(REPRO_WASM)}`));
   assert.match(r.out, /balance {3}1\.0000 NEAR free above storage: after the lock no key can move it; only the contract's own methods spend it \(refresh_prices' oracle deposit, refunds\)/);
@@ -583,11 +608,18 @@ test('--non-reproducible: the wasm is rebuilt from the clean checkout and must b
 });
 
 test('--non-reproducible: a stale file is never compared (old file left in place, nothing written, written elsewhere, build_info set)', async () => {
-  // The rebuild "succeeds" but leaves the old file in place: it is older than the rebuild, refused.
+  // The old file stays in place (the deletion did not take): refused before any build.
   const stale = lockWorld({ wasm: PLAIN_WASM, keepOld: true, writesNothing: true });
   const s = await stale.run([...LOCK_SEND, '--non-reproducible']);
-  assert.match(s.error.message, /contract\/target\/near\/gimbal\.wasm is older than this rebuild \(written 2026-11-03T11:00:00\.000Z, the rebuild started 2026-11-03T11:01:00\.000Z\): a stale file/);
+  assert.match(s.error.message, /contract\/target\/near\/gimbal\.wasm is still there after deleting it, so a stale file could be compared/);
+  assert.equal(stale.st.rebuilds, 0);
   assert.deepEqual(stale.st.sent, []);
+  // A fresh file whose time is older than the rebuild (a copy keeps its source's time): a warning only.
+  const copied = lockWorld({ wasm: STALE_WASM, rebuilt: PLAIN_WASM, oldTime: true });
+  const c = await copied.run([...LOCK_SEND, '--non-reproducible']);
+  assert.equal(c.error, null, c.error?.message);
+  assert.match(c.out, /warning {3}contract\/target\/near\/gimbal\.wasm carries a time before this rebuild \(2026-11-03T10:00:00\.000Z, the rebuild started 2026-11-03T11:01:00\.000Z\)/);
+  assert.equal(copied.st.sent.length, 1);
   // Deleted first, and the rebuild wrote nothing.
   const none = lockWorld({ wasm: PLAIN_WASM, writesNothing: true });
   const n = await none.run([...LOCK_SEND, '--non-reproducible']);
@@ -604,6 +636,8 @@ test('--non-reproducible: a stale file is never compared (old file left in place
   assert.equal(env.st.rebuilds, 0);
   assert.equal(env.st.removed, 0);
   assert.match(e.error.message, /CARGO_TARGET_DIR is set \(D:\/cargo-target\): cargo would build somewhere else than contract\/target\/near\/gimbal\.wasm/);
+  const build = await lockWorld({ wasm: PLAIN_WASM, processEnv: { CARGO_BUILD_TARGET_DIR: 'D:/other' } }).run([...LOCK_SEND, '--non-reproducible']);
+  assert.match(build.error.message, /CARGO_BUILD_TARGET_DIR is set \(D:\/other\)/);
   // A "rebuilt" file with build_info: not what non-reproducible-wasm writes, so not this run's build.
   const repro = lockWorld({ wasm: STALE_WASM, rebuilt: REPRO_WASM });
   const r = await repro.run([...LOCK_SEND, '--non-reproducible']);
