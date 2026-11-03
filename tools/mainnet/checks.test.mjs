@@ -1,12 +1,17 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { UsageError } from './cli.mjs';
 import {
   ALLOWED_CALLS, ASSETS, CALL_TGAS, KEY_LIFETIME_MS, ORACLE_DEPOSIT, ORACLE_IDS, callProblem, engineEnvProblems, guardedTransport,
-  parseChecksArgs, quoteRequests, quoteVerdict, runChecks, sendRefusal, stalePrices, txCosts,
+  parseChecksArgs, policyOracleSymbols, quoteRequests, quoteVerdict, runChecks, sendRefusal, stalePrices, txCosts,
 } from './checks.mjs';
 import { OPERATOR_METHODS, orderlyAccountId } from './desk.mjs';
-import { CANARY_SYMBOLS } from './venues.mjs';
+import { CANARY_POLICY_FILE, FINAL_POLICY_FILE } from './policy.mjs';
+import { CANARY_SYMBOLS, FINAL_SYMBOLS } from './venues.mjs';
+
+const CANARY_POLICY = JSON.parse(readFileSync(CANARY_POLICY_FILE, 'utf8'));
+const FINAL_POLICY = JSON.parse(readFileSync(FINAL_POLICY_FILE, 'utf8'));
 
 const CONTRACT = 'gimbal-canary.near';
 const DESK_ID = 'canary';
@@ -20,7 +25,7 @@ const PUBLIC = `ed25519:${'7'.repeat(44)}`;
 const NOW = Date.parse('2026-11-01T12:00:00Z');
 
 const DESK = {
-  owner: OWNER, operator: null, paused: false, policy: {}, evm_address: EVM,
+  owner: OWNER, operator: null, paused: false, policy: CANARY_POLICY, evm_address: EVM,
   solana: { authority: AUTHORITY, usdc_ata: 'u', phusd_ata: 'p', phoenix_trader: 't' },
   orderly_account_id: ACCOUNT, orderly_receiver: null, orderly_ips: [],
   ledger: { deposited: 0, withdrawn: 0, fees_paid: 0, hwm: 0, idle_usdc: 0 },
@@ -151,8 +156,20 @@ test('prices: costs over every receipt, and which assets got no newer price', ()
   const after = [{ asset: 'BTC', price_e8: 1, at_ms: 10 }, { asset: 'ETH', price_e8: 1, at_ms: 20 }];
   assert.deepEqual(stalePrices(before, after, ['BTC', 'ETH', 'SOL']), ['BTC', 'SOL']);
   assert.deepEqual(stalePrices([], after, ['ETH']), []);
-  assert.deepEqual(Object.keys(ORACLE_IDS).sort(), [...CANARY_SYMBOLS].sort(), 'an oracle id for every canary asset');
+  assert.deepEqual(Object.keys(ORACLE_IDS).sort(), [...FINAL_SYMBOLS].sort(), 'an oracle id for every final asset');
+  assert.equal(ORACLE_IDS.XLM, 'xlm', 'the bare id, not an omft one');
+  assert.equal(ORACLE_IDS.ZEC, 'zec.omft.near');
   assert.equal(ORACLE_DEPOSIT, 20n * 10n ** 21n);
+});
+
+test('the prices step refreshes the oracle assets the desk\'s policy trades, so the canary never asks for XLM or ZEC', () => {
+  assert.deepEqual(policyOracleSymbols(CANARY_POLICY), CANARY_SYMBOLS);
+  assert.deepEqual(policyOracleSymbols(FINAL_POLICY), FINAL_SYMBOLS);
+  assert.deepEqual(policyOracleSymbols({
+    hl_assets: [{ symbol: 'HYPE' }, { symbol: 'ETH' }], phoenix_markets: [{ symbol: 'ZEC' }, { symbol: 'ETH' }],
+    orderly_symbols: ['PERP_XLM_USDC', 'PERP_NEAR_USDC'],
+  }), ['ETH', 'ZEC', 'XLM'], 'unpriced symbols are left out, each once');
+  assert.deepEqual(policyOracleSymbols({}), []);
 });
 
 test('the constants are the engine\'s: call gas, the orderly key lifetime', async () => {
@@ -310,6 +327,17 @@ test('the dry run refuses a contract that is not a mainnet canary, or a desk tha
   await assert.rejects(capture([CONTRACT, DESK_ID], withView(async (_c, m) => (m === 'config' ? { ...CONFIG, orderly: { broker_id: 'woofi_dex', chain_id: 42161 } } : DESK))), /not the engine's mainnet broker/);
   await assert.rejects(capture([CONTRACT, DESK_ID], withView(async (_c, m) => (m === 'config' ? CONFIG : null))), /has no desk canary/);
   await assert.rejects(capture([CONTRACT, DESK_ID], withView(async (_c, m) => (m === 'config' ? CONFIG : { ...DESK, orderly_account_id: '0x00' }))), /orderly_account_id 0x00 is not/);
+  await assert.rejects(capture([CONTRACT, DESK_ID, '--step', 'prices'], withView(async (_c, m) => (m === 'config' ? CONFIG : { ...DESK, policy: { ...CANARY_POLICY, hl_assets: [], phoenix_markets: [], orderly_symbols: [] } }))),
+    /policy trades no oracle asset/);
+});
+
+test('a desk under the final policy: the prices step asks for all seven oracle assets', async () => {
+  const f = fakes();
+  const view = async (c, m, args) => (m === 'get_desk' ? { ...DESK, policy: FINAL_POLICY } : f.deps.near.view(c, m, args));
+  const { out, block } = await capture([CONTRACT, DESK_ID, '--step', 'prices'], { ...f.deps, near: { ...f.deps.near, view } });
+  assert.match(out, /args {"assets":\["BTC","ETH","SOL","DOGE","LTC","XLM","ZEC"\]}/);
+  assert.match(out, /request_price_data {"asset_ids":\["nbtc\.bridge\.near","eth\.bridge\.near","22\.contract\.portalbridge\.near","doge\.omft\.near","ltc\.omft\.near","xlm","zec\.omft\.near"\]}/);
+  assert.equal(block[2], 'prices:  dry run; refresh_prices BTC,ETH,SOL,DOGE,LTC,XLM,ZEC not sent; prices() now: none stored');
 });
 
 test('--send: prices and orderly through the engine, the key checked first and never printed', async () => {

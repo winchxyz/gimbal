@@ -6,11 +6,12 @@ use super::hl::{at, hl_desk_with, hl_policy, unpriced};
 use super::sol::outcome;
 use super::*;
 use crate::prices::{
-    answer_time_ms, OraclePriceData, PriceRow, ON_PRICES_GAS, ORACLE_DEPOSIT,
+    answer_time_ms, OraclePriceData, PriceRow, ON_PRICES_GAS, ORACLE_DEPOSIT, REFRESH_PRICES_GAS,
     REFRESH_PRICES_MIN_GAS, REFRESH_SKIP_MS, REQUEST_PRICE_DATA_GAS,
 };
 use gimbal_core::errors::E_ORACLE_STALE;
 use gimbal_core::hl::HlOrder;
+use gimbal_core::oracle::ORACLE_ASSETS;
 
 fn outlayer() -> Gimbal {
     testnet_with(PriceSource::OutLayer {
@@ -218,10 +219,10 @@ fn refresh_prices_asks_the_oracle_on_the_contracts_deposit_then_on_prices() {
             yocto(0),
         )
     );
-    // All five symbols, each mapped to its OutLayer asset id.
+    // All seven symbols, each mapped to its OutLayer asset id.
     call_with_gas_by(contract_id(), REFRESH_PRICES_MIN_GAS);
     g.refresh_prices(
-        ["SOL", "LTC", "DOGE", "ETH", "BTC"]
+        ["ZEC", "SOL", "LTC", "XLM", "DOGE", "ETH", "BTC"]
             .map(String::from)
             .to_vec(),
     )
@@ -229,8 +230,10 @@ fn refresh_prices_asks_the_oracle_on_the_contracts_deposit_then_on_prices() {
     assert_eq!(
         calls_with_deposits()[0].2,
         json!({ "asset_ids": [
+            "zec.omft.near",
             "22.contract.portalbridge.near",
             "ltc.omft.near",
+            "xlm",
             "doge.omft.near",
             "eth.bridge.near",
             "nbtc.bridge.near",
@@ -246,6 +249,10 @@ fn refresh_prices_refuses_bad_symbols_strangers_little_gas_and_the_mock_source()
         (vec![], "E_ARGS: "),
         (vec!["ETH", "ETH"], "E_ARGS: "),
         (vec!["ETH", "BTC", "SOL", "LTC", "DOGE", "ETH"], "E_ARGS: "),
+        (
+            vec!["ETH", "BTC", "SOL", "LTC", "DOGE", "XLM", "ZEC", "ETH"],
+            "E_ARGS: 8 symbols; name 1 to 7",
+        ),
         (vec!["HYPE"], "E_ASSET: "),
         (vec!["eth.bridge.near"], "E_ASSET: "),
     ] {
@@ -568,6 +575,54 @@ fn request_price_data_gets_the_gas_outlayer_needs() {
     let c = calls_with_deposits();
     assert_eq!((c[0].3, c[0].4), (REQUEST_PRICE_DATA_GAS, 1));
     assert_eq!((c[1].3, c[1].4), (ON_PRICES_GAS, 0));
+}
+
+/// With all seven symbols, `refresh_prices` (host gas and the fees of its two receipts, leaving
+/// out the gas it attaches) and `on_prices` (reading an answer of seven prices and storing them)
+/// stay well inside the gas each keeps. The mock meters host functions, not wasm instructions,
+/// and charges an older, higher fee table; `--nocapture` prints the numbers.
+#[test]
+fn seven_symbols_fit_the_gas_refresh_prices_and_on_prices_keep() {
+    const TGAS: u64 = Gas::from_tgas(1).as_gas();
+    let all: Vec<String> = ORACLE_ASSETS.iter().map(|(s, _)| (*s).to_owned()).collect();
+    let mut g = outlayer_desk();
+    call_with_gas_by(owner(), Gas::from_tgas(300));
+    let start = near_sdk::env::used_gas().as_gas();
+    g.refresh_prices(all.clone()).detach();
+    let attached = REQUEST_PRICE_DATA_GAS.as_gas() + ON_PRICES_GAS.as_gas();
+    let refresh = near_sdk::env::used_gas().as_gas() - start - attached;
+    assert_eq!(
+        calls_with_deposits()[0].2["asset_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        7
+    );
+
+    let mut g = outlayer();
+    let prices: Vec<Value> = ORACLE_ASSETS
+        .iter()
+        .map(|(_, id)| json!({ "asset_id": id, "price": { "multiplier": "113703000000", "decimals": 8 } }))
+        .collect();
+    let answer = json!({
+        "timestamp": ANSWER_NS.to_string(),
+        "recency_duration_sec": 90,
+        "prices": prices,
+    });
+    let refs: Vec<&str> = all.iter().map(String::as_str).collect();
+    assert!(on_prices_with(&mut g, successful(&answer), &refs));
+    let stored = near_sdk::env::used_gas().as_gas();
+    assert_eq!(g.prices().len(), 7);
+    println!(
+        "seven symbols, mock gas (TGas): refresh_prices {:.2}, on_prices {:.2}",
+        refresh as f64 / TGAS as f64,
+        stored as f64 / TGAS as f64
+    );
+    assert!(
+        refresh + 3 * TGAS <= REFRESH_PRICES_GAS.as_gas(),
+        "refresh_prices: {refresh}"
+    );
+    assert!(3 * stored <= ON_PRICES_GAS.as_gas(), "on_prices: {stored}");
 }
 
 #[test]

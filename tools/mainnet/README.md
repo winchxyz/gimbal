@@ -192,6 +192,12 @@ Hyperliquid index and szDecimals, Phoenix orderbook, lot and tick, and Orderly `
 20 USD per leg, a 100 bps price band, a 900 s oracle age, a 20 USD per hour rescue cap, transfer cost at most
 300 bps / 1 USD, and nothing unpriced.
 
+`node tools/mainnet/policy.mjs --final` does the same for the final contract, whose oracle assets add XLM
+(OutLayer id `xlm`) and ZEC (`zec.omft.near`), against `tools/mainnet-final-policy.json`, with the same limits.
+Phoenix lists both; Orderly lists `PERP_ZEC_USDC` but not `PERP_XLM_USDC` (only `PERP_XLM_USDC_mythos`, another
+market), so the final policy trades XLM on Hyperliquid and Phoenix only. The prices step of `checks.mjs` refreshes
+the oracle assets the desk's own policy trades, so it never asks the canary for XLM or ZEC.
+
 Why 300 bps / 1 USD: the contract refuses a 1Click quote whose `amountIn - minAmountOut` is over
 max(`amountIn` x `max_transfer_cost_bps`, `max_transfer_cost_flat_e6`). That gap is 1Click's fee plus the
 slippage room, and `fund_venue` itself needs at least 0.5 % of room. Measured on mainnet quotes: 20 USDC from

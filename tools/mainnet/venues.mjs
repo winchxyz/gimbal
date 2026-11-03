@@ -1,9 +1,11 @@
-// Live mainnet market data for the canary policy: Hyperliquid's perp meta (asset index, szDecimals), Phoenix's
-// market configs (orderbook, base lot, tick) and Orderly's symbol list. Public reads, no keys. The policy the
-// contract stores is checked against them here, so a wrong index or orderbook is refused before it is signed.
+// Live mainnet market data for the canary and final policies: Hyperliquid's perp meta (asset index, szDecimals),
+// Phoenix's market configs (orderbook, base lot, tick) and Orderly's symbol list. Public reads, no keys. The policy
+// the contract stores is checked against them here, so a wrong index or orderbook is refused before it is signed.
 
-/** The contract's oracle assets (contract/core/src/oracle.rs), in the canary policy's order. */
+/** The canary contract's oracle assets (its deployed code's ORACLE_ASSETS), in the canary policy's order. */
 export const CANARY_SYMBOLS = ['BTC', 'ETH', 'SOL', 'DOGE', 'LTC'];
+/** The final contract's oracle assets (contract/core/src/oracle.rs ORACLE_ASSETS), in the final policy's order. */
+export const FINAL_SYMBOLS = [...CANARY_SYMBOLS, 'XLM', 'ZEC'];
 
 export const HL_API = 'https://api.hyperliquid.xyz';
 export const PHOENIX_API = 'https://perp-api.phoenix.trade';
@@ -109,7 +111,10 @@ export function phoenixUnits(baseLotsDecimals, tickSize) {
   return { base_lot_e8: Number(base), tick_e8: Number(tick) };
 }
 
-/** The canary policy from live data: every oracle asset on Hyperliquid, and on Phoenix and Orderly where listed. */
+/**
+ * A policy from live data with the canary's limits: every one of `symbols` (oracle assets) on Hyperliquid, and on
+ * Phoenix and Orderly where listed (Orderly as PERP_<X>_USDC exactly).
+ */
 export function buildPolicy(live, symbols = CANARY_SYMBOLS) {
   const hl_assets = symbols.map((s) => {
     const a = live.hl.find((x) => x.symbol === s && !x.delisted);

@@ -2,20 +2,23 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { CANARY_POLICY_FILE, policyDiff } from './policy.mjs';
+import { CANARY_POLICY_FILE, FINAL_POLICY_FILE, policyDiff, policyTarget } from './policy.mjs';
 import {
-  CANARY_SYMBOLS, MAINNET_ORDERLY_BROKER, brokerIdProblem, buildPolicy, formatPolicy, livePolicyProblems, phoenixUnits, policyShapeProblems,
-  readLive,
+  CANARY_SYMBOLS, FINAL_SYMBOLS, MAINNET_ORDERLY_BROKER, brokerIdProblem, buildPolicy, formatPolicy, livePolicyProblems, phoenixUnits,
+  policyShapeProblems, readLive,
 } from './venues.mjs';
 
-// The venues' answers as recorded on mainnet 2026-10-31, cut to the fields the policy reads.
+// The venues' answers as recorded on mainnet 2026-10-31 (XLM and ZEC 2026-11-03), cut to the fields the policy reads.
+const HL_FIRST = [
+  { szDecimals: 5, name: 'BTC' }, { szDecimals: 4, name: 'ETH' }, { szDecimals: 1, name: 'ATOM' }, { szDecimals: 1, name: 'MATIC', isDelisted: true },
+  { szDecimals: 1, name: 'DYDX' }, { szDecimals: 2, name: 'SOL' }, { szDecimals: 1, name: 'AVAX' }, { szDecimals: 1, name: 'BNB' },
+  { szDecimals: 1, name: 'APE', isDelisted: true }, { szDecimals: 1, name: 'OP' }, { szDecimals: 2, name: 'LTC' }, { szDecimals: 1, name: 'ARB' },
+  { szDecimals: 0, name: 'DOGE' },
+];
+// XLM is Hyperliquid's asset 154 and ZEC 214; the perps between them are fillers here.
+const filler = (from, to) => Array.from({ length: to - from }, (_, i) => ({ szDecimals: 1, name: `FILL${from + i}` }));
 const HL_META = {
-  universe: [
-    { szDecimals: 5, name: 'BTC' }, { szDecimals: 4, name: 'ETH' }, { szDecimals: 1, name: 'ATOM' }, { szDecimals: 1, name: 'MATIC', isDelisted: true },
-    { szDecimals: 1, name: 'DYDX' }, { szDecimals: 2, name: 'SOL' }, { szDecimals: 1, name: 'AVAX' }, { szDecimals: 1, name: 'BNB' },
-    { szDecimals: 1, name: 'APE', isDelisted: true }, { szDecimals: 1, name: 'OP' }, { szDecimals: 2, name: 'LTC' }, { szDecimals: 1, name: 'ARB' },
-    { szDecimals: 0, name: 'DOGE' },
-  ],
+  universe: [...HL_FIRST, ...filler(13, 154), { szDecimals: 0, name: 'XLM' }, ...filler(155, 214), { szDecimals: 2, name: 'ZEC' }],
 };
 const PHOENIX = [
   { symbol: 'SOL', marketPubkey: '71Si24E4uc3oCaPbPZTozC1ptSNNqygjjebxSmErSsC2', baseLotsDecimals: 2, tickSize: 100, marketStatus: 'active' },
@@ -23,8 +26,17 @@ const PHOENIX = [
   { symbol: 'BTC', marketPubkey: 'AXFz1MuzMUBHi5UKJuK3FDCQ73o3rSzubGU2mPr4LLU7', baseLotsDecimals: 4, tickSize: 100, marketStatus: 'active' },
   { symbol: 'LTC', marketPubkey: 'HFYNBdwXP1BrnD7eLx7B3NGHi3VqEHdTkQH9FhEUFa8n', baseLotsDecimals: 2, tickSize: 10, marketStatus: 'active' },
   { symbol: 'DOGE', marketPubkey: 'Hqt5Vom5L3X3RcKysKnBmLAvjYgo6TGAwoheW658h5cz', baseLotsDecimals: 0, tickSize: 1, marketStatus: 'active' },
+  { symbol: 'XLM', marketPubkey: 'AXewQALSfgppjhfsZ6w5pqV7wNR5ShDRXPPTy7yx7yuE', baseLotsDecimals: 0, tickSize: 10, marketStatus: 'active' },
+  { symbol: 'ZEC', marketPubkey: 'FTbbqCP2N2NkUHw1nMPpBhiQCrYGiMQAhK7g1G8NJKEt', baseLotsDecimals: 2, tickSize: 100, marketStatus: 'active' },
 ];
-const ORDERLY = { success: true, data: { rows: ['PERP_BTC_USDC', 'PERP_ETH_USDC', 'PERP_SOL_USDC', 'PERP_DOGE_USDC', 'PERP_LTC_USDC', 'PERP_XRP_USDC'].map((symbol) => ({ symbol })) } };
+// Orderly lists ZEC as PERP_ZEC_USDC but XLM only as PERP_XLM_USDC_mythos, which is not the PERP_<X>_USDC market.
+const ORDERLY = {
+  success: true,
+  data: {
+    rows: ['PERP_BTC_USDC', 'PERP_ETH_USDC', 'PERP_SOL_USDC', 'PERP_DOGE_USDC', 'PERP_LTC_USDC', 'PERP_XRP_USDC', 'PERP_ZEC_USDC', 'PERP_XLM_USDC_mythos']
+      .map((symbol) => ({ symbol })),
+  },
+};
 
 const fakeFetch = async (url) => {
   const body = url.includes('hyperliquid') ? HL_META : url.includes('phoenix') ? PHOENIX : url.includes('orderly') ? ORDERLY : null;
@@ -77,6 +89,29 @@ test('tools/mainnet-canary-policy.json is the policy built from the recorded dat
   assert.deepEqual(livePolicyProblems(file, live), []);
   assert.deepEqual(policyDiff(buildPolicy(live), file), []);
   assert.equal(readFileSync(CANARY_POLICY_FILE, 'utf8'), formatPolicy(file));
+});
+
+test('the final policy: the seven oracle assets with the canary limits; XLM on Hyperliquid and Phoenix only', () => {
+  assert.deepEqual(FINAL_SYMBOLS, ['BTC', 'ETH', 'SOL', 'DOGE', 'LTC', 'XLM', 'ZEC']);
+  assert.deepEqual(policyTarget(false).symbols, CANARY_SYMBOLS);
+  assert.deepEqual(policyTarget(true), { name: 'final', symbols: FINAL_SYMBOLS, rel: 'tools/mainnet-final-policy.json', file: FINAL_POLICY_FILE });
+  const p = buildPolicy(live, FINAL_SYMBOLS);
+  assert.deepEqual(p.hl_assets.slice(5), [{ index: 154, symbol: 'XLM', sz_decimals: 0 }, { index: 214, symbol: 'ZEC', sz_decimals: 2 }]);
+  assert.deepEqual(p.phoenix_markets.slice(5), [
+    { symbol: 'XLM', orderbook: 'AXewQALSfgppjhfsZ6w5pqV7wNR5ShDRXPPTy7yx7yuE', base_lot_e8: 100_000_000, tick_e8: 1_000 },   // 1 XLM, $0.00001
+    { symbol: 'ZEC', orderbook: 'FTbbqCP2N2NkUHw1nMPpBhiQCrYGiMQAhK7g1G8NJKEt', base_lot_e8: 1_000_000, tick_e8: 1_000_000 },  // 0.01 ZEC, $0.01
+  ]);
+  assert.deepEqual(p.orderly_symbols, ['PERP_BTC_USDC', 'PERP_ETH_USDC', 'PERP_SOL_USDC', 'PERP_DOGE_USDC', 'PERP_LTC_USDC', 'PERP_ZEC_USDC']);
+  const { hl_assets, phoenix_markets, orderly_symbols, ...limits } = p;
+  const { hl_assets: _h, phoenix_markets: _p, orderly_symbols: _o, ...canaryLimits } = buildPolicy(live);
+  assert.deepEqual(limits, canaryLimits, 'the same limits as the canary');
+  assert.equal(hl_assets.length + phoenix_markets.length + orderly_symbols.length, 20);
+
+  const file = JSON.parse(readFileSync(FINAL_POLICY_FILE, 'utf8'));
+  assert.deepEqual(policyShapeProblems(file), []);
+  assert.deepEqual(livePolicyProblems(file, live), []);
+  assert.deepEqual(policyDiff(p, file), []);
+  assert.equal(readFileSync(FINAL_POLICY_FILE, 'utf8'), formatPolicy(file));
 });
 
 test('policy mismatch refusal: an index, szDecimals, orderbook, lot, tick or symbol that live data does not have', () => {
