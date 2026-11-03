@@ -77,7 +77,8 @@ test('evm_usdc_to_intents: the nonce rule and digest of eip3009.json, signed by 
   for (const k of v.cases.filter((x: { network: string }) => x.network === 'testnet')) {
     const c = new ReplayContractClient({
       config: { network: 'testnet', hlBuilder: '0x2222222222222222222222222222222222222222', hlBuilderTenthBps: 10 },
-      desks: { [k.desk_id]: testDesk() }, keys: { [k.desk_id]: { evm: v.keys.deskEvm.private_key } }, now: () => k.now_s * 1000,
+      // The vector's amounts are over a test policy's rescue cap, which this test is not about.
+      desks: { [k.desk_id]: testDesk({ policy: { ...testDesk().policy, rescue_cap_usd_per_hour: 1_000_000 } }) }, keys: { [k.desk_id]: { evm: v.keys.deskEvm.private_key } }, now: () => k.now_s * 1000,
     });
     const quote = { quote: { depositAddress: k.message.to, amountIn: k.message.value }, quote_signature: 'ed25519:test' };
     for (let i = 0n; i < BigInt(k.counter); i++) await c.evmUsdcToIntents(k.desk_id, quote, 'earlier');
@@ -150,4 +151,19 @@ test('the stand-in client_order_id is orderly.json\'s g<request_id> and fits Ord
   for (const e of rule.examples) assert.equal(standInClientOrderId(e.request_id), e.client_order_id);
   const long = standInClientOrderId(Number.MAX_SAFE_INTEGER);
   assert.ok(long.length <= ORDERLY_CLIENT_ORDER_ID_MAX, long);
+});
+
+test('the rescue cap meter: sol_sign_rescue, evm_usdc_to_intents and the operator hl_withdraw share one sliding hour', async () => {
+  let now = 1_800_000_000_000;
+  const c = new ReplayContractClient({
+    config: { network: 'testnet', hlBuilder: '0x2222222222222222222222222222222222222222', hlBuilderTenthBps: 10 },
+    desks: { alpha: testDesk({ policy: { ...testDesk().policy, rescue_cap_usd_per_hour: 20 } }) }, now: () => now,
+  });
+  const quote = (usdc: number) => ({ quote: { depositAddress: TEST_DEPOSIT_EVM, amountIn: String(usdc * 1e6) }, quote_signature: 'ed25519:test' });
+  await c.hlWithdraw('alpha', '12');
+  await assert.rejects(c.evmUsdcToIntents('alpha', quote(9), 'over'), (e: unknown) => e instanceof ContractRefusal && e.code === 'E_RESCUE_CAP');
+  await c.evmUsdcToIntents('alpha', quote(8), 'fits');
+  now += 30 * 60_000;   // half an hour: the 20 spent weighs 10
+  await c.hlWithdraw('alpha', '10');
+  await assert.rejects(c.hlWithdraw('alpha', '0.5'), /E_RESCUE_CAP/);
 });

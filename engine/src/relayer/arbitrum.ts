@@ -29,6 +29,7 @@ export const ARBITRUM_USDC: Record<ChainNetwork, { token: Hex; chain: Chain }> =
 export const USDC_EIP3009_ABI = parseAbi([
   'function transferWithAuthorization(address from, address to, uint256 value, uint256 validAfter, uint256 validBefore, bytes32 nonce, uint8 v, bytes32 r, bytes32 s)',
   'function authorizationState(address authorizer, bytes32 nonce) view returns (bool)',
+  'function balanceOf(address account) view returns (uint256)',
 ]);
 
 /** The EIP-3009 digest USDC verifies: domain "USD Coin" / "2" / chain / the token. */
@@ -99,6 +100,16 @@ export class ArbitrumSubmitter {
     } catch (err) {
       throw redactError(err, this.#rpcUrl);
     }
+  }
+
+  /** The USDC `address` holds on Arbitrum, × 1e6 (a rescue out of Hyperliquid waits for its withdraw here). */
+  async usdcBalance(address: string): Promise<bigint> {
+    return this.#safe(this.#public.readContract({ address: this.#token, abi: USDC_EIP3009_ABI, functionName: 'balanceOf', args: [address as Hex] }));
+  }
+
+  /** USDC's authorizationState: whether the EIP-3009 authorization `nonce` of `authorizer` was used. */
+  async authorizationUsed(authorizer: string, nonce: string): Promise<boolean> {
+    return this.#safe(this.#public.readContract({ address: this.#token, abi: USDC_EIP3009_ABI, functionName: 'authorizationState', args: [authorizer as Hex, nonce as Hex] }));
   }
 
   /** Checks, submits and confirms one authorization from the desk at `deskAddress`. */

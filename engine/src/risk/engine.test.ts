@@ -167,7 +167,7 @@ test('stress is refused on mainnet, and with no leg to stress', async () => {
 });
 
 /** An engine on a clock the test moves, with a rescuer that records the triggers. */
-function rig(options: { adl?: AdlWatch; desk?: Desk; rescuer?: (x: RescueTrigger) => void; source?: DeskSource } = {}) {
+function rig(options: { adl?: AdlWatch; desk?: Desk; rescuer?: (x: RescueTrigger) => void; source?: DeskSource; running?: () => string | null } = {}) {
   let t = 1_000_000;
   const events: StreamEvent[] = [];
   const triggers: RescueTrigger[] = [];
@@ -175,6 +175,7 @@ function rig(options: { adl?: AdlWatch; desk?: Desk; rescuer?: (x: RescueTrigger
   const risk = new RiskEngine({
     mode: 'testnet', source: options.source ?? desk, strategy: () => DEFAULT_STRATEGY, health: new VenueHealth(), publish: (e) => events.push(e),
     clock: { now: () => t }, rescuer: (x) => { triggers.push(x); options.rescuer?.(x); }, ...(options.adl !== undefined ? { adl: options.adl } : {}),
+    ...(options.running !== undefined ? { rescuerRunning: options.running } : {}),
   });
   const journal = () => events.filter((e) => e.type === 'journal').map((e) => e.data as JournalEntry);
   const health = () => events.filter((e) => e.type === 'health').map((e) => e.data as HealthMap);
@@ -457,4 +458,30 @@ test('POST /stress on mainnet: 403 with the reason, nothing stressed', async () 
     assert.equal((await call('POST', '{"on":true}', { 'content-type': 'application/json' })).status, 403);
     assert.equal(server.state().desk, null);
   });
+});
+
+test('a rescue the rescuer is still running never lapses; its late end still counts', async () => {
+  const desk = new Desk();
+  desk.hlMargin = 150;
+  desk.phoenixMargin = 1000;
+  let running: string | null = null;
+  const { risk, triggers, advance } = rig({ desk, running: () => running });
+  await risk.tick();
+  assert.equal(triggers.length, 1);
+  running = triggers[0]!.id;
+  // A real rescue (reserve -> Hyperliquid, or out of Hyperliquid through Arbitrum) can outlast RESCUE_LAPSE_MS.
+  advance(RESCUE_LAPSE_MS + RESCUE_RETRY_MS * 4);
+  await risk.tick();
+  assert.equal(triggers.length, 1, 'not lapsed while it runs');
+  // It lands late: the leg starts afresh (attempt 0), not as a retry of a lapsed one.
+  risk.rescueEnded(running, true);
+  running = null;
+  await risk.tick();
+  assert.equal(triggers.length, 2);
+  assert.equal(triggers[1]!.attempt, 0);
+  // Once nothing runs it, a rescue with no end reported lapses as before.
+  advance(RESCUE_LAPSE_MS + RESCUE_RETRY_MS);
+  await risk.tick();
+  assert.equal(triggers.length, 3);
+  assert.equal(triggers[2]!.attempt, 1);
 });

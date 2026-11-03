@@ -8,7 +8,8 @@
 //   - `rescue`: a RescueProgress at step `detect` for each rescue trigger, unless a rescuer (E9) takes the trigger.
 //
 // Rescue triggers are per leg. A leg that reaches rescue is triggered once; while it stays in rescue it is triggered
-// again only when its rescue failed (rescueEnded(id, false)) or lapsed (no end reported within RESCUE_LAPSE_MS), after
+// again only when its rescue failed (rescueEnded(id, false)) or lapsed (no end reported within RESCUE_LAPSE_MS while the
+// rescuer is not running it: a real rescue can outlast the lapse, and its end then counts), after
 // a backoff of RESCUE_RETRY_MS doubling up to RESCUE_RETRY_MAX_MS. A leg that leaves rescue starts afresh.
 //
 // The ADL check runs beside the reads, never inside them: its response trades (an MPC signature can take 120 s, a
@@ -122,6 +123,8 @@ export interface RiskEngineOptions {
   adl?: AdlWatch;
   /** E9: takes a trigger and runs the rescue, then calls rescueEnded. Without it the trigger is published at `detect`. */
   rescuer?: (trigger: RescueTrigger) => void;
+  /** E9: the id of the rescue the rescuer is running now; a running rescue never lapses (a real one can take 10 min). */
+  rescuerRunning?: () => string | null;
   log?: (line: string) => void;
 }
 
@@ -148,6 +151,7 @@ export class RiskEngine {
   readonly #rescues = new Map<string, LegRescue>();
   #views: LegView[] = [];
   #desk: DeskState | null = null;
+  #failure: DeskState['rescueFailure'] = null;
   #stress: { key: string; rescuePct: number; at: number } | null = null;
   #seq = 0;
   #timer: ReturnType<typeof setTimeout> | undefined;
@@ -173,6 +177,22 @@ export class RiskEngine {
   /** The running ADL check, if any (tests wait on it). */
   get adlRunning(): Promise<void> | null {
     return this.#adlRun;
+  }
+
+  /** E9: the legs and each leg venue's free margin, as last read (the rescue plans its sources on them). */
+  legView(): { legs: Leg[]; freeMargin: Partial<Record<VenueId, number>> } {
+    const freeMargin: Partial<Record<VenueId, number>> = {};
+    for (const v of this.#views) freeMargin[v.leg.venue] = v.freeMarginUsd;
+    return { legs: this.#views.map((v) => v.leg), freeMargin };
+  }
+
+  /** E9: a rescue failed and the owner must act (null: it landed). Shown in DeskState until no leg is in rescue. */
+  setRescueFailure(f: DeskState['rescueFailure']): void {
+    this.#failure = f;
+    if (this.#desk !== null) {
+      this.#desk = { ...this.#desk, rescueFailure: f };
+      this.#o.publish({ type: 'desk', data: this.#desk });
+    }
   }
 
   /** The lines each leg was last judged by. */
@@ -374,7 +394,8 @@ export class RiskEngine {
       pnl: { fundingUsd, feesUsd, priceUsd, netUsd: fundingUsd + feesUsd + priceUsd },
       health: worst(views.map((v) => v.level)),
       paused: snap.paused,
-      rescueFailure: this.#desk?.rescueFailure ?? null,
+      // A failure stays shown while a leg is in rescue; once none is, margin is safe again and it clears.
+      rescueFailure: views.some((v) => v.level === 'rescue') ? this.#failure : (this.#failure = null),
       updatedAt: t,
     };
   }
@@ -395,7 +416,9 @@ export class RiskEngine {
         continue;
       }
       const backoff = Math.min(RESCUE_RETRY_MAX_MS, RESCUE_RETRY_MS * 2 ** r.attempt);
-      const ended = r.endedAt ?? (t - r.trigger.at >= RESCUE_LAPSE_MS ? r.trigger.at + RESCUE_LAPSE_MS : null);
+      // Lapsed: no end reported in time, and the rescuer is not still running it (it reports its end when it ends).
+      const lapsed = t - r.trigger.at >= RESCUE_LAPSE_MS && (this.#o.rescuerRunning?.() ?? null) !== r.trigger.id;
+      const ended = r.endedAt ?? (lapsed ? r.trigger.at + RESCUE_LAPSE_MS : null);
       if (ended !== null && t >= ended + backoff) {
         this.#log(`rescue ${r.trigger.id} of ${k} ${r.endedAt === null ? 'lapsed (no end reported)' : 'failed'}; the leg is still in rescue: again`);
         this.#fire(v, views, t, r.attempt + 1);

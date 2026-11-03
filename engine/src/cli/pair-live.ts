@@ -162,8 +162,11 @@ async function run(): Promise<void> {
     values.fail === 'hyperliquid' ? failing(hl) : hl,
     values.fail === 'orderly' ? failing(orderly) : orderly,
   ];
+  // panic_close: a desk that get_desk shows closing takes no open, only the reduce-only close (read again before the open).
+  const closingNote = (d: { closing?: boolean } | null) => (d?.closing === true ? 'the desk is closing (panic_close): only reduce-only closes go out' : null);
+  let closing = closingNote(desk);
   trader = new PairTrader({
-    legs, log, priceBandBps: desk.policy.price_band_bps,
+    legs, log, priceBandBps: desk.policy.price_band_bps, openBlocked: () => closing,
     // An alert the watch raises, or raises again (an order with no answer whose window ended), reaches the operator.
     onWatch: (w) => {
       if (w.status === 'unhedged') alert(`watch: ${w.notes.join('; ')}`);
@@ -188,6 +191,7 @@ async function run(): Promise<void> {
     await finish(hl, stream, watchedTrader);
     return;
   }
+  closing = closingNote(await client.getDesk(live.cfg.deskId));
   log(`open ${values.size} ETH: long ${values.long}${values.fail === undefined ? '' : `, ${values.fail} forced to fail`}`);
   const opened = await trader.open({ size: values.size!, longIndex, reason: `pair-live: open ${values.size} ETH, long ${values.long}` });
   print('open', opened);

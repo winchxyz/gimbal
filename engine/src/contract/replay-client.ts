@@ -110,6 +110,7 @@ export class ReplayContractClient implements ContractClient {
   readonly #keys: Record<string, ReplayKeys>;
   readonly #now: () => number;
   readonly #hlNonces = new Map<string, number>();
+  readonly #rescueSpent = new Map<string, { e8: bigint; at: number }>();
   readonly #evmCounters = new Map<string, bigint>();
   #requestId = 0;
   /** Every action method call, in order: what a test asserts on. */
@@ -223,6 +224,18 @@ export class ReplayContractClient implements ContractClient {
     }, nonce);
   }
 
+  /** withdraw3 to the desk's own EVM address; allowed on a paused desk (it reduces nothing, but a rescue needs it). */
+  async hlWithdraw(deskId: string, amount: string): Promise<HlSignedAction> {
+    this.calls.push({ method: 'hl_withdraw', args: { desk_id: deskId, amount } });
+    const desk = this.#gate(deskId, 'reduces-risk');
+    // The operator's hl_withdraw counts against the hourly rescue cap, as the contract counts it (C9).
+    this.#countRescue(deskId, desk, checkUsdcAmount(amount), 'hl_withdraw');
+    const nonce = this.#hlNonce(deskId);
+    return this.#hlUser(deskId, 'withdraw3', {
+      type: 'withdraw3', signatureChainId: HL_SIGNATURE_CHAIN_ID, hyperliquidChain: this.#hlChain(), destination: desk.evm_address.toLowerCase(), amount, time: nonce,
+    }, nonce);
+  }
+
   /** sendAsset to the quote's deposit address; the 1Click quote signature is not verified in replay. */
   async hlSendToIntents(deskId: string, quote: SignedQuote, reason: string): Promise<HlSignedAction> {
     this.calls.push({ method: 'hl_send_to_intents', args: { desk_id: deskId, quote, reason } });
@@ -258,7 +271,7 @@ export class ReplayContractClient implements ContractClient {
     this.calls.push({ method: 'sol_sign_rescue', args: { desk_id: deskId, message_b64: messageB64, quote, reason } });
     const desk = this.#gate(deskId, 'reduces-risk');
     checkReason(reason);
-    quoteFields(quote);
+    this.#countRescue(deskId, desk, BigInt(quoteFields(quote).amountIn) * 100n, 'sol_sign_rescue');
     return this.#sol(deskId, desk, 'rescue', messageB64, 1);
   }
 
@@ -330,6 +343,7 @@ export class ReplayContractClient implements ContractClient {
     const desk = this.#gate(deskId, 'reduces-risk');
     checkReason(reason);
     const q = quoteFields(quote);
+    this.#countRescue(deskId, desk, BigInt(q.amountIn) * 100n, 'evm_usdc_to_intents');
     const counter = this.#evmCounters.get(deskId) ?? 0n;
     this.#evmCounters.set(deskId, counter + 1n);
     const usdc = USDC_ARBITRUM[this.#config.network];
@@ -365,6 +379,19 @@ export class ReplayContractClient implements ContractClient {
   }
 
   // ---- internals ----
+
+  /** The contract's hourly rescue meter: what was spent decays linearly over an hour (rescue.rs DeskCounters). */
+  #countRescue(deskId: string, desk: DeskView, amountE8: bigint, method: string): void {
+    const now = this.#now();
+    const cap = BigInt(Math.round(desk.policy.rescue_cap_usd_per_hour * 1e6)) * 100n;
+    const prev = this.#rescueSpent.get(deskId);
+    const left = prev === undefined ? 0n : BigInt(Math.max(0, 3_600_000 - (now - prev.at)));
+    const spent = prev === undefined ? 0n : (prev.e8 * left) / 3_600_000n;
+    if (spent + amountE8 > cap) {
+      throw new ContractRefusal('E_RESCUE_CAP', `${method} of ${amountE8} (USD × 1e8) is over what is left of the hourly rescue cap (${cap - spent})`);
+    }
+    this.#rescueSpent.set(deskId, { e8: spent + amountE8, at: now });
+  }
 
   #desk(deskId: string): DeskView {
     checkDeskId(deskId);
@@ -539,7 +566,9 @@ function checkOrderlyTimestamp(field: string, timestamp: number, blockMs: number
 }
 
 function quoteFields(quote: SignedQuote): { depositAddress: string; amountIn: string } {
-  const q = (quote.quote ?? {}) as { quote?: { depositAddress?: unknown; amountIn?: unknown }; depositAddress?: unknown; amountIn?: unknown };
+  // The contract takes the canonical JSON string 1Click signed; older callers pass the object.
+  const raw = typeof quote.quote === 'string' ? (() => { try { return JSON.parse(quote.quote as string) as unknown; } catch { return {}; } })() : quote.quote;
+  const q = (raw ?? {}) as { quote?: { depositAddress?: unknown; amountIn?: unknown }; depositAddress?: unknown; amountIn?: unknown };
   const inner = (q.quote ?? q) as { depositAddress?: unknown; amountIn?: unknown };
   if (typeof inner.depositAddress !== 'string' || typeof inner.amountIn !== 'string' || !/^\d+$/.test(inner.amountIn)) {
     throw new ContractRefusal('E_QUOTE_FIELDS', 'the quote has no depositAddress or amountIn');

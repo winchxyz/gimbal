@@ -229,6 +229,11 @@ export class NearContractClient implements ContractClient {
     return this.#signed('hl_usd_class_transfer', () => ({ desk_id: deskId, amount, to_perp: toPerp, reason }), 'never', deskId);
   }
 
+  // Money out of Hyperliquid: never retried (a second withdraw3 could be posted while the first may still land).
+  hlWithdraw(deskId: string, amount: string): Promise<HlSignedAction> {
+    return this.#signed('hl_withdraw', () => ({ desk_id: deskId, amount }), 'never', deskId);
+  }
+
   hlSendToIntents(deskId: string, quote: SignedQuote, reason: string): Promise<HlSignedAction> {
     return this.#signed('hl_send_to_intents', () => ({ desk_id: deskId, quote: quote.quote, quote_signature: quote.quote_signature, reason }), 'never', deskId);
   }
@@ -302,7 +307,9 @@ export class NearContractClient implements ContractClient {
       if (d === null) throw new Error(`fund_venue: the contract has no desk ${deskId}`);
       return BigInt(String(d.ledger.idle_usdc));
     };
-    const amountIn = String((quote.quote as { amountIn?: unknown } | null)?.amountIn ?? '');
+    // The contract takes `quote` as the canonical JSON string 1Click signed; an object is read as is.
+    const fields = typeof quote.quote === 'string' ? (JSON.parse(quote.quote) as unknown) : quote.quote;
+    const amountIn = String((fields as { amountIn?: unknown } | null)?.amountIn ?? '');
     if (!/^[1-9]\d*$/.test(amountIn)) throw new Error('fund_venue: the quote has no amountIn');
     const before = await idle();
     const r = await this.#call('fund_venue', () => ({ desk_id: deskId, quote: quote.quote, quote_signature: quote.quote_signature, reason }), 'never');
