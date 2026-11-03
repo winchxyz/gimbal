@@ -34,9 +34,10 @@
 // held by a PairTrader whose orders are all reduce-only: panic_close closes both legs, a rescue's reduce makes both
 // smaller, a confirmed ADL pauses the pair and unwinds both (risk/adl.ts). It trades only with GIMBAL_TRADE=1 (the
 // operator key, the per-desk lock, never in a linked worktree, never with --once); otherwise it only alerts.
-// GIMBAL_TRADER_FRESH=<contract>/<desk> starts its state anew from the venues' positions, for one start (a missing
-// state file is not a fresh start). On SIGINT or SIGTERM serve waits up to SHUTDOWN_WAIT_MS for a close in flight
-// (panic_close, a rescue's reduce, an ADL unwind) before it releases the lock and exits.
+// GIMBAL_TRADER_FRESH=<contract>/<desk> starts its state anew from the venues' positions when the state file is
+// missing or unusable (a missing file is not a fresh start without it; a usable file is always used). On SIGINT or
+// SIGTERM serve waits up to SHUTDOWN_WAIT_MS, in all, for the risk engine and a close in flight (panic_close, a
+// rescue's reduce, an ADL unwind) before it releases the lock and exits.
 // The monitor (src/risk/monitor.ts): every 30 min the legs, their distance to liquidation and the net; an alert to the
 // journal and the console when a leg is under 25 % from liquidation. `npm run monitor -w engine -- --mainnet` is the
 // one-shot form.
@@ -389,14 +390,23 @@ async function shutdown(reason: string): Promise<void> {
   clearInterval(intentsTimer);
   clearInterval(monitorTimer);
   // No new trigger or desk read after this; a close already running (panic_close, a rescue's reduce, an ADL unwind)
-  // is waited for, bounded, before the lock is released: pair-mainnet must not start next to it.
-  await risk?.stop();
-  if (pair?.pair?.closing === true || closingWatch?.current != null) {
+  // is waited for, bounded, before the lock is released: pair-mainnet must not start next to it. One deadline covers
+  // it all: risk.stop() (it waits for an ADL attempt that is running) and the closes.
+  const deadline = new Promise<false>((r) => setTimeout(() => r(false), SHUTDOWN_WAIT_MS).unref());
+  if (pair?.pair?.closing === true || closingWatch?.current != null || risk?.adlRunning != null) {
     log(`stopping: waiting up to ${SHUTDOWN_WAIT_MS / 1000} s for the close in flight before the trader lock is released`);
   }
   const drained = await Promise.race([
-    Promise.allSettled([closingWatch?.current ?? Promise.resolve(), pair?.drain(SHUTDOWN_WAIT_MS) ?? Promise.resolve(true)]).then(() => pair?.pair?.closing !== true),
-    new Promise<boolean>((r) => setTimeout(() => r(false), SHUTDOWN_WAIT_MS).unref()),
+    (async () => {
+      try {
+        await risk?.stop();
+      } catch (err) {
+        log(`stopping: the risk engine stopped with an error (${err instanceof Error ? err.message : String(err)})`);
+      }
+      await Promise.allSettled([closingWatch?.current ?? Promise.resolve(), pair?.drain(SHUTDOWN_WAIT_MS) ?? Promise.resolve(true)]);
+      return pair?.pair?.closing !== true;
+    })(),
+    deadline,
   ]);
   if (!drained) log(`stopping: a close is still running after ${SHUTDOWN_WAIT_MS / 1000} s; exiting anyway: its orders are saved as in flight (the next start only alerts on ADL until a close result); check both legs by hand`);
   pair?.stop();

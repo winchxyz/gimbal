@@ -472,7 +472,7 @@ export function acquireTraderLock(path: string, options: { onExit?: boolean } = 
         continue;      // removed meanwhile: try again
       }
       const pid = /^\d+$/.test(text) ? Number(text) : null;
-      if (pid === null) throw new Error(`the trader lock ${path} holds no pid (${JSON.stringify(text.slice(0, 40))}): another process may be taking it now, so it counts as held; if no serve or pair-mainnet runs for this desk, remove it`);
+      if (pid === null) throw new Error(`the trader lock ${path} holds no pid (${JSON.stringify(text.slice(0, 40))}): another process may be taking it now, so it counts as held; if no serve or pair-mainnet runs for this desk, delete this file and start again (tools/mainnet/README.md, "Clear a lock file")`);
       if (pid === process.pid || alive(pid)) throw new Error(`another process (pid ${pid}) trades this desk and holds ${path}: one trader per desk; stop it first`);
       try {
         unlinkSync(path);       // stale: its process is gone

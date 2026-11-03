@@ -16,7 +16,7 @@ import { qtyString, toQty } from './lots.ts';
 import { PairTrader } from './pair.ts';
 import type { PairTraderState } from './pair.ts';
 import type { OutgoingOrder } from './protected-pair.ts';
-import { GuardedLeg, InFlightBook, ProtectedPair, startPlan } from './protected-pair.ts';
+import { GuardedLeg, IN_FLIGHT_LIFE_MS, InFlightBook, ProtectedPair, inFlightUnexplained, startPlan } from './protected-pair.ts';
 import type { InFlightOrder, LoadedTraderState, TraderFileState } from './trader-state.ts';
 import { TRADER_STATE_VERSION, TraderStateStore, acquireTraderLock, lockHolder, parseTraderState, traderStateFile, traderStateJson } from './trader-state.ts';
 
@@ -59,7 +59,8 @@ function traderState(baselines: [bigint | null, bigint | null], extra: Partial<P
 }
 
 const loaded = (s: TraderFileState): LoadedTraderState => ({ kind: 'loaded', state: { ...s, identity: ID } });
-const plan = (read: [bigint, bigint], saved: LoadedTraderState, fresh?: string) => startPlan({ symbol: 'XLM', read, saved, fresh, freshWant: FRESH, path: 'trader.json' });
+/** `now` 1 s after the flight() orders were signed by default: they can still run. */
+const plan = (read: [bigint, bigint], saved: LoadedTraderState, fresh?: string, now = 1_000) => startPlan({ symbol: 'XLM', read, saved, fresh, freshWant: FRESH, path: 'trader.json', now });
 
 // ---- the guarded legs ----
 
@@ -175,7 +176,7 @@ test('start: a missing state file is not a fresh start (alert only); GIMBAL_TRAD
   assert.equal(plan([0n, 0n], { kind: 'unusable', problem: 'broken' }, FRESH).stateOk, true, 'an unusable file can be started over');
 });
 
-test('(4) GIMBAL_TRADER_FRESH is refused over a usable state with an ADL event, a spent budget, unsettled or in-flight orders', () => {
+test('(B) GIMBAL_TRADER_FRESH applies only to a missing or unusable file: over any usable state it is ignored and the state restored', () => {
   const read: [bigint, bigint] = [toQty('-30'), toQty('50')];
   const base = traderState([toQty('-50'), toQty('50')]);
   const event = { at: 1, reference: [toQty('-50'), toQty('50')] as [bigint, bigint], seen: read, attempts: 1, nextAt: 2, alerted: false };
@@ -183,17 +184,35 @@ test('(4) GIMBAL_TRADER_FRESH is refused over a usable state with an ADL event, 
   const cases: [string, TraderFileState][] = [
     ['an ADL event in progress', fileState(base, { adl: { attemptsLeft: 2, paused: 'ADL', event } })],
     ['an ADL budget already spent in part', fileState(base, { adl: { attemptsLeft: 2, paused: null, event: null } })],
-    ['leg\\(s\\) with an order that may still run', fileState(traderState([toQty('-50'), toQty('50')], { unsettled: [{ index: 0, refs: [ref], until: 10, from: toQty('-50'), unwind: null }] }))],
-    ['order\\(s\\) in flight when the engine stopped', fileState(base, { inFlight: [flight()] })],
+    ['an order that may still run', fileState(traderState([toQty('-50'), toQty('50')], { unsettled: [{ index: 0, refs: [ref], until: 10, from: toQty('-50'), unwind: null }] }))],
+    ['orders in flight', fileState(base, { inFlight: [flight()] })],
+    ['nothing a restart must keep (a clean save)', fileState(base)],
   ];
   for (const [what, state] of cases) {
     const p = plan(read, loaded(state), FRESH);
-    assert.match(p.notes[0] ?? '', new RegExp(`GIMBAL_TRADER_FRESH is refused: trader.json holds .*${what}`));
+    assert.equal(p.notes[0], 'GIMBAL_TRADER_FRESH is ignored: trader.json is a usable trader state and is used as saved (a fresh start applies only when the file is missing or unusable); remove GIMBAL_TRADER_FRESH from the env', what);
     assert.equal(p.adopt, null, `${what}: the saved state is restored, not the venues adopted`);
-    assert.deepEqual(p.restore?.baselines, [toQty('-50'), toQty('50')]);
+    assert.deepEqual(p.restore?.baselines, [toQty('-50'), toQty('50')], what);
   }
-  const clean = plan(read, loaded(fileState(base)), FRESH);
-  assert.deepEqual(clean.adopt, read, 'a usable state with nothing a restart must keep may be started over');
+});
+
+test('(B) a shrink that happened while serve was down, FRESH left set: the baselines are restored and the ADL watch starts its normal path', async () => {
+  const read: [bigint, bigint] = [toQty('-30'), toQty('50')];
+  const p = plan(read, loaded(fileState(traderState([toQty('-50'), toQty('50')]))), FRESH);
+  assert.equal(p.adopt, null);
+  const s = pair(true);
+  s.trader.importState(p.restore!);
+  [s.hl.pos, s.px.pos] = read;
+  let reads = 0;
+  const position = s.hl.position.bind(s.hl);
+  s.hl.position = async () => { reads++; return position(); };
+  const adl = new AdlWatch(s.p, { hold: () => s.p.adlHold, sleep: async () => {}, confirmMs: 0 });
+  const r = await adl.check();
+  assert.notEqual(r?.stage, 'alert');
+  assert.ok(reads >= 2, 'two agreeing reads before anything is done');
+  assert.notEqual(adl.state.paused, null, 'the pair is paused');
+  assert.equal(adl.state.attemptsLeft, 2, 'and the unwind attempt went out');
+  assert.deepEqual([s.hl.pos, s.px.pos], [0n, 0n]);
 });
 
 test('(B) start: venues smaller than the saved baselines restore the baselines, so the ADL watch sees the shrink', () => {
@@ -224,7 +243,7 @@ test('(3) start: orders saved in flight restore the baselines with the ADL hold;
   assert.equal(p.stateOk, true);
   assert.deepEqual(p.restore?.baselines, [toQty('-50'), toQty('50')]);
   assert.equal(p.inFlight.length, 1);
-  assert.match(p.adlHold ?? '', /1 order\(s\) were in flight when the engine stopped \(hyperliquid BUY 20\).*ADL only alerts until a close result or an adopt/);
+  assert.match(p.adlHold ?? '', /1 order\(s\) were in flight when the engine stopped \(hyperliquid BUY 20\).*ADL only alerts until a close result or an adopt sets the baselines, or until they can no longer run \(1970-01-01T00:10:00\.000Z\) and serve settles them from the venues/);
   const same = plan([toQty('-50'), toQty('50')], saved);
   assert.notEqual(same.adlHold, null, 'as saved too: the order may still land');
   const flatNow = plan([0n, 0n], saved);
@@ -319,12 +338,85 @@ test('a close clamps stale targets between 0 and the position read when it runs:
   assert.deepEqual(s.hl.orders, [], 'hyperliquid -30 is not grown to -40');
   assert.deepEqual(s.px.orders.map((o) => [o.side, o.size]), [['SELL', toQty('10')]]);
   assert.match(r.notes.join(' '), /hyperliquid target -40 is past its position -30 read now \(toward zero only\): -30/);
+  // The clamped targets do not offset: the net is what they hold, and the open: lines say ADL only alerts now.
+  assert.equal(s.trader.net, toQty('-10'));
+  assert.match(s.p.openLines().join('\n'), /meant to hold hyperliquid -30 and phoenix 20, which do not offset each other \(a close clamped to the legs as read\): ADL only alerts until a close offsets them/);
   const t = pair(true);
   t.hl.pos = toQty('-30');
   t.px.pos = toQty('30');
   t.p.adopt([toQty('-30'), toQty('30')]);
   await t.p.close({ reason: 'stale', targets: [toQty('10'), toQty('-10')] });
   assert.deepEqual([t.hl.pos, t.px.pos], [0n, 0n], 'a target past zero stops at zero');
+});
+
+test('(A) inFlightUnexplained: a leg is explained by its baseline moved by none, some or all of its orders, each in full', () => {
+  const orders = [flight({ side: 'BUY', size: '10' }), flight({ side: 'BUY', size: '10' }), flight({ index: 1, venue: 'phoenix', side: 'SELL', size: '5' })];
+  const base: [bigint, bigint] = [toQty('-50'), toQty('50')];
+  for (const hl of ['-50', '-40', '-30']) assert.deepEqual(inFlightUnexplained(orders, base, [toQty(hl), toQty('45')]), [], hl);
+  assert.deepEqual(inFlightUnexplained(orders, base, [toQty('-50'), toQty('50')]), []);
+  assert.deepEqual(inFlightUnexplained(orders, base, [toQty('-35'), toQty('50')]), ['hyperliquid reads -35, but its saved baseline -50 with BUY 10, BUY 10 does not reach it']);
+  assert.deepEqual(inFlightUnexplained(orders, base, [toQty('-50'), toQty('40')]), ['phoenix reads 40, but its saved baseline 50 with SELL 5 does not reach it']);
+  assert.deepEqual(inFlightUnexplained([], [null, toQty('50')], [toQty('-50'), toQty('50')]), ['hyperliquid reads -50 and its saved baseline is unknown']);
+});
+
+test('(A) start: orders in flight that can no longer run are settled from the venues; explained reads are adopted, others keep the hold with what to run', () => {
+  const saved = (extra: Partial<TraderFileState> = {}) => loaded(fileState(traderState([toQty('-50'), toQty('50')]), { inFlight: [flight({ side: 'BUY', size: '20' })], ...extra }));
+  const old = IN_FLIGHT_LIFE_MS;
+  for (const hl of ['-30', '-50']) {
+    const p = plan([toQty(hl), toQty('50')], saved(), undefined, old);
+    assert.equal(p.stateOk, true);
+    assert.deepEqual(p.restore?.baselines, [toQty('-50'), toQty('50')], 'the saved state (ADL budget, unsettled) is kept');
+    assert.deepEqual([p.adopt, p.inFlight, p.adlHold], [[toQty(hl), toQty('50')], [], null], hl);
+    assert.match(p.notes.at(-1) ?? '', /signed more than 10 min ago and can no longer run; the venues read hyperliquid .*, as the saved baselines and those orders explain: adopted, the ADL hold ends/);
+  }
+  const off = plan([toQty('-40'), toQty('50')], saved(), undefined, old);
+  assert.equal(off.adopt, null);
+  assert.equal(off.inFlight.length, 1);
+  assert.match(off.adlHold ?? '', /1 order\(s\) were in flight when the engine stopped \(hyperliquid BUY 20\) and can no longer run, but hyperliquid reads -40, but its saved baseline -50 with BUY 20 does not reach it \(an ADL, a partial fill or a trade elsewhere\): ADL only alerts until the owner reconciles; /);
+  assert.match(off.adlHold ?? '', /check both legs \(npm run monitor -w engine -- --mainnet\); to close them: stop serve, then pair-mainnet close XLM --send, then start serve again; if the legs are right as they are: stop serve, move trader\.json aside, then start serve once with GIMBAL_TRADER_FRESH=gimbal-test\.near\/canary$/);
+  assert.match(off.notes.at(-1) ?? '', /^ADL hold: /);
+  const resting = plan([toQty('-30'), toQty('50')], saved({ pendingMaker: [{ cloid: '0xc', oid: 5, side: 'BUY', size: '1' }] }), undefined, old);
+  assert.match(resting.adlHold ?? '', /1 Hyperliquid post-only order\(s\) are not settled and may still fill/);
+  const young = plan([toQty('-30'), toQty('50')], saved(), undefined, old - 1);
+  assert.deepEqual([young.adopt, young.inFlight.length], [null, 1], 'one that can still run is not settled at start');
+});
+
+test('(A) resolveInFlight: once the orders can no longer run, explained reads are adopted; unexplained ones keep the hold with what to run', () => {
+  const restored = [flight({ side: 'BUY', size: '20' })];
+  const s = pair(true, { restored, adlHold: 'held' });
+  s.trader.importState(traderState([toQty('-50'), toQty('50')]));
+  const read: [bigint, bigint] = [toQty('-30'), toQty('50')];
+  const early = s.p.resolveInFlight(read, IN_FLIGHT_LIFE_MS - 1);
+  assert.equal(early?.again, true);
+  assert.equal(s.p.adlHold, 'held');
+  const done = s.p.resolveInFlight(read, IN_FLIGHT_LIFE_MS);
+  assert.equal(done?.again, false);
+  assert.match(done?.line ?? '', /as the saved baselines and those orders explain: adopted, the ADL hold ends/);
+  assert.deepEqual([s.p.adlHold, s.book.orders, s.trader.baseline(s.trader.legs[0])], [null, [], toQty('-30')]);
+  assert.equal(s.p.resolveInFlight(read, IN_FLIGHT_LIFE_MS), null, 'nothing left to settle');
+  const t = pair(true, { restored, adlHold: 'held' });
+  t.trader.importState(traderState([toQty('-50'), toQty('50')]));
+  const kept = t.p.resolveInFlight([toQty('-45'), toQty('50')], IN_FLIGHT_LIFE_MS);
+  assert.equal(kept?.again, false);
+  assert.match(t.p.adlHold ?? '', /can no longer run, but hyperliquid reads -45.*ADL only alerts until the owner reconciles; check both legs by hand$/);
+  assert.equal(t.book.orders.length, 1);
+});
+
+test('(C) stop() is final: a close and every guarded order are refused after it, nothing signed', async () => {
+  const s = pair(true);
+  s.hl.pos = toQty('-50');
+  s.px.pos = toQty('50');
+  s.p.adopt([toQty('-50'), toQty('50')]);
+  s.p.stop();
+  assert.equal(s.p.stopped, true);
+  await assert.rejects(s.p.close({ reason: 'rescue: reduce', targets: [toQty('-40'), toQty('40')] }), /^Error: serve is stopping and its trader lock is released: nothing is signed/);
+  let stopped = false;
+  const inner = new Leg('hyperliquid');
+  const leg = new GuardedLeg(inner, { index: 0, live: () => true, stopped: () => stopped, beforeSign: () => {} });
+  stopped = true;
+  const r = await leg.order('BUY', toQty('5'), true, 'rescue: reduce');
+  assert.match(r.kind === 'failed' ? r.error.message : '', /serve is stopping and its trader lock is released; nothing signed/);
+  assert.equal(inner.orders.length + s.hl.orders.length + s.px.orders.length, 0);
 });
 
 test('ProtectedPair.whenIdle waits for a close in flight, bounded', async () => {

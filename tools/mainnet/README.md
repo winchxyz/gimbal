@@ -913,6 +913,42 @@ node --env-file=... engine/src/cli/pair-mainnet.ts close ETH
   cannot see how the last one ended: after a run that ended with `open:` lines, reconcile both legs with `status`
   (and wait a few seconds after the last Phoenix order) before the next `open`.
 
+### Serve holding the pair
+
+Serve (`engine/src/cli/serve-pair.ts`, `docs/interfaces.md` "serve pair") holds the open pair with reduce-only
+closes only (panic_close, a rescue's reduce, the ADL unwind). It trades only with `GIMBAL_TRADE=1`, from the main
+checkout, never with `--once`, and holds the per-desk trader lock that `pair-mainnet --send` takes too: stop serve
+before any `pair-mainnet --send`.
+
+1. Check both legs: `npm run monitor -w engine -- --mainnet` (read-only).
+2. First start, no trader state file yet:
+   `GIMBAL_MODE=mainnet GIMBAL_TRADE=1 GIMBAL_TRADER_FRESH=<contract>/<desk> npm run serve -w engine`.
+   `GIMBAL_TRADER_FRESH` applies only when the state file is missing or unusable; over a usable file it is ignored
+   with a line saying so.
+3. Check the start lines: `live      TRADES (GIMBAL_TRADE=1)`, the `pair` line with the state file and the lock, and
+   no `ADL -> alert only` line.
+4. Remove `GIMBAL_TRADER_FRESH` from the env. Every later start:
+   `GIMBAL_MODE=mainnet GIMBAL_TRADE=1 npm run serve -w engine`.
+5. Stop with Ctrl-C: serve starts no new trigger, waits up to 180 s for the ADL attempt or close in flight, then
+   turns trading off and releases the lock.
+
+**Reconcile an ADL hold.** After a crash in the middle of a close, or a stop that passed 180 s, the state file still
+holds orders in flight and ADL only alerts. Serve settles them itself once they are 10 min old (at start, or on a
+timer): when both legs read their saved baselines moved by those orders, the reads are adopted and the hold ends. When
+they do not, the start line `ADL -> alert only: ... can no longer run, but <leg> reads ...` stays, and the owner:
+
+- checks both legs: `npm run monitor -w engine -- --mainnet`;
+- to close them: stops serve, runs `pair-mainnet close <SYM> --send`, starts serve again (the close result clears it);
+- if the legs are right as they are: stops serve, moves the trader state file aside (its path is on the `pair` start
+  line: `trader-mainnet-<contract>-<desk>-<evm>.json` in `GIMBAL_STATE_DIR`, default `%LOCALAPPDATA%/gimbal/state` or
+  `$XDG_STATE_HOME/gimbal`), then starts serve once with `GIMBAL_TRADER_FRESH=<contract>/<desk>` and removes it again.
+
+**Clear a lock file.** The lock is `locks/trader-mainnet-<contract>-<desk>.lock` in the per-user state directory
+(`%LOCALAPPDATA%/gimbal/state/locks/` or `$XDG_STATE_HOME/gimbal/locks/`). A lock whose process is gone is taken
+over by itself. When serve or `pair-mainnet --send` refuses with "the trader lock ... holds no pid" (an empty or
+partly written file, left by a crash while it was being made): check that no serve and no `pair-mainnet` runs for
+this desk (Task Manager or `ps`), then delete that one file and start again.
+
 ## Files the scripts write
 
 All of them are gitignored and are written in the main checkout only (never in a linked worktree). None is ever

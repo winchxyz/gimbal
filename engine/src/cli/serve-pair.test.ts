@@ -174,11 +174,13 @@ test('GIMBAL_TRADE=1 with the fresh start named: trades, holds the lock, writes 
     assert.ok(out.some((l) => /^live {6}TRADES \(GIMBAL_TRADE=1\).*panic_close -> resting Hyperliquid orders cancelled, both legs closed; ADL -> pair paused, both legs unwound \(3 of 3 attempts left\)/.test(l)), out.join('\n'));
     // Two serves at once: the second (a restart with FRESH left in the env, or a second terminal) cannot take the lock.
     await assert.rejects(servePair(input(w)), /another process \(pid \d+\) trades this desk.*pair-mainnet --send holds the same lock/);
-    // FRESH left in the env: after a clean save the next start re-adopts (nothing a restart must keep), not refused.
+    // FRESH left in the env: the next start finds a usable state, so FRESH is ignored (with a line) and it is restored.
     p.stop();
     assert.equal(existsSync(lockPath(w)), false);
     const again = await servePair(input(w));
     assert.equal(again.pair?.live, true);
+    assert.ok(again.lines.some((l) => /GIMBAL_TRADER_FRESH is ignored: .* is a usable trader state and is used as saved .*remove GIMBAL_TRADER_FRESH from the env/.test(l)), again.lines.join('\n'));
+    assert.ok(again.lines.some((l) => /restored from .*as saved/.test(l)), again.lines.join('\n'));
     again.stop();
   } finally {
     rmSync(w.dir, { recursive: true, force: true });
@@ -239,15 +241,18 @@ test('panic_close\'s cancelResting cancels every resting order on a policy coin 
     open(w);
     const p = await servePair(input(w));
     assert.equal(p.pair?.live, true);
-    w.openOrders = [{ coin: 'XLM', side: 'A', sz: '5', oid: 1 }, { coin: 'ETH', side: 'B', sz: '0.01', oid: 2 }, { coin: 'DOGE', side: 'B', sz: '1', oid: 3 }];
+    w.openOrders = [{ coin: 'ETH', side: 'B', sz: '0.01', oid: 2 }, { coin: 'DOGE', side: 'B', sz: '1', oid: 3 }, { coin: 'XLM', side: 'A', sz: '5', oid: 1 }, { coin: 'ETH', side: 'A', sz: '0.02', oid: 'x9' }];
     const r = await p.cancelResting!();
     assert.equal(r.cancelled, 2);
-    assert.deepEqual(w.cancels, [{ asset: 7, oid: 1 }, { asset: 1, oid: 2 }]);
+    assert.deepEqual(w.cancels, [{ asset: 7, oid: 1 }, { asset: 1, oid: 2 }], 'the pair\'s coin first, then the rest in order');
     assert.deepEqual(r.tx.map((t) => t.id), ['c1', 'c2']);
-    assert.match(r.notes.join('; '), /DOGE BUY 1 \(oid 3\): not a policy coin, not cancelled here.*Phoenix: the leg sends IOCs only/);
+    assert.match(r.notes.join('; '), /DOGE BUY 1 \(oid 3\): not a policy coin, not cancelled here; ETH SELL 0\.02 \(oid x9\): the order id is not a number, so it cannot be cancelled by id here; cancel it on Hyperliquid.*Phoenix: the leg sends IOCs only/);
     w.openOrders = { error: 'down' };
     await assert.rejects(p.cancelResting!(), /open orders cannot be read/);
     p.stop();
+    w.openOrders = [{ coin: 'XLM', side: 'A', sz: '5', oid: 4 }];
+    await assert.rejects(p.cancelResting!(), /serve is stopping and its trader lock is released: nothing is cancelled/);
+    assert.equal(w.cancels.length, 2);
   } finally {
     rmSync(w.dir, { recursive: true, force: true });
   }
@@ -284,7 +289,7 @@ test('the start lines: ADL alert only while orders saved in flight hold it, and 
     const trader = { intents: [toQty('-50'), toQty('50')], baselines: [toQty('-50'), toQty('50')], known: [toQty('-50'), toQty('50')], net: 0n, unhedged: null, unsettled: [] } as const;
     store.save({
       version: TRADER_STATE_VERSION, savedAt: 1, symbol: 'XLM', trader: { ...trader, intents: [...trader.intents], baselines: [...trader.baselines], known: [...trader.known], unsettled: [] }, pendingMaker: [],
-      inFlight: [{ index: 0, venue: 'hyperliquid', side: 'BUY', size: '10', reduceOnly: true, reason: 'rescue r1: reduce', at: 5, op: 'close' }], adl: newAdlState(),
+      inFlight: [{ index: 0, venue: 'hyperliquid', side: 'BUY', size: '10', reduceOnly: true, reason: 'rescue r1: reduce', at: Date.now() - 1_000, op: 'close' }], adl: newAdlState(),
     });
     delete w.env.GIMBAL_TRADER_FRESH;
     w.hl.pos = toQty('-40');      // our reduce landed, its result was never saved
@@ -296,6 +301,104 @@ test('the start lines: ADL alert only while orders saved in flight hold it, and 
     assert.ok(after.some((l) => /^open: {5}hyperliquid BUY 10 XLM reduce-only \(rescue r1: reduce\) was sent at /.test(l)));
     assert.equal(q.pair?.trader.baseline(q.pair.legs[0]), toQty('-50'), 'the saved baselines, not the venues: the shrink is not hidden');
     q.stop();
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+/** A crash in the middle of a reduce: the state holds the pair as before it (-50/50) and a Hyperliquid BUY 10 in flight. */
+function crashed(w: World, at: number): void {
+  const identity = { contractId: CONTRACT, deskId: DESK, evm: EVM };
+  const store = new TraderStateStore(traderStateFile(w.dir, 'mainnet', identity), identity);
+  store.save({
+    version: TRADER_STATE_VERSION, savedAt: 1, symbol: 'XLM',
+    trader: { intents: [toQty('-50'), toQty('50')], baselines: [toQty('-50'), toQty('50')], known: [toQty('-50'), toQty('50')], net: 0n, unhedged: null, unsettled: [] }, pendingMaker: [],
+    inFlight: [{ index: 0, venue: 'hyperliquid', side: 'BUY', size: '10', reduceOnly: true, reason: 'rescue r1: reduce', at, op: 'close' }], adl: newAdlState(),
+  });
+}
+
+test('(A) orders saved in flight that can no longer run are settled at start: explained legs are adopted, others keep the hold and say what to run', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1' });
+  try {
+    crashed(w, Date.now() - 11 * 60_000);
+    w.hl.pos = toQty('-40');      // our reduce landed, its result was never saved
+    w.px.pos = toQty('50');
+    const p = await servePair(input(w));
+    assert.equal(p.pair?.live, true);
+    assert.equal(p.pair?.adlHold, null);
+    assert.equal(p.pair?.trader.baseline(p.pair.legs[0]), toQty('-40'));
+    assert.ok(p.lines.some((l) => /can no longer run.*as the saved baselines and those orders explain: adopted, the ADL hold ends/.test(l)), p.lines.join('\n'));
+    p.stop();
+    crashed(w, Date.now() - 11 * 60_000);
+    w.hl.pos = toQty('-45');      // neither the baseline nor the order: an ADL, a partial fill, a trade elsewhere
+    const q = await servePair(input(w));
+    assert.equal(q.pair?.live, true, 'panic_close and a rescue reduce still trade');
+    const out = lines(q);
+    assert.ok(out.some((l) => /ADL -> alert only: 1 order\(s\) were in flight .* can no longer run, but hyperliquid reads -45, .*npm run monitor -w engine -- --mainnet.*pair-mainnet close XLM --send.*move .*trader-mainnet-.*\.json aside, then start serve once with GIMBAL_TRADER_FRESH=gimbal-test\.near\/canary/.test(l)), out.join('\n'));
+    assert.equal(q.pair?.trader.baseline(q.pair.legs[0]), toQty('-50'), 'not adopted: the shrink stays visible');
+    q.stop();
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+test('(A) orders in flight that could still run at start are settled from the venues once they cannot', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1' });
+  try {
+    let now = Date.now();
+    crashed(w, now - 1_000);
+    w.hl.pos = toQty('-40');
+    w.px.pos = toQty('50');
+    const p = await servePair(input(w, { clock: { now: () => now } }));
+    assert.match(p.pair?.adlHold ?? '', /or until they can no longer run \(.*\) and serve settles them from the venues/);
+    assert.match((await p.settleInFlight!()) ?? '', /they can run until .*, settled from the venues then/);
+    assert.notEqual(p.pair?.adlHold, null);
+    now += 10 * 60_000;
+    assert.match((await p.settleInFlight!()) ?? '', /as the saved baselines and those orders explain: adopted, the ADL hold ends/);
+    assert.equal(p.pair?.adlHold, null);
+    assert.equal(p.pair?.trader.baseline(p.pair.legs[0]), toQty('-40'));
+    assert.equal(await p.settleInFlight!(), null);
+    p.stop();
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+test('(B) a usable state and FRESH left set: a shrink since the last run is restored against, and the ADL watch takes it (two reads, then the unwind)', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
+  try {
+    open(w);
+    const p = await servePair(input(w));
+    p.stop();
+    w.hl.pos = toQty('-30');      // ADL while serve was down
+    const q = await servePair(input(w));
+    assert.equal(q.pair?.live, true);
+    assert.equal(q.pair?.trader.baseline(q.pair.legs[0]), toQty('-50'), 'restored, not adopted');
+    const r = await q.adl!.check();
+    assert.notEqual(r?.stage, 'alert');
+    assert.notEqual(q.adl!.state.paused, null);
+    assert.deepEqual([w.hl.pos, w.px.pos], [0n, 0n], 'unwound reduce-only');
+    q.stop();
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+test('(C) stop() turns trading off first: no reducer, closes and guarded orders refused, nothing signed or saved after it', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
+  try {
+    open(w);
+    const p = await servePair(input(w));
+    const reducer = p.reducer();
+    assert.notEqual(reducer, null);
+    p.stop();
+    assert.equal(p.reducer(), null);
+    assert.equal(p.notTrading(), 'serve is stopping: nothing is signed');
+    // A rescue that took the reducer before stop() and reaches its reduce after it.
+    await assert.rejects(reducer!.close({ reason: 'rescue: reduce', targets: [toQty('-40'), toQty('40')] }), /serve is stopping and its trader lock is released: nothing is signed/);
+    const r = await p.pair!.legs[0].order('BUY', toQty('10'), true, 'rescue: reduce');
+    assert.match(r.kind === 'failed' ? r.error.message : '', /serve is stopping and its trader lock is released; nothing signed/);
+    assert.equal(w.hl.orders.length + w.px.orders.length, 0);
   } finally {
     rmSync(w.dir, { recursive: true, force: true });
   }

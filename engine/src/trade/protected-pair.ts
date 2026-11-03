@@ -25,19 +25,28 @@
 // comes out as `open:` lines, as pair-mainnet prints them.
 //
 // startPlan decides at start what the trader holds: the saved state, or the venues' positions (adopted). A missing or
-// unusable state file is never a fresh start unless GIMBAL_TRADER_FRESH names this contract and desk; and a saved
-// pair whose legs now read smaller is restored, not adopted, so the ADL watch sees the shrink. When the saved state
-// still holds orders in flight, the legs may have moved by our own order: ADL then only alerts until a close result or
-// an adopt sets the baselines again (the `adlHold`).
+// unusable state file is never a fresh start unless GIMBAL_TRADER_FRESH names this contract and desk; a usable file is
+// always used (GIMBAL_TRADER_FRESH is then ignored, with a line saying to remove it), and a saved pair whose legs now
+// read smaller is restored, not adopted, so the ADL watch sees the shrink (two agreeing reads, then the unwind).
+//
+// Orders in flight. When the saved state still holds orders in flight, the legs may have moved by our own order: ADL
+// then only alerts (the `adlHold`) until a close result or an adopt sets the baselines again, or until the orders are
+// resolved from the venues. An order cannot run longer than IN_FLIGHT_LIFE_MS after it was signed (a Hyperliquid IOC
+// answers at once; a Phoenix transaction's blockhash lasts about 2 min), so once every one is that old, two agreeing
+// reads of the legs settle them: when each leg reads its saved baseline moved by some of those orders (none, some or
+// all of them, each in full), the reads are adopted and the hold ends; otherwise the hold stays and says what to run
+// (reconcileHow). startPlan does this at start; serve calls resolveInFlight when the youngest order passes that age.
+//
+// stop() (serve's shutdown, before its lock is released) is final: every order and close is refused after it.
 
 import type { VenueId } from '@gimbal/shared';
 import type { AdlState } from '../risk/adl.ts';
 import { ADL_ATTEMPTS, newAdlState } from '../risk/adl.ts';
 import type { LegOutcome, LegRef, LegSide, PendingMakerOrder, TradeLeg } from './legs.ts';
 import { LegCheckError } from './legs.ts';
-import { qtyString, signedQtyString } from './lots.ts';
+import { qtyString, signedQtyString, toQty } from './lots.ts';
 import type { PairResult, PairTrader, PairTraderState } from './pair.ts';
-import type { InFlightOrder, LoadedTraderFile, LoadedTraderState } from './trader-state.ts';
+import type { InFlightOrder, LoadedTraderState } from './trader-state.ts';
 
 /** An order as GuardedLeg names it before it is signed (the book adds `op`). */
 export type OutgoingOrder = Omit<InFlightOrder, 'op'>;
@@ -51,6 +60,11 @@ export class InFlightBook {
 
   constructor(restored: readonly InFlightOrder[] = []) {
     this.#restored = restored.map((o) => ({ ...o }));
+  }
+
+  /** The orders from the saved state still in the book (the ones the ADL hold is about). */
+  get restored(): InFlightOrder[] {
+    return this.#restored.map((o) => ({ ...o }));
   }
 
   /** Every order in the book, as it is saved. */
@@ -93,10 +107,59 @@ export class InFlightBook {
   }
 }
 
+/**
+ * How long after it was signed an order of serve's can still run: a Hyperliquid IOC answers at once, a Phoenix
+ * transaction's blockhash lasts about 2 min; 10 min is a safe bound for both (see the header).
+ */
+export const IN_FLIGHT_LIFE_MS = 10 * 60_000;
+
+/** When the youngest of `orders` can no longer run (IN_FLIGHT_LIFE_MS after it was signed); null for no orders. */
+export function inFlightEnds(orders: readonly InFlightOrder[]): number | null {
+  return orders.length === 0 ? null : Math.max(...orders.map((o) => o.at)) + IN_FLIGHT_LIFE_MS;
+}
+
+/**
+ * The legs whose read the saved baselines and the orders in flight do not explain, one line each (empty: both are
+ * explained). A leg is explained when it reads its baseline moved by some of its orders, each in full (BUY adds, SELL
+ * takes off): none of them ran, some did, or all did. A baseline that is unknown explains nothing.
+ */
+export function inFlightUnexplained(orders: readonly InFlightOrder[], baselines: readonly (bigint | null)[], read: readonly [bigint, bigint]): string[] {
+  const out: string[] = [];
+  for (const index of [0, 1] as const) {
+    const mine = orders.filter((o) => o.index === index);
+    const venue = index === 0 ? 'hyperliquid' : 'phoenix';
+    const base = baselines[index] ?? null;
+    if (base === null) {
+      out.push(`${venue} reads ${signedQtyString(read[index])} and its saved baseline is unknown`);
+      continue;
+    }
+    // Every sum of some of the orders (each order in or out); repeated sizes keep the set small.
+    let sums = new Set<bigint>([0n]);
+    for (const o of mine) {
+      const d = o.side === 'BUY' ? toQty(o.size) : -toQty(o.size);
+      sums = new Set([...sums, ...[...sums].map((s) => s + d)]);
+      if (sums.size > 4096) break;
+    }
+    if (!sums.has(read[index] - base)) {
+      const moves = mine.length === 0 ? 'no order in flight on it' : mine.map((o) => `${o.side} ${o.size}`).join(', ');
+      out.push(`${venue} reads ${signedQtyString(read[index])}, but its saved baseline ${signedQtyString(base)} with ${moves} does not reach it`);
+    }
+  }
+  return out;
+}
+
+/** What the owner runs when orders in flight cannot be settled from the venues (the ADL hold's text ends with it). */
+export function reconcileHow(p: { symbol: string; path: string; freshWant: string }): string {
+  return `check both legs (npm run monitor -w engine -- --mainnet); to close them: stop serve, then pair-mainnet close ${p.symbol} --send, then start serve again; `
+    + `if the legs are right as they are: stop serve, move ${p.path} aside, then start serve once with GIMBAL_TRADER_FRESH=${p.freshWant}`;
+}
+
 export interface GuardedLegOptions {
   index: 0 | 1;
   /** Whether the pair trades now; false refuses every order (alert only). */
   live: () => boolean;
+  /** serve is stopping (its lock is being released): every order is refused from then on. */
+  stopped?: () => boolean;
   /** Adds the order to the book and saves it; throws when it could not (the order is then refused). */
   beforeSign: (order: OutgoingOrder) => void;
   now?: () => number;
@@ -150,6 +213,7 @@ export class GuardedLeg implements TradeLeg {
       const ref: LegRef = { venue: this.venue, side, size: qtyString(size), reduceOnly, orderId: null, clientId: null, tx: [], sentAt: at };
       return { kind: 'failed', error: new LegCheckError(`${this.venue} ${this.symbol}: ${why}; nothing signed`), ref };
     };
+    if (this.#o.stopped?.() === true) return refuse('serve is stopping and its trader lock is released');
     if (!this.#o.live()) return refuse('alert only: this engine does not trade');
     if (!reduceOnly) return refuse('serve sends reduce-only orders only, and this one could open or grow a position');
     try {
@@ -172,6 +236,8 @@ export interface ProtectedPairOptions {
   inFlight?: InFlightBook;
   /** Why ADL only alerts until a close result or an adopt sets the baselines (startPlan's adlHold), or null. */
   adlHold?: string | null;
+  /** What the owner runs when resolveInFlight cannot settle the orders in flight (reconcileHow). */
+  reconcile?: string;
   /** Refreshes the stored price so the IOC and its retry fit inside its life; throws when it cannot (nothing is sent). */
   freshPrice?: () => Promise<void>;
   /** Hyperliquid post-only orders a maker order could not settle, and their cancel by id. */
@@ -197,6 +263,7 @@ export class ProtectedPair {
   #adlHold: string | null;
   /** Closes running now (queued in the trader or past it). */
   #running = 0;
+  #stopped = false;
 
   constructor(options: ProtectedPairOptions) {
     this.#o = options;
@@ -261,8 +328,42 @@ export class ProtectedPair {
     this.#save();
   }
 
+  /** serve is stopping: final, every close is refused from now on (the guarded legs refuse every order too). */
+  stop(): void {
+    this.#stopped = true;
+  }
+
+  get stopped(): boolean {
+    return this.#stopped;
+  }
+
+  /**
+   * The orders in flight from before the restart, once the youngest can no longer run (IN_FLIGHT_LIFE_MS), settled
+   * from `read` (two agreeing reads of both legs): explained by the baselines and those orders, the legs are adopted
+   * and the ADL hold ends; else the hold stays and says what to run. Null when there is nothing to settle (no hold, no
+   * restored order left, or stopped); `again` true when it could not be decided now (a close runs, the trader is busy,
+   * or an order can still run): the caller tries again later.
+   */
+  resolveInFlight(read: readonly [bigint, bigint], now: number): { line: string; again: boolean } | null {
+    const restored = this.inFlight.restored;
+    if (this.#adlHold === null || restored.length === 0 || this.#stopped) return null;
+    if (this.closing) return { line: 'orders in flight from before the restart: not settled now, a close is running (a close result settles them)', again: true };
+    const ends = inFlightEnds(restored)!;
+    if (now < ends) return { line: `orders in flight from before the restart: they can run until ${new Date(ends).toISOString()}, settled from the venues then`, again: true };
+    const off = inFlightUnexplained(restored, this.trader.legs.map((l) => this.trader.baseline(l) ?? null), read);
+    const resting = this.#o.pendingMaker?.() ?? [];
+    if (resting.length > 0) off.push(`${resting.length} Hyperliquid post-only order(s) are not settled and may still fill (cancel them on Hyperliquid)`);
+    if (off.length === 0) {
+      this.adopt(read);
+      return { line: `the ${restored.length} order(s) in flight from before the restart can no longer run, and the venues read hyperliquid ${signedQtyString(read[0])}, phoenix ${signedQtyString(read[1])}, as the saved baselines and those orders explain: adopted, the ADL hold ends`, again: false };
+    }
+    this.#adlHold = holdText(restored, off, this.#o.reconcile ?? 'check both legs by hand');
+    return { line: `ADL hold stays: ${this.#adlHold}`, again: false };
+  }
+
   /** A protection's close: always reduce-only (see the header); throws, with nothing sent, when it cannot start. */
   async close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean }): Promise<PairResult> {
+    if (this.#stopped) throw new Error('serve is stopping and its trader lock is released: nothing is signed');
     if (!this.live) {
       throw new Error(`alert only (${this.why ?? 'this engine does not trade'}): nothing is signed; close the legs by hand (stop serve, then pair-mainnet close ${this.symbol} --send)`);
     }
@@ -322,6 +423,12 @@ export class ProtectedPair {
       out.push(`open:     hyperliquid post-only ${p.side} ${p.size} ${this.symbol} (oid ${p.oid ?? 'unknown'}, cloid ${p.cloid}) may still rest and fill: cancel it on Hyperliquid and reconcile both legs`);
     }
     if (this.trader.unhedged !== null) out.push(`open:     ${this.trader.unhedged}`);
+    else {
+      const base = this.trader.legs.map((l) => this.trader.baseline(l));
+      if (base.every((b) => b !== null && b !== undefined) && base[0]! + base[1]! !== 0n) {
+        out.push(`open:     the legs are meant to hold hyperliquid ${signedQtyString(base[0]!)} and phoenix ${signedQtyString(base[1]!)}, which do not offset each other (a close clamped to the legs as read): ADL only alerts until a close offsets them`);
+      }
+    }
     for (const leg of this.trader.legs) {
       const u = this.trader.unsettled(leg);
       if (u === null) continue;
@@ -372,13 +479,15 @@ export interface StartInput {
   freshWant: string;
   /** Where the state lives (for the messages). */
   path: string;
+  /** Now (ms): orders in flight older than IN_FLIGHT_LIFE_MS are settled from `read`. */
+  now: number;
 }
 
 export interface StartPlan {
   /** False: the state does not allow trading (the reason in `why`); the pair is then alert only. */
   stateOk: boolean;
   why: string | null;
-  /** Import this state, or else adopt `adopt`. */
+  /** Import `restore` when set, then adopt `adopt` when set (at least one is). */
   restore: PairTraderState | null;
   adopt: [bigint, bigint] | null;
   adl: AdlState;
@@ -394,15 +503,17 @@ export interface StartPlan {
 const flat = (p: readonly (bigint | null)[]): boolean => p.every((x) => x === 0n);
 const text = (p: readonly (bigint | null)[]): string => `hyperliquid ${p[0] === null ? 'unknown' : signedQtyString(p[0]!)}, phoenix ${p[1] === null ? 'unknown' : signedQtyString(p[1]!)}`;
 
-/** What in a usable saved state a fresh start would forget: each one refuses GIMBAL_TRADER_FRESH. */
-export function freshBlockers(s: LoadedTraderFile): string[] {
-  const out: string[] = [];
-  if (s.adl.event !== null) out.push(`an ADL event in progress (since ${new Date(s.adl.event.at).toISOString()})`);
-  if (s.adl.attemptsLeft < ADL_ATTEMPTS) out.push(`an ADL budget already spent in part (${s.adl.attemptsLeft} of ${ADL_ATTEMPTS} attempts left)`);
-  const unsettled = s.trader?.unsettled.length ?? 0;
-  if (unsettled > 0) out.push(`${unsettled} leg(s) with an order that may still run`);
-  if (s.inFlight.length > 0) out.push(`${s.inFlight.length} order(s) in flight when the engine stopped`);
-  return out;
+/**
+ * The ADL hold's text for orders in flight from before the restart: `off` null while they can still run (until
+ * `ends`), else the legs the venues read that the baselines and those orders do not explain, and what to run.
+ */
+export function holdText(orders: readonly InFlightOrder[], off: readonly string[] | null, reconcile: string): string {
+  const listed = `${orders.length} order(s) were in flight when the engine stopped (${orders.map((f) => `${f.venue} ${f.side} ${f.size}`).join(', ')})`;
+  if (off === null) {
+    const ends = inFlightEnds(orders);
+    return `${listed}, so a leg may have moved by our own order: ADL only alerts until a close result or an adopt sets the baselines, or until they can no longer run (${ends === null ? 'now' : new Date(ends).toISOString()}) and serve settles them from the venues`;
+  }
+  return `${listed} and can no longer run, but ${off.join('; ')} (an ADL, a partial fill or a trade elsewhere): ADL only alerts until the owner reconciles; ${reconcile}`;
 }
 
 /** What the trader holds at start (see the header). */
@@ -411,11 +522,12 @@ export function startPlan(input: StartInput): StartPlan {
   const freshNotes: string[] = [];
   let fresh = false;
   if (input.fresh !== undefined) {
-    const blockers = saved.kind === 'loaded' ? freshBlockers(saved.state) : [];
-    if (input.fresh !== input.freshWant) {
+    if (saved.kind === 'loaded') {
+      // A usable state is always used: a fresh start would forget what it holds (an ADL that happened while serve
+      // was down among it: the restored baselines show the shrink, and the ADL watch takes it from there).
+      freshNotes.push(`GIMBAL_TRADER_FRESH is ignored: ${input.path} is a usable trader state and is used as saved (a fresh start applies only when the file is missing or unusable); remove GIMBAL_TRADER_FRESH from the env`);
+    } else if (input.fresh !== input.freshWant) {
       freshNotes.push(`GIMBAL_TRADER_FRESH=${JSON.stringify(input.fresh)} is ignored: a fresh start names this contract and desk, GIMBAL_TRADER_FRESH=${input.freshWant}, for one start only`);
-    } else if (blockers.length > 0) {
-      freshNotes.push(`GIMBAL_TRADER_FRESH is refused: ${input.path} holds ${blockers.join(', ')}; the saved state is used. Remove GIMBAL_TRADER_FRESH`);
     } else {
       fresh = true;
     }
@@ -436,15 +548,19 @@ export function startPlan(input: StartInput): StartPlan {
 
   const s = saved.state;
   const inFlight = s.inFlight;
-  const hold = inFlight.length === 0
-    ? null
-    : `${inFlight.length} order(s) were in flight when the engine stopped (${inFlight.map((f) => `${f.venue} ${f.side} ${f.size}`).join(', ')}), so a leg may have moved by our own order: ADL only alerts until a close result or an adopt sets the baselines`;
+  const reconcile = reconcileHow({ symbol, path: input.path, freshWant: input.freshWant });
+  const ends = inFlightEnds(inFlight);
+  // Every order in flight is too old to run: the reads settle them (see the header).
+  const settled = ends !== null && input.now >= ends;
+  const hold = inFlight.length === 0 ? null : holdText(inFlight, null, reconcile);
   const t = s.trader;
-  const freshPair = (why: string): StartPlan => adopted(true, null, [why], newAdlState(), s.pendingMaker, inFlight, hold);
+  const settledNote = (): string => `the ${inFlight.length} order(s) in flight when the engine stopped were signed more than ${IN_FLIGHT_LIFE_MS / 60_000} min ago and can no longer run; the venues read ${text(read)}`;
+  // The venues' positions become the pair: orders that can no longer run are in them.
+  const freshPair = (why: string): StartPlan => adopted(true, null, settled ? [why, settledNote()] : [why], newAdlState(), s.pendingMaker, settled ? [] : inFlight, settled ? null : hold);
   if (s.symbol !== null && s.symbol !== symbol) {
     const idle = t === null || (flat(t.baselines) && t.unsettled.length === 0 && s.adl.event === null);
     if (idle && s.pendingMaker.length === 0 && inFlight.length === 0) return freshPair(`the saved state is for ${s.symbol}, flat; the venues hold ${text(read)} ${symbol}: adopted as a new pair, a new ADL budget of ${ADL_ATTEMPTS}`);
-    return adopted(false, `${input.path} is for ${s.symbol} with legs or orders open, but the venues are read for ${symbol}: reconcile ${s.symbol} by hand, then ${how}`, [], s.adl, s.pendingMaker, inFlight, hold);
+    return adopted(false, `${input.path} is for ${s.symbol} with legs or orders open, but the venues are read for ${symbol}: reconcile ${s.symbol} by hand, then stop serve, move ${input.path} aside and ${how}`, [], s.adl, s.pendingMaker, inFlight, hold);
   }
   // Both legs flat: nothing is left to protect, and a reduce-only order of ours (all serve sends) cannot run on a flat leg.
   const flatAdopt = (note: string): StartPlan => adopted(true, null, [note], { ...s.adl, event: null }, s.pendingMaker, [], null);
@@ -452,8 +568,18 @@ export function startPlan(input: StartInput): StartPlan {
     if (flat(read)) return flatAdopt('no pair in the saved state and both legs flat: adopted flat');
     return freshPair(`no pair in the saved state; the venues hold ${text(read)} ${symbol}: adopted as a new pair, a new ADL budget of ${ADL_ATTEMPTS}`);
   }
-  const restore = (note: string): StartPlan => plan({ stateOk: true, why: null, restore: t, adopt: null, adl: s.adl, pendingMaker: s.pendingMaker, inFlight, adlHold: hold, notes: [note] });
   const base = t.baselines;
+  const restore = (note: string): StartPlan => {
+    const restored = { stateOk: true, why: null, restore: t, adl: s.adl, pendingMaker: s.pendingMaker };
+    if (!settled) return plan({ ...restored, adopt: null, inFlight, adlHold: hold, notes: [note] });
+    const off = inFlightUnexplained(inFlight, base, read);
+    if (s.pendingMaker.length > 0) off.push(`${s.pendingMaker.length} Hyperliquid post-only order(s) are not settled and may still fill (cancel them on Hyperliquid)`);
+    if (off.length === 0) {
+      return plan({ ...restored, adopt: read, inFlight: [], adlHold: null, notes: [note, `${settledNote()}, as the saved baselines and those orders explain: adopted, the ADL hold ends`] });
+    }
+    const why = holdText(inFlight, off, reconcile);
+    return plan({ ...restored, adopt: null, inFlight, adlHold: why, notes: [note, `ADL hold: ${why}`] });
+  };
   if (t.unsettled.length > 0 || s.adl.event !== null || s.pendingMaker.length > 0) {
     return restore(`restored from ${input.path}: baselines ${text(base)}, venues ${text(read)}${t.unsettled.length > 0 ? `, ${t.unsettled.length} leg(s) with an order that may still run` : ''}${s.adl.event !== null ? ', an ADL event in progress' : ''}${s.pendingMaker.length > 0 ? `, ${s.pendingMaker.length} post-only order(s) not settled` : ''}`);
   }

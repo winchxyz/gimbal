@@ -30,7 +30,14 @@
 // Without trading (serve's trader not live), a confirmed ADL is journaled with the owner alert and the event is kept
 // so it is not reported again; it ends the same way, when both legs read flat. While `hold` says why a shrink may be
 // an order of ours whose result was never saved (serve restarted with orders in flight), a shrink starts no event at
-// all: it is journaled once for the owner, and nothing is traded until a close result or adopt sets the baselines.
+// all: it is journaled once for the owner, and nothing is traded until a close result or adopt sets the baselines
+// (or serve settles those orders from the venues once they can no longer run: trade/protected-pair.ts).
+//
+// A clamped close (serve's: a rescue's reduce whose targets, computed before another close ran ahead of it, are
+// brought between 0 and the legs as read when it runs) can leave the legs not offsetting each other: its result sets
+// the baselines there and the trader's net to their sum, so the pair counts as not hedged before, and a shrink is
+// alerted to the owner, not unwound, until a close result offsets the legs again (serve's `open:` lines say so).
+// That is kept on purpose: the legs really do not offset then, and an unwind on such a pair is the owner's call.
 //
 // The pause stops opens only (the pair trader's open). It does not stop a rescue (its transfers, or its reduce, which
 // is reduce-only like the unwind and queues behind it in the trader) or panic_close.

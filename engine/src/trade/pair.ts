@@ -625,6 +625,8 @@ export class PairTrader {
     for (const i of [0, 1] as const) {
       if (targets[i] !== asked[i]) notes.push(`${this.legs[i].venue} target ${signedQtyString(asked[i])} is past its position ${signedQtyString(starts[i]!)} read now (toward zero only): ${signedQtyString(targets[i])}`);
     }
+    // A clamped pair of targets may not offset each other: the net is what they hold together (risk/adl.ts: the pair
+    // then counts as not hedged before until a close offsets the legs again).
     const net = targets[0] + targets[1];
     if (runs.every((r) => r.pos === r.target)) {
       notes.push('both legs were already at their close targets');

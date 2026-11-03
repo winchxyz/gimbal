@@ -20,8 +20,8 @@ export function legLine(l: Leg): string {
 }
 
 /**
- * The legs offset each other: the net delta (a float sum of leg sizes) is zero within a millionth of the largest leg,
- * and at most 1e-9 in base units, so the float sum's rounding never reads as an unhedged pair.
+ * The legs offset each other: the net delta (a float sum of leg sizes) is zero within a billionth (1e-9) of the
+ * largest leg, and never less than 1e-9 base units, so the float sum's rounding never reads as an unhedged pair.
  */
 export function isHedged(desk: Pick<DeskState, 'netDelta' | 'legs'>): boolean {
   const largest = desk.legs.reduce((m, l) => Math.max(m, Math.abs(l.size)), 0);

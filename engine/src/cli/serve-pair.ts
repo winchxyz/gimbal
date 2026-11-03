@@ -10,7 +10,10 @@
 // the liquidation alert are journaled, and nothing is signed; the lock is released as soon as the pair is found not
 // to trade, so pair-mainnet can run. The trader's state is kept in GIMBAL_STATE_DIR (default the per-user state
 // directory), trader-mainnet-<contract>-<desk>-<evm>.json (trade/trader-state.ts); a missing file is not a fresh start:
-// GIMBAL_TRADER_FRESH=<contract>/<desk> asks for one (trade/protected-pair.ts startPlan).
+// GIMBAL_TRADER_FRESH=<contract>/<desk> asks for one when the file is missing or unusable, and is ignored over a usable
+// file (trade/protected-pair.ts startPlan). Orders saved in flight that could still run at start are settled from the
+// venues once they cannot (a timer: ProtectedPair.resolveInFlight). stop() turns trading off before anything else: a
+// rescue between its read and its reduce, or a cancel, signs nothing once the lock is being released.
 //
 // The pair: the one symbol in both policy.hl_assets and policy.phoenix_markets that either venue holds; with both legs
 // flat, GIMBAL_PAIR_SYMBOL (exactly as the policy spells it: kPEPE), else the saved state's, else the only symbol in
@@ -44,7 +47,7 @@ import { DEFAULT_MAKER, HlLeg } from '../trade/legs.ts';
 import { signedQtyString } from '../trade/lots.ts';
 import { PairTrader } from '../trade/pair.ts';
 import { PhoenixLeg, phoenixTraderApi } from '../trade/phoenix-leg.ts';
-import { GuardedLeg, InFlightBook, ProtectedPair, startPlan } from '../trade/protected-pair.ts';
+import { GuardedLeg, InFlightBook, ProtectedPair, inFlightEnds, reconcileHow, startPlan } from '../trade/protected-pair.ts';
 import type { TraderFileState, TraderLock } from '../trade/trader-state.ts';
 import { TRADER_STATE_VERSION, TraderStateStore, acquireTraderLock, traderLockPath, traderStateFile, userStateDir } from '../trade/trader-state.ts';
 import { HL_MAINNET_URL, HyperliquidReader } from '../venues/hyperliquid.ts';
@@ -61,6 +64,8 @@ export const SERVE_SLIPPAGE_BPS = 50;
 /** At start both legs are read twice this far apart, and must agree; up to START_READ_TRIES times. */
 const START_CONFIRM_MS = 3_000;
 const START_READ_TRIES = 3;
+/** Orders in flight from before the restart that could not be settled now are tried again this much later. */
+const SETTLE_RETRY_MS = 60_000;
 
 /** The Hyperliquid leg as serve needs it (HlLeg; tests pass their own). */
 export type PairHlLeg = TradeLeg & Pick<HlLeg, 'adoptPending' | 'pendingMakerOrders' | 'cancelPending'>;
@@ -118,7 +123,9 @@ export interface ServePair {
   lines: string[];
   /** Waits up to `timeoutMs` for a close in flight to end; true when none runs (serve's shutdown, before stop()). */
   drain(timeoutMs: number): Promise<boolean>;
-  /** Stops the watch and the trader, closes the readers and releases the lock. */
+  /** Settles the orders in flight from before the restart from the venues (serve runs it on a timer; tests call it). */
+  settleInFlight?: () => Promise<string | null>;
+  /** Turns trading off first (every order and close refused from then on), then stops the watch and the trader, closes the readers and releases the lock. */
   stop(): void;
 }
 
@@ -223,7 +230,8 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
 
     // ---- what the trader holds ----
     const read = await readTwice([legs.hl, legs.phoenix], sleep, log);
-    const plan = startPlan({ symbol, read, saved, fresh: env('GIMBAL_TRADER_FRESH'), freshWant: `${contractId}/${input.deskId}`, path: store.path });
+    const freshWant = `${contractId}/${input.deskId}`;
+    const plan = startPlan({ symbol, read, saved, fresh: env('GIMBAL_TRADER_FRESH'), freshWant, path: store.path, now: input.clock.now() });
     if (!plan.stateOk && plan.why !== null) why.push(plan.why);
     if (input.once === true) why.unshift(`serve --once is alert only${asksTrade ? ' (GIMBAL_TRADE=1 is ignored: it exits after one read, maybe in the middle of a close)' : ''}`);
     else if (!asksTrade) why.unshift('GIMBAL_TRADE is not 1');
@@ -231,6 +239,8 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
     // An alert-only pair holds no lock: pair-mainnet must be able to fix what made it alert only.
     if (!live) release();
 
+    // stop() sets it first: from then on nothing is signed (its lock is being released).
+    let stopped = false;
     const book = new InFlightBook(plan.inFlight);
     // Set once the trader and the watch exist; a save before that has nothing to write.
     let snapshot: (() => TraderFileState) | null = null;
@@ -239,7 +249,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       store.save(snapshot());
     };
     const guard = (index: 0 | 1) => ({
-      index, live: () => live, now: () => input.clock.now(),
+      index, live: () => live, stopped: () => stopped, now: () => input.clock.now(),
       beforeSign: (o: Parameters<InFlightBook['add']>[0]) => book.add(o, save),
     });
     let pair: ProtectedPair | null = null;
@@ -265,10 +275,11 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       },
     });
     if (plan.restore !== null) trader.importState(plan.restore);
-    else trader.adopt(plan.adopt!);
+    if (plan.adopt !== null) trader.adopt(plan.adopt);
     legs.hl.adoptPending(plan.pendingMaker);
     pair = new ProtectedPair({
       trader, symbol, live, why: live ? null : why.join('; '), inFlight: book, adlHold: plan.adlHold,
+      reconcile: reconcileHow({ symbol, path: store.path, freshWant }),
       ...(legs.priced ? { freshPrice: async () => { await ensureFresh(prices, symbol, PRICE_MARGIN_S); } } : {}),
       pendingMaker: () => legs.hl.pendingMakerOrders(),
       cancelPending: (reason) => legs.hl.cancelPending(reason),
@@ -276,7 +287,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
     });
     const pp = pair;
     const adl = new AdlWatch(pp, {
-      state: plan.adl, trade: live, hold: () => pp.adlHold, log: (l) => log(`pair      ${l}`),
+      state: plan.adl, trade: live, hold: () => pp.adlHold, log: (l) => log(`pair      ${l}`), clock: input.clock, sleep,
       // Throws when the save fails: an unwind attempt then sends nothing (risk/adl.ts).
       onChange: () => save(),
     });
@@ -291,15 +302,64 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
     lines.push(`pair      ${symbol}: hyperliquid ${signedQtyString(read[0])} (${read[0] < 0n ? 'short' : read[0] > 0n ? 'long' : 'flat'}), phoenix ${signedQtyString(read[1])} (${read[1] > 0n ? 'long' : read[1] < 0n ? 'short' : 'flat'})`
       + `${read[0] + read[1] === 0n ? '' : ' NOT offsetting'}; state ${store.path}${live ? '' : ' (read only)'}${heldLock === null ? '' : `, lock ${heldLock.path}`}`);
     for (const line of pp.openLines()) lines.push(line);
+
+    // Orders in flight from before the restart that could still run at start: settled from the venues once the
+    // youngest can no longer run (ProtectedPair.resolveInFlight), tried again a minute later when it cannot be decided.
+    let settleTimer: ReturnType<typeof setTimeout> | null = null;
+    const settleLater = (ms: number) => {
+      if (stopped || pp.adlHold === null || book.restored.length === 0) return;
+      settleTimer = setTimeout(() => void settle(), Math.max(0, ms));
+      settleTimer.unref?.();
+    };
+    const settle = async (): Promise<string | null> => {
+      settleTimer = null;
+      if (stopped || pp.adlHold === null || book.restored.length === 0) return null;
+      const epoch = trader.baselineEpoch;
+      const sent = book.orders.length;
+      let out: { line: string; again: boolean } | null;
+      try {
+        const now = await readTwice(trader.legs, sleep, log);
+        // A close or a watch check of ours ran meanwhile: the reads may hold its orders, so they settle nothing.
+        out = trader.baselineEpoch !== epoch || book.orders.length !== sent
+          ? { line: 'orders in flight from before the restart: an order of ours went out while the legs were read; tried again in 1 min', again: true }
+          : pp.resolveInFlight(now, input.clock.now());
+      } catch (err) {
+        out = { line: `orders in flight from before the restart: the legs could not be read to settle them (${errorMessage(err)}); tried again in 1 min`, again: true };
+      }
+      if (out === null) return null;
+      log(`pair      ${out.line}`);
+      if (out.again) settleLater(Math.max(SETTLE_RETRY_MS, (inFlightEnds(book.restored) ?? 0) - input.clock.now()));
+      return out.line;
+    };
+    // Only orders that could still run at start: those that could not were settled by startPlan (adopted, or the hold
+    // names what the owner runs).
+    const ends = inFlightEnds(book.restored);
+    if (live && pp.adlHold !== null && ends !== null && ends > input.clock.now()) settleLater(ends - input.clock.now() + START_CONFIRM_MS);
+
     const cancelResting = async (): Promise<CancelResult> => {
+      if (stopped) throw new Error('serve is stopping and its trader lock is released: nothing is cancelled');
       const raw = await deps.openOrders(evm);
       if (!Array.isArray(raw)) throw new Error(restingOn(raw, symbol) as string);
       const out: CancelResult = { cancelled: 0, tx: [], notes: [] };
-      for (const o of raw as { coin?: unknown; side?: unknown; sz?: unknown; oid?: unknown }[]) {
+      // The pair's coin first: its resting order is the one that can fill under the close. One at a time, in order:
+      // each cancel is a contract call on the desk's nonce, so they do not go out in parallel.
+      const orders = (raw as { coin?: unknown; side?: unknown; sz?: unknown; oid?: unknown }[])
+        .map((o, i) => ({ o, i }))
+        .sort((a, b) => Number(b.o.coin === symbol) - Number(a.o.coin === symbol) || a.i - b.i)
+        .map(({ o }) => o);
+      for (const o of orders) {
+        if (stopped) {
+          out.notes.push('serve is stopping: the cancels left were not sent');
+          break;
+        }
         const name = `${String(o.coin)} ${o.side === 'B' ? 'BUY' : 'SELL'} ${String(o.sz)} (oid ${String(o.oid)})`;
         const asset = policy.hl_assets.find((a) => a.symbol === o.coin);
-        if (asset === undefined || typeof o.oid !== 'number') {
+        if (asset === undefined) {
           out.notes.push(`${name}: not a policy coin, not cancelled here`);
+          continue;
+        }
+        if (typeof o.oid !== 'number') {
+          out.notes.push(`${name}: the order id is not a number, so it cannot be cancelled by id here; cancel it on Hyperliquid`);
           continue;
         }
         try {
@@ -317,10 +377,18 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
     return {
       pair: pp, adl, lines,
       reducer: () => (live ? pp : null),
-      notTrading: () => (live ? null : `alert only: ${pp.why ?? 'not live'}`),
+      notTrading: () => (stopped ? 'serve is stopping: nothing is signed' : live ? null : `alert only: ${pp.why ?? 'not live'}`),
       ...(live ? { cancelResting } : {}),
       drain: (timeoutMs) => pp.whenIdle(timeoutMs),
+      settleInFlight: settle,
       stop: () => {
+        // First: nothing is signed from here on (a rescue between its read and its reduce must not sign after the
+        // lock is released), and nothing is saved.
+        stopped = true;
+        live = false;
+        pp.stop();
+        if (settleTimer !== null) clearTimeout(settleTimer);
+        settleTimer = null;
         adl.stop();
         trader.stop();
         deps.close();
