@@ -77,7 +77,7 @@ import { PhoenixLeg, parseTraderSnapshot, phoenixTraderApi } from '../trade/phoe
 import type { TraderLock } from '../trade/trader-state.ts';
 import { acquireTraderLock, lockHolder, traderLockPath } from '../trade/trader-state.ts';
 import { HL_MAINNET_URL, HyperliquidReader } from '../venues/hyperliquid.ts';
-import { PHOENIX_API_URL, PhoenixReader, SOLANA_MAINNET_RPC_URL } from '../venues/phoenix.ts';
+import { PHOENIX_API_URL, PhoenixReader, SOLANA_MAINNET_RPC_URL, phoenixGet } from '../venues/phoenix.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { Args, PriceDeps, StoredPrice } from './pair-mainnet-lib.ts';
 import {
@@ -232,10 +232,9 @@ async function hlInfo<T>(ctx: Ctx, body: Record<string, unknown>): Promise<T> {
   return (await res.json()) as T;
 }
 
-async function phoenixGet<T>(ctx: Ctx, path: string): Promise<T> {
-  const res = await fetch(`${ctx.phoenixUrl}${path}`, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(20_000) });
-  if (!res.ok) throw new Error(`phoenix GET ${path}: HTTP ${res.status}`);
-  return (await res.json()) as T;
+/** Through the Phoenix host's budget (venues/phoenix.ts phoenixGet): critical, retried after a 429. */
+function phoenixApiGet<T>(ctx: Ctx, path: string): Promise<T> {
+  return phoenixGet<T>(ctx.phoenixUrl, path, { timeoutMs: 20_000 });
 }
 
 interface PhoenixMarketConfig extends SnapshotMarket {
@@ -246,7 +245,7 @@ interface PhoenixMarketConfig extends SnapshotMarket {
 }
 
 async function phoenixExchange(ctx: Ctx): Promise<{ mismatches: string[]; markets: PhoenixMarketConfig[] }> {
-  const snap = await phoenixGet<{ exchange: Record<string, unknown>; markets: PhoenixMarketConfig[] }>(ctx, '/v1/exchange/snapshot');
+  const snap = await phoenixApiGet<{ exchange: Record<string, unknown>; markets: PhoenixMarketConfig[] }>(ctx, '/v1/exchange/snapshot');
   return { mismatches: exchangeMismatches(snap.exchange), markets: snap.markets };
 }
 

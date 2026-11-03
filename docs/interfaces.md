@@ -975,6 +975,9 @@ export interface MarketFunding extends FundingRate {   // the prices the rate ap
   fundingCapPerHour?: number;            // the venue's own per-market rate limits, per hour, from the same answer
   fundingFloorPerHour?: number;          // where it gives them; absent = unknown (the scanner then falls back to its
                                          // sourced caps and the same-rate rule for "At the cap")
+  rateReadAt?: number;                   // ms: the rate is from this earlier read, the venue's latest refresh of it
+                                         // having failed (Phoenix serves its last hourly overview up to 10 min); the
+                                         // scanner counts the row stale (its windows stale). Absent = read now
 }
 
 export interface WatchReader {           // a watch-only venue: public funding and marks, no account, no orders;
