@@ -243,6 +243,22 @@ test('after an order with no answer, the slot where its blockhash expired is the
   assert.equal(await f.leg.position(), toQty('0.005'));
 });
 
+test('after a restart the chain\'s confirmed slot is the oldest snapshot trusted: a stale snapshot is waited for, then unknown', async () => {
+  // A fresh leg (a restart) trusts any snapshot: the one at 400 shows no ETH, though our last IOC landed by slot 700.
+  const fresh = leg({ states: [stateWith(null, 400)], current: 700 });
+  assert.equal(await fresh.leg.position(), 0n, 'unsynced, the stale snapshot reads as current');
+  // Synced to the chain: the stale snapshot is waited out (settleTimeoutMs), then the position is unknown (thrown).
+  await fresh.leg.syncToChain();
+  await assert.rejects(fresh.leg.position(), /the trader snapshot is at slot 400, still before slot 700 .*the position is unknown/);
+  // A snapshot that reaches the chain's slot is read.
+  const caught = leg({ states: [stateWith(null, 400), stateWith(null, 400), stateWith('5', 700)], current: 700 });
+  await caught.leg.syncToChain();
+  assert.equal(await caught.leg.position(), toQty('0.005'));
+  // No chain slot to sync to: thrown, so the read that needed it is unknown too.
+  const blind = leg({ states: [stateWith('5', 700)] });
+  await assert.rejects(blind.leg.syncToChain(), /the chain's confirmed slot cannot be read/);
+});
+
 test('cancel_all signs the vector-shaped cancel on the leg\'s market', async () => {
   const f = leg({ states: [stateWith(null, 400)] });
   assert.deepEqual(await f.leg.cancelAll('cancel'), [NEAR_TX, SOL_TX]);

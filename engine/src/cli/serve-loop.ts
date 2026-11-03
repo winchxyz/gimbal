@@ -135,6 +135,14 @@ export function fillsOf(results: readonly PairResult[]): BookFill[] {
   }));
 }
 
+/**
+ * The leg size an open's parts that went out and opened add up to (canonical base units): a part its gate stopped
+ * before its first order, or one that ended other than open (its legs unwound or alerted), adds nothing.
+ */
+export function openedQty(results: readonly PairResult[]): string {
+  return qtyString(results.reduce((acc, r) => (r.status === 'open' && r.legs.some((l) => l.orders.length > 0) ? acc + toQty(r.size) : acc), 0n));
+}
+
 /** The pair symbols the policy allows: in both hl_assets and phoenix_markets. */
 export function policySymbols(policy: ContractPolicy | null): string[] {
   if (policy === null) return [];
@@ -177,7 +185,11 @@ export function loopHands(
       return { symbol, legUsd, pnlUsd, oneLeg, ...(legs.length === 0 ? {} : { freedMarginUsd: freed }) };
     },
     symbolOf: (w) => windowSymbol(w, hands.symbols),
-    open: async (r) => outcome(await hands.open({ symbol: r.symbol, legUsd: r.legUsd, leverage: r.leverage, reason: r.reason, qty: r.qty, gate })),
+    open: async (r) => {
+      const h = await hands.open({ symbol: r.symbol, legUsd: r.legUsd, leverage: r.leverage, reason: r.reason, qty: r.qty, gate });
+      // What filled, not what was asked (a later part the gate stopped holds nothing): the journal and the held size.
+      return { ...outcome(h), filledQty: openedQty(h.results) };
+    },
     reconcile: () => hands.reconcile(),
     close: async (r) => outcome(await hands.close({ reason: r.reason })),
   };
