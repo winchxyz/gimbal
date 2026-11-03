@@ -17,7 +17,8 @@ import { errorMessage } from '../venues/recorder.ts';
 import type { AccountState, Clock, Market, VenueReader } from '../venues/venue.ts';
 import type { DecideInput, Decision } from '../strategy/decide.ts';
 import type { ActOutcome, BookFill, BookSink, HandsHeld, LoopHands, LoopHeld, WindowFacts } from '../strategy/loop.ts';
-import type { AdoptInput } from '../book/book.ts';
+import type { AdoptInput, OutsideClose } from '../book/book.ts';
+import type { ProtectionCloseReport } from '../trade/protected-pair.ts';
 import type { BookRecord } from '../book/types.ts';
 import type { PairResult } from '../trade/pair.ts';
 import { qtyString, signedQtyString, toQty } from '../trade/lots.ts';
@@ -305,6 +306,7 @@ export interface LoopBookPort {
   record(record: BookRecord): { positionId: string | null; numbers: Record<string, number | string>; note?: string | null };
   adopt(input: AdoptInput): string;
   openWindow(): string | null;
+  recordOutside(close: OutsideClose): { positionId: string | null };
 }
 
 /**
@@ -314,9 +316,13 @@ export interface LoopBookPort {
  * net and actual APR) into that next journal entry, the book's keys over the loop's (the book's `feeUsd` is signed, a
  * cost < 0), and the book's note (an exit: `funding read to 14:00, settling`) to its summary. `adopt` books the pair the loop holds when the book has no open position for it (opened outside the
  * loop, or before the book existed), from the loop's own `since`; serve calls it at start and on every decision.
+ * `protectionClose` books a protection's close (panic_close, a rescue's reduce, an ADL unwind: ProtectedPair's
+ * onProtectionClose) from its result: an exit when both legs ended flat, else its fills as a partial fill. One that
+ * threw left no result: the book's next sync finds that close from the loop's held state and the venues' fills.
  */
 export function loopBook(book: LoopBookPort, publish: (event: StreamEvent) => void, log: (line: string) => void, held: () => LoopHeld | null = () => null): {
   sink: BookSink; publish: (event: StreamEvent) => void; adopt: (held: LoopHeld | null) => void;
+  protectionClose: (report: ProtectionCloseReport) => void;
 } {
   let pending: { numbers: Record<string, number | string>; note: string | null } | null = null;
   const adopt = (held: LoopHeld | null) => {
@@ -326,7 +332,8 @@ export function loopBook(book: LoopBookPort, publish: (event: StreamEvent) => vo
         windowId: held.windowId, symbol: held.symbol, since: held.since, legUsd: held.legUsd, forecastNetAprPct: held.entryNetAprPct,
         legs: [{ venue: 'hyperliquid', side: 'short' }, { venue: 'phoenix', side: 'long' }], by: 'manual',
       });
-      log(`book: holds ${held.symbol} as ${id} (adopted from the strategy loop, from ${new Date(held.since).toISOString()})`);
+      // A position the book closed after `since` (a protection's close the loop has not seen yet) is not adopted again.
+      if (book.openWindow() === held.windowId) log(`book: holds ${held.symbol} as ${id} (adopted from the strategy loop, from ${new Date(held.since).toISOString()})`);
     } catch (err) {
       log(`book: ${held.windowId} not adopted (${errorMessage(err)})`);
     }
@@ -349,5 +356,21 @@ export function loopBook(book: LoopBookPort, publish: (event: StreamEvent) => vo
       if (event.type === 'decision') adopt(held());
     },
     adopt,
+    protectionClose: (c) => {
+      const r = c.result;
+      if (r === null) {
+        log(`book: the ${c.by} close left no result (${c.error ?? 'no error'}); the next sync looks for it in the venues' fills`);
+        return;
+      }
+      const flat = r.legs.every((l) => l.final !== null && toQty(l.final) === 0n);
+      try {
+        book.recordOutside({
+          reason: c.by, by: c.by === 'panic_close' ? 'manual' : 'auto', startedAt: c.startedAt, at: c.at,
+          fills: fillsOf([r]), feeUsd: r.feeUsd, tx: r.tx, flat, symbol: r.legs[0].symbol,
+        });
+      } catch (err) {
+        log(`book: the ${c.by} close was not booked (${errorMessage(err)})`);
+      }
+    },
   };
 }

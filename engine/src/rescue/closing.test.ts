@@ -69,7 +69,7 @@ test('closing: cancel resting orders, then close both legs reduce-only, journale
   assert.match(reasons[0]!, /the desk is closing \(panic_close\): no rescue starts/);
   await s.watch.current;
   assert.deepEqual(s.calls, ['cancel', 'close']);
-  assert.deepEqual(s.closes, [{ reason: 'panic_close: the owner closed the desk', reduceOnly: true }]);
+  assert.deepEqual(s.closes, [{ reason: 'panic_close: the owner closed the desk', reduceOnly: true, by: 'panic_close' }]);
   const j = s.journal();
   assert.equal(j.length, 3);
   assert.match(j[0]!, /^exit: panic_close read from get_desk/);

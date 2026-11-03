@@ -63,6 +63,7 @@ import { signedQtyString } from '../trade/lots.ts';
 import type { PairResult } from '../trade/pair.ts';
 import { PairTrader } from '../trade/pair.ts';
 import { PhoenixLeg, phoenixTraderApi } from '../trade/phoenix-leg.ts';
+import type { ProtectionCloseReport } from '../trade/protected-pair.ts';
 import { GuardedLeg, InFlightBook, ProtectedPair, inFlightEnds, reconcileHow, startPlan } from '../trade/protected-pair.ts';
 import type { TraderFileState, TraderLock } from '../trade/trader-state.ts';
 import { TRADER_STATE_VERSION, TraderStateStore, acquireTraderLock, traderLockPath, traderStateFile, userStateDir } from '../trade/trader-state.ts';
@@ -163,6 +164,8 @@ export interface ServePairInput {
   deps?: Partial<ServePairDeps>;
   /** What the start could read of each venue it needs (serve's health map): slow or down until the start is confirmed. */
   health?: (venue: StartVenue, status: 'ok' | 'slow' | 'down', detail: string | null) => void;
+  /** A protection's close (panic_close, a rescue's reduce, an ADL unwind) as it ended: serve's position book takes it. */
+  onProtectionClose?: (report: ProtectionCloseReport) => void;
 }
 
 /** What panic_close's cancel did (rescue/closing.ts cancelResting). */
@@ -453,6 +456,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         pendingMaker: () => legs.hl.pendingMakerOrders(),
         cancelPending: (reason) => legs.hl.cancelPending(reason),
         save, onOpen, log: (l) => log(`pair      ${l}`), sleep,
+        ...(input.onProtectionClose === undefined ? {} : { onProtectionClose: input.onProtectionClose }),
       });
       const pq = pp;
       const adl = new AdlWatch(pq, {

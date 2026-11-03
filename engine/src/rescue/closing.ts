@@ -105,7 +105,7 @@ export class ClosingWatch {
       }
     }
     try {
-      const r = await reducer.close({ reason: 'panic_close: the owner closed the desk', reduceOnly: true });
+      const r = await reducer.close({ reason: 'panic_close: the owner closed the desk', reduceOnly: true, by: 'panic_close' });
       const legs = r.legs.map((l) => `${l.venue} ${l.symbol} ${l.start} -> ${l.final ?? '?'}`).join(', ');
       if (r.status === 'closed' || r.status === 'flat') {
         done();

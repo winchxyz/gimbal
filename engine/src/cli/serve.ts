@@ -97,6 +97,7 @@ import { loopBook, serveLoop } from './serve-loop.ts';
 import { ConfigError, retryStart } from './start-errors.ts';
 import type { PositionBook } from '../book/book.ts';
 import { createBook } from '../book/book.ts';
+import type { ProtectionCloseReport } from '../trade/protected-pair.ts';
 import { liveBookSources } from '../book/sources.ts';
 import { userStateDir } from '../trade/trader-state.ts';
 import type { StrategyLoop } from '../strategy/loop.ts';
@@ -333,11 +334,14 @@ if (mode === 'replay') {
   log(`risk: reading the desk's ${accounts.map((a) => a.reader.id).join(' and ')} accounts every 5 s (Orderly legs need its private stream, which serve does not open)`);
 }
 let pair: ServePair | null = null;
+// A protection's close (panic_close, a rescue's reduce, an ADL unwind) goes to the position book once it exists.
+let protectionClosed: (report: ProtectionCloseReport) => void = () => {};
 if (contract !== null && deskId !== null) {
   const side = contract;
   const id = deskId;
   pair = await servePair({
     mode, env: envVar, side, deskId: id, clock, log, publish, linkedWorktree: linkedWorktree(), once: values.once === true,
+    onProtectionClose: (report) => protectionClosed(report),
     ...(stateDirSet === undefined ? {} : { stateDir: resolve(stateDirSet) }),
     // Review S1: a start read that fails degrades the pair (alert only, legs unknown, retried); health says which venue.
     health: (venue, status, detail) => {
@@ -435,6 +439,8 @@ if (contract !== null && deskId !== null) {
       addresses: { hyperliquid: contract.desk.evm_address, phoenix: contract.desk.solana.authority },
       sources: mode === 'replay' ? null : liveBookSources({ network: mode === 'mainnet' ? 'mainnet' : 'testnet' }),
       publish: (entry) => publish({ type: 'journal', data: entry }), clock, log,
+      // Only a loop with hands on a confirmed start checks what it holds against the venues; else unknown.
+      loopHeld: () => (loop === null || pair?.hands === undefined || (pair.unconfirmed?.() ?? null) !== null ? undefined : loop.held),
     });
     log(`book: positions kept in ${book.path}; venue ledgers synced now and every hour (read only); npm run report prints it`);
   } catch (err) {
@@ -442,6 +448,7 @@ if (contract !== null && deskId !== null) {
   }
 }
 const booked = book === null ? null : loopBook(book, publish, log, () => loop?.held ?? null);
+if (booked !== null) protectionClosed = booked.protectionClose;
 loop = serveLoop({
   mode, env: envVar, once: false, contractId: contract?.client.contractId ?? null, deskId, pair, lastDesk: () => lastDesk,
   accounts: loopAccounts, rescueLive: () => rescueLive(), windows: () => server?.state().windows ?? null,

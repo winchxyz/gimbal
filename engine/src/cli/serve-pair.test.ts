@@ -654,7 +654,8 @@ test('S1: a Phoenix snapshot behind the chain at start: alert only with the legs
     w.px.chainSlot = 120;
     const events: StreamEvent[] = [];
     const health = healthOf();
-    const p = await servePair(input(w, { publish: (e) => events.push(e), health: health.hook }));
+    const closes: string[] = [];
+    const p = await servePair(input(w, { publish: (e) => events.push(e), health: health.hook, onProtectionClose: (r) => closes.push(`${r.by} ${r.result?.status ?? r.error}`) }));
     // Serve runs on: nothing adopted, nothing trades, every act refused with the reason.
     assert.equal(p.pair === null, true, 'the stale Phoenix 0 is not adopted');
     assert.match(p.unconfirmed!() ?? '', /^legs unknown, start not confirmed: the legs could not be read twice alike \(phoenix: the trader snapshot is at slot 100, still before slot 120: the position is unknown\); nothing is adopted$/);
@@ -690,6 +691,11 @@ test('S1: a Phoenix snapshot behind the chain at start: alert only with the legs
     assert.match(startJournal(events).at(-1)!, /^wait: pair start confirmed after 2 failed attempt/);
     assert.deepEqual(health.now(), ['hyperliquid ok', 'near ok', 'phoenix ok']);
     assert.equal(await p.retryStart!(), null, 'confirmed: nothing more to try');
+    // The position book's hook: nothing reported while the start was pending, wired to the pair once it trades.
+    assert.deepEqual(closes, []);
+    await p.pair!.close({ reason: 'panic_close', by: 'panic_close' });
+    assert.equal(closes.length, 1);
+    assert.match(closes[0]!, /^panic_close /);
     p.stop();
     assert.equal(existsSync(lockPath(w)), false);
   } finally {

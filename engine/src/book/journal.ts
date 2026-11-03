@@ -48,6 +48,7 @@ export function fundingJournal(events: readonly BookEvent[], now: number): Journ
   const journals = events.filter((e) => e.type === 'journal') as JournalEvent[];
   const covered = new Set(journals.flatMap((j) => j.keys ?? []));
   const done = new Set(journals.filter((j) => j.hour !== undefined && j.late !== true).map((j) => `${j.positionId}|${j.hour}`));
+  const finals = new Set(journals.filter((j) => j.settled === true && j.positionId !== undefined).map((j) => j.positionId!));
   const groups = new Map<string, { position: (typeof all)[number]; hour: number; rows: FundingEvent[] }>();
   for (const f of events) {
     if (f.type !== 'funding' || covered.has(f.key)) continue;
@@ -82,11 +83,19 @@ export function fundingJournal(events: readonly BookEvent[], now: number): Journ
       numbers[`${v}RatePerHour`] = rows[0]!.ratePerHour;
       const samples = rows.reduce((s, r) => s + (r.samples ?? 0), 0);
       if (samples > 0) numbers[`${v}Hours`] = samples;
-      parts.push(`${v} ${signed(usd)}${samples > 0 ? ` (${samples} h aggregated)` : ''}`);
+      parts.push(`${v} ${signed(usd)}${samples > 0 ? ` (${samples} h aggregated, estimated)` : ''}`);
     }
     if (late) numbers.late = 1;
-    const summary = `funding ${g.position.symbol} ${iso(g.hour)}${late ? ' (booked late)' : ''}: ${parts.join(', ')}; ${signed(total)} USD`;
-    const id = `book-funding-${g.position.id}-${g.hour}${late ? `-late-${g.rows.map((r) => r.time).sort()[0]}` : ''}`;
+    // A daily aggregate's amount per hour is not verified against a real row: marked as an estimate.
+    if (g.rows.some((r) => r.samples !== null)) numbers.estimated = 1;
+    // Booked after the position's final entry: an adjustment against it.
+    const afterFinal = late && finals.has(g.position.id);
+    if (afterFinal) numbers.afterFinal = 1;
+    const when = afterFinal ? ` (booked late, after the final entry of ${g.position.id}: an adjustment to it)` : late ? ' (booked late)' : '';
+    const summary = `funding ${g.position.symbol} ${iso(g.hour)}${when}: ${parts.join(', ')}; ${signed(total)} USD`;
+    // A late entry's id names its first payment time and, for an adjustment of a stored hour, its index (adjN).
+    const adj = Math.max(0, ...g.rows.map((r) => Number(/\|adj(\d+)$/.exec(r.key)?.[1] ?? 0)));
+    const id = `book-funding-${g.position.id}-${g.hour}${late ? `-late-${g.rows.map((r) => r.time).sort()[0]}${adj > 0 ? `-adj${adj}` : ''}` : ''}`;
     out.push({
       v: 1, type: 'journal', at: now, entry: entry(id, now, 'funding', summary, numbers),
       positionId: g.position.id, hour: g.hour, keys: g.rows.map((r) => r.key), ...(late ? { late: true } : {}),
@@ -175,11 +184,16 @@ export function settlingNote(r: PositionResult): string | null {
 
 /** The position's settled entry: its final numbers, once (see the header). */
 export function settledJournal(r: PositionResult, now: number): JournalEvent {
-  const numbers = { ...resultNumbers(r), final: 1, settled: 1 };
+  const numbers: Record<string, number | string> = { ...resultNumbers(r), final: 1, settled: 1 };
+  if (r.estimatedUsd !== 0) {
+    numbers.estimated = 1;
+    numbers.estimatedUsd = round6(r.estimatedUsd);
+  }
   const apr = r.actualAprPct === null ? 'n/a' : `${r.actualAprPct.toFixed(2)} %`;
   const summary = `settled ${r.symbol} ${r.id}: funding ${signed(r.fundingUsd)}, fees ${signed(r.feesUsd)}`
     + `${r.priceUsd === null ? '' : `, price ${signed(r.priceUsd)}`}, net ${signed(r.netUsd)} USD; actual APR ${apr}`
-    + ` over ${r.aprHours.toFixed(1)} h, funding read to ${r.fundingThrough === null ? 'none' : hhmm(r.fundingThrough)} (final)`;
+    + ` over ${r.aprHours.toFixed(1)} h, funding read to ${r.fundingThrough === null ? 'none' : hhmm(r.fundingThrough)}`
+    + `${r.estimatedUsd === 0 ? '' : ` (${signed(r.estimatedUsd)} of the funding estimated from daily aggregates)`}; final as of ${hhmm(now)}`;
   return {
     v: 1, type: 'journal', at: now, positionId: r.id, settled: true,
     entry: entry(`book-settled-${r.id}`, now, 'funding', summary, numbers),

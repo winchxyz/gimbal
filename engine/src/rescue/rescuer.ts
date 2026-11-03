@@ -250,7 +250,8 @@ export interface LandingPort {
 export interface Reducer {
   readonly legs: readonly [TradeLeg, TradeLeg];
   readonly lot: bigint;
-  close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean }): Promise<PairResult>;
+  /** `by`: which protection closes (the book takes it as an exit or a partial fill outside the loop). */
+  close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean; by?: 'panic_close' | 'rescue reduce' | 'ADL unwind' }): Promise<PairResult>;
 }
 
 export interface RescuerOptions {
@@ -1090,7 +1091,7 @@ export class Rescuer {
     const started = this.#o.clock.now();
     let result: PairResult;
     try {
-      result = await reducer.close({ reason: `rescue ${t.id}: reduce both legs by ${qtyString(cut)} (${(fraction * 100).toFixed(1)} %)`, targets, reduceOnly: true });
+      result = await reducer.close({ reason: `rescue ${t.id}: reduce both legs by ${qtyString(cut)} (${(fraction * 100).toFixed(1)} %)`, targets, reduceOnly: true, by: 'rescue reduce' });
     } catch (err) {
       throw new StepFailed('sign', `the reduce failed: ${errorMessage(err)}`);
     }

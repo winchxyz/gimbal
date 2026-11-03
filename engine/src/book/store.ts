@@ -5,12 +5,19 @@
 // it and cuts the file back to the last whole line, so the next append starts clean. Any other line that is not a
 // whole event is refused: a book is never trimmed in the middle to make it readable.
 //
+// A write that fails is undone: the file's size is taken before it, and a short write (a full disk) or a failed fsync
+// cuts the file back to that size and throws. So the next append never lands after torn bytes, and what the caller
+// takes as not written (and writes again) is not on disk. Should the cut fail too, load keeps the first copy of an
+// event with the same identity (a funding key, a fee's fill, a transfer id, a journal entry id, a position's enter or
+// exit, a fill record) and says how many it dropped.
+//
 // The summary is written atomically (the whole content to a temporary file, fsync, rename, then the directory's
 // fsync): a crash before the rename leaves the old summary whole. It is always derived again from the JSONL, so a
 // stale one is only stale.
 
 import {
-  closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, truncateSync, unlinkSync, writeSync,
+  closeSync, fstatSync, fsyncSync, ftruncateSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, truncateSync,
+  unlinkSync, writeSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { Mode } from '@gimbal/shared';
@@ -47,9 +54,44 @@ export function bookFilesIn(dir: string): string[] {
   return names.filter((n) => /^book-.*\.jsonl$/.test(n)).sort().map((n) => join(dir, n));
 }
 
-/** Hooks for tests: called after the summary's temporary file is written and fsynced, before the rename. */
+/** Hooks for tests: the summary's rename, and the JSONL append's write and fsync (default node:fs). */
 export interface StoreHooks {
+  /** Called after the summary's temporary file is written and fsynced, before the rename. */
   beforeRename?: (tmp: string, target: string) => void;
+  /** Writes `text` to the JSONL at byte `position`; returns the bytes written. */
+  write?: (fd: number, text: string, position: number) => number;
+  fsync?: (fd: number) => void;
+}
+
+const messageOf = (err: unknown) => (err instanceof Error ? err.message : String(err));
+
+/** What makes an event the same one when it shows twice; null: no identity (a desk or sync line may repeat). */
+export function eventIdentity(e: BookEvent): string | null {
+  switch (e.type) {
+    case 'enter': return `enter|${e.positionId}`;
+    case 'exit': return e.positionId === null ? `exit|-|${e.record.windowId}|${e.record.at}` : `exit|${e.positionId}`;
+    case 'fill': return `fill|${e.positionId}|${e.record.windowId}|${e.record.at}`;
+    case 'funding': return `funding|${e.key}`;
+    case 'fee': return `fee|${e.positionId}|${e.recordAt}|${e.index}`;
+    case 'transfer': return `transfer|${e.id}`;
+    case 'journal': return `journal|${e.entry.id}`;
+    default: return null;
+  }
+}
+
+/** The events with every later copy of one identity dropped, and how many were. */
+export function dedupeEvents(events: readonly BookEvent[]): { events: BookEvent[]; dropped: number } {
+  const seen = new Set<string>();
+  const out: BookEvent[] = [];
+  for (const e of events) {
+    const id = eventIdentity(e);
+    if (id !== null) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+    }
+    out.push(e);
+  }
+  return { events: out, dropped: events.length - out.length };
 }
 
 /** fsync a directory, so a created or renamed entry in it survives a power cut. Windows cannot: skipped there. */
@@ -156,15 +198,18 @@ export class BookStore {
       text = '';
     }
     const parsed = parseBook(text, this.path);
-    this.#events = parsed.events;
-    this.repaired = null;
+    const unique = dedupeEvents(parsed.events);
+    this.#events = unique.events;
     this.#needsNewline = false;
+    const notes: string[] = [];
     if (parsed.torn > 0) {
-      this.repaired = `dropped a torn last line (${parsed.torn} bytes, a write cut off)`;
+      notes.push(`dropped a torn last line (${parsed.torn} bytes, a write cut off)`);
       if (options.repair !== false) truncateSync(this.path, Buffer.byteLength(text) - parsed.torn);
     } else {
       this.#needsNewline = text !== '' && !text.endsWith('\n');
     }
+    if (unique.dropped > 0) notes.push(`dropped ${unique.dropped} event(s) written twice (a failed write that could not be cut back)`);
+    this.repaired = notes.length === 0 ? null : notes.join('; ');
     return [...this.#events];
   }
 
@@ -173,8 +218,9 @@ export class BookStore {
   }
 
   /**
-   * Appends events in one write, fsynced; memory moves only once the write went through. `persist` false: memory only
-   * (a reader that must not write, the report's --sync).
+   * Appends events in one write, fsynced; memory moves only once the write went through. A write that fails (short,
+   * or its fsync) is cut back off the file and thrown (see the header). `persist` false: memory only (a reader that
+   * must not write, the report's --sync).
    */
   append(events: readonly BookEvent[], persist = true): void {
     if (events.length === 0) return;
@@ -191,11 +237,28 @@ export class BookStore {
       created = true;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-      fd = openSync(this.path, 'a');
+      // Not 'a': a file opened to append cannot be cut back on every platform. The write goes at the end by position.
+      fd = openSync(this.path, 'r+');
     }
+    const write = this.#hooks.write ?? ((f: number, t: string, at: number) => writeSync(f, t, at));
+    const sync = this.#hooks.fsync ?? fsyncSync;
     try {
-      writeSync(fd, text);
-      fsyncSync(fd);
+      const size = fstatSync(fd).size;
+      const bytes = Buffer.byteLength(text);
+      try {
+        const wrote = write(fd, text, size);
+        if (wrote !== bytes) throw new Error(`short write: ${wrote} of ${bytes} bytes (disk full?)`);
+        sync(fd);
+      } catch (err) {
+        // Undo: nothing of this write stays, so the next one starts on a whole line and nothing is booked twice.
+        try {
+          ftruncateSync(fd, size);
+          fsyncSync(fd);
+        } catch (cut) {
+          throw new Error(`${messageOf(err)}; cutting it back failed too (${messageOf(cut)}): load drops what it repeats`);
+        }
+        throw err;
+      }
     } finally {
       closeSync(fd);
     }

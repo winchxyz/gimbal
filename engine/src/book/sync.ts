@@ -15,6 +15,12 @@
 // and symbol covers (its amount pro rata), and dropped when they cover them all; an hourly row on a day that already
 // holds an aggregate is dropped. A long-offline catch-up cannot count an hour twice.
 //
+// What is known of the aggregate rows (a public mainnet userFunding answer read by hand, 2026-11-04): a row at 00:00:00
+// UTC with nSamples 24 and the hourly fields (coin, usdc, szi, fundingRate); the last one sits at D 00:00 and the first
+// hourly row after it at D+1 00:00, so a row stands for the 24 hours of its own UTC day. That its usdc is the sum of
+// those hours, and how a partial day looks, are not verified: amounts from aggregate rows are marked as estimated
+// (numbers.estimated = 1 in the funding entry, and the report says so).
+//
 // Payments no position's hold covers are not stored (counted as ignored).
 //
 // The sync line (the read's window and counts) is what tells the next read where to start. It is written when the read
@@ -26,7 +32,7 @@ import type { FundingPayment } from '../venues/venue.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import { HOUR_MS, SETTLE_MS, attribute, cursors, hourOf, positionsOf, spans } from './derive.ts';
 import type {
-  BookEvent, BookRecord, FeeEvent, FundingEvent, HlLedgerRow, SyncEvent, TransferEvent,
+  BookEvent, BookFill, BookRecord, FeeEvent, FundingEvent, HlLedgerRow, SyncEvent, TransferEvent,
 } from './types.ts';
 
 export const OVERLAP_MS = 24 * HOUR_MS;
@@ -61,6 +67,20 @@ export interface BookSources {
   fillFee?: (q: FillFeeQuery) => Promise<number | null>;
   /** Tx refs for the Hyperliquid ledger rows. */
   hlTxRef?: (hash: string) => TxRef;
+  /**
+   * The desk's fills on one venue, symbol and side in [from, to], summed (size-weighted price, the venue's fee charge)
+   * with the last fill's time; null when there are none. For a close made outside the loop with no close report.
+   */
+  closeFills?: (q: CloseFillQuery) => Promise<{ fill: BookFill; at: number } | null>;
+}
+
+export interface CloseFillQuery {
+  venue: string;
+  address: string;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  from: number;
+  to: number;
 }
 
 export interface SyncLine {

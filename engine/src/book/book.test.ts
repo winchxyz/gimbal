@@ -360,7 +360,7 @@ test('the settle flow: the exit says how far funding was read, then one settled 
   assert.equal(settled.numbers.fundingUsd, 0.51);
   assert.equal(settled.numbers.actualAprPct, 44.68);
   assert.equal(settled.numbers.fundingThrough, new Date(exitXlm().at).toISOString());
-  assert.match(settled.summary, /^settled XLM .*funding read to 20:20 \(final\)$/);
+  assert.match(settled.summary, /^settled XLM .*funding read to 20:20; final as of 22:25$/);
   // The read that crossed exit + 2 h is on file: the report sees the position settled too.
   assert.ok(syncLines(s.book.events, 'phoenix').some((l) => l.to >= exitXlm().at + 2 * H));
   assert.equal(summarize(new BookStore(path).load(), s.clock.now()).positions[0]!.settled, true);
@@ -554,7 +554,7 @@ test('the report: per position and desk totals, actual APR checked by hand', asy
   assert.match(text, /settled {4}yes/);
   assert.match(text, /SOL {2}short hyperliquid, long phoenix {2}OPEN/);
   assert.match(text, /fees {7}open -0\.1000, close not yet, total -0\.1000 \(1 fill\(s\) with no fee known: not counted\)/);
-  assert.match(text, /NEAR AI veto ledger \(helped \/ hurt\)\n {2}-- not recorded yet/);
+  assert.match(text, /NEAR AI risk check ledger \(helped \/ hurt\)\n {2}-- not recorded yet/);
   // Desk totals: funding 0.51 + 0.03, fees -0.40 - 0.10, transfers -0.32, price +0.40.
   close(s.totals.netUsd, 0.51 + 0.03 - 0.5 - 0.32 + 0.4, 'desk net');
   assert.match(text, /net {8}\+0\.1200 USD\n {2}desk ledger/);
