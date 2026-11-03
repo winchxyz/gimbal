@@ -40,6 +40,7 @@ export const KINDS: Record<Kind, KindInfo> = {
   deposit: { label: 'Deposit', tone: null, filter: 'money', signed: true, principal: true, noun: ['deposit', 'deposits'] },
   withdraw: { label: 'Withdraw', tone: null, filter: 'money', signed: true, principal: true, noun: ['withdrawal', 'withdrawals'] },
   fee: { label: 'Fee', tone: null, filter: 'money', signed: false, principal: false, noun: ['fee', 'fees'] },
+  wait: { label: 'Waiting', tone: null, filter: null, signed: false, principal: false, noun: ['wait', 'waits'] },
 };
 
 export interface FilterInfo {

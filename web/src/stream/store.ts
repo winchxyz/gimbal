@@ -8,6 +8,7 @@ import type {
   RescueProgress,
   ScanStatus,
   SetupProgress,
+  StrategyDecision,
   StreamEvent,
   Window as FundingWindow,
 } from '@gimbal/shared';
@@ -15,7 +16,7 @@ import type {
 export type StreamType = StreamEvent['type'];
 export type Health = Extract<StreamEvent, { type: 'health' }>['data'];
 
-export const STREAM_TYPES: readonly StreamType[] = ['windows', 'scan', 'desk', 'journal', 'rescue', 'setup', 'health'];
+export const STREAM_TYPES: readonly StreamType[] = ['windows', 'scan', 'desk', 'journal', 'rescue', 'setup', 'health', 'decision'];
 
 /** Where events come from: the engine's `/events`, or the development fake. */
 export type Source = 'sse' | 'fake';
@@ -50,6 +51,7 @@ export interface StreamState {
   rescue: RescueProgress | null;
   setup: SetupProgress | null;
   health: Health | null;
+  decision: StrategyDecision | null;
 }
 
 export type StreamAction =
@@ -69,7 +71,7 @@ export function initialStreamState(): StreamState {
     skewMs: 0,
     received: 0,
     rejected: 0,
-    counts: { windows: 0, scan: 0, desk: 0, journal: 0, rescue: 0, setup: 0, health: 0 },
+    counts: { windows: 0, scan: 0, desk: 0, journal: 0, rescue: 0, setup: 0, health: 0, decision: 0 },
     last: null,
     windows: null,
     scan: null,
@@ -78,6 +80,7 @@ export function initialStreamState(): StreamState {
     rescue: null,
     setup: null,
     health: null,
+    decision: null,
   };
 }
 
@@ -132,6 +135,8 @@ export function reduceStream(state: StreamState, action: StreamAction): StreamSt
           return { ...next, setup: event.data };
         case 'health':
           return { ...next, health: event.data };
+        case 'decision':
+          return { ...next, decision: event.data };
       }
     }
   }

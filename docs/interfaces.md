@@ -825,7 +825,7 @@ export interface TxRef { chain: 'near' | 'hyperliquid' | 'solana' | 'arbitrum'; 
 export interface JournalEntry {
   id: string; t: number;
   kind: 'window' | 'enter' | 'exit' | 'rotate' | 'rescue' | 'refused' | 'veto' | 'adl' | 'error' | 'funding'
-      | 'deposit' | 'withdraw' | 'fee';
+      | 'deposit' | 'withdraw' | 'fee' | 'wait';   // wait: the strategy's reason not to act changed
   summary: string;                // one line, written by the engine
   why?: string;                   // optional plain-language reason from NEAR AI; never used for decisions
   // Keys the web reads; numbers may come as decimal strings ("1050.00"). Every key is optional.
@@ -846,6 +846,15 @@ export interface RescueProgress {
 
 export type HealthMap = Record<VenueId | 'intents' | 'near', 'ok' | 'slow' | 'down'>;
 
+// The strategy loop's latest decision (engine/src/strategy/): the web's decision line. Published when it changes.
+export interface StrategyDecision {
+  action: 'off' | 'wait' | 'enter' | 'hold' | 'exit' | 'rotate';   // off: auto false or GIMBAL_TRADE not 1
+  reason: string;                 // one line, engine-written, with the numbers ("XLM 14.2 % net, 2 of 3 hours above 10 %")
+  windowId: string | null;        // the window entered, rotated into or waited for
+  heldId: string | null;          // the window the desk holds, if any
+  at: number;                     // ms
+}
+
 export type StreamEvent =
   | { type: 'windows'; data: Window[] }
   | { type: 'scan'; data: ScanStatus }
@@ -853,7 +862,8 @@ export type StreamEvent =
   | { type: 'journal'; data: JournalEntry }
   | { type: 'rescue'; data: RescueProgress }
   | { type: 'setup'; data: SetupProgress }
-  | { type: 'health'; data: HealthMap };
+  | { type: 'health'; data: HealthMap }
+  | { type: 'decision'; data: StrategyDecision };
 
 // GET /state: the latest value of each StreamEvent type, so a client that (re)connects draws at once and
 // then applies /events on top. null = the engine has not produced that type yet.
@@ -867,6 +877,7 @@ export interface EngineState {
   rescue: RescueProgress | null;  // the running rescue, else the last one
   setup: SetupProgress | null;
   health: HealthMap | null;
+  decision: StrategyDecision | null;
   at: number;                     // ms, when the engine built the response
 }
 ```
@@ -908,6 +919,27 @@ only remove a window from consideration; nothing a model returns is ever sent to
 windows pass without a veto check.
 
 ## 3. Engine internals
+
+**Strategy loop** (E10, `engine/src/strategy/`). The agent finds funding, enters, holds, exits and rotates by itself;
+the contract still decides what is possible, so the loop can lose money on a bad trade but cannot move money
+anywhere the policy does not allow.
+
+- `decide.ts` (pure): `decide(DecideInput) → Decision` with the shapes in that file. Entry: the best enterable
+  window (`isEnterable`, `netAprPct ≥ minNetAprPct`) that held for `LOOP_RULES.enterAfterChecks` hourly checks in a
+  row, the 7 d and 14 d spread signs agreeing with this hour's, depth on both legs; size `legUsd` capped by the
+  policy's `max_notional_usd` less the band and by free margin; leverage ≤ `maxLeverage`, ≤ 1.5 on a leg without a
+  live rescue. Exit: expected net over the rest of the hold < 0 or under the threshold, or a sign flip, for
+  `exitAfterChecks` checks; the time stop; drawdown ≥ `stopDrawdownPct`; then `cooldownHours`. Rotation: another
+  window beats the held one by `rotate.minGainPts` for `rotate.forHours` and `switchCostUsd` pays back within the
+  hold; windows on venues that already hold the margin first; at most `maxRotationsPerDay`. Every decision carries a
+  one-line reason with the numbers; a `wait` is journaled only when its reason changes.
+- `veto.ts`: the NEAR AI veto before an enter or a rotate (the client behind `POST /policy/draft`); no answer in
+  `vetoTimeoutMs` = pass, journaled "no veto check". A veto drops the window and writes a `veto` entry.
+- `loop.ts` (serve): runs `decide` after each funding payment (the hourly check) and on each scan event, only with
+  `GIMBAL_TRADE=1` and `strategy.auto`, one decision at a time under the per-desk trader lock, never while a rescue
+  or an ADL unwind runs. It carries `act` out with the same open and close code as `pair-mainnet` (maker first),
+  publishes `decision` events and journals `enter` / `exit` / `rotate` / `veto` / `wait` with numbers and tx links,
+  and saves `LoopCounters` next to the trader state. `POST /rotate` and `POST /close` go through the same path.
 
 ```ts
 export interface VenueReader {           // engine/src/venues/venue.ts; readers only read

@@ -160,7 +160,7 @@ export interface TxRef { chain: 'near' | 'hyperliquid' | 'solana' | 'arbitrum'; 
 export interface JournalEntry {
   id: string; t: number;
   kind: 'window' | 'enter' | 'exit' | 'rotate' | 'rescue' | 'refused' | 'veto' | 'adl' | 'error' | 'funding'
-      | 'deposit' | 'withdraw' | 'fee';
+      | 'deposit' | 'withdraw' | 'fee' | 'wait';   // wait: the strategy's reason not to act changed
   summary: string;                // one line, written by the engine
   why?: string;                   // optional plain-language reason from NEAR AI; never used for decisions
   // Keys the web reads; numbers may come as decimal strings ("1050.00"). Every key is optional.
@@ -181,6 +181,15 @@ export interface RescueProgress {
 
 export type HealthMap = Record<VenueId | 'intents' | 'near', 'ok' | 'slow' | 'down'>;
 
+// The strategy loop's latest decision (engine/src/strategy/): the web's decision line. Published when it changes.
+export interface StrategyDecision {
+  action: 'off' | 'wait' | 'enter' | 'hold' | 'exit' | 'rotate';   // off: auto false or GIMBAL_TRADE not 1
+  reason: string;                 // one line, engine-written, with the numbers ("XLM 14.2 % net, 2 of 3 hours above 10 %")
+  windowId: string | null;        // the window entered, rotated into or waited for
+  heldId: string | null;          // the window the desk holds, if any
+  at: number;                     // ms
+}
+
 export type StreamEvent =
   | { type: 'windows'; data: Window[] }
   | { type: 'scan'; data: ScanStatus }
@@ -188,7 +197,8 @@ export type StreamEvent =
   | { type: 'journal'; data: JournalEntry }
   | { type: 'rescue'; data: RescueProgress }
   | { type: 'setup'; data: SetupProgress }
-  | { type: 'health'; data: HealthMap };
+  | { type: 'health'; data: HealthMap }
+  | { type: 'decision'; data: StrategyDecision };
 
 // GET /state: the latest value of each StreamEvent type, so a client that (re)connects draws at once and
 // then applies /events on top. null = the engine has not produced that type yet.
@@ -202,5 +212,6 @@ export interface EngineState {
   rescue: RescueProgress | null;  // the running rescue, else the last one
   setup: SetupProgress | null;
   health: HealthMap | null;
+  decision: StrategyDecision | null;
   at: number;                     // ms, when the engine built the response
 }
