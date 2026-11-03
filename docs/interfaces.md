@@ -982,9 +982,75 @@ notional. Lines (`thresholds.ts`):
 
 Rescue triggers are per leg: a leg that reaches rescue is triggered once; while it stays in rescue it is triggered
 again only when its rescue failed or lapsed (no end within 370 s), after a backoff of 30 s doubling up to 10 min. A
-leg that leaves rescue starts afresh. ADL detection (`engine/src/risk/adl.ts`: a leg that shrank without an order of
-ours is re-hedged or unwound with reduce-only orders) exists but is **not active**: `serve` does not wire it into the
-risk engine yet (TODO day 10, once serve holds the strategy engine's pair trader).
+leg that leaves rescue starts afresh.
+
+**The pair in serve (mainnet).** `serve` adopts the carry pair `pair-mainnet open` made from the venues at start
+(`engine/src/cli/serve-pair.ts`: the Hyperliquid and Phoenix legs and the relayer of `pair-mainnet-lib.ts`) and
+holds it in a `PairTrader` behind `ProtectedPair` (`engine/src/trade/protected-pair.ts`). Every order it sends is
+reduce-only and IOC, after the stored price is refreshed to last the order and its retry (the 300 s price-life rule),
+each target clamped between 0 and the leg's position when the close runs: panic_close (the contract flips the desk
+to `closing`) cancels the desk's resting Hyperliquid orders on the policy's coins and closes both legs (the Phoenix
+leg sends IOCs only, so nothing rests there), a rescue's `reduce` route makes both smaller, a confirmed ADL unwinds
+both. Serve never opens or grows a pair. It trades only with `GIMBAL_TRADE=1`, from the main checkout, never with
+`--once`, holding the per-desk lock, which `pair-mainnet --send` takes too for its whole run (neither starts while
+the other holds it; a lock file with no pid in it counts as held). The lock is
+`locks/trader-<mode>-<contract>-<desk>.lock` in the per-user state directory (`%LOCALAPPDATA%/gimbal/state/locks/` or
+`$XDG_STATE_HOME/gimbal/locks/`, not `GIMBAL_STATE_DIR`); a lock whose pid is not running is taken over. When the acquire error says the lock
+"holds no pid" (empty or partly written: a crash while it was being made), first check that no serve and no
+`pair-mainnet` runs for this desk (Task Manager or `ps`), then delete that one file and start again. Otherwise every
+protection only alerts, says so, and holds no lock. A resting order on the pair's coin at start also makes it alert
+only (it could fill under the trader). On SIGINT or SIGTERM serve starts no new trigger, waits up to 180 s in all
+(the risk engine's ADL attempt and a close in flight), then turns trading off before it releases the lock: from then
+on every close, order and cancel is refused, nothing signed. At start
+serve prints which legs are live, which protections trade, which only alert (ADL too, while it is held or the
+baselines do not offset), and which rescue routes run on mainnet.
+
+**ADL** (`engine/src/risk/adl.ts`). A leg that shrank toward zero against the trader's baseline (the positions after
+the last close, adopt or restored state; never what a watch read or reconciled) with no order of ours in flight,
+confirmed by a second read 3 s later, is ADL: the pair is paused and both legs are unwound reduce-only. The pause
+stops opens only; a rescue (its transfers and its reduce) and panic_close still run. There is no
+partial re-hedge. While the saved state held orders in flight at start (our own order may have moved a leg), a
+shrink starts no event: it is journaled once for the owner and nothing is traded, until a close result or an adopt
+sets the baselines again, or the orders are settled from the venues. An order cannot run more than 10 min after it
+was signed (a Hyperliquid IOC answers at once, a Phoenix blockhash lasts about 2 min), so once the youngest is that
+old (at start, or on a timer serve sets for it) both legs are read twice alike: when each reads its saved baseline
+moved by none, some or all of its orders in flight (each in full) and the two reads offset each other as the pair's
+net, they are adopted and the hold ends. Explained leg by leg but not offsetting (one leg moved alone: an ADL while
+serve was down looks the same as an order of ours that never went out), they are not adopted: the hold ends and the
+saved baselines stay, so the ADL watch takes the shrink (two reads, then both legs unwound reduce-only; a reduce that
+never went out is over-unwound, which is safe). While a leg has an order with no answer, nothing is adopted (the hold
+stays; tried again each minute). Every outcome but an adopt is also journaled for the owner (`error`, `owner: ...`).
+Otherwise the hold stays, and the start line `ADL -> alert only: ...` says what the owner runs (**reconcile**): check both legs
+(`npm run monitor -w engine -- --mainnet`); to close them, stop serve, `pair-mainnet close <SYM> --send`, start serve
+again (a close result clears the hold); if the legs are right as they are, stop serve, move the trader state file
+aside and start serve once with `GIMBAL_TRADER_FRESH=<contract>/<desk>`. A close clamped to the legs as read (a
+rescue's reduce queued behind another close) can leave the legs not offsetting: the pair then counts as not hedged
+before (a shrink is alerted, not unwound) until a close offsets them, and the `open:` lines say so. Each pair has one budget of 3 unwind attempts across all events and restarts, counted on disk
+before the attempt's first order; a failed attempt raises the `unhedged` alert and is retried after 60 s doubling up
+to 10 min; when the budget is spent the owner is alerted (journal `error`, `owner: ...`) and nothing more is sent.
+Every stage is journaled (`adl` with `numbers.stage`: unwound, flat, failed, gave-up, alert, not-adl), and the
+alert is cleared when the event ends. A leg that grew or flipped, or a pair that was not hedged before, is not ADL:
+it is journaled once for the owner and nothing is traded.
+
+**Trader state.** The trader's open pair, orders that may still run, Hyperliquid post-only orders not settled, the
+orders in flight and the ADL budget and pause are saved in `GIMBAL_STATE_DIR` (default: the per-user state directory,
+`%LOCALAPPDATA%/gimbal/state` or `$XDG_STATE_HOME/gimbal`) as
+`trader-<mode>-<contract>-<desk>-<desk evm>.json`, written atomically (temporary file, fsync, rename, then the
+directory fsynced on POSIX) and refused for another contract, desk or address. Every order is saved in flight, one
+entry each, before it is signed, and leaves that list only in the save that holds the trader's result for it (a
+close's result, a watch check's report, an adopt). A reader removes only its own temporary files and those of a
+process that is gone. A missing or unreadable file is not a fresh start: serve then only alerts until it is started
+once with `GIMBAL_TRADER_FRESH=<contract>/<desk>` after both legs were checked on the venues. Any other value
+(`1` included) is ignored, and so is the right one over a usable file: a usable file is always restored (a start line
+says to remove `GIMBAL_TRADER_FRESH` from the env), so a shrink that happened while serve was down is compared with the
+saved baselines and goes the normal ADL way (two agreeing reads, then the unwind). To start over a usable file, stop
+serve and move the file aside first. Legs that read flat, or a new pair opened after a flat save, start over without
+it.
+
+**Monitor** (`engine/src/risk/monitor.ts`). Every 30 min serve prints each leg (size, mark, liquidation price,
+distance, margin) and the net; a leg under 25 % from liquidation raises an alert in the journal (`error`) and the
+console when it crosses, and again every 30 min while it stays under. `npm run monitor -w engine -- --mainnet` prints
+the same once, read-only, with the trader's saved state.
 
 **Outcome unknown.** Signing and sending never guess. When the engine cannot prove an action did not run, it
 throws `OutcomeUnknown` (`engine/src/contract/types.ts`) with every id it knows: the NEAR tx hash, the HL cloid

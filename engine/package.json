@@ -14,7 +14,8 @@
     "serve": "node src/cli/serve.ts",
     "relay-hl": "node src/cli/relay-hl.ts",
     "windows": "node src/cli/windows.ts",
-    "pair-mainnet": "node src/cli/pair-mainnet.ts"
+    "pair-mainnet": "node src/cli/pair-mainnet.ts",
+    "monitor": "node src/cli/monitor.ts"
   },
   "dependencies": {
     "@ellipsis-labs/rise": "0.6.2",

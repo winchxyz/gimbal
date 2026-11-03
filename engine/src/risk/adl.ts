@@ -1,119 +1,164 @@
-// ADL detection: a leg whose position shrank without an order of ours (auto-deleveraging, or a partial liquidation;
-// the venue's account read cannot tell them apart, and both leave the pair unhedged by the same amount).
+// ADL: a leg whose position shrank without an order of ours (auto-deleveraging, or a partial liquidation; the venue's
+// account read cannot tell them apart, and both leave the pair unhedged by the same amount).
 //
-// Our own fills never look like ADL because the pair trader is asked first. A leg is compared with what the trader
-// means it to hold (its intent: the final position of its last open or close, kept up to date by its watch), and only
-// while nothing of ours can be moving it:
-//   - the trader is idle (`busy` false: no open, close or watch check queued or running);
-//   - the leg is not watched (`watching` false: no Orderly replay window of a signed order) and has no unsettled
-//     order at all (`unsettled` null: a Hyperliquid order with no answer, also one past its window that the trader
-//     has not closed out yet, or one an unwind waits on);
-//   - the intent is known (not null, not before the first open).
-// The positions are read from the venue twice, CONFIRM_MS apart, and both reads must agree: one bad read (a
-// Hyperliquid answer that leaves the coin out of assetPositions reads as 0) must not unwind a pair. The conditions
-// above are checked again after each read: an open that started meanwhile makes the reads stale, and they are dropped.
-// On Orderly the two reads are only as independent as its position(): on the fallback path that answers from the
-// private stream's session snapshot, so a wrong snapshot is read twice; Hyperliquid and Phoenix read REST each time.
+// The rule (day 10, the human's decision, in place of a re-hedge that had four bugs in review): on a confirmed ADL the
+// pair is paused and both legs are unwound reduce-only. Never a partial re-hedge.
 //
-// Shrank means: same side as the intent (or flat), smaller in size. A position that grew, or flipped side, is not
-// ADL (no venue deleverages past zero or adds size); it is reported for the owner and nothing is traded.
+// Detection. A leg is compared with its baseline: what the pair trader's last open, close or adoption left it meaning
+// to hold (PairTrader.baseline). A watch check of the trader (a replayed copy reconciled, an order with no answer that
+// ran) never moves the baseline, so nothing but the trader's own results can make a shrunk leg look expected. It is
+// compared only while nothing of ours can be moving it: the trader idle (`busy` false), the leg not watched (no
+// replay window) and with no unsettled order, and the baseline known. The positions are read twice, CONFIRM_MS apart,
+// and both reads must agree: one bad read (a Hyperliquid answer that leaves the coin out reads as 0) must not unwind a
+// pair. Shrank means: the same side as the baseline (or flat), smaller in size. A leg that grew or flipped is not ADL
+// (no venue deleverages past zero or adds size), and neither is a shrink on a pair whose baselines did not offset each
+// other (it was unhedged before): both are journaled once for the owner, and nothing is traded.
 //
-// The response is taken only when the intents offset each other (they add up to the pair's net, and that net is 0):
-// a pair that was already unhedged is the owner's to fix, and sizing a re-hedge off it would grow a leg. It goes
-// through the pair trader's close with `reduceOnly: true`, so every order is reduce-only and the close never reaches
-// its re-hedge step: nothing this sends can open or grow a position. The size kept is floored to the pair's common
-// lot (toward less exposure), so every target is one both venues can trade.
-//   - re-hedge: what remains is at least UNWIND_BELOW of the intent: the partner is reduced by as much as the leg
-//     lost, and the pair is level again at the smaller size;
-//   - unwind: less remains (or nothing): both legs are closed. A small remnant earns little funding against two
-//     takers' fees, and a leg that has been deleveraged once sits where the venue is short of counterparties.
-//     It runs in two steps: first the pair is levelled at the remnant (the partner reduced, the remnant untouched),
-//     and only once that is done are both legs closed. A partner that refuses its reduction so leaves the remnant in
-//     place as the hedge it still is; a failed second step leaves at most the remnant open, which (being under
-//     UNWIND_BELOW of the intent) is less than the exposure the ADL left.
+// The response. A confirmed ADL becomes the pair's event: the baselines and the two reads, kept until both legs read
+// flat twice alike. From then on the pair is paused (`paused`: the trader opens nothing) and each attempt is one
+// reduce-only close of both legs to zero through the pair trader. Attempts come from one budget per pair,
+// ADL_ATTEMPTS in all, not per event: each one is taken off the budget and saved (onChange) before any order goes
+// out, so neither a new reading of the legs nor a restart can refill it. Attempts are RETRY_MS apart, doubling. When
+// the budget is spent the owner alert is raised (`gaveUp`, an `error` line in the journal) and nothing more is sent.
 //
-// The outcome of a response is not taken from the close's answer (its own start read can be wrong too): the legs
-// are read again, twice CONFIRM_MS apart, and only two agreeing reads at the targets count as reached.
+// The event ends only on two agreeing reads of both legs at zero: after an attempt, or later (a late fill, the owner
+// closing by hand). Neither the trader adopting the positions a failed close left nor anything else drops it. When it
+// ends, the trader adopts the flat legs, which clears the unhedged alert this watch raised; while it lasts the alert
+// says why the pair is exposed. Every end is journaled: the event confirmed and its first attempt, every attempt's
+// result, the budget spent, the end.
 //
-// One event, one response: the same finding (same intents, same positions) is answered once. When the response did
-// not reach its targets (refused, stuck, partly filled, a close that threw, a confirming read off the targets), the
-// watch keeps it: the intents from before it (the reference), its targets, and where the legs were left. The pair
-// trader adopts what the legs hold after a failed close as its new intents, so they would show nothing off; while
-// a response is kept, findings are taken against the reference instead, and every answer is decided afresh from the
-// confirmed positions with the same checks as a first one (shrank only, the reference hedged, unwind under
-// UNWIND_BELOW). The legs where the last attempt left them are tried again after a backoff (RETRY_MS, doubling up
-// to RETRY_MAX_MS); legs that moved since (a new ADL) are answered at once, as a new event. A kept response is
-// dropped when two agreeing reads find the legs at its targets, or when the trader opens or closes on its own (its
-// intents move off what the response left). After MAX_TRIES attempts at one event the watch stops trying, flags
-// the pair unhedged and reports `gaveUp` (an `error` line in the journal: only the owner can act then; every
-// attempt costs an MPC signature). Journaled: the first answer to each event (`retry` 0), one that reached its
-// targets, and the give-up; a retry is logged as due only while the response is kept.
+// Without trading (serve's trader not live), a confirmed ADL is journaled with the owner alert and the event is kept
+// so it is not reported again; it ends the same way, when both legs read flat. While `hold` says why a shrink may be
+// an order of ours whose result was never saved (serve restarted with orders in flight), a shrink starts no event at
+// all: it is journaled once for the owner, and nothing is traded until a close result or adopt sets the baselines
+// (or serve settles those orders from the venues once they can no longer run: trade/protected-pair.ts).
+//
+// A clamped close (serve's: a rescue's reduce whose targets, computed before another close ran ahead of it, are
+// brought between 0 and the legs as read when it runs) can leave the legs not offsetting each other: its result sets
+// the baselines there and the trader's net to their sum, so the pair counts as not hedged before, and a shrink is
+// alerted to the owner, not unwound, until a close result offsets the legs again (serve's `open:` lines say so).
+// That is kept on purpose: the legs really do not offset then, and an unwind on such a pair is the owner's call.
+//
+// The pause stops opens only (the pair trader's open). It does not stop a rescue (its transfers, or its reduce, which
+// is reduce-only like the unwind and queues behind it in the trader) or panic_close.
 //
 // stop() is final: a check in flight sends nothing after it (the flag is read after every wait).
 
-import type { JournalEntry } from '@gimbal/shared';
+import type { JournalEntry, TxRef } from '@gimbal/shared';
 import type { TradeLeg } from '../trade/legs.ts';
-import { abs, floorToLot, qtyString, signedQtyString } from '../trade/lots.ts';
+import { abs, qtyString, signedQtyString } from '../trade/lots.ts';
 import type { PairResult } from '../trade/pair.ts';
-import { reducedTarget } from '../trade/pair.ts';
 import type { Clock } from '../venues/venue.ts';
 import { systemClock } from '../venues/venue.ts';
 
-/** A leg left with less than this share of its intent is unwound with its partner instead of re-hedged. */
-export const UNWIND_BELOW = 0.5;
 /** The second read that confirms a change comes this long after the first. */
 export const CONFIRM_MS = 3_000;
-/** A response that did not bring the pair level is tried again after this, doubling each time, up to RETRY_MAX_MS. */
+/** Unwind attempts per pair, over every ADL event it has: each one is at least one signed order per leg. */
+export const ADL_ATTEMPTS = 3;
+/** An unwind that did not close both legs is tried again after this, doubling each time, up to RETRY_MAX_MS. */
 export const RETRY_MS = 60_000;
-export const RETRY_MAX_MS = 30 * 60_000;
-/** Attempts at one ADL event before the watch stops and leaves it to the owner. */
-export const MAX_TRIES = 8;
+export const RETRY_MAX_MS = 10 * 60_000;
 
-/** The parts of PairTrader the ADL watch reads and drives. */
+/** The parts of the pair trader the ADL watch reads and drives. */
 export interface AdlTrader {
-  readonly legs: [TradeLeg, TradeLeg];
-  /** The pair's common lot: every size it trades is a whole number of these. */
-  readonly lot: bigint;
+  readonly legs: readonly [TradeLeg, TradeLeg];
   readonly busy: boolean;
   readonly net: bigint;
-  /** The pair trader's unhedged alert: the watch sets it when a response leaves the pair off its targets. */
+  /** The pair trader's unhedged alert: set while an event is not unwound. */
   unhedged: string | null;
   watching(leg: TradeLeg): boolean;
   unsettled(leg: TradeLeg): unknown;
-  intent(leg: TradeLeg): bigint | null | undefined;
+  /** What the last open, close or adoption left the leg meaning to hold (PairTrader.baseline). */
+  baseline(leg: TradeLeg): bigint | null | undefined;
+  /** The legs as they are now become the pair (PairTrader.adopt): used when an event ends with both legs flat. */
+  adopt(positions: readonly [bigint, bigint]): void;
   close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean }): Promise<PairResult>;
+}
+
+/** A confirmed ADL that has not ended (both legs not yet read flat twice alike). */
+export interface AdlEvent {
+  at: number;
+  /** The baselines the legs shrank from. */
+  reference: [bigint, bigint];
+  /** The two agreeing reads that confirmed it. */
+  seen: [bigint, bigint];
+  /** Unwind attempts made on this event. */
+  attempts: number;
+  /** No attempt before this (local ms); null: the next one may go now. */
+  nextAt: number | null;
+  /** The owner alert was raised (alert only, or the budget spent): it is not journaled again. */
+  alerted: boolean;
+}
+
+/** What the watch keeps across restarts (trade/trader-state.ts saves it with the trader). */
+export interface AdlState {
+  /** Unwind attempts left for this pair (ADL_ATTEMPTS for a new pair). */
+  attemptsLeft: number;
+  /** Why the pair is paused since an ADL (null: not paused); it stays after the unwind, until a new pair. */
+  paused: string | null;
+  event: AdlEvent | null;
+}
+
+export function newAdlState(): AdlState {
+  return { attemptsLeft: ADL_ATTEMPTS, paused: null, event: null };
 }
 
 export type LegChange = 'same' | 'shrank' | 'grew' | 'flipped';
 
-/** How a position compares with the intent. */
-export function legChange(intent: bigint, pos: bigint): LegChange {
-  if (pos === intent) return 'same';
-  if (intent === 0n) return 'grew';
-  if (pos !== 0n && (pos > 0n) !== (intent > 0n)) return 'flipped';
-  return abs(pos) < abs(intent) ? 'shrank' : 'grew';
+/** How a position compares with the baseline. */
+export function legChange(baseline: bigint, pos: bigint): LegChange {
+  if (pos === baseline) return 'same';
+  if (baseline === 0n) return 'grew';
+  if (pos !== 0n && (pos > 0n) !== (baseline > 0n)) return 'flipped';
+  return abs(pos) < abs(baseline) ? 'shrank' : 'grew';
 }
 
 export interface AdlFinding {
   index: 0 | 1;
   leg: TradeLeg;
-  intent: bigint;
+  baseline: bigint;
   pos: bigint;
   change: Exclude<LegChange, 'same'>;
 }
 
 export interface AdlReport {
-  findings: AdlFinding[];
-  action: 'rehedge' | 'unwind' | 'none';
-  targets: [bigint, bigint] | null;
-  result: PairResult | null;
+  /**
+   *   unwound   an attempt closed both legs (two agreeing reads at zero): the event ended
+   *   flat      both legs read flat with no attempt of this watch (closed elsewhere, a late fill): the event ended
+   *   failed    an attempt did not close both legs; the next one waits its backoff
+   *   gave-up   the budget is spent: no more orders, only the owner can act
+   *   alert     a confirmed ADL while the trader does not trade: the owner must unwind
+   *   not-adl   a leg off its baseline that is not ADL (grew, flipped, or the pair was unhedged before): nothing traded
+   */
+  stage: 'unwound' | 'flat' | 'failed' | 'gave-up' | 'alert' | 'not-adl';
   summary: string;
-  /** 0 on the first answer to this finding; n on the n-th retry after a backoff (not journaled). */
-  retry: number;
-  /** Two agreeing reads after the response found the legs at its targets (false for none, a refusal, a throw...). */
-  reached: boolean;
-  /** MAX_TRIES attempts failed: no more; only the owner can act. */
-  gaveUp: boolean;
+  findings: AdlFinding[];
+  result: PairResult | null;
+  tx: TxRef[];
+  /** The attempt this report is about (1..ADL_ATTEMPTS), 0 when none was made. */
+  attempt: number;
+  attemptsLeft: number;
+  /** Only the owner can act now: journaled as an `error` too. */
+  ownerAlert: boolean;
+}
+
+export interface AdlWatchOptions {
+  /** The saved state (attempts left, pause, an event in progress); default a new pair's. */
+  state?: AdlState;
+  /** Called after every change to the state, before any order of an attempt: it must save it or throw. */
+  onChange?: (state: AdlState) => void;
+  /** false: confirmed ADL is only alerted (serve's trader not live). */
+  trade?: boolean;
+  /**
+   * Why a shrink cannot be told from an order of ours now (serve: orders were in flight when the engine stopped, and
+   * no close result or adopt has set the baselines since), or null. While it says why, a confirmed shrink starts no
+   * event: it is alerted to the owner once and nothing is traded. An event already in progress goes on.
+   */
+  hold?: () => string | null;
+  log?: (line: string) => void;
+  clock?: Clock;
+  sleep?: (ms: number) => Promise<void>;
+  confirmMs?: number;
 }
 
 export class AdlWatch {
@@ -122,18 +167,26 @@ export class AdlWatch {
   readonly #clock: Clock;
   readonly #sleep: (ms: number) => Promise<void>;
   readonly #confirmMs: number;
-  /** The last finding answered for good (action none, or done): never answered again. */
-  #settled: string | null = null;
-  /** A response that has not reached its targets yet (see the header). */
-  #pending: Pending | null = null;
+  readonly #trade: boolean;
+  readonly #onChange: (state: AdlState) => void;
+  readonly #hold: () => string | null;
+  readonly state: AdlState;
+  /** The last finding reported as not ADL: not reported again while the legs read the same. */
+  #reported: string | null = null;
+  /** The unhedged alert this watch set on the trader (cleared when the event ends). */
+  #alert: string | null = null;
   #stopped = false;
 
-  constructor(trader: AdlTrader, options: { log?: (line: string) => void; clock?: Clock; sleep?: (ms: number) => Promise<void>; confirmMs?: number } = {}) {
+  constructor(trader: AdlTrader, options: AdlWatchOptions = {}) {
     this.#trader = trader;
     this.#log = options.log ?? (() => {});
     this.#clock = options.clock ?? systemClock;
     this.#sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.#confirmMs = options.confirmMs ?? CONFIRM_MS;
+    this.#trade = options.trade ?? true;
+    this.#onChange = options.onChange ?? (() => {});
+    this.#hold = options.hold ?? (() => null);
+    this.state = options.state ?? newAdlState();
   }
 
   /** Final: a check in flight sends nothing after this, and no check runs again. */
@@ -141,82 +194,150 @@ export class AdlWatch {
     this.#stopped = true;
   }
 
-  /** One look at both legs; null when nothing is off, nothing can be told now, or a response waits its backoff. */
+  /** Why the pair is paused (no open), or null. */
+  get paused(): string | null {
+    return this.state.paused;
+  }
+
+  /** One look at both legs; a report for every end (journal it), null when there is nothing new. */
   async check(): Promise<AdlReport | null> {
     if (this.#stopped) return null;
+    if (this.state.event !== null) return this.#follow();
     const first = await this.#read();
     if (first === null || this.#stopped) return null;
-    let p = this.#pending;
-    if (p !== null && first.intents.some((q, i) => q !== p!.adopted[i])) {
-      this.#pending = p = null;
-      this.#log('adl: the pair trader traded since the response: it is dropped');
-    }
-    const ref = p?.intents ?? first.intents;
-    if (p === null) {
-      if (findingsOf(this.#trader.legs, ref, first.positions).length === 0 || first.key === this.#settled) return null;
-    } else if (!same(first.positions, p.targets) && same(first.positions, p.left) && this.#clock.now() < p.nextAt) {
+    const seen = findingsOf(this.#trader.legs, first.baselines, first.positions);
+    if (seen.length === 0) {
+      this.#reported = null;
       return null;
     }
+    if (first.key === this.#reported) return null;
     await this.#sleep(this.#confirmMs);
     if (this.#stopped) return null;
     const second = await this.#read();
     if (this.#stopped) return null;
     if (second === null || second.key !== first.key) {
-      this.#log(`adl: ${describe(findingsOf(this.#trader.legs, ref, first.positions))} not confirmed by a read ${this.#confirmMs / 1000} s later: nothing done`);
+      this.#log(`adl: ${describe(seen)} not confirmed by a read ${this.#confirmMs / 1000} s later: nothing done`);
       return null;
     }
-    const findings = findingsOf(this.#trader.legs, ref, second.positions);
-    if (p !== null && (same(second.positions, p.targets) || findings.length === 0)) {
-      this.#pending = null;
-      this.#log('adl: two reads find the legs at the response\'s targets: done');
-      return null;
+    const ref = second.baselines;
+    const pos = second.positions;
+    if (seen.some((f) => f.change !== 'shrank')) {
+      this.#reported = second.key;
+      return this.#report('not-adl', `position off the baseline, not ADL, nothing traded: ${seen.map((f) => `${f.leg.venue} ${f.leg.symbol} ${f.change} ${signedQtyString(f.baseline)} -> ${signedQtyString(f.pos)}`).join('; ')}; the owner must look`, seen, { ownerAlert: true });
     }
-    const retry = p === null || !same(second.positions, p.left) ? 0 : p.tries;
-    const report = await this.#answer(findings, second.positions, ref, retry);
-    if (report.action === 'none') {
-      if (p !== null) {
-        this.#pending = null;
-        this.#trader.unhedged = `adl: ${report.summary}`;
-      }
-      this.#settled = second.key;
-      return report;
+    if (this.#trader.net !== 0n || ref[0] + ref[1] !== 0n) {
+      this.#reported = second.key;
+      return this.#report('not-adl', `${describe(seen)} shrank without an order of ours, but the pair was not hedged before (baselines ${ref.map(signedQtyString).join(' and ')}): nothing traded, the owner must act`, seen, { ownerAlert: true });
     }
-    if (this.#stopped) return report;
-    return this.#after(report, ref, second.positions, retry + 1);
+    const hold = this.#hold();
+    if (hold !== null) {
+      this.#reported = second.key;
+      return this.#report('alert', `${describe(seen)} shrank against the baselines, not taken as ADL (${hold}): no event, nothing traded; the owner must check both legs`, seen, { ownerAlert: true });
+    }
+    const event: AdlEvent = { at: this.#clock.now(), reference: ref, seen: pos, attempts: 0, nextAt: null, alerted: false };
+    this.state.event = event;
+    this.state.paused = `ADL on ${describe(seen)} at ${iso(event.at)}`;
+    this.#changed();
+    const head = `ADL on ${describe(seen)} (shrank without an order of ours, two reads ${this.#confirmMs / 1000} s apart): the pair is paused`;
+    this.#log(`adl: ${head}`);
+    if (pos[0] === 0n && pos[1] === 0n) return this.#end('flat', `${head}; both legs read flat: nothing to unwind`, seen, null, 0);
+    if (!this.#trade) {
+      event.alerted = true;
+      this.#raise(`adl: ${head}; this engine does not trade: unwind both legs by hand`);
+      this.#changed();
+      return this.#report('alert', `${head}; this engine does not trade (alert only): unwind both legs by hand`, seen, { ownerAlert: true });
+    }
+    if (this.state.attemptsLeft <= 0) {
+      event.alerted = true;
+      this.#raise(`adl: ${head}; the pair's unwind attempts are spent`);
+      this.#changed();
+      return this.#report('gave-up', `${head}; the pair's ${ADL_ATTEMPTS} unwind attempts were spent on an earlier event: no order goes out, only the owner can act now`, seen, { ownerAlert: true });
+    }
+    return this.#attempt(seen, `${head}; unwinding both legs reduce-only`);
   }
 
-  /**
-   * After a response: the legs read twice; reached only when both reads agree and are at the targets. Otherwise the
-   * response is kept for a retry, or, after MAX_TRIES, given up.
-   */
-  async #after(report: AdlReport, ref: [bigint, bigint], before: [bigint, bigint], tries: number): Promise<AdlReport> {
-    const t = this.#trader;
-    const targets = report.targets!;
+  /** An event in progress: ended when both legs read flat; else the next attempt when the budget and backoff allow. */
+  async #follow(): Promise<AdlReport | null> {
+    const ev = this.state.event!;
+    if (this.#trader.busy) return null;
+    const pos = await this.#outcome();
+    if (pos === null || this.#stopped) return null;
+    const findings = findingsOf(this.#trader.legs, ev.reference, pos);
+    const head = `ADL of ${iso(ev.at)}`;
+    if (pos[0] === 0n && pos[1] === 0n) return this.#end('flat', `${head}: both legs read flat (closed outside this watch, or a late fill): the event ends`, findings, null, 0);
+    if (!this.#trade) return null;
+    if (this.state.attemptsLeft <= 0) {
+      if (ev.alerted) return null;
+      ev.alerted = true;
+      this.#raise(`adl: ${head}: the pair's unwind attempts are spent`);
+      this.#changed();
+      return this.#report('gave-up', `${head}: the pair's ${ADL_ATTEMPTS} unwind attempts are spent and ${legsText(this.#trader.legs, pos)} are still open: no more orders, only the owner can act now`, findings, { ownerAlert: true });
+    }
+    if (ev.nextAt !== null && this.#clock.now() < ev.nextAt) return null;
+    return this.#attempt(findings, `${head}: ${legsText(this.#trader.legs, pos)} still open; unwinding both legs reduce-only`);
+  }
+
+  /** One unwind attempt, taken off the budget and saved before any order goes out. */
+  async #attempt(findings: AdlFinding[], head: string): Promise<AdlReport | null> {
+    const ev = this.state.event!;
+    this.state.attemptsLeft--;
+    ev.attempts++;
+    const n = ADL_ATTEMPTS - this.state.attemptsLeft;
+    ev.nextAt = this.#clock.now() + Math.min(RETRY_MAX_MS, RETRY_MS * 2 ** (ev.attempts - 1));
+    // A save that throws stops the attempt here: no order goes out that the budget on disk does not count.
+    this.#changed();
+    if (this.#stopped) return null;
+    let result: PairResult | null = null;
+    let error: string | null = null;
+    try {
+      result = await this.#trader.close({ reason: `adl: unwind both legs (attempt ${n} of ${ADL_ATTEMPTS})`, targets: [0n, 0n], reduceOnly: true });
+    } catch (err) {
+      error = errorText(err);
+    }
     const left = await this.#outcome();
-    const reached = report.reached && left !== null && same(left, targets);
-    if (report.reached && !reached) {
-      report.summary += `; but ${left === null ? 'the legs could not be read twice alike' : `the legs read ${left.map(signedQtyString).join(' and ')}`} ${this.#confirmMs / 1000} s later, not ${targets.map(signedQtyString).join(' and ')}`;
+    const tx = result?.tx ?? [];
+    if (left !== null && left[0] === 0n && left[1] === 0n) {
+      return this.#end('unwound', `${head}: attempt ${n} of ${ADL_ATTEMPTS} closed both legs`, findings, result, n);
     }
-    report.reached = reached;
-    if (reached) {
-      this.#pending = null;
-      return report;
+    const why = [
+      error === null ? `the close ended ${result!.status}${result!.notes.length === 0 ? '' : ` (${result!.notes.at(-1)})`}` : `the close failed: ${error}`,
+      left === null ? 'the legs could not be read twice alike after it' : `${legsText(this.#trader.legs, left)} after it`,
+    ].join('; ');
+    this.#raise(`adl: ${head}: attempt ${n} of ${ADL_ATTEMPTS} did not close both legs: ${why}`);
+    if (this.state.attemptsLeft <= 0) {
+      ev.alerted = true;
+      this.#changed();
+      return this.#report('gave-up', `${head}: attempt ${n} of ${ADL_ATTEMPTS} did not close both legs (${why}); the pair's unwind attempts are spent: no more orders, only the owner can act now`, findings, { result, tx, attempt: n, ownerAlert: true });
     }
-    t.unhedged = `adl: ${report.summary}`;
-    const at = left ?? before;
-    const adopted = t.legs.map((leg) => t.intent(leg) ?? null) as [bigint | null, bigint | null];
-    if (tries >= MAX_TRIES) {
-      this.#pending = null;
-      this.#settled = `${adopted.join(',')} ${at.join(',')}`;
-      report.gaveUp = true;
-      report.summary += `; ${tries} tries did not bring the pair level: no more tries, only the owner can act now`;
-      this.#log(`adl: ${report.summary}`);
-      return report;
-    }
-    const nextAt = this.#clock.now() + Math.min(RETRY_MAX_MS, RETRY_MS * 2 ** (tries - 1));
-    this.#pending = { intents: ref, targets, adopted, left: at, tries, nextAt };
-    this.#log(`adl: ${report.summary}; tried ${tries}x, next try after ${iso(nextAt)}`);
-    return report;
+    this.#changed();
+    return this.#report('failed', `${head}: attempt ${n} of ${ADL_ATTEMPTS} did not close both legs (${why}); ${this.state.attemptsLeft} left, the next after ${iso(ev.nextAt!)}`, findings, { result, tx, attempt: n });
+  }
+
+  /** The event ends: the flat legs become the pair, the alert this watch raised is gone; the pause stays. */
+  #end(stage: 'unwound' | 'flat', summary: string, findings: AdlFinding[], result: PairResult | null, attempt: number): AdlReport {
+    this.state.event = null;
+    this.#trader.adopt([0n, 0n]);
+    if (this.#alert !== null && this.#trader.unhedged === this.#alert) this.#trader.unhedged = null;
+    this.#alert = null;
+    this.#changed();
+    return this.#report(stage, summary, findings, { result, tx: result?.tx ?? [], attempt });
+  }
+
+  #raise(alert: string): void {
+    this.#alert = alert;
+    this.#trader.unhedged = alert;
+  }
+
+  #changed(): void {
+    this.#onChange(this.state);
+  }
+
+  #report(stage: AdlReport['stage'], summary: string, findings: AdlFinding[], extra: { result?: PairResult | null; tx?: TxRef[]; attempt?: number; ownerAlert?: boolean } = {}): AdlReport {
+    this.#log(`adl: ${summary}`);
+    return {
+      stage, summary, findings, result: extra.result ?? null, tx: extra.tx ?? [], attempt: extra.attempt ?? 0,
+      attemptsLeft: this.state.attemptsLeft, ownerAlert: extra.ownerAlert ?? false,
+    };
   }
 
   /** Both legs read now and CONFIRM_MS later; the positions when the two reads agree, else null. */
@@ -224,10 +345,11 @@ export class AdlWatch {
     try {
       const a = await Promise.all(this.#trader.legs.map((leg) => leg.position()));
       await this.#sleep(this.#confirmMs);
+      if (this.#stopped) return null;
       const b = await Promise.all(this.#trader.legs.map((leg) => leg.position()));
-      return same(a, b) ? [a[0]!, a[1]!] : null;
+      return a[0] === b[0] && a[1] === b[1] ? [a[0]!, a[1]!] : null;
     } catch (err) {
-      this.#log(`adl: the legs could not be read after the response: ${errorText(err)}`);
+      this.#log(`adl: the legs could not be read: ${errorText(err)}`);
       return null;
     }
   }
@@ -235,169 +357,79 @@ export class AdlWatch {
   /** Both legs read while nothing of ours moves them; null when that cannot be told now. */
   async #read(): Promise<Read | null> {
     const positions: bigint[] = [];
-    const intents: bigint[] = [];
+    const baselines: bigint[] = [];
     for (const index of [0, 1] as const) {
       const leg = this.#trader.legs[index];
-      const intent = this.#quiet(leg);
-      if (intent === null) return null;
+      const base = this.#quiet(leg);
+      if (base === null) return null;
       let pos: bigint;
       try {
         pos = await leg.position();
       } catch (err) {
-        this.#log(`adl: ${leg.venue} ${leg.symbol}: position unread (${err instanceof Error ? err.message : String(err)}): not checked`);
+        this.#log(`adl: ${leg.venue} ${leg.symbol}: position unread (${errorText(err)}): not checked`);
         return null;
       }
       // Our own order may have started while the read was out: its answer is stale then.
-      if (this.#quiet(leg) !== intent) return null;
+      if (this.#quiet(leg) !== base) return null;
       positions.push(pos);
-      intents.push(intent);
+      baselines.push(base);
     }
-    const key = `${intents.join(',')} ${positions.join(',')}`;
-    return { positions: positions as [bigint, bigint], intents: intents as [bigint, bigint], key };
+    const key = `${baselines.join(',')} ${positions.join(',')}`;
+    return { positions: positions as [bigint, bigint], baselines: baselines as [bigint, bigint], key };
   }
 
-  /** The leg's intent when nothing of ours can be moving it; null otherwise. */
+  /** The leg's baseline when nothing of ours can be moving it; null otherwise. */
   #quiet(leg: TradeLeg): bigint | null {
     const t = this.#trader;
     if (t.busy || t.watching(leg) || t.unsettled(leg) !== null) return null;
-    const intent = t.intent(leg);
-    return intent === undefined ? null : intent;
-  }
-
-  /** The answer to findings against the reference intents `ref`, decided from the confirmed positions `pos`. */
-  async #answer(findings: AdlFinding[], pos: [bigint, bigint], ref: [bigint, bigint], retry: number): Promise<AdlReport> {
-    const what = describe(findings);
-    const none = (summary: string): AdlReport => {
-      this.#log(`adl: ${summary}`);
-      return { findings, action: 'none', targets: null, result: null, summary, retry, reached: false, gaveUp: false };
-    };
-    if (findings.some((f) => f.change !== 'shrank')) {
-      return none(`position off the intent, not ADL, nothing traded: ${findings.map((f) => `${f.leg.venue} ${f.leg.symbol} ${f.change} ${signedQtyString(f.intent)} -> ${signedQtyString(f.pos)}`).join('; ')}`);
-    }
-    if (this.#trader.net !== 0n || ref[0] + ref[1] !== 0n) {
-      return none(`${what} shrank without an order of ours, but the pair was not hedged before (intents ${ref.map(signedQtyString).join(' and ')}): nothing traded, the owner must act`);
-    }
-    // The size both legs can still offset: what the shrunk leg (or the smaller of two) kept, in whole common lots.
-    const t = this.#trader;
-    const kept = level(pos, t.lot);
-    const share = Number(kept) / Number(abs(ref[0]));
-    const unwind = kept === 0n || share < UNWIND_BELOW;
-    // Each leg keeps its reference's side: the legs offset (checked above), so the levelled targets do too.
-    const levelled: [bigint, bigint] = [sign(ref[0]) * kept, sign(ref[1]) * kept];
-    for (const i of [0, 1] as const) {
-      if (pos[i] !== levelled[i] && reducedTarget(pos[i], levelled[i]) !== levelled[i]) {
-        return none(`${what}: ${t.legs[i].venue} at ${signedQtyString(pos[i])} cannot reach ${signedQtyString(levelled[i])} reduce-only: nothing traded`);
-      }
-    }
-    return this.#respond(findings, pos, levelled, unwind, share, retry);
-  }
-
-  /** Level both legs at `levelled` (reduce-only), then, for an unwind, close both. */
-  async #respond(findings: AdlFinding[], pos: [bigint, bigint], levelled: [bigint, bigint], unwind: boolean, share: number, retry: number): Promise<AdlReport> {
-    const what = describe(findings);
-    const t = this.#trader;
-    const [a, b] = t.legs;
-    const kept = abs(levelled[0]);
-    const targets: [bigint, bigint] = unwind ? [0n, 0n] : levelled;
-    const action = unwind ? 'unwind' : 'rehedge';
-    const moves = [a, b].map((l, i) => (pos[i] === levelled[i] ? null : `${l.venue} ${signedQtyString(pos[i])} -> ${signedQtyString(levelled[i])}`)).filter((x) => x !== null).join(', ');
-    const plan = unwind
-      ? `unwinding both legs (${Math.round(share * 100)} % kept, under ${UNWIND_BELOW * 100} %): levelling at ${qtyString(kept)} first${kept === 0n ? '' : ', then closing both'}`
-      : `re-hedging at ${qtyString(kept)}: ${moves}`;
-    const head = `ADL on ${what} (shrank without an order of ours)${retry > 0 ? ` (retry ${retry})` : ''}; ${plan}`;
-    this.#log(`adl: ${what} without an order of ours; ${plan}`);
-    let result: PairResult | null = null;
-    const failed = (why: string): AdlReport => ({ findings, action, targets, result, summary: `${head} failed: ${why}`, retry, reached: false, gaveUp: false });
-    try {
-      if (pos.some((q, i) => q !== levelled[i])) {
-        result = await t.close({ reason: `adl: ${what}${unwind ? ' (level first)' : ''}`, targets: levelled, reduceOnly: true });
-      }
-      if (unwind && kept > 0n && (result === null || result.status === 'closed')) {
-        if (this.#stopped) return failed('the watch stopped before the second step');
-        const first = result;
-        result = await t.close({ reason: `adl: ${what} (unwind)`, targets: [0n, 0n], reduceOnly: true });
-        if (first !== null) result = { ...result, tx: [...first.tx, ...result.tx], notes: [...first.notes, ...result.notes] };
-      }
-    } catch (err) {
-      return failed(errorText(err));
-    }
-    const reached = result === null || result.status === 'closed';
-    const done = reached ? (unwind ? 'both legs closed' : 'level again') : `pair ${result!.status}: ${result!.notes.at(-1) ?? ''}`;
-    return { findings, action, targets, result: result ?? closedNothing(), summary: `${head}: ${done}`, retry, reached, gaveUp: false };
+    const base = t.baseline(leg);
+    return base === undefined ? null : base;
   }
 }
 
 interface Read {
   positions: [bigint, bigint];
-  intents: [bigint, bigint];
+  baselines: [bigint, bigint];
   key: string;
 }
 
-interface Pending {
-  intents: [bigint, bigint];        // the reference: the trader's intents before the first response
-  targets: [bigint, bigint];        // where the last attempt meant to take the legs
-  adopted: [bigint | null, bigint | null];   // the trader's intents right after it
-  left: [bigint, bigint];           // where it left them (confirmed when it could be)
-  tries: number;                    // attempts at this event
-  nextAt: number;
-}
-
-/** The legs off the reference intents. */
-function findingsOf(legs: readonly [TradeLeg, TradeLeg], ref: [bigint, bigint], pos: [bigint, bigint]): AdlFinding[] {
+/** The legs off the baselines `ref`. */
+function findingsOf(legs: readonly [TradeLeg, TradeLeg], ref: readonly [bigint, bigint], pos: readonly [bigint, bigint]): AdlFinding[] {
   const out: AdlFinding[] = [];
   for (const index of [0, 1] as const) {
     const change = legChange(ref[index], pos[index]);
-    if (change !== 'same') out.push({ index, leg: legs[index], intent: ref[index], pos: pos[index], change });
+    if (change !== 'same') out.push({ index, leg: legs[index], baseline: ref[index], pos: pos[index], change });
   }
   return out;
 }
 
-function same(a: readonly bigint[], b: readonly bigint[]): boolean {
-  return a.length === b.length && a.every((q, i) => q === b[i]);
+function legsText(legs: readonly [TradeLeg, TradeLeg], pos: readonly [bigint, bigint]): string {
+  return legs.map((l, i) => `${l.venue} ${l.symbol} ${signedQtyString(pos[i]!)}`).join(' and ');
 }
 
-/** The size both legs can offset: the smaller of the two, floored to whole lots. */
-function level(pos: [bigint, bigint], lot: bigint): bigint {
-  const small = abs(pos[0]) < abs(pos[1]) ? abs(pos[0]) : abs(pos[1]);
-  return floorToLot(small, lot);
-}
-
-function sign(q: bigint): bigint {
-  return q < 0n ? -1n : 1n;
+function describe(findings: AdlFinding[]): string {
+  return findings.map((f) => `${f.leg.venue} ${f.leg.symbol} ${signedQtyString(f.baseline)} -> ${signedQtyString(f.pos)}`).join(', ');
 }
 
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/** A response with nothing to send (the legs were already at its targets). */
-function closedNothing(): PairResult {
-  return { status: 'closed', size: '0', legs: [] as unknown as PairResult['legs'], notes: ['both legs were already at their targets'], tx: [], feeUsd: 0, feeUnknown: 0 };
-}
-
-function describe(findings: AdlFinding[]): string {
-  return findings.map((f) => `${f.leg.venue} ${f.leg.symbol} ${signedQtyString(f.intent)} -> ${signedQtyString(f.pos)}`).join(', ');
-}
-
 function iso(ms: number): string {
   return new Date(ms).toISOString();
 }
 
-/** The journal entry for an ADL report (kind `adl`), without its id. */
-export function adlJournal(report: AdlReport, t: number): Omit<JournalEntry, 'id'> {
-  const f = report.findings[0]!;
-  return {
-    t,
-    kind: 'adl',
-    summary: report.summary,
-    numbers: {
-      venue: f.leg.venue,
-      before: signedQtyString(f.intent),
-      after: signedQtyString(f.pos),
-      lost: qtyString(abs(f.intent - f.pos)),
-      action: report.action,
-      ...(report.retry > 0 ? { retry: report.retry } : {}),
-    },
-    tx: report.result?.tx ?? [],
+/** The journal entries of an ADL report (kind `adl`, and an `error` when only the owner can act), without ids. */
+export function adlJournal(report: AdlReport, t: number): Omit<JournalEntry, 'id'>[] {
+  const f = report.findings[0];
+  const numbers: Record<string, number | string> = {
+    stage: report.stage, attemptsLeft: report.attemptsLeft,
+    ...(report.attempt > 0 ? { attempt: report.attempt } : {}),
+    ...(f === undefined ? {} : { venue: f.leg.venue, before: signedQtyString(f.baseline), after: signedQtyString(f.pos), lost: qtyString(abs(f.baseline - f.pos)) }),
   };
+  const out: Omit<JournalEntry, 'id'>[] = [{ t, kind: 'adl', summary: report.summary, numbers, tx: [...report.tx] }];
+  if (report.ownerAlert) {
+    out.push({ t, kind: 'error', summary: `owner: ${report.summary}`, numbers: { ...(f === undefined ? {} : { venue: f.leg.venue }), stage: report.stage }, tx: [] });
+  }
+  return out;
 }

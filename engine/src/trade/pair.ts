@@ -103,6 +103,15 @@ export interface MakerFirst {
   index: 0 | 1;
 }
 
+/** PairTrader.close's request (see there). */
+export interface CloseRequest {
+  reason: string;
+  targets?: [bigint, bigint];
+  reduceOnly?: boolean;
+  maker?: MakerFirst;
+  clampTargets?: boolean;
+}
+
 /** What one push check did: the watched leg first, then its partner when a deficit moved it. */
 export interface WatchReport {
   status:
@@ -136,6 +145,20 @@ export interface PairTraderOptions {
   unsettledPollMs?: number | null;
   /** Why no open may go out now (a desk closing after panic_close), or null; read before every open. */
   openBlocked?: () => string | null;
+}
+
+/**
+ * What a trader keeps across a restart (trade/trader-state.ts writes it to disk): what each leg should hold and what
+ * the last open, close or adoption left it meaning to hold (the ADL baseline), where it last knew each leg to be, the
+ * pair's net, the alert, and every order with no answer that may still run. Index 0 and 1 are `legs`.
+ */
+export interface PairTraderState {
+  intents: [bigint | null, bigint | null];
+  baselines: [bigint | null, bigint | null];
+  known: [bigint | null, bigint | null];
+  net: bigint;
+  unhedged: string | null;
+  unsettled: { index: 0 | 1; refs: LegRef[]; until: number; from: bigint; unwind: { to: bigint; reason: string; failed: boolean } | null }[];
 }
 
 /**
@@ -197,6 +220,12 @@ export class PairTrader {
    * unsettled order, what offsets its partner.
    */
   readonly #intent = new Map<TradeLeg, bigint | null>();
+  /**
+   * What the last open, close or adoption left each leg meaning to hold. Unlike #intent, a watch check (a replayed copy
+   * reconciled, a deficit matched) never moves it: the ADL watch compares the venues with this, so nothing but the
+   * trader's own results can make a leg that shrank look expected.
+   */
+  readonly #baseline = new Map<TradeLeg, bigint | null>();
   /** Where the trader last knew each leg to be (a result or a check); an unsettled leg that moves from it ran its order. */
   readonly #known = new Map<TradeLeg, bigint | null>();
   /** What both legs together should hold: the sum of the last open's or close's targets (0 for a plain pair). */
@@ -212,6 +241,11 @@ export class PairTrader {
 
   /** The last push check that found a leg off its intent (for logs and tests). */
   lastWatch: WatchReport | null = null;
+  /**
+   * Counts the times the baselines were set from the venues: every open or close result and every adopt (not a
+   * refusal that sent nothing, nor importState). A caller compares it before and after an operation.
+   */
+  baselineEpoch = 0;
   /**
    * Why the pair is exposed: set by an unhedged result or watch check; cleared by the next open or close, or by a watch
    * check that leaves the legs offsetting each other again.
@@ -335,8 +369,10 @@ export class PairTrader {
    * Brings both legs to `targets` (default flat) with reduce-only orders. A leg that stays open is normally re-hedged by
    * reopening its partner against it (not reduce-only); `reduceOnly: true` forbids that step, so nothing this close
    * sends can open or grow a position (the ADL response): the pair is then left stuck or unhedged, with the alert.
+   * `clampTargets`: each target is brought between 0 and the leg's position as read when the close runs (a target
+   * computed from an older read, queued behind another close, must not ask a leg to grow or cross zero).
    */
-  close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean; maker?: MakerFirst }): Promise<PairResult> {
+  close(request: CloseRequest): Promise<PairResult> {
     return this.#serial(async () => {
       const end = this.#beginMaker(request.maker);
       try {
@@ -410,6 +446,66 @@ export class PairTrader {
   /** What both legs together should hold: the sum of the last open's or close's targets (0 for a plain pair). */
   get net(): bigint {
     return this.#net;
+  }
+
+  /** What the last open, close or adoption left the leg meaning to hold (null: unknown; undefined: none yet). */
+  baseline(leg: TradeLeg): bigint | null | undefined {
+    return this.#baseline.get(leg);
+  }
+
+  /**
+   * Takes the venues' positions as the pair (a trader that starts next to a pair opened elsewhere, or legs found flat):
+   * intent, baseline and known position of each leg, and the net they should hold together. The alert is cleared when
+   * they offset each other and set when they do not. Unsettled orders stay watched.
+   */
+  adopt(positions: readonly [bigint, bigint], net = 0n): void {
+    this.baselineEpoch++;
+    this.#net = net;
+    for (const [i, leg] of this.legs.entries()) {
+      this.#intent.set(leg, positions[i]!);
+      this.#baseline.set(leg, positions[i]!);
+      this.#known.set(leg, positions[i]!);
+    }
+    const off = positions[0] + positions[1] - net;
+    this.unhedged = off === 0n
+      ? null
+      : `unhedged: adopted ${this.legs.map((l, i) => `${l.venue} ${l.symbol} ${signedQtyString(positions[i]!)}`).join(', ')}, which do not offset each other`;
+    this.#log(`adopted ${this.legs.map((l, i) => `${l.venue} ${l.symbol} ${signedQtyString(positions[i]!)}`).join(', ')}${off === 0n ? '' : ' (NOT offsetting)'}`);
+  }
+
+  /** The state a restart needs (see PairTraderState). */
+  exportState(): PairTraderState {
+    const pair = <T>(m: Map<TradeLeg, T>): [T | null, T | null] => [m.get(this.legs[0]) ?? null, m.get(this.legs[1]) ?? null];
+    const unsettled: PairTraderState['unsettled'] = [];
+    for (const [i, leg] of this.legs.entries()) {
+      const u = this.#unsettled.get(leg);
+      if (u === undefined) continue;
+      unsettled.push({ index: i as 0 | 1, refs: u.refs.map((r) => ({ ...r, tx: [...r.tx] })), until: u.until, from: u.from, unwind: u.unwind === null ? null : { ...u.unwind } });
+    }
+    return { intents: pair(this.#intent), baselines: pair(this.#baseline), known: pair(this.#known), net: this.#net, unhedged: this.unhedged, unsettled };
+  }
+
+  /**
+   * A saved state back in a new trader, before it trades: each order with no answer is watched again until its own
+   * window ends (its poll starts), and the intents are the saved ones, not what the venues hold now.
+   */
+  importState(s: PairTraderState): void {
+    if (this.#active > 0) throw new Error('importState: the trader is busy');
+    this.#net = s.net;
+    for (const [i, leg] of this.legs.entries()) {
+      this.#intent.set(leg, s.intents[i] ?? null);
+      this.#baseline.set(leg, s.baselines[i] ?? null);
+      this.#known.set(leg, s.known[i] ?? null);
+    }
+    this.unhedged = s.unhedged;
+    for (const u of s.unsettled) {
+      const leg = this.legs[u.index];
+      const ref = u.refs.at(-1);
+      if (ref === undefined) continue;
+      this.#unsettled.set(leg, { ref, refs: [...u.refs], until: u.until, from: u.from, unwind: u.unwind });
+      this.#log(`${leg.venue} ${leg.symbol}: ${u.refs.length === 1 ? 'an order' : `${u.refs.length} orders`} with no answer from before the restart (${u.refs.map(refId).join(', ')}): watched until ${iso(u.until)}`);
+      this.#poll(leg);
+    }
   }
 
   /**
@@ -518,13 +614,19 @@ export class PairTrader {
     return hedge;
   }
 
-  async #close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean; maker?: MakerFirst }): Promise<PairResult> {
-    const targets = request.targets ?? [0n, 0n];
+  async #close(request: CloseRequest): Promise<PairResult> {
     // Not refused while an order has no answer: a reduce-only close cannot double it, and its watch stays on.
     const starts = await Promise.all(this.legs.map((leg) => leg.position()));
+    const asked = request.targets ?? [0n, 0n];
+    const targets: [bigint, bigint] = request.clampTargets === true ? [towardZero(starts[0]!, asked[0]), towardZero(starts[1]!, asked[1])] : asked;
     const runs = this.legs.map((leg, i) => this.#run(leg, starts[i]!, targets[i]!)) as [LegRun, LegRun];
     const size = abs(starts[0]! - targets[0]!) > abs(starts[1]! - targets[1]!) ? abs(starts[0]! - targets[0]!) : abs(starts[1]! - targets[1]!);
     const notes: string[] = [];
+    for (const i of [0, 1] as const) {
+      if (targets[i] !== asked[i]) notes.push(`${this.legs[i].venue} target ${signedQtyString(asked[i])} is past its position ${signedQtyString(starts[i]!)} read now (toward zero only): ${signedQtyString(targets[i])}`);
+    }
+    // A clamped pair of targets may not offset each other: the net is what they hold together (risk/adl.ts: the pair
+    // then counts as not hedged before until a close offsets the legs again).
     const net = targets[0] + targets[1];
     if (runs.every((r) => r.pos === r.target)) {
       notes.push('both legs were already at their close targets');
@@ -1119,6 +1221,7 @@ export class PairTrader {
   }
 
   #result(status: PairStatus, size: bigint, runs: [LegRun, LegRun], notes: string[], net: bigint): PairResult {
+    this.baselineEpoch++;
     this.#net = net;
     // A newer open or close decides what each leg should hold: an unwind left from an older open no longer applies.
     for (const u of this.#unsettled.values()) u.unwind = null;
@@ -1140,6 +1243,7 @@ export class PairTrader {
       if (partner.pos !== null && partner.unsettled === null) this.#intent.set(r.leg, net - partner.pos);
       this.#armUnsettled(r);
     }
+    for (const r of runs) this.#baseline.set(r.leg, this.#intent.get(r.leg) ?? null);
     this.unhedged = status === 'unhedged' ? notes.at(-1) ?? 'unhedged' : null;
     const tx = runs.flatMap((r) => r.report.orders.flatMap((o) => o.ref.tx));
     const fills = runs.flatMap((r) => r.report.orders.filter((o) => o.outcome === 'filled'));
@@ -1309,6 +1413,13 @@ export function reducedTarget(pos: bigint, target: bigint): bigint | null {
 
 function crossesZero(from: bigint, to: bigint): boolean {
   return (from > 0n && to < 0n) || (from < 0n && to > 0n);
+}
+
+/** `target` brought between 0 and `pos` (both ends included): a close may only shrink the leg. */
+function towardZero(pos: bigint, target: bigint): bigint {
+  const lo = pos < 0n ? pos : 0n;
+  const hi = pos > 0n ? pos : 0n;
+  return target < lo ? lo : target > hi ? hi : target;
 }
 
 /** The legs offset each other: together they hold what the pair's targets add up to (0 for a pair). */
