@@ -6,7 +6,9 @@
 //   mainnet   live only with GIMBAL_RESCUE=1, since it is the part of serve that moves money: it loads the operator
 //             key (OPERATOR_PRIVATE_KEY) and the relayer's gas wallet (RELAYER_EVM_PRIVATE_KEY) by name, never printed,
 //             and calls 1Click (ONECLICK_API_KEY optional: it only lowers the fee). Without it the risk engine only
-//             detects (the trigger is published at `detect`) and the owner acts.
+//             detects (the trigger is published at `detect`) and the owner acts. Its holds and cap meter are kept in
+//             GIMBAL_STATE_DIR (rescue-mainnet-<desk>.json, state.ts); off mainnet nothing real can be held, so the
+//             recorded worlds keep theirs in memory.
 //
 // Live routes wired here: the reserve (fund_venue) and Hyperliquid (hl_withdraw, then evm_usdc_to_intents). Phoenix
 // as a source needs sol_sign_rescue's message (Phoenix withdraw + Ember unwrap + the transfer) built from Phoenix's
@@ -34,6 +36,8 @@ import type { VerifiedQuote } from './oneclick.ts';
 import { RecordedOneClick, SimulatedMoney, loadRescueRecording, steadyClock } from './recorded.ts';
 import type { Payer, Reducer, RescueDesk, RescuerOptions } from './rescuer.ts';
 import { Rescuer } from './rescuer.ts';
+import type { Eip3009Ref } from './state.ts';
+import { RescueStateStore, rescueStateFile } from './state.ts';
 
 export interface ServeRescueInput {
   mode: Mode;
@@ -52,6 +56,8 @@ export interface ServeRescueInput {
   /** The policy serve runs with (replay: the policy file, else the recording's). */
   policy: ContractPolicy | null;
   reducer?: () => Reducer | null;
+  /** GIMBAL_STATE_DIR: where a live rescuer keeps its holds and counters across restarts (state.ts). */
+  stateDir?: string;
 }
 
 export interface ServeRescue {
@@ -165,18 +171,21 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
       return { tx, send: async () => ({ tx: [], depositTx: tx[0]?.id ?? '' }) };
     },
   };
+  // An authorization can never run once validBefore has passed (by this clock, less a minute for skew) and USDC still
+  // reads it unused; a read error is not taken as unused.
+  const authorizationNeverRuns = async (a: Eip3009Ref): Promise<boolean> => input.clock.now() > a.validBefore * 1000 + 60_000
+    && !(await arb.authorizationUsed(a.from, a.nonce));
   const arbitrum: Payer = {
     method: 'evm_usdc_to_intents',
     sign: async (q, reason) => {
       const signed = await contract.evmUsdcToIntents(deskId, { quote: q.quote, quote_signature: q.signature }, reason);
+      const authorization: Eip3009Ref = { from: signed.payload.from, nonce: signed.payload.nonce, validBefore: Number(signed.payload.validBefore) };
       return {
         tx: signed.nearTx === undefined ? [] : [signed.nearTx],
         // The authorization is public once signed and anyone may submit it until validBefore.
-        usableUntilMs: Number(signed.payload.validBefore) * 1000,
-        // It can never run once validBefore has passed (by this clock, less a minute for skew) and USDC still reads it
-        // unused; a read error is not taken as unused.
-        neverRuns: async () => input.clock.now() > Number(signed.payload.validBefore) * 1000 + 60_000
-          && !(await arb.authorizationUsed(signed.payload.from, signed.payload.nonce)),
+        usableUntilMs: authorization.validBefore * 1000,
+        authorization,
+        neverRuns: () => authorizationNeverRuns(authorization),
         send: async () => {
           const tx = await arb.submit(signed, await evm());
           return { tx, depositTx: tx.find((x) => x.chain === 'arbitrum')?.id ?? '' };
@@ -184,8 +193,10 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
       };
     },
   };
+  const store = input.stateDir === undefined ? undefined : new RescueStateStore(rescueStateFile(input.stateDir, mode, deskId));
   const rescuer = new Rescuer({
     ...common, clock: input.clock, sleep, oneClick, keyed: apiKey !== null,
+    ...(store === undefined ? {} : { store }), authorizationNeverRuns,
     desk: async () => {
       const d = await readDesk();
       return {
@@ -216,6 +227,7 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
   });
   return {
     rescuer: (t) => rescuer.take(t), closing, running: () => rescuer.runningId,
-    summary: `rescue: LIVE on mainnet (GIMBAL_RESCUE=1), operator ${cfg.accountId}, 1Click ${apiKey === null ? 'without a key (+0.2 %)' : 'with a key'}; sources: reserve, Hyperliquid via Arbitrum (Phoenix not wired)`,
+    summary: `rescue: LIVE on mainnet (GIMBAL_RESCUE=1), operator ${cfg.accountId}, 1Click ${apiKey === null ? 'without a key (+0.2 %)' : 'with a key'}; sources: reserve, Hyperliquid via Arbitrum (Phoenix not wired); `
+      + `holds and the cap meter ${store === undefined ? 'in memory only' : `kept in ${store.path}`}`,
   };
 }

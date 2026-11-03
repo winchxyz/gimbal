@@ -4,6 +4,9 @@
 // called exactly once per trigger.
 
 import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import type { Leg, RescueFailure, RescueProgress, StreamEvent, TxRef, VenueId } from '@gimbal/shared';
 import { OutcomeUnknown } from '../contract/types.ts';
@@ -16,6 +19,8 @@ import { ASSETS } from './oneclick.ts';
 import { RecordedOneClick, SimulatedMoney, loadRescueRecording } from './recorded.ts';
 import type { CreditPort, HlWithdrawPort, LandingPort, Payer, Reducer, RescueDesk, RescuerOptions } from './rescuer.ts';
 import { Rescuer } from './rescuer.ts';
+import type { Eip3009Ref } from './state.ts';
+import { RescueStateStore } from './state.ts';
 import { testQuote, testSigner } from './test-quotes.ts';
 
 const rec = loadRescueRecording();
@@ -46,6 +51,8 @@ interface World {
   logs: string[];
   steps(id?: string): RescueProgress['step'][];
   journal(): string[];
+  /** A new Rescuer on the same world (the engine restarted): the same ports, store and clock. */
+  restart(): Rescuer;
 }
 
 function world(make: (w: Pick<World, 'clock'> & { sleep: (ms: number) => Promise<void> }) => Omit<RescuerOptions, 'publish' | 'clock' | 'sleep' | 'ended' | 'failure'>): World {
@@ -55,10 +62,11 @@ function world(make: (w: Pick<World, 'clock'> & { sleep: (ms: number) => Promise
     w.t += ms;
   };
   const o = make({ clock: w.clock, sleep });
-  w.rescuer = new Rescuer({
+  w.restart = () => (w.rescuer = new Rescuer({
     log: (line) => w.logs.push(line), ...o, clock: w.clock, sleep, publish: (e) => w.events.push(e),
     ended: (id, landed) => w.ended.push([id, landed]), failure: (f) => w.failures.push(f),
-  });
+  }));
+  w.restart();
   w.steps = (id = 'rescue-1') => w.events.filter((e): e is Extract<StreamEvent, { type: 'rescue' }> => e.type === 'rescue' && e.data.id === id).map((e) => e.data.step);
   w.journal = () => w.events.filter((e): e is Extract<StreamEvent, { type: 'journal' }> => e.type === 'journal').map((e) => e.data.summary);
   return w;
@@ -171,6 +179,10 @@ interface SyntheticOptions {
   neverRuns?: () => Promise<boolean>;
   seedCap?: boolean;
   confirms?: (venue: VenueId) => string | null;
+  store?: RescueStateStore;
+  /** The EIP-3009 payments carry their authorization (as the live one does). */
+  authorization?: boolean;
+  authorizationNeverRuns?: (a: Eip3009Ref) => Promise<boolean>;
 }
 
 const venueOf = (q: VerifiedQuote): VenueId => (q.destinationAsset === ASSETS.hypercoreUsdc ? 'hyperliquid' : q.destinationAsset === ASSETS.solanaUsdc ? 'phoenix' : 'orderly');
@@ -201,9 +213,11 @@ function synthetic(o: SyntheticOptions = {}): Synthetic {
       method,
       sign: async (q) => {
         await o.sign?.();
+        const validBefore = Math.floor((clock.now() + (o.usableForMs ?? 300_000)) / 1000);
         return {
           tx: [{ chain: 'near', id: `near-${method}`, url: 'https://nearblocks.io/x' }] as TxRef[],
           ...(o.usableForMs === undefined ? {} : { usableUntilMs: clock.now() + o.usableForMs }),
+          ...(o.authorization === true && method === 'evm_usdc_to_intents' ? { authorization: { from: rec.desk.evm, nonce: `0x${q.depositAddress.slice(-8)}`, validBefore } } : {}),
           ...(o.neverRuns === undefined ? {} : { neverRuns: o.neverRuns }),
           send: async () => {
             await o.send?.();
@@ -262,7 +276,9 @@ function synthetic(o: SyntheticOptions = {}): Synthetic {
       },
     };
     return {
-      mode: 'mainnet', oneClick, keyed: true, seedCap: o.seedCap ?? false,
+      mode: 'mainnet', oneClick, keyed: true, ...(o.seedCap === undefined && o.store !== undefined ? {} : { seedCap: o.seedCap ?? false }),
+      ...(o.store === undefined ? {} : { store: o.store }),
+      ...(o.authorizationNeverRuns === undefined ? {} : { authorizationNeverRuns: o.authorizationNeverRuns }),
       desk: async () => ({ addresses: rec.desk, policy: rec.policy, reserveUsd: 100, closing: false, ...o.desk }),
       view: () => ({ legs: s.legs, freeMargin: o.freeMargin ?? { phoenix: 100 } }),
       landing,
@@ -448,6 +464,8 @@ test('a signed EIP-3009 authorization that failed to send is held until it can n
   await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
   assert.deepEqual(s.w.ended, [['a', false]]);
   assert.match(s.w.rescuer.held!, /the signed evm_usdc_to_intents of rescue a was not sent but stays usable until/);
+  assert.equal(s.w.rescuer.arbitrumOwnUsd, 0, 'its Arbitrum USDC is set aside for the signed payment');
+  assert.ok(s.arb.e6 > 20_000_000n, 'though still on the address');
   sendFails = false;
   s.status = () => ({ status: 'PENDING_DEPOSIT', body: null });
   // Past validBefore, but authorizationState is not read as unused yet (or the read failed): still held.
@@ -461,8 +479,9 @@ test('a signed EIP-3009 authorization that failed to send is held until it can n
   assert.match(s.w.rescuer.held!, /rescue a/, 'PENDING_DEPOSIT is not final yet');
   s.w.t += 10 * 60_000;
   await run(s.w, trigger({ id: 'd', venue: 'phoenix', amountUsd: 20 }));
-  assert.ok(s.w.journal().some((j) => /rescue a's signed payment can no longer run and 1Click saw no deposit 10 min later: expired unused/.test(j)));
+  assert.ok(s.w.journal().some((j) => /rescue a's signed payment can no longer run and 1Click saw no deposit 10 min later: expired unused; its \d+\.\d\d USDC on Arbitrum is the rescuer's to spend again/.test(j)));
   assert.equal(s.w.rescuer.held, null);
+  assert.equal(s.w.rescuer.arbitrumOwnUsd, Number(s.arb.e6) / 1e6, 'given back');
   assert.ok(asked.length >= 2);
 });
 
@@ -518,74 +537,138 @@ test('mainnet says at start that a restart dropped any holds and the cap meter s
   assert.ok(!synthetic().w.logs.some((l) => /rescuer started/.test(l)), 'not without the seeded cap');
 });
 
-test('Hyperliquid USDC left on Arbitrum by a failed rescue is spent first; no second hl_withdraw meanwhile', async () => {
-  let refuse = true;
+const hlWorld = (o: SyntheticOptions = {}) => {
+  let refuse = false;
   const s = synthetic({
-    desk: { reserveUsd: 0 }, legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 100 },
+    // A cap that several Hyperliquid rescues in a row fit in (each counts about twice its size).
+    desk: { reserveUsd: 0, policy: { ...rec.policy, rescue_cap_usd_per_hour: 1000 } }, legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 200 },
     quote: async (body, now) => (refuse ? { ok: false, status: 400, message: 'Quoting for this pair is not available' } : { ok: true, response: testQuote(s.signer, body, now) }),
+    ...o,
   });
+  return { s, refuse: (r: boolean) => { refuse = r; } };
+};
+
+test('Hyperliquid USDC left on Arbitrum by a failed rescue is the rescuer\'s own and spent first; no second hl_withdraw when it covers the next', async () => {
+  const { s, refuse } = hlWorld();
+  refuse(true);
   await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
   assert.deepEqual(s.w.ended, [['a', false]]);
   assert.equal(s.withdrawn.length, 1);
-  assert.match(s.w.rescuer.hlWithdrawHeld!, /left its USDC on the desk's Arbitrum address/);
   assert.ok(s.arb.e6 > 0n, 'stranded on Arbitrum');
-  refuse = false;
+  assert.equal(s.w.rescuer.arbitrumOwnUsd, Number(s.arb.e6) / 1e6, 'all of it the rescuer\'s own');
+  assert.equal(s.w.rescuer.hlWithdrawHeld, null, 'it arrived: nothing on its way');
+  refuse(false);
   await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
   assert.deepEqual(s.w.ended.at(-1), ['b', true]);
   assert.equal(s.withdrawn.length, 1, 'no second withdraw');
   assert.match(s.w.journal().join('\n'), /already on the desk's Arbitrum address \(an earlier withdraw\), no new withdraw/);
-  assert.equal(s.w.rescuer.hlWithdrawHeld, null, 'bridged: Hyperliquid may be withdrawn from again');
+  assert.equal(s.w.rescuer.arbitrumOwnUsd, Number(s.arb.e6) / 1e6, 'what is left there is still its own');
 });
 
-test('the hl_withdraw hold: less on Arbitrum than needed is bridged in part; it ends once Arbitrum reads empty with no withdraw on its way', async () => {
-  let refuse = true;
-  const s = synthetic({
-    desk: { reserveUsd: 0 }, legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 100 },
-    quote: async (body, now) => (refuse ? { ok: false, status: 400, message: 'Quoting for this pair is not available' } : { ok: true, response: testQuote(s.signer, body, now) }),
-  });
+test('USDC left on Arbitrum never blocks a withdraw: a short balance, however small, is topped up and bridged along', async () => {
+  const { s, refuse } = hlWorld();
+  refuse(true);
   await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 10 }));
-  assert.match(s.w.rescuer.hlWithdrawHeld!, /left its USDC/);
-  const stranded = s.arb.e6;
-  refuse = false;
-  // A bigger rescue: what is on Arbitrum is bridged first, all of it, and no second withdraw.
-  await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 40 }));
+  refuse(false);
+  // b needs less than what is there: about 1 USDC stays (between 1 and 3.20: the case that used to hold forever).
+  await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 10 }));
   assert.deepEqual(s.w.ended.at(-1), ['b', true]);
-  assert.equal(s.withdrawn.length, 1);
-  assert.equal(BigInt(s.quotes.at(-1)!.amount), stranded / 10_000n * 10_000n, 'the whole stranded balance (to the cent)');
-  assert.match(s.w.journal().join('\n'), /only \d+\.\d\d of the \d+\.\d\d USD is on Arbitrum/);
+  const left = s.arb.e6;
+  assert.ok(left > 900_000n && left < 3_200_000n, `left ${left}`);
   assert.equal(s.w.rescuer.hlWithdrawHeld, null);
-
-  // A withdraw that never arrives: held while it may still be on its way, then Arbitrum reads empty and it ends.
-  const t = synthetic({ desk: { reserveUsd: 0 }, legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 100 } });
-  const realPush = t.arb.arriving.push.bind(t.arb.arriving);
-  t.arb.arriving.push = () => 0;   // Hyperliquid accepted the withdraw; it never shows on Arbitrum
-  await run(t.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
-  assert.match(t.w.failures.at(-1)!.reason, /did not reach the desk's Arbitrum address/);
-  assert.ok(t.w.rescuer.hlWithdrawHeld !== null);
-  t.arb.arriving.push = realPush;
-  await run(t.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
-  assert.equal(t.withdrawn.length, 1, 'still on its way: no second withdraw');
-  t.w.t += 30 * 60_000;
-  await run(t.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 20 }));
-  assert.ok(t.w.journal().some((j) => /Arbitrum address reads empty and no hl_withdraw is on its way/.test(j)));
-  assert.equal(t.withdrawn.length, 2, 'withdraws run again');
+  // c needs more: one withdraw tops it up and the bridge takes both, leaving nothing of the rescuer's.
+  await run(s.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 40 }));
+  assert.deepEqual(s.w.ended.at(-1), ['c', true]);
+  assert.equal(s.withdrawn.length, 2);
+  assert.equal(BigInt(s.quotes.at(-1)!.amount), left / 10_000n * 10_000n + s.withdrawn[1]! - 1_000_000n, 'what was there (to the cent) and what arrived');
+  assert.match(s.w.journal().join('\n'), /hl_withdraw \d+\.\d\d USDC to the desk's Arbitrum address \(1 USDC fee\), topping up the \d+\.\d\d USDC an earlier withdraw left there/);
+  assert.ok(s.w.rescuer.arbitrumOwnUsd < 0.01);
 });
 
-test('an Arbitrum balance that cannot be read stops the Hyperliquid source and keeps the hl_withdraw hold', async () => {
-  let refuse = true;
-  const s = synthetic({
-    desk: { reserveUsd: 0 }, legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 100 }, reducer: true,
-    quote: async (body, now) => (refuse ? { ok: false, status: 400, message: 'Quoting for this pair is not available' } : { ok: true, response: testQuote(s.signer, body, now) }),
-  });
+test('a withdraw on its way holds the next withdraw, also after a bridge of other USDC lands; 30 min later: reconcile needed, once', async () => {
+  const { s, refuse } = hlWorld();
+  refuse(true);
+  await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 10 }));
+  const own = s.arb.e6;
+  refuse(false);
+  const realPush = s.arb.arriving.push.bind(s.arb.arriving);
+  s.arb.arriving.push = () => 0;   // Hyperliquid accepts the next withdraw; it does not show on Arbitrum
+  await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 40 }));
+  assert.match(s.w.failures.at(-1)!.reason, /did not reach the desk's Arbitrum address/);
+  assert.equal(s.withdrawn.length, 2);
+  assert.match(s.w.rescuer.hlWithdrawHeld!, /rescue b's hl_withdraw .* not yet seen/);
+  // c fits in what a left there: bridged and landed, and b's withdraw still holds the next one.
+  await run(s.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 10 }));
+  assert.deepEqual(s.w.ended.at(-1), ['c', true]);
+  assert.ok(s.arb.e6 < own);
+  assert.match(s.w.rescuer.hlWithdrawHeld ?? '', /rescue b's hl_withdraw/, 'a landed bridge does not end a withdraw on its way');
+  await run(s.w, trigger({ id: 'd', venue: 'phoenix', amountUsd: 40 }));
+  assert.equal(s.withdrawn.length, 2, 'no second withdraw while one is on its way');
+  assert.match(s.w.journal().join('\n'), /no new hl_withdraw: rescue b's hl_withdraw/);
+  s.arb.arriving.push = realPush;
+  s.w.t += 30 * 60_000;
+  await run(s.w, trigger({ id: 'e', venue: 'phoenix', amountUsd: 40 }));
+  await run(s.w, trigger({ id: 'f', venue: 'phoenix', amountUsd: 40 }));
+  const lines = s.w.journal().filter((j) => /reconcile needed: rescue b's hl_withdraw/.test(j));
+  assert.equal(lines.length, 1, 'said once');
+  assert.match(lines[0]!, /is not on the desk's Arbitrum address after \d+ min; it is no longer taken as on its way/);
+  assert.ok(s.w.logs.some((l) => /reconcile needed: rescue b's hl_withdraw/.test(l)));
+  assert.ok(s.withdrawn.length >= 3, 'withdraws run again');
+});
+
+test('a withdraw on its way that shows up late counts as the rescuer\'s own then', async () => {
+  const { s } = hlWorld();
+  const realPush = s.arb.arriving.push.bind(s.arb.arriving);
+  const late: { at: number; e6: bigint }[] = [];
+  s.arb.arriving.push = (a) => late.push(a);
   await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
-  refuse = false;
+  assert.equal(s.w.rescuer.arbitrumOwnUsd, 0);
+  s.arb.arriving.push = realPush;
+  s.arb.e6 += late[0]!.e6;   // it lands now, 15 min late
+  await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
+  assert.ok(s.w.journal().some((j) => /rescue a's hl_withdraw reached the desk's Arbitrum address late/.test(j)));
+  assert.deepEqual(s.w.ended.at(-1), ['b', true]);
+  assert.equal(s.withdrawn.length, 1, 'b bridged a\'s USDC with no withdraw of its own');
+});
+
+test('USDC of other flows on the desk\'s Arbitrum address is never spent; the own count never exceeds the balance', async () => {
+  const { s, refuse } = hlWorld();
+  // 50 USDC of an Orderly money-out (or the owner's return) sits on the address before any rescue.
+  s.arb.e6 = 50_000_000n;
+  await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
+  assert.deepEqual(s.w.ended, [['a', true]]);
+  assert.equal(s.withdrawn.length, 1, 'withdrawn, though 50 USDC was there');
+  assert.equal(BigInt(s.quotes[0]!.amount), s.withdrawn[0]! - 1_000_000n, 'only what its own withdraw brought');
+  assert.equal(s.arb.e6, 50_000_000n, 'the other flow\'s USDC is untouched');
+  assert.equal(s.w.rescuer.arbitrumOwnUsd, 0);
+  // A failed bridge leaves its own USDC there; then someone else takes most of the address's balance.
+  refuse(true);
+  await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
+  assert.ok(s.w.rescuer.arbitrumOwnUsd > 20);
+  s.arb.e6 = 2_000_000n;
+  refuse(false);
+  await run(s.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 20 }));
+  assert.ok(s.w.journal().some((j) => /holds 2.00 USDC, less than the \d+\.\d\d the rescuer counted as its own \(moved by someone else\)/.test(j)));
+  assert.deepEqual(s.w.ended.at(-1), ['c', true]);
+  // c counted only the 2 USDC left as its own and topped that up.
+  assert.equal(BigInt(s.quotes.at(-1)!.amount), 2_000_000n + s.withdrawn.at(-1)! - 1_000_000n);
+  assert.ok(s.w.rescuer.arbitrumOwnUsd < 0.01);
+});
+
+test('an Arbitrum balance that cannot be read stops the Hyperliquid source and is not taken as empty', async () => {
+  const { s, refuse } = hlWorld({ reducer: true });
+  refuse(true);
+  await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
+  const own = s.w.rescuer.arbitrumOwnUsd;
+  assert.ok(own > 0);
+  refuse(false);
   s.arbDown = true;
   s.w.t += 3_600_000;
   await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
   assert.match(s.w.journal().join('\n'), /hyperliquid: the desk's Arbitrum USDC could not be read/);
   assert.equal(s.withdrawn.length, 1);
   assert.equal(s.quotes.length, 1, 'no bridge either');
-  assert.ok(s.w.rescuer.hlWithdrawHeld !== null, 'an unread balance is not an empty one');
+  assert.equal(s.w.rescuer.arbitrumOwnUsd, own, 'an unread balance changes nothing');
 });
 
 test('mainnet starts its cap meter full: no rescue out of a venue in the first hour after a restart, the reserve still pays', async () => {
@@ -614,4 +697,161 @@ test('a target whose landing cannot be confirmed takes no transfer', async () =>
   await run(s.w, trigger({ venue: 'orderly', symbol: 'PERP_ETH_USDC', amountUsd: 30 }));
   assert.equal(s.quotes.length, 0);
   assert.match(s.w.failures[0]!.reason, /reserve: a landing on Orderly cannot be confirmed here/);
+});
+
+// ---- the state file: holds and counters across restarts ----
+
+const tmpStore = () => new RescueStateStore(join(mkdtempSync(join(tmpdir(), 'gimbal-rescue-')), 'rescue-mainnet-alpha.json'));
+const onDisk = (store: RescueStateStore) => JSON.parse(readFileSync(store.path, 'utf8')) as { holds: { paying: boolean; status: string | null; authorization: unknown }[]; unknown: string | null; hl: { strandedE6: string; inFlight: unknown }; cap: unknown[] };
+
+/** Lets a run go on until `done` (a run left hanging in a payment, as a crash would). */
+async function until(done: () => boolean): Promise<void> {
+  for (let i = 0; i < 1000 && !done(); i++) await new Promise((r) => setImmediate(r));
+  assert.ok(done(), 'the run got there');
+}
+
+test('state: with no file on mainnet the cap starts full and the start line says so; a held transfer and the cap meter survive a restart, and the loaded hold is read again before the next plan', async () => {
+  const store = tmpStore();
+  const s = synthetic({ store, reducer: true, noLanding: true, status: () => ({ status: 'PROCESSING', body: null }) });
+  assert.ok(s.w.logs.some((l) => /rescuer started with no state file at .*rescue-mainnet-alpha\.json: taken as a first run.*cap counts as used in full/.test(l)));
+  await run(s.w, trigger({ id: 'a', amountUsd: 30 }));
+  assert.match(s.w.journal()[0]!, /rescuer started at .*there was no state file .*cap counts as used in full \(50 USD\)/);
+  assert.match(s.w.rescuer.held!, /rescue a's transfer to \S+ is PROCESSING at 1Click/);
+  const saved = onDisk(store);
+  assert.equal(saved.holds.length, 1);
+  assert.equal(saved.holds[0]!.paying, false);
+  assert.equal(saved.holds[0]!.status, 'PROCESSING');
+  const capBefore = s.w.rescuer.capUsed();
+  assert.ok(capBefore > 40);
+
+  const again = s.w.restart();
+  assert.ok(s.w.logs.some((l) => /rescuer state loaded from .*: 1 held transfer\(s\), 0\.00 USDC of its own on Arbitrum, \d+\.\d\d USD of the rescue cap used; each hold is read again/.test(l)));
+  assert.match(again.held!, /rescue a's transfer to \S+ is PROCESSING at 1Click/);
+  assert.ok(Math.abs(again.capUsed() - capBefore) < 1e-6, 'the cap meter is the saved one, not seeded full again');
+  // Still processing: only a reduce runs, and no second "cap counts as used in full".
+  await run(s.w, trigger({ id: 'b', amountUsd: 30 }));
+  assert.deepEqual(s.w.ended.at(-1), ['b', true]);
+  assert.equal(s.sent.length, 1);
+  assert.equal(s.w.journal().filter((j) => /rescuer started at/.test(j)).length, 1);
+  // 1Click delivers and the ledger shows it: the loaded hold settles before the next plan, which pays.
+  s.status = () => ({ status: 'SUCCESS', body: null });
+  s.ledger.push({ venue: 'hyperliquid', usd: 31, id: 'late-delivery' });
+  await run(s.w, trigger({ id: 'c', amountUsd: 30 }));
+  assert.ok(s.w.journal().some((j) => /rescue a's 31.00 USD landed on hyperliquid late/.test(j)));
+  assert.equal(s.sent.length, 2, 'c paid');
+});
+
+test('state: the unknown outcome, the rescuer\'s own Arbitrum USDC and a withdraw on its way survive a restart', async () => {
+  const store = tmpStore();
+  const { s, refuse } = hlWorld({ store, seedCap: false });
+  refuse(true);
+  await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
+  const own = s.w.rescuer.arbitrumOwnUsd;
+  assert.ok(own > 20);
+  s.arb.arriving.push = () => 0;   // the next withdraw never shows
+  refuse(false);
+  await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 40 }));
+  assert.ok(s.w.rescuer.hlWithdrawHeld !== null);
+  const cap = s.w.rescuer.capUsed();
+  assert.ok(onDisk(store).hl.inFlight !== null);
+  const again = s.w.restart();
+  assert.equal(again.arbitrumOwnUsd, own);
+  assert.match(again.hlWithdrawHeld!, /rescue b's hl_withdraw/);
+  assert.ok(Math.abs(again.capUsed() - cap) < 1e-6);
+  assert.ok(s.w.logs.some((l) => /an hl_withdraw of rescue b on its way/.test(l)));
+
+  const u = synthetic({ store: tmpStore(), seedCap: false, reducer: true, sign: async () => { throw new OutcomeUnknown('fund_venue', 'sent, no answer', {} as OutcomeIds); } });
+  await run(u.w, trigger({ id: 'a', amountUsd: 30 }));
+  const restarted = u.w.restart();
+  assert.match(restarted.held!, /the fund_venue of rescue a may have been signed or paid/);
+  await run(u.w, trigger({ id: 'b', amountUsd: 30 }));
+  assert.equal(u.quotes.length, 1, 'still held after the restart: only a reduce ran');
+});
+
+test('state: a crash while signing leaves the payment held after the restart, as one that may have been signed or sent', async () => {
+  const store = tmpStore();
+  const s = synthetic({ store, seedCap: false, reducer: true, sign: () => new Promise<void>(() => {}) });
+  s.w.rescuer.take(trigger({ id: 'a', amountUsd: 30 }));
+  await until(() => s.w.steps('a').includes('sign'));
+  const saved = onDisk(store);
+  assert.equal(saved.holds.length, 1, 'saved before the signature was asked for');
+  assert.equal(saved.holds[0]!.paying, true);
+  // The engine dies here; a new one starts on the same file.
+  const again = s.w.restart();
+  assert.match(again.held!, /rescue a was paying \S+ \(fund_venue\) when the engine stopped: it may have been signed or sent/);
+  s.status = () => ({ status: 'PENDING_DEPOSIT', body: null });
+  await run(s.w, trigger({ id: 'b', amountUsd: 30 }));
+  assert.equal(s.quotes.length, 1, 'no second payment');
+  assert.deepEqual(s.w.ended.at(-1), ['b', true]);
+});
+
+test('state: a signed EIP-3009 authorization saved before a crash is still told dead after the restart; its USDC is the rescuer\'s again', async () => {
+  const store = tmpStore();
+  let dead = false;
+  let crashed = false;
+  const { s } = hlWorld({
+    store, seedCap: false, reducer: true, authorization: true, usableForMs: 300_000,
+    send: () => (crashed ? Promise.resolve() : new Promise<void>(() => {})),
+    authorizationNeverRuns: async (a) => { assert.match(a.nonce, /^0x/); return dead; },
+  });
+  s.w.rescuer.take(trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
+  await until(() => s.w.steps('a').filter((x) => x === 'deposit').length === 2);
+  const saved = onDisk(store);
+  assert.equal(saved.holds.length, 1);
+  assert.ok(saved.holds[0]!.authorization !== null, 'the authorization is on disk');
+  assert.equal(BigInt(saved.hl.strandedE6), 0n, 'its Arbitrum USDC set aside');
+  crashed = true;
+  const again = s.w.restart();
+  assert.match(again.held!, /rescue a was paying/);
+  assert.equal(again.arbitrumOwnUsd, 0);
+  // a's deposit address never sees a deposit; any later transfer settles.
+  const aAddress = (onDisk(store) as unknown as { holds: { quote: { depositAddress: string } }[] }).holds[0]!.quote.depositAddress;
+  s.status = (_n, addr) => ({ status: addr === aAddress ? 'PENDING_DEPOSIT' : 'SUCCESS', body: null });
+  s.w.t += 300_001;
+  dead = true;
+  await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
+  assert.match(again.held!, /rescue a/, 'PENDING_DEPOSIT is not final for 10 more minutes');
+  s.w.t += 10 * 60_000;
+  await run(s.w, trigger({ id: 'c', venue: 'phoenix', amountUsd: 20 }));
+  assert.ok(s.w.journal().some((j) => /rescue a's signed payment can no longer run .*expired unused; its \d+\.\d\d USDC on Arbitrum is the rescuer's to spend again/.test(j)));
+  assert.deepEqual(s.w.ended.at(-1), ['c', true], s.w.failures.at(-1)?.reason);
+  assert.equal(s.withdrawn.length, 1, 'with no second withdraw');
+});
+
+test('state: an unusable file is never "no holds": every transfer is held, the cap starts full, and the file is left as it is', async () => {
+  for (const text of ['{"version":1,"holds":[', JSON.stringify({ version: 1, savedAt: 0, unknown: null, holds: [{ why: 'x' }], hl: { strandedE6: '0', inFlight: null }, cap: [], seen: [] })]) {
+    const store = tmpStore();
+    writeFileSync(store.path, text, 'utf8');
+    const s = synthetic({ store, reducer: true });
+    assert.ok(s.w.logs.some((l) => /rescuer state unusable: .*rescue-mainnet-alpha\.json is not a rescuer state this engine wrote: .*It is not taken as "no holds": every transfer is held/.test(l)));
+    assert.match(s.w.rescuer.held!, /state file could not be used/);
+    await run(s.w, trigger({ id: 'a', amountUsd: 30 }));
+    assert.equal(s.quotes.length, 0, 'no transfer');
+    assert.equal(s.closes.length, 1, 'a reduce still runs');
+    assert.match(s.w.journal()[0]!, /its state file could not be used, so every transfer is held/);
+    assert.ok(s.w.rescuer.capUsed() > 40, 'the cap counts as used in full');
+    assert.equal(readFileSync(store.path, 'utf8'), text, 'left for the owner');
+  }
+});
+
+test('state: a save that fails before a signature or a withdraw means nothing is signed or sent', async () => {
+  class FullDisk extends RescueStateStore {
+    override save(): void {
+      throw new Error('ENOSPC: no space left on device');
+    }
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'gimbal-rescue-'));
+  let signs = 0;
+  const s = synthetic({ store: new FullDisk(join(dir, 'rescue-mainnet-alpha.json')), seedCap: false, sign: async () => { signs++; } });
+  await run(s.w, trigger({ id: 'a', amountUsd: 30 }));
+  assert.equal(signs, 0);
+  assert.equal(s.w.failures[0]!.step, 'sign');
+  assert.match(s.w.failures[0]!.reason, /the rescuer state could not be saved, so nothing was signed: .*ENOSPC/);
+  assert.equal(s.w.rescuer.held, null, 'nothing was signed, so nothing is held');
+
+  const { s: h } = hlWorld({ store: new FullDisk(join(dir, 'rescue-mainnet-beta.json')), seedCap: false });
+  await run(h.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
+  assert.equal(h.withdrawn.length, 0);
+  assert.match(h.w.failures[0]!.reason, /could not be saved, so hl_withdraw was not sent/);
+  assert.equal(h.w.rescuer.hlWithdrawHeld, null);
 });

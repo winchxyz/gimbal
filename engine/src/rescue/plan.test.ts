@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { PlanInput } from './plan.ts';
-import { CapLedger, HL_WITHDRAW_FEE_USD, MAX_FEE_SHARE, amountInFor, expectedFeeUsd, planRescue } from './plan.ts';
+import { CapLedger, HL_WITHDRAW_FEE_USD, MAX_FEE_SHARE, amountInFor, bridgeMinUsd, expectedFeeUsd, planRescue } from './plan.ts';
 
 const base = (over: Partial<PlanInput> = {}): PlanInput => ({
   target: { venue: 'hyperliquid', symbol: 'ETH', amountUsd: 40, marginUsd: 200 },
@@ -124,11 +124,57 @@ test('stranded Arbitrum USDC: no withdraw fee in its fee share, spent in part wh
   const partial = into({ arbitrumUsd: 3.456, hlWithdrawHeld: 'an earlier withdraw' });
   assert.ok(partial.kind === 'transfer' && partial.withdrawUsd === null && partial.amountInUsd === 3.45 && partial.capUsd === 3.45);
   assert.match(partial.notes.join(' '), /only 3.45 of the 5.\d\d USD is on Arbitrum/);
-  // Dust under the fee share falls through to the withdraw rule.
+  // Dust under what a bridge takes alone, while a withdraw is on its way: nothing to bridge now, the next withdraw takes it.
   const dust = into({ arbitrumUsd: 0.2, hlWithdrawHeld: 'an earlier withdraw', target: { venue: 'phoenix', symbol: 'ETH', amountUsd: 40, marginUsd: 200 } });
   assert.equal(dust.kind, 'reduce');
-  assert.match(dust.notes.join(' '), /the 0.20 USDC on Arbitrum\): fees of about 0.05.*no new hl_withdraw: an earlier withdraw/);
+  assert.match(dust.notes.join(' '), /no new hl_withdraw: an earlier withdraw.*the 0.20 USDC on Arbitrum is under the 0.50 a bridge into phoenix takes alone/);
   const unread = into({ arbitrumUsd: null, target: { venue: 'phoenix', symbol: 'ETH', amountUsd: 40, marginUsd: 200 } });
   assert.equal(unread.kind, 'reduce');
   assert.match(unread.notes.join(' '), /hyperliquid: the desk's Arbitrum USDC could not be read/);
+});
+
+test('a withdraw tops up USDC already on Arbitrum, so no amount left there ever blocks one (it is bridged along)', () => {
+  const into = (over: Partial<PlanInput>) => planRescue(base({ target: { venue: 'phoenix', symbol: 'ETH', amountUsd: 40, marginUsd: 200 }, reserveUsd: 0, freeMargin: { hyperliquid: 500 }, ...over }));
+  const alone = into({});
+  assert.ok(alone.kind === 'transfer' && alone.withdrawUsd !== null && alone.arbitrumUsd === 0);
+  // 2 USDC is there (under what a bridge into HyperCore takes alone, 3.20): it does not hold the withdraw, which tops it up.
+  const topUp = into({ arbitrumUsd: 2 });
+  assert.ok(topUp.kind === 'transfer' && topUp.withdrawUsd !== null && alone.kind === 'transfer');
+  assert.equal(topUp.arbitrumUsd, 2);
+  assert.equal(topUp.amountInUsd, alone.amountInUsd, 'the same bridge');
+  assert.ok(Math.abs(topUp.withdrawUsd! - (alone.withdrawUsd! - 2)) < 0.011, 'the withdraw is short by what is there');
+  assert.ok(Math.abs(topUp.capUsd - (topUp.withdrawUsd! + topUp.amountInUsd)) < 1e-9);
+  // Just short of a bridge alone: a small top-up (at least 1 USDC arrives), everything bridged together.
+  const bridgeNeed = amountInFor('hyperliquid', 'phoenix', 40, true, false);
+  const near = into({ arbitrumUsd: bridgeNeed - 0.01 });
+  assert.ok(near.kind === 'transfer' && near.withdrawUsd !== null && near.withdrawUsd >= 2 && near.withdrawUsd < 3.1);
+  assert.ok(near.kind === 'transfer' && near.amountInUsd >= alone.amountInUsd && near.arbitrumUsd === Math.round((bridgeNeed - 0.01) * 100) / 100);
+  // Held (a withdraw on its way): 2 USDC is bridged alone into Phoenix (it takes 0.50 and up), the rest later.
+  const held = into({ arbitrumUsd: 2, hlWithdrawHeld: 'on its way' });
+  assert.ok(held.kind === 'transfer' && held.withdrawUsd === null && held.amountInUsd === 2);
+});
+
+test('the least a bridge of Arbitrum USDC takes alone: the route minimum and the fee share, with and without a key', () => {
+  assert.equal(bridgeMinUsd('hyperliquid', true), 3.2);
+  assert.equal(bridgeMinUsd('hyperliquid', false), 3.27);
+  assert.equal(bridgeMinUsd('phoenix', true), 0.5);
+  assert.equal(bridgeMinUsd('orderly', true), 6.2);
+  for (const keyed of [true, false]) {
+    for (const to of ['hyperliquid', 'phoenix', 'orderly'] as const) {
+      const x = bridgeMinUsd(to, keyed);
+      assert.ok(expectedFeeUsd('hyperliquid', to, x, keyed, false) <= MAX_FEE_SHARE * x, `${to} ${keyed}: within the share`);
+      assert.ok(x - 0.01 < 1 || expectedFeeUsd('hyperliquid', to, x - 0.01, keyed, false) > MAX_FEE_SHARE * (x - 0.01) || to === 'orderly', `${to} ${keyed}: the least`);
+    }
+  }
+});
+
+test('the cap ledger lists what still weighs, so a restart can count it again', () => {
+  const c = new CapLedger();
+  c.add(40, 0);
+  c.add(10, 50 * 60_000);
+  assert.deepEqual(c.entries(30 * 60_000), [{ usd: 40, at: 0 }, { usd: 10, at: 50 * 60_000 }]);
+  assert.deepEqual(c.entries(3_600_000), [{ usd: 10, at: 50 * 60_000 }]);
+  const again = new CapLedger();
+  for (const e of c.entries(3_600_000)) again.add(e.usd, e.at);
+  assert.equal(again.used(3_600_000), c.used(3_600_000));
 });
