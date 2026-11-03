@@ -170,6 +170,8 @@ type Read<T> = { ok: true; value: T } | { ok: false; error: string };
 interface SignatureStatus {
   err: unknown;
   confirmationStatus?: 'processed' | 'confirmed' | 'finalized' | null;
+  /** The slot the transaction landed in. */
+  slot?: number;
 }
 
 export class SolanaSubmitter {
@@ -182,6 +184,8 @@ export class SolanaSubmitter {
   readonly #sleep: (ms: number) => Promise<void>;
   readonly #now: () => number;
   readonly #timeoutMs: number;
+  /** The slot each transaction this submitter saw confirmed landed in (landedSlot). */
+  readonly #landed = new Map<string, number>();
   #id = 0;
 
   constructor(options: SolanaSubmitterOptions) {
@@ -241,7 +245,7 @@ export class SolanaSubmitter {
       const status = await this.#status(signature, false);
       if (!status.ok) lastError = status.error;
       const landed = status.ok ? verdict(status.value.status) : null;
-      if (landed === 'confirmed') return [...nearTx, ref];
+      if (landed === 'confirmed') return this.#confirmed(signature, status.ok ? status.value.status : null, [...nearTx, ref]);
       if (landed !== null) throw new NothingExecuted('solana', `the transaction failed on chain: ${landed.failed}`, [...nearTx, ref]);
 
       const expiry = await this.#expired(parsed.blockhash, options.lastValidBlockHeight);
@@ -249,7 +253,7 @@ export class SolanaSubmitter {
       if (expiry.ok && expiry.value.state !== 'valid') {
         const last = await this.#status(signature, true);
         const seen = last.ok ? verdict(last.value.status) : null;
-        if (seen === 'confirmed') return [...nearTx, ref];
+        if (seen === 'confirmed') return this.#confirmed(signature, last.ok ? last.value.status : null, [...nearTx, ref]);
         if (seen !== null) throw new NothingExecuted('solana', `the transaction failed on chain: ${seen.failed}`, [...nearTx, ref]);
         const notFound = last.ok && last.value.status === null;
         if (expiry.value.state === 'past-last-valid-height' && notFound) {
@@ -278,13 +282,35 @@ export class SolanaSubmitter {
    * caller may sign a new one after an MPC timeout.
    */
   async waitPastLastValidHeight(lastValidBlockHeight: number, maxWaitMs = 90_000): Promise<boolean> {
+    return (await this.waitPastLastValidHeightSlot(lastValidBlockHeight, maxWaitMs)) !== null;
+  }
+
+  /**
+   * waitPastLastValidHeight with the slot the passing height was read at (null: not proven in time). A position
+   * snapshot at or past that slot shows anything a copy of the message could have done.
+   */
+  async waitPastLastValidHeightSlot(lastValidBlockHeight: number, maxWaitMs = 90_000): Promise<number | null> {
     const until = this.#now() + maxWaitMs;
     for (;;) {
       const r = await this.#expired('', lastValidBlockHeight);
-      if (r.ok && r.value.state === 'past-last-valid-height') return true;
-      if (this.#now() >= until) return false;
+      if (r.ok && r.value.state === 'past-last-valid-height') return r.value.slot;
+      if (this.#now() >= until) return null;
       await this.#sleep(this.#rebroadcastMs);
     }
+  }
+
+  /**
+   * The slot a transaction submit() returned for landed in, from its confirmed status; null when that status gave
+   * none (or the transaction was not sent here). A reader of the transaction's effects waits for a state at that slot.
+   */
+  landedSlot(signature: string): number | null {
+    return this.#landed.get(signature) ?? null;
+  }
+
+  #confirmed(signature: string, status: SignatureStatus | null, tx: TxRef[]): TxRef[] {
+    const slot = status?.slot;
+    if (typeof slot === 'number' && Number.isSafeInteger(slot)) this.#landed.set(signature, slot);
+    return tx;
   }
 
   /** A signature's status, and the slot the answering node read it at (its context; null when it gave none). */

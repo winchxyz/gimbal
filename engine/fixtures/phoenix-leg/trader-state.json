@@ -1,0 +1,92 @@
+{
+ "authority": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB",
+ "traderPdaIndex": 0,
+ "slot": 464772031,
+ "slotIndex": 212,
+ "snapshot": {
+  "version": 1,
+  "capabilities": {
+   "flags": 62,
+   "state": "cold",
+   "capabilities": {
+    "placeLimitOrder": {
+     "immediate": false,
+     "viaColdActivation": true
+    },
+    "placeMarketOrder": {
+     "immediate": true
+    },
+    "riskIncreasingTrade": {
+     "immediate": true
+    },
+    "riskReducingTrade": {
+     "immediate": true
+    },
+    "depositCollateral": {
+     "immediate": true
+    },
+    "withdrawCollateral": {
+     "immediate": true
+    }
+   }
+  },
+  "makerFeeOverrideMultiplier": 1,
+  "takerFeeOverrideMultiplier": 0,
+  "subaccounts": [
+   {
+    "subaccountIndex": 0,
+    "sequence": 0,
+    "collateral": "71533235",
+    "spotCollaterals": [
+     {
+      "assetIndex": 4294901760,
+      "symbol": "SOL",
+      "balance": "0",
+      "decimals": 9,
+      "maxBalance": "1000000000000"
+     }
+    ],
+    "lockedDeposit": {
+     "lockedQuoteLots": "0",
+     "consumedQuoteLots": "0"
+    },
+    "escrowRequests": [],
+    "cooldownStatus": {
+     "lastDepositSlot": 464728021,
+     "cooldownPeriodInSlots": 0
+    },
+    "positions": [
+     {
+      "symbol": "AAPL",
+      "positionSequenceNumber": "69",
+      "basePositionLots": "-12",
+      "entryPriceTicks": "33041",
+      "entryPriceUsd": "330.41",
+      "virtualQuotePositionLots": "3964920",
+      "unsettledFundingQuoteLots": "0",
+      "accumulatedFundingQuoteLots": "0",
+      "takeProfitTriggers": [],
+      "stopLossTriggers": [],
+      "conditionalTakeProfitTriggers": [],
+      "conditionalStopLossTriggers": []
+     },
+     {
+      "symbol": "AAVE",
+      "positionSequenceNumber": "30",
+      "basePositionLots": "-3",
+      "entryPriceTicks": "12612",
+      "entryPriceUsd": "126.12",
+      "virtualQuotePositionLots": "3783600",
+      "unsettledFundingQuoteLots": "0",
+      "accumulatedFundingQuoteLots": "0",
+      "takeProfitTriggers": [],
+      "stopLossTriggers": [],
+      "conditionalTakeProfitTriggers": [],
+      "conditionalStopLossTriggers": []
+     }
+    ],
+    "orders": []
+   }
+  ]
+ }
+}

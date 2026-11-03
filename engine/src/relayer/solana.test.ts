@@ -252,3 +252,16 @@ test('never sent: a signature that does not verify, a message without a compute 
   await assert.rejects(s.submit({ ...noBudget, payload: { message_b64: twoSigners.toString('base64') } }), /needs 2 signatures/);
   assert.equal(r.calls.length, 0);
 });
+
+test('the slot a confirmed transaction landed in is kept (landedSlot); the slot where a height passed is returned', async () => {
+  const r = rpc({ statuses: [{ err: null, confirmationStatus: 'confirmed', slot: 4242 }] });
+  const signed = await signedIoc();
+  const s = submitter(r.fetch);
+  await s.submit(signed);
+  const { signature } = SolanaSubmitter.transaction(signed);
+  assert.equal(s.landedSlot(signature), 4242);
+  assert.equal(s.landedSlot('other'), null);
+  const past = submitter(rpc({ statuses: [null], blockHeight: 1001, slot: 5150 }).fetch);
+  assert.equal(await past.waitPastLastValidHeightSlot(1000), 5150);
+  assert.equal(await submitter(rpc({ statuses: [null], blockHeight: 900, slot: 5150 }).fetch).waitPastLastValidHeightSlot(1000, 10_000), null);
+});

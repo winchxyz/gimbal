@@ -28,7 +28,7 @@ function setup(results: PairResult['status'][] = ['closed'], gate: Promise<void>
       await gate.shift();
       const status = results.shift() ?? 'closed';
       return {
-        status, size: '1', notes: status === 'closed' ? [] : ['phoenix did not fill'], tx: [],
+        status, size: '1', notes: status === 'closed' ? [] : ['phoenix did not fill'], tx: [], feeUsd: 0, feeUnknown: 0,
         legs: [
           { venue: 'hyperliquid', symbol: 'ETH', start: '1', target: '0', final: status === 'closed' ? '0' : '0', orders: [] },
           { venue: 'phoenix', symbol: 'ETH', start: '-1', target: '0', final: status === 'closed' ? '0' : '-1', orders: [] },

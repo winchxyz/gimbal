@@ -69,8 +69,12 @@ export interface LegOrderRecord {
   outcome: LegOutcome['kind'];
   filled: string | null;         // canonical, when the venue said
   avgPx: number | null;
+  /** What the venue charged for this fill, USD; null when it did not say (or nothing filled). */
+  fee: number | null;
   error: string | null;
   purpose: 'open' | 'retry' | 'unwind' | 'close' | 'rehedge' | 'excess' | 'deficit';
+  /** One part of a maker order (a post-only limit, or the IOC after its timeout). */
+  maker?: true;
 }
 
 export interface LegReport {
@@ -88,6 +92,15 @@ export interface PairResult {
   legs: [LegReport, LegReport];
   notes: string[];
   tx: TxRef[];
+  /** The fees of every fill of this open or close, USD, as the venues reported them. */
+  feeUsd: number;
+  /** Fills whose fee the venue did not report (not in feeUsd). */
+  feeUnknown: number;
+}
+
+/** Maker first: leg `index` goes first as a maker order (TradeLeg.makerOrder), its partner after it as an IOC. */
+export interface MakerFirst {
+  index: 0 | 1;
 }
 
 /** What one push check did: the watched leg first, then its partner when a deficit moved it. */
@@ -156,6 +169,8 @@ interface LegRun {
    */
   unsettled: LegOutcome | null;
   unsettledFrom: bigint | null;
+  /** The hedge of a maker leg's known fill that an order with no answer stopped: #halt does not unwind it. */
+  keep?: boolean;
   report: LegReport;
 }
 
@@ -236,9 +251,73 @@ export class PairTrader {
     for (const wake of [...this.#wakes]) wake();
   }
 
-  /** `size` in base units, rounded down to the coarser lot; leg `longIndex` buys, the other sells. */
-  open(request: { size: bigint | number | string; longIndex: 0 | 1; reason: string }): Promise<PairResult> {
-    return this.#serial(() => this.#open(request));
+  /**
+   * `size` in base units, rounded down to the coarser lot; leg `longIndex` buys, the other sells. With `maker`, that
+   * leg goes first as a maker order and its partner follows as an IOC sized to what the first actually filled
+   * (rounded down to the common lot; the first leg's excess is closed reduce-only), so the pair may open smaller.
+   */
+  open(request: { size: bigint | number | string; longIndex: 0 | 1; reason: string; maker?: MakerFirst }): Promise<PairResult> {
+    return this.#serial(() => {
+      this.#beginMaker(request.maker);
+      return this.#open(request);
+    });
+  }
+
+  /**
+   * An open split into pairs under the policy cap (openChunk), each one a whole open with its own legging guard. Stops
+   * at the first part that does not end open, or that opened less than asked (a maker leg that did not fill).
+   */
+  async openInChunks(request: {
+    size: bigint | number | string; longIndex: 0 | 1; reason: string; maker?: MakerFirst;
+    /** Runs before each part (a CLI refreshes the stored price there); a throw stops the open before that part. */
+    beforePart?: (part: number, parts: number) => Promise<void>;
+  }): Promise<PairResult[]> {
+    const total = floorToLot(typeof request.size === 'bigint' ? request.size : toQty(request.size), this.lot);
+    if (total === 0n) throw new LegCheckError(`size ${String(request.size)} is under one common lot ${qtyString(this.lot)}`);
+    const chunk = await this.openChunk(request.longIndex);
+    const parts = Number((total + chunk - 1n) / chunk);
+    if (parts > MAX_CLOSE_ORDERS) throw new LegCheckError(`an open of ${qtyString(total)} needs ${parts} pairs of at most ${qtyString(chunk)}, over ${MAX_CLOSE_ORDERS}`);
+    const results: PairResult[] = [];
+    let left = total;
+    for (let i = 1; left > 0n; i++) {
+      const size = left > chunk ? chunk : left;
+      if (request.beforePart !== undefined) {
+        try {
+          await request.beforePart(i, parts);
+        } catch (err) {
+          results.push(this.#refused(size, [`part ${i} of ${parts} not sent: ${errorText(err)}`]));
+          break;
+        }
+      }
+      const part = { longIndex: request.longIndex, ...(request.maker === undefined ? {} : { maker: request.maker }), size, reason: parts === 1 ? request.reason : `${request.reason} (part ${i} of ${parts})` };
+      // One maker budget for the whole open, every part and move included: begun with the first part.
+      const first = i === 1;
+      const r = await this.#serial(() => {
+        if (first) this.#beginMaker(request.maker);
+        return this.#open(part);
+      });
+      results.push(r);
+      const opened = toQty(r.size);
+      if (r.status !== 'open' || opened < size) break;
+      left -= opened;
+    }
+    return results;
+  }
+
+  /**
+   * The largest pair one open may send: on each leg the cap at today's price, less the band (as a reduce-only chunk,
+   * see the header: the order prices itself again when it goes out), floored to the common lot.
+   */
+  async openChunk(longIndex: 0 | 1): Promise<bigint> {
+    let chunk: bigint | null = null;
+    for (const [i, leg] of this.legs.entries()) {
+      const cap = abs(await leg.maxSize(i === longIndex ? 'BUY' : 'SELL', false));
+      const band = BigInt(Math.ceil(this.#bandBps));
+      const max = floorToLot((cap * 10_000n) / (10_000n + band), this.lot);
+      if (chunk === null || max < chunk) chunk = max;
+    }
+    if (chunk === null || chunk === 0n) throw new LegCheckError(`the policy cap allows less than one common lot ${qtyString(this.lot)} per order`);
+    return chunk;
   }
 
   /**
@@ -246,8 +325,16 @@ export class PairTrader {
    * reopening its partner against it (not reduce-only); `reduceOnly: true` forbids that step, so nothing this close
    * sends can open or grow a position (the ADL response): the pair is then left stuck or unhedged, with the alert.
    */
-  close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean }): Promise<PairResult> {
-    return this.#serial(() => this.#close(request));
+  close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean; maker?: MakerFirst }): Promise<PairResult> {
+    return this.#serial(() => {
+      this.#beginMaker(request.maker);
+      return this.#close(request);
+    });
+  }
+
+  /** A pair operation with a maker leg starts that leg's budget of post-only orders (TradeLeg.beginMakerOperation). */
+  #beginMaker(maker: MakerFirst | undefined): void {
+    if (maker !== undefined) this.legs[maker.index].beginMakerOperation?.();
   }
 
   /**
@@ -314,7 +401,7 @@ export class PairTrader {
     return this.#active > 0;
   }
 
-  async #open(request: { size: bigint | number | string; longIndex: 0 | 1; reason: string }): Promise<PairResult> {
+  async #open(request: { size: bigint | number | string; longIndex: 0 | 1; reason: string; maker?: MakerFirst }): Promise<PairResult> {
     const size = floorToLot(typeof request.size === 'bigint' ? request.size : toQty(request.size), this.lot);
     if (size === 0n) throw new LegCheckError(`size ${String(request.size)} is under one common lot ${qtyString(this.lot)}`);
     const closing = this.#openBlocked();
@@ -332,9 +419,16 @@ export class PairTrader {
     const notes: string[] = [];
     const net = starts[0]! + starts[1]!;
 
-    await Promise.all(runs.map((r) => this.#move(r, r.target, false, request.reason, 'open')));
-    if (this.#stopped(runs, notes)) return this.#halt(runs, notes, size, net, request.reason);
-    if (runs.every((r) => r.pos === r.target)) return this.#result('open', size, runs, notes, net);
+    let opened = size;
+    if (request.maker === undefined) {
+      await Promise.all(runs.map((r) => this.#move(r, r.target, false, request.reason, 'open')));
+    } else {
+      const hedge = await this.#makerFirstOpen(runs, request.maker.index, size, request.reason, notes);
+      if (hedge === null) return this.#halt(runs, notes, size, net, request.reason);
+      opened = hedge;
+    }
+    if (this.#stopped(runs, notes)) return this.#halt(runs, notes, opened, net, request.reason);
+    if (runs.every((r) => r.pos === r.target)) return this.#result(opened === 0n ? 'flat' : 'open', opened, runs, notes, net);
     if (runs.every((r) => r.pos === r.start)) {
       notes.push('neither leg traded: nothing to unwind');
       return this.#result('flat', size, runs, notes, net);
@@ -344,8 +438,8 @@ export class PairTrader {
     const short = runs.filter((r) => r.pos !== r.target);
     notes.push(`legging: ${short.map((r) => `${r.leg.venue} at ${signedQtyString(r.pos!)} of ${signedQtyString(r.target)}`).join(', ')}; retrying once`);
     await Promise.all(short.map((r) => this.#move(r, r.target, false, `${request.reason} (retry)`, 'retry')));
-    if (this.#stopped(runs, notes)) return this.#halt(runs, notes, size, net, request.reason);
-    if (runs.every((r) => r.pos === r.target)) return this.#result('open', size, runs, notes, net);
+    if (this.#stopped(runs, notes)) return this.#halt(runs, notes, opened, net, request.reason);
+    if (runs.every((r) => r.pos === r.target)) return this.#result('open', opened, runs, notes, net);
 
     // Still legged: both legs back to their start, reduce-only, with one retry each.
     notes.push(`still legged after the retry: unwinding both legs to their start`);
@@ -354,14 +448,58 @@ export class PairTrader {
       const off = runs.filter((r) => r.pos !== r.start);
       if (off.length === 0) break;
       await Promise.all(off.map((r) => this.#move(r, r.start, true, `${request.reason} (unwind${attempt === 0 ? '' : ' retry'})`, 'unwind')));
-      if (this.#stopped(runs, notes)) return this.#stop(size, runs, notes, net);
+      if (this.#stopped(runs, notes)) return this.#stop(opened, runs, notes, net);
     }
-    if (runs.every((r) => r.pos === r.start)) return this.#result('flat', size, runs, notes, net);
+    if (runs.every((r) => r.pos === r.start)) return this.#result('flat', opened, runs, notes, net);
     notes.push('the unwind did not bring both legs back');
-    return this.#result(hedged(runs, net) ? 'stuck' : 'unhedged', size, runs, notes, net);
+    return this.#result(hedged(runs, net) ? 'stuck' : 'unhedged', opened, runs, notes, net);
   }
 
-  async #close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean }): Promise<PairResult> {
+  /**
+   * The maker-first open: the maker leg works its order (TradeLeg.makerOrder), then its partner goes as one IOC for
+   * what the maker leg actually filled, rounded down to the common lot; a fill past that (a finer lot) is closed
+   * reduce-only first. Both targets are set to the hedge, so the legging guard after it works on the real size.
+   * Returns the hedge size (0: nothing to hedge), or null when the maker leg stopped on an unsettled order or a lost
+   * position (the caller halts). On an unsettled order, what its filled parts are known to have filled is hedged
+   * first (#hedgeKnownFill), and that hedge is kept; otherwise the partner has not moved.
+   */
+  async #makerFirstOpen(runs: [LegRun, LegRun], index: 0 | 1, size: bigint, reason: string, notes: string[]): Promise<bigint | null> {
+    const first = runs[index];
+    const second = runs[index === 0 ? 1 : 0];
+    if (first.leg.makerOrder === undefined) throw new Error(`${first.leg.venue} has no maker order`);
+    await this.#makerMove(first, first.target, false, `${reason} (maker)`, 'open');
+    if (this.#stopped([first], notes)) {
+      await this.#hedgeKnownFill(first, second, false, reason, notes);
+      return null;
+    }
+    const moved = first.pos! - first.start;
+    const dir = first.target > first.start ? 1n : -1n;
+    if (moved * dir < 0n) {
+      // Something else traded the leg the other way: both targets back to the start; the guard after this unwinds.
+      notes.push(`${first.leg.venue} moved ${signedQtyString(moved)}, against the open`);
+      first.target = first.start;
+      second.target = second.start;
+      return 0n;
+    }
+    const hedge = floorToLot(abs(moved), this.lot);
+    first.target = first.start + dir * hedge;
+    second.target = second.start - dir * hedge;
+    if (moved === 0n) {
+      notes.push(`the maker leg ${first.leg.venue} did not fill: nothing to hedge, nothing opened`);
+      return 0n;
+    }
+    if (hedge !== abs(moved)) {
+      notes.push(`${first.leg.venue} filled ${qtyString(abs(moved))}, not a whole common lot ${qtyString(this.lot)}: closing ${qtyString(abs(moved) - hedge)} of it reduce-only`);
+      await this.#move(first, first.target, true, `${reason} (trim to the common lot)`, 'excess');
+      if (this.#stopped([first], notes)) return null;
+    }
+    if (hedge === 0n) return 0n;
+    if (hedge < size) notes.push(`the maker leg filled ${qtyString(hedge)} of ${qtyString(size)}: the pair opens at that size`);
+    await this.#move(second, second.target, false, reason, 'open');
+    return hedge;
+  }
+
+  async #close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean; maker?: MakerFirst }): Promise<PairResult> {
     const targets = request.targets ?? [0n, 0n];
     // Not refused while an order has no answer: a reduce-only close cannot double it, and its watch stays on.
     const starts = await Promise.all(this.legs.map((leg) => leg.position()));
@@ -393,7 +531,11 @@ export class PairTrader {
 
     // A leg left unsettled here is not retried and its partner's close stands (it only reduced): if that leaves the
     // partner closed and the unsettled leg open, the pair is unhedged until the order runs (#stop).
-    await Promise.all(runs.filter((r) => r.pos !== r.target).map((r) => this.#move(r, r.target, true, request.reason, 'close')));
+    if (request.maker !== undefined && runs[request.maker.index].pos !== runs[request.maker.index].target) {
+      await this.#makerFirstClose(runs, request.maker.index, request.reason, notes);
+    } else {
+      await Promise.all(runs.filter((r) => r.pos !== r.target).map((r) => this.#move(r, r.target, true, request.reason, 'close')));
+    }
     if (this.#stopped(runs, notes)) return this.#stop(size, runs, notes, net);
     if (runs.every((r) => r.pos === r.target)) return this.#result('closed', size, runs, notes, net);
 
@@ -438,6 +580,68 @@ export class PairTrader {
   }
 
   /**
+   * The maker-first close: the maker leg closes reduce-only as a maker order; then its partner closes, reduce-only and
+   * as an IOC, as much as the maker leg did (all of it when the maker leg reached its target, else the same amount in
+   * the partner's lots). What is left on either leg goes to the close's retry, as IOCs.
+   */
+  async #makerFirstClose(runs: [LegRun, LegRun], index: 0 | 1, reason: string, notes: string[]): Promise<void> {
+    const first = runs[index];
+    const second = runs[index === 0 ? 1 : 0];
+    if (first.leg.makerOrder === undefined) throw new Error(`${first.leg.venue} has no maker order`);
+    await this.#makerMove(first, first.target, true, `${reason} (maker)`, 'close');
+    if (this.#stopped([first], notes)) {
+      await this.#hedgeKnownFill(first, second, true, reason, notes);
+      return;
+    }
+    if (second.pos === null || second.pos === second.target) return;
+    const closed = abs(first.pos! - first.start);
+    if (first.pos === first.target) {
+      await this.#move(second, second.target, true, reason, 'close');
+      return;
+    }
+    const match = floorToLot(closed, second.leg.lot);
+    if (match === 0n) {
+      notes.push(`the maker leg ${first.leg.venue} closed ${qtyString(closed)}, under one ${second.leg.venue} lot: ${second.leg.venue} waits for the retry`);
+      return;
+    }
+    const dir = second.target > second.start ? 1n : -1n;
+    const to = abs(second.target - second.start) <= match ? second.target : second.start + dir * match;
+    notes.push(`the maker leg ${first.leg.venue} closed ${qtyString(closed)} of ${qtyString(abs(first.target - first.start))}: ${second.leg.venue} closes ${qtyString(abs(to - second.start))} to match`);
+    await this.#move(second, to, true, reason, 'close');
+  }
+
+  /**
+   * A maker leg stopped by an order with no answer after parts of it filled: what those parts filled is known (the
+   * order with no answer can only add to it), so the partner goes as one IOC for that much, rounded down to the
+   * common lot on an open (reduce-only, in the partner's lots, on a close). The order with no answer stays watched,
+   * and its watch reconciles what it fills later. The hedge is marked kept: #halt does not unwind it.
+   */
+  async #hedgeKnownFill(first: LegRun, second: LegRun, closing: boolean, reason: string, notes: string[]): Promise<void> {
+    if (first.unsettled === null || first.pos === null || first.unsettledFrom === null) return;
+    if (second.pos === null || second.unsettled !== null) return;
+    const known = first.unsettledFrom - first.start;
+    const dir = first.target > first.start ? 1n : -1n;
+    if (known * dir <= 0n) return;
+    const hedge = floorToLot(abs(known), closing ? second.leg.lot : this.lot);
+    if (hedge === 0n) {
+      notes.push(`the maker leg ${first.leg.venue} filled ${qtyString(abs(known))} before an order with no answer, under one lot of the hedge: ${second.leg.venue} does not trade`);
+      return;
+    }
+    let to: bigint;
+    if (closing) {
+      const sdir = second.target > second.start ? 1n : -1n;
+      if (second.target === second.start) return;
+      to = abs(second.target - second.start) <= hedge ? second.target : second.start + sdir * hedge;
+    } else {
+      to = second.start - dir * hedge;
+      second.target = to;
+    }
+    second.keep = true;
+    notes.push(`the maker leg ${first.leg.venue} filled ${qtyString(abs(known))} before an order with no answer: ${second.leg.venue} ${closing ? 'closes' : 'hedges'} ${qtyString(abs(to - second.start))} of it now; the order with no answer stays watched`);
+    await this.#move(second, to, closing, `${reason} (hedge of the known fill)`, closing ? 'close' : 'open');
+  }
+
+  /**
    * An open stopped by an unsettled leg: the other leg goes back to its start reduce-only (twice at most). Stuck when
    * that leaves the legs offsetting each other (the unsettled order can still land; its watch then closes it back),
    * unhedged when it does not (#stop). A lost position stops all, unhedged: the other leg may be the hedge of a fill
@@ -455,7 +659,7 @@ export class PairTrader {
       if (u !== undefined) u.unwind = { to: other!.start, reason, failed: false };
       return result;
     }
-    const others = runs.filter((r) => r.unsettled === null);
+    const others = runs.filter((r) => r.unsettled === null && r.keep !== true);
     for (const r of others) r.target = r.start;
     for (let attempt = 0; attempt < 2; attempt++) {
       const off = others.filter((r) => r.pos !== null && r.pos !== r.start);
@@ -515,7 +719,7 @@ export class PairTrader {
     const legs: [LegReport, LegReport] = [report(0), report(1)];
     const status: PairStatus = this.unhedged === null ? 'stuck' : 'unhedged';
     this.#log(`${status}: ${notes.join('; ')}`);
-    return { status, size: qtyString(size), legs, notes, tx: [] };
+    return { status, size: qtyString(size), legs, notes, tx: [], feeUsd: 0, feeUnknown: 0 };
   }
 
   #run(leg: TradeLeg, start: bigint, target: bigint): LegRun {
@@ -548,6 +752,43 @@ export class PairTrader {
     }
     const past = r.pos !== null && dir !== 0n && (dir > 0n ? r.pos > target : r.pos < target);
     if (trim && past && r.leg.replayable) await this.#trim(r, `reconcile ${r.leg.symbol}`);
+  }
+
+  /**
+   * #move with maker orders (TradeLeg.makerOrder): split under the cap for a reduce-only move as #move splits. A maker
+   * order is several orders, so the leg's position after it is read from the venue (the fill sum if that read fails).
+   */
+  async #makerMove(r: LegRun, target: bigint, reduceOnly: boolean, reason: string, purpose: LegOrderRecord['purpose']): Promise<void> {
+    const leg = r.leg;
+    for (let n = 0; n < MAX_MOVE_ORDERS; n++) {
+      if (r.pos === null || r.unsettled !== null) return;
+      const from = r.pos;
+      let delta = target - from;
+      if (reduceOnly && crossesZero(from, target)) delta = -from;
+      if (delta === 0n) return;
+      const side: LegSide = delta > 0n ? 'BUY' : 'SELL';
+      const want = abs(delta);
+      const size = reduceOnly ? await this.#chunk(leg, side, want) : want;
+      const out = await leg.makerOrder!(side, size, reduceOnly, reason);
+      r.report.orders.push(...records(out, purpose));
+      this.#log(`${leg.venue} ${purpose} maker ${side} ${qtyString(size)}${reduceOnly ? ' reduce-only' : ''}: ${describe(out)}`);
+      this.#arm(leg, out);
+      if (out.kind === 'filled') {
+        const read = await this.#read(leg, undefined, 'after a maker order');
+        r.pos = read ?? from + (side === 'BUY' ? out.filled : -out.filled);
+      } else {
+        await this.#settle(r, from, side, out);
+        // A maker order is several orders, and the one that ended with no answer and no expiry may still rest and fill
+        // after the parts that did: a position that moved by those parts does not show it ran. Always unsettled, from
+        // where the filled parts left the leg, so the partner is never sized past what is known and the watch sees it.
+        if (out.kind === 'unknown' && out.expiresAt === null) {
+          const partsFilled = (out.parts ?? []).reduce((acc, p) => acc + (p.kind === 'filled' ? p.filled : 0n), 0n);
+          r.unsettled = out;
+          r.unsettledFrom = from + (side === 'BUY' ? partsFilled : -partsFilled);
+        }
+      }
+      if (size === want || out.kind !== 'filled' || out.filled !== size) return;
+    }
   }
 
   /** Closes what a replayable leg holds past its target, reduce-only, up to twice (a copy can land meanwhile). */
@@ -600,7 +841,7 @@ export class PairTrader {
 
   async #send(r: LegRun, side: LegSide, size: bigint, reduceOnly: boolean, reason: string, purpose: LegOrderRecord['purpose']): Promise<LegOutcome> {
     const out = await r.leg.order(side, size, reduceOnly, reason);
-    r.report.orders.push(record(out, purpose));
+    r.report.orders.push(...records(out, purpose));
     this.#log(`${r.leg.venue} ${purpose} ${side} ${qtyString(size)}${reduceOnly ? ' reduce-only' : ''}: ${describe(out)}`);
     this.#arm(r.leg, out);
     return out;
@@ -881,8 +1122,11 @@ export class PairTrader {
     }
     this.unhedged = status === 'unhedged' ? notes.at(-1) ?? 'unhedged' : null;
     const tx = runs.flatMap((r) => r.report.orders.flatMap((o) => o.ref.tx));
+    const fills = runs.flatMap((r) => r.report.orders.filter((o) => o.outcome === 'filled'));
+    const feeUsd = fills.reduce((sum, o) => sum + (o.fee ?? 0), 0);
+    const feeUnknown = fills.filter((o) => o.fee === null).length;
     this.#log(`${status}: ${runs.map((r) => `${r.leg.venue} ${r.report.final ?? 'unknown'}`).join(', ')}`);
-    return { status, size: qtyString(size), legs: [runs[0].report, runs[1].report], notes, tx };
+    return { status, size: qtyString(size), legs: [runs[0].report, runs[1].report], notes, tx, feeUsd, feeUnknown };
   }
 
   /**
@@ -1058,8 +1302,15 @@ function record(out: LegOutcome, purpose: LegOrderRecord['purpose']): LegOrderRe
     ref: out.ref, outcome: out.kind, purpose,
     filled: out.kind === 'filled' ? qtyString(out.filled) : null,
     avgPx: out.kind === 'filled' ? out.avgPx : null,
+    fee: out.kind === 'filled' ? out.fee ?? null : null,
     error: out.kind === 'filled' ? null : out.error.message,
   };
+}
+
+/** The records of one outcome: one, or one per part of a maker order (each its own order on the venue). */
+function records(out: LegOutcome, purpose: LegOrderRecord['purpose']): LegOrderRecord[] {
+  if (out.parts === undefined || out.parts.length === 0) return [record(out, purpose)];
+  return out.parts.map((p) => ({ ...record(p, purpose), maker: true as const }));
 }
 
 function describe(out: LegOutcome): string {

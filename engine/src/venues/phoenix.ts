@@ -47,6 +47,14 @@ export interface PhoenixMarket extends Market {
 /** A Phoenix position, with the subaccount it lives in: 0 is the cross-margin account, others are isolated. */
 export interface PhoenixPosition extends Position {
   subaccountIndex: number;
+  /** Notional at the mark (USD, unsigned). */
+  notionalUsd: number;
+}
+
+/** The account with the cross-margin subaccount (0) on its own: isolated collateral is tied to its position. */
+export interface PhoenixAccountState extends AccountState {
+  positions: PhoenixPosition[];
+  cross: { equityUsd: number; maintenanceMarginUsd: number };
 }
 
 export interface PhoenixReaderOptions {
@@ -114,7 +122,7 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
   }
 
   /** `address` is the trader's authority (wallet); the account read is its trader PDA `traderPdaIndex`. */
-  async account(address: string): Promise<AccountState> {
+  async account(address: string): Promise<PhoenixAccountState> {
     const authority = normalizeAuthority(address);
     const c = this.#api();
     const [snapshot, configs, stats] = await Promise.all([
@@ -414,7 +422,7 @@ function bps(basisPoints: number | undefined, percent: number): string {
  */
 export function parseAccount(
   snapshot: TraderStateSnapshotResponse, configs: readonly ExchangeMarketConfig[], marks: ReadonlyMap<string, number>, time: number,
-): AccountState {
+): PhoenixAccountState {
   const subaccounts = snapshot.snapshot.subaccounts;
   const configBySymbol = new Map(configs.map((c) => [c.symbol, c]));
   const symbols = new Set<string>();
@@ -449,11 +457,17 @@ export function parseAccount(
   let equity = 0n;
   let maintenance = 0n;
   let free = 0n;
+  let crossEquity = 0n;
+  let crossMaintenance = 0n;
   const positions: PhoenixPosition[] = [];
   for (const sub of margin.subaccounts) {
     equity += BigInt(sub.margin.portfolioValueQuoteLots);
     maintenance += BigInt(sub.margin.maintenanceMarginQuoteLots);
-    if (sub.subaccountIndex === 0) free = BigInt(sub.margin.withdrawableQuoteCollateralQuoteLots);
+    if (sub.subaccountIndex === 0) {
+      free = BigInt(sub.margin.withdrawableQuoteCollateralQuoteLots);
+      crossEquity = BigInt(sub.margin.portfolioValueQuoteLots);
+      crossMaintenance = BigInt(sub.margin.maintenanceMarginQuoteLots);
+    }
     const liqBySymbol = new Map(
       (liquidation.subaccounts.find((l) => l.subaccountIndex === sub.subaccountIndex)?.positions ?? [])
         .map((l) => [l.symbol, l.liquidationPriceUsd]),
@@ -480,6 +494,7 @@ export function parseAccount(
         fundingSinceOpenUsd: quoteLotsToUsd(m.accumulatedFundingQuoteLots),
         unsettledFundingUsd: quoteLotsToUsd(m.unsettledFundingQuoteLots),
         subaccountIndex: sub.subaccountIndex,
+        notionalUsd: valueUsd,
       });
     }
   }
@@ -491,6 +506,7 @@ export function parseAccount(
     freeMarginUsd: quoteLotsToUsd(free),
     maintenanceMarginUsd: quoteLotsToUsd(maintenance),
     positions,
+    cross: { equityUsd: quoteLotsToUsd(crossEquity), maintenanceMarginUsd: quoteLotsToUsd(crossMaintenance) },
   };
 }
 

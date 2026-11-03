@@ -14,8 +14,8 @@
 import type { TxRef, VenueId } from '@gimbal/shared';
 import { ContractRefusal, OutcomeUnknown, SignatureBudgetError } from '../contract/types.ts';
 import type { HlOrder, OutcomeIds } from '../contract/types.ts';
-import { capPrice, planIoc } from '../relayer/hl-order.ts';
-import type { HlSubmitResult } from '../relayer/hyperliquid.ts';
+import { HL_MIN_ORDER_USD, capPrice, hlPx, newCloid, planIoc } from '../relayer/hl-order.ts';
+import type { HlFill, HlSubmitResult } from '../relayer/hyperliquid.ts';
 import { HlExchangeError } from '../relayer/hyperliquid.ts';
 import type { OrderlyRequest, OrderlyRequestKind } from '../venues/orderly-signer.ts';
 import { NothingExecuted } from '../relayer/tx.ts';
@@ -39,12 +39,15 @@ export const HL_EXPIRY_MARGIN_MS = 10_000;
 export const HL_NONCE_WINDOW_MS = 2 * 86_400_000;
 
 /** What one order did, as far as the venue's answer proves it. */
+// `fee`: what the venue charged for the fill, USD (Hyperliquid userFills `fee`, Phoenix trades-history `fees`); null
+// or absent when the venue's answer did not say. `parts`: a maker order is several orders (post-only limits, then an
+// IOC); the outcome sums them, and each part is its own order record.
 export type LegOutcome =
-  | { kind: 'filled'; filled: bigint; avgPx: number | null; ref: LegRef }     // filled > 0, possibly less than asked
-  | { kind: 'failed'; error: Error; ref: LegRef }                             // proof that nothing ran
+  | { kind: 'filled'; filled: bigint; avgPx: number | null; fee?: number | null; ref: LegRef; parts?: LegOutcome[] }   // filled > 0, possibly less than asked
+  | { kind: 'failed'; error: Error; ref: LegRef; parts?: LegOutcome[] }                                                // proof that nothing ran
   // Reconcile from position() first. `expiresAt`: local ms after which no copy can execute any more; null when no
   // such time is known (a Hyperliquid order without expiresAfter may still land at any time).
-  | { kind: 'unknown'; error: Error; ref: LegRef; expiresAt: number | null };
+  | { kind: 'unknown'; error: Error; ref: LegRef; expiresAt: number | null; parts?: LegOutcome[] };
 
 export interface LegRef {
   venue: VenueId;
@@ -76,6 +79,42 @@ export interface TradeLeg {
   position(after?: number): Promise<bigint>;
   /** One IOC. Never throws: every error is classified into the outcome. */
   order(side: LegSide, size: bigint, reduceOnly: boolean, reason: string): Promise<LegOutcome>;
+  /**
+   * Maker first (optional): post-only limits at the touch, repriced, then an IOC for what is left after the timeout.
+   * The outcome sums every part; never throws.
+   */
+  makerOrder?(side: LegSide, size: bigint, reduceOnly: boolean, reason: string): Promise<LegOutcome>;
+  /**
+   * Starts one pair operation (an open with all its parts, or a close): from here the leg's maker orders share one
+   * budget of maxOrders post-only orders, until the next call.
+   */
+  beginMakerOperation?(): void;
+}
+
+/** How a maker order works the book: reprice at most every `repriceMs`, give up after `timeoutMs`, then IOC or not. */
+export interface MakerSettings {
+  repriceMs: number;
+  timeoutMs: number;
+  /** After the timeout, an IOC for what is left (true), or stop with what filled (false). An explicit opt-in. */
+  takerFallback: boolean;
+  /** How often a resting order's status is read (default 1 s). */
+  pollMs?: number;
+  /**
+   * The most post-only orders signed per pair operation (default 6; per maker order when no operation was begun), a
+   * crossing refusal included: from C10 the contract meters signed notional that is not reduce-only per rolling hour,
+   * and every reprice is signed again. Two placements are always at least repriceMs apart, after a refusal too.
+   */
+  maxOrders?: number;
+}
+
+export const DEFAULT_MAKER: MakerSettings = { repriceMs: 30_000, timeoutMs: 180_000, takerFallback: false, pollMs: 1_000, maxOrders: 6 };
+
+/** A post-only order a maker order left without a settled state: it may still rest and fill. */
+export interface PendingMakerOrder {
+  cloid: string;
+  oid: number | null;
+  side: LegSide;
+  size: string;
 }
 
 /** A size or price a venue or the policy would refuse, caught before anything is signed. */
@@ -108,7 +147,11 @@ function classify(err: unknown, ref: LegRef, expiresAt: number | null): LegOutco
 // ---- Hyperliquid ----
 
 export interface HlLegOptions {
-  relayer: { hlOrder(order: HlOrder, reason: string): Promise<HlSubmitResult> };
+  relayer: {
+    hlOrder(order: HlOrder, reason: string): Promise<HlSubmitResult>;
+    /** Needed by makerOrder only: a resting post-only order is cancelled before it is repriced. */
+    hlCancel?(asset: number, oid: number, reason: string): Promise<HlSubmitResult>;
+  };
   /** POST /info on the venue's API. */
   info: (body: Record<string, unknown>) => Promise<unknown>;
   user: string;                  // the desk's EVM address
@@ -123,7 +166,10 @@ export interface HlLegOptions {
   /** Best ask for a buy, best bid for a sell. */
   bestPx: (side: LegSide) => Promise<number>;
   slippageBps?: number;
+  /** How makerOrder works the book (default DEFAULT_MAKER). */
+  maker?: MakerSettings;
   clock?: Clock;
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export class HlLeg implements TradeLeg {
@@ -133,6 +179,10 @@ export class HlLeg implements TradeLeg {
   readonly replayable = false;     // every signed action has its own nonce: Hyperliquid takes it once
   readonly #o: HlLegOptions;
   readonly #clock: Clock;
+  /** Post-only orders whose state a maker order could not settle (cancelPending tries them again). */
+  readonly #pending: PendingMakerOrder[] = [];
+  /** Post-only orders the current pair operation may still sign (null: no operation begun, maxOrders per call). */
+  #makerLeft: number | null = null;
 
   constructor(options: HlLegOptions) {
     this.#o = options;
@@ -191,7 +241,302 @@ export class HlLeg implements TradeLeg {
     if (result.expiresAfter !== null) ref.expiresAfter = result.expiresAfter;
     const filled = result.filled === null ? 0n : toQty(result.filled.totalSz);
     if (filled === 0n) return { kind: 'failed', error: new NothingExecuted('hyperliquid', `the IOC ${ref.clientId} did not fill`, result.tx), ref };
-    return { kind: 'filled', filled, avgPx: result.filled === null ? null : Number(result.filled.avgPx), ref };
+    return { kind: 'filled', filled, avgPx: result.filled === null ? null : Number(result.filled.avgPx), fee: feeOf(result.fills), ref };
+  }
+
+  /**
+   * Maker first: a post-only (Alo) limit at the touch (best bid for a buy, best ask for a sell), read every pollMs,
+   * cancelled and placed again at the new touch every repriceMs, until the size filled or timeoutMs passed; then an
+   * IOC for the rest when takerFallback is on. An Alo that would cross is refused by Hyperliquid (nothing ran) and is
+   * placed again repriceMs after it. Each resting order's fill is read from orderStatus (origSz − sz) once it is no longer open,
+   * its price and fee from userFills. A post-only order whose state cannot be settled (no answer and no expiry, still
+   * open after two cancels, or a status read that keeps failing) stops the whole order as unknown with no expiry: it
+   * may still fill, and it is kept for cancelPending. At most maxOrders post-only orders are signed (per pair
+   * operation once beginMakerOperation was called), each at least repriceMs after the one before. Never throws.
+   */
+  async makerOrder(side: LegSide, size: bigint, reduceOnly: boolean, reason: string): Promise<LegOutcome> {
+    const s = { ...DEFAULT_MAKER, ...this.#o.maker };
+    const sleep = this.#o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+    const poll = s.pollMs ?? 1_000;
+    const maxOrders = s.maxOrders ?? 6;
+    const started = this.#clock.now();
+    const deadline = started + s.timeoutMs;
+    const parts: LegOutcome[] = [];
+    let filled = 0n;
+    let notional = 0;
+    let fee: number | null = 0;
+    let refusedInARow = 0;
+    let placed = 0;
+    let lastPlacedAt: number | null = null;
+    const budget = (): boolean => placed < maxOrders && (this.#makerLeft === null || this.#makerLeft > 0);
+    /** The post-only order out now, until its final state is read. */
+    let resting: { cloid: string; oid: number | null; size: string } | null = null;
+    const stuck = (cloid: string, oid: number | null, sz: string): void => {
+      this.#pending.push({ cloid, oid: oid !== null && oid >= 0 ? oid : null, side, size: sz });
+    };
+    const total = (out: LegOutcome): void => {
+      parts.push(out);
+      if (out.kind !== 'filled') return;
+      filled += out.filled;
+      notional += qtyNumber(out.filled) * (out.avgPx ?? 0);
+      fee = fee === null || out.fee === null || out.fee === undefined ? null : fee + out.fee;
+    };
+    const summary = (last: LegOutcome | undefined, unknown: LegOutcome | null): LegOutcome => {
+      if (unknown !== null && !parts.includes(unknown)) parts.push(unknown);
+      // The ids of the order with no answer when there is one: it is the one to reconcile.
+      const named = unknown ?? last;
+      const ref: LegRef = {
+        venue: this.venue, side, size: qtyString(size), reduceOnly, orderId: named?.ref.orderId ?? null, clientId: named?.ref.clientId ?? null,
+        tx: parts.flatMap((p) => p.ref.tx), sentAt: started,
+      };
+      if (unknown !== null && unknown.kind === 'unknown') return { kind: 'unknown', error: unknown.error, ref, expiresAt: unknown.expiresAt, parts };
+      if (filled > 0n) return { kind: 'filled', filled, avgPx: notional > 0 ? notional / qtyNumber(filled) : null, fee, ref, parts };
+      const error = last !== undefined && last.kind !== 'filled' ? last.error : new NothingExecuted('hyperliquid', `the maker order ${side} ${qtyString(size)} did not fill`, ref.tx);
+      return { kind: 'failed', error, ref, parts };
+    };
+
+    try {
+      while (filled < size && this.#clock.now() < deadline && refusedInARow < 5 && budget()) {
+        // Never two placements less than repriceMs apart (a crossing refusal or an early cancel included): each one
+        // is signed and metered.
+        if (lastPlacedAt !== null) {
+          const next = lastPlacedAt + s.repriceMs;
+          if (next >= deadline) break;
+          if (this.#clock.now() < next) await sleep(next - this.#clock.now());
+        }
+        const left = size - filled;
+        const ref: LegRef = { venue: this.venue, side, size: qtyString(left), reduceOnly, orderId: null, clientId: null, tx: [], sentAt: this.#clock.now() };
+        let order: HlOrder;
+        try {
+          order = await this.#makerPlan(side, left, reduceOnly);
+        } catch (err) {
+          total({ kind: 'failed', error: err instanceof LegCheckError ? err : new LegCheckError(errorText(err)), ref });
+          break;      // the rest goes to the IOC, which checks it again
+        }
+        ref.clientId = order.cloid ?? null;
+        let oid: number | null = null;
+        placed++;
+        if (this.#makerLeft !== null) this.#makerLeft--;
+        lastPlacedAt = this.#clock.now();
+        resting = { cloid: order.cloid!, oid: null, size: order.sz };
+        try {
+          const result = await this.#o.relayer.hlOrder(order, `${reason} (maker)`);
+          ref.tx = result.tx;
+          oid = result.oid;
+          if (result.expiresAfter !== null) ref.expiresAfter = result.expiresAfter;
+        } catch (err) {
+          if (err instanceof NothingExecuted || err instanceof OutcomeUnknown) ref.tx = err.tx;
+          if (provesNothingRan(err)) {
+            // Most often an Alo that would have crossed: the touch moved. Placed again at the new one.
+            resting = null;
+            total({ kind: 'failed', error: err as Error, ref });
+            refusedInARow++;
+            continue;
+          }
+          const known = await this.#statusAfterUnknown(order.cloid!, err, sleep);
+          if (known === null) {
+            stuck(order.cloid!, null, order.sz);
+            resting = null;
+            return summary(parts.at(-1), classify(err, ref, null));
+          }
+          oid = known;
+        }
+        refusedInARow = 0;
+        if (oid === null || !Number.isFinite(oid)) {
+          stuck(order.cloid!, null, order.sz);
+          resting = null;
+          return summary(parts.at(-1), classify(new Error('hyperliquid accepted the post-only order without an oid'), ref, null));
+        }
+        resting.oid = oid;
+        ref.orderId = String(oid);
+        const repriceAt = Math.min(this.#clock.now() + s.repriceMs, deadline);
+        // A status read that fails (a 429, a 5xx, an answer this code does not know) ends the wait: the order is
+        // cancelled and read again below, never left resting behind a throw.
+        let status: HlOrderStatus | null = null;
+        try {
+          status = await this.#orderStatus(oid);
+          while (status?.status === 'open' && this.#clock.now() < repriceAt) {
+            await sleep(poll);
+            status = await this.#orderStatus(oid);
+          }
+        } catch {
+          status = null;
+        }
+        const final = await this.#closeResting(oid, status, reason, sleep);
+        if (final === null) {
+          stuck(order.cloid!, oid, order.sz);
+          resting = null;
+          return summary(parts.at(-1), { kind: 'unknown', error: new Error(`hyperliquid post-only order ${oid} (${order.cloid}) could not be settled after two cancels: it may still rest and fill`), ref, expiresAt: null });
+        }
+        resting = null;
+        const got = final.filled;
+        if (got === 0n) {
+          total({ kind: 'failed', error: new NothingExecuted('hyperliquid', `post-only order ${oid} did not fill before it was cancelled`, ref.tx), ref });
+          continue;
+        }
+        const fills = await this.#fillsOf(oid, got, sleep);
+        total({ kind: 'filled', filled: got, avgPx: fills.avgPx ?? final.limitPx, fee: fills.fee, ref });
+      }
+
+      if (filled < size && s.takerFallback) {
+        const out = await this.order(side, size - filled, reduceOnly, `${reason} (taker fallback)`);
+        total(out);
+        if (out.kind === 'unknown') return summary(out, out);
+      }
+      return summary(parts.at(-1), null);
+    } catch (err) {
+      // Nothing above should throw; if something does, the order out now (if any) may still rest.
+      const left: string = resting === null ? qtyString(size - filled) : resting.size;
+      if (resting !== null) stuck(resting.cloid, resting.oid, resting.size);
+      const ref: LegRef = { venue: this.venue, side, size: left, reduceOnly, orderId: resting?.oid === null || resting === null ? null : String(resting.oid), clientId: resting?.cloid ?? null, tx: [], sentAt: this.#clock.now() };
+      return summary(parts.at(-1), { kind: 'unknown', error: new Error(`hyperliquid maker order: ${errorText(err)}`), ref, expiresAt: resting === null ? this.#clock.now() : null });
+    }
+  }
+
+  beginMakerOperation(): void {
+    this.#makerLeft = { ...DEFAULT_MAKER, ...this.#o.maker }.maxOrders ?? 6;
+  }
+
+  /** Post-only orders a maker order could not settle; they may still rest and fill. */
+  pendingMakerOrders(): readonly PendingMakerOrder[] {
+    return this.#pending;
+  }
+
+  /**
+   * Tries each post-only order a maker order could not settle once more: its status by oid (or cloid), a cancel while
+   * it rests, and what it filled. One line each; an order whose state is settled here leaves the list. Never throws.
+   */
+  async cancelPending(reason: string): Promise<string[]> {
+    const lines: string[] = [];
+    for (const p of [...this.#pending]) {
+      const name = `hyperliquid ${p.side} ${p.size} post-only ${p.oid ?? '(no oid)'} cloid ${p.cloid}`;
+      try {
+        let st = await this.#orderStatus(p.oid ?? p.cloid);
+        if (st === null) {
+          lines.push(`${name}: Hyperliquid does not know it (yet); it may still land`);
+          continue;
+        }
+        if (st.status === 'open' && this.#o.relayer.hlCancel !== undefined) {
+          try {
+            await this.#o.relayer.hlCancel(this.#o.asset, st.oid, `${reason} (cancel a post-only order left resting)`);
+          } catch {
+            // refused (it filled or ended) or no answer: the status read decides
+          }
+          st = await this.#orderStatus(st.oid);
+        }
+        if (st === null || st.status === 'open') {
+          lines.push(`${name}: still resting; cancel it on Hyperliquid by hand`);
+          continue;
+        }
+        lines.push(`${name}: ${st.status}, filled ${qtyString(st.origSz - st.sz)} of ${qtyString(st.origSz)}`);
+        this.#pending.splice(this.#pending.indexOf(p), 1);
+      } catch (err) {
+        lines.push(`${name}: its status cannot be read (${errorText(err)}); check it on Hyperliquid by hand`);
+      }
+    }
+    return lines;
+  }
+
+  /** A post-only limit at the touch, inside 95 % of the band, under the cap, over Hyperliquid's minimum. */
+  async #makerPlan(side: LegSide, size: bigint, reduceOnly: boolean): Promise<HlOrder> {
+    const name = `hyperliquid ${this.symbol}`;
+    if (size <= 0n || !isWholeLots(size, this.lot)) throw new LegCheckError(`${name}: ${signedQtyString(size)} is not a positive multiple of the lot ${qtyString(this.lot)}`);
+    const buy = side === 'BUY';
+    // The passive side of the book: a buy rests at the best bid (what a sell would take), a sell at the best ask.
+    const [touch, oracle] = await Promise.all([this.#o.bestPx(buy ? 'SELL' : 'BUY'), this.#o.oraclePx()]);
+    if (!(touch > 0)) throw new LegCheckError(`${name}: no ${buy ? 'bid' : 'ask'} to rest at`);
+    const px = hlPx(touch, this.#o.szDecimals, buy ? 'down' : 'up');
+    const pxN = Number(px);
+    if (oracle !== null && Math.abs(pxN - oracle) * 10_000 > this.#o.bandBps * 0.95 * oracle) {
+      throw new LegCheckError(`${name}: the touch ${px} is outside 95 % of the ${this.#o.bandBps} bps band around the contract's price ${oracle}`);
+    }
+    const capped = qtyNumber(size) * capPrice(pxN, oracle);
+    if (capped > this.#o.maxNotionalUsd) throw new LegCheckError(`${name}: ${qtyString(size)} at ${capPrice(pxN, oracle)} is ${capped.toFixed(2)} USD, over the policy's ${this.#o.maxNotionalUsd} USD`);
+    if (this.#o.maxSz !== undefined && size > toQty(this.#o.maxSz)) throw new LegCheckError(`${name}: ${qtyString(size)} is over the unpriced asset's max_sz ${this.#o.maxSz}`);
+    if (!reduceOnly && qtyNumber(size) * pxN < HL_MIN_ORDER_USD) throw new LegCheckError(`${name}: ${qtyString(size)} at ${px} is under Hyperliquid's ${HL_MIN_ORDER_USD} USD minimum`);
+    return { asset: this.#o.asset, is_buy: buy, px, sz: qtyString(size), reduce_only: reduceOnly, tif: 'Alo', cloid: newCloid() };
+  }
+
+  /** orderStatus by oid or cloid: the order's status and sizes, or null when Hyperliquid does not know it (unknownOid). */
+  async #orderStatus(id: number | string): Promise<HlOrderStatus | null> {
+    const r = await this.#o.info({ type: 'orderStatus', user: this.#o.user.toLowerCase(), oid: id }) as {
+      status?: unknown; order?: { status?: unknown; order?: { oid?: unknown; sz?: unknown; origSz?: unknown; limitPx?: unknown } };
+    };
+    if (r?.status === 'unknownOid') return null;
+    const o = r?.order?.order;
+    if (r?.status !== 'order' || typeof r.order?.status !== 'string' || o === undefined) throw new Error(`hyperliquid orderStatus ${id}: unexpected answer ${JSON.stringify(r)?.slice(0, 160)}`);
+    return {
+      status: r.order.status, oid: Number(o.oid), sz: toQty(String(o.sz)), origSz: toQty(String(o.origSz)), limitPx: Number(o.limitPx),
+    };
+  }
+
+  /**
+   * A post-only order whose submission has no answer: its oid from orderStatus by cloid. Not known yet: once its
+   * signed action expired (expiresAfter), still not known means it never ran (null is returned then only when no
+   * expiry is known, i.e. it may still land). Returns the oid, or -1 for "never ran".
+   */
+  async #statusAfterUnknown(cloid: string, err: unknown, sleep: (ms: number) => Promise<void>): Promise<number | null> {
+    const expiresAt = this.#expiresAt(err);
+    try {
+      const now = await this.#orderStatus(cloid);
+      if (now !== null) return now.oid;
+      if (expiresAt === null) return null;
+      const wait = expiresAt - this.#clock.now();
+      if (wait > 0) await sleep(wait);
+      const later = await this.#orderStatus(cloid);
+      return later === null ? -1 : later.oid;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Ends a resting post-only order: cancelled while open (a cancel refused because it filled or ended is fine), then
+   * read until it is no longer open. Null when it stays open after two cancels.
+   */
+  async #closeResting(oid: number, status: HlOrderStatus | null, reason: string, sleep: (ms: number) => Promise<void>): Promise<{ filled: bigint; limitPx: number } | null> {
+    if (oid === -1) return { filled: 0n, limitPx: 0 };
+    let st = status;
+    for (let attempt = 0; attempt < 2 && (st === null || st.status === 'open'); attempt++) {
+      // Cancelled whenever it is not known to be closed: an unread status may be an order still resting.
+      if (this.#o.relayer.hlCancel !== undefined) {
+        try {
+          await this.#o.relayer.hlCancel(this.#o.asset, oid, `${reason} (reprice)`);
+        } catch {
+          // refused (it filled or ended meanwhile) or no answer: the status read below decides
+        }
+      }
+      for (let i = 0; i < 10; i++) {
+        try {
+          st = await this.#orderStatus(oid);
+        } catch {
+          st = null;
+        }
+        if (st !== null && st.status !== 'open') break;
+        await sleep(500);
+      }
+    }
+    if (st === null || st.status === 'open') return null;
+    return { filled: st.origSz - st.sz, limitPx: st.limitPx };
+  }
+
+  /** The fills of `oid` in userFills (price and fee), once they add up to `size`; a few tries. */
+  async #fillsOf(oid: number, size: bigint, sleep: (ms: number) => Promise<void>): Promise<{ avgPx: number | null; fee: number | null }> {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const rows = await this.#o.info({ type: 'userFills', user: this.#o.user.toLowerCase() }) as HlFill[];
+        const mine = (Array.isArray(rows) ? rows : []).filter((f) => Number(f.oid) === oid);
+        const sz = mine.reduce((acc, f) => acc + toQty(f.sz), 0n);
+        if (mine.length > 0 && sz >= size) {
+          const px = mine.reduce((acc, f) => acc + Number(f.sz) * Number(f.px), 0) / qtyNumber(sz);
+          return { avgPx: px, fee: feeOf(mine) };
+        }
+      } catch {
+        // userFills not read: tried again
+      }
+      await sleep(1_000);
+    }
+    return { avgPx: null, fee: null };
   }
 
   /**
@@ -495,6 +840,21 @@ export class OrderlyLeg implements TradeLeg {
 
 function qtyOf(positions: OrderlyStreamPosition[], symbol: string): bigint {
   return positions.filter((p) => p.symbol === symbol).reduce((s, p) => s + toQty(p.positionQty), 0n);
+}
+
+/** orderStatus's answer, the fields a maker order reads (sizes in 1e-8 units; `sz` is what is left). */
+interface HlOrderStatus {
+  status: string;                // open | filled | canceled | marginCanceled | rejected | ...
+  oid: number;
+  sz: bigint;
+  origSz: bigint;
+  limitPx: number;
+}
+
+/** The fee of some Hyperliquid fills, USD (userFills `fee`, the builder's share included); null when one has none. */
+function feeOf(fills: readonly HlFill[]): number | null {
+  if (fills.length === 0 || fills.some((f) => f.fee === undefined)) return null;
+  return fills.reduce((s, f) => s + Number(f.fee), 0);
 }
 
 function minQ(a: bigint, b: bigint): bigint {
