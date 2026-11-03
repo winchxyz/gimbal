@@ -64,6 +64,10 @@ export interface LegResult {
   payments: number;
   /** Hours with a payment booked (an aggregated row counts its samples). */
   paidHours: number;
+  /** Of fundingUsd: what Hyperliquid's daily aggregate rows give (their split per hour is not verified: an estimate). */
+  estimatedUsd: number;
+  /** Hours paid through aggregate rows. */
+  estimatedHours: number;
   /** Funding times (top of the hour) inside the hold, up to the last read of this venue's ledger. */
   hours: number;
 }
@@ -86,6 +90,12 @@ export interface PositionResult {
   fundingThrough: number | null;
   /** Closed and every leg read past exit + SETTLE_MS: the numbers are final. */
   settled: boolean;
+  /** When the settled (final) journal entry was written; null before it. */
+  finalAt: number | null;
+  /** Funding booked after the final entry (a late booking): an adjustment against it, in fundingUsd and net. */
+  afterFinalUsd: number;
+  /** Of fundingUsd: from aggregate rows (estimated). */
+  estimatedUsd: number;
   by: 'auto' | 'manual';
   exitBy: 'auto' | 'manual' | null;
   exitReason: string | null;
@@ -290,6 +300,8 @@ export interface BookIndex {
   fees: Map<string, number>;
   transfers: Map<string, TransferEvent[]>;
   cursors: Record<string, number>;
+  /** Position id -> when its settled (final) journal entry was written. */
+  finals: Map<string, number>;
 }
 
 export function indexBook(events: readonly BookEvent[], overlay: Readonly<Record<string, number>> = {}): BookIndex {
@@ -298,6 +310,7 @@ export function indexBook(events: readonly BookEvent[], overlay: Readonly<Record
   const funding = new Map<string, FundingEvent[]>();
   const fees = new Map<string, number>();
   const transfers = new Map<string, TransferEvent[]>();
+  const finals = new Map<string, number>();
   for (const e of events) {
     if (e.type === 'funding') {
       const p = attribute(e, bySpan);
@@ -311,9 +324,11 @@ export function indexBook(events: readonly BookEvent[], overlay: Readonly<Record
       const list = transfers.get(e.positionId) ?? [];
       list.push(e);
       transfers.set(e.positionId, list);
+    } else if (e.type === 'journal' && e.settled === true && e.positionId !== undefined && !finals.has(e.positionId)) {
+      finals.set(e.positionId, e.at);
     }
   }
-  return { all, bySpan, funding, fees, transfers, cursors: cursors(events, overlay) };
+  return { all, bySpan, funding, fees, transfers, cursors: cursors(events, overlay), finals };
 }
 
 interface Costs { usd: number; unknown: number }
@@ -423,6 +438,7 @@ export function positionResult(p: Position, ix: BookIndex, now: number): Positio
       exitFeeUsd: later.length === 0 || exits.some((x) => x.unknown > 0) ? null : sum(exits.map((x) => x.usd)),
       fundingUsd: sum(mine.map((f) => f.usd)), payments: mine.filter((f) => f.adjusts === undefined).length,
       paidHours: hourly.size + aggregated, hours: hoursIn(start, readTo(leg.venue)),
+      estimatedUsd: sum(mine.filter((f) => f.samples !== null).map((f) => f.usd)), estimatedHours: aggregated,
     };
   });
 
@@ -461,6 +477,9 @@ export function positionResult(p: Position, ix: BookIndex, now: number): Positio
   return {
     id: p.id, windowId: p.windowId, symbol: p.symbol, open, adopted: p.enter.adopted, legs,
     startedAt: began, enteredAt: enter.at, exitedAt: exit?.at ?? null, heldHours, aprHours, fundingThrough, settled,
+    finalAt: ix.finals.get(p.id) ?? null,
+    afterFinalUsd: ix.finals.has(p.id) ? sum(payments.filter((f) => f.at > ix.finals.get(p.id)!).map((f) => f.usd)) : 0,
+    estimatedUsd: sum(legs.map((l) => l.estimatedUsd)),
     by: enter.by, exitBy: exit?.by ?? null, exitReason: exit?.exitReason ?? null, rotatedFrom, rotatedTo,
     entryTx: enter.tx, exitTx: exit?.tx ?? [], partialFills: p.fills.length,
     forecastNetAprPct: finiteOrNull(enter.forecastNetAprPct), legUsd, leverage: positiveOrNull(enter.leverage), marginUsd,

@@ -196,9 +196,11 @@ test('(A) the attempt budget is per pair, not per event: 24 checks with the legs
   s.px.reject = (_side, reduceOnly) => reduceOnly;
   const reports: AdlReport[] = [];
   let closes = 0;
+  const by: unknown[] = [];
   const close = s.trader.close.bind(s.trader);
   s.trader.close = (req) => {
     closes++;
+    by.push((req as { by?: string }).by);
     return close(req);
   };
   for (let i = 0; i < 24; i++) {
@@ -209,6 +211,7 @@ test('(A) the attempt budget is per pair, not per event: 24 checks with the legs
     s.advance(RETRY_MS * 2 ** i);                            // well past every backoff
   }
   assert.equal(closes, ADL_ATTEMPTS);
+  assert.ok(by.every((x) => x === 'ADL unwind'), 'each unwind names itself: the book books it outside the loop');
   assert.ok(sent(s.hl, s.px) - opening <= ADL_ATTEMPTS * 4, `at most 2 orders per leg per attempt, got ${sent(s.hl, s.px) - opening}`);
   assert.deepEqual(reports.map((r) => r.stage), ['failed', 'failed', 'gave-up']);
   assert.equal(s.adl.state.attemptsLeft, 0);

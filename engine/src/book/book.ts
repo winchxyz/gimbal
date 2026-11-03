@@ -8,7 +8,7 @@
 // option and journal; `book.start()` syncs now, then every hour HOUR_SYNC_DELAY_MS after the top of the hour, and
 // `book.stop()` on shutdown.
 
-import type { JournalEntry, Mode } from '@gimbal/shared';
+import type { JournalEntry, Mode, TxRef } from '@gimbal/shared';
 import { scanRead } from '../venues/http-budget.ts';
 import type { Clock } from '../venues/venue.ts';
 import { systemClock } from '../venues/venue.ts';
@@ -24,7 +24,7 @@ import type { BookSources, SyncLine } from './sync.ts';
 import {
   failedLine, feeEvents, fundingEvents, fundingWindow, keepSync, knownTxIds, ledgerEvents, ledgerWindow, missingFees, syncLine,
 } from './sync.ts';
-import type { BookEvent, BookRecord, EnterEvent, JournalEvent, SyncEvent, TransferEvent, TransferInput } from './types.ts';
+import type { BookEvent, BookFill, BookRecord, EnterEvent, JournalEvent, SyncEvent, TransferEvent, TransferInput } from './types.ts';
 
 /** The hourly sync runs this long after the top of the hour: Hyperliquid pays at it, Phoenix books a little later. */
 export const HOUR_SYNC_DELAY_MS = 5 * 60_000;
@@ -54,7 +54,35 @@ export interface BookOptions {
   path?: string;
   hooks?: StoreHooks;
   timers?: Timers;
+  /**
+   * The window the strategy loop holds now: null when it holds nothing, undefined when it cannot tell (no loop, no
+   * hands). A position the book holds open while the loop holds nothing was closed outside the loop with no close
+   * report (a protection's close that threw, a close by hand): the next sync books its exit from the venues' fills.
+   */
+  loopHeld?: () => { windowId: string } | null | undefined;
 }
+
+/** A close made outside the strategy loop (panic_close, a rescue's reduce, an ADL unwind), as recordOutside takes it. */
+export interface OutsideClose {
+  /** The exit reason: 'panic_close', 'rescue reduce', 'ADL unwind', 'closed outside the loop'. */
+  reason: string;
+  by: 'auto' | 'manual';
+  /** ms, before its first order. */
+  startedAt: number;
+  at: number;
+  /** Its fills per venue and side (BookFill: feeUsd is the venue's charge). */
+  fills: BookFill[];
+  /** The venues' charge for them, > 0 a cost. */
+  feeUsd: number;
+  tx: TxRef[];
+  /** Both legs read flat after it: the position's exit. Otherwise its fills are a partial reduce (a `fill` record). */
+  flat: boolean;
+  /** The pair's symbol: the open position on it. */
+  symbol?: string;
+}
+
+/** A position open in the book this long after its last record, while the loop holds nothing, is looked for as closed. */
+export const OUTSIDE_CLOSE_GRACE_MS = 2 * 60_000;
 
 export interface AdoptInput {
   windowId: string;
@@ -179,6 +207,9 @@ export class PositionBook {
     const positions = positionsOf(this.events);
     const held = openPosition(positions, input.windowId);
     if (held !== null) return held.id;
+    // Closed in the book (panic_close, a rescue, an ADL unwind) while the loop still says it holds it: not adopted again.
+    const closed = positions.findLast((p) => p.windowId === input.windowId && p.exit !== null && p.exit.record.at >= input.since);
+    if (closed !== undefined) return closed.id;
     const positionId = this.#newId(input.windowId, input.since, positions);
     const record: BookRecord = {
       kind: 'enter', windowId: input.windowId, symbol: input.symbol, at: input.since,
@@ -244,6 +275,7 @@ export class PositionBook {
     if (sources === undefined || sources === null) return { lines: [{ ledger: 'book', ok: false, text: 'no ledgers to read' }], added };
     // The book's reads are background reads: below the risk engine's account reads, skipped (not retried) when the
     // venue's budget is short. A skipped read is a failed one: the next sync starts from the last good read.
+    lines.push(...await this.#closedOutside(sources));
     const venues = [...new Set(positionsOf(this.events).flatMap((p) => p.legs.map((l) => l.venue)))].sort();
     for (const venue of venues) {
       const source = sources.funding[venue];
@@ -320,6 +352,76 @@ export class PositionBook {
     this.#scheduleSummary();
     for (const l of lines) this.#log(`book: ${l.text}`);
     return { lines, added };
+  }
+
+  /**
+   * A close made outside the strategy loop: an exit when both legs ended flat, else (a partial reduce with fills) a
+   * `fill` record of the open position. The position is the open one on `symbol` (else the latest open). Nothing
+   * filled and not flat: nothing to book. Returns what record() returns.
+   */
+  recordOutside(c: OutsideClose): Recorded {
+    const positions = positionsOf(this.events);
+    const open = positions.filter((p) => p.exit === null);
+    const on = c.symbol === undefined ? [] : open.filter((p) => p.symbol.toUpperCase() === c.symbol!.toUpperCase());
+    const target = on.at(-1) ?? open.at(-1) ?? null;
+    if (!c.flat && c.fills.length === 0) return { positionId: null, numbers: {}, note: null };
+    if (c.flat && target === null && c.fills.length === 0) return { positionId: null, numbers: {}, note: null };
+    const record: BookRecord = {
+      kind: c.flat && target !== null ? 'exit' : 'fill',
+      windowId: target?.windowId ?? `outside:${c.reason}`, symbol: target?.symbol ?? c.symbol ?? '',
+      at: c.at, startedAt: c.startedAt, legs: c.fills, feeUsd: c.feeUsd, tx: c.tx,
+      forecastNetAprPct: target?.enter.record.forecastNetAprPct ?? null, exitReason: c.reason, rotation: null, by: c.by, marginMoves: [],
+    };
+    const r = this.record(record);
+    this.#log(`book: ${c.reason} booked as ${record.kind === 'exit' ? `the exit of ${r.positionId}` : `a partial fill of ${r.positionId ?? 'the desk'}`}`
+      + ` (${c.fills.length} fill(s))`);
+    return r;
+  }
+
+  /** Open positions the loop no longer holds (see BookOptions.loopHeld): booked as exits from the venues' closing fills. */
+  async #closedOutside(sources: BookSources): Promise<SyncLine[]> {
+    const held = this.#o.loopHeld?.();
+    if (held === undefined) return [];
+    const lines: SyncLine[] = [];
+    const now = this.#clock.now();
+    for (const p of positionsOf(this.events)) {
+      if (p.exit !== null || (held !== null && held.windowId === p.windowId)) continue;
+      const last = Math.max(p.enter.record.at, ...p.fills.map((f) => f.record.at));
+      if (now - last < OUTSIDE_CLOSE_GRACE_MS) continue;
+      const fills: BookFill[] = [];
+      let at = 0;
+      for (const leg of p.legs) {
+        const address = this.address(leg.venue);
+        if (sources.closeFills === undefined || address === null) continue;
+        try {
+          const f = await scanRead(() => sources.closeFills!({
+            venue: leg.venue, address, symbol: p.symbol, side: leg.side === 'long' ? 'SELL' : 'BUY', from: last, to: now,
+          }));
+          if (f !== null) {
+            fills.push(f.fill);
+            at = Math.max(at, f.at);
+          }
+        } catch (err) {
+          lines.push(failedLine(`${leg.venue}-fills`, err));
+        }
+      }
+      let r: Recorded;
+      try {
+        r = this.record({
+          kind: 'exit', windowId: p.windowId, symbol: p.symbol, at: at > 0 ? at : now, legs: fills,
+          feeUsd: fills.reduce((a, f) => a + (f.feeUsd ?? 0), 0), tx: [], forecastNetAprPct: p.enter.record.forecastNetAprPct,
+          exitReason: 'closed outside the loop', rotation: null, by: 'manual', marginMoves: [],
+        });
+      } catch (err) {
+        lines.push({ ledger: 'book', ok: false, text: `${p.id} closed outside the loop, but its exit was not written (${errorMessage(err)}); the next sync tries again` });
+        continue;
+      }
+      lines.push({
+        ledger: 'book', ok: true,
+        text: `${r.positionId} closed outside the loop (the loop holds ${held === null ? 'nothing' : held.windowId}): exit booked from ${fills.length} venue fill(s)`,
+      });
+    }
+    return lines;
   }
 
   /** Syncs now, then every hour HOUR_SYNC_DELAY_MS after the top of the hour, until stop(). */

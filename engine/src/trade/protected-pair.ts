@@ -294,6 +294,20 @@ export class GuardedLeg implements TradeLeg {
   }
 }
 
+/** The closes the protections make outside the strategy loop. */
+export type ProtectionCloseBy = 'panic_close' | 'rescue reduce' | 'ADL unwind';
+
+/** One protection's close as it ended: its result, or the error it threw (its fills then unknown). */
+export interface ProtectionCloseReport {
+  by: ProtectionCloseBy;
+  reason: string;
+  /** ms, before its first order. */
+  startedAt: number;
+  at: number;
+  result: PairResult | null;
+  error: string | null;
+}
+
 export interface ProtectedPairOptions {
   trader: PairTrader;
   symbol: string;
@@ -315,6 +329,8 @@ export interface ProtectedPairOptions {
   save: () => void;
   /** What stays open after a close: serve logs and journals it. */
   onOpen?: (lines: string[]) => void;
+  /** After a protection's close (one that names `by`), sent or failed: serve books it (book/book.ts recordOutside). */
+  onProtectionClose?: (report: ProtectionCloseReport) => void;
   log?: (line: string) => void;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
@@ -510,7 +526,29 @@ export class ProtectedPair {
   }
 
   /** A protection's close: always reduce-only (see the header); throws, with nothing sent, when it cannot start. */
-  async close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean; maker?: MakerFirst }): Promise<PairResult> {
+  async close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean; maker?: MakerFirst; by?: ProtectionCloseBy }): Promise<PairResult> {
+    const { by, ...rest } = request;
+    if (by === undefined) return this.#close(rest);
+    const now = this.#o.now ?? Date.now;
+    const startedAt = now();
+    let result: PairResult | null = null;
+    let error: string | null = null;
+    try {
+      result = await this.#close(rest);
+      return result;
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+      throw err;
+    } finally {
+      try {
+        this.#o.onProtectionClose?.({ by, reason: request.reason, startedAt, at: now(), result, error });
+      } catch (err) {
+        this.#log(`book: the ${by} close was not booked (${err instanceof Error ? err.message : String(err)})`);
+      }
+    }
+  }
+
+  async #close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean; maker?: MakerFirst }): Promise<PairResult> {
     if (this.#stopped) throw new Error('serve is stopping and its trader lock is released: nothing is signed');
     if (!this.live) {
       throw new Error(`alert only (${this.why ?? 'this engine does not trade'}): nothing is signed; close the legs by hand (stop serve, then pair-mainnet close ${this.symbol} --send)`);

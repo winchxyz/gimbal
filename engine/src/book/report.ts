@@ -26,7 +26,15 @@ function legLine(l: LegResult, open: boolean): string {
 
 function fundingPart(l: LegResult): string {
   const missing = l.hours - l.paidHours;
-  return `${l.venue} ${signed(l.fundingUsd)} (${l.paidHours} of ${l.hours} h paid${missing > 0 ? `, ${missing} h with no payment booked` : ''})`;
+  const estimated = l.estimatedHours > 0 ? `, ${l.estimatedHours} h ${signed(l.estimatedUsd)} estimated from daily aggregates` : '';
+  return `${l.venue} ${signed(l.fundingUsd)} (${l.paidHours} of ${l.hours} h paid${missing > 0 ? `, ${missing} h with no payment booked` : ''}${estimated})`;
+}
+
+function settledText(p: PositionResult): string {
+  if (!p.settled && p.finalAt === null) return 'not yet: the venues may still book the last hours';
+  const asOf = p.finalAt === null ? 'every ledger read past the exit + 2 h (the final entry not written yet)' : `final as of ${when(p.finalAt)}`;
+  const later = p.afterFinalUsd === 0 ? '' : `; booked late after it: ${signed(p.afterFinalUsd)} (an adjustment to the final, in the numbers here)`;
+  return `yes: ${asOf}${later}`;
 }
 
 export function positionBlock(p: PositionResult): string[] {
@@ -39,7 +47,7 @@ export function positionBlock(p: PositionResult): string[] {
   else {
     out.push(`  held       ${hoursText(p.heldHours)}, exited ${when(p.exitedAt!)} by ${p.exitBy ?? '?'}${p.rotatedTo === null ? '' : `, rotated out to ${p.rotatedTo}`}`);
     out.push(`  exit       ${p.exitReason ?? 'no reason recorded'}`);
-    out.push(`  settled    ${p.settled ? 'yes: every ledger read past the exit + 2 h, final numbers' : 'not yet: the venues may still book the last hours'}`);
+    out.push(`  settled    ${settledText(p)}`);
   }
   out.push(`  legs       ${p.legs.map((l) => legLine(l, p.open)).join('; ')}`);
   const sizing = [
@@ -93,7 +101,7 @@ export function bookReport(s: BookSummary, notes: readonly string[] = []): strin
   const d = s.deskTransfers;
   out.push(`  desk ledger ${d.count} entr${d.count === 1 ? 'y' : 'ies'} not tied to a position: in ${signed(d.inUsd, 2)}, out ${signed(d.outUsd, 2)}, fees ${signed(d.feeUsd)}`);
   out.push('');
-  out.push('NEAR AI veto ledger (helped / hurt)');
-  out.push('  -- not recorded yet: this section joins when the veto outcomes are booked --');
+  out.push('NEAR AI risk check ledger (helped / hurt)');
+  out.push('  -- not recorded yet: this section joins when the risk check outcomes are booked --');
   return `${out.join('\n')}\n`;
 }

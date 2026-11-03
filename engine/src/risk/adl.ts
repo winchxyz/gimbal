@@ -72,7 +72,8 @@ export interface AdlTrader {
   baseline(leg: TradeLeg): bigint | null | undefined;
   /** The legs as they are now become the pair (PairTrader.adopt): used when an event ends with both legs flat. */
   adopt(positions: readonly [bigint, bigint]): void;
-  close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean }): Promise<PairResult>;
+  /** `by`: which protection closes (the book takes it as an exit or a partial fill outside the loop). */
+  close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean; by?: 'panic_close' | 'rescue reduce' | 'ADL unwind' }): Promise<PairResult>;
 }
 
 /** A confirmed ADL that has not ended (both legs not yet read flat twice alike). */
@@ -290,7 +291,7 @@ export class AdlWatch {
     let result: PairResult | null = null;
     let error: string | null = null;
     try {
-      result = await this.#trader.close({ reason: `adl: unwind both legs (attempt ${n} of ${ADL_ATTEMPTS})`, targets: [0n, 0n], reduceOnly: true });
+      result = await this.#trader.close({ reason: `adl: unwind both legs (attempt ${n} of ${ADL_ATTEMPTS})`, targets: [0n, 0n], reduceOnly: true, by: 'ADL unwind' });
     } catch (err) {
       error = errorText(err);
     }

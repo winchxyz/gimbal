@@ -15,7 +15,7 @@ import type { LegOutcome, LegSide, TradeLeg } from './legs.ts';
 import { qtyString, toQty } from './lots.ts';
 import { PairTrader } from './pair.ts';
 import type { PairTraderState } from './pair.ts';
-import type { OutgoingOrder } from './protected-pair.ts';
+import type { OutgoingOrder, ProtectionCloseReport } from './protected-pair.ts';
 import { GuardedLeg, IN_FLIGHT_LIFE_MS, InFlightBook, ProtectedPair, inFlightUnexplained, startPlan } from './protected-pair.ts';
 import type { InFlightOrder, LoadedTraderState, TraderFileState } from './trader-state.ts';
 import { TRADER_STATE_VERSION, TraderStateStore, acquireTraderLock, lockHolder, parseTraderState, traderStateFile, traderStateJson } from './trader-state.ts';
@@ -96,7 +96,7 @@ test('a guarded leg saves the order in flight before it is sent, and refuses it 
 
 // ---- ProtectedPair ----
 
-function pair(live: boolean, options: { restored?: InFlightOrder[]; adlHold?: string; hl?: TradeLeg; px?: TradeLeg } = {}) {
+function pair(live: boolean, options: { restored?: InFlightOrder[]; adlHold?: string; hl?: TradeLeg; px?: TradeLeg; onProtectionClose?: (r: ProtectionCloseReport) => void } = {}) {
   const hl = new Leg('hyperliquid');
   const px = new Leg('phoenix');
   const book = new InFlightBook(options.restored ?? []);
@@ -114,6 +114,7 @@ function pair(live: boolean, options: { restored?: InFlightOrder[]; adlHold?: st
   const p = new ProtectedPair({
     trader, symbol: 'XLM', live, why: live ? null : 'GIMBAL_TRADE is not 1', save, inFlight: book, ...(options.adlHold === undefined ? {} : { adlHold: options.adlHold }),
     freshPrice: async () => { events.push('price'); }, onOpen: (lines) => events.push(...lines),
+    ...(options.onProtectionClose === undefined ? {} : { onProtectionClose: options.onProtectionClose }),
   });
   return { hl, px, trader, p, events, saves, book };
 }
@@ -131,6 +132,29 @@ test('ProtectedPair: a close refreshes the price, is reduce-only even when asked
   assert.equal(s.events[0], 'price');
   assert.equal(s.events.at(-1), 'save');
   assert.deepEqual(s.p.openLines(), []);
+});
+
+test('ProtectedPair: a protection close that names itself is reported with its result or its error; others are not', async () => {
+  const reports: ProtectionCloseReport[] = [];
+  const s = pair(true, { onProtectionClose: (r) => reports.push(r) });
+  s.hl.pos = toQty('-50');
+  s.px.pos = toQty('50');
+  s.p.adopt([toQty('-50'), toQty('50')]);
+  await s.p.close({ reason: 'strategy: exit', targets: [0n, 0n] });
+  assert.equal(reports.length, 0, 'the loop books its own closes');
+  s.hl.pos = toQty('-50');
+  s.px.pos = toQty('50');
+  s.p.adopt([toQty('-50'), toQty('50')]);
+  const r = await s.p.close({ reason: 'panic_close: the owner closed the desk', reduceOnly: true, by: 'panic_close' });
+  assert.equal(reports.length, 1);
+  assert.deepEqual([reports[0]!.by, reports[0]!.reason, reports[0]!.error], ['panic_close', 'panic_close: the owner closed the desk', null]);
+  assert.equal(reports[0]!.result, r);
+  assert.ok(reports[0]!.startedAt <= reports[0]!.at);
+  // A close that throws is reported with its error and no result.
+  const off = pair(false, { onProtectionClose: (x) => reports.push(x) });
+  await assert.rejects(off.p.close({ reason: 'adl: unwind', targets: [0n, 0n], by: 'ADL unwind' }), /alert only/);
+  assert.deepEqual([reports[1]!.by, reports[1]!.result], ['ADL unwind', null]);
+  assert.match(reports[1]!.error!, /alert only/);
 });
 
 test('ProtectedPair alert only: a close throws before anything is signed, and saves nothing', async () => {

@@ -7,7 +7,8 @@ import { hyperliquidTxRef } from '../relayer/tx.ts';
 import { fillsOf, phoenixTraderApi } from '../trade/phoenix-leg.ts';
 import { HL_MAINNET_INFO_URL, HL_TESTNET_INFO_URL, HyperliquidReader } from '../venues/hyperliquid.ts';
 import { PHOENIX_API_URL, PhoenixReader } from '../venues/phoenix.ts';
-import type { BookSources, FillFeeQuery } from './sync.ts';
+import type { BookSources, CloseFillQuery, FillFeeQuery } from './sync.ts';
+import type { BookFill } from './types.ts';
 import type { HlLedgerRow } from './types.ts';
 
 const PAGE_ROWS = 500;
@@ -66,7 +67,54 @@ export function rowShape(r: unknown): string {
     .join(', ');
 }
 
-interface HlFillRow { coin: string; side: 'B' | 'A'; fee?: string; time: number }
+interface HlFillRow { coin: string; side: 'B' | 'A'; fee?: string; time: number; px?: string; sz?: string }
+
+/** Fills summed into one BookFill (size-weighted price; the fee null when one is missing) and the last one's time. */
+export function sumFills(venue: string, side: 'BUY' | 'SELL', rows: readonly { size: number; px: number | null; fee: number | null; time: number }[]): { fill: BookFill; at: number } | null {
+  let qty = 0;
+  let notional = 0;
+  let priced = 0;
+  let fee: number | null = 0;
+  let at = 0;
+  for (const r of rows) {
+    if (!(r.size > 0)) continue;
+    qty += r.size;
+    if (r.px !== null && Number.isFinite(r.px)) {
+      notional += r.size * r.px;
+      priced += r.size;
+    }
+    fee = fee === null || r.fee === null || !Number.isFinite(r.fee) ? null : fee + r.fee;
+    at = Math.max(at, r.time);
+  }
+  if (qty === 0) return null;
+  return { fill: { venue, side, qty: String(Number(qty.toPrecision(12))), avgPx: priced > 0 ? notional / priced : null, feeUsd: fee }, at };
+}
+
+/** The desk's Hyperliquid fills on a coin and side in [from, to] (userFillsByTime), summed. */
+export async function hlCloseFills(f: typeof fetch, infoUrl: string, q: CloseFillQuery): Promise<{ fill: BookFill; at: number } | null> {
+  const rows = await post<unknown>(f, infoUrl, { type: 'userFillsByTime', user: q.address.toLowerCase(), startTime: Math.max(0, q.from), endTime: q.to });
+  if (!Array.isArray(rows)) throw new Error('userFillsByTime: not a list');
+  const mine = (rows as HlFillRow[]).filter((r) => r.coin === q.symbol && r.side === (q.side === 'BUY' ? 'B' : 'A') && r.time >= q.from && r.time <= q.to);
+  return sumFills('hyperliquid', q.side, mine.map((r) => ({
+    size: Number(r.sz), px: r.px === undefined ? null : Number(r.px), fee: r.fee === undefined ? null : Number(r.fee), time: r.time,
+  })));
+}
+
+/** The desk's Phoenix fills on a market and side in [from, to] (trades-history: a buy has baseLotsDelta > 0), summed. */
+export async function phoenixCloseFills(api: ReturnType<typeof phoenixTraderApi>, q: CloseFillQuery): Promise<{ fill: BookFill; at: number } | null> {
+  const raw = await api.tradesHistory(q.address, 100);
+  const rows = (raw as { data?: unknown } | null)?.data;
+  if (!Array.isArray(rows)) return null;
+  const mine: { size: number; px: number | null; fee: number | null; time: number }[] = [];
+  for (const r of rows as { marketSymbol?: unknown; baseLotsDelta?: unknown; price?: unknown; fees?: unknown; timestamp?: unknown }[]) {
+    const time = typeof r.timestamp === 'string' ? Date.parse(r.timestamp) : NaN;
+    const delta = Number(r.baseLotsDelta);
+    if (r.marketSymbol !== q.symbol || !Number.isFinite(time) || time < q.from || time > q.to || !Number.isFinite(delta)) continue;
+    if ((delta > 0) !== (q.side === 'BUY')) continue;
+    mine.push({ size: Math.abs(delta), px: Number.isFinite(Number(r.price)) ? Number(r.price) : null, fee: Number.isFinite(Number(r.fees)) ? Number(r.fees) : null, time });
+  }
+  return sumFills('phoenix', q.side, mine);
+}
 
 /**
  * The fee Hyperliquid charged for one venue side of an act: every fill on the coin and side between the act's start
@@ -116,5 +164,10 @@ export function liveBookSources(o: LiveSourceOptions): BookSources {
       return null;
     },
     hlTxRef: (hash: string): TxRef => hyperliquidTxRef(o.network, hash),
+    closeFills: async (q) => {
+      if (q.venue === 'hyperliquid') return hlCloseFills(f, infoUrl, q);
+      if (q.venue === 'phoenix' && phoenixApi !== null) return phoenixCloseFills(phoenixApi, q);
+      return null;
+    },
   };
 }

@@ -158,7 +158,7 @@ interface Synthetic {
   sent: VerifiedQuote[];
   withdrawn: bigint[];
   credited: bigint[];
-  closes: { targets?: [bigint, bigint]; reduceOnly?: boolean }[];
+  closes: { targets?: [bigint, bigint]; reduceOnly?: boolean; by?: string }[];
   /** The target venues' ledgers: one entry per delivery (the test may add or hold them). */
   ledger: { venue: VenueId; usd: number; id: string }[];
   /** Arbitrum: the desk's USDC, Transfer logs, used authorizations; `down` makes every read fail. */
@@ -359,6 +359,7 @@ test('the fee share: a small rescue whose fees are over 10 % reduces both legs r
   assert.equal(s.closes.length, 1);
   const c = s.closes[0]!;
   assert.equal(c.reduceOnly, true);
+  assert.equal(c.by, 'rescue reduce', 'the book books it as a partial fill outside the loop');
   const [a, b] = c.targets!;
   const cut = 100_000_000n - a;
   assert.equal(b, -100_000_000n + cut, 'both legs by the same size: the hedge stays flat');
