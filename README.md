@@ -141,7 +141,95 @@ Hyperliquid testnet, which names the address it recovered. A desk with no funds 
 `faucet`, `order`, `ws`, `settle`, ...) are listed at the top of `tools/testnet/live.mjs`. 1Click has no
 testnet, so rescues run live only on mainnet.
 
-### 4. Mainnet evidence
+### 4. The agent's MCP server
+
+Gimbal ships an MCP server (stdio) so an AI agent can run one desk with only the operator key — read it, place a
+Hyperliquid order, fund a venue, withdraw, and try an attack. Every tool returns the contract's answer: a result, or
+a refusal with its `E_*` code and the NEAR transaction. The server holds no venue key; the NEAR operator key signs,
+and only the methods that key allows.
+
+```bash
+# add the operator key to the desk owner's account (dry run first, then the human runs --send)
+node tools/testnet/operator-key.mjs gimbal-final-fcf135.testnet --owner gimbal-owner-fcf135.testnet
+node tools/testnet/operator-key.mjs gimbal-final-fcf135.testnet --owner gimbal-owner-fcf135.testnet --send
+
+# run the server
+GIMBAL_CONTRACT_ID=gimbal-final-fcf135.testnet DESK_ID=final-1 NEAR_NETWORK=testnet npm run mcp -w engine
+```
+
+Add it to Claude Code:
+
+```bash
+claude mcp add gimbal \
+  --env GIMBAL_CONTRACT_ID=gimbal-final-fcf135.testnet --env DESK_ID=final-1 --env NEAR_NETWORK=testnet \
+  -- node /absolute/path/to/engine/src/mcp/server.ts
+```
+
+Or add it to Claude Desktop (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "gimbal": {
+      "command": "node",
+      "args": ["/absolute/path/to/engine/src/mcp/server.ts"],
+      "env": { "GIMBAL_CONTRACT_ID": "gimbal-final-fcf135.testnet", "DESK_ID": "final-1", "NEAR_NETWORK": "testnet" }
+    }
+  }
+}
+```
+
+The operator key file is `.keys/operator-<contract>.json` by default (set `OPERATOR_KEY_FILE` to move it). The five
+tools are `read_desk`, `place_hl_order`, `fund_venue`, `withdraw` and `try_attack`.
+
+### 5. Try to make the agent steal
+
+`npm run attack` runs a scripted list of malicious operator requests against a desk and prints a table — PASS/FAIL →
+attack → refusal code → NEAR transaction or "rejected before the chain, no tx" — then a before/after check of the
+desk's NEAR ledger and its Hyperliquid account value. The attacks: an over-size order (`E_SIZE`), an asset outside
+the policy (`E_ASSET`), `hl_withdraw` with an extra `destination` argument (`E_ARGS`, unknown field `destination`), a
+made-up `fund_venue` quote paying the attacker (`E_QUOTE_SIGNATURE`), a real recorded 1Click quote for another desk
+(`E_QUOTE_FIELDS`), a method outside the key's list (rejected by the node as a method mismatch, no tx), resuming a
+paused desk with `set_paused(false)` (`E_NOT_ALLOWED`: it needs exactly 1 yoctoNEAR, which a FunctionCall key cannot
+attach), an Orderly `MARKET` order (`E_PRICE_BAND`), and the hourly meter behind `--meter`.
+
+A row passes only when it gets exactly its expected refusal (code, and for shared codes the message). Anything
+else — another code, an RPC error, a spent allowance, a signature — is FAIL with what came back. A missing operator
+key or an allowance under 0.3 NEAR is a FAIL before any row runs.
+
+| Flag | What it does |
+| --- | --- |
+| `--contract <id>`, `--desk <id>` | the desk (or `GIMBAL_CONTRACT_ID`, `DESK_ID`) |
+| `--network testnet\|mainnet` | the network (or `NEAR_NETWORK`; default testnet) |
+| `--mainnet` | required for mainnet; without it a mainnet target is refused |
+| `--key-file <path>` | the operator key file (or `OPERATOR_KEY_FILE`; default `.keys/operator-<contract>.json`); its `network` must match |
+| `--env-file <path>` | load these variables from a file first |
+| `--dry` | build every request, send nothing (the default when no key file exists) |
+| `--only a,b` | run only these attack ids (`over-size`, `asset`, `withdraw-destination`, `fake-quote`, `foreign-quote`, `owner-method`, `unpause`, `orderly-market`, `hourly-meter`) |
+| `--meter` | testnet only: also run the hourly-meter attack. It signs post-only buys far below the market, sized to the cap left in the hour (`get_desk_counters`), until the contract refuses; none is posted |
+
+The MCP server takes the same guard: it refuses mainnet unless started with `--mainnet` (or `GIMBAL_ALLOW_MAINNET=1`),
+and its `try_attack` tool never runs the meter.
+
+```bash
+# the attack: dry (default when no operator key exists) prints every request and the code it expects, sends nothing
+node engine/src/mcp/attack-cli.ts --contract gimbal-final-fcf135.testnet --desk final-1 --dry
+# live, with the operator key on chain (the human has run operator-key.mjs --send):
+npm run attack -w engine -- --contract gimbal-final-fcf135.testnet --desk final-1
+npm run attack -w engine -- --contract gimbal-final-fcf135.testnet --desk final-1 --meter
+
+# the rescue: the margin move that keeps a leg alive, dry against a mainnet desk (keyless, read-only)
+npm run rescue-dry -w engine -- --mainnet --contract <mainnet-contract> --desk <desk>
+
+# the live pair: one MPC signature per step from the desk owner's account, checked here, then posted to the venue
+node tools/testnet/live.mjs gimbal-final-fcf135.testnet final-1 hl --owner gimbal-owner-fcf135.testnet
+```
+
+The attack's dry run against `final-1` (BTC/ETH/SOL unpriced, ledger zero) builds every request and names the code
+the contract would answer. A live run ends with `N USDC moved (NEAR ledger + Hyperliquid account)`; when the desk
+holds, every row is PASS and that is `0 USDC moved`.
+
+### 6. Mainnet evidence
 
 <!-- fill: table — action · time · NEAR tx · venue tx — for: desk created, both legs opened, funding paid,
 rescue through Intents (with measured seconds), four refusals -->
