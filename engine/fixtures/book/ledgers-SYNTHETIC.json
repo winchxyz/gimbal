@@ -1,0 +1,333 @@
+{
+ "note": "SYNTHETIC ledger answers in the venues' wire shapes (Hyperliquid userFunding rows, Phoenix funding-history events, Hyperliquid userNonFundingLedgerUpdates rows) for placeholder addresses; times from 2026-11-02 10:00 UTC.",
+ "hyperliquidAddress": "0x00000000000000000000000000000000000000d1",
+ "phoenixAuthority": "PhoenixDeskAuthorityPLACEHOLDER111111111111",
+ "hyperliquid": {
+  "userFunding": [
+   {
+    "time": 1793613600065,
+    "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "delta": {
+     "type": "funding",
+     "coin": "XLM",
+     "usdc": "0.06",
+     "szi": "-4000.0",
+     "fundingRate": "0.00006",
+     "nSamples": null
+    }
+   },
+   {
+    "time": 1793617200065,
+    "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "delta": {
+     "type": "funding",
+     "coin": "XLM",
+     "usdc": "0.06",
+     "szi": "-4000.0",
+     "fundingRate": "0.00006",
+     "nSamples": null
+    }
+   },
+   {
+    "time": 1793620800065,
+    "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "delta": {
+     "type": "funding",
+     "coin": "XLM",
+     "usdc": "0.06",
+     "szi": "-4000.0",
+     "fundingRate": "0.00006",
+     "nSamples": null
+    }
+   },
+   {
+    "time": 1793624400065,
+    "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "delta": {
+     "type": "funding",
+     "coin": "XLM",
+     "usdc": "0.06",
+     "szi": "-4000.0",
+     "fundingRate": "0.00006",
+     "nSamples": null
+    }
+   },
+   {
+    "time": 1793624400065,
+    "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "delta": {
+     "type": "funding",
+     "coin": "BTC",
+     "usdc": "1.5",
+     "szi": "-0.5",
+     "fundingRate": "0.00002",
+     "nSamples": null
+    }
+   },
+   {
+    "time": 1793628000065,
+    "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "delta": {
+     "type": "funding",
+     "coin": "XLM",
+     "usdc": "0.06",
+     "szi": "-4000.0",
+     "fundingRate": "0.00006",
+     "nSamples": null
+    }
+   },
+   {
+    "time": 1793631600065,
+    "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "delta": {
+     "type": "funding",
+     "coin": "XLM",
+     "usdc": "0.06",
+     "szi": "-4000.0",
+     "fundingRate": "0.00006",
+     "nSamples": null
+    }
+   },
+   {
+    "time": 1793635200065,
+    "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "delta": {
+     "type": "funding",
+     "coin": "XLM",
+     "usdc": "0.06",
+     "szi": "-4000.0",
+     "fundingRate": "0.00006",
+     "nSamples": null
+    }
+   },
+   {
+    "time": 1793638800065,
+    "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "delta": {
+     "type": "funding",
+     "coin": "XLM",
+     "usdc": "0.06",
+     "szi": "-4000.0",
+     "fundingRate": "0.00006",
+     "nSamples": null
+    }
+   },
+   {
+    "time": 1793642400065,
+    "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "delta": {
+     "type": "funding",
+     "coin": "XLM",
+     "usdc": "0.06",
+     "szi": "-4000.0",
+     "fundingRate": "0.00006",
+     "nSamples": null
+    }
+   },
+   {
+    "time": 1793646000065,
+    "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "delta": {
+     "type": "funding",
+     "coin": "XLM",
+     "usdc": "0.06",
+     "szi": "-4000.0",
+     "fundingRate": "0.00006",
+     "nSamples": null
+    }
+   },
+   {
+    "time": 1793649600065,
+    "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "delta": {
+     "type": "funding",
+     "coin": "XLM",
+     "usdc": "0.06",
+     "szi": "-4000.0",
+     "fundingRate": "0.00006",
+     "nSamples": null
+    }
+   },
+   {
+    "time": 1793649600065,
+    "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "delta": {
+     "type": "funding",
+     "coin": "SOL",
+     "usdc": "0.03",
+     "szi": "-5.0",
+     "fundingRate": "0.00003",
+     "nSamples": null
+    }
+   },
+   {
+    "time": 1793653200065,
+    "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "delta": {
+     "type": "funding",
+     "coin": "XLM",
+     "usdc": "0.06",
+     "szi": "-4000.0",
+     "fundingRate": "0.00006",
+     "nSamples": null
+    }
+   },
+   {
+    "time": 1793653200065,
+    "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "delta": {
+     "type": "funding",
+     "coin": "SOL",
+     "usdc": "0.03",
+     "szi": "-5.0",
+     "fundingRate": "0.00003",
+     "nSamples": null
+    }
+   },
+   {
+    "time": 1793656800065,
+    "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "delta": {
+     "type": "funding",
+     "coin": "SOL",
+     "usdc": "0.03",
+     "szi": "-5.0",
+     "fundingRate": "0.00003",
+     "nSamples": null
+    }
+   },
+   {
+    "time": 1793660400065,
+    "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "delta": {
+     "type": "funding",
+     "coin": "SOL",
+     "usdc": "-0.05",
+     "szi": "-5.0",
+     "fundingRate": "-0.00005",
+     "nSamples": null
+    }
+   }
+  ]
+ },
+ "phoenix": {
+  "fundingHistory": [
+   {
+    "timestamp": 1793617200000,
+    "symbol": "XLM",
+    "fundingPayment": "-0.01",
+    "fundingRatePercentage": "0.001",
+    "positionSize": "4000",
+    "positionSide": "long"
+   },
+   {
+    "timestamp": 1793620800000,
+    "symbol": "XLM",
+    "fundingPayment": "-0.01",
+    "fundingRatePercentage": "0.001",
+    "positionSize": "4000",
+    "positionSide": "long"
+   },
+   {
+    "timestamp": 1793624400000,
+    "symbol": "XLM",
+    "fundingPayment": "-0.01",
+    "fundingRatePercentage": "0.001",
+    "positionSize": "4000",
+    "positionSide": "long"
+   },
+   {
+    "timestamp": 1793628000000,
+    "symbol": "XLM",
+    "fundingPayment": "-0.01",
+    "fundingRatePercentage": "0.001",
+    "positionSize": "4000",
+    "positionSide": "long"
+   },
+   {
+    "timestamp": 1793635200000,
+    "symbol": "XLM",
+    "fundingPayment": "-0.01",
+    "fundingRatePercentage": "0.001",
+    "positionSize": "4000",
+    "positionSide": "long"
+   },
+   {
+    "timestamp": 1793638800000,
+    "symbol": "XLM",
+    "fundingPayment": "-0.01",
+    "fundingRatePercentage": "0.001",
+    "positionSize": "4000",
+    "positionSide": "long"
+   },
+   {
+    "timestamp": 1793642400000,
+    "symbol": "XLM",
+    "fundingPayment": "-0.01",
+    "fundingRatePercentage": "0.001",
+    "positionSize": "4000",
+    "positionSide": "long"
+   },
+   {
+    "timestamp": 1793646000000,
+    "symbol": "XLM",
+    "fundingPayment": "-0.01",
+    "fundingRatePercentage": "0.001",
+    "positionSize": "4000",
+    "positionSide": "long"
+   },
+   {
+    "timestamp": 1793649600000,
+    "symbol": "XLM",
+    "fundingPayment": "-0.01",
+    "fundingRatePercentage": "0.001",
+    "positionSize": "4000",
+    "positionSide": "long"
+   },
+   {
+    "timestamp": 1793653200000,
+    "symbol": "SOL",
+    "fundingPayment": "-0.01",
+    "fundingRatePercentage": "0.001",
+    "positionSize": "5",
+    "positionSide": "long"
+   },
+   {
+    "timestamp": 1793656800000,
+    "symbol": "SOL",
+    "fundingPayment": "-0.01",
+    "fundingRatePercentage": "0.001",
+    "positionSize": "5",
+    "positionSide": "long"
+   },
+   {
+    "timestamp": 1793660400000,
+    "symbol": "SOL",
+    "fundingPayment": "0.04",
+    "fundingRatePercentage": "-0.004",
+    "positionSize": "5",
+    "positionSide": "long"
+   }
+  ]
+ },
+ "hyperliquidLedger": [
+  {
+   "time": 1793606400000,
+   "hash": "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+   "delta": {
+    "type": "deposit",
+    "usdc": "600.0"
+   }
+  },
+  {
+   "time": 1793656800000,
+   "hash": "0xb2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+   "delta": {
+    "type": "withdraw",
+    "usdc": "50.0",
+    "nonce": 1,
+    "fee": "1.0"
+   }
+  }
+ ]
+}
