@@ -101,3 +101,11 @@ test('a connection keeps why it failed until it works again', () => {
   s = reduceStream(s, { kind: 'connection', source: 'sse', connection: 'open' });
   assert.equal(s.error, null);
 });
+
+test('GET /state seeds the strategy decision, and a restarted engine without one clears it', () => {
+  const decision = { action: 'hold', reason: 'XLM stays above 10 %', windowId: 'w1', heldId: 'w1', at: 7 } as const;
+  let s = seed(engine({ decision }));
+  assert.deepEqual(s.decision, decision);
+  s = seed(engine({ decision: null }), 2000, s);
+  assert.equal(s.decision, null);
+});

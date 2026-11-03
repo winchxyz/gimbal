@@ -6,7 +6,7 @@ import { useEffect, useRef, useSyncExternalStore } from 'react';
 import { createStore, useStream } from '../stream/hub.ts';
 import { engineApi } from '../stream/start.ts';
 import { needsHistory, reduceHistory, type HistoryState } from './history.ts';
-import { outcomeOf, type ManualAction, type Outcome } from './manual.ts';
+import { sendVia, type ManualAction, type Outcome } from './manual.ts';
 
 // ---------- strategy ----------
 
@@ -96,9 +96,9 @@ export function retryHistory(id: string): void {
 /** Sends Rotate or Close to the engine and says what came of it; it never throws. */
 export async function sendManual(action: ManualAction): Promise<Outcome> {
   try {
-    const api = await engineApi();
-    return outcomeOf(action, action.kind === 'rotate' ? await api.rotate(action.windowId) : await api.close());
+    return await sendVia(await engineApi(), action);
   } catch (error) {
-    return outcomeOf(action, error instanceof Error ? error : new Error(String(error)));
+    // No engine API to ask at all (the stream source could not be picked): the same "no answer" as a dropped request.
+    return sendVia({ rotate: () => Promise.reject(error), close: () => Promise.reject(error) }, action);
   }
 }
