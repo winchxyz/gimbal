@@ -56,7 +56,9 @@ export function Page({
   /** The buttons at the right of the bar. */
   end?: ReactNode;
 }) {
-  const index = Math.max(0, steps.findIndex((s) => s.status === 'now'));
+  // The last page (everything done) has no step in progress: it is the last step, not the first.
+  const now = steps.findIndex((s) => s.status === 'now');
+  const index = now === -1 ? Math.max(0, steps.length - 1) : now;
   return (
     <section className="obmain">
       <div className="ob-step lab">

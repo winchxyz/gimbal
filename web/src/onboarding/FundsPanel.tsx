@@ -1,7 +1,7 @@
 import { useEffect } from 'react';
 import { cx } from '../ui/cx.ts';
 import type { FlowState, OnboardingFlow, StepView } from './flow.ts';
-import { formatUsdc, MIN_FUND_USDC, ORIGINS, statusText, usdcUnits } from './intents.ts';
+import { balanceText, formatUsdc, MIN_FUND_USDC, ORIGINS, statusText, usdcUnits } from './intents.ts';
 import { Act, Err, Field, Mono, Page } from './ui.tsx';
 
 interface Props {
@@ -38,7 +38,7 @@ export function FundsPanel({ flow, s, steps }: Props) {
       steps={steps}
       title="Add funds"
       lead="Bring USDC to your NEAR account, then deposit it into the desk. Money you deposit counts as your principal: it comes back to you as principal, not as profit."
-      note={balance === null ? 'Reading your balance…' : `Your NEAR account holds ${formatUsdc(balance)} USDC.`}
+      note={balance === null ? 'Reading your balance…' : `Your NEAR account holds ${balanceText(balance)}.`}
       end={
         <Act busy={s.busy} mine="deposit" primary disabled={!canDeposit} onClick={() => void flow.deposit()}>
           Deposit to desk
@@ -100,7 +100,7 @@ export function FundsPanel({ flow, s, steps }: Props) {
         <section>
           <h3 className="ob-h3">
             <span>USDC on your NEAR account</span>
-            <span>{balance === null ? '' : `${formatUsdc(balance)} USDC`}</span>
+            <span>{balance === null ? '' : balanceText(balance)}</span>
           </h3>
           {s.config.usdcToken === null ? (
             <p className="ob-err">No USDC token is configured for {s.config.network}, so a deposit cannot be built. Set VITE_USDC_TOKEN for this page.</p>
