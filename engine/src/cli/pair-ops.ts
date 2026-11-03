@@ -400,8 +400,15 @@ export async function planOpen(ctx: OpsCtx, pair: Pair, request: OpenRequest): P
   return { request, refusals, size, carry: plan };
 }
 
-/** Sends a planned open whose refusals are empty: maker first, part by part, then finish(). */
-export async function sendOpen(ctx: OpsCtx, pair: Pair, plan: OpenPlan, reason = `pair-mainnet: carry ${plan.request.symbol}, short hyperliquid, long phoenix`): Promise<PairResult[]> {
+/**
+ * Sends a planned open whose refusals are empty: maker first, part by part, then finish(). `gate` (serve) is asked
+ * before each part, after the price refresh: a reason stops the open there, with nothing of that part sent (the parts
+ * already sent are whole hedged pairs, each through its own legging guard, and stay as they are).
+ */
+export async function sendOpen(
+  ctx: OpsCtx, pair: Pair, plan: OpenPlan, reason = `pair-mainnet: carry ${plan.request.symbol}, short hyperliquid, long phoenix`,
+  options: { gate?: () => string | null } = {},
+): Promise<PairResult[]> {
   if (plan.refusals.length > 0) throw new Error(`open refused, nothing signed: ${plan.refusals.join('; ')}`);
   const { symbol } = plan.request;
   // The open's targets keep hl + px as they are. A fresh process reads Phoenix from slot 0, so a snapshot that lags
@@ -415,6 +422,8 @@ export async function sendOpen(ctx: OpsCtx, pair: Pair, plan: OpenPlan, reason =
       size: plan.size, longIndex: 1, reason, maker: { index: 0 },
       beforePart: async () => {
         if (pair.priced) await ensureFresh(ctx.prices, symbol, pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S);
+        const gated = options.gate?.() ?? null;
+        if (gated !== null) throw new Error(gated);
       },
     });
     for (const r of results) printResult(ctx, 'open', r);

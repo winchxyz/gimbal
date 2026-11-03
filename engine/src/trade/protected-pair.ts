@@ -6,8 +6,9 @@
 // and the strategy loop's own operations (strategy/loop.ts through serve-pair.ts, pair-mainnet's code in pair-ops.ts):
 // its exit (a close, reduce-only like the others) and its open (openInChunks, and the residual hedge after it).
 //
-// GuardedLeg wraps each venue leg: an order that is not reduce-only is refused before anything is signed unless the
-// strategy loop's open runs (ProtectedPair.openInChunks, or a hedge it allows to open), so no protection can open or
+// GuardedLeg wraps each venue leg: an order that is not reduce-only is refused before anything is signed unless it
+// comes from the strategy loop's open on this pair (ProtectedPair.openInChunks, or a hedge it allows to open: the
+// work inside its OPEN_SCOPE token, open-scope.ts; a watch check between two parts is not), so no protection can open or
 // grow a position (a PairTrader close re-hedges by reopening a leg unless reduceOnly is set; every close here sets it,
 // and the leg refuses one anyway). While the pair does not trade (alert only) every order is refused the same way. Before an order is signed it is added to the InFlightBook and the state is saved
 // (trader-state.ts); a save that fails refuses the order, so no order goes out that the state on disk does not name.
@@ -53,6 +54,8 @@ import { LegCheckError } from './legs.ts';
 import { qtyString, signedQtyString, toQty } from './lots.ts';
 import type { MakerFirst, PairResult, PairTrader, PairTraderState } from './pair.ts';
 import type { InFlightOrder, LoadedTraderState } from './trader-state.ts';
+import type { OpenToken } from './open-scope.ts';
+import { OPEN_SCOPE } from './open-scope.ts';
 
 /** An order as GuardedLeg names it before it is signed (the book adds `op`). */
 export type OutgoingOrder = Omit<InFlightOrder, 'op'>;
@@ -63,6 +66,7 @@ export class InFlightBook {
   #restored: InFlightOrder[];
   #orders: InFlightOrder[] = [];
   #closes = 0;
+  #signed = 0;
 
   constructor(restored: readonly InFlightOrder[] = []) {
     this.#restored = restored.map((o) => ({ ...o }));
@@ -71,6 +75,11 @@ export class InFlightBook {
   /** The orders from the saved state still in the book (the ones the ADL hold is about). */
   get restored(): InFlightOrder[] {
     return this.#restored.map((o) => ({ ...o }));
+  }
+
+  /** Orders added since the book was made (never goes down: a caller compares it around an operation). */
+  get signed(): number {
+    return this.#signed;
   }
 
   /** Every order in the book, as it is saved. */
@@ -88,6 +97,7 @@ export class InFlightBook {
       this.#orders.splice(this.#orders.indexOf(o), 1);
       throw err;
     }
+    this.#signed++;
   }
 
   /** A protection's close starts; the function returned ends it. Orders sent meanwhile wait for its result. */
@@ -212,7 +222,7 @@ export interface GuardedLegOptions {
   live: () => boolean;
   /** serve is stopping (its lock is being released): every order is refused from then on. */
   stopped?: () => boolean;
-  /** The strategy loop's open runs (ProtectedPair.opening): an order that is not reduce-only may go out then. */
+  /** The caller is the strategy loop's open on this pair (ProtectedPair.openingHere): an order that is not reduce-only may go out. */
   opening?: () => boolean;
   /** Adds the order to the book and saves it; throws when it could not (the order is then refused). */
   beforeSign: (order: OutgoingOrder) => void;
@@ -320,6 +330,8 @@ export class ProtectedPair {
   #stopped = false;
   /** The strategy loop's open (or the hedge it allows) runs: the guarded legs let orders that are not reduce-only out. */
   #opening = 0;
+  /** The opens running now, each the OPEN_SCOPE token of its own work. */
+  readonly #openTokens = new Set<OpenToken>();
 
   constructor(options: ProtectedPairOptions) {
     this.#o = options;
@@ -427,9 +439,18 @@ export class ProtectedPair {
     return { line: r.line, again: r.kind === 'wait', owner: true };
   }
 
-  /** The strategy loop's open runs now (GuardedLegOptions.opening reads it). */
+  /** The strategy loop's open runs now, somewhere. */
   get opening(): boolean {
     return this.#opening > 0;
+  }
+
+  /**
+   * The caller runs inside the strategy loop's open of this pair (GuardedLegOptions.opening and the trader's
+   * openBlocked read it): an order from anything else, a watch check between two parts included, is not part of it.
+   */
+  get openingHere(): boolean {
+    const token = OPEN_SCOPE.getStore();
+    return token !== undefined && this.#openTokens.has(token);
   }
 
   /**
@@ -463,15 +484,22 @@ export class ProtectedPair {
     if (this.#stopped) throw new Error('serve is stopping and its trader lock is released: nothing is signed');
     if (!this.live) throw new Error(`alert only (${this.why ?? 'this engine does not trade'}): nothing is signed`);
     this.#running++;
-    if (opening) this.#opening++;
+    const token: OpenToken | null = opening ? { owner: this } : null;
+    if (token !== null) {
+      this.#opening++;
+      this.#openTokens.add(token);
+    }
     const end = this.inFlight.beginClose();
     try {
-      return await run();
+      return await (token === null ? run() : OPEN_SCOPE.run(token, run));
     } finally {
       this.#save();
       const open = this.openLines();
       if (open.length > 0) this.#o.onOpen?.(open);
-      if (opening) this.#opening--;
+      if (token !== null) {
+        this.#openTokens.delete(token);
+        this.#opening--;
+      }
       end();
       this.#running--;
     }

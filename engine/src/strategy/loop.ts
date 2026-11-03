@@ -6,7 +6,8 @@
 // runs (its counts move, so turning auto on does not wait out the hours again) and answers `off`; nothing is carried
 // out. One decision at a time: checks, acts and the manual POST /rotate and /close run one after another. Never while
 // a rescue or an ADL unwind is running: that is checked at the start of a check and again right before every close
-// and every open (auto and manual), and such a refusal is tried again on the next check.
+// and every open (auto and manual), and once more inside the open, right before its first order and before each
+// later part (the hands' gate); such a refusal is tried again on the next check.
 //
 // What decide() is fed: the last scan's windows, the held pair (the loop's own record of what it entered, or the pair
 // serve adopted from the venues, matched to its desk window) with the margin a rotation would free, free margin per
@@ -21,7 +22,9 @@
 // and signs nothing; the verdict is shown on the window (Window.veto, republished). An act refused before anything was
 // sent is journaled and not tried again for RETRY_AFTER_MS; one that sent orders, or was refused for a passing reason
 // (a rescue running, a close in flight), is tried again on the next check. A single leg (only one venue holds a
-// position) is never held as a pair: it is closed at once, reduce-only, and tried again every check until flat.
+// position) is never held as a pair: it is closed at once, reduce-only, and tried again every check until flat. Each
+// check first asks the hands to check their record against the venues (serve-pair.ts reconcileWithVenues): a pair
+// recorded while one leg or none is open is corrected from two agreeing reads, and journaled.
 //
 // Published: `decision` whenever it changes (action, reason, window or held; not the time). Journal: every enter,
 // exit, rotate, refused, error and veto with numbers and tx links; `wait` when its category changes (journalWait),
@@ -146,6 +149,11 @@ export interface LoopHands {
   open(request: { window: FundingWindow; symbol: string; legUsd: number; leverage: number; qty: string; reason: string }): Promise<ActOutcome>;
   /** Both legs (or the one open) to flat, reduce-only. */
   close(request: { reason: string }): Promise<ActOutcome>;
+  /**
+   * The desk's record checked against the venues (serve-pair.ts reconcileWithVenues): a line when it was corrected
+   * (a pair recorded while one leg or none is open), null when nothing changed.
+   */
+  reconcile?(): Promise<string | null>;
 }
 
 /** What decide() and the veto take that Window does not carry (serve-loop.ts: the scanner's carry, the venues' lots). */
@@ -589,6 +597,14 @@ export class StrategyLoop {
     const last = this.#state.counters.lastHourlyAt;
     const hourly = now - hourStart >= HOUR_GRACE_MS && (last === null || last < hourStart);
 
+    // The record against the venues first: a pair recorded while one leg or none is open is corrected (two reads).
+    if (this.#o.hands?.reconcile !== undefined && this.#manual === null) {
+      const fixed = await this.#o.hands.reconcile().catch((err: unknown) => {
+        this.#log(`strategy loop: the record was not checked against the venues (${errorMessage(err)})`);
+        return null;
+      });
+      if (fixed !== null) this.#journal('error', fixed, { action: 'reconcile' });
+    }
     // A single leg is never held as a pair: it is closed, reduce-only, every check until flat.
     const venues = this.#o.hands?.held() ?? null;
     if (venues?.oneLeg != null && this.#manual === null) {
@@ -779,7 +795,9 @@ export class StrategyLoop {
         return { end: 'done', sent: true, passing: false };
       }
       this.#journal(opened.sent ? 'error' : 'refused', `${kind} ${w.id}: ${opened.reason}${flat}`, { ...base, feeUsd: opened.feeUsd }, opened.tx);
-      return p.fromId === null ? { end: 'skipped', sent: opened.sent, passing: false } : { end: 'flat', sent: true, passing: false };
+      // Stopped by the open's own gate (a rescue that started after the check before it): tried again next check.
+      const passing = this.#gate() !== null;
+      return p.fromId === null ? { end: 'skipped', sent: opened.sent, passing } : { end: 'flat', sent: true, passing };
     }
     // Held from now: an entry's time, or the rotation's.
     this.#setHeld({ windowId: w.id, symbol: sym.symbol, since: now, legUsd: p.legUsd, entryNetAprPct: w.netAprPct });

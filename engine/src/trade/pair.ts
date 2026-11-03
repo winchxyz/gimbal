@@ -45,6 +45,7 @@ import { systemClock } from '../venues/venue.ts';
 import type { LegOutcome, LegRef, LegSide, TradeLeg } from './legs.ts';
 import { HL_EXPIRY_MARGIN_MS, HL_NONCE_WINDOW_MS, LegCheckError, ORDERLY_REPLAY_MS, wasSigned } from './legs.ts';
 import { abs, commonLot, floorToLot, qtyString, signedQtyString, toQty } from './lots.ts';
+import { outsideOpen } from './open-scope.ts';
 
 /** Orderly takes a signed request until 300 s after its timestamp; a little more covers clock skew. */
 export const REPLAY_WINDOW_MS = ORDERLY_REPLAY_MS;
@@ -399,6 +400,11 @@ export class PairTrader {
    * handled; never rejects.
    */
   positionPushed(leg: TradeLeg, position: bigint): Promise<void> {
+    // A watch check is never part of an open, whatever runs when the push arrives (open-scope.ts).
+    return outsideOpen(() => this.#pushed(leg, position));
+  }
+
+  #pushed(leg: TradeLeg, position: bigint): Promise<void> {
     if (this.#ended) return Promise.resolve();
     if (!this.watching(leg)) {
       this.#until.delete(leg);
@@ -446,6 +452,11 @@ export class PairTrader {
   /** What both legs together should hold: the sum of the last open's or close's targets (0 for a plain pair). */
   get net(): bigint {
     return this.#net;
+  }
+
+  /** Where the trader last read the leg (a result, a watch check or a lapse; null: unknown; undefined: never read). */
+  known(leg: TradeLeg): bigint | null | undefined {
+    return this.#known.get(leg);
   }
 
   /** What the last open, close or adoption left the leg meaning to hold (null: unknown; undefined: none yet). */
@@ -1298,7 +1309,8 @@ export class PairTrader {
         this.#polling.delete(leg);
       }
     };
-    loop().catch((err) => this.#log(`${leg.venue} ${leg.symbol}: the unsettled order's watch stopped: ${errorText(err)}`));
+    // The poll outlives the open that armed it: its checks and lapses run outside that open (open-scope.ts).
+    outsideOpen(() => loop().catch((err) => this.#log(`${leg.venue} ${leg.symbol}: the unsettled order's watch stopped: ${errorText(err)}`)));
   }
 
   /**

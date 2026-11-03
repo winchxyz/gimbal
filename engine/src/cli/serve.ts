@@ -365,20 +365,23 @@ if (values.once === true) {
   process.exit(0);
 }
 
+/** A protection runs (a rescue, its fund_venue step included; an ADL unwind; panic_close): no order of the loop goes out. */
+function protectionRunning(): string | null {
+  const rescuing = rescueRunning?.() ?? null;
+  if (rescuing !== null) return `rescue ${rescuing} runs`;
+  if (risk?.adlRunning != null) return 'an ADL unwind runs';
+  if (closingWatch?.current != null) return 'panic_close runs';
+  return null;
+}
+
 loop = serveLoop({
   mode, env: envVar, once: false, contractId: contract?.client.contractId ?? null, deskId, pair, lastDesk: () => lastDesk,
   accounts: loopAccounts, rescueLive, windows: () => server?.state().windows ?? null,
   carry: (id) => scanner.carry(id), venues: readers.venues, veto: nearAi,
   strategy: () => server?.strategy ?? saved.strategy ?? DEFAULT_STRATEGY, policy: () => policy, publish, clock, log,
   ...(stateDirSet === undefined ? {} : { stateDir: resolve(stateDirSet) }),
-  busy: () => {
-    const rescuing = rescueRunning?.() ?? null;
-    if (rescuing !== null) return `rescue ${rescuing} runs`;
-    if (risk?.adlRunning != null) return 'an ADL unwind runs';
-    if (closingWatch?.current != null) return 'panic_close runs';
-    if (pair?.pair?.closing === true) return 'a close of the pair runs';
-    return null;
-  },
+  busy: () => protectionRunning() ?? (pair?.pair?.closing === true ? 'a close of the pair runs' : null),
+  orderGate: protectionRunning,
 });
 log(loop.startLine());
 const strategyLoop = loop;
