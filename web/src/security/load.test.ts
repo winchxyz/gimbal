@@ -22,7 +22,7 @@ test('a desk is read in full: the config, the desk with its policy, and the owne
   const read = readKeys(data.keys, TARGET.contractId);
   assert.equal(read.keys.length, 1, 'the engine’s operator key');
   assert.equal(read.fullAccess, 1, 'the owner’s wallet');
-  assert.equal(read.keys[0]!.methods.length, 19);
+  assert.equal(read.keys[0]!.methods.length, 21);
 });
 
 test('a contract with no such desk is "no desk", not an error, and the owner’s keys are not read', async () => {

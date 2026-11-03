@@ -62,7 +62,7 @@ test('only function-call keys to this contract are operator keys; wallets are co
   assert.equal(read.keys[0]!.allowance, '5');
 });
 
-test('a key with the full operator list holds all 19 methods in the owner’s groups and nothing else', () => {
+test('a key with the full operator list holds all 21 methods in the owner’s groups and nothing else', () => {
   const [key] = readKeys([operatorKey(null)], CONTRACT).keys;
   assert.ok(key);
   assert.equal(key.allowance, null, 'no allowance limit');
@@ -94,7 +94,7 @@ test('the owner-only list is the table of docs/interfaces.md §1.3: owner ✓, n
   const fromTable = table()
     .filter((r) => r.owner === '✓' && r.operator === '')
     .map((r) => r.method);
-  assert.equal(fromTable.length, 9);
+  assert.equal(fromTable.length, 7);
   assert.deepEqual(OWNER_ONLY.map((o) => o.method).sort(), fromTable.sort());
 });
 

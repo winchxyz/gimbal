@@ -166,7 +166,7 @@ every owner call; more would stay in the contract and is refused (`E_DEPOSIT`).
 **Paused desks.** While a desk is paused every operator action method refuses `E_PAUSED`, except actions that
 only reduce risk, which `panic_close` and a rescue rely on: reduce-only orders (`hl_order` / an `orderly_request`
 order with `reduce_only: true`), cancels, rescue transfers (`hl_send_to_intents`, `sol_sign_rescue`,
-`evm_usdc_to_intents`, within `rescue_cap_usd_per_hour`) and `fund_venue` (it only adds margin; within its own limits,
+`evm_usdc_to_intents`, the operator's `hl_withdraw`, within `rescue_cap_usd_per_hour`), `panic_close` and `fund_venue` (it only adds margin; within its own limits,
 "fund_venue" below). `withdraw_to_owner` and `clear_payout_lock` also work on a paused desk. A paused desk's `sol_sign_rescue` passes
 only what frees and pays out the quote's `amountIn`: Phoenix withdrawals and Ember unwraps of at most `amountIn` in
 all (with the unwrap's `Approve` and `Revoke`), the idempotent create of the deposit owner's USDC account and the one
@@ -214,7 +214,7 @@ chooses nothing:
 | `clear_payout_lock(desk_id)` | ✓ | | exactly 1 yocto; only once the payout lock is ≥ 1 h old; re-credits and rolls back nothing; event `payout_lock_cleared` ("Payouts" below) |
 | `hl_approve_builder_fee(desk_id)` | ✓ | ✓ | `ApproveBuilderFee` for the treasury builder at `maxFeeRate` from `FeeConfig` |
 | `hl_set_referrer(desk_id)` | ✓ | ✓ | L1 action `{type:"setReferrer", code}` with `code = treasury.referral_codes.hyperliquid`; setup calls it once per desk, before its first order (the contract does not refuse a repeat; Hyperliquid does); no other code can be signed; with no code configured it refuses (`E_ARGS`) and setup skips it |
-| `hl_withdraw(desk_id, amount)` | ✓ | | emergency only: to the desk's own EVM address |
+| `hl_withdraw(desk_id, amount)` | ✓ | ✓ | `withdraw3` of `amount` (Hyperliquid takes its 1 USDC fee out of it) to the desk's own EVM address on Arbitrum only, also on a paused desk. Owner: exactly 1 yocto attached, no limit (emergency). Operator (no deposit; it is how a rescue leaves Hyperliquid while 1Click quotes nothing out of HyperCore): counts `amount` against the rescue amount cap ("Rescue limits"), not the cost budget or the deposit ring. The owner's engine key is a FunctionCall key on the owner's account, so it takes the operator path; the contract tells the two apart by the attached deposit |
 | `set_mock_price(asset, price_e8)` | contract owner | | only with `PriceSource::Mock` |
 | `refresh_prices(assets: Vec<String>)` | ✓ | ✓ | 1–5 symbols, each once. Callers: any desk owner (so its engine key), any desk's separate operator account and the contract account; anyone else `E_NOT_ALLOWED`, so strangers cannot spend the contract's deposit. Needs ≥ 240 TGas (`E_ARGS`; the engine attaches 300). Asks the OutLayer oracle with `request_price_data`, which gets 200 TGas plus all the unused gas, while the callback `on_prices` gets a fixed 15 TGas; there is no `oracle_call` fallback (it would need as much gas again). It stores each price newer than the stored one; the oracle deposit (0.02 NEAR, mostly refunded) comes from the contract balance; event `prices`. The contract remembers when each symbol was last asked for: when every symbol asked for had a price stored, or was asked for by an earlier call, under 30 s before the block time, it asks nothing and returns `true` at once (a skip means "nothing to do now", not "priced": a caller that needs a newer price reads `prices()` again). Otherwise it asks the oracle for all of them and returns `true` only when every symbol got a price from that answer |
 | `oracle_on_call(sender_id, data, msg)` | the oracle only | | unused: `refresh_prices` no longer makes an `oracle_call`. The method stays for the interface; any predecessor other than the configured oracle, or a `sender_id` other than the contract, → `E_NOT_ALLOWED` |
@@ -234,7 +234,7 @@ chooses nothing:
 | `orderly_settle_pnl(desk_id, settle_nonce)` | ✓ | ✓ | EIP-712 `SettlePnl`; runs before every withdraw, or the withdrawable balance is short |
 | `orderly_withdraw(desk_id, amount, withdraw_nonce)` | ✓ | ✓ | EIP-712 `Withdraw` to the desk's own EVM address only (Arbitrum) |
 | `evm_usdc_to_intents(desk_id, quote, quote_signature, reason)` | ✓ | ✓ | EIP-712 USDC `TransferWithAuthorization` (EIP-3009) from the desk's EVM address to a verified 1Click deposit address on Arbitrum; the relayer submits it and pays the gas |
-| `panic_close(desk_id)` | ✓ | | pauses, then the engine sends reduce-only closes |
+| `panic_close(desk_id)` | ✓ | ✓ | pauses the desk and sets `closing: true` (event `paused` with `paused: true`, then `panic_close`); 0 or 1 yocto (more → `E_DEPOSIT`); on an already paused desk it only sets `closing`. The engine, on reading `closing`, cancels resting orders and closes every leg reduce-only (the paused-desk rules above let exactly that through). `set_paused(desk_id, false)` clears `closing` |
 
 **Orderly money path.** In: 1Click delivers Arbitrum USDC straight to the account's *exclusive receiver
 address* (`GET /v1/client/asset/receiver_address?chain_id=<id>&token=USDC`, pinned with `set_orderly_receiver`;
@@ -267,7 +267,8 @@ treats "no quote" as a normal answer.
 `create_desk`:
 - **Amount.** `rescue_cap_usd_per_hour` over a sliding hour: each transfer weighs `amountIn × (1 − elapsed / 1 h)`,
   so the full cap is back an hour after the last transfer and 2 × the cap can never move within a moment
-  (`E_RESCUE_CAP`).
+  (`E_RESCUE_CAP`). The operator's `hl_withdraw` counts here too (its `amount`, no quote), so a rescue out of
+  Hyperliquid (`hl_withdraw`, then `evm_usdc_to_intents` from Arbitrum) uses about twice its size of the cap.
 - **Cost.** The quotes' cost (`amountIn` − `minAmountOut`) over the same sliding hour, against
   max(`rescue_cap_usd_per_hour` × `max_transfer_cost_bps` / 10⁴, 2 × `max_transfer_cost_flat_e6`), so many small
   transfers cannot pay the cap away in fees (`E_RESCUE_CAP`). Hyperliquid's 1 USDC send fee is not counted: it is
@@ -335,7 +336,8 @@ delayed more than 1 h, and only the treasury loses.
 
 Views: `config()`, `get_desk(desk_id)`, `desks_of(owner)`, `prices()`, `version()`. `get_desk` also returns
 `orderly_account_id` (keccak of the desk EVM address and the broker hash, fixed at `create_desk`),
-`orderly_receiver` (null until pinned) and `orderly_ips` (empty until set). `prices()` returns the same shape as the
+`orderly_receiver` (null until pinned), `orderly_ips` (empty until set) and `closing` (true from `panic_close`
+until the owner unpauses). `prices()` returns the same shape as the
 `prices` event, `[{ asset, price_e8, at_ms }]` sorted by asset. `at_ms` is the oldest a report behind the price can
 be: the oracle answer's `timestamp` − its `recency_duration_sec` (600 s on mainnet), never later than the block that
 stored it. A price fresh from the oracle is therefore up to 10 min old already, so `oracle_max_age_s` must be well
@@ -473,6 +475,7 @@ near-sdk before the method runs ("Failed to deserialize input from JSON"); clien
 | `orderly_receiver_set` | desk_id, receiver |
 | `orderly_ips_set` | desk_id, ips |
 | `paused` | desk_id, paused, by |
+| `panic_close` | desk_id, by |
 | `prices` | [{ asset, price_e8, at_ms }] |
 | `signed` | desk_id, request_id, venue, kind, asset?, side?, size?, px?, oracle_px?, amount?, deposit_address?, reason_sha256 |
 | `deposit` | desk_id, sender, amount, principal (true when the sender is the owner), deposited_total, idle_usdc |

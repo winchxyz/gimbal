@@ -25,13 +25,13 @@ function methodsInTable(): string[] {
 
 test('the operator key’s method list is the table of docs/interfaces.md §1.3, nothing more, nothing less', () => {
   const fromTable = methodsInTable();
-  assert.equal(fromTable.length, 19);
+  assert.equal(fromTable.length, 21);
   assert.deepEqual([...OPERATOR_METHODS].sort(), [...fromTable].sort());
   assert.equal(new Set(OPERATOR_METHODS).size, OPERATOR_METHODS.length, 'no method twice');
 });
 
 test('the owner methods are not on the list: the key must not be able to move money out', () => {
-  for (const owner of ['create_desk', 'set_policy', 'set_operator', 'withdraw_to_owner', 'hl_withdraw', 'panic_close', 'set_orderly_receiver', 'set_orderly_ips']) {
+  for (const owner of ['create_desk', 'set_policy', 'set_operator', 'withdraw_to_owner', 'set_orderly_receiver', 'set_orderly_ips']) {
     assert.equal((OPERATOR_METHODS as readonly string[]).includes(owner), false, owner);
   }
 });
@@ -41,7 +41,7 @@ test('the groups shown to the owner cover every method exactly once', () => {
   assert.deepEqual([...grouped].sort(), [...OPERATOR_METHODS].sort());
 });
 
-test('the AddKey action: the gimbal contract as receiver, the 19 methods, the allowance in yoctoNEAR', () => {
+test('the AddKey action: the gimbal contract as receiver, the 21 methods, the allowance in yoctoNEAR', () => {
   const action = addOperatorKeyAction(KEY, CONTRACT, DEFAULT_ALLOWANCE_NEAR);
   assert.equal(action.type, 'AddKey');
   if (action.type !== 'AddKey') return;

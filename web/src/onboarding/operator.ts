@@ -13,6 +13,7 @@ export const OPERATOR_METHODS = [
   'fund_venue',
   'hl_approve_builder_fee',
   'hl_set_referrer',
+  'hl_withdraw',
   'refresh_prices',
   'hl_order',
   'hl_cancel',
@@ -28,6 +29,7 @@ export const OPERATOR_METHODS = [
   'orderly_settle_pnl',
   'orderly_withdraw',
   'evm_usdc_to_intents',
+  'panic_close',
 ] as const;
 
 /** The allowlist as the owner reads it: what each group of methods is for, in plain words. */
@@ -39,8 +41,8 @@ export const OPERATOR_GROUPS: readonly { label: string; what: string; methods: r
     what: 'register the desk, trade, settle and withdraw to the desk’s own address',
     methods: ['orderly_register', 'orderly_add_key', 'orderly_request', 'orderly_ws_auth', 'orderly_settle_pnl', 'orderly_withdraw'],
   },
-  { label: 'Moving margin', what: 'send margin between exchanges through NEAR Intents', methods: ['fund_venue', 'hl_send_to_intents', 'evm_usdc_to_intents'] },
-  { label: 'Housekeeping', what: 'refresh prices, pause the desk', methods: ['refresh_prices', 'set_paused'] },
+  { label: 'Moving margin', what: 'send margin between exchanges through NEAR Intents', methods: ['fund_venue', 'hl_send_to_intents', 'hl_withdraw', 'evm_usdc_to_intents'] },
+  { label: 'Housekeeping', what: 'refresh prices, pause the desk, close both legs', methods: ['refresh_prices', 'set_paused', 'panic_close'] },
 ];
 
 /** The allowance the key gets unless the page is configured otherwise (docs/interfaces.md §1.3). */

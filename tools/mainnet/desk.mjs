@@ -45,6 +45,7 @@ export const OPERATOR_METHODS = [
   'fund_venue',
   'hl_approve_builder_fee',
   'hl_set_referrer',
+  'hl_withdraw',
   'refresh_prices',
   'hl_order',
   'hl_cancel',
@@ -60,6 +61,7 @@ export const OPERATOR_METHODS = [
   'orderly_settle_pnl',
   'orderly_withdraw',
   'evm_usdc_to_intents',
+  'panic_close',
 ];
 
 /** tools/testnet/desk.mjs's storage deposit; create_desk refunds what the desk does not take. */
