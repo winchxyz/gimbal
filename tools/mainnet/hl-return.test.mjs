@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { MONEY_METHODS } from './deploy.mjs';
 import { OPERATOR_METHODS } from './desk.mjs';
 import {
-  ALLOWED_CALLS, HL_REPLAY_MS, HL_WITHDRAW_FEE_E6, authorizationProblem, bridgeMismatch, callProblem, checkBridgeQuote, deliveryHashes, guardedSend,
+  ALLOWED_CALLS, HL_REPLAY_MS, HL_WITHDRAW_FEE_E6, authorizationProblem, bridgeMismatch, callProblem, checkBridgeQuote, counterGuards, deliveryHashes,
+  depositAddressOf, eip3009NonceOf, guardedSend, quoteObjectOf,
   hlWithdrawActions, hlWithdrawEntry, parseHlReturnArgs, recentWithdraws, relayerGas, runHlReturn, transferActionProblems, withdrawActionProblems,
   withdrawGuards, withdrawNonceMs, withdrawPlan,
 } from './hl-return.mjs';
@@ -68,6 +69,16 @@ const deskOf = (over = {}) => ({
   ...over,
 });
 
+/** A DeskCounters record (contract/src/rescue.rs, borsh, 1,329 bytes): `next` the EIP-3009 counter, `paid` the ring's paid times. */
+function countersRecord({ next = 0, paid = [] }) {
+  const buf = Buffer.alloc(8 + 16 + 16 + 8 + 32 * 32 + 1 + 32 * 8);
+  buf.writeBigUInt64LE(BigInt(Math.max(0, ...paid)), 0);
+  buf.writeBigUInt64LE(BigInt(next), 40);
+  buf.writeUInt8(paid.length % 32, 48 + 1024);
+  paid.forEach((ms, i) => buf.writeBigUInt64LE(BigInt(ms), 48 + 1024 + 1 + 8 * i));
+  return buf;
+}
+
 const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 const hex = (v) => `0x${BigInt(v).toString(16)}`;
 const secp = { scheme: 'Secp256k1', big_r: { affine_point: `02${'cd'.repeat(32)}` }, s: { scalar: 'ef'.repeat(32) }, recovery_id: 0 };
@@ -76,7 +87,8 @@ const secp = { scheme: 'Secp256k1', big_r: { affine_point: `02${'cd'.repeat(32)}
  * A fake mainnet, Hyperliquid, Arbitrum, 1Click and nearblocks. `o`: desk, withdrawable, hlLedger, arb ({ address:
  * usdc e6 }), wei ({ address: wei }), keyPublic, env, quote(body), onSend({ actions, desk, setDesk }) -> { value,
  * logs, failure }, sendThrows, status (1Click, after a send), earlierStatus ({ deposit address: status }), hlDown,
- * calls ({ method: nearblocks txns }), nearblocksDown, hlNonce (BigInt), hlSubmit, arbSubmit.
+ * calls ({ method: nearblocks txns }), nearblocksDown, hlNonce (BigInt), counters ({ next, paid }), stateDown
+ * ([prefix]), authUsed / authDown (authorizationState on Arbitrum USDC), hlSubmit, arbSubmit.
  */
 function world(o = {}) {
   let desk = o.desk ?? deskOf();
@@ -109,12 +121,19 @@ function world(o = {}) {
       return null;
     },
     fees: async () => FEES,
-    // The contract state: only the desk's HlNonces record (o.hlNonce, BigInt ms) is read.
+    // The contract state: the desk's HlNonces record (prefix 3, o.hlNonce, BigInt ms) and DeskCounters (prefix 5,
+    // o.counters { next, paid: [ms] }). o.stateDown: the prefixes whose read fails.
     state: async (id, prefix) => {
-      if (id !== CONTRACT || o.hlNonce === undefined) return [];
-      const value = Buffer.alloc(8);
-      value.writeBigUInt64LE(o.hlNonce);
-      return [{ key: Buffer.from(prefix), value }];
+      const key = Buffer.from(prefix);
+      if (o.stateDown?.includes(key[0])) throw new Error('view_state: timeout');
+      if (id !== CONTRACT) return [];
+      if (key[0] === 3 && o.hlNonce !== undefined) {
+        const value = Buffer.alloc(8);
+        value.writeBigUInt64LE(o.hlNonce);
+        return [{ key, value }];
+      }
+      if (key[0] === 5 && o.counters !== undefined) return [{ key, value: countersRecord(o.counters) }];
+      return [];
     },
     send: async (signer, receiver, actions, { onSent } = {}) => {
       const hash = `Tx${seen.sent.length + 1}`;
@@ -142,6 +161,11 @@ function world(o = {}) {
       if (method === 'eth_chainId') return json({ result: '0xa4b1' });
       if (method === 'eth_gasPrice') return json({ result: hex(10_000_000n) });
       if (method === 'eth_getBalance') return json({ result: hex(wei.get(params[0].toLowerCase()) ?? 0n) });
+      if (method === 'eth_call' && params[0].data.startsWith('0xe94a0102')) {
+        seen.authChecks = [...(seen.authChecks ?? []), { to: params[0].to, data: params[0].data }];
+        if (o.authDown) return json({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'rate limited' } });
+        return json({ result: `0x${(o.authUsed ? 1n : 0n).toString(16).padStart(64, '0')}` });
+      }
       if (method === 'eth_call') {
         const who = `0x${params[0].data.slice(-40)}`;
         return json({ result: hex(params[0].to === ARB_USDC ? arb.get(who) ?? 0n : 0n) });
@@ -736,4 +760,91 @@ test('bridge: settled earlier authorizations (SUCCESS, REFUNDED, expired unused,
   const c = { hash: 'H', ms: AT - 3_600_000, accepted: true, depositAddress: null };
   assert.match(authorizationProblem(c, 'unread (no deposit address in its quote)', AT), /deposit address not readable.*1Click says unread/);
   assert.equal(authorizationProblem({ ...c, depositAddress: EARLIER_DEPOSIT }, 'SUCCESS', AT), null);
+});
+
+test('depositAddressOf: the quote\'s own depositAddress (over-escaped as nearblocks gives it), never an address in reason', () => {
+  const a = '0x' + '1a'.repeat(20);
+  const b = '0x' + '2b'.repeat(20);
+  // The args nearblocks returned on 2026-11-03: the quote's quotes escaped once more than JSON needs.
+  const nearblocksQuote = `{\\"amountIn\\":\\"2000000\\",\\"customRecipientMsg\\":\\"{\\\\\\"desk_id\\\\\\":\\\\\\"canary\\\\\\"}\\",\\"depositAddress\\":\\"${a}\\"}`;
+  assert.deepEqual(quoteObjectOf(nearblocksQuote), { amountIn: '2000000', customRecipientMsg: '{"desk_id":"canary"}', depositAddress: a });
+  assert.equal(depositAddressOf({ quote: nearblocksQuote, reason: `depositAddress ${b}` }, ''), a);
+  assert.equal(depositAddressOf({ quote: JSON.stringify({ depositAddress: a }), reason: `depositAddress ${b}` }, ''), a);
+  // A quote that parses but has no deposit address: none, not the one in reason.
+  assert.equal(depositAddressOf({ quote: JSON.stringify({ amountIn: '1' }), reason: `depositAddress ${b}` }, ''), null);
+  // Args that are not JSON: the text before reason only.
+  assert.equal(depositAddressOf(null, `{"desk_id":"canary","quote":"..depositAddress..${a}..","reason":"depositAddress ${b}"}x`), a);
+  assert.equal(depositAddressOf(null, `{"desk_id":"canary","reason":"depositAddress ${b}"}x`), null);
+});
+
+test('eip3009NonceOf: keccak256(desk_id ‖ counter as u64 big-endian), the contract\'s vectors', () => {
+  const v = JSON.parse(readFileSync(fileURLToPath(new URL('../../contract/core/tests/vectors/eip3009.json', import.meta.url)), 'utf8'));
+  assert.ok(v.nonce_cases.length > 0);
+  for (const n of v.nonce_cases) assert.equal(eip3009NonceOf(n.desk_id, BigInt(n.counter)), n.nonce, `${n.desk_id} ${n.counter}`);
+});
+
+test('counterGuards: the last authorization unused and possibly valid refuses; a used one newer than nearblocks lists refuses for 10 min', () => {
+  const nonce1 = eip3009NonceOf(DESK_ID, 1n);
+  const base = { deskId: DESK_ID, listedMs: [], nowMs: AT };
+  const at = (ms) => ({ eip3009_next: 2n, deposit_paid_ms: [BigInt(AT - 3_600_000), BigInt(ms)] });
+  const live = counterGuards({ ...base, counters: at(AT - 60_000), lastUsed: false });
+  assert.match(live.refusals.join(), new RegExp(`the desk's last authorization \\(counter 1, nonce ${nonce1}\\) is not used on Arbitrum USDC and may be valid until about ${new Date(AT - 60_000 + 360_000).toISOString()}`));
+  assert.ok(live.lines.includes(`last authorization (counter 1, nonce ${nonce1}): not used on Arbitrum USDC`));
+  // Unused and past its validBefore: it can never be used.
+  assert.deepEqual(counterGuards({ ...base, counters: at(AT - 400_000), lastUsed: false }).refusals, []);
+  // Used, and nearblocks does not list a call that recent: its deposit is unchecked.
+  const lag = counterGuards({ ...base, counters: at(AT - 60_000), lastUsed: true });
+  assert.match(lag.refusals.join(), /the desk counted a rescue at .* that nearblocks does not list as an evm_usdc_to_intents yet/);
+  assert.deepEqual(counterGuards({ ...base, counters: at(AT - 60_000), lastUsed: true, listedMs: [AT - 60_000] }).refusals, []);
+  assert.deepEqual(counterGuards({ ...base, counters: at(AT - 11 * 60_000), lastUsed: true }).refusals, []);
+  // No record, or no authorization ever signed.
+  assert.deepEqual(counterGuards({ ...base, counters: null, lastUsed: null }).refusals, []);
+  assert.deepEqual(counterGuards({ ...base, counters: { eip3009_next: 0n, deposit_paid_ms: [BigInt(AT - 1000)] }, lastUsed: null }).refusals, []);
+});
+
+test('bridge --send: an authorization nearblocks has not indexed yet (contract counter, authorizationState) refuses before the quote; unreadable state refuses', async () => {
+  // Signed a minute ago (a rerun after a lost outcome), not used on Arbitrum, not on nearblocks yet.
+  const w = world({ ...ready, counters: { next: 3, paid: [AT - 7_200_000, AT - 60_000] }, authUsed: false });
+  const r = await capture(BRIDGE_SEND, await liveLike(w.deps));
+  assert.match(r.error?.message ?? '', /the desk's last authorization \(counter 2, nonce 0x[0-9a-f]{64}\) is not used on Arbitrum USDC and may be valid until about/);
+  assert.equal(w.seen.quotes.length + w.seen.keys + w.seen.sent.length, 0);
+  // authorizationState(desk EVM, nonce of counter 2) on Circle USDC.
+  assert.deepEqual(w.seen.authChecks, [{ to: ARB_USDC, data: `0xe94a0102${EVM.slice(2).toLowerCase().padStart(64, '0')}${eip3009NonceOf(DESK_ID, 2n).slice(2)}` }]);
+  // The dry run prints the counter lines.
+  const dry = await capture([CONTRACT, DESK_ID, 'bridge', 'all'], world({ ...ready, counters: { next: 3, paid: [AT - 60_000] }, authUsed: false }).deps);
+  assert.ok(blockOf(dry).some((x) => x.startsWith('earlier:  desk EIP-3009 counter 3 (the next nonce\'s); the last rescue counted at')), dry.out);
+  assert.ok(blockOf(dry).some((x) => x.startsWith('would refuse at --send: the desk\'s last authorization (counter 2')), dry.out);
+  // Used a minute ago and not on nearblocks yet.
+  const used = await capture(BRIDGE_SEND, await liveLike(world({ ...ready, counters: { next: 3, paid: [AT - 60_000] }, authUsed: true }).deps));
+  assert.match(used.error?.message ?? '', /nearblocks does not list as an evm_usdc_to_intents yet/);
+  // Listed, used and SUCCESS: no refusal from either check.
+  const listed = world({
+    ...ready, counters: { next: 3, paid: [AT - 200_000] }, authUsed: true, calls: { evm_usdc_to_intents: [earlierAuth(200_000)] }, earlierStatus: { [EARLIER_DEPOSIT]: 'SUCCESS' },
+    onSend: ({ desk, setDesk }) => { setDesk({ ...desk, ledger: { ...desk.ledger, idle_usdc: 22_500_000 } }); return { value: transferSigned() }; },
+  });
+  const ok = await capture(BRIDGE_SEND, await liveLike(listed.deps));
+  assert.equal(ok.error, null, ok.error?.stack);
+  // Fail closed: the counters record or authorizationState unreadable.
+  for (const o of [{ stateDown: [5] }, { counters: { next: 1, paid: [AT - 7_200_000] }, authDown: true }]) {
+    const d = world({ ...ready, ...o });
+    const x = await capture(BRIDGE_SEND, await liveLike(d.deps));
+    assert.match(x.error?.message ?? '', /the desk's EIP-3009 counter or its last nonce on Arbitrum could not be read .*: an authorization nearblocks has not indexed cannot be ruled out/, JSON.stringify(o));
+    assert.equal(d.seen.quotes.length, 0);
+  }
+});
+
+test('withdraw: an unreadable Hyperliquid nonce refuses; one ledger entry books at most one of two hl_withdraw calls a moment apart', async () => {
+  const r = await capture([CONTRACT, DESK_ID, 'withdraw', 'all'], world({ stateDown: [3] }).deps);
+  assert.match(r.error?.message ?? '', /the desk's Hyperliquid nonce \(contract state\) could not be read: an hl_withdraw signed in the last minutes, before nearblocks lists it, cannot be ruled out/);
+  const call = (hash, ms) => ({ hash, ms, accepted: true, amount: '5', deskKnown: true });
+  const t = AT - 3_600_000;
+  const entry = { type: 'withdraw', time: t + 200_000, hash: '0xone', usdcE6: 4_000_000n, delta: { type: 'withdraw', usdc: '4.0', nonce: (t + 1500) * 1000, fee: '1.0' } };
+  const g = withdrawGuards({ calls: [call('Second', t + 1500), call('First', t)], entries: [entry], hlNonce: BigInt(t + 1500), nowMs: AT });
+  assert.equal(g.refusals.length, 1, g.refusals.join('\n'));
+  // The entry's nonce is the second call's time: it books that one, and the first stays open.
+  assert.match(g.refusals[0], /^hl_withdraw First \(5 USDC\) signed a withdraw3/);
+  assert.ok(g.lines.some((l) => l.startsWith('hl_withdraw Second (5 USDC)') && l.includes('booked, ledger 0xone')), g.lines.join('\n'));
+  // With an entry each, both are booked.
+  const both = withdrawGuards({ calls: [call('Second', t + 1500), call('First', t)], entries: [entry, { ...entry, hash: '0xtwo', delta: { ...entry.delta, nonce: t * 1000 } }], hlNonce: BigInt(t + 1500), nowMs: AT });
+  assert.deepEqual(both.refusals, []);
 });

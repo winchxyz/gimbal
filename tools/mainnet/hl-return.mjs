@@ -32,7 +32,9 @@
 // hl_withdraw's withdraw3 (nearblocks, checked against the desk's Hyperliquid nonce) is not booked in the ledger
 // and still inside Hyperliquid's nonce window (its time + 2 days). bridge --send refuses while an earlier
 // evm_usdc_to_intents's authorization (valid until its block time + 300 s) may still be used or its 1Click deposit
-// has not settled (SUCCESS, REFUNDED, or expired unused). --again sends anyway; the dry run lists the same reasons.
+// has not settled (SUCCESS, REFUNDED, or expired unused); for what nearblocks has not indexed, the desk's EIP-3009
+// counter (contract state) and authorizationState on Arbitrum USDC stand in. Anything unreadable refuses.
+// --again sends anyway; the dry run lists the same reasons.
 
 import { UsageError, envValues, isMain, parseFlags, run } from './cli.mjs';
 import {
@@ -50,7 +52,8 @@ import {
   transferCostE8, usdE8Text, verifyQuote,
 } from './oneclick.mjs';
 import { ENTRY as RELAYER_ENTRY, ethText, evmAddressOf } from './relayer-wallet.mjs';
-import { hlNonceOf } from './retire.mjs';
+import { deskCountersOf, hlNonceOf } from './retire.mjs';
+import { keccak256 } from '../testnet/near.mjs';
 import { OWNER_GAS_MARGIN } from './withdraw.mjs';
 
 export const STAGES = ['withdraw', 'bridge'];
@@ -236,6 +239,45 @@ function receiptMs(t) {
 }
 
 /**
+ * A quote string as nearblocks gives it inside a call's args, as an object, or null. nearblocks escapes the
+ * quote's own quotes once more ({\\\"amount\\\":... once the args are parsed), so each level of escaping is
+ * removed until it parses as an object.
+ */
+export function quoteObjectOf(text) {
+  let s = text;
+  for (let i = 0; i < 4 && typeof s === 'string'; i++) {
+    try {
+      const v = JSON.parse(s);
+      if (v !== null && typeof v === 'object') return v;
+      s = v;
+      continue;
+    } catch {
+      // not JSON yet: one level of escaping to remove
+    }
+    try {
+      s = JSON.parse(`"${s}"`);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * The deposit address of an evm_usdc_to_intents call: the quote's own depositAddress (the args JSON, then the
+ * quote JSON). Only when the quote cannot be parsed, the first address after "depositAddress" in the quote's text;
+ * when the args are not JSON either, in the args text before `reason`. Never an address inside `reason`.
+ */
+export function depositAddressOf(args, raw) {
+  const quote = typeof args?.quote === 'string' ? args.quote : null;
+  const parsed = quote === null ? null : quoteObjectOf(quote);
+  if (typeof parsed?.depositAddress === 'string' && /^0x[0-9a-fA-F]{40}$/.test(parsed.depositAddress)) return parsed.depositAddress;
+  if (parsed !== null) return null;
+  const text = quote ?? (args === null ? String(raw ?? '').split('reason')[0] : '');
+  return /depositAddress[^0-9a-zA-Z]*(0x[0-9a-fA-F]{40})/.exec(text)?.[1] ?? null;
+}
+
+/**
  * The contract's calls of `method` for `deskId` since `sinceMs`, newest first, from nearblocks:
  * { hash, ms (the receipt block's), accepted (false when the contract refused it: nothing was signed), args }.
  * A call whose desk cannot be read is kept (it may be this desk's). Throws when nearblocks cannot be read.
@@ -270,7 +312,7 @@ export async function deskCalls(fetchImpl, contract, method, deskId, sinceMs) {
         out.push({
           hash: t.transaction_hash, ms, accepted: t.receipt_outcome?.status !== false, args, deskKnown: desk !== null,
           amount: typeof args?.amount === 'string' ? args.amount : null,
-          depositAddress: /depositAddress[^0-9a-zA-Z]*(0x[0-9a-fA-F]{40})/.exec(raw)?.[1] ?? null,
+          depositAddress: depositAddressOf(args, raw),
         });
       }
     }
@@ -294,12 +336,19 @@ export function withdrawGuards({ calls, entries, hlNonce, nowMs }) {
   for (const w of recentWithdraws(withdraws, nowMs).filter((x) => x.inFlight)) {
     refusals.push(`a Hyperliquid withdrawal of ${w.usdcE6 === null ? '?' : usdcText(w.usdcE6)} USDC booked at ${iso(w.time)} is under 30 min old: it may still be on its way to Arbitrum (bridge it first)`);
   }
-  const bookedAt = (ms, amountText) => withdraws.find((e) => {
+  // How well a ledger entry fits a signature at `ms` (smaller is closer), or null: by nonce within the window,
+  // else (no nonce) by amount, ranked after every nonce match.
+  const fit = (e, ms, amountText) => {
     const n = withdrawNonceMs(e.delta);
-    if (n !== null) return n >= BigInt(ms) - 1n && n <= BigInt(ms) + NONCE_AHEAD_MS;
+    if (n !== null) {
+      if (n < BigInt(ms) - 1n || n > BigInt(ms) + NONCE_AHEAD_MS) return null;
+      return n >= BigInt(ms) ? n - BigInt(ms) : BigInt(ms) - n;
+    }
     const amount = amountText === null ? null : micros(amountText);
-    return amount !== null && e.time >= ms - LEDGER_SLACK_MS && isWithdrawOf(e, amount);
-  }) ?? null;
+    return amount !== null && e.time >= ms - LEDGER_SLACK_MS && isWithdrawOf(e, amount) ? 10n ** 15n + BigInt(Math.abs(e.time - ms)) : null;
+  };
+  const taken = new Set();
+  const bookedAt = (ms, amountText) => withdraws.find((e) => !taken.has(e) && fit(e, ms, amountText) !== null) ?? null;
   const replayEnd = (ms) => iso(Number(ms) + HL_REPLAY_MS);
   if (calls instanceof Error) {
     lines.push(`hl_withdraw calls not read: ${calls.message}`);
@@ -310,12 +359,28 @@ export function withdrawGuards({ calls, entries, hlNonce, nowMs }) {
     }
     return { lines, refusals };
   }
+  // One to one: each ledger entry books at most one signature, the closest pairs first, so two hl_withdraw calls
+  // a moment apart are never both booked by one withdraw.
+  const pairs = [];
+  for (const c of calls.filter((x) => x.accepted)) {
+    for (const e of withdraws) {
+      const f = fit(e, c.ms, c.amount);
+      if (f !== null) pairs.push({ c, e, f });
+    }
+  }
+  pairs.sort((x, y) => (x.f < y.f ? -1 : x.f > y.f ? 1 : 0));
+  const booking = new Map();
+  for (const p of pairs) {
+    if (booking.has(p.c) || taken.has(p.e)) continue;
+    booking.set(p.c, p.e);
+    taken.add(p.e);
+  }
   for (const c of calls) {
     if (!c.accepted) {
       lines.push(`hl_withdraw ${c.hash} at ${iso(c.ms)}: refused by the contract (nothing signed)`);
       continue;
     }
-    const hit = bookedAt(c.ms, c.amount);
+    const hit = booking.get(c) ?? null;
     if (hit !== null) {
       lines.push(`hl_withdraw ${c.hash} (${c.amount ?? '?'} USDC) at ${iso(c.ms)}: booked, ledger ${hit.hash}${hit.delta.nonce === undefined ? '' : ` (nonce ${hit.delta.nonce})`}`);
       continue;
@@ -327,8 +392,10 @@ export function withdrawGuards({ calls, entries, hlNonce, nowMs }) {
         + `Hyperliquid takes it until about ${replayEnd(c.ms)} (its nonce window); read userNonFundingLedgerUpdates before withdrawing again`);
     }
   }
-  if (hlNonce !== null && hlNonce > 0n) {
-    const newest = calls.find((c) => c.accepted)?.ms ?? 0;
+  if (hlNonce === null) {
+    refusals.push('the desk\'s Hyperliquid nonce (contract state) could not be read: an hl_withdraw signed in the last minutes, before nearblocks lists it, cannot be ruled out');
+  } else if (hlNonce > 0n) {
+    const newest = Math.max(0, ...calls.filter((c) => c.accepted).map((c) => c.ms));
     lines.push(`desk Hyperliquid nonce ${hlNonce} (${iso(hlNonce)}): the time of the last Hyperliquid action the contract signed for the desk`);
     if (Number(hlNonce) > newest + Number(NONCE_AHEAD_MS) && nowMs - Number(hlNonce) < INDEX_LAG_MS && bookedAt(Number(hlNonce), null) === null) {
       refusals.push(`the desk signed a Hyperliquid action at ${iso(hlNonce)} that nearblocks does not list yet: if it is an hl_withdraw it is not checked here; wait ${INDEX_LAG_MS / 60_000} min`);
@@ -352,8 +419,71 @@ export function authorizationProblem(c, status, nowMs) {
   return `${what}: 1Click says ${status}: its deposit has not settled`;
 }
 
-/** The desk's earlier authorizations and what 1Click says of each: { lines, refusals }. Fails closed. */
-async function bridgeGuards({ fetchImpl, contract, deskId, nowMs, apiKey }) {
+/** The EIP-3009 nonce the contract signs for counter `counter` of a desk: keccak256(desk_id ‖ counter as u64 big-endian). */
+export function eip3009NonceOf(deskId, counter) {
+  const n = Buffer.alloc(8);
+  n.writeBigUInt64BE(BigInt(counter));
+  return `0x${Buffer.from(keccak256(Buffer.concat([Buffer.from(deskId), n]))).toString('hex')}`;
+}
+
+/** authorizationState(address,bytes32) on Arbitrum USDC: whether the authorizer used (or canceled) that nonce. */
+export async function authorizationUsed(fetchImpl, url, authorizer, nonce) {
+  const call = async (method, params) => {
+    const res = await fetchImpl(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal: AbortSignal.timeout(30_000) });
+    const body = await res.json().catch(() => null);
+    if (!res.ok || typeof body?.result !== 'string' || !/^0x[0-9a-fA-F]*$/.test(body.result)) throw new Error(`chain 42161 ${method}: HTTP ${res.status} ${JSON.stringify(body?.error ?? body).slice(0, 200)}`);
+    return body.result;
+  };
+  if (BigInt(await call('eth_chainId', [])) !== BigInt(ARBITRUM_ONE)) throw new Error('the Arbitrum RPC is not chain 42161');
+  if (!/^0x[0-9a-fA-F]{40}$/.test(authorizer) || !/^0x[0-9a-f]{64}$/.test(nonce)) throw new Error('authorizationState: bad authorizer or nonce');
+  const data = `0xe94a0102${authorizer.slice(2).toLowerCase().padStart(64, '0')}${nonce.slice(2)}`;
+  const out = await call('eth_call', [{ to: ARBITRUM_USDC, data }, 'latest']);
+  if (out.length !== 66) throw new Error(`authorizationState answered ${out.slice(0, 80)}, not one word`);
+  return BigInt(out) !== 0n;
+}
+
+/**
+ * What the contract's own record says of the desk's authorizations, without nearblocks: `counters` (DeskCounters:
+ * eip3009_next, the deposit ring's paid times; null when no rescue was ever counted), `lastUsed` (the last
+ * authorization's authorizationState, or null when there is none), `listedMs` (the receipt times nearblocks lists
+ * for accepted evm_usdc_to_intents). The ring's newest paid time bounds every authorization's block time, so its
+ * validBefore is at most that + 300 s. Returns { lines, refusals }.
+ */
+export function counterGuards({ deskId, counters, lastUsed, listedMs, nowMs }) {
+  const lines = [];
+  const refusals = [];
+  if (counters === null) {
+    lines.push('no rescue counter record: the contract never counted a rescue for the desk');
+    return { lines, refusals };
+  }
+  const next = BigInt(counters.eip3009_next);
+  const newest = counters.deposit_paid_ms.reduce((m, x) => (BigInt(x) > m ? BigInt(x) : m), 0n);
+  const newestMs = Number(newest);
+  lines.push(`desk EIP-3009 counter ${next} (the next nonce's); the last rescue counted at ${newest === 0n ? 'never' : iso(newestMs)}`);
+  if (next === 0n) return { lines, refusals };
+  const nonce = eip3009NonceOf(deskId, next - 1n);
+  const until = newestMs + AUTH_VALID_MS + AUTH_SLACK_MS;
+  lines.push(`last authorization (counter ${next - 1n}, nonce ${nonce}): ${lastUsed ? 'used on Arbitrum USDC' : 'not used on Arbitrum USDC'}`);
+  if (!lastUsed && nowMs < until) {
+    refusals.push(`the desk's last authorization (counter ${next - 1n}, nonce ${nonce}) is not used on Arbitrum USDC and may be valid until about ${iso(until)} `
+      + '(its rescue\'s block time + 300 s at most): do not bridge again before then');
+  }
+  // A rescue newer than every listed call: if it is an evm_usdc_to_intents it is the last authorization, so only
+  // a used one (money sent to a deposit address nearblocks does not show yet) needs its 1Click status.
+  const newestListed = Math.max(0, ...listedMs);
+  if (lastUsed && newestMs > newestListed + Number(NONCE_AHEAD_MS) && nowMs - newestMs < INDEX_LAG_MS) {
+    refusals.push(`the desk counted a rescue at ${iso(newestMs)} that nearblocks does not list as an evm_usdc_to_intents yet: if it is one, its 1Click deposit is not checked here; `
+      + `wait ${INDEX_LAG_MS / 60_000} min`);
+  }
+  return { lines, refusals };
+}
+
+/**
+ * The desk's earlier authorizations: nearblocks' calls and what 1Click says of each, then the contract's own
+ * counter and the last nonce's state on Arbitrum (counterGuards), for what nearblocks has not indexed yet.
+ * { lines, refusals }. Fails closed: anything unreadable refuses.
+ */
+async function bridgeGuards({ fetchImpl, client, urls, contract, deskId, evm, nowMs, apiKey }) {
   const lines = [];
   const refusals = [];
   let calls;
@@ -362,6 +492,16 @@ async function bridgeGuards({ fetchImpl, contract, deskId, nowMs, apiKey }) {
   } catch (e) {
     refusals.push(`earlier evm_usdc_to_intents calls could not be read (${e.message}): an authorization still valid cannot be ruled out`);
     return { lines, refusals };
+  }
+  try {
+    const counters = await deskCountersOf(client, contract, deskId);
+    const next = counters === null ? 0n : BigInt(counters.eip3009_next);
+    const lastUsed = next === 0n ? null : await authorizationUsed(fetchImpl, urls.arbitrum, evm, eip3009NonceOf(deskId, next - 1n));
+    const g = counterGuards({ deskId, counters, lastUsed, listedMs: calls.filter((c) => c.accepted).map((c) => c.ms), nowMs });
+    lines.push(...g.lines);
+    refusals.push(...g.refusals);
+  } catch (e) {
+    refusals.push(`the desk's EIP-3009 counter or its last nonce on Arbitrum could not be read (${e.message}): an authorization nearblocks has not indexed cannot be ruled out`);
   }
   if (calls.length === 0) lines.push('no evm_usdc_to_intents for the desk in the last 24 h');
   for (const c of calls) {
@@ -775,7 +915,7 @@ async function bridgeStage({ a, client, fetchImpl, say, now, sleep, pollMs, urls
   const apiKey = env.get('ONECLICK_API_KEY')?.value ?? null;
   say(`1click    ${apiKey === null ? 'no ONECLICK_API_KEY: 1Click adds 0.2 % to the fee' : `ONECLICK_API_KEY set (from ${env.get('ONECLICK_API_KEY').from}; not shown)`}`);
   // Earlier authorizations: none may still be usable or its deposit unsettled (each is a counted rescue).
-  const guard = await bridgeGuards({ fetchImpl, contract: a.contract, deskId: a.deskId, nowMs: now(), apiKey });
+  const guard = await bridgeGuards({ fetchImpl, client, urls, contract: a.contract, deskId: a.deskId, evm, nowMs: now(), apiKey });
   for (const l of guard.lines) say(`earlier   ${l}`);
   const overrides = [];
   applyGuard(a, say, refusals, overrides, guard.refusals);

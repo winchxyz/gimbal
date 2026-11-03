@@ -658,15 +658,29 @@ about 6.3), 0.7 free on the owner for the desk, and 0.3 NEAR free on the owner p
        the desk (nearblocks, the last 2 days; the desk's Hyperliquid nonce from the contract state covers the
        last minutes nearblocks may not have indexed, and stands in when nearblocks cannot be read) has no
        `withdraw` in the ledger with its nonce: Hyperliquid takes a withdraw3 until about its time + 2 days (its
-       nonce window), and the line prints that end. Each earlier call prints as `booked` or `not in the
-       Hyperliquid ledger`.
+       nonce window), and the line prints that end. Each ledger entry books at most one call. Each earlier call
+       prints as `booked` or `not in the Hyperliquid ledger`.
      - **bridge**, while an earlier `evm_usdc_to_intents` of the desk (nearblocks, the last 24 h) may still be
        used or has not settled: its authorization is valid until its block time + 300 s, and its deposit address
-       (read from the quote) must be 1Click `SUCCESS` or `REFUNDED`, or expired and still `PENDING_DEPOSIT`.
-       `PROCESSING`, `KNOWN_DEPOSIT_TX`, `INCOMPLETE_DEPOSIT`, `FAILED` or an unreadable status refuse. This check
-       runs before the live quote.
-     - Unreadable nearblocks refuses (fails closed). `--again` sends anyway and prints each overridden reason as
+       (the quote's own `depositAddress`) must be 1Click `SUCCESS` or `REFUNDED`, or expired and still
+       `PENDING_DEPOSIT`. `PROCESSING`, `KNOWN_DEPOSIT_TX`, `INCOMPLETE_DEPOSIT`, `FAILED` or an unreadable status
+       refuse. For what nearblocks has not indexed yet, it also reads the desk's counters from the contract state:
+       the EIP-3009 counter gives the last authorization's nonce (keccak256 of the desk id and the counter as a
+       big-endian u64), and Arbitrum USDC's `authorizationState(desk EVM, nonce)` tells whether it was used. An
+       unused one refuses until the newest rescue in the deposit ring is 300 s + 60 s old (the latest its
+       validBefore can be). A used one refuses for 10 min when it is newer than every call nearblocks lists. This
+       check runs before the live quote.
+     - Anything unreadable refuses (fails closed): nearblocks, the contract state (the desk's Hyperliquid nonce
+       or counters), or `authorizationState`. `--again` sends anyway and prints each overridden reason as
        `override:` in the block: use it only after reading the ledger or the 1Click status yourself.
+     - Cases that refuse although nothing is wrong, and need `--again` once you have checked:
+       - withdraw, for 10 min after any newer Hyperliquid action of the desk that nearblocks does not list as an
+         `hl_withdraw` (an engine order, a transfer): the desk's nonce cannot tell which action it was;
+       - bridge, for 10 min after any newer rescue of the desk (`hl_send_to_intents`, a Solana rescue) while the
+         last authorization was used: the deposit ring is shared by all rescues;
+       - bridge, for 24 h, when a 1Click deposit address of an earlier `evm_usdc_to_intents` never got its deposit
+         and 1Click does not answer `PENDING_DEPOSIT` for it after the authorization expired (any other status or
+         no answer counts as not settled).
 
      The bridge moves only USDC that is on Arbitrum: with some still in flight, `all` takes what arrived, and a
      typed amount over the balance refuses at `--send`. If the relayer's outcome is unknown, the block names the
