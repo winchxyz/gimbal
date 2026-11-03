@@ -1,12 +1,15 @@
 // The parts of pair-mainnet.ts that decide something without a network: its arguments and order options, when the
-// stored price is fresh enough and when to refresh it, whether a withdrawal leaves the Phoenix leg its collateral,
-// the cross-margin numbers of each venue, and the Phoenix order that hedges what a late maker fill left open.
+// stored price is fresh enough and when to refresh it (and whether a failed refresh still went on chain), whether
+// Hyperliquid has resting orders an open must not start beside, whether a withdrawal leaves the Phoenix leg its collateral,
+// the cross-margin numbers of each venue, and the Phoenix order that hedges what a late maker fill left open (with
+// the reads around it).
 // pair-mainnet.ts runs on import; this module does not, so the tests drive these directly.
 
 import type { TxRef } from '@gimbal/shared';
+import { ContractRefusal, OutcomeUnknown } from '../contract/types.ts';
 import { MAX_PRIORITY_MICROLAMPORTS, ORDER_PRIORITY_MICROLAMPORTS } from '../relayer/phoenix-tx.ts';
 import { pct, usd, venueMaxLeverage } from '../trade/carry-plan.ts';
-import type { LegSide, MakerSettings } from '../trade/legs.ts';
+import type { LegOutcome, LegSide, MakerSettings } from '../trade/legs.ts';
 import { abs, floorToLot, qtyString, signedQtyString } from '../trade/lots.ts';
 
 export class UsageError extends Error {}
@@ -116,8 +119,8 @@ export interface PriceDeps {
   read(symbol: string): Promise<StoredPrice | null>;
   refresh(symbol: string, maxAgeS: number): Promise<TxRef[]>;
   /**
-   * Whether a refresh that threw still went on chain (it ran but the poll saw no newer price, or its outcome is
-   * unknown): then the contract skips another within MIN_REFRESH_GAP_S. Default: it did not.
+   * Whether a refresh that threw still went on chain (refreshLanded for the near-client): then the contract skips
+   * another within MIN_REFRESH_GAP_S. Default: it did not.
    */
   landed?(err: unknown): boolean;
   now(): number;
@@ -266,12 +269,36 @@ export async function withdrawKeepsLegs(
 }
 
 /**
- * The Phoenix IOC that brings the pair back to its starting net (Phoenix to `startNet` − hl), in whole Phoenix lots,
- * or null when no whole lot is off. Reduce-only when it only shrinks the Phoenix position. The starting net, not zero:
- * an imbalance an older run left is not this run's to trade away.
+ * Whether a refresh_prices that threw still went on chain, so the contract skips another within MIN_REFRESH_GAP_S:
+ * it ran (near-client refreshPrices wraps every error after the call returned as "refresh_prices ran in <tx>: ..."),
+ * or it was sent with no final outcome. Not a refusal, an error before the call, or a transaction that failed on chain
+ * (its state reverted: no ask was recorded).
  */
-export function residualHedge(hlPos: bigint, pxPos: bigint, pxLot: bigint, startNet: bigint): { side: LegSide; size: bigint; reduceOnly: boolean } | null {
-  const delta = startNet - hlPos - pxPos;
+export function refreshLanded(err: unknown): boolean {
+  if (err instanceof OutcomeUnknown) return !err.detail.startsWith('failed without a refusal code');
+  return err instanceof Error && !(err instanceof ContractRefusal) && /^refresh_prices ran in \S+: /.test(err.message);
+}
+
+/**
+ * Why `open` must not start while Hyperliquid has resting orders for `coin` (an earlier run's post-only orders could
+ * fill outside the target net), or null. `raw` is the /info openOrders answer; one that cannot be read refuses too.
+ */
+export function restingOrdersRefusal(raw: unknown, coin: string): string | null {
+  if (!Array.isArray(raw)) return `the Hyperliquid open orders cannot be read (${JSON.stringify(raw)?.slice(0, 80)}): an earlier run's resting order could fill outside the pair`;
+  const rows = (raw as { coin?: unknown; side?: unknown; sz?: unknown; oid?: unknown }[]).filter((o) => o?.coin === coin);
+  if (rows.length === 0) return null;
+  const names = rows.map((o) => `${o.side === 'B' ? 'BUY' : o.side === 'A' ? 'SELL' : String(o.side)} ${String(o.sz)} (oid ${String(o.oid)})`).join(', ');
+  return `Hyperliquid has ${rows.length} resting ${coin} order(s) (${names}): an earlier run's order could fill outside the target net; cancel it on Hyperliquid and reconcile both legs first`;
+}
+
+/**
+ * The Phoenix IOC that brings the pair back to its target net (Phoenix to `targetNet` − hl), in whole Phoenix lots,
+ * or null when no whole lot is off. Reduce-only when it only shrinks the Phoenix position. The target net is the sum
+ * of the operation's targets: an open keeps hl + px as it found them (an imbalance an older run left is not this run's
+ * to trade away); a close targets flat on both legs, so 0.
+ */
+export function residualHedge(hlPos: bigint, pxPos: bigint, pxLot: bigint, targetNet: bigint): { side: LegSide; size: bigint; reduceOnly: boolean } | null {
+  const delta = targetNet - hlPos - pxPos;
   const size = floorToLot(abs(delta), pxLot);
   if (size === 0n) return null;
   const side: LegSide = delta > 0n ? 'BUY' : 'SELL';
@@ -292,8 +319,8 @@ export interface ResidualInput {
   px: bigint;
   /** The Phoenix lot. */
   lot: bigint;
-  /** hl + px before the open or close began. */
-  startNet: bigint;
+  /** The sum of the operation's targets: hl + px before an open began; 0 for a close (both legs flat). */
+  targetNet: bigint;
   symbol: string;
   /** The pair's unhedged alert before this read (PairTrader.unhedged). */
   unhedged: string | null;
@@ -305,25 +332,64 @@ export interface ResidualPlan {
   /** Why the legs are off and nothing is sent, or null. */
   held: string | null;
   /**
-   * The unhedged alert as of this read: the exact amount when the legs do not offset (net of the start); cleared only
+   * The unhedged alert as of this read: the exact amount when the legs are off the target net; cleared only
    * when they do and no post-only order is left that could still fill; the alert before it otherwise.
    */
   unhedged: string | null;
 }
 
 export function residualPlan(i: ResidualInput): ResidualPlan {
-  const off = i.hl + i.px - i.startNet;
+  const off = i.hl + i.px - i.targetNet;
   const unhedged = off !== 0n
-    ? `unhedged: hyperliquid ${i.symbol} ${signedQtyString(i.hl)}, phoenix ${i.symbol} ${signedQtyString(i.px)} against a starting net of ${signedQtyString(i.startNet)}: ${qtyString(abs(off))} ${i.symbol} ${off > 0n ? 'long' : 'short'} is not offset`
+    ? `unhedged: hyperliquid ${i.symbol} ${signedQtyString(i.hl)}, phoenix ${i.symbol} ${signedQtyString(i.px)} against a target net of ${signedQtyString(i.targetNet)}: ${qtyString(abs(off))} ${i.symbol} ${off > 0n ? 'long' : 'short'} is not offset`
     : i.left === 0 ? null : i.unhedged;
   if (off === 0n) return { hedge: null, held: null, unhedged };
-  const hedge = residualHedge(i.hl, i.px, i.lot, i.startNet);
+  const hedge = residualHedge(i.hl, i.px, i.lot, i.targetNet);
   const held = hedge === null ? `the ${qtyString(abs(off))} ${i.symbol} off is under one Phoenix lot ${qtyString(i.lot)}`
     : i.left > 0 ? `${i.left} post-only order(s) are still unsettled and may fill more`
     : i.phoenixUnsettled ? 'Phoenix has an order with no answer that may still run'
     : !i.send || !i.trading ? 'nothing is sent outside a trading --send run'
     : null;
   return { hedge: held === null ? hedge : null, held, unhedged };
+}
+
+/** What settleResidual reads and sends. */
+export interface ResidualDeps {
+  /** Both legs' positions now, or null (with the reason printed) when either cannot be read. */
+  readLegs(): Promise<{ hl: bigint; px: bigint } | null>;
+  /** The Phoenix IOC (PhoenixLeg.order); never throws. */
+  hedge(side: LegSide, size: bigint, reduceOnly: boolean): Promise<LegOutcome>;
+  say(line: string): void;
+  /** Something the owner must reconcile: an `open:` line, exit code 3. */
+  open(line: string): void;
+}
+
+/**
+ * finish() after cancelPending: both legs read again, the residual plan, at most one Phoenix IOC back to the target
+ * net, and the legs read once more after it. Returns the unhedged alert as of the last read (null when the legs are at
+ * the target net and nothing is left that could still move them). A hedge with no answer is an `open:` line and keeps
+ * the alert: its order may still run.
+ */
+export async function settleResidual(base: Omit<ResidualInput, 'hl' | 'px'>, d: ResidualDeps): Promise<string | null> {
+  const read = await d.readLegs();
+  if (read === null) return `the legs cannot be read after the cancel: check hyperliquid and phoenix ${base.symbol} by hand`;
+  d.say(`positions after the cancel: hyperliquid ${base.symbol} ${signedQtyString(read.hl)}, phoenix ${base.symbol} ${signedQtyString(read.px)} (net ${signedQtyString(read.hl + read.px)}, target ${signedQtyString(base.targetNet)})`);
+  const input: ResidualInput = { ...base, hl: read.hl, px: read.px };
+  const plan = residualPlan(input);
+  if (plan.held !== null) d.say(`hedge     not sent: ${plan.held}`);
+  if (plan.hedge === null) return plan.unhedged;
+  const h = plan.hedge;
+  d.say(`hedge     phoenix ${h.side} ${qtyString(h.size)}${h.reduceOnly ? ' reduce-only' : ''}: back to the target net against hyperliquid ${signedQtyString(read.hl)}`);
+  const out = await d.hedge(h.side, h.size, h.reduceOnly);
+  const tx = out.ref.tx.length === 0 ? '' : ` ${out.ref.tx.map((t) => t.url).join('  ')}`;
+  d.say(`          ${out.kind}${out.kind === 'filled' ? ` ${qtyString(out.filled)}` : ` (${out.error.message})`}${tx}`);
+  if (out.kind === 'unknown') {
+    d.open(`the phoenix hedge ${h.side} ${qtyString(h.size)} ${base.symbol} (${out.ref.orderId ?? 'no signature'}) has no proven outcome: check Phoenix by hand before sending another`);
+  }
+  const now = await d.readLegs();
+  if (now === null) return `the legs cannot be read after the hedge: check hyperliquid and phoenix ${base.symbol} by hand`;
+  d.say(`positions hyperliquid ${base.symbol} ${signedQtyString(now.hl)}, phoenix ${base.symbol} ${signedQtyString(now.px)}`);
+  return residualPlan({ ...input, hl: now.hl, px: now.px, phoenixUnsettled: out.kind === 'unknown' || input.phoenixUnsettled }).unhedged;
 }
 
 /** A string or number that reads as a finite number (never null, which Number() reads as 0). */

@@ -297,7 +297,7 @@ export class HlLeg implements TradeLeg {
       if (unknown !== null && unknown.kind === 'unknown') return { kind: 'unknown', error: unknown.error, ref, expiresAt: unknown.expiresAt, parts };
       if (filled > 0n) return { kind: 'filled', filled, avgPx: notional > 0 ? notional / qtyNumber(filled) : null, fee, ref, parts };
       const error = spent
-        ? new NothingExecuted('hyperliquid', `the maker order ${side} ${qtyString(size)} did not fill: the budget of ${op === null ? maxOrders : s.maxOrders ?? 6} post-only orders ${op === null ? 'per maker order' : 'for this open or close'} is spent`, ref.tx)
+        ? new NothingExecuted('hyperliquid', `the maker order ${side} ${qtyString(size)} did not fill: the budget of ${maxOrders} post-only orders ${op === null ? 'per maker order' : 'for this open or close'} is spent`, ref.tx)
         : last !== undefined && last.kind !== 'filled' ? last.error : new NothingExecuted('hyperliquid', `the maker order ${side} ${qtyString(size)} did not fill`, ref.tx);
       return { kind: 'failed', error, ref, parts };
     };

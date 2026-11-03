@@ -185,14 +185,21 @@ test('one pair operation shares the maxOrders budget across its maker orders; th
 
 test('the reprice floor holds across the maker orders of one operation, and ends with it', async () => {
   // repriceMs 5 s: part 1 fills at once at t0; part 2 of the same operation places no sooner than t0 + 5 s.
-  const v = venue([{ fills: '0', fillAtOnce: true }, { fills: '0', fillAtOnce: true }, { fills: '0', fillAtOnce: true }]);
+  const v = venue(Array.from({ length: 5 }, () => ({ fills: '0', fillAtOnce: true })));
   const end = v.leg.beginMakerOperation();
   const a = await v.leg.makerOrder('BUY', toQty('0.005'), false, 'open (part 1)');
   const b = await v.leg.makerOrder('BUY', toQty('0.005'), false, 'open (part 2)');
   assert.ok(a.kind === 'filled' && b.kind === 'filled');
   assert.equal(b.parts![0]!.ref.sentAt - a.parts![0]!.ref.sentAt, 5_000, 'part 2 waits out the floor from part 1');
   end();
-  end();      // ending twice, or after a later operation began, touches nothing
+  end();      // ending twice touches nothing
+  const e2 = v.leg.beginMakerOperation();
+  end();      // the first operation's end, after a later one began: the later one stays
+  const d1 = await v.leg.makerOrder('BUY', toQty('0.005'), false, 'open 2 (part 1)');
+  const d2 = await v.leg.makerOrder('BUY', toQty('0.005'), false, 'open 2 (part 2)');
+  assert.ok(d1.kind === 'filled' && d2.kind === 'filled');
+  assert.equal(d2.parts![0]!.ref.sentAt - d1.parts![0]!.ref.sentAt, 5_000, 'still the second operation: its floor holds');
+  e2();
   const c = await v.leg.makerOrder('BUY', toQty('0.005'), false, 'another open');
   assert.equal(c.parts![0]!.ref.sentAt, c.ref.sentAt, 'no operation: no floor carried over, placed at once');
 });
