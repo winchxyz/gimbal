@@ -15,7 +15,7 @@
 //   mainnet); a leg is sized at the recorded Hyperliquid mark. BTC and ZEC are not used: one common lot of either is
 //   under 10 USD or over 12 at their recorded prices, so a 12 USD leg cannot be sized (decide waits on that).
 // The veto plays NEAR AI exchanges recorded for these prompts (fixtures/nearai/SYNTHETIC-veto.json) with no key; a
-// prompt it has no reply for (the scanner's numbers changed) passes with "no veto check". E10_DUMP_FACTS=1 prints
+// prompt it has no reply for (the scanner's numbers changed) passes with "no NEAR AI risk check". E10_DUMP_FACTS=1 prints
 // the facts of each prompt to stderr, to rebuild those exchanges.
 //
 // Expected: wait, wait, enter NEAR, hold, hold, exit, cooldown waits, enter SOL, hold while ETH counts, rotate to ETH.
@@ -218,6 +218,6 @@ test('a recorded hour of mainnet scans, one an hour: enter, compression, exit, c
     assert.equal(s.veto !== null, s.d.vetoCandidate !== null, 'the veto is asked before every enter and rotate');
     if (['wait', 'hold'].includes(s.d.decision.action)) assert.equal(s.d.act, null);
     // The recorded verdicts pass; a prompt with no recording passes unchecked. Either way the act stands.
-    if (s.veto !== null) assert.match(s.veto, /^(NEAR AI passed|no veto check)/);
+    if (s.veto !== null) assert.match(s.veto, /^(NEAR AI passed|no NEAR AI risk check)/);
   }
 });

@@ -1,5 +1,5 @@
 // The NEAR AI veto: the request (same client, endpoint, key and model as POST /policy/draft), the verdict, every way
-// it falls back to "no veto check" or fails closed, and the recorded exchanges played back without a key.
+// it falls back to "no NEAR AI risk check" or fails closed, and the recorded exchanges played back without a key.
 
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -27,7 +27,7 @@ test('asks NEAR AI with the policy-draft client: same endpoint, model, key heade
   assert.deepEqual(sent[0]!.body.messages, vetoMessages(VETO_FACTS));
   assert.deepEqual(r.veto, { verdict: 'veto', reasons: answer.reasons, model: NEAR_AI_MODEL, at: T0 });
   assert.equal(r.checked, true);
-  assert.equal(r.line, 'NEAR AI vetoed MEME: The spread this hour is 14 times its 7-day mean: a spike.');
+  assert.equal(r.line, 'NEAR AI risk check refused MEME: The spread this hour is 14 times its 7-day mean: a spike.');
   assert.equal(r.exchange?.key, promptKey(vetoMessages(VETO_FACTS)));
   assert.ok(!JSON.stringify(r).includes(KEY), 'the key is in no result');
 });
@@ -39,24 +39,24 @@ test('a pass', async () => {
   assert.equal(r.line, 'NEAR AI passed NEAR');
 });
 
-test('no NEAR_AI_API_KEY: pass, "no veto check", nothing sent', async () => {
+test('no NEAR_AI_API_KEY: pass, "no NEAR AI risk check", nothing sent', async () => {
   const { fetch, sent } = fixedFetch(completion({ verdict: 'veto', reasons: ['x'] }));
   const r = await checkVeto(new NearAiClient({ apiKey: undefined, fetch }), PASS_FACTS, { now: T0 });
   assert.equal(sent.length, 0);
   assert.equal(r.checked, false);
-  assert.deepEqual(r.veto, { verdict: 'pass', reasons: ['no veto check: NEAR_AI_API_KEY is not set'], model: NEAR_AI_MODEL, at: T0 });
-  assert.equal(r.line, 'no veto check on NEAR: NEAR_AI_API_KEY is not set');
+  assert.deepEqual(r.veto, { verdict: 'pass', reasons: ['no NEAR AI risk check: NEAR_AI_API_KEY is not set'], model: NEAR_AI_MODEL, at: T0 });
+  assert.equal(r.line, 'no NEAR AI risk check on NEAR: NEAR_AI_API_KEY is not set');
   assert.equal(r.exchange, null);
 });
 
-test('no answer within the timeout: pass, "no veto check"', async () => {
+test('no answer within the timeout: pass, "no NEAR AI risk check"', async () => {
   const silent: VetoSource = { model: NEAR_AI_MODEL, configured: true, complete: () => new Promise(() => {}) };
   const started = Date.now();
   const r = await checkVeto(silent, PASS_FACTS, { now: T0, timeoutMs: 50 });
   assert.ok(Date.now() - started < 2_000);
   assert.equal(r.checked, false);
   assert.equal(r.veto.verdict, 'pass');
-  assert.equal(r.line, 'no veto check on NEAR: no answer within 0.05 s');
+  assert.equal(r.line, 'no NEAR AI risk check on NEAR: no answer within 0.05 s');
   // The prompt is still kept for the journal, with no answer.
   assert.deepEqual(r.exchange, { key: promptKey(vetoMessages(PASS_FACTS)), model: NEAR_AI_MODEL, messages: vetoMessages(PASS_FACTS), response: null });
   assert.equal(LOOP_RULES.vetoTimeoutMs, 5_000);
@@ -79,9 +79,9 @@ test('the exchange goes into a journal entry as strings: model, key, the facts s
 const ask = (body: unknown, status = 200) =>
   checkVeto(new NearAiClient({ apiKey: KEY, fetch: fixedFetch(body, status).fetch }), PASS_FACTS, { now: T0 });
 
-test('NEAR AI down (HTTP or transport error): pass, "no veto check"', async () => {
+test('NEAR AI down (HTTP or transport error): pass, "no NEAR AI risk check"', async () => {
   const down = await ask({ error: { message: 'overloaded' } }, 503);
-  assert.equal(down.line, 'no veto check on NEAR: NEAR AI answered HTTP 503: overloaded');
+  assert.equal(down.line, 'no NEAR AI risk check on NEAR: NEAR AI answered HTTP 503: overloaded');
   assert.equal(down.veto.verdict, 'pass');
   assert.equal(down.checked, false);
   const broken: VetoSource = {
@@ -90,7 +90,7 @@ test('NEAR AI down (HTTP or transport error): pass, "no veto check"', async () =
   };
   const reset = await checkVeto(broken, PASS_FACTS, { now: T0 });
   assert.equal(reset.veto.verdict, 'pass');
-  assert.equal(reset.line, 'no veto check on NEAR: NEAR AI did not answer: connection reset');
+  assert.equal(reset.line, 'no NEAR AI risk check on NEAR: NEAR AI did not answer: connection reset');
 });
 
 test('a key NEAR AI rejects (401, 403) passes unchecked, and the line says the key was rejected', async () => {
@@ -98,15 +98,15 @@ test('a key NEAR AI rejects (401, 403) passes unchecked, and the line says the k
     const r = await ask({ error: { message: 'invalid api key' } }, status);
     assert.equal(r.veto.verdict, 'pass');
     assert.equal(r.checked, false);
-    assert.equal(r.line, `no veto check on NEAR: NEAR AI key rejected (HTTP ${status}: invalid api key)`);
-    assert.deepEqual(r.veto.reasons, [`no veto check: NEAR AI key rejected (HTTP ${status}: invalid api key)`]);
+    assert.equal(r.line, `no NEAR AI risk check on NEAR: NEAR AI key rejected (HTTP ${status}: invalid api key)`);
+    assert.deepEqual(r.veto.reasons, [`no NEAR AI risk check: NEAR AI key rejected (HTTP ${status}: invalid api key)`]);
   }
 });
 
 test('a verdict in any case, padded or fenced is read', async () => {
   const veto = await ask(completion('{"verdict": "Veto", "reasons": ["a spike"]}'));
   assert.equal(veto.veto.verdict, 'veto');
-  assert.equal(veto.line, 'NEAR AI vetoed NEAR: a spike');
+  assert.equal(veto.line, 'NEAR AI risk check refused NEAR: a spike');
   assert.equal((await ask(completion('{"verdict": "VETO ", "reasons": ["a spike"]}'))).veto.verdict, 'veto');
   assert.equal((await ask(completion('{"verdict": " Pass\\n"}'))).veto.verdict, 'pass');
   const fenced = await ask(completion('```json\n{"verdict": "veto", "reasons": ["the 14-day spread is {negative}"]}\n```'));
@@ -138,7 +138,7 @@ test('a reply that cannot be read fails closed: a veto, "unreadable reply"', asy
     const r = await ask(body);
     assert.deepEqual(r.veto, { verdict: 'veto', reasons: [UNREADABLE_REPLY], model: NEAR_AI_MODEL, at: T0 });
     assert.equal(r.checked, true);
-    assert.match(r.line, /^NEAR AI vetoed NEAR: unreadable reply \(/);
+    assert.match(r.line, /^NEAR AI risk check refused NEAR: unreadable reply \(/);
     assert.match(r.line, why);
     assert.notEqual(r.exchange, null, 'what was asked is still kept for the record');
   }
@@ -184,7 +184,7 @@ test('vetoFacts: a window\'s numbers plus what Window does not carry', () => {
   assert.deepEqual(bare.legs[1], { venue: 'phoenix', side: 'short', openInterestUsd: null, bookDepthUsd: null });
 });
 
-test('the recorded exchanges play back without a key; an unrecorded prompt is "no veto check"', async () => {
+test('the recorded exchanges play back without a key; an unrecorded prompt is "no NEAR AI risk check"', async () => {
   const recorded = RecordedVeto.fromFile(VETO_FIXTURE);
   const body = JSON.parse(readFileSync(VETO_FIXTURE, 'utf8')) as { exchanges: { key: string; messages: unknown }[] };
   // Every recorded prompt is what vetoMessages builds today: a changed prompt would never be found again.
@@ -197,7 +197,7 @@ test('the recorded exchanges play back without a key; an unrecorded prompt is "n
   const veto = await checkVeto(recorded, VETO_FACTS, { now: T0 });
   assert.equal(veto.veto.verdict, 'veto');
   assert.equal(veto.veto.reasons.length, 3);
-  assert.match(veto.line, /^NEAR AI vetoed MEME: The spread this hour, 310 % APR, is 14 times its 7-day mean/);
+  assert.match(veto.line, /^NEAR AI risk check refused MEME: The spread this hour, 310 % APR, is 14 times its 7-day mean/);
   // A recording of the live exchange plays back the same verdict.
   const { fetch } = fixedFetch(completion({ verdict: 'veto', reasons: ['r'] }));
   const live = await checkVeto(new NearAiClient({ apiKey: KEY, fetch }), VETO_FACTS, { now: T0 });
@@ -206,5 +206,5 @@ test('the recorded exchanges play back without a key; an unrecorded prompt is "n
 
   const other = await checkVeto(recorded, { ...PASS_FACTS, netAprPct: 9.5 }, { now: T0 });
   assert.equal(other.checked, false);
-  assert.equal(other.line, 'no veto check on NEAR: no recorded veto reply for this prompt');
+  assert.equal(other.line, 'no NEAR AI risk check on NEAR: no recorded NEAR AI risk check reply for this prompt');
 });

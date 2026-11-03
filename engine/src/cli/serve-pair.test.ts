@@ -3,9 +3,9 @@
 // serves at once, and the pair symbol as the policy spells it.
 
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import type { StreamEvent, VenueId } from '@gimbal/shared';
 import type { NearContractClient } from '../contract/near-client.ts';
@@ -13,7 +13,7 @@ import type { Relayer } from '../relayer/relayer.ts';
 import type { LegOutcome, LegSide, PendingMakerOrder, TradeLeg } from '../trade/legs.ts';
 import { toQty } from '../trade/lots.ts';
 import { newAdlState } from '../risk/adl.ts';
-import { TRADER_STATE_VERSION, TraderStateStore, traderLockPath, traderStateFile } from '../trade/trader-state.ts';
+import { THIS_PROCESS, TRADER_STATE_VERSION, TraderStateStore, lockText, parseLockText, traderLockPath, traderStateFile } from '../trade/trader-state.ts';
 import type { ContractSide } from './serve-contract.ts';
 import type { CarryInput, ServePairDeps, ServePairInput, SlotCarry } from './serve-pair.ts';
 import { liveLines, servePair } from './serve-pair.ts';
@@ -219,11 +219,16 @@ test('GIMBAL_TRADE=1 with the fresh start named: trades, holds the lock, writes 
     assert.equal(p.pair?.live, true, p.pair?.why ?? '');
     assert.equal(p.reducer(), p.pair);
     assert.equal(p.notTrading(), null);
-    assert.equal(readFileSync(lockPath(w), 'utf8').trim(), String(process.pid));
+    assert.equal(parseLockText(readFileSync(lockPath(w), 'utf8'))?.id, THIS_PROCESS.id);
     const out = lines(p);
     assert.ok(out.some((l) => /^live {6}TRADES \(GIMBAL_TRADE=1\).*panic_close -> resting Hyperliquid orders cancelled, both legs closed; ADL -> pair paused, both legs unwound \(3 of 3 attempts left\)/.test(l)), out.join('\n'));
-    // Two serves at once: the second (a restart with FRESH left in the env, or a second terminal) cannot take the lock.
-    await assert.rejects(servePair(input(w)), /another process \(pid \d+\) trades this desk.*pair-mainnet --send holds the same lock/);
+    // Two serves at once: the second (a restart with FRESH left in the env, or a second terminal) cannot take the lock;
+    // it does not stop either (review S1: an exit would crash-loop): alert only, the lock tried again.
+    const second = await servePair(input(w));
+    assert.match(second.unconfirmed!() ?? '', /the trader lock is not held: this process \(pid \d+\) already trades this desk.*pair-mainnet --send holds the same lock/);
+    assert.equal(second.pair === null, true);
+    second.stop();
+    assert.ok(existsSync(lockPath(w)), 'the first serve keeps its lock');
     // FRESH left in the env: the next start finds a usable state, so FRESH is ignored (with a line) and it is restored.
     p.stop();
     assert.equal(existsSync(lockPath(w)), false);
@@ -692,6 +697,103 @@ test('S1: a Phoenix snapshot behind the chain at start: alert only with the legs
     assert.equal(await p.retryStart!(), null, 'confirmed: nothing more to try');
     p.stop();
     assert.equal(existsSync(lockPath(w)), false);
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+test('S1 (Railway): a stale lock of this pid from before this process (node is pid 1 in every container) is taken over and journaled', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1' });
+  try {
+    savedPair(w);
+    w.hl.pos = toQty('-50');
+    w.px.pos = toQty('50');
+    // What a killed container left on the volume: this pid, an earlier start, another process id.
+    mkdirSync(dirname(lockPath(w)), { recursive: true });
+    writeFileSync(lockPath(w), lockText({ pid: process.pid, startedMs: THIS_PROCESS.startedMs! - 60_000, id: 'killed-container', boot: THIS_PROCESS.boot }));
+    const events: StreamEvent[] = [];
+    const p = await servePair(input(w, { publish: (e) => events.push(e) }));
+    assert.equal(p.unconfirmed!(), null);
+    assert.equal(p.pair?.live, true, p.pair?.why ?? '');
+    assert.equal(parseLockText(readFileSync(lockPath(w), 'utf8'))?.id, THIS_PROCESS.id, 'the lock is this process\'s now');
+    const took = events.flatMap((e) => (e.type === 'journal' && e.data.numbers.stage === 'lock' ? [e.data.summary] : []));
+    assert.equal(took.length, 1);
+    assert.match(took[0]!, new RegExp(`^pair: the trader lock .* of pid ${process.pid} was stale \\(it names pid ${process.pid}, this process's own pid, started .*before this process started: that process is gone \\(a restart\\)\\) and is taken over`));
+    assert.ok(w.lines.some((l) => /pair {6}the trader lock .* was stale/.test(l)));
+    p.stop();
+    // An older serve's lock (a bare pid, no start time) of this pid: stale too.
+    writeFileSync(lockPath(w), `${process.pid}\n`);
+    const q = await servePair(input(w));
+    assert.equal(q.pair?.live, true, q.pair?.why ?? '');
+    q.stop();
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+test('S1 (Railway): a lock held by a live other process degrades the pair (no exit), retried until it is free, then live', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1' });
+  try {
+    savedPair(w);
+    w.hl.pos = toQty('-50');
+    w.px.pos = toQty('50');
+    mkdirSync(dirname(lockPath(w)), { recursive: true });
+    // The parent of this test process: alive, and not this process (pair-mainnet --send in another terminal).
+    writeFileSync(lockPath(w), lockText({ pid: process.ppid, startedMs: 1, id: 'pair-mainnet', boot: THIS_PROCESS.boot }));
+    const events: StreamEvent[] = [];
+    const health = healthOf();
+    const p = await servePair(input(w, { publish: (e) => events.push(e), health: health.hook }));
+    assert.match(p.unconfirmed!() ?? '', new RegExp(`^legs unknown, start not confirmed: the trader lock is not held: another process \\(pid ${process.ppid}\\) trades this desk`));
+    assert.equal(p.pair === null, true, 'nothing adopted');
+    assert.match(p.hands!.blocked() ?? '', /^legs unknown, start not confirmed/);
+    assert.deepEqual(health.now(), ['hyperliquid ok', 'near ok', 'phoenix ok'], 'no venue is to blame');
+    assert.match(startJournal(events)[0] ?? '', /^error: pair start not confirmed: the trader lock is not held: another process/);
+    assert.equal(parseLockText(readFileSync(lockPath(w), 'utf8'))?.id, 'pair-mainnet', 'the other process\'s lock is left alone');
+    assert.equal(await p.retryStart!(), null, 'still held');
+    // The other process ends and lets its lock go: the next try takes it and the pair goes live.
+    rmSync(lockPath(w));
+    assert.match(await p.retryStart!() ?? '', /^pair start confirmed after 2 failed attempt\(s\).*XLM trades$/);
+    assert.equal(p.pair?.live, true);
+    p.stop();
+    assert.equal(existsSync(lockPath(w)), false);
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+test('S2: while the start is not confirmed, the monitor says "pair unprotected" every 30 min, journaled at most hourly; nothing once confirmed', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1' });
+  try {
+    savedPair(w);
+    w.hl.pos = toQty('-50');
+    w.px.pos = toQty('50');
+    w.px.snap = { slot: 100, pos: 0n };
+    w.px.chainSlot = 120;
+    let now = Date.UTC(2026, 10, 4, 12, 0, 0);
+    const start = now;
+    const events: StreamEvent[] = [];
+    const p = await servePair(input(w, { publish: (e) => events.push(e), clock: { now: () => now } }));
+    const unprotected = () => startJournal(events).filter((l) => l.startsWith('error: pair unprotected'));
+    assert.equal(startJournal(events).length, 1, 'the start said it once');
+    now += 30 * 60_000;
+    const line = p.monitor!();
+    assert.match(line ?? '', new RegExp(`^pair unprotected: legs unknown since ${new Date(start).toISOString()}, 1 try \\(the legs could not be read twice alike .*\\); no trader, ADL watch or rescue reduce acts on a pair that may be open`));
+    assert.equal(unprotected().length, 0, 'under an hour since the start\'s entry: the log line only');
+    assert.equal(await p.retryStart!(), null);
+    now += 30 * 60_000;
+    assert.match(p.monitor!() ?? '', /, 2 tries \(/);
+    assert.equal(unprotected().length, 1, 'an hour on: journaled again');
+    assert.match(unprotected()[0]!, /legs unknown since 2026-11-04T12:00:00\.000Z, 2 tries/);
+    now += 30 * 60_000;
+    p.monitor!();
+    assert.equal(unprotected().length, 1, 'the next half hour: the log line only');
+    now += 30 * 60_000;
+    p.monitor!();
+    assert.equal(unprotected().length, 2);
+    w.px.snap = { slot: 121, pos: toQty('50') };
+    assert.match(await p.retryStart!() ?? '', /^pair start confirmed/);
+    assert.equal(p.monitor!(), null, 'the legs are known: nothing to say');
+    p.stop();
   } finally {
     rmSync(w.dir, { recursive: true, force: true });
   }

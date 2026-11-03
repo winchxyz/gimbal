@@ -9,7 +9,9 @@ repo root are all it needs.
 
 - **One service, one replica, one volume.** Railway never runs two deployments of a service with a volume at the
   same time, and a service with a volume cannot have replicas. That matters: two engines on one desk would send
-  every order twice. The per-desk trader lock is a file, so it only stops a second engine on the same disk.
+  every order twice. The per-desk trader lock is a file, so it only stops a second engine on the same disk. After an
+  OOM kill or a SIGKILL the lock stays on the volume naming pid 1; the next container (pid 1 again, started later)
+  takes it over and journals that, so a restart never sticks on its own lock.
   **While the Railway engine runs, run nothing that trades this desk anywhere else**: no local `serve` with
   `GIMBAL_TRADE=1`, no `pair-mainnet --send`, no `fund.mjs --send`. Read-only commands are fine.
 - **The volume is mounted on `/data`.** The image sets `XDG_STATE_HOME=/data` and `GIMBAL_STATE_DIR=/data/gimbal`:
@@ -33,8 +35,8 @@ repo root are all it needs.
      `NEAR_NETWORK`, `GIMBAL_CONTRACT_ID`, `DESK_ID`, `OWNER_ACCOUNT_ID`, `OPERATOR_ACCOUNT_ID`,
      `OPERATOR_PRIVATE_KEY`, `OPERATOR_ALLOWANCE_NEAR`, `ORDERLY_BROKER_ID`, `HL_API_URL`, `ORDERLY_API_URL`,
      `PHOENIX_API_URL`, `SOLANA_RPC_URL`;
-   - `ONECLICK_API_KEY` (rescues and transfers), `NEAR_AI_API_KEY` (the veto; without it windows pass with
-     "no veto check");
+   - `ONECLICK_API_KEY` (rescues and transfers), `NEAR_AI_API_KEY` (the NEAR AI risk check; without it windows pass with
+     "no NEAR AI risk check");
    - `GIMBAL_TRADE=1`, `GIMBAL_RESCUE=1`;
    - `GIMBAL_TRADER_FRESH=<contract>/<desk>` for the first start only when a pair is already open and its legs
      were checked on the venues (`docs/interfaces.md`, "The pair in serve"); remove it after that start.

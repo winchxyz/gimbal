@@ -705,14 +705,14 @@ export interface Window {
   updatedAt: number;
   tradable: boolean;              // both legs are VenueIds, so a desk could trade it; false = watch only. Structural
                                   // only: policy, oracle and desk reasons go in `refused`, never here
-  veto?: { verdict: 'pass' | 'veto'; reasons: string[]; model: string; at: number };   // NEAR AI, can only refuse
+  veto?: { verdict: 'pass' | 'veto'; reasons: string[]; model: string; at: number };   // NEAR AI risk check, can only refuse (verdict "veto": refused)
   refused?: { code: string; reason: string };   // tradable, but it cannot be entered now: the contract would refuse
                                                 // it (E_ORACLE_STALE, E_ASSET, E_SIZE) or no desk exists (E_NO_DESK)
   held: { since: number } | null;   // the desk holds this window now
   checks: { ok: boolean; text: string }[];   // what the engine checked (policy, oracle, rescue path, the carry
                                              // gate on the multi-day spread), one line each, engine-written; the
                                              // first failing one is why it is not entered. Enterable = tradable, not
-                                             // refused, not stale, every check ok, no veto
+                                             // refused, not stale, every check ok, not refused by the NEAR AI risk check
   switchCostUsd: number | null;     // cost to rotate from the held window into this one at strategy.legUsd:
                                     // the fills that change, plus moving margin onto this window's venues and
                                     // back (its net APR leaves those moves out);
@@ -913,10 +913,10 @@ venue. Nothing reports it yet either: the rescuer (E9) whose withdraw step will 
 merged.
 
 **NEAR AI rule:** the model drafts and refuses, never acts. A policy draft becomes real only through the
-owner's own `set_policy` transaction (and the engine rules only after the owner confirms them); a veto can
+owner's own `set_policy` transaction (and the engine rules only after the owner confirms them); the NEAR AI risk check can
 only remove a window from consideration; nothing a model returns is ever sent to the contract or a venue. Model: a NEAR AI Cloud TEE model with JSON output
 (`Qwen/Qwen3-VL-30B-A3B-Instruct`, no reasoning, ~1 s); if NEAR AI is down, drafting is unavailable and
-windows pass without a veto check.
+windows pass with no NEAR AI risk check.
 
 ## 3. Engine internals
 
@@ -954,16 +954,18 @@ anywhere the policy does not allow.
   - On a `rotate`, loop.ts sets `HeldPair.since` to the rotation time: the time stop and the payback horizon start
     again.
   - The hours left for payback are clamped to the whole hold: a `since` in the future (clock skew) never adds hours.
-  - A veto or a failed act: loop.ts saves `skipAct(input, decision)` instead of `decision.counters`; on a NEAR AI veto,
-    `skipAct(input, decision, { vetoed: true })` holds that window out of entries and rotations for
-    `LOOP_RULES.vetoHoldHours` (6 h, `LoopCounters.vetoedUntil`) and starts its counts again, and the wait says so.
-    Saved counters without `vetoedUntil` read as none vetoed.
-- `veto.ts`: the NEAR AI veto before an enter or a rotate (the client behind `POST /policy/draft`). No key, no
-  answer in `vetoTimeoutMs`, or a transport/HTTP error = pass, journaled "no veto check" (a 401 or 403 says "NEAR AI
+  - A NEAR AI risk check refusal or a failed act: loop.ts saves `skipAct(input, decision)` instead of
+    `decision.counters`; on a refusal of the NEAR AI risk check, `skipAct(input, decision, { vetoed: true })` holds
+    that window out of entries and rotations for `LOOP_RULES.vetoHoldHours` (6 h, `LoopCounters.vetoedUntil`) and
+    starts its counts again, and the wait says so ("refused by the NEAR AI risk check, held out for N h more").
+    Saved counters without `vetoedUntil` read as none refused.
+- `veto.ts`: the NEAR AI risk check before an enter or a rotate (the client behind `POST /policy/draft`). No key, no
+  answer in `vetoTimeoutMs`, or a transport/HTTP error = pass, journaled "no NEAR AI risk check" (a 401 or 403 says "NEAR AI
   key rejected", so a bad key shows on every decision). The whole reply is read; one that is not exactly one readable
   verdict (no JSON object, more than one, text around it other than ``` fences, a key given twice, not "pass" or
-  "veto" after trimming and lowercasing, a "veto" inside a "pass", cut off at its token limit) fails closed: a veto, "unreadable reply". A veto drops the window and writes a
-  `veto` entry.
+  "veto" after trimming and lowercasing, a "veto" inside a "pass", cut off at its token limit) fails closed: refused,
+  "unreadable reply". A refusal ("NEAR AI risk check refused X: …") drops the window and writes a journal entry of
+  kind `veto` (the kind keeps its name; every text the owner reads says "NEAR AI risk check").
 - `loop.ts` (serve): runs `decide` after each funding payment (the hourly check) and on each scan event, only with
   `GIMBAL_TRADE=1` and `strategy.auto`, one decision at a time under the per-desk trader lock, never while a rescue
   or an ADL unwind runs. It carries `act` out with the same open and close code as `pair-mainnet` (maker first),
@@ -1154,7 +1156,11 @@ both. Serve never opens or grows a pair. It trades only with `GIMBAL_TRADE=1`, f
 `--once`, holding the per-desk lock, which `pair-mainnet --send` takes too for its whole run (neither starts while
 the other holds it; a lock file with no pid in it counts as held). The lock is
 `locks/trader-<mode>-<contract>-<desk>.lock` in the per-user state directory (`%LOCALAPPDATA%/gimbal/state/locks/` or
-`$XDG_STATE_HOME/gimbal/locks/`, not `GIMBAL_STATE_DIR`); a lock whose pid is not running is taken over. When the acquire error says the lock
+`$XDG_STATE_HOME/gimbal/locks/`, not `GIMBAL_STATE_DIR`). It names its process by pid, start time, a random id and
+the host's boot id: a lock whose pid is not running, of an earlier boot, or of this very pid from before this process
+started (node is pid 1 in every container, so a killed container leaves "pid 1" behind) is stale, taken over and
+journaled. A lock held by a live other process does not stop serve: the pair starts alert only with its legs unknown
+and the lock is tried again with the start's backoff (the same as a start read that failed). When the acquire error says the lock
 "holds no pid" (empty or partly written: a crash while it was being made), first check that no serve and no
 `pair-mainnet` runs for this desk (Task Manager or `ps`), then delete that one file and start again. Otherwise every
 protection only alerts, says so, and holds no lock. A resting order on the pair's coin at start also makes it alert

@@ -40,7 +40,11 @@
 // with its legs unknown (nothing adopted, `unconfirmed` says why, the hands refuse every act), the reads are tried
 // again on a timer with backoff up to START_RETRY_MAX_MS, and the pair goes live once both legs, synced to their
 // chains, read twice alike. The transitions are journaled and the venue's health says slow or down meanwhile. Only
-// a ConfigError (a bad env, a contract on another network) stops the start.
+// a ConfigError (a bad env, a contract on another network) stops the start. The trader lock is part of the start:
+// one held by a live other process degrades the pair the same way and is tried again (never an exit, which would
+// crash-loop under the host's restart policy), and a stale one (its process gone, or this pid before a container
+// restart) is taken over and journaled. While the start is not confirmed a pair may be open with nothing protecting it:
+// serve's monitor asks `monitor()` every 30 min for the "pair unprotected" line, journaled at most hourly.
 
 import type { ContractPolicy, Mode, StreamEvent, TxRef } from '@gimbal/shared';
 import type { NearTransport } from '../contract/near-client.ts';
@@ -245,6 +249,12 @@ export interface ServePair {
   unconfirmed?(): string | null;
   /** Tries the start again now while it is not confirmed (serve runs it on a timer; tests call it); the line when it was. */
   retryStart?: () => Promise<string | null>;
+  /**
+   * serve's monitor (every 30 min): "pair unprotected: legs unknown since T, N tries" while the start is not confirmed
+   * (a pair may be open with no trader, ADL or reduce on it), journaled again at most every UNPROTECTED_REMIND_MS; null
+   * once the legs are known.
+   */
+  monitor?(): string | null;
   /** Turns trading off first (every order and close refused from then on), then stops the watch and the trader, closes the readers and releases the lock. */
   stop(): void;
 }
@@ -315,6 +325,9 @@ interface Slot {
   end(): void;
 }
 
+/** How often the "pair unprotected" alert is journaled again while the start is not confirmed (at most hourly). */
+export const UNPROTECTED_REMIND_MS = 60 * 60_000;
+
 export async function servePair(input: ServePairInput): Promise<ServePair> {
   const { env, log } = input;
   if (input.mode !== 'mainnet') return none([`pair      none on ${input.mode}: the pair is Hyperliquid and Phoenix, and Phoenix is mainnet only`], `no pair on ${input.mode}`);
@@ -332,20 +345,13 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
   const contractId = input.side.client.contractId;
   const deps: ServePairDeps = { ...defaultDeps({ input, hlUrl, phoenixUrl, solRpcUrl }), ...input.deps };
 
-  // The lock first: pair-mainnet --send cannot start between the reads below and the first save.
+  // The lock first, in each start attempt (attempt() below): pair-mainnet --send cannot start between the reads and
+  // the first save. One that is held is a start not confirmed (tried again), never an exit.
   let lock: TraderLock | null = null;
   const release = () => {
     lock?.release();
     lock = null;
   };
-  if (wantLive) {
-    try {
-      lock = acquireTraderLock(traderLockPath(env, input.mode, contractId, input.deskId));
-    } catch (err) {
-      deps.close();
-      throw new Error(`GIMBAL_TRADE=1: ${errorMessage(err)} (pair-mainnet --send holds the same lock)`);
-    }
-  }
   const stopNone = () => {
     deps.close();
     release();
@@ -566,6 +572,18 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
      * Throws a ConfigError (serve stops) or a read that failed (the start is not confirmed and is tried again).
      */
     const attempt = async (): Promise<Started> => {
+      if (wantLive && lock === null) {
+        try {
+          lock = acquireTraderLock(traderLockPath(env, input.mode, contractId, input.deskId));
+        } catch (err) {
+          throw new Error(`the trader lock is not held: ${errorMessage(err)} (pair-mainnet --send holds the same lock)`);
+        }
+        const took = (lock as TraderLock).tookOver;
+        if (took !== null) {
+          log(`pair      ${took}`);
+          journal('error', `pair: ${took}. A serve or pair-mainnet that was killed (an OOM, a SIGKILL, a container restart) leaves its lock behind; nothing else trades this desk now`, { stage: 'lock' });
+        }
+      }
       const saved = store.load();
       const held = [...new Set([
         ...(await startRead('hyperliquid', () => deps.hlHeld(evm))),
@@ -616,6 +634,9 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
     /** Why the start is not confirmed (review S1): a read it needs failed. Null once two synced reads agreed. */
     let pending: string | null = null;
     let failures = 0;
+    /** When the start was first not confirmed, and when the owner last heard of it (a journal entry). */
+    let pendingSince: number | null = null;
+    let pendingSaidAt: number | null = null;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     let attempting: Promise<string | null> | null = null;
     /** A retry found a configuration error: the start is not tried again (serve must be restarted). */
@@ -663,12 +684,14 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       }
       const was = pending;
       pending = why;
+      pendingSince ??= input.clock.now();
       const wait = startBackoffMs(failures);
       log(`pair      start not confirmed (try ${failures}): ${why}; alert only, legs unknown, nothing adopted; trying again in ${wait / 1000} s`);
       if (was === null || !sameKind(was, why)) {
-        journal('error', `pair start not confirmed: ${why}. Alert only until two synced reads of both legs agree: the legs are unknown, nothing is adopted and the strategy loop acts on nothing; the risk engine, the liquidation monitor, ADL alerts and panic_close's journal run. Tried again with backoff up to ${START_RETRY_MAX_MS / 1000} s`, {
+        journal('error', `pair start not confirmed: ${why}. Alert only until two synced reads of both legs agree: the legs are unknown, nothing is adopted and the strategy loop acts on nothing; the risk engine, the liquidation monitor and panic_close's journal run, and ADL is off until the legs are known. Tried again with backoff up to ${START_RETRY_MAX_MS / 1000} s`, {
           stage: 'start', ...(read === null ? {} : { venue: read.venue }),
         });
+        pendingSaidAt = input.clock.now();
       }
       schedule(wait);
     };
@@ -686,6 +709,8 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           const tries = failures;
           pending = null;
           failures = 0;
+          pendingSince = null;
+          pendingSaidAt = null;
           if (retryTimer !== null) clearTimeout(retryTimer);
           retryTimer = null;
           healthOk();
@@ -948,9 +973,10 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         return current?.adl.state ?? newAdlState();
       },
     };
-    // A start not confirmed yet keeps the hands (they refuse until it is) and the ADL watch: it may go live later.
+    // A start not confirmed yet keeps the hands (they refuse until it is) and the ADL watch: it may go live later, the
+    // trader lock included when another process held it at start.
     const started = current as Slot | null;       // set by land(), which TypeScript does not follow
-    const live = trading() && (pending !== null || started === null || started.live());
+    const live = wantLive && !stopped && (pending !== null || (lock !== null && (started === null || started.live())));
     return {
       get pair() {
         return current?.pp ?? null;
@@ -978,6 +1004,18 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       settleInFlight: () => current?.settle() ?? Promise.resolve(null),
       unconfirmed,
       retryStart,
+      monitor: () => {
+        if (pending === null || stopped) return null;
+        const now = input.clock.now();
+        const since = pendingSince ?? now;
+        const line = `pair unprotected: legs unknown since ${new Date(since).toISOString()}, ${failures} ${failures === 1 ? 'try' : 'tries'} (${pending}); `
+          + 'no trader, ADL watch or rescue reduce acts on a pair that may be open: check both legs on the venues';
+        if (pendingSaidAt === null || now - pendingSaidAt >= UNPROTECTED_REMIND_MS) {
+          pendingSaidAt = now;
+          journal('error', line, { stage: 'start', tries: failures });
+        }
+        return line;
+      },
       stop: () => {
         // First: nothing is signed from here on (a rescue between its read and its reduce must not sign after the
         // lock is released), and nothing is saved.

@@ -56,11 +56,11 @@ export const VERDICT_SHOWN_MS = HOUR_MS;
 export const RETRY_AFTER_MS = 15 * 60_000;
 export const LOOP_STATE_VERSION = 1;
 
-/** No NEAR AI here: checkVeto answers "no veto check: NEAR_AI_API_KEY is not set", a pass. */
+/** No NEAR AI here: checkVeto answers "no NEAR AI risk check: NEAR_AI_API_KEY is not set", a pass. */
 export const NO_VETO_SOURCE: VetoSource = {
   model: 'none', configured: false,
   complete: async () => {
-    throw new Error('no veto source');
+    throw new Error('no NEAR AI risk check source');
   },
 };
 
@@ -317,7 +317,7 @@ export function notEnterable(w: FundingWindow): string | null {
   if (!w.tradable) return `${w.id} is watch only`;
   if (w.refused !== undefined) return `${w.id} is refused: ${w.refused.code} ${w.refused.reason}`;
   if (w.stale) return `${w.id} is stale: a venue it needs did not answer`;
-  if (w.veto?.verdict === 'veto') return `${w.id} was vetoed by NEAR AI: ${w.veto.reasons.join('; ')}`;
+  if (w.veto?.verdict === 'veto') return `${w.id} was refused by the NEAR AI risk check: ${w.veto.reasons.join('; ')}`;
   const failed = w.checks.find((c) => !c.ok);
   return `${w.id} fails a check: ${failed?.text ?? 'unknown'}`;
 }
@@ -359,7 +359,7 @@ export interface StrategyLoopOptions {
 
 type Task = () => Promise<void>;
 /**
- * How an act ended: carried out; not carried out; vetoed by NEAR AI; or a rotate that closed the held pair and
+ * How an act ended: carried out; not carried out; refused by the NEAR AI risk check; or a rotate that closed the held pair and
  * opened nothing. `sent`: orders went out (or may have). `passing`: refused for a reason that passes (a rescue
  * running, a close in flight): tried again on the next check.
  */
@@ -421,8 +421,8 @@ export class StrategyLoop {
 
   /** The start line: what runs and why. */
   startLine(): string {
-    const rules = `enter after ${LOOP_RULES.enterAfterChecks} hourly checks, exit after ${LOOP_RULES.exitAfterChecks}, cooldown ${LOOP_RULES.cooldownHours} h, time stop ${LOOP_RULES.maxHoldDays} d, at most ${LOOP_RULES.maxRotationsPerDay} rotations a day, a veto holds ${LOOP_RULES.vetoHoldHours} h`;
-    const veto = this.#o.veto?.configured === true ? `NEAR AI veto ${this.#o.veto.model} (${(this.#o.vetoTimeoutMs ?? LOOP_RULES.vetoTimeoutMs) / 1000} s)` : 'no NEAR AI veto (NEAR_AI_API_KEY is not set: every window passes, "no veto check")';
+    const rules = `enter after ${LOOP_RULES.enterAfterChecks} hourly checks, exit after ${LOOP_RULES.exitAfterChecks}, cooldown ${LOOP_RULES.cooldownHours} h, time stop ${LOOP_RULES.maxHoldDays} d, at most ${LOOP_RULES.maxRotationsPerDay} rotations a day, a NEAR AI risk check refusal holds ${LOOP_RULES.vetoHoldHours} h`;
+    const veto = this.#o.veto?.configured === true ? `NEAR AI risk check ${this.#o.veto.model} (${(this.#o.vetoTimeoutMs ?? LOOP_RULES.vetoTimeoutMs) / 1000} s)` : 'no NEAR AI risk check (NEAR_AI_API_KEY is not set: every window passes)';
     const hands = this.#o.hands === null ? `no hands (${this.#o.handsWhy ?? 'nothing can be opened or closed here'}): decisions are published, acts journaled as refused` : 'acts through the pair trader (pair-mainnet open / close)';
     return `strategy loop: ${this.#o.trade ? 'GIMBAL_TRADE=1' : 'GIMBAL_TRADE is not 1 (off)'}, auto ${this.#o.strategy().auto ? 'on' : 'off'}; ${hands}; ${veto}; ${rules}; state ${this.#o.store.path}`;
   }
@@ -542,7 +542,7 @@ export class StrategyLoop {
     if (heldNow?.oneLeg != null) return { reason: `one leg is open (${heldNow.oneLeg.venue} ${heldNow.oneLeg.qty}): it is closed first` };
     if (this.#state.held?.windowId === windowId && heldNow !== null) return { reason: `${windowId} is the window held now` };
     const until = this.#state.counters.vetoedUntil[windowId];
-    if (until !== undefined && now < until) return { reason: `${windowId} was vetoed by NEAR AI: held out until ${new Date(until).toISOString()}` };
+    if (until !== undefined && now < until) return { reason: `${windowId} was refused by the NEAR AI risk check: held out until ${new Date(until).toISOString()}` };
     const not = notEnterable(w);
     if (not !== null) return { reason: not };
     const sym = hands.symbolOf(w);

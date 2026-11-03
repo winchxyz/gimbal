@@ -65,7 +65,7 @@ test('the entry rules: enterable, net at the minimum, this hour, 7 and 14 days o
   assert.equal(entryFailure(win(XLM, { refused: { code: 'E_ORACLE_STALE', reason: 'no oracle price for XLM on phoenix' } }), s),
     'refused E_ORACLE_STALE: no oracle price for XLM on phoenix');
   assert.equal(entryFailure(win(XLM, { stale: true }), s), 'its numbers are stale');
-  assert.equal(entryFailure(win(XLM, { veto: { verdict: 'veto', reasons: ['a spike'], model: 'm', at: T0 } }), s), 'vetoed by NEAR AI: a spike');
+  assert.equal(entryFailure(win(XLM, { veto: { verdict: 'veto', reasons: ['a spike'], model: 'm', at: T0 } }), s), 'refused by the NEAR AI risk check: a spike');
   assert.equal(entryFailure(win(XLM, { veto: { verdict: 'pass', reasons: [], model: 'm', at: T0 } }), s), null);
   assert.equal(entryFailure(win(XLM, { checks: [{ ok: true, text: 'a' }, { ok: false, text: 'The Phoenix book fills only $5.00' }] }), s), 'The Phoenix book fills only $5.00');
   assert.match(entryFailure(win(XLM, { grossAprPct: -3 }), s)!, /this hour pays -3\.0 %/);
@@ -504,9 +504,9 @@ test('a vetoed entry holds that window out for 6 h, says so, and its count start
   assert.equal(scan.vetoCandidate, null);
   const after = hours(input({ now: at + HOUR, counters: vetoed }), 8, () => [win(XLM)]);
   assert.deepEqual(actions(after), ['wait', 'wait', 'wait', 'wait', 'wait', 'wait', 'wait', 'enter']);
-  assert.equal(after[0]!.decision.reason, 'No window clears the entry rules; best XLM 15.0 % net: vetoed by NEAR AI, held out for 5.0 h more');
+  assert.equal(after[0]!.decision.reason, 'No window clears the entry rules; best XLM 15.0 % net: refused by the NEAR AI risk check, held out for 5.0 h more');
   assert.equal(after[0]!.counters.lastWaitReason, `blocked:${XLM}:vetoed`);
-  assert.equal(entryFailure(win(XLM), { strategy: STRATEGY, now: at + HOUR, counters: vetoed }), 'vetoed by NEAR AI, held out for 5.0 h more');
+  assert.equal(entryFailure(win(XLM), { strategy: STRATEGY, now: at + HOUR, counters: vetoed }), 'refused by the NEAR AI risk check, held out for 5.0 h more');
   // At 6 h the hold is over and the count starts from 1.
   assert.equal(after[5]!.decision.reason, 'XLM 15.0 % net, 1 of 3 hours above 10 %');
   assert.deepEqual(after[5]!.counters.vetoedUntil, {});
@@ -523,7 +523,7 @@ test('a vetoed window drops out: the next one in the scanner\'s rank is entered,
   // While the next one warms up, its wait names the veto above it.
   const fresh = skipAct(input({ now: T0 + 2 * HOUR, windows: windows(), counters: ds[1]!.counters }), ds[2]!, { vetoed: true });
   const warming = decide(input({ now: T0 + 3 * HOUR, windows: windows(), counters: { ...fresh, aboveByWindow: {} } }));
-  assert.equal(warming.decision.reason, 'SOL 12.0 % net, 1 of 3 hours above 10 %; XLM vetoed by NEAR AI, held out for 5.0 h more');
+  assert.equal(warming.decision.reason, 'SOL 12.0 % net, 1 of 3 hours above 10 %; XLM refused by the NEAR AI risk check, held out for 5.0 h more');
   assert.equal(warming.counters.lastWaitReason, `warming:${SOL}:1:veto:${XLM}`);
 });
 

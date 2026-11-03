@@ -3,7 +3,7 @@
 // reasons}, before every enter and every rotate. A veto can only remove a window: nothing the model says changes the
 // window, the size or the leverage, or is sent to the contract or a venue. No key, no answer within
 // LOOP_RULES.vetoTimeoutMs, or NEAR AI down (a transport or HTTP error): the window passes, and the journal line says
-// "no veto check" (a 401 or 403 says "NEAR AI key rejected", so a bad key shows on every decision). A reply that
+// "no NEAR AI risk check" (a 401 or 403 says "NEAR AI key rejected", so a bad key shows on every decision). A reply that
 // came but cannot be read as one verdict (not JSON, no verdict, more than one JSON object, text around it, a key
 // given twice, a "veto" inside a "pass", cut off at its token limit) fails closed: it is a veto, "unreadable reply".
 //
@@ -133,9 +133,9 @@ export interface VetoExchange {
 
 export interface VetoResult {
   veto: Veto;
-  /** false = no veto check (no answer came): the window passes unchecked, and `line` says why. */
+  /** false = no NEAR AI risk check (no answer came): the window passes unchecked, and `line` says why. */
   checked: boolean;
-  /** One line for the journal: "NEAR AI passed …", "NEAR AI vetoed …: <reason>", or "no veto check: <why>". */
+  /** One line for the journal: "NEAR AI passed …", "NEAR AI risk check refused …: <reason>", or "no NEAR AI risk check: <why>". */
   line: string;
   /** What was asked and what came back; null only when nothing was asked (no key). */
   exchange: VetoExchange | null;
@@ -269,13 +269,13 @@ export function parseVerdict(value: Record<string, unknown>): { verdict: 'pass' 
 }
 
 /** NearAiUnavailable messages that mean no reply came at all (transport, HTTP, no key, nothing recorded). */
-const NO_ANSWER = ['NEAR_AI_API_KEY is not set', 'NEAR AI did not answer', 'NEAR AI answered HTTP', 'no recorded veto reply'];
+const NO_ANSWER = ['NEAR_AI_API_KEY is not set', 'NEAR AI did not answer', 'NEAR AI answered HTTP', 'no recorded NEAR AI risk check reply'];
 
 /** The reason a veto that fails closed carries. */
 export const UNREADABLE_REPLY = 'unreadable reply';
 
 /**
- * Asks for a verdict on `facts`. Never throws. A timeout or a transport/HTTP error passes with "no veto check"; a
+ * Asks for a verdict on `facts`. Never throws. A timeout or a transport/HTTP error passes with "no NEAR AI risk check"; a
  * reply that came but is not a readable verdict (including one cut off at its token limit) is a veto, "unreadable
  * reply".
  */
@@ -284,15 +284,15 @@ export async function checkVeto(
 ): Promise<VetoResult> {
   const timeoutMs = options.timeoutMs ?? LOOP_RULES.vetoTimeoutMs;
   const unchecked = (why: string): VetoResult => ({
-    veto: { verdict: 'pass', reasons: [`no veto check: ${why}`], model: source.model, at: options.now },
+    veto: { verdict: 'pass', reasons: [`no NEAR AI risk check: ${why}`], model: source.model, at: options.now },
     checked: false,
-    line: `no veto check on ${facts.symbol}: ${why}`,
+    line: `no NEAR AI risk check on ${facts.symbol}: ${why}`,
     exchange: null,
   });
   const unreadable = (why: string, exchange: VetoExchange): VetoResult => ({
     veto: { verdict: 'veto', reasons: [UNREADABLE_REPLY], model: source.model, at: options.now },
     checked: true,
-    line: `NEAR AI vetoed ${facts.symbol}: ${UNREADABLE_REPLY} (${why})`,
+    line: `NEAR AI risk check refused ${facts.symbol}: ${UNREADABLE_REPLY} (${why})`,
     exchange,
   });
   if (!source.configured) return unchecked('NEAR_AI_API_KEY is not set');
@@ -300,7 +300,7 @@ export async function checkVeto(
   const asked: VetoExchange = { key: promptKey(messages), model: source.model, messages, response: null };
   let completion: Completion;
   try {
-    completion = await withTimeout(source.complete(messages, { json: true, maxTokens: MAX_TOKENS }), timeoutMs, 'NEAR AI veto');
+    completion = await withTimeout(source.complete(messages, { json: true, maxTokens: MAX_TOKENS }), timeoutMs, 'NEAR AI risk check');
   } catch (err) {
     const message = errorMessage(err);
     if (!(err instanceof NearAiUnavailable) && /no answer within/.test(message)) {
@@ -323,14 +323,14 @@ export async function checkVeto(
   }
   const veto: Veto = { verdict: verdict.verdict, reasons: verdict.reasons, model: source.model, at: options.now };
   const line = verdict.verdict === 'veto'
-    ? `NEAR AI vetoed ${facts.symbol}: ${verdict.reasons.join('; ')}`
+    ? `NEAR AI risk check refused ${facts.symbol}: ${verdict.reasons.join('; ')}`
     : `NEAR AI passed ${facts.symbol}${verdict.reasons.length === 0 ? '' : `: ${verdict.reasons.join('; ')}`}`;
   return { veto, checked: true, line, exchange };
 }
 
 /**
  * Plays recorded veto exchanges back, found by their prompt: no key, no network. A prompt with no recording is
- * NearAiUnavailable, so checkVeto passes it with "no veto check".
+ * NearAiUnavailable, so checkVeto passes it with "no NEAR AI risk check".
  */
 export class RecordedVeto implements VetoSource {
   readonly configured = true;
@@ -352,7 +352,7 @@ export class RecordedVeto implements VetoSource {
 
   async complete(messages: readonly ChatMessage[]): Promise<Completion> {
     const raw = this.#byKey.get(promptKey(messages));
-    if (raw === undefined) throw new NearAiUnavailable('no recorded veto reply for this prompt');
+    if (raw === undefined) throw new NearAiUnavailable('no recorded NEAR AI risk check reply for this prompt');
     return { content: completionContent(raw), raw };
   }
 }
