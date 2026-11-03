@@ -3,7 +3,8 @@
 // AccountsDeskSource (testnet, mainnet): the desk's own accounts through the venue readers, one account per venue,
 // every open position a leg. serve passes Hyperliquid (the desk EVM address) and Phoenix (the desk's Solana
 // authority), which read publicly; Orderly's account is read only over its authenticated stream, which serve does not
-// open (it signs nothing), so Orderly legs come in once the strategy engine holds that session.
+// open (it signs nothing), so Orderly legs come in once the strategy engine holds that session. An account read has a
+// deadline (ACCOUNT_READ_DEADLINE_MS): past it that venue's read fails for this tick instead of holding the tick up.
 //
 // ReplayDesk (replay): there are no recorded accounts, so the desk is scripted: one pair at strategy.legUsd a leg and
 // strategy.maxLeverage, opened at the first recorded marks, then marked and funded by the recording as the replay
@@ -11,6 +12,7 @@
 // what it opened, saying so.
 
 import type { DeskState, StrategyConfig, VenueId } from '@gimbal/shared';
+import { readBy } from '../venues/http-budget.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { AccountState, Clock, MarketFunding, Position, VenueReader } from '../venues/venue.ts';
 import type { DeskSnapshot, DeskSource, LegInput } from './engine.ts';
@@ -34,10 +36,19 @@ export interface AccountsDeskSourceOptions {
   now?: () => number;
   /** Default DESK_VIEW_WAIT_MS. */
   deskWaitMs?: number;
+  /** Default ACCOUNT_READ_DEADLINE_MS. */
+  readDeadlineMs?: number;
 }
 
 /** A snapshot waits this long for the desk view (get_desk) before it goes on with the last answer. */
 export const DESK_VIEW_WAIT_MS = 5_000;
+
+/**
+ * An account read gives up after this: the tick goes on with that venue's read failed (the venue is down in
+ * HealthMap) rather than wait out a venue's request budget (Phoenix: up to 15 s through a cool-down). Over
+ * SLOW_READ_MS (5 s), so a slow answer still counts as slow, and long enough for one 429 retry after Retry-After: 1.
+ */
+export const ACCOUNT_READ_DEADLINE_MS = 7_000;
 
 export class AccountsDeskSource implements DeskSource {
   readonly #o: AccountsDeskSourceOptions;
@@ -53,10 +64,11 @@ export class AccountsDeskSource implements DeskSource {
   async read(): Promise<DeskSnapshot> {
     const now = this.#o.now ?? Date.now;
     const deskRead = this.#readDesk(now);
+    const deadlineMs = this.#o.readDeadlineMs ?? ACCOUNT_READ_DEADLINE_MS;
     const reads = await Promise.all(this.#o.accounts.map(async ({ reader, address }) => {
       const started = now();
       try {
-        const account = await reader.account(address);
+        const account = await withDeadline(deadlineMs, `${reader.id} account read`, () => reader.account(address));
         return { venue: reader.id, ms: now() - started, error: null, account };
       } catch (err) {
         return { venue: reader.id, ms: now() - started, error: errorMessage(err), account: null };
@@ -107,6 +119,22 @@ export class AccountsDeskSource implements DeskSource {
     } finally {
       clearTimeout(timer);
     }
+  }
+}
+
+/**
+ * `fn` with a deadline `ms` from now: budgeted reads in it (http-budget.ts readBy) stop waiting and time out then, and
+ * whatever still runs is no longer waited for: the result rejects.
+ */
+async function withDeadline<T>(ms: number, what: string, fn: () => Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} gave up after ${ms / 1000} s`)), ms);
+  });
+  try {
+    return await Promise.race([readBy(Date.now() + ms, fn), late]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 

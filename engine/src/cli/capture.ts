@@ -17,7 +17,7 @@ import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { HyperliquidReader } from '../venues/hyperliquid.ts';
 import { OrderlyReader, orderlySymbol } from '../venues/orderly.ts';
-import { PhoenixReader, PHOENIX_API_URL } from '../venues/phoenix.ts';
+import { PhoenixReader, PHOENIX_API_URL, phoenixGet } from '../venues/phoenix.ts';
 import type { WireLine } from '../venues/recorder.ts';
 import { JsonlGzWriter, errorMessage, recordingFetch, recordingWsRequester } from '../venues/recorder.ts';
 import { watchReaders } from '../venues/watch/index.ts';
@@ -72,8 +72,8 @@ if (venue === 'hl') {
     const address = values.address;
     await step('account', () => reader.account(address));
     if (values.view !== undefined) {
-      const url = `${PHOENIX_API_URL}/v1/view/trader/${encodeURIComponent(values.view)}`;
-      await step('trader view', async () => (await wireFetch(url, { method: 'GET' })).json());
+      const path = `/v1/view/trader/${encodeURIComponent(values.view)}`;
+      await step('trader view', () => phoenixGet(PHOENIX_API_URL, path, { fetch: wireFetch }));
     }
     const since = Number(values['funding-since'] ?? Date.now() - 20 * 86_400_000);
     if (!Number.isInteger(since)) fail('--funding-since must be a ms timestamp');

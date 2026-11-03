@@ -180,6 +180,7 @@ export function WindowsScreen() {
               selected={w.id === selectedId}
               below={isBelow(w, minimum)}
               history={histories[w.id]}
+              held={held}
               onSelect={select}
             />
           ))}

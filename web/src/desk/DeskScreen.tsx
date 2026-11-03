@@ -1,4 +1,4 @@
-import type { DeskState, JournalEntry, Leg, ScanStatus, StrategyConfig, VenueId, Window as FundingWindow } from '@gimbal/shared';
+import type { DeskState, JournalEntry, Leg, ScanStatus, StrategyConfig, StrategyDecision, VenueId, Window as FundingWindow } from '@gimbal/shared';
 import { MoneyActions } from '../shell/Header.tsx';
 import { StatusActions } from '../shell/StatusActions.tsx';
 import { downVenues, type StatusActionsView } from '../shell/status.ts';
@@ -31,6 +31,7 @@ import {
   thresholdText,
   type EventRow,
 } from './model.ts';
+import { DecisionBar } from './Decision.tsx';
 import { DeskLoading } from './States.tsx';
 import './desk.css';
 
@@ -44,10 +45,18 @@ export function DeskScreen() {
   const strategy = useStrategy().value;
   const status = useStatus('desk');
   const noDesk = useStream((s) => deskMissing(s.windows));
+  const decision = useStream((s) => s.decision);
   const now = useNow(10_000);
 
   if (desk === null || status === null) return noDesk ? <NoDesk scan={scan} now={now} /> : <DeskLoading />;
-  if (desk.legs.length === 0) return <Waiting desk={desk} windows={windows} strategy={strategy} scan={scan} now={now} />;
+  if (desk.legs.length === 0) {
+    return (
+      <div className="d-page">
+        <DecisionBar decision={decision} now={now} held={false} symbol={null} urgent={false} />
+        <Waiting desk={desk} windows={windows} strategy={strategy} scan={scan} now={now} />
+      </div>
+    );
+  }
 
   return (
     <Stage
@@ -57,6 +66,8 @@ export function DeskScreen() {
       journal={journal}
       down={downVenues(desk, health)}
       now={now}
+      decision={decision}
+      urgent={status.actions.buttons.some((b) => b.id === 'close' && b.style === 'primary')}
       phoneActions={status.actions}
     />
   );
@@ -71,11 +82,14 @@ interface StageProps {
   journal: readonly JournalEntry[];
   down: readonly VenueId[];
   now: number;
+  decision: StrategyDecision | null;
+  /** The status line asks the owner to act, so Close is the filled pill. */
+  urgent: boolean;
   /** The status line's buttons, drawn again at the bottom of the page on the phone, where the line has none. */
   phoneActions: StatusActionsView;
 }
 
-function Stage({ desk, windows, strategy, journal, down, now, phoneActions }: StageProps) {
+function Stage({ desk, windows, strategy, journal, down, now, decision, urgent, phoneActions }: StageProps) {
   const { left, right } = placeLegs(desk.legs);
   const rate = dayRate(windows ? heldWindow(windows) : null, desk.legs);
   const payback = paybackOf(desk.pnl, rate?.perDayUsd ?? null);
@@ -84,6 +98,7 @@ function Stage({ desk, windows, strategy, journal, down, now, phoneActions }: St
 
   return (
     <div className="d-page">
+      <DecisionBar decision={decision} now={now} held symbol={windows ? (heldWindow(windows)?.symbol ?? null) : null} urgent={urgent} />
       <div className="d-grid">
         <section className="d-hero" aria-label="Desk value">
           <div className="lab">Desk value</div>
@@ -148,7 +163,7 @@ function Stage({ desk, windows, strategy, journal, down, now, phoneActions }: St
       </div>
 
       <div className="d-actions d-phone">
-        <StatusActions view={phoneActions} skip={['auto']} className="btns" />
+        <StatusActions view={phoneActions} skip={['auto', 'close']} className="btns" />
       </div>
     </div>
   );

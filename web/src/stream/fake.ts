@@ -2,11 +2,14 @@
 // Every value here is made up; the UI labels this source "Fake stream". Each event goes through
 // JSON and the same parser as the SSE client, so it exercises the real path into the store.
 import type { JournalEntry, Mode, RescueProgress, SetupProgress, StreamEvent } from '@gimbal/shared';
-import { fakeDesk, fakeDeskHealth, fakeLatest } from './fake-desk.ts';
+import { fakeDecision, fakeDesk, fakeDeskHealth, fakeLatest } from './fake-desk.ts';
 import { fakeScan, fakeWindows, type Scenario } from './fake-windows.ts';
 import { fakeDeskFor, fakeEarlierRescues, fakeProgress, fakeRun, stressRun, takeFakeStress, type FakeRun } from './fake-rescue.ts';
 import { deskFor, type DeskScenario, type RescueScenario } from './source.ts';
 import { parseStreamEvent, type StreamAction } from './store.ts';
+
+/** The fake decision was made this long before the page opened, so the line reads "14 min ago". */
+const DECISION_AGE_MS = 14 * 60_000;
 
 /** How often the fake looks at its rescue: a step change is sent within this long of when it happens. */
 const RESCUE_LOOK_MS = 200;
@@ -35,6 +38,7 @@ export function startFakeStream(dispatch: (action: StreamAction) => void, option
   // A desk with no position waits because nothing clears the minimum, so the windows say the same.
   const windowsOptions = { scenario: desk === 'waiting' && scenario === 'normal' ? ('empty' as const) : scenario, startedAt: Date.now(), drift };
   let tick = 0;
+  const startedAt = windowsOptions.startedAt;
 
   const send = (event: StreamEvent) => {
     const parsed = parseStreamEvent(JSON.stringify(event));
@@ -79,6 +83,11 @@ export function startFakeStream(dispatch: (action: StreamAction) => void, option
         for (const entry of fakeEarlierRescues(now, options.mode)) send({ type: 'journal', data: entry });
         lookAtRescue();
       }
+    }
+    // The loop publishes a decision when it changes; the fake repeats the same one now and then, as a reconnect would.
+    if (tick % 12 === 0) {
+      const decision = fakeDecision(startedAt - DECISION_AGE_MS, desk);
+      if (decision !== null) send({ type: 'decision', data: decision });
     }
     if (tick % 3 === 0) send({ type: 'health', data: fakeDeskHealth(tick, desk) });
     // The scanner sends its windows and its status together; `loading` sends neither.

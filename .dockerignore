@@ -1,0 +1,10 @@
+.git
+.env
+.env.*
+.keys
+node_modules
+**/node_modules
+**/dist
+contract/target
+target
+*.log

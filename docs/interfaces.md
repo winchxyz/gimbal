@@ -924,17 +924,46 @@ windows pass without a veto check.
 the contract still decides what is possible, so the loop can lose money on a bad trade but cannot move money
 anywhere the policy does not allow.
 
-- `decide.ts` (pure): `decide(DecideInput) → Decision` with the shapes in that file. Entry: the best enterable
-  window (`isEnterable`, `netAprPct ≥ minNetAprPct`) that held for `LOOP_RULES.enterAfterChecks` hourly checks in a
-  row, the 7 d and 14 d spread signs agreeing with this hour's, depth on both legs; size `legUsd` capped by the
-  policy's `max_notional_usd` less the band and by free margin; leverage ≤ `maxLeverage`, ≤ 1.5 on a leg without a
-  live rescue. Exit: expected net over the rest of the hold < 0 or under the threshold, or a sign flip, for
-  `exitAfterChecks` checks; the time stop; drawdown ≥ `stopDrawdownPct`; then `cooldownHours`. Rotation: another
-  window beats the held one by `rotate.minGainPts` for `rotate.forHours` and `switchCostUsd` pays back within the
-  hold; windows on venues that already hold the margin first; at most `maxRotationsPerDay`. Every decision carries a
-  one-line reason with the numbers; a `wait` is journaled only when its reason changes.
-- `veto.ts`: the NEAR AI veto before an enter or a rotate (the client behind `POST /policy/draft`); no answer in
-  `vetoTimeoutMs` = pass, journaled "no veto check". A veto drops the window and writes a `veto` entry.
+- `decide.ts` (pure): `decide(DecideInput) → Decision` with the shapes in that file. Entry: the top of the
+  scanner's ranked list among the windows passing the entry rules (`isEnterable`, `netAprPct ≥ minNetAprPct`, the
+  7 d and 14 d spread signs agreeing with this hour's, depth on both legs), once it has passed them for
+  `LOOP_RULES.enterAfterChecks` hourly checks in a row; until then the loop waits on it ("k of N hours") and never
+  enters a lower window instead. Size: `legUsd` capped by the policy's `max_notional_usd` less the band, by free
+  margin at the leverage and by depth, rounded down to whole common lots; a cap that is not a finite number or is
+  ≤ 0 sizes nothing. Leverage ≤ `maxLeverage`, ≤ 1.5 on a leg without a live rescue. Stops, first and at once: the
+  time stop (needs only a finite `HeldPair.since`) and drawdown ≥ `stopDrawdownPct` (needs a finite `pnlUsd`,
+  `legUsd` > 0 and a finite stop), where drawdown is `HeldPair.pnlUsd` against one leg's notional `HeldPair.legUsd`;
+  no other unknown number keeps them from firing. Past the stops, a held pair whose P&L, leg size (≤ 0 included),
+  window numbers or rules are not finite gets no act: a `wait`, "held pair numbers unknown", never counted healthy.
+  The held window is judged from here (`heldForwardAprPct`): its multi-day gross (`netAprPct` plus the costs the
+  scanner took off) less the exit still to pay (half the fees and slippage plus the basis buffer), in the constant
+  points the scanner spread them over its hold, never re-spread over the hours left (the exit is paid whenever the
+  pair leaves, so it never times the exit); the opening fills are sunk. Exit: that figure under `minNetAprPct`, or a sign
+  flip, for `exitAfterChecks` checks; then `cooldownHours`. Rotation: another window's `netAprPct` beats that held
+  figure by `rotate.minGainPts` for `rotate.forHours`
+  and `switchCostUsd` pays back within the hold at that gain on the new leg's sized `legUsd` (the switch cost is not
+  scaled); the new legs are sized on free margin plus `DecideInput.freedMarginUsd` (loop.ts measures it: the held
+  legs' margin plus that leg's P&L, per venue; absent = none); windows on venues that already hold the margin first;
+  at most `maxRotationsPerDay`. Every decision carries a one-line reason with the numbers; a `wait` is journaled only
+  when its reason or failure category changes.
+  - `qty` on an `enter` or `rotate` act is the base units a leg, whole common lots of both venues, and a maximum. The
+    executor never derives a size again from `legUsd` (which is `qty` at the price it was sized at). The contract
+    values an order at sz × max(limit, oracle) against the cap, so at order time the executor re-checks
+    `qty` × max(limit, oracle) ≤ the cap and, if a price move put it over, rounds `qty` down only, to whole common
+    lots, the same on both legs, before either leg is sent.
+  - On a `rotate`, loop.ts sets `HeldPair.since` to the rotation time: the time stop and the payback horizon start
+    again.
+  - The hours left for payback are clamped to the whole hold: a `since` in the future (clock skew) never adds hours.
+  - A veto or a failed act: loop.ts saves `skipAct(input, decision)` instead of `decision.counters`; on a NEAR AI veto,
+    `skipAct(input, decision, { vetoed: true })` holds that window out of entries and rotations for
+    `LOOP_RULES.vetoHoldHours` (6 h, `LoopCounters.vetoedUntil`) and starts its counts again, and the wait says so.
+    Saved counters without `vetoedUntil` read as none vetoed.
+- `veto.ts`: the NEAR AI veto before an enter or a rotate (the client behind `POST /policy/draft`). No key, no
+  answer in `vetoTimeoutMs`, or a transport/HTTP error = pass, journaled "no veto check" (a 401 or 403 says "NEAR AI
+  key rejected", so a bad key shows on every decision). The whole reply is read; one that is not exactly one readable
+  verdict (no JSON object, more than one, text around it other than ``` fences, a key given twice, not "pass" or
+  "veto" after trimming and lowercasing, a "veto" inside a "pass", cut off at its token limit) fails closed: a veto, "unreadable reply". A veto drops the window and writes a
+  `veto` entry.
 - `loop.ts` (serve): runs `decide` after each funding payment (the hourly check) and on each scan event, only with
   `GIMBAL_TRADE=1` and `strategy.auto`, one decision at a time under the per-desk trader lock, never while a rescue
   or an ADL unwind runs. It carries `act` out with the same open and close code as `pair-mainnet` (maker first),
@@ -975,6 +1004,9 @@ export interface MarketFunding extends FundingRate {   // the prices the rate ap
   fundingCapPerHour?: number;            // the venue's own per-market rate limits, per hour, from the same answer
   fundingFloorPerHour?: number;          // where it gives them; absent = unknown (the scanner then falls back to its
                                          // sourced caps and the same-rate rule for "At the cap")
+  rateReadAt?: number;                   // ms: the rate is from this earlier read, the venue's latest refresh of it
+                                         // having failed (Phoenix serves its last hourly overview up to 10 min); the
+                                         // scanner counts the row stale (its windows stale). Absent = read now
 }
 
 export interface WatchReader {           // a watch-only venue: public funding and marks, no account, no orders;

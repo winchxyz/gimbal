@@ -1,11 +1,48 @@
 // AccountsDeskSource: every open position on the desk's accounts is a leg; a failed account read is reported with
-// how long it took, and the others still come in.
+// how long it took, and the others still come in; a read held up by a venue's request budget gives up at its deadline.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { DeskState } from '@gimbal/shared';
+import { HostBudget, PHOENIX_BUDGET, readClass } from '../venues/http-budget.ts';
 import type { AccountState } from '../venues/venue.ts';
-import { AccountsDeskSource } from './sources.ts';
+import { ACCOUNT_READ_DEADLINE_MS, AccountsDeskSource } from './sources.ts';
+
+test('an account read past its deadline fails that venue for the tick: the snapshot is not held up', async () => {
+  // A Phoenix budget in a cool-down that a critical read would wait out (10 s), and a reader that never answers.
+  const budget = new HostBudget('phoenix-test', { ...PHOENIX_BUDGET, random: () => 0 });
+  await budget.run('book', async () => new Response('{}', { status: 429, headers: { 'retry-after': '10' } }));
+  const hl: AccountState = { venue: 'hyperliquid', address: '0xdesk', time: 1, equityUsd: 1, freeMarginUsd: 1, maintenanceMarginUsd: 0, positions: [] };
+  let sent = 0;
+  const source = new AccountsDeskSource({
+    deskId: 'alpha', owner: 'owner.near', contract: 'gimbal.near', readDeadlineMs: 150,
+    accounts: [
+      { reader: { id: 'hyperliquid', account: () => new Promise<AccountState>(() => {}) }, address: '0xdesk' },
+      {
+        reader: {
+          id: 'phoenix',
+          account: async () => {
+            await budget.run(readClass('account'), async () => {
+              sent++;
+              return new Response('{}', { status: 200 });
+            });
+            return hl;
+          },
+        },
+        address: 'Auth111',
+      },
+    ],
+  });
+  const t0 = Date.now();
+  const snap = await source.read();
+  assert.ok(Date.now() - t0 < 1_000, `${Date.now() - t0} ms`);
+  assert.deepEqual(snap.reads.map((r) => r.venue), ['hyperliquid', 'phoenix']);
+  assert.equal(snap.reads[0]!.error, 'hyperliquid account read gave up after 0.15 s');
+  // The budgeted read heard the deadline itself: skipped, nothing sent.
+  assert.match(snap.reads[1]!.error ?? '', /phoenix-test critical read skipped: rate-limit cool-down/);
+  assert.equal(sent, 0);
+  assert.ok(ACCOUNT_READ_DEADLINE_MS > 5_000 && ACCOUNT_READ_DEADLINE_MS < PHOENIX_BUDGET.maxWaitMs.critical);
+});
 
 test('accounts: open positions become legs, a flat one does not, a failed read is reported per venue', async () => {
   let t = 0;

@@ -5,11 +5,13 @@ import { Flash } from '../ui/Flash.tsx';
 import { cx } from '../ui/cx.ts';
 import { dotColor } from '../ui/dot.ts';
 import { ago, useNow } from '../ui/useNow.ts';
+import { useManualSend } from '../ui/useManualSend.ts';
 import type { Alert, Reached } from './alerts.ts';
 import { sparkline } from './chart.ts';
 import { depth, hours, pct, plain, usd } from './format.ts';
 import type { HistoryEntry } from './history.ts';
-import { isNoDesk, rowStatus, totalCosts, venuePair, type FailedScan, type Tab } from './model.ts';
+import { confirmText } from './manual.ts';
+import { isEnterable, isNoDesk, rowStatus, totalCosts, venuePair, type FailedScan, type Tab } from './model.ts';
 
 /** "2 s ago", ticking: a component of its own so the list does not re-render every second. */
 export function Ago({ at }: { at: number }) {
@@ -135,14 +137,50 @@ interface RowProps {
   selected: boolean;
   below: boolean;
   history: HistoryEntry | undefined;
+  /** The window the desk holds, if any: a row that could replace it offers Rotate. */
+  held: FundingWindow | null;
   onSelect(id: string): void;
 }
 
-export function Row({ w, selected, below, history, onSelect }: RowProps) {
+/**
+ * Rotate from the held window into this row's: a confirm naming both windows, then `POST /rotate`. The engine answers at
+ * once with ok or the reason a check refused; the answer stays next to the button. Offered on the selected row only, so
+ * the list stays a list.
+ */
+function RowRotate({ from, to }: { from: FundingWindow; to: FundingWindow }) {
+  const action = { kind: 'rotate', from: from.symbol, to: to.symbol, windowId: to.id } as const;
+  const send = useManualSend(action);
+  // The row is a button that selects it; nothing in here should do that again.
+  const stop = { onClick: (e: { stopPropagation(): void }) => e.stopPropagation(), onKeyDown: (e: { stopPropagation(): void }) => e.stopPropagation() };
+  return (
+    <span className="rot" {...stop}>
+      {send.asking ? (
+        <span role="alertdialog" aria-label="Confirm" className="ask">
+          <span className="ink">{confirmText(action)}</span>
+          <button type="button" className="btn quiet" onClick={send.cancel}>Cancel</button>
+          <button type="button" className="btn primary" onClick={send.confirm}>Rotate</button>
+        </span>
+      ) : (
+        <>
+          {send.sending ? <span className="g" role="status">Sending to the engine…</span> : null}
+          {send.outcome ? (
+            <span className={send.outcome.tone === 'sent' ? 'ink' : 'wt'} role="status">
+              {send.outcome.title}: {send.outcome.text}
+            </span>
+          ) : null}
+          <button type="button" className="btn" disabled={send.sending} onClick={send.ask}>Rotate to {to.symbol}</button>
+        </>
+      )}
+    </span>
+  );
+}
+
+export function Row({ w, selected, below, history, held, onSelect }: RowProps) {
   const status = rowStatus(w);
   const watch = !w.tradable;
   const costs = totalCosts(w);
   const seven = w.grossApr7dPct === null ? '—' : plain(w.grossApr7dPct);
+  const rotateFrom = selected && held !== null && !w.held && isEnterable(w) ? held : null;
   return (
     <div
       role="option"
@@ -185,6 +223,7 @@ export function Row({ w, selected, below, history, onSelect }: RowProps) {
           {watch ? null : <> · {plain(-costs)}<span className="desk-only"> costs</span></>} · {depth(w.depthUsd)}
         </span>
       </span>
+      {rotateFrom ? <RowRotate from={rotateFrom} to={w} /> : null}
     </div>
   );
 }

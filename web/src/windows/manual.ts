@@ -1,7 +1,7 @@
 // What the owner is told after Rotate or Close Position was sent to the engine (`POST /rotate`, `POST /close`).
 // The engine answers `{ ok: true }` or `{ ok: false, reason }` at once; the work itself shows up as Journal and Desk
 // events. Pure, so every wording is tested; useEngine.ts does the sending.
-import type { ActionResult } from '../stream/api.ts';
+import type { ActionResult, EngineApi } from '../stream/api.ts';
 import { capital, sentence } from './format.ts';
 
 /** `rotate` names the symbols for the notice and the target window's id for the request; `close.symbol` is the window being closed, when the page knows it. */
@@ -43,4 +43,19 @@ export function outcomeOf(action: ManualAction, answer: ActionResult | Error): O
     };
   }
   return { tone: 'refused', title: 'Not sent', text: `The engine refused it. ${reasonText(answer.reason)} ${unchanged(action)}` };
+}
+
+/** The question asked before a send, in the page's own words; the same for the Desk, the Windows list and the detail. */
+export function confirmText(action: ManualAction): string {
+  if (action.kind === 'rotate') return `Rotate ${action.from} to ${action.to}? Both ${action.from} legs close and ${action.to} opens.`;
+  return 'Close both legs now?';
+}
+
+/** Sends the action through `api` and says what came of it; it never throws, whatever the engine or the network does. */
+export async function sendVia(api: Pick<EngineApi, 'rotate' | 'close'>, action: ManualAction): Promise<Outcome> {
+  try {
+    return outcomeOf(action, action.kind === 'rotate' ? await api.rotate(action.windowId) : await api.close());
+  } catch (error) {
+    return outcomeOf(action, error instanceof Error ? error : new Error(String(error)));
+  }
 }

@@ -38,7 +38,8 @@ export function StatusLine({ screen }: { screen: ScreenId }) {
         {view.detail ? <span className="g"> {view.detail}</span> : null}
       </span>
       {view.tone === 'down' ? null : <span className="g3 checked">Checked {ago(desk.updatedAt, now)}</span>}
-      <StatusActions view={actions} className="end" />
+      {/* On Desk the decision line under this one carries Close, with its own confirm and answer. */}
+      <StatusActions view={actions} className="end" skip={screen === 'desk' ? ['close'] : undefined} />
     </div>
   );
 }

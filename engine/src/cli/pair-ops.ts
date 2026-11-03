@@ -28,6 +28,7 @@ import { PairTrader } from '../trade/pair.ts';
 import { PhoenixLeg, parseTraderSnapshot, phoenixTraderApi } from '../trade/phoenix-leg.ts';
 import type { HyperliquidReader } from '../venues/hyperliquid.ts';
 import type { PhoenixReader } from '../venues/phoenix.ts';
+import { phoenixGet } from '../venues/phoenix.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { PriceDeps, StoredPrice } from './pair-mainnet-lib.ts';
 import { PRICE_MARGIN_S, UsageError, ensureFresh, hlCross, oraclePxOf, phoenixCross, priceFitRefusal, priceLifeS, restingOrdersRefusal, settleResidual } from './pair-mainnet-lib.ts';
@@ -75,10 +76,9 @@ export async function hlInfo<T>(ctx: Pick<OpsCtx, 'hlUrl'>, body: Record<string,
   return (await res.json()) as T;
 }
 
-export async function phoenixGet<T>(ctx: Pick<OpsCtx, 'phoenixUrl'>, path: string): Promise<T> {
-  const res = await fetch(`${ctx.phoenixUrl}${path}`, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(20_000) });
-  if (!res.ok) throw new Error(`phoenix GET ${path}: HTTP ${res.status}`);
-  return (await res.json()) as T;
+/** Through the Phoenix host's budget (venues/phoenix.ts phoenixGet): critical, retried after a 429. */
+export function phoenixApiGet<T>(ctx: Pick<OpsCtx, 'phoenixUrl'>, path: string): Promise<T> {
+  return phoenixGet<T>(ctx.phoenixUrl, path, { timeoutMs: 20_000 });
 }
 
 export interface PhoenixMarketConfig extends SnapshotMarket {
@@ -89,7 +89,7 @@ export interface PhoenixMarketConfig extends SnapshotMarket {
 }
 
 export async function phoenixExchange(ctx: Pick<OpsCtx, 'phoenixUrl'>): Promise<{ mismatches: string[]; markets: PhoenixMarketConfig[] }> {
-  const snap = await phoenixGet<{ exchange: Record<string, unknown>; markets: PhoenixMarketConfig[] }>(ctx, '/v1/exchange/snapshot');
+  const snap = await phoenixApiGet<{ exchange: Record<string, unknown>; markets: PhoenixMarketConfig[] }>(ctx, '/v1/exchange/snapshot');
   return { mismatches: exchangeMismatches(snap.exchange), markets: snap.markets };
 }
 

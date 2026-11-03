@@ -2,7 +2,7 @@
 // design/screens/shared/data.js (the mockup's DOGE desk) and are made up. Every status the line can show has a
 // scenario (`?desk=`, listed with their meaning in source.ts). The short leg is 32.6% from liquidation in `level`,
 // 12.4% in `watch`, 7.6% in `rescuing` and 6.8% in `needs`.
-import type { DeskState, JournalEntry, Leg, Mode } from '@gimbal/shared';
+import type { DeskState, JournalEntry, Leg, Mode, StrategyDecision } from '@gimbal/shared';
 import { FAKE_OWNER, fakeContract, fakeTx } from './fake-explorer.ts';
 import type { DeskScenario } from './source.ts';
 import type { Health } from './store.ts';
@@ -118,6 +118,18 @@ function leg(
     lotSize: 1,
     unpriced,
   };
+}
+
+/**
+ * What the fake strategy loop says for a scenario, as the engine words a decision (reason with numbers). `at` is
+ * fixed by the caller, so "14 min ago" does not restart on every send; null while the desk is still loading.
+ */
+export function fakeDecision(at: number, scenario: DeskScenario): StrategyDecision | null {
+  if (scenario === 'loading') return null;
+  if (scenario === 'waiting') {
+    return { action: 'wait', reason: 'Nothing clears your 10 % minimum: LTC is best at 8.1 % net', windowId: 'LTC', heldId: null, at };
+  }
+  return { action: 'hold', reason: 'DOGE 14.8 % net, LTC is 4.2 points lower, rotation needs 3 points for 4 hours', windowId: 'DOGE', heldId: 'DOGE', at };
 }
 
 /** The engine's health event for a scenario: only `down` has a venue that does not answer. */
