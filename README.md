@@ -63,7 +63,7 @@ instead.
 | FunctionCall access keys | `docs/…` | the engine can call only operator methods, cannot attach deposits |
 | NEP-297 events | `contract/src/events.rs` | auditable on-chain journal |
 | OutLayer TEE price oracle | `contract/src/oracle.rs` | price band on every order |
-| NEAR AI Cloud (TEE) | `engine/src/ai/…` | drafts the desk policy from the owner's words (the owner signs it); vetoes trap windows (can only refuse); writes journal explanations. Never in the signing path |
+| NEAR AI Cloud (TEE) | `engine/src/ai/…` | drafts the desk policy from the owner's words (the owner signs it); refuses trap windows in the NEAR AI risk check (it can only refuse); writes journal explanations. Never in the signing path |
 
 <!-- fill: exact file paths once the code exists -->
 

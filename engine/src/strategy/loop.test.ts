@@ -187,7 +187,7 @@ test('decision events only when the decision changes; a wait is journaled only w
   assert.equal(typeof n.block, 'string');
 });
 
-test('enter: the veto (none: "no veto check"), then the open; journaled with numbers and tx; held saved and reloaded', async () => {
+test('enter: the veto (none: "no NEAR AI risk check"), then the open; journaled with numbers and tx; held saved and reloaded', async () => {
   const w = world();
   const store = tmpStore();
   const loop = makeLoop(w, store);
@@ -197,7 +197,7 @@ test('enter: the veto (none: "no veto check"), then the open; journaled with num
   const enter = journal(w).find((j) => j.kind === 'enter')!;
   assert.match(enter.summary, /enter sol-phoenix-hyperliquid, SOL short hyperliquid, long phoenix, at most 5 SOL \(500 USD\) a leg at 1.5x/);
   assert.equal(enter.numbers.qty, '5');
-  assert.match(String(enter.numbers.veto), /^no veto check on SOL: NEAR_AI_API_KEY is not set/);
+  assert.match(String(enter.numbers.veto), /^no NEAR AI risk check on SOL: NEAR_AI_API_KEY is not set/);
   assert.equal(enter.numbers.legUsd, 500);
   assert.equal(enter.tx[0]!.id, 'h1');
   assert.equal(loop.held?.windowId, 'sol-phoenix-hyperliquid');
@@ -224,7 +224,7 @@ test('a veto drops the window: journaled, nothing opened, held out by counters.v
   await loop.check();
   assert.equal(w.opens.length, 0);
   const v = journal(w).find((j) => j.kind === 'veto')!;
-  assert.match(v.summary, /NEAR AI vetoed SOL: delisting announced/);
+  assert.match(v.summary, /NEAR AI risk check refused SOL: delisting announced/);
   assert.equal(v.numbers.vetoModel, 'test-model');
   assert.match(String(v.numbers.vetoReply), /delisting announced/);
   // The verdict is put on the window and republished, so the web shows it.
@@ -238,7 +238,7 @@ test('a veto drops the window: journaled, nothing opened, held out by counters.v
   assert.equal(w.inputs.at(-1)!.counters.vetoedUntil['sol-phoenix-hyperliquid'], T0 + LOOP_RULES.vetoHoldHours * HOUR);
   assert.equal(w.inputs.at(-1)!.windows.find((x) => x.id === 'sol-phoenix-hyperliquid')!.veto, undefined);
   // A manual rotate into it is refused while it is held out.
-  assert.match((loop.rotate('sol-phoenix-hyperliquid') as { reason: string }).reason, /vetoed by NEAR AI: held out until/);
+  assert.match((loop.rotate('sol-phoenix-hyperliquid') as { reason: string }).reason, /refused by the NEAR AI risk check: held out until/);
   // A veto that does not answer in time is a pass.
   const w2 = world();
   const slow: VetoSource = { model: 'test-model', configured: true, complete: () => new Promise(() => {}) };
@@ -246,7 +246,7 @@ test('a veto drops the window: journaled, nothing opened, held out by counters.v
   w2.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
   await loop2.check();
   assert.equal(w2.opens.length, 1);
-  assert.match(String(journal(w2).find((j) => j.kind === 'enter')!.numbers.veto), /no veto check on SOL: no answer within/);
+  assert.match(String(journal(w2).find((j) => j.kind === 'enter')!.numbers.veto), /no NEAR AI risk check on SOL: no answer within/);
 });
 
 test('rotate: close the held pair, then open the new one; a refused open is journaled and the desk stays flat', async () => {

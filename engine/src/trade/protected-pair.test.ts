@@ -3,9 +3,9 @@
 // file is not a fresh start), the per-desk lock, the PairTrader's adopt/export/import, and the 25 % monitor.
 
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import type { DeskState, Leg as DeskLeg, VenueId } from '@gimbal/shared';
 import { newAdlState } from '../risk/adl.ts';
@@ -18,7 +18,7 @@ import type { PairTraderState } from './pair.ts';
 import type { OutgoingOrder, ProtectionCloseReport } from './protected-pair.ts';
 import { GuardedLeg, IN_FLIGHT_LIFE_MS, InFlightBook, ProtectedPair, inFlightUnexplained, startPlan } from './protected-pair.ts';
 import type { InFlightOrder, LoadedTraderState, TraderFileState } from './trader-state.ts';
-import { TRADER_STATE_VERSION, TraderStateStore, acquireTraderLock, lockHolder, parseTraderState, traderStateFile, traderStateJson } from './trader-state.ts';
+import { TRADER_STATE_VERSION, TraderStateStore, acquireTraderLock, lockHolder, lockStatus, lockText, parseLockText, parseTraderState, traderStateFile, traderStateJson } from './trader-state.ts';
 
 class Leg implements TradeLeg {
   readonly venue: VenueId;
@@ -559,8 +559,41 @@ test('the per-desk lock: one holder; a stale lock is taken over; lockHolder name
     writeFileSync(path, '999999999\n');
     assert.equal(lockHolder(path), null, 'its process is gone');
     const again = acquireTraderLock(path, { onExit: false });
-    assert.equal(readFileSync(path, 'utf8').trim(), String(process.pid));
+    assert.match(again.tookOver ?? '', /of pid 999999999 was stale \(its process \(pid 999999999\) is gone\) and is taken over/);
+    assert.equal(parseLockText(readFileSync(path, 'utf8'))?.pid, process.pid);
     again.release();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the lock at pid 1 (node in a container): a lock of this pid from before this process, or of another boot, is stale; a later or live one is held', () => {
+  const dir = tempDir();
+  try {
+    const path = join(dir, 'locks', 'trader.lock');
+    const me = { pid: 1, startedMs: 2_000_000, id: 'container-2', boot: 'boot-a' };
+    const nobody = () => false;
+    mkdirSync(dirname(path), { recursive: true });
+    // The container before this one was killed (OOM, SIGKILL): its lock still says pid 1.
+    writeFileSync(path, lockText({ pid: 1, startedMs: 1_000_000, id: 'container-1', boot: 'boot-a' }));
+    const lock = acquireTraderLock(path, { onExit: false, me, alive: nobody });
+    assert.match(lock.tookOver ?? '', /of pid 1 was stale \(it names pid 1, this process's own pid, started .* before this process started: that process is gone \(a restart\)\)/);
+    assert.deepEqual(parseLockText(readFileSync(path, 'utf8')), me);
+    assert.throws(() => acquireTraderLock(path, { onExit: false, me, alive: nobody }), /this process \(pid 1\) already trades this desk/);
+    lock.release();
+    assert.equal(existsSync(path), false);
+    // An older serve's lock: a bare pid 1, no start time.
+    writeFileSync(path, '1\n');
+    acquireTraderLock(path, { onExit: false, me, alive: nobody }).release();
+    // Another boot of the host: whatever its pid, its process is gone.
+    writeFileSync(path, lockText({ pid: 7, startedMs: 5_000_000, id: 'x', boot: 'boot-b' }));
+    assert.match(acquireTraderLock(path, { onExit: false, me, alive: () => true }).tookOver ?? '', /an earlier boot of this host/);
+    rmSync(path);
+    // Held: pid 1 that started after this process (another pid namespace on the same volume), and a live other pid.
+    assert.equal(lockStatus({ pid: 1, startedMs: 3_000_000, id: 'other-ns', boot: 'boot-a' }, me, nobody).kind, 'held');
+    writeFileSync(path, lockText({ pid: 42, startedMs: 1, id: 'pair-mainnet', boot: 'boot-a' }));
+    assert.throws(() => acquireTraderLock(path, { onExit: false, me, alive: (pid) => pid === 42 }), /another process \(pid 42\) trades this desk/);
+    assert.equal(lockStatus({ pid: 42, startedMs: 1, id: 'pair-mainnet', boot: null }, me, () => false).kind, 'stale');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
