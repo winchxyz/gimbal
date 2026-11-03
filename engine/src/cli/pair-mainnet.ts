@@ -153,6 +153,7 @@ async function main(argv: string[]): Promise<void> {
     const path = traderLockPath(envVar, 'mainnet', cfg.contractId, cfg.deskId);
     try {
       lock = acquireTraderLock(path);
+      if (lock.tookOver !== null) say(lock.tookOver);
     } catch (err) {
       const holder = lockHolder(path);
       throw new Error(`${holder === null ? 'the trader lock could not be taken' : `serve or another pair-mainnet --send (pid ${holder}) trades desk ${cfg.deskId}`}: ${errorMessage(err)}; stop it first, run this, then start serve again (it adopts the legs from the venues)`);

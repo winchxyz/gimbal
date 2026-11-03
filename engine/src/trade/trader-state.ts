@@ -19,12 +19,16 @@
 //
 // One trader per mode, contract and desk on this machine: it trades only with an exclusive lock file at a fixed
 // per-user path, which pair-mainnet --send takes too, for its whole run. A lock file that holds no pid (its holder is
-// between creating and writing it) counts as held.
+// between creating and writing it) counts as held. The lock names its process by pid, start time, a random id and the
+// host's boot id: in a container node runs as pid 1 every time, so after a kill the next container finds a lock of
+// "pid 1" on the volume. A lock of this pid that predates this process, or of a host boot that is over, is stale and
+// taken over (said in the TraderLock's `tookOver`); one of a live other process is held.
 //
 // The conventions (and userStateDir, the lock) follow the rescuer's state of PR #63 (rescue/state.ts, rescue/lock.ts);
 // TODO(dedupe): once both are merged, share userStateDir, the atomic save and the lock with those files.
 
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import type { Mode, TxRef, VenueId } from '@gimbal/shared';
@@ -420,21 +424,88 @@ function alive(pid: number): boolean {
   }
 }
 
+/** The host's boot id (Linux), or null: a lock of another boot is stale, whatever its pid. */
+function readBootId(): string | null {
+  try {
+    const id = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+    return /^[0-9a-f-]{8,64}$/i.test(id) ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+/** This process in a lock file: its pid, when it started (ms), a random id of its own and the host's boot id. */
+export interface LockOwner {
+  pid: number;
+  startedMs: number | null;
+  id: string | null;
+  boot: string | null;
+}
+
+/** This process, as its locks name it. */
+export const THIS_PROCESS: LockOwner = {
+  pid: process.pid,
+  startedMs: Math.floor(Date.now() - process.uptime() * 1000),
+  id: randomUUID(),
+  boot: readBootId(),
+};
+
+/** A lock file's text: `<pid>` then `started=<ms> id=<uuid> boot=<id|->` on a second line (an older lock is a bare pid). */
+export function lockText(owner: LockOwner): string {
+  return `${owner.pid}\nstarted=${owner.startedMs ?? '-'} id=${owner.id ?? '-'} boot=${owner.boot ?? '-'}\n`;
+}
+
+/** The owner a lock file names; null when it names none (empty, or cut short before its pid). */
+export function parseLockText(text: string): LockOwner | null {
+  const [first, second] = text.trim().split('\n');
+  if (first === undefined || !/^\d+$/.test(first.trim())) return null;
+  const field = (name: string): string | null => {
+    const m = new RegExp(`(?:^|\\s)${name}=(\\S+)`).exec(second ?? '');
+    return m === null || m[1] === '-' ? null : m[1]!;
+  };
+  const started = field('started');
+  return {
+    pid: Number(first.trim()),
+    startedMs: started !== null && /^\d+$/.test(started) ? Number(started) : null,
+    id: field('id'),
+    boot: field('boot'),
+  };
+}
+
+/**
+ * Whose a lock is, from `me`'s side: `mine` (this very process), `held` (a live other process, or one that cannot be
+ * told apart from one), or `stale` with why (its process is gone: safe to take over).
+ */
+export function lockStatus(owner: LockOwner, me: LockOwner = THIS_PROCESS, isAlive: (pid: number) => boolean = alive): { kind: 'mine' } | { kind: 'held'; why: string } | { kind: 'stale'; why: string } {
+  if (owner.id !== null && owner.id === me.id) return { kind: 'mine' };
+  if (owner.boot !== null && me.boot !== null && owner.boot !== me.boot) return { kind: 'stale', why: `it was taken during an earlier boot of this host (boot ${owner.boot}), so its process is gone` };
+  if (owner.pid === me.pid) {
+    // This pid is this process: the lock's process ran before it (a restart in a container, where node is pid 1 each
+    // time), unless it says it started after this one, which only another pid namespace on the same volume can.
+    if (owner.startedMs === null) return { kind: 'stale', why: `it names pid ${owner.pid}, this process's own pid, without a start time (an older serve's lock), so its process is gone` };
+    if (me.startedMs !== null && owner.startedMs < me.startedMs) {
+      return { kind: 'stale', why: `it names pid ${owner.pid}, this process's own pid, started ${new Date(owner.startedMs).toISOString()}, before this process started: that process is gone (a restart)` };
+    }
+    return { kind: 'held', why: `pid ${owner.pid} (this pid, in another pid namespace: it started at ${new Date(owner.startedMs).toISOString()}, after this process)` };
+  }
+  return isAlive(owner.pid) ? { kind: 'held', why: `pid ${owner.pid}` } : { kind: 'stale', why: `its process (pid ${owner.pid}) is gone` };
+}
+
 /**
  * Who holds the lock at `path`: a running process's pid; 'unknown' for a file with no pid in it (its holder is between
  * creating and writing it, or crashed there: held until removed by hand) or one that cannot be read; null when there
- * is no lock or its process is gone.
+ * is no lock or it is stale. This process's own lock names its pid.
  */
 export function lockHolder(path: string): number | 'unknown' | null {
   let text: string;
   try {
-    text = readFileSync(path, 'utf8').trim();
+    text = readFileSync(path, 'utf8');
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === 'ENOENT' ? null : 'unknown';
   }
-  if (!/^\d+$/.test(text)) return 'unknown';
-  const pid = Number(text);
-  return alive(pid) ? pid : null;
+  const owner = parseLockText(text);
+  if (owner === null) return 'unknown';
+  return lockStatus(owner).kind === 'stale' ? null : owner.pid;
 }
 
 /** The directory entry of a renamed file reaches the disk too (POSIX; Windows cannot open a directory for that). */
@@ -453,12 +524,16 @@ function syncDir(dir: string): void {
 
 export interface TraderLock {
   readonly path: string;
+  /** A stale lock this one replaced: whose it was and why it was stale (serve journals it); null when none was there. */
+  readonly tookOver: string | null;
   release(): void;
 }
 
-/** Takes the lock or throws why not; `onExit` false leaves removing it to the caller (tests). */
-export function acquireTraderLock(path: string, options: { onExit?: boolean } = {}): TraderLock {
+/** Takes the lock or throws why not; `onExit` false leaves removing it to the caller (tests); `me` is for tests. */
+export function acquireTraderLock(path: string, options: { onExit?: boolean; me?: LockOwner; alive?: (pid: number) => boolean } = {}): TraderLock {
+  const me = options.me ?? THIS_PROCESS;
   mkdirSync(dirname(path), { recursive: true });
+  let tookOver: string | null = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     let fd: number;
     try {
@@ -467,34 +542,37 @@ export function acquireTraderLock(path: string, options: { onExit?: boolean } = 
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw new Error(`the trader lock ${path} could not be made: ${(err as Error).message}`);
       let text = '';
       try {
-        text = readFileSync(path, 'utf8').trim();
+        text = readFileSync(path, 'utf8');
       } catch {
         continue;      // removed meanwhile: try again
       }
-      const pid = /^\d+$/.test(text) ? Number(text) : null;
-      if (pid === null) throw new Error(`the trader lock ${path} holds no pid (${JSON.stringify(text.slice(0, 40))}): another process may be taking it now, so it counts as held; if no serve or pair-mainnet runs for this desk, delete this file and start again (tools/mainnet/README.md, "Clear a lock file")`);
-      if (pid === process.pid || alive(pid)) throw new Error(`another process (pid ${pid}) trades this desk and holds ${path}: one trader per desk; stop it first`);
+      const owner = parseLockText(text);
+      if (owner === null) throw new Error(`the trader lock ${path} holds no pid (${JSON.stringify(text.trim().slice(0, 40))}): another process may be taking it now, so it counts as held; if no serve or pair-mainnet runs for this desk, delete this file and start again (tools/mainnet/README.md, "Clear a lock file")`);
+      const status = lockStatus(owner, me, options.alive);
+      if (status.kind === 'mine') throw new Error(`this process (pid ${me.pid}) already trades this desk and holds ${path}: one trader per desk`);
+      if (status.kind === 'held') throw new Error(`another process (${status.why}) trades this desk and holds ${path}: one trader per desk; stop it first`);
       try {
         unlinkSync(path);       // stale: its process is gone
+        tookOver = `the trader lock ${path} of pid ${owner.pid} was stale (${status.why}) and is taken over`;
       } catch {
         // Someone else took it over first; the next open says who.
       }
       continue;
     }
-    writeSync(fd, `${process.pid}\n`);
+    writeSync(fd, lockText(me));
     closeSync(fd);
     let released = false;
     const release = () => {
       if (released) return;
       released = true;
       try {
-        if (readFileSync(path, 'utf8').trim() === String(process.pid)) unlinkSync(path);
+        if (parseLockText(readFileSync(path, 'utf8'))?.id === me.id) unlinkSync(path);
       } catch {
         // Already gone.
       }
     };
     if (options.onExit !== false) process.once('exit', release);
-    return { path, release };
+    return { path, tookOver, release };
   }
   throw new Error(`the trader lock ${path} could not be taken`);
 }

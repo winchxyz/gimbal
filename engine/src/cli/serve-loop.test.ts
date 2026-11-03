@@ -125,7 +125,7 @@ test('replay: scan -> decide -> act (fake executor) -> journal and decision even
     assert.equal(state.decision?.action, 'enter');
     const enter = state.journal.find((j) => j.kind === 'enter')!;
     assert.match(enter.summary, new RegExp(`enter ${best.id}`));
-    assert.match(String(enter.numbers.veto), /^no veto check on .*: NEAR_AI_API_KEY is not set/);
+    assert.match(String(enter.numbers.veto), /^no NEAR AI risk check on .*: NEAR_AI_API_KEY is not set/);
     assert.equal(enter.tx[0]!.id, '0xopen');
 
     // The next scan: the scanner marks the held window, decide() holds.

@@ -50,8 +50,8 @@ export const LOOP_RULES = {
   cooldownHours: 6,           // after an exit, no new entry for this long
   maxHoldDays: 14,            // time stop
   maxRotationsPerDay: 2,
-  vetoTimeoutMs: 5_000,       // NEAR AI veto: no answer in time = pass, journaled as "no veto check"
-  vetoHoldHours: 6,           // a window NEAR AI vetoed is not entered or rotated into for this long
+  vetoTimeoutMs: 5_000,       // NEAR AI veto: no answer in time = pass, journaled as "no NEAR AI risk check"
+  vetoHoldHours: 6,           // a window NEAR AI risk check refused is not entered or rotated into for this long
 } as const;
 
 /** The pair the desk holds, as the loop sees it. */
@@ -176,11 +176,11 @@ function gate(w: FundingWindow, input: GateInput): GateFailure | null {
   const legUsd = input.strategy.legUsd;
   if (!w.tradable) return { code: 'watch', text: 'watch only' };
   const vetoLeft = vetoHoursLeft(input.counters, w.id, input.now);
-  if (vetoLeft !== null) return { code: 'vetoed', text: `vetoed by NEAR AI, held out for ${vetoLeft.toFixed(1)} h more` };
+  if (vetoLeft !== null) return { code: 'vetoed', text: `refused by the NEAR AI risk check, held out for ${vetoLeft.toFixed(1)} h more` };
   if (!isEnterable(w)) {
     if (w.refused !== undefined) return { code: 'refused', text: `refused ${w.refused.code}: ${w.refused.reason}` };
     if (w.stale) return { code: 'stale', text: 'its numbers are stale' };
-    if (w.veto?.verdict === 'veto') return { code: 'vetoed', text: `vetoed by NEAR AI${w.veto.reasons[0] === undefined ? '' : `: ${w.veto.reasons[0]}`}` };
+    if (w.veto?.verdict === 'veto') return { code: 'vetoed', text: `refused by the NEAR AI risk check${w.veto.reasons[0] === undefined ? '' : `: ${w.veto.reasons[0]}`}` };
     const failing = w.checks.find((c) => !c.ok);
     return { code: 'check', text: failing === undefined ? 'not enterable' : failing.text };
   }
@@ -513,7 +513,7 @@ function flatStatus(input: DecideInput, counters: LoopCounters): FlatStatus {
   const vetoed = above.find((w) => vetoHoursLeft(counters, w.id, input.now) !== null);
   const vetoNote = vetoed === undefined
     ? { line: '', key: '' }
-    : { line: `; ${vetoed.symbol} vetoed by NEAR AI, held out for ${vetoHoursLeft(counters, vetoed.id, input.now)!.toFixed(1)} h more`, key: `:veto:${vetoed.id}` };
+    : { line: `; ${vetoed.symbol} refused by the NEAR AI risk check, held out for ${vetoHoursLeft(counters, vetoed.id, input.now)!.toFixed(1)} h more`, key: `:veto:${vetoed.id}` };
   if (top !== null) {
     const n = Math.min(counters.aboveByWindow[top.id] ?? 0, LOOP_RULES.enterAfterChecks);
     return {
@@ -575,7 +575,7 @@ function afterAct(c: LoopCounters, act: Decision['act'], now: number): LoopCount
  * The counters to save when a decision's act is not carried out (the veto refused it, or it failed): this check's
  * counts stay, the act's own marks (the cooldown start, the rotation slot, the reset counts) do not. An exit that
  * failed is tried again on the next check, its bad checks still counted. `input` is the one decide() was given.
- * With `{ vetoed: true }` (NEAR AI vetoed the enter or rotate target) that window is held out for
+ * With `{ vetoed: true }` (NEAR AI risk check refused the enter or rotate target) that window is held out for
  * LOOP_RULES.vetoHoldHours and its counts start again, so the veto is not asked again on the next scan.
  */
 export function skipAct(input: DecideInput, d: Decision, options: { vetoed?: boolean } = {}): LoopCounters {

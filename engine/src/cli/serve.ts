@@ -283,8 +283,11 @@ const setup = await setupFromEnv(mode, envVar, log).catch((err: unknown) => {
 const liquidation = new LiquidationAlert();
 let lastDesk: DeskState | null = null;
 let monitorSeq = 0;
+/** Journal entries published before the server exists (the pair's start, a lock taken over): published once it does. */
+const earlyJournal: StreamEvent[] = [];
 const publish = (event: StreamEvent) => {
-  server?.publish(event);
+  if (server !== null) server.publish(event);
+  else if (event.type === 'journal') earlyJournal.push(event);
   if (event.type !== 'desk') return;
   lastDesk = event.data;
   const alert = liquidation.observe(event.data, clock.now());
@@ -410,6 +413,8 @@ if (values.once === true) {
   await risk?.adlRunning;
   await closingWatch?.current;
   for (const line of lastDesk === null ? ['monitor   no desk read'] : monitorLines(lastDesk)) log(line);
+  const unprotected = pair?.monitor?.() ?? null;
+  if (unprotected !== null) log(`monitor   ${unprotected}`);
   await risk?.stop();
   pair?.stop();
   contract?.prices.stop();
@@ -490,6 +495,7 @@ server = new EngineServer({
 const listening = await server.start(port, host);
 risk?.start();
 publishHealth();
+for (const event of earlyJournal.splice(0)) server.publish(event);
 for (const note of startNotes.splice(0)) startJournal(note.kind, note.summary);
 let intentsTimer: ReturnType<typeof setInterval> | undefined;
 if (mode !== 'replay') {
@@ -503,9 +509,12 @@ if (mode !== 'replay') {
   intentsTimer = setInterval(() => void probe(), 60_000);
   intentsTimer.unref();
 }
-// The monitor: the legs, their distance to liquidation and the net, every 30 min (read-only).
+// The monitor: the legs, their distance to liquidation and the net, every 30 min (read-only). While the pair's start
+// is not confirmed, also "pair unprotected: legs unknown since T, N tries" (journaled at most hourly, serve-pair.ts).
 const monitorTimer = setInterval(() => {
   for (const line of lastDesk === null ? ['monitor   no desk read yet'] : monitorLines(lastDesk)) log(line);
+  const unprotected = pair?.monitor?.() ?? null;
+  if (unprotected !== null) log(`monitor   ${unprotected}`);
 }, MONITOR_EVERY_MS);
 monitorTimer.unref();
 const shown = host.includes(':') ? `[${host}]` : host;
