@@ -3,7 +3,7 @@
 // serves at once, and the pair symbol as the policy spells it.
 
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
@@ -13,7 +13,7 @@ import type { Relayer } from '../relayer/relayer.ts';
 import type { LegOutcome, LegSide, PendingMakerOrder, TradeLeg } from '../trade/legs.ts';
 import { toQty } from '../trade/lots.ts';
 import { newAdlState } from '../risk/adl.ts';
-import { THIS_PROCESS, TRADER_STATE_VERSION, TraderStateStore, lockText, parseLockText, traderLockPath, traderStateFile } from '../trade/trader-state.ts';
+import { LOCK_STALE_MS, THIS_PROCESS, TRADER_STATE_VERSION, TraderStateStore, lockHeartbeats, lockText, parseLockText, traderLockPath, traderStateFile } from '../trade/trader-state.ts';
 import type { ContractSide } from './serve-contract.ts';
 import type { CarryInput, ServePairDeps, ServePairInput, SlotCarry } from './serve-pair.ts';
 import { liveLines, servePair } from './serve-pair.ts';
@@ -708,30 +708,47 @@ test('S1: a Phoenix snapshot behind the chain at start: alert only with the legs
   }
 });
 
-test('S1 (Railway): a stale lock of this pid from before this process (node is pid 1 in every container) is taken over and journaled', async () => {
+test('S1 (Railway): a lock of this pid (node is pid 1 in every container) waits while it beats, is taken over once its heartbeat is over 90 s old, and beats until stop()', async () => {
   const w = world('XLM', { GIMBAL_TRADE: '1' });
+  const beatAgo = (agoMs: number) => {
+    const t = new Date(Date.now() - agoMs);
+    utimesSync(lockPath(w), t, t);
+  };
   try {
     savedPair(w);
     w.hl.pos = toQty('-50');
     w.px.pos = toQty('50');
-    // What a killed container left on the volume: this pid, an earlier start, another process id.
+    // Another process with this pid: the container before this one, or one overlapping it. Beating: it waits.
     mkdirSync(dirname(lockPath(w)), { recursive: true });
     writeFileSync(lockPath(w), lockText({ pid: process.pid, startedMs: THIS_PROCESS.startedMs! - 60_000, id: 'killed-container', boot: THIS_PROCESS.boot }));
+    beatAgo(10_000);
+    const beats = lockHeartbeats();
     const events: StreamEvent[] = [];
     const p = await servePair(input(w, { publish: (e) => events.push(e) }));
-    assert.equal(p.unconfirmed!(), null);
+    assert.match(p.unconfirmed!() ?? '', /^legs unknown, start not confirmed: the trader lock is not held: another process \(.*its last heartbeat 10 s ago: taken over only after 90 s without one\)/);
+    assert.equal(p.pair === null, true, 'alert only meanwhile, nothing adopted');
+    assert.equal(parseLockText(readFileSync(lockPath(w), 'utf8'))?.id, 'killed-container', 'left alone while it beats');
+    assert.equal(lockHeartbeats(), beats);
+    // Its heartbeat stopped over 90 s ago (the container was killed): the next try takes it over.
+    beatAgo(LOCK_STALE_MS + 5_000);
+    assert.match(await p.retryStart!() ?? '', /^pair start confirmed after 1 failed attempt\(s\).*XLM trades$/);
     assert.equal(p.pair?.live, true, p.pair?.why ?? '');
     assert.equal(parseLockText(readFileSync(lockPath(w), 'utf8'))?.id, THIS_PROCESS.id, 'the lock is this process\'s now');
     const took = events.flatMap((e) => (e.type === 'journal' && e.data.numbers.stage === 'lock' ? [e.data.summary] : []));
     assert.equal(took.length, 1);
-    assert.match(took[0]!, new RegExp(`^pair: the trader lock .* of pid ${process.pid} was stale \\(it names pid ${process.pid}, this process's own pid, started .*before this process started: that process is gone \\(a restart\\)\\) and is taken over`));
+    assert.match(took[0]!, new RegExp(`^pair: the trader lock .* of pid ${process.pid} was stale \\(it names pid ${process.pid}, this process's own pid .*its last heartbeat 95 s ago, over 90 s: that process is gone\\) and is taken over`));
     assert.ok(w.lines.some((l) => /pair {6}the trader lock .* was stale/.test(l)));
+    assert.equal(lockHeartbeats(), beats + 1, 'the holder beats');
     p.stop();
-    // An older serve's lock (a bare pid, no start time) of this pid: stale too.
+    assert.equal(lockHeartbeats(), beats, 'stop() ends the heartbeat');
+    assert.equal(existsSync(lockPath(w)), false);
+    // An older serve's lock (a bare pid, no start time) of this pid, silent for over 90 s: stale too.
     writeFileSync(lockPath(w), `${process.pid}\n`);
+    beatAgo(LOCK_STALE_MS + 5_000);
     const q = await servePair(input(w));
     assert.equal(q.pair?.live, true, q.pair?.why ?? '');
     q.stop();
+    assert.equal(lockHeartbeats(), beats);
   } finally {
     rmSync(w.dir, { recursive: true, force: true });
   }

@@ -10,8 +10,10 @@ repo root are all it needs.
 - **One service, one replica, one volume.** Railway never runs two deployments of a service with a volume at the
   same time, and a service with a volume cannot have replicas. That matters: two engines on one desk would send
   every order twice. The per-desk trader lock is a file, so it only stops a second engine on the same disk. After an
-  OOM kill or a SIGKILL the lock stays on the volume naming pid 1; the next container (pid 1 again, started later)
-  takes it over and journals that, so a restart never sticks on its own lock.
+  OOM kill or a SIGKILL the lock stays on the volume naming pid 1. The running engine touches its lock every 30 s;
+  the next container (pid 1 again) waits about 90 s after the last touch before it takes the lock over (and journals
+  that), alert only meanwhile, so a restart never sticks on its own lock and an overlapping container never trades
+  next to a live one. Expect the pair to go live about 90 s to 3 min after a kill (the start retries back off up to 60 s).
   **While the Railway engine runs, run nothing that trades this desk anywhere else**: no local `serve` with
   `GIMBAL_TRADE=1`, no `pair-mainnet --send`, no `fund.mjs --send`. Read-only commands are fine.
 - **The volume is mounted on `/data`.** The image sets `XDG_STATE_HOME=/data` and `GIMBAL_STATE_DIR=/data/gimbal`:
