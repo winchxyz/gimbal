@@ -995,11 +995,15 @@ mainnet with `GIMBAL_RESCUE=1`:
   deposit, confirmed. Before anything is paid the engine checks a deposit could follow (a registered trader, a
   running desk, SOL for the fee), else the rescue is refused. A delivery that reaches the desk's USDC account with no
   deposit after it (serve stopped first, the deposit failed, or the rescue was parked and 1Click's SUCCESS is read
-  after a restart) is settled: the hold is released and the journal says, as an `owner:` line, how much was
-  delivered. It gives the `pair-mainnet fund-phoenix` command only when no deposit was ever about to be signed (the
-  hold saves a "credit started" marker first) and the wallet still holds the baseline plus the delivery; otherwise
-  it says the deposit may have run: check Phoenix margin and the desk's Solana transactions first. The engine never
-  deposits it late.
+  after a restart) is settled: the wallet is read (bounded to 10 s), then the hold is released and saved, then the
+  journal says, as an `owner:` line, how much was delivered. It gives the `pair-mainnet fund-phoenix` command only
+  when no deposit was ever about to be signed (the hold saves a "credit started" marker first; a deposit that throws
+  `NothingExecuted` counts as never signed), the release was saved, and the wallet still holds the saved baseline
+  plus the delivery. Otherwise it says why and to check first: the deposit may have run (check Phoenix margin and
+  the desk's Solana transactions), the wallet could not be read or did not answer in time, no baseline was saved,
+  the delivery is not on the wallet yet, or the state save failed (a restart reads the hold again). The engine never
+  deposits it late. Known limitation: a delivery that reaches the wallet after its rescue gave up is counted by the
+  next Phoenix rescue's credit as part of that one's delivery (the money is misattributed, never deposited twice).
 - Phoenix → Hyperliquid: one `sol_sign_rescue` transaction to the 1Click deposit address (Solana USDC for HyperCore
   USDC), the landing in the Hyperliquid ledger. The message is one of three, built and simulated unsigned before the
   hold is saved: spare USDC already on the desk's USDC account (the deposit owner's account and the

@@ -124,6 +124,8 @@ export const TRANSFER_TIMEOUT_MS = 10 * 60_000;
 export const WITHDRAW_TIMEOUT_MS = 15 * 60_000;
 /** The delivery not in the target's ledger after 1Click's SUCCESS within this is failed and held (Orderly: 1–2 min). */
 export const LANDING_TIMEOUT_MS = 5 * 60_000;
+/** How long the owner line waits for the desk wallet's balance (desk read plus one RPC call): it never holds up a stop. */
+export const WALLET_READ_MS = 10_000;
 /** A signed payment with no validity of its own is said to be usable this long (a 1Click deposit address lives 30 min). */
 export const SIGNED_USABLE_MS = 35 * 60_000;
 /** After a signed payment can no longer run, 1Click gets this long to index a deposit before PENDING_DEPOSIT is final. */
@@ -303,6 +305,8 @@ export interface RescuerOptions {
   transferTimeoutMs?: number;
   withdrawTimeoutMs?: number;
   landingTimeoutMs?: number;
+  /** The bound on the wallet read behind a credit venue's owner line (real time); default WALLET_READ_MS. */
+  walletReadMs?: number;
 }
 
 /** Ends the run of one step: the step it failed at and why. */
@@ -1003,10 +1007,12 @@ export class Rescuer {
     const to = plan.to;
     const credit = this.#o.credit?.[to];
     if (credit !== undefined && this.#stopping) {
-      // Signing the deposit now could be cut off by the exit: the USDC waits on the venue's wallet instead.
+      // Signing the deposit now could be cut off by the exit: the USDC waits on the venue's wallet instead. The wallet
+      // is read (bounded) before the hold is dropped, so an exit during the read leaves the hold, not a silent gap.
+      const read = await this.#walletRead(hold);
       this.#dropHold(hold);
-      this.#persist();
-      this.#ownerLine(await this.#waitingOnWallet(hold, 'the engine stopped before the deposit'), to);
+      const saved = this.#persist();
+      this.#ownerLine(this.#walletLine(hold, 'the engine stopped before the deposit', read, saved), to);
       throw new StepFailed('deposit', `the engine is stopping: 1Click delivered at least ${e8Text(q.minAmountOutE8)} USDC to the desk's ${to} wallet, not moved into margin (a deposit moves it)`);
     }
     if (credit !== undefined) {
@@ -1015,18 +1021,25 @@ export class Rescuer {
           deliveryTx, baseE6: hold.creditBaseE6, stopping: () => this.#stopping,
           beforeSign: () => {
             hold.creditStarted = true;
-            return this.#persist();
+            const ok = this.#persist();
+            // Not saved: the credit signs nothing, so the marker is not true either.
+            if (!ok) hold.creditStarted = false;
+            return ok;
           },
         });
         run.tx.push(...tx);
       } catch (err) {
-        // 1Click delivered: nothing more of this payment can move.
+        // 1Click delivered: nothing more of this payment can move. The wallet is read first (bounded), then the hold
+        // is dropped and saved, then the owner line says what the save allows.
+        const unknown = err instanceof OutcomeUnknown;
+        const read = unknown ? null : await this.#walletRead(hold);
         this.#dropHold(hold);
-        if (err instanceof OutcomeUnknown) this.#unknown ??= `the ${to} credit of rescue ${run.trigger.id}: ${errorMessage(err)}; reconcile it, then ${this.#clearHow()}`;
-        this.#persist();
-        if (!(err instanceof OutcomeUnknown)) {
+        if (unknown) this.#unknown ??= `the ${to} credit of rescue ${run.trigger.id}: ${errorMessage(err)}; reconcile it, then ${this.#clearHow()}`;
+        const saved = this.#persist();
+        if (read !== null) {
           const proved = err instanceof NothingExecuted;
-          this.#ownerLine(await this.#waitingOnWallet(hold, `the deposit ${hold.creditStarted && !proved ? 'failed once its signing began' : 'did not run'}: ${errorMessage(err)}`, proved), to);
+          const why = `the deposit ${hold.creditStarted && !proved ? 'failed once its signing began' : 'did not run'}: ${errorMessage(err)}`;
+          this.#ownerLine(this.#walletLine(hold, why, read, saved, proved), to);
         }
         throw new StepFailed('deposit', `1Click delivered, but moving it into ${to} margin failed: ${errorMessage(err)}`);
       }
@@ -1325,11 +1338,15 @@ export class Rescuer {
           settled = `rescue ${d.rescueId}'s ${entry.usd.toFixed(2)} USD landed on ${d.venue} late (after its rescue was failed)`;
         } else if (this.#o.credit?.[d.venue] !== undefined) {
           // A venue with a credit (Phoenix): 1Click delivered to the desk's wallet there and the rescue that paid it
-          // stopped, timed out or was cut off by a restart before its deposit. Settled as waiting on that wallet, with
-          // the owner's command: never deposited late from here.
-          const line = await this.#waitingOnWallet(d, '1Click says SUCCESS and no deposit of it was made by this run');
+          // stopped, timed out or was cut off by a restart before its deposit. Settled here, never deposited late:
+          // the wallet is read (bounded), the hold dropped and saved, then the owner line says what the save allows.
+          const read = await this.#walletRead(d);
+          this.#dropHold(d);
+          const saved = this.#persist();
+          const line = this.#walletLine(d, '1Click says SUCCESS and no deposit of it was made by this run', read, saved);
           this.#log(line);
-          settled = line;
+          this.#journalLine(`${line}; transfers are no longer held by it`, d.venue);
+          continue;
         }
       } else if (SETTLED_STATUSES.includes(s.status)) {
         settled = `rescue ${d.rescueId}'s transfer ended ${s.status} at 1Click: refunded, nothing landed`
@@ -1516,27 +1533,54 @@ export class Rescuer {
     });
   }
 
+  /** The desk wallet's balance on a credit venue, read with a real-time bound; null with the reason when not read. */
+  async #walletRead(d: DepositHold): Promise<{ held: bigint | null; problem: string | null }> {
+    const credit = this.#o.credit?.[d.venue];
+    if (credit?.baseline === undefined) return { held: null, problem: 'no wallet read is wired' };
+    const ms = this.#o.walletReadMs ?? WALLET_READ_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`no answer in ${ms / 1000} s`)), ms);
+      timer.unref?.();
+    });
+    try {
+      return { held: await Promise.race([credit.baseline(), late]), problem: null };
+    } catch (err) {
+      return { held: null, problem: errorMessage(err) };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   /**
    * The owner's line for a delivery to a venue's wallet that this run did not see moved into margin. The deposit
    * command is given only when no deposit was ever about to be signed (`creditStarted` unset, or `proved`: the
-   * deposit is shown to have run nothing) and the wallet still holds the delivery above its baseline; otherwise the
-   * deposit may have run, and depositing again would move other USDC: the owner checks first.
+   * deposit is shown to have run nothing), the hold's drop was saved (else a restart settles it again), and the wallet
+   * still holds the delivery above its saved baseline. Otherwise the owner checks first.
    */
-  async #waitingOnWallet(d: DepositHold, why: string, proved = false): Promise<string> {
-    const credit = this.#o.credit?.[d.venue];
+  #walletLine(d: DepositHold, why: string, read: { held: bigint | null; problem: string | null }, saved: boolean, proved = false): string {
     const lead = `owner: rescue ${d.rescueId}'s delivery of at least ${e8Text(d.q.minAmountOutE8)} USDC to the desk's ${d.venue} wallet is not seen in margin (${why})`;
-    let held: bigint | null = null;
-    try {
-      held = (await credit?.baseline?.()) ?? null;
-    } catch {
-      held = null;
+    const margin = `${d.venue} margin`;
+    if (d.creditStarted && !proved) {
+      return `${lead}: the deposit may have run (it was about to be signed): check ${margin} (and the desk's Solana transactions) before depositing`;
     }
-    const delivered = d.creditBaseE6 !== null && held !== null && held >= d.creditBaseE6 + d.q.minAmountOut;
-    if ((d.creditStarted && !proved) || !delivered) {
-      const wallet = held === null ? 'the wallet could not be read' : `the wallet holds ${usdc(held)} USDC${d.creditBaseE6 === null ? '' : `, ${usdc(d.creditBaseE6)} before the payment`}`;
-      return `${lead}: the deposit may have run (${d.creditStarted ? 'it was about to be signed' : wallet}): check ${d.venue} margin (and the desk's Solana transactions) before depositing`;
+    if (!saved) {
+      return `${lead}: the engine deposited nothing, but the rescuer state could not be saved (${this.#saveProblem ?? 'unknown'}), so a restart reads this hold again: `
+        + `check the wallet, then ${margin}, before depositing`;
     }
-    const how = credit?.manual?.(d.q.minAmountOut) ?? `deposit it into ${d.venue} margin by hand`;
+    const { held } = read;
+    if (held === null) {
+      return `${lead}: the engine deposited nothing; the wallet could not be read (${read.problem ?? 'unknown'}): check the wallet, then ${margin}, before depositing`;
+    }
+    if (d.creditBaseE6 === null) {
+      return `${lead}: the engine deposited nothing; no baseline was saved with this hold, so the delivery cannot be told from other USDC on the wallet `
+        + `(it holds ${usdc(held)} USDC): check the wallet, then ${margin}, before depositing`;
+    }
+    if (held < d.creditBaseE6 + d.q.minAmountOut) {
+      return `${lead}: the delivery is not on the wallet yet (it holds ${usdc(held)} USDC, ${usdc(d.creditBaseE6)} before the payment) and the engine deposited nothing: `
+        + `check the wallet, then ${margin}, before depositing`;
+    }
+    const how = this.#o.credit?.[d.venue]?.manual?.(d.q.minAmountOut) ?? `deposit it into ${margin} by hand`;
     return `${lead}: it waits on the wallet, not in margin; to move it: ${how}`;
   }
 

@@ -1539,7 +1539,7 @@ test('state: a Phoenix delivery parked before its credit (stopped while 1Click w
     if (delivered) {
       assert.match(line, /it waits on the wallet, not in margin; to move it: pair-mainnet fund-phoenix .* --send/);
     } else {
-      assert.match(line, /the deposit may have run \(the wallet holds .* USDC, 0.40 before the payment\): check phoenix margin \(and the desk's Solana transactions\) before depositing/);
+      assert.match(line, /the delivery is not on the wallet yet \(it holds .* USDC, 0.40 before the payment\) and the engine deposited nothing: check the wallet, then phoenix margin, before depositing/);
       assert.doesNotMatch(line, /fund-phoenix/);
     }
     assert.ok(s.w.logs.some((l) => /^owner: rescue a's delivery/.test(l)));
@@ -1614,4 +1614,167 @@ test('the credit gets the baseline read before the hold; a stop during that read
   assert.equal(t.signed.length, 0, 'nothing signed');
   assert.equal(t.w.rescuer.held, null, 'no hold opened');
   assert.match(JSON.stringify(t.w.failures.at(-1)), /the engine is stopping: nothing was signed/);
+});
+
+// ---- the owner line's other branches: the stop before the credit, a proved deposit, no or no readable baseline, a
+// failed save ----
+
+/** A store whose saves fail while `fail` is set. */
+class FlakyDisk extends RescueStateStore {
+  fail = false;
+  override save(snapshot: Parameters<RescueStateStore['save']>[0]): void {
+    if (this.fail) throw new Error('ENOSPC: no space left on device');
+    super.save(snapshot);
+  }
+}
+
+/** A rescue into Phoenix parked while 1Click is PROCESSING (serve stopped), with `phoenix` as the credit; the state on `store`. */
+async function parkedPhoenix(store: RescueStateStore, phoenix: CreditPort) {
+  let stopped: Promise<void> | null = null;
+  const s = synthetic({
+    store, fresh: true, seedCap: false, noLanding: true, reducer: true, legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 0 },
+    send: async () => { stopped = s.w.rescuer.stop(); }, status: () => ({ status: 'PROCESSING', body: null }),
+  });
+  s.w.restart({ store, fresh: true, credit: { phoenix } });
+  await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
+  await stopped;
+  assert.match(s.w.rescuer.held ?? '', /rescue a/);
+  return { s, q: s.signed[0]! };
+}
+
+/** The restart, SUCCESS at 1Click, and the next pass: the owner line of rescue a. */
+async function settleAfterRestart(s: Synthetic, store: RescueStateStore, phoenix: CreditPort, over: Partial<RescuerOptions> = {}): Promise<string> {
+  s.status = () => ({ status: 'SUCCESS', body: null });
+  s.w.restart({ store, credit: { phoenix }, ...over });
+  await run(s.w, trigger({ id: 'b', venue: 'hyperliquid', amountUsd: 20 }));
+  const line = ownerLine(s.w);
+  assert.ok(line !== undefined, s.w.journal().join('\n'));
+  assert.doesNotMatch(line, /fund-phoenix/, 'no deposit command');
+  return line;
+}
+
+test('the stop before the credit: the wallet is read before the hold is dropped; the command when the delivery is there, "check first" when the read times out', async () => {
+  for (const hangs of [false, true]) {
+    const store = tmpStore();
+    const wallet = { e6: 300_000n };
+    let reads = 0;
+    const phoenix: CreditPort = {
+      baseline: async () => {
+        reads++;
+        // The first read is the baseline before the hold; a later one may hang.
+        return hangs && reads > 1 ? new Promise<never>(() => {}) : wallet.e6;
+      },
+      manual: (e6) => `pair-mainnet fund-phoenix ${Number(e6) / 1e6} --send`,
+      credit: async () => { throw new Error('never called while stopping'); },
+    };
+    let heldWhileRead = false;
+    const s = synthetic({
+      store, fresh: true, seedCap: false, legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 0 },
+      status: () => {
+        // 1Click delivers, and serve begins to stop before the credit.
+        wallet.e6 = 300_000n + s.signed[0]!.minAmountOut;
+        void s.w.rescuer.stop();
+        return { status: 'SUCCESS', body: null };
+      },
+    });
+    s.w.restart({
+      store, fresh: true, walletReadMs: 20,
+      credit: { phoenix: { ...phoenix, baseline: async () => { if (reads >= 1) heldWhileRead = onDisk(store).holds.length === 1; return phoenix.baseline!(); } } },
+    });
+    await run(s.w, trigger({ id: 'a', venue: 'phoenix', amountUsd: 20 }));
+    assert.ok(heldWhileRead, 'the hold is still saved while the wallet is read');
+    assert.equal(s.w.rescuer.held, null);
+    assert.equal(onDisk(store).holds.length, 0, 'then dropped and saved');
+    assert.match(JSON.stringify(s.w.failures.at(-1)), /the engine is stopping: 1Click delivered/);
+    const line = ownerLine(s.w) ?? '';
+    if (hangs) {
+      assert.match(line, /\(the engine stopped before the deposit\): the engine deposited nothing; the wallet could not be read \(no answer in 0.02 s\): check the wallet, then phoenix margin, before depositing/);
+      assert.doesNotMatch(line, /fund-phoenix/);
+    } else {
+      assert.match(line, /\(the engine stopped before the deposit\): it waits on the wallet, not in margin; to move it: pair-mainnet fund-phoenix/);
+    }
+  }
+});
+
+test('a credit whose deposit is proved to have run nothing (NothingExecuted) after the marker: the command, as if never signed', async () => {
+  const wallet = { e6: 0n };
+  const s = synthetic({ legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 0 } });
+  s.w.restart({
+    credit: {
+      phoenix: {
+        baseline: async () => wallet.e6, manual: () => 'run the deposit by hand',
+        credit: async (e6, _r, o) => {
+          wallet.e6 = e6;
+          assert.equal(o?.beforeSign?.(), true);
+          throw new NothingExecuted('solana', 'the deposit failed on chain');
+        },
+      },
+    },
+  });
+  await run(s.w, trigger({ venue: 'phoenix', amountUsd: 10 }));
+  const line = s.w.journal().find((j) => /^owner: rescue rescue-1's delivery/.test(j)) ?? '';
+  assert.match(line, /\(the deposit did not run: solana: nothing executed: the deposit failed on chain\): it waits on the wallet, not in margin; to move it: run the deposit by hand/);
+});
+
+test('state: no baseline saved with the hold, or a wallet read that throws: "check first", never the command', async () => {
+  // No baseline: the credit at payment time had no wallet read.
+  const store = tmpStore();
+  const { s, q } = await parkedPhoenix(store, { credit: async () => ({ tx: [] }) });
+  assert.equal(onDisk(store).holds[0]!.creditBaseE6, null);
+  const line = await settleAfterRestart(s, store, { baseline: async () => q.minAmountOut * 2n, manual: () => 'pair-mainnet fund-phoenix x --send', credit: async () => ({ tx: [] }) });
+  assert.match(line, /the engine deposited nothing; no baseline was saved with this hold, so the delivery cannot be told from other USDC on the wallet \(it holds .* USDC\): check the wallet, then phoenix margin, before depositing/);
+  assert.doesNotMatch(s.w.rescuer.held ?? '', /rescue a/, 'settled');
+
+  const store2 = tmpStore();
+  const wallet = { e6: 0n };
+  const p2 = await parkedPhoenix(store2, phoenixWallet(wallet, []));
+  const line2 = await settleAfterRestart(p2.s, store2, { baseline: async () => { throw new Error('solana rpc: 503'); }, manual: () => 'pair-mainnet fund-phoenix x --send', credit: async () => ({ tx: [] }) });
+  assert.match(line2, /the engine deposited nothing; the wallet could not be read \(solana rpc: 503\): check the wallet, then phoenix margin, before depositing/);
+});
+
+test('state: a SUCCESS settle whose wallet read hangs is bounded: "check first", and the next pass goes on', async () => {
+  const store = tmpStore();
+  const wallet = { e6: 0n };
+  const { s } = await parkedPhoenix(store, phoenixWallet(wallet, []));
+  const line = await settleAfterRestart(s, store, { baseline: () => new Promise<never>(() => {}), manual: () => 'pair-mainnet fund-phoenix x --send', credit: async () => ({ tx: [] }) }, { walletReadMs: 20 });
+  assert.match(line, /the wallet could not be read \(no answer in 0.02 s\)/);
+  assert.ok(s.w.ended.some(([id]) => id === 'b'), 'the rescue after it ran');
+});
+
+test('state: a drop whose save fails gives no command (a restart reads the hold again), and says the save failed', async () => {
+  const store = new FlakyDisk(tmpPath(), ID);
+  const wallet = { e6: 400_000n };
+  const { s, q } = await parkedPhoenix(store, phoenixWallet(wallet, []));
+  wallet.e6 = 400_000n + q.minAmountOut;
+  store.fail = true;
+  const line = await settleAfterRestart(s, store, phoenixWallet(wallet, []));
+  assert.match(line, /the engine deposited nothing, but the rescuer state could not be saved \(.*ENOSPC.*\), so a restart reads this hold again: check the wallet, then phoenix margin, before depositing/);
+  store.fail = false;
+  assert.equal(onDisk(store).holds.length, 1, 'still on disk');
+});
+
+test('a beforeSign whose save fails leaves the marker false: the owner line says the deposit did not run', async () => {
+  const store = new FlakyDisk(tmpPath(), ID);
+  const wallet = { e6: 0n };
+  let marked: boolean | undefined;
+  const s = synthetic({ store, fresh: true, seedCap: false, legs: [leg('phoenix', 200), leg('hyperliquid', 200)], freeMargin: { hyperliquid: 0 } });
+  s.w.restart({
+    store, fresh: true,
+    credit: {
+      phoenix: {
+        baseline: async () => wallet.e6, manual: () => 'run the deposit by hand',
+        credit: async (e6, _r, o) => {
+          wallet.e6 = e6;
+          store.fail = true;
+          marked = o?.beforeSign?.();
+          store.fail = false;
+          throw new Error('the rescuer state could not be saved before the deposit: nothing was deposited');
+        },
+      },
+    },
+  });
+  await run(s.w, trigger({ venue: 'phoenix', amountUsd: 10 }));
+  assert.equal(marked, false);
+  const line = s.w.journal().find((j) => /^owner: rescue rescue-1's delivery/.test(j)) ?? '';
+  assert.match(line, /\(the deposit did not run: .*\): it waits on the wallet, not in margin; to move it: run the deposit by hand/);
 });
