@@ -6,6 +6,7 @@ import type { Mode } from '@gimbal/shared';
 import { NearContractClient } from '../contract/near-client.ts';
 import { NearApiTransport } from '../contract/near-transport.ts';
 import { checkContractNetwork, contractEnv } from '../cli/serve-contract.ts';
+import { ConfigError } from '../cli/start-errors.ts';
 import { HL_MAINNET_URL, HL_TESTNET_URL } from '../venues/hyperliquid.ts';
 import { ORDERLY_ENDPOINTS } from '../venues/orderly-http.ts';
 import { publicIpLookup } from './public-ip.ts';
@@ -13,15 +14,15 @@ import { SetupService } from './service.ts';
 
 export async function setupFromEnv(mode: Mode, env: (name: string) => string | undefined, log: (line: string) => void): Promise<SetupService | null> {
   if (env('GIMBAL_SETUP') !== '1') return null;
-  if (mode === 'replay') throw new Error('GIMBAL_SETUP=1 needs GIMBAL_MODE testnet or mainnet: replay signs nothing');
+  if (mode === 'replay') throw new ConfigError('GIMBAL_SETUP=1 needs GIMBAL_MODE testnet or mainnet: replay signs nothing');
   const cfg = contractEnv(env, mode, { signing: true });
-  if (cfg === null) throw new Error('GIMBAL_SETUP=1 needs GIMBAL_CONTRACT_ID and the operator key');
+  if (cfg === null) throw new ConfigError('GIMBAL_SETUP=1 needs GIMBAL_CONTRACT_ID and the operator key');
   const network = cfg.network;
   const hlUrl = (env('HL_API_URL') ?? (network === 'mainnet' ? HL_MAINNET_URL : HL_TESTNET_URL)).replace(/\/+$/, '').replace(/\/info$/, '');
   const orderlyUrl = (env('ORDERLY_API_URL') ?? ORDERLY_ENDPOINTS[network].api).replace(/\/+$/, '');
   // A testnet desk must never be set up against a mainnet venue, nor the other way round.
   for (const [name, url] of [['HL_API_URL', hlUrl], ['ORDERLY_API_URL', orderlyUrl]] as const) {
-    if (/testnet/.test(url) !== (network === 'testnet')) throw new Error(`${name} ${url} is not a ${network} URL`);
+    if (/testnet/.test(url) !== (network === 'testnet')) throw new ConfigError(`${name} ${url} is not a ${network} URL`);
   }
   const transport = new NearApiTransport({
     network, accountId: cfg.accountId!, privateKey: cfg.privateKey!, ...(cfg.rpcUrl === undefined ? {} : { rpcUrl: cfg.rpcUrl }),

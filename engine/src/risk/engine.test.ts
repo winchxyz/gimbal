@@ -167,19 +167,19 @@ test('stress is refused on mainnet, and with no leg to stress', async () => {
 });
 
 /** An engine on a clock the test moves, with a rescuer that records the triggers. */
-function rig(options: { adl?: AdlWatch; desk?: Desk; rescuer?: (x: RescueTrigger) => void; source?: DeskSource; running?: () => string | null } = {}) {
+function rig(options: { adl?: AdlWatch; desk?: Desk; rescuer?: (x: RescueTrigger) => void | boolean; source?: DeskSource; running?: () => string | null } = {}) {
   let t = 1_000_000;
   const events: StreamEvent[] = [];
   const triggers: RescueTrigger[] = [];
   const desk = options.desk ?? new Desk();
   const risk = new RiskEngine({
     mode: 'testnet', source: options.source ?? desk, strategy: () => DEFAULT_STRATEGY, health: new VenueHealth(), publish: (e) => events.push(e),
-    clock: { now: () => t }, rescuer: (x) => { triggers.push(x); options.rescuer?.(x); }, ...(options.adl !== undefined ? { adl: options.adl } : {}),
+    clock: { now: () => t }, rescuer: (x) => { triggers.push(x); return options.rescuer?.(x); }, ...(options.adl !== undefined ? { adl: options.adl } : {}),
     ...(options.running !== undefined ? { rescuerRunning: options.running } : {}),
   });
   const journal = () => events.filter((e) => e.type === 'journal').map((e) => e.data as JournalEntry);
   const health = () => events.filter((e) => e.type === 'health').map((e) => e.data as HealthMap);
-  return { risk, desk, triggers, journal, health, now: () => t, advance: (ms: number) => { t += ms; } };
+  return { risk, desk, triggers, events, journal, health, now: () => t, advance: (ms: number) => { t += ms; } };
 }
 
 async function within<T>(p: Promise<T>, ms = 1_000): Promise<T | 'hung'> {
@@ -324,6 +324,23 @@ test('a rescuer that throws does not end the tick: the ADL check still starts, t
   await risk.tick();
   assert.equal(triggers.length, 2);
   assert.equal(triggers[1]!.attempt, 1);
+});
+
+test('a rescuer that does not take the trigger (no live rescuer yet): it is published at detect, as without one; a taken one is not', async () => {
+  let take = false;
+  const desk = new Desk();
+  desk.mark = 2200;
+  const r = rig({ desk, rescuer: () => take, running: () => null });
+  const detected = () => r.events.filter((e) => e.type === 'rescue').map((e) => (e.data as RescueProgress).step);
+  await r.risk.tick();
+  assert.equal(r.triggers.length, 1);
+  assert.deepEqual(detected(), ['detect'], 'not taken: the owner sees it at detect');
+  // The live rescuer runs now: the trigger (lapsed, no end reported) fires again and is taken; it reports its own steps.
+  take = true;
+  r.advance(RESCUE_LAPSE_MS + RESCUE_RETRY_MS);
+  await r.risk.tick();
+  assert.equal(r.triggers.length, 2);
+  assert.deepEqual(detected(), ['detect'], 'no detect progress for a taken trigger');
 });
 
 test('stop() is final: no read, no ADL check and no stress after it', async () => {

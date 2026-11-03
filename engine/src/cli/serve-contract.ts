@@ -17,6 +17,7 @@ import { NearViewTransport } from '../contract/near-transport.ts';
 import { ContractPriceCache } from '../contract/prices.ts';
 import type { DeskView } from '../contract/types.ts';
 import { parseContractPolicy } from '../scanner/config.ts';
+import { ConfigError } from './start-errors.ts';
 
 export interface ContractEnv {
   contractId: string;
@@ -46,18 +47,18 @@ export function contractEnv(env: (name: string) => string | undefined, mode: Mod
     options.signing === true && accountId === undefined ? 'OWNER_ACCOUNT_ID (or OPERATOR_ACCOUNT_ID)' : null,
     options.signing === true && privateKey === undefined ? 'OPERATOR_PRIVATE_KEY' : null,
   ].filter((m): m is string => m !== null);
-  if (missing.length > 0) throw new Error(`GIMBAL_CONTRACT_ID is set, so these are needed too: ${missing.join(', ')}`);
+  if (missing.length > 0) throw new ConfigError(`GIMBAL_CONTRACT_ID is set, so these are needed too: ${missing.join(', ')}`);
   const nearNetwork = env('NEAR_NETWORK');
   if (nearNetwork !== undefined && nearNetwork !== 'mainnet' && nearNetwork !== 'testnet') {
-    throw new Error(`NEAR_NETWORK must be mainnet or testnet, got ${nearNetwork}`);
+    throw new ConfigError(`NEAR_NETWORK must be mainnet or testnet, got ${nearNetwork}`);
   }
   if (nearNetwork !== undefined && nearNetwork !== mode) {
-    throw new Error(`NEAR_NETWORK is ${nearNetwork} but the engine runs in ${mode} mode (GIMBAL_MODE): a ${nearNetwork} contract would sign for ${mode} venues. Set both to the same network.`);
+    throw new ConfigError(`NEAR_NETWORK is ${nearNetwork} but the engine runs in ${mode} mode (GIMBAL_MODE): a ${nearNetwork} contract would sign for ${mode} venues. Set both to the same network.`);
   }
   const network = mode as NearNetwork;
   const suffix = /\.(near|testnet)$/.exec(contractId)?.[1];
   if (suffix !== undefined && (suffix === 'near' ? 'mainnet' : 'testnet') !== network) {
-    throw new Error(`GIMBAL_CONTRACT_ID ${contractId} is a ${suffix === 'near' ? 'mainnet' : 'testnet'} account, but the engine runs on ${network}`);
+    throw new ConfigError(`GIMBAL_CONTRACT_ID ${contractId} is a ${suffix === 'near' ? 'mainnet' : 'testnet'} account, but the engine runs on ${network}`);
   }
   return {
     contractId, deskId: deskId!, network, rpcUrl: env('NEAR_RPC_URL'), accountId,
@@ -68,8 +69,8 @@ export function contractEnv(env: (name: string) => string | undefined, mode: Mod
 /** Refuses a contract whose config().network is not the engine's network (or does not say). */
 export function checkContractNetwork(contractId: string, config: { network?: unknown }, network: NearNetwork): void {
   const said = typeof config.network === 'string' ? config.network.toLowerCase() : null;
-  if (said === null) throw new Error(`${contractId}: config() names no network, so it cannot be checked against ${network}; not starting`);
-  if (said !== network) throw new Error(`${contractId} is a ${said} contract (config().network), but the engine runs on ${network}; not starting`);
+  if (said === null) throw new ConfigError(`${contractId}: config() names no network, so it cannot be checked against ${network}; not starting`);
+  if (said !== network) throw new ConfigError(`${contractId} is a ${said} contract (config().network), but the engine runs on ${network}; not starting`);
 }
 
 export interface ContractSide {
@@ -95,12 +96,12 @@ export async function connectContract(cfg: ContractEnv, options: {
   });
   checkContractNetwork(cfg.contractId, await client.config(), cfg.network);
   const desk = await client.getDesk(cfg.deskId);
-  if (desk === null) throw new Error(`${cfg.contractId} has no desk ${cfg.deskId}`);
+  if (desk === null) throw new ConfigError(`${cfg.contractId} has no desk ${cfg.deskId}`);
   let policy: ContractPolicy;
   try {
     policy = parseContractPolicy(desk.policy);
   } catch (err) {
-    throw new Error(`get_desk(${cfg.deskId}).policy: ${(err as Error).message}`);
+    throw new ConfigError(`get_desk(${cfg.deskId}).policy: ${(err as Error).message}`);
   }
   const prices = new ContractPriceCache({
     client, ...(options.refreshMs === undefined ? {} : { refreshMs: options.refreshMs }), ...(options.onError === undefined ? {} : { onError: options.onError }),

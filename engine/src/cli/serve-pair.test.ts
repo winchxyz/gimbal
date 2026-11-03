@@ -17,6 +17,7 @@ import { TRADER_STATE_VERSION, TraderStateStore, traderLockPath, traderStateFile
 import type { ContractSide } from './serve-contract.ts';
 import type { CarryInput, ServePairDeps, ServePairInput, SlotCarry } from './serve-pair.ts';
 import { liveLines, servePair } from './serve-pair.ts';
+import { ConfigError } from './start-errors.ts';
 
 const CONTRACT = 'gimbal-test.near';
 const DESK = 'canary';
@@ -39,6 +40,8 @@ class Leg implements TradeLeg {
   chainSlot: number | null = null;
   /** The oldest snapshot slot trusted: 0 after a restart, raised by syncToChain. */
   minSlot = 0;
+  /** syncToChain throws this (the chain's slot cannot be read), when set. */
+  syncFails: string | null = null;
   constructor(venue: VenueId, symbol: string) {
     this.venue = venue;
     this.symbol = symbol;
@@ -54,6 +57,7 @@ class Leg implements TradeLeg {
     return this.snap.pos;
   }
   async syncToChain(): Promise<void> {
+    if (this.syncFails !== null) throw new Error(this.syncFails);
     if (this.chainSlot !== null) this.minSlot = Math.max(this.minSlot, this.chainSlot);
   }
   async order(side: LegSide, size: bigint, reduceOnly: boolean): Promise<LegOutcome> {
@@ -84,13 +88,17 @@ interface World {
   refuse: string[];
   /** The stand-in carry signs one order outside the trader, then throws (an open that dies before its result). */
   throwAfterOrder: boolean;
+  /** hlHeld throws this, when set (Hyperliquid info not answering). */
+  hlHeldFails: string | null;
+  /** signing() throws this, when set (NEAR RPC, or a configuration error). */
+  signingFails: Error | null;
 }
 
 function world(symbol = 'XLM', env: Record<string, string> = {}): World {
   const dir = mkdtempSync(join(tmpdir(), 'gimbal-serve-pair-'));
   return {
     dir, env: { LOCALAPPDATA: dir, XDG_STATE_HOME: dir, ...env },
-    hl: new Leg('hyperliquid', symbol), px: new Leg('phoenix', symbol), openOrders: [], signed: 0, cancels: [], lines: [], refuse: [], throwAfterOrder: false,
+    hl: new Leg('hyperliquid', symbol), px: new Leg('phoenix', symbol), openOrders: [], signed: 0, cancels: [], lines: [], refuse: [], throwAfterOrder: false, hlHeldFails: null, signingFails: null,
   };
 }
 
@@ -106,10 +114,14 @@ function side(): ContractSide {
 
 function input(w: World, extra: Partial<ServePairInput> = {}): ServePairInput {
   const deps: ServePairDeps = {
-    hlHeld: async () => (w.hl.pos === 0n ? [] : [w.hl.symbol]),
+    hlHeld: async () => {
+      if (w.hlHeldFails !== null) throw new Error(w.hlHeldFails);
+      return w.hl.pos === 0n ? [] : [w.hl.symbol];
+    },
     phoenixHeld: async () => (w.px.pos === 0n ? [] : [w.px.symbol]),
     openOrders: async () => w.openOrders,
     signing: async () => {
+      if (w.signingFails !== null) throw w.signingFails;
       w.signed++;
       const relayer = {
         hlCancel: async (asset: number, oid: number) => {
@@ -255,7 +267,7 @@ test('serve --once is alert only even with GIMBAL_TRADE=1: no key, no lock, noth
   }
 });
 
-test('a resting order on the pair\'s coin at start: alert only with a line naming it; unreadable open orders too', async () => {
+test('a resting order on the pair\'s coin at start: alert only with a line naming it; unreadable open orders are retried', async () => {
   const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
   try {
     open(w);
@@ -264,9 +276,14 @@ test('a resting order on the pair\'s coin at start: alert only with a line namin
     assert.equal(p.pair?.live, false);
     assert.match(p.pair?.why ?? '', /Hyperliquid has 1 resting XLM order\(s\) \(BUY 10 \(oid 42\)\).*cancel it on Hyperliquid, reconcile both legs, then start serve again/);
     p.stop();
+    // Open orders that cannot be read are a read that failed: not confirmed, tried again, then live.
     w.openOrders = 'HTTP 500';
     const q = await servePair(input(w));
-    assert.match(q.pair?.why ?? '', /the Hyperliquid open orders cannot be read/);
+    assert.equal(q.pair === null, true);
+    assert.match(q.unconfirmed!() ?? '', /the Hyperliquid open orders cannot be read/);
+    w.openOrders = [];
+    assert.match(await q.retryStart!() ?? '', /XLM trades$/);
+    assert.equal(q.pair?.live, true);
     q.stop();
   } finally {
     rmSync(w.dir, { recursive: true, force: true });
@@ -604,28 +621,131 @@ test('Phoenix settlement lag after a restart: a stale snapshot showing Phoenix 0
   }
 });
 
-test('Phoenix settlement lag at start: the start plan reads Phoenix only at or past the chain\'s confirmed slot', async () => {
+/** A trader state saved with the XLM pair -50/50, nothing in flight (a clean restart). */
+function savedPair(w: World): void {
+  const identity = { contractId: CONTRACT, deskId: DESK, evm: EVM };
+  const store = new TraderStateStore(traderStateFile(w.dir, 'mainnet', identity), identity);
+  store.save({
+    version: TRADER_STATE_VERSION, savedAt: 1, symbol: 'XLM',
+    trader: { intents: [toQty('-50'), toQty('50')], baselines: [toQty('-50'), toQty('50')], known: [toQty('-50'), toQty('50')], net: 0n, unhedged: null, unsettled: [] }, pendingMaker: [],
+    inFlight: [], adl: newAdlState(),
+  });
+}
+
+/** The start's word on each venue's health, the latest one: `venue status`, sorted. */
+function healthOf() {
+  const last = new Map<string, string>();
+  return {
+    hook: (v: string, s: string, d: string | null) => last.set(v, d === null ? s : `${s}: ${d}`),
+    now: () => [...last.entries()].sort().map(([v, s]) => `${v} ${s}`),
+  };
+}
+
+/** The start's journal lines (numbers.stage 'start'), as `kind: summary`. */
+const startJournal = (events: StreamEvent[]) => events.flatMap((e) => (e.type === 'journal' && e.data.numbers.stage === 'start' ? [`${e.data.kind}: ${e.data.summary}`] : []));
+
+test('S1: a Phoenix snapshot behind the chain at start: alert only with the legs unknown, retried, then live once two synced reads agree', async () => {
   const w = world('XLM', { GIMBAL_TRADE: '1' });
   try {
-    const identity = { contractId: CONTRACT, deskId: DESK, evm: EVM };
-    const store = new TraderStateStore(traderStateFile(w.dir, 'mainnet', identity), identity);
-    store.save({
-      version: TRADER_STATE_VERSION, savedAt: 1, symbol: 'XLM',
-      trader: { intents: [toQty('-50'), toQty('50')], baselines: [toQty('-50'), toQty('50')], known: [toQty('-50'), toQty('50')], net: 0n, unhedged: null, unsettled: [] }, pendingMaker: [],
-      inFlight: [], adl: newAdlState(),
-    });
+    savedPair(w);
     w.hl.pos = toQty('-50');
     w.px.pos = toQty('50');
     w.px.snap = { slot: 100, pos: 0n };
     w.px.chainSlot = 120;
-    await assert.rejects(servePair(input(w)), /the legs could not be read twice alike at start \(phoenix: the trader snapshot is at slot 100, still before slot 120: the position is unknown\); nothing is adopted/);
-    w.px.minSlot = 0;
-    w.px.snap = { slot: 120, pos: toQty('50') };
-    const p = await servePair(input(w));
+    const events: StreamEvent[] = [];
+    const health = healthOf();
+    const p = await servePair(input(w, { publish: (e) => events.push(e), health: health.hook }));
+    // Serve runs on: nothing adopted, nothing trades, every act refused with the reason.
+    assert.equal(p.pair === null, true, 'the stale Phoenix 0 is not adopted');
+    assert.match(p.unconfirmed!() ?? '', /^legs unknown, start not confirmed: the legs could not be read twice alike \(phoenix: the trader snapshot is at slot 100, still before slot 120: the position is unknown\); nothing is adopted$/);
+    assert.equal(p.reducer(), null);
+    assert.match(p.notTrading() ?? '', /^legs unknown, start not confirmed/);
+    assert.notEqual(p.adl, undefined, 'the ADL watch is kept for the pair to come');
+    assert.equal(await p.adl!.check(), null);
+    await assert.rejects(p.cancelResting!(), /legs unknown, start not confirmed.*nothing is cancelled/);
+    const hands = p.hands!;
+    assert.match(hands.blocked() ?? '', /^legs unknown, start not confirmed/);
+    const opened = await hands.open({ symbol: 'XLM', legUsd: 10, leverage: 1.5, reason: 'strategy: enter' });
+    assert.equal(opened.ok, false);
+    assert.match(opened.reason, /^legs unknown, start not confirmed/);
+    assert.match((await hands.close({ reason: 'strategy: exit' })).reason, /^legs unknown, start not confirmed/);
+    assert.deepEqual([w.hl.orders.length, w.px.orders.length], [0, 0]);
+    assert.ok(existsSync(lockPath(w)), 'the lock is kept: the pair goes live without a restart');
+    assert.deepEqual(health.now().map((h) => h.replace(/: .*/, '')), ['hyperliquid ok', 'near ok', 'phoenix slow']);
+    assert.ok(lines(p).some((l) => /^live {6}trades: NOTHING yet, legs unknown, start not confirmed: .*goes live once two synced reads of both legs agree/.test(l)), lines(p).join('\n'));
+    assert.equal(startJournal(events).length, 1);
+    assert.match(startJournal(events)[0]!, /^error: pair start not confirmed: .*still before slot 120.*Alert only until two synced reads of both legs agree/);
+    // Still behind: tried again, the same reason is not journaled again.
+    assert.equal(await p.retryStart!(), null);
+    assert.equal(startJournal(events).length, 1);
+    // The snapshot reaches the chain's slot: the saved pair is restored and trades.
+    w.px.snap = { slot: 121, pos: toQty('50') };
+    assert.match(await p.retryStart!() ?? '', /^pair start confirmed after 2 failed attempt\(s\): both legs synced to their chains and read twice alike; XLM trades$/);
+    assert.equal(p.unconfirmed!(), null);
     assert.equal(p.pair?.live, true);
     assert.deepEqual(p.pair!.legs.map((l) => p.pair!.trader.baseline(l)), [toQty('-50'), toQty('50')]);
     assert.deepEqual(p.pair!.legs.map((l) => p.pair!.trader.known(l)), [toQty('-50'), toQty('50')]);
+    assert.equal(hands.blocked(), null);
+    assert.notEqual(p.reducer(), null);
+    assert.match(startJournal(events).at(-1)!, /^wait: pair start confirmed after 2 failed attempt/);
+    assert.deepEqual(health.now(), ['hyperliquid ok', 'near ok', 'phoenix ok']);
+    assert.equal(await p.retryStart!(), null, 'confirmed: nothing more to try');
     p.stop();
+    assert.equal(existsSync(lockPath(w)), false);
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+test('S1: getSlot failing at start: Phoenix down, alert only, then live when the chain answers', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
+  try {
+    open(w);
+    w.px.syncFails = 'solana getSlot: fetch failed';
+    const health = healthOf();
+    const p = await servePair(input(w, { health: health.hook }));
+    assert.equal(p.pair === null, true);
+    assert.match(p.unconfirmed!() ?? '', /phoenix XLM: the chain's confirmed slot was not read \(solana getSlot: fetch failed\), so no snapshot can be proven current/);
+    assert.match(health.now()[2]!, /^phoenix down: .*getSlot: fetch failed/);
+    assert.equal(w.signed, 1, 'the signing side is loaded once');
+    w.px.syncFails = null;
+    assert.match(await p.retryStart!() ?? '', /XLM trades$/);
+    assert.equal(w.signed, 1);
+    assert.deepEqual(p.pair!.legs.map((l) => p.pair!.trader.baseline(l)), [toQty('-50'), toQty('50')]);
+    p.stop();
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+test('S1: Hyperliquid info and NEAR RPC failing at start degrade too; a configuration error still stops the start', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
+  try {
+    open(w);
+    w.hlHeldFails = 'hyperliquid /info clearinghouseState: HTTP 502';
+    const health = healthOf();
+    const p = await servePair(input(w, { health: health.hook }));
+    assert.match(p.unconfirmed!() ?? '', /hyperliquid: hyperliquid \/info clearinghouseState: HTTP 502$/);
+    assert.deepEqual(health.now().map((h) => h.replace(/: .*/, '')), ['hyperliquid down', 'near ok', 'phoenix ok']);
+    w.hlHeldFails = null;
+    w.signingFails = new Error('near rpc: 503 Service Unavailable');
+    assert.equal(await p.retryStart!(), null);
+    assert.match(p.unconfirmed!() ?? '', /the signing contract client: near rpc: 503 Service Unavailable$/);
+    assert.deepEqual(health.now().map((h) => h.replace(/: .*/, '')), ['hyperliquid ok', 'near down', 'phoenix ok']);
+    // A contract on another network found on a retry: not tried again, the lock goes.
+    w.signingFails = new ConfigError('gimbal-test.near is a testnet contract (config().network), but the engine runs on mainnet; not starting');
+    assert.equal(await p.retryStart!(), null);
+    assert.match(p.unconfirmed!() ?? '', /a configuration error: fix it and restart serve; not tried again/);
+    assert.equal(existsSync(lockPath(w)), false);
+    w.signingFails = null;                         // even if the next read would pass: refused stays refused
+    assert.equal(await p.retryStart!(), null);
+    assert.equal(p.pair, null, 'still nothing adopted');
+    assert.match(p.unconfirmed!() ?? '', /not tried again/);
+    p.stop();
+    // The same error at the first attempt stops serve (exit 2): no retry fixes a configuration.
+    w.signingFails = new ConfigError('GIMBAL_TRADE=1 needs GIMBAL_CONTRACT_ID, DESK_ID and the operator key');
+    await assert.rejects(servePair(input(w)), /GIMBAL_TRADE=1 needs GIMBAL_CONTRACT_ID, DESK_ID and the operator key/);
+    assert.equal(existsSync(lockPath(w)), false);
   } finally {
     rmSync(w.dir, { recursive: true, force: true });
   }

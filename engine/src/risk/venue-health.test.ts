@@ -21,6 +21,24 @@ test('a scan miss or a failed read is down, a slow read slow; each clears when t
   assert.deepEqual(h.changed(), { intents: 'ok', near: 'ok', hyperliquid: 'ok', phoenix: 'ok', orderly: 'ok' });
 });
 
+test('the pair start\'s word: Phoenix slow while its snapshot lags, NEAR down while the signing client fails; ok once confirmed', () => {
+  const h = new VenueHealth();
+  h.changed();
+  h.pairStart('phoenix', 'slow', 'the trader snapshot is at slot 100, still before slot 120');
+  h.pairStart('near', 'down', 'near rpc: 503');
+  h.readOk('phoenix', 200);
+  assert.deepEqual(h.changed(), { intents: 'ok', near: 'down', hyperliquid: 'ok', phoenix: 'slow', orderly: 'ok' }, 'the worse of the account read and the start');
+  assert.equal(h.detail('phoenix').status, 'slow');
+  assert.equal(h.detail('phoenix').start, 'the trader snapshot is at slot 100, still before slot 120');
+  assert.equal(h.nearDetail, 'near rpc: 503');
+  h.pairStart('phoenix', 'down', 'getSlot: fetch failed');
+  assert.equal(h.map().phoenix, 'down');
+  for (const k of ['hyperliquid', 'phoenix', 'near'] as const) h.pairStart(k, 'ok');
+  assert.deepEqual(h.changed(), { intents: 'ok', near: 'ok', hyperliquid: 'ok', phoenix: 'ok', orderly: 'ok' });
+  assert.equal(h.detail('phoenix').start, null);
+  assert.equal(h.nearDetail, null);
+});
+
 test('withdrawals paused: the venue still answers, so slow (it cannot be a rescue source); a withdraw that goes through clears it', () => {
   let t = 0;
   const h = new VenueHealth({ now: () => t });
