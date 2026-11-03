@@ -282,7 +282,7 @@ export function windowFacts(p: {
 
 /** The book calls loopBook uses (book/book.ts PositionBook). */
 export interface LoopBookPort {
-  record(record: BookRecord): { positionId: string | null; numbers: Record<string, number | string> };
+  record(record: BookRecord): { positionId: string | null; numbers: Record<string, number | string>; note?: string | null };
   adopt(input: AdoptInput): string;
   openWindow(): string | null;
 }
@@ -292,13 +292,13 @@ export interface LoopBookPort {
  * exit and then, synchronously, journals it (`enter`, `rotate`, `exit`, or `error` when the venues hold a pair the open
  * did not finish): `publish` merges the book's numbers (position id, legs, fees, the forecast; at an exit its funding,
  * net and actual APR) into that next journal entry, the book's keys over the loop's (the book's `feeUsd` is signed, a
- * cost < 0). `adopt` books the pair the loop holds when the book has no open position for it (opened outside the
+ * cost < 0), and the book's note (an exit: `funding read to 14:00, settling`) to its summary. `adopt` books the pair the loop holds when the book has no open position for it (opened outside the
  * loop, or before the book existed), from the loop's own `since`; serve calls it at start and on every decision.
  */
 export function loopBook(book: LoopBookPort, publish: (event: StreamEvent) => void, log: (line: string) => void, held: () => LoopHeld | null = () => null): {
   sink: BookSink; publish: (event: StreamEvent) => void; adopt: (held: LoopHeld | null) => void;
 } {
-  let pending: Record<string, number | string> | null = null;
+  let pending: { numbers: Record<string, number | string>; note: string | null } | null = null;
   const adopt = (held: LoopHeld | null) => {
     if (held === null || book.openWindow() === held.windowId) return;
     try {
@@ -315,13 +315,14 @@ export function loopBook(book: LoopBookPort, publish: (event: StreamEvent) => vo
     sink: (record) => {
       pending = null;
       const r = book.record(record);
-      if (r.positionId !== null) pending = r.numbers;
+      if (r.positionId !== null) pending = { numbers: r.numbers, note: r.note ?? null };
     },
     publish: (event) => {
       if (event.type === 'journal' && pending !== null) {
-        const numbers = pending;
+        const { numbers, note } = pending;
         pending = null;
-        publish({ type: 'journal', data: { ...event.data, numbers: { ...event.data.numbers, ...numbers } } });
+        const summary = note === null ? event.data.summary : `${event.data.summary}; ${note}`;
+        publish({ type: 'journal', data: { ...event.data, summary, numbers: { ...event.data.numbers, ...numbers } } });
         return;
       }
       publish(event);

@@ -2,10 +2,17 @@
 // hour per position, `fee` for fees the loop's own enter / exit entries do not carry, `deposit` / `withdraw` for the
 // desk's Hyperliquid ledger. The loop journals `enter` and `exit` itself; entryNumbers / exitNumbers are what serve
 // merges into those.
+//
+// A closed position's numbers settle after its exit entry: the venues book the last hours' funding later. The exit
+// entry carries what was read by then (`fundingThrough`, `settling` 1, and its summary says so). Once every leg's
+// ledger is read past exit + SETTLE_MS, the book writes ONE settled entry with the final numbers: kind `funding` (not
+// a second `exit`, which the web would count as another close), `final` 1 and `settled` 1, and no `usd`: the hourly
+// funding entries already carry the money, so a day's total does not count it twice.
 
 import type { JournalEntry, TxRef } from '@gimbal/shared';
 import type { PositionResult } from './derive.ts';
 import { HOUR_MS, attribute, hourOf, positionsOf, spans } from './derive.ts';
+import type { MissingFee } from './sync.ts';
 import type { BookEvent, FeeEvent, FundingEvent, JournalEvent, TransferEvent } from './types.ts';
 
 /** An hour is journaled once every leg has paid it, or this long after it with what came (a missing leg says so). */
@@ -20,6 +27,11 @@ export function signed(x: number, digits = 4): string {
 
 function iso(t: number): string {
   return new Date(t).toISOString().replace(/:\d\d\.\d{3}Z$/, 'Z');
+}
+
+/** `14:00`, UTC. */
+export function hhmm(t: number): string {
+  return new Date(t).toISOString().slice(11, 16);
 }
 
 function entry(id: string, t: number, kind: JournalEntry['kind'], summary: string, numbers: Record<string, number | string>, tx: TxRef[] = []): JournalEntry {
@@ -83,12 +95,17 @@ export function fundingJournal(events: readonly BookEvent[], now: number): Journ
   return out;
 }
 
-export function feeJournal(fee: FeeEvent, symbol: string, now: number): JournalEvent {
-  const summary = `fee ${fee.venue} ${symbol} ${fee.stage === 'enter' ? 'open' : 'close'}: ${signed(fee.usd)} USD, read from the venue's fills (the record had none)`;
+const STAGE = { enter: 'open', exit: 'close', fill: 'partial fill' } as const;
+
+/** The fees read from a venue for one record's fills on one venue and side. */
+export function feeJournal(m: MissingFee, fees: readonly FeeEvent[], now: number): JournalEvent {
+  const usd = fees.reduce((a, f) => a + f.usd, 0);
+  const summary = `fee ${m.venue} ${m.symbol} ${STAGE[m.stage]}: ${signed(usd)} USD, read from the venue's fills (the record had none)`
+    + `${m.positionId === null ? ' (desk: no position)' : ''}`;
   return {
-    v: 1, type: 'journal', at: now, positionId: fee.positionId,
-    entry: entry(`book-fee-${fee.positionId}-${fee.stage}-${fee.venue}`, now, 'fee', summary, {
-      usd: round6(fee.usd), position: fee.positionId, venue: fee.venue, stage: fee.stage,
+    v: 1, type: 'journal', at: now, ...(m.positionId === null ? {} : { positionId: m.positionId }),
+    entry: entry(`book-fee-${m.positionId ?? 'desk'}-${m.stage}-${m.record.at}-${m.venue}-${m.side}`, now, 'fee', summary, {
+      usd: round6(usd), ...(m.positionId === null ? {} : { position: m.positionId }), venue: m.venue, stage: m.stage, fills: fees.length,
     }),
   };
 }
@@ -132,19 +149,48 @@ export function entryNumbers(r: PositionResult): Record<string, number | string>
   return out;
 }
 
-/** What serve merges into the loop's `exit` entry: the position's results at the close. */
-export function exitNumbers(r: PositionResult): Record<string, number | string> {
+/** The position's results: funding (per leg), fees, transfers, price, net, hours and the APR over the hours read. */
+function resultNumbers(r: PositionResult): Record<string, number | string> {
   const out: Record<string, number | string> = {
-    position: r.id, window: r.windowId, symbol: r.symbol, feeUsd: round6(r.exitFeesUsd),
+    position: r.id, window: r.windowId, symbol: r.symbol,
     fundingUsd: round6(r.fundingUsd), feesUsd: round6(r.feesUsd), transferCostUsd: round6(r.transferCostUsd),
-    netUsd: round6(r.netUsd), heldH: Math.round(r.heldHours * 100) / 100,
+    netUsd: round6(r.netUsd), heldH: Math.round(r.heldHours * 100) / 100, aprH: Math.round(r.aprHours * 100) / 100,
+    fundingThrough: r.fundingThrough === null ? 'none' : new Date(r.fundingThrough).toISOString(),
   };
   if (r.priceUsd !== null) out.priceUsd = round6(r.priceUsd);
   if (r.actualAprPct !== null) out.actualAprPct = Math.round(r.actualAprPct * 100) / 100;
   if (r.forecastNetAprPct !== null) out.forecastNetAprPct = r.forecastNetAprPct;
   if (r.netOnMarginPct !== null) out.netOnMarginPct = Math.round(r.netOnMarginPct * 100) / 100;
+  if (r.unknownFees > 0) out.unknownFees = r.unknownFees;
+  if (r.partialFills > 0) out.partialFills = r.partialFills;
+  for (const l of r.legs) out[`${l.venue}FundingUsd`] = round6(l.fundingUsd);
+  return out;
+}
+
+/** What the exit entry says of the funding read so far: `funding read to 14:00, settling`; null once settled. */
+export function settlingNote(r: PositionResult): string | null {
+  if (r.open || r.settled) return null;
+  return `funding read to ${r.fundingThrough === null ? 'none yet' : hhmm(r.fundingThrough)}, settling`;
+}
+
+/** The position's settled entry: its final numbers, once (see the header). */
+export function settledJournal(r: PositionResult, now: number): JournalEvent {
+  const numbers = { ...resultNumbers(r), final: 1, settled: 1 };
+  const apr = r.actualAprPct === null ? 'n/a' : `${r.actualAprPct.toFixed(2)} %`;
+  const summary = `settled ${r.symbol} ${r.id}: funding ${signed(r.fundingUsd)}, fees ${signed(r.feesUsd)}`
+    + `${r.priceUsd === null ? '' : `, price ${signed(r.priceUsd)}`}, net ${signed(r.netUsd)} USD; actual APR ${apr}`
+    + ` over ${r.aprHours.toFixed(1)} h, funding read to ${r.fundingThrough === null ? 'none' : hhmm(r.fundingThrough)} (final)`;
+  return {
+    v: 1, type: 'journal', at: now, positionId: r.id, settled: true,
+    entry: entry(`book-settled-${r.id}`, now, 'funding', summary, numbers),
+  };
+}
+
+/** What serve merges into the loop's `exit` entry: the position's results at the close, as read so far. */
+export function exitNumbers(r: PositionResult): Record<string, number | string> {
+  const out: Record<string, number | string> = { ...resultNumbers(r), feeUsd: round6(r.exitFeesUsd) };
+  if (!r.settled) out.settling = 1;
   for (const l of r.legs) {
-    out[`${l.venue}FundingUsd`] = round6(l.fundingUsd);
     if (l.exitPx !== null) out[`${l.venue}ExitPx`] = l.exitPx;
     out[`${l.venue}FeeUsd`] = l.exitFeeUsd === null ? 'unknown' : round6(l.exitFeeUsd);
   }

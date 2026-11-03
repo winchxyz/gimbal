@@ -12,8 +12,8 @@ import type { HlLedgerRow } from './types.ts';
 
 const PAGE_ROWS = 500;
 const MAX_PAGES = 50;
-/** A record is written once its act has finished; its fills are looked for this long before it. */
-export const FILL_LOOKBACK_MS = 30 * 60_000;
+/** An act's fills are looked for in [startedAt, at], widened by this either way (the venue's clock against ours). */
+export const FILL_WINDOW_SLACK_MS = 5_000;
 
 export interface LiveSourceOptions {
   network: 'mainnet' | 'testnet';
@@ -43,7 +43,7 @@ export async function hlNonFundingLedger(f: typeof fetch, infoUrl: string, user:
     let last = from;
     for (const r of rows as HlLedgerRow[]) {
       if (!Number.isSafeInteger(r?.time) || typeof r.hash !== 'string' || typeof r.delta?.type !== 'string') {
-        throw new Error(`userNonFundingLedgerUpdates: malformed row ${JSON.stringify(r).slice(0, 120)}`);
+        throw new Error(`userNonFundingLedgerUpdates: malformed row (${rowShape(r)})`);
       }
       last = Math.max(last, r.time);
       const key = `${r.time}|${r.hash}|${r.delta.type}`;
@@ -58,15 +58,27 @@ export async function hlNonFundingLedger(f: typeof fetch, infoUrl: string, user:
   return out.sort((a, b) => a.time - b.time);
 }
 
+/** A row's field names and value types, never its values (a ledger row carries counterparty addresses). */
+export function rowShape(r: unknown): string {
+  if (r === null || typeof r !== 'object') return r === null ? 'null' : typeof r;
+  return Object.entries(r as Record<string, unknown>)
+    .map(([k, v]) => `${k}: ${v === null ? 'null' : Array.isArray(v) ? 'array' : typeof v === 'object' ? `{${rowShape(v)}}` : typeof v}`)
+    .join(', ');
+}
+
 interface HlFillRow { coin: string; side: 'B' | 'A'; fee?: string; time: number }
 
-/** The fee Hyperliquid charged for one leg's fills of an act: its fills on the coin and side in the act's last 30 min. */
+/**
+ * The fee Hyperliquid charged for one venue side of an act: every fill on the coin and side between the act's start
+ * and its record (FILL_WINDOW_SLACK_MS either way). Without the act's start it cannot tell the act's fills: null.
+ */
 export async function hlFillFee(f: typeof fetch, infoUrl: string, q: FillFeeQuery): Promise<number | null> {
-  const rows = await post<unknown>(f, infoUrl, {
-    type: 'userFillsByTime', user: q.address.toLowerCase(), startTime: Math.max(0, q.at - FILL_LOOKBACK_MS), endTime: q.at + 60_000,
-  });
+  if (q.startedAt === null || !(q.startedAt <= q.at)) return null;
+  const lo = q.startedAt - FILL_WINDOW_SLACK_MS;
+  const hi = q.at + FILL_WINDOW_SLACK_MS;
+  const rows = await post<unknown>(f, infoUrl, { type: 'userFillsByTime', user: q.address.toLowerCase(), startTime: Math.max(0, lo), endTime: hi });
   if (!Array.isArray(rows)) throw new Error('userFillsByTime: not a list');
-  const mine = (rows as HlFillRow[]).filter((r) => r.coin === q.symbol && r.side === (q.side === 'BUY' ? 'B' : 'A'));
+  const mine = (rows as HlFillRow[]).filter((r) => r.coin === q.symbol && r.side === (q.side === 'BUY' ? 'B' : 'A') && r.time >= lo && r.time <= hi);
   if (mine.length === 0 || mine.some((r) => r.fee === undefined || !Number.isFinite(Number(r.fee)))) return null;
   return mine.reduce((s, r) => s + Number(r.fee), 0);
 }

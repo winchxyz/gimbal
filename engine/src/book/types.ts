@@ -54,7 +54,7 @@ export const BOOK_VERSION = 1;
 
 // The JSONL lines. Each one is appended once and never changed; everything the book reports is derived from them.
 export type BookEvent =
-  | DeskEvent | EnterEvent | ExitEvent | FundingEvent | FeeEvent | TransferEvent | SyncEvent | JournalEvent;
+  | DeskEvent | EnterEvent | ExitEvent | FillEvent | FundingEvent | FeeEvent | TransferEvent | SyncEvent | JournalEvent;
 
 /** The first line: which desk this book is, and the addresses its ledgers are read for. */
 export interface DeskEvent {
@@ -78,7 +78,19 @@ export interface ExitEvent {
   record: BookRecord;
 }
 
-/** One payment from a venue's own funding ledger, stored once (key = venue|time|symbol). */
+/** Fills of an open or close that did not end as asked (BookRecord kind 'fill'): they count in fees and price. */
+export interface FillEvent {
+  v: 1; type: 'fill'; at: number;
+  /** The open position with its window id; null: none (a failed open that left the desk flat), the desk's. */
+  positionId: string | null;
+  record: BookRecord;
+}
+
+/**
+ * One payment from a venue's own funding ledger, stored once (key = venue|time|symbol). When a later read sums a key
+ * differently (Phoenix: a subaccount's row for the same hour showed up), the difference is stored as its own event
+ * with `adjusts` = that key.
+ */
 export interface FundingEvent {
   v: 1; type: 'funding'; at: number;
   key: string;
@@ -95,13 +107,18 @@ export interface FundingEvent {
   samples: number | null;
   /** The position it was attributed to when stored (derive attributes again from the times). */
   positionId: string;
+  /** An adjustment of the payment with this key (the difference a later read gave). */
+  adjusts?: string;
 }
 
 /** A fill fee read from the venue because the record did not carry it. */
 export interface FeeEvent {
   v: 1; type: 'fee'; at: number;
-  positionId: string;
-  stage: 'enter' | 'exit';
+  positionId: string | null;
+  stage: 'enter' | 'exit' | 'fill';
+  /** The record's `at` and the fill's index in its legs: which fill this is the fee of. */
+  recordAt: number;
+  index: number;
   venue: string;
   /** Signed: a cost < 0. */
   usd: number;
@@ -143,4 +160,6 @@ export interface JournalEvent {
   hour?: number;
   keys?: string[];
   late?: boolean;
+  /** The position's settled entry (written once, after its ledgers were read past exit + SETTLE_MS). */
+  settled?: boolean;
 }

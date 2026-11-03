@@ -1,24 +1,30 @@
 // The position book (E10): a durable record of every position the desk holds, from the strategy loop's carried-out
-// enters and exits (BookRecord, through the loop's `book` sink), the venues' own funding ledgers, fill fees and
-// transfers. On disk in GIMBAL_STATE_DIR: book-<mode>-<contract>-<desk>.jsonl (append-only events, store.ts) and
-// .summary.json next to it (derived, rewritten after every change). Both are written atomically.
+// enters, exits and partial fills (BookRecord, through the loop's `book` sink), the venues' own funding ledgers, fill
+// fees and transfers. On disk in GIMBAL_STATE_DIR: book-<mode>-<contract>-<desk>.jsonl (appended to, fsynced; store.ts)
+// and .summary.json next to it (derived; rewritten atomically once per record and once per sync, after the call has
+// returned).
 //
-// serve wiring (after the loop merges): `const book = createBook({...})`, pass `book.record` as the loop's `book`
-// option, `book.start()` (sync now, then every hour, HOUR_SYNC_DELAY_MS after the top of the hour), `book.stop()` on
-// shutdown; merge `book.entryNumbers(id)` / `book.exitNumbers(id)` into the loop's enter / exit journal entries.
+// serve wiring: serve.ts creates it with createBook and hands `loopBook(book, ...)` (serve-loop.ts) the loop's `book`
+// option and journal; `book.start()` syncs now, then every hour HOUR_SYNC_DELAY_MS after the top of the hour, and
+// `book.stop()` on shutdown.
 
 import type { JournalEntry, Mode } from '@gimbal/shared';
+import { scanRead } from '../venues/http-budget.ts';
 import type { Clock } from '../venues/venue.ts';
 import { systemClock } from '../venues/venue.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { BookSummary, PositionResult } from './derive.ts';
-import { HOUR_MS, openPosition, positionIdOf, positionResult, positionsOf, summarize } from './derive.ts';
-import { entryNumbers, exitNumbers, feeJournal, fundingJournal, transferJournal } from './journal.ts';
+import {
+  HOUR_MS, indexBook, openPosition, positionIdOf, positionResult, positionsOf, summarize, unsettledJournals,
+} from './derive.ts';
+import { entryNumbers, exitNumbers, feeJournal, fundingJournal, settledJournal, settlingNote, transferJournal } from './journal.ts';
 import type { StoreHooks } from './store.ts';
 import { BookStore, bookFile } from './store.ts';
 import type { BookSources, SyncLine } from './sync.ts';
-import { failedLine, fundingEvents, fundingWindow, ledgerEvents, ledgerWindow, missingFees, syncLine } from './sync.ts';
-import type { BookEvent, BookRecord, EnterEvent, FeeEvent, JournalEvent, TransferEvent, TransferInput } from './types.ts';
+import {
+  failedLine, feeEvents, fundingEvents, fundingWindow, keepSync, knownTxIds, ledgerEvents, ledgerWindow, missingFees, syncLine,
+} from './sync.ts';
+import type { BookEvent, BookRecord, EnterEvent, JournalEvent, SyncEvent, TransferEvent, TransferInput } from './types.ts';
 
 /** The hourly sync runs this long after the top of the hour: Hyperliquid pays at it, Phoenix books a little later. */
 export const HOUR_SYNC_DELAY_MS = 5 * 60_000;
@@ -66,15 +72,25 @@ export interface SyncReport {
   added: number;
 }
 
+export interface Recorded {
+  positionId: string | null;
+  /** What serve merges into the loop's journal entry for the act. */
+  numbers: Record<string, number | string>;
+  /** A clause for that entry's summary (an exit: `funding read to 14:00, settling`), or null. */
+  note: string | null;
+}
+
 export class PositionBook {
   readonly path: string;
   readonly #o: BookOptions;
   readonly #store: BookStore;
   readonly #clock: Clock;
   readonly #persist: boolean;
-  #events: BookEvent[];
+  /** Ledger reads that went through but whose sync line was not written (it stored nothing): ledger -> end. */
+  readonly #cursors: Record<string, number> = {};
   #syncing: Promise<SyncReport> | null = null;
   #timer: unknown = null;
+  #summaryDue: NodeJS.Immediate | null = null;
   #stopped = false;
 
   constructor(o: BookOptions) {
@@ -83,9 +99,10 @@ export class PositionBook {
     this.#persist = o.persist ?? true;
     this.path = o.path ?? bookFile(o.dir, o.mode, o.contractId, o.deskId);
     this.#store = new BookStore(this.path, o.hooks ?? {});
-    this.#events = this.#store.load();
+    this.#store.load({ repair: this.#persist });
+    if (this.#store.repaired !== null) this.#log(`book: ${this.path}: ${this.#store.repaired}`);
     const addresses = Object.fromEntries(Object.entries(o.addresses ?? {}).filter(([, a]) => a !== ''));
-    const desk = [...this.#events].reverse().find((e) => e.type === 'desk');
+    const desk = [...this.events].reverse().find((e) => e.type === 'desk');
     const same = desk !== undefined && desk.type === 'desk' && desk.mode === o.mode && desk.contract === o.contractId
       && desk.desk === o.deskId && JSON.stringify(desk.addresses) === JSON.stringify(addresses);
     if (!same && (o.addresses !== undefined || desk === undefined)) {
@@ -94,37 +111,43 @@ export class PositionBook {
   }
 
   get events(): readonly BookEvent[] {
-    return this.#events;
+    return this.#store.events;
   }
 
   /** The desk's address on a venue: the options', else the book's own desk line. */
   address(venue: string): string | null {
     const given = this.#o.addresses?.[venue];
     if (given !== undefined && given !== '') return given;
-    for (let i = this.#events.length - 1; i >= 0; i--) {
-      const e = this.#events[i]!;
+    const events = this.events;
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i]!;
       if (e.type === 'desk' && e.addresses[venue] !== undefined) return e.addresses[venue]!;
     }
     return null;
   }
 
   /**
-   * A carried-out enter or exit (the loop's BookSink). An exit closes the open position with its window id; with none
-   * open it is kept as an exit the book never saw enter. Returns the position and the numbers for its journal entry.
-   * Throws when the book could not be written (the loop logs it; the act stands).
+   * A carried-out act (the loop's BookSink): an enter, an exit, or the fills of an act that did not end as asked. An
+   * exit closes the open position with its window id; with none open it is kept as an exit the book never saw enter.
+   * Fills go to the open position with their window id, else to the desk. Returns the position and the numbers for the
+   * act's journal entry. Throws when the book could not be written (the loop logs it; the act stands).
    */
-  record(record: BookRecord): { positionId: string | null; numbers: Record<string, number | string> } {
+  record(record: BookRecord): Recorded {
     const now = this.#clock.now();
-    const positions = positionsOf(this.#events);
+    const positions = positionsOf(this.events);
     let positionId: string | null;
     const added: BookEvent[] = [];
+    const copy = structuredClone(record);
     if (record.kind === 'enter') {
       positionId = this.#newId(record.windowId, record.at, positions);
-      added.push({ v: 1, type: 'enter', at: now, positionId, record: structuredClone(record), adopted: false });
+      added.push({ v: 1, type: 'enter', at: now, positionId, record: copy, adopted: false });
+    } else if (record.kind === 'exit') {
+      positionId = openPosition(positions, record.windowId)?.id ?? null;
+      added.push({ v: 1, type: 'exit', at: now, positionId, record: copy });
+      if (positionId === null) this.#log(`book: exit of ${record.windowId} with no open position booked; kept apart`);
     } else {
       positionId = openPosition(positions, record.windowId)?.id ?? null;
-      added.push({ v: 1, type: 'exit', at: now, positionId, record: structuredClone(record) });
-      if (positionId === null) this.#log(`book: exit of ${record.windowId} with no open position booked; kept apart`);
+      added.push({ v: 1, type: 'fill', at: now, positionId, record: copy });
     }
     for (const [i, m] of record.marginMoves.entries()) {
       const t: TransferEvent = {
@@ -137,19 +160,23 @@ export class PositionBook {
     }
     this.#append(added);
     this.#publishNew(added);
-    const numbers = positionId === null ? {} : record.kind === 'enter' ? this.entryNumbers(positionId) : this.exitNumbers(positionId);
-    return { positionId, numbers };
+    if (positionId === null || record.kind === 'fill') return { positionId, numbers: {}, note: null };
+    const r = this.result(positionId);
+    if (r === null) return { positionId, numbers: {}, note: null };
+    return record.kind === 'enter'
+      ? { positionId, numbers: entryNumbers(r), note: null }
+      : { positionId, numbers: exitNumbers(r), note: settlingNote(r) };
   }
 
   /** The window id of the position open now (the latest), or null. */
   openWindow(): string | null {
-    return openPosition(positionsOf(this.#events))?.windowId ?? null;
+    return openPosition(positionsOf(this.events))?.windowId ?? null;
   }
 
   /** A pair opened outside the loop (adopted from the venues): booked from `since`, with no opening fills. */
   adopt(input: AdoptInput): string {
     const now = this.#clock.now();
-    const positions = positionsOf(this.#events);
+    const positions = positionsOf(this.events);
     const held = openPosition(positions, input.windowId);
     if (held !== null) return held.id;
     const positionId = this.#newId(input.windowId, input.since, positions);
@@ -164,19 +191,31 @@ export class PositionBook {
     return positionId;
   }
 
-  /** A transfer made outside the loop (rescue, the manual fund scripts), with its tx refs. Returns its id. */
+  /**
+   * A transfer made outside the loop (rescue, the manual fund scripts), with its tx refs. Returns its id. A transfer
+   * whose tx the book already holds (added before, read from the Hyperliquid ledger, a margin move of the loop) is not
+   * added again: the id of the one held is returned.
+   */
   addTransfer(input: TransferInput, options: { journal?: boolean } = {}): string {
     if (!Number.isFinite(input.usd) || !Number.isFinite(input.feeUsd)) throw new Error('addTransfer: usd and feeUsd must be numbers');
     if (input.feeUsd > 0) throw new Error(`addTransfer: feeUsd is a cost, ≤ 0 (got ${input.feeUsd})`);
+    const known = knownTxIds(this.events);
+    for (const t of input.tx) {
+      const held = known.get(t.id.toLowerCase());
+      if (held !== undefined) {
+        this.#log(`book: transfer ${t.chain} ${t.id} is already booked as ${held}; not added again`);
+        return held;
+      }
+    }
     const now = this.#clock.now();
     const time = input.at ?? now;
     let positionId: string | null = null;
-    if (input.positionId === 'open') positionId = openPosition(positionsOf(this.#events))?.id ?? null;
+    if (input.positionId === 'open') positionId = openPosition(positionsOf(this.events))?.id ?? null;
     else if (input.positionId !== undefined && input.positionId !== null) {
-      if (!positionsOf(this.#events).some((p) => p.id === input.positionId)) throw new Error(`addTransfer: no position ${input.positionId}`);
+      if (!positionsOf(this.events).some((p) => p.id === input.positionId)) throw new Error(`addTransfer: no position ${input.positionId}`);
       positionId = input.positionId;
     }
-    const same = this.#events.filter((e) => e.type === 'transfer' && e.time === time && e.source === input.source).length;
+    const same = this.events.filter((e) => e.type === 'transfer' && e.time === time && e.source === input.source).length;
     const t: TransferEvent = {
       v: 1, type: 'transfer', at: now, id: `${input.source}:${time}:${same}`, time, positionId,
       from: input.from, to: input.to, usd: input.usd, feeUsd: input.feeUsd || 0, tx: input.tx, source: input.source, note: input.note ?? null,
@@ -203,7 +242,9 @@ export class PositionBook {
     const lines: SyncLine[] = [];
     let added = 0;
     if (sources === undefined || sources === null) return { lines: [{ ledger: 'book', ok: false, text: 'no ledgers to read' }], added };
-    const venues = [...new Set(positionsOf(this.#events).flatMap((p) => p.legs.map((l) => l.venue)))].sort();
+    // The book's reads are background reads: below the risk engine's account reads, skipped (not retried) when the
+    // venue's budget is short. A skipped read is a failed one: the next sync starts from the last good read.
+    const venues = [...new Set(positionsOf(this.events).flatMap((p) => p.legs.map((l) => l.venue)))].sort();
     for (const venue of venues) {
       const source = sources.funding[venue];
       const address = this.address(venue);
@@ -211,16 +252,15 @@ export class PositionBook {
         lines.push({ ledger: venue, ok: false, text: `${venue}: ${source === undefined ? 'no ledger reader' : 'no desk address'}` });
         continue;
       }
-      const now = this.#clock.now();
-      const read = fundingWindow(this.#events, venue, now);
+      const read = fundingWindow(this.events, venue, this.#clock.now(), this.#cursors);
       if (read === null) {
         lines.push({ ledger: venue, ok: true, text: `${venue}: no position needs it` });
         continue;
       }
       try {
-        const rows = await source.userFunding(address, read.from, read.to);
-        const events = fundingEvents(this.#events, venue, rows, read, this.#clock.now());
-        this.#append(events);
+        const rows = await scanRead(() => source.userFunding(address, read.from, read.to));
+        const events = fundingEvents(this.events, venue, rows, read, this.#clock.now());
+        this.#appendRead(events);
         added += events.length - 1;
         lines.push(syncLine(venue, events));
       } catch (err) {
@@ -228,15 +268,16 @@ export class PositionBook {
       }
     }
     const hlAddress = this.address('hyperliquid');
-    if (sources.hlLedger !== undefined && hlAddress !== null) {
-      const read = ledgerWindow(this.#events, this.#clock.now());
+    const hlLedger = sources.hlLedger;
+    if (hlLedger !== undefined && hlAddress !== null) {
+      const read = ledgerWindow(this.events, this.#clock.now(), this.#cursors);
       if (read !== null) {
         try {
-          const rows = await sources.hlLedger(hlAddress, read.from, read.to);
-          const events = ledgerEvents(this.#events, rows, hlAddress, read, sources.hlTxRef ?? (() => null), this.#clock.now());
+          const rows = await scanRead(() => hlLedger(hlAddress, read.from, read.to));
+          const events = ledgerEvents(this.events, rows, hlAddress, read, sources.hlTxRef ?? (() => null), this.#clock.now());
           const journals = events.filter((e): e is TransferEvent => e.type === 'transfer')
             .map((t) => transferJournal(t, this.#clock.now())).filter((j): j is JournalEvent => j !== null);
-          this.#append([...events, ...journals]);
+          this.#appendRead([...events, ...journals]);
           this.#publishNew(journals);
           added += events.length - 1;
           lines.push(syncLine('hyperliquid-ledger', events));
@@ -245,29 +286,38 @@ export class PositionBook {
         }
       }
     }
-    if (sources.fillFee !== undefined) {
-      for (const m of missingFees(this.#events, this.#clock.now())) {
+    const fillFee = sources.fillFee;
+    if (fillFee !== undefined) {
+      for (const m of missingFees(this.events, this.#clock.now())) {
         const address = this.address(m.venue);
         if (address === null) continue;
-        const fill = m.record.legs.find((l) => l.venue === m.venue)!;
         try {
-          const charged = await sources.fillFee({ venue: m.venue, address, symbol: m.symbol, side: fill.side, at: m.record.at, tx: m.record.tx });
-          if (charged === null) continue;
+          const charged = await scanRead(() => fillFee({
+            venue: m.venue, address, symbol: m.symbol, side: m.side, startedAt: m.record.startedAt ?? null, at: m.record.at, tx: m.record.tx,
+          }));
+          if (charged === null || !Number.isFinite(charged)) continue;
           const now = this.#clock.now();
-          const fee: FeeEvent = { v: 1, type: 'fee', at: now, positionId: m.positionId, stage: m.stage, venue: m.venue, usd: -charged || 0, source: 'venue' };
-          const j = feeJournal(fee, m.symbol, now);
-          this.#append([fee, j]);
+          const fees = feeEvents(m, charged, now);
+          const j = feeJournal(m, fees, now);
+          this.#append([...fees, j], false);
           this.#publishNew([j]);
-          added++;
-          lines.push({ ledger: `${m.venue}-fills`, ok: true, text: `${m.venue}: ${m.stage} fee of ${m.positionId} read from the venue's fills` });
+          added += fees.length;
+          lines.push({ ledger: `${m.venue}-fills`, ok: true, text: `${m.venue}: ${m.stage} fee of ${m.positionId ?? 'the desk'} read from the venue's fills` });
         } catch (err) {
           lines.push(failedLine(`${m.venue}-fills`, err));
         }
       }
     }
-    const journals = fundingJournal(this.#events, this.#clock.now());
-    this.#append(journals);
+    const journals = fundingJournal(this.events, this.#clock.now());
+    this.#append(journals, false);
     this.#publishNew(journals);
+    // Settled: written to the file first, published after, once per position.
+    const now = this.#clock.now();
+    const ix = indexBook(this.events, this.#cursors);
+    const settled = unsettledJournals(this.events, ix.all.map((p) => positionResult(p, ix, now))).map((r) => settledJournal(r, now));
+    this.#append(settled, false);
+    this.#publishNew(settled);
+    this.#scheduleSummary();
     for (const l of lines) this.#log(`book: ${l.text}`);
     return { lines, added };
   }
@@ -284,6 +334,7 @@ export class PositionBook {
     run();
   }
 
+  /** Stops the hourly sync and writes a summary that is due. */
   stop(): void {
     this.#stopped = true;
     if (this.#timer !== null) {
@@ -291,6 +342,7 @@ export class PositionBook {
       else clearTimeout(this.#timer as NodeJS.Timeout);
     }
     this.#timer = null;
+    this.flushSummary();
   }
 
   #schedule(run: () => void): void {
@@ -305,13 +357,13 @@ export class PositionBook {
   }
 
   summary(): BookSummary {
-    return summarize(this.#events, this.#clock.now());
+    return summarize(this.events, this.#clock.now(), this.#cursors);
   }
 
   result(positionId: string): PositionResult | null {
-    const all = positionsOf(this.#events);
-    const p = all.find((x) => x.id === positionId);
-    return p === undefined ? null : positionResult(p, this.#events, this.#clock.now(), all);
+    const ix = indexBook(this.events, this.#cursors);
+    const p = ix.all.find((x) => x.id === positionId);
+    return p === undefined ? null : positionResult(p, ix, this.#clock.now());
   }
 
   /** What serve merges into the loop's enter (or rotate) journal entry. */
@@ -326,6 +378,14 @@ export class PositionBook {
     return r === null ? {} : exitNumbers(r);
   }
 
+  /** Writes the summary now when one is due (stop() does; tests do). */
+  flushSummary(): void {
+    if (this.#summaryDue === null) return;
+    clearImmediate(this.#summaryDue);
+    this.#summaryDue = null;
+    this.#writeSummary();
+  }
+
   #newId(windowId: string, at: number, positions: readonly { id: string }[]): string {
     const base = positionIdOf(windowId, at);
     let id = base;
@@ -333,18 +393,36 @@ export class PositionBook {
     return id;
   }
 
-  #append(events: BookEvent[]): void {
+  /** One ledger read: its events, and its sync line only when keepSync says so (else the cursor moves in memory). */
+  #appendRead(events: readonly BookEvent[]): void {
+    const sync = events.find((e): e is SyncEvent => e.type === 'sync');
+    const rest = events.filter((e) => e.type !== 'sync');
+    const keep = sync !== undefined && keepSync(this.events, sync);
+    this.#append(keep ? [...rest, sync] : rest, false);
+    if (sync !== undefined && !(this.#cursors[sync.ledger]! >= sync.to)) this.#cursors[sync.ledger] = sync.to;
+  }
+
+  /** Appends (fsynced when persisting); `summary` true schedules the summary (a sync schedules it once, at its end). */
+  #append(events: readonly BookEvent[], summary = true): void {
     if (events.length === 0) return;
-    if (this.#persist) {
-      this.#store.append(events);
-      this.#events = [...this.#store.events];
-      try {
-        this.#store.writeSummary(this.summary());
-      } catch (err) {
-        this.#log(`book: summary not written (${errorMessage(err)}); the JSONL holds everything`);
-      }
-    } else {
-      this.#events = [...this.#events, ...events];
+    this.#store.append(events, this.#persist);
+    if (summary) this.#scheduleSummary();
+  }
+
+  /** The summary is derived from everything: written once the current call has returned, coalesced. */
+  #scheduleSummary(): void {
+    if (!this.#persist || this.#summaryDue !== null) return;
+    this.#summaryDue = setImmediate(() => {
+      this.#summaryDue = null;
+      this.#writeSummary();
+    });
+  }
+
+  #writeSummary(): void {
+    try {
+      this.#store.writeSummary(this.summary());
+    } catch (err) {
+      this.#log(`book: summary not written (${errorMessage(err)}); the JSONL holds everything`);
     }
   }
 

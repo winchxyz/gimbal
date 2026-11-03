@@ -637,3 +637,38 @@ test('F2: an open its own gate stopped (nothing sent, a rescue now running) is t
   assert.equal(w.opens.length, 2, 'not held off for RETRY_AFTER_MS');
   assert.equal(loop.held?.windowId, 'sol-phoenix-hyperliquid');
 });
+
+test('the book: an act carries its start; the fills of an exit or open that did not end as asked are booked as fill', async () => {
+  const records: BookRecord[] = [];
+  const fills = [{ venue: 'hyperliquid', side: 'BUY' as const, qty: '2', avgPx: 100, feeUsd: 0.05 }];
+  const w = world();
+  // The open takes 90 s: the record is written after it, the start is before its first order.
+  w.openAnswer = () => {
+    w.now += 90_000;
+    return { ...OK('opened'), fills };
+  };
+  const loop = makeLoop(w, tmpStore(), { book: (r) => records.push(r) });
+  w.next = { decision: { action: 'enter', reason: 'go' }, act: ENTER_SOL };
+  await loop.check();
+  assert.deepEqual([records[0]!.kind, records[0]!.startedAt, records[0]!.at], ['enter', T0, T0 + 90_000]);
+  // An exit that filled part and did not end flat: its fills go to the book as `fill`, the position stays held.
+  w.closeAnswer = () => ({ ok: false, reason: 'one leg did not fill', sent: true, tx: [], feeUsd: 0.05, open: [], fills });
+  w.next = { decision: { action: 'exit', reason: 'below the bar' }, act: { kind: 'exit', reason: 'below the bar' } };
+  w.now += 60_000;
+  await loop.check();
+  assert.deepEqual(records.map((r) => r.kind), ['enter', 'fill']);
+  assert.deepEqual([records[1]!.windowId, records[1]!.legs, records[1]!.exitReason], ['sol-phoenix-hyperliquid', fills, 'one leg did not fill']);
+  // One that filled nothing adds nothing.
+  w.closeAnswer = () => ({ ok: false, reason: 'refused', sent: false, tx: [], feeUsd: 0, open: [] });
+  w.now += 60_000;
+  await loop.check();
+  assert.equal(records.length, 2);
+  // An open that failed and left the desk flat, with fills on the way: booked as `fill` of that window.
+  const w2 = world();
+  w2.openAnswer = () => ({ ok: false, reason: 'unwound: the other leg did not fill', sent: true, tx: [], feeUsd: 0.1, open: [], fills });
+  const r2: BookRecord[] = [];
+  const loop2 = makeLoop(w2, tmpStore(), { book: (r) => r2.push(r) });
+  w2.next = { decision: { action: 'enter', reason: 'go' }, act: ENTER_SOL };
+  await loop2.check();
+  assert.deepEqual(r2.map((r) => [r.kind, r.windowId, r.startedAt]), [['fill', 'sol-phoenix-hyperliquid', T0]]);
+});

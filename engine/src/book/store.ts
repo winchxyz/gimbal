@@ -1,15 +1,24 @@
-// The book on disk: an append-only JSONL of BookEvents (the record) and a derived summary JSON next to it, both
-// written atomically: a temporary file with the whole new content, fsynced, then renamed over the old one. A crash
-// before the rename leaves the old file whole (and a stray .tmp, which the next write replaces); the summary is
-// always derived again from the JSONL on load, so a crash between the two renames only leaves a stale summary.
+// The book on disk: an append-only JSONL of BookEvents (the record) and a derived summary JSON next to it.
+//
+// The JSONL is appended to, never rewritten: the new lines in one write, then fsync (and the directory's fsync when
+// the write created the file). A crash in that write can leave the last line torn (no newline, not JSON): load drops
+// it and cuts the file back to the last whole line, so the next append starts clean. Any other line that is not a
+// whole event is refused: a book is never trimmed in the middle to make it readable.
+//
+// The summary is written atomically (the whole content to a temporary file, fsync, rename, then the directory's
+// fsync): a crash before the rename leaves the old summary whole. It is always derived again from the JSONL, so a
+// stale one is only stale.
 
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeSync } from 'node:fs';
+import {
+  closeSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, truncateSync, unlinkSync, writeSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { Mode } from '@gimbal/shared';
 import type { BookEvent } from './types.ts';
 import { BOOK_VERSION } from './types.ts';
 
 const SAFE = /^[a-z0-9._-]{1,64}$/;
+const TYPES = ['desk', 'enter', 'exit', 'fill', 'funding', 'fee', 'transfer', 'sync', 'journal'];
 
 /** The book's JSONL path: one per mode, contract and desk, next to the loop and trader state. */
 export function bookFile(dir: string, mode: Mode, contractId: string | null, deskId: string | null): string {
@@ -38,12 +47,23 @@ export function bookFilesIn(dir: string): string[] {
   return names.filter((n) => /^book-.*\.jsonl$/.test(n)).sort().map((n) => join(dir, n));
 }
 
-/** Hooks for tests: called after the temporary file is written and fsynced, before the rename. */
+/** Hooks for tests: called after the summary's temporary file is written and fsynced, before the rename. */
 export interface StoreHooks {
   beforeRename?: (tmp: string, target: string) => void;
 }
 
-/** Atomic: the whole content to `<path>.tmp`, fsynced, renamed over `path`. Throws when it could not. */
+/** fsync a directory, so a created or renamed entry in it survives a power cut. Windows cannot: skipped there. */
+export function fsyncDir(dir: string): void {
+  if (process.platform === 'win32') return;
+  const fd = openSync(dir, 'r');
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Atomic: the whole content to `<path>.tmp`, fsynced, renamed over `path`, the directory fsynced. Throws when it could not. */
 export function writeAtomic(path: string, content: string, hooks: StoreHooks = {}): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp`;
@@ -65,37 +85,57 @@ export function writeAtomic(path: string, content: string, hooks: StoreHooks = {
     }
     throw err;
   }
+  fsyncDir(dirname(path));
 }
 
-/** Parses a book's JSONL. Every line must be a whole event: a book is never trimmed to make it readable. */
-export function parseBook(text: string, source = 'book'): BookEvent[] {
+function parseLine(line: string, where: string): BookEvent {
+  let v: unknown;
+  try {
+    v = JSON.parse(line);
+  } catch (err) {
+    throw new Error(`${where}: not JSON (${(err as Error).message})`);
+  }
+  const o = v as { v?: unknown; type?: unknown } | null;
+  if (o === null || typeof o !== 'object') throw new Error(`${where}: not an object`);
+  if (o.v !== BOOK_VERSION) throw new Error(`${where}: version ${JSON.stringify(o.v)}, not ${BOOK_VERSION}`);
+  if (!TYPES.includes(String(o.type))) throw new Error(`${where}: unknown event type ${JSON.stringify(o.type)}`);
+  return v as BookEvent;
+}
+
+/**
+ * Parses a book's JSONL. `torn` is the byte length of a last line that has no newline and is not a whole event (a
+ * write cut off by a crash); it is not in `events`. Every other line must be a whole event.
+ */
+export function parseBook(text: string, source = 'book'): { events: BookEvent[]; torn: number } {
   const out: BookEvent[] = [];
   const lines = text.split('\n');
+  const last = lines.length - 1;
+  let torn = 0;
   lines.forEach((line, i) => {
     if (line.trim() === '') return;
-    let v: unknown;
-    try {
-      v = JSON.parse(line);
-    } catch (err) {
-      throw new Error(`${source}:${i + 1}: not JSON (${(err as Error).message})`);
+    if (i === last) {
+      // No newline after it: the last write may have been cut off.
+      try {
+        out.push(parseLine(line, `${source}:${i + 1}`));
+      } catch {
+        torn = Buffer.byteLength(line);
+      }
+      return;
     }
-    const o = v as { v?: unknown; type?: unknown } | null;
-    if (o === null || typeof o !== 'object') throw new Error(`${source}:${i + 1}: not an object`);
-    if (o.v !== BOOK_VERSION) throw new Error(`${source}:${i + 1}: version ${JSON.stringify(o.v)}, not ${BOOK_VERSION}`);
-    if (!['desk', 'enter', 'exit', 'funding', 'fee', 'transfer', 'sync', 'journal'].includes(String(o.type))) {
-      throw new Error(`${source}:${i + 1}: unknown event type ${JSON.stringify(o.type)}`);
-    }
-    out.push(v as BookEvent);
+    out.push(parseLine(line, `${source}:${i + 1}`));
   });
-  return out;
+  return { events: out, torn };
 }
 
 export class BookStore {
   readonly path: string;
   readonly summaryPath: string;
   readonly #hooks: StoreHooks;
-  #text = '';
   #events: BookEvent[] = [];
+  /** The file ends without a newline (its last line is whole): the next append starts with one. */
+  #needsNewline = false;
+  /** What load() repaired, for the log. */
+  repaired: string | null = null;
 
   constructor(path: string, hooks: StoreHooks = {}) {
     this.path = path;
@@ -103,8 +143,11 @@ export class BookStore {
     this.#hooks = hooks;
   }
 
-  /** Reads the JSONL; a missing file is an empty book. Throws on an unreadable one (never starts it over). */
-  load(): BookEvent[] {
+  /**
+   * Reads the JSONL; a missing file is an empty book. A torn last line is dropped and, unless `repair` is false (a
+   * reader that must not write), cut from the file; `repaired` says so. Throws on any other unreadable line.
+   */
+  load(options: { repair?: boolean } = {}): BookEvent[] {
     let text: string;
     try {
       text = readFileSync(this.path, 'utf8');
@@ -112,8 +155,16 @@ export class BookStore {
       if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
       text = '';
     }
-    this.#events = parseBook(text, this.path);
-    this.#text = text === '' || text.endsWith('\n') ? text : `${text}\n`;
+    const parsed = parseBook(text, this.path);
+    this.#events = parsed.events;
+    this.repaired = null;
+    this.#needsNewline = false;
+    if (parsed.torn > 0) {
+      this.repaired = `dropped a torn last line (${parsed.torn} bytes, a write cut off)`;
+      if (options.repair !== false) truncateSync(this.path, Buffer.byteLength(text) - parsed.torn);
+    } else {
+      this.#needsNewline = text !== '' && !text.endsWith('\n');
+    }
     return [...this.#events];
   }
 
@@ -121,13 +172,36 @@ export class BookStore {
     return this.#events;
   }
 
-  /** Appends events: the old lines unchanged plus the new ones, written atomically. Memory moves only once on disk. */
-  append(events: readonly BookEvent[]): void {
+  /**
+   * Appends events in one write, fsynced; memory moves only once the write went through. `persist` false: memory only
+   * (a reader that must not write, the report's --sync).
+   */
+  append(events: readonly BookEvent[], persist = true): void {
     if (events.length === 0) return;
-    const text = this.#text + events.map((e) => `${JSON.stringify(e)}\n`).join('');
-    writeAtomic(this.path, text, this.#hooks);
-    this.#text = text;
-    this.#events = [...this.#events, ...events];
+    if (!persist) {
+      this.#events.push(...events);
+      return;
+    }
+    const text = `${this.#needsNewline ? '\n' : ''}${events.map((e) => `${JSON.stringify(e)}\n`).join('')}`;
+    mkdirSync(dirname(this.path), { recursive: true });
+    let created = false;
+    let fd: number;
+    try {
+      fd = openSync(this.path, 'wx');
+      created = true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      fd = openSync(this.path, 'a');
+    }
+    try {
+      writeSync(fd, text);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    if (created) fsyncDir(dirname(this.path));
+    this.#needsNewline = false;
+    this.#events.push(...events);
   }
 
   writeSummary(summary: unknown): void {

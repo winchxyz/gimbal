@@ -99,12 +99,14 @@ export interface MarginMove {
 }
 
 /**
- * One carried-out enter or exit, for the position book (engine/src/book/, built later). A rotation is an exit of
+ * One carried-out enter or exit, for the position book (engine/src/book/). A rotation is an exit of
  * `rotation.fromId` then an enter of `rotation.toId`, both carrying `rotation`; a rotation whose open was refused
- * is the exit alone.
+ * is the exit alone. `fill`: an open or close that did not end as asked but filled something (its fills and fees).
  */
 export interface BookRecord {
-  kind: 'enter' | 'exit';
+  kind: 'enter' | 'exit' | 'fill';
+  /** When the act began (before its first order): the hold starts here. */
+  startedAt?: number;
   windowId: string;
   symbol: string;
   at: number;
@@ -765,14 +767,16 @@ export class StrategyLoop {
         this.#refuseOnce(key, `rotate ${p.fromId} -> ${w.id} not carried out: ${gate}`);
         return { ...SKIPPED, passing: true };
       }
+      const closeAt = this.#o.clock.now();
       const closed = await hands.close({ reason: `strategy: rotate out of ${p.fromId} into ${w.id} (${who})` });
       this.#owner(closed.open);
       if (!closed.ok) {
+        this.#record('fill', { windowId: p.fromId, symbol: this.#state.held?.symbol ?? '', outcome: closed, forecastNetAprPct: null, exitReason: closed.reason, rotation: null, manual: p.manual, startedAt: closeAt });
         this.#journal(closed.sent ? 'error' : 'refused', `rotate ${p.fromId} -> ${w.id}: the close of ${p.fromId} ${closed.sent ? 'did not end flat' : 'was refused'}: ${closed.reason}; nothing opened`, { ...base, from: p.fromId, feeUsd: closed.feeUsd }, closed.tx);
         return { end: 'skipped', sent: closed.sent, passing: false };
       }
       const fromHeld = this.#state.held;
-      this.#record('exit', { windowId: p.fromId, symbol: fromHeld?.symbol ?? '', outcome: closed, forecastNetAprPct: fromHeld?.entryNetAprPct ?? null, exitReason: `rotate into ${w.id}`, rotation: { fromId: p.fromId, toId: w.id }, manual: p.manual });
+      this.#record('exit', { windowId: p.fromId, symbol: fromHeld?.symbol ?? '', outcome: closed, forecastNetAprPct: fromHeld?.entryNetAprPct ?? null, exitReason: `rotate into ${w.id}`, rotation: { fromId: p.fromId, toId: w.id }, manual: p.manual, startedAt: closeAt });
       this.#setHeld(null);
       this.#journal('exit', `rotate: ${p.fromId} closed (${who})${fromHeld === null ? '' : `, held since ${new Date(fromHeld.since).toISOString()}`}; ${closed.reason}`, { window: p.fromId, feeUsd: closed.feeUsd, by: who, stage: 'rotate' }, closed.tx);
     }
@@ -782,6 +786,7 @@ export class StrategyLoop {
       this.#journal('refused', `${kind} ${w.id} not carried out: ${gate}${flat}`, base);
       return p.fromId === null ? { ...SKIPPED, passing: true } : { end: 'flat', sent: true, passing: true };
     }
+    const openAt = this.#o.clock.now();
     const opened = await hands.open({ window: w, symbol: sym.symbol, legUsd: p.legUsd, leverage: p.leverage, qty: p.qty, reason: `strategy: ${kind} ${w.id} (${who})` });
     this.#owner(opened.open);
     const now = this.#o.clock.now();
@@ -790,10 +795,11 @@ export class StrategyLoop {
       if (opened.sent && after !== null) {
         // Orders went out and the venues hold a position: the desk holds it, the book sees the entry.
         this.#setHeld({ windowId: w.id, symbol: sym.symbol, since: now, legUsd: after.legUsd, entryNetAprPct: w.netAprPct });
-        this.#record('enter', { windowId: w.id, symbol: sym.symbol, outcome: opened, forecastNetAprPct: w.netAprPct, exitReason: null, rotation: p.fromId === null ? null : { fromId: p.fromId, toId: w.id }, manual: p.manual });
+        this.#record('enter', { windowId: w.id, symbol: sym.symbol, outcome: opened, forecastNetAprPct: w.netAprPct, exitReason: null, rotation: p.fromId === null ? null : { fromId: p.fromId, toId: w.id }, manual: p.manual, startedAt: openAt });
         this.#journal('error', `${kind} ${w.id}: ${opened.reason}; the venues hold ${after.symbol} (${round(after.legUsd)} USD a leg${after.oneLeg === null ? '' : `, one leg only: ${after.oneLeg.venue} ${after.oneLeg.qty}`}): held from now`, { ...base, heldLegUsd: round(after.legUsd), feeUsd: opened.feeUsd }, opened.tx);
         return { end: 'done', sent: true, passing: false };
       }
+      this.#record('fill', { windowId: w.id, symbol: sym.symbol, outcome: opened, forecastNetAprPct: null, exitReason: opened.reason, rotation: null, manual: p.manual, startedAt: openAt });
       this.#journal(opened.sent ? 'error' : 'refused', `${kind} ${w.id}: ${opened.reason}${flat}`, { ...base, feeUsd: opened.feeUsd }, opened.tx);
       // Stopped by the open's own gate (a rescue that started after the check before it): tried again next check.
       const passing = this.#gate() !== null;
@@ -801,7 +807,7 @@ export class StrategyLoop {
     }
     // Held from now: an entry's time, or the rotation's.
     this.#setHeld({ windowId: w.id, symbol: sym.symbol, since: now, legUsd: p.legUsd, entryNetAprPct: w.netAprPct });
-    this.#record('enter', { windowId: w.id, symbol: sym.symbol, outcome: opened, forecastNetAprPct: w.netAprPct, exitReason: null, rotation: p.fromId === null ? null : { fromId: p.fromId, toId: w.id }, manual: p.manual });
+    this.#record('enter', { windowId: w.id, symbol: sym.symbol, outcome: opened, forecastNetAprPct: w.netAprPct, exitReason: null, rotation: p.fromId === null ? null : { fromId: p.fromId, toId: w.id }, manual: p.manual, startedAt: openAt });
     this.#journal(kind, `${kind === 'rotate' ? `rotate ${p.fromId} -> ${w.id}` : `enter ${w.id}`}, ${sym.symbol} short hyperliquid, long phoenix, at most ${p.qty} ${sym.symbol} (${p.legUsd} USD) a leg at ${p.leverage}x, ${round(w.netAprPct)} % net (${who})${p.reason === undefined ? '' : `: ${p.reason}`}; ${opened.reason}`,
       { ...base, usd: p.legUsd, feeUsd: opened.feeUsd, ...(p.fromId === null ? {} : { from: p.fromId }) }, opened.tx);
     return { end: 'done', sent: true, passing: false };
@@ -819,13 +825,15 @@ export class StrategyLoop {
       return { ...SKIPPED, passing: true };
     }
     const pnl = hands.held()?.pnlUsd;
+    const closeAt = this.#o.clock.now();
     const r = await hands.close({ reason: `strategy: exit ${id} (${who}): ${reason}` });
     this.#owner(r.open);
     if (!r.ok) {
+      this.#record('fill', { windowId: id, symbol: held?.symbol ?? '', outcome: r, forecastNetAprPct: null, exitReason: r.reason, rotation: null, manual, startedAt: closeAt });
       this.#journal(r.sent ? 'error' : 'refused', `exit ${id}: ${r.reason}`, { window: id, by: who, feeUsd: r.feeUsd }, r.tx);
       return { end: 'skipped', sent: r.sent, passing: false };
     }
-    this.#record('exit', { windowId: id, symbol: held?.symbol ?? '', outcome: r, forecastNetAprPct: held?.entryNetAprPct ?? null, exitReason: reason, rotation: null, manual });
+    this.#record('exit', { windowId: id, symbol: held?.symbol ?? '', outcome: r, forecastNetAprPct: held?.entryNetAprPct ?? null, exitReason: reason, rotation: null, manual, startedAt: closeAt });
     this.#setHeld(null);
     this.#journal('exit', `exit ${id}: ${reason}; ${r.reason} (${who})`, { window: id, by: who, feeUsd: r.feeUsd, ...(pnl === undefined ? {} : { pnlUsd: round(pnl) }) }, r.tx);
     return { end: 'done', sent: true, passing: false };
@@ -845,14 +853,16 @@ export class StrategyLoop {
       say('error', `${line}: not closed this check, ${gate}`, { venue: leg.venue, qty: leg.qty });
       return;
     }
+    const closeAt = this.#o.clock.now();
     const r = await this.#o.hands!.close({ reason: `strategy: ${line}, closed reduce-only` });
     this.#owner(r.open);
     if (!r.ok) {
+      this.#record('fill', { windowId: this.#state.held?.windowId ?? `${leg.venue} leg`, symbol: this.#state.held?.symbol ?? '', outcome: r, forecastNetAprPct: null, exitReason: r.reason, rotation: null, manual: false, startedAt: closeAt });
       say('error', `${line}: the close did not end flat: ${r.reason}`, { venue: leg.venue, qty: leg.qty, feeUsd: r.feeUsd }, r.tx);
       return;
     }
     const held = this.#state.held;
-    this.#record('exit', { windowId: held?.windowId ?? `${leg.venue} leg`, symbol: held?.symbol ?? '', outcome: r, forecastNetAprPct: held?.entryNetAprPct ?? null, exitReason: line, rotation: null, manual: false });
+    this.#record('exit', { windowId: held?.windowId ?? `${leg.venue} leg`, symbol: held?.symbol ?? '', outcome: r, forecastNetAprPct: held?.entryNetAprPct ?? null, exitReason: line, rotation: null, manual: false, startedAt: closeAt });
     this.#setHeld(null);
     this.#patchCounters({ badChecks: 0, betterByWindow: {}, lastExitAt: this.#o.clock.now() });
     this.#oneLegLine = null;
@@ -934,14 +944,15 @@ export class StrategyLoop {
   }
 
   /** A carried-out enter or exit, to the book. Its failure is logged, never the act's. */
-  #record(kind: 'enter' | 'exit', p: {
+  #record(kind: 'enter' | 'exit' | 'fill', p: {
     windowId: string; symbol: string; outcome: ActOutcome; forecastNetAprPct: number | null; exitReason: string | null;
-    rotation: { fromId: string; toId: string } | null; manual: boolean;
+    rotation: { fromId: string; toId: string } | null; manual: boolean; startedAt: number;
   }): void {
     if (this.#o.book === undefined) return;
+    if (kind === 'fill' && (p.outcome.fills ?? []).length === 0) return;
     try {
       this.#o.book({
-        kind, windowId: p.windowId, symbol: p.symbol, at: this.#o.clock.now(), legs: p.outcome.fills ?? [], feeUsd: p.outcome.feeUsd, tx: p.outcome.tx,
+        kind, windowId: p.windowId, symbol: p.symbol, at: this.#o.clock.now(), startedAt: p.startedAt, legs: p.outcome.fills ?? [], feeUsd: p.outcome.feeUsd, tx: p.outcome.tx,
         forecastNetAprPct: p.forecastNetAprPct, exitReason: p.exitReason, rotation: p.rotation, by: p.manual ? 'manual' : 'auto', marginMoves: [],
       });
     } catch (err) {
