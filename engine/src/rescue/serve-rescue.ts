@@ -39,6 +39,7 @@ import { NearApiTransport } from '../contract/near-transport.ts';
 import type { DeskView } from '../contract/types.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import { checkContractNetwork, contractEnv } from '../cli/serve-contract.ts';
+import { ConfigError } from '../cli/start-errors.ts';
 import { ArbitrumSubmitter } from '../relayer/arbitrum.ts';
 import { HyperliquidSubmitter } from '../relayer/hyperliquid.ts';
 import { solanaChain } from '../relayer/phoenix-money.ts';
@@ -269,9 +270,9 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
     };
   }
   const cfg = contractEnv(env, mode, { signing: true });
-  if (cfg === null) throw new Error('GIMBAL_RESCUE=1 needs GIMBAL_CONTRACT_ID, GIMBAL_DESK_ID and the operator key');
+  if (cfg === null) throw new ConfigError('GIMBAL_RESCUE=1 needs GIMBAL_CONTRACT_ID, GIMBAL_DESK_ID and the operator key');
   const relayerKey = env('RELAYER_EVM_PRIVATE_KEY');
-  if (relayerKey === undefined) throw new Error('GIMBAL_RESCUE=1 needs RELAYER_EVM_PRIVATE_KEY (the gas wallet that submits evm_usdc_to_intents)');
+  if (relayerKey === undefined) throw new ConfigError('GIMBAL_RESCUE=1 needs RELAYER_EVM_PRIVATE_KEY (the gas wallet that submits evm_usdc_to_intents)');
   const transport = new NearApiTransport({
     network: cfg.network, accountId: cfg.accountId!, privateKey: cfg.privateKey!, ...(cfg.rpcUrl === undefined ? {} : { rpcUrl: cfg.rpcUrl }),
   });

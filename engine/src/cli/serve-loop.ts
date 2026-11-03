@@ -74,8 +74,13 @@ export interface ServeLoopInput {
 
 export function serveLoop(input: ServeLoopInput): StrategyLoop {
   const trade = input.env('GIMBAL_TRADE') === '1' && !input.once;
+  // A pair whose start is not confirmed (review S1): its legs are unknown, so the loop decides nothing (a held
+  // record must not read as "closed outside the loop") and every act, a manual one too, is refused with the reason.
+  const unconfirmed = () => input.pair?.unconfirmed?.() ?? null;
+  const busy = () => unconfirmed() ?? input.busy();
+  const orderGate = () => unconfirmed() ?? (input.orderGate ?? input.busy)();
   const pairHands = input.pair?.hands;
-  const hands = input.hands !== undefined ? input.hands : pairHands === undefined ? null : loopHands(pairHands, input.lastDesk, input.log, input.busy, input.orderGate ?? input.busy);
+  const hands = input.hands !== undefined ? input.hands : pairHands === undefined ? null : loopHands(pairHands, input.lastDesk, input.log, busy, orderGate);
   const handsWhy = hands !== null ? undefined
     : input.pair === null ? (input.mode === 'mainnet' ? 'no contract desk is set (GIMBAL_CONTRACT_ID, DESK_ID)' : `serve holds a pair on mainnet only, this is ${input.mode}`)
     : input.pair.notTrading() ?? 'the pair is alert only';
@@ -100,7 +105,7 @@ export function serveLoop(input: ServeLoopInput): StrategyLoop {
     },
     liveRescue: () => Object.fromEntries(LOOP_VENUES.map((v) => [v, input.rescueLive && LIVE_RESCUE[v] === true])),
     ...(facts === undefined ? {} : { facts }),
-    busy: input.busy, store, publish: input.publish, clock: input.clock, log: input.log,
+    busy, store, publish: input.publish, clock: input.clock, log: input.log,
     ...(input.decide === undefined ? {} : { decide: input.decide }),
     ...(input.veto === undefined ? {} : { veto: input.veto }),
     ...(input.book === undefined ? {} : { book: input.book }),

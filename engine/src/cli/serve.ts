@@ -88,6 +88,7 @@ import { liveLines, servePair } from './serve-pair.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { connectContract, contractEnv, marginVenues } from './serve-contract.ts';
 import { serveLoop } from './serve-loop.ts';
+import { ConfigError, retryStart } from './start-errors.ts';
 import type { StrategyLoop } from '../strategy/loop.ts';
 import { ThinningSink, WATCH_RECORD_GAPS, loadPolicyFile, replayStart, scanLine } from './serve-replay.ts';
 
@@ -135,14 +136,16 @@ try {
   const cfg = contractEnv(envVar, mode);
   if (cfg !== null) {
     deskId = cfg.deskId;
-    contract = await connectContract(cfg, {
+    // Review S1: a NEAR RPC that does not answer is tried again (backoff up to 60 s), never an exit; the desk names
+    // every account serve watches, so nothing else starts before it. A configuration error still stops serve.
+    contract = await retryStart(`contract ${cfg.contractId}`, () => connectContract(cfg, {
       onHealth: (status, detail) => {
         venueHealth.near(status);
         log(`near ${status}: ${detail}`);
         publishHealth();
       },
       onError: (message) => noteOnce(message),
-    });
+    }), { log });
     if (policy !== null) log(`${policyFile}: ignored, the policy is get_desk(${cfg.deskId})'s`);
     policy = contract.policy;
     log(`contract ${cfg.contractId} (${cfg.network}), desk ${cfg.deskId}: policy read, ${contract.prices.size} stored prices`);
@@ -221,6 +224,8 @@ const scanner = new Scanner(readers.venues, readers.watch, {
 let loop: StrategyLoop | null = null;
 
 let scans = 0;
+/** What the start could not do (a read that failed, not a configuration error): journaled once the server runs. */
+const startNotes: string[] = [];
 /** A `health` event whenever a desk venue's, 1Click's or NEAR's state changes (with the risk engine: and a journal line). */
 function publishHealth(): void {
   if (server === null) return;
@@ -244,7 +249,14 @@ else if (saved.strategy !== null) log(`engine rules from ${strategyStore.path}`)
 const nearAi = new NearAiClient({ apiKey: envVar('NEAR_AI_API_KEY') });
 const drafter = new PolicyDrafter({ client: nearAi, markets: deskMarkets(readers.venues) });
 log(drafter.configured ? `policy drafts: NEAR AI ${drafter.model}` : 'policy drafts: off (NEAR_AI_API_KEY is not set), POST /policy/draft answers 503');
-const setup = await setupFromEnv(mode, envVar, log).catch((err: unknown) => fail(`setup: ${errorMessage(err)}`));
+const setup = await setupFromEnv(mode, envVar, log).catch((err: unknown) => {
+  if (err instanceof ConfigError) fail(`setup: ${errorMessage(err)}`);
+  // Review S1: NEAR not answering at start turns POST /setup off for this run instead of stopping serve.
+  const note = `venue setup: off for this run (POST /setup answers 503): its start read failed (${errorMessage(err)}); restart serve to try again`;
+  log(note);
+  startNotes.push(note);
+  return null;
+});
 
 // The 25 % liquidation alert rides on every `desk` event the risk engine publishes (risk/monitor.ts).
 const liquidation = new LiquidationAlert();
@@ -306,6 +318,11 @@ if (contract !== null && deskId !== null) {
   pair = await servePair({
     mode, env: envVar, side, deskId: id, clock, log, publish, linkedWorktree: linkedWorktree(), once: values.once === true,
     ...(stateDirSet === undefined ? {} : { stateDir: resolve(stateDirSet) }),
+    // Review S1: a start read that fails degrades the pair (alert only, legs unknown, retried); health says which venue.
+    health: (venue, status, detail) => {
+      venueHealth.pairStart(venue, status, detail);
+      publishHealth();
+    },
   }).catch((err: unknown) => fail(`pair: ${errorMessage(err)}`));
 }
 // --once is alert only: nothing it starts may be cut off by its exit (a rescue's transfer included).
@@ -315,8 +332,8 @@ if (deskSource !== null) {
   // GIMBAL_RESCUE=1 on mainnet); its reduce and panic_close trade through the pair when it trades.
   const side = contract;
   const servedPair = pair;
-  const rescue = await serveRescue({
-    mode, env: rescueEnv, clock, publish, log, risk: () => risk, policy, reducer: () => pair?.reducer() ?? null,
+  const rescueInput = (env: (name: string) => string | undefined): Parameters<typeof serveRescue>[0] => ({
+    mode, env, clock, publish, log, risk: () => risk, policy, reducer: () => pair?.reducer() ?? null,
     ...(stateDirSet === undefined ? {} : { stateDir: resolve(stateDirSet) }),
     closing: {
       notTrading: () => servedPair?.notTrading() ?? null,
@@ -330,6 +347,15 @@ if (deskSource !== null) {
         return view;
       },
     }),
+  });
+  // Review S1: a live rescuer whose start read fails (NEAR RPC, Phoenix, Solana) does not stop serve: the rescue runs
+  // detect only for this run, and the owner hears of it. A configuration error still stops serve.
+  const rescue = await serveRescue(rescueInput(rescueEnv)).catch(async (err: unknown) => {
+    if (err instanceof ConfigError) fail(`rescue: ${errorMessage(err)}`);
+    const note = `rescue: the live rescuer did not start (${errorMessage(err)}): detect only for this run, triggers are journaled and the owner acts; restart serve to try the live rescuer again`;
+    log(note);
+    startNotes.push(note);
+    return serveRescue(rescueInput((name) => (name === 'GIMBAL_RESCUE' ? undefined : rescueEnv(name))));
   }).catch((err: unknown) => fail(`rescue: ${errorMessage(err)}`));
   closingWatch = rescue.closing;
   rescueStop = rescue.stop;
@@ -412,6 +438,10 @@ server = new EngineServer({
 const listening = await server.start(port, host);
 risk?.start();
 publishHealth();
+for (const [i, summary] of startNotes.entries()) {
+  const t = clock.now();
+  server.publish({ type: 'journal', data: { id: `start-${t.toString(36)}-${i}`, t, kind: 'error', summary, numbers: { stage: 'start' }, tx: [] } });
+}
 let intentsTimer: ReturnType<typeof setInterval> | undefined;
 if (mode !== 'replay') {
   // 1Click has no testnet: its mainnet API is probed in both live modes (a public GET, no key, nothing sent).

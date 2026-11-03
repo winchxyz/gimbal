@@ -20,7 +20,7 @@ import { STRATEGY, T0, win as deskWin } from '../strategy/test-helpers.ts';
 import { VirtualClock, readRecording } from '../venues/replay.ts';
 import { replayStart } from './serve-replay.ts';
 import { fillsOf, loopHands, openedQty, serveLoop, windowFacts, windowSymbol } from './serve-loop.ts';
-import type { PairHands } from './serve-pair.ts';
+import type { PairHands, ServePair } from './serve-pair.ts';
 import { toQty } from '../trade/lots.ts';
 import type { PairResult } from '../trade/pair.ts';
 import type { VenueReader } from '../venues/venue.ts';
@@ -276,6 +276,40 @@ test('the real decide(): three hourly checks above the bar, then the exact qty i
   assert.equal(opens[0]!.qty, '0.12');
   const enter = events.filter((e) => e.type === 'journal').map((e) => e.data as JournalEntry).find((j) => j.kind === 'enter')!;
   assert.equal(enter.numbers.qty, '0.12');
+  loop.stop();
+});
+
+test('a pair whose start is not confirmed: the loop decides nothing and refuses every act, a manual one too, with the reason', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gimbal-serve-loop-'));
+  dirs.push(dir);
+  let pending: string | null = 'legs unknown, start not confirmed: phoenix: the trader snapshot is at slot 100, still before slot 120';
+  let decided = 0;
+  const logs: string[] = [];
+  const hands: PairHands = {
+    symbols: ['SOL'], blocked: () => null, heldSymbol: () => null, heldLegs: () => [],
+    open: async () => ({ ok: false, reason: 'not here', results: [], lines: [], open: [], tx: [], feeUsd: 0 }),
+    close: async () => ({ ok: false, reason: 'not here', results: [], lines: [], open: [], tx: [], feeUsd: 0 }),
+    reconcile: async () => null,
+  };
+  const pair = { hands, unconfirmed: () => pending, notTrading: () => pending } as unknown as ServePair;
+  const loop = serveLoop({
+    mode: 'mainnet', env: (n) => (n === 'GIMBAL_TRADE' ? '1' : undefined), once: false, stateDir: dir, contractId: 'gimbal.near', deskId: 'desk-1',
+    pair, lastDesk: () => null, accounts: [], rescueLive: false, busy: () => null, windows: () => [],
+    strategy: () => ({ ...DEFAULT_STRATEGY, auto: true }), policy: () => null, publish: () => {}, clock: { now: () => T0 }, log: (l) => logs.push(l),
+    decide: (input) => {
+      decided++;
+      return { counters: input.counters, act: null, vetoCandidate: null, decision: { action: 'wait', reason: 'test', windowId: null, heldId: null, at: input.now } };
+    },
+  });
+  await loop.check();
+  assert.equal(decided, 0, 'no decision on legs that are unknown');
+  assert.ok(logs.includes(`strategy loop: no decision now, ${pending}`), logs.join('\n'));
+  assert.deepEqual(loop.close(), { ok: false, reason: pending });
+  assert.deepEqual(loop.rotate('sol-phoenix-hyperliquid'), { ok: false, reason: pending });
+  // Confirmed: the loop decides again.
+  pending = null;
+  await loop.check();
+  assert.equal(decided, 1);
   loop.stop();
 });
 

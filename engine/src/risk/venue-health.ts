@@ -12,6 +12,8 @@
 // 1Click is probed (GET /v0/tokens, public, no key): an error or a non-2xx is down, an answer over SLOW_READ_MS slow.
 // NEAR is the worse of the contract client's own health (the operator key's budget, slow MPC signatures) and the
 // desk view's (get_desk: slow when its latest read failed or is late, down when it was never read or is stale).
+// The pair trader's start (serve-pair.ts, review S1) adds its own word for Hyperliquid, Phoenix and NEAR until its
+// start is confirmed: down when a read it needs failed, slow when the Phoenix snapshot lags the chain.
 
 import type { HealthMap, ScanStatus, VenueId } from '@gimbal/shared';
 import type { NearHealth } from '../contract/budget.ts';
@@ -34,6 +36,8 @@ export interface VenueDetail {
   readError: string | null;
   readMs: number | null;
   withdrawalsPaused: string | null;   // the venue's words, while the report counts
+  /** Why the pair trader's start could not read this venue (null: it could, or it does not read it). */
+  start: string | null;
 }
 
 export class VenueHealth {
@@ -46,10 +50,11 @@ export class VenueHealth {
   #deskView: HealthStatus = 'ok';
   #deskViewDetail: string | null = null;
   #last: HealthMap | null = null;
+  readonly #start = new Map<HealthKey, { status: HealthStatus; detail: string | null }>();
 
   constructor(options: { now?: () => number } = {}) {
     this.#now = options.now ?? Date.now;
-    for (const v of DESK_VENUE_IDS) this.#venues.set(v, { status: 'ok', scanFailed: false, readError: null, readMs: null, withdrawalsPaused: null });
+    for (const v of DESK_VENUE_IDS) this.#venues.set(v, { status: 'ok', scanFailed: false, readError: null, readMs: null, withdrawalsPaused: null, start: null });
   }
 
   /** The scanner's view: the desk venues its last scan could not read. */
@@ -91,6 +96,14 @@ export class VenueHealth {
     this.#near = status;
   }
 
+  /** The pair trader's start reads (serve-pair.ts): `ok` once its start is confirmed. */
+  pairStart(key: 'hyperliquid' | 'phoenix' | 'near', status: HealthStatus, detail: string | null = null): void {
+    if (status === 'ok') this.#start.delete(key);
+    else this.#start.set(key, { status, detail });
+    const d = this.#venues.get(key as VenueId);
+    if (d !== undefined) d.start = status === 'ok' ? null : detail ?? status;
+  }
+
   /** The desk view's state (the risk engine sets it from its source's get_desk reads), and why. */
   deskView(status: HealthStatus, detail: string | null = null): void {
     this.#deskView = status;
@@ -99,13 +112,13 @@ export class VenueHealth {
 
   /** Why NEAR is not ok, when the desk view says so (null otherwise). */
   get nearDetail(): string | null {
-    return this.#deskView === 'ok' ? null : this.#deskViewDetail;
+    return this.#deskView === 'ok' ? this.#start.get('near')?.detail ?? null : this.#deskViewDetail;
   }
 
   detail(venue: VenueId): VenueDetail {
     this.#expire();
     const d = this.#venues.get(venue)!;
-    return { ...d, status: this.#status(d) };
+    return { ...d, status: worse(this.#status(d), this.#start.get(venue)?.status ?? 'ok') };
   }
 
   get intentsDetail(): string | null {
@@ -114,8 +127,8 @@ export class VenueHealth {
 
   map(): HealthMap {
     this.#expire();
-    const map = { intents: this.#intents, near: worse(this.#near, this.#deskView) } as HealthMap;
-    for (const [v, d] of this.#venues) map[v] = this.#status(d);
+    const map = { intents: this.#intents, near: worse(worse(this.#near, this.#deskView), this.#start.get('near')?.status ?? 'ok') } as HealthMap;
+    for (const [v, d] of this.#venues) map[v] = worse(this.#status(d), this.#start.get(v)?.status ?? 'ok');
     return map;
   }
 

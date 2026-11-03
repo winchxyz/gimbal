@@ -495,7 +495,7 @@ export class RiskEngine {
     for (const [k, status] of Object.entries(map)) {
       if (status === 'down' && !this.#down.has(k)) {
         this.#down.add(k);
-        const why = k === 'intents' ? this.#o.health.intentsDetail : k === 'near' ? this.#o.health.nearDetail : this.#o.health.detail(k as VenueId).readError;
+        const why = k === 'intents' ? this.#o.health.intentsDetail : k === 'near' ? this.#o.health.nearDetail : this.#o.health.detail(k as VenueId).readError ?? this.#o.health.detail(k as VenueId).start;
         this.#journal({ t, kind: 'error', summary: `${k} not answering${why === null ? '' : `: ${why}`}`, numbers: { venue: k }, tx: [] });
       } else if (status !== 'down') {
         this.#down.delete(k);
