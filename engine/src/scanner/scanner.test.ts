@@ -57,6 +57,8 @@ class FakeVenue {
 class HistoryVenue extends FakeVenue {
   readonly historyCalls: [string, number, number][] = [];
   historyError: Error | 'hang' | null = null;
+  /** No prints before this hour: a market listed then. */
+  listedAt = -Infinity;
   readonly rate: (symbol: string, hour: number) => number;
 
   constructor(id: VenueId, rows: MarketFunding[], rate: (symbol: string, hour: number) => number) {
@@ -69,7 +71,7 @@ class HistoryVenue extends FakeVenue {
     if (this.historyError === 'hang') return new Promise(() => {});
     if (this.historyError !== null) throw this.historyError;
     const points: MarketFundingPoint[] = [];
-    for (let t = Math.ceil(start / HOUR_MS) * HOUR_MS; t <= end; t += HOUR_MS) points.push({ time: t + 59, symbol, ratePerHour: this.rate(symbol, t), periodHours: 1 });
+    for (let t = Math.max(Math.ceil(start / HOUR_MS) * HOUR_MS, this.listedAt); t <= end; t += HOUR_MS) points.push({ time: t + 59, symbol, ratePerHour: this.rate(symbol, t), periodHours: 1 });
     return points.filter((p) => p.time <= end);
   }
 }
@@ -633,43 +635,123 @@ test('a desk pair whose hour is reversed: listed in the direction the week paid,
   ]);
 });
 
-test('an older read that fails: loading while it may still answer, then the 7 days alone, then the 14 days once it answers', async () => {
-  const hl = new HistoryVenue('hyperliquid', [DOGE_HL], () => 0.000026);
-  const phoenix = new HistoryVenue('phoenix', [DOGE_PH], () => 0.0000125);
-  const clock = new VirtualClock(T0);
-  const { scanner: s, notes } = scanner({ venues: [hl, phoenix] }, clock, { policy: DOGE_POLICY }, { strategy: () => LEG_20_ANY, oracle: dogeOracle(clock) });
-  await s.scan();
-  await s.idle();
-  // The weeks are in; Hyperliquid fails every read from now on, the week before included.
-  hl.historyError = new Error('HTTP 429');
-  const at = async (t: number) => {
-    clock.set(t);
-    const r = await s.scan();
+test('an older read the venue refuses: loading for an hour, then the 7 days alone, then the 14 days once it answers; 429s never give up', async () => {
+  const setup = async () => {
+    const hl = new HistoryVenue('hyperliquid', [DOGE_HL], () => 0.000026);
+    const phoenix = new HistoryVenue('phoenix', [DOGE_PH], () => 0.0000125);
+    const clock = new VirtualClock(T0);
+    const { scanner: s, notes } = scanner({ venues: [hl, phoenix] }, clock, { policy: DOGE_POLICY }, { strategy: () => LEG_20_ANY, oracle: dogeOracle(clock) });
+    await s.scan();
     await s.idle();
-    const w = byId(r.windows, 'doge-phoenix-hyperliquid')!;
-    return { w, e: s.carry(w.id)!.estimate };
+    const at = async (t: number) => {
+      clock.set(T0 + t);
+      const r = await s.scan();
+      await s.idle();
+      const w = byId(r.windows, 'doge-phoenix-hyperliquid')!;
+      return { w, e: s.carry(w.id)!.estimate };
+    };
+    return { hl, notes, at };
   };
-  // Its first and second failures, each tried again after historyRetryMs (60 s): still loading.
-  for (const t of [T0 + 5_000, T0 + 66_000, T0 + 127_000]) {
-    const { w, e } = await at(t);
-    assert.equal(e.state, 'loading', String(t - T0));
+  const MIN = 60_000;
+
+  // The weeks are in; Hyperliquid refuses every read from now on, the week before included.
+  const refused = await setup();
+  refused.hl.historyError = new Error('HTTP 404 not found');
+  // Tried again after 60 s, then 120, 240 ... up to 15 min: inside the hour from its first refusal, still loading.
+  for (const t of [5_000, 70_000, 30 * MIN, 59 * MIN]) {
+    const { w, e } = await refused.at(t);
+    assert.equal(e.state, 'loading', `${t / MIN} min`);
     assert.equal(isEnterable(w), false);
   }
-  assert.equal(notes.filter((n) => n.startsWith('hyperliquid older history DOGE failed: HTTP 429')).length, 3);
-  // After the third failure it is judged on the 7 days alone, and says so.
-  const fallback = await at(T0 + 130_000);
+  // Refused again an hour after the first time: it has failed for good, and the window is judged on its 7 days alone.
+  await refused.at(68 * MIN);
+  const fallback = await refused.at(69 * MIN);
   assert.equal(fallback.e.state, 'known');
   assert.equal(fallback.e.basis, '7d');
-  assert.ok(fallback.w.checks.some((c) => c.ok && c.text.includes('the 7-day spread of 11.83 % APR (the 14-day mean could not be had)')), JSON.stringify(fallback.w.checks));
+  // (The hour's live rates have joined the 7 days by now, so the mean has moved off 11.83 %.)
+  assert.ok(fallback.w.checks.some((c) => c.ok && /the 7-day spread of 11\.\d\d % APR \(the 14-day mean could not be had\)/.test(c.text)), JSON.stringify(fallback.w.checks));
   assert.equal(isEnterable(fallback.w), true);
-  // Tried again an hour later (the scan after the new hour's own read): once it answers, the 14 days count.
-  hl.historyError = null;
-  await at(T0 + 127_000 + HOUR_MS + 1_000);
-  await at(T0 + 127_000 + HOUR_MS + 6_000);
-  const later = await at(T0 + 127_000 + HOUR_MS + 11_000);
+  assert.ok(refused.notes.some((n) => n.startsWith('hyperliquid older history DOGE failed: HTTP 404 not found')));
+  // Still tried (every 15 min by then): once it answers, the 14 days count.
+  refused.hl.historyError = null;
+  await refused.at(84 * MIN);   // the new hour's own week read first
+  await refused.at(85 * MIN);   // then the week before
+  const later = await refused.at(86 * MIN);
   assert.equal(later.e.state, 'known');
-  assert.equal(later.e.gross.d14AprPct, 11.826);
+  assert.ok(later.e.gross.d14AprPct !== null);
   assert.ok(later.w.checks.some((c) => c.ok && c.text.includes('(the smaller of the 7- and 14-day means)')));
+
+  // A rate limit is not the venue saying no: two hours of 429s and the window still waits for its 14 days.
+  const limited = await setup();
+  limited.hl.historyError = new Error('HTTP 429 Too Many Requests');
+  for (const t of [5_000, 70_000, 30 * MIN, 68 * MIN, 100 * MIN, 130 * MIN]) {
+    const { w, e } = await limited.at(t);
+    assert.equal(e.state, 'loading', `${t / MIN} min`);
+    assert.equal(isEnterable(w), false);
+  }
+});
+
+test('a decaying spread of one sign is judged on its 7 days: 4.38 % against 10.91 % over 14 does not pay the round trip', async () => {
+  // Hyperliquid paid 0.000005/h this week and 0.00002/h the week before; Phoenix nothing. Short HL / long PH: 4.38 %
+  // over 7 days, (169 × 4.38 + 167 × 17.52) / 336 = 10.91 % over 14.
+  const weekAgo = CURRENT - 168 * HOUR_MS;
+  const hl = new HistoryVenue('hyperliquid', [DOGE_HL], (_s, t) => (t >= weekAgo ? 0.000005 : 0.00002));
+  const phoenix = new HistoryVenue('phoenix', [DOGE_PH], () => 0);
+  const clock = new VirtualClock(T0);
+  const { scanner: s } = scanner({ venues: [hl, phoenix] }, clock, { policy: DOGE_POLICY }, { strategy: () => LEG_20_ANY, oracle: DOGE_ORACLE });
+  for (const t of [0, 5_000]) {
+    clock.set(T0 + t);
+    await s.scan();
+    await s.idle();
+  }
+  clock.set(T0 + 10_000);
+  const r = await s.scan();
+  const w = byId(r.windows, 'doge-phoenix-hyperliquid')!;
+  const e = s.carry(w.id)!.estimate;
+  assert.equal(e.state, 'known');
+  assert.equal(e.basis, '7d');
+  assert.equal(e.expectedAprPct, 4.38);
+  assert.equal(e.gross.d14AprPct, 10.911);
+  assert.equal(e.ok, false);
+  assert.ok(w.checks.some((c) => !c.ok && c.text.includes('the 7-day spread of 4.38 % APR (the smaller of the 7- and 14-day means)')
+    && c.text.includes('no more than the')), JSON.stringify(w.checks));
+  assert.equal(isEnterable(w), false);
+});
+
+test('a market younger than 14 days: judged on its 7 days once the week before answers empty, on 14 once it has 303 hours', async () => {
+  // Hyperliquid DOGE listed 167 hours before this hour: the week read has its 168 prints, the older read none.
+  const listedAt = CURRENT - 167 * HOUR_MS;
+  const hl = new HistoryVenue('hyperliquid', [DOGE_HL], () => 0.000026);
+  hl.listedAt = listedAt;
+  const phoenix = new HistoryVenue('phoenix', [DOGE_PH], () => 0.0000125);
+  const clock = new VirtualClock(T0);
+  const { scanner: s, notes } = scanner({ venues: [hl, phoenix] }, clock, {}, { strategy: () => LEG_20_ANY });
+  for (const t of [0, 5_000]) {
+    clock.set(T0 + t);
+    await s.scan();
+    await s.idle();
+  }
+  assert.ok(notes.includes('hyperliquid older history DOGE: 0 prints against 168 for the week after it: a market younger than 14 days'), JSON.stringify(notes));
+  clock.set(T0 + 10_000);
+  await s.scan();
+  const young = s.carry('doge-phoenix-hyperliquid')!.estimate;
+  assert.deepEqual([young.state, young.basis, young.gross.d14AprPct], ['known', '7d', null]);
+  // An hour at a time, each hour's week read adding to the store: the 14 days count once 90 % of them (303) are in.
+  let upgradedAtAge: number | null = null;
+  for (let k = 1; k <= 140 && upgradedAtAge === null; k++) {
+    const now = CURRENT + k * HOUR_MS + 61_000;
+    clock.set(now);
+    await s.scan();
+    await s.idle();
+    const e = s.carry('doge-phoenix-hyperliquid')!.estimate;
+    if (e.gross.d14AprPct !== null) {
+      assert.equal(e.state, 'known');
+      upgradedAtAge = (CURRENT + k * HOUR_MS - listedAt) / HOUR_MS;
+    } else {
+      assert.equal(e.state, 'known', `hour ${k}: judged on 7 days until then, never loading`);
+    }
+  }
+  assert.ok(upgradedAtAge !== null && Math.abs(upgradedAtAge - 303) <= 2, String(upgradedAtAge));
 });
 
 test('a desk pair whose 7 and 14 days disagree in sign is listed in neither direction; held, it keeps its direction and fails', async () => {
@@ -704,8 +786,10 @@ test('a desk pair whose 7 and 14 days disagree in sign is listed in neither dire
   assert.equal(held.s.carry(w.id)!.estimate.state, 'mixed');
   assert.ok(w.checks.some((c) => !c.ok && c.text === 'The 7-day spread (11.83 % APR) and the 14-day spread (-11.47 % APR) point opposite ways: '
     + 'no steady carry in this direction'), JSON.stringify(w.checks));
-  // Its net APR stays this hour's: there is no multi-day figure to put in its place.
-  assert.equal(w.netAprPct, Math.round((w.grossAprPct - totalCosts(w)) * 1000) / 1000);
+  // Its net APR is its 7 days minus the round trip, not this hour's swing; the margin moves and the rescue reserve
+  // are not in its costs.
+  assert.equal(w.netAprPct, Math.round((11.826 - totalCosts(w)) * 1000) / 1000);
+  assert.equal(w.costs.rescueReservePct, 0);
 });
 
 test('a desk leg over 2 % of its open interest: listed only on a multi-day spread that pays, with a failing check naming the share', async () => {

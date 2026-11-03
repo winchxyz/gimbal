@@ -80,6 +80,11 @@ test('the block for one window: legs now / 7 d / 14 d, round trip in USD and bps
   assert.ok(Math.abs(c.estimate.netUsd! - 0.066) < 1e-6);
   // 0.066 / 20 × 8760 / 240 = 12.045 % APR net over the hold: over the default 5 % minimum.
   assert.ok(Math.abs(c.estimate.netAprPct! - 12.045) < 1e-4);
+  // The window's own net APR is the same number (to its rounded cost terms): one net, judged once. Its costs are the
+  // round trip over the hold; the transfers and the rescue reserve are the one-off line's, not in them.
+  assert.equal(w.netAprPct, 12.045);
+  assert.deepEqual(w.costs, { feesPct: 6.57, slippagePct: 1.46, basisPct: 1.825, rescueReservePct: 0 });
+  assert.equal(w.usdPerDayPer1k, Math.round((12.045 / 100 / 365) * 1000 * 1e4) / 1e4);
   // 0.054 USD at 21.9 % on 20 USD (0.012 USD a day): 4.5 days.
   assert.ok(Math.abs(c.estimate.breakevenDays! - 4.5) < 1e-6);
   const g = legGross(c.long, c.short);

@@ -56,12 +56,17 @@ export type MultiDay =
   | { state: 'mixed'; d7AprPct: number; d14AprPct: number }
   | { state: 'known'; basis: '14d' | '7d'; aprPct: number };
 
+/** A 7-day mean under this (APR points, either sign) counts as 0. */
+export const DEAD_BAND_APR_PCT = 0.5;
+
 /**
  * The multi-day figure from the 7- and 14-day means; `fortnightPending` while a leg's older read is still due.
- * 7 d 5.11, 14 d 10.95: known, 5.11 on 7 d. 7 d 5.11, 14 d -2: mixed. 7 d 5.11, no 14 d, pending: loading.
+ * 7 d 5.11, 14 d 10.95: known, 5.11 on 7 d. 7 d 5.11, 14 d -2: mixed. 7 d 5.11, no 14 d, pending: loading. 7 d 0.3: as 0.
  */
-export function multiDay(d7AprPct: number | null, d14AprPct: number | null, fortnightPending: boolean): MultiDay {
-  if (d7AprPct === null) return { state: 'none' };
+export function multiDay(d7Raw: number | null, d14AprPct: number | null, fortnightPending: boolean): MultiDay {
+  if (d7Raw === null) return { state: 'none' };
+  // A 7-day mean this close to zero has no direction: as 0, so a pair does not flicker in and out of the list.
+  const d7AprPct = Math.abs(d7Raw) < DEAD_BAND_APR_PCT ? 0 : d7Raw;
   if (d14AprPct === null) return fortnightPending ? { state: 'loading', d7AprPct } : { state: 'known', basis: '7d', aprPct: d7AprPct };
   if (d7AprPct * d14AprPct < 0) return { state: 'mixed', d7AprPct, d14AprPct };
   const basis = Math.abs(d14AprPct) < Math.abs(d7AprPct) ? '14d' : '7d';

@@ -506,21 +506,25 @@ export interface FundingRate {
 
 export interface Window {
   id: string; symbol: string; longVenue: ScanVenueId; shortVenue: ScanVenueId;
-  // Each figure's basis. "This hour": the live rates. "Multi-day": a desk window's 7- and 14-day means when they
-  // agree in sign, the smaller of the two (the 7 days alone when the 14 cannot be had); a desk window has it once its
-  // history is in, not while the week before loads or when the two means disagree. "Today's": books and fees now.
+  // Each figure's basis. "This hour": the live rates. "Multi-day": a desk window with its 7 days in, on the smaller of
+  // its 7- and 14-day means when they agree in sign, else (the week before loading, the two disagreeing, or no 14
+  // days to be had) on its 7 days. "Today's": books and fees now.
   grossAprPct: number;            // this hour
   grossApr7dPct: number | null;   // the last 168 complete hours; null until the history is loaded
   costs: { feesPct: number; slippagePct: number; basisPct: number; rescueReservePct: number };
-                                  // today's, the one-off costs spread over the hold as APR points. feesPct: venue
-                                  // fees on four fills plus the 1Click fees to move both legs' margin in and out
-                                  // while the desk holds none there; basisPct includes the timing loss when the legs
-                                  // settle on different schedules
-  netAprPct: number;              // multi-day gross minus costs once known; else this hour's gross minus costs (watch
-                                  // windows always). What the list ranks by, the minimum line and the rotation gap
+                                  // today's one-off costs, spread over the hold as APR points. A desk window on the
+                                  // multi-day basis: the round trip the gate uses, feesPct the four fills, basisPct
+                                  // the basis buffer (adverse mark gap, timing loss, buffer bps), rescueReservePct 0;
+                                  // its margin moves and rescue reserve are shown apart, in its checks. Otherwise
+                                  // feesPct also has the 1Click fees to move both legs' margin in and out, and
+                                  // basisPct the mark gap and timing loss
+  netAprPct: number;              // multi-day gross minus costs on a desk window with its 7 days in: the net the gate
+                                  // holds to minNetAprPct, once both weeks agree; else this hour's gross minus costs
+                                  // (watch windows always). What the list ranks by, the minimum line and the rotation
+                                  // gap
   usdPerDayPer1k: number;         // netAprPct as USD a day per 1k a leg: the same basis
-  breakevenHours: number;         // multi-day once known: hours of that spread paying the round trip (fills,
-                                  // slippage, basis buffer); else at this hour's rates, transfers included
+  breakevenHours: number;         // multi-day once both weeks are judged: hours of that spread paying the round trip;
+                                  // else at this hour's rates, transfers included
   depthUsd: number;               // the smaller leg's open interest now
   intervalsAbove: number;         // hourly: hours in a row whose own gross minus today's costs cleared minNetAprPct
   updatedAt: number;
@@ -535,7 +539,7 @@ export interface Window {
                                              // first failing one is why it is not entered. Enterable = tradable, not
                                              // refused, not stale, every check ok, no veto
   switchCostUsd: number | null;     // cost to rotate from the held window into this one at strategy.legUsd:
-                                    // the fills only; the margin moves are already in this window's feesPct;
+                                    // the fills only; the margin moves are a one-off cost of their own;
                                     // null when nothing is held or this is the held one
   stale: boolean;                   // a venue it needs did not answer: the numbers are from the last good read
 }
@@ -569,7 +573,7 @@ export interface StrategyConfig {  // engine rules, off-chain: the contract neve
                                    // rescues and journals, and the owner acts by hand (POST /rotate, /close)
   minNetAprPct: number;            // "your minimum": enter only above this net APR. The engine's carry gate
                                    // holds a desk window's multi-day spread over the hold, net of the round trip,
-                                   // to it; the web's minimum line compares Window.netAprPct
+                                   // to it: the same number as Window.netAprPct, which the web's minimum line uses
   legUsd: number;                  // notional per leg the engine opens (≤ policy.max_notional_usd)
   maxLeverage: number;             // leverage target per leg
   stopDrawdownPct: number | null;  // close both legs when the desk's drawdown reaches this

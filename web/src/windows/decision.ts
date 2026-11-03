@@ -25,6 +25,13 @@ export interface DecisionInput {
 
 const none = (text: string): Decision => ({ text, rotate: null, alert: null, close: false });
 
+/** Why the engine would not open a window: its first failing check (the carry gate, the open-interest share, ...). */
+function notEnterable(w: FundingWindow): string {
+  const failing = w.checks.find((c) => !c.ok);
+  if (failing) return sentence(failing.text);
+  return w.stale ? 'its numbers are from an older read.' : 'it is not open to the desk.';
+}
+
 /** `3`, `2.5`: a whole number without its decimal. */
 const count = (n: number): string => plain(n, Number.isInteger(n) ? 0 : 1);
 const hoursText = (h: number): string => `${count(h)} ${h === 1 ? 'hour' : 'hours'}`;
@@ -81,6 +88,7 @@ export function decide({ selected, windows, strategy, now }: DecisionInput): Dec
   if (isBelow(selected, minimum)) {
     return none(`Nothing is held. ${selected.symbol} is under your ${plain(minimum, 0)}% minimum, so auto will not enter it.`);
   }
+  if (!isEnterable(selected)) return none(`Nothing is held. Auto will not enter ${selected.symbol}: ${notEnterable(selected)}`);
   const best = bestEnterable(windows.filter((w) => !isBelow(w, minimum)));
   if (best && best.id !== selected.id) {
     return none(
@@ -92,6 +100,14 @@ export function decide({ selected, windows, strategy, now }: DecisionInput): Dec
 
 function againstHeld(selected: FundingWindow, held: FundingWindow, strategy: StrategyConfig | null): Decision {
   const gap = selected.netAprPct - held.netAprPct;
+  if (!isEnterable(selected)) {
+    return {
+      text: `${held.symbol} stays: auto will not enter ${selected.symbol}: ${notEnterable(selected)}`,
+      rotate: null,
+      alert: gap <= 0 ? { over: held } : null,
+      close: false,
+    };
+  }
   const cost = selected.switchCostUsd;
   const costText = cost === null ? '' : ` Switching now costs about ${usd(cost)}.`;
   const rotate = isEnterable(selected) ? { from: held, to: selected, costUsd: cost } : null;

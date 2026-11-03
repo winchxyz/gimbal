@@ -28,7 +28,7 @@ import { errorMessage } from '../venues/recorder.ts';
 import type { ScannerConfig } from './config.ts';
 import type { CarryEstimate, MultiDay } from './carry.ts';
 import { carryChecks, carryEstimate, listingApr, multiDay, roundTrip, spreadOverHoldUsd } from './carry.ts';
-import { HOURS_PER_YEAR, aprPct, basisCostUsd, fillFeeBps, takerFeesUsd } from './costs.ts';
+import { HOURS_PER_YEAR, aprPct, basisCostUsd, fillFeeBps, oneOffAprPct, takerFeesUsd } from './costs.ts';
 import {
   FORTNIGHT_HOURS, HOUR_MS, RateStore, WEEK_HOURS, grossApr7d, grossAprOver, hourStart, intervalsAbove, legAprOver,
   netAprSeries, round,
@@ -89,6 +89,8 @@ interface Source {
 interface HistoryState {
   loadedHour: number | null;
   retryAt: number;
+  /** Prints the last week read answered with. */
+  points: number;
 }
 
 /** A desk pair's multi-day gross this scan (APR, rounded as shown), read once per scan. */
@@ -118,16 +120,26 @@ export interface WindowCarry {
 
 /**
  * The second week of a desk leg's history is read once (its hours never change). A failed read is tried again after
- * historyRetryMs; after OLDER_MAX_TRIES failures in a row the leg's windows are judged on their 7 days alone, and the
- * read is still tried once every OLDER_RETRY_MS.
+ * historyRetryMs, doubling up to OLDER_RETRY_MAX_MS. It has failed for good, and the leg's windows are judged on their
+ * 7 days alone, once the venue has said no for OLDER_GIVE_UP_MS: a rate limit or a timeout is not the venue saying no,
+ * so a burst of 429s at startup never lets a window in on 7 days. Still tried after that, in case it answers.
  */
-const OLDER_MAX_TRIES = 3;
-const OLDER_RETRY_MS = HOUR_MS;
+const OLDER_GIVE_UP_MS = HOUR_MS;
+const OLDER_RETRY_MAX_MS = 15 * 60_000;
 
 interface OlderState {
   done: boolean;
   failures: number;
+  /** When the venue first said no in the current run of failures (not a rate limit or timeout); null = it has not. */
+  refusedSince: number | null;
+  /** A refusal came at least OLDER_GIVE_UP_MS after the first: judged on 7 days until the read answers. */
+  givenUp: boolean;
   retryAt: number;
+}
+
+/** A failure that says nothing about whether the venue has the hours: a rate limit, a timeout, an aborted request. */
+export function isTransientReadError(message: string): boolean {
+  return /\b429\b|rate.?limit|too many requests|time(d)?.?out|no answer within|abort/i.test(message);
 }
 
 const legKey = (leg: Pick<ScanLeg, 'venue' | 'symbol'>): string => `${leg.venue}|${leg.symbol}`;
@@ -216,6 +228,14 @@ export class Scanner {
       this.#note(`the clock went back ${this.#lastAt - now} ms: books and watch venues read again, history left alone this scan`);
       for (const [key, st] of this.#history) {
         if (st.retryAt > now + config.historyRetryMs) this.#history.set(key, { ...st, retryAt: 0 });
+      }
+      for (const [key, o] of this.#older) {
+        // A wait or a refusal dated in the future: from now instead, so neither outlasts what it was meant to.
+        this.#older.set(key, {
+          ...o,
+          retryAt: o.retryAt > now + OLDER_RETRY_MAX_MS ? 0 : o.retryAt,
+          refusedSince: o.refusedSince !== null && o.refusedSince > now ? now : o.refusedSince,
+        });
       }
     }
     this.#lastAt = now;
@@ -354,8 +374,10 @@ export class Scanner {
       } else {
         w.grossApr7dPct = dh.d7;
       }
-      w.intervalsAbove = intervalsAbove(this.#rates, longKey, shortKey, now, w.grossAprPct, pw.costsApr, strategy.minNetAprPct);
-      if (dh === undefined) continue;
+      if (dh === undefined) {
+        w.intervalsAbove = intervalsAbove(this.#rates, longKey, shortKey, now, w.grossAprPct, pw.costsApr, strategy.minNetAprPct);
+        continue;
+      }
       const b = pw.breakdown;
       const rt = roundTrip(strategy.legUsd, b.feesUsd ?? 0, b.slippageUsd ?? 0, b.basisUsd ?? 0, b.timingUsd, config.costs.basisBufferBps);
       const estimate = carryEstimate({
@@ -363,12 +385,20 @@ export class Scanner {
         gross7dAprPct: dh.d7, gross14dAprPct: dh.d14, multiDay: dh.m, roundTrip: rt, minNetAprPct: strategy.minNetAprPct,
       });
       w.checks.push(...carryChecks(estimate));
-      // Once the multi-day spread is known, the window's net APR is that spread minus its costs, so the list, the
-      // owner's minimum and the rotation rule all compare days of funding, never one hour's swing.
-      if (estimate.expectedAprPct !== null) {
-        w.netAprPct = round(estimate.expectedAprPct - pw.costsApr, 3);
+      // Once its 7 days are in, a desk window's figures are days of funding against the round trip, the numbers the
+      // gate holds to the owner's minimum: its costs are the round trip spread over the hold, and its net APR the
+      // multi-day spread (the 7 days while the week before loads or when the two weeks disagree) minus them. So the
+      // list, the minimum line and the rotation gap compare what the gate does, never one hour's swing. The margin
+      // moves and the rescue reserve are one-off costs shown apart (the checks above, `npm run windows`).
+      const basisApr = dh.m.state === 'mixed' ? dh.m.d7AprPct : listingApr(dh.m);
+      if (basisApr !== null) {
+        const apr = (usd: number) => round(oneOffAprPct(usd, strategy.legUsd, config.costs.holdHours), 3);
+        w.costs = { feesPct: apr(rt.feesUsd), slippagePct: apr(rt.slippageUsd), basisPct: apr(rt.basisBufferUsd), rescueReservePct: 0 };
+        pw.costsApr = round(w.costs.feesPct + w.costs.slippagePct + w.costs.basisPct, 3);
+        w.netAprPct = round(basisApr - pw.costsApr, 3);
         w.usdPerDayPer1k = round((w.netAprPct / 100 / 365) * 1000, 4);
       }
+      w.intervalsAbove = intervalsAbove(this.#rates, longKey, shortKey, now, w.grossAprPct, pw.costsApr, strategy.minNetAprPct);
       // Break-even on the same multi-day spread as the gate, against the same round trip (the 1Click margin moves and
       // the rescue reserve are shown apart, never gated on): this hour alone says little about a hold of days.
       if (estimate.expectedAprPct !== null) {
@@ -475,13 +505,16 @@ export class Scanner {
   }
 
   /**
-   * Whether a leg's 14-day mean may still come: its venue publishes history and the older read has neither answered
-   * nor failed OLDER_MAX_TRIES times. Once it answered, a 14-day mean still missing means the market is younger.
+   * Whether a leg's 14-day mean may still come: its venue publishes history, its week has loaded, and the older read
+   * has neither answered nor failed for good. Once it answered, a 14-day mean still missing means the market is
+   * younger.
    */
   #fortnightPending(leg: ScanLeg): boolean {
     if (this.#sources.find((s) => s.id === leg.venue)?.history === undefined) return false;
+    // The older read follows the week's: while the week has never loaded it is not coming, as with no history.
+    if ((this.#history.get(legKey(leg))?.loadedHour ?? null) === null) return false;
     const o = this.#older.get(legKey(leg));
-    return o === undefined || (!o.done && o.failures < OLDER_MAX_TRIES);
+    return o === undefined || (!o.done && !o.givenUp);
   }
 
   #legRates(leg: ScanLeg, key: string, ratePerHour: number, now: number): LegRates {
@@ -535,7 +568,8 @@ export class Scanner {
     }
     for (const { leg, src } of unique) {
       if (todo.length >= config.historyPerScan) break;
-      if (leg.kind !== 'desk' || todo.some((t) => t.leg === leg)) continue;
+      // Due alongside the leg's week read if need be: a week read that keeps failing must not starve it.
+      if (leg.kind !== 'desk' || todo.some((t) => t.leg === leg && t.older)) continue;
       const key = legKey(leg);
       if ((this.#history.get(key)?.loadedHour ?? null) === null) continue;
       const o = this.#older.get(key);
@@ -556,16 +590,28 @@ export class Scanner {
         const points = await withTimeout(src.history!(leg.symbol, older ? olderStart : start, older ? olderEnd : end), config.readTimeoutMs * 2, what);
         this.#rates.recordBooked(longSide(leg), points);
         this.#rates.recordBooked(shortSide(leg), points);
-        if (older) this.#older.set(key, { done: true, failures: 0, retryAt: 0 });
-        else this.#history.set(key, { loadedHour: current, retryAt: 0 });
+        if (older) {
+          this.#older.set(key, { done: true, failures: 0, refusedSince: null, givenUp: false, retryAt: 0 });
+          const week = this.#history.get(key)?.points ?? 0;
+          if (points.length < 0.5 * week) {
+            this.#note(`${what}: ${points.length} prints against ${week} for the week after it: a market younger than 14 days`);
+          }
+        } else {
+          this.#history.set(key, { loadedHour: current, retryAt: 0, points: points.length });
+        }
       } catch (err) {
         this.#note(`${what} failed: ${errorMessage(err)}`);
         if (older) {
-          const failures = (this.#older.get(key)?.failures ?? 0) + 1;
-          this.#older.set(key, { done: false, failures, retryAt: now + (failures < OLDER_MAX_TRIES ? config.historyRetryMs : OLDER_RETRY_MS) });
+          const o = this.#older.get(key);
+          const failures = (o?.failures ?? 0) + 1;
+          const refused = !isTransientReadError(errorMessage(err));
+          const refusedSince = refused ? (o?.refusedSince ?? now) : (o?.refusedSince ?? null);
+          const givenUp = (o?.givenUp ?? false) || (refused && refusedSince !== null && now - refusedSince >= OLDER_GIVE_UP_MS);
+          const backoff = Math.min(OLDER_RETRY_MAX_MS, config.historyRetryMs * 2 ** (failures - 1));
+          this.#older.set(key, { done: false, failures, refusedSince, givenUp, retryAt: now + backoff });
         } else {
           const st = this.#history.get(key);
-          this.#history.set(key, { loadedHour: st?.loadedHour ?? null, retryAt: now + config.historyRetryMs });
+          this.#history.set(key, { loadedHour: st?.loadedHour ?? null, retryAt: now + config.historyRetryMs, points: st?.points ?? 0 });
         }
       }
     }), 2).then(() => {
