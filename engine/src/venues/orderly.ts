@@ -235,7 +235,15 @@ export class OrderlyReader implements VenueReader, FundingHistorySource, MarketH
   }
 
   async book(symbol: string, depth?: number): Promise<Book> {
-    const url = `${this.#publicWs}${await this.#streamAccountId()}`;
+    // The public stream's path needs an account id, borrowed once over REST: a failure says it was that step, not
+    // the book request, which the WebSocket answers in well under a second.
+    let accountId: string;
+    try {
+      accountId = await this.#streamAccountId();
+    } catch (err) {
+      throw new Error(`orderly book ${symbol}: no public stream account id: ${(err as Error).message}`);
+    }
+    const url = `${this.#publicWs}${accountId}`;
     const answer = await this.#ws()(url, { id: `book-${++this.#requests}`, event: 'request', params: { type: 'orderbook', symbol } });
     return trimBook(parseBookAnswer(symbol, answer), depth);
   }

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { WebSocketLike, WsEvent } from './ws.ts';
+import { OrderlyReader } from './orderly.ts';
 import { WsRequestClient, WsTimeoutError } from './ws.ts';
 
 type Listener = (ev: WsEvent) => void;
@@ -114,5 +115,68 @@ test('an idle connection is closed after its last answer, so a process can exit'
   assert.equal(sockets[0]!.readyState, 1);
   await new Promise((r) => setTimeout(r, 30));
   assert.equal(sockets[0]!.readyState, 3);
+  c.close();
+});
+
+test('several Orderly books at once on one client: one account id borrowed, one socket, every answer to its own request', async () => {
+  const { c, sockets } = client({ timeoutMs: 1_000 });
+  const account = `0x${'ab'.repeat(32)}`;
+  const calls: string[] = [];
+  const fetchFake = (async (url: string | URL) => {
+    const path = new URL(String(url)).pathname;
+    calls.push(path);
+    const data = path === '/v1/public/query' ? { rows: [{ address: `0x${'12'.repeat(20)}`, broker_id: 'woofi_pro' }] } : { account_id: account };
+    return new Response(JSON.stringify({ success: true, data }), { status: 200 });
+  }) as typeof fetch;
+  const reader = new OrderlyReader({ network: 'mainnet', fetch: fetchFake, wsRequest: c.request, publicWsUrl: 'wss://x/stream/' });
+  const symbols = ['PERP_DOGE_USDC', 'PERP_LTC_USDC', 'PERP_XLM_USDC', 'PERP_ZEC_USDC'];
+  const books = Promise.all(symbols.map((s) => reader.book(s, 5)));
+  // The borrow answers in the background; then every request is queued on the one socket being opened.
+  for (let i = 0; i < 20 && sockets.length === 0; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(sockets.length, 1);
+  assert.equal(sockets[0]!.url, `wss://x/stream/${account}`);
+  sockets[0]!.open();
+  const sent = sockets[0]!.sent as { id: string; params: { symbol: string } }[];
+  assert.deepEqual(sent.map((f) => f.params.symbol), symbols);
+  assert.equal(new Set(sent.map((f) => f.id)).size, symbols.length, 'one id per request');
+  // Answered in reverse order, with a keep-alive in between.
+  for (const f of [...sent].reverse()) {
+    sockets[0]!.push({ event: 'ping', ts: 1 });
+    sockets[0]!.push({ id: f.id, event: 'request', success: true, data: { symbol: f.params.symbol, ts: 7, bids: [[1, 2]], asks: [[1.1, 3]] } });
+  }
+  assert.deepEqual((await books).map((b) => b.symbol), symbols);
+  assert.deepEqual(calls, ['/v1/public/query', '/v1/get_account'], 'the account id is borrowed once for all four');
+  reader.close();
+  c.close();
+});
+
+test('a socket that never opens is dropped when its requests time out: the next request connects again', async () => {
+  const { c, sockets } = client({ timeoutMs: 20 });
+  const a = c.request('wss://x/1', { id: 'a' });
+  const b = c.request('wss://x/1', { id: 'b' });
+  await assert.rejects(a, /no answer to a within 20 ms/);
+  await assert.rejects(b, WsTimeoutError);
+  assert.equal(sockets[0]!.readyState, 3, 'the stuck socket is closed');
+  const d = c.request('wss://x/1', { id: 'd' });
+  assert.equal(sockets.length, 2, 'a new connection');
+  sockets[1]!.open();
+  sockets[1]!.push({ id: 'd', ok: true });
+  assert.deepEqual(await d, { id: 'd', ok: true });
+  c.close();
+});
+
+test('an open socket that says nothing is dropped on a timeout; one that answers other requests is kept', async () => {
+  const { c, sockets } = client({ timeoutMs: 20 });
+  const a = c.request('wss://x/1', { id: 'a' });
+  sockets[0]!.open();
+  await assert.rejects(a, WsTimeoutError);
+  assert.equal(sockets[0]!.readyState, 3);
+  const b = c.request('wss://x/1', { id: 'b' });
+  const e = c.request('wss://x/1', { id: 'e' });
+  sockets[1]!.open();
+  sockets[1]!.push({ id: 'e' });
+  await e;
+  await assert.rejects(b, WsTimeoutError);
+  assert.equal(sockets[1]!.readyState, 1, 'it answered after b went out: kept');
   c.close();
 });
