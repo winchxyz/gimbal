@@ -5,9 +5,9 @@ import { fileURLToPath } from 'node:url';
 import { b58encode, sha256 } from '../testnet/near.mjs';
 import { UsageError } from './cli.mjs';
 import {
-  LOCK_METHODS, MONEY_METHODS, NEAR_USDC, accessKeyLine, buildProvenance, canonical, cargoPackageInfo, checkFunder, configDiff, deployPlanFor, initArgs, initialBalance, lockConfigProblems,
+  MONEY_METHODS, NEAR_USDC, SNAPSHOT_REPO, accessKeyLine, buildProvenance, canonical, cargoPackageInfo, checkFunder, configDiff, deployPlanFor, initArgs, initialBalance, lockConfigProblems,
   lockEvidence, lockKeyProblems, isCanary, lockNetworkProblem, minInitialBalance, nextFreeName, parseDeployArgs, referralCodes, reproducibleBuildProblems, runDeploy,
-  treasuryUsdcLine, wasmExports, wasmSourceMetadata,
+  treasuryUsdcLine, wasmExports, wasmSourceMetadata, cargoNearBinary, lockMethodsFrom, lockMethodSources,
 } from './deploy.mjs';
 import { NO_CODE } from './near.mjs';
 
@@ -145,7 +145,9 @@ const OWN_KEY = `ed25519:${b58encode(Buffer.alloc(32, 9))}`;
 const OTHER_KEY = `ed25519:${b58encode(Buffer.alloc(32, 5))}`;
 const REV = 'a'.repeat(40);
 const IMAGE = 'sourcescan/cargo-near:0.22.0-rust-1.86.0@sha256:' + 'b'.repeat(64);
-const SNAPSHOT = `git+https://github.com/example/gimbal?rev=${REV}`;
+const SNAPSHOT = `git+https://github.com/winchxyz/gimbal?rev=${REV}`;
+/** What a locked contract must export, derived from docs/interfaces.md §1.3 and contract/src of this checkout. */
+const LOCK_METHODS = lockMethodsFrom(lockMethodSources());
 const RUSTC = 'rustc 1.86.0 (05f9846f8 2025-03-31)';
 const leb = (n) => {
   const out = [];
@@ -199,8 +201,11 @@ const DOWN = { ok: false, installed: true, detail: 'failed to connect to the doc
  */
 function lockWorld(o = {}) {
   let wasm = o.wasm ?? REPRO_WASM;
+  // The wasm on disk was written at T0; the clock reads T0 + 60 s; a rebuild writes at T0 + 61 s.
+  const T0 = Date.parse('2026-11-03T11:00:00.000Z');
+  let writtenAt = T0;
   const deployed = o.codeHash ?? hashOf(o.rebuilt ?? wasm);
-  const st = { keys: o.keys ?? [fullAccess(OWN_KEY)], sent: [], dockerAsked: 0, rebuilds: 0, gitCalls: [] };
+  const st = { keys: o.keys ?? [fullAccess(OWN_KEY)], sent: [], dockerAsked: 0, rebuilds: 0, removed: 0, gitCalls: [] };
   const exists = new Set(['v1.signer', 'price-oracle.near', 'funder.near', ...(o.treasuryMissing ? [] : ['treasury.near'])]);
   const client = {
     rpc: async (method) => {
@@ -257,9 +262,21 @@ function lockWorld(o = {}) {
     rebuild: () => {
       st.rebuilds++;
       if (o.rebuildFails) return { ok: false, detail: o.rebuildFails };
-      wasm = o.rebuilt ?? wasm;
-      return { ok: true };
+      if (!o.writesNothing) {
+        wasm = o.rebuilt ?? wasm;
+        writtenAt = T0 + 61_000;
+      }
+      return { ok: true, binary: o.binary ?? null };
     },
+    removeWasm: () => {
+      st.removed++;
+      if (o.keepOld) return;
+      wasm = null;
+      writtenAt = null;
+    },
+    wasmWrittenAt: () => writtenAt,
+    now: () => T0 + 60_000,
+    processEnv: o.processEnv ?? {},
   };
   const run = async (argv) => {
     let error = null;
@@ -315,8 +332,13 @@ test('the lock refuses every chain but mainnet', async () => {
 
 test('the build: NEP-330 metadata read from the wasm, reproducible only with build_info; Cargo.toml version and section; Docker missing or down', () => {
   assert.deepEqual(buildProvenance(wasmSourceMetadata(REPRO_WASM)), {
-    reproducible: true, version: '0.1.0', rev: REV, snapshot: SNAPSHOT, environment: IMAGE, command: 'cargo near build reproducible-wasm',
+    reproducible: true, version: '0.1.0', rev: REV, repo: SNAPSHOT_REPO, snapshot: SNAPSHOT, environment: IMAGE, command: 'cargo near build reproducible-wasm',
   });
+  assert.equal(buildProvenance({ build_info: { source_code_snapshot: `git+https://github.com/winchxyz/gimbal.git?rev=${REV}` } }).repo, SNAPSHOT_REPO);
+  assert.equal(buildProvenance({ build_info: { source_code_snapshot: `git+https://github.com/someone/gimbal?rev=${REV}` } }).repo, 'https://github.com/someone/gimbal');
+  assert.equal(cargoNearBinary('Compiling...\nContract successfully built!\n     - Binary: /src/contract/target/near/gimbal.wasm\n     - SHA-256 checksum hex : ab\n'),
+    '/src/contract/target/near/gimbal.wasm');
+  assert.equal(cargoNearBinary('error: could not compile'), null);
   assert.deepEqual(buildProvenance(wasmSourceMetadata(PLAIN_WASM)), { reproducible: false, version: '0.1.0' });
   assert.equal(wasmSourceMetadata(Buffer.from([0x00, 0x61, 0x73, 0x6d, 1, 0, 0, 0])), null);
   assert.deepEqual(wasmExports(REPRO_WASM), LOCK_METHODS);
@@ -329,7 +351,33 @@ test('the build: NEP-330 metadata read from the wasm, reproducible only with bui
   assert.deepEqual(reproducibleBuildProblems({ cargo: { reproducible: true }, docker: { ok: false, installed: false, detail: 'no docker command' } }), [
     'Docker is not installed (no docker command): install Docker Desktop, start it, then build again',
   ]);
-  assert.deepEqual(LOCK_METHODS, [...MONEY_METHODS, 'panic_close', 'hl_withdraw', 'hl_send_to_intents', 'evm_usdc_to_intents']);
+});
+
+test('the methods a locked contract must export: every method of interfaces §1.3, then the #[private] callbacks, derived and not hand-kept', () => {
+  // The real ones, from this checkout's docs and contract sources.
+  for (const m of [...MONEY_METHODS, 'panic_close', 'hl_withdraw', 'hl_send_to_intents', 'evm_usdc_to_intents', 'sol_sign_rescue', 'orderly_withdraw',
+    'orderly_settle_pnl', 'sol_sign', 'set_paused', 'hl_usd_class_transfer', 'create_desk', 'refresh_prices', 'on_signed', 'on_payout_owner', 'on_payout_fee',
+    'on_fund_venue', 'on_prices', 'on_desk_keys', 'refuse', 'new']) {
+    assert.ok(LOCK_METHODS.includes(m), m);
+  }
+  assert.equal(new Set(LOCK_METHODS).size, LOCK_METHODS.length, 'each method once');
+  assert.equal(LOCK_METHODS[0], 'create_desk', 'the table first, in its order');
+  const callbacks = LOCK_METHODS.slice(LOCK_METHODS.indexOf('panic_close') + 1);
+  assert.deepEqual(callbacks, [...callbacks].sort(), 'then the callbacks, sorted');
+  assert.ok(callbacks.every((m) => m === 'new' || m === 'refuse' || m.startsWith('on_')), callbacks.join(' '));
+
+  // A row added to the table, or a callback added to the contract, is required from then on.
+  const rows = Array.from({ length: 20 }, (_, i) => `| \`m${i}(desk_id)\` | ✓ | | |`);
+  const doc = ['### 1.3 Who may call what', '', '| Method | Owner | Operator | Notes |', '|---|---|---|---|',
+    ...MONEY_METHODS.map((m) => `| \`${m}(desk_id)\` | ✓ | | |`), ...rows, '| `new_setter(desk_id, x)` | ✓ | | added later |', '', '### 1.4 What an action method returns',
+    '| `not_here(x)` | ✓ | | |'].join('\n');
+  const src = [
+    '    #[private]\n    pub fn on_b(&self) {}\n    #[init]\n    #[private]\n    #[deny_unknown_arguments]\n    pub fn new(x: u8) -> Self {}\n',
+    '    /// `#[private]` in a comment is not an attribute\n    pub fn not_private(&self) {}\r\n    #[private]\r\n    pub fn on_a(&self) {}\r\n',
+  ];
+  assert.deepEqual(lockMethodsFrom({ doc, sources: src }), [...MONEY_METHODS, ...rows.map((_, i) => `m${i}`), 'new_setter', 'new', 'on_a', 'on_b']);
+  assert.throws(() => lockMethodsFrom({ doc: '# no table', sources: src }), /no §1\.3 "Who may call what"/);
+  assert.throws(() => lockMethodsFrom({ doc: doc.replace(/\| `m\d+\(desk_id\)` .*\n/g, ''), sources: src }), /lists 5 methods: the table did not parse/);
 });
 
 test('plan without --lock: a canary\'s deploy prints no tx 3; the final deploy prints tx 3 (the DeleteKey) as its own later run with --confirm-lock', async () => {
@@ -358,10 +406,10 @@ test('plan with --lock: only the DeleteKey of the key file\'s key, after every c
   const r = await w.run(LOCK);
   assert.equal(r.error, null, r.error?.message);
   assert.doesNotMatch(r.out, /^tx [12]/m);
-  assert.match(r.out, new RegExp(`checkout  commit ${REV}, clean, on a remote branch \\(after git fetch --prune\\)`));
+  assert.match(r.out, new RegExp(`checkout  commit ${REV}, clean, on a branch of origin \\(after git fetch --prune origin\\)`));
   assert.deepEqual(w.st.gitCalls, [{}], 'one checkout read, with the fetch');
-  assert.match(r.out, /exports {3}all of ft_on_transfer, fund_venue, withdraw_to_owner, clear_payout_lock, panic_close, hl_withdraw, hl_send_to_intents, evm_usdc_to_intents/);
-  assert.match(r.out, new RegExp(`build {5}reproducible: cargo near build reproducible-wasm, image ${IMAGE.replace(/[.+]/g, '\\$&')}, source ${SNAPSHOT.replace(/[.?+/]/g, '\\$&')}`));
+  assert.ok(r.out.includes(`exports   all ${LOCK_METHODS.length} methods of docs/interfaces.md §1.3 and the contract's #[private] callbacks`), r.out);
+  assert.match(r.out, new RegExp(`build {5}reproducible: its NEP-330 build_info names cargo near build reproducible-wasm, image ${IMAGE.replace(/[.+]/g, '\\$&')}, source ${SNAPSHOT.replace(/[.?+/]/g, '\\$&')}`));
   assert.match(r.out, new RegExp(`code {6}the code on chain is the built wasm: code_hash ${hashOf(REPRO_WASM)}`));
   assert.match(r.out, /balance {3}1\.0000 NEAR free above storage: after the lock no key can move it; only the contract's own methods spend it \(refresh_prices' oracle deposit, refunds\)/);
   assert.match(r.out, /config {3}matches/);
@@ -418,10 +466,12 @@ test('refused: the code on chain is not the built wasm', async () => {
   assert.match(none.error.message, /has no code: deploy it first/);
 });
 
-test('refused: a wasm without every method a locked contract needs (money, panic_close, the venue returns)', async () => {
+test('refused: a wasm without every method a locked contract needs (interfaces §1.3 and the callbacks)', async () => {
   const w = lockWorld({ wasm: wasmWith(META(BUILD_INFO), MONEY_METHODS) });
   const r = await w.run(LOCK_SEND);
-  assert.match(r.error.message, /the wasm does not export panic_close, hl_withdraw, hl_send_to_intents, evm_usdc_to_intents: a locked contract can never get them/);
+  const missing = LOCK_METHODS.filter((m) => !MONEY_METHODS.includes(m));
+  assert.ok(r.error.message.includes(`the wasm does not export ${missing.join(', ')}: a locked contract can never get them`), r.error.message);
+  assert.ok(missing.includes('panic_close') && missing.includes('on_signed') && missing.includes('sol_sign_rescue'));
   assert.deepEqual(w.st.sent, []);
   const one = await lockWorld({ wasm: wasmWith(META(BUILD_INFO), LOCK_METHODS.filter((m) => m !== 'withdraw_to_owner')) }).run(LOCK);
   assert.match(one.error.message, /the wasm does not export withdraw_to_owner: a locked contract can never get it/);
@@ -453,20 +503,26 @@ test('refused: a treasury that does not exist or is not on USDC, and version() o
 test('refused: a dirty or unpushed checkout, and a reproducible wasm built from another commit', async () => {
   const w = lockWorld({ dirty: [' M contract/src/lib.rs'] });
   const r = await w.run(LOCK_SEND);
-  assert.match(r.out, /checkout  commit a{40}, 1 uncommitted change, on a remote branch \(after git fetch --prune\)\n {10} M contract\/src\/lib\.rs/);
+  assert.match(r.out, /checkout  commit a{40}, 1 uncommitted change, on a branch of origin \(after git fetch --prune origin\)\n {10} M contract\/src\/lib\.rs/);
   assert.match(r.error.message, /the checkout has uncommitted changes: commit or stash them/);
   assert.deepEqual(w.st.sent, []);
   const unpushed = await lockWorld({ pushed: false }).run(LOCK_SEND);
-  assert.match(unpushed.out, /NOT on a remote branch/);
-  assert.match(unpushed.error.message, /commit a{40} is on no remote branch: push it\. The repo is public from the hackathon submission; the commit is named so anyone can rebuild it then/);
+  assert.match(unpushed.out, /NOT on a branch of origin/);
+  assert.match(unpushed.error.message, /commit a{40} is on no branch of origin: push it\. The repo is public from the hackathon submission; the commit is named so anyone can rebuild it then/);
   const offline = await lockWorld({ pushed: false, fetchError: 'fatal: unable to access the remote' }).run(LOCK_SEND);
-  assert.match(offline.error.message, /is on no remote branch \(git fetch --prune failed: fatal: unable to access the remote\): push it/);
+  assert.match(offline.error.message, /is on no branch of origin \(git fetch --prune origin failed: fatal: unable to access the remote\): push it/);
 
   const other = 'c'.repeat(40);
   const moved = lockWorld({ head: other });
   const m = await moved.run(LOCK_SEND);
   assert.match(m.error.message, new RegExp(`the wasm was built from commit ${REV}, and this checkout is at ${other}: check out ${REV} \\(clean, pushed\\) and run --lock there`));
   assert.deepEqual(moved.st.sent, []);
+
+  // The snapshot must name this repository.
+  const elsewhere = lockWorld({ wasm: wasmWith(META({ ...BUILD_INFO, source_code_snapshot: `git+https://github.com/someone/gimbal?rev=${REV}` })) });
+  const e = await elsewhere.run(LOCK_SEND);
+  assert.match(e.error.message, /the wasm's build_info names the repository "https:\/\/github\.com\/someone\/gimbal", not https:\/\/github\.com\/winchxyz\/gimbal/);
+  assert.deepEqual(elsewhere.st.sent, []);
 });
 
 test('refused: a non-reproducible wasm without --non-reproducible, with why reproducible-wasm cannot run here (Docker missing or down)', async () => {
@@ -491,6 +547,7 @@ test('--non-reproducible: the wasm is rebuilt from the clean checkout and must b
   const f = await forced.run([...LOCK_SEND, '--non-reproducible']);
   assert.equal(f.error, null, f.error?.message);
   assert.equal(forced.st.rebuilds, 1);
+  assert.equal(forced.st.removed, 1, 'the old wasm is deleted before the rebuild');
   assert.deepEqual(forced.st.gitCalls, [{}, { fetch: false }], 'the checkout is read again after the rebuild');
   assert.equal(forced.st.dockerAsked, 0, '--non-reproducible asks Docker nothing');
   assert.equal(forced.st.sent.length, 1);
@@ -525,6 +582,35 @@ test('--non-reproducible: the wasm is rebuilt from the clean checkout and must b
   assert.deepEqual(writes.st.sent, []);
 });
 
+test('--non-reproducible: a stale file is never compared (old file left in place, nothing written, written elsewhere, build_info set)', async () => {
+  // The rebuild "succeeds" but leaves the old file in place: it is older than the rebuild, refused.
+  const stale = lockWorld({ wasm: PLAIN_WASM, keepOld: true, writesNothing: true });
+  const s = await stale.run([...LOCK_SEND, '--non-reproducible']);
+  assert.match(s.error.message, /contract\/target\/near\/gimbal\.wasm is older than this rebuild \(written 2026-11-03T11:00:00\.000Z, the rebuild started 2026-11-03T11:01:00\.000Z\): a stale file/);
+  assert.deepEqual(stale.st.sent, []);
+  // Deleted first, and the rebuild wrote nothing.
+  const none = lockWorld({ wasm: PLAIN_WASM, writesNothing: true });
+  const n = await none.run([...LOCK_SEND, '--non-reproducible']);
+  assert.equal(none.st.removed, 1);
+  assert.match(n.error.message, /the rebuild wrote no contract\/target\/near\/gimbal\.wasm: nothing was checked or sent/);
+  // cargo-near says it wrote another file (a target-dir somewhere).
+  const away = lockWorld({ wasm: STALE_WASM, rebuilt: PLAIN_WASM, binary: '/elsewhere/target/near/gimbal.wasm' });
+  const w = await away.run([...LOCK_SEND, '--non-reproducible']);
+  assert.match(w.error.message, /cargo near wrote \/elsewhere\/target\/near\/gimbal\.wasm, not contract\/target\/near\/gimbal\.wasm/);
+  assert.deepEqual(away.st.sent, []);
+  // CARGO_TARGET_DIR set: refused before any build.
+  const env = lockWorld({ wasm: PLAIN_WASM, processEnv: { CARGO_TARGET_DIR: 'D:/cargo-target' } });
+  const e = await env.run([...LOCK_SEND, '--non-reproducible']);
+  assert.equal(env.st.rebuilds, 0);
+  assert.equal(env.st.removed, 0);
+  assert.match(e.error.message, /CARGO_TARGET_DIR is set \(D:\/cargo-target\): cargo would build somewhere else than contract\/target\/near\/gimbal\.wasm/);
+  // A "rebuilt" file with build_info: not what non-reproducible-wasm writes, so not this run's build.
+  const repro = lockWorld({ wasm: STALE_WASM, rebuilt: REPRO_WASM });
+  const r = await repro.run([...LOCK_SEND, '--non-reproducible']);
+  assert.match(r.error.message, /the rebuilt wasm carries a NEP-330 build_info, which non-reproducible-wasm never writes: it is not this run's build \(a stale file\)/);
+  assert.deepEqual(repro.st.sent, []);
+});
+
 test('--lock --send: one DeleteKey signed by that key, the key list read empty after, the evidence block and the key file called useless', async () => {
   const w = lockWorld();
   const r = await w.run(LOCK_SEND);
@@ -540,14 +626,14 @@ test('--lock --send: one DeleteKey signed by that key, the key list read empty a
     'contract:  gimbal.near https://nearblocks.io/address/gimbal.near',
     'DeleteKey: tx LockTx111 https://nearblocks.io/txns/LockTx111',
     `code_hash: ${hashOf(REPRO_WASM)}`,
-    `sha256:    ${shaOf(REPRO_WASM)} (contract/target/near/gimbal.wasm, ${REPRO_WASM.length} bytes)`,
+    `sha256:    ${shaOf(REPRO_WASM)} (contract/target/near/gimbal.wasm, ${REPRO_WASM.length.toLocaleString('en-US')} bytes)`,
     'version:   0.1.0 (contract/Cargo.toml, version() on chain)',
-    `checkout:  commit ${REV}, clean, on a remote branch after git fetch --prune`,
-    `build:     reproducible: cargo near build reproducible-wasm, image ${IMAGE}, source ${SNAPSHOT}`,
+    `checkout:  commit ${REV}, clean, on a branch of origin after git fetch --prune origin`,
+    `build:     reproducible: its NEP-330 build_info names cargo near build reproducible-wasm, image ${IMAGE}, source ${SNAPSHOT} (not rebuilt by this run)`,
     'keys:      view_access_key_list is empty',
     'README:',
-    `Contract has no access keys: DeleteKey tx LockTx111 (https://nearblocks.io/txns/LockTx111), code_hash ${hashOf(REPRO_WASM)} (sha256 ${shaOf(REPRO_WASM)}), `
-      + `a reproducible build (${IMAGE}) of ${SNAPSHOT}.`,
+    `Contract has no access keys: DeleteKey tx LockTx111 (https://nearblocks.io/txns/LockTx111), code_hash ${hashOf(REPRO_WASM)} (sha256 ${shaOf(REPRO_WASM)}); `
+      + `its NEP-330 build_info names a reproducible build (${IMAGE}) of ${SNAPSHOT}.`,
     '=== end ===',
   ]);
   assert.match(r.out, /key file {2}.*gimbal\.near\.json is now useless: its key is on no account any more and can sign nothing\. You can delete it\./);

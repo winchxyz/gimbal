@@ -757,16 +757,21 @@ command from the main checkout, the dry run first:
    account typed again exactly; the dry run may leave out the treasury and the builder (then `config()`'s are taken
    as they are, with a warning). It reads `.env` for the broker and the referral codes, like the deploy. Before
    signing it checks, and the dry run prints each check:
-   - the checkout: clean (`git status --porcelain` empty) and its commit on a remote branch, read after
-     `git fetch --prune` (a failed fetch counts as not pushed);
-   - the build: the wasm's NEP-330 `build_info` is filled (a reproducible build) and the commit it names is the
-     checkout's `HEAD` (else it refuses: check out that commit and lock from there). A non-reproducible wasm is
+   - the checkout: clean (`git status --porcelain` empty) and its commit on a branch of `origin`
+     (`refs/remotes/origin/*`, no other remote), read after `git fetch --prune origin` (a failed fetch counts as
+     not pushed);
+   - the build: the wasm's NEP-330 `build_info` is filled (a reproducible build), its snapshot names
+     `https://github.com/winchxyz/gimbal`, and the commit it names is the checkout's `HEAD` (else it refuses:
+     check out that commit and lock from there). The lock does not rebuild a reproducible wasm in Docker: the
+     evidence says what its `build_info` names, and anyone can rebuild that to compare. A non-reproducible wasm is
      refused, with why `reproducible-wasm` cannot run here now (Docker not installed, Docker's engine not running:
      "start Docker Desktop", or the missing `Cargo.toml` section), unless `--non-reproducible`, which rebuilds it
      first (below);
-   - the wasm exports every method a locked contract needs, since its code never changes again: the money
-     methods (`ft_on_transfer`, `fund_venue`, `withdraw_to_owner`, `clear_payout_lock`), `panic_close` and the
-     venue returns (`hl_withdraw`, `hl_send_to_intents`, `evm_usdc_to_intents`); a missing one is named and refused;
+   - the wasm exports every method a locked contract needs, since its code never changes again: every method
+     of the table in `docs/interfaces.md` §1.3 (owner, operator and public ones) and every `#[private]` callback
+     in `contract/src` (`on_signed`, the payout callbacks, ...). The list is read from this checkout, not kept by
+     hand, so a method the table or the contract gains is required from then on; a missing one is named and
+     refused;
    - `code_hash` (`view_account`) equals the base58 sha256 of `contract/target/near/gimbal.wasm`;
    - `version()` equals the `[package]` version in `contract/Cargo.toml` (and the version in the wasm's metadata);
    - `config()` is exactly what `new()` was given on mainnet: Mainnet, `v1.signer`, OutLayer `price-oracle.near`,
@@ -780,11 +785,14 @@ command from the main checkout, the dry run first:
    own methods spend it (`refresh_prices`' oracle deposit, refunds).
 
    **`--non-reproducible`** (while the reproducible build cannot run): the wasm on disk may be any earlier build,
-   so the lock rebuilds it in the clean checkout first (`cd contract && cargo near build non-reproducible-wasm
-   --no-abi`, minutes), reads the checkout again (the build must not change it: commit what it writes), and only
-   those bytes are compared with the deployed `code_hash`. A dirty checkout, a failed build or a different hash
-   refuses. The evidence then says exactly that: rebuilt from that clean commit, with that cargo-near and rustc, the
-   sha256 equals the deployed code; another machine may not rebuild the same bytes.
+   so the lock deletes `contract/target/near/gimbal.wasm`, rebuilds it in the clean checkout (`cd contract &&
+   cargo near build non-reproducible-wasm --no-abi`, minutes), reads the checkout again (the build must not change
+   it: commit what it writes), and only those bytes are compared with the deployed `code_hash`. It refuses a dirty
+   checkout, a set `CARGO_TARGET_DIR`, a failed build, a build that wrote no file, a file older than the rebuild,
+   a file that cargo-near says it wrote elsewhere, a rebuilt file with a non-null `build_info` (not what
+   non-reproducible-wasm writes, so a stale file) and a different hash. The evidence then says exactly that:
+   rebuilt from that clean commit, with that cargo-near and rustc, the sha256 equals the deployed code; another
+   machine may not rebuild the same bytes. The dry run rebuilds too.
 
    It refuses when any check fails, when the account does not exist or has no code, and on any chain but mainnet
    (testnet contracts stay upgradeable; there is no flag for testnet). `--send` sends one DeleteKey of that key,
@@ -807,11 +815,11 @@ command from the main checkout, the dry run first:
    code_hash: <base58>
    sha256:    <hex> (contract/target/near/gimbal.wasm, <bytes> bytes)
    version:   <version> (contract/Cargo.toml, version() on chain)
-   checkout:  commit <commit>, clean, on a remote branch after git fetch --prune
-   build:     reproducible: cargo near build reproducible-wasm, image <image@digest>, source git+<repo>?rev=<commit>
+   checkout:  commit <commit>, clean, on a branch of origin after git fetch --prune origin
+   build:     reproducible: its NEP-330 build_info names cargo near build reproducible-wasm, image <image@digest>, source git+https://github.com/winchxyz/gimbal?rev=<commit> (not rebuilt by this run)
    keys:      view_access_key_list is empty
    README:
-   Contract has no access keys: DeleteKey tx <hash> (https://nearblocks.io/txns/<hash>), code_hash <base58> (sha256 <hex>), a reproducible build (<image@digest>) of git+<repo>?rev=<commit>.
+   Contract has no access keys: DeleteKey tx <hash> (https://nearblocks.io/txns/<hash>), code_hash <base58> (sha256 <hex>); its NEP-330 build_info names a reproducible build (<image@digest>) of git+https://github.com/winchxyz/gimbal?rev=<commit>.
    === end ===
    ```
 

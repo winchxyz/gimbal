@@ -29,21 +29,22 @@
 //
 // tx 3, signed by the contract account's own key: DeleteKey of that key, the account's only key. Never on a
 // canary (it gets retired). Before it, on chain: code_hash = base58(sha256(the wasm)), the wasm exports every
-// method in LOCK_METHODS, config() = new()'s args, version() = contract/Cargo.toml's version, the treasury exists
-// and is registered on USDC, and view_access_key_list = exactly the full-access key in .keys/<contract>.json (any
-// other key is printed and refused). The checkout must be clean and its commit pushed, and the wasm built by `cargo
-// near build reproducible-wasm` from that commit (its NEP-330 build_info names the image and the commit);
-// --non-reproducible instead rebuilds the wasm in the clean checkout during the run and requires its sha256 to be
-// the deployed code's, and the evidence says what was checked. After it: view_access_key_list is empty, and a
+// method of docs/interfaces.md §1.3 and every #[private] callback (lockMethodsFrom), config() = new()'s args,
+// version() = contract/Cargo.toml's version, the treasury exists and is registered on USDC, and
+// view_access_key_list = exactly the full-access key in .keys/<contract>.json (any other key is printed and
+// refused). The checkout must be clean and its commit on a branch of origin, and the wasm built by `cargo near
+// build reproducible-wasm` from that commit of winchxyz/gimbal (its NEP-330 build_info names the image and the
+// commit); --non-reproducible instead deletes the wasm, rebuilds it in the clean checkout during the run and
+// requires that fresh file's sha256 to be the deployed code's, and the evidence says what was checked. After it: view_access_key_list is empty, and a
 // block with the tx hash, its nearblocks link, the code hash, the sha256, the commit and the build goes into the
 // README. Then no key can deploy code to the account, sign for it, retire it or move its NEAR; only the contract's
 // own methods spend that NEAR (refresh_prices' oracle deposit, refunds). The dry run prints all of it and signs
 // nothing (it may leave out --treasury-near and --hl-builder); --lock alone works on an account deployed earlier,
 // so it is also the resume. Mainnet only, like every script here: testnet contracts stay upgradeable.
 
-import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { existsSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { b58encode, sha256 } from '../testnet/near.mjs';
 import { UsageError, envReport, envValues, isMain, parseFlags, run } from './cli.mjs';
 import {
@@ -144,10 +145,44 @@ const SPEC = {
 /** A canary is never locked: it gets retired (tools/mainnet/README.md, "Retiring a canary"). */
 export const isCanary = (id) => /canary/.test(id);
 /**
- * What a locked contract must export, since its code never changes again: the money methods, panic_close, and
- * every way money comes back from a venue (hl_withdraw, hl_send_to_intents, evm_usdc_to_intents).
+ * What a locked contract must export, since its code never changes again: every method of the table in
+ * docs/interfaces.md §1.3 (owner, operator and public ones, in the table's order; desk.test.mjs and the contract's
+ * tests pin the contract to that table), then the contract's `#[private]` callbacks (from contract/src, sorted).
+ * Not hand-kept: a method added to the table or a callback added to the contract is required from then on.
+ * `doc` is the text of docs/interfaces.md, `sources` the text of each file of contract/src.
  */
-export const LOCK_METHODS = [...MONEY_METHODS, 'panic_close', 'hl_withdraw', 'hl_send_to_intents', 'evm_usdc_to_intents'];
+export function lockMethodsFrom({ doc, sources }) {
+  const start = doc.indexOf('### 1.3 Who may call what');
+  const end = doc.indexOf('\n### 1.4', start);
+  if (start < 0 || end < 0) throw new Error('docs/interfaces.md has no §1.3 "Who may call what" before §1.4: the methods a locked contract needs are unknown');
+  const table = [];
+  for (const line of doc.slice(start, end).split('\n')) {
+    const method = /^`([a-z_0-9]+)\(/.exec(line.split('|')[1]?.trim() ?? '')?.[1];
+    if (method !== undefined && !table.includes(method)) table.push(method);
+  }
+  // Each `#[private]` attribute on a line of its own, then any other attributes, then the `pub fn`.
+  const callbacks = new Set();
+  for (const text of sources) {
+    for (const m of text.matchAll(/^[ \t]*#\[private\][ \t]*\r?\n(?:[ \t]*#\[[^\]\n]*\][ \t]*\r?\n)*[ \t]*pub fn ([a-z_0-9]+)/gm)) callbacks.add(m[1]);
+  }
+  const methods = [...table, ...[...callbacks].filter((m) => !table.includes(m)).sort()];
+  const missing = MONEY_METHODS.filter((m) => !methods.includes(m));
+  if (table.length < 20 || missing.length > 0) {
+    throw new Error(`docs/interfaces.md §1.3 lists ${table.length} methods${missing.length > 0 ? `, without ${missing.join(', ')}` : ''}: the table did not parse, so the methods a locked contract needs are unknown`);
+  }
+  return methods;
+}
+
+/** docs/interfaces.md and contract/src/*.rs (not the tests) of this checkout, for lockMethodsFrom. */
+export function lockMethodSources() {
+  const src = join(ROOT, 'contract', 'src');
+  return {
+    doc: readFileSync(join(ROOT, 'docs', 'interfaces.md'), 'utf8'),
+    sources: readdirSync(src).filter((f) => f.endsWith('.rs') && f !== 'tests.rs').map((f) => readFileSync(join(src, f), 'utf8')),
+  };
+}
+/** The snapshot repository a reproducible build of the lock must name (NEP-330 build_info.source_code_snapshot). */
+export const SNAPSHOT_REPO = 'https://github.com/winchxyz/gimbal';
 /** Deploy-only flags: --lock is its own run on an account deployed earlier. */
 const DEPLOY_ONLY = ['--funder', '--key-file', '--balance', '--resume'];
 
@@ -340,6 +375,8 @@ export function buildProvenance(meta) {
     reproducible: true,
     version: meta.version ?? null,
     rev: /[?&]rev=([0-9a-f]{40})(?![0-9a-f])/.exec(snapshot ?? '')?.[1] ?? null,
+    // The repository of `git+<repo>?rev=...`, without a trailing .git or slash.
+    repo: /^git\+([^?#]+)/.exec(snapshot ?? '')?.[1].replace(/(\.git)?\/?$/, '') ?? null,
     snapshot,
     environment: typeof b.build_environment === 'string' ? b.build_environment : null,
     command: Array.isArray(b.build_command) ? b.build_command.join(' ') : null,
@@ -384,9 +421,10 @@ const sh = (cmd, args, opts = {}) => execFileSync(cmd, args, { encoding: 'utf8',
 const firstLine = (e) => (String(e?.stderr || e?.message || e).split(/\r?\n/).find((l) => l.trim() !== '') ?? 'no answer').trim();
 
 /**
- * The checkout's state for the evidence: { head, clean, changed (lines), pushed, fetchError }. `pushed` is read
- * after `git fetch --prune`, so a remote branch deleted or moved since the last fetch does not count.
- * `{ fetch: false }` skips the fetch (the recheck after a rebuild).
+ * The checkout's state for the evidence: { head, clean, changed (lines), pushed, fetchError }. `pushed`: HEAD is
+ * on a branch of `origin` (refs/remotes/origin/*, no other remote), read after `git fetch --prune origin`, so a
+ * branch deleted or moved since the last fetch does not count. `{ fetch: false }` skips the fetch (the recheck
+ * after a rebuild).
  */
 function gitState({ fetch = true } = {}) {
   const git = (...args) => sh('git', ['-C', ROOT, ...args]).trimEnd();
@@ -396,12 +434,14 @@ function gitState({ fetch = true } = {}) {
   let fetchError = null;
   if (fetch) {
     try {
-      git('fetch', '--prune', '--quiet');
+      git('fetch', '--prune', '--quiet', 'origin');
     } catch (e) {
       fetchError = firstLine(e);
     }
   }
-  const pushed = fetchError === null && git('branch', '-r', '--contains', 'HEAD') !== '';
+  const onOrigin = () => git('for-each-ref', '--contains', 'HEAD', '--format=%(refname)', 'refs/remotes/origin/')
+    .split(/\r?\n/).some((r) => r.startsWith('refs/remotes/origin/') && r !== 'refs/remotes/origin/HEAD');
+  const pushed = fetchError === null && onOrigin();
   return { head, clean: changed.length === 0, changed, pushed, fetchError };
 }
 
@@ -424,14 +464,43 @@ function rustcVersion() {
   }
 }
 
-/** Runs BUILD in contract/ (the --non-reproducible lock's rebuild): { ok } or { ok: false, detail }. */
+/**
+ * The file cargo-near says it wrote: its `- Binary: <path>` line (cargo-near 0.1x and later print it once the
+ * contract is built), or null when the output has none.
+ */
+export function cargoNearBinary(output) {
+  return /^\s*-\s*Binary:\s*(.+?\.wasm)\s*$/m.exec(output ?? '')?.[1] ?? null;
+}
+
+/**
+ * Runs BUILD in contract/ (the --non-reproducible lock's rebuild): { ok, binary } (the path cargo-near printed, or
+ * null) or { ok: false, detail }. The lock deletes the old wasm first and checks the new one is fresh.
+ */
 function rebuildWasm() {
+  // Both streams: cargo-near prints its summary on one or the other, depending on the version.
+  const r = spawnSync('cargo', ['near', 'build', 'non-reproducible-wasm', '--no-abi'], {
+    cwd: join(ROOT, 'contract'), timeout: 30 * 60_000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024,
+  });
+  const out = `${r.stdout ?? ''}\n${r.stderr ?? ''}`;
+  if (r.error?.code === 'ENOENT') return { ok: false, detail: 'no cargo command' };
+  if (r.error || r.status !== 0) {
+    const lines = String(r.stderr || r.error?.message || '').split(/\r?\n/).filter((l) => l.trim() !== '');
+    return { ok: false, detail: lines.slice(-3).join(' | ') || `exit ${r.status ?? r.signal}` };
+  }
+  return { ok: true, binary: cargoNearBinary(out) };
+}
+
+/** Deletes the wasm before the rebuild, so a build that writes nothing cannot leave an older file to compare. */
+function removeWasm() {
+  rmSync(WASM, { force: true });
+}
+
+/** When the wasm was last written (ms), or null when it is missing. */
+function wasmWrittenAt() {
   try {
-    sh('cargo', ['near', 'build', 'non-reproducible-wasm', '--no-abi'], { cwd: join(ROOT, 'contract'), timeout: 30 * 60_000 });
-    return { ok: true };
-  } catch (e) {
-    const lines = String(e?.stderr || e?.message || e).split(/\r?\n/).filter((l) => l.trim() !== '');
-    return { ok: false, detail: e?.code === 'ENOENT' ? 'no cargo command' : lines.slice(-3).join(' | ') || 'no output' };
+    return statSync(WASM).mtimeMs;
+  } catch {
+    return null;
   }
 }
 
@@ -519,11 +588,11 @@ export function lockEvidence({ at, contract, hash, codeHash, wasmSha256, wasmByt
   const tx = hash === null ? `<the DeleteKey's hash from ${accountLink(contract)}>` : `${hash} (${txLink(hash)})`;
   const tools = `cargo-near ${cargoNear ?? '<version>'}, ${rustc ?? 'rustc <version>'}`;
   const buildLine = build.reproducible
-    ? `reproducible: ${build.command ?? 'cargo near build reproducible-wasm'}, image ${build.environment}, source ${build.snapshot}`
+    ? `reproducible: its NEP-330 build_info names ${build.command ?? 'cargo near build reproducible-wasm'}, image ${build.environment}, source ${build.snapshot} (not rebuilt by this run)`
     : `non-reproducible (build_info null): rebuilt during the lock run with \`${BUILD}\` from the clean commit ${commit} (${tools}); `
       + 'its sha256 equals the deployed code. Another machine may not get the same bytes';
   const readme = build.reproducible
-    ? `Contract has no access keys: DeleteKey tx ${tx}, code_hash ${codeHash} (sha256 ${wasmSha256}), a reproducible build (${build.environment}) of ${build.snapshot}.`
+    ? `Contract has no access keys: DeleteKey tx ${tx}, code_hash ${codeHash} (sha256 ${wasmSha256}); its NEP-330 build_info names a reproducible build (${build.environment}) of ${build.snapshot}.`
     : `Contract has no access keys: DeleteKey tx ${tx}, code_hash ${codeHash}. Its code is a non-reproducible build of commit ${commit} (${tools}): `
       + `rebuilt from that clean commit when it was locked, its sha256 ${wasmSha256} equals the deployed code; another machine may not rebuild the same bytes.`;
   return [
@@ -535,7 +604,7 @@ export function lockEvidence({ at, contract, hash, codeHash, wasmSha256, wasmByt
     `code_hash: ${codeHash}`,
     `sha256:    ${wasmSha256} (${WASM_SHOWN}, ${wasmBytes.toLocaleString('en-US')} bytes)`,
     `version:   ${version} (contract/Cargo.toml, version() on chain)`,
-    `checkout:  commit ${commit}, clean, on a remote branch after git fetch --prune`,
+    `checkout:  commit ${commit}, clean, on a branch of origin after git fetch --prune origin`,
     `build:     ${buildLine}`,
     'keys:      view_access_key_list is empty',
     'README:',
@@ -745,7 +814,10 @@ async function deploy(a, { client, say, readWasm, envOf, readKey, keyExists, fet
   }
 }
 
-async function lock(a, { client, say, readWasm, envOf, readKey, keyExists, at, git, docker, cargoNear, readCargoToml, rebuild, rustc }) {
+async function lock(a, {
+  client, say, readWasm, envOf, readKey, keyExists, at, git, docker, cargoNear, readCargoToml, rebuild, rustc, removeWasm, wasmWrittenAt, now, processEnv,
+  lockSources,
+}) {
   say(`gimbal mainnet lock of ${a.contract}: ${a.send ? 'SEND' : 'dry run'} (DeleteKey of its last full-access key: no upgrade, no undo)`);
   const status = await client.rpc('status', []);
   say(`chain     ${status.chain_id}, block ${status.sync_info.latest_block_height}`);
@@ -756,24 +828,40 @@ async function lock(a, { client, say, readWasm, envOf, readKey, keyExists, at, g
   // Where the code comes from, for the evidence: the checkout (clean, pushed), the crate version, the build.
   const repo = git();
   say(`checkout  commit ${repo.head}, ${repo.clean ? 'clean' : `${repo.changed.length} uncommitted change${repo.changed.length === 1 ? '' : 's'}`}, `
-    + `${repo.pushed ? 'on a remote branch (after git fetch --prune)' : 'NOT on a remote branch'}`);
+    + `${repo.pushed ? 'on a branch of origin (after git fetch --prune origin)' : 'NOT on a branch of origin'}`);
   for (const l of repo.changed.slice(0, 10)) say(`          ${l}`);
   if (!repo.clean) problems.push(`the checkout has uncommitted changes: commit or stash them (the evidence names commit ${repo.head})`);
   if (!repo.pushed) {
-    problems.push(`commit ${repo.head} is on no remote branch${repo.fetchError === null ? '' : ` (git fetch --prune failed: ${repo.fetchError})`}: push it. `
+    problems.push(`commit ${repo.head} is on no branch of origin${repo.fetchError === null ? '' : ` (git fetch --prune origin failed: ${repo.fetchError})`}: push it. `
       + 'The repo is public from the hackathon submission; the commit is named so anyone can rebuild it then');
   }
 
-  // --non-reproducible: the wasm on disk may be any earlier build, so it is rebuilt here from the clean checkout,
-  // and only those bytes are compared with the deployed code.
+  // --non-reproducible: the wasm on disk may be any earlier build, so it is deleted and rebuilt here from the
+  // clean checkout, and only a file this rebuild wrote is compared with the deployed code.
   let rebuilt = null;
   if (a.nonReproducible) {
+    const targetDir = processEnv.CARGO_TARGET_DIR;
     if (!repo.clean) {
       problems.push(`--non-reproducible rebuilds the wasm from a clean checkout, and this one is not: the wasm on disk was not rebuilt, so nothing ties it to commit ${repo.head}`);
+    } else if (typeof targetDir === 'string' && targetDir !== '') {
+      problems.push(`CARGO_TARGET_DIR is set (${targetDir}): cargo would build somewhere else than ${WASM_SHOWN}, which the lock compares; unset it and run --lock again`);
     } else {
-      say(`rebuild   --non-reproducible: \`${BUILD}\` from commit ${repo.head} (minutes; nothing is sent meanwhile)`);
+      say(`rebuild   --non-reproducible: \`${BUILD}\` from commit ${repo.head}, after deleting ${WASM_SHOWN} (minutes; nothing is sent meanwhile)`);
+      removeWasm();
+      const started = now();
       const r = rebuild();
       if (!r.ok) throw new Error(`the rebuild failed (${r.detail}): nothing was checked or sent; fix the build and run --lock again`);
+      const same = (p, q) => (process.platform === 'win32' ? resolve(p).toLowerCase() === resolve(q).toLowerCase() : resolve(p) === resolve(q));
+      if (r.binary !== null && r.binary !== undefined && !same(r.binary, WASM)) {
+        throw new Error(`cargo near wrote ${r.binary}, not ${WASM_SHOWN} (a target-dir in a .cargo/config.toml?): build into contract/target and run --lock again; nothing was checked or sent`);
+      }
+      // Up to 2 s of slack for file systems that store coarse times.
+      const written = wasmWrittenAt();
+      if (written === null) throw new Error(`the rebuild wrote no ${WASM_SHOWN}: nothing was checked or sent`);
+      if (written < started - 2000) {
+        throw new Error(`${WASM_SHOWN} is older than this rebuild (written ${new Date(written).toISOString()}, the rebuild started ${new Date(started).toISOString()}): `
+          + 'a stale file, not this build; nothing was checked or sent');
+      }
       const after = git({ fetch: false });
       if (!after.clean || after.head !== repo.head) {
         problems.push(`the rebuild changed the checkout (commit ${after.head}, ${after.changed.length} uncommitted change${after.changed.length === 1 ? '' : 's'}: `
@@ -790,11 +878,15 @@ async function lock(a, { client, say, readWasm, envOf, readKey, keyExists, at, g
   const hash = sha256(wasm);
   const codeHash = b58encode(hash);
   say(`wasm      ${WASM_SHOWN}: ${wasm.length.toLocaleString('en-US')} bytes, sha256 ${hash.toString('hex')} (code_hash ${codeHash})`);
-  // A locked contract's code never changes again: every way money leaves it must be in this wasm.
+  // A locked contract's code never changes again: every method of the interface, and every callback, must be in it.
+  const lockMethods = lockMethodsFrom(lockSources());
   const exported = new Set(wasmExports(wasm));
-  const missing = LOCK_METHODS.filter((m) => !exported.has(m));
-  if (missing.length === 0) say(`exports   all of ${LOCK_METHODS.join(', ')}`);
-  else problems.push(`the wasm does not export ${missing.join(', ')}: a locked contract can never get ${missing.length === 1 ? 'it' : 'them'}, so build and deploy code that has every one of ${LOCK_METHODS.join(', ')}`);
+  const missing = lockMethods.filter((m) => !exported.has(m));
+  if (missing.length === 0) say(`exports   all ${lockMethods.length} methods of docs/interfaces.md §1.3 and the contract's #[private] callbacks`);
+  else {
+    problems.push(`the wasm does not export ${missing.join(', ')}: a locked contract can never get ${missing.length === 1 ? 'it' : 'them'}, so build and deploy code that `
+      + `has every method of docs/interfaces.md §1.3 and every #[private] callback of contract/src (${lockMethods.length} in all)`);
+  }
 
   const cargo = cargoPackageInfo(readCargoToml());
   const meta = wasmSourceMetadata(wasm);
@@ -803,7 +895,11 @@ async function lock(a, { client, say, readWasm, envOf, readKey, keyExists, at, g
   if (cargo.version === null) problems.push('contract/Cargo.toml has no [package] version');
   else if (build.version !== null && build.version !== cargo.version) problems.push(`the wasm says version ${build.version}, contract/Cargo.toml ${cargo.version}: build this checkout`);
   if (build.reproducible) {
-    say(`build     reproducible: ${build.command ?? '(no command)'}, image ${build.environment}, source ${build.snapshot}`);
+    say(`build     reproducible: its NEP-330 build_info names ${build.command ?? '(no command)'}, image ${build.environment}, source ${build.snapshot}`);
+    if (rebuilt !== null) {
+      problems.push('the rebuilt wasm carries a NEP-330 build_info, which non-reproducible-wasm never writes: it is not this run\'s build (a stale file); stop');
+    }
+    if (build.repo !== SNAPSHOT_REPO) problems.push(`the wasm's build_info names the repository ${JSON.stringify(build.repo)}, not ${SNAPSHOT_REPO}: build it from this repository`);
     if (build.rev === null) problems.push(`the wasm's build_info has no commit in source_code_snapshot (${JSON.stringify(build.snapshot)})`);
     else if (build.rev !== repo.head) {
       problems.push(`the wasm was built from commit ${build.rev}, and this checkout is at ${repo.head}: check out ${build.rev} (clean, pushed) and run --lock there, `
@@ -944,6 +1040,11 @@ export async function runDeploy(argv, deps = {}) {
     readCargoToml: deps.readCargoToml ?? (() => readFileSync(CARGO_TOML, 'utf8')),
     rebuild: deps.rebuild ?? rebuildWasm,
     rustc: deps.rustc ?? rustcVersion,
+    removeWasm: deps.removeWasm ?? removeWasm,
+    wasmWrittenAt: deps.wasmWrittenAt ?? wasmWrittenAt,
+    now: deps.now ?? Date.now,
+    processEnv: deps.processEnv ?? process.env,
+    lockSources: deps.lockSources ?? lockMethodSources,
   };
   return a.lock ? lock(a, ctx) : deploy(a, ctx);
 }
