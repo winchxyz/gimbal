@@ -313,6 +313,10 @@ What a rogue operator can still do is lose money inside these bounds: trade badl
 fees, and spend the desk's SOL on Solana fees. The risks below are those bounds and the residuals the human
 accepted: each is described, not fixed.
 
+The engine runs on a server (Railway, `docs/deploy-railway.md`) with only that operator key: a FunctionCall key
+limited to the 21 operator methods and a 5 NEAR gas allowance. It cannot call `withdraw_to_owner`, `set_policy` or
+resume a paused desk, so a stolen server key is a rogue operator in the sense above and nothing more.
+
 ### Accepted risks
 
 Each at the default policy: what can happen, its bound, and why it is accepted.
