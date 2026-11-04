@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { VenueId } from '@gimbal/shared';
 import type { LegOutcome, LegSide, PendingMakerOrder, TradeLeg } from '../trade/legs.ts';
+import { wasSigned } from '../trade/legs.ts';
 import { toQty } from '../trade/lots.ts';
 import { PairTrader } from '../trade/pair.ts';
 import type { PairShape } from '../trade/pair-shape.ts';
@@ -93,14 +94,24 @@ function priceWorld(timeline: string[], ageS: number, px = 100) {
   return { client, prices };
 }
 
-/** A Pair on fake legs in `shape`'s order, sending through its own trader; nothing reads a venue. */
+/**
+ * A Pair on fake legs in `shape`'s order, sending through its own trader as serve's runner does (the residual hedge on
+ * a replayable leg through PairTrader.hedge, sized again from the target net); nothing reads a venue.
+ */
 function fakePair(shape: PairShape, legs: [FakeLeg, FakeLeg], priced = false): Pair {
   const trader = new PairTrader({ legs, priceBandBps: 100 });
   const makerIndex = makerIndexOf(shape);
   const hl = legs.find((l) => l.venue === 'hyperliquid') ?? null;
+  const iocIndex = makerIndex === 0 ? 1 : 0;
+  const ioc = legs[iocIndex];
   return {
     symbol: 'SOL', shape, legs, makerIndex, hl, phoenix: null, trader,
-    run: { ...traderRunner(trader, legs[makerIndex === 0 ? 1 : 0]), stopOnFinish: false },
+    run: {
+      ...traderRunner(trader, ioc), stopOnFinish: false,
+      hedge: (side: LegSide, size: bigint, reduceOnly: boolean, reason: string, targetNet?: bigint) => (ioc.replayable
+        ? trader.hedge(iocIndex, side, size, reduceOnly, reason, targetNet)
+        : (ioc as TradeLeg).order(side, size, reduceOnly, reason)),
+    },
     lot: toQty('1'), bandBps: 100, priced, mismatches: [], marketConfig: null, orderlyMarket: null, maker: MAKER, microLamports: 1, targetNet: null,
   } as unknown as Pair;
 }
@@ -402,4 +413,16 @@ test('buildPair: a close goes on an Orderly market dropped from the list (or a l
   await assert.rejects(buildPair(buildCtx(timeline, dropped), 'SOL', ORDERS, false, shape), /Orderly has no PERP_SOL_USDC market the desk can trade/);
   await assert.rejects(buildPair(buildCtx(timeline, unread), 'SOL', ORDERS, false, shape), /HTTP 503/);
   assert.deepEqual(timeline, [], 'nothing sent');
+});
+
+test('traderRunner (pair-mainnet): a residual hedge on a replayable leg is refused, never signed', async () => {
+  const timeline: string[] = [];
+  const hl = new FakeHl(timeline);
+  const ol = new FakeLeg('orderly', 'PERP_SOL_USDC', timeline);
+  const trader = new PairTrader({ legs: [hl, ol], priceBandBps: 100 });
+  const out = await traderRunner(trader, ol).hedge('BUY', toQty('2'), false, 'hedge');
+  assert.equal(out.kind, 'failed');
+  assert.equal(wasSigned(out), false);
+  assert.match(out.kind === 'failed' ? out.error.message : '', /a CLI sends no hedge on a replayable leg/);
+  assert.deepEqual(ol.orders, []);
 });

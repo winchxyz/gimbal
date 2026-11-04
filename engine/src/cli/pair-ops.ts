@@ -33,7 +33,7 @@ import { carryPlan, meanRatePerHour, pct, usd } from '../trade/carry-plan.ts';
 import { DEFAULT_SCANNER_CONFIG, MAINNET_COSTS, hlFillFeeBps } from '../scanner/config.ts';
 import { bookMid } from '../scanner/costs.ts';
 import type { LegOutcome, LegSide, MakerSettings, TradeLeg } from '../trade/legs.ts';
-import { HlLeg } from '../trade/legs.ts';
+import { HlLeg, LegCheckError } from '../trade/legs.ts';
 import { commonLot, floorToLot, qtyNumber, qtyString, signedQtyString, toQty } from '../trade/lots.ts';
 import type { CloseRequest, PairResult } from '../trade/pair.ts';
 import { PairTrader } from '../trade/pair.ts';
@@ -179,8 +179,11 @@ export async function storedPrice(client: Pick<NearContractClient, 'prices'>, sy
 export interface PairRunner {
   openInChunks: PairTrader['openInChunks'];
   close(request: CloseRequest): Promise<PairResult>;
-  /** finish()'s residual IOC on the IOC leg (the maker leg's partner); never throws. */
-  hedge(side: LegSide, size: bigint, reduceOnly: boolean, reason: string): Promise<LegOutcome>;
+  /**
+   * finish()'s residual IOC on the IOC leg (the maker leg's partner); never throws. `targetNet`: what both legs should
+   * hold together, for a runner that sizes the hedge again in turn (serve's, on Orderly: PairTrader.hedge).
+   */
+  hedge(side: LegSide, size: bigint, reduceOnly: boolean, reason: string, targetNet?: bigint): Promise<LegOutcome>;
   /** finish() stops the trader first (a CLI about to exit); serve's trader keeps running. */
   stopOnFinish: boolean;
 }
@@ -228,16 +231,19 @@ export function venueName(v: VenueId): string {
 }
 
 /**
- * The CLI's runner: its own trader, and the IOC leg for the residual hedge (raw, or through the trader when the leg
- * is replayable, so its replay window is watched: PairTrader.hedge).
+ * The CLI's runner: its own trader, and the raw IOC leg for the residual hedge. A replayable leg (Orderly) is refused
+ * outright: a signed copy can be sent again for 300 s, and a CLI that exits cannot watch that window (pair-mainnet
+ * refuses Orderly pairs before this is reached; serve's runner hedges through its trader).
  */
 export function traderRunner(trader: PairTrader, ioc: TradeLeg): PairRunner {
-  const index: 0 | 1 = trader.legs[0] === ioc ? 0 : 1;
   return {
     openInChunks: (request) => trader.openInChunks(request),
     close: (request) => trader.close(request),
-    hedge: (side, size, reduceOnly, reason) => (ioc.replayable
-      ? trader.hedge(index, side, size, reduceOnly, reason)
+    hedge: async (side, size, reduceOnly, reason) => (ioc.replayable
+      ? {
+        kind: 'failed', error: new LegCheckError(`${ioc.venue} ${ioc.symbol}: a CLI sends no hedge on a replayable leg (it cannot watch the replay window): nothing was sent`),
+        ref: { venue: ioc.venue, side, size: qtyString(size), reduceOnly, orderId: null, clientId: null, tx: [], sentAt: Date.now() },
+      }
       : ioc.order(side, size, reduceOnly, reason)),
     stopOnFinish: true,
   };
@@ -990,7 +996,7 @@ export async function finish(ctx: OpsCtx, pair: Pair): Promise<void> {
         send: ctx.send, trading: ctx.trading, lot: ioc.lot, targetNet: pair.targetNet, symbol: pair.symbol, unhedged,
       }, {
         readLegs: () => readLegs(ctx, pair), say: (line) => ctx.say(line),
-        hedge: (side, size, reduceOnly) => pair.run.hedge(side, size, reduceOnly, `pair-mainnet: hedge ${pair.symbol} after a late maker fill`),
+        hedge: (side, size, reduceOnly) => pair.run.hedge(side, size, reduceOnly, `pair-mainnet: hedge ${pair.symbol} after a late maker fill`, pair.targetNet ?? undefined),
         open: (line) => ctx.open(line),
       });
   }

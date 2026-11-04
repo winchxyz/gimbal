@@ -13,7 +13,7 @@ import { MpcTimeoutError, OutcomeUnknown } from '../contract/types.ts';
 import type { HlOrder } from '../contract/types.ts';
 import { NothingExecuted } from '../relayer/tx.ts';
 import type { LegOutcome, LegRef, LegSide, TradeLeg } from './legs.ts';
-import { HlLeg, LegCheckError } from './legs.ts';
+import { HlLeg, LegCheckError, wasSigned } from './legs.ts';
 import { floorToLot, lotQty, toQty } from './lots.ts';
 import { OPEN_SCOPE } from './open-scope.ts';
 import type { PairTraderOptions, WatchReport } from './pair.ts';
@@ -1048,4 +1048,35 @@ test('hedge: a copy found right after the hedge is trimmed at once; an unreadabl
   assert.match(out.kind === 'failed' ? out.error.message : '', /cannot be read before the hedge: nothing was sent/);
   assert.equal(u.b.orders.length, 0);
   assert.equal(u.trader.watching(u.b), false);
+});
+
+test('hedge with the target net: sized again in turn from both legs; at the net or off it the other way, nothing is signed', async () => {
+  // Read as -0.012 / 0.010 (BUY 0.002), but Orderly reached 0.011 before the hedge's turn: it sends 0.001.
+  const s = setup({ pos: '-0.012' }, { pos: '0.011' });
+  s.trader.adopt([q('-0.010'), q('0.010')]);
+  const out = await s.trader.hedge(1, 'BUY', q('0.002'), false, 'hedge', 0n);
+  assert.equal(out.kind, 'filled');
+  assert.deepEqual(s.b.orders.map((o) => [o.side, o.size]), [['BUY', '0.001']]);
+  assert.equal(s.b.pos, q('0.012'));
+  for (const [hl, ol, why] of [['-0.012', '0.012', /the legs are at the target net now/], ['-0.012', '0.013', /the legs are off it the other way now/]] as const) {
+    const t = setup({ pos: hl }, { pos: ol });
+    const r = await t.trader.hedge(1, 'BUY', q('0.002'), false, 'hedge', 0n);
+    assert.equal(r.kind, 'failed');
+    assert.equal(wasSigned(r), false, 'never signed');
+    assert.match(r.kind === 'failed' ? r.error.message : '', why);
+    assert.equal(t.b.orders.length, 0);
+    assert.equal(t.trader.watching(t.b), false);
+  }
+});
+
+test('hedge: a copy of a reducing hedge does not become the intent; the watch matches the deficit on the partner', async () => {
+  const s = setup({ pos: '-0.010' }, { pos: '0.012', script: ['copy'] });
+  s.trader.adopt([q('-0.012'), q('0.012')]);
+  await s.trader.hedge(1, 'SELL', q('0.002'), true, 'hedge', 0n);
+  assert.equal(s.b.pos, q('0.008'), 'the copy landed too');
+  assert.equal(s.trader.intent(s.b), q('0.010'), 'the hedge\'s target, not the copy');
+  assert.equal(s.trader.known(s.b), q('0.008'));
+  await s.trader.positionPushed(s.b, q('0.008'));
+  assert.deepEqual(s.a.orders.at(-1), { side: 'BUY', size: '0.002', reduceOnly: true, reason: 'reconcile ETH: close 0.002 its partner lost' });
+  assert.equal(s.a.pos + s.b.pos, 0n, 'the partner was matched');
 });

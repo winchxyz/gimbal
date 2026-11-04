@@ -509,12 +509,13 @@ export class ProtectedPair {
    * `allowOpen` only from the loop's open. It stays in the book (no trader result holds it) until a close result or an
    * adopt. Never throws for the order itself (a refusal comes back as a failed outcome). On a replayable leg (Orderly)
    * it goes through the trader (PairTrader.hedge): anyone can send a signed copy again inside the replay window, so the
-   * leg is watched and held to where the hedge leaves it. A leg that cannot be replayed sends the order as before.
+   * leg is watched and held to where the hedge leaves it, and with `targetNet` its size is computed again from both
+   * legs as they are when its turn comes. A leg that cannot be replayed sends the order as before.
    */
-  async hedge(index: 0 | 1, side: LegSide, size: bigint, reduceOnly: boolean, reason: string, allowOpen: boolean): Promise<LegOutcome> {
+  async hedge(index: 0 | 1, side: LegSide, size: bigint, reduceOnly: boolean, reason: string, allowOpen: boolean, targetNet?: bigint): Promise<LegOutcome> {
     const leg = this.trader.legs[index];
     return this.#operation(allowOpen, () => (leg.replayable
-      ? this.trader.hedge(index, side, size, reduceOnly, reason)
+      ? this.trader.hedge(index, side, size, reduceOnly, reason, targetNet)
       : leg.order(side, size, reduceOnly, reason)));
   }
 

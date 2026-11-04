@@ -388,34 +388,54 @@ export class PairTrader {
    * One order on leg `index` after an open or close (the residual hedge after a late maker fill), in turn with the
    * pair's other work. On a replayable leg it arms the replay window like any other order and sets the leg's intent to
    * where the hedge leaves it, so a copy of the hedge is trimmed back and the hedge itself is not read as off-intent;
-   * a copy past the target found right after it is trimmed here. The partner's intent becomes what it holds now. The
-   * baselines stay (the caller adopts the legs after it). A leg that cannot be read first sends nothing: the outcome
-   * is a failed one.
+   * a copy past the target found right after it is trimmed here. The leg's intent is the hedge's target once the order
+   * reached it (a copy of a reducing hedge is then a deficit the watch matches, not the new intent); the partner's is
+   * what it holds now. The baselines stay (the caller adopts the legs after it).
+   *
+   * With `targetNet`, the size is computed again here, in turn, from both legs read now: the residual targetNet less
+   * what they hold, at most `size`, on `side` (a size read before something else moved the legs is not sent). Nothing
+   * is sent, and the outcome is a failed one that was never signed, when a leg cannot be read, the legs are at the
+   * target net or off it the other way, or the residual is under one lot.
    */
-  hedge(index: 0 | 1, side: LegSide, size: bigint, reduceOnly: boolean, reason: string): Promise<LegOutcome> {
+  hedge(index: 0 | 1, side: LegSide, size: bigint, reduceOnly: boolean, reason: string, targetNet?: bigint): Promise<LegOutcome> {
     return this.#serial(async () => {
       const leg = this.legs[index];
+      const partner = this.#partner(leg);
+      const refused = (why: string): LegOutcome => ({
+        kind: 'failed', error: new LegCheckError(`${why}: nothing was sent`),
+        ref: { venue: leg.venue, side, size: qtyString(size), reduceOnly, orderId: null, clientId: null, tx: [], sentAt: this.#clock.now() },
+      });
       const from = await this.#read(leg, undefined, 'before a hedge');
-      if (from === null) {
-        const ref: LegRef = { venue: leg.venue, side, size: qtyString(size), reduceOnly, orderId: null, clientId: null, tx: [], sentAt: this.#clock.now() };
-        return { kind: 'failed', error: new Error(`${leg.venue} ${leg.symbol} cannot be read before the hedge: nothing was sent`), ref };
+      if (from === null) return refused(`${leg.venue} ${leg.symbol} cannot be read before the hedge`);
+      let want = size;
+      let held: bigint | null = null;
+      if (targetNet !== undefined) {
+        held = this.#unsettled.has(partner) ? null : await this.#read(partner, undefined, 'the partner of a hedge');
+        if (held === null) return refused(`${partner.venue} ${partner.symbol} cannot be read, or has an order that may still run, before the hedge`);
+        const residual = targetNet - from - held;
+        const legs = `${leg.venue} ${signedQtyString(from)}, ${partner.venue} ${signedQtyString(held)}, target net ${signedQtyString(targetNet)}`;
+        if (residual === 0n || (residual > 0n) !== (side === 'BUY')) {
+          return refused(`the legs are ${residual === 0n ? 'at the target net' : 'off it the other way'} now (${legs})`);
+        }
+        want = floorToLot(abs(residual) < size ? abs(residual) : size, leg.lot);
+        if (want === 0n) return refused(`the residual ${signedQtyString(residual)} is under one lot now (${legs})`);
       }
-      const target = from + (side === 'BUY' ? size : -size);
+      const target = from + (side === 'BUY' ? want : -want);
       const r = this.#run(leg, from, target);
-      const out = await this.#send(r, side, size, reduceOnly, reason, 'rehedge');
+      const out = await this.#send(r, side, want, reduceOnly, reason, 'rehedge');
       await this.#settle(r, from, side, out);
       if (leg.replayable && r.pos !== null && r.unsettled === null && (side === 'BUY' ? r.pos > target : r.pos < target)) {
         await this.#trim(r, `reconcile ${leg.symbol}`);
       }
-      this.#intent.set(leg, r.unsettled !== null ? target : r.pos);
+      const reached = r.pos !== null && (side === 'BUY' ? r.pos >= target : r.pos <= target);
+      this.#intent.set(leg, r.unsettled !== null || reached ? target : r.pos);
       this.#known.set(leg, r.pos);
       if (r.unsettled !== null) this.#armUnsettled(r);
-      const partner = this.#partner(leg);
       if (!this.#unsettled.has(partner)) {
-        const held = await this.#read(partner, undefined, 'the partner of a hedge');
-        if (held !== null) {
-          this.#intent.set(partner, held);
-          this.#known.set(partner, held);
+        const now = await this.#read(partner, undefined, 'the partner of a hedge');
+        if (now !== null) {
+          this.#intent.set(partner, now);
+          this.#known.set(partner, now);
         }
       }
       return out;
