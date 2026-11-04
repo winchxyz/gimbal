@@ -15,6 +15,12 @@ function fixed(value: number, decimals: number): string {
 /** `8.6%`, `−2.4%` */
 export const pct = (value: number, decimals = 1): string => `${fixed(value, decimals)}%`;
 
+/** `+8.6%`, `−2.4%`, `0.0%`: a percentage with its sign. A value that rounds to zero has none. */
+export function signedPct(value: number, decimals = 1): string {
+  const text = fixed(value, decimals);
+  return Number(text.replace(MINUS, '-')) > 0 ? `+${text}%` : `${text}%`;
+}
+
 /** `8.6`, `−2.4`: a percentage without the sign, for the small lines under a row */
 export const plain = (value: number, decimals = 1): string => fixed(value, decimals);
 
