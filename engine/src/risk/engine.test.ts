@@ -13,7 +13,7 @@ import { EngineServer } from '../server.ts';
 import type { AccountState, Position } from '../venues/venue.ts';
 import type { DeskSnapshot, DeskSource, LegInput } from './engine.ts';
 import type { RescueTrigger } from './engine.ts';
-import { DESK_VIEW_STALE_MS, RESCUE_LAPSE_MS, RESCUE_RETRY_MS, RiskEngine, STRESS_MARGIN_PTS, StressRefused } from './engine.ts';
+import { DESK_VIEW_STALE_MS, LANDED_SETTLE_MS, RESCUE_LAPSE_MS, RESCUE_RETRY_MS, RiskEngine, STRESS_MARGIN_PTS, StressRefused } from './engine.ts';
 import type { AdlReport, AdlWatch } from './adl.ts';
 import type { TradeLeg } from '../trade/legs.ts';
 import { STRESS_MAINNET_REASON } from './stress-route.ts';
@@ -174,7 +174,7 @@ function rig(options: { adl?: AdlWatch; desk?: Desk; rescuer?: (x: RescueTrigger
   const desk = options.desk ?? new Desk();
   const risk = new RiskEngine({
     mode: 'testnet', source: options.source ?? desk, strategy: () => DEFAULT_STRATEGY, health: new VenueHealth(), publish: (e) => events.push(e),
-    clock: { now: () => t }, rescuer: (x) => { triggers.push(x); return options.rescuer?.(x); }, ...(options.adl !== undefined ? { adl: options.adl } : {}),
+    clock: { now: () => t }, monotonic: () => t, rescuer: (x) => { triggers.push(x); return options.rescuer?.(x); }, ...(options.adl !== undefined ? { adl: options.adl } : {}),
     ...(options.running !== undefined ? { rescuerRunning: options.running } : {}),
   });
   const journal = () => events.filter((e) => e.type === 'journal').map((e) => e.data as JournalEntry);
@@ -479,6 +479,122 @@ test('POST /stress on mainnet: 403 with the reason, nothing stressed', async () 
   });
 });
 
+/** A desk whose read takes its snapshot at once and, while held, answers only when released (a slow venue read). */
+function slowReads(desk: Desk) {
+  let gate: Promise<void> | null = null;
+  const source: DeskSource = {
+    read: async () => {
+      const snap = await desk.read();
+      if (gate !== null) await gate;
+      return snap;
+    },
+  };
+  /** Holds the next read; the returned function lets it answer. */
+  const hold = (): (() => void) => {
+    let open!: () => void;
+    gate = new Promise<void>((r) => { open = r; });
+    return () => { gate = null; open(); };
+  };
+  return { source, hold };
+}
+
+test('a read that started before a rescue landed triggers nothing; a read that started after it still does', async () => {
+  const desk = new Desk();
+  desk.hlMargin = 150;   // 5.39 % from liquidation, under the 8 % rescue line
+  const { source, hold } = slowReads(desk);
+  const { risk, triggers, advance } = rig({ desk, source });
+  await risk.tick();
+  assert.equal(triggers.length, 1);
+  const first = triggers[0]!.id;
+
+  const release = hold();
+  const inFlight = risk.tick();
+  // The margin lands while that read is still out, so its numbers predate the landing.
+  advance(1_000);
+  risk.rescueEnded(first, true);
+  release();
+  const stale = (await inFlight)!;
+  assert.ok(stale.legs[0]!.distanceToLiqPct! < 8, 'the late read still shows the leg under its line');
+  assert.equal(triggers.length, 1, 'no second rescue on a read from before the landing');
+
+  // A read that starts after the landing (and its settle time) is judged as usual: still under the line, afresh.
+  advance(5_000);
+  await risk.tick();
+  assert.equal(triggers.length, 2);
+  assert.equal(triggers[1]!.attempt, 0);
+  assert.notEqual(triggers[1]!.id, first);
+});
+
+test('a read started within LANDED_SETTLE_MS of a landing triggers nothing; the first one after it does', async () => {
+  const desk = new Desk();
+  desk.hlMargin = 150;
+  const { risk, triggers, advance } = rig({ desk });
+  await risk.tick();
+  risk.rescueEnded(triggers[0]!.id, true);
+  // The venue's API may still answer from before the landing (Phoenix lags its chain).
+  advance(LANDED_SETTLE_MS - 1_000);
+  await risk.tick();
+  assert.equal(triggers.length, 1, 'no trigger inside the settle window');
+  advance(1_000);
+  await risk.tick();
+  assert.equal(triggers.length, 2, 'settled and still under the line: a fresh rescue');
+  assert.equal(triggers[1]!.attempt, 0);
+});
+
+test('rescue A lands after the leg bounced out and trigger B was refused: a stale read pays nothing twice', async () => {
+  const desk = new Desk();
+  desk.hlMargin = 150;
+  const { source, hold } = slowReads(desk);
+  const { risk, triggers, advance } = rig({ desk, source });
+  await risk.tick();
+  const a = triggers[0]!.id;
+  // A runs; the leg bounces out of rescue (its record goes), then back in: trigger B.
+  desk.hlMargin = 400;
+  advance(5_000);
+  await risk.tick();
+  desk.hlMargin = 150;
+  advance(5_000);
+  await risk.tick();
+  assert.equal(triggers.length, 2);
+  const b = triggers[1]!.id;
+  // The rescuer refuses B (one at a time: A still runs).
+  risk.rescueEnded(b, false);
+  // A read starts, B's backoff passes while it is out, and A lands before it answers.
+  const release = hold();
+  const inFlight = risk.tick();
+  advance(RESCUE_RETRY_MS * 2);
+  risk.rescueEnded(a, true);
+  release();
+  await inFlight;
+  assert.equal(triggers.length, 2, 'no retry of B on numbers from before A landed');
+  // Once a read could see A's margin, the leg is judged afresh (here still under the line).
+  advance(LANDED_SETTLE_MS);
+  await risk.tick();
+  assert.equal(triggers.length, 3);
+  assert.equal(triggers[2]!.attempt, 0);
+});
+
+test('a landing while the leg\'s venue is unread: its kept numbers trigger nothing until a settled read', async () => {
+  const desk = new Desk();
+  desk.hlMargin = 400;
+  desk.phoenixMargin = 100;   // the Phoenix long 3.06 % from liquidation
+  const { risk, triggers, advance } = rig({ desk });
+  await risk.tick();
+  assert.equal(triggers.length, 1);
+  assert.equal(triggers[0]!.venue, 'phoenix');
+  risk.rescueEnded(triggers[0]!.id, true);
+  desk.phoenixDown = 'timeout';
+  advance(LANDED_SETTLE_MS + 5_000);
+  const d = (await risk.tick())!;
+  assert.equal(d.legs.find((l) => l.venue === 'phoenix')!.distanceToLiqPct! < 8, true, 'the kept numbers are from before the landing');
+  assert.equal(triggers.length, 1, 'no trigger on numbers read before the landing');
+  desk.phoenixDown = null;
+  advance(5_000);
+  await risk.tick();
+  assert.equal(triggers.length, 2);
+  assert.equal(triggers[1]!.attempt, 0);
+});
+
 test('a rescue the rescuer is still running never lapses; its late end still counts', async () => {
   const desk = new Desk();
   desk.hlMargin = 150;
@@ -495,6 +611,7 @@ test('a rescue the rescuer is still running never lapses; its late end still cou
   // It lands late: the leg starts afresh (attempt 0), not as a retry of a lapsed one.
   risk.rescueEnded(running, true);
   running = null;
+  advance(LANDED_SETTLE_MS);
   await risk.tick();
   assert.equal(triggers.length, 2);
   assert.equal(triggers[1]!.attempt, 0);

@@ -11,6 +11,11 @@
 // again only when its rescue failed (rescueEnded(id, false)) or lapsed (no end reported within RESCUE_LAPSE_MS while the
 // rescuer is not running it: a real rescue can outlast the lapse, and its end then counts), after
 // a backoff of RESCUE_RETRY_MS doubling up to RESCUE_RETRY_MAX_MS. A leg that leaves rescue starts afresh.
+// A landed rescue (rescueEnded(id, true)) starts the leg afresh too, but only on a read that started LANDED_SETTLE_MS
+// or more after the landing: a read already under way when the margin landed, or started just after while the venue's
+// API still lags its chain, shows the leg without it, and would pay it twice. The landing is kept on the leg whichever
+// of its triggers is current, and even when the leg left rescue meanwhile. Read and landing times are taken on a
+// monotonic clock (`monotonic`), so a wall clock stepped back cannot hold triggers off.
 //
 // The ADL check runs beside the reads, never inside them: its response trades (an MPC signature can take 120 s, a
 // close several), and reads, rescue triggers and POST /stress must go on meanwhile. One check runs at a time.
@@ -47,6 +52,13 @@ export const RESCUE_LAPSE_MS = 2 * RESCUE_HORIZON_S * 1000;
 /** A failed or lapsed rescue of a leg still in rescue is triggered again after this, doubling, up to the max. */
 export const RESCUE_RETRY_MS = 30_000;
 export const RESCUE_RETRY_MAX_MS = 10 * 60_000;
+/**
+ * After a landing, reads that started before this much time passed are not judged for a new trigger: over the 2 s a
+ * venue's API may still answer from before the desk's own act (desk-acts.ts DESK_ACT_SETTLE_MS), with a margin.
+ */
+export const LANDED_SETTLE_MS = 3_000;
+/** A trigger is remembered this long for its landing to find its leg (a rescue reports its end once, well before). */
+const TRIGGER_MEMORY_MS = 24 * 3_600_000;
 /** The desk's view (get_desk) older than this marks NEAR down; any failed or late read in between marks it slow. */
 export const DESK_VIEW_STALE_MS = 60_000;
 
@@ -130,6 +142,8 @@ export interface RiskEngineOptions {
   /** E9: the id of the rescue the rescuer is running now; a running rescue never lapses (a real one can take 10 min). */
   rescuerRunning?: () => string | null;
   log?: (line: string) => void;
+  /** Monotonic milliseconds for read starts and landings (default performance.now(); tests pass their own). */
+  monotonic?: () => number;
 }
 
 interface LegView {
@@ -138,12 +152,16 @@ interface LegView {
   lines: Lines;
   level: HealthLevel;
   freeMarginUsd: number;
+  /** When the read these numbers came from started, monotonic (a venue that did not answer keeps its older read's). */
+  readAt: number;
 }
 
-/** A leg's rescue: the last trigger, when it ended (null: running), and how many came before it. */
+/** A leg's rescue: the last trigger, when it failed (null: running), when one landed, and how many came before it. */
 interface LegRescue {
   trigger: RescueTrigger;
   endedAt: number | null;
+  /** Monotonic time a rescue of this leg landed: reads started before it + LANDED_SETTLE_MS trigger nothing. */
+  landedAt?: number;
   attempt: number;
 }
 
@@ -153,6 +171,9 @@ export class RiskEngine {
   readonly #vol = new Map<string, Volatility>();
   readonly #levels = new Map<string, HealthLevel>();
   readonly #rescues = new Map<string, LegRescue>();
+  /** Trigger id -> its leg, so a landing finds the leg after a newer trigger replaced it or the leg left rescue. */
+  readonly #triggerLeg = new Map<string, RescueTrigger>();
+  readonly #mono: () => number;
   #views: LegView[] = [];
   #desk: DeskState | null = null;
   #failure: DeskState['rescueFailure'] = null;
@@ -168,6 +189,7 @@ export class RiskEngine {
   constructor(options: RiskEngineOptions) {
     this.#o = options;
     this.#clock = options.clock ?? systemClock;
+    this.#mono = options.monotonic ?? (() => performance.now());
   }
 
   get desk(): DeskState | null {
@@ -241,11 +263,24 @@ export class RiskEngine {
     }
   }
 
-  /** E9: a rescue ended. Landed: the leg starts afresh; failed: it is triggered again after the backoff if still in rescue. */
+  /**
+   * E9: a rescue ended. Landed: the leg starts afresh on a read that started LANDED_SETTLE_MS after now (see the
+   * header), whichever of its triggers is current and even if it left rescue meanwhile; failed: that trigger is
+   * tried again after the backoff if the leg is still in rescue.
+   */
   rescueEnded(id: string, landed: boolean): void {
-    for (const [k, r] of this.#rescues) {
+    const trigger = this.#triggerLeg.get(id);
+    this.#triggerLeg.delete(id);
+    if (landed && trigger !== undefined) {
+      const k = key(trigger.venue, trigger.symbol);
+      const r = this.#rescues.get(k);
+      if (r !== undefined) r.landedAt = this.#mono();
+      else this.#rescues.set(k, { trigger, endedAt: null, landedAt: this.#mono(), attempt: 0 });
+      return;
+    }
+    for (const r of this.#rescues.values()) {
       if (r.trigger.id !== id) continue;
-      if (landed) this.#rescues.delete(k);
+      if (landed) r.landedAt = this.#mono();
       else r.endedAt = this.#clock.now();
     }
   }
@@ -282,6 +317,7 @@ export class RiskEngine {
 
   async #tick(): Promise<DeskState | null> {
     let snap: DeskSnapshot;
+    const readAt = this.#mono();
     try {
       snap = await this.#o.source.read();
     } catch (err) {
@@ -306,7 +342,7 @@ export class RiskEngine {
     const unread = new Set(snap.reads.filter((r) => r.error !== null).map((r) => r.venue));
     const strategy = this.#o.strategy();
     const views: LegView[] = [];
-    for (const input of snap.legs) views.push(this.#view(input, strategy, t));
+    for (const input of snap.legs) views.push(this.#view(input, strategy, t, readAt));
     // A leg whose venue did not answer keeps its last numbers, and is at least watched: it cannot be seen.
     for (const old of this.#views) {
       if (!unread.has(old.leg.venue) || views.some((v) => v.leg.venue === old.leg.venue && v.leg.symbol === old.leg.symbol)) continue;
@@ -320,7 +356,7 @@ export class RiskEngine {
     if (viewUnknown) desk.health = worst([desk.health, 'watch']);
     this.#desk = desk;
     this.#o.publish({ type: 'desk', data: desk });
-    this.#triggers(views, t);
+    this.#triggers(views, t, readAt);
     this.#startAdl();
     return desk;
   }
@@ -342,7 +378,7 @@ export class RiskEngine {
     })();
   }
 
-  #view(input: LegInput, strategy: StrategyConfig, t: number): LegView {
+  #view(input: LegInput, strategy: StrategyConfig, t: number, readAt: number): LegView {
     const k = key(input.venue, input.symbol);
     const risk = legRisk({ venue: input.venue, account: input.account, position: input.position, markPx: input.markPx });
     let vol = this.#vol.get(k);
@@ -374,7 +410,7 @@ export class RiskEngine {
       feesUsd: input.feesUsd,
       unpriced: input.unpriced,
     };
-    return { leg, risk, lines, level, freeMarginUsd: input.account.freeMarginUsd };
+    return { leg, risk, lines, level, freeMarginUsd: input.account.freeMarginUsd, readAt };
   }
 
   #deskState(snap: DeskSnapshot, views: LegView[], t: number): DeskState {
@@ -399,8 +435,9 @@ export class RiskEngine {
   }
 
   /** Per leg (see the header): a first trigger, or another after a failed or lapsed one and its backoff. */
-  #triggers(views: LegView[], t: number): void {
+  #triggers(views: LegView[], t: number, readAt: number): void {
     const inRescue = new Set<string>();
+    const settled = (v: { readAt: number }, r: LegRescue) => r.landedAt === undefined || v.readAt >= r.landedAt + LANDED_SETTLE_MS;
     // Nearest its line first, so the leg that bites first is rescued first.
     const due = views
       .filter((v) => v.level === 'rescue' && v.risk !== null)
@@ -409,6 +446,19 @@ export class RiskEngine {
       const k = key(v.leg.venue, v.leg.symbol);
       inRescue.add(k);
       const r = this.#rescues.get(k);
+      if (r?.landedAt !== undefined) {
+        // Read before the margin landed, or while the venue may still answer from before it: these numbers may not
+        // have it yet, so they say nothing about the leg now.
+        if (!settled(v, r)) continue;
+        if (r.endedAt === null && (this.#o.rescuerRunning?.() ?? null) === r.trigger.id) {
+          // Another rescue of this leg still runs: its own end decides what comes next.
+          delete r.landedAt;
+          continue;
+        }
+        this.#rescues.delete(k);
+        this.#fire(v, views, t, 0);
+        continue;
+      }
       if (r === undefined) {
         this.#fire(v, views, t, 0);
         continue;
@@ -422,7 +472,8 @@ export class RiskEngine {
         this.#fire(v, views, t, r.attempt + 1);
       }
     }
-    for (const k of this.#rescues.keys()) if (!inRescue.has(k)) this.#rescues.delete(k);
+    // A leg out of rescue starts afresh, except that a landing is kept until a settled read could have seen it.
+    for (const [k, r] of this.#rescues) if (!inRescue.has(k) && settled({ readAt }, r)) this.#rescues.delete(k);
   }
 
   #fire(v: LegView, views: LegView[], t: number, attempt: number): void {
@@ -442,6 +493,8 @@ export class RiskEngine {
       amountUsd, amountKnown: sized.known, from: partner?.leg.venue ?? 'reserve', stress, attempt, at: t,
     };
     this.#rescues.set(k, { trigger, endedAt: null, attempt });
+    for (const [id, old] of this.#triggerLeg) if (t - old.at > TRIGGER_MEMORY_MS) this.#triggerLeg.delete(id);
+    this.#triggerLeg.set(trigger.id, trigger);
     const volNote = v.lines.volPct > 0 ? `, volatility term ${v.lines.volPct.toFixed(2)} %` : '';
     const again = attempt > 0 ? ` (again: attempt ${attempt + 1})` : '';
     const amountText = !sized.known
