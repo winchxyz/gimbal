@@ -915,8 +915,8 @@ not reduce-only (`E_ARGS`) until the desk has a list and the contract signed its
 ```
 node tools/mainnet/orderly.mjs status    <contract>.near <desk_id> [--send]
 node tools/mainnet/orderly.mjs receiver  <contract>.near <desk_id> [0x<receiver>] [--key-file <owner key json>] [--send]
-node tools/mainnet/orderly.mjs ips       <contract>.near <desk_id> <ip[,ip...]> [--key-file <owner key json>] [--send]
-node tools/mainnet/orderly.mjs apply-ips <contract>.near <desk_id> [--engine-ips <ip[,ip...]>] [--send]
+node tools/mainnet/orderly.mjs ips       <contract>.near <desk_id> <ip[,ip...]> [--force-same] [--key-file <owner key json>] [--send]
+node tools/mainnet/orderly.mjs apply-ips <contract>.near <desk_id> --engine-ips <ip[,ip...]> [--send]
 ```
 
 Each is a dry run without `--send`: it reads mainnet, prints every call in full (signer, receiver, method, args,
@@ -927,8 +927,12 @@ run ends with a block, `=== gimbal orderly <command> ... ===` to `=== end ===`. 
 
 - **status** prints `get_desk`'s `orderly_receiver` and `orderly_ips`, `orderly_ips_applied`, an `opens` line (whether
   the contract signs Orderly orders that grow a position), and Orderly's public view of the account (registered, the
-  key's state). The holding is not public: `--send` reads it with one signed `orderly_request` kind `holding` (the
-  operator key, gas only). Run it before and after each step below.
+  key's state). The holding and the receiver are not public, so **`status --send` signs reads**: two
+  `orderly_request` calls, kinds `holding` and `receiver_address` (the operator key, gas only, nothing else signed).
+  It prints the holding and compares the pinned receiver with Orderly's answer: a match, Orderly's answer and the
+  command that pins it when none is pinned, or `MISMATCH` and a non-zero exit when the pinned one is not Orderly's
+  answer (fund nothing into Orderly then; the pin is permanent, so the fix is a new desk). Run it before and after
+  each step below.
 - **receiver** pins `set_orderly_receiver({"desk_id","receiver"})`, signed by the owner, with 0.01 NEAR attached and
   50 TGas: the contract keeps what the pin takes (under 0.001 NEAR) and refunds the rest. Orderly gives the receiver
   only to a request the desk key signed, so `--send` first has the contract sign `orderly_request` kind
@@ -947,27 +951,48 @@ run ends with a block, `=== gimbal orderly <command> ... ===` to `=== end ===`. 
   leading zeros, IPv6 lowercase with the longest zero run as `::`): a form it would refuse is refused here with the
   form to write. Private, loopback, link-local, multicast, carrier-grade NAT and documentation addresses are
   refused too, since Orderly never sees a request come from them; so is an IPv4-mapped IPv6 address (give the IPv4
-  one). The same list again is `nothing to send` (it would only clear `orderly_ips_applied`). After it, opens stay
-  refused until `apply-ips`.
+  one); so are NAT64 (`64:ff9b::/96`), 6to4 (`2002::/16`) and the 6to4 relay (`192.88.99.0/24`), which stand for
+  an IPv4 address Orderly would see instead. The same list again is `nothing to send` (it would only clear
+  `orderly_ips_applied`) unless `--force-same` is given: then it sends it, only to clear the flag (see below). After
+  it, opens stay refused until `apply-ips`.
 - **apply-ips** runs the engine's own setup (`runSetup`), cut to its Orderly steps as `checks.mjs` does: register
   and add-key as done-checks only, `orderly_receiver_lookup` (a signed read; it fails when a pinned receiver is not
-  Orderly's answer) and `orderly_ip_restriction`, in which the contract signs `ip_restriction` for the stored list
-  and this machine posts `POST /v1/client/set_orderly_key_ip_restriction {"orderly_key","ip_restriction_list"}` to
-  Orderly. The operator key may sign only `orderly_request` of those two kinds. Like the engine's step, it refuses,
-  nothing signed, while the list leaves out an IP the engine sends from: `--engine-ips`, else this machine's public
-  IP (`api.ipify.org`, then `checkip.amazonaws.com`). Then it reads `orderly_ips_applied`.
+  Orderly's answer, and the run then exits non-zero with a `FAILED` line) and `orderly_ip_restriction`, in which the
+  contract signs `ip_restriction` for the stored list and this machine posts `POST
+  /v1/client/set_orderly_key_ip_restriction {"orderly_key","ip_restriction_list"}` to Orderly. The operator key may
+  sign only `orderly_request` of those two kinds. `--send` needs `--engine-ips`, every IP the engine sends from;
+  this machine's IP is never taken for the engine's. Like the engine's step, it refuses, nothing signed, while the
+  list leaves out one of them. It also looks up this machine's public IP (`api.ipify.org`, then
+  `checkip.amazonaws.com`) and says whether it is in the list: once Orderly applies the list, a machine outside it
+  cannot post a correction or read the holding. Then it reads `orderly_ips_applied`.
+
+  **When the post fails after the contract signed.** The contract sets `orderly_ips_applied` when it signs
+  `ip_restriction`, before this machine posts it. If Orderly refuses the post (for example an earlier list is applied
+  there and this machine is not in it), the run prints `FAILED ... OPENS ARE NOT PROTECTED` and exits non-zero: the
+  contract now signs opens that Orderly does not limit to the list. The way out is either to rerun `apply-ips` from an
+  IP Orderly takes the key from (the engine's POST /setup), or to clear the flag with the same list:
+  `ips <contract>.near <desk_id> <same list> --force-same --key-file <owner key json> --send`, after which opens are
+  refused again until an `apply-ips` succeeds.
 
 **A wrong list blocks Orderly.** Until a list is set and its `ip_restriction` signed, every Orderly open is refused
 by the contract; reduce-only closes are still signed. Once an `ip_restriction` is applied, Orderly takes the desk's
 key only from the listed IPs, so an engine whose IP is left out cannot open, close or even read on Orderly (the
 contract still signs the close; Orderly refuses it). A corrected list is itself a request signed with that key, so
-apply it from an IP in the applied list. The engine on Railway sends from Railway's outbound IPs: list those (a
-service without static outbound IPs can change them on a redeploy), pass them as `--engine-ips`, and apply while no
-list is applied yet, or from a listed IP. The other way is the engine's own POST /setup on the Railway host
+apply it from an IP in the applied list. The engine on Railway sends from Railway's static outbound IPs: list every
+one of them (with high availability there are several, and Orderly refuses a request from any one left out), pass
+the same list as `--engine-ips`, and apply while no list is applied yet, or from a listed IP. After that, a laptop
+outside the list cannot post a correction; the other way is the engine's own POST /setup on the Railway host
 (section 6; it needs `GIMBAL_SETUP=1`), whose step checks its own IP.
 
+For example, with the engine's IPs from `railway outbound-network static-ip status`:
+
+```
+node tools/mainnet/orderly.mjs ips       <contract>.near <desk_id> 208.77.244.241,152.55.184.240,152.55.185.190 --key-file <owner key json> --send
+node tools/mainnet/orderly.mjs apply-ips <contract>.near <desk_id> --engine-ips 208.77.244.241,152.55.184.240,152.55.185.190 --send
+```
+
 Order: `status`; `receiver` (lookup), then `receiver <address> --key-file ... --send`; `ips <list> --key-file ...
---send`; `apply-ips --engine-ips <list> --send`; `status` again (`opens signed`). Cost: the two owner calls keep
+--send`; `apply-ips --engine-ips <list> --send`; `status --send` again (`opens signed`, the receiver matching). Cost: the two owner calls keep
 under 0.006 NEAR of storage and burn under 0.01 NEAR of gas; each operator request about 0.001 NEAR (0.3 NEAR of
 the key's allowance held per call until the refund).
 

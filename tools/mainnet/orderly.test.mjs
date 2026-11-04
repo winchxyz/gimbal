@@ -66,7 +66,8 @@ const json = (body, status = 200) => new Response(JSON.stringify(body), { status
 
 /**
  * A fake mainnet, Orderly and keys. `o`: desk, applied, code, registered, keyActive, receiverAnswer, ownerKey (the key
- * file's public key), ownerNear, holding, ipRefused.
+ * file's public key), ownerNear, holding, ipRefused (the holding read), ipPostFails (Orderly refuses the ip_restriction
+ * POST after the contract signed it), thisIps (this machine's public IPs).
  */
 function world(o = {}) {
   let desk = o.desk ?? deskOf();
@@ -160,7 +161,10 @@ function world(o = {}) {
       if (o.ipRefused) return json({ success: false, code: -1002, message: 'IP is not allowed' }, 401);
       return json({ success: true, data: { holding: o.holding ?? [{ token: 'USDC', holding: 12.5, frozen: 0, pending_short: 0 }] } });
     }
-    if (u.endsWith('/v1/client/set_orderly_key_ip_restriction')) return json({ success: true, data: {} });
+    if (u.endsWith('/v1/client/set_orderly_key_ip_restriction')) {
+      if (o.ipPostFails) return json({ success: false, code: -1002, message: 'IP is not allowed' }, 401);
+      return json({ success: true, data: {} });
+    }
     throw new Error(`unexpected fetch ${u}`);
   };
   const env = new Map([
@@ -183,7 +187,10 @@ async function capture(argv, deps) {
     const block = await runOrderly(argv, { ...deps, say: (s = '') => lines.push(s) });
     return { out: lines.join('\n'), block, error: null };
   } catch (e) {
-    return { out: lines.join('\n'), block: null, error: e };
+    // A run that exits non-zero still prints its block: read it back from the output.
+    const out = lines.join('\n').split('\n');
+    const start = out.findIndex((l) => l.startsWith('=== gimbal orderly '));
+    return { out: lines.join('\n'), block: start < 0 ? null : out.slice(start, out.indexOf('=== end ===', start) + 1), error: e };
   }
 }
 
@@ -216,6 +223,12 @@ test('arguments: four commands, mainnet ids, the receiver and the IP list checke
   usage(['ips', CONTRACT, DESK_ID, `${IP1}, 5.6.7.8`], /" 5\.6\.7\.8" is not an IPv4 or IPv6 address/);
   usage(['ips', CONTRACT, DESK_ID, Array.from({ length: 11 }, (_, i) => `1.2.3.${i + 10}`).join(',')], /11 addresses; the contract takes 1 to 10/);
   usage(['apply-ips', CONTRACT, DESK_ID, '--engine-ips', '10.0.0.1'], /--engine-ips: 10\.0\.0\.1 is in 10\.0\.0\.0\/8 \(private\)/);
+  // The engine's IPs are never this machine's guess at --send.
+  usage(['apply-ips', CONTRACT, DESK_ID, '--send'], /--send needs --engine-ips <ip\[,ip\.\.\.\]>: every IP the engine sends .*railway outbound-network static-ip status/);
+  assert.equal(parseOrderlyArgs(['apply-ips', CONTRACT, DESK_ID]).engineIps, null, 'a dry run may leave it out');
+  assert.equal(parseOrderlyArgs(['ips', CONTRACT, DESK_ID, IP1, '--force-same']).forceSame, true);
+  assert.equal(parseOrderlyArgs(['ips', CONTRACT, DESK_ID, IP1]).forceSame, false);
+  usage(['apply-ips', CONTRACT, DESK_ID, '--force-same'], /unknown option --force-same/);
   // A receiver --send without an address is the lookup alone: it needs no owner key.
   assert.equal(parseOrderlyArgs(['receiver', CONTRACT, DESK_ID, '--send']).receiver, null);
   assert.equal(parseReceiver('0xAbCdEf0000000000000000000000000000000001'), '0xabcdef0000000000000000000000000000000001');
@@ -251,7 +264,11 @@ test('IPs: the canonical form is Rust\'s IpAddr display, as the contract compare
     ['127.0.0.1', '127.0.0.0/8 (loopback)'], ['100.64.0.1', '100.64.0.0/10 (carrier-grade NAT)'], ['203.0.113.7', '203.0.113.0/24 (documentation)'],
     ['0.0.0.0', '0.0.0.0/8'], ['255.255.255.255', '240.0.0.0/4 (reserved)'], ['::1', '::/96'], ['2001:db8::1', '2001:db8::/32 (documentation)'],
     ['fd00::1', 'fc00::/7 (unique local (private))'], ['fe80::1', 'fe80::/10 (link-local)'], ['ff02::1', 'ff00::/8 (multicast)'],
+    // Addresses that stand for an IPv4 one: Orderly sees the IPv4 address, never these.
+    ['64:ff9b::102:304', '64:ff9b::/96 (NAT64: a translated IPv4 address)'], ['2002:102:304::1', '2002::/16 (6to4: a tunnelled IPv4 address)'],
+    ['192.88.99.1', '192.88.99.0/24 (6to4 relay anycast)'],
   ]) assert.ok(ipProblem(ip)?.includes(`is in ${range}`), `${ip}: ${ipProblem(ip)}`);
+  for (const ip of ['64:ff9b:0:1::1', '2003::1', '2001:db9::1', '192.88.100.1', '192.88.98.255']) assert.equal(ipProblem(ip), null, `${ip} is public`);
   assert.ok(parseIpList('172.32.0.1', 'x'), 'just past 172.16/12 is public');
   assert.throws(() => parseIpList('1.1.1.1,10.0.0.1,1.1.1.1', 'the IP list'), /10\.0\.0\.1 is in 10\.0\.0\.0\/8 \(private\)[\s\S]*1\.1\.1\.1 is listed twice/);
 });
@@ -284,7 +301,7 @@ test('the reasons are the engine\'s, and the guard lets only the command\'s kind
   const actions = readFileSync(new URL('../../engine/src/venues/orderly-actions.ts', import.meta.url), 'utf8');
   assert.ok(actions.includes("this.request('ip_restriction', {}, 'limit the Orderly key to the relayer IPs')"));
   assert.ok(actions.includes("holding(reason = 'read Orderly holding')"));
-  assert.deepEqual(ALLOWED_KINDS, { status: ['holding'], receiver: ['receiver_address'], 'apply-ips': ['receiver_address', 'ip_restriction'] });
+  assert.deepEqual(ALLOWED_KINDS, { status: ['holding', 'receiver_address'], receiver: ['receiver_address'], 'apply-ips': ['receiver_address', 'ip_restriction'] });
   const calls = [];
   const inner = { accountId: OWNER, call: async (...c) => { calls.push(c); return { ok: true }; }, view: async () => 1, account: async () => 2, allowance: async () => 3n };
   const g = kindGuard(inner, CONTRACT, ['ip_restriction']);
@@ -302,7 +319,7 @@ test('--send refuses in a linked git worktree before anything is read, for every
     ['status', CONTRACT, DESK_ID, '--send'],
     ['receiver', CONTRACT, DESK_ID, RECEIVER, '--key-file', 'k.json', '--send'],
     ['ips', CONTRACT, DESK_ID, IP1, '--key-file', 'k.json', '--send'],
-    ['apply-ips', CONTRACT, DESK_ID, '--send'],
+    ['apply-ips', CONTRACT, DESK_ID, '--engine-ips', IP1, '--send'],
   ]) {
     await assert.rejects(runOrderly(argv, { tree: '/w/tree', near: touched, fetch: touched, say: () => {} }), /\/w\/tree is a linked git worktree: --send runs from the main checkout only/, argv[0]);
   }
@@ -333,7 +350,10 @@ test('status dry run: receiver, IP list, applied, opens, Orderly\'s public view;
   assert.match(r.out, /reduce-only closes are still signed/);
   assert.match(r.out, new RegExp(`orderly {3}registered under gimbal_dex; key ed25519:${AUTHORITY} ACTIVE, scope read,trading`));
   assert.ok(r.out.includes(`args {"desk_id":"carry","req":{"reduce_only":false,"kind":"holding","timestamp_ms":${NOW}},"reason":"read Orderly holding"}`));
+  assert.ok(r.out.includes(`args {"desk_id":"carry","req":{"reduce_only":false,"kind":"receiver_address","timestamp_ms":${NOW}},"reason":"look up the Orderly receiver address"}`));
   assert.match(r.out, /GET https:\/\/api\.orderly\.org\/v1\/client\/holding/);
+  assert.match(r.out, /GET https:\/\/api\.orderly\.org\/v1\/client\/asset\/receiver_address\?chain_id=42161&token=USDC/);
+  assert.match(r.out, /status --send SIGNS two reads with the operator key, orderly_request\n {10}of kinds holding and receiver_address/);
   assert.deepEqual(r.block, [
     '=== gimbal orderly status 2026-11-04T12:00:00.000Z ===',
     `contract ${CONTRACT}, desk carry, dry run`,
@@ -341,29 +361,51 @@ test('status dry run: receiver, IP list, applied, opens, Orderly\'s public view;
     'opens:    refused: the contract refuses every Orderly order that is not reduce-only (E_ARGS) until the owner sets a list and it signs ip_restriction for it; reduce-only closes are still signed',
     'orderly:  registered; key ACTIVE',
     'holding:  not read (signed read at --send)',
+    'receiver: not pinned; not compared with Orderly (signed read at --send)',
     '=== end ===',
   ]);
   assert.equal(w.seen.signed.length + w.seen.sent.length + w.seen.envReads + w.seen.keyReads, 0);
   assert.ok(w.seen.fetch.every((f) => /\/v1\/get_(account|orderly_key)\?/.test(f)), w.seen.fetch.join('\n'));
 });
 
-test('status --send: one signed holding read with the operator key, never printed; an applied list it reads as such', async () => {
+test('status --send: two signed reads with the operator key, never printed; the pinned receiver compared with Orderly\'s answer', async () => {
   const w = world({ desk: deskOf({ orderly_receiver: RECEIVER, orderly_ips: [IP1, IP2] }), applied: true });
   const r = await capture(['status', CONTRACT, DESK_ID, '--send'], w.deps);
   assert.equal(r.error, null, r.error?.stack);
-  assert.deepEqual(w.seen.signed.map((s) => s.args.req.kind), ['holding']);
+  assert.deepEqual(w.seen.signed.map((s) => [s.method, s.args.req.kind, s.args.reason]), [
+    ['orderly_request', 'holding', 'read Orderly holding'],
+    ['orderly_request', 'receiver_address', 'look up the Orderly receiver address'],
+  ]);
   assert.equal(w.seen.sent.length, 0);
   assert.ok(!r.out.includes(SECRET));
-  assert.deepEqual(r.block.slice(2, 6), [
+  assert.match(r.out, /money {5}none moves: two signed reads, gas only/);
+  assert.match(r.out, /\nholding {3}USDC 12\.5 \(frozen 0, pending_short 0\)\nreceiver {2}pinned 0x1{40}, Orderly's answer: they match\n/);
+  assert.deepEqual(r.block.slice(2, -1), [
     `state:    receiver ${RECEIVER}; ips ${IP1},${IP2}; applied true`,
     'opens:    signed: the list is set and its ip_restriction signed, so the contract signs Orderly orders that grow a position',
     'orderly:  registered; key ACTIVE',
     'holding:  USDC 12.5 (frozen 0, pending_short 0)',
+    `receiver: pinned ${RECEIVER}, Orderly's answer: they match`,
   ]);
   assert.doesNotMatch(r.out, /a wrong IP list blocks Orderly/, 'no warning once the list is applied');
+
+  // A pinned receiver that is not Orderly's answer: a clear line and a non-zero exit.
+  const wrong = world({ desk: deskOf({ orderly_receiver: RECEIVER, orderly_ips: [IP1] }), applied: true, receiverAnswer: OTHER });
+  const m = await capture(['status', CONTRACT, DESK_ID, '--send'], wrong.deps);
+  assert.match(m.error.message, new RegExp(`the pinned receiver ${RECEIVER} is NOT Orderly's answer ${OTHER}: .*Fund nothing into Orderly`));
+  assert.ok(m.out.includes(`receiver: MISMATCH: the pinned receiver ${RECEIVER} is NOT Orderly's answer ${OTHER}`), m.out);
+  assert.equal(wrong.seen.sent.length, 0);
+
+  // Not pinned yet: Orderly's answer and the command that pins it.
+  const fresh = await capture(['status', CONTRACT, DESK_ID, '--send'], world().deps);
+  assert.equal(fresh.error, null, fresh.error?.stack);
+  assert.ok(fresh.block.includes(`receiver: not pinned; Orderly answers ${RECEIVER}`));
+  assert.ok(fresh.block.includes(`next:     node tools/mainnet/orderly.mjs receiver ${CONTRACT} carry ${RECEIVER} --key-file <owner key json> --send`));
+
   const refused = world({ desk: deskOf({ orderly_ips: [IP2] }), applied: true, ipRefused: true });
   const e = await capture(['status', CONTRACT, DESK_ID, '--send'], refused.deps);
   assert.match(e.error.message, /Orderly holding could not be read: .*an applied IP list refuses the desk key from any IP not in it/);
+  assert.deepEqual(refused.seen.signed.map((s) => s.args.req.kind), ['holding', 'receiver_address'], 'the receiver is still read and shown');
 });
 
 // --- receiver ---
@@ -456,7 +498,7 @@ test('ips dry run: current against new, the warning, set_orderly_ips with 0.01 N
   assert.match(r.out, /money {5}no USDC moves\./);
   assert.deepEqual(r.block.slice(2, -1), [
     'ips:      1.2.3.4 -> 1.2.3.4,2a00:1450::1 planned',
-    `next:     node tools/mainnet/orderly.mjs apply-ips ${CONTRACT} carry (after --send)`,
+    `next:     node tools/mainnet/orderly.mjs apply-ips ${CONTRACT} carry --engine-ips <the engine's IPs> (after --send)`,
   ]);
   assert.equal(w.seen.signed.length + w.seen.sent.length + w.seen.keyReads, 0);
 });
@@ -475,25 +517,63 @@ test('ips --send: the owner signs set_orderly_ips; the list reads back and appli
   const same = world({ desk: deskOf({ orderly_ips: [IP1] }), applied: true });
   const s = await capture(['ips', CONTRACT, DESK_ID, IP1, '--key-file', 'k.json', '--send'], same.deps);
   assert.equal(s.error, null);
-  assert.match(s.out, /nothing to send: the desk has this list already \(setting it again would only clear orderly_ips_applied\)/);
+  assert.match(s.out, /nothing to send: the desk has this list already \(setting it again would only clear orderly_ips_applied; --force-same does that\)/);
   assert.equal(same.seen.sent.length + same.seen.keyReads, 0);
   const reordered = await capture(['ips', CONTRACT, DESK_ID, `${IP2},${IP1}`], world({ desk: deskOf({ orderly_ips: [IP1, IP2] }) }).deps);
   assert.match(reordered.out, /the same addresses in another order/);
+});
+
+test('ips --force-same: the same list again, signed by the owner, only to clear orderly_ips_applied', async () => {
+  const w = world({ desk: deskOf({ orderly_ips: [IP1, IP2] }), applied: true });
+  const dry = await capture(['ips', CONTRACT, DESK_ID, `${IP1},${IP2}`, '--force-same'], w.deps);
+  assert.equal(dry.error, null, dry.error?.stack);
+  assert.match(dry.out, /force {5}--force-same: the same list again, only to clear orderly_ips_applied\. Use it when the contract signed an ip_restriction\n {10}that Orderly did not take/);
+  assert.doesNotMatch(dry.out, /nothing to send|another order/);
+  assert.match(dry.out, /args {"desk_id":"carry","ips":\["1\.2\.3\.4","2a00:1450::1"\]}/);
+  assert.equal(w.seen.sent.length + w.seen.keyReads, 0);
+
+  const r = await capture(['ips', CONTRACT, DESK_ID, `${IP1},${IP2}`, '--force-same', '--key-file', 'k.json', '--send'], w.deps);
+  assert.equal(r.error, null, r.error?.stack);
+  assert.deepEqual(w.seen.sent.map((s) => [s.signer, s.receiver, s.actions]), [[OWNER_PUBLIC, CONTRACT, ipsActions(DESK_ID, [IP1, IP2])]]);
+  assert.equal(w.applied(), false, 'the contract clears the flag');
+  assert.ok(r.block.includes(`ips:      get_desk now ${IP1},${IP2}; applied false`));
+
+  const differs = await capture(['ips', CONTRACT, DESK_ID, IP1, '--force-same'], world({ desk: deskOf({ orderly_ips: [IP2] }) }).deps);
+  assert.match(differs.out, /--force-same changes nothing here: the list differs from the desk's/);
 });
 
 // --- apply-ips ---
 
 test('apply-ips dry run: the engine\'s two signed requests and the body the contract builds; a missing engine IP is called out', async () => {
   const w = world({ desk: deskOf({ orderly_ips: [IP1, IP2] }) });
-  const r = await capture(['apply-ips', CONTRACT, DESK_ID], w.deps);
+  const r = await capture(['apply-ips', CONTRACT, DESK_ID, '--engine-ips', IP2], w.deps);
   assert.equal(r.error, null, r.error?.stack);
-  assert.match(r.out, /engine {4}1\.2\.3\.4 \(this machine's public IP, looked up as the engine does\)/);
+  assert.match(r.out, /engine {4}2a00:1450::1 \(--engine-ips\)/);
+  assert.match(r.out, /^this {6}this machine's public IP 1\.2\.3\.4: in the list$/m);
   assert.ok(r.out.includes(`args {"desk_id":"carry","req":{"reduce_only":false,"kind":"ip_restriction","timestamp_ms":${NOW}},"reason":"limit the Orderly key to the relayer IPs"}`));
   assert.ok(r.out.includes(`POST https://api.orderly.org/v1/client/set_orderly_key_ip_restriction {"orderly_key":"ed25519:${AUTHORITY}","ip_restriction_list":"1.2.3.4,2a00:1450::1"}`));
   assert.match(r.out, /money {5}none moves: two signed requests on the operator key, gas only/);
   assert.match(r.out, /a wrong IP list blocks Orderly/);
   assert.doesNotMatch(r.out, /^refused /m, 'nothing the --send would refuse');
+  assert.deepEqual(r.block.slice(2, -1), [`state:    receiver none; ips ${IP1},${IP2}; applied false`, `engine:   ${IP2}`, `this:     ${IP1} in the list`]);
   assert.equal(w.seen.signed.length + w.seen.envReads, 0);
+
+  // Without --engine-ips the dry run says --send needs it; this machine's IP is never taken for the engine's.
+  const bare = await capture(['apply-ips', CONTRACT, DESK_ID], w.deps);
+  assert.equal(bare.error, null, bare.error?.stack);
+  assert.match(bare.out, /engine {4}not given: --send needs --engine-ips, every IP the engine sends its Orderly requests from \(on Railway: `railway outbound-network static-ip status`, all of them\)/);
+  assert.match(bare.out, /^refused {3}at --send without --engine-ips$/m);
+  assert.ok(bare.block.includes('engine:   not given (--send needs --engine-ips)'));
+
+  // This machine outside the list: said plainly, not refused (the laptop applying Railway's IPs is the normal case).
+  const away = world({ desk: deskOf({ orderly_ips: [IP2] }), thisIps: ['5.6.7.8'] });
+  const a = await capture(['apply-ips', CONTRACT, DESK_ID, '--engine-ips', IP2], away.deps);
+  assert.match(a.out, /this {6}this machine's public IP 5\.6\.7\.8: NOT in the list\. Once Orderly applies it, this machine cannot post a correction or read the holding/);
+  assert.ok(a.block.includes('this:     5.6.7.8 NOT in the list'));
+  assert.doesNotMatch(a.out, /^refused /m);
+  const lost = world({ desk: deskOf({ orderly_ips: [IP2] }) });
+  lost.deps.publicIps = async () => { throw new Error('no answer'); };
+  assert.match((await capture(['apply-ips', CONTRACT, DESK_ID, '--engine-ips', IP2], lost.deps)).out, /^this {6}this machine's public IP unknown \(no answer\)$/m);
 
   const miss = world({ desk: deskOf({ orderly_ips: [IP2] }) });
   const m = await capture(['apply-ips', CONTRACT, DESK_ID, '--engine-ips', '5.6.7.8'], miss.deps);
@@ -504,10 +584,6 @@ test('apply-ips dry run: the engine\'s two signed requests and the body the cont
   assert.equal(miss.seen.signed.length + miss.seen.envReads, 0);
 
   assert.match((await capture(['apply-ips', CONTRACT, DESK_ID], world().deps)).error.message, /has no IP list: set one with the ips command first/);
-  const unknown = world({ desk: deskOf({ orderly_ips: [IP1] }) });
-  unknown.deps.publicIps = async () => { throw new Error('no answer'); };
-  const u = await capture(['apply-ips', CONTRACT, DESK_ID, '--send'], unknown.deps);
-  assert.match(u.error.message, /the engine's IP is unknown \(no answer\): pass --engine-ips; nothing was signed/);
 });
 
 test('apply-ips --send: the engine\'s setup steps sign receiver_address then ip_restriction, post the body, and the contract reads applied', async () => {
@@ -522,6 +598,7 @@ test('apply-ips --send: the engine\'s setup steps sign receiver_address then ip_
   assert.ok(w.seen.fetch.includes(`POST https://api.orderly.org/v1/client/set_orderly_key_ip_restriction {"orderly_key":"ed25519:${AUTHORITY}","ip_restriction_list":"${IP1},${IP2}"}`), w.seen.fetch.join('\n'));
   assert.ok(!r.out.includes(SECRET));
   assert.deepEqual(r.block.slice(2, -1), [
+    `this:     ${IP1} in the list`,
     `setup:    orderly_register done: registered under gimbal_dex: ${ACCOUNT}`,
     'setup:    orderly_add_key done: key active until 2027-08-31',
     `setup:    orderly_receiver_lookup done: ${RECEIVER}; tx OpTx1`,
@@ -533,7 +610,44 @@ test('apply-ips --send: the engine\'s setup steps sign receiver_address then ip_
   // An operator key that is not on chain as the operator key signs nothing.
   const bad = world({ desk: deskOf({ orderly_ips: [IP1] }) });
   bad.deps.near.accessKey = async () => ({ nonce: 1, permission: 'FullAccess' });
-  const b = await capture(['apply-ips', CONTRACT, DESK_ID, '--send'], bad.deps);
+  const b = await capture(['apply-ips', CONTRACT, DESK_ID, '--engine-ips', IP1, '--send'], bad.deps);
   assert.match(b.error.message, /is not .*'s operator key for gimbal-dex-test\.near/);
   assert.equal(bad.seen.signed.length, 0);
+});
+
+test('apply-ips --send, Orderly refuses the POST after the contract signed: loud NOT PROTECTED lines, the way out, a non-zero exit', async () => {
+  const w = world({ desk: deskOf({ orderly_receiver: RECEIVER, orderly_ips: [IP2] }), thisIps: ['5.6.7.8'], ipPostFails: true });
+  const r = await capture(['apply-ips', CONTRACT, DESK_ID, '--engine-ips', IP2, '--send'], w.deps);
+  assert.deepEqual(w.seen.signed.map((s) => s.args.req.kind), ['receiver_address', 'ip_restriction'], 'the contract did sign it');
+  assert.equal(w.applied(), true, 'the contract marks the list applied when it signs');
+  const fix = `node tools/mainnet/orderly.mjs ips ${CONTRACT} carry ${IP2} --force-same --key-file <owner key json> --send`;
+  assert.match(r.error.message, /^orderly_ip_restriction failed after the contract signed it: .*IP is not allowed.*\. The contract marks the list applied but Orderly did not take it, so opens are NOT protected\. Rerun apply-ips from an IP Orderly takes, or clear the flag: /);
+  assert.ok(r.error.message.endsWith(fix), r.error.message);
+  assert.match(r.out, /\nFAILED {4}orderly_ip_restriction: the contract signed it \(tx OpTx2\) and marks the list applied, but Orderly did NOT take it: .*IP is not allowed/);
+  assert.match(r.out, /\n {10}OPENS ARE NOT PROTECTED: the contract signs Orderly opens while Orderly does not limit the key to the list\.\n/);
+  assert.ok(r.out.includes(`          - clear the flag, so the contract refuses opens again: ${fix}`));
+  assert.deepEqual(r.block.slice(2, -1).filter((l) => !l.startsWith('setup:')), [
+    'this:     5.6.7.8 NOT in the list',
+    'applied:  true in the contract, but Orderly did NOT take the list',
+    'opens:    NOT PROTECTED: the contract signs opens that Orderly does not limit to the list',
+    `fix:      rerun apply-ips from an IP Orderly takes, or: ${fix}`,
+  ]);
+  assert.doesNotMatch(r.block.join('\n'), /opens: {4}signed/, 'never the plain "signed" line');
+  assert.ok(r.block.some((l) => /^setup: {4}orderly_ip_restriction failed: .*IP is not allowed.*; tx OpTx2$/.test(l)), r.block.join('\n'));
+
+  // The way out it names: the same list with --force-same clears the flag, so opens are refused again.
+  const out = await capture(['ips', CONTRACT, DESK_ID, IP2, '--force-same', '--key-file', 'k.json', '--send'], w.deps);
+  assert.equal(out.error, null, out.error?.stack);
+  assert.equal(w.applied(), false);
+  assert.ok(out.block.includes(`ips:      get_desk now ${IP2}; applied false`));
+});
+
+test('apply-ips --send with a pinned receiver that is not Orderly\'s answer: a FAILED line and a non-zero exit', async () => {
+  const w = world({ desk: deskOf({ orderly_receiver: RECEIVER, orderly_ips: [IP1] }), receiverAnswer: OTHER });
+  const r = await capture(['apply-ips', CONTRACT, DESK_ID, '--engine-ips', IP1, '--send'], w.deps);
+  assert.match(r.error.message, new RegExp(`^orderly_receiver_lookup failed: the pinned receiver ${RECEIVER} is not the one Orderly gives this account \\(${OTHER}\\)`));
+  assert.match(r.out, new RegExp(`\\nFAILED {4}orderly_receiver_lookup failed: the pinned receiver ${RECEIVER}`));
+  assert.ok(r.block.some((l) => l.startsWith(`receiver: FAILED: the pinned receiver ${RECEIVER}`)), r.block.join('\n'));
+  // The IP step is independent of the receiver and still ran (as the engine's setup runs it).
+  assert.ok(r.block.includes('applied:  true'));
 });

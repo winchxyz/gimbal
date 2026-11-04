@@ -4,23 +4,27 @@
 //
 //   node tools/mainnet/orderly.mjs status    <contract> <desk_id> [--env-file <file>] [--send]
 //   node tools/mainnet/orderly.mjs receiver  <contract> <desk_id> [0x<receiver>] [--key-file <owner key json>] [--env-file <file>] [--send]
-//   node tools/mainnet/orderly.mjs ips       <contract> <desk_id> <ip[,ip...]> [--key-file <owner key json>] [--send]
-//   node tools/mainnet/orderly.mjs apply-ips <contract> <desk_id> [--engine-ips <ip[,ip...]>] [--env-file <file>] [--send]
+//   node tools/mainnet/orderly.mjs ips       <contract> <desk_id> <ip[,ip...]> [--force-same] [--key-file <owner key json>] [--send]
+//   node tools/mainnet/orderly.mjs apply-ips <contract> <desk_id> --engine-ips <ip[,ip...]> [--env-file <file>] [--send]
 //
 //   status     get_desk's orderly_receiver and orderly_ips, get_desk_settings' orderly_ips_applied, whether the
-//              contract signs Orderly opens, and Orderly's public view of the account. The holding is not public:
-//              --send reads it with one signed orderly_request of kind holding (the operator key).
+//              contract signs Orderly opens, and Orderly's public view of the account. The holding and the receiver
+//              are not public: --send signs two reads, orderly_request of kinds holding and receiver_address (the
+//              operator key, gas only), and compares the pinned receiver with Orderly's answer.
 //   receiver   set_orderly_receiver (owner): pins the Orderly account's receiver on Arbitrum, once and for good. --send
 //              first has the contract sign orderly_request kind receiver_address (the operator key) and reads Orderly's
 //              answer: without an address it prints that answer and pins nothing; with one it pins it only when it is
 //              that answer.
 //   ips        set_orderly_ips (owner): the IPs Orderly may take the desk's key from. A new list is applied only by
-//              apply-ips; until then the contract refuses every Orderly order that is not reduce-only.
+//              apply-ips; until then the contract refuses every Orderly order that is not reduce-only. --force-same
+//              sends the list the desk has already, which only clears orderly_ips_applied: the way out when the
+//              contract signed an ip_restriction that Orderly did not take.
 //   apply-ips  the engine's own venue setup (engine/src/setup/setup.ts runSetup), cut to its Orderly steps as checks.mjs
 //              does: the done-checks, the signed receiver_address read, then orderly_ip_restriction, in which the
 //              contract signs orderly_request kind ip_restriction for the stored list and this machine posts it to
-//              Orderly. The step refuses, nothing signed, while the list leaves out an IP the engine sends from
-//              (--engine-ips, else this machine's public IP, as the engine looks it up).
+//              Orderly. The step refuses, nothing signed, while the list leaves out one of --engine-ips (the IPs the
+//              engine sends from; required with --send, never this machine's guess). It also says whether this
+//              machine's IP is in the list: once the list is applied, a machine outside it cannot post a correction.
 //
 // Default: a dry run that reads mainnet and signs nothing. --send reads the owner's key file (receiver, ips) or the
 // engine env file (the operator key: status, the receiver lookup, apply-ips) only then, never prints a key, and
@@ -53,7 +57,7 @@ export const IP_REASON = 'limit the Orderly key to the relayer IPs';
 export const HOLDING_REASON = 'read Orderly holding';
 export const IP_RESTRICTION_PATH = '/v1/client/set_orderly_key_ip_restriction';
 /** The only orderly_request kinds each command may have signed; anything else is refused before signing. */
-export const ALLOWED_KINDS = { status: ['holding'], receiver: ['receiver_address'], 'apply-ips': ['receiver_address', 'ip_restriction'] };
+export const ALLOWED_KINDS = { status: ['holding', 'receiver_address'], receiver: ['receiver_address'], 'apply-ips': ['receiver_address', 'ip_restriction'] };
 /** The contract methods each command needs in the deployed code. */
 const NEEDS = {
   status: ['get_desk'],
@@ -64,15 +68,19 @@ const NEEDS = {
 
 const USAGE = `usage: node tools/mainnet/orderly.mjs status    <contract> <desk_id> [--env-file <file>] [--send]
        node tools/mainnet/orderly.mjs receiver  <contract> <desk_id> [0x<receiver>] [--key-file <owner key json>] [--env-file <file>] [--send]
-       node tools/mainnet/orderly.mjs ips       <contract> <desk_id> <ip[,ip...]> [--key-file <owner key json>] [--send]
-       node tools/mainnet/orderly.mjs apply-ips <contract> <desk_id> [--engine-ips <ip[,ip...]>] [--env-file <file>] [--send]
-  default: dry run (reads mainnet, prints every call in full; signs nothing, reads no key)`;
+       node tools/mainnet/orderly.mjs ips       <contract> <desk_id> <ip[,ip...]> [--force-same] [--key-file <owner key json>] [--send]
+       node tools/mainnet/orderly.mjs apply-ips <contract> <desk_id> --engine-ips <ip[,ip...]> [--env-file <file>] [--send]
+  default: dry run (reads mainnet, prints every call in full; signs nothing, reads no key)
+  status --send signs two reads with the operator key (holding, receiver_address): gas only, nothing else`;
 const SPEC = {
   status: { '--env-file': 'value', '--send': 'switch' },
   receiver: { '--key-file': 'value', '--env-file': 'value', '--send': 'switch' },
-  ips: { '--key-file': 'value', '--send': 'switch' },
+  ips: { '--key-file': 'value', '--force-same': 'switch', '--send': 'switch' },
   'apply-ips': { '--engine-ips': 'value', '--env-file': 'value', '--send': 'switch' },
 };
+
+/** Where the engine's IPs come from. */
+export const ENGINE_IPS_HINT = 'every IP the engine sends its Orderly requests from (on Railway: `railway outbound-network static-ip status`, all of them)';
 
 /** Printed by ips, apply-ips and status: what a wrong or missing list does. */
 export const WRONG_LIST = [
@@ -140,12 +148,12 @@ export function parseIp(text) {
 const V4_RESERVED = [
   ['0.0.0.0', 8, '"this network"'], ['10.0.0.0', 8, 'private'], ['100.64.0.0', 10, 'carrier-grade NAT'], ['127.0.0.0', 8, 'loopback'],
   ['169.254.0.0', 16, 'link-local'], ['172.16.0.0', 12, 'private'], ['192.0.0.0', 24, 'IETF protocol assignments'], ['192.0.2.0', 24, 'documentation'],
-  ['192.168.0.0', 16, 'private'], ['198.18.0.0', 15, 'benchmarking'], ['198.51.100.0', 24, 'documentation'], ['203.0.113.0', 24, 'documentation'],
+  ['192.88.99.0', 24, '6to4 relay anycast'], ['192.168.0.0', 16, 'private'], ['198.18.0.0', 15, 'benchmarking'], ['198.51.100.0', 24, 'documentation'], ['203.0.113.0', 24, 'documentation'],
   ['224.0.0.0', 4, 'multicast'], ['240.0.0.0', 4, 'reserved'],
 ];
 const V6_RESERVED = [
-  ['::', 96, 'unspecified, loopback or IPv4-compatible'], ['100::', 64, 'discard-only'], ['2001:db8::', 32, 'documentation'],
-  ['fc00::', 7, 'unique local (private)'], ['fe80::', 10, 'link-local'], ['ff00::', 8, 'multicast'],
+  ['::', 96, 'unspecified, loopback or IPv4-compatible'], ['64:ff9b::', 96, 'NAT64: a translated IPv4 address'], ['100::', 64, 'discard-only'],
+  ['2001:db8::', 32, 'documentation'], ['2002::', 16, '6to4: a tunnelled IPv4 address'], ['fc00::', 7, 'unique local (private)'], ['fe80::', 10, 'link-local'], ['ff00::', 8, 'multicast'],
 ];
 
 /** The reserved range an address is in ({ cidr, name }), or null for a public address. */
@@ -217,7 +225,7 @@ export function parseOrderlyArgs(argv) {
   if (!DESK_ID.test(deskId)) throw new UsageError(`desk id ${JSON.stringify(deskId)} is not 1 to 32 characters of a-z, 0-9 and -`);
   const send = values['--send'] === true;
   const a = {
-    command, contract, deskId, send, keyFile: values['--key-file'] ?? null, receiver: null, ips: null, engineIps: null,
+    command, contract, deskId, send, keyFile: values['--key-file'] ?? null, receiver: null, ips: null, engineIps: null, forceSame: values['--force-same'] === true,
     envFile: values['--env-file'] === undefined ? engineEnvFile(contract) : resolve(values['--env-file']),
   };
   if (command === 'receiver' && more.length === 1) a.receiver = asUsage(() => parseReceiver(more[0]));
@@ -229,6 +237,10 @@ export function parseOrderlyArgs(argv) {
     if (send && a.keyFile === null) throw new UsageError('--send needs --key-file: only the desk owner can set the IP list');
   }
   if (values['--engine-ips'] !== undefined) a.engineIps = asUsage(() => parseIpList(values['--engine-ips'], '--engine-ips', Infinity));
+  if (command === 'apply-ips' && send && a.engineIps === null) {
+    throw new UsageError(`--send needs --engine-ips <ip[,ip...]>: ${ENGINE_IPS_HINT}. This machine's IP is not the engine's, and a list `
+      + 'applied without the engine\'s IPs locks it out of Orderly');
+  }
   return a;
 }
 
@@ -464,39 +476,60 @@ async function status(x) {
     lines.push('holding:  none (no account)');
     return finish(x, lines);
   }
+  const pinned = x.desk.orderly_receiver ?? null;
+  say('signed    the holding and the receiver are not public: status --send SIGNS two reads with the operator key, orderly_request');
+  say('          of kinds holding and receiver_address (gas only; the contract signs nothing else for them)');
   if (!a.send) {
-    say('holding   not public: --send reads it with one signed orderly_request kind holding (the operator key)');
-    say(describeTx('  tx: orderly_request kind holding (operator key, read at --send)', {
-      signer: x.desk.operator ?? x.desk.owner, signedBy: `the operator key from ${a.envFile}, read at --send`, receiver: a.contract,
-      actions: requestActions(a.deskId, 'holding', x.now(), HOLDING_REASON),
-    }).join('\n'));
-    say(`    GET ${ORDERLY_API}/v1/client/holding`);
-    say('money     none: reads only. --send spends gas only (about 0.001 NEAR; 0.3 NEAR of the key\'s allowance held until the refund)');
-    lines.push('holding:  not read (signed read at --send)');
-    return finish(x, lines, { dryNote: 'dry run: nothing was signed or sent.' });
+    for (const [kind, reason, path] of [['holding', HOLDING_REASON, '/v1/client/holding'],
+      ['receiver_address', RECEIVER_REASON, `/v1/client/asset/receiver_address?chain_id=${x.chainId}&token=USDC`]]) {
+      say(describeTx(`  tx: orderly_request kind ${kind} (operator key, signed at --send)`, {
+        signer: x.desk.operator ?? x.desk.owner, signedBy: `the operator key from ${a.envFile}, read at --send`, receiver: a.contract,
+        actions: requestActions(a.deskId, kind, x.now(), reason),
+      }).join('\n'));
+      say(`    GET ${ORDERLY_API}${path}`);
+    }
+    say('money     none: reads only. --send spends gas only (about 0.001 NEAR per read; 0.3 NEAR of the key\'s allowance held per call until the refund)');
+    lines.push('holding:  not read (signed read at --send)', `receiver: ${pinned === null ? 'not pinned' : `pinned ${pinned}`}; not compared with Orderly (signed read at --send)`);
+    return finish(x, lines, { dryNote: 'dry run: nothing was signed or sent. --send signs the two reads above.' });
   }
   const op = await operator(x, ALLOWED_KINDS.status);
-  say('money     none moves: one signed read, gas only');
-  let data;
+  say('money     none moves: two signed reads, gas only');
+  const client = orderlyClient(x, op.contract);
+  const ipHint = x.settings?.orderly_ips_applied === true ? ' (an applied IP list refuses the desk key from any IP not in it, this machine\'s included)' : '';
+  const problems = [];
   try {
-    data = await orderlyClient(x, op.contract).holding(HOLDING_REASON);
+    const data = await client.holding(HOLDING_REASON);
+    const rows = Array.isArray(data?.holding) ? data.holding : null;
+    if (rows === null) lines.push(`holding:  answer ${JSON.stringify(data).slice(0, 300)}`);
+    else if (rows.length === 0) lines.push('holding:  none');
+    else for (const h of rows) lines.push(`holding:  ${h?.token ?? '?'} ${h?.holding ?? '?'} (frozen ${h?.frozen ?? 0}, pending_short ${h?.pending_short ?? 0})`);
   } catch (e) {
-    const why = `Orderly holding could not be read: ${e.message}`
-      + `${x.settings?.orderly_ips_applied === true ? ' (an applied IP list refuses the desk key from any IP not in it, this machine\'s included)' : ''}`;
+    const why = `Orderly holding could not be read: ${e.message}${ipHint}`;
     lines.push(`holding:  ${why}`);
-    finish(x, lines);
-    throw new Error(why);
+    problems.push(why);
   }
-  const rows = Array.isArray(data?.holding) ? data.holding : null;
-  if (rows === null) {
-    lines.push(`holding:  answer ${JSON.stringify(data).slice(0, 300)}`);
-  } else if (rows.length === 0) {
-    lines.push('holding:  none');
-  } else {
-    for (const h of rows) lines.push(`holding:  ${h?.token ?? '?'} ${h?.holding ?? '?'} (frozen ${h?.frozen ?? 0}, pending_short ${h?.pending_short ?? 0})`);
+  try {
+    const found = x.engine.receiverOf(await client.receiverAddress());
+    if (pinned === null) {
+      lines.push(`receiver: not pinned; Orderly answers ${found}`,
+        `next:     node tools/mainnet/orderly.mjs receiver ${a.contract} ${a.deskId} ${found} --key-file <owner key json> --send`);
+    } else if (pinned === found) {
+      lines.push(`receiver: pinned ${pinned}, Orderly's answer: they match`);
+    } else {
+      const why = `the pinned receiver ${pinned} is NOT Orderly's answer ${found}: every fund_venue and rescue into Orderly pays the pinned `
+        + 'address, which Orderly does not credit to this account. Fund nothing into Orderly; the pin is permanent, so the fix is a new desk';
+      lines.push(`receiver: MISMATCH: ${why}`);
+      problems.push(why);
+    }
+  } catch (e) {
+    const why = `Orderly's receiver could not be read: ${e.message}${ipHint}`;
+    lines.push(`receiver: ${why}`);
+    problems.push(why);
   }
-  for (const l of lines.slice(3)) say(l.replace(/^holding: {2}/, 'holding   '));
-  return finish(x, lines);
+  for (const l of lines.slice(3)) say(l.replace(/^(\w+): +/, (_, k) => `${k}${' '.repeat(Math.max(1, 10 - k.length))}`));
+  const block = finish(x, lines);
+  if (problems.length > 0) throw new Error(problems.join('\n'));
+  return block;
 }
 
 // --- receiver ---
@@ -575,18 +608,26 @@ async function ips(x) {
   const added = a.ips.filter((ip) => !current.includes(ip));
   const removed = current.filter((ip) => !a.ips.includes(ip));
   say(`change    ${added.length === 0 ? 'none added' : `adds ${added.join(', ')}`}; ${removed.length === 0 ? 'none removed' : `removes ${removed.join(', ')}`}`);
-  if (current.length === a.ips.length && current.every((ip, i) => ip === a.ips[i])) {
-    say('nothing to send: the desk has this list already (setting it again would only clear orderly_ips_applied)');
+  const same = current.length === a.ips.length && current.every((ip, i) => ip === a.ips[i]);
+  if (same && !a.forceSame) {
+    say('nothing to send: the desk has this list already (setting it again would only clear orderly_ips_applied; --force-same does that)');
     return finish(x, [`ips:      ${current.join(',')} already set; nothing to send`]);
   }
-  if (added.length === 0 && removed.length === 0) say('warning   the same addresses in another order: the contract takes it as a new list and clears orderly_ips_applied');
+  if (same) {
+    say('force     --force-same: the same list again, only to clear orderly_ips_applied. Use it when the contract signed an ip_restriction');
+    say('          that Orderly did not take: the contract then signs opens that Orderly does not limit to the list. After it,');
+    say('          opens are refused until apply-ips succeeds');
+  } else if (a.forceSame) {
+    say('force     --force-same changes nothing here: the list differs from the desk\'s, so it is a new list anyway');
+  }
+  if (!same && added.length === 0 && removed.length === 0) say('warning   the same addresses in another order: the contract takes it as a new list and clears orderly_ips_applied');
   for (const l of WRONG_LIST) say(l);
   const actions = ipsActions(a.deskId, a.ips);
   await ownerPlan(x, 'tx: set_orderly_ips (owner)', actions, a.send ? `--key-file, a full-access key of ${desk.owner}` : 'the owner\'s key, read at --send');
   say('  then      orderly_ips_applied is false until apply-ips has the contract sign ip_restriction for the new list: no Orderly opens until then');
   say('money     no USDC moves. 0.01 NEAR attached for storage: the contract keeps what the list takes (at most about 0.005 NEAR for 10 IPv6 '
     + `addresses) and refunds the rest to ${desk.owner}`);
-  const next = `node tools/mainnet/orderly.mjs apply-ips ${a.contract} ${a.deskId}`;
+  const next = `node tools/mainnet/orderly.mjs apply-ips ${a.contract} ${a.deskId} --engine-ips <the engine's IPs>`;
   if (!a.send) {
     return finish(x, [`ips:      ${current.length === 0 ? 'none' : current.join(',')} -> ${a.ips.join(',')} planned`, `next:     ${next} (after --send)`], {
       dryNote: 'dry run: nothing was signed or sent. Add --send and --key-file <owner key json>, from the main checkout, to send it.',
@@ -612,23 +653,27 @@ async function applyIps(x) {
   const list = desk.orderly_ips ?? [];
   if (list.length === 0) throw new Error(`desk ${a.deskId} has no IP list: set one with the ips command first (the contract refuses ip_restriction without one, E_ARGS)`);
   for (const l of WRONG_LIST) say(l);
-  let engineIps = a.engineIps;
-  let from = '--engine-ips';
-  let lookupError = null;
-  if (engineIps === null) {
-    from = 'this machine\'s public IP, looked up as the engine does';
-    try {
-      engineIps = await (x.deps.publicIps ?? (() => x.engine.publicIpLookup({ fetch: x.fetchImpl })()))();
-    } catch (e) {
-      lookupError = e.message;
-    }
-  }
-  say(`engine    ${engineIps === null ? `unknown (${lookupError}); pass --engine-ips` : engineIps.join(', ')} (${from})`);
+  const engineIps = a.engineIps;
+  say(`engine    ${engineIps === null ? `not given: --send needs --engine-ips, ${ENGINE_IPS_HINT}` : `${engineIps.join(', ')} (--engine-ips)`}`);
   const missing = engineIps === null ? null : x.engine.missingIps(list, engineIps);
   if (missing !== null && missing.length > 0) {
     say(`refused   the list leaves out ${missing.join(', ')}: Orderly would refuse every request the engine sends from there, so it could not open, `
       + 'close or read. Nothing is signed; add it with the ips command first');
   }
+  // This machine posts the ip_restriction; once a list is applied at Orderly, only a listed IP can post the next one.
+  let here = null;
+  let hereError = null;
+  try {
+    here = await (x.deps.publicIps ?? (() => x.engine.publicIpLookup({ fetch: x.fetchImpl })()))();
+  } catch (e) {
+    hereError = e.message;
+  }
+  const hereOut = here === null ? null : x.engine.missingIps(list, here);
+  const hereText = here === null ? `unknown (${hereError})`
+    : hereOut.length === 0 ? `${here.join(', ')}: in the list`
+      : `${here.join(', ')}: NOT in the list. Once Orderly applies it, this machine cannot post a correction or read the holding; `
+        + 'a correction then goes from a listed IP (the engine\'s POST /setup)';
+  say(`this      this machine's public IP ${hereText}`);
   const pub = await orderlyPublic(x);
   const signer = desk.operator ?? desk.owner;
   const signedBy = `the operator key from ${a.envFile}, read at --send`;
@@ -645,13 +690,13 @@ async function applyIps(x) {
   say('money     none moves: two signed requests on the operator key, gas only (about 0.001 NEAR each; 0.3 NEAR of the allowance held per call until the refund)');
   const ready = pub.registered && pub.usable;
   if (!ready) say(`refused   at --send: ${NOT_READY}`);
-  if (engineIps === null) say('refused   at --send: the engine\'s IP is unknown; pass --engine-ips');
+  if (engineIps === null) say('refused   at --send without --engine-ips');
+  const thisLine = `this:     ${here === null ? 'unknown' : `${here.join(',')} ${hereOut.length === 0 ? 'in the list' : 'NOT in the list'}`}`;
   if (!a.send) {
-    return finish(x, [`state:    ${stateSummary(desk, x.settings)}`, `engine:   ${engineIps === null ? 'unknown' : engineIps.join(',')}${missing?.length ? `; missing from the list: ${missing.join(',')}` : ''}`], {
+    return finish(x, [`state:    ${stateSummary(desk, x.settings)}`, `engine:   ${engineIps === null ? 'not given (--send needs --engine-ips)' : engineIps.join(',')}${missing?.length ? `; missing from the list: ${missing.join(',')}` : ''}`, thisLine], {
       dryNote: 'dry run: nothing was signed or sent. --send, from the main checkout, runs the two steps above.',
     });
   }
-  if (engineIps === null) throw new Error(`the engine's IP is unknown (${lookupError}): pass --engine-ips; nothing was signed`);
   if (missing.length > 0) throw new Error(`the desk's IP list (${list.join(', ')}) leaves out ${missing.join(', ')}, an IP the engine sends from: nothing was signed`);
   if (!ready) throw new Error(NOT_READY);
 
@@ -682,7 +727,7 @@ async function applyIps(x) {
     log: (line) => say(`  ${line}`),
     now: x.now,
   });
-  const lines = [];
+  const lines = [thisLine];
   for (const name of ['orderly_register', 'orderly_add_key', 'orderly_receiver_lookup', 'orderly_ip_restriction']) {
     const s = progress.steps.find((p) => p.step === name);
     const line = `setup:    ${name} ${s.status}${s.detail === undefined ? '' : `: ${s.detail}`}${s.tx.length === 0 ? '' : `; tx ${s.tx.map((t) => t.id).join(', ')}`}`;
@@ -691,10 +736,40 @@ async function applyIps(x) {
   }
   const settings = x.settings === null ? null : await x.client.view(a.contract, 'get_desk_settings', { desk_id: a.deskId });
   const applied = settings === null ? null : settings.orderly_ips_applied === true;
-  lines.push(`applied:  ${applied === null ? 'unknown (no get_desk_settings)' : String(applied)}`, `opens:    ${opensText(list, applied)}`);
-  const block = finish(x, lines);
   const ip = progress.steps.find((p) => p.step === 'orderly_ip_restriction');
-  if (ip.status !== 'done') throw new Error(`orderly_ip_restriction ${ip.status}: ${ip.detail ?? 'no detail'}`);
+  const lookup = progress.steps.find((p) => p.step === 'orderly_receiver_lookup');
+  const problems = [];
+  // The contract marks the list applied when it signs ip_restriction, before this machine posts it: a failed post
+  // leaves the contract signing opens that Orderly does not limit to the list.
+  const signedNotTaken = ip.status !== 'done' && ip.tx.length > 0 && applied !== false;
+  if (signedNotTaken) {
+    const sameList = `node tools/mainnet/orderly.mjs ips ${a.contract} ${a.deskId} ${list.join(',')} --force-same --key-file <owner key json> --send`;
+    const loud = [
+      `FAILED    orderly_ip_restriction: the contract signed it${ip.tx.length === 0 ? '' : ` (tx ${ip.tx.map((t) => t.id).join(', ')})`} and marks the list applied, `
+        + `but Orderly did NOT take it: ${ip.detail ?? 'no detail'}`,
+      '          OPENS ARE NOT PROTECTED: the contract signs Orderly opens while Orderly does not limit the key to the list.',
+      '          Way out, one of:',
+      `          - rerun apply-ips from an IP Orderly takes the key from (one in the list applied there, if any: the engine's POST /setup)`,
+      `          - clear the flag, so the contract refuses opens again: ${sameList}`,
+    ];
+    for (const l of loud) say(l);
+    lines.push(`applied:  ${applied === null ? 'unknown (no get_desk_settings)' : String(applied)} in the contract, but Orderly did NOT take the list`,
+      'opens:    NOT PROTECTED: the contract signs opens that Orderly does not limit to the list',
+      `fix:      rerun apply-ips from an IP Orderly takes, or: ${sameList}`);
+    problems.push(`orderly_ip_restriction failed after the contract signed it: ${ip.detail ?? 'no detail'}. The contract marks the list applied but `
+      + `Orderly did not take it, so opens are NOT protected. Rerun apply-ips from an IP Orderly takes, or clear the flag: ${sameList}`);
+  } else {
+    lines.push(`applied:  ${applied === null ? 'unknown (no get_desk_settings)' : String(applied)}`, `opens:    ${opensText(list, applied)}`);
+    if (ip.status !== 'done') problems.push(`orderly_ip_restriction ${ip.status}: ${ip.detail ?? 'no detail'}`);
+  }
+  if (lookup.status !== 'done') {
+    const why = `orderly_receiver_lookup ${lookup.status}: ${lookup.detail ?? 'no detail'}`;
+    say(`FAILED    ${why}`);
+    lines.push(`receiver: FAILED: ${lookup.detail ?? lookup.status}`);
+    problems.push(why);
+  }
+  const block = finish(x, lines);
+  if (problems.length > 0) throw new Error(problems.join('\n'));
   return block;
 }
 
