@@ -27,6 +27,17 @@ test('enters a window only after it passed the entry rules for 3 hourly checks i
   assert.match(e.decision.reason, /\$12\.00 a leg at 1\.5x$/);
 });
 
+test('a window whose stored price the open refreshes is counted and entered, its note on every why line', () => {
+  const note = 'stored XLM price missing: refreshed at open';
+  const ds = hours(input(), 3, () => [win(XLM, { netAprPct: 14.2, note })]);
+  assert.deepEqual(actions(ds), ['wait', 'wait', 'enter'], 'the hourly checks count it like any enterable window');
+  assert.equal(ds[0]!.decision.reason, `XLM 14.2 % net, 1 of 3 hours above 10 %; ${note}`);
+  assert.equal(ds[1]!.decision.reason, `XLM 14.2 % net, 2 of 3 hours above 10 %; ${note}`);
+  assert.deepEqual(ds[2]!.act, { kind: 'enter', windowId: XLM, legUsd: 12, leverage: 1.5, qty: '12' });
+  assert.match(ds[2]!.decision.reason, /\$12\.00 a leg at 1\.5x; stored XLM price missing: refreshed at open$/);
+  assert.doesNotMatch(ds.map((d) => d.decision.reason).join('\n'), /refused|E_ORACLE_STALE/);
+});
+
 test('scan events never move the counters; an hourly check within half an hour of the last counts as a scan event', () => {
   const w = [win(XLM)];
   let d = decide(input({ windows: w }));
