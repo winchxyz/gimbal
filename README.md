@@ -9,6 +9,12 @@ Tracks: DeFi (main); Agents and Security. Built for NEAR HACKATHON, Nov 1–14, 
 ([@winchxyz](https://x.com/winchxyz)). This repository started on Oct 30, 2026, inside the build window (Oct 19 to
 Nov 14, rule Q-001 of the hackathon).
 
+<!-- SUBMISSION: fill the three lines below on submit day, then delete this comment. -->
+- **Demo video:** TODO(submission): video link
+- **X post:** TODO(submission): X post link
+- **Status:** TODO(submission): one line read from the chain on submit day (for example the first live pair or the
+  first live rescue); the dated details are under [Status](#status-2026-11-04)
+
 ## What it does
 
 A funding carry is two positions that cancel out: short a perp on the venue that pays high funding, long the same
@@ -130,6 +136,8 @@ most 300 USD per hour):
 | `hl_set_referrer`, `hl_approve_builder_fee` | 2026-11-03 20:10:05 | [6hPqfFKM…](https://nearblocks.io/txns/6hPqfFKMZgy261xuhjR9sSRzRbMJchGfaLAXu4V3hQd5), [7AA2AeUa…](https://nearblocks.io/txns/7AA2AeUahAHB6K57zqZfqBWeLqoYv2EjpDHCY7Fv5MvR) | MPC signs a Hyperliquid L1 action and a user-signed action the contract built |
 | `fund_venue` to Solana | 2026-11-03 20:19:37 | [97DivxqnJ…](https://nearblocks.io/txns/97DivxqnJgiA3r4t9Kwjcq62bhVvVBWa4bkDtXFyhVKp) | a second verified quote: USDC to the desk's own Solana account, the Phoenix leg's margin |
 | `sol_sign` Phoenix deposit | 2026-11-04 03:09:46 | [BBABoMmY…](https://nearblocks.io/txns/BBABoMmYvHx6os8Nmg8fz1Gek9zsX9FMbF1KamDTjUFS) | MPC signs a Phoenix deposit transaction the contract parsed; 9.75 USDC is now the desk's Phoenix equity |
+| `refresh_prices` | 2026-11-04 07:00:30 | [7RpGjfP4…](https://nearblocks.io/txns/7RpGjfP4YNL7bxiqA682FR7mdARCQo7wZc4X5JDyQJ8e) | the contract stores fresh OutLayer TEE oracle prices |
+| `hl_order` refused: `E_PRICE_BAND` | 2026-11-04 07:00:43 | [33K2sHAd…](https://nearblocks.io/txns/33K2sHAd7TzJrEoAav6JymkuvPG7sUbtDcfRrPf74NSj) | a real ETH buy at 2343.5, 2.0007 % from the stored oracle price 2297.535, is refused on chain (band 100 bps); nothing is signed (`pair-mainnet refuse-band ETH`) |
 
 **Canary `gimbal-canary2.near`** (an earlier build of the contract, before the audit fixes; emptied on 2026-11-03).
 It carried the first real money around the full cross-chain path: NEAR → Hyperliquid → Arbitrum → NEAR.
@@ -157,21 +165,20 @@ Done:
   the strategy loop on and live rescue enabled. Its NEAR AI model is `Qwen/Qwen3-VL-30B-A3B-Instruct`, for policy
   drafts and the risk check.
 - On testnet the same contract code refused 8 of 8 scripted malicious requests, 0 USDC moved (below).
+- On mainnet `gimbal_dex.near` refused a real Hyperliquid order outside the price band with `E_PRICE_BAND`
+  (2026-11-04 07:00:43 UTC, in the desk table above).
+- The NEAR AI risk check runs on the mainnet engine before every enter and rotate, with a 5 s timeout; without an
+  answer in time the window passes, and the journal says "risk check timed out: passed". `npm run report` books
+  every outcome (refusals as helped or hurt, estimated); each pass shows the position its act opened, with that
+  position's net.
 
 Not done yet:
 
-- **The strategy loop has not opened its first live pair.** No order has been signed on `gimbal_dex.near` yet, and
-  the desk's Hyperliquid account holds no position. The loop is waiting: the best windows are outside the desk's
-  policy, and the ones inside it are refused because `gimbal_dex.near` has no stored oracle price yet. The engine
-  change that refreshes a missing price at open is in review (PR #92). The owner's threshold is 5 % net APR at
-  12 USD a leg.
+- **The strategy loop has not opened its first live pair.** The contract has signed no opening order on
+  `gimbal_dex.near` yet (its hourly notional meter is at 0), and the desk's Hyperliquid account holds no position.
+  The owner's threshold is 5 % net APR at 12 USD a leg, and the loop opens only a window inside the desk's policy.
 - **No margin rescue has run on mainnet yet.** The desk's rescue counters on chain are zero. The live routes have
   been dry-run against mainnet; the money path itself ran on the canary (above).
-- **No mainnet order refusal yet.** The recorded `E_PRICE_BAND` refusal is on testnet (an Orderly `MARKET` order).
-  A mainnet demo command for it (`pair-mainnet refuse-band <SYM>`) is planned in PR #93, not merged yet.
-- **The NEAR AI risk check runs on the mainnet engine; `npm run report` books every outcome (refusals as helped or hurt, estimated).** It runs
-  before every enter and rotate with a 5 s timeout; without an answer in time the window passes, and the journal
-  says "risk check timed out: passed". Each pass shows the position its act opened, with that position's net.
 - The money is small on purpose. At 12 USD a leg, funding earns about a cent a day while each one-off transfer costs
   about 0.3 to 1.3 USD, so the desk's record will stay negative through Nov 14; the book shows funding and costs
   apart.
@@ -207,12 +214,13 @@ the engine.
 
 ### For reviewers
 
-Each command from the repo root, and what it prints when it works.
+Each command from the repo root of a fresh clone, and what it prints when it works (the reproducible run, rule
+Q-012). None needs a key, an account or a chain; only the last row needs Docker.
 
 | Command | Prints |
 | --- | --- |
 | `npm ci` | installs the four workspaces (`engine`, `web`, `shared`, `tools`) from the lockfile, no errors |
-| `npm run ci -- --only npm` | `ci: green - npm ci, build, test, typecheck (node tests N + N + N) in N s`, the engine, web and tools test counts (1111 + 411 + 184 at this commit) |
+| `npm run ci -- --only npm` | `ci: green - npm ci, build, test, typecheck (node tests N + N + N) in N s`, the engine, web and tools test counts (1215 + 462 + 192 at this commit) |
 | `npm run demo` | `demo: ready. Open http://localhost:5190`, then the steps above |
 | `cd contract && cargo test -p gimbal-core` | `test result: ok.` for the 126 unit tests and for each vector file (decimal, EIP-3009, Hyperliquid, 1Click, Orderly, Solana, Solana fuzz): 190 passed, 0 failed |
 | `npm run ci -- --only contract` | `ci: green - cargo fmt, clippy, cargo test, wasm (cargo tests 439; wasm 674,490 bytes) in N s` |
