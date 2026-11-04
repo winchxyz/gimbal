@@ -1,6 +1,93 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { waitCopy } from './waitCopy.ts';
+import { refusedCopy, waitCopy } from './waitCopy.ts';
+
+// The cost gate (decide.ts: gate `cost`) and the trader's reasons it carries (trade/carry-plan.ts: costRefusal).
+const SPREAD = 'the expected spread over 3 days, $0.30, does not cover the round trip $0.52 (10.4 bps: 4 fills $0.20, slippage $0.12, basis buffer $0.20)';
+const THIN = 'the phoenix book fills only $12.00 of $50.00 within the levels read: the round trip cannot be priced';
+const NO_TOUCH = 'the hyperliquid book has no two-sided touch: the round trip cannot be priced';
+const costGate = (why: string) => `No window clears the entry rules; best XLM 14.2 % net: the pair trader refused it for cost this hour: ${why}`;
+
+test('the cost gate: the carry does not cover the round trip, and the desk tries again after the next hourly check', () => {
+  assert.equal(
+    waitCopy(costGate(SPREAD), { minNetAprPct: 5 }).text,
+    'No window clears your 5 % minimum right now. Closest: XLM, 14.2 % net, but its carry does not cover the cost of opening and closing it ($0.30 expected over 3 days, against $0.52); the desk tries it again after the next hourly check, from zero.',
+  );
+  assert.equal(waitCopy(costGate(SPREAD)).mapped, true);
+});
+
+test('the cost gate: a book too thin to price the round trip, and an unknown cost reason', () => {
+  assert.match(waitCopy(costGate(THIN), { minNetAprPct: 5 }).text, /but the Phoenix book is too thin to price opening and closing it; the desk tries it again after the next hourly check, from zero\.$/);
+  assert.match(waitCopy(costGate(NO_TOUCH)).text, /but the Hyperliquid book is too thin to price/);
+  assert.match(waitCopy(costGate('something new')).text, /but the pair trader would not open it for cost this hour; the desk tries it again after the next hourly check, from zero\.$/);
+});
+
+const HELD_OUT = (inner: string, tail = '; NEAR AI passed XLM') =>
+  `enter xlm-phoenix-hyperliquid: open refused, nothing signed: ${inner}; xlm-phoenix-hyperliquid is held out of the entry rules until the hourly check at 2026-11-04T10:00:00.000Z and its hours start again${tail}`;
+
+test('the loop line for an open refused for cost says when it is tried again', () => {
+  const raw = HELD_OUT(SPREAD);
+  const c = refusedCopy(raw);
+  assert.equal(
+    c?.text,
+    'Opening xlm-phoenix-hyperliquid was refused: its carry does not cover the cost of opening and closing it ($0.30 expected over 3 days, against $0.52). It is out of the entry rules until the hourly check at 10:00 UTC, and its hours start again from zero.',
+  );
+  assert.equal(c?.raw, raw);
+  assert.match(refusedCopy(HELD_OUT(THIN))?.text ?? '', /the Phoenix book is too thin to price opening and closing it\./);
+});
+
+test('a rotation that closed the old pair first says the desk is flat; other refusals are left alone', () => {
+  const raw = `rotate a-b: open refused, nothing signed: ${SPREAD}; a-b was closed, so the desk stays flat; b-c is held out of the entry rules until the hourly check at 2026-11-04T11:00:00.000Z and its hours start again; NEAR AI passed XLM`;
+  assert.equal(refusedCopy(raw), null); // the window named differs from the one rotated into: not this shape
+  const ok = `rotate a-b: open refused, nothing signed: ${SPREAD}; a-b was closed, so the desk stays flat; a-b is held out of the entry rules until the hourly check at 2026-11-04T11:00:00.000Z and its hours start again`;
+  assert.match(refusedCopy(ok)?.text ?? '', /^Rotation into a-b was refused: .* at 11:00 UTC, and its hours start again from zero\. The old pair was closed, so the desk is flat\.$/);
+  assert.equal(refusedCopy('enter xlm: open refused, nothing signed: the leverage is too high'), null);
+  assert.equal(refusedCopy(''), null);
+});
+
+test('hold lines in plain words', () => {
+  assert.equal(
+    waitCopy('Hold XLM: 12.0 % net of the exit, at least your 5 % minimum; day 2 of 7').text,
+    'Holding XLM: it nets 12.0 % after the exit, at least your 5 % minimum. Day 2 of 7.',
+  );
+  assert.equal(
+    waitCopy('Hold XLM: 3.0 % net of the exit, under your 5 % minimum, 2 of 6 hours before exit; day 3 of 7').text,
+    'Holding XLM: it nets 3.0 % after the exit, under your 5 % minimum (2 of 6 hours before the desk exits). Day 3 of 7.',
+  );
+  assert.equal(
+    waitCopy('Hold XLM: the spread flipped: this hour pays -1.0 %, 1 of 6 hours before exit; day 1 of 7').text,
+    'Holding XLM: the spread has flipped, as this hour pays -1.0 % (1 of 6 hours before the desk exits). Day 1 of 7.',
+  );
+  assert.match(waitCopy('Hold XLM: the spread flipped: the 7-day spread is -0.5 %, 1 of 1 hour before exit; day 1 of 7').text, /the 7-day spread is -0\.5 % \(1 of 1 hours?/);
+  assert.equal(
+    waitCopy('Hold XLM: its window is not in this scan, so nothing is decided on it; day 2 of 7').text,
+    'Holding XLM: its window is not in this scan, so the desk decides nothing on it for now. Day 2 of 7.',
+  );
+  assert.match(waitCopy('Hold XLM: its numbers are stale this scan, so nothing is decided on them; day 2 of 7').text, /^Holding XLM: its numbers are out of date this scan/);
+});
+
+test('hold lines with a rotation note', () => {
+  const base = 'Hold XLM: 12.0 % net of the exit, at least your 5 % minimum; day 2 of 7';
+  const head = 'Holding XLM: it nets 12.0 % after the exit, at least your 5 % minimum. Day 2 of 7.';
+  assert.equal(waitCopy(`${base}; DOGE beats it by 4.2 pts, 2 of 4 hours`).text, `${head} DOGE beats it by 4.2 points: 2 of 4 hours toward a rotation.`);
+  assert.equal(waitCopy(`${base}; DOGE beats it by 4.2 pts, but 3 rotations in 24 h is the most`).text, `${head} DOGE beats it by 4.2 points, but 3 rotations in 24 hours is the most the desk makes.`);
+  assert.equal(waitCopy(`${base}; DOGE beats it by 4.2 pts, but its switch cost is not known`).text, `${head} DOGE beats it by 4.2 points, but its switch cost is not known.`);
+  assert.equal(
+    waitCopy(`${base}; DOGE beats it by 4.2 pts, but the $1.20 switch takes 5.5 days to pay back, 3.0 are left`).text,
+    `${head} DOGE beats it by 4.2 points, but switching costs $1.20 and takes 5.5 days to pay back, with 3.0 left.`,
+  );
+  assert.equal(waitCopy(`${base}; your rotation rule is not a number: no rotation`).text, `${head} Your rotation rule is not a number, so the desk will not rotate.`);
+  assert.match(waitCopy(`${base}; DOGE beats it by 4.2 pts, but $1.00 free margin on Phoenix at 2x leaves nothing to open`).text, /DOGE beats it by 4\.2 points, but Phoenix has only \$1\.00 free margin/);
+  const odd = waitCopy(`${base}; something odd`);
+  assert.equal(odd.text, `${head} something odd`);
+  assert.equal(odd.mapped, false);
+});
+
+test('a hold line nothing knows comes back as sent', () => {
+  const raw = 'Hold XLM: something else entirely; day 2 of 7';
+  assert.deepEqual(waitCopy(raw), { text: raw, raw, mapped: false });
+  assert.equal(waitCopy('Hold XLM').mapped, false);
+});
 
 const HANDS = 'No window clears the entry rules; best BONK 14.8 % net: serve opens short hyperliquid, long phoenix only (as pair-mainnet open); bonk-orderly-hyperliquid is long orderly, short hyperliquid';
 

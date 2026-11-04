@@ -45,7 +45,10 @@ test('a wait or an off line is put in plain words with the engine’s string kep
   assert.equal(wait?.raw, raw);
   const off = decisionLine({ ...decision('off'), reason: 'Auto is off: the engine watches and you act by hand; x' }, NOW);
   assert.equal(off?.reason, 'Auto is off, so the desk only watches and you act by hand.');
-  assert.equal(decisionLine({ ...decision('hold'), reason: raw }, NOW)?.reason, raw);
+  const hold = decisionLine({ ...decision('hold'), reason: 'Hold XLM: 12.0 % net of the exit, at least your 5 % minimum; day 2 of 7' }, NOW);
+  assert.equal(hold?.reason, 'Holding XLM: it nets 12.0 % after the exit, at least your 5 % minimum. Day 2 of 7.');
+  assert.equal(decisionLine({ ...decision('hold'), reason: 'DOGE 14.8 % net, rotation needs 3 points' }, NOW)?.reason, 'DOGE 14.8 % net, rotation needs 3 points');
+  assert.equal(decisionLine({ ...decision('enter'), reason: raw }, NOW)?.reason, raw);
   assert.equal(decisionLine({ ...decision('wait'), reason: 'something new' }, NOW)?.reason, 'something new');
 });
 

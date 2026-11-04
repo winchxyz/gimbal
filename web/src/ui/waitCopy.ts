@@ -28,6 +28,21 @@ const minimumText = (n: number): string => `${Number.isInteger(n) ? n : n.toFixe
 
 const hoursWord = (n: string): string => (Number(n) === 1 ? 'hour' : 'hours');
 
+/** What the loop does after the pair trader refuses an open for cost (loop.ts: costRefused, until the next hourly check). */
+const RETRY = 'the desk tries it again after the next hourly check, from zero';
+
+/** The trader's cost refusal (trade/carry-plan.ts: CarryPlan.costRefusal), as a clause that follows "but". */
+function costReason(cost: string): string {
+  let m: RegExpMatchArray | null;
+  if ((m = cost.match(new RegExp(`^the expected spread over (\\d+(?:\\.\\d+)?) days, (${MONEY}), does not cover the round trip (${MONEY})`)))) {
+    return `its carry does not cover the cost of opening and closing it (${m[2]} expected over ${m[1]} days, against ${m[3]})`;
+  }
+  if ((m = cost.match(/^the (\S+) book (?:has no two-sided touch|fills only .*): the round trip cannot be priced$/s))) {
+    return `the ${venueName(m[1]!)} book is too thin to price opening and closing it`;
+  }
+  return 'the pair trader would not open it for cost this hour';
+}
+
 /** The rest of a sentence about a window that fails a rule, in the engine's gate order (decide.ts: gate). */
 function gateClause(text: string): string | null {
   let m: RegExpMatchArray | null;
@@ -37,6 +52,7 @@ function gateClause(text: string): string | null {
   if ((m = text.match(/^(.+?) is not a market both legs list in the desk's policy/))) {
     return `but ${m[1]} is not one of the markets in your policy`;
   }
+  if ((m = text.match(/^the pair trader refused it for cost this hour: (.+)$/s))) return `but ${costReason(m[1]!)}; ${RETRY}`;
   if (text === 'watch only') return 'but it is watch-only, so the desk will not trade it';
   if ((m = text.match(/^refused by the NEAR AI risk check.*, held out for (\d+(?:\.\d+)?) h more$/s))) {
     return `but the NEAR AI risk check refused it, so it is held out for ${m[1]} h more`;
@@ -124,6 +140,72 @@ function flat(line: string, ctx: WaitContext): Part | null {
   return null;
 }
 
+/** A rotation note on a hold line (decide.ts: rotationFor), as a sentence; null when nothing knows it. */
+function rotationNote(note: string): string | null {
+  let m: RegExpMatchArray | null;
+  if (note === 'your rotation rule is not a number: no rotation') return 'Your rotation rule is not a number, so the desk will not rotate.';
+  if ((m = note.match(new RegExp(`^(\\S+) beats it by (${NUM}) pts, (\\d+) of (\\d+) hours$`)))) {
+    return `${m[1]} beats it by ${m[2]} points: ${m[3]} of ${m[4]} hours toward a rotation.`;
+  }
+  if ((m = note.match(new RegExp(`^(\\S+) beats it by (${NUM}) pts, but (\\d+) rotations in 24 h is the most$`)))) {
+    return `${m[1]} beats it by ${m[2]} points, but ${m[3]} rotations in 24 hours is the most the desk makes.`;
+  }
+  if ((m = note.match(new RegExp(`^(\\S+) beats it by (${NUM}) pts, but its switch cost is not known$`)))) {
+    return `${m[1]} beats it by ${m[2]} points, but its switch cost is not known.`;
+  }
+  if ((m = note.match(new RegExp(`^(\\S+) beats it by (${NUM}) pts, but the (${MONEY}) switch takes (${NUM}) days to pay back, (${NUM}) are left$`)))) {
+    return `${m[1]} beats it by ${m[2]} points, but switching costs ${m[3]} and takes ${m[4]} days to pay back, with ${m[5]} left.`;
+  }
+  if ((m = note.match(new RegExp(`^(\\S+) beats it by (${NUM}) pts, but (.+)$`, 's')))) {
+    const clause = sizeClause(m[3]!);
+    return clause === null ? null : `${m[1]} beats it by ${m[2]} points, but ${clause}.`;
+  }
+  return null;
+}
+
+/** `Hold SYM: <status>; day D of M[; <rotation note>]` (decide.ts: decideHeld). */
+function hold(raw: string): Part | null {
+  const m = raw.match(/^Hold (\S+): (.+?); day (\d+) of (\d+)(?:; (.+))?$/s);
+  if (!m) return null;
+  const [, symbol, status, day, max, note] = m as unknown as [string, string, string, string, string, string | undefined];
+  const days = `Day ${day} of ${max}.`;
+  let head: string | null = null;
+  let s: RegExpMatchArray | null;
+  if (status === 'its window is not in this scan, so nothing is decided on it') {
+    head = `Holding ${symbol}: its window is not in this scan, so the desk decides nothing on it for now.`;
+  } else if (status === 'its numbers are stale this scan, so nothing is decided on them') {
+    head = `Holding ${symbol}: its numbers are out of date this scan, so the desk decides nothing on it for now.`;
+  } else if ((s = status.match(new RegExp(`^(${PCT}) net of the exit, at least your (${PCT}) minimum$`)))) {
+    head = `Holding ${symbol}: it nets ${s[1]} after the exit, at least your ${s[2]} minimum.`;
+  } else if ((s = status.match(new RegExp(`^(${PCT}) net of the exit, under your (${PCT}) minimum, (\\d+) of (\\d+) hours? before exit$`)))) {
+    head = `Holding ${symbol}: it nets ${s[1]} after the exit, under your ${s[2]} minimum (${s[3]} of ${s[4]} ${hoursWord(s[4]!)} before the desk exits).`;
+  } else if ((s = status.match(new RegExp(`^the spread flipped: (this hour pays ${PCT}|the (?:7|14)-day spread is ${PCT}), (\\d+) of (\\d+) hours? before exit$`)))) {
+    head = `Holding ${symbol}: the spread has flipped, as ${s[1]} (${s[2]} of ${s[3]} ${hoursWord(s[3]!)} before the desk exits).`;
+  }
+  if (head === null) return null;
+  if (note === undefined) return { text: `${head} ${days}`, mapped: true };
+  const noted = rotationNote(note);
+  return { text: `${head} ${days} ${noted ?? note}`, mapped: noted !== null };
+}
+
+/**
+ * The loop's journal line for an open the pair trader refused for cost (loop.ts, journaled `refused`):
+ * `enter ID: open refused, nothing signed: <why>[; X was closed, so the desk stays flat]; ID is held out of the entry
+ * rules until the hourly check at <ISO> and its hours start again; <risk check>`. Null for any other refusal.
+ */
+export function refusedCopy(reason: string): WaitCopy | null {
+  const raw = reason.trim();
+  const m = raw.match(/^(enter|rotate) (\S+): (.*?); \2 is held out of the entry rules until the hourly check at (\d{4}-\d\d-\d\dT(\d\d:\d\d)[^ ;]*) and its hours start again(?:;|$)/s);
+  if (!m) return null;
+  const [, kind, id, inner, , time] = m as unknown as [string, string, string, string, string, string];
+  const cost = inner.match(/the expected spread over .*? does not cover the round trip \$?[^;]*|the \S+ book (?:has no two-sided touch|fills only [^;]*)[^;]*round trip cannot be priced/s);
+  const why = cost === null ? 'the pair trader refused to open it for cost' : costReason(cost[0]);
+  const flatNote = /was closed, so the desk stays flat/.test(inner) ? ' The old pair was closed, so the desk is flat.' : '';
+  const text = `${kind === 'rotate' ? 'Rotation into' : 'Opening'} ${id} was refused: ${why}. `
+    + `It is out of the entry rules until the hourly check at ${time} UTC, and its hours start again from zero.${flatNote}`;
+  return { text, raw, mapped: true };
+}
+
 /** `Cooling down after the exit, 3.2 h left; <flat line>` and the other whole-sentence shapes. */
 function whole(raw: string, ctx: WaitContext): Part | null {
   let m: RegExpMatchArray | null;
@@ -147,6 +229,7 @@ function whole(raw: string, ctx: WaitContext): Part | null {
       ? { text: `${m[1]} is ready at ${m[2]} net, but the desk cannot size it: ${m[3]}.`, mapped: false }
       : { text: `${m[1]} is ready at ${m[2]} net, but ${clause}.`, mapped: true };
   }
+  if (raw.startsWith('Hold ')) return hold(raw);
   return flat(raw, ctx);
 }
 
