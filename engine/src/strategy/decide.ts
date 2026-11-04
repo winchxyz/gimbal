@@ -113,6 +113,12 @@ export interface DecideInput {
    * loop.ts. A rotation sizes the new legs on free margin plus this. Absent = none counted.
    */
   freedMarginUsd?: Record<string, number>;
+  /**
+   * Window id -> why the loop's hands cannot open it here (loop.ts: LoopHands.symbolOf refusals, which include serve's
+   * direction rule, long Phoenix / short Hyperliquid only). Such a window fails the entry rules (`hands`), so a lower
+   * window the hands can open is the one counted and entered. Absent = every window is openable.
+   */
+  unopenable?: Record<string, string>;
 }
 
 export interface Decision {
@@ -170,41 +176,73 @@ function vetoHoursLeft(c: Pick<LoopCounters, 'vetoedUntil'> | undefined, id: str
 interface GateFailure { code: string; text: string }
 
 type GateInput = Pick<DecideInput, 'strategy' | 'gross14dAprPct'>
-  & Partial<Pick<DecideInput, 'now' | 'counters' | 'freeMarginUsd' | 'freedMarginUsd' | 'liveRescue'>>;
+  & Partial<Pick<DecideInput, 'now' | 'counters' | 'freeMarginUsd' | 'freedMarginUsd' | 'liveRescue' | 'lots' | 'unopenable'>>;
 
-/** The leverage sizeFor opens a window's legs at: the owner's, at most MAX_LEVERAGE, lower when a leg has no live rescue. */
-function legLeverage(w: FundingWindow, input: Pick<DecideInput, 'strategy'> & Partial<Pick<DecideInput, 'liveRescue'>>): number {
+/**
+ * The leverage a window's legs open at: the owner's, at most MAX_LEVERAGE, at most NO_RESCUE_MAX_LEVERAGE when a leg
+ * has no live rescue. Null when the owner's is not a positive finite number (sizeFor refuses it).
+ */
+function legLeverage(w: FundingWindow, input: Pick<DecideInput, 'strategy'> & Partial<Pick<DecideInput, 'liveRescue'>>): number | null {
+  const asked = input.strategy.maxLeverage;
+  if (!finite(asked) || asked <= 0) return null;
   const noRescue = [w.longVenue, w.shortVenue].some((v) => input.liveRescue?.[v] !== true);
-  return Math.min(input.strategy.maxLeverage, MAX_LEVERAGE, noRescue ? NO_RESCUE_MAX_LEVERAGE : Infinity);
+  return Math.min(asked, MAX_LEVERAGE, noRescue ? NO_RESCUE_MAX_LEVERAGE : Infinity);
+}
+
+/** A leg capped at `capUsd`, rounded down to whole common lots of `w`'s two venues, as sizeFor and pair-mainnet round it. */
+type LotLeg = { ok: true; qty: bigint; legUsd: number } | { ok: false; code: 'lots' | 'zero'; why: string; lot?: bigint };
+
+function lotLeg(w: FundingWindow, capUsd: number, lots: DecideInput['lots']): LotLeg {
+  const l = lots?.[w.id];
+  if (l === undefined || !finite(l.px) || l.px <= 0) return { ok: false, code: 'lots', why: `no lot sizes for ${w.symbol}: its size cannot be rounded to whole lots` };
+  let lot: bigint;
+  try {
+    lot = commonLot(toQty(l.longLot), toQty(l.shortLot));
+  } catch (err) {
+    return { ok: false, code: 'lots', why: `${w.symbol}'s lots cannot be combined: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  if (lot <= 0n) return { ok: false, code: 'lots', why: `${w.symbol} has a lot of zero` };
+  const qty = floorToLot(toQty((capUsd / l.px).toFixed(8)), lot);
+  if (qty === 0n) return { ok: false, code: 'zero', why: `under one common lot (${qtyString(lot)} ${w.symbol} at ${l.px})`, lot };
+  return { ok: true, qty, legUsd: Math.floor(qtyNumber(qty) * l.px * 100) / 100 };
 }
 
 /**
- * The margin moves entering `w` would need: its leg venues whose free margin (plus what a close frees first) cannot
- * open even a MIN_LEG_USD leg at the leverage sizeFor uses, priced by the scanner (Window.marginMoveUsd: onto the
- * venue and back). sizeFor sizes a leg down to the free margin and the loop never moves margin to open, so a venue
- * with some margin costs no move; one without needs it moved there first. Null when nothing is known to move: no
- * free margin read (callers outside decide()), or no move priced.
+ * The first leg venue of `w` whose free margin (plus what a close frees first) cannot open a MIN_LEG_USD leg at the
+ * leverage sizeFor uses, in whole lots, or null. The loop never moves margin to open a leg, so such a window cannot
+ * be entered at all. A venue missing from freeMarginUsd was not read this check (a failed read): it is skipped, so a
+ * read failure never resets a window's hours; sizeFor still waits on it. Null outside decide() (no free margin given).
  */
-function marginMoves(w: FundingWindow, input: GateInput): { usd: number; venues: string[]; leverage: number } | null {
-  if (input.freeMarginUsd === undefined || w.marginMoveUsd === undefined) return null;
+function marginShort(w: FundingWindow, input: GateInput): GateFailure | null {
+  const free = input.freeMarginUsd;
+  if (free === undefined) return null;
   const leverage = legLeverage(w, input);
-  let total = 0;
-  const venues: string[] = [];
+  if (leverage === null) return null;
   for (const v of [w.longVenue, w.shortVenue]) {
-    const free = (input.freeMarginUsd[v] ?? 0) + (input.freedMarginUsd?.[v] ?? 0);
-    if (finite(free) && free * leverage >= MIN_LEG_USD) continue;
-    const cost = w.marginMoveUsd[v as keyof typeof w.marginMoveUsd];
-    if (cost === undefined || !finite(cost)) continue;
-    total += cost;
-    venues.push(venueName(v));
+    if (!Object.hasOwn(free, v)) continue;
+    const margin = free[v]! + (input.freedMarginUsd?.[v] ?? 0);
+    if (!finite(margin)) continue;
+    const cap = margin * leverage;
+    // Without lot sizes the leg is not rounded here; sizeFor refuses the window for that.
+    const rounded = cap <= 0 ? null : lotLeg(w, cap, input.lots);
+    const legUsd = cap <= 0 ? 0 : rounded!.ok ? rounded!.legUsd : rounded!.code === 'zero' ? 0 : cap;
+    if (legUsd < MIN_LEG_USD) {
+      return {
+        code: 'margin',
+        text: `${usd(margin)} free margin on ${venueName(v)} at ${lev(leverage)} opens ${usd(legUsd)} a leg in whole lots, `
+          + `under the ${usd(MIN_LEG_USD)} minimum: the loop does not move margin to open`,
+      };
+    }
   }
-  return venues.length === 0 ? null : { usd: total, venues, leverage };
+  return null;
 }
 
 function gate(w: FundingWindow, input: GateInput): GateFailure | null {
   const min = input.strategy.minNetAprPct;
   const legUsd = input.strategy.legUsd;
   if (!w.tradable) return { code: 'watch', text: 'watch only' };
+  const hands = input.unopenable?.[w.id];
+  if (hands !== undefined) return { code: 'hands', text: hands };
   const vetoLeft = vetoHoursLeft(input.counters, w.id, input.now);
   if (vetoLeft !== null) return { code: 'vetoed', text: `refused by the NEAR AI risk check, held out for ${vetoLeft.toFixed(1)} h more` };
   if (!isEnterable(w)) {
@@ -227,20 +265,7 @@ function gate(w: FundingWindow, input: GateInput): GateFailure | null {
   if (d14 !== null && !(d14 > 0)) return { code: '14d', text: `the 14-day spread is ${pct(d14)}` };
   const need = legUsd / DEFAULT_SCANNER_CONFIG.deskMaxOiShare;
   if (w.depthUsd < need) return { code: 'depth', text: `capacity ${usd(w.depthUsd)}, under the ${usd(need)} a ${usd(legUsd)} leg needs` };
-  // Its net leaves the margin moves out (the scanner shows them apart): where no margin sits, they are paid on entry,
-  // so the net after them, spread over the same hold, must still clear the minimum.
-  const moves = marginMoves(w, input);
-  if (moves !== null) {
-    const after = w.netAprPct - (moves.usd / legUsd) * (HOURS_PER_YEAR / DEFAULT_SCANNER_CONFIG.costs.holdHours) * 100;
-    if (!(after >= min)) {
-      return {
-        code: 'moves',
-        text: `${pct(w.netAprPct)} net, but no free margin on ${moves.venues.join(' or ')} opens a leg at ${lev(moves.leverage)}: `
-          + `moving it there and back costs ${usd(moves.usd)}, ${pct(after)} net after that, under your ${minimum(min)} minimum`,
-      };
-    }
-  }
-  return null;
+  return marginShort(w, input);
 }
 
 /** Why a window fails the entry rules now, in a few words; null when it passes them all. */
@@ -323,10 +348,8 @@ export function sizeFor(
 ): Sizing {
   const fail = (code: string, why: string): Sizing => ({ ok: false, code, why });
   const venues = [w.longVenue, w.shortVenue];
-  const noRescue = venues.filter((v) => input.liveRescue[v] !== true);
-  const asked = input.strategy.maxLeverage;
-  if (!finite(asked) || asked <= 0) return fail('leverage', `your leverage ${String(asked)}x is not a positive number`);
-  const leverage = Math.min(asked, MAX_LEVERAGE, noRescue.length > 0 ? NO_RESCUE_MAX_LEVERAGE : Infinity);
+  const leverage = legLeverage(w, input);
+  if (leverage === null) return fail('leverage', `your leverage ${String(input.strategy.maxLeverage)}x is not a positive number`);
   const band = input.priceBandBps ?? DEFAULT_PRICE_BAND_BPS;
   if (!finite(band) || band < 0 || band >= 1e4) return fail('band', `the policy's price band ${String(band)} bps is not usable`);
   const caps: { code: string; usd: number; why: string }[] = [
@@ -346,24 +369,12 @@ export function sizeFor(
     if (c.usd <= 0) return fail(c.code, `${c.why} leaves nothing to open`);
   }
   const binding = caps.reduce((a, b) => (b.usd < a.usd ? b : a));
-  const lots = input.lots?.[w.id];
-  if (lots === undefined || !finite(lots.px) || lots.px <= 0) return fail('lots', `no lot sizes for ${w.symbol}: its size cannot be rounded to whole lots`);
-  let lot: bigint;
-  try {
-    lot = commonLot(toQty(lots.longLot), toQty(lots.shortLot));
-  } catch (err) {
-    return fail('lots', `${w.symbol}'s lots cannot be combined: ${err instanceof Error ? err.message : String(err)}`);
+  const leg = lotLeg(w, binding.usd, input.lots);
+  if (!leg.ok) return leg.code === 'lots' ? fail('lots', leg.why) : fail(binding.code, `${binding.why} sizes a leg at ${usd(binding.usd)}, ${leg.why}`);
+  if (leg.legUsd < MIN_LEG_USD) {
+    return fail(binding.code, `${binding.why} sizes a leg at ${usd(leg.legUsd)} in whole lots, under the ${usd(MIN_LEG_USD)} minimum`);
   }
-  if (lot <= 0n) return fail('lots', `${w.symbol} has a lot of zero`);
-  const size = floorToLot(toQty((binding.usd / lots.px).toFixed(8)), lot);
-  if (size === 0n) {
-    return fail(binding.code, `${binding.why} sizes a leg at ${usd(binding.usd)}, under one common lot (${qtyString(lot)} ${w.symbol} at ${lots.px})`);
-  }
-  const legUsd = Math.floor(qtyNumber(size) * lots.px * 100) / 100;
-  if (legUsd < MIN_LEG_USD) {
-    return fail(binding.code, `${binding.why} sizes a leg at ${usd(legUsd)} in whole lots, under the ${usd(MIN_LEG_USD)} minimum`);
-  }
-  return { ok: true, legUsd, leverage, qty: qtyString(size) };
+  return { ok: true, legUsd: leg.legUsd, leverage, qty: qtyString(leg.qty) };
 }
 
 // ---- counters ----
