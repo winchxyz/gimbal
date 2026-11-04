@@ -925,6 +925,33 @@ test('a desk pair: listed by this hour until its history is in, then in the dire
   assert.equal(flipped.windows[0]!.grossApr7dPct, 17.52);
 });
 
+test('a small desk leg before its history is in: the same costs as after, not the margin moves annualised', async () => {
+  // At 20 USD a leg the margin moves (flat 1Click fees) and the rescue reserve annualise to hundreds of APR points
+  // over the hold; once the week is in they are shown apart. Before it, the list used them, so a window read -605 %
+  // and then about -1.5 % a scan later.
+  const thick = { ...DOGE_PH, openInterest: 555491e3 };
+  const hl = new HistoryVenue('hyperliquid', [DOGE_HL], () => 0.00001);
+  const ph = new HistoryVenue('phoenix', [thick], () => 0.00003);
+  const clock = new VirtualClock(T0);
+  // A desk loaded and no minimum: only the missing history can keep the window shut.
+  const { scanner: s } = scanner({ venues: [hl, ph] }, clock, { policy: DOGE_POLICY }, { strategy: () => LEG_20_ANY, oracle: dogeOracle(clock) });
+  const before = (await s.scan()).windows[0]!;
+  assert.equal(before.grossApr7dPct, null);
+  assert.ok(before.grossAprPct > 0, `this hour pays: ${before.grossAprPct}`);
+  assert.equal(before.refused, undefined);
+  assert.equal(isEnterable(before), false, 'not entered on one hour, however it pays');
+  assert.ok(before.checks.some((c) => /^Moving \$\d+\.\d\d of margin a leg onto .* and back costs/.test(c.text)), 'the moves are still shown');
+  assert.equal(before.costs.rescueReservePct, 0);
+  const costs = before.costs.feesPct + before.costs.slippagePct + before.costs.basisPct;
+  assert.ok(costs < 30, `costs ${costs} APR points`);
+  assert.equal(before.netAprPct, Math.round((before.grossAprPct - costs) * 1000) / 1000);
+  await s.idle();
+  clock.set(T0 + 5_000);
+  const after = (await s.scan()).windows[0]!;
+  assert.equal(after.grossApr7dPct, 17.52);
+  assert.deepEqual(after.costs, before.costs);
+});
+
 test('a desk pair over the open-interest share whose multi-day spread cannot pay its fees is not listed, its books never read', async () => {
   // A 1000 USD leg is 2.4 % of Phoenix's 41k USD. 0.0000005/h apart: 0.44 % APR, 0.12 USD over 10 days, against
   // 1.80 USD of fees.

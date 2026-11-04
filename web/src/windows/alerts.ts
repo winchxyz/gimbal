@@ -36,7 +36,8 @@ export function reached(alerts: readonly Alert[], windows: readonly FundingWindo
   const out: Reached[] = [];
   for (const alert of alerts) {
     const watched = windows.find((w) => w.id === alert.windowId);
-    if (!watched) continue;
+    // Without a 7-day spread the net is one hour stated as a year: not something to alert on.
+    if (!watched || watched.grossApr7dPct === null) continue;
     const over = windows.find((w) => w.id === alert.overId)?.netAprPct ?? alert.overNetAprPct;
     if (watched.netAprPct > over) out.push({ alert, window: watched, overNetAprPct: over });
   }

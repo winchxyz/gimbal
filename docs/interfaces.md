@@ -697,12 +697,12 @@ export interface Window {
   grossAprPct: number;            // this hour
   grossApr7dPct: number | null;   // the last 168 complete hours; null until the history is loaded
   costs: { feesPct: number; slippagePct: number; basisPct: number; rescueReservePct: number };
-                                  // today's one-off costs, spread over the hold as APR points. A desk window on the
-                                  // multi-day basis: the round trip the gate uses, feesPct the four fills, basisPct
-                                  // the basis buffer (adverse mark gap, timing loss, buffer bps), rescueReservePct 0;
-                                  // its margin moves and rescue reserve are shown apart, in its checks. Otherwise
-                                  // feesPct also has the 1Click fees to move both legs' margin in and out, and
-                                  // basisPct the mark gap and timing loss
+                                  // today's one-off costs, spread over the hold as APR points. A desk window, with
+                                  // or without its history: the round trip the gate uses, feesPct the four fills,
+                                  // basisPct the basis buffer (adverse mark gap, timing loss, buffer bps),
+                                  // rescueReservePct 0; its margin moves and rescue reserve are shown apart, in its
+                                  // checks. Otherwise (watch windows, which price neither) basisPct is the mark gap
+                                  // and timing loss
   netAprPct: number;              // multi-day gross minus costs on a desk window with its 7 days in: the net the gate
                                   // holds to minNetAprPct, once both weeks agree; else this hour's gross minus costs
                                   // (watch windows always). What the list ranks by, the minimum line and the rotation
@@ -851,7 +851,10 @@ export interface JournalEntry {
 }
 
 export interface RescueProgress {
-  id: string; from: VenueId | 'reserve'; to: VenueId; amountUsd: number;
+  // amountUsd: at `detect` what the leg needs; from `source` on what the planned transfer sends (a capped or
+  // fixed-size move can be less than the need); at `landed` what reached the margin after 1Click's fees.
+  // sentUsd: what the planned transfer sends, from `source` on and still at `landed` (the quote row keeps it).
+  id: string; from: VenueId | 'reserve'; to: VenueId; amountUsd: number; sentUsd?: number;
   step: 'detect' | 'source' | 'quote' | 'verify' | 'sign' | 'deposit' | 'landed' | 'failed';
   startedAt: number; elapsedS: number; tx: TxRef[];
 }

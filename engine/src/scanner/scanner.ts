@@ -502,14 +502,15 @@ export class Scanner {
       // multi-day spread (the 7 days while the week before loads or when the two weeks disagree) minus them. So the
       // list, the minimum line and the rotation gap compare what the gate does, never one hour's swing. The margin
       // moves and the rescue reserve are one-off costs shown apart (the checks above, `npm run windows`).
-      const basisApr = dh.m.state === 'mixed' ? dh.m.d7AprPct : listingApr(dh.m);
-      if (basisApr !== null) {
-        const apr = (usd: number) => round(oneOffAprPct(usd, strategy.legUsd, config.costs.holdHours), 3);
-        w.costs = { feesPct: apr(rt.feesUsd), slippagePct: apr(rt.slippageUsd), basisPct: apr(rt.basisBufferUsd), rescueReservePct: 0 };
-        pw.costsApr = round(w.costs.feesPct + w.costs.slippagePct + w.costs.basisPct, 3);
-        w.netAprPct = round(basisApr - pw.costsApr, 3);
-        w.usdPerDayPer1k = round((w.netAprPct / 100 / 365) * 1000, 4);
-      }
+      // Before its 7 days are in, the same costs stand against this hour's gross. Pricing alone also counts the margin
+      // moves and the rescue reserve, flat 1Click fees that on a small leg annualise to hundreds of points: the list
+      // showed such a window at -605 % until its week loaded, then at -1.5 %.
+      const basisApr = (dh.m.state === 'mixed' ? dh.m.d7AprPct : listingApr(dh.m)) ?? w.grossAprPct;
+      const apr = (usd: number) => round(oneOffAprPct(usd, strategy.legUsd, config.costs.holdHours), 3);
+      w.costs = { feesPct: apr(rt.feesUsd), slippagePct: apr(rt.slippageUsd), basisPct: apr(rt.basisBufferUsd), rescueReservePct: 0 };
+      pw.costsApr = round(w.costs.feesPct + w.costs.slippagePct + w.costs.basisPct, 3);
+      w.netAprPct = round(basisApr - pw.costsApr, 3);
+      w.usdPerDayPer1k = round((w.netAprPct / 100 / 365) * 1000, 4);
       w.intervalsAbove = intervalsAbove(this.#rates, longKey, shortKey, now, w.grossAprPct, pw.costsApr, strategy.minNetAprPct);
       // Break-even on the same multi-day spread as the gate, against the same round trip (the 1Click margin moves and
       // the rescue reserve are shown apart, never gated on): this hour alone says little about a hold of days.
