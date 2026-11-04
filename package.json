@@ -19,7 +19,8 @@
     "test": "npm run test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "attack": "npm run attack -w engine --",
-    "report": "npm run report -w engine --"
+    "report": "npm run report -w engine --",
+    "backtest:checks": "npm run backtest:checks -w engine --"
   },
   "devDependencies": {
     "@types/node": "^24.19.2",

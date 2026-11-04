@@ -120,6 +120,22 @@ export interface DecideInput {
    * window the hands can open is the one counted and entered. Absent = every window is openable.
    */
   unopenable?: Record<string, string>;
+  /**
+   * The hourly-check counts, when not LOOP_RULES' own: what the entry/exit-checks backtest (src/backtest) varies.
+   * serve never passes it.
+   */
+  rules?: Partial<CheckRules>;
+}
+
+/** The two counts a backtest may set: hourly checks in a row before an entry, and before a counted exit. */
+export interface CheckRules { enterAfterChecks: number; exitAfterChecks: number }
+
+/** The counts this decision runs on: the input's, else LOOP_RULES'. */
+function checkRules(input: Pick<DecideInput, 'rules'>): CheckRules {
+  return {
+    enterAfterChecks: input.rules?.enterAfterChecks ?? LOOP_RULES.enterAfterChecks,
+    exitAfterChecks: input.rules?.exitAfterChecks ?? LOOP_RULES.exitAfterChecks,
+  };
 }
 
 export interface Decision {
@@ -496,14 +512,15 @@ function decideHeld(input: DecideInput, held: HeldPair, heldW: FundingWindow | n
   }
 
   // Counted exit.
+  const { exitAfterChecks } = checkRules(input);
   const trouble = heldTrouble(heldW, input);
-  if (trouble !== null && counters.badChecks >= LOOP_RULES.exitAfterChecks) {
-    const reason = `Exit ${held.symbol}: ${trouble}, ${counters.badChecks} of ${hours(LOOP_RULES.exitAfterChecks)} in a row`;
+  if (trouble !== null && counters.badChecks >= exitAfterChecks) {
+    const reason = `Exit ${held.symbol}: ${trouble}, ${counters.badChecks} of ${hours(exitAfterChecks)} in a row`;
     return out('exit', reason, held.windowId, { kind: 'exit', reason });
   }
   const status = trouble === null
     ? `${pct(heldApr)} net of the exit, at least your ${minimum(strategy.minNetAprPct)} minimum`
-    : `${trouble}, ${counters.badChecks} of ${hours(LOOP_RULES.exitAfterChecks)} before exit`;
+    : `${trouble}, ${counters.badChecks} of ${hours(exitAfterChecks)} before exit`;
   return out('hold', `Hold ${held.symbol}: ${status}; ${day}${rot.note === null ? '' : `; ${rot.note}`}`, held.windowId);
 }
 
@@ -579,9 +596,10 @@ function flatStatus(input: DecideInput, counters: LoopCounters): FlatStatus {
     ? { line: '', key: '' }
     : { line: `; ${vetoed.symbol} refused by the NEAR AI risk check${vetoWhyText(counters, vetoed.id)}, held out for ${vetoHoursLeft(counters, vetoed.id, input.now)!.toFixed(1)} h more`, key: `:veto:${vetoed.id}` };
   if (top !== null) {
-    const n = Math.min(counters.aboveByWindow[top.id] ?? 0, LOOP_RULES.enterAfterChecks);
+    const { enterAfterChecks } = checkRules(input);
+    const n = Math.min(counters.aboveByWindow[top.id] ?? 0, enterAfterChecks);
     return {
-      line: `${top.symbol} ${pct(top.netAprPct)} net, ${n} of ${LOOP_RULES.enterAfterChecks} hours above ${minimum(min)}${noteOf(top)}${vetoNote.line}`,
+      line: `${top.symbol} ${pct(top.netAprPct)} net, ${n} of ${enterAfterChecks} hours above ${minimum(min)}${noteOf(top)}${vetoNote.line}`,
       key: `warming:${top.id}:${n}${vetoNote.key}`,
       windowId: top.id,
       top,
@@ -610,13 +628,14 @@ function decideFlat(input: DecideInput, counters: LoopCounters, out: Out): Decis
   // The top of the scanner's ranked list among the windows the rules allow: that one or none. Until it has its
   // hours, or when it cannot be sized, the desk waits on it; a lower window is never entered in its place.
   const w = status.top;
-  if (w === null || (counters.aboveByWindow[w.id] ?? 0) < LOOP_RULES.enterAfterChecks) {
+  const { enterAfterChecks } = checkRules(input);
+  if (w === null || (counters.aboveByWindow[w.id] ?? 0) < enterAfterChecks) {
     return out('wait', capitalize(status.line), status.windowId, null, status.key);
   }
   const size = sizeFor(w, input);
   if (!size.ok) return out('wait', `${w.symbol} ${pct(w.netAprPct)} net is ready, but ${size.why}`, w.id, null, `size:${w.id}:${size.code}`);
   const n = counters.aboveByWindow[w.id] ?? 0;
-  const reason = `Enter ${pair(w)}: ${pct(w.netAprPct)} net, ${Math.min(n, LOOP_RULES.enterAfterChecks)} of ${LOOP_RULES.enterAfterChecks} hours above `
+  const reason = `Enter ${pair(w)}: ${pct(w.netAprPct)} net, ${Math.min(n, enterAfterChecks)} of ${enterAfterChecks} hours above `
     + `${minimum(input.strategy.minNetAprPct)}, 7-day ${pct(w.grossApr7dPct!)} and this hour ${pct(w.grossAprPct)}; ${usd(size.legUsd)} a leg at ${lev(size.leverage)}${noteOf(w)}`;
   return out('enter', reason, w.id, { kind: 'enter', windowId: w.id, legUsd: size.legUsd, leverage: size.leverage, qty: size.qty });
 }
