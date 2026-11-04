@@ -727,7 +727,7 @@ export interface Window {
                                              // refused, not stale, every check ok, not refused by the NEAR AI risk check
   switchCostUsd: number | null;     // cost to rotate from the held window into this one at strategy.legUsd:
                                     // the fills that change, plus moving margin onto this window's venues and
-                                    // back (its net APR leaves those moves out);
+                                    // back (a desk window's net APR with its 7 days in leaves those moves out);
                                     // null when nothing is held or this is the held one
   stale: boolean;                   // a venue it needs did not answer: the numbers are from the last good read
 }
@@ -941,7 +941,11 @@ anywhere the policy does not allow.
 
 - `decide.ts` (pure): `decide(DecideInput) → Decision` with the shapes in that file. Entry: the top of the
   scanner's ranked list among the windows passing the entry rules (`isEnterable`, `netAprPct ≥ minNetAprPct`, the
-  7 d and 14 d spread signs agreeing with this hour's, depth on both legs), once it has passed them for
+  7 d and 14 d spread signs agreeing with this hour's, depth on both legs; not in `DecideInput.unopenable`, the
+  windows the loop's hands refuse (serve opens long Phoenix / short Hyperliquid only, on the policy's markets); and
+  free margin on each leg venue, plus what a close frees, opening at least 10 USD a leg at the leverage in whole
+  lots, as the size below rounds it: the loop never moves margin to open; a venue whose free margin was not read
+  this check is skipped, so a read failure never resets the count), once it has passed them for
   `LOOP_RULES.enterAfterChecks` hourly checks in a row; until then the loop waits on it ("k of N hours") and never
   enters a lower window instead. Size: `legUsd` capped by the policy's `max_notional_usd` less the band, by free
   margin at the leverage and by depth, rounded down to whole common lots; a cap that is not a finite number or is

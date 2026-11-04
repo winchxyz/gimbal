@@ -398,8 +398,10 @@ function watchVerdict(pair: Pair): Verdict {
  * What it costs to rotate from the held window into another at the same leg size, USD: close the held legs that
  * change and open the new ones (taker fee and slippage of each of those fills; a leg that stays, same venue, market
  * and side, costs nothing), plus moving margin onto the new window's venues and back (its transferUsd: none where
- * marginHeldAt says the desk's margin already sits). A desk window's net APR leaves its margin moves out (they are a
- * one-off cost shown apart), so this is where the rotation gap and its payback pay for them.
+ * marginHeldAt says the desk's margin already sits). The net priced here counts the same moves in feesPct, but once a
+ * desk window's 7 days are in, scanner.ts restates its costs as the round trip alone and its net APR leaves the moves
+ * out (a one-off cost shown apart, in its checks): every window the entry gate passes is on that basis, so this is
+ * where the rotation gap and its payback pay for them.
  */
 export function switchCostUsd(held: PricedWindow, next: PricedWindow): number | null {
   if (held.fills === null || next.fills === null) return null;

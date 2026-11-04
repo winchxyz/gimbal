@@ -633,6 +633,22 @@ export class StrategyLoop {
     return next;
   }
 
+  /**
+   * decide()'s unopenable: the tradable windows the hands refuse (LoopHands.symbolOf: serve's direction rule and the
+   * policy's markets), so the gate passes over them to one the hands can open. No hands: nothing is opened anyway.
+   */
+  #unopenable(windows: readonly FundingWindow[]): Pick<DecideInput, 'unopenable'> {
+    const hands = this.#o.hands;
+    if (hands === undefined || hands === null) return {};
+    const out: Record<string, string> = {};
+    for (const w of windows) {
+      if (!w.tradable) continue;
+      const sym = hands.symbolOf(w);
+      if ('refused' in sym) out[w.id] = sym.refused;
+    }
+    return { unopenable: out };
+  }
+
   async #readFree(): Promise<Record<string, number>> {
     return this.#o.freeMargin().catch((err: unknown) => {
       this.#log(`strategy loop: free margin not read (${errorMessage(err)})`);
@@ -706,6 +722,7 @@ export class StrategyLoop {
       counters: before, ...(policy === null ? {} : { priceBandBps: policy.price_band_bps }),
       ...(facts.gross14dAprPct === undefined ? {} : { gross14dAprPct: facts.gross14dAprPct }), ...(facts.lots === undefined ? {} : { lots: facts.lots }),
       ...(freed === undefined ? {} : { freedMarginUsd: freed }),
+      ...this.#unopenable(scanned),
     };
     const d = (this.#o.decide ?? defaultDecide)(input);
     this.#journalDecision(input, d, before);

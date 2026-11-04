@@ -176,6 +176,8 @@ test('the hourly check: the first check past the grace after the top of the hour
   assert.deepEqual(i.freeMarginUsd, { hyperliquid: 900, phoenix: 800 });
   assert.deepEqual(i.liveRescue, { hyperliquid: true, phoenix: false });
   assert.equal(i.windows.length, 3);
+  // And the windows the hands refuse (here the wrong direction), so the gate passes over them.
+  assert.deepEqual(i.unopenable, { 'btc-hyperliquid-phoenix': 'short hyperliquid, long phoenix only' });
 });
 
 test('decision events only when the decision changes; a wait is journaled only when its reason changes', async () => {
