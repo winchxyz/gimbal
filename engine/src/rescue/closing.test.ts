@@ -17,14 +17,15 @@ const rec = loadRescueRecording();
 function setup(results: PairResult['status'][] = ['closed'], gate: Promise<void>[] = []) {
   let t = 1_000_000;
   const calls: string[] = [];
-  const closes: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean }[] = [];
+  const closes: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean; fresh?: boolean; closingNow?: boolean }[] = [];
   const events: StreamEvent[] = [];
   const reducer: Reducer = {
     legs: [{ venue: 'hyperliquid', symbol: 'ETH' }, { venue: 'phoenix', symbol: 'ETH' }] as unknown as [TradeLeg, TradeLeg],
     lot: 10_000n,
     close: async (req) => {
       calls.push('close');
-      closes.push(req);
+      const { closing, ...rest } = req;
+      closes.push({ ...rest, closingNow: closing?.() });
       await gate.shift();
       const status = results.shift() ?? 'closed';
       return {
@@ -69,7 +70,7 @@ test('closing: cancel resting orders, then close both legs reduce-only, journale
   assert.match(reasons[0]!, /the desk is closing \(panic_close\): no rescue starts/);
   await s.watch.current;
   assert.deepEqual(s.calls, ['cancel', 'close']);
-  assert.deepEqual(s.closes, [{ reason: 'panic_close: the owner closed the desk', reduceOnly: true, by: 'panic_close' }]);
+  assert.deepEqual(s.closes, [{ reason: 'panic_close: the owner closed the desk', reduceOnly: true, by: 'panic_close', fresh: true, closingNow: true }]);
   const j = s.journal();
   assert.equal(j.length, 3);
   assert.match(j[0]!, /^exit: panic_close read from get_desk/);

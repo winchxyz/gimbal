@@ -18,6 +18,7 @@ import type { ContractSide } from './serve-contract.ts';
 import type { CarryInput, ServeOrderly, ServePairDeps, ServePairInput, SlotCarry } from './serve-pair.ts';
 import { liveLines, pairRefreshesAtOpen, servePair } from './serve-pair.ts';
 import { adlGate, openGateText } from './serve-loop.ts';
+import { SWEEP_POLL_MS } from './orderly-sweep.ts';
 import { ConfigError } from './start-errors.ts';
 
 const CONTRACT = 'gimbal-test.near';
@@ -335,6 +336,33 @@ test('panic_close\'s cancelResting cancels every resting order on a policy coin 
     w.openOrders = [{ coin: 'XLM', side: 'A', sz: '5', oid: 4 }];
     await assert.rejects(p.cancelResting!(), /serve is stopping and its trader lock is released: nothing is cancelled/);
     assert.equal(w.cancels.length, 2);
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+test('panic_close on an alert-only slot still cancels resting orders: the lock is taken for the cancels and let go', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
+  try {
+    open(w);
+    // A start not confirmed (open orders unreadable), then a retry that lands alert only on a resting XLM order.
+    w.openOrders = 'HTTP 500';
+    const p = await servePair(input(w));
+    w.openOrders = [{ coin: 'XLM', side: 'B', sz: '10', oid: 42 }];
+    assert.match(await p.retryStart!() ?? '', /XLM alert only/);
+    assert.equal(p.pair?.live, false);
+    assert.equal(existsSync(lockPath(w)), false, 'alert only holds no lock');
+    const r = await p.cancelResting!();
+    assert.equal(r.cancelled, 1);
+    assert.deepEqual(w.cancels, [{ asset: 7, oid: 42 }]);
+    assert.equal(existsSync(lockPath(w)), false, 'the lock went back after the cancels');
+    // pair-mainnet --send holding the lock: nothing is cancelled under it.
+    mkdirSync(dirname(lockPath(w)), { recursive: true });
+    writeFileSync(lockPath(w), lockText({ pid: process.ppid, startedMs: 1, id: 'pair-mainnet', boot: THIS_PROCESS.boot }));
+    await assert.rejects(p.cancelResting!(), /the trader lock is not held: .*nothing is cancelled/);
+    assert.equal(w.cancels.length, 1);
+    assert.equal(parseLockText(readFileSync(lockPath(w), 'utf8'))?.id, 'pair-mainnet', 'the other process\'s lock is left alone');
+    p.stop();
   } finally {
     rmSync(w.dir, { recursive: true, force: true });
   }
@@ -1382,6 +1410,105 @@ test('a panic_close sweep that took the lock never lets it go under a start retr
     assert.equal(parseLockText(readFileSync(lockPath(o.w), 'utf8'))?.id, THIS_PROCESS.id, 'the live pair holds the lock: pair-mainnet --send cannot start beside it');
     sp.stop();
     assert.equal(existsSync(lockPath(o.w)), false);
+  } finally {
+    rmSync(o.w.dir, { recursive: true, force: true });
+  }
+});
+
+test('a start retry that lands alert only during a sweep keeps the lock until the sweep ends; a sweep whose signing fails gives it back', async () => {
+  const ol = new Leg('orderly', 'PERP_XLM_USDC');
+  const eth = new Leg('orderly', 'PERP_ETH_USDC');
+  const o = orderlyWorld([ol, eth]);
+  try {
+    savedPair(o.w);
+    o.w.hl.pos = toQty('-50');
+    o.w.px.pos = toQty('50');
+    eth.pos = toQty('2');                                    // held on Orderly, no pair trader's leg
+    mkdirSync(dirname(lockPath(o.w)), { recursive: true });
+    writeFileSync(lockPath(o.w), lockText({ pid: process.ppid, startedMs: 1, id: 'pair-mainnet', boot: THIS_PROCESS.boot }));
+    const sp = await servePair(o.make(true));
+    assert.match(sp.unconfirmed!() ?? '', /the trader lock is not held/);
+    rmSync(lockPath(o.w));                                   // pair-mainnet exits
+
+    // The sweep takes the free lock, and the signing client fails: the lock goes back, nothing is sent.
+    o.w.signingFails = new Error('NEAR RPC down');
+    const failed = await sp.reducer()!.close({ ...PANIC, fresh: true, closing: () => true });
+    assert.notEqual(failed.status, 'closed');
+    assert.match(failed.notes.join(' '), /the desk's Orderly positions are not closed: the signing contract client: NEAR RPC down/);
+    assert.equal(existsSync(lockPath(o.w)), false, 'the lock the sweep took went back');
+    assert.equal(eth.orders.length, 0);
+    o.w.signingFails = null;
+
+    // The sweep takes the lock again and holds its Orderly order there.
+    let sweepGo: () => void = () => {};
+    let sent = false;
+    eth.hold = () => {
+      sent = true;
+      return new Promise<void>((r) => {
+        sweepGo = r;
+      });
+    };
+    const settle = async (done: () => boolean) => {
+      for (let n = 0; n < 500 && !done(); n++) await new Promise((r) => setImmediate(r));
+    };
+    const closing = sp.reducer()!.close({ ...PANIC, closing: () => true });
+    await settle(() => sent);
+    assert.equal(parseLockText(readFileSync(lockPath(o.w), 'utf8'))?.id, THIS_PROCESS.id, 'the sweep holds the lock');
+
+    // A start retry lands alert only (a resting order on the pair's coin) while the sweep's order is out.
+    o.w.openOrders = [{ coin: 'XLM', side: 'B', sz: '10', oid: 42 }];
+    assert.match(await sp.retryStart!() ?? '', /XLM alert only/);
+    assert.equal(sp.pair?.live, false);
+    assert.equal(parseLockText(readFileSync(lockPath(o.w), 'utf8'))?.id, THIS_PROCESS.id, 'not let go under the sweep');
+    sweepGo();
+    await closing;
+    await ticks();
+    assert.equal(eth.pos, 0n);
+    assert.equal(existsSync(lockPath(o.w)), false, 'the sweep gave it back: nothing here trades');
+    sp.stop();
+  } finally {
+    rmSync(o.w.dir, { recursive: true, force: true });
+  }
+});
+
+test('the strategy loop\'s open while ClosingWatch still reads closing leaves the replay watch on: a copy that lands later is closed', async () => {
+  const ol = new Leg('orderly', 'PERP_XLM_USDC');
+  const eth = new Leg('orderly', 'PERP_ETH_USDC');
+  const o = orderlyWorld([ol, eth]);
+  try {
+    const i = o.make(true);
+    // The watch's reads wait for the test; every other sleep runs at once.
+    let wake: (() => void) | null = null;
+    let reads = 0;
+    i.sleep = async (ms) => {
+      if (ms !== SWEEP_POLL_MS) return;
+      reads++;
+      await new Promise<void>((r) => {
+        wake = r;
+      });
+    };
+    const sp = await servePair(i);
+    const opened = await sp.hands!.open({ symbol: 'XLM', long: 'orderly', short: 'hyperliquid', legUsd: 10, leverage: 1.5, reason: 'strategy: enter' });
+    assert.equal(opened.ok, true, opened.reason);
+    eth.pos = toQty('2');
+    const r = await sp.reducer()!.close({ ...PANIC, fresh: true, closing: () => true });
+    assert.equal(r.status, 'closed', r.notes.join('; '));
+    assert.equal(eth.pos, 0n);
+    await ticks();
+    assert.equal(reads, 1, 'the watch waits on its first read');
+
+    // The loop opens while the desk still reads closing (the paused desk refuses the open itself).
+    o.w.refuse = ['the desk is paused: nothing sent'];
+    const again = await sp.hands!.open({ symbol: 'XLM', long: 'orderly', short: 'hyperliquid', legUsd: 10, leverage: 1.5, reason: 'strategy: enter' });
+    assert.equal(again.ok, false);
+    eth.pos = toQty('2');                                    // a replayed copy of the sweep's IOC... or of the open's
+    (wake as (() => void) | null)?.();
+    for (let n = 0; n < 500 && eth.pos !== 0n; n++) await new Promise((res) => setImmediate(res));
+    assert.equal(eth.pos, 0n, 'the watch went on and closed it');
+    assert.ok(o.events.some((e) => e.type === 'journal' && /came back after the sweep/.test(e.data.summary)));
+    sp.stop();
+    (wake as (() => void) | null)?.();
+    await ticks();
   } finally {
     rmSync(o.w.dir, { recursive: true, force: true });
   }

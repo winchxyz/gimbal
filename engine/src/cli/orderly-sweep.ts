@@ -8,18 +8,26 @@
 // less the price band as the trader splits them. Which markets the pair trader holds (`covered`) is asked anew on each
 // sweep and each watch round.
 //
-// A position whose reduce-only order filled nothing (a rejected order, an IOC with an empty book, a market Orderly
-// dropped) is not tried again until the desk's `closing` ends (unpause, then panic_close again to retry): nothing signs
-// over and over on a market that does not take it.
+// A position whose signed reduce-only order left it where it was (a rejection, a rate limit, a stale price, an IOC
+// with an empty book, a market Orderly dropped, an unknown timeout) counts a failed try. panic_close's own retry (every
+// 60 s) sweeps it again, SWEEP_TRIES_PER_CLOSING times per panic_close, then at most every SWEEP_BACKOFF_MS while the
+// desk stays closing: a market that does not take an order is not signed over and over, and one that refused once is
+// still closed when it takes one. A close that ends flat clears its count. The replay watch never closes a market with
+// a failed try (panic_close's retry does). Every count, and the watch's rounds, start again on each new panic_close
+// (`fresh`), and once the desk reads not closing.
 //
 // The replay watch: a signed Orderly order can be sent again by anyone for 300 s, a copy of the open's IOC included.
 // Each sweep watches from its own start for REPLAY_WINDOW_MS (never from the orders it sends): every SWEEP_POLL_MS it
-// reads the desk's Orderly positions, and one that comes back (held now, flat or absent at the last look) is closed
-// and journaled, at most SWEEP_MAX_WATCH_ROUNDS times. It stops at the end of its window, on stop(), on endWatch()
-// (the strategy loop opens), and once `closing` reads false. A sweep and a watch round run one at a time.
+// looks at the desk's Orderly positions, and one that comes back (held now, flat or absent at the last look) is closed
+// and journaled, at most SWEEP_MAX_WATCH_ROUNDS times. Whether the desk is still closing is ClosingWatch's own read of
+// get_desk (the request's `closing`), not a read of its own. The watch stops at the end of its window, on stop(), and
+// once `closing` reads false; endWatch() (the strategy loop opens) stops it only then too. A sweep and a watch round
+// run one at a time.
 //
-// With no session, the sweep closes nothing: it says so in its result when the saved trader state holds an Orderly
-// leg (panic_close journals it as an error and tries again every 60 s), and "nothing on Orderly to close" when not.
+// With no session, the sweep closes nothing. It is done ("nothing on Orderly to close") only when the saved trader
+// state is of a pair with no Orderly leg; otherwise it is not (panic_close journals it as an error and tries again every
+// 60 s): "nothing known on Orderly" when the state's Orderly leg is flat and no order is in the replay window, or there
+// is no state, and that the leg may be held when not.
 // A rescue's reduce never uses the sweep (Reducer.panicOnly while no pair trader holds the legs).
 
 import type { StreamEvent, TxRef } from '@gimbal/shared';
@@ -35,6 +43,10 @@ import type { OrderlyLegSpec } from './pair-ops.ts';
 
 /** How often the desk's Orderly positions are read while a sweep's window is open. */
 export const SWEEP_POLL_MS = 15_000;
+/** Failed tries (a signed close that left the position where it was) per market and panic_close before the backoff. */
+export const SWEEP_TRIES_PER_CLOSING = 3;
+/** After those: one try per market at most this often while the desk stays closing. */
+export const SWEEP_BACKOFF_MS = 300_000;
 /** Reduce-only orders one position's close may send (each under the policy cap). */
 export const SWEEP_MAX_ORDERS = 8;
 /** Watch rounds that close a position that came back, per panic_close; the watch stops after them. */
@@ -43,12 +55,13 @@ export const SWEEP_MAX_WATCH_ROUNDS = 3;
 export interface OrderlySweepInput {
   /** serve's Orderly session; undefined: serve has none, and nothing on Orderly is read or closed here. */
   session: { leg(spec: OrderlyLegSpec): TradeLeg | null; account(): Promise<AccountState> } | undefined;
-  /** With no session: whether the saved trader state holds an Orderly leg that may be open (unknown counts as yes). */
-  heldKnown(): boolean;
+  /**
+   * With no session, what the saved trader state says of Orderly: 'none' (a pair with no Orderly leg), 'flat' (its
+   * Orderly leg flat with no order in the replay window, or no state file), 'open' (it may be held; unknown counts).
+   */
+  heldKnown(): 'none' | 'flat' | 'open';
   /** The Orderly markets (PERP_X_USDC) the live pair trader holds and closes itself, now. */
   covered(): readonly string[];
-  /** The desk's `closing` (get_desk) now; null: unknown (the watch goes on). */
-  closing(): Promise<boolean | null>;
   /** The leg spec of an Orderly market, its stored price refreshed first; null: not one the desk can price. */
   spec(symbol: string): OrderlyLegSpec | null;
   /** Before anything is signed: the trader lock and the signing client; why not, or null. */
@@ -75,6 +88,20 @@ export interface SweepResult {
 
 type Session = NonNullable<OrderlySweepInput['session']>;
 
+/** What panic_close says with its sweep (Reducer.close's request). */
+export interface SweepRequest {
+  /** The first close of a panic_close (not a retry): every failed-try count and watch round starts again. */
+  fresh?: boolean;
+  /** Whether that panic_close still stands, as ClosingWatch last read get_desk. */
+  closing?: () => boolean;
+}
+
+interface Tries {
+  count: number;
+  lastAt: number;
+  why: string;
+}
+
 export class OrderlySweep {
   readonly #o: OrderlySweepInput;
   #queue: Promise<unknown> = Promise.resolve();
@@ -84,8 +111,10 @@ export class OrderlySweep {
   #ended = false;
   #seq = 0;
   #rounds = 0;
-  /** Markets whose last reduce-only order filled nothing: not tried again until `closing` ends. */
-  readonly #gaveUp = new Map<string, string>();
+  /** Failed tries per market in this panic_close (see the header). */
+  readonly #tries = new Map<string, Tries>();
+  /** The latest panic_close's `closing` (ClosingWatch's read); null: none seen. */
+  #closingNow: (() => boolean) | null = null;
   /** Markets held (and not covered) at the last look: the watch acts only on one that was not. */
   #held = new Set<string>();
 
@@ -99,13 +128,24 @@ export class OrderlySweep {
   }
 
   /** Every Orderly position the pair trader does not hold, closed reduce-only (after any watch round in flight). */
-  sweep(reason: string): Promise<SweepResult> {
+  sweep(reason: string, request: SweepRequest = {}): Promise<SweepResult> {
+    // Set before the queue: a watch round waiting in it already reads this panic_close's state.
+    if (request.closing !== undefined) this.#closingNow = request.closing;
+    if (request.fresh === true) this.#reset();
     return this.#serial(async () => {
       const start = this.#o.clock.now();
       const session = this.#o.session;
       if (session === undefined) {
-        if (!this.#o.heldKnown()) {
+        const known = this.#o.heldKnown();
+        if (known === 'none') {
           return { closed: true, legs: [], tx: [], notes: ['nothing on Orderly to close: serve has no Orderly session, and the trader state holds no Orderly leg'] };
+        }
+        if (known === 'flat') {
+          // Flat as last saved is not flat now (a leg lost from the state, a replayed order): not done, the alert goes on.
+          return {
+            closed: false, legs: [], tx: [],
+            notes: ['nothing known on Orderly: serve has no Orderly session to read it, and the trader state holds no open Orderly leg (or there is none); check the desk\'s Orderly positions yourself, or start serve with its Orderly session'],
+          };
         }
         return {
           closed: false, legs: [], tx: [],
@@ -123,9 +163,19 @@ export class OrderlySweep {
     });
   }
 
-  /** Ends the watch now (the strategy loop opens: the desk is not closing). */
+  /**
+   * The strategy loop opens: the watch ends, and every count starts again, when the desk is not closing as
+   * ClosingWatch last read it. While it reads closing (the open is refused anyway), nothing changes.
+   */
   endWatch(): void {
+    if (this.#closingNow?.() === true) return;
     this.#until = null;
+    this.#reset();
+  }
+
+  #reset(): void {
+    this.#tries.clear();
+    this.#rounds = 0;
   }
 
   /** Ends the watch for good (serve's stop). */
@@ -155,10 +205,13 @@ export class OrderlySweep {
     else for (const s of held) this.#held.add(s);
     for (const symbol of held) {
       if (only !== null && !only.includes(symbol)) continue;
-      const gave = this.#gaveUp.get(symbol);
-      if (gave !== undefined) {
+      const tried = this.#tries.get(symbol);
+      const wait = tried === undefined ? 0 : this.#wait(tried);
+      if (tried !== undefined && (only !== null || wait > 0)) {
         out.closed = false;
-        out.notes.push(`Orderly ${symbol}: not tried again while the desk is closing (${gave}); unpause, then panic_close again to retry`);
+        out.notes.push(only !== null
+          ? `Orderly ${symbol}: its last close failed (${tried.why}); panic_close's own retry closes it`
+          : `Orderly ${symbol}: ${tried.count} closes failed in this panic_close (last: ${tried.why}); tried again in ${Math.ceil(wait / 1000)} s (at most every ${SWEEP_BACKOFF_MS / 60_000} min while the desk is closing)`);
         continue;
       }
       const spec = this.#o.spec(symbol);
@@ -173,21 +226,23 @@ export class OrderlySweep {
         out.notes.push(`Orderly ${symbol}: serve's Orderly session is not up, so it is not closed`);
         continue;
       }
-      const one = await this.#closeOne(leg, reason);
+      const one = await this.#closeOne(leg, reason, tried);
       out.legs.push(one.report);
       out.tx.push(...one.report.orders.flatMap((o) => o.ref.tx));
       out.notes.push(...one.notes);
-      if (one.flat) this.#held.delete(symbol);
-      else out.closed = false;
+      if (one.flat) {
+        this.#held.delete(symbol);
+        this.#tries.delete(symbol);
+      } else out.closed = false;
     }
     return out;
   }
 
   /**
    * One position to 0 with reduce-only IOCs, each under the cap less the band, read back from the venue after each.
-   * An order that left the position where it was (rejected, or filled nothing) gives the market up until `closing` ends.
+   * A signed order that left the position where it was counts a failed try (see the header) and ends this close.
    */
-  async #closeOne(leg: TradeLeg, reason: string): Promise<{ report: LegReport; notes: string[]; flat: boolean }> {
+  async #closeOne(leg: TradeLeg, reason: string, tried: Tries | undefined): Promise<{ report: LegReport; notes: string[]; flat: boolean }> {
     const report: LegReport = { venue: leg.venue, symbol: leg.symbol, start: 'unknown', target: '0', final: null, orders: [] };
     const notes: string[] = [];
     let pos: bigint | null;
@@ -218,14 +273,22 @@ export class OrderlySweep {
         break;
       }
       if (abs(pos) >= abs(before)) {
-        this.#gaveUp.set(leg.symbol, `its reduce-only ${said} left it at ${signedQtyString(pos)}`);
-        notes.push(`Orderly ${leg.symbol}: the reduce-only ${said} left it at ${signedQtyString(pos)}; not tried again while the desk is closing`);
+        const t: Tries = { count: (tried?.count ?? 0) + 1, lastAt: this.#o.clock.now(), why: `the reduce-only ${said} left it at ${signedQtyString(pos)}` };
+        this.#tries.set(leg.symbol, t);
+        const next = t.count < SWEEP_TRIES_PER_CLOSING ? 'panic_close tries it again on its next retry' : `tried again at most every ${SWEEP_BACKOFF_MS / 60_000} min while the desk is closing`;
+        notes.push(`Orderly ${leg.symbol}: ${t.why} (failed try ${t.count}); ${next}`);
         break;
       }
     }
     report.final = pos === null ? null : signedQtyString(pos);
     if (pos !== null && pos !== 0n) notes.push(`Orderly ${leg.symbol} still holds ${signedQtyString(pos)} after the sweep`);
     return { report, notes, flat: pos === 0n };
+  }
+
+  /** How long a market with failed tries waits before the next (0: tried now). */
+  #wait(t: Tries): number {
+    if (t.count < SWEEP_TRIES_PER_CLOSING) return 0;
+    return Math.max(0, t.lastAt + SWEEP_BACKOFF_MS - this.#o.clock.now());
   }
 
   /** As the pair trader sizes a reduce-only order (PairTrader #chunk): all of it, or the cap less the band, floored to the lot. */
@@ -257,12 +320,10 @@ export class OrderlySweep {
     for (;;) {
       await this.#o.sleep(this.#o.pollMs ?? SWEEP_POLL_MS);
       if (this.#ended || this.#until === null) return;
-      const closing = await this.#o.closing().catch(() => null);
-      if (closing === false) {
-        // Unpaused: this panic_close is over. A later one tries every market again.
+      if (this.#closingNow?.() === false) {
+        // Unpaused (or a newer panic_close, whose own sweep starts its own watch): this one is over.
         this.#until = null;
-        this.#gaveUp.clear();
-        this.#rounds = 0;
+        this.#reset();
         this.#o.log('pair      panic_close sweep watch: the desk is not closing any more; the watch stops');
         return;
       }
@@ -288,7 +349,7 @@ export class OrderlySweep {
     const covered = this.#o.covered();
     const now = account.positions.filter((p) => p.size !== 0 && !covered.includes(p.symbol));
     const nowHeld = new Set(now.map((p) => p.symbol));
-    const back = now.filter((p) => !this.#held.has(p.symbol) && !this.#gaveUp.has(p.symbol));
+    const back = now.filter((p) => !this.#held.has(p.symbol) && !this.#tries.has(p.symbol));
     this.#held = new Set([...this.#held].filter((s) => nowHeld.has(s)));
     if (back.length === 0) return;
     const names = back.map((p) => `${p.symbol} ${p.size}`).join(', ');
@@ -345,7 +406,7 @@ export function panicReducer(pair: Reducer | null, sweep: OrderlySweep, outside:
           failed = err;
         }
       }
-      const swept = await sweep.sweep(request.reason);
+      const swept = await sweep.sweep(request.reason, { ...(request.fresh === undefined ? {} : { fresh: request.fresh }), ...(request.closing === undefined ? {} : { closing: request.closing }) });
       if (pair === null) {
         const left = await outside();
         if (left !== null) {

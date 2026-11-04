@@ -248,6 +248,16 @@ export interface LandingPort {
   find(venue: VenueId, q: VerifiedQuote, sinceMs: number, seen: ReadonlySet<string>, deliveryTx?: readonly string[]): Promise<LedgerEntry | null>;
 }
 
+/** What a protection asks a reducer to close (see Reducer.close). */
+export interface ReduceRequest {
+  reason: string;
+  targets?: [bigint, bigint];
+  reduceOnly?: boolean;
+  by?: 'panic_close' | 'rescue reduce' | 'ADL unwind';
+  fresh?: boolean;
+  closing?: () => boolean;
+}
+
 /** A reducer's close: the pair's two legs, or every position panic_close's Orderly sweep closed (serve-pair). */
 export type ReduceResult = Omit<PairResult, 'legs'> & { legs: LegReport[] };
 
@@ -261,8 +271,12 @@ export interface Reducer {
    * rescue's reduce cannot use it. The rescuer then plans and runs no reduce, as with no reducer.
    */
   readonly panicOnly?: string;
-  /** `by`: which protection closes (the book takes it as an exit or a partial fill outside the loop). */
-  close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean; by?: 'panic_close' | 'rescue reduce' | 'ADL unwind' }): Promise<ReduceResult>;
+  /**
+   * `by`: which protection closes (the book takes it as an exit or a partial fill outside the loop). panic_close's
+   * also say whether this is its first close (`fresh`; a retry is not) and whether the desk is still closing as
+   * ClosingWatch last read it (`closing`), for serve's Orderly sweep.
+   */
+  close(request: ReduceRequest): Promise<ReduceResult>;
 }
 
 export interface RescuerOptions {

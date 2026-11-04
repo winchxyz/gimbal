@@ -1,7 +1,9 @@
 // panic_close's Orderly sweep: every Orderly position the pair trader does not hold is closed reduce-only through the
-// session (split under the cap less the band, read back after each order); a market whose order filled nothing is not
-// tried again while the desk is closing; the watch runs from each sweep's start only, acts on a position that came
-// back, at most SWEEP_MAX_WATCH_ROUNDS times, asks `covered` anew, and stops once `closing` ends; sweeps and watch
+// session (split under the cap less the band, read back after each order); a refused close is tried again on
+// panic_close's retry with a backoff, never by the watch, and every count starts again on a new panic_close or once the
+// desk is not closing; the watch runs from each sweep's start only, acts on a position that came back, at most
+// SWEEP_MAX_WATCH_ROUNDS times, asks `covered` anew, stops once `closing` ends, and endWatch is a no-op while the desk
+// still reads closing; sweeps and watch
 // rounds run one at a time; no session or no lock closes nothing and says so; and the panic reducer closes the pair
 // first, leaves a rescue's reduce to the pair, and with no pair is panicOnly.
 
@@ -15,7 +17,7 @@ import { toQty } from '../trade/lots.ts';
 import { REPLAY_WINDOW_MS } from '../trade/pair.ts';
 import type { AccountState } from '../venues/venue.ts';
 import type { OrderlySweepInput } from './orderly-sweep.ts';
-import { OrderlySweep, SWEEP_MAX_WATCH_ROUNDS, SWEEP_POLL_MS, panicReducer } from './orderly-sweep.ts';
+import { OrderlySweep, SWEEP_BACKOFF_MS, SWEEP_MAX_WATCH_ROUNDS, SWEEP_POLL_MS, SWEEP_TRIES_PER_CLOSING, panicReducer } from './orderly-sweep.ts';
 
 class Leg implements TradeLeg {
   readonly venue: VenueId = 'orderly';
@@ -26,6 +28,8 @@ class Leg implements TradeLeg {
   cap: bigint;
   /** The IOC fills nothing (an empty book, a market Orderly dropped): signed, and the venue answers no fill. */
   dead = false;
+  /** The next this many IOCs fill nothing (a rate limit, a stale price): signed, and refused for now. */
+  refuse = 0;
   /** Orders in flight now, and the most at once (sweeps and watch rounds must not overlap). */
   inFlight = 0;
   most = 0;
@@ -49,6 +53,10 @@ class Leg implements TradeLeg {
     this.inFlight--;
     this.orders.push({ side, size, reduceOnly, reason });
     const ref = { venue: 'orderly' as const, side, size: String(size), reduceOnly, orderId: `o${this.orders.length}`, clientId: null, tx: [{ chain: 'near' as const, id: `t${this.orders.length}`, url: '' }], sentAt: 0 };
+    if (this.refuse > 0) {
+      this.refuse--;
+      return { kind: 'failed', error: new NothingExecuted('orderly', 'rate limited'), ref };
+    }
     if (this.dead) return { kind: 'failed', error: new NothingExecuted('orderly', 'the IOC filled nothing'), ref };
     this.pos += side === 'BUY' ? size : -size;
     return { kind: 'filled', filled: size, avgPx: 1, fee: 0.01, ref };
@@ -58,7 +66,7 @@ class Leg implements TradeLeg {
 interface Options {
   session?: boolean;
   begin?: string | null;
-  heldKnown?: boolean;
+  heldKnown?: 'none' | 'flat' | 'open';
 }
 
 function setup(legs: Leg[], options: Options = {}) {
@@ -72,12 +80,12 @@ function setup(legs: Leg[], options: Options = {}) {
       symbol: l.symbol, size: Number(l.pos) / 1e8, entryPx: 1, liqPx: null, marginUsd: 1, unrealizedPnlUsd: 0, leverage: 1, fundingSinceOpenUsd: 0, unsettledFundingUsd: 0,
     })),
   });
-  const world = { covered: [] as string[], closing: true as boolean | null, onSleep: null as (() => void) | null, polls: 0 };
+  // `closing`: ClosingWatch's read of get_desk, handed to each sweep (the request's `closing`).
+  const world = { covered: [] as string[], closing: true, onSleep: null as (() => void) | null, polls: 0 };
   const input: OrderlySweepInput = {
     session: options.session === false ? undefined : { leg: (spec) => bySymbol.get(spec.symbol) ?? null, account },
-    heldKnown: () => options.heldKnown ?? true,
+    heldKnown: () => options.heldKnown ?? 'open',
     covered: () => world.covered,
-    closing: async () => world.closing,
     spec: (symbol) => (symbol.startsWith('PERP_') ? { symbol, oraclePx: async () => 1, maxNotionalUsd: 100, slippageBps: 50 } : null),
     begin: async () => {
       marks.push('begin');
@@ -94,7 +102,10 @@ function setup(legs: Leg[], options: Options = {}) {
     log: () => {},
     publish: (e) => events.push(e),
   };
-  return { sweep: new OrderlySweep(input), events, marks, world, now: () => now };
+  const sweep = new OrderlySweep(input);
+  /** A panic_close's sweep as ClosingWatch asks for it (`fresh`: its first close, not a retry). */
+  const go = (reason: string, fresh = false) => sweep.sweep(reason, { fresh, closing: () => world.closing });
+  return { sweep, go, events, marks, world, now: () => now, advance: (ms: number) => void (now += ms) };
 }
 
 const journal = (events: StreamEvent[]) => events.flatMap((e) => (e.type === 'journal' ? [e.data.summary] : []));
@@ -123,7 +134,7 @@ test('the watch runs from the sweep\'s start only (its own orders never extend i
   s.world.onSleep = () => {
     if (s.world.polls === 2) eth.pos = toQty('3');            // a replayed copy of the open's IOC lands
   };
-  assert.equal((await s.sweep.sweep('panic_close')).closed, true);
+  assert.equal((await s.go('panic_close')).closed, true);
   assert.ok(s.sweep.watch !== null, 'watched after the sweep');
   await s.sweep.watch;
   assert.equal(eth.pos, 0n);
@@ -132,21 +143,70 @@ test('the watch runs from the sweep\'s start only (its own orders never extend i
   assert.equal(s.world.polls, POLLS, 'the window ended REPLAY_WINDOW_MS after the sweep\'s start, the watch\'s own close not counted');
 });
 
-test('a market whose reduce-only order filled nothing is not tried again while the desk is closing: no signing every round', async () => {
+test('a refused close is tried again on panic_close\'s retry: a transient refusal, then the close', async () => {
+  const eth = new Leg('PERP_ETH_USDC', '3');
+  eth.refuse = 1;
+  const s = setup([eth]);
+  const r = await s.go('panic_close', true);
+  assert.equal(r.closed, false);
+  assert.match(r.notes.join(' '), /the reduce-only SELL 3 reduce-only: failed \(.*rate limited\) left it at 3 \(failed try 1\); panic_close tries it again on its next retry/);
+  // The watch never signs it (no watch round began); panic_close's 60 s retry does, and it closes.
+  s.advance(60_000);
+  const again = await s.go('panic_close');
+  assert.equal(again.closed, true, again.notes.join('; '));
+  assert.equal(eth.pos, 0n);
+  assert.equal(eth.orders.length, 2);
+  await s.sweep.watch;
+  assert.deepEqual(s.marks, ['begin', 'end', 'begin', 'end']);
+  assert.deepEqual(journal(s.events), []);
+});
+
+test('a market that keeps refusing: SWEEP_TRIES_PER_CLOSING tries, then one every SWEEP_BACKOFF_MS; the watch never signs it', async () => {
   const eth = new Leg('PERP_ETH_USDC', '3');
   eth.dead = true;
   const s = setup([eth]);
-  const r = await s.sweep.sweep('panic_close');
-  assert.equal(r.closed, false);
-  assert.match(r.notes.join(' '), /the reduce-only SELL 3 reduce-only: failed \(.*the IOC filled nothing\) left it at 3; not tried again while the desk is closing/);
-  assert.equal(eth.orders.length, 1);
-  // panic_close's 60 s retry, and the whole watch window: nothing more is signed, the lock is not taken again.
-  const again = await s.sweep.sweep('panic_close');
-  assert.match(again.notes.join(' '), /Orderly PERP_ETH_USDC: not tried again while the desk is closing \(.*\); unpause, then panic_close again to retry/);
+  for (let n = 1; n <= SWEEP_TRIES_PER_CLOSING; n++) {
+    const r = await s.go('panic_close', n === 1);
+    assert.equal(r.closed, false);
+    assert.match(r.notes.join(' '), new RegExp(`failed try ${n}\\); ${n < SWEEP_TRIES_PER_CLOSING ? 'panic_close tries it again' : 'tried again at most every 5 min'}`));
+    s.advance(60_000);
+  }
+  assert.equal(eth.orders.length, SWEEP_TRIES_PER_CLOSING);
+  // The next 60 s retries within the backoff sign nothing.
+  const held = await s.go('panic_close');
+  assert.match(held.notes.join(' '), new RegExp(`Orderly PERP_ETH_USDC: ${SWEEP_TRIES_PER_CLOSING} closes failed in this panic_close \\(last: .*\\); tried again in \\d+ s`));
   await s.sweep.watch;
-  assert.equal(eth.orders.length, 1);
-  assert.deepEqual(s.marks, ['begin', 'end', 'begin', 'end'], 'no watch round began: the position never came back, it stayed');
-  assert.deepEqual(journal(s.events), []);
+  assert.equal(eth.orders.length, SWEEP_TRIES_PER_CLOSING, 'nothing signed in the backoff, the watch included');
+  // After the backoff it is tried again, and closes once the venue takes it.
+  s.advance(SWEEP_BACKOFF_MS);
+  eth.dead = false;
+  assert.equal((await s.go('panic_close')).closed, true);
+  assert.equal(eth.pos, 0n);
+  await s.sweep.watch;
+});
+
+test('every count starts again on a new panic_close (fresh) and on endWatch once the desk is not closing', async () => {
+  const eth = new Leg('PERP_ETH_USDC', '3');
+  eth.dead = true;
+  const s = setup([eth]);
+  for (let n = 0; n < SWEEP_TRIES_PER_CLOSING; n++) await s.go('panic_close', n === 0);
+  assert.equal(eth.orders.length, SWEEP_TRIES_PER_CLOSING);
+  // An unpause and a new panic_close inside one watch read: the new one's first close tries it at once.
+  await s.go('panic_close', true);
+  assert.equal(eth.orders.length, SWEEP_TRIES_PER_CLOSING + 1);
+  for (let n = 1; n < SWEEP_TRIES_PER_CLOSING; n++) await s.go('panic_close');
+  assert.equal(eth.orders.length, 2 * SWEEP_TRIES_PER_CLOSING);
+  // endWatch while ClosingWatch reads closing: nothing changes.
+  s.sweep.endWatch();
+  await s.go('panic_close');
+  assert.equal(eth.orders.length, 2 * SWEEP_TRIES_PER_CLOSING, 'still in the backoff');
+  // Not closing any more (an unpause the loop read before it opens): endWatch starts every count again.
+  s.world.closing = false;
+  s.sweep.endWatch();
+  s.world.closing = true;
+  await s.go('panic_close');
+  assert.equal(eth.orders.length, 2 * SWEEP_TRIES_PER_CLOSING + 1, 'tried at once after the reset');
+  await s.sweep.watch;
 });
 
 test('the watch closes at most SWEEP_MAX_WATCH_ROUNDS positions that came back, then stops and says so', async () => {
@@ -155,7 +215,7 @@ test('the watch closes at most SWEEP_MAX_WATCH_ROUNDS positions that came back, 
   s.world.onSleep = () => {
     eth.pos = toQty('1');                                     // it comes back before every read
   };
-  await s.sweep.sweep('panic_close');
+  await s.go('panic_close');
   await s.sweep.watch;
   assert.equal(eth.orders.length, 1 + SWEEP_MAX_WATCH_ROUNDS);
   assert.match(journal(s.events).at(-1) ?? '', new RegExp(`came back after the sweep again, after ${SWEEP_MAX_WATCH_ROUNDS} closes: the watch stops`));
@@ -165,7 +225,7 @@ test('the watch closes at most SWEEP_MAX_WATCH_ROUNDS positions that came back, 
 test('the watch asks covered anew: a pair the loop opened meanwhile keeps its Orderly leg; closing ending stops it and a later panic_close retries', async () => {
   const xlm = new Leg('PERP_XLM_USDC', '0');
   const s = setup([xlm]);
-  await s.sweep.sweep('panic_close');
+  await s.go('panic_close');
   s.world.onSleep = () => {
     if (s.world.polls === 2) {
       s.world.covered = ['PERP_XLM_USDC'];                    // a new pair's trader holds XLM now
@@ -175,24 +235,39 @@ test('the watch asks covered anew: a pair the loop opened meanwhile keeps its Or
   await s.sweep.watch;
   assert.deepEqual([xlm.orders.length, xlm.pos], [0, toQty('4')], 'the pair\'s own leg is left to its trader');
 
-  // closing ends (unpause): the watch stops at its next read, and a market given up is tried again next time.
+  // closing ends (unpause): the watch stops at its next read, and every count starts again.
   const eth = new Leg('PERP_ETH_USDC', '2');
   eth.dead = true;
   const t = setup([eth]);
-  await t.sweep.sweep('panic_close');
+  for (let n = 0; n < SWEEP_TRIES_PER_CLOSING; n++) await t.go('panic_close', n === 0);
+  const before = t.world.polls;
   t.world.closing = false;
   await t.sweep.watch;
-  assert.ok(t.world.polls <= 2, 'stopped at its next read');
+  assert.ok(t.world.polls - before <= 2, 'stopped at its next read');
   eth.dead = false;
-  assert.equal(eth.orders.length, 1);
+  assert.equal(eth.orders.length, SWEEP_TRIES_PER_CLOSING);
   t.world.closing = true;
-  assert.equal((await t.sweep.sweep('panic_close')).closed, true, 'the next panic_close tries it again');
+  assert.equal((await t.go('panic_close')).closed, true, 'a retry, no backoff: the counts started again');
   assert.equal(eth.pos, 0n);
   await t.sweep.watch;
 
-  // The strategy loop opens: endWatch stops it at once.
+  // The strategy loop opens (endWatch) while ClosingWatch still reads closing: the watch goes on, and closes a copy.
+  const back = new Leg('PERP_ETH_USDC', '1');
+  const v = setup([back]);
+  v.world.onSleep = () => {
+    if (v.world.polls === 3) back.pos = toQty('1');
+  };
+  await v.go('panic_close', true);
+  v.sweep.endWatch();
+  await v.sweep.watch;
+  assert.equal(back.pos, 0n);
+  assert.equal(back.orders.length, 2, 'the watch closed the position that came back');
+  assert.equal(v.world.polls, POLLS);
+
+  // Once it reads not closing, endWatch stops it at once.
   const u = setup([new Leg('PERP_ETH_USDC', '1')]);
-  await u.sweep.sweep('panic_close');
+  await u.go('panic_close', true);
+  u.world.closing = false;
   u.sweep.endWatch();
   await u.sweep.watch;
   assert.ok(u.world.polls <= 2, 'stopped at its next read');
@@ -201,7 +276,7 @@ test('the watch asks covered anew: a pair the loop opened meanwhile keeps its Or
 test('sweeps (and watch rounds) run one at a time: two panic_close sweeps at once send one close', async () => {
   const eth = new Leg('PERP_ETH_USDC', '3');
   const s = setup([eth]);
-  const [a, b] = await Promise.all([s.sweep.sweep('panic_close'), s.sweep.sweep('panic_close retry')]);
+  const [a, b] = await Promise.all([s.go('panic_close'), s.sweep.sweep('panic_close retry')]);
   assert.deepEqual([a.closed, b.closed], [true, true]);
   assert.equal(eth.orders.length, 1);
   assert.equal(eth.most, 1);
@@ -211,8 +286,12 @@ test('sweeps (and watch rounds) run one at a time: two panic_close sweeps at onc
 
 test('sweep: no session (with and without an Orderly leg saved), no lock or signing, or a market it cannot price', async () => {
   const eth = new Leg('PERP_ETH_USDC', '3');
-  const nothing = await setup([eth], { session: false, heldKnown: false }).sweep.sweep('panic_close');
+  const nothing = await setup([eth], { session: false, heldKnown: 'none' }).sweep.sweep('panic_close');
   assert.deepEqual([nothing.closed, nothing.notes], [true, ['nothing on Orderly to close: serve has no Orderly session, and the trader state holds no Orderly leg']]);
+  // A saved Orderly leg that is flat, or no state: nothing known, and not done (the alert goes on).
+  const flat = await setup([eth], { session: false, heldKnown: 'flat' }).sweep.sweep('panic_close');
+  assert.equal(flat.closed, false);
+  assert.match(flat.notes.join(' '), /^nothing known on Orderly: serve has no Orderly session to read it/);
   const none = await setup([eth], { session: false }).sweep.sweep('panic_close');
   assert.equal(none.closed, false);
   assert.match(none.notes.join(' '), /serve has no Orderly session \(GIMBAL_ORDERLY_PAIRS=1\), and the trader state holds an Orderly leg: the desk's Orderly positions are neither read nor closed here, and pair-mainnet cannot close them/);
@@ -223,7 +302,7 @@ test('sweep: no session (with and without an Orderly leg saved), no lock or sign
   assert.equal(locked.sweep.watch, null);
   const odd = new Leg('WEIRD', '1');
   const u = setup([odd]);
-  const w = await u.sweep.sweep('panic_close');
+  const w = await u.go('panic_close');
   assert.deepEqual([w.closed, w.notes], [false, ['Orderly WEIRD: not a market the desk can price, so it is not closed here']]);
   await u.sweep.watch;
   assert.equal(eth.orders.length + odd.orders.length, 0);
@@ -273,7 +352,7 @@ test('panicReducer: panic_close closes the pair, then sweeps the rest; a rescue\
   const u = setup([]);
   assert.equal((await panicReducer(fakePair('unhedged', []), u.sweep).close({ reason: 'panic_close', by: 'panic_close' })).status, 'unhedged');
   await u.sweep.watch;
-  const v = setup([], { session: false, heldKnown: false });
+  const v = setup([], { session: false, heldKnown: 'none' });
   const done = await panicReducer(fakePair('closed', []), v.sweep).close({ reason: 'panic_close', by: 'panic_close' });
   assert.equal(done.status, 'closed');
   assert.match(done.notes.join(' '), /nothing on Orderly to close/);

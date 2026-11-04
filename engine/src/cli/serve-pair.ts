@@ -76,7 +76,7 @@ import type { LegSide, MakerSettings, TradeLeg } from '../trade/legs.ts';
 import { DEFAULT_MAKER, HlLeg } from '../trade/legs.ts';
 import { signedQtyString } from '../trade/lots.ts';
 import type { PairResult } from '../trade/pair.ts';
-import { PairTrader } from '../trade/pair.ts';
+import { PairTrader, REPLAY_WINDOW_MS } from '../trade/pair.ts';
 import { PhoenixLeg, phoenixTraderApi } from '../trade/phoenix-leg.ts';
 import type { PairShape } from '../trade/pair-shape.ts';
 import { PAIR_VENUES, defaultShape, isDefaultShape, makerIndexOf, orderlyPairsOn, pairShape, policyLists, sameShape, shapeRefusal, shapeText } from '../trade/pair-shape.ts';
@@ -473,13 +473,39 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
   // The lock first, in each start attempt (attempt() below): pair-mainnet --send cannot start between the reads and
   // the first save. One that is held is a start not confirmed (tried again), never an exit.
   let lock: TraderLock | null = null;
+  // Who holds the lock: the start (an attempt, then the slot it landed: `startHolds`), and serve's own short users
+  // (panic_close's Orderly sweep, its resting-order cancel: `borrowed`). It goes back once neither holds it.
+  let startHolds = false;
+  let borrowed = 0;
   const release = () => {
     lock?.release();
     lock = null;
   };
+  /** The start lets the lock go (nothing trades): now, or when the last borrower gives it back. */
+  const yieldLock = () => {
+    startHolds = false;
+    if (borrowed === 0) release();
+  };
+  const lockPath = () => traderLockPath(env, input.mode, contractId, input.deskId);
+  /** A short user takes the lock (or shares the start's); why not, or null. Each borrow is given back by returnLock. */
+  const borrowLock = (): string | null => {
+    if (lock === null) {
+      try {
+        lock = acquireTraderLock(lockPath());
+      } catch (err) {
+        return `the trader lock is not held: ${errorMessage(err)} (pair-mainnet --send holds the same lock)`;
+      }
+    }
+    borrowed++;
+    return null;
+  };
+  const returnLock = () => {
+    borrowed = Math.max(0, borrowed - 1);
+    if (borrowed === 0 && !startHolds) release();
+  };
   const stopNone = () => {
     deps.close();
-    release();
+    yieldLock();
   };
 
   try {
@@ -726,11 +752,10 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
      * Throws a ConfigError (serve stops) or a read that failed (the start is not confirmed and is tried again).
      */
     const attempt = async (): Promise<Started> => {
-      // A start attempt owns the lock it finds held, a sweep's included (the sweep then never lets it go).
-      startGen++;
+      // A start attempt holds the lock, one a borrower holds now included (it is not let go while the start holds it).
       if (wantLive && lock === null) {
         try {
-          lock = acquireTraderLock(traderLockPath(env, input.mode, contractId, input.deskId));
+          lock = acquireTraderLock(lockPath());
         } catch (err) {
           throw new Error(`the trader lock is not held: ${errorMessage(err)} (pair-mainnet --send holds the same lock)`);
         }
@@ -740,6 +765,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           journal('error', `pair: ${took}. A serve or pair-mainnet that was killed (an OOM, a SIGKILL, a container restart) leaves its lock behind; nothing else trades this desk now`, { stage: 'lock' });
         }
       }
+      if (wantLive) startHolds = true;
       const saved = store.load();
       const heldOn = new Map<VenueId, string[]>([
         ['hyperliquid', await startRead('hyperliquid', () => deps.hlHeld(evm))],
@@ -812,30 +838,27 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
     let current: Slot | null = null;
 
     // ---- panic_close's Orderly sweep (GIMBAL_ORDERLY_PAIRS=1, trading): orderly-sweep.ts ----
-    // It may sign with no pair trader (a NONE start, a start not confirmed, a pair alert only): it takes the trader
-    // lock and the signing client itself, and gives the lock back after when no pair trades.
-    let sweepLock = false;
-    /** Start attempts begun: a sweep lets go only a lock it took with no start attempt begun since (or running). */
-    let startGen = 0;
-    let sweepGen = -1;
+    // It may sign with no pair trader (a NONE start, a start not confirmed, a pair alert only): it borrows the trader
+    // lock and takes the signing client itself; the lock goes back after when the start does not hold it.
     const sweep = !orderlyOn || !wantLive ? null : new OrderlySweep({
       session: input.orderly,
       heldKnown: () => {
-        // Without the session nothing on Orderly can be read: the saved trader state is all that says one is open.
+        // Without the session nothing on Orderly can be read: the saved trader state is all that says what is there.
         const saved = store.load();
-        if (saved.kind === 'none') return false;
-        if (saved.kind !== 'loaded') return true;
+        if (saved.kind === 'none') return 'flat';
+        if (saved.kind !== 'loaded') return 'open';
         const shape = savedShape(saved.state);
         const i = shape?.legs.findIndex((l) => l.venue === 'orderly') ?? -1;
-        if (i === -1) return false;
+        if (i === -1) return 'none';
         const base = saved.state.trader?.baselines[i];
-        return base === null || (base !== undefined && base !== 0n) || saved.state.inFlight.some((o) => o.index === i);
+        const now = input.clock.now();
+        // An Orderly order signed within REPLAY_WINDOW_MS may still be replayed: the leg may be held again. Every order
+        // is followed by a save, so a save within the window counts as one.
+        const recent = now - saved.state.savedAt < REPLAY_WINDOW_MS;
+        const pendingHere = saved.state.inFlight.some((o) => o.index === i) || (saved.state.trader?.unsettled ?? []).some((u) => u.index === i);
+        return base === null || (base !== undefined && base !== 0n) || pendingHere || recent ? 'open' : 'flat';
       },
       covered: () => (current !== null && current.live() && !stopped ? current.trader.legs.filter((l) => l.venue === 'orderly').map((l) => l.symbol) : []),
-      closing: async () => {
-        const view = await client.getDesk(input.deskId).catch(() => null);
-        return view === null ? null : view.closing === true;
-      },
       spec: (market) => {
         const base = orderlyBaseSymbol(market);
         if (base === null) return null;
@@ -848,30 +871,20 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       },
       begin: async () => {
         if (stopped) return 'serve is stopping: nothing is signed';
-        if (lock === null) {
-          try {
-            lock = acquireTraderLock(traderLockPath(env, input.mode, contractId, input.deskId));
-            sweepLock = true;
-            sweepGen = startGen;
-          } catch (err) {
-            return `the trader lock is not held: ${errorMessage(err)} (pair-mainnet --send holds the same lock)`;
-          }
-        }
+        const why = borrowLock();
+        if (why !== null) return why;
         if (!signing) {
           try {
             ({ client, relayer } = await deps.signing());
             signing = true;
           } catch (err) {
+            returnLock();
             return `the signing contract client: ${errorMessage(err)}`;
           }
         }
         return null;
       },
-      end: () => {
-        // A start attempt that began since the sweep took the lock (or runs now) owns it: it keeps it or lets it go.
-        if (sweepLock && attempting === null && startGen === sweepGen && (current === null || !current.live())) release();
-        sweepLock = false;
-      },
+      end: returnLock,
       bandBps: policy.price_band_bps, clock: input.clock, sleep, log, publish: input.publish,
     });
     /** With no pair trader: what panic_close leaves held on Hyperliquid and Phoenix (null: nothing), read now. */
@@ -914,7 +927,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         return s.lines;
       }
       current = s.slot;
-      if (current !== null && !current.live()) release();
+      if (current !== null && !current.live()) yieldLock();
       return s.lines;
     };
     const unconfirmed = (): string | null => (pending === null ? null : `legs unknown, start not confirmed: ${pending}`);
@@ -989,7 +1002,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           pending = `${errorMessage(err)} (a configuration error: fix it and restart serve; not tried again)`;
           if (retryTimer !== null) clearTimeout(retryTimer);
           retryTimer = null;
-          release();
+          yieldLock();
           log(`pair      start refused: ${pending}`);
           journal('error', `pair start refused: ${pending}`, { stage: 'start' });
           return null;
@@ -1036,16 +1049,25 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
     } else {
       lines.push(`pair      start NOT confirmed: ${pending ?? 'unknown'}; alert only, legs unknown, nothing adopted: serve tries again with backoff (up to ${START_RETRY_MAX_MS / 1000} s) and goes live once two synced reads of both legs agree`);
     }
-    const trading = () => !stopped && lock !== null;
+    const trading = () => !stopped && lock !== null && startHolds;
 
     // The strategy loop's operation in flight (one at a time).
     let operation: Promise<HandsResult> | null = null;
 
     const cancelResting = async (): Promise<CancelResult> => {
       if (stopped) throw new Error('serve is stopping and its trader lock is released: nothing is cancelled');
-      if (lock === null) throw new Error('the trader lock is not held here (another process may trade this desk): nothing is cancelled');
       const unsure = unconfirmed() ?? noneWhy;
       if (unsure !== null || relayer === null) throw new Error(`${unsure ?? 'no signing relayer'}: nothing is cancelled`);
+      // The lock for the cancels (an alert-only slot let it go): pair-mainnet --send does not start under them.
+      const why = borrowLock();
+      if (why !== null) throw new Error(`${why}: nothing is cancelled`);
+      try {
+        return await cancelAll();
+      } finally {
+        returnLock();
+      }
+    };
+    const cancelAll = async (): Promise<CancelResult> => {
       const coin = current?.symbol ?? null;
       const raw = await deps.openOrders(evm);
       if (!Array.isArray(raw)) throw new Error(restingOn(raw, coin ?? '') as string);
