@@ -506,6 +506,20 @@ test('a transfer 1Click has not settled in time is held: only reduces run until 
   assert.equal(s.sent.length, 2, 'd paid');
 });
 
+test('a late delivery to the other leg\'s venue does not stop a rescue this leg needs: it pays', async () => {
+  const s = synthetic({ status: () => ({ status: 'PROCESSING', body: null }) });
+  await run(s.w, trigger({ id: 'a', amountUsd: 30 }));
+  assert.deepEqual(s.w.ended, [['a', false]]);
+  assert.match(s.w.rescuer.held!, /rescue a/);
+  assert.equal(s.sent.length, 1);
+  // a's Hyperliquid delivery settles late, found before the plan of a rescue of the Phoenix leg.
+  s.status = () => ({ status: 'SUCCESS', body: null });
+  await run(s.w, trigger({ id: 'b', venue: 'phoenix', amountUsd: 20 }));
+  assert.ok(s.w.journal().some((j) => /rescue a's \d+\.\d\d USD landed on hyperliquid late/.test(j)));
+  assert.equal(s.sent.length, 2, 'b paid: the late margin is on the other leg');
+  assert.deepEqual(s.w.ended.at(-1), ['b', true]);
+});
+
 test('a delivery 1Click calls SUCCESS but the ledger does not show is held too; a refund ends the hold', async () => {
   const s = synthetic({ reducer: true, noLanding: true });
   await run(s.w, trigger({ id: 'a', amountUsd: 30 }));

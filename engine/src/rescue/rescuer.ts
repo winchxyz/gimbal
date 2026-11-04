@@ -622,6 +622,7 @@ export class Rescuer {
       this.#journal(run, `rescue ${t.id}: ${t.venue} ${t.symbol} needs no margin to reach its watch line; nothing to move`, {});
       return this.#land(run, 0, null);
     }
+    // Late deliveries are keyed by venue only: right while the desk holds one leg per venue.
     const lateUsd = (await this.#settleHolds(evm)).get(t.venue);
     if (lateUsd !== undefined) {
       // An earlier rescue's margin reached this leg just now, and this trigger was sized on a read that may predate it.
