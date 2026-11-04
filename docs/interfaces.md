@@ -1336,6 +1336,7 @@ retries or rebuilds. In particular:
 `{"t": <ms>, "venue": "hyperliquid", "method": "funding", "args": [], "ms": <how long the venue took>, "result": …}`,
 with `"error": "<message>"` in place of `result` when the call threw (replay throws it again). `t` is when the
 answer arrived; replay serves it from that moment on. A `ReplayVenue` answers
-from the file on a virtual clock; `npm run demo` plays a recorded day at ×N speed, with a scripted
-margin squeeze, and its `ReplayContractClient` applies the same policy checks and refusal codes as the
-contract (signatures marked as replay).
+from the file on a virtual clock; `npm run demo` (`tools/demo.mjs`) plays the newest recording, about an hour of
+mainnet answers, at ×10 (`--speed`) with the dashboard, and the Rescue screen's stress test pushes a leg past the
+rescue line. `serve` in replay has no contract client and signs nothing; the tests use `ReplayContractClient`,
+which applies the same policy checks and refusal codes as the contract (signatures marked as replay).

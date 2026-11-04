@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ContractPolicy, VenueId, Window as FundingWindow } from '@gimbal/shared';
 import { scanLine } from '../cli/serve-replay.ts';
-import { VirtualClock } from '../venues/replay.ts';
+import { ReplayMissError, VirtualClock } from '../venues/replay.ts';
 import type { Book, MarketFunding, MarketFundingPoint, VenueReader, WatchReader } from '../venues/venue.ts';
 import { DEFAULT_SCANNER_CONFIG, DEFAULT_STRATEGY } from './config.ts';
 import type { ScannerConfig } from './config.ts';
@@ -391,6 +391,24 @@ test('a desk pair whose book was never read is left out, not shown with zero sli
   assert.equal(w.stale, true);
   assert.equal(w.updatedAt, T0 + 5_000);
   assert.deepEqual(w.checks[0], { ok: false, text: 'Orderly did not answer: numbers from 35 s ago' });
+});
+
+test('replay: a book the recording never captured leaves the pair out, but the venue is not listed as failed', async () => {
+  const { hl, phoenix, orderly } = venues();
+  orderly.books.set('PERP_SOL_USDC', new ReplayMissError('replay orderly: no book("PERP_SOL_USDC") at or before 0'));
+  const clock = new VirtualClock(T0);
+  const { scanner: s, notes } = scanner({ venues: [hl, phoenix, orderly] }, clock);
+  const r = await s.scan();
+  assert.deepEqual(r.scan.failed, []);
+  assert.equal(r.windows.filter((w) => w.longVenue === 'orderly' || w.shortVenue === 'orderly').length, 0);
+  const miss = '1 book not in the recording, their pairs left out: orderly PERP_SOL_USDC';
+  assert.equal(notes.filter((n) => n === miss).length, 1);
+
+  // Asked again on a later scan, it is still missing and still not a failure; the note is not repeated.
+  clock.set(T0 + 40_000);
+  const r2 = await s.scan();
+  assert.deepEqual(r2.scan.failed, []);
+  assert.equal(notes.filter((n) => n === miss).length, 1);
 });
 
 test('the held window is marked and kept whatever its gross; the others carry the cost of switching to them', async () => {
