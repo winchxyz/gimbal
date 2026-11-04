@@ -179,6 +179,15 @@ test('every step has a sentence, and the source never names a withdrawal from a 
   assert.match(stepText('quote', { p, leg: null, line: null }), /\$120\.00 to Hyperliquid margin/);
 });
 
+test('the sign step names MPC only where MPC signs: a reserve rescue is the contract paying with fund_venue', () => {
+  // Phoenix -> Hyperliquid (sol_sign_rescue) and Hyperliquid's routes are MPC-signed transactions.
+  assert.equal(stepText('sign', { p: progress('sign', 5), leg: null, line: 8 }), 'NEAR MPC signs the transfer');
+  assert.equal(stepText('sign', { p: progress('sign', 5, { from: 'hyperliquid', to: 'phoenix' }), leg: null, line: 8 }), 'NEAR MPC signs the transfer');
+  const reserve = stepText('sign', { p: progress('sign', 5, { from: 'reserve' }), leg: null, line: 8 });
+  assert.equal(reserve, 'The contract pays the Intents deposit address from the reserve (fund_venue)');
+  assert.doesNotMatch(reserve, /MPC|sign/i);
+});
+
 test('the quote row keeps what was quoted after landing, while the amount turns to what arrived', () => {
   const landed = progress('landed', 52, { amountUsd: 19.48, sentUsd: 20 });
   assert.equal(stepText('quote', { p: landed, leg: null, line: 8 }), 'NEAR Intents: $20.00 to Hyperliquid margin');
@@ -223,6 +232,18 @@ test('transactions sit at the steps they belong to, and only once that step is r
   assert.deepEqual(ids(progress('sign', 3, { tx: [near] })), ['', '', '', '', 'n1', '', '']);
   assert.deepEqual(ids(progress('deposit', 9, { tx: [near, sol] })), ['', '', '', '', 'n1', 's1', '']);
   assert.deepEqual(ids(progress('landed', 52, { tx: [near, sol, hl] })), ['', '', '', '', 'n1', 's1', 'h1']);
+});
+
+test('paid from the reserve, fund_venue is the deposit, so the Hyperliquid ledger link sits at landed', () => {
+  const ids = (p: RescueProgress) => {
+    const by = txByStep(p, CHAIN_OF[p.to]);
+    return STEPS.map((id) => by[id].map((l) => l.short).join(','));
+  };
+  const near = tx('near', 'n1');
+  const hl = tx('hyperliquid', 'h1');
+  assert.deepEqual(ids(progress('landed', 95, { from: 'reserve', tx: [near, hl] })), ['', '', '', '', 'n1', '', 'h1']);
+  // Out of Phoenix the Solana transfer is the deposit, and the Hyperliquid entry after it the landing, as before.
+  assert.deepEqual(ids(progress('landed', 70, { tx: [near, tx('solana', 's1'), hl] })), ['', '', '', '', 'n1', 's1', 'h1']);
 });
 
 test('a link that is not an http address is left out', () => {

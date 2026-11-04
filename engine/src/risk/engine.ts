@@ -11,6 +11,8 @@
 // again only when its rescue failed (rescueEnded(id, false)) or lapsed (no end reported within RESCUE_LAPSE_MS while the
 // rescuer is not running it: a real rescue can outlast the lapse, and its end then counts), after
 // a backoff of RESCUE_RETRY_MS doubling up to RESCUE_RETRY_MAX_MS. A leg that leaves rescue starts afresh.
+// A landed rescue (rescueEnded(id, true)) starts the leg afresh too, but only on a read that started at or after the
+// landing: a read already under way when the margin landed still shows the leg without it, and would pay it twice.
 //
 // The ADL check runs beside the reads, never inside them: its response trades (an MPC signature can take 120 s, a
 // close several), and reads, rescue triggers and POST /stress must go on meanwhile. One check runs at a time.
@@ -138,12 +140,16 @@ interface LegView {
   lines: Lines;
   level: HealthLevel;
   freeMarginUsd: number;
+  /** When the read these numbers came from started (a venue that did not answer keeps its older read's). */
+  readAt: number;
 }
 
-/** A leg's rescue: the last trigger, when it ended (null: running), and how many came before it. */
+/** A leg's rescue: the last trigger, when it failed (null: running), when it landed, and how many came before it. */
 interface LegRescue {
   trigger: RescueTrigger;
   endedAt: number | null;
+  /** Set once it landed: reads that started before this cannot show the margin it added. */
+  landedAt?: number;
   attempt: number;
 }
 
@@ -241,11 +247,14 @@ export class RiskEngine {
     }
   }
 
-  /** E9: a rescue ended. Landed: the leg starts afresh; failed: it is triggered again after the backoff if still in rescue. */
+  /**
+   * E9: a rescue ended. Landed: the leg starts afresh on the next read that started after now (see the header);
+   * failed: it is triggered again after the backoff if still in rescue.
+   */
   rescueEnded(id: string, landed: boolean): void {
-    for (const [k, r] of this.#rescues) {
+    for (const r of this.#rescues.values()) {
       if (r.trigger.id !== id) continue;
-      if (landed) this.#rescues.delete(k);
+      if (landed) r.landedAt = this.#clock.now();
       else r.endedAt = this.#clock.now();
     }
   }
@@ -282,6 +291,7 @@ export class RiskEngine {
 
   async #tick(): Promise<DeskState | null> {
     let snap: DeskSnapshot;
+    const readAt = this.#clock.now();
     try {
       snap = await this.#o.source.read();
     } catch (err) {
@@ -306,7 +316,7 @@ export class RiskEngine {
     const unread = new Set(snap.reads.filter((r) => r.error !== null).map((r) => r.venue));
     const strategy = this.#o.strategy();
     const views: LegView[] = [];
-    for (const input of snap.legs) views.push(this.#view(input, strategy, t));
+    for (const input of snap.legs) views.push(this.#view(input, strategy, t, readAt));
     // A leg whose venue did not answer keeps its last numbers, and is at least watched: it cannot be seen.
     for (const old of this.#views) {
       if (!unread.has(old.leg.venue) || views.some((v) => v.leg.venue === old.leg.venue && v.leg.symbol === old.leg.symbol)) continue;
@@ -342,7 +352,7 @@ export class RiskEngine {
     })();
   }
 
-  #view(input: LegInput, strategy: StrategyConfig, t: number): LegView {
+  #view(input: LegInput, strategy: StrategyConfig, t: number, readAt: number): LegView {
     const k = key(input.venue, input.symbol);
     const risk = legRisk({ venue: input.venue, account: input.account, position: input.position, markPx: input.markPx });
     let vol = this.#vol.get(k);
@@ -374,7 +384,7 @@ export class RiskEngine {
       feesUsd: input.feesUsd,
       unpriced: input.unpriced,
     };
-    return { leg, risk, lines, level, freeMarginUsd: input.account.freeMarginUsd };
+    return { leg, risk, lines, level, freeMarginUsd: input.account.freeMarginUsd, readAt };
   }
 
   #deskState(snap: DeskSnapshot, views: LegView[], t: number): DeskState {
@@ -409,6 +419,13 @@ export class RiskEngine {
       const k = key(v.leg.venue, v.leg.symbol);
       inRescue.add(k);
       const r = this.#rescues.get(k);
+      if (r?.landedAt !== undefined) {
+        // Read before the margin landed: these numbers do not have it yet, so they say nothing about the leg now.
+        if (v.readAt < r.landedAt) continue;
+        this.#rescues.delete(k);
+        this.#fire(v, views, t, 0);
+        continue;
+      }
       if (r === undefined) {
         this.#fire(v, views, t, 0);
         continue;

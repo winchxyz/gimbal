@@ -479,6 +479,43 @@ test('POST /stress on mainnet: 403 with the reason, nothing stressed', async () 
   });
 });
 
+test('a read that started before a rescue landed triggers nothing; a read that started after it still does', async () => {
+  const desk = new Desk();
+  desk.hlMargin = 150;   // 5.39 % from liquidation, under the 8 % rescue line
+  // When set, a read takes its snapshot at once and answers only once the gate opens (a slow venue read).
+  let gate: Promise<void> | null = null;
+  const source: DeskSource = {
+    read: async () => {
+      const snap = await desk.read();
+      if (gate !== null) await gate;
+      return snap;
+    },
+  };
+  const { risk, triggers, advance } = rig({ desk, source });
+  await risk.tick();
+  assert.equal(triggers.length, 1);
+  const first = triggers[0]!.id;
+
+  let open!: () => void;
+  gate = new Promise<void>((r) => { open = r; });
+  const inFlight = risk.tick();
+  // The margin lands while that read is still out, so its numbers predate the landing.
+  advance(1_000);
+  risk.rescueEnded(first, true);
+  gate = null;
+  open();
+  const stale = (await inFlight)!;
+  assert.ok(stale.legs[0]!.distanceToLiqPct! < 8, 'the late read still shows the leg under its line');
+  assert.equal(triggers.length, 1, 'no second rescue on a read from before the landing');
+
+  // A read that starts after the landing is judged as usual: still under the line, so the leg starts afresh.
+  advance(5_000);
+  await risk.tick();
+  assert.equal(triggers.length, 2);
+  assert.equal(triggers[1]!.attempt, 0);
+  assert.notEqual(triggers[1]!.id, first);
+});
+
 test('a rescue the rescuer is still running never lapses; its late end still counts', async () => {
   const desk = new Desk();
   desk.hlMargin = 150;
