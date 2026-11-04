@@ -52,7 +52,7 @@ export interface Window {
                                              // refused, not stale, every check ok, no veto
   switchCostUsd: number | null;     // cost to rotate from the held window into this one at strategy.legUsd:
                                     // the fills that change, plus moving margin onto this window's venues and
-                                    // back (its net APR leaves those moves out);
+                                    // back (a desk window's net APR with its 7 days in leaves those moves out);
                                     // null when nothing is held or this is the held one
   stale: boolean;                   // a venue it needs did not answer: the numbers are from the last good read
 }
@@ -182,7 +182,10 @@ export interface JournalEntry {
 }
 
 export interface RescueProgress {
-  id: string; from: VenueId | 'reserve'; to: VenueId; amountUsd: number;
+  // amountUsd: at `detect` what the leg needs; from `source` on what the planned transfer sends (a capped or
+  // fixed-size move can be less than the need); at `landed` what reached the margin after 1Click's fees.
+  // sentUsd: what the planned transfer sends, from `source` on and still at `landed` (the quote row keeps it).
+  id: string; from: VenueId | 'reserve'; to: VenueId; amountUsd: number; sentUsd?: number;
   step: 'detect' | 'source' | 'quote' | 'verify' | 'sign' | 'deposit' | 'landed' | 'failed';
   startedAt: number; elapsedS: number; tx: TxRef[];
 }

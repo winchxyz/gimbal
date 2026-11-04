@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { PhoenixHttpError } from '@ellipsis-labs/rise';
 import { phoenixTraderApi } from '../trade/phoenix-leg.ts';
-import { noteDeskAct } from './desk-acts.ts';
+import { DESK_ACT_SETTLE_MS, asDeskAct, noteDeskAct, useDeskActClock } from './desk-acts.ts';
 import { HostBudget, PHOENIX_BUDGET, hostBudget, isReadSkipped, scanRead } from './http-budget.ts';
 import type { BudgetTimers, HostBudgetOptions } from './http-budget.ts';
 import { MARKS_MAX_AGE_MS, PhoenixReader } from './phoenix.ts';
@@ -453,4 +453,36 @@ test('the desk\'s own action (an order, a close, a rescue) ends the reuse of acc
   release();
   await Promise.all([before, joined, after]);
   assert.equal(count('/v1/trader/state/'), 4, 'one for the two before the act, one after it');
+});
+
+test('after an act ends, Phoenix\'s API may lag the chain: answers read in the next DESK_ACT_SETTLE_MS are not reused', async () => {
+  let wall = AT;
+  const restore = useDeskActClock(() => wall);
+  try {
+    const { f, count } = fakeFetch();
+    const clock = new VirtualClock(AT);
+    const { reader: r } = reader(f, {}, clock);
+    // The desk's order, through the relayer's marks; it ends at AT.
+    await asDeskAct(async () => {});
+    // A read 1 s after its end may still show the margin from before it: not handed out again.
+    wall = AT + 1_000;
+    clock.set(AT + 1_000);
+    await r.account(AUTHORITY);
+    assert.equal(count('/v1/trader/state/'), 1);
+    wall = AT + 1_500;
+    clock.set(AT + 1_500);
+    await r.accountWithin(AUTHORITY, 7_000);
+    assert.equal(count('/v1/trader/state/'), 2, 'the read inside the settle is not reused');
+    // Read again past the settle: that one is reused.
+    wall = AT + DESK_ACT_SETTLE_MS;
+    clock.set(AT + DESK_ACT_SETTLE_MS);
+    await r.accountWithin(AUTHORITY, 0);
+    assert.equal(count('/v1/trader/state/'), 3);
+    wall = AT + DESK_ACT_SETTLE_MS + 1_000;
+    clock.set(AT + DESK_ACT_SETTLE_MS + 1_000);
+    await r.accountWithin(AUTHORITY, 7_000);
+    assert.equal(count('/v1/trader/state/'), 3, 'a read after the settle is reused');
+  } finally {
+    restore();
+  }
 });

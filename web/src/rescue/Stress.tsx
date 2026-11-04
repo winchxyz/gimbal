@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import type { Mode } from '@gimbal/shared';
+import { writeControls } from '../remote/readonly.ts';
 import { notify } from '../ui/notice.ts';
 import { stressView } from './model.ts';
 import { sendStress } from './useRescue.ts';
@@ -8,7 +9,7 @@ import { sendStress } from './useRescue.ts';
 export function StressButton({ mode, running }: { mode: Mode | null; running: boolean }) {
   const [sending, setSending] = useState(false);
   const button = stressView(mode, running, sending).button;
-  if (!button) return null;
+  if (!button || !writeControls().stress) return null;
   const onClick = () => {
     setSending(true);
     void sendStress()
@@ -25,6 +26,8 @@ export function StressButton({ mode, running }: { mode: Mode | null; running: bo
 /** The stress test block under the steps: what it does, the button where one may exist, and why not where it may not. */
 export function Stress({ mode, running }: { mode: Mode | null; running: boolean }) {
   const { note } = stressView(mode, running, false);
+  // Read-only view: the whole block is about a button this page does not have.
+  if (!writeControls().stress) return null;
   return (
     <section className="r-stress" aria-label="Stress test">
       <h3>

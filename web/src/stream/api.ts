@@ -202,13 +202,20 @@ export async function readEngineState(base = ''): Promise<EngineState> {
   return parseEngineState(await getJson(`${base}/state`));
 }
 
+/** The four reads, over any way of getting JSON by path: the local engine's, or the remote view's with its token. */
+export function readApi(get: (path: string) => Promise<unknown>): Pick<EngineApi, 'strategy' | 'windowHistory' | 'journal' | 'journalBefore'> {
+  return {
+    strategy: async () => parseStrategy(await get('/strategy')),
+    windowHistory: async (id) => parseHistory(await get(`/windows/history?id=${encodeURIComponent(id)}`)),
+    journal: async () => parseJournal(await get('/state')),
+    journalBefore: async (before) => parseJournalPage(await get(`/journal?before=${encodeURIComponent(before)}`)),
+  };
+}
+
 /** The real engine, through the dev proxy or the same origin in production. */
 export function httpApi(base = ''): EngineApi {
   return {
-    strategy: async () => parseStrategy(await getJson(`${base}/strategy`)),
-    windowHistory: async (id) => parseHistory(await getJson(`${base}/windows/history?id=${encodeURIComponent(id)}`)),
-    journal: async () => parseJournal(await getJson(`${base}/state`)),
-    journalBefore: async (before) => parseJournalPage(await getJson(`${base}/journal?before=${encodeURIComponent(before)}`)),
+    ...readApi((path) => getJson(`${base}${path}`)),
     rotate: (windowId) => postJson(`${base}/rotate`, { windowId }),
     close: () => postJson(`${base}/close`, {}),
     stress: () => postJson(`${base}/stress`, {}),

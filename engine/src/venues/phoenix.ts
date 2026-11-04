@@ -15,7 +15,8 @@ import type {
 } from '@ellipsis-labs/rise';
 import type { BudgetTimers, HostBudget, ReadKind } from './http-budget.ts';
 import { PHOENIX_BUDGET, backgroundScanRead, hostBudget, readClass, requestTimeoutMs } from './http-budget.ts';
-import { deskActEpoch } from './desk-acts.ts';
+import type { DeskActStamp } from './desk-acts.ts';
+import { deskActStamp, stillReusable } from './desk-acts.ts';
 import { errorMessage } from './recorder.ts';
 import type {
   AccountState, Book, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, MarketFundingPoint,
@@ -122,12 +123,12 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
   #lastOverview: Dated<FundingOverviewResponse> | null = null;
   #historyBatches = new Map<string, SharedRead<FundingOverviewResponse>>();
   #stats: SharedRead<LatestMarketsStatsResponse> | null = null;
-  #accounts = new Map<string, SharedRead<PhoenixAccountState> & { epoch: number }>();
+  #accounts = new Map<string, SharedRead<PhoenixAccountState> & { stamp: DeskActStamp }>();
   /**
-   * The last account answer of each authority, when it was asked for, and the desk-act epoch it was asked under
+   * The last account answer of each authority, when it was asked for, and the desk-act stamp it was asked under
    * (accountWithin; an answer from before the desk's own action is not reused, venues/desk-acts.ts).
    */
-  #lastAccount = new Map<string, Dated<PhoenixAccountState> & { epoch: number }>();
+  #lastAccount = new Map<string, Dated<PhoenixAccountState> & { stamp: DeskActStamp }>();
   /** The last marks answer and when it arrived (an account read takes it while MARKS_MAX_AGE_MS old at most). */
   #marks: Dated<LatestMarketsStatsResponse> | null = null;
   readonly #timers: BudgetTimers;
@@ -188,7 +189,7 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
     const authority = normalizeAuthority(address);
     const now = this.#clock.now();
     const joined = this.#accounts.get(authority);
-    if (joined !== undefined && joined.epoch === deskActEpoch() && now >= joined.at && now - joined.at < ACCOUNT_JOIN_MS) {
+    if (joined !== undefined && stillReusable(joined.stamp) && now >= joined.at && now - joined.at < ACCOUNT_JOIN_MS) {
       return shared(joined, () => this.#accountRead(authority));
     }
     return this.#accountRead(authority);
@@ -203,27 +204,27 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
     const last = this.#lastAccount.get(authority);
     const now = this.#clock.now();
     // Not across the desk's own action (an order, a close, a rescue): sizing takes the margin after it.
-    if (last !== undefined && last.epoch === deskActEpoch() && now >= last.at && now - last.at <= maxAgeMs) return last.value;
+    if (last !== undefined && stillReusable(last.stamp) && now >= last.at && now - last.at <= maxAgeMs) return last.value;
     return this.account(authority);
   }
 
   #accountRead(authority: string): Promise<PhoenixAccountState> {
     const at = this.#clock.now();
-    const epoch = deskActEpoch();
+    const stamp = deskActStamp();
     const c = this.#api('account');
     const value = Promise.all([
       c.traders.getTraderStateSnapshot(authority, { traderPdaIndex: this.#traderPdaIndex }),
       this.#marketConfigs(false, 'account'),
       this.#accountMarks(at),
     ]).then(([snapshot, configs, stats]) => parseAccount(snapshot, configs, markPrices(stats), this.#clock.now()));
-    const entry = { at, value, critical: readClass('account') === 'critical', epoch };
+    const entry = { at, value, critical: readClass('account') === 'critical', stamp };
     this.#accounts.set(authority, entry);
     this.#lastAccountAsk = at;
     this.#armMarksRefresh();
     value.then(
       (v) => {
         const last = this.#lastAccount.get(authority);
-        if (last === undefined || at >= last.at) this.#lastAccount.set(authority, { at, value: v, epoch });
+        if (last === undefined || at >= last.at) this.#lastAccount.set(authority, { at, value: v, stamp });
       },
       () => {
         if (this.#accounts.get(authority) === entry) this.#accounts.delete(authority);
@@ -616,6 +617,7 @@ export function parseFunding(
       oraclePx: s?.oracle_price ?? null,
       openInterest: s?.open_interest ?? null,      // base units (the config counts it in base lots)
       volume24hUsd: s?.day_volume_usd ?? null,
+      ...(typeof s?.prev_day_mark_price === 'number' ? { prevDayPx: s.prev_day_mark_price } : {}),
     });
   }
   return out;

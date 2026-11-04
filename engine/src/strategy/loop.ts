@@ -17,9 +17,12 @@
 // How an act is carried out (the hands: serve-pair.ts, pair-mainnet's own code in pair-ops.ts): enter = open the
 // exact quantity decide() sized (a maximum: held to the contract's cap at order time, never raised); exit = close both
 // legs reduce-only; rotate = close the held pair, then open the new one, and when the open is refused the desk stays
-// flat and the journal says so. Before an enter or a rotate the window goes to the NEAR AI veto (veto.ts checkVeto);
-// a veto saves skipAct(…, { vetoed: true }), whose counters hold the window out (vetoedUntil), writes a `veto` entry
-// and signs nothing; the verdict is shown on the window (Window.veto, republished). An act refused before anything was
+// flat and the journal says so. Before an enter or a rotate the window goes to the NEAR AI risk check (veto.ts
+// checkVeto), with the facts serve adds (riskFacts: book depth at the size, the 24 h move, the listing age); a refusal
+// saves skipAct(…, { vetoed: true, why }), whose counters hold the window out (vetoedUntil, vetoWhy), writes a `veto`
+// entry and signs nothing; the verdict is shown on the window (Window.veto, republished). Every check is booked in the
+// risk check ledger (book/risk-ledger.ts), and the decision, the act's journal entry and any refusal after it carry
+// its why line (riskCheckWhy, with the attestation label); a refusal before it says RISK_NOT_ASKED. An act refused before anything was
 // sent is journaled and not tried again for RETRY_AFTER_MS; one that sent orders, or was refused for a passing reason
 // (a rescue running, a close in flight), is tried again on the next check. An open that needs the stored price
 // refreshed pays for one refresh_prices only after its other refusals pass (pair-ops.ts refreshForOpen); one refused
@@ -49,8 +52,12 @@ import { errorMessage } from '../venues/recorder.ts';
 import type { Clock } from '../venues/venue.ts';
 import type { CheckRules, DecideInput, Decision, HeldPair, LoopCounters } from './decide.ts';
 import { LOOP_RULES, NO_COUNTERS, decide as defaultDecide, heldForwardAprPct, journalWait, sizeFor, skipAct } from './decide.ts';
-import type { Veto, VetoLeg, VetoResult, VetoSource } from './veto.ts';
-import { checkVeto, vetoFacts, vetoJournalNumbers } from './veto.ts';
+import type { Veto, VetoLegFacts, VetoResult, VetoSource } from './veto.ts';
+import { checkVeto, replyText, riskCheckWhy, vetoFacts, vetoJournalNumbers } from './veto.ts';
+import type { RiskLedgerSink } from '../book/risk-ledger.ts';
+import { roundTripUsd } from '../book/risk-ledger.ts';
+import { positionIdOf } from '../book/derive.ts';
+import { DEFAULT_SCANNER_CONFIG } from '../scanner/config.ts';
 
 const HOUR_MS = 3_600_000;
 /** Hyperliquid pays funding at the top of the hour: the hourly check is the first scan this long after it. */
@@ -67,6 +74,16 @@ export const REFRESH_HOLD_MS = 6 * HOUR_MS;
 /** At most this many refresh_prices an open of the loop sends per symbol per UTC day (the day's count is saved). */
 export const MAX_OPEN_REFRESHES_PER_DAY = 12;
 export const LOOP_STATE_VERSION = 1;
+
+/** A refusal before the risk check was asked says so. */
+export const RISK_NOT_ASKED = 'NEAR AI risk check: not asked (refused before it)';
+/**
+ * The hold a refused window is priced over in the risk check ledger: the scanner's own hold (the one its net APR is
+ * spread over), at most the time stop.
+ */
+/** A retry of the same act within this long is not booked again in the risk check ledger. */
+export const LEDGER_RETRY_MS = 3_600_000;
+export const LEDGER_HOLD_HOURS = Math.min(DEFAULT_SCANNER_CONFIG.costs.holdHours, LOOP_RULES.maxHoldDays * 24);
 
 /** No NEAR AI here: checkVeto answers "no NEAR AI risk check: NEAR_AI_API_KEY is not set", a pass. */
 export const NO_VETO_SOURCE: VetoSource = {
@@ -317,6 +334,13 @@ export function parseLoopState(v: unknown): LoopFileState {
     lastHourlyAt: time(c.lastHourlyAt, 'lastHourlyAt'), lastWaitReason: c.lastWaitReason as string | null,
     vetoedUntil: c.vetoedUntil === undefined ? {} : record(c.vetoedUntil, 'vetoedUntil', isTime, 'a time'),
   };
+  // vetoWhy is display only (the hold-out is vetoedUntil): a malformed one is dropped, never the whole state; an
+  // entry that is not text is dropped alone.
+  delete counters.vetoWhy;
+  const why = c.vetoWhy as Record<string, unknown> | null | undefined;
+  if (why !== null && typeof why === 'object' && !Array.isArray(why)) {
+    counters.vetoWhy = Object.fromEntries(Object.entries(why).filter((e): e is [string, string] => typeof e[1] === 'string'));
+  }
   let held: LoopHeld | null = null;
   if (o.held !== null && o.held !== undefined) {
     const h = o.held as Record<string, unknown>;
@@ -380,6 +404,14 @@ export interface StrategyLoopOptions {
   /** NEAR AI (NearAiClient) or a recording (RecordedVeto); none = NO_VETO_SOURCE. */
   veto?: VetoSource;
   vetoTimeoutMs?: number;
+  /** How a reply is shown attested: Attestor.label() ("TEE attested <date> UTC" or "TEE not attested: <why>"); none = not fetched. */
+  attestation?: () => string;
+  /** The risk check's facts a window does not carry: each leg's book at the leg's size, 24 h move, listing age. */
+  riskFacts?: (w: FundingWindow, legUsd: number) => Promise<{ long?: VetoLegFacts; short?: VetoLegFacts }>;
+  /** Every risk check outcome (book/risk-ledger.ts); default none. */
+  ledger?: RiskLedgerSink;
+  /** The scanner's grossHours, for the ledger's hourly pricing of refused windows. */
+  grossHours?: (windowId: string, fromMs: number, toMs: number) => { t: number; grossAprPct: number }[] | null;
   /** Every carried-out enter and exit (the position book); default none. */
   book?: BookSink;
 }
@@ -394,6 +426,11 @@ interface ActEnd {
   end: 'done' | 'skipped' | 'vetoed' | 'flat';
   sent: boolean;
   passing: boolean;
+  /** The NEAR AI risk check's why line: on every outcome after it was asked (a refusal keeps it with the hold-out). */
+  why?: string;
+  /** What the act came to, for the risk check ledger: the book's position id it opened, else why it did not open. */
+  positionId?: string | null;
+  result?: string;
   /** Refused after it paid for a refresh_prices (nothing of the open sent): why. The window is held REFRESH_HOLD_MS. */
   paidRefusal?: string;
 }
@@ -414,6 +451,8 @@ export class StrategyLoop {
   #seq = 0;
   /** Window id -> NEAR AI's last verdict, shown on the window until `until` (display only: the hold is vetoedUntil). */
   readonly #verdicts = new Map<string, { veto: Veto; until: number }>();
+  /** Window id -> its last booked risk check (for a retry of the same act: not booked again). */
+  readonly #lastChecks = new Map<string, { id: string; kind: 'enter' | 'rotate'; verdict: string; at: number; opened: boolean }>();
   /** `kind window` -> until when an act refused with nothing sent is not tried again, and the line journaled. */
   readonly #refused = new Map<string, { until: number; reason: string }>();
   #lastSkip: string | null = null;
@@ -595,6 +634,22 @@ export class StrategyLoop {
     return next;
   }
 
+  /**
+   * decide()'s unopenable: the tradable windows the hands refuse (LoopHands.symbolOf: serve's direction rule and the
+   * policy's markets), so the gate passes over them to one the hands can open. No hands: nothing is opened anyway.
+   */
+  #unopenable(windows: readonly FundingWindow[]): Pick<DecideInput, 'unopenable'> {
+    const hands = this.#o.hands;
+    if (hands === undefined || hands === null) return {};
+    const out: Record<string, string> = {};
+    for (const w of windows) {
+      if (!w.tradable) continue;
+      const sym = hands.symbolOf(w);
+      if ('refused' in sym) out[w.id] = sym.refused;
+    }
+    return { unopenable: out };
+  }
+
   async #readFree(): Promise<Record<string, number>> {
     return this.#o.freeMargin().catch((err: unknown) => {
       this.#log(`strategy loop: free margin not read (${errorMessage(err)})`);
@@ -634,6 +689,13 @@ export class StrategyLoop {
     const hourStart = Math.floor(now / HOUR_MS) * HOUR_MS;
     const last = this.#state.counters.lastHourlyAt;
     const hourly = now - hourStart >= HOUR_GRACE_MS && (last === null || last < hourStart);
+    if (hourly && this.#o.ledger !== undefined && this.#o.grossHours !== undefined) {
+      try {
+        this.#o.ledger.hourly(now, this.#o.grossHours);
+      } catch (err) {
+        this.#log(`strategy loop: the refused windows' hours were not booked (${errorMessage(err)})`);
+      }
+    }
 
     // The record against the venues first: a pair recorded while one leg or none is open is corrected (two reads).
     if (this.#o.hands?.reconcile !== undefined && this.#manual === null) {
@@ -661,6 +723,7 @@ export class StrategyLoop {
       counters: before, ...(policy === null ? {} : { priceBandBps: policy.price_band_bps }),
       ...(facts.gross14dAprPct === undefined ? {} : { gross14dAprPct: facts.gross14dAprPct }), ...(facts.lots === undefined ? {} : { lots: facts.lots }),
       ...(freed === undefined ? {} : { freedMarginUsd: freed }),
+      ...this.#unopenable(scanned),
     };
     const d = (this.#o.decide ?? defaultDecide)(input);
     this.#journalDecision(input, d, before);
@@ -678,7 +741,7 @@ export class StrategyLoop {
     this.#saveCounters(skipAct(input, d));
     const r = await this.#act(d, scanned, facts);
     if (r.end === 'done') this.#saveCounters(d.counters);
-    else if (r.end === 'vetoed') this.#saveCounters(skipAct(input, d, { vetoed: true }));
+    else if (r.end === 'vetoed') this.#saveCounters(skipAct(input, d, { vetoed: true, ...(r.why === undefined ? {} : { why: r.why }) }));
     else if (r.end === 'flat') this.#saveCounters({ ...skipAct(input, d), badChecks: 0, betterByWindow: {}, lastExitAt: this.#o.clock.now() });
   }
 
@@ -741,7 +804,7 @@ export class StrategyLoop {
     const key = `${act.kind} ${target}`;
     const now = this.#o.clock.now();
     if (this.#o.hands === null) {
-      this.#refuse(key, `${key} not carried out: no pair trader here: ${this.#o.handsWhy ?? 'nothing can be opened or closed'}`, now);
+      this.#refuse(key, `${key} not carried out: no pair trader here: ${this.#o.handsWhy ?? 'nothing can be opened or closed'}${act.kind === 'exit' ? '' : `; ${RISK_NOT_ASKED}`}`, now);
       return SKIPPED;
     }
     const waiting = this.#refused.get(key);
@@ -754,7 +817,7 @@ export class StrategyLoop {
       } else {
         const w = windows.find((x) => x.id === target);
         if (w === undefined) {
-          this.#refuseOnce(key, `${key} not carried out: the window is not in the last scan`);
+          this.#refuseOnce(key, `${key} not carried out: the window is not in the last scan; ${RISK_NOT_ASKED}`);
           return SKIPPED;
         }
         r = await this.#enterOrRotate({
@@ -767,7 +830,7 @@ export class StrategyLoop {
       // that ended flat comes back as an enter), so a refusal that repeats does not pay again every retry.
       if (r.paidRefusal !== undefined && act.kind !== 'exit') {
         const until = this.#o.clock.now() + REFRESH_HOLD_MS;
-        const line = `${key} held until ${new Date(until).toISOString()}: refused after the open paid for refresh_prices (${r.paidRefusal}); not tried again for ${REFRESH_HOLD_MS / HOUR_MS} h, so a refusal that repeats does not pay again`;
+        const line = `${key} held until ${new Date(until).toISOString()}: refused after the open paid for refresh_prices (${r.paidRefusal}); not tried again for ${REFRESH_HOLD_MS / HOUR_MS} h, so a refusal that repeats does not pay again${r.why === undefined ? '' : `; ${r.why}`}`;
         for (const k of [`enter ${target}`, `rotate ${target}`]) this.#refused.set(k, { until, reason: line });
         this.#journal('refused', line, { window: target, holdHours: REFRESH_HOLD_MS / HOUR_MS });
         return r;
@@ -781,11 +844,29 @@ export class StrategyLoop {
     }
   }
 
-  /** The veto, then (rotate) the close, then the open; the gate is checked right before each. */
+  /**
+   * The NEAR AI risk check, then (rotate) the target's price (prepareOpen, which may pay for a refresh), the close and
+   * the open; the gate is checked right before each. A refusal never costs a refresh. Every outcome after the check
+   * carries its why line, and the act's end is booked against the check in the risk check ledger.
+   */
   async #enterOrRotate(p: {
     fromId: string | null; w: FundingWindow; legUsd: number; leverage: number; qty: string; manual: boolean; reason?: string; key?: string;
     facts?: WindowFacts; hoursAbove?: number;
   }): Promise<ActEnd> {
+    let checked: { checkId: string | null; fresh: boolean; why: string } | null = null;
+    const r = await this.#enterOrRotateChecked(p, (c) => {
+      checked = c;
+    });
+    const c = checked as { checkId: string | null; fresh: boolean; why: string } | null;
+    if (c === null) return r;
+    if (r.end !== 'vetoed') this.#bookAct(c.checkId, c.fresh, r);
+    return { ...r, why: c.why };
+  }
+
+  async #enterOrRotateChecked(p: {
+    fromId: string | null; w: FundingWindow; legUsd: number; leverage: number; qty: string; manual: boolean; reason?: string; key?: string;
+    facts?: WindowFacts; hoursAbove?: number;
+  }, onChecked: (c: { checkId: string | null; fresh: boolean; why: string }) => void): Promise<ActEnd> {
     const hands = this.#o.hands!;
     const { w } = p;
     const kind = p.fromId === null ? 'enter' : 'rotate';
@@ -793,24 +874,26 @@ export class StrategyLoop {
     const key = p.key ?? `${kind} ${w.id}`;
     const sym = hands.symbolOf(w);
     if ('refused' in sym) {
-      this.#refuseOnce(key, `${kind} ${w.id} not carried out: ${sym.refused}`);
+      this.#refuseOnce(key, `${kind} ${w.id} not carried out: ${sym.refused}; ${RISK_NOT_ASKED}`);
       return SKIPPED;
     }
     // NEAR AI first: it can only remove a window.
-    const veto = await this.#veto(w, {
+    const check = await this.#veto(w, {
       kind, legUsd: p.legUsd, leverage: p.leverage, hoursAbove: p.hoursAbove ?? this.#state.counters.aboveByWindow[w.id] ?? 0, facts: p.facts ?? this.#lastFacts,
+      manual: p.manual,
     });
-    if (veto.veto.verdict === 'veto') return { end: 'vetoed', sent: false, passing: false };
+    onChecked({ checkId: check.checkId, fresh: check.fresh, why: check.why });
+    if (check.result.veto.verdict === 'veto') return { end: 'vetoed', sent: false, passing: false, why: check.why };
+    const why = check.why;
     const base = {
       window: w.id, symbol: sym.symbol, legUsd: p.legUsd, leverage: p.leverage, qty: p.qty,
-      netAprPct: round(w.netAprPct), grossAprPct: round(w.grossAprPct), veto: veto.line, by: who,
-      ...(veto.exchange === null ? {} : vetoJournalNumbers(veto.exchange)),
+      netAprPct: round(w.netAprPct), grossAprPct: round(w.grossAprPct), veto: check.result.line, by: who, ...check.numbers,
     };
     if (p.fromId !== null) {
       const gate = this.#gate();
       if (gate !== null) {
-        this.#refuseOnce(key, `rotate ${p.fromId} -> ${w.id} not carried out: ${gate}`);
-        return { ...SKIPPED, passing: true };
+        this.#refuseOnce(key, `rotate ${p.fromId} -> ${w.id} not carried out: ${gate}; ${why}`);
+        return { ...SKIPPED, passing: true, result: `not rotated: ${gate}` };
       }
       // The target's stored price before the held pair is closed: a refresh that fails keeps the pair held, where
       // the open after the close would leave the desk flat.
@@ -818,8 +901,8 @@ export class StrategyLoop {
         const ready = await hands.prepareOpen({ symbol: sym.symbol, ...this.#refreshAllowance(sym.symbol) });
         if (ready.refreshed === true) this.#countRefresh(sym.symbol);
         if (!ready.ok) {
-          this.#journal('refused', `rotate ${p.fromId} -> ${w.id} not carried out: ${ready.reason}; ${p.fromId} is kept, nothing closed`, { ...base, from: p.fromId });
-          return { ...SKIPPED, passing: this.#gate() !== null, ...(ready.refreshed === true ? { paidRefusal: ready.reason } : {}) };
+          this.#journal('refused', `rotate ${p.fromId} -> ${w.id} not carried out: ${ready.reason}; ${p.fromId} is kept, nothing closed; ${why}`, { ...base, from: p.fromId });
+          return { ...SKIPPED, passing: this.#gate() !== null, result: `not rotated: ${ready.reason}`, ...(ready.refreshed === true ? { paidRefusal: ready.reason } : {}) };
         }
       }
       const closeAt = this.#o.clock.now();
@@ -827,8 +910,8 @@ export class StrategyLoop {
       this.#owner(closed.open);
       if (!closed.ok) {
         this.#record('fill', { windowId: p.fromId, symbol: this.#state.held?.symbol ?? '', outcome: closed, forecastNetAprPct: null, exitReason: closed.reason, rotation: null, manual: p.manual, startedAt: closeAt });
-        this.#journal(closed.sent ? 'error' : 'refused', `rotate ${p.fromId} -> ${w.id}: the close of ${p.fromId} ${closed.sent ? 'did not end flat' : 'was refused'}: ${closed.reason}; nothing opened`, { ...base, from: p.fromId, feeUsd: closed.feeUsd }, closed.tx);
-        return { end: 'skipped', sent: closed.sent, passing: false };
+        this.#journal(closed.sent ? 'error' : 'refused', `rotate ${p.fromId} -> ${w.id}: the close of ${p.fromId} ${closed.sent ? 'did not end flat' : 'was refused'}: ${closed.reason}; nothing opened; ${why}`, { ...base, from: p.fromId, feeUsd: closed.feeUsd }, closed.tx);
+        return { end: 'skipped', sent: closed.sent, passing: false, result: `not rotated: the close of ${p.fromId} failed: ${closed.reason}` };
       }
       const fromHeld = this.#state.held;
       this.#record('exit', { windowId: p.fromId, symbol: fromHeld?.symbol ?? '', outcome: closed, forecastNetAprPct: fromHeld?.entryNetAprPct ?? null, exitReason: `rotate into ${w.id}`, rotation: { fromId: p.fromId, toId: w.id }, manual: p.manual, startedAt: closeAt });
@@ -838,8 +921,8 @@ export class StrategyLoop {
     const flat = p.fromId === null ? '' : `; ${p.fromId} was closed, so the desk stays flat`;
     const gate = this.#gate();
     if (gate !== null) {
-      this.#journal('refused', `${kind} ${w.id} not carried out: ${gate}${flat}`, base);
-      return p.fromId === null ? { ...SKIPPED, passing: true } : { end: 'flat', sent: true, passing: true };
+      this.#journal('refused', `${kind} ${w.id} not carried out: ${gate}${flat}; ${why}`, base);
+      return p.fromId === null ? { ...SKIPPED, passing: true, result: `not opened: ${gate}` } : { end: 'flat', sent: true, passing: true, result: `not opened: ${gate}` };
     }
     const openAt = this.#o.clock.now();
     const opened = await hands.open({
@@ -853,29 +936,30 @@ export class StrategyLoop {
       if (opened.sent && after !== null) {
         // Orders went out and the venues hold a position: the desk holds it, the book sees the entry.
         this.#setHeld({ windowId: w.id, symbol: sym.symbol, since: now, legUsd: after.legUsd, entryNetAprPct: w.netAprPct });
-        this.#record('enter', { windowId: w.id, symbol: sym.symbol, outcome: opened, forecastNetAprPct: w.netAprPct, exitReason: null, rotation: p.fromId === null ? null : { fromId: p.fromId, toId: w.id }, manual: p.manual, startedAt: openAt });
-        this.#journal('error', `${kind} ${w.id}: ${opened.reason}; the venues hold ${after.symbol} (${round(after.legUsd)} USD a leg${after.oneLeg === null ? '' : `, one leg only: ${after.oneLeg.venue} ${after.oneLeg.qty}`}): held from now`, { ...base, heldLegUsd: round(after.legUsd), feeUsd: opened.feeUsd }, opened.tx);
-        return { end: 'done', sent: true, passing: false };
+        const bookedAt = this.#record('enter', { windowId: w.id, symbol: sym.symbol, outcome: opened, forecastNetAprPct: w.netAprPct, exitReason: null, rotation: p.fromId === null ? null : { fromId: p.fromId, toId: w.id }, manual: p.manual, startedAt: openAt });
+        this.#journal('error', `${kind} ${w.id}: ${opened.reason}; the venues hold ${after.symbol} (${round(after.legUsd)} USD a leg${after.oneLeg === null ? '' : `, one leg only: ${after.oneLeg.venue} ${after.oneLeg.qty}`}): held from now; ${why}`, { ...base, heldLegUsd: round(after.legUsd), feeUsd: opened.feeUsd }, opened.tx);
+        return { end: 'done', sent: true, passing: false, positionId: bookedAt === null ? null : positionIdOf(w.id, bookedAt), result: `opened, partly: ${opened.reason}` };
       }
       this.#record('fill', { windowId: w.id, symbol: sym.symbol, outcome: opened, forecastNetAprPct: null, exitReason: opened.reason, rotation: null, manual: p.manual, startedAt: openAt });
-      this.#journal(opened.sent ? 'error' : 'refused', `${kind} ${w.id}: ${opened.reason}${flat}`, { ...base, feeUsd: opened.feeUsd }, opened.tx);
+      this.#journal(opened.sent ? 'error' : 'refused', `${kind} ${w.id}: ${opened.reason}${flat}; ${why}`, { ...base, feeUsd: opened.feeUsd }, opened.tx);
       // Stopped by the open's own gate (a rescue that started after the check before it): tried again next check.
       const passing = this.#gate() !== null;
       const paid = opened.refreshed === true && !opened.sent ? { paidRefusal: opened.reason } : {};
-      return p.fromId === null ? { end: 'skipped', sent: opened.sent, passing, ...paid } : { end: 'flat', sent: true, passing, ...paid };
+      const result = `not opened: ${opened.reason}`;
+      return p.fromId === null ? { end: 'skipped', sent: opened.sent, passing, result, ...paid } : { end: 'flat', sent: true, passing, result, ...paid };
     }
     // Held from now: an entry's time, or the rotation's. What filled, not what was asked: a later part its gate
     // stopped holds nothing.
     const filled = filledLeg(p, opened.filledQty);
     this.#setHeld({ windowId: w.id, symbol: sym.symbol, since: now, legUsd: filled.usd, entryNetAprPct: w.netAprPct });
-    this.#record('enter', { windowId: w.id, symbol: sym.symbol, outcome: opened, forecastNetAprPct: w.netAprPct, exitReason: null, rotation: p.fromId === null ? null : { fromId: p.fromId, toId: w.id }, manual: p.manual, startedAt: openAt });
+    const enteredAt = this.#record('enter', { windowId: w.id, symbol: sym.symbol, outcome: opened, forecastNetAprPct: w.netAprPct, exitReason: null, rotation: p.fromId === null ? null : { fromId: p.fromId, toId: w.id }, manual: p.manual, startedAt: openAt });
     const size = filled.partial
       ? `${filled.qty} ${sym.symbol} (${round(filled.usd)} USD) a leg filled of the ${p.qty} (${p.legUsd} USD) asked`
       : `at most ${p.qty} ${sym.symbol} (${p.legUsd} USD) a leg`;
     const sizeNumbers: Record<string, number | string> = filled.partial ? { legUsd: round(filled.usd), qty: filled.qty, usd: round(filled.usd), askedLegUsd: p.legUsd, askedQty: p.qty } : { usd: p.legUsd };
-    this.#journal(kind, `${kind === 'rotate' ? `rotate ${p.fromId} -> ${w.id}` : `enter ${w.id}`}, ${sym.symbol} short hyperliquid, long phoenix, ${size} at ${p.leverage}x, ${round(w.netAprPct)} % net (${who})${p.reason === undefined ? '' : `: ${p.reason}`}; ${opened.reason}`,
+    this.#journal(kind, `${kind === 'rotate' ? `rotate ${p.fromId} -> ${w.id}` : `enter ${w.id}`}, ${sym.symbol} short hyperliquid, long phoenix, ${size} at ${p.leverage}x, ${round(w.netAprPct)} % net (${who})${p.reason === undefined ? '' : `: ${p.reason}`}; ${why}; ${opened.reason}`,
       { ...base, ...sizeNumbers, feeUsd: opened.feeUsd, ...(p.fromId === null ? {} : { from: p.fromId }) }, opened.tx);
-    return { end: 'done', sent: true, passing: false };
+    return { end: 'done', sent: true, passing: false, positionId: enteredAt === null ? null : positionIdOf(w.id, enteredAt), result: `opened: ${opened.reason}` };
   }
 
   /** Both legs closed reduce-only. */
@@ -934,29 +1018,97 @@ export class StrategyLoop {
     this.#journal('exit', `${line}: closed reduce-only; ${r.reason}`, { venue: leg.venue, qty: leg.qty, feeUsd: r.feeUsd }, r.tx);
   }
 
-  /** NEAR AI's verdict (veto.ts checkVeto), shown on the window; a veto is journaled (decide's vetoedUntil holds it out). */
-  async #veto(w: FundingWindow, p: { kind: 'enter' | 'rotate'; legUsd: number; leverage: number; hoursAbove: number; facts: WindowFacts }): Promise<VetoResult> {
+  /**
+   * NEAR AI's verdict (veto.ts checkVeto), shown on the window and booked in the risk check ledger; a refusal is
+   * journaled (decide's vetoedUntil holds it out). `why` is the line every decision after it carries.
+   */
+  async #veto(w: FundingWindow, p: { kind: 'enter' | 'rotate'; legUsd: number; leverage: number; hoursAbove: number; facts: WindowFacts; manual: boolean }): Promise<{
+    result: VetoResult; why: string; numbers: Record<string, number | string>; checkId: string | null; fresh: boolean;
+  }> {
     const now = this.#o.clock.now();
     const oi = p.facts.openInterest?.[w.id];
-    const legs: { long: Partial<Pick<VetoLeg, 'openInterestUsd'>>; short: Partial<Pick<VetoLeg, 'openInterestUsd'>> } = {
-      long: { openInterestUsd: oi?.longUsd ?? null }, short: { openInterestUsd: oi?.shortUsd ?? null },
-    };
-    // Book depth, the 24 h move and the listing age are not known here: null, never invented.
+    // Book depth at the leg's size, the 24 h move and the listing age come from riskFacts where a venue gives them;
+    // anything it cannot get stays null (unknown), never invented.
+    // No reads for a check that will not be asked (no key): nothing would be sent.
+    const asks = this.#o.veto?.configured === true;
+    const extra = await ((asks ? this.#o.riskFacts?.(w, p.legUsd) : undefined) ?? Promise.resolve({})).catch((err: unknown) => {
+      this.#log(`strategy loop: risk check facts for ${w.id} not read (${errorMessage(err)})`);
+      return {};
+    }) as { long?: VetoLegFacts; short?: VetoLegFacts };
     const facts = vetoFacts(w, {
       kind: p.kind, legUsd: p.legUsd, leverage: p.leverage, minNetAprPct: this.#o.strategy().minNetAprPct, hoursAbove: p.hoursAbove,
-      grossApr14dPct: p.facts.gross14dAprPct?.[w.id] ?? null, legs,
+      grossApr14dPct: p.facts.gross14dAprPct?.[w.id] ?? null,
+      legs: { long: { ...extra.long, openInterestUsd: oi?.longUsd ?? null }, short: { ...extra.short, openInterestUsd: oi?.shortUsd ?? null } },
     });
     const result = await checkVeto(this.#o.veto ?? NO_VETO_SOURCE, facts, { now, timeoutMs: this.#o.vetoTimeoutMs ?? LOOP_RULES.vetoTimeoutMs });
+    // The attestation is shown only for a reply that came: an unchecked window has nothing to attest.
+    const attestation = result.exchange?.response == null ? null : (this.#o.attestation?.() ?? 'TEE not attested: no attestation fetched in this run');
+    const why = riskCheckWhy(result, attestation ?? '');
+    const numbers: Record<string, number | string> = {
+      riskCheck: why, riskCheckOutcome: result.outcome, ...(attestation === null ? {} : { attestation }),
+      ...(result.exchange === null ? {} : vetoJournalNumbers(result.exchange)),
+    };
+    const booked = this.#bookCheck(w, p, result, why, attestation, now);
     const shown = result.veto.verdict === 'veto' ? LOOP_RULES.vetoHoldHours * HOUR_MS : VERDICT_SHOWN_MS;
     this.#verdicts.set(w.id, { veto: result.veto, until: now + shown });
     const scanned = this.#o.windows();
     if (scanned !== null) this.#republishVerdicts(scanned, now);
+    // The decision that asked carries the verdict from here.
+    const d = this.#decision;
+    if (!p.manual && d !== null && d.windowId === w.id && (d.action === 'enter' || d.action === 'rotate')) {
+      const tail = result.veto.verdict === 'veto' ? `; ${why}: not ${d.action === 'enter' ? 'entered' : 'rotated'}` : `; ${why}`;
+      this.#publishDecision({ ...d, reason: `${d.reason}${tail}`, at: now });
+    }
     if (result.veto.verdict === 'veto') {
-      this.#journal('veto', `${w.id}: ${result.line}; not entered, held out for ${LOOP_RULES.vetoHoldHours} h`, {
-        window: w.id, model: result.veto.model, ...(result.exchange === null ? {} : vetoJournalNumbers(result.exchange)),
+      this.#journal('veto', `${w.id}: ${why}; not ${p.kind === 'enter' ? 'entered' : 'rotated into'}, held out for ${LOOP_RULES.vetoHoldHours} h`, {
+        window: w.id, model: result.veto.model, ...numbers,
       });
     }
-    return result;
+    return { result, why, numbers, ...booked };
+  }
+
+  /**
+   * The check, to the risk check ledger, with its id. The same act asked again (a retry after a refusal that passes:
+   * the same window, kind and verdict, its earlier act not opened, within LEDGER_RETRY_MS) is not booked again: the
+   * earlier check stands for it (`fresh` false). Its failure is logged, never the act's.
+   */
+  #bookCheck(w: FundingWindow, p: { kind: 'enter' | 'rotate'; legUsd: number; leverage: number; manual: boolean }, r: VetoResult, why: string, attestation: string | null, now: number): { checkId: string | null; fresh: boolean } {
+    if (this.#o.ledger === undefined) return { checkId: null, fresh: false };
+    const verdict = r.veto.verdict === 'veto' ? 'refused' : r.checked ? 'passed' : 'unchecked';
+    const last = this.#lastChecks.get(w.id);
+    if (last !== undefined && last.kind === p.kind && last.verdict === verdict && !last.opened && now - last.at < LEDGER_RETRY_MS) {
+      return { checkId: last.id, fresh: false };
+    }
+    const id = `${now}-${w.id}`;
+    try {
+      const holdHours = LEDGER_HOLD_HOURS;
+      this.#o.ledger.check({
+        v: 1, type: 'check', id, at: now, kind: p.kind, by: p.manual ? 'manual' : 'auto', windowId: w.id, symbol: w.symbol,
+        outcome: r.outcome, verdict, reason: r.reason, why, attestation,
+        model: r.veto.model, prompt: r.exchange?.messages ?? null, reply: r.exchange === null ? '' : replyText(r.exchange), latencyMs: r.latencyMs,
+        legUsd: p.legUsd, leverage: p.leverage, forecastNetAprPct: w.netAprPct, roundTripCostUsd: roundTripUsd(w.costs, p.legUsd, DEFAULT_SCANNER_CONFIG.costs.holdHours), holdHours,
+      });
+    } catch (err) {
+      this.#log(`strategy loop: the risk check on ${w.id} was not booked (${errorMessage(err)})`);
+      return { checkId: null, fresh: false };
+    }
+    this.#lastChecks.set(w.id, { id, kind: p.kind, verdict, at: now, opened: false });
+    for (const [k, v] of this.#lastChecks) if (now - v.at >= LEDGER_RETRY_MS) this.#lastChecks.delete(k);
+    return { checkId: id, fresh: true };
+  }
+
+  /** How the act after a check ended, to the ledger: once per check, and again for a retry only when it opened. */
+  #bookAct(checkId: string | null, fresh: boolean, r: ActEnd): void {
+    const ledger = this.#o.ledger;
+    if (checkId === null || ledger?.act === undefined) return;
+    const opened = r.end === 'done';
+    if (!fresh && !opened) return;
+    for (const v of this.#lastChecks.values()) if (v.id === checkId && opened) v.opened = true;
+    try {
+      ledger.act({ v: 1, type: 'act', at: this.#o.clock.now(), checkId, opened, positionId: opened ? r.positionId ?? null : null, result: r.result ?? r.end });
+    } catch (err) {
+      this.#log(`strategy loop: the end of the act after ${checkId} was not booked (${errorMessage(err)})`);
+    }
   }
 
   /** A `windows` event with NEAR AI's verdicts shown on their windows, when the last scan's do not carry them. */
@@ -1012,17 +1164,20 @@ export class StrategyLoop {
   #record(kind: 'enter' | 'exit' | 'fill', p: {
     windowId: string; symbol: string; outcome: ActOutcome; forecastNetAprPct: number | null; exitReason: string | null;
     rotation: { fromId: string; toId: string } | null; manual: boolean; startedAt: number;
-  }): void {
-    if (this.#o.book === undefined) return;
-    if (kind === 'fill' && (p.outcome.fills ?? []).length === 0) return;
+  }): number | null {
+    if (this.#o.book === undefined) return null;
+    if (kind === 'fill' && (p.outcome.fills ?? []).length === 0) return null;
+    const at = this.#o.clock.now();
     try {
       this.#o.book({
-        kind, windowId: p.windowId, symbol: p.symbol, at: this.#o.clock.now(), startedAt: p.startedAt, legs: p.outcome.fills ?? [], feeUsd: p.outcome.feeUsd, tx: p.outcome.tx,
+        kind, windowId: p.windowId, symbol: p.symbol, at, startedAt: p.startedAt, legs: p.outcome.fills ?? [], feeUsd: p.outcome.feeUsd, tx: p.outcome.tx,
         forecastNetAprPct: p.forecastNetAprPct, exitReason: p.exitReason, rotation: p.rotation, by: p.manual ? 'manual' : 'auto', marginMoves: [],
       });
     } catch (err) {
       this.#log(`strategy loop: the book did not take the ${kind} of ${p.windowId} (${errorMessage(err)})`);
+      return null;
     }
+    return at;
   }
 
   /** The UTC day of `t`, as LoopFileState.refreshes keeps it. */

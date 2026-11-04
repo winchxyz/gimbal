@@ -128,6 +128,24 @@ test('reserve -> Hyperliquid (fund_venue, recorded): quote, verify, sign, deposi
   assert.equal(w.rescuer.capUsed(), 0, 'fund_venue is not in the rescue cap');
 });
 
+test('the progress amount: what the leg needs at detect, what the transfer sends from source on, what landed at the end', async () => {
+  // The recorded move is 20 USDC whatever the need, so the three differ: the screen once said "Moved" with the need.
+  const { w } = recorded();
+  await run(w, trigger({ amountUsd: 64.14 }));
+  const amounts = w.events
+    .filter((e): e is Extract<StreamEvent, { type: 'rescue' }> => e.type === 'rescue')
+    .map((e) => [e.data.step, e.data.amountUsd]);
+  assert.deepEqual(amounts, [
+    ['detect', 64.14], ['source', 20], ['quote', 20], ['verify', 20], ['sign', 20], ['deposit', 20], ['landed', 19.48],
+  ]);
+  const sent = w.events
+    .filter((e): e is Extract<StreamEvent, { type: 'rescue' }> => e.type === 'rescue')
+    .map((e) => [e.data.step, e.data.sentUsd]);
+  assert.deepEqual(sent, [
+    ['detect', undefined], ['source', 20], ['quote', 20], ['verify', 20], ['sign', 20], ['deposit', 20], ['landed', 20],
+  ], 'what was sent stays put after landing');
+});
+
 test('Phoenix -> Orderly receiver (sol_sign_rescue, recorded): the reserve is short, Phoenix pays; Orderly credits later', async () => {
   const { w } = recorded({ reserveUsd: 2 }, [leg('orderly', 200), leg('phoenix', 200)]);
   await run(w, trigger({ venue: 'orderly', symbol: 'PERP_ETH_USDC', amountUsd: 9 }));

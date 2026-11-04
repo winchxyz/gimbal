@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   arrange,
   bestEnterable,
+  bestNetAprPct,
   checkLines,
   failedScan,
   inTab,
@@ -24,6 +25,20 @@ const ids = (rows: { symbol: string }[]) => rows.map((w) => w.symbol);
 test('rows sort by net APR, highest first, and equal rows keep a stable order', () => {
   const rows = sortWindows([net('LTC', 6.9), net('ZRO', 35.2), net('BTC', 2.1), net('AAA', 6.9), net('ETH', -2.4)]);
   assert.deepEqual(ids(rows), ['ZRO', 'AAA', 'LTC', 'BTC', 'ETH']);
+});
+
+test('windows without a 7-day spread rank after the others, and are never the best', () => {
+  // A new listing's hour stated as a year can be far above every real window; the engine does not enter it.
+  const fresh = net('NEW', 480, { grossApr7dPct: null });
+  const rows = [net('LTC', 6.9), fresh, net('ZRO', 35.2), net('OLD', 2, { grossApr7dPct: null })];
+  assert.deepEqual(ids(sortWindows(rows)), ['ZRO', 'LTC', 'NEW', 'OLD']);
+  assert.deepEqual(ids(arrange(rows, 'tradable', 5, null).rows), ['ZRO', 'LTC', 'NEW', 'OLD']);
+  assert.equal(bestEnterable(rows.slice(0, 2).reverse())?.symbol, 'LTC');
+  assert.equal(bestEnterable([fresh]), null);
+  assert.equal(bestNetAprPct(rows), 35.2);
+  assert.equal(bestNetAprPct([fresh]), null);
+  assert.equal(bestNetAprPct(null), null);
+  assert.equal(bestNetAprPct([]), null);
 });
 
 test('the tabs split tradable from watch-only, and watch-only rows rank by gross', () => {

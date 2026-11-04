@@ -77,6 +77,7 @@ export interface LoopCounters {
   lastHourlyAt: number | null;             // ms of the last hourly check (counters move only on those)
   lastWaitReason: string | null;           // a wait is journaled only when this changes
   vetoedUntil: Record<string, number>;     // window id -> ms until which a NEAR AI veto holds it out
+  vetoWhy?: Record<string, string>;        // window id -> the risk check's why line for that hold-out (absent: none kept)
 }
 
 export const NO_COUNTERS: LoopCounters = {
@@ -116,6 +117,12 @@ export interface DecideInput {
    * loop.ts. A rotation sizes the new legs on free margin plus this. Absent = none counted.
    */
   freedMarginUsd?: Record<string, number>;
+  /**
+   * Window id -> why the loop's hands cannot open it here (loop.ts: LoopHands.symbolOf refusals, which include serve's
+   * direction rule, long Phoenix / short Hyperliquid only). Such a window fails the entry rules (`hands`), so a lower
+   * window the hands can open is the one counted and entered. Absent = every window is openable.
+   */
+  unopenable?: Record<string, string>;
   /**
    * The hourly-check counts: loop.ts passes the owner's (StrategyConfig.enterAfterChecks / exitAfterChecks), the
    * entry/exit-checks backtest (src/backtest) varies them. Absent = LOOP_RULES' defaults. The counters stay raw
@@ -177,6 +184,12 @@ function normalized(c: LoopCounters): LoopCounters {
   return v !== undefined && typeof v === 'object' && v !== null ? c : { ...c, vetoedUntil: {} };
 }
 
+/** The risk check's why line kept with a window's hold-out, as " (<why>)", or "". */
+function vetoWhyText(c: Pick<LoopCounters, 'vetoWhy'> | undefined, id: string): string {
+  const why = (c as Partial<LoopCounters> | undefined)?.vetoWhy?.[id];
+  return typeof why === 'string' && why !== '' ? ` (${why})` : '';
+}
+
 /** Hours a NEAR AI veto still holds `id` out, or null. */
 function vetoHoursLeft(c: Pick<LoopCounters, 'vetoedUntil'> | undefined, id: string, now: number | undefined): number | null {
   const until = (c as Partial<LoopCounters> | undefined)?.vetoedUntil?.[id];
@@ -189,14 +202,76 @@ function vetoHoursLeft(c: Pick<LoopCounters, 'vetoedUntil'> | undefined, id: str
 /** Why a window fails the entry rules: a category (the wait journal key) and a line. */
 interface GateFailure { code: string; text: string }
 
-type GateInput = Pick<DecideInput, 'strategy' | 'gross14dAprPct'> & Partial<Pick<DecideInput, 'now' | 'counters'>>;
+type GateInput = Pick<DecideInput, 'strategy' | 'gross14dAprPct'>
+  & Partial<Pick<DecideInput, 'now' | 'counters' | 'freeMarginUsd' | 'freedMarginUsd' | 'liveRescue' | 'lots' | 'unopenable'>>;
+
+/**
+ * The leverage a window's legs open at: the owner's, at most MAX_LEVERAGE, at most NO_RESCUE_MAX_LEVERAGE when a leg
+ * has no live rescue. Null when the owner's is not a positive finite number (sizeFor refuses it).
+ */
+function legLeverage(w: FundingWindow, input: Pick<DecideInput, 'strategy'> & Partial<Pick<DecideInput, 'liveRescue'>>): number | null {
+  const asked = input.strategy.maxLeverage;
+  if (!finite(asked) || asked <= 0) return null;
+  const noRescue = [w.longVenue, w.shortVenue].some((v) => input.liveRescue?.[v] !== true);
+  return Math.min(asked, MAX_LEVERAGE, noRescue ? NO_RESCUE_MAX_LEVERAGE : Infinity);
+}
+
+/** A leg capped at `capUsd`, rounded down to whole common lots of `w`'s two venues, as sizeFor and pair-mainnet round it. */
+type LotLeg = { ok: true; qty: bigint; legUsd: number } | { ok: false; code: 'lots' | 'zero'; why: string; lot?: bigint };
+
+function lotLeg(w: FundingWindow, capUsd: number, lots: DecideInput['lots']): LotLeg {
+  const l = lots?.[w.id];
+  if (l === undefined || !finite(l.px) || l.px <= 0) return { ok: false, code: 'lots', why: `no lot sizes for ${w.symbol}: its size cannot be rounded to whole lots` };
+  let lot: bigint;
+  try {
+    lot = commonLot(toQty(l.longLot), toQty(l.shortLot));
+  } catch (err) {
+    return { ok: false, code: 'lots', why: `${w.symbol}'s lots cannot be combined: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  if (lot <= 0n) return { ok: false, code: 'lots', why: `${w.symbol} has a lot of zero` };
+  const qty = floorToLot(toQty((capUsd / l.px).toFixed(8)), lot);
+  if (qty === 0n) return { ok: false, code: 'zero', why: `under one common lot (${qtyString(lot)} ${w.symbol} at ${l.px})`, lot };
+  return { ok: true, qty, legUsd: Math.floor(qtyNumber(qty) * l.px * 100) / 100 };
+}
+
+/**
+ * The first leg venue of `w` whose free margin (plus what a close frees first) cannot open a MIN_LEG_USD leg at the
+ * leverage sizeFor uses, in whole lots, or null. The loop never moves margin to open a leg, so such a window cannot
+ * be entered at all. A venue missing from freeMarginUsd was not read this check (a failed read): it is skipped, so a
+ * read failure never resets a window's hours; sizeFor still waits on it. Null outside decide() (no free margin given).
+ */
+function marginShort(w: FundingWindow, input: GateInput): GateFailure | null {
+  const free = input.freeMarginUsd;
+  if (free === undefined) return null;
+  const leverage = legLeverage(w, input);
+  if (leverage === null) return null;
+  for (const v of [w.longVenue, w.shortVenue]) {
+    if (!Object.hasOwn(free, v)) continue;
+    const margin = free[v]! + (input.freedMarginUsd?.[v] ?? 0);
+    if (!finite(margin)) continue;
+    const cap = margin * leverage;
+    // Without lot sizes the leg is not rounded here; sizeFor refuses the window for that.
+    const rounded = cap <= 0 ? null : lotLeg(w, cap, input.lots);
+    const legUsd = cap <= 0 ? 0 : rounded!.ok ? rounded!.legUsd : rounded!.code === 'zero' ? 0 : cap;
+    if (legUsd < MIN_LEG_USD) {
+      return {
+        code: 'margin',
+        text: `${usd(margin)} free margin on ${venueName(v)} at ${lev(leverage)} opens ${usd(legUsd)} a leg in whole lots, `
+          + `under the ${usd(MIN_LEG_USD)} minimum: the loop does not move margin to open`,
+      };
+    }
+  }
+  return null;
+}
 
 function gate(w: FundingWindow, input: GateInput): GateFailure | null {
   const min = input.strategy.minNetAprPct;
   const legUsd = input.strategy.legUsd;
   if (!w.tradable) return { code: 'watch', text: 'watch only' };
+  const hands = input.unopenable?.[w.id];
+  if (hands !== undefined) return { code: 'hands', text: hands };
   const vetoLeft = vetoHoursLeft(input.counters, w.id, input.now);
-  if (vetoLeft !== null) return { code: 'vetoed', text: `refused by the NEAR AI risk check, held out for ${vetoLeft.toFixed(1)} h more` };
+  if (vetoLeft !== null) return { code: 'vetoed', text: `refused by the NEAR AI risk check${vetoWhyText(input.counters, w.id)}, held out for ${vetoLeft.toFixed(1)} h more` };
   if (!isEnterable(w)) {
     if (w.refused !== undefined) return { code: 'refused', text: `refused ${w.refused.code}: ${w.refused.reason}` };
     if (w.stale) return { code: 'stale', text: 'its numbers are stale' };
@@ -217,7 +292,7 @@ function gate(w: FundingWindow, input: GateInput): GateFailure | null {
   if (d14 !== null && !(d14 > 0)) return { code: '14d', text: `the 14-day spread is ${pct(d14)}` };
   const need = legUsd / DEFAULT_SCANNER_CONFIG.deskMaxOiShare;
   if (w.depthUsd < need) return { code: 'depth', text: `capacity ${usd(w.depthUsd)}, under the ${usd(need)} a ${usd(legUsd)} leg needs` };
-  return null;
+  return marginShort(w, input);
 }
 
 /** Why a window fails the entry rules now, in a few words; null when it passes them all. */
@@ -300,10 +375,8 @@ export function sizeFor(
 ): Sizing {
   const fail = (code: string, why: string): Sizing => ({ ok: false, code, why });
   const venues = [w.longVenue, w.shortVenue];
-  const noRescue = venues.filter((v) => input.liveRescue[v] !== true);
-  const asked = input.strategy.maxLeverage;
-  if (!finite(asked) || asked <= 0) return fail('leverage', `your leverage ${String(asked)}x is not a positive number`);
-  const leverage = Math.min(asked, MAX_LEVERAGE, noRescue.length > 0 ? NO_RESCUE_MAX_LEVERAGE : Infinity);
+  const leverage = legLeverage(w, input);
+  if (leverage === null) return fail('leverage', `your leverage ${String(input.strategy.maxLeverage)}x is not a positive number`);
   const band = input.priceBandBps ?? DEFAULT_PRICE_BAND_BPS;
   if (!finite(band) || band < 0 || band >= 1e4) return fail('band', `the policy's price band ${String(band)} bps is not usable`);
   const caps: { code: string; usd: number; why: string }[] = [
@@ -323,24 +396,12 @@ export function sizeFor(
     if (c.usd <= 0) return fail(c.code, `${c.why} leaves nothing to open`);
   }
   const binding = caps.reduce((a, b) => (b.usd < a.usd ? b : a));
-  const lots = input.lots?.[w.id];
-  if (lots === undefined || !finite(lots.px) || lots.px <= 0) return fail('lots', `no lot sizes for ${w.symbol}: its size cannot be rounded to whole lots`);
-  let lot: bigint;
-  try {
-    lot = commonLot(toQty(lots.longLot), toQty(lots.shortLot));
-  } catch (err) {
-    return fail('lots', `${w.symbol}'s lots cannot be combined: ${err instanceof Error ? err.message : String(err)}`);
+  const leg = lotLeg(w, binding.usd, input.lots);
+  if (!leg.ok) return leg.code === 'lots' ? fail('lots', leg.why) : fail(binding.code, `${binding.why} sizes a leg at ${usd(binding.usd)}, ${leg.why}`);
+  if (leg.legUsd < MIN_LEG_USD) {
+    return fail(binding.code, `${binding.why} sizes a leg at ${usd(leg.legUsd)} in whole lots, under the ${usd(MIN_LEG_USD)} minimum`);
   }
-  if (lot <= 0n) return fail('lots', `${w.symbol} has a lot of zero`);
-  const size = floorToLot(toQty((binding.usd / lots.px).toFixed(8)), lot);
-  if (size === 0n) {
-    return fail(binding.code, `${binding.why} sizes a leg at ${usd(binding.usd)}, under one common lot (${qtyString(lot)} ${w.symbol} at ${lots.px})`);
-  }
-  const legUsd = Math.floor(qtyNumber(size) * lots.px * 100) / 100;
-  if (legUsd < MIN_LEG_USD) {
-    return fail(binding.code, `${binding.why} sizes a leg at ${usd(legUsd)} in whole lots, under the ${usd(MIN_LEG_USD)} minimum`);
-  }
-  return { ok: true, legUsd, leverage, qty: qtyString(size) };
+  return { ok: true, legUsd: leg.legUsd, leverage, qty: qtyString(leg.qty) };
 }
 
 // ---- counters ----
@@ -361,7 +422,10 @@ function bump(previous: Record<string, number>, ids: readonly string[], broken: 
 function count(input: DecideInput, hourly: boolean, heldW: FundingWindow | null): LoopCounters {
   const c0 = normalized(input.counters);
   const vetoedUntil = Object.fromEntries(Object.entries(c0.vetoedUntil).filter(([, t]) => finite(t) && input.now < t));
-  const c: LoopCounters = { ...c0, vetoedUntil, rotationsAt: c0.rotationsAt.filter((t) => input.now - t < 24 * HOUR_MS) };
+  const why = c0.vetoWhy === undefined ? undefined : Object.fromEntries(Object.entries(c0.vetoWhy).filter(([id]) => id in vetoedUntil));
+  const c: LoopCounters = {
+    ...c0, vetoedUntil, ...(why === undefined ? {} : { vetoWhy: why }), rotationsAt: c0.rotationsAt.filter((t) => input.now - t < 24 * HOUR_MS),
+  };
   if (!hourly) return c;
   const broken = c.lastHourlyAt !== null && input.now - c.lastHourlyAt > MAX_HOURLY_GAP_MS;
   const gated = { ...input, counters: c };
@@ -534,7 +598,7 @@ function flatStatus(input: DecideInput, counters: LoopCounters): FlatStatus {
   const vetoed = above.find((w) => vetoHoursLeft(counters, w.id, input.now) !== null);
   const vetoNote = vetoed === undefined
     ? { line: '', key: '' }
-    : { line: `; ${vetoed.symbol} refused by the NEAR AI risk check, held out for ${vetoHoursLeft(counters, vetoed.id, input.now)!.toFixed(1)} h more`, key: `:veto:${vetoed.id}` };
+    : { line: `; ${vetoed.symbol} refused by the NEAR AI risk check${vetoWhyText(counters, vetoed.id)}, held out for ${vetoHoursLeft(counters, vetoed.id, input.now)!.toFixed(1)} h more`, key: `:veto:${vetoed.id}` };
   if (top !== null) {
     const { enterAfterChecks } = checkRules(input);
     const n = Math.min(counters.aboveByWindow[top.id] ?? 0, enterAfterChecks);
@@ -604,9 +668,10 @@ function afterAct(c: LoopCounters, act: Decision['act'], now: number): LoopCount
  * counts stay, the act's own marks (the cooldown start, the rotation slot, the reset counts) do not. An exit that
  * failed is tried again on the next check, its bad checks still counted. `input` is the one decide() was given.
  * With `{ vetoed: true }` (NEAR AI risk check refused the enter or rotate target) that window is held out for
- * LOOP_RULES.vetoHoldHours and its counts start again, so the veto is not asked again on the next scan.
+ * LOOP_RULES.vetoHoldHours and its counts start again, so the veto is not asked again on the next scan; `why` (the
+ * risk check's why line) is kept with the hold-out and shown on the waits while it lasts.
  */
-export function skipAct(input: DecideInput, d: Decision, options: { vetoed?: boolean } = {}): LoopCounters {
+export function skipAct(input: DecideInput, d: Decision, options: { vetoed?: boolean; why?: string } = {}): LoopCounters {
   if (d.act === null) return d.counters;
   const held = input.held;
   const heldW = held === null ? null : (input.windows.find((w) => w.id === held.windowId) ?? null);
@@ -618,6 +683,7 @@ export function skipAct(input: DecideInput, d: Decision, options: { vetoed?: boo
   return {
     ...counted, aboveByWindow, betterByWindow,
     vetoedUntil: { ...counted.vetoedUntil, [target]: input.now + LOOP_RULES.vetoHoldHours * HOUR_MS },
+    ...(options.why === undefined ? {} : { vetoWhy: { ...counted.vetoWhy, [target]: options.why } }),
   };
 }
 

@@ -410,8 +410,8 @@ node tools/mainnet/relayer-rotate.mjs --send
   before, with the old key) and writes `.env` atomically: `RELAYER_EVM_PRIVATE_KEY` = the new key,
   `RELAYER_EVM_PRIVATE_KEY_OLD` = the old one. Every file and its folder are fsynced (the folder on POSIX only).
   It reads `.env` back, then sends all the old wallet's ETH minus gas to the address of the key in the file on
-  Arbitrum One, and prints both addresses and the arbiscan link. No key is printed. Keep the key file until
-  Railway runs the new key.
+  Arbitrum One, and prints both addresses and the arbiscan link. No key is printed. Delete the key file once
+  Railway runs the new key and the old address holds no ETH worth moving (a rerun says the rotation is done).
 - The files are made mode 0600 on POSIX. On Windows a file takes its folder's permissions: keep the checkout in a
   folder only the owner can read.
 - The ETH stays the owner's: both are the owner's gas wallets. Only the transfer's gas is spent, well under

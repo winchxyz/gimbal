@@ -152,7 +152,12 @@ async function run(): Promise<Step[]> {
         // This check's counts, before the act's own marks (the rotation resets the better counts).
         hoursAbove: (d.act!.kind === 'rotate' ? skipAct(input, d).betterByWindow[w.id] : d.counters.aboveByWindow[w.id]) ?? 0,
         grossApr14dPct: c?.estimate.gross.d14AprPct ?? null,
-        legs: { long: { openInterestUsd: c?.long.oiUsd ?? null }, short: { openInterestUsd: c?.short.oiUsd ?? null } },
+        // What serve's riskFacts adds from the carry: the 24 h move per leg. The recording holds no book or listing time
+        // for these legs' sizes, so those stay unknown, as they would in a serve whose reads failed.
+        legs: {
+          long: { openInterestUsd: c?.long.oiUsd ?? null, priceMove24hPct: c?.long.priceMove24hPct ?? null },
+          short: { openInterestUsd: c?.short.oiUsd ?? null, priceMove24hPct: c?.short.priceMove24hPct ?? null },
+        },
       });
       if (process.env.E10_DUMP_FACTS === '1') console.error(`FACTS ${JSON.stringify(facts)}`);
       const r = await checkVeto(veto, facts, { now: input.now });

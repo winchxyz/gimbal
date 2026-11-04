@@ -43,6 +43,7 @@ export interface HlAssetCtx {
   markPx: string;
   midPx?: string | null;
   dayNtlVlm: string;
+  prevDayPx?: string;
 }
 
 export type HlMetaAndAssetCtxs = [HlMeta, HlAssetCtx[]];
@@ -291,6 +292,7 @@ export function parseFunding(meta: HlMeta, ctxs: HlAssetCtx[], now: number): Mar
       oraclePx: optNum(c.oraclePx),
       openInterest: optNum(c.openInterest),
       volume24hUsd: optNum(c.dayNtlVlm),
+      ...(optNum(c.prevDayPx) === null ? {} : { prevDayPx: optNum(c.prevDayPx) }),
     });
   });
   return out;

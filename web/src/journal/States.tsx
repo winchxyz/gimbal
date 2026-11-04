@@ -1,4 +1,5 @@
 import type { Mode } from '@gimbal/shared';
+import { writeControls } from '../remote/readonly.ts';
 import { ONBOARDING_HREF } from '../shell/routes.ts';
 import { notify } from '../ui/notice.ts';
 import { clock, contractUrl } from './entry.ts';
@@ -111,7 +112,7 @@ export function JournalEmpty({ mode }: { mode: Mode | null }) {
           Every action the desk takes will appear here as an event the contract wrote on NEAR, with a link to check it. Your deposit will be the
           first.
         </p>
-        {mode === 'replay' ? null : (
+        {mode === 'replay' || !writeControls().money ? null : (
           <div className="go">
             <a className="btn primary" href={ONBOARDING_HREF}>
               {mode === 'testnet' ? 'Get test USDC' : 'Add funds'}

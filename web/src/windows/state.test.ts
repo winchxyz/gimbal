@@ -24,6 +24,8 @@ test('an alert fires when its window passes the one it had to pass, using the li
   assert.equal(reached([alert], [net('SOL', 13)]).length, 0);
   // its own window is gone: nothing to say
   assert.deepEqual(reached([alert], [doge]), []);
+  // no 7-day spread yet: its net is one hour stated as a year, so it never fires, however high
+  assert.deepEqual(reached([alert], [doge, net('SOL', 480, { grossApr7dPct: null })]), []);
 });
 
 test('alerts toggle on and off and survive a round trip through storage text', () => {
