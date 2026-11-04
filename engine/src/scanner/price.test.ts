@@ -394,9 +394,6 @@ test('switch cost: close the legs that change and open the new ones, and move ma
   assert.equal(switchCostUsd(held, toOrderly), Math.round((1.150000002 + toOrderly.breakdown.transferUsd!) * 1e4) / 1e4);
   assert.equal(switchCostUsd(held, toOrderly), 4.1233);
   assert.ok(toOrderly.window.checks.some((c) => c.text === 'Moving $333 of margin a leg onto Orderly and back costs $2.97'), JSON.stringify(toOrderly.window.checks));
-  // Every leg venue's move is priced for the entry gate, also where margin sits now (decide() reads free margin).
-  near(toOrderly.window.marginMoveUsd!.orderly!, toOrderly.breakdown.transferUsd!, 1e-4);
-  assert.equal(typeof toOrderly.window.marginMoveUsd!.phoenix, 'number');
   // Long moves Phoenix -> Orderly: close 0.35 + 0.10001, open 0.40 + 0.09999 = 0.950000002 USD, and the same move.
   const longOrderly = priced(leg('orderly', 'PERP_SOL_USDC', { base: 'SOL', ratePerHour: 0 }), SHORT, heldAt);
   assert.equal(switchCostUsd(held, longOrderly), Math.round((0.950000002 + longOrderly.breakdown.transferUsd!) * 1e4) / 1e4);

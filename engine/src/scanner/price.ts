@@ -133,7 +133,6 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
 
   let breakdown: CostBreakdown;
   let fills: PricedWindow['fills'] = null;
-  let marginMoveUsd: FundingWindow['marginMoveUsd'];
   const checks: FundingWindow['checks'] = [];
   const staleVenues = [long, short].filter((l) => l.stale).map((l) => l.venue);
   let oldest = Math.min(long.readAt, short.readAt);
@@ -163,10 +162,6 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
     // venue and leaving means moving it back: both trips are part of what the window costs.
     const moving = [lv, sv].filter((v) => !(ctx.marginHeldAt?.has(v) ?? false));
     const transferUsd = moving.reduce((s, v) => s + marginRoundTripUsd(v, margin, ctx.costs.reserveAt, ctx.costs.transfers), 0);
-    marginMoveUsd = {
-      [lv]: round(marginRoundTripUsd(lv, margin, ctx.costs.reserveAt, ctx.costs.transfers), 4),
-      [sv]: round(marginRoundTripUsd(sv, margin, ctx.costs.reserveAt, ctx.costs.transfers), 4),
-    };
     breakdown = {
       feesUsd: takerFeesUsd(L, longBps, shortBps),
       transferUsd,
@@ -257,7 +252,6 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
     checks: [...head, ...verdict.checks, ...quality, ...checks, ...tail],
     switchCostUsd: null,
     stale: staleVenues.length > 0,
-    ...(marginMoveUsd === undefined ? {} : { marginMoveUsd }),
   };
   return { ok: true, priced: { pair, window, costsApr, breakdown, fills, flagged: quality.length > 0 } };
 }
@@ -404,8 +398,10 @@ function watchVerdict(pair: Pair): Verdict {
  * What it costs to rotate from the held window into another at the same leg size, USD: close the held legs that
  * change and open the new ones (taker fee and slippage of each of those fills; a leg that stays, same venue, market
  * and side, costs nothing), plus moving margin onto the new window's venues and back (its transferUsd: none where
- * marginHeldAt says the desk's margin already sits). A desk window's net APR leaves its margin moves out (they are a
- * one-off cost shown apart), so this is where the rotation gap and its payback pay for them.
+ * marginHeldAt says the desk's margin already sits). The net priced here counts the same moves in feesPct, but once a
+ * desk window's 7 days are in, scanner.ts restates its costs as the round trip alone and its net APR leaves the moves
+ * out (a one-off cost shown apart, in its checks): every window the entry gate passes is on that basis, so this is
+ * where the rotation gap and its payback pay for them.
  */
 export function switchCostUsd(held: PricedWindow, next: PricedWindow): number | null {
   if (held.fills === null || next.fills === null) return null;
