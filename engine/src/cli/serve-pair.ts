@@ -726,6 +726,8 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
      * Throws a ConfigError (serve stops) or a read that failed (the start is not confirmed and is tried again).
      */
     const attempt = async (): Promise<Started> => {
+      // A start attempt owns the lock it finds held, a sweep's included (the sweep then never lets it go).
+      startGen++;
       if (wantLive && lock === null) {
         try {
           lock = acquireTraderLock(traderLockPath(env, input.mode, contractId, input.deskId));
@@ -813,8 +815,27 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
     // It may sign with no pair trader (a NONE start, a start not confirmed, a pair alert only): it takes the trader
     // lock and the signing client itself, and gives the lock back after when no pair trades.
     let sweepLock = false;
+    /** Start attempts begun: a sweep lets go only a lock it took with no start attempt begun since (or running). */
+    let startGen = 0;
+    let sweepGen = -1;
     const sweep = !orderlyOn || !wantLive ? null : new OrderlySweep({
       session: input.orderly,
+      heldKnown: () => {
+        // Without the session nothing on Orderly can be read: the saved trader state is all that says one is open.
+        const saved = store.load();
+        if (saved.kind === 'none') return false;
+        if (saved.kind !== 'loaded') return true;
+        const shape = savedShape(saved.state);
+        const i = shape?.legs.findIndex((l) => l.venue === 'orderly') ?? -1;
+        if (i === -1) return false;
+        const base = saved.state.trader?.baselines[i];
+        return base === null || (base !== undefined && base !== 0n) || saved.state.inFlight.some((o) => o.index === i);
+      },
+      covered: () => (current !== null && current.live() && !stopped ? current.trader.legs.filter((l) => l.venue === 'orderly').map((l) => l.symbol) : []),
+      closing: async () => {
+        const view = await client.getDesk(input.deskId).catch(() => null);
+        return view === null ? null : view.closing === true;
+      },
       spec: (market) => {
         const base = orderlyBaseSymbol(market);
         if (base === null) return null;
@@ -831,6 +852,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           try {
             lock = acquireTraderLock(traderLockPath(env, input.mode, contractId, input.deskId));
             sweepLock = true;
+            sweepGen = startGen;
           } catch (err) {
             return `the trader lock is not held: ${errorMessage(err)} (pair-mainnet --send holds the same lock)`;
           }
@@ -846,7 +868,8 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         return null;
       },
       end: () => {
-        if (sweepLock && (current === null || !current.live())) release();
+        // A start attempt that began since the sweep took the lock (or runs now) owns it: it keeps it or lets it go.
+        if (sweepLock && attempting === null && startGen === sweepGen && (current === null || !current.live())) release();
         sweepLock = false;
       },
       bandBps: policy.price_band_bps, clock: input.clock, sleep, log, publish: input.publish,
@@ -1020,6 +1043,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
 
     const cancelResting = async (): Promise<CancelResult> => {
       if (stopped) throw new Error('serve is stopping and its trader lock is released: nothing is cancelled');
+      if (lock === null) throw new Error('the trader lock is not held here (another process may trade this desk): nothing is cancelled');
       const unsure = unconfirmed() ?? noneWhy;
       if (unsure !== null || relayer === null) throw new Error(`${unsure ?? 'no signing relayer'}: nothing is cancelled`);
       const coin = current?.symbol ?? null;
@@ -1206,6 +1230,8 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
             slot = next;
           }
           if (!slot.live()) return result(false, `alert only: ${slot.pp.why ?? 'not live'}`);
+          // The loop opens: the desk is not closing, and no panic_close sweep may watch this pair's Orderly leg.
+          sweep?.endWatch();
           const { lines: said, opens, out } = collect();
           const r = await slot.carry.open({
             legUsd: request.legUsd, leverage: request.leverage, reason: request.reason,
@@ -1414,7 +1440,7 @@ export function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string
   const runner = (opening: boolean): PairRunner => ({
     openInChunks: (request) => p.pair.openInChunks(request),
     close: (request) => p.pair.close(request),
-    hedge: (side, size, reduceOnly, reason) => p.pair.hedge(iocIndex, side, size, reduceOnly, reason, opening),
+    hedge: (side, size, reduceOnly, reason, targetNet) => p.pair.hedge(iocIndex, side, size, reduceOnly, reason, opening, targetNet),
     stopOnFinish: false,
   });
   const pairFor = (ctx: OpsCtx, opening: boolean) => pairOf(ctx, {
