@@ -37,12 +37,13 @@ import type { ReadSkipped } from '../venues/http-budget.ts';
 import { isReadSkipped, scanRead } from '../venues/http-budget.ts';
 import { venueName } from '../venues/names.ts';
 import { errorMessage } from '../venues/recorder.ts';
+import { ReplayMissError } from '../venues/replay.ts';
 import type { ScannerConfig } from './config.ts';
 import type { CarryEstimate, MultiDay } from './carry.ts';
 import { DEAD_BAND_APR_PCT, carryChecks, carryEstimate, listingApr, multiDay, roundTrip, spreadOverHoldUsd } from './carry.ts';
 import { HOURS_PER_YEAR, aprPct, basisCostUsd, fillFeeBps, oneOffAprPct, takerFeesUsd } from './costs.ts';
 import {
-  FORTNIGHT_HOURS, HOUR_MS, RateStore, WEEK_HOURS, grossApr7d, grossAprOver, hourStart, intervalsAbove, legAprOver,
+  FORTNIGHT_HOURS, HOUR_MS, RateStore, WEEK_HOURS, grossApr7d, grossAprOver, hourStart, hourlyGrossApr, intervalsAbove, legAprOver,
   netAprSeries, round,
 } from './history.ts';
 import type { DropReason, LegKind, Pair, ScanLeg } from './pairs.ts';
@@ -127,6 +128,8 @@ export interface LegRates {
   d7AprPct: number | null;
   d14AprPct: number | null;
   oiUsd: number | null;          // open interest in USD
+  /** The venue's mark against its price 24 h ago, signed percent; absent or null where the venue does not say. */
+  priceMove24hPct?: number | null;
 }
 
 /** What the last scan expects of a desk window over the hold, with the legs' rates behind it. */
@@ -222,6 +225,8 @@ export class Scanner {
   readonly #options: ScannerOptions;
   readonly #lastGood = new Map<ScanVenueId, { rows: MarketFunding[]; at: number }>();
   readonly #books = new Map<string, BookRead>();
+  /** Books a replay never recorded: noted the first scan each one is missed, in one line (they are asked every scan). */
+  readonly #replayMisses = new Set<string>();
   readonly #rates = new RateStore();
   readonly #history = new Map<string, HistoryState>();
   readonly #older = new Map<string, OlderState>();
@@ -395,6 +400,7 @@ export class Scanner {
       else d.count++;
       this.#deferBook(w.key, now);
     };
+    const replayMissed: string[] = [];
     await pool(due.map((w) => async () => {
       const { key, leg } = w;
       const src = sourceById.get(leg.venue);
@@ -408,6 +414,13 @@ export class Scanner {
         this.#books.set(key, { book, readAt: clock.now(), stale: false });
       } catch (err) {
         if (isReadSkipped(err)) return defer(w, err);
+        // A replay that never recorded this book: the venue answered when it was recorded, so it is not down. The
+        // window goes without a book (as if never read), and the dashboard does not claim the venue stopped answering.
+        if (err instanceof ReplayMissError) {
+          if (!this.#replayMisses.has(key)) replayMissed.push(`${leg.venue} ${leg.symbol}`);
+          this.#replayMisses.add(key);
+          return;
+        }
         failed.add(leg.venue);
         this.#note(`${leg.venue} book ${leg.symbol} failed: ${errorMessage(err)}`);
         const last = this.#books.get(key);
@@ -421,6 +434,10 @@ export class Scanner {
       // A cool-down means the venue refused us a moment ago: it did not answer this scan.
       if (d.first.reason === 'cooling') failed.add(venue);
       this.#note(`${venue} books: ${d.count} not read this scan (${d.first.message})`);
+    }
+    if (replayMissed.length > 0) {
+      const n = replayMissed.length;
+      this.#note(`${n} book${n === 1 ? '' : 's'} not in the recording, their pairs left out: ${replayMissed.sort().join(', ')}`);
     }
 
     // 5. price
@@ -485,14 +502,15 @@ export class Scanner {
       // multi-day spread (the 7 days while the week before loads or when the two weeks disagree) minus them. So the
       // list, the minimum line and the rotation gap compare what the gate does, never one hour's swing. The margin
       // moves and the rescue reserve are one-off costs shown apart (the checks above, `npm run windows`).
-      const basisApr = dh.m.state === 'mixed' ? dh.m.d7AprPct : listingApr(dh.m);
-      if (basisApr !== null) {
-        const apr = (usd: number) => round(oneOffAprPct(usd, strategy.legUsd, config.costs.holdHours), 3);
-        w.costs = { feesPct: apr(rt.feesUsd), slippagePct: apr(rt.slippageUsd), basisPct: apr(rt.basisBufferUsd), rescueReservePct: 0 };
-        pw.costsApr = round(w.costs.feesPct + w.costs.slippagePct + w.costs.basisPct, 3);
-        w.netAprPct = round(basisApr - pw.costsApr, 3);
-        w.usdPerDayPer1k = round((w.netAprPct / 100 / 365) * 1000, 4);
-      }
+      // Before its 7 days are in, the same costs stand against this hour's gross. Pricing alone also counts the margin
+      // moves and the rescue reserve, flat 1Click fees that on a small leg annualise to hundreds of points: the list
+      // showed such a window at -605 % until its week loaded, then at -1.5 %.
+      const basisApr = (dh.m.state === 'mixed' ? dh.m.d7AprPct : listingApr(dh.m)) ?? w.grossAprPct;
+      const apr = (usd: number) => round(oneOffAprPct(usd, strategy.legUsd, config.costs.holdHours), 3);
+      w.costs = { feesPct: apr(rt.feesUsd), slippagePct: apr(rt.slippageUsd), basisPct: apr(rt.basisBufferUsd), rescueReservePct: 0 };
+      pw.costsApr = round(w.costs.feesPct + w.costs.slippagePct + w.costs.basisPct, 3);
+      w.netAprPct = round(basisApr - pw.costsApr, 3);
+      w.usdPerDayPer1k = round((w.netAprPct / 100 / 365) * 1000, 4);
       w.intervalsAbove = intervalsAbove(this.#rates, longKey, shortKey, now, w.grossAprPct, pw.costsApr, strategy.minNetAprPct);
       // Break-even on the same multi-day spread as the gate, against the same round trip (the 1Click margin moves and
       // the rescue reserve are shown apart, never gated on): this hour alone says little about a hold of days.
@@ -559,6 +577,23 @@ export class Scanner {
     if (pw === undefined) return null;
     const points = netAprSeries(this.#rates, longSide(pw.pair.long), shortSide(pw.pair.short), this.#lastAt, pw.window.grossAprPct, pw.costsApr);
     return { windowId, points };
+  }
+
+  /**
+   * The gross APR each complete hour paid on a window's legs (booked rates, else the scanner's own reads), for the
+   * hours starting in [fromMs, toMs) and before the current one; hours with a leg missing are left out. Null when the
+   * last scan did not list the window. The NEAR AI risk check ledger (book/risk-ledger.ts) prices refusals with it.
+   */
+  grossHours(windowId: string, fromMs: number, toMs: number): { t: number; grossAprPct: number }[] | null {
+    const pw = this.#priced.get(windowId);
+    if (pw === undefined) return null;
+    const out: { t: number; grossAprPct: number }[] = [];
+    const end = Math.min(toMs, hourStart(this.#lastAt));
+    for (let t = Math.ceil(fromMs / HOUR_MS) * HOUR_MS; t < end; t += HOUR_MS) {
+      const g = hourlyGrossApr(this.#rates, longSide(pw.pair.long), shortSide(pw.pair.short), t);
+      if (g !== null) out.push({ t, grossAprPct: round(g, 4) });
+    }
+    return out;
   }
 
   /** The expected carry of a desk window the last scan listed, with its legs' rates; null for any other id. */
@@ -636,6 +671,7 @@ export class Scanner {
     return {
       venue: leg.venue, symbol: leg.symbol, nowAprPct: round(aprPct(ratePerHour), 3),
       d7AprPct: d7 === null ? null : round(d7, 3), d14AprPct: d14 === null ? null : round(d14, 3), oiUsd: leg.oiUsd,
+      ...(leg.prevDayPx == null || leg.venueMarkPx === null ? {} : { priceMove24hPct: round((leg.venueMarkPx / leg.prevDayPx - 1) * 100, 3) }),
     };
   }
 

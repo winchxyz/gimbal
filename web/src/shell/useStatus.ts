@@ -1,5 +1,6 @@
 // The status line's view of the desk, as a hook: the status line and the phone's page buttons read the same one.
 import type { DeskState } from '@gimbal/shared';
+import { isReadOnly } from '../remote/readonly.ts';
 import { useStream } from '../stream/hub.ts';
 import { bestEnterable } from '../windows/model.ts';
 import { useStrategy } from '../windows/useEngine.ts';
@@ -23,6 +24,7 @@ export function useStatus(screen: 'desk' | 'rescue'): StatusState | null {
   const view = statusOf(desk, {
     down: downVenues(desk, health),
     auto,
+    remote: isReadOnly(),
     minNetAprPct: strategy?.minNetAprPct ?? null,
     bestNetAprPct: windows ? (bestEnterable(windows)?.netAprPct ?? null) : null,
   });

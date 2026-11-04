@@ -697,12 +697,12 @@ export interface Window {
   grossAprPct: number;            // this hour
   grossApr7dPct: number | null;   // the last 168 complete hours; null until the history is loaded
   costs: { feesPct: number; slippagePct: number; basisPct: number; rescueReservePct: number };
-                                  // today's one-off costs, spread over the hold as APR points. A desk window on the
-                                  // multi-day basis: the round trip the gate uses, feesPct the four fills, basisPct
-                                  // the basis buffer (adverse mark gap, timing loss, buffer bps), rescueReservePct 0;
-                                  // its margin moves and rescue reserve are shown apart, in its checks. Otherwise
-                                  // feesPct also has the 1Click fees to move both legs' margin in and out, and
-                                  // basisPct the mark gap and timing loss
+                                  // today's one-off costs, spread over the hold as APR points. A desk window, with
+                                  // or without its history: the round trip the gate uses, feesPct the four fills,
+                                  // basisPct the basis buffer (adverse mark gap, timing loss, buffer bps),
+                                  // rescueReservePct 0; its margin moves and rescue reserve are shown apart, in its
+                                  // checks. Otherwise (watch windows, which price neither) basisPct is the mark gap
+                                  // and timing loss
   netAprPct: number;              // multi-day gross minus costs on a desk window with its 7 days in: the net the gate
                                   // holds to minNetAprPct, once both weeks agree; else this hour's gross minus costs
                                   // (watch windows always). What the list ranks by, the minimum line and the rotation
@@ -727,7 +727,7 @@ export interface Window {
                                              // refused, not stale, every check ok, not refused by the NEAR AI risk check
   switchCostUsd: number | null;     // cost to rotate from the held window into this one at strategy.legUsd:
                                     // the fills that change, plus moving margin onto this window's venues and
-                                    // back (its net APR leaves those moves out);
+                                    // back (a desk window's net APR with its 7 days in leaves those moves out);
                                     // null when nothing is held or this is the held one
   stale: boolean;                   // a venue it needs did not answer: the numbers are from the last good read
 }
@@ -851,7 +851,10 @@ export interface JournalEntry {
 }
 
 export interface RescueProgress {
-  id: string; from: VenueId | 'reserve'; to: VenueId; amountUsd: number;
+  // amountUsd: at `detect` what the leg needs; from `source` on what the planned transfer sends (a capped or
+  // fixed-size move can be less than the need); at `landed` what reached the margin after 1Click's fees.
+  // sentUsd: what the planned transfer sends, from `source` on and still at `landed` (the quote row keeps it).
+  id: string; from: VenueId | 'reserve'; to: VenueId; amountUsd: number; sentUsd?: number;
   step: 'detect' | 'source' | 'quote' | 'verify' | 'sign' | 'deposit' | 'landed' | 'failed';
   startedAt: number; elapsedS: number; tx: TxRef[];
 }
@@ -938,7 +941,11 @@ anywhere the policy does not allow.
 
 - `decide.ts` (pure): `decide(DecideInput) → Decision` with the shapes in that file. Entry: the top of the
   scanner's ranked list among the windows passing the entry rules (`isEnterable`, `netAprPct ≥ minNetAprPct`, the
-  7 d and 14 d spread signs agreeing with this hour's, depth on both legs), once it has passed them for
+  7 d and 14 d spread signs agreeing with this hour's, depth on both legs; not in `DecideInput.unopenable`, the
+  windows the loop's hands refuse (serve opens long Phoenix / short Hyperliquid only, on the policy's markets); and
+  free margin on each leg venue, plus what a close frees, opening at least 10 USD a leg at the leverage in whole
+  lots, as the size below rounds it: the loop never moves margin to open; a venue whose free margin was not read
+  this check is skipped, so a read failure never resets the count), once it has passed them for
   `LOOP_RULES.enterAfterChecks` hourly checks in a row; until then the loop waits on it ("k of N hours") and never
   enters a lower window instead. Size: `legUsd` capped by the policy's `max_notional_usd` less the band, by free
   margin at the leverage and by depth, rounded down to whole common lots; a cap that is not a finite number or is
@@ -969,20 +976,83 @@ anywhere the policy does not allow.
   - A NEAR AI risk check refusal or a failed act: loop.ts saves `skipAct(input, decision)` instead of
     `decision.counters`; on a refusal of the NEAR AI risk check, `skipAct(input, decision, { vetoed: true })` holds
     that window out of entries and rotations for `LOOP_RULES.vetoHoldHours` (6 h, `LoopCounters.vetoedUntil`) and
-    starts its counts again, and the wait says so ("refused by the NEAR AI risk check, held out for N h more").
-    Saved counters without `vetoedUntil` read as none refused.
+    starts its counts again, and the wait says so ("refused by the NEAR AI risk check (<why line>), held out for N h
+    more"; the why line is kept in `LoopCounters.vetoWhy` while the hold lasts). Saved counters without `vetoedUntil`
+    read as none refused.
 - `veto.ts`: the NEAR AI risk check before an enter or a rotate (the client behind `POST /policy/draft`). No key, no
   answer in `vetoTimeoutMs`, or a transport/HTTP error = pass, journaled "no NEAR AI risk check" (a 401 or 403 says "NEAR AI
   key rejected", so a bad key shows on every decision). The whole reply is read; one that is not exactly one readable
   verdict (no JSON object, more than one, text around it other than ``` fences, a key given twice, not "pass" or
   "veto" after trimming and lowercasing, a "veto" inside a "pass", cut off at its token limit) fails closed: refused,
-  "unreadable reply". A refusal ("NEAR AI risk check refused X: …") drops the window and writes a journal entry of
-  kind `veto` (the kind keeps its name; every text the owner reads says "NEAR AI risk check").
+  "unreadable reply". A refusal drops the window and writes a journal entry of kind `veto` (the kind keeps its name;
+  every text the owner reads says "NEAR AI risk check").
+  - The why line (`riskCheckWhy`): every enter, rotate, skip and refusal decision carries one, in its summary and as
+    `numbers.riskCheck`: "NEAR AI risk check passed (<attestation>): <reason>", "NEAR AI risk check refused
+    (<attestation>): <reason>" (an unreadable reply too), "risk check timed out: passed", "no NEAR AI key: not
+    checked", "NEAR AI key rejected (…): not checked, passed" or "NEAR AI risk check unavailable (…): passed".
+    `<attestation>` is serve's `Attestor.label()` ("TEE attested <date> UTC" or "TEE not attested: <why>"), shown
+    only for a reply that came. It says what the model's TEE instances were when last attested; that the reply came
+    from those instances is not verified (per-reply signatures need the key and are not fetched). A refusal before the check is asked (no hands, the window not in the scan, a symbol serve does not trade)
+    says "NEAR AI risk check: not asked (refused before it)". The decision event is published again with it, after
+    the decision's own reason, so a window whose stored price the open refreshes carries both ("…; stored SOL price
+    stale: refreshed at open; NEAR AI risk check passed (TEE attested …): …"). Every outcome after the check carries
+    it, the refusals #92 added included (a rotate's prepareOpen refusal, the paid-refresh hold line, the open's
+    no-refresh refusal). The order is the check (and its facts), then a rotate's prepareOpen (which may pay for a
+    refresh), the close and the open: a refusal never costs a refresh.
+  - The journal numbers of every check that was asked: `vetoModel`, `vetoKey`, `vetoSystem` and `vetoPrompt` (the
+    exact messages sent), `vetoReply` (the model's text as it came), `vetoMs` (latency), `riskCheckOutcome`
+    (passed, refused, unreadable, timeout, unavailable, no-key, key-rejected) and `attestation`. The API key is never
+    in an exchange, a line, a reason or the ledger (an error quoting it, or a 200 body quoting it, is redacted).
+  - The facts sent (`vetoFacts`): per leg `open_interest_usd` (the carry), `book_depth_usd` and `fill_impact_bps`
+    (serve-loop.ts `riskFacts`: 20 levels of the side the leg fills, read when asked, and not read at all when the
+    check is not configured (no key); impact = the size's VWAP
+    against the mid, null when the levels read do not fill it), `price_move_24h_pct` (the venue's mark against its
+    own price 24 h ago: Hyperliquid `prevDayPx`, Orderly `24h_open`, Phoenix `prev_day_mark_price`) and
+    `days_since_listing` (Orderly's `created_time` only; the other venues do not give it). Anything a venue does not
+    give, or does not answer within 3 s, is null, which the prompt calls unknown; nothing is guessed.
+  - Recordings: `RecordedVeto` plays exchanges by prompt key, with their recorded latency.
+    `npm run record-nearai -w engine -- --risk-checks` sends the prompts of `fixtures/nearai/SYNTHETIC-veto.json`
+    for real (the human's step: it spends tokens) and writes `risk-checks-<date>.json`; serve replay with no key
+    plays those.
+- `nearai/attestation.ts`: the TEE attestation of the model. `GET https://cloud-api.near.ai/v1/attestation/report
+  ?model=…&nonce=<32 fresh bytes>&signing_algo=ecdsa` (public, no key) and NVIDIA NRAS
+  (`POST https://nras.attestation.nvidia.com/v3/attest/gpu`) for each model TEE's GPU evidence. For the gateway and
+  every model TEE it checks: the Intel TDX quote (v4: its ECDSA P-256 signature by the attestation key, that key
+  bound by the quoting enclave's report, the QE report signed by the PCK certificate, the PCK chain to the pinned
+  Intel SGX Root CA, each certificate within its dates), not a debug TD, the report data = signing address ‖ 12 zero
+  bytes ‖ our nonce (and the echoed nonce), MRCONFIGID = 01 ‖ sha256(app_compose), the event log replaying to
+  RTMR0-3 with the compose-hash event equal to the app_compose hash, and the GPUs' evidence carrying our nonce with
+  NRAS's overall result true (a model TEE with no GPU evidence is not attested). It does not check: the TCB level or revocation (Intel PCS collateral), an allowlist of
+  measurements or images, the NRAS token's signature (read over TLS), or that a given reply came from the attested
+  instance (per-reply signatures need the key and are not fetched); every attestation line and journal entry says
+  so. serve fetches it in the background once the server runs (never on the start path) and every 24 h, logs and
+  journals the line when it lands (kind `wait` when verified, `error` when not, `numbers.stage` "attestation", with
+  the steps, signing addresses, MRTD, RTMR3 and compose hashes); until then checks show "TEE not attested: …". A
+  check is "TEE attested <date>" only with a live, verified report under 25 h old. Replay plays the newest
+  `fixtures/nearai/attestation-<date>.json.gz` (`record-nearai -- --attestation`) and shows "TEE not attested:
+  replay plays an attestation recorded <date>". A failed attestation never blocks trading.
+- `book/risk-ledger.ts`: every risk check outcome, appended (fsynced) to `risk-checks-<mode>[-<contract>-<desk>]
+  .jsonl` next to the position book under GIMBAL_STATE_DIR: a `check` line (prompt, model, reply, latency, verdict,
+  attestation, why line, leg size, forecast, the round trip the scanner priced: fees, slippage and basis, the hold);
+  an `act` line when the act after it ended (opened, with the book's position id `<window>@<time>`, or not, with
+  why); and, for a refusal, `hours` lines on each hourly check with the gross APR the refused window actually paid
+  each hour (the scanner's `grossHours`), over `LEDGER_HOLD_HOURS` (the scanner's 240 h cost hold, capped by the time
+  stop). The same act asked again within `LEDGER_RETRY_MS` (1 h: a retry after a refusal that passes, same window,
+  kind and verdict, not opened) is not booked again; its act is booked only if it opens. Serve keeps in memory only
+  the refusals still pricing (at most 500; a refusal fully priced, or 14 days past its hold, is not asked again).
+  `npm run report` reads it offline. A refusal's estimated net = Σ gross / 100 × leg / 8760 over the hours priced,
+  less the round trip prorated by hours priced / hold; it is pending until the whole hold is priced, then helped
+  (< 0: a loss avoided), hurt (> 0: a gain given up) or even. A window refused again inside an earlier refusal's
+  hold is a repeat, counted in that first one, so each window-hour counts once. The counterfactual is a full hold: it
+  leaves out the exits the loop's own bad checks would have made. A pass (and an unchecked pass) shows the position
+  its own act opened (matched by position id, never by time; a pass whose open failed shows none), realised net
+  (running while open). Then the totals: the fully priced refusals' sum, and the pending ones' estimate apart.
 - `loop.ts` (serve): runs `decide` after each funding payment (the hourly check) and on each scan event, only with
   `GIMBAL_TRADE=1` and `strategy.auto`, one decision at a time under the per-desk trader lock, never while a rescue
   or an ADL unwind runs. It carries `act` out with the same open and close code as `pair-mainnet` (maker first),
   publishes `decision` events and journals `enter` / `exit` / `rotate` / `veto` / `wait` with numbers and tx links,
-  and saves `LoopCounters` next to the trader state. `POST /rotate` and `POST /close` go through the same path.
+  each enter, rotate and refusal with the risk check's why line, books every check in the risk check ledger (a ledger
+  that fails is logged, never the act's), and saves `LoopCounters` next to the trader state. `POST /rotate` and `POST /close` go through the same path.
 
 **Position book** (`engine/src/book/`, serve with a contract desk). Every carried-out enter and exit comes in through
 the loop's `book` sink (`BookRecord`, with `startedAt`: when the act began), and so do the fills of an open or close
@@ -1273,6 +1343,7 @@ retries or rebuilds. In particular:
 `{"t": <ms>, "venue": "hyperliquid", "method": "funding", "args": [], "ms": <how long the venue took>, "result": …}`,
 with `"error": "<message>"` in place of `result` when the call threw (replay throws it again). `t` is when the
 answer arrived; replay serves it from that moment on. A `ReplayVenue` answers
-from the file on a virtual clock; `npm run demo` plays a recorded day at ×N speed, with a scripted
-margin squeeze, and its `ReplayContractClient` applies the same policy checks and refusal codes as the
-contract (signatures marked as replay).
+from the file on a virtual clock; `npm run demo` (`tools/demo.mjs`) plays the newest recording, about an hour of
+mainnet answers, at ×10 (`--speed`) with the dashboard, and the Rescue screen's stress test pushes a leg past the
+rescue line. `serve` in replay has no contract client and signs nothing; the tests use `ReplayContractClient`,
+which applies the same policy checks and refusal codes as the contract (signatures marked as replay).

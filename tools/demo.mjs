@@ -1,0 +1,164 @@
+#!/usr/bin/env node
+// `npm run demo`: the engine in replay mode plus the dashboard, with no keys and no chain.
+//
+// It builds `shared/` when its dist/ is missing, starts `serve` (GIMBAL_MODE=replay, the final mainnet policy, replay
+// time x10) and the Vite dev server, waits until both answer, sets the demo's engine rules, and prints the URL.
+// Ctrl+C stops both.
+//
+// The engine plays the newest recording in engine/fixtures/replay/ (about an hour of real mainnet venue answers)
+// through the real scanner, strategy loop and risk engine. Nothing is signed or sent: replay has no contract client,
+// and every GIMBAL_* / NEAR_* / venue / key variable of the calling shell is dropped, so a mainnet environment cannot
+// leak into the demo. The strategy loop runs (GIMBAL_TRADE=1) but replay has no hands: what it would do is journaled
+// as refused. The engine's state lives in a fresh temp folder, removed on exit, so every run starts the same and the
+// user's own state/ is never touched. The rules are set to legs of 12 USD with auto on, the size the final policy
+// (max 20 USD an order) lets through; the engine's default of 1000 USD would be refused E_SIZE everywhere.
+// Plain node and the repo's own node_modules only; no shell, so it runs the same on Windows and Linux.
+//
+//   npm run demo [-- --speed 10] [--engine-port 8790]
+// The web port is 5190 (web/vite.config.ts, strictPort); the engine must not answer on its port before the start.
+
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { connect } from 'node:net';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { parseArgs } from 'node:util';
+
+const root = join(dirname(fileURLToPath(import.meta.url)), '..');
+const WEB_PORT = 5190;
+const START_TIMEOUT_MS = 90_000;
+// The demo's engine rules (PUT /strategy): the engine's defaults, with legs the final policy accepts and auto on.
+const DEMO_STRATEGY = {
+  auto: true,
+  minNetAprPct: 5,
+  legUsd: 12,
+  maxLeverage: 3,
+  stopDrawdownPct: 10,
+  rotate: { minGainPts: 3, forHours: 4 },
+  risk: { watchDistancePct: 15, rescueDistancePct: 8 },
+};
+
+const { values } = parseArgs({
+  options: { speed: { type: 'string', default: '10' }, 'engine-port': { type: 'string', default: '8790' } },
+});
+const speed = values.speed;
+const enginePort = Number(values['engine-port']);
+if (!(Number(speed) > 0)) fail('--speed must be > 0');
+if (!Number.isInteger(enginePort) || enginePort <= 0) fail('--engine-port must be a port number');
+
+// Variables that would point serve at a chain, a venue account or a key. Replay needs none of them.
+const DROP = /^(GIMBAL_|NEAR_|OPERATOR_|OWNER_|DESK_ID$|ORDERLY_|HL_|PHOENIX_|SOLANA_|ARBITRUM_|RELAYER_|ONECLICK_|ENGINE_PORT$|VITE_)/;
+const baseEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !DROP.test(k)));
+
+const children = [];
+let stopping = false;
+let stateDir = null;
+
+function fail(msg) {
+  console.error(`demo: ${msg}`);
+  stop(1);
+}
+
+// Kills both children (the signal is sent synchronously) and exits; never returns.
+function stop(code) {
+  stopping = true;
+  for (const c of children) if (c.exitCode === null) c.kill();
+  if (stateDir !== null) {
+    // The engine may still hold a file for a moment after the kill; a leftover temp folder is harmless.
+    try { rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
+  }
+  process.exit(code);
+}
+
+process.on('SIGINT', () => stop(0));
+process.on('SIGTERM', () => stop(0));
+
+// A package's folder as seen from `from` (a workspace may have its own copy, else the hoisted one). Not through
+// require.resolve of a bin path: packages like typescript do not export their bin files.
+function pkgDir(name, from) {
+  try {
+    return dirname(createRequire(join(from, 'package.json')).resolve(`${name}/package.json`));
+  } catch {
+    for (const dir of [join(from, 'node_modules', name), join(root, 'node_modules', name)]) {
+      if (existsSync(join(dir, 'package.json'))) return dir;
+    }
+    fail(`${name} is not installed; run \`npm install\``);
+    return '';
+  }
+}
+
+function portInUse(port) {
+  return new Promise((resolve) => {
+    const s = connect({ port, host: '127.0.0.1' });
+    s.once('connect', () => { s.destroy(); resolve(true); });
+    s.once('error', () => resolve(false));
+  });
+}
+
+async function answers(url) {
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(2000) });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function waitFor(name, url) {
+  const until = Date.now() + START_TIMEOUT_MS;
+  while (Date.now() < until) {
+    if (stopping) return;
+    if (await answers(url)) return;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  fail(`${name} did not answer on ${url} within ${START_TIMEOUT_MS / 1000} s`);
+}
+
+function run(name, args, cwd, env) {
+  const child = spawn(process.execPath, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  children.push(child);
+  const prefix = (chunk) => chunk.toString().split(/\r?\n/).filter((l) => l !== '').map((l) => `[${name}] ${l}`).join('\n');
+  child.stdout.on('data', (d) => console.log(prefix(d)));
+  child.stderr.on('data', (d) => console.error(prefix(d)));
+  child.on('exit', (code, signal) => {
+    if (!stopping) fail(`${name} exited (${signal ?? `code ${code}`})`);
+  });
+  return child;
+}
+
+if (!existsSync(join(root, 'node_modules'))) fail('run `npm install` first');
+
+for (const [name, port] of [['engine', enginePort], ['web', WEB_PORT]]) {
+  if (await portInUse(port)) fail(`port ${port} is already in use; stop whatever runs there (the ${name} would clash with it)`);
+}
+
+if (!existsSync(join(root, 'shared', 'dist', 'index.js'))) {
+  console.log('demo: building shared/ (first run)');
+  const tsc = join(pkgDir('typescript', root), 'bin', 'tsc');
+  const r = spawnSync(process.execPath, [tsc, '-p', join(root, 'shared', 'tsconfig.json')], { stdio: 'inherit' });
+  if (r.status !== 0) fail('building shared/ failed');
+}
+
+const policy = join(root, 'tools', 'mainnet-final-policy.json');
+stateDir = mkdtempSync(join(tmpdir(), 'gimbal-demo-'));
+const engineArgs = ['src/cli/serve.ts', '--speed', speed, '--port', String(enginePort), '--policy', policy, '--state-dir', stateDir];
+run('engine', engineArgs, join(root, 'engine'), { ...baseEnv, GIMBAL_MODE: 'replay', GIMBAL_TRADE: '1' });
+const vite = join(pkgDir('vite', join(root, 'web')), 'bin', 'vite.js');
+run('web', [vite, '--clearScreen', 'false'], join(root, 'web'), { ...baseEnv, ENGINE_PORT: String(enginePort) });
+
+await waitFor('engine', `http://127.0.0.1:${enginePort}/state`);
+const put = await fetch(`http://127.0.0.1:${enginePort}/strategy`, {
+  method: 'PUT',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify(DEMO_STRATEGY),
+}).catch((err) => ({ ok: false, status: 0, text: async () => String(err) }));
+if (!put.ok) fail(`PUT /strategy failed (${put.status}): ${(await put.text()).slice(0, 300)}`);
+console.log(`demo: engine rules set: legs ${DEMO_STRATEGY.legUsd} USD at up to ${DEMO_STRATEGY.maxLeverage}x, enter above ${DEMO_STRATEGY.minNetAprPct} % net APR, auto on`);
+await waitFor('web', `http://localhost:${WEB_PORT}/`);
+if (!stopping) {
+  console.log('');
+  console.log(`demo: ready. Open http://localhost:${WEB_PORT}  (replay x${speed}: nothing is signed or sent; Ctrl+C stops both)`);
+  console.log('');
+}

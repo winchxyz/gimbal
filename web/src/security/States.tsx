@@ -1,3 +1,4 @@
+import { writeControls } from '../remote/readonly.ts';
 import { ONBOARDING_HREF } from '../shell/routes.ts';
 import { clock } from '../journal/entry.ts';
 import { ExtLink } from './ExtLink.tsx';
@@ -13,11 +14,13 @@ export function SecurityEmpty() {
         <div className="lab">Security</div>
         <h1>No desk yet</h1>
         <p>Once you create a desk, this page shows the accounts its contract controls, your policy, and what the operator can and cannot do.</p>
-        <div className="go">
-          <a className="btn primary" href={ONBOARDING_HREF}>
-            Create a desk
-          </a>
-        </div>
+        {writeControls().onboarding ? (
+          <div className="go">
+            <a className="btn primary" href={ONBOARDING_HREF}>
+              Create a desk
+            </a>
+          </div>
+        ) : null}
       </div>
     </div>
   );

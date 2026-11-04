@@ -5,6 +5,7 @@
 // authority), which read publicly; Orderly's account is read only over its authenticated stream, which serve does not
 // open (it signs nothing), so Orderly legs come in once the strategy engine holds that session. An account read has a
 // deadline (ACCOUNT_READ_DEADLINE_MS): past it that venue's read fails for this tick instead of holding the tick up.
+// Phoenix legs are marked with marks up to 5 s old (phoenix.ts MARKS_MAX_AGE_MS), refreshed between ticks.
 //
 // ReplayDesk (replay): there are no recorded accounts, so the desk is scripted: one pair at strategy.legUsd a leg and
 // strategy.maxLeverage, opened at the first recorded marks, then marked and funded by the recording as the replay

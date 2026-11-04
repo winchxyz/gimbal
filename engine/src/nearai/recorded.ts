@@ -27,3 +27,31 @@ export function ethBtcReplies(): { file: string; synthetic: boolean }[] {
     ...recorded.map((f) => ({ file: join(NEARAI_FIXTURES, f), synthetic: false })),
   ];
 }
+
+/** The synthetic risk check replies (hand-written); real ones are recorded next to them as risk-checks-<date>.json. */
+export const SYNTHETIC_RISK_CHECKS = 'SYNTHETIC-veto.json';
+const RECORDED_RISK_CHECKS = /^risk-checks-\d{4}-\d{2}-\d{2}\.json$/;
+const RECORDED_ATTESTATION = /^attestation-\d{4}-\d{2}-\d{2}\.json\.gz$/;
+
+/** The file names `npm run record-nearai` writes on `date` (ms). */
+export function riskChecksName(date: number): string {
+  return `risk-checks-${new Date(date).toISOString().slice(0, 10)}.json`;
+}
+export function attestationName(date: number): string {
+  return `attestation-${new Date(date).toISOString().slice(0, 10)}.json.gz`;
+}
+
+/** Every risk check recording, synthetic first, then the recorded ones oldest first (a later answer wins). */
+export function riskCheckFiles(dir = NEARAI_FIXTURES): { file: string; synthetic: boolean }[] {
+  const recorded = readdirSync(dir).filter((f) => RECORDED_RISK_CHECKS.test(f)).sort();
+  return [
+    { file: join(dir, SYNTHETIC_RISK_CHECKS), synthetic: true },
+    ...recorded.map((f) => ({ file: join(dir, f), synthetic: false })),
+  ];
+}
+
+/** The newest recorded attestation in the fixtures, or null. */
+export function newestAttestationFile(dir = NEARAI_FIXTURES): string | null {
+  const recorded = readdirSync(dir).filter((f) => RECORDED_ATTESTATION.test(f)).sort();
+  return recorded.length === 0 ? null : join(dir, recorded.at(-1)!);
+}

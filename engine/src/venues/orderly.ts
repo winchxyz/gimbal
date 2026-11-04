@@ -47,6 +47,7 @@ export interface OrderlyInfoRow {
   base_mmr: number;
   imr_factor: number;
   funding_period: number;        // hours
+  created_time?: number;         // ms, when the market was listed
 }
 
 export interface OrderlyFuturesRow {
@@ -60,6 +61,7 @@ export interface OrderlyFuturesRow {
   next_funding_time: number;     // ms
   open_interest: number;         // base units
   '24h_amount': number;          // USD
+  '24h_open'?: number;           // the price 24 h ago
 }
 
 export interface OrderlyRateHistoryRow {
@@ -440,6 +442,7 @@ export function parseMarkets(info: readonly OrderlyInfoRow[]): OrderlyMarket[] {
     maxLeverage: maxLeverageFromImr(r.base_imr),
     isolatedOnly: false,
     delisted: r.status !== 'ACTIVE',
+    ...(finiteOrNull(r.created_time) === null ? {} : { listedAt: finiteOrNull(r.created_time) }),
     brokerId: r.broker_id,
     baseMin: r.base_min,
     minNotional: r.min_notional,
@@ -479,6 +482,7 @@ export function parseFunding(
       oraclePx: finiteOrNull(f.index_price),
       openInterest: finiteOrNull(f.open_interest),
       volume24hUsd: finiteOrNull(f['24h_amount']),
+      ...(finiteOrNull(f['24h_open']) === null ? {} : { prevDayPx: finiteOrNull(f['24h_open']) }),
     });
   }
   return out;

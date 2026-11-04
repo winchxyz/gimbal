@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react';
 import type { Mode } from '@gimbal/shared';
 import { useStream } from '../stream/hub.ts';
 import { hrefOf } from '../shell/routes.ts';
+import { bestNetAprPct } from '../windows/model.ts';
 import type { FlowState, OnboardingFlow } from './flow.ts';
 import type { HeroOptions } from './hero/types.ts';
 import { sentence } from './text.ts';
@@ -51,7 +52,7 @@ export function Welcome({ flow, s, mode }: Props) {
 
   const windows = useStream((x) => x.windows);
   const scan = useStream((x) => x.scan);
-  const best = windows && windows.length > 0 ? Math.max(...windows.map((w) => w.netAprPct)) : null;
+  const best = bestNetAprPct(windows);
   const waiting = s.busy === 'connect';
   const failed = s.errors.connect !== undefined && !waiting;
   const look = mode === 'replay' ? { href: hrefOf('desk'), label: 'Watch the replay first' } : { href: hrefOf('windows'), label: 'Look at the windows first' };

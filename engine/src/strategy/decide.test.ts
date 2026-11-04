@@ -2,8 +2,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { LOOP_RULES, NO_COUNTERS, decide, entryFailure, heldForwardAprPct, journalWait, sizeFor, skipAct } from './decide.ts';
-import type { Decision, LoopCounters } from './decide.ts';
+import { LOOP_RULES, NO_COUNTERS, decide, entryFailure, heldForwardAprPct, journalWait, sizeFor, skipAct } from './decide.ts';import type { Decision, LoopCounters } from './decide.ts';
 import { HOUR, STRATEGY, T0, held, hours, input, win } from './test-helpers.ts';
 
 const XLM = 'xlm-hyperliquid-phoenix';
@@ -89,6 +88,97 @@ test('the entry rules: enterable, net at the minimum, this hour, 7 and 14 days o
   // A 12 USD leg may be at most 2 % of a leg market's open interest: 600 USD.
   assert.equal(entryFailure(win(XLM, { depthUsd: 599 }), s), 'capacity $599.00, under the $600.00 a $12.00 leg needs');
   assert.equal(entryFailure(win(XLM, { depthUsd: 600 }), s), null);
+});
+
+// ---- free margin and the hands on entry ----
+
+const ETH_OR = 'eth-orderly-phoenix';
+/** The way serve opens it: long Phoenix, short Hyperliquid. */
+const XLM_PH = 'xlm-phoenix-hyperliquid';
+/** Free margin on the mainnet desk today. */
+const TODAY = { hyperliquid: 7.68, phoenix: 9.75 };
+/** XLM in whole coins (Hyperliquid sz_decimals 0) at the 0.25 USD a stored XLM price reads in the pair tests. */
+const XLM_LOTS = { [XLM_PH]: { longLot: 1, shortLot: 1, px: 0.25 } };
+/** What serve-loop.ts windowSymbol says of a window in the other direction. */
+const WRONG_WAY = `serve opens short hyperliquid, long phoenix only (as pair-mainnet open); ${XLM} is long hyperliquid, short phoenix`;
+
+test('margin: the same window passes with free margin on both venues and is refused where none opens a 10 USD leg', () => {
+  const s = { strategy: STRATEGY, freeMarginUsd: { orderly: 50, phoenix: 50 }, liveRescue: { hyperliquid: true } };
+  assert.equal(entryFailure(win(ETH_OR), s), null);
+  // The loop never moves margin to open: no cost makes up for it, the window is refused outright.
+  assert.equal(entryFailure(win(ETH_OR), { ...s, freeMarginUsd: { orderly: 0, phoenix: 50 } }),
+    '$0.00 free margin on Orderly at 1.5x opens $0.00 a leg in whole lots, under the $10.00 minimum: the loop does not move margin to open');
+  // Some margin is enough: sizeFor sizes the leg down to it. 6.67 USD at 1.5x opens 10 USD; 6.6 opens 9.90.
+  assert.equal(entryFailure(win(ETH_OR), { ...s, freeMarginUsd: { orderly: 6.67, phoenix: 50 } }), null);
+  assert.match(entryFailure(win(ETH_OR), { ...s, freeMarginUsd: { orderly: 6.6, phoenix: 50 } })!, /^\$6\.60 free margin on Orderly at 1\.5x opens \$9\.90 a leg/);
+  // What a close frees first counts there (a rotation).
+  assert.equal(entryFailure(win(ETH_OR), { ...s, freeMarginUsd: { orderly: 0, phoenix: 50 }, freedMarginUsd: { orderly: 8 } }), null);
+  // A venue not read this check is skipped: sizeFor waits on it, the gate does not refuse on a read failure.
+  assert.equal(entryFailure(win(ETH_OR), { ...s, freeMarginUsd: { phoenix: 50 } }), null);
+  // Outside decide() (no free margin given) nothing is judged.
+  assert.equal(entryFailure(win(ETH_OR), { strategy: STRATEGY }), null);
+});
+
+test('margin: the gate rounds to whole lots as sizeFor does, so the two agree', () => {
+  // 7 USD at 1.5x is 10.50, but in lots of 1 at 3 USD that is 3 lots, 9.00: refused by both.
+  const lots = { [XLM_PH]: { longLot: 1, shortLot: 1, px: 3 } };
+  const short = input({ freeMarginUsd: { hyperliquid: 7, phoenix: 50 }, lots });
+  assert.match(entryFailure(win(XLM_PH), short)!, /^\$7\.00 free margin on Hyperliquid at 1\.5x opens \$9\.00 a leg in whole lots/);
+  const size = sizeFor(win(XLM_PH), short);
+  assert.equal(size.ok, false);
+  assert.match(!size.ok ? size.why : '', /sizes a leg at \$9\.00 in whole lots, under the \$10\.00 minimum/);
+  // 8 USD: 12.00 a leg capped by the 12 USD leg, 4 lots: both pass.
+  const enough = input({ freeMarginUsd: { hyperliquid: 8, phoenix: 50 }, lots });
+  assert.equal(entryFailure(win(XLM_PH), enough), null);
+  assert.deepEqual(sizeFor(win(XLM_PH), enough), { ok: true, legUsd: 12, leverage: 1.5, qty: '4' });
+});
+
+test('margin: XLM at 2 of 3 hours keeps its count when a free-margin read fails, waits to size, then enters', () => {
+  const at2 = { ...NO_COUNTERS, aboveByWindow: { [XLM_PH]: 2 }, lastHourlyAt: T0 - HOUR };
+  const failed = decide(input({ windows: [win(XLM_PH)], counters: at2, freeMarginUsd: { phoenix: 9.75 }, lots: XLM_LOTS }));
+  assert.equal(failed.counters.aboveByWindow[XLM_PH], 3, 'the count stays: a read failure is not a reason the window failed');
+  assert.equal(failed.act, null);
+  assert.match(failed.decision.reason, /^XLM 15\.0 % net is ready, but \$0\.00 free margin on Hyperliquid at 1\.5x leaves nothing to open$/);
+  const next = decide(input({ windows: [win(XLM_PH)], now: T0 + HOUR, counters: failed.counters, freeMarginUsd: TODAY, lots: XLM_LOTS }));
+  assert.equal(next.act?.kind, 'enter');
+  // A read that answers 0 is a refusal, and the count starts again.
+  const zero = decide(input({ windows: [win(XLM_PH)], counters: at2, freeMarginUsd: { hyperliquid: 0, phoenix: 9.75 }, lots: XLM_LOTS }));
+  assert.equal(zero.counters.aboveByWindow[XLM_PH], undefined);
+});
+
+test('today: Hyperliquid 7.68 and Phoenix 9.75 free, XLM long Phoenix / short Hyperliquid passes and is entered', () => {
+  const today = input({ freeMarginUsd: TODAY, lots: XLM_LOTS });
+  assert.equal(entryFailure(win(XLM_PH), today), null);
+  const ds = hours(today, 3, () => [win(XLM_PH)]);
+  assert.deepEqual(actions(ds), ['wait', 'wait', 'enter']);
+  // Phoenix has no live rescue: 1.5x. Hyperliquid binds: 7.68 x 1.5 = 11.52, 46 XLM at 0.25 = 11.50.
+  assert.deepEqual(ds[2]!.act, { kind: 'enter', windowId: XLM_PH, legUsd: 11.5, leverage: 1.5, qty: '46' });
+});
+
+test('hands: a window the hands cannot open, ranked above XLM, is passed over; XLM is the one counted and entered', () => {
+  const ranked = () => [win(XLM, { netAprPct: 30 }), win(ETH_OR, { netAprPct: 25 }), win(XLM_PH, { netAprPct: 14.2 })];
+  const unopenable = { [XLM]: WRONG_WAY, [ETH_OR]: 'serve opens short hyperliquid, long phoenix only' };
+  const ds = hours(input({ freeMarginUsd: TODAY, lots: XLM_LOTS, unopenable }), 3, ranked);
+  assert.deepEqual(actions(ds), ['wait', 'wait', 'enter']);
+  assert.equal(ds[0]!.decision.reason, 'XLM 14.2 % net, 1 of 3 hours above 10 %');
+  assert.equal(ds[1]!.counters.aboveByWindow[XLM_PH], 2);
+  assert.equal(ds[1]!.counters.aboveByWindow[XLM], undefined);
+  assert.equal(ds[2]!.act?.kind === 'enter' && ds[2]!.act.windowId, XLM_PH);
+  assert.equal(entryFailure(win(XLM), { strategy: STRATEGY, unopenable }), WRONG_WAY);
+  // Without the list the top window stalls the desk: it is the one waited on, and it cannot be opened.
+  const stalled = hours(input({ freeMarginUsd: TODAY, lots: XLM_LOTS }), 3, ranked);
+  assert.equal(stalled[2]!.decision.windowId, XLM);
+  assert.equal(stalled[2]!.act?.kind === 'enter' && stalled[2]!.act.windowId, false);
+});
+
+test('hands: a rotation challenger the hands cannot open is never counted as better', () => {
+  const windows = () => [win(XLM, { netAprPct: 40, switchCostUsd: 0.1 }), win(XLM_PH, { netAprPct: 14 })];
+  const base = input({ held: held(XLM_PH), lots: XLM_LOTS });
+  const counted = hours(base, 5, windows);
+  assert.ok((counted[4]!.counters.betterByWindow[XLM] ?? 0) > 0, 'without the list it counts');
+  const ds = hours({ ...base, unopenable: { [XLM]: WRONG_WAY } }, 5, windows);
+  assert.equal(ds[4]!.counters.betterByWindow[XLM], undefined);
+  assert.ok(ds.every((d) => d.act === null), JSON.stringify(ds.map((d) => d.decision.reason)));
 });
 
 test('a number the gate reads that is not finite fails the gate with a reason', () => {
@@ -180,14 +270,21 @@ test('size: rounded down to whole common lots of the two venues, as pair-mainnet
 });
 
 test('the top window that cannot be sized is waited on with the reason, not swapped for the next one', () => {
+  const SOL_HO = 'sol-hyperliquid-orderly';
+  const lots = { [SOL_HO]: { longLot: 0.01, shortLot: 0.01, px: 1 } };
+  const two = hours(input({ lots }), 3, () => [win(XLM, { netAprPct: 16 }), win(SOL_HO, { netAprPct: 12 })]);
+  assert.equal(two[2]!.decision.action, 'wait');
+  assert.equal(two[2]!.decision.windowId, XLM);
+  assert.equal(two[2]!.decision.reason, 'XLM 16.0 % net is ready, but no lot sizes for XLM: its size cannot be rounded to whole lots');
+  // Free margin that cannot open a 10 USD leg is not a size to wait on: the loop never moves margin there, so the
+  // gate refuses the window and the next one is counted and entered.
   const free = { hyperliquid: 50, phoenix: 2, orderly: 50 };
   const lone = hours(input({ freeMarginUsd: free }), 3, () => [win(XLM, { netAprPct: 16 })]);
   assert.equal(lone[2]!.decision.action, 'wait');
-  assert.equal(lone[2]!.decision.reason, 'XLM 16.0 % net is ready, but $2.00 free margin on Phoenix at 1.5x sizes a leg at $3.00 in whole lots, under the $10.00 minimum');
-  assert.equal(lone[2]!.counters.lastWaitReason, `size:${XLM}:margin:phoenix`);
-  const two = hours(input({ freeMarginUsd: free }), 3, () => [win(XLM, { netAprPct: 16 }), win('sol-hyperliquid-orderly', { netAprPct: 12 })]);
-  assert.equal(two[2]!.decision.action, 'wait');
-  assert.equal(two[2]!.decision.windowId, XLM);
+  assert.equal(lone[2]!.decision.reason, 'No window clears the entry rules; best XLM 16.0 % net: $2.00 free margin on Phoenix at 1.5x opens $3.00 a leg in whole lots, under the $10.00 minimum: the loop does not move margin to open');
+  assert.equal(lone[2]!.counters.lastWaitReason, `blocked:${XLM}:margin`);
+  const past = hours(input({ freeMarginUsd: free }), 3, () => [win(XLM, { netAprPct: 16 }), win(SOL_HO, { netAprPct: 12 })]);
+  assert.equal(past[2]!.act?.kind === 'enter' && past[2]!.act.windowId, SOL_HO);
   const noLots = hours(input({ lots: {} }), 3, () => [win(XLM)]);
   assert.equal(noLots[2]!.decision.reason, 'XLM 15.0 % net is ready, but no lot sizes for XLM: its size cannot be rounded to whole lots');
   assert.equal(noLots[2]!.counters.lastWaitReason, `size:${XLM}:lots`);
@@ -456,14 +553,16 @@ test('a rotation sizes the new legs with the margin loop.ts says the held legs f
   // 3 USD free on each venue plus 6 USD freed is 9 USD: 13.50 at 1.5x, capped at 12.
   const ds = hours(input({ held: held(XLM), freeMarginUsd: free, freedMarginUsd: { hyperliquid: 6, phoenix: 6 } }), 4, () => windows);
   assert.deepEqual(ds[3]!.act, { kind: 'rotate', fromId: XLM, toId: ZEC, legUsd: 12, leverage: 1.5, qty: '12' });
-  // Freed on one venue only: Phoenix's 3 USD at 1.5x is 4.50.
-  const one = hours(input({ held: held(XLM), freeMarginUsd: free, freedMarginUsd: { hyperliquid: 6 } }), 4, () => windows);
+  // Freed on one venue only: Phoenix's 3 USD at 1.5x is 4.50, so ZEC fails the gate and is never counted better.
+  const oneFreed = input({ held: held(XLM), freeMarginUsd: free, freedMarginUsd: { hyperliquid: 6 } });
+  const one = hours(oneFreed, 4, () => windows);
   assert.equal(one[3]!.decision.action, 'hold');
-  assert.match(one[3]!.decision.reason, /\$3\.00 free margin on Phoenix at 1\.5x sizes a leg at \$4\.50 in whole lots, under the \$10\.00 minimum$/);
+  assert.equal(one[3]!.counters.betterByWindow[ZEC], undefined);
+  assert.match(entryFailure(win(ZEC), oneFreed)!, /^\$3\.00 free margin on Phoenix at 1\.5x opens \$4\.50 a leg in whole lots, under the \$10\.00 minimum/);
   // Absent: no freed margin is guessed from the held leg.
   const none = hours(input({ held: held(XLM), freeMarginUsd: free }), 4, () => windows);
   assert.equal(none[3]!.decision.action, 'hold');
-  assert.match(none[3]!.decision.reason, /under the \$10\.00 minimum$/);
+  assert.equal(none[3]!.counters.betterByWindow[ZEC], undefined);
 });
 
 test('rotation comes before a counted exit: a better window replaces a compressed one without a cooldown', () => {
