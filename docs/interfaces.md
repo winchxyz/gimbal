@@ -1224,11 +1224,13 @@ directory fsynced on POSIX) and refused for another contract, desk or address. E
 entry each, before it is signed, and leaves that list only in the save that holds the trader's result for it (a
 close's result, a watch check's report, an adopt). A reader removes only its own temporary files and those of a
 process that is gone. A missing or unreadable file is not a fresh start: serve then only alerts until it is started
-once with `GIMBAL_TRADER_FRESH=<contract>/<desk>` after both legs were checked on the venues. Any other value
+once with `GIMBAL_TRADER_FRESH=<contract>/<desk>` after both legs were checked on the venues. That holds for a first
+start with both legs flat too: with no file, serve keeps no pair and the strategy loop gets no hands until that start
+writes one. Any other value
 (`1` included) is ignored, and so is the right one over a usable file: a usable file is always restored (a start line
 says to remove `GIMBAL_TRADER_FRESH` from the env), so a shrink that happened while serve was down is compared with the
 saved baselines and goes the normal ADL way (two agreeing reads, then the unwind). To start over a usable file, stop
-serve and move the file aside first. Legs that read flat, or a new pair opened after a flat save, start over without
+serve and move the file aside first. Over a usable file, legs that read flat, or a new pair opened after a flat save, start over without
 it.
 
 **Monitor** (`engine/src/risk/monitor.ts`). Every 30 min serve prints each leg (size, mark, liquidation price,

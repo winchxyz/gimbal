@@ -54,7 +54,10 @@ export interface OpsCtx {
   prices: PriceDeps;
   /** --send (the CLI), or serve trading. */
   send: boolean;
-  /** Set once an --send open or close has passed its refusals: only then may a price read send refresh_prices. */
+  /**
+   * Set once an --send open or close has passed its refusals: only then may a leg's price read send refresh_prices.
+   * The one exception is planOpen's own refresh, at --send, of a stored price that is missing or too old to plan with.
+   */
   trading: boolean;
   say(line?: string): void;
   /** Something the owner must reconcile (the CLI prints it as an `open:` line); `alert` false: printed, no exit code 3. */
@@ -318,7 +321,7 @@ export async function planOpen(ctx: OpsCtx, pair: Pair, request: OpenRequest): P
   const since = Date.now() - 7 * 86_400_000;
   const evm = ctx.desk.evm_address.toLowerCase();
 
-  const [hlF, pxF, hlBook, pxBook, hlState, state, sp, lamports, assetData, hlOpen] = await Promise.all([
+  const [hlF, pxF, hlBook, pxBook, hlState, state, spRead, lamports, assetData, hlOpen] = await Promise.all([
     hlFunding(ctx, symbol, since), phoenixFunding(ctx, symbol, since), ctx.hl.book(symbol, 5), ctx.phoenix.book(symbol, 5),
     hlInfo<unknown>(ctx, { type: 'clearinghouseState', user: evm }), traderState(ctx), storedPrice(ctx.client, symbol), ctx.chain.balance(ctx.sol.authority),
     hlInfo<{ leverage?: { type?: string; value?: number } }>(ctx, { type: 'activeAssetData', user: evm, coin: symbol }).catch(() => null),
@@ -373,6 +376,23 @@ export async function planOpen(ctx: OpsCtx, pair: Pair, request: OpenRequest): P
   const plan = carryPlan({ symbol, legUsd, leverage, holdDays, basisBufferBps: basisBps, short, long });
   refusals.push(...plan.refusals);
 
+  // A real open (--send, or serve trading) on a priced symbol whose stored price is missing (a contract that never had
+  // refresh_prices) or would not live the first part sends one refresh_prices here, through ensureFresh (shared with any
+  // refresh in flight, none within 30 s of the last), so the cap and band checks below run on the refreshed price.
+  // Only when nothing above refused it already: a refused open spends no gas. A dry run stays read-only.
+  let sp = spRead;
+  let refreshed = false;
+  let refreshFailed: string | null = null;
+  const marginS = pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S;
+  if (ctx.send && pair.priced && refusals.length === 0 && ctx.desk.closing !== true && (sp === null || sp.ageS > ctx.prices.maxAgeS - marginS)) {
+    try {
+      sp = await ensureFresh(ctx.prices, symbol, marginS);
+      refreshed = true;
+    } catch (err) {
+      refreshFailed = errorMessage(err);
+    }
+  }
+
   let chunk: bigint | null = null;
   try {
     chunk = await pair.trader.openChunk(1);
@@ -385,7 +405,8 @@ export async function planOpen(ctx: OpsCtx, pair: Pair, request: OpenRequest): P
   const orderTx = txCostLamports({ units: ORDER_COMPUTE_UNITS, microLamports: pair.microLamports });
   const solNeed = Math.max(1, parts) * ORDERS_PER_PART * orderTx + SYSTEM_ACCOUNT_RENT_LAMPORTS;
   if (lamports < solNeed) refusals.push(`the desk authority holds ${solText(lamports)}; ${Math.max(1, parts)} pair part(s) need up to ${solText(solNeed)} for Phoenix fees and the rent-exempt reserve: send ${solText(solNeed - lamports)} to ${ctx.sol.authority}`);
-  if (sp === null && pair.priced) refusals.push(`the contract has no stored ${symbol} price`);
+  if (refreshFailed !== null) refusals.push(`the stored ${symbol} price could not be refreshed before the open: ${refreshFailed}`);
+  else if (sp === null && pair.priced) refusals.push(`the contract has no stored ${symbol} price`);
   const sim = first === null ? { lines: ['ioc sim   no part to simulate'], refusals: [] } : await simulateIoc(ctx, pair, first);
   refusals.push(...sim.refusals);
 
@@ -393,7 +414,7 @@ export async function planOpen(ctx: OpsCtx, pair: Pair, request: OpenRequest): P
   ctx.say(`size      ${qtyString(size)} ${symbol} per leg (${usd(qtyNumber(size) * mid)} at ${mid.toFixed(4)}); common lot ${qtyString(pair.lot)}`);
   ctx.say(`          ${parts} pair part(s) of at most ${chunk === null ? '?' : qtyString(chunk)} (policy max_notional_usd ${policy.max_notional_usd} less the ${pair.bandBps} bps band)`);
   ctx.say(`leverage  Hyperliquid ${symbol}: ${assetData?.leverage === undefined ? 'unknown' : `${assetData.leverage.type} ${assetData.leverage.value}x`} on the account (the contract cannot set it); effective leverage is what is checked`);
-  ctx.say(`price     stored ${symbol} ${sp === null ? 'none' : `${sp.px}, ${Math.round(sp.ageS)} s old`}; --send refreshes it before each part when it would not live ${pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S} s more (a fresh one lives ${priceLifeS(policy.oracle_max_age_s)} s of the ${policy.oracle_max_age_s})`);
+  ctx.say(`price     stored ${symbol} ${sp === null ? 'none' : `${sp.px}, ${Math.round(sp.ageS)} s old${refreshed ? ' (refreshed for this open)' : ''}`}; --send refreshes it before each part when it would not live ${pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S} s more (a fresh one lives ${priceLifeS(policy.oracle_max_age_s)} s of the ${policy.oracle_max_age_s})`);
   ctx.say(`solana    authority ${solText(lamports)}; up to ${solText(solNeed)} needed (unit price ${pair.microLamports} µlamports)`);
   for (const l of sim.lines) ctx.say(l);
   ctx.say(`order     maker first: Hyperliquid SELL post-only at the ask, repriced every ${pair.maker.repriceMs / 1000} s, at most ${pair.maker.maxOrders} signed post-only orders for the whole open (the C10 meter counts each), for ${pair.maker.timeoutMs / 1000} s${pair.maker.takerFallback ? ', then an IOC for the rest' : ', no taker fallback (--taker-fallback to add one)'}; then Phoenix BUY IOC for what filled`);

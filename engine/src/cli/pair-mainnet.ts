@@ -23,7 +23,9 @@
 // IOC retry). A stored price is the oracle's timestamp less its 600 s recency, so one fresh from refresh_prices lives
 // oracle_max_age_s - 600 s (300 s at 900): the maker timeout plus 120 s must fit that. The price is refreshed (only
 // once the refusals are checked) before each part when it would not outlive that, and whenever an order (an unwind,
-// a close) finds it stale; never twice within 30 s.
+// a close) finds it stale; never twice within 30 s. One exception: open --send whose other refusals pass refreshes a
+// stored price that is missing or would not outlive the first part while it plans, so the cap and band checks run on
+// it; a dry run never sends refresh_prices and reports the missing price.
 //
 // Before an open the plan prints both legs' funding now and over 7 days, the gross APR, the spread expected over the
 // hold against the round trip (taker fees, half spreads, basis buffer), the size, the leverage and liquidation

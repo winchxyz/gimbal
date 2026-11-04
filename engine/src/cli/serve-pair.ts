@@ -129,7 +129,10 @@ export interface CarryInput {
   client: NearContractClient;
   relayer: Relayer | null;
   prices: PriceDeps;
-  /** While on, the legs price with the stored price as it is: no refresh_prices before the open's refusals pass. */
+  /**
+   * While on, the legs price with the stored price as it is: their reads send no refresh_prices before the open's
+   * refusals pass (planOpen itself refreshes one that is missing or too old to plan with, once).
+   */
   planning(on: boolean): void;
 }
 

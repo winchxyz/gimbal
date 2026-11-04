@@ -32,7 +32,9 @@ repo root are all it needs.
    and builds the `Dockerfile`.
 2. Settings → Region: EU West. Settings → Networking: no public domain.
 3. Add a volume to the service, mount path `/data`.
-4. Variables (Raw Editor accepts a pasted env file). The names, values never in the repo:
+4. Variables (Raw Editor accepts a pasted env file). The names, values never in the repo. Each variable is its own
+   `NAME=value` line; check that every value sits under its own name (a key pasted under the wrong name is a common
+   mistake, and serve then refuses to start or signs with the wrong key):
    - from `.keys/engine-mainnet-<contract>.env` (written by `tools/mainnet/desk.mjs`): `GIMBAL_MODE`,
      `NEAR_NETWORK`, `GIMBAL_CONTRACT_ID`, `DESK_ID`, `OWNER_ACCOUNT_ID`, `OPERATOR_ACCOUNT_ID`,
      `OPERATOR_PRIVATE_KEY`, `OPERATOR_ALLOWANCE_NEAR`, `ORDERLY_BROKER_ID`, `HL_API_URL`, `ORDERLY_API_URL`,
@@ -40,8 +42,14 @@ repo root are all it needs.
    - `ONECLICK_API_KEY` (rescues and transfers), `NEAR_AI_API_KEY` (the NEAR AI risk check; without it windows pass with
      "no NEAR AI risk check");
    - `GIMBAL_TRADE=1`, `GIMBAL_RESCUE=1`;
-   - `GIMBAL_TRADER_FRESH=<contract>/<desk>` for the first start only when a pair is already open and its legs
-     were checked on the venues (`docs/interfaces.md`, "The pair in serve"); remove it after that start.
+   - `RELAYER_EVM_PRIVATE_KEY`, required with `GIMBAL_RESCUE=1`: the Arbitrum gas wallet that submits
+     `evm_usdc_to_intents` (it pays gas only, it holds no desk money); without it serve exits at start with a
+     configuration error;
+   - `ARBITRUM_RPC_URL` (optional): the Arbitrum RPC the rescue uses; without it, viem's public Arbitrum One RPC;
+   - `GIMBAL_TRADER_FRESH=<contract>/<desk>` on the first start whenever the volume holds no trader state file yet,
+     even with both legs flat: a missing file is not a fresh start, so without it the pair stays alert only and the
+     strategy loop gets no hands (it can never open). Check both legs on the venues first (`docs/interfaces.md`,
+     "The pair in serve"); remove it after that start (a later start restores the file and ignores it).
 5. Deploy. The log shows the start lines: mode, contract, which legs are live, which protections trade, the
    rescue routes, and `strategy: off` until the owner turns `auto` on.
 
