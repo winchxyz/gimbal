@@ -259,7 +259,7 @@ test('auto on refuses before get_desk; auto turned on during the reads refuses b
   const on = deps(tempDir(t), { autoOn: () => true });
   assert.equal((await runOrderlyWithdraw(on.d)).status, 'refused');
   assert.equal(on.deskReads(), 0);
-  assert.match(on.lines.at(-1)!, /refused: the engine's auto is on: the strategy loop could open an Orderly leg between the flat check and the withdrawal; turn auto off/);
+  assert.match(on.lines.at(-1)!, /refused: the strategy loop trades \(GIMBAL_TRADE=1 and auto on\) and could open an Orderly leg between the flat check and the withdrawal: unset GIMBAL_TRADE for the withdrawal \(railway variable delete GIMBAL_TRADE\) and set it back after/);
 
   const dir = tempDir(t);
   const fake = fakeClient();
@@ -349,7 +349,7 @@ test('success: marker started before the withdraw, then done with the report; th
   assert.deepEqual(m.report, REPORT);
   assert.deepEqual((m.tx as { id: string }[]).map((x) => x.id), ['nearTxA']);
   assert.ok(lines.every((l) => l.startsWith('orderly withdraw: ')));
-  assert.match(lines.find((l) => l.includes('checks passed'))!, /auto off, positions flat, 25 USDC can leave .*operator minimum 10, hourly cap left 2000; 13 USDC stays on Orderly$/);
+  assert.match(lines.find((l) => l.includes('checks passed'))!, /no trading loop, positions flat, 25 USDC can leave .*operator minimum 10, hourly cap left 2000; 13 USDC stays on Orderly$/);
   assert.match(lines.find((l) => l.includes(': started:'))!, /marker .*orderly-withdraw-gimbal_dex\.near-carry-run-1\.json/);
   assert.match(lines.at(-1)!, /done: Orderly took the withdrawal of 12 USDC to 0x.* on Arbitrum \(settle \{"settle_pnl_id":3\}, withdraw \{"withdraw_id":9\}; NEAR nearTxA\)\. Orderly's 1 USDC fee comes out of it, so 11 USDC lands/);
 
@@ -508,6 +508,7 @@ test('shutdown drains the run: before the marker it stops with none; during the 
   const run2 = start(dir2, replay(), api.fetch, []);
   for (let i = 0; i < 500 && !api.withdrawAsked(); i++) await tick();
   assert.ok(api.withdrawAsked());
+  assert.equal(run2.inFlight(), true, 'past its marker, no outcome yet: serve says so if it exits now');
   let settled = false;
   const waiting = run2.drain().then((x) => { settled = true; return x; });
   for (let i = 0; i < 10; i++) await tick();
@@ -515,4 +516,24 @@ test('shutdown drains the run: before the marker it stops with none; during the 
   answer();
   assert.equal((await waiting)?.status, 'done');
   assert.equal(readMarker(dir2, 'r1').status, 'done');
+  assert.equal(run2.inFlight(), false);
+  assert.equal(run.inFlight(), false, 'a run stopped before its marker was never in flight');
+});
+
+test('a withdraw_request whose fetch throws after it was called is unknown, also under a prefixed ORDERLY_API_URL', async (t) => {
+  const prefixed = `${ORDERLY}/gateway`;
+  const api = orderlyApi();
+  const f: typeof fetch = async (input, init) => {
+    if (String(input).endsWith('/v1/withdraw_request')) throw new TypeError('fetch failed: socket hang up');
+    return api.fetch(String(input).replace(prefixed, ORDERLY), init);
+  };
+  const dir = tempDir(t);
+  const lines: string[] = [];
+  const r = await startOrderlyWithdraw({
+    value: `${CONTRACT}/${DESK}/12/r1`, network: 'mainnet', contract: replay(), counters: async () => null, autoOn: () => false,
+    engine: ENGINE, orderlyUrl: prefixed, stateDir: dir, log: (l) => lines.push(l), fetch: f, now: () => NOW,
+  })!.done;
+  assert.equal(r?.status === 'failed' && r.outcome, 'unknown', lines.join('\n'));
+  assert.equal(readMarker(dir, 'r1').outcome, 'unknown');
+  assert.match(lines.at(-1)!, /no definite answer: unknown outcome, check the desk EVM on Arbitrum and nearblocks/);
 });

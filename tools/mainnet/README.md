@@ -1009,14 +1009,18 @@ With the list applied, Orderly takes the desk's key only from the engine's IPs, 
 `settle_pnl` or `withdraw_request`. The engine on Railway does it once per run-id. The full runbook is in
 docs/deploy-railway.md, "Bringing USDC back from Orderly". In short:
 
-1. Check that the desk is running, with `auto` off and every Orderly position flat. For a paused desk, the owner
-   unpauses with `set_paused(<desk>, false)` and 1 yoctoNEAR, keeping `auto` off. Orderly must hold at least 10
+1. Check that the desk is running and every Orderly position flat. For a paused desk, the owner unpauses with
+   `set_paused(<desk>, false)` and 1 yoctoNEAR, with `GIMBAL_TRADE` already unset. Orderly must hold at least 10
    USDC: the operator's `orderly_withdraw` refuses less than max(10 × `max_transfer_cost_flat_e6`, 10 USDC). It
    counts against the hourly rescue cap and cost budget, and the run reads what is left of both first.
 2. Withdraw everything in one run with `all`: under 10 USDC left on Orderly would be stuck behind the owner's path,
-   which also works only from the engine's IPs. Use a new run-id each time.
+   which also works only from the engine's IPs. Use a new run-id each time. Unset `GIMBAL_TRADE` for the
+   withdrawal: with the trade loop off nothing can open in the window (the run refuses while `GIMBAL_TRADE=1` and
+   `auto` are on, and `auto` cannot be turned off from outside the container). The pair is alert only meanwhile, so
+   keep the window short.
 
    ```
+   railway variable delete GIMBAL_TRADE
    railway variable set GIMBAL_SETUP=1 GIMBAL_ORDERLY_WITHDRAW=<contract>.near/<desk_id>/all/<run-id>
    ```
 
@@ -1028,11 +1032,13 @@ docs/deploy-railway.md, "Bringing USDC back from Orderly". In short:
    - A `started` marker or `no definite answer` reads `unknown outcome, check the desk EVM on Arbitrum and
      nearblocks; set a new run-id only after checking`. Wait about 30 min and look at the desk EVM's USDC on
      arbiscan before you choose a new run-id.
-4. Remove both variables, one key per call (each redeploys), or in the service's Variables tab:
+4. Remove both variables, one key per call (each redeploys), or in the service's Variables tab, and set
+   `GIMBAL_TRADE` back:
 
    ```
    railway variable delete GIMBAL_ORDERLY_WITHDRAW
    railway variable delete GIMBAL_SETUP
+   railway variable set GIMBAL_TRADE=1
    ```
 
 5. Bring the USDC from the desk EVM on Arbitrum to the contract, then pay the owner. Run each dry run first, then

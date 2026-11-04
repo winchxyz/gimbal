@@ -5,7 +5,7 @@
 // receiver); tools/mainnet/hl-return.mjs `bridge` then brings it to the contract on NEAR.
 //
 //   1  a marker for this run-id in the state directory: log what it says, do nothing (at most once per run-id)
-//   2  the engine's `auto` is off; get_desk: the contract and desk are the engine's, the desk running (operator path)
+//   2  no trading loop (GIMBAL_TRADE=1 with auto on); get_desk: the contract and desk are the engine's, the desk running (operator path)
 //   3  get_desk_counters: what is left of the hourly rescue cap and cost budget; signed reads: every Orderly position
 //      flat, and the amount within what can leave (holding - frozen, less any unsettled loss, at most free_collateral)
 //   4  `auto` checked again, then the marker `started`, created exclusively and fsynced before anything that moves
@@ -99,10 +99,12 @@ export interface OrderlyWithdrawDeps {
   /** The engine's own GIMBAL_CONTRACT_ID and DESK_ID, and the NEAR account the operator key is on. */
   engine: { contractId: string; deskId: string; operatorAccount: string };
   stateDir: string;
-  /** Whether the strategy loop may open a leg by itself (the engine rules' `auto`). Absent: unknown, so refused. */
+  /** Whether the strategy loop may open a leg by itself (GIMBAL_TRADE=1 and the engine rules' `auto`). Absent: unknown, so refused. */
   autoOn?: () => boolean;
   /** serve is shutting down: a run that has not written its marker yet stops. */
   stopping?: () => boolean;
+  /** Called once the `started` marker is on disk. */
+  onStarted?: () => void;
   desk(): Promise<DeskView | null>;
   /** get_desk_counters(desk), as the contract answers it (null: no counters yet). */
   counters(): Promise<unknown>;
@@ -151,7 +153,10 @@ export async function runOrderlyWithdraw(d: OrderlyWithdrawDeps): Promise<Orderl
   const autoProblem = (): string | null => {
     if (d.stopping?.() === true) return 'serve is stopping';
     if (d.autoOn === undefined) return 'the engine\'s auto setting cannot be read here, so a leg the strategy loop opens meanwhile cannot be ruled out';
-    return d.autoOn() ? 'the engine\'s auto is on: the strategy loop could open an Orderly leg between the flat check and the withdrawal; turn auto off (PUT /strategy) first' : null;
+    return d.autoOn()
+      ? 'the strategy loop trades (GIMBAL_TRADE=1 and auto on) and could open an Orderly leg between the flat check and the withdrawal: '
+        + 'unset GIMBAL_TRADE for the withdrawal (railway variable delete GIMBAL_TRADE) and set it back after'
+      : null;
   };
   const path = orderlyWithdrawMarker(d.stateDir, ask);
 
@@ -225,7 +230,7 @@ export async function runOrderlyWithdraw(d: OrderlyWithdrawDeps): Promise<Orderl
     return refuse(`${amount} USDC is over what is left of the hourly rescue cap, ${formatE6(room.capLeftE6)} USD: withdraw at most that now and the rest an hour later`);
   }
   const left = out.availableE6 - amountE6;
-  say(`checks passed: auto off, positions flat, ${formatE6(out.availableE6)} USDC can leave (${out.text}), operator minimum ${formatE6(min)}, `
+  say(`checks passed: no trading loop, positions flat, ${formatE6(out.availableE6)} USDC can leave (${out.text}), operator minimum ${formatE6(min)}, `
     + `hourly cap left ${formatE6(room.capLeftE6)}; ${formatE6(left)} USDC stays on Orderly`
     + (left > 0n && left < min ? `, under the operator's minimum: only the owner's path can take it out later, and that too only from the engine's IPs` : ''));
 
@@ -245,6 +250,7 @@ export async function runOrderlyWithdraw(d: OrderlyWithdrawDeps): Promise<Orderl
     }
     return refuse(`could not write the marker ${path}: ${errorMessage(err)}`);
   }
+  d.onStarted?.();
   say(`started: marker ${path}; settle_pnl, then a withdraw of ${amount} USDC to ${client.evmAddress} on Arbitrum`);
 
   // 5 and 6. Exactly one attempt.
@@ -286,6 +292,8 @@ function failureText(outcome: WithdrawFailure | undefined): string {
 export interface OrderlyWithdrawRun {
   done: Promise<OrderlyWithdrawResult | null>;
   drain(): Promise<OrderlyWithdrawResult | null>;
+  /** Past its `started` marker with no outcome yet: a process that exits now leaves an unknown outcome. */
+  inFlight(): boolean;
 }
 
 export interface OrderlyWithdrawStart {
@@ -318,17 +326,23 @@ export function startOrderlyWithdraw(o: OrderlyWithdrawStart): OrderlyWithdrawRu
     return null;
   }
   const collected = collectingSigner(o.contract);
-  // Set as the withdraw_request leaves for Orderly: before that, no failure can have moved money.
+  // Set once the contract has signed the withdraw_request (the orderly-key REST request), right before it is sent:
+  // before that no failure can have moved money; from then on only Orderly's definite refusal says nothing moved.
   let posted = false;
-  const base = o.fetch ?? fetch;
-  const watched: typeof fetch = (input, init) => {
-    if (new URL(String(input instanceof Request ? input.url : input)).pathname === '/v1/withdraw_request') posted = true;
-    return base(input, init);
+  const signer: OrderlySigner = {
+    ...collected.signer,
+    orderlyRequest: async (deskId, req, reason) => {
+      const action = await collected.signer.orderlyRequest(deskId, req, reason);
+      if (req.kind === 'withdraw_request') posted = true;
+      return action;
+    },
   };
+  let phase: 'checking' | 'started' | 'over' = 'checking';
   let stopping = false;
   const done = runOrderlyWithdraw({
     ask, engine: o.engine, stateDir: o.stateDir, log: o.log,
     stopping: () => stopping,
+    onStarted: () => { phase = 'started'; },
     ...(o.autoOn === undefined ? {} : { autoOn: o.autoOn }),
     desk: () => o.contract.getDesk(ask.deskId),
     counters: () => o.counters(ask.deskId),
@@ -336,8 +350,8 @@ export function startOrderlyWithdraw(o: OrderlyWithdrawStart): OrderlyWithdrawRu
       if (desk.orderly_account_id === undefined) throw new Error(`get_desk(${ask.deskId}) has no orderly_account_id`);
       return new OrderlyDeskClient({
         deskId: ask.deskId, network: o.network, apiUrl: o.orderlyUrl, accountId: desk.orderly_account_id,
-        orderlyKey: `ed25519:${desk.solana.authority}`, evmAddress: desk.evm_address, referralCode: null, signer: collected.signer,
-        fetch: watched, ...(o.now === undefined ? {} : { clock: { now: o.now } }),
+        orderlyKey: `ed25519:${desk.solana.authority}`, evmAddress: desk.evm_address, referralCode: null, signer,
+        ...(o.fetch === undefined ? {} : { fetch: o.fetch }), ...(o.now === undefined ? {} : { clock: { now: o.now } }),
       });
     },
     takeTx: collected.take,
@@ -346,13 +360,14 @@ export function startOrderlyWithdraw(o: OrderlyWithdrawStart): OrderlyWithdrawRu
   }).catch((err: unknown) => {
     o.log(`${PREFIX} stopped: ${errorMessage(err)}; if a marker says started: ${UNKNOWN_HINT}`);
     return null;
-  });
+  }).finally(() => { phase = 'over'; });
   return {
     done,
     drain: () => {
       stopping = true;
       return done;
     },
+    inFlight: () => phase === 'started',
   };
 }
 

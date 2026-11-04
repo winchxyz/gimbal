@@ -302,7 +302,7 @@ const riskCheck: VetoSource = recordedChecks.length === 0 ? nearAi : RecordedVet
 log(riskCheck === nearAi
   ? `NEAR AI risk check: ${nearAi.configured ? `NEAR AI ${nearAi.model}` : 'no NEAR AI key: every enter and rotate passes unchecked, said so'}`
   : `NEAR AI risk check: replay plays ${(riskCheck as RecordedVeto).size} recorded repl${(riskCheck as RecordedVeto).size === 1 ? 'y' : 'ies'} from ${recordedChecks.length} file(s); other prompts pass unchecked`);
-const setup = await setupFromEnv(mode, envVar, log, { autoOn: () => (server?.strategy ?? saved.strategy ?? DEFAULT_STRATEGY).auto }).catch((err: unknown) => {
+const setup = await setupFromEnv(mode, envVar, log, { autoOn: () => envVar('GIMBAL_TRADE') === '1' && (server?.strategy ?? saved.strategy ?? DEFAULT_STRATEGY).auto }).catch((err: unknown) => {
   if (err instanceof ConfigError) fail(`setup: ${errorMessage(err)}`);
   // Review S1: NEAR not answering at start turns POST /setup off for this run instead of stopping serve.
   const note = `venue setup: off for this run (POST /setup answers 503): its start read failed (${errorMessage(err)}); restart serve to try again`;
@@ -692,6 +692,7 @@ async function shutdown(reason: string): Promise<void> {
   const stillRescuing = rescueRunning?.() ?? null;
   if (!drained && stillRescuing !== null) log(`stopping: rescue ${stillRescuing} is still running after ${SHUTDOWN_WAIT_MS / 1000} s; exiting anyway: a payment it signed was saved as held before signing, and the next start reads it at 1Click and on chain`);
   if (!drained && (stillRescuing === null || pair?.pair?.closing === true)) log(`stopping: a close is still running after ${SHUTDOWN_WAIT_MS / 1000} s; exiting anyway: its orders are saved as in flight (the next start only alerts on ADL until a close result); check both legs by hand`);
+  if (setup?.orderlyWithdraw?.inFlight() === true) log('orderly withdraw: started marker left, unknown outcome; check arbiscan before a new run-id');
   pair?.stop();
   orderly?.stop();
   await view?.stop();

@@ -133,8 +133,9 @@ drain). Every line starts with `orderly withdraw:`:
 
 1. A marker `/data/gimbal/orderly-withdraw-<contract>-<desk>-<run-id>.json` (in `GIMBAL_STATE_DIR`) already
    exists: it logs what the marker says and does nothing. A run-id runs at most once, across restarts.
-2. The engine's `auto` must be off: with it on, the strategy loop could open an Orderly leg between the flat check
-   and the withdrawal. `get_desk`: the contract and desk must be the engine's own (`GIMBAL_CONTRACT_ID`,
+2. No trading loop: with `GIMBAL_TRADE=1` and `auto` on, the strategy loop could open an Orderly leg between the
+   flat check and the withdrawal, so the run refuses. `auto` cannot be turned off from outside the container (PUT
+   /strategy is loopback only), so unset `GIMBAL_TRADE` for the withdrawal instead. `get_desk`: the contract and desk must be the engine's own (`GIMBAL_CONTRACT_ID`,
    `DESK_ID`), and the operator key must act for the desk. A paused or closing desk is refused: the operator's
    `orderly_withdraw` needs a running desk.
 3. The checks:
@@ -145,7 +146,7 @@ drain). Every line starts with `orderly withdraw:`:
    - Two signed reads. Every Orderly position must be flat. The amount must be at most what can leave Orderly after
      `settle_pnl`: holding − frozen, less any unsettled loss, and at most Orderly's `free_collateral`. With `all`,
      the amount is exactly that.
-4. `auto` is checked again. Then it writes the marker `started` (amount, desk EVM, time), created exclusively and
+4. The trading loop is checked again. Then it writes the marker `started` (amount, desk EVM, time), created exclusively and
    fsynced.
 5. It runs `settle_pnl`, then `withdraw_request` (`OrderlyDeskClient.withdraw`).
 6. It writes the marker `done` with the report (settle and withdraw answers, the NEAR transactions), or `failed`
@@ -165,7 +166,10 @@ itself. A failed run tells you what Orderly got:
 
 **Before you start.**
 
-- The desk must be running, not paused, `auto` off, and every Orderly position flat.
+- The desk must be running, not paused, and every Orderly position flat.
+- `GIMBAL_TRADE` must be unset for the withdrawal (step 1), unless the engine's `auto` is off. With the trade loop
+  off nothing can open in the window. The pair is alert only meanwhile: the engine does not close or unwind it, so
+  keep the window short and set `GIMBAL_TRADE=1` back right after (step 3).
 - Orderly's 1 USDC fee comes out of the amount: a withdrawal of 100 delivers 99. So at least 10 USDC on Orderly is
   enough for this path (at the default flat bound).
 - Withdraw everything in one run: use `all`. Anything under the operator's minimum (10 USDC) left on Orderly is
@@ -175,16 +179,16 @@ itself. A failed run tells you what Orderly got:
   cost budget. A rescue in the last hour uses both. The run reads what is left and refuses before signing when it is
   short.
 
-**A paused desk.** Unpause it first, and keep the engine's `auto` off (`strategy: off` on the start lines) so
-nothing opens. The owner calls `set_paused(<desk>, false)` with exactly 1 yoctoNEAR from their own wallet, since
+**A paused desk.** Unpause it first, with `GIMBAL_TRADE` unset so nothing opens. The owner calls `set_paused(<desk>, false)` with exactly 1 yoctoNEAR from their own wallet, since
 the operator key cannot unpause. Then run the steps below.
 
 **Steps** (the owner runs each command):
 
-1. Set both variables. Each change redeploys the engine, which takes about 90 s to 3 min to go live again
-   (above):
+1. Unset `GIMBAL_TRADE`, then set both variables. Each change redeploys the engine, which takes about 90 s to 3 min
+   to go live again (above):
 
    ```
+   railway variable delete GIMBAL_TRADE
    railway variable set GIMBAL_SETUP=1 GIMBAL_ORDERLY_WITHDRAW=gimbal_dex.near/carry/all/2026-11-05a
    ```
 
@@ -194,11 +198,13 @@ the operator key cannot unpause. Then run the steps below.
    `checks passed: ...`, `started: marker ...`, then `done: ...` or `failed: ...` (or one `refused: ...`). The run
    takes about a minute: 8 operator calls on NEAR at about 6 s each, plus Orderly. Do not redeploy before the
    `done` or `failed` line. A container killed in step 5 leaves `started`, an unknown outcome.
-3. Remove both variables, one key per call (each call redeploys), or in the service's Variables tab:
+3. Remove both variables, one key per call (each call redeploys), or in the service's Variables tab, and set
+   `GIMBAL_TRADE` back:
 
    ```
    railway variable delete GIMBAL_ORDERLY_WITHDRAW
    railway variable delete GIMBAL_SETUP
+   railway variable set GIMBAL_TRADE=1
    ```
 
    Left set, they do nothing more for a run-id that has a marker, but `GIMBAL_SETUP=1` keeps the operator key's
