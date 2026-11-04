@@ -1,16 +1,19 @@
 // A request budget per API host, shared by every reader of that host in one process: a rate cap (token bucket), a
-// small concurrency limit, priorities, and a cool-down after HTTP 429. Built for Phoenix's public API, which answers
-// a burst of about 15 requests with 429 {"error":"rate_limited"} and `Retry-After: 1` (measured 2026-11-03: 14 of 15
-// parallel book reads passed, 20 reads at 10 a second all passed).
+// small concurrency limit, priorities, and a cool-down after HTTP 429. Built for Phoenix's public API (PHOENIX_BUDGET
+// below says what it allows).
 //
 // Two kinds of caller share a host. The scanner reads funding, books and history every few seconds; it can serve its
 // last good value when a read is skipped, so its reads wait little, never retry, and stand aside after a 429. Every
 // other read (an account or trader state for the risk engine, a rescue or the pair trader, a trader's book before a
-// close) is critical: it goes first, keeps a token and a slot no scanner read may take, waits out a cool-down and is
+// close) is critical: it goes first, keeps tokens and a slot no scanner read may take, waits out a cool-down and is
 // retried after a 429. The scanner marks its reads by running them inside scanRead(); a read outside it is critical.
+// The scanner's own classes leave more of the bucket the less they matter: funding keeps criticalReserve tokens for
+// critical reads, books and history (classReserve) more, so history only spends what the bucket has to spare.
 // A caller with a deadline of its own (the risk engine's account read) runs inside readBy(): its reads wait for the
 // budget and run at most until then. A Retry-After longer than retryAfterMaxMs is cut to it, so a host that asks for
-// an hour cannot lock critical reads out: they probe it again after the capped wait.
+// an hour cannot lock critical reads out: they probe it again after the capped wait. With `adaptive`, a 429 also
+// cuts the rate (the host is shared with someone, or allows less than thought) and empties the bucket; the rate
+// climbs back a step a minute while no 429 comes.
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 
@@ -93,6 +96,10 @@ export interface HostBudgetOptions {
   scanMaxInFlight: number;
   /** Tokens a scanner read must leave in the bucket, kept for critical reads. */
   criticalReserve: number;
+  /** Tokens a scanner read of this class must leave instead (default criticalReserve); at most burst - 1 is used. */
+  classReserve?: Partial<Record<Exclude<ReadClass, 'critical'>, number>>;
+  /** A 429 cuts the rate to `cut` of itself, down to minRatePerSec; it climbs back by recoverStep every recoverEveryMs. */
+  adaptive?: AdaptiveRate | null;
   /** How long a read may wait for a token and a slot, by class; past it a scanner read is skipped. */
   maxWaitMs: Record<ReadClass, number>;
   /** 429 retries by class (the first request not counted). */
@@ -105,27 +112,56 @@ export interface HostBudgetOptions {
   /** After a 429 scanner books and history stand aside at least this long, doubling per 429 in a row, up to max. */
   quietBaseMs: number;
   quietMaxMs: number;
-  /** Clock and randomness, for tests. */
+  /** Clock, timers and randomness, for tests. */
   now?: () => number;
+  timers?: BudgetTimers;
   random?: () => number;
 }
 
+export interface AdaptiveRate {
+  /** The rate after a 429: this fraction of the rate before it. */
+  cut: number;
+  minRatePerSec: number;
+  recoverEveryMs: number;
+  /** Requests a second added back each recoverEveryMs without a 429, up to ratePerSec. */
+  recoverStep: number;
+}
+
+export interface BudgetTimers {
+  setTimeout(fn: () => void, ms: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+
+const realTimers: BudgetTimers = {
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+};
+
 /**
- * Phoenix: 5 requests a second with a burst of 5 is half of what passed in the measurement above, so a second process
- * on the same machine (pair-mainnet) has as much again; one token and one slot are always kept for critical reads.
+ * Phoenix documents no numbers (docs.phoenix.trade, "WS/API best practices": authenticated sessions get higher limits;
+ * back off on 429 and retry after the server's delay). Measured from one IP on 2026-11-04, unauthenticated: one token
+ * bucket per IP across endpoints, about 1 request a second sustained with a burst of about 20, then 429
+ * {"error":"rate_limited"} with Retry-After: 2 (at 3 a second the first 429 came after 29 requests, then 10 of every
+ * 30 passed; at 1.5 a second the first after 38 s, then 1 a second passed; 1 a second for 90 s all passed). So 0.75 a
+ * second with a burst of 10: our load alone never empties the host's bucket, and a 429 (someone else on the same
+ * egress IP, as on a shared cloud host, or a second process here) halves the rate until quiet minutes step it back.
+ * Critical reads keep 2 tokens (a risk read is two requests: the trader snapshot and the marks); books leave 3,
+ * history 5.
  */
 export const PHOENIX_BUDGET: HostBudgetOptions = {
-  ratePerSec: 5,
-  burst: 5,
+  ratePerSec: 0.75,
+  burst: 10,
   maxInFlight: 4,
-  scanMaxInFlight: 3,
-  criticalReserve: 1,
+  scanMaxInFlight: 2,
+  criticalReserve: 2,
+  classReserve: { book: 3, history: 5 },
+  adaptive: { cut: 0.5, minRatePerSec: 0.25, recoverEveryMs: 60_000, recoverStep: 0.1 },
   // The scanner times out a funding read at 4 s and a book at 8 s: it hears "skipped" well before either.
   maxWaitMs: { critical: 15_000, funding: 3_000, book: 1_500, history: 1_500 },
   retries: { critical: 3, funding: 1, book: 0, history: 0 },
   backoffBaseMs: 1_000,
   backoffMaxMs: 30_000,
-  // Phoenix asks for 1 s; anything past 10 s is not believed (with the 15 % spread it still ends inside a critical
+  // Phoenix asks for 2 s; anything past 10 s is not believed (with the 15 % spread it still ends inside a critical
   // read's 15 s wait).
   retryAfterMaxMs: 10_000,
   quietBaseMs: 5_000,
@@ -147,6 +183,8 @@ export interface HostBudgetState {
   quietUntil: number;
   /** 429s in a row. */
   rateLimited: number;
+  /** Requests a second now (below ratePerSec after a 429 when adaptive). */
+  ratePerSec: number;
   inFlight: number;
   queued: number;
   sent: number;
@@ -168,13 +206,17 @@ export class HostBudget {
   readonly #o: HostBudgetOptions;
   readonly #now: () => number;
   readonly #random: () => number;
+  readonly #timers: BudgetTimers;
   #tokens: number;
+  #rate: number;
+  /** When the rate last changed (a cut, or a step back): the next step is due recoverEveryMs after it. */
+  #rateAt: number;
   #refilledAt: number;
   #inFlight = 0;
   #scanInFlight = 0;
   #queue: Waiter[] = [];
   #seq = 0;
-  #timer: ReturnType<typeof setTimeout> | null = null;
+  #timer: unknown = null;
   #timerAt = Infinity;
   #retryAt = 0;
   #quietUntil = 0;
@@ -189,14 +231,17 @@ export class HostBudget {
     this.#o = options;
     this.#now = options.now ?? Date.now;
     this.#random = options.random ?? Math.random;
+    this.#timers = options.timers ?? realTimers;
     this.#tokens = options.burst;
+    this.#rate = options.ratePerSec;
     this.#refilledAt = this.#now();
+    this.#rateAt = this.#refilledAt;
   }
 
   state(): HostBudgetState {
     return {
       retryAt: this.#retryAt, quietUntil: this.#quietUntil, rateLimited: this.#rateLimited,
-      inFlight: this.#inFlight, queued: this.#queue.length, sent: this.#sent,
+      inFlight: this.#inFlight, queued: this.#queue.length, sent: this.#sent, ratePerSec: this.#rate,
     };
   }
 
@@ -243,6 +288,14 @@ export class HostBudget {
     this.#retryAt = Math.max(this.#retryAt, now + pause);
     const quiet = Math.round(Math.min(this.#o.quietMaxMs, this.#o.quietBaseMs * 2 ** (n - 1)) * (0.75 + 0.25 * this.#random()));
     this.#quietUntil = Math.max(this.#quietUntil, this.#retryAt, now + quiet);
+    const a = this.#o.adaptive;
+    if (a !== undefined && a !== null) {
+      // The host's bucket for us is empty, and it allows less than the rate we ran at: slower, from an empty bucket.
+      this.#refill(now);
+      this.#rate = Math.max(a.minRatePerSec, this.#rate * a.cut);
+      this.#rateAt = now;
+      this.#tokens = 0;
+    }
     this.#pump();
   }
 
@@ -274,9 +327,24 @@ export class HostBudget {
 
   #refill(now: number): void {
     if (now > this.#refilledAt) {
-      this.#tokens = Math.min(this.#o.burst, this.#tokens + ((now - this.#refilledAt) / 1000) * this.#o.ratePerSec);
+      this.#tokens = Math.min(this.#o.burst, this.#tokens + ((now - this.#refilledAt) / 1000) * this.#rate);
     }
     this.#refilledAt = now;
+    const a = this.#o.adaptive;
+    if (a !== undefined && a !== null && this.#rate < this.#o.ratePerSec) {
+      const steps = Math.floor((now - this.#rateAt) / a.recoverEveryMs);
+      if (steps > 0) {
+        this.#rate = Math.min(this.#o.ratePerSec, this.#rate + steps * a.recoverStep);
+        this.#rateAt += steps * a.recoverEveryMs;
+      }
+    }
+  }
+
+  /** Tokens a read of `cls` needs in the bucket to be sent: 1, plus what a scanner class must leave. */
+  #need(cls: ReadClass): number {
+    if (cls === 'critical') return 1;
+    const reserve = this.#o.classReserve?.[cls] ?? this.#o.criticalReserve;
+    return Math.min(this.#o.burst, 1 + reserve);
   }
 
   /** Starts what can start, in queue order; skips what waited too long; sets one timer for the next change. */
@@ -304,9 +372,9 @@ export class HostBudget {
         : this.#inFlight < this.#o.maxInFlight && this.#scanInFlight < this.#o.scanMaxInFlight;
       // A release wakes the queue again; nothing to time.
       if (!slots) break;
-      const need = critical ? 1 : 1 + this.#o.criticalReserve;
+      const need = this.#need(w.cls);
       if (this.#tokens < need) {
-        wakeAt = now + Math.ceil(((need - this.#tokens) / this.#o.ratePerSec) * 1000);
+        wakeAt = now + Math.ceil(((need - this.#tokens) / this.#rate) * 1000);
         break;
       }
       this.#queue.shift();
@@ -322,15 +390,15 @@ export class HostBudget {
 
   #arm(at: number, now: number): void {
     if (at === Infinity) {
-      if (this.#timer !== null) clearTimeout(this.#timer);
+      if (this.#timer !== null) this.#timers.clearTimeout(this.#timer);
       this.#timer = null;
       this.#timerAt = Infinity;
       return;
     }
     if (this.#timer !== null && this.#timerAt <= at) return;
-    if (this.#timer !== null) clearTimeout(this.#timer);
+    if (this.#timer !== null) this.#timers.clearTimeout(this.#timer);
     this.#timerAt = at;
-    this.#timer = setTimeout(() => {
+    this.#timer = this.#timers.setTimeout(() => {
       this.#timer = null;
       this.#timerAt = Infinity;
       this.#pump();

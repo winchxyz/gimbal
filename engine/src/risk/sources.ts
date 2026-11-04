@@ -46,7 +46,8 @@ export const DESK_VIEW_WAIT_MS = 5_000;
 /**
  * An account read gives up after this: the tick goes on with that venue's read failed (the venue is down in
  * HealthMap) rather than wait out a venue's request budget (Phoenix: up to 15 s through a cool-down). Over
- * SLOW_READ_MS (5 s), so a slow answer still counts as slow, and long enough for one 429 retry after Retry-After: 1.
+ * SLOW_READ_MS (5 s), so a slow answer still counts as slow, and long enough for one 429 retry after Phoenix's
+ * Retry-After: 2 and a token at the cut rate (http-budget.ts PHOENIX_BUDGET).
  */
 export const ACCOUNT_READ_DEADLINE_MS = 7_000;
 

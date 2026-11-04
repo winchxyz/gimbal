@@ -13,8 +13,9 @@
 //    while the week before loads, or alone when it cannot be had), whatever this hour says, or with gross > 0 now
 //    until its history is known; never one whose 7 and 14 days disagree in sign; a desk pair with a leg over its
 //    share of the open interest only on a multi-day spread that pays its fees over the hold (carry.ts);
-// 4. books of the desk legs those pairs need, read again once older than bookTtlMs (a failed read keeps the last
-//    book, marked stale, and lists the venue as failed); a venue whose funding failed this scan is not asked for
+// 4. books of the desk legs those pairs need, read again once older than bookTtlMs, or offDeskBookTtlMs for a leg that
+//    is neither the held window's nor a market of the desk's policy (a failed read keeps the last book, marked stale,
+//    and lists the venue as failed); a venue whose funding failed this scan is not asked for
 //    books; a desk pair with no book ever read is left out. They are asked for in order: the held window's legs, the
 //    policy's markets, then the other legs by the gross funding of their best pair, so that a venue's request budget
 //    (venues/http-budget.ts: Phoenix) goes to them first. A read the budget skips is not sent and its last book is
@@ -366,9 +367,13 @@ export class Scanner {
       }
     }
     const skipped = new Set<ScanVenueId>();
-    const due = [...wanted.values()].filter(({ key, leg }) => {
+    const due = [...wanted.values()].filter((w) => {
+      const { key, leg } = w;
       const b = this.#books.get(key);
-      if (!(b === undefined || b.stale || b.readAt > now || now - b.readAt >= config.bookTtlMs)) return false;
+      // Without a policy (no desk yet, replay without one) every leg counts as the desk's.
+      const offDesk = config.policy !== null && w.tier === 2;
+      const ttl = offDesk ? Math.max(config.bookTtlMs, config.offDeskBookTtlMs) : config.bookTtlMs;
+      if (!(b === undefined || b.stale || b.readAt > now || now - b.readAt >= ttl)) return false;
       // A venue that did not answer for funding is likely down: its book reads would only hold the scan up.
       if (fundingFailed.has(leg.venue)) {
         skipped.add(leg.venue);
@@ -686,6 +691,8 @@ export class Scanner {
     const end = current + HOUR_MS - 1;
     const olderStart = current - (FORTNIGHT_HOURS + 8) * HOUR_MS;
     const olderEnd = current - WEEK_HOURS * HOUR_MS;
+    // Reads the venue's request budget did not send: one note a venue, and they come back one scan apart, not at once.
+    const skipped = new Map<ScanVenueId, { first: ReadSkipped; count: number }>();
     const run: Promise<void> = pool(todo.map(({ leg, src, older }) => async () => {
       const key = legKey(leg);
       const what = `${leg.venue} ${older ? 'older history' : 'history'} ${leg.symbol}`;
@@ -712,6 +719,24 @@ export class Scanner {
           if (o !== undefined && o.refusedSince !== null) this.#older.set(key, { ...o, refusedSince: null });
         }
       } catch (err) {
+        if (isReadSkipped(err)) {
+          // Nothing reached the venue: no failure of it, only a later try, spread over the scans that follow.
+          const d = skipped.get(leg.venue) ?? { first: err, count: 0 };
+          d.count++;
+          skipped.set(leg.venue, d);
+          const retryAt = Math.max(now + config.historyRetryMs, err.retryAt ?? 0) + (d.count - 1) * config.intervalMs;
+          if (older) {
+            const o = this.#older.get(key);
+            this.#older.set(key, {
+              done: false, failures: o?.failures ?? 0, refusedSince: o?.refusedSince ?? null, failingSince: o?.failingSince ?? null,
+              givenUp: o?.givenUp ?? null, retryAt,
+            });
+          } else {
+            const st = this.#history.get(key);
+            this.#history.set(key, { loadedHour: st?.loadedHour ?? null, retryAt, points: st?.points ?? 0 });
+          }
+          return;
+        }
         this.#note(`${what} failed: ${errorMessage(err)}`);
         if (older) {
           const o = this.#older.get(key);
@@ -730,6 +755,7 @@ export class Scanner {
         }
       }
     }), 2).then(() => {
+      for (const [venue, d] of skipped) this.#note(`${venue} history: ${d.count} read(s) not sent, tried again over the next scans (${d.first.message})`);
       if (this.#historyRun === run) this.#historyRun = null;
     });
     this.#historyRun = run;

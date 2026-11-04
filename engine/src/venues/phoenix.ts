@@ -50,6 +50,13 @@ const OVERVIEW_FALLBACK_MS = 10 * 60_000;
 // per market. Kept this long, so a booking that lands late in the hour is picked up by legs read later. A read from
 // outside the scanner (one symbol, pair-mainnet) asks for that symbol alone.
 const HISTORY_BATCH_TTL_MS = 10 * 60_000;
+// The marks and open interest (markets/stats/latest) are asked for by the scanner's funding() every scan and by every
+// account() (the risk engine every 5 s): under Phoenix's 1 request a second they share one read. The scanner takes
+// one this young (the risk engine's, as a rule); an account read only one still in flight or started this recently.
+const STATS_TTL_SCAN_MS = 6_000;
+const STATS_TTL_ACCOUNT_MS = 1_000;
+// An account read started this recently, or still in flight, is joined by the next account() of the same authority.
+const ACCOUNT_JOIN_MS = 1_000;
 const HISTORY_BATCHES_KEPT = 2;
 // The batch's newest booking must be at most this far before min(endTime, now): Phoenix books every hour, so an older
 // newest point means every series came back cut short from the newest end, and none of them is trusted.
@@ -104,6 +111,10 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
   #overview: SharedRead<Dated<FundingOverviewResponse>> | null = null;
   #lastOverview: Dated<FundingOverviewResponse> | null = null;
   #historyBatches = new Map<string, SharedRead<FundingOverviewResponse>>();
+  #stats: SharedRead<LatestMarketsStatsResponse> | null = null;
+  #accounts = new Map<string, SharedRead<PhoenixAccountState>>();
+  /** The last account answer of each authority and when it was asked for (accountWithin). */
+  #lastAccount = new Map<string, Dated<PhoenixAccountState>>();
 
   constructor(options: PhoenixReaderOptions = {}) {
     this.apiUrl = (options.apiUrl ?? PHOENIX_API_URL).replace(/\/+$/, '');
@@ -127,10 +138,9 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
    * last booking is more than two funding intervals old (stale), are left out.
    */
   async funding(): Promise<MarketFunding[]> {
-    const c = this.#api('funding');
     const [overview, stats, configs] = await Promise.all([
       this.#fundingOverview(),
-      c.markets.getLatestMarketsStats(),
+      this.#marketStats(STATS_TTL_SCAN_MS, 'funding'),
       this.#marketConfigs(false, 'funding'),
     ]);
     const rows = parseFunding(overview.value, stats, configs, this.#clock.now());
@@ -154,13 +164,59 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
   /** `address` is the trader's authority (wallet); the account read is its trader PDA `traderPdaIndex`. */
   async account(address: string): Promise<PhoenixAccountState> {
     const authority = normalizeAuthority(address);
+    const now = this.#clock.now();
+    const joined = this.#accounts.get(authority);
+    if (joined !== undefined && now >= joined.at && now - joined.at < ACCOUNT_JOIN_MS) return shared(joined, () => this.#accountRead(authority));
+    return this.#accountRead(authority);
+  }
+
+  /**
+   * The account as read at most `maxAgeMs` ago by anyone in this process (the risk engine reads it every 5 s), else
+   * read now. For callers that only need it roughly fresh (the strategy loop's free margin), so they add no request.
+   */
+  async accountWithin(address: string, maxAgeMs: number): Promise<PhoenixAccountState> {
+    const authority = normalizeAuthority(address);
+    const last = this.#lastAccount.get(authority);
+    const now = this.#clock.now();
+    if (last !== undefined && now >= last.at && now - last.at <= maxAgeMs) return last.value;
+    return this.account(authority);
+  }
+
+  #accountRead(authority: string): Promise<PhoenixAccountState> {
+    const at = this.#clock.now();
     const c = this.#api('account');
-    const [snapshot, configs, stats] = await Promise.all([
+    const value = Promise.all([
       c.traders.getTraderStateSnapshot(authority, { traderPdaIndex: this.#traderPdaIndex }),
       this.#marketConfigs(false, 'account'),
-      c.markets.getLatestMarketsStats(),
-    ]);
-    return parseAccount(snapshot, configs, markPrices(stats), this.#clock.now());
+      this.#marketStats(STATS_TTL_ACCOUNT_MS, 'account'),
+    ]).then(([snapshot, configs, stats]) => parseAccount(snapshot, configs, markPrices(stats), this.#clock.now()));
+    const entry = { at, value, critical: readClass('account') === 'critical' };
+    this.#accounts.set(authority, entry);
+    value.then(
+      (v) => {
+        const last = this.#lastAccount.get(authority);
+        if (last === undefined || at >= last.at) this.#lastAccount.set(authority, { at, value: v });
+      },
+      () => {
+        if (this.#accounts.get(authority) === entry) this.#accounts.delete(authority);
+      },
+    );
+    return value;
+  }
+
+  /** markets/stats/latest, shared while younger than `ttlMs` (see STATS_TTL_SCAN_MS). */
+  #marketStats(ttlMs: number, kind: ReadKind): Promise<LatestMarketsStatsResponse> {
+    const now = this.#clock.now();
+    const cached = this.#stats;
+    if (cached !== null && now >= cached.at && now - cached.at < ttlMs) return shared(cached, () => this.#marketStats(0, kind));
+    const value = this.#api(kind).markets.getLatestMarketsStats();
+    const entry = { at: now, value, critical: readClass(kind) === 'critical' };
+    this.#stats = entry;
+    // A failed read is not kept: the next call asks again.
+    value.catch(() => {
+      if (this.#stats === entry) this.#stats = null;
+    });
+    return value;
   }
 
   /**
@@ -240,6 +296,9 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
     this.#configs = null;
     this.#overview = null;
     this.#historyBatches.clear();
+    this.#stats = null;
+    this.#accounts.clear();
+    this.#lastAccount.clear();
   }
 
   #marketConfigs(fresh: boolean, kind: ReadKind): Promise<ExchangeMarketConfig[]> {

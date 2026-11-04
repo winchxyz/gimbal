@@ -11,7 +11,7 @@ import {
 
 const FAST: HostBudgetOptions = {
   ...PHOENIX_BUDGET,
-  ratePerSec: 1000, burst: 100, maxInFlight: 4, scanMaxInFlight: 3, criticalReserve: 1,
+  ratePerSec: 1000, burst: 100, maxInFlight: 4, scanMaxInFlight: 3, criticalReserve: 1, classReserve: {}, adaptive: null,
   maxWaitMs: { critical: 3_000, funding: 1_000, book: 500, history: 500 },
 };
 

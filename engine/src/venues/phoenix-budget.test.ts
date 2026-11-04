@@ -42,8 +42,16 @@ const limited = (retryAfter?: string) => new Response('{"error":"rate_limited"}'
   status: 429, headers: retryAfter === undefined ? {} : { 'retry-after': retryAfter },
 });
 
+/**
+ * PHOENIX_BUDGET's waits, retries and cool-downs on a faster bucket with no rate cut after a 429, so these tests run in
+ * real time in well under a second each; the real numbers are tested on a fake clock in http-budget.test.ts.
+ */
+const TEST_BUDGET: HostBudgetOptions = {
+  ...PHOENIX_BUDGET, ratePerSec: 5, burst: 5, criticalReserve: 1, classReserve: {}, adaptive: null, random: () => 0,
+};
+
 function reader(f: typeof fetch, budget: Partial<HostBudgetOptions> = {}, clock = new VirtualClock(AT), timeoutMs?: number) {
-  const b = new HostBudget('phoenix-test', { ...PHOENIX_BUDGET, random: () => 0, ...budget });
+  const b = new HostBudget('phoenix-test', { ...TEST_BUDGET, ...budget });
   return { reader: new PhoenixReader({ fetch: f, clock, budget: b, ...(timeoutMs === undefined ? {} : { timeoutMs }) }), budget: b, clock };
 }
 
@@ -129,7 +137,7 @@ test('account reads go ahead of the scanner\'s queued book reads', async () => {
   assert.equal(order.filter((o) => o === 'book').length, 6, 'the books are read too, after');
 });
 
-test('funding: the overview is read once a minute (rates book hourly), the marks on every call; a failed refresh serves the last one, dated', async () => {
+test('funding: the overview is read once a minute (rates book hourly), the marks once 6 s old; a failed refresh serves the last one, dated', async () => {
   let overviewDown = false;
   const { f, count } = fakeFetch((url) => (overviewDown && url.pathname === '/v1/funding/overview' ? new Response('{}', { status: 502 }) : undefined));
   const clock = new VirtualClock(AT);
@@ -139,7 +147,10 @@ test('funding: the overview is read once a minute (rates book hourly), the marks
   clock.set(AT + 5_000);
   await scanRead(() => r.funding());
   assert.equal(count('/v1/funding/overview'), 1);
-  assert.equal(count('/v1/markets/stats/latest'), 2);
+  assert.equal(count('/v1/markets/stats/latest'), 1, 'the marks of 5 s ago are shared');
+  clock.set(AT + 6_000);
+  await scanRead(() => r.funding());
+  assert.equal(count('/v1/markets/stats/latest'), 2, 'read again once 6 s old');
   clock.set(AT + 61_000);
   await scanRead(() => r.funding());
   assert.equal(count('/v1/funding/overview'), 2);
@@ -289,7 +300,7 @@ const TRADER_STATE = `/v1/trader/state/${AUTHORITY}`;
 test('phoenixTraderApi: a 429 on the trader state is retried after Retry-After, then answered', async () => {
   let states = 0;
   const { f } = fakeFetch((url) => (url.pathname === TRADER_STATE && ++states === 1 ? limited('0.2') : undefined));
-  const budget = new HostBudget('phoenix-test', { ...PHOENIX_BUDGET, random: () => 0 });
+  const budget = new HostBudget('phoenix-test', TEST_BUDGET);
   const t0 = Date.now();
   const raw = await phoenixTraderApi('https://perp-api.phoenix.trade/', f, 0, budget).traderState(AUTHORITY);
   assert.equal(states, 2);
@@ -300,7 +311,7 @@ test('phoenixTraderApi: a 429 on the trader state is retried after Retry-After, 
 
   // An hour of Retry-After is cut to the cap: the read probes after it instead of failing for an hour.
   states = 0;
-  const capped = new HostBudget('phoenix-test', { ...PHOENIX_BUDGET, retryAfterMaxMs: 200, random: () => 0 });
+  const capped = new HostBudget('phoenix-test', { ...TEST_BUDGET, retryAfterMaxMs: 200 });
   const { f: f2 } = fakeFetch((url) => (url.pathname === TRADER_STATE && ++states === 1 ? limited('3600') : undefined));
   const t1 = Date.now();
   await phoenixTraderApi('https://perp-api.phoenix.trade', f2, 0, capped).traderState(AUTHORITY);
@@ -343,4 +354,29 @@ test('phoenixTraderApi with no budget given shares the process\'s budget for tha
   await phoenixTraderApi(`${origin}/`, f).traderState(AUTHORITY);
   await new PhoenixReader({ apiUrl: origin, fetch: f }).book('SOL').catch(() => {});
   assert.equal(shared.state().sent, before + 2);
+});
+
+test('account reads: two at once share one snapshot; the loop\'s accountWithin takes the risk engine\'s last answer; the scanner takes its marks', async () => {
+  const { f, count } = fakeFetch();
+  const clock = new VirtualClock(AT);
+  const { reader: r } = reader(f, {}, clock);
+  const [a, b] = await Promise.all([r.account(AUTHORITY), r.account(AUTHORITY)]);
+  assert.deepEqual(a, b);
+  assert.equal(count('/v1/trader/state/'), 1, 'one snapshot for both');
+  assert.equal(count('/v1/markets/stats/latest'), 1);
+  // The scanner's funding 4 s later takes those marks; the strategy loop's free margin takes that account answer.
+  clock.set(AT + 4_000);
+  await scanRead(() => r.funding());
+  assert.equal(count('/v1/markets/stats/latest'), 1, 'the marks of the account read');
+  assert.deepEqual(await r.accountWithin(AUTHORITY, 7_000), a);
+  assert.equal(count('/v1/trader/state/'), 1);
+  // The risk engine's next read (5 s on) is its own: a fresh snapshot and fresh marks.
+  clock.set(AT + 5_000);
+  await r.account(AUTHORITY);
+  assert.equal(count('/v1/trader/state/'), 2);
+  assert.equal(count('/v1/markets/stats/latest'), 2);
+  // Past its age the loop reads too.
+  clock.set(AT + 13_000);
+  await r.accountWithin(AUTHORITY, 7_000);
+  assert.equal(count('/v1/trader/state/'), 3);
 });
