@@ -6,11 +6,11 @@ import { useNow } from '../ui/useNow.ts';
 import { hasAlert, makeAlert, type Alert } from './alerts.ts';
 import { Chart } from './Chart.tsx';
 import { decide, perDayOnLegs, type Decision } from './decision.ts';
-import { depth, hours, pct, plain, usd, usdWhole, venueName } from './format.ts';
+import { depth, hours, pct, usd, usdWhole, venueName } from './format.ts';
 import type { HistoryState } from './history.ts';
 import { checkLines, heldWindow, isNoDesk } from './model.ts';
 import { Ago } from './WindowList.tsx';
-import { waterfall, type StepKey } from './waterfall.ts';
+import { stepValue, waterfall } from './waterfall.ts';
 import type { ManualAction, Outcome } from './manual.ts';
 import { retryHistory, sendManual } from './useEngine.ts';
 
@@ -114,13 +114,6 @@ function Waterfall({ w, legUsd }: { w: FundingWindow; legUsd: number | null }) {
       </div>
     </div>
   );
-}
-
-/** `+18.4%` earned, `−1.9%` spent, `13.8%` net */
-function stepValue(key: StepKey, value: number): string {
-  if (key === 'net') return pct(value);
-  if (key === 'gross') return `+${plain(value)}%`;
-  return value < 0 ? `+${plain(-value)}%` : pct(-value); // a cost that came out negative is a gain
 }
 
 // ---------- checks ----------

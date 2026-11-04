@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { waterfall } from './waterfall.ts';
+import { stepValue, waterfall } from './waterfall.ts';
 import { win } from './testing.ts';
 
 test('gross, four costs, net: in that order, with the engine numbers', () => {
@@ -33,4 +33,15 @@ test('zero costs are left out of the bar, and the label names no size until the 
   const wf = waterfall(win({ costs: { feesPct: 1, slippagePct: 0, basisPct: 0, rescueReservePct: 0 }, grossAprPct: 4, netAprPct: 3 }), null);
   assert.deepEqual(wf.parts.map((p) => p.key), ['net', 'fees']);
   assert.equal(wf.steps[2]?.label, 'Slippage');
+});
+
+test('step values show one sign: a negative gross is not "+−"', () => {
+  assert.equal(stepValue('gross', 18.4), '+18.4%');
+  assert.equal(stepValue('gross', -194.3), '−194.3%');
+  assert.equal(stepValue('gross', 0), '0.0%');
+  assert.equal(stepValue('fees', 1.9), '−1.9%'); // a cost
+  assert.equal(stepValue('basis', -0.7), '+0.7%'); // a cost that came out negative is a gain
+  assert.equal(stepValue('reserve', 0), '0.0%');
+  assert.equal(stepValue('net', -3.2), '−3.2%');
+  assert.equal(stepValue('net', 13.8), '13.8%');
 });

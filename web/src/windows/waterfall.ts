@@ -1,7 +1,7 @@
 // The cost waterfall of a window: gross, then fees, slippage, basis and the rescue reserve, then net.
 // All values are APR percentage points from `Window.costs`; widths are shares of one bar.
 import type { Window as FundingWindow } from '@gimbal/shared';
-import { usdWhole } from './format.ts';
+import { pct, signedPct, usdWhole } from './format.ts';
 
 export type StepKey = 'gross' | 'fees' | 'slippage' | 'basis' | 'reserve' | 'net';
 
@@ -61,4 +61,11 @@ export function waterfall(w: FundingWindow, legUsd: number | null): Waterfall {
     parts,
     gap: w.grossAprPct - costSum - w.netAprPct,
   };
+}
+
+/** `+18.4%` earned, `−1.9%` spent, `13.8%` net. One sign only: a negative gross reads `−194.3%`, never `+−194.3%`. */
+export function stepValue(key: StepKey, value: number): string {
+  if (key === 'net') return pct(value);
+  if (key === 'gross') return signedPct(value);
+  return signedPct(-value); // a cost that came out negative is a gain
 }

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { dayMonth, dayMonthTime, depth, duration, hours, list, pct, plain, sentence, usd, usdWhole, venueName } from './format.ts';
+import { dayMonth, dayMonthTime, depth, duration, hours, list, pct, plain, sentence, signedPct, usd, usdWhole, venueName } from './format.ts';
 
 test('percentages use the real minus sign and never show a negative zero', () => {
   assert.equal(pct(8.64), '8.6%');
@@ -9,6 +9,14 @@ test('percentages use the real minus sign and never show a negative zero', () =>
   assert.equal(pct(35), '35.0%');
   assert.equal(plain(39.34), '39.3');
   assert.equal(plain(-4.1), '−4.1');
+});
+
+test('signed percentages carry exactly one sign and zero carries none', () => {
+  assert.equal(signedPct(8.64), '+8.6%');
+  assert.equal(signedPct(-194.3), '−194.3%');
+  assert.equal(signedPct(0), '0.0%');
+  assert.equal(signedPct(-0.04), '0.0%');
+  assert.equal(signedPct(0.04), '0.0%');
 });
 
 test('dollars: cents for small amounts, whole dollars for leg sizes', () => {
