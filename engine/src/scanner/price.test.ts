@@ -258,6 +258,67 @@ test('tradable is structural: a desk pair with no oracle price is tradable and r
   assert.equal(priced(pair.long, pair.short, ctx({ policy: POLICY })).window.tradable, true);
 });
 
+test('a trading serve: a missing or stale stored price of an oracle-priced pair is a note, enterable as when fresh', () => {
+  const NOTE_MISSING = 'stored SOL price missing: refreshed at open';
+  // Missing on both legs: one note for the symbol, every check ok, nothing refused.
+  const missing = deskVerdict(pairOf(LONG, SHORT), verdictCtx({ oracleRefreshAtOpen: true }));
+  assert.equal(missing.refused, undefined);
+  assert.equal(missing.note, NOTE_MISSING);
+  assert.equal(missing.checks.every((c) => c.ok), true);
+  assert.match(missing.checks[0]!.text, /^The stored price for SOL on Phoenix is missing: the open refreshes it first \(refresh_prices\)/);
+  // Stale (over oracle_max_age_s 60).
+  const stale = deskVerdict(pairOf(LONG, SHORT), verdictCtx({ oracleRefreshAtOpen: true, oracle: oracleAged(3600) }));
+  assert.equal(stale.refused, undefined);
+  assert.equal(stale.note, 'stored SOL price stale: refreshed at open');
+  assert.match(stale.checks[0]!.text, /is 3600 s old, over the 60 s limit: the open refreshes it first/);
+  // A fresh price needs no note.
+  assert.equal(deskVerdict(pairOf(LONG, SHORT), verdictCtx({ oracleRefreshAtOpen: true, oracle: FRESH })).note, undefined);
+  // The window: enterable exactly as it is with a fresh price, the note on it, no refusal.
+  const noted = priced(LONG, SHORT, ctx({ policy: POLICY, oracleRefreshAtOpen: true })).window;
+  const fresh = priced(LONG, SHORT, ctx({ policy: POLICY, oracle: FRESH })).window;
+  assert.equal(noted.refused, undefined);
+  assert.equal(noted.note, NOTE_MISSING);
+  assert.equal(fresh.note, undefined);
+  assert.equal(isEnterable(noted), isEnterable(fresh));
+  assert.equal(isEnterable(noted), true);
+});
+
+test('not a trading serve: a missing or stale stored price is still E_ORACLE_STALE, with no note', () => {
+  for (const over of [{}, { oracleRefreshAtOpen: false }]) {
+    const v = deskVerdict(pairOf(LONG, SHORT), verdictCtx(over));
+    assert.deepEqual(v.refused, { code: 'E_ORACLE_STALE', reason: 'no oracle price for SOL on phoenix' });
+    assert.equal(v.note, undefined);
+  }
+  const w = priced(LONG, SHORT, ctx({ policy: POLICY, oracle: oracleAged(3600) })).window;
+  assert.deepEqual(w.refused, { code: 'E_ORACLE_STALE', reason: 'oracle price for SOL on phoenix 3600 s old' });
+  assert.equal(w.note, undefined);
+  assert.equal(isEnterable(w), false);
+});
+
+test('a trading serve still refuses what a refresh cannot fix: a symbol the contract does not price, an Orderly leg, a wrong clock, the cap', () => {
+  // HYPE is in both venue lists and not unpriced, but refresh_prices cannot store a HYPE price.
+  const hypePolicy: ContractPolicy = {
+    ...POLICY,
+    hl_assets: [...POLICY.hl_assets, { index: 159, symbol: 'HYPE', sz_decimals: 2 }],
+    phoenix_markets: [...POLICY.phoenix_markets, { symbol: 'HYPE', orderbook: 'test-orderbook-hype', base_lot_e8: 1, tick_e8: 1 }],
+  };
+  const hype = deskVerdict(pairOf(leg('phoenix', 'HYPE'), leg('hyperliquid', 'HYPE', { ratePerHour: 0.0001 })), verdictCtx({ policy: hypePolicy, oracleRefreshAtOpen: true }));
+  assert.deepEqual(hype.refused, { code: 'E_ORACLE_STALE', reason: 'no oracle price for HYPE on phoenix' });
+  assert.equal(hype.note, undefined);
+  // serve's open is Hyperliquid and Phoenix only: an Orderly leg's price is not refreshed by it.
+  const orderlyPolicy: ContractPolicy = { ...POLICY, orderly_symbols: [...POLICY.orderly_symbols, 'PERP_SOL_USDC'] };
+  const orderly = deskVerdict(pairOf(leg('orderly', 'PERP_SOL_USDC', { base: 'SOL' }), SHORT), verdictCtx({ policy: orderlyPolicy, oracleRefreshAtOpen: true }));
+  assert.deepEqual(orderly.refused, { code: 'E_ORACLE_STALE', reason: 'no oracle price for PERP_SOL_USDC on orderly' });
+  // A price dated ahead of the clock is a clock problem, not a stale price.
+  const ahead = deskVerdict(pairOf(LONG, SHORT), verdictCtx({ oracleRefreshAtOpen: true, oracle: oracleAged(-(ORACLE_MAX_SKEW_MS / 1000 + 60)) }));
+  assert.equal(ahead.refused?.code, 'E_ORACLE_STALE');
+  assert.equal(ahead.note, undefined);
+  // Any other refusal stays, and drops the note.
+  const big = deskVerdict(pairOf(LONG, SHORT), verdictCtx({ oracleRefreshAtOpen: true, strategy: { ...DEFAULT_STRATEGY, legUsd: 4990 } }));
+  assert.deepEqual(big.refused, { code: 'E_SIZE', reason: 'leg over the $5,000 cap' });
+  assert.equal(big.note, undefined);
+});
+
 test('unpriced is per leg: WIF on Hyperliquid is unpriced, PERP_WIF_USDC on Orderly is not', () => {
   const wifHl = leg('hyperliquid', 'WIF', { markPx: 0.5, openInterest: 9e6 });
   const wifOrderly = leg('orderly', 'PERP_WIF_USDC', { base: 'WIF', markPx: 0.5, openInterest: 9e6 });

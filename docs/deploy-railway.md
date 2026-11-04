@@ -33,8 +33,19 @@ repo root are all it needs.
 2. Settings → Region: EU West. Settings → Networking: no public domain.
 3. Add a volume to the service, mount path `/data`.
 4. Variables (Raw Editor accepts a pasted env file). The names, values never in the repo. Each variable is its own
-   `NAME=value` line; check that every value sits under its own name (a key pasted under the wrong name is a common
-   mistake, and serve then refuses to start or signs with the wrong key):
+   `NAME=value` line; check that every value sits under its own name (a value pasted under the wrong name is a common
+   mistake). Most such mistakes do not stop serve, they quietly turn a part off:
+   - `GIMBAL_TRADE` and `GIMBAL_RESCUE` act only when the value is exactly `1`: anything else (a key pasted there)
+     leaves the pair alert only and the rescue detect only, and the start lines say so
+     (`rescue: detect only on mainnet ...`);
+   - an `OPERATOR_PRIVATE_KEY` that is not an `ed25519:` key keeps the pair alert only (its NEAR start read fails
+     and is retried) and the rescue detect only (its live start retried in the background);
+   - a `RELAYER_EVM_PRIVATE_KEY` that is not `0x` + 64 hex keeps the rescue detect only the same way;
+   - a `GIMBAL_TRADER_FRESH` or `GIMBAL_RESCUE_FRESH` that does not name this contract and desk exactly is ignored,
+     with a start line;
+   - an empty value counts as not set.
+
+   Read the start lines after every deploy. The variables:
    - from `.keys/engine-mainnet-<contract>.env` (written by `tools/mainnet/desk.mjs`): `GIMBAL_MODE`,
      `NEAR_NETWORK`, `GIMBAL_CONTRACT_ID`, `DESK_ID`, `OWNER_ACCOUNT_ID`, `OPERATOR_ACCOUNT_ID`,
      `OPERATOR_PRIVATE_KEY`, `OPERATOR_ALLOWANCE_NEAR`, `ORDERLY_BROKER_ID`, `HL_API_URL`, `ORDERLY_API_URL`,
@@ -43,15 +54,31 @@ repo root are all it needs.
      "no NEAR AI risk check");
    - `GIMBAL_TRADE=1`, `GIMBAL_RESCUE=1`;
    - `RELAYER_EVM_PRIVATE_KEY`, required with `GIMBAL_RESCUE=1`: the Arbitrum gas wallet that submits
-     `evm_usdc_to_intents` (it pays gas only, it holds no desk money); without it serve exits at start with a
-     configuration error;
+     `evm_usdc_to_intents`; without it serve exits at start with a configuration error;
    - `ARBITRUM_RPC_URL` (optional): the Arbitrum RPC the rescue uses; without it, viem's public Arbitrum One RPC;
    - `GIMBAL_TRADER_FRESH=<contract>/<desk>` on the first start whenever the volume holds no trader state file yet,
      even with both legs flat: a missing file is not a fresh start, so without it the pair stays alert only and the
      strategy loop gets no hands (it can never open). Check both legs on the venues first (`docs/interfaces.md`,
-     "The pair in serve"); remove it after that start (a later start restores the file and ignores it).
+     "The pair in serve"); remove it after that start (a later start restores the file and ignores it);
+   - `GIMBAL_RESCUE_FRESH=<contract>/<desk>` for the rescuer's first run (step 5).
 5. Deploy. The log shows the start lines: mode, contract, which legs are live, which protections trade, the
    rescue routes, and `strategy: off` until the owner turns `auto` on.
+
+   **The rescuer's first run.** With no rescuer state file on the volume (`/data/gimbal/rescue-mainnet-<contract>-<desk>-<evm>.json`)
+   the start line says `rescuer state missing`: every rescue transfer is held and only reduces run. A missing file is
+   never taken as a first run, so the first run is asked for with `GIMBAL_RESCUE_FRESH=<contract>/<desk>`:
+   - the first start with it, on a volume with no trace of this desk's rescuers, is refused once by design: it writes
+     the marker `rescue-mainnet-<contract>-<desk>.fresh` next to where the state file goes and logs
+     `GIMBAL_RESCUE_FRESH is refused: ... start again with GIMBAL_RESCUE_FRESH=<contract>/<desk> after <time>`
+     (65 min later; a NEAR call of a rescuer that ran elsewhere may still land until then). Serve keeps running,
+     transfers still held. Run no other rescuer of this desk anywhere meanwhile;
+   - it is also refused while the contract counted a rescue or a `fund_venue` of this desk in the last 65 min, while
+     the desk's counters on NEAR cannot be read, or while any file of this desk's rescuers in that directory is under
+     65 min old; the log line says which, and when to try again;
+   - after the time in that line, redeploy (or restart) with the variable still set: the rescuer writes an empty
+     state file (`rescuer first run (GIMBAL_RESCUE_FRESH)`), removes the marker, and counts the rescue cap as used in
+     full for its first hour;
+   - then remove `GIMBAL_RESCUE_FRESH`. Over an existing state file it is ignored anyway (the start line says so).
 
 ## Operate
 

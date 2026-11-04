@@ -45,7 +45,7 @@ export const deskMissing = (windows: readonly FundingWindow[] | null): boolean =
 export const isBelow = (w: FundingWindow, minimum: number | null): boolean =>
   w.tradable && minimum !== null && w.netAprPct < minimum;
 
-export type StatusKind = 'held' | 'refused' | 'nodesk' | 'veto' | 'watch' | 'none';
+export type StatusKind = 'held' | 'refused' | 'nodesk' | 'veto' | 'watch' | 'note' | 'none';
 
 export interface RowStatus {
   kind: StatusKind;
@@ -81,6 +81,8 @@ export function rowStatus(w: FundingWindow): RowStatus {
   }
   if (w.veto?.verdict === 'veto') return plainStatus('veto', withReason('Risk check', firstReason(w.veto.reasons)));
   if (!w.tradable) return plainStatus('watch', 'Watch-only');
+  // Not a refusal: what the open does first (a stored price it refreshes), in the row's plain grey.
+  if (w.note) return { kind: 'note', text: w.note, compact: 'Price at open' };
   return plainStatus('none', '');
 }
 

@@ -231,6 +231,9 @@ const scanner = new Scanner(readers.venues, readers.watch, {
   strategy: () => server?.strategy ?? DEFAULT_STRATEGY,
   onNote: (note) => noteOnce(note),
   held: () => loop?.heldWindow() ?? null,
+  // A trading pair (mainnet, GIMBAL_TRADE=1, the loop's hands) refreshes a missing or stale stored price at open:
+  // its windows show that as a note, not E_ORACLE_STALE. Every other serve keeps the contract's verdict.
+  oracleRefreshAtOpen: () => pair?.hands !== undefined,
 });
 let loop: StrategyLoop | null = null;
 

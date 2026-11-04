@@ -174,7 +174,13 @@ sell at a far-off limit (1 tick, say) cannot pass the meter for nothing. The `si
 unpriced: true`. Only the owner can add a symbol to `unpriced` (it is part of `set_policy`); the UI asks for the
 cap in USD, converts it to `max_sz` at the current price, and shows such symbols as "no price protection". Any
 other symbol without a fresh oracle price is refused (`E_ORACLE_STALE` / `E_ASSET`): the engine calls
-`refresh_prices` before an order when the stored price is too old.
+`refresh_prices` before an order when the stored price is too old. The scanner shows that refusal on a window, except
+while serve trades (mainnet, `GIMBAL_TRADE=1`, the strategy loop's hands): a Hyperliquid or Phoenix leg whose symbol
+the contract prices (`ORACLE_ASSETS`) and whose stored price is missing or older than `oracle_max_age_s` is then not
+refused but carries `Window.note` ("stored ETH price stale: refreshed at open"), because the open refreshes it once
+before its refusals (`pair-ops.ts` `planOpen`) and holds the band and the cap to the new price, as the contract does.
+A price dated ahead of the engine's clock, a symbol outside `ORACLE_ASSETS`, an Orderly leg and every other refusal
+stay refused.
 
 ### 1.3 Who may call what
 
@@ -708,6 +714,8 @@ export interface Window {
   veto?: { verdict: 'pass' | 'veto'; reasons: string[]; model: string; at: number };   // NEAR AI risk check, can only refuse (verdict "veto": refused)
   refused?: { code: string; reason: string };   // tradable, but it cannot be entered now: the contract would refuse
                                                 // it (E_ORACLE_STALE, E_ASSET, E_SIZE) or no desk exists (E_NO_DESK)
+  note?: string;                    // not a refusal: what the desk will do at open for an enterable window, shown on
+                                    // the row ("stored ETH price stale: refreshed at open", a trading serve only)
   held: { since: number } | null;   // the desk holds this window now
   checks: { ok: boolean; text: string }[];   // what the engine checked (policy, oracle, rescue path, the carry
                                              // gate on the multi-day spread), one line each, engine-written; the

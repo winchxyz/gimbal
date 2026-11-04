@@ -95,6 +95,16 @@ test('status word: held wins, then the contract refusal, then the NEAR AI risk c
   assert.equal(rowStatus(win({ veto: { ...veto, reasons: [] } })).text, 'Risk check');
 });
 
+test('a stored price the open refreshes is a note on an enterable row, never a refusal', () => {
+  const note = 'stored ETH price stale: refreshed at open';
+  const w = win({ note });
+  assert.deepEqual(rowStatus(w), { kind: 'note', text: note, compact: 'Price at open' });
+  assert.equal(bestEnterable([w]), w, 'still the first window auto would open');
+  // A refusal or the desk holding it still wins over the note.
+  assert.equal(rowStatus(win({ note, refused: { code: 'E_SIZE', reason: 'leg over the cap' } })).kind, 'refused');
+  assert.equal(rowStatus(win({ note, held: { since: 1 } })).kind, 'held');
+});
+
 test('empty: nothing open to the desk clears the minimum, however high a refused or risk-checked row is', () => {
   const refused = { code: 'E_ORACLE_STALE', reason: 'no trusted price' };
   const veto = { verdict: 'veto' as const, reasons: ['spike'], model: 'm', at: 1 };

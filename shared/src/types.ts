@@ -43,6 +43,8 @@ export interface Window {
   veto?: { verdict: 'pass' | 'veto'; reasons: string[]; model: string; at: number };   // NEAR AI, can only refuse
   refused?: { code: string; reason: string };   // tradable, but it cannot be entered now: the contract would refuse
                                                 // it (E_ORACLE_STALE, E_ASSET, E_SIZE) or no desk exists (E_NO_DESK)
+  note?: string;                    // not a refusal: what the desk will do at open for an enterable window, shown on
+                                    // the row ("stored ETH price stale: refreshed at open", a trading serve only)
   held: { since: number } | null;   // the desk holds this window now
   checks: { ok: boolean; text: string }[];   // what the engine checked (policy, oracle, rescue path, the carry
                                              // gate on the multi-day spread), one line each, engine-written; the

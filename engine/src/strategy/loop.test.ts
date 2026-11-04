@@ -215,6 +215,17 @@ test('enter: the veto (none: "no NEAR AI risk check"), then the open; journaled 
   assert.equal(w.inputs.at(-1)!.held?.entryNetAprPct, 24);
 });
 
+test('enter on a window whose stored price the open refreshes: the journal carries the note, nothing is refused', async () => {
+  const w = world();
+  const loop = makeLoop(w);
+  const reason = 'Enter SOL: 24 % net, 3 of 3 hours above 10 %; $500.00 a leg at 1.5x; stored SOL price missing: refreshed at open';
+  w.next = { decision: { action: 'enter', reason, windowId: 'sol-phoenix-hyperliquid' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  await loop.check();
+  const enter = journal(w).find((j) => j.kind === 'enter')!;
+  assert.match(enter.summary, /stored SOL price missing: refreshed at open/);
+  assert.equal(journal(w).some((j) => j.kind === 'refused'), false);
+});
+
 test('a veto drops the window: journaled, nothing opened, held out by counters.vetoedUntil (saved), shown on the window', async () => {
   const w = world();
   const reply = (content: string) => ({ content, raw: { choices: [{ message: { content } }] } });
