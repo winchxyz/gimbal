@@ -39,7 +39,8 @@ export const HL_EXPIRY_MARGIN_MS = 10_000;
 export const HL_NONCE_WINDOW_MS = 2 * 86_400_000;
 
 /** What one order did, as far as the venue's answer proves it. */
-// `fee`: what the venue charged for the fill, USD (Hyperliquid userFills `fee`, Phoenix trades-history `fees`); null
+// `fee`: what the venue charged for the fill, USD (Hyperliquid userFills `fee`, Phoenix trades-history `fees`, Orderly
+// executionreport `totalFee`); null
 // or absent when the venue's answer did not say. `parts`: a maker order is several orders (post-only limits, then an
 // IOC); the outcome sums them, and each part is its own order record.
 export type LegOutcome =
@@ -605,21 +606,50 @@ export interface OrderlyReport {
   executedQuantity: number;      // this report's fill (0 on a status change without a fill)
   totalExecutedQuantity: number | null;
   avgPrice: number | null;
+  /**
+   * What Orderly charged, USD: `fee` for this report's execution, `totalFee` for the order so far (> 0 a cost, < 0 a
+   * maker rebate, as Orderly's fee rates are signed). Null when absent, or when `feeAsset` is not USDC.
+   */
+  fee: number | null;
+  totalFee: number | null;
+  executedPrice: number | null;  // this report's fill price (0 on a report without a fill)
+  tradeId: string | null;        // this report's fill ("0" on a report without a fill)
+  time: number | null;           // the venue's event time (`timestamp`), ms
   receivedAt: number;            // local ms
 }
 
 const TERMINAL = new Set(['FILLED', 'CANCELLED', 'REJECTED', 'EXPIRED']);
 
+// Field names as Orderly's private executionreport sends them (a testnet push of 2026-10-27 carried fee 0, feeAsset
+// "USDC", totalFee 0, executedPrice, tradeId, timestamp; Orderly's docs list the same names).
 export function parseOrderlyReport(r: Record<string, unknown>, receivedAt: number): OrderlyReport | null {
   const orderId = r.orderId ?? r.order_id;
   if (typeof r.symbol !== 'string' || (typeof orderId !== 'number' && typeof orderId !== 'string') || typeof r.status !== 'string') return null;
   const side = r.side === 'BUY' || r.side === 'SELL' ? r.side : null;
   const clientOrderId = r.clientOrderId ?? r.client_order_id;
+  const usdFee = r.feeAsset === undefined || r.feeAsset === 'USDC';
+  const tradeId = r.tradeId;
+  const time = streamNumber(r.timestamp);
   return {
     symbol: r.symbol, orderId: String(orderId), clientOrderId: typeof clientOrderId === 'string' && clientOrderId !== '' ? clientOrderId : null, side,
     status: r.status, executedQuantity: streamNumber(r.executedQuantity) ?? 0, totalExecutedQuantity: streamNumber(r.totalExecutedQuantity) ?? null,
-    avgPrice: streamNumber(r.avgPrice) ?? null, receivedAt,
+    avgPrice: streamNumber(r.avgPrice) ?? null,
+    fee: usdFee ? streamNumber(r.fee) ?? null : null, totalFee: usdFee ? streamNumber(r.totalFee) ?? null : null,
+    executedPrice: streamNumber(r.executedPrice) ?? null,
+    tradeId: (typeof tradeId === 'number' || typeof tradeId === 'string') && String(tradeId) !== '' ? String(tradeId) : null,
+    time: time !== undefined && time > 0 ? time : null, receivedAt,
   };
+}
+
+/**
+ * What Orderly charged for one order: its final report's `totalFee`, else the sum of its fill reports' `fee`; null when
+ * neither says (a fill report without a fee).
+ */
+export function orderlyOrderFee(end: OrderlyReport, reports: readonly OrderlyReport[]): number | null {
+  if (end.totalFee !== null) return end.totalFee;
+  const fills = reports.filter((r) => r.executedQuantity > 0);
+  if (fills.length === 0 || fills.some((r) => r.fee === null)) return null;
+  return fills.reduce((s, r) => s + r.fee!, 0);
 }
 
 export interface OrderlyLegOptions {
@@ -775,7 +805,7 @@ export class OrderlyLeg implements TradeLeg {
     const executed = end.totalExecutedQuantity ?? this.reportsFor(ref.orderId).reduce((s, r) => s + r.executedQuantity, 0);
     const filled = toQty(executed);
     if (filled === 0n) return { kind: 'failed', error: new NothingExecuted('orderly', `the IOC ${ref.orderId} did not fill (${end.status})`, ref.tx), ref };
-    return { kind: 'filled', filled, avgPx: end.avgPrice, ref };
+    return { kind: 'filled', filled, avgPx: end.avgPrice, fee: orderlyOrderFee(end, this.reportsFor(ref.orderId)), ref };
   }
 
   #oracle(): Promise<number | null> {

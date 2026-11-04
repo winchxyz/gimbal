@@ -37,6 +37,17 @@ export const ENTRY_SLACK_MS = 10 * 60_000;
 /** A closed position's numbers are final once each leg's ledger is read this long past the exit. */
 export const SETTLE_MS = 2 * HOUR_MS;
 
+/**
+ * Venues that pay once per funding period, not every hour (Orderly: 8 h, 4 h on some symbols). Their row is one exact
+ * payment standing for `samples` hours: never an estimate, and an hour without one is not a missing payment.
+ */
+export const PERIODIC_FUNDING_VENUES: ReadonlySet<string> = new Set(['orderly']);
+
+/** A row whose amount stands for hours the venue aggregated (Hyperliquid's daily rows): an estimate per hour. */
+export function isEstimate(f: { venue: string; samples: number | null }): boolean {
+  return f.samples !== null && !PERIODIC_FUNDING_VENUES.has(f.venue);
+}
+
 export interface Position {
   id: string;
   windowId: string;
@@ -440,7 +451,8 @@ export function positionResult(p: Position, ix: BookIndex, now: number): Positio
       exitFeeUsd: later.length === 0 || exits.some((x) => x.unknown > 0) ? null : sum(exits.map((x) => x.usd)),
       fundingUsd: sum(mine.map((f) => f.usd)), payments: mine.filter((f) => f.adjusts === undefined).length,
       paidHours: hourly.size + aggregated, hours: hoursIn(start, readTo(leg.venue)),
-      estimatedUsd: sum(mine.filter((f) => f.samples !== null).map((f) => f.usd)), estimatedHours: aggregated,
+      estimatedUsd: sum(mine.filter(isEstimate).map((f) => f.usd)),
+      estimatedHours: sum(mine.filter((f) => isEstimate(f) && f.adjusts === undefined).map((f) => f.samples!)),
     };
   });
 

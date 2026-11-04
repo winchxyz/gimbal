@@ -1101,8 +1101,14 @@ payment stored once (venue, time, symbol; a Phoenix hour whose sum changes later
 and counted only on its position's symbol between the act's start (`startedAt`, else the record less 10 min; never
 before the previous exit there) and its exit, on the leg side its signed size matches. A Hyperliquid daily aggregate
 counts only the hours of its day no hourly row covers; its split per hour is not verified, so its amount is marked
-estimated (`estimated` 1 in the funding entry and the final one, "estimated from daily aggregates" in the report). Fill fees come from the record, else the venue's fills in the
-act's window (`userFillsByTime`, Phoenix trades-history); margin-move fees and `addTransfer()` (rescue, fund scripts)
+estimated (`estimated` 1 in the funding entry and the final one, "estimated from daily aggregates" in the report).
+Orderly (only when serve hands `liveBookSources` its `orderly` reads; the book's `orderly` address is the account id):
+funding from the signed `funding_fee_history` read, booked under the book's symbol ("PERP_SOL_USDC" as SOL, 1000X as
+kX); one row per funding period (8 h or 4 h), exact, never estimated, and an hour between its payments is not missing
+(the journal shows it on its own hour as "its 8 h funding period"; the report as payments per period). Its fills come
+from the private session's executionreports (`OrderlyFillLog`, `book/orderly.ts`: `fee` / `totalFee` in USDC, > 0 a
+cost); a window the session did not hear (before it, or while it was down) is a failed read. Fill fees come from the record, else the venue's fills in the
+act's window (`userFillsByTime`, Phoenix trades-history, the Orderly fill log); margin-move fees and `addTransfer()` (rescue, fund scripts)
 are transfer costs; the desk's Hyperliquid `userNonFundingLedgerUpdates` are booked to the desk, not a position; a tx
 hash already booked is never counted twice. Per position: funding per leg and in total, fees and price over every fill
 (price: each fill's cash flow, once closed), transfers, net, hours held, and the actual APR next to the forecast net
