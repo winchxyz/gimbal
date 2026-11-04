@@ -2,6 +2,7 @@
 // operator key by name (OPERATOR_PRIVATE_KEY, never printed) and checks the contract and every venue URL are on the
 // engine's network before anything can be signed.
 
+import { resolve } from 'node:path';
 import type { Mode } from '@gimbal/shared';
 import { NearContractClient } from '../contract/near-client.ts';
 import { NearApiTransport } from '../contract/near-transport.ts';
@@ -9,11 +10,17 @@ import { checkContractNetwork, contractEnv } from '../cli/serve-contract.ts';
 import { ConfigError } from '../cli/start-errors.ts';
 import { HL_MAINNET_URL, HL_TESTNET_URL } from '../venues/hyperliquid.ts';
 import { ORDERLY_ENDPOINTS } from '../venues/orderly-http.ts';
+import { userStateDir } from '../trade/trader-state.ts';
+import { ORDERLY_WITHDRAW_ENV, startOrderlyWithdraw } from './orderly-withdraw.ts';
 import { publicIpLookup } from './public-ip.ts';
 import { SetupService } from './service.ts';
 
 export async function setupFromEnv(mode: Mode, env: (name: string) => string | undefined, log: (line: string) => void): Promise<SetupService | null> {
-  if (env('GIMBAL_SETUP') !== '1') return null;
+  const withdraw = env(ORDERLY_WITHDRAW_ENV);
+  if (env('GIMBAL_SETUP') !== '1') {
+    if (withdraw !== undefined) log(`orderly withdraw: ignored: ${ORDERLY_WITHDRAW_ENV} runs only with GIMBAL_SETUP=1 (it signs with the operator key)`);
+    return null;
+  }
   if (mode === 'replay') throw new ConfigError('GIMBAL_SETUP=1 needs GIMBAL_MODE testnet or mainnet: replay signs nothing');
   const cfg = contractEnv(env, mode, { signing: true });
   if (cfg === null) throw new ConfigError('GIMBAL_SETUP=1 needs GIMBAL_CONTRACT_ID and the operator key');
@@ -34,6 +41,15 @@ export async function setupFromEnv(mode: Mode, env: (name: string) => string | u
   // Checked against a desk's Orderly IP list before setup applies it; a bad GIMBAL_PUBLIC_IP stops serve here.
   const publicIps = publicIpLookup({ override: env('GIMBAL_PUBLIC_IP') });
   log(`venue setup: on (POST /setup), operator ${cfg.accountId}, ${network}`);
+  // GIMBAL_ORDERLY_WITHDRAW: a one-shot withdrawal in the background (orderly-withdraw.ts); serve does not wait for it.
+  if (withdraw !== undefined) {
+    const stateDirEnv = env('GIMBAL_STATE_DIR');
+    void startOrderlyWithdraw({
+      value: withdraw, network, contract, orderlyUrl, log,
+      engine: { contractId: cfg.contractId, deskId: cfg.deskId, operatorAccount: cfg.accountId! },
+      stateDir: stateDirEnv === undefined ? userStateDir(env) : resolve(stateDirEnv),
+    });
+  }
   return new SetupService({
     network, contract, operatorAccount: cfg.accountId!, config, hlUrl, orderlyUrl, log, publicIps,
     ...(solanaRpcUrl === undefined ? {} : { solanaRpcUrl }),

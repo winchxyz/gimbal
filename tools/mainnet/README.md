@@ -1003,6 +1003,37 @@ Order: `status`; `receiver` (lookup), then `receiver <address> --key-file ... --
 under 0.006 NEAR of storage and burn under 0.01 NEAR of gas; each operator request about 0.001 NEAR (0.3 NEAR of
 the key's allowance held per call until the refund).
 
+### Money out of Orderly once the IP list is applied
+
+With the list applied, Orderly takes the desk's key only from the engine's IPs, so no script here can post
+`settle_pnl` or `withdraw_request`. The engine on Railway does it once per run-id. The full runbook is in
+docs/deploy-railway.md, "Bringing USDC back from Orderly". In short:
+
+1. Check that the desk is running (a paused desk: the owner unpauses with `set_paused(<desk>, false)` and 1
+   yoctoNEAR, `auto` kept off), every Orderly position is flat, and Orderly holds at least about 12 USDC. The
+   operator's `orderly_withdraw` refuses less than max(10 × `max_transfer_cost_flat_e6`, 10 USDC) and counts against
+   the hourly rescue cap. Orderly takes a 1 USDC fee, gone for good.
+2. `railway variable set GIMBAL_SETUP=1 GIMBAL_ORDERLY_WITHDRAW=<contract>.near/<desk_id>/<amount USDC>/<run-id>`,
+   with a new run-id each time.
+3. Watch `railway logs` for `orderly withdraw:` lines until `done: ...` or `failed: ...`, and redeploy nothing
+   meanwhile. A `refused: ...` line wrote no marker: fix the cause and restart. A `failed` run or a `started`
+   marker is never retried: `unknown outcome, check the desk EVM on Arbitrum and nearblocks; set a new run-id only
+   after checking`.
+4. Remove both variables (the service's Variables tab).
+5. Bring the USDC from the desk EVM on Arbitrum to the contract, then pay the owner. Do a dry run of each first:
+
+   ```
+   node tools/mainnet/hl-return.mjs <contract>.near <desk_id> bridge all --send
+   node tools/mainnet/withdraw.mjs <contract>.near <desk_id> all --key-file <owner key json> --send
+   ```
+
+   The bridge counts against the same hourly cap, so if the withdrawal plus the bridge are over it, bridge an hour
+   later. Its rescuer lock sees only this machine: check `railway logs` that no rescue is under way.
+
+Costs: Orderly's 1 USDC fee, NEAR gas for 8 operator calls (about 0.001 NEAR each), the 1Click fee and the relayer's
+Arbitrum gas for the bridge, and NEAR gas for the payout. Orderly's accepted withdrawal cannot be cancelled. It goes
+to the desk's own EVM address only. The payout to the owner is final.
+
 ## 9. The carry pair: short Hyperliquid, long Phoenix
 
 `engine/src/cli/pair-mainnet.ts` (`npm run pair-mainnet -w engine -- ...`) is a dry run unless `--send` is given,
