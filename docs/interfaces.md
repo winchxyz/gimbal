@@ -178,12 +178,23 @@ other symbol without a fresh oracle price is refused (`E_ORACLE_STALE` / `E_ASSE
 while serve can open (mainnet, `GIMBAL_TRADE=1`, the start confirmed, live, not stopping: `PairHands.canOpen`): a
 Hyperliquid or Phoenix leg whose symbol the contract prices (`ORACLE_ASSETS`) and whose stored price is missing or
 older than `oracle_max_age_s` is then not refused but carries `Window.note` ("stored ETH price stale: refreshed at
-open"). The open plans read-only on the price as it is (a missing one on the books' mid), judges every other refusal
-first, and only then sends one `refresh_prices` (`pair-ops.ts` `planOpen`, `refreshForOpen`), holding the size to the
-cap at the new price before either leg; the refreshed price must live the first part's margin plus 15 s, so no second
-refresh is needed before it. The strategy loop holds a window 6 h after an open refused once it paid for a refresh,
-sends at most 12 such refreshes per symbol per UTC day (saved with its state under `GIMBAL_STATE_DIR`), and refreshes
-a rotate's target before it closes the held pair. A price dated ahead of the engine's clock, a symbol outside
+open"). The open plans read-only on the price as it is (on the books' mid when none is stored, or when the stored
+one is over the band from the books), judges every other refusal first, and only then sends one `refresh_prices`
+(`pair-ops.ts` `planOpen`, `refreshForOpen`), holding the size to the cap at the new price before either leg; the
+refreshed price must live the first part's margin plus 15 s, so no second refresh is needed before it. When the
+refreshed price is over the band from the one the plan was judged on, the read-only plan runs again on it (parts,
+SOL, the Hyperliquid minimum, the IOC), and the price must still live that margin plus 15 s when it is done; a
+refusal then is a paid one. A refresh is paid when it reached the chain (`refreshReachedChain`: it ran, was sent with
+no outcome, or was refused or failed in a transaction, all of which spend gas); one that failed before the chain (the
+RPC, HTTP, the prices() read) pays nothing. The 30 s gap between refreshes still follows only one the contract
+recorded (`refreshLanded`). The strategy loop holds a window 6 h after an open
+refused once it paid for a refresh, its own or one in the size recheck or before a part (the hold is saved, so a
+restart keeps it, and cut to at most 6 h from the load), and refreshes a rotate's target before it closes the held
+pair. It sends at most 12 refreshes per symbol and 24 over all symbols per UTC day (saved with its state under
+`GIMBAL_STATE_DIR`). These caps are soft: they are checked only before an open starts, so one open may spend its
+own refresh, the recheck's and one before each part past them, and a part, an unwind or a hedge is never refused
+for a cap; every paid refresh is counted, so the next open sees it. A leg's own read during a part may still
+refresh a price about to go stale; that one is not counted, on purpose, and is bounded per open by its parts. A price dated ahead of the engine's clock, a symbol outside
 `ORACLE_ASSETS`, an Orderly leg and every other refusal stay refused.
 
 ### 1.3 Who may call what

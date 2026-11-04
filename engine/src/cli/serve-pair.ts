@@ -78,9 +78,9 @@ import { PHOENIX_API_URL, PhoenixReader, SOLANA_MAINNET_RPC_URL, phoenixGet } fr
 import { errorMessage } from '../venues/recorder.ts';
 import type { Clock } from '../venues/venue.ts';
 import type { PriceDeps, StoredPrice } from './pair-mainnet-lib.ts';
-import { PRICE_MARGIN_S, ensureFresh, newPriceState, oraclePxOf, priceFitRefusal, priceLifeS, refreshLanded } from './pair-mainnet-lib.ts';
+import { PRICE_MARGIN_S, ensureFresh, newPriceState, oraclePxOf, priceFitRefusal, priceLifeS, refreshLanded, refreshReachedChain } from './pair-mainnet-lib.ts';
 import type { OpsCtx, PairRunner } from './pair-ops.ts';
-import { pairOf, planClose, planOpen, recheckOpenSize, refreshForOpen, sendClose, sendOpen } from './pair-ops.ts';
+import { counting, pairOf, planClose, planOpen, recheckOpenSize, refreshForOpen, sendClose, sendOpen } from './pair-ops.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { checkContractNetwork, contractEnv } from './serve-contract.ts';
 import { ConfigError, START_RETRY_MAX_MS, startBackoffMs } from './start-errors.ts';
@@ -120,7 +120,7 @@ export interface CarryResult {
 export interface RefreshAllowance {
   /** Why no refresh_prices may be sent for it (the day's refreshes of the symbol are used); absent: one may. */
   noRefresh?: string;
-  /** Called when refresh_prices was sent for it (paid), before anything else of the open. */
+  /** Called for each refresh_prices sent for it (paid): its own, and any before the size check or a part. */
   onPaidRefresh?: () => void;
 }
 
@@ -220,6 +220,8 @@ export interface HandsResult {
   sent?: boolean;
   /** refresh_prices was sent for it (paid), whatever came of it. */
   refreshed?: boolean;
+  /** How many refresh_prices were sent for it (with `refreshed`); absent: one. */
+  refreshes?: number;
 }
 
 /** The strategy loop's hands on the desk's pair (strategy/loop.ts). */
@@ -411,7 +413,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
     const prices: PriceDeps = {
       maxAgeS: policy.oracle_max_age_s, send: wantLive, read: (s) => storedPrice(client, s),
       refresh: (s, maxAgeS) => client.refreshPrices([s], { maxAgeS }), now: () => input.clock.now(), log: (l) => log(`pair ${l.trim()}`),
-      landed: refreshLanded, ...newPriceState(),
+      landed: refreshLanded, reachedChain: refreshReachedChain, ...newPriceState(),
     };
     // stop() sets it first: from then on nothing is signed (its lock is being released).
     let stopped = false;
@@ -939,13 +941,9 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           if (!oraclePriced(sym)) return result(false, `the stored ${sym} price is ${was} and refresh_prices cannot refresh it (${sym} is not one of the contract's oracle assets)`);
           if (request.noRefresh !== undefined) return result(false, `the stored ${sym} price is ${was} and needs refresh_prices: ${request.noRefresh}`);
           try {
-            const fresh = await ensureFresh({
-              ...prices,
-              refresh: (s, maxAgeS) => {
-                paid = true;
-                return prices.refresh(s, maxAgeS);
-              },
-            }, sym, marginS);
+            const fresh = await ensureFresh(counting(prices, () => {
+              paid = true;
+            }), sym, marginS);
             return result(true, `the stored ${sym} price (${was}) refreshed before the close: ${fresh.px}, ${Math.round(fresh.ageS)} s old`);
           } catch (err) {
             return result(false, `the stored ${sym} price (${was}) could not be refreshed: ${errorMessage(err)}`);
@@ -953,7 +951,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         }).then((r) => (paid ? { ...r, refreshed: true } : r));
       },
       open: (request) => {
-        let paid = false;
+        let paid = 0;
         return exclusive(async () => {
           const sym = request.symbol;
           if (!common.includes(sym)) return result(false, `${sym} is not in both policy.hl_assets and policy.phoenix_markets (${common.join(', ') || 'none'})`);
@@ -990,7 +988,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
             ...(request.qty === undefined ? {} : { qty: request.qty }), ...(request.gate === undefined ? {} : { gate: request.gate }),
             ...(request.noRefresh === undefined ? {} : { noRefresh: request.noRefresh }),
             onPaidRefresh: () => {
-              paid = true;
+              paid++;
             },
           }, out);
           if (r.refusals.length > 0) return result(false, `open refused, nothing signed: ${r.refusals.join('; ')}`, { lines: said, open: opens });
@@ -1005,7 +1003,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           // Orders went out when a part sent any (a part the gate stopped before its first order sent none).
           const sent = r.results.some((x) => x.legs.some((l) => l.orders.length > 0)) || heldSymbol() !== null;
           return result(ok, reason, { results: r.results, lines: said, open: opens, sent, ...summarise(r.results) });
-        }).then((r) => (paid ? { ...r, refreshed: true } : r));
+        }).then((r) => (paid > 0 ? { ...r, refreshed: true, refreshes: paid } : r));
       },
       reconcile: async () => {
         const slot = current;
@@ -1161,13 +1159,14 @@ export function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string
         refusals.push(`the stored ${p.symbol} price is ${plan.refresh.was} and needs refresh_prices: ${request.noRefresh}; nothing sent`);
       }
       if (refusals.length > 0) return { refusals, results: [] };
-      const fresh = await refreshForOpen(ctx, { ...plan, refusals });
+      const fresh = await refreshForOpen(ctx, pair, { ...plan, refusals }, { planning: (on) => p.planning(on) });
       if (fresh.paid) request.onPaidRefresh?.();
       if (fresh.line !== null) out.say(fresh.line);
       if (fresh.refused !== null) return { refusals: [fresh.refused], results: [], refreshed: fresh.paid };
+      plan = fresh.plan;
       // The exact size decide() took is a maximum: held to the cap at the prices of the moment, before either leg.
       if (request.qty !== undefined) {
-        const held = await recheckOpenSize(ctx, pair, plan.size, SERVE_SLIPPAGE_BPS);
+        const held = await recheckOpenSize(ctx, pair, plan.size, SERVE_SLIPPAGE_BPS, request.onPaidRefresh);
         if ('refused' in held) return { refusals: [held.refused], results: [], refreshed: fresh.paid };
         out.say(held.line);
         plan = { ...plan, size: held.qty };
@@ -1176,7 +1175,8 @@ export function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string
       // refuses the open here, before the first order, and stops it before each later part (sendOpen's beforePart).
       const gated = request.gate?.() ?? null;
       if (gated !== null) return { refusals: [`${gated}: nothing sent`], results: [], refreshed: fresh.paid };
-      return { refusals: [], results: await sendOpen(ctx, pair, plan, request.reason, request.gate === undefined ? {} : { gate: request.gate }), refreshed: fresh.paid };
+      const options = { ...(request.gate === undefined ? {} : { gate: request.gate }), ...(request.onPaidRefresh === undefined ? {} : { onRefresh: request.onPaidRefresh }) };
+      return { refusals: [], results: await sendOpen(ctx, pair, plan, request.reason, options), refreshed: fresh.paid };
     },
     close: async (request, out) => {
       const ctx = await ctxFor(out);

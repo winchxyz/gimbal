@@ -315,14 +315,20 @@ export interface OpenPlan {
    * refusal passed): missing, or too old to live the first part's margin. null: none needed (or an unpriced symbol).
    */
   refresh: { marginS: number; was: string } | null;
+  /**
+   * The price the plan's cap, minimum and IOC were judged on: the stored one, or the books' mid where none is stored
+   * or a stale one is over the band from the books; null for an unpriced symbol. refreshForOpen plans again when the
+   * refreshed price is over the band from it.
+   */
+  pricedAt: number | null;
 }
 
 /**
  * Everything an open checks before anything is signed, printed (the window, the carry, the size, the leverage, the
  * stored price, the SOL, the simulated Phoenix IOC, the maker plan); the refusals are returned, not thrown. Read-only:
- * it never sends refresh_prices. A stored price that is missing or too old to plan with is planned on as it is (a
- * missing one on the books' mid), so every other refusal is judged first; a real open then refreshes it once, through
- * refreshForOpen, only when nothing refused.
+ * it never sends refresh_prices. A stored price that is missing or too old to plan with is planned on as it is (on
+ * the books' mid when none is stored or it is over the band from the books), so every other refusal is judged
+ * first; a real open then refreshes it once, through refreshForOpen, only when nothing refused.
  */
 export async function planOpen(ctx: OpsCtx, pair: Pair, request: OpenRequest): Promise<OpenPlan> {
   const { symbol, legUsd, leverage, holdDays, basisBps } = request;
@@ -396,7 +402,8 @@ export async function planOpen(ctx: OpsCtx, pair: Pair, request: OpenRequest): P
   const marginS = pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S;
   const was = sp === null ? 'missing' : `${Math.round(sp.ageS)} s old`;
   let refresh: OpenPlan['refresh'] = null;
-  if (pair.priced && (sp === null || sp.ageS > ctx.prices.maxAgeS - marginS)) {
+  const tooOld = pair.priced && (sp === null || sp.ageS > ctx.prices.maxAgeS - marginS);
+  if (tooOld) {
     if (!oraclePriced(symbol)) {
       refusals.push(sp === null
         ? `the contract has no stored ${symbol} price`
@@ -407,8 +414,13 @@ export async function planOpen(ctx: OpsCtx, pair: Pair, request: OpenRequest): P
       refresh = { marginS, was };
     }
   }
-  const estimated = pair.priced && sp === null && mid > 0;
+  // A stale row is good enough to judge on while it is within the band of the books; one further off (a price days
+  // old), or none, is planned on the books' mid instead.
+  const band = policy.price_band_bps / 10_000;
+  const offBook = sp !== null && mid > 0 && Math.abs(sp.px - mid) / mid > band;
+  const estimated = tooOld && mid > 0 && (sp === null || offBook);
   if (estimated) (ctx.prices.estimate ??= new Map()).set(symbol, mid);
+  const pricedAt = !pair.priced ? null : estimated ? mid : (sp?.px ?? null);
 
   let chunk: bigint | null = null;
   let sim: { lines: string[]; refusals: string[] } = { lines: ['ioc sim   no part to simulate'], refusals: [] };
@@ -435,11 +447,11 @@ export async function planOpen(ctx: OpsCtx, pair: Pair, request: OpenRequest): P
   ctx.say(`size      ${qtyString(size)} ${symbol} per leg (${usd(qtyNumber(size) * mid)} at ${mid.toFixed(4)}); common lot ${qtyString(pair.lot)}`);
   ctx.say(`          ${parts} pair part(s) of at most ${chunk === null ? '?' : qtyString(chunk)} (policy max_notional_usd ${policy.max_notional_usd} less the ${pair.bandBps} bps band)`);
   ctx.say(`leverage  Hyperliquid ${symbol}: ${assetData?.leverage === undefined ? 'unknown' : `${assetData.leverage.type} ${assetData.leverage.value}x`} on the account (the contract cannot set it); effective leverage is what is checked`);
-  ctx.say(`price     stored ${symbol} ${sp === null ? 'none' : `${sp.px}, ${Math.round(sp.ageS)} s old`}${estimated ? ` (planned on the books' mid ${mid.toFixed(4)})` : ''}${refresh === null ? '' : `; ${ctx.send ? 'the open refreshes it once every check above passed' : '--send refreshes it once its checks pass'}`}; --send refreshes it before each part when it would not live ${marginS} s more (a fresh one lives ${priceLifeS(policy.oracle_max_age_s)} s of the ${policy.oracle_max_age_s})`);
+  ctx.say(`price     stored ${symbol} ${sp === null ? 'none' : `${sp.px}, ${Math.round(sp.ageS)} s old`}${estimated ? ` (planned on the books' mid ${mid.toFixed(4)}${sp === null ? '' : ', the stored one is over the band from the books'})` : ''}${refresh === null ? '' : `; ${ctx.send ? 'the open refreshes it once every check above passed' : '--send refreshes it once its checks pass'}`}; --send refreshes it before each part when it would not live ${marginS} s more (a fresh one lives ${priceLifeS(policy.oracle_max_age_s)} s of the ${policy.oracle_max_age_s})`);
   ctx.say(`solana    authority ${solText(lamports)}; up to ${solText(solNeed)} needed (unit price ${pair.microLamports} µlamports)`);
   for (const l of sim.lines) ctx.say(l);
   ctx.say(`order     maker first: Hyperliquid SELL post-only at the ask, repriced every ${pair.maker.repriceMs / 1000} s, at most ${pair.maker.maxOrders} signed post-only orders for the whole open (the C10 meter counts each), for ${pair.maker.timeoutMs / 1000} s${pair.maker.takerFallback ? ', then an IOC for the rest' : ', no taker fallback (--taker-fallback to add one)'}; then Phoenix BUY IOC for what filled`);
-  return { request, refusals, size, carry: plan, refresh };
+  return { request, refusals, size, carry: plan, refresh, pricedAt };
 }
 
 /** What refreshForOpen did: `refused` why the open must not be sent (null: it may); `paid` a refresh_prices was sent. */
@@ -448,6 +460,8 @@ export interface OpenRefresh {
   paid: boolean;
   /** The price line to print, when it read one. */
   line: string | null;
+  /** The plan to send: the one given, or planned again on the refreshed price. */
+  plan: OpenPlan;
 }
 
 /**
@@ -455,44 +469,90 @@ export interface OpenRefresh {
  * (the plan's, and the caller's own before it: serve's price fit and gate): a refused open never pays for one. Through
  * ensureFresh at the first part's margin (shared with a refresh in flight, none within MIN_REFRESH_GAP_S of the last),
  * then held to OPEN_HEADROOM_S more, so the size check and the first part's own check find it fresh and send no second
- * one. Never throws: a refresh that fails is a refusal with its reason.
+ * one. When the refreshed price is over the band from the one the plan was judged on (OpenPlan.pricedAt), the
+ * read-only planOpen runs again on it (`planning` on around it, serve's legs), so the part count, the SOL, the
+ * Hyperliquid minimum and the IOC are checked on the new price; a refusal then is a paid one. Never throws: a refresh
+ * that fails is a refusal with its reason.
  */
-export async function refreshForOpen(ctx: OpsCtx, plan: OpenPlan): Promise<OpenRefresh> {
+export async function refreshForOpen(ctx: OpsCtx, pair: Pair, plan: OpenPlan, options: { planning?: (on: boolean) => void } = {}): Promise<OpenRefresh> {
   const need = plan.refresh;
   const { symbol } = plan.request;
-  if (need === null) return { refused: null, paid: false, line: null };
-  if (plan.refusals.length > 0) return { refused: `refused already, so the stored ${symbol} price (${need.was}) is not refreshed: ${plan.refusals.join('; ')}`, paid: false, line: null };
-  if (!ctx.send) return { refused: `the stored ${symbol} price is ${need.was}: a dry run does not refresh it`, paid: false, line: null };
+  if (need === null) return { refused: null, paid: false, line: null, plan };
+  if (plan.refusals.length > 0) return { refused: `refused already, so the stored ${symbol} price (${need.was}) is not refreshed: ${plan.refusals.join('; ')}`, paid: false, line: null, plan };
+  if (!ctx.send) return { refused: `the stored ${symbol} price is ${need.was}: a dry run does not refresh it`, paid: false, line: null, plan };
   let paid = false;
-  const deps: PriceDeps = {
-    ...ctx.prices,
-    refresh: (s, maxAgeS) => {
-      paid = true;
-      return ctx.prices.refresh(s, maxAgeS);
-    },
-  };
+  const deps = counting(ctx.prices, () => {
+    paid = true;
+  });
   let sp: StoredPrice;
   try {
     sp = await ensureFresh(deps, symbol, need.marginS);
   } catch (err) {
-    return { refused: `the stored ${symbol} price (${need.was}) could not be refreshed before the open: ${errorMessage(err)}`, paid, line: null };
+    return { refused: `the stored ${symbol} price (${need.was}) could not be refreshed before the open: ${errorMessage(err)}`, paid, line: null, plan };
   }
   const left = ctx.prices.maxAgeS - need.marginS - sp.ageS;
   const line = `price     stored ${symbol} ${sp.px}, ${Math.round(sp.ageS)} s old${paid ? ' (refreshed for this open)' : ''}: it lives ${Math.round(left)} s past the first part's ${need.marginS} s`;
   if (left < OPEN_HEADROOM_S) {
-    return { refused: `the stored ${symbol} price is ${Math.round(sp.ageS)} s old after refresh_prices: it lives ${Math.round(left)} s past the first part's ${need.marginS} s, under the ${OPEN_HEADROOM_S} s the open needs before it; nothing sent`, paid, line };
+    return { refused: `the stored ${symbol} price is ${Math.round(sp.ageS)} s old after refresh_prices: it lives ${Math.round(left)} s past the first part's ${need.marginS} s, under the ${OPEN_HEADROOM_S} s the open needs before it; nothing sent`, paid, line, plan };
   }
-  return { refused: null, paid, line };
+  const bandBps = ctx.desk.policy.price_band_bps;
+  const movedBps = plan.pricedAt === null || !(plan.pricedAt > 0) ? 0 : (Math.abs(sp.px - plan.pricedAt) / plan.pricedAt) * 10_000;
+  if (movedBps <= bandBps) return { refused: null, paid, line, plan };
+  const moved = `the stored ${symbol} price after refresh_prices is ${sp.px}, ${Math.round(movedBps)} bps from the ${plan.pricedAt} the open was judged on (over the ${bandBps} bps band)`;
+  ctx.say(`replan    ${moved}: planned again on it`);
+  options.planning?.(true);
+  let again: OpenPlan;
+  try {
+    again = await planOpen(ctx, pair, plan.request);
+  } catch (err) {
+    return { refused: `${moved}, and planning again failed: ${errorMessage(err)}; nothing sent`, paid, line, plan };
+  } finally {
+    options.planning?.(false);
+  }
+  const why = [...again.refusals, ...(again.refresh === null ? [] : [`the stored ${symbol} price is ${again.refresh.was} again`])];
+  if (why.length > 0) return { refused: `${moved}, and planned again the open refuses: ${why.join('; ')}; nothing sent`, paid, line, plan: again };
+  // Planning again takes seconds of the price's life: the headroom is checked again before anything else runs.
+  const after = await ctx.prices.read(symbol);
+  const leftAfter = after === null ? -Infinity : ctx.prices.maxAgeS - need.marginS - after.ageS;
+  if (leftAfter < OPEN_HEADROOM_S) {
+    const age = after === null ? 'missing' : `${Math.round(after.ageS)} s old`;
+    return { refused: `${moved}; planned again, the stored ${symbol} price is ${age}: it lives ${Number.isFinite(leftAfter) ? Math.round(leftAfter) : 0} s past the first part's ${need.marginS} s, under the ${OPEN_HEADROOM_S} s the open needs before it; nothing sent`, paid, line, plan: again };
+  }
+  return { refused: null, paid, line, plan: again };
+}
+
+/**
+ * `d` with each refresh_prices that reached the chain reported to `onRefresh` (it is paid for: the loop's caps count it
+ * and a refusal after it holds the window): the call returned, or it threw and `d.reachedChain` (else `d.landed`) says
+ * it got there, a transaction that failed or was refused on chain included, so one that keeps failing there is held and
+ * capped. One that failed before the chain (an RPC or HTTP error, the prices() read) paid nothing.
+ */
+export function counting(d: PriceDeps, onRefresh: () => void): PriceDeps {
+  return {
+    ...d,
+    refresh: async (s, maxAgeS) => {
+      let tx: Awaited<ReturnType<PriceDeps['refresh']>>;
+      try {
+        tx = await d.refresh(s, maxAgeS);
+      } catch (err) {
+        if ((d.reachedChain ?? d.landed)?.(err) === true) onRefresh();
+        throw err;
+      }
+      onRefresh();
+      return tx;
+    },
+  };
 }
 
 /**
  * Sends a planned open whose refusals are empty: maker first, part by part, then finish(). `gate` (serve) is asked
- * before each part, after the price refresh: a reason stops the open there, with nothing of that part sent (the parts
- * already sent are whole hedged pairs, each through its own legging guard, and stay as they are).
+ * before each part, after the price refresh (`onRefresh` hears of each refresh_prices it sends): a reason stops the
+ * open there, with nothing of that part sent (the parts already sent are whole hedged pairs, each through its own
+ * legging guard, and stay as they are).
  */
 export async function sendOpen(
   ctx: OpsCtx, pair: Pair, plan: OpenPlan, reason = `pair-mainnet: carry ${plan.request.symbol}, short hyperliquid, long phoenix`,
-  options: { gate?: () => string | null } = {},
+  options: { gate?: () => string | null; onRefresh?: () => void } = {},
 ): Promise<PairResult[]> {
   if (plan.refusals.length > 0) throw new Error(`open refused, nothing signed: ${plan.refusals.join('; ')}`);
   const { symbol } = plan.request;
@@ -506,7 +566,11 @@ export async function sendOpen(
     const results = await pair.run.openInChunks({
       size: plan.size, longIndex: 1, reason, maker: { index: 0 },
       beforePart: async () => {
-        if (pair.priced) await ensureFresh(ctx.prices, symbol, pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S);
+        // Counted for the loop's caps. The legs' own read during a part (oraclePxOf, trading) may still refresh a
+        // price within PRICE_STALE_MARGIN_S of going stale: not counted, on purpose. It fires only when a part outlasts
+        // the margin checked here, and the price it stores lives minutes again, so it adds about one per part at
+        // most, bounded per open by its parts (an unwind or a close must never be refused for a cap).
+        if (pair.priced) await ensureFresh(options.onRefresh === undefined ? ctx.prices : counting(ctx.prices, options.onRefresh), symbol, pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S);
         const gated = options.gate?.() ?? null;
         if (gated !== null) throw new Error(gated);
       },
@@ -551,10 +615,12 @@ export function capQtyAtOrder(p: { qty: bigint; lot: bigint; worstPx: number; mi
  * (the ask plus `slippageBps`, at most the band over the stored price), the Hyperliquid sell's maker price (at most
  * the ask) and the stored price itself.
  */
-export async function recheckOpenSize(ctx: OpsCtx, pair: Pair, size: bigint, slippageBps: number): Promise<{ qty: bigint; cut: boolean; line: string } | { refused: string }> {
+export async function recheckOpenSize(
+  ctx: OpsCtx, pair: Pair, size: bigint, slippageBps: number, onRefresh?: () => void,
+): Promise<{ qty: bigint; cut: boolean; line: string } | { refused: string }> {
   const policy = ctx.desk.policy;
   const symbol = pair.symbol;
-  const sp = pair.priced ? await ensureFresh(ctx.prices, symbol, pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S) : null;
+  const sp = pair.priced ? await ensureFresh(onRefresh === undefined ? ctx.prices : counting(ctx.prices, onRefresh), symbol, pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S) : null;
   const [hlBook, pxBook] = await Promise.all([ctx.hl.book(symbol, 5), ctx.phoenix.book(symbol, 5)]);
   const hlAsk = hlBook.asks[0]?.px ?? 0;
   const pxAsk = pxBook.asks[0]?.px ?? 0;

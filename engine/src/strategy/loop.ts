@@ -26,8 +26,9 @@
 // sent is journaled and not tried again for RETRY_AFTER_MS; one that sent orders, or was refused for a passing reason
 // (a rescue running, a close in flight), is tried again on the next check. An open that needs the stored price
 // refreshed pays for one refresh_prices only after its other refusals pass (pair-ops.ts refreshForOpen); one refused
-// after that payment holds its window REFRESH_HOLD_MS, and the opens send at most MAX_OPEN_REFRESHES_PER_DAY per
-// symbol per UTC day (counted in the saved state, journaled when hit). A rotate refreshes the target's price before
+// after that payment holds its window REFRESH_HOLD_MS (saved, so a restart keeps it), and the opens send at most
+// MAX_OPEN_REFRESHES_PER_DAY per symbol and MAX_OPEN_REFRESHES_PER_DAY_ALL over all symbols per UTC day (counted in
+// the saved state, journaled when hit). A rotate refreshes the target's price before
 // it closes the held pair (hands.prepareOpen): a refresh that fails keeps the pair held. A single leg (only one venue
 // holds a position) is never held as a pair: it is closed at once, reduce-only, and tried again every check until
 // flat. Each check first asks the hands to check their record against the venues (serve-pair.ts
@@ -71,8 +72,15 @@ export const RETRY_AFTER_MS = 15 * 60_000;
  * window before this: each try would pay again (a fresh price lives 5 minutes, a retry comes after 15).
  */
 export const REFRESH_HOLD_MS = 6 * HOUR_MS;
-/** At most this many refresh_prices an open of the loop sends per symbol per UTC day (the day's count is saved). */
+/**
+ * At most this many refresh_prices an open of the loop sends per symbol per UTC day (the day's count is saved).
+ * Soft caps, this one and the next: they are checked only before an open starts (its noRefresh), so one open may
+ * spend its own refresh, the size recheck's and one before each part past them; a part, an unwind or a hedge is
+ * never refused for a cap. Every refresh that reached the chain is counted, so the next open sees the overrun.
+ */
 export const MAX_OPEN_REFRESHES_PER_DAY = 12;
+/** And at most this many per UTC day over all symbols (the sum of the day's per-symbol counts, saved with them). */
+export const MAX_OPEN_REFRESHES_PER_DAY_ALL = 24;
 export const LOOP_STATE_VERSION = 1;
 
 /** A refusal before the risk check was asked says so. */
@@ -113,6 +121,8 @@ export interface ActOutcome {
   filledQty?: string;
   /** refresh_prices was sent for it (paid), whatever came of it. */
   refreshed?: boolean;
+  /** How many refresh_prices were sent for it (with `refreshed`: its own and those before its parts); absent: one. */
+  refreshes?: number;
 }
 
 /** One leg's fills in an open or a close: summed size, size-weighted price, summed fee. */
@@ -226,6 +236,11 @@ export interface LoopFileState {
   held: LoopHeld | null;
   /** The refresh_prices the loop's opens sent on `day` (UTC, YYYY-MM-DD), per symbol; absent: none yet. */
   refreshes?: { day: string; bySymbol: Record<string, number> };
+  /**
+   * `kind window` -> until when an act is held after its open was refused once it paid for refresh_prices, and the
+   * line journaled (REFRESH_HOLD_MS); absent: none. A restart keeps the holds that have not ended.
+   */
+  holds?: Record<string, { until: number; reason: string }>;
 }
 
 /** The loop's file, next to the trader state: one per mode, contract and desk. */
@@ -351,10 +366,24 @@ export function parseLoopState(v: unknown): LoopFileState {
     };
     held = { windowId: h.windowId, symbol: h.symbol, since: n(h.since, 'since'), legUsd: n(h.legUsd, 'legUsd'), entryNetAprPct: n(h.entryNetAprPct, 'entryNetAprPct') };
   }
-  if (o.refreshes === undefined) return { version: LOOP_STATE_VERSION, counters, held };
-  const r = o.refreshes as Record<string, unknown> | null;
-  if (r === null || typeof r !== 'object' || typeof r.day !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(r.day)) throw new Error('refreshes has no day');
-  return { version: LOOP_STATE_VERSION, counters, held, refreshes: { day: r.day, bySymbol: record(r.bySymbol, 'refreshes.bySymbol', isCount, 'a count') } };
+  const out: LoopFileState = { version: LOOP_STATE_VERSION, counters, held };
+  if (o.refreshes !== undefined) {
+    const r = o.refreshes as Record<string, unknown> | null;
+    if (r === null || typeof r !== 'object' || typeof r.day !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(r.day)) throw new Error('refreshes has no day');
+    out.refreshes = { day: r.day, bySymbol: record(r.bySymbol, 'refreshes.bySymbol', isCount, 'a count') };
+  }
+  if (o.holds !== undefined) {
+    const h = o.holds as Record<string, unknown> | null;
+    if (h === null || typeof h !== 'object' || Array.isArray(h)) throw new Error('holds is not an object');
+    const holds: Record<string, { until: number; reason: string }> = {};
+    for (const [k, v] of Object.entries(h)) {
+      const x = v as { until?: unknown; reason?: unknown } | null;
+      if (x === null || typeof x !== 'object' || !isTime(x.until) || typeof x.reason !== 'string') throw new Error(`holds.${k} has no until or reason`);
+      holds[k] = { until: x.until as number, reason: x.reason };
+    }
+    out.holds = holds;
+  }
+  return out;
 }
 
 /** Whether two decisions say the same thing (the time aside). */
@@ -466,7 +495,24 @@ export class StrategyLoop {
     this.#o = options;
     const loaded = options.store.load(options.clock.now());
     this.#state = loaded.state;
+    // The holds of a paid refusal that have not ended: a restart must not pay again for the same refusal.
+    const now = options.clock.now();
+    // A hold is never longer than REFRESH_HOLD_MS from now (a clock that jumped, or a hand-edited file). A clamped one
+    // is saved so: otherwise each restart would clamp it again from its own now, and it would never end.
+    let clamped = false;
+    const holds: Record<string, { until: number; reason: string }> = {};
+    for (const [k, h] of Object.entries(loaded.state.holds ?? {})) {
+      if (h.until <= now) continue;
+      const until = Math.min(h.until, now + REFRESH_HOLD_MS);
+      if (until !== h.until) clamped = true;
+      holds[k] = { ...h, until };
+      this.#refused.set(k, holds[k]);
+    }
     if (loaded.problem !== null) options.log(`strategy loop: state not usable, counters start over with the cooldown and the day's rotations taken as used: ${loaded.problem}`);
+    if (clamped) {
+      this.#state = { ...this.#state, holds };
+      this.#save();
+    }
   }
 
   get counters(): LoopCounters {
@@ -830,7 +876,14 @@ export class StrategyLoop {
       if (r.paidRefusal !== undefined && act.kind !== 'exit') {
         const until = this.#o.clock.now() + REFRESH_HOLD_MS;
         const line = `${key} held until ${new Date(until).toISOString()}: refused after the open paid for refresh_prices (${r.paidRefusal}); not tried again for ${REFRESH_HOLD_MS / HOUR_MS} h, so a refusal that repeats does not pay again${r.why === undefined ? '' : `; ${r.why}`}`;
-        for (const k of [`enter ${target}`, `rotate ${target}`]) this.#refused.set(k, { until, reason: line });
+        const now = this.#o.clock.now();
+        const holds = Object.fromEntries(Object.entries(this.#state.holds ?? {}).filter(([, h]) => h.until > now));
+        for (const k of [`enter ${target}`, `rotate ${target}`]) {
+          this.#refused.set(k, { until, reason: line });
+          holds[k] = { until, reason: line };
+        }
+        this.#state = { ...this.#state, holds };
+        this.#save();
         this.#journal('refused', line, { window: target, holdHours: REFRESH_HOLD_MS / HOUR_MS });
         return r;
       }
@@ -927,7 +980,7 @@ export class StrategyLoop {
     const opened = await hands.open({
       window: w, symbol: sym.symbol, legUsd: p.legUsd, leverage: p.leverage, qty: p.qty, reason: `strategy: ${kind} ${w.id} (${who})`, ...this.#refreshAllowance(sym.symbol),
     });
-    if (opened.refreshed === true) this.#countRefresh(sym.symbol);
+    if (opened.refreshed === true) this.#countRefresh(sym.symbol, opened.refreshes ?? 1);
     this.#owner(opened.open);
     const now = this.#o.clock.now();
     if (!opened.ok) {
@@ -1184,26 +1237,39 @@ export class StrategyLoop {
     return new Date(t).toISOString().slice(0, 10);
   }
 
-  /** What an open of `symbol` may spend on refresh_prices today: noRefresh once MAX_OPEN_REFRESHES_PER_DAY are used. */
+  /**
+   * What an open of `symbol` may spend on refresh_prices today: noRefresh once MAX_OPEN_REFRESHES_PER_DAY of the
+   * symbol, or MAX_OPEN_REFRESHES_PER_DAY_ALL over all symbols, are used.
+   */
   #refreshAllowance(symbol: string): { noRefresh?: string } {
     const day = this.#day(this.#o.clock.now());
     const r = this.#state.refreshes;
-    const used = r?.day === day ? (r.bySymbol[symbol] ?? 0) : 0;
-    if (used < MAX_OPEN_REFRESHES_PER_DAY) return {};
+    const bySymbol = r?.day === day ? r.bySymbol : {};
+    const all = Object.values(bySymbol).reduce((a, n) => a + n, 0);
+    if (all >= MAX_OPEN_REFRESHES_PER_DAY_ALL) {
+      return { noRefresh: `the strategy loop's ${MAX_OPEN_REFRESHES_PER_DAY_ALL} refresh_prices for ${day} (UTC), all symbols, are used; the next may go after 00:00 UTC` };
+    }
+    if ((bySymbol[symbol] ?? 0) < MAX_OPEN_REFRESHES_PER_DAY) return {};
     return { noRefresh: `the strategy loop's ${MAX_OPEN_REFRESHES_PER_DAY} refresh_prices of ${symbol} for ${day} (UTC) are used; the next may go after 00:00 UTC` };
   }
 
-  /** One refresh_prices an open of `symbol` paid for, counted in the saved state; journaled when the day's cap is hit. */
-  #countRefresh(symbol: string): void {
+  /** `n` refresh_prices an open of `symbol` paid for, counted in the saved state; journaled when a day's cap is hit. */
+  #countRefresh(symbol: string, n = 1): void {
     const day = this.#day(this.#o.clock.now());
     const r = this.#state.refreshes;
     const bySymbol = r?.day === day ? { ...r.bySymbol } : {};
-    const used = (bySymbol[symbol] ?? 0) + 1;
+    const before = bySymbol[symbol] ?? 0;
+    const allBefore = Object.values(bySymbol).reduce((a, x) => a + x, 0);
+    const used = before + n;
     bySymbol[symbol] = used;
     this.#state = { ...this.#state, refreshes: { day, bySymbol } };
     this.#save();
-    if (used === MAX_OPEN_REFRESHES_PER_DAY) {
+    if (before < MAX_OPEN_REFRESHES_PER_DAY && used >= MAX_OPEN_REFRESHES_PER_DAY) {
       this.#journal('refused', `refresh_prices cap: the strategy loop's opens sent ${used} refresh_prices of ${symbol} on ${day} (UTC), the most a day; no open of ${symbol} that needs one is sent before 00:00 UTC`, { symbol, refreshes: used });
+    }
+    const all = allBefore + n;
+    if (allBefore < MAX_OPEN_REFRESHES_PER_DAY_ALL && all >= MAX_OPEN_REFRESHES_PER_DAY_ALL) {
+      this.#journal('refused', `refresh_prices cap: the strategy loop's opens sent ${all} refresh_prices on ${day} (UTC) over all symbols, the most a day; no open that needs one is sent before 00:00 UTC`, { refreshes: all });
     }
   }
 

@@ -129,6 +129,12 @@ export interface PriceDeps {
    * another within MIN_REFRESH_GAP_S. Default: it did not.
    */
   landed?(err: unknown): boolean;
+  /**
+   * Whether a refresh that threw still reached the chain and spent gas (refreshReachedChain): a transaction that ran,
+   * failed or was refused there, or one sent with no outcome. Such a refresh is paid for and counted (pair-ops
+   * counting) even when it recorded no ask; only an error before the chain is not. Default: landed().
+   */
+  reachedChain?(err: unknown): boolean;
   now(): number;
   log(line: string): void;
   /** One refresh in flight per symbol: concurrent callers wait on it rather than send a second one. */
@@ -136,8 +142,9 @@ export interface PriceDeps {
   /** When each symbol's last refresh that landed ended (ms). */
   lastRefreshAt: Map<string, number>;
   /**
-   * While planning only: the price an open plans with where the contract stores none (planOpen sets the books' mid,
-   * and clears it), so every other refusal is judged before any refresh_prices is paid for. Never used once trading.
+   * While planning only: the price an open plans with where the contract stores none, or a stale one over the band
+   * from the books (planOpen sets the books' mid, and clears it), so every other refusal is judged before any
+   * refresh_prices is paid for. Never used once trading.
    */
   estimate?: Map<string, number>;
 }
@@ -191,16 +198,17 @@ export async function ensureFresh(d: PriceDeps, symbol: string, marginS: number)
 
 /**
  * The legs' price read: the stored price as it is while planning (a dry run, or --send before its refusals are
- * checked; with none stored, planOpen's estimate); once `trading()`, one about to go stale is refreshed first, so an
+ * checked; planOpen's estimate where it set one); once `trading()`, one about to go stale is refreshed first, so an
  * unwind or a close is never refused for a stale price.
  */
 export function oraclePxOf(d: PriceDeps, symbol: string, trading: () => boolean): () => Promise<number> {
   return async () => {
     if (trading()) return (await ensureFresh(d, symbol, PRICE_STALE_MARGIN_S)).px;
-    const sp = await d.read(symbol);
-    if (sp !== null) return sp.px;
+    // planOpen's estimate first: it is set only where the stored price is missing or too far off to judge on.
     const estimate = d.estimate?.get(symbol);
     if (estimate !== undefined) return estimate;
+    const sp = await d.read(symbol);
+    if (sp !== null) return sp.px;
     throw new Error(`the contract has no stored ${symbol} price`);
   };
 }
@@ -290,6 +298,18 @@ export async function withdrawKeepsLegs(
 export function refreshLanded(err: unknown): boolean {
   if (err instanceof OutcomeUnknown) return !err.detail.startsWith('failed without a refusal code');
   return err instanceof Error && !(err instanceof ContractRefusal) && /^refresh_prices ran in \S+: /.test(err.message);
+}
+
+/**
+ * Whether a refresh_prices that threw reached the chain, so its gas is spent: it landed (refreshLanded), it was sent
+ * with no final outcome, the contract refused it in a transaction, or the transaction failed there (state reverted).
+ * Not an error before the call: the RPC or HTTP failing, or the prices() read the call starts with. Wider than
+ * refreshLanded, which says only whether the contract recorded the ask (the 30 s gap); this one says it was paid.
+ */
+export function refreshReachedChain(err: unknown): boolean {
+  if (refreshLanded(err) || err instanceof OutcomeUnknown) return true;
+  if (err instanceof ContractRefusal) return err.txHash !== null;
+  return err instanceof Error && /^refresh_prices failed in transaction \S+: /.test(err.message);
 }
 
 /**

@@ -273,7 +273,7 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
     };
   }
   const cfg = contractEnv(env, mode, { signing: true });
-  if (cfg === null) throw new ConfigError('GIMBAL_RESCUE=1 needs GIMBAL_CONTRACT_ID, GIMBAL_DESK_ID and the operator key');
+  if (cfg === null) throw new ConfigError('GIMBAL_RESCUE=1 needs GIMBAL_CONTRACT_ID, DESK_ID and the operator key');
   const relayerKey = env('RELAYER_EVM_PRIVATE_KEY');
   if (relayerKey === undefined) throw new ConfigError('GIMBAL_RESCUE=1 needs RELAYER_EVM_PRIVATE_KEY (the gas wallet that submits evm_usdc_to_intents)');
   const transport = new NearApiTransport({

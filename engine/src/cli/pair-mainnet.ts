@@ -85,7 +85,7 @@ import { HL_MAINNET_URL, HyperliquidReader } from '../venues/hyperliquid.ts';
 import { PHOENIX_API_URL, PhoenixReader, SOLANA_MAINNET_RPC_URL } from '../venues/phoenix.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { Args, PriceDeps } from './pair-mainnet-lib.ts';
-import { UsageError, newPriceState, num, orderOptions, parseArgs, refreshLanded, withdrawKeepsLegs } from './pair-mainnet-lib.ts';
+import { UsageError, newPriceState, num, orderOptions, parseArgs, refreshLanded, refreshReachedChain, withdrawKeepsLegs } from './pair-mainnet-lib.ts';
 import type { OpsCtx } from './pair-ops.ts';
 import {
   ORDERS_PER_PART, buildPair, hlInfo, phoenixExchange, planClose, planOpen, policyMarketMismatches, refreshForOpen, refs, sendClose, sendOpen, storedPrice, traderState,
@@ -233,7 +233,7 @@ async function run(args: Args, cfg: NonNullable<ReturnType<typeof contractEnv>>,
     prices: {
       maxAgeS: desk.policy.oracle_max_age_s, send: args.send, read: (symbol) => storedPrice(client, symbol),
       refresh: (symbol, maxAgeS) => client.refreshPrices([symbol], { maxAgeS }), now: () => Date.now(), log: say, ...newPriceState(),
-      landed: refreshLanded,
+      landed: refreshLanded, reachedChain: refreshReachedChain,
     },
     send: args.send, trading: false, say,
     open: (line, alert = true) => {
@@ -402,10 +402,10 @@ async function open(ctx: Ctx): Promise<void> {
   }
   if (refusals.length > 0) throw new Error(`open --send refused, nothing signed: ${refusals.join('; ')}`);
   // The stored price the plan found missing or too old: refreshed once, only now that nothing refused.
-  const fresh = await refreshForOpen(ctx, plan);
+  const fresh = await refreshForOpen(ctx, pair, plan);
   if (fresh.line !== null) say(fresh.line);
   if (fresh.refused !== null) throw new Error(`open --send refused, nothing signed: ${fresh.refused}`);
-  await sendOpen(ctx, pair, plan);
+  await sendOpen(ctx, pair, fresh.plan);
 }
 
 async function close(ctx: Ctx): Promise<void> {
