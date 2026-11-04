@@ -258,6 +258,24 @@ test('with a policy and fresh oracle prices: enterable windows first by expected
   assert.match(scanLine(12, r), /, best sol-phoenix-hyperliquid -?\d+\.\d\d % net, /);
 });
 
+test('oracleRefreshAtOpen is read every scan: while serve trades, no stored SOL price is a note; otherwise E_ORACLE_STALE', async () => {
+  const fake = venues();
+  const clock = new VirtualClock(T0);
+  let trading = false;
+  const { scanner: s } = scanner({ venues: [fake.hl, fake.phoenix, fake.orderly], watch: fake.watchers }, clock, { policy: POLICY }, { oracleRefreshAtOpen: () => trading });
+  const off = byId((await s.scan()).windows, 'sol-phoenix-hyperliquid')!;
+  assert.deepEqual(off.refused, { code: 'E_ORACLE_STALE', reason: 'no oracle price for SOL on phoenix' });
+  assert.equal(off.note, undefined);
+  trading = true;
+  clock.set(T0 + 5_000);
+  const r = await s.scan();
+  const on = byId(r.windows, 'sol-phoenix-hyperliquid')!;
+  assert.equal(on.refused, undefined);
+  assert.equal(on.note, 'stored SOL price missing: refreshed at open');
+  // The Orderly leg is not one serve's open refreshes: still refused.
+  assert.equal(byId(r.windows, 'sol-orderly-hyperliquid')!.refused?.code, 'E_ORACLE_STALE');
+});
+
 test('a venue that does not answer: listed as failed, its last good numbers marked stale, gone after 10 minutes', async () => {
   const { hl, phoenix, orderly } = venues();
   const clock = new VirtualClock(T0);

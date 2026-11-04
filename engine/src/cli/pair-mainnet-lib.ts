@@ -37,6 +37,12 @@ export const PRICE_MARGIN_S = 120;
 export const PRICE_STALE_MARGIN_S = 30;
 /** The contract skips a refresh_prices this soon after the last one (and the client's poll would then throw). */
 export const MIN_REFRESH_GAP_S = 30;
+/**
+ * An open's own refresh_prices (refreshForOpen) must leave the price this long past the first part's margin, for what
+ * runs between it and the first part's check (serve: the size held to the cap, the gate, both legs read): that check
+ * then finds it fresh and sends no second refresh, which the contract would skip within MIN_REFRESH_GAP_S anyway.
+ */
+export const OPEN_HEADROOM_S = 15;
 
 export interface Args {
   command: string;
@@ -129,6 +135,11 @@ export interface PriceDeps {
   refreshing: Map<string, Promise<void>>;
   /** When each symbol's last refresh that landed ended (ms). */
   lastRefreshAt: Map<string, number>;
+  /**
+   * While planning only: the price an open plans with where the contract stores none (planOpen sets the books' mid,
+   * and clears it), so every other refusal is judged before any refresh_prices is paid for. Never used once trading.
+   */
+  estimate?: Map<string, number>;
 }
 
 export function newPriceState(): Pick<PriceDeps, 'refreshing' | 'lastRefreshAt'> {
@@ -180,15 +191,17 @@ export async function ensureFresh(d: PriceDeps, symbol: string, marginS: number)
 
 /**
  * The legs' price read: the stored price as it is while planning (a dry run, or --send before its refusals are
- * checked); once `trading()`, one about to go stale is refreshed first, so an unwind or a close is never refused for
- * a stale price.
+ * checked; with none stored, planOpen's estimate); once `trading()`, one about to go stale is refreshed first, so an
+ * unwind or a close is never refused for a stale price.
  */
 export function oraclePxOf(d: PriceDeps, symbol: string, trading: () => boolean): () => Promise<number> {
   return async () => {
     if (trading()) return (await ensureFresh(d, symbol, PRICE_STALE_MARGIN_S)).px;
     const sp = await d.read(symbol);
-    if (sp === null) throw new Error(`the contract has no stored ${symbol} price`);
-    return sp.px;
+    if (sp !== null) return sp.px;
+    const estimate = d.estimate?.get(symbol);
+    if (estimate !== undefined) return estimate;
+    throw new Error(`the contract has no stored ${symbol} price`);
   };
 }
 
