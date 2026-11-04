@@ -1,6 +1,6 @@
 // The backtest core on a synthetic series with a known answer: one market, SYN, on Hyperliquid and Phoenix. Phoenix
-// pays 0; Hyperliquid pays shorts S per hour (20 % APR) for the first 14.5 days plus 120 hours, then the same against
-// them. Long Phoenix / short Hyperliquid then nets about 10 % over the hold after its 0.0324 USD round trip, so:
+// pays 0; Hyperliquid pays shorts S per hour (30 % APR) for the first 14.5 days plus 120 hours, then the same against
+// them. Long Phoenix / short Hyperliquid then nets about 13 % over the 7-day hold after its 0.0384 USD round trip, so:
 // - check 1 fails (the week before is still loading), check 2 is the window's first passing check, and it is entered
 //   at check 1 + N for N = enterAfterChecks;
 // - the flip shows at the check after the first negative hour (this hour pays < 0), so the pair leaves M checks later
@@ -15,7 +15,7 @@ import type { MarketFundingPoint } from '../venues/venue.ts';
 import type { BacktestData } from './checks-data.ts';
 import { HOUR_MS, firstCheckHour, lastCheckHour, simulate } from './checks-sim.ts';
 
-const S = 0.2 / 8760;
+const S = 0.3 / 8760;
 const T0 = Date.UTC(2026, 0, 1);
 const START = T0 + (14 * 24 + 12) * HOUR_MS;
 const FLIP = START + 120 * HOUR_MS;           // the first hour Hyperliquid pays against shorts
@@ -57,8 +57,8 @@ const POLICY: ContractPolicy = {
   unpriced: [], unpriced_max_notional_usd: 0, max_transfer_cost_bps: 300, max_transfer_cost_flat_e6: 1_000_000,
 };
 const STRATEGY = { ...DEFAULT_STRATEGY, auto: true, minNetAprPct: 5, legUsd: 12, maxLeverage: 3, stopDrawdownPct: 10, rotate: { minGainPts: 3, forHours: 4 } };
-/** The round trip at 12 USD: 4 taker fills (5.5 + 3.5 bps), 1 bp of slippage a fill, the 5 bps basis buffer. */
-const ROUND_TRIP = 12 * 2 * (5.5 + 3.5) / 1e4 + 4 * 12 * (0.01 / 100) + 12 * 5 / 1e4;
+/** The round trip at 12 USD: 4 taker fills (5.5 + 3.5 bps), 1 bp of slippage a fill, the 10 bps basis buffer. */
+const ROUND_TRIP = 12 * 2 * (5.5 + 3.5) / 1e4 + 4 * 12 * (0.01 / 100) + 12 * 10 / 1e4;
 
 test('the check hours span the synthetic history', () => {
   assert.equal(firstCheckHour(DATA, ['hyperliquid', 'phoenix']), START);

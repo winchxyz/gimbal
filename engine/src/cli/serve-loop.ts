@@ -26,7 +26,7 @@ import type { PairResult } from '../trade/pair.ts';
 import { qtyString, signedQtyString, toQty } from '../trade/lots.ts';
 import { LoopStore, StrategyLoop, loopStateFile } from '../strategy/loop.ts';
 import type { VetoLegFacts, VetoSource } from '../strategy/veto.ts';
-import type { HandsResult, PairHands, ServePair } from './serve-pair.ts';
+import type { HandsResult, PairAdl, PairHands, ServePair } from './serve-pair.ts';
 
 /** The venues decide() reads free margin and live rescue for. */
 export const LOOP_VENUES = ['hyperliquid', 'phoenix', 'orderly'] as const;
@@ -166,6 +166,55 @@ export function openedQty(results: readonly PairResult[]): string {
   return qtyString(results.reduce((acc, r) => (r.status === 'open' && r.legs.some((l) => l.orders.length > 0) ? acc + toQty(r.size) : acc), 0n));
 }
 
+/** What the ADL watch of the pair held now says about the loop's orders (serve-pair.ts PairAdl, AdlWatch). */
+export interface AdlGate {
+  /** An unwind attempt runs: its close signs or is in flight. */
+  unwinding: boolean;
+  /** A check saw a leg off its baseline and is confirming it: an event may be made under an open. */
+  confirming: boolean;
+  /** An ADL event is open (made, not yet ended): attempts may still go out on it. */
+  event: boolean;
+  /** Why the pair is paused since an ADL (no new pair opens until the owner reconciles), or null. */
+  paused: string | null;
+}
+
+export function adlGate(adl: PairAdl | undefined): AdlGate | null {
+  if (adl === undefined) return null;
+  return { unwinding: adl.unwinding, confirming: adl.confirming, event: adl.state.event !== null, paused: adl.state.paused };
+}
+
+/** What protectionText and openGateText read. */
+export interface Protections {
+  rescue: string | null;
+  adl: AdlGate | null;
+  panicClose: boolean;
+}
+
+/**
+ * Why the strategy loop decides and sends nothing now because a protection runs, or null: a rescue (its fund_venue
+ * step included); the ADL watch unwinding, holding an open event, or confirming a leg off its baseline; panic_close.
+ * The ADL watch's read-only check, started beside every 5 s desk read, is not one while it sees nothing off.
+ */
+export function protectionText(p: Protections): string | null {
+  if (p.rescue !== null) return `rescue ${p.rescue} runs`;
+  if (p.adl?.unwinding === true) return 'an ADL unwind is in flight';
+  if (p.adl?.event === true) return 'an ADL event is in progress';
+  if (p.adl?.confirming === true) return 'an ADL check is confirming a leg off its baseline';
+  if (p.panicClose) return 'panic_close runs';
+  return null;
+}
+
+/**
+ * The gate every open of the loop carries, asked again right before its first order and before each later part:
+ * protectionText, and a pair paused since an ADL (paused while the open ran, after its own start checks).
+ */
+export function openGateText(p: Protections): string | null {
+  const protection = protectionText(p);
+  if (protection !== null) return protection;
+  const paused = p.adl?.paused ?? null;
+  return paused === null ? null : `the pair is paused since an ADL (${paused}): no new pair opens until the owner reconciles`;
+}
+
 /** The pair symbols the policy allows: in both hl_assets and phoenix_markets. */
 export function policySymbols(policy: ContractPolicy | null): string[] {
   if (policy === null) return [];
@@ -186,6 +235,7 @@ export function loopHands(
     return {
       ok: r.ok, reason: r.reason, sent: r.sent ?? (r.results.length > 0 || r.tx.length > 0), tx: r.tx, feeUsd: r.feeUsd, open: r.open, fills: fillsOf(r.results),
       ...(r.refreshed === true ? { refreshed: true, ...(r.refreshes === undefined ? {} : { refreshes: r.refreshes }) } : {}),
+      ...(r.costRefused === undefined ? {} : { costRefused: r.costRefused }),
     };
   };
   return {

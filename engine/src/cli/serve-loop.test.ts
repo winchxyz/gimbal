@@ -19,7 +19,7 @@ import { sizeFor } from '../strategy/decide.ts';
 import { STRATEGY, T0, win as deskWin } from '../strategy/test-helpers.ts';
 import { VirtualClock, readRecording } from '../venues/replay.ts';
 import { replayStart } from './serve-replay.ts';
-import { depthAtSize, fillsOf, loopHands, openedQty, riskFacts, serveLoop, windowFacts, windowSymbol } from './serve-loop.ts';
+import { adlGate, depthAtSize, fillsOf, loopHands, openGateText, openedQty, protectionText, riskFacts, serveLoop, windowFacts, windowSymbol } from './serve-loop.ts';
 import type { PairHands, ServePair } from './serve-pair.ts';
 import { toQty } from '../trade/lots.ts';
 import type { PairResult } from '../trade/pair.ts';
@@ -363,6 +363,13 @@ test('loopHands: the held symbol\'s legs only, one leg named, busy() refusing fi
   assert.equal(gateSeen?.(), 'rescue r-1 runs', 'the open carries the gate, asked again before its orders');
   assert.equal(await h.reconcile!(), 'SOL record reconciled with the venues');
   assert.equal((await h.close({ reason: 'test' })).sent, false);
+  // An open the trader refused for cost carries why, for the loop to hold the window out of the entry rules.
+  const why = 'the expected spread over 7 days, $0.0390, does not cover the round trip $0.0421';
+  const cost = loopHands({ ...pair, open: async () => ({ ok: false, reason: `open refused, nothing signed: ${why}`, results: [], lines: [], open: [], tx: [], feeUsd: 0, costRefused: why }) },
+    () => desk, () => {}, () => null);
+  const refused = await cost.open({ window: deskWin('sol-phoenix-hyperliquid'), symbol: 'SOL', legUsd: 12, leverage: 1, qty: '0.12', reason: 'test' });
+  assert.deepEqual([refused.ok, refused.sent, refused.costRefused], [false, false, why]);
+  assert.equal(opened.costRefused, undefined);
 });
 
 test('depth at size: a long walks the asks, a short the bids; the fill\'s distance from the mid in bps, unknown when the levels read do not fill it', () => {
@@ -412,4 +419,29 @@ test('risk facts: each leg\'s book at size, the 24 h move from the carry, the li
   assert.ok(logs.some((l) => /hyperliquid SOL book not read \(socket closed\), its depth is unknown/.test(l)));
   // A window the scan does not carry: nothing added.
   assert.deepEqual(await facts({ id: 'eth-orderly-hyperliquid' } as FundingWindow, 500), {});
+});
+
+test('protectionText and openGateText: a rescue, an ADL unwind, event or confirming check, panic_close; the open also stops on a pause', () => {
+  const quiet = { unwinding: false, confirming: false, event: false, paused: null };
+  const none = { rescue: null, adl: quiet, panicClose: false };
+  // serve runs the ADL check beside every 5 s read: while it sees nothing off it holds nothing back.
+  assert.equal(protectionText(none), null);
+  assert.equal(protectionText({ ...none, adl: null }), null, 'no pair, no ADL watch');
+  assert.equal(protectionText({ ...none, adl: { ...quiet, unwinding: true } }), 'an ADL unwind is in flight');
+  // An event whose attempt failed (no unwind in flight) or a check confirming a leg off its baseline: the loop waits.
+  assert.equal(protectionText({ ...none, adl: { ...quiet, event: true } }), 'an ADL event is in progress');
+  assert.equal(protectionText({ ...none, adl: { ...quiet, confirming: true } }), 'an ADL check is confirming a leg off its baseline');
+  assert.equal(protectionText({ ...none, rescue: 'r-1' }), 'rescue r-1 runs');
+  assert.equal(protectionText({ ...none, panicClose: true }), 'panic_close runs');
+  assert.equal(protectionText({ rescue: 'r-1', adl: { ...quiet, unwinding: true }, panicClose: true }), 'rescue r-1 runs', 'the rescue is named first');
+  // A pause after an ADL does not stop the loop's decisions (a held pair may still be closed), but stops every open.
+  const paused = { ...none, adl: { ...quiet, paused: 'ADL on hyperliquid XLM -50 -> -30' } };
+  assert.equal(protectionText(paused), null);
+  assert.equal(openGateText(paused), 'the pair is paused since an ADL (ADL on hyperliquid XLM -50 -> -30): no new pair opens until the owner reconciles');
+  assert.equal(openGateText({ ...none, adl: { ...quiet, event: true } }), 'an ADL event is in progress');
+  assert.equal(openGateText(none), null);
+  // adlGate reads serve-pair's PairAdl.
+  const state = { attemptsLeft: 3, paused: null, event: null };
+  assert.deepEqual(adlGate({ check: async () => null, stop: () => {}, state, unwinding: false, confirming: true }), { ...quiet, confirming: true });
+  assert.equal(adlGate(undefined), null);
 });

@@ -241,16 +241,16 @@ test('with a policy and fresh oracle prices: enterable windows first by expected
   assert.equal(wif.id, 'wif-phoenix-hyperliquid');
   assert.ok(wif.netAprPct > enterable[0]!.netAprPct);
   assert.deepEqual(wif.refused, { code: 'E_ASSET', reason: 'WIF not in policy on phoenix' });
-  // Long Phoenix, short Orderly passes every contract check, but its 8.76 % over 10 days at 1000 USD is 2.40 USD,
-  // exactly its round trip: the gate holds it back. It ranks by that carry (0 USD net), ahead of BTC's (8.76 % too,
-  // against Hyperliquid's dearer fills: 2.70 USD).
+  // Long Phoenix, short Orderly passes every contract check, but its 8.76 % over 7 days at 1000 USD is 1.68 USD,
+  // under its 2.90 USD round trip: the gate holds it back. It ranks by that carry (-1.22 USD net), ahead of BTC's
+  // (8.76 % too, against Hyperliquid's dearer fills: 3.20 USD).
   const po = r.windows[3]!;
   assert.equal(po.id, 'sol-phoenix-orderly');
   assert.equal(po.refused, undefined);
   assert.deepEqual(po.checks.filter((c) => !c.ok).map((c) => c.text), [
-    'Over a 10-day hold (assumed: the engine rules set none), the 7-day spread of 8.76 % APR (the smaller of the 7- and 14-day means) '
-    + 'pays $2.40 at $1,000 a leg, no more than the $2.40 round trip (4 fills $1.50, slippage $0.40, basis buffer $0.50; 24.0 bps): '
-    + 'it takes 10.0 days to pay it back',
+    'Over a 7-day hold (assumed: the engine rules set none), the 7-day spread of 8.76 % APR (the smaller of the 7- and 14-day means) '
+    + 'pays $1.68 at $1,000 a leg, no more than the $2.90 round trip (4 fills $1.50, slippage $0.40, basis buffer $1.00; 29.0 bps): '
+    + 'it takes 12.1 days to pay it back',
   ]);
   // BTC is listed but has no oracle price.
   assert.deepEqual(r.windows[4]!.refused, { code: 'E_ORACLE_STALE', reason: 'no oracle price for BTC on phoenix' });
@@ -606,6 +606,13 @@ const DOGE_POLICY: ContractPolicy = {
 };
 const DOGE_ORACLE: OracleSource = { price: (_venue, symbol) => (symbol === 'DOGE' ? { px: 0.0742, at: T0 - 5_000 } : null) };
 
+/**
+ * The DOGE scenarios' costs: a 10-day hold and a 5 bps exit buffer, over which their 11.8 % spread pays a few cents
+ * more than the round trip at 20 USD a leg. They test the listing direction, the history reads and the share of open
+ * interest, not the hold: on the default 7-day hold and 10 bps the same window does not pay (asserted below).
+ */
+const TEN_DAYS: Partial<ScannerConfig> = { costs: { ...DEFAULT_SCANNER_CONFIG.costs, holdHours: 240, basisBufferBps: 5 } };
+
 /** Fresh DOGE oracle prices whenever asked: 5 s old on `clock`. */
 const dogeOracle = (clock: { now(): number }): OracleSource => ({ price: (_venue, symbol) => (symbol === 'DOGE' ? { px: 0.0742, at: clock.now() - 5_000 } : null) });
 
@@ -615,7 +622,7 @@ test('a desk pair whose hour is reversed: listed in the direction the week paid,
   const phoenix = new HistoryVenue('phoenix', [DOGE_PH], () => 0.0000125);
   const clock = new VirtualClock(T0);
   let strategy = LEG_20_ANY;
-  const { scanner: s } = scanner({ venues: [hl, phoenix] }, clock, { policy: DOGE_POLICY }, { strategy: () => strategy, oracle: DOGE_ORACLE });
+  const { scanner: s } = scanner({ venues: [hl, phoenix] }, clock, { policy: DOGE_POLICY, ...TEN_DAYS }, { strategy: () => strategy, oracle: DOGE_ORACLE });
   const r1 = await s.scan();
   // A 20 USD leg is 0.048 % of Phoenix's 41k USD: well inside the 2 % share. Before its history is in, this hour
   // decides the direction, as for any desk pair; the gate is not passed yet.
@@ -682,7 +689,7 @@ test('an older read the venue refuses: loading for an hour, then the 7 days alon
     const hl = new HistoryVenue('hyperliquid', [DOGE_HL], () => 0.000026);
     const phoenix = new HistoryVenue('phoenix', [DOGE_PH], () => 0.0000125);
     const clock = new VirtualClock(T0);
-    const { scanner: s, notes } = scanner({ venues: [hl, phoenix] }, clock, { policy: DOGE_POLICY }, { strategy: () => LEG_20_ANY, oracle: dogeOracle(clock) });
+    const { scanner: s, notes } = scanner({ venues: [hl, phoenix] }, clock, { policy: DOGE_POLICY, ...TEN_DAYS }, { strategy: () => LEG_20_ANY, oracle: dogeOracle(clock) });
     await s.scan();
     await s.idle();
     const at = async (t: number) => {
@@ -878,10 +885,22 @@ test('a desk pair whose 7 and 14 days disagree in sign is listed in neither dire
 
 test('a desk leg over 2 % of its open interest: listed only on a multi-day spread that pays, with a failing check naming the share', async () => {
   // At the default 1000 USD leg, Phoenix's 41k USD of DOGE is 2.4 % a leg.
-  const hl = new HistoryVenue('hyperliquid', [DOGE_HL], () => 0.000026);
-  const phoenix = new HistoryVenue('phoenix', [DOGE_PH], () => 0.0000125);
-  const clock = new VirtualClock(T0);
-  const { scanner: s } = scanner({ venues: [hl, phoenix] }, clock);
+  const setup = (config: Partial<ScannerConfig>) => {
+    const hl = new HistoryVenue('hyperliquid', [DOGE_HL], () => 0.000026);
+    const phoenix = new HistoryVenue('phoenix', [DOGE_PH], () => 0.0000125);
+    const clock = new VirtualClock(T0);
+    return { hl, clock, s: scanner({ venues: [hl, phoenix] }, clock, config).scanner };
+  };
+  // On the default 7-day hold its 11.8 % (2.27 USD at 1000 USD) does not pay the fees and the 10 bps exit buffer
+  // known before any book (1.80 + 1.00 USD): not listed, and its thin book is never read.
+  const short = setup({});
+  await short.s.scan();
+  await short.s.idle();
+  short.clock.set(T0 + 5_000);
+  assert.deepEqual((await short.s.scan()).windows.map((w) => w.id), []);
+  assert.deepEqual(short.hl.bookCalls, []);
+  // Over 10 days with a 5 bps buffer it does (3.24 USD against 2.30): listed, never entered.
+  const { hl, clock, s } = setup(TEN_DAYS);
   const r1 = await s.scan();
   // Before its history is in: listed in neither direction and no book read, but its legs' history is asked for.
   assert.deepEqual(r1.windows.map((w) => w.id), []);

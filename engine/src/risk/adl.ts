@@ -177,6 +177,10 @@ export class AdlWatch {
   /** The unhedged alert this watch set on the trader (cleared when the event ends). */
   #alert: string | null = null;
   #stopped = false;
+  /** An unwind attempt runs: from taking it off the budget until its close returned and the legs were read. */
+  #unwinding = false;
+  /** A check saw a leg off its baseline and is confirming it (the second read, CONFIRM_MS later), until it returns. */
+  #confirming = false;
 
   constructor(trader: AdlTrader, options: AdlWatchOptions = {}) {
     this.#trader = trader;
@@ -200,8 +204,32 @@ export class AdlWatch {
     return this.state.paused;
   }
 
+  /**
+   * Whether an unwind attempt runs now: its close signs or is in flight, or its result is being read. False during
+   * the read-only checks (two reads CONFIRM_MS apart) that run beside every desk read, and between attempts.
+   */
+  get unwinding(): boolean {
+    return this.#unwinding;
+  }
+
+  /**
+   * Whether a check saw a leg off its baseline and is confirming it: from the first read that saw it until the check
+   * returns (the event made, or not confirmed). An open must not start its orders then: the event may be made under it.
+   */
+  get confirming(): boolean {
+    return this.#confirming;
+  }
+
   /** One look at both legs; a report for every end (journal it), null when there is nothing new. */
   async check(): Promise<AdlReport | null> {
+    try {
+      return await this.#check();
+    } finally {
+      this.#confirming = false;
+    }
+  }
+
+  async #check(): Promise<AdlReport | null> {
     if (this.#stopped) return null;
     if (this.state.event !== null) return this.#follow();
     const first = await this.#read();
@@ -212,6 +240,7 @@ export class AdlWatch {
       return null;
     }
     if (first.key === this.#reported) return null;
+    this.#confirming = true;
     await this.#sleep(this.#confirmMs);
     if (this.#stopped) return null;
     const second = await this.#read();
@@ -280,6 +309,15 @@ export class AdlWatch {
 
   /** One unwind attempt, taken off the budget and saved before any order goes out. */
   async #attempt(findings: AdlFinding[], head: string): Promise<AdlReport | null> {
+    this.#unwinding = true;
+    try {
+      return await this.#attemptRun(findings, head);
+    } finally {
+      this.#unwinding = false;
+    }
+  }
+
+  async #attemptRun(findings: AdlFinding[], head: string): Promise<AdlReport | null> {
     const ev = this.state.event!;
     this.state.attemptsLeft--;
     ev.attempts++;

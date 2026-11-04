@@ -1,4 +1,4 @@
-// One window priced by hand: every cost term at a 1000 USD leg held 240 h (the default 10-day hold), the verdicts,
+// One window priced by hand: every cost term at a 1000 USD leg held 240 h (HOLD below; the default is 7 days), the verdicts,
 // and the switch cost. APR is percentage points a year on one leg's notional; a one-off cost of C USD is
 // C / 1000 × (8760 / 240) × 100 = C × 3.65.
 
@@ -51,11 +51,14 @@ function pairOf(long: ScanLeg, short: ScanLeg): Pair {
   return pairLegs([long, short]).find((p) => p.long === long)!;
 }
 
+/** The hold these numbers are worked out on: 10 days, so a one-off C USD is C × 3.65 APR points. */
+const HOLD = { ...DEFAULT_COSTS, holdHours: 240 };
+
 function ctx(over: Partial<PricingContext> = {}, books: Record<string, BookRead | null> = {}): PricingContext {
   return {
     now: T0,
     strategy: DEFAULT_STRATEGY,
-    costs: DEFAULT_COSTS,
+    costs: HOLD,
     policy: null,
     oracle: null,
     book: (l) => (l.venue in books ? books[l.venue]! : BOOKS[l.venue] === undefined ? null : { book: BOOKS[l.venue]!, readAt: T0, stale: false }),

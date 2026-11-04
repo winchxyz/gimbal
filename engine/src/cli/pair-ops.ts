@@ -20,7 +20,9 @@ import type { DeskSolanaAccounts } from '../relayer/phoenix-withdraw.ts';
 import type { Relayer } from '../relayer/relayer.ts';
 import type { SolanaSubmitter } from '../relayer/solana.ts';
 import type { CarryLegInput, CarryPlan } from '../trade/carry-plan.ts';
-import { carryPlan, halfSpreadBps, meanRatePerHour, pct, usd } from '../trade/carry-plan.ts';
+import { carryPlan, meanRatePerHour, pct, usd } from '../trade/carry-plan.ts';
+import { DEFAULT_SCANNER_CONFIG, hlFillFeeBps } from '../scanner/config.ts';
+import { bookMid } from '../scanner/costs.ts';
 import type { LegOutcome, LegSide, MakerSettings } from '../trade/legs.ts';
 import { HlLeg } from '../trade/legs.ts';
 import { commonLot, floorToLot, qtyNumber, qtyString, signedQtyString, toQty } from '../trade/lots.ts';
@@ -36,7 +38,6 @@ import { OPEN_HEADROOM_S, PRICE_MARGIN_S, UsageError, ensureFresh, hlCross, orac
 
 /** Phoenix orders one pair part may take: the open, its retry, and two unwind orders. */
 export const ORDERS_PER_PART = 4;
-export const HL_TAKER_BPS = 5.5;
 
 /** What the open and close read, sign with and print to. */
 export interface OpsCtx {
@@ -338,7 +339,8 @@ export async function planOpen(ctx: OpsCtx, pair: Pair, request: OpenRequest): P
   const evm = ctx.desk.evm_address.toLowerCase();
 
   const [hlF, pxF, hlBook, pxBook, hlState, state, spRead, lamports, assetData, hlOpen] = await Promise.all([
-    hlFunding(ctx, symbol, since), phoenixFunding(ctx, symbol, since), ctx.hl.book(symbol, 5), ctx.phoenix.book(symbol, 5),
+    // The books at the scanner's depth: the round trip walks each fill through them as the scanner's gate does.
+    hlFunding(ctx, symbol, since), phoenixFunding(ctx, symbol, since), ctx.hl.book(symbol, DEFAULT_SCANNER_CONFIG.bookDepth), ctx.phoenix.book(symbol, DEFAULT_SCANNER_CONFIG.bookDepth),
     hlInfo<unknown>(ctx, { type: 'clearinghouseState', user: evm }), traderState(ctx), storedPrice(ctx.client, symbol), ctx.chain.balance(ctx.sol.authority),
     hlInfo<{ leverage?: { type?: string; value?: number } }>(ctx, { type: 'activeAssetData', user: evm, coin: symbol }).catch(() => null),
     hlInfo<unknown>(ctx, { type: 'openOrders', user: evm }).catch((err: unknown) => errorMessage(err)),
@@ -377,17 +379,22 @@ export async function planOpen(ctx: OpsCtx, pair: Pair, request: OpenRequest): P
     }
   }
   if (size === 0n) refusals.push(`${usd(legUsd)} at ${mid.toFixed(4)} is under one common lot ${qtyString(pair.lot)}`);
-  const builderBps = (ctx.config.fees?.hl_builder_tenth_bps ?? 0) / 10;
+  // Hyperliquid's taker fee plus the builder fee every order carries (the contract's FeeConfig), counted once. Fails
+  // closed: a config read without the fee (or with one the contract would not accept) prices nothing, it refuses.
+  const hlFeeBps = hlFillFeeBps(ctx.config.fees?.hl_builder_tenth_bps);
+  if (hlFeeBps === null) {
+    refusals.push(`the contract's config() gave no usable fees.hl_builder_tenth_bps (${String(ctx.config.fees?.hl_builder_tenth_bps)}): the Hyperliquid fee, and so the round trip, is unknown`);
+  }
   // Cross margin on both venues, open notional at the mark: what liquidation and the effective leverage run on.
   const hlC = hlCross(hlState);
   const pxC = pxAccount === null ? { equityUsd: 0, maintenanceUsd: 0, notionalUsd: 0 } : phoenixCross(pxAccount);
   const pxLotsAfter = (toQty(String(Math.abs(pxAccount?.positions.find((p) => p.symbol === symbol)?.size ?? 0))) + size) / pair.phoenix.lot;
   const short: CarryLegInput = {
-    venue: 'hyperliquid', ratePerHour: hlF.now, rate7dPerHour: hlF.mean7d ?? hlF.now, takerBps: HL_TAKER_BPS + builderBps, halfSpreadBps: halfSpreadBps(hlBid, hlAsk),
+    venue: 'hyperliquid', ratePerHour: hlF.now, rate7dPerHour: hlF.mean7d ?? hlF.now, feeBps: hlFeeBps ?? Number.NaN, book: hlBook,
     equityUsd: hlC.equityUsd, maintenanceUsd: hlC.maintenanceUsd, notionalUsd: hlC.notionalUsd, maintenanceRate: 1 / (2 * hlF.maxLeverage),
   };
   const long: CarryLegInput = {
-    venue: 'phoenix', ratePerHour: pxF.now ?? 0, rate7dPerHour: pxF.mean7d ?? pxF.now ?? 0, takerBps: pair.marketConfig.takerFee * 10_000, halfSpreadBps: halfSpreadBps(pxBid, pxAsk),
+    venue: 'phoenix', ratePerHour: pxF.now ?? 0, rate7dPerHour: pxF.mean7d ?? pxF.now ?? 0, feeBps: pair.marketConfig.takerFee * 10_000, book: pxBook,
     equityUsd: pxC.equityUsd, maintenanceUsd: pxC.maintenanceUsd, notionalUsd: pxC.notionalUsd,
     maintenanceRate: phoenixMaintenanceRate(pair.marketConfig, pxLotsAfter),
   };
@@ -443,7 +450,7 @@ export async function planOpen(ctx: OpsCtx, pair: Pair, request: OpenRequest): P
   if (lamports < solNeed) refusals.push(`the desk authority holds ${solText(lamports)}; ${Math.max(1, parts)} pair part(s) need up to ${solText(solNeed)} for Phoenix fees and the rent-exempt reserve: send ${solText(solNeed - lamports)} to ${ctx.sol.authority}`);
   refusals.push(...sim.refusals);
 
-  printCarry(ctx, symbol, legUsd, leverage, holdDays, plan, short, long, { hlBid, hlAsk, pxBid, pxAsk });
+  printCarry(ctx, symbol, legUsd, leverage, holdDays, basisBps, plan, short, long, { hlBid, hlAsk, pxBid, pxAsk });
   ctx.say(`size      ${qtyString(size)} ${symbol} per leg (${usd(qtyNumber(size) * mid)} at ${mid.toFixed(4)}); common lot ${qtyString(pair.lot)}`);
   ctx.say(`          ${parts} pair part(s) of at most ${chunk === null ? '?' : qtyString(chunk)} (policy max_notional_usd ${policy.max_notional_usd} less the ${pair.bandBps} bps band)`);
   ctx.say(`leverage  Hyperliquid ${symbol}: ${assetData?.leverage === undefined ? 'unknown' : `${assetData.leverage.type} ${assetData.leverage.value}x`} on the account (the contract cannot set it); effective leverage is what is checked`);
@@ -687,7 +694,7 @@ async function approveBuilderFee(ctx: OpsCtx): Promise<void> {
 }
 
 function printCarry(
-  ctx: OpsCtx, symbol: string, legUsd: number, leverage: number, holdDays: number, plan: CarryPlan, short: CarryLegInput, long: CarryLegInput,
+  ctx: OpsCtx, symbol: string, legUsd: number, leverage: number, holdDays: number, basisBps: number, plan: CarryPlan, short: CarryLegInput, long: CarryLegInput,
   book: { hlBid: number; hlAsk: number; pxBid: number; pxAsk: number },
 ): void {
   const say = (line: string) => ctx.say(line);
@@ -697,8 +704,14 @@ function printCarry(
   say(`          phoenix (long)      funding now ${rate(long.ratePerHour)}, 7-day mean ${rate(long.rate7dPerHour)}; book ${book.pxBid} / ${book.pxAsk}`);
   say(`          gross APR now ${pct(plan.grossAprNow)}, 7-day ${pct(plan.grossApr7d)} (short receives, long pays)`);
   say(`spread    expected over ${holdDays} d at the 7-day mean: ${usd(plan.expectedSpreadUsd)}`);
-  say(`          round trip ${plan.roundTripBps.toFixed(2)} bps = ${usd(plan.roundTripUsd)}: taker ${short.takerBps} + ${long.takerBps} bps each way, half spreads ${short.halfSpreadBps.toFixed(2)} + ${long.halfSpreadBps.toFixed(2)} bps each way, basis buffer`);
-  say(`          ${plan.expectedSpreadUsd > plan.roundTripUsd ? 'covers the round trip' : 'does NOT cover the round trip'}`);
+  const rt = plan.roundTrip;
+  const mids = [bookMid(short.book.bids, short.book.asks), bookMid(long.book.bids, long.book.asks)];
+  say(rt === null
+    ? '          round trip not priced: a book has no two-sided touch'
+    : `          round trip ${rt.bps.toFixed(2)} bps = ${usd(rt.totalUsd)}: 4 fills ${usd(rt.feesUsd)} (${short.feeBps} + ${long.feeBps} bps each way), `
+      + `slippage ${usd(rt.slippageUsd)} (the books walked at ${usd(legUsd)}), basis buffer ${usd(rt.basisBufferUsd)} (adverse gap of the mids `
+      + `${mids.map((m) => (m === null ? '?' : m.toString())).join(' / ')} + ${basisBps} bps)`);
+  say(`          ${plan.costRefusal === null ? 'covers the round trip' : 'does NOT cover the round trip'}`);
   for (const [i, l] of plan.legs.entries()) {
     const src = i === 0 ? short : long;
     const eff = Number.isFinite(l.effectiveLeverage) ? `${l.effectiveLeverage.toFixed(2)}x` : 'no equity';

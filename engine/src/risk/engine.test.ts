@@ -343,6 +343,28 @@ test('a rescuer that does not take the trigger (no live rescuer yet): it is publ
   assert.deepEqual(detected(), ['detect'], 'no detect progress for a taken trigger');
 });
 
+test('adlUnwinding: the ADL check that starts beside every read is running, but no unwind is until the watch says one is in flight', async () => {
+  let unwinding = false;
+  let release!: (r: AdlReport | null) => void;
+  const adl = { check: () => new Promise<AdlReport | null>((r) => { release = r; }), get unwinding() { return unwinding; } } as unknown as AdlWatch;
+  const { risk } = rig({ adl });
+  await risk.tick();
+  assert.notEqual(risk.adlRunning, null, 'the read-only check runs beside the read');
+  assert.equal(risk.adlUnwinding, false, 'and is not an unwind');
+  unwinding = true;
+  assert.equal(risk.adlUnwinding, true);
+  unwinding = false;
+  release(null);
+  await risk.adlRunning;
+  assert.equal(risk.adlUnwinding, false);
+  // A watch without the flag (an older stand-in) never reads as unwinding.
+  const plain = rig({ adl: { check: async () => null } as unknown as AdlWatch });
+  await plain.risk.tick();
+  assert.equal(plain.risk.adlUnwinding, false);
+  await plain.risk.stop();
+  await risk.stop();
+});
+
 test('stop() is final: no read, no ADL check and no stress after it', async () => {
   let checks = 0;
   const adl = { check: async () => { checks++; return null; } } as unknown as AdlWatch;

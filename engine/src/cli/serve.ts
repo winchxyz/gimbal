@@ -84,7 +84,7 @@ import { StrategyStore, strategyFile } from '../strategy-store.ts';
 import { setupFromEnv } from '../setup/serve-setup.ts';
 import { LOOP_ACCOUNT_MAX_AGE_MS, accountWithin, liveReaders, replayReaders } from '../readers.ts';
 import type { Readers } from '../readers.ts';
-import { DEFAULT_STRATEGY, ORDERLY_BROKERS, scannerConfigFor } from '../scanner/config.ts';
+import { DEFAULT_STRATEGY, ORDERLY_BROKERS, scannerConfigFor, withBuilderFee } from '../scanner/config.ts';
 import { Scanner } from '../scanner/scanner.ts';
 import { DEFAULT_ENGINE_HOST, DEFAULT_ENGINE_PORT, EngineServer } from '../server.ts';
 import type { RecordLine } from '../venues/recorder.ts';
@@ -104,7 +104,7 @@ import type { ServePair } from './serve-pair.ts';
 import { liveLines, pairRefreshesAtOpen, servePair } from './serve-pair.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { connectContract, contractEnv, marginVenues } from './serve-contract.ts';
-import { loopBook, serveLoop } from './serve-loop.ts';
+import { adlGate, loopBook, openGateText, protectionText, serveLoop } from './serve-loop.ts';
 import { ConfigError, retryStart } from './start-errors.ts';
 import type { PositionBook } from '../book/book.ts';
 import { createBook } from '../book/book.ts';
@@ -231,7 +231,8 @@ if (mode === 'replay') {
 let server: EngineServer | null = null;
 // The costs of the network the desk trades on: testnet prices Orderly under woofi_dex, mainnet and replay (recorded
 // mainnet answers) under gimbal_dex.
-const scannerConfig = { ...scannerConfigFor(mode), policy };
+// Hyperliquid's fills carry the deployed contract's builder fee, the one the pair trader's open prices (hlFillFeeBps).
+const scannerConfig = { ...withBuilderFee(scannerConfigFor(mode), contract?.builderTenthBps), policy };
 const fees = scannerConfig.costs.fees;
 const fill = (v: keyof typeof fees) => `${v} ${fees[v].takerBps + fees[v].extraBps} bps`;
 log(`scanner costs (${mode}): taker fill ${fill('hyperliquid')}, ${fill('phoenix')}, ${fill('orderly')} `
@@ -449,13 +450,16 @@ if (values.once === true) {
   process.exit(0);
 }
 
-/** A protection runs (a rescue, its fund_venue step included; an ADL unwind; panic_close): no order of the loop goes out. */
+/**
+ * A protection runs (a rescue, its fund_venue step included; an ADL unwind, an open ADL event or a check confirming a
+ * leg off its baseline; panic_close): the loop decides nothing and no order of it goes out. The read-only ADL check
+ * that starts beside every desk read (risk.adlRunning) is not one while it sees nothing off.
+ */
+function protections() {
+  return { rescue: rescueRunning?.() ?? null, adl: adlGate(pair?.adl), panicClose: closingWatch?.current != null };
+}
 function protectionRunning(): string | null {
-  const rescuing = rescueRunning?.() ?? null;
-  if (rescuing !== null) return `rescue ${rescuing} runs`;
-  if (risk?.adlRunning != null) return 'an ADL unwind runs';
-  if (closingWatch?.current != null) return 'panic_close runs';
-  return null;
+  return protectionText(protections());
 }
 
 // The position book: next to the loop state. An unreadable book file is never started over: serve runs without the
@@ -538,7 +542,8 @@ loop = serveLoop({
   ...(booked === null ? {} : { book: booked.sink }),
   ...(stateDirSet === undefined ? {} : { stateDir: resolve(stateDirSet) }),
   busy: () => protectionRunning() ?? (pair?.pair?.closing === true ? 'a close of the pair runs' : null),
-  orderGate: protectionRunning,
+  // Every open's gate, asked again before its first order and each later part: also a pair paused since an ADL.
+  orderGate: () => openGateText(protections()),
 });
 log(loop.startLine());
 booked?.adopt(loop.held);
@@ -634,7 +639,7 @@ async function shutdown(reason: string): Promise<void> {
   // is waited for, bounded, before the lock is released: pair-mainnet must not start next to it. One deadline covers
   // it all: risk.stop() (it waits for an ADL attempt that is running) and the closes.
   const deadline = new Promise<false>((r) => setTimeout(() => r(false), SHUTDOWN_WAIT_MS).unref());
-  if (pair?.pair?.closing === true || closingWatch?.current != null || risk?.adlRunning != null) {
+  if (pair?.pair?.closing === true || closingWatch?.current != null || risk?.adlUnwinding === true) {
     log(`stopping: waiting up to ${SHUTDOWN_WAIT_MS / 1000} s for the close in flight before the trader lock is released`);
   }
   // A running rescue signs nothing new from here; one that is signing or sending goes on until its payment is saved

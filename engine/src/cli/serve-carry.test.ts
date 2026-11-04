@@ -97,7 +97,7 @@ async function carryWorld(o: { closing?: boolean; refreshedAgeS?: number; refres
   const timeline: string[] = [];
   let planning = false;
   const client = {
-    config: async () => ({ fees: {} }), getDesk: async () => desk(o.closing), prices: async () => rows.map((r) => ({ ...r })),
+    config: async () => ({ fees: { hl_builder_tenth_bps: 10 } }), getDesk: async () => desk(o.closing), prices: async () => rows.map((r) => ({ ...r })),
   } as unknown as NearContractClient;
   const prices: PriceDeps = {
     maxAgeS: 900, send: true, read: (s) => storedPrice(client, s),

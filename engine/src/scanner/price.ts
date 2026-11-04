@@ -7,9 +7,11 @@ import { venueName, venueNames } from '../venues/names.ts';
 import type { Book } from '../venues/venue.ts';
 import type { CostParams } from './config.ts';
 import {
-  HOURS_PER_YEAR, aprPct, basisCostUsd, breakevenHours, fillFeeBps, fundingTimingUsd, hoursUntil, legSlippage,
-  marginRoundTripUsd, oneOffAprPct, paymentPeriodHours, rescueAmountUsd, rescueCostUsd, takerFeesUsd,
+  HOURS_PER_YEAR, aprPct, basisCostUsd, breakevenHours, fillFeeBps, fundingTimingUsd, hoursUntil,
+  marginRoundTripUsd, oneOffAprPct, paymentPeriodHours, rescueAmountUsd, rescueCostUsd,
 } from './costs.ts';
+import type { RoundTrip } from './carry.ts';
+import { deskRoundTrip } from './carry.ts';
 import type { LegSlippage } from './costs.ts';
 import { round } from './history.ts';
 import type { Pair, ScanLeg } from './pairs.ts';
@@ -84,6 +86,8 @@ export interface PricedWindow {
   window: FundingWindow;
   costsApr: number;              // the sum of the four cost fields, APR points
   breakdown: CostBreakdown;
+  /** A desk window's round trip (carry.ts deskRoundTrip, the one the pair trader's open is refused on); null otherwise. */
+  roundTrip: RoundTrip | null;
   fills: { long: LegFills; short: LegFills } | null;
   /** A watch-only window with a quality finding: it ranks after the clean watch windows. */
   flagged: boolean;
@@ -132,6 +136,7 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
   const basisUsd = long.markPx !== null && short.markPx !== null ? basisCostUsd(long.markPx, short.markPx, L) : null;
 
   let breakdown: CostBreakdown;
+  let rt: RoundTrip | null = null;
   let fills: PricedWindow['fills'] = null;
   const checks: FundingWindow['checks'] = [];
   const staleVenues = [long, short].filter((l) => l.stale).map((l) => l.venue);
@@ -144,18 +149,19 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
     const sb = ctx.book(short);
     if (lb === null) return { ok: false, reason: 'no-book', venue: lv };
     if (sb === null) return { ok: false, reason: 'no-book', venue: sv };
-    const ls = legSlippage(lb.book, L, 'long');
-    const ss = legSlippage(sb.book, L, 'short');
-    if (ls === null) return { ok: false, reason: 'empty-book', venue: lv };
-    if (ss === null) return { ok: false, reason: 'empty-book', venue: sv };
+    const longBps = fillFeeBps(ctx.costs.fees[lv]);
+    const shortBps = fillFeeBps(ctx.costs.fees[sv]);
+    // The round trip the gate holds the spread against: the pair trader's open prices it with the same function.
+    const priced = deskRoundTrip(L, { feeBps: longBps, book: lb.book, px: long.markPx }, { feeBps: shortBps, book: sb.book, px: short.markPx }, timingUsd, ctx.costs.basisBufferBps);
+    if (!priced.ok) return { ok: false, reason: 'empty-book', venue: priced.side === 'long' ? lv : sv };
+    rt = priced.roundTrip;
+    const { long: ls, short: ss } = priced;
     for (const [leg, b] of [[long, lb], [short, sb]] as const) {
       if (b.stale) {
         if (!staleVenues.includes(leg.venue)) staleVenues.push(leg.venue);
         oldest = Math.min(oldest, b.readAt);
       }
     }
-    const longBps = fillFeeBps(ctx.costs.fees[lv]);
-    const shortBps = fillFeeBps(ctx.costs.fees[sv]);
     const amount = rescueAmountUsd(L, ctx.strategy.risk.watchDistancePct, ctx.strategy.risk.rescueDistancePct);
     const margin = L / ctx.strategy.maxLeverage;
     // The desk keeps its money in the reserve between holds, so entering means moving each leg's margin onto its
@@ -163,9 +169,9 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
     const moving = [lv, sv].filter((v) => !(ctx.marginHeldAt?.has(v) ?? false));
     const transferUsd = moving.reduce((s, v) => s + marginRoundTripUsd(v, margin, ctx.costs.reserveAt, ctx.costs.transfers), 0);
     breakdown = {
-      feesUsd: takerFeesUsd(L, longBps, shortBps),
+      feesUsd: rt.feesUsd,
       transferUsd,
-      slippageUsd: ls.openUsd + ls.closeUsd + ss.openUsd + ss.closeUsd,
+      slippageUsd: rt.slippageUsd,
       basisUsd,
       timingUsd,
       rescueUsd: rescueCostUsd(lv, sv, amount, ctx.costs.rescuesPerHold, ctx.costs.reserveAt, ctx.costs.transfers),
@@ -253,7 +259,7 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
     switchCostUsd: null,
     stale: staleVenues.length > 0,
   };
-  return { ok: true, priced: { pair, window, costsApr, breakdown, fills, flagged: quality.length > 0 } };
+  return { ok: true, priced: { pair, window, costsApr, breakdown, roundTrip: rt, fills, flagged: quality.length > 0 } };
 }
 
 function schedule(leg: ScanLeg, incomePerHourUsd: number, now: number) {

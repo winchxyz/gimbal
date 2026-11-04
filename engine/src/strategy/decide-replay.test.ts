@@ -93,7 +93,13 @@ function shape(h: number, windows: readonly FundingWindow[]): FundingWindow[] {
 
 interface Step { h: number; d: Decision; veto: string | null; px: Map<string, number> }
 
-async function run(): Promise<Step[]> {
+/**
+ * The recording's costs: a 10-day hold and a 5 bps exit buffer, the ones its hours were priced on. The scenario test is
+ * decide's sequence over them, not the hold; the stricter default hurdle is checked on its own below.
+ */
+const RECORDED_COSTS = { ...DEFAULT_SCANNER_CONFIG.costs, holdHours: 240, basisBufferBps: 5 };
+
+async function run(costs = RECORDED_COSTS): Promise<Step[]> {
   const lines = readRecording(RECORDING);
   const start = replayStart(lines);
   const end = lines.reduce((m, l) => Math.max(m, l.t), 0);
@@ -105,7 +111,7 @@ async function run(): Promise<Step[]> {
   let held: HeldPair | null = null;
   let heldVenues = new Set<VenueId>();
   const scanner = new Scanner(readers.venues, [], {
-    config: { ...DEFAULT_SCANNER_CONFIG, policy: POLICY }, clock, strategy: () => STRAT, oracle,
+    config: { ...DEFAULT_SCANNER_CONFIG, policy: POLICY, costs }, clock, strategy: () => STRAT, oracle,
     held: () => (held === null ? null : { windowId: held.windowId, since: start }),
     marginHeldAt: () => heldVenues,
   });
@@ -227,4 +233,18 @@ test('a recorded hour of mainnet scans, one an hour: enter, compression, exit, c
     // The recorded verdicts pass; a prompt with no recording passes unchecked. Either way the act stands.
     if (s.veto !== null) assert.match(s.veto, /^(NEAR AI passed|no NEAR AI risk check)/);
   }
+});
+
+test('on the default costs (168 h, 10 bps) the recorded NEAR hours never clear the 5 % minimum: the stricter hurdle, on purpose', async () => {
+  assert.deepEqual([DEFAULT_SCANNER_CONFIG.costs.holdHours, DEFAULT_SCANNER_CONFIG.costs.basisBufferBps], [168, 10]);
+  const steps = await run(DEFAULT_SCANNER_CONFIG.costs);
+  // NEAR's recorded hours, unshaped until hour 3, net under the minimum: never counted, never entered. What is
+  // entered later is only the windows shape() sets a net on (SOL from hour 4, ETH from hour 12).
+  for (const s of steps.slice(0, 3)) {
+    assert.equal(s.d.decision.action, 'wait');
+    assert.match(s.d.decision.reason, /^No window clears the entry rules; best NEAR \d\.\d % net: \d\.\d % net, under your 5 % minimum$/);
+  }
+  const entered = steps.flatMap((s) => (s.d.act?.kind === 'enter' ? [s.d.act.windowId] : s.d.act?.kind === 'rotate' ? [s.d.act.toId] : []));
+  assert.ok(!entered.includes(NEAR), entered.join(', '));
+  assert.deepEqual(entered, [SOL, ETH]);
 });

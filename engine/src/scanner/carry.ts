@@ -7,7 +7,9 @@
 // Units: APR in percentage points a year on one leg's notional (as costs.ts); money in USD at `legUsd` a leg.
 
 import type { Window as FundingWindow } from '@gimbal/shared';
-import { HOURS_PER_YEAR } from './costs.ts';
+import type { BookLevel } from '../venues/venue.ts';
+import { HOURS_PER_YEAR, basisCostUsd, legSlippage, takerFeesUsd } from './costs.ts';
+import type { LegSlippage } from './costs.ts';
 import { usd } from './price.ts';
 
 /** What one round trip of a desk window costs, USD at `legUsd`: everything paid once whatever the hold. */
@@ -28,6 +30,41 @@ export function roundTrip(legUsd: number, feesUsd: number, slippageUsd: number, 
   const basisBufferUsd = basisUsd + timingUsd + (legUsd * bufferBps) / 1e4;
   const totalUsd = feesUsd + slippageUsd + basisBufferUsd;
   return { feesUsd, slippageUsd, basisBufferUsd, totalUsd, bps: (totalUsd / legUsd) * 1e4 };
+}
+
+/** One leg of a desk window as its round trip prices it. */
+export interface RoundTripLeg {
+  /** One fill's fee, bps of notional: the venue's taker fee plus what rides on every order (costs.ts fillFeeBps). */
+  feeBps: number;
+  /** Its book now: the open and the close are walked through it at the leg size. */
+  book: { bids: readonly BookLevel[]; asks: readonly BookLevel[] };
+  /** Its price for the adverse gap between the legs, USD per base unit; null: not known (the gap is not priced). */
+  px: number | null;
+}
+
+export type DeskRoundTrip =
+  | { ok: true; roundTrip: RoundTrip; long: LegSlippage; short: LegSlippage; basisUsd: number | null }
+  | { ok: false; side: 'long' | 'short' };
+
+/**
+ * The round trip of a desk window at `legUsd` a leg: the one cost both the scanner's gate (price.ts, scanner.ts) and
+ * the pair trader's open (cli/pair-ops.ts planOpen, trade/carry-plan.ts) hold the expected spread against, so a
+ * window the trader would refuse for its cost is never shown as enterable. Each of the 4 fills (open and close, both
+ * legs) is priced as a taker fill: its venue's fee plus that side walked through today's book at the leg size, which
+ * includes half the spread and any impact. The basis buffer is the adverse gap between the legs' prices at entry,
+ * the funding lost to payment schedules (`timingUsd`) and `bufferBps` of the leg for the gap moving by the exit.
+ * `ok: false` when a book has an empty side. 20 USD on Hyperliquid (5.5 bps) and Phoenix (3.5 bps), books 1 bp
+ * wide, no gap, 10 bps buffer: fees 0.036, slippage 4 × 20 × 0.5 bp = 0.004, buffer 0.02: 0.06 USD = 30 bps.
+ */
+export function deskRoundTrip(legUsd: number, long: RoundTripLeg, short: RoundTripLeg, timingUsd: number, bufferBps: number): DeskRoundTrip {
+  const ls = legSlippage(long.book, legUsd, 'long');
+  if (ls === null) return { ok: false, side: 'long' };
+  const ss = legSlippage(short.book, legUsd, 'short');
+  if (ss === null) return { ok: false, side: 'short' };
+  const basisUsd = long.px !== null && short.px !== null ? basisCostUsd(long.px, short.px, legUsd) : null;
+  const slippageUsd = ls.openUsd + ls.closeUsd + ss.openUsd + ss.closeUsd;
+  const rt = roundTrip(legUsd, takerFeesUsd(legUsd, long.feeBps, short.feeBps), slippageUsd, basisUsd ?? 0, timingUsd, bufferBps);
+  return { ok: true, roundTrip: rt, long: ls, short: ss, basisUsd };
 }
 
 /** A gross APR earned over `holdHours` on one leg, USD: 10.95 % on 20 USD over 240 h is 0.06 USD. */

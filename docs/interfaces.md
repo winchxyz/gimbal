@@ -959,7 +959,10 @@ anywhere the policy does not allow.
 - `decide.ts` (pure): `decide(DecideInput) → Decision` with the shapes in that file. Entry: the top of the
   scanner's ranked list among the windows passing the entry rules (`isEnterable`, `netAprPct ≥ minNetAprPct`, the
   7 d and 14 d spread signs agreeing with this hour's, depth on both legs; not in `DecideInput.unopenable`, the
-  windows the loop's hands refuse (serve opens long Phoenix / short Hyperliquid only, on the policy's markets); and
+  windows the loop's hands refuse (serve opens long Phoenix / short Hyperliquid only, on the policy's markets); not in
+  `DecideInput.costRefused`, the windows whose open the pair trader refused for cost (its own book reads: the spread
+  over the 168 h hold does not cover `deskRoundTrip`, the scanner's own round trip), until the next hourly check, the
+  window's count starting again (`skipAct`'s `costRefused`), so the next window is the one entered; and
   free margin on each leg venue, plus what a close frees, opening at least 10 USD a leg at the leverage in whole
   lots, as the size below rounds it: the loop never moves margin to open; a venue whose free margin was not read
   this check is skipped, so a read failure never resets the count), once it has passed them for
@@ -1057,7 +1060,7 @@ anywhere the policy does not allow.
   attestation, why line, leg size, forecast, the round trip the scanner priced: fees, slippage and basis, the hold);
   an `act` line when the act after it ended (opened, with the book's position id `<window>@<time>`, or not, with
   why); and, for a refusal, `hours` lines on each hourly check with the gross APR the refused window actually paid
-  each hour (the scanner's `grossHours`), over `LEDGER_HOLD_HOURS` (the scanner's 240 h cost hold, capped by the time
+  each hour (the scanner's `grossHours`), over `LEDGER_HOLD_HOURS` (the scanner's 168 h cost hold, capped by the time
   stop). The same act asked again within `LEDGER_RETRY_MS` (1 h: a retry after a refusal that passes, same window,
   kind and verdict, not opened) is not booked again; its act is booked only if it opens. Serve keeps in memory only
   the refusals still pricing (at most 500; a refusal fully priced, or 14 days past its hold, is not asked again).
@@ -1069,8 +1072,11 @@ anywhere the policy does not allow.
   its own act opened (matched by position id, never by time; a pass whose open failed shows none), realised net
   (running while open). Then the totals: the fully priced refusals' sum, and the pending ones' estimate apart.
 - `loop.ts` (serve): runs `decide` after each funding payment (the hourly check) and on each scan event, only with
-  `GIMBAL_TRADE=1` and `strategy.auto`, one decision at a time under the per-desk trader lock, never while a rescue
-  or an ADL unwind runs. It carries `act` out with the same open and close code as `pair-mainnet` (maker first),
+  `GIMBAL_TRADE=1` and `strategy.auto`, one decision at a time under the per-desk trader lock, never while a rescue,
+  an ADL unwind (`AdlWatch.unwinding`: its close signs or is in flight), an open ADL event, an ADL check confirming a
+  leg off its baseline (`AdlWatch.confirming`) or panic_close runs; the read-only ADL check beside every desk read is
+  not one while it sees nothing off. Every open's gate, asked again before its first order and each later part, also
+  refuses a pair paused since an ADL (serve-loop.ts `openGateText`). It carries `act` out with the same open and close code as `pair-mainnet` (maker first),
   publishes `decision` events and journals `enter` / `exit` / `rotate` / `veto` / `wait` with numbers and tx links,
   each enter, rotate and refusal with the risk check's why line, books every check in the risk check ledger (a ledger
   that fails is logged, never the act's), and saves `LoopCounters` next to the trader state. `POST /rotate` and `POST /close` go through the same path.

@@ -146,6 +146,8 @@ interface PlanWorldOptions {
   /** activeAssetData's margin mode and the openOrders answer the venues give (withVenues). */
   marginMode?: string;
   resting?: unknown[];
+  /** The contract's FeeConfig.hl_builder_tenth_bps as config() gives it. Default 10 (1 bp); null: config() has none. */
+  builderTenthBps?: number | null;
 }
 
 /**
@@ -176,9 +178,9 @@ function planWorld(o: PlanWorldOptions) {
     now: () => Date.now(), log: (l) => logs.push(l), landed: refreshLanded, reachedChain: refreshReachedChain, ...newPriceState(),
   };
   const said: string[] = [];
-  const book = async () => ({ bids: [{ px: 2499 }], asks: [{ px: 2501 }] });
+  const book = async () => ({ bids: [{ px: 2499, sz: 10 }], asks: [{ px: 2501, sz: 10 }] });
   const ctx = {
-    client, config: { fees: {} }, desk: { policy, paused: o.desk?.paused ?? false, closing: o.desk?.closing ?? false, evm_address: '0xDESK' },
+    client, config: { fees: o.builderTenthBps === null ? {} : { hl_builder_tenth_bps: o.builderTenthBps ?? 10 } }, desk: { policy, paused: o.desk?.paused ?? false, closing: o.desk?.closing ?? false, evm_address: '0xDESK' },
     hlUrl: 'http://hl.plan.test', phoenixUrl: 'http://phoenix.plan.test',
     hl: {
       funding: async () => [{ symbol: sym, ratePerHour: 0.0002 }], marketFundingHistory: async () => [],
@@ -329,6 +331,29 @@ test('no stored price, a real open whose refresh fails: a refusal with the reaso
   const onChain = await refreshForOpen(failed.ctx, failed.pair, failedPlan);
   assert.deepEqual(three(onChain), { refused: 'the stored ETH price (missing) could not be refreshed before the open: refresh_prices failed in transaction H6: Exceeded the prepaid gas.', paid: true, line: null });
   assert.equal(failed.prices.lastRefreshAt.has('ETH'), false, 'not landed: the next refresh is not held back 30 s');
+});
+
+test('the trader\'s Hyperliquid fee: the 4.5 bps taker plus the contract\'s builder fee once; no builder fee read, no plan', async () => {
+  // A 50 USD leg; Phoenix's market config takes 2 bps a fill. Builder 10 tenths (1 bp): Hyperliquid 5.5 bps a fill,
+  // the 4 fills 2 x 50 x (5.5 + 2) / 10^4 = 0.075 USD.
+  const one = planWorld({ send: true, builderTenthBps: 10 });
+  const p1 = await withVenues(() => planOpen(one.ctx, one.pair, one.request));
+  assert.deepEqual(p1.refusals, []);
+  assert.ok(Math.abs(p1.carry.roundTrip!.feesUsd - 0.075) < 1e-12, String(p1.carry.roundTrip!.feesUsd));
+  // 20 tenths (2 bps): 6.5 bps a fill, 0.085 USD.
+  const two = planWorld({ send: true, builderTenthBps: 20 });
+  const p2 = await withVenues(() => planOpen(two.ctx, two.pair, two.request));
+  assert.ok(Math.abs(p2.carry.roundTrip!.feesUsd - 0.085) < 1e-12, String(p2.carry.roundTrip!.feesUsd));
+  // Fails closed: config() without the fee (or one the contract would not take) refuses the open, not for cost.
+  for (const bad of [null, 0, 101, 2.5]) {
+    const w = planWorld({ send: true, builderTenthBps: bad });
+    const p = await withVenues(() => planOpen(w.ctx, w.pair, w.request));
+    assert.match(p.refusals.join('; '), /the contract's config\(\) gave no usable fees\.hl_builder_tenth_bps .*: the Hyperliquid fee, and so the round trip, is unknown/, String(bad));
+    assert.match(p.refusals.join('; '), /the hyperliquid fee a fill is not known \(NaN\): the round trip cannot be priced/);
+    assert.equal(p.carry.costRefusal, null);
+    assert.equal(p.carry.roundTrip, null);
+    assert.deepEqual(w.refreshes, []);
+  }
 });
 
 test('a real open already refused for anything else sends no refresh_prices: paused, closing, margin, resting, SOL, minimum, cap, IOC', async () => {

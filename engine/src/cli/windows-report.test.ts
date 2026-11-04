@@ -69,24 +69,24 @@ test('the block for one window: legs now / 7 d / 14 d, round trip in USD and bps
   assert.deepEqual(r.windows.map((w) => w.id), ['xlm-phoenix-hyperliquid']);
   const w = r.windows[0]!;
   const c = s.carry(w.id)!;
-  // 0.000025/h apart for two weeks: 21.9 % APR on both means (a tie is judged on the 7 days); over 240 h on 20 USD
-  // that is 0.12 USD.
+  // 0.000025/h apart for two weeks: 21.9 % APR on both means (a tie is judged on the 7 days); over 168 h on 20 USD
+  // that is 0.084 USD.
   assert.equal(c.estimate.state, 'known');
   assert.equal(c.estimate.basis, '7d');
-  assert.ok(Math.abs(c.estimate.expectedUsd! - 0.12) < 1e-9);
+  assert.ok(Math.abs(c.estimate.expectedUsd! - 0.084) < 1e-9);
   // Fees 20 × 2 × 9 / 10⁴ = 0.036, slippage 4 × 20 × 1 bp = 0.008, no adverse gap (the long is the cheaper mark),
-  // buffer 5 bps = 0.01: 0.054 USD = 27 bps.
-  assert.ok(Math.abs(c.estimate.roundTrip.totalUsd - 0.054) < 1e-6, String(c.estimate.roundTrip.totalUsd));
-  assert.ok(Math.abs(c.estimate.netUsd! - 0.066) < 1e-6);
-  // 0.066 / 20 × 8760 / 240 = 12.045 % APR net over the hold: over the default 5 % minimum.
-  assert.ok(Math.abs(c.estimate.netAprPct! - 12.045) < 1e-4);
+  // buffer 10 bps = 0.02: 0.064 USD = 32 bps.
+  assert.ok(Math.abs(c.estimate.roundTrip.totalUsd - 0.064) < 1e-6, String(c.estimate.roundTrip.totalUsd));
+  assert.ok(Math.abs(c.estimate.netUsd! - 0.02) < 1e-6);
+  // 0.02 / 20 × 8760 / 168 = 5.214 % APR net over the hold: just over the default 5 % minimum.
+  assert.ok(Math.abs(c.estimate.netAprPct! - 5.2143) < 1e-4);
   // The window's own net APR is the same number (to its rounded cost terms): one net, judged once. Its costs are the
   // round trip over the hold; the transfers and the rescue reserve are the one-off line's, not in them.
-  assert.equal(w.netAprPct, 12.045);
-  assert.deepEqual(w.costs, { feesPct: 6.57, slippagePct: 1.46, basisPct: 1.825, rescueReservePct: 0 });
-  assert.equal(w.usdPerDayPer1k, Math.round((12.045 / 100 / 365) * 1000 * 1e4) / 1e4);
-  // 0.054 USD at 21.9 % on 20 USD (0.012 USD a day): 4.5 days.
-  assert.ok(Math.abs(c.estimate.breakevenDays! - 4.5) < 1e-6);
+  assert.equal(w.netAprPct, 5.214);
+  assert.deepEqual(w.costs, { feesPct: 9.386, slippagePct: 2.086, basisPct: 5.214, rescueReservePct: 0 });
+  assert.equal(w.usdPerDayPer1k, Math.round((5.214 / 100 / 365) * 1000 * 1e4) / 1e4);
+  // 0.064 USD at 21.9 % on 20 USD (0.012 USD a day): 5.33 days.
+  assert.ok(Math.abs(c.estimate.breakevenDays! - 0.064 / 0.012) < 1e-6);
   const g = legGross(c.long, c.short);
   assert.ok(Math.abs(g.d14! - c.estimate.gross.d14AprPct!) < 1e-9);
   assert.deepEqual(windowBlock(w, c), [
@@ -95,15 +95,15 @@ test('the block for one window: legs now / 7 d / 14 d, round trip in USD and bps
     '    Hyperliquid XLM short    10.95   10.95   10.95',
     '    Phoenix XLM long         10.81  -10.95  -10.95',
     '    gross (short - long)      0.14   21.90   21.90',
-    '  round trip    $0.05 = 27.0 bps at $20.00 a leg (4 fills $0.04, slippage $0.0080, basis buffer $0.01)',
+    '  round trip    $0.06 = 32.0 bps at $20.00 a leg (4 fills $0.04, slippage $0.0080, basis buffer $0.02)',
     '  one-off, not in the gate: transfers $1.56 (both legs\' margin moved in and out through 1Click), rescue reserve $0.32 over the hold',
-    '  over a 10-day hold  expected $0.12 on 21.90 % APR (7 d, the smaller of 7 d and 14 d), $0.07 after the round trip = 12.04 % APR net '
-      + '(minimum 5 %), break-even 4.5 days: passes the gate',
+    '  over a 7-day hold  expected $0.08 on 21.90 % APR (7 d, the smaller of 7 d and 14 d), $0.02 after the round trip = 5.21 % APR net '
+      + '(minimum 5 %), break-even 5.3 days: passes the gate',
     '  depth         $25k (the smaller leg\'s open interest: Hyperliquid $9.7M, Phoenix $25k)',
     '  refused       E_NO_DESK: no desk policy loaded yet',
     '  failing       No desk policy loaded yet: nothing can be entered',
   ]);
-  // A 20 USD leg is 0.079 % of Phoenix's 25k USD: no share check fails, and the break-even (4.5 days on the 14-day
+  // A 20 USD leg is 0.079 % of Phoenix's 25k USD: no share check fails, and the break-even (5.3 days on the 14-day
   // spread) is well inside a year.
-  assert.equal(w.breakevenHours, 108);
+  assert.equal(w.breakevenHours, 128);
 });

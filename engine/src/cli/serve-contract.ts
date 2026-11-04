@@ -78,6 +78,8 @@ export interface ContractSide {
   desk: DeskView;
   policy: ContractPolicy;
   prices: ContractPriceCache;
+  /** config().fees.hl_builder_tenth_bps as read at the start (null: not given): the scanner prices it (withBuilderFee). */
+  builderTenthBps: number | null;
 }
 
 /** Connects, reads the desk and its policy, and starts the price cache (first read awaited). */
@@ -94,7 +96,8 @@ export async function connectContract(cfg: ContractEnv, options: {
   const client = new NearContractClient({
     contractId: cfg.contractId, network: cfg.network, transport, ...(options.onHealth === undefined ? {} : { onHealth: options.onHealth }),
   });
-  checkContractNetwork(cfg.contractId, await client.config(), cfg.network);
+  const config = await client.config();
+  checkContractNetwork(cfg.contractId, config, cfg.network);
   const desk = await client.getDesk(cfg.deskId);
   if (desk === null) throw new ConfigError(`${cfg.contractId} has no desk ${cfg.deskId}`);
   let policy: ContractPolicy;
@@ -108,7 +111,7 @@ export async function connectContract(cfg: ContractEnv, options: {
   });
   await prices.refresh();
   prices.start();
-  return { client, desk, policy, prices };
+  return { client, desk, policy, prices, builderTenthBps: config.fees?.hl_builder_tenth_bps ?? null };
 }
 
 /** The desk venues holding margin now: every leg with margin on it. */

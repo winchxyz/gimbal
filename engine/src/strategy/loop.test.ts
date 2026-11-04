@@ -4,13 +4,13 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
 import type { JournalEntry, StrategyConfig, StrategyDecision, StreamEvent, Window as FundingWindow } from '@gimbal/shared';
-import { DEFAULT_STRATEGY } from '../scanner/config.ts';
+import { DEFAULT_SCANNER_CONFIG, DEFAULT_STRATEGY } from '../scanner/config.ts';
 import type { DecideInput, Decision } from './decide.ts';
 import { LOOP_RULES, NO_COUNTERS } from './decide.ts';
 import type { ActOutcome, BookFill, BookRecord, HandsHeld, LoopHands, StrategyLoopOptions } from './loop.ts';
 import {
   HOUR_GRACE_MS, LEDGER_HOLD_HOURS, LOOP_STATE_VERSION, LoopStore, MAX_OPEN_REFRESHES_PER_DAY, MAX_OPEN_REFRESHES_PER_DAY_ALL, REFRESH_HOLD_MS, RETRY_AFTER_MS,
-  RISK_NOT_ASKED, StrategyLoop, loopStateFile, notEnterable, parseLoopState,
+  RISK_NOT_ASKED, StrategyLoop, loopStateFile, nextHourlyCheck, notEnterable, parseLoopState,
 } from './loop.ts';
 import type { RiskActRecord, RiskCheckRecord, RiskLedgerSink } from '../book/risk-ledger.ts';
 import { positionIdOf } from '../book/derive.ts';
@@ -576,6 +576,69 @@ test('a refused act is journaled once and not tried again before RETRY_AFTER_MS;
   assert.equal(decisions(w2)[0]!.action, 'enter');
 });
 
+test('an open the trader refuses for cost: held out of the entry rules until the next hourly check, its hours start again, the next window entered', async () => {
+  const SOL = 'sol-phoenix-hyperliquid';
+  const ETH = 'eth-phoenix-hyperliquid';
+  const why = 'the expected spread over 7 days, $0.0390, does not cover the round trip $0.0421 (36.7 bps: 4 fills $0.0206, slippage $0.0101, basis buffer $0.0114)';
+  const w = world({ openAnswer: (sym) => (sym === 'SOL' ? { ...REFUSED(`open refused, nothing signed: ${why}`), costRefused: why } : OK('opened both legs')) });
+  // decide() itself: SOL and ETH both pass the entry rules, SOL ranked first.
+  const loop = makeLoop(w, tmpStore(), { decide: undefined });
+  for (let h = 0; h < 3; h += 1) {
+    w.now = T0 + h * HOUR;
+    await loop.check();
+  }
+  // 12:05, the third hourly check: SOL entered, refused for cost, nothing sent.
+  assert.deepEqual(w.opens.map((o) => o.symbol), ['SOL']);
+  const refused = journal(w).filter((j) => j.kind === 'refused');
+  assert.equal(refused.length, 1);
+  assert.match(refused[0]!.summary, new RegExp(`^enter ${SOL}: open refused, nothing signed: the expected spread over 7 days`));
+  assert.match(refused[0]!.summary, /; sol-phoenix-hyperliquid is held out of the entry rules until the hourly check at 2026-11-03T13:01:00\.000Z and its hours start again; /);
+  // Its count is gone, ETH's stands: the refusal is not counted as an hour SOL passed.
+  assert.equal(loop.counters.aboveByWindow[SOL], undefined);
+  assert.equal(loop.counters.aboveByWindow[ETH], 3);
+  // The next scan: SOL fails the entry rules as `cost` and the loop falls through to ETH, entered.
+  w.now = T0 + 2 * HOUR + 60_000;
+  await loop.check();
+  assert.equal(w.inputs.length, 0, 'decide() is the real one: nothing recorded by the fake');
+  assert.deepEqual(w.opens.map((o) => o.symbol), ['SOL', 'ETH']);
+  assert.equal(journal(w).filter((j) => j.kind === 'enter').length, 1);
+});
+
+test('the cost hold-out ends at the next hourly check; until then decide() is told why, after it the window is counted from 1', async () => {
+  const SOL = 'sol-phoenix-hyperliquid';
+  const why = 'the expected spread over 7 days, $0.0390, does not cover the round trip $0.0421';
+  const w = world({ openAnswer: () => ({ ...REFUSED(`open refused, nothing signed: ${why}`), costRefused: why }) });
+  const loop = makeLoop(w);
+  w.next = { decision: { action: 'enter', reason: 'go', windowId: SOL }, act: { kind: 'enter', windowId: SOL, legUsd: 500, leverage: 1.5, qty: '5' } };
+  await loop.check();                                    // 10:05: refused for cost
+  assert.equal(loop.counters.aboveByWindow[SOL], undefined, 'counted this hour, then its count reset');
+  w.next = {};
+  w.now = T0 + 60_000;
+  await loop.check();                                    // 10:06: still held out
+  assert.deepEqual(w.inputs.at(-1)!.costRefused, { [SOL]: why });
+  w.now = Date.UTC(2026, 10, 3, 11, 0, 30);
+  await loop.check();                                    // 11:00:30: before the hourly check, still held out
+  assert.equal(w.inputs.at(-1)!.hourly, false);
+  assert.ok(w.inputs.at(-1)!.costRefused !== undefined);
+  w.now = Date.UTC(2026, 10, 3, 11, 1);
+  await loop.check();                                    // 11:01: the hourly check reads it again
+  assert.equal(w.inputs.at(-1)!.hourly, true);
+  assert.equal(w.inputs.at(-1)!.costRefused, undefined);
+  // Other refusals (margin, a stale price) mark nothing.
+  const w2 = world({ openAnswer: () => REFUSED('Hyperliquid leg 38 % from liquidation, under 40 %') });
+  const loop2 = makeLoop(w2);
+  w2.next = { decision: { action: 'enter', reason: 'go', windowId: SOL }, act: { kind: 'enter', windowId: SOL, legUsd: 500, leverage: 1.5, qty: '5' } };
+  await loop2.check();
+  w2.now += 60_000;
+  await loop2.check();
+  assert.equal(w2.inputs.at(-1)!.costRefused, undefined);
+  assert.equal(loop2.counters.aboveByWindow[SOL], 1, 'a refusal that is not for cost keeps the count');
+  // When the next hourly check runs: the grace past this hour's top when not yet taken, else the next hour's.
+  assert.equal(nextHourlyCheck(Date.UTC(2026, 10, 3, 10, 0, 30)), Date.UTC(2026, 10, 3, 10, 1));
+  assert.equal(nextHourlyCheck(Date.UTC(2026, 10, 3, 10, 1)), Date.UTC(2026, 10, 3, 11, 1));
+  assert.equal(nextHourlyCheck(T0), Date.UTC(2026, 10, 3, 11, 1));
+});
+
 test('no decision while a rescue or an ADL unwind runs; the hourly check is taken at the next scan', async () => {
   const w = world({ busy: 'rescue r-1 runs' });
   const loop = makeLoop(w);
@@ -1028,8 +1091,9 @@ test('the risk check why line: every enter and refusal carries the verdict, the 
   ]);
   assert.equal(b.prompt?.[1]?.content, enter.numbers.vetoPrompt);
   assert.equal(b.reply, '{"verdict":"pass","reasons":["deep books, no event"]}');
-  // Fees 2 + slippage 1 + basis 1 APR points over the scanner's 240 h hold on 500 USD.
-  assert.ok(Math.abs(b.roundTripCostUsd - 0.04 * 500 * 240 / 8760) < 1e-9);
+  // Fees 2 + slippage 1 + basis 1 APR points over the scanner's 168 h hold on 500 USD.
+  assert.equal(DEFAULT_SCANNER_CONFIG.costs.holdHours, 168);
+  assert.ok(Math.abs(b.roundTripCostUsd - 0.04 * 500 * 168 / 8760) < 1e-9);
 
   // No key: the window passes unchecked, said so, with no attestation (nothing came to attest), and booked as unchecked.
   const w2 = world();
