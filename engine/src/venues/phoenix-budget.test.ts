@@ -10,9 +10,10 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { PhoenixHttpError } from '@ellipsis-labs/rise';
 import { phoenixTraderApi } from '../trade/phoenix-leg.ts';
+import { noteDeskAct } from './desk-acts.ts';
 import { HostBudget, PHOENIX_BUDGET, hostBudget, isReadSkipped, scanRead } from './http-budget.ts';
-import type { HostBudgetOptions } from './http-budget.ts';
-import { PhoenixReader } from './phoenix.ts';
+import type { BudgetTimers, HostBudgetOptions } from './http-budget.ts';
+import { MARKS_MAX_AGE_MS, PhoenixReader } from './phoenix.ts';
 import { VirtualClock, readWireRecording } from './replay.ts';
 
 const DIR = fileURLToPath(new URL('../../fixtures/phoenix-wire/', import.meta.url));
@@ -47,12 +48,19 @@ const limited = (retryAfter?: string) => new Response('{"error":"rate_limited"}'
  * real time in well under a second each; the real numbers are tested on a fake clock in http-budget.test.ts.
  */
 const TEST_BUDGET: HostBudgetOptions = {
-  ...PHOENIX_BUDGET, ratePerSec: 5, burst: 5, criticalReserve: 1, classReserve: {}, adaptive: null, random: () => 0,
+  ...PHOENIX_BUDGET, ratePerSec: 5, burst: 5, criticalReserve: 1, classReserve: {}, adaptive: null, criticalFloor: null, random: () => 0,
 };
 
-function reader(f: typeof fetch, budget: Partial<HostBudgetOptions> = {}, clock = new VirtualClock(AT), timeoutMs?: number) {
+/** Timers that fire only when told (the marks refresh between account reads). */
+function heldTimers() {
+  const due: (() => void)[] = [];
+  const timers: BudgetTimers = { setTimeout: (fn) => due.push(fn), clearTimeout: () => {} };
+  return { timers, fire: () => due.splice(0).forEach((fn) => fn()), armed: () => due.length };
+}
+
+function reader(f: typeof fetch, budget: Partial<HostBudgetOptions> = {}, clock = new VirtualClock(AT), timeoutMs?: number, timers = heldTimers().timers) {
   const b = new HostBudget('phoenix-test', { ...TEST_BUDGET, ...budget });
-  return { reader: new PhoenixReader({ fetch: f, clock, budget: b, ...(timeoutMs === undefined ? {} : { timeoutMs }) }), budget: b, clock };
+  return { reader: new PhoenixReader({ fetch: f, clock, budget: b, timers, ...(timeoutMs === undefined ? {} : { timeoutMs }) }), budget: b, clock };
 }
 
 test('a 429 burst on books: the scanner\'s read is sent once, the next ones are skipped unsent, account and trader reads go through after Retry-After', async () => {
@@ -359,7 +367,8 @@ test('phoenixTraderApi with no budget given shares the process\'s budget for tha
 test('account reads: two at once share one snapshot; the loop\'s accountWithin takes the risk engine\'s last answer; the scanner takes its marks', async () => {
   const { f, count } = fakeFetch();
   const clock = new VirtualClock(AT);
-  const { reader: r } = reader(f, {}, clock);
+  const held = heldTimers();
+  const { reader: r } = reader(f, {}, clock, undefined, held.timers);
   const [a, b] = await Promise.all([r.account(AUTHORITY), r.account(AUTHORITY)]);
   assert.deepEqual(a, b);
   assert.equal(count('/v1/trader/state/'), 1, 'one snapshot for both');
@@ -370,13 +379,78 @@ test('account reads: two at once share one snapshot; the loop\'s accountWithin t
   assert.equal(count('/v1/markets/stats/latest'), 1, 'the marks of the account read');
   assert.deepEqual(await r.accountWithin(AUTHORITY, 7_000), a);
   assert.equal(count('/v1/trader/state/'), 1);
-  // The risk engine's next read (5 s on) is its own: a fresh snapshot and fresh marks.
-  clock.set(AT + 5_000);
-  await r.account(AUTHORITY);
-  assert.equal(count('/v1/trader/state/'), 2);
-  assert.equal(count('/v1/markets/stats/latest'), 2);
   // Past its age the loop reads too.
-  clock.set(AT + 13_000);
+  clock.set(AT + 12_000);
   await r.accountWithin(AUTHORITY, 7_000);
-  assert.equal(count('/v1/trader/state/'), 3);
+  assert.equal(count('/v1/trader/state/'), 2);
+});
+
+test('a risk tick is one request: the marks come from a cache of at most 5 s, refreshed between ticks as a scanner read', async () => {
+  const { f, count } = fakeFetch();
+  const clock = new VirtualClock(AT);
+  const held = heldTimers();
+  // A bucket that never runs dry here (the budget's clock is the system's): the requests are what is counted.
+  const { reader: r, budget } = reader(f, { ratePerSec: 1_000, burst: 100 }, clock, undefined, held.timers);
+  const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+  // The first tick has no marks yet: the snapshot and the marks, both critical.
+  await r.account(AUTHORITY);
+  assert.deepEqual([count('/v1/trader/state/'), count('/v1/markets/stats/latest')], [1, 1]);
+  assert.equal(held.armed(), 1, 'the refresh is armed');
+  for (let tick = 1; tick <= 4; tick++) {
+    // Half way to the next tick the refresh reads the marks, from the scanner's class.
+    clock.set(AT + tick * 5_000 - 2_500);
+    const sentBefore = budget.state().sent;
+    held.fire();
+    await settle();
+    await settle();
+    assert.equal(count('/v1/markets/stats/latest'), 1 + tick);
+    assert.equal(budget.state().sent, sentBefore + 1);
+    // The tick: its snapshot alone, the marks 2.5 s old.
+    clock.set(AT + tick * 5_000 + 30);
+    await r.account(AUTHORITY);
+    assert.deepEqual([count('/v1/trader/state/'), count('/v1/markets/stats/latest')], [1 + tick, 1 + tick], `tick ${tick}`);
+  }
+  // A refresh that did not come (skipped after a 429, say): marks older than 5 s are not used, the tick reads them.
+  clock.set(AT + 20_030 + MARKS_MAX_AGE_MS + 3_000);
+  await r.account(AUTHORITY);
+  assert.deepEqual([count('/v1/trader/state/'), count('/v1/markets/stats/latest')], [6, 6]);
+  // Without account reads for a while the armed refresh does nothing.
+  clock.set(AT + 60_000);
+  held.fire();
+  await settle();
+  assert.equal(count('/v1/markets/stats/latest'), 6);
+});
+
+test('the desk\'s own action (an order, a close, a rescue) ends the reuse of account answers read before it', async () => {
+  let hold = false;
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const { f, count } = fakeFetch((url) => {
+    if (!hold || !url.pathname.startsWith('/v1/trader/state/')) return undefined;
+    const line = LINES.find((l) => l.url === url.href)!;
+    return gate.then(() => new Response(JSON.stringify(line.response), { status: line.status }));
+  });
+  const clock = new VirtualClock(AT);
+  const { reader: r } = reader(f, {}, clock);
+  await r.account(AUTHORITY);
+  assert.equal(count('/v1/trader/state/'), 1);
+  clock.set(AT + 1_000);
+  await r.accountWithin(AUTHORITY, 7_000);
+  assert.equal(count('/v1/trader/state/'), 1, 'reused');
+  // The relayer marks an order (venues/desk-acts.ts): the loop sizes from a fresh read.
+  noteDeskAct();
+  await r.accountWithin(AUTHORITY, 7_000);
+  assert.equal(count('/v1/trader/state/'), 2, 'read again after the act');
+  await r.accountWithin(AUTHORITY, 7_000);
+  assert.equal(count('/v1/trader/state/'), 2, 'that fresh answer is reused');
+  // A read in flight when the act starts is not joined after it either.
+  clock.set(AT + 9_000);
+  hold = true;
+  const before = r.account(AUTHORITY);
+  const joined = r.account(AUTHORITY);
+  noteDeskAct();
+  const after = r.account(AUTHORITY);
+  release();
+  await Promise.all([before, joined, after]);
+  assert.equal(count('/v1/trader/state/'), 4, 'one for the two before the act, one after it');
 });

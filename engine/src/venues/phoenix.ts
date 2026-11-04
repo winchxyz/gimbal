@@ -13,8 +13,9 @@ import type {
   LatestMarketsStatsResponse, MarketParams, OrderbookView, QueryParams, RequestOptions,
   TraderStateSnapshotResponse,
 } from '@ellipsis-labs/rise';
-import type { HostBudget, ReadKind } from './http-budget.ts';
-import { PHOENIX_BUDGET, hostBudget, readClass, requestTimeoutMs } from './http-budget.ts';
+import type { BudgetTimers, HostBudget, ReadKind } from './http-budget.ts';
+import { PHOENIX_BUDGET, backgroundScanRead, hostBudget, readClass, requestTimeoutMs } from './http-budget.ts';
+import { deskActEpoch } from './desk-acts.ts';
 import { errorMessage } from './recorder.ts';
 import type {
   AccountState, Book, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, MarketFundingPoint,
@@ -52,9 +53,16 @@ const OVERVIEW_FALLBACK_MS = 10 * 60_000;
 const HISTORY_BATCH_TTL_MS = 10 * 60_000;
 // The marks and open interest (markets/stats/latest) are asked for by the scanner's funding() every scan and by every
 // account() (the risk engine every 5 s): under Phoenix's 1 request a second they share one read. The scanner takes
-// one this young (the risk engine's, as a rule); an account read only one still in flight or started this recently.
+// one this young. An account read takes marks that arrived at most MARKS_MAX_AGE_MS ago, or joins a read still in
+// flight or started STATS_TTL_ACCOUNT_MS ago; else it reads them itself, as a critical read. So that a risk tick is
+// one critical request (the trader snapshot), an account read arms a refresh of the marks MARKS_REFRESH_IN_MS later,
+// between two ticks, as a scanner-class read (it may be skipped or cut after a 429; the next account read then reads
+// the marks itself). The refresh runs only while account reads keep coming (MARKS_REFRESH_WHILE_MS).
 const STATS_TTL_SCAN_MS = 6_000;
 const STATS_TTL_ACCOUNT_MS = 1_000;
+export const MARKS_MAX_AGE_MS = 5_000;
+const MARKS_REFRESH_IN_MS = 2_500;
+const MARKS_REFRESH_WHILE_MS = 15_000;
 // An account read started this recently, or still in flight, is joined by the next account() of the same authority.
 const ACCOUNT_JOIN_MS = 1_000;
 const HISTORY_BATCHES_KEPT = 2;
@@ -96,6 +104,8 @@ export interface PhoenixReaderOptions {
    * shares, so the scanner, the risk engine, the pair trader and the rescuer never add up to a burst; null: none.
    */
   budget?: HostBudget | null;
+  /** Timers for the marks refresh between account reads (tests); default setTimeout, unref'd. */
+  timers?: BudgetTimers;
 }
 
 export class PhoenixReader implements VenueReader, FundingHistorySource, MarketHistorySource {
@@ -112,9 +122,17 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
   #lastOverview: Dated<FundingOverviewResponse> | null = null;
   #historyBatches = new Map<string, SharedRead<FundingOverviewResponse>>();
   #stats: SharedRead<LatestMarketsStatsResponse> | null = null;
-  #accounts = new Map<string, SharedRead<PhoenixAccountState>>();
-  /** The last account answer of each authority and when it was asked for (accountWithin). */
-  #lastAccount = new Map<string, Dated<PhoenixAccountState>>();
+  #accounts = new Map<string, SharedRead<PhoenixAccountState> & { epoch: number }>();
+  /**
+   * The last account answer of each authority, when it was asked for, and the desk-act epoch it was asked under
+   * (accountWithin; an answer from before the desk's own action is not reused, venues/desk-acts.ts).
+   */
+  #lastAccount = new Map<string, Dated<PhoenixAccountState> & { epoch: number }>();
+  /** The last marks answer and when it arrived (an account read takes it while MARKS_MAX_AGE_MS old at most). */
+  #marks: Dated<LatestMarketsStatsResponse> | null = null;
+  readonly #timers: BudgetTimers;
+  #marksTimer: unknown = null;
+  #lastAccountAsk = -Infinity;
 
   constructor(options: PhoenixReaderOptions = {}) {
     this.apiUrl = (options.apiUrl ?? PHOENIX_API_URL).replace(/\/+$/, '');
@@ -126,6 +144,10 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
     this.#timeoutMs = options.timeoutMs ?? 10_000;
     this.#traderPdaIndex = options.traderPdaIndex ?? 0;
     this.#budget = options.budget === undefined ? hostBudget(this.apiUrl, PHOENIX_BUDGET) : options.budget;
+    this.#timers = options.timers ?? {
+      setTimeout: (fn, ms) => setTimeout(fn, ms).unref(),
+      clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+    };
   }
 
   async markets(): Promise<PhoenixMarket[]> {
@@ -166,7 +188,9 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
     const authority = normalizeAuthority(address);
     const now = this.#clock.now();
     const joined = this.#accounts.get(authority);
-    if (joined !== undefined && now >= joined.at && now - joined.at < ACCOUNT_JOIN_MS) return shared(joined, () => this.#accountRead(authority));
+    if (joined !== undefined && joined.epoch === deskActEpoch() && now >= joined.at && now - joined.at < ACCOUNT_JOIN_MS) {
+      return shared(joined, () => this.#accountRead(authority));
+    }
     return this.#accountRead(authority);
   }
 
@@ -178,30 +202,53 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
     const authority = normalizeAuthority(address);
     const last = this.#lastAccount.get(authority);
     const now = this.#clock.now();
-    if (last !== undefined && now >= last.at && now - last.at <= maxAgeMs) return last.value;
+    // Not across the desk's own action (an order, a close, a rescue): sizing takes the margin after it.
+    if (last !== undefined && last.epoch === deskActEpoch() && now >= last.at && now - last.at <= maxAgeMs) return last.value;
     return this.account(authority);
   }
 
   #accountRead(authority: string): Promise<PhoenixAccountState> {
     const at = this.#clock.now();
+    const epoch = deskActEpoch();
     const c = this.#api('account');
     const value = Promise.all([
       c.traders.getTraderStateSnapshot(authority, { traderPdaIndex: this.#traderPdaIndex }),
       this.#marketConfigs(false, 'account'),
-      this.#marketStats(STATS_TTL_ACCOUNT_MS, 'account'),
+      this.#accountMarks(at),
     ]).then(([snapshot, configs, stats]) => parseAccount(snapshot, configs, markPrices(stats), this.#clock.now()));
-    const entry = { at, value, critical: readClass('account') === 'critical' };
+    const entry = { at, value, critical: readClass('account') === 'critical', epoch };
     this.#accounts.set(authority, entry);
+    this.#lastAccountAsk = at;
+    this.#armMarksRefresh();
     value.then(
       (v) => {
         const last = this.#lastAccount.get(authority);
-        if (last === undefined || at >= last.at) this.#lastAccount.set(authority, { at, value: v });
+        if (last === undefined || at >= last.at) this.#lastAccount.set(authority, { at, value: v, epoch });
       },
       () => {
         if (this.#accounts.get(authority) === entry) this.#accounts.delete(authority);
       },
     );
     return value;
+  }
+
+  /** An account read's marks: an answer at most MARKS_MAX_AGE_MS old, else a read joined or made now. */
+  #accountMarks(now: number): Promise<LatestMarketsStatsResponse> {
+    const m = this.#marks;
+    if (m !== null && now >= m.at && now - m.at <= MARKS_MAX_AGE_MS) return Promise.resolve(m.value);
+    return this.#marketStats(STATS_TTL_ACCOUNT_MS, 'account');
+  }
+
+  /** Arms the marks refresh between account reads (STATS_TTL_SCAN_MS comment), once. */
+  #armMarksRefresh(): void {
+    if (this.#marksTimer !== null) return;
+    this.#marksTimer = this.#timers.setTimeout(() => {
+      this.#marksTimer = null;
+      if (this.#clock.now() - this.#lastAccountAsk > MARKS_REFRESH_WHILE_MS) return;
+      // A scanner-class read: it gives way to every critical read and stands aside after a 429. Outside the arming
+      // read's deadline (risk/sources.ts readBy), which the timer would otherwise carry.
+      backgroundScanRead(() => this.#marketStats(MARKS_REFRESH_IN_MS, 'funding')).catch(() => {});
+    }, MARKS_REFRESH_IN_MS);
   }
 
   /** markets/stats/latest, shared while younger than `ttlMs` (see STATS_TTL_SCAN_MS). */
@@ -212,6 +259,10 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
     const value = this.#api(kind).markets.getLatestMarketsStats();
     const entry = { at: now, value, critical: readClass(kind) === 'critical' };
     this.#stats = entry;
+    value.then((v) => {
+      const arrived = this.#clock.now();
+      if (this.#marks === null || arrived >= this.#marks.at) this.#marks = { at: arrived, value: v };
+    }, () => {});
     // A failed read is not kept: the next call asks again.
     value.catch(() => {
       if (this.#stats === entry) this.#stats = null;
@@ -297,8 +348,11 @@ export class PhoenixReader implements VenueReader, FundingHistorySource, MarketH
     this.#overview = null;
     this.#historyBatches.clear();
     this.#stats = null;
+    this.#marks = null;
     this.#accounts.clear();
     this.#lastAccount.clear();
+    if (this.#marksTimer !== null) this.#timers.clearTimeout(this.#marksTimer);
+    this.#marksTimer = null;
   }
 
   #marketConfigs(fresh: boolean, kind: ReadKind): Promise<ExchangeMarketConfig[]> {

@@ -6,6 +6,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { BudgetTimers, HostBudgetOptions, ReadClass } from './http-budget.ts';
+import { ACCOUNT_READ_DEADLINE_MS } from '../risk/sources.ts';
 import { HostBudget, PHOENIX_BUDGET, isReadSkipped } from './http-budget.ts';
 
 const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -76,7 +77,12 @@ function phoenixHost(time: FakeTime, perSec = 1, burst = 20) {
     ok++;
     return new Response('{}', { status: 200 });
   };
-  return { send, counts: () => ({ ok, limited }) };
+  /** Someone else on the same IP spends the whole bucket now. */
+  const drain = () => {
+    tokens = 0;
+    at = time.now();
+  };
+  return { send, drain, counts: () => ({ ok, limited }) };
 }
 
 interface Tally {
@@ -90,14 +96,15 @@ interface Tally {
 
 /**
  * serve's Phoenix load after this change, per class. `critical`: the risk engine's account read every 5 s (the trader
- * snapshot and the marks); the strategy loop takes that answer (accountWithin) and adds nothing. `funding`: the
- * overview once a minute, the market configs every 10 min, the marks when the scanner misses the risk engine's (every
- * 30 s here, to be safe), the book sync's ledger reads hourly. `book`, as the scanner asks for them every 5 s: the
- * held window's and the policy's books once 30 s old, then the off-desk ones once 5 min old, a book not read still due
+ * snapshot, and the marks when the refresh between ticks did not bring them); the strategy loop takes that answer
+ * (accountWithin) and adds nothing. `funding`: the marks refresh 2.5 s after each tick (the scanner shares it), the
+ * overview once a minute, the market configs every 10 min, the book sync's ledger reads hourly. `book`, as the scanner
+ * asks for them every 5 s: the held window's and the policy's books once 30 s old, then the off-desk ones once 5 min
+ * old, a book not read still due
  * at the next scan, and none asked for after the first one skipped in a scan. `history`: the all-market batch twice an
  * hour, and 4 single-market reads a scan for the first two minutes (a start with every week still to load).
  */
-function steadyLoad(time: FakeTime, budget: HostBudget, send: () => Promise<Response>, o: { policyBooks?: number; offDeskBooks?: number; offDeskTtlMs?: number } = {}) {
+function steadyLoad(time: FakeTime, budget: HostBudget, send: () => Promise<Response>, o: { policyBooks?: number; offDeskBooks?: number; offDeskTtlMs?: number; risk?: 'cached' | 'both' } = {}) {
   const tally: Record<ReadClass, Tally> = {
     critical: { sent: 0, answered: 0, skipped: 0, limited: 0, waits: [] },
     funding: { sent: 0, answered: 0, skipped: 0, limited: 0, waits: [] },
@@ -127,13 +134,29 @@ function steadyLoad(time: FakeTime, budget: HostBudget, send: () => Promise<Resp
     ...Array.from({ length: o.offDeskBooks ?? 16 }, () => book(o.offDeskTtlMs ?? 300_000, false)),
   ];
   const t0 = time.now();
+  // The risk tick: the trader snapshot, and the marks too unless the refresh between ticks brought them at most 5 s
+  // ago (phoenix.ts MARKS_MAX_AGE_MS); `both` is the read before, the two every tick. `ticks`: ms from the tick to
+  // its last answer, Infinity for a tick a read of which was not answered.
+  const ticks: number[] = [];
+  let marksAt = -Infinity;
   time.every(5_000, () => {
-    void read('critical');
-    void read('critical');
+    const start = time.now();
+    const fresh = o.risk !== 'both' && start - marksAt <= 5_000;
+    const reads = fresh ? [read('critical')] : [read('critical'), read('critical')];
+    if (!fresh) marksAt = start;
+    void Promise.all(reads).then((answered) => ticks.push(answered.every(Boolean) ? time.now() - start : Infinity));
   });
+  if (o.risk !== 'both') {
+    time.every(5_000, () => {
+      void read('funding').then((answered) => {
+        if (answered) marksAt = time.now();
+      });
+    }, 2_500);
+  }
   time.every(60_000, () => void read('funding'), 100);
   time.every(600_000, () => void read('funding'), 200);
-  time.every(30_000, () => void read('funding'), 300);
+  // The scanner's marks are the refresh's (risk 'both': the risk tick's, missed now and then).
+  if (o.risk === 'both') time.every(30_000, () => void read('funding'), 300);
   time.every(3_600_000, () => {
     void read('funding');
     void read('funding');
@@ -155,7 +178,7 @@ function steadyLoad(time: FakeTime, budget: HostBudget, send: () => Promise<Resp
   }, 700);
   /** The oldest a book got before it was read again: the policy's books, or the off-desk ones. */
   const oldest = (policy: boolean) => Math.max(0, ...books.filter((b) => b.policy === policy).flatMap((b) => b.ages));
-  return { tally, oldest };
+  return { tally, oldest, ticks };
 }
 
 const T0 = Date.UTC(2026, 10, 4, 12);
@@ -164,10 +187,11 @@ test('serve\'s steady load under PHOENIX_BUDGET on a host with Phoenix\'s limits
   const time = new FakeTime(T0);
   const host = phoenixHost(time);
   const budget = new HostBudget('phoenix-sim', { ...PHOENIX_BUDGET, now: time.now, timers: time.timers, random: () => 0.5 });
-  const { tally, oldest } = steadyLoad(time, budget, host.send);
+  const { tally, oldest, ticks } = steadyLoad(time, budget, host.send);
   await time.advance(2 * 3_600_000);
   await time.advance(20_000);
   assert.equal(host.counts().limited, 0, JSON.stringify(tally.book));
+  assert.ok(ticks.length >= 1_440 && Math.max(...ticks) <= 3_000, `${ticks.length} risk ticks, the slowest ${Math.max(...ticks)} ms`);
   const c = tally.critical;
   // The reads asked for in the last 20 s may still wait; every one before has its answer.
   assert.ok(c.answered >= c.sent - 8 && c.skipped === 0 && c.limited === 0, JSON.stringify({ ...c, waits: undefined }));
@@ -184,11 +208,11 @@ test('the same load under the budget before (5 a second, a burst of 5) and its r
   const time = new FakeTime(T0);
   const host = phoenixHost(time);
   const before: HostBudgetOptions = {
-    ...PHOENIX_BUDGET, ratePerSec: 5, burst: 5, scanMaxInFlight: 3, criticalReserve: 1, classReserve: {}, adaptive: null,
+    ...PHOENIX_BUDGET, ratePerSec: 5, burst: 5, scanMaxInFlight: 3, criticalReserve: 1, classReserve: {}, adaptive: null, criticalFloor: null,
     now: time.now, timers: time.timers, random: () => 0.5,
   };
   const budget = new HostBudget('phoenix-sim', before);
-  steadyLoad(time, budget, host.send, { policyBooks: 0, offDeskBooks: 20, offDeskTtlMs: 30_000 });
+  steadyLoad(time, budget, host.send, { policyBooks: 0, offDeskBooks: 20, offDeskTtlMs: 30_000, risk: 'both' });
   // The strategy loop's free margin (two more requests) and the scanner's own marks, every 5 s.
   time.every(5_000, () => {
     for (const cls of ['critical', 'critical', 'funding'] as const) void budget.run(cls, host.send).catch(() => {});
@@ -234,14 +258,21 @@ test('a 429 halves the rate and empties the bucket; quiet minutes step it back b
   const ok = async () => new Response('{}', { status: 200 });
   assert.equal((await budget.run('book', limited)).status, 429);
   assert.equal(budget.state().ratePerSec, 0.375);
-  // Empty: the next critical read waits for the cool-down (2 s) and a token at the new rate (1 / 0.375 s = 2.7 s).
+  // The shared bucket is empty, the critical floor is not: the next critical read waits out the server's Retry-After
+  // (2 s) alone and goes on a floor token, while the scanner's funding waits for the shared bucket at the new rate.
   const asked = time.now();
   const read = budget.run('critical', ok);
-  await time.advance(2_000);
+  const funding = budget.run('funding', ok).then(() => 'sent', (err: unknown) => (isReadSkipped(err) ? `skipped ${err.reason}` : 'error'));
+  await time.advance(1_999);
   assert.equal(budget.state().sent, 1, 'not sent inside the cool-down');
-  await time.advance(1_000);
+  await time.advance(1);
   assert.equal((await read).status, 200);
-  assert.ok(time.now() - asked >= 2_666, `${time.now() - asked} ms`);
+  assert.equal(time.now() - asked, 2_000);
+  assert.equal(budget.state().sent, 2, 'the funding read still waits');
+  assert.ok(Math.abs(budget.state().floorTokens - 1) < 1e-9, `${budget.state().floorTokens} floor tokens`);
+  // It needs 3 shared tokens, 8 s at the cut rate: past its 3 s wait, so the scanner is the one that goes without.
+  await time.advance(3_000);
+  assert.equal(await funding, 'skipped budget');
   // A minute without a 429: 0.475; five more: back at 0.75, and no higher.
   await time.advance(60_000);
   await budget.run('critical', ok);
@@ -278,4 +309,27 @@ test('a host shared with someone else (it lets this process have 0.6 a second): 
   steadyLoad(time2, fixed, host2.send);
   await time2.advance(60 * 60_000);
   assert.ok(host2.counts().limited > 3 * Math.max(1, cut), `${host2.counts().limited} against ${cut}`);
+});
+
+test('a 429 storm (a host that allows 0.6 a second, emptied by someone else every 20 s): every risk read is answered inside its 7 s deadline', async () => {
+  const run = async (options: HostBudgetOptions, risk: 'cached' | 'both') => {
+    const time = new FakeTime(T0);
+    const host = phoenixHost(time, 0.6, 20);
+    const budget = new HostBudget('phoenix-sim', { ...options, now: time.now, timers: time.timers, random: () => 0.5 });
+    const { ticks } = steadyLoad(time, budget, host.send, { risk });
+    time.every(20_000, host.drain, 1_000);
+    await time.advance(60 * 60_000);
+    await time.advance(20_000);
+    return { ticks, limited: host.counts().limited, rate: budget.state().ratePerSec };
+  };
+  const now = await run(PHOENIX_BUDGET, 'cached');
+  // The host answers 429 after every drain until the cut rate is under it (from 0.75 to 0.375 to 0.25 a second).
+  assert.ok(now.limited >= 10 && now.rate < PHOENIX_BUDGET.ratePerSec, `${now.limited} 429s, rate ${now.rate}`);
+  assert.ok(now.ticks.length >= 720, `${now.ticks.length} risk ticks`);
+  const slowest = Math.max(...now.ticks);
+  assert.ok(slowest <= ACCOUNT_READ_DEADLINE_MS, `the slowest risk tick ${slowest} ms`);
+  // Before: the cut and the drain reached the risk reads too, two requests a tick: past the deadline again and again.
+  const before = await run({ ...PHOENIX_BUDGET, criticalFloor: null }, 'both');
+  const late = before.ticks.filter((t) => t > ACCOUNT_READ_DEADLINE_MS).length;
+  assert.ok(before.limited > 5 * now.limited && late > before.ticks.length / 2, `before: ${before.limited} 429s, ${late} of ${before.ticks.length} risk ticks late`);
 });

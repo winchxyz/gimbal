@@ -13,7 +13,10 @@
 // budget and run at most until then. A Retry-After longer than retryAfterMaxMs is cut to it, so a host that asks for
 // an hour cannot lock critical reads out: they probe it again after the capped wait. With `adaptive`, a 429 also
 // cuts the rate (the host is shared with someone, or allows less than thought) and empties the bucket; the rate
-// climbs back a step a minute while no 429 comes.
+// climbs back a step a minute while no 429 comes. With `criticalFloor`, critical reads also have a bucket of their
+// own that no 429 cuts or empties: they take a token from the shared bucket while it has one, else from theirs, so
+// the desk's own account reads keep that rate through a storm of 429s; and they wait out only the server's
+// Retry-After, never the budget's own backoff (which holds the scanner's reads).
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 
@@ -67,6 +70,14 @@ export function readBy<T>(deadline: number, fn: () => Promise<T>): Promise<T> {
   return deadlines.run(outer === undefined ? deadline : Math.min(outer, deadline), fn);
 }
 
+/**
+ * Runs `fn` as the scanner with no caller's deadline: for a read started from a timer that a deadlined read armed
+ * (a timer runs in the context it was set in, so it would inherit that deadline, long past by then).
+ */
+export function backgroundScanRead<T>(fn: () => Promise<T>): Promise<T> {
+  return deadlines.exit(() => scanReads.run(true, fn));
+}
+
 /** ms left before the deadline of the readBy() this runs in (0 once past); null outside one. */
 export function readTimeLeft(): number | null {
   const d = deadlines.getStore();
@@ -100,6 +111,11 @@ export interface HostBudgetOptions {
   classReserve?: Partial<Record<Exclude<ReadClass, 'critical'>, number>>;
   /** A 429 cuts the rate to `cut` of itself, down to minRatePerSec; it climbs back by recoverStep every recoverEveryMs. */
   adaptive?: AdaptiveRate | null;
+  /**
+   * Critical reads' own bucket, never cut or emptied by a 429: the rate they keep whatever the shared bucket does.
+   * With it, critical reads wait only for the server's Retry-After after a 429, not for the backoff without one.
+   */
+  criticalFloor?: { ratePerSec: number; burst: number } | null;
   /** How long a read may wait for a token and a slot, by class; past it a scanner read is skipped. */
   maxWaitMs: Record<ReadClass, number>;
   /** 429 retries by class (the first request not counted). */
@@ -145,8 +161,11 @@ const realTimers: BudgetTimers = {
  * 30 passed; at 1.5 a second the first after 38 s, then 1 a second passed; 1 a second for 90 s all passed). So 0.75 a
  * second with a burst of 10: our load alone never empties the host's bucket, and a 429 (someone else on the same
  * egress IP, as on a shared cloud host, or a second process here) halves the rate until quiet minutes step it back.
- * Critical reads keep 2 tokens (a risk read is two requests: the trader snapshot and the marks); books leave 3,
- * history 5.
+ * Critical reads keep 2 tokens of the shared bucket (books leave 3, history 5) and have 0.45 a second of their own
+ * that no 429 cuts: a risk tick is one request every 5 s (the trader snapshot; the marks come from a cache of at most
+ * 5 s that a scanner-class read refreshes between ticks, phoenix.ts), two when that refresh was skipped, so even at
+ * the cut floor and after Retry-After: 2 the risk read is answered well inside its 7 s deadline
+ * (risk/sources.ts ACCOUNT_READ_DEADLINE_MS).
  */
 export const PHOENIX_BUDGET: HostBudgetOptions = {
   ratePerSec: 0.75,
@@ -156,6 +175,7 @@ export const PHOENIX_BUDGET: HostBudgetOptions = {
   criticalReserve: 2,
   classReserve: { book: 3, history: 5 },
   adaptive: { cut: 0.5, minRatePerSec: 0.25, recoverEveryMs: 60_000, recoverStep: 0.1 },
+  criticalFloor: { ratePerSec: 0.45, burst: 2 },
   // The scanner times out a funding read at 4 s and a book at 8 s: it hears "skipped" well before either.
   maxWaitMs: { critical: 15_000, funding: 3_000, book: 1_500, history: 1_500 },
   retries: { critical: 3, funding: 1, book: 0, history: 0 },
@@ -179,6 +199,10 @@ interface Waiter {
 export interface HostBudgetState {
   /** ms: no request goes out before this (Retry-After or the backoff of the last 429). */
   retryAt: number;
+  /** ms: no critical request goes out before this (with criticalFloor: the server's Retry-After only). */
+  criticalRetryAt: number;
+  /** Tokens in the critical floor bucket (criticalFloor), else 0. */
+  floorTokens: number;
   /** ms: scanner books and history are skipped until this. */
   quietUntil: number;
   /** 429s in a row. */
@@ -219,6 +243,9 @@ export class HostBudget {
   #timer: unknown = null;
   #timerAt = Infinity;
   #retryAt = 0;
+  /** The server's Retry-After alone: what critical reads wait for when there is a criticalFloor. */
+  #serverRetryAt = 0;
+  #floorTokens: number;
   #quietUntil = 0;
   #rateLimited = 0;
   #sent = 0;
@@ -233,6 +260,7 @@ export class HostBudget {
     this.#random = options.random ?? Math.random;
     this.#timers = options.timers ?? realTimers;
     this.#tokens = options.burst;
+    this.#floorTokens = options.criticalFloor?.burst ?? 0;
     this.#rate = options.ratePerSec;
     this.#refilledAt = this.#now();
     this.#rateAt = this.#refilledAt;
@@ -240,7 +268,8 @@ export class HostBudget {
 
   state(): HostBudgetState {
     return {
-      retryAt: this.#retryAt, quietUntil: this.#quietUntil, rateLimited: this.#rateLimited,
+      retryAt: this.#retryAt, criticalRetryAt: this.#gate('critical'), floorTokens: this.#floorTokens,
+      quietUntil: this.#quietUntil, rateLimited: this.#rateLimited,
       inFlight: this.#inFlight, queued: this.#queue.length, sent: this.#sent, ratePerSec: this.#rate,
     };
   }
@@ -268,7 +297,7 @@ export class HostBudget {
         return res;
       }
       this.#onRateLimited(res);
-      if (attempt >= this.#o.retries[cls] || this.#retryAt > deadline) return res;
+      if (attempt >= this.#o.retries[cls] || this.#gate(cls) > deadline) return res;
       // The body is not read: release the connection before waiting.
       await res.body?.cancel().catch(() => {});
     }
@@ -286,11 +315,13 @@ export class HostBudget {
       ? Math.round(said * (1 + 0.15 * this.#random()))
       : Math.round(Math.min(this.#o.backoffMaxMs, this.#o.backoffBaseMs * 2 ** (n - 1)) * (0.5 + 0.5 * this.#random()));
     this.#retryAt = Math.max(this.#retryAt, now + pause);
+    if (said !== null) this.#serverRetryAt = Math.max(this.#serverRetryAt, this.#retryAt);
     const quiet = Math.round(Math.min(this.#o.quietMaxMs, this.#o.quietBaseMs * 2 ** (n - 1)) * (0.75 + 0.25 * this.#random()));
     this.#quietUntil = Math.max(this.#quietUntil, this.#retryAt, now + quiet);
     const a = this.#o.adaptive;
     if (a !== undefined && a !== null) {
       // The host's bucket for us is empty, and it allows less than the rate we ran at: slower, from an empty bucket.
+      // The critical floor is neither cut nor emptied.
       this.#refill(now);
       this.#rate = Math.max(a.minRatePerSec, this.#rate * a.cut);
       this.#rateAt = now;
@@ -306,12 +337,12 @@ export class HostBudget {
     if ((cls === 'book' || cls === 'history') && now < this.#quietUntil) {
       return Promise.reject(new ReadSkipped(this.host, cls, 'cooling', this.#quietUntil, now));
     }
-    if (this.#retryAt > deadline) return Promise.reject(new ReadSkipped(this.host, cls, 'cooling', this.#retryAt, now));
+    if (this.#gate(cls) > deadline) return Promise.reject(new ReadSkipped(this.host, cls, 'cooling', this.#gate(cls), now));
     return new Promise<void>((resolve, reject) => {
       const w: Waiter = {
         cls, seq: this.#seq++, deadline,
         start: () => resolve(),
-        skip: (reason) => reject(new ReadSkipped(this.host, cls, reason, reason === 'cooling' ? Math.max(this.#retryAt, this.#quietUntil) : null, this.#now())),
+        skip: (reason) => reject(new ReadSkipped(this.host, cls, reason, reason === 'cooling' ? Math.max(this.#gate(cls), cls === 'critical' ? 0 : this.#quietUntil) : null, this.#now())),
       };
       this.#queue.push(w);
       this.#queue.sort((a, b) => RANK[a.cls] - RANK[b.cls] || a.seq - b.seq);
@@ -325,9 +356,16 @@ export class HostBudget {
     this.#pump();
   }
 
+  /** ms: when a read of `cls` may go out after the last 429s. */
+  #gate(cls: ReadClass): number {
+    return cls === 'critical' && this.#o.criticalFloor ? this.#serverRetryAt : this.#retryAt;
+  }
+
   #refill(now: number): void {
     if (now > this.#refilledAt) {
       this.#tokens = Math.min(this.#o.burst, this.#tokens + ((now - this.#refilledAt) / 1000) * this.#rate);
+      const f = this.#o.criticalFloor;
+      if (f) this.#floorTokens = Math.min(f.burst, this.#floorTokens + ((now - this.#refilledAt) / 1000) * f.ratePerSec);
     }
     this.#refilledAt = now;
     const a = this.#o.adaptive;
@@ -356,15 +394,16 @@ export class HostBudget {
     const kept: Waiter[] = [];
     for (const w of this.#queue) {
       if ((w.cls === 'book' || w.cls === 'history') && now < this.#quietUntil) w.skip('cooling');
-      else if (this.#retryAt > w.deadline) w.skip('cooling');
+      else if (this.#gate(w.cls) > w.deadline) w.skip('cooling');
       else if (now >= w.deadline) w.skip('budget');
       else kept.push(w);
     }
     this.#queue = kept;
     while (this.#queue.length > 0) {
       const w = this.#queue[0]!;
-      if (now < this.#retryAt) {
-        wakeAt = this.#retryAt;
+      const gate = this.#gate(w.cls);
+      if (now < gate) {
+        wakeAt = gate;
         break;
       }
       const critical = w.cls === 'critical';
@@ -373,12 +412,18 @@ export class HostBudget {
       // A release wakes the queue again; nothing to time.
       if (!slots) break;
       const need = this.#need(w.cls);
-      if (this.#tokens < need) {
-        wakeAt = now + Math.ceil(((need - this.#tokens) / this.#rate) * 1000);
+      // A critical read takes a shared token while there is one, else one of its floor's.
+      const floor = critical && this.#tokens < need && this.#floorTokens >= 1;
+      if (this.#tokens < need && !floor) {
+        const f = critical ? this.#o.criticalFloor : null;
+        const shared = ((need - this.#tokens) / this.#rate) * 1000;
+        const own = f ? ((1 - this.#floorTokens) / f.ratePerSec) * 1000 : Infinity;
+        wakeAt = now + Math.ceil(Math.min(shared, own));
         break;
       }
       this.#queue.shift();
-      this.#tokens -= 1;
+      if (floor) this.#floorTokens -= 1;
+      else this.#tokens -= 1;
       this.#inFlight++;
       if (!critical) this.#scanInFlight++;
       this.#sent++;
