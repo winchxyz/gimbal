@@ -349,7 +349,8 @@ const loopAccounts: LoopAccount[] = [];
 // Built (and its configuration checked) here; its first session opens, and signs, right before the pair trader starts
 // (which reads the desk's Orderly positions over it).
 let orderly: ServeOrderly | null = null;
-// The contract client on the operator key the session signs with; the pair's relayer signs through the same one.
+// The contract client on the operator key the session signs with; the pair's relayer and the live rescuer sign through
+// the same one (POST /setup keeps a transport of its own: serve-orderly.ts operatorClient).
 let operator: (() => Promise<NearContractClient>) | null = null;
 // The pair trader's Orderly side and the book's Orderly fills over that session (listening from before its first onUp).
 let orderlySide: OrderlyPairSide | null = null;
@@ -444,6 +445,8 @@ if (deskSource !== null) {
       ...(servedPair?.cancelResting === undefined ? {} : { cancelResting: servedPair.cancelResting }),
     },
     ...(replayDesk === null ? {} : { replayDesk }),
+    // GIMBAL_ORDERLY_PAIRS=1: the live rescuer signs through the operator client the pair and the session use.
+    ...(operator === null ? {} : { operator }),
     ...(side === null ? {} : {
       getDesk: async () => {
         const view = await side.client.getDesk(deskId!);

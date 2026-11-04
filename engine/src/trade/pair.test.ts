@@ -266,6 +266,60 @@ test('legging guard: a partial fill is topped up once, and an unwind that fails 
   assert.deepEqual(stubborn.b.orders.map((o) => o.reduceOnly), [false, true, true]);
 });
 
+test('legging guard: Orderly fills 6 of 10, then refuses its retry and both unwinds: Hyperliquid goes to offset it, hedged at 6', async () => {
+  const s = setup({}, { script: [{ partial: '0.006' }, 'fail', 'fail', 'fail'] });
+  const r = await s.trader.open({ size: '0.01', longIndex: 0, reason: 'open' });
+  assert.deepEqual([s.a.pos, s.b.pos], [q('0.006'), q('-0.006')], 'hedged: never Hyperliquid flat with Orderly short alone');
+  assert.equal(r.status, 'stuck');
+  assert.equal(s.trader.unhedged, null);
+  // Orderly goes back first (its reduce-only can be refused); Hyperliquid then reduces to what Orderly still holds.
+  assert.deepEqual(s.b.orders.map((o) => [o.side, o.size, o.reduceOnly]), [['SELL', '0.01', false], ['SELL', '0.004', false], ['BUY', '0.006', true], ['BUY', '0.006', true]]);
+  assert.deepEqual(s.a.orders.map((o) => [o.side, o.size, o.reduceOnly]), [['BUY', '0.01', false], ['SELL', '0.004', true]]);
+  assert.deepEqual(r.legs[0].orders.map((o) => o.purpose), ['open', 'unwind']);
+  assert.deepEqual([r.legs[0].target, r.legs[1].target], ['0.006', '0']);
+  assert.match(r.notes.join(' '), /orderly stayed at -0\.006, not back to 0: hyperliquid goes to 0\.006 to offset it/);
+  assert.match(r.notes.at(-1)!, /^hedged at 0\.006: hyperliquid holds 0\.006, orderly holds -0\.006$/);
+  // The watch holds each leg there: a later copy of a refused Orderly unwind is a deficit matched on Hyperliquid.
+  assert.deepEqual([s.trader.intent(s.a), s.trader.intent(s.b)], [q('0.006'), q('-0.006')]);
+  s.b.pos = 0n;
+  await s.trader.positionPushed(s.b, 0n);
+  assert.deepEqual([s.a.pos, s.b.pos], [0n, 0n]);
+  assert.equal(s.watches.at(-1)?.status, 'rehedged');
+
+  // The same refusals after Orderly unwound part of it: Hyperliquid offsets what is left.
+  const part = setup({}, { script: [{ partial: '0.006' }, 'fail', { partial: '0.002' }, 'fail'] });
+  const r2 = await part.trader.open({ size: '0.01', longIndex: 0, reason: 'open' });
+  assert.deepEqual([part.a.pos, part.b.pos], [q('0.004'), q('-0.004')]);
+  assert.equal(r2.status, 'stuck');
+});
+
+test('legging guard: when Orderly unwinds, its partner follows to its start; nothing is unwound in parallel', async () => {
+  const s = setup({}, { script: [{ partial: '0.006' }, 'fail'] });
+  const r = await s.trader.open({ size: '0.01', longIndex: 0, reason: 'open' });
+  assert.equal(r.status, 'flat');
+  assert.deepEqual([s.a.pos, s.b.pos], [0n, 0n]);
+  assert.deepEqual(s.a.orders.map((o) => [o.side, o.size, o.reduceOnly, o.reason]), [['BUY', '0.01', false, 'open'], ['SELL', '0.01', true, 'open (unwind)']]);
+  assert.deepEqual(s.b.orders.map((o) => [o.side, o.size, o.reduceOnly, o.reason]), [['SELL', '0.01', false, 'open'], ['SELL', '0.004', false, 'open (retry)'], ['BUY', '0.006', true, 'open (unwind)']]);
+});
+
+test('legging guard: Orderly filled in full and refuses its unwind; its partner short of it is reopened to offset it (not while an open is blocked)', async () => {
+  const s = setup({ script: [{ partial: '0.006' }, 'fail', 'fill'] }, { script: ['fill', 'fail', 'fail'] });
+  const r = await s.trader.open({ size: '0.01', longIndex: 0, reason: 'open' });
+  assert.deepEqual([s.a.pos, s.b.pos], [q('0.01'), q('-0.01')]);
+  assert.equal(r.status, 'stuck');
+  assert.deepEqual(s.a.orders.map((o) => [o.side, o.size, o.reduceOnly, o.reason]), [['BUY', '0.01', false, 'open'], ['BUY', '0.004', false, 'open (retry)'], ['BUY', '0.004', false, 'open (re-hedge)']]);
+  assert.deepEqual(r.legs[0].orders.map((o) => o.purpose), ['open', 'retry', 'rehedge']);
+
+  let asks = 0;
+  const closing = setup({ script: [{ partial: '0.006' }, 'fail'] }, { script: ['fill', 'fail', 'fail'] }, { openBlocked: () => (asks++ === 0 ? null : 'the desk is closing (panic_close)') });
+  const r2 = await closing.trader.open({ size: '0.01', longIndex: 0, reason: 'open' });
+  assert.deepEqual([closing.a.pos, closing.b.pos], [q('0.006'), q('-0.01')]);
+  assert.equal(r2.status, 'unhedged');
+  assert.equal(closing.a.orders.length, 2, 'not reopened while the desk closes');
+  assert.match(r2.notes.join(' '), /hyperliquid not reopened to 0\.01: the desk is closing \(panic_close\)/);
+  assert.match(closing.trader.unhedged ?? '', /^unhedged: hyperliquid holds 0\.006, orderly holds -0\.01, 0\.004 not offset$/);
+});
+
 test('outcome unknown: the leg is read back first; a fill that happened is not sent again', async () => {
   const s = setup({ script: ['unknown-filled'] });
   const r = await s.trader.open({ size: '0.005', longIndex: 0, reason: 'open' });

@@ -120,6 +120,28 @@ test('the IOC partner fails twice: the maker leg is unwound reduce-only, flat', 
   assert.deepEqual([p.a.pos, p.b.pos], [0n, 0n]);
 });
 
+test('the IOC partner fills part, then its retry and both unwinds fail: the maker leg reduces to offset it, hedged (Phoenix and Orderly alike)', async () => {
+  // Phoenix: the leg that moved less goes back first; Hyperliquid then reduces to what Phoenix still holds.
+  const p = pair({}, { iocs: [{ fill: '0.003' }, 'fail', 'fail', 'fail'] });
+  const r = await p.trader.open({ size: '0.005', longIndex: 1, reason: 'carry', maker: { index: 0 } });
+  assert.deepEqual([p.a.pos, p.b.pos], [toQty('-0.003'), toQty('0.003')]);
+  assert.equal(r.status, 'stuck');
+  assert.deepEqual(p.log, [
+    'hyperliquid maker SELL 0.005', 'phoenix ioc BUY 0.005', 'phoenix ioc BUY 0.002', 'phoenix ioc SELL 0.003 ro', 'phoenix ioc SELL 0.003 ro', 'hyperliquid ioc BUY 0.002 ro',
+  ]);
+
+  // Orderly as the IOC leg: the same, Orderly first.
+  const log: string[] = [];
+  const hl = new Leg('hyperliquid', log, { lot: '0.0001' });
+  const orderly = new Leg('orderly', log, { lot: '0.001', iocs: [{ fill: '0.003' }, 'fail', 'fail', 'fail'] });
+  const trader = new PairTrader({ legs: [hl, orderly], priceBandBps: 100, unsettledPollMs: null, sleep: async () => {} });
+  const r2 = await trader.open({ size: '0.005', longIndex: 1, reason: 'carry', maker: { index: 0 } });
+  assert.deepEqual([hl.pos, orderly.pos], [toQty('-0.003'), toQty('0.003')]);
+  assert.equal(r2.status, 'stuck');
+  assert.equal(log.at(-1), 'hyperliquid ioc BUY 0.002 ro');
+  assert.equal(trader.unhedged, null);
+});
+
 test('a maker leg with no answer and no expiry halts the open before its partner trades', async () => {
   const p = pair({ makers: ['unknown-none'] }, {});
   const r = await p.trader.open({ size: '0.005', longIndex: 1, reason: 'carry', maker: { index: 0 } });

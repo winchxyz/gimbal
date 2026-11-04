@@ -832,7 +832,7 @@ test('an exit that sent orders and did not end flat is tried again on the next c
   assert.equal(loop.held, null);
 });
 
-test('one leg is never held: closed reduce-only at once (auto off too), retried every check, journaled and published as exit', async () => {
+test('one leg is never held: closed reduce-only at once (auto off too), retried on the checks past its backoff, journaled and published as exit', async () => {
   const w = world({ strategy: { ...DEFAULT_STRATEGY, auto: false }, held: { symbol: 'SOL', legUsd: 250, pnlUsd: 0, oneLeg: { venue: 'phoenix', qty: '2.5' } } });
   w.closeAnswer = () => ({ ok: false, reason: 'Phoenix did not answer', sent: false, tx: [], feeUsd: 0, open: [] });
   const loop = makeLoop(w);
@@ -844,17 +844,92 @@ test('one leg is never held: closed reduce-only at once (auto off too), retried 
   assert.equal(d.action, 'exit');
   assert.match(d.reason, /^one leg open: phoenix 2.5/);
   assert.equal(journal(w).at(-1)!.kind, 'error');
-  assert.match(journal(w).at(-1)!.summary, /^one leg open: phoenix 2.5: the close did not end flat: Phoenix did not answer/);
+  assert.match(journal(w).at(-1)!.summary, /^one leg open: phoenix 2.5: the close did not end flat: Phoenix did not answer; tried again in 5 s$/);
   w.now += 60_000;
   await loop.check();
-  assert.equal(w.closes.length, 2, 'retried every check');
-  assert.equal(journal(w).filter((j) => j.kind === 'error').length, 1, 'the same line is journaled once');
+  assert.equal(w.closes.length, 2, 'retried: its 5 s wait is over');
+  assert.match(journal(w).at(-1)!.summary, /; tried again in 10 s$/);
   w.closeAnswer = () => OK('closed, flat');
   w.now += 60_000;
   await loop.check();
   assert.equal(w.held, null);
   assert.equal(journal(w).at(-1)!.kind, 'exit');
   assert.equal(loop.counters.lastExitAt, w.now);
+});
+
+test('a one-leg close that keeps failing backs off: 5 s doubling to 10 min, one journal line per step; flat or another leg starts over', async () => {
+  const w = world({ strategy: { ...DEFAULT_STRATEGY, auto: false }, held: { symbol: 'SOL', legUsd: 250, pnlUsd: 0, oneLeg: { venue: 'orderly', qty: '2.5' } } });
+  w.closeAnswer = () => ({ ok: false, reason: 'Orderly refused the reduce-only order', sent: true, tx: [], feeUsd: 0, open: [] });
+  const loop = makeLoop(w);
+  // A check every second (the scan): the close goes out only when its wait is over.
+  const at: number[] = [];
+  for (let s = 0; s <= 1_300; s++) {
+    const before = w.closes.length;
+    await loop.check();
+    if (w.closes.length > before) at.push((w.now - T0) / 1000);
+    w.now += 1_000;
+  }
+  // 0, then +5, +10, +20, +40, +80, +160, +320, +600 (the cap), +600.
+  assert.deepEqual(at, [0, 5, 15, 35, 75, 155, 315, 635, 1235]);
+  const lines = journal(w).filter((j) => j.kind === 'error').map((j) => j.summary.replace(/^.*; tried again in /, ''));
+  assert.deepEqual(lines, ['5 s', '10 s', '20 s', '40 s', '1 min 20 s', '2 min 40 s', '5 min 20 s', '10 min'], 'one line per step; the cap repeats nothing');
+  assert.equal(journal(w).filter((j) => j.kind === 'error').at(-1)!.numbers['retryMs'], 600_000);
+  assert.match(decisions(w).at(-1)!.reason, /^one leg open: orderly 2\.5: closing it, reduce-only; the last close failed, next try at /);
+
+  // Another size is a new state: it starts over at 5 s.
+  w.held = { ...w.held!, oneLeg: { venue: 'orderly', qty: '1.5' } };
+  const n = w.closes.length;
+  await loop.check();
+  assert.equal(w.closes.length, n + 1, 'tried at once');
+  w.now += 5_000;
+  await loop.check();
+  assert.equal(w.closes.length, n + 2, 'after 5 s');
+
+  // A close that ends flat ends the backoff: the next single leg is tried at once.
+  w.now += 10_000;
+  w.closeAnswer = () => OK('closed, flat');
+  await loop.check();
+  assert.equal(w.held, null);
+  w.held = { symbol: 'SOL', legUsd: 250, pnlUsd: 0, oneLeg: { venue: 'orderly', qty: '1.5' } };
+  w.closeAnswer = () => REFUSED('Orderly refused the reduce-only order');
+  const m = w.closes.length;
+  await loop.check();
+  assert.equal(w.closes.length, m + 1, 'tried at once after a flat close');
+});
+
+test('an automatic rotate out of a pair the hands refuse to leave (an Orderly leg) asks no NEAR AI risk check and is journaled once; a manual one still is checked and refused', async () => {
+  let asked = 0;
+  const veto: VetoSource = {
+    model: 'test-model', configured: true,
+    complete: async () => {
+      asked++;
+      return { content: '{"verdict":"pass","reasons":[]}', raw: {} };
+    },
+  };
+  const OUT = 'the held SOL pair has an Orderly leg (PERP_SOL_USDC): its close arms the trader\'s replay watch';
+  const w = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 3 }, prepareAnswer: () => REFUSED(OUT) });
+  const hands = { ...fakeHands(w), rotateOutRefused: () => OUT };
+  const loop = makeLoop(w, tmpStore(), { veto, hands });
+  await loop.check();                                    // adopts the held pair
+  w.next = { decision: { action: 'rotate', reason: 'eth better' }, act: { kind: 'rotate', fromId: 'sol-phoenix-hyperliquid', toId: 'eth-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  for (let h = 1; h <= 3; h++) {
+    w.now += HOUR;
+    await loop.check();
+  }
+  assert.equal(asked, 0, 'no NEAR AI call for a rotation the hands refuse');
+  assert.deepEqual([w.prepares, w.closes.length, w.opens.length], [[], 0, 0]);
+  const refused = journal(w).filter((j) => j.kind === 'refused');
+  assert.equal(refused.length, 1, JSON.stringify(refused.map((j) => j.summary)));
+  assert.equal(refused[0]!.summary, `rotate sol-phoenix-hyperliquid -> eth-phoenix-hyperliquid not carried out: ${OUT}; sol-phoenix-hyperliquid is kept, nothing closed; ${RISK_NOT_ASKED}`);
+  assert.equal(loop.held?.windowId, 'sol-phoenix-hyperliquid');
+
+  // POST /rotate: checked (the owner asked for it) and refused by prepareOpen, as before.
+  w.next = {};
+  assert.deepEqual(loop.rotate('eth-phoenix-hyperliquid'), { ok: true });
+  await loop.idle(2_000);
+  assert.equal(asked, 1);
+  assert.deepEqual([w.prepares.length, w.closes.length, w.opens.length], [1, 0, 0]);
+  assert.match(journal(w).at(-1)!.summary, new RegExp(`^rotate sol-phoenix-hyperliquid -> eth-phoenix-hyperliquid not carried out: ${OUT.replace(/[()]/g, '\\$&')}; sol-phoenix-hyperliquid is kept, nothing closed; NEAR AI risk check passed`));
 });
 
 test('a manual close accepted while a check runs: the check\'s act waits for it; a queued manual task does nothing after stop()', async () => {

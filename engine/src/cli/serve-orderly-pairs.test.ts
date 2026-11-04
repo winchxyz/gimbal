@@ -484,6 +484,8 @@ test('GIMBAL_ORDERLY_PAIRS=1: a rotate out of a pair with an Orderly leg is refu
   const d = desk({ GIMBAL_ORDERLY_PAIRS: '1' });
   const s = await serve(d);
   await enter(d, s, 'sol-orderly-hyperliquid');
+  // The loop asks this before its risk check (an automatic rotate pays no NEAR AI call for it).
+  assert.match(s.pair.hands!.rotateOutRefused?.() ?? '', /^the held SOL pair has an Orderly leg \(PERP_SOL_USDC\)/);
   const sent = d.timeline.length;
   d.windows = [win('sol-orderly-hyperliquid'), win('eth-phoenix-orderly', { netAprPct: 40 })];
   await hourly(d, s.loop, () => false, 1);                  // the target's lots are read at a check
@@ -553,11 +555,31 @@ test('GIMBAL_ORDERLY_PAIRS=1: the Hyperliquid maker leg fills and the Orderly IO
     assert.deepEqual(positions(d), {}, said);
     assert.equal(s.loop.held, null, said);
     assert.ok(d.timeline.includes('hyperliquid SOL ioc BUY reduce-only'), said);
-    if (name === 'partly') assert.equal(d.timeline.at(-1), 'orderly PERP_SOL_USDC ioc SELL reduce-only', said);
+    // Orderly goes back first, then Hyperliquid to offset what Orderly holds (here its start: flat).
+    if (name === 'partly') assert.deepEqual(d.timeline.slice(-2), ['orderly PERP_SOL_USDC ioc SELL reduce-only', 'hyperliquid SOL ioc BUY reduce-only'], said);
     assert.ok(!journal(d).some((j) => j.kind === 'enter'), 'no enter journaled');
     s.stop();
     await ticks();
   }
+});
+
+test('GIMBAL_ORDERLY_PAIRS=1: Orderly fills 6 of 12, then refuses its retry and both unwinds: Hyperliquid offsets it, the pair is held hedged at 6', async () => {
+  const d = desk({ GIMBAL_ORDERLY_PAIRS: '1' });
+  const s = await serve(d);
+  legOf(d, 'orderly', 'PERP_SOL_USDC').next = [toQty('6'), 'refuse', 'refuse', 'refuse'];
+  d.windows = [win('sol-orderly-hyperliquid')];
+  await hourly(d, s.loop, () => d.timeline.length > 0);
+  const said = `${JSON.stringify(positions(d))}; ${d.timeline.join(', ')}; held ${JSON.stringify(s.loop.held)}`;
+  assert.deepEqual(positions(d), { 'hyperliquid:SOL': -6, 'orderly:PERP_SOL_USDC': 6 }, said);
+  assert.deepEqual(d.timeline, [
+    'hyperliquid SOL maker SELL', 'orderly PERP_SOL_USDC ioc BUY 6 of 12', 'orderly PERP_SOL_USDC ioc BUY refused',
+    'orderly PERP_SOL_USDC ioc SELL reduce-only refused', 'orderly PERP_SOL_USDC ioc SELL reduce-only refused', 'hyperliquid SOL ioc BUY reduce-only',
+  ], said);
+  assert.equal(s.pair.pair!.trader.unhedged, null, said);
+  // The desk holds the smaller pair, and the loop holds it from now.
+  assert.equal(s.loop.held?.windowId, 'sol-orderly-hyperliquid', said);
+  s.stop();
+  await ticks();
 });
 
 test('GIMBAL_ORDERLY_PAIRS=1: a window Orderly has too little margin for is refused in plain words, never entered, journaled once', async () => {
@@ -581,6 +603,7 @@ test('without GIMBAL_ORDERLY_PAIRS: the HL / Phoenix desk decides, opens and wri
   const hands = s.pair.hands!;
   assert.equal(hands.pairSymbols, undefined);
   assert.equal(hands.heldPair, undefined);
+  assert.equal(hands.rotateOutRefused, undefined, 'no rotation refused before the risk check');
   assert.deepEqual(windowSymbol(d.windows[0]!, hands.symbols), {
     refused: 'serve opens short hyperliquid, long phoenix only (as pair-mainnet open); sol-orderly-hyperliquid is long orderly, short hyperliquid',
   });

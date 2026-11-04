@@ -2,7 +2,9 @@
 // venue, plus or minus the size), so every later step compares the venue's own state with a target.
 //
 // Legging guard (open): a leg that did not reach its target is retried once for what is missing; if it still falls
-// short, both legs go back to their start with reduce-only orders, so a failed open ends where it began. Close
+// short, both legs go back to their start, one after the other: the first reduce-only (Orderly when it is a leg, else
+// the leg that moved less), then its partner to offset what the first actually holds. A failed open ends where it
+// began, or hedged at a smaller size when the first leg's unwind is refused, never with one leg alone. Close
 // mirrors it: a leg that did not close is retried once; if it stays open, the leg that closed is reopened against it,
 // so the desk is left hedged (and the pair reported stuck), never with one leg alone.
 //
@@ -645,18 +647,47 @@ export class PairTrader {
     if (this.#stopped(runs, notes)) return this.#halt(runs, notes, opened, net, request.reason);
     if (runs.every((r) => r.pos === r.target)) return this.#result('open', opened, runs, notes, net);
 
-    // Still legged: both legs back to their start, reduce-only, with one retry each.
+    // Still legged: both legs back to their start, one after the other, with one retry each. The first goes back
+    // reduce-only; its partner then goes to offset what the first actually holds (its start when the first got back),
+    // so a first leg whose unwind is refused is left hedged, never alone (two unwinds at once could close the partner
+    // and leave it naked).
     notes.push(`still legged after the retry: unwinding both legs to their start`);
-    for (const r of runs) r.target = r.start;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const off = runs.filter((r) => r.pos !== r.start);
-      if (off.length === 0) break;
-      await Promise.all(off.map((r) => this.#move(r, r.start, true, `${request.reason} (unwind${attempt === 0 ? '' : ' retry'})`, 'unwind')));
+    const [first, second] = unwindOrder(runs);
+    first.target = first.start;
+    await this.#unwind(first, first.start, true, request.reason, 'unwind');
+    if (this.#stopped(runs, notes)) return this.#stop(opened, runs, notes, net);
+    const offset = offsetTarget(second, net - first.pos!);
+    second.target = offset;
+    if (first.pos !== first.start) {
+      notes.push(`${first.leg.venue} stayed at ${signedQtyString(first.pos!)}, not back to ${signedQtyString(first.start)}: ${second.leg.venue} goes to ${signedQtyString(offset)} to offset it`);
+    }
+    // A reduce toward its start (the partner moved more: a maker leg against its IOC hedge), else a reopen, as #close
+    // re-hedges (the partner moved less, or the other way): never while an open is blocked.
+    const reduce = second.pos === offset || reducedTarget(second.pos!, offset) === offset;
+    const noOpen = reduce ? null : this.#openBlocked();
+    if (noOpen !== null) {
+      notes.push(`${second.leg.venue} not reopened to ${signedQtyString(offset)}: ${noOpen}`);
+    } else {
+      await this.#unwind(second, offset, reduce, request.reason, reduce ? 'unwind' : 'rehedge');
       if (this.#stopped(runs, notes)) return this.#stop(opened, runs, notes, net);
     }
     if (runs.every((r) => r.pos === r.start)) return this.#result('flat', opened, runs, notes, net);
     notes.push('the unwind did not bring both legs back');
-    return this.#result(hedged(runs, net) ? 'stuck' : 'unhedged', opened, runs, notes, net);
+    if (hedged(runs, net)) {
+      notes.push(`hedged at ${qtyString(abs(first.pos! - first.start))}: ${runs.map((r) => `${r.leg.venue} holds ${signedQtyString(r.pos!)}`).join(', ')}`);
+      return this.#result('stuck', opened, runs, notes, net);
+    }
+    const off = runs[0].pos! + runs[1].pos! - net;
+    notes.push(`unhedged: ${runs.map((r) => `${r.leg.venue} holds ${signedQtyString(r.pos!)}`).join(', ')}, ${qtyString(abs(off))} not offset${abs(off) < second.leg.lot ? ` (under one ${second.leg.venue} lot)` : ''}`);
+    return this.#result('unhedged', opened, runs, notes, net);
+  }
+
+  /** One leg of the open's unwind toward `to`: at most two orders' worth (#move, then a retry for what is left). */
+  async #unwind(r: LegRun, to: bigint, reduceOnly: boolean, reason: string, purpose: LegOrderRecord['purpose']): Promise<void> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (r.pos === null || r.unsettled !== null || r.pos === to) return;
+      await this.#move(r, to, reduceOnly, `${reason} (${purpose === 'rehedge' ? 're-hedge' : 'unwind'}${attempt === 0 ? '' : ' retry'})`, purpose);
+    }
   }
 
   /**
@@ -1512,6 +1543,25 @@ function towardZero(pos: bigint, target: bigint): bigint {
   const lo = pos < 0n ? pos : 0n;
   const hi = pos > 0n ? pos : 0n;
   return target < lo ? lo : target > hi ? hi : target;
+}
+
+/**
+ * Which leg of a legged open goes back first, and which then offsets what it holds. Orderly first: it is IOC only and
+ * may refuse a reduce-only order, so the leg left to offset it should be the other venue's. Otherwise the leg that
+ * moved less: its partner (a maker leg against the IOC sized to its fill) then only reduces toward its own start.
+ */
+function unwindOrder(runs: [LegRun, LegRun]): [LegRun, LegRun] {
+  const [a, b] = runs;
+  const orderly = runs.filter((r) => r.leg.venue === 'orderly');
+  if (orderly.length === 1) return orderly[0] === a ? [a, b] : [b, a];
+  return abs(a.pos! - a.start) <= abs(b.pos! - b.start) ? [a, b] : [b, a];
+}
+
+/** `want` for the leg, in its own whole lots from its start (nearest: within half a lot of offsetting its partner). */
+function offsetTarget(r: LegRun, want: bigint): bigint {
+  const delta = want - r.start;
+  const lots = (abs(delta) + r.leg.lot / 2n) / r.leg.lot;
+  return r.start + (delta < 0n ? -lots : lots) * r.leg.lot;
 }
 
 /** The legs offset each other: together they hold what the pair's targets add up to (0 for a pair). */
