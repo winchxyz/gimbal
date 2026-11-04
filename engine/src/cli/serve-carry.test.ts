@@ -16,7 +16,7 @@ import type { ProtectedPair } from '../trade/protected-pair.ts';
 import type { HyperliquidReader } from '../venues/hyperliquid.ts';
 import type { PhoenixReader } from '../venues/phoenix.ts';
 import type { PriceDeps } from './pair-mainnet-lib.ts';
-import { PRICE_MARGIN_S, newPriceState } from './pair-mainnet-lib.ts';
+import { PRICE_MARGIN_S, newPriceState, refreshLanded } from './pair-mainnet-lib.ts';
 import { storedPrice } from './pair-ops.ts';
 import type { CarryResult, RefreshAllowance, ServePairInput } from './serve-pair.ts';
 import { SERVE_MAKER, buildLiveLegs, liveCarry } from './serve-pair.ts';
@@ -85,7 +85,7 @@ async function withVenues<T>(run: () => Promise<T>): Promise<T> {
  * off, each refresh_prices (and whether it came while planning), the size check's line and each part sent. `agedBeforePartS`
  * ages the price and the last refresh that long before the part's own check (beforePart), as a long earlier part would.
  */
-async function carryWorld(o: { closing?: boolean; refreshedAgeS?: number; refreshedPx?: number; row?: { ageS: number; px: number }; agedBeforePartS?: number } = {}) {
+async function carryWorld(o: { closing?: boolean; refreshedAgeS?: number; refreshedPx?: number; row?: { ageS: number; px: number }; agedBeforePartS?: number; refreshFails?: string } = {}) {
   const rows: { asset: string; price_e8: string; at_ms: number }[] = [];
   if (o.row !== undefined) rows.push({ asset: 'ETH', price_e8: String(Math.round(o.row.px * 1e8)), at_ms: Date.now() - o.row.ageS * 1000 });
   const timeline: string[] = [];
@@ -97,10 +97,11 @@ async function carryWorld(o: { closing?: boolean; refreshedAgeS?: number; refres
     maxAgeS: 900, send: true, read: (s) => storedPrice(client, s),
     refresh: async (s) => {
       timeline.push(`refresh ${s}${planning ? ' while planning' : ''}`);
+      if (o.refreshFails !== undefined) throw new Error(o.refreshFails);
       rows.splice(0, rows.length, { asset: s, price_e8: String(Math.round((o.refreshedPx ?? 2500) * 1e8)), at_ms: Date.now() - (o.refreshedAgeS ?? 610) * 1000 });
       return [{ chain: 'near', id: 'R', url: 'https://nearblocks.io/txns/R' }];
     },
-    now: () => Date.now(), log: () => {}, ...newPriceState(),
+    now: () => Date.now(), log: () => {}, landed: refreshLanded, ...newPriceState(),
   };
   const book = async () => ({ bids: [{ px: 2499, sz: 10 }], asks: [{ px: 2501, sz: 10 }] });
   const hl = {
@@ -182,6 +183,15 @@ test('serve\'s carry, a part whose price grew old: the refresh before it is coun
   assert.equal(r.refreshed, true);
   assert.equal(w.paid(), 2, 'the open\'s own refresh and the one before the part');
   assert.deepEqual(w.timeline, ['planning on', 'planning off', 'refresh ETH', 'size held to the cap', 'refresh ETH', 'part 1 sent']);
+});
+
+test('serve\'s carry, a refresh_prices the RPC never took: refused, not paid (no onPaidRefresh, refreshed unset)', async () => {
+  const w = await carryWorld({ refreshFails: 'near rpc: HTTP 503' });
+  const r = await w.open();
+  assert.deepEqual(r.refusals, ['the stored ETH price (missing) could not be refreshed before the open: near rpc: HTTP 503']);
+  assert.equal(r.refreshed, false);
+  assert.equal(w.paid(), 0);
+  assert.deepEqual(w.timeline, ['planning on', 'planning off', 'refresh ETH']);
 });
 
 test('serve\'s carry on a closing desk (panic_close): refused in the plan, read-only, no refresh_prices', async () => {

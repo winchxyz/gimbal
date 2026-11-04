@@ -261,11 +261,16 @@ test('an enter refused after its open paid for refresh_prices holds the window 6
   assert.equal(loop.held?.windowId, 'sol-phoenix-hyperliquid');
 
   // The same refusal with no refresh_prices paid: the usual 15-minute retry.
+  // (A refresh the RPC never took is reported so too: serve's hands set `refreshed` only for one that landed.)
   const v = world();
-  const plain = makeLoop(v);
-  v.openAnswer = () => REFUSED('open refused, nothing signed: the price moved');
+  const vStore = tmpStore();
+  const plain = makeLoop(v, vStore);
+  v.openAnswer = () => REFUSED('open refused, nothing signed: the stored SOL price (missing) could not be refreshed before the open: near rpc: HTTP 503');
   v.next = w.next;
   await plain.check();
+  const vSaved = JSON.parse(readFileSync(vStore.path, 'utf8')) as { holds?: unknown; refreshes?: unknown };
+  assert.equal(vSaved.holds, undefined, 'no hold saved');
+  assert.equal(vSaved.refreshes, undefined, 'nothing counted for the caps');
   v.now += RETRY_AFTER_MS + 60_000;
   await plain.check();
   assert.equal(v.opens.length, 2);

@@ -94,6 +94,8 @@ interface World {
   signingFails: Error | null;
   /** refresh_prices calls the contract got, and the price row it stores (none: prices() answers nothing). */
   refreshes: number;
+  /** refresh_prices throws this, when set (an RPC error before the call reached the chain). */
+  refreshFails: Error | null;
   stored: { asset: string; price_e8: string; at_ms: number } | null;
 }
 
@@ -102,7 +104,7 @@ function world(symbol = 'XLM', env: Record<string, string> = {}): World {
   return {
     dir, env: { LOCALAPPDATA: dir, XDG_STATE_HOME: dir, ...env },
     hl: new Leg('hyperliquid', symbol), px: new Leg('phoenix', symbol), openOrders: [], signed: 0, cancels: [], lines: [], refuse: [], throwAfterOrder: false, hlHeldFails: null, signingFails: null,
-    refreshes: 0, stored: null,
+    refreshes: 0, refreshFails: null, stored: null,
   };
 }
 
@@ -116,6 +118,7 @@ function side(w?: World): ContractSide {
     contractId: CONTRACT, prices: async () => (w?.stored == null ? [] : [{ ...w.stored }]),
     refreshPrices: async () => {
       if (w !== undefined) w.refreshes++;
+      if (w?.refreshFails != null) throw w.refreshFails;
       return [];
     },
   } as unknown as NearContractClient;
@@ -988,6 +991,21 @@ test('canOpen (the scanner\'s oracleRefreshAtOpen): false before the start is co
     p.stop();
   } finally {
     rmSync(a.dir, { recursive: true, force: true });
+  }
+});
+
+test('prepareOpen: a refresh_prices the RPC never took (an error before the chain) is not ok and not paid: no hold, not counted', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
+  try {
+    const p = await servePair(input(w));
+    w.refreshFails = new Error('near rpc: HTTP 503');
+    const down = await p.hands!.prepareOpen({ symbol: 'XLM' });
+    assert.deepEqual([down.ok, down.refreshed], [false, undefined]);
+    assert.equal(down.reason, 'the stored XLM price (missing) could not be refreshed: near rpc: HTTP 503');
+    assert.equal(w.refreshes, 1);
+    p.stop();
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
   }
 });
 

@@ -521,13 +521,24 @@ export async function refreshForOpen(ctx: OpsCtx, pair: Pair, plan: OpenPlan, op
   return { refused: null, paid, line, plan: again };
 }
 
-/** `d` with each refresh_prices it sends reported to `onRefresh` first (the loop's caps count them). */
+/**
+ * `d` with each refresh_prices that landed reported to `onRefresh` (it is paid for: the loop's caps count it and a
+ * refusal after it holds the window). Landed as ensureFresh judges it for lastRefreshAt: the call returned, or it threw
+ * and `d.landed` says it still went on chain. One that failed before the chain (an RPC error) paid nothing.
+ */
 export function counting(d: PriceDeps, onRefresh: () => void): PriceDeps {
   return {
     ...d,
-    refresh: (s, maxAgeS) => {
+    refresh: async (s, maxAgeS) => {
+      let tx: Awaited<ReturnType<PriceDeps['refresh']>>;
+      try {
+        tx = await d.refresh(s, maxAgeS);
+      } catch (err) {
+        if (d.landed?.(err) === true) onRefresh();
+        throw err;
+      }
       onRefresh();
-      return d.refresh(s, maxAgeS);
+      return tx;
     },
   };
 }
@@ -554,6 +565,10 @@ export async function sendOpen(
     const results = await pair.run.openInChunks({
       size: plan.size, longIndex: 1, reason, maker: { index: 0 },
       beforePart: async () => {
+        // Counted for the loop's caps. The legs' own read during a part (oraclePxOf, trading) may still refresh a
+        // price within PRICE_STALE_MARGIN_S of going stale: not counted, on purpose. It fires only when a part outlasts
+        // the margin checked here, and the price it stores lives minutes again, so it adds about one per part at
+        // most, bounded per open by its parts (an unwind or a close must never be refused for a cap).
         if (pair.priced) await ensureFresh(options.onRefresh === undefined ? ctx.prices : counting(ctx.prices, options.onRefresh), symbol, pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S);
         const gated = options.gate?.() ?? null;
         if (gated !== null) throw new Error(gated);

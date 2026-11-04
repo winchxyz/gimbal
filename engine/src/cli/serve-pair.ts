@@ -80,7 +80,7 @@ import type { Clock } from '../venues/venue.ts';
 import type { PriceDeps, StoredPrice } from './pair-mainnet-lib.ts';
 import { PRICE_MARGIN_S, ensureFresh, newPriceState, oraclePxOf, priceFitRefusal, priceLifeS, refreshLanded } from './pair-mainnet-lib.ts';
 import type { OpsCtx, PairRunner } from './pair-ops.ts';
-import { pairOf, planClose, planOpen, recheckOpenSize, refreshForOpen, sendClose, sendOpen } from './pair-ops.ts';
+import { counting, pairOf, planClose, planOpen, recheckOpenSize, refreshForOpen, sendClose, sendOpen } from './pair-ops.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { checkContractNetwork, contractEnv } from './serve-contract.ts';
 import { ConfigError, START_RETRY_MAX_MS, startBackoffMs } from './start-errors.ts';
@@ -941,13 +941,9 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           if (!oraclePriced(sym)) return result(false, `the stored ${sym} price is ${was} and refresh_prices cannot refresh it (${sym} is not one of the contract's oracle assets)`);
           if (request.noRefresh !== undefined) return result(false, `the stored ${sym} price is ${was} and needs refresh_prices: ${request.noRefresh}`);
           try {
-            const fresh = await ensureFresh({
-              ...prices,
-              refresh: (s, maxAgeS) => {
-                paid = true;
-                return prices.refresh(s, maxAgeS);
-              },
-            }, sym, marginS);
+            const fresh = await ensureFresh(counting(prices, () => {
+              paid = true;
+            }), sym, marginS);
             return result(true, `the stored ${sym} price (${was}) refreshed before the close: ${fresh.px}, ${Math.round(fresh.ageS)} s old`);
           } catch (err) {
             return result(false, `the stored ${sym} price (${was}) could not be refreshed: ${errorMessage(err)}`);

@@ -11,7 +11,7 @@ import type { LegOutcome, LegSide, MakerSettings, TradeLeg } from '../trade/legs
 import { floorToLot, toQty } from '../trade/lots.ts';
 import { PairTrader } from '../trade/pair.ts';
 import type { PriceDeps } from './pair-mainnet-lib.ts';
-import { OPEN_HEADROOM_S, PRICE_MARGIN_S, newPriceState, oraclePxOf } from './pair-mainnet-lib.ts';
+import { OPEN_HEADROOM_S, PRICE_MARGIN_S, newPriceState, oraclePxOf, refreshLanded } from './pair-mainnet-lib.ts';
 import type { OpenPlan, OpenRefresh, OpenRequest, OpsCtx, Pair } from './pair-ops.ts';
 import { MIN_ORDER_USD, capQtyAtOrder, planOpen, recheckOpenSize, refreshForOpen, sendOpen, storedPrice } from './pair-ops.ts';
 import { SERVE_MAKER } from './serve-pair.ts';
@@ -166,7 +166,7 @@ function planWorld(o: PlanWorldOptions) {
       rows.splice(0, rows.length, { asset: s, price_e8: String(Math.round((o.refreshedPx ?? 2500) * 1e8)), at_ms: Date.now() - (o.refreshedAgeS ?? 610) * 1000 });
       return [{ chain: 'near', id: 'R', url: 'https://nearblocks.io/txns/R' }];
     },
-    now: () => Date.now(), log: (l) => logs.push(l), ...newPriceState(),
+    now: () => Date.now(), log: (l) => logs.push(l), landed: refreshLanded, ...newPriceState(),
   };
   const said: string[] = [];
   const book = async () => ({ bids: [{ px: 2499 }], asks: [{ px: 2501 }] });
@@ -303,13 +303,19 @@ test('no stored price, a dry run: read-only, the missing price is a refusal, eve
   assert.deepEqual(stale.refreshes, []);
 });
 
-test('no stored price, a real open whose refresh fails: a refusal with the reason, paid, never a throw', async () => {
+test('no stored price, a real open whose refresh fails: a refusal with the reason, never a throw; paid only when it landed', async () => {
+  // The RPC failed before the chain: nothing went out, nothing paid (no 6 h hold, not counted for the caps).
   const w = planWorld({ send: true, refreshFails: 'near rpc: HTTP 503' });
   const plan = await withVenues(() => planOpen(w.ctx, w.pair, w.request));
   assert.deepEqual(plan.refusals, []);
   const fresh = await refreshForOpen(w.ctx, w.pair, plan);
   assert.equal(w.refreshes.length, 1);
-  assert.deepEqual(three(fresh), { refused: 'the stored ETH price (missing) could not be refreshed before the open: near rpc: HTTP 503', paid: true, line: null });
+  assert.deepEqual(three(fresh), { refused: 'the stored ETH price (missing) could not be refreshed before the open: near rpc: HTTP 503', paid: false, line: null });
+  // It ran on chain, then reading the outcome failed: it landed, so it is paid.
+  const ran = planWorld({ send: true, refreshFails: 'refresh_prices ran in T: prices() has no newer price' });
+  const ranPlan = await withVenues(() => planOpen(ran.ctx, ran.pair, ran.request));
+  const landed = await refreshForOpen(ran.ctx, ran.pair, ranPlan);
+  assert.deepEqual(three(landed), { refused: 'the stored ETH price (missing) could not be refreshed before the open: refresh_prices ran in T: prices() has no newer price', paid: true, line: null });
 });
 
 test('a real open already refused for anything else sends no refresh_prices: paused, closing, margin, resting, SOL, minimum, cap, IOC', async () => {
