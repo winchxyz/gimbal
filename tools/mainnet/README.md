@@ -892,12 +892,14 @@ node --env-file=... engine/src/cli/pair-mainnet.ts cancel-hl ETH <oid|cloid>  # 
   lot over the cap. `--send` prints the nearblocks link and the exact error and costs about 0.001 NEAR, plus one
   `refresh_prices` when the stored price is stale. No trader lock, no venue order, one NEAR call at a time, and it
   refuses when the key has under 0.6 NEAR (two call reserves) spendable or allowance: safe while serve runs. Exit 0
-  refused as expected, 1 refused otherwise (gas spent), 3 no proven outcome, 4 signed, 5 nothing sent.
+  refused as expected, 1 refused otherwise (gas spent), 3 no proven outcome, 4 signed, 5 `hl_order` not sent
+  (a `refresh_prices` may have gone out and spent gas).
 - The order is priced at least max(25 bps, half the band) above the best ask, read twice (the second right before
   `hl_order`). A signature the contract returns anyway (exit 4) is never forwarded, but it is public in the
   transaction. `expiresAfter` (60 s) bounds only when Hyperliquid takes it; posted in time and not crossing, a post-only
   buy rests until filled or cancelled. Then check the printed cloid with `cancel-hl` and, if it rests, stop serve,
-  run `cancel-hl <SYM> <cloid> --send`, and start serve again.
+  run `cancel-hl <SYM> <cloid> --send`, and start serve again. "Hyperliquid does not know it" in the first
+  60 s after the block can still change: check again after that.
 
 - Every Phoenix transaction is one legacy message signed by `sol_sign` (compute budget first, fee at most 600,000
   lamports; orders at the 600k unit limit and `--priority-microlamports`, default 100,000, at most 200,000). The money
