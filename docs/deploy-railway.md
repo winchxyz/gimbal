@@ -206,6 +206,13 @@ scan.
   enter; its prompt says the trade was asked by hand and the owner's minimum is waived, with no streak (an auto
   enter's prompt carries both). A refusal holds that window out for 6 h: then rotate into another one. With a pair held it closes that pair first. The route needs `auto` on and answers `409 auto is off`
   otherwise.
+- **`POST /rotate {"windowId": ..., "demo": {"maxLossUsd": <USD>}}`, an owner demo entry.** As above, and it also
+  waives the window's **profit checks** only: the owner minimum, the expected spread paying back the round trip, and
+  break-even within a year. Every other check stays. `maxLossUsd` is required, above 0 and at most 1 USD, and the
+  window's estimated round trip in USD must be known and at most `maxLossUsd`; the refusal says the number. It opens
+  from flat only (`POST /close` first). The NEAR AI risk check runs as for any manual enter, and its prompt says this
+  is an owner-requested demonstration entry with the profit checks waived and the cost the owner accepted. The
+  journal's `enter` line, the book and the risk ledger mark it as an owner demo entry (`demo: true`).
 - **`POST /close`**: both legs, reduce-only. It works with `auto` on or off and answers `409 no pair is held` when
   there is none.
 - **`PUT /strategy <the whole config>`**: every engine rule, the rescue and watch lines included (there is no
@@ -283,7 +290,7 @@ Run each step only after the previous one's result line. Every body is an exampl
 log printed. `<rules>` below stands for every field of that line, with the changes listed.
 
 1. **Demo rules** (`PUT /strategy`): `auto` true, `minNetAprPct` 1000 (the loop then enters nothing under 1000 % net
-   by itself, which in practice is nothing; a `/rotate` skips this minimum), `rotate.minGainPts` 1000 (no rotation by itself), `exitAfterChecks` 24, and
+   by itself, which in practice is nothing; step 2's `/rotate` with `demo` waives it), `rotate.minGainPts` 1000 (no rotation by itself), `exitAfterChecks` 24, and
    `legUsd` the size you want. With `auto` true and this minimum the held pair counts as compressed at every hourly
    check, so the loop exits it by itself after 24 hourly checks: finish the demo within a day. The drawdown and time
    stops still act. Without the high minimum, the check a `PUT` runs at once could enter the top window by itself
@@ -295,17 +302,23 @@ log printed. `<rules>` below stands for every field of that line, with the chang
 
    Wait for `control: done: PUT /strategy answered 200`. Keep its `engine rules before the call` line: it holds your
    own rules for step 6.
-2. **Enter** (`POST /rotate`). Pick the window and a backup from the scan lines or the Windows view first. Wait for
-   `journal   enter: enter <window id>, ...` (or `error` / `refused`). A `veto` / `refused ... NEAR AI risk check`
-   line means the model refused that window (held out for 6 h): send the same step with the backup window and a new
-   run-id.
+2. **Enter** (`POST /rotate` with `demo`). Pick the window and a backup from the scan lines or the Windows view
+   first. The body carries `"demo":{"maxLossUsd":0.25}`: under the step 1 rules every window fails its profit checks
+   (nothing earns 1000 % net), so a plain `/rotate` is refused with `fails a check`. The demo flag waives those profit
+   checks only; the safety checks (tradable, not stale, not refused, the risk check, the policy, the size) all stay.
+   `maxLossUsd` is the most the round trip may cost, at most 1 USD; a 12 USD ZEC Orderly/Hyperliquid leg costs about
+   0.04 USD. Wait for `journal   enter: enter <window id>, ...; owner demo entry: ...` (or `error` / `refused`). A
+   `veto` / `refused ... NEAR AI risk check` line means the model refused that window: send the same step with the
+   backup window. **Every attempt needs a new run-id**, a refused one included: a used run-id never runs again.
 
    ```
-   '{"id":"demo-enter","method":"POST","path":"/rotate","until":"2026-11-06T18:00:00Z","body":{"windowId":"eth-phoenix-hyperliquid"}}' | railway variable set GIMBAL_CONTROL --stdin
-   '{"id":"demo-enter-2","method":"POST","path":"/rotate","until":"2026-11-06T18:00:00Z","body":{"windowId":"sol-phoenix-hyperliquid"}}' | railway variable set GIMBAL_CONTROL --stdin
+   '{"id":"demo-enter","method":"POST","path":"/rotate","until":"2026-11-06T18:00:00Z","body":{"windowId":"eth-phoenix-hyperliquid","demo":{"maxLossUsd":0.25}}}' | railway variable set GIMBAL_CONTROL --stdin
+   '{"id":"demo-enter-2","method":"POST","path":"/rotate","until":"2026-11-06T18:00:00Z","body":{"windowId":"sol-phoenix-hyperliquid","demo":{"maxLossUsd":0.25}}}' | railway variable set GIMBAL_CONTROL --stdin
    ```
 
-   (the second line only after a refusal of the first).
+   (the second line only after a refusal of the first). The held demo pair then counts as compressed at every hourly
+   check under the 1000 % minimum and the loop exits it by itself at the 24th hourly check in a row, about a day
+   after the entry (no rotation: nothing gains 1000 points); the drawdown and time stops still act.
 
 3. **Raise the rescue line** (`PUT /strategy`, the step 1 rules with the new `risk`), once the legs are far enough
    apart and the reserve covers the rescue (above). For a 12 USD Hyperliquid short that reads 30.7 % live, with the

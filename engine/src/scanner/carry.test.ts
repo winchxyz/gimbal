@@ -59,9 +59,9 @@ test('the gate: a 14-day spread that a weaker 7 days undercut fails; the spread 
   near(doge.expectedUsd, 0.028);
   assert.equal(doge.ok, false);
   assert.deepEqual(carryChecks(doge), [
-    { ok: false, text: 'Over a 10-day hold (assumed: the engine rules set none), the 7-day spread of 5.11 % APR (the smaller of the 7- and 14-day means) '
+    { ok: false, kind: 'profit', text: 'Over a 10-day hold (assumed: the engine rules set none), the 7-day spread of 5.11 % APR (the smaller of the 7- and 14-day means) '
       + `pays $0.03 at $20.00 a leg, no more than the ${RT_TEXT}: it takes 17.9 days to pay it back` },
-    { ok: true, text: 'Listed on the 7-day spread: this hour pays -1.21 % APR in this direction' },
+    { ok: true, kind: 'profit', text: 'Listed on the 7-day spread: this hour pays -1.21 % APR in this direction' },
   ]);
 
   // 12 % over 7 days and 10.95 % over 14: judged on 10.95 %, 0.06 USD over the hold, 0.01 USD net of the round trip,
@@ -73,7 +73,7 @@ test('the gate: a 14-day spread that a weaker 7 days undercut fails; the spread 
   near(steady.netAprPct, 1.825);
   assert.equal(steady.ok, true);
   assert.deepEqual(carryChecks(steady)[0], {
-    ok: true,
+    ok: true, kind: 'profit',
     text: 'Over a 10-day hold (assumed: the engine rules set none), the 14-day spread of 10.95 % APR (the smaller of the 7- and 14-day means) '
       + `pays $0.06 at $20.00 a leg, more than the ${RT_TEXT}: it nets 1.82 % APR over the hold, at least your 1 % minimum, `
       + 'and pays the round trip back in 8.3 days',
@@ -82,7 +82,7 @@ test('the gate: a 14-day spread that a weaker 7 days undercut fails; the spread 
   const under = estimate(12, 10.95, false, 5);
   assert.equal(under.ok, false);
   assert.deepEqual(carryChecks(under)[0], {
-    ok: false,
+    ok: false, kind: 'profit',
     text: 'Over a 10-day hold (assumed: the engine rules set none), the 14-day spread of 10.95 % APR (the smaller of the 7- and 14-day means) '
       + `pays $0.06 at $20.00 a leg, more than the ${RT_TEXT}, but it nets only 1.82 % APR over the hold, under your 5 % minimum`,
   });
@@ -101,15 +101,15 @@ test('the gate fails while the week before loads, when the 7 and 14 days disagre
   assert.equal(loading.ok, false);
   assert.equal(loading.netUsd, null);
   assert.deepEqual(carryChecks(loading), [
-    { ok: false, text: `14-day history loading: the 7-day spread of 12.00 % APR is in, the week before it is still being read; the gate waits for both, against a ${RT_TEXT}` },
-    { ok: true, text: 'Listed on the 7-day spread: this hour pays -1.21 % APR in this direction' },
+    { ok: false, kind: 'profit', text: `14-day history loading: the 7-day spread of 12.00 % APR is in, the week before it is still being read; the gate waits for both, against a ${RT_TEXT}` },
+    { ok: true, kind: 'profit', text: 'Listed on the 7-day spread: this hour pays -1.21 % APR in this direction' },
   ]);
 
   const mixed = estimate(5.11, -2, false);
   assert.equal(mixed.state, 'mixed');
   assert.equal(mixed.ok, false);
   assert.deepEqual(carryChecks(mixed), [
-    { ok: false, text: 'The 7-day spread (5.11 % APR) and the 14-day spread (-2.00 % APR) point opposite ways: no steady carry in this direction' },
+    { ok: false, kind: 'profit', text: 'The 7-day spread (5.11 % APR) and the 14-day spread (-2.00 % APR) point opposite ways: no steady carry in this direction' },
   ]);
 
   const none = estimate(null, null, true, 0, 30);
@@ -118,6 +118,8 @@ test('the gate fails while the week before loads, when the 7 and 14 days disagre
   assert.equal(none.breakevenDays, null);
   assert.match(carryChecks(none)[0]!.text, /^No 7-day funding history on both legs yet: the spread expected over a 10-day hold/);
   assert.equal(carryChecks(none)[0]!.ok, false);
+  // Every carry line is a profit check: an owner demo entry waives them (strategy/loop.ts), nothing else does.
+  for (const e of [loading, mixed, none]) assert.ok(carryChecks(e).every((c) => c.kind === 'profit'));
 });
 
 test('labels: the hold in days or hours; money with the sign first and four decimals under a cent', () => {

@@ -331,6 +331,7 @@ export function loopHands(
       const legs = hands.pairSymbols === undefined ? {} : { long: r.window.longVenue as VenueId, short: r.window.shortVenue as VenueId };
       const h = await hands.open({
         symbol: r.symbol, ...legs, legUsd: r.legUsd, leverage: r.leverage, reason: r.reason, qty: r.qty, gate, ...(r.noRefresh === undefined ? {} : { noRefresh: r.noRefresh }),
+        ...(r.demo === undefined ? {} : { demo: r.demo }),
       });
       // What filled, not what was asked (a later part the gate stopped holds nothing): the journal and the held size.
       return { ...outcome(h), filledQty: openedQty(h.results) };
@@ -386,17 +387,18 @@ export function windowSymbol(
 }
 
 /**
- * decide()'s and the veto's facts: every window's 14-day gross and legs' open interest from the scanner's carry; and,
- * for the enterable windows serve could trade (at most MAX_LOT_WINDOWS), each leg's lot (Market.lotSize) and the mid
- * pair-mainnet sizes on (the mean of both venues' best bid and ask). A venue that does not answer leaves its windows
- * without lots: decide() does not enter them.
+ * decide()'s and the veto's facts: every window's 14-day gross, legs' open interest and round trip in USD (the one its
+ * profit checks print) from the scanner's carry; and, for the enterable windows serve could trade (at most
+ * MAX_LOT_WINDOWS) and the windows named in `lotsFor` (an owner demo entry's target, whose profit checks fail), each
+ * leg's lot (Market.lotSize) and the mid pair-mainnet sizes on (the mean of both venues' best bid and ask). A venue
+ * that does not answer leaves its windows without lots: decide() does not enter them.
  */
 export function windowFacts(p: {
   carry: (windowId: string) => WindowCarry | null; venues: readonly VenueReader[]; symbols: () => readonly string[]; clock: Clock;
   log: (line: string) => void;
   /** GIMBAL_ORDERLY_PAIRS=1: windowSymbol's pairs (any two venues; lots and mid on the window's own two). */
   pairs?: (long: VenueId, short: VenueId) => readonly string[];
-}): (windows: readonly FundingWindow[]) => Promise<WindowFacts> {
+}): (windows: readonly FundingWindow[], lotsFor?: readonly string[]) => Promise<WindowFacts> {
   const markets = new Map<string, { at: number; bySymbol: Map<string, Market> }>();
   const mids = new Map<string, { at: number; px: number | null }>();
   const reader = (id: string) => p.venues.find((v) => v.id === id);
@@ -437,23 +439,28 @@ export function windowFacts(p: {
     mids.set(key, { at: now, px: mid });
     return mid;
   };
-  return async (windows) => {
+  return async (windows, lotsFor = []) => {
     const gross14dAprPct: Record<string, number | null> = {};
     const openInterest: Record<string, { longUsd: number | null; shortUsd: number | null }> = {};
+    const roundTripUsd: Record<string, number> = {};
     for (const w of windows) {
       const c = p.carry(w.id);
       if (c === null) continue;
       gross14dAprPct[w.id] = c.estimate.gross.d14AprPct;
       openInterest[w.id] = { longUsd: c.long.oiUsd, shortUsd: c.short.oiUsd };
+      // A carry without a priced round trip leaves the window out: a demo entry is then refused, its cost not known.
+      const rt = (c.estimate.roundTrip as WindowCarry['estimate']['roundTrip'] | undefined)?.totalUsd;
+      if (rt !== undefined && Number.isFinite(rt)) roundTripUsd[w.id] = rt;
     }
     const lots: NonNullable<WindowFacts['lots']> = {};
     const symbols = p.symbols();
-    const candidates = windows
-      .filter((w) => isEnterable(w))
+    const tradable = (list: readonly FundingWindow[]) => list
       .map((w) => ({ w, s: windowSymbol(w, symbols, p.pairs) }))
-      .filter((x): x is { w: FundingWindow; s: { symbol: string } } => 'symbol' in x.s)
-      .sort((a, b) => b.w.netAprPct - a.w.netAprPct)
-      .slice(0, MAX_LOT_WINDOWS);
+      .filter((x): x is { w: FundingWindow; s: { symbol: string } } => 'symbol' in x.s);
+    const top = tradable(windows.filter((w) => isEnterable(w))).sort((a, b) => b.w.netAprPct - a.w.netAprPct).slice(0, MAX_LOT_WINDOWS);
+    // Asked for by name (a demo entry's target): read past the cap, it is one window.
+    const named = tradable(windows.filter((w) => lotsFor.includes(w.id) && !top.some((x) => x.w.id === w.id)));
+    const candidates = [...top, ...named];
     if (candidates.length > 0) {
       // Each window's own two venues (Hyperliquid and Phoenix only, without Orderly pairs), read once each.
       const need = PAIR_VENUES.filter((v) => candidates.some(({ w }) => w.longVenue === v || w.shortVenue === v));
@@ -471,7 +478,7 @@ export function windowFacts(p: {
         lots[w.id] = { longLot: long.lotSize, shortLot: short.lotSize, px };
       }
     }
-    return { gross14dAprPct, openInterest, lots };
+    return { gross14dAprPct, openInterest, roundTripUsd, lots };
   };
 }
 

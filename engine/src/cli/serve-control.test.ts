@@ -37,10 +37,11 @@ function reader(id: 'hyperliquid' | 'phoenix', ratePerHour: number): VenueReader
 // The engine's real server, with fake hands behind /rotate and /close that count what reaches them.
 let server: EngineServer;
 let port: number;
-const hands = { rotates: [] as unknown[], closes: 0 };
+const hands = { rotates: [] as unknown[], demos: [] as unknown[], closes: 0 };
 const fakeLoop: StrategyHands = {
-  rotate: (windowId) => {
+  rotate: (windowId, demo) => {
     hands.rotates.push(windowId);
+    hands.demos.push(demo);
     return { ok: true };
   },
   close: () => {
@@ -161,6 +162,25 @@ test('/rotate waits for the engine (first scan, pair, loop check), then calls th
   assert.equal(second.status, 'marker');
   assert.deepEqual(hands.rotates, [WINDOW]);
   assert.match(again.lines[0]!, /^control: run enter-1 has a marker \(.*\), so nothing runs: done at .*, POST \/rotate answered 200 \{"ok":true\}; unset GIMBAL_CONTROL$/);
+});
+
+test('/rotate with demo: the body goes to the route as given (the route and the loop check it), shown on the log and kept in the marker', async (t) => {
+  const dir = tempDir(t);
+  hands.rotates.length = 0;
+  hands.demos.length = 0;
+  const value = JSON.stringify({ id: 'demo-1', method: 'POST', path: '/rotate', body: { windowId: WINDOW, demo: { maxLossUsd: 0.25 } } });
+  const { d, lines } = deps(dir, value);
+  const result = await runControl(d);
+  assert.deepEqual(result, { status: 'done', answer: { status: 200, body: { ok: true } } });
+  assert.deepEqual(hands.rotates, [WINDOW]);
+  assert.deepEqual(hands.demos, [{ maxLossUsd: 0.25 }], 'the route passed demo to the loop');
+  assert.ok(lines.some((l) => l.startsWith(`control: run demo-1: POST /rotate {"windowId":"${WINDOW}","demo":{"maxLossUsd":0.25}}; no marker at `)));
+  const marker = JSON.parse(readFileSync(controlMarker(dir, 'demo-1'), 'utf8'));
+  assert.deepEqual(marker.body, { windowId: WINDOW, demo: { maxLossUsd: 0.25 } });
+  // Without demo the route calls the loop with the window id alone, as before.
+  const plain = await runControl(deps(dir, rotate('plain-1')).d);
+  assert.equal(plain.status, 'done');
+  assert.deepEqual(hands.demos, [{ maxLossUsd: 0.25 }, undefined]);
 });
 
 test('the route\'s own refusal is its answer: kept in the marker as done, with the status and the reason', async (t) => {

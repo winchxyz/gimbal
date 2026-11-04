@@ -6,11 +6,11 @@
 //
 // Units: APR in percentage points a year on one leg's notional (as costs.ts); money in USD at `legUsd` a leg.
 
-import type { Window as FundingWindow } from '@gimbal/shared';
 import type { BookLevel } from '../venues/venue.ts';
 import { HOURS_PER_YEAR, basisCostUsd, legSlippage, takerFeesUsd } from './costs.ts';
 import type { LegSlippage } from './costs.ts';
 import { usd } from './price.ts';
+import type { WindowCheck } from './price.ts';
 
 /** What one round trip of a desk window costs, USD at `legUsd`: everything paid once whatever the hold. */
 export interface RoundTrip {
@@ -189,49 +189,50 @@ const minimum = (n: number) => `${Number.isInteger(n) ? n : n.toFixed(2)} %`;
  * The window's check lines for its expected carry: the gate (fails without a multi-day figure, while the older week
  * loads, when the 7 and 14 days disagree in sign, when the spread over the hold does not pay the round trip, or when
  * what it nets over the hold is under the owner's minimum), and a note when the current hour points the other way.
+ * Every line is a profit check (WindowCheck.kind): an owner demo entry waives them, and nothing else.
  */
-export function carryChecks(e: CarryEstimate): FundingWindow['checks'] {
+export function carryChecks(e: CarryEstimate): WindowCheck[] {
   const hold = `a ${holdLabel(e.holdHours)} hold (assumed: the engine rules set none)`;
   const rt = e.roundTrip;
   const parts = `4 fills ${money(rt.feesUsd)}, slippage ${money(rt.slippageUsd)}, basis buffer ${money(rt.basisBufferUsd)}; ${rt.bps.toFixed(1)} bps`;
   const against = `against a ${money(rt.totalUsd)} round trip (${parts})`;
   const { d7AprPct: d7, d14AprPct: d14, nowAprPct: now } = e.gross;
   if (e.state === 'none') {
-    return [{ ok: false, text: `No 7-day funding history on both legs yet: the spread expected over ${hold} is not known, ${against}` }];
+    return [{ ok: false, kind: 'profit', text: `No 7-day funding history on both legs yet: the spread expected over ${hold} is not known, ${against}` }];
   }
   if (e.state === 'loading') {
-    const out: FundingWindow['checks'] = [{
-      ok: false,
+    const out: WindowCheck[] = [{
+      ok: false, kind: 'profit',
       text: `14-day history loading: the 7-day spread of ${pct(d7!)} APR is in, the week before it is still being read; the gate waits for both, ${against}`,
     }];
-    if (d7! > 0 && !(now > 0)) out.push({ ok: true, text: `Listed on the 7-day spread: this hour pays ${pct(now)} APR in this direction` });
+    if (d7! > 0 && !(now > 0)) out.push({ ok: true, kind: 'profit', text: `Listed on the 7-day spread: this hour pays ${pct(now)} APR in this direction` });
     return out;
   }
   if (e.state === 'mixed') {
-    return [{ ok: false, text: `The 7-day spread (${pct(d7!)} APR) and the 14-day spread (${pct(d14!)} APR) point opposite ways: no steady carry in this direction` }];
+    return [{ ok: false, kind: 'profit', text: `The 7-day spread (${pct(d7!)} APR) and the 14-day spread (${pct(d14!)} APR) point opposite ways: no steady carry in this direction` }];
   }
   const label = e.basis === '14d' ? '14-day' : '7-day';
   const which = d14 === null ? `no 14-day mean: ${e.noFortnightWhy ?? 'it could not be had'}` : 'the smaller of the 7- and 14-day means';
   const head = `Over ${hold}, the ${label} spread of ${pct(e.expectedAprPct!)} APR (${which}) pays ${money(e.expectedUsd!)} at ${usd(e.legUsd)} a leg`;
   const nets = `${pct(e.netAprPct!)} APR over the hold`;
-  const out: FundingWindow['checks'] = [];
+  const out: WindowCheck[] = [];
   if (e.ok) {
     out.push({
-      ok: true,
+      ok: true, kind: 'profit',
       text: `${head}, more than the ${money(rt.totalUsd)} round trip (${parts}): it nets ${nets}, at least your ${minimum(e.minNetAprPct)} minimum, `
         + `and pays the round trip back in ${e.breakevenDays!.toFixed(1)} days`,
     });
   } else if (e.netUsd! > 0) {
     out.push({
-      ok: false,
+      ok: false, kind: 'profit',
       text: `${head}, more than the ${money(rt.totalUsd)} round trip (${parts}), but it nets only ${nets}, under your ${minimum(e.minNetAprPct)} minimum`,
     });
   } else {
     const even = e.breakevenDays === null ? 'it never pays it back' : `it takes ${e.breakevenDays.toFixed(1)} days to pay it back`;
-    out.push({ ok: false, text: `${head}, no more than the ${money(rt.totalUsd)} round trip (${parts}): ${even}` });
+    out.push({ ok: false, kind: 'profit', text: `${head}, no more than the ${money(rt.totalUsd)} round trip (${parts}): ${even}` });
   }
   if (e.expectedAprPct! > 0 && !(now > 0)) {
-    out.push({ ok: true, text: `Listed on the ${label} spread: this hour pays ${pct(now)} APR in this direction` });
+    out.push({ ok: true, kind: 'profit', text: `Listed on the ${label} spread: this hour pays ${pct(now)} APR in this direction` });
   }
   return out;
 }

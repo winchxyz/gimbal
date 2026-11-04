@@ -7,8 +7,10 @@
 //
 //   GIMBAL_CONTROL={"id":"<run-id>","method":"POST","path":"/rotate","body":{"windowId":"<window id>"},"until":"<ISO time>"}
 //
-// Allowed: POST /rotate {windowId}, POST /close (no body), PUT /strategy <the whole StrategyConfig> (the engine
-// rules, the risk lines strategy.risk.watchDistancePct and rescueDistancePct among them). Anything else is refused.
+// Allowed: POST /rotate {windowId} or {windowId, demo: {maxLossUsd}} (an owner demo entry: the route and the strategy
+// loop check `demo`, this passes the body through as given), POST /close (no body), PUT /strategy <the whole
+// StrategyConfig> (the engine rules, the risk lines strategy.risk.watchDistancePct and rescueDistancePct among them).
+// Anything else is refused.
 // `until` (optional): past that time the run is refused, with no marker, so a variable left set never acts on a
 // later deploy (a new volume has no marker to stop it).
 //

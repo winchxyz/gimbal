@@ -123,9 +123,12 @@ export interface EngineServerOptions {
   keepJournal?: (entry: JournalEntry) => void;
 }
 
-/** What POST /rotate and /close call: they answer at once, whether the act was started or why not. */
+/**
+ * What POST /rotate and /close call: they answer at once, whether the act was started or why not. `demo`: POST
+ * /rotate's demo as sent (an owner demo entry, checked by the loop: strategy/loop.ts parseDemo); absent when not sent.
+ */
 export interface StrategyHands {
-  rotate(windowId: unknown): { ok: true } | { ok: false; reason: string };
+  rotate(windowId: unknown, demo?: unknown): { ok: true } | { ok: false; reason: string };
   close(): { ok: true } | { ok: false; reason: string };
 }
 
@@ -488,14 +491,17 @@ export class EngineServer {
       const loop = this.#options.strategyLoop;
       if (loop === undefined) return json(res, 503, { ok: false, reason: 'no strategy loop in this engine: nothing is entered or closed here' });
       let answer: { ok: true } | { ok: false; reason: string };
+      let route = path === '/rotate' ? 'POST /rotate' : 'POST /close';
       if (path === '/rotate') {
         const windowId = body !== null && typeof body === 'object' ? (body as { windowId?: unknown }).windowId : undefined;
         if (typeof windowId !== 'string' || windowId.trim() === '') return json(res, 400, { ok: false, reason: 'POST /rotate needs { "windowId": "<window id>" }' });
-        answer = loop.rotate(windowId);
+        const demo = (body as { demo?: unknown }).demo;
+        answer = demo === undefined ? loop.rotate(windowId) : loop.rotate(windowId, demo);
+        route = demo === undefined ? 'POST /rotate' : `POST /rotate (owner demo entry ${JSON.stringify(demo)})`;
       } else {
         answer = loop.close();
       }
-      this.#log(`${path === '/rotate' ? 'POST /rotate' : 'POST /close'}: ${answer.ok ? 'started' : `refused, ${answer.reason}`}`);
+      this.#log(`${route}: ${answer.ok ? 'started' : `refused, ${answer.reason}`}`);
       return json(res, answer.ok ? 200 : 409, answer);
     }
     if (path === '/stress') {

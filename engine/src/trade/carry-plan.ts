@@ -15,6 +15,9 @@
 // The open is refused when the spread does not cover the round trip (or a book cannot price it: one side empty, or
 // too thin to fill legUsd within the levels read), a leg's distance is 40 % or less, the asked leverage is over
 // MAX_LEVERAGE, or a leg's effective leverage is over the asked leverage or its venue's cap (venueMaxLeverage).
+// An owner demo entry (`demo`, the strategy loop's POST /rotate with demo) waives the first of these only, the spread
+// not covering a round trip that was priced, and is refused instead when that round trip is over its maxLossUsd; a
+// book that cannot price it is refused as before.
 //
 // Every fill is priced as a taker fill, though serve's opens and closes put the Hyperliquid leg first as a post-only
 // order (maker fee, no spread crossed): its partner is hedged only once it fills, after the price came to it, so the
@@ -72,6 +75,8 @@ export interface CarryInput {
   basisBufferBps: number;
   short: CarryLegInput;
   long: CarryLegInput;
+  /** An owner demo entry: the spread need not cover the round trip, which must be at most maxLossUsd. Absent: none. */
+  demo?: { maxLossUsd: number };
 }
 
 export interface CarryLegPlan {
@@ -100,6 +105,8 @@ export interface CarryPlan {
    * cannot price it. The strategy loop holds such a window out until its next hourly check; null: none.
    */
   costRefusal: string | null;
+  /** The refusal for cost an owner demo entry waived (the spread does not cover the round trip); null: none waived. */
+  waived: string | null;
 }
 
 export function carryPlan(input: CarryInput): CarryPlan {
@@ -125,6 +132,7 @@ export function carryPlan(input: CarryInput): CarryPlan {
   const legs: [CarryLegPlan, CarryLegPlan] = [leg(short, 'short'), leg(long, 'long')];
   const refusals: string[] = [];
   let costRefusal: string | null = null;
+  let waived: string | null = null;
   // A fee that is not known (the caller's fee read failed) prices nothing: refused, and not for cost (the window's
   // spread was never judged).
   const unknownFee = ([short, long] as const).filter((l) => !(Number.isFinite(l.feeBps) && l.feeBps >= 0));
@@ -137,9 +145,17 @@ export function carryPlan(input: CarryInput): CarryPlan {
     const thin = ([[long, priced.long], [short, priced.short]] as const).filter(([, f]) => f.exhausted);
     if (thin.length > 0) {
       costRefusal = `${thin.map(([l, f]) => `the ${l.venue} book fills only ${usd(f.filledUsd)} of ${usd(legUsd)} within the levels read`).join('; ')}: the round trip cannot be priced`;
-    } else if (!(expectedSpreadUsd > rt.totalUsd)) {
-      costRefusal = `the expected spread over ${input.holdDays} days, ${usd(expectedSpreadUsd)}, does not cover the round trip ${usd(rt.totalUsd)} `
-        + `(${rt.bps.toFixed(1)} bps: 4 fills ${usd(rt.feesUsd)}, slippage ${usd(rt.slippageUsd)}, basis buffer ${usd(rt.basisBufferUsd)})`;
+    } else {
+      if (!(expectedSpreadUsd > rt.totalUsd)) {
+        const line = `the expected spread over ${input.holdDays} days, ${usd(expectedSpreadUsd)}, does not cover the round trip ${usd(rt.totalUsd)} `
+          + `(${rt.bps.toFixed(1)} bps: 4 fills ${usd(rt.feesUsd)}, slippage ${usd(rt.slippageUsd)}, basis buffer ${usd(rt.basisBufferUsd)})`;
+        if (input.demo === undefined) costRefusal = line;
+        else waived = line;
+      }
+      // The demo's bound, on this open's own books: what the owner accepted to pay is never exceeded by the estimate.
+      if (input.demo !== undefined && !(rt.totalUsd <= input.demo.maxLossUsd)) {
+        refusals.push(`owner demo entry: the round trip ${usd(rt.totalUsd)} on this open's books is over the ${usd(input.demo.maxLossUsd)} the owner accepted (maxLossUsd)`);
+      }
     }
   }
   if (costRefusal !== null) refusals.push(costRefusal);
@@ -157,7 +173,7 @@ export function carryPlan(input: CarryInput): CarryPlan {
   const roundTrip = priced.ok && unknownFee.length === 0 ? priced.roundTrip : null;
   return {
     netPerHourNow, netPerHour7d, grossAprNow: netPerHourNow * HOURS_PER_YEAR, grossApr7d: netPerHour7d * HOURS_PER_YEAR,
-    expectedSpreadUsd, roundTrip, roundTripBps: roundTrip?.bps ?? NaN, roundTripUsd: roundTrip?.totalUsd ?? NaN, legs, refusals, costRefusal,
+    expectedSpreadUsd, roundTrip, roundTripBps: roundTrip?.bps ?? NaN, roundTripUsd: roundTrip?.totalUsd ?? NaN, legs, refusals, costRefusal, waived,
   };
 }
 

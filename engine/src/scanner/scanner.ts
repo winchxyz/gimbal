@@ -49,7 +49,7 @@ import {
 import type { DropReason, LegKind, Pair, ScanLeg } from './pairs.ts';
 import { filterLegs, heldLegKeys, pairLegs, toLeg } from './pairs.ts';
 import type { BookRead, CostBreakdown, OracleSource, PricedWindow, PricingContext } from './price.ts';
-import { NO_BREAKEVEN_TEXT, isEnterable, priceWindow, switchCostUsd } from './price.ts';
+import { NO_BREAKEVEN_TEXT, isEnterable, priceWindow, profitCheck, switchCostUsd } from './price.ts';
 import { WatchQuality } from './quality.ts';
 
 export interface HeldWindow {
@@ -524,7 +524,7 @@ export class Scanner {
         w.checks = w.checks.filter((c) => c.text !== NO_BREAKEVEN_TEXT);
         if (hours === null || hours > HOURS_PER_YEAR) {
           const label = estimate.basis === '14d' ? '14-day' : '7-day';
-          w.checks.push({ ok: false, text: `Does not break even within a year on its ${label} spread` });
+          w.checks.push(profitCheck(`Does not break even within a year on its ${label} spread`));
         }
         w.breakevenHours = hours === null ? HOURS_PER_YEAR : round(Math.min(hours, HOURS_PER_YEAR), 1);
       }

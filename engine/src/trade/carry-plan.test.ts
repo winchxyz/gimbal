@@ -111,6 +111,32 @@ test('refused for cost when a book cannot price the round trip: one side empty, 
   assert.match(shallow.costRefusal!, /^the hyperliquid book fills only \$4\.9995 of \$15\.0000 within the levels read: the round trip cannot be priced$/);
 });
 
+test('an owner demo entry: the spread not covering the round trip is waived and said; a round trip over maxLossUsd and every other refusal stand', () => {
+  // XLM as refused for cost above (0.0397 USD round trip): with demo it is waived, nothing refused.
+  const xlm: CarryInput = {
+    symbol: 'XLM', legUsd: 11.44, leverage: 1.5, holdDays: 7, basisBufferBps: 10,
+    short: { ...base.short, ratePerHour: 0.178 / 8760, rate7dPerHour: 0.178 / 8760, feeBps: 5.5, book: book(1, 2.35) },
+    long: { ...base.long, ratePerHour: 0, rate7dPerHour: 0, feeBps: 3.5, book: book(1, 1) },
+  };
+  const demo = carryPlan({ ...xlm, demo: { maxLossUsd: 0.25 } });
+  assert.equal(demo.costRefusal, null);
+  assert.match(demo.waived!, /^the expected spread over 7 days, \$0\.0391, does not cover the round trip \$0\.0397/);
+  assert.deepEqual(demo.refusals, []);
+  assert.equal(carryPlan(xlm).waived, null, 'without demo nothing is waived');
+  // The round trip over what the owner accepted: refused, with both numbers; not a refusal for cost (no hold-out).
+  const over = carryPlan({ ...xlm, demo: { maxLossUsd: 0.03 } });
+  assert.deepEqual(over.refusals, ['owner demo entry: the round trip $0.0397 on this open\'s books is over the $0.0300 the owner accepted (maxLossUsd)']);
+  assert.equal(over.costRefusal, null);
+  // A book that cannot price it, margin and liquidation: refused as without demo.
+  const empty = carryPlan({ ...xlm, demo: { maxLossUsd: 0.25 }, long: { ...xlm.long, book: { bids: [], asks: [{ px: 1, sz: 1 }] } } });
+  assert.equal(empty.costRefusal, 'the phoenix book has no two-sided touch: the round trip cannot be priced');
+  assert.equal(empty.waived, null);
+  const tight = carryPlan({ ...base, holdDays: 1, demo: { maxLossUsd: 0.25 }, long: { ...base.long, equityUsd: 6 } });
+  assert.notEqual(tight.waived, null);
+  assert.equal(tight.refusals.length, 2);
+  assert.match(tight.refusals.join(' | '), /1\.5x cap .* \| .*liquidated 38\.00 % away/);
+});
+
 test('the 7-day mean weights each print by its hours; half spread in bps of the mid', () => {
   assert.equal(meanRatePerHour([]), null);
   near(meanRatePerHour([{ ratePerHour: 0.0001, periodHours: 1 }, { ratePerHour: 0.0004, periodHours: 3 }])!, 0.000325, 1e-15);
