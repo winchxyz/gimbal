@@ -1,5 +1,5 @@
 {
-  "note": "Hyperliquid metaAndAssetCtxs, Phoenix exchange/markets and Orderly public/info as recorded on mainnet, cut to the fields and symbols set-policy.mjs reads",
+  "note": "Hyperliquid metaAndAssetCtxs, Phoenix exchange/markets and Orderly public/info (min_notional read 2026-11-05) as recorded on mainnet, cut to the fields and symbols set-policy.mjs reads",
   "recorded": "2026-11-04",
   "hl": [
     {"index":0,"name":"BTC","szDecimals":5,"markPx":"80510.0"},
@@ -29,17 +29,17 @@
     {"symbol":"BTC","marketPubkey":"AXFz1MuzMUBHi5UKJuK3FDCQ73o3rSzubGU2mPr4LLU7","baseLotsDecimals":4,"tickSize":100,"marketStatus":"active"}
   ],
   "orderly": [
-    {"symbol":"PERP_1000PEPE_USDC","base_tick":100,"price_range":0.03,"status":"ACTIVE"},
-    {"symbol":"PERP_AAVE_USDC","base_tick":0.01,"price_range":0.03,"status":"ACTIVE"},
-    {"symbol":"PERP_BTC_USDC","base_tick":0.00001,"price_range":0.0094,"status":"ACTIVE"},
-    {"symbol":"PERP_DOGE_USDC","base_tick":1,"price_range":0.0191,"status":"ACTIVE"},
-    {"symbol":"PERP_ETHFI_USDC","base_tick":0.1,"price_range":0.03,"status":"ACTIVE"},
-    {"symbol":"PERP_ETH_USDC","base_tick":0.0001,"price_range":0.0094,"status":"ACTIVE"},
-    {"symbol":"PERP_HYPE_USDC","base_tick":0.01,"price_range":0.03,"status":"ACTIVE"},
-    {"symbol":"PERP_LTC_USDC","base_tick":0.01,"price_range":0.03,"status":"ACTIVE"},
-    {"symbol":"PERP_SOL_USDC","base_tick":0.01,"price_range":0.0094,"status":"ACTIVE"},
-    {"symbol":"PERP_XLM_USDC_mythos","base_tick":1,"price_range":0.05,"status":"ACTIVE"},
-    {"symbol":"PERP_ZEC_USDC","base_tick":0.01,"price_range":0.03,"status":"ACTIVE"},
-    {"symbol":"PERP_ZRO_USDC","base_tick":0.1,"price_range":0.03,"status":"ACTIVE"}
+    {"symbol":"PERP_1000PEPE_USDC","base_tick":100,"price_range":0.03,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_AAVE_USDC","base_tick":0.01,"price_range":0.03,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_BTC_USDC","base_tick":0.00001,"price_range":0.0094,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_DOGE_USDC","base_tick":1,"price_range":0.0191,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_ETHFI_USDC","base_tick":0.1,"price_range":0.03,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_ETH_USDC","base_tick":0.0001,"price_range":0.0094,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_HYPE_USDC","base_tick":0.01,"price_range":0.03,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_LTC_USDC","base_tick":0.01,"price_range":0.03,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_SOL_USDC","base_tick":0.01,"price_range":0.0094,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_XLM_USDC_mythos","base_tick":1,"price_range":0.05,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_ZEC_USDC","base_tick":0.01,"price_range":0.03,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_ZRO_USDC","base_tick":0.1,"price_range":0.03,"status":"ACTIVE","min_notional":10}
   ]
 }

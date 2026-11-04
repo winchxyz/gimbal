@@ -1298,39 +1298,54 @@ desk's policy with `get_desk` (never from a file) and appends, for each symbol:
 - `unpriced`: `max_sz` = `--usd` / Hyperliquid's live mark, rounded down to the coarsest lot of the venues the symbol
   is added on (Hyperliquid szDecimals, Orderly `base_tick`, Phoenix base lot).
 
-`--unpriced-cap-usd N` sets `unpriced_max_notional_usd`. The tool never removes or changes an existing entry. It
-refuses an oracle asset (BTC, DOGE, ETH, LTC, SOL, XLM, ZEC: those are priced), a symbol that is not on Hyperliquid
-plus at least one of the other venues asked for, a k- or 1000-prefixed name (one unit is 1000 tokens on some venues),
-a list over 32 entries, and a result the contract's `validate_for` or the live venue data would refuse.
+`--unpriced-cap-usd N` sets `unpriced_max_notional_usd`; without it the cap stays as it is. The tool never removes or
+changes an existing entry. It refuses an oracle asset (BTC, DOGE, ETH, LTC, SOL, XLM, ZEC: those are priced), a
+symbol that is not on Hyperliquid plus at least one of the other venues asked for, a k- or 1000-prefixed name (one
+unit is 1000 tokens on some venues), a list over 32 entries, and a result the contract's `validate_for` or the live
+venue data would refuse.
 
-**The trade-off.** Orders on these symbols get no oracle price band. The contract caps each one by its `max_sz` in
-base units and by min(`max_notional_usd`, `unpriced_max_notional_usd`) USD at the order's own price. A bad order
-(a stolen operator key, an engine bug) can still trade at any price the venue accepts, so the worst loss per order is
-bounded by `max_sz` and the venue's own price limits (Orderly takes prices within `price_range` of its mark, 3 % for
-these symbols). The dry run prints that bound per symbol.
+**The trade-off.** Orders on these symbols get no oracle price band, on any venue. The contract caps each one by its
+`max_sz` in base units and by min(`max_notional_usd`, `unpriced_max_notional_usd`) USD at the order's own price. A
+bad order (a stolen operator key, an engine bug) can still trade at any price the venue accepts, so the worst loss
+per order is bounded by `max_sz` and the venue's own price limits. Hyperliquid accepts limit prices far from its
+mark, so on the Hyperliquid leg that bound is about the full `max_sz` worth (about 15 USD at `--usd 15`). Orderly
+takes prices within `price_range` of its mark (3 % for these symbols), so there it is about 0.45 USD. The dry run
+prints both per symbol.
+
+**Keep the unpriced cap at `max_notional_usd`.** Closes are held to the same USD cap. With `--usd 15` and a cap of
+15, a close after a price rise is split, and its tail can fall under the venues' 10 USD minimum order: a remainder
+the engine cannot close. With `--usd 15` leave out `--unpriced-cap-usd`, so the cap stays at `max_notional_usd`
+(20). The dry run warns when the cap is under 1.3 x a symbol's `max_sz` worth.
 
 Dry run first (public reads only; it works in a worktree):
 
 ```
-node tools/mainnet/set-policy.mjs <contract> <desk_id> --add-unpriced ZRO,ETHFI,AAVE --venues hl,orderly --usd 15 --unpriced-cap-usd 15
+node tools/mainnet/set-policy.mjs <contract> <desk_id> --add-unpriced ZRO,ETHFI,AAVE --venues hl,orderly --usd 15
 ```
 
 It prints the live policy's sha256 (the contract's `policy_sha256` form), every added field, `max_sz` per symbol
 with the mark and the USD it is worth, the full `set_policy` args, the signer (the desk's owner), the deposit (the
 storage the larger policy adds plus 500 bytes of margin; the contract keeps what the storage took and refunds the
-rest), the gas, and what changes for the engine. Then, from the main checkout:
+rest), the gas, what changes for the engine, and the new policy's sha256. Review it, then send that plan from the
+main checkout with the sha256 it printed:
 
 ```
-node tools/mainnet/set-policy.mjs <contract> <desk_id> --add-unpriced ZRO,ETHFI,AAVE --venues hl,orderly --usd 15 --unpriced-cap-usd 15 --key-file <owner key json> --send
+node tools/mainnet/set-policy.mjs <contract> <desk_id> --add-unpriced ZRO,ETHFI,AAVE --venues hl,orderly --usd 15 --key-file <owner key json> --send --expect-sha256 <new policy sha256 from the dry run>
 ```
 
+`--send` plans again from fresh marks and signs only when that plan's sha256 is `--expect-sha256`. When the marks
+or the live policy moved in between (another `max_sz`), it refuses: run the dry run again and send with its sha256.
 It signs one `set_policy` with the owner's full-access key, waits for final, prints the transaction link and the
 `policy_set` event, reads `get_desk` again and checks the policy on chain is exactly the planned one.
 
 After it:
 
-- **Restart serve.** The scanner reads the policy's symbol list at start: `railway redeploy`, or Redeploy in the
-  Railway dashboard.
+- **Restart serve.** Nothing changes for the engine until then: the scanner reads the policy's symbol list at start
+  (`railway redeploy`, or Redeploy in the Railway dashboard). A symbol added on Hyperliquid and Orderly only is
+  traded only with `GIMBAL_ORDERLY_PAIRS=1` set on Railway.
+- **legUsd must fit.** The strategy's `legUsd` must be at least the venues' 10 USD minimum order and at most
+  min(`max_sz` worth, cap / (1 + `price_band_bps` / 10^4)); otherwise every window on the symbol is refused. The dry
+  run prints that range per symbol (about 10 to 14.9 USD for `--usd 15` with the cap at 20).
 - **Never remove a symbol while a position on it is open.** The contract refuses every order on a symbol missing
   from the venue's list, reduce-only closes included (`E_ASSET`), so the position could not be closed through the
   desk. Close it first; a removal is a separate, reviewed change (this tool has none).

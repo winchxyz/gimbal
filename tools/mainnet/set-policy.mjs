@@ -2,7 +2,7 @@
 // Edits a live desk's policy by appending to it (tools/mainnet/README.md, "Allowing a token without an oracle price"):
 //
 //   node tools/mainnet/set-policy.mjs <contract> <desk_id> [--add-unpriced SYM[,SYM...] --venues hl,orderly|hl,phoenix
-//     --usd <cap per symbol>] [--unpriced-cap-usd N] [--key-file <owner key json>] [--send]
+//     --usd <cap per symbol>] [--unpriced-cap-usd N] [--send --key-file <owner key json> --expect-sha256 <sha256>]
 //
 // The live policy is read with get_desk, never from a file. --add-unpriced appends, for each symbol: its Hyperliquid
 // perp (index and szDecimals from Hyperliquid's live meta), PERP_<SYM>_USDC when Orderly lists it and the Phoenix
@@ -14,7 +14,8 @@
 // Default: a dry run. It prints the live policy's sha256, every added field, max_sz with the mark and USD it is worth,
 // the full set_policy args, the signer, the deposit and the gas, and what changes for the engine. --send reads the
 // owner's key file, only then, checks it is a full-access key of the desk's owner, refuses in a linked git worktree,
-// signs one set_policy, waits for final and reads get_desk after: the new policy must be the planned one exactly.
+// and plans again from fresh marks: it signs only when that plan's sha256 is the --expect-sha256 the reviewed dry run
+// printed. It signs one set_policy, waits for final and reads get_desk after: the new policy must be the planned one.
 
 import { createHash } from 'node:crypto';
 import { UsageError, isMain, parseFlags, run } from './cli.mjs';
@@ -29,11 +30,12 @@ import {
 import { FINAL_SYMBOLS, HL_API, ORDERLY_API, livePolicyProblems, phoenixUnits, policyShapeProblems, readLive } from './venues.mjs';
 
 const USAGE = `usage: node tools/mainnet/set-policy.mjs <contract> <desk_id> [--add-unpriced SYM[,SYM...] --venues hl,orderly|hl,phoenix --usd <cap per symbol>]
-         [--unpriced-cap-usd N] [--key-file <owner key json>] [--send]
+         [--unpriced-cap-usd N] [--send --key-file <owner key json> --expect-sha256 <new policy sha256 from the dry run>]
   default: dry run (reads the live policy and public venue data, prints the set_policy call; no key needed)
   the tool only appends: it never removes or changes an existing entry of the policy`;
 const SPEC = {
-  '--add-unpriced': 'value', '--venues': 'value', '--usd': 'value', '--unpriced-cap-usd': 'value', '--key-file': 'value', '--send': 'switch',
+  '--add-unpriced': 'value', '--venues': 'value', '--usd': 'value', '--unpriced-cap-usd': 'value', '--expect-sha256': 'value', '--key-file': 'value',
+  '--send': 'switch',
   // Named only to refuse them with the reason (parsed as switches so the refusal comes before anything else).
   '--remove': 'switch', '--remove-unpriced': 'switch',
 };
@@ -159,9 +161,14 @@ export function parseSetPolicyArgs(argv) {
     unpricedCap = Number(t);
   }
   if (!adding && unpricedCap === null) throw new UsageError('nothing to change: give --add-unpriced and/or --unpriced-cap-usd');
+  const expectSha = values['--expect-sha256'] ?? null;
+  if (expectSha !== null && !/^[0-9a-f]{64}$/.test(expectSha)) throw new UsageError('--expect-sha256 is not 64 lowercase hex characters');
   const send = values['--send'] === true;
   if (send && values['--key-file'] === undefined) throw new UsageError('--send needs --key-file: only the desk owner can set its policy');
-  return { contract, deskId, symbols, venues, usdE6, unpricedCap, keyFile: values['--key-file'] ?? null, send };
+  if (send && expectSha === null) {
+    throw new UsageError('--send needs --expect-sha256 <the new policy sha256 the dry run printed>: it signs only the plan that was reviewed');
+  }
+  return { contract, deskId, symbols, venues, usdE6, unpricedCap, expectSha, keyFile: values['--key-file'] ?? null, send };
 }
 
 // --- the policy ---
@@ -303,6 +310,7 @@ export function planPolicy(policy, a, market) {
     let orderly = null;
     let phoenix = null;
     let priceRange = null;
+    let orderlyMin = null;
     if (a.venues.includes('orderly')) {
       const sym = `PERP_${s}_USDC`;
       const row = market.orderly.get(sym);
@@ -311,6 +319,7 @@ export function planPolicy(policy, a, market) {
           lots.push({ venue: 'Orderly', lotE8: numberE8(row.base_tick, `${sym} base_tick`), why: `base_tick ${row.base_tick}` });
           orderly = sym;
           priceRange = typeof row.price_range === 'number' ? row.price_range : null;
+          orderlyMin = typeof row.min_notional === 'number' ? row.min_notional : null;
         } catch (e) {
           problems.push(e.message);
           continue;
@@ -349,7 +358,7 @@ export function planPolicy(policy, a, market) {
     if (phoenix !== null) add.phoenix_markets.push(phoenix);
     if (orderly !== null) add.orderly_symbols.push(orderly);
     add.unpriced.push({ symbol: s, max_sz: e8Text(sz) });
-    rows.push({ symbol: s, markPx: ctx.markPx, markE8, lots, lotE8, maxSzE8: sz, worthE6: worthE6(sz, markE8), missing, priceRange, orderly, phoenix });
+    rows.push({ symbol: s, markPx: ctx.markPx, markE8, lots, lotE8, maxSzE8: sz, worthE6: worthE6(sz, markE8), missing, priceRange, orderlyMin, orderly, phoenix });
   }
 
   // A JSON copy keeps the live field order (the contract's), so the new policy hashes as the contract will.
@@ -368,6 +377,37 @@ export function planPolicy(policy, a, market) {
   }
   if (problems.length > 0) throw new Error(`the policy change is refused, nothing was signed:\n  ${problems.join('\n  ')}`);
   return { next, add, rows };
+}
+
+/** Hyperliquid refuses an order under 10 USD (engine/src/cli/pair-ops.ts MIN_ORDER_USD); Orderly's min_notional is 10 too. */
+export const MIN_ORDER_USD = 10;
+/** Below this multiple of a symbol's max_sz worth, the unpriced cap is too tight for closes after a price rise. */
+export const CLOSE_CAP_MULTIPLE = 1.3;
+
+/**
+ * The legUsd the engine can trade a planned symbol at (engine/src/scanner/price.ts deskVerdict): at least every venue's
+ * minimum order, at most the max_sz worth at the mark and the cap at the band's edge, cap / (1 + price_band_bps / 1e4).
+ * Returns { lo, hi, capAtBand } in USD; lo > hi means none.
+ */
+export function legUsdRange(row, policy) {
+  const cap = Math.min(policy.max_notional_usd, policy.unpriced_max_notional_usd);
+  const capAtBand = cap / (1 + policy.price_band_bps / 1e4);
+  const lo = Math.max(MIN_ORDER_USD, row.orderly === null ? 0 : row.orderlyMin ?? MIN_ORDER_USD);
+  const hi = Math.min(Number(row.worthE6) / 1e6, capAtBand);
+  return { lo, hi, capAtBand };
+}
+
+/**
+ * A warning when the unpriced cap is under CLOSE_CAP_MULTIPLE x a symbol's max_sz worth, else null. Closes are valued
+ * against the same USD cap: after a price rise a close of the whole position is split, and its tail can fall under
+ * the venues' 10 USD minimum, leaving a remainder the engine cannot close.
+ */
+export function closeCapWarning(rows, cap) {
+  const tight = rows.filter((r) => cap < (CLOSE_CAP_MULTIPLE * Number(r.worthE6)) / 1e6);
+  if (tight.length === 0) return null;
+  return `the unpriced cap per order, ${cap} USD, is under ${CLOSE_CAP_MULTIPLE} x the max_sz worth of ${tight.map((r) => `${r.symbol} (${usd2(r.worthE6)})`).join(', ')}: `
+    + `closes are held to the same cap, so after a price rise a close is split and its tail can fall under the ${MIN_ORDER_USD} USD venue minimum `
+    + '(a remainder that cannot be closed). Keep unpriced_max_notional_usd at max_notional_usd: leave out --unpriced-cap-usd';
 }
 
 // --- live data ---
@@ -407,7 +447,7 @@ export async function readMarket({ fetch: fetchImpl = (...a) => globalThis.fetch
   if (!Array.isArray(meta?.universe) || !Array.isArray(ctxs)) throw new Error('hyperliquid metaAndAssetCtxs: no universe and contexts');
   const marks = new Map();
   meta.universe.forEach((a, index) => marks.set(a.name, { index, markPx: ctxs[index]?.markPx }));
-  const orderly = new Map(info.data.rows.map((r) => [r.symbol, { base_tick: r.base_tick, price_range: r.price_range, status: r.status }]));
+  const orderly = new Map(info.data.rows.map((r) => [r.symbol, { base_tick: r.base_tick, price_range: r.price_range, min_notional: r.min_notional, status: r.status }]));
   return { live, marks, orderly };
 }
 
@@ -479,6 +519,7 @@ export async function runSetPolicy(argv, deps = {}) {
   say(`          ${summary(before)}`);
   for (const u of before.unpriced) say(`          unpriced already: ${u.symbol} max_sz ${u.max_sz}`);
 
+  // Fresh marks every run: --send never signs a plan other than the one a dry run printed (--expect-sha256 below).
   const market = await readMarket({ fetch: deps.fetch });
   say(`venues    read live: Hyperliquid meta and marks, Orderly public/info, Phoenix markets (${new Date(now()).toISOString()})`);
   const plan = planPolicy(before, a, market);
@@ -501,10 +542,19 @@ export async function runSetPolicy(argv, deps = {}) {
       say(`note      --usd ${usdcText(a.usdE6)} is over the unpriced cap per order, min(max_notional_usd, unpriced_max_notional_usd) = ${cap} USD: that cap decides`);
     }
   }
+  const tight = closeCapWarning(plan.rows, cap);
+  if (tight !== null) say(`warning   ${tight}`);
   say();
   say(`new       ${summary(next)}`);
   const nextSha = policyOrderProblem(next) === null ? policySha256(next) : null;
-  say(`          policy sha256 ${nextSha ?? 'not computed'} (the policy_set event must show it)`);
+  say(`          policy sha256 ${nextSha ?? 'not computed'} (the policy_set event must show it; --send needs it as --expect-sha256)`);
+  if (a.expectSha !== null) {
+    if (nextSha !== a.expectSha) {
+      throw new Error(`the planned policy's sha256 is ${nextSha ?? 'not computable'}, not the --expect-sha256 ${a.expectSha}: the live policy or the venues' `
+        + 'marks or lists changed since that dry run. Run the dry run again, review it, and send with the sha256 it prints');
+    }
+    say(`          matches --expect-sha256: this is the plan the dry run printed`);
+  }
 
   // Deposit and gas.
   const growth = policyBorshBytes(next) - policyBorshBytes(before);
@@ -544,14 +594,30 @@ export async function runSetPolicy(argv, deps = {}) {
 
   const added = plan.rows.map((r) => r.symbol);
   say();
-  say(`engine    restart serve once this is final: the scanner reads the policy's symbol list at start (railway redeploy, or Redeploy in the Railway dashboard)`);
+  say('engine    nothing changes for the engine until serve restarts once this is final: the scanner reads the policy\'s symbol list at');
+  say('          start (railway redeploy, or Redeploy in the Railway dashboard)');
+  const orderlyOnly = plan.rows.filter((r) => r.orderly !== null && r.phoenix === null).map((r) => r.symbol);
+  if (orderlyOnly.length > 0) {
+    say(`          ${orderlyOnly.join(', ')} pair Hyperliquid with Orderly only: serve trades them only with GIMBAL_ORDERLY_PAIRS=1 set on`);
+    say('          Railway; without it this change does nothing for them');
+  }
   if (added.length > 0) {
-    say(`risk      ${added.join(', ')} have no oracle price: the contract checks no price band on their orders. Each order is capped by its max_sz in`);
-    say(`          base units and by min(max_notional_usd, unpriced_max_notional_usd) = ${cap} USD at the order's own price. The worst loss per bad`);
-    say('          order is bounded by max_sz and the venue\'s own price limits:');
+    say(`          the strategy's legUsd must fit each symbol: venue minimum <= legUsd <= min(max_sz worth, cap / (1 + price_band_bps / 10^4))`);
     for (const r of plan.rows) {
-      const edge = r.priceRange === null ? '' : `; Orderly takes prices within ${(r.priceRange * 100).toFixed(1)} % of its mark: about ${usd2((r.worthE6 * BigInt(Math.round(r.priceRange * 1e6))) / 1_000_000n)} USD at that edge`;
-      say(`            ${r.symbol}: ${e8Text(r.maxSzE8)} ${r.symbol} is worth ${usd2(r.worthE6)} USD now${edge}`);
+      const g = legUsdRange(r, next);
+      // The bounds printed inward (the minimum up, the maxima down), so every legUsd in the printed range fits.
+      const up = (x) => (Math.ceil(x * 100 - 1e-9) / 100).toFixed(2);
+      const down = (x) => (Math.floor(x * 100 + 1e-9) / 100).toFixed(2);
+      say(`            ${r.symbol.padEnd(6)} ${g.lo > g.hi ? `no workable legUsd: the minimum ${up(g.lo)} USD is over ${down(g.hi)} USD` : `legUsd ${up(g.lo)} to ${down(g.hi)} USD`}`
+        + ` (minimum ${up(g.lo)}, max_sz worth ${usd2(r.worthE6)}, cap ${cap} / ${(1 + next.price_band_bps / 1e4).toFixed(4)} = ${down(g.capAtBand)})`);
+    }
+    say(`risk      ${added.join(', ')} have no oracle price: the contract checks no price band on their orders, on any venue. Each order is`);
+    say(`          capped by its max_sz in base units and by min(max_notional_usd, unpriced_max_notional_usd) = ${cap} USD at the order's own`);
+    say('          price. The worst loss per bad order (a stolen operator key, an engine bug) is bounded by max_sz and the venue\'s own');
+    say('          price limits. Hyperliquid accepts limit prices far from its mark, so there it is about the full max_sz worth:');
+    for (const r of plan.rows) {
+      const edge = r.priceRange === null ? '' : `; on Orderly, which takes prices within ${(r.priceRange * 100).toFixed(1)} % of its mark, about ${usd2((r.worthE6 * BigInt(Math.round(r.priceRange * 1e6))) / 1_000_000n)} USD`;
+      say(`            ${r.symbol}: ${e8Text(r.maxSzE8)} ${r.symbol} is worth ${usd2(r.worthE6)} USD now: on Hyperliquid up to about ${usd2(r.worthE6)} USD per order${edge}`);
     }
     say('          never remove one of them while a position on it is open: the contract refuses every order on a symbol missing from');
     say('          the venue list, reduce-only closes included (E_ASSET). After a large price move, set a new max_sz (a separate');
@@ -569,12 +635,13 @@ export async function runSetPolicy(argv, deps = {}) {
         `live:     sha256 ${liveSha ?? 'not computed'}; ${summary(before)}`,
         `adds:     ${addedText}; unpriced_max_notional_usd ${before.unpriced_max_notional_usd} -> ${next.unpriced_max_notional_usd}`,
         `new:      sha256 ${nextSha ?? 'not computed'}; deposit ${nearText(deposit)} NEAR, gas at most ${tgasText(gasCap.total)} TGas`,
+        ...(tight === null ? [] : [`warning:  ${tight}`]),
         ...(short === null ? [] : [`refused:  ${short}`]),
       ],
     });
     say();
     say(block.join('\n'));
-    say('\ndry run: nothing was signed or sent. Add --send and --key-file <owner key json>, from the main checkout, to send it.');
+    say(`\ndry run: nothing was signed or sent. To send this plan, from the main checkout, add --send --key-file <owner key json> --expect-sha256 ${nextSha ?? '<not computable: refused>'}`);
     if (short !== null) throw new Error(short);
     return block;
   }
@@ -599,7 +666,7 @@ export async function runSetPolicy(argv, deps = {}) {
   else if (afterSha !== null && event.data.policy_sha256 !== afterSha) problems.push(`policy_set says sha256 ${event.data.policy_sha256}, get_desk's policy hashes to ${afterSha}`);
   lines.push(`after:    sha256 ${afterSha ?? 'none'}; ${after?.policy === undefined ? 'no policy' : summary(after.policy)}`);
   lines.push(problems.length === 0 ? `check:    get_desk holds exactly the planned additions (${addedText})` : `check:    FAILED ${problems.join('; ')}`);
-  lines.push('next:     restart serve (railway redeploy, or Redeploy in the Railway dashboard)');
+  lines.push('next:     restart serve (railway redeploy, or Redeploy in the Railway dashboard); Hyperliquid + Orderly symbols need GIMBAL_ORDERLY_PAIRS=1 there');
   const block = summaryBlock('set-policy', { at: at(), lines });
   say();
   say(block.join('\n'));

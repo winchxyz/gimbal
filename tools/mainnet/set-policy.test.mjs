@@ -6,10 +6,11 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { UsageError } from './cli.mjs';
 import {
-  ORACLE_ASSETS, SET_POLICY_TGAS, addSymbolProblem, additionProblems, argsText, decimalE8, e8Text, isCanonicalDecimal, maxSzE8, numberE8,
+  ORACLE_ASSETS, SET_POLICY_TGAS, addSymbolProblem, additionProblems, argsText, closeCapWarning, decimalE8, e8Text, isCanonicalDecimal, legUsdRange,
+  maxSzE8, numberE8,
   parseSetPolicyArgs, planPolicy, policyBorshBytes, policyOrderProblem, policySha256, readMarket, runSetPolicy, storageDeposit, validateForProblems,
 } from './set-policy.mjs';
-import { MAINNET_ORDERLY_BROKER } from './venues.mjs';
+import { MAINNET_ORDERLY_BROKER, livePolicyProblems } from './venues.mjs';
 
 const read = (rel) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8');
 const VENUES = JSON.parse(read('./fixtures/set-policy-venues.json'));
@@ -171,7 +172,7 @@ test('refused: any removal or change of what is there (the tool only appends)', 
 
 test('the arguments: what is required, what is refused', () => {
   const a = parseSetPolicyArgs(['gimbal_dex.near', 'carry', '--add-unpriced', 'ZRO,ETHFI,AAVE', '--venues', 'hl,orderly', '--usd', '15', '--unpriced-cap-usd', '15']);
-  assert.deepEqual(a, { contract: 'gimbal_dex.near', deskId: 'carry', symbols: ['ZRO', 'ETHFI', 'AAVE'], venues: ['hl', 'orderly'], usdE6: 15_000_000n, unpricedCap: 15, keyFile: null, send: false });
+  assert.deepEqual(a, { contract: 'gimbal_dex.near', deskId: 'carry', symbols: ['ZRO', 'ETHFI', 'AAVE'], venues: ['hl', 'orderly'], usdE6: 15_000_000n, unpricedCap: 15, expectSha: null, keyFile: null, send: false });
   assert.equal(parseSetPolicyArgs(['gimbal_dex.near', 'carry', '--unpriced-cap-usd', '10']).unpricedCap, 10);
   const usage = (argv, re) => assert.throws(() => parseSetPolicyArgs(argv), (e) => e instanceof UsageError && re.test(e.message));
   usage(['gimbal_dex.near', 'carry'], /nothing to change/);
@@ -335,6 +336,58 @@ function world(o = {}) {
 }
 
 const FIRST_USE = [CONTRACT, 'carry', '--add-unpriced', 'ZRO,ETHFI,AAVE', '--venues', 'hl,orderly', '--usd', '15', '--unpriced-cap-usd', '15'];
+const PLANNED_SHA = policySha256(planPolicy(LIVE_POLICY, args(), MARKET).next);
+/** The README's command: the unpriced cap stays at max_notional_usd (20). */
+const RECOMMENDED = [CONTRACT, 'carry', '--add-unpriced', 'ZRO,ETHFI,AAVE', '--venues', 'hl,orderly', '--usd', '15'];
+
+test('legUsd range and the close-cap warning', () => {
+  const { next, rows } = planPolicy(LIVE_POLICY, args({ unpricedCap: null }), MARKET);
+  const zro = legUsdRange(rows[0], next);
+  assert.equal(zro.lo, 10);
+  assert.equal(zro.hi.toFixed(2), '14.95');               // 8.2 ZRO x 1.8228, under 20 / 1.01
+  assert.equal(zro.capAtBand.toFixed(2), '19.80');
+  const capped = planPolicy(LIVE_POLICY, args(), MARKET);
+  assert.equal(legUsdRange(capped.rows[0], capped.next).hi.toFixed(2), '14.85');  // 15 / 1.01
+  assert.equal(closeCapWarning(rows, 20), null);           // 20 >= 1.3 x 14.95
+  assert.match(closeCapWarning(capped.rows, 15), /15 USD, is under 1\.3 x the max_sz worth of ZRO \(14\.94\), ETHFI \(14\.97\), AAVE \(14\.60\)/);
+  // A cap under the venue minimum leaves no workable legUsd.
+  const tiny = planPolicy(LIVE_POLICY, args({ unpricedCap: 8 }), MARKET);
+  const g = legUsdRange(tiny.rows[0], tiny.next);
+  assert.ok(g.lo > g.hi);
+});
+
+test('the README command: no warning, the cap unchanged, the engine lines', async () => {
+  const w = world();
+  const block = await runSetPolicy(RECOMMENDED, w.deps);
+  const out = w.seen.out;
+  assert.ok(!out.includes('warning   the unpriced cap'));
+  assert.ok(!out.includes('~ unpriced_max_notional_usd'));
+  assert.match(block.join('\n'), /unpriced_max_notional_usd 20 -> 20/);
+  assert.match(out, /nothing changes for the engine until serve restarts/);
+  assert.match(out, /ZRO, ETHFI, AAVE pair Hyperliquid with Orderly only: serve trades them only with GIMBAL_ORDERLY_PAIRS=1 set on/);
+  assert.match(out, /ZRO {4}legUsd 10\.00 to 14\.94 USD \(minimum 10\.00, max_sz worth 14\.94, cap 20 \/ 1\.0100 = 19\.80\)/);
+  assert.match(out, /on Hyperliquid up to about 14\.94 USD per order; on Orderly, which takes prices within 3\.0 % of its mark, about 0\.44 USD/);
+  const sha = policySha256(planPolicy(LIVE_POLICY, args({ unpricedCap: null }), MARKET).next);
+  assert.ok(out.includes(`add --send --key-file <owner key json> --expect-sha256 ${sha}`));
+});
+
+test('--send signs only the plan the dry run printed (--expect-sha256)', async () => {
+  assert.throws(() => parseSetPolicyArgs([...FIRST_USE, '--key-file', 'k.json', '--send']), (e) => e instanceof UsageError && /--send needs --expect-sha256/.test(e.message));
+  assert.throws(() => parseSetPolicyArgs([...FIRST_USE, '--expect-sha256', 'ABC']), (e) => e instanceof UsageError && /64 lowercase hex/.test(e.message));
+  // The marks moved since the dry run: another max_sz, another sha256, nothing read or signed.
+  const moved = clone(VENUES);
+  moved.hl.find((a) => a.name === 'ZRO').markPx = '1.7';
+  const w = world();
+  w.deps.fetch = venueFetch(moved);
+  await assert.rejects(runSetPolicy([...FIRST_USE, '--key-file', 'k.json', '--send', '--expect-sha256', PLANNED_SHA], w.deps),
+    /not the --expect-sha256 [0-9a-f]{64}: the live policy or the venues' marks or lists changed since that dry run\. Run the dry run again/);
+  assert.equal(w.seen.keys, 0);
+  assert.equal(w.seen.sent.length, 0);
+  // A dry run given the sha256 says it matches.
+  const d = world();
+  await runSetPolicy([...FIRST_USE, '--expect-sha256', PLANNED_SHA], d.deps);
+  assert.match(d.seen.out, /matches --expect-sha256: this is the plan the dry run printed/);
+});
 
 test('dry run: live sha256, the diff, max_sz with mark and USD, the args, signer, deposit, gas, engine and risk; nothing signed', async () => {
   const w = world();
@@ -350,12 +403,14 @@ test('dry run: live sha256, the diff, max_sz with mark and USD, the args, signer
   assert.match(out, /signer    owner\.near/);
   assert.match(out, /FunctionCall set_policy {2}gas 50 TGas {2}deposit 0\.007 NEAR/);
   assert.match(out, /deposit   0\.007 NEAR: the policy grows by 140 bytes/);
-  assert.match(out, /restart serve once this is final: the scanner reads the policy's symbol list at start \(railway redeploy/);
+  assert.match(out, /start \(railway redeploy, or Redeploy in the Railway dashboard\)/);
+  assert.match(out, /warning   the unpriced cap per order, 15 USD, is under 1\.3 x the max_sz worth of ZRO/);
+  assert.match(block.join('\n'), /warning: +the unpriced cap per order, 15 USD/);
   assert.match(out, /no oracle price: the contract checks no price band/);
   assert.match(out, /reduce-only closes included \(E_ASSET\)/);
   assert.match(out, /dry run: nothing was signed or sent/);
   const planned = planPolicy(LIVE_POLICY, args(), MARKET).next;
-  assert.match(out, new RegExp(`policy sha256 ${policySha256(planned)} \\(the policy_set event must show it\\)`));
+  assert.match(out, new RegExp(`policy sha256 ${policySha256(planned)} \\(the policy_set event must show it; --send needs it as --expect-sha256\\)`));
   // The full args, once on the action line and once one entry per line.
   assert.ok(out.includes(`args ${JSON.stringify({ desk_id: 'carry', policy: planned })}`));
   assert.ok(out.includes(argsText({ desk_id: 'carry', policy: planned })));
@@ -369,7 +424,7 @@ test('dry run: live sha256, the diff, max_sz with mark and USD, the args, signer
 
 test('--send: one set_policy from the owner, the policy_set event, get_desk holds exactly the planned additions', async () => {
   const w = world();
-  const block = await runSetPolicy([...FIRST_USE, '--key-file', '<owner key json>', '--send'], w.deps);
+  const block = await runSetPolicy([...FIRST_USE, '--key-file', '<owner key json>', '--send', '--expect-sha256', PLANNED_SHA], w.deps);
   assert.equal(w.seen.keys, 1);
   assert.equal(w.seen.sent.length, 1);
   const [tx] = w.seen.sent;
@@ -390,11 +445,11 @@ test('--send: one set_policy from the owner, the policy_set event, get_desk hold
 
 test('--send: a policy on chain that is not the planned one fails loudly', async () => {
   const w = world({ store: (p) => ({ ...p, unpriced: p.unpriced.slice(0, 2) }) });
-  await assert.rejects(runSetPolicy([...FIRST_USE, '--key-file', 'k.json', '--send'], w.deps), /not the planned one[\s\S]*unpriced/);
+  await assert.rejects(runSetPolicy([...FIRST_USE, '--key-file', 'k.json', '--send', '--expect-sha256', PLANNED_SHA], w.deps), /not the planned one[\s\S]*unpriced/);
 });
 
 test('--send is refused: in a linked worktree, with a key that is not full access, when the owner cannot pay', async () => {
-  const send = [...FIRST_USE, '--key-file', 'k.json', '--send'];
+  const send = [...FIRST_USE, '--key-file', 'k.json', '--send', '--expect-sha256', PLANNED_SHA];
   const tree = world({ tree: '/checkout/wt' });
   await assert.rejects(runSetPolicy(send, tree.deps), /linked git worktree: --send runs from the main checkout only/);
   assert.equal(tree.seen.sent.length, 0);
@@ -408,9 +463,20 @@ test('--send is refused: in a linked worktree, with a key that is not full acces
   await assert.rejects(runSetPolicy(FIRST_USE, old.deps), /code has no set_policy/);
 });
 
+test('livePolicyProblems checks a name listed twice against its active market, as buildPolicy and the plan pick it', () => {
+  const p = planPolicy(LIVE_POLICY, args({ symbols: ['ZRO'], venues: ['hl', 'phoenix'] }), MARKET).next;
+  const live = clone({ hl: MARKET.live.hl, phoenix: MARKET.live.phoenix, orderly: MARKET.live.orderly });
+  live.hl.unshift({ index: 999, symbol: 'ZRO', szDecimals: 0, delisted: true });
+  live.phoenix.unshift({ symbol: 'ZRO', orderbook: '11111111111111111111111111111111', baseLotsDecimals: 0, tickSize: 1, active: false });
+  assert.deepEqual(livePolicyProblems(p, live), []);
+  // Only the delisted one: still refused.
+  live.hl = live.hl.filter((a) => a.symbol !== 'ZRO' || a.delisted);
+  assert.match(livePolicyProblems(p, live).join(), /hl_assets ZRO: index 46, Hyperliquid says 999[\s\S]*delisted/);
+});
+
 test('a refused plan stops before any transaction is built', async () => {
   const w = world();
-  await assert.rejects(runSetPolicy([CONTRACT, 'carry', '--add-unpriced', 'SOL', '--venues', 'hl,orderly', '--usd', '15', '--key-file', 'k.json', '--send'], w.deps), /SOL has an oracle price/);
+  await assert.rejects(runSetPolicy([CONTRACT, 'carry', '--add-unpriced', 'SOL', '--venues', 'hl,orderly', '--usd', '15', '--key-file', 'k.json', '--send', '--expect-sha256', PLANNED_SHA], w.deps), /SOL has an oracle price/);
   assert.equal(w.seen.keys, 0);
   assert.equal(w.seen.sent.length, 0);
 });
