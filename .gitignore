@@ -9,3 +9,4 @@ target/
 .DS_Store
 submission*.json
 .claude/settings.local.json
+.cache/
