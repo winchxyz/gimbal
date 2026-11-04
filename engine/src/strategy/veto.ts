@@ -62,7 +62,15 @@ export interface VetoFacts {
   legUsd: number;
   leverage: number;
   legs: [VetoLeg, VetoLeg];
+  /**
+   * The owner asked for this act by hand (POST /rotate): it skips the minimum and the streak, so the prompt says the
+   * minimum is waived and leaves the streak out, rather than show a minimum the act was never held to. Absent: auto.
+   */
+  manual?: boolean;
 }
+
+/** What a manual act's prompt says in place of the owner's minimum. */
+export const MANUAL_MINIMUM = 'waived: the owner asked for this trade';
 
 /** The most reasons kept from a reply, and the longest. */
 const MAX_REASONS = 3;
@@ -87,8 +95,14 @@ const r2 = (n: number | null) => (n === null ? null : Math.round(n * 100) / 100)
 
 /** The messages that ask for a verdict on `facts`: deterministic, so a recording is found again by them. */
 export function vetoMessages(facts: VetoFacts): ChatMessage[] {
+  const trade = facts.kind === 'enter' ? 'open a new pair' : 'rotate the held pair into this one';
+  // An auto act's prompt is unchanged (recorded replies are found by it); a manual one says the minimum is waived and
+  // carries no streak (the owner's ask skips both).
+  const gate = facts.manual === true
+    ? { manual: true, owner_minimum_net_apr_pct: MANUAL_MINIMUM }
+    : { owner_minimum_net_apr_pct: r2(facts.minNetAprPct), hours_in_a_row_above_minimum: facts.hoursAbove };
   const f = {
-    trade: facts.kind === 'enter' ? 'open a new pair' : 'rotate the held pair into this one',
+    trade: facts.manual === true ? `${trade} (asked by the owner by hand)` : trade,
     asset: facts.symbol,
     long_venue: facts.longVenue,
     short_venue: facts.shortVenue,
@@ -96,8 +110,7 @@ export function vetoMessages(facts: VetoFacts): ChatMessage[] {
     gross_apr_pct_7d: r2(facts.grossApr7dPct),
     gross_apr_pct_14d: r2(facts.grossApr14dPct),
     net_apr_pct_after_costs: r2(facts.netAprPct),
-    owner_minimum_net_apr_pct: r2(facts.minNetAprPct),
-    hours_in_a_row_above_minimum: facts.hoursAbove,
+    ...gate,
     leg_usd: r2(facts.legUsd),
     leverage: r2(facts.leverage),
     legs: facts.legs.map((l) => ({
@@ -113,7 +126,7 @@ export function vetoFacts(
   w: FundingWindow,
   extra: {
     kind: 'enter' | 'rotate'; legUsd: number; leverage: number; minNetAprPct: number; hoursAbove: number;
-    grossApr14dPct?: number | null; legs?: { long?: VetoLegFacts; short?: VetoLegFacts };
+    grossApr14dPct?: number | null; legs?: { long?: VetoLegFacts; short?: VetoLegFacts }; manual?: boolean;
   },
 ): VetoFacts {
   const leg = (venue: string, side: 'long' | 'short', x: VetoLegFacts | undefined): VetoLeg => ({
@@ -126,6 +139,7 @@ export function vetoFacts(
     netAprPct: w.netAprPct, minNetAprPct: extra.minNetAprPct, hoursAbove: extra.hoursAbove,
     legUsd: extra.legUsd, leverage: extra.leverage,
     legs: [leg(w.longVenue, 'long', extra.legs?.long), leg(w.shortVenue, 'short', extra.legs?.short)],
+    ...(extra.manual === true ? { manual: true } : {}),
   };
 }
 

@@ -25,7 +25,8 @@ repo root are all it needs.
   close or a rescue already under way. Railway's default is 0 s, which would kill it mid-order.
 - **The control API is never public.** The engine's HTTP API listens on `127.0.0.1:8790` only and has no login:
   anyone who could reach it could close the pair or turn `auto` on. Reach it from inside the container with
-  `railway ssh` (below). Never point a domain, a TCP proxy or `GIMBAL_HOST` at it.
+  `railway ssh` (below), or, with static outbound IPs on (where `railway ssh` does not work), through
+  `GIMBAL_CONTROL` ("Control without a shell", below). Never point a domain, a TCP proxy or `GIMBAL_HOST` at it.
 - **A public domain only for the read-only view.** The one port that may have a Railway public domain is the
   view's: a second listener, off by default, that serves the GET routes and the event stream behind a bearer token
   and refuses every write (below, "The read-only view"). No `GIMBAL_VIEW_TOKEN`, no public domain.
@@ -117,6 +118,203 @@ Then deploy, and make no `PUT /strategy` in between. After the deploy, the log m
 `engine rules from /data/gimbal/strategy-mainnet-<desk>.json`, not `engine rules not loaded, starting from the
 defaults (auto off): ...`. `GET /strategy` must also show the auto you expect. The older code runs on its own fixed
 counts (enter 3, exit 3).
+
+## Control without a shell (GIMBAL_CONTROL)
+
+`railway ssh` does not work while the service has static outbound IPs, and those must stay on: Orderly takes the
+desk key only from them. So `POST /rotate`, `POST /close` and `PUT /strategy` can be sent once through a variable
+instead (`engine/src/cli/serve-control.ts`):
+
+```
+GIMBAL_CONTROL={"id":"<run-id>","method":"POST|PUT","path":"/rotate|/close|/strategy","body":{...},"until":"<ISO time>"}
+```
+
+Serve sends that request to its own loopback server, so the route's handler, its checks and its answer are the same
+as for a request from inside the container. Nothing is added and nothing is skipped. Only `POST /rotate`, `POST /close`
+and `PUT /strategy` are allowed; anything else is refused with a `control: refused: ...` line and nothing is called.
+The run-id is letters, digits, `-` and `_`, up to 40 characters. Pick a new one for every action. `until` is
+optional: an ISO time with a zone (`2026-11-06T18:00:00Z`). Past it the run is refused with no marker. Always set it a
+few hours ahead: a variable left set then never acts on a later deploy, not even on a new volume with no markers.
+
+What it does (every line starts with `control:`):
+
+1. A marker `/data/gimbal/control-<run-id>.json` already exists: it logs what the marker says and does nothing. A
+   run-id runs at most once, across restarts and redeploys. The marker keeps the request (method, path, body). If the
+   variable now asks a **different** request under that run-id, the line reads
+   `control: DIFFERENT request under used run-id <id>: NOT run. ...` and nothing runs: use a new run-id.
+2. `POST /rotate` and `POST /close` need `GIMBAL_TRADE=1`. Without it the run is refused at once, with no marker, and
+   the same run-id runs once `GIMBAL_TRADE=1` is back. Past `until`: refused, no marker.
+3. It waits until the engine is ready, at most 10 min: the first scan, and for `/rotate` and `/close` also the
+   pair's confirmed start and the strategy loop's first check of a scan (so `/rotate` sees the window and the free
+   margin). The `waiting for ...` lines say what for. Past 10 min it writes the marker `failed` and calls nothing; that
+   run-id is not tried again. `PUT /strategy` waits for the first scan only: it does not touch the pair, and restoring
+   the rescue line must not hang on a pair whose start is not confirmed.
+4. It logs the engine rules as `GET /strategy` answers them (`control: engine rules before the call ...`), then
+   writes the marker `started`, created exclusively and fsynced.
+5. It sends the request and logs the route's answer, and the marker becomes `done` with that status and body. A
+   request that fails with no answer leaves `failed` (unknown outcome).
+   - `PUT /strategy` answered `200` has taken effect (and is saved).
+   - `POST /rotate` or `POST /close` answered `200 {"ok":true}` is only **accepted**: the line says
+     `ACCEPTED, not yet carried out`. The act runs in the strategy loop after that, and its result is a
+     `journal   enter: ...` / `journal   rotate: ...` / `journal   exit: ...` line, or `journal   error: ...` /
+     `journal   refused: ...`. **Wait for that result line before any redeploy.**
+   - `409` is the route's own refusal, for example `{"ok":false,"reason":"auto is off: ..."}`. The run-id is spent.
+
+Serve's start does not wait for the run; serve's shutdown does (within the 180 s drain). A shutdown while it still
+waits stops it with no marker, so the next start runs it. A marker that says `started` with no outcome (the
+container died during the call) is logged as an unknown outcome and never run again: check the journal, the desk and
+the engine rules before you pick a new run-id.
+
+**Setting it.** Each `railway variable set` or `railway variable delete` redeploys the engine: a build, up to 180 s
+of the old engine's drain, then 90 s to 3 min until the new one is live (above). Setting a new value over the old one
+is one redeploy, so go from one action to the next by setting the next value. `railway variable set` has
+`--skip-deploys`: use it on all but the last of several variables you change together, so they cost one redeploy.
+`railway variable delete` has no such flag (CLI 5.71): it always redeploys. Piping the JSON with `--stdin` works the
+same in bash and in every PowerShell, with no quoting to get wrong:
+
+```
+'{"id":"close-1","method":"POST","path":"/close","until":"2026-11-06T18:00:00Z"}' | railway variable set GIMBAL_CONTROL --stdin
+```
+
+(in bash, `echo '...' | railway variable set GIMBAL_CONTROL --stdin`). As an argument, single quotes work in bash
+and PowerShell 7.3 or later: `railway variable set 'GIMBAL_CONTROL={"id":...}'`. Windows PowerShell 5.1 and
+PowerShell 7.2 or older strip the double quotes from an argument to a native program, so there escape each one as
+`\"` inside the single quotes. The service's Variables tab (Raw Editor) takes the JSON as is.
+
+**Watching it.** `railway logs | grep control:` (bash) or `railway logs | Select-String 'control:'` (PowerShell).
+The first line, `control: run <run-id>: POST /close ...`, echoes what serve read; `control: refused: GIMBAL_CONTROL
+is not JSON` means the quotes were lost. Then `waiting for ...`, `engine rules before the call ...`,
+`started: marker ...` and `done: ...` (or `failed: ...`). For the act's result, also watch `journal   ` lines; a
+rescue shows as `rescue trigger ...` in the log and in full in the dashboard's Rescue view and Journal.
+
+**At the end.** With `until` passed, a variable left set does nothing. Remove it with the next redeploy you make
+anyway (`railway variable delete GIMBAL_CONTROL`, which redeploys).
+
+**Window ids.** A window id is `<base>-<long venue>-<short venue>` in lower case: `eth-hyperliquid-phoenix` holds
+ETH long on Hyperliquid and short on Phoenix. The log names them in the scan line
+(`scan N: ... best <window id> 12.34 % net`, on the first scan and every 12th after, about once a minute) and in the
+strategy loop's `decision  <action>: ...` and `journal   ...` lines. The dashboard's Windows view and the read-only
+view's `GET /state` (`windows[].id`) list every window of the last scan. A rotate only takes a window in the last
+scan.
+
+### The routes
+
+- **`POST /rotate {"windowId": ...}`, a manual enter.** It skips the entry streak (`enterAfterChecks`) and
+  `minNetAprPct` and keeps every other check: the window must be in the last scan, tradable and not stale, pass its
+  checks, not be held out by the NEAR AI risk check, be in a direction the pair trader opens, and size within the
+  free margin and the policy. It is checked and sized again when it runs, and the NEAR AI risk check runs as for any
+  enter; its prompt says the trade was asked by hand and the owner's minimum is waived, with no streak (an auto
+  enter's prompt carries both). A refusal holds that window out for 6 h: then rotate into another one. With a pair held it closes that pair first. The route needs `auto` on and answers `409 auto is off`
+  otherwise.
+- **`POST /close`**: both legs, reduce-only. It works with `auto` on or off and answers `409 no pair is held` when
+  there is none.
+- **`PUT /strategy <the whole config>`**: every engine rule, the rescue and watch lines included (there is no
+  separate risk route). Copy the last `control: engine rules before the call` line (every run logs it; also
+  `GET /strategy` on the read-only view) and change only what you mean to. **Send every field**: a config without
+  `enterAfterChecks` or `exitAfterChecks` resets them to 3 and 6, and any other missing field is refused (400).
+  **It persists**: serve saves it in `/data/gimbal/strategy-mainnet-<desk>.json` before it takes effect, and every
+  later start loads it, until another `PUT /strategy` changes it back. Deleting `GIMBAL_CONTROL` does not undo it.
+  A `PUT` also runs a strategy check at once.
+
+### The rescue line
+
+The settings are `risk.rescueDistancePct` and `risk.watchDistancePct` (defaults 8 and 15; the route refuses
+anything but `0 < rescueDistancePct < watchDistancePct < 100`). They apply to **every leg alike**: the engine has no
+per-leg or per-venue line (`POST /stress`, which targets one leg, is refused on mainnet).
+
+- A leg is in rescue when its distance to liquidation is under the rescue line, `max(rescueDistancePct, the
+  volatility term)` (`engine/src/risk/thresholds.ts`). The risk engine reads the desk every 5 s.
+- The rescue moves the margin that brings the leg back to its watch line, `max(watchDistancePct, rescue line +
+  (watchDistancePct − rescueDistancePct))` (`marginToReach`, `engine/src/risk/margin.ts`). For one position on the
+  account that is **amount ≈ (watch − live distance) / 100 × notional × (1 + maintenance fraction)**: on a 12 USD leg,
+  each point of distance is about 0.12 USD.
+- It pays from the reserve first (the desk's `idle_usdc` on NEAR, `fund_venue`), then from the free margin on the
+  other leg's venue, else it reduces both legs (`engine/src/rescue/plan.ts`). A route whose fees would be over 10 %
+  of what it sends is skipped, so each route has a smallest rescue. At the final policy, with a 1Click key:
+
+  | Target leg on | Smallest rescue (margin the leg needs) | On a 12 USD leg |
+  |---|---|---|
+  | Hyperliquid | 2.86 USD (reserve or Phoenix → Hyperliquid) | watch ≈ 24 points above the live distance |
+  | Phoenix | 0.44 USD (reserve → Phoenix) | watch ≈ 4 points above |
+  | Orderly | any amount, but it sends at least 6.20 USD (under 5 USDC the Orderly receiver loses it) | — |
+
+  Under the smallest amount, or over what is left of `rescue_cap_usd_per_hour`, the rescue **reduces both legs**
+  instead of moving margin, and a reduce of a 12 USD leg can run into Hyperliquid's 10 USD order minimum. The
+  `rescue routes` start lines say which routes run on this deployment.
+- **Worked example**, a 12 USD Hyperliquid short at 3x, counted as if isolated (4 USD margin, maintenance about
+  2 %): its distance is (4/12 − 0.02) / 1.02 ≈ 30.7 %. The desk's Hyperliquid account is cross margin: all its
+  USDC backs the leg, so the live distance is higher than this whenever the account holds more than the leg's own
+  margin, and each point then costs more. Use these numbers for the shape only and read both legs' live distances
+  before you pick the lines. For at least 2.86 USD to move, the watch line must be at least about 54.1 %: with
+  `"watchDistancePct":56` the rescue moves (0.56 × 1.02 + 0.02 − 0.333) × 12 ≈ 3.10 USD (it sends about 3.45 with
+  1Click's fee and slippage room). With the old rule of thumb, watch 36 against 30 %, it would be about 0.72 USD:
+  under the minimum, so it would reduce both legs instead.
+
+**Both legs.** A hedged pair at equal leverage has both legs at nearly the same distance: the 3x Phoenix long next
+to that short sits near (4/12 − m) / (1 − m) ≈ 32 %, about one point away. Both legs fire when both are under the
+line, nearest first, and a rescue paid from the other leg's free margin lowers that leg's distance by about the
+amount ÷ its notional (≈ 25 points here), which puts it under the line too: the two legs then rescue each other in
+turn. So:
+
+- Put `rescueDistancePct` **between** the two legs' distances, so only the target leg is under it, with at least
+  1.5 points to the other leg (1 point of hysteresis plus a few seconds of price move). Read both from the
+  `monitor   <venue> <symbol> ... D % from liquidation` lines (every 30 min) or the dashboard's Desk, right before.
+- Have the reserve cover the whole rescue (the amount plus about 0.5 USD of fees and slippage room), so the plan pays from NEAR and never
+  takes the other leg's margin.
+- **If the legs are less than about 2 points apart, the demo cannot be done safely**: no single line puts one leg
+  under and the other above, and the engine has no per-leg line. A price move separates them (a 2 % move shifts each
+  by about 2 points, in opposite directions); wait for that, with the nearer leg being the one you mean to rescue.
+
+**The restore window.** The restore is a redeploy too: it applies only after the build, the old engine's drain (up
+to 180 s) and the new engine's first scan. Until then the raised line is live, and the new engine does not remember
+the old one's rescue. So:
+
+- Restore only after the rescue's **end**, whatever it is: `rescue <id> landed in N s`, a reduce, or a failure
+  (`rescue <id> failed at <step>: ...` in the log; all of them in the Rescue view and Journal).
+- The residual risk, stated plainly: from the new engine's first desk read until the restore takes effect (the first
+  scan, usually seconds), any leg still under the raised line (the target after a reduce or a failure, or the other
+  leg if it paid) gets a new rescue, against the reserve, the hourly cap and its fees. Restoring sooner does not
+  shorten this. Check on the Desk that every leg is above the raised rescue line before you set the restore; if one
+  is not, expect one more rescue.
+
+### The demo sequence
+
+Run each step only after the previous one's result line. Every body is an example: build each from the rules the
+log printed. `<rules>` below stands for every field of that line, with the changes listed.
+
+1. **Demo rules** (`PUT /strategy`): `auto` true, `minNetAprPct` 1000 (the loop then enters nothing under 1000 % net
+   by itself, which in practice is nothing; a `/rotate` skips this minimum), `rotate.minGainPts` 1000 (no rotation by itself), `exitAfterChecks` 24, and
+   `legUsd` the size you want. With `auto` true and this minimum the held pair counts as compressed at every hourly
+   check, so the loop exits it by itself after 24 hourly checks: finish the demo within a day. The drawdown and time
+   stops still act. Without the high minimum, the check a `PUT` runs at once could enter the top window by itself
+   before your `/rotate` (paying fees twice), and re-enter after your `/close` once the 6 h cooldown is over.
+
+   ```
+   '{"id":"demo-rules","method":"PUT","path":"/strategy","until":"2026-11-06T18:00:00Z","body":{"auto":true,"minNetAprPct":1000,"legUsd":12,"maxLeverage":3,"stopDrawdownPct":10,"rotate":{"minGainPts":1000,"forHours":4},"risk":{"watchDistancePct":15,"rescueDistancePct":8},"enterAfterChecks":3,"exitAfterChecks":24}}' | railway variable set GIMBAL_CONTROL --stdin
+   ```
+
+   Wait for `control: done: PUT /strategy answered 200`. Keep its `engine rules before the call` line: it holds your
+   own rules for step 6.
+2. **Enter** (`POST /rotate`). Pick the window and a backup from the scan lines or the Windows view first. Wait for
+   `journal   enter: enter <window id>, ...` (or `error` / `refused`). A `veto` / `refused ... NEAR AI risk check`
+   line means the model refused that window (held out for 6 h): send the same step with the backup window and a new
+   run-id.
+
+   ```
+   '{"id":"demo-enter","method":"POST","path":"/rotate","until":"2026-11-06T18:00:00Z","body":{"windowId":"eth-phoenix-hyperliquid"}}' | railway variable set GIMBAL_CONTROL --stdin
+   '{"id":"demo-enter-2","method":"POST","path":"/rotate","until":"2026-11-06T18:00:00Z","body":{"windowId":"sol-phoenix-hyperliquid"}}' | railway variable set GIMBAL_CONTROL --stdin
+   ```
+
+   (the second line only after a refusal of the first).
+
+3. **Raise the rescue line** (`PUT /strategy`, the step 1 rules with the new `risk`), once the legs are far enough
+   apart and the reserve covers the rescue (above). For a 12 USD Hyperliquid short that reads 30.7 % live, with the
+   long at 33 % or more: `"risk":{"watchDistancePct":56,"rescueDistancePct":31.5}`. Wait for the rescue's end line.
+4. **Restore** (`PUT /strategy`, the step 1 rules as they were: `"risk":{"watchDistancePct":15,"rescueDistancePct":8}`),
+   set straight over step 3. Wait for `control: done: PUT /strategy answered 200`.
+5. **Close** (`POST /close`). Wait for `journal   exit: exit <window id>: ...`.
+6. **Your own rules back, `auto` off** (`PUT /strategy` with the rules from step 1's `engine rules before the call`
+   line and `"auto":false`). Wait for `control: done: PUT /strategy answered 200`.
 
 ## Bringing USDC back from Orderly
 

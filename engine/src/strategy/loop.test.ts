@@ -1323,3 +1323,56 @@ test('the saved state keeps the risk check\'s why line with a hold-out; a malfor
     assert.equal(s.counters.vetoedUntil['sol-phoenix-hyperliquid'], T0 + HOUR);
   }
 });
+
+test('the NEAR AI prompt: an auto enter carries the owner\'s minimum and the streak; a manual one says the minimum is waived and has no streak', async () => {
+  const reply = (content: string) => ({ content, raw: { choices: [{ message: { content } }] } });
+  const prompts: Record<string, unknown>[] = [];
+  const veto: VetoSource = {
+    model: 'test-model', configured: true,
+    complete: async (messages) => {
+      prompts.push(JSON.parse(messages[1]!.content) as Record<string, unknown>);
+      return reply('{"verdict":"pass","reasons":[]}');
+    },
+  };
+  const auto = world({ strategy: { ...DEFAULT_STRATEGY, auto: true, minNetAprPct: 7 } });
+  auto.next = { decision: { action: 'enter', reason: 'go', windowId: 'sol-phoenix-hyperliquid' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  await makeLoop(auto, tmpStore(), { veto }).check();
+  assert.equal(prompts.length, 1);
+  assert.equal(prompts[0]!.owner_minimum_net_apr_pct, 7);
+  assert.equal(typeof prompts[0]!.hours_in_a_row_above_minimum, 'number');
+  assert.equal(prompts[0]!.manual, undefined);
+  assert.equal(prompts[0]!.trade, 'open a new pair');
+
+  // The demo's rules: a minimum the manual enter skips. The prompt must not hold it to that minimum.
+  const hand = world({ strategy: { ...DEFAULT_STRATEGY, auto: true, minNetAprPct: 987 } });
+  const loop = makeLoop(hand, tmpStore(), { veto });
+  await loop.check();
+  assert.deepEqual(loop.rotate('sol-phoenix-hyperliquid'), { ok: true });
+  await loop.idle(1000);
+  assert.equal(hand.opens.length, 1);
+  const manual = prompts.at(-1)!;
+  assert.equal(manual.manual, true);
+  assert.equal(manual.owner_minimum_net_apr_pct, 'waived: the owner asked for this trade');
+  assert.equal('hours_in_a_row_above_minimum' in manual, false);
+  assert.equal(manual.trade, 'open a new pair (asked by the owner by hand)');
+  assert.doesNotMatch(JSON.stringify(manual), /987/);
+});
+
+test('checked counts only the checks that read a scan and the free margin (GIMBAL_CONTROL waits for the first)', async () => {
+  const off = world({ trade: false });
+  const offLoop = makeLoop(off);
+  await offLoop.check();
+  assert.equal(offLoop.checked, 0, 'GIMBAL_TRADE off: no check reads the scan');
+
+  const w = world({ windows: null });
+  const loop = makeLoop(w);
+  await loop.check();
+  assert.equal(loop.checked, 0, 'no scan yet');
+  w.busy = 'rescue r-1 is running';
+  w.windows = world().windows;
+  await loop.check();
+  assert.equal(loop.checked, 0, 'busy: no decision');
+  w.busy = null;
+  await loop.check();
+  assert.equal(loop.checked, 1);
+});

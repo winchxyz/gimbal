@@ -681,6 +681,15 @@ export class StrategyLoop {
   // ---- state kept between checks for a manual rotate ----
   #lastFacts: WindowFacts = {};
   #lastFree: Record<string, number> = {};
+  #checked = 0;
+
+  /**
+   * Checks so far that read a scan's windows and the free margin (what a manual rotate's first check is sized on).
+   * GIMBAL_CONTROL's /rotate and /close wait for the first (serve-control.ts).
+   */
+  get checked(): number {
+    return this.#checked;
+  }
 
   #manualRefusal(): string | null {
     if (this.#stopped) return 'serve is stopping';
@@ -813,6 +822,7 @@ export class StrategyLoop {
     const facts = await this.#readFacts(scanned);
     this.#lastFacts = facts;
     this.#lastFree = freeMarginUsd;
+    this.#checked++;
     const policy = this.#o.policy();
     const before = this.#state.counters;
     const input: DecideInput = {
@@ -1191,7 +1201,7 @@ export class StrategyLoop {
     }) as { long?: VetoLegFacts; short?: VetoLegFacts };
     const facts = vetoFacts(w, {
       kind: p.kind, legUsd: p.legUsd, leverage: p.leverage, minNetAprPct: this.#o.strategy().minNetAprPct, hoursAbove: p.hoursAbove,
-      grossApr14dPct: p.facts.gross14dAprPct?.[w.id] ?? null,
+      grossApr14dPct: p.facts.gross14dAprPct?.[w.id] ?? null, manual: p.manual,
       legs: { long: { ...extra.long, openInterestUsd: oi?.longUsd ?? null }, short: { ...extra.short, openInterestUsd: oi?.shortUsd ?? null } },
     });
     const result = await checkVeto(this.#o.veto ?? NO_VETO_SOURCE, facts, { now, timeoutMs: this.#o.vetoTimeoutMs ?? LOOP_RULES.vetoTimeoutMs });

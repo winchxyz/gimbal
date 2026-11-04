@@ -9,7 +9,7 @@ import { completion, fixedFetch } from '../nearai/test-helpers.ts';
 import { LOOP_RULES } from './decide.ts';
 import { PASS_FACTS, T0, VETO_FACTS, VETO_FIXTURE, win } from './test-helpers.ts';
 import {
-  RecordedVeto, UNREADABLE_REPLY, VETO_SYSTEM_PROMPT, checkVeto, parseVerdict, promptKey, riskCheckWhy, vetoFacts, vetoJournalNumbers, vetoMessages,
+  MANUAL_MINIMUM, RecordedVeto, UNREADABLE_REPLY, VETO_SYSTEM_PROMPT, checkVeto, parseVerdict, promptKey, riskCheckWhy, vetoFacts, vetoJournalNumbers, vetoMessages,
 } from './veto.ts';
 import type { VetoSource } from './veto.ts';
 
@@ -255,4 +255,17 @@ test('a 200 reply that quotes the key is journaled and booked with the key cut, 
   assert.ok(!JSON.stringify(r).includes(KEY));
   assert.ok(!JSON.stringify(vetoJournalNumbers(r.exchange!)).includes(KEY));
   assert.match(String(vetoJournalNumbers(r.exchange!).vetoReply), /key … seen/);
+});
+
+test('vetoMessages: a manual act says the minimum is waived and carries no streak; an auto act keeps both, as recorded', () => {
+  const auto = JSON.parse(vetoMessages(PASS_FACTS)[1]!.content) as Record<string, unknown>;
+  assert.equal(auto.owner_minimum_net_apr_pct, PASS_FACTS.minNetAprPct);
+  assert.equal(auto.hours_in_a_row_above_minimum, PASS_FACTS.hoursAbove);
+  assert.equal('manual' in auto, false);
+  assert.deepEqual(vetoMessages({ ...PASS_FACTS, manual: false }), vetoMessages(PASS_FACTS), 'manual false is an auto prompt');
+  const manual = JSON.parse(vetoMessages({ ...PASS_FACTS, manual: true })[1]!.content) as Record<string, unknown>;
+  assert.equal(manual.manual, true);
+  assert.equal(manual.owner_minimum_net_apr_pct, MANUAL_MINIMUM);
+  assert.equal('hours_in_a_row_above_minimum' in manual, false);
+  assert.notEqual(promptKey(vetoMessages({ ...PASS_FACTS, manual: true })), promptKey(vetoMessages(PASS_FACTS)));
 });
