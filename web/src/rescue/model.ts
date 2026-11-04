@@ -212,18 +212,25 @@ export function distanceNote(distance: number | null, line: number | null): stri
 /**
  * The step each transaction belongs to. `TxRef` carries no step, so it is read from the chain: a NEAR transaction is the
  * contract call that signs; the first other one is the deposit into the Intents address; a later one on the venue the
- * margin goes to is the landing. Paid from the reserve, the deposit is that NEAR call itself (fund_venue), so the
- * first transaction on the venue's chain is already the landing. A transaction shows only once its step has been reached.
+ * margin goes to is the landing. Paid from the reserve, the deposit is that NEAR call itself (fund_venue): its link
+ * shows at both steps, and the first transaction on the venue's chain is already the landing. A transaction shows only
+ * once its step has been reached.
  */
 export function txByStep(p: RescueProgress, destinationChain: TxRef['chain'] | null): Record<StepId, ProofLink[]> {
   const out = Object.fromEntries(STEPS.map((id) => [id, [] as ProofLink[]])) as Record<StepId, ProofLink[]>;
-  let deposited = p.from === 'reserve';
+  const reserve = p.from === 'reserve';
+  let deposited = reserve;
+  let fundVenue = reserve;
   for (const t of p.tx) {
     const link = proofLinks([t])[0];
     if (!link) continue;
     const step: StepId = t.chain === 'near' ? 'sign' : deposited && t.chain === destinationChain ? 'landed' : 'deposit';
     if (t.chain !== 'near') deposited = true;
     out[step].push(link);
+    if (fundVenue && t.chain === 'near') {
+      out.deposit.push(link);
+      fundVenue = false;
+    }
   }
   return out;
 }

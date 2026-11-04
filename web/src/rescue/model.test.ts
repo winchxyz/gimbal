@@ -234,14 +234,17 @@ test('transactions sit at the steps they belong to, and only once that step is r
   assert.deepEqual(ids(progress('landed', 52, { tx: [near, sol, hl] })), ['', '', '', '', 'n1', 's1', 'h1']);
 });
 
-test('paid from the reserve, fund_venue is the deposit, so the Hyperliquid ledger link sits at landed', () => {
+test('paid from the reserve, the fund_venue link is the deposit too, and the Hyperliquid ledger link sits at landed', () => {
   const ids = (p: RescueProgress) => {
     const by = txByStep(p, CHAIN_OF[p.to]);
     return STEPS.map((id) => by[id].map((l) => l.short).join(','));
   };
   const near = tx('near', 'n1');
   const hl = tx('hyperliquid', 'h1');
-  assert.deepEqual(ids(progress('landed', 95, { from: 'reserve', tx: [near, hl] })), ['', '', '', '', 'n1', '', 'h1']);
+  assert.deepEqual(ids(progress('landed', 95, { from: 'reserve', tx: [near, hl] })), ['', '', '', '', 'n1', 'n1', 'h1']);
+  // Reserve -> Phoenix: a later NEAR call (the sol_sign of the Phoenix deposit) stays at sign only.
+  const p = progress('landed', 120, { from: 'reserve', to: 'phoenix', tx: [near, tx('near', 'n2'), tx('solana', 's1')] });
+  assert.deepEqual(ids(p), ['', '', '', '', 'n1,n2', 'n1', 's1']);
   // Out of Phoenix the Solana transfer is the deposit, and the Hyperliquid entry after it the landing, as before.
   assert.deepEqual(ids(progress('landed', 70, { tx: [near, tx('solana', 's1'), hl] })), ['', '', '', '', 'n1', 's1', 'h1']);
 });
