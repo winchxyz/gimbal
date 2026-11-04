@@ -215,6 +215,32 @@ export function openGateText(p: Protections): string | null {
   return paused === null ? null : `the pair is paused since an ADL (${paused}): no new pair opens until the owner reconciles`;
 }
 
+/** Where serve reads what its protections are doing (loopGates): each asked fresh at every gate. */
+export interface ProtectionSources {
+  /** The rescue running (its fund_venue step included), by id, or null. */
+  rescue: () => string | null;
+  /** The ADL watch of the pair held now (ServePair.adl). */
+  adl: () => PairAdl | undefined;
+  /** panic_close runs. */
+  panicClose: () => boolean;
+  /** A close of the pair runs (ProtectedPair.closing: panic_close, a rescue's reduce, an ADL unwind or the loop's). */
+  pairClosing: () => boolean;
+}
+
+/**
+ * serveLoop's `busy` and `orderGate` as serve wires them, from one place: `busy` (no decision, no act) is
+ * protectionText or a close of the pair running; `orderGate` (every open's gate, asked again before its first order
+ * and each later part) is openGateText, which also stops on a pair paused since an ADL. The two differ on purpose:
+ * a pause stops opens, not the loop's decisions (a held pair may still be closed).
+ */
+export function loopGates(s: ProtectionSources): { busy: () => string | null; orderGate: () => string | null } {
+  const now = (): Protections => ({ rescue: s.rescue(), adl: adlGate(s.adl()), panicClose: s.panicClose() });
+  return {
+    busy: () => protectionText(now()) ?? (s.pairClosing() ? 'a close of the pair runs' : null),
+    orderGate: () => openGateText(now()),
+  };
+}
+
 /** The pair symbols the policy allows: in both hl_assets and phoenix_markets. */
 export function policySymbols(policy: ContractPolicy | null): string[] {
   if (policy === null) return [];

@@ -104,7 +104,7 @@ import type { ServePair } from './serve-pair.ts';
 import { liveLines, pairRefreshesAtOpen, servePair } from './serve-pair.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { connectContract, contractEnv, marginVenues } from './serve-contract.ts';
-import { adlGate, loopBook, openGateText, protectionText, serveLoop } from './serve-loop.ts';
+import { loopBook, loopGates, serveLoop } from './serve-loop.ts';
 import { ConfigError, retryStart } from './start-errors.ts';
 import type { PositionBook } from '../book/book.ts';
 import { createBook } from '../book/book.ts';
@@ -452,15 +452,14 @@ if (values.once === true) {
 
 /**
  * A protection runs (a rescue, its fund_venue step included; an ADL unwind, an open ADL event or a check confirming a
- * leg off its baseline; panic_close): the loop decides nothing and no order of it goes out. The read-only ADL check
- * that starts beside every desk read (risk.adlRunning) is not one while it sees nothing off.
+ * leg off its baseline; panic_close): the loop decides nothing and no order of it goes out (`busy`); every open's
+ * gate also stops on a pair paused since an ADL (`orderGate`). The read-only ADL check that starts beside every desk
+ * read (risk.adlRunning) is not one while it sees nothing off. Built in serve-loop.ts (loopGates), where it is tested.
  */
-function protections() {
-  return { rescue: rescueRunning?.() ?? null, adl: adlGate(pair?.adl), panicClose: closingWatch?.current != null };
-}
-function protectionRunning(): string | null {
-  return protectionText(protections());
-}
+const gates = loopGates({
+  rescue: () => rescueRunning?.() ?? null, adl: () => pair?.adl, panicClose: () => closingWatch?.current != null,
+  pairClosing: () => pair?.pair?.closing === true,
+});
 
 // The position book: next to the loop state. An unreadable book file is never started over: serve runs without the
 // book (the loop trades as before) and says so, until the owner fixes or moves the file. It does not wait for the
@@ -541,9 +540,7 @@ loop = serveLoop({
   strategy: () => server?.strategy ?? saved.strategy ?? DEFAULT_STRATEGY, policy: () => policy, publish: booked?.publish ?? publish, clock, log,
   ...(booked === null ? {} : { book: booked.sink }),
   ...(stateDirSet === undefined ? {} : { stateDir: resolve(stateDirSet) }),
-  busy: () => protectionRunning() ?? (pair?.pair?.closing === true ? 'a close of the pair runs' : null),
-  // Every open's gate, asked again before its first order and each later part: also a pair paused since an ADL.
-  orderGate: () => openGateText(protections()),
+  ...gates,
 });
 log(loop.startLine());
 booked?.adopt(loop.held);

@@ -20,7 +20,7 @@ import type { PriceDeps } from './pair-mainnet-lib.ts';
 import { PRICE_MARGIN_S, newPriceState, refreshLanded, refreshReachedChain } from './pair-mainnet-lib.ts';
 import { storedPrice } from './pair-ops.ts';
 import type { CarryResult, RefreshAllowance, ServePairInput } from './serve-pair.ts';
-import { SERVE_MAKER, buildLiveLegs, liveCarry } from './serve-pair.ts';
+import { SERVE_MAKER, buildLiveLegs, builderFeeDrift, liveCarry } from './serve-pair.ts';
 
 const HL_URL = 'https://hl.carry.test';
 const PHOENIX_URL = 'https://phoenix.carry.test';
@@ -91,13 +91,18 @@ async function withVenues<T>(run: () => Promise<T>): Promise<T> {
  * off, each refresh_prices (and whether it came while planning), the size check's line and each part sent. `agedBeforePartS`
  * ages the price and the last refresh that long before the part's own check (beforePart), as a long earlier part would.
  */
-async function carryWorld(o: { closing?: boolean; refreshedAgeS?: number; refreshedPx?: number; row?: { ageS: number; px: number }; agedBeforePartS?: number; refreshFails?: string } = {}) {
+async function carryWorld(o: {
+  closing?: boolean; refreshedAgeS?: number; refreshedPx?: number; row?: { ageS: number; px: number }; agedBeforePartS?: number; refreshFails?: string;
+  /** config()'s fees.hl_builder_tenth_bps at each open (default 10); `atStart`: the one serve's scanner read at the start. */
+  builderTenthBps?: () => number; atStart?: number | null;
+} = {}) {
+  const logs: string[] = [];
   const rows: { asset: string; price_e8: string; at_ms: number }[] = [];
   if (o.row !== undefined) rows.push({ asset: 'ETH', price_e8: String(Math.round(o.row.px * 1e8)), at_ms: Date.now() - o.row.ageS * 1000 });
   const timeline: string[] = [];
   let planning = false;
   const client = {
-    config: async () => ({ fees: { hl_builder_tenth_bps: 10 } }), getDesk: async () => desk(o.closing), prices: async () => rows.map((r) => ({ ...r })),
+    config: async () => ({ fees: { hl_builder_tenth_bps: o.builderTenthBps?.() ?? 10 } }), getDesk: async () => desk(o.closing), prices: async () => rows.map((r) => ({ ...r })),
   } as unknown as NearContractClient;
   const prices: PriceDeps = {
     maxAgeS: 900, send: true, read: (s) => storedPrice(client, s),
@@ -149,12 +154,14 @@ async function carryWorld(o: { closing?: boolean; refreshedAgeS?: number; refres
       planning = on;
       timeline.push(`planning ${on ? 'on' : 'off'}`);
     },
-    input: { deskId: 'desk-1' } as ServePairInput, hlUrl: HL_URL, phoenixUrl: PHOENIX_URL, solRpcUrl: SOL_RPC,
+    input: {
+      deskId: 'desk-1', log: (l: string) => logs.push(l), ...(o.atStart === undefined ? {} : { side: { builderTenthBps: o.atStart } }),
+    } as unknown as ServePairInput, hlUrl: HL_URL, phoenixUrl: PHOENIX_URL, solRpcUrl: SOL_RPC,
     readers: () => ({ hl, phoenix, solana }),
   });
   const said: string[] = [];
   let paid = 0;
-  const open = (allow: RefreshAllowance = {}): Promise<CarryResult> => withVenues(() => carry.open({
+  const open = (allow: RefreshAllowance & { gate?: () => string | null } = {}): Promise<CarryResult> => withVenues(() => carry.open({
     legUsd: 50, leverage: 2, reason: 'strategy: enter eth-phoenix-hyperliquid', qty: '0.02', gate: () => null, ...allow,
     onPaidRefresh: () => {
       paid++;
@@ -166,7 +173,7 @@ async function carryWorld(o: { closing?: boolean; refreshedAgeS?: number; refres
     },
     open: (l) => said.push(`open: ${l}`),
   }));
-  return { open, timeline, said, paid: () => paid };
+  return { open, timeline, said, logs, paid: () => paid };
 }
 
 test('serve\'s carry, no stored price: planning (read-only) -> one refresh_prices -> the size held to the cap -> the first part, no second refresh', async () => {
@@ -180,6 +187,46 @@ test('serve\'s carry, no stored price: planning (read-only) -> one refresh_price
   assert.match(said, /stored ETH none \(planned on the books' mid 2500\.0000\); the open refreshes it once every check above passed/);
   assert.match(said, new RegExp(`stored ETH 2500, 610 s old \\(refreshed for this open\\): it lives 50 s past the first part's ${SERVE_MAKER.timeoutMs / 1000 + PRICE_MARGIN_S} s`));
   assert.match(said, /ioc sim   Phoenix BUY 0\.02 ETH .*: ok/);
+});
+
+test('serve\'s carry, its last gate (serve\'s orderGate) refusing after the plan and the refresh: nothing sent, the refresh paid', async () => {
+  const w = await carryWorld();
+  const paused = 'the pair is paused since an ADL (ADL on hyperliquid ETH -0.02 -> -0.01): no new pair opens until the owner reconciles';
+  let asked = 0;
+  // Clear when the open starts; paused once its refresh_prices went out (an ADL check confirmed meanwhile).
+  const gate = () => {
+    asked++;
+    return w.timeline.includes('refresh ETH') ? paused : null;
+  };
+  const r = await w.open({ gate });
+  assert.deepEqual(r.refusals, [`${paused}: nothing sent`]);
+  assert.equal(r.refreshed, true);
+  assert.equal(asked, 2, 'asked at the start of the open and again right before its first order');
+  assert.deepEqual(w.timeline, ['planning on', 'planning off', 'refresh ETH', 'size held to the cap']);
+  assert.ok(!w.timeline.includes('part 1 sent'));
+});
+
+test('serve\'s carry, a builder fee changed since the start: logged once per new value, the open prices the new one', async () => {
+  let tenth = 10;
+  const w = await carryWorld({ atStart: 10, builderTenthBps: () => tenth });
+  await w.open();
+  assert.deepEqual(w.logs, [], 'the same fee the scanner prices: nothing to say');
+  tenth = 20;
+  await w.open();
+  await w.open();
+  assert.deepEqual(w.logs, [
+    'pair      the contract\'s builder fee is 20 tenths of a bp now (config()), but the scanner has priced 10 since the start: '
+      + 'the open prices Hyperliquid at 6.5 bps a fill, the scanner\'s gate at 5.5, until serve restarts',
+  ]);
+  tenth = 30;
+  await w.open();
+  assert.equal(w.logs.length, 2, 'a new value is logged again');
+  assert.match(w.logs[1]!, /builder fee is 30 tenths .* at 7\.5 bps a fill, the scanner's gate at 5\.5/);
+  // The rules: agreement, or an open fee planOpen refuses, says nothing; a start without a fee names the default.
+  assert.equal(builderFeeDrift(10, 10), null);
+  assert.equal(builderFeeDrift(10, undefined), null);
+  assert.equal(builderFeeDrift(10, 0), null);
+  assert.match(builderFeeDrift(null, 10)!, /the scanner has priced its default since the start \(it read null\): .* the scanner's gate at its default/);
 });
 
 test('serve\'s carry, a part whose price grew old: the refresh before it is counted for the caps (onPaidRefresh each time)', async () => {

@@ -62,7 +62,7 @@ import { SolanaSubmitter } from '../relayer/solana.ts';
 import type { Reducer } from '../rescue/rescuer.ts';
 import type { AdlState } from '../risk/adl.ts';
 import { ADL_ATTEMPTS, AdlWatch, newAdlState } from '../risk/adl.ts';
-import { MAINNET_COSTS } from '../scanner/config.ts';
+import { MAINNET_COSTS, hlFillFeeBps } from '../scanner/config.ts';
 import type { LegSide, MakerSettings, TradeLeg } from '../trade/legs.ts';
 import { DEFAULT_MAKER, HlLeg } from '../trade/legs.ts';
 import { signedQtyString } from '../trade/lots.ts';
@@ -1127,6 +1127,23 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
   }
 }
 
+/**
+ * The line serve logs when the builder fee an open reads from config() is not the one the scanner has priced since the
+ * start (serve.ts withBuilderFee, ContractSide.builderTenthBps): the open and the scanner's gate then price Hyperliquid
+ * differently until serve restarts. null when they agree, or when the open's own fee is not usable (planOpen refuses
+ * that open and says why).
+ */
+export function builderFeeDrift(atStart: number | null, now: number | null | undefined): string | null {
+  if (hlFillFeeBps(now) === null || now === atStart) return null;
+  const scanner = hlFillFeeBps(atStart);
+  return `pair      the contract's builder fee is ${now} tenths of a bp now (config()), but the scanner has priced `
+    + `${atStart === null || scanner === null ? `its default since the start (it read ${String(atStart)})` : `${atStart} since the start`}: `
+    + `the open prices Hyperliquid at ${hlFillFeeBps(now)} bps a fill, the scanner's gate at ${scanner ?? 'its default'}, until serve restarts`;
+}
+
+/** The builder fee last logged as drifted, per contract side: each new value is logged once. */
+const builderFeeLogged = new WeakMap<ContractSide, number>();
+
 /** pair-mainnet's open and close (pair-ops.ts) on a live pair's legs, sending through its ProtectedPair (exported for tests). */
 export function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string; phoenixUrl: string; solRpcUrl: string; readers: () => { hl: HyperliquidReader; phoenix: PhoenixReader; solana: SolanaSubmitter } }): SlotCarry {
   const { hl, phoenix } = p.legs;
@@ -1138,6 +1155,13 @@ export function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string
     // A fresh desk each time: paused and closing (panic_close) are refusals, and the policy may have changed.
     const [config, desk] = await Promise.all([p.client.config(), p.client.getDesk(p.input.deskId)]);
     if (desk === null) throw new Error(`get_desk(${p.input.deskId}) answered null`);
+    const side = p.input.side as ContractSide | undefined;
+    const now = config.fees?.hl_builder_tenth_bps;
+    const drift = side === undefined ? null : builderFeeDrift(side.builderTenthBps ?? null, now);
+    if (side !== undefined && drift !== null && builderFeeLogged.get(side) !== now) {
+      builderFeeLogged.set(side, now!);
+      p.input.log(drift);
+    }
     const r = p.readers();
     return {
       client: p.client, config, desk, hlUrl: p.hlUrl, hl: r.hl, phoenix: r.phoenix, phoenixUrl: p.phoenixUrl, chain: solanaChain(p.solRpcUrl),
