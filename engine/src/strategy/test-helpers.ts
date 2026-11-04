@@ -79,10 +79,9 @@ export const PASS_FACTS: VetoFacts = {
   grossAprPct: 25.81, grossApr7dPct: 19.08, grossApr14dPct: 17.4, netAprPct: 9, minNetAprPct: 5, hoursAbove: 3,
   legUsd: 12, leverage: 1.5,
   legs: [
-    { venue: 'hyperliquid', side: 'long', openInterestUsd: 27_400_000, bookDepthUsd: 41_000 },
-    { venue: 'phoenix', side: 'short', openInterestUsd: 1_583_197, bookDepthUsd: 6_200 },
+    { venue: 'hyperliquid', side: 'long', openInterestUsd: 27_400_000, bookDepthUsd: 41_000, fillImpactBps: 1.2, priceMove24hPct: -2.1, daysSinceListing: null },
+    { venue: 'phoenix', side: 'short', openInterestUsd: 1_583_197, bookDepthUsd: 6_200, fillImpactBps: 4.8, priceMove24hPct: -2.1, daysSinceListing: null },
   ],
-  priceMove24hPct: -2.1, daysSinceListing: null,
 };
 
 /** The facts the fixture's veto answers: a one-hour spike on a market listed five days ago. */
@@ -91,8 +90,7 @@ export const VETO_FACTS: VetoFacts = {
   grossAprPct: 310, grossApr7dPct: 22, grossApr14dPct: null, netAprPct: 18, minNetAprPct: 5, hoursAbove: 3,
   legUsd: 12, leverage: 1.5,
   legs: [
-    { venue: 'phoenix', side: 'long', openInterestUsd: 1_200, bookDepthUsd: 300 },
-    { venue: 'hyperliquid', side: 'short', openInterestUsd: 2_100_000, bookDepthUsd: 9_000 },
+    { venue: 'phoenix', side: 'long', openInterestUsd: 1_200, bookDepthUsd: 300, fillImpactBps: 180, priceMove24hPct: 38.5, daysSinceListing: 5 },
+    { venue: 'hyperliquid', side: 'short', openInterestUsd: 2_100_000, bookDepthUsd: 9_000, fillImpactBps: 2.5, priceMove24hPct: 38.5, daysSinceListing: null },
   ],
-  priceMove24hPct: 38.5, daysSinceListing: 5,
 };

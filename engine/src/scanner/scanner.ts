@@ -42,7 +42,7 @@ import type { CarryEstimate, MultiDay } from './carry.ts';
 import { DEAD_BAND_APR_PCT, carryChecks, carryEstimate, listingApr, multiDay, roundTrip, spreadOverHoldUsd } from './carry.ts';
 import { HOURS_PER_YEAR, aprPct, basisCostUsd, fillFeeBps, oneOffAprPct, takerFeesUsd } from './costs.ts';
 import {
-  FORTNIGHT_HOURS, HOUR_MS, RateStore, WEEK_HOURS, grossApr7d, grossAprOver, hourStart, intervalsAbove, legAprOver,
+  FORTNIGHT_HOURS, HOUR_MS, RateStore, WEEK_HOURS, grossApr7d, grossAprOver, hourStart, hourlyGrossApr, intervalsAbove, legAprOver,
   netAprSeries, round,
 } from './history.ts';
 import type { DropReason, LegKind, Pair, ScanLeg } from './pairs.ts';
@@ -127,6 +127,8 @@ export interface LegRates {
   d7AprPct: number | null;
   d14AprPct: number | null;
   oiUsd: number | null;          // open interest in USD
+  /** The venue's mark against its price 24 h ago, signed percent; absent or null where the venue does not say. */
+  priceMove24hPct?: number | null;
 }
 
 /** What the last scan expects of a desk window over the hold, with the legs' rates behind it. */
@@ -561,6 +563,23 @@ export class Scanner {
     return { windowId, points };
   }
 
+  /**
+   * The gross APR each complete hour paid on a window's legs (booked rates, else the scanner's own reads), for the
+   * hours starting in [fromMs, toMs) and before the current one; hours with a leg missing are left out. Null when the
+   * last scan did not list the window. The NEAR AI risk check ledger (book/risk-ledger.ts) prices refusals with it.
+   */
+  grossHours(windowId: string, fromMs: number, toMs: number): { t: number; grossAprPct: number }[] | null {
+    const pw = this.#priced.get(windowId);
+    if (pw === undefined) return null;
+    const out: { t: number; grossAprPct: number }[] = [];
+    const end = Math.min(toMs, hourStart(this.#lastAt));
+    for (let t = Math.ceil(fromMs / HOUR_MS) * HOUR_MS; t < end; t += HOUR_MS) {
+      const g = hourlyGrossApr(this.#rates, longSide(pw.pair.long), shortSide(pw.pair.short), t);
+      if (g !== null) out.push({ t, grossAprPct: round(g, 4) });
+    }
+    return out;
+  }
+
   /** The expected carry of a desk window the last scan listed, with its legs' rates; null for any other id. */
   carry(windowId: string): WindowCarry | null {
     return this.#carry.get(windowId) ?? null;
@@ -636,6 +655,7 @@ export class Scanner {
     return {
       venue: leg.venue, symbol: leg.symbol, nowAprPct: round(aprPct(ratePerHour), 3),
       d7AprPct: d7 === null ? null : round(d7, 3), d14AprPct: d14 === null ? null : round(d14, 3), oiUsd: leg.oiUsd,
+      ...(leg.prevDayPx == null || leg.venueMarkPx === null ? {} : { priceMove24hPct: round((leg.venueMarkPx / leg.prevDayPx - 1) * 100, 3) }),
     };
   }
 

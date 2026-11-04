@@ -616,6 +616,7 @@ export function parseFunding(
       oraclePx: s?.oracle_price ?? null,
       openInterest: s?.open_interest ?? null,      // base units (the config counts it in base lots)
       volume24hUsd: s?.day_volume_usd ?? null,
+      ...(typeof s?.prev_day_mark_price === 'number' ? { prevDayPx: s.prev_day_mark_price } : {}),
     });
   }
   return out;

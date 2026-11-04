@@ -1,7 +1,9 @@
-// What `npm run report` prints: one block per position and the desk's totals, from a BookSummary. Pure.
+// What `npm run report` prints: one block per position and the desk's totals, from a BookSummary, then the NEAR AI
+// risk check ledger (book/risk-ledger.ts) against those positions. Pure.
 
 import type { BookSummary, LegResult, PositionResult } from './derive.ts';
 import { signed } from './journal.ts';
+import type { PassResult, RefusalResult, RiskLedgerSummary } from './risk-ledger.ts';
 
 function when(t: number): string {
   return new Date(t).toISOString().replace('T', ' ').replace(/:\d\d\.\d{3}Z$/, ' UTC');
@@ -69,7 +71,62 @@ export function positionBlock(p: PositionResult): string[] {
   return out;
 }
 
-export function bookReport(s: BookSummary, notes: readonly string[] = []): string {
+function refusalLines(r: RefusalResult): string[] {
+  const c = r.check;
+  const head = `    ${when(c.at)}  ${c.kind} ${c.windowId} (${c.by}), ${c.legUsd.toFixed(2)} USD a leg at ${c.leverage}x, ${c.forecastNetAprPct.toFixed(2)} % net forecast`;
+  let result: string;
+  if (r.call === 'repeat') result = `      refused again inside the hold of ${r.repeatOf}: counted there, not again`;
+  else if (r.counterfactualUsd === null) result = `      no hour of its hold priced yet (from ${when(c.at)} + ${c.holdHours} h): pending`;
+  else {
+    const cost = c.roundTripCostUsd * Math.min(1, r.hours / c.holdHours);
+    const call = r.call === 'pending' ? `pending until all ${c.holdHours} h are priced, or 90 % once the hold is over`
+      : r.call === 'helped' ? 'helped: a loss avoided' : r.call === 'hurt' ? 'hurt: a gain given up' : 'even';
+    result = `      estimated ${signed(r.counterfactualUsd)} USD over ${r.hours} of ${c.holdHours} h (funding the refused leg would have earned, less`
+      + ` ${cost.toFixed(4)} USD of the ${c.roundTripCostUsd.toFixed(4)} USD round trip, prorated) -> ${call}`;
+  }
+  return [head, `      ${c.why}`, result];
+}
+
+function passLines(x: PassResult): string[] {
+  const c = x.check;
+  const p = x.position;
+  const result = p !== null
+    ? `      position ${p.id} ${p.open ? `OPEN, running net ${signed(p.netUsd)} USD so far` : `closed, realised net ${signed(p.netUsd)} USD`}`
+    : x.act === null ? '      no position: no act booked after it' : `      no position: ${x.act}`;
+  return [`    ${when(c.at)}  ${c.kind} ${c.windowId} (${c.by}), ${c.legUsd.toFixed(2)} USD a leg`, `      ${c.why}`, result];
+}
+
+/** The ledger section's lines; `null` when serve has booked no ledger next to this book. */
+export function riskLedgerLines(r: RiskLedgerSummary | null, file?: string): string[] {
+  const out = ['NEAR AI risk check ledger (helped / hurt)'];
+  if (r === null || r.totals.checks === 0) {
+    out.push(`  no risk check booked yet${file === undefined ? '' : ` (serve books them in ${file})`}`);
+    return out;
+  }
+  if (file !== undefined) out.push(`  file       ${file}`);
+  if (r.skipped > 0) out.push(`  skipped    ${r.skipped} line(s) that are not records`);
+  const t = r.totals;
+  out.push(`  refusals   ${t.refused}${t.repeats === 0 ? '' : ` (and ${t.repeats} repeat(s) inside an earlier refusal's hold)`}: each estimated from the`
+    + ' scanner\'s hourly gross over the full hold the loop would have taken (it leaves out the exits the loop\'s own bad checks would'
+    + ' have made); helped or hurt only once the whole hold is priced (90 % of it once the hold is over)');
+  for (const x of r.refusals) out.push(...refusalLines(x));
+  out.push(`  passes     ${t.passed}: each with the position its own act opened`);
+  for (const x of r.passes) out.push(...passLines(x));
+  if (t.unchecked > 0) {
+    out.push(`  unchecked  ${t.unchecked}: no answer (no key, a timeout, NEAR AI down), the window passed unchecked`);
+    for (const x of r.unchecked) out.push(...passLines(x));
+  }
+  out.push('  totals');
+  out.push(`    checks     ${t.checks}`);
+  out.push(`    refused    ${t.refused}: ${t.helped} helped, ${t.hurt} hurt, ${t.pending} pending; estimated ${signed(t.refusedCounterfactualUsd)} USD`
+    + ` over the fully priced ones (< 0: losses avoided, > 0: gains given up)${t.pending === 0 ? '' : `; pending so far ${signed(t.pendingCounterfactualUsd)} USD`}`);
+  out.push(`    passed     ${t.passed}: ${t.passedWithPosition} with a position, net ${signed(t.passedNetUsd)} USD (realised, open ones running)`);
+  out.push(`    unchecked  ${t.unchecked}: ${t.uncheckedWithPosition} with a position, net ${signed(t.uncheckedNetUsd)} USD`);
+  out.push('    The TEE attestation shown with a check is of the model\'s instances at the time; that a given reply came from them is not verified.');
+  return out;
+}
+
+export function bookReport(s: BookSummary, notes: readonly string[] = [], ledger: { summary: RiskLedgerSummary | null; file?: string } = { summary: null }): string {
   const out: string[] = [];
   const desk = s.desk === null ? 'unknown desk' : `${s.desk.mode} ${s.desk.contract ?? '-'} / ${s.desk.desk ?? '-'}`;
   out.push(`position book: ${desk}, as of ${when(s.at)} (${s.events} events)`);
@@ -101,7 +158,6 @@ export function bookReport(s: BookSummary, notes: readonly string[] = []): strin
   const d = s.deskTransfers;
   out.push(`  desk ledger ${d.count} entr${d.count === 1 ? 'y' : 'ies'} not tied to a position: in ${signed(d.inUsd, 2)}, out ${signed(d.outUsd, 2)}, fees ${signed(d.feeUsd)}`);
   out.push('');
-  out.push('NEAR AI risk check ledger (helped / hurt)');
-  out.push('  -- not recorded yet: this section joins when the risk check outcomes are booked --');
+  out.push(...riskLedgerLines(ledger.summary, ledger.file));
   return `${out.join('\n')}\n`;
 }

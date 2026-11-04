@@ -73,6 +73,12 @@ import { parseArgs } from 'node:util';
 import type { ContractPolicy, DeskState, Mode, StreamEvent } from '@gimbal/shared';
 import { ReplayOracle } from '../contract/replay-oracle.ts';
 import { NearAiClient } from '../nearai/client.ts';
+import type { Attestation } from '../nearai/attestation.ts';
+import { Attestor, readAttestationRecording } from '../nearai/attestation.ts';
+import { newestAttestationFile, riskCheckFiles } from '../nearai/recorded.ts';
+import { RiskLedger, riskLedgerFile } from '../book/risk-ledger.ts';
+import type { VetoSource } from '../strategy/veto.ts';
+import { RecordedVeto } from '../strategy/veto.ts';
 import { PolicyDrafter, deskMarkets } from '../nearai/draft-route.ts';
 import { StrategyStore, strategyFile } from '../strategy-store.ts';
 import { setupFromEnv } from '../setup/serve-setup.ts';
@@ -280,6 +286,13 @@ else if (saved.strategy !== null) log(`engine rules from ${strategyStore.path}`)
 const nearAi = new NearAiClient({ apiKey: envVar('NEAR_AI_API_KEY') });
 const drafter = new PolicyDrafter({ client: nearAi, markets: deskMarkets(readers.venues) });
 log(drafter.configured ? `policy drafts: NEAR AI ${drafter.model}` : 'policy drafts: off (NEAR_AI_API_KEY is not set), POST /policy/draft answers 503');
+// The NEAR AI risk check: the client with a key; replay with no key plays the risk check replies recorded by
+// `npm run record-nearai -w engine -- --risk-checks` (a prompt with no recorded reply passes, said so).
+const recordedChecks = mode === 'replay' && !nearAi.configured ? riskCheckFiles().filter((f) => !f.synthetic).map((f) => f.file) : [];
+const riskCheck: VetoSource = recordedChecks.length === 0 ? nearAi : RecordedVeto.fromFiles(recordedChecks);
+log(riskCheck === nearAi
+  ? `NEAR AI risk check: ${nearAi.configured ? `NEAR AI ${nearAi.model}` : 'no NEAR AI key: every enter and rotate passes unchecked, said so'}`
+  : `NEAR AI risk check: replay plays ${(riskCheck as RecordedVeto).size} recorded repl${(riskCheck as RecordedVeto).size === 1 ? 'y' : 'ies'} from ${recordedChecks.length} file(s); other prompts pass unchecked`);
 const setup = await setupFromEnv(mode, envVar, log).catch((err: unknown) => {
   if (err instanceof ConfigError) fail(`setup: ${errorMessage(err)}`);
   // Review S1: NEAR not answering at start turns POST /setup off for this run instead of stopping serve.
@@ -464,12 +477,62 @@ if (contract !== null && deskId !== null) {
     log(`book: NOT kept (${errorMessage(err)}); the loop runs without it until that file is fixed or moved and serve restarts`);
   }
 }
+// The TEE attestation of the model (nearai/attestation.ts): live modes fetch it at start and every day; replay plays
+// the newest recorded one, shown as not attested (it is not fresh). A failed attestation never blocks trading.
+let attestationJournalSeq = 0;
+const attestationJournal = (line: string, a: Attestation | null) => {
+  const t = Date.now();
+  publish({
+    type: 'journal',
+    data: {
+      id: `attestation-${t.toString(36)}-${++attestationJournalSeq}`, t, kind: a?.verified === true ? 'wait' : 'error', summary: line,
+      numbers: {
+        stage: 'attestation', attestation: attestor.label(), model: attestor.model,
+        ...(a === null ? {} : {
+          verified: a.verified ? 'yes' : 'no', source: a.source, fetchedAt: a.at, nonce: a.nonce,
+          steps: a.steps.map((s) => `${s.ok ? 'ok' : 'FAILED'} ${s.tee} ${s.step}: ${s.detail}`).join('; '),
+          tees: a.measurements.map((m) => `${m.tee} ${m.signingAddress} mrtd ${m.mrtd} rtmr3 ${m.rtmr3} compose ${m.composeHash}`).join('; '),
+          notChecked: a.notChecked.join('; '),
+        }),
+      },
+      tx: [],
+    },
+  });
+};
+let attestor: Attestor;
+{
+  const file = mode === 'replay' ? newestAttestationFile() : null;
+  let recorded;
+  try {
+    recorded = file === null ? undefined : readAttestationRecording(file);
+  } catch (err) {
+    log(`NEAR AI attestation: the recording ${file} is not read (${errorMessage(err)})`);
+  }
+  attestor = new Attestor({ model: nearAi.model, now: () => Date.now(), ...(recorded === undefined ? {} : { recorded }) });
+}
+if (mode === 'replay') {
+  log(attestor.last === null ? 'NEAR AI attestation: TEE not attested: replay has no recorded attestation (npm run record-nearai -w engine -- --attestation)' : attestor.line());
+  attestationJournal(attestor.line(), attestor.last);
+} else {
+  log('NEAR AI attestation: fetched in the background once the server runs, then every 24 h; checks show "TEE not attested" until it lands');
+}
+// The NEAR AI risk check ledger: every check's outcome next to the book (npm run report prices it as helped or hurt).
+let riskLedger: RiskLedger | null = null;
+try {
+  riskLedger = new RiskLedger(riskLedgerFile(
+    stateDirSet === undefined ? userStateDir(envVar) : resolve(stateDirSet), mode, contract?.client.contractId ?? null, deskId,
+  ), log);
+  log(`risk checks: booked in ${riskLedger.path}; npm run report shows them as helped or hurt`);
+} catch (err) {
+  log(`risk checks: NOT booked (${errorMessage(err)})`);
+}
 const booked = book === null ? null : loopBook(book, publish, log, () => loop?.held ?? null);
 if (booked !== null) protectionClosed = booked.protectionClose;
 loop = serveLoop({
   mode, env: envVar, once: false, contractId: contract?.client.contractId ?? null, deskId, pair, lastDesk: () => lastDesk,
   accounts: loopAccounts, rescueLive: () => rescueLive(), windows: () => server?.state().windows ?? null,
-  carry: (id) => scanner.carry(id), venues: readers.venues, veto: nearAi,
+  carry: (id) => scanner.carry(id), venues: readers.venues, veto: riskCheck, attestation: () => attestor.label(),
+  ...(riskLedger === null ? {} : { ledger: riskLedger, grossHours: (id: string, from: number, to: number) => scanner.grossHours(id, from, to) }),
   strategy: () => server?.strategy ?? saved.strategy ?? DEFAULT_STRATEGY, policy: () => policy, publish: booked?.publish ?? publish, clock, log,
   ...(booked === null ? {} : { book: booked.sink }),
   ...(stateDirSet === undefined ? {} : { stateDir: resolve(stateDirSet) }),
@@ -509,6 +572,21 @@ risk?.start();
 publishHealth();
 for (const event of earlyJournal.splice(0)) server.publish(event);
 for (const note of startNotes.splice(0)) startJournal(note.kind, note.summary);
+// The attestation, off the start path: it never holds up the server, the book or the protections. Its line is logged
+// and journaled when it lands, and again on every daily refresh.
+if (mode !== 'replay') {
+  void attestor.refresh().then((a) => {
+    log(attestor.line());
+    attestationJournal(attestor.line(), a);
+  }).catch((err: unknown) => {
+    // refresh() never throws; this is the line or the journal failing. Noted, never fatal.
+    log(`NEAR AI attestation: its start line was not written (${errorMessage(err)})`);
+  });
+  attestor.start((line, a) => {
+    log(line);
+    attestationJournal(line, a);
+  });
+}
 let intentsTimer: ReturnType<typeof setInterval> | undefined;
 if (mode !== 'replay') {
   // 1Click has no testnet: its mainnet API is probed in both live modes (a public GET, no key, nothing sent).
@@ -546,6 +624,7 @@ async function shutdown(reason: string): Promise<void> {
   clearInterval(monitorTimer);
   // The loop starts nothing new; an open or close it runs is waited for with the rest, under the same deadline.
   strategyLoop.stop();
+  attestor.stop();
   book?.stop();
   // No new trigger or desk read after this; a close already running (panic_close, a rescue's reduce, an ADL unwind)
   // is waited for, bounded, before the lock is released: pair-mainnet must not start next to it. One deadline covers

@@ -8,7 +8,9 @@ import { NEAR_AI_MODEL, NEAR_AI_URL, NearAiClient, NearAiUnavailable } from '../
 import { completion, fixedFetch } from '../nearai/test-helpers.ts';
 import { LOOP_RULES } from './decide.ts';
 import { PASS_FACTS, T0, VETO_FACTS, VETO_FIXTURE, win } from './test-helpers.ts';
-import { RecordedVeto, UNREADABLE_REPLY, checkVeto, parseVerdict, promptKey, vetoFacts, vetoJournalNumbers, vetoMessages } from './veto.ts';
+import {
+  RecordedVeto, UNREADABLE_REPLY, VETO_SYSTEM_PROMPT, checkVeto, parseVerdict, promptKey, riskCheckWhy, vetoFacts, vetoJournalNumbers, vetoMessages,
+} from './veto.ts';
 import type { VetoSource } from './veto.ts';
 
 const KEY = 'test-key-not-real';
@@ -59,21 +61,56 @@ test('no answer within the timeout: pass, "no NEAR AI risk check"', async () => 
   assert.equal(r.line, 'no NEAR AI risk check on NEAR: no answer within 0.05 s');
   // The prompt is still kept for the journal, with no answer.
   assert.deepEqual(r.exchange, { key: promptKey(vetoMessages(PASS_FACTS)), model: NEAR_AI_MODEL, messages: vetoMessages(PASS_FACTS), response: null });
+  assert.equal(r.outcome, 'timeout');
+  assert.equal(r.latencyMs, null);
+  assert.equal(riskCheckWhy(r, 'attested'), 'risk check timed out: passed');
   assert.equal(LOOP_RULES.vetoTimeoutMs, 5_000);
 });
 
-test('the exchange goes into a journal entry as strings: model, key, the facts sent, the reply as it came', async () => {
+test('the exchange goes into a journal entry: model, key, the exact prompt, the reply as it came, its latency', async () => {
   const { fetch } = fixedFetch(completion({ verdict: 'veto', reasons: ['a spike'] }));
-  const r = await checkVeto(new NearAiClient({ apiKey: KEY, fetch }), VETO_FACTS, { now: T0 });
+  let clock = 1_000;
+  const timer = () => (clock += 420);
+  const r = await checkVeto(new NearAiClient({ apiKey: KEY, fetch }), VETO_FACTS, { now: T0, timer });
+  assert.equal(r.latencyMs, 420);
   const n = vetoJournalNumbers(r.exchange!);
   assert.deepEqual(n, {
-    vetoModel: NEAR_AI_MODEL, vetoKey: r.exchange!.key, vetoPrompt: vetoMessages(VETO_FACTS)[1]!.content,
-    vetoReply: '{"verdict":"veto","reasons":["a spike"]}',
+    vetoModel: NEAR_AI_MODEL, vetoKey: r.exchange!.key, vetoSystem: VETO_SYSTEM_PROMPT, vetoPrompt: vetoMessages(VETO_FACTS)[1]!.content,
+    vetoReply: '{"verdict":"veto","reasons":["a spike"]}', vetoMs: 420,
   });
+  assert.ok(!JSON.stringify(n).includes(KEY), 'the key is in no journal number');
   assert.equal(vetoJournalNumbers({ ...r.exchange!, response: null }).vetoReply, '');
   // The same object is what a replay fixture holds: JSON round trip, then played back.
   const played = await checkVeto(new RecordedVeto([JSON.parse(JSON.stringify(r.exchange))]), VETO_FACTS, { now: T0 });
   assert.deepEqual(played.veto, r.veto);
+  // A recording plays back the latency it was recorded with.
+  assert.equal(played.latencyMs, 420);
+});
+
+test('the why line: verdict and one-line reason, with the attestation for a reply that came, or why not checked', async () => {
+  const { fetch } = fixedFetch(completion({ verdict: 'veto', reasons: ['a spike', '38.5 % in 24 h'] }));
+  const refused = await checkVeto(new NearAiClient({ apiKey: KEY, fetch }), VETO_FACTS, { now: T0 });
+  assert.equal(refused.outcome, 'refused');
+  assert.equal(riskCheckWhy(refused, 'attested'), 'NEAR AI risk check refused (attested): a spike; 38.5 % in 24 h');
+  const passed = await ask(completion({ verdict: 'pass', reasons: [] }));
+  assert.equal(riskCheckWhy(passed, 'not attested: the TDX quote failed'), 'NEAR AI risk check passed (not attested: the TDX quote failed): no red flag named');
+  const unreadable = await ask(completion('looks fine'));
+  assert.equal(unreadable.outcome, 'unreadable');
+  assert.match(riskCheckWhy(unreadable, 'attested'), /^NEAR AI risk check refused \(attested\): unreadable reply \(/);
+  const noKey = await checkVeto(new NearAiClient({ apiKey: undefined }), PASS_FACTS, { now: T0 });
+  assert.equal(riskCheckWhy(noKey, 'attested'), 'no NEAR AI key: not checked');
+  const rejected = await ask({ error: { message: 'invalid api key' } }, 401);
+  assert.equal(riskCheckWhy(rejected, 'attested'), 'NEAR AI key rejected (HTTP 401: invalid api key): not checked, passed');
+  const down = await ask({ error: { message: 'overloaded' } }, 503);
+  assert.equal(down.outcome, 'unavailable');
+  assert.equal(riskCheckWhy(down, 'attested'), 'NEAR AI risk check unavailable (NEAR AI answered HTTP 503: overloaded): passed');
+});
+
+test('an error that quotes the key never carries it into a line, a reason or the exchange', async () => {
+  const echo = fixedFetch({ error: { message: `bad key ${KEY}` } }, 500);
+  const r = await checkVeto(new NearAiClient({ apiKey: KEY, fetch: echo.fetch }), PASS_FACTS, { now: T0 });
+  assert.ok(!JSON.stringify(r).includes(KEY));
+  assert.ok(!riskCheckWhy(r, 'attested').includes(KEY));
 });
 
 const ask = (body: unknown, status = 200) =>
@@ -163,10 +200,9 @@ test('the prompt is the facts alone, deterministic, with unknowns as null', () =
   assert.equal(facts.gross_apr_pct_this_hour, 25.81);
   assert.equal(facts.gross_apr_pct_7d, 19.08);
   assert.equal(facts.hours_in_a_row_above_minimum, 3);
-  assert.equal(facts.days_since_listing, null);
   assert.deepEqual(facts.legs, [
-    { venue: 'hyperliquid', side: 'long', open_interest_usd: 27_400_000, book_depth_usd: 41_000 },
-    { venue: 'phoenix', side: 'short', open_interest_usd: 1_583_197, book_depth_usd: 6_200 },
+    { venue: 'hyperliquid', side: 'long', open_interest_usd: 27_400_000, book_depth_usd: 41_000, fill_impact_bps: 1.2, price_move_24h_pct: -2.1, days_since_listing: null },
+    { venue: 'phoenix', side: 'short', open_interest_usd: 1_583_197, book_depth_usd: 6_200, fill_impact_bps: 4.8, price_move_24h_pct: -2.1, days_since_listing: null },
   ]);
   assert.notEqual(promptKey(a), promptKey(vetoMessages(VETO_FACTS)));
 });
@@ -175,13 +211,17 @@ test('vetoFacts: a window\'s numbers plus what Window does not carry', () => {
   const w = win('near-hyperliquid-phoenix', { grossAprPct: 25.81, grossApr7dPct: 19.08, netAprPct: 9 });
   const f = vetoFacts(w, {
     kind: 'enter', legUsd: 12, leverage: 1.5, minNetAprPct: 5, hoursAbove: 3, grossApr14dPct: 17.4,
-    legs: { long: { openInterestUsd: 27_400_000, bookDepthUsd: 41_000 }, short: { openInterestUsd: 1_583_197, bookDepthUsd: 6_200 } },
-    priceMove24hPct: -2.1,
+    legs: {
+      long: { openInterestUsd: 27_400_000, bookDepthUsd: 41_000, fillImpactBps: 1.2, priceMove24hPct: -2.1 },
+      short: { openInterestUsd: 1_583_197, bookDepthUsd: 6_200, fillImpactBps: 4.8, priceMove24hPct: -2.1 },
+    },
   });
   assert.deepEqual(f, PASS_FACTS);
   const bare = vetoFacts(w, { kind: 'rotate', legUsd: 12, leverage: 1.5, minNetAprPct: 5, hoursAbove: 4 });
   assert.equal(bare.grossApr14dPct, null);
-  assert.deepEqual(bare.legs[1], { venue: 'phoenix', side: 'short', openInterestUsd: null, bookDepthUsd: null });
+  assert.deepEqual(bare.legs[1], {
+    venue: 'phoenix', side: 'short', openInterestUsd: null, bookDepthUsd: null, fillImpactBps: null, priceMove24hPct: null, daysSinceListing: null,
+  });
 });
 
 test('the recorded exchanges play back without a key; an unrecorded prompt is "no NEAR AI risk check"', async () => {
@@ -207,4 +247,12 @@ test('the recorded exchanges play back without a key; an unrecorded prompt is "n
   const other = await checkVeto(recorded, { ...PASS_FACTS, netAprPct: 9.5 }, { now: T0 });
   assert.equal(other.checked, false);
   assert.equal(other.line, 'no NEAR AI risk check on NEAR: no recorded NEAR AI risk check reply for this prompt');
+});
+
+test('a 200 reply that quotes the key is journaled and booked with the key cut, as errors are', async () => {
+  const { fetch } = fixedFetch(completion(`{"verdict":"pass","reasons":["key ${KEY} seen"]}`));
+  const r = await checkVeto(new NearAiClient({ apiKey: KEY, fetch }), PASS_FACTS, { now: T0 });
+  assert.ok(!JSON.stringify(r).includes(KEY));
+  assert.ok(!JSON.stringify(vetoJournalNumbers(r.exchange!)).includes(KEY));
+  assert.match(String(vetoJournalNumbers(r.exchange!).vetoReply), /key … seen/);
 });
