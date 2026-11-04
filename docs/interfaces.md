@@ -730,6 +730,11 @@ export interface Window {
                                     // back (its net APR leaves those moves out);
                                     // null when nothing is held or this is the held one
   stale: boolean;                   // a venue it needs did not answer: the numbers are from the last good read
+  marginMoveUsd?: Partial<Record<VenueId, number>>;
+                                    // desk windows: moving one leg's margin onto each leg's venue and back (1Click
+                                    // and venue fees), USD, whether or not margin sits there now. The entry gate
+                                    // adds it for a venue whose free margin cannot open a leg (the loop never moves
+                                    // margin to open), and holds the net after it to minNetAprPct
 }
 
 export interface WindowHistory {   // GET /windows/history?id=<window id>: hourly net APR, oldest first
@@ -938,7 +943,9 @@ anywhere the policy does not allow.
 
 - `decide.ts` (pure): `decide(DecideInput) → Decision` with the shapes in that file. Entry: the top of the
   scanner's ranked list among the windows passing the entry rules (`isEnterable`, `netAprPct ≥ minNetAprPct`, the
-  7 d and 14 d spread signs agreeing with this hour's, depth on both legs), once it has passed them for
+  7 d and 14 d spread signs agreeing with this hour's, depth on both legs, and the net still at the minimum after
+  `Window.marginMoveUsd` for each leg venue whose free margin cannot open a 10 USD leg at the leverage; the loop
+  never moves margin to open, so such a window cannot be entered cheaply), once it has passed them for
   `LOOP_RULES.enterAfterChecks` hourly checks in a row; until then the loop waits on it ("k of N hours") and never
   enters a lower window instead. Size: `legUsd` capped by the policy's `max_notional_usd` less the band, by free
   margin at the leverage and by depth, rounded down to whole common lots; a cap that is not a finite number or is

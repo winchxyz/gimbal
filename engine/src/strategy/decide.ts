@@ -169,7 +169,37 @@ function vetoHoursLeft(c: Pick<LoopCounters, 'vetoedUntil'> | undefined, id: str
 /** Why a window fails the entry rules: a category (the wait journal key) and a line. */
 interface GateFailure { code: string; text: string }
 
-type GateInput = Pick<DecideInput, 'strategy' | 'gross14dAprPct'> & Partial<Pick<DecideInput, 'now' | 'counters'>>;
+type GateInput = Pick<DecideInput, 'strategy' | 'gross14dAprPct'>
+  & Partial<Pick<DecideInput, 'now' | 'counters' | 'freeMarginUsd' | 'freedMarginUsd' | 'liveRescue'>>;
+
+/** The leverage sizeFor opens a window's legs at: the owner's, at most MAX_LEVERAGE, lower when a leg has no live rescue. */
+function legLeverage(w: FundingWindow, input: Pick<DecideInput, 'strategy'> & Partial<Pick<DecideInput, 'liveRescue'>>): number {
+  const noRescue = [w.longVenue, w.shortVenue].some((v) => input.liveRescue?.[v] !== true);
+  return Math.min(input.strategy.maxLeverage, MAX_LEVERAGE, noRescue ? NO_RESCUE_MAX_LEVERAGE : Infinity);
+}
+
+/**
+ * The margin moves entering `w` would need: its leg venues whose free margin (plus what a close frees first) cannot
+ * open even a MIN_LEG_USD leg at the leverage sizeFor uses, priced by the scanner (Window.marginMoveUsd: onto the
+ * venue and back). sizeFor sizes a leg down to the free margin and the loop never moves margin to open, so a venue
+ * with some margin costs no move; one without needs it moved there first. Null when nothing is known to move: no
+ * free margin read (callers outside decide()), or no move priced.
+ */
+function marginMoves(w: FundingWindow, input: GateInput): { usd: number; venues: string[]; leverage: number } | null {
+  if (input.freeMarginUsd === undefined || w.marginMoveUsd === undefined) return null;
+  const leverage = legLeverage(w, input);
+  let total = 0;
+  const venues: string[] = [];
+  for (const v of [w.longVenue, w.shortVenue]) {
+    const free = (input.freeMarginUsd[v] ?? 0) + (input.freedMarginUsd?.[v] ?? 0);
+    if (finite(free) && free * leverage >= MIN_LEG_USD) continue;
+    const cost = w.marginMoveUsd[v as keyof typeof w.marginMoveUsd];
+    if (cost === undefined || !finite(cost)) continue;
+    total += cost;
+    venues.push(venueName(v));
+  }
+  return venues.length === 0 ? null : { usd: total, venues, leverage };
+}
 
 function gate(w: FundingWindow, input: GateInput): GateFailure | null {
   const min = input.strategy.minNetAprPct;
@@ -197,6 +227,19 @@ function gate(w: FundingWindow, input: GateInput): GateFailure | null {
   if (d14 !== null && !(d14 > 0)) return { code: '14d', text: `the 14-day spread is ${pct(d14)}` };
   const need = legUsd / DEFAULT_SCANNER_CONFIG.deskMaxOiShare;
   if (w.depthUsd < need) return { code: 'depth', text: `capacity ${usd(w.depthUsd)}, under the ${usd(need)} a ${usd(legUsd)} leg needs` };
+  // Its net leaves the margin moves out (the scanner shows them apart): where no margin sits, they are paid on entry,
+  // so the net after them, spread over the same hold, must still clear the minimum.
+  const moves = marginMoves(w, input);
+  if (moves !== null) {
+    const after = w.netAprPct - (moves.usd / legUsd) * (HOURS_PER_YEAR / DEFAULT_SCANNER_CONFIG.costs.holdHours) * 100;
+    if (!(after >= min)) {
+      return {
+        code: 'moves',
+        text: `${pct(w.netAprPct)} net, but no free margin on ${moves.venues.join(' or ')} opens a leg at ${lev(moves.leverage)}: `
+          + `moving it there and back costs ${usd(moves.usd)}, ${pct(after)} net after that, under your ${minimum(min)} minimum`,
+      };
+    }
+  }
   return null;
 }
 

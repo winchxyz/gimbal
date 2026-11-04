@@ -91,6 +91,43 @@ test('the entry rules: enterable, net at the minimum, this hour, 7 and 14 days o
   assert.equal(entryFailure(win(XLM, { depthUsd: 600 }), s), null);
 });
 
+// ---- margin moves on entry ----
+
+const ETH_OR = 'eth-orderly-phoenix';
+/** Moving a 6 USD margin onto each venue and back, as the scanner prices it (1Click and venue fees). */
+const MOVES = { orderly: 1.55, phoenix: 1.4, hyperliquid: 1.5 };
+
+test('margin moves: the same window passes with margin on both venues and fails when moving it there sinks the net', () => {
+  const held = { strategy: STRATEGY, freeMarginUsd: { orderly: 50, phoenix: 50 }, liveRescue: { hyperliquid: true } };
+  assert.equal(entryFailure(win(ETH_OR, { marginMoveUsd: MOVES }), held), null);
+  // No margin on Orderly: 1.55 USD on a 12 USD leg over the 240 h hold is 471 APR points.
+  const none = { ...held, freeMarginUsd: { phoenix: 50 } };
+  assert.equal(entryFailure(win(ETH_OR, { marginMoveUsd: MOVES }), none),
+    '15.0 % net, but no free margin on Orderly opens a leg at 1.5x: moving it there and back costs $1.55, -456.5 % net after that, under your 10 % minimum');
+  // Some margin is enough: the leg is sized down to it (sizeFor), nothing moves. 6.67 USD at 1.5x opens 10 USD.
+  assert.equal(entryFailure(win(ETH_OR, { marginMoveUsd: MOVES }), { ...held, freeMarginUsd: { orderly: 6.67, phoenix: 50 } }), null);
+  assert.match(entryFailure(win(ETH_OR, { marginMoveUsd: MOVES }), { ...held, freeMarginUsd: { orderly: 6.6, phoenix: 50 } })!, /no free margin on Orderly/);
+  // Both missing: both moves count. What a close frees first counts as margin there (a rotation).
+  assert.match(entryFailure(win(ETH_OR, { marginMoveUsd: MOVES }), { ...held, freeMarginUsd: {} })!, /on Orderly or Phoenix .* costs \$2\.95/);
+  assert.equal(entryFailure(win(ETH_OR, { marginMoveUsd: MOVES }), { ...none, freedMarginUsd: { orderly: 8 } }), null);
+  // A move cheap enough for the net to stay above the minimum passes: 0.01 USD is 3 points.
+  assert.equal(entryFailure(win(ETH_OR, { marginMoveUsd: { orderly: 0.01, phoenix: 0.01 } }), none), null);
+  // Outside decide() (no free margin read) or with no move priced, nothing is known to move.
+  assert.equal(entryFailure(win(ETH_OR, { marginMoveUsd: MOVES }), { strategy: STRATEGY }), null);
+  assert.equal(entryFailure(win(ETH_OR), none), null);
+});
+
+test('margin moves: a top window that would need them is passed over, and the next one on held margin is entered', () => {
+  const windows = () => [win(ETH_OR, { netAprPct: 30, marginMoveUsd: MOVES }), win(XLM, { netAprPct: 14.2, marginMoveUsd: MOVES })];
+  const free = { hyperliquid: 7.68, phoenix: 9.75 };
+  const ds = hours(input({ freeMarginUsd: free }), 3, windows);
+  assert.deepEqual(actions(ds), ['wait', 'wait', 'enter']);
+  assert.equal(ds[2]!.act?.kind === 'enter' && ds[2]!.act.windowId, XLM);
+  // With margin on Orderly it is the top window, and entered.
+  const withOrderly = hours(input({ freeMarginUsd: { ...free, orderly: 9 } }), 3, windows);
+  assert.equal(withOrderly[2]!.act?.kind === 'enter' && withOrderly[2]!.act.windowId, ETH_OR);
+});
+
 test('a number the gate reads that is not finite fails the gate with a reason', () => {
   const s = { strategy: STRATEGY };
   assert.equal(entryFailure(win(XLM, { netAprPct: NaN }), s), 'its net APR is not a number (NaN)');

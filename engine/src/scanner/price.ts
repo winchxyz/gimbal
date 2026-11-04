@@ -133,6 +133,7 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
 
   let breakdown: CostBreakdown;
   let fills: PricedWindow['fills'] = null;
+  let marginMoveUsd: FundingWindow['marginMoveUsd'];
   const checks: FundingWindow['checks'] = [];
   const staleVenues = [long, short].filter((l) => l.stale).map((l) => l.venue);
   let oldest = Math.min(long.readAt, short.readAt);
@@ -162,6 +163,10 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
     // venue and leaving means moving it back: both trips are part of what the window costs.
     const moving = [lv, sv].filter((v) => !(ctx.marginHeldAt?.has(v) ?? false));
     const transferUsd = moving.reduce((s, v) => s + marginRoundTripUsd(v, margin, ctx.costs.reserveAt, ctx.costs.transfers), 0);
+    marginMoveUsd = {
+      [lv]: round(marginRoundTripUsd(lv, margin, ctx.costs.reserveAt, ctx.costs.transfers), 4),
+      [sv]: round(marginRoundTripUsd(sv, margin, ctx.costs.reserveAt, ctx.costs.transfers), 4),
+    };
     breakdown = {
       feesUsd: takerFeesUsd(L, longBps, shortBps),
       transferUsd,
@@ -252,6 +257,7 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
     checks: [...head, ...verdict.checks, ...quality, ...checks, ...tail],
     switchCostUsd: null,
     stale: staleVenues.length > 0,
+    ...(marginMoveUsd === undefined ? {} : { marginMoveUsd }),
   };
   return { ok: true, priced: { pair, window, costsApr, breakdown, fills, flagged: quality.length > 0 } };
 }

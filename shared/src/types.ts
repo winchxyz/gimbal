@@ -55,6 +55,11 @@ export interface Window {
                                     // back (its net APR leaves those moves out);
                                     // null when nothing is held or this is the held one
   stale: boolean;                   // a venue it needs did not answer: the numbers are from the last good read
+  marginMoveUsd?: Partial<Record<VenueId, number>>;
+                                    // desk windows: moving one leg's margin onto each leg's venue and back (1Click
+                                    // and venue fees), USD, whether or not margin sits there now. The entry gate
+                                    // adds it for a venue whose free margin cannot open a leg (the loop never moves
+                                    // margin to open), and holds the net after it to minNetAprPct
 }
 
 export interface WindowHistory {   // GET /windows/history?id=<window id>: hourly net APR, oldest first
