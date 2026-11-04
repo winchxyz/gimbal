@@ -334,7 +334,12 @@ test('until: a value past it is refused with no marker, also when it passes duri
   const withUntil = (id: string, until: string) => JSON.stringify({ id, method: 'POST', path: '/close', until });
   assert.equal(parseControl(withUntil('u', '2026-11-05T10:31:00Z')).until, Date.UTC(2026, 10, 5, 10, 31));
   assert.equal(parseControl(withUntil('u', '2026-11-05T12:31:00.000+02:00')).until, Date.UTC(2026, 10, 5, 10, 31));
-  for (const bad of ['2026-11-05', '2026-11-05T10:31:00', 'tomorrow', '2026-13-45T10:31:00Z']) {
+  // Dates and times that do not exist are refused, not rolled over (Date.parse reads 2026-02-30 as March 2).
+  assert.equal(parseControl(withUntil('u', '2028-02-29T23:59:59.5-05:00')).until, Date.parse('2028-03-01T04:59:59.500Z'));
+  for (const bad of [
+    '2026-11-05', '2026-11-05T10:31:00', 'tomorrow', '2026-13-45T10:31:00Z', '2026-02-30T10:00:00Z', '2026-04-31T10:00:00+02:00',
+    '2026-11-05T24:00:00Z', '2026-11-05T10:61:00Z', '2026-11-05T10:31:60Z', '2026-11-05T10:31:00+25:00',
+  ]) {
     assert.throws(() => parseControl(withUntil('u', bad)), /until .* is not an ISO time with a zone/, bad);
   }
   assert.throws(() => parseControl(JSON.stringify({ id: 'u', method: 'POST', path: '/close', until: 1 })), /until 1 is not/);

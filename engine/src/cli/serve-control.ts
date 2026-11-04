@@ -75,9 +75,7 @@ export function parseControl(value: string): ControlAsk {
   const { id, method, path, body, until } = o;
   let untilMs: number | undefined;
   if (until !== undefined) {
-    // An ISO time with a date, a time and a zone (Z or an offset): never a local time read differently by each host.
-    const iso = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})$/;
-    untilMs = typeof until === 'string' && iso.test(until) ? Date.parse(until) : NaN;
+    untilMs = typeof until === 'string' ? isoWithZone(until) : NaN;
     if (!Number.isFinite(untilMs)) throw new Error(`${CONTROL_ENV}: until ${JSON.stringify(until)} is not an ISO time with a zone, e.g. "2026-11-06T18:00:00Z"`);
   }
   if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,40}$/.test(id)) throw new Error(`${CONTROL_ENV}: id ${JSON.stringify(id)} is not [A-Za-z0-9_-]{1,40}`);
@@ -93,6 +91,23 @@ export function parseControl(value: string): ControlAsk {
     runId: id, method: m, path: p, ...(p === '/close' ? {} : { body: body as Record<string, unknown> }),
     ...(untilMs === undefined ? {} : { until: untilMs }),
   };
+}
+
+/**
+ * ms of an ISO time with a date, a time and a zone (Z or an offset; never a local time each host reads its own way),
+ * or NaN. The date and time must exist: Date.parse rolls 2026-02-30 over into March, so the parsed time is written
+ * back in the given zone and must read as given.
+ */
+export function isoWithZone(text: string): number {
+  const m = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|([+-])(\d{2}):(\d{2}))$/.exec(text);
+  if (m === null) return NaN;
+  const ms = Date.parse(text);
+  if (!Number.isFinite(ms)) return NaN;
+  const offsetMin = m[4] === 'Z' ? 0 : (m[5] === '-' ? -1 : 1) * (Number(m[6]) * 60 + Number(m[7]));
+  if (m[4] !== 'Z' && (Number(m[6]) > 23 || Number(m[7]) > 59)) return NaN;
+  const wall = new Date(ms + offsetMin * 60_000).toISOString();   // YYYY-MM-DDTHH:MM:SS.mmmZ, in the given zone
+  const given = `${m[1]}:${m[2] ?? '00'}.${(m[3] ?? '').padEnd(3, '0')}`;
+  return wall.slice(0, 23) === given ? ms : NaN;
 }
 
 /** The request a run sends, as one string: method, path and body with its keys sorted (a marker is matched on it). */

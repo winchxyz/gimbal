@@ -203,7 +203,8 @@ scan.
   `minNetAprPct` and keeps every other check: the window must be in the last scan, tradable and not stale, pass its
   checks, not be held out by the NEAR AI risk check, be in a direction the pair trader opens, and size within the
   free margin and the policy. It is checked and sized again when it runs, and the NEAR AI risk check runs as for any
-  enter. With a pair held it closes that pair first. The route needs `auto` on and answers `409 auto is off`
+  enter; its prompt says the trade was asked by hand and the owner's minimum is waived, with no streak (an auto
+  enter's prompt carries both). A refusal holds that window out for 6 h: then rotate into another one. With a pair held it closes that pair first. The route needs `auto` on and answers `409 auto is off`
   otherwise.
 - **`POST /close`**: both legs, reduce-only. It works with `auto` on or off and answers `409 no pair is held` when
   there is none.
@@ -240,8 +241,11 @@ per-leg or per-venue line (`POST /stress`, which targets one leg, is refused on 
   Under the smallest amount, or over what is left of `rescue_cap_usd_per_hour`, the rescue **reduces both legs**
   instead of moving margin, and a reduce of a 12 USD leg can run into Hyperliquid's 10 USD order minimum. The
   `rescue routes` start lines say which routes run on this deployment.
-- **Worked example**, a 12 USD Hyperliquid short at 3x (4 USD margin, maintenance about 2 %): its distance is
-  (4/12 − 0.02) / 1.02 ≈ 30.7 %. For at least 2.86 USD to move, the watch line must be at least about 54.1 %: with
+- **Worked example**, a 12 USD Hyperliquid short at 3x, counted as if isolated (4 USD margin, maintenance about
+  2 %): its distance is (4/12 − 0.02) / 1.02 ≈ 30.7 %. The desk's Hyperliquid account is cross margin: all its
+  USDC backs the leg, so the live distance is higher than this whenever the account holds more than the leg's own
+  margin, and each point then costs more. Use these numbers for the shape only and read both legs' live distances
+  before you pick the lines. For at least 2.86 USD to move, the watch line must be at least about 54.1 %: with
   `"watchDistancePct":56` the rescue moves (0.56 × 1.02 + 0.02 − 0.333) × 12 ≈ 3.10 USD (it sends about 3.45 with
   1Click's fee and slippage room). With the old rule of thumb, watch 36 against 30 %, it would be about 0.72 USD:
   under the minimum, so it would reduce both legs instead.
@@ -278,8 +282,8 @@ the old one's rescue. So:
 Run each step only after the previous one's result line. Every body is an example: build each from the rules the
 log printed. `<rules>` below stands for every field of that line, with the changes listed.
 
-1. **Demo rules** (`PUT /strategy`): `auto` true, `minNetAprPct` 1000 (the loop then enters nothing by itself; a
-   `/rotate` skips this minimum), `rotate.minGainPts` 1000 (no rotation by itself), `exitAfterChecks` 24, and
+1. **Demo rules** (`PUT /strategy`): `auto` true, `minNetAprPct` 1000 (the loop then enters nothing under 1000 % net
+   by itself, which in practice is nothing; a `/rotate` skips this minimum), `rotate.minGainPts` 1000 (no rotation by itself), `exitAfterChecks` 24, and
    `legUsd` the size you want. With `auto` true and this minimum the held pair counts as compressed at every hourly
    check, so the loop exits it by itself after 24 hourly checks: finish the demo within a day. The drawdown and time
    stops still act. Without the high minimum, the check a `PUT` runs at once could enter the top window by itself
@@ -291,15 +295,21 @@ log printed. `<rules>` below stands for every field of that line, with the chang
 
    Wait for `control: done: PUT /strategy answered 200`. Keep its `engine rules before the call` line: it holds your
    own rules for step 6.
-2. **Enter** (`POST /rotate`). Wait for `journal   enter: enter <window id>, ...` (or `error` / `refused`).
+2. **Enter** (`POST /rotate`). Pick the window and a backup from the scan lines or the Windows view first. Wait for
+   `journal   enter: enter <window id>, ...` (or `error` / `refused`). A `veto` / `refused ... NEAR AI risk check`
+   line means the model refused that window (held out for 6 h): send the same step with the backup window and a new
+   run-id.
 
    ```
-   '{"id":"demo-enter","method":"POST","path":"/rotate","until":"2026-11-06T18:00:00Z","body":{"windowId":"eth-hyperliquid-phoenix"}}' | railway variable set GIMBAL_CONTROL --stdin
+   '{"id":"demo-enter","method":"POST","path":"/rotate","until":"2026-11-06T18:00:00Z","body":{"windowId":"eth-phoenix-hyperliquid"}}' | railway variable set GIMBAL_CONTROL --stdin
+   '{"id":"demo-enter-2","method":"POST","path":"/rotate","until":"2026-11-06T18:00:00Z","body":{"windowId":"sol-phoenix-hyperliquid"}}' | railway variable set GIMBAL_CONTROL --stdin
    ```
+
+   (the second line only after a refusal of the first).
 
 3. **Raise the rescue line** (`PUT /strategy`, the step 1 rules with the new `risk`), once the legs are far enough
-   apart and the reserve covers the rescue (above). For the 12 USD Hyperliquid short at 30.7 % with the long at
-   33 % or more: `"risk":{"watchDistancePct":56,"rescueDistancePct":31.5}`. Wait for the rescue's end line.
+   apart and the reserve covers the rescue (above). For a 12 USD Hyperliquid short that reads 30.7 % live, with the
+   long at 33 % or more: `"risk":{"watchDistancePct":56,"rescueDistancePct":31.5}`. Wait for the rescue's end line.
 4. **Restore** (`PUT /strategy`, the step 1 rules as they were: `"risk":{"watchDistancePct":15,"rescueDistancePct":8}`),
    set straight over step 3. Wait for `control: done: PUT /strategy answered 200`.
 5. **Close** (`POST /close`). Wait for `journal   exit: exit <window id>: ...`.

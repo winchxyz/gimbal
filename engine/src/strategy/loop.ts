@@ -1201,7 +1201,7 @@ export class StrategyLoop {
     }) as { long?: VetoLegFacts; short?: VetoLegFacts };
     const facts = vetoFacts(w, {
       kind: p.kind, legUsd: p.legUsd, leverage: p.leverage, minNetAprPct: this.#o.strategy().minNetAprPct, hoursAbove: p.hoursAbove,
-      grossApr14dPct: p.facts.gross14dAprPct?.[w.id] ?? null,
+      grossApr14dPct: p.facts.gross14dAprPct?.[w.id] ?? null, manual: p.manual,
       legs: { long: { ...extra.long, openInterestUsd: oi?.longUsd ?? null }, short: { ...extra.short, openInterestUsd: oi?.shortUsd ?? null } },
     });
     const result = await checkVeto(this.#o.veto ?? NO_VETO_SOURCE, facts, { now, timeoutMs: this.#o.vetoTimeoutMs ?? LOOP_RULES.vetoTimeoutMs });
