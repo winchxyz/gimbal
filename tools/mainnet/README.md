@@ -53,8 +53,8 @@ Money paths that are **not available yet**:
   EVM address on Arbitrum, then `evm_usdc_to_intents` (operator) and 1Click from Arbitrum USDC to the contract.
   It costs Hyperliquid's 1 USDC withdrawal fee, the 1Click cost and the relayer's Arbitrum gas, so the fixed
   1 USDC weighs on small amounts.
-- **Orderly.** `fund.mjs orderly` needs the receiver pinned with `set_orderly_receiver` (an owner call these tools
-  do not make) and at least 6 USDC out.
+- **Orderly.** `fund.mjs orderly` needs the receiver pinned with `set_orderly_receiver` (`orderly.mjs receiver`,
+  "Orderly: receiver and IP list") and at least 6 USDC out.
 
 ## Retiring a canary
 
@@ -372,8 +372,8 @@ funded, the setup steps in step 6 that depend on funding stay waiting or fail, a
 - **Phoenix:** the desk's Solana authority is the fee payer of the registration transaction
   (`engine/src/setup/phoenix.ts`), so it likely needs a little SOL before `phoenix_register` can succeed: at least
   the 0.000005 SOL signature fee. Whether it also pays the trader account's rent is not checked yet.
-- **Orderly:** after `orderly_receiver_lookup`, the owner pins the receiver with `set_orderly_receiver` (an
-  owner call, not part of this runbook).
+- **Orderly:** after `orderly_receiver_lookup`, the owner pins the receiver with `set_orderly_receiver`
+  (`orderly.mjs receiver`, "Orderly: receiver and IP list").
 
 ## 5. Relayer wallet
 
@@ -461,7 +461,8 @@ curl -sN http://127.0.0.1:8790/events
   - `orderly_register`, `orderly_add_key`, `orderly_receiver_lookup`, `orderly_referral_bind`, `orderly_ip_restriction`
   - `phoenix_register`, `phoenix_referral`
 - Each step reads the venue first and skips what is already done, so running POST /setup again is safe. A
-  referral step without a code is `skipped`. `orderly_ip_restriction` is skipped without a `set_orderly_ips` list.
+  referral step without a code is `skipped`. `orderly_ip_restriction` is skipped without a `set_orderly_ips` list
+  (`orderly.mjs ips`, then `orderly.mjs apply-ips`: "Orderly: receiver and IP list").
 
 - **Cost:** each operator call reserves about 0.3 NEAR of gas, held against both the key's allowance and the
   owner's balance until the refund. The real fee is about 0.001 NEAR. The contract pays 1 yoctoNEAR per MPC
@@ -503,7 +504,7 @@ and running it again is safe.
   - the signed GET `/v1/client/asset/receiver_address?chain_id=42161&token=USDC`. The whole answer is printed.
 
   It binds no referral code and sets no IP restriction. It does not pin the receiver: `set_orderly_receiver` is
-  the owner's call.
+  the owner's call (`orderly.mjs receiver`).
 - **quotes:** dry 1Click quotes (`dry: true`). They reserve no deposit address. The step asks two quotes out of
   HyperCore: to the desk's Solana authority (Solana USDC), and to the contract with `{"desk_id":"<desk_id>"}`
   (USDC on NEAR). It also asks one control quote into HyperCore. The question is whether 1Click still answers
@@ -599,7 +600,7 @@ about 6.3), 0.7 free on the owner for the desk, and 0.3 NEAR free on the owner p
    ```
 
    `refresh_prices` goes out at 300 TGas (the C8 contract refuses under 240). To fund Orderly later, the owner
-   pins the receiver that the orderly step prints with `set_orderly_receiver` (not in these tools).
+   pins the receiver that the orderly step prints with `orderly.mjs receiver` ("Orderly: receiver and IP list").
 
 6. **Deposit** 30 USDC from the owner:
 
@@ -902,6 +903,105 @@ DeleteKey and signs nothing; add `--send`, from the main checkout, to send it. I
 have, a full-access key, and at `--send` a key file that is not a full-access key of the account or that is the key
 to delete. Use it to remove an operator key whose contract was retired (receiver `gimbal-canary.near`): a retired
 name can be registered again by anyone.
+
+## Orderly: receiver and IP list
+
+Before a desk trades Orderly, the owner sets two things the operator key cannot: the receiver that funding pays
+(`set_orderly_receiver`) and the IPs Orderly may take the desk's key from (`set_orderly_ips`). Then the contract signs
+`orderly_request` kind `ip_restriction` for that list. On mainnet the contract refuses every Orderly order that is
+not reduce-only (`E_ARGS`) until the desk has a list and the contract signed its `ip_restriction`
+(`get_desk_settings`' `orderly_ips_applied`; a new list clears it). Reduce-only closes are always signed.
+
+```
+node tools/mainnet/orderly.mjs status    <contract>.near <desk_id> [--send]
+node tools/mainnet/orderly.mjs receiver  <contract>.near <desk_id> [0x<receiver>] [--key-file <owner key json>] [--send]
+node tools/mainnet/orderly.mjs ips       <contract>.near <desk_id> <ip[,ip...]> [--force-same] [--key-file <owner key json>] [--send]
+node tools/mainnet/orderly.mjs apply-ips <contract>.near <desk_id> --engine-ips <ip[,ip...]> [--send]
+```
+
+Each is a dry run without `--send`: it reads mainnet, prints every call in full (signer, receiver, method, args,
+deposit, gas) and a `money` line, signs nothing and reads no key. `--send` refuses in a linked worktree. The operator
+key comes from `.keys/engine-mainnet-<contract>.near.env` (or `--env-file`), checked against the chain as `checks.mjs`
+does; the owner's key from `--key-file`, which must be a full-access key of the desk owner. Neither is printed. Each
+run ends with a block, `=== gimbal orderly <command> ... ===` to `=== end ===`. No USDC moves in any of them.
+
+- **status** prints `get_desk`'s `orderly_receiver` and `orderly_ips`, `orderly_ips_applied`, an `opens` line (whether
+  the contract signs Orderly orders that grow a position), and Orderly's public view of the account (registered, the
+  key's state). The holding and the receiver are not public, so **`status --send` signs reads**: two
+  `orderly_request` calls, kinds `holding` and `receiver_address` (the operator key, gas only, nothing else signed).
+  It prints the holding and compares the pinned receiver with Orderly's answer: a match, Orderly's answer and the
+  command that pins it when none is pinned, or `MISMATCH` and a non-zero exit when the pinned one is not Orderly's
+  answer (fund nothing into Orderly then; the pin is permanent, so the fix is a new desk). Run it before and after
+  each step below.
+- **receiver** pins `set_orderly_receiver({"desk_id","receiver"})`, signed by the owner, with 0.01 NEAR attached and
+  50 TGas: the contract keeps what the pin takes (under 0.001 NEAR) and refunds the rest. Orderly gives the receiver
+  only to a request the desk key signed, so `--send` first has the contract sign `orderly_request` kind
+  `receiver_address` (the operator key) and reads Orderly's answer:
+  - without an address, `--send` stops there: it prints the address and the command that pins it;
+  - with an address (any case, sent lowercase), `--send` pins it only when it is Orderly's answer, else refuses with
+    nothing pinned.
+
+  **The pin is permanent** (the contract takes it once, `E_ARGS` the second time): every `fund_venue` and rescue into
+  Orderly pays it, and a wrong one needs a new desk. An address already pinned is `nothing to send`; another one is
+  refused. It refuses while Orderly has no account or no active trading key for the desk (`checks.mjs --step orderly
+  --send` first).
+- **ips** sets `set_orderly_ips({"desk_id","ips"})`, signed by the owner, with 0.01 NEAR attached and 50 TGas (the
+  contract keeps at most about 0.005 NEAR for 10 IPv6 addresses). It prints the current list and the new one. The
+  list is 1 to 10 distinct addresses, separated by commas, in the form the contract takes (Rust's: IPv4 without
+  leading zeros, IPv6 lowercase with the longest zero run as `::`): a form it would refuse is refused here with the
+  form to write. Private, loopback, link-local, multicast, carrier-grade NAT and documentation addresses are
+  refused too, since Orderly never sees a request come from them; so is an IPv4-mapped IPv6 address (give the IPv4
+  one); so are NAT64 (`64:ff9b::/96`, and the local-use `64:ff9b:1::/48`), 6to4 (`2002::/16`) and the 6to4 relay
+  (`192.88.99.0/24`), which stand for an IPv4 address Orderly would see instead. The same list again is `nothing to
+  send` (it would only clear `orderly_ips_applied`) unless `--force-same` is given: then it sends it, only to clear
+  the flag (see below); with the flag false already, `--force-same` is `nothing to send` too. After it, opens stay
+  refused until `apply-ips`.
+- **apply-ips** runs the engine's own setup (`runSetup`), cut to its Orderly steps as `checks.mjs` does: register
+  and add-key as done-checks only, `orderly_receiver_lookup` (a signed read; it fails when a pinned receiver is not
+  Orderly's answer, and the run then exits non-zero with a `FAILED` line) and `orderly_ip_restriction`, in which the
+  contract signs `ip_restriction` for the stored list and this machine posts `POST
+  /v1/client/set_orderly_key_ip_restriction {"orderly_key","ip_restriction_list"}` to Orderly. The operator key may
+  sign only `orderly_request` of those two kinds. `--send` needs `--engine-ips`, every IP the engine sends from;
+  this machine's IP is never taken for the engine's. Like the engine's step, it refuses, nothing signed, while the
+  list leaves out one of them. It also looks up this machine's public IP (`api.ipify.org`, then
+  `checkip.amazonaws.com`) and says whether it is in the list: once Orderly applies the list, a machine outside it
+  cannot post a correction or read the holding. When the contract has the list marked applied already and this
+  machine is not in it, `--send` refuses before signing: Orderly, if it holds the list, would refuse the post from
+  here, so post it from a listed IP (the engine's POST /setup).
+
+  **When the post fails after the contract signed.** The contract sets `orderly_ips_applied` when it signs
+  `ip_restriction`, before this machine posts it. The tool reads the flag right before the run and again after it,
+  and judges by the flag, not by which transactions it saw (a transaction that landed but whose result was lost
+  flips it all the same):
+  - false before, true after (or unreadable after), and the step not done: the run prints `FAILED ... OPENS ARE NOT
+    PROTECTED` and exits non-zero, since the contract now signs opens that Orderly does not limit to the list. The way
+    out is either to post it from an IP Orderly takes the key from (the engine's POST /setup), or to clear the flag
+    with the same list: `ips <contract>.near <desk_id> <same list> --force-same --key-file <owner key json> --send`,
+    after which opens are refused again until an `apply-ips` succeeds;
+  - true before and the step not done: Orderly already enforces a list (an earlier one, or this one), which is why it
+    refused; the run says so, exits non-zero and does not offer `--force-same`: post it from a listed IP.
+
+**A wrong list blocks Orderly.** Until a list is set and its `ip_restriction` signed, every Orderly open is refused
+by the contract; reduce-only closes are still signed. Once an `ip_restriction` is applied, Orderly takes the desk's
+key only from the listed IPs, so an engine whose IP is left out cannot open, close or even read on Orderly (the
+contract still signs the close; Orderly refuses it). A corrected list is itself a request signed with that key, so
+apply it from an IP in the applied list. The engine on Railway sends from Railway's static outbound IPs: list every
+one of them (with high availability there are several, and Orderly refuses a request from any one left out), pass
+the same list as `--engine-ips`, and apply while no list is applied yet, or from a listed IP. After that, a laptop
+outside the list cannot post a correction; the other way is the engine's own POST /setup on the Railway host
+(section 6; it needs `GIMBAL_SETUP=1`), whose step checks its own IP.
+
+For example, with the engine's IPs from `railway outbound-network static-ip status`:
+
+```
+node tools/mainnet/orderly.mjs ips       <contract>.near <desk_id> 208.77.244.241,152.55.184.240,152.55.185.190 --key-file <owner key json> --send
+node tools/mainnet/orderly.mjs apply-ips <contract>.near <desk_id> --engine-ips 208.77.244.241,152.55.184.240,152.55.185.190 --send
+```
+
+Order: `status`; `receiver` (lookup), then `receiver <address> --key-file ... --send`; `ips <list> --key-file ...
+--send`; `apply-ips --engine-ips <list> --send`; `status --send` again (`opens signed`, the receiver matching). Cost: the two owner calls keep
+under 0.006 NEAR of storage and burn under 0.01 NEAR of gas; each operator request about 0.001 NEAR (0.3 NEAR of
+the key's allowance held per call until the refund).
 
 ## 9. The carry pair: short Hyperliquid, long Phoenix
 
