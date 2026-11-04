@@ -114,6 +114,7 @@ import { userStateDir } from '../trade/trader-state.ts';
 import type { StrategyLoop } from '../strategy/loop.ts';
 import { ThinningSink, WATCH_RECORD_GAPS, loadPolicyFile, replayStart, scanLine } from './serve-replay.ts';
 import { startView } from '../view/serve-view.ts';
+import { openJournal } from '../journal-store.ts';
 
 const { values } = parseArgs({
   options: {
@@ -543,6 +544,8 @@ log(loop.startLine());
 booked?.adopt(loop.held);
 book?.start();
 const strategyLoop = loop;
+// The journal survives a restart (journal-store.ts): next to the book in testnet and mainnet, memory only in replay.
+const journal = openJournal(mode, stateDirSet === undefined ? userStateDir(envVar) : resolve(stateDirSet), contract?.client.contractId ?? null, deskId, log);
 
 server = new EngineServer({
   mode,
@@ -557,6 +560,7 @@ server = new EngineServer({
   policy,
   intervalMs: scannerConfig.intervalMs,
   log,
+  ...journal,
   onScan: (r) => {
     scans++;
     if (scans === 1 || scans % 12 === 0) log(scanLine(scans, r));
