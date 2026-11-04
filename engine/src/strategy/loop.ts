@@ -68,6 +68,12 @@ export const VERDICT_SHOWN_MS = HOUR_MS;
 /** An act refused before anything was sent is not tried again for the same target before this. */
 export const RETRY_AFTER_MS = 15 * 60_000;
 /**
+ * A single leg's close that failed is tried again after this, doubling on each failure that sent orders up to
+ * ONE_LEG_RETRY_MAX_MS; one refused before anything was signed is tried again after this, undoubled.
+ */
+export const ONE_LEG_RETRY_MS = 5_000;
+export const ONE_LEG_RETRY_MAX_MS = 2 * 60_000;
+/**
  * An enter or rotate refused after the open paid for a refresh_prices (refreshForOpen) is not tried again for its
  * window before this: each try would pay again (a fresh price lives 5 minutes, a retry comes after 15).
  */
@@ -216,6 +222,12 @@ export interface LoopHands {
    * price refreshed when the open would need it, so a refresh that fails keeps the held pair. Absent: no such step.
    */
   prepareOpen?(request: { symbol: string; noRefresh?: string }): Promise<ActOutcome>;
+  /**
+   * Why no rotation may leave the pair held now, whatever the target (serve-pair.ts: an Orderly leg, whose close arms
+   * the replay watch), or null. An automatic rotate is refused on it before the NEAR AI risk check is asked; a manual
+   * one goes on to prepareOpen, which refuses it in the same words. Absent: never refused here.
+   */
+  rotateOutRefused?(): string | null;
   /** Both legs (or the one open) to flat, reduce-only. */
   close(request: { reason: string }): Promise<ActOutcome>;
   /**
@@ -521,8 +533,13 @@ export class StrategyLoop {
   /** The category of the last `hold` journaled; the last action journaled `off`. */
   #lastHoldKey: string | null = null;
   #offJournaled = false;
-  /** A single leg's close: the last line journaled (it is tried every check). */
+  /** A single leg's close: the last line journaled (it is tried every check, past its backoff). */
   #oneLegLine: string | null = null;
+  /**
+   * A single leg's close that failed: not tried again before `at`; `ms` is the wait that set it (ONE_LEG_RETRY_MS
+   * doubling to ONE_LEG_RETRY_MAX_MS). `key` names the leg and its size: another leg or size starts over.
+   */
+  #oneLegRetry: { key: string; at: number; ms: number } | null = null;
 
   constructor(options: StrategyLoopOptions) {
     this.#o = options;
@@ -790,6 +807,7 @@ export class StrategyLoop {
       await this.#closeOneLeg(venues.oneLeg, now);
       return;
     }
+    if (venues?.oneLeg == null) this.#oneLegRetry = null;
     const { held, freed } = this.#heldPair(scanned, now);
     const freeMarginUsd = await this.#readFree();
     const facts = await this.#readFacts(scanned);
@@ -981,6 +999,13 @@ export class StrategyLoop {
       this.#refuseOnce(key, `${kind} ${w.id} not carried out: ${sym.refused}; ${RISK_NOT_ASKED}`);
       return SKIPPED;
     }
+    // A rotation the hands refuse for the pair held, whatever the target, is not worth a risk check (paid, asked again
+    // at every retry); a manual rotate still goes the whole way and is refused by prepareOpen after its check.
+    const out = p.fromId === null || p.manual ? null : hands.rotateOutRefused?.() ?? null;
+    if (out !== null) {
+      this.#refuseOnce(key, `rotate ${p.fromId} -> ${w.id} not carried out: ${out}; ${p.fromId} is kept, nothing closed; ${RISK_NOT_ASKED}`);
+      return SKIPPED;
+    }
     // NEAR AI first: it can only remove a window.
     const check = await this.#veto(w, {
       kind, legUsd: p.legUsd, leverage: p.leverage, hoursAbove: p.hoursAbove ?? this.#state.counters.aboveByWindow[w.id] ?? 0, facts: p.facts ?? this.#lastFacts,
@@ -1101,9 +1126,20 @@ export class StrategyLoop {
     return { end: 'done', sent: true, passing: false };
   }
 
-  /** One venue holds a position, the other none: closed at once, reduce-only, tried every check until flat. */
+  /**
+   * One venue holds a position, the other none: closed at once, reduce-only, tried on the checks until flat. A close
+   * that fails is tried again after ONE_LEG_RETRY_MS, doubling up to ONE_LEG_RETRY_MAX_MS while its tries send orders
+   * (each signs NEAR calls, whose gas a refusal that repeats every check could make larger than the leg); one refused
+   * before anything was signed waits ONE_LEG_RETRY_MS. A close that ends flat, or another leg or size, starts over.
+   * Each wait is journaled once, with its length.
+   */
   async #closeOneLeg(leg: { venue: string; qty: string }, now: number): Promise<void> {
     const line = `one leg open: ${leg.venue} ${leg.qty}`;
+    const retry = this.#oneLegRetry?.key === line ? this.#oneLegRetry : null;
+    if (retry !== null && now < retry.at) {
+      this.#publishDecision({ action: 'exit', reason: `${line}: closing it, reduce-only; the last close failed, next try at ${new Date(retry.at).toISOString()}`, windowId: null, heldId: this.#state.held?.windowId ?? null, at: now });
+      return;
+    }
     this.#publishDecision({ action: 'exit', reason: `${line}: closing it, reduce-only`, windowId: null, heldId: this.#state.held?.windowId ?? null, at: now });
     const say = (kind: JournalEntry['kind'], summary: string, numbers: Record<string, number | string>, tx: TxRef[] = []) => {
       if (summary === this.#oneLegLine) return;
@@ -1120,9 +1156,14 @@ export class StrategyLoop {
     this.#owner(r.open);
     if (!r.ok) {
       this.#record('fill', { windowId: this.#state.held?.windowId ?? `${leg.venue} leg`, symbol: this.#state.held?.symbol ?? '', outcome: r, forecastNetAprPct: null, exitReason: r.reason, rotation: null, manual: false, startedAt: closeAt });
-      say('error', `${line}: the close did not end flat: ${r.reason}`, { venue: leg.venue, qty: leg.qty, feeUsd: r.feeUsd }, r.tx);
+      // Only a close that signed something backs off: one refused before signing (a price refresh or an RPC that
+      // failed, alert only) costs no gas, and the leg must not sit naked longer once its cause clears.
+      const ms = retry === null || !r.sent ? ONE_LEG_RETRY_MS : Math.min(retry.ms * 2, ONE_LEG_RETRY_MAX_MS);
+      this.#oneLegRetry = { key: line, at: this.#o.clock.now() + ms, ms };
+      say('error', `${line}: the close did not end flat: ${r.reason}; tried again in ${waitText(ms)}`, { venue: leg.venue, qty: leg.qty, feeUsd: r.feeUsd, retryMs: ms }, r.tx);
       return;
     }
+    this.#oneLegRetry = null;
     const held = this.#state.held;
     this.#record('exit', { windowId: held?.windowId ?? `${leg.venue} leg`, symbol: held?.symbol ?? '', outcome: r, forecastNetAprPct: held?.entryNetAprPct ?? null, exitReason: line, rotation: null, manual: false, startedAt: closeAt });
     this.#setHeld(null);
@@ -1422,6 +1463,13 @@ export function checkRulesOf(s: StrategyConfig): CheckRules {
 
 function round(v: number): number {
   return Math.round(v * 100) / 100;
+}
+
+/** A wait as a journal line says it: "5 s", "2 min 40 s", "10 min". */
+function waitText(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s} s`;
+  return s % 60 === 0 ? `${s / 60} min` : `${Math.floor(s / 60)} min ${s % 60} s`;
 }
 
 /**

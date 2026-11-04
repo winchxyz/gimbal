@@ -43,6 +43,8 @@ export async function setupFromEnv(
   for (const [name, url] of [['HL_API_URL', hlUrl], ['ORDERLY_API_URL', orderlyUrl]] as const) {
     if (/testnet/.test(url) !== (network === 'testnet')) throw new ConfigError(`${name} ${url} is not a ${network} URL`);
   }
+  // A transport of its own on the operator key, not serve's operator client (cli/serve-orderly.ts operatorClient): the
+  // owner starts setup and the withdraw by hand; a nonce collision with the engine's signatures costs a retry.
   const transport = options.transport ?? new NearApiTransport({
     network, accountId: cfg.accountId!, privateKey: cfg.privateKey!, ...(cfg.rpcUrl === undefined ? {} : { rpcUrl: cfg.rpcUrl }),
   });

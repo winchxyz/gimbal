@@ -652,8 +652,12 @@ export function orderlyPairSide(orderly: ServeOrderly, o: { log: (line: string) 
   };
 }
 
-/** How long serve waits for its Orderly session to be live before the pair trader's start reads over it. */
-export const ORDERLY_START_WAIT_MS = 45_000;
+/**
+ * How long serve waits for its Orderly session to be live before the pair trader's start reads over it. Nothing else
+ * of serve runs meanwhile (its server, health and risk engine start after the pair), so the wait is short: a start
+ * that reads the session down is alert only and retries on its backoff.
+ */
+export const ORDERLY_START_WAIT_MS = 15_000;
 
 /**
  * Opens the session (start) and waits until it is live (logged in, subscribed and seeded) or `deadlineMs` passed. The
@@ -689,10 +693,13 @@ export function riskOrderlyNote(orderly: Pick<ServeOrderly, 'accountId'> | null)
 
 /**
  * The contract client on the operator key, built once at its first use (a failed build is tried again at the next);
- * the key is never printed. serve hands the same one to the Orderly session and to the pair trader
- * (ServePairInput.operator), so every signature on that key goes through one transport and one nonce: two transports
- * on one key would collide on nonces, and the InvalidNonce retries would widen the gap between a Hyperliquid fill and
- * its Orderly IOC. Throws a ConfigError at once when the operator key is not configured.
+ * the key is never printed. serve hands the same one to the Orderly session, the pair trader (ServePairInput.operator)
+ * and the live rescuer (ServeRescueInput.operator), so every signature the engine makes on its own on that key goes
+ * through one transport and one nonce: two transports on one key would collide on nonces, and the InvalidNonce retries
+ * (near-transport.ts: a fresh nonce, at most 3) would widen the gap between a Hyperliquid fill and its Orderly IOC.
+ * POST /setup and GIMBAL_ORDERLY_WITHDRAW (GIMBAL_SETUP=1, setup/serve-setup.ts) keep a transport of their own on the
+ * key: the owner starts them by hand, and a collision there costs such a retry, never a wrong signature. Throws a
+ * ConfigError at once when the operator key is not configured.
  */
 export function operatorClient(env: (name: string) => string | undefined, mode: Mode, log: (line: string) => void): () => Promise<NearContractClient> {
   const cfg = contractEnv(env, mode, { signing: true });

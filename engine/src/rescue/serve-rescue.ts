@@ -93,6 +93,12 @@ export interface ServeRescueInput {
   reducer?: () => Reducer | null;
   /** --state-dir or GIMBAL_STATE_DIR when set: where a live rescuer keeps its holds and counters (default: userStateDir). */
   stateDir?: string;
+  /**
+   * serve's contract client on the operator key (serve-orderly.ts operatorClient, GIMBAL_ORDERLY_PAIRS=1): the live
+   * rescuer signs through it, one transport and one nonce with the pair's relayer and the Orderly session. Absent: a
+   * transport of its own on the same key, as before.
+   */
+  operator?: () => Promise<NearContractClient>;
 }
 
 export interface ServeRescue {
@@ -276,10 +282,13 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
   if (cfg === null) throw new ConfigError('GIMBAL_RESCUE=1 needs GIMBAL_CONTRACT_ID, DESK_ID and the operator key');
   const relayerKey = env('RELAYER_EVM_PRIVATE_KEY');
   if (relayerKey === undefined) throw new ConfigError('GIMBAL_RESCUE=1 needs RELAYER_EVM_PRIVATE_KEY (the gas wallet that submits evm_usdc_to_intents)');
-  const transport = new NearApiTransport({
-    network: cfg.network, accountId: cfg.accountId!, privateKey: cfg.privateKey!, ...(cfg.rpcUrl === undefined ? {} : { rpcUrl: cfg.rpcUrl }),
+  const contract = input.operator !== undefined ? await input.operator() : new NearContractClient({
+    contractId: cfg.contractId, network: cfg.network, onHealth: (s, d) => log(`rescue near ${s}: ${d}`),
+    transport: new NearApiTransport({
+      network: cfg.network, accountId: cfg.accountId!, privateKey: cfg.privateKey!, ...(cfg.rpcUrl === undefined ? {} : { rpcUrl: cfg.rpcUrl }),
+    }),
   });
-  const contract = new NearContractClient({ contractId: cfg.contractId, network: cfg.network, transport, onHealth: (s, d) => log(`rescue near ${s}: ${d}`) });
+  if (contract.contractId !== cfg.contractId) throw new ConfigError(`the operator client is on ${contract.contractId}, the rescue on ${cfg.contractId}`);
   checkContractNetwork(cfg.contractId, await contract.config(), cfg.network);
   const arbitrumRpc = env('ARBITRUM_RPC_URL');
   const arb = new ArbitrumSubmitter({ network: 'mainnet', relayerKey: relayerKey as Hex, ...(arbitrumRpc === undefined ? {} : { rpcUrl: arbitrumRpc }) });

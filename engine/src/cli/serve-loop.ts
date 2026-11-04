@@ -336,6 +336,7 @@ export function loopHands(
       return { ...outcome(h), filledQty: openedQty(h.results) };
     },
     prepareOpen: async (r) => outcome(await hands.prepareOpen({ symbol: r.symbol, ...(r.noRefresh === undefined ? {} : { noRefresh: r.noRefresh }) })),
+    ...(hands.rotateOutRefused === undefined ? {} : { rotateOutRefused: hands.rotateOutRefused.bind(hands) }),
     reconcile: () => hands.reconcile(),
     close: async (r) => outcome(await hands.close({ reason: r.reason })),
   };

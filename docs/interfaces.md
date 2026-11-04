@@ -1016,7 +1016,8 @@ anywhere the policy does not allow.
     checked", "NEAR AI key rejected (…): not checked, passed" or "NEAR AI risk check unavailable (…): passed".
     `<attestation>` is serve's `Attestor.label()` ("TEE attested <date> UTC" or "TEE not attested: <why>"), shown
     only for a reply that came. It says what the model's TEE instances were when last attested; that the reply came
-    from those instances is not verified (per-reply signatures need the key and are not fetched). A refusal before the check is asked (no hands, the window not in the scan, a symbol serve does not trade)
+    from those instances is not verified (per-reply signatures need the key and are not fetched). A refusal before the check is asked (no hands, the window not in the scan, a symbol serve does not trade, an
+    automatic rotate out of a pair the hands will not leave: `LoopHands.rotateOutRefused`, an Orderly leg)
     says "NEAR AI risk check: not asked (refused before it)". The decision event is published again with it, after
     the decision's own reason, so a window whose stored price the open refreshes carries both ("…; stored SOL price
     stale: refreshed at open; NEAR AI risk check passed (TEE attested …): …"). Every outcome after the check carries
@@ -1080,6 +1081,10 @@ anywhere the policy does not allow.
   publishes `decision` events and journals `enter` / `exit` / `rotate` / `veto` / `wait` with numbers and tx links,
   each enter, rotate and refusal with the risk check's why line, books every check in the risk check ledger (a ledger
   that fails is logged, never the act's), and saves `LoopCounters` next to the trader state. `POST /rotate` and `POST /close` go through the same path.
+  A single leg (one venue holds a position, the other is known flat) is closed reduce-only before anything is decided;
+  a close of it that fails after sending orders is tried again after 5 s, doubling up to 2 min (each try signs NEAR
+  calls); one refused before anything was signed is tried again after 5 s; each wait is journaled once,
+  with its length ("tried again in 20 s"); a close that ends flat, or another leg or size, starts over at once.
 
 **Position book** (`engine/src/book/`, serve with a contract desk). Every carried-out enter and exit comes in through
 the loop's `book` sink (`BookRecord`, with `startedAt`: when the act began), and so do the fills of an open or close
@@ -1205,7 +1210,7 @@ the one computed from its account; on an account with several positions the comp
 the venue gives none either the distance is the account basis, (equity − maintenance) ÷ the account's whole
 notional. In serve the venues are the desk's Hyperliquid and Phoenix accounts, plus its Orderly account with
 `GIMBAL_ORDERLY_PAIRS=1` (default off; `engine/src/cli/serve-orderly.ts`): serve then keeps the desk's private Orderly
-session open from right before the pair trader starts, which waits for it to be live at most 45 s (its start reads
+session open from right before the pair trader starts, which waits for it to be live at most 15 s (its start reads
 the desk's Orderly positions over it; not live by then, the start retries on its backoff), one `orderly_ws_auth` and
 the `positions` and `holding` reads per session, signed by the same operator contract client as the pair's relayer;
 it reopens a session that held 10 min at once and otherwise after 60 s doubling to
@@ -1221,12 +1226,16 @@ order across reconnects, and nothing after serve stops. With the session the pai
 pair (`serve-orderly.ts` `orderlyPairSide`): any two of Hyperliquid, Orderly and Phoenix in the direction the window
 pays, its symbol listed by both venues in the policy (`pair-shape.ts` `pairSymbols`); a Hyperliquid leg opens first as
 maker and its partner by IOC, two IOCs otherwise; the Orderly leg is made only while the session is live and its
-market's lot is known. The book reads that leg's fills from the session's `executionreport` pushes (a fill log made at
+market's lot is known. An open still legged after its retry unwinds the legs one after the other (`trade/pair.ts`, every
+pair): first the Orderly leg (else the leg that moved less), reduce-only, twice at most; then its partner to offset what
+that leg actually holds, in its own lots (a reduce toward its start, else a reopen, never while an open is blocked), so
+a refused Orderly unwind leaves the pair hedged at a smaller size (`stuck`), never one leg alone. The book reads that leg's fills from the session's `executionreport` pushes (a fill log made at
 the first `onUp`: a window reaching back before it, or over a time the session was down, is unknown, never "nothing
 filled") and its funding from the signed `funding_fee_history` read; the health map gets an `orderly` key. Orderly
 stays a non-rescue venue (1.5x at most): a window its free margin cannot open at the $10 minimum is refused in those
 words and journaled once. A rotation out of a held pair with an Orderly leg is refused before anything closes (its
-close arms a 300 s replay watch no other pair could open through, which would leave the desk flat) and journaled; the
+close arms a 300 s replay watch no other pair could open through, which would leave the desk flat) and journaled; an
+automatic one before the NEAR AI risk check (`rotateOutRefused`, journaled once), a manual one by `prepareOpen` after it; the
 watch is saved in the trader state (`trader.replay`, only while one runs, so a short Hyperliquid / long Phoenix file
 is unchanged) and restored after a restart. Lines (`thresholds.ts`):
 - rescue line = `max(rescueDistancePct, (exp(4 σ √185 s) − 1) × 100)`, where σ is the leg's realised volatility per

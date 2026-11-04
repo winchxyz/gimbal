@@ -323,6 +323,11 @@ export interface PairHands {
   pairSymbols?(long: VenueId, short: VenueId): readonly string[];
   /** GIMBAL_ORDERLY_PAIRS=1 only: the long and short venues of the pair the trader has now (held or flat), or null. */
   heldPair?(): { long: VenueId; short: VenueId } | null;
+  /**
+   * GIMBAL_ORDERLY_PAIRS=1 only: why no rotation may leave the pair held (an Orderly leg: its close arms the replay
+   * watch), or null; prepareOpen refuses in the same words. The loop asks it before its risk check.
+   */
+  rotateOutRefused?(): string | null;
   /** Why nothing can be opened or closed now, or null. */
   blocked(): string | null;
   /**
@@ -1183,6 +1188,14 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       return null;
     };
     const blocked = (): string | null => blockedWhy(true);
+    // A rotate closes the held pair before it opens the next: closing an Orderly leg arms its 300 s replay watch, and
+    // no other pair opens while it runs (quiet), so the rotate would leave the desk flat. Refused before anything is
+    // closed (prepareOpen; the loop asks first, before its risk check): the pair is kept and exits on its own rules.
+    const rotateOutRefused = (): string | null => {
+      const replayable = orderlyOn && current !== null && heldSymbol() !== null ? current.trader.legs.find((l) => l.replayable) : undefined;
+      if (replayable === undefined) return null;
+      return `the held ${current!.symbol} pair has an Orderly leg (${replayable.symbol}): its close arms the trader's replay watch (Orderly takes a signed copy of an order for up to 300 s), so no other pair could open after it and the rotate would leave the desk flat`;
+    };
     const result = (ok: boolean, reason: string, extra: Partial<HandsResult> = {}): HandsResult => ({
       ok, reason, results: [], lines: [], open: [], tx: [], feeUsd: 0, ...extra,
     });
@@ -1230,6 +1243,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       ...(orderlyOn ? {
         pairSymbols: (long: VenueId, short: VenueId) => (input.orderly === undefined && (long === 'orderly' || short === 'orderly') ? [] : pairSymbols(policy, long, short)),
         heldPair: () => (current === null ? null : { long: longLeg(current.shape).venue, short: shortLeg(current.shape).venue }),
+        rotateOutRefused,
       } : {}),
       blocked,
       canOpen: () => blockedWhy(false) === null,
@@ -1245,13 +1259,8 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         let paid = false;
         return exclusive(async () => {
           const sym = request.symbol;
-          // A rotate closes the held pair before it opens the next: closing an Orderly leg arms its 300 s replay watch,
-          // and no other pair opens while it runs (quiet), so the rotate would leave the desk flat. Refused here, before
-          // anything is closed: the pair is kept and exits on its own rules.
-          const replayable = orderlyOn && current !== null && heldSymbol() !== null ? current.trader.legs.find((l) => l.replayable) : undefined;
-          if (replayable !== undefined) {
-            return result(false, `the held ${current!.symbol} pair has an Orderly leg (${replayable.symbol}): its close arms the trader's replay watch (Orderly takes a signed copy of an order for up to 300 s), so no other pair could open after it and the rotate would leave the desk flat`);
-          }
+          const out = rotateOutRefused();
+          if (out !== null) return result(false, out);
           if (policy.unpriced.some((u) => u.symbol === sym)) return result(true, `${sym} is unpriced: no stored price to refresh`);
           const marginS = SERVE_MAKER.timeoutMs / 1000 + PRICE_MARGIN_S;
           const sp = await prices.read(sym);
