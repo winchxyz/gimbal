@@ -5,8 +5,9 @@
 // forwarded nor printed itself, and the pair-mainnet wiring: no trader lock, no relayer, no submitter on this path.
 
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import type { ContractPolicy } from '@gimbal/shared';
@@ -156,7 +157,7 @@ test('a desk or symbol where another check would refuse first is not sent (exit 
   const chain = new Chain();
   const r = deps(chain, 'band', true, { paused: true });
   assert.equal(await refuse(r.d), EXIT_NOT_SENT);
-  assert.match(r.lines.join('\n'), /not sent .*E_PAUSED.*hl_order was not sent/);
+  assert.match(r.lines.join('\n'), /not sent .*E_PAUSED.*hl_order not sent/);
   assert.deepEqual(chain.calls, []);
 });
 
@@ -247,6 +248,15 @@ test('an ask the order does not clear by the margin, or one that moves before th
   assert.match(m.lines.join('\n'), /the best ask moved to 2545: px 2550 is no longer 50 bps above it/);
   assert.deepEqual(moved.calls, [], 'hl_order not sent');
 
+  // A stale price is refreshed first: when the ask then stops it, the line says that refresh spent gas.
+  const stale = new Chain();
+  stale.atMs = Date.now() - 2_000_000;
+  const st = deps(stale, 'band', true, { asks: [2540] });
+  assert.equal(await refuse(st.d), EXIT_NOT_SENT);
+  assert.deepEqual(stale.calls, ['refresh_prices']);
+  assert.match(st.lines.join('\n'), /hl_order not sent; a refresh_prices went out before it and spent its gas/);
+  assert.doesNotMatch(r.lines.join('\n'), /refresh_prices went out/, 'not when none did');
+
   const dry = deps(new Chain(), 'band', false, { asks: [2540] });
   assert.equal(await refuse(dry.d), EXIT_NOT_SENT);
   assert.match(dry.lines.join('\n'), /not 50 bps above the best ask; run again .*\(dry run\)/);
@@ -288,6 +298,9 @@ test('cancel-hl: the status in a dry run, hl_cancel with --send only for an open
   answers = [{ status: 'unknownOid' }];
   assert.equal(await cancelHl({ ...base, send: true, status }), 0);
   assert.deepEqual(cancels, [77], 'nothing to cancel');
+  const unknownOut = lines.join('\n');
+  assert.match(unknownOut, /does not know it \(yet\): nothing to cancel now/);
+  assert.match(unknownOut, /can still be posted until its expiresAfter, 60 s after the block .* check again once that has passed/);
   assert.equal(parseOrderId('123'), 123);
   assert.throws(() => parseOrderId('0x12'), /neither an oid/);
 });
@@ -296,38 +309,107 @@ test('cancel-hl: the status in a dry run, hl_cancel with --send only for an open
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-/** Every module refuse-cli.ts loads at run time (value imports, transitively), as paths under src/. */
+const srcRoot = resolve(here, '..');
+
+/** `src` without its comments; string and template literals are kept as they are (a URL's // is not a comment). */
+function stripComments(src: string): string {
+  let out = '';
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i]!;
+    const next = src[i + 1];
+    if (c === '/' && next === '/') {
+      while (i < src.length && src[i] !== '\n') i++;
+    } else if (c === '/' && next === '*') {
+      const close = src.indexOf('*/', i + 2);
+      i = close === -1 ? src.length : close + 2;
+      out += ' ';
+    } else if (c === '\'' || c === '"' || c === '`') {
+      let j = i + 1;
+      while (j < src.length && src[j] !== c) j += src[j] === '\\' ? 2 : 1;
+      out += src.slice(i, j + 1);
+      i = j + 1;
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return out;
+}
+
+/** The relative modules `code` (comments stripped) loads at run time: value imports, re-exports, side-effect and dynamic imports. */
+function runtimeSpecifiers(code: string): string[] {
+  const out: string[] = [];
+  // import x from / import { a, type B } from / export { a } from / export * from; not `import type` / `export type`.
+  for (const m of code.matchAll(/\b(import|export)\s+(type\s+)?[^;'"`]*?\bfrom\s*(['"])(\.[^'"]+)\3/g)) {
+    if (m[2] === undefined) out.push(m[4]!);
+  }
+  for (const m of code.matchAll(/\bimport\s*(['"])(\.[^'"]+)\1/g)) out.push(m[2]!);            // import './x'
+  for (const m of code.matchAll(/\bimport\s*\(\s*(['"`])(\.[^'"`]+)\1\s*\)/g)) out.push(m[2]!); // import('./x')
+  return out;
+}
+
+/** Every module `entry` loads at run time, transitively: path relative to engine/src -> its code without comments. */
 function runtimeGraph(entry: string): Map<string, string> {
   const seen = new Map<string, string>();
   const walk = (file: string) => {
-    if (seen.has(file)) return;
-    const src = readFileSync(file, 'utf8');
-    seen.set(file, src);
-    for (const m of src.matchAll(/^import\s+(type\s+)?[^;]*?from\s+'(\.[^']+)'/gms)) {
-      if (m[1] === undefined) walk(resolve(dirname(file), m[2]!));
-    }
+    const name = relative(srcRoot, file).split(sep).join('/');
+    if (seen.has(name)) return;
+    const code = stripComments(readFileSync(file, 'utf8'));
+    seen.set(name, code);
+    for (const spec of runtimeSpecifiers(code)) walk(resolve(dirname(file), spec));
   };
   walk(entry);
   return seen;
 }
 
+test('the import walk follows re-exports, side-effect and dynamic imports, skips type-only ones, and ignores comments', () => {
+  const code = stripComments([
+    "import type { A } from './a.ts';",
+    "import { b, type C } from './b.ts';",
+    "export { d } from './d.ts';",
+    "export * from './e.ts';",
+    "export type { F } from './f.ts';",
+    "import './g.ts';",
+    "const h = await import('./h.ts');",
+    "// import { z } from './z.ts'; new Relayer(",
+    "/* new Relayer( */ const url = 'https://example.org/x';",
+  ].join('\n'));
+  assert.deepEqual(runtimeSpecifiers(code).sort(), ['./b.ts', './d.ts', './e.ts', './g.ts', './h.ts']);
+  assert.ok(!code.includes('new Relayer('), 'comments are gone');
+  assert.ok(code.includes("'https://example.org/x'"), 'a string with // is kept');
+});
+
 test('refuse-* in pair-mainnet run before the trader lock and load no relayer, no submitter and no lock code', () => {
   const graph = runtimeGraph(join(here, 'refuse-cli.ts'));
-  const names = [...graph.keys()].map((f) => f.replace(/\\/g, '/').split('/src/')[1]);
+  const names = [...graph.keys()];
+  assert.ok(names.includes('cli/refuse-lib.ts') && names.includes('contract/near-client.ts'), 'the walk sees the refuse path');
   for (const banned of ['relayer/relayer.ts', 'relayer/hyperliquid.ts', 'trade/trader-state.ts', 'cli/pair-ops.ts', 'trade/legs.ts']) {
     assert.ok(!names.includes(banned), `refuse-cli.ts loads ${banned}`);
   }
-  for (const [file, src] of graph) {
-    for (const call of ['new Relayer(', 'new HyperliquidSubmitter(', 'new SolanaSubmitter(', 'acquireTraderLock(']) {
-      assert.ok(!src.includes(call), `${file} has ${call}`);
+  for (const [file, code] of graph) {
+    for (const call of [/\bnew\s+Relayer\s*\(/, /\bnew\s+HyperliquidSubmitter\s*\(/, /\bnew\s+SolanaSubmitter\s*\(/, /\bacquireTraderLock\s*\(/]) {
+      assert.ok(!call.test(code), `${file} has ${call.source}`);
     }
   }
   // pair-mainnet.ts dispatches refuse-* in main() before the lock, and run() (the relayer) is never reached for them.
-  const main = readFileSync(join(here, 'pair-mainnet.ts'), 'utf8');
+  const main = stripComments(readFileSync(join(here, 'pair-mainnet.ts'), 'utf8'));
   const body = main.slice(main.indexOf('async function main('), main.indexOf('async function run('));
   const dispatch = body.indexOf('await runRefuse(');
   assert.ok(dispatch > 0, 'main() calls runRefuse');
   assert.ok(dispatch < body.indexOf('acquireTraderLock('), 'before the trader lock');
   assert.ok(dispatch < body.indexOf('contractEnv('), 'before the signing setup of the other commands');
   assert.match(body.slice(dispatch, dispatch + 120), /await runRefuse\([^)]*\);\s*return;/, 'and returns');
+});
+
+test('pair-mainnet refuse-* exits 5 on a setup failure whatever the order of its arguments; a usage error stays 2', () => {
+  // No GIMBAL_CONTRACT_ID (and, in a linked worktree, --send refuses first): either way it stops before hl_order.
+  const env: Record<string, string> = {};
+  for (const k of ['PATH', 'Path', 'SystemRoot', 'TEMP', 'TMP', 'HOME', 'USERPROFILE']) if (process.env[k] !== undefined) env[k] = process.env[k]!;
+  const run = (...argv: string[]) => spawnSync(process.execPath, [join(here, 'pair-mainnet.ts'), ...argv], { env, encoding: 'utf8', timeout: 60_000 });
+  for (const argv of [['--send', 'refuse-band', 'ETH'], ['refuse-band', 'ETH', '--send'], ['refuse-notional', 'ETH']]) {
+    const r = run(...argv);
+    assert.equal(r.status, 5, `${argv.join(' ')}: ${r.stderr}`);
+  }
+  assert.equal(run('refuse-band', 'ETH', '--leverage', '2').status, 2, 'usage');
 });

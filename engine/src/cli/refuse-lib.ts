@@ -28,8 +28,8 @@
 //   when the key's account or allowance has less than two call reserves, so serve's own budget never runs out.
 //
 // Exit codes: 0 refused as expected; 1 sent and refused for another reason (its gas is spent); 3 sent with no proven
-// outcome; 4 signed (must never happen); 5 nothing sent (a precondition, a dry run that would not send, any error
-// before hl_order went out). A usage error stays 2, as for every pair-mainnet command.
+// outcome; 4 signed (must never happen); 5 hl_order not sent (a precondition, a dry run that would not send, any
+// error before hl_order went out); a refresh_prices may still have gone out before it and spent its gas. A usage error stays 2, as for every pair-mainnet command.
 
 import type { TxRef } from '@gimbal/shared';
 import { DEFAULT_CALL_TGAS, formatNear, reserveFor } from '../contract/budget.ts';
@@ -57,6 +57,9 @@ export const EXIT_OTHER_REFUSAL = 1;
 export const EXIT_UNKNOWN = 3;
 export const EXIT_SIGNED = 4;
 export const EXIT_NOT_SENT = 5;
+
+/** The contract's expiresAfter on every order: block time + this (contract/core/src/hl.rs EXPIRES_AFTER_MS). */
+export const EXPIRES_AFTER_S = 60;
 
 /** The least the order's price must sit above the best ask, bps; half the band when that is more. */
 export const MIN_ASK_MARGIN_BPS = 25;
@@ -215,7 +218,9 @@ export async function refuse(d: RefuseDeps): Promise<number> {
     });
   } catch (err) {
     if (sent) throw err;
-    d.say(`not sent  ${err instanceof Error ? err.message : String(err)}: hl_order was not sent`);
+    // The gap map holds a symbol only once a refresh_prices went on chain (it ran, or was sent with no outcome).
+    const refreshed = d.prices.lastRefreshAt.has(d.symbol) ? '; a refresh_prices went out before it and spent its gas' : '';
+    d.say(`not sent  ${err instanceof Error ? err.message : String(err)}: hl_order not sent${refreshed}`);
     return EXIT_NOT_SENT;
   }
 }
@@ -317,6 +322,7 @@ export function signedWarning(symbol: string, order: HlOrder, tx: TxRef[]): stri
     '          or cancelled. Check it now and cancel it if it rests:',
     `            pair-mainnet cancel-hl ${symbol} ${order.cloid}           (dry run: its status on Hyperliquid)`,
     `            stop serve; pair-mainnet cancel-hl ${symbol} ${order.cloid} --send; start serve   (hl_cancel by its oid)`,
+    `          "Hyperliquid does not know it" within ${EXPIRES_AFTER_S} s of the block can still change: check again after that.`,
     '          Then check the desk policy (price_band_bps, max_notional_usd) and the contract version before anything else.',
     bar,
   ];
@@ -372,7 +378,8 @@ export async function cancelHl(d: CancelDeps): Promise<number> {
   const idText = String(d.id);
   const st = parseHlOrderStatus(await d.status(d.id), idText);
   if (st === null) {
-    d.say(`order     ${idText}: Hyperliquid does not know it: nothing to cancel`);
+    d.say(`order     ${idText}: Hyperliquid does not know it (yet): nothing to cancel now`);
+    d.say(`          a signed order can still be posted until its expiresAfter, ${EXPIRES_AFTER_S} s after the block that signed it: right after an exit 4, check again once that has passed`);
     return 0;
   }
   d.say(`order     ${idText}: oid ${st.oid}, ${st.coin} ${st.side} ${st.sz} of ${st.origSz} at ${st.limitPx}: ${st.status}`);
