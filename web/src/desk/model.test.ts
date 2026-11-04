@@ -20,6 +20,7 @@ import {
   sizeText,
   dayRate,
   thresholdText,
+  valueGaps,
   whenLabel,
 } from './model.ts';
 
@@ -255,4 +256,20 @@ test('the pieces take a whole DeskState', () => {
   const state: Pick<DeskState, 'legs' | 'netDelta' | 'pnl'> = { legs: [SHORT, LONG], netDelta: 0, pnl: { fundingUsd: 0, feesUsd: 0, priceUsd: 0, netUsd: 0 } };
   assert.equal(exposureOf(state).drift, false);
   assert.equal(pnlRows(state.pnl).length, 4);
+});
+
+test('the desk value says which venue accounts it leaves out or holds old, and nothing when all are fresh', () => {
+  const at = 1_000_000;
+  const fresh = { venue: 'hyperliquid' as const, equityUsd: 7.68, at };
+  assert.equal(valueGaps({ updatedAt: at, accounts: [fresh, { venue: 'phoenix', equityUsd: 0, at }, { venue: 'orderly', equityUsd: 13, at }] }), null);
+  // An engine that does not list its accounts: nothing to say.
+  assert.equal(valueGaps({ updatedAt: at }), null);
+  assert.equal(
+    valueGaps({ updatedAt: at, accounts: [fresh, { venue: 'phoenix', equityUsd: null, at: null }, { venue: 'orderly', equityUsd: null, at: null }] }),
+    'Phoenix and Orderly not read yet, so not counted.',
+  );
+  assert.equal(
+    valueGaps({ updatedAt: at, accounts: [{ venue: 'hyperliquid', equityUsd: null, at: null }, { venue: 'orderly', equityUsd: 13, at: at - 3 * 60_000 }] }),
+    'Hyperliquid not read yet, so not counted. Orderly as last read 3 min ago.',
+  );
 });

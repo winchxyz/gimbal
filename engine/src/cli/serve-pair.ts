@@ -92,6 +92,7 @@ import { OrderlyReader, orderlyBaseSymbol } from '../venues/orderly.ts';
 import { PHOENIX_API_URL, PhoenixReader, SOLANA_MAINNET_RPC_URL, phoenixGet } from '../venues/phoenix.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { AccountState, Clock } from '../venues/venue.ts';
+import { isSessionStarting } from '../venues/venue.ts';
 import type { PriceDeps, StoredPrice } from './pair-mainnet-lib.ts';
 import { PRICE_MARGIN_S, ensureFresh, newPriceState, oraclePxOf, priceFitRefusal, priceLifeS, refreshLanded, refreshReachedChain } from './pair-mainnet-lib.ts';
 import type { OpsCtx, OrderlyLegSpec, OrderlyOps, PairRunner } from './pair-ops.ts';
@@ -1015,7 +1016,11 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       const wait = startBackoffMs(failures);
       log(`pair      start not confirmed (try ${failures}): ${why}; alert only, legs unknown, nothing adopted; trying again in ${wait / 1000} s`);
       if (was === null || !sameKind(was, why)) {
-        journal('error', `pair start not confirmed: ${why}. Alert only until two synced reads of both legs agree: the legs are unknown, nothing is adopted and the strategy loop acts on nothing; the risk engine, the liquidation monitor and panic_close's journal run, and ADL is off until the legs are known. Tried again with backoff up to ${START_RETRY_MAX_MS / 1000} s`, {
+        // Orderly's session still in its first open (serve starting, venue.ts SESSION_STARTING) is a wait, not an
+        // error; the same state reached any other way (an open that failed, a session that dropped) stays an error.
+        const starting = read !== null && read.venue === 'orderly' && isSessionStarting(why);
+        const tail = `Alert only until two synced reads of both legs agree: the legs are unknown, nothing is adopted and the strategy loop acts on nothing; the risk engine, the liquidation monitor and panic_close's journal run, and ADL is off until the legs are known. Tried again with backoff up to ${START_RETRY_MAX_MS / 1000} s`;
+        journal(starting ? 'wait' : 'error', starting ? `pair start waits for the Orderly session, which is still opening: ${why}. ${tail}` : `pair start not confirmed: ${why}. ${tail}`, {
           stage: 'start', ...(read === null ? {} : { venue: read.venue }),
         });
         pendingSaidAt = input.clock.now();

@@ -4,7 +4,9 @@
 //   - `desk`: DeskState with the legs and the desk's health (the worst leg's level);
 //   - `health`: the HealthMap, when a venue, 1Click or NEAR changes state (venue-health.ts);
 //   - `journal`: `rescue` for each rescue trigger, `adl` for every end of an ADL check (adl.ts: confirmed, each unwind
-//     attempt, the budget spent, the event ended), `error` when a venue stops answering or only the owner can act;
+//     attempt, the budget spent, the event ended), `error` when a venue stops answering or only the owner can act
+//     (a `wait` instead while a venue's private session is in its first open since serve started, venue.ts
+//     SESSION_STARTING; an `error` follows if that open fails);
 //   - `rescue`: a RescueProgress at step `detect` for each rescue trigger, unless a rescuer (E9) takes the trigger.
 //
 // Rescue triggers are per leg. A leg that reaches rescue is triggered once; while it stays in rescue it is triggered
@@ -24,6 +26,11 @@
 // was never read, or is older than DESK_VIEW_STALE_MS, marks NEAR down in the health map and keeps the desk at watch
 // at least (DeskState has no "unknown" reserve or pause, so the reserve reads 0 and the pause null until it is read).
 //
+// The desk value (DeskState.equityUsd) is the reserve plus the equity of every venue account the source reads, each
+// account once, with or without a position: a flat desk's money sits in those accounts too. A read that fails keeps
+// that account's last equity, as its legs keep their last numbers; an account never read adds nothing, and
+// DeskState.accounts says which (equityUsd null), so the web can say what the value leaves out.
+//
 // stop() is final: no tick, ADL check or stress starts after it; a tick in flight publishes and triggers nothing
 // once its read returns, and the ADL watch is stopped too (a check in flight sends nothing more, adl.ts).
 //
@@ -31,9 +38,9 @@
 // goes to rescue on the next read and its rescue starts; cleared with { "on": false }. On mainnet it is refused,
 // whatever the request: a stress there would move real money.
 
-import type { DeskState, JournalEntry, Leg, Mode, RescueProgress, StrategyConfig, StreamEvent, VenueId } from '@gimbal/shared';
+import type { DeskState, JournalEntry, Leg, Mode, RescueProgress, StrategyConfig, StreamEvent, VenueAccount, VenueId } from '@gimbal/shared';
 import type { Clock } from '../venues/venue.ts';
-import { systemClock } from '../venues/venue.ts';
+import { isSessionStarting, systemClock } from '../venues/venue.ts';
 import type { AccountState, Position } from '../venues/venue.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { AdlWatch } from './adl.ts';
@@ -82,6 +89,12 @@ export interface DeskSnapshot {
   reserveUsd: number;
   paused: DeskState['paused'];
   legs: LegInput[];
+  /**
+   * Every venue account the source reads for the desk, this time, with or without a position: its equity (account
+   * value with open P&L), or null when this read failed. Absent: taken from the legs (each venue's account once) and
+   * the failed reads.
+   */
+  accounts?: { venue: VenueId; equityUsd: number | null }[];
   /** Each venue read this time: how long it took, or why it failed. */
   reads: { venue: VenueId; ms: number; error: string | null }[];
   /**
@@ -175,6 +188,8 @@ export class RiskEngine {
   readonly #triggerLeg = new Map<string, RescueTrigger>();
   readonly #mono: () => number;
   #views: LegView[] = [];
+  /** Each venue account's last equity read and when (clock ms): a failed read keeps it. */
+  readonly #equity = new Map<VenueId, { usd: number; at: number }>();
   #desk: DeskState | null = null;
   #failure: DeskState['rescueFailure'] = null;
   #stress: { key: string; rescuePct: number; at: number } | null = null;
@@ -184,7 +199,8 @@ export class RiskEngine {
   #ticking: Promise<DeskState | null> | null = null;
   #adlRun: Promise<void> | null = null;
   #stopped = false;
-  readonly #down = new Set<string>();
+  /** Each key down now, and whether it was journaled as a session starting or as down. */
+  readonly #down = new Map<string, 'starting' | 'down'>();
 
   constructor(options: RiskEngineOptions) {
     this.#o = options;
@@ -432,11 +448,12 @@ export class RiskEngine {
     const feesUsd = legs.reduce((s, l) => s + l.feesUsd, 0);
     const priceUsd = views.reduce((s, v) => s + (v.leg.mark - v.leg.entry) * v.leg.size * (v.leg.side === 'long' ? 1 : -1), 0);
     const netDelta = legs.reduce((s, l) => s + (l.side === 'long' ? l.size : -l.size), 0);
+    const accounts = this.#accounts(snap, t);
     return {
       deskId: snap.deskId, owner: snap.owner, contract: snap.contract, mode: this.#o.mode,
       legs,
       netDelta: Math.abs(netDelta) < 1e-12 ? 0 : netDelta,
-      equityUsd: legs.reduce((s, l) => s + l.marginUsd, 0) + snap.reserveUsd,
+      equityUsd: accounts.reduce((s, a) => s + (a.equityUsd ?? 0), 0) + snap.reserveUsd,
       reserveUsd: snap.reserveUsd,
       pnl: { fundingUsd, feesUsd, priceUsd, netUsd: fundingUsd + feesUsd + priceUsd },
       health: worst(views.map((v) => v.level)),
@@ -444,7 +461,21 @@ export class RiskEngine {
       // A failure stays shown while a leg is in rescue; once none is, margin is safe again and it clears.
       rescueFailure: views.some((v) => v.level === 'rescue') ? this.#failure : (this.#failure = null),
       updatedAt: t,
+      accounts,
     };
+  }
+
+  /** The desk's venue accounts with their last equity read (see the header), in the source's order. */
+  #accounts(snap: DeskSnapshot, t: number): VenueAccount[] {
+    const read = snap.accounts ?? accountsFromLegs(snap);
+    const out: VenueAccount[] = [];
+    for (const a of read) {
+      if (out.some((o) => o.venue === a.venue)) continue;
+      if (a.equityUsd !== null && Number.isFinite(a.equityUsd)) this.#equity.set(a.venue, { usd: a.equityUsd, at: t });
+      const last = this.#equity.get(a.venue);
+      out.push({ venue: a.venue, equityUsd: last?.usd ?? null, at: last?.at ?? null });
+    }
+    return out;
   }
 
   /** Per leg (see the header): a first trigger, or another after a failed or lapsed one and its backoff. */
@@ -562,15 +593,26 @@ export class RiskEngine {
 
   #publishHealth(t: number): void {
     const map = this.#o.health.changed();
-    if (map === null) return;
-    this.#o.publish({ type: 'health', data: map });
-    for (const [k, status] of Object.entries(map)) {
-      if (status === 'down' && !this.#down.has(k)) {
-        this.#down.add(k);
-        const why = k === 'intents' ? this.#o.health.intentsDetail : k === 'near' ? this.#o.health.nearDetail : this.#o.health.detail(k as VenueId).readError ?? this.#o.health.detail(k as VenueId).start;
-        this.#journal({ t, kind: 'error', summary: `${k} not answering${why === null ? '' : `: ${why}`}`, numbers: { venue: k }, tx: [] });
-      } else if (status !== 'down') {
+    if (map !== null) this.#o.publish({ type: 'health', data: map });
+    // Unchanged, the map still has to be looked at while a venue is down only because its session is starting: that
+    // turning into a failure (the open failed) changes the reason, not the word.
+    if (map === null && ![...this.#down.values()].includes('starting')) return;
+    for (const [k, status] of Object.entries(map ?? this.#o.health.map())) {
+      if (status !== 'down') {
         this.#down.delete(k);
+        continue;
+      }
+      const why = k === 'intents' ? this.#o.health.intentsDetail : k === 'near' ? this.#o.health.nearDetail : this.#o.health.detail(k as VenueId).readError ?? this.#o.health.detail(k as VenueId).start;
+      // A private session in its first open since serve started (venue.ts SESSION_STARTING) is serve starting: said
+      // once as a wait. Anything else down is an error, journaled once per spell, after a "starting" one too.
+      const now = isSessionStarting(why) ? 'starting' : 'down';
+      const was = this.#down.get(k);
+      if (was === now || was === 'down') continue;
+      this.#down.set(k, now);
+      if (now === 'starting') {
+        this.#journal({ t, kind: 'wait', summary: `${k} session starting: its account is read once the session is up (${why})`, numbers: { venue: k }, tx: [] });
+      } else {
+        this.#journal({ t, kind: 'error', summary: `${k} not answering${why === null ? '' : `: ${why}`}`, numbers: { venue: k }, tx: [] });
       }
     }
   }
@@ -587,6 +629,14 @@ export class RiskEngine {
   #log(line: string): void {
     this.#o.log?.(line);
   }
+}
+
+/** A source that lists no accounts: each leg venue's account once, and a venue whose read failed as unread. */
+function accountsFromLegs(snap: DeskSnapshot): { venue: VenueId; equityUsd: number | null }[] {
+  const out: { venue: VenueId; equityUsd: number | null }[] = [];
+  for (const l of snap.legs) if (!out.some((o) => o.venue === l.venue)) out.push({ venue: l.venue, equityUsd: l.account.equityUsd });
+  for (const r of snap.reads) if (r.error !== null && !out.some((o) => o.venue === r.venue)) out.push({ venue: r.venue, equityUsd: null });
+  return out;
 }
 
 function key(venue: VenueId, symbol: string): string {

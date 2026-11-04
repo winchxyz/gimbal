@@ -142,13 +142,23 @@ export interface DeskState {
   deskId: string; owner: string; contract: string; mode: Mode;
   legs: Leg[];
   netDelta: number;               // base units, long minus short; 0 when level
-  equityUsd: number;              // the desk value: margin on every venue + reserve + open P&L
+  equityUsd: number;              // the desk value: reserve + the equity (with open P&L) of every venue account in
+                                  // `accounts` that has been read, with or without a position; one not read yet adds 0
   reserveUsd: number;             // the part of equityUsd held back for rescues
   pnl: { fundingUsd: number; feesUsd: number; priceUsd: number; netUsd: number };
   health: 'level' | 'watch' | 'rescue';
   paused: { by: string; at: number } | null;   // set_paused / panic_close: the NEAR account that paused, ms; null = running
   rescueFailure: RescueFailure | null;         // a rescue failed and the owner must act; cleared once margin is safe again
   updatedAt: number;
+  accounts?: VenueAccount[];      // every venue account the engine reads for this desk, read or not; absent from an
+                                  // engine that does not list them (equityUsd then cannot say what it left out)
+}
+
+// One venue account of the desk as the engine last read it. A read that fails keeps the last value (and its `at`).
+export interface VenueAccount {
+  venue: VenueId;
+  equityUsd: number | null;       // account value with open P&L; null: not read since the engine started
+  at: number | null;              // ms, when equityUsd was read; null with it
 }
 
 // The status line reads, first match wins: rescueFailure → Needs you, a leg's venue down in HealthMap →

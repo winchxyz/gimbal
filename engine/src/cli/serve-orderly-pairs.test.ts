@@ -33,6 +33,7 @@ import type { HlFundingRow } from '../venues/hyperliquid.ts';
 import type { OrderlyFundingFeePage, OrderlyFundingFeeRow } from '../venues/orderly-actions.ts';
 import { readWireRecording, replayFetch } from '../venues/replay.ts';
 import type { AccountState, Book, Market, VenueReader } from '../venues/venue.ts';
+import { SESSION_STARTING } from '../venues/venue.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { loopBook, serveLoop, windowSymbol } from './serve-loop.ts';
 import type { BuiltLegs, ServeOrderly, ServePair, ServePairInput } from './serve-pair.ts';
@@ -142,7 +143,7 @@ interface Desk {
    * serve's Orderly session (serveOrderly): idle until started; live `upAfterMs` after the start (null: never), the
    * pair's start waiting for it at most `waitMs` (startOrderlySession, as serve.ts waits).
    */
-  session: { state: 'idle' | 'opening' | 'live'; starts: number; upAfterMs: number | null; waitMs: number };
+  session: { state: 'idle' | 'opening' | 'live'; starts: number; upAfterMs: number | null; waitMs: number; firstOpen?: boolean };
 }
 
 function desk(env: Record<string, string>): Desk {
@@ -190,7 +191,8 @@ function pairInput(d: Desk, onProtectionClose: ServePairInput['onProtectionClose
     leg: (spec) => (d.session.state === 'live' ? legOf(d, 'orderly', spec.symbol) : null),
     ready: async () => (d.session.state === 'live' ? null : `serve's Orderly session is not up (${d.session.state})`),
     account: async () => {
-      if (d.session.state !== 'live') throw new Error(`orderly account unknown: the private session is ${d.session.state}`);
+      // firstOpen: as the real keeper says it before its first open ended (serve-orderly.ts).
+      if (d.session.state !== 'live') throw new Error(`orderly account unknown: ${d.session.firstOpen === true ? `${SESSION_STARTING} (${d.session.state})` : `the private session is ${d.session.state}`}`);
       return {
       venue: 'orderly', address: ACCOUNT, time: d.now, equityUsd: 100, freeMarginUsd: d.margin.orderly!, maintenanceMarginUsd: 0,
       positions: heldOn(d, 'orderly').map((l) => ({
@@ -472,11 +474,29 @@ test('GIMBAL_ORDERLY_PAIRS=1: a session not live by the start\'s wait leaves the
   const s = await serve(d);
   assert.ok(d.lines.includes('orderly: the Orderly session is not live after 0.02 s (opening)'), d.lines.join('\n'));
   assert.match(s.pair.unconfirmed?.() ?? '', /^legs unknown, start not confirmed: orderly: orderly account unknown: the private session is opening/);
+  // Not the first open (a session that failed or dropped): an error.
+  assert.match(journal(d).find((j) => j.numbers.stage === 'start')?.kind ?? '', /^error$/);
   d.session.state = 'live';
   assert.match(await s.pair.retryStart!() ?? '', /pair start confirmed after 1 failed attempt/);
   assert.equal(s.pair.unconfirmed?.() ?? null, null);
   await enter(d, s, 'sol-orderly-hyperliquid');
   assert.deepEqual(positions(d), { 'hyperliquid:SOL': -12, 'orderly:PERP_SOL_USDC': 12 });
+  s.stop();
+});
+
+test('GIMBAL_ORDERLY_PAIRS=1: a start that reads the session in its first open journals a wait for it, not an error; the pair is still alert only until it confirms', async () => {
+  const d = desk({ GIMBAL_ORDERLY_PAIRS: '1' });
+  d.session.upAfterMs = null;
+  d.session.waitMs = 20;
+  d.session.firstOpen = true;
+  const s = await serve(d);
+  assert.match(s.pair.unconfirmed?.() ?? '', /^legs unknown, start not confirmed: orderly: orderly account unknown: the private session is starting/);
+  const start = journal(d).filter((j) => j.numbers.stage === 'start');
+  assert.deepEqual(start.map((j) => j.kind), ['wait'], JSON.stringify(start));
+  assert.match(start[0]!.summary, /^pair start waits for the Orderly session, which is still opening: orderly: orderly account unknown: the private session is starting \(opening\)\. Alert only until two synced reads/);
+  d.session.state = 'live';
+  assert.match(await s.pair.retryStart!() ?? '', /pair start confirmed after 1 failed attempt/);
+  assert.deepEqual(journal(d).filter((j) => j.numbers.stage === 'start').map((j) => j.kind), ['wait', 'wait']);
   s.stop();
 });
 

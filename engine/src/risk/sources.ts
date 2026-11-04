@@ -96,6 +96,8 @@ export class AccountsDeskSource implements DeskSource {
       reserveUsd: this.#desk.reserveUsd,
       paused: this.#desk.paused,
       legs,
+      // Every account, flat ones too: the desk value counts each one's equity (risk/engine.ts).
+      accounts: reads.map((r) => ({ venue: r.venue, equityUsd: r.account?.equityUsd ?? null })),
       reads: reads.map(({ venue, ms, error }) => ({ venue, ms, error })),
       ...(this.#o.desk === undefined ? {} : { deskView: { at: this.#deskAt, error: late ?? this.#deskError } }),
     };
@@ -213,8 +215,14 @@ export class ReplayDesk implements DeskSource {
     const failed = new Set(reads.filter((r) => r.error !== null).map((r) => r.venue));
     const legs = this.#legs.filter((l) => !failed.has(l.venue)).map((l) => this.#input(l, now));
     this.#reserve ??= this.#legs.reduce((s, l) => s + l.marginUsd, 0) * REPLAY_RESERVE_SHARE;
+    // The script's accounts are its legs' venues (one scripted account per leg).
+    const accounts: { venue: VenueId; equityUsd: number | null }[] = [];
+    for (const l of this.#legs) {
+      if (accounts.some((a) => a.venue === l.venue)) continue;
+      accounts.push({ venue: l.venue, equityUsd: failed.has(l.venue) ? null : legs.filter((i) => i.venue === l.venue).reduce((s, i) => s + i.account.equityUsd, 0) });
+    }
     return {
-      deskId: 'replay', owner: 'replay', contract: 'replay', reserveUsd: Math.max(0, this.#reserve), paused: null, legs, reads,
+      deskId: 'replay', owner: 'replay', contract: 'replay', reserveUsd: Math.max(0, this.#reserve), paused: null, legs, accounts, reads,
     };
   }
 
