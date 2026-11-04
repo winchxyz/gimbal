@@ -150,7 +150,8 @@ export function stepText(id: StepId, { p, leg, line }: StepContext): string {
     case 'source':
       return p.from === 'reserve' ? 'The reserve pays. Both legs keep their margin.' : `${VENUE_NAMES[p.from]} free margin pays. The reserve is kept.`;
     case 'quote':
-      return `NEAR Intents: ${usd(p.amountUsd)} to ${to} margin`;
+      // What was quoted and sent; once landed, amountUsd is what arrived after fees, so the row keeps sentUsd.
+      return `NEAR Intents: ${usd(p.sentUsd ?? p.amountUsd)} to ${to} margin`;
     case 'verify':
       return 'The contract checks the quote signature and the deposit address';
     case 'sign':

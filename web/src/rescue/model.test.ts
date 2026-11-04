@@ -179,6 +179,12 @@ test('every step has a sentence, and the source never names a withdrawal from a 
   assert.match(stepText('quote', { p, leg: null, line: null }), /\$120\.00 to Hyperliquid margin/);
 });
 
+test('the quote row keeps what was quoted after landing, while the amount turns to what arrived', () => {
+  const landed = progress('landed', 52, { amountUsd: 19.48, sentUsd: 20 });
+  assert.equal(stepText('quote', { p: landed, leg: null, line: 8 }), 'NEAR Intents: $20.00 to Hyperliquid margin');
+  assert.equal(movingOf(landed, null).amount, '$19.48');
+});
+
 test('a failure says why, how many tries and what the desk does next', () => {
   const failure: RescueFailure = { rescueId: 'r1', step: 'quote', reason: 'No route for $120 within 30 s', tries: 2, next: 'Trying $40 from the reserve', at: T0 };
   assert.equal(failText(failure), 'No route for $120 within 30 s.');

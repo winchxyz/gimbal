@@ -915,9 +915,13 @@ test('a small desk leg before its history is in: the same costs as after, not th
   const hl = new HistoryVenue('hyperliquid', [DOGE_HL], () => 0.00001);
   const ph = new HistoryVenue('phoenix', [thick], () => 0.00003);
   const clock = new VirtualClock(T0);
-  const { scanner: s } = scanner({ venues: [hl, ph] }, clock, {}, { strategy: () => LEG_20 });
+  // A desk loaded and no minimum: only the missing history can keep the window shut.
+  const { scanner: s } = scanner({ venues: [hl, ph] }, clock, { policy: DOGE_POLICY }, { strategy: () => LEG_20_ANY, oracle: dogeOracle(clock) });
   const before = (await s.scan()).windows[0]!;
   assert.equal(before.grossApr7dPct, null);
+  assert.ok(before.grossAprPct > 0, `this hour pays: ${before.grossAprPct}`);
+  assert.equal(before.refused, undefined);
+  assert.equal(isEnterable(before), false, 'not entered on one hour, however it pays');
   assert.ok(before.checks.some((c) => /^Moving \$\d+\.\d\d of margin a leg onto .* and back costs/.test(c.text)), 'the moves are still shown');
   assert.equal(before.costs.rescueReservePct, 0);
   const costs = before.costs.feesPct + before.costs.slippagePct + before.costs.basisPct;

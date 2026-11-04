@@ -324,6 +324,8 @@ interface Run {
   from: Source;
   /** RescueProgress.amountUsd: what the leg needs, then what the planned transfer sends, then what landed. */
   amountUsd: number;
+  /** RescueProgress.sentUsd: what the planned transfer sends; unset until the plan. */
+  sentUsd?: number;
   startedAt: number;
   tx: TxRef[];
   step: RescueStep;
@@ -649,7 +651,7 @@ export class Rescuer {
     run.from = plan.kind === 'transfer' ? plan.from : t.venue;
     // From here the screen shows what this transfer sends, not what the leg needed: a capped or fixed-size move
     // (the recorded 20 USDC) is smaller, and the rest comes from the next rescue.
-    if (plan.kind === 'transfer') run.amountUsd = round2(plan.amountInUsd);
+    if (plan.kind === 'transfer') run.amountUsd = run.sentUsd = round2(plan.amountInUsd);
     this.#journal(run, `rescue ${t.id} started: ${t.venue} ${t.symbol} needs ${t.amountUsd.toFixed(2)} USD of margin; ${planText(plan)}`
       + `${plan.notes.length === 0 ? '' : ` (passed over: ${plan.notes.join('; ')})`}`, { venue: t.venue, amountUsd: t.amountUsd, from: run.from });
     if (plan.kind === 'none') {
@@ -1522,6 +1524,7 @@ export class Rescuer {
     const p: RescueProgress = {
       id: run.trigger.id, from: run.from, to: run.trigger.venue, amountUsd: run.amountUsd, step,
       startedAt: run.startedAt, elapsedS: round1(this.#elapsed(run)), tx: [...run.tx],
+      ...(run.sentUsd === undefined ? {} : { sentUsd: run.sentUsd }),
     };
     this.#o.publish({ type: 'rescue', data: p });
   }
