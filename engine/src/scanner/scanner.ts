@@ -36,6 +36,7 @@ import type { ReadSkipped } from '../venues/http-budget.ts';
 import { isReadSkipped, scanRead } from '../venues/http-budget.ts';
 import { venueName } from '../venues/names.ts';
 import { errorMessage } from '../venues/recorder.ts';
+import { ReplayMissError } from '../venues/replay.ts';
 import type { ScannerConfig } from './config.ts';
 import type { CarryEstimate, MultiDay } from './carry.ts';
 import { DEAD_BAND_APR_PCT, carryChecks, carryEstimate, listingApr, multiDay, roundTrip, spreadOverHoldUsd } from './carry.ts';
@@ -216,6 +217,8 @@ export class Scanner {
   readonly #options: ScannerOptions;
   readonly #lastGood = new Map<ScanVenueId, { rows: MarketFunding[]; at: number }>();
   readonly #books = new Map<string, BookRead>();
+  /** Books a replay never recorded: noted the first scan each one is missed, in one line (they are asked every scan). */
+  readonly #replayMisses = new Set<string>();
   readonly #rates = new RateStore();
   readonly #history = new Map<string, HistoryState>();
   readonly #older = new Map<string, OlderState>();
@@ -385,6 +388,7 @@ export class Scanner {
       else d.count++;
       this.#deferBook(w.key, now);
     };
+    const replayMissed: string[] = [];
     await pool(due.map((w) => async () => {
       const { key, leg } = w;
       const src = sourceById.get(leg.venue);
@@ -398,6 +402,13 @@ export class Scanner {
         this.#books.set(key, { book, readAt: clock.now(), stale: false });
       } catch (err) {
         if (isReadSkipped(err)) return defer(w, err);
+        // A replay that never recorded this book: the venue answered when it was recorded, so it is not down. The
+        // window goes without a book (as if never read), and the dashboard does not claim the venue stopped answering.
+        if (err instanceof ReplayMissError) {
+          if (!this.#replayMisses.has(key)) replayMissed.push(`${leg.venue} ${leg.symbol}`);
+          this.#replayMisses.add(key);
+          return;
+        }
         failed.add(leg.venue);
         this.#note(`${leg.venue} book ${leg.symbol} failed: ${errorMessage(err)}`);
         const last = this.#books.get(key);
@@ -411,6 +422,10 @@ export class Scanner {
       // A cool-down means the venue refused us a moment ago: it did not answer this scan.
       if (d.first.reason === 'cooling') failed.add(venue);
       this.#note(`${venue} books: ${d.count} not read this scan (${d.first.message})`);
+    }
+    if (replayMissed.length > 0) {
+      const n = replayMissed.length;
+      this.#note(`${n} book${n === 1 ? '' : 's'} not in the recording, their pairs left out: ${replayMissed.sort().join(', ')}`);
     }
 
     // 5. price
