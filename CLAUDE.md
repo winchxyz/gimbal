@@ -56,7 +56,7 @@ cargo +stable-x86_64-pc-windows-msvc test --workspace   # plain `cargo test` run
 
 ## Rules
 
-- **Git flow:** one branch per task, pushed to the private GitHub repo and merged through a PR. The
+- **Git flow:** one branch per task, pushed to the GitHub repo and merged through a PR. The
   orchestrator merges once CI is green and its review passes (the human's standing OK). Never push to `main`.
 - **Never without the human's explicit OK in chat:** make the repo public, post anywhere, submit
   the hackathon form, deploy to mainnet, sign or send any mainnet transaction, spend tokens.

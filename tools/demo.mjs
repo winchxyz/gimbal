@@ -89,12 +89,24 @@ function pkgDir(name, from) {
   }
 }
 
-function portInUse(port) {
+// A server may listen on IPv4 only, on IPv6 `::1` only (Vite on Windows does), or on whatever `localhost` resolves
+// to, so each is tried. Returns the first host that accepts a connection, else null.
+const LOCAL_HOSTS = ['127.0.0.1', '::1', 'localhost'];
+
+function acceptsOn(port, host) {
   return new Promise((resolve) => {
-    const s = connect({ port, host: '127.0.0.1' });
+    const s = connect({ port, host });
+    s.setTimeout(1000, () => { s.destroy(); resolve(false); });
     s.once('connect', () => { s.destroy(); resolve(true); });
     s.once('error', () => resolve(false));
   });
+}
+
+async function portInUse(port) {
+  for (const host of LOCAL_HOSTS) {
+    if (await acceptsOn(port, host)) return host;
+  }
+  return null;
 }
 
 async function answers(url) {
@@ -131,7 +143,11 @@ function run(name, args, cwd, env) {
 if (!existsSync(join(root, 'node_modules'))) fail('run `npm install` first');
 
 for (const [name, port] of [['engine', enginePort], ['web', WEB_PORT]]) {
-  if (await portInUse(port)) fail(`port ${port} is already in use; stop whatever runs there (the ${name} would clash with it)`);
+  const host = await portInUse(port);
+  if (host !== null) {
+    const hint = name === 'engine' ? '; or move the engine with `npm run demo -- --engine-port <n>`' : ' (the dashboard needs 5190)';
+    fail(`port ${port} is already in use (a server answers on ${host.includes(':') ? `[${host}]` : host}:${port}); stop whatever runs there, the ${name} would clash with it${hint}`);
+  }
 }
 
 if (!existsSync(join(root, 'shared', 'dist', 'index.js'))) {

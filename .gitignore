@@ -7,6 +7,17 @@ target/
 .keys/
 *.log
 .DS_Store
+# caches: TypeScript build info, Vite, test coverage, linters, atomic-write leftovers
+*.tsbuildinfo
+.cache/
+.vite/
+coverage/
+.eslintcache
+*.tmp
+*.tmp-*
+# fixture caches: half-written captures and scratch recordings; finished fixtures in */fixtures/ are committed
+**/fixtures/**/scratch/
+**/fixtures/**/*.partial
 submission*.json
 .claude/settings.local.json
 .cache/

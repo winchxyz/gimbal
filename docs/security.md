@@ -141,6 +141,12 @@ at least 10 USDC, and the route counts against the rescue cap twice. Every hop e
 cost and time, not a way out. The Hyperliquid → Phoenix rescue runs in replay only, and Hyperliquid → Orderly is not
 built. Accepted because the gap is on 1Click's side; the contract keeps `hl_send_to_intents` for when quoting opens.
 
+### Oversized Phoenix answers (zod < 4.6.6)
+
+The Phoenix SDK validates every API answer with zod 4.4.3, so a huge malformed array from Phoenix's API could exhaust
+the engine's memory and stop it (no signing, funds or policy affected; rescues wait for the restart). Fixed by
+`@ellipsis-labs/rise` 0.6.8, which we take after the hackathon demo.
+
 ## Other bounded residuals
 
 ### Paused rescues
