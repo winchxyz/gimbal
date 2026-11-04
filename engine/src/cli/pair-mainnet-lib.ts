@@ -5,7 +5,7 @@
 // the reads around it).
 // pair-mainnet.ts runs on import; this module does not, so the tests drive these directly.
 
-import type { TxRef } from '@gimbal/shared';
+import type { TxRef, VenueId } from '@gimbal/shared';
 import { ContractRefusal, OutcomeUnknown } from '../contract/types.ts';
 import { MAX_PRIORITY_MICROLAMPORTS, ORDER_PRIORITY_MICROLAMPORTS } from '../relayer/phoenix-tx.ts';
 import { pct, usd, venueMaxLeverage } from '../trade/carry-plan.ts';
@@ -325,8 +325,8 @@ export function restingOrdersRefusal(raw: unknown, coin: string): string | null 
 }
 
 /**
- * The Phoenix IOC that brings the pair back to its target net (Phoenix to `targetNet` − hl), in whole Phoenix lots,
- * or null when no whole lot is off. Reduce-only when it only shrinks the Phoenix position. The target net is the sum
+ * The IOC that brings the pair back to its target net (the IOC leg, Phoenix or Orderly, to `targetNet` − hl), in whole
+ * lots of that leg, or null when no whole lot is off. Reduce-only when it only shrinks that leg's position. The target net is the sum
  * of the operation's targets: an open keeps hl + px as it found them (an imbalance an older run left is not this run's
  * to trade away); a close targets flat on both legs, so 0.
  */
@@ -339,18 +339,29 @@ export function residualHedge(hlPos: bigint, pxPos: bigint, pxLot: bigint, targe
   return { side, size, reduceOnly };
 }
 
-/** What finish() knows after cancelPending and a fresh read of both legs. */
+/** The capitalised venue name, as the residual lines print it. */
+function venueName(v: VenueId): string {
+  return v === 'hyperliquid' ? 'Hyperliquid' : v === 'orderly' ? 'Orderly' : 'Phoenix';
+}
+
+/**
+ * What finish() knows after cancelPending and a fresh read of both legs. `hl` is the maker leg (Hyperliquid, the only
+ * leg that works a post-only order); `px` and `lot` are the IOC leg's, the leg the hedge goes on: Phoenix, or Orderly
+ * (`venue`).
+ */
 export interface ResidualInput {
   /** Post-only orders still unsettled after cancelPending. */
   left: number;
-  /** The Phoenix leg has an order with no answer that may still run. */
+  /** The IOC leg has an order with no answer that may still run. */
   phoenixUnsettled: boolean;
+  /** The IOC leg's venue; default phoenix. */
+  venue?: VenueId;
   send: boolean;
   /** The command passed its refusals and traded. */
   trading: boolean;
   hl: bigint;
   px: bigint;
-  /** The Phoenix lot. */
+  /** The IOC leg's lot. */
   lot: bigint;
   /** The sum of the operation's targets: hl + px before an open began; 0 for a close (both legs flat). */
   targetNet: bigint;
@@ -360,7 +371,7 @@ export interface ResidualInput {
 }
 
 export interface ResidualPlan {
-  /** The Phoenix IOC to send, or null. */
+  /** The IOC leg's order to send, or null. */
   hedge: { side: LegSide; size: bigint; reduceOnly: boolean } | null;
   /** Why the legs are off and nothing is sent, or null. */
   held: string | null;
@@ -372,15 +383,16 @@ export interface ResidualPlan {
 }
 
 export function residualPlan(i: ResidualInput): ResidualPlan {
+  const v = i.venue ?? 'phoenix';
   const off = i.hl + i.px - i.targetNet;
   const unhedged = off !== 0n
-    ? `unhedged: hyperliquid ${i.symbol} ${signedQtyString(i.hl)}, phoenix ${i.symbol} ${signedQtyString(i.px)} against a target net of ${signedQtyString(i.targetNet)}: ${qtyString(abs(off))} ${i.symbol} ${off > 0n ? 'long' : 'short'} is not offset`
+    ? `unhedged: hyperliquid ${i.symbol} ${signedQtyString(i.hl)}, ${v} ${i.symbol} ${signedQtyString(i.px)} against a target net of ${signedQtyString(i.targetNet)}: ${qtyString(abs(off))} ${i.symbol} ${off > 0n ? 'long' : 'short'} is not offset`
     : i.left === 0 ? null : i.unhedged;
   if (off === 0n) return { hedge: null, held: null, unhedged };
   const hedge = residualHedge(i.hl, i.px, i.lot, i.targetNet);
-  const held = hedge === null ? `the ${qtyString(abs(off))} ${i.symbol} off is under one Phoenix lot ${qtyString(i.lot)}`
+  const held = hedge === null ? `the ${qtyString(abs(off))} ${i.symbol} off is under one ${venueName(v)} lot ${qtyString(i.lot)}`
     : i.left > 0 ? `${i.left} post-only order(s) are still unsettled and may fill more`
-    : i.phoenixUnsettled ? 'Phoenix has an order with no answer that may still run'
+    : i.phoenixUnsettled ? `${venueName(v)} has an order with no answer that may still run`
     : !i.send || !i.trading ? 'nothing is sent outside a trading --send run'
     : null;
   return { hedge: held === null ? hedge : null, held, unhedged };
@@ -390,7 +402,7 @@ export function residualPlan(i: ResidualInput): ResidualPlan {
 export interface ResidualDeps {
   /** Both legs' positions now, or null (with the reason printed) when either cannot be read. */
   readLegs(): Promise<{ hl: bigint; px: bigint } | null>;
-  /** The Phoenix IOC (PhoenixLeg.order); never throws. */
+  /** The IOC leg's order (TradeLeg.order); never throws. */
   hedge(side: LegSide, size: bigint, reduceOnly: boolean): Promise<LegOutcome>;
   say(line: string): void;
   /** Something the owner must reconcile: an `open:` line, exit code 3. */
@@ -398,30 +410,31 @@ export interface ResidualDeps {
 }
 
 /**
- * finish() after cancelPending: both legs read again, the residual plan, at most one Phoenix IOC back to the target
+ * finish() after cancelPending: both legs read again, the residual plan, at most one IOC on the IOC leg back to the target
  * net, and the legs read once more after it. Returns the unhedged alert as of the last read (null when the legs are at
  * the target net and nothing is left that could still move them). A hedge with no answer is an `open:` line and keeps
  * the alert: its order may still run.
  */
 export async function settleResidual(base: Omit<ResidualInput, 'hl' | 'px'>, d: ResidualDeps): Promise<string | null> {
+  const v = base.venue ?? 'phoenix';
   const read = await d.readLegs();
-  if (read === null) return `the legs cannot be read after the cancel: check hyperliquid and phoenix ${base.symbol} by hand`;
-  d.say(`positions after the cancel: hyperliquid ${base.symbol} ${signedQtyString(read.hl)}, phoenix ${base.symbol} ${signedQtyString(read.px)} (net ${signedQtyString(read.hl + read.px)}, target ${signedQtyString(base.targetNet)})`);
+  if (read === null) return `the legs cannot be read after the cancel: check hyperliquid and ${v} ${base.symbol} by hand`;
+  d.say(`positions after the cancel: hyperliquid ${base.symbol} ${signedQtyString(read.hl)}, ${v} ${base.symbol} ${signedQtyString(read.px)} (net ${signedQtyString(read.hl + read.px)}, target ${signedQtyString(base.targetNet)})`);
   const input: ResidualInput = { ...base, hl: read.hl, px: read.px };
   const plan = residualPlan(input);
   if (plan.held !== null) d.say(`hedge     not sent: ${plan.held}`);
   if (plan.hedge === null) return plan.unhedged;
   const h = plan.hedge;
-  d.say(`hedge     phoenix ${h.side} ${qtyString(h.size)}${h.reduceOnly ? ' reduce-only' : ''}: back to the target net against hyperliquid ${signedQtyString(read.hl)}`);
+  d.say(`hedge     ${v} ${h.side} ${qtyString(h.size)}${h.reduceOnly ? ' reduce-only' : ''}: back to the target net against hyperliquid ${signedQtyString(read.hl)}`);
   const out = await d.hedge(h.side, h.size, h.reduceOnly);
   const tx = out.ref.tx.length === 0 ? '' : ` ${out.ref.tx.map((t) => t.url).join('  ')}`;
   d.say(`          ${out.kind}${out.kind === 'filled' ? ` ${qtyString(out.filled)}` : ` (${out.error.message})`}${tx}`);
   if (out.kind === 'unknown') {
-    d.open(`the phoenix hedge ${h.side} ${qtyString(h.size)} ${base.symbol} (${out.ref.orderId ?? 'no signature'}) has no proven outcome: check Phoenix by hand before sending another`);
+    d.open(`the ${v} hedge ${h.side} ${qtyString(h.size)} ${base.symbol} (${out.ref.orderId ?? 'no signature'}) has no proven outcome: check ${venueName(v)} by hand before sending another`);
   }
   const now = await d.readLegs();
-  if (now === null) return `the legs cannot be read after the hedge: check hyperliquid and phoenix ${base.symbol} by hand`;
-  d.say(`positions hyperliquid ${base.symbol} ${signedQtyString(now.hl)}, phoenix ${base.symbol} ${signedQtyString(now.px)}`);
+  if (now === null) return `the legs cannot be read after the hedge: check hyperliquid and ${v} ${base.symbol} by hand`;
+  d.say(`positions hyperliquid ${base.symbol} ${signedQtyString(now.hl)}, ${v} ${base.symbol} ${signedQtyString(now.px)}`);
   return residualPlan({ ...input, hl: now.hl, px: now.px, phoenixUnsettled: out.kind === 'unknown' || input.phoenixUnsettled }).unhedged;
 }
 

@@ -10,6 +10,7 @@ import type { VenueId } from '@gimbal/shared';
 import type { LegOutcome, LegSide, MakerSettings, TradeLeg } from '../trade/legs.ts';
 import { floorToLot, toQty } from '../trade/lots.ts';
 import { PairTrader } from '../trade/pair.ts';
+import { defaultShape } from '../trade/pair-shape.ts';
 import { PHOENIX_BUDGET, hostBudget } from '../venues/http-budget.ts';
 import type { PriceDeps } from './pair-mainnet-lib.ts';
 import { OPEN_HEADROOM_S, PRICE_MARGIN_S, newPriceState, oraclePxOf, refreshLanded, refreshReachedChain } from './pair-mainnet-lib.ts';
@@ -94,7 +95,7 @@ function gateWorld() {
   const said: string[] = [];
   const ctx = { config: {}, say: (l = '') => said.push(l), open: (l: string) => said.push(`open: ${l}`), trading: false } as unknown as OpsCtx;
   const pair = {
-    symbol: 'XLM', hl, phoenix: px, trader, priced: false, targetNet: null, maker: { timeoutMs: 60_000 },
+    symbol: 'XLM', shape: defaultShape('XLM'), legs: [hl, px], makerIndex: 0, hl, phoenix: px, trader, priced: false, targetNet: null, maker: { timeoutMs: 60_000 },
     run: { openInChunks: (r: Parameters<PairTrader['openInChunks']>[0]) => trader.openInChunks(r), close: () => Promise.reject(new Error('no close')), hedge: () => Promise.reject(new Error('no hedge')), stopOnFinish: false },
   } as unknown as Pair;
   const plan = { request: { symbol: 'XLM' }, refusals: [], size: toQty('10'), carry: {} } as unknown as OpenPlan;
@@ -199,7 +200,7 @@ function planWorld(o: PlanWorldOptions) {
   const oraclePx = oraclePxOf(prices, sym, () => ctx.send && ctx.trading);
   const lot = toQty('0.001');
   const pair = {
-    symbol: sym, lot, bandBps: policy.price_band_bps, priced: true, mismatches: [], microLamports: 1, targetNet: null,
+    symbol: sym, shape: defaultShape(sym), makerIndex: 0, hl: {}, lot, bandBps: policy.price_band_bps, priced: true, mismatches: [], microLamports: 1, targetNet: null,
     maker: o.maker ?? { timeoutMs: 60_000, repriceMs: 30_000, maxOrders: 6, takerFallback: false },
     marketConfig: { takerFee: 0.0002, leverageTiers: [{ maxLeverage: 10, maxSizeBaseLots: '1000000' }], riskFactors: { maintenance: 50 } },
     trader: {
@@ -407,8 +408,10 @@ test('SERVE_MAKER: one refresh lives through the size check and the first part, 
   assert.ok(!('refused' in held), 'refused' in held ? held.refused : '');
   w.age(10);                                         // both legs read, the builder fee checked
   let beforeParts = 0;
+  const hlFlat = { position: async () => 0n, pendingMakerOrders: () => [] };
+  const pxFlat = { ...(w.pair.phoenix as object), position: async () => 0n };
   const pair = {
-    ...w.pair, hl: { position: async () => 0n, pendingMakerOrders: () => [] }, phoenix: { ...(w.pair.phoenix as object), position: async () => 0n },
+    ...w.pair, hl: hlFlat, phoenix: pxFlat, legs: [hlFlat, pxFlat],
     trader: { unhedged: null, unsettled: () => null, legs: [] },
     run: {
       openInChunks: async (r: { beforePart?: (part: number, parts: number) => Promise<void> }) => {

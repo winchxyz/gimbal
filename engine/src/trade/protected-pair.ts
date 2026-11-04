@@ -145,11 +145,13 @@ export function inFlightEnds(orders: readonly InFlightOrder[]): number | null {
  * explained). A leg is explained when it reads its baseline moved by some of its orders, each in full (BUY adds, SELL
  * takes off): none of them ran, some did, or all did. A baseline that is unknown explains nothing.
  */
-export function inFlightUnexplained(orders: readonly InFlightOrder[], baselines: readonly (bigint | null)[], read: readonly [bigint, bigint]): string[] {
+export function inFlightUnexplained(
+  orders: readonly InFlightOrder[], baselines: readonly (bigint | null)[], read: readonly [bigint, bigint], venues: readonly VenueId[] = DEFAULT_VENUES,
+): string[] {
   const out: string[] = [];
   for (const index of [0, 1] as const) {
     const mine = orders.filter((o) => o.index === index);
-    const venue = index === 0 ? 'hyperliquid' : 'phoenix';
+    const venue = venues[index];
     const base = baselines[index] ?? null;
     if (base === null) {
       out.push(`${venue} reads ${signedQtyString(read[index])} and its saved baseline is unknown`);
@@ -196,11 +198,14 @@ export function settleInFlight(p: {
   unsettled: number;
   pendingMaker: number;
   reconcile: string;
+  /** The legs' venues in the trader's order; default short Hyperliquid / long Phoenix's. */
+  venues?: readonly VenueId[];
 }): InFlightSettle {
   const { orders, read } = p;
-  const reads = `hyperliquid ${signedQtyString(read[0])}, phoenix ${signedQtyString(read[1])}`;
+  const venues = p.venues ?? DEFAULT_VENUES;
+  const reads = `${venues[0]} ${signedQtyString(read[0])}, ${venues[1]} ${signedQtyString(read[1])}`;
   const head = `the ${orders.length} order(s) in flight when the engine stopped were signed more than ${IN_FLIGHT_LIFE_MS / 60_000} min ago and can no longer run; the venues read ${reads}`;
-  const off = inFlightUnexplained(orders, p.baselines, read);
+  const off = inFlightUnexplained(orders, p.baselines, read, venues);
   if (p.pendingMaker > 0) off.push(`${p.pendingMaker} Hyperliquid post-only order(s) are not settled and may still fill (cancel them on Hyperliquid)`);
   if (off.length > 0) {
     const hold = holdText(orders, off, p.reconcile);
@@ -450,7 +455,7 @@ export class ProtectedPair {
     const r = settleInFlight({
       orders: restored, baselines: legs.map((l) => this.trader.baseline(l) ?? null), net: this.trader.net, read,
       unsettled: legs.filter((l) => this.trader.unsettled(l) !== null).length, pendingMaker: (this.#o.pendingMaker?.() ?? []).length,
-      reconcile: this.#o.reconcile ?? 'check both legs by hand',
+      reconcile: this.#o.reconcile ?? 'check both legs by hand', venues: legs.map((l) => l.venue),
     });
     if (r.kind === 'adopt') {
       this.adopt(read);
@@ -620,7 +625,7 @@ export class ProtectedPair {
     else {
       const base = this.trader.legs.map((l) => this.trader.baseline(l));
       if (base.every((b) => b !== null && b !== undefined) && base[0]! + base[1]! !== 0n) {
-        out.push(`open:     the legs are meant to hold hyperliquid ${signedQtyString(base[0]!)} and phoenix ${signedQtyString(base[1]!)}, which do not offset each other (a close clamped to the legs as read): ADL only alerts until a close offsets them`);
+        out.push(`open:     the legs are meant to hold ${this.trader.legs[0].venue} ${signedQtyString(base[0]!)} and ${this.trader.legs[1].venue} ${signedQtyString(base[1]!)}, which do not offset each other (a close clamped to the legs as read): ADL only alerts until a close offsets them`);
       }
     }
     for (const leg of this.trader.legs) {
@@ -779,7 +784,7 @@ export function startPlan(input: StartInput): StartPlan {
   const restore = (note: string): StartPlan => {
     const restored = { stateOk: true, why: null, restore: t, adl: s.adl, pendingMaker: s.pendingMaker };
     if (!settled) return plan({ ...restored, adopt: null, inFlight, adlHold: hold, notes: [note] });
-    const r = settleInFlight({ orders: inFlight, baselines: base, net: t.net, read, unsettled: t.unsettled.length, pendingMaker: s.pendingMaker.length, reconcile });
+    const r = settleInFlight({ orders: inFlight, baselines: base, net: t.net, read, unsettled: t.unsettled.length, pendingMaker: s.pendingMaker.length, reconcile, venues: shape.legs.map((l) => l.venue) });
     if (r.kind === 'adopt') return plan({ ...restored, adopt: read, inFlight: [], adlHold: null, notes: [note, r.line] });
     // The baselines stay as saved: the ADL watch compares the legs with them.
     if (r.kind === 'restore') return plan({ ...restored, adopt: null, inFlight: [], adlHold: null, notes: [note, r.line], owner: [r.line] });

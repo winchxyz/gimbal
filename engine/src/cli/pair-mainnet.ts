@@ -9,7 +9,7 @@
 //     open <symbol> <legUsd> --short hyperliquid --long phoenix [--leverage 2] [--hold-days 7] [--basis-bps 10]
 //          [--slippage-bps 50] [--reprice-s 30] [--maker-timeout-s 120] [--max-orders 6] [--taker-fallback]
 //          [--priority-microlamports 100000]
-//     close <symbol> [the same order options]
+//     close <symbol> [--short hyperliquid --long phoenix] [the same order options]
 //     refuse-band <symbol>                  one real Hyperliquid order outside the price band, sent to hl_order so the
 //                                           contract refuses it on chain (E_PRICE_BAND); refuse-lib.ts
 //     refuse-notional <symbol>              the same, inside the band and one lot over max_notional_usd (E_SIZE)
@@ -52,6 +52,10 @@
 //
 // The open and close are pair-ops.ts, which serve's strategy loop runs too (serve-pair.ts).
 //
+// --short / --long name the pair's venues (hyperliquid, orderly, phoenix; close defaults to short hyperliquid / long
+// phoenix). Any pair but that one needs GIMBAL_ORDERLY_PAIRS=1, and an Orderly leg needs the desk's Orderly session,
+// which only serve holds: this CLI refuses an Orderly pair with that reason and builds nothing.
+//
 // refuse-band and refuse-notional (refuse-cli.ts) run before the trader lock and before any relayer or submitter
 // exists: their only calls are refresh_prices (when the stored price is stale) and one hl_order the contract is expected
 // to refuse, one at a time. They are safe to run while serve trades the desk with the same operator key (an InvalidNonce
@@ -60,7 +64,7 @@
 
 import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import type { TxRef } from '@gimbal/shared';
+import type { TxRef, VenueId } from '@gimbal/shared';
 import { formatNear } from '../contract/budget.ts';
 import type { ContractConfigView, NearTransport } from '../contract/near-client.ts';
 import { NearContractClient } from '../contract/near-client.ts';
@@ -82,6 +86,8 @@ import { MAINNET_COSTS } from '../scanner/config.ts';
 import { MAX_LEVERAGE, usd, venueMaxLeverage } from '../trade/carry-plan.ts';
 import type { TraderLock } from '../trade/trader-state.ts';
 import { acquireTraderLock, lockHolder, traderLockPath } from '../trade/trader-state.ts';
+import type { PairShape } from '../trade/pair-shape.ts';
+import { ORDERLY_PAIRS_ENV, PAIR_VENUES, orderlyPairsOn, pairShape, shapeText } from '../trade/pair-shape.ts';
 import { HL_MAINNET_URL, HyperliquidReader } from '../venues/hyperliquid.ts';
 import { PHOENIX_API_URL, PhoenixReader, SOLANA_MAINNET_RPC_URL } from '../venues/phoenix.ts';
 import { errorMessage } from '../venues/recorder.ts';
@@ -101,7 +107,7 @@ const USAGE = `usage: node --env-file=<engine env> engine/src/cli/pair-mainnet.t
   defund-phoenix <usdc|all>
   open <symbol> <legUsd> --short hyperliquid --long phoenix [--leverage 2] [--hold-days 7] [--basis-bps 10] [--slippage-bps 50]
        [--reprice-s 30] [--maker-timeout-s 120] [--max-orders 6] [--taker-fallback] [--priority-microlamports 100000]
-  close <symbol> [--slippage-bps 50] [--reprice-s 30] [--maker-timeout-s 120] [--max-orders 6] [--taker-fallback] [--priority-microlamports 100000]
+  close <symbol> [--short hyperliquid --long phoenix] [--slippage-bps 50] [--reprice-s 30] [--maker-timeout-s 120] [--max-orders 6] [--taker-fallback] [--priority-microlamports 100000]
   refuse-band <symbol>       a real order outside the price band to hl_order: the contract refuses it on chain (E_PRICE_BAND)
   refuse-notional <symbol>   a real order over max_notional_usd to hl_order: the contract refuses it on chain (E_SIZE)
     Both are safe to run while serve trades: no trader lock, no venue order, one NEAR call at a time; nothing is ever
@@ -381,11 +387,34 @@ function printPlan(plan: MoneyPlan): void {
 
 // ---- the pair ----
 
+/**
+ * The pair --short / --long name (default short hyperliquid / long phoenix). Another pair is refused unless
+ * GIMBAL_ORDERLY_PAIRS is 1; the policy listing is buildPair's to check.
+ */
+function shapeOf(ctx: Ctx, symbol: string): PairShape {
+  const venue = (flag: '--short' | '--long', fallback: VenueId): VenueId => {
+    const v = ctx.args.flags[flag];
+    if (v === undefined) return fallback;
+    if (typeof v !== 'string' || !(PAIR_VENUES as readonly string[]).includes(v)) throw new UsageError(`${flag} must be one of ${PAIR_VENUES.join(', ')}`);
+    return v as VenueId;
+  };
+  let shape: PairShape;
+  try {
+    shape = pairShape(symbol, venue('--long', 'phoenix'), venue('--short', 'hyperliquid'));
+  } catch (err) {
+    throw new UsageError(errorMessage(err));
+  }
+  const isDefault = shape.legs[0].venue === 'hyperliquid' && shape.legs[1].venue === 'phoenix' && shape.longIndex === 1;
+  if (!isDefault && !orderlyPairsOn(envVar)) throw new UsageError(`${shapeText(shape)}: only short hyperliquid / long phoenix trades while ${ORDERLY_PAIRS_ENV} is not 1`);
+  return shape;
+}
+
 async function open(ctx: Ctx): Promise<void> {
   const [symbolArg, legUsdText] = ctx.args.positional;
   if (symbolArg === undefined || legUsdText === undefined) throw new UsageError('open needs <symbol> <legUsd>');
-  if (ctx.args.flags['--short'] !== 'hyperliquid' || ctx.args.flags['--long'] !== 'phoenix') throw new UsageError('this pair is --short hyperliquid --long phoenix');
+  if (typeof ctx.args.flags['--short'] !== 'string' || typeof ctx.args.flags['--long'] !== 'string') throw new UsageError('this pair is --short hyperliquid --long phoenix');
   const symbol = symbolArg.toUpperCase();
+  const shape = shapeOf(ctx, symbol);
   const legUsd = Number(legUsdText);
   if (!(legUsd > 0)) throw new UsageError('legUsd must be a number above 0');
   const leverage = num(ctx.args, '--leverage', 2);
@@ -393,7 +422,7 @@ async function open(ctx: Ctx): Promise<void> {
   const holdDays = num(ctx.args, '--hold-days', MAINNET_COSTS.holdHours / 24);
   const basisBps = num(ctx.args, '--basis-bps', MAINNET_COSTS.basisBufferBps);
   if (!(leverage > 0) || !(holdDays > 0)) throw new UsageError('--leverage and --hold-days must be above 0');
-  const pair = await buildPair(ctx, symbol, () => orderOptions(ctx.args));
+  const pair = await buildPair(ctx, symbol, () => orderOptions(ctx.args), false, shape);
   const plan = await planOpen(ctx, pair, { symbol, legUsd, leverage, holdDays, basisBps });
   const { refusals } = plan;
   if (!ctx.args.send) {
@@ -414,7 +443,7 @@ async function close(ctx: Ctx): Promise<void> {
   const symbolArg = ctx.args.positional[0];
   if (symbolArg === undefined) throw new UsageError('close needs <symbol>');
   const symbol = symbolArg.toUpperCase();
-  const pair = await buildPair(ctx, symbol, () => orderOptions(ctx.args), true);
+  const pair = await buildPair(ctx, symbol, () => orderOptions(ctx.args), true, shapeOf(ctx, symbol));
   const { refusals } = await planClose(ctx, pair);
   if (!ctx.args.send) {
     for (const r of refusals) say(`would refuse at --send: ${r}`);

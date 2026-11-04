@@ -15,7 +15,7 @@ import { toQty } from '../trade/lots.ts';
 import { newAdlState } from '../risk/adl.ts';
 import { LOCK_STALE_MS, THIS_PROCESS, TRADER_STATE_VERSION, TraderStateStore, lockHeartbeats, lockText, parseLockText, traderLockPath, traderStateFile } from '../trade/trader-state.ts';
 import type { ContractSide } from './serve-contract.ts';
-import type { CarryInput, ServePairDeps, ServePairInput, SlotCarry } from './serve-pair.ts';
+import type { CarryInput, ServeOrderly, ServePairDeps, ServePairInput, SlotCarry } from './serve-pair.ts';
 import { liveLines, pairRefreshesAtOpen, servePair } from './serve-pair.ts';
 import { adlGate, openGateText } from './serve-loop.ts';
 import { ConfigError } from './start-errors.ts';
@@ -1108,6 +1108,79 @@ test('prepareOpen (a rotate\'s first step): a missing price is refreshed, a fail
     assert.deepEqual([fresh.ok, fresh.refreshed], [true, undefined]);
     assert.equal(w.refreshes, 1);
     p.stop();
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+// ---- Orderly pairs (GIMBAL_ORDERLY_PAIRS=1) ----
+
+test('Orderly pairs: refused without GIMBAL_ORDERLY_PAIRS=1 or serve\'s Orderly session; with both, opened and saved with its legs, restored only by a serve with the flag, then closed', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
+  const ol = new Leg('orderly', 'PERP_XLM_USDC');
+  const session: ServeOrderly = {
+    leg: () => ol,
+    account: async () => ({
+      venue: 'orderly', address: 'acct', time: 1, equityUsd: 100, freeMarginUsd: 100, maintenanceMarginUsd: 0,
+      positions: ol.pos === 0n ? [] : [{ symbol: 'PERP_XLM_USDC', size: Number(ol.pos) / 1e8, entryPx: 1, liqPx: null, marginUsd: 1, unrealizedPnlUsd: 0, leverage: 1, fundingSinceOpenUsd: 0, unsettledFundingUsd: 0 }],
+    }),
+  };
+  /** serve's input with Orderly listed by the policy, and legs built for the shape asked (Orderly's from `ol`). */
+  const withOrderly = (extra: Partial<ServePairInput> = {}): ServePairInput => {
+    const i = input(w, extra);
+    (i.side.desk.policy as { orderly_symbols?: string[] }).orderly_symbols = ['PERP_XLM_USDC'];
+    i.deps = {
+      ...i.deps,
+      buildLegs: async ({ shape }) => (shape.legs[1].venue === 'orderly'
+        ? { shape, legs: [w.hl, ol], hl: w.hl, phoenix: null, priced: false, mismatches: [] }
+        : { hl: w.hl, phoenix: w.px, priced: false, mismatches: [] }),
+    };
+    return i;
+  };
+  const ask = { symbol: 'XLM', long: 'orderly', short: 'hyperliquid', legUsd: 10, leverage: 1.5, reason: 'strategy: enter xlm-orderly-hyperliquid' } as const;
+  const statePath = traderStateFile(w.dir, 'mainnet', { contractId: CONTRACT, deskId: DESK, evm: EVM });
+  try {
+    // Without the flag: refused before anything is built, whatever the session.
+    const off = await servePair(withOrderly({ orderly: session }));
+    const refused = await off.hands!.open(ask);
+    assert.equal(refused.ok, false);
+    assert.match(refused.reason, /short hyperliquid XLM, long orderly PERP_XLM_USDC: only short hyperliquid \/ long phoenix trades while GIMBAL_ORDERLY_PAIRS is not 1/);
+    off.stop();
+    // With the flag and no Orderly session: refused, nothing built.
+    w.env.GIMBAL_ORDERLY_PAIRS = '1';
+    const noSession = await servePair(withOrderly());
+    const none = await noSession.hands!.open(ask);
+    assert.match(none.reason, /an Orderly pair needs serve's Orderly session .*, and serve has none: nothing built or sent/);
+    noSession.stop();
+    assert.equal(w.hl.orders.length + ol.orders.length + w.px.orders.length, 0);
+
+    // With both: short Hyperliquid / long Orderly, saved as version 2 with its legs.
+    const on = await servePair(withOrderly({ orderly: session }));
+    const opened = await on.hands!.open(ask);
+    assert.equal(opened.ok, true, opened.reason);
+    assert.deepEqual([w.hl.pos, ol.pos, w.px.pos], [-toQty('10'), toQty('10'), 0n]);
+    assert.deepEqual(on.hands!.heldLegs().map((l) => l.venue), ['hyperliquid', 'orderly']);
+    const saved = JSON.parse(readFileSync(statePath, 'utf8')) as { version: number; pair: unknown };
+    assert.equal(saved.version, 2);
+    assert.deepEqual(saved.pair, { legs: [{ venue: 'hyperliquid', symbol: 'XLM' }, { venue: 'orderly', symbol: 'PERP_XLM_USDC' }], longIndex: 1 });
+    on.stop();
+
+    // A serve without the flag never rebuilds it on Phoenix: alert only, the saved legs named.
+    delete w.env.GIMBAL_ORDERLY_PAIRS;
+    const old = await servePair(withOrderly({ orderly: session }));
+    assert.equal(old.pair?.live, false);
+    assert.match(old.pair?.why ?? '', /is for XLM \(short hyperliquid XLM, long orderly PERP_XLM_USDC\) with legs or orders open, but the venues are read for XLM \(short hyperliquid XLM, long phoenix XLM\)/);
+    old.stop();
+
+    // With the flag again: XLM held on Hyperliquid and Orderly, the saved pair's legs: restored and live, then closed.
+    w.env.GIMBAL_ORDERLY_PAIRS = '1';
+    const back = await servePair(withOrderly({ orderly: session }));
+    assert.equal(back.pair?.live, true, back.lines.join('\n'));
+    assert.match(back.lines.join('\n'), /pair {6}XLM: hyperliquid -10 \(short\), orderly 10 \(long\)/);
+    const closed = await back.hands!.close({ reason: 'strategy: exit' });
+    assert.equal(closed.ok, true, closed.reason);
+    assert.deepEqual([w.hl.pos, ol.pos], [0n, 0n]);
+    back.stop();
   } finally {
     rmSync(w.dir, { recursive: true, force: true });
   }
