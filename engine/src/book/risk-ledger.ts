@@ -10,7 +10,7 @@
 //
 // The report prices a refusal from those hours alone, offline, marked estimated: what the refused leg would have
 // earned, less the round trip of fills, slippage and basis the scanner priced it with, prorated over the hours
-// priced (hours / hold). It is pending until its whole hold is priced, and only then helped (the window would have
+// priced (hours / hold). It is pending until its whole hold is priced (or, once the hold is over, 90 % of it), and only then helped (the window would have
 // lost: a loss avoided) or hurt (it would have gained: a gain given up). A window refused again inside an earlier
 // refusal's hold is a repeat, counted in that first refusal: each window-hour is counted once. The counterfactual is
 // a full hold: it leaves out the exits the loop's own bad checks would have made. A pass is matched to the position
@@ -24,6 +24,7 @@ import { dirname, join } from 'node:path';
 import type { Mode } from '@gimbal/shared';
 import type { ChatMessage } from '../nearai/client.ts';
 import { HOURS_PER_YEAR } from '../scanner/costs.ts';
+import { WEEK_COVERAGE } from '../scanner/history.ts';
 import type { RiskCheckOutcome } from '../strategy/veto.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { PositionResult } from './derive.ts';
@@ -321,9 +322,14 @@ export interface RiskLedgerSummary {
   skipped: number;
 }
 
-/** The ledger against the book's positions. Pure. */
+/**
+ * The ledger against the book's positions, as of `now` (default: every hold over). Pure. A refusal is final when its
+ * whole hold is priced, or once its hold is over with at least WEEK_COVERAGE (90 %) of its hours priced, the coverage
+ * the scanner's own averages accept: one hour the scanner never held does not keep it pending for ever.
+ */
 export function riskLedgerSummary(
   records: readonly RiskLedgerRecord[], positions: readonly Pick<PositionResult, 'id' | 'windowId' | 'open' | 'netUsd'>[], skipped = 0,
+  now = Number.POSITIVE_INFINITY,
 ): RiskLedgerSummary {
   const checks = records.filter((r): r is RiskCheckRecord => r.type === 'check');
   const seen = new Set<string>();
@@ -361,7 +367,7 @@ export function riskLedgerSummary(
       }
       const funding = pts.reduce((s, [, g]) => s + (g / 100) * c.legUsd / HOURS_PER_YEAR, 0);
       const net = funding - c.roundTripCostUsd * Math.min(1, pts.length / c.holdHours);
-      const done = pts.length >= c.holdHours;
+      const done = pts.length >= c.holdHours || (now >= to && pts.length >= Math.ceil(c.holdHours * WEEK_COVERAGE));
       refusals.push({ check: c, hours: pts.length, counterfactualUsd: net, call: !done ? 'pending' : net < 0 ? 'helped' : net > 0 ? 'hurt' : 'even' });
       continue;
     }

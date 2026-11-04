@@ -804,7 +804,7 @@ test('npm run report: the NEAR AI risk check ledger next to the book, offline: r
   assert.equal(run.status, 0, run.stderr);
   const out = run.stdout;
   assert.match(out, /NEAR AI risk check ledger \(helped \/ hurt\)\n {2}file {7}.*risk-checks-mainnet-gimbal-test\.near-desk-1\.jsonl\n/);
-  assert.match(out, / {2}refusals {3}1: each estimated from the scanner's hourly gross over the full hold .*bad checks would have made\); helped or hurt only once the whole hold is priced\n/);
+  assert.match(out, / {2}refusals {3}1: each estimated from the scanner's hourly gross over the full hold .*bad checks would have made\); helped or hurt only once the whole hold is priced \(90 % of it once the hold is over\)\n/);
   assert.match(out, /enter eth-phoenix-hyperliquid \(auto\), 1000\.00 USD a leg at 1\.5x, 20\.00 % net forecast\n {6}NEAR AI risk check refused \(TEE attested 2026-11-02 09:00 UTC\): a spike\n {6}estimated -0\.4600 USD over 4 of 4 h .* -> helped: a loss avoided/);
   assert.match(out, /enter xlm-phoenix-hyperliquid \(auto\), 1000\.00 USD a leg\n {6}NEAR AI risk check passed \(TEE attested 2026-11-02 09:00 UTC\): no red flag named\n {6}position xlm-phoenix-hyperliquid@\S+ closed, realised net [+-]\d+\.\d{4} USD/);
   assert.match(out, /enter sol-phoenix-hyperliquid \(auto\), 1000\.00 USD a leg\n {6}NEAR AI risk check passed .*\n {6}no position: not opened: the spread does not cover the round trip/);

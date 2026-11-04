@@ -79,7 +79,7 @@ function refusalLines(r: RefusalResult): string[] {
   else if (r.counterfactualUsd === null) result = `      no hour of its hold priced yet (from ${when(c.at)} + ${c.holdHours} h): pending`;
   else {
     const cost = c.roundTripCostUsd * Math.min(1, r.hours / c.holdHours);
-    const call = r.call === 'pending' ? `pending until all ${c.holdHours} h are priced`
+    const call = r.call === 'pending' ? `pending until all ${c.holdHours} h are priced, or 90 % once the hold is over`
       : r.call === 'helped' ? 'helped: a loss avoided' : r.call === 'hurt' ? 'hurt: a gain given up' : 'even';
     result = `      estimated ${signed(r.counterfactualUsd)} USD over ${r.hours} of ${c.holdHours} h (funding the refused leg would have earned, less`
       + ` ${cost.toFixed(4)} USD of the ${c.roundTripCostUsd.toFixed(4)} USD round trip, prorated) -> ${call}`;
@@ -108,7 +108,7 @@ export function riskLedgerLines(r: RiskLedgerSummary | null, file?: string): str
   const t = r.totals;
   out.push(`  refusals   ${t.refused}${t.repeats === 0 ? '' : ` (and ${t.repeats} repeat(s) inside an earlier refusal's hold)`}: each estimated from the`
     + ' scanner\'s hourly gross over the full hold the loop would have taken (it leaves out the exits the loop\'s own bad checks would'
-    + ' have made); helped or hurt only once the whole hold is priced');
+    + ' have made); helped or hurt only once the whole hold is priced (90 % of it once the hold is over)');
   for (const x of r.refusals) out.push(...refusalLines(x));
   out.push(`  passes     ${t.passed}: each with the position its own act opened`);
   for (const x of r.passes) out.push(...passLines(x));

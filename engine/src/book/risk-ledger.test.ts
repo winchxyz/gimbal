@@ -131,6 +131,24 @@ test('the summary: the round trip is prorated to the hours priced, and helped or
   assert.ok(Math.abs(s.totals.pendingCounterfactualUsd - 0.125) < 1e-9);
 });
 
+test('one hour the scanner never held: final once the hold is over with 90 % priced, prorated; pending before', () => {
+  // A 20 h hold with hour 7 never priced: 19 of 20 h (95 %) at 8.76 % gross on 1000 USD = 0.19 USD, less 19/20 of 0.5.
+  const c = check({ at: T0, holdHours: 20 });
+  const { from, to } = holdSpan(c);
+  const pts = Array.from({ length: 20 }, (_, i) => i).filter((i) => i !== 7).map((i) => ({ t: from + i * HOUR, grossAprPct: 8.76 }));
+  const records: RiskLedgerRecord[] = [c, { v: 1, type: 'hours', at: to, checkId: c.id, points: pts }];
+  const during = riskLedgerSummary(records, [], 0, to - 1);
+  assert.deepEqual([during.refusals[0]!.call, during.refusals[0]!.hours], ['pending', 19]);
+  const over = riskLedgerSummary(records, [], 0, to);
+  const r = over.refusals[0]!;
+  assert.deepEqual([r.call, r.hours], ['helped', 19]);
+  assert.ok(Math.abs(r.counterfactualUsd! - (0.19 - 0.5 * 19 / 20)) < 1e-9);
+  assert.deepEqual([over.totals.helped, over.totals.pending], [1, 0]);
+  // Under 90 %: still pending after the hold (17 of 20 h).
+  const thin: RiskLedgerRecord[] = [c, { v: 1, type: 'hours', at: to, checkId: c.id, points: pts.slice(0, 17) }];
+  assert.equal(riskLedgerSummary(thin, [], 0, to + HOUR).refusals[0]!.call, 'pending');
+});
+
 test('a window refused again inside an earlier refusal\'s hold is a repeat: each window-hour counted once', () => {
   const first = check({ at: T0 });
   const inside = check({ at: T0 + 2 * HOUR });                        // inside the first refusal's hold

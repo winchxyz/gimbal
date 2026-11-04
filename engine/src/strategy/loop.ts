@@ -334,11 +334,12 @@ export function parseLoopState(v: unknown): LoopFileState {
     lastHourlyAt: time(c.lastHourlyAt, 'lastHourlyAt'), lastWaitReason: c.lastWaitReason as string | null,
     vetoedUntil: c.vetoedUntil === undefined ? {} : record(c.vetoedUntil, 'vetoedUntil', isTime, 'a time'),
   };
-  if (c.vetoWhy !== undefined) {
-    const why = c.vetoWhy as Record<string, unknown> | null;
-    if (why === null || typeof why !== 'object' || Array.isArray(why)) throw new Error('vetoWhy is not an object');
-    for (const [k, s] of Object.entries(why)) if (typeof s !== 'string') throw new Error(`vetoWhy.${k} is not text`);
-    counters.vetoWhy = { ...(why as Record<string, string>) };
+  // vetoWhy is display only (the hold-out is vetoedUntil): a malformed one is dropped, never the whole state; an
+  // entry that is not text is dropped alone.
+  delete counters.vetoWhy;
+  const why = c.vetoWhy as Record<string, unknown> | null | undefined;
+  if (why !== null && typeof why === 'object' && !Array.isArray(why)) {
+    counters.vetoWhy = Object.fromEntries(Object.entries(why).filter((e): e is [string, string] => typeof e[1] === 'string'));
   }
   let held: LoopHeld | null = null;
   if (o.held !== null && o.held !== undefined) {

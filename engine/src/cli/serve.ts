@@ -570,6 +570,9 @@ if (mode !== 'replay') {
   void attestor.refresh().then((a) => {
     log(attestor.line());
     attestationJournal(attestor.line(), a);
+  }).catch((err: unknown) => {
+    // refresh() never throws; this is the line or the journal failing. Noted, never fatal.
+    log(`NEAR AI attestation: its start line was not written (${errorMessage(err)})`);
   });
   attestor.start((line, a) => {
     log(line);

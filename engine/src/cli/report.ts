@@ -77,7 +77,7 @@ for (const path of files) {
   let ledger;
   try {
     const { records, skipped } = loadRiskLedger(ledgerFile);
-    ledger = { summary: riskLedgerSummary(records, summary.positions, skipped), file: ledgerFile };
+    ledger = { summary: riskLedgerSummary(records, summary.positions, skipped, Date.now()), file: ledgerFile };
   } catch (err) {
     notes.push(`risk check ledger ${ledgerFile} not read: ${errorMessage(err)}`);
     ledger = { summary: null, file: ledgerFile };
@@ -88,7 +88,7 @@ for (const path of files) {
 for (const file of lonelyLedgers) {
   try {
     const { records, skipped } = loadRiskLedger(file);
-    console.log(`${riskLedgerLines(riskLedgerSummary(records, [], skipped), file).join('\n')}\n  (no position book next to it: passes show no position)\n`);
+    console.log(`${riskLedgerLines(riskLedgerSummary(records, [], skipped, Date.now()), file).join('\n')}\n  (no position book next to it: passes show no position)\n`);
   } catch (err) {
     console.error(`${file}: ${errorMessage(err)}`);
     failed = true;

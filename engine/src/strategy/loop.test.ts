@@ -1001,7 +1001,7 @@ test('no key: the facts for a check that is not asked are not read; a refusal ne
   assert.equal(rot.held?.windowId, 'sol-phoenix-hyperliquid');
 });
 
-test('the saved state keeps the risk check\'s why line with a hold-out; a bad one is refused', () => {
+test('the saved state keeps the risk check\'s why line with a hold-out; a malformed one is dropped, the state kept', () => {
   const store = tmpStore();
   const state = {
     version: LOOP_STATE_VERSION, held: null,
@@ -1011,6 +1011,12 @@ test('the saved state keeps the risk check\'s why line with a hold-out; a bad on
   const w = world();
   const loop = makeLoop(w, store);
   assert.equal(loop.counters.vetoWhy?.['sol-phoenix-hyperliquid'], 'NEAR AI risk check refused (TEE attested 2026-11-03 09:00 UTC): a spike');
-  assert.throws(() => parseLoopState({ ...state, counters: { ...state.counters, vetoWhy: { x: 5 } } }), /vetoWhy\.x is not text/);
-  assert.throws(() => parseLoopState({ ...state, counters: { ...state.counters, vetoWhy: [] } }), /vetoWhy is not an object/);
+  // Display only: a malformed one is dropped, the rest of the state (the hold-out itself) is kept.
+  const bad = parseLoopState({ ...state, counters: { ...state.counters, vetoWhy: { x: 5, 'sol-phoenix-hyperliquid': 'kept' } } });
+  assert.deepEqual(bad.counters.vetoWhy, { 'sol-phoenix-hyperliquid': 'kept' });
+  for (const junk of [[], 'text', null, 7]) {
+    const s = parseLoopState({ ...state, counters: { ...state.counters, vetoWhy: junk } });
+    assert.equal(s.counters.vetoWhy, undefined);
+    assert.equal(s.counters.vetoedUntil['sol-phoenix-hyperliquid'], T0 + HOUR);
+  }
 });
