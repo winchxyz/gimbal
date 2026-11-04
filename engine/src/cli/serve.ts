@@ -94,7 +94,7 @@ import type { RecordLine } from '../venues/recorder.ts';
 import { JsonlGzWriter, RecordingVenue, RecordingWatch, errorMessage } from '../venues/recorder.ts';
 import { ScaledClock, readRecording } from '../venues/replay.ts';
 import { watchReaders } from '../venues/watch/index.ts';
-import type { AccountState, Clock } from '../venues/venue.ts';
+import type { Clock } from '../venues/venue.ts';
 import { RiskEngine } from '../risk/engine.ts';
 import type { DeskSource } from '../risk/engine.ts';
 import { AccountsDeskSource, ReplayDesk } from '../risk/sources.ts';
@@ -109,6 +109,8 @@ import type { ContractSide } from './serve-contract.ts';
 import { connectContract, contractEnv, marginVenues } from './serve-contract.ts';
 import type { ServeOrderly } from './serve-orderly.ts';
 import { ORDERLY_PAIRS_ENV, orderlyPairsOn, riskOrderlyNote, serveOrderly } from './serve-orderly.ts';
+import { startEgressLog } from './serve-egress.ts';
+import type { LoopAccount } from './serve-loop.ts';
 import { loopBook, loopGates, serveLoop } from './serve-loop.ts';
 import { ConfigError, retryStart } from './start-errors.ts';
 import type { PositionBook } from '../book/book.ts';
@@ -334,9 +336,10 @@ let rescueRunning: (() => string | null) | null = null;
 /** Whether the live rescuer runs now: it may start late, after a failed start read (rescue-retry.ts). */
 let rescueLive: () => boolean = () => false;
 // The desk's venue accounts, for the strategy loop's free margin.
-const loopAccounts: { venue: string; read: () => Promise<AccountState> }[] = [];
+const loopAccounts: LoopAccount[] = [];
 // GIMBAL_ORDERLY_PAIRS=1 (cli/serve-orderly.ts): the desk's Orderly private session, read by the risk engine and the
 // loop's free margin; also what a later Orderly leg is built from. Off (the default): null, nothing opened or signed.
+// Built (and its configuration checked) here; its first session opens, and signs, only once the server listens.
 let orderly: ServeOrderly | null = null;
 if (orderlyPairsOn(envVar)) {
   if (contract === null || deskId === null) log(`${ORDERLY_PAIRS_ENV}=1: ignored, ${mode === 'replay' ? 'replay has no contract desk' : 'no contract desk is set (GIMBAL_CONTRACT_ID, DESK_ID)'}`);
@@ -347,7 +350,6 @@ if (orderlyPairsOn(envVar)) {
     } catch (err) {
       fail(`orderly: ${errorMessage(err)}`);
     }
-    orderly?.start();
   }
 }
 if (mode === 'replay') {
@@ -365,11 +367,15 @@ if (mode === 'replay') {
     { reader: reader('hyperliquid'), address: side.desk.evm_address },
     { reader: reader('phoenix'), address: side.desk.solana.authority },
   ].filter((a): a is { reader: NonNullable<typeof a.reader>; address: string } => a.reader !== undefined && a.address !== '');
-  // Its own reader over the kept session (the scanner's Orderly reader has no private side).
-  if (orderly !== null) accounts.push(orderly.riskAccount);
   // The strategy loop's free margin takes the risk engine's last read when it is a scan old at most: on Phoenix
   // (about 1 request a second for everything) a second account read every scan would spend a third of it.
   for (const a of accounts) loopAccounts.push({ venue: a.reader.id, read: () => accountWithin(a.reader, a.address, LOOP_ACCOUNT_MAX_AGE_MS) });
+  // Orderly: its own reader over the kept session (the scanner's Orderly reader has no private side); the loop's read
+  // of it has a deadline and logs once per error kind.
+  if (orderly !== null) {
+    accounts.push(orderly.riskAccount);
+    loopAccounts.push(orderly.loopAccount);
+  }
   // get_desk says only whether the desk is paused, not who paused it or when (that is in its `paused` event): `at` is
   // when this engine first saw it paused, `by` is unknown.
   let pausedSince: number | null = null;
@@ -597,6 +603,10 @@ server = new EngineServer({
 
 const listening = await server.start(port, host);
 risk?.start();
+// The Orderly session's first ws_auth, once every start step before it went through (GIMBAL_ORDERLY_PAIRS=1 only).
+orderly?.start();
+// GIMBAL_LOG_EGRESS=1 only: the public IPv4 addresses serve's traffic leaves from, now and hourly (never fatal).
+const egress = startEgressLog({ env: envVar, log });
 publishHealth();
 for (const event of earlyJournal.splice(0)) server.publish(event);
 for (const note of startNotes.splice(0)) startJournal(note.kind, note.summary);
@@ -650,6 +660,7 @@ async function shutdown(reason: string): Promise<void> {
   log(`stopping: ${reason}`);
   clearInterval(intentsTimer);
   clearInterval(monitorTimer);
+  egress?.stop();
   // The loop starts nothing new; an open or close it runs is waited for with the rest, under the same deadline.
   strategyLoop.stop();
   attestor.stop();

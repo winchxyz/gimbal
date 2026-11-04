@@ -130,7 +130,7 @@ export class AccountsDeskSource implements DeskSource {
  * `fn` with a deadline `ms` from now: budgeted reads in it (http-budget.ts readBy) stop waiting and time out then, and
  * whatever still runs is no longer waited for: the result rejects.
  */
-async function withDeadline<T>(ms: number, what: string, fn: () => Promise<T>): Promise<T> {
+export async function withDeadline<T>(ms: number, what: string, fn: () => Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const late = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new Error(`${what} gave up after ${ms / 1000} s`)), ms);

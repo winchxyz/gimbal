@@ -5,20 +5,25 @@
 // account (equity, margin ratio, positions) from that session every 5 s, and the strategy loop reads its free margin.
 //
 // Fail closed: the Orderly account is unknown, never flat, whenever the session is not open and seeded. Before the
-// keeper opened one, while it is down, after a seed read failed, or when the server has not spoken for 30 s (the
-// stream's watchdog ends that session; OrderlyReader.account refuses state confirmed over 30 s ago), the account read
-// throws. The risk engine then marks Orderly down and keeps every Orderly leg it saw at its last numbers, at least
-// watched (risk/engine.ts), as it does for a venue that does not answer.
+// keeper opened one, while it opens (the ws_auth signature can take 120 s), while it is down, while its positions or
+// holding are not known or not usable, or when the server has not spoken for 30 s (the stream's watchdog ends that
+// session; OrderlyReader.account refuses state confirmed over 30 s ago), the account read throws at once: it never
+// waits on a signature. The risk engine then marks Orderly down and keeps every Orderly leg it saw at its last
+// numbers, at least watched (risk/engine.ts), as it does for a venue that does not answer. The strategy loop's read
+// of Orderly's free margin has the risk source's deadline too (ACCOUNT_READ_DEADLINE_MS) and logs once per error kind.
 //
 // Signatures: only the keeper opens a session (the reader's account() never does). The contract's C10 meters do not
 // count ws_auth or the signed reads (they are reduces-risk calls, allowed on a paused desk, and no notional), but each
 // one is an MPC signature and a NEAR call that holds ~0.3 NEAR of the operator key's budget while it runs. So a session
-// that lived at least SESSION_STABLE_MS is reopened at once when it drops; a failed open, a session that dropped sooner
-// and a failed seed are tried again after SESSION_RETRY_MIN_MS, doubling to SESSION_RETRY_MAX_MS; and two opens are
-// never closer than SESSION_MIN_GAP_MS. The keeper logs once per state change, never per tick.
+// that lived at least SESSION_STABLE_MS is reopened at once when it drops; sessions that keep dropping sooner wait
+// SESSION_RETRY_MIN_MS, doubling to SESSION_RETRY_MAX_MS; failed opens and failed seed reads wait the same way, the
+// wait going back to the minimum once a session is live; and two opens are never closer than SESSION_MIN_GAP_MS. A seed
+// read that answered with rows the stream cannot use is not read again (it would sign two reads for the same answer):
+// the account stays unknown until a push replaces them. The keeper logs once per state change, never per tick.
 //
 // Orderly stays a non-rescue venue (trade/carry-plan.ts LIVE_RESCUE.orderly is false) and serve opens no Orderly
-// window here: the stream, the reader, the signed client and the listeners are exposed for a later Orderly TradeLeg.
+// window here. For a later Orderly TradeLeg it exposes the reader, the signed client, the listeners and `legStream`,
+// the keeper-guarded positions; never the raw stream, whose state() would open (and sign) a session of its own.
 
 import type { Mode } from '@gimbal/shared';
 import { NearContractClient } from '../contract/near-client.ts';
@@ -30,10 +35,13 @@ import type { OrderlyNetwork } from '../venues/orderly-http.ts';
 import { normalizeAccountId } from '../venues/orderly-http.ts';
 import { OrderlyReader } from '../venues/orderly.ts';
 import type { OrderlySigner } from '../venues/orderly-signer.ts';
-import type { OrderlyAccountSnapshot, OrderlyStreamPosition } from '../venues/orderly-stream.ts';
+import type {
+  OrderlyAccountSnapshot, OrderlyPositionsSnapshot, OrderlyStreamPosition, OrderlyStreamReadiness,
+} from '../venues/orderly-stream.ts';
 import { OrderlyAccountStream } from '../venues/orderly-stream.ts';
 import { errorMessage } from '../venues/recorder.ts';
-import type { Clock } from '../venues/venue.ts';
+import { ACCOUNT_READ_DEADLINE_MS, withDeadline } from '../risk/sources.ts';
+import type { AccountState, Clock } from '../venues/venue.ts';
 import { systemClock } from '../venues/venue.ts';
 import type { WebSocketFactory } from '../venues/ws.ts';
 import { contractEnv } from './serve-contract.ts';
@@ -75,8 +83,10 @@ export interface OrderlySessionStatus {
 export interface KeptStream {
   readonly down: Error | null;
   readonly signatures: number;
+  readonly readiness: OrderlyStreamReadiness;
   start(): Promise<void>;
   state(): Promise<OrderlyAccountSnapshot>;
+  positionsState(): Promise<OrderlyPositionsSnapshot>;
   reseed(): Promise<void>;
   close(): void;
 }
@@ -117,7 +127,10 @@ export class OrderlySessionKeeper {
   #since: number;
   #why: string | null = null;
   #nextAt: number | null = null;
+  /** The wait after a failed open or seed; doubled after each, back to the minimum once a session is live. */
   #retryMs: number;
+  /** Sessions in a row that dropped before stableMs: the next reopen waits retryMinMs × 2^flaps (up to the max). */
+  #flaps = 0;
   #lastOpenAt: number | null = null;
   #liveSince: number | null = null;
   #busy: Promise<void> | null = null;
@@ -162,9 +175,11 @@ export class OrderlySessionKeeper {
   }
 
   /**
-   * One look at the session: a session that ended is marked down (and logged once); a down or never opened one is
-   * opened when its time has come; an unseeded one is read again when its time has come. Never while an open or a
-   * reseed runs.
+   * One look at the session: a session that ended is marked down (and logged once); a live one whose account became
+   * unknown (a push it could not use) is marked unseeded, and an unseeded one that a push made known again is live; a
+   * down or never opened session is opened when its time has come; an unseeded one whose seed read failed is read
+   * again when its time has come (one whose read answered with rows it cannot use waits for a push: reading it again
+   * would sign two reads for the same answer). Never while an open or a reseed runs.
    */
   check(): void {
     if (this.#state === 'stopped' || this.#busy !== null) return;
@@ -172,11 +187,19 @@ export class OrderlySessionKeeper {
     const dead = this.#stream.down;
     if ((this.#state === 'live' || this.#state === 'unseeded') && dead !== null) {
       const lived = this.#liveSince === null ? 0 : now - this.#liveSince;
-      // A session that held for a while is reopened at once: its drop is the network, not a pattern.
-      if (this.#state === 'live' && lived >= this.#t.stableMs) this.#retryMs = this.#t.retryMinMs;
-      const wait = this.#state === 'live' && lived >= this.#t.stableMs ? 0 : this.#backoff();
+      let wait: number;
+      if (lived >= this.#t.stableMs) {
+        // A session that held for a while is reopened at once: its drop is the network, not a pattern.
+        this.#flaps = 0;
+        wait = 0;
+      } else {
+        wait = Math.min(this.#t.retryMaxMs, this.#t.retryMinMs * 2 ** this.#flaps);
+        this.#flaps++;
+      }
       this.#liveSince = null;
       this.#set('down', dead.message, this.#notBefore(now + wait));
+    } else if (this.#state === 'live' || this.#state === 'unseeded') {
+      this.#settle(now);
     }
     if ((this.#state === 'idle' || this.#state === 'down') && (this.#nextAt === null || now >= this.#nextAt)) {
       this.#run(() => this.#open());
@@ -186,14 +209,39 @@ export class OrderlySessionKeeper {
   }
 
   /**
-   * The cached account for OrderlyReader.account(), only while the keeper has a session: before its first open and
-   * while it is down this throws, so the reader never starts (and signs) a session of its own.
+   * The cached account for OrderlyReader.account(). It never waits and never signs: it answers only from a session the
+   * keeper opened whose positions and holding are known and usable, and throws (unknown) otherwise: before the first
+   * open, while opening (the ws_auth signature can take 120 s), while down, unseeded or stopped.
    */
   async state(): Promise<OrderlyAccountSnapshot> {
+    this.#readable((r) => r.why);
+    return this.#stream.state();
+  }
+
+  /** The cached positions on the same terms (a later Orderly TradeLeg's `stream`): never waits, never signs. */
+  async positionsState(): Promise<OrderlyPositionsSnapshot> {
+    this.#readable((r) => r.positionsWhy);
+    return this.#stream.positionsState();
+  }
+
+  #readable(why: (r: OrderlyStreamReadiness) => string | null): void {
     if (this.#state === 'idle' || this.#state === 'stopped' || this.#state === 'down') {
       throw new Error(`orderly account unknown: the private session is ${this.#state}${this.#why === null ? '' : ` (${this.#why})`}`);
     }
-    return this.#stream.state();
+    const r = this.#stream.readiness;
+    const not = why(r);
+    if (not !== null) throw new Error(`orderly account unknown: the private session is ${this.#state === 'live' ? 'unseeded' : this.#state} (${not})`);
+  }
+
+  /** A logged-in session's state from what the stream holds now: live when known, else unseeded (reseed only after a failed read). */
+  #settle(now: number): void {
+    const r = this.#stream.readiness;
+    if (r.why === null) {
+      this.#live();
+      return;
+    }
+    const keep = this.#state === 'unseeded' && this.#nextAt !== null;
+    this.#set('unseeded', r.why, !r.seedFailed ? null : keep ? this.#nextAt : now + this.#backoff());
   }
 
   #run(fn: () => Promise<void>): void {
@@ -216,10 +264,13 @@ export class OrderlySessionKeeper {
     } catch (err) {
       if (this.#state === 'stopped') return;
       if (loggedIn && this.#stream.down === null) {
-        // Logged in, but a seed read failed and no push made its topic known: the session stays (pushes may still
-        // make it known); the reads are tried again later.
+        // Logged in, but the account is not known: a seed read failed (read again later) or answered rows it cannot
+        // use (a push makes it known). The session stays either way.
         this.#liveSince = this.#clock.now();
-        this.#set('unseeded', errorMessage(err), this.#clock.now() + this.#backoff());
+        this.#state = 'unseeded';
+        this.#nextAt = null;
+        this.#why = null;
+        this.#settle(this.#clock.now());
         return;
       }
       this.#set('down', errorMessage(err), this.#notBefore(this.#clock.now() + this.#backoff()));
@@ -228,19 +279,19 @@ export class OrderlySessionKeeper {
 
   async #reseed(): Promise<void> {
     this.#log(`orderly session: reading positions and holding again (two signed reads; ${this.#why ?? 'the last seed failed'})`);
-    try {
-      await this.#stream.reseed();
-      await this.#stream.state();
-      this.#live();
-    } catch (err) {
-      if (this.#state === 'stopped' || this.#stream.down !== null) return;   // check() marks a dead session down
-      this.#set('unseeded', errorMessage(err), this.#clock.now() + this.#backoff());
-    }
+    // Its outcome is what the stream holds after it, whether the reads answered or not.
+    await this.#stream.reseed().catch(() => {});
+    if (this.#state === 'stopped' || this.#stream.down !== null) return;   // check() marks a dead session down
+    const now = this.#clock.now();
+    const r = this.#stream.readiness;
+    if (r.why === null) this.#live();
+    else this.#set('unseeded', r.why, r.seedFailed ? now + this.#backoff() : null);
   }
 
   #live(): void {
     if (this.#state === 'stopped') return;
     this.#liveSince ??= this.#clock.now();
+    this.#retryMs = this.#t.retryMinMs;
     this.#set('live', null, null);
   }
 
@@ -268,7 +319,7 @@ export class OrderlySessionKeeper {
     const at = (t: number | null) => (t === null ? '' : t <= now ? ', opening it again now' : `, trying again in ${Math.round((t - now) / 1000)} s`);
     switch (state) {
       case 'opening':
-        this.#log(`orderly session: opening the desk's private stream (one orderly_ws_auth signature, then the positions and holding reads; ${count})`);
+        this.#log(`orderly session: opening the desk's private stream (orderly_ws_auth #${this.#stream.signatures + 1} this run, then the positions and holding reads)`);
         break;
       case 'live':
         this.#log(`orderly session: live, the Orderly account is read from it (${count})`);
@@ -288,9 +339,21 @@ export class OrderlySessionKeeper {
   }
 }
 
+/**
+ * What the kept session tells whoever listens (a later Orderly TradeLeg, the Orderly book). Per session, in order:
+ * onUp, then onFrame for each frame and the pushes, then onDown once; a reconnect starts a new onUp. Nothing is sent
+ * after serve's stop() (whose close sends the last onDown of a session that was up). A listener that throws is logged
+ * and does not reach the session or the other listeners.
+ */
 export interface OrderlyListeners {
   executionReport?: (report: Record<string, unknown>) => void;
   positions?: (positions: OrderlyStreamPosition[], from: 'push' | 'read') => void;
+  /** Logged in and every subscription acknowledged: pushes from here on are not missed until onDown. */
+  onUp?: (at: number) => void;
+  /** Every frame the server sends on an up session (pushes, pings, pongs, acks): a liveness tick. */
+  onFrame?: (at: number) => void;
+  /** The up session ended (dropped, silent, refused, or closed at stop); whatever was pushed until the next onUp is missed. */
+  onDown?: (at: number) => void;
 }
 
 export interface ServeOrderlyInput {
@@ -308,14 +371,19 @@ export interface ServeOrderlyInput {
   /** The stream's own timeouts (tests); default the stream's. */
   streamTiming?: { timeoutMs?: number; silenceMs?: number; seedTimeoutMs?: number };
   timing?: Partial<SessionTiming>;
+  /** The loop account's deadline; default ACCOUNT_READ_DEADLINE_MS. */
+  loopDeadlineMs?: number;
 }
 
 export interface ServeOrderly {
   readonly accountId: string;
   readonly orderlyKey: string;
   readonly network: OrderlyNetwork;
-  /** The private session; for a later Orderly TradeLeg's `stream` (its pushes reach listen()). */
-  readonly stream: OrderlyAccountStream;
+  /**
+   * For a later Orderly TradeLeg's `stream`: the kept session's positions, guarded by the keeper (they never wait and
+   * never open or sign a session). Its pushes reach listen().
+   */
+  readonly legStream: { positionsState(): Promise<OrderlyPositionsSnapshot> };
   /** account() over the kept session, book() over the public stream (the leg's bestPx). */
   readonly reader: OrderlyReader;
   /** Signed REST through the contract (the leg's readPositions; positions and holding seed each session). */
@@ -325,7 +393,15 @@ export interface ServeOrderly {
   readonly keeper: OrderlySessionKeeper;
   /** The risk source's Orderly account (AccountsDeskSource accounts). */
   readonly riskAccount: { reader: OrderlyReader; address: string };
-  /** The executionreport and position pushes (and each session's seed positions), to whoever listens. */
+  /**
+   * The strategy loop's Orderly free margin (serve-loop accounts): the same account under the risk source's deadline,
+   * a failed read logged once per error kind.
+   */
+  readonly loopAccount: { venue: string; read: () => Promise<AccountState>; logOnce: true };
+  /**
+   * The executionreport and position pushes (and each session's seed positions), and the session's onUp, onFrame and
+   * onDown, to whoever listens (OrderlyListeners); returns the unsubscribe.
+   */
   listen(listeners: OrderlyListeners): () => void;
   status(): OrderlySessionStatus;
   start(): void;
@@ -372,6 +448,17 @@ export function serveOrderly(input: ServeOrderlyInput): ServeOrderly | null {
   });
   let reads = 0;
   const listeners = new Set<OrderlyListeners>();
+  let stopped = false;
+  const emit = (call: (l: OrderlyListeners) => void) => {
+    if (stopped) return;
+    for (const l of [...listeners]) {
+      try {
+        call(l);
+      } catch (err) {
+        input.log(`orderly session: a listener failed (${errorMessage(err)})`);
+      }
+    }
+  };
   const stream = new OrderlyAccountStream({
     deskId: input.deskId, accountId, orderlyKey, signer, network, clock,
     reads: {
@@ -386,12 +473,11 @@ export function serveOrderly(input: ServeOrderlyInput): ServeOrderly | null {
     },
     ...(input.webSocket === undefined ? {} : { webSocket: input.webSocket }),
     ...input.streamTiming,
-    onExecutionReport: (report) => {
-      for (const l of listeners) l.executionReport?.(report);
-    },
-    onPositions: (positions, from) => {
-      for (const l of listeners) l.positions?.(positions, from);
-    },
+    onExecutionReport: (report) => emit((l) => l.executionReport?.(report)),
+    onPositions: (positions, from) => emit((l) => l.positions?.(positions, from)),
+    onUp: (at) => emit((l) => l.onUp?.(at)),
+    onFrame: (at) => emit((l) => l.onFrame?.(at)),
+    onDown: (at) => emit((l) => l.onDown?.(at)),
   });
   const keeper = new OrderlySessionKeeper({ stream, clock, log: input.log, reads: () => reads, ...(input.timing === undefined ? {} : { timing: input.timing }) });
   const reader = new OrderlyReader({
@@ -401,16 +487,24 @@ export function serveOrderly(input: ServeOrderlyInput): ServeOrderly | null {
     ...(input.fetch === undefined ? {} : { fetch: input.fetch }),
   });
   return {
-    accountId, orderlyKey, network, stream, reader, client, signer, keeper,
+    accountId, orderlyKey, network, reader, client, signer, keeper,
+    legStream: { positionsState: () => keeper.positionsState() },
     riskAccount: { reader, address: accountId },
+    loopAccount: {
+      venue: 'orderly', logOnce: true,
+      read: () => withDeadline(input.loopDeadlineMs ?? ACCOUNT_READ_DEADLINE_MS, 'orderly account read', () => reader.account(accountId)),
+    },
     listen: (l) => {
+      if (stopped) return () => false;
       listeners.add(l);
       return () => listeners.delete(l);
     },
     status: () => keeper.status(),
     start: () => keeper.start(),
     stop: () => {
-      keeper.stop();
+      keeper.stop();   // closes the session: a session that was up sends its onDown here
+      stopped = true;
+      listeners.clear();
       reader.close();
     },
   };

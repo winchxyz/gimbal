@@ -10,9 +10,11 @@ import type { DeskView } from '../contract/types.ts';
 import { AccountsDeskSource } from '../risk/sources.ts';
 import type { OrderlyRequest, OrderlyRestAction, OrderlySigner } from '../venues/orderly-signer.ts';
 import { orderlyRestMessage } from '../venues/orderly-signer.ts';
-import type { OrderlyAccountSnapshot } from '../venues/orderly-stream.ts';
+import type { OrderlyAccountSnapshot, OrderlyPositionsSnapshot, OrderlyStreamReadiness } from '../venues/orderly-stream.ts';
 import { VirtualClock } from '../venues/replay.ts';
+import type { AccountState } from '../venues/venue.ts';
 import type { WebSocketLike, WsEvent } from '../venues/ws.ts';
+import { freeMarginReader } from './serve-loop.ts';
 import type { KeptStream } from './serve-orderly.ts';
 import { ORDERLY_PAIRS_ENV, OrderlySessionKeeper, SESSION_TIMING, orderlyPairsOn, riskOrderlyNote, serveOrderly } from './serve-orderly.ts';
 import { ConfigError } from './start-errors.ts';
@@ -108,11 +110,22 @@ const REST: Record<string, unknown> = {
   },
 };
 
-function harness() {
+interface HarnessOptions {
+  /** REST answers to change: `data`, or a number for an HTTP error status. */
+  rest?: Record<string, unknown>;
+  /** orderly_ws_auth never answers (an MPC signature that hangs). */
+  wsAuthHangs?: boolean;
+  loopDeadlineMs?: number;
+}
+
+function harness(options: HarnessOptions = {}) {
   const clock = new VirtualClock(NOW);
   const sockets: FakeSocket[] = [];
   const signed: string[] = [];
   const logs: string[] = [];
+  const rest: Record<string, unknown> = { ...REST, ...options.rest };
+  /** Set to make every REST call hang (a venue that stops answering). */
+  const hang = { rest: false };
   const action = (kind: string, method: string, path: string, timestamp: number): OrderlyRestAction => ({
     desk_id: 'carry', request_id: signed.length, venue: 'orderly', kind,
     payload: { method, path, body: '', timestamp, message: kind === 'ws_auth' ? String(timestamp) : orderlyRestMessage(timestamp, method, path, '') },
@@ -121,6 +134,7 @@ function harness() {
   const contract = {
     async orderlyWsAuth(_desk: string, timestamp: number) {
       signed.push('ws_auth');
+      if (options.wsAuthHangs === true) await new Promise(() => {});
       return action('ws_auth', '', '', timestamp);
     },
     async orderlyRequest(_desk: string, req: OrderlyRequest) {
@@ -129,9 +143,11 @@ function harness() {
     },
   } as unknown as OrderlySigner;
   const fetchFake = (async (url: string | URL) => {
+    if (hang.rest) await new Promise(() => {});
     const path = new URL(String(url)).pathname;
-    const data = REST[path];
+    const data = rest[path];
     if (data === undefined) return new Response('{"success":false,"message":"unknown"}', { status: 404 });
+    if (typeof data === 'number') return new Response('{"success":false,"message":"server error"}', { status: data });
     return new Response(JSON.stringify({ success: true, data }), { status: 200 });
   }) as typeof fetch;
   const orderly = serveOrderly({
@@ -143,9 +159,10 @@ function harness() {
       return s;
     },
     streamTiming: { timeoutMs: 1_000, silenceMs: 60_000, seedTimeoutMs: 2_000 },
+    ...(options.loopDeadlineMs === undefined ? {} : { loopDeadlineMs: options.loopDeadlineMs }),
   })!;
   const source = new AccountsDeskSource({ deskId: 'carry', owner: 'owner.near', contract: 'gimbal.near', accounts: [orderly.riskAccount], readDeadlineMs: 2_000 });
-  return { clock, sockets, signed, logs, orderly, source };
+  return { clock, sockets, signed, logs, orderly, source, rest, hang };
 }
 
 async function settle(h: ReturnType<typeof harness>): Promise<void> {
@@ -240,6 +257,195 @@ test('flag on: a dropped session is unknown at once, logged once, and reopened o
   assert.match(h.logs.at(-1)!, /orderly session: closed \(2 ws_auth and 4 seed reads signed this run\)/);
 });
 
+test('listeners: onUp after the subscriptions, onFrame per frame, onDown once; the same order across a reconnect; nothing after stop', async () => {
+  const h = harness();
+  const events: string[] = [];
+  const at = (t: number) => t - NOW;
+  h.orderly.listen({
+    onUp: (t) => events.push(`up@${at(t)}`),
+    onFrame: (t) => events.push(`frame@${at(t)}`),
+    onDown: (t) => events.push(`down@${at(t)}`),
+    positions: (_p, from) => events.push(`positions:${from}`),
+  });
+  // A listener that throws is logged and keeps neither the session nor the others from their events.
+  h.orderly.listen({ onFrame: () => { throw new Error('book bug'); } });
+  const late: string[] = [];
+
+  h.orderly.keeper.check();
+  // Opening (the ws_auth in flight, the socket not answered yet): nothing is up, nothing is sent.
+  assert.deepEqual(events, []);
+  await settle(h);
+  // The last subscribe answer makes the session up; its seed read comes after it.
+  assert.deepEqual(events, ['up@0', 'positions:read']);
+
+  h.clock.set(NOW + 1_000);
+  h.sockets[0]!.push({ event: 'ping', ts: NOW + 1_000 });
+  h.clock.set(NOW + 2_000);
+  h.sockets[0]!.push({ topic: 'position', ts: NOW + 2_000, data: { positions: [] } });
+  h.clock.set(NOW + 3_000);
+  h.sockets[0]!.push({ event: 'pong', ts: NOW + 3_000 });
+  assert.deepEqual(events.slice(2), ['frame@1000', 'frame@2000', 'positions:push', 'frame@3000']);
+  assert.equal(h.logs.filter((l) => l.includes('a listener failed (book bug)')).length, 3);
+
+  // The drop: one onDown at once (not at the keeper's next check), then nothing until the reopen's onUp.
+  h.clock.set(NOW + 4_000);
+  h.sockets[0]!.drop();
+  h.sockets[0]!.push({ event: 'ping', ts: NOW + 4_000 });
+  h.orderly.keeper.check();
+  await settle(h);
+  assert.deepEqual(events.slice(6), ['down@4000']);
+  h.clock.set(NOW + 64_000);
+  h.orderly.keeper.check();
+  await settle(h);
+  h.clock.set(NOW + 65_000);
+  h.sockets[1]!.push({ event: 'ping', ts: NOW + 65_000 });
+  assert.deepEqual(events.slice(7), ['up@64000', 'positions:read', 'frame@65000']);
+
+  // stop(): the up session's last onDown, then nothing (frames on the old socket, timers, a late listen()).
+  h.clock.set(NOW + 66_000);
+  h.orderly.stop();
+  assert.deepEqual(events.slice(10), ['down@66000']);
+  h.sockets[1]!.push({ event: 'ping', ts: NOW + 66_000 });
+  h.sockets[1]!.drop();
+  h.orderly.listen({ onUp: () => late.push('up'), onFrame: () => late.push('frame'), onDown: () => late.push('down') });
+  h.orderly.keeper.check();
+  await settle(h);
+  assert.equal(events.length, 11, `no event after stop: ${events.slice(11).join(', ')}`);
+  assert.deepEqual(late, []);
+  assert.equal(h.signed.filter((s) => s === 'ws_auth').length, 2);
+});
+
+test('flag on: a ws_auth that never answers holds up no read: account, risk source and loop free margin answer at once', async () => {
+  const h = harness({ wsAuthHangs: true });
+  const logs: string[] = [];
+  try {
+    h.orderly.keeper.check();
+    assert.equal(h.orderly.status().state, 'opening');
+    assert.match(h.logs[0]!, /orderly_ws_auth #1 this run/);
+    const started = Date.now();
+    await assert.rejects(h.orderly.reader.account(h.orderly.accountId), /orderly account unknown: the private session is unseeded|opening/);
+    await assert.rejects(h.orderly.legStream.positionsState(), /orderly account unknown/);
+    const snap = await h.source.read();
+    assert.match(snap.reads[0]!.error ?? '', /orderly account unknown/);
+    const free = await freeMarginReader([h.orderly.loopAccount], (l) => logs.push(l))();
+    assert.deepEqual(free, {});
+    assert.ok(Date.now() - started < 1_000, `took ${Date.now() - started} ms`);
+    assert.equal(h.signed.length, 1, 'one ws_auth asked, nothing else');
+  } finally {
+    h.orderly.stop();
+  }
+});
+
+test('flag on: the loop\'s Orderly read gives up at its deadline when the venue stops answering', async () => {
+  const h = harness({ loopDeadlineMs: 50 });
+  try {
+    h.orderly.keeper.check();
+    await settle(h);
+    assert.equal(h.orderly.status().state, 'live');
+    h.hang.rest = true;
+    const started = Date.now();
+    await assert.rejects(h.orderly.loopAccount.read(), /orderly account read gave up after 0.05 s/);
+    assert.ok(Date.now() - started < 1_000);
+  } finally {
+    h.orderly.stop();
+  }
+});
+
+test('flag on: a seed read that answered rows it cannot use is not read again; the account waits, unknown, for a push', async () => {
+  const bad = { rows: [{ symbol: 'PERP_SOL_USDC', position_qty: -3, cost_position: -303, last_sum_unitary_funding: 10, average_open_price: 101, est_liq_price: null }] };
+  const h = harness({ rest: { '/v1/positions': bad } });
+  try {
+    h.orderly.keeper.check();
+    await settle(h);
+    assert.equal(h.orderly.status().state, 'unseeded');
+    assert.equal(h.orderly.status().nextAttemptAt, null);
+    assert.match(h.logs.at(-1)!, /open, but the Orderly account is unknown: .*est_liq_price/);
+    const logged = h.logs.length;
+    // An hour of checks: no new read, no new ws_auth, no new line, and the account stays unknown.
+    for (let t = 5_000; t <= 3_600_000; t += 5_000) {
+      h.clock.set(NOW + t);
+      h.orderly.keeper.check();
+      await settle(h);
+    }
+    assert.equal(h.signed.length, 3);
+    assert.equal(h.logs.length, logged);
+    await assert.rejects(h.orderly.reader.account(h.orderly.accountId), /est_liq_price/);
+    // A usable position push makes it known: the keeper goes live on its next check.
+    h.sockets[0]!.push({ topic: 'position', ts: NOW + 3_600_000, data: { positions: [{ symbol: 'PERP_SOL_USDC', positionQty: -3, costPosition: -303, lastSumUnitaryFunding: 10, averageOpenPrice: 101, estLiqPrice: 130.5, accruedFundingFee: 0 }] } });
+    h.orderly.keeper.check();
+    assert.equal(h.orderly.status().state, 'live');
+    assert.equal((await h.source.read()).legs.length, 1);
+    assert.equal(h.signed.length, 3);
+  } finally {
+    h.orderly.stop();
+  }
+});
+
+test('flag on: a seed read that failed is read again after the backoff (two reads, no new ws_auth)', async () => {
+  const h = harness({ rest: { '/v1/client/holding': 500 } });
+  try {
+    h.orderly.keeper.check();
+    await settle(h);
+    assert.equal(h.orderly.status().state, 'unseeded');
+    assert.equal(h.orderly.status().nextAttemptAt, NOW + 60_000);
+    await assert.rejects(h.orderly.reader.account(h.orderly.accountId), /holding read that seeds the session failed/);
+    h.rest['/v1/client/holding'] = REST['/v1/client/holding'];
+    h.clock.set(NOW + 55_000);
+    h.orderly.keeper.check();
+    assert.equal(h.signed.length, 3);
+    h.clock.set(NOW + 60_000);
+    h.orderly.keeper.check();
+    await settle(h);
+    assert.equal(h.orderly.status().state, 'live');
+    assert.deepEqual(h.signed.filter((s) => s === 'ws_auth').length, 1);
+    assert.equal(h.signed.length, 5);
+    h.sockets[0]!.push({ event: 'ping', ts: NOW + 60_000 });   // the server's ping keeps the session confirmed
+    assert.equal((await h.source.read()).legs.length, 1);
+  } finally {
+    h.orderly.stop();
+  }
+});
+
+test('flag on: a holding read with no USDC row is an empty balance (Orderly leaves empty balances out), not unknown', async () => {
+  const h = harness({ rest: { '/v1/client/holding': { holding: [] }, '/v1/positions': { rows: [] } } });
+  try {
+    h.orderly.keeper.check();
+    await settle(h);
+    assert.equal(h.orderly.status().state, 'live');
+    const account = await h.orderly.reader.account(h.orderly.accountId);
+    assert.deepEqual([account.equityUsd, account.freeMarginUsd, account.positions.length], [0, 0, 0]);
+    const snap = await h.source.read();
+    assert.deepEqual(snap.reads.map((r) => r.error), [null]);
+  } finally {
+    h.orderly.stop();
+  }
+});
+
+test('loop free margin: a logOnce account logs a failure once per kind of error, until it reads again', async () => {
+  const logs: string[] = [];
+  let fail: string | null = 'orderly account unknown: the private session is down (closed 1006)';
+  const orderlyAccount = { venue: 'orderly', logOnce: true, read: async () => {
+    if (fail !== null) throw new Error(fail);
+    return { freeMarginUsd: 7 } as AccountState;
+  } };
+  const plain = { venue: 'phoenix', read: async (): Promise<AccountState> => {
+    throw new Error('phoenix down');
+  } };
+  const read = freeMarginReader([orderlyAccount, plain], (l) => logs.push(l));
+  for (let i = 0; i < 3; i++) assert.deepEqual(await read(), {});
+  fail = 'orderly account unknown: the private session is down (closed 1011)';
+  await read();
+  assert.deepEqual(logs.filter((l) => l.includes('orderly')).length, 1, 'digits do not make a new kind');
+  assert.equal(logs.filter((l) => l.includes('phoenix')).length, 4, 'an account without logOnce logs every failure, as before');
+  fail = 'orderly account: stale';
+  await read();
+  fail = null;
+  assert.deepEqual(await read(), { orderly: 7 });
+  fail = 'orderly account: stale';
+  await read();
+  assert.equal(logs.filter((l) => l.includes('orderly')).length, 3);
+});
+
 // ---- the keeper's pace, on a fake stream ----
 
 class FakeStream implements KeptStream {
@@ -247,7 +453,13 @@ class FakeStream implements KeptStream {
   signatures = 0;
   reseeds = 0;
   failStart: Error | null = null;
+  /** The account is not known: a seed read failed (seedFailed) or answered rows it cannot use. */
   failState: Error | null = null;
+  seedFailed = true;
+  get readiness(): OrderlyStreamReadiness {
+    const why = this.down?.message ?? this.failState?.message ?? null;
+    return { why, positionsWhy: why, seedFailed: this.down === null && this.failState !== null && this.seedFailed };
+  }
   async start(): Promise<void> {
     this.signatures++;
     this.down = null;
@@ -261,8 +473,12 @@ class FakeStream implements KeptStream {
     if (this.failState !== null) throw this.failState;
     return {} as OrderlyAccountSnapshot;
   }
+  async positionsState(): Promise<OrderlyPositionsSnapshot> {
+    return (await this.state()) as OrderlyPositionsSnapshot;
+  }
   async reseed(): Promise<void> {
     this.reseeds++;
+    this.failState = null;
   }
   close(): void {
     this.down = new Error('closed');
@@ -302,6 +518,24 @@ test('keeper: failed opens back off from 60 s doubling to 15 min, so a dead venu
   assert.equal(k.stream.signatures, 12);
 });
 
+test('keeper: the failed-open wait goes back to 60 s once a session is live', async () => {
+  const k = keeperHarness();
+  k.stream.failStart = new Error('login refused');
+  k.keeper.check();
+  await k.keeper.busy;
+  await k.run(7 * 60_000);   // opens at 0, 1, 3 and 7 min: the next wait would be 8 min
+  assert.equal(k.stream.signatures, 4);
+  k.stream.failStart = null;
+  await k.run(8 * 60_000);
+  assert.equal(k.keeper.status().state, 'live');
+  k.stream.failStart = new Error('login refused');
+  k.stream.down = new Error('network');
+  await k.run(SESSION_TIMING.checkMs);   // the drop: an early one, 60 s
+  await k.run(60_000);                   // that reopen fails: 60 s again, not 16 min
+  assert.equal(k.keeper.status().state, 'down');
+  assert.equal(k.keeper.status().nextAttemptAt! - k.clock.now(), 60_000);
+});
+
 test('keeper: a session that held 10 min is reopened at once; one that keeps dropping early backs off', async () => {
   const k = keeperHarness();
   k.keeper.check();
@@ -335,11 +569,23 @@ test('keeper: a failed seed keeps the session, leaves the account unknown and re
   await assert.rejects(k.keeper.state(), /holding read/);
   await k.run(55_000);
   assert.equal(k.stream.reseeds, 0);
-  k.stream.failState = null;
   await k.run(5_000);
   assert.equal(k.stream.reseeds, 1);
   assert.equal(k.keeper.status().state, 'live');
   assert.equal(k.stream.signatures, 1, 'the reseed signs no new ws_auth');
+});
+
+test('keeper: an unusable seed answer is never read again', async () => {
+  const k = keeperHarness();
+  k.stream.failState = new Error('orderly private stream: position read unusable: position PERP_SOL_USDC: est_liq_price is not a number (null)');
+  k.stream.seedFailed = false;
+  k.keeper.check();
+  await k.keeper.busy;
+  await k.run(2 * 60 * 60_000);
+  assert.equal(k.keeper.status().state, 'unseeded');
+  assert.equal(k.stream.reseeds, 0);
+  assert.equal(k.stream.signatures, 1);
+  assert.equal(k.logs.length, 2, 'opening, then unseeded: nothing per check');
 });
 
 test('keeper: stopped, it signs nothing and the account is unknown', async () => {
