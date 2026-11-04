@@ -1,4 +1,5 @@
 import type { StrategyDecision } from '@gimbal/shared';
+import { writeControls } from '../remote/readonly.ts';
 import { useManualSend } from '../ui/useManualSend.ts';
 import { cx } from '../ui/cx.ts';
 import { confirmText } from '../windows/manual.ts';
@@ -22,8 +23,10 @@ interface Props {
  */
 export function DecisionBar({ decision, now, held, symbol, urgent }: Props) {
   const line = decisionLine(decision, now);
-  const send = useManualSend(held ? { kind: 'close', symbol } : null);
-  if (line === null && !held) return null;
+  // Read-only view: the line says what the loop decided; the override is not offered.
+  const canClose = held && writeControls().close;
+  const send = useManualSend(canClose ? { kind: 'close', symbol } : null);
+  if (line === null && !canClose) return null;
 
   return (
     <div className="d-decision" data-testid="decision-line">
@@ -36,7 +39,7 @@ export function DecisionBar({ decision, now, held, symbol, urgent }: Props) {
       ) : (
         <span className="say" />
       )}
-      {held ? (
+      {canClose ? (
         send.asking ? (
           <span className="end" role="alertdialog" aria-label="Confirm">
             <span className="ink">{confirmText({ kind: 'close', symbol })}</span>

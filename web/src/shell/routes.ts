@@ -23,6 +23,21 @@ export function screenFromHash(hash: string): ScreenId {
 /** Onboarding is not one of the five sections: it has its own header and no tabs, and the sections never link to it. */
 export const ONBOARDING_HREF = '#/onboarding';
 
+/** The remote-engine settings form. Like onboarding it is not one of the five sections: no tabs, and only the bars that need it link to it. */
+export const CONNECT_HREF = '#/connect';
+
+export const isConnectHash = (hash: string): boolean => /^#\/?connect(?:[/?]|$)/.test(hash);
+
+export function useConnectRoute(): boolean {
+  const [on, setOn] = useState<boolean>(() => isConnectHash(window.location.hash));
+  useEffect(() => {
+    const onChange = () => setOn(isConnectHash(window.location.hash));
+    window.addEventListener('hashchange', onChange);
+    return () => window.removeEventListener('hashchange', onChange);
+  }, []);
+  return on;
+}
+
 export function isOnboardingHash(hash: string): boolean {
   return /^#\/?onboarding(?:[/?]|$)/.test(hash);
 }

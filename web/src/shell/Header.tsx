@@ -2,6 +2,7 @@ import type { Mode } from '@gimbal/shared';
 import { useStream } from '../stream/hub.ts';
 import type { Connection } from '../stream/store.ts';
 import { dotColor } from '../ui/dot.ts';
+import { writeControls } from '../remote/readonly.ts';
 import { ONBOARDING_HREF, SCREENS, hrefOf, type ScreenId } from './routes.ts';
 import { Wordmark } from './Wordmark.tsx';
 
@@ -64,6 +65,8 @@ export function Header({ screen }: { screen: ScreenId }) {
 // wallet (the funds step once the desk exists). The phone has no header buttons: the Desk screen draws the same pair
 // under the desk value, with its own `className`.
 export function MoneyActions({ mode, className = 'money' }: { mode: Mode; className?: string }) {
+  // Read-only view: nothing here is drawn; every one of these opens a wallet or the set-up flow.
+  if (!writeControls().money) return null;
   if (mode === 'replay') {
     return (
       <span className={className}>

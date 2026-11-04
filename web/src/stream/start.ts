@@ -3,6 +3,10 @@ import { connectSse } from './sse.ts';
 import { httpApi, readEngineState, type EngineApi } from './api.ts';
 import { pickFakeDesk, pickFakeDrift, pickFakeMode, pickFakeRescue, pickFakeScenario, resolveSource } from './source.ts';
 import type { Source } from './store.ts';
+import { reportProblem } from '../remote/problem.ts';
+import { remoteSettings } from '../remote/readonly.ts';
+import { lockedApi, remoteApi, startRemoteStream } from '../remote/stream.ts';
+import { ViewError } from '../remote/view.ts';
 
 /** How long the page waits for the engine to answer before it falls back to the fake (development only). */
 const PROBE_MS = 2000;
@@ -30,6 +34,16 @@ function pageSource(): Promise<Source> {
 
 /** Starts the app's one stream. The fake is behind `import.meta.env.DEV`, so production builds drop it. */
 export async function startStream(): Promise<() => void> {
+  // A remote engine is chosen by the address saved in Settings (remote/settings.ts), never by the page address.
+  const remote = remoteSettings();
+  if (remote.base !== null) {
+    if (remote.token === null) {
+      reportProblem(new ViewError('needs-token', 'no view token entered'));
+      stream.dispatch({ kind: 'connection', source: 'sse', connection: 'idle' });
+      return () => undefined;
+    }
+    return startRemoteStream(stream.dispatch, { base: remote.base, token: remote.token });
+  }
   const search = window.location.search;
   if (import.meta.env.DEV && (await pageSource()) === 'fake') {
     const { startFakeStream } = await import('./fake.ts');
@@ -57,10 +71,15 @@ async function fakeEngineApi(search: string): Promise<EngineApi> {
 
 /**
  * The engine's HTTP side (`GET /strategy`, `GET /windows/history`, `GET /state`, `GET /journal`, `POST /rotate`,
- * `POST /close`), from the same source as the stream: the engine, or the fake in development. This is the one place
- * that chooses.
+ * `POST /close`), from the same source as the stream: the engine, a remote engine's read-only view, or the fake in
+ * development. This is the one place that chooses.
  */
 export function engineApi(): Promise<EngineApi> {
+  const remote = remoteSettings();
+  if (remote.base !== null) {
+    api ??= Promise.resolve(remote.token === null ? lockedApi() : remoteApi({ base: remote.base, token: remote.token }));
+    return api;
+  }
   api ??= pageSource().then((picked) =>
     import.meta.env.DEV && picked === 'fake' ? fakeEngineApi(window.location.search) : httpApi(),
   );
