@@ -60,6 +60,10 @@
 // in replay, a scripted desk priced by the recording. It publishes `desk`, `health`, `journal` and `rescue`, and answers
 // POST /stress (testnet and replay; refused on mainnet). `health` is published in every mode: the venues the last
 // scan or account read missed, 1Click (probed every minute in the live modes) and NEAR.
+// The read-only view (src/view/, opt in): with GIMBAL_VIEW_TOKEN (32+ characters) and GIMBAL_VIEW_PORT or PORT set, a
+// second listener on 0.0.0.0 serves the GET routes and /events only, behind that bearer token, to the origins in
+// GIMBAL_VIEW_ORIGINS, with every payload redacted; the API above stays on its own address, unchanged. Its start line
+// is `view: read-only on :<port> for origins ...` or `view: off`.
 
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -102,6 +106,7 @@ import { liveBookSources } from '../book/sources.ts';
 import { userStateDir } from '../trade/trader-state.ts';
 import type { StrategyLoop } from '../strategy/loop.ts';
 import { ThinningSink, WATCH_RECORD_GAPS, loadPolicyFile, replayStart, scanLine } from './serve-replay.ts';
+import { startView } from '../view/serve-view.ts';
 
 const { values } = parseArgs({
   options: {
@@ -520,6 +525,8 @@ const monitorTimer = setInterval(() => {
 monitorTimer.unref();
 const shown = host.includes(':') ? `[${host}]` : host;
 log(`engine ${mode} on http://${shown}:${listening}: GET /events /state /windows/history?id= /strategy /journal, PUT /strategy, POST /rotate /close`);
+// The read-only view: a second listener on a ViewSource (reads only), never on the server above.
+const view = await startView({ env: envVar, processEnv: process.env, enginePort: listening, source: server.viewSource(), log });
 
 let stopping = false;
 /** How long a shutdown waits for a close in flight: one MPC signature can take 120 s, and a close is one per leg plus a retry. */
@@ -561,6 +568,7 @@ async function shutdown(reason: string): Promise<void> {
   if (!drained && stillRescuing !== null) log(`stopping: rescue ${stillRescuing} is still running after ${SHUTDOWN_WAIT_MS / 1000} s; exiting anyway: a payment it signed was saved as held before signing, and the next start reads it at 1Click and on chain`);
   if (!drained && (stillRescuing === null || pair?.pair?.closing === true)) log(`stopping: a close is still running after ${SHUTDOWN_WAIT_MS / 1000} s; exiting anyway: its orders are saved as in flight (the next start only alerts on ADL until a close result); check both legs by hand`);
   pair?.stop();
+  await view?.stop();
   await server!.stop();
   contract?.prices.stop();
   readers.close();
