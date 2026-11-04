@@ -711,6 +711,12 @@ export function acquireTraderLock(path: string, options: AcquireOptions = {}): T
         // Left by a starter that died while taking over: removed only while it is still that guard, the same file
         // (another starter may have removed it and made its own since, empty too until its token is written).
         options.onTakeover?.('stale-guard');
+        // Known window (from before the inode check): between this check and the unlink, another starter can remove
+        // the stale guard and make its own, which this unlink then removes, so two starters may both hold "the"
+        // guard. It takes a starter that died holding a guard, then two starters reaching its removal within the same
+        // few microseconds. A rename to a private name would make the check race-free, but when the renamed file
+        // turns out to be a live starter's guard it has to be renamed back, and that can race a third starter: not
+        // worth it here.
         if (sameGuard(seen, seeGuard(guardPath))) {
           try {
             unlinkSync(guardPath);
