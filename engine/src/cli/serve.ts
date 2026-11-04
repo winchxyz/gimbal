@@ -62,8 +62,9 @@
 // scan or account read missed, 1Click (probed every minute in the live modes) and NEAR.
 // The read-only view (src/view/, opt in): with GIMBAL_VIEW_TOKEN (32+ characters) and GIMBAL_VIEW_PORT or PORT set, a
 // second listener on 0.0.0.0 serves the GET routes and /events only, behind that bearer token, to the origins in
-// GIMBAL_VIEW_ORIGINS, with every payload redacted; the API above stays on its own address, unchanged. Its start line
-// is `view: read-only on :<port> for origins ...` or `view: off`.
+// GIMBAL_VIEW_ORIGINS, with every payload redacted and the owner's and operator's accounts masked; the API above stays
+// on its own address, unchanged, and must be on loopback for the view to start. Its start line is
+// `view: read-only on :<port> for origins ...` or `view: off` (with the reason when the token is set).
 
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -526,7 +527,7 @@ monitorTimer.unref();
 const shown = host.includes(':') ? `[${host}]` : host;
 log(`engine ${mode} on http://${shown}:${listening}: GET /events /state /windows/history?id= /strategy /journal, PUT /strategy, POST /rotate /close`);
 // The read-only view: a second listener on a ViewSource (reads only), never on the server above.
-const view = await startView({ env: envVar, processEnv: process.env, enginePort: listening, source: server.viewSource(), log });
+const view = await startView({ env: envVar, processEnv: process.env, enginePort: listening, engineHost: host, source: server.viewSource(), log });
 
 let stopping = false;
 /** How long a shutdown waits for a close in flight: one MPC signature can take 120 s, and a close is one per leg plus a retry. */

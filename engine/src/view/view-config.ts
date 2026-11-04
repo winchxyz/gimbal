@@ -1,12 +1,32 @@
 // The read-only view listener's settings, from the environment (docs/deploy-railway.md, "The read-only view"):
 //   GIMBAL_VIEW_TOKEN    the bearer token viewers send; unset = the view is off. At least VIEW_TOKEN_MIN_LENGTH
-//                        characters, no whitespace
+//                        characters, no whitespace, and not guessable (VIEW_TOKEN_MIN_DISTINCT distinct characters
+//                        or VIEW_TOKEN_MIN_BITS estimated)
 //   GIMBAL_VIEW_PORT     the port it listens on, on every interface (0.0.0.0); default PORT, which Railway sets
 //   GIMBAL_VIEW_ORIGINS  the browser origins allowed to call it (CORS), comma or space separated, e.g.
 //                        https://gimbal.example; none = no browser page may call it (curl still can)
 // Off is never an error: serve runs the engine either way, and the start line says why the view is off.
 
 export const VIEW_TOKEN_MIN_LENGTH = 32;
+/** A token passes with this many distinct characters, or with VIEW_TOKEN_MIN_BITS estimated. */
+export const VIEW_TOKEN_MIN_DISTINCT = 16;
+export const VIEW_TOKEN_MIN_BITS = 128;
+
+/**
+ * The token's entropy estimated from its own characters: length times the Shannon entropy of their frequencies. It
+ * rates "aaaa…" or "abab…" near zero and a random hex string near 4 bits a character. The second test matters for hex:
+ * `openssl rand -hex 32` leaves out one of the 16 digits about a quarter of the time, and still has about 250 bits.
+ */
+export function tokenBits(token: string): number {
+  const counts = new Map<string, number>();
+  for (const c of token) counts.set(c, (counts.get(c) ?? 0) + 1);
+  let perChar = 0;
+  for (const n of counts.values()) {
+    const p = n / token.length;
+    perChar -= p * Math.log2(p);
+  }
+  return perChar * token.length;
+}
 
 export interface ViewConfig {
   token: string;
@@ -23,6 +43,10 @@ export function viewConfigFromEnv(
   if (/\s/.test(token)) return { off: 'GIMBAL_VIEW_TOKEN has whitespace in it' };
   if (token.length < VIEW_TOKEN_MIN_LENGTH) {
     return { off: `GIMBAL_VIEW_TOKEN is ${token.length} characters, under the ${VIEW_TOKEN_MIN_LENGTH} required (openssl rand -hex 32 makes one)` };
+  }
+  const distinct = new Set(token).size;
+  if (distinct < VIEW_TOKEN_MIN_DISTINCT && tokenBits(token) < VIEW_TOKEN_MIN_BITS) {
+    return { off: `GIMBAL_VIEW_TOKEN looks guessable (${distinct} distinct characters, about ${Math.floor(tokenBits(token))} bits; needs ${VIEW_TOKEN_MIN_DISTINCT} distinct or ${VIEW_TOKEN_MIN_BITS} bits): use openssl rand -hex 32` };
   }
   const portText = env('GIMBAL_VIEW_PORT') ?? env('PORT');
   if (portText === undefined) return { off: 'GIMBAL_VIEW_TOKEN is set but neither GIMBAL_VIEW_PORT nor PORT is' };

@@ -73,12 +73,14 @@ server, so no request to it can reach `PUT /strategy`, `POST /rotate` or `POST /
 
 | Name | What |
 |---|---|
-| `GIMBAL_VIEW_TOKEN` | The bearer token. Unset = the view is off. At least 32 characters, no whitespace: `openssl rand -hex 32`. Shorter, and the view stays off and says why. |
+| `GIMBAL_VIEW_TOKEN` | The bearer token. Unset = the view is off. At least 32 characters, no whitespace, and not guessable (16 distinct characters, or about 128 bits by the characters' own frequencies): `openssl rand -hex 32`. Otherwise the view stays off and says why. |
 | `GIMBAL_VIEW_PORT` | The port it listens on, on `0.0.0.0`. Default: `PORT`, which Railway sets for the service. Must differ from `ENGINE_PORT` (8790). |
 | `GIMBAL_VIEW_ORIGINS` | The dashboard origins allowed to call it from a browser, comma separated, e.g. `https://gimbal.example`: scheme, host and port only, no path, no `*`. A request with any other `Origin` is refused (403). Empty: no browser page can call it; `curl` still can. |
 
 Then Settings → Networking → Generate Domain, with the target port set to the view's port. The start line reads
-`view: read-only on :<port> for origins <list>`.
+`view: read-only on :<port> for origins <list>`. The view starts only while the control API is on loopback (the
+default `GIMBAL_HOST`): with the engine on `0.0.0.0`, port 8790 would answer on Railway's private network, where a
+request with `Host: localhost` passes its checks, so serve logs `view: off: the control API is not on loopback`.
 
 **What it serves:** `GET /state`, `/journal?before=`, `/strategy`, `/windows/history?id=` and `/events` (SSE), each
 the same as the engine's, plus `GET /view-ticket` and an unauthenticated `GET /healthz` (`{ "ok": true }`). Any
@@ -90,24 +92,51 @@ other path is 404; any other method (PUT, POST, DELETE, ...) is 405, answered be
 - `EventSource` cannot send headers, so `/events` also takes `?ticket=<t>`: `GET /view-ticket` (bearer) answers
   `{ "ticket", "expiresAt" }`, an HMAC under a key the engine makes at start, good for 30 s and for one connection.
   The token itself never goes in a URL; a ticket in an edge log is spent or expired by the time anyone reads it.
-  A restart voids every ticket; the dashboard asks for a new one whenever it reconnects.
-- A client with 10 failed tries in a minute gets 429 until the minute is over (the client is the last
-  `X-Forwarded-For` entry, which Railway's proxy adds). Refusals are logged with method and path only, one line a
-  minute per kind.
+  A restart voids every ticket; the dashboard asks for a new one whenever it reconnects. At most 8 tickets are
+  outstanding: a new one retires the oldest, so someone asking for tickets can never lock the owner out.
+- The credentials are checked first, and a right token or ticket is always served. A client with 10 failed tries
+  in a minute gets 429 instead of 401 on each further failure until the minute is over. The client is the last
+  `X-Forwarded-For` entry: that assumes exactly one proxy appends to the header in front of the view (Railway's
+  edge). Behind a second proxy, the last entry would be that proxy and all its clients would share one budget.
+  Refusals are logged with method and path only, one line a minute per kind.
+- No client can hold the engine's shutdown: a request has 10 s to arrive in full (headers and body; a stream's
+  response may then run on), and on SIGTERM the view closes every connection and is done within 3 s.
 
-**Redaction:** every string in every payload is cut before it leaves: the value of every variable named
-`…_KEY`, `…_SECRET`, `…_TOKEN` or `…PRIVATE…` (`OPERATOR_PRIVATE_KEY`, `RELAYER_EVM_PRIVATE_KEY`, `ONECLICK_API_KEY`,
-`NEAR_AI_API_KEY`, `GIMBAL_VIEW_TOKEN`), the key-bearing parts of every URL in the environment (RPC URLs are shown as
-their origin plus `/…`), NEAR ed25519 secret keys by shape, and `?api-key=`-style query values in any URL. None of
-these is meant to be in the state, journal or events in the first place; a test greps the served payloads for each
-value to prove they are not.
+**Redaction:** every string in every payload is cut before it leaves:
 
-**If the view token leaks:** whoever has it can read what the dashboard shows, and nothing more: the desk's state
-(legs, sizes, margins, P&L, health, the desk's venue addresses, which are public on chain anyway), the journal (every
-entry, with its transaction links), the strategy rules (`auto`, the minimum net APR, leg size, leverage, rotation and
-risk thresholds), the funding windows and the event stream. They cannot change the rules, enter, rotate, close or
-move money, and they get no key. Rotate it: set a new `GIMBAL_VIEW_TOKEN` and redeploy (the engine restarts, which
-the trader lock handles as above), or remove it to turn the view off.
+- the value of every variable named `…_KEY`, `…_SECRET`, `…_TOKEN` or `…PRIVATE…` (`OPERATOR_PRIVATE_KEY`,
+  `RELAYER_EVM_PRIVATE_KEY`, `ONECLICK_API_KEY`, `NEAR_AI_API_KEY`, `GIMBAL_VIEW_TOKEN`), also without an
+  `ed25519:` prefix, a hex key with or without `0x` in any case, and each URL-encoded or JSON-escaped;
+- the key-bearing parts of every URL in the environment (RPC URLs are shown as their origin plus `/…`);
+- by shape: `ed25519:` with 43 or more base58 characters (secret keys, seeds, and public keys too), and
+  `?api-key=`-style query values in any URL.
+
+None of these is meant to be in the state, journal or events in the first place; a test greps the served
+payloads, as sent and as decoded, for each value and each variant to prove they are not.
+
+**Masked accounts:** the owner's and the operator's NEAR accounts (`OWNER_ACCOUNT_ID`, `OPERATOR_ACCOUNT_ID`) and
+any 64-hex implicit account are shown as their first 4 and last 4 characters (`gimb…near`) wherever they stand as a
+whole account id: `desk.owner`, `desk.paused.by`, journal and decision text, explorer URLs that name an account. The
+contract id (even a sub-account of the owner) and the desk id stay as they are, and so do transaction hashes and
+their explorer links: they are the proof of what the desk did.
+
+**If the view token leaks,** whoever has it can read exactly what the dashboard shows, and nothing more:
+
+- the mode, and the funding windows: every window's rates, costs, net APR, depth, checks, NEAR AI verdict and
+  hourly history, and the scan status;
+- the desk (`DeskState`): desk id, contract id, the masked owner, every leg (venue, symbol, side, size, entry,
+  mark, liquidation price, margin, margin ratio, distance to liquidation, funding, fees), net delta, equity,
+  reserve, P&L, health, paused (masked account and time), a rescue failure's reason;
+- the journal, every entry still in memory (up to 5 000): its summary, the NEAR AI text, its numbers, and its
+  transaction links, which name the desk's own venue addresses (EVM, Solana) as any block explorer does;
+- rescue and venue-setup progress (amounts, steps, transaction links), the venue health map, and the strategy
+  loop's latest decision;
+- the strategy rules (`auto`, the minimum net APR, leg size, leverage, stop drawdown, rotation and risk thresholds);
+- the live event stream of all of the above.
+
+They cannot change the rules, enter, rotate, close, stress or move money, they get no key, and they cannot read
+the owner's or the operator's account in full. Rotate it: set a new `GIMBAL_VIEW_TOKEN` and redeploy (the engine
+restarts, which the trader lock handles as above), or remove it to turn the view off.
 
 ## What the server holds, and what it cannot do
 
