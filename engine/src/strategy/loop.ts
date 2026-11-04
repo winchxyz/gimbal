@@ -69,7 +69,7 @@ export const REFRESH_HOLD_MS = 6 * HOUR_MS;
  * At most this many refresh_prices an open of the loop sends per symbol per UTC day (the day's count is saved).
  * Soft caps, this one and the next: they are checked only before an open starts (its noRefresh), so one open may
  * spend its own refresh, the size recheck's and one before each part past them; a part, an unwind or a hedge is
- * never refused for a cap. Every refresh that landed is counted, so the next open sees the overrun.
+ * never refused for a cap. Every refresh that reached the chain is counted, so the next open sees the overrun.
  */
 export const MAX_OPEN_REFRESHES_PER_DAY = 12;
 /** And at most this many per UTC day over all symbols (the sum of the day's per-symbol counts, saved with them). */

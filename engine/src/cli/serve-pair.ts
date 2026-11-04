@@ -78,7 +78,7 @@ import { PHOENIX_API_URL, PhoenixReader, SOLANA_MAINNET_RPC_URL, phoenixGet } fr
 import { errorMessage } from '../venues/recorder.ts';
 import type { Clock } from '../venues/venue.ts';
 import type { PriceDeps, StoredPrice } from './pair-mainnet-lib.ts';
-import { PRICE_MARGIN_S, ensureFresh, newPriceState, oraclePxOf, priceFitRefusal, priceLifeS, refreshLanded } from './pair-mainnet-lib.ts';
+import { PRICE_MARGIN_S, ensureFresh, newPriceState, oraclePxOf, priceFitRefusal, priceLifeS, refreshLanded, refreshReachedChain } from './pair-mainnet-lib.ts';
 import type { OpsCtx, PairRunner } from './pair-ops.ts';
 import { counting, pairOf, planClose, planOpen, recheckOpenSize, refreshForOpen, sendClose, sendOpen } from './pair-ops.ts';
 import type { ContractSide } from './serve-contract.ts';
@@ -413,7 +413,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
     const prices: PriceDeps = {
       maxAgeS: policy.oracle_max_age_s, send: wantLive, read: (s) => storedPrice(client, s),
       refresh: (s, maxAgeS) => client.refreshPrices([s], { maxAgeS }), now: () => input.clock.now(), log: (l) => log(`pair ${l.trim()}`),
-      landed: refreshLanded, ...newPriceState(),
+      landed: refreshLanded, reachedChain: refreshReachedChain, ...newPriceState(),
     };
     // stop() sets it first: from then on nothing is signed (its lock is being released).
     let stopped = false;

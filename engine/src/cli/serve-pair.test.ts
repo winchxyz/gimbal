@@ -1009,6 +1009,21 @@ test('prepareOpen: a refresh_prices the RPC never took (an error before the chai
   }
 });
 
+test('prepareOpen: a refresh_prices that failed on chain spent gas: not ok, and paid (held, counted)', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
+  try {
+    const p = await servePair(input(w));
+    w.refreshFails = new Error('refresh_prices failed in transaction H6: Exceeded the prepaid gas.');
+    const failed = await p.hands!.prepareOpen({ symbol: 'XLM' });
+    assert.deepEqual([failed.ok, failed.refreshed], [false, true]);
+    assert.equal(failed.reason, 'the stored XLM price (missing) could not be refreshed: refresh_prices failed in transaction H6: Exceeded the prepaid gas.');
+    assert.equal(w.refreshes, 1);
+    p.stop();
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
 test('prepareOpen (a rotate\'s first step): a missing price is refreshed, a failed refresh is not ok and paid; no refresh past the cap or for a symbol the oracle cannot price', async () => {
   const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
   try {

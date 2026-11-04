@@ -522,9 +522,10 @@ export async function refreshForOpen(ctx: OpsCtx, pair: Pair, plan: OpenPlan, op
 }
 
 /**
- * `d` with each refresh_prices that landed reported to `onRefresh` (it is paid for: the loop's caps count it and a
- * refusal after it holds the window). Landed as ensureFresh judges it for lastRefreshAt: the call returned, or it threw
- * and `d.landed` says it still went on chain. One that failed before the chain (an RPC error) paid nothing.
+ * `d` with each refresh_prices that reached the chain reported to `onRefresh` (it is paid for: the loop's caps count it
+ * and a refusal after it holds the window): the call returned, or it threw and `d.reachedChain` (else `d.landed`) says
+ * it got there, a transaction that failed or was refused on chain included, so one that keeps failing there is held and
+ * capped. One that failed before the chain (an RPC or HTTP error, the prices() read) paid nothing.
  */
 export function counting(d: PriceDeps, onRefresh: () => void): PriceDeps {
   return {
@@ -534,7 +535,7 @@ export function counting(d: PriceDeps, onRefresh: () => void): PriceDeps {
       try {
         tx = await d.refresh(s, maxAgeS);
       } catch (err) {
-        if (d.landed?.(err) === true) onRefresh();
+        if ((d.reachedChain ?? d.landed)?.(err) === true) onRefresh();
         throw err;
       }
       onRefresh();

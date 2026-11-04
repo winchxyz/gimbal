@@ -11,7 +11,7 @@ import type { LegOutcome, LegSide, MakerSettings, TradeLeg } from '../trade/legs
 import { floorToLot, toQty } from '../trade/lots.ts';
 import { PairTrader } from '../trade/pair.ts';
 import type { PriceDeps } from './pair-mainnet-lib.ts';
-import { OPEN_HEADROOM_S, PRICE_MARGIN_S, newPriceState, oraclePxOf, refreshLanded } from './pair-mainnet-lib.ts';
+import { OPEN_HEADROOM_S, PRICE_MARGIN_S, newPriceState, oraclePxOf, refreshLanded, refreshReachedChain } from './pair-mainnet-lib.ts';
 import type { OpenPlan, OpenRefresh, OpenRequest, OpsCtx, Pair } from './pair-ops.ts';
 import { MIN_ORDER_USD, capQtyAtOrder, planOpen, recheckOpenSize, refreshForOpen, sendOpen, storedPrice } from './pair-ops.ts';
 import { SERVE_MAKER } from './serve-pair.ts';
@@ -166,7 +166,7 @@ function planWorld(o: PlanWorldOptions) {
       rows.splice(0, rows.length, { asset: s, price_e8: String(Math.round((o.refreshedPx ?? 2500) * 1e8)), at_ms: Date.now() - (o.refreshedAgeS ?? 610) * 1000 });
       return [{ chain: 'near', id: 'R', url: 'https://nearblocks.io/txns/R' }];
     },
-    now: () => Date.now(), log: (l) => logs.push(l), landed: refreshLanded, ...newPriceState(),
+    now: () => Date.now(), log: (l) => logs.push(l), landed: refreshLanded, reachedChain: refreshReachedChain, ...newPriceState(),
   };
   const said: string[] = [];
   const book = async () => ({ bids: [{ px: 2499 }], asks: [{ px: 2501 }] });
@@ -316,6 +316,12 @@ test('no stored price, a real open whose refresh fails: a refusal with the reaso
   const ranPlan = await withVenues(() => planOpen(ran.ctx, ran.pair, ran.request));
   const landed = await refreshForOpen(ran.ctx, ran.pair, ranPlan);
   assert.deepEqual(three(landed), { refused: 'the stored ETH price (missing) could not be refreshed before the open: refresh_prices ran in T: prices() has no newer price', paid: true, line: null });
+  // The transaction failed on chain (its state reverted, no ask recorded): the gas is spent, so it is paid too.
+  const failed = planWorld({ send: true, refreshFails: 'refresh_prices failed in transaction H6: Exceeded the prepaid gas.' });
+  const failedPlan = await withVenues(() => planOpen(failed.ctx, failed.pair, failed.request));
+  const onChain = await refreshForOpen(failed.ctx, failed.pair, failedPlan);
+  assert.deepEqual(three(onChain), { refused: 'the stored ETH price (missing) could not be refreshed before the open: refresh_prices failed in transaction H6: Exceeded the prepaid gas.', paid: true, line: null });
+  assert.equal(failed.prices.lastRefreshAt.has('ETH'), false, 'not landed: the next refresh is not held back 30 s');
 });
 
 test('a real open already refused for anything else sends no refresh_prices: paused, closing, margin, resting, SOL, minimum, cap, IOC', async () => {

@@ -16,7 +16,7 @@ import { toQty } from '../trade/lots.ts';
 import type { PhoenixCrossView, PriceDeps, ResidualDeps, ResidualInput, StoredPrice } from './pair-mainnet-lib.ts';
 import {
   DEFAULT_MAKER_TIMEOUT_S, PRICE_MARGIN_S, UsageError, ensureFresh, hlCross, newPriceState, oraclePxOf, orderOptions, parseArgs, phoenixCross,
-  priceFitRefusal, priceLifeS, refreshLanded, residualHedge, residualPlan, restingOrdersRefusal, settleResidual, withdrawKeepsLegs,
+  priceFitRefusal, priceLifeS, refreshLanded, refreshReachedChain, residualHedge, residualPlan, restingOrdersRefusal, settleResidual, withdrawKeepsLegs,
 } from './pair-mainnet-lib.ts';
 
 const OPEN = ['open', 'ETH', '15', '--short', 'hyperliquid', '--long', 'phoenix'];
@@ -178,6 +178,14 @@ test('refreshLanded reads the near-client\'s own errors: on chain after the call
   assert.equal(refreshLanded(lost), true);
   assert.equal(refreshLanded(new OutcomeUnknown('refresh_prices', 'failed without a refusal code: Exceeded the prepaid gas.', { nearTx: 'H8' })), false, 'an on-chain failure reverted its state');
   assert.equal(refreshLanded(new Error('some refresh_prices ran in H9: elsewhere')), false, 'only the near-client\'s own prefix');
+
+  // refreshReachedChain (paid, counted): every one of those that reached the chain, the reverted and refused ones too.
+  for (const e of [ranFalse, noNewer, readFails, refused, reverted, lost]) assert.equal(refreshReachedChain(e), true, String(e));
+  assert.equal(refreshReachedChain(new OutcomeUnknown('refresh_prices', 'failed without a refusal code: Exceeded the prepaid gas.', { nearTx: 'H8' })), true);
+  // Before the chain: the prices() read the call starts with, or the RPC itself.
+  assert.equal(refreshReachedChain(before), false, String(before));
+  assert.equal(refreshReachedChain(new Error('NEAR RPC: HTTP 503')), false);
+  assert.equal(refreshReachedChain(new Error('some refresh_prices failed in transaction H9: elsewhere')), false, 'only the near-client\'s own prefix');
 });
 
 test('an open refuses beside resting Hyperliquid orders for the coin; other coins, or none, pass; an unreadable answer refuses', () => {

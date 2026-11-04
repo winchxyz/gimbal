@@ -400,6 +400,23 @@ test('the 6 h hold after a paid refusal is saved: a restart keeps it until it en
   later.stop();
 });
 
+test('an open refused after a refresh_prices that failed on chain (paid, refreshed): held 6 h and counted for the caps', async () => {
+  const w = world();
+  const store = tmpStore();
+  const loop = makeLoop(w, store);
+  w.openAnswer = () => ({ ...REFUSED('open refused, nothing signed: the stored SOL price (missing) could not be refreshed before the open: refresh_prices failed in transaction H6: Exceeded the prepaid gas.'), refreshed: true });
+  w.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  await loop.check();
+  const saved = JSON.parse(readFileSync(store.path, 'utf8')) as { holds: Record<string, { until: number }>; refreshes: unknown };
+  assert.equal(saved.holds['enter sol-phoenix-hyperliquid']!.until, T0 + REFRESH_HOLD_MS);
+  assert.deepEqual(saved.refreshes, { day: '2026-11-03', bySymbol: { SOL: 1 } });
+  // A retry 15 min later (the usual one for an unpaid refusal) does not come: the failure does not repeat every check.
+  w.now += RETRY_AFTER_MS + 60_000;
+  await loop.check();
+  assert.equal(w.opens.length, 1);
+  loop.stop();
+});
+
 test('a saved hold longer than 6 h from now (a clock that jumped, a hand-edited file) is cut to 6 h on load and saved so', async () => {
   const w = world();
   const store = tmpStore();

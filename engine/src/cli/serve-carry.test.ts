@@ -16,7 +16,7 @@ import type { ProtectedPair } from '../trade/protected-pair.ts';
 import type { HyperliquidReader } from '../venues/hyperliquid.ts';
 import type { PhoenixReader } from '../venues/phoenix.ts';
 import type { PriceDeps } from './pair-mainnet-lib.ts';
-import { PRICE_MARGIN_S, newPriceState, refreshLanded } from './pair-mainnet-lib.ts';
+import { PRICE_MARGIN_S, newPriceState, refreshLanded, refreshReachedChain } from './pair-mainnet-lib.ts';
 import { storedPrice } from './pair-ops.ts';
 import type { CarryResult, RefreshAllowance, ServePairInput } from './serve-pair.ts';
 import { SERVE_MAKER, buildLiveLegs, liveCarry } from './serve-pair.ts';
@@ -101,7 +101,7 @@ async function carryWorld(o: { closing?: boolean; refreshedAgeS?: number; refres
       rows.splice(0, rows.length, { asset: s, price_e8: String(Math.round((o.refreshedPx ?? 2500) * 1e8)), at_ms: Date.now() - (o.refreshedAgeS ?? 610) * 1000 });
       return [{ chain: 'near', id: 'R', url: 'https://nearblocks.io/txns/R' }];
     },
-    now: () => Date.now(), log: () => {}, landed: refreshLanded, ...newPriceState(),
+    now: () => Date.now(), log: () => {}, landed: refreshLanded, reachedChain: refreshReachedChain, ...newPriceState(),
   };
   const book = async () => ({ bids: [{ px: 2499, sz: 10 }], asks: [{ px: 2501, sz: 10 }] });
   const hl = {
@@ -191,6 +191,15 @@ test('serve\'s carry, a refresh_prices the RPC never took: refused, not paid (no
   assert.deepEqual(r.refusals, ['the stored ETH price (missing) could not be refreshed before the open: near rpc: HTTP 503']);
   assert.equal(r.refreshed, false);
   assert.equal(w.paid(), 0);
+  assert.deepEqual(w.timeline, ['planning on', 'planning off', 'refresh ETH']);
+});
+
+test('serve\'s carry, a refresh_prices that failed on chain: refused and paid (onPaidRefresh once, refreshed)', async () => {
+  const w = await carryWorld({ refreshFails: 'refresh_prices failed in transaction H6: Exceeded the prepaid gas.' });
+  const r = await w.open();
+  assert.deepEqual(r.refusals, ['the stored ETH price (missing) could not be refreshed before the open: refresh_prices failed in transaction H6: Exceeded the prepaid gas.']);
+  assert.equal(r.refreshed, true);
+  assert.equal(w.paid(), 1);
   assert.deepEqual(w.timeline, ['planning on', 'planning off', 'refresh ETH']);
 });
 

@@ -129,6 +129,12 @@ export interface PriceDeps {
    * another within MIN_REFRESH_GAP_S. Default: it did not.
    */
   landed?(err: unknown): boolean;
+  /**
+   * Whether a refresh that threw still reached the chain and spent gas (refreshReachedChain): a transaction that ran,
+   * failed or was refused there, or one sent with no outcome. Such a refresh is paid for and counted (pair-ops
+   * counting) even when it recorded no ask; only an error before the chain is not. Default: landed().
+   */
+  reachedChain?(err: unknown): boolean;
   now(): number;
   log(line: string): void;
   /** One refresh in flight per symbol: concurrent callers wait on it rather than send a second one. */
@@ -292,6 +298,18 @@ export async function withdrawKeepsLegs(
 export function refreshLanded(err: unknown): boolean {
   if (err instanceof OutcomeUnknown) return !err.detail.startsWith('failed without a refusal code');
   return err instanceof Error && !(err instanceof ContractRefusal) && /^refresh_prices ran in \S+: /.test(err.message);
+}
+
+/**
+ * Whether a refresh_prices that threw reached the chain, so its gas is spent: it landed (refreshLanded), it was sent
+ * with no final outcome, the contract refused it in a transaction, or the transaction failed there (state reverted).
+ * Not an error before the call: the RPC or HTTP failing, or the prices() read the call starts with. Wider than
+ * refreshLanded, which says only whether the contract recorded the ask (the 30 s gap); this one says it was paid.
+ */
+export function refreshReachedChain(err: unknown): boolean {
+  if (refreshLanded(err) || err instanceof OutcomeUnknown) return true;
+  if (err instanceof ContractRefusal) return err.txHash !== null;
+  return err instanceof Error && /^refresh_prices failed in transaction \S+: /.test(err.message);
 }
 
 /**
