@@ -502,23 +502,11 @@ let attestor: Attestor;
   }
   attestor = new Attestor({ model: nearAi.model, now: () => Date.now(), ...(recorded === undefined ? {} : { recorded }) });
 }
-/** How long serve's start waits for the first attestation (it never blocks trading; a slower one is logged when it ends). */
-const ATTESTATION_START_WAIT_MS = 15_000;
-if (mode !== 'replay') {
-  // At start, up to ATTESTATION_START_WAIT_MS: a slower fetch logs and journals its line when it ends.
-  const first = attestor.refresh().then((a) => {
-    log(attestor.line());
-    attestationJournal(attestor.line(), a);
-  });
-  const waited = await Promise.race([first.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), ATTESTATION_START_WAIT_MS).unref())]);
-  if (!waited) log(`NEAR AI attestation: still fetching after ${ATTESTATION_START_WAIT_MS / 1000} s; its line follows when it ends`);
-  attestor.start((line, a) => {
-    log(line);
-    attestationJournal(line, a);
-  });
-} else {
-  log(attestor.last === null ? 'NEAR AI attestation: not attested: replay has no recorded attestation (npm run record-nearai -w engine -- --attestation)' : attestor.line());
+if (mode === 'replay') {
+  log(attestor.last === null ? 'NEAR AI attestation: TEE not attested: replay has no recorded attestation (npm run record-nearai -w engine -- --attestation)' : attestor.line());
   attestationJournal(attestor.line(), attestor.last);
+} else {
+  log('NEAR AI attestation: fetched in the background once the server runs, then every 24 h; checks show "TEE not attested" until it lands');
 }
 // The NEAR AI risk check ledger: every check's outcome next to the book (npm run report prices it as helped or hurt).
 let riskLedger: RiskLedger | null = null;
@@ -576,6 +564,18 @@ risk?.start();
 publishHealth();
 for (const event of earlyJournal.splice(0)) server.publish(event);
 for (const note of startNotes.splice(0)) startJournal(note.kind, note.summary);
+// The attestation, off the start path: it never holds up the server, the book or the protections. Its line is logged
+// and journaled when it lands, and again on every daily refresh.
+if (mode !== 'replay') {
+  void attestor.refresh().then((a) => {
+    log(attestor.line());
+    attestationJournal(attestor.line(), a);
+  });
+  attestor.start((line, a) => {
+    log(line);
+    attestationJournal(line, a);
+  });
+}
 let intentsTimer: ReturnType<typeof setInterval> | undefined;
 if (mode !== 'replay') {
   // 1Click has no testnet: its mainnet API is probed in both live modes (a public GET, no key, nothing sent).

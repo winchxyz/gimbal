@@ -1,7 +1,8 @@
 // NEAR AI Cloud's TEE attestation for the model the risk check calls (docs.near.ai, "Verification": Cloud API gateway
-// attestation, model attestations, quote, nonce and signer bindings). serve fetches it at start and once a day, checks
-// what can be checked here, journals what was verified and what was not, and every risk check shows the result as
-// "attested" or "not attested: <why>". A failed attestation never blocks trading: it is shown, honestly.
+// attestation, model attestations, quote, nonce and signer bindings). serve fetches it in the background once its
+// server runs and once a day, checks what can be checked here, journals what was verified and what was not, and every
+// risk check shows the result as "TEE attested <date> UTC" or "TEE not attested: <why>": what the instances were when
+// attested; that a given reply came from them is not verified. A failed attestation never blocks trading.
 //
 // The report: GET https://cloud-api.near.ai/v1/attestation/report?model=<id>&provider=near&signing_algo=ecdsa
 // &include_tls_fingerprint=false&nonce=<32 random bytes, hex> with `x-no-aliasing: true` (public: no key needed). It
@@ -325,6 +326,9 @@ function checkTee(tee: string, ev: TeeEvidence, nonce: string, now: number, nras
     step('GPUs', ours && verdict === true, !ours ? 'the GPU evidence does not carry our nonce'
       : nras === undefined || nras === null ? 'NVIDIA NRAS did not answer' : verdict === null ? 'NVIDIA NRAS gave no verdict'
         : verdict ? `NVIDIA NRAS: ${gpus ?? '?'} GPU(s), overall result true` : 'NVIDIA NRAS: overall result false');
+  } else if (tee !== 'gateway') {
+    // A model TEE runs the model on its GPUs: with no GPU evidence it is not attested.
+    step('GPUs', false, 'no GPU evidence');
   }
   const str = (v: unknown) => (typeof v === 'string' ? v : null);
   return {
@@ -402,7 +406,7 @@ export function writeAttestationRecording(path: string, rec: AttestationRecordin
 
 /** One line for serve's start lines and the journal: the verdict, what was verified and what was not. */
 export function attestationLine(a: Attestation | null, why?: string): string {
-  if (a === null) return `NEAR AI attestation: not attested: ${why ?? 'not fetched yet'}`;
+  if (a === null) return `NEAR AI attestation: TEE not attested: ${why ?? 'not fetched yet'}`;
   const when = new Date(a.at).toISOString();
   const head = a.verified
     ? `NEAR AI attestation of ${a.model} (${a.source === 'live' ? 'fetched' : 'recorded'} ${when}): verified ${uniqueSteps(a)}`
@@ -416,16 +420,17 @@ function uniqueSteps(a: Attestation): string {
 }
 
 /**
- * How a risk check shows the attestation: "attested" only for a live, verified report fetched within
- * ATTESTATION_VALID_MS; else "not attested: <why>".
+ * How a risk check shows the attestation: "TEE attested <when>" only for a live, verified report fetched within
+ * ATTESTATION_VALID_MS; else "TEE not attested: <why>". It says what the model's instances were when fetched; that a
+ * given reply came from them is not verified (per-reply signatures are not fetched).
  */
 export function attestationLabel(a: Attestation | null, now: number, why?: string): string {
-  if (a === null) return `not attested: ${why ?? 'no attestation fetched yet'}`;
-  if (!a.verified) return `not attested: ${a.why}`;
-  if (a.source === 'recorded') return `not attested: replay plays an attestation recorded ${new Date(a.at).toISOString().slice(0, 10)}, not a fresh one`;
+  if (a === null) return `TEE not attested: ${why ?? 'no attestation fetched yet'}`;
+  if (!a.verified) return `TEE not attested: ${a.why}`;
+  if (a.source === 'recorded') return `TEE not attested: replay plays an attestation recorded ${new Date(a.at).toISOString().slice(0, 10)}, not a fresh one`;
   const age = now - a.at;
-  if (age > ATTESTATION_VALID_MS) return `not attested: the last verified attestation is ${(age / 3_600_000).toFixed(0)} h old`;
-  return 'attested';
+  if (age > ATTESTATION_VALID_MS) return `TEE not attested: the last verified attestation is ${(age / 3_600_000).toFixed(0)} h old`;
+  return `TEE attested ${new Date(a.at).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
 }
 
 /** serve's attestation: fetched at start and every ATTESTATION_EVERY_MS; `label()` for each check. */

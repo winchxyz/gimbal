@@ -74,18 +74,25 @@ export function positionBlock(p: PositionResult): string[] {
 function refusalLines(r: RefusalResult): string[] {
   const c = r.check;
   const head = `    ${when(c.at)}  ${c.kind} ${c.windowId} (${c.by}), ${c.legUsd.toFixed(2)} USD a leg at ${c.leverage}x, ${c.forecastNetAprPct.toFixed(2)} % net forecast`;
-  const result = r.counterfactualUsd === null
-    ? `      no hour of its hold priced yet (from ${when(c.at)} + ${c.holdHours} h): pending`
-    : `      estimated ${signed(r.counterfactualUsd)} USD over ${r.hours} of ${c.holdHours} h (funding the refused leg would have earned, less the`
-      + ` ${c.roundTripCostUsd.toFixed(4)} USD round trip) -> ${r.call === 'helped' ? 'helped: a loss avoided' : r.call === 'hurt' ? 'hurt: a gain given up' : 'even'}`;
+  let result: string;
+  if (r.call === 'repeat') result = `      refused again inside the hold of ${r.repeatOf}: counted there, not again`;
+  else if (r.counterfactualUsd === null) result = `      no hour of its hold priced yet (from ${when(c.at)} + ${c.holdHours} h): pending`;
+  else {
+    const cost = c.roundTripCostUsd * Math.min(1, r.hours / c.holdHours);
+    const call = r.call === 'pending' ? `pending until all ${c.holdHours} h are priced`
+      : r.call === 'helped' ? 'helped: a loss avoided' : r.call === 'hurt' ? 'hurt: a gain given up' : 'even';
+    result = `      estimated ${signed(r.counterfactualUsd)} USD over ${r.hours} of ${c.holdHours} h (funding the refused leg would have earned, less`
+      + ` ${cost.toFixed(4)} USD of the ${c.roundTripCostUsd.toFixed(4)} USD round trip, prorated) -> ${call}`;
+  }
   return [head, `      ${c.why}`, result];
 }
 
 function passLines(x: PassResult): string[] {
   const c = x.check;
   const p = x.position;
-  const result = p === null ? '      no position followed (not opened, or not booked)'
-    : `      position ${p.id} ${p.open ? `OPEN, running net ${signed(p.netUsd)} USD so far` : `closed, realised net ${signed(p.netUsd)} USD`}`;
+  const result = p !== null
+    ? `      position ${p.id} ${p.open ? `OPEN, running net ${signed(p.netUsd)} USD so far` : `closed, realised net ${signed(p.netUsd)} USD`}`
+    : x.act === null ? '      no position: no act booked after it' : `      no position: ${x.act}`;
   return [`    ${when(c.at)}  ${c.kind} ${c.windowId} (${c.by}), ${c.legUsd.toFixed(2)} USD a leg`, `      ${c.why}`, result];
 }
 
@@ -99,9 +106,11 @@ export function riskLedgerLines(r: RiskLedgerSummary | null, file?: string): str
   if (file !== undefined) out.push(`  file       ${file}`);
   if (r.skipped > 0) out.push(`  skipped    ${r.skipped} line(s) that are not records`);
   const t = r.totals;
-  out.push(`  refusals   ${t.refused}: each priced, estimated, from the scanner's hourly gross over the hold the loop would have taken`);
+  out.push(`  refusals   ${t.refused}${t.repeats === 0 ? '' : ` (and ${t.repeats} repeat(s) inside an earlier refusal's hold)`}: each estimated from the`
+    + ' scanner\'s hourly gross over the full hold the loop would have taken (it leaves out the exits the loop\'s own bad checks would'
+    + ' have made); helped or hurt only once the whole hold is priced');
   for (const x of r.refusals) out.push(...refusalLines(x));
-  out.push(`  passes     ${t.passed}: each with the position the book opened in that window within 30 min of it`);
+  out.push(`  passes     ${t.passed}: each with the position its own act opened`);
   for (const x of r.passes) out.push(...passLines(x));
   if (t.unchecked > 0) {
     out.push(`  unchecked  ${t.unchecked}: no answer (no key, a timeout, NEAR AI down), the window passed unchecked`);
@@ -110,9 +119,10 @@ export function riskLedgerLines(r: RiskLedgerSummary | null, file?: string): str
   out.push('  totals');
   out.push(`    checks     ${t.checks}`);
   out.push(`    refused    ${t.refused}: ${t.helped} helped, ${t.hurt} hurt, ${t.pending} pending; estimated ${signed(t.refusedCounterfactualUsd)} USD`
-    + ' (< 0: losses avoided, > 0: gains given up)');
+    + ` over the fully priced ones (< 0: losses avoided, > 0: gains given up)${t.pending === 0 ? '' : `; pending so far ${signed(t.pendingCounterfactualUsd)} USD`}`);
   out.push(`    passed     ${t.passed}: ${t.passedWithPosition} with a position, net ${signed(t.passedNetUsd)} USD (realised, open ones running)`);
   out.push(`    unchecked  ${t.unchecked}: ${t.uncheckedWithPosition} with a position, net ${signed(t.uncheckedNetUsd)} USD`);
+  out.push('    The TEE attestation shown with a check is of the model\'s instances at the time; that a given reply came from them is not verified.');
   return out;
 }
 

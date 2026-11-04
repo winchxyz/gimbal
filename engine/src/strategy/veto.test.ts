@@ -248,3 +248,11 @@ test('the recorded exchanges play back without a key; an unrecorded prompt is "n
   assert.equal(other.checked, false);
   assert.equal(other.line, 'no NEAR AI risk check on NEAR: no recorded NEAR AI risk check reply for this prompt');
 });
+
+test('a 200 reply that quotes the key is journaled and booked with the key cut, as errors are', async () => {
+  const { fetch } = fixedFetch(completion(`{"verdict":"pass","reasons":["key ${KEY} seen"]}`));
+  const r = await checkVeto(new NearAiClient({ apiKey: KEY, fetch }), PASS_FACTS, { now: T0 });
+  assert.ok(!JSON.stringify(r).includes(KEY));
+  assert.ok(!JSON.stringify(vetoJournalNumbers(r.exchange!)).includes(KEY));
+  assert.match(String(vetoJournalNumbers(r.exchange!).vetoReply), /key … seen/);
+});

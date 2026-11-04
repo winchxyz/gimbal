@@ -773,23 +773,30 @@ test('npm run report: the NEAR AI risk check ledger next to the book, offline: r
     const windowId = over.windowId ?? XLM;
     return {
       v: 1, type: 'check', id: `${at}-${windowId}`, at, kind: 'enter', by: 'auto', windowId, symbol: 'XLM', outcome: 'passed', verdict: 'passed',
-      reason: 'no red flag named', why: 'NEAR AI risk check passed (attested): no red flag named', attestation: 'attested', model: 'test-model',
+      reason: 'no red flag named', why: 'NEAR AI risk check passed (TEE attested 2026-11-02 09:00 UTC): no red flag named', attestation: 'TEE attested 2026-11-02 09:00 UTC', model: 'test-model',
       prompt: [{ role: 'user', content: '{}' }], reply: '{"verdict":"pass","reasons":[]}', latencyMs: 700,
       legUsd: 1000, leverage: 1.5, forecastNetAprPct: 20, roundTripCostUsd: 0.5, holdHours: 4, ...over,
     };
   };
-  // The XLM pass came 1 min before its entry; the SOL enter passed unchecked (no key); an ETH window was refused and
-  // its four hours then paid 8.76 % gross: 0.04 USD on 1000 against a 0.5 round trip, so the refusal helped.
+  // The XLM pass came 1 min before its entry, and its act opened the XLM position; the SOL enter passed unchecked (no
+  // key) and opened SOL; a later XLM pass's open was refused (no position, though one was open by then). An ETH window
+  // was refused and its four hours then paid 8.76 % gross: 0.04 USD on 1000 against a 0.5 round trip, so it helped.
+  const att = 'TEE attested 2026-11-02 09:00 UTC';
   const pass = check({ at: enterXlm().at - 60_000 });
   const noKey = check({
     at: enterSol().at - 30_000, windowId: SOL, symbol: 'SOL', outcome: 'no-key', verdict: 'unchecked', why: 'no NEAR AI key: not checked',
     attestation: null, prompt: null, reply: '', latencyMs: null,
   });
-  const refused = check({ at: T0 + 2 * H, windowId: 'eth-phoenix-hyperliquid', symbol: 'ETH', outcome: 'refused', verdict: 'refused', reason: 'a spike', why: 'NEAR AI risk check refused (attested): a spike' });
+  const failed = check({ at: enterSol().at + H, windowId: SOL, symbol: 'SOL' });
+  const refused = check({ at: T0 + 2 * H, windowId: 'eth-phoenix-hyperliquid', symbol: 'ETH', outcome: 'refused', verdict: 'refused', reason: 'a spike', why: `NEAR AI risk check refused (${att}): a spike` });
   const { from } = holdSpan(refused);
   const hours: RiskLedgerRecord = { v: 1, type: 'hours', at: from + 5 * H, checkId: refused.id, points: [0, 1, 2, 3].map((i) => ({ t: from + i * H, grossAprPct: 8.76 })) };
+  const act = (c: RiskCheckRecord, positionId: string | null, result: string): RiskLedgerRecord => ({ v: 1, type: 'act', at: c.at + 60_000, checkId: c.id, opened: positionId !== null, positionId, result });
   const ledger = riskLedgerFile(dir, DESK.mode, DESK.contractId, DESK.deskId);
-  writeFileSync(ledger, [pass, noKey, refused, hours].map((r) => `${JSON.stringify(r)}\n`).join(''));
+  writeFileSync(ledger, [
+    pass, noKey, failed, refused, hours, act(pass, positionIdOf(XLM, enterXlm().at), 'opened: both legs'), act(noKey, positionIdOf(SOL, enterSol().at), 'opened: both legs'),
+    act(failed, null, 'not opened: the spread does not cover the round trip'),
+  ].map((r) => `${JSON.stringify(r)}\n`).join(''));
   // A ledger with no book next to it (replay) is shown on its own.
   writeFileSync(riskLedgerFile(dir, 'replay', null, null), `${JSON.stringify(check({ windowId: 'btc-phoenix-hyperliquid', symbol: 'BTC' }))}\n`);
   const cli = fileURLToPath(new URL('../cli/report.ts', import.meta.url));
@@ -797,11 +804,13 @@ test('npm run report: the NEAR AI risk check ledger next to the book, offline: r
   assert.equal(run.status, 0, run.stderr);
   const out = run.stdout;
   assert.match(out, /NEAR AI risk check ledger \(helped \/ hurt\)\n {2}file {7}.*risk-checks-mainnet-gimbal-test\.near-desk-1\.jsonl\n/);
-  assert.match(out, / {2}refusals {3}1: each priced, estimated, /);
-  assert.match(out, /enter eth-phoenix-hyperliquid \(auto\), 1000\.00 USD a leg at 1\.5x, 20\.00 % net forecast\n {6}NEAR AI risk check refused \(attested\): a spike\n {6}estimated -0\.4600 USD over 4 of 4 h .* -> helped: a loss avoided/);
-  assert.match(out, /enter xlm-phoenix-hyperliquid \(auto\), 1000\.00 USD a leg\n {6}NEAR AI risk check passed \(attested\): no red flag named\n {6}position \S+ closed, realised net [+-]\d+\.\d{4} USD/);
-  assert.match(out, / {2}unchecked {2}1: .*\n.*sol-phoenix-hyperliquid.*\n {6}no NEAR AI key: not checked\n {6}position \S+ OPEN, running net /);
-  assert.match(out, / {4}refused {4}1: 1 helped, 0 hurt, 0 pending; estimated -0\.4600 USD/);
-  assert.match(out, / {4}passed {5}1: 1 with a position, net /);
-  assert.match(out, /risk-checks-replay\.jsonl\n[\s\S]*btc-phoenix-hyperliquid[\s\S]*no position followed[\s\S]*\(no position book next to it: passes show no position\)/);
+  assert.match(out, / {2}refusals {3}1: each estimated from the scanner's hourly gross over the full hold .*bad checks would have made\); helped or hurt only once the whole hold is priced\n/);
+  assert.match(out, /enter eth-phoenix-hyperliquid \(auto\), 1000\.00 USD a leg at 1\.5x, 20\.00 % net forecast\n {6}NEAR AI risk check refused \(TEE attested 2026-11-02 09:00 UTC\): a spike\n {6}estimated -0\.4600 USD over 4 of 4 h .* -> helped: a loss avoided/);
+  assert.match(out, /enter xlm-phoenix-hyperliquid \(auto\), 1000\.00 USD a leg\n {6}NEAR AI risk check passed \(TEE attested 2026-11-02 09:00 UTC\): no red flag named\n {6}position xlm-phoenix-hyperliquid@\S+ closed, realised net [+-]\d+\.\d{4} USD/);
+  assert.match(out, /enter sol-phoenix-hyperliquid \(auto\), 1000\.00 USD a leg\n {6}NEAR AI risk check passed .*\n {6}no position: not opened: the spread does not cover the round trip/);
+  assert.match(out, / {2}unchecked {2}1: .*\n.*sol-phoenix-hyperliquid.*\n {6}no NEAR AI key: not checked\n {6}position sol-phoenix-hyperliquid@\S+ OPEN, running net /);
+  assert.match(out, / {4}refused {4}1: 1 helped, 0 hurt, 0 pending; estimated -0\.4600 USD over the fully priced ones/);
+  assert.match(out, / {4}passed {5}2: 1 with a position, net /);
+  assert.match(out, /that a given reply came from them is not verified/);
+  assert.match(out, /risk-checks-replay\.jsonl\n[\s\S]*btc-phoenix-hyperliquid[\s\S]*no position: no act booked after it[\s\S]*\(no position book next to it: passes show no position\)/);
 });

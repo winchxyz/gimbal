@@ -983,17 +983,22 @@ anywhere the policy does not allow.
     `numbers.riskCheck`: "NEAR AI risk check passed (<attestation>): <reason>", "NEAR AI risk check refused
     (<attestation>): <reason>" (an unreadable reply too), "risk check timed out: passed", "no NEAR AI key: not
     checked", "NEAR AI key rejected (…): not checked, passed" or "NEAR AI risk check unavailable (…): passed".
-    `<attestation>` is serve's `Attestor.label()` ("attested" or "not attested: <why>"), shown only for a reply that
-    came. A refusal before the check is asked (no hands, the window not in the scan, a symbol serve does not trade)
+    `<attestation>` is serve's `Attestor.label()` ("TEE attested <date> UTC" or "TEE not attested: <why>"), shown
+    only for a reply that came. It says what the model's TEE instances were when last attested; that the reply came
+    from those instances is not verified (per-reply signatures need the key and are not fetched). A refusal before the check is asked (no hands, the window not in the scan, a symbol serve does not trade)
     says "NEAR AI risk check: not asked (refused before it)". The decision event is published again with it, after
     the decision's own reason, so a window whose stored price the open refreshes carries both ("…; stored SOL price
-    stale: refreshed at open; NEAR AI risk check passed (attested): …").
+    stale: refreshed at open; NEAR AI risk check passed (TEE attested …): …"). Every outcome after the check carries
+    it, the refusals #92 added included (a rotate's prepareOpen refusal, the paid-refresh hold line, the open's
+    no-refresh refusal). The order is the check (and its facts), then a rotate's prepareOpen (which may pay for a
+    refresh), the close and the open: a refusal never costs a refresh.
   - The journal numbers of every check that was asked: `vetoModel`, `vetoKey`, `vetoSystem` and `vetoPrompt` (the
     exact messages sent), `vetoReply` (the model's text as it came), `vetoMs` (latency), `riskCheckOutcome`
     (passed, refused, unreadable, timeout, unavailable, no-key, key-rejected) and `attestation`. The API key is never
-    in an exchange, a line, a reason or the ledger (an error quoting it is redacted).
+    in an exchange, a line, a reason or the ledger (an error quoting it, or a 200 body quoting it, is redacted).
   - The facts sent (`vetoFacts`): per leg `open_interest_usd` (the carry), `book_depth_usd` and `fill_impact_bps`
-    (serve-loop.ts `riskFacts`: 20 levels of the side the leg fills, read when asked; impact = the size's VWAP
+    (serve-loop.ts `riskFacts`: 20 levels of the side the leg fills, read when asked, and not read at all when the
+    check is not configured (no key); impact = the size's VWAP
     against the mid, null when the levels read do not fill it), `price_move_24h_pct` (the venue's mark against its
     own price 24 h ago: Hyperliquid `prevDayPx`, Orderly `24h_open`, Phoenix `prev_day_mark_price`) and
     `days_since_listing` (Orderly's `created_time` only; the other venues do not give it). Anything a venue does not
@@ -1010,23 +1015,31 @@ anywhere the policy does not allow.
   Intel SGX Root CA, each certificate within its dates), not a debug TD, the report data = signing address ‖ 12 zero
   bytes ‖ our nonce (and the echoed nonce), MRCONFIGID = 01 ‖ sha256(app_compose), the event log replaying to
   RTMR0-3 with the compose-hash event equal to the app_compose hash, and the GPUs' evidence carrying our nonce with
-  NRAS's overall result true. It does not check: the TCB level or revocation (Intel PCS collateral), an allowlist of
+  NRAS's overall result true (a model TEE with no GPU evidence is not attested). It does not check: the TCB level or revocation (Intel PCS collateral), an allowlist of
   measurements or images, the NRAS token's signature (read over TLS), or that a given reply came from the attested
-  instance (per-reply signatures need the key and are not fetched). serve fetches it at start (waiting up to 15 s)
-  and every 24 h, logs and journals the line (kind `wait` when verified, `error` when not, `numbers.stage`
-  "attestation", with the steps, signing addresses, MRTD, RTMR3 and compose hashes); a check is "attested" only
-  with a live, verified report under 25 h old. Replay plays the newest `fixtures/nearai/attestation-<date>.json.gz`
-  (`record-nearai -- --attestation`) and shows "not attested: replay plays an attestation recorded <date>". A
-  failed attestation never blocks trading.
+  instance (per-reply signatures need the key and are not fetched); every attestation line and journal entry says
+  so. serve fetches it in the background once the server runs (never on the start path) and every 24 h, logs and
+  journals the line when it lands (kind `wait` when verified, `error` when not, `numbers.stage` "attestation", with
+  the steps, signing addresses, MRTD, RTMR3 and compose hashes); until then checks show "TEE not attested: …". A
+  check is "TEE attested <date>" only with a live, verified report under 25 h old. Replay plays the newest
+  `fixtures/nearai/attestation-<date>.json.gz` (`record-nearai -- --attestation`) and shows "TEE not attested:
+  replay plays an attestation recorded <date>". A failed attestation never blocks trading.
 - `book/risk-ledger.ts`: every risk check outcome, appended (fsynced) to `risk-checks-<mode>[-<contract>-<desk>]
   .jsonl` next to the position book under GIMBAL_STATE_DIR: a `check` line (prompt, model, reply, latency, verdict,
-  attestation, why line, leg size, forecast, the round trip the scanner priced, the hold) and, for a refusal, `hours`
-  lines on each hourly check with the gross APR the refused window actually paid each hour (the scanner's
-  `grossHours`), over `LEDGER_HOLD_HOURS` (the scanner's 240 h cost hold, capped by the time stop). `npm run report`
-  reads it offline: a refusal's estimated net = Σ gross / 100 × leg / 8760 over the hours priced, less the round
-  trip; < 0 helped (a loss avoided), > 0 hurt (a gain given up), no hour yet pending. A pass (and an unchecked pass)
-  shows the position the book entered in that window within 30 min after it, realised net (running while open). Then
-  the totals.
+  attestation, why line, leg size, forecast, the round trip the scanner priced: fees, slippage and basis, the hold);
+  an `act` line when the act after it ended (opened, with the book's position id `<window>@<time>`, or not, with
+  why); and, for a refusal, `hours` lines on each hourly check with the gross APR the refused window actually paid
+  each hour (the scanner's `grossHours`), over `LEDGER_HOLD_HOURS` (the scanner's 240 h cost hold, capped by the time
+  stop). The same act asked again within `LEDGER_RETRY_MS` (1 h: a retry after a refusal that passes, same window,
+  kind and verdict, not opened) is not booked again; its act is booked only if it opens. Serve keeps in memory only
+  the refusals still pricing (at most 500; a refusal fully priced, or 14 days past its hold, is not asked again).
+  `npm run report` reads it offline. A refusal's estimated net = Σ gross / 100 × leg / 8760 over the hours priced,
+  less the round trip prorated by hours priced / hold; it is pending until the whole hold is priced, then helped
+  (< 0: a loss avoided), hurt (> 0: a gain given up) or even. A window refused again inside an earlier refusal's
+  hold is a repeat, counted in that first one, so each window-hour counts once. The counterfactual is a full hold: it
+  leaves out the exits the loop's own bad checks would have made. A pass (and an unchecked pass) shows the position
+  its own act opened (matched by position id, never by time; a pass whose open failed shows none), realised net
+  (running while open). Then the totals: the fully priced refusals' sum, and the pending ones' estimate apart.
 - `loop.ts` (serve): runs `decide` after each funding payment (the hourly check) and on each scan event, only with
   `GIMBAL_TRADE=1` and `strategy.auto`, one decision at a time under the per-desk trader lock, never while a rescue
   or an ADL unwind runs. It carries `act` out with the same open and close code as `pair-mainnet` (maker first),

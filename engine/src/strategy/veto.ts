@@ -188,7 +188,7 @@ export function replyText(e: Pick<VetoExchange, 'response'>): string {
 
 /**
  * The risk check's part of a "why" line: its verdict and one-line reason, with the attestation for a reply that came
- * ("attested" or "not attested: <why>"), or why it was not checked.
+ * ("TEE attested <date> UTC" or "TEE not attested: <why>"), or why it was not checked.
  */
 export function riskCheckWhy(r: Pick<VetoResult, 'outcome' | 'reason'>, attestation: string): string {
   switch (r.outcome) {

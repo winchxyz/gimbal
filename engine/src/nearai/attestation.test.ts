@@ -78,6 +78,14 @@ test('a changed quote byte, another nonce or a changed compose fails, and says w
   assert.equal(a4.verified, false);
   assert.match(a4.why!, /model 1 GPUs: NVIDIA NRAS did not answer/);
 
+  // A model TEE with no GPU evidence is not attested (the gateway has none to give).
+  const t6 = clone(rec);
+  delete (model(t6) as { nvidia_payload?: unknown }).nvidia_payload;
+  const a6 = verifyAttestation(t6, t6.at, 'recorded');
+  assert.equal(a6.verified, false);
+  assert.equal(a6.why, 'model 1 GPUs: no GPU evidence');
+  assert.equal(attestationLabel({ ...a6, source: 'live' }, t6.at), 'TEE not attested: model 1 GPUs: no GPU evidence');
+
   // Ten years on, the PCK certificates have expired.
   const a5 = verifyAttestation(rec, rec.at + 10 * 365 * 24 * HOUR, 'recorded');
   assert.equal(a5.verified, false);
@@ -90,20 +98,21 @@ test('no model attestation for the model: said so, never invented', () => {
   const a = verifyAttestation(rec, rec.at, 'live');
   assert.equal(a.verified, false);
   assert.equal(a.why, `NEAR AI publishes no model attestation for ${NEAR_AI_MODEL}`);
-  assert.equal(attestationLabel(a, rec.at), `not attested: NEAR AI publishes no model attestation for ${NEAR_AI_MODEL}`);
+  assert.equal(attestationLabel(a, rec.at), `TEE not attested: NEAR AI publishes no model attestation for ${NEAR_AI_MODEL}`);
   assert.equal(verifyAttestation({ ...rec, report: null }, rec.at, 'live').why, 'the attestation report is not an object');
 });
 
-test('the label: "attested" only for a live, verified report under 25 h old', () => {
+test('the label: "TEE attested <when>" only for a live, verified report under 25 h old', () => {
   const rec = recorded();
   const live = verifyAttestation(rec, rec.at, 'live');
-  assert.equal(attestationLabel(live, rec.at + HOUR), 'attested');
-  assert.equal(attestationLabel(live, rec.at + ATTESTATION_VALID_MS + HOUR), 'not attested: the last verified attestation is 26 h old');
+  // It names when the instances were attested: it does not say the reply came from them.
+  assert.equal(attestationLabel(live, rec.at + HOUR), `TEE attested ${new Date(rec.at).toISOString().slice(0, 16).replace('T', ' ')} UTC`);
+  assert.equal(attestationLabel(live, rec.at + ATTESTATION_VALID_MS + HOUR), 'TEE not attested: the last verified attestation is 26 h old');
   const played = verifyAttestation(rec, rec.at, 'recorded');
-  assert.match(attestationLabel(played, rec.at), /^not attested: replay plays an attestation recorded \d{4}-\d{2}-\d{2}, not a fresh one$/);
-  assert.equal(attestationLabel(null, rec.at), 'not attested: no attestation fetched yet');
-  assert.equal(attestationLabel(null, rec.at, 'the attestation fetch failed: timeout'), 'not attested: the attestation fetch failed: timeout');
-  assert.equal(attestationLine(null, 'the attestation fetch failed: timeout'), 'NEAR AI attestation: not attested: the attestation fetch failed: timeout');
+  assert.match(attestationLabel(played, rec.at), /^TEE not attested: replay plays an attestation recorded \d{4}-\d{2}-\d{2}, not a fresh one$/);
+  assert.equal(attestationLabel(null, rec.at), 'TEE not attested: no attestation fetched yet');
+  assert.equal(attestationLabel(null, rec.at, 'the attestation fetch failed: timeout'), 'TEE not attested: the attestation fetch failed: timeout');
+  assert.equal(attestationLine(null, 'the attestation fetch failed: timeout'), 'NEAR AI attestation: TEE not attested: the attestation fetch failed: timeout');
 });
 
 test('the fetch: a fresh nonce on the public report URL (no key), the GPU evidence to NRAS; a stale report fails the nonce', async () => {
@@ -129,21 +138,21 @@ test('the fetch: a fresh nonce on the public report URL (no key), the GPU eviden
   assert.equal(failedStep(a)?.step, 'nonce and key');
 });
 
-test('Attestor: refresh never throws; a failed fetch is "not attested: <why>", keeping a live result it had; replay plays a recorded one', async () => {
+test('Attestor: refresh never throws; a failed fetch is "TEE not attested: <why>", keeping a live result it had; replay plays a recorded one', async () => {
   const rec = recorded();
   let now = rec.at;
   const down = new Attestor({ now: () => now, fetch: (async () => { throw new Error('getaddrinfo ENOTFOUND'); }) as typeof fetch });
   assert.equal(await down.refresh(), null);
-  assert.equal(down.label(), 'not attested: the attestation fetch failed: getaddrinfo ENOTFOUND');
-  assert.equal(down.line(), 'NEAR AI attestation: not attested: the attestation fetch failed: getaddrinfo ENOTFOUND');
+  assert.equal(down.label(), 'TEE not attested: the attestation fetch failed: getaddrinfo ENOTFOUND');
+  assert.equal(down.line(), 'NEAR AI attestation: TEE not attested: the attestation fetch failed: getaddrinfo ENOTFOUND');
   const http = new Attestor({ now: () => now, fetch: (async () => new Response('busy', { status: 503 })) as typeof fetch });
   await http.refresh();
-  assert.equal(http.label(), 'not attested: the attestation fetch failed: NEAR AI attestation answered HTTP 503');
+  assert.equal(http.label(), 'TEE not attested: the attestation fetch failed: NEAR AI attestation answered HTTP 503');
 
   const replay = new Attestor({ now: () => now, recorded: rec });
   assert.equal(replay.last?.verified, true);
   assert.equal(replay.last?.source, 'recorded');
-  assert.match(replay.label(), /^not attested: replay plays an attestation recorded /);
+  assert.match(replay.label(), /^TEE not attested: replay plays an attestation recorded /);
   assert.match(replay.line(), /^NEAR AI attestation of .* \(recorded .*\): verified /);
   now += 2 * ATTESTATION_VALID_MS;
   replay.stop();

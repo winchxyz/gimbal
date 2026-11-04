@@ -10,9 +10,10 @@ import { LOOP_RULES, NO_COUNTERS } from './decide.ts';
 import type { ActOutcome, BookFill, BookRecord, HandsHeld, LoopHands, StrategyLoopOptions } from './loop.ts';
 import {
   HOUR_GRACE_MS, LEDGER_HOLD_HOURS, LOOP_STATE_VERSION, LoopStore, MAX_OPEN_REFRESHES_PER_DAY, REFRESH_HOLD_MS, RETRY_AFTER_MS, RISK_NOT_ASKED, StrategyLoop,
-  loopStateFile, notEnterable,
+  loopStateFile, notEnterable, parseLoopState,
 } from './loop.ts';
-import type { RiskCheckRecord, RiskLedgerSink } from '../book/risk-ledger.ts';
+import type { RiskActRecord, RiskCheckRecord, RiskLedgerSink } from '../book/risk-ledger.ts';
+import { positionIdOf } from '../book/derive.ts';
 import type { VetoSource } from './veto.ts';
 import { NearAiClient } from '../nearai/client.ts';
 
@@ -253,7 +254,7 @@ test('an enter refused after its open paid for refresh_prices holds the window 6
   const until = new Date(T0 + REFRESH_HOLD_MS).toISOString();
   const held = journal(w).at(-1)!;
   assert.equal(held.kind, 'refused');
-  assert.equal(held.summary, `enter sol-phoenix-hyperliquid held until ${until}: refused after the open paid for refresh_prices (open refused, nothing signed: the price moved: under one common lot fits the cap); not tried again for 6 h, so a refusal that repeats does not pay again`);
+  assert.equal(held.summary, `enter sol-phoenix-hyperliquid held until ${until}: refused after the open paid for refresh_prices (open refused, nothing signed: the price moved: under one common lot fits the cap); not tried again for 6 h, so a refusal that repeats does not pay again; no NEAR AI key: not checked`);
   assert.equal(held.numbers.holdHours, 6);
   // Past the 15-minute retry: still held, nothing opened, nothing refused again.
   const said = journal(w).length;
@@ -356,9 +357,9 @@ test('a veto drops the window: journaled, nothing opened, held out by counters.v
   await loop.check();
   assert.equal(w.opens.length, 0);
   const v = journal(w).find((j) => j.kind === 'veto')!;
-  assert.equal(v.summary, 'sol-phoenix-hyperliquid: NEAR AI risk check refused (not attested: no attestation fetched in this run): delisting announced; not entered, held out for 6 h');
+  assert.equal(v.summary, 'sol-phoenix-hyperliquid: NEAR AI risk check refused (TEE not attested: no attestation fetched in this run): delisting announced; not entered, held out for 6 h');
   // The why line is kept with the hold-out, so the waits say why the window is out.
-  assert.equal(loop.counters.vetoWhy?.['sol-phoenix-hyperliquid'], 'NEAR AI risk check refused (not attested: no attestation fetched in this run): delisting announced');
+  assert.equal(loop.counters.vetoWhy?.['sol-phoenix-hyperliquid'], 'NEAR AI risk check refused (TEE not attested: no attestation fetched in this run): delisting announced');
   assert.equal(v.numbers.vetoModel, 'test-model');
   assert.match(String(v.numbers.vetoReply), /delisting announced/);
   // The verdict is put on the window and republished, so the web shows it.
@@ -879,8 +880,8 @@ test('the risk check why line: every enter and refusal carries the verdict, the 
   ]);
   assert.equal(b.prompt?.[1]?.content, enter.numbers.vetoPrompt);
   assert.equal(b.reply, '{"verdict":"pass","reasons":["deep books, no event"]}');
-  // (2 + 1) APR points over the scanner's 240 h hold on 500 USD.
-  assert.ok(Math.abs(b.roundTripCostUsd - 0.03 * 500 * 240 / 8760) < 1e-9);
+  // Fees 2 + slippage 1 + basis 1 APR points over the scanner's 240 h hold on 500 USD.
+  assert.ok(Math.abs(b.roundTripCostUsd - 0.04 * 500 * 240 / 8760) < 1e-9);
 
   // No key: the window passes unchecked, said so, with no attestation (nothing came to attest), and booked as unchecked.
   const w2 = world();
@@ -944,4 +945,72 @@ test('the NEAR AI key is in no journal entry, decision or ledger record, even wh
   const all = JSON.stringify({ events, booked });
   assert.ok(!all.includes(KEY), 'the key is nowhere');
   assert.ok(!all.includes('0123456789abcdef'), 'no part of it either');
+});
+
+test('the ledger: the act after a pass is booked with the position id the book got; a retry of the same act is not booked again', async () => {
+  const records: (RiskCheckRecord | RiskActRecord)[] = [];
+  const ledger: RiskLedgerSink = { check: (r) => records.push(r), act: (r) => records.push(r), hourly: () => {} };
+  const veto: VetoSource = { model: 'test-model', configured: true, complete: async () => ({ content: '{"verdict":"pass","reasons":[]}', raw: {} }) };
+  const booked: BookRecord[] = [];
+  const w = world({ openAnswer: () => REFUSED('the spread does not cover the round trip') });
+  const loop = makeLoop(w, tmpStore(), { veto, ledger, attestation: () => 'TEE attested 2026-11-03 09:00 UTC', book: (r) => booked.push(r) });
+  w.next = { decision: { action: 'enter', reason: 'go', windowId: 'sol-phoenix-hyperliquid' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  await loop.check();
+  // Refused with nothing sent: tried again after RETRY_AFTER_MS, asked again, but the same act: one check, one act.
+  w.now += RETRY_AFTER_MS + 60_000;
+  await loop.check();
+  assert.equal(w.opens.length, 2);
+  assert.deepEqual(records.map((r) => r.type), ['check', 'act']);
+  const first = records[0] as RiskCheckRecord;
+  assert.deepEqual(records[1], {
+    v: 1, type: 'act', at: T0, checkId: first.id, opened: false, positionId: null, result: 'not opened: the spread does not cover the round trip',
+  });
+  // The next retry opens: the act that opened is booked against the same check, with the book's position id.
+  w.openAnswer = () => OK('opened both legs');
+  w.now += RETRY_AFTER_MS + 60_000;
+  await loop.check();
+  assert.deepEqual(records.map((r) => r.type), ['check', 'act', 'act']);
+  const opened = records[2] as RiskActRecord;
+  const enter = booked.find((r) => r.kind === 'enter')!;
+  assert.deepEqual([opened.checkId, opened.opened, opened.positionId], [first.id, true, positionIdOf('sol-phoenix-hyperliquid', enter.at)]);
+});
+
+test('no key: the facts for a check that is not asked are not read; a refusal never costs a refresh', async () => {
+  let reads = 0;
+  const riskFacts = async () => {
+    reads++;
+    return {};
+  };
+  const w = world();
+  const loop = makeLoop(w, tmpStore(), { riskFacts });
+  w.next = { decision: { action: 'enter', reason: 'go', windowId: 'sol-phoenix-hyperliquid' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  await loop.check();
+  assert.equal(w.opens.length, 1);
+  assert.equal(reads, 0, 'no book reads for an unasked check');
+
+  // A rotate the risk check refuses: no prepareOpen (no paid refresh), nothing closed.
+  const v = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 3 } });
+  const veto: VetoSource = { model: 'test-model', configured: true, complete: async () => ({ content: '{"verdict":"veto","reasons":["a spike"]}', raw: {} }) };
+  const rot = makeLoop(v, tmpStore(), { veto, riskFacts });
+  await rot.check();
+  v.next = { decision: { action: 'rotate', reason: 'eth better' }, act: { kind: 'rotate', fromId: 'sol-phoenix-hyperliquid', toId: 'eth-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  v.now += 60_000;
+  await rot.check();
+  assert.equal(reads, 1, 'asked: its facts were read');
+  assert.deepEqual([v.prepares, v.closes.length, v.opens.length], [[], 0, 0]);
+  assert.equal(rot.held?.windowId, 'sol-phoenix-hyperliquid');
+});
+
+test('the saved state keeps the risk check\'s why line with a hold-out; a bad one is refused', () => {
+  const store = tmpStore();
+  const state = {
+    version: LOOP_STATE_VERSION, held: null,
+    counters: { ...NO_COUNTERS, vetoedUntil: { 'sol-phoenix-hyperliquid': T0 + HOUR }, vetoWhy: { 'sol-phoenix-hyperliquid': 'NEAR AI risk check refused (TEE attested 2026-11-03 09:00 UTC): a spike' } },
+  };
+  writeFileSync(store.path, JSON.stringify(state));
+  const w = world();
+  const loop = makeLoop(w, store);
+  assert.equal(loop.counters.vetoWhy?.['sol-phoenix-hyperliquid'], 'NEAR AI risk check refused (TEE attested 2026-11-03 09:00 UTC): a spike');
+  assert.throws(() => parseLoopState({ ...state, counters: { ...state.counters, vetoWhy: { x: 5 } } }), /vetoWhy\.x is not text/);
+  assert.throws(() => parseLoopState({ ...state, counters: { ...state.counters, vetoWhy: [] } }), /vetoWhy is not an object/);
 });

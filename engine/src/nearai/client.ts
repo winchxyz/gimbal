@@ -97,7 +97,8 @@ export class NearAiClient {
     }
     let raw: unknown;
     try {
-      raw = JSON.parse(text);
+      // The body is journaled and booked as it came (the risk check's reply): the key is cut from it as from errors.
+      raw = JSON.parse(redactSecret(text, key));
     } catch {
       throw new NearAiUnavailable('NEAR AI answered something that is not JSON');
     }
