@@ -154,7 +154,8 @@ Done:
 - Desk `carry` is set up on all three venues and funded: 7.68 USDC on Hyperliquid, 9.75 USDC on Phoenix, the rest
   idle on NEAR as the rescue reserve.
 - The engine runs on a server (`docs/deploy-railway.md`) with the operator key and a gas-only relayer wallet, with
-  the strategy loop on and live rescue enabled.
+  the strategy loop on and live rescue enabled. Its NEAR AI model is `Qwen/Qwen3-VL-30B-A3B-Instruct`, for policy
+  drafts and the risk check.
 - On testnet the same contract code refused 8 of 8 scripted malicious requests, 0 USDC moved (below).
 
 Not done yet:
@@ -168,8 +169,9 @@ Not done yet:
   been dry-run against mainnet; the money path itself ran on the canary (above).
 - **No mainnet order refusal yet.** The recorded `E_PRICE_BAND` refusal is on testnet (an Orderly `MARKET` order).
   A mainnet demo command for it (`pair-mainnet refuse-band <SYM>`) is planned in PR #93, not merged yet.
-- **The NEAR AI risk check is wired but has no key on the mainnet engine yet.** Without an answer within 5 s a window
-  passes, and the journal says "no NEAR AI risk check".
+- **The NEAR AI risk check runs on the mainnet engine, but its outcomes are not booked in the report yet.** It runs
+  before every enter and rotate with a 5 s timeout; without an answer in time the window passes, and the journal
+  says "no NEAR AI risk check". The ledger of what its refusals helped or hurt is being added to `npm run report`.
 - The money is small on purpose. At 12 USD a leg, funding earns about a cent a day while each one-off transfer costs
   about 0.3 to 1.3 USD, so the desk's record will stay negative through Nov 14; the book shows funding and costs
   apart.
