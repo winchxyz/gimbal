@@ -60,7 +60,11 @@
 // in replay, a scripted desk priced by the recording. GIMBAL_ORDERLY_PAIRS=1 (default off; src/cli/serve-orderly.ts) adds
 // the desk's Orderly account over its private stream: one orderly_ws_auth signature through the operator key per
 // session, kept open and reopened at a bounded pace; while the session is down the Orderly account is unknown (never
-// flat). The loop's free margin reads it too. It opens no Orderly window and Orderly stays a non-rescue venue. It publishes `desk`, `health`, `journal` and `rescue`, and answers
+// flat). The loop's free margin reads it too (the risk engine's last read, a scan old at most). With it the pair trader
+// may hold an Orderly pair (any two of Hyperliquid, Orderly and Phoenix, in the direction the window pays): its Orderly
+// leg signs through the same session's signer (serve-orderly.ts orderlyPairSide), the book reads that leg's fills
+// from the session's executionreport pushes and its funding from the signed funding_fee_history read, and the
+// session's start reads join the health map. Orderly stays a non-rescue venue (1.5x at most). It publishes `desk`, `health`, `journal` and `rescue`, and answers
 // POST /stress (testnet and replay; refused on mainnet). `health` is published in every mode: the venues the last
 // scan or account read missed, 1Click (probed every minute in the live modes) and NEAR.
 // The read-only view (src/view/, opt in): with GIMBAL_VIEW_TOKEN (32+ characters) and GIMBAL_VIEW_PORT or PORT set, a
@@ -107,8 +111,8 @@ import type { ServePair } from './serve-pair.ts';
 import { liveLines, pairRefreshesAtOpen, servePair } from './serve-pair.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { connectContract, contractEnv, marginVenues } from './serve-contract.ts';
-import type { ServeOrderly } from './serve-orderly.ts';
-import { ORDERLY_PAIRS_ENV, orderlyPairsOn, riskOrderlyNote, serveOrderly } from './serve-orderly.ts';
+import type { OrderlyPairSide, ServeOrderly } from './serve-orderly.ts';
+import { ORDERLY_PAIRS_ENV, orderlyPairSide, orderlyPairsOn, riskOrderlyNote, serveOrderly } from './serve-orderly.ts';
 import { startEgressLog } from './serve-egress.ts';
 import type { LoopAccount } from './serve-loop.ts';
 import { loopBook, loopGates, serveLoop } from './serve-loop.ts';
@@ -256,6 +260,8 @@ const scanner = new Scanner(readers.venues, readers.watch, {
   // refreshes a missing or stale stored price at open: its windows show that as a note, not E_ORACLE_STALE. Every
   // other serve, and this one while it cannot open, keeps the contract's verdict.
   oracleRefreshAtOpen: () => pairRefreshesAtOpen(pair),
+  // GIMBAL_ORDERLY_PAIRS=1 with its session: an Orderly leg's open refreshes the stored price too.
+  oracleRefreshOrderly: () => orderly !== null,
 });
 let loop: StrategyLoop | null = null;
 
@@ -341,12 +347,15 @@ const loopAccounts: LoopAccount[] = [];
 // loop's free margin; also what a later Orderly leg is built from. Off (the default): null, nothing opened or signed.
 // Built (and its configuration checked) here; its first session opens, and signs, only once the server listens.
 let orderly: ServeOrderly | null = null;
+// The pair trader's Orderly side and the book's Orderly fills over that session (listening from before its first onUp).
+let orderlySide: OrderlyPairSide | null = null;
 if (orderlyPairsOn(envVar)) {
   if (contract === null || deskId === null) log(`${ORDERLY_PAIRS_ENV}=1: ignored, ${mode === 'replay' ? 'replay has no contract desk' : 'no contract desk is set (GIMBAL_CONTRACT_ID, DESK_ID)'}`);
   else if (values.once === true) log(`${ORDERLY_PAIRS_ENV}=1: the Orderly private session is not opened with --once (it signs orderly_ws_auth); Orderly legs are not read`);
   else {
     try {
       orderly = serveOrderly({ mode, env: envVar, deskId, desk: contract.desk, log, clock });
+      orderlySide = orderly === null ? null : orderlyPairSide(orderly, { log, clock });
     } catch (err) {
       fail(`orderly: ${errorMessage(err)}`);
     }
@@ -401,6 +410,7 @@ if (contract !== null && deskId !== null) {
     mode, env: envVar, side, deskId: id, clock, log, publish, linkedWorktree: linkedWorktree(), once: values.once === true,
     onProtectionClose: (report) => protectionClosed(report),
     ...(stateDirSet === undefined ? {} : { stateDir: resolve(stateDirSet) }),
+    ...(orderlySide === null ? {} : { orderly: orderlySide }),
     // Review S1: a start read that fails degrades the pair (alert only, legs unknown, retried); health says which venue.
     health: (venue, status, detail) => {
       venueHealth.pairStart(venue, status, detail);
@@ -498,8 +508,12 @@ if (contract !== null && deskId !== null) {
   try {
     book = createBook({
       dir: stateDirSet === undefined ? userStateDir(envVar) : resolve(stateDirSet), mode, contractId: contract.client.contractId, deskId,
-      addresses: { hyperliquid: contract.desk.evm_address, phoenix: contract.desk.solana.authority },
-      sources: mode === 'replay' ? null : liveBookSources({ network: mode === 'mainnet' ? 'mainnet' : 'testnet' }),
+      // GIMBAL_ORDERLY_PAIRS=1 with its session only: the Orderly account (a new desk line in the book) and its ledgers.
+      addresses: { hyperliquid: contract.desk.evm_address, phoenix: contract.desk.solana.authority, ...(orderly === null ? {} : { orderly: orderly.accountId }) },
+      sources: mode === 'replay' ? null : liveBookSources({
+        network: mode === 'mainnet' ? 'mainnet' : 'testnet',
+        ...(orderly === null || orderlySide === null ? {} : { orderly: { fundingFees: orderly.client, fills: orderlySide.fills } }),
+      }),
       publish: (entry) => publish({ type: 'journal', data: entry }), clock, log,
       // Only a loop with hands on a confirmed start checks what it holds against the venues; else unknown.
       loopHeld: () => (loop === null || pair?.hands === undefined || (pair.unconfirmed?.() ?? null) !== null ? undefined : loop.held),
@@ -693,6 +707,7 @@ async function shutdown(reason: string): Promise<void> {
   if (!drained && stillRescuing !== null) log(`stopping: rescue ${stillRescuing} is still running after ${SHUTDOWN_WAIT_MS / 1000} s; exiting anyway: a payment it signed was saved as held before signing, and the next start reads it at 1Click and on chain`);
   if (!drained && (stillRescuing === null || pair?.pair?.closing === true)) log(`stopping: a close is still running after ${SHUTDOWN_WAIT_MS / 1000} s; exiting anyway: its orders are saved as in flight (the next start only alerts on ADL until a close result); check both legs by hand`);
   pair?.stop();
+  orderlySide?.stop();
   orderly?.stop();
   await view?.stop();
   await server!.stop();

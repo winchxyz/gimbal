@@ -74,6 +74,8 @@ export interface ScannerOptions {
    * stored price, so the scanner notes it instead of refusing E_ORACLE_STALE (price.ts deskVerdict). Default: never.
    */
   oracleRefreshAtOpen?: () => boolean;
+  /** With it, serve opens Orderly pairs too (price.ts oracleRefreshOrderly). Default: never. */
+  oracleRefreshOrderly?: () => boolean;
   /** Desk venues that already hold the desk's margin; default none (the desk keeps it in the reserve between holds). */
   marginHeldAt?: () => ReadonlySet<VenueId>;
   /** Where notes go (a failed read, a skipped book); default nowhere. */
@@ -448,6 +450,7 @@ export class Scanner {
       policy: config.policy,
       oracle: this.#options.oracle ?? null,
       oracleRefreshAtOpen: this.#options.oracleRefreshAtOpen?.() === true,
+      oracleRefreshOrderly: this.#options.oracleRefreshOrderly?.() === true,
       book: (leg: ScanLeg) => this.#books.get(legKey(leg)) ?? null,
       marginHeldAt: this.#options.marginHeldAt?.() ?? new Set(),
       quality: (pair) => quality.checks(pair),

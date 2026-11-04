@@ -29,9 +29,10 @@ export interface LiveSourceOptions {
   /**
    * The desk's Orderly reads, when it trades Orderly pairs (serve with GIMBAL_ORDERLY_PAIRS=1): `fundingFees` is the
    * desk client's signed funding_fee_history read (the book's address for 'orderly' is the account id), `fills` the
-   * log the private session's executionreports feed. Absent: no Orderly ledger, as before.
+   * log the private session's executionreports feed (or a getter for it: serve makes the log at the session's first
+   * onUp, null before). Absent: no Orderly ledger, as before.
    */
-  orderly?: { fundingFees?: OrderlyFundingFeeSource; fills?: OrderlyFillLog; apiUrl?: string; hearWaitMs?: number };
+  orderly?: { fundingFees?: OrderlyFundingFeeSource; fills?: OrderlyFillLog | (() => OrderlyFillLog | null); apiUrl?: string; hearWaitMs?: number };
 }
 
 async function post<T>(f: typeof fetch, url: string, body: unknown): Promise<T> {
@@ -180,11 +181,12 @@ export function liveBookSources(o: LiveSourceOptions): BookSources {
   const ox = o.orderly;
   const orderlyFunding = ox?.fundingFees === undefined ? null
     : orderlyBookFunding(new OrderlyReader({ network: o.network, fetch: f, fundingFees: ox.fundingFees, ...(ox.apiUrl === undefined ? {} : { apiUrl: ox.apiUrl }) }));
-  const orderlyFills = ox?.fills ?? null;
+  const fillsOf = ox?.fills;
   // An Orderly leg's fills without the session's log are unknown, never "none": a failed read the book holds and retries.
   const orderlyLog = (): OrderlyFillLog => {
-    if (orderlyFills === null) throw new Error('orderly: no fill log (the private session is not open)');
-    return orderlyFills;
+    const log = typeof fillsOf === 'function' ? fillsOf() : fillsOf ?? null;
+    if (log === null) throw new Error('orderly: no fill log (the private session is not open)');
+    return log;
   };
   return {
     funding: { hyperliquid: hl, ...(phoenix === null ? {} : { phoenix }), ...(orderlyFunding === null ? {} : { orderly: orderlyFunding }) },

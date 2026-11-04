@@ -13,7 +13,9 @@
 // NEAR is the worse of the contract client's own health (the operator key's budget, slow MPC signatures) and the
 // desk view's (get_desk: slow when its latest read failed or is late, down when it was never read or is stale).
 // The pair trader's start (serve-pair.ts, review S1) adds its own word for Hyperliquid, Phoenix and NEAR until its
-// start is confirmed: down when a read it needs failed, slow when the Phoenix snapshot lags the chain.
+// start is confirmed: down when a read it needs failed, slow when the Phoenix snapshot lags the chain. With
+// GIMBAL_ORDERLY_PAIRS=1 it adds Orderly's too (an Orderly pair's start reads); the session itself being down or
+// unseeded shows as the risk engine's Orderly account read failing (readFailed).
 
 import type { HealthMap, ScanStatus, VenueId } from '@gimbal/shared';
 import type { NearHealth } from '../contract/budget.ts';
@@ -97,7 +99,7 @@ export class VenueHealth {
   }
 
   /** The pair trader's start reads (serve-pair.ts): `ok` once its start is confirmed. */
-  pairStart(key: 'hyperliquid' | 'phoenix' | 'near', status: HealthStatus, detail: string | null = null): void {
+  pairStart(key: 'hyperliquid' | 'phoenix' | 'near' | 'orderly', status: HealthStatus, detail: string | null = null): void {
     if (status === 'ok') this.#start.delete(key);
     else this.#start.set(key, { status, detail });
     const d = this.#venues.get(key as VenueId);

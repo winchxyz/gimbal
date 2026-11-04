@@ -92,6 +92,20 @@ export function policyLists(policy: Pick<ContractPolicy, 'hl_assets' | 'phoenix_
 }
 
 /**
+ * The policy symbols a pair long `long` / short `short` can be opened on: both venues list it (Orderly's
+ * PERP_<symbol>_USDC in orderly_symbols). In the policy's order (hl_assets, then phoenix_markets, then orderly_symbols);
+ * none when the two venues are not a pair.
+ */
+export function pairSymbols(policy: Pick<ContractPolicy, 'hl_assets' | 'phoenix_markets' | 'orderly_symbols'>, long: VenueId, short: VenueId): string[] {
+  if (long === short || !PAIR_VENUES.includes(long) || !PAIR_VENUES.includes(short)) return [];
+  const all = [
+    ...policy.hl_assets.map((a) => a.symbol), ...policy.phoenix_markets.map((m) => m.symbol),
+    ...(policy.orderly_symbols ?? []).map((m) => /^PERP_([A-Za-z0-9]+)_USDC$/.exec(m)?.[1]).filter((x): x is string => x !== undefined),
+  ];
+  return [...new Set(all)].filter((s) => policyLists(policy, long, s) && policyLists(policy, short, s));
+}
+
+/**
  * Why `shape` may not be built or opened for `symbol`, or null: a shape other than short Hyperliquid / long Phoenix
  * while GIMBAL_ORDERLY_PAIRS is not 1, legs that are not `symbol`'s markets in the trader's order, or a market the
  * policy does not list.

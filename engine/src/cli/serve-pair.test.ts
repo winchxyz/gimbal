@@ -1305,6 +1305,34 @@ test('panic_close with GIMBAL_ORDERLY_PAIRS=1 and the trader state lost: the sta
   }
 });
 
+test('a panic_close sweep that takes over a stale lock journals it, as the start does', async () => {
+  const ol = new Leg('orderly', 'PERP_XLM_USDC');
+  const o = orderlyWorld([ol]);
+  try {
+    const first = await servePair(o.make(true));
+    assert.equal((await first.hands!.open({ symbol: 'XLM', long: 'orderly', short: 'hyperliquid', legUsd: 10, leverage: 1.5, reason: 'strategy: enter' })).ok, true);
+    first.stop();
+    rmSync(o.statePath);                                     // NONE: the sweep borrows the lock for its orders
+    const sp = await servePair(o.make(true));
+    assert.equal(sp.pair, null);
+    // A killed container's lock of this pid, silent for over 90 s.
+    mkdirSync(dirname(lockPath(o.w)), { recursive: true });
+    writeFileSync(lockPath(o.w), lockText({ pid: process.pid, startedMs: THIS_PROCESS.startedMs! - 60_000, id: 'killed-container', boot: THIS_PROCESS.boot }));
+    const t = new Date(Date.now() - LOCK_STALE_MS - 5_000);
+    utimesSync(lockPath(o.w), t, t);
+    await sp.reducer()!.close(PANIC);
+    assert.equal(ol.pos, 0n);
+    const took = o.events.flatMap((e) => (e.type === 'journal' && e.data.numbers.stage === 'lock' ? [e.data.summary] : []));
+    assert.equal(took.length, 1, JSON.stringify(took));
+    assert.match(took[0]!, /^pair: the trader lock .* was stale .* and is taken over.*nothing else trades this desk now$/);
+    assert.ok(o.w.lines.some((l) => /pair {6}the trader lock .* was stale/.test(l)));
+    await ticks();
+    sp.stop();
+  } finally {
+    rmSync(o.w.dir, { recursive: true, force: true });
+  }
+});
+
 test('GIMBAL_ORDERLY_PAIRS=1 and no Orderly session: the start journals it; panic_close says "nothing on Orderly to close" unless the saved state holds an Orderly leg', async () => {
   // A live Hyperliquid / Phoenix pair, and no Orderly leg saved: the pair closes, and panic_close is done.
   const ol = new Leg('orderly', 'PERP_XLM_USDC');

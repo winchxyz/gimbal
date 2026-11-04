@@ -4,6 +4,7 @@
 import type { ContractPolicy, StrategyConfig, VenueId, Window as FundingWindow } from '@gimbal/shared';
 import { oraclePriced } from '../contract/oracle-assets.ts';
 import { venueName, venueNames } from '../venues/names.ts';
+import { orderlyBaseSymbol } from '../venues/orderly.ts';
 import type { Book } from '../venues/venue.ts';
 import type { CostParams } from './config.ts';
 import {
@@ -56,6 +57,11 @@ export interface PricingContext {
    * stored price first, so such a leg is a note, not E_ORACLE_STALE (deskVerdict). Default: false, today's verdict.
    */
   oracleRefreshAtOpen?: boolean;
+  /**
+   * With oracleRefreshAtOpen: serve also opens Orderly pairs (GIMBAL_ORDERLY_PAIRS=1 with its Orderly session), so an
+   * Orderly leg on a symbol the contract prices is refreshed at open too. Default: false (Hyperliquid and Phoenix only).
+   */
+  oracleRefreshOrderly?: boolean;
   /** The latest book of a desk leg, or null when none was ever read. */
   book(leg: ScanLeg): BookRead | null;
   /** Desk venues that already hold the desk's margin: entering there moves nothing in or out. Default: none. */
@@ -274,8 +280,15 @@ interface Verdict {
   note?: string;
 }
 
-/** The legs a trading serve's open refreshes the stored price for: the pair it opens, on a symbol the contract prices. */
-function refreshesAtOpen(leg: ScanLeg): boolean {
+/**
+ * The legs a trading serve's open refreshes the stored price for: the pair it opens, on a symbol the contract prices
+ * (an Orderly leg's PERP_<symbol>_USDC by its symbol, the contract's oracle key for it, when serve opens Orderly pairs).
+ */
+function refreshesAtOpen(leg: ScanLeg, orderly: boolean): boolean {
+  if (leg.venue === 'orderly') {
+    const base = orderly ? orderlyBaseSymbol(leg.symbol) : null;
+    return base !== null && oraclePriced(base);
+  }
   return (leg.venue === 'hyperliquid' || leg.venue === 'phoenix') && oraclePriced(leg.symbol);
 }
 
@@ -301,7 +314,7 @@ function inVenuePolicy(policy: ContractPolicy, leg: ScanLeg): boolean {
  * - the notional the contract values, up to legUsd × (1 + price_band_bps / 10⁴) at a limit price inside the band,
  *   must fit max_notional_usd, or the unpriced cap when a leg is unpriced (E_SIZE).
  */
-export function deskVerdict(pair: Pair, ctx: Pick<PricingContext, 'strategy' | 'policy' | 'oracle' | 'now' | 'oracleRefreshAtOpen'>): Verdict {
+export function deskVerdict(pair: Pair, ctx: Pick<PricingContext, 'strategy' | 'policy' | 'oracle' | 'now' | 'oracleRefreshAtOpen' | 'oracleRefreshOrderly'>): Verdict {
   const L = ctx.strategy.legUsd;
   const policy = ctx.policy;
   const checks: FundingWindow['checks'] = [];
@@ -356,7 +369,7 @@ export function deskVerdict(pair: Pair, ctx: Pick<PricingContext, 'strategy' | '
     // cap are held to the refreshed price at open, and by the contract. A price dated ahead of the clock is 0 s old
     // here, never stale: a refresh does not fix a wrong clock, so it is refused below as before.
     const oldS = o === null || age === null ? null : age;
-    if ((oldS === null || oldS > policy.oracle_max_age_s) && ctx.oracleRefreshAtOpen === true && refreshesAtOpen(leg)) {
+    if ((oldS === null || oldS > policy.oracle_max_age_s) && ctx.oracleRefreshAtOpen === true && refreshesAtOpen(leg, ctx.oracleRefreshOrderly === true)) {
       checks.push({
         ok: true,
         text: `The stored price for ${where} is ${oldS === null ? 'missing' : `${Math.round(oldS)} s old, over the ${policy.oracle_max_age_s} s limit`}: `

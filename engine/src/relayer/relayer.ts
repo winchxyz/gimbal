@@ -16,7 +16,7 @@
 import type { TxRef } from '@gimbal/shared';
 import type { ContractClient, DeskView, HlOrder, HlSignedAction, OutcomeIds, SignedQuote, SolSignedAction } from '../contract/types.ts';
 import { MpcTimeoutError, OutcomeUnknown, solMessageDigest } from '../contract/types.ts';
-import type { OrderlyRequest, OrderlyRequestKind } from '../venues/orderly-signer.ts';
+import type { OrderlyRequest, OrderlyRequestKind, OrderlySigner } from '../venues/orderly-signer.ts';
 import { signedClientOrderId } from '../venues/orderly-signer.ts';
 import { asDeskAct } from '../venues/desk-acts.ts';
 import type { ArbitrumSubmitter } from './arbitrum.ts';
@@ -169,17 +169,7 @@ export class Relayer {
    */
   async orderlyRequest<T = unknown>(kind: OrderlyRequestKind, fields: Partial<OrderlyRequest>, reason: string): Promise<{ data: T; tx: TxRef[]; clientOrderId: string | null }> {
     if (this.#orderly === undefined) throw new Error('relayer: no Orderly target configured');
-    if (kind === 'order' && fields.client_order_id !== undefined && fields.client_order_id !== null) {
-      throw new Error('relayer: the contract derives an order\'s client_order_id from its request_id; do not pass one');
-    }
-    const now = this.#orderly.now ?? Date.now;
-    const req: OrderlyRequest = { reduce_only: false, ...fields, kind, timestamp_ms: now() };
-    const target = this.#orderly;
-    return asDeskAct(async () => {
-      const signed = await this.#contract.orderlyRequest(this.deskId, req, reason);
-      const data = await sendOrderlyRest<T>(signed, kind, target);
-      return { data, tx: signed.nearTx === undefined ? [] : [signed.nearTx], clientOrderId: kind === 'order' ? signedClientOrderId(signed) : null };
-    });
+    return relayOrderlyRequest<T>(this.#contract, this.#orderly, kind, fields, reason);
   }
 
   // ---- Arbitrum and NEAR ----
@@ -200,4 +190,23 @@ export class Relayer {
 
 function sameBytes(a: unknown, b: string): boolean {
   return typeof a === 'string' && Buffer.from(a, 'base64').equals(Buffer.from(b, 'base64'));
+}
+
+/**
+ * Relayer.orderlyRequest on any contract client that signs Orderly requests (serve's Orderly session signs its leg's
+ * orders with its own): signed by the contract, sent with Orderly's headers, marked as the desk's own act.
+ */
+export async function relayOrderlyRequest<T = unknown>(
+  contract: Pick<OrderlySigner, 'orderlyRequest'>, target: OrderlyRestTarget, kind: OrderlyRequestKind, fields: Partial<OrderlyRequest>, reason: string,
+): Promise<{ data: T; tx: TxRef[]; clientOrderId: string | null }> {
+  if (kind === 'order' && fields.client_order_id !== undefined && fields.client_order_id !== null) {
+    throw new Error('relayer: the contract derives an order\'s client_order_id from its request_id; do not pass one');
+  }
+  const now = target.now ?? Date.now;
+  const req: OrderlyRequest = { reduce_only: false, ...fields, kind, timestamp_ms: now() };
+  return asDeskAct(async () => {
+    const signed = await contract.orderlyRequest(target.deskId, req, reason);
+    const data = await sendOrderlyRest<T>(signed, kind, target);
+    return { data, tx: signed.nearTx === undefined ? [] : [signed.nearTx], clientOrderId: kind === 'order' ? signedClientOrderId(signed) : null };
+  });
 }

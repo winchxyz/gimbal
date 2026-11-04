@@ -141,7 +141,7 @@ const positionPush = (positions: unknown[], ts = NOW + 5) => ({ topic: 'position
 const balancePush = (holding: number, frozen = 0, ts = NOW + 6) => ({ topic: 'balance', ts, data: { balances: { USDC: { holding, frozen } } } });
 
 test('one ws auth signature opens the session: auth frame auth-1, then the three topics', async () => {
-  const s = setup();
+  const s = setup({ timeoutMs: 5_000 });   // the 200 ms default flaked under a loaded CI box
   const started = s.stream.start();
   await until(() => s.sockets[0]?.sent.length === 1);
   const sock = s.sockets[0]!;

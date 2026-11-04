@@ -33,7 +33,16 @@ import { ORDERLY_BROKERS } from '../scanner/config.ts';
 import { OrderlyDeskClient } from '../venues/orderly-actions.ts';
 import type { OrderlyNetwork } from '../venues/orderly-http.ts';
 import { normalizeAccountId } from '../venues/orderly-http.ts';
+import type { OrderlyMarket } from '../venues/orderly.ts';
 import { OrderlyReader } from '../venues/orderly.ts';
+import { OrderlyFillLog } from '../book/orderly.ts';
+import type { OrderlyRestTarget } from '../relayer/orderly.ts';
+import { relayOrderlyRequest } from '../relayer/relayer.ts';
+import type { OrderlyLegOptions } from '../trade/legs.ts';
+import { OrderlyLeg, parseOrderlyReport } from '../trade/legs.ts';
+import { lotQty, toQty } from '../trade/lots.ts';
+import type { OrderlyRequest, OrderlyRequestKind } from '../venues/orderly-signer.ts';
+import type { ServeOrderly as PairOrderly } from './serve-pair.ts';
 import type { OrderlySigner } from '../venues/orderly-signer.ts';
 import type {
   OrderlyAccountSnapshot, OrderlyPositionsSnapshot, OrderlyStreamPosition, OrderlyStreamReadiness,
@@ -41,6 +50,7 @@ import type {
 import { OrderlyAccountStream } from '../venues/orderly-stream.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import { ACCOUNT_READ_DEADLINE_MS, withDeadline } from '../risk/sources.ts';
+import { LOOP_ACCOUNT_MAX_AGE_MS } from '../readers.ts';
 import type { AccountState, Clock } from '../venues/venue.ts';
 import { systemClock } from '../venues/venue.ts';
 import type { WebSocketFactory } from '../venues/ws.ts';
@@ -376,6 +386,7 @@ export interface ServeOrderlyInput {
 }
 
 export interface ServeOrderly {
+  readonly deskId: string;
   readonly accountId: string;
   readonly orderlyKey: string;
   readonly network: OrderlyNetwork;
@@ -487,12 +498,13 @@ export function serveOrderly(input: ServeOrderlyInput): ServeOrderly | null {
     ...(input.fetch === undefined ? {} : { fetch: input.fetch }),
   });
   return {
-    accountId, orderlyKey, network, reader, client, signer, keeper,
+    deskId: input.deskId, accountId, orderlyKey, network, reader, client, signer, keeper,
     legStream: { positionsState: () => keeper.positionsState() },
     riskAccount: { reader, address: accountId },
     loopAccount: {
       venue: 'orderly', logOnce: true,
-      read: () => withDeadline(input.loopDeadlineMs ?? ACCOUNT_READ_DEADLINE_MS, 'orderly account read', () => reader.account(accountId)),
+      // The risk engine's last read when it is a scan old at most (OrderlyReader.accountWithin), else one now.
+      read: () => withDeadline(input.loopDeadlineMs ?? ACCOUNT_READ_DEADLINE_MS, 'orderly account read', () => reader.accountWithin(accountId, LOOP_ACCOUNT_MAX_AGE_MS)),
     },
     listen: (l) => {
       if (stopped) return () => false;
@@ -506,6 +518,136 @@ export function serveOrderly(input: ServeOrderlyInput): ServeOrderly | null {
       stopped = true;
       listeners.clear();
       reader.close();
+    },
+  };
+}
+
+/**
+ * serve's Orderly side for the pair trader (ServePairInput.orderly) and for the position book, over the kept session:
+ *
+ *   - leg(spec): an OrderlyLeg (trade/legs.ts) on a market the desk can trade (the shared ones and gimbal_dex's),
+ *     its orders signed by the contract through the session's signer (relayOrderlyRequest: the desk's own act) and
+ *     sent with Orderly's headers; its position from the signed `positions` read, else the session's pushes; its best
+ *     price from the public book. Null while the session is not live or the market's lot is not known yet (the markets
+ *     are read at each onUp, and again when a leg asks for one not known). Every executionreport push reaches every
+ *     leg made (held weakly: a leg no one keeps is dropped).
+ *   - account(): the account over the session, read now (an open plans on fresh margin).
+ *   - onPositions: the session's position pushes and seed reads, for the trader's replay watch.
+ *   - fills(): the book's OrderlyFillLog, made at the session's first onUp. A report pushed before it (a session that
+ *     is not subscribed yet) is not logged: the log starts after the latest such report, so no window it answers can
+ *     hold a fill it never saw. Later sessions: down() at onDown, up() at onUp, heard() at every frame.
+ */
+export interface OrderlyPairSide extends PairOrderly {
+  ready(symbol: string): Promise<string | null>;
+  onPositions(fn: (rows: { symbol: string; qty: bigint }[]) => void): () => void;
+  /** The book's fill log; null before the session's first onUp. */
+  fills(): OrderlyFillLog | null;
+  stop(): void;
+}
+
+export function orderlyPairSide(orderly: ServeOrderly, o: { log: (line: string) => void; clock?: Clock; fetch?: typeof fetch }): OrderlyPairSide {
+  const clock = o.clock ?? systemClock;
+  const target: OrderlyRestTarget = {
+    apiUrl: orderly.reader.apiUrl, deskId: orderly.deskId, accountId: orderly.accountId, orderlyKey: orderly.orderlyKey, now: () => clock.now(),
+    ...(o.fetch === undefined ? {} : { fetch: o.fetch }),
+  };
+  const relayer: OrderlyLegOptions['relayer'] = {
+    orderlyRequest: <T>(kind: OrderlyRequestKind, fields: Partial<OrderlyRequest>, reason: string) => relayOrderlyRequest<T>(orderly.signer, target, kind, fields, reason),
+  };
+  const markets = new Map<string, OrderlyMarket>();
+  let loading: Promise<void> | null = null;
+  let loadSaid: string | null = null;
+  const load = (): Promise<void> => {
+    loading ??= orderly.reader.markets().then((rows) => {
+      for (const m of rows) if (!m.delisted && m.tickSize !== null) markets.set(m.symbol, m);
+      loadSaid = null;
+    }, (err: unknown) => {
+      const why = errorMessage(err);
+      if (why !== loadSaid) o.log(`orderly pair: the Orderly markets were not read (${why}); an Orderly leg waits for them`);
+      loadSaid = why;
+    }).finally(() => {
+      loading = null;
+    });
+    return loading;
+  };
+  const legs = new Set<WeakRef<OrderlyLeg>>();
+  let log: OrderlyFillLog | null = null;
+  let earlyUntil = -Infinity;
+  const positionFns = new Set<(rows: { symbol: string; qty: bigint }[]) => void>();
+  let stopped = false;
+  const unlisten = orderly.listen({
+    executionReport: (raw) => {
+      const at = clock.now();
+      for (const ref of [...legs]) {
+        const leg = ref.deref();
+        if (leg === undefined) legs.delete(ref);
+        else leg.onExecutionReport(raw);
+      }
+      if (log !== null) log.onExecutionReport(raw, at);
+      else earlyUntil = Math.max(earlyUntil, at, parseOrderlyReport(raw, at)?.time ?? at);
+    },
+    positions: (rows) => {
+      const out: { symbol: string; qty: bigint }[] = [];
+      for (const p of rows) {
+        try {
+          out.push({ symbol: p.symbol, qty: toQty(p.positionQty) });
+        } catch {
+          // A quantity that is not a number: the trader's own read decides.
+        }
+      }
+      for (const fn of [...positionFns]) fn(out);
+    },
+    onUp: (at) => {
+      if (log === null) log = new OrderlyFillLog(Number.isFinite(earlyUntil) ? Math.max(at, earlyUntil + 1) : at);
+      else log.up(at);
+      void load();
+    },
+    onFrame: (at) => log?.heard(at),
+    onDown: (at) => log?.down(at),
+  });
+  const live = () => !stopped && orderly.status().state === 'live';
+  return {
+    leg: (spec) => {
+      if (!live()) return null;
+      const m = markets.get(spec.symbol);
+      if (m === undefined) {
+        void load();
+        return null;
+      }
+      const leg = new OrderlyLeg({
+        relayer, readPositions: () => orderly.client.positions(`serve: read the Orderly ${spec.symbol} leg`), stream: orderly.legStream,
+        symbol: spec.symbol, lot: lotQty(String(m.lotSize)), baseMin: lotQty(String(m.baseMin)), quoteTick: m.tickSize!, minNotional: m.minNotional,
+        maxNotionalUsd: spec.maxNotionalUsd, oraclePx: spec.oraclePx, ...(spec.maxSz === undefined ? {} : { maxSz: spec.maxSz }),
+        bestPx: async (side) => {
+          const book = await orderly.reader.book(spec.symbol, 5);
+          const px = side === 'BUY' ? book.asks[0]?.px : book.bids[0]?.px;
+          if (px === undefined) throw new Error(`no ${side === 'BUY' ? 'asks' : 'bids'} on Orderly ${spec.symbol}`);
+          return px;
+        },
+        slippageBps: spec.slippageBps, clock, log: (l) => o.log(`pair      ${l}`),
+      });
+      legs.add(new WeakRef(leg));
+      return leg;
+    },
+    ready: async (symbol) => {
+      if (stopped) return 'serve is stopping';
+      if (!markets.has(symbol)) await load();
+      const s = orderly.status();
+      if (s.state !== 'live') return `serve's Orderly session is not up (${s.state}${s.why === null ? '' : `: ${s.why}`})`;
+      if (!markets.has(symbol)) return `${symbol} is not an active Orderly market the desk can trade${loadSaid === null ? '' : ` (the markets were not read: ${loadSaid})`}`;
+      return null;
+    },
+    account: () => orderly.reader.account(orderly.accountId),
+    onPositions: (fn) => {
+      positionFns.add(fn);
+      return () => positionFns.delete(fn);
+    },
+    fills: () => log,
+    stop: () => {
+      stopped = true;
+      unlisten();
+      positionFns.clear();
+      legs.clear();
     },
   };
 }

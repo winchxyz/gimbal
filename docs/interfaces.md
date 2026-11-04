@@ -1212,10 +1212,19 @@ same backoff, and never re-reads one that answered with rows it cannot use (it w
 account as unknown at once, without waiting (a failed read: Orderly down, its legs kept at their last numbers, at
 least watched), before the first session, while one is opening, down or unseeded, and when the server has been quiet
 for 30 s. A holding read with no USDC row is an empty balance (Orderly omits empty tokens unless `all=true`). The
-strategy loop's free margin reads it too, within 7 s, and logs a failed read once per kind of failure. Its listeners
-get each session's `onUp` (logged in, every subscription acknowledged), `onFrame` per server frame, and one `onDown`,
-in that order across reconnects, and nothing after serve stops. It opens no Orderly window and changes no rescue
-route. Lines (`thresholds.ts`):
+strategy loop's free margin reuses the risk engine's last read of it while that is at most 7 s old and no desk act
+came since (else reads it, within 7 s), and logs a failed read once per kind of failure. Its listeners get each
+session's `onUp` (logged in, every subscription acknowledged), `onFrame` per server frame, and one `onDown`, in that
+order across reconnects, and nothing after serve stops. With the session the pair trader may also hold an Orderly
+pair (`serve-orderly.ts` `orderlyPairSide`): any two of Hyperliquid, Orderly and Phoenix in the direction the window
+pays, its symbol listed by both venues in the policy (`pair-shape.ts` `pairSymbols`); a Hyperliquid leg opens first as
+maker and its partner by IOC, two IOCs otherwise; the Orderly leg is made only while the session is live and its
+market's lot is known. The book reads that leg's fills from the session's `executionreport` pushes (a fill log made at
+the first `onUp`: a window reaching back before it, or over a time the session was down, is unknown, never "nothing
+filled") and its funding from the signed `funding_fee_history` read; the health map gets an `orderly` key. Orderly
+stays a non-rescue venue (1.5x at most): a window its free margin cannot open at the $10 minimum is refused in those
+words and journaled once. A rotation between pairs on other legs closes the old pair first and waits out an Orderly
+leg's 300 s replay watch. Lines (`thresholds.ts`):
 - rescue line = `max(rescueDistancePct, (exp(4 σ √185 s) − 1) × 100)`, where σ is the leg's realised volatility per
   √s over the last 30 min (at least 10 returns, else the owner's line alone) and 185 s is the slow rescue measured on
   mainnet (a 120 s MPC signature plus a 65 s 1Click transfer);

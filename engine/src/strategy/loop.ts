@@ -189,6 +189,13 @@ export interface HandsHeld {
   freedMarginUsd?: Record<string, number>;
   /** Only one venue holds a position: that leg and its signed size; null when both legs are open. */
   oneLeg: { venue: string; qty: string } | null;
+  /**
+   * The held pair's long and short venues, named by hands that open more than one pair (GIMBAL_ORDERLY_PAIRS=1): the
+   * loop's record must then name the same legs. Absent: long Phoenix, short Hyperliquid, and the record is matched on
+   * its symbol alone, as before.
+   */
+  long?: string;
+  short?: string;
 }
 
 /** The loop's hands on the desk (serve: serve-pair.ts PairHands with the desk's numbers). */
@@ -233,6 +240,19 @@ export interface LoopHeld {
   since: number;
   legUsd: number;
   entryNetAprPct: number;
+  /** The pair's long and short venues; absent (every state saved before Orderly pairs): long Phoenix, short Hyperliquid. */
+  long?: string;
+  short?: string;
+}
+
+/** The pair a held record or the hands name, with the default filled in. */
+function legsOf(h: { long?: string; short?: string }): { long: string; short: string } {
+  return { long: h.long ?? 'phoenix', short: h.short ?? 'hyperliquid' };
+}
+
+/** A window's venues as LoopHeld keeps them: nothing for long Phoenix / short Hyperliquid (the state file as before). */
+function heldVenues(long: string, short: string): { long?: string; short?: string } {
+  return long === 'phoenix' && short === 'hyperliquid' ? {} : { long, short };
 }
 
 export interface LoopFileState {
@@ -370,6 +390,10 @@ export function parseLoopState(v: unknown): LoopFileState {
       return x;
     };
     held = { windowId: h.windowId, symbol: h.symbol, since: n(h.since, 'since'), legUsd: n(h.legUsd, 'legUsd'), entryNetAprPct: n(h.entryNetAprPct, 'entryNetAprPct') };
+    if (h.long !== undefined || h.short !== undefined) {
+      if (typeof h.long !== 'string' || typeof h.short !== 'string') throw new Error('held names the venue of one leg only');
+      Object.assign(held, heldVenues(h.long, h.short));
+    }
   }
   const out: LoopFileState = { version: LOOP_STATE_VERSION, counters, held };
   if (o.refreshes !== undefined) {
@@ -1015,7 +1039,7 @@ export class StrategyLoop {
       const after = hands.held();
       if (opened.sent && after !== null) {
         // Orders went out and the venues hold a position: the desk holds it, the book sees the entry.
-        this.#setHeld({ windowId: w.id, symbol: sym.symbol, since: now, legUsd: after.legUsd, entryNetAprPct: w.netAprPct });
+        this.#setHeld({ windowId: w.id, symbol: sym.symbol, since: now, legUsd: after.legUsd, entryNetAprPct: w.netAprPct, ...heldVenues(w.longVenue, w.shortVenue) });
         const bookedAt = this.#record('enter', { windowId: w.id, symbol: sym.symbol, outcome: opened, forecastNetAprPct: w.netAprPct, exitReason: null, rotation: p.fromId === null ? null : { fromId: p.fromId, toId: w.id }, manual: p.manual, startedAt: openAt });
         this.#journal('error', `${kind} ${w.id}: ${opened.reason}; the venues hold ${after.symbol} (${round(after.legUsd)} USD a leg${after.oneLeg === null ? '' : `, one leg only: ${after.oneLeg.venue} ${after.oneLeg.qty}`}): held from now; ${why}`, { ...base, heldLegUsd: round(after.legUsd), feeUsd: opened.feeUsd }, opened.tx);
         return { end: 'done', sent: true, passing: false, positionId: bookedAt === null ? null : positionIdOf(w.id, bookedAt), result: `opened, partly: ${opened.reason}` };
@@ -1040,13 +1064,13 @@ export class StrategyLoop {
     // Held from now: an entry's time, or the rotation's. What filled, not what was asked: a later part its gate
     // stopped holds nothing.
     const filled = filledLeg(p, opened.filledQty);
-    this.#setHeld({ windowId: w.id, symbol: sym.symbol, since: now, legUsd: filled.usd, entryNetAprPct: w.netAprPct });
+    this.#setHeld({ windowId: w.id, symbol: sym.symbol, since: now, legUsd: filled.usd, entryNetAprPct: w.netAprPct, ...heldVenues(w.longVenue, w.shortVenue) });
     const enteredAt = this.#record('enter', { windowId: w.id, symbol: sym.symbol, outcome: opened, forecastNetAprPct: w.netAprPct, exitReason: null, rotation: p.fromId === null ? null : { fromId: p.fromId, toId: w.id }, manual: p.manual, startedAt: openAt });
     const size = filled.partial
       ? `${filled.qty} ${sym.symbol} (${round(filled.usd)} USD) a leg filled of the ${p.qty} (${p.legUsd} USD) asked`
       : `at most ${p.qty} ${sym.symbol} (${p.legUsd} USD) a leg`;
     const sizeNumbers: Record<string, number | string> = filled.partial ? { legUsd: round(filled.usd), qty: filled.qty, usd: round(filled.usd), askedLegUsd: p.legUsd, askedQty: p.qty } : { usd: p.legUsd };
-    this.#journal(kind, `${kind === 'rotate' ? `rotate ${p.fromId} -> ${w.id}` : `enter ${w.id}`}, ${sym.symbol} short hyperliquid, long phoenix, ${size} at ${p.leverage}x, ${round(w.netAprPct)} % net (${who})${p.reason === undefined ? '' : `: ${p.reason}`}; ${why}; ${opened.reason}`,
+    this.#journal(kind, `${kind === 'rotate' ? `rotate ${p.fromId} -> ${w.id}` : `enter ${w.id}`}, ${sym.symbol} short ${w.shortVenue}, long ${w.longVenue}, ${size} at ${p.leverage}x, ${round(w.netAprPct)} % net (${who})${p.reason === undefined ? '' : `: ${p.reason}`}; ${why}; ${opened.reason}`,
       { ...base, ...sizeNumbers, feeUsd: opened.feeUsd, ...(p.fromId === null ? {} : { from: p.fromId }) }, opened.tx);
     return { end: 'done', sent: true, passing: false, positionId: enteredAt === null ? null : positionIdOf(w.id, enteredAt), result: `opened: ${opened.reason}` };
   }
@@ -1230,16 +1254,21 @@ export class StrategyLoop {
       return { held: null };
     }
     const freed = venues.freedMarginUsd === undefined ? {} : { freed: venues.freedMarginUsd };
-    if (record !== null && record.symbol === venues.symbol) {
+    // The record is the pair the venues hold when it names its symbol, and its legs when the hands name theirs
+    // (absent legs on the record: long Phoenix, short Hyperliquid).
+    const legs = legsOf(venues);
+    const named = venues.long !== undefined || venues.short !== undefined;
+    const sameLegs = record === null || !named || (legsOf(record).long === legs.long && legsOf(record).short === legs.short);
+    if (record !== null && record.symbol === venues.symbol && sameLegs) {
       return {
         held: { windowId: record.windowId, symbol: record.symbol, since: record.since, legUsd: venues.legUsd > 0 ? venues.legUsd : record.legUsd, entryNetAprPct: record.entryNetAprPct, pnlUsd: venues.pnlUsd },
         ...freed,
       };
     }
-    const w = windows.find((x) => x.longVenue === 'phoenix' && x.shortVenue === 'hyperliquid' && symbolIs(hands!.symbolOf(x), venues.symbol));
+    const w = windows.find((x) => x.longVenue === legs.long && x.shortVenue === legs.short && symbolIs(hands!.symbolOf(x), venues.symbol));
     const adopted: LoopHeld = {
-      windowId: w?.id ?? `${venues.symbol}-phoenix-hyperliquid`.toLowerCase(), symbol: venues.symbol, since: now, legUsd: venues.legUsd,
-      entryNetAprPct: w?.netAprPct ?? 0,
+      windowId: w?.id ?? `${venues.symbol}-${legs.long}-${legs.short}`.toLowerCase(), symbol: venues.symbol, since: now, legUsd: venues.legUsd,
+      entryNetAprPct: w?.netAprPct ?? 0, ...heldVenues(legs.long, legs.short),
     };
     this.#setHeld(adopted);
     this.#patchCounters({ badChecks: 0, betterByWindow: {} });
