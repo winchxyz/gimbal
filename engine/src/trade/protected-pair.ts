@@ -54,8 +54,14 @@ import { LegCheckError } from './legs.ts';
 import { qtyString, signedQtyString, toQty } from './lots.ts';
 import type { MakerFirst, PairResult, PairTrader, PairTraderState } from './pair.ts';
 import type { InFlightOrder, LoadedTraderState } from './trader-state.ts';
+import { savedShape } from './trader-state.ts';
 import type { OpenToken } from './open-scope.ts';
 import { OPEN_SCOPE } from './open-scope.ts';
+import type { PairShape } from './pair-shape.ts';
+import { defaultShape, sameShape, shapeText } from './pair-shape.ts';
+
+/** The legs' venues of short Hyperliquid / long Phoenix, in the trader's order: what a text names when given none. */
+const DEFAULT_VENUES: readonly VenueId[] = ['hyperliquid', 'phoenix'];
 
 /** An order as GuardedLeg names it before it is signed (the book adds `op`). */
 export type OutgoingOrder = Omit<InFlightOrder, 'op'>;
@@ -658,7 +664,9 @@ export class ProtectedPair {
 
 export interface StartInput {
   symbol: string;
-  /** The legs as two agreeing reads found them: [hyperliquid, phoenix]. */
+  /** The legs being built, in the trader's order; absent: short Hyperliquid / long Phoenix. */
+  pair?: PairShape;
+  /** The legs as two agreeing reads found them, in the trader's order. */
   read: [bigint, bigint];
   saved: LoadedTraderState;
   /** GIMBAL_TRADER_FRESH as set (undefined: not set). */
@@ -691,7 +699,9 @@ export interface StartPlan {
 }
 
 const flat = (p: readonly (bigint | null)[]): boolean => p.every((x) => x === 0n);
-const text = (p: readonly (bigint | null)[]): string => `hyperliquid ${p[0] === null ? 'unknown' : signedQtyString(p[0]!)}, phoenix ${p[1] === null ? 'unknown' : signedQtyString(p[1]!)}`;
+/** The two legs' positions by venue ("hyperliquid -5, phoenix 5"); `venues` default short Hyperliquid / long Phoenix's. */
+const legsText = (p: readonly (bigint | null)[], venues: readonly VenueId[] = DEFAULT_VENUES): string =>
+  `${venues[0]} ${p[0] === null ? 'unknown' : signedQtyString(p[0]!)}, ${venues[1]} ${p[1] === null ? 'unknown' : signedQtyString(p[1]!)}`;
 
 /**
  * The ADL hold's text for orders in flight from before the restart: `off` null while they can still run (until
@@ -709,6 +719,8 @@ export function holdText(orders: readonly InFlightOrder[], off: readonly string[
 /** What the trader holds at start (see the header). */
 export function startPlan(input: StartInput): StartPlan {
   const { read, saved, symbol } = input;
+  const shape = input.pair ?? defaultShape(symbol);
+  const text = (p: readonly (bigint | null)[]): string => legsText(p, shape.legs.map((l) => l.venue));
   const freshNotes: string[] = [];
   let fresh = false;
   if (input.fresh !== undefined) {
@@ -747,10 +759,15 @@ export function startPlan(input: StartInput): StartPlan {
   const settledNote = (): string => `the ${inFlight.length} order(s) in flight when the engine stopped were signed more than ${IN_FLIGHT_LIFE_MS / 60_000} min ago and can no longer run; the venues read ${text(read)}`;
   // The venues' positions become the pair: orders that can no longer run are in them.
   const freshPair = (why: string): StartPlan => adopted(true, null, settled ? [why, settledNote()] : [why], newAdlState(), s.pendingMaker, settled ? [] : inFlight, settled ? null : hold);
-  if (s.symbol !== null && s.symbol !== symbol) {
+  // Another pair: another symbol, or the same symbol on other legs (or the other way round). Its baselines and orders
+  // are of legs this trader does not hold, so they are never restored onto these.
+  const was = savedShape(s);
+  if (s.symbol !== null && (s.symbol !== symbol || (was !== null && !sameShape(was, shape)))) {
+    const other = s.symbol !== symbol ? s.symbol : `${s.symbol} (${shapeText(was!)})`;
+    const now = s.symbol !== symbol ? symbol : `${symbol} (${shapeText(shape)})`;
     const idle = t === null || (flat(t.baselines) && t.unsettled.length === 0 && s.adl.event === null);
-    if (idle && s.pendingMaker.length === 0 && inFlight.length === 0) return freshPair(`the saved state is for ${s.symbol}, flat; the venues hold ${text(read)} ${symbol}: adopted as a new pair, a new ADL budget of ${ADL_ATTEMPTS}`);
-    return adopted(false, `${input.path} is for ${s.symbol} with legs or orders open, but the venues are read for ${symbol}: reconcile ${s.symbol} by hand, then stop serve, move ${input.path} aside and ${how}`, [], s.adl, s.pendingMaker, inFlight, hold);
+    if (idle && s.pendingMaker.length === 0 && inFlight.length === 0) return freshPair(`the saved state is for ${other}, flat; the venues hold ${text(read)} ${now}: adopted as a new pair, a new ADL budget of ${ADL_ATTEMPTS}`);
+    return adopted(false, `${input.path} is for ${other} with legs or orders open, but the venues are read for ${now}: reconcile ${other} by hand, then stop serve, move ${input.path} aside and ${how}`, [], s.adl, s.pendingMaker, inFlight, hold);
   }
   // Both legs flat: nothing is left to protect, and a reduce-only order of ours (all serve sends) cannot run on a flat leg.
   const flatAdopt = (note: string): StartPlan => adopted(true, null, [note], { ...s.adl, event: null }, s.pendingMaker, [], null);
