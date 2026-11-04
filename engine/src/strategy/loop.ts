@@ -99,6 +99,8 @@ export interface ActOutcome {
   filledQty?: string;
   /** refresh_prices was sent for it (paid), whatever came of it. */
   refreshed?: boolean;
+  /** How many refresh_prices were sent for it (with `refreshed`: its own and those before its parts); absent: one. */
+  refreshes?: number;
 }
 
 /** One leg's fills in an open or a close: summed size, size-weighted price, summed fee. */
@@ -451,8 +453,22 @@ export class StrategyLoop {
     this.#state = loaded.state;
     // The holds of a paid refusal that have not ended: a restart must not pay again for the same refusal.
     const now = options.clock.now();
-    for (const [k, h] of Object.entries(loaded.state.holds ?? {})) if (h.until > now) this.#refused.set(k, h);
+    // A hold is never longer than REFRESH_HOLD_MS from now (a clock that jumped, or a hand-edited file). A clamped one
+    // is saved so: otherwise each restart would clamp it again from its own now, and it would never end.
+    let clamped = false;
+    const holds: Record<string, { until: number; reason: string }> = {};
+    for (const [k, h] of Object.entries(loaded.state.holds ?? {})) {
+      if (h.until <= now) continue;
+      const until = Math.min(h.until, now + REFRESH_HOLD_MS);
+      if (until !== h.until) clamped = true;
+      holds[k] = { ...h, until };
+      this.#refused.set(k, holds[k]);
+    }
     if (loaded.problem !== null) options.log(`strategy loop: state not usable, counters start over with the cooldown and the day's rotations taken as used: ${loaded.problem}`);
+    if (clamped) {
+      this.#state = { ...this.#state, holds };
+      this.#save();
+    }
   }
 
   get counters(): LoopCounters {
@@ -876,7 +892,7 @@ export class StrategyLoop {
     const opened = await hands.open({
       window: w, symbol: sym.symbol, legUsd: p.legUsd, leverage: p.leverage, qty: p.qty, reason: `strategy: ${kind} ${w.id} (${who})`, ...this.#refreshAllowance(sym.symbol),
     });
-    if (opened.refreshed === true) this.#countRefresh(sym.symbol);
+    if (opened.refreshed === true) this.#countRefresh(sym.symbol, opened.refreshes ?? 1);
     this.#owner(opened.open);
     const now = this.#o.clock.now();
     if (!opened.ok) {
@@ -1077,20 +1093,22 @@ export class StrategyLoop {
     return { noRefresh: `the strategy loop's ${MAX_OPEN_REFRESHES_PER_DAY} refresh_prices of ${symbol} for ${day} (UTC) are used; the next may go after 00:00 UTC` };
   }
 
-  /** One refresh_prices an open of `symbol` paid for, counted in the saved state; journaled when the day's cap is hit. */
-  #countRefresh(symbol: string): void {
+  /** `n` refresh_prices an open of `symbol` paid for, counted in the saved state; journaled when a day's cap is hit. */
+  #countRefresh(symbol: string, n = 1): void {
     const day = this.#day(this.#o.clock.now());
     const r = this.#state.refreshes;
     const bySymbol = r?.day === day ? { ...r.bySymbol } : {};
-    const used = (bySymbol[symbol] ?? 0) + 1;
+    const before = bySymbol[symbol] ?? 0;
+    const allBefore = Object.values(bySymbol).reduce((a, x) => a + x, 0);
+    const used = before + n;
     bySymbol[symbol] = used;
     this.#state = { ...this.#state, refreshes: { day, bySymbol } };
     this.#save();
-    if (used === MAX_OPEN_REFRESHES_PER_DAY) {
+    if (before < MAX_OPEN_REFRESHES_PER_DAY && used >= MAX_OPEN_REFRESHES_PER_DAY) {
       this.#journal('refused', `refresh_prices cap: the strategy loop's opens sent ${used} refresh_prices of ${symbol} on ${day} (UTC), the most a day; no open of ${symbol} that needs one is sent before 00:00 UTC`, { symbol, refreshes: used });
     }
-    const all = Object.values(bySymbol).reduce((a, n) => a + n, 0);
-    if (all === MAX_OPEN_REFRESHES_PER_DAY_ALL) {
+    const all = allBefore + n;
+    if (allBefore < MAX_OPEN_REFRESHES_PER_DAY_ALL && all >= MAX_OPEN_REFRESHES_PER_DAY_ALL) {
       this.#journal('refused', `refresh_prices cap: the strategy loop's opens sent ${all} refresh_prices on ${day} (UTC) over all symbols, the most a day; no open that needs one is sent before 00:00 UTC`, { refreshes: all });
     }
   }

@@ -418,3 +418,26 @@ test('a refresh that moves the price over the band from what the plan judged on:
   assert.match(refused.refused ?? '', /^the stored ETH price after refresh_prices is 2540, 160 bps from the 2500 the open was judged on \(over the 100 bps band\), and planned again the open refuses: the desk authority holds/);
   await assert.rejects(sendOpen(low.ctx, low.pair, refused.plan), /open refused, nothing signed/);
 });
+
+test('planning again takes the price past the headroom: refused, paid, before anything else runs', async () => {
+  // Refreshed to 610 s old at 2540 (160 bps off the 2500 judged on): 50 s past SERVE_MAKER's 240 s. Planning again
+  // takes 40 s on this clock (the books and funding answer slowly), so the price is 650 s old when it is done.
+  const w = planWorld({ send: true, maker: SERVE_MAKER, refreshedPx: 2540 });
+  const plan = await withVenues(() => planOpen(w.ctx, w.pair, w.request));
+  assert.deepEqual(plan.refusals, []);
+  const hl = w.ctx.hl as unknown as { funding: () => Promise<unknown> };
+  const funding = hl.funding;
+  hl.funding = async () => {
+    if (w.refreshes.length > 0) w.age(40);
+    return funding();
+  };
+  const fresh = await withVenues(() => refreshForOpen(w.ctx, w.pair, plan));
+  assert.equal(fresh.paid, true);
+  assert.equal(fresh.refused, `the stored ETH price after refresh_prices is 2540, 160 bps from the 2500 the open was judged on (over the 100 bps band); planned again, the stored ETH price is 650 s old: it lives 10 s past the first part's 240 s, under the ${OPEN_HEADROOM_S} s the open needs before it; nothing sent`);
+  assert.equal(w.refreshes.length, 1, 'no second refresh_prices');
+  // On an instant clock the same replan passes.
+  const quick = planWorld({ send: true, maker: SERVE_MAKER, refreshedPx: 2540 });
+  const quickPlan = await withVenues(() => planOpen(quick.ctx, quick.pair, quick.request));
+  const ok = await withVenues(() => refreshForOpen(quick.ctx, quick.pair, quickPlan));
+  assert.deepEqual([ok.refused, ok.paid, ok.plan.pricedAt], [null, true, 2540]);
+});

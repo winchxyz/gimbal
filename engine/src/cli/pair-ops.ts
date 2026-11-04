@@ -481,13 +481,9 @@ export async function refreshForOpen(ctx: OpsCtx, pair: Pair, plan: OpenPlan, op
   if (plan.refusals.length > 0) return { refused: `refused already, so the stored ${symbol} price (${need.was}) is not refreshed: ${plan.refusals.join('; ')}`, paid: false, line: null, plan };
   if (!ctx.send) return { refused: `the stored ${symbol} price is ${need.was}: a dry run does not refresh it`, paid: false, line: null, plan };
   let paid = false;
-  const deps: PriceDeps = {
-    ...ctx.prices,
-    refresh: (s, maxAgeS) => {
-      paid = true;
-      return ctx.prices.refresh(s, maxAgeS);
-    },
-  };
+  const deps = counting(ctx.prices, () => {
+    paid = true;
+  });
   let sp: StoredPrice;
   try {
     sp = await ensureFresh(deps, symbol, need.marginS);
@@ -515,17 +511,36 @@ export async function refreshForOpen(ctx: OpsCtx, pair: Pair, plan: OpenPlan, op
   }
   const why = [...again.refusals, ...(again.refresh === null ? [] : [`the stored ${symbol} price is ${again.refresh.was} again`])];
   if (why.length > 0) return { refused: `${moved}, and planned again the open refuses: ${why.join('; ')}; nothing sent`, paid, line, plan: again };
+  // Planning again takes seconds of the price's life: the headroom is checked again before anything else runs.
+  const after = await ctx.prices.read(symbol);
+  const leftAfter = after === null ? -Infinity : ctx.prices.maxAgeS - need.marginS - after.ageS;
+  if (leftAfter < OPEN_HEADROOM_S) {
+    const age = after === null ? 'missing' : `${Math.round(after.ageS)} s old`;
+    return { refused: `${moved}; planned again, the stored ${symbol} price is ${age}: it lives ${Number.isFinite(leftAfter) ? Math.round(leftAfter) : 0} s past the first part's ${need.marginS} s, under the ${OPEN_HEADROOM_S} s the open needs before it; nothing sent`, paid, line, plan: again };
+  }
   return { refused: null, paid, line, plan: again };
+}
+
+/** `d` with each refresh_prices it sends reported to `onRefresh` first (the loop's caps count them). */
+export function counting(d: PriceDeps, onRefresh: () => void): PriceDeps {
+  return {
+    ...d,
+    refresh: (s, maxAgeS) => {
+      onRefresh();
+      return d.refresh(s, maxAgeS);
+    },
+  };
 }
 
 /**
  * Sends a planned open whose refusals are empty: maker first, part by part, then finish(). `gate` (serve) is asked
- * before each part, after the price refresh: a reason stops the open there, with nothing of that part sent (the parts
- * already sent are whole hedged pairs, each through its own legging guard, and stay as they are).
+ * before each part, after the price refresh (`onRefresh` hears of each refresh_prices it sends): a reason stops the
+ * open there, with nothing of that part sent (the parts already sent are whole hedged pairs, each through its own
+ * legging guard, and stay as they are).
  */
 export async function sendOpen(
   ctx: OpsCtx, pair: Pair, plan: OpenPlan, reason = `pair-mainnet: carry ${plan.request.symbol}, short hyperliquid, long phoenix`,
-  options: { gate?: () => string | null } = {},
+  options: { gate?: () => string | null; onRefresh?: () => void } = {},
 ): Promise<PairResult[]> {
   if (plan.refusals.length > 0) throw new Error(`open refused, nothing signed: ${plan.refusals.join('; ')}`);
   const { symbol } = plan.request;
@@ -539,7 +554,7 @@ export async function sendOpen(
     const results = await pair.run.openInChunks({
       size: plan.size, longIndex: 1, reason, maker: { index: 0 },
       beforePart: async () => {
-        if (pair.priced) await ensureFresh(ctx.prices, symbol, pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S);
+        if (pair.priced) await ensureFresh(options.onRefresh === undefined ? ctx.prices : counting(ctx.prices, options.onRefresh), symbol, pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S);
         const gated = options.gate?.() ?? null;
         if (gated !== null) throw new Error(gated);
       },
@@ -584,10 +599,12 @@ export function capQtyAtOrder(p: { qty: bigint; lot: bigint; worstPx: number; mi
  * (the ask plus `slippageBps`, at most the band over the stored price), the Hyperliquid sell's maker price (at most
  * the ask) and the stored price itself.
  */
-export async function recheckOpenSize(ctx: OpsCtx, pair: Pair, size: bigint, slippageBps: number): Promise<{ qty: bigint; cut: boolean; line: string } | { refused: string }> {
+export async function recheckOpenSize(
+  ctx: OpsCtx, pair: Pair, size: bigint, slippageBps: number, onRefresh?: () => void,
+): Promise<{ qty: bigint; cut: boolean; line: string } | { refused: string }> {
   const policy = ctx.desk.policy;
   const symbol = pair.symbol;
-  const sp = pair.priced ? await ensureFresh(ctx.prices, symbol, pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S) : null;
+  const sp = pair.priced ? await ensureFresh(onRefresh === undefined ? ctx.prices : counting(ctx.prices, onRefresh), symbol, pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S) : null;
   const [hlBook, pxBook] = await Promise.all([ctx.hl.book(symbol, 5), ctx.phoenix.book(symbol, 5)]);
   const hlAsk = hlBook.asks[0]?.px ?? 0;
   const pxAsk = pxBook.asks[0]?.px ?? 0;

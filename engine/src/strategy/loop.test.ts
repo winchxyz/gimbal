@@ -395,6 +395,48 @@ test('the 6 h hold after a paid refusal is saved: a restart keeps it until it en
   later.stop();
 });
 
+test('a saved hold longer than 6 h from now (a clock that jumped, a hand-edited file) is cut to 6 h on load and saved so', async () => {
+  const w = world();
+  const store = tmpStore();
+  const reason = 'enter sol-phoenix-hyperliquid held until 2026-12-03T10:05:00.000Z: refused after the open paid for refresh_prices (the price moved)';
+  store.save({ version: LOOP_STATE_VERSION, counters: { ...NO_COUNTERS }, held: null, holds: { 'enter sol-phoenix-hyperliquid': { until: T0 + 30 * 24 * HOUR, reason } } });
+  const loop = makeLoop(w, store);
+  const saved = JSON.parse(readFileSync(store.path, 'utf8')) as { holds: Record<string, { until: number; reason: string }> };
+  assert.deepEqual(saved.holds, { 'enter sol-phoenix-hyperliquid': { until: T0 + REFRESH_HOLD_MS, reason } });
+  w.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  await loop.check();
+  assert.equal(w.opens.length, 0, 'held');
+  loop.stop();
+  // Restarted 5 h later: still held to T0 + 6 h, not 6 h from the restart.
+  w.now = T0 + 5 * HOUR;
+  const restarted = makeLoop(w, store);
+  await restarted.check();
+  assert.equal(w.opens.length, 0);
+  restarted.stop();
+  w.now = T0 + REFRESH_HOLD_MS + 60_000;
+  const later = makeLoop(w, store);
+  await later.check();
+  assert.equal(w.opens.length, 1, 'tried again once the 6 h are over');
+  later.stop();
+});
+
+test('every refresh_prices an open sent counts toward the caps: its own and those before its parts', async () => {
+  const w = world();
+  const store = tmpStore();
+  store.save({ version: LOOP_STATE_VERSION, counters: { ...NO_COUNTERS }, held: null, refreshes: { day: '2026-11-03', bySymbol: { SOL: 10, ETH: 11 } } });
+  const loop = makeLoop(w, store);
+  w.openAnswer = () => ({ ...OK('opened both legs'), refreshed: true, refreshes: 3 });
+  w.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  await loop.check();
+  assert.deepEqual((JSON.parse(readFileSync(store.path, 'utf8')) as { refreshes: unknown }).refreshes, { day: '2026-11-03', bySymbol: { SOL: 13, ETH: 11 } });
+  // Both caps are passed in one open (10 -> 13 of 12, 21 -> 24 of 24): each journaled once.
+  const cap = journal(w).filter((j) => j.summary.startsWith('refresh_prices cap')).map((j) => j.summary);
+  assert.equal(cap.length, 2);
+  assert.match(cap[0]!, /sent 13 refresh_prices of SOL on 2026-11-03/);
+  assert.match(cap[1]!, new RegExp(`sent ${MAX_OPEN_REFRESHES_PER_DAY_ALL} refresh_prices on 2026-11-03 \\(UTC\\) over all symbols`));
+  loop.stop();
+});
+
 test('a veto drops the window: journaled, nothing opened, held out by counters.vetoedUntil (saved), shown on the window', async () => {
   const w = world();
   const reply = (content: string) => ({ content, raw: { choices: [{ message: { content } }] } });

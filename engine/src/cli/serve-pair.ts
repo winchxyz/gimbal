@@ -120,7 +120,7 @@ export interface CarryResult {
 export interface RefreshAllowance {
   /** Why no refresh_prices may be sent for it (the day's refreshes of the symbol are used); absent: one may. */
   noRefresh?: string;
-  /** Called when refresh_prices was sent for it (paid), before anything else of the open. */
+  /** Called for each refresh_prices sent for it (paid): its own, and any before the size check or a part. */
   onPaidRefresh?: () => void;
 }
 
@@ -220,6 +220,8 @@ export interface HandsResult {
   sent?: boolean;
   /** refresh_prices was sent for it (paid), whatever came of it. */
   refreshed?: boolean;
+  /** How many refresh_prices were sent for it (with `refreshed`); absent: one. */
+  refreshes?: number;
 }
 
 /** The strategy loop's hands on the desk's pair (strategy/loop.ts). */
@@ -953,7 +955,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         }).then((r) => (paid ? { ...r, refreshed: true } : r));
       },
       open: (request) => {
-        let paid = false;
+        let paid = 0;
         return exclusive(async () => {
           const sym = request.symbol;
           if (!common.includes(sym)) return result(false, `${sym} is not in both policy.hl_assets and policy.phoenix_markets (${common.join(', ') || 'none'})`);
@@ -990,7 +992,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
             ...(request.qty === undefined ? {} : { qty: request.qty }), ...(request.gate === undefined ? {} : { gate: request.gate }),
             ...(request.noRefresh === undefined ? {} : { noRefresh: request.noRefresh }),
             onPaidRefresh: () => {
-              paid = true;
+              paid++;
             },
           }, out);
           if (r.refusals.length > 0) return result(false, `open refused, nothing signed: ${r.refusals.join('; ')}`, { lines: said, open: opens });
@@ -1005,7 +1007,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           // Orders went out when a part sent any (a part the gate stopped before its first order sent none).
           const sent = r.results.some((x) => x.legs.some((l) => l.orders.length > 0)) || heldSymbol() !== null;
           return result(ok, reason, { results: r.results, lines: said, open: opens, sent, ...summarise(r.results) });
-        }).then((r) => (paid ? { ...r, refreshed: true } : r));
+        }).then((r) => (paid > 0 ? { ...r, refreshed: true, refreshes: paid } : r));
       },
       reconcile: async () => {
         const slot = current;
@@ -1168,7 +1170,7 @@ export function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string
       plan = fresh.plan;
       // The exact size decide() took is a maximum: held to the cap at the prices of the moment, before either leg.
       if (request.qty !== undefined) {
-        const held = await recheckOpenSize(ctx, pair, plan.size, SERVE_SLIPPAGE_BPS);
+        const held = await recheckOpenSize(ctx, pair, plan.size, SERVE_SLIPPAGE_BPS, request.onPaidRefresh);
         if ('refused' in held) return { refusals: [held.refused], results: [], refreshed: fresh.paid };
         out.say(held.line);
         plan = { ...plan, size: held.qty };
@@ -1177,7 +1179,8 @@ export function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string
       // refuses the open here, before the first order, and stops it before each later part (sendOpen's beforePart).
       const gated = request.gate?.() ?? null;
       if (gated !== null) return { refusals: [`${gated}: nothing sent`], results: [], refreshed: fresh.paid };
-      return { refusals: [], results: await sendOpen(ctx, pair, plan, request.reason, request.gate === undefined ? {} : { gate: request.gate }), refreshed: fresh.paid };
+      const options = { ...(request.gate === undefined ? {} : { gate: request.gate }), ...(request.onPaidRefresh === undefined ? {} : { onRefresh: request.onPaidRefresh }) };
+      return { refusals: [], results: await sendOpen(ctx, pair, plan, request.reason, options), refreshed: fresh.paid };
     },
     close: async (request, out) => {
       const ctx = await ctxFor(out);

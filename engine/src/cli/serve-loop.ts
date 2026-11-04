@@ -173,7 +173,7 @@ export function loopHands(
     for (const line of r.lines) log(`strategy loop: ${line}`);
     return {
       ok: r.ok, reason: r.reason, sent: r.sent ?? (r.results.length > 0 || r.tx.length > 0), tx: r.tx, feeUsd: r.feeUsd, open: r.open, fills: fillsOf(r.results),
-      ...(r.refreshed === true ? { refreshed: true } : {}),
+      ...(r.refreshed === true ? { refreshed: true, ...(r.refreshes === undefined ? {} : { refreshes: r.refreshes }) } : {}),
     };
   };
   return {

@@ -82,9 +82,10 @@ async function withVenues<T>(run: () => Promise<T>): Promise<T> {
 /**
  * The carry of an ETH pair as serve builds it, the contract storing no ETH price (or `row`). refresh_prices stores
  * `refreshedPx` (default 2500, the books' mid) at `refreshedAgeS` old (the oracle's 600 s recency plus its lag). `timeline` says, in order, when planning went on and
- * off, each refresh_prices (and whether it came while planning), the size check's line and each part sent.
+ * off, each refresh_prices (and whether it came while planning), the size check's line and each part sent. `agedBeforePartS`
+ * ages the price and the last refresh that long before the part's own check (beforePart), as a long earlier part would.
  */
-async function carryWorld(o: { closing?: boolean; refreshedAgeS?: number; refreshedPx?: number; row?: { ageS: number; px: number } } = {}) {
+async function carryWorld(o: { closing?: boolean; refreshedAgeS?: number; refreshedPx?: number; row?: { ageS: number; px: number }; agedBeforePartS?: number } = {}) {
   const rows: { asset: string; price_e8: string; at_ms: number }[] = [];
   if (o.row !== undefined) rows.push({ asset: 'ETH', price_e8: String(Math.round(o.row.px * 1e8)), at_ms: Date.now() - o.row.ageS * 1000 });
   const timeline: string[] = [];
@@ -119,6 +120,11 @@ async function carryWorld(o: { closing?: boolean; refreshedAgeS?: number; refres
   const pair = {
     openInChunks: async (r: { beforePart?: (part: number, parts: number) => Promise<void> }) => {
       await trader.openChunk(1);                         // as the trader does: the legs price the part, trading
+      if (o.agedBeforePartS !== undefined) {            // a long earlier part: the price and the last refresh grow old
+        for (const row of rows) row.at_ms -= o.agedBeforePartS * 1000;
+        const last = prices.lastRefreshAt.get('ETH');
+        if (last !== undefined) prices.lastRefreshAt.set('ETH', last - o.agedBeforePartS * 1000);
+      }
       await r.beforePart?.(0, 1);
       timeline.push('part 1 sent');
       return [];
@@ -167,6 +173,15 @@ test('serve\'s carry, no stored price: planning (read-only) -> one refresh_price
   assert.match(said, /stored ETH none \(planned on the books' mid 2500\.0000\); the open refreshes it once every check above passed/);
   assert.match(said, new RegExp(`stored ETH 2500, 610 s old \\(refreshed for this open\\): it lives 50 s past the first part's ${SERVE_MAKER.timeoutMs / 1000 + PRICE_MARGIN_S} s`));
   assert.match(said, /ioc sim   Phoenix BUY 0\.02 ETH .*: ok/);
+});
+
+test('serve\'s carry, a part whose price grew old: the refresh before it is counted for the caps (onPaidRefresh each time)', async () => {
+  const w = await carryWorld({ agedBeforePartS: 100 });
+  const r = await w.open();
+  assert.deepEqual(r.refusals, []);
+  assert.equal(r.refreshed, true);
+  assert.equal(w.paid(), 2, 'the open\'s own refresh and the one before the part');
+  assert.deepEqual(w.timeline, ['planning on', 'planning off', 'refresh ETH', 'size held to the cap', 'refresh ETH', 'part 1 sent']);
 });
 
 test('serve\'s carry on a closing desk (panic_close): refused in the plan, read-only, no refresh_prices', async () => {
