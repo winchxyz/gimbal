@@ -344,6 +344,8 @@ One line per point below; the full text, with each bound and why it is accepted,
   stays held until settled; without a usable state file, transfers wait about 65 min.
 - [No 1Click quotes out of HyperCore](docs/security.md#no-1click-quotes-out-of-hypercore): money leaves Hyperliquid
   through Arbitrum instead, at more cost and time, and every hop ends at a desk address.
+- [Oversized Phoenix answers](docs/security.md#oversized-phoenix-answers-zod--466): a huge malformed array from
+  Phoenix's API could stop the engine (zod 4.4.3 in the Phoenix SDK); no signing, funds or policy affected.
 
 ### Other bounded residuals
 
