@@ -1,12 +1,17 @@
 // The live ledgers the book reads (BookSources), over the venues' public read endpoints. Nothing here signs or sends:
 // Hyperliquid /info (userFunding through HyperliquidReader, userNonFundingLedgerUpdates, userFillsByTime) and Phoenix's
-// public API (funding history through PhoenixReader, trades-history).
+// public API (funding history through PhoenixReader, trades-history). Orderly only when the caller hands it the desk's
+// own reads (book/orderly.ts): its funding history is a signed read, and its fills come from the private session.
 
 import type { TxRef } from '@gimbal/shared';
 import { hyperliquidTxRef } from '../relayer/tx.ts';
 import { fillsOf, phoenixTraderApi } from '../trade/phoenix-leg.ts';
 import { HL_MAINNET_INFO_URL, HL_TESTNET_INFO_URL, HyperliquidReader } from '../venues/hyperliquid.ts';
+import type { OrderlyFundingFeeSource } from '../venues/orderly.ts';
+import { OrderlyReader } from '../venues/orderly.ts';
 import { PHOENIX_API_URL, PhoenixReader } from '../venues/phoenix.ts';
+import type { OrderlyFillLog } from './orderly.ts';
+import { orderlyBookFunding } from './orderly.ts';
 import type { BookSources, CloseFillQuery, FillFeeQuery } from './sync.ts';
 import type { BookFill } from './types.ts';
 import type { HlLedgerRow } from './types.ts';
@@ -21,6 +26,12 @@ export interface LiveSourceOptions {
   fetch?: typeof fetch;
   hlInfoUrl?: string;
   phoenixApiUrl?: string;
+  /**
+   * The desk's Orderly reads, when it trades Orderly pairs (serve with GIMBAL_ORDERLY_PAIRS=1): `fundingFees` is the
+   * desk client's signed funding_fee_history read (the book's address for 'orderly' is the account id), `fills` the
+   * log the private session's executionreports feed. Absent: no Orderly ledger, as before.
+   */
+  orderly?: { fundingFees?: OrderlyFundingFeeSource; fills?: OrderlyFillLog; apiUrl?: string; hearWaitMs?: number };
 }
 
 async function post<T>(f: typeof fetch, url: string, body: unknown): Promise<T> {
@@ -166,18 +177,29 @@ export function liveBookSources(o: LiveSourceOptions): BookSources {
   const phoenixUrl = o.phoenixApiUrl ?? PHOENIX_API_URL;
   const phoenix = o.network === 'mainnet' ? new PhoenixReader({ apiUrl: phoenixUrl, fetch: f }) : null;
   const phoenixApi = o.network === 'mainnet' ? phoenixTraderApi(phoenixUrl, f) : null;
+  const ox = o.orderly;
+  const orderlyFunding = ox?.fundingFees === undefined ? null
+    : orderlyBookFunding(new OrderlyReader({ network: o.network, fetch: f, fundingFees: ox.fundingFees, ...(ox.apiUrl === undefined ? {} : { apiUrl: ox.apiUrl }) }));
+  const orderlyFills = ox?.fills ?? null;
+  // An Orderly leg's fills without the session's log are unknown, never "none": a failed read the book holds and retries.
+  const orderlyLog = (): OrderlyFillLog => {
+    if (orderlyFills === null) throw new Error('orderly: no fill log (the private session is not open)');
+    return orderlyFills;
+  };
   return {
-    funding: { hyperliquid: hl, ...(phoenix === null ? {} : { phoenix }) },
+    funding: { hyperliquid: hl, ...(phoenix === null ? {} : { phoenix }), ...(orderlyFunding === null ? {} : { orderly: orderlyFunding }) },
     hlLedger: (user, startTime, endTime) => hlNonFundingLedger(f, infoUrl, user, startTime, endTime),
     fillFee: async (q) => {
       if (q.venue === 'hyperliquid') return hlFillFee(f, infoUrl, q);
       if (q.venue === 'phoenix' && phoenixApi !== null) return phoenixFillFee(phoenixApi, q);
+      if (q.venue === 'orderly') return orderlyLog().fillFee(q);
       return null;
     },
     hlTxRef: (hash: string): TxRef => hyperliquidTxRef(o.network, hash),
     closeFills: async (q) => {
       if (q.venue === 'hyperliquid') return hlCloseFills(f, infoUrl, q);
       if (q.venue === 'phoenix' && phoenixApi !== null) return phoenixCloseFills(phoenixApi, q);
+      if (q.venue === 'orderly') return orderlyLog().readCloseFills(q, ox?.hearWaitMs);
       return null;
     },
   };

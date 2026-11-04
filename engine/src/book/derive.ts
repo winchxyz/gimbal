@@ -37,6 +37,17 @@ export const ENTRY_SLACK_MS = 10 * 60_000;
 /** A closed position's numbers are final once each leg's ledger is read this long past the exit. */
 export const SETTLE_MS = 2 * HOUR_MS;
 
+/**
+ * Venues that pay once per funding period, not every hour (Orderly: 8 h, 4 h on some symbols). Their row is one exact
+ * payment standing for `samples` hours: never an estimate, and an hour without one is not a missing payment.
+ */
+export const PERIODIC_FUNDING_VENUES: ReadonlySet<string> = new Set(['orderly']);
+
+/** A row whose amount stands for hours the venue aggregated (Hyperliquid's daily rows): an estimate per hour. */
+export function isEstimate(f: { venue: string; samples: number | null }): boolean {
+  return f.samples !== null && !PERIODIC_FUNDING_VENUES.has(f.venue);
+}
+
 export interface Position {
   id: string;
   windowId: string;
@@ -70,6 +81,55 @@ export interface LegResult {
   estimatedHours: number;
   /** Funding times (top of the hour) inside the hold, up to the last read of this venue's ledger. */
   hours: number;
+  /**
+   * A venue paying once per funding period only (PERIODIC_FUNDING_VENUES): its latest period (from its payments, else
+   * the default), the funding times inside the hold up to the last read (each interval on its own period), and
+   * whether its ledger was read.
+   */
+  periodic?: { periodHours: number; due: number; read: boolean };
+}
+
+/** The period assumed for a periodic venue's leg before any payment says otherwise (Orderly's usual 8 h). */
+export const DEFAULT_FUNDING_PERIOD_HOURS = 8;
+
+type PeriodRow = { time: number; samples: number | null; adjusts?: string };
+
+/** A periodic venue's payments that state a period, oldest first. */
+function periodRows(rows: readonly PeriodRow[]): PeriodRow[] {
+  return rows.filter((r) => r.adjusts === undefined && r.samples !== null && r.samples > 0).sort((a, b) => a.time - b.time);
+}
+
+/**
+ * The period in force at `t`: that of the first payment at or after it (the payment that ends its interval), else
+ * that of the last one before it, else the default.
+ */
+export function fundingPeriodAt(rows: readonly PeriodRow[], t: number): number {
+  const pays = periodRows(rows);
+  return (pays.find((r) => r.time >= t) ?? pays.at(-1))?.samples ?? DEFAULT_FUNDING_PERIOD_HOURS;
+}
+
+/** The funding times in (from, to], each payment interval counted on its own payment's period. */
+export function periodicOf(rows: readonly FundingEvent[], from: number, to: number, read: boolean): { periodHours: number; due: number; read: boolean } {
+  const pays = periodRows(rows);
+  let due = 0;
+  let at = from;
+  for (const r of pays) {
+    if (r.time <= at) continue;
+    const end = Math.min(r.time, to);
+    due += periodTimesIn(at, end, r.samples!);
+    at = end;
+    if (at >= to) break;
+  }
+  const last = pays.at(-1)?.samples ?? DEFAULT_FUNDING_PERIOD_HOURS;
+  if (at < to) due += periodTimesIn(at, to, last);
+  return { periodHours: last, due, read };
+}
+
+/** Funding times on a UTC grid of `periodHours` in (from, to]. */
+export function periodTimesIn(from: number, to: number, periodHours: number): number {
+  const p = periodHours * HOUR_MS;
+  if (!(to > from)) return 0;
+  return Math.floor(to / p) - Math.floor(from / p);
 }
 
 export interface PositionResult {
@@ -440,7 +500,9 @@ export function positionResult(p: Position, ix: BookIndex, now: number): Positio
       exitFeeUsd: later.length === 0 || exits.some((x) => x.unknown > 0) ? null : sum(exits.map((x) => x.usd)),
       fundingUsd: sum(mine.map((f) => f.usd)), payments: mine.filter((f) => f.adjusts === undefined).length,
       paidHours: hourly.size + aggregated, hours: hoursIn(start, readTo(leg.venue)),
-      estimatedUsd: sum(mine.filter((f) => f.samples !== null).map((f) => f.usd)), estimatedHours: aggregated,
+      estimatedUsd: sum(mine.filter(isEstimate).map((f) => f.usd)),
+      estimatedHours: sum(mine.filter((f) => isEstimate(f) && f.adjusts === undefined).map((f) => f.samples!)),
+      ...(PERIODIC_FUNDING_VENUES.has(leg.venue) ? { periodic: periodicOf(mine, start, readTo(leg.venue), ix.cursors[leg.venue] !== undefined) } : {}),
     };
   });
 

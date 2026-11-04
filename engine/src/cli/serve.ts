@@ -57,7 +57,10 @@
 // journal and the console when a leg is under 25 % from liquidation. `npm run monitor -w engine -- --mainnet` is the
 // one-shot form.
 // The risk engine (src/risk/) reads the desk every 5 s: with the contract, the desk's Hyperliquid and Phoenix accounts;
-// in replay, a scripted desk priced by the recording. It publishes `desk`, `health`, `journal` and `rescue`, and answers
+// in replay, a scripted desk priced by the recording. GIMBAL_ORDERLY_PAIRS=1 (default off; src/cli/serve-orderly.ts) adds
+// the desk's Orderly account over its private stream: one orderly_ws_auth signature through the operator key per
+// session, kept open and reopened at a bounded pace; while the session is down the Orderly account is unknown (never
+// flat). The loop's free margin reads it too. It opens no Orderly window and Orderly stays a non-rescue venue. It publishes `desk`, `health`, `journal` and `rescue`, and answers
 // POST /stress (testnet and replay; refused on mainnet). `health` is published in every mode: the venues the last
 // scan or account read missed, 1Click (probed every minute in the live modes) and NEAR.
 // The read-only view (src/view/, opt in): with GIMBAL_VIEW_TOKEN (32+ characters) and GIMBAL_VIEW_PORT or PORT set, a
@@ -91,7 +94,7 @@ import type { RecordLine } from '../venues/recorder.ts';
 import { JsonlGzWriter, RecordingVenue, RecordingWatch, errorMessage } from '../venues/recorder.ts';
 import { ScaledClock, readRecording } from '../venues/replay.ts';
 import { watchReaders } from '../venues/watch/index.ts';
-import type { AccountState, Clock } from '../venues/venue.ts';
+import type { Clock } from '../venues/venue.ts';
 import { RiskEngine } from '../risk/engine.ts';
 import type { DeskSource } from '../risk/engine.ts';
 import { AccountsDeskSource, ReplayDesk } from '../risk/sources.ts';
@@ -104,6 +107,10 @@ import type { ServePair } from './serve-pair.ts';
 import { liveLines, pairRefreshesAtOpen, servePair } from './serve-pair.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { connectContract, contractEnv, marginVenues } from './serve-contract.ts';
+import type { ServeOrderly } from './serve-orderly.ts';
+import { ORDERLY_PAIRS_ENV, orderlyPairsOn, riskOrderlyNote, serveOrderly } from './serve-orderly.ts';
+import { startEgressLog } from './serve-egress.ts';
+import type { LoopAccount } from './serve-loop.ts';
 import { loopBook, loopGates, serveLoop } from './serve-loop.ts';
 import { ConfigError, retryStart } from './start-errors.ts';
 import type { PositionBook } from '../book/book.ts';
@@ -329,7 +336,22 @@ let rescueRunning: (() => string | null) | null = null;
 /** Whether the live rescuer runs now: it may start late, after a failed start read (rescue-retry.ts). */
 let rescueLive: () => boolean = () => false;
 // The desk's venue accounts, for the strategy loop's free margin.
-const loopAccounts: { venue: string; read: () => Promise<AccountState> }[] = [];
+const loopAccounts: LoopAccount[] = [];
+// GIMBAL_ORDERLY_PAIRS=1 (cli/serve-orderly.ts): the desk's Orderly private session, read by the risk engine and the
+// loop's free margin; also what a later Orderly leg is built from. Off (the default): null, nothing opened or signed.
+// Built (and its configuration checked) here; its first session opens, and signs, only once the server listens.
+let orderly: ServeOrderly | null = null;
+if (orderlyPairsOn(envVar)) {
+  if (contract === null || deskId === null) log(`${ORDERLY_PAIRS_ENV}=1: ignored, ${mode === 'replay' ? 'replay has no contract desk' : 'no contract desk is set (GIMBAL_CONTRACT_ID, DESK_ID)'}`);
+  else if (values.once === true) log(`${ORDERLY_PAIRS_ENV}=1: the Orderly private session is not opened with --once (it signs orderly_ws_auth); Orderly legs are not read`);
+  else {
+    try {
+      orderly = serveOrderly({ mode, env: envVar, deskId, desk: contract.desk, log, clock });
+    } catch (err) {
+      fail(`orderly: ${errorMessage(err)}`);
+    }
+  }
+}
 if (mode === 'replay') {
   deskSource = replayDesk = new ReplayDesk({
     venues: readers.venues, clock, strategy: () => server?.strategy ?? DEFAULT_STRATEGY,
@@ -348,6 +370,12 @@ if (mode === 'replay') {
   // The strategy loop's free margin takes the risk engine's last read when it is a scan old at most: on Phoenix
   // (about 1 request a second for everything) a second account read every scan would spend a third of it.
   for (const a of accounts) loopAccounts.push({ venue: a.reader.id, read: () => accountWithin(a.reader, a.address, LOOP_ACCOUNT_MAX_AGE_MS) });
+  // Orderly: its own reader over the kept session (the scanner's Orderly reader has no private side); the loop's read
+  // of it has a deadline and logs once per error kind.
+  if (orderly !== null) {
+    accounts.push(orderly.riskAccount);
+    loopAccounts.push(orderly.loopAccount);
+  }
   // get_desk says only whether the desk is paused, not who paused it or when (that is in its `paused` event): `at` is
   // when this engine first saw it paused, `by` is unknown.
   let pausedSince: number | null = null;
@@ -361,7 +389,7 @@ if (mode === 'replay') {
       return { reserveUsd: Number(view.ledger.idle_usdc) / 1e6, paused: pausedSince === null ? null : { by: 'unknown', at: pausedSince } };
     },
   });
-  log(`risk: reading the desk's ${accounts.map((a) => a.reader.id).join(' and ')} accounts every 5 s (Orderly legs need its private stream, which serve does not open)`);
+  log(`risk: reading the desk's ${accounts.map((a) => a.reader.id).join(' and ')} accounts every 5 s ${riskOrderlyNote(orderly)}`);
 }
 let pair: ServePair | null = null;
 // A protection's close (panic_close, a rescue's reduce, an ADL unwind) goes to the position book once it exists.
@@ -575,6 +603,10 @@ server = new EngineServer({
 
 const listening = await server.start(port, host);
 risk?.start();
+// The Orderly session's first ws_auth, once every start step before it went through (GIMBAL_ORDERLY_PAIRS=1 only).
+orderly?.start();
+// GIMBAL_LOG_EGRESS=1 only: the public IPv4 addresses serve's traffic leaves from, now and hourly (never fatal).
+const egress = startEgressLog({ env: envVar, log });
 publishHealth();
 for (const event of earlyJournal.splice(0)) server.publish(event);
 for (const note of startNotes.splice(0)) startJournal(note.kind, note.summary);
@@ -628,6 +660,7 @@ async function shutdown(reason: string): Promise<void> {
   log(`stopping: ${reason}`);
   clearInterval(intentsTimer);
   clearInterval(monitorTimer);
+  egress?.stop();
   // The loop starts nothing new; an open or close it runs is waited for with the rest, under the same deadline.
   strategyLoop.stop();
   attestor.stop();
@@ -660,6 +693,7 @@ async function shutdown(reason: string): Promise<void> {
   if (!drained && stillRescuing !== null) log(`stopping: rescue ${stillRescuing} is still running after ${SHUTDOWN_WAIT_MS / 1000} s; exiting anyway: a payment it signed was saved as held before signing, and the next start reads it at 1Click and on chain`);
   if (!drained && (stillRescuing === null || pair?.pair?.closing === true)) log(`stopping: a close is still running after ${SHUTDOWN_WAIT_MS / 1000} s; exiting anyway: its orders are saved as in flight (the next start only alerts on ADL until a close result); check both legs by hand`);
   pair?.stop();
+  orderly?.stop();
   await view?.stop();
   await server!.stop();
   contract?.prices.stop();

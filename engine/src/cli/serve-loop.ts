@@ -49,7 +49,7 @@ export interface ServeLoopInput {
   pair: ServePair | null;
   lastDesk: () => DeskState | null;
   /** The desk's venue accounts, for free margin (none in replay without a contract). */
-  accounts: { venue: string; read: () => Promise<AccountState> }[];
+  accounts: LoopAccount[];
   /**
    * A live rescuer runs (mainnet with GIMBAL_RESCUE=1): the venues LIVE_RESCUE names have a route. A function in serve:
    * the live rescuer may start late, after a failed start read (rescue-retry.ts).
@@ -86,6 +86,40 @@ export interface ServeLoopInput {
   decide?: (input: DecideInput) => Decision;
 }
 
+/**
+ * A desk venue account the loop reads free margin from. `logOnce`: a failed read is logged once per kind of error
+ * (digits ignored) until the venue reads again, not at every decision (serve's Orderly account, which stays unknown
+ * while its private session is down); without it every failure is logged.
+ */
+export interface LoopAccount {
+  venue: string;
+  read: () => Promise<AccountState>;
+  logOnce?: boolean;
+}
+
+/** decide()'s free margin per venue: a venue whose read fails is left out (and logged, see LoopAccount). */
+export function freeMarginReader(accounts: readonly LoopAccount[], log: (line: string) => void): () => Promise<Record<string, number>> {
+  const lastFailure = new Map<string, string>();
+  return async () => {
+    const out: Record<string, number> = {};
+    await Promise.all(accounts.map(async (a) => {
+      try {
+        out[a.venue] = (await a.read()).freeMarginUsd;
+        lastFailure.delete(a.venue);
+      } catch (err) {
+        const message = errorMessage(err);
+        if (a.logOnce === true) {
+          const kind = message.replace(/\d+/g, '#');
+          if (lastFailure.get(a.venue) === kind) return;
+          lastFailure.set(a.venue, kind);
+        }
+        log(`strategy loop: ${a.venue} free margin not read (${message})`);
+      }
+    }));
+    return out;
+  };
+}
+
 export function serveLoop(input: ServeLoopInput): StrategyLoop {
   const trade = input.env('GIMBAL_TRADE') === '1' && !input.once;
   // A pair whose start is not confirmed (review S1): its legs are unknown, so the loop decides nothing (a held
@@ -106,17 +140,7 @@ export function serveLoop(input: ServeLoopInput): StrategyLoop {
   return new StrategyLoop({
     trade, hands, ...(handsWhy === undefined ? {} : { handsWhy }),
     strategy: input.strategy, policy: input.policy, windows: input.windows,
-    freeMargin: async () => {
-      const out: Record<string, number> = {};
-      await Promise.all(input.accounts.map(async (a) => {
-        try {
-          out[a.venue] = (await a.read()).freeMarginUsd;
-        } catch (err) {
-          input.log(`strategy loop: ${a.venue} free margin not read (${errorMessage(err)})`);
-        }
-      }));
-      return out;
-    },
+    freeMargin: freeMarginReader(input.accounts, input.log),
     liveRescue: () => Object.fromEntries(LOOP_VENUES.map((v) => [v, (typeof input.rescueLive === 'function' ? input.rescueLive() : input.rescueLive) && LIVE_RESCUE[v] === true])),
     ...(facts === undefined ? {} : { facts }),
     busy, store, publish: input.publish, clock: input.clock, log: input.log,

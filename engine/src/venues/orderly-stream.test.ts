@@ -197,6 +197,7 @@ test('state() waits for both first pushes; positions replace, balances merge, re
     positionsReceivedAt: NOW + 50,
     balancesFrom: 'push',
     confirmedAt: NOW + 70,          // the local time of the server's last frame
+    holdingRead: false,             // no holding read answered: a missing USDC row stays unknown
   });
   sock.push(positionPush([{ ...SOL_ROW, symbol: 'PERP_ETH_USDC', positionQty: -1 }], NOW + 9));
   sock.push({ topic: 'balance', ts: NOW + 10, data: { balances: { USDT: { holding: '7', frozen: 0 } } } });

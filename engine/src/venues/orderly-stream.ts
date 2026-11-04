@@ -63,6 +63,23 @@ export interface OrderlyAccountSnapshot {
   balancesFrom: 'push' | 'read';
   confirmedAt: number;           // local ms of the server's last frame on this live session, pings included: the
                                  // cache is current up to here (pushes arrive in order, so nothing earlier is missing)
+  /**
+   * This session's holding read answered with a usable list. Orderly's GET /v1/client/holding leaves out tokens with
+   * an empty balance unless asked with all=true (its docs), so a token missing after such a read holds 0 until a
+   * balance push names it. Absent or false: a missing token is unknown.
+   */
+  holdingRead?: boolean;
+}
+
+/**
+ * Whether state() would answer now, without waiting or signing: `why` is null when it would, else why not (the
+ * account is unknown). `positionsWhy` is the same for positionsState(). `seedFailed`: a seed read of a topic still
+ * unknown failed, so reseed() can make it known; false when the topic is known but unusable (only a push changes it).
+ */
+export interface OrderlyStreamReadiness {
+  why: string | null;
+  positionsWhy: string | null;
+  seedFailed: boolean;
 }
 
 /** The positions half of a snapshot: what a leg's reconcile needs, known even while the holding is not. */
@@ -95,6 +112,15 @@ export interface OrderlyAccountStreamOptions {
   onExecutionReport?: (report: Record<string, unknown>) => void;
   /** Every new position list, pushed or read: what the engine's reconcile watches between its own reads. */
   onPositions?: (positions: OrderlyStreamPosition[], from: 'push' | 'read') => void;
+  /**
+   * The session is up: logged in and every topic's subscription acknowledged. Once per session; anything pushed
+   * before it (or between an onDown and the next onUp) may have been missed.
+   */
+  onUp?: (at: number) => void;
+  /** Every frame the server sends on a session that is up (pushes, pings, pongs, acks): a liveness tick. */
+  onFrame?: (at: number) => void;
+  /** A session that was up ended (dropped, silent, refused, or close()); once per session, always after its onUp. */
+  onDown?: (at: number, why: Error) => void;
 }
 
 interface Deferred {
@@ -146,6 +172,8 @@ interface Session {
   seeding: Promise<void>;
   /** Why a seed read failed, per topic still unknown. */
   seedErrors: { positions?: Error; holding?: Error };
+  /** onUp was sent for this session (logged in, every subscription acknowledged); onDown follows it once. */
+  up: boolean;
 }
 
 /** The topics the seed reads wait for: once both are on, a change after the read is pushed. */
@@ -165,6 +193,9 @@ export class OrderlyAccountStream {
   readonly #silenceMs: number;
   readonly #onExecutionReport: OrderlyAccountStreamOptions['onExecutionReport'];
   readonly #onPositions: OrderlyAccountStreamOptions['onPositions'];
+  readonly #onUp: OrderlyAccountStreamOptions['onUp'];
+  readonly #onFrame: OrderlyAccountStreamOptions['onFrame'];
+  readonly #onDown: OrderlyAccountStreamOptions['onDown'];
   #session: Session | null = null;
   #positions: OrderlyStreamPosition[] = [];
   #positionsError: Error | null = null;
@@ -175,6 +206,7 @@ export class OrderlyAccountStream {
   #positionsFrom: 'push' | 'read' | null = null;
   #positionsReceivedAt: number | null = null;
   #balancesFrom: 'push' | 'read' | null = null;
+  #holdingRead = false;
   #signatures = 0;
 
   constructor(options: OrderlyAccountStreamOptions) {
@@ -192,6 +224,9 @@ export class OrderlyAccountStream {
     this.#silenceMs = options.silenceMs ?? 30_000;
     this.#onExecutionReport = options.onExecutionReport;
     this.#onPositions = options.onPositions;
+    this.#onUp = options.onUp;
+    this.#onFrame = options.onFrame;
+    this.#onDown = options.onDown;
   }
 
   /** How many ws auth signatures this stream has asked for: one per session (the seed reads are counted by the signer). */
@@ -202,6 +237,19 @@ export class OrderlyAccountStream {
   /** Why the current session ended, null while it lives (or before the first start): a caller decides to start again. */
   get down(): Error | null {
     return this.#session?.dead ?? null;
+  }
+
+  /** Whether state() and positionsState() would answer now (see OrderlyStreamReadiness); never starts a session. */
+  get readiness(): OrderlyStreamReadiness {
+    const s = this.#session;
+    if (s === null) return { why: 'orderly private stream: not started', positionsWhy: 'orderly private stream: not started', seedFailed: false };
+    if (s.dead !== null) return { why: s.dead.message, positionsWhy: s.dead.message, seedFailed: false };
+    const positionsWhy = this.#positionsAt === null
+      ? s.seedErrors.positions?.message ?? 'orderly private stream: positions not known yet'
+      : this.#positionsError?.message ?? null;
+    const holdingWhy = this.#balancesAt === null ? s.seedErrors.holding?.message ?? 'orderly private stream: holding not known yet' : null;
+    const seedFailed = (this.#positionsAt === null && s.seedErrors.positions !== undefined) || (this.#balancesAt === null && s.seedErrors.holding !== undefined);
+    return { why: positionsWhy ?? holdingWhy, positionsWhy, seedFailed };
   }
 
   /**
@@ -215,6 +263,7 @@ export class OrderlyAccountStream {
     const session: Session = {
       ws: null, ready: Promise.resolve(), dead: null, failStart: null, watchdog: null, lastFrameAt: null,
       acked: new Set(), onAck: null, known: deferred(), positionsKnown: deferred(), seeding: Promise.resolve(), seedErrors: {},
+      up: false,
     };
     this.#session = session;
     this.#positions = [];
@@ -226,6 +275,7 @@ export class OrderlyAccountStream {
     this.#positionsFrom = null;
     this.#positionsReceivedAt = null;
     this.#balancesFrom = null;
+    this.#holdingRead = false;
     session.ready = this.#open(session);
     session.ready.catch((err: unknown) => this.#kill(session, err instanceof Error ? err : new Error(String(err))));
     session.seeding = session.ready.then(() => this.#seed(session)).catch((err: unknown) => {
@@ -275,6 +325,7 @@ export class OrderlyAccountStream {
       positionsReceivedAt: this.#positionsReceivedAt!,
       balancesFrom: this.#balancesFrom!,
       confirmedAt: current.lastFrameAt!,
+      holdingRead: this.#holdingRead,
     };
   }
 
@@ -345,6 +396,7 @@ export class OrderlyAccountStream {
         if (session.dead !== null) return;
         session.lastFrameAt = this.#clock.now();
         if (authed) this.#watch(session);
+        if (session.up) this.#onFrame?.(session.lastFrameAt);
         let msg: Record<string, unknown>;
         try {
           const parsed: unknown = JSON.parse(String(ev.data));
@@ -378,6 +430,10 @@ export class OrderlyAccountStream {
           if (topic !== null) {
             session.acked.add(topic);
             session.onAck?.();
+            if (!session.up && session.dead === null && ORDERLY_PRIVATE_TOPICS.every((t) => session.acked.has(t))) {
+              session.up = true;
+              this.#onUp?.(this.#clock.now());
+            }
           }
           return;
         }
@@ -410,12 +466,16 @@ export class OrderlyAccountStream {
     }
     if (this.#balancesFrom === null) {
       if (holding.status === 'rejected') session.seedErrors.holding = new Error(`orderly private stream: the holding read that seeds the session failed: ${errorText(holding.reason)}`);
-      else this.#setBalances(() => parseRestHolding(holding.value), at, 'read');
+      else {
+        this.#setBalances(() => parseRestHolding(holding.value), at, 'read');
+        this.#holdingRead = this.#invalidBalances['*'] === undefined;
+      }
     } else if (holding.status === 'fulfilled') {
       // A balance push may carry one token only: the read fills in the tokens no push has named yet.
       let rows: [string, unknown][] = [];
       try {
         rows = parseRestHolding(holding.value);
+        this.#holdingRead = true;
       } catch {
         // The pushes already make the balances known; an unusable read adds nothing to them.
       }
@@ -542,6 +602,8 @@ export class OrderlyAccountStream {
     if (!session.positionsKnown.settled) session.positionsKnown.reject(err);
     session.onAck?.();
     if (session.ws !== null && session.ws.readyState <= 1) session.ws.close(1000);
+    // Last, so a listener that throws cannot leave the session half ended.
+    if (session.up) this.#onDown?.(this.#clock.now(), err);
   }
 }
 
