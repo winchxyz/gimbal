@@ -178,12 +178,15 @@ other symbol without a fresh oracle price is refused (`E_ORACLE_STALE` / `E_ASSE
 while serve can open (mainnet, `GIMBAL_TRADE=1`, the start confirmed, live, not stopping: `PairHands.canOpen`): a
 Hyperliquid or Phoenix leg whose symbol the contract prices (`ORACLE_ASSETS`) and whose stored price is missing or
 older than `oracle_max_age_s` is then not refused but carries `Window.note` ("stored ETH price stale: refreshed at
-open"). The open plans read-only on the price as it is (a missing one on the books' mid), judges every other refusal
-first, and only then sends one `refresh_prices` (`pair-ops.ts` `planOpen`, `refreshForOpen`), holding the size to the
-cap at the new price before either leg; the refreshed price must live the first part's margin plus 15 s, so no second
-refresh is needed before it. The strategy loop holds a window 6 h after an open refused once it paid for a refresh,
-sends at most 12 such refreshes per symbol per UTC day (saved with its state under `GIMBAL_STATE_DIR`), and refreshes
-a rotate's target before it closes the held pair. A price dated ahead of the engine's clock, a symbol outside
+open"). The open plans read-only on the price as it is (on the books' mid when none is stored, or when the stored
+one is over the band from the books), judges every other refusal first, and only then sends one `refresh_prices`
+(`pair-ops.ts` `planOpen`, `refreshForOpen`), holding the size to the cap at the new price before either leg; the
+refreshed price must live the first part's margin plus 15 s, so no second refresh is needed before it. When the
+refreshed price is over the band from the one the plan was judged on, the read-only plan runs again on it (parts,
+SOL, the Hyperliquid minimum, the IOC); a refusal then is a paid one. The strategy loop holds a window 6 h after an
+open refused once it paid for a refresh (the hold is saved, so a restart keeps it), sends at most 12 such refreshes
+per symbol and 24 over all symbols per UTC day (saved with its state under `GIMBAL_STATE_DIR`), and refreshes a
+rotate's target before it closes the held pair. A price dated ahead of the engine's clock, a symbol outside
 `ORACLE_ASSETS`, an Orderly leg and every other refusal stay refused.
 
 ### 1.3 Who may call what

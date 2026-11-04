@@ -8,7 +8,7 @@ import { DEFAULT_STRATEGY } from '../scanner/config.ts';
 import type { DecideInput, Decision } from './decide.ts';
 import { LOOP_RULES, NO_COUNTERS } from './decide.ts';
 import type { ActOutcome, BookFill, BookRecord, HandsHeld, LoopHands, StrategyLoopOptions } from './loop.ts';
-import { HOUR_GRACE_MS, LOOP_STATE_VERSION, LoopStore, MAX_OPEN_REFRESHES_PER_DAY, REFRESH_HOLD_MS, RETRY_AFTER_MS, StrategyLoop, loopStateFile, notEnterable } from './loop.ts';
+import { HOUR_GRACE_MS, LOOP_STATE_VERSION, LoopStore, MAX_OPEN_REFRESHES_PER_DAY, MAX_OPEN_REFRESHES_PER_DAY_ALL, REFRESH_HOLD_MS, RETRY_AFTER_MS, StrategyLoop, loopStateFile, notEnterable } from './loop.ts';
 import type { VetoSource } from './veto.ts';
 
 const dirs: string[] = [];
@@ -337,6 +337,62 @@ test('a rotate refreshes the target price before it closes the held pair; a refr
   assert.deepEqual(v.prepares, ['ETH closes=0']);
   assert.deepEqual([v.closes.length, v.opens.map((o) => o.symbol)], [1, ['ETH']]);
   assert.equal(ok.held?.windowId, 'eth-phoenix-hyperliquid');
+});
+
+test('the opens send at most 24 refresh_prices a UTC day over all symbols: saved with the per-symbol counts, journaled when hit', async () => {
+  const w = world();
+  const store = tmpStore();
+  store.save({ version: LOOP_STATE_VERSION, counters: { ...NO_COUNTERS }, held: null, refreshes: { day: '2026-11-03', bySymbol: { SOL: 5, ETH: 11, BTC: 7 } } });
+  const loop = makeLoop(w, store);
+  w.openAnswer = () => ({ ...OK('opened both legs'), refreshed: true });
+  w.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  await loop.check();
+  assert.equal(w.opens[0]!.noRefresh, undefined, 'the 24th may still be sent');
+  const cap = journal(w).filter((j) => j.summary.startsWith('refresh_prices cap'));
+  assert.deepEqual(cap.map((j) => j.summary), [`refresh_prices cap: the strategy loop's opens sent ${MAX_OPEN_REFRESHES_PER_DAY_ALL} refresh_prices on 2026-11-03 (UTC) over all symbols, the most a day; no open that needs one is sent before 00:00 UTC`]);
+  assert.deepEqual((JSON.parse(readFileSync(store.path, 'utf8')) as { refreshes: unknown }).refreshes, { day: '2026-11-03', bySymbol: { SOL: 6, ETH: 11, BTC: 7 } });
+  // ETH (11 of its 12) after a restart: refused by the day's total, not its own count.
+  w.next = { decision: { action: 'exit', reason: 'below the bar' }, act: { kind: 'exit', reason: 'below the bar' } };
+  w.now += 60_000;
+  await loop.check();
+  loop.stop();
+  const again = makeLoop(w, store);
+  w.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'eth-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  w.now += 60_000;
+  await again.check();
+  assert.equal(w.opens[1]!.symbol, 'ETH');
+  assert.equal(w.opens[1]!.noRefresh, 'the strategy loop\'s 24 refresh_prices for 2026-11-03 (UTC), all symbols, are used; the next may go after 00:00 UTC');
+  again.stop();
+});
+
+test('the 6 h hold after a paid refusal is saved: a restart keeps it until it ends, then the act is tried again', async () => {
+  const w = world();
+  const store = tmpStore();
+  const loop = makeLoop(w, store);
+  w.openAnswer = () => ({ ...REFUSED('open refused, nothing signed: the price moved'), refreshed: true });
+  w.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  await loop.check();
+  assert.equal(w.opens.length, 1);
+  const saved = JSON.parse(readFileSync(store.path, 'utf8')) as { holds: Record<string, { until: number; reason: string }> };
+  assert.deepEqual(Object.keys(saved.holds).sort(), ['enter sol-phoenix-hyperliquid', 'rotate sol-phoenix-hyperliquid']);
+  assert.equal(saved.holds['enter sol-phoenix-hyperliquid']!.until, T0 + REFRESH_HOLD_MS);
+  assert.match(saved.holds['enter sol-phoenix-hyperliquid']!.reason, /^enter sol-phoenix-hyperliquid held until /);
+  loop.stop();
+  // Restarted 1 h later: still held, nothing opened, nothing journaled again.
+  w.now += HOUR;
+  const restarted = makeLoop(w, store);
+  const said = journal(w).length;
+  await restarted.check();
+  assert.equal(w.opens.length, 1);
+  assert.equal(journal(w).slice(said).some((j) => j.kind === 'refused'), false);
+  restarted.stop();
+  // Restarted after the hold ended: tried again.
+  w.now = T0 + REFRESH_HOLD_MS + 60_000;
+  w.openAnswer = () => OK('opened both legs');
+  const later = makeLoop(w, store);
+  await later.check();
+  assert.equal(w.opens.length, 2);
+  later.stop();
 });
 
 test('a veto drops the window: journaled, nothing opened, held out by counters.vetoedUntil (saved), shown on the window', async () => {

@@ -1161,10 +1161,11 @@ export function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string
         refusals.push(`the stored ${p.symbol} price is ${plan.refresh.was} and needs refresh_prices: ${request.noRefresh}; nothing sent`);
       }
       if (refusals.length > 0) return { refusals, results: [] };
-      const fresh = await refreshForOpen(ctx, { ...plan, refusals });
+      const fresh = await refreshForOpen(ctx, pair, { ...plan, refusals }, { planning: (on) => p.planning(on) });
       if (fresh.paid) request.onPaidRefresh?.();
       if (fresh.line !== null) out.say(fresh.line);
       if (fresh.refused !== null) return { refusals: [fresh.refused], results: [], refreshed: fresh.paid };
+      plan = fresh.plan;
       // The exact size decide() took is a maximum: held to the cap at the prices of the moment, before either leg.
       if (request.qty !== undefined) {
         const held = await recheckOpenSize(ctx, pair, plan.size, SERVE_SLIPPAGE_BPS);

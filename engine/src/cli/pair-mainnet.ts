@@ -399,10 +399,10 @@ async function open(ctx: Ctx): Promise<void> {
   }
   if (refusals.length > 0) throw new Error(`open --send refused, nothing signed: ${refusals.join('; ')}`);
   // The stored price the plan found missing or too old: refreshed once, only now that nothing refused.
-  const fresh = await refreshForOpen(ctx, plan);
+  const fresh = await refreshForOpen(ctx, pair, plan);
   if (fresh.line !== null) say(fresh.line);
   if (fresh.refused !== null) throw new Error(`open --send refused, nothing signed: ${fresh.refused}`);
-  await sendOpen(ctx, pair, plan);
+  await sendOpen(ctx, pair, fresh.plan);
 }
 
 async function close(ctx: Ctx): Promise<void> {

@@ -136,8 +136,9 @@ export interface PriceDeps {
   /** When each symbol's last refresh that landed ended (ms). */
   lastRefreshAt: Map<string, number>;
   /**
-   * While planning only: the price an open plans with where the contract stores none (planOpen sets the books' mid,
-   * and clears it), so every other refusal is judged before any refresh_prices is paid for. Never used once trading.
+   * While planning only: the price an open plans with where the contract stores none, or a stale one over the band
+   * from the books (planOpen sets the books' mid, and clears it), so every other refusal is judged before any
+   * refresh_prices is paid for. Never used once trading.
    */
   estimate?: Map<string, number>;
 }
@@ -191,16 +192,17 @@ export async function ensureFresh(d: PriceDeps, symbol: string, marginS: number)
 
 /**
  * The legs' price read: the stored price as it is while planning (a dry run, or --send before its refusals are
- * checked; with none stored, planOpen's estimate); once `trading()`, one about to go stale is refreshed first, so an
+ * checked; planOpen's estimate where it set one); once `trading()`, one about to go stale is refreshed first, so an
  * unwind or a close is never refused for a stale price.
  */
 export function oraclePxOf(d: PriceDeps, symbol: string, trading: () => boolean): () => Promise<number> {
   return async () => {
     if (trading()) return (await ensureFresh(d, symbol, PRICE_STALE_MARGIN_S)).px;
-    const sp = await d.read(symbol);
-    if (sp !== null) return sp.px;
+    // planOpen's estimate first: it is set only where the stored price is missing or too far off to judge on.
     const estimate = d.estimate?.get(symbol);
     if (estimate !== undefined) return estimate;
+    const sp = await d.read(symbol);
+    if (sp !== null) return sp.px;
     throw new Error(`the contract has no stored ${symbol} price`);
   };
 }

@@ -80,12 +80,13 @@ async function withVenues<T>(run: () => Promise<T>): Promise<T> {
 }
 
 /**
- * The carry of an ETH pair as serve builds it, the contract storing no ETH price. refresh_prices stores 2500 at
- * `refreshedAgeS` old (the oracle's 600 s recency plus its lag). `timeline` says, in order, when planning went on and
+ * The carry of an ETH pair as serve builds it, the contract storing no ETH price (or `row`). refresh_prices stores
+ * `refreshedPx` (default 2500, the books' mid) at `refreshedAgeS` old (the oracle's 600 s recency plus its lag). `timeline` says, in order, when planning went on and
  * off, each refresh_prices (and whether it came while planning), the size check's line and each part sent.
  */
-async function carryWorld(o: { closing?: boolean; refreshedAgeS?: number } = {}) {
+async function carryWorld(o: { closing?: boolean; refreshedAgeS?: number; refreshedPx?: number; row?: { ageS: number; px: number } } = {}) {
   const rows: { asset: string; price_e8: string; at_ms: number }[] = [];
+  if (o.row !== undefined) rows.push({ asset: 'ETH', price_e8: String(Math.round(o.row.px * 1e8)), at_ms: Date.now() - o.row.ageS * 1000 });
   const timeline: string[] = [];
   let planning = false;
   const client = {
@@ -95,7 +96,7 @@ async function carryWorld(o: { closing?: boolean; refreshedAgeS?: number } = {})
     maxAgeS: 900, send: true, read: (s) => storedPrice(client, s),
     refresh: async (s) => {
       timeline.push(`refresh ${s}${planning ? ' while planning' : ''}`);
-      rows.splice(0, rows.length, { asset: s, price_e8: String(2500 * 1e8), at_ms: Date.now() - (o.refreshedAgeS ?? 610) * 1000 });
+      rows.splice(0, rows.length, { asset: s, price_e8: String(Math.round((o.refreshedPx ?? 2500) * 1e8)), at_ms: Date.now() - (o.refreshedAgeS ?? 610) * 1000 });
       return [{ chain: 'near', id: 'R', url: 'https://nearblocks.io/txns/R' }];
     },
     now: () => Date.now(), log: () => {}, ...newPriceState(),
@@ -192,4 +193,33 @@ test('serve\'s carry refused after its refresh_prices (the price lives too littl
   assert.equal(w.paid(), 1);
   assert.match(r.refusals.join('; '), /^the stored ETH price is 650 s old after refresh_prices: it lives 10 s past the first part's 240 s/);
   assert.deepEqual(w.timeline, ['planning on', 'planning off', 'refresh ETH']);
+});
+
+test('serve\'s carry, a days-old stored 2490 refreshed to 2520 (120 bps, over the band): planned again on 2520, then sent', async () => {
+  const w = await carryWorld({ row: { ageS: 3 * 86_400, px: 2490 }, refreshedPx: 2520 });
+  const r = await w.open();
+  assert.deepEqual(r.refusals, []);
+  assert.equal(w.paid(), 1);
+  assert.deepEqual(w.timeline, ['planning on', 'planning off', 'refresh ETH', 'planning on', 'planning off', 'size held to the cap', 'part 1 sent']);
+  const said = w.said.join('\n');
+  assert.match(said, /stored ETH 2490, 259200 s old; the open refreshes it/);
+  assert.match(said, /replan    the stored ETH price after refresh_prices is 2520, 120 bps from the 2490 the open was judged on \(over the 100 bps band\): planned again on it/);
+  assert.match(said, /price     stored ETH 2520, 610 s old; --send refreshes it before each part/, 'the second plan reads the refreshed price, fresh');
+});
+
+test('serve\'s carry, no stored price, refreshed to 2560 (240 bps from the mid 2500): planned again, the books are outside the band, refused as paid', async () => {
+  const w = await carryWorld({ refreshedPx: 2560 });
+  const r = await w.open();
+  assert.equal(r.refreshed, true);
+  assert.equal(w.paid(), 1);
+  assert.match(r.refusals.join('; '), /^the stored ETH price after refresh_prices is 2560, 240 bps from the 2500 the open was judged on \(over the 100 bps band\), and planned again the open refuses: no pair fits the policy cap: hyperliquid ETH: the best bid 2499 is outside the contract's band/);
+  assert.deepEqual(w.timeline, ['planning on', 'planning off', 'refresh ETH', 'planning on', 'planning off'], 'nothing sent');
+});
+
+test('serve\'s carry, a days-old stored 1800 (over the band from the books): judged on the mid, refreshed to 2500, sent without planning again', async () => {
+  const w = await carryWorld({ row: { ageS: 5 * 86_400, px: 1800 } });
+  const r = await w.open();
+  assert.deepEqual(r.refusals, []);
+  assert.deepEqual(w.timeline, ['planning on', 'planning off', 'refresh ETH', 'size held to the cap', 'part 1 sent']);
+  assert.match(w.said.join('\n'), /stored ETH 1800, 432000 s old \(planned on the books' mid 2500\.0000, the stored one is over the band from the books\)/);
 });

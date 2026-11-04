@@ -12,7 +12,7 @@ import { floorToLot, toQty } from '../trade/lots.ts';
 import { PairTrader } from '../trade/pair.ts';
 import type { PriceDeps } from './pair-mainnet-lib.ts';
 import { OPEN_HEADROOM_S, PRICE_MARGIN_S, newPriceState, oraclePxOf } from './pair-mainnet-lib.ts';
-import type { OpenPlan, OpenRequest, OpsCtx, Pair } from './pair-ops.ts';
+import type { OpenPlan, OpenRefresh, OpenRequest, OpsCtx, Pair } from './pair-ops.ts';
 import { MIN_ORDER_USD, capQtyAtOrder, planOpen, recheckOpenSize, refreshForOpen, sendOpen, storedPrice } from './pair-ops.ts';
 import { SERVE_MAKER } from './serve-pair.ts';
 
@@ -130,6 +130,8 @@ interface PlanWorldOptions {
   refreshFails?: string;
   /** The age (s) refresh_prices leaves the price at: the oracle's 600 s recency plus its lag. Default 610. */
   refreshedAgeS?: number;
+  /** The price refresh_prices stores. Default 2500, the books' mid. */
+  refreshedPx?: number;
   maker?: MakerSettings;
   desk?: { paused?: boolean; closing?: boolean };
   lamports?: number;
@@ -141,7 +143,7 @@ interface PlanWorldOptions {
 
 /**
  * planOpen on fakes that pass every refusal but the ones `o` asks for: the contract's prices() answers what is stored
- * (`row`, or nothing), and refresh_prices writes a row `refreshedAgeS` old at 2600 unless `refreshFails`. The books
+ * (`row`, or nothing), and refresh_prices writes a row `refreshedAgeS` old at `refreshedPx` unless `refreshFails`. The books
  * are 2499 / 2501 (mid 2500). The legs read the stored price as buildPair's do (oraclePxOf: while planning, as it is,
  * or the estimate where none is stored), so the cap and band checks see what is there when they run.
  */
@@ -161,7 +163,7 @@ function planWorld(o: PlanWorldOptions) {
     refresh: async (s, maxAgeS) => {
       refreshes.push(`${s} ${maxAgeS}`);
       if (o.refreshFails !== undefined) throw new Error(o.refreshFails);
-      rows.splice(0, rows.length, { asset: s, price_e8: String(2600 * 1e8), at_ms: Date.now() - (o.refreshedAgeS ?? 610) * 1000 });
+      rows.splice(0, rows.length, { asset: s, price_e8: String(Math.round((o.refreshedPx ?? 2500) * 1e8)), at_ms: Date.now() - (o.refreshedAgeS ?? 610) * 1000 });
       return [{ chain: 'near', id: 'R', url: 'https://nearblocks.io/txns/R' }];
     },
     now: () => Date.now(), log: (l) => logs.push(l), ...newPriceState(),
@@ -216,6 +218,9 @@ function planWorld(o: PlanWorldOptions) {
   return { ctx, pair, refreshes, logs, said, seen, prices, age, request };
 }
 
+/** What refreshForOpen answered, without the plan it hands on. */
+const three = (f: OpenRefresh) => ({ refused: f.refused, paid: f.paid, line: f.line });
+
 /** The Hyperliquid /info and Phoenix trader-state answers of a desk that may open (cross margin, no resting orders). */
 async function withVenues<T>(run: () => Promise<T>, o: Pick<PlanWorldOptions, 'marginMode' | 'resting'> = {}): Promise<T> {
   const real = globalThis.fetch;
@@ -244,31 +249,39 @@ test('no stored price, a real open: planned on the books\' mid with nothing sent
   assert.equal(w.prices.estimate?.has('ETH') ?? false, false, 'the estimate is gone once planned');
   assert.deepEqual(plan.refresh, { marginS: 60 + PRICE_MARGIN_S, was: 'missing' });
   assert.match(w.said.join('\n'), /stored ETH none \(planned on the books' mid 2500\.0000\); the open refreshes it once every check above passed/);
-  const fresh = await refreshForOpen(w.ctx, plan);
+  const fresh = await refreshForOpen(w.ctx, w.pair, plan);
   // The first part's margin (the maker timeout plus the IOC's 120 s): sendOpen's beforePart then finds it fresh.
   assert.deepEqual(w.refreshes, [`ETH ${900 - (60 + PRICE_MARGIN_S)}`]);
-  assert.deepEqual(fresh, { refused: null, paid: true, line: 'price     stored ETH 2600, 610 s old (refreshed for this open): it lives 110 s past the first part\'s 180 s' });
+  assert.deepEqual(three(fresh), { refused: null, paid: true, line: 'price     stored ETH 2500, 610 s old (refreshed for this open): it lives 110 s past the first part\'s 180 s' });
   assert.match(w.logs.join('\n'), /the stored ETH price is missing: refresh_prices/);
   // Asked again at once: the price is fresh now, nothing more is sent.
-  assert.deepEqual(await refreshForOpen(w.ctx, plan), { refused: null, paid: false, line: 'price     stored ETH 2600, 610 s old: it lives 110 s past the first part\'s 180 s' });
+  assert.deepEqual(three(await refreshForOpen(w.ctx, w.pair, plan)), { refused: null, paid: false, line: 'price     stored ETH 2500, 610 s old: it lives 110 s past the first part\'s 180 s' });
   assert.equal(w.refreshes.length, 1);
 });
 
-test('a stored price too old to plan with: planned on as it is, refreshed once after the checks; a fresh one is not', async () => {
-  const old = planWorld({ send: true, row: { ageS: 5 * 86_400, px: 1800 } });
+test('a stored price too old to plan with: planned on as it is within the band of the books, else on the mid; refreshed once after the checks', async () => {
+  const far = planWorld({ send: true, row: { ageS: 5 * 86_400, px: 1800 } });
+  const farPlan = await withVenues(() => planOpen(far.ctx, far.pair, far.request));
+  assert.deepEqual(farPlan.refusals, []);
+  assert.deepEqual(far.seen, [2500, 2500], 'a days-old 1800 is over the band from the books: judged on the mid');
+  assert.equal(farPlan.pricedAt, 2500);
+  assert.match(far.said.join('\n'), /stored ETH 1800, 432000 s old \(planned on the books' mid 2500\.0000, the stored one is over the band from the books\)/);
+
+  const old = planWorld({ send: true, row: { ageS: 5 * 86_400, px: 2490 } });
   const plan = await withVenues(() => planOpen(old.ctx, old.pair, old.request));
   assert.deepEqual(plan.refusals, []);
   assert.deepEqual(old.refreshes, []);
-  assert.deepEqual(old.seen, [1800, 1800], 'judged on the stored price as it is');
+  assert.deepEqual(old.seen, [2490, 2490], 'judged on the stored price as it is');
+  assert.equal(plan.pricedAt, 2490);
   assert.equal(plan.refresh?.was, `${5 * 86_400} s old`);
-  assert.equal((await refreshForOpen(old.ctx, plan)).paid, true);
+  assert.equal((await refreshForOpen(old.ctx, old.pair, plan)).paid, true);
   assert.equal(old.refreshes.length, 1);
 
   const fresh = planWorld({ send: true, row: { ageS: 610, px: 2500 } });
   const freshPlan = await withVenues(() => planOpen(fresh.ctx, fresh.pair, fresh.request));
   assert.deepEqual(freshPlan.refusals, []);
   assert.equal(freshPlan.refresh, null);
-  assert.deepEqual(await refreshForOpen(fresh.ctx, freshPlan), { refused: null, paid: false, line: null });
+  assert.deepEqual(three(await refreshForOpen(fresh.ctx, fresh.pair, freshPlan)), { refused: null, paid: false, line: null });
   assert.deepEqual(fresh.refreshes, []);
 });
 
@@ -279,14 +292,14 @@ test('no stored price, a dry run: read-only, the missing price is a refusal, eve
   assert.deepEqual(w.seen, [2500, 2500]);
   assert.equal(plan.refresh, null);
   assert.match(w.said.join('\n'), /stored ETH none/);
-  assert.equal((await refreshForOpen(w.ctx, plan)).paid, false);
+  assert.equal((await refreshForOpen(w.ctx, w.pair, plan)).paid, false);
   assert.deepEqual(w.refreshes, []);
   // Stale but stored: a dry run plans on it and says --send would refresh it; nothing is sent.
   const stale = planWorld({ send: false, row: { ageS: 800, px: 2500 } });
   const stalePlan = await withVenues(() => planOpen(stale.ctx, stale.pair, stale.request));
   assert.deepEqual(stalePlan.refusals, []);
   assert.match(stale.said.join('\n'), /--send refreshes it once its checks pass/);
-  assert.deepEqual(await refreshForOpen(stale.ctx, stalePlan), { refused: 'the stored ETH price is 800 s old: a dry run does not refresh it', paid: false, line: null });
+  assert.deepEqual(three(await refreshForOpen(stale.ctx, stale.pair, stalePlan)), { refused: 'the stored ETH price is 800 s old: a dry run does not refresh it', paid: false, line: null });
   assert.deepEqual(stale.refreshes, []);
 });
 
@@ -294,9 +307,9 @@ test('no stored price, a real open whose refresh fails: a refusal with the reaso
   const w = planWorld({ send: true, refreshFails: 'near rpc: HTTP 503' });
   const plan = await withVenues(() => planOpen(w.ctx, w.pair, w.request));
   assert.deepEqual(plan.refusals, []);
-  const fresh = await refreshForOpen(w.ctx, plan);
+  const fresh = await refreshForOpen(w.ctx, w.pair, plan);
   assert.equal(w.refreshes.length, 1);
-  assert.deepEqual(fresh, { refused: 'the stored ETH price (missing) could not be refreshed before the open: near rpc: HTTP 503', paid: true, line: null });
+  assert.deepEqual(three(fresh), { refused: 'the stored ETH price (missing) could not be refreshed before the open: near rpc: HTTP 503', paid: true, line: null });
 });
 
 test('a real open already refused for anything else sends no refresh_prices: paused, closing, margin, resting, SOL, minimum, cap, IOC', async () => {
@@ -316,7 +329,7 @@ test('a real open already refused for anything else sends no refresh_prices: pau
     const plan = await withVenues(() => planOpen(w.ctx, w.pair, request), c.o);
     assert.ok(plan.refusals.some((r) => c.match.test(r)), `${c.name}: ${plan.refusals.join('; ')}`);
     assert.notEqual(plan.refresh, null, `${c.name}: the price would need a refresh`);
-    const fresh = await refreshForOpen(w.ctx, plan);
+    const fresh = await refreshForOpen(w.ctx, w.pair, plan);
     assert.equal(fresh.paid, false, c.name);
     assert.match(fresh.refused ?? '', /^refused already, so the stored ETH price \(missing\) is not refreshed/, c.name);
     assert.deepEqual(w.refreshes, [], `${c.name}: nothing refreshed`);
@@ -332,8 +345,8 @@ test('a symbol refresh_prices cannot price: a missing price keeps the old refusa
   const stale = planWorld({ send: true, symbol: 'AVAX', row: { ageS: 2000, px: 20 } });
   const stalePlan = await withVenues(() => planOpen(stale.ctx, stale.pair, stale.request));
   assert.ok(stalePlan.refusals.includes('the stored AVAX price is 2000 s old and refresh_prices cannot refresh it (AVAX is not one of the contract\'s oracle assets)'), stalePlan.refusals.join('; '));
-  assert.equal((await refreshForOpen(missing.ctx, plan)).paid, false);
-  assert.equal((await refreshForOpen(stale.ctx, stalePlan)).paid, false);
+  assert.equal((await refreshForOpen(missing.ctx, missing.pair, plan)).paid, false);
+  assert.equal((await refreshForOpen(stale.ctx, stale.pair, stalePlan)).paid, false);
   assert.deepEqual([...missing.refreshes, ...stale.refreshes], []);
 });
 
@@ -342,7 +355,7 @@ test('SERVE_MAKER: one refresh lives through the size check and the first part, 
   const plan = await withVenues(() => planOpen(w.ctx, w.pair, { ...w.request, qty: '0.02' }));
   assert.deepEqual(plan.refusals, []);
   assert.equal(SERVE_MAKER.timeoutMs / 1000 + PRICE_MARGIN_S, 240);
-  const fresh = await refreshForOpen(w.ctx, plan);
+  const fresh = await refreshForOpen(w.ctx, w.pair, plan);
   assert.deepEqual([fresh.refused, fresh.paid], [null, true]);
   assert.match(fresh.line ?? '', /lives 50 s past the first part's 240 s/);
   w.age(10);                                         // the size held to the cap, the gate
@@ -371,7 +384,37 @@ test('SERVE_MAKER: one refresh lives through the size check and the first part, 
 test('SERVE_MAKER: a refresh that leaves the price under the open\'s headroom is refused (paid), before anything is sent', async () => {
   const w = planWorld({ send: true, maker: SERVE_MAKER, refreshedAgeS: 650 });
   const plan = await withVenues(() => planOpen(w.ctx, w.pair, w.request));
-  const fresh = await refreshForOpen(w.ctx, plan);
+  const fresh = await refreshForOpen(w.ctx, w.pair, plan);
   assert.equal(fresh.paid, true);
   assert.equal(fresh.refused, `the stored ETH price is 650 s old after refresh_prices: it lives 10 s past the first part's 240 s, under the ${OPEN_HEADROOM_S} s the open needs before it; nothing sent`);
+});
+
+test('a refresh that moves the price over the band from what the plan judged on: planned again on it; a refusal then is paid', async () => {
+  // Planned on the mid 2500, refreshed to 2540 (160 bps): planned again, and the plan sent is the new one.
+  const moved = planWorld({ send: true, refreshedPx: 2540 });
+  const plan = await withVenues(() => planOpen(moved.ctx, moved.pair, moved.request));
+  assert.deepEqual(plan.refusals, []);
+  const fresh = await withVenues(() => refreshForOpen(moved.ctx, moved.pair, plan));
+  assert.deepEqual([fresh.refused, fresh.paid], [null, true]);
+  assert.notEqual(fresh.plan, plan);
+  assert.equal(fresh.plan.pricedAt, 2540);
+  assert.deepEqual(moved.seen, [2500, 2500, 2540, 2540], 'the cap and the IOC judged again on the refreshed price');
+  assert.match(moved.said.join('\n'), /replan    the stored ETH price after refresh_prices is 2540, 160 bps from the 2500 the open was judged on \(over the 100 bps band\): planned again on it/);
+  assert.equal(moved.refreshes.length, 1, 'planning again sends nothing');
+
+  // Within the band: the plan stands as it is.
+  const near = planWorld({ send: true, refreshedPx: 2520 });
+  const nearPlan = await withVenues(() => planOpen(near.ctx, near.pair, near.request));
+  const kept = await withVenues(() => refreshForOpen(near.ctx, near.pair, nearPlan));
+  assert.equal(kept.plan, nearPlan);
+  assert.deepEqual(near.seen, [2500, 2500]);
+
+  // Planned again, the open refuses (a part now under the Hyperliquid minimum at the new price): refused, paid.
+  const low = planWorld({ send: true, refreshedPx: 2540, simErr: undefined });
+  const lowPlan = await withVenues(() => planOpen(low.ctx, low.pair, low.request));
+  (low.ctx.chain as unknown as { balance: () => Promise<number> }).balance = async () => 1000;
+  const refused = await withVenues(() => refreshForOpen(low.ctx, low.pair, lowPlan));
+  assert.equal(refused.paid, true);
+  assert.match(refused.refused ?? '', /^the stored ETH price after refresh_prices is 2540, 160 bps from the 2500 the open was judged on \(over the 100 bps band\), and planned again the open refuses: the desk authority holds/);
+  await assert.rejects(sendOpen(low.ctx, low.pair, refused.plan), /open refused, nothing signed/);
 });
