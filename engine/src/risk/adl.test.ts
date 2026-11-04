@@ -122,6 +122,29 @@ test('a confirmed ADL pauses the pair and unwinds both legs reduce-only, never a
   assert.equal(await s.adl.check(), null, 'flat and flat: nothing more');
 });
 
+test('unwinding: true only while an unwind attempt\'s close signs or is in flight, never during the read-only checks', async () => {
+  const s = setup();
+  await opened(s);
+  const seen: boolean[] = [];
+  s.hl.onRead = () => seen.push(s.adl.unwinding);
+  assert.equal(await s.adl.check(), null);
+  assert.deepEqual(seen, [false], 'a check with nothing off reads only');
+  assert.equal(s.adl.unwinding, false);
+  // The venue deleveraged the short: the confirming read is still read-only, then the close goes out and is held.
+  s.hl.pos = toQty('-30');
+  let release!: () => void;
+  s.px.hold = new Promise<void>((r) => { release = r; });
+  s.hl.onRead = () => seen.push(s.adl.unwinding);
+  const running = s.adl.check();
+  while (s.px.orders.length < 2) await new Promise((r) => setImmediate(r));
+  assert.equal(seen.at(-1), false, 'the first read of the event is the read-only check');
+  assert.equal(s.adl.unwinding, true, 'the close is in flight');
+  release();
+  const report = await running;
+  assert.equal(report?.stage, 'unwound');
+  assert.equal(s.adl.unwinding, false, 'over when the attempt returns');
+});
+
 test('a partial ADL is unwound too, not re-hedged at the smaller size', async () => {
   const s = setup();
   await opened(s);

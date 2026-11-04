@@ -62,6 +62,7 @@ import { SolanaSubmitter } from '../relayer/solana.ts';
 import type { Reducer } from '../rescue/rescuer.ts';
 import type { AdlState } from '../risk/adl.ts';
 import { ADL_ATTEMPTS, AdlWatch, newAdlState } from '../risk/adl.ts';
+import { MAINNET_COSTS } from '../scanner/config.ts';
 import type { LegSide, MakerSettings, TradeLeg } from '../trade/legs.ts';
 import { DEFAULT_MAKER, HlLeg } from '../trade/legs.ts';
 import { signedQtyString } from '../trade/lots.ts';
@@ -89,9 +90,12 @@ import { ConfigError, START_RETRY_MAX_MS, startBackoffMs } from './start-errors.
 export const SERVE_SLIPPAGE_BPS = 50;
 /** serve's maker settings: pair-mainnet's defaults (--reprice-s 30, --maker-timeout-s 120, --max-orders 6, no taker fallback). */
 export const SERVE_MAKER: MakerSettings = { ...DEFAULT_MAKER, timeoutMs: 120_000 };
-/** The strategy loop's open: pair-mainnet open's defaults for what StrategyConfig does not set. */
-export const SERVE_HOLD_DAYS = 7;
-export const SERVE_BASIS_BPS = 10;
+/**
+ * The strategy loop's open, for what StrategyConfig does not set: the hold and the basis buffer the scanner's gate
+ * prices a desk window on (MAINNET_COSTS), so a window shown as enterable is judged on the same numbers here.
+ */
+export const SERVE_HOLD_DAYS = MAINNET_COSTS.holdHours / 24;
+export const SERVE_BASIS_BPS = MAINNET_COSTS.basisBufferBps;
 /** At start both legs are read twice this far apart, and must agree; up to START_READ_TRIES times. */
 const START_CONFIRM_MS = 3_000;
 const START_READ_TRIES = 3;
@@ -111,6 +115,8 @@ export interface CarryOut {
 export interface CarryResult {
   /** pair-mainnet's refusals: nothing was signed when this is not empty. */
   refusals: string[];
+  /** The open's refusal for cost (CarryPlan.costRefusal, one of `refusals`), when the plan had one. */
+  costRefused?: string;
   results: PairResult[];
   /** The open sent refresh_prices (refreshForOpen), paid whatever came of it. */
   refreshed?: boolean;
@@ -198,6 +204,8 @@ export interface PairAdl {
   check(): ReturnType<AdlWatch['check']>;
   stop(): void;
   readonly state: AdlState;
+  /** An unwind attempt runs now (AdlWatch.unwinding). */
+  readonly unwinding: boolean;
 }
 
 /** What an open or a close of the strategy loop did. */
@@ -222,6 +230,8 @@ export interface HandsResult {
   refreshed?: boolean;
   /** How many refresh_prices were sent for it (with `refreshed`); absent: one. */
   refreshes?: number;
+  /** An open refused for its cost (CarryPlan.costRefusal): why. The strategy loop holds the window out for the hour. */
+  costRefused?: string;
 }
 
 /** The strategy loop's hands on the desk's pair (strategy/loop.ts). */
@@ -991,7 +1001,9 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
               paid++;
             },
           }, out);
-          if (r.refusals.length > 0) return result(false, `open refused, nothing signed: ${r.refusals.join('; ')}`, { lines: said, open: opens });
+          if (r.refusals.length > 0) {
+            return result(false, `open refused, nothing signed: ${r.refusals.join('; ')}`, { lines: said, open: opens, ...(r.costRefused === undefined ? {} : { costRefused: r.costRefused }) });
+          }
           const again = await slot.readopt().catch((err: unknown) => `not adopted after the residual hedge: ${errorMessage(err)}`);
           if (again !== null) log(`pair      ${again}`);
           const opened = r.results.filter((x) => x.status === 'open');
@@ -1045,6 +1057,9 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       stop: () => current?.adl.stop(),
       get state() {
         return current?.adl.state ?? newAdlState();
+      },
+      get unwinding() {
+        return current?.adl.unwinding ?? false;
       },
     };
     // A start not confirmed yet keeps the hands (they refuse until it is) and the ADL watch: it may go live later, the
@@ -1158,7 +1173,8 @@ export function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string
       if (plan.refresh !== null && request.noRefresh !== undefined) {
         refusals.push(`the stored ${p.symbol} price is ${plan.refresh.was} and needs refresh_prices: ${request.noRefresh}; nothing sent`);
       }
-      if (refusals.length > 0) return { refusals, results: [] };
+      const cost = plan.carry.costRefusal === null ? {} : { costRefused: plan.carry.costRefusal };
+      if (refusals.length > 0) return { refusals, results: [], ...cost };
       const fresh = await refreshForOpen(ctx, pair, { ...plan, refusals }, { planning: (on) => p.planning(on) });
       if (fresh.paid) request.onPaidRefresh?.();
       if (fresh.line !== null) out.say(fresh.line);

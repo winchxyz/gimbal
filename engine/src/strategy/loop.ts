@@ -123,6 +123,11 @@ export interface ActOutcome {
   refreshed?: boolean;
   /** How many refresh_prices were sent for it (with `refreshed`: its own and those before its parts); absent: one. */
   refreshes?: number;
+  /**
+   * An open refused for its cost, nothing sent (the trader's CarryPlan.costRefusal): why. The window is held out of
+   * the entry rules until the next hourly check (DecideInput.costRefused) and its hours start again.
+   */
+  costRefused?: string;
 }
 
 /** One leg's fills in an open or a close: summed size, size-weighted price, summed fee. */
@@ -462,6 +467,8 @@ interface ActEnd {
   result?: string;
   /** Refused after it paid for a refresh_prices (nothing of the open sent): why. The window is held REFRESH_HOLD_MS. */
   paidRefusal?: string;
+  /** The open was refused for its cost (ActOutcome.costRefused), nothing sent: why. */
+  costRefused?: string;
 }
 const SKIPPED: ActEnd = { end: 'skipped', sent: false, passing: false };
 
@@ -484,6 +491,8 @@ export class StrategyLoop {
   readonly #lastChecks = new Map<string, { id: string; kind: 'enter' | 'rotate'; verdict: string; at: number; opened: boolean }>();
   /** `kind window` -> until when an act refused with nothing sent is not tried again, and the line journaled. */
   readonly #refused = new Map<string, { until: number; reason: string }>();
+  /** Window id -> until when (the next hourly check) its open stays refused for cost, and the trader's why. */
+  readonly #costRefused = new Map<string, { until: number; reason: string }>();
   #lastSkip: string | null = null;
   /** The category of the last `hold` journaled; the last action journaled `off`. */
   #lastHoldKey: string | null = null;
@@ -770,6 +779,7 @@ export class StrategyLoop {
       ...(facts.gross14dAprPct === undefined ? {} : { gross14dAprPct: facts.gross14dAprPct }), ...(facts.lots === undefined ? {} : { lots: facts.lots }),
       ...(freed === undefined ? {} : { freedMarginUsd: freed }),
       ...this.#unopenable(scanned),
+      ...this.#costHeld(now),
     };
     const d = (this.#o.decide ?? defaultDecide)(input);
     this.#journalDecision(input, d, before);
@@ -786,9 +796,26 @@ export class StrategyLoop {
     // Until the act is done, the counters are those of an act not carried out.
     this.#saveCounters(skipAct(input, d));
     const r = await this.#act(d, scanned, facts);
+    // Refused for cost: the window's hours start again (skipAct), and until the next hourly check it fails the entry
+    // rules (#costHeld), so the next check falls through to the window below it.
+    const cost = r.costRefused === undefined ? {} : { costRefused: true };
     if (r.end === 'done') this.#saveCounters(d.counters);
     else if (r.end === 'vetoed') this.#saveCounters(skipAct(input, d, { vetoed: true, ...(r.why === undefined ? {} : { why: r.why }) }));
-    else if (r.end === 'flat') this.#saveCounters({ ...skipAct(input, d), badChecks: 0, betterByWindow: {}, lastExitAt: this.#o.clock.now() });
+    else if (r.end === 'flat') this.#saveCounters({ ...skipAct(input, d, cost), badChecks: 0, betterByWindow: {}, lastExitAt: this.#o.clock.now() });
+    else if (r.costRefused !== undefined) this.#saveCounters(skipAct(input, d, cost));
+  }
+
+  /**
+   * decide()'s costRefused: the windows the pair trader refused for cost, until the next hourly check after the
+   * refusal (the books and the 7-day means it priced them on are read again then). Ended ones are dropped.
+   */
+  #costHeld(now: number): Pick<DecideInput, 'costRefused'> {
+    const out: Record<string, string> = {};
+    for (const [id, h] of this.#costRefused) {
+      if (now < h.until) out[id] = h.reason;
+      else this.#costRefused.delete(id);
+    }
+    return Object.keys(out).length === 0 ? {} : { costRefused: out };
   }
 
   /** The wait, hold and off lines: on a change of category, and one hold line per hourly check, with the numbers. */
@@ -994,12 +1021,21 @@ export class StrategyLoop {
         return { end: 'done', sent: true, passing: false, positionId: bookedAt === null ? null : positionIdOf(w.id, bookedAt), result: `opened, partly: ${opened.reason}` };
       }
       this.#record('fill', { windowId: w.id, symbol: sym.symbol, outcome: opened, forecastNetAprPct: null, exitReason: opened.reason, rotation: null, manual: p.manual, startedAt: openAt });
-      this.#journal(opened.sent ? 'error' : 'refused', `${kind} ${w.id}: ${opened.reason}${flat}; ${why}`, { ...base, feeUsd: opened.feeUsd }, opened.tx);
+      // Refused for cost with nothing sent: held out of the entry rules until the next hourly check, its hours reset.
+      const costRefused = !opened.sent && opened.costRefused !== undefined ? opened.costRefused : undefined;
+      let held = '';
+      if (costRefused !== undefined) {
+        const until = nextHourlyCheck(now);
+        this.#costRefused.set(w.id, { until, reason: costRefused });
+        held = `; ${w.id} is held out of the entry rules until the hourly check at ${new Date(until).toISOString()} and its hours start again`;
+      }
+      this.#journal(opened.sent ? 'error' : 'refused', `${kind} ${w.id}: ${opened.reason}${flat}${held}; ${why}`, { ...base, feeUsd: opened.feeUsd }, opened.tx);
       // Stopped by the open's own gate (a rescue that started after the check before it): tried again next check.
       const passing = this.#gate() !== null;
       const paid = opened.refreshed === true && !opened.sent ? { paidRefusal: opened.reason } : {};
+      const cost = costRefused === undefined ? {} : { costRefused };
       const result = `not opened: ${opened.reason}`;
-      return p.fromId === null ? { end: 'skipped', sent: opened.sent, passing, result, ...paid } : { end: 'flat', sent: true, passing, result, ...paid };
+      return p.fromId === null ? { end: 'skipped', sent: opened.sent, passing, result, ...paid, ...cost } : { end: 'flat', sent: true, passing, result, ...paid, ...cost };
     }
     // Held from now: an entry's time, or the rotation's. What filled, not what was asked: a later part its gate
     // stopped holds nothing.
@@ -1335,6 +1371,12 @@ export class StrategyLoop {
   #log(line: string): void {
     this.#o.log(line);
   }
+}
+
+/** When the hourly check after `now` runs: HOUR_GRACE_MS past the next top of the hour, or this hour's when not yet run. */
+export function nextHourlyCheck(now: number): number {
+  const hourStart = Math.floor(now / HOUR_MS) * HOUR_MS;
+  return now - hourStart >= HOUR_GRACE_MS ? hourStart + HOUR_MS + HOUR_GRACE_MS : hourStart + HOUR_GRACE_MS;
 }
 
 function symbolIs(s: { symbol: string } | { refused: string }, symbol: string): boolean {

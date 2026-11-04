@@ -124,6 +124,14 @@ export interface DecideInput {
    */
   unopenable?: Record<string, string>;
   /**
+   * Window id -> why the pair trader refused to open it for its cost (CarryPlan.costRefusal: on its own reads at the
+   * open, the spread over the hold does not cover the round trip), until the next hourly check (loop.ts). Such a
+   * window fails the entry rules (`cost`), as `hands` and `margin` do, so a lower window is the one counted and
+   * entered instead of the same refusal coming back. Its hours start again when it is refused (skipAct's
+   * `costRefused`). Absent = none.
+   */
+  costRefused?: Record<string, string>;
+  /**
    * The hourly-check counts: loop.ts passes the owner's (StrategyConfig.enterAfterChecks / exitAfterChecks), the
    * entry/exit-checks backtest (src/backtest) varies them. Absent = LOOP_RULES' defaults. The counters stay raw
    * counts: a changed number is compared against the count already reached, never resets it.
@@ -203,7 +211,7 @@ function vetoHoursLeft(c: Pick<LoopCounters, 'vetoedUntil'> | undefined, id: str
 interface GateFailure { code: string; text: string }
 
 type GateInput = Pick<DecideInput, 'strategy' | 'gross14dAprPct'>
-  & Partial<Pick<DecideInput, 'now' | 'counters' | 'freeMarginUsd' | 'freedMarginUsd' | 'liveRescue' | 'lots' | 'unopenable'>>;
+  & Partial<Pick<DecideInput, 'now' | 'counters' | 'freeMarginUsd' | 'freedMarginUsd' | 'liveRescue' | 'lots' | 'unopenable' | 'costRefused'>>;
 
 /**
  * The leverage a window's legs open at: the owner's, at most MAX_LEVERAGE, at most NO_RESCUE_MAX_LEVERAGE when a leg
@@ -270,6 +278,8 @@ function gate(w: FundingWindow, input: GateInput): GateFailure | null {
   if (!w.tradable) return { code: 'watch', text: 'watch only' };
   const hands = input.unopenable?.[w.id];
   if (hands !== undefined) return { code: 'hands', text: hands };
+  const cost = input.costRefused?.[w.id];
+  if (cost !== undefined) return { code: 'cost', text: `the pair trader refused it for cost this hour: ${cost}` };
   const vetoLeft = vetoHoursLeft(input.counters, w.id, input.now);
   if (vetoLeft !== null) return { code: 'vetoed', text: `refused by the NEAR AI risk check${vetoWhyText(input.counters, w.id)}, held out for ${vetoLeft.toFixed(1)} h more` };
   if (!isEnterable(w)) {
@@ -670,16 +680,22 @@ function afterAct(c: LoopCounters, act: Decision['act'], now: number): LoopCount
  * With `{ vetoed: true }` (NEAR AI risk check refused the enter or rotate target) that window is held out for
  * LOOP_RULES.vetoHoldHours and its counts start again, so the veto is not asked again on the next scan; `why` (the
  * risk check's why line) is kept with the hold-out and shown on the waits while it lasts.
+ * With `{ costRefused: true }` (the pair trader refused the target's open for its cost) the target's counts start
+ * again: the streak counts hourly checks in a row that pass the entry rules, and at this one the window failed the
+ * cost check the trader holds it to on its own reads at the open, the check the scanner's gate stands in for. Kept,
+ * the count would enter the window again at the next hourly check and the trader refuse it again, every hour. The
+ * hold-out until the next hourly check is loop.ts's (DecideInput.costRefused), not a counter.
  */
-export function skipAct(input: DecideInput, d: Decision, options: { vetoed?: boolean; why?: string } = {}): LoopCounters {
+export function skipAct(input: DecideInput, d: Decision, options: { vetoed?: boolean; why?: string; costRefused?: boolean } = {}): LoopCounters {
   if (d.act === null) return d.counters;
   const held = input.held;
   const heldW = held === null ? null : (input.windows.find((w) => w.id === held.windowId) ?? null);
   const counted: LoopCounters = { ...count(input, countsAsHourly(input), heldW), lastWaitReason: d.counters.lastWaitReason };
   const target = d.vetoCandidate;
-  if (options.vetoed !== true || target === null) return counted;
+  if ((options.vetoed !== true && options.costRefused !== true) || target === null) return counted;
   const { [target]: _above, ...aboveByWindow } = counted.aboveByWindow;
   const { [target]: _better, ...betterByWindow } = counted.betterByWindow;
+  if (options.vetoed !== true) return { ...counted, aboveByWindow, betterByWindow };
   return {
     ...counted, aboveByWindow, betterByWindow,
     vetoedUntil: { ...counted.vetoedUntil, [target]: input.now + LOOP_RULES.vetoHoldHours * HOUR_MS },

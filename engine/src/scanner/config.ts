@@ -243,17 +243,28 @@ export const ORDERLY_BROKERS = {
   testnet: { brokerId: 'woofi_dex', makerBps: null, takerBps: ORDERLY_BASE_TAKER_BPS + 1.5, markupBps: 1.5 },
 } as const;
 
+/** The hold a desk window's expected spread is counted over, by the scanner's gate and the pair trader's open alike. */
+export const CARRY_HOLD_HOURS = 168;
+/** What a desk window's round trip sets aside for the marks moving apart by the exit, bps of the leg (both gates). */
+export const CARRY_BASIS_BUFFER_BPS = 10;
+/** Hyperliquid's tier-0 taker fee on perps, bps, before the treasury builder fee every order carries. */
+export const HL_TAKER_BPS = 4.5;
+
 /** Costs on mainnet, and in replay, which plays recorded mainnet answers. */
 export const MAINNET_COSTS: CostParams = {
-  // A stated assumption: 10 days. The owner's engine rules carry no hold to take it from.
-  holdHours: 240,
-  // A stated assumption. Hyperliquid and Phoenix marks differed by 0.6 to 7.8 bps on 2026-11-03 (XLM, LTC, SOL, DOGE,
-  // NEAR), so an exit can lose a few bps to the gap whatever it was at entry.
-  basisBufferBps: 5,
+  // A stated assumption: 7 days. The owner's engine rules carry no hold to take it from. The pair trader's open
+  // (serve-pair.ts SERVE_HOLD_DAYS, pair-mainnet open's --hold-days) judges the spread over this same hold, so the
+  // scanner never shows a window as enterable on a longer hold than the open is refused on. Held pairs in the
+  // entry/exit-checks backtest averaged about 11 days (most to the 14-day time stop): 7 days is the cautious end.
+  holdHours: CARRY_HOLD_HOURS,
+  // A stated assumption, the same as the pair trader's open (SERVE_BASIS_BPS). Hyperliquid and Phoenix marks differed
+  // by 0.6 to 7.8 bps on 2026-11-03 (XLM, LTC, SOL, DOGE, NEAR), so an exit can lose up to about that much to the gap
+  // whatever it was at entry; the adverse gap at entry is priced on top (carry.ts deskRoundTrip).
+  basisBufferBps: CARRY_BASIS_BUFFER_BPS,
   fees: {
     // Hyperliquid tier-0 taker 4.5 bps, plus the treasury builder fee on every order (FeeConfig.hl_builder_tenth_bps
     // 10 = 1 bp). The referral discount is not counted.
-    hyperliquid: { takerBps: 4.5, extraBps: 1 },
+    hyperliquid: { takerBps: HL_TAKER_BPS, extraBps: 1 },
     // Phoenix: 3.5 bps taker on every market (its market config, 2026-10-31).
     phoenix: { takerBps: 3.5, extraBps: 0 },
     // Orderly under gimbal_dex: 3 bps base taker plus the 1 bp markup (ORDERLY_BROKERS.mainnet).

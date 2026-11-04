@@ -104,7 +104,7 @@ import type { ServePair } from './serve-pair.ts';
 import { liveLines, pairRefreshesAtOpen, servePair } from './serve-pair.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { connectContract, contractEnv, marginVenues } from './serve-contract.ts';
-import { loopBook, serveLoop } from './serve-loop.ts';
+import { loopBook, protectionText, serveLoop } from './serve-loop.ts';
 import { ConfigError, retryStart } from './start-errors.ts';
 import type { PositionBook } from '../book/book.ts';
 import { createBook } from '../book/book.ts';
@@ -448,13 +448,13 @@ if (values.once === true) {
   process.exit(0);
 }
 
-/** A protection runs (a rescue, its fund_venue step included; an ADL unwind; panic_close): no order of the loop goes out. */
+/**
+ * A protection runs (a rescue, its fund_venue step included; an ADL unwind; panic_close): no order of the loop goes
+ * out. An ADL unwind is one whose close signs or is in flight (risk.adlUnwinding), not the read-only ADL check that
+ * starts beside every desk read (risk.adlRunning).
+ */
 function protectionRunning(): string | null {
-  const rescuing = rescueRunning?.() ?? null;
-  if (rescuing !== null) return `rescue ${rescuing} runs`;
-  if (risk?.adlRunning != null) return 'an ADL unwind runs';
-  if (closingWatch?.current != null) return 'panic_close runs';
-  return null;
+  return protectionText({ rescue: rescueRunning?.() ?? null, adlUnwinding: risk?.adlUnwinding === true, panicClose: closingWatch?.current != null });
 }
 
 // The position book: next to the loop state. An unreadable book file is never started over: serve runs without the
@@ -630,7 +630,7 @@ async function shutdown(reason: string): Promise<void> {
   // is waited for, bounded, before the lock is released: pair-mainnet must not start next to it. One deadline covers
   // it all: risk.stop() (it waits for an ADL attempt that is running) and the closes.
   const deadline = new Promise<false>((r) => setTimeout(() => r(false), SHUTDOWN_WAIT_MS).unref());
-  if (pair?.pair?.closing === true || closingWatch?.current != null || risk?.adlRunning != null) {
+  if (pair?.pair?.closing === true || closingWatch?.current != null || risk?.adlUnwinding === true) {
     log(`stopping: waiting up to ${SHUTDOWN_WAIT_MS / 1000} s for the close in flight before the trader lock is released`);
   }
   // A running rescue signs nothing new from here; one that is signing or sending goes on until its payment is saved

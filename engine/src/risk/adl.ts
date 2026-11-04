@@ -177,6 +177,8 @@ export class AdlWatch {
   /** The unhedged alert this watch set on the trader (cleared when the event ends). */
   #alert: string | null = null;
   #stopped = false;
+  /** An unwind attempt runs: from taking it off the budget until its close returned and the legs were read. */
+  #unwinding = false;
 
   constructor(trader: AdlTrader, options: AdlWatchOptions = {}) {
     this.#trader = trader;
@@ -198,6 +200,14 @@ export class AdlWatch {
   /** Why the pair is paused (no open), or null. */
   get paused(): string | null {
     return this.state.paused;
+  }
+
+  /**
+   * Whether an unwind attempt runs now: its close signs or is in flight, or its result is being read. False during
+   * the read-only checks (two reads CONFIRM_MS apart) that run beside every desk read, and between attempts.
+   */
+  get unwinding(): boolean {
+    return this.#unwinding;
   }
 
   /** One look at both legs; a report for every end (journal it), null when there is nothing new. */
@@ -280,6 +290,15 @@ export class AdlWatch {
 
   /** One unwind attempt, taken off the budget and saved before any order goes out. */
   async #attempt(findings: AdlFinding[], head: string): Promise<AdlReport | null> {
+    this.#unwinding = true;
+    try {
+      return await this.#attemptRun(findings, head);
+    } finally {
+      this.#unwinding = false;
+    }
+  }
+
+  async #attemptRun(findings: AdlFinding[], head: string): Promise<AdlReport | null> {
     const ev = this.state.event!;
     this.state.attemptsLeft--;
     ev.attempts++;

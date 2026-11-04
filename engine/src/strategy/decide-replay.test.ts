@@ -105,7 +105,9 @@ async function run(): Promise<Step[]> {
   let held: HeldPair | null = null;
   let heldVenues = new Set<VenueId>();
   const scanner = new Scanner(readers.venues, [], {
-    config: { ...DEFAULT_SCANNER_CONFIG, policy: POLICY }, clock, strategy: () => STRAT, oracle,
+    // The recording's costs: a 10-day hold and a 5 bps exit buffer, the ones its hours were priced on. The test is
+    // decide's sequence over them, not the hold (on the 7-day default NEAR nets about 2 % and is never entered).
+    config: { ...DEFAULT_SCANNER_CONFIG, policy: POLICY, costs: { ...DEFAULT_SCANNER_CONFIG.costs, holdHours: 240, basisBufferBps: 5 } }, clock, strategy: () => STRAT, oracle,
     held: () => (held === null ? null : { windowId: held.windowId, since: start }),
     marginHeldAt: () => heldVenues,
   });

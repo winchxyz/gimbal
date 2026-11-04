@@ -86,6 +86,8 @@ interface World {
   lines: string[];
   /** What the stand-in carry refuses an open with. */
   refuse: string[];
+  /** The stand-in carry's refusal for cost (one of `refuse`), as liveCarry passes CarryPlan.costRefusal. */
+  costRefuse?: string;
   /** The stand-in carry signs one order outside the trader, then throws (an open that dies before its result). */
   throwAfterOrder: boolean;
   /** hlHeld throws this, when set (Hyperliquid info not answering). */
@@ -158,7 +160,7 @@ function input(w: World, extra: Partial<ServePairInput> = {}): ServePairInput {
 function testCarry(c: CarryInput, w: World): SlotCarry {
   return {
     open: async (request, out) => {
-      if (w.refuse.length > 0) return { refusals: [...w.refuse], results: [] };
+      if (w.refuse.length > 0) return { refusals: [...w.refuse], results: [], ...(w.costRefuse === undefined ? {} : { costRefused: w.costRefuse }) };
       if (w.throwAfterOrder) {
         await c.pair.hedge(0, 'SELL', toQty('1'), false, 'test: an order signed inside the open', true);
         throw new Error('the open died before its result was recorded');
@@ -518,7 +520,16 @@ test('the hands (strategy loop): a flat desk opens through the pair, is held and
     const refused = await hands.open({ symbol: 'XLM', legUsd: 10, leverage: 1.5, reason: 'test' });
     assert.equal(refused.ok, false);
     assert.match(refused.reason, /38 % from liquidation/);
+    assert.equal(refused.costRefused, undefined, 'not a refusal for cost');
     assert.equal(w.hl.orders.length + w.px.orders.length, 0);
+    // Refused for cost: the same, and the hands say which refusal it was, for the loop's hold-out.
+    const why = 'the expected spread over 7 days, $0.0390, does not cover the round trip $0.0421';
+    w.refuse = [why];
+    w.costRefuse = why;
+    const dear = await hands.open({ symbol: 'XLM', legUsd: 10, leverage: 1.5, reason: 'test' });
+    assert.deepEqual([dear.ok, dear.costRefused, dear.reason], [false, why, `open refused, nothing signed: ${why}`]);
+    assert.equal(w.hl.orders.length + w.px.orders.length, 0);
+    delete w.costRefuse;
     w.refuse = [];
     // The open: short Hyperliquid, long Phoenix, then held and protected as an adopted pair (ADL, reducer).
     const opened = await hands.open({ symbol: 'XLM', legUsd: 10, leverage: 1.5, reason: 'strategy: enter xlm-phoenix-hyperliquid' });

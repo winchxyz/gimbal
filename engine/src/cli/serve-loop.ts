@@ -166,6 +166,18 @@ export function openedQty(results: readonly PairResult[]): string {
   return qtyString(results.reduce((acc, r) => (r.status === 'open' && r.legs.some((l) => l.orders.length > 0) ? acc + toQty(r.size) : acc), 0n));
 }
 
+/**
+ * Why no order of the strategy loop may go out now because a protection runs, or null: a rescue (its fund_venue step
+ * included), an ADL unwind whose close signs or is in flight (AdlWatch.unwinding), or panic_close. The ADL watch's
+ * read-only check, started beside every 5 s desk read, is not one: with no unwind attempt it leaves the loop free.
+ */
+export function protectionText(p: { rescue: string | null; adlUnwinding: boolean; panicClose: boolean }): string | null {
+  if (p.rescue !== null) return `rescue ${p.rescue} runs`;
+  if (p.adlUnwinding) return 'an ADL unwind is in flight';
+  if (p.panicClose) return 'panic_close runs';
+  return null;
+}
+
 /** The pair symbols the policy allows: in both hl_assets and phoenix_markets. */
 export function policySymbols(policy: ContractPolicy | null): string[] {
   if (policy === null) return [];
@@ -186,6 +198,7 @@ export function loopHands(
     return {
       ok: r.ok, reason: r.reason, sent: r.sent ?? (r.results.length > 0 || r.tx.length > 0), tx: r.tx, feeUsd: r.feeUsd, open: r.open, fills: fillsOf(r.results),
       ...(r.refreshed === true ? { refreshed: true, ...(r.refreshes === undefined ? {} : { refreshes: r.refreshes }) } : {}),
+      ...(r.costRefused === undefined ? {} : { costRefused: r.costRefused }),
     };
   };
   return {

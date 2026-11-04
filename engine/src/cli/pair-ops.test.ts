@@ -176,7 +176,7 @@ function planWorld(o: PlanWorldOptions) {
     now: () => Date.now(), log: (l) => logs.push(l), landed: refreshLanded, reachedChain: refreshReachedChain, ...newPriceState(),
   };
   const said: string[] = [];
-  const book = async () => ({ bids: [{ px: 2499 }], asks: [{ px: 2501 }] });
+  const book = async () => ({ bids: [{ px: 2499, sz: 10 }], asks: [{ px: 2501, sz: 10 }] });
   const ctx = {
     client, config: { fees: {} }, desk: { policy, paused: o.desk?.paused ?? false, closing: o.desk?.closing ?? false, evm_address: '0xDESK' },
     hlUrl: 'http://hl.plan.test', phoenixUrl: 'http://phoenix.plan.test',

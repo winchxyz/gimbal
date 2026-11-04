@@ -490,7 +490,8 @@ export class Scanner {
         continue;
       }
       const b = pw.breakdown;
-      const rt = roundTrip(strategy.legUsd, b.feesUsd ?? 0, b.slippageUsd ?? 0, b.basisUsd ?? 0, b.timingUsd, config.costs.basisBufferBps);
+      // The desk round trip priceWindow took (carry.ts deskRoundTrip): the cost the pair trader's open is refused on.
+      const rt = pw.roundTrip ?? roundTrip(strategy.legUsd, b.feesUsd ?? 0, b.slippageUsd ?? 0, b.basisUsd ?? 0, b.timingUsd, config.costs.basisBufferBps);
       const estimate = carryEstimate({
         legUsd: strategy.legUsd, holdHours: config.costs.holdHours, grossNowAprPct: w.grossAprPct,
         gross7dAprPct: dh.d7, gross14dAprPct: dh.d14, multiDay: dh.m, roundTrip: rt, minNetAprPct: strategy.minNetAprPct,

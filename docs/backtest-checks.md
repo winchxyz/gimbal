@@ -28,8 +28,9 @@ rerun reads nothing. A full run takes about an hour on one core; each scope and 
   what Phoenix's own `funding()` reports, and no lookahead), and its history read returns prints up to `t` only.
   Books, marks, open interest and lots are today's.
 - **The real scanner.** `Scanner` runs with the mainnet costs (`MAINNET_COSTS`: taker fees with the Hyperliquid
-  builder fee, slippage on the books at the leg size, the basis buffer of adverse mark gap + timing loss + 5 bps,
-  spread over the assumed 240 h hold), the desk policy, the 2 % open-interest cap, the 7- and 14-day multi-day gate
+  builder fee, slippage on the books at the leg size, the basis buffer of adverse mark gap + timing loss + 10 bps,
+  spread over the assumed 168 h hold: the round trip and hold the pair trader's open is held to, `deskRoundTrip`;
+  the runs reported below before 2026-11-04 used 5 bps over 240 h), the desk policy, the 2 % open-interest cap, the 7- and 14-day multi-day gate
   and its ranking. The contract's oracle prices count as fresh (serve refreshes them at the open). The margin sits on
   the desk's venues: no 1Click move is priced.
 - **The real decide().** Every hour: two scans (the first loads that hour's history, the second is priced on it, as

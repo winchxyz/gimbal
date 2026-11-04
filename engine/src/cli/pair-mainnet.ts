@@ -78,6 +78,7 @@ import type { DeskSolanaAccounts } from '../relayer/phoenix-withdraw.ts';
 import { Relayer } from '../relayer/relayer.ts';
 import { SolanaSubmitter, parseMessage } from '../relayer/solana.ts';
 import { NothingExecuted } from '../relayer/tx.ts';
+import { MAINNET_COSTS } from '../scanner/config.ts';
 import { MAX_LEVERAGE, usd, venueMaxLeverage } from '../trade/carry-plan.ts';
 import type { TraderLock } from '../trade/trader-state.ts';
 import { acquireTraderLock, lockHolder, traderLockPath } from '../trade/trader-state.ts';
@@ -388,8 +389,9 @@ async function open(ctx: Ctx): Promise<void> {
   const legUsd = Number(legUsdText);
   if (!(legUsd > 0)) throw new UsageError('legUsd must be a number above 0');
   const leverage = num(ctx.args, '--leverage', 2);
-  const holdDays = num(ctx.args, '--hold-days', 7);
-  const basisBps = num(ctx.args, '--basis-bps', 10);
+  // The scanner's hold and basis buffer by default (7 days, 10 bps): what its gate showed the window on.
+  const holdDays = num(ctx.args, '--hold-days', MAINNET_COSTS.holdHours / 24);
+  const basisBps = num(ctx.args, '--basis-bps', MAINNET_COSTS.basisBufferBps);
   if (!(leverage > 0) || !(holdDays > 0)) throw new UsageError('--leverage and --hold-days must be above 0');
   const pair = await buildPair(ctx, symbol, () => orderOptions(ctx.args));
   const plan = await planOpen(ctx, pair, { symbol, legUsd, leverage, holdDays, basisBps });

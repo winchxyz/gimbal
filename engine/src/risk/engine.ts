@@ -133,7 +133,7 @@ export interface RiskEngineOptions {
   clock?: Clock;
   intervalMs?: number;
   /** The ADL watch (serve's pair may change under it: serve-pair.ts passes one that follows the pair held now). */
-  adl?: Pick<AdlWatch, 'check' | 'stop'>;
+  adl?: Pick<AdlWatch, 'check' | 'stop'> & Partial<Pick<AdlWatch, 'unwinding'>>;
   /**
    * E9: takes a trigger and runs the rescue, then calls rescueEnded. Without it, or when it answers false (not taken:
    * serve's live rescuer is not running yet, rescue-retry.ts), the trigger is published at `detect`.
@@ -200,9 +200,17 @@ export class RiskEngine {
     return this.#stress?.rescuePct ?? null;
   }
 
-  /** The running ADL check, if any (tests wait on it). */
+  /**
+   * The running ADL check, if any (tests and shutdown wait on it). It starts beside every desk read and is read-only
+   * unless it unwinds: whether an unwind signs is adlUnwinding.
+   */
   get adlRunning(): Promise<void> | null {
     return this.#adlRun;
+  }
+
+  /** An ADL unwind attempt runs now (AdlWatch.unwinding): its close signs or is in flight. */
+  get adlUnwinding(): boolean {
+    return this.#o.adl?.unwinding === true;
   }
 
   /** How many triggers are remembered for their landing to find their leg (tests). */

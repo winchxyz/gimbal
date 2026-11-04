@@ -19,7 +19,7 @@ import { sizeFor } from '../strategy/decide.ts';
 import { STRATEGY, T0, win as deskWin } from '../strategy/test-helpers.ts';
 import { VirtualClock, readRecording } from '../venues/replay.ts';
 import { replayStart } from './serve-replay.ts';
-import { depthAtSize, fillsOf, loopHands, openedQty, riskFacts, serveLoop, windowFacts, windowSymbol } from './serve-loop.ts';
+import { depthAtSize, fillsOf, loopHands, openedQty, protectionText, riskFacts, serveLoop, windowFacts, windowSymbol } from './serve-loop.ts';
 import type { PairHands, ServePair } from './serve-pair.ts';
 import { toQty } from '../trade/lots.ts';
 import type { PairResult } from '../trade/pair.ts';
@@ -363,6 +363,13 @@ test('loopHands: the held symbol\'s legs only, one leg named, busy() refusing fi
   assert.equal(gateSeen?.(), 'rescue r-1 runs', 'the open carries the gate, asked again before its orders');
   assert.equal(await h.reconcile!(), 'SOL record reconciled with the venues');
   assert.equal((await h.close({ reason: 'test' })).sent, false);
+  // An open the trader refused for cost carries why, for the loop to hold the window out of the entry rules.
+  const why = 'the expected spread over 7 days, $0.0390, does not cover the round trip $0.0421';
+  const cost = loopHands({ ...pair, open: async () => ({ ok: false, reason: `open refused, nothing signed: ${why}`, results: [], lines: [], open: [], tx: [], feeUsd: 0, costRefused: why }) },
+    () => desk, () => {}, () => null);
+  const refused = await cost.open({ window: deskWin('sol-phoenix-hyperliquid'), symbol: 'SOL', legUsd: 12, leverage: 1, qty: '0.12', reason: 'test' });
+  assert.deepEqual([refused.ok, refused.sent, refused.costRefused], [false, false, why]);
+  assert.equal(opened.costRefused, undefined);
 });
 
 test('depth at size: a long walks the asks, a short the bids; the fill\'s distance from the mid in bps, unknown when the levels read do not fill it', () => {
@@ -412,4 +419,14 @@ test('risk facts: each leg\'s book at size, the 24 h move from the carry, the li
   assert.ok(logs.some((l) => /hyperliquid SOL book not read \(socket closed\), its depth is unknown/.test(l)));
   // A window the scan does not carry: nothing added.
   assert.deepEqual(await facts({ id: 'eth-orderly-hyperliquid' } as FundingWindow, 500), {});
+});
+
+test('protectionText: the loop waits on a rescue, an ADL unwind in flight or panic_close, never on the read-only ADL check', () => {
+  const none = { rescue: null, adlUnwinding: false, panicClose: false };
+  // serve runs the ADL check beside every 5 s read: with no unwind attempt it holds nothing back.
+  assert.equal(protectionText(none), null);
+  assert.equal(protectionText({ ...none, adlUnwinding: true }), 'an ADL unwind is in flight');
+  assert.equal(protectionText({ ...none, rescue: 'r-1' }), 'rescue r-1 runs');
+  assert.equal(protectionText({ ...none, panicClose: true }), 'panic_close runs');
+  assert.equal(protectionText({ rescue: 'r-1', adlUnwinding: true, panicClose: true }), 'rescue r-1 runs', 'the rescue is named first');
 });

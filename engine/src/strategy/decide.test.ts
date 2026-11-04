@@ -682,6 +682,37 @@ test('a vetoed window drops out: the next one in the scanner\'s rank is entered,
   assert.equal(warming.counters.lastWaitReason, `warming:${SOL}:1:veto:${XLM}`);
 });
 
+test('cost: a window the pair trader refused for cost fails the gate, its hours start again, and the one below it is entered', () => {
+  const windows = () => [win(XLM), win(SOL, { netAprPct: 12 })];
+  const ds = hours(input(), 3, windows);
+  assert.deepEqual(ds[2]!.act, { kind: 'enter', windowId: XLM, legUsd: 12, leverage: 1.5, qty: '12' });
+  // The trader refused XLM's open for cost: XLM's count goes (not SOL's), and no veto hold is set.
+  const why = 'the expected spread over 7 days, $0.0390, does not cover the round trip $0.0421';
+  const refused = skipAct(input({ now: T0 + 2 * HOUR, windows: windows(), counters: ds[1]!.counters }), ds[2]!, { costRefused: true });
+  assert.equal(refused.aboveByWindow[XLM], undefined);
+  assert.equal(refused.aboveByWindow[SOL], 3);
+  assert.deepEqual(refused.vetoedUntil, {});
+  // Until the next hourly check the loop passes the refusal: XLM fails the entry rules as `cost`, SOL is entered.
+  const costRefused = { [XLM]: why };
+  assert.equal(entryFailure(win(XLM), { strategy: STRATEGY, costRefused }), `the pair trader refused it for cost this hour: ${why}`);
+  const next = decide(input({ hourly: false, now: T0 + 2 * HOUR + 5_000, windows: windows(), counters: refused, costRefused }));
+  assert.deepEqual(next.act, { kind: 'enter', windowId: SOL, legUsd: 12, leverage: 1.5, qty: '12' });
+  // Without the refusal the same scan would ask for XLM again at once (its count of 3 kept): the retry every hour.
+  const kept = decide(input({ hourly: false, now: T0 + 2 * HOUR + 5_000, windows: windows(), counters: ds[2]!.counters }));
+  assert.equal(kept.act?.kind === 'enter' && kept.act.windowId, XLM);
+  // Alone, XLM counts from 1 again once the refusal ends: re-asked after 3 more hours at the earliest, not every hour.
+  const alone = hours(input({ now: T0 + 3 * HOUR, counters: refused }), 3, () => [win(XLM)]);
+  assert.deepEqual(actions(alone), ['wait', 'wait', 'enter']);
+  assert.equal(alone[0]!.decision.reason, 'XLM 15.0 % net, 1 of 3 hours above 10 %');
+  // A rotation target refused for cost loses its better-hours count the same way.
+  const rWindows = [heldWin(12), win(ZEC, { netAprPct: 30, switchCostUsd: 0.04 })];
+  const rs = hours(input({ held: held(XLM) }), 4, () => rWindows);
+  assert.equal(rs[3]!.decision.action, 'rotate');
+  const rRefused = skipAct(input({ held: held(XLM), now: T0 + 3 * HOUR, windows: rWindows, counters: rs[2]!.counters }), rs[3]!, { costRefused: true });
+  assert.equal(rRefused.betterByWindow[ZEC], undefined);
+  assert.deepEqual(rRefused.vetoedUntil, {});
+});
+
 test('a vetoed rotation target is not rotated into again for 6 h', () => {
   const windows = [heldWin(12), win(ZEC, { netAprPct: 30, switchCostUsd: 0.04 })];
   const rs = hours(input({ held: held(XLM) }), 4, () => windows);
