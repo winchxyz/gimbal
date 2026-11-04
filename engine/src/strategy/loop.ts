@@ -681,6 +681,15 @@ export class StrategyLoop {
   // ---- state kept between checks for a manual rotate ----
   #lastFacts: WindowFacts = {};
   #lastFree: Record<string, number> = {};
+  #checked = 0;
+
+  /**
+   * Checks so far that read a scan's windows and the free margin (what a manual rotate's first check is sized on).
+   * GIMBAL_CONTROL's /rotate and /close wait for the first (serve-control.ts).
+   */
+  get checked(): number {
+    return this.#checked;
+  }
 
   #manualRefusal(): string | null {
     if (this.#stopped) return 'serve is stopping';
@@ -813,6 +822,7 @@ export class StrategyLoop {
     const facts = await this.#readFacts(scanned);
     this.#lastFacts = facts;
     this.#lastFree = freeMarginUsd;
+    this.#checked++;
     const policy = this.#o.policy();
     const before = this.#state.counters;
     const input: DecideInput = {

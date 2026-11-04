@@ -25,6 +25,9 @@
 //                       must not leave a close or a transfer half done)
 // NEAR_AI_API_KEY turns on POST /policy/draft (src/nearai/); without it the route answers 503, drafting unavailable.
 // GIMBAL_SETUP=1 turns on POST /setup (src/setup/): venue setup signs through the operator key (OPERATOR_PRIVATE_KEY).
+// GIMBAL_CONTROL={"id","method","path","body"} (serve-control.ts): one POST /rotate, POST /close or PUT /strategy sent
+// to this server's own route over loopback once the engine is ready for it, at most once per run-id (a marker in the
+// state directory); for a host where the control routes cannot be reached from a shell (docs/deploy-railway.md).
 // The contract (testnet and mainnet, src/cli/serve-contract.ts): with GIMBAL_CONTRACT_ID and DESK_ID set (and
 // OWNER_ACCOUNT_ID or OPERATOR_ACCOUNT_ID, OPERATOR_PRIVATE_KEY, optional NEAR_NETWORK / NEAR_RPC_URL), the policy
 // is get_desk's, the oracle is the contract's stored prices, and a `health` event carries NEAR's state. Views
@@ -115,6 +118,7 @@ import type { OrderlyPairSide, ServeOrderly } from './serve-orderly.ts';
 import { ORDERLY_PAIRS_ENV, ORDERLY_START_WAIT_MS, operatorClient, orderlyPairSide, orderlyPairsOn, riskOrderlyNote, serveOrderly, startOrderlySession } from './serve-orderly.ts';
 import type { NearContractClient } from '../contract/near-client.ts';
 import { startEgressLog } from './serve-egress.ts';
+import { controlFromEnv, loopbackCall } from './serve-control.ts';
 import type { LoopAccount } from './serve-loop.ts';
 import { loopBook, loopGates, serveLoop } from './serve-loop.ts';
 import { ConfigError, retryStart } from './start-errors.ts';
@@ -677,6 +681,21 @@ const shown = host.includes(':') ? `[${host}]` : host;
 log(`engine ${mode} on http://${shown}:${listening}: GET /events /state /windows/history?id= /strategy /journal, PUT /strategy, POST /rotate /close`);
 // The read-only view: a second listener on a ViewSource (reads only), never on the server above.
 const view = await startView({ env: envVar, processEnv: process.env, enginePort: listening, engineHost: host, source: server.viewSource(), log });
+// GIMBAL_CONTROL (serve-control.ts): one request to this server's own POST /rotate, POST /close or PUT /strategy, sent
+// over loopback in the background once the engine is ready for it, at most once per run-id. Unset: nothing runs.
+const control = controlFromEnv(envVar, {
+  stateDir: stateDirSet === undefined ? userStateDir(envVar) : resolve(stateDirSet),
+  trade: envVar('GIMBAL_TRADE') === '1',
+  waitingFor: (path) => {
+    if (scans === 0) return 'the first scan';
+    if (path === '/strategy') return null;
+    const unsure = pair?.unconfirmed?.() ?? null;
+    if (unsure !== null) return `the pair's start (${unsure})`;
+    return strategyLoop.checked === 0 ? 'the strategy loop\'s first check of a scan' : null;
+  },
+  call: loopbackCall(host, listening),
+  log,
+});
 
 let stopping = false;
 /** How long a shutdown waits for a close in flight: one MPC signature can take 120 s, and a close is one per leg plus a retry. */
@@ -711,7 +730,7 @@ async function shutdown(reason: string): Promise<void> {
       } catch (err) {
         log(`stopping: the risk engine stopped with an error (${err instanceof Error ? err.message : String(err)})`);
       }
-      await Promise.allSettled([closingWatch?.current ?? Promise.resolve(), strategyLoop.idle(SHUTDOWN_WAIT_MS), pair?.drain(SHUTDOWN_WAIT_MS) ?? Promise.resolve(true), rescueDone, setup?.orderlyWithdraw?.drain()]);
+      await Promise.allSettled([closingWatch?.current ?? Promise.resolve(), strategyLoop.idle(SHUTDOWN_WAIT_MS), pair?.drain(SHUTDOWN_WAIT_MS) ?? Promise.resolve(true), rescueDone, setup?.orderlyWithdraw?.drain(), control?.drain()]);
       return pair?.pair?.closing !== true && rescueRunning?.() == null;
     })(),
     deadline,
@@ -720,6 +739,7 @@ async function shutdown(reason: string): Promise<void> {
   if (!drained && stillRescuing !== null) log(`stopping: rescue ${stillRescuing} is still running after ${SHUTDOWN_WAIT_MS / 1000} s; exiting anyway: a payment it signed was saved as held before signing, and the next start reads it at 1Click and on chain`);
   if (!drained && (stillRescuing === null || pair?.pair?.closing === true)) log(`stopping: a close is still running after ${SHUTDOWN_WAIT_MS / 1000} s; exiting anyway: its orders are saved as in flight (the next start only alerts on ADL until a close result); check both legs by hand`);
   if (setup?.orderlyWithdraw?.inFlight() === true) log('orderly withdraw: started marker left, unknown outcome; check arbiscan before a new run-id');
+  if (control?.inFlight() === true) log('control: started marker left, unknown outcome; check the journal and the engine rules before a new run-id');
   pair?.stop();
   orderlySide?.stop();
   orderly?.stop();

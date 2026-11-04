@@ -1323,3 +1323,22 @@ test('the saved state keeps the risk check\'s why line with a hold-out; a malfor
     assert.equal(s.counters.vetoedUntil['sol-phoenix-hyperliquid'], T0 + HOUR);
   }
 });
+
+test('checked counts only the checks that read a scan and the free margin (GIMBAL_CONTROL waits for the first)', async () => {
+  const off = world({ trade: false });
+  const offLoop = makeLoop(off);
+  await offLoop.check();
+  assert.equal(offLoop.checked, 0, 'GIMBAL_TRADE off: no check reads the scan');
+
+  const w = world({ windows: null });
+  const loop = makeLoop(w);
+  await loop.check();
+  assert.equal(loop.checked, 0, 'no scan yet');
+  w.busy = 'rescue r-1 is running';
+  w.windows = world().windows;
+  await loop.check();
+  assert.equal(loop.checked, 0, 'busy: no decision');
+  w.busy = null;
+  await loop.check();
+  assert.equal(loop.checked, 1);
+});

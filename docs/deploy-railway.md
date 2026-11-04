@@ -25,7 +25,8 @@ repo root are all it needs.
   close or a rescue already under way. Railway's default is 0 s, which would kill it mid-order.
 - **The control API is never public.** The engine's HTTP API listens on `127.0.0.1:8790` only and has no login:
   anyone who could reach it could close the pair or turn `auto` on. Reach it from inside the container with
-  `railway ssh` (below). Never point a domain, a TCP proxy or `GIMBAL_HOST` at it.
+  `railway ssh` (below), or, with static outbound IPs on (where `railway ssh` does not work), through
+  `GIMBAL_CONTROL` ("Control without a shell", below). Never point a domain, a TCP proxy or `GIMBAL_HOST` at it.
 - **A public domain only for the read-only view.** The one port that may have a Railway public domain is the
   view's: a second listener, off by default, that serves the GET routes and the event stream behind a bearer token
   and refuses every write (below, "The read-only view"). No `GIMBAL_VIEW_TOKEN`, no public domain.
@@ -117,6 +118,137 @@ Then deploy, and make no `PUT /strategy` in between. After the deploy, the log m
 `engine rules from /data/gimbal/strategy-mainnet-<desk>.json`, not `engine rules not loaded, starting from the
 defaults (auto off): ...`. `GET /strategy` must also show the auto you expect. The older code runs on its own fixed
 counts (enter 3, exit 3).
+
+## Control without a shell (GIMBAL_CONTROL)
+
+`railway ssh` does not work while the service has static outbound IPs, and those must stay on: Orderly takes the
+desk key only from them. So `POST /rotate`, `POST /close` and `PUT /strategy` can be sent once through a variable
+instead (`engine/src/cli/serve-control.ts`):
+
+```
+GIMBAL_CONTROL={"id":"<run-id>","method":"POST|PUT","path":"/rotate|/close|/strategy","body":{...}}
+```
+
+Serve sends that request to its own loopback server, so the route's handler, its checks and its answer are the same
+as for a request from inside the container. Nothing is added and nothing is skipped. Only `POST /rotate`, `POST /close`
+and `PUT /strategy` are allowed; anything else is refused with a `control: refused: ...` line and nothing is called.
+The run-id is letters, digits, `-` and `_`, up to 40 characters. Pick a new one for every action.
+
+What it does (every line starts with `control:`):
+
+1. A marker `/data/gimbal/control-<run-id>.json` already exists: it logs what the marker says and does nothing. A
+   run-id runs at most once, across restarts and redeploys.
+2. `POST /rotate` and `POST /close` need `GIMBAL_TRADE=1`. Without it the run is refused at once, with no marker, and
+   the same run-id runs once `GIMBAL_TRADE=1` is back.
+3. It waits until the engine is ready, at most 10 min: the first scan, and for `/rotate` and `/close` also the
+   pair's confirmed start and the strategy loop's first check of a scan (so `/rotate` sees the window and the free
+   margin). The `waiting for ...` lines say what for. Past 10 min it writes the marker `failed` and calls nothing; that
+   run-id is not tried again. `PUT /strategy` waits for the first scan only: it does not touch the pair, and restoring
+   the rescue line must not hang on a pair whose start is not confirmed.
+4. It logs the engine rules as `GET /strategy` answers them (`control: engine rules before the call ...`), then
+   writes the marker `started`, created exclusively and fsynced.
+5. It sends the request and logs the route's answer: `control: done: POST /rotate answered 200 {"ok":true} ...`, or
+   the route's own refusal, for example `409 {"ok":false,"reason":"auto is off: ..."}`. The marker becomes `done` with
+   that status and body. A request that fails with no answer leaves `failed` (unknown outcome).
+
+Serve's start does not wait for the run; serve's shutdown does (within the 180 s drain). A shutdown while it still
+waits stops it with no marker, so the next start runs it. A marker that says `started` with no outcome (the
+container died during the call) is logged as an unknown outcome and never run again: check the journal, the desk and
+the engine rules before you pick a new run-id. A `/rotate` or `/close` the route accepted runs in the strategy loop
+like any other: its progress is in the `journal   ...` lines and the dashboard's Journal.
+
+**Steps** (the owner runs each command):
+
+1. Set the variable. **Each `railway variable set` or `delete` redeploys the engine**, which takes about 90 s to
+   3 min to go live again (above). Setting a new value over the old one is one redeploy, so go from one action to the
+   next by setting the next value; delete the variable only at the end. In bash, and in PowerShell 7.3 or later, use
+   single quotes:
+
+   ```
+   railway variable set 'GIMBAL_CONTROL={"id":"close-1","method":"POST","path":"/close"}'
+   ```
+
+   Windows PowerShell 5.1 (and PowerShell 7.2 or older) strips the double quotes from an argument to a native
+   program, so escape each one as `\"` inside the single quotes:
+
+   ```
+   railway variable set 'GIMBAL_CONTROL={\"id\":\"close-1\",\"method\":\"POST\",\"path\":\"/close\"}'
+   ```
+
+   The Variables tab of the service (Raw Editor) takes the JSON as is, with no quoting.
+2. Watch the log for the `control:` lines: `railway logs | grep control:` (bash) or
+   `railway logs | Select-String 'control:'` (PowerShell). The first one, `control: run <run-id>: POST /close`,
+   echoes what serve read; `control: refused: GIMBAL_CONTROL is not JSON` means the quotes were lost. Then
+   `waiting for ...`, `engine rules before the call ...`, `started: marker ...` and `done: ...` (or `failed: ...`).
+   Do not redeploy before the `done` or `failed` line.
+3. At the end, remove it: `railway variable delete GIMBAL_CONTROL`. Left set, it does nothing more for a run-id that
+   has a marker (one `control: run ... has a marker` line at each start).
+
+**Window ids.** A window id is `<base>-<long venue>-<short venue>` in lower case: `eth-hyperliquid-phoenix` holds
+ETH long on Hyperliquid and short on Phoenix. The log names them in the scan line
+(`scan N: ... best <window id> 12.34 % net`, on the first scan and every 12th after, about once a minute) and in the
+strategy loop's `decision  <action>: ...` and `journal   ...` lines. The dashboard's Windows view and the read-only
+view's `GET /state` (`windows[].id`) list every window of the last scan. A rotate only takes a window in the last
+scan.
+
+**Examples.**
+
+- **Manual enter** (`POST /rotate`). It skips the entry streak (`enterAfterChecks`) and `minNetAprPct` and keeps
+  every other check: the window must be in the last scan, tradable and not stale, pass its checks, not be held out by
+  the NEAR AI risk check, be in a direction the pair trader opens, and size within the free margin and the policy;
+  it is checked and sized again when it runs, and the NEAR AI risk check runs as for any enter. With a pair held it
+  closes that pair first. The route needs `auto` on and answers `409 auto is off` otherwise. Turn `auto` on first with
+  a strategy change (below); with `auto` on the loop also enters, exits and rotates by itself after its checks.
+
+  ```
+  railway variable set 'GIMBAL_CONTROL={"id":"enter-1","method":"POST","path":"/rotate","body":{"windowId":"eth-hyperliquid-phoenix"}}'
+  ```
+
+- **Close** (`POST /close`): both legs, reduce-only. It works with `auto` on or off and answers `409 no pair is held`
+  when there is none.
+
+  ```
+  railway variable set 'GIMBAL_CONTROL={"id":"close-1","method":"POST","path":"/close"}'
+  ```
+
+- **Raise the rescue line, then restore it** (`PUT /strategy`, the settings `risk.rescueDistancePct` and
+  `risk.watchDistancePct`). There is no separate risk route: the rescue and watch lines are part of the engine rules.
+  A leg is in rescue when its distance to liquidation is under the rescue line, `max(rescueDistancePct, the
+  volatility term)` (`engine/src/risk/thresholds.ts`); the risk engine reads the desk every 5 s, and the rescue moves
+  the margin that brings the leg back to its watch line, `max(watchDistancePct, rescue line + (watchDistancePct −
+  rescueDistancePct))`. `PUT /strategy` takes the **whole** config, so copy the last
+  `control: engine rules before the call` line (every run logs it; also `GET /strategy` on the read-only view) and
+  change only `risk`. The route refuses (400) anything but `0 < rescueDistancePct < watchDistancePct < 100`.
+
+  1. Read the leg's live distance from the `monitor   <venue> <symbol> ... D % from liquidation` lines (every
+     30 min) or the dashboard's Desk.
+  2. Raise: `rescueDistancePct` 2 points above the live distance, `watchDistancePct` a few points above that. The
+     wider the gap between the live distance and the watch line, the more margin moves. For a leg at 30 %:
+     `"risk":{"watchDistancePct":36,"rescueDistancePct":32}`. The `rescue trigger <id>: <venue> <symbol> at D % < R %,
+     A USD from <source>` line says how much and from where. Under a route's smallest amount (about 2.86 USD into
+     Hyperliquid, 0.44 into Phoenix at the final policy, `engine/src/rescue/plan.ts`) or over what is left of
+     `rescue_cap_usd_per_hour`, the rescue reduces both legs instead of moving margin.
+
+     ```
+     railway variable set 'GIMBAL_CONTROL={"id":"rescue-up-1","method":"PUT","path":"/strategy","body":{"auto":true,"minNetAprPct":5,"legUsd":20,"maxLeverage":3,"stopDrawdownPct":10,"rotate":{"minGainPts":3,"forHours":4},"risk":{"watchDistancePct":36,"rescueDistancePct":32},"enterAfterChecks":3,"exitAfterChecks":6}}'
+     ```
+
+  3. Restore once the rescue landed (the dashboard's Rescue view and Journal: `rescue <id> landed in N s`): the same
+     body with the `risk` values from the `engine rules before the call` line of the raise (the defaults are
+     `"watchDistancePct":15,"rescueDistancePct":8`). While the raised line is above a leg the engine keeps rescuing
+     it, with backoff, and each try counts against the hourly cap. Set the restore straight over the raise (one
+     redeploy).
+
+     ```
+     railway variable set 'GIMBAL_CONTROL={"id":"rescue-down-1","method":"PUT","path":"/strategy","body":{"auto":true,"minNetAprPct":5,"legUsd":20,"maxLeverage":3,"stopDrawdownPct":10,"rotate":{"minGainPts":3,"forHours":4},"risk":{"watchDistancePct":15,"rescueDistancePct":8},"enterAfterChecks":3,"exitAfterChecks":6}}'
+     ```
+
+  The values in these bodies are an example: send the rules the log printed, not these.
+
+- **Any strategy change** (`PUT /strategy`), for example `auto` on or off, `legUsd` or `minNetAprPct`: the whole
+  config, as above. **It persists**: serve saves it in `/data/gimbal/strategy-mainnet-<desk>.json` before it takes
+  effect, and every later start loads it, until another `PUT /strategy` changes it back. Deleting `GIMBAL_CONTROL`
+  does not undo it. Write down the `engine rules before the call` line before you change anything.
 
 ## Bringing USDC back from Orderly
 
