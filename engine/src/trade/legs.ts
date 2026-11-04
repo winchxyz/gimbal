@@ -641,6 +641,9 @@ export function parseOrderlyReport(r: Record<string, unknown>, receivedAt: numbe
   };
 }
 
+/** How far the fills' fee sum and the final report's totalFee may differ before it is a disagreement, USD. */
+export const ORDERLY_FEE_TOLERANCE_USD = 2e-6;
+
 /**
  * What Orderly charged for one order: the sum of its fill reports' `fee` when every fill report seen has one and they
  * add up to the order's executed total, else its final report's `totalFee`; null when neither says. When both are
@@ -653,7 +656,8 @@ export function orderlyOrderFee(end: OrderlyReport, reports: readonly OrderlyRep
     && (end.totalExecutedQuantity === null || Math.abs(executed - end.totalExecutedQuantity) <= 1e-9 * Math.max(1, executed));
   const sum = whole ? fills.reduce((s, r) => s + r.fee!, 0) : null;
   if (sum === null) return end.totalFee;
-  if (end.totalFee !== null && Math.abs(sum - end.totalFee) > 1e-9 * Math.max(1, Math.abs(sum))) {
+  // Orderly rounds each fee to 1e-6 USDC: a difference within that is the rounding, not a disagreement.
+  if (end.totalFee !== null && Math.abs(sum - end.totalFee) > ORDERLY_FEE_TOLERANCE_USD) {
     onDisagree?.(`orderly order ${end.orderId}: the fills' fees add up to ${sum}, its final report says totalFee ${end.totalFee}; booked ${sum}`);
   }
   return sum;

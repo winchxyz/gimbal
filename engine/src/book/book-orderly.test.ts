@@ -15,6 +15,7 @@ import type { OrderlyFundingFeePage, OrderlyFundingFeeRow } from '../venues/orde
 import { VirtualClock, readWireRecording, replayFetch } from '../venues/replay.ts';
 import type { FundingPayment } from '../venues/venue.ts';
 import { createBook } from './book.ts';
+import { fundingPeriodAt, periodicOf } from './derive.ts';
 import { ORDERLY_FILL_KEEP_MS, ORDERLY_LATE_PUSH_MS, OrderlyFillLog, orderlyBookFunding, orderlyBookSymbol } from './orderly.ts';
 import { bookReport } from './report.ts';
 import { liveBookSources } from './sources.ts';
@@ -286,10 +287,52 @@ test('the Orderly fill log answers only for the time the session heard: before i
   log.heard(T0 + 6 * H + 60_000);
   assert.equal(log.closeFills({ ...q, from: T0 + 6 * H - 1_000, to: T0 + 6 * H + 1_000 })!.fill.qty, '1');
 
-  // Kept 48 h: older fills and gaps go, and the log then knows only from there.
+  // Kept 48 h: older fills and gaps go; a window reaching back to the newest one dropped is unknown, a later one is not.
   log.heard(T0 + 6 * H + ORDERLY_FILL_KEEP_MS);
-  assert.equal(log.since, T0 + 6 * H);
-  assert.throws(() => log.closeFills({ ...q, from: T0 + 5 * H, to: T0 + 7 * H }), /known from/);
+  assert.equal(log.since, T0, 'the session start stays');
+  assert.throws(() => log.closeFills({ ...q, from: T0 + 5 * H, to: T0 + 7 * H }), /no longer kept/);
+  assert.equal(log.closeFills({ ...q, from: T0 + 5 * H + 60_001, to: T0 + 7 * H })!.fill.qty, '1');
+});
+
+test('a silent session costs one hear-wait: later reads fail at once until it is heard again', async () => {
+  const log = new OrderlyFillLog(T0);
+  log.heard(T0 + H);
+  assert.equal(await log.whenHeard(T0 + 2 * H, 20), false);
+  const quick = await Promise.race([log.whenHeard(T0 + 2 * H, 10_000), new Promise<'waited'>((r) => setTimeout(() => r('waited'), 200).unref())]);
+  assert.equal(quick, false);
+  // Heard again: the next read waits once more, and resolves when the session is heard past its target.
+  log.heard(T0 + H + 1_000);
+  const back = log.whenHeard(T0 + 2 * H, 10_000);
+  log.heard(T0 + 2 * H);
+  assert.equal(await back, true);
+});
+
+test('a 72 h Orderly hold with no fill after its open still reads its close outside the loop', async () => {
+  const s = setup();
+  s.book.record(enterSol());
+  await s.syncAt(T0 + 7 * H + 5 * 60_000);
+  // Frames every hour for three days; the open's fill (10:19:50) is dropped after 48 h.
+  for (let t = T0 + 8 * H; t <= T0 + 72 * H; t += H) s.log.heard(t);
+  const closedAt = T0 + 72 * H + 30 * 60_000;
+  s.log.onExecutionReport(push({ orderId: 13, side: 'SELL', qty: 5, px: 199, fee: 0.398, tradeId: 9003, at: closedAt }), closedAt + 50);
+  s.release();
+  const r = await s.syncAt(closedAt + 5 * 60_000);
+  const p = s.book.summary().positions[0]!;
+  assert.deepEqual([p.open, p.exitReason, p.fillsUnread], [false, 'closed outside the loop', false], JSON.stringify(r.lines));
+  assert.equal(p.legs.find((l) => l.venue === 'orderly')!.exitPx, 199);
+});
+
+test('Orderly funding times are counted per payment interval on that payment\'s period', () => {
+  const row = (time: number, samples: number) => ({ v: 1 as const, type: 'funding' as const, at: time, key: `k${time}`, venue: 'orderly', symbol: 'SOL', time, usd: -0.01, size: 1, ratePerHour: 0, samples, positionId: 'p' });
+  // 4 h payments at 04:00 and 08:00, then 8 h ones at 16:00 and 00:00; held 00:30 .. 23:59 of day 0.
+  const day = T0 - 10 * H;
+  const rows = [row(day + 4 * H, 4), row(day + 8 * H, 4), row(day + 16 * H, 8), row(day + 24 * H, 8)];
+  // (00:30, 04:00] on 4 h: 04:00; (04:00, 08:00]: 08:00; (08:00, 16:00] on 8 h: 16:00; (16:00, 23:59] on 8 h: none.
+  // The shortest period everywhere would also owe 12:00 and 20:00.
+  assert.deepEqual(periodicOf(rows, day + 30 * 60_000, day + 24 * H - 60_000, true), { periodHours: 8, due: 3, read: true });
+  assert.equal(fundingPeriodAt(rows, day + 12 * H), 8);
+  assert.equal(fundingPeriodAt(rows, day + 2 * H), 4);
+  assert.equal(fundingPeriodAt([], day), 8);
 });
 
 test('without the session\'s fill log an Orderly fill read fails rather than saying nothing filled; symbols; no Orderly, as before', async () => {

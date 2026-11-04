@@ -82,8 +82,9 @@ export interface LegResult {
   /** Funding times (top of the hour) inside the hold, up to the last read of this venue's ledger. */
   hours: number;
   /**
-   * A venue paying once per funding period only (PERIODIC_FUNDING_VENUES): its period (from its payments, else the
-   * default), the funding times of that period inside the hold up to the last read, and whether its ledger was read.
+   * A venue paying once per funding period only (PERIODIC_FUNDING_VENUES): its latest period (from its payments, else
+   * the default), the funding times inside the hold up to the last read (each interval on its own period), and
+   * whether its ledger was read.
    */
   periodic?: { periodHours: number; due: number; read: boolean };
 }
@@ -91,15 +92,37 @@ export interface LegResult {
 /** The period assumed for a periodic venue's leg before any payment says otherwise (Orderly's usual 8 h). */
 export const DEFAULT_FUNDING_PERIOD_HOURS = 8;
 
-/** A periodic venue's period on a position: the shortest its payments stand for, else the default. */
-export function fundingPeriodHours(rows: readonly { samples: number | null; adjusts?: string }[]): number {
-  const periods = rows.filter((r) => r.adjusts === undefined && r.samples !== null && r.samples > 0).map((r) => r.samples!);
-  return periods.length === 0 ? DEFAULT_FUNDING_PERIOD_HOURS : Math.min(...periods);
+type PeriodRow = { time: number; samples: number | null; adjusts?: string };
+
+/** A periodic venue's payments that state a period, oldest first. */
+function periodRows(rows: readonly PeriodRow[]): PeriodRow[] {
+  return rows.filter((r) => r.adjusts === undefined && r.samples !== null && r.samples > 0).sort((a, b) => a.time - b.time);
 }
 
-function periodicOf(rows: readonly FundingEvent[], from: number, to: number, read: boolean): { periodHours: number; due: number; read: boolean } {
-  const periodHours = fundingPeriodHours(rows);
-  return { periodHours, due: periodTimesIn(from, to, periodHours), read };
+/**
+ * The period in force at `t`: that of the first payment at or after it (the payment that ends its interval), else
+ * that of the last one before it, else the default.
+ */
+export function fundingPeriodAt(rows: readonly PeriodRow[], t: number): number {
+  const pays = periodRows(rows);
+  return (pays.find((r) => r.time >= t) ?? pays.at(-1))?.samples ?? DEFAULT_FUNDING_PERIOD_HOURS;
+}
+
+/** The funding times in (from, to], each payment interval counted on its own payment's period. */
+export function periodicOf(rows: readonly FundingEvent[], from: number, to: number, read: boolean): { periodHours: number; due: number; read: boolean } {
+  const pays = periodRows(rows);
+  let due = 0;
+  let at = from;
+  for (const r of pays) {
+    if (r.time <= at) continue;
+    const end = Math.min(r.time, to);
+    due += periodTimesIn(at, end, r.samples!);
+    at = end;
+    if (at >= to) break;
+  }
+  const last = pays.at(-1)?.samples ?? DEFAULT_FUNDING_PERIOD_HOURS;
+  if (at < to) due += periodTimesIn(at, to, last);
+  return { periodHours: last, due, read };
 }
 
 /** Funding times on a UTC grid of `periodHours` in (from, to]. */

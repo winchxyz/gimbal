@@ -176,6 +176,16 @@ test('orderly: fills and final report disagreeing on the fee: the fills\' sum is
   assert.equal(notes.length, 1);
   assert.match(notes[0]!, /^orderly order 77: the fills' fees add up to 0\.005\d*, its final report says totalFee 0\.006; booked 0\.005\d* \(said once\)$/);
 
+  // Orderly's rounding (1e-6 USDC) apart is agreement: nothing logged.
+  const rounded = orderlyLeg({
+    reports: (leg) => {
+      leg.onExecutionReport(pushed('PARTIAL_FILLED', { qty: 0.002, px: 2499, fee: 0.001999, total: 0.002, totalFee: 0.001999, tradeId: 501 }));
+      leg.onExecutionReport(pushed('FILLED', { qty: 0.003, px: 2500, fee: 0.003, total: 0.005, totalFee: 0.005, tradeId: 502 }));
+    },
+  });
+  await rounded.leg.order('SELL', q('0.005'), false, 'open');
+  assert.equal(rounded.lines.filter((l) => /totalFee/.test(l)).length, 0);
+
   // A fill report the leg never saw (the reports seen add up to less than the order executed): the final totalFee.
   const missed = await orderlyLeg({
     reports: (leg) => leg.onExecutionReport(pushed('FILLED', { qty: 0.003, px: 2500, fee: 0.003, total: 0.005, totalFee: 0.005, tradeId: 502 })),

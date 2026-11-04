@@ -9,7 +9,10 @@
 // private session's executionreport pushes, kept here (OrderlyFillLog). The log answers only for the time it heard the
 // session: a window before it started (or before what it kept), inside a time the session was down, or not yet heard
 // past by ORDERLY_LATE_PUSH_MS (a socket that died silently, a push still on its way) throws, so the book holds the
-// exit (or books it "fills unread") instead of taking "no fills" for an answer.
+// exit (or books it "fills unread") instead of taking "no fills" for an answer. Known limit: a position opened before
+// serve's last restart has its close window start before the new session, so an Orderly close of it made outside the
+// loop is never readable: after the book's 24 h wait it is booked "fills unread" (price and close fees estimated).
+// Only a fills read kind in the contract would fix that.
 //
 // Symbols: the book names a position by its policy symbol (Hyperliquid's and Phoenix's names: "SOL", "kPEPE",
 // "GOLD"); an Orderly row "PERP_SOL_USDC" is booked under that name (orderlyBookSymbol).
@@ -109,6 +112,10 @@ export class OrderlyFillLog {
   #downSince: number | null = null;
   /** The last time the session was heard (a frame, a pong, a push). */
   #heardUntil: number;
+  /** The newest time the log forgot something (a dropped fill, a dropped gap): a window reaching it is unknown. */
+  #forgotUntil = -Infinity;
+  /** A wait for the session timed out and nothing was heard since: later waits fail at once (one wait per silence). */
+  #silent = false;
 
   /** `since`: when the session's subscriptions were on (ms); nothing before it is known. */
   constructor(since: number) {
@@ -116,7 +123,7 @@ export class OrderlyFillLog {
     this.#heardUntil = since;
   }
 
-  /** From when the log knows the desk's fills (it moves forward as old fills are dropped). */
+  /** When the session's subscriptions were on: nothing before it is known. */
   get since(): number {
     return this.#since;
   }
@@ -124,7 +131,10 @@ export class OrderlyFillLog {
   /** The session was heard at `at` (any frame or pong): it was alive up to then. */
   heard(at: number): void {
     if (this.#downSince !== null) return;
-    if (at > this.#heardUntil) this.#heardUntil = at;
+    if (at > this.#heardUntil) {
+      this.#heardUntil = at;
+      this.#silent = false;
+    }
     this.#evict();
     for (const w of [...this.#waiters]) if (w.target <= this.#heardUntil) w.done(true);
   }
@@ -133,16 +143,19 @@ export class OrderlyFillLog {
 
   /**
    * Resolves true once the session is heard at or after `target` (a read up to now waits for the late-push margin
-   * to pass), false after `timeoutMs` (a session that went silent: the read then fails as unheard).
+   * to pass), false after `timeoutMs` (a session that went silent: the read then fails as unheard). After a wait that
+   * timed out, the next ones fail at once until the session is heard again, so a silent session costs one wait.
    */
   whenHeard(target: number, timeoutMs: number): Promise<boolean> {
     if (this.#heardUntil >= target) return Promise.resolve(true);
+    if (this.#silent) return Promise.resolve(false);
     return new Promise<boolean>((resolve) => {
       const w = {
         target,
         done: (ok: boolean) => {
           clearTimeout(timer);
           this.#waiters.delete(w);
+          if (!ok && this.#heardUntil < target) this.#silent = true;
           resolve(ok);
         },
       };
@@ -182,6 +195,7 @@ export class OrderlyFillLog {
   /** Why [from, to] cannot be answered, or null when the session heard all of it (and late pushes for it). */
   uncovered(from: number, to: number): string | null {
     if (from < this.#since) return `orderly: the session's fills are known from ${new Date(this.#since).toISOString()} only`;
+    if (from <= this.#forgotUntil) return `orderly: what the session heard up to ${new Date(this.#forgotUntil).toISOString()} is no longer kept`;
     if (this.#downSince !== null && to >= this.#downSince) return `orderly: the session is down since ${new Date(this.#downSince).toISOString()}`;
     const gap = this.#gaps.find((g) => g.from <= to && g.to >= from);
     if (gap !== undefined) return `orderly: the session was down ${new Date(gap.from).toISOString()} .. ${new Date(gap.to).toISOString()}`;
@@ -221,18 +235,23 @@ export class OrderlyFillLog {
     return mine.reduce((s, f) => s + f.fee!, 0);
   }
 
-  /** Drops what is older than the keep time: fills, their keys and gaps; the log then knows from there on. */
+  /**
+   * Drops fills and gaps older than the keep time. Only a window reaching back to the newest thing dropped is unknown
+   * afterwards: a long hold with no fill since its open still reads its close (the open's fill is before the window).
+   */
   #evict(): void {
     const keepFrom = this.#heardUntil - ORDERLY_FILL_KEEP_MS;
-    if (keepFrom <= this.#since) return;
-    this.#since = keepFrom;
     for (let i = this.#fills.length - 1; i >= 0; i--) {
       const f = this.#fills[i]!;
       if (f.time >= keepFrom) continue;
+      this.#forgotUntil = Math.max(this.#forgotUntil, f.time);
       this.#keys.delete(f.key);
       this.#fills.splice(i, 1);
     }
-    this.#gaps = this.#gaps.filter((g) => g.to >= keepFrom);
+    if (this.#gaps.some((g) => g.to < keepFrom)) {
+      for (const g of this.#gaps) if (g.to < keepFrom) this.#forgotUntil = Math.max(this.#forgotUntil, g.to);
+      this.#gaps = this.#gaps.filter((g) => g.to >= keepFrom);
+    }
   }
 }
 

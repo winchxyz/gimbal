@@ -11,7 +11,7 @@
 
 import type { JournalEntry, TxRef } from '@gimbal/shared';
 import type { PositionResult } from './derive.ts';
-import { HOUR_MS, PERIODIC_FUNDING_VENUES, attribute, fundingPeriodHours, hourOf, isEstimate, positionsOf, spans } from './derive.ts';
+import { HOUR_MS, PERIODIC_FUNDING_VENUES, attribute, fundingPeriodAt, hourOf, isEstimate, positionsOf, spans } from './derive.ts';
 import type { MissingFee } from './sync.ts';
 import type { BookEvent, FeeEvent, FundingEvent, JournalEvent, TransferEvent } from './types.ts';
 
@@ -65,12 +65,13 @@ export function fundingJournal(events: readonly BookEvent[], now: number): Journ
     const late = done.has(k);
     const venues = g.position.legs.map((l) => l.venue);
     const paid = new Set(g.rows.map((r) => r.venue));
-    // A venue that pays once per funding period is waited for, and missing, only on its funding times (its period from
-    // the payments booked on the symbol, else the default); in the hours between them it owes nothing.
+    // A venue that pays once per funding period is waited for, and missing, only on its funding times (the period of
+    // the payment interval the hour is in, from the payments booked on the symbol, else the default); in the hours
+    // between them it owes nothing.
     const periodic = (v: string) => PERIODIC_FUNDING_VENUES.has(v);
     const owes = (v: string) => {
       if (!periodic(v)) return true;
-      const p = fundingPeriodHours(events.filter((e): e is FundingEvent => e.type === 'funding' && e.venue === v && e.symbol === g.position.symbol));
+      const p = fundingPeriodAt(events.filter((e): e is FundingEvent => e.type === 'funding' && e.venue === v && e.symbol === g.position.symbol), g.hour);
       return g.hour % (p * HOUR_MS) === 0;
     };
     if (!late && !venues.every((v) => !owes(v) || paid.has(v)) && now - g.hour < JOURNAL_GRACE_MS) continue;
