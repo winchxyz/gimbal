@@ -6,10 +6,22 @@ import { OrderlyReader } from './venues/orderly.ts';
 import { PhoenixReader } from './venues/phoenix.ts';
 import type { RecordLine } from './venues/recorder.ts';
 import { ReplayVenue, ReplayWatch } from './venues/replay.ts';
-import type { Clock, VenueReader, WatchReader } from './venues/venue.ts';
+import type { AccountState, Clock, VenueReader, WatchReader } from './venues/venue.ts';
 import { isDeskVenueId } from './venues/venue.ts';
 import type { WatchVenueId } from './venues/watch/index.ts';
 import { WATCH_VENUE_IDS, watchReaders } from './venues/watch/index.ts';
+
+/** How old an account read the strategy loop's free margin may take (serve): one scan and a little. */
+export const LOOP_ACCOUNT_MAX_AGE_MS = 7_000;
+
+/**
+ * `reader`'s account at `address`, as read at most `maxAgeMs` ago by anyone in the process when the reader keeps one
+ * (PhoenixReader.accountWithin), else read now.
+ */
+export function accountWithin(reader: VenueReader, address: string, maxAgeMs: number): Promise<AccountState> {
+  const within = (reader as VenueReader & { accountWithin?: (a: string, ms: number) => Promise<AccountState> }).accountWithin;
+  return typeof within === 'function' ? within.call(reader, address, maxAgeMs) : reader.account(address);
+}
 
 export interface Readers {
   venues: VenueReader[];

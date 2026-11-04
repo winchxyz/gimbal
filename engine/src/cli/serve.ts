@@ -76,7 +76,7 @@ import { NearAiClient } from '../nearai/client.ts';
 import { PolicyDrafter, deskMarkets } from '../nearai/draft-route.ts';
 import { StrategyStore, strategyFile } from '../strategy-store.ts';
 import { setupFromEnv } from '../setup/serve-setup.ts';
-import { liveReaders, replayReaders } from '../readers.ts';
+import { LOOP_ACCOUNT_MAX_AGE_MS, accountWithin, liveReaders, replayReaders } from '../readers.ts';
 import type { Readers } from '../readers.ts';
 import { DEFAULT_STRATEGY, ORDERLY_BROKERS, scannerConfigFor } from '../scanner/config.ts';
 import { Scanner } from '../scanner/scanner.ts';
@@ -330,7 +330,9 @@ if (mode === 'replay') {
     { reader: reader('hyperliquid'), address: side.desk.evm_address },
     { reader: reader('phoenix'), address: side.desk.solana.authority },
   ].filter((a): a is { reader: NonNullable<typeof a.reader>; address: string } => a.reader !== undefined && a.address !== '');
-  for (const a of accounts) loopAccounts.push({ venue: a.reader.id, read: () => a.reader.account(a.address) });
+  // The strategy loop's free margin takes the risk engine's last read when it is a scan old at most: on Phoenix
+  // (about 1 request a second for everything) a second account read every scan would spend a third of it.
+  for (const a of accounts) loopAccounts.push({ venue: a.reader.id, read: () => accountWithin(a.reader, a.address, LOOP_ACCOUNT_MAX_AGE_MS) });
   // get_desk says only whether the desk is paused, not who paused it or when (that is in its `paused` event): `at` is
   // when this engine first saw it paused, `by` is unknown.
   let pausedSince: number | null = null;
@@ -457,7 +459,7 @@ if (contract !== null && deskId !== null) {
       // Only a loop with hands on a confirmed start checks what it holds against the venues; else unknown.
       loopHeld: () => (loop === null || pair?.hands === undefined || (pair.unconfirmed?.() ?? null) !== null ? undefined : loop.held),
     });
-    log(`book: positions kept in ${book.path}; venue ledgers synced now and every hour (read only); npm run report prints it`);
+    log(`book: positions kept in ${book.path}; venue ledgers synced now, when a position is booked and every hour (read only; with no position booked there is none to read); npm run report prints it`);
   } catch (err) {
     log(`book: NOT kept (${errorMessage(err)}); the loop runs without it until that file is fixed or moved and serve restarts`);
   }

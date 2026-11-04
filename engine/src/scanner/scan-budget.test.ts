@@ -62,7 +62,8 @@ const POLICY: ContractPolicy = {
 function scanner(vs: GatedVenue[], clock: VirtualClock, held: HeldWindow | null = null, policy: ContractPolicy | null = null) {
   const notes: string[] = [];
   const s = new Scanner(vs as unknown as VenueReader[], [], {
-    config: { ...DEFAULT_SCANNER_CONFIG, policy },
+    // Off-desk books at the desk's age too: these tests are about skips, not about how often each tier is read.
+    config: { ...DEFAULT_SCANNER_CONFIG, offDeskBookTtlMs: DEFAULT_SCANNER_CONFIG.bookTtlMs, policy },
     clock,
     strategy: () => DEFAULT_STRATEGY,
     held: () => held,
@@ -201,14 +202,15 @@ test('a scan on a Phoenix reader that answers 429 to everything resolves: failed
     return new Response('{"error":"not recorded"}', { status: 404 });
   }) as typeof fetch;
   const budget = new HostBudget('phoenix-test', { ...PHOENIX_BUDGET, ratePerSec: 200, burst: 50, random: () => 0 });
-  const phoenix = new PhoenixReader({ fetch: f, clock: new VirtualClock(at), budget });
+  // The reader on the scanner's clock: its shared reads (the marks, the overview) age as the scans go on.
+  const clock = new VirtualClock(at);
+  const phoenix = new PhoenixReader({ fetch: f, clock, budget });
   // Hyperliquid quotes the recording's SOL, ETH and BTC at Phoenix's marks, paying more.
   const funding = await phoenix.funding();
   const hl = new GatedVenue('hyperliquid', ['SOL', 'ETH', 'BTC'].map((s) => {
     const p = funding.find((x) => x.symbol === s)!;
     return row('hyperliquid', s, { ratePerHour: p.ratePerHour + 0.0001, markPx: p.markPx, oraclePx: p.markPx, openInterest: 1e9 / p.markPx! });
   }));
-  const clock = new VirtualClock(at);
   const s = new Scanner([hl, phoenix] as unknown as VenueReader[], [], {
     config: DEFAULT_SCANNER_CONFIG, clock, strategy: () => DEFAULT_STRATEGY,
   });
@@ -240,4 +242,65 @@ test('a scan on a Phoenix reader that answers 429 to everything resolves: failed
   assert.deepEqual(r3.scan.failed, ['phoenix']);
   assert.ok(phoenixWindows(r3.windows).every((w) => w.stale));
   await s.idle();
+});
+
+test('off-desk books are read again once 5 min old, the held window\'s and the policy\'s once 30 s old', async () => {
+  const { hl, phoenix } = venues();
+  const clock = new VirtualClock(T0);
+  const s = new Scanner([hl, phoenix] as unknown as VenueReader[], [], {
+    config: { ...DEFAULT_SCANNER_CONFIG, policy: POLICY }, clock, strategy: () => DEFAULT_STRATEGY,
+  });
+  await s.scan();
+  assert.deepEqual([...phoenix.bookCalls].sort(), ['BTC', 'ETH', 'SOL', 'WIF']);
+  phoenix.bookCalls.length = 0;
+  clock.set(T0 + 40_000);
+  const r2 = await s.scan();
+  assert.deepEqual(phoenix.bookCalls, ['BTC'], 'only the policy market: the others are 40 s old, under 5 min');
+  assert.ok(phoenixWindows(r2.windows).every((w) => !w.stale), 'a book under its age is fresh, not stale');
+  phoenix.bookCalls.length = 0;
+  clock.set(T0 + 5 * 60_000);
+  await s.scan();
+  assert.deepEqual([...phoenix.bookCalls].sort(), ['BTC', 'ETH', 'SOL', 'WIF']);
+  // Without a policy (no desk yet) every leg counts as the desk's: read once 30 s old.
+  const { hl: hl2, phoenix: px2 } = venues();
+  const clock2 = new VirtualClock(T0);
+  const { scanner: none } = scanner([hl2, px2], clock2, null, null);
+  await none.scan();
+  px2.bookCalls.length = 0;
+  clock2.set(T0 + 40_000);
+  await none.scan();
+  assert.equal(px2.bookCalls.length, 4);
+});
+
+test('history reads the budget skips: one note for the venue, no failure, and they come back a scan apart', async () => {
+  const { hl, phoenix } = venues();
+  const asked: { symbol: string; at: number }[] = [];
+  let skipping = true;
+  const clock = new VirtualClock(T0);
+  const px = Object.assign(phoenix, {
+    marketFundingHistory: async (symbol: string, _start: number, end: number) => {
+      // The week's reads only: once a week is in, the week before is read too.
+      if (end > clock.now() - 86_400_000) asked.push({ symbol, at: clock.now() });
+      if (skipping) throw new ReadSkipped('perp-api.phoenix.trade', 'history', 'budget', null, clock.now());
+      return [];
+    },
+  });
+  const { scanner: s, notes } = scanner([hl, px], clock, null, POLICY);
+  await s.scan();
+  await s.idle();
+  const first = asked.length;
+  assert.ok(first >= 2, `${first} history reads`);
+  assert.ok(!notes.some((n) => /phoenix history .* failed/.test(n)), notes.join('\n'));
+  assert.ok(notes.some((n) => n.startsWith(`phoenix history: ${first} read(s) not sent, tried again over the next scans (perp-api.phoenix.trade history read skipped: request budget spent)`)), notes.join('\n'));
+  // A minute on, one is due; a scan later the next; not all at once.
+  skipping = false;
+  asked.length = 0;
+  clock.set(T0 + 60_000);
+  await s.scan();
+  await s.idle();
+  assert.equal(asked.length, 1, JSON.stringify(asked));
+  clock.set(T0 + 65_000);
+  await s.scan();
+  await s.idle();
+  assert.equal(asked.length, 2, JSON.stringify(asked));
 });

@@ -131,11 +131,22 @@ export async function hlFillFee(f: typeof fetch, infoUrl: string, q: FillFeeQuer
   return mine.reduce((s, r) => s + Number(r.fee), 0);
 }
 
+/**
+ * How long a fee read waits for every one of an act's Solana signatures to show in Phoenix's trades-history. Until
+ * then a signature that is not there yet means no fee: a sum without it would be partial and booked for good, so the
+ * read is tried again at the next sync. After it, a signature still not there is taken as a transaction without fills
+ * (a margin move in the same act, say), and the fee is what the others show.
+ */
+export const PHOENIX_FEE_INDEX_WAIT_MS = 30 * 60_000;
+
 /** The fee Phoenix charged for one leg's fills of an act: trades-history rows of the act's Solana transactions. */
 export async function phoenixFillFee(api: ReturnType<typeof phoenixTraderApi>, q: FillFeeQuery): Promise<number | null> {
   const sigs = q.tx.filter((t) => t.chain === 'solana').map((t) => t.id);
   if (sigs.length === 0) return null;
   const raw = await api.tradesHistory(q.address, 100);
+  const rows = (raw as { data?: unknown } | null)?.data;
+  const indexed = new Set(Array.isArray(rows) ? (rows as { signature?: unknown }[]).map((r) => r.signature).filter((x): x is string => typeof x === 'string') : []);
+  if ((q.now ?? Date.now()) - q.at < PHOENIX_FEE_INDEX_WAIT_MS && sigs.some((sig) => !indexed.has(sig))) return null;
   let fee = 0;
   let found = false;
   for (const sig of sigs) {

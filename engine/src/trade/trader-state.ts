@@ -564,9 +564,13 @@ export interface TraderLock {
   readonly path: string;
   /** A stale lock this one replaced: whose it was and why it was stale (serve journals it); null when none was there. */
   readonly tookOver: string | null;
-  /** Touches the lock now (the timer does every LOCK_HEARTBEAT_MS); false once the lock is not this holder's any more. */
+  /**
+   * Touches the lock now (the timer does every LOCK_HEARTBEAT_MS). false when nothing was touched: released, the lock
+   * names another holder (the heartbeat stops for good), or it could not be read or touched now (a transient EIO or
+   * EMFILE: the heartbeat goes on and tries again at the next beat).
+   */
   beat(): boolean;
-  /** Whether the heartbeat runs (until release(), or until the lock is found not to be this holder's). */
+  /** Whether the heartbeat runs: until release(), or until the lock is read and names another holder. */
   beating(): boolean;
   release(): void;
 }
@@ -600,11 +604,11 @@ export interface AcquireOptions {
   now?: () => number;
   timers?: LockTimers;
   /**
-   * Tests: called when a stale lock was read (`read`), once the takeover guard is held (`guarded`), right before the
-   * stale lock is removed (`unlink`), and right before the new lock's text is written (`write`; a throw there is a
-   * failed write).
+   * Tests: called when a stale lock was read (`read`), when a stale takeover guard was read and is about to be checked
+   * again before its removal (`stale-guard`), once the takeover guard is held (`guarded`), right before the stale lock
+   * is removed (`unlink`), and right before the new lock's text is written (`write`; a throw there is a failed write).
    */
-  onTakeover?: (stage: 'read' | 'guarded' | 'unlink' | 'write') => void;
+  onTakeover?: (stage: 'read' | 'stale-guard' | 'guarded' | 'unlink' | 'write') => void;
 }
 
 /**
@@ -638,6 +642,31 @@ function readGuard(path: string): string | null {
   } catch {
     return null;
   }
+}
+
+/** A guard as read: its text and which file it is (inode and mtime, from stat); null when it cannot be read (gone). */
+interface GuardSeen {
+  text: string;
+  ino: bigint;
+  mtimeNs: bigint;
+}
+
+function seeGuard(path: string): GuardSeen | null {
+  try {
+    const st = statSync(path, { bigint: true });
+    return { text: readFileSync(path, 'utf8'), ino: st.ino, mtimeNs: st.mtimeNs };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether `now` is still the guard `seen` was: the same text, inode and mtime. The text alone cannot tell a dead
+ * starter's empty guard (it died between making the file and writing its token) from a live starter's fresh one at
+ * the same moment of its life.
+ */
+function sameGuard(seen: GuardSeen, now: GuardSeen | null): boolean {
+  return now !== null && now.text === seen.text && now.ino === seen.ino && now.mtimeNs === seen.mtimeNs;
 }
 
 /** Takes the lock or throws why not. */
@@ -676,12 +705,19 @@ export function acquireTraderLock(path: string, options: AcquireOptions = {}): T
       guard = openSync(guardPath, 'wx');
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw new Error(`the trader lock's takeover guard ${guardPath} could not be made: ${(err as Error).message}`);
-      const seen = readGuard(guardPath);
-      const age = beatAge(guardPath, now());
+      const seen = seeGuard(guardPath);
+      const age = seen === null ? null : Math.max(0, now() - Number(seen.mtimeNs / 1_000_000n));
       if (seen !== null && age !== null && age > TAKEOVER_GUARD_STALE_MS) {
-        // Left by a starter that died while taking over: removed only while it is still that guard (another starter
-        // may have removed it and made its own since).
-        if (readGuard(guardPath) === seen) {
+        // Left by a starter that died while taking over: removed only while it is still that guard, the same file
+        // (another starter may have removed it and made its own since, empty too until its token is written).
+        options.onTakeover?.('stale-guard');
+        // Known window (from before the inode check): between this check and the unlink, another starter can remove
+        // the stale guard and make its own, which this unlink then removes, so two starters may both hold "the"
+        // guard. It takes a starter that died holding a guard, then two starters reaching its removal within the same
+        // few microseconds. A rename to a private name would make the check race-free, but when the renamed file
+        // turns out to be a live starter's guard it has to be renamed back, and that can race a third starter: not
+        // worth it here.
+        if (sameGuard(seen, seeGuard(guardPath))) {
           try {
             unlinkSync(guardPath);
           } catch {
@@ -736,12 +772,18 @@ export function acquireTraderLock(path: string, options: AcquireOptions = {}): T
   const timers = options.timers ?? lockTimers;
   let released = false;
   let timer: unknown = null;
-  const mine = (): boolean => {
+  // Whose the lock is now: `other` only when the file was read and names another holder; `unread` when it could not
+  // be read (gone, EIO, EMFILE) or names no one yet (a starter between making it and writing it).
+  const whose = (): 'mine' | 'other' | 'unread' => {
+    let text: string;
     try {
-      return parseLockText(readFileSync(path, 'utf8'))?.id === me.id;
+      text = readFileSync(path, 'utf8');
     } catch {
-      return false;
+      return 'unread';
     }
+    const owner = parseLockText(text);
+    if (owner === null) return 'unread';
+    return owner.id === me.id ? 'mine' : 'other';
   };
   const stopBeat = () => {
     if (timer === null) return;
@@ -750,10 +792,17 @@ export function acquireTraderLock(path: string, options: AcquireOptions = {}): T
     heartbeats--;
   };
   const beat = (): boolean => {
-    if (released || !mine()) {
+    if (released) {
       stopBeat();
       return false;
     }
+    const w = whose();
+    if (w === 'other') {
+      stopBeat();
+      return false;
+    }
+    // A read that failed proves nothing: the lock is still this holder's as far as is known, so the beat goes on.
+    if (w === 'unread') return false;
     const t = new Date(now());
     try {
       utimesSync(path, t, t);
@@ -769,7 +818,7 @@ export function acquireTraderLock(path: string, options: AcquireOptions = {}): T
     released = true;
     stopBeat();
     try {
-      if (mine()) unlinkSync(path);
+      if (whose() === 'mine') unlinkSync(path);
     } catch {
       // Already gone.
     }

@@ -9,12 +9,16 @@
 //   Solana       contract.sol_sign*   -> sendTransaction, rebroadcast every 2 s until it lands   (solana.ts)
 //   Orderly      contract.orderly_*   -> REST with the orderly-* headers                         (orderly.ts)
 //   Arbitrum     evm_usdc_to_intents  -> transferWithAuthorization from the gas-only wallet      (arbitrum.ts)
+//
+// Every action is marked as the desk's own at its start and end (venues/desk-acts.ts): an account answer read before
+// it is not handed out again after it (the strategy loop sizes from the margin after the desk's own order).
 
 import type { TxRef } from '@gimbal/shared';
 import type { ContractClient, DeskView, HlOrder, HlSignedAction, OutcomeIds, SignedQuote, SolSignedAction } from '../contract/types.ts';
 import { MpcTimeoutError, OutcomeUnknown, solMessageDigest } from '../contract/types.ts';
 import type { OrderlyRequest, OrderlyRequestKind } from '../venues/orderly-signer.ts';
 import { signedClientOrderId } from '../venues/orderly-signer.ts';
+import { asDeskAct } from '../venues/desk-acts.ts';
 import type { ArbitrumSubmitter } from './arbitrum.ts';
 import { newCloid } from './hl-order.ts';
 import type { HlSubmitResult, HyperliquidSubmitter } from './hyperliquid.ts';
@@ -101,8 +105,9 @@ export class Relayer {
   }
 
   async submitHl(signed: HlSignedAction): Promise<HlSubmitResult> {
-    if (this.#hl === undefined) throw new Error('relayer: no Hyperliquid submitter configured');
-    return this.#hl.submit(signed, (await this.desk()).evm_address);
+    const hl = this.#hl;
+    if (hl === undefined) throw new Error('relayer: no Hyperliquid submitter configured');
+    return asDeskAct(async () => hl.submit(signed, (await this.desk()).evm_address));
   }
 
   // ---- Solana ----
@@ -119,7 +124,11 @@ export class Relayer {
     return this.#solana(build, (m) => this.#contract.solSignRescue(this.deskId, m, quote, reason));
   }
 
-  async #solana(build: SolanaMessageBuilder, sign: (messageB64: string) => Promise<SolSignedAction>): Promise<TxRef[]> {
+  #solana(build: SolanaMessageBuilder, sign: (messageB64: string) => Promise<SolSignedAction>): Promise<TxRef[]> {
+    return asDeskAct(() => this.#solanaAct(build, sign));
+  }
+
+  async #solanaAct(build: SolanaMessageBuilder, sign: (messageB64: string) => Promise<SolSignedAction>): Promise<TxRef[]> {
     const sol = this.#sol;
     if (sol === undefined) throw new Error('relayer: no Solana submitter configured');
     const authority = (await this.desk()).solana.authority;
@@ -165,17 +174,23 @@ export class Relayer {
     }
     const now = this.#orderly.now ?? Date.now;
     const req: OrderlyRequest = { reduce_only: false, ...fields, kind, timestamp_ms: now() };
-    const signed = await this.#contract.orderlyRequest(this.deskId, req, reason);
-    const data = await sendOrderlyRest<T>(signed, kind, this.#orderly);
-    return { data, tx: signed.nearTx === undefined ? [] : [signed.nearTx], clientOrderId: kind === 'order' ? signedClientOrderId(signed) : null };
+    const target = this.#orderly;
+    return asDeskAct(async () => {
+      const signed = await this.#contract.orderlyRequest(this.deskId, req, reason);
+      const data = await sendOrderlyRest<T>(signed, kind, target);
+      return { data, tx: signed.nearTx === undefined ? [] : [signed.nearTx], clientOrderId: kind === 'order' ? signedClientOrderId(signed) : null };
+    });
   }
 
   // ---- Arbitrum and NEAR ----
 
   async evmUsdcToIntents(quote: SignedQuote, reason: string): Promise<TxRef[]> {
-    if (this.#arb === undefined) throw new Error('relayer: no Arbitrum submitter configured');
-    const signed = await this.#contract.evmUsdcToIntents(this.deskId, quote, reason);
-    return this.#arb.submit(signed, (await this.desk()).evm_address);
+    const arb = this.#arb;
+    if (arb === undefined) throw new Error('relayer: no Arbitrum submitter configured');
+    return asDeskAct(async () => {
+      const signed = await this.#contract.evmUsdcToIntents(this.deskId, quote, reason);
+      return arb.submit(signed, (await this.desk()).evm_address);
+    });
   }
 
   fundVenue(quote: SignedQuote, reason: string): Promise<TxRef[]> {
