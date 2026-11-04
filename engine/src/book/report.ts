@@ -2,7 +2,6 @@
 // risk check ledger (book/risk-ledger.ts) against those positions. Pure.
 
 import type { BookSummary, LegResult, PositionResult } from './derive.ts';
-import { PERIODIC_FUNDING_VENUES } from './derive.ts';
 import { signed } from './journal.ts';
 import type { PassResult, RefusalResult, RiskLedgerSummary } from './risk-ledger.ts';
 
@@ -28,12 +27,13 @@ function legLine(l: LegResult, open: boolean): string {
 }
 
 function fundingPart(l: LegResult): string {
-  // A venue paying once per funding period: its payments, each standing for a whole period, against the hours read.
-  if (PERIODIC_FUNDING_VENUES.has(l.venue)) {
-    if (l.payments === 0) return `${l.venue} ${signed(l.fundingUsd)} (no payment in ${l.hours} h: it pays once per funding period)`;
-    const period = l.paidHours / l.payments;
-    const each = Number.isInteger(period) ? `one per ${period} h funding period` : `${l.paidHours} h of funding periods`;
-    return `${l.venue} ${signed(l.fundingUsd)} (${l.payments} payment(s), ${each}, in ${l.hours} h)`;
+  // A venue paying once per funding period: its payments against the funding times of its period inside the hold.
+  const per = l.periodic;
+  if (per !== undefined) {
+    if (!per.read) return `${l.venue} ${signed(l.fundingUsd)} (not read)`;
+    const missing = per.due - l.payments;
+    return `${l.venue} ${signed(l.fundingUsd)} (${l.payments} of ${per.due} payment(s) of its ${per.periodHours} h funding period in ${l.hours} h`
+      + `${missing > 0 ? `, ${missing} with no payment booked` : ''})`;
   }
   const missing = l.hours - l.paidHours;
   const estimated = l.estimatedHours > 0 ? `, ${l.estimatedHours} h ${signed(l.estimatedUsd)} estimated from daily aggregates` : '';

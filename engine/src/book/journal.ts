@@ -11,7 +11,7 @@
 
 import type { JournalEntry, TxRef } from '@gimbal/shared';
 import type { PositionResult } from './derive.ts';
-import { HOUR_MS, PERIODIC_FUNDING_VENUES, attribute, hourOf, isEstimate, positionsOf, spans } from './derive.ts';
+import { HOUR_MS, PERIODIC_FUNDING_VENUES, attribute, fundingPeriodHours, hourOf, isEstimate, positionsOf, spans } from './derive.ts';
 import type { MissingFee } from './sync.ts';
 import type { BookEvent, FeeEvent, FundingEvent, JournalEvent, TransferEvent } from './types.ts';
 
@@ -65,9 +65,15 @@ export function fundingJournal(events: readonly BookEvent[], now: number): Journ
     const late = done.has(k);
     const venues = g.position.legs.map((l) => l.venue);
     const paid = new Set(g.rows.map((r) => r.venue));
-    // A venue that pays once per funding period is neither waited for nor missing in the hours between its payments.
+    // A venue that pays once per funding period is waited for, and missing, only on its funding times (its period from
+    // the payments booked on the symbol, else the default); in the hours between them it owes nothing.
     const periodic = (v: string) => PERIODIC_FUNDING_VENUES.has(v);
-    if (!late && !venues.every((v) => periodic(v) || paid.has(v)) && now - g.hour < JOURNAL_GRACE_MS) continue;
+    const owes = (v: string) => {
+      if (!periodic(v)) return true;
+      const p = fundingPeriodHours(events.filter((e): e is FundingEvent => e.type === 'funding' && e.venue === v && e.symbol === g.position.symbol));
+      return g.hour % (p * HOUR_MS) === 0;
+    };
+    if (!late && !venues.every((v) => !owes(v) || paid.has(v)) && now - g.hour < JOURNAL_GRACE_MS) continue;
     const total = g.rows.reduce((s, r) => s + r.usd, 0);
     const numbers: Record<string, number | string> = {
       usd: round6(total), position: g.position.id, window: g.position.windowId, symbol: g.position.symbol, hour: iso(g.hour),
@@ -76,7 +82,7 @@ export function fundingJournal(events: readonly BookEvent[], now: number): Journ
     for (const v of late ? [...paid] : venues) {
       const rows = g.rows.filter((r) => r.venue === v);
       if (rows.length === 0) {
-        if (periodic(v)) continue;
+        if (!owes(v)) continue;
         parts.push(`${v} no payment`);
         numbers[`${v}Usd`] = 'missing';
         continue;

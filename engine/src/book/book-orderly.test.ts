@@ -13,8 +13,9 @@ import type { HlFundingRow } from '../venues/hyperliquid.ts';
 import { parseFundingRow } from '../venues/hyperliquid.ts';
 import type { OrderlyFundingFeePage, OrderlyFundingFeeRow } from '../venues/orderly-actions.ts';
 import { VirtualClock, readWireRecording, replayFetch } from '../venues/replay.ts';
+import type { FundingPayment } from '../venues/venue.ts';
 import { createBook } from './book.ts';
-import { OrderlyFillLog, orderlyBookSymbol } from './orderly.ts';
+import { ORDERLY_FILL_KEEP_MS, ORDERLY_LATE_PUSH_MS, OrderlyFillLog, orderlyBookFunding, orderlyBookSymbol } from './orderly.ts';
 import { bookReport } from './report.ts';
 import { liveBookSources } from './sources.ts';
 import type { BookSources, CloseFillQuery } from './sync.ts';
@@ -86,20 +87,19 @@ function enterSol(): BookRecord {
   };
 }
 
-function setup() {
+/** Orderly pays at 16:00 UTC (its 8 h period): the long pays 0.05 on a positive rate. 08:00 and 00:00 are outside the hold. */
+const FUNDING_ROWS = [feeRow(T0 - 2 * H, 0.04, 'Pay'), feeRow(T0 + 6 * H, 0.05, 'Pay'), feeRow(T0 + 14 * H, 0.03, 'Pay')];
+
+function setup(o: { fundingRows?: OrderlyFundingFeeRow[]; orderlyFunding?: boolean } = {}) {
   const log = new OrderlyFillLog(T0);
-  // The open's Orderly fill (4 bps of 5 x 200.1), then the close nobody reported: sold 5 at 201 (4 bps of 1005).
+  // The open's Orderly fill: 4 bps of 5 x 200.1.
   log.onExecutionReport(push({ orderId: 11, side: 'BUY', qty: 5, px: 200.1, fee: 0.4002, tradeId: 9001, at: ENTER_AT - 10_000 }), ENTER_AT - 9_950);
-  log.onExecutionReport(push({ orderId: 12, side: 'SELL', qty: 5, px: 201, fee: 0.402, tradeId: 9002, at: CLOSED_AT }), CLOSED_AT + 50);
-  // The same push twice (a resubscribe) is one fill.
-  log.onExecutionReport(push({ orderId: 12, side: 'SELL', qty: 5, px: 201, fee: 0.402, tradeId: 9002, at: CLOSED_AT }), CLOSED_AT + 60);
-  // Orderly pays at 16:00 UTC (its 8 h period): the long pays 0.05 on a positive rate. 08:00 and 00:00 are outside the hold.
-  const fees = feeHistory([feeRow(T0 - 2 * H, 0.04, 'Pay'), feeRow(T0 + 6 * H, 0.05, 'Pay'), feeRow(T0 + 14 * H, 0.03, 'Pay')]);
-  const live = liveBookSources({ network: 'mainnet', fetch: replayFetch(WIRE), orderly: { fundingFees: fees, fills: log } });
+  const fees = feeHistory(o.fundingRows ?? FUNDING_ROWS);
+  const live = liveBookSources({ network: 'mainnet', fetch: replayFetch(WIRE), orderly: { fundingFees: fees, fills: log, hearWaitMs: 20 } });
   const hl = new FixtureLedger(hlRows().map(parseFundingRow));
   const hlClose: CloseFillQuery[] = [];
   const sources: BookSources = {
-    funding: { hyperliquid: hl, orderly: live.funding.orderly! },
+    funding: { hyperliquid: hl, ...(o.orderlyFunding === false ? {} : { orderly: live.funding.orderly! }) },
     fillFee: (q) => (q.venue === 'orderly' ? live.fillFee!(q) : Promise.resolve(null)),
     closeFills: async (q) => {
       if (q.venue === 'orderly') return live.closeFills!(q);
@@ -114,14 +114,34 @@ function setup() {
     dir: tempDir(dirs), ...DESK, addresses: { hyperliquid: HL_ADDRESS, orderly: ACCOUNT }, sources, clock,
     publish: (e) => journal.push(e), log: () => {}, loopHeld: () => held,
   });
-  return { book, clock, journal, fees, log, hlClose, release: () => { held = null; } };
+  /**
+   * The book syncs at `t`. The session is alive: it is heard through `t` and the late-push margin after it (the frames
+   * a close read up to `t` waits for), unless `silent`.
+   */
+  const syncAt = async (t: number, silent = false) => {
+    clock.set(t);
+    if (!silent) log.heard(t + ORDERLY_LATE_PUSH_MS);
+    return book.sync();
+  };
+  return { book, clock, journal, fees, log, hlClose, syncAt, release: () => { held = null; } };
+}
+
+/** The open, then the close nobody reported (sold 5 at 201, 4 bps of 1005), settled past exit + 2 h. */
+async function closedOutside(s: ReturnType<typeof setup>) {
+  s.book.record(enterSol());
+  await s.syncAt(T0 + 7 * H + 5 * 60_000);
+  s.log.onExecutionReport(push({ orderId: 12, side: 'SELL', qty: 5, px: 201, fee: 0.402, tradeId: 9002, at: CLOSED_AT }), CLOSED_AT + 50);
+  // The same push twice (a resubscribe) is one fill.
+  s.log.onExecutionReport(push({ orderId: 12, side: 'SELL', qty: 5, px: 201, fee: 0.402, tradeId: 9002, at: CLOSED_AT }), CLOSED_AT + 60);
+  s.release();
+  await s.syncAt(CLOSED_AT + 5 * 60_000);
+  await s.syncAt(CLOSED_AT + 3 * H);
 }
 
 test('an Orderly leg: its fill fee from the session\'s pushes, its close from them, its 8 h funding booked into the pair\'s P&L', async () => {
   const s = setup();
   s.book.record(enterSol());
-  s.clock.set(T0 + 7 * H + 5 * 60_000);
-  await s.book.sync();
+  await s.syncAt(T0 + 7 * H + 5 * 60_000);
 
   // The open's Orderly fee was not in the record: read from the session's fill (one fee event, journaled once).
   const fees = s.book.events.filter((e): e is FeeEvent => e.type === 'fee');
@@ -131,23 +151,27 @@ test('an Orderly leg: its fill fee from the session\'s pushes, its close from th
   const orderly = s.book.events.filter((e): e is FundingEvent => e.type === 'funding' && e.venue === 'orderly');
   assert.deepEqual(orderly.map((f) => [f.symbol, f.time, f.usd, f.samples, f.size]), [['SOL', T0 + 6 * H, -0.05, 8, 5]]);
 
-  // The loop lets go at 17:35 without a report: the exit is booked from both venues' fills since the open.
+  // The close comes at 17:30; the loop lets go without a report, and the exit is booked from both venues' fills.
+  s.log.onExecutionReport(push({ orderId: 12, side: 'SELL', qty: 5, px: 201, fee: 0.402, tradeId: 9002, at: CLOSED_AT }), CLOSED_AT + 50);
+  s.log.onExecutionReport(push({ orderId: 12, side: 'SELL', qty: 5, px: 201, fee: 0.402, tradeId: 9002, at: CLOSED_AT }), CLOSED_AT + 60);
   s.release();
-  s.clock.set(CLOSED_AT + 5 * 60_000);
-  await s.book.sync();
+  await s.syncAt(CLOSED_AT + 5 * 60_000);
   assert.deepEqual(s.hlClose.map((q) => [q.side, q.symbol]), [['BUY', 'SOL']]);
   let p = s.book.summary().positions[0]!;
   assert.deepEqual([p.open, p.exitReason, p.fillsUnread], [false, 'closed outside the loop', false]);
 
-  // Settled: read past the exit + 2 h.
-  s.clock.set(CLOSED_AT + 3 * H);
-  await s.book.sync();
+  // Settled: read past the exit + 2 h. The signed read is made at 17:05 and 20:30 only: at 17:35 no funding time
+  // (16:00, plus the hour it may take to post) fell after the last read.
+  await s.syncAt(CLOSED_AT + 3 * H);
+  assert.equal(s.fees.asked.length, 2);
   p = s.book.summary().positions[0]!;
   const hl = p.legs.find((l) => l.venue === 'hyperliquid')!;
   const ox = p.legs.find((l) => l.venue === 'orderly')!;
   close(hl.fundingUsd, 0.07, 'hyperliquid 11:00 .. 17:00');
   close(ox.fundingUsd, -0.05, 'orderly 16:00');
   assert.deepEqual([ox.payments, ox.paidHours, ox.estimatedUsd, ox.estimatedHours], [1, 8, 0, 0]);
+  assert.deepEqual(ox.periodic, { periodHours: 8, due: 1, read: true });
+  assert.equal(hl.periodic, undefined);
   assert.equal(ox.exitPx, 201);
   close(ox.entryFeeUsd!, -0.4002, 'orderly open fee');
   close(ox.exitFeeUsd!, -0.402, 'orderly close fee');
@@ -174,12 +198,47 @@ test('an Orderly leg: its fill fee from the session\'s pushes, its close from th
   const text = bookReport(s.book.summary());
   assert.match(text, /SOL {2}short hyperliquid, long orderly {2}closed/);
   assert.match(text, /legs {7}hyperliquid short 5 @ 200 -> 201; orderly long 5 @ 200\.1 -> 201/);
-  assert.match(text, /funding {4}hyperliquid \+0\.0700 \(7 of 7 h paid\), orderly -0\.0500 \(1 payment\(s\), one per 8 h funding period, in 7 h\); total \+0\.0200/);
+  assert.match(text, /funding {4}hyperliquid \+0\.0700 \(7 of 7 h paid\), orderly -0\.0500 \(1 of 1 payment\(s\) of its 8 h funding period in 7 h\); total \+0\.0200/);
   assert.match(text, /fees {7}open -0\.8002, close -0\.8020, total -1\.6022\n/);
   assert.doesNotMatch(text, /estimated/);
 });
 
-test('the Orderly fill log answers only for the time the session heard: before it, or while it was down, the read fails', () => {
+test('an Orderly payment that never came is missing on its funding time (journal and report); a never-read leg says so', async () => {
+  // No 16:00 row: Orderly owes one on its funding time inside the hold.
+  const s = setup({ fundingRows: [feeRow(T0 - 2 * H, 0.04, 'Pay')] });
+  await closedOutside(s);
+  const funding = s.journal.filter((j) => j.kind === 'funding' && j.numbers.final === undefined);
+  const at16 = funding.find((j) => j.numbers.hour === '2026-11-02T16:00Z')!;
+  assert.equal(at16.numbers.orderlyUsd, 'missing');
+  assert.match(at16.summary, /orderly no payment/);
+  assert.equal(funding.filter((j) => j.numbers.orderlyUsd === 'missing').length, 1, 'only on its funding time');
+  assert.match(bookReport(s.book.summary()), /orderly \+0\.0000 \(0 of 1 payment\(s\) of its 8 h funding period in 7 h, 1 with no payment booked\)/);
+
+  // No Orderly ledger reader at all: the leg was never read, and the report does not pretend it paid nothing.
+  const u = setup({ orderlyFunding: false });
+  await closedOutside(u);
+  const ox = u.book.summary().positions[0]!.legs.find((l) => l.venue === 'orderly')!;
+  assert.equal(ox.periodic!.read, false);
+  assert.match(bookReport(u.book.summary()), /orderly \+0\.0000 \(not read\)/);
+});
+
+test('a session that went silent before a close outside the loop holds the exit (never booked as no Orderly fills); once heard, it books', async () => {
+  const s = setup();
+  s.book.record(enterSol());
+  await s.syncAt(T0 + 7 * H + 5 * 60_000);
+  // The socket dies without a close at 17:05 + 10 s: the 17:30 close's push never comes, and nothing is heard.
+  s.release();
+  const r = await s.syncAt(CLOSED_AT + 5 * 60_000, true);
+  assert.equal(s.book.summary().positions[0]!.open, true);
+  assert.ok(r.lines.some((l) => !l.ok && /orderly: .*the session was last heard/.test(l.text)), JSON.stringify(r.lines));
+  // A new session comes up (a gap from 17:05 on would be marked by down/up; here the push is late, then frames again).
+  s.log.onExecutionReport(push({ orderId: 12, side: 'SELL', qty: 5, px: 201, fee: 0.402, tradeId: 9002, at: CLOSED_AT }), CLOSED_AT + 6 * 60_000);
+  await s.syncAt(CLOSED_AT + 10 * 60_000);
+  const p = s.book.summary().positions[0]!;
+  assert.deepEqual([p.open, p.exitReason, p.legs.find((l) => l.venue === 'orderly')!.exitPx], [false, 'closed outside the loop', 201]);
+});
+
+test('the Orderly fill log answers only for the time the session heard: before it, while down, after it went silent', () => {
   const log = new OrderlyFillLog(T0);
   log.onExecutionReport(push({ orderId: 1, side: 'SELL', qty: 2, px: 100, fee: 0.08, tradeId: 1, at: T0 + H }), T0 + H);
   log.onExecutionReport(push({ orderId: 1, side: 'SELL', qty: 3, px: 101, fee: 0.1212, tradeId: 2, at: T0 + H + 1 }), T0 + H + 1);
@@ -187,28 +246,83 @@ test('the Orderly fill log answers only for the time the session heard: before i
   log.onExecutionReport({ ...push({ orderId: 2, side: 'SELL', qty: 0, px: 0, fee: 0, tradeId: 0, at: T0 + H }), status: 'CANCELLED' }, T0 + H);
   log.onExecutionReport({ ...push({ orderId: 3, side: 'SELL', qty: 1, px: 50, fee: 0.02, tradeId: 3, at: T0 + H }), symbol: 'PERP_ETH_USDC' }, T0 + H);
   log.onExecutionReport(push({ orderId: 4, side: 'BUY', qty: 1, px: 100, fee: 0.04, tradeId: 4, at: T0 + H }), T0 + H);
+  log.heard(T0 + 3 * H);
   const q = { venue: 'orderly', address: ACCOUNT, symbol: 'SOL', side: 'SELL' as const, from: T0, to: T0 + 2 * H };
   const got = log.closeFills(q)!;
   assert.deepEqual([got.fill.qty, got.fill.avgPx, got.at], ['5', (2 * 100 + 3 * 101) / 5, T0 + H + 1]);
   close(got.fill.feeUsd!, 0.2012, 'fees summed');
   // Orderly's own symbol names the same market.
   assert.equal(log.closeFills({ ...q, symbol: 'PERP_SOL_USDC' })!.fill.qty, '5');
-  assert.equal(log.closeFills({ ...q, from: T0 + 2 * H, to: T0 + 3 * H }), null, 'heard, and nothing filled');
+  assert.equal(log.closeFills({ ...q, from: T0 + 2 * H, to: T0 + 3 * H - ORDERLY_LATE_PUSH_MS }), null, 'heard, and nothing filled');
   assert.throws(() => log.closeFills({ ...q, from: T0 - 1 }), /known from/);
-  log.down(T0 + 2 * H);
-  assert.throws(() => log.closeFills({ ...q, from: T0 + 2 * H, to: T0 + 3 * H }), /down since/);
-  log.up(T0 + 2 * H + 60_000);
-  assert.throws(() => log.closeFills({ ...q, from: T0 + 2 * H - 10, to: T0 + 3 * H }), /was down/);
-  assert.equal(log.closeFills({ ...q, from: T0 + 2 * H + 60_001, to: T0 + 3 * H }), null);
-  // A fee read cannot tell what it did not hear: null, never 0.
-  assert.equal(log.fillFee({ venue: 'orderly', address: ACCOUNT, symbol: 'SOL', side: 'SELL', startedAt: T0 + 2 * H, at: T0 + 2 * H + 1, tx: [] }), null);
+
+  // A socket that died without a close: nothing heard after 3:00, so a window past it is unknown, not "nothing filled".
+  assert.throws(() => log.closeFills({ ...q, from: T0 + 2 * H, to: T0 + 4 * H }), /last heard/);
+  assert.equal(log.fillFee({ venue: 'orderly', address: ACCOUNT, symbol: 'SOL', side: 'SELL', startedAt: T0 + 3 * H, at: T0 + 4 * H, tx: [] }), null);
+
+  // A late push: a fill at 4:00 whose push came 4 s later. Until the session is heard past the window plus the margin
+  // the window is unknown; then the fill is in it.
+  const at = T0 + 4 * H;
+  log.heard(at + 1_000);
+  const late = { ...q, from: at - 60_000, to: at + 2_000 };
+  assert.throws(() => log.closeFills(late), /last heard/);
+  log.onExecutionReport(push({ orderId: 5, side: 'SELL', qty: 1, px: 102, fee: 0.0408, tradeId: 5, at }), at + 4_000);
+  assert.throws(() => log.closeFills(late), /last heard/, 'still inside the late-push margin');
+  log.heard(at + 2_000 + ORDERLY_LATE_PUSH_MS);
+  assert.equal(log.closeFills(late)!.fill.qty, '1');
+
+  // Down and up: the time between is unknown for good.
+  log.down(T0 + 5 * H);
+  log.heard(T0 + 6 * H);   // a frame from a dead session counts for nothing
+  assert.throws(() => log.closeFills({ ...q, from: T0 + 5 * H - 10, to: T0 + 5 * H }), /down since/);
+  log.up(T0 + 5 * H + 60_000);
+  log.heard(T0 + 6 * H);
+  assert.throws(() => log.closeFills({ ...q, from: T0 + 5 * H - 10, to: T0 + 5 * H + 10 }), /was down/);
+  assert.equal(log.closeFills({ ...q, from: T0 + 5 * H + 60_001, to: T0 + 5 * H + 2 * 60_000 }), null);
   close(log.fillFee({ venue: 'orderly', address: ACCOUNT, symbol: 'SOL', side: 'SELL', startedAt: T0 + H - 1000, at: T0 + H + 1000, tx: [] })!, 0.2012, 'fee read');
+
+  // A push whose own clock is a day off is placed at the time it came.
+  log.onExecutionReport(push({ orderId: 6, side: 'SELL', qty: 1, px: 103, fee: 0.0412, tradeId: 6, at: 1_000 }), T0 + 6 * H);
+  log.heard(T0 + 6 * H + 60_000);
+  assert.equal(log.closeFills({ ...q, from: T0 + 6 * H - 1_000, to: T0 + 6 * H + 1_000 })!.fill.qty, '1');
+
+  // Kept 48 h: older fills and gaps go, and the log then knows only from there.
+  log.heard(T0 + 6 * H + ORDERLY_FILL_KEEP_MS);
+  assert.equal(log.since, T0 + 6 * H);
+  assert.throws(() => log.closeFills({ ...q, from: T0 + 5 * H, to: T0 + 7 * H }), /known from/);
 });
 
-test('book symbols for Orderly markets; without Orderly reads the live sources are what they were', async () => {
+test('without the session\'s fill log an Orderly fill read fails rather than saying nothing filled; symbols; no Orderly, as before', async () => {
   assert.deepEqual(['PERP_SOL_USDC', 'PERP_1000PEPE_USDC', 'PERP_XAU_USDC'].map(orderlyBookSymbol), ['SOL', 'kPEPE', 'GOLD']);
   const plain = liveBookSources({ network: 'mainnet', fetch: async () => { throw new Error('no network in this test'); } });
   assert.deepEqual(Object.keys(plain.funding).sort(), ['hyperliquid', 'phoenix']);
-  assert.equal(await plain.closeFills!({ venue: 'orderly', address: ACCOUNT, symbol: 'SOL', side: 'SELL', from: 0, to: 1 }), null);
-  assert.equal(await plain.fillFee!({ venue: 'orderly', address: ACCOUNT, symbol: 'SOL', side: 'SELL', startedAt: 0, at: 1, tx: [] }), null);
+  await assert.rejects(plain.closeFills!({ venue: 'orderly', address: ACCOUNT, symbol: 'SOL', side: 'SELL', from: 0, to: 1 }), /orderly: no fill log/);
+  await assert.rejects(plain.fillFee!({ venue: 'orderly', address: ACCOUNT, symbol: 'SOL', side: 'SELL', startedAt: 0, at: 1, tx: [] }), /orderly: no fill log/);
+
+  // An HL + Orderly protection close with no log: the Orderly leg's read fails, so the exit is held, never booked flat.
+  const s = setup();
+  s.book.record(enterSol());
+  await s.syncAt(T0 + 7 * H + 5 * 60_000);
+  const noLog = liveBookSources({ network: 'mainnet', fetch: replayFetch(WIRE) });
+  const sources: BookSources = {
+    funding: {},
+    closeFills: async (q) => (q.venue === 'orderly' ? noLog.closeFills!(q) : { fill: { venue: 'hyperliquid', side: 'BUY', qty: '5', avgPx: 201, feeUsd: 0.4 }, at: CLOSED_AT }),
+  };
+  const book = createBook({ dir: tempDir(dirs), ...DESK, addresses: { hyperliquid: HL_ADDRESS, orderly: ACCOUNT }, sources, clock: s.clock, log: () => {}, loopHeld: () => null });
+  book.record(enterSol());
+  s.clock.set(CLOSED_AT + 5 * 60_000);
+  const r = await book.sync();
+  assert.equal(book.summary().positions[0]!.open, true, JSON.stringify(r.lines));
+  assert.ok(r.lines.some((l) => !l.ok && /orderly: no fill log/.test(l.text)), JSON.stringify(r.lines));
+});
+
+test('the signed Orderly funding read is made only when a funding time fell after the last read', async () => {
+  const calls: [number, number | undefined][] = [];
+  const reader = { userFunding: async (_a: string, start: number, end?: number): Promise<FundingPayment[]> => { calls.push([start, end]); return []; } };
+  const f = orderlyBookFunding(reader);
+  const day = T0 - 10 * H;   // 00:00 UTC
+  for (const hour of [0.1, 1.1, 2.1, 3.1, 4.1, 5.1, 6.1, 7.1, 8.1]) await f.userFunding(ACCOUNT, day - 24 * H, day + hour * H);
+  // 00:06 (first), 01:06 (00:00 may still post), then 04:06 and 05:06, then 08:06.
+  assert.deepEqual(calls.map(([, end]) => ((end! - day) / H).toFixed(1)), ['0.1', '1.1', '4.1', '5.1', '8.1']);
+  assert.equal(f.skipped, 4);
 });

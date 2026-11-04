@@ -31,7 +31,7 @@ export interface LiveSourceOptions {
    * desk client's signed funding_fee_history read (the book's address for 'orderly' is the account id), `fills` the
    * log the private session's executionreports feed. Absent: no Orderly ledger, as before.
    */
-  orderly?: { fundingFees?: OrderlyFundingFeeSource; fills?: OrderlyFillLog; apiUrl?: string };
+  orderly?: { fundingFees?: OrderlyFundingFeeSource; fills?: OrderlyFillLog; apiUrl?: string; hearWaitMs?: number };
 }
 
 async function post<T>(f: typeof fetch, url: string, body: unknown): Promise<T> {
@@ -181,20 +181,25 @@ export function liveBookSources(o: LiveSourceOptions): BookSources {
   const orderlyFunding = ox?.fundingFees === undefined ? null
     : orderlyBookFunding(new OrderlyReader({ network: o.network, fetch: f, fundingFees: ox.fundingFees, ...(ox.apiUrl === undefined ? {} : { apiUrl: ox.apiUrl }) }));
   const orderlyFills = ox?.fills ?? null;
+  // An Orderly leg's fills without the session's log are unknown, never "none": a failed read the book holds and retries.
+  const orderlyLog = (): OrderlyFillLog => {
+    if (orderlyFills === null) throw new Error('orderly: no fill log (the private session is not open)');
+    return orderlyFills;
+  };
   return {
     funding: { hyperliquid: hl, ...(phoenix === null ? {} : { phoenix }), ...(orderlyFunding === null ? {} : { orderly: orderlyFunding }) },
     hlLedger: (user, startTime, endTime) => hlNonFundingLedger(f, infoUrl, user, startTime, endTime),
     fillFee: async (q) => {
       if (q.venue === 'hyperliquid') return hlFillFee(f, infoUrl, q);
       if (q.venue === 'phoenix' && phoenixApi !== null) return phoenixFillFee(phoenixApi, q);
-      if (q.venue === 'orderly' && orderlyFills !== null) return orderlyFills.fillFee(q);
+      if (q.venue === 'orderly') return orderlyLog().fillFee(q);
       return null;
     },
     hlTxRef: (hash: string): TxRef => hyperliquidTxRef(o.network, hash),
     closeFills: async (q) => {
       if (q.venue === 'hyperliquid') return hlCloseFills(f, infoUrl, q);
       if (q.venue === 'phoenix' && phoenixApi !== null) return phoenixCloseFills(phoenixApi, q);
-      if (q.venue === 'orderly' && orderlyFills !== null) return orderlyFills.closeFills(q);
+      if (q.venue === 'orderly') return orderlyLog().readCloseFills(q, ox?.hearWaitMs);
       return null;
     },
   };

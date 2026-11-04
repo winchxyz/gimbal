@@ -1103,11 +1103,14 @@ before the previous exit there) and its exit, on the leg side its signed size ma
 counts only the hours of its day no hourly row covers; its split per hour is not verified, so its amount is marked
 estimated (`estimated` 1 in the funding entry and the final one, "estimated from daily aggregates" in the report).
 Orderly (only when serve hands `liveBookSources` its `orderly` reads; the book's `orderly` address is the account id):
-funding from the signed `funding_fee_history` read, booked under the book's symbol ("PERP_SOL_USDC" as SOL, 1000X as
-kX); one row per funding period (8 h or 4 h), exact, never estimated, and an hour between its payments is not missing
-(the journal shows it on its own hour as "its 8 h funding period"; the report as payments per period). Its fills come
-from the private session's executionreports (`OrderlyFillLog`, `book/orderly.ts`: `fee` / `totalFee` in USDC, > 0 a
-cost); a window the session did not hear (before it, or while it was down) is a failed read. Fill fees come from the record, else the venue's fills in the
+funding from the signed `funding_fee_history` read (made only when a funding time on the 4 h UTC grid, plus 1 h to
+post, fell after the last read), booked under the book's symbol ("PERP_SOL_USDC" as SOL, 1000X as kX); one row per
+funding period (8 h or 4 h), exact, never estimated; owed only on its funding times (period from its payments, else
+8 h): missing there, nothing between (journal "its 8 h funding period"; report "N of M payment(s)", "not read" for a
+leg never read). Its fills come from the private session's executionreports (`OrderlyFillLog`, `book/orderly.ts`: the
+fills' `fee`, else `totalFee`, in USDC, > 0 a cost; fed `onExecutionReport`, `heard` per frame, `down` / `up`); a
+window it did not hear (before it, while down, or not heard 10 s past its end; a read up to now waits up to 30 s for
+that) is a failed read, and an Orderly leg without the log fails its fill reads. Fill fees come from the record, else the venue's fills in the
 act's window (`userFillsByTime`, Phoenix trades-history, the Orderly fill log); margin-move fees and `addTransfer()` (rescue, fund scripts)
 are transfer costs; the desk's Hyperliquid `userNonFundingLedgerUpdates` are booked to the desk, not a position; a tx
 hash already booked is never counted twice. Per position: funding per leg and in total, fees and price over every fill

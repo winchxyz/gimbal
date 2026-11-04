@@ -163,16 +163,37 @@ const pushed = (status: string, fill: { qty: number; px: number; fee: number; to
   timestamp: 1_793_060_012_806, createdTime: 1_793_060_012_802, matchId: 0, seq: 1, marginMode: 'CROSS', maker: false, ...extra,
 });
 
-test('orderly: a fill books the fee Orderly reported (totalFee of the final report, else the fills\' fee); not USDC or absent is unknown', async () => {
+test('orderly: fills and final report disagreeing on the fee: the fills\' sum is booked and the disagreement logged once', async () => {
+  const s = orderlyLeg({
+    reports: (leg) => {
+      leg.onExecutionReport(pushed('PARTIAL_FILLED', { qty: 0.002, px: 2499, fee: 0.002, total: 0.002, totalFee: 0.002, tradeId: 501 }));
+      leg.onExecutionReport(pushed('FILLED', { qty: 0.003, px: 2500, fee: 0.003, total: 0.005, totalFee: 0.006, tradeId: 502 }));
+    },
+  });
+  const out = await s.leg.order('SELL', q('0.005'), false, 'open');
+  assert.ok(out.kind === 'filled' && Math.abs(out.fee! - 0.005) < 1e-12);
+  const notes = s.lines.filter((l) => /totalFee/.test(l));
+  assert.equal(notes.length, 1);
+  assert.match(notes[0]!, /^orderly order 77: the fills' fees add up to 0\.005\d*, its final report says totalFee 0\.006; booked 0\.005\d* \(said once\)$/);
+
+  // A fill report the leg never saw (the reports seen add up to less than the order executed): the final totalFee.
+  const missed = await orderlyLeg({
+    reports: (leg) => leg.onExecutionReport(pushed('FILLED', { qty: 0.003, px: 2500, fee: 0.003, total: 0.005, totalFee: 0.005, tradeId: 502 })),
+  }).leg.order('SELL', q('0.005'), false, 'open');
+  assert.equal(missed.kind === 'filled' && missed.fee, 0.005);
+});
+
+test('orderly: a fill books the fee Orderly reported (the fills\' fee, else totalFee of the final report); not USDC or absent is unknown', async () => {
   // Two executions of one IOC at the 4 bps taker fee: 0.002 x 2499 x 0.0004 and 0.003 x 2500 x 0.0004.
-  const two = await orderlyLeg({
+  const two = orderlyLeg({
     reports: (leg) => {
       leg.onExecutionReport(pushed('PARTIAL_FILLED', { qty: 0.002, px: 2499, fee: 0.0019992, total: 0.002, totalFee: 0.0019992, tradeId: 501 }));
       leg.onExecutionReport(pushed('FILLED', { qty: 0.003, px: 2500, fee: 0.003, total: 0.005, totalFee: 0.0049992, tradeId: 502 }));
     },
-  }).leg.order('SELL', q('0.005'), false, 'open');
-  assert.equal(two.kind, 'filled');
-  assert.equal(two.kind === 'filled' && two.fee, 0.0049992);
+  });
+  const twoOut = await two.leg.order('SELL', q('0.005'), false, 'open');
+  assert.ok(twoOut.kind === 'filled' && Math.abs(twoOut.fee! - 0.0049992) < 1e-12);
+  assert.equal(two.lines.filter((l) => /totalFee/.test(l)).length, 0, 'they agree: nothing logged');
 
   // A final report without totalFee: the fill reports' fee summed.
   const summed = await orderlyLeg({

@@ -40,7 +40,7 @@ export const HL_NONCE_WINDOW_MS = 2 * 86_400_000;
 
 /** What one order did, as far as the venue's answer proves it. */
 // `fee`: what the venue charged for the fill, USD (Hyperliquid userFills `fee`, Phoenix trades-history `fees`, Orderly
-// executionreport `totalFee`); null
+// executionreport `fee` / `totalFee`); null
 // or absent when the venue's answer did not say. `parts`: a maker order is several orders (post-only limits, then an
 // IOC); the outcome sums them, and each part is its own order record.
 export type LegOutcome =
@@ -642,14 +642,21 @@ export function parseOrderlyReport(r: Record<string, unknown>, receivedAt: numbe
 }
 
 /**
- * What Orderly charged for one order: its final report's `totalFee`, else the sum of its fill reports' `fee`; null when
- * neither says (a fill report without a fee).
+ * What Orderly charged for one order: the sum of its fill reports' `fee` when every fill report seen has one and they
+ * add up to the order's executed total, else its final report's `totalFee`; null when neither says. When both are
+ * known and differ, `onDisagree` hears it (the sum is kept).
  */
-export function orderlyOrderFee(end: OrderlyReport, reports: readonly OrderlyReport[]): number | null {
-  if (end.totalFee !== null) return end.totalFee;
+export function orderlyOrderFee(end: OrderlyReport, reports: readonly OrderlyReport[], onDisagree?: (note: string) => void): number | null {
   const fills = reports.filter((r) => r.executedQuantity > 0);
-  if (fills.length === 0 || fills.some((r) => r.fee === null)) return null;
-  return fills.reduce((s, r) => s + r.fee!, 0);
+  const executed = fills.reduce((s, r) => s + r.executedQuantity, 0);
+  const whole = fills.length > 0 && fills.every((r) => r.fee !== null)
+    && (end.totalExecutedQuantity === null || Math.abs(executed - end.totalExecutedQuantity) <= 1e-9 * Math.max(1, executed));
+  const sum = whole ? fills.reduce((s, r) => s + r.fee!, 0) : null;
+  if (sum === null) return end.totalFee;
+  if (end.totalFee !== null && Math.abs(sum - end.totalFee) > 1e-9 * Math.max(1, Math.abs(sum))) {
+    onDisagree?.(`orderly order ${end.orderId}: the fills' fees add up to ${sum}, its final report says totalFee ${end.totalFee}; booked ${sum}`);
+  }
+  return sum;
 }
 
 export interface OrderlyLegOptions {
@@ -701,6 +708,8 @@ export class OrderlyLeg implements TradeLeg {
   #readRefused: Error | null = null;
   /** The newest terminal report an order of this leg waited for: a push before it may predate the fill. */
   #lastSettledAt = 0;
+  /** A fee disagreement between the fills and the final report was logged (once per leg). */
+  #feeNoted = false;
 
   constructor(options: OrderlyLegOptions) {
     this.#o = options;
@@ -805,7 +814,12 @@ export class OrderlyLeg implements TradeLeg {
     const executed = end.totalExecutedQuantity ?? this.reportsFor(ref.orderId).reduce((s, r) => s + r.executedQuantity, 0);
     const filled = toQty(executed);
     if (filled === 0n) return { kind: 'failed', error: new NothingExecuted('orderly', `the IOC ${ref.orderId} did not fill (${end.status})`, ref.tx), ref };
-    return { kind: 'filled', filled, avgPx: end.avgPrice, fee: orderlyOrderFee(end, this.reportsFor(ref.orderId)), ref };
+    const fee = orderlyOrderFee(end, this.reportsFor(ref.orderId), (note) => {
+      if (this.#feeNoted) return;
+      this.#feeNoted = true;
+      this.#o.log?.(`${note} (said once)`);
+    });
+    return { kind: 'filled', filled, avgPx: end.avgPrice, fee, ref };
   }
 
   #oracle(): Promise<number | null> {

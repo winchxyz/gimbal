@@ -81,6 +81,32 @@ export interface LegResult {
   estimatedHours: number;
   /** Funding times (top of the hour) inside the hold, up to the last read of this venue's ledger. */
   hours: number;
+  /**
+   * A venue paying once per funding period only (PERIODIC_FUNDING_VENUES): its period (from its payments, else the
+   * default), the funding times of that period inside the hold up to the last read, and whether its ledger was read.
+   */
+  periodic?: { periodHours: number; due: number; read: boolean };
+}
+
+/** The period assumed for a periodic venue's leg before any payment says otherwise (Orderly's usual 8 h). */
+export const DEFAULT_FUNDING_PERIOD_HOURS = 8;
+
+/** A periodic venue's period on a position: the shortest its payments stand for, else the default. */
+export function fundingPeriodHours(rows: readonly { samples: number | null; adjusts?: string }[]): number {
+  const periods = rows.filter((r) => r.adjusts === undefined && r.samples !== null && r.samples > 0).map((r) => r.samples!);
+  return periods.length === 0 ? DEFAULT_FUNDING_PERIOD_HOURS : Math.min(...periods);
+}
+
+function periodicOf(rows: readonly FundingEvent[], from: number, to: number, read: boolean): { periodHours: number; due: number; read: boolean } {
+  const periodHours = fundingPeriodHours(rows);
+  return { periodHours, due: periodTimesIn(from, to, periodHours), read };
+}
+
+/** Funding times on a UTC grid of `periodHours` in (from, to]. */
+export function periodTimesIn(from: number, to: number, periodHours: number): number {
+  const p = periodHours * HOUR_MS;
+  if (!(to > from)) return 0;
+  return Math.floor(to / p) - Math.floor(from / p);
 }
 
 export interface PositionResult {
@@ -453,6 +479,7 @@ export function positionResult(p: Position, ix: BookIndex, now: number): Positio
       paidHours: hourly.size + aggregated, hours: hoursIn(start, readTo(leg.venue)),
       estimatedUsd: sum(mine.filter(isEstimate).map((f) => f.usd)),
       estimatedHours: sum(mine.filter((f) => isEstimate(f) && f.adjusts === undefined).map((f) => f.samples!)),
+      ...(PERIODIC_FUNDING_VENUES.has(leg.venue) ? { periodic: periodicOf(mine, start, readTo(leg.venue), ix.cursors[leg.venue] !== undefined) } : {}),
     };
   });
 
