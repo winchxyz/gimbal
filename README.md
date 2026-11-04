@@ -37,10 +37,10 @@ checks the order itself, per venue, for every signature:
 |---|---|---|
 | Per-venue order parsing | builds Hyperliquid msgpack actions and EIP-712 digests and Orderly requests itself; decodes every Solana instruction against pinned programs and accounts (Phoenix, Ember, and token transfers only to the desk's own accounts or a verified 1Click address) | `E_ARGS`, `E_SOL_MESSAGE`, `E_SOL_PROGRAM`, `E_SOL_ACCOUNT` |
 | Oracle price band | the limit price must be within `price_band_bps` of the stored OutLayer TEE oracle price, which must be younger than the policy's `oracle_max_age_s` (900 s on the mainnet desk) | `E_PRICE_BAND`, `E_ORACLE_STALE` |
-| Notional cap | each order's notional at the reference price is capped (`max_notional_usd`), and a sliding-hour meter caps the sum of opening orders (`max_hourly_notional_usd`) | `E_SIZE` |
-| Reduce-only | after `panic_close` or on a paused desk, only reduce-only orders and cancels are signed; reduce-only orders are not counted on the hourly meter, so a desk can always close | `E_PAUSED` |
+| Notional cap | each order's notional, size × max(limit price, oracle price), is capped (`max_notional_usd`), and a sliding-hour meter caps the sum of orders that are not reduce-only, on all three venues (`max_hourly_notional_usd`) | `E_SIZE` |
+| Pause and reduce-only | on a paused desk (after `panic_close` or the owner's pause) only orders flagged reduce-only and cancels are signed. The flag is part of the signed order, so the venue enforces it against the position; the contract cannot see positions. Reduce-only orders still pass the band and size checks but skip the hourly meter, so a desk can always close | `E_PAUSED` |
 | Policy | only the assets and markets the owner listed | `E_ASSET` |
-| Transfers | a 1Click quote is paid only if 1Click's signature verifies on chain and its recipient is one of the desk's own accounts; margin moves are capped per sliding hour by amount and cost | `E_QUOTE_SIGNATURE`, `E_QUOTE_FIELDS`, `E_RESCUE_CAP` |
+| Transfers | a 1Click quote is paid only if 1Click's signature verifies on chain and its recipient is one of the desk's own accounts (or the Orderly receiver the owner pinned); margin moves are capped per sliding hour by amount and cost | `E_QUOTE_SIGNATURE`, `E_QUOTE_FIELDS`, `E_RESCUE_CAP` |
 
 Every rule and its code are in [docs/interfaces.md](docs/interfaces.md) §1.3 and §1.5; each has a contract unit test
 that proves the refusal.
@@ -167,6 +167,7 @@ Not done yet:
 - **No margin rescue has run on mainnet yet.** The desk's rescue counters on chain are zero. The live routes have
   been dry-run against mainnet; the money path itself ran on the canary (above).
 - **No mainnet order refusal yet.** The recorded `E_PRICE_BAND` refusal is on testnet (an Orderly `MARKET` order).
+  A mainnet demo command for it (`pair-mainnet refuse-band <SYM>`) is planned in PR #93, not merged yet.
 - **The NEAR AI risk check is wired but has no key on the mainnet engine yet.** Without an answer within 5 s a window
   passes, and the journal says "no NEAR AI risk check".
 - The money is small on purpose. At 12 USD a leg, funding earns about a cent a day while each one-off transfer costs
