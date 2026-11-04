@@ -98,6 +98,25 @@ node -e "fetch('http://127.0.0.1:8790/strategy').then(r=>r.json()).then(console.
 `PUT /strategy` with the same body and `"auto": true` turns the loop on; `POST /close` closes both legs. Both
 need `content-type: application/json` and a localhost Host, which a request from inside the container has.
 
+### Rolling back past #106
+
+#106 made `enterAfterChecks` and `exitAfterChecks` strategy settings. Every `PUT /strategy` after it saves both
+fields in `/data/gimbal/strategy-mainnet-<desk>.json`. Code from before #106 refuses unknown strategy fields, so it
+cannot load that file. That code then starts with auto off. On a held pair, decide() answers `off` before the
+drawdown stop and the time stop, so neither stop protects the pair.
+
+Before you deploy code older than #106, delete the two keys in the running container:
+
+```
+railway ssh
+node -e "const fs=require('fs');for(const f of fs.readdirSync('/data/gimbal').filter((n)=>/^strategy-mainnet-.*\.json$/.test(n))){const p='/data/gimbal/'+f;const s=JSON.parse(fs.readFileSync(p,'utf8'));delete s.enterAfterChecks;delete s.exitAfterChecks;fs.writeFileSync(p,JSON.stringify(s));console.log('cleaned',p)}"
+```
+
+Then deploy, and make no `PUT /strategy` in between. After the deploy, the log must read
+`engine rules from /data/gimbal/strategy-mainnet-<desk>.json`, not `engine rules not loaded, starting from the
+defaults (auto off): ...`. `GET /strategy` must also show the auto you expect. The older code runs on its own fixed
+counts (enter 3, exit 3).
+
 ## The read-only view
 
 For the dashboard on another machine (the demo video, the owner watching the desk), serve can open a second
