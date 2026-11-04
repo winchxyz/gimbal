@@ -392,10 +392,7 @@ The code was written with Claude Code.
 **Timeline (rules Q-001 to Q-003).** The first commit, `eb66ed1`, is from 2026-10-30, inside the build window
 (Oct 19 to Nov 14); every commit in the history is from the window. No code written before the window is in this
 repository. Before the first commit, from 2026-10-20, the builder wrote throwaway experiments and the test-vector
-generators outside the repository; only the generators' outputs, the JSON vectors, are committed. The idea of
-scanning funding across venues comes from the builder's own earlier funding scanner (Python, private, before the
-window); none of its code is here: the venue readers in `engine/src/venues/` were written for this repository in
-TypeScript.
+generators outside the repository; only the generators' outputs, the JSON vectors, are committed.
 
 **Main dependencies** (Q-005), at the versions in `contract/Cargo.lock` and `package-lock.json`:
 
