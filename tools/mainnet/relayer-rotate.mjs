@@ -5,14 +5,20 @@
 //   node tools/mainnet/relayer-rotate.mjs           dry run: generates nothing, writes nothing, signs nothing. Prints
 //                                                   the old relayer's address, its Arbitrum ETH, USDC and USDC.e, what
 //                                                   --send would do, and how much ETH would leave, to where
-//   node tools/mainnet/relayer-rotate.mjs --send    generates a new key; backs up .env (.env.bak-<time>, mode 0600)
-//                                                   and writes it atomically with RELAYER_EVM_PRIVATE_KEY = the new
-//                                                   key and RELAYER_EVM_PRIVATE_KEY_OLD = the old one; then sends all
-//                                                   the old wallet's ETH minus gas to the new address on Arbitrum One
+//   node tools/mainnet/relayer-rotate.mjs --send    generates a new key; writes it first to a key file of its own
+//                                                   (.env.relayer-new-<time>: the new and the old key); backs up .env
+//                                                   (.env.bak-<time>: the file before, with the old key) and writes it
+//                                                   atomically with RELAYER_EVM_PRIVATE_KEY = the new key and
+//                                                   RELAYER_EVM_PRIVATE_KEY_OLD = the old one; then sends all the old
+//                                                   wallet's ETH minus gas to the new address on Arbitrum One
 //
+// Every file is fsynced, and its folder after it (POSIX; Windows has no folder fsync). They are made mode 0600 on
+// POSIX; on Windows a file takes its folder's permissions, so keep the checkout in a folder only the owner can read.
 // The new key is written, read back and checked before any ETH moves: the transfer goes to the address of the key
 // in the file. A rerun after a --send (RELAYER_EVM_PRIVATE_KEY_OLD set) generates no key and writes nothing: it moves
-// what is left on the old wallet to the current one, or says the rotation is done.
+// what is left on the old wallet to the current one, or says the rotation is done. A rerun that finds .env without
+// the new key (its old key back in RELAYER_EVM_PRIVATE_KEY, a key file naming it as the old one) puts the key file's
+// keys back first: the dry run says so, --send does it.
 //
 // Refusals: USDC or USDC.e on the old wallet (the script moves ETH only; move the USDC first), a transaction of the
 // old wallet still pending, RELAYER_EVM_PRIVATE_KEY set in the shell environment (it wins over .env, so other scripts
@@ -23,13 +29,13 @@
 // After --send: update RELAYER_EVM_PRIVATE_KEY on Railway to the new value in .env and redeploy. Until then serve's
 // relayer signs with the old wallet, which has no gas left: its Arbitrum submits fail and nothing is paid.
 
-import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { arbitrumBalances, arbitrumGasPrice, rpcUrls, unitsText } from './balances.mjs';
 import { DOT_ENV, UsageError, envValues, isMain, parseDotEnv, parseFlags, run } from './cli.mjs';
 import { summaryBlock } from './money.mjs';
 import { assertNotInLinkedWorktree, linkedWorktreeOf } from './near.mjs';
-import { ARBITRUM_ONE, ENTRY, ethText, evmAddressOf, newEvmKey } from './relayer-wallet.mjs';
+import { ARBITRUM_ONE, ENTRY, ethText, evmAddressOf, newEvmKey, setEnvEntry } from './relayer-wallet.mjs';
 
 export const OLD_ENTRY = `${ENTRY}_OLD`;
 const USAGE = 'usage: node tools/mainnet/relayer-rotate.mjs [--send] [--env-file <file>]';
@@ -70,9 +76,35 @@ export function rotateEnvText(text, newKey) {
   return out.join(eol);
 }
 
+/** The file name part of a time: 20261104T120000Z. */
+const stampOf = (now) => new Date(now).toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+
+/** fsyncs a folder, so a file made or renamed in it survives a crash (POSIX; Windows cannot open a folder: skipped). */
+export function fsyncDir(dir) {
+  if (process.platform === 'win32') return;
+  const fd = openSync(dir, 'r');
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** A new file at `path` (never over another one; mode 0600 on POSIX) holding `text`, fsynced, its folder too. */
+function writeNew(path, text) {
+  const fd = openSync(path, 'wx', 0o600);
+  try {
+    writeSync(fd, text);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  fsyncDir(dirname(path));
+}
+
 /**
- * Writes `text` to `path` atomically: a new temporary file next to it (mode 0600; for .env it is .env.tmp-<...>,
- * which .gitignore's `.env.*` covers), fsync, then a rename over it.
+ * Writes `text` to `path` atomically: a new temporary file next to it (mode 0600 on POSIX; for .env it is
+ * .env.tmp-<...>, which .gitignore's `.env.*` covers), fsync, a rename over it, then an fsync of the folder.
  */
 export function writeAtomic(path, text) {
   const tmp = join(dirname(path), `${basename(path)}.tmp-${process.pid}-${Date.now()}`);
@@ -89,20 +121,57 @@ export function writeAtomic(path, text) {
     rmSync(tmp, { force: true });
     throw e;
   }
+  fsyncDir(dirname(path));
 }
 
-/** A copy of `path` as `<path>.bak-<time>` (mode 0600, never over another file); returns its path. */
+/** A copy of `path` as `<path>.bak-<time>` (never over another file); returns its path. */
 export function backUp(path, text, now) {
-  const stamp = new Date(now).toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
-  const bak = `${path}.bak-${stamp}`;
-  const fd = openSync(bak, 'wx', 0o600);
-  try {
-    writeSync(fd, text);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
+  const bak = `${path}.bak-${stampOf(now)}`;
+  writeNew(bak, text);
   return bak;
+}
+
+/** The key file's name part: `<env file>.relayer-new-<time>` (.env.relayer-new-..., covered by `.env.*`). */
+export const KEY_FILE_PART = '.relayer-new-';
+
+/**
+ * Writes the new key and the old one to `<path>.relayer-new-<time>` before .env is touched, so the key that will hold
+ * the ETH is on disk twice before it is sent; returns its path.
+ */
+export function writeKeyFile(path, newKey, oldKey, now) {
+  const out = `${path}${KEY_FILE_PART}${stampOf(now)}`;
+  writeNew(out, `# relayer-rotate: the relayer key written ${new Date(now).toISOString()} (${ENTRY}) and the one it replaced (${OLD_ENTRY})\n`
+    + `${ENTRY}=${newKey}\n${OLD_ENTRY}=${oldKey}\n`);
+  return out;
+}
+
+/** The key files next to `path`, newest first: { path, newKey, oldKey }; one that does not parse is left out. */
+export function keyFiles(path) {
+  const dir = dirname(path);
+  const prefix = `${basename(path)}${KEY_FILE_PART}`;
+  let names;
+  try {
+    names = readdirSync(dir).filter((n) => n.startsWith(prefix)).sort().reverse();
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const n of names) {
+    const m = parseDotEnv(readFileSync(join(dir, n), 'utf8'));
+    const newKey = m.get(ENTRY)?.trim() ?? '';
+    const oldKey = m.get(OLD_ENTRY)?.trim() ?? '';
+    if (/^0x[0-9a-fA-F]{64}$/.test(newKey) && /^0x[0-9a-fA-F]{64}$/.test(oldKey)) out.push({ path: join(dir, n), newKey, oldKey });
+  }
+  return out;
+}
+
+/**
+ * The key file whose new key .env lost: .env holds that file's old key as RELAYER_EVM_PRIVATE_KEY (or none) and no
+ * RELAYER_EVM_PRIVATE_KEY_OLD (a backup put back, a write that did not land). Null when .env is as a rotation left it.
+ */
+export function lostRotation(path, current, earlier) {
+  if (earlier !== '') return null;
+  return keyFiles(path).find((k) => current === '' || current === k.oldKey) ?? null;
 }
 
 async function rpc(fetchImpl, url, method, params) {
@@ -183,10 +252,29 @@ export async function runRotate(argv, deps = {}) {
     say(`warning   ${why}`);
   }
 
-  const text = existsSync(file) ? readFileSync(file, 'utf8') : '';
-  const dot = parseDotEnv(text);
-  const current = dot.get(ENTRY)?.trim() ?? '';
-  const earlier = dot.get(OLD_ENTRY)?.trim() ?? '';
+  let text = existsSync(file) ? readFileSync(file, 'utf8') : '';
+  let dot = parseDotEnv(text);
+  let current = dot.get(ENTRY)?.trim() ?? '';
+  let earlier = dot.get(OLD_ENTRY)?.trim() ?? '';
+  // .env lost the new key of an earlier --send: its key file puts it back, before anything else (a key that may hold
+  // the ETH is never left out of .env).
+  const lost = lostRotation(file, current, earlier);
+  if (lost !== null) {
+    const restored = rotateEnvText(current === '' ? setEnvEntry(text, ENTRY, lost.oldKey).text : text, lost.newKey);
+    if (!send) {
+      both(`recovery  ${file} lost the new key an earlier --send wrote; ${lost.path} has it (relayer ${evmAddressOf(lost.newKey)}): --send puts it back first`);
+    } else {
+      const bak = backUp(file, text, now());
+      writeAtomic(file, restored);
+      const back = parseDotEnv(readFileSync(file, 'utf8'));
+      if (back.get(ENTRY) !== lost.newKey || back.get(OLD_ENTRY) !== lost.oldKey) throw new Error(`${file} did not read back as written: nothing was sent; the backup is ${bak}`);
+      both(`recovered ${file}: ${ENTRY} and ${OLD_ENTRY} put back from ${lost.path} (the file before is ${bak})`);
+    }
+    text = restored;
+    dot = parseDotEnv(text);
+    current = dot.get(ENTRY)?.trim() ?? '';
+    earlier = dot.get(OLD_ENTRY)?.trim() ?? '';
+  }
   if (current === '') throw new Error(`${file} has no ${ENTRY}: there is no relayer key to rotate (relayer-wallet.mjs --write makes the first one)`);
   const rpcEntry = envValues(['ARBITRUM_RPC_URL'], { file, env }).get('ARBITRUM_RPC_URL');
   const urls = rpcUrls({ ARBITRUM_RPC_URL: rpcEntry.value ?? '' });
@@ -209,10 +297,15 @@ export async function runRotate(argv, deps = {}) {
   const g = await transferGas(fetchImpl, url, oldAddress, fixedTo ?? oldAddress);
   const leaves = b.wei > g.feeCap ? b.wei - g.feeCap : 0n;
   const to = fixedTo ?? 'the new relayer address (generated by --send)';
+  const money = (amount, dest, where, feeCap) => `money     ${ethText(amount)} ETH leaves the old relayer ${oldAddress} for ${dest} on Arbitrum One; `
+    + `it stays the owner's (both are the owner's gas wallets; ${where}). Gone for good: only the gas, at most ${feeText(feeCap)} ETH; `
+    + 'what the gas does not use stays on the old wallet';
+  const where = finishing
+    ? `the new key is in the env file${lost === null ? '' : ` and in ${lost.path}`}`
+    : `the new key is in the env file and in its key file ${basename(file)}${KEY_FILE_PART}<time>; the backup holds the file before, with the old key`;
   const moneyLine = leaves === 0n
     ? `money     nothing leaves: ${ethText(b.wei)} ETH does not cover the transfer's gas (at most ${feeText(g.feeCap)} ETH)`
-    : `money     ${ethText(leaves)} ETH leaves the old relayer ${oldAddress} for ${to} on Arbitrum One; it stays the owner's (both are the owner's gas `
-      + `wallets and the new key is in the env file and its backup). Gone for good: only the gas, at most ${feeText(g.feeCap)} ETH; what the gas does not use stays on the old wallet`;
+    : money(leaves, to, where, g.feeCap);
 
   if (!send) {
     say('');
@@ -220,8 +313,10 @@ export async function runRotate(argv, deps = {}) {
       say(`--send would: generate no key and write nothing (the env file is rotated already), and send the old wallet's ETH minus gas to ${fixedTo}`);
     } else {
       say('--send would:');
-      say('  1. generate a new relayer key (never printed)');
-      say(`  2. back up the env file to ${basename(file)}.bak-<time> (mode 0600), then write it atomically: ${ENTRY} = the new key, ${OLD_ENTRY} = this one`);
+      say('  1. generate a new relayer key (never printed) and write it, with this one, to a key file of its own,');
+      say(`     ${basename(file)}${KEY_FILE_PART}<time>`);
+      say(`  2. back up the env file to ${basename(file)}.bak-<time>, then write it atomically: ${ENTRY} = the new key, ${OLD_ENTRY} = this one`);
+      say('     (mode 0600 on POSIX; on Windows the files take the folder\'s permissions)');
       say('  3. read the file back, and send all the old wallet\'s ETH minus gas to the address of the key it holds, on Arbitrum One');
       say(`  4. print both addresses and the transaction; then update ${ENTRY} on Railway and redeploy`);
     }
@@ -243,11 +338,16 @@ export async function runRotate(argv, deps = {}) {
   const nonce = await settledNonce(fetchImpl, url, oldAddress);
 
   let newAddress = fixedTo;
+  let whereNow = where;
   if (!finishing) {
     const key = (deps.newKey ?? newEvmKey)();
     const next = rotateEnvText(text, key.privateKey);
+    // The new key on disk before .env is touched, and twice before any ETH goes to it.
+    const keyFile = writeKeyFile(file, key.privateKey, oldKey, now());
+    both(`key file  ${keyFile}: the new key and the old one (values not shown); keep it until Railway runs the new key`);
+    whereNow = `the new key is in the env file and in ${keyFile}; the backup holds the file before, with the old key`;
     const bak = backUp(file, text, now());
-    say(`backup    ${bak} (the env file before the rotation, mode 0600)`);
+    say(`backup    ${bak} (the env file before the rotation, with the old key)`);
     writeAtomic(file, next);
     // The transfer goes to the key the file holds, read back, never to one held in memory only.
     const back = parseDotEnv(readFileSync(file, 'utf8'));
@@ -268,6 +368,7 @@ export async function runRotate(argv, deps = {}) {
   const raw = await account.signTransaction({
     type: 'eip1559', chainId: ARBITRUM_ONE, nonce: Number(nonce), to: newAddress, value, gas: gas.gas, maxFeePerGas: gas.maxFeePerGas, maxPriorityFeePerGas: 0n,
   });
+  both(money(value, newAddress, whereNow, gas.feeCap));
   both(`send      ${ethText(value)} ETH from ${oldAddress} to ${newAddress} on Arbitrum One (gas at most ${feeText(gas.feeCap)} ETH)`);
   const hash = await rpc(fetchImpl, url, 'eth_sendRawTransaction', [raw]);
   if (typeof hash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(hash)) throw new Error(`eth_sendRawTransaction: unexpected answer ${JSON.stringify(hash)}`);

@@ -46,6 +46,7 @@ function fakeArbitrum(o = {}) {
       }
       case 'eth_getTransactionCount': return q(params[1] === 'pending' ? s.pending : s.latest);
       case 'eth_sendRawTransaction': {
+        if (o.failSend) throw new Error('fake RPC: eth_sendRawTransaction refused');
         const tx = parseTransaction(params[0]);
         s.sent.push(tx);
         const hash = `0x${String(s.sent.length).padStart(64, 'a')}`;
@@ -134,9 +135,15 @@ test('--send: a backup, the atomic write read back, then all the ETH minus gas t
   assert.equal(after.get(OLD_ENTRY), OLD_KEY);
   assert.equal(after.get('GIMBAL_MODE'), 'mainnet', 'the rest of the file kept');
   const files = readdirSync(dir).sort();
-  assert.deepEqual(files, ['.env', '.env.bak-20261104T120000Z'], 'the backup, and no temporary file left');
+  assert.deepEqual(files, ['.env', '.env.bak-20261104T120000Z', '.env.relayer-new-20261104T120000Z'], 'the backup, the key file, and no temporary file left');
   assert.equal(readFileSync(join(dir, files[1]), 'utf8'), BEFORE, 'the backup is the file before');
-  if (process.platform !== 'win32') assert.equal(statSync(join(dir, files[1])).mode & 0o777, 0o600);
+  // The key file holds the new key and the old one: written before .env, so the key the ETH goes to is on disk twice.
+  const keys = parseDotEnv(readFileSync(join(dir, files[2]), 'utf8'));
+  assert.equal(keys.get(ENTRY), NEW_KEY);
+  assert.equal(keys.get(OLD_ENTRY), OLD_KEY);
+  if (process.platform !== 'win32') for (const f of files) assert.equal(statSync(join(dir, f)).mode & 0o777, 0o600, f);
+  assert.match(r.out, /key file  .*\.env\.relayer-new-20261104T120000Z: the new key and the old one \(values not shown\)/);
+  assert.match(r.out, new RegExp(`money     0\\.002999 ETH leaves the old relayer ${OLD} for ${NEW} on Arbitrum One; it stays the owner's \\(both are the owner's gas wallets; the new key is in the env file and in .*\\.env\\.relayer-new-20261104T120000Z; the backup holds the file before, with the old key\\)`));
   assert.equal(chain.sent.length, 1);
   const tx = chain.sent[0];
   assert.equal(tx.to.toLowerCase(), NEW);
@@ -176,6 +183,31 @@ test('a rerun after a --send whose transfer did not go out sends to the address 
   assert.equal(readFileSync(file, 'utf8'), rotated);
   assert.deepEqual(readdirSync(dir), ['.env'], 'no backup: nothing written');
   assert.equal(chain.sent[0].to.toLowerCase(), NEW);
+});
+
+test('.env that lost the new key (the backup put back, a write that did not land): the key file puts it back, and the ETH goes to it', async () => {
+  const { dir, file } = envDir(BEFORE);
+  // A --send whose transfer failed after .env was written: the key file and .env both hold the new key.
+  const failing = fakeArbitrum({ failSend: true });
+  await assert.rejects(rotate(['--send', '--env-file', file], failing), /eth_sendRawTransaction/);
+  assert.equal(failing.sent.length, 0);
+  // Then .env loses it: the backup is copied over it.
+  writeFileSync(file, BEFORE);
+  const chain = fakeArbitrum();
+  const dry = await rotate(['--env-file', file], chain);
+  assert.match(dry.out, new RegExp(`recovery  .* lost the new key an earlier --send wrote; .*\\.env\\.relayer-new-20261104T120000Z has it \\(relayer ${NEW}\\): --send puts it back first`));
+  assert.match(dry.out, new RegExp(`money     0\\.002999 ETH leaves the old relayer ${OLD} for ${NEW} on Arbitrum One`));
+  assert.equal(readFileSync(file, 'utf8'), BEFORE, 'the dry run writes nothing');
+  const r = await rotate(['--send', '--env-file', file], chain, { now: () => Date.UTC(2026, 10, 4, 13) });
+  assert.equal(r.made(), 0, 'no other key generated');
+  const after = parseDotEnv(readFileSync(file, 'utf8'));
+  assert.equal(after.get(ENTRY), NEW_KEY);
+  assert.equal(after.get(OLD_ENTRY), OLD_KEY);
+  assert.match(r.out, /recovered .*: RELAYER_EVM_PRIVATE_KEY and RELAYER_EVM_PRIVATE_KEY_OLD put back from .*\.env\.relayer-new-20261104T120000Z/);
+  assert.equal(chain.sent.length, 1);
+  assert.equal(chain.sent[0].to.toLowerCase(), NEW);
+  assert.ok(readdirSync(dir).includes('.env.bak-20261104T130000Z'), 'the file before the recovery is kept');
+  for (const k of [OLD_KEY, NEW_KEY]) assert.equal(r.out.includes(k.slice(2)), false, 'no key printed');
 });
 
 test('USDC or USDC.e on the old wallet: the dry run says --send refuses and how to move it; --send refuses before anything', async () => {

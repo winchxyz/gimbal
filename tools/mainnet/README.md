@@ -405,17 +405,23 @@ node tools/mainnet/relayer-rotate.mjs --send
 
 - Without a flag, a dry run: it generates, writes and signs nothing. It prints the old relayer's address, its
   Arbitrum ETH, USDC and USDC.e, what `--send` would do, and the money line: how much ETH leaves, to where.
-- `--send` (from the main checkout) generates a new key, backs up `.env` to `.env.bak-<time>` (mode 0600) and
-  writes it atomically: `RELAYER_EVM_PRIVATE_KEY` = the new key, `RELAYER_EVM_PRIVATE_KEY_OLD` = the old one. It
-  reads the file back, then sends all the old wallet's ETH minus gas to the address of the key in the file on
-  Arbitrum One, and prints both addresses and the arbiscan link. No key is printed.
+- `--send` (from the main checkout) generates a new key and writes it, with the old one, to a key file of its own,
+  `.env.relayer-new-<time>`, before `.env` is touched. It then backs up `.env` to `.env.bak-<time>` (the file
+  before, with the old key) and writes `.env` atomically: `RELAYER_EVM_PRIVATE_KEY` = the new key,
+  `RELAYER_EVM_PRIVATE_KEY_OLD` = the old one. Every file and its folder are fsynced (the folder on POSIX only).
+  It reads `.env` back, then sends all the old wallet's ETH minus gas to the address of the key in the file on
+  Arbitrum One, and prints both addresses and the arbiscan link. No key is printed. Keep the key file until
+  Railway runs the new key.
+- The files are made mode 0600 on POSIX. On Windows a file takes its folder's permissions: keep the checkout in a
+  folder only the owner can read.
 - The ETH stays the owner's: both are the owner's gas wallets. Only the transfer's gas is spent, well under
   0.000001 ETH at Arbitrum's usual price; the part of the gas limit it does not use stays on the old wallet.
 - It refuses while the old wallet holds USDC or USDC.e (it moves ETH only: move the USDC to an owner address by
   hand first), while a transaction of the old wallet is pending, and while `RELAYER_EVM_PRIVATE_KEY` is set in
   the shell environment (it would win over `.env`).
 - A rerun after `--send` generates nothing and writes nothing: it moves what is left on the old wallet to the
-  current one, or says the rotation is done. To rotate again later, take `RELAYER_EVM_PRIVATE_KEY_OLD` out of
+  current one, or says the rotation is done. If `.env` lost the new key (a backup copied over it, say), the rerun
+  finds the key file that names the old key and puts both keys back first; the dry run says so. To rotate again later, take `RELAYER_EVM_PRIVATE_KEY_OLD` out of
   `.env` first, once its wallet is empty.
 - Then set `RELAYER_EVM_PRIVATE_KEY` on Railway (the service's variables) to the new value in `.env` and
   redeploy. Until then serve's relayer signs with the old wallet, which has no gas: its Arbitrum submits fail
@@ -1113,7 +1119,7 @@ first, and each is printed with its absolute path when written:
 | `.keys/operator-<contract>.near.json` | desk `--send` | the engine's FunctionCall key on the owner's account |
 | `.keys/engine-mainnet-<contract>.near.env` | desk `--send` | the engine settings below |
 | `.env` `RELAYER_EVM_PRIVATE_KEY` | relayer-wallet `--write` | the Arbitrum gas wallet's key, only into an empty entry |
-| `.env` `RELAYER_EVM_PRIVATE_KEY`, `RELAYER_EVM_PRIVATE_KEY_OLD`, `.env.bak-<time>` | relayer-rotate `--send` | the one write that replaces a key: the new key, the old one kept under it, and a backup of the file before |
+| `.env` `RELAYER_EVM_PRIVATE_KEY`, `RELAYER_EVM_PRIVATE_KEY_OLD`, `.env.bak-<time>`, `.env.relayer-new-<time>` | relayer-rotate `--send` | the one write that replaces a key: the new key, the old one kept under it, a backup of the file before, and a key file with both keys written first |
 
 ## Engine env file
 
