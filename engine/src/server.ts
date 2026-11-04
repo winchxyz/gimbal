@@ -54,7 +54,10 @@ export const DEFAULT_WEB_ORIGINS: readonly string[] = ['http://localhost:5190', 
 const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
 /** Journal entries per page: GET /state's newest and each GET /journal?before= page. */
 const JOURNAL_PAGE = 100;
-/** Entries kept in memory for paging back; older ones are not served (the journal is not persisted yet). */
+/**
+ * Entries kept in memory for paging back; older ones are not served. serve keeps them on disk too (journal-store.ts,
+ * the same cap) and hands the newest back at start (`journalHistory`), so a restart keeps what the dashboard shows.
+ */
 const JOURNAL_KEEP = 5_000;
 const HEARTBEAT_MS = 15_000;
 const MAX_BODY_BYTES = 64 * 1024;
@@ -114,6 +117,10 @@ export interface EngineServerOptions {
   strategyLoop?: StrategyHands;
   /** Called after a PUT /strategy took effect (the loop checks at once, so `auto` shows without waiting a scan). */
   onStrategy?: (strategy: StrategyConfig) => void;
+  /** Journal entries from before this run (journal-store.ts), oldest first: served as if published now, in order. */
+  journalHistory?: readonly JournalEntry[];
+  /** Called with every journal entry published (journal-store.ts appends it); a throw is logged, never fatal. */
+  keepJournal?: (entry: JournalEntry) => void;
 }
 
 /** What POST /rotate and /close call: they answer at once, whether the act was started or why not. */
@@ -138,6 +145,8 @@ export class EngineServer {
   readonly #clients = new Set<ServerResponse>();
   readonly #latest: Latest = { windows: null, scan: null, desk: null, rescue: null, setup: null, health: null, decision: null };
   readonly #journal: JournalEntry[] = [];
+  /** The ids in #journal: an entry published again under its id replaces the older copy, so a page never lists it twice. */
+  readonly #journalIds = new Set<string>();
   #strategy: StrategyConfig;
   #timer: ReturnType<typeof setTimeout> | undefined;
   #heartbeat: ReturnType<typeof setInterval> | undefined;
@@ -156,6 +165,7 @@ export class EngineServer {
     this.#options = options;
     this.#strategy = options.strategy;
     this.#origins = new Set(options.allowedOrigins ?? DEFAULT_WEB_ORIGINS);
+    for (const entry of options.journalHistory ?? []) this.#keep(entry);
     this.#server = createServer((req, res) => {
       this.#route(req, res).catch((err: unknown) => {
         this.#log(`${req.method} ${req.url}: ${errorMessage(err)}`);
@@ -218,8 +228,12 @@ export class EngineServer {
   /** Sends one event to every client and keeps it for GET /state. */
   publish(event: StreamEvent): void {
     if (event.type === 'journal') {
-      this.#journal.unshift(event.data);
-      this.#journal.length = Math.min(this.#journal.length, JOURNAL_KEEP);
+      this.#keep(event.data);
+      try {
+        this.#options.keepJournal?.(event.data);
+      } catch (err) {
+        this.#log(`journal entry ${event.data.id} not kept on disk: ${errorMessage(err)}`);
+      }
     } else {
       (this.#latest as Record<string, unknown>)[event.type] = event.data;
     }
@@ -231,6 +245,17 @@ export class EngineServer {
         this.#log(`event listener failed: ${errorMessage(err)}`);
       }
     }
+  }
+
+  /** Puts a journal entry first, in place of an older copy with its id, and drops what is past JOURNAL_KEEP. */
+  #keep(entry: JournalEntry): void {
+    if (this.#journalIds.has(entry.id)) {
+      const at = this.#journal.findIndex((e) => e.id === entry.id);
+      if (at !== -1) this.#journal.splice(at, 1);
+    }
+    this.#journal.unshift(entry);
+    this.#journalIds.add(entry.id);
+    while (this.#journal.length > JOURNAL_KEEP) this.#journalIds.delete(this.#journal.pop()!.id);
   }
 
   /** Calls `listener` with every event published from now on; the function returned stops it. */

@@ -85,6 +85,11 @@ cargo +stable-x86_64-pc-windows-msvc test --workspace   # plain `cargo test` run
 - serve keeps the pair trader's state and the rescuer's state in `GIMBAL_STATE_DIR` (default the per-user state
   directory, `%LOCALAPPDATA%/gimbal/state` or `$XDG_STATE_HOME/gimbal`), outside any checkout. The rescuer's file is
   `rescue-mainnet-<contract>-<desk>-<desk evm>.json`; its path is on serve's start lines.
+- The journal (what the dashboard's Journal and the read-only view list) is kept there too, in testnet and mainnet:
+  `journal-<mode>-<contract>-<desk>.jsonl`, one entry per line, appended and fsynced (`engine/src/journal-store.ts`).
+  At start serve loads the newest 5 000 entries within 30 days (`journal: N entries loaded from ...`); the file is
+  rewritten to that bound once it runs 1 000 lines past it. A line that is not a whole entry is skipped, a file that
+  cannot be read starts the journal empty, and neither stops serve. Replay keeps its journal in memory only.
 - A persisted OutcomeUnknown (`"unknown"` in the rescuer's file) survives restarts and holds every transfer; reduces
   still run. The owner clears it after reconciling: stop serve, set `"unknown"` to `null` in that file, start again
   (docs/interfaces.md, "Rescuer state"). Never delete the file to clear it: a missing or unusable state file also

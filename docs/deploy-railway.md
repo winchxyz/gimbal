@@ -18,7 +18,8 @@ repo root are all it needs.
   `GIMBAL_TRADE=1`, no `pair-mainnet --send`, no `fund.mjs --send`. Read-only commands are fine.
 - **The volume is mounted on `/data`.** The image sets `XDG_STATE_HOME=/data` and `GIMBAL_STATE_DIR=/data/gimbal`:
   the trader state (the legs' baselines the ADL watch compares against), the confirmed engine rules
-  (`PUT /strategy`), the strategy loop's counters and the locks all live there and survive a redeploy.
+  (`PUT /strategy`), the strategy loop's counters, the journal (`journal-mainnet-<contract>-<desk>.jsonl`, the newest
+  5 000 entries within 30 days) and the locks all live there and survive a redeploy.
 - **Region: EU West (Amsterdam).** Hyperliquid refuses US IP addresses.
 - **Shutdown: `drainingSeconds` 180.** On SIGTERM serve starts nothing new and waits up to 180 s for an order, a
   close or a rescue already under way. Railway's default is 0 s, which would kill it mid-order.
@@ -181,7 +182,7 @@ their explorer links: they are the proof of what the desk did.
 - the desk (`DeskState`): desk id, contract id, the masked owner, every leg (venue, symbol, side, size, entry,
   mark, liquidation price, margin, margin ratio, distance to liquidation, funding, fees), net delta, equity,
   reserve, P&L, health, paused (masked account and time), a rescue failure's reason;
-- the journal, every entry still in memory (up to 5 000): its summary, the NEAR AI text, its numbers, and its
+- the journal, every entry still in memory (up to 5 000, loaded from the volume at start): its summary, the NEAR AI text, its numbers, and its
   transaction links, which name the desk's own venue addresses (EVM, Solana) as any block explorer does;
 - rescue and venue-setup progress (amounts, steps, transaction links), the venue health map, and the strategy
   loop's latest decision;
