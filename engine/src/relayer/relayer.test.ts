@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ContractClient } from '../contract/types.ts';
 import { MpcTimeoutError, OutcomeUnknown, solMessageDigest } from '../contract/types.ts';
+import { deskActEpoch } from '../venues/desk-acts.ts';
 import { OrderlyApiError } from '../venues/orderly-http.ts';
 import { HyperliquidSubmitter } from './hyperliquid.ts';
 import { Relayer } from './relayer.ts';
@@ -26,9 +27,12 @@ test('hlOrder: the contract signs, the relayer posts and confirms, the desk addr
     contract, deskId: 'alpha',
     hyperliquid: new HyperliquidSubmitter({ network: 'testnet', fetch: stub.fetch, clock: time.clock, sleep: time.sleep }),
   });
+  const epoch = deskActEpoch();
   const result = await relayer.hlOrder({ asset: 1, is_buy: true, px: '2510', sz: '0.004', reduce_only: false, tif: 'Ioc', cloid: null }, 'enter');
   assert.deepEqual(result.tx.map((t) => t.id), [hash]);
   assert.deepEqual(contract.calls.map((c) => c.method), ['hl_order']);
+  // Marked as the desk's act at its start and its end: account answers read before it are not reused after it.
+  assert.equal(deskActEpoch(), epoch + 2);
   await assert.rejects(new Relayer({ contract, deskId: 'alpha' }).hlCancel(1, 5, 'x'), /no Hyperliquid submitter/);
 });
 

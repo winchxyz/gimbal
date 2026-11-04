@@ -38,6 +38,7 @@ import { parseStrategyConfig } from './scanner/config.ts';
 import type { ScanResult, Scanner } from './scanner/scanner.ts';
 import type { RiskEngine } from './risk/engine.ts';
 import { stressRoute } from './risk/stress-route.ts';
+import type { ViewSource } from './view/view-server.ts';
 
 export const DEFAULT_ENGINE_PORT = 8790;
 
@@ -148,6 +149,8 @@ export class EngineServer {
   #boundHost: string | null = null;
   readonly #origins: ReadonlySet<string>;
   readonly #refusedLogged = new Map<RefusalKind, RefusedLog>();
+  /** In-process readers of every published event (the read-only view listener, src/view/). */
+  readonly #listeners = new Set<(event: StreamEvent) => void>();
 
   constructor(options: EngineServerOptions) {
     this.#options = options;
@@ -208,6 +211,7 @@ export class EngineServer {
     await this.#scanning;
     for (const res of this.#clients) res.end();
     this.#clients.clear();
+    this.#listeners.clear();
     await new Promise<void>((resolve) => this.#server.close(() => resolve()));
   }
 
@@ -220,6 +224,42 @@ export class EngineServer {
       (this.#latest as Record<string, unknown>)[event.type] = event.data;
     }
     this.#write(`data: ${JSON.stringify(event)}\n\n`);
+    for (const listener of this.#listeners) {
+      try {
+        listener(event);
+      } catch (err) {
+        this.#log(`event listener failed: ${errorMessage(err)}`);
+      }
+    }
+  }
+
+  /** Calls `listener` with every event published from now on; the function returned stops it. */
+  subscribe(listener: (event: StreamEvent) => void): () => void {
+    this.#listeners.add(listener);
+    return () => this.#listeners.delete(listener);
+  }
+
+  /** GET /journal's page: the newest JOURNAL_PAGE entries, or up to that many older than `before`. */
+  journalPage(before: string | null): JournalEntry[] {
+    if (before === null || before === '') return this.#journal.slice(0, JOURNAL_PAGE);
+    // An id not in memory (older than the last JOURNAL_KEEP, or never seen) has nothing older to page to.
+    const at = this.#journal.findIndex((e) => e.id === before);
+    if (at === -1) return [];
+    return this.#journal.slice(at + 1, at + 1 + JOURNAL_PAGE);
+  }
+
+  /**
+   * What the read-only view listener (src/view/view-server.ts) may read: the GET routes' data and the event stream,
+   * as plain functions. It never gets this server, so nothing it does can reach PUT /strategy, /rotate or /close.
+   */
+  viewSource(): ViewSource {
+    return Object.freeze({
+      state: () => this.state(),
+      journal: (before: string | null) => this.journalPage(before),
+      history: (windowId: string) => this.#options.scanner.history(windowId),
+      strategy: () => this.#strategy,
+      subscribe: (listener: (event: StreamEvent) => void) => this.subscribe(listener),
+    });
   }
 
   state(): EngineState {
@@ -371,12 +411,7 @@ export class EngineServer {
     }
     if (path === '/journal') {
       if (method !== 'GET') return notAllowed(res, 'GET');
-      const before = url.searchParams.get('before');
-      if (before === null || before === '') return json(res, 200, this.#journal.slice(0, JOURNAL_PAGE));
-      // An id not in memory (older than the last JOURNAL_KEEP, or never seen) has nothing older to page to.
-      const at = this.#journal.findIndex((e) => e.id === before);
-      if (at === -1) return json(res, 200, []);
-      return json(res, 200, this.#journal.slice(at + 1, at + 1 + JOURNAL_PAGE));
+      return json(res, 200, this.journalPage(url.searchParams.get('before')));
     }
     if (path === '/strategy') {
       if (method === 'GET') return json(res, 200, this.#strategy);

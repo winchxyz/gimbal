@@ -13,6 +13,7 @@ import { parseArgs } from 'node:util';
 import { PositionBook } from '../book/book.ts';
 import { bookReport } from '../book/report.ts';
 import { liveBookSources } from '../book/sources.ts';
+import { readServeSummary, withServeSummary } from '../book/serve-summary.ts';
 import { bookFilesIn } from '../book/store.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import { userStateDir } from '../trade/trader-state.ts';
@@ -67,6 +68,8 @@ for (const path of files) {
     for (const l of r.lines) notes.push(`sync ${l.ok ? 'ok' : 'FAILED'}: ${l.text}`);
     notes.push('sync results are in this report only; the book file is unchanged');
   }
-  console.log(bookReport(book.summary(), notes));
+  // serve's own summary has its ledger reads that found nothing new (the JSONL keeps only those that stored something).
+  const served = withServeSummary(book.summary(), readServeSummary(path));
+  console.log(bookReport(served.summary, [...notes, ...served.notes]));
 }
 if (failed) process.exit(1);

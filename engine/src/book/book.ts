@@ -5,8 +5,10 @@
 // returned).
 //
 // serve wiring: serve.ts creates it with createBook and hands `loopBook(book, ...)` (serve-loop.ts) the loop's `book`
-// option and journal; `book.start()` syncs now, then every hour HOUR_SYNC_DELAY_MS after the top of the hour, and
-// `book.stop()` on shutdown.
+// option and journal; `book.start()` syncs now, then every hour HOUR_SYNC_DELAY_MS after the top of the hour, and at
+// once when a position is booked (entered, or adopted from the loop) while it runs, so its ledgers are read from the
+// start rather than at the next hour; `book.stop()` on shutdown. A book with no position has no ledger to read: its
+// summary then has no cursors (`npm run report`: "never synced") until one is booked.
 
 import type { JournalEntry, Mode, TxRef } from '@gimbal/shared';
 import { scanRead } from '../venues/http-budget.ts';
@@ -29,6 +31,12 @@ import type { BookEvent, BookFill, BookRecord, EnterEvent, JournalEvent, SyncEve
 
 /** The hourly sync runs this long after the top of the hour: Hyperliquid pays at it, Phoenix books a little later. */
 export const HOUR_SYNC_DELAY_MS = 5 * 60_000;
+/**
+ * The sync after an enter waits this long: Phoenix's trades-history indexes a fill some seconds after it lands, and a
+ * fee read before every signature is there would be partial (the fee read waits for them all anyway, sources.ts). An
+ * adopted position (no fills of its own) is read at once.
+ */
+export const POST_ENTER_SYNC_MS = 60_000;
 
 export interface Timers {
   setTimeout(fn: () => void, ms: number): unknown;
@@ -139,6 +147,8 @@ export class PositionBook {
   #timer: unknown = null;
   #summaryDue: NodeJS.Immediate | null = null;
   #stopped = false;
+  #started = false;
+  #syncSoonDue = false;
   /** Protection closes whose fills the next sync reads (memory only: a restart drops them, the venues keep the fills). */
   #lookups: (CloseLookup & { positionId: string; failingSince: number | null })[] = [];
   /** Position id -> when the read of its closing fills first failed (the detector retries until FILL_READ_GIVE_UP_MS). */
@@ -225,6 +235,7 @@ export class PositionBook {
     }
     this.#append(added);
     this.#publishNew(added);
+    if (record.kind === 'enter') this.#syncSoon(POST_ENTER_SYNC_MS);
     if (positionId === null || record.kind === 'fill') return { positionId, numbers: {}, note: null };
     const r = this.result(positionId);
     if (r === null) return { positionId, numbers: {}, note: null };
@@ -256,6 +267,7 @@ export class PositionBook {
     };
     const e: EnterEvent = { v: 1, type: 'enter', at: now, positionId, record, adopted: true };
     this.#append([e]);
+    this.#syncSoon(0);
     return positionId;
   }
 
@@ -366,6 +378,7 @@ export class PositionBook {
         try {
           const charged = await scanRead(() => fillFee({
             venue: m.venue, address, symbol: m.symbol, side: m.side, startedAt: m.record.startedAt ?? null, at: m.record.at, tx: m.record.tx,
+            now: this.#clock.now(),
           }));
           if (charged === null || !Number.isFinite(charged)) continue;
           const now = this.#clock.now();
@@ -391,6 +404,7 @@ export class PositionBook {
     this.#publishNew(settled);
     this.#scheduleSummary();
     for (const l of lines) this.#log(`book: ${l.text}`);
+    if (lines.length === 0) this.#log('book: no ledger read: no position is booked yet (the next sync after one is booked reads them)');
     return { lines, added };
   }
 
@@ -574,6 +588,7 @@ export class PositionBook {
   /** Syncs now, then every hour HOUR_SYNC_DELAY_MS after the top of the hour, until stop(). */
   start(): void {
     this.#stopped = false;
+    this.#started = true;
     const run = () => {
       this.#timer = null;
       this.sync().catch((err: unknown) => this.#log(`book: sync failed (${errorMessage(err)})`)).finally(() => {
@@ -586,12 +601,35 @@ export class PositionBook {
   /** Stops the hourly sync and writes a summary that is due. */
   stop(): void {
     this.#stopped = true;
+    this.#started = false;
     if (this.#timer !== null) {
       if (this.#o.timers !== undefined) this.#o.timers.clearTimeout(this.#timer);
       else clearTimeout(this.#timer as NodeJS.Timeout);
     }
     this.#timer = null;
     this.flushSummary();
+  }
+
+  /**
+   * A position was just booked while the hourly sync runs: a sync `delayMs` on (off the caller's stack; an enter's after
+   * POST_ENTER_SYNC_MS), after the one running ends if one does (it chose its ledgers before this position was there).
+   * The hourly timer is left as it is.
+   */
+  #syncSoon(delayMs: number): void {
+    if (!this.#started || this.#stopped || this.#syncSoonDue) return;
+    this.#syncSoonDue = true;
+    const go = () => {
+      if (this.#stopped) return;
+      this.sync().catch((err: unknown) => this.#log(`book: sync failed (${errorMessage(err)})`));
+    };
+    const run = () => {
+      this.#syncSoonDue = false;
+      const running = this.#syncing;
+      if (running === null) go();
+      else void running.then(go, go);
+    };
+    if (this.#o.timers !== undefined) this.#o.timers.setTimeout(run, delayMs);
+    else setTimeout(run, delayMs).unref();
   }
 
   #schedule(run: () => void): void {

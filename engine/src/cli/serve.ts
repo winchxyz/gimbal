@@ -60,6 +60,11 @@
 // in replay, a scripted desk priced by the recording. It publishes `desk`, `health`, `journal` and `rescue`, and answers
 // POST /stress (testnet and replay; refused on mainnet). `health` is published in every mode: the venues the last
 // scan or account read missed, 1Click (probed every minute in the live modes) and NEAR.
+// The read-only view (src/view/, opt in): with GIMBAL_VIEW_TOKEN (32+ characters) and GIMBAL_VIEW_PORT or PORT set, a
+// second listener on 0.0.0.0 serves the GET routes and /events only, behind that bearer token, to the origins in
+// GIMBAL_VIEW_ORIGINS, with every payload redacted and the owner's and operator's accounts masked; the API above stays
+// on its own address, unchanged, and must be on loopback for the view to start. Its start line is
+// `view: read-only on :<port> for origins ...` or `view: off` (with the reason when the token is set).
 
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -71,7 +76,7 @@ import { NearAiClient } from '../nearai/client.ts';
 import { PolicyDrafter, deskMarkets } from '../nearai/draft-route.ts';
 import { StrategyStore, strategyFile } from '../strategy-store.ts';
 import { setupFromEnv } from '../setup/serve-setup.ts';
-import { liveReaders, replayReaders } from '../readers.ts';
+import { LOOP_ACCOUNT_MAX_AGE_MS, accountWithin, liveReaders, replayReaders } from '../readers.ts';
 import type { Readers } from '../readers.ts';
 import { DEFAULT_STRATEGY, ORDERLY_BROKERS, scannerConfigFor } from '../scanner/config.ts';
 import { Scanner } from '../scanner/scanner.ts';
@@ -102,6 +107,7 @@ import { liveBookSources } from '../book/sources.ts';
 import { userStateDir } from '../trade/trader-state.ts';
 import type { StrategyLoop } from '../strategy/loop.ts';
 import { ThinningSink, WATCH_RECORD_GAPS, loadPolicyFile, replayStart, scanLine } from './serve-replay.ts';
+import { startView } from '../view/serve-view.ts';
 
 const { values } = parseArgs({
   options: {
@@ -324,7 +330,9 @@ if (mode === 'replay') {
     { reader: reader('hyperliquid'), address: side.desk.evm_address },
     { reader: reader('phoenix'), address: side.desk.solana.authority },
   ].filter((a): a is { reader: NonNullable<typeof a.reader>; address: string } => a.reader !== undefined && a.address !== '');
-  for (const a of accounts) loopAccounts.push({ venue: a.reader.id, read: () => a.reader.account(a.address) });
+  // The strategy loop's free margin takes the risk engine's last read when it is a scan old at most: on Phoenix
+  // (about 1 request a second for everything) a second account read every scan would spend a third of it.
+  for (const a of accounts) loopAccounts.push({ venue: a.reader.id, read: () => accountWithin(a.reader, a.address, LOOP_ACCOUNT_MAX_AGE_MS) });
   // get_desk says only whether the desk is paused, not who paused it or when (that is in its `paused` event): `at` is
   // when this engine first saw it paused, `by` is unknown.
   let pausedSince: number | null = null;
@@ -451,7 +459,7 @@ if (contract !== null && deskId !== null) {
       // Only a loop with hands on a confirmed start checks what it holds against the venues; else unknown.
       loopHeld: () => (loop === null || pair?.hands === undefined || (pair.unconfirmed?.() ?? null) !== null ? undefined : loop.held),
     });
-    log(`book: positions kept in ${book.path}; venue ledgers synced now and every hour (read only); npm run report prints it`);
+    log(`book: positions kept in ${book.path}; venue ledgers synced now, when a position is booked and every hour (read only; with no position booked there is none to read); npm run report prints it`);
   } catch (err) {
     log(`book: NOT kept (${errorMessage(err)}); the loop runs without it until that file is fixed or moved and serve restarts`);
   }
@@ -524,6 +532,8 @@ const monitorTimer = setInterval(() => {
 monitorTimer.unref();
 const shown = host.includes(':') ? `[${host}]` : host;
 log(`engine ${mode} on http://${shown}:${listening}: GET /events /state /windows/history?id= /strategy /journal, PUT /strategy, POST /rotate /close`);
+// The read-only view: a second listener on a ViewSource (reads only), never on the server above.
+const view = await startView({ env: envVar, processEnv: process.env, enginePort: listening, engineHost: host, source: server.viewSource(), log });
 
 let stopping = false;
 /** How long a shutdown waits for a close in flight: one MPC signature can take 120 s, and a close is one per leg plus a retry. */
@@ -565,6 +575,7 @@ async function shutdown(reason: string): Promise<void> {
   if (!drained && stillRescuing !== null) log(`stopping: rescue ${stillRescuing} is still running after ${SHUTDOWN_WAIT_MS / 1000} s; exiting anyway: a payment it signed was saved as held before signing, and the next start reads it at 1Click and on chain`);
   if (!drained && (stillRescuing === null || pair?.pair?.closing === true)) log(`stopping: a close is still running after ${SHUTDOWN_WAIT_MS / 1000} s; exiting anyway: its orders are saved as in flight (the next start only alerts on ADL until a close result); check both legs by hand`);
   pair?.stop();
+  await view?.stop();
   await server!.stop();
   contract?.prices.stop();
   readers.close();
