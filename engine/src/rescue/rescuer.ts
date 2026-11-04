@@ -59,7 +59,9 @@
 //   - an OutcomeUnknown of an hl_withdraw or of a Phoenix credit: held until the owner reconciles it and clears
 //     `unknown` in the state file (MANUAL_CLEAR) and restarts.
 // A hold still open after RECONCILE_AFTER_MS is journaled once as "reconcile needed" with its deposit address,
-// amounts, 1Click status and how to clear it by hand, and stays held.
+// amounts, 1Click status and how to clear it by hand, and stays held. A held delivery found landed in the margin of
+// the leg a new rescue is for (before its plan, also the first after a restart) ends that rescue as failed: it was
+// sized on a read that may predate the delivery, and the retry after the backoff is sized on one that includes it.
 //
 // The Hyperliquid route spends only Arbitrum USDC it can attribute to itself: a withdraw counts as arrived only by a
 // USDC Transfer log from Hyperliquid's Bridge2 to the desk address of exactly the amount it expects (each log counted
@@ -620,7 +622,15 @@ export class Rescuer {
       this.#journal(run, `rescue ${t.id}: ${t.venue} ${t.symbol} needs no margin to reach its watch line; nothing to move`, {});
       return this.#land(run, 0, null);
     }
-    await this.#settleHolds(evm);
+    // Late deliveries are keyed by venue only: right while the desk holds one leg per venue.
+    const lateUsd = (await this.#settleHolds(evm)).get(t.venue);
+    if (lateUsd !== undefined) {
+      // An earlier rescue's margin reached this leg just now, and this trigger was sized on a read that may predate it.
+      // Failing (not landing: this run moved nothing) lets the risk engine's backoff pass, so the retry is sized on a
+      // read taken well after the delivery, and a leg it already cleared leaves rescue with nothing paid twice.
+      return this.#fail(run, 'source', `${lateUsd.toFixed(2)} USD of an earlier rescue landed late on ${t.venue} just now, after this rescue was sized`,
+        'tried again after the backoff, on a read that includes it');
+    }
     // undefined: no Hyperliquid route here; null: not read. Unread stops the Hyperliquid source, never counts as empty.
     let read: ArbitrumRead | null | undefined;
     if (this.#o.hlWithdraw !== undefined && this.#o.arbitrum !== undefined) {
@@ -1328,9 +1338,13 @@ export class Rescuer {
     if (changed) this.#persist();
   }
 
-  /** Reads each held deposit again; drops those settled (refunded, delivered and seen, or shown never to run). */
-  async #settleHolds(evm: string): Promise<void> {
-    if (this.#deposits.length === 0) return;
+  /**
+   * Reads each held deposit again; drops those settled (refunded, delivered and seen, or shown never to run). Returns
+   * the USD found landed late in a venue's margin, by venue.
+   */
+  async #settleHolds(evm: string): Promise<Map<VenueId, number>> {
+    const late = new Map<VenueId, number>();
+    if (this.#deposits.length === 0) return late;
     for (const d of [...this.#deposits]) {
       const s = await this.#o.oneClick.status(d.q.depositAddress).catch(() => null);
       if (s !== null) d.status = s.status;
@@ -1342,6 +1356,7 @@ export class Rescuer {
         const entry = await this.#o.landing.find(d.venue, d.q, d.heldAt, this.#seen, deliveryHashes(s.body)).catch(() => null);
         if (entry !== null) {
           this.#seen.add(entry.id);
+          late.set(d.venue, (late.get(d.venue) ?? 0) + entry.usd);
           settled = `rescue ${d.rescueId}'s ${entry.usd.toFixed(2)} USD landed on ${d.venue} late (after its rescue was failed)`;
         } else if (this.#o.credit?.[d.venue] !== undefined) {
           // A venue with a credit (Phoenix): 1Click delivered to the desk's wallet there and the rescue that paid it
@@ -1401,6 +1416,7 @@ export class Rescuer {
       this.#journalLine(`${settled}; transfers are no longer held by it`, d.venue);
     }
     this.#persist();
+    return late;
   }
 
   /** The setting that starts a first run of this desk's state (it names the desk, so one left in an env file never re-arms). */
