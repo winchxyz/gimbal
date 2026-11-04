@@ -4,6 +4,7 @@
 
 import { resolve } from 'node:path';
 import type { Mode } from '@gimbal/shared';
+import type { NearTransport } from '../contract/near-client.ts';
 import { NearContractClient } from '../contract/near-client.ts';
 import { NearApiTransport } from '../contract/near-transport.ts';
 import { checkContractNetwork, contractEnv } from '../cli/serve-contract.ts';
@@ -15,7 +16,18 @@ import { ORDERLY_WITHDRAW_ENV, startOrderlyWithdraw } from './orderly-withdraw.t
 import { publicIpLookup } from './public-ip.ts';
 import { SetupService } from './service.ts';
 
-export async function setupFromEnv(mode: Mode, env: (name: string) => string | undefined, log: (line: string) => void): Promise<SetupService | null> {
+export interface SetupFromEnvOptions {
+  /** The engine rules' `auto` now: GIMBAL_ORDERLY_WITHDRAW refuses while it is on (orderly-withdraw.ts). */
+  autoOn?: () => boolean;
+  /** Tests: the NEAR transport (else one on OPERATOR_PRIVATE_KEY) and the venues' fetch. */
+  transport?: NearTransport;
+  fetch?: typeof fetch;
+}
+
+/** The service for POST /setup, or null when GIMBAL_SETUP is not 1; its `orderlyWithdraw` is a run serve's shutdown drains. */
+export async function setupFromEnv(
+  mode: Mode, env: (name: string) => string | undefined, log: (line: string) => void, options: SetupFromEnvOptions = {},
+): Promise<SetupService | null> {
   const withdraw = env(ORDERLY_WITHDRAW_ENV);
   if (env('GIMBAL_SETUP') !== '1') {
     if (withdraw !== undefined) log(`orderly withdraw: ignored: ${ORDERLY_WITHDRAW_ENV} runs only with GIMBAL_SETUP=1 (it signs with the operator key)`);
@@ -31,7 +43,7 @@ export async function setupFromEnv(mode: Mode, env: (name: string) => string | u
   for (const [name, url] of [['HL_API_URL', hlUrl], ['ORDERLY_API_URL', orderlyUrl]] as const) {
     if (/testnet/.test(url) !== (network === 'testnet')) throw new ConfigError(`${name} ${url} is not a ${network} URL`);
   }
-  const transport = new NearApiTransport({
+  const transport = options.transport ?? new NearApiTransport({
     network, accountId: cfg.accountId!, privateKey: cfg.privateKey!, ...(cfg.rpcUrl === undefined ? {} : { rpcUrl: cfg.rpcUrl }),
   });
   const contract = new NearContractClient({ contractId: cfg.contractId, network, transport, onHealth: (status, detail) => log(`setup near ${status}: ${detail}`) });
@@ -41,17 +53,21 @@ export async function setupFromEnv(mode: Mode, env: (name: string) => string | u
   // Checked against a desk's Orderly IP list before setup applies it; a bad GIMBAL_PUBLIC_IP stops serve here.
   const publicIps = publicIpLookup({ override: env('GIMBAL_PUBLIC_IP') });
   log(`venue setup: on (POST /setup), operator ${cfg.accountId}, ${network}`);
-  // GIMBAL_ORDERLY_WITHDRAW: a one-shot withdrawal in the background (orderly-withdraw.ts); serve does not wait for it.
+  const service = new SetupService({
+    network, contract, operatorAccount: cfg.accountId!, config, hlUrl, orderlyUrl, log, publicIps,
+    ...(solanaRpcUrl === undefined ? {} : { solanaRpcUrl }), ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+  });
+  // GIMBAL_ORDERLY_WITHDRAW: a one-shot withdrawal in the background (orderly-withdraw.ts); serve's start does not wait
+  // for it, its shutdown does.
   if (withdraw !== undefined) {
     const stateDirEnv = env('GIMBAL_STATE_DIR');
-    void startOrderlyWithdraw({
+    service.orderlyWithdraw = startOrderlyWithdraw({
       value: withdraw, network, contract, orderlyUrl, log,
+      counters: (deskId) => transport.view<unknown>(cfg.contractId, 'get_desk_counters', { desk_id: deskId }),
       engine: { contractId: cfg.contractId, deskId: cfg.deskId, operatorAccount: cfg.accountId! },
       stateDir: stateDirEnv === undefined ? userStateDir(env) : resolve(stateDirEnv),
+      ...(options.autoOn === undefined ? {} : { autoOn: options.autoOn }), ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
     });
   }
-  return new SetupService({
-    network, contract, operatorAccount: cfg.accountId!, config, hlUrl, orderlyUrl, log, publicIps,
-    ...(solanaRpcUrl === undefined ? {} : { solanaRpcUrl }),
-  });
+  return service;
 }

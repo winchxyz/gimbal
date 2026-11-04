@@ -302,7 +302,7 @@ const riskCheck: VetoSource = recordedChecks.length === 0 ? nearAi : RecordedVet
 log(riskCheck === nearAi
   ? `NEAR AI risk check: ${nearAi.configured ? `NEAR AI ${nearAi.model}` : 'no NEAR AI key: every enter and rotate passes unchecked, said so'}`
   : `NEAR AI risk check: replay plays ${(riskCheck as RecordedVeto).size} recorded repl${(riskCheck as RecordedVeto).size === 1 ? 'y' : 'ies'} from ${recordedChecks.length} file(s); other prompts pass unchecked`);
-const setup = await setupFromEnv(mode, envVar, log).catch((err: unknown) => {
+const setup = await setupFromEnv(mode, envVar, log, { autoOn: () => (server?.strategy ?? saved.strategy ?? DEFAULT_STRATEGY).auto }).catch((err: unknown) => {
   if (err instanceof ConfigError) fail(`setup: ${errorMessage(err)}`);
   // Review S1: NEAR not answering at start turns POST /setup off for this run instead of stopping serve.
   const note = `venue setup: off for this run (POST /setup answers 503): its start read failed (${errorMessage(err)}); restart serve to try again`;
@@ -684,7 +684,7 @@ async function shutdown(reason: string): Promise<void> {
       } catch (err) {
         log(`stopping: the risk engine stopped with an error (${err instanceof Error ? err.message : String(err)})`);
       }
-      await Promise.allSettled([closingWatch?.current ?? Promise.resolve(), strategyLoop.idle(SHUTDOWN_WAIT_MS), pair?.drain(SHUTDOWN_WAIT_MS) ?? Promise.resolve(true), rescueDone]);
+      await Promise.allSettled([closingWatch?.current ?? Promise.resolve(), strategyLoop.idle(SHUTDOWN_WAIT_MS), pair?.drain(SHUTDOWN_WAIT_MS) ?? Promise.resolve(true), rescueDone, setup?.orderlyWithdraw?.drain()]);
       return pair?.pair?.closing !== true && rescueRunning?.() == null;
     })(),
     deadline,
