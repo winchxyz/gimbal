@@ -13,6 +13,7 @@ import { orderlyRestMessage } from '../venues/orderly-signer.ts';
 import type { OrderlyAccountSnapshot, OrderlyPositionsSnapshot, OrderlyStreamReadiness } from '../venues/orderly-stream.ts';
 import { VirtualClock } from '../venues/replay.ts';
 import type { AccountState } from '../venues/venue.ts';
+import { isSessionStarting } from '../venues/venue.ts';
 import type { WebSocketLike, WsEvent } from '../venues/ws.ts';
 import { freeMarginReader } from './serve-loop.ts';
 import type { KeptStream } from './serve-orderly.ts';
@@ -181,7 +182,7 @@ test('flag on: one ws_auth and the two seed reads open the session, and the risk
     // Before the keeper opened a session the account is unknown, and the read does not open (or sign) one itself.
     const before = await h.source.read();
     assert.equal(before.legs.length, 0);
-    assert.match(before.reads[0]!.error ?? '', /orderly account unknown: the private session is idle/);
+    assert.match(before.reads[0]!.error ?? '', /orderly account unknown: the private session is starting \(not opened yet/);
     assert.deepEqual(h.signed, []);
 
     h.orderly.keeper.check();
@@ -329,7 +330,7 @@ test('flag on: a ws_auth that never answers holds up no read: account, risk sour
     assert.equal(h.orderly.status().state, 'opening');
     assert.match(h.logs[0]!, /orderly_ws_auth #1 this run/);
     const started = Date.now();
-    await assert.rejects(h.orderly.reader.account(h.orderly.accountId), /orderly account unknown: the private session is unseeded|opening/);
+    await assert.rejects(h.orderly.reader.account(h.orderly.accountId), /orderly account unknown: the private session is starting \(its first open runs/);
     await assert.rejects(h.orderly.legStream.positionsState(), /orderly account unknown/);
     const snap = await h.source.read();
     assert.match(snap.reads[0]!.error ?? '', /orderly account unknown/);
@@ -592,6 +593,29 @@ test('keeper: an unusable seed answer is never read again', async () => {
   assert.equal(k.stream.reseeds, 0);
   assert.equal(k.stream.signatures, 1);
   assert.equal(k.logs.length, 2, 'opening, then unseeded: nothing per check');
+});
+
+test('keeper: unknown is "starting" only before the first open ends; after a failed first open or a drop it is down', async () => {
+  const k = keeperHarness();
+  await assert.rejects(k.keeper.state(), (err: Error) => isSessionStarting(err.message) && /not opened yet/.test(err.message));
+  k.stream.failStart = new Error('login refused');
+  k.keeper.check();
+  // The first open runs (its signature is in flight): still serve starting.
+  await assert.rejects(k.keeper.state(), (err: Error) => isSessionStarting(err.message) && /its first open runs/.test(err.message));
+  await k.keeper.busy;
+  await assert.rejects(k.keeper.state(), (err: Error) => !isSessionStarting(err.message) && /the private session is down \(login refused\)/.test(err.message));
+  // The reopen after the backoff is no longer serve starting.
+  k.stream.failStart = null;
+  let reopened = false;
+  const start = k.stream.start.bind(k.stream);
+  k.stream.start = async () => {
+    reopened = true;
+    await assert.rejects(k.keeper.state(), (err: Error) => !isSessionStarting(err.message) && /the private session is opening/.test(err.message));
+    return start();
+  };
+  await k.run(SESSION_TIMING.retryMinMs + SESSION_TIMING.checkMs);
+  assert.equal(reopened, true);
+  assert.equal(k.keeper.status().state, 'live');
 });
 
 test('keeper: stopped, it signs nothing and the account is unknown', async () => {

@@ -120,7 +120,7 @@ function waitingSentence({ minNetAprPct, bestNetAprPct, auto }: StatusContext): 
   return 'No position is open.';
 }
 
-function joinNames(names: readonly string[]): string {
+export function joinNames(names: readonly string[]): string {
   return names.length <= 1 ? (names[0] ?? '') : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
 }
 

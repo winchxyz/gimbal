@@ -10,6 +10,18 @@ export function isDeskVenueId(venue: ScanVenueId): venue is VenueId {
   return (DESK_VENUE_IDS as readonly string[]).includes(venue);
 }
 
+/**
+ * In a read's error: the private session the read needs is still in its first open since serve started (serve's
+ * Orderly session: the ws_auth signature and the seed reads take 10-30 s, up to 120 s). That is serve starting, not
+ * the venue failing, so the journal says the session is starting instead of "not answering". A session whose open
+ * failed, or that dropped after it was up, never says it: those are failures and are journaled as such.
+ */
+export const SESSION_STARTING = 'the private session is starting';
+
+export function isSessionStarting(error: string | null | undefined): boolean {
+  return error !== null && error !== undefined && error.includes(SESSION_STARTING);
+}
+
 /** A perp market as the venue lists it. Static between listings; read once per session. */
 export interface Market {
   venue: VenueId;

@@ -29,6 +29,7 @@ import {
   pnlRows,
   sizeText,
   thresholdText,
+  valueGaps,
   type EventRow,
 } from './model.ts';
 import { DecisionBar } from './Decision.tsx';
@@ -95,6 +96,7 @@ function Stage({ desk, windows, strategy, journal, down, now, decision, urgent, 
   const payback = paybackOf(desk.pnl, rate?.perDayUsd ?? null);
   const exposure = exposureOf(desk);
   const value = splitUsd(desk.equityUsd);
+  const gaps = valueGaps(desk);
 
   return (
     <div className="d-page">
@@ -128,6 +130,7 @@ function Stage({ desk, windows, strategy, journal, down, now, decision, urgent, 
             </div>
           </div>
           <p className="d-reserve">Includes {usd(desk.reserveUsd)} held in reserve for rescues</p>
+          {gaps === null ? null : <p className="d-reserve" data-testid="desk-value-gaps">{gaps}</p>}
           <MoneyActions mode={desk.mode} className="btns d-phone" />
         </section>
 
@@ -335,6 +338,7 @@ function Waiting({ desk, windows, strategy, scan, now }: WaitingProps) {
   const best = windows ? bestEnterable(windows) : null;
   const minimum = strategy?.minNetAprPct ?? null;
   const rounded = (n: number) => (Number.isInteger(n) ? n.toFixed(0) : n.toFixed(1));
+  const gaps = valueGaps(desk);
   return (
     <div className="d-empty">
       <div className="msg">
@@ -342,6 +346,7 @@ function Waiting({ desk, windows, strategy, scan, now }: WaitingProps) {
         <h1 data-testid="desk-value">
           <Flash value={desk.equityUsd}>{usd(desk.equityUsd)}</Flash>
         </h1>
+        {gaps === null ? null : <p data-testid="desk-value-gaps">{gaps}</p>}
         <p>
           Your money sits in the desk’s accounts and earns nothing until a window pays{' '}
           {minimum === null ? (

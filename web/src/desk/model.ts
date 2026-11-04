@@ -1,12 +1,12 @@
 // What the Desk screen shows, worked out from `DeskState` and the rest of the stream. Pure functions, so the
 // rules in design/HANDOFF.md (Desk) are tested without a browser.
 import type { DeskState, JournalEntry, Leg, StrategyConfig, VenueId, Window as FundingWindow } from '@gimbal/shared';
-import { VENUE_NAMES } from '../shell/status.ts';
+import { VENUE_NAMES, joinNames } from '../shell/status.ts';
 import { amountUsd, clock, proofLinks, unprotectedText } from '../journal/entry.ts';
 import { dayMonthTime, hours, pct, plain, usd } from '../windows/format.ts';
 import { bestEnterable, heldWindow, venuePair } from '../windows/model.ts';
 import { perDayOnLegs } from '../windows/decision.ts';
-import { price, qty, ratioPct, signedQty, signedUsd } from './format.ts';
+import { elapsed, price, qty, ratioPct, signedQty, signedUsd } from './format.ts';
 
 /**
  * Where the desk warns and where it starts a rescue, in % of price from liquidation: the owner's own numbers
@@ -120,6 +120,29 @@ export function exposureOf(desk: Pick<DeskState, 'legs' | 'netDelta'>): Exposure
       ? `The legs differ by ${qty(Math.abs(desk.netDelta))} ${symbol}, so a ${symbol} price move no longer cancels out. The desk is rebalancing.`
       : `Both legs are the same size, so a ${symbol} price move adds to one and takes the same from the other.`,
   };
+}
+
+// ---------- the desk value ----------
+
+/** A venue account read this long before the desk's latest update is shown with its age. */
+export const ACCOUNT_OLD_MS = 60_000;
+
+/**
+ * What the desk value (`equityUsd`) leaves out or holds old, as one line, or null when every venue account it lists
+ * is counted and fresh: an account never read adds nothing to the value, and one whose reads fail keeps its last
+ * equity. Null too for an engine that does not list its accounts (`accounts` absent).
+ */
+export function valueGaps(desk: Pick<DeskState, 'accounts' | 'updatedAt'>): string | null {
+  const accounts = desk.accounts;
+  if (accounts === undefined) return null;
+  const parts: string[] = [];
+  const unread = accounts.filter((a) => a.equityUsd === null).map((a) => VENUE_NAMES[a.venue]);
+  if (unread.length > 0) parts.push(`${joinNames(unread)} not read yet, so not counted`);
+  for (const a of accounts) {
+    if (a.equityUsd === null || a.at === null || desk.updatedAt - a.at < ACCOUNT_OLD_MS) continue;
+    parts.push(`${VENUE_NAMES[a.venue]} as last read ${elapsed(desk.updatedAt - a.at)} ago`);
+  }
+  return parts.length === 0 ? null : `${parts.join('. ')}.`;
 }
 
 // ---------- income and payback ----------

@@ -52,7 +52,7 @@ import { errorMessage } from '../venues/recorder.ts';
 import { ACCOUNT_READ_DEADLINE_MS, withDeadline } from '../risk/sources.ts';
 import { LOOP_ACCOUNT_MAX_AGE_MS } from '../readers.ts';
 import type { AccountState, Clock } from '../venues/venue.ts';
-import { systemClock } from '../venues/venue.ts';
+import { SESSION_STARTING, systemClock } from '../venues/venue.ts';
 import type { WebSocketFactory } from '../venues/ws.ts';
 import { contractEnv } from './serve-contract.ts';
 import { ConfigError } from './start-errors.ts';
@@ -143,6 +143,8 @@ export class OrderlySessionKeeper {
   #flaps = 0;
   #lastOpenAt: number | null = null;
   #liveSince: number | null = null;
+  /** No open has ended yet since serve started: an account read before it is serve starting, not a failure. */
+  #firstOpen = true;
   #busy: Promise<void> | null = null;
   #timer: ReturnType<typeof setInterval> | null = null;
 
@@ -235,6 +237,9 @@ export class OrderlySessionKeeper {
   }
 
   #readable(why: (r: OrderlyStreamReadiness) => string | null): void {
+    if (this.#firstOpen && (this.#state === 'idle' || this.#state === 'opening')) {
+      throw new Error(`orderly account unknown: ${SESSION_STARTING} (${this.#state === 'idle' ? 'not opened yet' : 'its first open runs'}; the ws_auth signature and the seed reads take a while)`);
+    }
     if (this.#state === 'idle' || this.#state === 'stopped' || this.#state === 'down') {
       throw new Error(`orderly account unknown: the private session is ${this.#state}${this.#why === null ? '' : ` (${this.#why})`}`);
     }
@@ -284,6 +289,9 @@ export class OrderlySessionKeeper {
         return;
       }
       this.#set('down', errorMessage(err), this.#notBefore(this.#clock.now() + this.#backoff()));
+    } finally {
+      // Whatever it came to (live, unseeded, down), serve's start is over: from now on unknown is a failure.
+      this.#firstOpen = false;
     }
   }
 
