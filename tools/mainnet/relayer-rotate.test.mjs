@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { parseTransaction } from 'viem';
 import { ARB_USDC, ARB_USDC_E } from './balances.mjs';
 import { parseDotEnv } from './cli.mjs';
-import { FEE_MARGIN, OLD_ENTRY, rotateEnvText, runRotate } from './relayer-rotate.mjs';
+import { FEE_MARGIN, KEY_FILE_DELETE_WHEN, OLD_ENTRY, rotateEnvText, runRotate } from './relayer-rotate.mjs';
 import { ENTRY, evmAddressOf } from './relayer-wallet.mjs';
 
 const OLD_KEY = `0x${'1'.repeat(64)}`;
@@ -169,6 +169,10 @@ test('--send: a backup, the atomic write read back, then all the ETH minus gas t
   assert.equal(chain.sent.length, 1);
   assert.match(again.out, /done      the rotation is finished/);
   assert.match(again.out, new RegExp(`take ${OLD_ENTRY} out of the env file first`));
+  // When the key file may go: said after the send, and again once the rotation is done.
+  assert.ok(r.out.includes(`then      the key file: ${KEY_FILE_DELETE_WHEN}`));
+  assert.ok(again.out.includes(`.env.relayer-new-20261104T120000Z: ${KEY_FILE_DELETE_WHEN}`));
+  assert.match(KEY_FILE_DELETE_WHEN, /once Railway runs the new key and the old address holds no ETH/);
 });
 
 test('a rerun after a --send whose transfer did not go out sends to the address of the key in the file, and writes nothing', async () => {

@@ -290,6 +290,26 @@ test('a 429 halves the rate and empties the bucket; quiet minutes step it back b
   assert.equal(budget.state().ratePerSec, PHOENIX_BUDGET.adaptive!.minRatePerSec);
 });
 
+test('critical reads wait for the server\'s Retry-After only, never for an older backoff of a 429 without one', async () => {
+  const time = new FakeTime(T0);
+  // No retries, so each 429 comes back as it came.
+  const retries = { critical: 0, funding: 0, book: 0, history: 0 };
+  const budget = new HostBudget('phoenix-sim', { ...PHOENIX_BUDGET, retries, now: time.now, timers: time.timers, random: () => 0 });
+  // 429s without Retry-After: the budget's own backoff (0.5, 1, 2, 4 s at the lowest jitter) holds the scanner; critical
+  // reads go on meanwhile (they wait for the server's pause only).
+  // 3 s apart, so each finds a floor token (0.45 a second) and is sent at once.
+  for (let i = 0; i < 4; i++) {
+    await time.advance(3_000);
+    assert.equal((await budget.run('critical', async () => new Response('', { status: 429 }))).status, 429);
+  }
+  assert.ok(budget.state().retryAt - time.now() >= 4_000, `${budget.state().retryAt - time.now()} ms of backoff`);
+  assert.equal(budget.state().criticalRetryAt, 0, 'no server pause yet');
+  // Then one with Retry-After: 2. Critical reads wait those 2 s, not the backoff still running.
+  assert.equal((await budget.run('critical', async () => new Response('', { status: 429, headers: { 'retry-after': '2' } }))).status, 429);
+  assert.equal(budget.state().criticalRetryAt, time.now() + 2_000);
+  assert.ok(budget.state().retryAt > budget.state().criticalRetryAt);
+});
+
 test('a host shared with someone else (it lets this process have 0.6 a second): the cut keeps 429s rare and every account read is answered', async () => {
   const time = new FakeTime(T0);
   const host = phoenixHost(time, 0.6, 20);
