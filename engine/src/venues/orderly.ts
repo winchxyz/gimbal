@@ -505,7 +505,9 @@ export function parseBookAnswer(symbol: string, answer: Record<string, unknown>)
  * equity = USDC holding + every position's unsettled PnL (price PnL and unsettled funding); maintenance and
  * initial margin from Orderly's IMR/MMR formulas (or the rates the stream pushed); free = equity - initial - frozen.
  * Nothing missing is read as zero: no USDC balance, no REST mark or funding sum for a held symbol, or stream state the
- * server last confirmed more than `maxAgeMs` before `now` all throw. `time` is that confirmation, not `now`.
+ * server last confirmed more than `maxAgeMs` before `now` all throw. `time` is that confirmation, not `now`. One
+ * exception, a statement rather than a gap: after this session's holding read answered (`holdingRead`), no USDC row
+ * means an empty balance (Orderly's holding read leaves empty balances out unless asked with all=true), so 0.
  */
 export function parseAccount(
   snapshot: OrderlyAccountSnapshot, futures: readonly OrderlyFuturesRow[], info: readonly OrderlyInfoRow[], now: number,
@@ -519,7 +521,7 @@ export function parseAccount(
   const infoBySymbol = new Map(info.map((r) => [r.symbol, r]));
   const badUsdc = snapshot.invalidBalances.USDC ?? snapshot.invalidBalances['*'];
   if (badUsdc !== undefined) throw new Error(`orderly account: the USDC balance push is unusable: ${badUsdc}`);
-  const usdc = snapshot.balances.USDC;
+  const usdc = snapshot.balances.USDC ?? (snapshot.holdingRead === true ? { holding: 0, frozen: 0 } : undefined);
   if (usdc === undefined) throw new Error('orderly account: the private stream pushed no USDC balance');
   let equity = usdc.holding;
   let initial = 0;

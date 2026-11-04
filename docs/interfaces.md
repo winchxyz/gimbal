@@ -1203,7 +1203,19 @@ transaction's `TxRef`.
 margin ratio and distance to liquidation (`margin.ts`). The leg uses the nearer of the venue's liquidation price and
 the one computed from its account; on an account with several positions the computed one does not apply, and when
 the venue gives none either the distance is the account basis, (equity − maintenance) ÷ the account's whole
-notional. Lines (`thresholds.ts`):
+notional. In serve the venues are the desk's Hyperliquid and Phoenix accounts, plus its Orderly account with
+`GIMBAL_ORDERLY_PAIRS=1` (default off; `engine/src/cli/serve-orderly.ts`): serve then keeps the desk's private Orderly
+session open from the moment serve listens (one `orderly_ws_auth` and the `positions` and `holding` reads per
+session, through the operator key), reopens a session that held 10 min at once and otherwise after 60 s doubling to
+15 min (back to 60 s once a session is live; never two opens within 30 s), re-reads a seed read that failed on the
+same backoff, and never re-reads one that answered with rows it cannot use (it waits for a push). It reads the Orderly
+account as unknown at once, without waiting (a failed read: Orderly down, its legs kept at their last numbers, at
+least watched), before the first session, while one is opening, down or unseeded, and when the server has been quiet
+for 30 s. A holding read with no USDC row is an empty balance (Orderly omits empty tokens unless `all=true`). The
+strategy loop's free margin reads it too, within 7 s, and logs a failed read once per kind of failure. Its listeners
+get each session's `onUp` (logged in, every subscription acknowledged), `onFrame` per server frame, and one `onDown`,
+in that order across reconnects, and nothing after serve stops. It opens no Orderly window and changes no rescue
+route. Lines (`thresholds.ts`):
 - rescue line = `max(rescueDistancePct, (exp(4 σ √185 s) − 1) × 100)`, where σ is the leg's realised volatility per
   √s over the last 30 min (at least 10 returns, else the owner's line alone) and 185 s is the slow rescue measured on
   mainnet (a 120 s MPC signature plus a 65 s 1Click transfer);
