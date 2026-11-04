@@ -52,9 +52,9 @@
 //
 // The open and close are pair-ops.ts, which serve's strategy loop runs too (serve-pair.ts).
 //
-// --short / --long name the pair's venues (hyperliquid, orderly, phoenix; close defaults to short hyperliquid / long
-// phoenix). Any pair but that one needs GIMBAL_ORDERLY_PAIRS=1, and an Orderly leg needs the desk's Orderly session,
-// which only serve holds: this CLI refuses an Orderly pair with that reason and builds nothing.
+// --short / --long name the pair's venues (close defaults to short hyperliquid / long phoenix). Only that pair is
+// traded here: this CLI writes no trader state, so serve would take another pair it opened as that one, and an Orderly
+// leg needs the desk's Orderly session, which only serve holds. Any other pair is refused before anything is built.
 //
 // refuse-band and refuse-notional (refuse-cli.ts) run before the trader lock and before any relayer or submitter
 // exists: their only calls are refresh_prices (when the stored price is stale) and one hl_order the contract is expected
@@ -388,8 +388,9 @@ function printPlan(plan: MoneyPlan): void {
 // ---- the pair ----
 
 /**
- * The pair --short / --long name (default short hyperliquid / long phoenix). Another pair is refused unless
- * GIMBAL_ORDERLY_PAIRS is 1; the policy listing is buildPair's to check.
+ * The pair --short / --long name (default short hyperliquid / long phoenix). Any other pair is refused: this CLI writes
+ * no trader state, and serve takes a pair it finds with no saved shape as short hyperliquid / long phoenix, so a pair
+ * opened here the other way round would be read with its legs the wrong way (and an Orderly leg needs serve's session).
  */
 function shapeOf(ctx: Ctx, symbol: string): PairShape {
   const venue = (flag: '--short' | '--long', fallback: VenueId): VenueId => {
@@ -405,7 +406,10 @@ function shapeOf(ctx: Ctx, symbol: string): PairShape {
     throw new UsageError(errorMessage(err));
   }
   const isDefault = shape.legs[0].venue === 'hyperliquid' && shape.legs[1].venue === 'phoenix' && shape.longIndex === 1;
-  if (!isDefault && !orderlyPairsOn(envVar)) throw new UsageError(`${shapeText(shape)}: only short hyperliquid / long phoenix trades while ${ORDERLY_PAIRS_ENV} is not 1`);
+  if (!isDefault) {
+    throw new UsageError(`${shapeText(shape)}: pair-mainnet trades short hyperliquid / long phoenix only (it writes no trader state, so serve would read any other pair `
+      + `the wrong way round); other pairs open and close through serve with ${ORDERLY_PAIRS_ENV}=1${orderlyPairsOn(envVar) ? '' : ' (not set here)'}`);
+  }
   return shape;
 }
 

@@ -237,10 +237,12 @@ function buildCtx(timeline: string[], orderly: OrderlyOps | null, priceAgeS = 10
 
 const ORDERS = () => ({ maker: MAKER, microLamports: 1, slippageBps: 50 });
 
-function orderlySession(timeline: string[], specs: OrderlyLegSpec[], up = true): OrderlyOps {
+const SOL_MARKET = { venue: 'orderly', symbol: 'PERP_SOL_USDC', delisted: false, baseMmr: 0.012, fundingPeriodHours: 8, minNotional: 10 };
+
+function orderlySession(timeline: string[], specs: OrderlyLegSpec[], up = true, markets: () => Promise<unknown[]> = async () => [SOL_MARKET]): OrderlyOps {
   return {
     reader: {
-      markets: async () => [{ venue: 'orderly', symbol: 'PERP_SOL_USDC', delisted: false, baseMmr: 0.012, fundingPeriodHours: 8, minNotional: 10 }],
+      markets,
     } as unknown as OrderlyOps['reader'],
     account: async () => {
       throw new Error('not read here');
@@ -385,4 +387,19 @@ test('planOpen refuses an Orderly open the contract would refuse or cannot price
   assert.match(await refusals({ ips: new Error('RPC timeout') }), /the desk's Orderly IP list could not be read from the contract \(get_desk_settings: RPC timeout\)/);
   assert.match(await refusals({ funding: false }), /Orderly PERP_SOL_USDC funding cannot be read \(Orderly has no funding for PERP_SOL_USDC\): the carry is not priced without it/);
   assert.match(await refusals({ account: false }), /the desk's Orderly account cannot be read \(the private stream is not confirmed\): its margin is not known/);
+});
+
+test('buildPair: a close goes on an Orderly market dropped from the list (or a list that cannot be read); an open does not', async () => {
+  const timeline: string[] = [];
+  const shape = pairShape('SOL', 'orderly', 'hyperliquid');
+  const dropped = orderlySession(timeline, [], true, async () => []);
+  const closing = await buildPair(buildCtx(timeline, dropped), 'SOL', ORDERS, true, shape);
+  assert.deepEqual([closing.orderlyMarket, closing.mismatches], [null, []], 'treated as delisted: nothing in a close reads it');
+  const unread = orderlySession(timeline, [], true, async () => {
+    throw new Error('HTTP 503');
+  });
+  assert.equal((await buildPair(buildCtx(timeline, unread), 'SOL', ORDERS, true, shape)).orderlyMarket, null);
+  await assert.rejects(buildPair(buildCtx(timeline, dropped), 'SOL', ORDERS, false, shape), /Orderly has no PERP_SOL_USDC market the desk can trade/);
+  await assert.rejects(buildPair(buildCtx(timeline, unread), 'SOL', ORDERS, false, shape), /HTTP 503/);
+  assert.deepEqual(timeline, [], 'nothing sent');
 });

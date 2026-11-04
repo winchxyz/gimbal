@@ -227,12 +227,18 @@ export function venueName(v: VenueId): string {
   return v === 'hyperliquid' ? 'Hyperliquid' : v === 'orderly' ? 'Orderly' : 'Phoenix';
 }
 
-/** The CLI's runner: its own trader, and the raw IOC leg for the residual hedge. */
+/**
+ * The CLI's runner: its own trader, and the IOC leg for the residual hedge (raw, or through the trader when the leg
+ * is replayable, so its replay window is watched: PairTrader.hedge).
+ */
 export function traderRunner(trader: PairTrader, ioc: TradeLeg): PairRunner {
+  const index: 0 | 1 = trader.legs[0] === ioc ? 0 : 1;
   return {
     openInChunks: (request) => trader.openInChunks(request),
     close: (request) => trader.close(request),
-    hedge: (side, size, reduceOnly, reason) => ioc.order(side, size, reduceOnly, reason),
+    hedge: (side, size, reduceOnly, reason) => (ioc.replayable
+      ? trader.hedge(index, side, size, reduceOnly, reason)
+      : ioc.order(side, size, reduceOnly, reason)),
     stopOnFinish: true,
   };
 }
@@ -341,10 +347,13 @@ export async function pairOf(ctx: Pick<OpsCtx, 'desk' | 'phoenixUrl' | 'orderly'
   const orderlyLeg = p.shape.legs.find((l) => l.venue === 'orderly');
   if (orderlyLeg !== undefined) {
     if (ctx.orderly == null) throw new Error(`an Orderly leg (${orderlyLeg.symbol}) needs the desk's Orderly session, and there is none here`);
-    orderlyMarket = (await ctx.orderly.reader.markets()).find((m) => m.symbol === orderlyLeg.symbol) ?? null;
-    if (orderlyMarket === null) throw new Error(`Orderly has no ${orderlyLeg.symbol} market the desk can trade`);
-    // A close is reduce-only and goes whatever the market's status; an open needs it active.
-    if (orderlyMarket.delisted && !p.closing) diffs.push(`Orderly ${orderlyLeg.symbol} is not active`);
+    // A close is reduce-only and goes whatever the market's status, a market dropped from the list (or a list that
+    // cannot be read) included, as a delisted one: nothing in a close reads it. An open needs it listed and active.
+    const ol = ctx.orderly;
+    const markets = p.closing ? await ol.reader.markets().catch(() => null) : await ol.reader.markets();
+    orderlyMarket = markets?.find((m) => m.symbol === orderlyLeg.symbol) ?? null;
+    if (orderlyMarket === null && !p.closing) throw new Error(`Orderly has no ${orderlyLeg.symbol} market the desk can trade`);
+    if (orderlyMarket?.delisted === true && !p.closing) diffs.push(`Orderly ${orderlyLeg.symbol} is not active`);
   }
   const makerIndex = makerIndexOf(p.shape);
   return {
