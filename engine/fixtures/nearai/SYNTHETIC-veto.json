@@ -2,16 +2,16 @@
   "_comment": "SYNTHETIC: written by hand in NEAR AI Cloud's chat-completions format, NOT recorded replies. The first two answer PASS_FACTS and VETO_FACTS (src/strategy/test-helpers.ts); the rest answer the enter and rotate prompts of src/strategy/decide-replay.test.ts (E10_DUMP_FACTS=1 prints their facts). RecordedVeto finds an answer by its prompt's key. Rebuild the messages and keys whenever vetoMessages changes.",
   "exchanges": [
     {
-      "key": "452ae4eae9c1e1f814a5f84c",
+      "key": "3643c8a9eb099b65fd34a0eb",
       "model": "Qwen/Qwen3-VL-30B-A3B-Instruct",
       "messages": [
         {
           "role": "system",
-          "content": "You review one funding-rate carry trade before an automated desk opens it. The desk holds a long perpetual leg on one venue and a short perpetual leg of the same asset on another, and earns the difference in funding. You cannot approve, size or change the trade: you can only veto it. The trade goes ahead unless you veto it.\n\nVeto only on a concrete red flag in the facts, for example:\n- the funding spread this hour is far above its 7-day mean, so it looks like a spike that will not last;\n- the 7-day and 14-day spreads disagree, or the spread is shrinking fast;\n- a leg's open interest is small next to the leg size, or its book cannot fill the leg;\n- the price moved more than 15 % in 24 hours, so a leg is near liquidation risk;\n- the market was listed less than 14 days ago.\nFacts given as null are unknown: never veto because a fact is unknown.\n\nAnswer with one JSON object and nothing else: {\"verdict\": \"pass\" or \"veto\", \"reasons\": [up to 3 short sentences, each naming the fact and its number]}. With \"pass\", reasons may be empty."
+          "content": "You review one funding-rate carry trade before an automated desk opens it. The desk holds a long perpetual leg on one venue and a short perpetual leg of the same asset on another, and earns the difference in funding. You cannot approve, size or change the trade: you can only veto it. The trade goes ahead unless you veto it.\n\nVeto only on a concrete red flag in the facts, for example:\n- the funding spread this hour is far above its 7-day mean, so it looks like a spike that will not last;\n- the 7-day and 14-day spreads disagree, or the spread is shrinking fast;\n- a leg's open interest is small next to the leg size, or its book cannot fill the leg (book_depth_usd under leg_usd, or fill_impact_bps above 50);\n- a leg's price moved more than 15 % in 24 hours, so a leg is near liquidation risk;\n- a leg's market was listed less than 14 days ago.\nFacts given as null are unknown: never veto because a fact is unknown.\n\nAnswer with one JSON object and nothing else: {\"verdict\": \"pass\" or \"veto\", \"reasons\": [up to 3 short sentences, each naming the fact and its number]}. With \"pass\", reasons may be empty."
         },
         {
           "role": "user",
-          "content": "{\"trade\":\"open a new pair\",\"asset\":\"NEAR\",\"long_venue\":\"hyperliquid\",\"short_venue\":\"phoenix\",\"gross_apr_pct_this_hour\":25.81,\"gross_apr_pct_7d\":19.08,\"gross_apr_pct_14d\":17.4,\"net_apr_pct_after_costs\":9,\"owner_minimum_net_apr_pct\":5,\"hours_in_a_row_above_minimum\":3,\"leg_usd\":12,\"leverage\":1.5,\"legs\":[{\"venue\":\"hyperliquid\",\"side\":\"long\",\"open_interest_usd\":27400000,\"book_depth_usd\":41000},{\"venue\":\"phoenix\",\"side\":\"short\",\"open_interest_usd\":1583197,\"book_depth_usd\":6200}],\"price_move_24h_pct\":-2.1,\"days_since_listing\":null}"
+          "content": "{\"trade\":\"open a new pair\",\"asset\":\"NEAR\",\"long_venue\":\"hyperliquid\",\"short_venue\":\"phoenix\",\"gross_apr_pct_this_hour\":25.81,\"gross_apr_pct_7d\":19.08,\"gross_apr_pct_14d\":17.4,\"net_apr_pct_after_costs\":9,\"owner_minimum_net_apr_pct\":5,\"hours_in_a_row_above_minimum\":3,\"leg_usd\":12,\"leverage\":1.5,\"legs\":[{\"venue\":\"hyperliquid\",\"side\":\"long\",\"open_interest_usd\":27400000,\"book_depth_usd\":41000,\"fill_impact_bps\":1.2,\"price_move_24h_pct\":-2.1,\"days_since_listing\":null},{\"venue\":\"phoenix\",\"side\":\"short\",\"open_interest_usd\":1583197,\"book_depth_usd\":6200,\"fill_impact_bps\":4.8,\"price_move_24h_pct\":-2.1,\"days_since_listing\":null}]}"
         }
       ],
       "response": {
@@ -37,16 +37,16 @@
       }
     },
     {
-      "key": "b3f81bf4d9c0e7a96f44e8c3",
+      "key": "79c933c523dcb17313a6de0b",
       "model": "Qwen/Qwen3-VL-30B-A3B-Instruct",
       "messages": [
         {
           "role": "system",
-          "content": "You review one funding-rate carry trade before an automated desk opens it. The desk holds a long perpetual leg on one venue and a short perpetual leg of the same asset on another, and earns the difference in funding. You cannot approve, size or change the trade: you can only veto it. The trade goes ahead unless you veto it.\n\nVeto only on a concrete red flag in the facts, for example:\n- the funding spread this hour is far above its 7-day mean, so it looks like a spike that will not last;\n- the 7-day and 14-day spreads disagree, or the spread is shrinking fast;\n- a leg's open interest is small next to the leg size, or its book cannot fill the leg;\n- the price moved more than 15 % in 24 hours, so a leg is near liquidation risk;\n- the market was listed less than 14 days ago.\nFacts given as null are unknown: never veto because a fact is unknown.\n\nAnswer with one JSON object and nothing else: {\"verdict\": \"pass\" or \"veto\", \"reasons\": [up to 3 short sentences, each naming the fact and its number]}. With \"pass\", reasons may be empty."
+          "content": "You review one funding-rate carry trade before an automated desk opens it. The desk holds a long perpetual leg on one venue and a short perpetual leg of the same asset on another, and earns the difference in funding. You cannot approve, size or change the trade: you can only veto it. The trade goes ahead unless you veto it.\n\nVeto only on a concrete red flag in the facts, for example:\n- the funding spread this hour is far above its 7-day mean, so it looks like a spike that will not last;\n- the 7-day and 14-day spreads disagree, or the spread is shrinking fast;\n- a leg's open interest is small next to the leg size, or its book cannot fill the leg (book_depth_usd under leg_usd, or fill_impact_bps above 50);\n- a leg's price moved more than 15 % in 24 hours, so a leg is near liquidation risk;\n- a leg's market was listed less than 14 days ago.\nFacts given as null are unknown: never veto because a fact is unknown.\n\nAnswer with one JSON object and nothing else: {\"verdict\": \"pass\" or \"veto\", \"reasons\": [up to 3 short sentences, each naming the fact and its number]}. With \"pass\", reasons may be empty."
         },
         {
           "role": "user",
-          "content": "{\"trade\":\"open a new pair\",\"asset\":\"MEME\",\"long_venue\":\"phoenix\",\"short_venue\":\"hyperliquid\",\"gross_apr_pct_this_hour\":310,\"gross_apr_pct_7d\":22,\"gross_apr_pct_14d\":null,\"net_apr_pct_after_costs\":18,\"owner_minimum_net_apr_pct\":5,\"hours_in_a_row_above_minimum\":3,\"leg_usd\":12,\"leverage\":1.5,\"legs\":[{\"venue\":\"phoenix\",\"side\":\"long\",\"open_interest_usd\":1200,\"book_depth_usd\":300},{\"venue\":\"hyperliquid\",\"side\":\"short\",\"open_interest_usd\":2100000,\"book_depth_usd\":9000}],\"price_move_24h_pct\":38.5,\"days_since_listing\":5}"
+          "content": "{\"trade\":\"open a new pair\",\"asset\":\"MEME\",\"long_venue\":\"phoenix\",\"short_venue\":\"hyperliquid\",\"gross_apr_pct_this_hour\":310,\"gross_apr_pct_7d\":22,\"gross_apr_pct_14d\":null,\"net_apr_pct_after_costs\":18,\"owner_minimum_net_apr_pct\":5,\"hours_in_a_row_above_minimum\":3,\"leg_usd\":12,\"leverage\":1.5,\"legs\":[{\"venue\":\"phoenix\",\"side\":\"long\",\"open_interest_usd\":1200,\"book_depth_usd\":300,\"fill_impact_bps\":180,\"price_move_24h_pct\":38.5,\"days_since_listing\":5},{\"venue\":\"hyperliquid\",\"side\":\"short\",\"open_interest_usd\":2100000,\"book_depth_usd\":9000,\"fill_impact_bps\":2.5,\"price_move_24h_pct\":38.5,\"days_since_listing\":null}]}"
         }
       ],
       "response": {
@@ -72,16 +72,16 @@
       }
     },
     {
-      "key": "5e156d0a747f74832673a086",
+      "key": "1113075d0e48e03b13b934b9",
       "model": "Qwen/Qwen3-VL-30B-A3B-Instruct",
       "messages": [
         {
           "role": "system",
-          "content": "You review one funding-rate carry trade before an automated desk opens it. The desk holds a long perpetual leg on one venue and a short perpetual leg of the same asset on another, and earns the difference in funding. You cannot approve, size or change the trade: you can only veto it. The trade goes ahead unless you veto it.\n\nVeto only on a concrete red flag in the facts, for example:\n- the funding spread this hour is far above its 7-day mean, so it looks like a spike that will not last;\n- the 7-day and 14-day spreads disagree, or the spread is shrinking fast;\n- a leg's open interest is small next to the leg size, or its book cannot fill the leg;\n- the price moved more than 15 % in 24 hours, so a leg is near liquidation risk;\n- the market was listed less than 14 days ago.\nFacts given as null are unknown: never veto because a fact is unknown.\n\nAnswer with one JSON object and nothing else: {\"verdict\": \"pass\" or \"veto\", \"reasons\": [up to 3 short sentences, each naming the fact and its number]}. With \"pass\", reasons may be empty."
+          "content": "You review one funding-rate carry trade before an automated desk opens it. The desk holds a long perpetual leg on one venue and a short perpetual leg of the same asset on another, and earns the difference in funding. You cannot approve, size or change the trade: you can only veto it. The trade goes ahead unless you veto it.\n\nVeto only on a concrete red flag in the facts, for example:\n- the funding spread this hour is far above its 7-day mean, so it looks like a spike that will not last;\n- the 7-day and 14-day spreads disagree, or the spread is shrinking fast;\n- a leg's open interest is small next to the leg size, or its book cannot fill the leg (book_depth_usd under leg_usd, or fill_impact_bps above 50);\n- a leg's price moved more than 15 % in 24 hours, so a leg is near liquidation risk;\n- a leg's market was listed less than 14 days ago.\nFacts given as null are unknown: never veto because a fact is unknown.\n\nAnswer with one JSON object and nothing else: {\"verdict\": \"pass\" or \"veto\", \"reasons\": [up to 3 short sentences, each naming the fact and its number]}. With \"pass\", reasons may be empty."
         },
         {
           "role": "user",
-          "content": "{\"trade\":\"open a new pair\",\"asset\":\"NEAR\",\"long_venue\":\"hyperliquid\",\"short_venue\":\"phoenix\",\"gross_apr_pct_this_hour\":21.63,\"gross_apr_pct_7d\":19.05,\"gross_apr_pct_14d\":null,\"net_apr_pct_after_costs\":9.07,\"owner_minimum_net_apr_pct\":5,\"hours_in_a_row_above_minimum\":3,\"leg_usd\":11.75,\"leverage\":1.5,\"legs\":[{\"venue\":\"hyperliquid\",\"side\":\"long\",\"open_interest_usd\":247067419.3,\"book_depth_usd\":null},{\"venue\":\"phoenix\",\"side\":\"short\",\"open_interest_usd\":1595896.14,\"book_depth_usd\":null}],\"price_move_24h_pct\":null,\"days_since_listing\":null}"
+          "content": "{\"trade\":\"open a new pair\",\"asset\":\"NEAR\",\"long_venue\":\"hyperliquid\",\"short_venue\":\"phoenix\",\"gross_apr_pct_this_hour\":21.63,\"gross_apr_pct_7d\":19.05,\"gross_apr_pct_14d\":null,\"net_apr_pct_after_costs\":9.07,\"owner_minimum_net_apr_pct\":5,\"hours_in_a_row_above_minimum\":3,\"leg_usd\":11.75,\"leverage\":1.5,\"legs\":[{\"venue\":\"hyperliquid\",\"side\":\"long\",\"open_interest_usd\":247067419.3,\"book_depth_usd\":null,\"fill_impact_bps\":null,\"price_move_24h_pct\":null,\"days_since_listing\":null},{\"venue\":\"phoenix\",\"side\":\"short\",\"open_interest_usd\":1595896.14,\"book_depth_usd\":null,\"fill_impact_bps\":null,\"price_move_24h_pct\":null,\"days_since_listing\":null}]}"
         }
       ],
       "response": {
@@ -107,16 +107,16 @@
       }
     },
     {
-      "key": "87ef3979d3a061e1f98eafd0",
+      "key": "7842d278bff6f84f29357557",
       "model": "Qwen/Qwen3-VL-30B-A3B-Instruct",
       "messages": [
         {
           "role": "system",
-          "content": "You review one funding-rate carry trade before an automated desk opens it. The desk holds a long perpetual leg on one venue and a short perpetual leg of the same asset on another, and earns the difference in funding. You cannot approve, size or change the trade: you can only veto it. The trade goes ahead unless you veto it.\n\nVeto only on a concrete red flag in the facts, for example:\n- the funding spread this hour is far above its 7-day mean, so it looks like a spike that will not last;\n- the 7-day and 14-day spreads disagree, or the spread is shrinking fast;\n- a leg's open interest is small next to the leg size, or its book cannot fill the leg;\n- the price moved more than 15 % in 24 hours, so a leg is near liquidation risk;\n- the market was listed less than 14 days ago.\nFacts given as null are unknown: never veto because a fact is unknown.\n\nAnswer with one JSON object and nothing else: {\"verdict\": \"pass\" or \"veto\", \"reasons\": [up to 3 short sentences, each naming the fact and its number]}. With \"pass\", reasons may be empty."
+          "content": "You review one funding-rate carry trade before an automated desk opens it. The desk holds a long perpetual leg on one venue and a short perpetual leg of the same asset on another, and earns the difference in funding. You cannot approve, size or change the trade: you can only veto it. The trade goes ahead unless you veto it.\n\nVeto only on a concrete red flag in the facts, for example:\n- the funding spread this hour is far above its 7-day mean, so it looks like a spike that will not last;\n- the 7-day and 14-day spreads disagree, or the spread is shrinking fast;\n- a leg's open interest is small next to the leg size, or its book cannot fill the leg (book_depth_usd under leg_usd, or fill_impact_bps above 50);\n- a leg's price moved more than 15 % in 24 hours, so a leg is near liquidation risk;\n- a leg's market was listed less than 14 days ago.\nFacts given as null are unknown: never veto because a fact is unknown.\n\nAnswer with one JSON object and nothing else: {\"verdict\": \"pass\" or \"veto\", \"reasons\": [up to 3 short sentences, each naming the fact and its number]}. With \"pass\", reasons may be empty."
         },
         {
           "role": "user",
-          "content": "{\"trade\":\"open a new pair\",\"asset\":\"SOL\",\"long_venue\":\"orderly\",\"short_venue\":\"phoenix\",\"gross_apr_pct_this_hour\":33.75,\"gross_apr_pct_7d\":6.02,\"gross_apr_pct_14d\":null,\"net_apr_pct_after_costs\":8,\"owner_minimum_net_apr_pct\":5,\"hours_in_a_row_above_minimum\":8,\"leg_usd\":11.6,\"leverage\":1.5,\"legs\":[{\"venue\":\"orderly\",\"side\":\"long\",\"open_interest_usd\":1598673.91,\"book_depth_usd\":null},{\"venue\":\"phoenix\",\"side\":\"short\",\"open_interest_usd\":5759666.82,\"book_depth_usd\":null}],\"price_move_24h_pct\":null,\"days_since_listing\":null}"
+          "content": "{\"trade\":\"open a new pair\",\"asset\":\"SOL\",\"long_venue\":\"orderly\",\"short_venue\":\"phoenix\",\"gross_apr_pct_this_hour\":33.75,\"gross_apr_pct_7d\":6.02,\"gross_apr_pct_14d\":null,\"net_apr_pct_after_costs\":8,\"owner_minimum_net_apr_pct\":5,\"hours_in_a_row_above_minimum\":8,\"leg_usd\":11.6,\"leverage\":1.5,\"legs\":[{\"venue\":\"orderly\",\"side\":\"long\",\"open_interest_usd\":1598673.91,\"book_depth_usd\":null,\"fill_impact_bps\":null,\"price_move_24h_pct\":null,\"days_since_listing\":null},{\"venue\":\"phoenix\",\"side\":\"short\",\"open_interest_usd\":5759666.82,\"book_depth_usd\":null,\"fill_impact_bps\":null,\"price_move_24h_pct\":null,\"days_since_listing\":null}]}"
         }
       ],
       "response": {
@@ -142,16 +142,16 @@
       }
     },
     {
-      "key": "f3f0d17047c5d2601c07da88",
+      "key": "e1353b67668d4f60337de451",
       "model": "Qwen/Qwen3-VL-30B-A3B-Instruct",
       "messages": [
         {
           "role": "system",
-          "content": "You review one funding-rate carry trade before an automated desk opens it. The desk holds a long perpetual leg on one venue and a short perpetual leg of the same asset on another, and earns the difference in funding. You cannot approve, size or change the trade: you can only veto it. The trade goes ahead unless you veto it.\n\nVeto only on a concrete red flag in the facts, for example:\n- the funding spread this hour is far above its 7-day mean, so it looks like a spike that will not last;\n- the 7-day and 14-day spreads disagree, or the spread is shrinking fast;\n- a leg's open interest is small next to the leg size, or its book cannot fill the leg;\n- the price moved more than 15 % in 24 hours, so a leg is near liquidation risk;\n- the market was listed less than 14 days ago.\nFacts given as null are unknown: never veto because a fact is unknown.\n\nAnswer with one JSON object and nothing else: {\"verdict\": \"pass\" or \"veto\", \"reasons\": [up to 3 short sentences, each naming the fact and its number]}. With \"pass\", reasons may be empty."
+          "content": "You review one funding-rate carry trade before an automated desk opens it. The desk holds a long perpetual leg on one venue and a short perpetual leg of the same asset on another, and earns the difference in funding. You cannot approve, size or change the trade: you can only veto it. The trade goes ahead unless you veto it.\n\nVeto only on a concrete red flag in the facts, for example:\n- the funding spread this hour is far above its 7-day mean, so it looks like a spike that will not last;\n- the 7-day and 14-day spreads disagree, or the spread is shrinking fast;\n- a leg's open interest is small next to the leg size, or its book cannot fill the leg (book_depth_usd under leg_usd, or fill_impact_bps above 50);\n- a leg's price moved more than 15 % in 24 hours, so a leg is near liquidation risk;\n- a leg's market was listed less than 14 days ago.\nFacts given as null are unknown: never veto because a fact is unknown.\n\nAnswer with one JSON object and nothing else: {\"verdict\": \"pass\" or \"veto\", \"reasons\": [up to 3 short sentences, each naming the fact and its number]}. With \"pass\", reasons may be empty."
         },
         {
           "role": "user",
-          "content": "{\"trade\":\"rotate the held pair into this one\",\"asset\":\"ETH\",\"long_venue\":\"phoenix\",\"short_venue\":\"orderly\",\"gross_apr_pct_this_hour\":14.46,\"gross_apr_pct_7d\":6.58,\"gross_apr_pct_14d\":null,\"net_apr_pct_after_costs\":30,\"owner_minimum_net_apr_pct\":5,\"hours_in_a_row_above_minimum\":4,\"leg_usd\":11.2,\"leverage\":1.5,\"legs\":[{\"venue\":\"phoenix\",\"side\":\"long\",\"open_interest_usd\":780037.27,\"book_depth_usd\":null},{\"venue\":\"orderly\",\"side\":\"short\",\"open_interest_usd\":27788276.54,\"book_depth_usd\":null}],\"price_move_24h_pct\":null,\"days_since_listing\":null}"
+          "content": "{\"trade\":\"rotate the held pair into this one\",\"asset\":\"ETH\",\"long_venue\":\"phoenix\",\"short_venue\":\"orderly\",\"gross_apr_pct_this_hour\":14.46,\"gross_apr_pct_7d\":6.58,\"gross_apr_pct_14d\":null,\"net_apr_pct_after_costs\":30,\"owner_minimum_net_apr_pct\":5,\"hours_in_a_row_above_minimum\":4,\"leg_usd\":11.2,\"leverage\":1.5,\"legs\":[{\"venue\":\"phoenix\",\"side\":\"long\",\"open_interest_usd\":780037.27,\"book_depth_usd\":null,\"fill_impact_bps\":null,\"price_move_24h_pct\":null,\"days_since_listing\":null},{\"venue\":\"orderly\",\"side\":\"short\",\"open_interest_usd\":27788276.54,\"book_depth_usd\":null,\"fill_impact_bps\":null,\"price_move_24h_pct\":null,\"days_since_listing\":null}]}"
         }
       ],
       "response": {

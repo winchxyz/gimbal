@@ -315,7 +315,8 @@ export class HostBudget {
       ? Math.round(said * (1 + 0.15 * this.#random()))
       : Math.round(Math.min(this.#o.backoffMaxMs, this.#o.backoffBaseMs * 2 ** (n - 1)) * (0.5 + 0.5 * this.#random()));
     this.#retryAt = Math.max(this.#retryAt, now + pause);
-    if (said !== null) this.#serverRetryAt = Math.max(this.#serverRetryAt, this.#retryAt);
+    // The server's own pause only: #retryAt may still hold a longer backoff of an earlier 429 without Retry-After.
+    if (said !== null) this.#serverRetryAt = Math.max(this.#serverRetryAt, now + pause);
     const quiet = Math.round(Math.min(this.#o.quietMaxMs, this.#o.quietBaseMs * 2 ** (n - 1)) * (0.75 + 0.25 * this.#random()));
     this.#quietUntil = Math.max(this.#quietUntil, this.#retryAt, now + quiet);
     const a = this.#o.adaptive;

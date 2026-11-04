@@ -5,6 +5,7 @@ import { Flash } from '../ui/Flash.tsx';
 import { cx } from '../ui/cx.ts';
 import { dotColor } from '../ui/dot.ts';
 import { ago, useNow } from '../ui/useNow.ts';
+import { writeControls } from '../remote/readonly.ts';
 import { useManualSend } from '../ui/useManualSend.ts';
 import type { Alert, Reached } from './alerts.ts';
 import { sparkline } from './chart.ts';
@@ -180,7 +181,7 @@ export function Row({ w, selected, below, history, held, onSelect }: RowProps) {
   const watch = !w.tradable;
   const costs = totalCosts(w);
   const seven = w.grossApr7dPct === null ? '—' : plain(w.grossApr7dPct);
-  const rotateFrom = selected && held !== null && !w.held && isEnterable(w) ? held : null;
+  const rotateFrom = selected && held !== null && !w.held && isEnterable(w) && writeControls().rotate ? held : null;
   return (
     <div
       role="option"

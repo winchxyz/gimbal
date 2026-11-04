@@ -1,4 +1,4 @@
-// ReplayContractClient: the contract without a chain, for `npm run demo` and for tests (docs/interfaces.md §3). It
+// ReplayContractClient: the contract without a chain, for tests (docs/interfaces.md §3; `serve` in replay has none). It
 // holds desks and stored prices in memory, runs the contract's checks and refusal codes (replay-checks.ts), builds
 // the same payloads the contract builds (Hyperliquid actions, Orderly REST calls, EIP-3009 messages) and returns
 // them as SignedActions marked `replay: true`.

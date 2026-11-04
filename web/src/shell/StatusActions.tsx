@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { cx } from '../ui/cx.ts';
 import { notify } from '../ui/notice.ts';
+import { writeControls } from '../remote/readonly.ts';
 import { sendManual } from '../windows/useEngine.ts';
 import type { ActionId, StatusActionsView } from './status.ts';
 
@@ -19,7 +20,8 @@ const NOT_SENT: Record<Exclude<ActionId, 'close'>, string> = {
  */
 export function StatusActions({ view, className, skip }: { view: StatusActionsView; className?: string; skip?: readonly ActionId[] }) {
   const [asking, setAsking] = useState(false);
-  const buttons = view.buttons.filter((b) => !skip?.includes(b.id));
+  // Read-only view: the owner's buttons are not drawn; the note, which only says something, stays.
+  const buttons = writeControls().owner ? view.buttons.filter((b) => !skip?.includes(b.id)) : [];
   if (!view.note && buttons.length === 0) return null;
 
   if (asking) {

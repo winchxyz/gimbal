@@ -99,11 +99,14 @@ export interface ProofLink {
   href: string;
 }
 
+/** The engine's remote view cuts account ids and 64-hex strings to `abcd…wxyz`: an address with that in it points nowhere. */
+export const isMasked = (text: string): boolean => text.includes('…');
+
 /** One link per transaction the explorer can open, in the order the engine lists them. */
 export function proofLinks(tx: readonly TxRef[]): ProofLink[] {
   const links: ProofLink[] = [];
   for (const t of tx) {
-    const href = externalUrl(t.url);
+    const href = isMasked(t.url) ? null : externalUrl(t.url);
     if (href !== null) links.push({ chain: t.chain, label: CHAIN_LABELS[t.chain], short: shortId(t.id), href });
   }
   return links;

@@ -22,6 +22,8 @@ export interface Market {
   maxLeverage: number;
   isolatedOnly: boolean;       // cannot use cross margin
   delisted: boolean;
+  listedAt?: number | null;    // ms, when the venue listed the market, where it says (Orderly created_time); absent
+                               // or null = the venue does not say
 }
 
 /**
@@ -33,7 +35,9 @@ export interface MarketFunding extends FundingRate {
   oraclePx: number | null;
   openInterest: number | null;   // units of `symbol` (what markPx prices); USD = openInterest × markPx
   volume24hUsd: number | null;
-  base?: string;                 // the cross-venue key the scanner pairs on: quote, suffixes and broker tags stripped,
+  prevDayPx?: number | null;     // the venue's price of `symbol` 24 h ago (Hyperliquid prevDayPx, Orderly 24h_open,
+                                 // Phoenix prev_day_mark_price); absent or null = not given
+  base?: string;                // the cross-venue key the scanner pairs on: quote, suffixes and broker tags stripped,
                                  // aliases applied ("kPEPE" → "PEPE", "PERP_SOL_USDC" → "SOL", "XBT" → "BTC");
                                  // absent = the scanner uses `symbol` as is
   multiplier?: number;           // base units per unit of `symbol` ("kPEPE" 1000); absent = 1

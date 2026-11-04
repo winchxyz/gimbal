@@ -29,6 +29,7 @@ export interface ScanLeg {
   markPx: number | null;         // USD per base unit (venueMarkPx ÷ multiplier)
   oiUsd: number | null;          // open interest in USD
   volume24hUsd: number | null;   // traded in the last 24 h, USD; null where the venue does not say
+  prevDayPx?: number | null;     // the venue's price of `symbol` 24 h ago; absent or null where it does not say
   readAt: number;                // ms, when this venue's funding was read
   stale: boolean;                // the venue did not answer this scan: this is its last good read
   fundingCapPerHour?: number;    // the market's own funding limits from the venue's answer, per hour; absent where
@@ -77,6 +78,7 @@ export function toLeg(f: MarketFunding, kind: LegKind, readAt: number, stale: bo
     // OI × the venue's own mark; the multiplier plays no part.
     oiUsd: oi === null || venueMarkPx === null ? null : oi * venueMarkPx,
     volume24hUsd: typeof f.volume24hUsd === 'number' && Number.isFinite(f.volume24hUsd) && f.volume24hUsd >= 0 ? f.volume24hUsd : null,
+    ...(finitePositive(f.prevDayPx) ? { prevDayPx: f.prevDayPx } : {}),
     readAt,
     stale,
     // A cap at or below zero, or a floor at or above it, would put a quiet market "at the cap": not a limit.

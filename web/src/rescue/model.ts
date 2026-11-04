@@ -150,7 +150,8 @@ export function stepText(id: StepId, { p, leg, line }: StepContext): string {
     case 'source':
       return p.from === 'reserve' ? 'The reserve pays. Both legs keep their margin.' : `${VENUE_NAMES[p.from]} free margin pays. The reserve is kept.`;
     case 'quote':
-      return `NEAR Intents: ${usd(p.amountUsd)} to ${to} margin`;
+      // What was quoted and sent; once landed, amountUsd is what arrived after fees, so the row keeps sentUsd.
+      return `NEAR Intents: ${usd(p.sentUsd ?? p.amountUsd)} to ${to} margin`;
     case 'verify':
       return 'The contract checks the quote signature and the deposit address';
     case 'sign':
@@ -187,10 +188,15 @@ export interface MovingView {
   text: string;
 }
 
+/**
+ * The engine's amount means what the step can say (RescueProgress.amountUsd): at detect what the leg needs, before
+ * a transfer is planned; from source on what the transfer sends; once landed what reached the margin after fees.
+ */
 export function movingOf(p: RescueProgress, failure: RescueFailure | null): MovingView {
   const route = `${p.from === 'reserve' ? 'Reserve' : `${VENUE_NAMES[p.from]} free margin`} → ${VENUE_NAMES[p.to]} margin, through NEAR Intents`;
   if (p.step === 'failed') return { label: 'The desk tries next', amount: null, text: nextText(failure) };
-  return { label: p.step === 'landed' ? 'Moved' : 'Moving', amount: usd(p.amountUsd), text: route };
+  const label = p.step === 'detect' ? 'The leg needs' : p.step === 'landed' ? 'Moved' : 'Moving';
+  return { label, amount: usd(p.amountUsd), text: route };
 }
 
 /** The line under the distance in the hero. */

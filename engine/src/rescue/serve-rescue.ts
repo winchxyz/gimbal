@@ -37,6 +37,7 @@ import type { Hex } from 'viem';
 import { NearContractClient } from '../contract/near-client.ts';
 import { NearApiTransport } from '../contract/near-transport.ts';
 import type { DeskView } from '../contract/types.ts';
+import { asDeskAct } from '../venues/desk-acts.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import { checkContractNetwork, contractEnv } from '../cli/serve-contract.ts';
 import { ConfigError } from '../cli/start-errors.ts';
@@ -318,10 +319,10 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
         // The authorization is public once signed and anyone may submit it until validBefore.
         usableUntilMs: authorization.validBefore * 1000,
         authorization,
-        send: async () => {
+        send: () => asDeskAct(async () => {
           const tx = await arb.submit(signed, await evm());
           return { tx, depositTx: tx.find((x) => x.chain === 'arbitrum')?.id ?? '' };
-        },
+        }),
       };
     },
   };
@@ -383,10 +384,10 @@ export async function serveRescue(input: ServeRescueInput): Promise<ServeRescue>
       landing: new VenueLandings({ hyperliquid: hlLanding, ...(phoenixProblem === null ? { phoenix: phoenixCredit.landing() } : {}) }, refusedLandings),
       payers: { reserve, arbitrum, ...(phoenixProblem === null ? { phoenix: phoenixPayer } : {}) },
       hlWithdraw: {
-        withdraw: async (amountE6) => {
+        withdraw: (amountE6) => asDeskAct(async () => {
           const r = await hl.submit(await contract.hlWithdraw(deskId, usdcDecimal(amountE6)), await evm());
           return { tx: r.tx };
-        },
+        }),
       },
       withdrawals: (venue, paused) => log(`rescue: ${venue} withdrawals ${paused === null ? 'ran' : `refused: ${paused}`}`),
     });

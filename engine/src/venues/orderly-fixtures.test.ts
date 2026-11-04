@@ -44,8 +44,10 @@ test('markets: the shared ones only by default, steps from base_tick and quote_t
   assert.deepEqual(sol, {
     venue: 'orderly', symbol: 'PERP_SOL_USDC', assetIndex: null, szDecimals: 2, lotSize: 0.01, tickSize: 0.001, maxPxDecimals: 3,
     maxLeverage: 100, isolatedOnly: false, delisted: false, brokerId: null, baseMin: 0.01, minNotional: 10, fundingPeriodHours: 8,
-    baseImr: 0.01, baseMmr: 0.006, imrFactor: 0.0000010667,
+    baseImr: 0.01, baseMmr: 0.006, imrFactor: 0.0000010667, listedAt: 1702531287807,
   });
+  // Listing age: Orderly's info carries created_time (ms) for every market.
+  assert.ok(markets.every((m) => typeof m.listedAt === 'number' && m.listedAt > Date.UTC(2020, 0, 1)), 'every shared market has a listing time');
   for (const m of markets) {
     assert.ok(Number.isInteger(m.szDecimals) && Number.isInteger(m.maxPxDecimals) && m.maxLeverage >= 1, m.symbol);
     assert.ok([4, 8].includes(m.fundingPeriodHours), `${m.symbol} period ${m.fundingPeriodHours}`);

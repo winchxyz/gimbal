@@ -27,6 +27,11 @@ export interface StatusContext {
   bestNetAprPct?: number | null;
   /** `StrategyConfig.auto`: with it off, Waiting says the desk is only watching. */
   auto?: boolean | null;
+  /**
+   * A remote read-only view: the engine masks the owner's and the operator's account ids there ("gimb…near"), so
+   * `paused.by` is a label to show as it came, never something to compare with `owner` to say "you".
+   */
+  remote?: boolean;
 }
 
 /**
@@ -67,7 +72,7 @@ export function statusOf(desk: DeskState, context: StatusContext = {}): StatusVi
   }
 
   if (desk.paused) {
-    const by = desk.paused.by === desk.owner ? 'you' : desk.paused.by;
+    const by = !context.remote && desk.paused.by === desk.owner ? 'you' : desk.paused.by;
     return {
       tone: 'paused',
       word: 'Paused',

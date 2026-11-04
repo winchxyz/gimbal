@@ -15,6 +15,7 @@
   "scripts": {
     "ci": "node scripts/ci.mjs",
     "build":"npm run build --workspaces --if-present",
+    "demo": "node tools/demo.mjs",
     "test": "npm run test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "attack": "npm run attack -w engine --",

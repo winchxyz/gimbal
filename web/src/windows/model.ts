@@ -10,12 +10,28 @@ export const TRADABLE_VENUES: readonly string[] = ['hyperliquid', 'phoenix', 'or
 
 export const tabOf = (w: FundingWindow): Tab => (w.tradable ? 'tradable' : 'watch');
 
+/**
+ * A 7-day spread is in. Without one the net is the listing's hour stated as a year, and the engine never enters it
+ * (decide.ts gate: "no 7-day spread yet"), so it ranks last and is never the best window or an alert.
+ */
+export const hasHistory = (w: FundingWindow): boolean => w.grossApr7dPct !== null;
+
 /** Tradable windows rank by net APR; watch-only ones have no net, so they rank by gross. */
 const rankOf = (w: FundingWindow): number => (w.tradable ? w.netAprPct : w.grossAprPct);
 
 export function sortWindows(windows: readonly FundingWindow[]): FundingWindow[] {
-  // Ties fall back to the symbol and id so two equal rows never swap places between updates.
-  return [...windows].sort((a, b) => rankOf(b) - rankOf(a) || a.symbol.localeCompare(b.symbol) || a.id.localeCompare(b.id));
+  // Windows without a 7-day spread go after the others. Ties fall back to the symbol and id so two equal rows never
+  // swap places between updates.
+  return [...windows].sort(
+    (a, b) =>
+      Number(hasHistory(b)) - Number(hasHistory(a)) || rankOf(b) - rankOf(a) || a.symbol.localeCompare(b.symbol) || a.id.localeCompare(b.id),
+  );
+}
+
+/** The best net APR on offer, over windows with a 7-day spread only; null when there is none. */
+export function bestNetAprPct(windows: readonly FundingWindow[] | null): number | null {
+  const nets = (windows ?? []).filter(hasHistory).map((w) => w.netAprPct);
+  return nets.length > 0 ? Math.max(...nets) : null;
 }
 
 export const inTab = (windows: readonly FundingWindow[], tab: Tab): FundingWindow[] =>
@@ -136,10 +152,10 @@ const clamp = (n: number, lo: number, hi: number): number => Math.min(hi, Math.m
 /**
  * The window auto would open first, or null: the first enterable one in the engine's order. The engine ranks desk
  * windows by the carry it expects over the hold, net of the round trip, which the web cannot recompute from a Window,
- * so the list is not re-sorted here.
+ * so the list is not re-sorted here. A window without a 7-day spread is never it: the gate does not enter one.
  */
 export function bestEnterable(windows: readonly FundingWindow[]): FundingWindow | null {
-  return windows.find(isEnterable) ?? null;
+  return windows.find((w) => isEnterable(w) && hasHistory(w)) ?? null;
 }
 
 /**

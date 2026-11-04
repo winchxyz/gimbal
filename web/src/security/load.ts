@@ -6,6 +6,7 @@ import { readDesk, type Chain, type ChainDesk } from '../onboarding/chain.ts';
 import { parsePolicy } from '../onboarding/engine.ts';
 import type { AccessKeyInfo } from '../onboarding/operator.ts';
 import { parseConfig, type ContractConfig } from './contract-config.ts';
+import { maskAccount, maskIf, maskIn } from '../remote/mask.ts';
 import { netOf } from './explorer.ts';
 
 export interface SecurityTarget {
@@ -25,10 +26,12 @@ export interface SecurityData {
 }
 
 /**
- * Reads the contract, the desk and the owner's keys. `null` is "the contract has no such desk". Throws with what failed:
+ * Reads the contract, the desk and the owner's keys. With `mask` (the remote view) the owner's and the operator's ids come back
+ * masked as the engine masks them (remote/mask.ts), and nothing built from them is a link.
+ * `null` is "the contract has no such desk". Throws with what failed:
  * an RPC that did not answer, a contract that does not answer like a gimbal contract, or one on the other network.
  */
-export async function loadSecurity(chain: Chain, target: SecurityTarget, now = Date.now()): Promise<SecurityData | null> {
+export async function loadSecurity(chain: Chain, target: SecurityTarget, now = Date.now(), options: { mask?: boolean } = {}): Promise<SecurityData | null> {
   const [config, desk] = await Promise.all([
     chain.view(target.contractId, 'config').then(parseConfig),
     readDesk(chain, target.contractId, target.deskId),
@@ -39,6 +42,24 @@ export async function loadSecurity(chain: Chain, target: SecurityTarget, now = D
   if (desk === null) return null;
   // `get_desk` is the contract's own word, but the screen draws every field: a policy that is not one is refused here.
   const checked: ChainDesk = { ...desk, policy: parsePolicy(desk.policy) };
-  const keys = await chain.accessKeys(checked.owner);
-  return { target, config, desk: checked, keys, at: now };
+  const secret = [checked.owner, checked.operator];
+  // The keys are read for the real owner; what is kept and shown carries the mask.
+  const keys = await chain.accessKeys(checked.owner).catch((error: unknown) => {
+    const text = error instanceof Error ? error.message : String(error);
+    throw new Error(options.mask ? maskIn(text, secret) : text);
+  });
+  if (!options.mask) return { target, config, desk: checked, keys, at: now };
+  const hide = (id: string): string => maskIf(id, secret);
+  return {
+    target,
+    config: {
+      ...config,
+      treasury: hide(config.treasury),
+      mpc: hide(config.mpc),
+      oracle: config.oracle.kind === 'outlayer' ? { kind: 'outlayer', contract: hide(config.oracle.contract) } : config.oracle,
+    },
+    desk: { ...checked, owner: maskAccount(checked.owner), operator: checked.operator === null ? null : maskAccount(checked.operator) },
+    keys,
+    at: now,
+  };
 }
