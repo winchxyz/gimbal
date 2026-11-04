@@ -13,8 +13,14 @@
 // length does not leak either). EventSource cannot send headers, so /events also takes ?ticket=<t> from GET
 // /view-ticket: an HMAC under a key made at start (a restart voids every ticket), valid TICKET_TTL_MS and once. The
 // token itself never goes in a URL, so it is never in a proxy's or a browser's history; a ticket that is, is spent.
-// A client with FAIL_LIMIT failed tries in FAIL_WINDOW_MS gets 429 until the window ends, the right token included.
-// The client is the last X-Forwarded-For entry (the one the platform's proxy adds) or the socket's address.
+// At most MAX_TICKETS are outstanding: a new one retires the oldest, so whoever asks for tickets never locks the
+// owner out. The credentials are checked first: a right one is always served (a shared IP's failures never refuse
+// it). A client with FAIL_LIMIT failed tries in FAIL_WINDOW_MS gets 429 instead of 401 on each further failure. The
+// client is the last X-Forwarded-For entry, which assumes exactly one proxy appends to that header in front of the
+// view (Railway's edge); without a proxy, the socket's address.
+//
+// It must never hold serve's shutdown: a request has REQUEST_TIMEOUT_MS to arrive in full, stop() closes every
+// connection and returns within STOP_WAIT_MS whatever a client does, and a listener error is logged, never thrown.
 //
 // CORS: a request whose Origin is not in GIMBAL_VIEW_ORIGINS is refused (403); a listed one gets
 // Access-Control-Allow-Origin for itself, and its preflight (OPTIONS, for the Authorization header) is answered.
@@ -44,8 +50,12 @@ export const FAIL_LIMIT = 10;
 export const FAIL_WINDOW_MS = 60_000;
 /** Clients whose failures are remembered; past this the oldest is forgotten, so the map stays bounded. */
 const FAIL_CLIENTS_MAX = 10_000;
-/** Unspent tickets kept; past this /view-ticket answers 429 until some expire. */
-const TICKETS_MAX = 10_000;
+/** Unspent tickets kept; a new one past this retires the oldest. */
+export const MAX_TICKETS = 8;
+/** Time for a request's headers and body to arrive; a client dripping a body is cut off after it. */
+export const REQUEST_TIMEOUT_MS = 10_000;
+/** stop() returns after this at the latest. */
+export const STOP_WAIT_MS = 3_000;
 /** SSE streams at once: a leaked token cannot make the engine hold more. */
 export const MAX_STREAMS = 32;
 const HEARTBEAT_MS = 15_000;
@@ -74,6 +84,8 @@ export interface ViewServerOptions {
   failLimit?: number;
   maxStreams?: number;
   sseMaxBufferBytes?: number;
+  requestTimeoutMs?: number;
+  stopWaitMs?: number;
 }
 
 export class ViewServer {
@@ -95,7 +107,13 @@ export class ViewServer {
     this.#o = options;
     this.#origins = new Set(options.origins);
     this.#tokenHash = sha256(options.token);
-    this.#server = createServer((req, res) => {
+    const timeout = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
+    this.#server = createServer({
+      requestTimeout: timeout,
+      headersTimeout: timeout,
+      // Node checks those timeouts this often (default 30 s), so a 10 s limit is enforced within about a second.
+      connectionsCheckingInterval: Math.min(1_000, timeout),
+    }, (req, res) => {
       try {
         this.#route(req, res);
       } catch {
@@ -111,6 +129,11 @@ export class ViewServer {
     return this.#clients.size;
   }
 
+  /** The node:http server underneath, for tests. */
+  get httpServer(): Server {
+    return this.#server;
+  }
+
   /** Listens on `host`:`port` (0 = any free port); resolves with the port. */
   async start(port: number, host = '0.0.0.0'): Promise<number> {
     await new Promise<void>((resolve, reject) => {
@@ -120,6 +143,8 @@ export class ViewServer {
         resolve();
       });
     });
+    // From here an error on the listener is a log line: with no listener node would throw it and stop serve.
+    this.#server.on('error', (err) => this.#log(`view: listener error: ${err instanceof Error ? err.message : String(err)}`));
     this.#unsubscribe = this.#o.source.subscribe((event) => {
       if (this.#clients.size === 0) return;
       const chunk = `data: ${JSON.stringify(this.#o.redact(event))}\n\n`;
@@ -139,7 +164,16 @@ export class ViewServer {
     for (const kind of this.#logged.keys()) this.#flushLog(kind);
     for (const res of this.#clients) res.end();
     this.#clients.clear();
-    await new Promise<void>((resolve) => this.#server.close(() => resolve()));
+    const closed = new Promise<void>((resolve) => this.#server.close(() => resolve()));
+    // Idle keep-alive sockets and requests still arriving (a body dripped on purpose) would hold close() open.
+    this.#server.closeAllConnections();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const bounded = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, this.#o.stopWaitMs ?? STOP_WAIT_MS);
+      timer.unref();
+    });
+    await Promise.race([closed, bounded]);
+    clearTimeout(timer);
   }
 
   #now(): number {
@@ -151,9 +185,12 @@ export class ViewServer {
     const url = new URL(req.url ?? '/', 'http://view');
     const path = url.pathname.replace(/\/+$/, '') || '/';
     for (const [k, v] of Object.entries(COMMON_HEADERS)) res.setHeader(k, v);
-    // A write is refused without reading its body: close the connection after the answer, so the unread body cannot
-    // be taken for the next request on it.
-    if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') res.setHeader('connection', 'close');
+    // No route reads a body: a request that sends one (a refused write, or a GET with a body dripped to hold the
+    // socket) has the connection closed after the answer, so the unread body is neither waited for nor taken for the
+    // next request on it.
+    const hasBody = (req.headers['content-length'] !== undefined && req.headers['content-length'] !== '0')
+      || req.headers['transfer-encoding'] !== undefined;
+    if (hasBody || (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS')) res.setHeader('connection', 'close');
 
     if (path === '/healthz') {
       if (method !== 'GET' && method !== 'HEAD') return notAllowed(res);
@@ -180,27 +217,30 @@ export class ViewServer {
     }
     if (method !== 'GET') return notAllowed(res);
 
-    const client = clientOf(req);
-    if (this.#limited(client)) {
-      this.#logRefused('limited', `view: refused ${method} ${path}: too many failed tries from one client`);
-      res.setHeader('retry-after', String(Math.ceil(FAIL_WINDOW_MS / 1000)));
-      return json(res, 429, { error: 'too many failed tries; wait and try again' });
-    }
     const ticket = path === '/events' ? url.searchParams.get('ticket') : null;
-    const ok = ticket !== null ? this.#spendTicket(ticket) : this.#bearerOk(req);
+    // A ticket is checked here and spent only once the stream opens, so a stream refused for the cap does not cost
+    // the viewer its ticket; an outsider gets 401 before the cap is looked at.
+    const nonce = ticket !== null ? this.#validTicket(ticket) : null;
+    const ok = ticket !== null ? nonce !== null : this.#bearerOk(req);
     if (!ok) {
+      const client = clientOf(req);
+      if (this.#limited(client)) {
+        this.#logRefused('limited', `view: refused ${method} ${path}: too many failed tries from one client`);
+        res.setHeader('retry-after', String(Math.ceil(FAIL_WINDOW_MS / 1000)));
+        return json(res, 429, { error: 'too many failed tries; wait and try again' });
+      }
       this.#fail(client);
       this.#logRefused('auth', `view: refused ${method} ${path}: ${ticket !== null ? 'bad or spent ticket' : 'bad or missing token'}`);
       res.setHeader('www-authenticate', 'Bearer');
       return json(res, 401, { error: ticket !== null ? 'ticket not valid: get a new one from /view-ticket' : 'unauthorized' });
     }
 
-    if (path === '/view-ticket') {
-      const issued = this.#issueTicket();
-      if (issued === null) return json(res, 429, { error: 'too many tickets outstanding; try again shortly' });
-      return json(res, 200, issued);
+    if (path === '/view-ticket') return json(res, 200, this.#issueTicket());
+    if (path === '/events') {
+      if (this.#clients.size >= (this.#o.maxStreams ?? MAX_STREAMS)) return json(res, 503, { error: 'too many streams open' });
+      if (nonce !== null) this.#tickets.delete(nonce);
+      return this.#events(req, res);
     }
-    if (path === '/events') return this.#events(req, res);
     if (path === '/state') return json(res, 200, this.#o.redact(this.#o.source.state()));
     if (path === '/strategy') return json(res, 200, this.#o.redact(this.#o.source.strategy()));
     if (path === '/journal') return json(res, 200, this.#o.redact(this.#o.source.journal(url.searchParams.get('before'))));
@@ -220,10 +260,11 @@ export class ViewServer {
     return timingSafeEqual(sha256(m[1]!), this.#tokenHash);
   }
 
-  #issueTicket(): { ticket: string; expiresAt: number } | null {
+  #issueTicket(): { ticket: string; expiresAt: number } {
     const now = this.#now();
     this.#pruneTickets(now);
-    if (this.#tickets.size >= TICKETS_MAX) return null;
+    // The oldest outstanding ticket is retired (insertion order), never the new one refused.
+    while (this.#tickets.size >= MAX_TICKETS) this.#tickets.delete(this.#tickets.keys().next().value!);
     const expiresAt = now + (this.#o.ticketTtlMs ?? TICKET_TTL_MS);
     const nonce = randomBytes(16).toString('hex');
     const body = `${expiresAt}.${nonce}`;
@@ -231,19 +272,17 @@ export class ViewServer {
     return { ticket: `${body}.${this.#sign(body)}`, expiresAt };
   }
 
-  /** True once per valid, unexpired ticket. */
-  #spendTicket(ticket: string): boolean {
+  /** The nonce of a valid, unexpired, unspent ticket (the caller spends it), else null. */
+  #validTicket(ticket: string): string | null {
     const m = /^(\d{1,16})\.([0-9a-f]{32})\.([A-Za-z0-9_-]{43})$/.exec(ticket);
-    if (m === null) return false;
+    if (m === null) return null;
     const [, exp, nonce, sig] = m as unknown as [string, string, string, string];
     const want = Buffer.from(this.#sign(`${exp}.${nonce}`));
     const got = Buffer.from(sig);
-    if (got.length !== want.length || !timingSafeEqual(got, want)) return false;
-    const now = this.#now();
+    if (got.length !== want.length || !timingSafeEqual(got, want)) return null;
     const expiresAt = this.#tickets.get(nonce);
-    if (expiresAt === undefined || expiresAt !== Number(exp)) return false;
-    this.#tickets.delete(nonce);
-    return now < expiresAt;
+    if (expiresAt === undefined || expiresAt !== Number(exp) || this.#now() >= expiresAt) return null;
+    return nonce;
   }
 
   #sign(body: string): string {
@@ -277,7 +316,6 @@ export class ViewServer {
   }
 
   #events(req: IncomingMessage, res: ServerResponse): void {
-    if (this.#clients.size >= (this.#o.maxStreams ?? MAX_STREAMS)) return json(res, 503, { error: 'too many streams open' });
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-cache, no-store, no-transform',
@@ -294,6 +332,8 @@ export class ViewServer {
     const drop = () => this.#clients.delete(res);
     req.on('close', drop);
     res.on('close', drop);
+    // A socket error on a stream drops that client; unhandled, it would be thrown.
+    res.on('error', drop);
   }
 
   #send(res: ServerResponse, chunk: string): void {

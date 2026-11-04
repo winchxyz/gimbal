@@ -882,7 +882,24 @@ node --env-file=... engine/src/cli/pair-mainnet.ts fund-phoenix 15            # 
 node --env-file=... engine/src/cli/pair-mainnet.ts defund-phoenix all         # Phoenix withdraw -> Ember unwrap -> USDC
 node --env-file=... engine/src/cli/pair-mainnet.ts open ETH 15 --short hyperliquid --long phoenix --leverage 2
 node --env-file=... engine/src/cli/pair-mainnet.ts close ETH
+node --env-file=... engine/src/cli/pair-mainnet.ts refuse-band ETH            # an order outside the band: E_PRICE_BAND on chain
+node --env-file=... engine/src/cli/pair-mainnet.ts refuse-notional ETH        # an order over max_notional_usd: E_SIZE on chain
+node --env-file=... engine/src/cli/pair-mainnet.ts cancel-hl ETH <oid|cloid>  # an order's status; --send cancels it (hl_cancel)
 ```
+
+- `refuse-band` / `refuse-notional` send one real Hyperliquid order to `hl_order` so the contract refuses it in a
+  failed transaction: a small post-only buy at twice the band above the stored price, or one inside the band and one
+  lot over the cap. `--send` prints the nearblocks link and the exact error and costs about 0.001 NEAR, plus one
+  `refresh_prices` when the stored price is stale. No trader lock, no venue order, one NEAR call at a time, and it
+  refuses when the key has under 0.6 NEAR (two call reserves) spendable or allowance: safe while serve runs. Exit 0
+  refused as expected, 1 refused otherwise (gas spent), 3 no proven outcome, 4 signed, 5 `hl_order` not sent
+  (a `refresh_prices` may have gone out and spent gas).
+- The order is priced at least max(25 bps, half the band) above the best ask, read twice (the second right before
+  `hl_order`). A signature the contract returns anyway (exit 4) is never forwarded, but it is public in the
+  transaction. `expiresAfter` (60 s) bounds only when Hyperliquid takes it; posted in time and not crossing, a post-only
+  buy rests until filled or cancelled. Then check the printed cloid with `cancel-hl` and, if it rests, stop serve,
+  run `cancel-hl <SYM> <cloid> --send`, and start serve again. "Hyperliquid does not know it" in the first
+  60 s after the block can still change: check again after that.
 
 - Every Phoenix transaction is one legacy message signed by `sol_sign` (compute budget first, fee at most 600,000
   lamports; orders at the 600k unit limit and `--priority-microlamports`, default 100,000, at most 200,000). The money
@@ -937,7 +954,8 @@ node --env-file=... engine/src/cli/pair-mainnet.ts close ETH
 Serve (`engine/src/cli/serve-pair.ts`, `docs/interfaces.md` "serve pair") holds the open pair with reduce-only
 closes only (panic_close, a rescue's reduce, the ADL unwind). It trades only with `GIMBAL_TRADE=1`, from the main
 checkout, never with `--once`, and holds the per-desk trader lock that `pair-mainnet --send` takes too: stop serve
-before any `pair-mainnet --send`.
+before any `pair-mainnet --send` (except `refuse-band` and `refuse-notional`, which take no lock and place no order;
+`cancel-hl --send` takes the lock).
 
 1. Check both legs: `npm run monitor -w engine -- --mainnet` (read-only).
 2. First start, no trader state file yet:

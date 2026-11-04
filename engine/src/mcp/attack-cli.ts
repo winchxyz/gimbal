@@ -5,7 +5,7 @@
 //
 //   node engine/src/mcp/attack-cli.ts --contract <id> --desk <id> [--dry] [--meter] [--only a,b] [--key-file f]
 //                                     [--env-file f] [--network testnet|mainnet] [--mainnet]
-//   npm run attack -w engine -- --contract gimbal-final-fcf135.testnet --desk final-1 --dry
+//   npm run attack -w engine -- --contract <contract> --desk <desk> --dry
 //
 // A row passes only on exactly its expected refusal; anything else is FAIL with what came back.
 // --dry (the default when no operator key file exists): build every request, print what would be sent and the code

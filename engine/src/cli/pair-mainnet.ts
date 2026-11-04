@@ -10,6 +10,10 @@
 //          [--slippage-bps 50] [--reprice-s 30] [--maker-timeout-s 120] [--max-orders 6] [--taker-fallback]
 //          [--priority-microlamports 100000]
 //     close <symbol> [the same order options]
+//     refuse-band <symbol>                  one real Hyperliquid order outside the price band, sent to hl_order so the
+//                                           contract refuses it on chain (E_PRICE_BAND); refuse-lib.ts
+//     refuse-notional <symbol>              the same, inside the band and one lot over max_notional_usd (E_SIZE)
+//     cancel-hl <symbol> <oid|cloid>        a Hyperliquid order's status; with --send, hl_cancel when it is open
 //
 // The env file holds the engine's names (GIMBAL_CONTRACT_ID, DESK_ID, OPERATOR_ACCOUNT_ID, OPERATOR_PRIVATE_KEY,
 // NEAR_RPC_URL, HL_API_URL, PHOENIX_API_URL, SOLANA_RPC_URL); values are never printed, and the key is read only
@@ -23,7 +27,11 @@
 // IOC retry). A stored price is the oracle's timestamp less its 600 s recency, so one fresh from refresh_prices lives
 // oracle_max_age_s - 600 s (300 s at 900): the maker timeout plus 120 s must fit that. The price is refreshed (only
 // once the refusals are checked) before each part when it would not outlive that, and whenever an order (an unwind,
-// a close) finds it stale; never twice within 30 s.
+// a close) finds it stale; never twice within 30 s. The plan itself is read-only: a stored price that is missing (the
+// plan then runs on the books' mid) or would not outlive the first part is planned on as it is, and open --send
+// refreshes it once, after every refusal passed, so a refused open pays for no refresh_prices; a symbol that is not
+// one of the contract's oracle assets is refused instead (refresh_prices cannot price it). A dry run never sends
+// refresh_prices and reports a missing price as a refusal.
 //
 // Before an open the plan prints both legs' funding now and over 7 days, the gross APR, the spread expected over the
 // hold against the round trip (taker fees, half spreads, basis buffer), the size, the leverage and liquidation
@@ -43,6 +51,12 @@
 // stays unhedged is printed exactly.
 //
 // The open and close are pair-ops.ts, which serve's strategy loop runs too (serve-pair.ts).
+//
+// refuse-band and refuse-notional (refuse-cli.ts) run before the trader lock and before any relayer or submitter
+// exists: their only calls are refresh_prices (when the stored price is stale) and one hl_order the contract is expected
+// to refuse, one at a time. They are safe to run while serve trades the desk with the same operator key (an InvalidNonce
+// from that shared key is retried with a fresh nonce). Whatever the contract answers, no signature goes to any venue.
+// Exit codes 0/1/3/4/5 (refuse-lib.ts). cancel-hl is an ordinary command: its --send takes the lock and posts a cancel.
 
 import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -74,8 +88,10 @@ import type { Args, PriceDeps } from './pair-mainnet-lib.ts';
 import { UsageError, newPriceState, num, orderOptions, parseArgs, refreshLanded, withdrawKeepsLegs } from './pair-mainnet-lib.ts';
 import type { OpsCtx } from './pair-ops.ts';
 import {
-  ORDERS_PER_PART, buildPair, hlInfo, phoenixExchange, planClose, planOpen, policyMarketMismatches, refs, sendClose, sendOpen, storedPrice, traderState,
+  ORDERS_PER_PART, buildPair, hlInfo, phoenixExchange, planClose, planOpen, policyMarketMismatches, refreshForOpen, refs, sendClose, sendOpen, storedPrice, traderState,
 } from './pair-ops.ts';
+import { runRefuse } from './refuse-cli.ts';
+import { EXIT_NOT_SENT, REFUSE_COMMANDS, cancelHl, parseOrderId } from './refuse-lib.ts';
 import { checkContractNetwork, contractEnv } from './serve-contract.ts';
 
 const USAGE = `usage: node --env-file=<engine env> engine/src/cli/pair-mainnet.ts <command> [--send]
@@ -84,7 +100,13 @@ const USAGE = `usage: node --env-file=<engine env> engine/src/cli/pair-mainnet.t
   defund-phoenix <usdc|all>
   open <symbol> <legUsd> --short hyperliquid --long phoenix [--leverage 2] [--hold-days 7] [--basis-bps 10] [--slippage-bps 50]
        [--reprice-s 30] [--maker-timeout-s 120] [--max-orders 6] [--taker-fallback] [--priority-microlamports 100000]
-  close <symbol> [--slippage-bps 50] [--reprice-s 30] [--maker-timeout-s 120] [--max-orders 6] [--taker-fallback] [--priority-microlamports 100000]`;
+  close <symbol> [--slippage-bps 50] [--reprice-s 30] [--maker-timeout-s 120] [--max-orders 6] [--taker-fallback] [--priority-microlamports 100000]
+  refuse-band <symbol>       a real order outside the price band to hl_order: the contract refuses it on chain (E_PRICE_BAND)
+  refuse-notional <symbol>   a real order over max_notional_usd to hl_order: the contract refuses it on chain (E_SIZE)
+    Both are safe to run while serve trades: no trader lock, no venue order, one NEAR call at a time; nothing is ever
+    forwarded to a venue, whatever the contract answers. Exit 0 refused as expected, 1 refused otherwise (gas spent),
+    3 no proven outcome, 4 signed (never forwarded), 5 hl_order not sent (a refresh_prices may have gone out and spent gas).
+  cancel-hl <symbol> <oid|cloid>   the order's status; --send (serve stopped) cancels it with hl_cancel when it is open`;
 
 const say = (line = '') => console.log(line);
 const envVar = (name: string): string | undefined => {
@@ -114,6 +136,8 @@ interface Ctx extends OpsCtx {
   prices: PriceDeps;
 }
 
+/** Set from the parsed command (an option may come before it, as in `--send refuse-band ETH`). */
+let refusing = false;
 try {
   await main(process.argv.slice(2));
 } catch (err) {
@@ -133,15 +157,25 @@ try {
     console.error(`pair-mainnet: ${errorMessage(err)}`);
     process.exitCode = 1;
   }
+  // refuse-*: whatever stopped it here stopped it before hl_order went out (refuse() answers for the call itself);
+  // a refresh_prices may still have gone out and spent its gas.
+  if (refusing && !(err instanceof UsageError)) process.exitCode = EXIT_NOT_SENT;
 }
 for (const line of openLines) console.log(line);
 setTimeout(() => process.exit(), 300).unref();
 
 async function main(argv: string[]): Promise<void> {
   const args = parseArgs(argv);
-  if (!['status', 'fund-phoenix', 'defund-phoenix', 'open', 'close'].includes(args.command)) throw new UsageError(`unknown command ${args.command}`);
+  refusing = REFUSE_COMMANDS[args.command] !== undefined;
+  if (!['status', 'fund-phoenix', 'defund-phoenix', 'open', 'close', 'cancel-hl', ...Object.keys(REFUSE_COMMANDS)].includes(args.command)) throw new UsageError(`unknown command ${args.command}`);
   const tree = linkedWorktree();
   if (args.send && tree) throw new Error('this checkout is a linked git worktree: --send refuses here; run it from the main checkout');
+  // Before the trader lock and before any relayer or submitter: refuse-* run beside serve and post nothing to a venue.
+  const refusal = REFUSE_COMMANDS[args.command];
+  if (refusal !== undefined) {
+    process.exitCode = await runRefuse(refusal, args, envVar, say, tree);
+    return;
+  }
   const cfg = contractEnv(envVar, 'mainnet', { signing: args.send });
   if (cfg === null) throw new Error('GIMBAL_CONTRACT_ID is not set: pass the engine env file with node --env-file');
   if (cfg.network !== 'mainnet') throw new Error('mainnet only');
@@ -187,7 +221,6 @@ async function run(args: Args, cfg: NonNullable<ReturnType<typeof contractEnv>>,
     const [account, allowance] = await Promise.all([transport.account(), transport.allowance()]);
     say(`signer    ${cfg.accountId}: ${formatNear(account.amount)}, allowance ${allowance === null ? 'unlimited' : formatNear(allowance)}`);
   }
-
   const sol: DeskSolanaAccounts = { authority: desk.solana.authority, traderAccount: desk.solana.phoenix_trader, usdcAta: desk.solana.usdc_ata, phusdAta: desk.solana.phusd_ata };
   // One submitter for the relayer and the Phoenix leg: the leg reads the slot its transactions landed in from it.
   const solana = new SolanaSubmitter({ rpcUrl: solRpcUrl, network: 'mainnet' });
@@ -209,6 +242,7 @@ async function run(args: Args, cfg: NonNullable<ReturnType<typeof contractEnv>>,
     },
   };
   if (args.command === 'status') return status(ctx);
+  if (args.command === 'cancel-hl') return cancel(ctx);
   if (args.command === 'fund-phoenix' || args.command === 'defund-phoenix') return money(ctx);
   if (args.command === 'open') return open(ctx);
   return close(ctx);
@@ -263,6 +297,28 @@ async function status(ctx: Ctx): Promise<void> {
   const pairNeed = 2 * ORDERS_PER_PART * orderTx + SYSTEM_ACCOUNT_RENT_LAMPORTS;
   say(`          SOL needed: a deposit ${solText(MONEY_TX_LAMPORTS + TOKEN_ACCOUNT_RENT_LAMPORTS + SYSTEM_ACCOUNT_RENT_LAMPORTS)} (with the PhUSD account), an open and close of one pair part ${solText(pairNeed)}`);
   if (lamports < pairNeed) say(`short     SOL: send at least ${solText(pairNeed - lamports)} to ${ctx.sol.authority} before trading on Phoenix`);
+}
+
+// ---- cancel-hl ----
+
+async function cancel(ctx: Ctx): Promise<void> {
+  const [symbolArg, idArg] = ctx.args.positional;
+  if (symbolArg === undefined || idArg === undefined) throw new UsageError('cancel-hl needs <symbol> <oid|cloid>');
+  const symbol = symbolArg.toUpperCase();
+  const asset = ctx.desk.policy.hl_assets.find((a) => a.symbol === symbol);
+  if (asset === undefined) throw new UsageError(`${symbol} is not in policy.hl_assets`);
+  let id: number | string;
+  try {
+    id = parseOrderId(idArg);
+  } catch (err) {
+    throw new UsageError(errorMessage(err));
+  }
+  const user = ctx.desk.evm_address.toLowerCase();
+  process.exitCode = await cancelHl({
+    symbol, asset: asset.index, id, send: ctx.send, say,
+    status: (oid) => hlInfo(ctx, { type: 'orderStatus', user, oid }),
+    cancel: (a, oid, reason) => ctx.relayer!.hlCancel(a, oid, reason),
+  });
 }
 
 // ---- fund / defund ----
@@ -345,6 +401,10 @@ async function open(ctx: Ctx): Promise<void> {
     return;
   }
   if (refusals.length > 0) throw new Error(`open --send refused, nothing signed: ${refusals.join('; ')}`);
+  // The stored price the plan found missing or too old: refreshed once, only now that nothing refused.
+  const fresh = await refreshForOpen(ctx, plan);
+  if (fresh.line !== null) say(fresh.line);
+  if (fresh.refused !== null) throw new Error(`open --send refused, nothing signed: ${fresh.refused}`);
   await sendOpen(ctx, pair, plan);
 }
 

@@ -50,6 +50,7 @@ import type { ContractPolicy, Mode, StreamEvent, TxRef } from '@gimbal/shared';
 import type { NearTransport } from '../contract/near-client.ts';
 import { NearContractClient } from '../contract/near-client.ts';
 import { NearApiTransport } from '../contract/near-transport.ts';
+import { oraclePriced } from '../contract/oracle-assets.ts';
 import type { DeskView } from '../contract/types.ts';
 import { HyperliquidSubmitter } from '../relayer/hyperliquid.ts';
 import type { SolanaChain } from '../relayer/phoenix-money.ts';
@@ -79,7 +80,7 @@ import type { Clock } from '../venues/venue.ts';
 import type { PriceDeps, StoredPrice } from './pair-mainnet-lib.ts';
 import { PRICE_MARGIN_S, ensureFresh, newPriceState, oraclePxOf, priceFitRefusal, priceLifeS, refreshLanded } from './pair-mainnet-lib.ts';
 import type { OpsCtx, PairRunner } from './pair-ops.ts';
-import { pairOf, planClose, planOpen, recheckOpenSize, sendClose, sendOpen } from './pair-ops.ts';
+import { pairOf, planClose, planOpen, recheckOpenSize, refreshForOpen, sendClose, sendOpen } from './pair-ops.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { checkContractNetwork, contractEnv } from './serve-contract.ts';
 import { ConfigError, START_RETRY_MAX_MS, startBackoffMs } from './start-errors.ts';
@@ -111,12 +112,22 @@ export interface CarryResult {
   /** pair-mainnet's refusals: nothing was signed when this is not empty. */
   refusals: string[];
   results: PairResult[];
+  /** The open sent refresh_prices (refreshForOpen), paid whatever came of it. */
+  refreshed?: boolean;
+}
+
+/** What an open may spend on the stored price (the strategy loop's daily cap). */
+export interface RefreshAllowance {
+  /** Why no refresh_prices may be sent for it (the day's refreshes of the symbol are used); absent: one may. */
+  noRefresh?: string;
+  /** Called when refresh_prices was sent for it (paid), before anything else of the open. */
+  onPaidRefresh?: () => void;
 }
 
 /** pair-mainnet's open and close (pair-ops.ts) on one pair's legs, sending through its ProtectedPair. */
 export interface SlotCarry {
   /** `gate`: why nothing may be sent now (a rescue, an ADL unwind or panic_close running), checked again before each part. */
-  open(request: { legUsd: number; leverage: number; reason: string; qty?: string; gate?: () => string | null }, out: CarryOut): Promise<CarryResult>;
+  open(request: { legUsd: number; leverage: number; reason: string; qty?: string; gate?: () => string | null } & RefreshAllowance, out: CarryOut): Promise<CarryResult>;
   close(request: { reason: string }, out: CarryOut): Promise<CarryResult>;
 }
 
@@ -129,7 +140,10 @@ export interface CarryInput {
   client: NearContractClient;
   relayer: Relayer | null;
   prices: PriceDeps;
-  /** While on, the legs price with the stored price as it is: no refresh_prices before the open's refusals pass. */
+  /**
+   * While on, the legs price with the stored price as it is (planOpen's estimate where none is stored): their reads
+   * send no refresh_prices before the open's refusals pass. The open's own refresh (refreshForOpen) comes after them.
+   */
   planning(on: boolean): void;
 }
 
@@ -204,6 +218,8 @@ export interface HandsResult {
    * a position; absent = judge by `results` and `tx`.
    */
   sent?: boolean;
+  /** refresh_prices was sent for it (paid), whatever came of it. */
+  refreshed?: boolean;
 }
 
 /** The strategy loop's hands on the desk's pair (strategy/loop.ts). */
@@ -212,6 +228,18 @@ export interface PairHands {
   readonly symbols: readonly string[];
   /** Why nothing can be opened or closed now, or null. */
   blocked(): string | null;
+  /**
+   * Whether an open could be sent now: blocked() without its "an open or close is running" term, so a scan that runs
+   * during the loop's own open or close still sees it (the scanner's oracleRefreshAtOpen). False before the start is
+   * confirmed, once stopped, while alert only, and while a protection's close or an ADL event runs.
+   */
+  canOpen(): boolean;
+  /**
+   * A rotate's first step, before the held pair is closed: the stored price of `symbol` refreshed when it would not
+   * live an open's first part (serve's maker), so a refresh that fails keeps the held pair instead of leaving the desk
+   * flat. ok: the price lives it, or `symbol` has no stored price to keep (unpriced).
+   */
+  prepareOpen(request: { symbol: string } & Pick<RefreshAllowance, 'noRefresh'>): Promise<HandsResult>;
   /** The symbol the trader holds open (a leg not flat, or unknown), or null when flat or no pair. */
   heldSymbol(): string | null;
   /** Each leg's venue and position the trader holds (its baseline), signed; null = not known; none when no pair. */
@@ -220,7 +248,7 @@ export interface PairHands {
    * pair-mainnet open on `symbol`, short Hyperliquid and long Phoenix: refusals first, then maker first. `gate` is
    * asked again right before the first order and before each later part: a reason refuses (or stops) the open there.
    */
-  open(request: { symbol: string; legUsd: number; leverage: number; reason: string; qty?: string; gate?: () => string | null }): Promise<HandsResult>;
+  open(request: { symbol: string; legUsd: number; leverage: number; reason: string; qty?: string; gate?: () => string | null } & Pick<RefreshAllowance, 'noRefresh'>): Promise<HandsResult>;
   /**
    * The trader's record against its last live reads (reconcileWithVenues): when they disagree on one leg or flat, two
    * agreeing venue reads that confirm it are adopted as the record. The line says what changed; null: nothing did.
@@ -260,6 +288,15 @@ export interface ServePair {
   monitor?(): string | null;
   /** Turns trading off first (every order and close refused from then on), then stops the watch and the trader, closes the readers and releases the lock. */
   stop(): void;
+}
+
+/**
+ * The scanner's oracleRefreshAtOpen for serve's pair: whether an open sent now would refresh a missing or stale stored
+ * price (refreshForOpen). Only while the hands can open (PairHands.canOpen): not before the start is confirmed, after
+ * stop(), or while the pair is alert only; true during the loop's own open or close.
+ */
+export function pairRefreshesAtOpen(pair: Pick<ServePair, 'hands'> | null | undefined): boolean {
+  return pair?.hands?.canOpen() === true;
 }
 
 const none = (lines: string[], why: string, stop: () => void = () => {}): ServePair => ({
@@ -820,20 +857,22 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       const base = s.trader.legs.map((l) => s.trader.baseline(l));
       return base.every((b) => b === 0n) ? null : s.symbol;
     };
-    const blocked = (): string | null => {
+    const blockedWhy = (busyCounts: boolean): string | null => {
       if (stopped) return 'serve is stopping: nothing is signed';
       const unsure = unconfirmed();
       if (unsure !== null) return unsure;
       if (noneWhy !== null) return `no pair trader: ${noneWhy}`;
       if (!trading()) return current === null ? 'no pair trader' : `alert only: ${current.pp.why ?? 'not live'}`;
-      if (operation !== null) return 'an open or close of the strategy loop is running';
+      if (busyCounts && operation !== null) return 'an open or close of the strategy loop is running';
       if (current !== null) {
         if (!current.live()) return `alert only: ${current.pp.why ?? 'not live'}`;
-        if (current.pp.closing) return `a close runs on ${current.symbol} (panic_close, a rescue's reduce or an ADL unwind)`;
+        // The trader is busy during the loop's own open or close too: that is the operation's term, not a protection.
+        if (current.pp.closing && (busyCounts || operation === null)) return `a close runs on ${current.symbol} (panic_close, a rescue's reduce or an ADL unwind)`;
         if (current.adl.state.event !== null) return `an ADL event on ${current.symbol} is in progress`;
       }
       return null;
     };
+    const blocked = (): string | null => blockedWhy(true);
     const result = (ok: boolean, reason: string, extra: Partial<HandsResult> = {}): HandsResult => ({
       ok, reason, results: [], lines: [], open: [], tx: [], feeUsd: 0, ...extra,
     });
@@ -879,6 +918,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
     const hands: PairHands = {
       symbols: common,
       blocked,
+      canOpen: () => blockedWhy(false) === null,
       heldSymbol,
       heldLegs: () => {
         const s = current;
@@ -887,54 +927,86 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           return { venue: l.venue, qty: b === undefined ? 0n : b };
         });
       },
-      open: (request) => exclusive(async () => {
-        const sym = request.symbol;
-        if (!common.includes(sym)) return result(false, `${sym} is not in both policy.hl_assets and policy.phoenix_markets (${common.join(', ') || 'none'})`);
-        const holding = heldSymbol();
-        if (holding !== null) return result(false, `a ${holding} pair is held: it is closed first (exit or rotate)`);
-        if (current !== null && current.adl.state.paused !== null) return result(false, `the pair is paused since an ADL (${current.adl.state.paused}): no new pair opens until the owner reconciles`);
-        const off = current?.quiet() ?? null;
-        if (off !== null) return result(false, `the ${current!.symbol} pair is not settled: ${off}`);
-        let slot = current;
-        if (slot === null || slot.symbol !== sym) {
-          const old = slot;
-          old?.suspend(true);
-          let next: Slot;
+      prepareOpen: (request) => {
+        let paid = false;
+        return exclusive(async () => {
+          const sym = request.symbol;
+          if (policy.unpriced.some((u) => u.symbol === sym)) return result(true, `${sym} is unpriced: no stored price to refresh`);
+          const marginS = SERVE_MAKER.timeoutMs / 1000 + PRICE_MARGIN_S;
+          const sp = await prices.read(sym);
+          if (sp !== null && sp.ageS <= prices.maxAgeS - marginS) return result(true, `the stored ${sym} price is ${Math.round(sp.ageS)} s old: it lives the open's ${marginS} s`);
+          const was = sp === null ? 'missing' : `${Math.round(sp.ageS)} s old`;
+          if (!oraclePriced(sym)) return result(false, `the stored ${sym} price is ${was} and refresh_prices cannot refresh it (${sym} is not one of the contract's oracle assets)`);
+          if (request.noRefresh !== undefined) return result(false, `the stored ${sym} price is ${was} and needs refresh_prices: ${request.noRefresh}`);
           try {
-            next = await makeSlot(sym);
+            const fresh = await ensureFresh({
+              ...prices,
+              refresh: (s, maxAgeS) => {
+                paid = true;
+                return prices.refresh(s, maxAgeS);
+              },
+            }, sym, marginS);
+            return result(true, `the stored ${sym} price (${was}) refreshed before the close: ${fresh.px}, ${Math.round(fresh.ageS)} s old`);
           } catch (err) {
-            old?.suspend(false);
-            return result(false, `the ${sym} pair could not be built: ${errorMessage(err)}`);
+            return result(false, `the stored ${sym} price (${was}) could not be refreshed: ${errorMessage(err)}`);
           }
-          if (!next.live() || stopped) {
-            next.end();
-            old?.suspend(false);
-            return result(false, `the ${sym} pair would not trade: ${next.why.join('; ') || 'serve is stopping'}`, { lines: next.lines });
+        }).then((r) => (paid ? { ...r, refreshed: true } : r));
+      },
+      open: (request) => {
+        let paid = false;
+        return exclusive(async () => {
+          const sym = request.symbol;
+          if (!common.includes(sym)) return result(false, `${sym} is not in both policy.hl_assets and policy.phoenix_markets (${common.join(', ') || 'none'})`);
+          const holding = heldSymbol();
+          if (holding !== null) return result(false, `a ${holding} pair is held: it is closed first (exit or rotate)`);
+          if (current !== null && current.adl.state.paused !== null) return result(false, `the pair is paused since an ADL (${current.adl.state.paused}): no new pair opens until the owner reconciles`);
+          const off = current?.quiet() ?? null;
+          if (off !== null) return result(false, `the ${current!.symbol} pair is not settled: ${off}`);
+          let slot = current;
+          if (slot === null || slot.symbol !== sym) {
+            const old = slot;
+            old?.suspend(true);
+            let next: Slot;
+            try {
+              next = await makeSlot(sym);
+            } catch (err) {
+              old?.suspend(false);
+              return result(false, `the ${sym} pair could not be built: ${errorMessage(err)}`);
+            }
+            if (!next.live() || stopped) {
+              next.end();
+              old?.suspend(false);
+              return result(false, `the ${sym} pair would not trade: ${next.why.join('; ') || 'serve is stopping'}`, { lines: next.lines });
+            }
+            old?.end();
+            for (const line of next.lines) log(line);
+            current = next;
+            slot = next;
           }
-          old?.end();
-          for (const line of next.lines) log(line);
-          current = next;
-          slot = next;
-        }
-        if (!slot.live()) return result(false, `alert only: ${slot.pp.why ?? 'not live'}`);
-        const { lines: said, opens, out } = collect();
-        const r = await slot.carry.open({
-          legUsd: request.legUsd, leverage: request.leverage, reason: request.reason,
-          ...(request.qty === undefined ? {} : { qty: request.qty }), ...(request.gate === undefined ? {} : { gate: request.gate }),
-        }, out);
-        if (r.refusals.length > 0) return result(false, `open refused, nothing signed: ${r.refusals.join('; ')}`, { lines: said, open: opens });
-        const again = await slot.readopt().catch((err: unknown) => `not adopted after the residual hedge: ${errorMessage(err)}`);
-        if (again !== null) log(`pair      ${again}`);
-        const opened = r.results.filter((x) => x.status === 'open');
-        const last = r.results.at(-1);
-        const ok = opened.length > 0 && heldSymbol() !== null;
-        const reason = ok
-          ? `${sym} opened: ${opened.map((x) => x.size).join(' + ')} a leg${last !== undefined && last.status !== 'open' ? ` (the last part ended ${last.status})` : ''}`
-          : `${sym} not opened: ${last === undefined ? 'no part was sent' : `${last.status}${last.notes.length > 0 ? ` (${last.notes.join('; ')})` : ''}`}`;
-        // Orders went out when a part sent any (a part the gate stopped before its first order sent none).
-        const sent = r.results.some((x) => x.legs.some((l) => l.orders.length > 0)) || heldSymbol() !== null;
-        return result(ok, reason, { results: r.results, lines: said, open: opens, sent, ...summarise(r.results) });
-      }),
+          if (!slot.live()) return result(false, `alert only: ${slot.pp.why ?? 'not live'}`);
+          const { lines: said, opens, out } = collect();
+          const r = await slot.carry.open({
+            legUsd: request.legUsd, leverage: request.leverage, reason: request.reason,
+            ...(request.qty === undefined ? {} : { qty: request.qty }), ...(request.gate === undefined ? {} : { gate: request.gate }),
+            ...(request.noRefresh === undefined ? {} : { noRefresh: request.noRefresh }),
+            onPaidRefresh: () => {
+              paid = true;
+            },
+          }, out);
+          if (r.refusals.length > 0) return result(false, `open refused, nothing signed: ${r.refusals.join('; ')}`, { lines: said, open: opens });
+          const again = await slot.readopt().catch((err: unknown) => `not adopted after the residual hedge: ${errorMessage(err)}`);
+          if (again !== null) log(`pair      ${again}`);
+          const opened = r.results.filter((x) => x.status === 'open');
+          const last = r.results.at(-1);
+          const ok = opened.length > 0 && heldSymbol() !== null;
+          const reason = ok
+            ? `${sym} opened: ${opened.map((x) => x.size).join(' + ')} a leg${last !== undefined && last.status !== 'open' ? ` (the last part ended ${last.status})` : ''}`
+            : `${sym} not opened: ${last === undefined ? 'no part was sent' : `${last.status}${last.notes.length > 0 ? ` (${last.notes.join('; ')})` : ''}`}`;
+          // Orders went out when a part sent any (a part the gate stopped before its first order sent none).
+          const sent = r.results.some((x) => x.legs.some((l) => l.orders.length > 0)) || heldSymbol() !== null;
+          return result(ok, reason, { results: r.results, lines: said, open: opens, sent, ...summarise(r.results) });
+        }).then((r) => (paid ? { ...r, refreshed: true } : r));
+      },
       reconcile: async () => {
         const slot = current;
         if (slot === null || blocked() !== null) return null;
@@ -1037,8 +1109,8 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
   }
 }
 
-/** pair-mainnet's open and close (pair-ops.ts) on a live pair's legs, sending through its ProtectedPair. */
-function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string; phoenixUrl: string; solRpcUrl: string; readers: () => { hl: HyperliquidReader; phoenix: PhoenixReader; solana: SolanaSubmitter } }): SlotCarry {
+/** pair-mainnet's open and close (pair-ops.ts) on a live pair's legs, sending through its ProtectedPair (exported for tests). */
+export function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string; phoenixUrl: string; solRpcUrl: string; readers: () => { hl: HyperliquidReader; phoenix: PhoenixReader; solana: SolanaSubmitter } }): SlotCarry {
   const { hl, phoenix } = p.legs;
   if (!(hl instanceof HlLeg) || !(phoenix instanceof PhoenixLeg)) {
     const no = async (): Promise<CarryResult> => ({ refusals: ['these legs are not the live Hyperliquid and Phoenix legs'], results: [] });
@@ -1078,24 +1150,33 @@ function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string; phoen
       } finally {
         p.planning(false);
       }
+      // Every refusal that needs no fresh price first: the plan's (the closing desk among them), a maker timeout the
+      // price cannot outlive (buildPair's), the gate, and the loop's daily cap on refreshes. Only then refresh_prices.
       const refusals = [...plan.refusals];
-      // pair-mainnet's trader refuses an open on a closing desk, and buildPair a maker timeout the price cannot outlive.
-      if (ctx.desk.closing === true) refusals.push('the desk is closing (panic_close)');
       const fit = p.legs.priced ? priceFitRefusal(SERVE_MAKER.timeoutMs / 1000, ctx.desk.policy.oracle_max_age_s) : null;
       if (fit !== null) refusals.push(fit);
+      const early = request.gate?.() ?? null;
+      if (early !== null) refusals.push(`${early}: nothing sent`);
+      if (plan.refresh !== null && request.noRefresh !== undefined) {
+        refusals.push(`the stored ${p.symbol} price is ${plan.refresh.was} and needs refresh_prices: ${request.noRefresh}; nothing sent`);
+      }
       if (refusals.length > 0) return { refusals, results: [] };
+      const fresh = await refreshForOpen(ctx, { ...plan, refusals });
+      if (fresh.paid) request.onPaidRefresh?.();
+      if (fresh.line !== null) out.say(fresh.line);
+      if (fresh.refused !== null) return { refusals: [fresh.refused], results: [], refreshed: fresh.paid };
       // The exact size decide() took is a maximum: held to the cap at the prices of the moment, before either leg.
       if (request.qty !== undefined) {
         const held = await recheckOpenSize(ctx, pair, plan.size, SERVE_SLIPPAGE_BPS);
-        if ('refused' in held) return { refusals: [held.refused], results: [] };
+        if ('refused' in held) return { refusals: [held.refused], results: [], refreshed: fresh.paid };
         out.say(held.line);
         plan = { ...plan, size: held.qty };
       }
       // Review F2: the reads and plans above take seconds after the loop's gate; a rescue that started meanwhile
       // refuses the open here, before the first order, and stops it before each later part (sendOpen's beforePart).
       const gated = request.gate?.() ?? null;
-      if (gated !== null) return { refusals: [`${gated}: nothing sent`], results: [] };
-      return { refusals: [], results: await sendOpen(ctx, pair, plan, request.reason, request.gate === undefined ? {} : { gate: request.gate }) };
+      if (gated !== null) return { refusals: [`${gated}: nothing sent`], results: [], refreshed: fresh.paid };
+      return { refusals: [], results: await sendOpen(ctx, pair, plan, request.reason, request.gate === undefined ? {} : { gate: request.gate }), refreshed: fresh.paid };
     },
     close: async (request, out) => {
       const ctx = await ctxFor(out);

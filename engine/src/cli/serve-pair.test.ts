@@ -16,7 +16,7 @@ import { newAdlState } from '../risk/adl.ts';
 import { LOCK_STALE_MS, THIS_PROCESS, TRADER_STATE_VERSION, TraderStateStore, lockHeartbeats, lockText, parseLockText, traderLockPath, traderStateFile } from '../trade/trader-state.ts';
 import type { ContractSide } from './serve-contract.ts';
 import type { CarryInput, ServePairDeps, ServePairInput, SlotCarry } from './serve-pair.ts';
-import { liveLines, servePair } from './serve-pair.ts';
+import { liveLines, pairRefreshesAtOpen, servePair } from './serve-pair.ts';
 import { ConfigError } from './start-errors.ts';
 
 const CONTRACT = 'gimbal-test.near';
@@ -92,6 +92,9 @@ interface World {
   hlHeldFails: string | null;
   /** signing() throws this, when set (NEAR RPC, or a configuration error). */
   signingFails: Error | null;
+  /** refresh_prices calls the contract got, and the price row it stores (none: prices() answers nothing). */
+  refreshes: number;
+  stored: { asset: string; price_e8: string; at_ms: number } | null;
 }
 
 function world(symbol = 'XLM', env: Record<string, string> = {}): World {
@@ -99,16 +102,23 @@ function world(symbol = 'XLM', env: Record<string, string> = {}): World {
   return {
     dir, env: { LOCALAPPDATA: dir, XDG_STATE_HOME: dir, ...env },
     hl: new Leg('hyperliquid', symbol), px: new Leg('phoenix', symbol), openOrders: [], signed: 0, cancels: [], lines: [], refuse: [], throwAfterOrder: false, hlHeldFails: null, signingFails: null,
+    refreshes: 0, stored: null,
   };
 }
 
-function side(): ContractSide {
+function side(w?: World): ContractSide {
   const policy = {
     hl_assets: [{ symbol: 'XLM', index: 7, sz_decimals: 0 }, { symbol: 'kPEPE', index: 9, sz_decimals: 0 }, { symbol: 'ETH', index: 1, sz_decimals: 4 }],
     phoenix_markets: [{ symbol: 'XLM' }, { symbol: 'kPEPE' }],
     oracle_max_age_s: 900, price_band_bps: 100, unpriced: [], max_notional_usd: 20, unpriced_max_notional_usd: 10,
   };
-  const client = { contractId: CONTRACT, prices: async () => [], refreshPrices: async () => [] } as unknown as NearContractClient;
+  const client = {
+    contractId: CONTRACT, prices: async () => (w?.stored == null ? [] : [{ ...w.stored }]),
+    refreshPrices: async () => {
+      if (w !== undefined) w.refreshes++;
+      return [];
+    },
+  } as unknown as NearContractClient;
   return { client, desk: { policy, evm_address: EVM, solana: { authority: 'Auth111' } }, policy, prices: {} } as unknown as ContractSide;
 }
 
@@ -129,14 +139,14 @@ function input(w: World, extra: Partial<ServePairInput> = {}): ServePairInput {
           return { kind: 'cancel', statuses: ['success'], oid: null, filled: null, resting: false, fills: [], tx: [{ chain: 'near', id: `c${oid}`, url: '' }], confirmed: true, expiresAfter: null };
         },
       } as unknown as Relayer;
-      return { client: side().client, relayer };
+      return { client: side(w).client, relayer };
     },
     buildLegs: async () => ({ hl: w.hl, phoenix: w.px, priced: false, mismatches: [] }),
     carry: (c) => testCarry(c, w),
     close: () => {},
   };
   return {
-    mode: 'mainnet', env: (n) => w.env[n], side: side(), deskId: DESK, clock: { now: () => Date.now() }, log: (l) => w.lines.push(l), publish: () => {},
+    mode: 'mainnet', env: (n) => w.env[n], side: side(w), deskId: DESK, clock: { now: () => Date.now() }, log: (l) => w.lines.push(l), publish: () => {},
     stateDir: w.dir, linkedWorktree: false, sleep: async () => {}, deps, ...extra,
   };
 }
@@ -928,6 +938,83 @@ test('the open\'s scope: during the loop\'s open, an order that could grow a pos
     const r = await opening;
     assert.equal(r.ok, true, r.reason);
     assert.equal(w.hl.orders.filter((o) => !o.reduceOnly).length, 1, 'only the open\'s own order grew Hyperliquid');
+    p.stop();
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+test('canOpen (the scanner\'s oracleRefreshAtOpen): false before the start is confirmed, true once live and during the loop\'s own open, false after stop()', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1' });
+  try {
+    savedPair(w);
+    w.hl.pos = toQty('-50');
+    w.px.pos = toQty('50');
+    w.px.snap = { slot: 100, pos: 0n };
+    w.px.chainSlot = 120;
+    const p = await servePair(input(w));
+    assert.notEqual(p.hands, undefined, 'the hands exist before the start is confirmed');
+    assert.equal(p.hands!.canOpen(), false);
+    assert.equal(pairRefreshesAtOpen(p), false);
+    w.px.snap = { slot: 121, pos: toQty('50') };
+    assert.match(await p.retryStart!() ?? '', /^pair start confirmed/);
+    assert.equal(pairRefreshesAtOpen(p), true);
+    // The loop's own open in flight: blocked() refuses a second act, the scan still sees a pair that opens.
+    assert.equal((await p.hands!.close({ reason: 'strategy: exit' })).ok, true);
+    let release!: () => void;
+    w.hl.hold = () => new Promise<void>((r) => {
+      release = r;
+    });
+    const opening = p.hands!.open({ symbol: 'XLM', legUsd: 10, leverage: 1.5, reason: 'strategy: enter' });
+    for (let i = 0; i < 50 && w.hl.orders.length === 0 && p.hands!.blocked() === null; i++) await new Promise((r) => setTimeout(r, 5));
+    assert.equal(p.hands!.blocked(), 'an open or close of the strategy loop is running');
+    assert.equal(pairRefreshesAtOpen(p), true);
+    while (release === undefined) await new Promise((r) => setTimeout(r, 5));
+    w.hl.hold = null;
+    release();
+    assert.equal((await opening).ok, true);
+    p.stop();
+    assert.equal(pairRefreshesAtOpen(p), false, 'stopped: nothing opens');
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+  // Alert only (no GIMBAL_TRADE): no hands, the contract's verdict stands.
+  const a = world();
+  try {
+    const p = await servePair(input(a));
+    assert.equal(p.hands, undefined);
+    assert.equal(pairRefreshesAtOpen(p), false);
+    assert.equal(pairRefreshesAtOpen(null), false);
+    p.stop();
+  } finally {
+    rmSync(a.dir, { recursive: true, force: true });
+  }
+});
+
+test('prepareOpen (a rotate\'s first step): a missing price is refreshed, a failed refresh is not ok and paid; no refresh past the cap or for a symbol the oracle cannot price', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
+  try {
+    const p = await servePair(input(w));
+    const hands = p.hands!;
+    // The contract stores nothing and refresh_prices stores nothing either: the refresh is paid and fails.
+    const failed = await hands.prepareOpen({ symbol: 'XLM' });
+    assert.equal(failed.ok, false);
+    assert.equal(failed.refreshed, true);
+    assert.match(failed.reason, /^the stored XLM price \(missing\) could not be refreshed: after refresh_prices the stored XLM price is missing/);
+    assert.equal(w.refreshes, 1);
+    // The day's cap: refused, nothing sent.
+    const capped = await hands.prepareOpen({ symbol: 'XLM', noRefresh: 'the day\'s 12 are used' });
+    assert.deepEqual([capped.ok, capped.refreshed, capped.reason], [false, undefined, 'the stored XLM price is missing and needs refresh_prices: the day\'s 12 are used']);
+    // kPEPE is not one of the contract's oracle assets: refused, nothing sent.
+    const pepe = await hands.prepareOpen({ symbol: 'kPEPE' });
+    assert.equal(pepe.ok, false);
+    assert.match(pepe.reason, /refresh_prices cannot refresh it \(kPEPE is not one of the contract's oracle assets\)/);
+    assert.equal(w.refreshes, 1);
+    // A fresh price: ok, nothing sent.
+    w.stored = { asset: 'XLM', price_e8: '25000000', at_ms: Date.now() - 610_000 };
+    const fresh = await hands.prepareOpen({ symbol: 'XLM' });
+    assert.deepEqual([fresh.ok, fresh.refreshed], [true, undefined]);
+    assert.equal(w.refreshes, 1);
     p.stop();
   } finally {
     rmSync(w.dir, { recursive: true, force: true });
