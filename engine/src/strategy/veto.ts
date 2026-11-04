@@ -1,4 +1,5 @@
-// The NEAR AI veto before an enter or a rotate (docs/interfaces.md §3 "Strategy loop"): the window's facts go to the
+// The NEAR AI risk check before an enter or a rotate (docs/interfaces.md §3 "Strategy loop"; internal names keep
+// "veto", every text the owner reads says "NEAR AI risk check"): the window's facts go to the
 // same client, endpoint, key and model as POST /policy/draft, and the model answers {verdict: 'pass' | 'veto',
 // reasons}, before every enter and every rotate. A veto can only remove a window: nothing the model says changes the
 // window, the size or the leverage, or is sent to the contract or a venue. No key, no answer within
@@ -9,7 +10,8 @@
 //
 // The prompt is built from the facts alone (no clock, no ids that change between runs), so a recorded exchange is
 // found again by its prompt: RecordedVeto plays a recording back without a key (replay mode, tests). checkVeto returns
-// the exchange it made, for loop.ts to record.
+// the exchange it made (the exact messages, the raw reply, the latency), for loop.ts to journal and book; riskCheckWhy
+// is the one line every decision then carries. Facts no venue gave are null in the prompt, which calls them unknown.
 
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -26,15 +28,24 @@ export type Veto = NonNullable<FundingWindow['veto']>;
 export interface VetoSource {
   readonly model: string;
   readonly configured: boolean;
-  complete(messages: readonly ChatMessage[], options?: { json?: boolean; maxTokens?: number }): Promise<Completion>;
+  /** A recording may say how long the answer took when it was recorded (`latencyMs`); a live call is timed here. */
+  complete(messages: readonly ChatMessage[], options?: { json?: boolean; maxTokens?: number }): Promise<Completion & { latencyMs?: number }>;
 }
 
 export interface VetoLeg {
   venue: string;
   side: 'long' | 'short';
   openInterestUsd: number | null;   // the leg market's open interest (scanner.carry(id).long/short.oiUsd)
-  bookDepthUsd: number | null;      // USD on the side the leg fills within the book levels read; null = not known
+  bookDepthUsd: number | null;      // USD on the side the leg fills (asks for a long, bids for a short) within the
+                                    // book levels read; null = not known
+  fillImpactBps: number | null;     // how far the leg's whole size fills from the mid, bps, walking those levels;
+                                    // null = not known, or the levels read do not hold the size
+  priceMove24hPct: number | null;   // the leg market's mark against its price 24 h ago, signed, as the venue gives it
+  daysSinceListing: number | null;  // where the venue says when it listed the market (Orderly); null = it does not
 }
+
+/** The leg facts vetoFacts takes; whatever is not passed is unknown (null). */
+export type VetoLegFacts = Partial<Omit<VetoLeg, 'venue' | 'side'>>;
 
 /** The window's facts the model judges. Unknown = null, and the prompt says so rather than guessing. */
 export interface VetoFacts {
@@ -51,24 +62,23 @@ export interface VetoFacts {
   legUsd: number;
   leverage: number;
   legs: [VetoLeg, VetoLeg];
-  priceMove24hPct: number | null;   // the mark's move over 24 h, signed
-  daysSinceListing: number | null;  // of the younger leg market, where a venue says
 }
 
 /** The most reasons kept from a reply, and the longest. */
 const MAX_REASONS = 3;
 const MAX_REASON_TEXT = 200;
 /** A verdict is a few dozen tokens. */
-const MAX_TOKENS = 300;
+export const VETO_MAX_TOKENS = 300;
+const MAX_TOKENS = VETO_MAX_TOKENS;
 
 export const VETO_SYSTEM_PROMPT = `You review one funding-rate carry trade before an automated desk opens it. The desk holds a long perpetual leg on one venue and a short perpetual leg of the same asset on another, and earns the difference in funding. You cannot approve, size or change the trade: you can only veto it. The trade goes ahead unless you veto it.
 
 Veto only on a concrete red flag in the facts, for example:
 - the funding spread this hour is far above its 7-day mean, so it looks like a spike that will not last;
 - the 7-day and 14-day spreads disagree, or the spread is shrinking fast;
-- a leg's open interest is small next to the leg size, or its book cannot fill the leg;
-- the price moved more than 15 % in 24 hours, so a leg is near liquidation risk;
-- the market was listed less than 14 days ago.
+- a leg's open interest is small next to the leg size, or its book cannot fill the leg (book_depth_usd under leg_usd, or fill_impact_bps above 50);
+- a leg's price moved more than 15 % in 24 hours, so a leg is near liquidation risk;
+- a leg's market was listed less than 14 days ago.
 Facts given as null are unknown: never veto because a fact is unknown.
 
 Answer with one JSON object and nothing else: {"verdict": "pass" or "veto", "reasons": [up to 3 short sentences, each naming the fact and its number]}. With "pass", reasons may be empty.`;
@@ -90,9 +100,10 @@ export function vetoMessages(facts: VetoFacts): ChatMessage[] {
     hours_in_a_row_above_minimum: facts.hoursAbove,
     leg_usd: r2(facts.legUsd),
     leverage: r2(facts.leverage),
-    legs: facts.legs.map((l) => ({ venue: l.venue, side: l.side, open_interest_usd: r2(l.openInterestUsd), book_depth_usd: r2(l.bookDepthUsd) })),
-    price_move_24h_pct: r2(facts.priceMove24hPct),
-    days_since_listing: r2(facts.daysSinceListing),
+    legs: facts.legs.map((l) => ({
+      venue: l.venue, side: l.side, open_interest_usd: r2(l.openInterestUsd), book_depth_usd: r2(l.bookDepthUsd),
+      fill_impact_bps: r2(l.fillImpactBps), price_move_24h_pct: r2(l.priceMove24hPct), days_since_listing: r2(l.daysSinceListing),
+    })),
   };
   return [{ role: 'system', content: VETO_SYSTEM_PROMPT }, { role: 'user', content: JSON.stringify(f) }];
 }
@@ -102,12 +113,12 @@ export function vetoFacts(
   w: FundingWindow,
   extra: {
     kind: 'enter' | 'rotate'; legUsd: number; leverage: number; minNetAprPct: number; hoursAbove: number;
-    grossApr14dPct?: number | null; legs?: { long: Partial<Pick<VetoLeg, 'openInterestUsd' | 'bookDepthUsd'>>; short: Partial<Pick<VetoLeg, 'openInterestUsd' | 'bookDepthUsd'>> };
-    priceMove24hPct?: number | null; daysSinceListing?: number | null;
+    grossApr14dPct?: number | null; legs?: { long?: VetoLegFacts; short?: VetoLegFacts };
   },
 ): VetoFacts {
-  const leg = (venue: string, side: 'long' | 'short', x: Partial<Pick<VetoLeg, 'openInterestUsd' | 'bookDepthUsd'>> | undefined): VetoLeg => ({
+  const leg = (venue: string, side: 'long' | 'short', x: VetoLegFacts | undefined): VetoLeg => ({
     venue, side, openInterestUsd: x?.openInterestUsd ?? null, bookDepthUsd: x?.bookDepthUsd ?? null,
+    fillImpactBps: x?.fillImpactBps ?? null, priceMove24hPct: x?.priceMove24hPct ?? null, daysSinceListing: x?.daysSinceListing ?? null,
   });
   return {
     kind: extra.kind, symbol: w.symbol, longVenue: w.longVenue, shortVenue: w.shortVenue,
@@ -115,7 +126,6 @@ export function vetoFacts(
     netAprPct: w.netAprPct, minNetAprPct: extra.minNetAprPct, hoursAbove: extra.hoursAbove,
     legUsd: extra.legUsd, leverage: extra.leverage,
     legs: [leg(w.longVenue, 'long', extra.legs?.long), leg(w.shortVenue, 'short', extra.legs?.short)],
-    priceMove24hPct: extra.priceMove24hPct ?? null, daysSinceListing: extra.daysSinceListing ?? null,
   };
 }
 
@@ -129,12 +139,25 @@ export interface VetoExchange {
   model: string;
   messages: ChatMessage[];
   response: unknown;
+  /** How long NEAR AI took to answer (ms); null or absent when no answer came or it was not timed. */
+  latencyMs?: number | null;
 }
+
+/**
+ * How a check ended: passed or refused on a readable verdict; refused on an unreadable reply; or passed unchecked
+ * (timed out, NEAR AI unavailable, no key, the key rejected).
+ */
+export type RiskCheckOutcome = 'passed' | 'refused' | 'unreadable' | 'timeout' | 'unavailable' | 'no-key' | 'key-rejected';
 
 export interface VetoResult {
   veto: Veto;
   /** false = no NEAR AI risk check (no answer came): the window passes unchecked, and `line` says why. */
   checked: boolean;
+  outcome: RiskCheckOutcome;
+  /** The one-line reason: the model's reasons joined, or why it was not checked. */
+  reason: string;
+  /** How long the answer took (ms); null when no answer came. */
+  latencyMs: number | null;
   /** One line for the journal: "NEAR AI passed …", "NEAR AI risk check refused …: <reason>", or "no NEAR AI risk check: <why>". */
   line: string;
   /** What was asked and what came back; null only when nothing was asked (no key). */
@@ -145,14 +168,38 @@ export interface VetoResult {
  * The exchange as JournalEntry.numbers keys (strings): vetoModel, vetoKey, vetoPrompt (the facts sent: the system
  * prompt is fixed and named by the key) and vetoReply (the model's text as it came, or "" when none came back).
  */
-export function vetoJournalNumbers(e: VetoExchange): Record<string, string> {
-  let reply = '';
+export function vetoJournalNumbers(e: VetoExchange): Record<string, string | number> {
+  return {
+    vetoModel: e.model, vetoKey: e.key, vetoSystem: e.messages.find((m) => m.role === 'system')?.content ?? '',
+    vetoPrompt: e.messages.at(-1)?.content ?? '', vetoReply: replyText(e),
+    ...(e.latencyMs === null || e.latencyMs === undefined ? {} : { vetoMs: Math.round(e.latencyMs) }),
+  };
+}
+
+/** The model's text as it came ("" when none came back; the body itself when it is not a chat completion). */
+export function replyText(e: Pick<VetoExchange, 'response'>): string {
+  if (e.response === null || e.response === undefined) return '';
   try {
-    reply = e.response === null ? '' : completionContent(e.response);
+    return completionContent(e.response);
   } catch {
-    reply = JSON.stringify(e.response);
+    return JSON.stringify(e.response);
   }
-  return { vetoModel: e.model, vetoKey: e.key, vetoPrompt: e.messages.at(-1)?.content ?? '', vetoReply: reply };
+}
+
+/**
+ * The risk check's part of a "why" line: its verdict and one-line reason, with the attestation for a reply that came
+ * ("attested" or "not attested: <why>"), or why it was not checked.
+ */
+export function riskCheckWhy(r: Pick<VetoResult, 'outcome' | 'reason'>, attestation: string): string {
+  switch (r.outcome) {
+    case 'passed': return `NEAR AI risk check passed (${attestation}): ${r.reason === '' ? 'no red flag named' : r.reason}`;
+    case 'refused':
+    case 'unreadable': return `NEAR AI risk check refused (${attestation}): ${r.reason}`;
+    case 'timeout': return 'risk check timed out: passed';
+    case 'no-key': return 'no NEAR AI key: not checked';
+    case 'key-rejected': return `${r.reason}: not checked, passed`;
+    case 'unavailable': return `NEAR AI risk check unavailable (${r.reason}): passed`;
+  }
 }
 
 /** The key a prompt is recorded under. */
@@ -280,41 +327,45 @@ export const UNREADABLE_REPLY = 'unreadable reply';
  * reply".
  */
 export async function checkVeto(
-  source: VetoSource, facts: VetoFacts, options: { now: number; timeoutMs?: number },
+  source: VetoSource, facts: VetoFacts, options: { now: number; timeoutMs?: number; timer?: () => number },
 ): Promise<VetoResult> {
   const timeoutMs = options.timeoutMs ?? LOOP_RULES.vetoTimeoutMs;
-  const unchecked = (why: string): VetoResult => ({
+  const timer = options.timer ?? (() => performance.now());
+  const unchecked = (why: string, outcome: RiskCheckOutcome): VetoResult => ({
     veto: { verdict: 'pass', reasons: [`no NEAR AI risk check: ${why}`], model: source.model, at: options.now },
-    checked: false,
+    checked: false, outcome, reason: why, latencyMs: null,
     line: `no NEAR AI risk check on ${facts.symbol}: ${why}`,
     exchange: null,
   });
   const unreadable = (why: string, exchange: VetoExchange): VetoResult => ({
     veto: { verdict: 'veto', reasons: [UNREADABLE_REPLY], model: source.model, at: options.now },
-    checked: true,
+    checked: true, outcome: 'unreadable', reason: `${UNREADABLE_REPLY} (${why})`, latencyMs: exchange.latencyMs ?? null,
     line: `NEAR AI risk check refused ${facts.symbol}: ${UNREADABLE_REPLY} (${why})`,
     exchange,
   });
-  if (!source.configured) return unchecked('NEAR_AI_API_KEY is not set');
+  if (!source.configured) return unchecked('NEAR_AI_API_KEY is not set', 'no-key');
   const messages = vetoMessages(facts);
   const asked: VetoExchange = { key: promptKey(messages), model: source.model, messages, response: null };
-  let completion: Completion;
+  let completion: Completion & { latencyMs?: number };
+  const started = timer();
   try {
     completion = await withTimeout(source.complete(messages, { json: true, maxTokens: MAX_TOKENS }), timeoutMs, 'NEAR AI risk check');
   } catch (err) {
     const message = errorMessage(err);
     if (!(err instanceof NearAiUnavailable) && /no answer within/.test(message)) {
-      return { ...unchecked(`no answer within ${timeoutMs / 1000} s`), exchange: asked };
+      return { ...unchecked(`no answer within ${timeoutMs / 1000} s`, 'timeout'), exchange: asked };
     }
     if (err instanceof NearAiUnavailable && NO_ANSWER.some((p) => message.startsWith(p))) {
       // A bad key is no answer too, but it never heals by itself: it says so on every decision.
       const rejected = /^NEAR AI answered (HTTP 40[13]\b.*)$/s.exec(message);
-      return { ...unchecked(rejected === null ? message : `NEAR AI key rejected (${rejected[1]})`), exchange: asked };
+      if (rejected !== null) return { ...unchecked(`NEAR AI key rejected (${rejected[1]})`, 'key-rejected'), exchange: asked };
+      return { ...unchecked(message, message.startsWith('NEAR_AI_API_KEY') ? 'no-key' : 'unavailable'), exchange: asked };
     }
     // A reply came and could not be read (cut off, not a chat completion, not JSON): fail closed.
-    return unreadable(message, asked);
+    return unreadable(message, { ...asked, latencyMs: timer() - started });
   }
-  const exchange: VetoExchange = { ...asked, response: completion.raw };
+  const latencyMs = completion.latencyMs ?? timer() - started;
+  const exchange: VetoExchange = { ...asked, response: completion.raw, latencyMs };
   let verdict: ReturnType<typeof parseVerdict>;
   try {
     verdict = verdictFromReply(completion.content);
@@ -325,7 +376,9 @@ export async function checkVeto(
   const line = verdict.verdict === 'veto'
     ? `NEAR AI risk check refused ${facts.symbol}: ${verdict.reasons.join('; ')}`
     : `NEAR AI passed ${facts.symbol}${verdict.reasons.length === 0 ? '' : `: ${verdict.reasons.join('; ')}`}`;
-  return { veto, checked: true, line, exchange };
+  return {
+    veto, checked: true, outcome: verdict.verdict === 'veto' ? 'refused' : 'passed', reason: verdict.reasons.join('; '), latencyMs, line, exchange,
+  };
 }
 
 /**
@@ -335,24 +388,39 @@ export async function checkVeto(
 export class RecordedVeto implements VetoSource {
   readonly configured = true;
   readonly model: string;
-  readonly #byKey: Map<string, unknown>;
+  readonly #byKey: Map<string, VetoExchange>;
 
   constructor(exchanges: readonly VetoExchange[], model = NEAR_AI_MODEL) {
     this.model = model;
-    // An exchange with no answer recorded plays back as no answer.
-    this.#byKey = new Map(exchanges.filter((e) => e.response !== null && e.response !== undefined).map((e) => [e.key, e.response]));
+    // An exchange with no answer recorded plays back as no answer. A later answer to the same prompt wins.
+    this.#byKey = new Map(exchanges.filter((e) => e.response !== null && e.response !== undefined).map((e) => [e.key, e]));
   }
 
   /** A recording file: `{ "exchanges": VetoExchange[] }` (other keys, like `_comment`, are ignored). */
   static fromFile(path: string): RecordedVeto {
-    const body = JSON.parse(readFileSync(path, 'utf8')) as { exchanges?: VetoExchange[] };
-    if (!Array.isArray(body.exchanges)) throw new Error(`${path}: no "exchanges" list`);
-    return new RecordedVeto(body.exchanges);
+    return RecordedVeto.fromFiles([path]);
   }
 
-  async complete(messages: readonly ChatMessage[]): Promise<Completion> {
-    const raw = this.#byKey.get(promptKey(messages));
-    if (raw === undefined) throw new NearAiUnavailable('no recorded NEAR AI risk check reply for this prompt');
-    return { content: completionContent(raw), raw };
+  /** Several recordings, in order: a later file's answer to a prompt replaces an earlier one's. */
+  static fromFiles(paths: readonly string[]): RecordedVeto {
+    return new RecordedVeto(paths.flatMap((path) => readExchanges(path)));
   }
+
+  /** Prompts with a recorded answer. */
+  get size(): number {
+    return this.#byKey.size;
+  }
+
+  async complete(messages: readonly ChatMessage[]): Promise<Completion & { latencyMs?: number }> {
+    const e = this.#byKey.get(promptKey(messages));
+    if (e === undefined) throw new NearAiUnavailable('no recorded NEAR AI risk check reply for this prompt');
+    return { content: completionContent(e.response), raw: e.response, ...(typeof e.latencyMs === 'number' ? { latencyMs: e.latencyMs } : {}) };
+  }
+}
+
+/** The exchanges of a recording file: `{ "exchanges": VetoExchange[] }`. */
+export function readExchanges(path: string): VetoExchange[] {
+  const body = JSON.parse(readFileSync(path, 'utf8')) as { exchanges?: VetoExchange[] };
+  if (!Array.isArray(body.exchanges)) throw new Error(`${path}: no "exchanges" list`);
+  return body.exchanges;
 }

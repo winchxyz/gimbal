@@ -19,7 +19,7 @@ import { sizeFor } from '../strategy/decide.ts';
 import { STRATEGY, T0, win as deskWin } from '../strategy/test-helpers.ts';
 import { VirtualClock, readRecording } from '../venues/replay.ts';
 import { replayStart } from './serve-replay.ts';
-import { fillsOf, loopHands, openedQty, serveLoop, windowFacts, windowSymbol } from './serve-loop.ts';
+import { depthAtSize, fillsOf, loopHands, openedQty, riskFacts, serveLoop, windowFacts, windowSymbol } from './serve-loop.ts';
 import type { PairHands, ServePair } from './serve-pair.ts';
 import { toQty } from '../trade/lots.ts';
 import type { PairResult } from '../trade/pair.ts';
@@ -150,8 +150,11 @@ test('replay: scan -> decide -> act (fake executor) -> journal and decision even
     const entries = events.filter((e) => e.type === 'journal').map((e) => e.data as JournalEntry);
     // off on its transition and hold on its change of category are `wait` entries whose numbers.action says which.
     assert.deepEqual(entries.map((j) => (j.kind === 'wait' ? `wait ${String(j.numbers.action)}` : j.kind)), ['wait off', 'enter', 'wait hold', 'exit']);
-    const actions = events.filter((e) => e.type === 'decision').map((e) => (e.data as StrategyDecision).action);
-    assert.deepEqual(actions, ['off', 'enter', 'hold']);
+    const shown = events.filter((e) => e.type === 'decision').map((e) => e.data as StrategyDecision);
+    // The enter is published twice: as decided, then with the risk check's why line once it answered.
+    assert.deepEqual(shown.map((d) => d.action), ['off', 'enter', 'enter', 'hold']);
+    assert.match(shown[2]!.reason, /; no NEAR AI key: not checked$/);
+    assert.match(enter.summary, /; no NEAR AI key: not checked; /);
     assert.equal(strategyLoop.held, null);
   } finally {
     strategyLoop.stop();
@@ -357,4 +360,53 @@ test('loopHands: the held symbol\'s legs only, one leg named, busy() refusing fi
   assert.equal(gateSeen?.(), 'rescue r-1 runs', 'the open carries the gate, asked again before its orders');
   assert.equal(await h.reconcile!(), 'SOL record reconciled with the venues');
   assert.equal((await h.close({ reason: 'test' })).sent, false);
+});
+
+test('depth at size: a long walks the asks, a short the bids; the fill\'s distance from the mid in bps, unknown when the levels read do not fill it', () => {
+  const book = {
+    venue: 'hyperliquid' as const, symbol: 'SOL', time: T0,
+    bids: [{ px: 99, sz: 2 }, { px: 98, sz: 10 }],
+    asks: [{ px: 101, sz: 1 }, { px: 102, sz: 10 }],
+  };
+  // mid 100. Long 300 USD: 101 USD at 101, 199 USD at 102 -> qty 1 + 199/102; vwap = 300 / qty.
+  const long = depthAtSize(book, 'long', 300);
+  assert.equal(long.bookDepthUsd, 101 + 1020);
+  const qty = 1 + 199 / 102;
+  assert.ok(Math.abs(long.fillImpactBps! - (300 / qty / 100 - 1) * 1e4) < 1e-9);
+  // Short 150 USD: all at 99 -> 100 bps under the mid.
+  const short = depthAtSize(book, 'short', 150);
+  assert.equal(short.bookDepthUsd, 198 + 980);
+  assert.ok(Math.abs(short.fillImpactBps! - 100) < 1e-9);
+  // More than the levels read hold: the depth is known, the impact is not.
+  assert.deepEqual(depthAtSize(book, 'short', 5_000), { bookDepthUsd: 1178, fillImpactBps: null });
+  // An empty or one-sided book: nothing known.
+  assert.deepEqual(depthAtSize({ ...book, bids: [] }, 'long', 100), { bookDepthUsd: null, fillImpactBps: null });
+});
+
+test('risk facts: each leg\'s book at size, the 24 h move from the carry, the listing age where the venue gives it; unknown otherwise', async () => {
+  const DAY = 86_400_000;
+  const carry = {
+    long: { venue: 'orderly', symbol: 'PERP_SOL_USDC', nowAprPct: 10, d7AprPct: 9, d14AprPct: 8, oiUsd: 1e6, priceMove24hPct: 3.2 },
+    short: { venue: 'hyperliquid', symbol: 'SOL', nowAprPct: 20, d7AprPct: 19, d14AprPct: 18, oiUsd: 2e7 },
+  } as unknown as WindowCarry;
+  const level = (px: number) => [{ px, sz: 100 }];
+  const reader = (id: string, over: Partial<VenueReader>): VenueReader => ({
+    id, markets: async () => [], book: async (symbol: string) => ({ venue: id, symbol, time: T0, bids: level(99.9), asks: level(100.1) }), ...over,
+  }) as unknown as VenueReader;
+  const venues = [
+    reader('orderly', { markets: async () => [{ symbol: 'PERP_SOL_USDC', listedAt: T0 - 30 * DAY }] as never }),
+    reader('hyperliquid', { book: async () => { throw new Error('socket closed'); } }),
+  ];
+  const logs: string[] = [];
+  const facts = riskFacts({ carry: (id) => (id === 'sol-orderly-hyperliquid' ? carry : null), venues, clock: { now: () => T0 }, log: (l) => logs.push(l) });
+  const got = await facts({ id: 'sol-orderly-hyperliquid' } as FundingWindow, 500);
+  assert.equal(got.long?.priceMove24hPct, 3.2);
+  assert.equal(got.long?.daysSinceListing, 30);
+  assert.equal(got.long?.bookDepthUsd, 100.1 * 100);
+  assert.ok(Math.abs(got.long!.fillImpactBps! - 10) < 1e-9);
+  // Hyperliquid: no move in the carry, no listing time, and its book did not answer: all unknown, and logged.
+  assert.deepEqual(got.short, { priceMove24hPct: null });
+  assert.ok(logs.some((l) => /hyperliquid SOL book not read \(socket closed\), its depth is unknown/.test(l)));
+  // A window the scan does not carry: nothing added.
+  assert.deepEqual(await facts({ id: 'eth-orderly-hyperliquid' } as FundingWindow, 500), {});
 });

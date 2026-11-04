@@ -957,20 +957,68 @@ anywhere the policy does not allow.
   - A NEAR AI risk check refusal or a failed act: loop.ts saves `skipAct(input, decision)` instead of
     `decision.counters`; on a refusal of the NEAR AI risk check, `skipAct(input, decision, { vetoed: true })` holds
     that window out of entries and rotations for `LOOP_RULES.vetoHoldHours` (6 h, `LoopCounters.vetoedUntil`) and
-    starts its counts again, and the wait says so ("refused by the NEAR AI risk check, held out for N h more").
-    Saved counters without `vetoedUntil` read as none refused.
+    starts its counts again, and the wait says so ("refused by the NEAR AI risk check (<why line>), held out for N h
+    more"; the why line is kept in `LoopCounters.vetoWhy` while the hold lasts). Saved counters without `vetoedUntil`
+    read as none refused.
 - `veto.ts`: the NEAR AI risk check before an enter or a rotate (the client behind `POST /policy/draft`). No key, no
   answer in `vetoTimeoutMs`, or a transport/HTTP error = pass, journaled "no NEAR AI risk check" (a 401 or 403 says "NEAR AI
   key rejected", so a bad key shows on every decision). The whole reply is read; one that is not exactly one readable
   verdict (no JSON object, more than one, text around it other than ``` fences, a key given twice, not "pass" or
   "veto" after trimming and lowercasing, a "veto" inside a "pass", cut off at its token limit) fails closed: refused,
-  "unreadable reply". A refusal ("NEAR AI risk check refused X: …") drops the window and writes a journal entry of
-  kind `veto` (the kind keeps its name; every text the owner reads says "NEAR AI risk check").
+  "unreadable reply". A refusal drops the window and writes a journal entry of kind `veto` (the kind keeps its name;
+  every text the owner reads says "NEAR AI risk check").
+  - The why line (`riskCheckWhy`): every enter, rotate, skip and refusal decision carries one, in its summary and as
+    `numbers.riskCheck`: "NEAR AI risk check passed (<attestation>): <reason>", "NEAR AI risk check refused
+    (<attestation>): <reason>" (an unreadable reply too), "risk check timed out: passed", "no NEAR AI key: not
+    checked", "NEAR AI key rejected (…): not checked, passed" or "NEAR AI risk check unavailable (…): passed".
+    `<attestation>` is serve's `Attestor.label()` ("attested" or "not attested: <why>"), shown only for a reply that
+    came. A refusal before the check is asked (no hands, the window not in the scan, a symbol serve does not trade)
+    says "NEAR AI risk check: not asked (refused before it)". The decision event is published again with it.
+  - The journal numbers of every check that was asked: `vetoModel`, `vetoKey`, `vetoSystem` and `vetoPrompt` (the
+    exact messages sent), `vetoReply` (the model's text as it came), `vetoMs` (latency), `riskCheckOutcome`
+    (passed, refused, unreadable, timeout, unavailable, no-key, key-rejected) and `attestation`. The API key is never
+    in an exchange, a line, a reason or the ledger (an error quoting it is redacted).
+  - The facts sent (`vetoFacts`): per leg `open_interest_usd` (the carry), `book_depth_usd` and `fill_impact_bps`
+    (serve-loop.ts `riskFacts`: 20 levels of the side the leg fills, read when asked; impact = the size's VWAP
+    against the mid, null when the levels read do not fill it), `price_move_24h_pct` (the venue's mark against its
+    own price 24 h ago: Hyperliquid `prevDayPx`, Orderly `24h_open`, Phoenix `prev_day_mark_price`) and
+    `days_since_listing` (Orderly's `created_time` only; the other venues do not give it). Anything a venue does not
+    give, or does not answer within 3 s, is null, which the prompt calls unknown; nothing is guessed.
+  - Recordings: `RecordedVeto` plays exchanges by prompt key, with their recorded latency.
+    `npm run record-nearai -w engine -- --risk-checks` sends the prompts of `fixtures/nearai/SYNTHETIC-veto.json`
+    for real (the human's step: it spends tokens) and writes `risk-checks-<date>.json`; serve replay with no key
+    plays those.
+- `nearai/attestation.ts`: the TEE attestation of the model. `GET https://cloud-api.near.ai/v1/attestation/report
+  ?model=…&nonce=<32 fresh bytes>&signing_algo=ecdsa` (public, no key) and NVIDIA NRAS
+  (`POST https://nras.attestation.nvidia.com/v3/attest/gpu`) for each model TEE's GPU evidence. For the gateway and
+  every model TEE it checks: the Intel TDX quote (v4: its ECDSA P-256 signature by the attestation key, that key
+  bound by the quoting enclave's report, the QE report signed by the PCK certificate, the PCK chain to the pinned
+  Intel SGX Root CA, each certificate within its dates), not a debug TD, the report data = signing address ‖ 12 zero
+  bytes ‖ our nonce (and the echoed nonce), MRCONFIGID = 01 ‖ sha256(app_compose), the event log replaying to
+  RTMR0-3 with the compose-hash event equal to the app_compose hash, and the GPUs' evidence carrying our nonce with
+  NRAS's overall result true. It does not check: the TCB level or revocation (Intel PCS collateral), an allowlist of
+  measurements or images, the NRAS token's signature (read over TLS), or that a given reply came from the attested
+  instance (per-reply signatures need the key and are not fetched). serve fetches it at start (waiting up to 15 s)
+  and every 24 h, logs and journals the line (kind `wait` when verified, `error` when not, `numbers.stage`
+  "attestation", with the steps, signing addresses, MRTD, RTMR3 and compose hashes); a check is "attested" only
+  with a live, verified report under 25 h old. Replay plays the newest `fixtures/nearai/attestation-<date>.json.gz`
+  (`record-nearai -- --attestation`) and shows "not attested: replay plays an attestation recorded <date>". A
+  failed attestation never blocks trading.
+- `book/risk-ledger.ts`: every risk check outcome, appended (fsynced) to `risk-checks-<mode>[-<contract>-<desk>]
+  .jsonl` next to the position book under GIMBAL_STATE_DIR: a `check` line (prompt, model, reply, latency, verdict,
+  attestation, why line, leg size, forecast, the round trip the scanner priced, the hold) and, for a refusal, `hours`
+  lines on each hourly check with the gross APR the refused window actually paid each hour (the scanner's
+  `grossHours`), over `LEDGER_HOLD_HOURS` (the scanner's 240 h cost hold, capped by the time stop). `npm run report`
+  reads it offline: a refusal's estimated net = Σ gross / 100 × leg / 8760 over the hours priced, less the round
+  trip; < 0 helped (a loss avoided), > 0 hurt (a gain given up), no hour yet pending. A pass (and an unchecked pass)
+  shows the position the book entered in that window within 30 min after it, realised net (running while open). Then
+  the totals.
 - `loop.ts` (serve): runs `decide` after each funding payment (the hourly check) and on each scan event, only with
   `GIMBAL_TRADE=1` and `strategy.auto`, one decision at a time under the per-desk trader lock, never while a rescue
   or an ADL unwind runs. It carries `act` out with the same open and close code as `pair-mainnet` (maker first),
   publishes `decision` events and journals `enter` / `exit` / `rotate` / `veto` / `wait` with numbers and tx links,
-  and saves `LoopCounters` next to the trader state. `POST /rotate` and `POST /close` go through the same path.
+  each enter, rotate and refusal with the risk check's why line, books every check in the risk check ledger (a ledger
+  that fails is logged, never the act's), and saves `LoopCounters` next to the trader state. `POST /rotate` and `POST /close` go through the same path.
 
 **Position book** (`engine/src/book/`, serve with a contract desk). Every carried-out enter and exit comes in through
 the loop's `book` sink (`BookRecord`, with `startedAt`: when the act began), and so do the fills of an open or close

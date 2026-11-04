@@ -10,11 +10,13 @@
 import type { ContractPolicy, DeskState, Mode, StrategyConfig, StreamEvent, Window as FundingWindow } from '@gimbal/shared';
 import { isEnterable } from '../scanner/price.ts';
 import type { WindowCarry } from '../scanner/scanner.ts';
+import { withTimeout } from '../scanner/scanner.ts';
+import type { RiskLedgerSink } from '../book/risk-ledger.ts';
 import { LIVE_RESCUE } from '../trade/carry-plan.ts';
 import { userStateDir } from '../trade/trader-state.ts';
 import { kiloBase } from '../venues/base-symbol.ts';
 import { errorMessage } from '../venues/recorder.ts';
-import type { AccountState, Clock, Market, VenueReader } from '../venues/venue.ts';
+import type { AccountState, Book, Clock, Market, VenueReader } from '../venues/venue.ts';
 import type { DecideInput, Decision } from '../strategy/decide.ts';
 import type { ActOutcome, BookFill, BookSink, HandsHeld, LoopHands, LoopHeld, WindowFacts } from '../strategy/loop.ts';
 import type { AdoptInput, CloseLookup, OutsideClose } from '../book/book.ts';
@@ -23,7 +25,7 @@ import type { BookRecord } from '../book/types.ts';
 import type { PairResult } from '../trade/pair.ts';
 import { qtyString, signedQtyString, toQty } from '../trade/lots.ts';
 import { LoopStore, StrategyLoop, loopStateFile } from '../strategy/loop.ts';
-import type { VetoSource } from '../strategy/veto.ts';
+import type { VetoLegFacts, VetoSource } from '../strategy/veto.ts';
 import type { HandsResult, PairHands, ServePair } from './serve-pair.ts';
 
 /** The venues decide() reads free margin and live rescue for. */
@@ -71,6 +73,12 @@ export interface ServeLoopInput {
   venues?: readonly VenueReader[];
   /** NEAR AI (the client POST /policy/draft uses); none = every window passes, "no NEAR AI risk check". */
   veto?: VetoSource;
+  /** How a reply shows its attestation (Attestor.label). */
+  attestation?: () => string;
+  /** Every risk check outcome, and the refused windows' hours (book/risk-ledger.ts); with `grossHours`. */
+  ledger?: RiskLedgerSink;
+  /** The scanner's grossHours. */
+  grossHours?: (windowId: string, fromMs: number, toMs: number) => { t: number; grossAprPct: number }[] | null;
   /** The position book: every carried-out enter and exit; default none. */
   book?: BookSink;
   /** Tests: stand-ins for the hands and decide(). */
@@ -115,6 +123,10 @@ export function serveLoop(input: ServeLoopInput): StrategyLoop {
     ...(input.decide === undefined ? {} : { decide: input.decide }),
     ...(input.veto === undefined ? {} : { veto: input.veto }),
     ...(input.book === undefined ? {} : { book: input.book }),
+    ...(input.attestation === undefined ? {} : { attestation: input.attestation }),
+    ...(input.ledger === undefined ? {} : { ledger: input.ledger }),
+    ...(input.grossHours === undefined ? {} : { grossHours: input.grossHours }),
+    ...(input.carry === undefined ? {} : { riskFacts: riskFacts({ carry: input.carry, venues: input.venues ?? [], clock: input.clock, log: input.log }) }),
   });
 }
 
@@ -298,6 +310,77 @@ export function windowFacts(p: {
       }
     }
     return { gross14dAprPct, openInterest, lots };
+  };
+}
+
+/** Book levels read per leg for the risk check's depth at the leg's size. */
+const RISK_BOOK_LEVELS = 20;
+/** A risk check fact read waits at most this long: the check itself has 5 s. */
+const RISK_FACT_TIMEOUT_MS = 3_000;
+const DAY_MS = 86_400_000;
+
+/** USD on the side a leg fills, and how far its whole size fills from the mid (null: the levels do not hold it). */
+export function depthAtSize(book: Book, side: 'long' | 'short', legUsd: number): { bookDepthUsd: number | null; fillImpactBps: number | null } {
+  const levels = side === 'long' ? book.asks : book.bids;
+  const bid = book.bids[0]?.px;
+  const ask = book.asks[0]?.px;
+  if (levels.length === 0 || bid === undefined || ask === undefined || !(bid > 0) || !(ask > 0)) return { bookDepthUsd: null, fillImpactBps: null };
+  const mid = (bid + ask) / 2;
+  let depth = 0;
+  let filledUsd = 0;
+  let filledQty = 0;
+  for (const l of levels) {
+    if (!(l.px > 0) || !(l.sz > 0)) continue;
+    const usd = l.px * l.sz;
+    depth += usd;
+    if (filledUsd < legUsd) {
+      const take = Math.min(usd, legUsd - filledUsd);
+      filledUsd += take;
+      filledQty += take / l.px;
+    }
+  }
+  const filled = filledUsd >= legUsd - 1e-9 && filledQty > 0;
+  return { bookDepthUsd: depth, fillImpactBps: filled ? Math.abs((filledUsd / filledQty) / mid - 1) * 1e4 : null };
+}
+
+/**
+ * The risk check's facts a window does not carry, read when the check is asked: each leg's book at the leg's size
+ * (RISK_BOOK_LEVELS levels on the side it fills), its market's 24 h move (the scanner's carry: the venue's mark
+ * against its own price 24 h ago) and its listing age where the venue says (Orderly's created_time). Whatever a venue
+ * does not give, or does not answer in time, stays unknown (null).
+ */
+export function riskFacts(p: {
+  carry: (windowId: string) => WindowCarry | null; venues: readonly VenueReader[]; clock: Clock; log: (line: string) => void;
+}): (w: FundingWindow, legUsd: number) => Promise<{ long?: VetoLegFacts; short?: VetoLegFacts }> {
+  const markets = new Map<string, { at: number; bySymbol: Map<string, Market> }>();
+  const marketOf = async (venue: string, symbol: string): Promise<Market | null> => {
+    const now = p.clock.now();
+    const cached = markets.get(venue);
+    if (cached !== undefined && now - cached.at < MARKETS_TTL_MS) return cached.bySymbol.get(symbol) ?? null;
+    const r = p.venues.find((v) => v.id === venue);
+    if (r === undefined) return null;
+    const bySymbol = new Map((await withTimeout(r.markets(), RISK_FACT_TIMEOUT_MS, `${venue} markets`)).map((m) => [m.symbol, m]));
+    markets.set(venue, { at: now, bySymbol });
+    return bySymbol.get(symbol) ?? null;
+  };
+  const leg = async (rates: WindowCarry['long'], side: 'long' | 'short', legUsd: number): Promise<VetoLegFacts> => {
+    const out: VetoLegFacts = { priceMove24hPct: rates.priceMove24hPct ?? null };
+    const r = p.venues.find((v) => v.id === rates.venue);
+    const [book, market] = await Promise.allSettled([
+      r === undefined ? Promise.reject(new Error('no reader')) : withTimeout(r.book(rates.symbol, RISK_BOOK_LEVELS), RISK_FACT_TIMEOUT_MS, `${rates.venue} ${rates.symbol} book`),
+      marketOf(rates.venue, rates.symbol),
+    ]);
+    if (book.status === 'fulfilled') Object.assign(out, depthAtSize(book.value, side, legUsd));
+    else p.log(`strategy loop: risk check: ${rates.venue} ${rates.symbol} book not read (${errorMessage(book.reason)}), its depth is unknown`);
+    const listedAt = market.status === 'fulfilled' ? market.value?.listedAt ?? null : null;
+    if (listedAt !== null && Number.isFinite(listedAt)) out.daysSinceListing = Math.max(0, (p.clock.now() - listedAt) / DAY_MS);
+    return out;
+  };
+  return async (w, legUsd) => {
+    const c = p.carry(w.id);
+    if (c === null) return {};
+    const [long, short] = await Promise.all([leg(c.long, 'long', legUsd), leg(c.short, 'short', legUsd)]);
+    return { long, short };
   };
 }
 

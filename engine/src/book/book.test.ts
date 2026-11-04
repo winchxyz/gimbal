@@ -17,6 +17,8 @@ import { loopBook } from '../cli/serve-loop.ts';
 import { PositionBook, createBook, nextSyncAt } from './book.ts';
 import { HOUR_MS, positionIdOf, summarize } from './derive.ts';
 import { bookReport } from './report.ts';
+import type { RiskCheckRecord, RiskLedgerRecord } from './risk-ledger.ts';
+import { holdSpan, riskLedgerFile } from './risk-ledger.ts';
 import { hlFillFee, hlNonFundingLedger } from './sources.ts';
 import { BookStore, bookFile } from './store.ts';
 import { OVERLAP_MS, READ_AFTER_EXIT_MS, fundingKey, fundingWindow } from './sync.ts';
@@ -554,7 +556,7 @@ test('the report: per position and desk totals, actual APR checked by hand', asy
   assert.match(text, /settled {4}yes/);
   assert.match(text, /SOL {2}short hyperliquid, long phoenix {2}OPEN/);
   assert.match(text, /fees {7}open -0\.1000, close not yet, total -0\.1000 \(1 fill\(s\) with no fee known: not counted\)/);
-  assert.match(text, /NEAR AI risk check ledger \(helped \/ hurt\)\n {2}-- not recorded yet/);
+  assert.match(text, /NEAR AI risk check ledger \(helped \/ hurt\)\n {2}no risk check booked yet\n$/);
   // Desk totals: funding 0.51 + 0.03, fees -0.40 - 0.10, transfers -0.32, price +0.40.
   close(s.totals.netUsd, 0.51 + 0.03 - 0.5 - 0.32 + 0.4, 'desk net');
   assert.match(text, /net {8}\+0\.1200 USD\n {2}desk ledger/);
@@ -761,4 +763,45 @@ test('start() syncs now and schedules the next hour; stop() cancels it', async (
   assert.equal(timers[0]!.ms, 35 * 60_000);
   book.stop();
   assert.equal(cleared, 1);
+});
+
+test('npm run report: the NEAR AI risk check ledger next to the book, offline: refusals priced as helped or hurt, passes with their position', async () => {
+  const dir = tempDir(dirs);
+  await rotated(dir);
+  const check = (over: Partial<RiskCheckRecord>): RiskCheckRecord => {
+    const at = over.at ?? T0;
+    const windowId = over.windowId ?? XLM;
+    return {
+      v: 1, type: 'check', id: `${at}-${windowId}`, at, kind: 'enter', by: 'auto', windowId, symbol: 'XLM', outcome: 'passed', verdict: 'passed',
+      reason: 'no red flag named', why: 'NEAR AI risk check passed (attested): no red flag named', attestation: 'attested', model: 'test-model',
+      prompt: [{ role: 'user', content: '{}' }], reply: '{"verdict":"pass","reasons":[]}', latencyMs: 700,
+      legUsd: 1000, leverage: 1.5, forecastNetAprPct: 20, roundTripCostUsd: 0.5, holdHours: 4, ...over,
+    };
+  };
+  // The XLM pass came 1 min before its entry; the SOL enter passed unchecked (no key); an ETH window was refused and
+  // its four hours then paid 8.76 % gross: 0.04 USD on 1000 against a 0.5 round trip, so the refusal helped.
+  const pass = check({ at: enterXlm().at - 60_000 });
+  const noKey = check({
+    at: enterSol().at - 30_000, windowId: SOL, symbol: 'SOL', outcome: 'no-key', verdict: 'unchecked', why: 'no NEAR AI key: not checked',
+    attestation: null, prompt: null, reply: '', latencyMs: null,
+  });
+  const refused = check({ at: T0 + 2 * H, windowId: 'eth-phoenix-hyperliquid', symbol: 'ETH', outcome: 'refused', verdict: 'refused', reason: 'a spike', why: 'NEAR AI risk check refused (attested): a spike' });
+  const { from } = holdSpan(refused);
+  const hours: RiskLedgerRecord = { v: 1, type: 'hours', at: from + 5 * H, checkId: refused.id, points: [0, 1, 2, 3].map((i) => ({ t: from + i * H, grossAprPct: 8.76 })) };
+  const ledger = riskLedgerFile(dir, DESK.mode, DESK.contractId, DESK.deskId);
+  writeFileSync(ledger, [pass, noKey, refused, hours].map((r) => `${JSON.stringify(r)}\n`).join(''));
+  // A ledger with no book next to it (replay) is shown on its own.
+  writeFileSync(riskLedgerFile(dir, 'replay', null, null), `${JSON.stringify(check({ windowId: 'btc-phoenix-hyperliquid', symbol: 'BTC' }))}\n`);
+  const cli = fileURLToPath(new URL('../cli/report.ts', import.meta.url));
+  const run = spawnSync(process.execPath, [cli, '--state', dir], { encoding: 'utf8', env: { ...process.env, GIMBAL_STATE_DIR: '' } });
+  assert.equal(run.status, 0, run.stderr);
+  const out = run.stdout;
+  assert.match(out, /NEAR AI risk check ledger \(helped \/ hurt\)\n {2}file {7}.*risk-checks-mainnet-gimbal-test\.near-desk-1\.jsonl\n/);
+  assert.match(out, / {2}refusals {3}1: each priced, estimated, /);
+  assert.match(out, /enter eth-phoenix-hyperliquid \(auto\), 1000\.00 USD a leg at 1\.5x, 20\.00 % net forecast\n {6}NEAR AI risk check refused \(attested\): a spike\n {6}estimated -0\.4600 USD over 4 of 4 h .* -> helped: a loss avoided/);
+  assert.match(out, /enter xlm-phoenix-hyperliquid \(auto\), 1000\.00 USD a leg\n {6}NEAR AI risk check passed \(attested\): no red flag named\n {6}position \S+ closed, realised net [+-]\d+\.\d{4} USD/);
+  assert.match(out, / {2}unchecked {2}1: .*\n.*sol-phoenix-hyperliquid.*\n {6}no NEAR AI key: not checked\n {6}position \S+ OPEN, running net /);
+  assert.match(out, / {4}refused {4}1: 1 helped, 0 hurt, 0 pending; estimated -0\.4600 USD/);
+  assert.match(out, / {4}passed {5}1: 1 with a position, net /);
+  assert.match(out, /risk-checks-replay\.jsonl\n[\s\S]*btc-phoenix-hyperliquid[\s\S]*no position followed[\s\S]*\(no position book next to it: passes show no position\)/);
 });
