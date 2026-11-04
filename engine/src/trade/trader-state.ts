@@ -5,11 +5,18 @@
 // every order (the order in flight) and again once the trader has recorded the order's result, and sends no order
 // unless the save before it succeeded.
 //
-// What it keeps: the pair's symbol; the trader's intents, baselines, known positions, net and alert, and every order
-// with no answer that may still run (its ids and window: PairTraderState); Hyperliquid post-only orders a maker order
-// could not settle; the orders in flight (each order sent since the trader last recorded a result, one entry per
-// order, so each leg has its own); the ADL state (attempts left, pause, an event in progress). Everything in it is
-// public on chain or at the venues once signed: no key, no secret.
+// What it keeps: the pair's symbol and its legs (each leg's venue and the venue's name of the market, in the trader's
+// order, and which leg is long: trade/pair-shape.ts), so a restart rebuilds the legs the trader held; the trader's
+// intents, baselines, known positions, net and alert, and every order with no answer that may still run (its ids and
+// window: PairTraderState); Hyperliquid post-only orders a maker order could not settle; the orders in flight (each
+// order sent since the trader last recorded a result, one entry per order, so each leg has its own); the ADL state
+// (attempts left, pause, an event in progress). Everything in it is public on chain or at the venues once signed: no
+// key, no secret.
+//
+// Versions. A file of version 1 has no legs: it is short Hyperliquid (index 0) / long Phoenix (index 1), the only pair
+// before Orderly pairs, and is read as that. A save writes version 1 for that pair (with its legs) and version 2 for
+// any other: an engine from before Orderly pairs, which reads version 1 only, then refuses a file whose index 1 is not
+// Phoenix (alert only) instead of rebuilding the wrong legs, and still reads its own pair's file.
 //
 // A file that is missing, cannot be read, names another contract, desk or EVM address, or does not pass
 // parseTraderState is never taken as "nothing in flight": serve's trader then does not trade (alert only) and says
@@ -41,8 +48,13 @@ import { ADL_ATTEMPTS } from '../risk/adl.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { LegRef, LegSide, PendingMakerOrder } from './legs.ts';
 import type { PairTraderState } from './pair.ts';
+import type { PairShape } from './pair-shape.ts';
+import { PAIR_VENUES, defaultShape, isDefaultShape, shapeText, venueSymbol } from './pair-shape.ts';
 
-export const TRADER_STATE_VERSION = 1;
+/** The newest version a save writes (for a pair other than short Hyperliquid / long Phoenix; see the header). */
+export const TRADER_STATE_VERSION = 2;
+/** The version of a file with no legs, and of a save of short Hyperliquid / long Phoenix. */
+export const TRADER_STATE_V1 = 1;
 
 const README = 'Gimbal pair trader state (serve): orders that may still run, the ADL unwind budget and pause. '
   + 'Never delete this file to clear something: a missing file stops serve from trading. To start over after '
@@ -73,10 +85,16 @@ export interface InFlightOrder {
 }
 
 export interface TraderFileState {
-  version: typeof TRADER_STATE_VERSION;
+  /** What the file says; a save writes the version its pair needs (see the header), whatever this is. */
+  version: typeof TRADER_STATE_VERSION | typeof TRADER_STATE_V1;
   savedAt: number;
   /** The pair's base (null: no pair was adopted). */
   symbol: string | null;
+  /**
+   * The pair's legs and which is long; null with no symbol. Absent: short Hyperliquid / long Phoenix (the file has no
+   * legs). Loaded files always carry it, and a save always writes it.
+   */
+  pair?: PairShape | null;
   trader: PairTraderState | null;
   pendingMaker: PendingMakerOrder[];
   /** Orders whose outcome no saved result holds yet; empty: none. */
@@ -143,10 +161,24 @@ function eventJson(e: AdlEvent): Record<string, unknown> {
   return { at: e.at, reference: e.reference.map(String), seen: e.seen.map(String), attempts: e.attempts, nextAt: e.nextAt, alerted: e.alerted };
 }
 
+/** The state's legs: as it names them, or short Hyperliquid / long Phoenix when it names none; null with no symbol. */
+export function savedShape(s: Pick<TraderFileState, 'symbol' | 'pair'>): PairShape | null {
+  if (s.pair !== undefined) return s.pair;
+  return s.symbol === null ? null : defaultShape(s.symbol);
+}
+
+/** The version a save of `s` writes: 1 for short Hyperliquid / long Phoenix (or no pair), else 2 (see the header). */
+export function versionFor(s: Pick<TraderFileState, 'symbol' | 'pair'>): typeof TRADER_STATE_VERSION | typeof TRADER_STATE_V1 {
+  const shape = savedShape(s);
+  return shape === null || (s.symbol !== null && isDefaultShape(shape, s.symbol)) ? TRADER_STATE_V1 : TRADER_STATE_VERSION;
+}
+
 export function traderStateJson(s: TraderFileState): Record<string, unknown> {
   const t = s.trader;
+  const shape = savedShape(s);
   return {
-    version: s.version, savedAt: s.savedAt, symbol: s.symbol,
+    version: versionFor(s), savedAt: s.savedAt, symbol: s.symbol,
+    pair: shape === null ? null : { legs: shape.legs.map((l) => ({ venue: l.venue, symbol: l.symbol })), longIndex: shape.longIndex },
     trader: t === null ? null : {
       intents: t.intents.map(q), baselines: t.baselines.map(q), known: t.known.map(q), net: t.net.toString(), unhedged: t.unhedged,
       unsettled: t.unsettled.map((u) => ({
@@ -267,19 +299,65 @@ function parseEvent(v: unknown, path: string): AdlEvent {
   };
 }
 
-/** The state as a save wrote it; throws, naming the field, on anything else. */
+/**
+ * The pair's legs as the file names them (`raw`; undefined: none, a version 1 file), checked against its symbol: two
+ * venues, each leg that venue's market of the symbol, in the trader's order. Version 1 is short Hyperliquid / long
+ * Phoenix, with or without legs written; version 2 names its legs.
+ */
+function parseShape(raw: unknown, version: number, symbol: string | null): PairShape | null {
+  if (raw === undefined && version === TRADER_STATE_V1) return symbol === null ? null : defaultShape(symbol);
+  if (raw === undefined) bad('state.pair', `missing: a version ${version} file names its legs`);
+  if (raw === null) {
+    if (symbol !== null) bad('state.pair', `null, but the state names the pair ${symbol}`);
+    return null;
+  }
+  if (symbol === null) bad('state.pair', 'names legs, but the state names no pair symbol');
+  const p = obj(raw, 'state.pair');
+  const legs = two(p.legs, 'state.pair.legs', (x, path) => {
+    const l = obj(x, path);
+    const venue = oneOf(l.venue, `${path}.venue`, VENUES);
+    const sym = str(l.symbol, `${path}.symbol`);
+    if (sym !== venueSymbol(venue, symbol)) bad(`${path}.symbol`, `${JSON.stringify(sym)} is not ${venue}'s market of ${symbol} (${venueSymbol(venue, symbol)})`);
+    return { venue, symbol: sym };
+  });
+  if (PAIR_VENUES.indexOf(legs[0].venue) >= PAIR_VENUES.indexOf(legs[1].venue)) bad('state.pair.legs', `${legs[0].venue} then ${legs[1].venue} is not two venues in the trader's order (${PAIR_VENUES.join(', ')})`);
+  const shape: PairShape = { legs, longIndex: index(p.longIndex, 'state.pair.longIndex') };
+  if (version === TRADER_STATE_V1 && !isDefaultShape(shape, symbol)) bad('state.pair', `a version ${TRADER_STATE_V1} file is short hyperliquid / long phoenix, not ${shapeText(shape)}`);
+  return shape;
+}
+
+/** Every order the file holds names the venue of its leg; a post-only order needs a Hyperliquid leg. */
+function checkLegVenues(s: LoadedTraderFile): void {
+  const shape = s.pair ?? null;
+  if (shape === null) return;
+  const venueAt = (i: 0 | 1) => shape.legs[i].venue;
+  for (const [i, f] of s.inFlight.entries()) {
+    if (f.venue !== venueAt(f.index)) bad(`state.inFlight[${i}].venue`, `${f.venue}, but leg ${f.index} is ${venueAt(f.index)}`);
+  }
+  for (const [i, u] of (s.trader?.unsettled ?? []).entries()) {
+    for (const [j, r] of u.refs.entries()) {
+      if (r.venue !== venueAt(u.index)) bad(`state.trader.unsettled[${i}].refs[${j}].venue`, `${r.venue}, but leg ${u.index} is ${venueAt(u.index)}`);
+    }
+  }
+  if (s.pendingMaker.length > 0 && !shape.legs.some((l) => l.venue === 'hyperliquid')) bad('state.pendingMaker', 'Hyperliquid post-only orders, but no leg is on Hyperliquid');
+}
+
+/** The state as a save wrote it (a version 1 file read as short Hyperliquid / long Phoenix); throws, naming the field, on anything else. */
 export function parseTraderState(v: unknown): LoadedTraderFile {
   const s = obj(v, 'state');
-  if (s.version !== TRADER_STATE_VERSION) bad('state.version', `not ${TRADER_STATE_VERSION}`);
+  const version = s.version;
+  if (version !== TRADER_STATE_VERSION && version !== TRADER_STATE_V1) bad('state.version', `not ${TRADER_STATE_V1} or ${TRADER_STATE_VERSION}`);
   const id = obj(s.identity, 'state.identity');
   const adl = obj(s.adl, 'state.adl');
   const left = adl.attemptsLeft;
   if (typeof left !== 'number' || !Number.isSafeInteger(left) || left < 0 || left > ADL_ATTEMPTS) bad('state.adl.attemptsLeft', `not 0..${ADL_ATTEMPTS}`);
-  return {
-    version: TRADER_STATE_VERSION,
+  const symbol = nullable(s.symbol, 'state.symbol', str);
+  const loaded: LoadedTraderFile = {
+    version,
     identity: { contractId: str(id.contractId, 'state.identity.contractId'), deskId: str(id.deskId, 'state.identity.deskId'), evm: str(id.evm, 'state.identity.evm') },
     savedAt: time(s.savedAt, 'state.savedAt'),
-    symbol: nullable(s.symbol, 'state.symbol', str),
+    symbol,
+    pair: parseShape(s.pair, version, symbol),
     trader: nullable(s.trader, 'state.trader', parseTrader),
     pendingMaker: list(s.pendingMaker, 'state.pendingMaker').map((x, i) => {
       const p = obj(x, `state.pendingMaker[${i}]`);
@@ -297,6 +375,8 @@ export function parseTraderState(v: unknown): LoadedTraderFile {
     }),
     adl: { attemptsLeft: left, paused: nullable(adl.paused, 'state.adl.paused', str), event: nullable(adl.event, 'state.adl.event', parseEvent) },
   };
+  checkLegVenues(loaded);
+  return loaded;
 }
 
 /** Blocks the thread for `ms`: a save is synchronous so that nothing is signed before it is on disk. */

@@ -18,7 +18,7 @@ import { RiskEngine } from '../risk/engine.ts';
 import { ALERT_DISTANCE_PCT, LiquidationAlert, isHedged, legsUnder, monitorLines } from '../risk/monitor.ts';
 import { AccountsDeskSource } from '../risk/sources.ts';
 import { VenueHealth } from '../risk/venue-health.ts';
-import { TraderStateStore, traderStateFile, userStateDir } from '../trade/trader-state.ts';
+import { TraderStateStore, savedShape, traderStateFile, userStateDir } from '../trade/trader-state.ts';
 import { signedQtyString } from '../trade/lots.ts';
 import { HL_MAINNET_URL, HyperliquidReader } from '../venues/hyperliquid.ts';
 import { PHOENIX_API_URL, PhoenixReader, SOLANA_MAINNET_RPC_URL } from '../venues/phoenix.ts';
@@ -89,7 +89,8 @@ async function main(): Promise<number> {
   else {
     const s = saved.state;
     const base = s.trader?.baselines.map((b) => (b === null ? 'unknown' : signedQtyString(b))).join(' / ') ?? 'none';
-    say(`trader    ${s.symbol ?? 'no pair'}: baselines hyperliquid / phoenix ${base}; ADL ${s.adl.attemptsLeft} attempt(s) left${s.adl.paused === null ? '' : `, PAUSED (${s.adl.paused})`}`
+    const venues = (savedShape(s)?.legs.map((l) => l.venue) ?? ['hyperliquid', 'phoenix']).join(' / ');
+    say(`trader    ${s.symbol ?? 'no pair'}: baselines ${venues} ${base}; ADL ${s.adl.attemptsLeft} attempt(s) left${s.adl.paused === null ? '' : `, PAUSED (${s.adl.paused})`}`
       + `${s.adl.event === null ? '' : `, an ADL event since ${new Date(s.adl.event.at).toISOString()} (${s.adl.event.attempts} attempt(s))`}; saved ${new Date(s.savedAt).toISOString()}`);
     for (const u of s.trader?.unsettled ?? []) say(`open:     ${u.refs.map((r) => `${r.venue} ${r.side} ${r.size} (${r.clientId ?? r.orderId ?? 'no id'})`).join(' and ')} has no answer and may still run until ${new Date(u.until).toISOString()}`);
     for (const p of s.pendingMaker) say(`open:     hyperliquid post-only ${p.side} ${p.size} (oid ${p.oid ?? 'unknown'}, cloid ${p.cloid}) may still rest`);
