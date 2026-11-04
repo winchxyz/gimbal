@@ -67,6 +67,11 @@ export interface ScannerOptions {
    * is refused E_ORACLE_STALE, as the contract would refuse it.
    */
   oracle?: OracleSource | null;
+  /**
+   * Whether serve trades now (a signing pair trader with the loop's hands): its open refreshes a missing or stale
+   * stored price, so the scanner notes it instead of refusing E_ORACLE_STALE (price.ts deskVerdict). Default: never.
+   */
+  oracleRefreshAtOpen?: () => boolean;
   /** Desk venues that already hold the desk's margin; default none (the desk keeps it in the reserve between holds). */
   marginHeldAt?: () => ReadonlySet<VenueId>;
   /** Where notes go (a failed read, a skipped book); default nowhere. */
@@ -422,6 +427,7 @@ export class Scanner {
       costs: config.costs,
       policy: config.policy,
       oracle: this.#options.oracle ?? null,
+      oracleRefreshAtOpen: this.#options.oracleRefreshAtOpen?.() === true,
       book: (leg: ScanLeg) => this.#books.get(legKey(leg)) ?? null,
       marginHeldAt: this.#options.marginHeldAt?.() ?? new Set(),
       quality: (pair) => quality.checks(pair),

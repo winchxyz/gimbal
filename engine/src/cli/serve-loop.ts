@@ -183,7 +183,10 @@ export function loopHands(
 ): LoopHands {
   const outcome = (r: HandsResult): ActOutcome => {
     for (const line of r.lines) log(`strategy loop: ${line}`);
-    return { ok: r.ok, reason: r.reason, sent: r.sent ?? (r.results.length > 0 || r.tx.length > 0), tx: r.tx, feeUsd: r.feeUsd, open: r.open, fills: fillsOf(r.results) };
+    return {
+      ok: r.ok, reason: r.reason, sent: r.sent ?? (r.results.length > 0 || r.tx.length > 0), tx: r.tx, feeUsd: r.feeUsd, open: r.open, fills: fillsOf(r.results),
+      ...(r.refreshed === true ? { refreshed: true } : {}),
+    };
   };
   return {
     blocked: () => busy() ?? hands.blocked(),
@@ -209,10 +212,13 @@ export function loopHands(
     },
     symbolOf: (w) => windowSymbol(w, hands.symbols),
     open: async (r) => {
-      const h = await hands.open({ symbol: r.symbol, legUsd: r.legUsd, leverage: r.leverage, reason: r.reason, qty: r.qty, gate });
+      const h = await hands.open({
+        symbol: r.symbol, legUsd: r.legUsd, leverage: r.leverage, reason: r.reason, qty: r.qty, gate, ...(r.noRefresh === undefined ? {} : { noRefresh: r.noRefresh }),
+      });
       // What filled, not what was asked (a later part the gate stopped holds nothing): the journal and the held size.
       return { ...outcome(h), filledQty: openedQty(h.results) };
     },
+    prepareOpen: async (r) => outcome(await hands.prepareOpen({ symbol: r.symbol, ...(r.noRefresh === undefined ? {} : { noRefresh: r.noRefresh }) })),
     reconcile: () => hands.reconcile(),
     close: async (r) => outcome(await hands.close({ reason: r.reason })),
   };

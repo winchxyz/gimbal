@@ -8,7 +8,10 @@ import { DEFAULT_STRATEGY } from '../scanner/config.ts';
 import type { DecideInput, Decision } from './decide.ts';
 import { LOOP_RULES, NO_COUNTERS } from './decide.ts';
 import type { ActOutcome, BookFill, BookRecord, HandsHeld, LoopHands, StrategyLoopOptions } from './loop.ts';
-import { HOUR_GRACE_MS, LEDGER_HOLD_HOURS, LoopStore, RETRY_AFTER_MS, RISK_NOT_ASKED, StrategyLoop, loopStateFile, notEnterable } from './loop.ts';
+import {
+  HOUR_GRACE_MS, LEDGER_HOLD_HOURS, LOOP_STATE_VERSION, LoopStore, MAX_OPEN_REFRESHES_PER_DAY, REFRESH_HOLD_MS, RETRY_AFTER_MS, RISK_NOT_ASKED, StrategyLoop,
+  loopStateFile, notEnterable,
+} from './loop.ts';
 import type { RiskCheckRecord, RiskLedgerSink } from '../book/risk-ledger.ts';
 import type { VetoSource } from './veto.ts';
 import { NearAiClient } from '../nearai/client.ts';
@@ -40,7 +43,10 @@ interface World {
   held: (Omit<HandsHeld, 'oneLeg'> & { oneLeg?: HandsHeld['oneLeg'] }) | null;
   blocked: string | null;
   busy: string | null;
-  opens: { symbol: string; legUsd: number; leverage: number; qty: string; reason: string }[];
+  opens: { symbol: string; legUsd: number; leverage: number; qty: string; reason: string; noRefresh?: string }[];
+  /** A rotate's prepareOpen (none: the hands have no such step), and what each call saw: `SYMBOL closes=N`. */
+  prepareAnswer?: (symbol: string) => ActOutcome;
+  prepares: string[];
   closes: string[];
   openAnswer: (symbol: string) => ActOutcome;
   closeAnswer: () => ActOutcome;
@@ -54,7 +60,7 @@ interface World {
 
 function world(over: Partial<World> = {}): World {
   return {
-    now: T0, held: null, blocked: null, busy: null, opens: [], closes: [], events: [], inputs: [],
+    now: T0, held: null, blocked: null, busy: null, opens: [], closes: [], events: [], inputs: [], prepares: [],
     openAnswer: () => OK('opened both legs'), closeAnswer: () => OK('closed both legs, flat'),
     next: {}, windows: [win('sol-phoenix-hyperliquid'), win('eth-phoenix-hyperliquid'), win('btc-hyperliquid-phoenix')],
     strategy: { ...DEFAULT_STRATEGY, auto: true }, trade: true, ...over,
@@ -66,8 +72,14 @@ function fakeHands(w: World): LoopHands {
     blocked: () => w.blocked,
     held: () => (w.held === null ? null : { ...w.held, oneLeg: w.held.oneLeg ?? null }),
     symbolOf: (x) => (x.longVenue === 'phoenix' && x.shortVenue === 'hyperliquid' ? { symbol: x.symbol } : { refused: 'short hyperliquid, long phoenix only' }),
+    ...(w.prepareAnswer === undefined ? {} : {
+      prepareOpen: async (r: { symbol: string; noRefresh?: string }) => {
+        w.prepares.push(`${r.symbol} closes=${w.closes.length}`);
+        return w.prepareAnswer!(r.symbol);
+      },
+    }),
     open: async (r) => {
-      w.opens.push({ symbol: r.symbol, legUsd: r.legUsd, leverage: r.leverage, qty: r.qty, reason: r.reason });
+      w.opens.push({ symbol: r.symbol, legUsd: r.legUsd, leverage: r.leverage, qty: r.qty, reason: r.reason, ...(r.noRefresh === undefined ? {} : { noRefresh: r.noRefresh }) });
       const a = w.openAnswer(r.symbol);
       if (a.ok) w.held = { symbol: r.symbol, legUsd: r.legUsd, pnlUsd: 0 };
       return a;
@@ -215,6 +227,124 @@ test('enter: the veto (none: "no NEAR AI risk check"), then the open; journaled 
   await again.check();
   assert.equal(w.inputs.at(-1)!.held?.windowId, 'sol-phoenix-hyperliquid');
   assert.equal(w.inputs.at(-1)!.held?.entryNetAprPct, 24);
+});
+
+test('enter on a window whose stored price the open refreshes: the journal carries the note, nothing is refused', async () => {
+  const w = world();
+  const loop = makeLoop(w);
+  const reason = 'Enter SOL: 24 % net, 3 of 3 hours above 10 %; $500.00 a leg at 1.5x; stored SOL price missing: refreshed at open';
+  w.next = { decision: { action: 'enter', reason, windowId: 'sol-phoenix-hyperliquid' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  await loop.check();
+  const enter = journal(w).find((j) => j.kind === 'enter')!;
+  assert.match(enter.summary, /stored SOL price missing: refreshed at open/);
+  // The why line carries both: the stored-price note and the risk check's verdict.
+  assert.match(enter.summary, /: Enter SOL: .*; stored SOL price missing: refreshed at open; no NEAR AI key: not checked; opened both legs$/);
+  assert.match(decisions(w).at(-1)!.reason, /; stored SOL price missing: refreshed at open; no NEAR AI key: not checked$/);
+  assert.equal(journal(w).some((j) => j.kind === 'refused'), false);
+});
+
+test('an enter refused after its open paid for refresh_prices holds the window 6 h, journaled with why; one refused unpaid is retried after 15 min', async () => {
+  const w = world();
+  const loop = makeLoop(w);
+  w.openAnswer = () => ({ ...REFUSED('open refused, nothing signed: the price moved: under one common lot fits the cap'), refreshed: true });
+  w.next = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  await loop.check();
+  assert.equal(w.opens.length, 1);
+  const until = new Date(T0 + REFRESH_HOLD_MS).toISOString();
+  const held = journal(w).at(-1)!;
+  assert.equal(held.kind, 'refused');
+  assert.equal(held.summary, `enter sol-phoenix-hyperliquid held until ${until}: refused after the open paid for refresh_prices (open refused, nothing signed: the price moved: under one common lot fits the cap); not tried again for 6 h, so a refusal that repeats does not pay again`);
+  assert.equal(held.numbers.holdHours, 6);
+  // Past the 15-minute retry: still held, nothing opened, nothing refused again.
+  const said = journal(w).length;
+  w.now += RETRY_AFTER_MS + 60_000;
+  await loop.check();
+  assert.equal(w.opens.length, 1);
+  assert.equal(journal(w).slice(said).some((j) => j.kind === 'refused'), false);
+  // After the hold: tried again.
+  w.now = T0 + REFRESH_HOLD_MS + 60_000;
+  w.openAnswer = () => OK('opened both legs');
+  await loop.check();
+  assert.equal(w.opens.length, 2);
+  assert.equal(loop.held?.windowId, 'sol-phoenix-hyperliquid');
+
+  // The same refusal with no refresh_prices paid: the usual 15-minute retry.
+  const v = world();
+  const plain = makeLoop(v);
+  v.openAnswer = () => REFUSED('open refused, nothing signed: the price moved');
+  v.next = w.next;
+  await plain.check();
+  v.now += RETRY_AFTER_MS + 60_000;
+  await plain.check();
+  assert.equal(v.opens.length, 2);
+  assert.equal(journal(v).some((j) => j.summary.includes('held until')), false);
+});
+
+test('the opens send at most 12 refresh_prices per symbol per UTC day: saved, journaled when hit, then the open is told not to refresh until 00:00 UTC', async () => {
+  const w = world();
+  const store = tmpStore();
+  store.save({ version: LOOP_STATE_VERSION, counters: { ...NO_COUNTERS }, held: null, refreshes: { day: '2026-11-03', bySymbol: { SOL: MAX_OPEN_REFRESHES_PER_DAY - 1, ETH: 3 } } });
+  const loop = makeLoop(w, store);
+  w.openAnswer = () => ({ ...OK('opened both legs'), refreshed: true });
+  const enter: World['next'] = { decision: { action: 'enter', reason: 'go' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  const exit: World['next'] = { decision: { action: 'exit', reason: 'below the bar' }, act: { kind: 'exit', reason: 'below the bar' } };
+  w.next = enter;
+  await loop.check();
+  assert.equal(w.opens[0]!.noRefresh, undefined, 'the 12th may still be sent');
+  const cap = journal(w).find((j) => j.summary.startsWith('refresh_prices cap'))!;
+  assert.equal(cap.summary, 'refresh_prices cap: the strategy loop\'s opens sent 12 refresh_prices of SOL on 2026-11-03 (UTC), the most a day; no open of SOL that needs one is sent before 00:00 UTC');
+  const saved = JSON.parse(readFileSync(store.path, 'utf8')) as { refreshes: unknown };
+  assert.deepEqual(saved.refreshes, { day: '2026-11-03', bySymbol: { SOL: 12, ETH: 3 } });
+  // A restart reads the day's count: the next SOL open may not refresh.
+  w.next = exit;
+  w.now += 60_000;
+  await loop.check();
+  loop.stop();
+  const again = makeLoop(w, store);
+  w.next = enter;
+  w.now += 60_000;
+  await again.check();
+  assert.equal(w.opens[1]!.noRefresh, 'the strategy loop\'s 12 refresh_prices of SOL for 2026-11-03 (UTC) are used; the next may go after 00:00 UTC');
+  // The next UTC day starts the count over.
+  w.next = exit;
+  w.now = Date.UTC(2026, 10, 4, 0, 10);
+  await again.check();
+  w.next = enter;
+  w.now += 60_000;
+  await again.check();
+  assert.equal(w.opens[2]!.noRefresh, undefined);
+  assert.deepEqual((JSON.parse(readFileSync(store.path, 'utf8')) as { refreshes: unknown }).refreshes, { day: '2026-11-04', bySymbol: { SOL: 1 } });
+});
+
+test('a rotate refreshes the target price before it closes the held pair; a refresh that fails keeps the pair, journaled and held 6 h', async () => {
+  const failed = REFUSED('the stored ETH price (missing) could not be refreshed: near rpc: HTTP 503');
+  const w = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 3 }, prepareAnswer: () => ({ ...failed, refreshed: true }) });
+  const loop = makeLoop(w);
+  await loop.check();                                    // adopts the venues' SOL pair as its desk window
+  const rotate: World['next'] = { decision: { action: 'rotate', reason: 'eth better' }, act: { kind: 'rotate', fromId: 'sol-phoenix-hyperliquid', toId: 'eth-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  w.next = rotate;
+  w.now += 60_000;
+  await loop.check();
+  assert.deepEqual(w.prepares, ['ETH closes=0']);
+  assert.deepEqual([w.closes.length, w.opens.length], [0, 0], 'nothing closed, nothing opened');
+  assert.equal(loop.held?.windowId, 'sol-phoenix-hyperliquid');
+  const lines = journal(w).filter((j) => j.kind === 'refused').map((j) => j.summary);
+  assert.ok(lines.includes(`rotate sol-phoenix-hyperliquid -> eth-phoenix-hyperliquid not carried out: ${failed.reason}; sol-phoenix-hyperliquid is kept, nothing closed; no NEAR AI key: not checked`), lines.join('\n'));
+  assert.ok(lines.some((l) => l.startsWith(`rotate eth-phoenix-hyperliquid held until ${new Date(w.now + REFRESH_HOLD_MS).toISOString()}`)), lines.join('\n'));
+  w.now += RETRY_AFTER_MS + 60_000;
+  await loop.check();
+  assert.equal(w.prepares.length, 1, 'held: not tried again');
+
+  // A refresh that works: the price first, then the close, then the open.
+  const v = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 3 }, prepareAnswer: () => ({ ...OK('the stored ETH price (missing) refreshed before the close'), refreshed: true }) });
+  const ok = makeLoop(v);
+  await ok.check();
+  v.next = rotate;
+  v.now += 60_000;
+  await ok.check();
+  assert.deepEqual(v.prepares, ['ETH closes=0']);
+  assert.deepEqual([v.closes.length, v.opens.map((o) => o.symbol)], [1, ['ETH']]);
+  assert.equal(ok.held?.windowId, 'eth-phoenix-hyperliquid');
 });
 
 test('a veto drops the window: journaled, nothing opened, held out by counters.vetoedUntil (saved), shown on the window', async () => {

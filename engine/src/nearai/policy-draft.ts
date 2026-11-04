@@ -10,22 +10,15 @@
 // The draft goes back to the owner only: the engine never sends it to the contract (docs/interfaces.md §2).
 
 import type { ContractPolicy, PolicyDraft, StrategyConfig, VenueId } from '@gimbal/shared';
+import { ORACLE_ASSETS } from '../contract/oracle-assets.ts';
 import { DEFAULT_STRATEGY, STRATEGY_LIMITS, parseContractPolicy, parseStrategyConfig } from '../scanner/config.ts';
 import { orderlySymbol } from '../venues/orderly.ts';
 import type { Market } from '../venues/venue.ts';
 import type { ChatMessage } from './client.ts';
 import { NearAiUnavailable } from './client.ts';
 
-/** The assets the contract prices, by ticker: their OutLayer token ids. Nothing else is ever drafted as priced. */
-export const ORACLE_ASSETS: Readonly<Record<string, string>> = {
-  ETH: 'eth.bridge.near',
-  BTC: 'nbtc.bridge.near',
-  SOL: '22.contract.portalbridge.near',
-  DOGE: 'doge.omft.near',
-  LTC: 'ltc.omft.near',
-  XLM: 'xlm',
-  ZEC: 'zec.omft.near',
-};
+/** The assets the contract prices (contract/oracle-assets.ts). Nothing else is ever drafted as priced. */
+export { ORACLE_ASSETS };
 const PRICED = Object.keys(ORACLE_ASSETS);
 
 /** The contract's own bounds on a Policy (contract/core/src/policy.rs, `Policy::validate`). */

@@ -2,6 +2,7 @@
 // Pure: the books, the oracle prices and the time come in as arguments.
 
 import type { ContractPolicy, StrategyConfig, VenueId, Window as FundingWindow } from '@gimbal/shared';
+import { oraclePriced } from '../contract/oracle-assets.ts';
 import { venueName, venueNames } from '../venues/names.ts';
 import type { Book } from '../venues/venue.ts';
 import type { CostParams } from './config.ts';
@@ -48,6 +49,11 @@ export interface PricingContext {
   costs: CostParams;
   policy: ContractPolicy | null;
   oracle: OracleSource | null;
+  /**
+   * A trading serve (a signing pair trader with the strategy loop's hands): its open refreshes a missing or stale
+   * stored price first, so such a leg is a note, not E_ORACLE_STALE (deskVerdict). Default: false, today's verdict.
+   */
+  oracleRefreshAtOpen?: boolean;
   /** The latest book of a desk leg, or null when none was ever read. */
   book(leg: ScanLeg): BookRead | null;
   /** Desk venues that already hold the desk's margin: entering there moves nothing in or out. Default: none. */
@@ -241,6 +247,7 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
     // Structural only: both legs on desk venues. What the contract would refuse goes in `refused`.
     tradable: pair.desk,
     ...(verdict.refused === undefined ? {} : { refused: verdict.refused }),
+    ...(verdict.note === undefined ? {} : { note: verdict.note }),
     held: null,
     checks: [...head, ...verdict.checks, ...quality, ...checks, ...tail],
     switchCostUsd: null,
@@ -257,6 +264,13 @@ function schedule(leg: ScanLeg, incomePerHourUsd: number, now: number) {
 interface Verdict {
   refused?: { code: string; reason: string };
   checks: FundingWindow['checks'];
+  /** Window.note: what the open does first (a stored price refreshed), on a window not refused. */
+  note?: string;
+}
+
+/** The legs a trading serve's open refreshes the stored price for: the pair it opens, on a symbol the contract prices. */
+function refreshesAtOpen(leg: ScanLeg): boolean {
+  return (leg.venue === 'hyperliquid' || leg.venue === 'phoenix') && oraclePriced(leg.symbol);
 }
 
 function inVenuePolicy(policy: ContractPolicy, leg: ScanLeg): boolean {
@@ -275,11 +289,13 @@ function inVenuePolicy(policy: ContractPolicy, leg: ScanLeg): boolean {
  * - a leg in policy.unpriced needs no oracle, but its size in the venue's own units (legUsd at the venue mark) must
  *   fit its own max_sz, and its notional the unpriced cap (E_SIZE; a leg without a mark cannot be sized: E_SIZE);
  * - any other leg needs an oracle price no older than policy.oracle_max_age_s, and dated no more than
- *   ORACLE_MAX_SKEW_MS ahead of now (E_ORACLE_STALE);
+ *   ORACLE_MAX_SKEW_MS ahead of now (E_ORACLE_STALE). With ctx.oracleRefreshAtOpen (a trading serve), a missing or
+ *   stale price of a Hyperliquid or Phoenix leg whose symbol the contract prices (ORACLE_ASSETS) is not refused: the
+ *   open refreshes it first, and the window carries the note;
  * - the notional the contract values, up to legUsd × (1 + price_band_bps / 10⁴) at a limit price inside the band,
  *   must fit max_notional_usd, or the unpriced cap when a leg is unpriced (E_SIZE).
  */
-export function deskVerdict(pair: Pair, ctx: Pick<PricingContext, 'strategy' | 'policy' | 'oracle' | 'now'>): Verdict {
+export function deskVerdict(pair: Pair, ctx: Pick<PricingContext, 'strategy' | 'policy' | 'oracle' | 'now' | 'oracleRefreshAtOpen'>): Verdict {
   const L = ctx.strategy.legUsd;
   const policy = ctx.policy;
   const checks: FundingWindow['checks'] = [];
@@ -291,6 +307,7 @@ export function deskVerdict(pair: Pair, ctx: Pick<PricingContext, 'strategy' | '
   const refuse = (code: string, reason: string) => {
     refused ??= { code, reason };
   };
+  const notes: string[] = [];
   const legs = [pair.long, pair.short];
   for (const leg of legs) {
     if (!inVenuePolicy(policy, leg)) {
@@ -328,6 +345,21 @@ export function deskVerdict(pair: Pair, ctx: Pick<PricingContext, 'strategy' | '
     const raw = ctx.oracle?.price(leg.venue as VenueId, leg.symbol) ?? null;
     const o = raw !== null && Number.isFinite(raw.px) && raw.px > 0 && Number.isFinite(raw.at) ? raw : null;
     const age = o === null ? null : Math.max(0, (ctx.now - o.at) / 1000);
+    // A trading serve's open refreshes a missing or stale stored price before its refusals (pair-ops.ts planOpen):
+    // on the venues it opens, for a symbol refresh_prices can price, that is a note, not a refusal. The band and the
+    // cap are held to the refreshed price at open, and by the contract. A price dated ahead of the clock is 0 s old
+    // here, never stale: a refresh does not fix a wrong clock, so it is refused below as before.
+    const oldS = o === null || age === null ? null : age;
+    if ((oldS === null || oldS > policy.oracle_max_age_s) && ctx.oracleRefreshAtOpen === true && refreshesAtOpen(leg)) {
+      checks.push({
+        ok: true,
+        text: `The stored price for ${where} is ${oldS === null ? 'missing' : `${Math.round(oldS)} s old, over the ${policy.oracle_max_age_s} s limit`}: `
+          + 'the open refreshes it first (refresh_prices), and the band and cap are held to the new price',
+      });
+      const line = `stored ${leg.symbol} price ${oldS === null ? 'missing' : 'stale'}: refreshed at open`;
+      if (!notes.includes(line)) notes.push(line);
+      continue;
+    }
     if (o === null || age === null) {
       checks.push({ ok: false, text: `No oracle price for ${where}: the contract refuses its orders` });
       refuse('E_ORACLE_STALE', `no oracle price for ${whereId}`);
@@ -350,7 +382,8 @@ export function deskVerdict(pair: Pair, ctx: Pick<PricingContext, 'strategy' | '
   } else {
     checks.push({ ok: true, text: `A ${usd(L)} leg (up to ${usd(atBand)} at the edge of the price band) fits the ${usd(cap)} cap` });
   }
-  return refused === undefined ? { checks } : { refused, checks };
+  if (refused !== undefined) return { refused, checks };
+  return notes.length === 0 ? { checks } : { checks, note: notes.join('; ') };
 }
 
 function watchVerdict(pair: Pair): Verdict {

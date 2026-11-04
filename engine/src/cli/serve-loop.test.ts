@@ -289,7 +289,8 @@ test('a pair whose start is not confirmed: the loop decides nothing and refuses 
   let decided = 0;
   const logs: string[] = [];
   const hands: PairHands = {
-    symbols: ['SOL'], blocked: () => null, heldSymbol: () => null, heldLegs: () => [],
+    symbols: ['SOL'], blocked: () => null, canOpen: () => false, heldSymbol: () => null, heldLegs: () => [],
+    prepareOpen: async () => ({ ok: false, reason: 'not here', results: [], lines: [], open: [], tx: [], feeUsd: 0 }),
     open: async () => ({ ok: false, reason: 'not here', results: [], lines: [], open: [], tx: [], feeUsd: 0 }),
     close: async () => ({ ok: false, reason: 'not here', results: [], lines: [], open: [], tx: [], feeUsd: 0 }),
     reconcile: async () => null,
@@ -323,8 +324,10 @@ test('loopHands: the held symbol\'s legs only, one leg named, busy() refusing fi
   const pair: PairHands = {
     symbols: ['SOL'],
     blocked: () => null,
+    canOpen: () => true,
     heldSymbol: () => 'SOL',
     heldLegs: () => legs,
+    prepareOpen: async () => ({ ok: true, reason: 'SOL refreshed', results: [], lines: [], open: [], tx: [], feeUsd: 0, refreshed: true }),
     open: async (r) => {
       gateSeen = r.gate;
       return { ok: false, reason: 'stopped with orders out: socket closed', results: [], lines: [], open: [], tx: [], feeUsd: 0, sent: true };

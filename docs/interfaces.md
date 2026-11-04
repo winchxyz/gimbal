@@ -174,7 +174,17 @@ sell at a far-off limit (1 tick, say) cannot pass the meter for nothing. The `si
 unpriced: true`. Only the owner can add a symbol to `unpriced` (it is part of `set_policy`); the UI asks for the
 cap in USD, converts it to `max_sz` at the current price, and shows such symbols as "no price protection". Any
 other symbol without a fresh oracle price is refused (`E_ORACLE_STALE` / `E_ASSET`): the engine calls
-`refresh_prices` before an order when the stored price is too old.
+`refresh_prices` before an order when the stored price is too old. The scanner shows that refusal on a window, except
+while serve can open (mainnet, `GIMBAL_TRADE=1`, the start confirmed, live, not stopping: `PairHands.canOpen`): a
+Hyperliquid or Phoenix leg whose symbol the contract prices (`ORACLE_ASSETS`) and whose stored price is missing or
+older than `oracle_max_age_s` is then not refused but carries `Window.note` ("stored ETH price stale: refreshed at
+open"). The open plans read-only on the price as it is (a missing one on the books' mid), judges every other refusal
+first, and only then sends one `refresh_prices` (`pair-ops.ts` `planOpen`, `refreshForOpen`), holding the size to the
+cap at the new price before either leg; the refreshed price must live the first part's margin plus 15 s, so no second
+refresh is needed before it. The strategy loop holds a window 6 h after an open refused once it paid for a refresh,
+sends at most 12 such refreshes per symbol per UTC day (saved with its state under `GIMBAL_STATE_DIR`), and refreshes
+a rotate's target before it closes the held pair. A price dated ahead of the engine's clock, a symbol outside
+`ORACLE_ASSETS`, an Orderly leg and every other refusal stay refused.
 
 ### 1.3 Who may call what
 
@@ -708,6 +718,8 @@ export interface Window {
   veto?: { verdict: 'pass' | 'veto'; reasons: string[]; model: string; at: number };   // NEAR AI risk check, can only refuse (verdict "veto": refused)
   refused?: { code: string; reason: string };   // tradable, but it cannot be entered now: the contract would refuse
                                                 // it (E_ORACLE_STALE, E_ASSET, E_SIZE) or no desk exists (E_NO_DESK)
+  note?: string;                    // not a refusal: what the desk will do at open for an enterable window, shown on
+                                    // the row ("stored ETH price stale: refreshed at open", a trading serve only)
   held: { since: number } | null;   // the desk holds this window now
   checks: { ok: boolean; text: string }[];   // what the engine checked (policy, oracle, rescue path, the carry
                                              // gate on the multi-day spread), one line each, engine-written; the
@@ -973,7 +985,9 @@ anywhere the policy does not allow.
     checked", "NEAR AI key rejected (…): not checked, passed" or "NEAR AI risk check unavailable (…): passed".
     `<attestation>` is serve's `Attestor.label()` ("attested" or "not attested: <why>"), shown only for a reply that
     came. A refusal before the check is asked (no hands, the window not in the scan, a symbol serve does not trade)
-    says "NEAR AI risk check: not asked (refused before it)". The decision event is published again with it.
+    says "NEAR AI risk check: not asked (refused before it)". The decision event is published again with it, after
+    the decision's own reason, so a window whose stored price the open refreshes carries both ("…; stored SOL price
+    stale: refreshed at open; NEAR AI risk check passed (attested): …").
   - The journal numbers of every check that was asked: `vetoModel`, `vetoKey`, `vetoSystem` and `vetoPrompt` (the
     exact messages sent), `vetoReply` (the model's text as it came), `vetoMs` (latency), `riskCheckOutcome`
     (passed, refused, unreadable, timeout, unavailable, no-key, key-rejected) and `attestation`. The API key is never
@@ -1272,11 +1286,13 @@ directory fsynced on POSIX) and refused for another contract, desk or address. E
 entry each, before it is signed, and leaves that list only in the save that holds the trader's result for it (a
 close's result, a watch check's report, an adopt). A reader removes only its own temporary files and those of a
 process that is gone. A missing or unreadable file is not a fresh start: serve then only alerts until it is started
-once with `GIMBAL_TRADER_FRESH=<contract>/<desk>` after both legs were checked on the venues. Any other value
+once with `GIMBAL_TRADER_FRESH=<contract>/<desk>` after both legs were checked on the venues. That holds for a first
+start with both legs flat too: with no file, serve keeps no pair and the strategy loop gets no hands until that start
+writes one. Any other value
 (`1` included) is ignored, and so is the right one over a usable file: a usable file is always restored (a start line
 says to remove `GIMBAL_TRADER_FRESH` from the env), so a shrink that happened while serve was down is compared with the
 saved baselines and goes the normal ADL way (two agreeing reads, then the unwind). To start over a usable file, stop
-serve and move the file aside first. Legs that read flat, or a new pair opened after a flat save, start over without
+serve and move the file aside first. Over a usable file, legs that read flat, or a new pair opened after a flat save, start over without
 it.
 
 **Monitor** (`engine/src/risk/monitor.ts`). Every 30 min serve prints each leg (size, mark, liquidation price,

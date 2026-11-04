@@ -435,7 +435,7 @@ function decideHeld(input: DecideInput, held: HeldPair, heldW: FundingWindow | n
     const n = counters.betterByWindow[w.id] ?? 0;
     const reason = `Rotate ${held.symbol} -> ${pair(w)}: ${pct(w.netAprPct)} net vs ${pct(heldApr)} held, +${gain.toFixed(1)} pts for `
       + `${n} of ${strategy.rotate.forHours} hours; the ${usd(w.switchCostUsd!)} switch pays back in ${(paybackHours / 24).toFixed(1)} of the `
-      + `${(restHours / 24).toFixed(1)} days left; ${usd(size.legUsd)} a leg at ${lev(size.leverage)}`;
+      + `${(restHours / 24).toFixed(1)} days left; ${usd(size.legUsd)} a leg at ${lev(size.leverage)}${noteOf(w)}`;
     return out('rotate', reason, w.id, {
       kind: 'rotate', fromId: held.windowId, toId: w.id, legUsd: size.legUsd, leverage: size.leverage, qty: size.qty,
     });
@@ -527,7 +527,7 @@ function flatStatus(input: DecideInput, counters: LoopCounters): FlatStatus {
   if (top !== null) {
     const n = Math.min(counters.aboveByWindow[top.id] ?? 0, LOOP_RULES.enterAfterChecks);
     return {
-      line: `${top.symbol} ${pct(top.netAprPct)} net, ${n} of ${LOOP_RULES.enterAfterChecks} hours above ${minimum(min)}${vetoNote.line}`,
+      line: `${top.symbol} ${pct(top.netAprPct)} net, ${n} of ${LOOP_RULES.enterAfterChecks} hours above ${minimum(min)}${noteOf(top)}${vetoNote.line}`,
       key: `warming:${top.id}:${n}${vetoNote.key}`,
       windowId: top.id,
       top,
@@ -563,8 +563,13 @@ function decideFlat(input: DecideInput, counters: LoopCounters, out: Out): Decis
   if (!size.ok) return out('wait', `${w.symbol} ${pct(w.netAprPct)} net is ready, but ${size.why}`, w.id, null, `size:${w.id}:${size.code}`);
   const n = counters.aboveByWindow[w.id] ?? 0;
   const reason = `Enter ${pair(w)}: ${pct(w.netAprPct)} net, ${Math.min(n, LOOP_RULES.enterAfterChecks)} of ${LOOP_RULES.enterAfterChecks} hours above `
-    + `${minimum(input.strategy.minNetAprPct)}, 7-day ${pct(w.grossApr7dPct!)} and this hour ${pct(w.grossAprPct)}; ${usd(size.legUsd)} a leg at ${lev(size.leverage)}`;
+    + `${minimum(input.strategy.minNetAprPct)}, 7-day ${pct(w.grossApr7dPct!)} and this hour ${pct(w.grossAprPct)}; ${usd(size.legUsd)} a leg at ${lev(size.leverage)}${noteOf(w)}`;
   return out('enter', reason, w.id, { kind: 'enter', windowId: w.id, legUsd: size.legUsd, leverage: size.leverage, qty: size.qty });
+}
+
+/** A window's note (Window.note: a stored price the open refreshes first), as the tail of a why line. */
+function noteOf(w: FundingWindow): string {
+  return w.note === undefined || w.note === '' ? '' : `; ${w.note}`;
 }
 
 function capitalize(s: string): string {
