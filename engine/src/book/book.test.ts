@@ -14,11 +14,11 @@ import { HL_MAINNET_INFO_URL, HyperliquidReader } from '../venues/hyperliquid.ts
 import type { WireLine } from '../venues/recorder.ts';
 import type { FundingPayment } from '../venues/venue.ts';
 import { loopBook } from '../cli/serve-loop.ts';
-import { PositionBook, createBook, nextSyncAt } from './book.ts';
+import { POST_ENTER_SYNC_MS, PositionBook, createBook, nextSyncAt } from './book.ts';
 import { HOUR_MS, positionIdOf, summarize } from './derive.ts';
 import { bookReport } from './report.ts';
 import { readServeSummary, withServeSummary } from './serve-summary.ts';
-import { hlFillFee, hlNonFundingLedger } from './sources.ts';
+import { PHOENIX_FEE_INDEX_WAIT_MS, hlFillFee, hlNonFundingLedger, phoenixFillFee } from './sources.ts';
 import { BookStore, bookFile } from './store.ts';
 import { OVERLAP_MS, READ_AFTER_EXIT_MS, fundingKey, fundingWindow } from './sync.ts';
 import type { BookRecord, FeeEvent, FundingEvent, SyncEvent, TransferEvent } from './types.ts';
@@ -790,10 +790,33 @@ test('a position booked while the book runs has its ledgers read at once, not at
   assert.equal(sources.phoenix.asked.length, 1);
   const cursors = Object.keys(book.summary().cursors).sort();
   assert.ok(cursors.includes('hyperliquid') && cursors.includes('phoenix'), cursors.join(', '));
-  // An enter books a position too; nothing is queued once stopped.
+  // An enter books a position too: its sync waits POST_ENTER_SYNC_MS (Phoenix indexes its fills some seconds late).
+  book.record(enterSol());
+  assert.equal(timers.filter((t) => t.ms === POST_ENTER_SYNC_MS).length, 1, 'the enter\'s sync a minute on');
+  // Nothing is queued once stopped.
   book.stop();
   book.record(enterSol());
-  assert.equal(timers.filter((t) => t.ms === 0).length, 1);
+  assert.equal(timers.filter((t) => t.ms === POST_ENTER_SYNC_MS).length, 1);
+});
+
+test('a Phoenix fee counts as found only once every signature of the act is in trades-history; a missing one is retried', async () => {
+  const at = T0 + 2 * H;
+  const row = (signature: string, fees: string) => ({ signature, marketSymbol: 'SOL', baseLotsDelta: '1', price: '150', fees, timestamp: new Date(at).toISOString() });
+  let rows = [row('sig-open-1', '0.05')];
+  const api = { tradesHistory: async () => ({ data: rows }) } as unknown as Parameters<typeof phoenixFillFee>[0];
+  const q = {
+    venue: 'phoenix', address: 'auth', symbol: 'SOL', side: 'BUY' as const, startedAt: at - 5_000, at,
+    tx: [{ chain: 'solana', id: 'sig-open-1' }, { chain: 'solana', id: 'sig-open-2' }] as BookRecord['tx'],
+  };
+  // Seconds after the enter, the second fill is not indexed yet: no fee (a partial one would be booked for good).
+  assert.equal(await phoenixFillFee(api, { ...q, now: at + 10_000 }), null);
+  // Both indexed: the whole fee.
+  rows = [row('sig-open-1', '0.05'), row('sig-open-2', '0.07')];
+  close((await phoenixFillFee(api, { ...q, now: at + 70_000 }))!, 0.12, 'both fills');
+  // A signature never there after PHOENIX_FEE_INDEX_WAIT_MS (a transaction without fills): the others' fee.
+  rows = [row('sig-open-1', '0.05')];
+  assert.equal(await phoenixFillFee(api, { ...q, now: at + PHOENIX_FEE_INDEX_WAIT_MS - 1 }), null);
+  close((await phoenixFillFee(api, { ...q, now: at + PHOENIX_FEE_INDEX_WAIT_MS }))!, 0.05, 'after the wait');
 });
 
 test('the report takes serve\'s summary: the cursors of reads that stored nothing, and why an empty book was never read', () => {

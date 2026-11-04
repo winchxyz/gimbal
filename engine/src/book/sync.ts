@@ -55,6 +55,8 @@ export interface FillFeeQuery {
   /** When the act's record was written (its fills came before). */
   at: number;
   tx: TxRef[];
+  /** When the read is made, on the book's clock (default the system's). */
+  now?: number;
 }
 
 /** Where the book reads the ledgers. Every method only reads. */

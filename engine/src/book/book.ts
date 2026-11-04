@@ -31,6 +31,12 @@ import type { BookEvent, BookFill, BookRecord, EnterEvent, JournalEvent, SyncEve
 
 /** The hourly sync runs this long after the top of the hour: Hyperliquid pays at it, Phoenix books a little later. */
 export const HOUR_SYNC_DELAY_MS = 5 * 60_000;
+/**
+ * The sync after an enter waits this long: Phoenix's trades-history indexes a fill some seconds after it lands, and a
+ * fee read before every signature is there would be partial (the fee read waits for them all anyway, sources.ts). An
+ * adopted position (no fills of its own) is read at once.
+ */
+export const POST_ENTER_SYNC_MS = 60_000;
 
 export interface Timers {
   setTimeout(fn: () => void, ms: number): unknown;
@@ -229,7 +235,7 @@ export class PositionBook {
     }
     this.#append(added);
     this.#publishNew(added);
-    if (record.kind === 'enter') this.#syncSoon();
+    if (record.kind === 'enter') this.#syncSoon(POST_ENTER_SYNC_MS);
     if (positionId === null || record.kind === 'fill') return { positionId, numbers: {}, note: null };
     const r = this.result(positionId);
     if (r === null) return { positionId, numbers: {}, note: null };
@@ -261,7 +267,7 @@ export class PositionBook {
     };
     const e: EnterEvent = { v: 1, type: 'enter', at: now, positionId, record, adopted: true };
     this.#append([e]);
-    this.#syncSoon();
+    this.#syncSoon(0);
     return positionId;
   }
 
@@ -372,6 +378,7 @@ export class PositionBook {
         try {
           const charged = await scanRead(() => fillFee({
             venue: m.venue, address, symbol: m.symbol, side: m.side, startedAt: m.record.startedAt ?? null, at: m.record.at, tx: m.record.tx,
+            now: this.#clock.now(),
           }));
           if (charged === null || !Number.isFinite(charged)) continue;
           const now = this.#clock.now();
@@ -604,11 +611,11 @@ export class PositionBook {
   }
 
   /**
-   * A position was just booked while the hourly sync runs: a sync on the next turn (off the caller's stack), after the
-   * one running ends if one does (it chose its ledgers before this position was there). The hourly timer is left as
-   * it is.
+   * A position was just booked while the hourly sync runs: a sync `delayMs` on (off the caller's stack; an enter's after
+   * POST_ENTER_SYNC_MS), after the one running ends if one does (it chose its ledgers before this position was there).
+   * The hourly timer is left as it is.
    */
-  #syncSoon(): void {
+  #syncSoon(delayMs: number): void {
     if (!this.#started || this.#stopped || this.#syncSoonDue) return;
     this.#syncSoonDue = true;
     const go = () => {
@@ -621,8 +628,8 @@ export class PositionBook {
       if (running === null) go();
       else void running.then(go, go);
     };
-    if (this.#o.timers !== undefined) this.#o.timers.setTimeout(run, 0);
-    else setTimeout(run, 0).unref();
+    if (this.#o.timers !== undefined) this.#o.timers.setTimeout(run, delayMs);
+    else setTimeout(run, delayMs).unref();
   }
 
   #schedule(run: () => void): void {
