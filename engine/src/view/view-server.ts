@@ -217,12 +217,11 @@ export class ViewServer {
     }
     if (method !== 'GET') return notAllowed(res);
 
-    // Before the ticket is spent: a stream refused for the cap must not cost the viewer its ticket.
-    if (path === '/events' && this.#clients.size >= (this.#o.maxStreams ?? MAX_STREAMS)) {
-      return json(res, 503, { error: 'too many streams open' });
-    }
     const ticket = path === '/events' ? url.searchParams.get('ticket') : null;
-    const ok = ticket !== null ? this.#spendTicket(ticket) : this.#bearerOk(req);
+    // A ticket is checked here and spent only once the stream opens, so a stream refused for the cap does not cost
+    // the viewer its ticket; an outsider gets 401 before the cap is looked at.
+    const nonce = ticket !== null ? this.#validTicket(ticket) : null;
+    const ok = ticket !== null ? nonce !== null : this.#bearerOk(req);
     if (!ok) {
       const client = clientOf(req);
       if (this.#limited(client)) {
@@ -237,7 +236,11 @@ export class ViewServer {
     }
 
     if (path === '/view-ticket') return json(res, 200, this.#issueTicket());
-    if (path === '/events') return this.#events(req, res);
+    if (path === '/events') {
+      if (this.#clients.size >= (this.#o.maxStreams ?? MAX_STREAMS)) return json(res, 503, { error: 'too many streams open' });
+      if (nonce !== null) this.#tickets.delete(nonce);
+      return this.#events(req, res);
+    }
     if (path === '/state') return json(res, 200, this.#o.redact(this.#o.source.state()));
     if (path === '/strategy') return json(res, 200, this.#o.redact(this.#o.source.strategy()));
     if (path === '/journal') return json(res, 200, this.#o.redact(this.#o.source.journal(url.searchParams.get('before'))));
@@ -269,19 +272,17 @@ export class ViewServer {
     return { ticket: `${body}.${this.#sign(body)}`, expiresAt };
   }
 
-  /** True once per valid, unexpired ticket. */
-  #spendTicket(ticket: string): boolean {
+  /** The nonce of a valid, unexpired, unspent ticket (the caller spends it), else null. */
+  #validTicket(ticket: string): string | null {
     const m = /^(\d{1,16})\.([0-9a-f]{32})\.([A-Za-z0-9_-]{43})$/.exec(ticket);
-    if (m === null) return false;
+    if (m === null) return null;
     const [, exp, nonce, sig] = m as unknown as [string, string, string, string];
     const want = Buffer.from(this.#sign(`${exp}.${nonce}`));
     const got = Buffer.from(sig);
-    if (got.length !== want.length || !timingSafeEqual(got, want)) return false;
-    const now = this.#now();
+    if (got.length !== want.length || !timingSafeEqual(got, want)) return null;
     const expiresAt = this.#tickets.get(nonce);
-    if (expiresAt === undefined || expiresAt !== Number(exp)) return false;
-    this.#tickets.delete(nonce);
-    return now < expiresAt;
+    if (expiresAt === undefined || expiresAt !== Number(exp) || this.#now() >= expiresAt) return null;
+    return nonce;
   }
 
   #sign(body: string): string {

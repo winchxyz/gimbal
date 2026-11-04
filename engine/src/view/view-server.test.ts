@@ -13,13 +13,13 @@ import { DEFAULT_SCANNER_CONFIG, DEFAULT_STRATEGY } from '../scanner/config.ts';
 import { Scanner } from '../scanner/scanner.ts';
 import { EngineServer } from '../server.ts';
 import { startView } from './serve-view.ts';
-import { VIEW_TOKEN_MIN_LENGTH, tokenBits, viewConfigFromEnv } from './view-config.ts';
+import { VIEW_TOKEN_MIN_LENGTH, tokenBits, tokenPattern, viewConfigFromEnv } from './view-config.ts';
 import { maskAccount, viewRedactor, viewSecrets } from './view-redact.ts';
 import { FAIL_LIMIT, FAIL_WINDOW_MS, MAX_TICKETS, STOP_WAIT_MS, TICKET_TTL_MS, ViewServer } from './view-server.ts';
 import type { ViewSource } from './view-server.ts';
 
 const T0 = Date.UTC(2026, 10, 4, 10, 30);
-const TOKEN = 'v'.repeat(20) + '0123456789abcdef0123';
+const TOKEN = 'f4a6b8c3e1d7a9b2c5e0d3f6a1b4c7e9d2f5a8b0';
 const ORIGIN = 'https://dash.example';
 
 function reader(id: 'hyperliquid' | 'phoenix', ratePerHour: number): VenueReader {
@@ -169,7 +169,7 @@ test('off unless GIMBAL_VIEW_TOKEN is set (and long enough) and a port is given;
   assert.deepEqual(on, { on: true, lines: [`view: read-only on :${port} for origins ${ORIGIN}`] });
 });
 
-test('a guessable token keeps the view off: under 16 distinct characters and under 128 bits estimated', async () => {
+test('a guessable token keeps the view off: too few characters or bits, a repeat, or a sequence', async () => {
   const off = (token: string) => {
     const cfg = viewConfigFromEnv((n) => ({ GIMBAL_VIEW_TOKEN: token, PORT: '8080' } as Record<string, string>)[n], 8790);
     return 'off' in cfg ? cfg.off : null;
@@ -177,10 +177,17 @@ test('a guessable token keeps the view off: under 16 distinct characters and und
   assert.match(off('a'.repeat(64))!, /^GIMBAL_VIEW_TOKEN looks guessable \(1 distinct characters, about 0 bits/);
   assert.match(off('ab'.repeat(32))!, /looks guessable \(2 distinct characters, about 64 bits/);
   assert.match(off('abcdefgh'.repeat(5))!, /looks guessable/);
-  // 16 distinct passes; so does 64 random-looking hex with one digit missing (about 250 bits).
-  assert.equal(off('0123456789abcdef'.repeat(2)), null);
+  // Repeats and sequences pass the counts but are refused for the pattern.
+  assert.match(off('0123456789abcdef'.repeat(2))!, /looks guessable \(it repeats "01234567"… every 16 characters\)/);
+  assert.match(off('Tr0ub4dor&3xKq9!Zw'.repeat(2))!, /it repeats .* every 18 characters/);
+  assert.match(off('0123456789abcdefghijklmnopqrstuv')!, /looks guessable \(a run of 6 characters in sequence at 0\)/);
+  assert.match(off('9f3Kq7Lm2Xzyxwvu8Pd4Rt6Wb1Nc5Hj0')!, /a run of 6 characters in sequence/);
+  // Both suggested commands are in the message.
+  assert.match(off('0123456789abcdefghijklmnopqrstuv')!, /openssl rand -hex 32 or node -e "console\.log\(require\('crypto'\)\.randomBytes\(32\)\.toString\('hex'\)\)"/);
+  // 64 random-looking hex with one digit missing passes (about 250 bits), as does the tests' token.
   assert.equal(off('3a9b17c8e2d4f6a0b5c3e1d7f9a2b4c6e8d0f1a3b5c7e9d2f4a6b8c0e1d3f5a7'.replaceAll('0', '1')), null);
   assert.equal(off(TOKEN), null);
+  assert.equal(tokenPattern('3a9b17c8e2d4f6a0b5c3e1d7f9a2b4c6'), null);
   assert.ok(tokenBits('0123456789abcdef'.repeat(4)) === 256);
 });
 
@@ -458,11 +465,15 @@ test('outstanding tickets are capped: a new one retires the oldest, so asking fo
   }
 });
 
-test('the stream cap is checked before a ticket is spent', async () => {
+test('the stream cap: an outsider gets 401 first, and a ticket refused for the cap is not spent', async () => {
   const v = await makeView({ maxStreams: 1 });
   try {
     const first = stream(v.base, '/events', (m) => m.some((e) => e.type === 'journal'), auth);
     for (let i = 0; i < 100 && v.view.clientCount === 0; i++) await new Promise((r) => setTimeout(r, 10));
+    // At the cap, no credentials or a forged ticket still answer 401: the cap says nothing to an outsider.
+    assert.equal((await stream(v.base, '/events', () => true)).status, 401);
+    assert.equal((await stream(v.base, '/events?ticket=1.2.3', () => true)).status, 401);
+    assert.equal((await stream(v.base, '/events', () => true, auth)).status, 503);
     const t = await ticket(v.base);
     assert.equal((await stream(v.base, `/events?ticket=${encodeURIComponent(t.ticket)}`, () => true)).status, 503);
     engine.publish({ type: 'journal', data: { id: 'cap-1', t: T0, kind: 'wait', summary: 'cap', numbers: {}, tx: [] } });
