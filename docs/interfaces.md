@@ -1190,7 +1190,13 @@ transaction's `TxRef`.
 margin ratio and distance to liquidation (`margin.ts`). The leg uses the nearer of the venue's liquidation price and
 the one computed from its account; on an account with several positions the computed one does not apply, and when
 the venue gives none either the distance is the account basis, (equity − maintenance) ÷ the account's whole
-notional. Lines (`thresholds.ts`):
+notional. In serve the venues are the desk's Hyperliquid and Phoenix accounts, plus its Orderly account with
+`GIMBAL_ORDERLY_PAIRS=1` (default off; `engine/src/cli/serve-orderly.ts`): serve then keeps the desk's private Orderly
+session open (one `orderly_ws_auth` and the `positions` and `holding` reads per session, through the operator key),
+reopens a session that held 10 min at once and otherwise after 60 s doubling to 15 min (never two opens within 30 s),
+and reads the Orderly account as unknown (a failed read: Orderly down, its legs kept at their last numbers, at least
+watched) before the first session, while it is down or unseeded, and when the server has been quiet for 30 s. The
+strategy loop's free margin reads it too. It opens no Orderly window and changes no rescue route. Lines (`thresholds.ts`):
 - rescue line = `max(rescueDistancePct, (exp(4 σ √185 s) − 1) × 100)`, where σ is the leg's realised volatility per
   √s over the last 30 min (at least 10 returns, else the owner's line alone) and 185 s is the slow rescue measured on
   mainnet (a 120 s MPC signature plus a 65 s 1Click transfer);
