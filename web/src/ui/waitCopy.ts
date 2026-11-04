@@ -43,15 +43,45 @@ function costReason(cost: string): string {
   return 'the pair trader would not open it for cost this hour';
 }
 
+/** `long Orderly / short Hyperliquid` */
+const legsText = (long: string, short: string): string => `long ${venueName(long)} / short ${venueName(short)}`;
+
+/** The engine's "; ID is long X, short Y" tail on a hands refusal: two capture groups, the venue ids. */
+const LEGS = String.raw`; \S+ is long (\S+), short (\S+)`;
+
+/**
+ * The hands' refusal of a window's pair (serve-loop.ts: windowSymbol), as a clause that does not start with "but":
+ * the direction rule (GIMBAL_ORDERLY_PAIRS off: only short Hyperliquid / long Phoenix), the venue rule (on: any two of
+ * Hyperliquid, Orderly and Phoenix) and the policy's markets. Null for any other text.
+ */
+function handsClause(text: string): string | null {
+  let m: RegExpMatchArray | null;
+  const only = legsText('phoenix', 'hyperliquid');
+  if ((m = text.match(new RegExp(`^serve opens short hyperliquid, long phoenix only[^;]*(?:${LEGS})?$`, 's')))) {
+    // Only an engine with Orderly pairs off says this, so "switched off" is true whenever it is shown.
+    if (m[1] === undefined || m[2] === undefined) return `the desk can't open it (this engine opens only ${only} pairs)`;
+    const orderly = m[1] === 'orderly' || m[2] === 'orderly';
+    return `the desk can't open it (it is ${legsText(m[1], m[2])}, and this engine opens only ${only}${orderly ? ' because Orderly pairs are switched off' : ''})`;
+  }
+  if ((m = text.match(new RegExp(`^serve opens a pair on two of ([^;]+)(?:${LEGS})?$`, 's')))) {
+    const names = m[1]!.split(',').map((v) => venueName(v.trim()));
+    const where = names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}` : names.join('');
+    const tail = m[2] === undefined || m[3] === undefined ? '' : ` (this one is ${legsText(m[2], m[3])})`;
+    return `the desk opens a pair only on two of ${where}${tail}`;
+  }
+  if ((m = text.match(/^(.+?) is not a market both legs(?: \(long (\S+), short (\S+)\))? list in the desk's policy/))) {
+    return m[2] === undefined || m[3] === undefined
+      ? `${m[1]} is not one of the markets in your policy`
+      : `${m[1]} is not in your policy on both ${venueName(m[2])} and ${venueName(m[3])}`;
+  }
+  return null;
+}
+
 /** The rest of a sentence about a window that fails a rule, in the engine's gate order (decide.ts: gate). */
 function gateClause(text: string): string | null {
   let m: RegExpMatchArray | null;
-  if (/^serve opens short hyperliquid, long phoenix only/.test(text)) {
-    return `but the desk can't open it (it trades long ${venueName('phoenix')} / short ${venueName('hyperliquid')} only)`;
-  }
-  if ((m = text.match(/^(.+?) is not a market both legs list in the desk's policy/))) {
-    return `but ${m[1]} is not one of the markets in your policy`;
-  }
+  const hands = handsClause(text);
+  if (hands !== null) return `but ${hands}`;
   if ((m = text.match(/^the pair trader refused it for cost this hour: (.+)$/s))) return `but ${costReason(m[1]!)}; ${RETRY}`;
   if (text === 'watch only') return 'but it is watch-only, so the desk will not trade it';
   if ((m = text.match(/^refused by the NEAR AI risk check.*, held out for (\d+(?:\.\d+)?) h more$/s))) {
@@ -189,13 +219,71 @@ function hold(raw: string): Part | null {
 }
 
 /**
+ * The refusal of a rotation out of a pair with an Orderly leg (serve-pair.ts: rotateOutRefused), found anywhere in
+ * `reason`, as sentences; null for any other text. The engine only says it with GIMBAL_ORDERLY_PAIRS=1.
+ */
+export function orderlyRotateReason(reason: string): string | null {
+  const m = reason.match(/the held (\S+) pair has an Orderly leg \([^)]*\): its close arms the trader's replay watch/);
+  if (!m) return null;
+  return `The held ${m[1]} pair has an Orderly leg. Orderly takes a signed copy of an order for up to 5 minutes, so closing the leg blocks every new open for that long, and a rotation would leave the desk flat. The pair exits on its own rules instead.`;
+}
+
+/**
+ * The loop's journal line for a window it did not carry out before the NEAR AI risk check (loop.ts, journaled `refused`):
+ * `enter|rotate ID not carried out: <hands' refusal>; NEAR AI risk check: not asked (refused before it)`, and
+ * `rotate A -> B not carried out: <reason>; A is kept, nothing closed; <risk check>`. Null for any other text.
+ */
+function notCarriedOutCopy(raw: string): WaitCopy | null {
+  let m: RegExpMatchArray | null;
+  if ((m = raw.match(/^rotate (\S+) -> (\S+) not carried out: (.*?); \1 is kept, nothing closed(?:; (.*))?$/s))) {
+    const why = orderlyRotateReason(m[3]!);
+    if (why === null) return null;
+    const asked = m[4] !== undefined && /^NEAR AI risk check: not asked/.test(m[4]) ? ', and the NEAR AI risk check was not asked' : '';
+    return { text: `Rotation from ${m[1]} into ${m[2]} was refused. ${why} Nothing was closed${asked}.`, raw, mapped: true };
+  }
+  if ((m = raw.match(/^(enter|rotate) (\S+) not carried out: (.*); NEAR AI risk check: not asked \(refused before it\)$/s))) {
+    const what = m[1] === 'rotate' ? 'Rotation into' : 'Opening';
+    const why = m[3] === 'the window is not in the last scan' ? 'it is not in the last scan' : handsClause(m[3]!);
+    if (why === null) return null;
+    return { text: `${what} ${m[2]} was refused: ${why}. The NEAR AI risk check was not asked.`, raw, mapped: true };
+  }
+  return null;
+}
+
+/**
+ * The loop's lines about a pair with one leg open (loop.ts: closeOneLeg), which it closes reduce-only on every check:
+ * `one leg open: orderly 1.5: closing it, reduce-only[; the last close failed, next try at <ISO>]`,
+ * `...: not closed this check, <gate>` and `...: the close did not end flat: <why>; tried again in <wait>`
+ * ("tried again" is the wait before the next try). Null for any other text.
+ */
+export function oneLegCopy(reason: string): WaitCopy | null {
+  const raw = reason.trim();
+  const m = raw.match(/^one leg open: (\S+) (\S+): (.*)$/s);
+  if (!m) return null;
+  const head = `Only one leg is open: ${m[2]} on ${venueName(m[1]!)}.`;
+  const rest = m[3]!;
+  let r: RegExpMatchArray | null;
+  if (rest === 'closing it, reduce-only') return { text: `${head} The desk is closing it with a reduce-only order.`, raw, mapped: true };
+  if ((r = rest.match(/^closing it, reduce-only; the last close failed, next try at (\d{4}-\d\d-\d\dT(\d\d:\d\d)\S*)$/))) {
+    return { text: `${head} The last close failed, so the desk tries again at ${r[2]} UTC.`, raw, mapped: true };
+  }
+  if ((r = rest.match(/^not closed this check, (.+)$/s))) return { text: `${head} It was not closed this check: ${r[1]}.`, raw, mapped: true };
+  if ((r = rest.match(/^the close did not end flat: (.*); tried again in ([^;]+)$/s))) {
+    return { text: `${head} The close did not finish: ${r[1]}. The desk tries again in ${r[2]}.`, raw, mapped: true };
+  }
+  return null;
+}
+
+/**
  * The loop's journal line for an open the pair trader refused for cost (loop.ts, journaled `refused`):
  * `enter ID: open refused, nothing signed: <why>[; X was closed, so the desk stays flat]; ID is held out of the entry
  * rules until the hourly check at <ISO> and its hours start again; <risk check>`. Null for any other refusal.
  */
 export function refusedCopy(reason: string): WaitCopy | null {
   const raw = reason.trim();
-  const m = raw.match(/^(enter|rotate) (\S+): (.*?); \2 is held out of the entry rules until the hourly check at (\d{4}-\d\d-\d\dT(\d\d:\d\d)[^ ;]*) and its hours start again(?:;|$)/s);
+  const early = notCarriedOutCopy(raw);
+  if (early !== null) return early;
+  const m =raw.match(/^(enter|rotate) (\S+): (.*?); \2 is held out of the entry rules until the hourly check at (\d{4}-\d\d-\d\dT(\d\d:\d\d)[^ ;]*) and its hours start again(?:;|$)/s);
   if (!m) return null;
   const [, kind, id, inner, , time] = m as unknown as [string, string, string, string, string, string];
   const cost = inner.match(/the expected spread over .*? does not cover the round trip \$?[^;]*|the \S+ book (?:has no two-sided touch|fills only [^;]*)[^;]*round trip cannot be priced/s);
@@ -230,6 +318,10 @@ function whole(raw: string, ctx: WaitContext): Part | null {
       : { text: `${m[1]} is ready at ${m[2]} net, but ${clause}.`, mapped: true };
   }
   if (raw.startsWith('Hold ')) return hold(raw);
+  if (raw.startsWith('one leg open: ')) {
+    const leg = oneLegCopy(raw);
+    return leg === null ? null : { text: leg.text, mapped: true };
+  }
   return flat(raw, ctx);
 }
 

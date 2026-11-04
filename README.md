@@ -75,8 +75,11 @@ that proves the refusal.
   most 2 rotations a day. The pair is the top allowed window; its size is the smallest of the owner's leg size, the
   policy cap less the band, free margin and book depth, in whole lots. Before every enter and rotate the **NEAR AI
   risk check** reads the window's facts and may refuse it (held out for 6 h); it cannot pick a pair, a size or an
-  order, and nothing it returns reaches the contract or a venue. The pair opens maker first on Hyperliquid (post-only),
-  then the other leg as IOC. The loop moves money only with `GIMBAL_TRADE=1` and auto turned on by the owner.
+  order, and nothing it returns reaches the contract or a venue. By default the pair is short Hyperliquid and long
+  Phoenix. With `GIMBAL_ORDERLY_PAIRS=1` (default off) it can be any two of Hyperliquid, Orderly and Phoenix, in the
+  direction the window pays. The pair opens maker first on Hyperliquid (post-only) when Hyperliquid is a leg, then the
+  other leg as IOC; Orderly takes IOCs only. The loop moves money only with `GIMBAL_TRADE=1` and auto turned on by the
+  owner.
 - **Rescue** (`engine/src/rescue/`). When a leg crosses its rescue line, the rescuer pays it from the first source that
   can: the desk's idle USDC on NEAR (`fund_venue`), free margin on the other leg (`sol_sign_rescue` out of Phoenix, or
   `hl_withdraw` and an EIP-3009 transfer out of Hyperliquid), else it cuts both legs reduce-only by the same size. A
@@ -377,8 +380,13 @@ Hyperliquid pays the code's owner 10% of the fees the desk pays.
   liquidation (8 % by default).
 - **Small carries.** Funding spreads on liquid coins are small, and 1Click fees are roughly flat per transfer
   (about 0.3 USDC, plus Hyperliquid's 1 USDC withdrawal fee), so small desks lose a large share of a transfer.
-- **Orderly has no live rescue.** Nothing can move margin into Orderly live yet (the Orderly routes run in replay;
-  Hyperliquid → Orderly is not built), and Orderly is never a rescue source.
+- **Orderly is a trading venue without a live rescue.** Orderly pairs run only with `GIMBAL_ORDERLY_PAIRS=1`
+  (default off); without it the desk trades short Hyperliquid and long Phoenix only. Nothing can move margin into
+  Orderly live yet (the Orderly routes run in replay; Hyperliquid → Orderly is not built), and Orderly is never a
+  rescue source, so an Orderly leg is opened at 1.5x at most. It takes IOC orders only. A pair with an Orderly leg is
+  not rotated out of: it is held until its own exit. Money comes back out of Orderly through the one-shot
+  `GIMBAL_ORDERLY_WITHDRAW` run ([docs/deploy-railway.md](docs/deploy-railway.md#bringing-usdc-back-from-orderly)),
+  which needs every Orderly position flat and no trading loop.
 - **No testnets for part of the path.** Phoenix and 1Click have no testnet, so those run live only on
   mainnet and are replayed elsewhere.
 - **Trust.** Gimbal trusts NEAR's MPC network, the OutLayer oracle, 1Click and the venues themselves.

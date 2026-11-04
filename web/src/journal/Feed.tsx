@@ -2,7 +2,7 @@ import { Fragment, memo, useState } from 'react';
 import type { JournalEntry } from '@gimbal/shared';
 import { signedUsd } from '../desk/format.ts';
 import { Flash } from '../ui/Flash.tsx';
-import { refusedCopy } from '../ui/waitCopy.ts';
+import { oneLegCopy, refusedCopy } from '../ui/waitCopy.ts';
 import { cx } from '../ui/cx.ts';
 import { rowOf, type DayGroup } from './model.ts';
 import { collapseWaits, waitsView } from './waits.ts';
@@ -10,8 +10,9 @@ import { collapseWaits, waitsView } from './waits.ts';
 /** One entry: when, what kind, the engine's one line, the reason, the money, and the links that prove it. */
 const Entry = memo(function Entry({ entry }: { entry: JournalEntry }) {
   const row = rowOf(entry);
-  // An open refused for cost says so in plain words; the engine's line stays under it.
-  const refused = entry.kind === 'refused' ? refusedCopy(entry.summary) : null;
+  // A refused open (cost, the pair's venues, a rotation out of an Orderly leg) and the close of a lone leg say so in
+  // plain words; the engine's line stays under it.
+  const refused = entry.kind === 'refused' ? refusedCopy(entry.summary) : entry.kind === 'error' ? oneLegCopy(entry.summary) : null;
   return (
     <article className="j-evt" data-kind={row.kind}>
       <span className="j-lead">

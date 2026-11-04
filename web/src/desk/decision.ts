@@ -15,7 +15,7 @@ export const ACTION_WORDS: Record<StrategyDecision['action'], string> = {
 
 export interface DecisionLine {
   word: string;
-  /** A wait, off or hold line in plain words (ui/waitCopy.ts); any other action's sentence, and one nothing knows, as sent. */
+  /** A wait, off, hold or exit line in plain words (ui/waitCopy.ts); any other action's sentence, and one nothing knows, as sent. */
   reason: string;
   /** The engine's own sentence, with its numbers, as sent. */
   raw: string;
@@ -27,6 +27,7 @@ export interface DecisionLine {
 export function decisionLine(decision: StrategyDecision | null, now: number, context: WaitContext = {}): DecisionLine | null {
   if (decision === null) return null;
   const raw = decision.reason.trim();
-  const plain = decision.action === 'wait' || decision.action === 'off' || decision.action === 'hold';
+  // An exit line waitCopy does not know (a stop, a flipped spread) comes back as sent.
+  const plain = decision.action === 'wait' || decision.action === 'off' || decision.action === 'hold' || decision.action === 'exit';
   return { word: ACTION_WORDS[decision.action], reason: plain ? waitCopy(raw, context).text : raw, raw, when: ago(decision.at, now) };
 }

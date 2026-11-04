@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { refusedCopy, waitCopy } from './waitCopy.ts';
+import { oneLegCopy, orderlyRotateReason, refusedCopy, waitCopy } from './waitCopy.ts';
 
 // The cost gate (decide.ts: gate `cost`) and the trader's reasons it carries (trade/carry-plan.ts: costRefusal).
 const SPREAD = 'the expected spread over 3 days, $0.30, does not cover the round trip $0.52 (10.4 bps: 4 fills $0.20, slippage $0.12, basis buffer $0.20)';
@@ -91,14 +91,35 @@ test('a hold line nothing knows comes back as sent', () => {
 
 const HANDS = 'No window clears the entry rules; best BONK 14.8 % net: serve opens short hyperliquid, long phoenix only (as pair-mainnet open); bonk-orderly-hyperliquid is long orderly, short hyperliquid';
 
-test('the hands refusal says what the desk can open, and names the closest window', () => {
+const OFF_NOTE = "but the desk can't open it (it is long Orderly / short Hyperliquid, and this engine opens only long Phoenix / short Hyperliquid because Orderly pairs are switched off)";
+
+test('the hands refusal with Orderly pairs off says what the desk can open, and names the closest window', () => {
   const c = waitCopy(HANDS, { minNetAprPct: 5 });
-  assert.equal(
-    c.text,
-    "No window clears your 5 % minimum right now. Closest: BONK, 14.8 % net, but the desk can't open it (it trades long Phoenix / short Hyperliquid only).",
-  );
+  assert.equal(c.text, `No window clears your 5 % minimum right now. Closest: BONK, 14.8 % net, ${OFF_NOTE}.`);
   assert.equal(c.mapped, true);
   assert.equal(c.raw, HANDS);
+});
+
+test('the same refusal for a pair that is not Orderly only names the direction; the id tail is optional', () => {
+  const wrongWay = HANDS.replace('is long orderly, short hyperliquid', 'is long hyperliquid, short phoenix');
+  assert.match(waitCopy(wrongWay, { minNetAprPct: 5 }).text, /but the desk can't open it \(it is long Hyperliquid \/ short Phoenix, and this engine opens only long Phoenix \/ short Hyperliquid\)\.$/);
+  const noTail = 'No window clears the entry rules; best BONK 14.8 % net: serve opens short hyperliquid, long phoenix only (as pair-mainnet open)';
+  assert.match(waitCopy(noTail).text, /but the desk can't open it \(this engine opens only long Phoenix \/ short Hyperliquid pairs\)\.$/);
+});
+
+test('with Orderly pairs on, a window outside the three venues, and the markets both legs list', () => {
+  const venues = 'No window clears the entry rules; best BONK 14.8 % net: serve opens a pair on two of hyperliquid, orderly, phoenix; bonk-lighter-hyperliquid is long lighter, short hyperliquid';
+  const v = waitCopy(venues, { minNetAprPct: 5 });
+  assert.equal(
+    v.text,
+    'No window clears your 5 % minimum right now. Closest: BONK, 14.8 % net, but the desk opens a pair only on two of Hyperliquid, Orderly and Phoenix (this one is long Lighter / short Hyperliquid).',
+  );
+  assert.equal(v.mapped, true);
+  const policy = "No window clears the entry rules; best ZRO 12.0 % net: ZRO is not a market both legs (long orderly, short hyperliquid) list in the desk's policy (BTC, ETH)";
+  assert.equal(
+    waitCopy(policy, { minNetAprPct: 5 }).text,
+    'No window clears your 5 % minimum right now. Closest: ZRO, 12.0 % net, but ZRO is not in your policy on both Orderly and Hyperliquid.',
+  );
 });
 
 test('without the owner’s minimum the sentence does not invent one', () => {
@@ -126,6 +147,15 @@ test('the margin refusal gets one sentence', () => {
     waitCopy(raw, { minNetAprPct: 5 }).text,
     'No window clears your 5 % minimum right now. Closest: DOGE, 9.1 % net, but Phoenix has only $4.20 free margin, too little to open a leg, and the desk does not move margin to open.',
   );
+});
+
+test('the margin refusal names an Orderly leg too', () => {
+  const raw = 'No window clears the entry rules; best DOGE 9.1 % net: $0.00 free margin on Orderly at 2x opens $0.00 a leg in whole lots, under the $5.00 minimum: the loop does not move margin to open';
+  assert.equal(
+    waitCopy(raw, { minNetAprPct: 5 }).text,
+    'No window clears your 5 % minimum right now. Closest: DOGE, 9.1 % net, but Orderly has only $0.00 free margin, too little to open a leg, and the desk does not move margin to open.',
+  );
+  assert.match(waitCopy('XLM 14.2 % net is ready, but $2.00 free margin on Orderly at 3x leaves nothing to open').text, /^XLM is ready at 14\.2 % net, but Orderly has only \$2\.00 free margin/);
 });
 
 test('the cost refusals: the carry does not pay the round trip, or nets under the minimum', () => {
@@ -190,7 +220,7 @@ test('a window ready but not sizable', () => {
 test('cooling down, auto off, trading off, no window, unknown held numbers', () => {
   assert.equal(
     waitCopy(`Cooling down after the exit, 3.2 h left; ${HANDS.replace('No', 'no')}`, { minNetAprPct: 5 }).text,
-    "Cooling down after the last exit, 3.2 h left. No window clears your 5 % minimum right now. Closest: BONK, 14.8 % net, but the desk can't open it (it trades long Phoenix / short Hyperliquid only).",
+    `Cooling down after the last exit, 3.2 h left. No window clears your 5 % minimum right now. Closest: BONK, 14.8 % net, ${OFF_NOTE}.`,
   );
   assert.equal(waitCopy('Auto is off: the engine watches and you act by hand; the desk holds BONK').text, 'Auto is off, so the desk only watches and you act by hand.');
   assert.match(waitCopy('GIMBAL_TRADE is not 1: the engine watches, rescues and journals, and trades nothing').text, /^Trading is switched off on this engine/);
@@ -206,4 +236,66 @@ test('a string nothing knows comes back as sent, trimmed', () => {
   assert.deepEqual(c, { text: 'Hold BONK: 14.8 % net; day 2', raw: 'Hold BONK: 14.8 % net; day 2', mapped: false });
   assert.equal(waitCopy('').text, '');
   assert.equal(waitCopy('Cooling down after the exit, 1.0 h left; something odd').mapped, false);
+});
+
+const NOT_ASKED = 'NEAR AI risk check: not asked (refused before it)';
+const ORDERLY_HELD = "the held XLM pair has an Orderly leg (PERP_XLM_USDC): its close arms the trader's replay watch (Orderly takes a signed copy of an order for up to 300 s), so no other pair could open after it and the rotate would leave the desk flat";
+
+test('a rotation out of a pair with an Orderly leg is refused before the risk check, and says the pair stays', () => {
+  const raw = `rotate xlm-phoenix-orderly -> doge-phoenix-hyperliquid not carried out: ${ORDERLY_HELD}; xlm-phoenix-orderly is kept, nothing closed; ${NOT_ASKED}`;
+  const c = refusedCopy(raw);
+  assert.equal(
+    c?.text,
+    'Rotation from xlm-phoenix-orderly into doge-phoenix-hyperliquid was refused. The held XLM pair has an Orderly leg. Orderly takes a signed copy of an order for up to 5 minutes, so closing the leg blocks every new open for that long, and a rotation would leave the desk flat. The pair exits on its own rules instead. Nothing was closed, and the NEAR AI risk check was not asked.',
+  );
+  assert.equal(c?.raw, raw);
+  // A manual rotate goes through the risk check first: its line ends with the check's own text.
+  const manual = `rotate a -> b not carried out: ${ORDERLY_HELD}; a is kept, nothing closed; NEAR AI passed XLM`;
+  assert.match(refusedCopy(manual)?.text ?? '', /^Rotation from a into b was refused\. .* Nothing was closed\.$/);
+  // Any other reason for a kept pair is left alone.
+  assert.equal(refusedCopy('rotate a -> b not carried out: the stored price is missing; a is kept, nothing closed; NEAR AI passed XLM'), null);
+});
+
+test('the engine’s manual-rotate answer for an Orderly leg reads as sentences', () => {
+  assert.match(orderlyRotateReason(`not rotated: ${ORDERLY_HELD}`) ?? '', /^The held XLM pair has an Orderly leg\. Orderly takes a signed copy/);
+  assert.equal(orderlyRotateReason('the engine is not running yet'), null);
+});
+
+test('an open the hands refuse is journaled before the risk check, in plain words for both flag states', () => {
+  const off = `enter bonk-orderly-hyperliquid not carried out: serve opens short hyperliquid, long phoenix only (as pair-mainnet open); bonk-orderly-hyperliquid is long orderly, short hyperliquid; ${NOT_ASKED}`;
+  assert.equal(
+    refusedCopy(off)?.text,
+    "Opening bonk-orderly-hyperliquid was refused: the desk can't open it (it is long Orderly / short Hyperliquid, and this engine opens only long Phoenix / short Hyperliquid because Orderly pairs are switched off). The NEAR AI risk check was not asked.",
+  );
+  const on = `rotate a-b not carried out: BONK is not a market both legs (long orderly, short phoenix) list in the desk's policy (ETH); ${NOT_ASKED}`;
+  assert.equal(
+    refusedCopy(on)?.text,
+    'Rotation into a-b was refused: BONK is not in your policy on both Orderly and Phoenix. The NEAR AI risk check was not asked.',
+  );
+  assert.equal(refusedCopy(`enter a-b not carried out: the window is not in the last scan; ${NOT_ASKED}`)?.text, 'Opening a-b was refused: it is not in the last scan. The NEAR AI risk check was not asked.');
+  assert.equal(refusedCopy(`enter a-b not carried out: something new; ${NOT_ASKED}`), null);
+});
+
+test('the lone-leg close: closing, failed and tried again, and not closed this check', () => {
+  const closing = oneLegCopy('one leg open: orderly 1.5: closing it, reduce-only');
+  assert.equal(closing?.text, 'Only one leg is open: 1.5 on Orderly. The desk is closing it with a reduce-only order.');
+  assert.equal(
+    oneLegCopy('one leg open: orderly 1.5: closing it, reduce-only; the last close failed, next try at 2026-11-04T10:05:30.000Z')?.text,
+    'Only one leg is open: 1.5 on Orderly. The last close failed, so the desk tries again at 10:05 UTC.',
+  );
+  const failed = 'one leg open: orderly 1.5: the close did not end flat: Orderly rejected the order; tried again in 2 min 40 s';
+  assert.equal(
+    oneLegCopy(failed)?.text,
+    'Only one leg is open: 1.5 on Orderly. The close did not finish: Orderly rejected the order. The desk tries again in 2 min 40 s.',
+  );
+  assert.equal(oneLegCopy(failed)?.raw, failed);
+  assert.equal(
+    oneLegCopy('one leg open: phoenix 3: not closed this check, a rescue is running')?.text,
+    'Only one leg is open: 3 on Phoenix. It was not closed this check: a rescue is running.',
+  );
+  assert.equal(oneLegCopy('one leg open: phoenix 3: something new'), null);
+  assert.equal(oneLegCopy('Hold XLM: x; day 1 of 7'), null);
+  // The Desk line (an exit decision) goes through waitCopy.
+  assert.equal(waitCopy('one leg open: orderly 1.5: closing it, reduce-only').text, closing?.text);
+  assert.equal(waitCopy('one leg open: orderly 1.5: closing it, reduce-only').mapped, true);
 });
