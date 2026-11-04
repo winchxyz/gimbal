@@ -90,7 +90,7 @@ import { retryingRescue } from '../rescue/rescue-retry.ts';
 import { VenueHealth, probeIntents } from '../risk/venue-health.ts';
 import { ALERT_DISTANCE_PCT, LiquidationAlert, MONITOR_EVERY_MS, monitorLines } from '../risk/monitor.ts';
 import type { ServePair } from './serve-pair.ts';
-import { liveLines, servePair } from './serve-pair.ts';
+import { liveLines, pairRefreshesAtOpen, servePair } from './serve-pair.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { connectContract, contractEnv, marginVenues } from './serve-contract.ts';
 import { loopBook, serveLoop } from './serve-loop.ts';
@@ -231,9 +231,10 @@ const scanner = new Scanner(readers.venues, readers.watch, {
   strategy: () => server?.strategy ?? DEFAULT_STRATEGY,
   onNote: (note) => noteOnce(note),
   held: () => loop?.heldWindow() ?? null,
-  // A trading pair (mainnet, GIMBAL_TRADE=1, the loop's hands) refreshes a missing or stale stored price at open:
-  // its windows show that as a note, not E_ORACLE_STALE. Every other serve keeps the contract's verdict.
-  oracleRefreshAtOpen: () => pair?.hands !== undefined,
+  // A pair that can open now (mainnet, GIMBAL_TRADE=1, the start confirmed, live, not stopping; PairHands.canOpen)
+  // refreshes a missing or stale stored price at open: its windows show that as a note, not E_ORACLE_STALE. Every
+  // other serve, and this one while it cannot open, keeps the contract's verdict.
+  oracleRefreshAtOpen: () => pairRefreshesAtOpen(pair),
 });
 let loop: StrategyLoop | null = null;
 

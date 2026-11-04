@@ -1,18 +1,20 @@
 // The open's order-time size check (contract S2): the qty decide() sized is a maximum, held to max_notional at the
 // highest price an order of the open may carry; it is only ever lowered, to whole common lots, the same on both legs.
 // And the open's gate (review F2): a rescue that starts after the loop's gate stops the open before its next part.
-// And the open's plan on a contract with no stored price: a real open refreshes it once before the refusals.
+// And the open's plan on a stored price that is missing or too old: every refusal is judged first (planOpen is
+// read-only), and a real open then refreshes it once (refreshForOpen), enough for the first part at SERVE_MAKER.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { VenueId } from '@gimbal/shared';
-import type { LegOutcome, LegSide, TradeLeg } from '../trade/legs.ts';
+import type { LegOutcome, LegSide, MakerSettings, TradeLeg } from '../trade/legs.ts';
 import { floorToLot, toQty } from '../trade/lots.ts';
 import { PairTrader } from '../trade/pair.ts';
 import type { PriceDeps } from './pair-mainnet-lib.ts';
-import { PRICE_MARGIN_S, newPriceState, oraclePxOf } from './pair-mainnet-lib.ts';
-import type { OpenPlan, OpsCtx, Pair } from './pair-ops.ts';
-import { MIN_ORDER_USD, capQtyAtOrder, planOpen, sendOpen, storedPrice } from './pair-ops.ts';
+import { OPEN_HEADROOM_S, PRICE_MARGIN_S, newPriceState, oraclePxOf } from './pair-mainnet-lib.ts';
+import type { OpenPlan, OpenRequest, OpsCtx, Pair } from './pair-ops.ts';
+import { MIN_ORDER_USD, capQtyAtOrder, planOpen, recheckOpenSize, refreshForOpen, sendOpen, storedPrice } from './pair-ops.ts';
+import { SERVE_MAKER } from './serve-pair.ts';
 
 const LOT = toQty('0.01');
 
@@ -119,16 +121,32 @@ test('F2: a rescue already running when the open reaches its first order: nothin
   assert.deepEqual(all.map((r) => r.status), ['open', 'open']);
 });
 
-// ---- the open's plan on a contract with no stored price (refresh_prices never called) ----
+// ---- the open's plan on a stored price that is missing or too old: judged first, refreshed once after ----
+
+interface PlanWorldOptions {
+  send: boolean;
+  symbol?: string;
+  row?: { ageS: number; px: number };
+  refreshFails?: string;
+  /** The age (s) refresh_prices leaves the price at: the oracle's 600 s recency plus its lag. Default 610. */
+  refreshedAgeS?: number;
+  maker?: MakerSettings;
+  desk?: { paused?: boolean; closing?: boolean };
+  lamports?: number;
+  simErr?: unknown;
+  /** activeAssetData's margin mode and the openOrders answer the venues give (withVenues). */
+  marginMode?: string;
+  resting?: unknown[];
+}
 
 /**
- * planOpen on fakes that pass every refusal but the price: the contract's prices() answers what is stored (`row`, or
- * nothing), and refresh_prices writes a row 610 s old (the oracle's 600 s recency) unless `refreshFails`. The legs
- * read the stored price as buildPair's do (oraclePxOf while planning: the price as it is), so the cap and band checks
- * see what is stored when they run.
+ * planOpen on fakes that pass every refusal but the ones `o` asks for: the contract's prices() answers what is stored
+ * (`row`, or nothing), and refresh_prices writes a row `refreshedAgeS` old at 2600 unless `refreshFails`. The books
+ * are 2499 / 2501 (mid 2500). The legs read the stored price as buildPair's do (oraclePxOf: while planning, as it is,
+ * or the estimate where none is stored), so the cap and band checks see what is there when they run.
  */
-function planWorld(o: { send: boolean; row?: { ageS: number; px: number }; refreshFails?: string }) {
-  const sym = 'ETH';
+function planWorld(o: PlanWorldOptions) {
+  const sym = o.symbol ?? 'ETH';
   const policy = {
     max_notional_usd: 100, price_band_bps: 100, oracle_max_age_s: 900, unpriced: [], unpriced_max_notional_usd: 0,
     hl_assets: [{ symbol: sym, index: 1, sz_decimals: 4 }], phoenix_markets: [{ symbol: sym }],
@@ -143,7 +161,7 @@ function planWorld(o: { send: boolean; row?: { ageS: number; px: number }; refre
     refresh: async (s, maxAgeS) => {
       refreshes.push(`${s} ${maxAgeS}`);
       if (o.refreshFails !== undefined) throw new Error(o.refreshFails);
-      rows.splice(0, rows.length, { asset: s, price_e8: String(2500 * 1e8), at_ms: Date.now() - 610_000 });
+      rows.splice(0, rows.length, { asset: s, price_e8: String(2600 * 1e8), at_ms: Date.now() - (o.refreshedAgeS ?? 610) * 1000 });
       return [{ chain: 'near', id: 'R', url: 'https://nearblocks.io/txns/R' }];
     },
     now: () => Date.now(), log: (l) => logs.push(l), ...newPriceState(),
@@ -151,7 +169,7 @@ function planWorld(o: { send: boolean; row?: { ageS: number; px: number }; refre
   const said: string[] = [];
   const book = async () => ({ bids: [{ px: 2499 }], asks: [{ px: 2501 }] });
   const ctx = {
-    client, config: { fees: {} }, desk: { policy, paused: false, closing: false, evm_address: '0xDESK' },
+    client, config: { fees: {} }, desk: { policy, paused: o.desk?.paused ?? false, closing: o.desk?.closing ?? false, evm_address: '0xDESK' },
     hlUrl: 'http://hl.plan.test', phoenixUrl: 'http://phoenix.plan.test',
     hl: {
       funding: async () => [{ symbol: sym, ratePerHour: 0.0002 }], marketFundingHistory: async () => [],
@@ -161,7 +179,7 @@ function planWorld(o: { send: boolean; row?: { ageS: number; px: number }; refre
       funding: async () => [{ symbol: sym, ratePerHour: 0 }], marketFundingHistory: async () => [], book,
       account: async () => ({ cross: { equityUsd: 100, maintenanceMarginUsd: 0 }, positions: [] }),
     },
-    chain: { balance: async () => 1_000_000_000, simulate: async () => ({ err: null, unitsConsumed: 200_000, logs: [] }) },
+    chain: { balance: async () => o.lamports ?? 1_000_000_000, simulate: async () => ({ err: o.simErr ?? null, unitsConsumed: 200_000, logs: [] }) },
     sol: { authority: 'AUTH' }, relayer: null, prices, send: o.send, trading: false,
     say: (l = '') => said.push(l), open: (l: string) => said.push(`open: ${l}`),
   } as unknown as OpsCtx;
@@ -171,7 +189,7 @@ function planWorld(o: { send: boolean; row?: { ageS: number; px: number }; refre
   const lot = toQty('0.001');
   const pair = {
     symbol: sym, lot, bandBps: policy.price_band_bps, priced: true, mismatches: [], microLamports: 1, targetNet: null,
-    maker: { timeoutMs: 60_000, repriceMs: 30_000, maxOrders: 6, takerFallback: false },
+    maker: o.maker ?? { timeoutMs: 60_000, repriceMs: 30_000, maxOrders: 6, takerFallback: false },
     marketConfig: { takerFee: 0.0002, leverageTiers: [{ maxLeverage: 10, maxSizeBaseLots: '1000000' }], riskFactors: { maintenance: 50 } },
     trader: {
       openChunk: async () => {
@@ -190,19 +208,24 @@ function planWorld(o: { send: boolean; row?: { ageS: number; px: number }; refre
       message: async () => ({ message: new Uint8Array(0) }),
     },
   } as unknown as Pair;
-  return { ctx, pair, refreshes, logs, said, seen, request: { symbol: sym, legUsd: 50, leverage: 2, holdDays: 7, basisBps: 10 } };
+  /** The stored row `s` seconds older: time passing. */
+  const age = (s: number) => {
+    for (const r of rows) r.at_ms -= s * 1000;
+  };
+  const request: OpenRequest = { symbol: sym, legUsd: 50, leverage: 2, holdDays: 7, basisBps: 10 };
+  return { ctx, pair, refreshes, logs, said, seen, prices, age, request };
 }
 
 /** The Hyperliquid /info and Phoenix trader-state answers of a desk that may open (cross margin, no resting orders). */
-async function withVenues<T>(run: () => Promise<T>): Promise<T> {
+async function withVenues<T>(run: () => Promise<T>, o: Pick<PlanWorldOptions, 'marginMode' | 'resting'> = {}): Promise<T> {
   const real = globalThis.fetch;
   const json = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
     if (String(input).startsWith('http://phoenix.plan.test')) return json({ slot: 1, snapshot: { capabilities: { state: 'active' }, subaccounts: [] } });
     const body = JSON.parse(String(init?.body)) as { type: string };
     if (body.type === 'clearinghouseState') return json({ crossMarginSummary: { accountValue: '100' }, crossMaintenanceMarginUsed: '0', assetPositions: [] });
-    if (body.type === 'activeAssetData') return json({ leverage: { type: 'cross', value: 5 } });
-    if (body.type === 'openOrders') return json([]);
+    if (body.type === 'activeAssetData') return json({ leverage: { type: o.marginMode ?? 'cross', value: 5 } });
+    if (body.type === 'openOrders') return json(o.resting ?? []);
     return new Response('{}', { status: 404 });
   }) as typeof fetch;
   try {
@@ -212,55 +235,143 @@ async function withVenues<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
-test('no stored price, a real open: one refresh_prices before the refusals, then the plan passes on the refreshed price', async () => {
+test('no stored price, a real open: planned on the books\' mid with nothing sent, then one refresh_prices after the checks', async () => {
   const w = planWorld({ send: true });
   const plan = await withVenues(() => planOpen(w.ctx, w.pair, w.request));
   assert.deepEqual(plan.refusals, []);
+  assert.deepEqual(w.refreshes, [], 'planOpen is read-only');
+  assert.deepEqual(w.seen, [2500, 2500], 'the cap (openChunk) and the IOC band priced on the books\' mid');
+  assert.equal(w.prices.estimate?.has('ETH') ?? false, false, 'the estimate is gone once planned');
+  assert.deepEqual(plan.refresh, { marginS: 60 + PRICE_MARGIN_S, was: 'missing' });
+  assert.match(w.said.join('\n'), /stored ETH none \(planned on the books' mid 2500\.0000\); the open refreshes it once every check above passed/);
+  const fresh = await refreshForOpen(w.ctx, plan);
   // The first part's margin (the maker timeout plus the IOC's 120 s): sendOpen's beforePart then finds it fresh.
   assert.deepEqual(w.refreshes, [`ETH ${900 - (60 + PRICE_MARGIN_S)}`]);
-  assert.deepEqual(w.seen, [2500, 2500], 'the cap (openChunk) and the IOC band priced with the refreshed price');
-  assert.equal(plan.size, toQty('0.02'));
-  assert.match(w.said.join('\n'), /stored ETH 2500, 610 s old \(refreshed for this open\)/);
+  assert.deepEqual(fresh, { refused: null, paid: true, line: 'price     stored ETH 2600, 610 s old (refreshed for this open): it lives 110 s past the first part\'s 180 s' });
   assert.match(w.logs.join('\n'), /the stored ETH price is missing: refresh_prices/);
-  // Planned again at once: the price is fresh now, nothing more is sent.
-  await withVenues(() => planOpen(w.ctx, w.pair, w.request));
+  // Asked again at once: the price is fresh now, nothing more is sent.
+  assert.deepEqual(await refreshForOpen(w.ctx, plan), { refused: null, paid: false, line: 'price     stored ETH 2600, 610 s old: it lives 110 s past the first part\'s 180 s' });
   assert.equal(w.refreshes.length, 1);
 });
 
-test('a stored price too old to plan with is refreshed once at a real open; a fresh one is not', async () => {
+test('a stored price too old to plan with: planned on as it is, refreshed once after the checks; a fresh one is not', async () => {
   const old = planWorld({ send: true, row: { ageS: 5 * 86_400, px: 1800 } });
   const plan = await withVenues(() => planOpen(old.ctx, old.pair, old.request));
   assert.deepEqual(plan.refusals, []);
+  assert.deepEqual(old.refreshes, []);
+  assert.deepEqual(old.seen, [1800, 1800], 'judged on the stored price as it is');
+  assert.equal(plan.refresh?.was, `${5 * 86_400} s old`);
+  assert.equal((await refreshForOpen(old.ctx, plan)).paid, true);
   assert.equal(old.refreshes.length, 1);
-  assert.deepEqual(old.seen, [2500, 2500], 'the cap and band are held to the refreshed price, not the 5-day-old one');
 
   const fresh = planWorld({ send: true, row: { ageS: 610, px: 2500 } });
-  assert.deepEqual((await withVenues(() => planOpen(fresh.ctx, fresh.pair, fresh.request))).refusals, []);
+  const freshPlan = await withVenues(() => planOpen(fresh.ctx, fresh.pair, fresh.request));
+  assert.deepEqual(freshPlan.refusals, []);
+  assert.equal(freshPlan.refresh, null);
+  assert.deepEqual(await refreshForOpen(fresh.ctx, freshPlan), { refused: null, paid: false, line: null });
   assert.deepEqual(fresh.refreshes, []);
 });
 
-test('no stored price, a dry run: read-only, the missing price is a refusal, nothing is refreshed', async () => {
+test('no stored price, a dry run: read-only, the missing price is a refusal, every other check still runs on the mid', async () => {
   const w = planWorld({ send: false });
   const plan = await withVenues(() => planOpen(w.ctx, w.pair, w.request));
-  assert.deepEqual(w.refreshes, []);
-  assert.ok(plan.refusals.includes('the contract has no stored ETH price'), plan.refusals.join('; '));
+  assert.deepEqual(plan.refusals, ['the contract has no stored ETH price']);
+  assert.deepEqual(w.seen, [2500, 2500]);
+  assert.equal(plan.refresh, null);
   assert.match(w.said.join('\n'), /stored ETH none/);
+  assert.equal((await refreshForOpen(w.ctx, plan)).paid, false);
+  assert.deepEqual(w.refreshes, []);
+  // Stale but stored: a dry run plans on it and says --send would refresh it; nothing is sent.
+  const stale = planWorld({ send: false, row: { ageS: 800, px: 2500 } });
+  const stalePlan = await withVenues(() => planOpen(stale.ctx, stale.pair, stale.request));
+  assert.deepEqual(stalePlan.refusals, []);
+  assert.match(stale.said.join('\n'), /--send refreshes it once its checks pass/);
+  assert.deepEqual(await refreshForOpen(stale.ctx, stalePlan), { refused: 'the stored ETH price is 800 s old: a dry run does not refresh it', paid: false, line: null });
+  assert.deepEqual(stale.refreshes, []);
 });
 
-test('no stored price, a real open whose refresh fails: a refusal with the reason, never a throw', async () => {
+test('no stored price, a real open whose refresh fails: a refusal with the reason, paid, never a throw', async () => {
   const w = planWorld({ send: true, refreshFails: 'near rpc: HTTP 503' });
   const plan = await withVenues(() => planOpen(w.ctx, w.pair, w.request));
+  assert.deepEqual(plan.refusals, []);
+  const fresh = await refreshForOpen(w.ctx, plan);
   assert.equal(w.refreshes.length, 1);
-  assert.ok(plan.refusals.includes('the stored ETH price could not be refreshed before the open: near rpc: HTTP 503'), plan.refusals.join('; '));
-  assert.equal(plan.refusals.includes('the contract has no stored ETH price'), false, 'one refusal for the price, with its reason');
-  await assert.rejects(sendOpen(w.ctx, w.pair, plan), /open refused, nothing signed/);
+  assert.deepEqual(fresh, { refused: 'the stored ETH price (missing) could not be refreshed before the open: near rpc: HTTP 503', paid: true, line: null });
 });
 
-test('a real open already refused for something else sends no refresh_prices', async () => {
-  const w = planWorld({ send: true });
-  (w.ctx.desk as { paused: boolean }).paused = true;
+test('a real open already refused for anything else sends no refresh_prices: paused, closing, margin, resting, SOL, minimum, cap, IOC', async () => {
+  const cases: { name: string; o: Partial<PlanWorldOptions>; legUsd?: number; qty?: string; match: RegExp }[] = [
+    { name: 'paused', o: { desk: { paused: true } }, match: /the desk is paused/ },
+    { name: 'closing', o: { desk: { closing: true } }, match: /the desk is closing \(panic_close\)/ },
+    { name: 'margin', o: { marginMode: 'isolated' }, match: /margin mode: only cross is planned/ },
+    { name: 'resting', o: { resting: [{ coin: 'ETH', side: 'A', sz: '0.01', oid: 7 }] }, match: /resting ETH order/ },
+    { name: 'SOL', o: { lamports: 1000 }, match: /the desk authority holds/ },
+    { name: 'minimum', o: {}, qty: '0.002', match: /under Hyperliquid's 10 USD order minimum/ },
+    { name: 'cap', o: {}, legUsd: 150, match: /is over .*, the policy's 100 USD cap/ },
+    { name: 'IOC', o: { simErr: { InstructionError: [0, 'Custom'] } }, match: /the Phoenix IOC fails in simulation/ },
+  ];
+  for (const c of cases) {
+    const w = planWorld({ send: true, ...c.o });
+    const request = { ...w.request, ...(c.legUsd === undefined ? {} : { legUsd: c.legUsd }), ...(c.qty === undefined ? {} : { qty: c.qty }) };
+    const plan = await withVenues(() => planOpen(w.ctx, w.pair, request), c.o);
+    assert.ok(plan.refusals.some((r) => c.match.test(r)), `${c.name}: ${plan.refusals.join('; ')}`);
+    assert.notEqual(plan.refresh, null, `${c.name}: the price would need a refresh`);
+    const fresh = await refreshForOpen(w.ctx, plan);
+    assert.equal(fresh.paid, false, c.name);
+    assert.match(fresh.refused ?? '', /^refused already, so the stored ETH price \(missing\) is not refreshed/, c.name);
+    assert.deepEqual(w.refreshes, [], `${c.name}: nothing refreshed`);
+    await assert.rejects(sendOpen(w.ctx, w.pair, plan), /open refused, nothing signed/);
+  }
+});
+
+test('a symbol refresh_prices cannot price: a missing price keeps the old refusal, a stale one is refused, nothing refreshed', async () => {
+  const missing = planWorld({ send: true, symbol: 'AVAX' });
+  const plan = await withVenues(() => planOpen(missing.ctx, missing.pair, missing.request));
+  assert.deepEqual(plan.refusals, ['the contract has no stored AVAX price']);
+  assert.equal(plan.refresh, null);
+  const stale = planWorld({ send: true, symbol: 'AVAX', row: { ageS: 2000, px: 20 } });
+  const stalePlan = await withVenues(() => planOpen(stale.ctx, stale.pair, stale.request));
+  assert.ok(stalePlan.refusals.includes('the stored AVAX price is 2000 s old and refresh_prices cannot refresh it (AVAX is not one of the contract\'s oracle assets)'), stalePlan.refusals.join('; '));
+  assert.equal((await refreshForOpen(missing.ctx, plan)).paid, false);
+  assert.equal((await refreshForOpen(stale.ctx, stalePlan)).paid, false);
+  assert.deepEqual([...missing.refreshes, ...stale.refreshes], []);
+});
+
+test('SERVE_MAKER: one refresh lives through the size check and the first part, 20 s later, with no second refresh', async () => {
+  const w = planWorld({ send: true, maker: SERVE_MAKER, refreshedAgeS: 610 });
+  const plan = await withVenues(() => planOpen(w.ctx, w.pair, { ...w.request, qty: '0.02' }));
+  assert.deepEqual(plan.refusals, []);
+  assert.equal(SERVE_MAKER.timeoutMs / 1000 + PRICE_MARGIN_S, 240);
+  const fresh = await refreshForOpen(w.ctx, plan);
+  assert.deepEqual([fresh.refused, fresh.paid], [null, true]);
+  assert.match(fresh.line ?? '', /lives 50 s past the first part's 240 s/);
+  w.age(10);                                         // the size held to the cap, the gate
+  const held = await recheckOpenSize(w.ctx, w.pair, plan.size, 50);
+  assert.ok(!('refused' in held), 'refused' in held ? held.refused : '');
+  w.age(10);                                         // both legs read, the builder fee checked
+  let beforeParts = 0;
+  const pair = {
+    ...w.pair, hl: { position: async () => 0n, pendingMakerOrders: () => [] }, phoenix: { ...(w.pair.phoenix as object), position: async () => 0n },
+    trader: { unhedged: null, unsettled: () => null, legs: [] },
+    run: {
+      openInChunks: async (r: { beforePart?: (part: number, parts: number) => Promise<void> }) => {
+        await r.beforePart?.(0, 1);
+        beforeParts++;
+        return [];
+      },
+      stopOnFinish: false,
+    },
+  } as unknown as Pair;
+  await sendOpen(w.ctx, pair, plan);
+  assert.equal(beforeParts, 1);
+  assert.deepEqual(w.refreshes, [`ETH ${900 - 240}`], 'one refresh_prices for the whole open');
+  assert.equal(w.logs.some((l) => l.includes('not sent again')), false, 'no second refresh was needed');
+});
+
+test('SERVE_MAKER: a refresh that leaves the price under the open\'s headroom is refused (paid), before anything is sent', async () => {
+  const w = planWorld({ send: true, maker: SERVE_MAKER, refreshedAgeS: 650 });
   const plan = await withVenues(() => planOpen(w.ctx, w.pair, w.request));
-  assert.deepEqual(w.refreshes, []);
-  assert.ok(plan.refusals.includes('the desk is paused: no open is signed'));
-  assert.ok(plan.refusals.includes('the contract has no stored ETH price'));
+  const fresh = await refreshForOpen(w.ctx, plan);
+  assert.equal(fresh.paid, true);
+  assert.equal(fresh.refused, `the stored ETH price is 650 s old after refresh_prices: it lives 10 s past the first part's 240 s, under the ${OPEN_HEADROOM_S} s the open needs before it; nothing sent`);
 });

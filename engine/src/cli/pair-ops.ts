@@ -10,6 +10,7 @@
 
 import type { ContractPolicy, TxRef } from '@gimbal/shared';
 import type { ContractConfigView, NearContractClient } from '../contract/near-client.ts';
+import { oraclePriced } from '../contract/oracle-assets.ts';
 import type { DeskView } from '../contract/types.ts';
 import type { SolanaChain } from '../relayer/phoenix-money.ts';
 import { SYSTEM_ACCOUNT_RENT_LAMPORTS, solText, txCostLamports } from '../relayer/phoenix-money.ts';
@@ -31,7 +32,7 @@ import type { PhoenixReader } from '../venues/phoenix.ts';
 import { phoenixGet } from '../venues/phoenix.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { PriceDeps, StoredPrice } from './pair-mainnet-lib.ts';
-import { PRICE_MARGIN_S, UsageError, ensureFresh, hlCross, oraclePxOf, phoenixCross, priceFitRefusal, priceLifeS, restingOrdersRefusal, settleResidual } from './pair-mainnet-lib.ts';
+import { OPEN_HEADROOM_S, PRICE_MARGIN_S, UsageError, ensureFresh, hlCross, oraclePxOf, phoenixCross, priceFitRefusal, priceLifeS, restingOrdersRefusal, settleResidual } from './pair-mainnet-lib.ts';
 
 /** Phoenix orders one pair part may take: the open, its retry, and two unwind orders. */
 export const ORDERS_PER_PART = 4;
@@ -56,7 +57,8 @@ export interface OpsCtx {
   send: boolean;
   /**
    * Set once an --send open or close has passed its refusals: only then may a leg's price read send refresh_prices.
-   * The one exception is planOpen's own refresh, at --send, of a stored price that is missing or too old to plan with.
+   * The one exception is refreshForOpen's, at --send after planOpen's refusals passed, of a stored price that is
+   * missing or too old for the first part.
    */
   trading: boolean;
   say(line?: string): void;
@@ -308,11 +310,19 @@ export interface OpenPlan {
   refusals: string[];
   size: bigint;
   carry: CarryPlan;
+  /**
+   * The stored price this open must refresh before its first order (refreshForOpen, a real open only, after every
+   * refusal passed): missing, or too old to live the first part's margin. null: none needed (or an unpriced symbol).
+   */
+  refresh: { marginS: number; was: string } | null;
 }
 
 /**
  * Everything an open checks before anything is signed, printed (the window, the carry, the size, the leverage, the
- * stored price, the SOL, the simulated Phoenix IOC, the maker plan); the refusals are returned, not thrown.
+ * stored price, the SOL, the simulated Phoenix IOC, the maker plan); the refusals are returned, not thrown. Read-only:
+ * it never sends refresh_prices. A stored price that is missing or too old to plan with is planned on as it is (a
+ * missing one on the books' mid), so every other refusal is judged first; a real open then refreshes it once, through
+ * refreshForOpen, only when nothing refused.
  */
 export async function planOpen(ctx: OpsCtx, pair: Pair, request: OpenRequest): Promise<OpenPlan> {
   const { symbol, legUsd, leverage, holdDays, basisBps } = request;
@@ -331,6 +341,8 @@ export async function planOpen(ctx: OpsCtx, pair: Pair, request: OpenRequest): P
   const pxAccount = registered ? await ctx.phoenix.account(ctx.sol.authority) : null;
   if (!registered) refusals.push(`the desk's Phoenix trader is not registered (${state ?? 'unknown'}): run the Phoenix registration (sol_sign_register), then fund-phoenix`);
   if (ctx.desk.paused) refusals.push('the desk is paused: no open is signed');
+  // The trader refuses an open on a closing desk too (buildPair's openBlocked); here it is judged with the rest.
+  if (ctx.desk.closing === true) refusals.push('the desk is closing (panic_close)');
   // The cap is valued at max(limit, oracle), and the limit may be up to the band from the stored price.
   const legCap = policy.max_notional_usd * (1 - policy.price_band_bps / 10_000);
   if (legUsd > legCap + 1e-9) refusals.push(`legUsd ${usd(legUsd)} is over ${usd(legCap)}, the policy's ${policy.max_notional_usd} USD cap less the ${policy.price_band_bps} bps band`);
@@ -376,49 +388,101 @@ export async function planOpen(ctx: OpsCtx, pair: Pair, request: OpenRequest): P
   const plan = carryPlan({ symbol, legUsd, leverage, holdDays, basisBufferBps: basisBps, short, long });
   refusals.push(...plan.refusals);
 
-  // A real open (--send, or serve trading) on a priced symbol whose stored price is missing (a contract that never had
-  // refresh_prices) or would not live the first part sends one refresh_prices here, through ensureFresh (shared with any
-  // refresh in flight, none within 30 s of the last), so the cap and band checks below run on the refreshed price.
-  // Only when nothing above refused it already: a refused open spends no gas. A dry run stays read-only.
-  let sp = spRead;
-  let refreshed = false;
-  let refreshFailed: string | null = null;
+  // The stored price. One missing (a contract that never had refresh_prices) or too old to live the first part is not
+  // refreshed here: the cap, the minimum and the IOC below are judged on it as it is (a missing one on the books' mid),
+  // and a real open refreshes it after, through refreshForOpen, only when nothing refused. refresh_prices refreshes
+  // the contract's oracle assets only: another symbol's price cannot be refreshed, so it is refused here.
+  const sp = spRead;
   const marginS = pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S;
-  if (ctx.send && pair.priced && refusals.length === 0 && ctx.desk.closing !== true && (sp === null || sp.ageS > ctx.prices.maxAgeS - marginS)) {
-    try {
-      sp = await ensureFresh(ctx.prices, symbol, marginS);
-      refreshed = true;
-    } catch (err) {
-      refreshFailed = errorMessage(err);
+  const was = sp === null ? 'missing' : `${Math.round(sp.ageS)} s old`;
+  let refresh: OpenPlan['refresh'] = null;
+  if (pair.priced && (sp === null || sp.ageS > ctx.prices.maxAgeS - marginS)) {
+    if (!oraclePriced(symbol)) {
+      refusals.push(sp === null
+        ? `the contract has no stored ${symbol} price`
+        : `the stored ${symbol} price is ${was} and refresh_prices cannot refresh it (${symbol} is not one of the contract's oracle assets)`);
+    } else if (!ctx.send && sp === null) {
+      refusals.push(`the contract has no stored ${symbol} price`);
+    } else {
+      refresh = { marginS, was };
     }
   }
+  const estimated = pair.priced && sp === null && mid > 0;
+  if (estimated) (ctx.prices.estimate ??= new Map()).set(symbol, mid);
 
   let chunk: bigint | null = null;
+  let sim: { lines: string[]; refusals: string[] } = { lines: ['ioc sim   no part to simulate'], refusals: [] };
+  let parts = 0;
   try {
-    chunk = await pair.trader.openChunk(1);
-  } catch (err) {
-    refusals.push(`no pair fits the policy cap: ${errorMessage(err)}`);
+    try {
+      chunk = await pair.trader.openChunk(1);
+    } catch (err) {
+      refusals.push(`no pair fits the policy cap: ${errorMessage(err)}`);
+    }
+    parts = chunk === null || size === 0n ? 0 : Number((size + chunk - 1n) / chunk);
+    const first = chunk === null || size === 0n ? null : size < chunk ? size : chunk;
+    if (first !== null && qtyNumber(first) * hlAsk < 10) refusals.push(`a pair part of ${qtyString(first)} ${symbol} is under Hyperliquid's 10 USD order minimum`);
+    if (first !== null) sim = await simulateIoc(ctx, pair, first);
+  } finally {
+    if (estimated) ctx.prices.estimate?.delete(symbol);
   }
-  const parts = chunk === null || size === 0n ? 0 : Number((size + chunk - 1n) / chunk);
-  const first = chunk === null || size === 0n ? null : size < chunk ? size : chunk;
-  if (first !== null && qtyNumber(first) * hlAsk < 10) refusals.push(`a pair part of ${qtyString(first)} ${symbol} is under Hyperliquid's 10 USD order minimum`);
   const orderTx = txCostLamports({ units: ORDER_COMPUTE_UNITS, microLamports: pair.microLamports });
   const solNeed = Math.max(1, parts) * ORDERS_PER_PART * orderTx + SYSTEM_ACCOUNT_RENT_LAMPORTS;
   if (lamports < solNeed) refusals.push(`the desk authority holds ${solText(lamports)}; ${Math.max(1, parts)} pair part(s) need up to ${solText(solNeed)} for Phoenix fees and the rent-exempt reserve: send ${solText(solNeed - lamports)} to ${ctx.sol.authority}`);
-  if (refreshFailed !== null) refusals.push(`the stored ${symbol} price could not be refreshed before the open: ${refreshFailed}`);
-  else if (sp === null && pair.priced) refusals.push(`the contract has no stored ${symbol} price`);
-  const sim = first === null ? { lines: ['ioc sim   no part to simulate'], refusals: [] } : await simulateIoc(ctx, pair, first);
   refusals.push(...sim.refusals);
 
   printCarry(ctx, symbol, legUsd, leverage, holdDays, plan, short, long, { hlBid, hlAsk, pxBid, pxAsk });
   ctx.say(`size      ${qtyString(size)} ${symbol} per leg (${usd(qtyNumber(size) * mid)} at ${mid.toFixed(4)}); common lot ${qtyString(pair.lot)}`);
   ctx.say(`          ${parts} pair part(s) of at most ${chunk === null ? '?' : qtyString(chunk)} (policy max_notional_usd ${policy.max_notional_usd} less the ${pair.bandBps} bps band)`);
   ctx.say(`leverage  Hyperliquid ${symbol}: ${assetData?.leverage === undefined ? 'unknown' : `${assetData.leverage.type} ${assetData.leverage.value}x`} on the account (the contract cannot set it); effective leverage is what is checked`);
-  ctx.say(`price     stored ${symbol} ${sp === null ? 'none' : `${sp.px}, ${Math.round(sp.ageS)} s old${refreshed ? ' (refreshed for this open)' : ''}`}; --send refreshes it before each part when it would not live ${pair.maker.timeoutMs / 1000 + PRICE_MARGIN_S} s more (a fresh one lives ${priceLifeS(policy.oracle_max_age_s)} s of the ${policy.oracle_max_age_s})`);
+  ctx.say(`price     stored ${symbol} ${sp === null ? 'none' : `${sp.px}, ${Math.round(sp.ageS)} s old`}${estimated ? ` (planned on the books' mid ${mid.toFixed(4)})` : ''}${refresh === null ? '' : `; ${ctx.send ? 'the open refreshes it once every check above passed' : '--send refreshes it once its checks pass'}`}; --send refreshes it before each part when it would not live ${marginS} s more (a fresh one lives ${priceLifeS(policy.oracle_max_age_s)} s of the ${policy.oracle_max_age_s})`);
   ctx.say(`solana    authority ${solText(lamports)}; up to ${solText(solNeed)} needed (unit price ${pair.microLamports} µlamports)`);
   for (const l of sim.lines) ctx.say(l);
   ctx.say(`order     maker first: Hyperliquid SELL post-only at the ask, repriced every ${pair.maker.repriceMs / 1000} s, at most ${pair.maker.maxOrders} signed post-only orders for the whole open (the C10 meter counts each), for ${pair.maker.timeoutMs / 1000} s${pair.maker.takerFallback ? ', then an IOC for the rest' : ', no taker fallback (--taker-fallback to add one)'}; then Phoenix BUY IOC for what filled`);
-  return { request, refusals, size, carry: plan };
+  return { request, refusals, size, carry: plan, refresh };
+}
+
+/** What refreshForOpen did: `refused` why the open must not be sent (null: it may); `paid` a refresh_prices was sent. */
+export interface OpenRefresh {
+  refused: string | null;
+  paid: boolean;
+  /** The price line to print, when it read one. */
+  line: string | null;
+}
+
+/**
+ * The one refresh_prices of a real open whose plan needs it (OpenPlan.refresh), sent only after every refusal passed
+ * (the plan's, and the caller's own before it: serve's price fit and gate): a refused open never pays for one. Through
+ * ensureFresh at the first part's margin (shared with a refresh in flight, none within MIN_REFRESH_GAP_S of the last),
+ * then held to OPEN_HEADROOM_S more, so the size check and the first part's own check find it fresh and send no second
+ * one. Never throws: a refresh that fails is a refusal with its reason.
+ */
+export async function refreshForOpen(ctx: OpsCtx, plan: OpenPlan): Promise<OpenRefresh> {
+  const need = plan.refresh;
+  const { symbol } = plan.request;
+  if (need === null) return { refused: null, paid: false, line: null };
+  if (plan.refusals.length > 0) return { refused: `refused already, so the stored ${symbol} price (${need.was}) is not refreshed: ${plan.refusals.join('; ')}`, paid: false, line: null };
+  if (!ctx.send) return { refused: `the stored ${symbol} price is ${need.was}: a dry run does not refresh it`, paid: false, line: null };
+  let paid = false;
+  const deps: PriceDeps = {
+    ...ctx.prices,
+    refresh: (s, maxAgeS) => {
+      paid = true;
+      return ctx.prices.refresh(s, maxAgeS);
+    },
+  };
+  let sp: StoredPrice;
+  try {
+    sp = await ensureFresh(deps, symbol, need.marginS);
+  } catch (err) {
+    return { refused: `the stored ${symbol} price (${need.was}) could not be refreshed before the open: ${errorMessage(err)}`, paid, line: null };
+  }
+  const left = ctx.prices.maxAgeS - need.marginS - sp.ageS;
+  const line = `price     stored ${symbol} ${sp.px}, ${Math.round(sp.ageS)} s old${paid ? ' (refreshed for this open)' : ''}: it lives ${Math.round(left)} s past the first part's ${need.marginS} s`;
+  if (left < OPEN_HEADROOM_S) {
+    return { refused: `the stored ${symbol} price is ${Math.round(sp.ageS)} s old after refresh_prices: it lives ${Math.round(left)} s past the first part's ${need.marginS} s, under the ${OPEN_HEADROOM_S} s the open needs before it; nothing sent`, paid, line };
+  }
+  return { refused: null, paid, line };
 }
 
 /**

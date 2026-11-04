@@ -175,12 +175,16 @@ unpriced: true`. Only the owner can add a symbol to `unpriced` (it is part of `s
 cap in USD, converts it to `max_sz` at the current price, and shows such symbols as "no price protection". Any
 other symbol without a fresh oracle price is refused (`E_ORACLE_STALE` / `E_ASSET`): the engine calls
 `refresh_prices` before an order when the stored price is too old. The scanner shows that refusal on a window, except
-while serve trades (mainnet, `GIMBAL_TRADE=1`, the strategy loop's hands): a Hyperliquid or Phoenix leg whose symbol
-the contract prices (`ORACLE_ASSETS`) and whose stored price is missing or older than `oracle_max_age_s` is then not
-refused but carries `Window.note` ("stored ETH price stale: refreshed at open"), because the open refreshes it once
-before its refusals (`pair-ops.ts` `planOpen`) and holds the band and the cap to the new price, as the contract does.
-A price dated ahead of the engine's clock, a symbol outside `ORACLE_ASSETS`, an Orderly leg and every other refusal
-stay refused.
+while serve can open (mainnet, `GIMBAL_TRADE=1`, the start confirmed, live, not stopping: `PairHands.canOpen`): a
+Hyperliquid or Phoenix leg whose symbol the contract prices (`ORACLE_ASSETS`) and whose stored price is missing or
+older than `oracle_max_age_s` is then not refused but carries `Window.note` ("stored ETH price stale: refreshed at
+open"). The open plans read-only on the price as it is (a missing one on the books' mid), judges every other refusal
+first, and only then sends one `refresh_prices` (`pair-ops.ts` `planOpen`, `refreshForOpen`), holding the size to the
+cap at the new price before either leg; the refreshed price must live the first part's margin plus 15 s, so no second
+refresh is needed before it. The strategy loop holds a window 6 h after an open refused once it paid for a refresh,
+sends at most 12 such refreshes per symbol per UTC day (saved with its state under `GIMBAL_STATE_DIR`), and refreshes
+a rotate's target before it closes the held pair. A price dated ahead of the engine's clock, a symbol outside
+`ORACLE_ASSETS`, an Orderly leg and every other refusal stay refused.
 
 ### 1.3 Who may call what
 

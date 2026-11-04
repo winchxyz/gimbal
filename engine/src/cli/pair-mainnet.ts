@@ -23,9 +23,11 @@
 // IOC retry). A stored price is the oracle's timestamp less its 600 s recency, so one fresh from refresh_prices lives
 // oracle_max_age_s - 600 s (300 s at 900): the maker timeout plus 120 s must fit that. The price is refreshed (only
 // once the refusals are checked) before each part when it would not outlive that, and whenever an order (an unwind,
-// a close) finds it stale; never twice within 30 s. One exception: open --send whose other refusals pass refreshes a
-// stored price that is missing or would not outlive the first part while it plans, so the cap and band checks run on
-// it; a dry run never sends refresh_prices and reports the missing price.
+// a close) finds it stale; never twice within 30 s. The plan itself is read-only: a stored price that is missing (the
+// plan then runs on the books' mid) or would not outlive the first part is planned on as it is, and open --send
+// refreshes it once, after every refusal passed, so a refused open pays for no refresh_prices; a symbol that is not
+// one of the contract's oracle assets is refused instead (refresh_prices cannot price it). A dry run never sends
+// refresh_prices and reports a missing price as a refusal.
 //
 // Before an open the plan prints both legs' funding now and over 7 days, the gross APR, the spread expected over the
 // hold against the round trip (taker fees, half spreads, basis buffer), the size, the leverage and liquidation
@@ -76,7 +78,7 @@ import type { Args, PriceDeps } from './pair-mainnet-lib.ts';
 import { UsageError, newPriceState, num, orderOptions, parseArgs, refreshLanded, withdrawKeepsLegs } from './pair-mainnet-lib.ts';
 import type { OpsCtx } from './pair-ops.ts';
 import {
-  ORDERS_PER_PART, buildPair, hlInfo, phoenixExchange, planClose, planOpen, policyMarketMismatches, refs, sendClose, sendOpen, storedPrice, traderState,
+  ORDERS_PER_PART, buildPair, hlInfo, phoenixExchange, planClose, planOpen, policyMarketMismatches, refreshForOpen, refs, sendClose, sendOpen, storedPrice, traderState,
 } from './pair-ops.ts';
 import { checkContractNetwork, contractEnv } from './serve-contract.ts';
 
@@ -347,6 +349,10 @@ async function open(ctx: Ctx): Promise<void> {
     return;
   }
   if (refusals.length > 0) throw new Error(`open --send refused, nothing signed: ${refusals.join('; ')}`);
+  // The stored price the plan found missing or too old: refreshed once, only now that nothing refused.
+  const fresh = await refreshForOpen(ctx, plan);
+  if (fresh.line !== null) say(fresh.line);
+  if (fresh.refused !== null) throw new Error(`open --send refused, nothing signed: ${fresh.refused}`);
   await sendOpen(ctx, pair, plan);
 }
 
