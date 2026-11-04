@@ -61,7 +61,12 @@ test('GET /strategy: every field or a clear error', () => {
   const rotate = { minGainPts: 3, forHours: 4 };
   const risk = { watchDistancePct: 15, rescueDistancePct: 8 };
   const base = { auto: true, minNetAprPct: 5, legUsd: 1200, maxLeverage: 3, stopDrawdownPct: null, rotate, risk };
-  assert.deepEqual(parseStrategy({ ...base, extra: 1, rotate: { ...rotate, extra: 1 }, risk: { ...risk, extra: 1 } }), base);
+  const checks = { enterAfterChecks: 3, exitAfterChecks: 6 };
+  assert.deepEqual(parseStrategy({ ...base, ...checks, extra: 1, rotate: { ...rotate, extra: 1 }, risk: { ...risk, extra: 1 } }), { ...base, ...checks });
+  // An engine from before the hourly-check settings sends neither: the defaults, enter 3 and exit 6.
+  assert.deepEqual(parseStrategy(base), { ...base, ...checks });
+  assert.deepEqual(parseStrategy({ ...base, exitAfterChecks: 8 }), { ...base, enterAfterChecks: 3, exitAfterChecks: 8 });
+  assert.throws(() => parseStrategy({ ...base, exitAfterChecks: '6' }), /exitAfterChecks is not a number/);
   assert.throws(() => parseStrategy(null), /not an object/);
   assert.throws(() => parseStrategy({ ...base, auto: 'yes' }), /auto/);
   assert.throws(() => parseStrategy({ ...base, minNetAprPct: '5' }), /minNetAprPct/);

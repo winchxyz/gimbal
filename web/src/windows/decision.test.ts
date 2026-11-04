@@ -21,7 +21,7 @@ test('the held window: since when, for how long, and Close position', () => {
   const d = decide({ selected: doge, windows: [doge, sol], strategy: STRATEGY, now: NOW });
   assert.equal(
     d.text,
-    'Held since 25 Oct 00:00 UTC · 2 d 14 h. Auto moves out of it when another window beats it by 3 points of net APR for 4 hours in a row.',
+    'Held since 25 Oct 00:00 UTC · 2 d 14 h. Auto moves out of it when another window beats it by 3 points of net APR for 4 hours in a row, and exits after 6 hourly checks in a row under your minimum or with the spread flipped.',
   );
   assert.equal(d.close, true);
   assert.equal(d.rotate, null);
@@ -78,7 +78,7 @@ test('nothing held: auto enters the best window that clears the minimum', () => 
   const windows = [b, a, c];
   const carryFirst = [a, b, c];
   assert.equal(decide({ selected: b, windows: carryFirst, strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters SOL first: 8.6% against 12.0% here.');
-  assert.equal(decide({ selected: b, windows, strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters NEAR: it is the best window that clears your 5% minimum.');
+  assert.equal(decide({ selected: b, windows, strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters NEAR: it is the best window that clears your 5% minimum. It enters once it has passed 3 hourly checks in a row.');
   assert.equal(decide({ selected: a, windows, strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters NEAR first: 12.0% against 8.6% here.');
   assert.equal(decide({ selected: c, windows, strategy: STRATEGY, now: NOW }).text, 'Nothing is held. BTC is under your 5% minimum, so auto will not enter it.');
   assert.match(decide({ selected: a, windows, strategy: null, now: NOW }).text, /minimum could not be read/);
@@ -86,7 +86,7 @@ test('nothing held: auto enters the best window that clears the minimum', () => 
   // whatever its net; nor is one with stale numbers.
   const gated = net('DOGE', 30, { checks: [{ ok: false, text: '14-day history loading' }] });
   const stale = net('LTC', 25, { stale: true });
-  assert.equal(decide({ selected: a, windows: [gated, stale, a, c], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters SOL: it is the best window that clears your 5% minimum.');
+  assert.equal(decide({ selected: a, windows: [gated, stale, a, c], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters SOL: it is the best window that clears your 5% minimum. It enters once it has passed 3 hourly checks in a row.');
   // Selected, such a window says why auto will not enter it, held window or not.
   assert.equal(decide({ selected: gated, windows: [gated, a], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto will not enter DOGE: 14-day history loading.');
   assert.equal(decide({ selected: stale, windows: [stale, a], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto will not enter LTC: its numbers are from an older read.');

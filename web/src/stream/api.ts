@@ -32,6 +32,9 @@ export const JOURNAL_PAGE = 100;
 const isObject = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null;
 const isNumber = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
 
+/** The engine's default hourly-check counts (DEFAULT_STRATEGY, docs/interfaces.md §2). */
+export const DEFAULT_CHECKS = { enterAfterChecks: 3, exitAfterChecks: 6 } as const;
+
 /** Checks the body of `GET /strategy`; throws with what is wrong, so the screen can say so. */
 export function parseStrategy(value: unknown): StrategyConfig {
   if (!isObject(value)) throw new Error('GET /strategy: not an object');
@@ -47,10 +50,19 @@ export function parseStrategy(value: unknown): StrategyConfig {
   if (!isObject(risk) || !isNumber(risk.watchDistancePct) || !isNumber(risk.rescueDistancePct)) {
     throw new Error('GET /strategy: risk needs watchDistancePct and rescueDistancePct');
   }
+  // The hourly-check counts: an engine from before the settings does not send them, and runs on its defaults.
+  const checks = (name: 'enterAfterChecks' | 'exitAfterChecks', fallback: number): number => {
+    const v = value[name];
+    if (v === undefined) return fallback;
+    if (!isNumber(v)) throw new Error(`GET /strategy: ${name} is not a number`);
+    return v;
+  };
   return {
     auto, minNetAprPct, legUsd, maxLeverage, stopDrawdownPct,
     rotate: { minGainPts: rotate.minGainPts, forHours: rotate.forHours },
     risk: { watchDistancePct: risk.watchDistancePct, rescueDistancePct: risk.rescueDistancePct },
+    enterAfterChecks: checks('enterAfterChecks', DEFAULT_CHECKS.enterAfterChecks),
+    exitAfterChecks: checks('exitAfterChecks', DEFAULT_CHECKS.exitAfterChecks),
   };
 }
 

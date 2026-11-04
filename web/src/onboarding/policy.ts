@@ -112,7 +112,7 @@ export function policyProblems(p: ContractPolicy): Problem[] {
 }
 
 /** The limits `PUT /strategy` enforces (engine/src/scanner/config.ts, STRATEGY_LIMITS), plus the policy's size cap. */
-export const STRATEGY_LIMITS = { minLegUsd: 10, maxLegUsd: 100_000, maxLeverage: 10, maxMinNetAprPct: 1_000, maxRotateGainPts: 1_000, maxRotateHours: 24 * 30 } as const;
+export const STRATEGY_LIMITS = { minLegUsd: 10, maxLegUsd: 100_000, maxLeverage: 10, maxMinNetAprPct: 1_000, maxRotateGainPts: 1_000, maxRotateHours: 24 * 30, minChecks: 1, maxChecks: 24 } as const;
 
 const finite = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n);
 const between = (n: unknown, lo: number, hi: number): n is number => finite(n) && n >= lo && n <= hi;
@@ -129,6 +129,9 @@ export function strategyProblems(s: StrategyConfig, policy: ContractPolicy): Pro
   if (s.stopDrawdownPct !== null && !(finite(s.stopDrawdownPct) && s.stopDrawdownPct > 0 && s.stopDrawdownPct <= 100)) add('stop', 'The stop must be a drawdown above 0% and at most 100%, or off.');
   if (!between(s.rotate.minGainPts, 0, L.maxRotateGainPts)) add('rotate-gain', `A rotation gain must be from 0 to ${L.maxRotateGainPts} points.`);
   if (!between(s.rotate.forHours, 0, L.maxRotateHours)) add('rotate-hours', `A rotation wait must be from 0 to ${L.maxRotateHours} hours.`);
+  const wholeChecks = (n: unknown): boolean => Number.isInteger(n) && between(n, L.minChecks, L.maxChecks);
+  if (!wholeChecks(s.enterAfterChecks)) add('enter-checks', `Enter after must be a whole number of hourly checks from ${L.minChecks} to ${L.maxChecks}.`);
+  if (!wholeChecks(s.exitAfterChecks)) add('exit-checks', `Exit after must be a whole number of hourly checks from ${L.minChecks} to ${L.maxChecks}.`);
   const { watchDistancePct: watch, rescueDistancePct: rescue } = s.risk;
   if (!(finite(watch) && finite(rescue) && rescue > 0 && rescue < watch && watch < 100)) add('risk', 'The rescue distance must be above 0 and below the watch distance, and the watch distance below 100%.');
   return out;

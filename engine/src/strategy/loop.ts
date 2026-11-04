@@ -47,7 +47,7 @@ import type { ContractPolicy, JournalEntry, Mode, StrategyConfig, StrategyDecisi
 import { isEnterable } from '../scanner/price.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { Clock } from '../venues/venue.ts';
-import type { DecideInput, Decision, HeldPair, LoopCounters } from './decide.ts';
+import type { CheckRules, DecideInput, Decision, HeldPair, LoopCounters } from './decide.ts';
 import { LOOP_RULES, NO_COUNTERS, decide as defaultDecide, heldForwardAprPct, journalWait, sizeFor, skipAct } from './decide.ts';
 import type { Veto, VetoLeg, VetoResult, VetoSource } from './veto.ts';
 import { checkVeto, vetoFacts, vetoJournalNumbers } from './veto.ts';
@@ -450,7 +450,8 @@ export class StrategyLoop {
 
   /** The start line: what runs and why. */
   startLine(): string {
-    const rules = `enter after ${LOOP_RULES.enterAfterChecks} hourly checks, exit after ${LOOP_RULES.exitAfterChecks}, cooldown ${LOOP_RULES.cooldownHours} h, time stop ${LOOP_RULES.maxHoldDays} d, at most ${LOOP_RULES.maxRotationsPerDay} rotations a day, a NEAR AI risk check refusal holds ${LOOP_RULES.vetoHoldHours} h`;
+    const counts = checkRulesOf(this.#o.strategy());
+    const rules = `enter after ${counts.enterAfterChecks} hourly checks in a row, exit after ${counts.exitAfterChecks} (owner settings), cooldown ${LOOP_RULES.cooldownHours} h, time stop ${LOOP_RULES.maxHoldDays} d, at most ${LOOP_RULES.maxRotationsPerDay} rotations a day, a NEAR AI risk check refusal holds ${LOOP_RULES.vetoHoldHours} h`;
     const veto = this.#o.veto?.configured === true ? `NEAR AI risk check ${this.#o.veto.model} (${(this.#o.vetoTimeoutMs ?? LOOP_RULES.vetoTimeoutMs) / 1000} s)` : 'no NEAR AI risk check (NEAR_AI_API_KEY is not set: every window passes)';
     const hands = this.#o.hands === null ? `no hands (${this.#o.handsWhy ?? 'nothing can be opened or closed here'}): decisions are published, acts journaled as refused` : 'acts through the pair trader (pair-mainnet open / close)';
     return `strategy loop: ${this.#o.trade ? 'GIMBAL_TRADE=1' : 'GIMBAL_TRADE is not 1 (off)'}, auto ${this.#o.strategy().auto ? 'on' : 'off'}; ${hands}; ${veto}; ${rules}; state ${this.#o.store.path}`;
@@ -656,7 +657,7 @@ export class StrategyLoop {
     const policy = this.#o.policy();
     const before = this.#state.counters;
     const input: DecideInput = {
-      now, hourly, windows: scanned, held, strategy, maxNotionalUsd: policy?.max_notional_usd ?? 0, freeMarginUsd, liveRescue: this.#o.liveRescue(),
+      now, hourly, windows: scanned, held, strategy, rules: checkRulesOf(strategy), maxNotionalUsd: policy?.max_notional_usd ?? 0, freeMarginUsd, liveRescue: this.#o.liveRescue(),
       counters: before, ...(policy === null ? {} : { priceBandBps: policy.price_band_bps }),
       ...(facts.gross14dAprPct === undefined ? {} : { gross14dAprPct: facts.gross14dAprPct }), ...(facts.lots === undefined ? {} : { lots: facts.lots }),
       ...(freed === undefined ? {} : { freedMarginUsd: freed }),
@@ -703,7 +704,7 @@ export class StrategyLoop {
         action: 'hold', hourly: input.hourly ? 1 : 0, window: input.held.windowId,
         ...(w === undefined ? {} : { heldNetAprPct: round(heldForwardAprPct(w)) }),
         pnlUsd: round(input.held.pnlUsd), hoursHeld: round((input.now - input.held.since) / HOUR_MS),
-        badChecks: d.counters.badChecks, exitAfterChecks: LOOP_RULES.exitAfterChecks,
+        badChecks: d.counters.badChecks, exitAfterChecks: checkRulesOf(input.strategy).exitAfterChecks,
       });
     }
   }
@@ -724,7 +725,7 @@ export class StrategyLoop {
       ?? (d.counters.lastWaitReason ?? 'rules');
     return {
       ...out, window: top.id, netAprPct: round(top.netAprPct),
-      checks: `${d.counters.aboveByWindow[top.id] ?? 0}/${LOOP_RULES.enterAfterChecks}`, block,
+      checks: `${d.counters.aboveByWindow[top.id] ?? 0}/${checkRulesOf(input.strategy).enterAfterChecks}`, block,
     };
   }
 
@@ -1117,6 +1118,14 @@ export class StrategyLoop {
 
 function symbolIs(s: { symbol: string } | { refused: string }, symbol: string): boolean {
   return 'symbol' in s && s.symbol === symbol;
+}
+
+/** The owner's hourly-check counts, as decide() takes them; a config read before the settings existed gets LOOP_RULES'. */
+export function checkRulesOf(s: StrategyConfig): CheckRules {
+  return {
+    enterAfterChecks: s.enterAfterChecks ?? LOOP_RULES.enterAfterChecks,
+    exitAfterChecks: s.exitAfterChecks ?? LOOP_RULES.exitAfterChecks,
+  };
 }
 
 function round(v: number): number {

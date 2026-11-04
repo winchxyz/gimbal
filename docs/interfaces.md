@@ -773,6 +773,12 @@ export interface StrategyConfig {  // engine rules, off-chain: the contract neve
                                                       // hours are counted on it scan by scan, not intervalsAbove
   risk: { watchDistancePct: number; rescueDistancePct: number };   // a leg closer to liquidation than these
                                                       // percentages is watch / rescue (defaults 15 and 8)
+  enterAfterChecks: number;        // hourly checks in a row a window must pass the entry rules before entry
+                                   // (whole, 1..24; default 3). A saved config without it reads as the default
+  exitAfterChecks: number;         // hourly checks in a row of compression or a flipped spread before a counted
+                                   // exit (whole, 1..24; default 6, docs/backtest-checks.md). PUT /strategy
+                                   // answers 400 for a value that is not a whole number in 1..24. A change never
+                                   // resets a count in progress: the counts are compared with the new number
 }
 
 export interface PolicyDraft {     // NEAR AI turns the owner's words into this; the owner edits and confirms
@@ -939,7 +945,7 @@ anywhere the policy does not allow.
 - `decide.ts` (pure): `decide(DecideInput) → Decision` with the shapes in that file. Entry: the top of the
   scanner's ranked list among the windows passing the entry rules (`isEnterable`, `netAprPct ≥ minNetAprPct`, the
   7 d and 14 d spread signs agreeing with this hour's, depth on both legs), once it has passed them for
-  `LOOP_RULES.enterAfterChecks` hourly checks in a row; until then the loop waits on it ("k of N hours") and never
+  `StrategyConfig.enterAfterChecks` hourly checks in a row (default 3); until then the loop waits on it ("k of N hours") and never
   enters a lower window instead. Size: `legUsd` capped by the policy's `max_notional_usd` less the band, by free
   margin at the leverage and by depth, rounded down to whole common lots; a cap that is not a finite number or is
   ≤ 0 sizes nothing. Leverage ≤ `maxLeverage`, ≤ 1.5 on a leg without a live rescue. Stops, first and at once: the
@@ -951,7 +957,11 @@ anywhere the policy does not allow.
   scanner took off) less the exit still to pay (half the fees and slippage plus the basis buffer), in the constant
   points the scanner spread them over its hold, never re-spread over the hours left (the exit is paid whenever the
   pair leaves, so it never times the exit); the opening fills are sunk. Exit: that figure under `minNetAprPct`, or a sign
-  flip, for `exitAfterChecks` checks; then `cooldownHours`. Rotation: another window's `netAprPct` beats that held
+  flip, for `StrategyConfig.exitAfterChecks` hourly checks in a row (default 6: "n of 6 hours before exit"); then `cooldownHours`.
+  loop.ts passes both counts to decide() as `DecideInput.rules` (absent = `LOOP_RULES`' defaults, also 3 and 6) and
+  prints them on the start line. The counters (`aboveByWindow`, `badChecks`) stay raw counts: a raised number is
+  not reached early, and a lowered one is acted on at the next check, a scan event included, once the count already
+  reached meets it. Rotation: another window's `netAprPct` beats that held
   figure by `rotate.minGainPts` for `rotate.forHours`
   and `switchCostUsd` pays back within the hold at that gain on the new leg's sized `legUsd` (the switch cost is not
   scaled); the new legs are sized on free margin plus `DecideInput.freedMarginUsd` (loop.ts measures it: the held

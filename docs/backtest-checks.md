@@ -1,9 +1,10 @@
 # Backtest: the strategy loop's entry and exit check counts
 
 The strategy loop (`engine/src/strategy/decide.ts`) enters a window only after it passes the entry rules on
-`LOOP_RULES.enterAfterChecks` hourly checks in a row, and leaves a held pair after `LOOP_RULES.exitAfterChecks`
-hourly checks in a row of compression or a flipped spread. Both are 3. This backtest measures what each pair of
-counts from 1 to 4 nets in USD on real funding history, with the engine's own scanner, gate and cost model.
+`enterAfterChecks` hourly checks in a row, and leaves a held pair after `exitAfterChecks` hourly checks in a row of
+compression or a flipped spread. Both were 3 (engine constants) when this ran. This backtest measures what each pair of
+counts from 1 to 4 nets in USD on real funding history, with the engine's own scanner, gate and cost model. The
+[decision](#decision) it led to: enter 3, exit 6, now owner settings in `StrategyConfig`.
 
 ```bash
 npm run backtest:checks                                    # every scope, 12 and 1000 USD a leg, enter and exit 1..4
@@ -321,6 +322,16 @@ Current setting (enter 3, exit 3):
 the tested 1..4). Confidence: high that 1 and 2 lose and that 4 or more beats 3 (true in both scopes, both leg sizes,
 and in each third of the year at 12 USD a leg; at 1000 USD better in one third and within 0.02 USD in the other two); low on how much it adds and on the
 exact count, which rests on 10 to 23 trades a setting at exit 3 or more and, at 1000 USD, mostly on ZEC in May 2026.
+
+## Decision
+
+Adopted: **enter after 3, exit after 6** hourly checks in a row. Both counts are now owner settings,
+`StrategyConfig.enterAfterChecks` and `exitAfterChecks` (whole numbers 1..24, read and written through `GET` /
+`PUT /strategy`, saved with the rest of the strategy), defaulting to 3 and 6; a strategy saved before the settings
+existed loads with those defaults. The engine prints them on the strategy loop's start line, the hold lines count
+"n of 6 hours before exit", and the onboarding form edits them (docs/interfaces.md §3 "Strategy loop"). A change never
+resets a count in progress. `npm run backtest:checks` prints the default setting's top trades when its grid holds it
+(`--exit 6`).
 
 ## Caveats
 

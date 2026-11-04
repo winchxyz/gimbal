@@ -87,6 +87,10 @@ test('engine rules: each limit of PUT /strategy, and a leg over the contract’s
   assert.deepEqual(strategyProblems({ ...ok, stopDrawdownPct: null }, p), []);
   assert.deepEqual(strategyProblems({ ...ok, rotate: { minGainPts: -1, forHours: 721 } }, p).map((x) => x.field), ['rotate-gain', 'rotate-hours']);
   assert.deepEqual(strategyProblems({ ...ok, risk: { watchDistancePct: 8, rescueDistancePct: 15 } }, p).map((x) => x.field), ['risk']);
+  assert.deepEqual([ok.enterAfterChecks, ok.exitAfterChecks], [3, 6], 'the engine defaults');
+  assert.deepEqual(strategyProblems({ ...ok, enterAfterChecks: 1, exitAfterChecks: 24 }, p), []);
+  assert.deepEqual(strategyProblems({ ...ok, enterAfterChecks: 0, exitAfterChecks: 25 }, p).map((x) => x.field), ['enter-checks', 'exit-checks']);
+  assert.match(strategyProblems({ ...ok, exitAfterChecks: 2.5 }, p)[0]!.message, /Exit after must be a whole number of hourly checks from 1 to 24/);
 });
 
 test('coins, venues and removals', () => {

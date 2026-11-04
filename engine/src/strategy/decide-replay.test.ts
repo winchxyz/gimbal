@@ -35,6 +35,7 @@ import { LIVE_RESCUE } from '../trade/carry-plan.ts';
 import { commonLot, toQty } from '../trade/lots.ts';
 import { VirtualClock, readRecording } from '../venues/replay.ts';
 import { NO_COUNTERS, decide, skipAct } from './decide.ts';
+import { checkRulesOf } from './loop.ts';
 import type { DecideInput, Decision, HeldPair, LoopCounters } from './decide.ts';
 import { HOUR, STRATEGY, VETO_FIXTURE } from './test-helpers.ts';
 import { RecordedVeto, checkVeto, vetoFacts } from './veto.ts';
@@ -49,7 +50,8 @@ const POLICY: ContractPolicy = {
   max_notional_usd: 20, price_band_bps: 100, oracle_max_age_s: 60, rescue_cap_usd_per_hour: 50,
   unpriced: [], unpriced_max_notional_usd: 0, max_transfer_cost_bps: 50, max_transfer_cost_flat_e6: 2_000_000,
 };
-const STRAT = { ...STRATEGY, minNetAprPct: 5 };
+// The recorded hour fits 3 bad hours before the exit: the owner setting is 3 here (the default 6 is in decide.test.ts).
+const STRAT = { ...STRATEGY, minNetAprPct: 5, exitAfterChecks: 3 };
 const HOURS = 18;
 const WARMUP_MS = 10 * 60_000;
 const NEAR = 'near-hyperliquid-phoenix';
@@ -132,7 +134,7 @@ async function run(): Promise<Step[]> {
     }
     const input: DecideInput = {
       lots,
-      now: simStart + h * HOUR, hourly: true, windows, held, strategy: STRAT, maxNotionalUsd: POLICY.max_notional_usd,
+      now: simStart + h * HOUR, hourly: true, windows, held, strategy: STRAT, rules: checkRulesOf(STRAT), maxNotionalUsd: POLICY.max_notional_usd,
       priceBandBps: POLICY.price_band_bps, freeMarginUsd: { hyperliquid: 20, phoenix: 20, orderly: 20 }, liveRescue: LIVE_RESCUE, counters,
       gross14dAprPct: Object.fromEntries(windows.map((w) => [w.id, scanner.carry(w.id)?.estimate.gross.d14AprPct ?? null])),
       // What loop.ts measures: the held legs' margin at 1.5x (their P&L is 0 here).

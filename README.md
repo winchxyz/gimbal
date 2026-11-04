@@ -64,7 +64,8 @@ that proves the refusal.
   The risk engine reads the desk every 5 s and sets each leg's watch and rescue lines from its distance to
   liquidation and recent volatility (`engine/src/risk/thresholds.ts`).
 - **Strategy loop** (`engine/src/strategy/`). After each scan and each funding payment it decides: enter, hold, exit,
-  rotate or wait. Enter and exit each need 3 hourly checks in a row; then a 6 h cooldown, a 14-day time stop and at
+  rotate or wait. Entry needs 3 hourly checks in a row and exit 6 (owner settings, `enterAfterChecks` and
+  `exitAfterChecks`, picked on [a backtest](docs/backtest-checks.md)); then a 6 h cooldown, a 14-day time stop and at
   most 2 rotations a day. The pair is the top allowed window; its size is the smallest of the owner's leg size, the
   policy cap less the band, free margin and book depth, in whole lots. Before every enter and rotate the **NEAR AI
   risk check** reads the window's facts and may refuse it (held out for 6 h); it cannot pick a pair, a size or an

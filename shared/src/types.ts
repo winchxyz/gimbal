@@ -98,6 +98,12 @@ export interface StrategyConfig {  // engine rules, off-chain: the contract neve
                                                       // hours are counted on it scan by scan, not intervalsAbove
   risk: { watchDistancePct: number; rescueDistancePct: number };   // a leg closer to liquidation than these
                                                       // percentages is watch / rescue (defaults 15 and 8)
+  enterAfterChecks: number;        // hourly checks in a row a window must pass the entry rules before entry
+                                   // (whole, 1..24; default 3). A saved config without it reads as the default
+  exitAfterChecks: number;         // hourly checks in a row of compression or a flipped spread before a counted
+                                   // exit (whole, 1..24; default 6, docs/backtest-checks.md). PUT /strategy
+                                   // answers 400 for a value that is not a whole number in 1..24. A change never
+                                   // resets a count in progress: the counts are compared with the new number
 }
 
 export interface PolicyDraft {     // NEAR AI turns the owner's words into this; the owner edits and confirms
