@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { Mode } from '@gimbal/shared';
 import { rpcChain, type Chain } from '../onboarding/chain.ts';
+import { isReadOnly } from '../remote/readonly.ts';
 import { useStream } from '../stream/hub.ts';
 import { deskMissing } from '../windows/model.ts';
 import { netOf } from './explorer.ts';
@@ -80,7 +81,7 @@ export function useSecurity(): { view: SecurityView; retry(): void } {
           setLoaded({ kind: 'replay' });
           return;
         }
-        const data = await loadSecurity(chain, { contractId, deskId, mode });
+        const data = await loadSecurity(chain, { contractId, deskId, mode }, Date.now(), { mask: isReadOnly() });
         if (!alive) return;
         setFailure(null);
         if (data === null) {

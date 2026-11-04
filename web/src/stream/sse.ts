@@ -20,11 +20,31 @@ export interface SseOptions {
   backoff?: (attempt: number) => number;
   /** Opens the stream; the browser's `EventSource` unless a test says otherwise. */
   open?: (url: string) => EventSourceLike;
+  /**
+   * Where to connect on each attempt, when the address changes every time: the remote view hands out a one-use ticket.
+   * A rejection counts as a failed attempt, like a stream that did not open.
+   */
+  address?: () => Promise<string>;
+  /**
+   * Runs when a stream failed before it ever opened. The browser's EventSource hides why (a refusal and a dropped
+   * connection look the same); this asks the engine, and rejects with the reason when it can tell. Resolving means
+   * nothing more is known: the plain wait applies.
+   */
+  explain?: () => Promise<void>;
+  /** Sees every failed attempt. It may ask to stop for good (a rejected token must not be retried) or to wait a given time. */
+  onFailure?: (error: unknown) => FailureVerdict | void;
 }
+
+export type FailureVerdict = { stop: true } | { waitMs: number };
 
 /** 1 s, 2 s, 4 s, 8 s, then every 15 s: the engine is on this machine, so a restart is back within seconds. */
 export function backoffMs(attempt: number): number {
   return Math.min(15_000, 1000 * 2 ** Math.max(0, attempt));
+}
+
+/** 1 s, 2 s, 4 s ... up to 30 s: for an engine on another machine, where a restart or a deploy can take a minute. */
+export function backoffUpTo30s(attempt: number): number {
+  return Math.min(30_000, 1000 * 2 ** Math.max(0, attempt));
 }
 
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
@@ -49,22 +69,42 @@ export function connectSse(dispatch: (action: StreamAction) => void, options: Ss
   const status = (connection: 'connecting' | 'open' | 'retrying' | 'idle', error?: string) =>
     dispatch({ kind: 'connection', source: 'sse', connection, ...(error === undefined ? {} : { error }) });
 
-  const fail = (stream: EventSourceLike, error: string) => {
+  /** The attempt is over: say so, then wait as long as the failure asks (or the usual growing wait) and try again. */
+  const settle = (cause: unknown) => {
+    if (stopped) return;
+    const verdict = options.onFailure?.(cause);
+    if (verdict && 'stop' in verdict) return status('idle', messageOf(cause));
+    status('retrying', messageOf(cause));
+    timer = setTimeout(connect, verdict?.waitMs ?? backoff(failures));
+    failures += 1;
+  };
+
+  const fail = (stream: EventSourceLike, error: unknown, neverOpened = false) => {
     if (stopped || current !== stream) return;
     stream.close();
     current = null;
-    status('retrying', error);
-    timer = setTimeout(connect, backoff(failures));
-    failures += 1;
+    if (neverOpened && options.explain) options.explain().then(() => settle(error), settle);
+    else settle(error);
   };
 
   function connect(): void {
     if (stopped) return;
     status(failures === 0 ? 'connecting' : 'retrying');
-    const stream = openStream(url);
+    if (options.address === undefined) return attach(url);
+    options.address().then(
+      (target) => {
+        if (!stopped) attach(target);
+      },
+      settle,
+    );
+  }
+
+  function attach(target: string): void {
+    const stream = openStream(target);
     current = stream;
     const waiting: StreamEvent[] = [];
     let seeded = false;
+    let opened = false;
 
     stream.onmessage = (message) => {
       if (current !== stream) return;
@@ -74,6 +114,7 @@ export function connectSse(dispatch: (action: StreamAction) => void, options: Ss
       else waiting.push(event);
     };
     stream.onopen = () => {
+      opened = true;
       options.readState().then(
         (state) => {
           if (current !== stream) return;
@@ -83,10 +124,10 @@ export function connectSse(dispatch: (action: StreamAction) => void, options: Ss
           failures = 0;
           status('open');
         },
-        (error: unknown) => fail(stream, messageOf(error)),
+        (error: unknown) => fail(stream, error),
       );
     };
-    stream.onerror = () => fail(stream, 'GET /events: the connection closed');
+    stream.onerror = () => fail(stream, new Error('GET /events: the connection closed'), !opened);
   }
 
   connect();

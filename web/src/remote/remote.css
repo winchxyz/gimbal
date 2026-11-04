@@ -1,0 +1,28 @@
+/* Remote view: the one plain line under the header, and the settings form. Tokens only; colour means state. */
+.ro-line { display: flex; align-items: baseline; gap: var(--s-4); padding: var(--s-2) var(--gutter); border-bottom: 1px solid var(--line); font: var(--t-s); color: var(--ink-2); }
+.ro-line a { margin-left: auto; color: var(--ink-2); }
+.ro-line a:hover { color: var(--ink); }
+
+.cx-hdr { grid-template-columns: 1fr; }
+.cx-page { min-height: calc(100dvh - var(--header)); display: grid; place-items: center; padding: var(--s-6) var(--gutter); }
+.cx-form { width: 480px; max-width: 100%; }
+.cx-form .lab { font: var(--t-s); color: var(--ink-2); }
+.cx-form h1 { font: var(--t-xl); letter-spacing: var(--track-xl); margin-top: 14px; }
+.cx-form > p { color: var(--ink-2); margin: var(--s-4) 0 0; }
+.cx-field { margin-top: var(--s-5); }
+.cx-field label { display: block; font: var(--t-s); color: var(--ink-2); margin-bottom: var(--s-1); }
+.cx-input { width: 100%; background: transparent; color: var(--ink); border: 0; border-bottom: 1px solid var(--line-2); border-radius: 0; padding: var(--s-2) 0; font: var(--t-m); letter-spacing: var(--track-text); outline: none; }
+.cx-input:focus { border-bottom-color: var(--ink); }
+.cx-input::placeholder { color: var(--ink-3); }
+.cx-hint { font: var(--t-s); color: var(--ink-3); margin-top: var(--s-2); }
+.cx-hint.warn { color: var(--watch); }
+.cx-err { margin-top: var(--s-4); color: var(--danger); font: var(--t-s); }
+.cx-go { display: flex; flex-wrap: wrap; gap: var(--s-2); margin-top: var(--s-5); }
+
+@media (max-width: 1023px) {
+  .cx-page { min-height: 0; display: block; padding: var(--s-5) var(--gutter); }
+  .cx-form h1 { font: 400 32px/1.1 var(--display); letter-spacing: var(--track-xl); }
+  .cx-input { min-height: 44px; }
+  .cx-go { flex-direction: column; }
+  .cx-go .btn { width: 100%; }
+}
