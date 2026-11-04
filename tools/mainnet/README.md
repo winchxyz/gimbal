@@ -1286,6 +1286,59 @@ held payment again at 1Click and on chain.
   Repair it, or move it aside and start once with `GIMBAL_RESCUE_FRESH=<contract>/<desk>` (the 65 min rule above
   applies).
 
+## Allowing a token without an oracle price
+
+`tools/mainnet/set-policy.mjs` lets a live desk trade symbols the contract has no oracle price for. It reads the
+desk's policy with `get_desk` (never from a file) and appends, for each symbol:
+
+- `hl_assets`: Hyperliquid's asset index and szDecimals, from its live `meta`;
+- `orderly_symbols`: `PERP_<SYM>_USDC`, only if `--venues` names `orderly` and Orderly lists it;
+- `phoenix_markets`: orderbook, lot and tick, only if `--venues` names `phoenix` and Phoenix lists it (the same live
+  read `policy.mjs` uses);
+- `unpriced`: `max_sz` = `--usd` / Hyperliquid's live mark, rounded down to the coarsest lot of the venues the symbol
+  is added on (Hyperliquid szDecimals, Orderly `base_tick`, Phoenix base lot).
+
+`--unpriced-cap-usd N` sets `unpriced_max_notional_usd`. The tool never removes or changes an existing entry. It
+refuses an oracle asset (BTC, DOGE, ETH, LTC, SOL, XLM, ZEC: those are priced), a symbol that is not on Hyperliquid
+plus at least one of the other venues asked for, a k- or 1000-prefixed name (one unit is 1000 tokens on some venues),
+a list over 32 entries, and a result the contract's `validate_for` or the live venue data would refuse.
+
+**The trade-off.** Orders on these symbols get no oracle price band. The contract caps each one by its `max_sz` in
+base units and by min(`max_notional_usd`, `unpriced_max_notional_usd`) USD at the order's own price. A bad order
+(a stolen operator key, an engine bug) can still trade at any price the venue accepts, so the worst loss per order is
+bounded by `max_sz` and the venue's own price limits (Orderly takes prices within `price_range` of its mark, 3 % for
+these symbols). The dry run prints that bound per symbol.
+
+Dry run first (public reads only; it works in a worktree):
+
+```
+node tools/mainnet/set-policy.mjs <contract> <desk_id> --add-unpriced ZRO,ETHFI,AAVE --venues hl,orderly --usd 15 --unpriced-cap-usd 15
+```
+
+It prints the live policy's sha256 (the contract's `policy_sha256` form), every added field, `max_sz` per symbol
+with the mark and the USD it is worth, the full `set_policy` args, the signer (the desk's owner), the deposit (the
+storage the larger policy adds plus 500 bytes of margin; the contract keeps what the storage took and refunds the
+rest), the gas, and what changes for the engine. Then, from the main checkout:
+
+```
+node tools/mainnet/set-policy.mjs <contract> <desk_id> --add-unpriced ZRO,ETHFI,AAVE --venues hl,orderly --usd 15 --unpriced-cap-usd 15 --key-file <owner key json> --send
+```
+
+It signs one `set_policy` with the owner's full-access key, waits for final, prints the transaction link and the
+`policy_set` event, reads `get_desk` again and checks the policy on chain is exactly the planned one.
+
+After it:
+
+- **Restart serve.** The scanner reads the policy's symbol list at start: `railway redeploy`, or Redeploy in the
+  Railway dashboard.
+- **Never remove a symbol while a position on it is open.** The contract refuses every order on a symbol missing
+  from the venue's list, reduce-only closes included (`E_ASSET`), so the position could not be closed through the
+  desk. Close it first; a removal is a separate, reviewed change (this tool has none).
+- **Re-cap `max_sz` after a large price move.** The cap is in base units, so it fails closed: after a fall a leg of
+  the planned USD size is over `max_sz` and the order is refused; after a rise the USD cap refuses it first. Neither
+  loses money, but the pair stops opening until `max_sz` is set again (a separate `set_policy`: this tool only
+  appends).
+
 ## Files the scripts write
 
 All of them are gitignored and are written in the main checkout only (never in a linked worktree). None is ever
