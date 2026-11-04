@@ -17,6 +17,7 @@ import { loopBook } from '../cli/serve-loop.ts';
 import { PositionBook, createBook, nextSyncAt } from './book.ts';
 import { HOUR_MS, positionIdOf, summarize } from './derive.ts';
 import { bookReport } from './report.ts';
+import { readServeSummary, withServeSummary } from './serve-summary.ts';
 import { hlFillFee, hlNonFundingLedger } from './sources.ts';
 import { BookStore, bookFile } from './store.ts';
 import { OVERLAP_MS, READ_AFTER_EXIT_MS, fundingKey, fundingWindow } from './sync.ts';
@@ -761,4 +762,67 @@ test('start() syncs now and schedules the next hour; stop() cancels it', async (
   assert.equal(timers[0]!.ms, 35 * 60_000);
   book.stop();
   assert.equal(cleared, 1);
+});
+
+test('a position booked while the book runs has its ledgers read at once, not at the next hour; the empty start says why it read none', async () => {
+  const dir = tempDir(dirs);
+  const sources = fixtureSources();
+  const clock = new VirtualClock(T0 + 2 * H + 30 * 60_000);
+  const timers: { fn: () => void; ms: number }[] = [];
+  const lines: string[] = [];
+  const book = createBook({
+    dir, ...DESK, clock, addresses: sources.addresses, sources: sources.sources, log: (l) => lines.push(l),
+    timers: { setTimeout: (fn, ms) => timers.push({ fn, ms }), clearTimeout: () => {} },
+  });
+  // serve's start on an empty book (the pair is adopted after the first scan): nothing to read, and it says so.
+  book.start();
+  for (let i = 0; i < 6; i++) await tick();
+  assert.ok(lines.includes('book: no ledger read: no position is booked yet (the next sync after one is booked reads them)'), lines.join('\n'));
+  assert.equal(sources.hl.asked.length, 0);
+  assert.deepEqual(book.summary().cursors, {}, 'what the report calls never synced');
+  // The loop adopts the pair after its first decision.
+  book.adopt({ windowId: XLM, symbol: 'XLM', since: T0 + 20 * 60_000, legUsd: 1000, legs: [{ venue: 'hyperliquid', side: 'short' }, { venue: 'phoenix', side: 'long' }] });
+  const soon = timers.filter((t) => t.ms === 0);
+  assert.equal(soon.length, 1, 'a sync is queued for the next turn');
+  soon[0]!.fn();
+  for (let i = 0; i < 6; i++) await tick();
+  assert.equal(sources.hl.asked.length, 1, 'the adopted position\'s Hyperliquid ledger is read now, not at the next hour');
+  assert.equal(sources.phoenix.asked.length, 1);
+  const cursors = Object.keys(book.summary().cursors).sort();
+  assert.ok(cursors.includes('hyperliquid') && cursors.includes('phoenix'), cursors.join(', '));
+  // An enter books a position too; nothing is queued once stopped.
+  book.stop();
+  book.record(enterSol());
+  assert.equal(timers.filter((t) => t.ms === 0).length, 1);
+});
+
+test('the report takes serve\'s summary: the cursors of reads that stored nothing, and why an empty book was never read', () => {
+  const dir = tempDir(dirs);
+  const clock = new VirtualClock(T0 + 3 * H);
+  const book = new PositionBook({ dir, ...DESK, clock });
+  book.record(enterXlm());
+  book.flushSummary();
+  const path = book.path;
+  // The JSONL holds a read up to 12:00 (it stored payments); serve read again at 13:05 and found nothing new, which only
+  // its summary has.
+  const fromFile = { ...book.summary(), cursors: { hyperliquid: T0 + 2 * H } };
+  const summaryPath = path.replace(/\.jsonl$/, '.summary.json');
+  writeFileSync(summaryPath, JSON.stringify({ ...book.summary(), at: T0 + 3 * H + 5 * 60_000, cursors: { hyperliquid: T0 + 3 * H + 5 * 60_000, phoenix: T0 + 3 * H + 5 * 60_000 } }));
+  const serve = readServeSummary(path);
+  assert.deepEqual(serve?.cursors, { hyperliquid: T0 + 3 * H + 5 * 60_000, phoenix: T0 + 3 * H + 5 * 60_000 });
+  const merged = withServeSummary(fromFile, serve);
+  assert.deepEqual(merged.summary.cursors, { hyperliquid: T0 + 3 * H + 5 * 60_000, phoenix: T0 + 3 * H + 5 * 60_000 });
+  assert.match(bookReport(merged.summary, merged.notes), /ledgers read up to: hyperliquid 2026-11-02 13:05.*phoenix 2026-11-02 13:05/);
+  assert.match(merged.notes[0]!, /^serve's summary of 2026-11-02T13:05:00\.000Z/);
+  // A later cursor in the file stands over an older one in the summary.
+  assert.equal(withServeSummary({ ...fromFile, cursors: { hyperliquid: T0 + 4 * H } }, serve).summary.cursors.hyperliquid, T0 + 4 * H);
+  // An empty book: no cursors anywhere; the report says why.
+  const empty = new PositionBook({ dir: tempDir(dirs), ...DESK, clock });
+  writeFileSync(empty.path.replace(/\.jsonl$/, '.summary.json'), JSON.stringify(empty.summary()));
+  const e = withServeSummary(empty.summary(), readServeSummary(empty.path));
+  assert.match(bookReport(e.summary, e.notes), /no ledger read yet: no position is booked, so there is none to read[\s\S]*ledgers read up to: never synced/);
+  // No summary, or one that does not parse: the report as before.
+  writeFileSync(summaryPath, '{not json');
+  assert.equal(readServeSummary(path), null);
+  assert.deepEqual(withServeSummary(fromFile, null), { summary: fromFile, notes: [] });
 });
