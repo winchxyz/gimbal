@@ -22,15 +22,19 @@ repo root are all it needs.
 - **Region: EU West (Amsterdam).** Hyperliquid refuses US IP addresses.
 - **Shutdown: `drainingSeconds` 180.** On SIGTERM serve starts nothing new and waits up to 180 s for an order, a
   close or a rescue already under way. Railway's default is 0 s, which would kill it mid-order.
-- **No public port.** The engine's HTTP API listens on `127.0.0.1:8790` only and has no login: anyone who could
-  reach it could close the pair or turn `auto` on. Do not add a public domain to the service. Reach it from
-  inside the container with `railway ssh` (below).
+- **The control API is never public.** The engine's HTTP API listens on `127.0.0.1:8790` only and has no login:
+  anyone who could reach it could close the pair or turn `auto` on. Reach it from inside the container with
+  `railway ssh` (below). Never point a domain, a TCP proxy or `GIMBAL_HOST` at it.
+- **A public domain only for the read-only view.** The one port that may have a Railway public domain is the
+  view's: a second listener, off by default, that serves the GET routes and the event stream behind a bearer token
+  and refuses every write (below, "The read-only view"). No `GIMBAL_VIEW_TOKEN`, no public domain.
 
 ## Set up
 
 1. New project → Deploy from GitHub repo (or `railway up` from a clean checkout). Railway reads `railway.json`
    and builds the `Dockerfile`.
-2. Settings → Region: EU West. Settings → Networking: no public domain.
+2. Settings → Region: EU West. Settings → Networking: no public domain, unless the read-only view is set up
+   (step 4 and "The read-only view"); then one domain, its target port the view's port and nothing else.
 3. Add a volume to the service, mount path `/data`.
 4. Variables (Raw Editor accepts a pasted env file). The names, values never in the repo. Each variable is its own
    `NAME=value` line; check that every value sits under its own name (a value pasted under the wrong name is a common
@@ -60,9 +64,12 @@ repo root are all it needs.
      even with both legs flat: a missing file is not a fresh start, so without it the pair stays alert only and the
      strategy loop gets no hands (it can never open). Check both legs on the venues first (`docs/interfaces.md`,
      "The pair in serve"); remove it after that start (a later start restores the file and ignores it);
-   - `GIMBAL_RESCUE_FRESH=<contract>/<desk>` for the rescuer's first run (step 5).
+   - `GIMBAL_RESCUE_FRESH=<contract>/<desk>` for the rescuer's first run (step 5);
+   - optional, the read-only view: `GIMBAL_VIEW_TOKEN`, `GIMBAL_VIEW_PORT` (or Railway's own `PORT`),
+     `GIMBAL_VIEW_ORIGINS` (below).
 5. Deploy. The log shows the start lines: mode, contract, which legs are live, which protections trade, the
-   rescue routes, and `strategy: off` until the owner turns `auto` on.
+   rescue routes, `strategy: off` until the owner turns `auto` on, and `view: off` or
+   `view: read-only on :<port> for origins ...`.
 
    **The rescuer's first run.** With no rescuer state file on the volume (`/data/gimbal/rescue-mainnet-<contract>-<desk>-<evm>.json`)
    the start line says `rescuer state missing`: every rescue transfer is held and only reduces run. A missing file is
@@ -90,6 +97,81 @@ node -e "fetch('http://127.0.0.1:8790/strategy').then(r=>r.json()).then(console.
 
 `PUT /strategy` with the same body and `"auto": true` turns the loop on; `POST /close` closes both legs. Both
 need `content-type: application/json` and a localhost Host, which a request from inside the container has.
+
+## The read-only view
+
+For the dashboard on another machine (the demo video, the owner watching the desk), serve can open a second
+listener, `engine/src/view/`. It is built on read functions only (`EngineServer.viewSource`), never on the control
+server, so no request to it can reach `PUT /strategy`, `POST /rotate` or `POST /close`.
+
+**Variables:**
+
+| Name | What |
+|---|---|
+| `GIMBAL_VIEW_TOKEN` | The bearer token. Unset = the view is off. At least 32 characters, no whitespace, and not guessable: 16 distinct characters or about 128 bits by the characters' own frequencies, no repeated piece (`abcabc…`) and no run of 6 in sequence (`012345`, `zyxwvu`). It is the only guard against guessing, so make it with `openssl rand -hex 32` or `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`, never by hand. Otherwise the view stays off and says why. |
+| `GIMBAL_VIEW_PORT` | The port it listens on, on `0.0.0.0`. Default: `PORT`, which Railway sets for the service. Must differ from `ENGINE_PORT` (8790). |
+| `GIMBAL_VIEW_ORIGINS` | The dashboard origins allowed to call it from a browser, comma separated, e.g. `https://gimbal.example`: scheme, host and port only, no path, no `*`. A request with any other `Origin` is refused (403). Empty: no browser page can call it; `curl` still can. |
+
+Then Settings → Networking → Generate Domain, with the target port set to the view's port. The start line reads
+`view: read-only on :<port> for origins <list>`. The view starts only while the control API is on loopback (the
+default `GIMBAL_HOST`): with the engine on `0.0.0.0`, port 8790 would answer on Railway's private network, where a
+request with `Host: localhost` passes its checks, so serve logs `view: off: the control API is not on loopback`.
+
+**What it serves:** `GET /state`, `/journal?before=`, `/strategy`, `/windows/history?id=` and `/events` (SSE), each
+the same as the engine's, plus `GET /view-ticket` and an unauthenticated `GET /healthz` (`{ "ok": true }`). Any
+other path is 404; any other method (PUT, POST, DELETE, ...) is 405, answered before the body is read.
+
+**Auth:**
+
+- `Authorization: Bearer <GIMBAL_VIEW_TOKEN>` on every route but `/healthz`, compared in constant time.
+- `EventSource` cannot send headers, so `/events` also takes `?ticket=<t>`: `GET /view-ticket` (bearer) answers
+  `{ "ticket", "expiresAt" }`, an HMAC under a key the engine makes at start, good for 30 s and for one connection.
+  The token itself never goes in a URL; a ticket in an edge log is spent or expired by the time anyone reads it.
+  A restart voids every ticket; the dashboard asks for a new one whenever it reconnects. At most 8 tickets are
+  outstanding: a new one retires the oldest, so someone asking for tickets can never lock the owner out.
+- The credentials are checked first, and a right token or ticket is always served. A client with 10 failed tries
+  in a minute gets 429 instead of 401 on each further failure until the minute is over. The client is the last
+  `X-Forwarded-For` entry: that assumes exactly one proxy appends to the header in front of the view (Railway's
+  edge). Behind a second proxy, the last entry would be that proxy and all its clients would share one budget.
+  Refusals are logged with method and path only, one line a minute per kind.
+- No client can hold the engine's shutdown: a request has 10 s to arrive in full (headers and body; a stream's
+  response may then run on), and on SIGTERM the view closes every connection and is done within 3 s.
+
+**Redaction:** every string in every payload is cut before it leaves:
+
+- the value of every variable named `…_KEY`, `…_SECRET`, `…_TOKEN` or `…PRIVATE…` (`OPERATOR_PRIVATE_KEY`,
+  `RELAYER_EVM_PRIVATE_KEY`, `ONECLICK_API_KEY`, `NEAR_AI_API_KEY`, `GIMBAL_VIEW_TOKEN`), also without an
+  `ed25519:` prefix, a hex key with or without `0x` in any case, and each URL-encoded or JSON-escaped;
+- the key-bearing parts of every URL in the environment (RPC URLs are shown as their origin plus `/…`);
+- by shape: `ed25519:` with 43 or more base58 characters (secret keys, seeds, and public keys too), and
+  `?api-key=`-style query values in any URL.
+
+None of these is meant to be in the state, journal or events in the first place; a test greps the served
+payloads, as sent and as decoded, for each value and each variant to prove they are not.
+
+**Masked accounts:** the owner's and the operator's NEAR accounts (`OWNER_ACCOUNT_ID`, `OPERATOR_ACCOUNT_ID`) and
+any 64-hex implicit account are shown as their first 4 and last 4 characters (`gimb…near`) wherever they stand as a
+whole account id: `desk.owner`, `desk.paused.by`, journal and decision text, explorer URLs that name an account. The
+contract id (even a sub-account of the owner) and the desk id stay as they are, and so do transaction hashes and
+their explorer links: they are the proof of what the desk did.
+
+**If the view token leaks,** whoever has it can read exactly what the dashboard shows, and nothing more:
+
+- the mode, and the funding windows: every window's rates, costs, net APR, depth, checks, NEAR AI verdict and
+  hourly history, and the scan status;
+- the desk (`DeskState`): desk id, contract id, the masked owner, every leg (venue, symbol, side, size, entry,
+  mark, liquidation price, margin, margin ratio, distance to liquidation, funding, fees), net delta, equity,
+  reserve, P&L, health, paused (masked account and time), a rescue failure's reason;
+- the journal, every entry still in memory (up to 5 000): its summary, the NEAR AI text, its numbers, and its
+  transaction links, which name the desk's own venue addresses (EVM, Solana) as any block explorer does;
+- rescue and venue-setup progress (amounts, steps, transaction links), the venue health map, and the strategy
+  loop's latest decision;
+- the strategy rules (`auto`, the minimum net APR, leg size, leverage, stop drawdown, rotation and risk thresholds);
+- the live event stream of all of the above.
+
+They cannot change the rules, enter, rotate, close, stress or move money, they get no key, and they cannot read
+the owner's or the operator's account in full. Rotate it: set a new `GIMBAL_VIEW_TOKEN` and redeploy (the engine
+restarts, which the trader lock handles as above), or remove it to turn the view off.
 
 ## What the server holds, and what it cannot do
 
