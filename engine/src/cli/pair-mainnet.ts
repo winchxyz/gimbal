@@ -10,6 +10,9 @@
 //          [--slippage-bps 50] [--reprice-s 30] [--maker-timeout-s 120] [--max-orders 6] [--taker-fallback]
 //          [--priority-microlamports 100000]
 //     close <symbol> [the same order options]
+//     refuse-band <symbol>                  one real Hyperliquid order outside the price band, sent to hl_order so the
+//                                           contract refuses it on chain (E_PRICE_BAND); refuse-lib.ts
+//     refuse-notional <symbol>              the same, inside the band and over max_notional_usd (E_SIZE)
 //
 // The env file holds the engine's names (GIMBAL_CONTRACT_ID, DESK_ID, OPERATOR_ACCOUNT_ID, OPERATOR_PRIVATE_KEY,
 // NEAR_RPC_URL, HL_API_URL, PHOENIX_API_URL, SOLANA_RPC_URL); values are never printed, and the key is read only
@@ -43,6 +46,11 @@
 // stays unhedged is printed exactly.
 //
 // The open and close are pair-ops.ts, which serve's strategy loop runs too (serve-pair.ts).
+//
+// refuse-band and refuse-notional take no trader lock, build no relayer and place no venue order: their only calls are
+// refresh_prices (when the stored price is stale) and one hl_order the contract is expected to refuse, one at a time.
+// They are safe to run while serve trades the desk with the same operator key (an InvalidNonce from that shared key is
+// retried with a fresh nonce). Whatever the contract answers, no signature goes to any venue.
 
 import { existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -76,6 +84,7 @@ import type { OpsCtx } from './pair-ops.ts';
 import {
   ORDERS_PER_PART, buildPair, hlInfo, phoenixExchange, planClose, planOpen, policyMarketMismatches, refs, sendClose, sendOpen, storedPrice, traderState,
 } from './pair-ops.ts';
+import { REFUSE_COMMANDS, refuse } from './refuse-lib.ts';
 import { checkContractNetwork, contractEnv } from './serve-contract.ts';
 
 const USAGE = `usage: node --env-file=<engine env> engine/src/cli/pair-mainnet.ts <command> [--send]
@@ -84,7 +93,11 @@ const USAGE = `usage: node --env-file=<engine env> engine/src/cli/pair-mainnet.t
   defund-phoenix <usdc|all>
   open <symbol> <legUsd> --short hyperliquid --long phoenix [--leverage 2] [--hold-days 7] [--basis-bps 10] [--slippage-bps 50]
        [--reprice-s 30] [--maker-timeout-s 120] [--max-orders 6] [--taker-fallback] [--priority-microlamports 100000]
-  close <symbol> [--slippage-bps 50] [--reprice-s 30] [--maker-timeout-s 120] [--max-orders 6] [--taker-fallback] [--priority-microlamports 100000]`;
+  close <symbol> [--slippage-bps 50] [--reprice-s 30] [--maker-timeout-s 120] [--max-orders 6] [--taker-fallback] [--priority-microlamports 100000]
+  refuse-band <symbol>       a real order outside the price band to hl_order: the contract refuses it on chain (E_PRICE_BAND)
+  refuse-notional <symbol>   a real order over max_notional_usd to hl_order: the contract refuses it on chain (E_SIZE)
+    Both are safe to run while serve trades: no trader lock, no venue order, one NEAR call at a time; nothing is ever
+    forwarded to a venue, whatever the contract answers.`;
 
 const say = (line = '') => console.log(line);
 const envVar = (name: string): string | undefined => {
@@ -139,7 +152,7 @@ setTimeout(() => process.exit(), 300).unref();
 
 async function main(argv: string[]): Promise<void> {
   const args = parseArgs(argv);
-  if (!['status', 'fund-phoenix', 'defund-phoenix', 'open', 'close'].includes(args.command)) throw new UsageError(`unknown command ${args.command}`);
+  if (!['status', 'fund-phoenix', 'defund-phoenix', 'open', 'close', ...Object.keys(REFUSE_COMMANDS)].includes(args.command)) throw new UsageError(`unknown command ${args.command}`);
   const tree = linkedWorktree();
   if (args.send && tree) throw new Error('this checkout is a linked git worktree: --send refuses here; run it from the main checkout');
   const cfg = contractEnv(envVar, 'mainnet', { signing: args.send });
@@ -148,8 +161,9 @@ async function main(argv: string[]): Promise<void> {
   if (args.send && (cfg.privateKey === undefined || cfg.accountId === undefined)) throw new Error('--send needs OPERATOR_ACCOUNT_ID and OPERATOR_PRIVATE_KEY in the env file');
   // One trader per desk: --send holds the lock a serve with GIMBAL_TRADE=1 takes (trade/trader-state.ts) for its whole
   // run, so serve can neither trade next to it nor start in the middle of an open or close and adopt a half-built pair.
+  // refuse-* take no lock: they place no venue order and run beside serve (the header).
   let lock: TraderLock | null = null;
-  if (args.send) {
+  if (args.send && REFUSE_COMMANDS[args.command] === undefined) {
     const path = traderLockPath(envVar, 'mainnet', cfg.contractId, cfg.deskId);
     try {
       lock = acquireTraderLock(path);
@@ -186,6 +200,29 @@ async function run(args: Args, cfg: NonNullable<ReturnType<typeof contractEnv>>,
   if (args.send) {
     const [account, allowance] = await Promise.all([transport.account(), transport.allowance()]);
     say(`signer    ${cfg.accountId}: ${formatNear(account.amount)}, allowance ${allowance === null ? 'unlimited' : formatNear(allowance)}`);
+  }
+  const refusal = REFUSE_COMMANDS[args.command];
+  if (refusal !== undefined) {
+    // Before any relayer or venue submitter exists: this path has none.
+    const symbolArg = args.positional[0];
+    if (symbolArg === undefined || args.positional.length > 1) throw new UsageError(`${args.command} needs one <symbol>`);
+    if (Object.keys(args.flags).some((f) => f !== '--send')) throw new UsageError(`${args.command} takes no option but --send`);
+    const hl = new HyperliquidReader({ network: 'mainnet', url: `${hlUrl}/info` });
+    process.exitCode = await refuse({
+      kind: refusal, symbol: symbolArg.toUpperCase(), send: args.send, deskId: cfg.deskId, desk, client,
+      prices: {
+        maxAgeS: desk.policy.oracle_max_age_s, send: args.send, read: (symbol) => storedPrice(client, symbol),
+        refresh: (symbol, maxAgeS) => client.refreshPrices([symbol], { maxAgeS }), now: () => Date.now(), log: say, ...newPriceState(),
+        landed: refreshLanded,
+      },
+      bestAsk: async (symbol) => {
+        const px = (await hl.book(symbol, 5)).asks[0]?.px;
+        if (px === undefined) throw new Error(`no asks on Hyperliquid ${symbol}`);
+        return px;
+      },
+      say,
+    });
+    return;
   }
 
   const sol: DeskSolanaAccounts = { authority: desk.solana.authority, traderAccount: desk.solana.phoenix_trader, usdcAta: desk.solana.usdc_ata, phusdAta: desk.solana.phusd_ata };

@@ -882,7 +882,15 @@ node --env-file=... engine/src/cli/pair-mainnet.ts fund-phoenix 15            # 
 node --env-file=... engine/src/cli/pair-mainnet.ts defund-phoenix all         # Phoenix withdraw -> Ember unwrap -> USDC
 node --env-file=... engine/src/cli/pair-mainnet.ts open ETH 15 --short hyperliquid --long phoenix --leverage 2
 node --env-file=... engine/src/cli/pair-mainnet.ts close ETH
+node --env-file=... engine/src/cli/pair-mainnet.ts refuse-band ETH            # an order outside the band: E_PRICE_BAND on chain
+node --env-file=... engine/src/cli/pair-mainnet.ts refuse-notional ETH        # an order over max_notional_usd: E_SIZE on chain
 ```
+
+- `refuse-band` / `refuse-notional` send one real Hyperliquid order (a small post-only buy at twice the band above
+  the stored price; or inside the band at twice the cap) to `hl_order`, so the contract refuses it in a failed
+  transaction; `--send` prints its nearblocks link and the exact error (exit 0 when it is the expected one) and costs
+  about 0.001 NEAR, plus one `refresh_prices` when the stored price is stale. No trader lock, no venue order, one NEAR
+  call at a time: safe while serve runs. A signature the contract returns anyway is never forwarded (exit 4, warning).
 
 - Every Phoenix transaction is one legacy message signed by `sol_sign` (compute budget first, fee at most 600,000
   lamports; orders at the 600k unit limit and `--priority-microlamports`, default 100,000, at most 200,000). The money
@@ -937,7 +945,7 @@ node --env-file=... engine/src/cli/pair-mainnet.ts close ETH
 Serve (`engine/src/cli/serve-pair.ts`, `docs/interfaces.md` "serve pair") holds the open pair with reduce-only
 closes only (panic_close, a rescue's reduce, the ADL unwind). It trades only with `GIMBAL_TRADE=1`, from the main
 checkout, never with `--once`, and holds the per-desk trader lock that `pair-mainnet --send` takes too: stop serve
-before any `pair-mainnet --send`.
+before any `pair-mainnet --send` (except `refuse-band` and `refuse-notional`, which take no lock and place no order).
 
 1. Check both legs: `npm run monitor -w engine -- --mainnet` (read-only).
 2. First start, no trader state file yet:
