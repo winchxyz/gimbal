@@ -14,7 +14,7 @@ import { maskAccount, maskIf, maskIn } from './mask.ts';
 
 const OWNER = 'ada-the-owner.testnet';
 const OPERATOR = 'gimbal-operator-7.testnet';
-const TARGET: SecurityTarget = { contractId: 'gimbal-c6-fcf135.testnet', deskId: 'main', mode: 'testnet' };
+const TARGET: SecurityTarget = { contractId: 'gimbal-demo.testnet', deskId: 'main', mode: 'testnet' };
 
 /** The fake chain, with an operator account set and the treasury paid to the owner, so every place an id can show is covered. */
 async function world(): Promise<Chain> {
@@ -67,7 +67,7 @@ test('remote: the Security data holds no full owner or operator id, and the ids 
   // the contract id and the desk id stay whole, with their link
   assert.equal(data.target.contractId, TARGET.contractId);
   assert.equal(data.target.deskId, 'main');
-  assert.match(nearUrl(data.target.contractId, 'testnet') ?? '', /^https:\/\/testnet\.nearblocks\.io\/address\/gimbal-c6-fcf135\.testnet$/);
+  assert.match(nearUrl(data.target.contractId, 'testnet') ?? '', /^https:\/\/testnet\.nearblocks\.io\/address\/gimbal-demo\.testnet$/);
   // the owner's keys were still read for the real account
   assert.equal(data.keys.length, 2);
 });
