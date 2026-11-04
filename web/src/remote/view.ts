@@ -139,7 +139,8 @@ export function createViewClient(target: ViewTarget, deps: ViewDeps = {}): ViewC
 
   function refusal(response: Response, route: string): ViewError {
     const status = response.status;
-    // A ticket the engine will not take (spent, expired, or voided by a restart) is not a rejected token: ask for a new one.
+    // A ticket the engine will not take (spent, expired, voided by a restart, or refused at the stream cap, which answers 401 to
+    // bad credentials before 503) is not a rejected token: ask for a new one.
     if (status === 401) {
       if (route === '/events') return new ViewError('status', 'the engine did not take the stream ticket');
       rejected = true;
