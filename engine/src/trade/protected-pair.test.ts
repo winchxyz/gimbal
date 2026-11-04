@@ -759,6 +759,84 @@ test('the takeover guard: removed only by its maker, and a stale one only while 
   }
 });
 
+test('a dead starter\'s empty guard is removed only while it is that same file: a fresh empty guard made meanwhile is a live starter\'s', () => {
+  const dir = tempDir();
+  try {
+    const path = join(dir, 'locks', 'trader.lock');
+    const guard = `${path}.takeover`;
+    const me = { pid: 1, startedMs: 1, id: 'starter-a', boot: null };
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, lockText({ pid: 1, startedMs: 1, id: 'killed', boot: null }));
+    beatAgo(path, LOCK_STALE_MS + 60_000);
+    // A starter died between making the guard and writing its token: an empty guard, old.
+    writeFileSync(guard, '');
+    beatAgo(guard, LOCK_HEARTBEAT_MS + 5_000);
+    // Between this starter's read of it and the removal, another starter removes it and makes its own, empty too
+    // (it has not written its token yet): the same text, but another file, just made.
+    let swapped = false;
+    assert.throws(() => acquireTraderLock(path, {
+      onExit: false, me, alive: () => false, timers: noTimers,
+      onTakeover: (stage) => {
+        if (stage !== 'stale-guard' || swapped) return;
+        swapped = true;
+        rmSync(guard);
+        writeFileSync(guard, '');
+      },
+    }), /another process is taking over the stale trader lock .* now/);
+    assert.equal(swapped, true);
+    assert.equal(existsSync(guard), true, 'the live starter\'s guard is left alone');
+    assert.equal(parseLockText(readFileSync(path, 'utf8'))?.id, 'killed', 'nothing taken over under it');
+    // Once that one is old too (its starter died as well), it is removed and the lock taken over.
+    beatAgo(guard, LOCK_HEARTBEAT_MS + 5_000);
+    const lock = acquireTraderLock(path, { onExit: false, me, alive: () => false, timers: noTimers });
+    assert.match(lock.tookOver ?? '', /was stale/);
+    assert.equal(existsSync(guard), false);
+    lock.release();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the heartbeat goes on through a lock it cannot read (EIO, EMFILE, a file not written yet); it stops only for a lock that names another holder', () => {
+  const dir = tempDir();
+  try {
+    const path = join(dir, 'locks', 'trader.lock');
+    const me = { pid: 1, startedMs: 1, id: 'holder', boot: null };
+    const before = lockHeartbeats();
+    const lock = acquireTraderLock(path, { onExit: false, me, timers: noTimers });
+    assert.equal(lock.beat(), true);
+    // A read that fails: the lock path is briefly not a readable file (here a directory: EISDIR on read).
+    const text = readFileSync(path, 'utf8');
+    rmSync(path);
+    mkdirSync(path);
+    assert.equal(lock.beat(), false, 'nothing touched');
+    assert.equal(lock.beating(), true, 'a failed read does not stop the heartbeat');
+    assert.equal(lockHeartbeats(), before + 1);
+    // Gone for a moment: the same.
+    rmSync(path, { recursive: true });
+    assert.equal(lock.beat(), false);
+    assert.equal(lock.beating(), true);
+    // A file that names no one yet (a starter between making it and writing it): not proof of another holder.
+    writeFileSync(path, '');
+    assert.equal(lock.beat(), false);
+    assert.equal(lock.beating(), true);
+    // Readable again and still this holder's: touched.
+    writeFileSync(path, text);
+    beatAgo(path, 20_000);
+    assert.equal(lock.beat(), true);
+    assert.ok(Date.now() - statSync(path).mtimeMs < 5_000, 'touched');
+    // Read, and it names another holder: the heartbeat stops for good, and release leaves that lock alone.
+    writeFileSync(path, lockText({ pid: 2, startedMs: 2, id: 'the-new-holder', boot: null }));
+    assert.equal(lock.beat(), false);
+    assert.equal(lock.beating(), false);
+    assert.equal(lockHeartbeats(), before);
+    lock.release();
+    assert.equal(parseLockText(readFileSync(path, 'utf8'))?.id, 'the-new-holder');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a stale lock let go between the re-read and the unlink is judged again, not an error', () => {
   const dir = tempDir();
   try {
