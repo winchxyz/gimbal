@@ -431,7 +431,7 @@ export function serveOrderly(input: ServeOrderlyInput): ServeOrderly | null {
   const accountId = normalizeAccountId(rawId);
   const orderlyKey = `ed25519:${input.desk.solana.authority}`;
   const clock = input.clock ?? systemClock;
-  const signing = input.signer ?? operatorSigner(input.env, input.mode, input.log);
+  const signing = input.signer ?? operatorClient(input.env, input.mode, input.log);
   // The contract's client is built at the first signature, so a NEAR RPC that is down at start delays the session
   // (retried at the keeper's pace) instead of serve's start.
   let pending: Promise<OrderlySigner> | null = null;
@@ -616,7 +616,7 @@ export function orderlyPairSide(orderly: ServeOrderly, o: { log: (line: string) 
       }
       const leg = new OrderlyLeg({
         relayer, readPositions: () => orderly.client.positions(`serve: read the Orderly ${spec.symbol} leg`), stream: orderly.legStream,
-        symbol: spec.symbol, lot: lotQty(String(m.lotSize)), baseMin: lotQty(String(m.baseMin)), quoteTick: m.tickSize!, minNotional: m.minNotional,
+        symbol: spec.symbol, lot: lotQty(m.lotSize.toFixed(8)), baseMin: lotQty(m.baseMin.toFixed(8)), quoteTick: m.tickSize!, minNotional: m.minNotional,
         maxNotionalUsd: spec.maxNotionalUsd, oraclePx: spec.oraclePx, ...(spec.maxSz === undefined ? {} : { maxSz: spec.maxSz }),
         bestPx: async (side) => {
           const book = await orderly.reader.book(spec.symbol, 5);
@@ -652,6 +652,34 @@ export function orderlyPairSide(orderly: ServeOrderly, o: { log: (line: string) 
   };
 }
 
+/** How long serve waits for its Orderly session to be live before the pair trader's start reads over it. */
+export const ORDERLY_START_WAIT_MS = 45_000;
+
+/**
+ * Opens the session (start) and waits until it is live (logged in, subscribed and seeded) or `deadlineMs` passed. The
+ * pair trader's start reads the desk's Orderly positions over the session; read before it is live, the start fails and
+ * the pair stays alert only (no ADL watch, no rescue reduce) until its backoff retries. Never throws: why the session
+ * is not live yet (the start then reads it as down and retries), or null.
+ */
+export async function startOrderlySession(
+  orderly: Pick<ServeOrderly, 'start' | 'status'>,
+  o: { deadlineMs?: number; pollMs?: number; now?: () => number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<string | null> {
+  const now = o.now ?? Date.now;
+  const sleep = o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const deadlineMs = o.deadlineMs ?? ORDERLY_START_WAIT_MS;
+  const end = now() + deadlineMs;
+  orderly.start();
+  while (orderly.status().state !== 'live') {
+    if (now() >= end) {
+      const s = orderly.status();
+      return `the Orderly session is not live after ${deadlineMs / 1000} s (${s.state}${s.why === null ? '' : `: ${s.why}`})`;
+    }
+    await sleep(o.pollMs ?? 250);
+  }
+  return null;
+}
+
 /** The risk start line's Orderly part: the words serve printed before this flag when it is off. */
 export function riskOrderlyNote(orderly: Pick<ServeOrderly, 'accountId'> | null): string {
   return orderly === null
@@ -659,14 +687,24 @@ export function riskOrderlyNote(orderly: Pick<ServeOrderly, 'accountId'> | null)
     : `(Orderly account ${orderly.accountId} over its private stream, ${ORDERLY_PAIRS_ENV}=1: one orderly_ws_auth signature a session; unknown while the session is down)`;
 }
 
-/** The contract client on the operator key (as serve-pair and serve-rescue build theirs); the key is never printed. */
-function operatorSigner(env: (name: string) => string | undefined, mode: Mode, log: (line: string) => void): () => Promise<OrderlySigner> {
+/**
+ * The contract client on the operator key, built once at its first use (a failed build is tried again at the next);
+ * the key is never printed. serve hands the same one to the Orderly session and to the pair trader
+ * (ServePairInput.operator), so every signature on that key goes through one transport and one nonce: two transports
+ * on one key would collide on nonces, and the InvalidNonce retries would widen the gap between a Hyperliquid fill and
+ * its Orderly IOC. Throws a ConfigError at once when the operator key is not configured.
+ */
+export function operatorClient(env: (name: string) => string | undefined, mode: Mode, log: (line: string) => void): () => Promise<NearContractClient> {
   const cfg = contractEnv(env, mode, { signing: true });
   if (cfg === null) throw new ConfigError(`${ORDERLY_PAIRS_ENV}=1 needs GIMBAL_CONTRACT_ID, DESK_ID and the operator key (it signs orderly_ws_auth)`);
+  let made: NearContractClient | null = null;
   return async () => {
-    const transport = new NearApiTransport({
-      network: cfg.network, accountId: cfg.accountId!, privateKey: cfg.privateKey!, ...(cfg.rpcUrl === undefined ? {} : { rpcUrl: cfg.rpcUrl }),
-    });
-    return new NearContractClient({ contractId: cfg.contractId, network: cfg.network, transport, onHealth: (s, d) => log(`orderly near ${s}: ${d}`) });
+    if (made === null) {
+      const transport = new NearApiTransport({
+        network: cfg.network, accountId: cfg.accountId!, privateKey: cfg.privateKey!, ...(cfg.rpcUrl === undefined ? {} : { rpcUrl: cfg.rpcUrl }),
+      });
+      made = new NearContractClient({ contractId: cfg.contractId, network: cfg.network, transport, onHealth: (s, d) => log(`operator near ${s}: ${d}`) });
+    }
+    return made;
   };
 }

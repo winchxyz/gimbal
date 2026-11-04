@@ -185,6 +185,7 @@ export function traderStateJson(s: TraderFileState): Record<string, unknown> {
         index: u.index, refs: u.refs.map(refJson), until: u.until, from: u.from.toString(),
         unwind: u.unwind === null ? null : { to: u.unwind.to.toString(), reason: u.unwind.reason, failed: u.unwind.failed },
       })),
+      ...(t.replay === undefined || t.replay.length === 0 ? {} : { replay: t.replay.map((r) => ({ index: r.index, until: r.until })) }),
     },
     pendingMaker: s.pendingMaker.map((p) => ({ cloid: p.cloid, oid: p.oid, side: p.side, size: p.size })),
     inFlight: s.inFlight.map((f) => ({ ...f })),
@@ -286,6 +287,13 @@ function parseTrader(v: unknown, path: string): PairTraderState {
         }),
       };
     }),
+    // Written only while a replay watch runs (an Orderly leg's); a file without it has none.
+    ...(t.replay === undefined ? {} : {
+      replay: list(t.replay, `${path}.replay`).map((x, i) => {
+        const r = obj(x, `${path}.replay[${i}]`);
+        return { index: index(r.index, `${path}.replay[${i}].index`), until: time(r.until, `${path}.replay[${i}].until`) };
+      }),
+    }),
   };
 }
 
@@ -338,6 +346,9 @@ function checkLegVenues(s: LoadedTraderFile): void {
     for (const [j, r] of u.refs.entries()) {
       if (r.venue !== venueAt(u.index)) bad(`state.trader.unsettled[${i}].refs[${j}].venue`, `${r.venue}, but leg ${u.index} is ${venueAt(u.index)}`);
     }
+  }
+  for (const [i, r] of (s.trader?.replay ?? []).entries()) {
+    if (venueAt(r.index) !== 'orderly') bad(`state.trader.replay[${i}].index`, `leg ${r.index} is ${venueAt(r.index)}, which cannot be replayed`);
   }
   if (s.pendingMaker.length > 0 && !shape.legs.some((l) => l.venue === 'hyperliquid')) bad('state.pendingMaker', 'Hyperliquid post-only orders, but no leg is on Hyperliquid');
 }

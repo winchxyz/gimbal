@@ -1205,8 +1205,10 @@ the one computed from its account; on an account with several positions the comp
 the venue gives none either the distance is the account basis, (equity − maintenance) ÷ the account's whole
 notional. In serve the venues are the desk's Hyperliquid and Phoenix accounts, plus its Orderly account with
 `GIMBAL_ORDERLY_PAIRS=1` (default off; `engine/src/cli/serve-orderly.ts`): serve then keeps the desk's private Orderly
-session open from the moment serve listens (one `orderly_ws_auth` and the `positions` and `holding` reads per
-session, through the operator key), reopens a session that held 10 min at once and otherwise after 60 s doubling to
+session open from right before the pair trader starts, which waits for it to be live at most 45 s (its start reads
+the desk's Orderly positions over it; not live by then, the start retries on its backoff), one `orderly_ws_auth` and
+the `positions` and `holding` reads per session, signed by the same operator contract client as the pair's relayer;
+it reopens a session that held 10 min at once and otherwise after 60 s doubling to
 15 min (back to 60 s once a session is live; never two opens within 30 s), re-reads a seed read that failed on the
 same backoff, and never re-reads one that answered with rows it cannot use (it waits for a push). It reads the Orderly
 account as unknown at once, without waiting (a failed read: Orderly down, its legs kept at their last numbers, at
@@ -1223,8 +1225,10 @@ market's lot is known. The book reads that leg's fills from the session's `execu
 the first `onUp`: a window reaching back before it, or over a time the session was down, is unknown, never "nothing
 filled") and its funding from the signed `funding_fee_history` read; the health map gets an `orderly` key. Orderly
 stays a non-rescue venue (1.5x at most): a window its free margin cannot open at the $10 minimum is refused in those
-words and journaled once. A rotation between pairs on other legs closes the old pair first and waits out an Orderly
-leg's 300 s replay watch. Lines (`thresholds.ts`):
+words and journaled once. A rotation out of a held pair with an Orderly leg is refused before anything closes (its
+close arms a 300 s replay watch no other pair could open through, which would leave the desk flat) and journaled; the
+watch is saved in the trader state (`trader.replay`, only while one runs, so a short Hyperliquid / long Phoenix file
+is unchanged) and restored after a restart. Lines (`thresholds.ts`):
 - rescue line = `max(rescueDistancePct, (exp(4 σ √185 s) − 1) × 100)`, where σ is the leg's realised volatility per
   √s over the last 30 min (at least 10 returns, else the owner's line alone) and 185 s is the slow rescue measured on
   mainnet (a 120 s MPC signature plus a 65 s 1Click transfer);

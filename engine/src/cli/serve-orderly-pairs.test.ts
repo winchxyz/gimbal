@@ -37,6 +37,11 @@ import type { ContractSide } from './serve-contract.ts';
 import { loopBook, serveLoop, windowSymbol } from './serve-loop.ts';
 import type { BuiltLegs, ServeOrderly, ServePair, ServePairInput } from './serve-pair.ts';
 import { fullLegs, servePair } from './serve-pair.ts';
+import { traderStateFile } from '../trade/trader-state.ts';
+import { REPLAY_WINDOW_MS } from '../trade/pair.ts';
+import type { OrderlySessionStatus } from './serve-orderly.ts';
+import { startOrderlySession } from './serve-orderly.ts';
+import { NothingExecuted } from '../relayer/tx.ts';
 
 const dirs: string[] = [];
 after(() => {
@@ -63,6 +68,8 @@ class FakeLeg implements TradeLeg {
   readonly replayable: boolean;
   readonly makerOrder?: (side: LegSide, size: bigint, reduceOnly: boolean, reason: string) => Promise<LegOutcome>;
   pos = 0n;
+  /** The next IOCs: how much each fills (less than asked: partly), or 'refuse' (signed, nothing filled). */
+  next: (bigint | 'refuse')[] = [];
   readonly venue: VenueId;
   readonly symbol: string;
   readonly #desk: Desk;
@@ -90,13 +97,20 @@ class FakeLeg implements TradeLeg {
   async cancelPending(): Promise<string[]> {
     return [];
   }
-  #fill(side: LegSide, size: bigint, reduceOnly: boolean, how: 'maker' | 'ioc'): LegOutcome {
+  #fill(side: LegSide, asked: bigint, reduceOnly: boolean, how: 'maker' | 'ioc'): LegOutcome {
     const at = this.#desk.now;
-    this.#desk.timeline.push(`${this.venue} ${this.symbol} ${how} ${side}${reduceOnly ? ' reduce-only' : ''}`);
+    const plan = how === 'ioc' ? this.next.shift() : undefined;
+    const id = ++this.#desk.orderIds;
+    const tx = [{ chain: 'near' as const, id: `t${id}`, url: '' }];
+    if (plan === 'refuse') {
+      this.#desk.timeline.push(`${this.venue} ${this.symbol} ${how} ${side}${reduceOnly ? ' reduce-only' : ''} refused`);
+      return { kind: 'failed', error: new NothingExecuted(this.venue, 'the IOC filled nothing'), ref: { venue: this.venue, side, size: String(asked), reduceOnly, orderId: `o${id}`, clientId: null, tx, sentAt: at } };
+    }
+    const size = plan ?? asked;
+    this.#desk.timeline.push(`${this.venue} ${this.symbol} ${how} ${side}${reduceOnly ? ' reduce-only' : ''}${size === asked ? '' : ` ${qtyNumber(size)} of ${qtyNumber(asked)}`}`);
     this.pos += side === 'BUY' ? size : -size;
     const n = qtyNumber(size);
-    const id = ++this.#desk.orderIds;
-    const ref = { venue: this.venue, side, size: String(size), reduceOnly, orderId: `o${id}`, clientId: null, tx: [], sentAt: at };
+    const ref = { venue: this.venue, side, size: String(asked), reduceOnly, orderId: `o${id}`, clientId: null, tx, sentAt: at };
     if (this.venue !== 'orderly') return { kind: 'filled', filled: size, avgPx: 1, fee: n * FEE[this.venue], ref };
     // Orderly: the fee comes with the session's executionreport push (the book reads it from the fill log).
     this.#desk.fills.onExecutionReport({
@@ -124,6 +138,11 @@ interface Desk {
   lines: string[];
   fundingRows: OrderlyFundingFeeRow[];
   hlFunding: FixtureLedger;
+  /**
+   * serve's Orderly session (serveOrderly): idle until started; live `upAfterMs` after the start (null: never), the
+   * pair's start waiting for it at most `waitMs` (startOrderlySession, as serve.ts waits).
+   */
+  session: { state: 'idle' | 'opening' | 'live'; starts: number; upAfterMs: number | null; waitMs: number };
 }
 
 function desk(env: Record<string, string>): Desk {
@@ -133,6 +152,7 @@ function desk(env: Record<string, string>): Desk {
     dir, env: { LOCALAPPDATA: dir, XDG_STATE_HOME: dir, GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}`, ...env },
     now: T0 + 2 * 60_000, timeline: [], orderIds: 0, fills: new OrderlyFillLog(T0 - HOUR), legs: new Map(),
     margin: { hyperliquid: 50, phoenix: 50, orderly: 50 }, windows: [], events: [], lines: [], fundingRows: [], hlFunding: new FixtureLedger([]),
+    session: { state: 'idle', starts: 0, upAfterMs: 5, waitMs: 2_000 },
   };
 }
 
@@ -165,14 +185,19 @@ function side(): ContractSide {
 /** servePair's input as serve builds it, over the fake venues; `orderly`: the Orderly session (serveOrderly) is up. */
 function pairInput(d: Desk, onProtectionClose: ServePairInput['onProtectionClose'], orderly = true): ServePairInput {
   const s = side();
+  // The pair trader's Orderly side over the session (orderlyPairSide): nothing until the session is live.
   const session: ServeOrderly = {
-    leg: (spec) => legOf(d, 'orderly', spec.symbol),
-    account: async () => ({
+    leg: (spec) => (d.session.state === 'live' ? legOf(d, 'orderly', spec.symbol) : null),
+    ready: async () => (d.session.state === 'live' ? null : `serve's Orderly session is not up (${d.session.state})`),
+    account: async () => {
+      if (d.session.state !== 'live') throw new Error(`orderly account unknown: the private session is ${d.session.state}`);
+      return {
       venue: 'orderly', address: ACCOUNT, time: d.now, equityUsd: 100, freeMarginUsd: d.margin.orderly!, maintenanceMarginUsd: 0,
       positions: heldOn(d, 'orderly').map((l) => ({
         symbol: l.symbol, size: qtyNumber(l.pos), entryPx: 1, liqPx: null, marginUsd: 1, unrealizedPnlUsd: 0, leverage: 1, fundingSinceOpenUsd: 0, unsettledFundingUsd: 0,
       })),
-    }),
+      };
+    },
   };
   return {
     mode: 'mainnet', env: (n) => d.env[n], side: s, deskId: DESK, clock: { now: () => d.now }, log: (l) => d.lines.push(l), publish: (e) => d.events.push(e),
@@ -248,6 +273,20 @@ async function serve(d: Desk, o: { orderly?: boolean } = {}) {
     publish: (data: JournalEntry) => d.events.push({ type: 'journal', data }), clock: { now: () => d.now }, log: (l) => d.lines.push(l), loopHeld: () => loop?.held ?? null,
   });
   const booked = loopBook(book, (e) => d.events.push(e), (l) => d.lines.push(l), () => loop?.held ?? null);
+  // As serve.ts: the Orderly session opened, and waited for, before the pair's start reads over it.
+  if (o.orderly !== false) {
+    const late = await startOrderlySession({
+      start: () => {
+        if (d.session.state !== 'idle') return;
+        d.session.starts++;
+        d.session.state = 'opening';
+        const after = d.session.upAfterMs;
+        if (after !== null) setTimeout(() => { d.session.state = 'live'; }, after);
+      },
+      status: () => ({ state: d.session.state, why: null } as unknown as OrderlySessionStatus),
+    }, { deadlineMs: d.session.waitMs, pollMs: 2 });
+    d.lines.push(late === null ? 'orderly: the private session is live; the pair starts' : `orderly: ${late}`);
+  }
   const pair: ServePair = await servePair(pairInput(d, (r) => booked.protectionClose(r), o.orderly ?? true));
   const account = (venue: string) => ({
     venue, read: async (): Promise<AccountState> => ({ venue, address: 'a', time: d.now, equityUsd: 100, freeMarginUsd: d.margin[venue]!, maintenanceMarginUsd: 0, positions: [] } as unknown as AccountState),
@@ -291,14 +330,25 @@ function hlRows(hours: number[]) {
   return hours.map((t) => parseFundingRow({ time: t + 65, hash: ZERO_HASH, delta: { type: 'funding', coin: 'SOL', usdc: '0.001', szi: '-12.0', fundingRate: '0.00001', nSamples: null } } as HlFundingRow));
 }
 
-const feeRow = (symbol: string, t: number, fee: number): OrderlyFundingFeeRow & Record<string, unknown> => ({
-  symbol, funding_rate: 0.00005, mark_price: 1, funding_fee: fee, payment_type: 'Pay', status: 'Accrued', created_time: t, updated_time: t, margin_mode: 'CROSS',
+const feeRow = (symbol: string, t: number, fee: number, type: 'Pay' | 'Receive' = 'Pay'): OrderlyFundingFeeRow & Record<string, unknown> => ({
+  symbol, funding_rate: 0.00005, mark_price: 1, funding_fee: fee, payment_type: type, status: 'Accrued', created_time: t, updated_time: t, margin_mode: 'CROSS',
 });
+
+const near = (a: number | null | undefined, b: number, what: string) => assert.ok(a !== null && a !== undefined && Math.abs(a - b) < 1e-9, `${what}: ${a} vs ${b}`);
+
+/** Enters `id` through the loop's hourly checks (the session already live). */
+async function enter(d: Desk, s: Awaited<ReturnType<typeof serve>>, id: string): Promise<void> {
+  d.windows = [win(id)];
+  assert.equal(await hourly(d, s.loop, () => s.loop.held !== null), 3, JSON.stringify(decisions(d).map((x) => x.reason)));
+}
 
 test('GIMBAL_ORDERLY_PAIRS=1, HL + Orderly: the window passes the gate, opens Hyperliquid maker then the Orderly IOC, is held and booked (fees, funding), adopted again after a restart, and closed by panic_close', async () => {
   const d = desk({ GIMBAL_ORDERLY_PAIRS: '1' });
   d.windows = [win('sol-orderly-hyperliquid')];
   let s = await serve(d);
+  // The session was opened and live before the pair's start read the desk's Orderly positions over it.
+  assert.equal(d.session.starts, 1);
+  assert.equal(s.pair.unconfirmed?.() ?? null, null, s.pair.lines.join('\n'));
   assert.ok(s.pair.hands?.pairSymbols !== undefined, s.pair.lines.join('\n'));
   assert.deepEqual(s.pair.hands!.pairSymbols!('orderly', 'hyperliquid'), ['SOL', 'ETH']);
   assert.deepEqual(windowSymbol(d.windows[0]!, s.pair.hands!.symbols, s.pair.hands!.pairSymbols!.bind(s.pair.hands!)), { symbol: 'SOL' });
@@ -367,6 +417,14 @@ test('GIMBAL_ORDERLY_PAIRS=1, HL + Orderly: the window passes the gate, opens Hy
   await ticks();
   p = s.book.summary().positions[0]!;
   assert.equal(p.open, false, JSON.stringify(p));
+  // Its Orderly exit fee from the session's push (the close's fill had none), once the session was heard past it.
+  d.now += 5 * 60_000;
+  d.fills.heard(d.now + ORDERLY_LATE_PUSH_MS);
+  await s.book.sync();
+  p = s.book.summary().positions[0]!;
+  near(p.legs.find((l) => l.venue === 'orderly')!.exitFeeUsd, -12 * FEE.orderly, 'orderly exit fee');
+  near(p.legs.find((l) => l.venue === 'hyperliquid')!.exitFeeUsd, -12 * FEE.hyperliquid, 'hyperliquid exit fee');
+  assert.equal(p.unknownFees, 0);
   s.stop();
 });
 
@@ -382,11 +440,124 @@ test('GIMBAL_ORDERLY_PAIRS=1, Orderly + Phoenix: the window passes the gate and 
   assert.match(journal(d).find((j) => j.kind === 'enter')!.summary, /^enter eth-phoenix-orderly, ETH short orderly, long phoenix, at most 12 ETH/);
   await hourly(d, s.loop, () => false, 1);
   assert.equal(decisions(d).at(-1)!.action, 'hold');
+  // Booked: the short Orderly leg receives its 16:00 payment (its 8 h period); its open fee from the session's push.
+  d.fundingRows = [feeRow('PERP_ETH_USDC', T0 + 4 * HOUR, 0.004, 'Receive')];
+  d.now = T0 + 5 * HOUR + 5 * 60_000;
+  d.fills.heard(d.now + ORDERLY_LATE_PUSH_MS);
+  await s.book.sync();
+  let p = s.book.summary().positions[0]!;
+  assert.deepEqual(p.legs.map((l) => `${l.venue} ${l.side}`).sort(), ['orderly short', 'phoenix long']);
+  const ox = () => p.legs.find((l) => l.venue === 'orderly')!;
+  near(ox().entryFeeUsd, -12 * FEE.orderly, 'orderly open fee');
+  near(p.legs.find((l) => l.venue === 'phoenix')!.entryFeeUsd, -12 * FEE.phoenix, 'phoenix open fee');
+  near(ox().fundingUsd, 0.004, 'orderly funding');
   const r = await s.pair.reducer()!.close(PANIC);
   assert.equal(r.status, 'closed', r.notes.join('; '));
   assert.deepEqual(positions(d), {});
   await ticks();
+  d.now += 5 * 60_000;
+  d.fills.heard(d.now + ORDERLY_LATE_PUSH_MS);
+  await s.book.sync();
+  p = s.book.summary().positions[0]!;
+  assert.equal(p.open, false);
+  near(ox().exitFeeUsd, -12 * FEE.orderly, 'orderly exit fee');
+  assert.equal(p.unknownFees, 0);
   s.stop();
+});
+
+test('GIMBAL_ORDERLY_PAIRS=1: a session not live by the start\'s wait leaves the pair alert only (Orderly read down), and the next start attempt once it is live trades', async () => {
+  const d = desk({ GIMBAL_ORDERLY_PAIRS: '1' });
+  d.session.upAfterMs = null;
+  d.session.waitMs = 20;
+  const s = await serve(d);
+  assert.ok(d.lines.includes('orderly: the Orderly session is not live after 0.02 s (opening)'), d.lines.join('\n'));
+  assert.match(s.pair.unconfirmed?.() ?? '', /^legs unknown, start not confirmed: orderly: orderly account unknown: the private session is opening/);
+  d.session.state = 'live';
+  assert.match(await s.pair.retryStart!() ?? '', /pair start confirmed after 1 failed attempt/);
+  assert.equal(s.pair.unconfirmed?.() ?? null, null);
+  await enter(d, s, 'sol-orderly-hyperliquid');
+  assert.deepEqual(positions(d), { 'hyperliquid:SOL': -12, 'orderly:PERP_SOL_USDC': 12 });
+  s.stop();
+});
+
+test('GIMBAL_ORDERLY_PAIRS=1: a rotate out of a pair with an Orderly leg is refused before anything is closed (its close would arm the replay watch and leave the desk flat)', async () => {
+  const d = desk({ GIMBAL_ORDERLY_PAIRS: '1' });
+  const s = await serve(d);
+  await enter(d, s, 'sol-orderly-hyperliquid');
+  const sent = d.timeline.length;
+  d.windows = [win('sol-orderly-hyperliquid'), win('eth-phoenix-orderly', { netAprPct: 40 })];
+  await hourly(d, s.loop, () => false, 1);                  // the target's lots are read at a check
+  assert.equal(d.timeline.length, sent, 'one hour above is no rotation');
+  assert.deepEqual(s.loop.rotate('eth-phoenix-orderly'), { ok: true });
+  await s.loop.idle(2_000);
+  assert.equal(d.timeline.length, sent, `nothing sent: ${d.timeline.slice(sent).join(', ')}`);
+  assert.deepEqual(positions(d), { 'hyperliquid:SOL': -12, 'orderly:PERP_SOL_USDC': 12 });
+  assert.equal(s.loop.held?.windowId, 'sol-orderly-hyperliquid');
+  const refused = journal(d).filter((j) => j.kind === 'refused' && j.summary.startsWith('rotate sol-orderly-hyperliquid -> eth-phoenix-orderly'));
+  assert.equal(refused.length, 1, JSON.stringify(journal(d).map((j) => j.summary)));
+  assert.match(refused[0]!.summary, /not carried out: the held SOL pair has an Orderly leg \(PERP_SOL_USDC\): its close arms the trader's replay watch \(Orderly takes a signed copy of an order for up to 300 s\), so no other pair could open after it and the rotate would leave the desk flat; sol-orderly-hyperliquid is kept, nothing closed/);
+  s.stop();
+});
+
+test('GIMBAL_ORDERLY_PAIRS=1: the Orderly leg\'s replay watch is saved with the trader and watched again after a restart inside its 300 s; a pair on other legs waits it out', async () => {
+  const d = desk({ GIMBAL_ORDERLY_PAIRS: '1' });
+  let s = await serve(d);
+  await enter(d, s, 'sol-orderly-hyperliquid');
+  const openedAt = d.now;
+  // The loop's exit (panic_close's sweep would sleep its own watch through the window here, the clock moving with it).
+  const r = await s.pair.hands!.close({ reason: 'strategy: exit' });
+  assert.equal(r.ok, true, r.reason);
+  s.stop();
+  await ticks();
+  const file = traderStateFile(d.dir, 'mainnet', { contractId: CONTRACT, deskId: DESK, evm: EVM });
+  const saved = JSON.parse(readFileSync(file, 'utf8')) as { trader: { replay?: { index: number; until: number }[] } };
+  assert.equal(saved.trader.replay?.length, 1);
+  assert.equal(saved.trader.replay![0]!.index, 1);
+  assert.ok(saved.trader.replay![0]!.until >= openedAt + 299_000, JSON.stringify(saved.trader.replay));
+
+  // A restart inside the window: the restored trader watches the Orderly leg; a pair on other legs is not built yet.
+  d.now += 60_000;
+  s = await serve(d);
+  const leg = s.pair.pair!.trader.legs.find((l) => l.venue === 'orderly')!;
+  assert.equal(s.pair.pair!.trader.watching(leg), true, s.pair.lines.join('\n'));
+  assert.ok(d.lines.some((l) => /PERP_SOL_USDC: a signed order from before the restart can still be replayed: watched until/.test(l)));
+  const other = await s.pair.hands!.open({ symbol: 'ETH', long: 'phoenix', short: 'orderly', legUsd: 12, leverage: 1.5, reason: 'test' });
+  assert.equal(other.ok, false);
+  assert.match(other.reason, /the SOL pair is not settled: a signed orderly PERP_SOL_USDC order can still be replayed/);
+  // The same pair again is not held back: its trader keeps watching.
+  const same = await s.pair.hands!.open({ symbol: 'SOL', long: 'orderly', short: 'hyperliquid', legUsd: 12, leverage: 1.5, reason: 'test' });
+  assert.equal(same.ok, true, same.reason);
+  await s.pair.hands!.close({ reason: 'test' });
+  s.stop();
+  await ticks();
+  // Past the window: nothing saved, nothing watched.
+  d.now += REPLAY_WINDOW_MS + 60_000;
+  s = await serve(d);
+  s.stop();
+  await ticks();
+  const later = JSON.parse(readFileSync(file, 'utf8')) as { trader: Record<string, unknown> };
+  assert.equal('replay' in later.trader, false);
+});
+
+test('GIMBAL_ORDERLY_PAIRS=1: the Hyperliquid maker leg fills and the Orderly IOC is refused or fills partly: the legs are taken back flat, nothing held', async () => {
+  const refusals = (n: number): 'refuse'[] => Array.from({ length: n }, () => 'refuse' as const);
+  for (const [name, plan] of [['refused', refusals(20)], ['partly', [toQty('6'), ...refusals(2)]]] as const) {
+    const d = desk({ GIMBAL_ORDERLY_PAIRS: '1' });
+    const s = await serve(d);
+    legOf(d, 'orderly', 'PERP_SOL_USDC').next = [...plan];
+    d.windows = [win('sol-orderly-hyperliquid')];
+    await hourly(d, s.loop, () => d.timeline.length > 0);
+    const said = `${name}: ${JSON.stringify(positions(d))}; ${d.timeline.join(', ')}; held ${JSON.stringify(s.loop.held)}`;
+    assert.ok(d.timeline[0] === 'hyperliquid SOL maker SELL' && d.timeline[1]!.startsWith('orderly PERP_SOL_USDC ioc BUY'), said);
+    // The open's legging guard took both legs back to where they started, reduce-only: flat, nothing held.
+    assert.deepEqual(positions(d), {}, said);
+    assert.equal(s.loop.held, null, said);
+    assert.ok(d.timeline.includes('hyperliquid SOL ioc BUY reduce-only'), said);
+    if (name === 'partly') assert.equal(d.timeline.at(-1), 'orderly PERP_SOL_USDC ioc SELL reduce-only', said);
+    assert.ok(!journal(d).some((j) => j.kind === 'enter'), 'no enter journaled');
+    s.stop();
+    await ticks();
+  }
 });
 
 test('GIMBAL_ORDERLY_PAIRS=1: a window Orderly has too little margin for is refused in plain words, never entered, journaled once', async () => {
@@ -422,5 +593,8 @@ test('without GIMBAL_ORDERLY_PAIRS: the HL / Phoenix desk decides, opens and wri
   assert.deepEqual(Object.keys(saved.held).sort(), ['entryNetAprPct', 'legUsd', 'since', 'symbol', 'windowId']);
   assert.equal('long' in s.loop.held!, false);
   assert.ok(!d.lines.some((l) => /orderly/i.test(l)), d.lines.filter((l) => /orderly/i.test(l)).join('\n'));
+  const trader = JSON.parse(readFileSync(traderStateFile(d.dir, 'mainnet', { contractId: CONTRACT, deskId: DESK, evm: EVM }), 'utf8')) as { version: number; trader: Record<string, unknown> };
+  assert.equal(trader.version, 1);
+  assert.deepEqual(Object.keys(trader.trader).sort(), ['baselines', 'intents', 'known', 'net', 'unhedged', 'unsettled']);
   s.stop();
 });

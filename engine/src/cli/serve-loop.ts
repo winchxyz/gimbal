@@ -342,8 +342,8 @@ export function loopHands(
 }
 
 /**
- * A desk leg's symbol and a policy symbol name the same market (kPEPE and PEPE, case aside; an Orderly leg's
- * PERP_SOL_USDC and SOL).
+ * A desk leg's symbol and a policy symbol name the same market: the same name case aside, or the same base and
+ * multiplier (an Orderly leg's PERP_SOL_USDC and SOL, its PERP_1000PEPE_USDC and kPEPE; kPEPE and PEPE are not).
  */
 function sameSymbol(a: string, b: string): boolean {
   const n = (s: string) => {

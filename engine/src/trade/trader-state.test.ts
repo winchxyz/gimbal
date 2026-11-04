@@ -80,6 +80,13 @@ test('an Orderly pair is saved as version 2 with its legs and loads back as save
     assert.ok(back.kind === 'loaded');
     assert.deepEqual(back.state.pair, pair);
     assert.deepEqual(back.state.inFlight, state.inFlight);
+    assert.equal('replay' in (JSON.parse(readFileSync(store.path, 'utf8')) as { trader: object }).trader, false, 'no replay watch: no key');
+    // An Orderly leg's replay watch running: saved, and loaded back as saved.
+    store.save({ ...state, trader: { ...state.trader!, replay: [{ index: 1, until: 310_001 }] } });
+    assert.deepEqual((JSON.parse(readFileSync(store.path, 'utf8')) as { trader: { replay: unknown } }).trader.replay, [{ index: 1, until: 310_001 }]);
+    const watched = store.load();
+    assert.ok(watched.kind === 'loaded');
+    assert.deepEqual(watched.state.trader?.replay, [{ index: 1, until: 310_001 }]);
     // Orderly and Phoenix: Orderly is index 0, Phoenix stays last.
     assert.deepEqual(pairShape('SOL', 'phoenix', 'orderly'), { legs: [{ venue: 'orderly', symbol: 'PERP_SOL_USDC' }, { venue: 'phoenix', symbol: 'SOL' }], longIndex: 1 });
   } finally {
@@ -99,6 +106,9 @@ test('legs that do not add up make the file unusable, naming the field', () => {
       ...OLD_FILE, version: 2, pair: { legs: [{ venue: 'orderly', symbol: 'PERP_XLM_USDC' }, { venue: 'phoenix', symbol: 'XLM' }], longIndex: 1 }, inFlight: [], trader: null,
     }, /state\.pendingMaker: Hyperliquid post-only orders, but no leg is on Hyperliquid/],
     ['an unknown version', { ...OLD_FILE, version: 3 }, /state\.version/],
+    ['a replay watch on a leg that cannot be replayed', {
+      ...OLD_FILE, version: 2, pair: orderly, inFlight: [], trader: { ...OLD_FILE.trader, unsettled: [], replay: [{ index: 0, until: 1 }] },
+    }, /state\.trader\.replay\[0\]\.index: leg 0 is hyperliquid, which cannot be replayed/],
   ];
   for (const [what, file, why] of cases) assert.throws(() => parseTraderState(file), why, what);
 });

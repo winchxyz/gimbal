@@ -112,7 +112,8 @@ import { liveLines, pairRefreshesAtOpen, servePair } from './serve-pair.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { connectContract, contractEnv, marginVenues } from './serve-contract.ts';
 import type { OrderlyPairSide, ServeOrderly } from './serve-orderly.ts';
-import { ORDERLY_PAIRS_ENV, orderlyPairSide, orderlyPairsOn, riskOrderlyNote, serveOrderly } from './serve-orderly.ts';
+import { ORDERLY_PAIRS_ENV, ORDERLY_START_WAIT_MS, operatorClient, orderlyPairSide, orderlyPairsOn, riskOrderlyNote, serveOrderly, startOrderlySession } from './serve-orderly.ts';
+import type { NearContractClient } from '../contract/near-client.ts';
 import { startEgressLog } from './serve-egress.ts';
 import type { LoopAccount } from './serve-loop.ts';
 import { loopBook, loopGates, serveLoop } from './serve-loop.ts';
@@ -345,8 +346,11 @@ let rescueLive: () => boolean = () => false;
 const loopAccounts: LoopAccount[] = [];
 // GIMBAL_ORDERLY_PAIRS=1 (cli/serve-orderly.ts): the desk's Orderly private session, read by the risk engine and the
 // loop's free margin; also what a later Orderly leg is built from. Off (the default): null, nothing opened or signed.
-// Built (and its configuration checked) here; its first session opens, and signs, only once the server listens.
+// Built (and its configuration checked) here; its first session opens, and signs, right before the pair trader starts
+// (which reads the desk's Orderly positions over it).
 let orderly: ServeOrderly | null = null;
+// The contract client on the operator key the session signs with; the pair's relayer signs through the same one.
+let operator: (() => Promise<NearContractClient>) | null = null;
 // The pair trader's Orderly side and the book's Orderly fills over that session (listening from before its first onUp).
 let orderlySide: OrderlyPairSide | null = null;
 if (orderlyPairsOn(envVar)) {
@@ -354,7 +358,8 @@ if (orderlyPairsOn(envVar)) {
   else if (values.once === true) log(`${ORDERLY_PAIRS_ENV}=1: the Orderly private session is not opened with --once (it signs orderly_ws_auth); Orderly legs are not read`);
   else {
     try {
-      orderly = serveOrderly({ mode, env: envVar, deskId, desk: contract.desk, log, clock });
+      operator = operatorClient(envVar, mode, log);
+      orderly = serveOrderly({ mode, env: envVar, deskId, desk: contract.desk, log, clock, signer: operator });
       orderlySide = orderly === null ? null : orderlyPairSide(orderly, { log, clock });
     } catch (err) {
       fail(`orderly: ${errorMessage(err)}`);
@@ -406,11 +411,17 @@ let protectionClosed: (report: ProtectionCloseReport) => void = () => {};
 if (contract !== null && deskId !== null) {
   const side = contract;
   const id = deskId;
+  // GIMBAL_ORDERLY_PAIRS=1: the session live first, so the pair's start can read the desk's Orderly positions.
+  if (orderly !== null) {
+    const late = await startOrderlySession(orderly, { deadlineMs: ORDERLY_START_WAIT_MS });
+    log(late === null ? 'orderly: the private session is live; the pair starts' : `orderly: ${late}; the pair starts anyway and reads Orderly again with its backoff`);
+  }
   pair = await servePair({
     mode, env: envVar, side, deskId: id, clock, log, publish, linkedWorktree: linkedWorktree(), once: values.once === true,
     onProtectionClose: (report) => protectionClosed(report),
     ...(stateDirSet === undefined ? {} : { stateDir: resolve(stateDirSet) }),
     ...(orderlySide === null ? {} : { orderly: orderlySide }),
+    ...(operator === null ? {} : { operator }),
     // Review S1: a start read that fails degrades the pair (alert only, legs unknown, retried); health says which venue.
     health: (venue, status, detail) => {
       venueHealth.pairStart(venue, status, detail);
@@ -617,8 +628,7 @@ server = new EngineServer({
 
 const listening = await server.start(port, host);
 risk?.start();
-// The Orderly session's first ws_auth, once every start step before it went through (GIMBAL_ORDERLY_PAIRS=1 only).
-orderly?.start();
+// GIMBAL_ORDERLY_PAIRS=1: the Orderly session was opened before the pair's start (startOrderlySession).
 // GIMBAL_LOG_EGRESS=1 only: the public IPv4 addresses serve's traffic leaves from, now and hourly (never fatal).
 const egress = startEgressLog({ env: envVar, log });
 publishHealth();

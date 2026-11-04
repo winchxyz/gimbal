@@ -95,6 +95,9 @@ export function policyLists(policy: Pick<ContractPolicy, 'hl_assets' | 'phoenix_
  * The policy symbols a pair long `long` / short `short` can be opened on: both venues list it (Orderly's
  * PERP_<symbol>_USDC in orderly_symbols). In the policy's order (hl_assets, then phoenix_markets, then orderly_symbols);
  * none when the two venues are not a pair.
+ * Known limit: a pair with an Orderly leg matches by name only (venueSymbol), so a market Orderly names otherwise is
+ * never paired: Hyperliquid's kPEPE is Orderly's PERP_1000PEPE_USDC, its GOLD is PERP_XAU_USDC (the book maps those,
+ * book/orderly.ts orderlyBookSymbol; the trader does not).
  */
 export function pairSymbols(policy: Pick<ContractPolicy, 'hl_assets' | 'phoenix_markets' | 'orderly_symbols'>, long: VenueId, short: VenueId): string[] {
   if (long === short || !PAIR_VENUES.includes(long) || !PAIR_VENUES.includes(short)) return [];
