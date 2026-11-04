@@ -189,6 +189,9 @@ test('a failure says why, how many tries and what the desk does next', () => {
     amount: '$120.00',
     text: 'Phoenix free margin → Hyperliquid margin, through NEAR Intents',
   });
+  // Each label names what the engine's amount is at that step: the need, what is sent, what landed after fees.
+  assert.equal(movingOf(progress('detect', 0), null).label, 'The leg needs');
+  assert.equal(movingOf(progress('source', 1), null).label, 'Moving');
   assert.equal(movingOf(progress('landed', 52, { from: 'reserve' }), null).label, 'Moved');
   assert.match(movingOf(progress('sign', 5, { from: 'reserve' }), null).text, /^Reserve → Hyperliquid margin/);
 });

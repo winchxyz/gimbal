@@ -187,10 +187,15 @@ export interface MovingView {
   text: string;
 }
 
+/**
+ * The engine's amount means what the step can say (RescueProgress.amountUsd): at detect what the leg needs, before
+ * a transfer is planned; from source on what the transfer sends; once landed what reached the margin after fees.
+ */
 export function movingOf(p: RescueProgress, failure: RescueFailure | null): MovingView {
   const route = `${p.from === 'reserve' ? 'Reserve' : `${VENUE_NAMES[p.from]} free margin`} → ${VENUE_NAMES[p.to]} margin, through NEAR Intents`;
   if (p.step === 'failed') return { label: 'The desk tries next', amount: null, text: nextText(failure) };
-  return { label: p.step === 'landed' ? 'Moved' : 'Moving', amount: usd(p.amountUsd), text: route };
+  const label = p.step === 'detect' ? 'The leg needs' : p.step === 'landed' ? 'Moved' : 'Moving';
+  return { label, amount: usd(p.amountUsd), text: route };
 }
 
 /** The line under the distance in the hero. */

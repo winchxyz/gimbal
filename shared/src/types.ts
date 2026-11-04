@@ -176,6 +176,8 @@ export interface JournalEntry {
 }
 
 export interface RescueProgress {
+  // amountUsd: at `detect` what the leg needs; from `source` on what the planned transfer sends (a capped or
+  // fixed-size move can be less than the need); at `landed` what reached the margin after 1Click's fees.
   id: string; from: VenueId | 'reserve'; to: VenueId; amountUsd: number;
   step: 'detect' | 'source' | 'quote' | 'verify' | 'sign' | 'deposit' | 'landed' | 'failed';
   startedAt: number; elapsedS: number; tx: TxRef[];
