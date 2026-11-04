@@ -99,7 +99,7 @@
 import type { ContractPolicy, Leg, Mode, RescueFailure, RescueProgress, StreamEvent, TxRef, VenueId } from '@gimbal/shared';
 import { OutcomeUnknown } from '../contract/types.ts';
 import type { RescueTrigger } from '../risk/engine.ts';
-import type { PairResult } from '../trade/pair.ts';
+import type { LegReport, PairResult } from '../trade/pair.ts';
 import type { TradeLeg } from '../trade/legs.ts';
 import { NothingExecuted } from '../relayer/tx.ts';
 import { abs, floorToLot, qtyString } from '../trade/lots.ts';
@@ -248,12 +248,21 @@ export interface LandingPort {
   find(venue: VenueId, q: VerifiedQuote, sinceMs: number, seen: ReadonlySet<string>, deliveryTx?: readonly string[]): Promise<LedgerEntry | null>;
 }
 
+/** A reducer's close: the pair's two legs, or every position panic_close's Orderly sweep closed (serve-pair). */
+export type ReduceResult = Omit<PairResult, 'legs'> & { legs: LegReport[] };
+
 /** The pair trader's close, as a reduce uses it. */
 export interface Reducer {
-  readonly legs: readonly [TradeLeg, TradeLeg];
+  /** The pair's legs (none on a panicOnly reducer). */
+  readonly legs: readonly TradeLeg[];
   readonly lot: bigint;
+  /**
+   * Set on a reducer only panic_close may use (serve's Orderly sweep while no pair trader holds the legs): why a
+   * rescue's reduce cannot use it. The rescuer then plans and runs no reduce, as with no reducer.
+   */
+  readonly panicOnly?: string;
   /** `by`: which protection closes (the book takes it as an exit or a partial fill outside the loop). */
-  close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean; by?: 'panic_close' | 'rescue reduce' | 'ADL unwind' }): Promise<PairResult>;
+  close(request: { reason: string; targets?: [bigint, bigint]; reduceOnly?: boolean; by?: 'panic_close' | 'rescue reduce' | 'ADL unwind' }): Promise<ReduceResult>;
 }
 
 export interface RescuerOptions {
@@ -699,7 +708,7 @@ export class Rescuer {
 
   #reduceProblem(): string | null {
     const r = this.#o.reducer?.() ?? null;
-    return r === null ? 'no pair trader holds the legs here' : null;
+    return r === null ? 'no pair trader holds the legs here' : r.panicOnly ?? null;
   }
 
   async #transfer(run: Run, plan: Extract<Plan, { kind: 'transfer' }>, desk: RescueDesk): Promise<void> {
@@ -1086,6 +1095,7 @@ export class Rescuer {
     const t = run.trigger;
     const reducer = this.#o.reducer?.() ?? null;
     if (reducer === null) throw new StepFailed('source', 'no pair trader holds the legs here');
+    if (reducer.panicOnly !== undefined) throw new StepFailed('source', reducer.panicOnly);
     const i = reducer.legs.findIndex((l) => l.venue === t.venue && l.symbol === t.symbol);
     if (i === -1) throw new StepFailed('source', `the pair trader does not hold ${t.venue} ${t.symbol}`);
     let pos: [bigint, bigint];
@@ -1105,7 +1115,7 @@ export class Rescuer {
     const targets = pos.map((p) => (p > 0n ? p - cut : p + cut)) as [bigint, bigint];
     this.#progress(run, 'sign');
     const started = this.#o.clock.now();
-    let result: PairResult;
+    let result: ReduceResult;
     try {
       result = await reducer.close({ reason: `rescue ${t.id}: reduce both legs by ${qtyString(cut)} (${(fraction * 100).toFixed(1)} %)`, targets, reduceOnly: true, by: 'rescue reduce' });
     } catch (err) {

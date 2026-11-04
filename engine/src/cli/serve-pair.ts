@@ -93,7 +93,8 @@ import type { AccountState, Clock } from '../venues/venue.ts';
 import type { PriceDeps, StoredPrice } from './pair-mainnet-lib.ts';
 import { PRICE_MARGIN_S, ensureFresh, newPriceState, oraclePxOf, priceFitRefusal, priceLifeS, refreshLanded, refreshReachedChain } from './pair-mainnet-lib.ts';
 import type { OpsCtx, OrderlyLegSpec, OrderlyOps, PairRunner } from './pair-ops.ts';
-import { counting, pairOf, planClose, planOpen, recheckOpenSize, refreshForOpen, sendClose, sendOpen } from './pair-ops.ts';
+import { counting, pairOf, planClose, planOpen, recheckOpenSize, refreshForOpen, sendClose, sendOpen, venueName } from './pair-ops.ts';
+import { OrderlySweep, panicReducer } from './orderly-sweep.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { checkContractNetwork, contractEnv } from './serve-contract.ts';
 import { ConfigError, START_RETRY_MAX_MS, startBackoffMs } from './start-errors.ts';
@@ -494,6 +495,18 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       ...(policy.orderly_symbols ?? []).map((m) => orderlyBaseSymbol(m)).filter((x): x is string => x !== null),
     ])].filter((sym) => PAIR_VENUES.filter((v) => policyLists(policy, v, sym)).length >= 2);
     const flatWhy = `both legs flat and no GIMBAL_PAIR_SYMBOL (policy pairs: ${common.join(', ') || 'none'})`;
+    // A trader state saved for another pair than short Hyperliquid / long Phoenix (an Orderly leg) with
+    // GIMBAL_ORDERLY_PAIRS off: no engine here could read or close that pair, and after Orderly's IP restriction the
+    // owner's machine cannot either (pair-mainnet refuses Orderly). serve refuses to start rather than run blind.
+    if (!orderlyOn) {
+      const saved = store.load();
+      const was = saved.kind === 'loaded' ? savedShape(saved.state) : null;
+      if (saved.kind === 'loaded' && was !== null && saved.state.symbol !== null && !isDefaultShape(was, saved.state.symbol)) {
+        throw new ConfigError(`the trader state ${store.path} is for the ${saved.state.symbol} pair ${shapeText(was)}, and GIMBAL_ORDERLY_PAIRS is not 1: `
+          + 'no engine here could protect or close it (panic_close included). Start serve with GIMBAL_ORDERLY_PAIRS=1 and its Orderly session; '
+          + `only once that pair's legs are flat on the venues, move the file aside and start once with GIMBAL_TRADER_FRESH=${freshWant}`);
+      }
+    }
 
     // ---- the signing side: loaded by the first start attempt that gets that far, then kept ----
     let relayer: Relayer | null = null;
@@ -795,6 +808,61 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
     };
 
     let current: Slot | null = null;
+
+    // ---- panic_close's Orderly sweep (GIMBAL_ORDERLY_PAIRS=1, trading): orderly-sweep.ts ----
+    // It may sign with no pair trader (a NONE start, a start not confirmed, a pair alert only): it takes the trader
+    // lock and the signing client itself, and gives the lock back after when no pair trades.
+    let sweepLock = false;
+    const sweep = !orderlyOn || !wantLive ? null : new OrderlySweep({
+      session: input.orderly,
+      spec: (market) => {
+        const base = orderlyBaseSymbol(market);
+        if (base === null) return null;
+        const unpriced = policy.unpriced.find((u) => u.symbol === base);
+        return {
+          symbol: market, oraclePx: unpriced !== undefined ? async () => null : oraclePxOf(prices, base, () => !stopped),
+          maxNotionalUsd: unpriced === undefined ? policy.max_notional_usd : Math.min(policy.max_notional_usd, policy.unpriced_max_notional_usd),
+          ...(unpriced === undefined ? {} : { maxSz: unpriced.max_sz }), slippageBps: SERVE_SLIPPAGE_BPS,
+        };
+      },
+      begin: async () => {
+        if (stopped) return 'serve is stopping: nothing is signed';
+        if (lock === null) {
+          try {
+            lock = acquireTraderLock(traderLockPath(env, input.mode, contractId, input.deskId));
+            sweepLock = true;
+          } catch (err) {
+            return `the trader lock is not held: ${errorMessage(err)} (pair-mainnet --send holds the same lock)`;
+          }
+        }
+        if (!signing) {
+          try {
+            ({ client, relayer } = await deps.signing());
+            signing = true;
+          } catch (err) {
+            return `the signing contract client: ${errorMessage(err)}`;
+          }
+        }
+        return null;
+      },
+      end: () => {
+        if (sweepLock && (current === null || !current.live())) release();
+        sweepLock = false;
+      },
+      bandBps: policy.price_band_bps, clock: input.clock, sleep, log, publish: input.publish,
+    });
+    /** With no pair trader: what panic_close leaves held on Hyperliquid and Phoenix (null: nothing), read now. */
+    const leftOutside = async (): Promise<string | null> => {
+      try {
+        const held = [
+          ...(await deps.hlHeld(evm)).map((s) => `hyperliquid ${s}`),
+          ...(await deps.phoenixHeld(desk.solana.authority)).map((s) => `phoenix ${s}`),
+        ];
+        return held.length === 0 ? null : `no pair trader holds ${held.join(', ')} here: nothing closed ${held.length === 1 ? 'it' : 'them'}; close by hand (stop serve, then pair-mainnet close --send)`;
+      } catch (err) {
+        return `Hyperliquid and Phoenix cannot be read (${errorMessage(err)}), and no pair trader holds a leg there: check them, and close what is held by hand (stop serve, then pair-mainnet close --send)`;
+      }
+    };
     /** A start attempt after a failed one found nothing to protect: no pair from then on (the readers and lock are let go). */
     let noneWhy: string | null = null;
     /** Why the start is not confirmed (review S1): a read it needs failed. Null once two synced reads agreed. */
@@ -910,6 +978,12 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       return attempting;
     };
 
+    if (orderlyOn && input.orderly === undefined) {
+      const line = 'GIMBAL_ORDERLY_PAIRS=1, and serve has no Orderly session: no Orderly position is read, protected or closed here, panic_close included, and pair-mainnet cannot close one either';
+      lines.push(`pair      ${line}`);
+      journal('error', line, { stage: 'start', venue: 'orderly' });
+    }
+
     // ---- the first start attempt: a read that fails degrades the pair instead of stopping serve (review S1) ----
     let first: Started | null = null;
     try {
@@ -922,7 +996,18 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       healthOk();
       if (first.kind === 'none') {
         stopNone();
-        return none(first.lines, first.why);
+        const said = [...lines, ...first.lines];
+        if (sweep === null) return none(said, first.why);
+        // No pair trader, but panic_close still closes the desk's Orderly positions (orderly-sweep.ts).
+        const s = sweep;
+        return {
+          ...none(said, first.why, () => {
+            stopped = true;
+            s.stop();
+            release();
+          }),
+          reducer: () => (stopped ? null : panicReducer(null, s, leftOutside)),
+        };
       }
       lines.push(...land(first));
     } else {
@@ -971,7 +1056,9 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           out.notes.push(`${name}: the cancel failed (${errorMessage(err)})`);
         }
       }
-      out.notes.push('Phoenix: the leg sends IOCs only, nothing rests there');
+      // The pair's other legs send IOCs only (Phoenix, Orderly): nothing rests there.
+      const ioc = current !== null ? current.shape.legs.map((l) => l.venue).filter((v) => v !== 'hyperliquid') : ['phoenix' as const, ...(orderlyOn ? ['orderly' as const] : [])];
+      for (const v of ioc) out.notes.push(`${venueName(v)}: the leg sends IOCs only, nothing rests there`);
       return out;
     };
 
@@ -1202,7 +1289,10 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       },
       adl: current !== null || live || pending !== null ? adl : undefined,
       lines,
-      reducer: () => (current !== null && current.live() && !stopped ? current.pp : null),
+      reducer: () => {
+        const pair = current !== null && current.live() && !stopped ? current.pp : null;
+        return sweep === null || stopped ? pair : panicReducer(pair, sweep, leftOutside);
+      },
       notTrading: () => {
         if (stopped) return 'serve is stopping: nothing is signed';
         const unsure = unconfirmed();
@@ -1239,6 +1329,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         // First: nothing is signed from here on (a rescue between its read and its reduce must not sign after the
         // lock is released), and nothing is saved.
         stopped = true;
+        sweep?.stop();
         if (retryTimer !== null) clearTimeout(retryTimer);
         retryTimer = null;
         current?.end();
