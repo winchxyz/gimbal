@@ -5,13 +5,17 @@
 // server on loopback, so the route's handler, its checks and its answer are exactly those of a request made from
 // inside the container.
 //
-//   GIMBAL_CONTROL={"id":"<run-id>","method":"POST","path":"/rotate","body":{"windowId":"<window id>"}}
+//   GIMBAL_CONTROL={"id":"<run-id>","method":"POST","path":"/rotate","body":{"windowId":"<window id>"},"until":"<ISO time>"}
 //
 // Allowed: POST /rotate {windowId}, POST /close (no body), PUT /strategy <the whole StrategyConfig> (the engine
 // rules, the risk lines strategy.risk.watchDistancePct and rescueDistancePct among them). Anything else is refused.
+// `until` (optional): past that time the run is refused, with no marker, so a variable left set never acts on a
+// later deploy (a new volume has no marker to stop it).
 //
-//   1  a marker <state dir>/control-<run-id>.json: log what it says, do nothing (at most once per run-id)
-//   2  POST /rotate and /close need GIMBAL_TRADE=1 (the route refuses without it): refused here, before any wait
+//   1  a marker <state dir>/control-<run-id>.json: log what it says, do nothing (at most once per run-id); a marker
+//      of a different request under that run-id is logged as such, loudly, and nothing runs either
+//   2  POST /rotate and /close need GIMBAL_TRADE=1 (the route refuses without it): refused here, before any wait;
+//      past `until`: refused
 //   3  wait, at most CONTROL_WAIT_MS, until the engine is ready for the route: the first scan for PUT /strategy; also
 //      the pair's start confirmed and the strategy loop's first check of a scan for /rotate and /close (so /rotate
 //      sees the window and the free margin). Past the wait: the marker `failed`, never retried
@@ -52,6 +56,8 @@ export interface ControlAsk {
   path: ControlPath;
   /** The JSON body as given; absent for POST /close. */
   body?: Record<string, unknown>;
+  /** ms: past this the run is refused (the optional `until`). */
+  until?: number;
 }
 
 /** Parses GIMBAL_CONTROL; throws saying what is wrong (an unknown route included). */
@@ -62,11 +68,18 @@ export function parseControl(value: string): ControlAsk {
   } catch (err) {
     throw new Error(`${CONTROL_ENV} is not JSON: ${errorMessage(err)}`);
   }
-  if (v === null || typeof v !== 'object' || Array.isArray(v)) throw new Error(`${CONTROL_ENV} must be a JSON object {"id","method","path","body"}`);
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) throw new Error(`${CONTROL_ENV} must be a JSON object {"id","method","path","body","until"}`);
   const o = v as Record<string, unknown>;
-  const extra = Object.keys(o).filter((k) => !['id', 'method', 'path', 'body'].includes(k));
+  const extra = Object.keys(o).filter((k) => !['id', 'method', 'path', 'body', 'until'].includes(k));
   if (extra.length > 0) throw new Error(`${CONTROL_ENV}: unknown field ${JSON.stringify(extra[0])}`);
-  const { id, method, path, body } = o;
+  const { id, method, path, body, until } = o;
+  let untilMs: number | undefined;
+  if (until !== undefined) {
+    // An ISO time with a date, a time and a zone (Z or an offset): never a local time read differently by each host.
+    const iso = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?(Z|[+-]\d{2}:\d{2})$/;
+    untilMs = typeof until === 'string' && iso.test(until) ? Date.parse(until) : NaN;
+    if (!Number.isFinite(untilMs)) throw new Error(`${CONTROL_ENV}: until ${JSON.stringify(until)} is not an ISO time with a zone, e.g. "2026-11-06T18:00:00Z"`);
+  }
   if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,40}$/.test(id)) throw new Error(`${CONTROL_ENV}: id ${JSON.stringify(id)} is not [A-Za-z0-9_-]{1,40}`);
   const route = CONTROL_ROUTES.find(([m, p]) => m === method && p === path);
   if (route === undefined) {
@@ -76,7 +89,24 @@ export function parseControl(value: string): ControlAsk {
   if (body !== undefined && (body === null || typeof body !== 'object' || Array.isArray(body))) throw new Error(`${CONTROL_ENV}: body must be a JSON object`);
   if (p === '/close' && body !== undefined && Object.keys(body).length > 0) throw new Error(`${CONTROL_ENV}: POST /close takes no body`);
   if (p !== '/close' && body === undefined) throw new Error(`${CONTROL_ENV}: ${m} ${p} needs a body (${p === '/rotate' ? '{"windowId":"<window id>"}' : 'the whole engine rules, as GET /strategy answers them'})`);
-  return { runId: id, method: m, path: p, ...(p === '/close' ? {} : { body: body as Record<string, unknown> }) };
+  return {
+    runId: id, method: m, path: p, ...(p === '/close' ? {} : { body: body as Record<string, unknown> }),
+    ...(untilMs === undefined ? {} : { until: untilMs }),
+  };
+}
+
+/** The request a run sends, as one string: method, path and body with its keys sorted (a marker is matched on it). */
+export function requestKey(r: { method: string; path: string; body?: unknown }): string {
+  return `${r.method} ${r.path} ${stableJson(r.body ?? {})}`;
+}
+
+function stableJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(stableJson).join(',')}]`;
+  if (v !== null && typeof v === 'object') {
+    const o = v as Record<string, unknown>;
+    return `{${Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${stableJson(o[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(v) ?? 'null';
 }
 
 export function controlMarker(stateDir: string, runId: string): string {
@@ -124,6 +154,8 @@ interface Marker {
   method: ControlMethod;
   path: ControlPath;
   body?: Record<string, unknown>;
+  /** The request's until, ISO (kept for the record; never extends a run). */
+  until?: string;
   startedAt?: string;
   finishedAt?: string;
   answer?: RouteAnswer;
@@ -137,17 +169,34 @@ export async function runControl(d: ControlDeps): Promise<ControlResult> {
   const say = (line: string) => d.log(`${PREFIX} ${line}`);
   const what = `${ask.method} ${ask.path}${ask.body === undefined ? '' : ` ${JSON.stringify(ask.body)}`}`;
   const path = controlMarker(d.stateDir, ask.runId);
-  const base: Marker = { status: 'started', runId: ask.runId, method: ask.method, path: ask.path, ...(ask.body === undefined ? {} : { body: ask.body }) };
+  const base: Marker = {
+    status: 'started', runId: ask.runId, method: ask.method, path: ask.path, ...(ask.body === undefined ? {} : { body: ask.body }),
+    ...(ask.until === undefined ? {} : { until: new Date(ask.until).toISOString() }),
+  };
 
-  // 1. At most once per run-id, across restarts.
+  // 1. At most once per run-id, across restarts. The marker names the request it was for: another request under a
+  // used run-id is not run either, and says so loudly (the owner changed the request and kept the run-id).
   const seen = readMarker(path);
   if (seen !== null) {
+    if (seen.kind === 'ok' && typeof seen.marker.method === 'string' && requestKey(seen.marker) !== requestKey(ask)) {
+      say(`DIFFERENT request under used run-id ${ask.runId}: NOT run. The marker ${path} (${seen.marker.status}) is for ${requestKey(seen.marker)}; `
+        + `${CONTROL_ENV} asks ${requestKey(ask)}. Pick a new run-id for a new request`);
+      return { status: 'marker', marker: path, was: 'different' };
+    }
     say(describeMarker(seen, path, ask.runId));
     return { status: 'marker', marker: path, was: seen.kind === 'ok' ? seen.marker.status : 'unreadable' };
   }
-  say(`run ${ask.runId}: ${what}; no marker at ${path}`);
+  say(`run ${ask.runId}: ${what}${ask.until === undefined ? '' : `, until ${new Date(ask.until).toISOString()}`}; no marker at ${path}`);
 
-  // 2. What the route would refuse anyway, before any wait.
+  // 2. What the route would refuse anyway, and an expired value, before any wait.
+  const expired = (): ControlResult | null => {
+    if (ask.until === undefined || now() <= ask.until) return null;
+    const reason = `its until, ${new Date(ask.until).toISOString()}, has passed`;
+    say(`refused: ${reason}; nothing was called and no marker was written: unset ${CONTROL_ENV}, or set it again with a new until`);
+    return { status: 'refused', reason };
+  };
+  const late = expired();
+  if (late !== null) return late;
   if (ask.path !== '/strategy' && !d.trade) {
     const reason = `GIMBAL_TRADE is not 1: POST ${ask.path} trades nothing in this engine`;
     say(`refused: ${reason}; nothing was called and no marker was written: set GIMBAL_TRADE=1 (the same run-id runs then), or unset ${CONTROL_ENV}`);
@@ -183,6 +232,8 @@ export async function runControl(d: ControlDeps): Promise<ControlResult> {
   }
 
   // 4. The rules before the call (the whole config PUT /strategy takes back), then the marker.
+  const expiredReady = expired();
+  if (expiredReady !== null) return expiredReady;
   try {
     const rules = await d.call('GET', '/strategy');
     say(`engine rules before the call (GET /strategy ${rules.status}): ${JSON.stringify(rules.body)}`);
@@ -193,6 +244,8 @@ export async function runControl(d: ControlDeps): Promise<ControlResult> {
     say(`stopped: serve is stopping before the call; nothing was called and no marker was written, so ${ask.runId} runs at the next start`);
     return { status: 'stopped' };
   }
+  const expiredNow = expired();
+  if (expiredNow !== null) return expiredNow;
   const started: Marker = { ...base, startedAt: new Date(now()).toISOString() };
   try {
     createExclusive(path, `${JSON.stringify(started, null, 2)}\n`);
@@ -224,10 +277,12 @@ export async function runControl(d: ControlDeps): Promise<ControlResult> {
     return { status: 'failed', error };
   }
   finish({ ...started, status: 'done', finishedAt: new Date(now()).toISOString(), answer });
-  const next = ask.path === '/rotate' && answer.status === 200
-    ? '; the rotate runs in the strategy loop now, its progress in the `journal` lines'
-    : ask.path === '/close' && answer.status === 200 ? '; the close runs in the strategy loop now, its progress in the `journal` lines' : '';
-  say(`done: ${ask.method} ${ask.path} answered ${answer.status} ${JSON.stringify(answer.body)}${next}. Next: unset ${CONTROL_ENV}`);
+  // 200 from /rotate or /close is "accepted", not "carried out": the act runs in the strategy loop after the answer.
+  const next = answer.status === 200 && ask.path !== '/strategy'
+    ? `; ACCEPTED, not yet carried out: the ${ask.path === '/rotate' ? 'rotate' : 'close'} runs in the strategy loop now; `
+      + 'wait for its result line (`journal   enter|rotate|exit|error|refused: ...`) before any redeploy'
+    : '';
+  say(`done: ${ask.method} ${ask.path} answered ${answer.status} ${JSON.stringify(answer.body)}${next}`);
   return { status: 'done', answer };
 }
 
@@ -239,7 +294,7 @@ export interface ControlRun {
   inFlight(): boolean;
 }
 
-export interface ControlStart extends Omit<ControlDeps, 'ask' | 'stopping' | 'onStarted'> {
+export interface ControlStart extends Omit<ControlDeps, 'ask' | 'onStarted'> {
   /** GIMBAL_CONTROL as set (never undefined here: unset means this is not called). */
   value: string;
 }
@@ -258,10 +313,11 @@ export function startControl(o: ControlStart): ControlRun | null {
   }
   let phase: 'waiting' | 'started' | 'over' = 'waiting';
   let stopping = false;
-  const { value: _value, ...deps } = o;
+  const { value: _value, stopping: serveStopping, ...deps } = o;
   const done = runControl({
     ...deps, ask,
-    stopping: () => stopping,
+    // serve's own flag (set the moment its shutdown starts) or this run's drain, whichever comes first.
+    stopping: () => stopping || serveStopping?.() === true,
     onStarted: () => { phase = 'started'; },
   }).catch((err: unknown) => {
     o.log(`${PREFIX} stopped: ${errorMessage(err)}; if its marker says started: ${UNKNOWN_HINT}`);

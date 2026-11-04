@@ -153,7 +153,7 @@ test('/rotate waits for the engine (first scan, pair, loop check), then calls th
   assert.ok(lines.some((l) => l.startsWith('control: waiting for the strategy loop\'s first check of a scan')));
   assert.ok(lines.some((l) => l.startsWith('control: engine rules before the call (GET /strategy 200): {"auto":false')));
   assert.ok(lines.some((l) => l.startsWith('control: started: marker ')));
-  assert.ok(lines.some((l) => l.startsWith('control: done: POST /rotate answered 200 {"ok":true}; the rotate runs in the strategy loop now')));
+  assert.ok(lines.some((l) => l.startsWith('control: done: POST /rotate answered 200 {"ok":true}; ACCEPTED, not yet carried out: the rotate runs in the strategy loop now; wait for its result line')));
 
   // The next start, the variable still set: the marker says what happened and nothing is called.
   const again = deps(dir, rotate('enter-1'));
@@ -170,7 +170,7 @@ test('the route\'s own refusal is its answer: kept in the marker as done, with t
   const result = await runControl(d);
   assert.deepEqual(result, { status: 'done', answer: { status: 409, body: { ok: false, reason: 'no pair is held: nothing to close' } } });
   assert.equal(hands.closes, before + 1);
-  assert.ok(lines.some((l) => l === 'control: done: POST /close answered 409 {"ok":false,"reason":"no pair is held: nothing to close"}. Next: unset GIMBAL_CONTROL'));
+  assert.ok(lines.some((l) => l === 'control: done: POST /close answered 409 {"ok":false,"reason":"no pair is held: nothing to close"}'));
 });
 
 test('PUT /strategy goes through the route\'s own checks: a bad config is answered 400 and changes nothing, a good one is set', async (t) => {
@@ -294,6 +294,84 @@ test('drain: a run still waiting stops with no marker (it runs at the next start
   assert.deepEqual(await drain, { status: 'done', answer: { status: 200, body: { ok: true } } });
   assert.equal(inCall.inFlight(), false);
   assert.equal(JSON.parse(readFileSync(controlMarker(dir, 'drain-call'), 'utf8')).status, 'done');
+});
+
+test('a different request under a used run-id is NOT run and says so loudly; the same request (keys in any order) is the plain marker line', async (t) => {
+  const dir = tempDir(t);
+  const raise = { ...DEFAULT_STRATEGY, risk: { watchDistancePct: 40, rescueDistancePct: 35 } };
+  const first = await runControl(deps(dir, JSON.stringify({ id: 'scene-2', method: 'PUT', path: '/strategy', body: raise })).d);
+  assert.equal(first.status, 'done');
+  let calls = 0;
+  const call: RouteCall = async () => { calls++; return { status: 200, body: {} }; };
+  const different: [string, string][] = [
+    [JSON.stringify({ id: 'scene-2', method: 'PUT', path: '/strategy', body: DEFAULT_STRATEGY }), 'another body'],
+    [JSON.stringify({ id: 'scene-2', method: 'POST', path: '/close' }), 'another route'],
+    [JSON.stringify({ id: 'scene-2', method: 'POST', path: '/rotate', body: { windowId: WINDOW } }), 'another route and body'],
+  ];
+  for (const [value, why] of different) {
+    const { d, lines } = deps(dir, value, { call });
+    const r = await runControl(d);
+    assert.deepEqual(r, { status: 'marker', marker: controlMarker(dir, 'scene-2'), was: 'different' }, why);
+    assert.equal(lines.length, 1, why);
+    assert.match(lines[0]!, /^control: DIFFERENT request under used run-id scene-2: NOT run\. The marker .* \(done\) is for PUT \/strategy \{.*"rescueDistancePct":35.*\}; GIMBAL_CONTROL asks /, why);
+    assert.doesNotMatch(lines[0]!, /done at|answered/, why);
+  }
+  // The same request, its keys in another order: the marker's own line.
+  const reordered = { risk: { rescueDistancePct: 35, watchDistancePct: 40 }, ...Object.fromEntries(Object.entries(DEFAULT_STRATEGY).filter(([k]) => k !== 'risk').reverse()) };
+  const same = deps(dir, JSON.stringify({ path: '/strategy', body: reordered, method: 'PUT', id: 'scene-2' }), { call });
+  const r = await runControl(same.d);
+  assert.deepEqual(r, { status: 'marker', marker: controlMarker(dir, 'scene-2'), was: 'done' });
+  assert.match(same.lines[0]!, /^control: run scene-2 has a marker .*: done at .*, PUT \/strategy answered 200/);
+  assert.equal(calls, 0);
+  assert.equal(server.strategy.risk.rescueDistancePct, 35, 'nothing changed the rules after the first run');
+  await runControl(deps(dir, JSON.stringify({ id: 'scene-2-back', method: 'PUT', path: '/strategy', body: DEFAULT_STRATEGY })).d);
+});
+
+test('until: a value past it is refused with no marker, also when it passes during the wait; a bad until is refused at parse', async (t) => {
+  const dir = tempDir(t);
+  let calls = 0;
+  const call: RouteCall = async () => { calls++; return { status: 200, body: {} }; };
+  const withUntil = (id: string, until: string) => JSON.stringify({ id, method: 'POST', path: '/close', until });
+  assert.equal(parseControl(withUntil('u', '2026-11-05T10:31:00Z')).until, Date.UTC(2026, 10, 5, 10, 31));
+  assert.equal(parseControl(withUntil('u', '2026-11-05T12:31:00.000+02:00')).until, Date.UTC(2026, 10, 5, 10, 31));
+  for (const bad of ['2026-11-05', '2026-11-05T10:31:00', 'tomorrow', '2026-13-45T10:31:00Z']) {
+    assert.throws(() => parseControl(withUntil('u', bad)), /until .* is not an ISO time with a zone/, bad);
+  }
+  assert.throws(() => parseControl(JSON.stringify({ id: 'u', method: 'POST', path: '/close', until: 1 })), /until 1 is not/);
+
+  // Past at the start: a variable left set on a later deploy (a new volume has no marker).
+  const stale = deps(dir, withUntil('stale', '2026-11-05T10:00:00Z'), { call });
+  assert.equal((await runControl(stale.d)).status, 'refused');
+  assert.match(stale.lines.at(-1)!, /^control: refused: its until, 2026-11-05T10:00:00.000Z, has passed; nothing was called and no marker was written/);
+
+  // Passing during the wait: refused right before the marker.
+  let now = T0;
+  let ready = false;
+  const waiting = deps(dir, withUntil('in-wait', '2026-11-05T10:31:00Z'), {
+    call, now: () => now, waitingFor: () => (ready ? null : 'the first scan'),
+    sleep: async () => { now += 30_000; if (now > T0 + 90_000) ready = true; },
+  });
+  assert.equal((await runControl(waiting.d)).status, 'refused');
+  assert.equal(calls, 0);
+  assert.deepEqual(readdirSync(dir), []);
+
+  // In time: runs, and the marker keeps the until.
+  const ok = deps(dir, withUntil('in-time', '2026-11-05T11:00:00Z'));
+  assert.equal((await runControl(ok.d)).status, 'done');
+  assert.equal(JSON.parse(readFileSync(controlMarker(dir, 'in-time'), 'utf8')).until, '2026-11-05T11:00:00.000Z');
+});
+
+test('serve\'s own stopping flag stops a run still waiting, without a drain', async (t) => {
+  const dir = tempDir(t);
+  let serveStopping = false;
+  const run = startControl({
+    value: rotate('serve-stops'), stateDir: dir, trade: true, waitingFor: () => 'the first scan', pollMs: 1,
+    stopping: () => serveStopping, call: async () => ({ status: 200, body: {} }), log: () => {},
+  })!;
+  await new Promise((r) => setTimeout(r, 5));
+  serveStopping = true;
+  assert.deepEqual(await run.done, { status: 'stopped' });
+  assert.equal(existsSync(controlMarker(dir, 'serve-stops')), false);
 });
 
 test('a wildcard listen address is reached on loopback; a named one as is', () => {

@@ -681,9 +681,13 @@ const shown = host.includes(':') ? `[${host}]` : host;
 log(`engine ${mode} on http://${shown}:${listening}: GET /events /state /windows/history?id= /strategy /journal, PUT /strategy, POST /rotate /close`);
 // The read-only view: a second listener on a ViewSource (reads only), never on the server above.
 const view = await startView({ env: envVar, processEnv: process.env, enginePort: listening, engineHost: host, source: server.viewSource(), log });
+
+let stopping = false;
 // GIMBAL_CONTROL (serve-control.ts): one request to this server's own POST /rotate, POST /close or PUT /strategy, sent
 // over loopback in the background once the engine is ready for it, at most once per run-id. Unset: nothing runs.
+// After `stopping`: the run reads it from its first step, so a shutdown stops a run still waiting at once.
 const control = controlFromEnv(envVar, {
+  stopping: () => stopping,
   stateDir: stateDirSet === undefined ? userStateDir(envVar) : resolve(stateDirSet),
   trade: envVar('GIMBAL_TRADE') === '1',
   waitingFor: (path) => {
@@ -697,7 +701,6 @@ const control = controlFromEnv(envVar, {
   log,
 });
 
-let stopping = false;
 /** How long a shutdown waits for a close in flight: one MPC signature can take 120 s, and a close is one per leg plus a retry. */
 const SHUTDOWN_WAIT_MS = 180_000;
 async function shutdown(reason: string): Promise<void> {
