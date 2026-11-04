@@ -118,6 +118,135 @@ Then deploy, and make no `PUT /strategy` in between. After the deploy, the log m
 defaults (auto off): ...`. `GET /strategy` must also show the auto you expect. The older code runs on its own fixed
 counts (enter 3, exit 3).
 
+## Bringing USDC back from Orderly
+
+Once the desk's Orderly key is limited to the engine's static IPs (`set_orderly_ips`, then the `ip_restriction`),
+Orderly takes the key only from this service. No laptop can post a withdrawal, `railway ssh` does not work with
+static IPs, and the control routes are loopback only. So the engine runs the withdrawal itself, once, when two
+variables are set. The USDC goes to the desk's own EVM address on Arbitrum. The contract signs no other
+receiver. From there the laptop brings it to NEAR and pays the owner.
+
+**What it does.** The run starts when serve starts with `GIMBAL_SETUP=1` and
+`GIMBAL_ORDERLY_WITHDRAW=<contract>/<desk>/<amount USDC | all>/<run-id>` (`engine/src/setup/orderly-withdraw.ts`). It
+runs in the background, so serve's start does not wait for it. Serve's shutdown does wait for it (within the 180 s
+drain). Every line starts with `orderly withdraw:`:
+
+1. A marker `/data/gimbal/orderly-withdraw-<contract>-<desk>-<run-id>.json` (in `GIMBAL_STATE_DIR`) already
+   exists: it logs what the marker says and does nothing. A run-id runs at most once, across restarts.
+2. No trading loop: with `GIMBAL_TRADE=1` and `auto` on, the strategy loop could open an Orderly leg between the
+   flat check and the withdrawal, so the run refuses. `auto` cannot be turned off from outside the container (PUT
+   /strategy is loopback only), so unset `GIMBAL_TRADE` for the withdrawal instead. `get_desk`: the contract and desk must be the engine's own (`GIMBAL_CONTRACT_ID`,
+   `DESK_ID`), and the operator key must act for the desk. A paused or closing desk is refused: the operator's
+   `orderly_withdraw` needs a running desk.
+3. The checks:
+   - The amount must be at least the operator's minimum, max(10 × `max_transfer_cost_flat_e6`, 10 USDC). The
+     refusal names the minimum.
+   - `get_desk_counters`: the amount must fit what is left of the hourly rescue cap, and Orderly's 1 USDC fee what
+     is left of the hourly cost budget.
+   - Two signed reads. Every Orderly position must be flat. The amount must be at most what can leave Orderly after
+     `settle_pnl`: holding − frozen, less any unsettled loss, and at most Orderly's `free_collateral`. With `all`,
+     the amount is exactly that.
+4. The trading loop is checked again. Then it writes the marker `started` (amount, desk EVM, time), created exclusively and
+   fsynced.
+5. It runs `settle_pnl`, then `withdraw_request` (`OrderlyDeskClient.withdraw`).
+6. It writes the marker `done` with the report (settle and withdraw answers, the NEAR transactions), or `failed`
+   with the error and what Orderly got.
+
+A refusal in steps 1 to 4 writes no marker, except when another run of the same run-id holds it. Fix the cause and
+restart, and the same run-id runs. A shutdown before step 4 stops the run the same way. Nothing is ever retried by
+itself. A failed run tells you what Orderly got:
+
+- `never went to Orderly`: for example the contract refused `orderly_withdraw` (`E_RESCUE_CAP`). No USDC left
+  Orderly, and a new run-id may try again.
+- `Orderly rejected the withdraw_request`: a definite refusal. Nothing left Orderly, and a new run-id may try again.
+- `no definite answer`, or a marker that says `started` with no outcome (the container died in step 5): the log
+  reads `unknown outcome, check the desk EVM on Arbitrum and nearblocks; set a new run-id only after checking`.
+  Wait about 30 min. Then look at the desk EVM's USDC on arbiscan and the desk's `orderly_withdraw` calls on
+  nearblocks before you choose a new run-id.
+
+**Before you start.**
+
+- The desk must be running, not paused, and every Orderly position flat.
+- `GIMBAL_TRADE` must be unset for the withdrawal (step 1), unless the engine's `auto` is off. With the trade loop
+  off nothing can open in the window. The pair is alert only meanwhile: the engine does not close or unwind it, so
+  keep the window short and set `GIMBAL_TRADE=1` back right after (step 3).
+- Orderly's 1 USDC fee comes out of the amount: a withdrawal of 100 delivers 99. So at least 10 USDC on Orderly is
+  enough for this path (at the default flat bound).
+- Withdraw everything in one run: use `all`. Anything under the operator's minimum (10 USDC) left on Orderly is
+  stuck behind the owner's path, and that path too works only from the engine's IPs. The `checks passed` line says
+  how much stays, and warns when it is under the minimum.
+- The amount counts against `rescue_cap_usd_per_hour`, and Orderly's 1 USDC fee counts against the hourly rescue
+  cost budget. A rescue in the last hour uses both. The run reads what is left and refuses before signing when it is
+  short.
+
+**A paused desk.** Unpause it first, with `GIMBAL_TRADE` unset so nothing opens. The owner calls `set_paused(<desk>, false)` with exactly 1 yoctoNEAR from their own wallet, since
+the operator key cannot unpause. Then run the steps below.
+
+**Steps** (the owner runs each command):
+
+1. Unset `GIMBAL_TRADE`, then set both variables. Each change redeploys the engine, which takes about 90 s to 3 min
+   to go live again (above):
+
+   ```
+   railway variable delete GIMBAL_TRADE
+   railway variable set GIMBAL_SETUP=1 GIMBAL_ORDERLY_WITHDRAW=gimbal_dex.near/carry/all/2026-11-05a
+   ```
+
+   Pick a new run-id for every withdrawal: letters, digits, `-` and `_`, up to 40 characters. The amount is `all`
+   or USDC with at most 6 decimals.
+2. Watch `railway logs` for the `orderly withdraw:` lines: `run ...: ... checking`, `desk ... is running`,
+   `checks passed: ...`, `started: marker ...`, then `done: ...` or `failed: ...` (or one `refused: ...`). The run
+   takes about a minute: 8 operator calls on NEAR at about 6 s each, plus Orderly. Do not redeploy before the
+   `done` or `failed` line. A container killed in step 5 leaves `started`, an unknown outcome.
+3. Remove both variables, one key per call (each call redeploys), or in the service's Variables tab, and set
+   `GIMBAL_TRADE` back:
+
+   ```
+   railway variable delete GIMBAL_ORDERLY_WITHDRAW
+   railway variable delete GIMBAL_SETUP
+   railway variable set GIMBAL_TRADE=1
+   ```
+
+   Left set, they do nothing more for a run-id that has a marker, but `GIMBAL_SETUP=1` keeps the operator key's
+   signing part of serve on.
+4. On the laptop, once the USDC is on Arbitrum (the amount less Orderly's 1 USDC; small amounts take about a minute),
+   bring it to the contract. Do a dry run first:
+
+   ```
+   node tools/mainnet/hl-return.mjs gimbal_dex.near carry bridge all
+   node tools/mainnet/hl-return.mjs gimbal_dex.near carry bridge all --send
+   ```
+
+   The bridge counts against the same hourly cap. If the withdrawal plus the bridge are over it, the dry run says
+   so: bridge an hour later, or in parts. Its lock check sees only rescuers on the laptop, not the one on
+   Railway. Both use the desk's EIP-3009 counter and Arbitrum USDC, so make sure no rescue is under way in
+   `railway logs`.
+5. Pay the owner from `idle_usdc`:
+
+   ```
+   node tools/mainnet/withdraw.mjs gimbal_dex.near carry all
+   node tools/mainnet/withdraw.mjs gimbal_dex.near carry all --key-file <owner key json> --send
+   ```
+
+**Costs.**
+
+- Orderly's 1 USDC fee per withdrawal, taken out of the amount (about the amount − 1 USDC lands on Arbitrum), gone
+  for good.
+- NEAR gas for 8 operator calls (2 reads, settle and withdraw), about 0.001 NEAR each. 0.3 NEAR of the key's
+  allowance is held while each call is in flight.
+- The 1Click fee on the bridge, at most `amountIn` − `minAmountOut`, shown by the dry run.
+- The relayer's Arbitrum gas for one transfer.
+- NEAR gas for `withdraw.mjs`, and the treasury's fee when there is profit (its dry run shows the split).
+
+**What cannot be undone.**
+
+- Once Orderly accepts `withdraw_request`, the USDC leaves Orderly for the desk EVM on Arbitrum. It cannot be
+  cancelled, but it stays the desk's money.
+- Once the bridge's authorization is used, the USDC is with 1Click. A failed swap is refunded to the desk EVM on
+  Arbitrum.
+- `withdraw.mjs --send` pays the owner and is final.
+- `settle_pnl` only books profit and loss inside the Orderly account.
+
 ## The read-only view
 
 For the dashboard on another machine (the demo video, the owner watching the desk), serve can open a second

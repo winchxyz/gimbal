@@ -10,6 +10,7 @@ import { Relayer } from '../relayer/relayer.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import { OrderlyDeskClient } from '../venues/orderly-actions.ts';
 import type { OrderlySigner } from '../venues/orderly-signer.ts';
+import type { OrderlyWithdrawRun } from './orderly-withdraw.ts';
 import { PhoenixOnboarding, solanaReads } from './phoenix.ts';
 import { publicIpLookup, type PublicIps } from './public-ip.ts';
 import type { HlSetup, SetupPlan } from './setup.ts';
@@ -43,6 +44,8 @@ export class SetupService implements SetupStarter {
   readonly #o: SetupServiceOptions;
   readonly #publicIps: PublicIps;
   readonly #running = new Map<string, Promise<SetupProgress | null>>();
+  /** A GIMBAL_ORDERLY_WITHDRAW run started next to this service (serve-setup.ts); serve's shutdown drains it. */
+  orderlyWithdraw: OrderlyWithdrawRun | null = null;
 
   constructor(options: SetupServiceOptions) {
     this.#o = options;
