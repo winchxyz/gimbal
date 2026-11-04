@@ -90,3 +90,10 @@ test('a non-2xx with no usable body, and a network error, both say there was no 
   assert.equal(down.result.tone, 'unknown');
   assert.match(down.result.text, /did not answer/);
 });
+
+test('a rotate refused for an Orderly leg reads as sentences, and says the pair is still held', () => {
+  const reason = "not rotated: the held XLM pair has an Orderly leg (PERP_XLM_USDC): its close arms the trader's replay watch (Orderly takes a signed copy of an order for up to 300 s), so no other pair could open after it and the rotate would leave the desk flat";
+  const out = outcomeOf(rotate, { ok: false, reason });
+  assert.equal(out.tone, 'refused');
+  assert.match(out.text, /^The engine refused it\. The held XLM pair has an Orderly leg\. .* The pair exits on its own rules instead\. DOGE is still held\.$/);
+});

@@ -2,6 +2,7 @@
 // The engine answers `{ ok: true }` or `{ ok: false, reason }` at once; the work itself shows up as Journal and Desk
 // events. Pure, so every wording is tested; useEngine.ts does the sending.
 import type { ActionResult, EngineApi } from '../stream/api.ts';
+import { orderlyRotateReason } from '../ui/waitCopy.ts';
 import { capital, sentence } from './format.ts';
 
 /** `rotate` names the symbols for the notice and the target window's id for the request; `close.symbol` is the window being closed, when the page knows it. */
@@ -18,7 +19,7 @@ export interface Outcome {
 }
 
 /** The engine's reason as a sentence: "the strategy engine is not running yet" becomes "The strategy engine is not running yet." */
-export const reasonText = (reason: string): string => sentence(capital(reason.trim()));
+export const reasonText = (reason: string): string => orderlyRotateReason(reason) ?? sentence(capital(reason.trim()));
 
 const unchanged = (action: ManualAction): string =>
   action.kind === 'rotate' ? `${action.from} is still held.` : action.symbol ? `Both ${action.symbol} legs are still open.` : 'Both legs are still open.';
