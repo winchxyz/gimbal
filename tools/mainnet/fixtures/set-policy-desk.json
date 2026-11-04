@@ -1,0 +1,32 @@
+{
+  "note": "get_desk(carry).policy on gimbal_dex.near as recorded on mainnet 2026-11-04, field order as the contract writes it",
+  "policy": {
+    "hl_assets": [
+      {"index":0,"symbol":"BTC","sz_decimals":5},
+      {"index":1,"symbol":"ETH","sz_decimals":4},
+      {"index":5,"symbol":"SOL","sz_decimals":2},
+      {"index":12,"symbol":"DOGE","sz_decimals":0},
+      {"index":10,"symbol":"LTC","sz_decimals":2},
+      {"index":154,"symbol":"XLM","sz_decimals":0},
+      {"index":214,"symbol":"ZEC","sz_decimals":2}
+    ],
+    "phoenix_markets": [
+      {"symbol":"BTC","orderbook":"AXFz1MuzMUBHi5UKJuK3FDCQ73o3rSzubGU2mPr4LLU7","base_lot_e8":10000,"tick_e8":100000000},
+      {"symbol":"ETH","orderbook":"9u7aqptdRFbsnnoHtjK13E5JkeM14EW5fAKTRPidVF88","base_lot_e8":100000,"tick_e8":10000000},
+      {"symbol":"SOL","orderbook":"71Si24E4uc3oCaPbPZTozC1ptSNNqygjjebxSmErSsC2","base_lot_e8":1000000,"tick_e8":1000000},
+      {"symbol":"DOGE","orderbook":"Hqt5Vom5L3X3RcKysKnBmLAvjYgo6TGAwoheW658h5cz","base_lot_e8":100000000,"tick_e8":100},
+      {"symbol":"LTC","orderbook":"HFYNBdwXP1BrnD7eLx7B3NGHi3VqEHdTkQH9FhEUFa8n","base_lot_e8":1000000,"tick_e8":100000},
+      {"symbol":"XLM","orderbook":"AXewQALSfgppjhfsZ6w5pqV7wNR5ShDRXPPTy7yx7yuE","base_lot_e8":100000000,"tick_e8":1000},
+      {"symbol":"ZEC","orderbook":"FTbbqCP2N2NkUHw1nMPpBhiQCrYGiMQAhK7g1G8NJKEt","base_lot_e8":1000000,"tick_e8":1000000}
+    ],
+    "orderly_symbols": ["PERP_BTC_USDC","PERP_ETH_USDC","PERP_SOL_USDC","PERP_DOGE_USDC","PERP_LTC_USDC","PERP_ZEC_USDC"],
+    "max_notional_usd": 20,
+    "price_band_bps": 100,
+    "oracle_max_age_s": 900,
+    "rescue_cap_usd_per_hour": 50,
+    "max_transfer_cost_bps": 300,
+    "max_transfer_cost_flat_e6": 1000000,
+    "unpriced": [],
+    "unpriced_max_notional_usd": 20
+  }
+}

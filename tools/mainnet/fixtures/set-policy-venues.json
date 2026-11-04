@@ -1,0 +1,45 @@
+{
+  "note": "Hyperliquid metaAndAssetCtxs, Phoenix exchange/markets and Orderly public/info (min_notional read 2026-11-05) as recorded on mainnet, cut to the fields and symbols set-policy.mjs reads",
+  "recorded": "2026-11-04",
+  "hl": [
+    {"index":0,"name":"BTC","szDecimals":5,"markPx":"80510.0"},
+    {"index":1,"name":"ETH","szDecimals":4,"markPx":"2429.2"},
+    {"index":5,"name":"SOL","szDecimals":2,"markPx":"95.315"},
+    {"index":12,"name":"DOGE","szDecimals":0,"markPx":"0.0772"},
+    {"index":10,"name":"LTC","szDecimals":2,"markPx":"56.41"},
+    {"index":154,"name":"XLM","szDecimals":0,"markPx":"0.16806"},
+    {"index":214,"name":"ZEC","szDecimals":2,"markPx":"1306.4"},
+    {"index":46,"name":"ZRO","szDecimals":1,"markPx":"1.8228"},
+    {"index":121,"name":"ETHFI","szDecimals":1,"markPx":"0.6014"},
+    {"index":28,"name":"AAVE","szDecimals":2,"markPx":"132.73"},
+    {"index":15,"name":"kPEPE","szDecimals":0,"markPx":"0.005009"},
+    {"index":159,"name":"HYPE","szDecimals":2,"markPx":"83.739"}
+  ],
+  "phoenix": [
+    {"symbol":"SOL","marketPubkey":"71Si24E4uc3oCaPbPZTozC1ptSNNqygjjebxSmErSsC2","baseLotsDecimals":2,"tickSize":100,"marketStatus":"active"},
+    {"symbol":"DOGE","marketPubkey":"Hqt5Vom5L3X3RcKysKnBmLAvjYgo6TGAwoheW658h5cz","baseLotsDecimals":0,"tickSize":1,"marketStatus":"active"},
+    {"symbol":"ZRO","marketPubkey":"7hWzmBJJTMNe5zWeiRbfo1bJ6FEhKUnJGpa1ficR6RWj","baseLotsDecimals":1,"tickSize":10,"marketStatus":"active"},
+    {"symbol":"AAVE","marketPubkey":"A6CdPuNY3mp4tsY1ifQoesHKfwYdVv3wqcaKirEGtaMS","baseLotsDecimals":2,"tickSize":100,"marketStatus":"active"},
+    {"symbol":"LTC","marketPubkey":"HFYNBdwXP1BrnD7eLx7B3NGHi3VqEHdTkQH9FhEUFa8n","baseLotsDecimals":2,"tickSize":10,"marketStatus":"active"},
+    {"symbol":"ETH","marketPubkey":"9u7aqptdRFbsnnoHtjK13E5JkeM14EW5fAKTRPidVF88","baseLotsDecimals":3,"tickSize":100,"marketStatus":"active"},
+    {"symbol":"XLM","marketPubkey":"AXewQALSfgppjhfsZ6w5pqV7wNR5ShDRXPPTy7yx7yuE","baseLotsDecimals":0,"tickSize":10,"marketStatus":"active"},
+    {"symbol":"HYPE","marketPubkey":"CEx9Mgz5cAmWwy6D5H2xGrhmwKeC5L7KtYhFhVGtiBaZ","baseLotsDecimals":2,"tickSize":10,"marketStatus":"active"},
+    {"symbol":"kPEPE","marketPubkey":"Fw9WM8cFMMNxynsvCE5wrVgYNqh6jkmCZCCdHeqM69uU","baseLotsDecimals":-2,"tickSize":100,"marketStatus":"active"},
+    {"symbol":"ZEC","marketPubkey":"FTbbqCP2N2NkUHw1nMPpBhiQCrYGiMQAhK7g1G8NJKEt","baseLotsDecimals":2,"tickSize":100,"marketStatus":"active"},
+    {"symbol":"BTC","marketPubkey":"AXFz1MuzMUBHi5UKJuK3FDCQ73o3rSzubGU2mPr4LLU7","baseLotsDecimals":4,"tickSize":100,"marketStatus":"active"}
+  ],
+  "orderly": [
+    {"symbol":"PERP_1000PEPE_USDC","base_tick":100,"price_range":0.03,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_AAVE_USDC","base_tick":0.01,"price_range":0.03,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_BTC_USDC","base_tick":0.00001,"price_range":0.0094,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_DOGE_USDC","base_tick":1,"price_range":0.0191,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_ETHFI_USDC","base_tick":0.1,"price_range":0.03,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_ETH_USDC","base_tick":0.0001,"price_range":0.0094,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_HYPE_USDC","base_tick":0.01,"price_range":0.03,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_LTC_USDC","base_tick":0.01,"price_range":0.03,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_SOL_USDC","base_tick":0.01,"price_range":0.0094,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_XLM_USDC_mythos","base_tick":1,"price_range":0.05,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_ZEC_USDC","base_tick":0.01,"price_range":0.03,"status":"ACTIVE","min_notional":10},
+    {"symbol":"PERP_ZRO_USDC","base_tick":0.1,"price_range":0.03,"status":"ACTIVE","min_notional":10}
+  ]
+}

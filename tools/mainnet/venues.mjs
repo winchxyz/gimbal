@@ -238,12 +238,13 @@ export function policyShapeProblems(p) {
 
 /**
  * Where the policy disagrees with live mainnet data: a Hyperliquid index or szDecimals, a Phoenix orderbook, lot
- * or tick, an Orderly symbol that is not listed, or a market that is delisted. [] when none.
+ * or tick, an Orderly symbol that is not listed, or a market that is delisted. [] when none. A name listed twice
+ * (an old delisted market and a new one) is checked against the active one, as buildPolicy picks it.
  */
 export function livePolicyProblems(p, live) {
   const out = [];
   for (const a of p.hl_assets ?? []) {
-    const l = live.hl.find((x) => x.symbol === a.symbol);
+    const l = live.hl.find((x) => x.symbol === a.symbol && !x.delisted) ?? live.hl.find((x) => x.symbol === a.symbol);
     if (l === undefined) {
       out.push(`hl_assets ${a.symbol}: Hyperliquid mainnet lists no such perp`);
       continue;
@@ -253,7 +254,7 @@ export function livePolicyProblems(p, live) {
     if (l.delisted) out.push(`hl_assets ${a.symbol}: delisted on Hyperliquid`);
   }
   for (const m of p.phoenix_markets ?? []) {
-    const l = live.phoenix.find((x) => x.symbol === m.symbol);
+    const l = live.phoenix.find((x) => x.symbol === m.symbol && x.active) ?? live.phoenix.find((x) => x.symbol === m.symbol);
     if (l === undefined) {
       out.push(`phoenix_markets ${m.symbol}: Phoenix mainnet lists no such market`);
       continue;
