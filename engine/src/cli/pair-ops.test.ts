@@ -10,6 +10,7 @@ import type { VenueId } from '@gimbal/shared';
 import type { LegOutcome, LegSide, MakerSettings, TradeLeg } from '../trade/legs.ts';
 import { floorToLot, toQty } from '../trade/lots.ts';
 import { PairTrader } from '../trade/pair.ts';
+import { PHOENIX_BUDGET, hostBudget } from '../venues/http-budget.ts';
 import type { PriceDeps } from './pair-mainnet-lib.ts';
 import { OPEN_HEADROOM_S, PRICE_MARGIN_S, newPriceState, oraclePxOf, refreshLanded, refreshReachedChain } from './pair-mainnet-lib.ts';
 import type { OpenPlan, OpenRefresh, OpenRequest, OpsCtx, Pair } from './pair-ops.ts';
@@ -17,6 +18,12 @@ import { MIN_ORDER_USD, capQtyAtOrder, planOpen, recheckOpenSize, refreshForOpen
 import { SERVE_MAKER } from './serve-pair.ts';
 
 const LOT = toQty('0.01');
+
+// The stand-in Phoenix host's request budget (planWorld's phoenixUrl), made before any reader takes the shared one
+// (hostBudget keeps the first it is given): its reads answer from a fake and need no pacing. With PHOENIX_BUDGET
+// (0.75 a second, burst 10) the bucket, shared by every test here, runs dry and each later plan waits seconds for a
+// token, so the wall-clock ages the headroom tests assert drift. Production keeps PHOENIX_BUDGET.
+hostBudget('http://phoenix.plan.test', { ...PHOENIX_BUDGET, ratePerSec: 1_000, burst: 1_000, adaptive: null, criticalFloor: null });
 
 test('a 2.1 % rise after decide() sized 0.2 at 100 under a 20 USD cap: cut to 0.19, whole lots, under the cap', () => {
   const r = capQtyAtOrder({ qty: toQty('0.2'), lot: LOT, worstPx: 100 * 1.021, midPx: 101, capUsd: 20 });

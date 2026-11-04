@@ -14,6 +14,7 @@ import type { SolanaSubmitter } from '../relayer/solana.ts';
 import { PairTrader } from '../trade/pair.ts';
 import type { ProtectedPair } from '../trade/protected-pair.ts';
 import type { HyperliquidReader } from '../venues/hyperliquid.ts';
+import { PHOENIX_BUDGET, hostBudget } from '../venues/http-budget.ts';
 import type { PhoenixReader } from '../venues/phoenix.ts';
 import type { PriceDeps } from './pair-mainnet-lib.ts';
 import { PRICE_MARGIN_S, newPriceState, refreshLanded, refreshReachedChain } from './pair-mainnet-lib.ts';
@@ -23,6 +24,11 @@ import { SERVE_MAKER, buildLiveLegs, liveCarry } from './serve-pair.ts';
 
 const HL_URL = 'https://hl.carry.test';
 const PHOENIX_URL = 'https://phoenix.carry.test';
+// The stand-in Phoenix host's request budget, made before any reader takes the shared one (hostBudget keeps the first
+// it is given): every read here answers from a fake, so it needs no pacing. With PHOENIX_BUDGET (0.75 a second, burst
+// 10) the bucket, shared by every test in this file, runs dry after a few opens and each later read waits seconds for
+// a token, so the wall-clock ages the tests assert drift. Production keeps PHOENIX_BUDGET.
+hostBudget(PHOENIX_URL, { ...PHOENIX_BUDGET, ratePerSec: 1_000, burst: 1_000, adaptive: null, criticalFloor: null });
 const SOL_RPC = 'https://solana.carry.test';
 const ETH_MARKET = { symbol: 'ETH', orderbook: '9u7aqptdRFbsnnoHtjK13E5JkeM14EW5fAKTRPidVF88', base_lot_e8: 100_000, tick_e8: 10_000_000 };
 const ACCOUNT = PHOENIX_MAINNET.globalVault;
@@ -255,5 +261,5 @@ test('serve\'s carry, a days-old stored 1800 (over the band from the books): jud
   const r = await w.open();
   assert.deepEqual(r.refusals, []);
   assert.deepEqual(w.timeline, ['planning on', 'planning off', 'refresh ETH', 'size held to the cap', 'part 1 sent']);
-  assert.match(w.said.join('\n'), /stored ETH 1800, 432000 s old \(planned on the books' mid 2500\.0000, the stored one is over the band from the books\)/);
+  assert.match(w.said.join('\n'), /stored ETH 1800, 43200\d s old \(planned on the books' mid 2500\.0000, the stored one is over the band from the books\)/);
 });
