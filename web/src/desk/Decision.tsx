@@ -14,6 +14,8 @@ interface Props {
   symbol: string | null;
   /** The status line says the owner should act (`needs`): the filled pill. */
   urgent: boolean;
+  /** The owner's minimum net APR (`StrategyConfig`), for the wait sentence; null until it is read. */
+  minNetAprPct?: number | null;
 }
 
 /**
@@ -21,8 +23,8 @@ interface Props {
  * Close both legs, after a confirm. The engine answers at once with ok or the reason it refused; the work itself arrives
  * as Journal and Desk events, so the answer is shown here and nothing else changes.
  */
-export function DecisionBar({ decision, now, held, symbol, urgent }: Props) {
-  const line = decisionLine(decision, now);
+export function DecisionBar({ decision, now, held, symbol, urgent, minNetAprPct = null }: Props) {
+  const line = decisionLine(decision, now, { minNetAprPct });
   // Read-only view: the line says what the loop decided; the override is not offered.
   const canClose = held && writeControls().close;
   const send = useManualSend(canClose ? { kind: 'close', symbol } : null);
@@ -33,7 +35,7 @@ export function DecisionBar({ decision, now, held, symbol, urgent }: Props) {
       {line ? (
         <p className="say">
           <span className="word">{line.word}</span>
-          <span className="reason">{line.reason}</span>
+          <span className="reason" title={line.raw !== line.reason ? line.raw : undefined}>{line.reason}</span>
           <span className="g3 when">{line.when}</span>
         </p>
       ) : (

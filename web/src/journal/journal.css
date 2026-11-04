@@ -41,6 +41,12 @@
 .j-evt .why { display: block; font: var(--t-s); color: var(--ink-2); margin-top: 6px; }
 .j-evt .why.flag { color: var(--watch); }
 .j-evt .why.flag::before { content: ''; display: inline-block; width: 6px; height: 6px; border-radius: var(--r-dot); background: var(--watch); margin-right: var(--s-2); vertical-align: 1px; }
+.j-wait .j-wait-more { display: block; margin-top: 6px; padding: 0; border: 0; background: none; font: var(--t-s); color: var(--ink-3); cursor: pointer; }
+.j-wait .j-wait-more:hover { color: var(--ink); }
+.j-wait-list { list-style: none; margin: 10px 0 0; padding: 0; font: var(--t-s); color: var(--ink-2); }
+.j-wait-list li { display: grid; grid-template-columns: 48px minmax(0, 1fr); column-gap: var(--s-3); padding: 4px 0; }
+.j-wait-list .t { color: var(--ink-3); }
+.j-wait-list .raw { display: block; color: var(--ink-3); margin-top: 2px; }
 .j-evt .amt { text-align: right; min-width: 0; }
 .j-evt .amt .note { display: block; font: var(--t-s); color: var(--ink-3); }
 .j-evt .proof { font: var(--t-s); color: var(--ink-2); text-align: right; display: flex; flex-direction: column; gap: var(--s-1); white-space: nowrap; min-width: 0; }
