@@ -67,7 +67,8 @@ const json = (body, status = 200) => new Response(JSON.stringify(body), { status
 /**
  * A fake mainnet, Orderly and keys. `o`: desk, applied, code, registered, keyActive, receiverAnswer, ownerKey (the key
  * file's public key), ownerNear, holding, ipRefused (the holding read), ipPostFails (Orderly refuses the ip_restriction
- * POST after the contract signed it), thisIps (this machine's public IPs).
+ * POST after the contract signed it), ipLandedUnread (the ip_restriction transaction lands but its result is lost),
+ * thisIps (this machine's public IPs).
  */
 function world(o = {}) {
   let desk = o.desk ?? deskOf();
@@ -132,6 +133,8 @@ function world(o = {}) {
       assert.equal(method, 'orderly_request');
       const kind = args.req.kind;
       if (kind === 'ip_restriction') applied = true;
+      // The transaction landed (the flag is set) but its result is lost: a plain error, no tx for the collector.
+      if (kind === 'ip_restriction' && o.ipLandedUnread) throw new Error('the transaction result could not be read');
       const [m, path, body] = PATHS[kind];
       const t = args.req.timestamp_ms;
       return {
@@ -266,7 +269,7 @@ test('IPs: the canonical form is Rust\'s IpAddr display, as the contract compare
     ['fd00::1', 'fc00::/7 (unique local (private))'], ['fe80::1', 'fe80::/10 (link-local)'], ['ff02::1', 'ff00::/8 (multicast)'],
     // Addresses that stand for an IPv4 one: Orderly sees the IPv4 address, never these.
     ['64:ff9b::102:304', '64:ff9b::/96 (NAT64: a translated IPv4 address)'], ['2002:102:304::1', '2002::/16 (6to4: a tunnelled IPv4 address)'],
-    ['192.88.99.1', '192.88.99.0/24 (6to4 relay anycast)'],
+    ['192.88.99.1', '192.88.99.0/24 (6to4 relay anycast)'], ['64:ff9b:1::1', '64:ff9b:1::/48 (local-use NAT64 (RFC 8215)'],
   ]) assert.ok(ipProblem(ip)?.includes(`is in ${range}`), `${ip}: ${ipProblem(ip)}`);
   for (const ip of ['64:ff9b:0:1::1', '2003::1', '2001:db9::1', '192.88.100.1', '192.88.98.255']) assert.equal(ipProblem(ip), null, `${ip} is public`);
   assert.ok(parseIpList('172.32.0.1', 'x'), 'just past 172.16/12 is public');
@@ -621,16 +624,16 @@ test('apply-ips --send, Orderly refuses the POST after the contract signed: loud
   assert.deepEqual(w.seen.signed.map((s) => s.args.req.kind), ['receiver_address', 'ip_restriction'], 'the contract did sign it');
   assert.equal(w.applied(), true, 'the contract marks the list applied when it signs');
   const fix = `node tools/mainnet/orderly.mjs ips ${CONTRACT} carry ${IP2} --force-same --key-file <owner key json> --send`;
-  assert.match(r.error.message, /^orderly_ip_restriction failed after the contract signed it: .*IP is not allowed.*\. The contract marks the list applied but Orderly did not take it, so opens are NOT protected\. Rerun apply-ips from an IP Orderly takes, or clear the flag: /);
+  assert.match(r.error.message, /^orderly_ip_restriction failed after the contract signed it: .*IP is not allowed.*\. The contract marks the list applied but Orderly did not take it, so opens are NOT protected\. Post it from an IP Orderly takes, or clear the flag: /);
   assert.ok(r.error.message.endsWith(fix), r.error.message);
-  assert.match(r.out, /\nFAILED {4}orderly_ip_restriction: the contract signed it \(tx OpTx2\) and marks the list applied, but Orderly did NOT take it: .*IP is not allowed/);
+  assert.match(r.out, /\nFAILED {4}orderly_ip_restriction: the contract signed it in this run and marks the list applied, but Orderly did NOT take it: .*IP is not allowed/);
   assert.match(r.out, /\n {10}OPENS ARE NOT PROTECTED: the contract signs Orderly opens while Orderly does not limit the key to the list\.\n/);
   assert.ok(r.out.includes(`          - clear the flag, so the contract refuses opens again: ${fix}`));
   assert.deepEqual(r.block.slice(2, -1).filter((l) => !l.startsWith('setup:')), [
     'this:     5.6.7.8 NOT in the list',
-    'applied:  true in the contract, but Orderly did NOT take the list',
+    'applied:  true in the contract (false before this run), but Orderly did NOT take the list',
     'opens:    NOT PROTECTED: the contract signs opens that Orderly does not limit to the list',
-    `fix:      rerun apply-ips from an IP Orderly takes, or: ${fix}`,
+    `fix:      post it from an IP Orderly takes, or: ${fix}`,
   ]);
   assert.doesNotMatch(r.block.join('\n'), /opens: {4}signed/, 'never the plain "signed" line');
   assert.ok(r.block.some((l) => /^setup: {4}orderly_ip_restriction failed: .*IP is not allowed.*; tx OpTx2$/.test(l)), r.block.join('\n'));
@@ -640,6 +643,40 @@ test('apply-ips --send, Orderly refuses the POST after the contract signed: loud
   assert.equal(out.error, null, out.error?.stack);
   assert.equal(w.applied(), false);
   assert.ok(out.block.includes(`ips:      get_desk now ${IP2}; applied false`));
+  // With the flag false already, --force-same has nothing to clear: nothing sent.
+  const again = await capture(['ips', CONTRACT, DESK_ID, IP2, '--force-same', '--key-file', 'k.json', '--send'], w.deps);
+  assert.equal(again.error, null, again.error?.stack);
+  assert.match(again.out, /nothing to send: orderly_ips_applied is false already, and --force-same only clears it/);
+  assert.deepEqual(again.block.slice(2, -1), [`ips:      ${IP2} already set, applied false; --force-same has nothing to clear`]);
+  assert.equal(w.seen.sent.length, 1, 'only the first --force-same was sent');
+});
+
+test('apply-ips --send, a transaction that landed but whose result was lost (no tx collected): decided from the flag, still NOT PROTECTED', async () => {
+  const w = world({ desk: deskOf({ orderly_receiver: RECEIVER, orderly_ips: [IP2] }), ipLandedUnread: true });
+  const r = await capture(['apply-ips', CONTRACT, DESK_ID, '--engine-ips', IP2, '--send'], w.deps);
+  assert.equal(w.applied(), true, 'the flag flipped on chain');
+  assert.ok(r.block.some((l) => /^setup: {4}orderly_ip_restriction failed: the transaction result could not be read$/.test(l)), r.block.join('\n'));
+  assert.ok(!w.seen.fetch.some((f) => f.startsWith('POST')), 'nothing was posted to Orderly');
+  assert.match(r.error.message, /^orderly_ip_restriction failed after the contract signed it: .*opens are NOT protected/);
+  assert.ok(r.block.includes('opens:    NOT PROTECTED: the contract signs opens that Orderly does not limit to the list'));
+  assert.doesNotMatch(r.block.join('\n'), /opens: {4}signed/);
+});
+
+test('apply-ips with the list applied already: refused before signing from an IP outside it; from a listed IP a refused post is no false alarm', async () => {
+  // This machine outside the applied list: Orderly would refuse the post, so nothing is signed.
+  const outside = world({ desk: deskOf({ orderly_ips: [IP2] }), applied: true, thisIps: ['5.6.7.8'] });
+  const dry = await capture(['apply-ips', CONTRACT, DESK_ID, '--engine-ips', IP2], outside.deps);
+  assert.match(dry.out, /^refused {3}at --send: the contract has this list marked applied already, and this machine's IP 5\.6\.7\.8 is not in it/m);
+  const s = await capture(['apply-ips', CONTRACT, DESK_ID, '--engine-ips', IP2, '--send'], outside.deps);
+  assert.match(s.error.message, /marked applied already, and this machine's IP 5\.6\.7\.8 is not in it: .*Post it from a listed IP \(the engine's POST \/setup\)\. If an earlier apply-ips printed NOT PROTECTED, clear the flag first with ips --force-same: nothing was signed$/);
+  assert.equal(outside.seen.signed.length + outside.seen.envReads, 0);
+
+  // A listed machine whose post Orderly still refuses: the flag was true before, so no NOT PROTECTED and no --force-same.
+  const listed = world({ desk: deskOf({ orderly_ips: [IP2] }), applied: true, thisIps: [IP2], ipPostFails: true });
+  const l = await capture(['apply-ips', CONTRACT, DESK_ID, '--engine-ips', IP2, '--send'], listed.deps);
+  assert.match(l.error.message, /^orderly_ip_restriction failed: .*IP is not allowed.*\. The contract had this list marked applied before this run, so Orderly holds a list already \(an earlier one, or this one\) and takes the post only from an IP in it/);
+  assert.doesNotMatch(l.out, /NOT PROTECTED|--force-same/);
+  assert.ok(l.block.includes('applied:  true (before this run too); Orderly holds an earlier list or this one'));
 });
 
 test('apply-ips --send with a pinned receiver that is not Orderly\'s answer: a FAILED line and a non-zero exit', async () => {

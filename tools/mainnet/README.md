@@ -951,10 +951,11 @@ run ends with a block, `=== gimbal orderly <command> ... ===` to `=== end ===`. 
   leading zeros, IPv6 lowercase with the longest zero run as `::`): a form it would refuse is refused here with the
   form to write. Private, loopback, link-local, multicast, carrier-grade NAT and documentation addresses are
   refused too, since Orderly never sees a request come from them; so is an IPv4-mapped IPv6 address (give the IPv4
-  one); so are NAT64 (`64:ff9b::/96`), 6to4 (`2002::/16`) and the 6to4 relay (`192.88.99.0/24`), which stand for
-  an IPv4 address Orderly would see instead. The same list again is `nothing to send` (it would only clear
-  `orderly_ips_applied`) unless `--force-same` is given: then it sends it, only to clear the flag (see below). After
-  it, opens stay refused until `apply-ips`.
+  one); so are NAT64 (`64:ff9b::/96`, and the local-use `64:ff9b:1::/48`), 6to4 (`2002::/16`) and the 6to4 relay
+  (`192.88.99.0/24`), which stand for an IPv4 address Orderly would see instead. The same list again is `nothing to
+  send` (it would only clear `orderly_ips_applied`) unless `--force-same` is given: then it sends it, only to clear
+  the flag (see below); with the flag false already, `--force-same` is `nothing to send` too. After it, opens stay
+  refused until `apply-ips`.
 - **apply-ips** runs the engine's own setup (`runSetup`), cut to its Orderly steps as `checks.mjs` does: register
   and add-key as done-checks only, `orderly_receiver_lookup` (a signed read; it fails when a pinned receiver is not
   Orderly's answer, and the run then exits non-zero with a `FAILED` line) and `orderly_ip_restriction`, in which the
@@ -964,15 +965,21 @@ run ends with a block, `=== gimbal orderly <command> ... ===` to `=== end ===`. 
   this machine's IP is never taken for the engine's. Like the engine's step, it refuses, nothing signed, while the
   list leaves out one of them. It also looks up this machine's public IP (`api.ipify.org`, then
   `checkip.amazonaws.com`) and says whether it is in the list: once Orderly applies the list, a machine outside it
-  cannot post a correction or read the holding. Then it reads `orderly_ips_applied`.
+  cannot post a correction or read the holding. When the contract has the list marked applied already and this
+  machine is not in it, `--send` refuses before signing: Orderly, if it holds the list, would refuse the post from
+  here, so post it from a listed IP (the engine's POST /setup).
 
   **When the post fails after the contract signed.** The contract sets `orderly_ips_applied` when it signs
-  `ip_restriction`, before this machine posts it. If Orderly refuses the post (for example an earlier list is applied
-  there and this machine is not in it), the run prints `FAILED ... OPENS ARE NOT PROTECTED` and exits non-zero: the
-  contract now signs opens that Orderly does not limit to the list. The way out is either to rerun `apply-ips` from an
-  IP Orderly takes the key from (the engine's POST /setup), or to clear the flag with the same list:
-  `ips <contract>.near <desk_id> <same list> --force-same --key-file <owner key json> --send`, after which opens are
-  refused again until an `apply-ips` succeeds.
+  `ip_restriction`, before this machine posts it. The tool reads the flag right before the run and again after it,
+  and judges by the flag, not by which transactions it saw (a transaction that landed but whose result was lost
+  flips it all the same):
+  - false before, true after (or unreadable after), and the step not done: the run prints `FAILED ... OPENS ARE NOT
+    PROTECTED` and exits non-zero, since the contract now signs opens that Orderly does not limit to the list. The way
+    out is either to post it from an IP Orderly takes the key from (the engine's POST /setup), or to clear the flag
+    with the same list: `ips <contract>.near <desk_id> <same list> --force-same --key-file <owner key json> --send`,
+    after which opens are refused again until an `apply-ips` succeeds;
+  - true before and the step not done: Orderly already enforces a list (an earlier one, or this one), which is why it
+    refused; the run says so, exits non-zero and does not offer `--force-same`: post it from a listed IP.
 
 **A wrong list blocks Orderly.** Until a list is set and its `ip_restriction` signed, every Orderly open is refused
 by the contract; reduce-only closes are still signed. Once an `ip_restriction` is applied, Orderly takes the desk's

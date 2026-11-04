@@ -152,7 +152,8 @@ const V4_RESERVED = [
   ['224.0.0.0', 4, 'multicast'], ['240.0.0.0', 4, 'reserved'],
 ];
 const V6_RESERVED = [
-  ['::', 96, 'unspecified, loopback or IPv4-compatible'], ['64:ff9b::', 96, 'NAT64: a translated IPv4 address'], ['100::', 64, 'discard-only'],
+  ['::', 96, 'unspecified, loopback or IPv4-compatible'], ['64:ff9b::', 96, 'NAT64: a translated IPv4 address'],
+  ['64:ff9b:1::', 48, 'local-use NAT64 (RFC 8215): a translated IPv4 address'], ['100::', 64, 'discard-only'],
   ['2001:db8::', 32, 'documentation'], ['2002::', 16, '6to4: a tunnelled IPv4 address'], ['fc00::', 7, 'unique local (private)'], ['fe80::', 10, 'link-local'], ['ff00::', 8, 'multicast'],
 ];
 
@@ -613,6 +614,10 @@ async function ips(x) {
     say('nothing to send: the desk has this list already (setting it again would only clear orderly_ips_applied; --force-same does that)');
     return finish(x, [`ips:      ${current.join(',')} already set; nothing to send`]);
   }
+  if (same && x.settings !== null && x.settings.orderly_ips_applied !== true) {
+    say('nothing to send: orderly_ips_applied is false already, and --force-same only clears it (opens are refused until apply-ips succeeds)');
+    return finish(x, [`ips:      ${current.join(',')} already set, applied false; --force-same has nothing to clear`]);
+  }
   if (same) {
     say('force     --force-same: the same list again, only to clear orderly_ips_applied. Use it when the contract signed an ip_restriction');
     say('          that Orderly did not take: the contract then signs opens that Orderly does not limit to the list. After it,');
@@ -691,6 +696,14 @@ async function applyIps(x) {
   const ready = pub.registered && pub.usable;
   if (!ready) say(`refused   at --send: ${NOT_READY}`);
   if (engineIps === null) say('refused   at --send without --engine-ips');
+  // With the list marked applied already, Orderly may hold it: then only a listed IP can post, and a post from
+  // elsewhere is refused ("IP is not allowed") after a signature. Refused here, before anything is signed.
+  const appliedRefusal = (applied) => (applied !== true || here === null || hereOut.length === 0 ? null
+    : `the contract has this list marked applied already, and this machine's IP ${here.join(', ')} is not in it: Orderly, if it `
+      + 'holds the list, refuses the post from here. Post it from a listed IP (the engine\'s POST /setup). If an earlier apply-ips '
+      + 'printed NOT PROTECTED, clear the flag first with ips --force-same');
+  const earlyRefusal = appliedRefusal(x.settings?.orderly_ips_applied === true);
+  if (earlyRefusal !== null) say(`refused   at --send: ${earlyRefusal}`);
   const thisLine = `this:     ${here === null ? 'unknown' : `${here.join(',')} ${hereOut.length === 0 ? 'in the list' : 'NOT in the list'}`}`;
   if (!a.send) {
     return finish(x, [`state:    ${stateSummary(desk, x.settings)}`, `engine:   ${engineIps === null ? 'not given (--send needs --engine-ips)' : engineIps.join(',')}${missing?.length ? `; missing from the list: ${missing.join(',')}` : ''}`, thisLine], {
@@ -699,6 +712,13 @@ async function applyIps(x) {
   }
   if (missing.length > 0) throw new Error(`the desk's IP list (${list.join(', ')}) leaves out ${missing.join(', ')}, an IP the engine sends from: nothing was signed`);
   if (!ready) throw new Error(NOT_READY);
+  // orderly_ips_applied right before the run, read fresh: the contract sets it when it signs ip_restriction, before
+  // this machine posts it, so before and after tell whether this run flipped it.
+  const readApplied = async () => (x.settings === null ? null
+    : (await x.client.view(a.contract, 'get_desk_settings', { desk_id: a.deskId }))?.orderly_ips_applied === true);
+  const before = await readApplied();
+  const refusal = appliedRefusal(before);
+  if (refusal !== null) throw new Error(`${refusal}: nothing was signed`);
 
   const op = await operator(x, ALLOWED_KINDS['apply-ips']);
   const orderly = orderlyClient(x, op.collected.signer);
@@ -734,33 +754,50 @@ async function applyIps(x) {
     say(line.replace(/^setup: {4}/, 'setup     '));
     lines.push(line);
   }
-  const settings = x.settings === null ? null : await x.client.view(a.contract, 'get_desk_settings', { desk_id: a.deskId });
-  const applied = settings === null ? null : settings.orderly_ips_applied === true;
   const ip = progress.steps.find((p) => p.step === 'orderly_ip_restriction');
   const lookup = progress.steps.find((p) => p.step === 'orderly_receiver_lookup');
   const problems = [];
-  // The contract marks the list applied when it signs ip_restriction, before this machine posts it: a failed post
-  // leaves the contract signing opens that Orderly does not limit to the list.
-  const signedNotTaken = ip.status !== 'done' && ip.tx.length > 0 && applied !== false;
-  if (signedNotTaken) {
-    const sameList = `node tools/mainnet/orderly.mjs ips ${a.contract} ${a.deskId} ${list.join(',')} --force-same --key-file <owner key json> --send`;
+  // Decided from the flag before and after, never from the step's tx list: a transaction that landed but whose result
+  // could not be read flips the flag with no tx collected.
+  let after;
+  let afterError = null;
+  try {
+    after = await readApplied();
+  } catch (e) {
+    after = undefined;
+    afterError = e.message;
+  }
+  const sameList = `node tools/mainnet/orderly.mjs ips ${a.contract} ${a.deskId} ${list.join(',')} --force-same --key-file <owner key json> --send`;
+  const failed = ip.status !== 'done';
+  if (failed && before === false && (after === true || after === undefined)) {
+    // This run flipped the flag (or it cannot be told): the contract signs opens Orderly does not limit to the list.
+    const flag = after === true ? 'marks the list applied' : `may mark the list applied (orderly_ips_applied could not be read again: ${afterError})`;
     const loud = [
-      `FAILED    orderly_ip_restriction: the contract signed it${ip.tx.length === 0 ? '' : ` (tx ${ip.tx.map((t) => t.id).join(', ')})`} and marks the list applied, `
-        + `but Orderly did NOT take it: ${ip.detail ?? 'no detail'}`,
-      '          OPENS ARE NOT PROTECTED: the contract signs Orderly opens while Orderly does not limit the key to the list.',
+      `FAILED    orderly_ip_restriction: the contract signed it in this run and ${flag}, but Orderly did NOT take it: ${ip.detail ?? 'no detail'}`,
+      `          OPENS ARE NOT PROTECTED${after === true ? '' : ' if the flag is set'}: the contract signs Orderly opens while Orderly does not limit the key to the list.`,
       '          Way out, one of:',
-      `          - rerun apply-ips from an IP Orderly takes the key from (one in the list applied there, if any: the engine's POST /setup)`,
+      '          - post it from an IP Orderly takes the key from (one in a list applied there, if any: the engine\'s POST /setup)',
       `          - clear the flag, so the contract refuses opens again: ${sameList}`,
     ];
     for (const l of loud) say(l);
-    lines.push(`applied:  ${applied === null ? 'unknown (no get_desk_settings)' : String(applied)} in the contract, but Orderly did NOT take the list`,
-      'opens:    NOT PROTECTED: the contract signs opens that Orderly does not limit to the list',
-      `fix:      rerun apply-ips from an IP Orderly takes, or: ${sameList}`);
-    problems.push(`orderly_ip_restriction failed after the contract signed it: ${ip.detail ?? 'no detail'}. The contract marks the list applied but `
-      + `Orderly did not take it, so opens are NOT protected. Rerun apply-ips from an IP Orderly takes, or clear the flag: ${sameList}`);
+    lines.push(`applied:  ${after === true ? 'true' : 'unread'} in the contract (false before this run), but Orderly did NOT take the list`,
+      `opens:    NOT PROTECTED${after === true ? '' : ' if the flag is set'}: the contract signs opens that Orderly does not limit to the list`,
+      `fix:      post it from an IP Orderly takes, or: ${sameList}`);
+    problems.push(`orderly_ip_restriction failed after the contract signed it: ${ip.detail ?? 'no detail'}. The contract ${flag} but `
+      + `Orderly did not take it, so opens are NOT protected. Post it from an IP Orderly takes, or clear the flag: ${sameList}`);
+  } else if (failed && before === true) {
+    // The flag was set before this run: Orderly refusing the post shows it enforces a list already (an earlier one, or this).
+    const why = `orderly_ip_restriction ${ip.status}: ${ip.detail ?? 'no detail'}. The contract had this list marked applied before this run, `
+      + 'so Orderly holds a list already (an earlier one, or this one) and takes the post only from an IP in it: post it from a listed IP '
+      + '(the engine\'s POST /setup). Nothing changed in the contract';
+    say(`FAILED    ${why}`);
+    lines.push('applied:  true (before this run too); Orderly holds an earlier list or this one', `opens:    ${opensText(list, true)}`);
+    problems.push(why);
   } else {
-    lines.push(`applied:  ${applied === null ? 'unknown (no get_desk_settings)' : String(applied)}`, `opens:    ${opensText(list, applied)}`);
-    if (ip.status !== 'done') problems.push(`orderly_ip_restriction ${ip.status}: ${ip.detail ?? 'no detail'}`);
+    const applied = after === undefined ? null : after;
+    lines.push(`applied:  ${after === undefined ? `unread (${afterError})` : applied === null ? 'unknown (no get_desk_settings)' : String(applied)}`,
+      `opens:    ${opensText(list, applied)}`);
+    if (failed) problems.push(`orderly_ip_restriction ${ip.status}: ${ip.detail ?? 'no detail'}${before === null ? '; whether the contract marked the list applied cannot be read (no get_desk_settings)' : ''}`);
   }
   if (lookup.status !== 'done') {
     const why = `orderly_receiver_lookup ${lookup.status}: ${lookup.detail ?? 'no detail'}`;
