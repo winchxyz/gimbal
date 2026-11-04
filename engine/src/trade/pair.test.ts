@@ -1002,3 +1002,50 @@ test('openBlocked: a closing desk refuses every open before anything is signed; 
   closing = null;
   assert.equal((await s.trader.open({ size: '0.005', longIndex: 0, reason: 'open ETH' })).status, 'open');
 });
+
+test('hedge: a residual hedge on Orderly arms the replay watch and moves its intent; a copy is trimmed back', async () => {
+  // The open's own Orderly IOC is still watched when a late Hyperliquid maker fill is hedged on Orderly.
+  const s = setup();
+  assert.equal((await s.trader.open({ size: '0.01', longIndex: 1, reason: 'open ETH' })).status, 'open');
+  assert.ok(s.trader.watching(s.b));
+  s.a.pos = q('-0.012');                                   // the late maker fill
+  const out = await s.trader.hedge(1, 'BUY', q('0.002'), false, 'hedge after a late maker fill');
+  assert.equal(out.kind, 'filled');
+  assert.equal(s.b.pos, q('0.012'));
+  assert.equal(s.trader.intent(s.b), q('0.012'), 'the hedge is the leg\'s intent now');
+  assert.equal(s.trader.intent(s.a), q('-0.012'), 'the partner\'s intent is what it holds');
+  const sent = s.b.orders.length;
+  await s.trader.positionPushed(s.b, q('0.012'));
+  assert.equal(s.b.orders.length, sent, 'the hedge\'s own push is not off-intent: nothing is trimmed');
+  assert.equal(s.b.pos, q('0.012'));
+
+  // Past the open's window, the hedge alone keeps Orderly watched: a copy of it is closed reduce-only.
+  const late = setup();
+  assert.equal((await late.trader.open({ size: '0.01', longIndex: 1, reason: 'open ETH' })).status, 'open');
+  late.shared.now += REPLAY_WINDOW_MS + 1;
+  assert.equal(late.trader.watching(late.b), false);
+  late.a.pos = q('-0.012');
+  await late.trader.hedge(1, 'BUY', q('0.002'), false, 'hedge after a late maker fill');
+  assert.ok(late.trader.watching(late.b), 'a signed Orderly hedge can be sent again for 300 s: its leg is watched');
+  late.b.pos += q('0.002');                                // someone sent the signed copy
+  await late.trader.positionPushed(late.b, late.b.pos);
+  assert.equal(late.b.pos, q('0.012'));
+  assert.deepEqual(late.b.orders.at(-1), { side: 'SELL', size: '0.002', reduceOnly: true, reason: 'reconcile PERP_ETH_USDC: close 0.002 over the target' });
+});
+
+test('hedge: a copy found right after the hedge is trimmed at once; an unreadable leg sends nothing', async () => {
+  const s = setup({ pos: '-0.012' }, { pos: '0.01', script: ['copy'] });
+  s.trader.adopt([q('-0.01'), q('0.01')]);
+  await s.trader.hedge(1, 'BUY', q('0.002'), false, 'hedge');
+  assert.equal(s.b.pos, q('0.012'), 'the copy landed with the hedge and was closed back');
+  assert.equal(s.trader.intent(s.b), q('0.012'));
+  assert.ok(s.trader.watching(s.b));
+
+  const u = setup({ pos: '-0.012' }, { pos: '0.01' });
+  u.b.unreadable = true;
+  const out = await u.trader.hedge(1, 'BUY', q('0.002'), false, 'hedge');
+  assert.equal(out.kind, 'failed');
+  assert.match(out.kind === 'failed' ? out.error.message : '', /cannot be read before the hedge: nothing was sent/);
+  assert.equal(u.b.orders.length, 0);
+  assert.equal(u.trader.watching(u.b), false);
+});

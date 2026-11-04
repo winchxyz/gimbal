@@ -25,11 +25,12 @@ class Leg implements TradeLeg {
   readonly venue: VenueId;
   readonly symbol = 'XLM';
   readonly lot = toQty('1');
-  readonly replayable = false;
+  readonly replayable: boolean;
   pos = 0n;
   orders: { side: LegSide; size: bigint; reduceOnly: boolean }[] = [];
-  constructor(venue: VenueId) {
+  constructor(venue: VenueId, replayable = false) {
     this.venue = venue;
+    this.replayable = replayable;
   }
   async check(): Promise<void> {}
   async maxSize(): Promise<bigint> {
@@ -110,15 +111,62 @@ function pair(live: boolean, options: { restored?: InFlightOrder[]; adlHold?: st
     saves.push({ inFlight: book.orders, unsettled: trader?.exportState().unsettled.map((u) => u.index) ?? [] });
   };
   const inner = [options.hl ?? hl, options.px ?? px];
-  const legs = inner.map((l, i) => new GuardedLeg(l, { index: i as 0 | 1, live: () => live, beforeSign: (o) => book.add(o, save) })) as [GuardedLeg, GuardedLeg];
+  // The guarded legs let an order that is not reduce-only out only inside the pair's open (as serve wires them).
+  let opening = (): boolean => false;
+  const legs = inner.map((l, i) => new GuardedLeg(l, { index: i as 0 | 1, live: () => live, beforeSign: (o) => book.add(o, save), opening: () => opening() })) as [GuardedLeg, GuardedLeg];
   trader = new PairTrader({ legs, priceBandBps: 100, unsettledPollMs: null });
   const p = new ProtectedPair({
     trader, symbol: 'XLM', live, why: live ? null : 'GIMBAL_TRADE is not 1', save, inFlight: book, ...(options.adlHold === undefined ? {} : { adlHold: options.adlHold }),
     freshPrice: async () => { events.push('price'); }, onOpen: (lines) => events.push(...lines),
     ...(options.onProtectionClose === undefined ? {} : { onProtectionClose: options.onProtectionClose }),
   });
+  opening = () => p.openingHere;
   return { hl, px, trader, p, events, saves, book };
 }
+
+/** A replayable leg (Orderly) whose orders are signed now: the trader's replay window runs from the real clock. */
+class ReplayLeg extends Leg {
+  constructor() {
+    super('orderly', true);
+  }
+  override async order(side: LegSide, size: bigint, reduceOnly: boolean): Promise<LegOutcome> {
+    const out = await super.order(side, size, reduceOnly);
+    out.ref.sentAt = Date.now();
+    return out;
+  }
+}
+
+test('ProtectedPair.hedge: on a replayable leg it goes through the trader (watched, intent set); otherwise a raw order', async () => {
+  const orderly = new ReplayLeg();
+  const s = pair(true, { px: orderly });
+  s.hl.pos = toQty('-50');
+  orderly.pos = toQty('50');
+  s.p.adopt([toQty('-50'), toQty('50')]);
+  const [hlLeg, orLeg] = s.trader.legs;
+  s.hl.pos = toQty('-60');                                 // a late maker fill on Hyperliquid
+  const out = await s.p.hedge(1, 'BUY', toQty('10'), false, 'hedge after a late maker fill', true);
+  assert.equal(out.kind, 'filled');
+  assert.equal(orderly.pos, toQty('60'));
+  assert.ok(s.trader.watching(orLeg), 'the signed Orderly hedge can be sent again for 300 s: its leg is watched');
+  assert.equal(s.trader.intent(orLeg), toQty('60'));
+  assert.equal(s.trader.intent(hlLeg), toQty('-60'));
+  await s.trader.positionPushed(orLeg, toQty('60'));
+  assert.equal(orderly.orders.length, 1, 'the hedge itself is not off-intent');
+  orderly.pos = toQty('70');                               // someone sent the signed copy
+  await s.trader.positionPushed(orLeg, toQty('70'));
+  assert.equal(orderly.pos, toQty('60'), 'the copy is closed reduce-only');
+  assert.deepEqual(orderly.orders.at(-1), { side: 'SELL', size: toQty('10'), reduceOnly: true });
+
+  // Hyperliquid cannot be replayed: the order goes out as before, and nothing is watched.
+  const h = pair(true);
+  h.hl.pos = toQty('-50');
+  h.px.pos = toQty('60');
+  h.p.adopt([toQty('-50'), toQty('60')]);
+  assert.equal((await h.p.hedge(0, 'SELL', toQty('10'), false, 'hedge', true)).kind, 'filled');
+  assert.equal(h.hl.pos, toQty('-60'));
+  assert.equal(h.trader.watching(h.trader.legs[0]), false);
+  assert.equal(h.trader.intent(h.trader.legs[0]), toQty('-50'), 'a raw order leaves the trader as it was until the adopt');
+});
 
 test('ProtectedPair: a close refreshes the price, is reduce-only even when asked otherwise, and saves after', async () => {
   const s = pair(true);

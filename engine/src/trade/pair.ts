@@ -385,6 +385,44 @@ export class PairTrader {
   }
 
   /**
+   * One order on leg `index` after an open or close (the residual hedge after a late maker fill), in turn with the
+   * pair's other work. On a replayable leg it arms the replay window like any other order and sets the leg's intent to
+   * where the hedge leaves it, so a copy of the hedge is trimmed back and the hedge itself is not read as off-intent;
+   * a copy past the target found right after it is trimmed here. The partner's intent becomes what it holds now. The
+   * baselines stay (the caller adopts the legs after it). A leg that cannot be read first sends nothing: the outcome
+   * is a failed one.
+   */
+  hedge(index: 0 | 1, side: LegSide, size: bigint, reduceOnly: boolean, reason: string): Promise<LegOutcome> {
+    return this.#serial(async () => {
+      const leg = this.legs[index];
+      const from = await this.#read(leg, undefined, 'before a hedge');
+      if (from === null) {
+        const ref: LegRef = { venue: leg.venue, side, size: qtyString(size), reduceOnly, orderId: null, clientId: null, tx: [], sentAt: this.#clock.now() };
+        return { kind: 'failed', error: new Error(`${leg.venue} ${leg.symbol} cannot be read before the hedge: nothing was sent`), ref };
+      }
+      const target = from + (side === 'BUY' ? size : -size);
+      const r = this.#run(leg, from, target);
+      const out = await this.#send(r, side, size, reduceOnly, reason, 'rehedge');
+      await this.#settle(r, from, side, out);
+      if (leg.replayable && r.pos !== null && r.unsettled === null && (side === 'BUY' ? r.pos > target : r.pos < target)) {
+        await this.#trim(r, `reconcile ${leg.symbol}`);
+      }
+      this.#intent.set(leg, r.unsettled !== null ? target : r.pos);
+      this.#known.set(leg, r.pos);
+      if (r.unsettled !== null) this.#armUnsettled(r);
+      const partner = this.#partner(leg);
+      if (!this.#unsettled.has(partner)) {
+        const held = await this.#read(partner, undefined, 'the partner of a hedge');
+        if (held !== null) {
+          this.#intent.set(partner, held);
+          this.#known.set(partner, held);
+        }
+      }
+      return out;
+    });
+  }
+
+  /**
    * A pair operation with a maker leg starts that leg's budget of post-only orders (TradeLeg.beginMakerOperation);
    * the function returned ends it.
    */
@@ -1453,7 +1491,7 @@ function record(out: LegOutcome, purpose: LegOrderRecord['purpose']): LegOrderRe
 }
 
 /** The records of one outcome: one, or one per part of a maker order (each its own order on the venue). */
-function records(out: LegOutcome, purpose: LegOrderRecord['purpose']): LegOrderRecord[] {
+export function records(out: LegOutcome, purpose: LegOrderRecord['purpose']): LegOrderRecord[] {
   if (out.parts === undefined || out.parts.length === 0) return [record(out, purpose)];
   return out.parts.map((p) => ({ ...record(p, purpose), maker: true as const }));
 }

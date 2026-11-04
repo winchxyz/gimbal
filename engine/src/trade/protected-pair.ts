@@ -507,10 +507,15 @@ export class ProtectedPair {
   /**
    * One order on leg `index` outside the trader (pair-ops.ts finish()'s residual hedge after a late maker fill):
    * `allowOpen` only from the loop's open. It stays in the book (no trader result holds it) until a close result or an
-   * adopt. Never throws for the order itself (a refusal comes back as a failed outcome).
+   * adopt. Never throws for the order itself (a refusal comes back as a failed outcome). On a replayable leg (Orderly)
+   * it goes through the trader (PairTrader.hedge): anyone can send a signed copy again inside the replay window, so the
+   * leg is watched and held to where the hedge leaves it. A leg that cannot be replayed sends the order as before.
    */
   async hedge(index: 0 | 1, side: LegSide, size: bigint, reduceOnly: boolean, reason: string, allowOpen: boolean): Promise<LegOutcome> {
-    return this.#operation(allowOpen, () => this.trader.legs[index].order(side, size, reduceOnly, reason));
+    const leg = this.trader.legs[index];
+    return this.#operation(allowOpen, () => (leg.replayable
+      ? this.trader.hedge(index, side, size, reduceOnly, reason)
+      : leg.order(side, size, reduceOnly, reason)));
   }
 
   async #operation<T>(opening: boolean, run: () => Promise<T>): Promise<T> {
