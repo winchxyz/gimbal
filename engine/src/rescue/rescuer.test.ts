@@ -496,7 +496,14 @@ test('a transfer 1Click has not settled in time is held: only reduces run until 
   await run(s.w, trigger({ id: 'c', amountUsd: 30 }));
   assert.doesNotMatch(s.w.rescuer.held ?? '', /rescue a/, "a's hold ended");
   assert.ok(s.w.journal().some((j) => /rescue a's 31.00 USD landed on hyperliquid late/.test(j)));
-  assert.equal(s.sent.length, 2, 'c paid: nothing is held any more');
+  // c was sized before a's 31 USD reached the same leg: it pays nothing and fails, so a fresh read decides.
+  assert.equal(s.sent.length, 1, 'c paid nothing on top of the late delivery');
+  assert.deepEqual(s.w.ended.at(-1), ['c', false]);
+  assert.match(s.w.failures.at(-1)!.reason, /31\.00 USD of an earlier rescue landed late on hyperliquid just now/);
+  assert.match(s.w.failures.at(-1)!.next, /tried again after the backoff/);
+  // The retry, sized on a read after the delivery, pays: nothing is held any more.
+  await run(s.w, trigger({ id: 'd', amountUsd: 30 }));
+  assert.equal(s.sent.length, 2, 'd paid');
 });
 
 test('a delivery 1Click calls SUCCESS but the ledger does not show is held too; a refund ends the hold', async () => {
@@ -982,12 +989,16 @@ test('state: a first run (GIMBAL_RESCUE_FRESH) writes an empty state and starts 
   assert.deepEqual(s.w.ended.at(-1), ['b', true]);
   assert.equal(s.sent.length, 1);
   assert.equal(s.w.journal().filter((j) => /rescuer started at/.test(j)).length, 1);
-  // 1Click delivers and the ledger shows it: the loaded hold settles before the next plan, which pays.
+  // 1Click delivers and the ledger shows it: the loaded hold settles before the next plan. That plan was sized before
+  // the delivery reached the same leg, so it pays nothing; the retry after it pays.
   s.status = () => ({ status: 'SUCCESS', body: null });
   s.ledger.push({ venue: 'hyperliquid', usd: 31, id: 'late-delivery' });
   await run(s.w, trigger({ id: 'c', amountUsd: 30 }));
   assert.ok(s.w.journal().some((j) => /rescue a's 31.00 USD landed on hyperliquid late/.test(j)));
-  assert.equal(s.sent.length, 2, 'c paid');
+  assert.deepEqual(s.w.ended.at(-1), ['c', false]);
+  assert.equal(s.sent.length, 1, 'c paid nothing on top of the late delivery');
+  await run(s.w, trigger({ id: 'd', amountUsd: 30 }));
+  assert.equal(s.sent.length, 2, 'd paid');
 });
 
 test('state: a missing file after a hold existed (another checkout, a git clean) holds every transfer, reduces still run; a fresh start only on GIMBAL_RESCUE_FRESH', async () => {

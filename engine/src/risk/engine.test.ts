@@ -621,3 +621,94 @@ test('a rescue the rescuer is still running never lapses; its late end still cou
   assert.equal(triggers.length, 3);
   assert.equal(triggers[2]!.attempt, 1);
 });
+
+/** A rig whose monotonic clock has its own origin, apart from the wall clock; `stepWall` moves the wall clock alone. */
+function twoClocks(desk: Desk, source?: DeskSource, rescuer?: (x: RescueTrigger) => void | boolean) {
+  let t = 1_000_000;
+  let m = 5;
+  const triggers: RescueTrigger[] = [];
+  const risk = new RiskEngine({
+    mode: 'testnet', source: source ?? desk, strategy: () => DEFAULT_STRATEGY, health: new VenueHealth(), publish: () => {},
+    clock: { now: () => t }, monotonic: () => m, rescuer: (x) => { triggers.push(x); return rescuer?.(x); },
+  });
+  return { risk, triggers, advance: (ms: number) => { t += ms; m += ms; }, stepWall: (ms: number) => { t += ms; } };
+}
+
+test('landing times are monotonic: a wall clock stepped back an hour neither holds the leg off nor ends the settle early', async () => {
+  const desk = new Desk();
+  desk.hlMargin = 150;
+  const { risk, triggers, advance, stepWall } = twoClocks(desk);
+  await risk.tick();
+  risk.rescueEnded(triggers[0]!.id, true);
+  stepWall(-3_600_000);
+  advance(LANDED_SETTLE_MS - 1);
+  await risk.tick();
+  assert.equal(triggers.length, 1, 'still inside the settle window on the monotonic clock');
+  advance(1);
+  await risk.tick();
+  assert.equal(triggers.length, 2, 'settled: judged afresh, whatever the wall clock says');
+  assert.equal(triggers[1]!.attempt, 0);
+});
+
+test('a landing for a leg that already left rescue, while a read is in flight: that stale read triggers nothing', async () => {
+  const desk = new Desk();
+  desk.hlMargin = 150;
+  const { source, hold } = slowReads(desk);
+  const { risk, triggers, advance } = twoClocks(desk, source);
+  await risk.tick();
+  const a = triggers[0]!.id;
+  // The leg leaves rescue (its record goes) while A still runs.
+  desk.hlMargin = 400;
+  advance(5_000);
+  await risk.tick();
+  // A read starts that shows it back under the line; A lands before that read answers.
+  desk.hlMargin = 150;
+  const release = hold();
+  advance(5_000);
+  const inFlight = risk.tick();
+  advance(1_000);
+  risk.rescueEnded(a, true);
+  release();
+  await inFlight;
+  assert.equal(triggers.length, 1, 'the landing is kept for the leg although it had no record');
+  advance(LANDED_SETTLE_MS);
+  await risk.tick();
+  assert.equal(triggers.length, 2);
+  assert.equal(triggers[1]!.attempt, 0);
+});
+
+test('out of rescue and back in, both within the settle window: the landing is kept and nothing triggers until settled', async () => {
+  const desk = new Desk();
+  desk.hlMargin = 150;
+  const { risk, triggers, advance } = twoClocks(desk);
+  await risk.tick();
+  risk.rescueEnded(triggers[0]!.id, true);
+  desk.hlMargin = 400;
+  advance(1_000);
+  await risk.tick();
+  desk.hlMargin = 150;
+  advance(1_000);
+  await risk.tick();
+  assert.equal(triggers.length, 1, 'an unsettled read out of rescue does not drop the landing');
+  advance(1_000);
+  await risk.tick();
+  assert.equal(triggers.length, 2);
+});
+
+test('triggers are remembered for their landing only while one can come: not when untaken, and 24 h at most', async () => {
+  const desk = new Desk();
+  desk.hlMargin = 150;
+  const untaken = twoClocks(desk, undefined, () => false);
+  await untaken.risk.tick();
+  assert.equal(untaken.triggers.length, 1);
+  assert.equal(untaken.risk.rememberedTriggers, 0, 'detect only: no end, so no landing, will come');
+
+  const { risk, triggers, advance } = twoClocks(desk);
+  await risk.tick();
+  assert.equal(risk.rememberedTriggers, 1);
+  // Never ended: it lapses and is tried again; a trigger over a day old is forgotten when the next one fires.
+  advance(24 * 3_600_000 + 1);
+  await risk.tick();
+  assert.equal(triggers.length, 2);
+  assert.equal(risk.rememberedTriggers, 1, 'the day-old trigger was pruned, the new one is kept');
+});

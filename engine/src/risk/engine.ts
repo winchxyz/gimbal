@@ -205,6 +205,11 @@ export class RiskEngine {
     return this.#adlRun;
   }
 
+  /** How many triggers are remembered for their landing to find their leg (tests). */
+  get rememberedTriggers(): number {
+    return this.#triggerLeg.size;
+  }
+
   /** E9: the legs and each leg venue's free margin, as last read (the rescue plans its sources on them). */
   legView(): { legs: Leg[]; freeMargin: Partial<Record<VenueId, number>> } {
     const freeMargin: Partial<Record<VenueId, number>> = {};
@@ -450,11 +455,8 @@ export class RiskEngine {
         // Read before the margin landed, or while the venue may still answer from before it: these numbers may not
         // have it yet, so they say nothing about the leg now.
         if (!settled(v, r)) continue;
-        if (r.endedAt === null && (this.#o.rescuerRunning?.() ?? null) === r.trigger.id) {
-          // Another rescue of this leg still runs: its own end decides what comes next.
-          delete r.landedAt;
-          continue;
-        }
+        // Settled and still under the line: afresh. Should another rescue still run, the rescuer refuses this one
+        // (one at a time) and the backoff applies; the landing is never dropped while the leg waits on a lapse.
         this.#rescues.delete(k);
         this.#fire(v, views, t, 0);
         continue;
@@ -463,6 +465,7 @@ export class RiskEngine {
         this.#fire(v, views, t, 0);
         continue;
       }
+      // Lapse and backoff run on the wall clock (`clock`), as before the landing rule; only read and landing times are monotonic.
       const backoff = Math.min(RESCUE_RETRY_MAX_MS, RESCUE_RETRY_MS * 2 ** r.attempt);
       // Lapsed: no end reported in time, and the rescuer is not still running it (it reports its end when it ends).
       const lapsed = t - r.trigger.at >= RESCUE_LAPSE_MS && (this.#o.rescuerRunning?.() ?? null) !== r.trigger.id;
@@ -519,12 +522,15 @@ export class RiskEngine {
         taken = this.#o.rescuer(trigger) !== false;
       } catch (err) {
         this.#rescues.get(k)!.endedAt = t;
+        this.#triggerLeg.delete(trigger.id);
         this.#log(`rescue ${trigger.id}: the rescuer threw: ${errorMessage(err)}`);
         this.#journal({ t, kind: 'error', summary: `rescue ${trigger.id} of ${v.leg.venue} ${v.leg.symbol} could not start: ${errorMessage(err)}`, numbers: { venue: v.leg.venue }, tx: [] });
         return;
       }
       if (taken) return;
     }
+    // Not taken (detect only): no end will be reported, so there is no landing to find its leg for.
+    this.#triggerLeg.delete(trigger.id);
     const progress: RescueProgress = {
       id: trigger.id, from: trigger.from, to: trigger.venue, amountUsd, step: 'detect', startedAt: t, elapsedS: 0, tx: [],
     };
