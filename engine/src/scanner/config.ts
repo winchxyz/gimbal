@@ -45,8 +45,13 @@ export interface ScannerConfig {
   /** The contract's policy for the desk, as get_desk returns it; null until a desk exists (nothing can be entered). */
   policy: ContractPolicy | null;
   intervalMs: number;
-  /** A desk venue's book is read again once it is this old. */
+  /** A desk venue's book is read again once it is this old (the held window's legs and the policy's markets). */
   bookTtlMs: number;
+  /**
+   * The same for a desk leg off the desk's policy (its windows cannot be entered, the book only prices them): read far
+   * less often, so a venue's request budget (Phoenix: about 1 request a second) goes to the books that can trade.
+   */
+  offDeskBookTtlMs: number;
   bookDepth: number;
   /** A watch-only venue's funding is read again once its last answer is this old (desk venues: every scan). */
   watchIntervalMs: number;
@@ -296,6 +301,7 @@ export const DEFAULT_SCANNER_CONFIG: ScannerConfig = {
   policy: null,
   intervalMs: 5_000,
   bookTtlMs: 30_000,
+  offDeskBookTtlMs: 5 * 60_000,
   bookDepth: 20,
   // Variational answered HTTP 429 to a 5 s poll on 2026-10-31.
   watchIntervalMs: 30_000,

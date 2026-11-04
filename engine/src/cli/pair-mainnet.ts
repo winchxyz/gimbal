@@ -105,7 +105,7 @@ const USAGE = `usage: node --env-file=<engine env> engine/src/cli/pair-mainnet.t
   refuse-notional <symbol>   a real order over max_notional_usd to hl_order: the contract refuses it on chain (E_SIZE)
     Both are safe to run while serve trades: no trader lock, no venue order, one NEAR call at a time; nothing is ever
     forwarded to a venue, whatever the contract answers. Exit 0 refused as expected, 1 refused otherwise (gas spent),
-    3 no proven outcome, 4 signed (never forwarded), 5 nothing sent.
+    3 no proven outcome, 4 signed (never forwarded), 5 hl_order not sent (a refresh_prices may have gone out and spent gas).
   cancel-hl <symbol> <oid|cloid>   the order's status; --send (serve stopped) cancels it with hl_cancel when it is open`;
 
 const say = (line = '') => console.log(line);
@@ -136,7 +136,8 @@ interface Ctx extends OpsCtx {
   prices: PriceDeps;
 }
 
-const refusing = REFUSE_COMMANDS[process.argv[2] ?? ''] !== undefined;
+/** Set from the parsed command (an option may come before it, as in `--send refuse-band ETH`). */
+let refusing = false;
 try {
   await main(process.argv.slice(2));
 } catch (err) {
@@ -156,7 +157,8 @@ try {
     console.error(`pair-mainnet: ${errorMessage(err)}`);
     process.exitCode = 1;
   }
-  // refuse-*: whatever stopped it here stopped it before hl_order went out (refuse() answers for the call itself).
+  // refuse-*: whatever stopped it here stopped it before hl_order went out (refuse() answers for the call itself);
+  // a refresh_prices may still have gone out and spent its gas.
   if (refusing && !(err instanceof UsageError)) process.exitCode = EXIT_NOT_SENT;
 }
 for (const line of openLines) console.log(line);
@@ -164,6 +166,7 @@ setTimeout(() => process.exit(), 300).unref();
 
 async function main(argv: string[]): Promise<void> {
   const args = parseArgs(argv);
+  refusing = REFUSE_COMMANDS[args.command] !== undefined;
   if (!['status', 'fund-phoenix', 'defund-phoenix', 'open', 'close', 'cancel-hl', ...Object.keys(REFUSE_COMMANDS)].includes(args.command)) throw new UsageError(`unknown command ${args.command}`);
   const tree = linkedWorktree();
   if (args.send && tree) throw new Error('this checkout is a linked git worktree: --send refuses here; run it from the main checkout');

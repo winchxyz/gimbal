@@ -10,9 +10,10 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { PhoenixHttpError } from '@ellipsis-labs/rise';
 import { phoenixTraderApi } from '../trade/phoenix-leg.ts';
+import { noteDeskAct } from './desk-acts.ts';
 import { HostBudget, PHOENIX_BUDGET, hostBudget, isReadSkipped, scanRead } from './http-budget.ts';
-import type { HostBudgetOptions } from './http-budget.ts';
-import { PhoenixReader } from './phoenix.ts';
+import type { BudgetTimers, HostBudgetOptions } from './http-budget.ts';
+import { MARKS_MAX_AGE_MS, PhoenixReader } from './phoenix.ts';
 import { VirtualClock, readWireRecording } from './replay.ts';
 
 const DIR = fileURLToPath(new URL('../../fixtures/phoenix-wire/', import.meta.url));
@@ -42,9 +43,24 @@ const limited = (retryAfter?: string) => new Response('{"error":"rate_limited"}'
   status: 429, headers: retryAfter === undefined ? {} : { 'retry-after': retryAfter },
 });
 
-function reader(f: typeof fetch, budget: Partial<HostBudgetOptions> = {}, clock = new VirtualClock(AT), timeoutMs?: number) {
-  const b = new HostBudget('phoenix-test', { ...PHOENIX_BUDGET, random: () => 0, ...budget });
-  return { reader: new PhoenixReader({ fetch: f, clock, budget: b, ...(timeoutMs === undefined ? {} : { timeoutMs }) }), budget: b, clock };
+/**
+ * PHOENIX_BUDGET's waits, retries and cool-downs on a faster bucket with no rate cut after a 429, so these tests run in
+ * real time in well under a second each; the real numbers are tested on a fake clock in http-budget.test.ts.
+ */
+const TEST_BUDGET: HostBudgetOptions = {
+  ...PHOENIX_BUDGET, ratePerSec: 5, burst: 5, criticalReserve: 1, classReserve: {}, adaptive: null, criticalFloor: null, random: () => 0,
+};
+
+/** Timers that fire only when told (the marks refresh between account reads). */
+function heldTimers() {
+  const due: (() => void)[] = [];
+  const timers: BudgetTimers = { setTimeout: (fn) => due.push(fn), clearTimeout: () => {} };
+  return { timers, fire: () => due.splice(0).forEach((fn) => fn()), armed: () => due.length };
+}
+
+function reader(f: typeof fetch, budget: Partial<HostBudgetOptions> = {}, clock = new VirtualClock(AT), timeoutMs?: number, timers = heldTimers().timers) {
+  const b = new HostBudget('phoenix-test', { ...TEST_BUDGET, ...budget });
+  return { reader: new PhoenixReader({ fetch: f, clock, budget: b, timers, ...(timeoutMs === undefined ? {} : { timeoutMs }) }), budget: b, clock };
 }
 
 test('a 429 burst on books: the scanner\'s read is sent once, the next ones are skipped unsent, account and trader reads go through after Retry-After', async () => {
@@ -129,7 +145,7 @@ test('account reads go ahead of the scanner\'s queued book reads', async () => {
   assert.equal(order.filter((o) => o === 'book').length, 6, 'the books are read too, after');
 });
 
-test('funding: the overview is read once a minute (rates book hourly), the marks on every call; a failed refresh serves the last one, dated', async () => {
+test('funding: the overview is read once a minute (rates book hourly), the marks once 6 s old; a failed refresh serves the last one, dated', async () => {
   let overviewDown = false;
   const { f, count } = fakeFetch((url) => (overviewDown && url.pathname === '/v1/funding/overview' ? new Response('{}', { status: 502 }) : undefined));
   const clock = new VirtualClock(AT);
@@ -139,7 +155,10 @@ test('funding: the overview is read once a minute (rates book hourly), the marks
   clock.set(AT + 5_000);
   await scanRead(() => r.funding());
   assert.equal(count('/v1/funding/overview'), 1);
-  assert.equal(count('/v1/markets/stats/latest'), 2);
+  assert.equal(count('/v1/markets/stats/latest'), 1, 'the marks of 5 s ago are shared');
+  clock.set(AT + 6_000);
+  await scanRead(() => r.funding());
+  assert.equal(count('/v1/markets/stats/latest'), 2, 'read again once 6 s old');
   clock.set(AT + 61_000);
   await scanRead(() => r.funding());
   assert.equal(count('/v1/funding/overview'), 2);
@@ -289,7 +308,7 @@ const TRADER_STATE = `/v1/trader/state/${AUTHORITY}`;
 test('phoenixTraderApi: a 429 on the trader state is retried after Retry-After, then answered', async () => {
   let states = 0;
   const { f } = fakeFetch((url) => (url.pathname === TRADER_STATE && ++states === 1 ? limited('0.2') : undefined));
-  const budget = new HostBudget('phoenix-test', { ...PHOENIX_BUDGET, random: () => 0 });
+  const budget = new HostBudget('phoenix-test', TEST_BUDGET);
   const t0 = Date.now();
   const raw = await phoenixTraderApi('https://perp-api.phoenix.trade/', f, 0, budget).traderState(AUTHORITY);
   assert.equal(states, 2);
@@ -300,7 +319,7 @@ test('phoenixTraderApi: a 429 on the trader state is retried after Retry-After, 
 
   // An hour of Retry-After is cut to the cap: the read probes after it instead of failing for an hour.
   states = 0;
-  const capped = new HostBudget('phoenix-test', { ...PHOENIX_BUDGET, retryAfterMaxMs: 200, random: () => 0 });
+  const capped = new HostBudget('phoenix-test', { ...TEST_BUDGET, retryAfterMaxMs: 200 });
   const { f: f2 } = fakeFetch((url) => (url.pathname === TRADER_STATE && ++states === 1 ? limited('3600') : undefined));
   const t1 = Date.now();
   await phoenixTraderApi('https://perp-api.phoenix.trade', f2, 0, capped).traderState(AUTHORITY);
@@ -343,4 +362,95 @@ test('phoenixTraderApi with no budget given shares the process\'s budget for tha
   await phoenixTraderApi(`${origin}/`, f).traderState(AUTHORITY);
   await new PhoenixReader({ apiUrl: origin, fetch: f }).book('SOL').catch(() => {});
   assert.equal(shared.state().sent, before + 2);
+});
+
+test('account reads: two at once share one snapshot; the loop\'s accountWithin takes the risk engine\'s last answer; the scanner takes its marks', async () => {
+  const { f, count } = fakeFetch();
+  const clock = new VirtualClock(AT);
+  const held = heldTimers();
+  const { reader: r } = reader(f, {}, clock, undefined, held.timers);
+  const [a, b] = await Promise.all([r.account(AUTHORITY), r.account(AUTHORITY)]);
+  assert.deepEqual(a, b);
+  assert.equal(count('/v1/trader/state/'), 1, 'one snapshot for both');
+  assert.equal(count('/v1/markets/stats/latest'), 1);
+  // The scanner's funding 4 s later takes those marks; the strategy loop's free margin takes that account answer.
+  clock.set(AT + 4_000);
+  await scanRead(() => r.funding());
+  assert.equal(count('/v1/markets/stats/latest'), 1, 'the marks of the account read');
+  assert.deepEqual(await r.accountWithin(AUTHORITY, 7_000), a);
+  assert.equal(count('/v1/trader/state/'), 1);
+  // Past its age the loop reads too.
+  clock.set(AT + 12_000);
+  await r.accountWithin(AUTHORITY, 7_000);
+  assert.equal(count('/v1/trader/state/'), 2);
+});
+
+test('a risk tick is one request: the marks come from a cache of at most 5 s, refreshed between ticks as a scanner read', async () => {
+  const { f, count } = fakeFetch();
+  const clock = new VirtualClock(AT);
+  const held = heldTimers();
+  // A bucket that never runs dry here (the budget's clock is the system's): the requests are what is counted.
+  const { reader: r, budget } = reader(f, { ratePerSec: 1_000, burst: 100 }, clock, undefined, held.timers);
+  const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+  // The first tick has no marks yet: the snapshot and the marks, both critical.
+  await r.account(AUTHORITY);
+  assert.deepEqual([count('/v1/trader/state/'), count('/v1/markets/stats/latest')], [1, 1]);
+  assert.equal(held.armed(), 1, 'the refresh is armed');
+  for (let tick = 1; tick <= 4; tick++) {
+    // Half way to the next tick the refresh reads the marks, from the scanner's class.
+    clock.set(AT + tick * 5_000 - 2_500);
+    const sentBefore = budget.state().sent;
+    held.fire();
+    await settle();
+    await settle();
+    assert.equal(count('/v1/markets/stats/latest'), 1 + tick);
+    assert.equal(budget.state().sent, sentBefore + 1);
+    // The tick: its snapshot alone, the marks 2.5 s old.
+    clock.set(AT + tick * 5_000 + 30);
+    await r.account(AUTHORITY);
+    assert.deepEqual([count('/v1/trader/state/'), count('/v1/markets/stats/latest')], [1 + tick, 1 + tick], `tick ${tick}`);
+  }
+  // A refresh that did not come (skipped after a 429, say): marks older than 5 s are not used, the tick reads them.
+  clock.set(AT + 20_030 + MARKS_MAX_AGE_MS + 3_000);
+  await r.account(AUTHORITY);
+  assert.deepEqual([count('/v1/trader/state/'), count('/v1/markets/stats/latest')], [6, 6]);
+  // Without account reads for a while the armed refresh does nothing.
+  clock.set(AT + 60_000);
+  held.fire();
+  await settle();
+  assert.equal(count('/v1/markets/stats/latest'), 6);
+});
+
+test('the desk\'s own action (an order, a close, a rescue) ends the reuse of account answers read before it', async () => {
+  let hold = false;
+  let release: () => void = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const { f, count } = fakeFetch((url) => {
+    if (!hold || !url.pathname.startsWith('/v1/trader/state/')) return undefined;
+    const line = LINES.find((l) => l.url === url.href)!;
+    return gate.then(() => new Response(JSON.stringify(line.response), { status: line.status }));
+  });
+  const clock = new VirtualClock(AT);
+  const { reader: r } = reader(f, {}, clock);
+  await r.account(AUTHORITY);
+  assert.equal(count('/v1/trader/state/'), 1);
+  clock.set(AT + 1_000);
+  await r.accountWithin(AUTHORITY, 7_000);
+  assert.equal(count('/v1/trader/state/'), 1, 'reused');
+  // The relayer marks an order (venues/desk-acts.ts): the loop sizes from a fresh read.
+  noteDeskAct();
+  await r.accountWithin(AUTHORITY, 7_000);
+  assert.equal(count('/v1/trader/state/'), 2, 'read again after the act');
+  await r.accountWithin(AUTHORITY, 7_000);
+  assert.equal(count('/v1/trader/state/'), 2, 'that fresh answer is reused');
+  // A read in flight when the act starts is not joined after it either.
+  clock.set(AT + 9_000);
+  hold = true;
+  const before = r.account(AUTHORITY);
+  const joined = r.account(AUTHORITY);
+  noteDeskAct();
+  const after = r.account(AUTHORITY);
+  release();
+  await Promise.all([before, joined, after]);
+  assert.equal(count('/v1/trader/state/'), 4, 'one for the two before the act, one after it');
 });

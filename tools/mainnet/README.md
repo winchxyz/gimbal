@@ -156,8 +156,9 @@ What it does:
   |---|---|---|
   | `ORDERLY_BROKER_ID` | deploy, desk | required; must be the engine's mainnet broker; `new()` fixes it for the contract's life |
   | `HL_REFERRAL_CODE`, `ORDERLY_REFERRAL_CODE`, `PHOENIX_REFERRAL_CODE` | deploy | empty → `null` (no code); fixed by `new()` |
-  | `RELAYER_EVM_PRIVATE_KEY` | relayer-wallet | written by step 5 (`--write`) when empty |
-  | `ARBITRUM_RPC_URL` | relayer-wallet `--check` | optional; default `https://arb1.arbitrum.io/rpc` |
+  | `RELAYER_EVM_PRIVATE_KEY` | relayer-wallet, relayer-rotate | written by step 5 (`--write`) when empty; replaced by relayer-rotate `--send` |
+  | `RELAYER_EVM_PRIVATE_KEY_OLD` | relayer-rotate | the rotated-out key, written by relayer-rotate `--send` |
+  | `ARBITRUM_RPC_URL` | relayer-wallet `--check`, relayer-rotate | optional; default `https://arb1.arbitrum.io/rpc` |
   | `ONECLICK_API_KEY` | fund | optional; sent as a header only, never printed; without it 1Click adds 0.2 % |
 
   retire and fund read `SOLANA_RPC_URL`, `ARBITRUM_RPC_URL` and `HYPEREVM_RPC_URL` from the shell environment
@@ -394,6 +395,37 @@ Venue setup (step 6) does not use this wallet; the bridge stage of `hl-return.mj
 
 - **Cost:** the ETH you send (a few dollars).
 - **Check after:** `--check` shows the balance, and arbiscan.io/address/`<address>` shows the transfer.
+
+### Rotating the relayer wallet
+
+```
+node tools/mainnet/relayer-rotate.mjs
+node tools/mainnet/relayer-rotate.mjs --send
+```
+
+- Without a flag, a dry run: it generates, writes and signs nothing. It prints the old relayer's address, its
+  Arbitrum ETH, USDC and USDC.e, what `--send` would do, and the money line: how much ETH leaves, to where.
+- `--send` (from the main checkout) generates a new key and writes it, with the old one, to a key file of its own,
+  `.env.relayer-new-<time>`, before `.env` is touched. It then backs up `.env` to `.env.bak-<time>` (the file
+  before, with the old key) and writes `.env` atomically: `RELAYER_EVM_PRIVATE_KEY` = the new key,
+  `RELAYER_EVM_PRIVATE_KEY_OLD` = the old one. Every file and its folder are fsynced (the folder on POSIX only).
+  It reads `.env` back, then sends all the old wallet's ETH minus gas to the address of the key in the file on
+  Arbitrum One, and prints both addresses and the arbiscan link. No key is printed. Keep the key file until
+  Railway runs the new key.
+- The files are made mode 0600 on POSIX. On Windows a file takes its folder's permissions: keep the checkout in a
+  folder only the owner can read.
+- The ETH stays the owner's: both are the owner's gas wallets. Only the transfer's gas is spent, well under
+  0.000001 ETH at Arbitrum's usual price; the part of the gas limit it does not use stays on the old wallet.
+- It refuses while the old wallet holds USDC or USDC.e (it moves ETH only: move the USDC to an owner address by
+  hand first), while a transaction of the old wallet is pending, and while `RELAYER_EVM_PRIVATE_KEY` is set in
+  the shell environment (it would win over `.env`).
+- A rerun after `--send` generates nothing and writes nothing: it moves what is left on the old wallet to the
+  current one, or says the rotation is done. If `.env` lost the new key (a backup copied over it, say), the rerun
+  finds the key file that names the old key and puts both keys back first; the dry run says so. To rotate again later, take `RELAYER_EVM_PRIVATE_KEY_OLD` out of
+  `.env` first, once its wallet is empty.
+- Then set `RELAYER_EVM_PRIVATE_KEY` on Railway (the service's variables) to the new value in `.env` and
+  redeploy. Until then serve's relayer signs with the old wallet, which has no gas: its Arbitrum submits fail
+  and nothing is paid.
 
 ## 6. Engine in mainnet mode: venue setup
 
@@ -892,12 +924,14 @@ node --env-file=... engine/src/cli/pair-mainnet.ts cancel-hl ETH <oid|cloid>  # 
   lot over the cap. `--send` prints the nearblocks link and the exact error and costs about 0.001 NEAR, plus one
   `refresh_prices` when the stored price is stale. No trader lock, no venue order, one NEAR call at a time, and it
   refuses when the key has under 0.6 NEAR (two call reserves) spendable or allowance: safe while serve runs. Exit 0
-  refused as expected, 1 refused otherwise (gas spent), 3 no proven outcome, 4 signed, 5 nothing sent.
+  refused as expected, 1 refused otherwise (gas spent), 3 no proven outcome, 4 signed, 5 `hl_order` not sent
+  (a `refresh_prices` may have gone out and spent gas).
 - The order is priced at least max(25 bps, half the band) above the best ask, read twice (the second right before
   `hl_order`). A signature the contract returns anyway (exit 4) is never forwarded, but it is public in the
   transaction. `expiresAfter` (60 s) bounds only when Hyperliquid takes it; posted in time and not crossing, a post-only
   buy rests until filled or cancelled. Then check the printed cloid with `cancel-hl` and, if it rests, stop serve,
-  run `cancel-hl <SYM> <cloid> --send`, and start serve again.
+  run `cancel-hl <SYM> <cloid> --send`, and start serve again. "Hyperliquid does not know it" in the first
+  60 s after the block can still change: check again after that.
 
 - Every Phoenix transaction is one legacy message signed by `sol_sign` (compute budget first, fee at most 600,000
   lamports; orders at the 600k unit limit and `--priority-microlamports`, default 100,000, at most 200,000). The money
@@ -1094,7 +1128,8 @@ held payment again at 1Click and on chain.
 ## Files the scripts write
 
 All of them are gitignored and are written in the main checkout only (never in a linked worktree). None is ever
-overwritten, and each is printed with its absolute path when written:
+overwritten except by relayer-rotate `--send`, which keeps the old key under the new one and backs the file up
+first, and each is printed with its absolute path when written:
 
 | file | written by | content |
 |---|---|---|
@@ -1102,6 +1137,7 @@ overwritten, and each is printed with its absolute path when written:
 | `.keys/operator-<contract>.near.json` | desk `--send` | the engine's FunctionCall key on the owner's account |
 | `.keys/engine-mainnet-<contract>.near.env` | desk `--send` | the engine settings below |
 | `.env` `RELAYER_EVM_PRIVATE_KEY` | relayer-wallet `--write` | the Arbitrum gas wallet's key, only into an empty entry |
+| `.env` `RELAYER_EVM_PRIVATE_KEY`, `RELAYER_EVM_PRIVATE_KEY_OLD`, `.env.bak-<time>`, `.env.relayer-new-<time>` | relayer-rotate `--send` | the one write that replaces a key: the new key, the old one kept under it, a backup of the file before, and a key file with both keys written first |
 
 ## Engine env file
 

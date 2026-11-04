@@ -2,6 +2,9 @@
   "name": "@gimbal/tools",
   "private": true,
   "license": "BUSL-1.1",
+  "dependencies": {
+    "viem": "2.57.7"
+  },
   "scripts": {
     "test": "node --test \"mainnet/*.test.mjs\" \"testnet/*.test.mjs\""
   }

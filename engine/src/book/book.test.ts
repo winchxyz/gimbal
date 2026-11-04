@@ -14,12 +14,13 @@ import { HL_MAINNET_INFO_URL, HyperliquidReader } from '../venues/hyperliquid.ts
 import type { WireLine } from '../venues/recorder.ts';
 import type { FundingPayment } from '../venues/venue.ts';
 import { loopBook } from '../cli/serve-loop.ts';
-import { PositionBook, createBook, nextSyncAt } from './book.ts';
+import { POST_ENTER_SYNC_MS, PositionBook, createBook, nextSyncAt } from './book.ts';
 import { HOUR_MS, positionIdOf, summarize } from './derive.ts';
 import { bookReport } from './report.ts';
 import type { RiskCheckRecord, RiskLedgerRecord } from './risk-ledger.ts';
 import { holdSpan, riskLedgerFile } from './risk-ledger.ts';
-import { hlFillFee, hlNonFundingLedger } from './sources.ts';
+import { readServeSummary, withServeSummary } from './serve-summary.ts';
+import { PHOENIX_FEE_INDEX_WAIT_MS, hlFillFee, hlNonFundingLedger, phoenixFillFee } from './sources.ts';
 import { BookStore, bookFile } from './store.ts';
 import { OVERLAP_MS, READ_AFTER_EXIT_MS, fundingKey, fundingWindow } from './sync.ts';
 import type { BookRecord, FeeEvent, FundingEvent, SyncEvent, TransferEvent } from './types.ts';
@@ -813,4 +814,90 @@ test('npm run report: the NEAR AI risk check ledger next to the book, offline: r
   assert.match(out, / {4}passed {5}2: 1 with a position, net /);
   assert.match(out, /that a given reply came from them is not verified/);
   assert.match(out, /risk-checks-replay\.jsonl\n[\s\S]*btc-phoenix-hyperliquid[\s\S]*no position: no act booked after it[\s\S]*\(no position book next to it: passes show no position\)/);
+});
+
+test('a position booked while the book runs has its ledgers read at once, not at the next hour; the empty start says why it read none', async () => {
+  const dir = tempDir(dirs);
+  const sources = fixtureSources();
+  const clock = new VirtualClock(T0 + 2 * H + 30 * 60_000);
+  const timers: { fn: () => void; ms: number }[] = [];
+  const lines: string[] = [];
+  const book = createBook({
+    dir, ...DESK, clock, addresses: sources.addresses, sources: sources.sources, log: (l) => lines.push(l),
+    timers: { setTimeout: (fn, ms) => timers.push({ fn, ms }), clearTimeout: () => {} },
+  });
+  // serve's start on an empty book (the pair is adopted after the first scan): nothing to read, and it says so.
+  book.start();
+  for (let i = 0; i < 6; i++) await tick();
+  assert.ok(lines.includes('book: no ledger read: no position is booked yet (the next sync after one is booked reads them)'), lines.join('\n'));
+  assert.equal(sources.hl.asked.length, 0);
+  assert.deepEqual(book.summary().cursors, {}, 'what the report calls never synced');
+  // The loop adopts the pair after its first decision.
+  book.adopt({ windowId: XLM, symbol: 'XLM', since: T0 + 20 * 60_000, legUsd: 1000, legs: [{ venue: 'hyperliquid', side: 'short' }, { venue: 'phoenix', side: 'long' }] });
+  const soon = timers.filter((t) => t.ms === 0);
+  assert.equal(soon.length, 1, 'a sync is queued for the next turn');
+  soon[0]!.fn();
+  for (let i = 0; i < 6; i++) await tick();
+  assert.equal(sources.hl.asked.length, 1, 'the adopted position\'s Hyperliquid ledger is read now, not at the next hour');
+  assert.equal(sources.phoenix.asked.length, 1);
+  const cursors = Object.keys(book.summary().cursors).sort();
+  assert.ok(cursors.includes('hyperliquid') && cursors.includes('phoenix'), cursors.join(', '));
+  // An enter books a position too: its sync waits POST_ENTER_SYNC_MS (Phoenix indexes its fills some seconds late).
+  book.record(enterSol());
+  assert.equal(timers.filter((t) => t.ms === POST_ENTER_SYNC_MS).length, 1, 'the enter\'s sync a minute on');
+  // Nothing is queued once stopped.
+  book.stop();
+  book.record(enterSol());
+  assert.equal(timers.filter((t) => t.ms === POST_ENTER_SYNC_MS).length, 1);
+});
+
+test('a Phoenix fee counts as found only once every signature of the act is in trades-history; a missing one is retried', async () => {
+  const at = T0 + 2 * H;
+  const row = (signature: string, fees: string) => ({ signature, marketSymbol: 'SOL', baseLotsDelta: '1', price: '150', fees, timestamp: new Date(at).toISOString() });
+  let rows = [row('sig-open-1', '0.05')];
+  const api = { tradesHistory: async () => ({ data: rows }) } as unknown as Parameters<typeof phoenixFillFee>[0];
+  const q = {
+    venue: 'phoenix', address: 'auth', symbol: 'SOL', side: 'BUY' as const, startedAt: at - 5_000, at,
+    tx: [{ chain: 'solana', id: 'sig-open-1' }, { chain: 'solana', id: 'sig-open-2' }] as BookRecord['tx'],
+  };
+  // Seconds after the enter, the second fill is not indexed yet: no fee (a partial one would be booked for good).
+  assert.equal(await phoenixFillFee(api, { ...q, now: at + 10_000 }), null);
+  // Both indexed: the whole fee.
+  rows = [row('sig-open-1', '0.05'), row('sig-open-2', '0.07')];
+  close((await phoenixFillFee(api, { ...q, now: at + 70_000 }))!, 0.12, 'both fills');
+  // A signature never there after PHOENIX_FEE_INDEX_WAIT_MS (a transaction without fills): the others' fee.
+  rows = [row('sig-open-1', '0.05')];
+  assert.equal(await phoenixFillFee(api, { ...q, now: at + PHOENIX_FEE_INDEX_WAIT_MS - 1 }), null);
+  close((await phoenixFillFee(api, { ...q, now: at + PHOENIX_FEE_INDEX_WAIT_MS }))!, 0.05, 'after the wait');
+});
+
+test('the report takes serve\'s summary: the cursors of reads that stored nothing, and why an empty book was never read', () => {
+  const dir = tempDir(dirs);
+  const clock = new VirtualClock(T0 + 3 * H);
+  const book = new PositionBook({ dir, ...DESK, clock });
+  book.record(enterXlm());
+  book.flushSummary();
+  const path = book.path;
+  // The JSONL holds a read up to 12:00 (it stored payments); serve read again at 13:05 and found nothing new, which only
+  // its summary has.
+  const fromFile = { ...book.summary(), cursors: { hyperliquid: T0 + 2 * H } };
+  const summaryPath = path.replace(/\.jsonl$/, '.summary.json');
+  writeFileSync(summaryPath, JSON.stringify({ ...book.summary(), at: T0 + 3 * H + 5 * 60_000, cursors: { hyperliquid: T0 + 3 * H + 5 * 60_000, phoenix: T0 + 3 * H + 5 * 60_000 } }));
+  const serve = readServeSummary(path);
+  assert.deepEqual(serve?.cursors, { hyperliquid: T0 + 3 * H + 5 * 60_000, phoenix: T0 + 3 * H + 5 * 60_000 });
+  const merged = withServeSummary(fromFile, serve);
+  assert.deepEqual(merged.summary.cursors, { hyperliquid: T0 + 3 * H + 5 * 60_000, phoenix: T0 + 3 * H + 5 * 60_000 });
+  assert.match(bookReport(merged.summary, merged.notes), /ledgers read up to: hyperliquid 2026-11-02 13:05.*phoenix 2026-11-02 13:05/);
+  assert.match(merged.notes[0]!, /^serve's summary of 2026-11-02T13:05:00\.000Z/);
+  // A later cursor in the file stands over an older one in the summary.
+  assert.equal(withServeSummary({ ...fromFile, cursors: { hyperliquid: T0 + 4 * H } }, serve).summary.cursors.hyperliquid, T0 + 4 * H);
+  // An empty book: no cursors anywhere; the report says why.
+  const empty = new PositionBook({ dir: tempDir(dirs), ...DESK, clock });
+  writeFileSync(empty.path.replace(/\.jsonl$/, '.summary.json'), JSON.stringify(empty.summary()));
+  const e = withServeSummary(empty.summary(), readServeSummary(empty.path));
+  assert.match(bookReport(e.summary, e.notes), /no ledger read yet: no position is booked, so there is none to read[\s\S]*ledgers read up to: never synced/);
+  // No summary, or one that does not parse: the report as before.
+  writeFileSync(summaryPath, '{not json');
+  assert.equal(readServeSummary(path), null);
+  assert.deepEqual(withServeSummary(fromFile, null), { summary: fromFile, notes: [] });
 });

@@ -36,6 +36,7 @@ import type { SolanaSendOptions } from '../relayer/solana.ts';
 import { SOLANA_COMPUTE_UNITS, SOLANA_PRIORITY_MICROLAMPORTS, SolanaSubmitter, parseMessage } from '../relayer/solana.ts';
 import type { ChainNetwork } from '../relayer/tx.ts';
 import { solanaTxRef } from '../relayer/tx.ts';
+import { asDeskAct } from '../venues/desk-acts.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { Clock } from '../venues/venue.ts';
 import type { VerifiedQuote } from './oneclick.ts';
@@ -221,10 +222,11 @@ export class PhoenixRescuePayer implements Payer {
     return {
       tx: nearTx,
       solanaSignature: signature,
-      send: async () => {
+      // A withdrawal out of Phoenix changes its margin: marked as the desk's act (venues/desk-acts.ts).
+      send: () => asDeskAct(async () => {
         const tx = await this.#o.sender.submit(signed, { authority, lastValidBlockHeight: plan.lastValidBlockHeight });
         return { tx, depositTx: signature };
-      },
+      }),
     };
   }
 }

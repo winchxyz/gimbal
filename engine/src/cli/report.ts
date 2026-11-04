@@ -16,6 +16,7 @@ import { PositionBook } from '../book/book.ts';
 import { bookReport, riskLedgerLines } from '../book/report.ts';
 import { ledgerFilesIn, ledgerForBook, loadRiskLedger, riskLedgerSummary } from '../book/risk-ledger.ts';
 import { liveBookSources } from '../book/sources.ts';
+import { readServeSummary, withServeSummary } from '../book/serve-summary.ts';
 import { bookFilesIn } from '../book/store.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import { userStateDir } from '../trade/trader-state.ts';
@@ -72,17 +73,20 @@ for (const path of files) {
     for (const l of r.lines) notes.push(`sync ${l.ok ? 'ok' : 'FAILED'}: ${l.text}`);
     notes.push('sync results are in this report only; the book file is unchanged');
   }
-  const summary = book.summary();
+  // serve's own summary has its ledger reads that found nothing new (the JSONL keeps only those that stored something).
+  const served = withServeSummary(book.summary(), readServeSummary(path));
+  const summary = served.summary;
+  const allNotes = [...notes, ...served.notes];
   const ledgerFile = ledgerForBook(path);
   let ledger;
   try {
     const { records, skipped } = loadRiskLedger(ledgerFile);
     ledger = { summary: riskLedgerSummary(records, summary.positions, skipped, Date.now()), file: ledgerFile };
   } catch (err) {
-    notes.push(`risk check ledger ${ledgerFile} not read: ${errorMessage(err)}`);
+    allNotes.push(`risk check ledger ${ledgerFile} not read: ${errorMessage(err)}`);
     ledger = { summary: null, file: ledgerFile };
   }
-  console.log(bookReport(summary, notes, ledger));
+  console.log(bookReport(summary, allNotes, ledger));
 }
 // A ledger with no book (a serve with no contract desk, replay): its checks, with no positions to match.
 for (const file of lonelyLedgers) {
