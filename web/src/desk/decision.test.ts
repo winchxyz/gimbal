@@ -30,10 +30,23 @@ test('the line is the word, the engine’s reason as sent, and how long ago', ()
   assert.deepEqual(decisionLine(decision('enter'), NOW), {
     word: 'Entering',
     reason: 'XLM 14.2 % net, 2 of 3 hours above 10 %',
+    raw: 'XLM 14.2 % net, 2 of 3 hours above 10 %',
     when: '3 min ago',
   });
   assert.equal(decisionLine(decision('hold', NOW - 12_000), NOW)?.when, '12 s ago');
   assert.equal(decisionLine(decision('wait', NOW - 2 * 3_600_000), NOW)?.when, '2 h ago');
+});
+
+test('a wait or an off line is put in plain words with the engine’s string kept; other actions are shown as sent', () => {
+  const raw =
+    'No window clears the entry rules; best BONK 14.8 % net: serve opens short hyperliquid, long phoenix only (as pair-mainnet open); bonk-orderly-hyperliquid is long orderly, short hyperliquid';
+  const wait = decisionLine({ ...decision('wait'), reason: raw }, NOW, { minNetAprPct: 5 });
+  assert.match(wait?.reason ?? '', /^No window clears your 5 % minimum right now\. Closest: BONK, 14\.8 % net, but the desk can't open it/);
+  assert.equal(wait?.raw, raw);
+  const off = decisionLine({ ...decision('off'), reason: 'Auto is off: the engine watches and you act by hand; x' }, NOW);
+  assert.equal(off?.reason, 'Auto is off, so the desk only watches and you act by hand.');
+  assert.equal(decisionLine({ ...decision('hold'), reason: raw }, NOW)?.reason, raw);
+  assert.equal(decisionLine({ ...decision('wait'), reason: 'something new' }, NOW)?.reason, 'something new');
 });
 
 test('no decision, no line; a time ahead of this page’s clock reads as just now', () => {

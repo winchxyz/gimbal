@@ -52,7 +52,7 @@ export function DeskScreen() {
   if (desk.legs.length === 0) {
     return (
       <div className="d-page">
-        <DecisionBar decision={decision} now={now} held={false} symbol={null} urgent={false} />
+        <DecisionBar decision={decision} now={now} held={false} symbol={null} urgent={false} minNetAprPct={strategy?.minNetAprPct ?? null} />
         <Waiting desk={desk} windows={windows} strategy={strategy} scan={scan} now={now} />
       </div>
     );
@@ -98,7 +98,7 @@ function Stage({ desk, windows, strategy, journal, down, now, decision, urgent, 
 
   return (
     <div className="d-page">
-      <DecisionBar decision={decision} now={now} held symbol={windows ? (heldWindow(windows)?.symbol ?? null) : null} urgent={urgent} />
+      <DecisionBar decision={decision} now={now} held symbol={windows ? (heldWindow(windows)?.symbol ?? null) : null} urgent={urgent} minNetAprPct={strategy?.minNetAprPct ?? null} />
       <div className="d-grid">
         <section className="d-hero" aria-label="Desk value">
           <div className="lab">Desk value</div>
