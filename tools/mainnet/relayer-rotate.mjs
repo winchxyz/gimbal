@@ -38,6 +38,8 @@ import { assertNotInLinkedWorktree, linkedWorktreeOf } from './near.mjs';
 import { ARBITRUM_ONE, ENTRY, ethText, evmAddressOf, newEvmKey, setEnvEntry } from './relayer-wallet.mjs';
 
 export const OLD_ENTRY = `${ENTRY}_OLD`;
+/** When the key file may go: the words the script and the README use. */
+export const KEY_FILE_DELETE_WHEN = 'delete it once Railway runs the new key and the old address holds no ETH worth moving (a rerun says the rotation is done)';
 const USAGE = 'usage: node tools/mainnet/relayer-rotate.mjs [--send] [--env-file <file>]';
 
 /** Gas limit = the estimate x 3/2: Arbitrum's estimate holds an L1 data part that moves with the L1 price. */
@@ -331,6 +333,7 @@ export async function runRotate(argv, deps = {}) {
     if (finishing) {
       both(`done      the rotation is finished: the old relayer has ${ethText(b.wei)} ETH left, less than the gas to move it`);
       both(`next      to rotate again, take ${OLD_ENTRY} out of the env file first (its wallet is empty)`);
+      for (const k of keyFiles(file).filter((x) => x.oldKey === oldKey)) both(`key file  ${k.path}: ${KEY_FILE_DELETE_WHEN}`);
       return summary;
     }
     throw new Error(`the old relayer has ${ethText(b.wei)} ETH, less than the transfer's gas (at most ${feeText(g.feeCap)} ETH): nothing to move; fund it or rotate with relayer-wallet.mjs`);
@@ -344,7 +347,7 @@ export async function runRotate(argv, deps = {}) {
     const next = rotateEnvText(text, key.privateKey);
     // The new key on disk before .env is touched, and twice before any ETH goes to it.
     const keyFile = writeKeyFile(file, key.privateKey, oldKey, now());
-    both(`key file  ${keyFile}: the new key and the old one (values not shown); keep it until Railway runs the new key`);
+    both(`key file  ${keyFile}: the new key and the old one (values not shown); ${KEY_FILE_DELETE_WHEN}`);
     whereNow = `the new key is in the env file and in ${keyFile}; the backup holds the file before, with the old key`;
     const bak = backUp(file, text, now());
     say(`backup    ${bak} (the env file before the rotation, with the old key)`);
@@ -389,6 +392,7 @@ export async function runRotate(argv, deps = {}) {
     both(`mined     block ${quantity(receipt.blockNumber, 'blockNumber')}: the new relayer has ${ethText(got)} ETH; ${ethText(left)} ETH stays on the old one (gas not used)`);
   }
   both(`next      update ${ENTRY} on Railway (the service's variables) to the new value in the env file, and redeploy; until then serve's relayer has no gas`);
+  both(`then      the key file: ${KEY_FILE_DELETE_WHEN}`);
   return summary;
 }
 
