@@ -19,8 +19,8 @@ import { sizeFor } from '../strategy/decide.ts';
 import { STRATEGY, T0, win as deskWin } from '../strategy/test-helpers.ts';
 import { VirtualClock, readRecording } from '../venues/replay.ts';
 import { replayStart } from './serve-replay.ts';
-import { adlGate, depthAtSize, fillsOf, loopHands, openGateText, openedQty, protectionText, riskFacts, serveLoop, windowFacts, windowSymbol } from './serve-loop.ts';
-import type { PairHands, ServePair } from './serve-pair.ts';
+import { adlGate, depthAtSize, fillsOf, loopGates, loopHands, openGateText, openedQty, protectionText, riskFacts, serveLoop, windowFacts, windowSymbol } from './serve-loop.ts';
+import type { PairAdl, PairHands, ServePair } from './serve-pair.ts';
 import { toQty } from '../trade/lots.ts';
 import type { PairResult } from '../trade/pair.ts';
 import type { VenueReader } from '../venues/venue.ts';
@@ -444,4 +444,90 @@ test('protectionText and openGateText: a rescue, an ADL unwind, event or confirm
   const state = { attemptsLeft: 3, paused: null, event: null };
   assert.deepEqual(adlGate({ check: async () => null, stop: () => {}, state, unwinding: false, confirming: true }), { ...quiet, confirming: true });
   assert.equal(adlGate(undefined), null);
+});
+
+/** A PairAdl stand-in whose state and flags a test sets. */
+function fakeAdl(): PairAdl & { set(o: Partial<{ unwinding: boolean; confirming: boolean; event: boolean; paused: string | null }>): void } {
+  let flags = { unwinding: false, confirming: false };
+  const state: PairAdl['state'] = { attemptsLeft: 3, paused: null, event: null };
+  return {
+    check: async () => null, stop: () => {}, state,
+    get unwinding() { return flags.unwinding; },
+    get confirming() { return flags.confirming; },
+    set(o) {
+      flags = { unwinding: o.unwinding ?? flags.unwinding, confirming: o.confirming ?? flags.confirming };
+      if (o.event !== undefined) state.event = o.event ? { at: 0, reference: [-50n, 50n], seen: [-30n, 50n], attempts: 1, nextAt: null, alerted: false } : null;
+      if (o.paused !== undefined) state.paused = o.paused;
+    },
+  };
+}
+
+test('loopGates: serve\'s busy is protectionText or a pair close; its orderGate is openGateText, which also stops on a pause', () => {
+  const adl = fakeAdl();
+  let rescue: string | null = null;
+  let panic = false;
+  let closing = false;
+  const g = loopGates({ rescue: () => rescue, adl: () => adl, panicClose: () => panic, pairClosing: () => closing });
+  assert.deepEqual([g.busy(), g.orderGate()], [null, null]);
+  // Asked fresh each time: what changes after the gates are built is seen.
+  adl.set({ paused: 'ADL on hyperliquid SOL -50 -> -30' });
+  assert.equal(g.busy(), null, 'a pause does not stop the decisions');
+  assert.equal(g.orderGate(), 'the pair is paused since an ADL (ADL on hyperliquid SOL -50 -> -30): no new pair opens until the owner reconciles');
+  adl.set({ paused: null, event: true });
+  assert.deepEqual([g.busy(), g.orderGate()], ['an ADL event is in progress', 'an ADL event is in progress']);
+  adl.set({ event: false, confirming: true });
+  assert.equal(g.orderGate(), 'an ADL check is confirming a leg off its baseline');
+  adl.set({ confirming: false, unwinding: true });
+  assert.equal(g.busy(), 'an ADL unwind is in flight');
+  adl.set({ unwinding: false });
+  rescue = 'r-1';
+  assert.deepEqual([g.busy(), g.orderGate()], ['rescue r-1 runs', 'rescue r-1 runs']);
+  rescue = null;
+  panic = true;
+  assert.equal(g.orderGate(), 'panic_close runs');
+  panic = false;
+  // A close of the pair holds the decisions; it is not an open's gate (the loop's own close is the pair's operation).
+  closing = true;
+  assert.deepEqual([g.busy(), g.orderGate()], ['a close of the pair runs', null]);
+});
+
+test('serveLoop wired as serve wires it (...loopGates): the gate an open carries to the hands is the orderGate, a pause included', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gimbal-serve-loop-'));
+  dirs.push(dir);
+  const adl = fakeAdl();
+  const gatesSeen: (string | null)[] = [];
+  const hands: PairHands = {
+    symbols: ['SOL'], blocked: () => null, canOpen: () => true, heldSymbol: () => null, heldLegs: () => [],
+    prepareOpen: async () => ({ ok: false, reason: 'not here', results: [], lines: [], open: [], tx: [], feeUsd: 0 }),
+    open: async (r) => {
+      // What liveCarry asks right before its first order.
+      gatesSeen.push(r.gate === undefined ? 'no gate' : r.gate());
+      return { ok: false, reason: 'test: nothing sent', results: [], lines: [], open: [], tx: [], feeUsd: 0 };
+    },
+    close: async () => ({ ok: false, reason: 'not here', results: [], lines: [], open: [], tx: [], feeUsd: 0 }),
+    reconcile: async () => null,
+  };
+  const pair = { hands, adl, unconfirmed: () => null, notTrading: () => null } as unknown as ServePair;
+  const window = deskWin('sol-phoenix-hyperliquid', { netAprPct: 15 });
+  let now = T0 + 5 * 60_000;
+  const loop = serveLoop({
+    mode: 'mainnet', env: (n) => (n === 'GIMBAL_TRADE' ? '1' : undefined), once: false, stateDir: dir, contractId: 'gimbal.near', deskId: 'desk-1',
+    pair, lastDesk: () => null, accounts: [], rescueLive: false, windows: () => [window],
+    strategy: () => ({ ...DEFAULT_STRATEGY, auto: true }), policy: () => null, publish: () => {}, clock: { now: () => now }, log: () => {},
+    ...loopGates({ rescue: () => null, adl: () => pair.adl, panicClose: () => false, pairClosing: () => false }),
+    decide: (input) => ({
+      counters: input.counters, vetoCandidate: window.id,
+      act: { kind: 'enter', windowId: window.id, legUsd: 12, leverage: 1.5, qty: '0.12' },
+      decision: { action: 'enter', reason: 'test', windowId: window.id, heldId: null, at: input.now },
+    }),
+  });
+  // Paused since an ADL: the loop decides (busy is null) and the open's gate refuses it.
+  adl.set({ paused: 'ADL on hyperliquid SOL -50 -> -30' });
+  await loop.check();
+  // Not paused (a later check, past the retry wait): the gate is clear.
+  adl.set({ paused: null });
+  now += 60 * 60_000;
+  await loop.check();
+  assert.deepEqual(gatesSeen, ['the pair is paused since an ADL (ADL on hyperliquid SOL -50 -> -30): no new pair opens until the owner reconciles', null]);
+  loop.stop();
 });
