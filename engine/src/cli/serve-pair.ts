@@ -45,8 +45,17 @@
 // crash-loop under the host's restart policy), and a stale one (its process gone, an earlier boot, or this pid with no
 // heartbeat for LOCK_STALE_MS: a killed container) is taken over and journaled. The holder's lock beats until stop(). While the start is not confirmed a pair may be open with nothing protecting it:
 // serve's monitor asks `monitor()` every 30 min for the "pair unprotected" line, journaled at most hourly.
+//
+// Orderly pairs (GIMBAL_ORDERLY_PAIRS=1 only; trade/pair-shape.ts): a pair is any two of Hyperliquid, Orderly and
+// Phoenix, its legs and which is long saved in the trader state. Without the flag nothing here changes: the pair is
+// short Hyperliquid / long Phoenix, Orderly is never read, and an open on another pair is refused. With it, the start
+// also reads the desk's Orderly positions (serve's Orderly session, ServePairInput.orderly), a held symbol takes the
+// saved pair's legs, and a symbol held on a venue that is not one of those legs is not protected (named, nothing
+// adopted). An Orderly leg needs that session: without one an Orderly pair is refused with that reason. Hyperliquid,
+// when it is a leg, goes first post-only; Orderly takes IOCs only, so Orderly and Phoenix go as two IOCs at once
+// (pair-ops.ts).
 
-import type { ContractPolicy, Mode, StreamEvent, TxRef } from '@gimbal/shared';
+import type { ContractPolicy, Mode, StreamEvent, TxRef, VenueId } from '@gimbal/shared';
 import type { NearTransport } from '../contract/near-client.ts';
 import { NearContractClient } from '../contract/near-client.ts';
 import { NearApiTransport } from '../contract/near-transport.ts';
@@ -62,26 +71,30 @@ import { SolanaSubmitter } from '../relayer/solana.ts';
 import type { Reducer } from '../rescue/rescuer.ts';
 import type { AdlState } from '../risk/adl.ts';
 import { ADL_ATTEMPTS, AdlWatch, newAdlState } from '../risk/adl.ts';
-import { MAINNET_COSTS, hlFillFeeBps } from '../scanner/config.ts';
+import { MAINNET_COSTS, ORDERLY_BROKERS, hlFillFeeBps } from '../scanner/config.ts';
 import type { LegSide, MakerSettings, TradeLeg } from '../trade/legs.ts';
 import { DEFAULT_MAKER, HlLeg } from '../trade/legs.ts';
 import { signedQtyString } from '../trade/lots.ts';
 import type { PairResult } from '../trade/pair.ts';
-import { PairTrader } from '../trade/pair.ts';
+import { PairTrader, REPLAY_WINDOW_MS } from '../trade/pair.ts';
 import { PhoenixLeg, phoenixTraderApi } from '../trade/phoenix-leg.ts';
+import type { PairShape } from '../trade/pair-shape.ts';
+import { PAIR_VENUES, defaultShape, isDefaultShape, makerIndexOf, orderlyPairsOn, pairShape, policyLists, sameShape, shapeRefusal, shapeText } from '../trade/pair-shape.ts';
 import type { ProtectionCloseReport } from '../trade/protected-pair.ts';
 import { GuardedLeg, InFlightBook, ProtectedPair, inFlightEnds, reconcileHow, startPlan } from '../trade/protected-pair.ts';
 import type { TraderFileState, TraderLock } from '../trade/trader-state.ts';
-import { TRADER_STATE_VERSION, TraderStateStore, acquireTraderLock, traderLockPath, traderStateFile, userStateDir } from '../trade/trader-state.ts';
+import { TRADER_STATE_VERSION, TraderStateStore, acquireTraderLock, savedShape, traderLockPath, traderStateFile, userStateDir } from '../trade/trader-state.ts';
 import { HL_MAINNET_URL, HyperliquidReader } from '../venues/hyperliquid.ts';
 import type { HostBudget } from '../venues/http-budget.ts';
+import { OrderlyReader, orderlyBaseSymbol } from '../venues/orderly.ts';
 import { PHOENIX_API_URL, PhoenixReader, SOLANA_MAINNET_RPC_URL, phoenixGet } from '../venues/phoenix.ts';
 import { errorMessage } from '../venues/recorder.ts';
-import type { Clock } from '../venues/venue.ts';
+import type { AccountState, Clock } from '../venues/venue.ts';
 import type { PriceDeps, StoredPrice } from './pair-mainnet-lib.ts';
 import { PRICE_MARGIN_S, ensureFresh, newPriceState, oraclePxOf, priceFitRefusal, priceLifeS, refreshLanded, refreshReachedChain } from './pair-mainnet-lib.ts';
-import type { OpsCtx, PairRunner } from './pair-ops.ts';
-import { counting, pairOf, planClose, planOpen, recheckOpenSize, refreshForOpen, sendClose, sendOpen } from './pair-ops.ts';
+import type { OpsCtx, OrderlyLegSpec, OrderlyOps, PairRunner } from './pair-ops.ts';
+import { counting, pairOf, planClose, planOpen, recheckOpenSize, refreshForOpen, sendClose, sendOpen, venueName } from './pair-ops.ts';
+import { OrderlySweep, panicReducer } from './orderly-sweep.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { checkContractNetwork, contractEnv } from './serve-contract.ts';
 import { ConfigError, START_RETRY_MAX_MS, startBackoffMs } from './start-errors.ts';
@@ -104,6 +117,56 @@ const SETTLE_RETRY_MS = 60_000;
 
 /** The Hyperliquid leg as serve needs it (HlLeg; tests pass their own). */
 export type PairHlLeg = TradeLeg & Pick<HlLeg, 'adoptPending' | 'pendingMakerOrders' | 'cancelPending'>;
+
+/** A pair's legs as a slot holds them. */
+export interface SlotLegs {
+  /** The legs' venues and markets, and which is long; absent: short Hyperliquid / long Phoenix. */
+  shape?: PairShape;
+  /** The venue legs in the trader's order; absent: [hl, phoenix]. */
+  legs?: [TradeLeg, TradeLeg];
+  /** Hyperliquid's leg when it is one (its post-only orders), else null. */
+  hl: PairHlLeg | null;
+  /** Phoenix's leg when it is one, else null. */
+  phoenix: TradeLeg | null;
+  /** The symbol has a stored price (not in policy.unpriced). */
+  priced: boolean;
+}
+
+/** What buildLegs returns: the legs, and the venue markets against the pinned accounts (one line each). */
+export interface BuiltLegs extends SlotLegs {
+  mismatches: string[];
+}
+
+/** SlotLegs with the shape and the legs filled in. */
+export type FullLegs = SlotLegs & { shape: PairShape; legs: [TradeLeg, TradeLeg] };
+
+/** `l` with its shape and legs filled in (absent: short Hyperliquid / long Phoenix on [hl, phoenix]); throws when they do not add up. */
+export function fullLegs<T extends SlotLegs>(symbol: string, l: T): T & FullLegs {
+  const shape = l.shape ?? defaultShape(symbol);
+  let legs = l.legs;
+  if (legs === undefined) {
+    if (l.hl === null || l.phoenix === null) throw new Error(`the ${symbol} legs name no pair: a Hyperliquid and a Phoenix leg, or a shape and its legs`);
+    legs = [l.hl, l.phoenix];
+  }
+  for (const i of [0, 1] as const) {
+    if (legs[i].venue !== shape.legs[i].venue) throw new Error(`the ${symbol} leg ${i} is on ${legs[i].venue}, but the pair (${shapeText(shape)}) has ${shape.legs[i].venue} there`);
+  }
+  return { ...l, shape, legs };
+}
+
+/**
+ * The desk's Orderly side, from serve's Orderly session (cli/serve.ts: the private stream and the signing client):
+ * the pair trader's Orderly leg and the account read. Absent: no Orderly pair is built or opened here.
+ */
+export interface ServeOrderly {
+  /**
+   * The desk's Orderly leg on `spec.symbol` (IOC only, its price checked against `spec.oraclePx`, which refreshes the
+   * stored price first once trading, a reduce-only close included), or null while the session is not up.
+   */
+  leg(spec: OrderlyLegSpec): TradeLeg | null;
+  /** The desk's Orderly account over the session (equity, maintenance, positions); throws when it is not known. */
+  account(): Promise<AccountState>;
+}
 
 /** Where an open's or a close's lines go: `say` its plan and results, `open` what the owner must reconcile. */
 export interface CarryOut {
@@ -140,7 +203,7 @@ export interface SlotCarry {
 /** What a pair's carry is built from. */
 export interface CarryInput {
   symbol: string;
-  legs: { hl: PairHlLeg; phoenix: TradeLeg; priced: boolean };
+  legs: SlotLegs;
   trader: PairTrader;
   pair: ProtectedPair;
   client: NearContractClient;
@@ -163,8 +226,8 @@ export interface ServePairDeps {
   openOrders(evm: string): Promise<unknown>;
   /** The signing contract client and relayer (GIMBAL_TRADE=1 only): the operator key is loaded here. */
   signing(): Promise<{ client: NearContractClient; relayer: Relayer }>;
-  /** The legs of `symbol` (buildLiveLegs). */
-  buildLegs(p: { symbol: string; client: NearContractClient; relayer: Relayer | null; prices: PriceDeps; trading: () => boolean }): Promise<{ hl: PairHlLeg; phoenix: TradeLeg; priced: boolean; mismatches: string[] }>;
+  /** The legs of `symbol` on `shape`'s venues (buildLiveShapeLegs). */
+  buildLegs(p: { symbol: string; shape: PairShape; client: NearContractClient; relayer: Relayer | null; prices: PriceDeps; trading: () => boolean }): Promise<BuiltLegs>;
   /** pair-mainnet's open and close on a pair's legs (liveCarry). */
   carry(p: CarryInput): SlotCarry;
   close(): void;
@@ -190,6 +253,8 @@ export interface ServePairInput {
   health?: (venue: StartVenue, status: 'ok' | 'slow' | 'down', detail: string | null) => void;
   /** A protection's close (panic_close, a rescue's reduce, an ADL unwind) as it ended: serve's position book takes it. */
   onProtectionClose?: (report: ProtectionCloseReport) => void;
+  /** serve's Orderly session (GIMBAL_ORDERLY_PAIRS=1 only): absent, no Orderly pair is built or opened. */
+  orderly?: ServeOrderly;
 }
 
 /** What panic_close's cancel did (rescue/closing.ts cancelResting). */
@@ -259,10 +324,12 @@ export interface PairHands {
   /** Each leg's venue and position the trader holds (its baseline), signed; null = not known; none when no pair. */
   heldLegs(): { venue: string; qty: bigint | null }[];
   /**
-   * pair-mainnet open on `symbol`, short Hyperliquid and long Phoenix: refusals first, then maker first. `gate` is
-   * asked again right before the first order and before each later part: a reason refuses (or stops) the open there.
+   * pair-mainnet open on `symbol`, short `short` and long `long` (default short Hyperliquid and long Phoenix; any other
+   * pair only with GIMBAL_ORDERLY_PAIRS=1, an Orderly leg only with serve's Orderly session): refusals first, then
+   * maker first (or two IOCs at once without a Hyperliquid leg). `gate` is asked again right before the first order and
+   * before each later part: a reason refuses (or stops) the open there.
    */
-  open(request: { symbol: string; legUsd: number; leverage: number; reason: string; qty?: string; gate?: () => string | null } & Pick<RefreshAllowance, 'noRefresh'>): Promise<HandsResult>;
+  open(request: { symbol: string; long?: VenueId; short?: VenueId; legUsd: number; leverage: number; reason: string; qty?: string; gate?: () => string | null } & Pick<RefreshAllowance, 'noRefresh'>): Promise<HandsResult>;
   /**
    * The trader's record against its last live reads (reconcileWithVenues): when they disagree on one leg or flat, two
    * agreeing venue reads that confirm it are adopted as the record. The line says what changed; null: nothing did.
@@ -317,15 +384,17 @@ const none = (lines: string[], why: string, stop: () => void = () => {}): ServeP
   pair: null, adl: undefined, reducer: () => null, notTrading: () => why, lines, drain: async () => true, stop,
 });
 
-/** What a start reads from: the two venues and NEAR (the signing client). */
+/** What a start reads from: the two venues and NEAR (the signing client): serve's health keys. */
 export type StartVenue = 'hyperliquid' | 'phoenix' | 'near';
+/** A start read's venue: Orderly too (an Orderly pair's), which serve's health map does not key (journaled only). */
+export type StartReadVenue = StartVenue | 'orderly';
 
 /** A start read that failed (a timeout, an HTTP error, a lagging snapshot): tried again, never a reason to exit. */
 export class StartReadError extends Error {
-  readonly venue: StartVenue;
+  readonly venue: StartReadVenue;
   /** What it says of the venue's health; null: nothing (two reads that differ). */
   readonly status: 'slow' | 'down' | null;
-  constructor(venue: StartVenue, status: 'slow' | 'down' | null, message: string) {
+  constructor(venue: StartReadVenue, status: 'slow' | 'down' | null, message: string) {
     super(message);
     this.name = 'StartReadError';
     this.venue = venue;
@@ -334,7 +403,7 @@ export class StartReadError extends Error {
 }
 
 /** `run`, its failure a StartReadError of `venue` (a ConfigError or a StartReadError is passed on as it is). */
-async function startRead<T>(venue: StartVenue, run: () => Promise<T>): Promise<T> {
+async function startRead<T>(venue: StartReadVenue, run: () => Promise<T>): Promise<T> {
   try {
     return await run();
   } catch (err) {
@@ -354,6 +423,8 @@ export function restingOn(raw: unknown, coin: string): { side: LegSide | string;
 /** One symbol's pair: its legs, trader, protections and carry. */
 interface Slot {
   symbol: string;
+  /** The pair's legs and which is long. */
+  shape: PairShape;
   pp: ProtectedPair;
   adl: AdlWatch;
   trader: PairTrader;
@@ -402,13 +473,39 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
   // The lock first, in each start attempt (attempt() below): pair-mainnet --send cannot start between the reads and
   // the first save. One that is held is a start not confirmed (tried again), never an exit.
   let lock: TraderLock | null = null;
+  // Who holds the lock: the start (an attempt, then the slot it landed: `startHolds`), and serve's own short users
+  // (panic_close's Orderly sweep, its resting-order cancel: `borrowed`). It goes back once neither holds it.
+  let startHolds = false;
+  let borrowed = 0;
   const release = () => {
     lock?.release();
     lock = null;
   };
+  /** The start lets the lock go (nothing trades): now, or when the last borrower gives it back. */
+  const yieldLock = () => {
+    startHolds = false;
+    if (borrowed === 0) release();
+  };
+  const lockPath = () => traderLockPath(env, input.mode, contractId, input.deskId);
+  /** A short user takes the lock (or shares the start's); why not, or null. Each borrow is given back by returnLock. */
+  const borrowLock = (): string | null => {
+    if (lock === null) {
+      try {
+        lock = acquireTraderLock(lockPath());
+      } catch (err) {
+        return `the trader lock is not held: ${errorMessage(err)} (pair-mainnet --send holds the same lock)`;
+      }
+    }
+    borrowed++;
+    return null;
+  };
+  const returnLock = () => {
+    borrowed = Math.max(0, borrowed - 1);
+    if (borrowed === 0 && !startHolds) release();
+  };
   const stopNone = () => {
     deps.close();
-    release();
+    yieldLock();
   };
 
   try {
@@ -416,7 +513,26 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
     const store = new TraderStateStore(traderStateFile(input.stateDir ?? userStateDir(env), input.mode, identity), identity);
     const freshWant = `${contractId}/${input.deskId}`;
     const common = policy.hl_assets.map((a) => a.symbol).filter((s) => policy.phoenix_markets.some((m) => m.symbol === s));
+    // GIMBAL_ORDERLY_PAIRS=1: a symbol any two of the policy's venues list is a pair symbol, and an Orderly pair may be
+    // held; without it, only the symbols in both hl_assets and phoenix_markets (Orderly is never read).
+    const orderlyOn = orderlyPairsOn(env);
+    const pairable = !orderlyOn ? common : [...new Set([
+      ...policy.hl_assets.map((a) => a.symbol), ...policy.phoenix_markets.map((m) => m.symbol),
+      ...(policy.orderly_symbols ?? []).map((m) => orderlyBaseSymbol(m)).filter((x): x is string => x !== null),
+    ])].filter((sym) => PAIR_VENUES.filter((v) => policyLists(policy, v, sym)).length >= 2);
     const flatWhy = `both legs flat and no GIMBAL_PAIR_SYMBOL (policy pairs: ${common.join(', ') || 'none'})`;
+    // A trader state saved for another pair than short Hyperliquid / long Phoenix (an Orderly leg) with
+    // GIMBAL_ORDERLY_PAIRS off: no engine here could read or close that pair, and after Orderly's IP restriction the
+    // owner's machine cannot either (pair-mainnet refuses Orderly). serve refuses to start rather than run blind.
+    if (!orderlyOn) {
+      const saved = store.load();
+      const was = saved.kind === 'loaded' ? savedShape(saved.state) : null;
+      if (saved.kind === 'loaded' && was !== null && saved.state.symbol !== null && !isDefaultShape(was, saved.state.symbol)) {
+        throw new ConfigError(`the trader state ${store.path} is for the ${saved.state.symbol} pair ${shapeText(was)}, and GIMBAL_ORDERLY_PAIRS is not 1: `
+          + 'no engine here could protect or close it (panic_close included). Start serve with GIMBAL_ORDERLY_PAIRS=1 and its Orderly session; '
+          + `only once that pair's legs are flat on the venues, move the file aside and start once with GIMBAL_TRADER_FRESH=${freshWant}`);
+      }
+    }
 
     // ---- the signing side: loaded by the first start attempt that gets that far, then kept ----
     let relayer: Relayer | null = null;
@@ -443,31 +559,39 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       input.publish({ type: 'journal', data: { id: `pair-${t.toString(36)}`, t, kind: 'error', summary: open.join(' | '), numbers: { venue: 'hyperliquid' }, tx: [] } });
     };
 
-    /** `symbol`'s pair, built and adopted as the start does (see the header); `start` false: a later open's new pair. */
-    const makeSlot = async (sym: string): Promise<Slot> => {
+    /** `symbol`'s pair on `shape`'s legs, built and adopted as the start does (see the header). */
+    const makeSlot = async (sym: string, shape: PairShape = defaultShape(sym)): Promise<Slot> => {
       let live = false;
       let suspended = false;
       let planning = false;
-      // The Phoenix exchange snapshot (and the market's spline) are read here: a failure is a start read that failed.
-      const legs = await startRead('phoenix', () => deps.buildLegs({ symbol: sym, client, relayer, prices, trading: () => live && !suspended && !planning }));
+      // The Phoenix exchange snapshot (and the market's spline) are read here, or the Orderly leg is made over the
+      // session: a failure is a start read that failed.
+      const buildVenue = shape.legs.some((l) => l.venue === 'phoenix') ? 'phoenix' : shape.legs.some((l) => l.venue === 'orderly') ? 'orderly' : 'hyperliquid';
+      const legs = fullLegs(sym, await startRead(buildVenue, () => deps.buildLegs({ symbol: sym, shape, client, relayer, prices, trading: () => live && !suspended && !planning })));
+      if (!sameShape(legs.shape, shape)) throw new Error(`the ${sym} legs built are ${shapeText(legs.shape)}, not ${shapeText(shape)}`);
+      const hlLeg = legs.hl;
       const why: string[] = [];
       why.push(...legs.mismatches);
       if (!(priceLifeS(policy.oracle_max_age_s) > PRICE_MARGIN_S)) {
         why.push(`oracle_max_age_s ${policy.oracle_max_age_s} leaves a fresh price ${priceLifeS(policy.oracle_max_age_s)} s, not more than the ${PRICE_MARGIN_S} s an IOC and its retry need`);
       }
-      // Open orders that cannot be read are a read that failed (tried again), not a reason to stay alert only.
-      const resting = restingOn(await deps.openOrders(evm).catch((err: unknown) => errorMessage(err)), sym);
-      if (typeof resting === 'string') {
-        throw new StartReadError('hyperliquid', 'down', `${resting}: a resting ${sym} order could fill under the trader`);
-      } else if (resting.length > 0) {
-        const names = resting.map((o) => `${o.side} ${o.sz} (oid ${String(o.oid)})`).join(', ');
-        why.push(`Hyperliquid has ${resting.length} resting ${sym} order(s) (${names}), left by an earlier pair-mainnet run: one could fill under the trader and the ADL watch would misread it; cancel it on Hyperliquid, reconcile both legs, then start serve again`);
+      // Open orders that cannot be read are a read that failed (tried again), not a reason to stay alert only. Only
+      // Hyperliquid's leg rests orders (post-only): a pair without it has none to look for.
+      if (hlLeg !== null) {
+        const resting = restingOn(await deps.openOrders(evm).catch((err: unknown) => errorMessage(err)), sym);
+        if (typeof resting === 'string') {
+          throw new StartReadError('hyperliquid', 'down', `${resting}: a resting ${sym} order could fill under the trader`);
+        } else if (resting.length > 0) {
+          const names = resting.map((o) => `${o.side} ${o.sz} (oid ${String(o.oid)})`).join(', ');
+          why.push(`Hyperliquid has ${resting.length} resting ${sym} order(s) (${names}), left by an earlier pair-mainnet run: one could fill under the trader and the ADL watch would misread it; cancel it on Hyperliquid, reconcile both legs, then start serve again`);
+        }
       }
 
       // ---- what the trader holds ----
-      const read = await readTwice([legs.hl, legs.phoenix], sleep, log);
-      const plan = startPlan({ symbol: sym, read, saved: store.load(), fresh: env('GIMBAL_TRADER_FRESH'), freshWant, path: store.path, now: input.clock.now() });
+      const read = await readTwice(legs.legs, sleep, log);
+      const plan = startPlan({ symbol: sym, pair: shape, read, saved: store.load(), fresh: env('GIMBAL_TRADER_FRESH'), freshWant, path: store.path, now: input.clock.now() });
       if (!plan.stateOk && plan.why !== null) why.push(plan.why);
+      if (hlLeg === null && plan.pendingMaker.length > 0) why.push(`the trader state holds ${plan.pendingMaker.length} Hyperliquid post-only order(s), but this pair has no Hyperliquid leg: cancel them on Hyperliquid and reconcile`);
       if (input.once === true) why.unshift(`serve --once is alert only${asksTrade ? ' (GIMBAL_TRADE=1 is ignored: it exits after one read, maybe in the middle of a close)' : ''}`);
       else if (!asksTrade) why.unshift('GIMBAL_TRADE is not 1');
       else if (lock === null) why.unshift('the trader lock is not held');
@@ -488,7 +612,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         beforeSign: (o: Parameters<InFlightBook['add']>[0]) => book.add(o, save),
       });
       const trader = new PairTrader({
-        legs: [new GuardedLeg(legs.hl, guard(0)), new GuardedLeg(legs.phoenix, guard(1))],
+        legs: [new GuardedLeg(legs.legs[0], guard(0)), new GuardedLeg(legs.legs[1], guard(1))],
         priceBandBps: policy.price_band_bps, clock: input.clock, log: (line) => log(`pair      ${line}`),
         // Only the strategy loop's open opens (ProtectedPair.openInChunks), and never while the pair is paused after an ADL.
         openBlocked: () => (pp?.openingHere !== true ? 'serve opens a pair only through the strategy loop (auto, or POST /rotate)' : watch?.paused ?? null),
@@ -505,13 +629,13 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       });
       if (plan.restore !== null) trader.importState(plan.restore);
       if (plan.adopt !== null) trader.adopt(plan.adopt);
-      legs.hl.adoptPending(plan.pendingMaker);
+      hlLeg?.adoptPending(plan.pendingMaker);
       pp = new ProtectedPair({
         trader, symbol: sym, live, why: live ? null : why.join('; '), inFlight: book, adlHold: plan.adlHold,
         reconcile: reconcileHow({ symbol: sym, path: store.path, freshWant }),
         ...(legs.priced ? { freshPrice: async () => { await ensureFresh(prices, sym, PRICE_MARGIN_S); } } : {}),
-        pendingMaker: () => legs.hl.pendingMakerOrders(),
-        cancelPending: (reason) => legs.hl.cancelPending(reason),
+        pendingMaker: () => hlLeg?.pendingMakerOrders() ?? [],
+        cancelPending: async (reason) => (hlLeg === null ? [] : hlLeg.cancelPending(reason)),
         save, onOpen, log: (l) => log(`pair      ${l}`), sleep,
         ...(input.onProtectionClose === undefined ? {} : { onProtectionClose: input.onProtectionClose }),
       });
@@ -523,8 +647,8 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       });
       watch = adl;
       snapshot = () => ({
-        version: TRADER_STATE_VERSION, savedAt: input.clock.now(), symbol: sym, trader: trader.exportState(),
-        pendingMaker: [...legs.hl.pendingMakerOrders()], inFlight: book.orders, adl: adl.state,
+        version: TRADER_STATE_VERSION, savedAt: input.clock.now(), symbol: sym, pair: shape, trader: trader.exportState(),
+        pendingMaker: [...(hlLeg?.pendingMakerOrders() ?? [])], inFlight: book.orders, adl: adl.state,
       });
       save();
 
@@ -532,7 +656,8 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       for (const n of plan.notes) slotLines.push(`pair      ${n}`);
       for (const line of plan.owner) ownerAlert(line);
       const heldLock = lock as TraderLock | null;
-      slotLines.push(`pair      ${sym}: hyperliquid ${signedQtyString(read[0])} (${read[0] < 0n ? 'short' : read[0] > 0n ? 'long' : 'flat'}), phoenix ${signedQtyString(read[1])} (${read[1] > 0n ? 'long' : read[1] < 0n ? 'short' : 'flat'})`
+      const sideOf = (q: bigint) => (q < 0n ? 'short' : q > 0n ? 'long' : 'flat');
+      slotLines.push(`pair      ${sym}: ${shape.legs[0].venue} ${signedQtyString(read[0])} (${sideOf(read[0])}), ${shape.legs[1].venue} ${signedQtyString(read[1])} (${sideOf(read[1])})`
         + `${read[0] + read[1] === 0n ? '' : ' NOT offsetting'}; state ${store.path}${live ? '' : ' (read only)'}${heldLock === null || !live ? '' : `, lock ${heldLock.path}`}`);
       for (const line of pq.openLines()) slotLines.push(line);
 
@@ -575,7 +700,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       }
       const carry = deps.carry({ symbol: sym, legs, trader, pair: pq, client, relayer, prices, planning: (on) => { planning = on; } });
       return {
-        symbol: sym, pp: pq, adl, trader, carry, why, lines: slotLines, settle,
+        symbol: sym, shape, pp: pq, adl, trader, carry, why, lines: slotLines, settle,
         live: trades,
         quiet: () => {
           const base = trader.legs.map((l) => trader.baseline(l));
@@ -583,7 +708,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           if (pq.closing) return `a close runs on ${sym}`;
           if (book.orders.length > 0) return `${book.orders.length} ${sym} order(s) are in flight with no saved result`;
           if (trader.legs.some((l) => trader.unsettled(l) !== null)) return `a ${sym} order has no answer and may still run`;
-          if (legs.hl.pendingMakerOrders().length > 0) return `a ${sym} post-only order is not settled`;
+          if ((hlLeg?.pendingMakerOrders().length ?? 0) > 0) return `a ${sym} post-only order is not settled`;
           if (pq.adlHold !== null) return `ADL only alerts on ${sym}: ${pq.adlHold}`;
           if (adl.state.event !== null) return `an ADL event on ${sym} is in progress`;
           return null;
@@ -594,7 +719,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         readopt: async () => {
           // Only orders that no trader result holds (the residual hedge) leave the book this way.
           if (book.orders.length === 0 || pq.closing || stopped) return null;
-          if (trader.legs.some((l) => trader.unsettled(l) !== null) || legs.hl.pendingMakerOrders().length > 0) return null;
+          if (trader.legs.some((l) => trader.unsettled(l) !== null) || (hlLeg?.pendingMakerOrders().length ?? 0) > 0) return null;
           const now = await readTwice(trader.legs, sleep, log).catch(() => null);
           if (now === null || now[0] + now[1] !== 0n || pq.closing) return null;
           pq.adopt(now);
@@ -603,7 +728,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         reconcile: () => reconcileWithVenues({
           trader, symbol: sym, sleep, confirmMs: START_CONFIRM_MS,
           idle: () => (pq.closing || stopped || !trades() ? 'not idle' : book.orders.length > 0 ? 'orders in flight'
-            : trader.legs.some((l) => trader.unsettled(l) !== null) || legs.hl.pendingMakerOrders().length > 0 ? 'an order may still run' : null),
+            : trader.legs.some((l) => trader.unsettled(l) !== null) || (hlLeg?.pendingMakerOrders().length ?? 0) > 0 ? 'an order may still run' : null),
           signed: () => book.signed,
           adopt: (read) => pq.adopt(read),
         }),
@@ -627,9 +752,10 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
      * Throws a ConfigError (serve stops) or a read that failed (the start is not confirmed and is tried again).
      */
     const attempt = async (): Promise<Started> => {
+      // A start attempt holds the lock, one a borrower holds now included (it is not let go while the start holds it).
       if (wantLive && lock === null) {
         try {
-          lock = acquireTraderLock(traderLockPath(env, input.mode, contractId, input.deskId));
+          lock = acquireTraderLock(lockPath());
         } catch (err) {
           throw new Error(`the trader lock is not held: ${errorMessage(err)} (pair-mainnet --send holds the same lock)`);
         }
@@ -639,15 +765,22 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           journal('error', `pair: ${took}. A serve or pair-mainnet that was killed (an OOM, a SIGKILL, a container restart) leaves its lock behind; nothing else trades this desk now`, { stage: 'lock' });
         }
       }
+      if (wantLive) startHolds = true;
       const saved = store.load();
-      const held = [...new Set([
-        ...(await startRead('hyperliquid', () => deps.hlHeld(evm))),
-        ...(await startRead('phoenix', () => deps.phoenixHeld(desk.solana.authority))),
-      ])];
+      const heldOn = new Map<VenueId, string[]>([
+        ['hyperliquid', await startRead('hyperliquid', () => deps.hlHeld(evm))],
+        ['phoenix', await startRead('phoenix', () => deps.phoenixHeld(desk.solana.authority))],
+      ]);
+      // The desk's Orderly positions, only with GIMBAL_ORDERLY_PAIRS=1 and serve's Orderly session.
+      if (orderlyOn && input.orderly !== undefined) {
+        const ol = input.orderly;
+        heldOn.set('orderly', await startRead('orderly', async () => (await ol.account()).positions.filter((x) => x.size !== 0).map((x) => orderlyBaseSymbol(x.symbol) ?? x.symbol)));
+      }
+      const held = [...new Set([...heldOn.values()].flat())];
       const lines: string[] = [];
-      const outside = held.filter((s) => !common.includes(s));
-      if (outside.length > 0) lines.push(`pair      not protected (not in both policy lists): ${outside.join(', ')}`);
-      const open = held.filter((s) => common.includes(s));
+      const outside = held.filter((s) => !pairable.includes(s));
+      if (outside.length > 0) lines.push(`pair      not protected (not in ${orderlyOn ? 'two' : 'both'} policy lists): ${outside.join(', ')}`);
+      const open = held.filter((s) => pairable.includes(s));
       if (open.length > 1) {
         return { kind: 'none', lines: [...lines, `pair      NONE: ${open.join(' and ')} are both open; serve protects one pair: close one with pair-mainnet first`], why: 'two pairs are open: serve protects none' };
       }
@@ -664,8 +797,27 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           return { kind: 'none', lines: [...lines, `pair      none: ${flatWhy}; ${why}`], why: 'no pair is open' };
         }
       }
-      if (symbol !== null && !common.includes(symbol)) {
-        return { kind: 'none', lines: [...lines, `pair      none: ${symbol} is not in both policy.hl_assets and policy.phoenix_markets (${common.join(', ') || 'none'})`], why: `${symbol} is not a policy pair` };
+      if (symbol !== null && !pairable.includes(symbol)) {
+        return { kind: 'none', lines: [...lines, orderlyOn
+          ? `pair      none: ${symbol} is not in two of policy.hl_assets, policy.phoenix_markets and policy.orderly_symbols (${pairable.join(', ') || 'none'})`
+          : `pair      none: ${symbol} is not in both policy.hl_assets and policy.phoenix_markets (${common.join(', ') || 'none'})`], why: `${symbol} is not a policy pair` };
+      }
+      // The pair's legs: short Hyperliquid / long Phoenix, or with GIMBAL_ORDERLY_PAIRS=1 the saved pair of that symbol.
+      // A venue holding the symbol that is not one of its legs is not protected: nothing is adopted over it.
+      let shape: PairShape | null = null;
+      if (symbol !== null) {
+        const was = saved.kind === 'loaded' && saved.state.symbol === symbol ? savedShape(saved.state) : null;
+        shape = orderlyOn && was !== null ? was : defaultShape(symbol);
+        if (orderlyOn) {
+          const s = shape;
+          const stray = [...heldOn.entries()].filter(([v, syms]) => syms.includes(symbol) && !s.legs.some((l) => l.venue === v)).map(([v]) => v);
+          if (stray.length > 0) {
+            return { kind: 'none', lines: [...lines, `pair      NONE: ${symbol} is held on ${stray.join(' and ')}, which is not a leg of the pair (${shapeText(s)}): reconcile it by hand, then start serve again`], why: `${symbol} is held outside its pair's legs` };
+          }
+          if (!isDefaultShape(s, symbol) && input.orderly === undefined && s.legs.some((l) => l.venue === 'orderly')) {
+            return { kind: 'none', lines: [...lines, `pair      NONE: the ${symbol} pair (${shapeText(s)}) has an Orderly leg, and serve has no Orderly session: nothing protects it here`], why: 'an Orderly pair needs serve\'s Orderly session' };
+          }
+        }
       }
       if (wantLive && !signing) {
         try {
@@ -679,11 +831,74 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         lines.push(`pair      none held: ${flatWhy}; the strategy loop may open one of ${common.join(', ')} (state ${store.path}, lock ${(lock as TraderLock | null)?.path ?? 'none'})`);
         return { kind: 'pair', lines, slot: null };
       }
-      const slot = await makeSlot(symbol);
+      const slot = await makeSlot(symbol, shape ?? defaultShape(symbol));
       return { kind: 'pair', lines: [...lines, ...slot.lines], slot };
     };
 
     let current: Slot | null = null;
+
+    // ---- panic_close's Orderly sweep (GIMBAL_ORDERLY_PAIRS=1, trading): orderly-sweep.ts ----
+    // It may sign with no pair trader (a NONE start, a start not confirmed, a pair alert only): it borrows the trader
+    // lock and takes the signing client itself; the lock goes back after when the start does not hold it.
+    const sweep = !orderlyOn || !wantLive ? null : new OrderlySweep({
+      session: input.orderly,
+      heldKnown: () => {
+        // Without the session nothing on Orderly can be read: the saved trader state is all that says what is there.
+        const saved = store.load();
+        if (saved.kind === 'none') return 'flat';
+        if (saved.kind !== 'loaded') return 'open';
+        const shape = savedShape(saved.state);
+        const i = shape?.legs.findIndex((l) => l.venue === 'orderly') ?? -1;
+        if (i === -1) return 'none';
+        const base = saved.state.trader?.baselines[i];
+        const now = input.clock.now();
+        // An Orderly order signed within REPLAY_WINDOW_MS may still be replayed: the leg may be held again. Every order
+        // is followed by a save, so a save within the window counts as one.
+        const recent = now - saved.state.savedAt < REPLAY_WINDOW_MS;
+        const pendingHere = saved.state.inFlight.some((o) => o.index === i) || (saved.state.trader?.unsettled ?? []).some((u) => u.index === i);
+        return base === null || (base !== undefined && base !== 0n) || pendingHere || recent ? 'open' : 'flat';
+      },
+      covered: () => (current !== null && current.live() && !stopped ? current.trader.legs.filter((l) => l.venue === 'orderly').map((l) => l.symbol) : []),
+      spec: (market) => {
+        const base = orderlyBaseSymbol(market);
+        if (base === null) return null;
+        const unpriced = policy.unpriced.find((u) => u.symbol === base);
+        return {
+          symbol: market, oraclePx: unpriced !== undefined ? async () => null : oraclePxOf(prices, base, () => !stopped),
+          maxNotionalUsd: unpriced === undefined ? policy.max_notional_usd : Math.min(policy.max_notional_usd, policy.unpriced_max_notional_usd),
+          ...(unpriced === undefined ? {} : { maxSz: unpriced.max_sz }), slippageBps: SERVE_SLIPPAGE_BPS,
+        };
+      },
+      begin: async () => {
+        if (stopped) return 'serve is stopping: nothing is signed';
+        const why = borrowLock();
+        if (why !== null) return why;
+        if (!signing) {
+          try {
+            ({ client, relayer } = await deps.signing());
+            signing = true;
+          } catch (err) {
+            returnLock();
+            return `the signing contract client: ${errorMessage(err)}`;
+          }
+        }
+        return null;
+      },
+      end: returnLock,
+      bandBps: policy.price_band_bps, clock: input.clock, sleep, log, publish: input.publish,
+    });
+    /** With no pair trader: what panic_close leaves held on Hyperliquid and Phoenix (null: nothing), read now. */
+    const leftOutside = async (): Promise<string | null> => {
+      try {
+        const held = [
+          ...(await deps.hlHeld(evm)).map((s) => `hyperliquid ${s}`),
+          ...(await deps.phoenixHeld(desk.solana.authority)).map((s) => `phoenix ${s}`),
+        ];
+        return held.length === 0 ? null : `no pair trader holds ${held.join(', ')} here: nothing closed ${held.length === 1 ? 'it' : 'them'}; close by hand (stop serve, then pair-mainnet close --send)`;
+      } catch (err) {
+        return `Hyperliquid and Phoenix cannot be read (${errorMessage(err)}), and no pair trader holds a leg there: check them, and close what is held by hand (stop serve, then pair-mainnet close --send)`;
+      }
+    };
     /** A start attempt after a failed one found nothing to protect: no pair from then on (the readers and lock are let go). */
     let noneWhy: string | null = null;
     /** Why the start is not confirmed (review S1): a read it needs failed. Null once two synced reads agreed. */
@@ -712,7 +927,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         return s.lines;
       }
       current = s.slot;
-      if (current !== null && !current.live()) release();
+      if (current !== null && !current.live()) yieldLock();
       return s.lines;
     };
     const unconfirmed = (): string | null => (pending === null ? null : `legs unknown, start not confirmed: ${pending}`);
@@ -787,7 +1002,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           pending = `${errorMessage(err)} (a configuration error: fix it and restart serve; not tried again)`;
           if (retryTimer !== null) clearTimeout(retryTimer);
           retryTimer = null;
-          release();
+          yieldLock();
           log(`pair      start refused: ${pending}`);
           journal('error', `pair start refused: ${pending}`, { stage: 'start' });
           return null;
@@ -798,6 +1013,12 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       });
       return attempting;
     };
+
+    if (orderlyOn && input.orderly === undefined) {
+      const line = 'GIMBAL_ORDERLY_PAIRS=1, and serve has no Orderly session: no Orderly position is read, protected or closed here, panic_close included, and pair-mainnet cannot close one either';
+      lines.push(`pair      ${line}`);
+      journal('error', line, { stage: 'start', venue: 'orderly' });
+    }
 
     // ---- the first start attempt: a read that fails degrades the pair instead of stopping serve (review S1) ----
     let first: Started | null = null;
@@ -811,13 +1032,24 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       healthOk();
       if (first.kind === 'none') {
         stopNone();
-        return none(first.lines, first.why);
+        const said = [...lines, ...first.lines];
+        if (sweep === null) return none(said, first.why);
+        // No pair trader, but panic_close still closes the desk's Orderly positions (orderly-sweep.ts).
+        const s = sweep;
+        return {
+          ...none(said, first.why, () => {
+            stopped = true;
+            s.stop();
+            release();
+          }),
+          reducer: () => (stopped ? null : panicReducer(null, s, leftOutside)),
+        };
       }
       lines.push(...land(first));
     } else {
       lines.push(`pair      start NOT confirmed: ${pending ?? 'unknown'}; alert only, legs unknown, nothing adopted: serve tries again with backoff (up to ${START_RETRY_MAX_MS / 1000} s) and goes live once two synced reads of both legs agree`);
     }
-    const trading = () => !stopped && lock !== null;
+    const trading = () => !stopped && lock !== null && startHolds;
 
     // The strategy loop's operation in flight (one at a time).
     let operation: Promise<HandsResult> | null = null;
@@ -826,6 +1058,16 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       if (stopped) throw new Error('serve is stopping and its trader lock is released: nothing is cancelled');
       const unsure = unconfirmed() ?? noneWhy;
       if (unsure !== null || relayer === null) throw new Error(`${unsure ?? 'no signing relayer'}: nothing is cancelled`);
+      // The lock for the cancels (an alert-only slot let it go): pair-mainnet --send does not start under them.
+      const why = borrowLock();
+      if (why !== null) throw new Error(`${why}: nothing is cancelled`);
+      try {
+        return await cancelAll();
+      } finally {
+        returnLock();
+      }
+    };
+    const cancelAll = async (): Promise<CancelResult> => {
       const coin = current?.symbol ?? null;
       const raw = await deps.openOrders(evm);
       if (!Array.isArray(raw)) throw new Error(restingOn(raw, coin ?? '') as string);
@@ -860,7 +1102,9 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           out.notes.push(`${name}: the cancel failed (${errorMessage(err)})`);
         }
       }
-      out.notes.push('Phoenix: the leg sends IOCs only, nothing rests there');
+      // The pair's other legs send IOCs only (Phoenix, Orderly): nothing rests there.
+      const ioc = current !== null ? current.shape.legs.map((l) => l.venue).filter((v) => v !== 'hyperliquid') : ['phoenix' as const, ...(orderlyOn ? ['orderly' as const] : [])];
+      for (const v of ioc) out.notes.push(`${venueName(v)}: the leg sends IOCs only, nothing rests there`);
       return out;
     };
 
@@ -966,19 +1210,33 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         let paid = 0;
         return exclusive(async () => {
           const sym = request.symbol;
-          if (!common.includes(sym)) return result(false, `${sym} is not in both policy.hl_assets and policy.phoenix_markets (${common.join(', ') || 'none'})`);
+          let shape: PairShape;
+          try {
+            shape = pairShape(sym, request.long ?? 'phoenix', request.short ?? 'hyperliquid');
+          } catch (err) {
+            return result(false, errorMessage(err));
+          }
+          if (isDefaultShape(shape, sym)) {
+            if (!common.includes(sym)) return result(false, `${sym} is not in both policy.hl_assets and policy.phoenix_markets (${common.join(', ') || 'none'})`);
+          } else {
+            const refusedShape = shapeRefusal(policy, sym, shape, orderlyOn);
+            if (refusedShape !== null) return result(false, refusedShape);
+            if (shape.legs.some((l) => l.venue === 'orderly') && input.orderly === undefined) {
+              return result(false, `${shapeText(shape)}: an Orderly pair needs serve's Orderly session (the desk's private stream and signing client), and serve has none: nothing built or sent`);
+            }
+          }
           const holding = heldSymbol();
           if (holding !== null) return result(false, `a ${holding} pair is held: it is closed first (exit or rotate)`);
           if (current !== null && current.adl.state.paused !== null) return result(false, `the pair is paused since an ADL (${current.adl.state.paused}): no new pair opens until the owner reconciles`);
           const off = current?.quiet() ?? null;
           if (off !== null) return result(false, `the ${current!.symbol} pair is not settled: ${off}`);
           let slot = current;
-          if (slot === null || slot.symbol !== sym) {
+          if (slot === null || slot.symbol !== sym || !sameShape(slot.shape, shape)) {
             const old = slot;
             old?.suspend(true);
             let next: Slot;
             try {
-              next = await makeSlot(sym);
+              next = await makeSlot(sym, shape);
             } catch (err) {
               old?.suspend(false);
               return result(false, `the ${sym} pair could not be built: ${errorMessage(err)}`);
@@ -994,6 +1252,8 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
             slot = next;
           }
           if (!slot.live()) return result(false, `alert only: ${slot.pp.why ?? 'not live'}`);
+          // The loop opens: the desk is not closing, and no panic_close sweep may watch this pair's Orderly leg.
+          sweep?.endWatch();
           const { lines: said, opens, out } = collect();
           const r = await slot.carry.open({
             legUsd: request.legUsd, leverage: request.leverage, reason: request.reason,
@@ -1077,7 +1337,10 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       },
       adl: current !== null || live || pending !== null ? adl : undefined,
       lines,
-      reducer: () => (current !== null && current.live() && !stopped ? current.pp : null),
+      reducer: () => {
+        const pair = current !== null && current.live() && !stopped ? current.pp : null;
+        return sweep === null || stopped ? pair : panicReducer(pair, sweep, leftOutside);
+      },
       notTrading: () => {
         if (stopped) return 'serve is stopping: nothing is signed';
         const unsure = unconfirmed();
@@ -1114,6 +1377,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         // First: nothing is signed from here on (a rescue between its read and its reduce must not sign after the
         // lock is released), and nothing is saved.
         stopped = true;
+        sweep?.stop();
         if (retryTimer !== null) clearTimeout(retryTimer);
         retryTimer = null;
         current?.end();
@@ -1144,13 +1408,39 @@ export function builderFeeDrift(atStart: number | null, now: number | null | und
 /** The builder fee last logged as drifted, per contract side: each new value is logged once. */
 const builderFeeLogged = new WeakMap<ContractSide, number>();
 
+/** The readers liveCarry plans with; `orderly` the public Orderly reader (gimbal_dex's markets), for an Orderly pair. */
+export interface CarryReaders {
+  hl: HyperliquidReader;
+  phoenix: PhoenixReader;
+  solana: SolanaSubmitter;
+  orderly?: OrderlyReader;
+}
+
 /** pair-mainnet's open and close (pair-ops.ts) on a live pair's legs, sending through its ProtectedPair (exported for tests). */
-export function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string; phoenixUrl: string; solRpcUrl: string; readers: () => { hl: HyperliquidReader; phoenix: PhoenixReader; solana: SolanaSubmitter } }): SlotCarry {
-  const { hl, phoenix } = p.legs;
-  if (!(hl instanceof HlLeg) || !(phoenix instanceof PhoenixLeg)) {
+export function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string; phoenixUrl: string; solRpcUrl: string; readers: () => CarryReaders }): SlotCarry {
+  let full: FullLegs;
+  try {
+    full = fullLegs(p.symbol, p.legs);
+  } catch (err) {
+    const no = async (): Promise<CarryResult> => ({ refusals: [errorMessage(err)], results: [] });
+    return { open: no, close: no };
+  }
+  const { hl, phoenix } = full;
+  if ((hl !== null && !(hl instanceof HlLeg)) || (phoenix !== null && !(phoenix instanceof PhoenixLeg))) {
     const no = async (): Promise<CarryResult> => ({ refusals: ['these legs are not the live Hyperliquid and Phoenix legs'], results: [] });
     return { open: no, close: no };
   }
+  // The residual hedge goes on the IOC leg: Hyperliquid's partner (index 1 for short Hyperliquid / long Phoenix).
+  const iocIndex: 0 | 1 = makerIndexOf(full.shape) === 1 ? 0 : 1;
+  const orderlyOps = (r: CarryReaders): OrderlyOps | null => {
+    const ol = p.input.orderly;
+    if (ol === undefined || r.orderly === undefined || !full.shape.legs.some((l) => l.venue === 'orderly')) return null;
+    return {
+      reader: r.orderly, account: () => ol.account(), leg: (spec) => ol.leg(spec),
+      // get_desk_settings, read fresh before each open: the owner may have applied the IP list since the last one.
+      ipsApplied: async () => (await p.client.deskSettings(p.input.deskId))?.orderly_ips_applied === true,
+    };
+  };
   const ctxFor = async (out: CarryOut): Promise<OpsCtx> => {
     // A fresh desk each time: paused and closing (panic_close) are refusals, and the policy may have changed.
     const [config, desk] = await Promise.all([p.client.config(), p.client.getDesk(p.input.deskId)]);
@@ -1166,17 +1456,17 @@ export function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string
     return {
       client: p.client, config, desk, hlUrl: p.hlUrl, hl: r.hl, phoenix: r.phoenix, phoenixUrl: p.phoenixUrl, chain: solanaChain(p.solRpcUrl),
       solana: r.solana, sol: { authority: desk.solana.authority, traderAccount: desk.solana.phoenix_trader, usdcAta: desk.solana.usdc_ata, phusdAta: desk.solana.phusd_ata },
-      relayer: p.relayer, prices: p.prices, send: true, trading: false, say: (line = '') => out.say(line), open: (line) => out.open(line),
+      relayer: p.relayer, orderly: orderlyOps(r), prices: p.prices, send: true, trading: false, say: (line = '') => out.say(line), open: (line) => out.open(line),
     };
   };
   const runner = (opening: boolean): PairRunner => ({
     openInChunks: (request) => p.pair.openInChunks(request),
     close: (request) => p.pair.close(request),
-    hedge: (side, size, reduceOnly, reason) => p.pair.hedge(1, side, size, reduceOnly, reason, opening),
+    hedge: (side, size, reduceOnly, reason, targetNet) => p.pair.hedge(iocIndex, side, size, reduceOnly, reason, opening, targetNet),
     stopOnFinish: false,
   });
   const pairFor = (ctx: OpsCtx, opening: boolean) => pairOf(ctx, {
-    symbol: p.symbol, hl, phoenix, trader: p.trader, run: runner(opening), maker: SERVE_MAKER, microLamports: ORDER_PRIORITY_MICROLAMPORTS, priced: p.legs.priced, closing: !opening,
+    symbol: p.symbol, shape: full.shape, legs: full.legs, trader: p.trader, run: runner(opening), maker: SERVE_MAKER, microLamports: ORDER_PRIORITY_MICROLAMPORTS, priced: p.legs.priced, closing: !opening,
   });
   return {
     open: async (request, out) => {
@@ -1238,11 +1528,14 @@ function defaultDeps(p: { input: ServePairInput; hlUrl: string; phoenixUrl: stri
   const { input, hlUrl, phoenixUrl, solRpcUrl } = p;
   const desk = input.side.desk;
   // Made on first use: a test that passes every dependency opens nothing.
-  let made: { hl: HyperliquidReader; phoenix: PhoenixReader; solana: SolanaSubmitter } | null = null;
+  let made: CarryReaders | null = null;
+  // Orderly's public reader only with GIMBAL_ORDERLY_PAIRS=1 and serve's Orderly session: otherwise nothing reads Orderly.
+  const orderlyReads = orderlyPairsOn(input.env) && input.orderly !== undefined;
   const r = () => (made ??= {
     hl: new HyperliquidReader({ network: 'mainnet', url: `${hlUrl}/info` }),
     phoenix: new PhoenixReader({ apiUrl: phoenixUrl, rpcUrl: solRpcUrl }),
     solana: new SolanaSubmitter({ rpcUrl: solRpcUrl, network: 'mainnet' }),
+    ...(orderlyReads ? { orderly: new OrderlyReader({ network: 'mainnet', brokerId: ORDERLY_BROKERS.mainnet.brokerId }) } : {}),
   });
   return {
     hlHeld: async (evm) => (await r().hl.account(evm)).positions.filter((x) => x.size !== 0).map((x) => x.symbol),
@@ -1256,12 +1549,15 @@ function defaultDeps(p: { input: ServePairInput; hlUrl: string; phoenixUrl: stri
       checkContractNetwork(cfg.contractId, await client.config(), cfg.network);
       return { client, relayer: new Relayer({ contract: client, deskId: input.deskId, hyperliquid: new HyperliquidSubmitter({ network: 'mainnet', apiUrl: hlUrl }), solana: r().solana }) };
     },
-    buildLegs: ({ symbol, client, relayer, prices, trading }) => buildLiveLegs({
+    buildLegs: ({ symbol, shape, client, relayer, prices, trading }) => buildLiveShapeLegs({
       client, desk, symbol, hlUrl, hl: r().hl, phoenix: r().phoenix, phoenixUrl, chain: solanaChain(solRpcUrl), solana: r().solana, relayer,
       prices, trading, maker: SERVE_MAKER, slippageBps: SERVE_SLIPPAGE_BPS, microLamports: ORDER_PRIORITY_MICROLAMPORTS,
-    }),
+    }, shape, input.orderly ?? null),
     carry: (c) => liveCarry({ ...c, input, hlUrl, phoenixUrl, solRpcUrl, readers: r }),
-    close: () => made?.phoenix.close(),
+    close: () => {
+      made?.phoenix.close();
+      made?.orderly?.close();
+    },
   };
 }
 
@@ -1349,7 +1645,7 @@ async function syncToChain(legs: readonly TradeLeg[]): Promise<void> {
  */
 async function readTwice(legs: [TradeLeg, TradeLeg], sleep: (ms: number) => Promise<void>, log: (line: string) => void): Promise<[bigint, bigint]> {
   let last: StartReadError | null = null;
-  const venueOf = (l: TradeLeg): StartVenue => (l.venue === 'phoenix' ? 'phoenix' : 'hyperliquid');
+  const venueOf = (l: TradeLeg): StartReadVenue => (l.venue === 'phoenix' ? 'phoenix' : l.venue === 'orderly' ? 'orderly' : 'hyperliquid');
   const read = () => Promise.all(legs.map((l) => l.position().catch((err: unknown) => {
     const text = errorMessage(err);
     throw new StartReadError(venueOf(l), /still before slot/.test(text) ? 'slow' : 'down', text);
@@ -1412,13 +1708,37 @@ export interface LiveLegs {
   mismatches: string[];
 }
 
-/** The two legs of the pair as pair-mainnet builds them (buildPair), for `symbol`. */
+/** The two legs of short Hyperliquid / long Phoenix as pair-mainnet builds them (buildPair), for `symbol`. */
 export async function buildLiveLegs(input: LiveLegsInput): Promise<LiveLegs> {
+  const built = await buildLiveShapeLegs(input, defaultShape(input.symbol), null);
+  return { hl: built.hl!, phoenix: built.phoenix!, priced: built.priced, mismatches: built.mismatches };
+}
+
+/** The legs of any pair, in the trader's order: LiveLegs' legs where they are legs, and Orderly's. */
+export interface LiveShapeLegs extends BuiltLegs {
+  shape: PairShape;
+  legs: [TradeLeg, TradeLeg];
+  hl: HlLeg | null;
+  phoenix: PhoenixLeg | null;
+}
+
+/**
+ * The legs of `shape` for `symbol` as pair-mainnet builds them (buildPair): Hyperliquid's and Phoenix's here, and the
+ * Phoenix exchange and market checked against the pinned accounts when Phoenix is a leg; an Orderly leg from serve's
+ * Orderly session, priced against the stored price (oraclePxOf: refreshed first once trading, closes included). An
+ * Orderly leg with no session, or a session not up, throws.
+ */
+export async function buildLiveShapeLegs(input: LiveLegsInput, shape: PairShape, orderly: ServeOrderly | null): Promise<LiveShapeLegs> {
   const { symbol, desk } = input;
   const p = desk.policy;
   const asset = p.hl_assets.find((a) => a.symbol === symbol);
   const market = p.phoenix_markets.find((m) => m.symbol === symbol);
-  if (asset === undefined || market === undefined) throw new Error(`${symbol} must be in both policy.hl_assets and policy.phoenix_markets`);
+  if (isDefaultShape(shape, symbol)) {
+    if (asset === undefined || market === undefined) throw new Error(`${symbol} must be in both policy.hl_assets and policy.phoenix_markets`);
+  } else {
+    const listed = shapeRefusal(p, symbol, shape, true);
+    if (listed !== null) throw new Error(listed);
+  }
   const unpriced = p.unpriced.find((u) => u.symbol === symbol);
   const maxNotionalUsd = unpriced === undefined ? p.max_notional_usd : Math.min(p.max_notional_usd, p.unpriced_max_notional_usd);
   const oraclePx = unpriced !== undefined ? async () => null : oraclePxOf(input.prices, symbol, input.trading);
@@ -1428,34 +1748,49 @@ export async function buildLiveLegs(input: LiveLegsInput): Promise<LiveLegs> {
     if (px === undefined) throw new Error(`no ${side === 'BUY' ? 'asks' : 'bids'} on ${venue} ${symbol}`);
     return px;
   };
-  const hl = new HlLeg({
-    relayer, info: (body) => hlInfo(input.hlUrl, body), user: desk.evm_address.toLowerCase(), coin: symbol, asset: asset.index, szDecimals: asset.sz_decimals, oraclePx,
+  const has = (v: VenueId) => shape.legs.some((l) => l.venue === v);
+  const hl = !has('hyperliquid') ? null : new HlLeg({
+    relayer, info: (body) => hlInfo(input.hlUrl, body), user: desk.evm_address.toLowerCase(), coin: symbol, asset: asset!.index, szDecimals: asset!.sz_decimals, oraclePx,
     bandBps: p.price_band_bps, maxNotionalUsd, ...(unpriced === undefined ? {} : { maxSz: unpriced.max_sz }),
     bestPx: async (side) => best(await input.hl.book(symbol, 5), side, 'Hyperliquid'),
     slippageBps: input.slippageBps, maker: input.maker,
   });
-  const spline = await splineOf(market.orderbook);
-  const sol: DeskSolanaAccounts = { authority: desk.solana.authority, traderAccount: desk.solana.phoenix_trader, usdcAta: desk.solana.usdc_ata, phusdAta: desk.solana.phusd_ata };
-  const phoenix = new PhoenixLeg({
-    relayer, chain: input.chain, landedSlot: (sig) => input.solana.landedSlot(sig), waitPastLastValidHeight: (h) => input.solana.waitPastLastValidHeightSlot(h),
-    api: phoenixTraderApi(input.phoenixUrl, input.phoenixFetch, 0, input.phoenixBudget),
-    desk: sol,
-    market: { symbol, orderbook: market.orderbook, spline, baseLotE8: market.base_lot_e8, tickE8: market.tick_e8 },
-    oraclePx, bandBps: p.price_band_bps, maxNotionalUsd, ...(unpriced === undefined ? {} : { maxSz: unpriced.max_sz }),
-    bestPx: async (side) => best(await input.phoenix.book(symbol, 5), side, 'Phoenix'),
-    slippageBps: input.slippageBps, microLamports: input.microLamports,
-  });
-  // Through the host's budget, retried after a 429: serve reads it once at startup, and a failure there stops serve.
-  const snap = await phoenixGet<{ exchange: Parameters<typeof exchangeMismatches>[0]; markets: (Parameters<typeof marketMismatches>[0] & { symbol: string })[] }>(
-    input.phoenixUrl, '/v1/exchange/snapshot', {
-      timeoutMs: 20_000, ...(input.phoenixFetch === undefined ? {} : { fetch: input.phoenixFetch }), ...(input.phoenixBudget === undefined ? {} : { budget: input.phoenixBudget }),
-    },
-  );
-  const mismatches = [
-    ...exchangeMismatches(snap.exchange).map((m) => `the Phoenix exchange differs from the pinned accounts: ${m}`),
-    ...marketMismatches(snap.markets.find((m) => m.symbol === symbol), market, spline, { ignoreStatus: true }),
-  ];
-  return { hl, phoenix, priced: unpriced === undefined, mismatches };
+  let phoenix: PhoenixLeg | null = null;
+  const mismatches: string[] = [];
+  if (has('phoenix')) {
+    const spline = await splineOf(market!.orderbook);
+    const sol: DeskSolanaAccounts = { authority: desk.solana.authority, traderAccount: desk.solana.phoenix_trader, usdcAta: desk.solana.usdc_ata, phusdAta: desk.solana.phusd_ata };
+    phoenix = new PhoenixLeg({
+      relayer, chain: input.chain, landedSlot: (sig) => input.solana.landedSlot(sig), waitPastLastValidHeight: (h) => input.solana.waitPastLastValidHeightSlot(h),
+      api: phoenixTraderApi(input.phoenixUrl, input.phoenixFetch, 0, input.phoenixBudget),
+      desk: sol,
+      market: { symbol, orderbook: market!.orderbook, spline, baseLotE8: market!.base_lot_e8, tickE8: market!.tick_e8 },
+      oraclePx, bandBps: p.price_band_bps, maxNotionalUsd, ...(unpriced === undefined ? {} : { maxSz: unpriced.max_sz }),
+      bestPx: async (side) => best(await input.phoenix.book(symbol, 5), side, 'Phoenix'),
+      slippageBps: input.slippageBps, microLamports: input.microLamports,
+    });
+    // Through the host's budget, retried after a 429: serve reads it once at startup, and a failure there stops serve.
+    const snap = await phoenixGet<{ exchange: Parameters<typeof exchangeMismatches>[0]; markets: (Parameters<typeof marketMismatches>[0] & { symbol: string })[] }>(
+      input.phoenixUrl, '/v1/exchange/snapshot', {
+        timeoutMs: 20_000, ...(input.phoenixFetch === undefined ? {} : { fetch: input.phoenixFetch }), ...(input.phoenixBudget === undefined ? {} : { budget: input.phoenixBudget }),
+      },
+    );
+    mismatches.push(
+      ...exchangeMismatches(snap.exchange).map((m) => `the Phoenix exchange differs from the pinned accounts: ${m}`),
+      ...marketMismatches(snap.markets.find((m) => m.symbol === symbol), market!, spline, { ignoreStatus: true }),
+    );
+  }
+  let orderlyLeg: TradeLeg | null = null;
+  const ol = shape.legs.find((l) => l.venue === 'orderly');
+  if (ol !== undefined) {
+    if (orderly === null) throw new Error(`an Orderly leg (${ol.symbol}) needs serve's Orderly session, and serve has none`);
+    orderlyLeg = orderly.leg({ symbol: ol.symbol, oraclePx, maxNotionalUsd, ...(unpriced === undefined ? {} : { maxSz: unpriced.max_sz }), slippageBps: input.slippageBps });
+    if (orderlyLeg === null) throw new Error(`the Orderly leg (${ol.symbol}) cannot be made: serve's Orderly session is not up`);
+    if (orderlyLeg.venue !== 'orderly') throw new Error(`the Orderly session made a ${orderlyLeg.venue} leg for ${ol.symbol}`);
+  }
+  const byVenue = (v: VenueId): TradeLeg => (v === 'hyperliquid' ? hl! : v === 'phoenix' ? phoenix! : orderlyLeg!);
+  const legs: [TradeLeg, TradeLeg] = [byVenue(shape.legs[0].venue), byVenue(shape.legs[1].venue)];
+  return { shape, legs, hl, phoenix, priced: unpriced === undefined, mismatches };
 }
 
 /** The relayer of a pair that does not trade: anything that would sign is refused (a bug if reached: legs refuse first). */

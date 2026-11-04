@@ -15,9 +15,10 @@ import { toQty } from '../trade/lots.ts';
 import { newAdlState } from '../risk/adl.ts';
 import { LOCK_STALE_MS, THIS_PROCESS, TRADER_STATE_VERSION, TraderStateStore, lockHeartbeats, lockText, parseLockText, traderLockPath, traderStateFile } from '../trade/trader-state.ts';
 import type { ContractSide } from './serve-contract.ts';
-import type { CarryInput, ServePairDeps, ServePairInput, SlotCarry } from './serve-pair.ts';
+import type { CarryInput, ServeOrderly, ServePairDeps, ServePairInput, SlotCarry } from './serve-pair.ts';
 import { liveLines, pairRefreshesAtOpen, servePair } from './serve-pair.ts';
 import { adlGate, openGateText } from './serve-loop.ts';
+import { SWEEP_POLL_MS } from './orderly-sweep.ts';
 import { ConfigError } from './start-errors.ts';
 
 const CONTRACT = 'gimbal-test.near';
@@ -335,6 +336,33 @@ test('panic_close\'s cancelResting cancels every resting order on a policy coin 
     w.openOrders = [{ coin: 'XLM', side: 'A', sz: '5', oid: 4 }];
     await assert.rejects(p.cancelResting!(), /serve is stopping and its trader lock is released: nothing is cancelled/);
     assert.equal(w.cancels.length, 2);
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+test('panic_close on an alert-only slot still cancels resting orders: the lock is taken for the cancels and let go', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
+  try {
+    open(w);
+    // A start not confirmed (open orders unreadable), then a retry that lands alert only on a resting XLM order.
+    w.openOrders = 'HTTP 500';
+    const p = await servePair(input(w));
+    w.openOrders = [{ coin: 'XLM', side: 'B', sz: '10', oid: 42 }];
+    assert.match(await p.retryStart!() ?? '', /XLM alert only/);
+    assert.equal(p.pair?.live, false);
+    assert.equal(existsSync(lockPath(w)), false, 'alert only holds no lock');
+    const r = await p.cancelResting!();
+    assert.equal(r.cancelled, 1);
+    assert.deepEqual(w.cancels, [{ asset: 7, oid: 42 }]);
+    assert.equal(existsSync(lockPath(w)), false, 'the lock went back after the cancels');
+    // pair-mainnet --send holding the lock: nothing is cancelled under it.
+    mkdirSync(dirname(lockPath(w)), { recursive: true });
+    writeFileSync(lockPath(w), lockText({ pid: process.ppid, startedMs: 1, id: 'pair-mainnet', boot: THIS_PROCESS.boot }));
+    await assert.rejects(p.cancelResting!(), /the trader lock is not held: .*nothing is cancelled/);
+    assert.equal(w.cancels.length, 1);
+    assert.equal(parseLockText(readFileSync(lockPath(w), 'utf8'))?.id, 'pair-mainnet', 'the other process\'s lock is left alone');
+    p.stop();
   } finally {
     rmSync(w.dir, { recursive: true, force: true });
   }
@@ -1110,5 +1138,378 @@ test('prepareOpen (a rotate\'s first step): a missing price is refreshed, a fail
     p.stop();
   } finally {
     rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+// ---- Orderly pairs (GIMBAL_ORDERLY_PAIRS=1) ----
+
+test('Orderly pairs: refused without GIMBAL_ORDERLY_PAIRS=1 or serve\'s Orderly session; with both, opened and saved with its legs, restored only by a serve with the flag, then closed', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
+  const ol = new Leg('orderly', 'PERP_XLM_USDC');
+  const session: ServeOrderly = {
+    leg: () => ol,
+    account: async () => ({
+      venue: 'orderly', address: 'acct', time: 1, equityUsd: 100, freeMarginUsd: 100, maintenanceMarginUsd: 0,
+      positions: ol.pos === 0n ? [] : [{ symbol: 'PERP_XLM_USDC', size: Number(ol.pos) / 1e8, entryPx: 1, liqPx: null, marginUsd: 1, unrealizedPnlUsd: 0, leverage: 1, fundingSinceOpenUsd: 0, unsettledFundingUsd: 0 }],
+    }),
+  };
+  /** serve's input with Orderly listed by the policy, and legs built for the shape asked (Orderly's from `ol`). */
+  const withOrderly = (extra: Partial<ServePairInput> = {}): ServePairInput => {
+    const i = input(w, extra);
+    (i.side.desk.policy as { orderly_symbols?: string[] }).orderly_symbols = ['PERP_XLM_USDC'];
+    i.deps = {
+      ...i.deps,
+      buildLegs: async ({ shape }) => (shape.legs[1].venue === 'orderly'
+        ? { shape, legs: [w.hl, ol], hl: w.hl, phoenix: null, priced: false, mismatches: [] }
+        : { hl: w.hl, phoenix: w.px, priced: false, mismatches: [] }),
+    };
+    return i;
+  };
+  const ask = { symbol: 'XLM', long: 'orderly', short: 'hyperliquid', legUsd: 10, leverage: 1.5, reason: 'strategy: enter xlm-orderly-hyperliquid' } as const;
+  const statePath = traderStateFile(w.dir, 'mainnet', { contractId: CONTRACT, deskId: DESK, evm: EVM });
+  try {
+    // Without the flag: refused before anything is built, whatever the session.
+    const off = await servePair(withOrderly({ orderly: session }));
+    const refused = await off.hands!.open(ask);
+    assert.equal(refused.ok, false);
+    assert.match(refused.reason, /short hyperliquid XLM, long orderly PERP_XLM_USDC: only short hyperliquid \/ long phoenix trades while GIMBAL_ORDERLY_PAIRS is not 1/);
+    off.stop();
+    // With the flag and no Orderly session: refused, nothing built.
+    w.env.GIMBAL_ORDERLY_PAIRS = '1';
+    const noSession = await servePair(withOrderly());
+    const none = await noSession.hands!.open(ask);
+    assert.match(none.reason, /an Orderly pair needs serve's Orderly session .*, and serve has none: nothing built or sent/);
+    noSession.stop();
+    assert.equal(w.hl.orders.length + ol.orders.length + w.px.orders.length, 0);
+
+    // With both: short Hyperliquid / long Orderly, saved as version 2 with its legs.
+    const on = await servePair(withOrderly({ orderly: session }));
+    const opened = await on.hands!.open(ask);
+    assert.equal(opened.ok, true, opened.reason);
+    assert.deepEqual([w.hl.pos, ol.pos, w.px.pos], [-toQty('10'), toQty('10'), 0n]);
+    assert.deepEqual(on.hands!.heldLegs().map((l) => l.venue), ['hyperliquid', 'orderly']);
+    const saved = JSON.parse(readFileSync(statePath, 'utf8')) as { version: number; pair: unknown };
+    assert.equal(saved.version, 2);
+    assert.deepEqual(saved.pair, { legs: [{ venue: 'hyperliquid', symbol: 'XLM' }, { venue: 'orderly', symbol: 'PERP_XLM_USDC' }], longIndex: 1 });
+    on.stop();
+
+    // A serve without the flag refuses to start: nothing here could protect or close that pair, panic_close included.
+    delete w.env.GIMBAL_ORDERLY_PAIRS;
+    for (const trade of ['1', '0']) {
+      w.env.GIMBAL_TRADE = trade;
+      await assert.rejects(servePair(withOrderly({ orderly: session })), (err: unknown) => err instanceof ConfigError
+        && /is for the XLM pair short hyperliquid XLM, long orderly PERP_XLM_USDC, and GIMBAL_ORDERLY_PAIRS is not 1: no engine here could protect or close it \(panic_close included\)\. Start serve with GIMBAL_ORDERLY_PAIRS=1/.test(err.message));
+      assert.equal(existsSync(lockPath(w)), false, 'the lock is let go');
+    }
+    w.env.GIMBAL_TRADE = '1';
+
+    // With the flag again: XLM held on Hyperliquid and Orderly, the saved pair's legs: restored and live, then closed.
+    w.env.GIMBAL_ORDERLY_PAIRS = '1';
+    const back = await servePair(withOrderly({ orderly: session }));
+    assert.equal(back.pair?.live, true, back.lines.join('\n'));
+    assert.match(back.lines.join('\n'), /pair {6}XLM: hyperliquid -10 \(short\), orderly 10 \(long\)/);
+    const closed = await back.hands!.close({ reason: 'strategy: exit' });
+    assert.equal(closed.ok, true, closed.reason);
+    assert.deepEqual([w.hl.pos, ol.pos], [0n, 0n]);
+    back.stop();
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+/** A world with GIMBAL_ORDERLY_PAIRS=1, Orderly listing XLM, and an Orderly session over `legs` (by market). */
+function orderlyWorld(legs: Leg[], env: Record<string, string> = {}) {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_ORDERLY_PAIRS: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}`, ...env });
+  const events: StreamEvent[] = [];
+  let now = Date.now();
+  const session: ServeOrderly = {
+    leg: (spec) => legs.find((l) => l.symbol === spec.symbol) ?? null,
+    account: async () => ({
+      venue: 'orderly', address: 'acct', time: now, equityUsd: 100, freeMarginUsd: 100, maintenanceMarginUsd: 0,
+      positions: legs.filter((l) => l.pos !== 0n).map((l) => ({
+        symbol: l.symbol, size: Number(l.pos) / 1e8, entryPx: 1, liqPx: null, marginUsd: 1, unrealizedPnlUsd: 0, leverage: 1, fundingSinceOpenUsd: 0, unsettledFundingUsd: 0,
+      })),
+    }),
+  };
+  const ol = legs.find((l) => l.symbol === 'PERP_XLM_USDC')!;
+  // The clock moves with every sleep: the sweep's replay watch runs its 300 s window at once.
+  const make = (withSession: boolean): ServePairInput => {
+    const i = input(w, { clock: { now: () => now }, sleep: async (ms) => { now += ms; }, publish: (e) => events.push(e), ...(withSession ? { orderly: session } : {}) });
+    (i.side.desk.policy as { orderly_symbols?: string[] }).orderly_symbols = ['PERP_XLM_USDC'];
+    i.deps = {
+      ...i.deps,
+      buildLegs: async ({ shape }) => (shape.legs[1].venue === 'orderly'
+        ? { shape, legs: [w.hl, ol], hl: w.hl, phoenix: null, priced: false, mismatches: [] }
+        : { hl: w.hl, phoenix: w.px, priced: false, mismatches: [] }),
+    };
+    return i;
+  };
+  return { w, events, make, statePath: traderStateFile(w.dir, 'mainnet', { contractId: CONTRACT, deskId: DESK, evm: EVM }) };
+}
+
+const PANIC = { reason: 'panic_close: the owner closed the desk', reduceOnly: true, by: 'panic_close' } as const;
+const ticks = async (n = 50) => {
+  for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r));
+};
+
+test('panic_close with GIMBAL_ORDERLY_PAIRS=1: the pair closes through its trader, and every other Orderly position through the session', async () => {
+  const ol = new Leg('orderly', 'PERP_XLM_USDC');
+  const eth = new Leg('orderly', 'PERP_ETH_USDC');
+  const o = orderlyWorld([ol, eth]);
+  try {
+    const sp = await servePair(o.make(true));
+    const opened = await sp.hands!.open({ symbol: 'XLM', long: 'orderly', short: 'hyperliquid', legUsd: 10, leverage: 1.5, reason: 'strategy: enter' });
+    assert.equal(opened.ok, true, opened.reason);
+    eth.pos = toQty('2');                                    // a position no pair trader holds
+    const reducer = sp.reducer()!;
+    assert.equal(reducer.panicOnly, undefined, 'the pair trades: a rescue\'s reduce uses it');
+    const r = await reducer.close(PANIC);
+    assert.equal(r.status, 'closed', r.notes.join('; '));
+    assert.deepEqual([o.w.hl.pos, ol.pos, eth.pos], [0n, 0n, 0n]);
+    assert.ok([...ol.orders.slice(1), ...eth.orders].every((x) => x.reduceOnly));
+    assert.deepEqual(r.legs.map((l) => `${l.venue} ${l.symbol}`), ['hyperliquid XLM', 'orderly PERP_XLM_USDC', 'orderly PERP_ETH_USDC']);
+    await ticks();
+    sp.stop();
+  } finally {
+    rmSync(o.w.dir, { recursive: true, force: true });
+  }
+});
+
+test('panic_close with GIMBAL_ORDERLY_PAIRS=1 and the trader state lost: the start is NONE, and panic_close still closes Orderly reduce-only (the lock taken and let go)', async () => {
+  const ol = new Leg('orderly', 'PERP_XLM_USDC');
+  const o = orderlyWorld([ol]);
+  try {
+    const first = await servePair(o.make(true));
+    assert.equal((await first.hands!.open({ symbol: 'XLM', long: 'orderly', short: 'hyperliquid', legUsd: 10, leverage: 1.5, reason: 'strategy: enter' })).ok, true);
+    first.stop();
+    rmSync(o.statePath);                                     // the state file is lost
+
+    const sp = await servePair(o.make(true));
+    assert.equal(sp.pair, null);
+    assert.match(sp.lines.join('\n'), /NONE: XLM is held on orderly, which is not a leg of the pair \(short hyperliquid XLM, long phoenix XLM\)/);
+    assert.equal(existsSync(lockPath(o.w)), false, 'NONE holds no lock');
+    const reducer = sp.reducer();
+    assert.ok(reducer !== null, 'panic_close has a reducer: the Orderly sweep');
+    assert.match(reducer.panicOnly ?? '', /no pair trader holds the legs here/, 'a rescue plans no reduce on it');
+    const r = await reducer.close(PANIC);
+    assert.equal(ol.pos, 0n);
+    assert.deepEqual(ol.orders.at(-1), { side: 'SELL', size: toQty('10'), reduceOnly: true });
+    assert.equal(r.status, 'stuck', 'Hyperliquid is still held, and no engine here closes it');
+    assert.match(r.notes.join(' '), /no pair trader holds hyperliquid XLM here: nothing closed it; close by hand \(stop serve, then pair-mainnet close --send\)/);
+    await ticks();
+    assert.equal(existsSync(lockPath(o.w)), false, 'the sweep let the lock go');
+    sp.stop();
+    assert.equal(sp.reducer(), null, 'nothing after stop()');
+  } finally {
+    rmSync(o.w.dir, { recursive: true, force: true });
+  }
+});
+
+test('GIMBAL_ORDERLY_PAIRS=1 and no Orderly session: the start journals it; panic_close says "nothing on Orderly to close" unless the saved state holds an Orderly leg', async () => {
+  // A live Hyperliquid / Phoenix pair, and no Orderly leg saved: the pair closes, and panic_close is done.
+  const ol = new Leg('orderly', 'PERP_XLM_USDC');
+  const o = orderlyWorld([ol]);
+  try {
+    savedPair(o.w);
+    o.w.hl.pos = toQty('-50');
+    o.w.px.pos = toQty('50');
+    const sp = await servePair(o.make(false));
+    assert.equal(sp.pair?.live, true, sp.lines.join('\n'));
+    assert.match(sp.lines.join('\n'), /GIMBAL_ORDERLY_PAIRS=1, and serve has no Orderly session: no Orderly position is read, protected or closed here, panic_close included/);
+    assert.ok(startJournal(o.events).some((l) => /^error: GIMBAL_ORDERLY_PAIRS=1, and serve has no Orderly session/.test(l)), startJournal(o.events).join('\n'));
+    const r = await sp.reducer()!.close(PANIC);
+    assert.equal(r.status, 'closed', r.notes.join('; '));
+    assert.deepEqual([o.w.hl.pos, o.w.px.pos], [0n, 0n]);
+    assert.match(r.notes.join(' '), /nothing on Orderly to close: serve has no Orderly session, and the trader state holds no Orderly leg/);
+    sp.stop();
+  } finally {
+    rmSync(o.w.dir, { recursive: true, force: true });
+  }
+
+  // An Orderly pair saved, and serve restarted without its session: NONE, and panic_close says what it cannot close.
+  const ol2 = new Leg('orderly', 'PERP_XLM_USDC');
+  const q = orderlyWorld([ol2]);
+  try {
+    const first = await servePair(q.make(true));
+    assert.equal((await first.hands!.open({ symbol: 'XLM', long: 'orderly', short: 'hyperliquid', legUsd: 10, leverage: 1.5, reason: 'strategy: enter' })).ok, true);
+    first.stop();
+    const sp = await servePair(q.make(false));
+    assert.match(sp.lines.join('\n'), /has an Orderly leg, and serve has no Orderly session/);
+    const r = await sp.reducer()!.close(PANIC);
+    assert.equal(r.status, 'stuck');
+    assert.match(r.notes.join(' '), /serve has no Orderly session \(GIMBAL_ORDERLY_PAIRS=1\), and the trader state holds an Orderly leg: the desk's Orderly positions are neither read nor closed here/);
+    assert.equal(ol2.pos, toQty('10'), 'nothing sent');
+    sp.stop();
+  } finally {
+    rmSync(q.w.dir, { recursive: true, force: true });
+  }
+});
+
+test('a panic_close sweep that took the lock never lets it go under a start retry: the pair goes live holding it', async () => {
+  const ol = new Leg('orderly', 'PERP_XLM_USDC');
+  const eth = new Leg('orderly', 'PERP_ETH_USDC');
+  const o = orderlyWorld([ol, eth]);
+  try {
+    savedPair(o.w);
+    o.w.hl.pos = toQty('-50');
+    o.w.px.pos = toQty('50');
+    eth.pos = toQty('2');                                    // held on Orderly, no pair trader's leg
+    mkdirSync(dirname(lockPath(o.w)), { recursive: true });
+    writeFileSync(lockPath(o.w), lockText({ pid: process.ppid, startedMs: 1, id: 'pair-mainnet', boot: THIS_PROCESS.boot }));
+    // The start's Hyperliquid read can be held (the retry then runs while the sweep ends).
+    const i = o.make(true);
+    const hlHeld = i.deps!.hlHeld!;
+    let startGate: Promise<void> | null = null;
+    let startHeld = false;
+    i.deps = {
+      ...i.deps,
+      hlHeld: async (evm) => {
+        if (startGate !== null) {
+          startHeld = true;
+          await startGate;
+        }
+        return hlHeld(evm);
+      },
+    };
+    const sp = await servePair(i);
+    assert.match(sp.unconfirmed!() ?? '', /the trader lock is not held/);
+    rmSync(lockPath(o.w));                                   // pair-mainnet exits
+
+    // panic_close: the sweep takes the free lock and sends its Orderly order, held there.
+    let sweepGo: () => void = () => {};
+    let sent = false;
+    eth.hold = () => {
+      sent = true;
+      return new Promise<void>((r) => {
+        sweepGo = r;
+      });
+    };
+    const settle = async (done: () => boolean) => {
+      for (let n = 0; n < 500 && !done(); n++) await new Promise((r) => setImmediate(r));
+    };
+    const closing = sp.reducer()!.close(PANIC);
+    await settle(() => sent);
+    assert.equal(parseLockText(readFileSync(lockPath(o.w), 'utf8'))?.id, THIS_PROCESS.id, 'the sweep holds the lock');
+
+    // A start retry finds the lock held (the sweep's) and goes on; the sweep ends while the retry reads.
+    let startGo: () => void = () => {};
+    startGate = new Promise<void>((r) => {
+      startGo = r;
+    });
+    const retry = sp.retryStart!();
+    await settle(() => startHeld);
+    sweepGo();
+    await settle(() => eth.pos === 0n);
+    await ticks();
+    assert.equal(parseLockText(readFileSync(lockPath(o.w), 'utf8'))?.id, THIS_PROCESS.id, 'the sweep did not let the lock go under the retry');
+    startGate = null;
+    startGo();
+    assert.match(await retry ?? '', /^pair start confirmed .*XLM trades$/);
+    await closing;
+    assert.equal(sp.pair?.live, true);
+    assert.equal(parseLockText(readFileSync(lockPath(o.w), 'utf8'))?.id, THIS_PROCESS.id, 'the live pair holds the lock: pair-mainnet --send cannot start beside it');
+    sp.stop();
+    assert.equal(existsSync(lockPath(o.w)), false);
+  } finally {
+    rmSync(o.w.dir, { recursive: true, force: true });
+  }
+});
+
+test('a start retry that lands alert only during a sweep keeps the lock until the sweep ends; a sweep whose signing fails gives it back', async () => {
+  const ol = new Leg('orderly', 'PERP_XLM_USDC');
+  const eth = new Leg('orderly', 'PERP_ETH_USDC');
+  const o = orderlyWorld([ol, eth]);
+  try {
+    savedPair(o.w);
+    o.w.hl.pos = toQty('-50');
+    o.w.px.pos = toQty('50');
+    eth.pos = toQty('2');                                    // held on Orderly, no pair trader's leg
+    mkdirSync(dirname(lockPath(o.w)), { recursive: true });
+    writeFileSync(lockPath(o.w), lockText({ pid: process.ppid, startedMs: 1, id: 'pair-mainnet', boot: THIS_PROCESS.boot }));
+    const sp = await servePair(o.make(true));
+    assert.match(sp.unconfirmed!() ?? '', /the trader lock is not held/);
+    rmSync(lockPath(o.w));                                   // pair-mainnet exits
+
+    // The sweep takes the free lock, and the signing client fails: the lock goes back, nothing is sent.
+    o.w.signingFails = new Error('NEAR RPC down');
+    const failed = await sp.reducer()!.close({ ...PANIC, fresh: true, closing: () => true });
+    assert.notEqual(failed.status, 'closed');
+    assert.match(failed.notes.join(' '), /the desk's Orderly positions are not closed: the signing contract client: NEAR RPC down/);
+    assert.equal(existsSync(lockPath(o.w)), false, 'the lock the sweep took went back');
+    assert.equal(eth.orders.length, 0);
+    o.w.signingFails = null;
+
+    // The sweep takes the lock again and holds its Orderly order there.
+    let sweepGo: () => void = () => {};
+    let sent = false;
+    eth.hold = () => {
+      sent = true;
+      return new Promise<void>((r) => {
+        sweepGo = r;
+      });
+    };
+    const settle = async (done: () => boolean) => {
+      for (let n = 0; n < 500 && !done(); n++) await new Promise((r) => setImmediate(r));
+    };
+    const closing = sp.reducer()!.close({ ...PANIC, closing: () => true });
+    await settle(() => sent);
+    assert.equal(parseLockText(readFileSync(lockPath(o.w), 'utf8'))?.id, THIS_PROCESS.id, 'the sweep holds the lock');
+
+    // A start retry lands alert only (a resting order on the pair's coin) while the sweep's order is out.
+    o.w.openOrders = [{ coin: 'XLM', side: 'B', sz: '10', oid: 42 }];
+    assert.match(await sp.retryStart!() ?? '', /XLM alert only/);
+    assert.equal(sp.pair?.live, false);
+    assert.equal(parseLockText(readFileSync(lockPath(o.w), 'utf8'))?.id, THIS_PROCESS.id, 'not let go under the sweep');
+    sweepGo();
+    await closing;
+    await ticks();
+    assert.equal(eth.pos, 0n);
+    assert.equal(existsSync(lockPath(o.w)), false, 'the sweep gave it back: nothing here trades');
+    sp.stop();
+  } finally {
+    rmSync(o.w.dir, { recursive: true, force: true });
+  }
+});
+
+test('the strategy loop\'s open while ClosingWatch still reads closing leaves the replay watch on: a copy that lands later is closed', async () => {
+  const ol = new Leg('orderly', 'PERP_XLM_USDC');
+  const eth = new Leg('orderly', 'PERP_ETH_USDC');
+  const o = orderlyWorld([ol, eth]);
+  try {
+    const i = o.make(true);
+    // The watch's reads wait for the test; every other sleep runs at once.
+    let wake: (() => void) | null = null;
+    let reads = 0;
+    i.sleep = async (ms) => {
+      if (ms !== SWEEP_POLL_MS) return;
+      reads++;
+      await new Promise<void>((r) => {
+        wake = r;
+      });
+    };
+    const sp = await servePair(i);
+    const opened = await sp.hands!.open({ symbol: 'XLM', long: 'orderly', short: 'hyperliquid', legUsd: 10, leverage: 1.5, reason: 'strategy: enter' });
+    assert.equal(opened.ok, true, opened.reason);
+    eth.pos = toQty('2');
+    const r = await sp.reducer()!.close({ ...PANIC, fresh: true, closing: () => true });
+    assert.equal(r.status, 'closed', r.notes.join('; '));
+    assert.equal(eth.pos, 0n);
+    await ticks();
+    assert.equal(reads, 1, 'the watch waits on its first read');
+
+    // The loop opens while the desk still reads closing (the paused desk refuses the open itself).
+    o.w.refuse = ['the desk is paused: nothing sent'];
+    const again = await sp.hands!.open({ symbol: 'XLM', long: 'orderly', short: 'hyperliquid', legUsd: 10, leverage: 1.5, reason: 'strategy: enter' });
+    assert.equal(again.ok, false);
+    eth.pos = toQty('2');                                    // a replayed copy of the sweep's IOC... or of the open's
+    (wake as (() => void) | null)?.();
+    for (let n = 0; n < 500 && eth.pos !== 0n; n++) await new Promise((res) => setImmediate(res));
+    assert.equal(eth.pos, 0n, 'the watch went on and closed it');
+    assert.ok(o.events.some((e) => e.type === 'journal' && /came back after the sweep/.test(e.data.summary)));
+    sp.stop();
+    (wake as (() => void) | null)?.();
+    await ticks();
+  } finally {
+    rmSync(o.w.dir, { recursive: true, force: true });
   }
 });

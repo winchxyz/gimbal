@@ -105,7 +105,11 @@ export class ClosingWatch {
       }
     }
     try {
-      const r = await reducer.close({ reason: 'panic_close: the owner closed the desk', reduceOnly: true, by: 'panic_close' });
+      // `closing`: this panic_close still stands as the watch last read get_desk (an unpause, or a newer one, ends it).
+      const r = await reducer.close({
+        reason: 'panic_close: the owner closed the desk', reduceOnly: true, by: 'panic_close', fresh: first,
+        closing: () => this.#closing && gen === this.#gen,
+      });
       const legs = r.legs.map((l) => `${l.venue} ${l.symbol} ${l.start} -> ${l.final ?? '?'}`).join(', ');
       if (r.status === 'closed' || r.status === 'flat') {
         done();

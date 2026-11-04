@@ -137,6 +137,15 @@ export class NearContractClient implements ContractClient {
     return (await this.#transport.view<DeskView | null>(this.contractId, 'get_desk', { desk_id: deskId })) ?? null;
   }
 
+  /**
+   * get_desk_settings (interfaces §1.4, "Venue settings"), the field the engine reads: `orderly_ips_applied`, whether
+   * the contract signed `ip_restriction` for the desk's current Orderly IP list (on mainnet an Orderly order that is not
+   * reduce-only is refused until it did). null for an unknown desk.
+   */
+  async deskSettings(deskId: string): Promise<{ orderly_ips_applied?: boolean } | null> {
+    return (await this.#transport.view<{ orderly_ips_applied?: boolean } | null>(this.contractId, 'get_desk_settings', { desk_id: deskId })) ?? null;
+  }
+
   async prices(): Promise<StoredPrice[]> {
     return parseStoredPrices(await this.#transport.view<unknown>(this.contractId, 'prices', {}));
   }
