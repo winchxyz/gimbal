@@ -20,7 +20,7 @@ const MAX_WORDS = 2_000;
 const EXAMPLE = 'For example: steady income, only big coins, never more than $1,000 a side, money only comes back to me.';
 
 /** The second number of a row that holds two (price band and oracle age are rows of their own). */
-const EXTRA: Partial<Record<string, EditId>> = { transfer: 'transfer-flat', rotate: 'rotate-hours', risk: 'rescue-distance' };
+const EXTRA: Partial<Record<string, EditId>> = { transfer: 'transfer-flat', rotate: 'rotate-hours', checks: 'exit-checks', risk: 'rescue-distance' };
 
 function NumberBox({ id, flow, s }: { id: EditId; flow: OnboardingFlow; s: FlowState }) {
   const draft = s.rules.draft!;

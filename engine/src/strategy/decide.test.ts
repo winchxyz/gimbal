@@ -333,12 +333,12 @@ test('a steady window entered on day 0 holds every hourly check until the day-14
 });
 
 test('a real drop in funding still compresses, late in the hold as early', () => {
-  // On day 12 the gross falls from 18 % to 10 %: 8.25 % held, under the minimum for 3 hours: exit.
+  // On day 12 the gross falls from 18 % to 10 %: 8.25 % held, under the minimum for 6 hours: exit.
   const since = T0 - 11 * 24 * HOUR;
-  const ds = hours(input({ held: held(XLM, { since }) }), 4, (h) => [win(XLM, { netAprPct: h === 0 ? 15 : 7 })]);
-  assert.deepEqual(actions(ds), ['hold', 'hold', 'hold', 'exit']);
-  assert.equal(ds[1]!.decision.reason, 'Hold XLM: 8.3 % net of the exit, under your 10 % minimum, 1 of 3 hours before exit; day 12 of 14');
-  assert.equal(ds[3]!.decision.reason, 'Exit XLM: 8.3 % net of the exit, under your 10 % minimum, 3 of 3 hours in a row');
+  const ds = hours(input({ held: held(XLM, { since }) }), 7, (h) => [win(XLM, { netAprPct: h === 0 ? 15 : 7 })]);
+  assert.deepEqual(actions(ds), ['hold', 'hold', 'hold', 'hold', 'hold', 'hold', 'exit']);
+  assert.equal(ds[1]!.decision.reason, 'Hold XLM: 8.3 % net of the exit, under your 10 % minimum, 1 of 6 hours before exit; day 12 of 14');
+  assert.equal(ds[6]!.decision.reason, 'Exit XLM: 8.3 % net of the exit, under your 10 % minimum, 6 of 6 hours in a row');
 });
 
 test('a since in the future (clock skew) never gives more than the whole hold', () => {
@@ -349,28 +349,69 @@ test('a since in the future (clock skew) never gives more than the whole hold', 
   assert.match(ds[4]!.decision.reason, /the \$0\.03 switch takes 22\.8 days to pay back, 14\.0 are left$/);
 });
 
-test('exit after 3 hourly checks in a row under the minimum; a good hour in between starts the count again', () => {
+test('exit after 6 hourly checks in a row under the minimum (the default), not 3; a good hour in between starts the count again', () => {
   // From here: 10.25 % and 14.75 % gross less the 1.75 points of exit: 8.5 % and 13 %.
-  const ds = hours(input({ held: held(XLM) }), 6, (h) => [win(XLM, { netAprPct: h === 1 ? 11.75 : 7.25 })], (h) => (h <= 4 ? held(XLM) : null));
-  assert.deepEqual(actions(ds), ['hold', 'hold', 'hold', 'hold', 'exit', 'wait']);
-  assert.equal(ds[0]!.decision.reason, 'Hold XLM: 8.5 % net of the exit, under your 10 % minimum, 1 of 3 hours before exit; day 1 of 14');
+  const ds = hours(input({ held: held(XLM) }), 9, (h) => [win(XLM, { netAprPct: h === 1 ? 11.75 : 7.25 })], (h) => (h <= 7 ? held(XLM) : null));
+  assert.deepEqual(actions(ds), ['hold', 'hold', 'hold', 'hold', 'hold', 'hold', 'hold', 'exit', 'wait']);
+  assert.equal(ds[0]!.decision.reason, 'Hold XLM: 8.5 % net of the exit, under your 10 % minimum, 1 of 6 hours before exit; day 1 of 14');
   assert.equal(ds[1]!.decision.reason, 'Hold XLM: 13.0 % net of the exit, at least your 10 % minimum; day 1 of 14');
-  assert.equal(ds[4]!.decision.reason, 'Exit XLM: 8.5 % net of the exit, under your 10 % minimum, 3 of 3 hours in a row');
-  assert.deepEqual(ds[4]!.act, { kind: 'exit', reason: ds[4]!.decision.reason });
-  assert.equal(ds[4]!.vetoCandidate, null);
-  assert.equal(ds[4]!.counters.lastExitAt, T0 + 4 * HOUR);
-  assert.equal(ds[4]!.counters.badChecks, 0);
+  assert.equal(ds[4]!.decision.reason, 'Hold XLM: 8.5 % net of the exit, under your 10 % minimum, 3 of 6 hours before exit; day 1 of 14', 'the third bad hour no longer exits');
+  assert.equal(ds[4]!.act, null);
+  assert.equal(ds[7]!.decision.reason, 'Exit XLM: 8.5 % net of the exit, under your 10 % minimum, 6 of 6 hours in a row');
+  assert.deepEqual(ds[7]!.act, { kind: 'exit', reason: ds[7]!.decision.reason });
+  assert.equal(ds[7]!.vetoCandidate, null);
+  assert.equal(ds[7]!.counters.lastExitAt, T0 + 7 * HOUR);
+  assert.equal(ds[7]!.counters.badChecks, 0);
+});
+
+test('the owner\'s counts: rules set the exit and the entry; the defaults are enter 3, exit 6', () => {
+  assert.equal(LOOP_RULES.enterAfterChecks, 3);
+  assert.equal(LOOP_RULES.exitAfterChecks, 6);
+  assert.equal(STRATEGY.enterAfterChecks, LOOP_RULES.enterAfterChecks);
+  assert.equal(STRATEGY.exitAfterChecks, LOOP_RULES.exitAfterChecks);
+  const bad = () => [win(XLM, { netAprPct: 7.25 })];
+  const three = hours(input({ held: held(XLM), rules: { exitAfterChecks: 3 } }), 3, bad);
+  assert.deepEqual(actions(three), ['hold', 'hold', 'exit']);
+  assert.equal(three[2]!.decision.reason, 'Exit XLM: 8.5 % net of the exit, under your 10 % minimum, 3 of 3 hours in a row');
+  const enter = hours(input({ rules: { enterAfterChecks: 5 } }), 5, () => [win(XLM)]);
+  assert.deepEqual(actions(enter), ['wait', 'wait', 'wait', 'wait', 'enter']);
+  assert.equal(enter[3]!.decision.reason, 'XLM 15.0 % net, 4 of 5 hours above 10 %');
+  // The default entry count stays 3 while the exit count is 6.
+  assert.deepEqual(actions(hours(input(), 3, () => [win(XLM)])), ['wait', 'wait', 'enter']);
+});
+
+test('a changed count never resets a count in progress: raising it does not exit early, lowering it acts on the count reached', () => {
+  const bad = () => [win(XLM, { netAprPct: 7.25 })];
+  // Two bad hours under exit 3, then the owner raises it to 6: the third bad hour is 3 of 6, no exit; the sixth exits.
+  const before = hours(input({ held: held(XLM), rules: { exitAfterChecks: 3 } }), 2, bad);
+  assert.equal(before[1]!.counters.badChecks, 2);
+  const after = hours(input({ held: held(XLM), now: T0 + 2 * HOUR, counters: before[1]!.counters, rules: { exitAfterChecks: 6 } }), 4, bad);
+  assert.deepEqual(actions(after), ['hold', 'hold', 'hold', 'exit']);
+  assert.match(after[0]!.decision.reason, /, 3 of 6 hours before exit; /);
+  // Lowering 6 to 3 with 4 bad hours counted: the next check, a scan event too, acts on the count already reached.
+  const four = hours(input({ held: held(XLM) }), 4, bad);
+  assert.equal(four[3]!.counters.badChecks, 4);
+  assert.equal(four[3]!.decision.action, 'hold');
+  const lowered = decide(input({ held: held(XLM), hourly: false, now: T0 + 3 * HOUR + 5_000, windows: bad(), counters: four[3]!.counters, rules: { exitAfterChecks: 3 } }));
+  assert.equal(lowered.decision.action, 'exit');
+  // The entry count: two hours counted under 3, raised to 5: no entry at the third, the count goes on to 5.
+  const seen = hours(input(), 2, () => [win(XLM)]);
+  assert.equal(seen[1]!.counters.aboveByWindow[XLM], 2);
+  const raised = hours(input({ now: T0 + 2 * HOUR, counters: seen[1]!.counters, rules: { enterAfterChecks: 5 } }), 3, () => [win(XLM)]);
+  assert.deepEqual(actions(raised), ['wait', 'wait', 'enter']);
+  assert.equal(raised[0]!.counters.aboveByWindow[XLM], 3);
+  assert.equal(raised[0]!.decision.reason, 'XLM 15.0 % net, 3 of 5 hours above 10 %');
 });
 
 test('exit when the rest of the hold nets below zero, or the spread flipped this hour or over 7 or 14 days', () => {
-  const neg = hours(input({ held: held(XLM) }), 3, () => [win(XLM, { netAprPct: -5 })]);
-  assert.equal(neg[2]!.decision.reason, 'Exit XLM: -3.8 % net of the exit, under your 10 % minimum, 3 of 3 hours in a row');
-  const flip = hours(input({ held: held(XLM) }), 3, () => [win(XLM, { grossAprPct: -6 })]);
-  assert.equal(flip[2]!.decision.reason, 'Exit XLM: the spread flipped: this hour pays -6.0 %, 3 of 3 hours in a row');
-  const d7 = hours(input({ held: held(XLM) }), 3, () => [win(XLM, { grossApr7dPct: -1 })]);
-  assert.equal(d7[2]!.decision.action, 'exit');
-  const d14 = hours(input({ held: held(XLM), gross14dAprPct: { [XLM]: -2 } }), 3, () => [win(XLM)]);
-  assert.equal(d14[2]!.decision.reason, 'Exit XLM: the spread flipped: the 14-day spread is -2.0 %, 3 of 3 hours in a row');
+  const neg = hours(input({ held: held(XLM) }), 6, () => [win(XLM, { netAprPct: -5 })]);
+  assert.equal(neg[5]!.decision.reason, 'Exit XLM: -3.8 % net of the exit, under your 10 % minimum, 6 of 6 hours in a row');
+  const flip = hours(input({ held: held(XLM) }), 6, () => [win(XLM, { grossAprPct: -6 })]);
+  assert.equal(flip[5]!.decision.reason, 'Exit XLM: the spread flipped: this hour pays -6.0 %, 6 of 6 hours in a row');
+  const d7 = hours(input({ held: held(XLM) }), 6, () => [win(XLM, { grossApr7dPct: -1 })]);
+  assert.equal(d7[5]!.decision.action, 'exit');
+  const d14 = hours(input({ held: held(XLM), gross14dAprPct: { [XLM]: -2 } }), 6, () => [win(XLM)]);
+  assert.equal(d14[5]!.decision.reason, 'Exit XLM: the spread flipped: the 14-day spread is -2.0 %, 6 of 6 hours in a row');
 });
 
 test('the time stop and the drawdown stop exit at once, on any check; drawdown is P&L against the leg', () => {
@@ -567,11 +608,15 @@ test('a rotation sizes the new legs with the margin loop.ts says the held legs f
 
 test('rotation comes before a counted exit: a better window replaces a compressed one without a cooldown', () => {
   // XLM at 6.5 % is 7.75 % held: under the minimum.
-  const ds = hours(input({ held: held(XLM) }), 4, () => [win(XLM, { netAprPct: 6.5 }), win(ZEC, { netAprPct: 20, switchCostUsd: 0.04 })], (h) => (h <= 2 ? held(XLM) : null));
-  assert.deepEqual(actions(ds), ['hold', 'hold', 'exit', 'wait']);
-  // Here the exit came first (3 bad hours before 4 better ones): the counts are what they are.
-  const quick = hours(input({ held: held(XLM), strategy: { ...STRATEGY, rotate: { minGainPts: 3, forHours: 3 } } }), 3,
-    () => [win(XLM, { netAprPct: 6.5 }), win(ZEC, { netAprPct: 20, switchCostUsd: 0.04 })]);
+  const both = () => [win(XLM, { netAprPct: 6.5 }), win(ZEC, { netAprPct: 20, switchCostUsd: 0.04 })];
+  // 4 better hours come before 6 bad ones: rotate.
+  const ds = hours(input({ held: held(XLM) }), 4, both);
+  assert.deepEqual(actions(ds), ['hold', 'hold', 'hold', 'rotate']);
+  assert.equal(ds[3]!.counters.lastExitAt, null);
+  // With an exit count of 3 the exit comes first (3 bad hours before 4 better ones): the counts are what they are.
+  const early = hours(input({ held: held(XLM), rules: { exitAfterChecks: 3 } }), 4, both, (h) => (h <= 2 ? held(XLM) : null));
+  assert.deepEqual(actions(early), ['hold', 'hold', 'exit', 'wait']);
+  const quick = hours(input({ held: held(XLM), rules: { exitAfterChecks: 3 }, strategy: { ...STRATEGY, rotate: { minGainPts: 3, forHours: 3 } } }), 3, both);
   assert.equal(quick[2]!.decision.action, 'rotate');
   assert.equal(quick[2]!.counters.lastExitAt, null);
 });
@@ -579,13 +624,13 @@ test('rotation comes before a counted exit: a better window replaces a compresse
 // ---- veto, failures and the journal rule ----
 
 test('skipAct: a failed act leaves this check\'s counts and none of the act\'s marks', () => {
-  const ds = hours(input({ held: held(XLM) }), 3, () => [win(XLM, { netAprPct: 7 })]);
-  const lastIn = input({ held: held(XLM), now: T0 + 2 * HOUR, windows: [win(XLM, { netAprPct: 7 })], counters: ds[1]!.counters });
-  const exit = ds[2]!;
-  assert.equal(exit.counters.lastExitAt, T0 + 2 * HOUR);
+  const ds = hours(input({ held: held(XLM) }), 6, () => [win(XLM, { netAprPct: 7 })]);
+  const lastIn = input({ held: held(XLM), now: T0 + 5 * HOUR, windows: [win(XLM, { netAprPct: 7 })], counters: ds[4]!.counters });
+  const exit = ds[5]!;
+  assert.equal(exit.counters.lastExitAt, T0 + 5 * HOUR);
   const failed = skipAct(lastIn, exit);
   assert.equal(failed.lastExitAt, null);
-  assert.equal(failed.badChecks, 3, 'the exit is tried again on the next check');
+  assert.equal(failed.badChecks, 6, 'the exit is tried again on the next check');
   const retry = decide({ ...lastIn, hourly: false, now: lastIn.now + 5_000, counters: failed });
   assert.equal(retry.decision.action, 'exit');
 

@@ -21,6 +21,8 @@ export const STRATEGY: StrategyConfig = {
   stopDrawdownPct: 10,
   rotate: { minGainPts: 3, forHours: 4 },
   risk: { watchDistancePct: 15, rescueDistancePct: 8 },
+  enterAfterChecks: 3,
+  exitAfterChecks: 6,
 };
 
 /** A desk window `<symbol>-<long venue>-<short venue>` that passes every entry rule unless `f` says otherwise. */

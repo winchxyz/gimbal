@@ -138,6 +138,10 @@ test('GET and PUT /strategy: the whole config, checked; a bad one is refused and
     [{ ...next, risk: { watchDistancePct: 8, rescueDistancePct: 15 } }, /rescueDistancePct < watchDistancePct/],
     [{ ...next, legUsd: 6000 }, /over the policy cap of 5000/],
     [{ ...next, auto: 'yes' }, /auto must be a boolean/],
+    [{ ...next, exitAfterChecks: 0 }, /^strategy: exitAfterChecks must be a whole number of hourly checks from 1 to 24/],
+    [{ ...next, exitAfterChecks: 25 }, /exitAfterChecks must be a whole number of hourly checks from 1 to 24/],
+    [{ ...next, enterAfterChecks: 2.5 }, /enterAfterChecks must be a whole number of hourly checks from 1 to 24/],
+    [{ ...next, enterAfterChecks: '3' }, /enterAfterChecks must be a whole number/],
   ] as const;
   for (const [body, error] of bad) {
     const r = await call('PUT', '/strategy', JSON.stringify(body));

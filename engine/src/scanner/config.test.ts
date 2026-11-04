@@ -69,6 +69,24 @@ test('strategy: what a hostile page sent is refused, field by field', () => {
   assert.equal(parseStrategyConfig({ ...DEFAULT_STRATEGY, stopDrawdownPct: null }, POLICY).stopDrawdownPct, null);
 });
 
+test('strategy: the hourly-check counts are whole numbers from 1 to 24; enter 3 and exit 6 by default, also when absent', () => {
+  assert.equal(DEFAULT_STRATEGY.enterAfterChecks, 3);
+  assert.equal(DEFAULT_STRATEGY.exitAfterChecks, 6);
+  assert.equal(STRATEGY_LIMITS.minChecks, 1);
+  assert.equal(STRATEGY_LIMITS.maxChecks, 24);
+  // A config saved before the settings existed has neither: it reads as the defaults.
+  const { enterAfterChecks: _e, exitAfterChecks: _x, ...old } = DEFAULT_STRATEGY;
+  assert.deepEqual(parseStrategyConfig({ ...old, exitAfterChecks: 4 }, POLICY), { ...DEFAULT_STRATEGY, exitAfterChecks: 4 });
+  assert.deepEqual(parseStrategyConfig(old, POLICY), DEFAULT_STRATEGY);
+  for (const name of ['enterAfterChecks', 'exitAfterChecks'] as const) {
+    for (const v of [1, 24]) assert.equal(parseStrategyConfig({ ...DEFAULT_STRATEGY, [name]: v })[name], v);
+    for (const v of [0, 25, 2.5, -3, '3', null, Number.NaN, 1e9]) {
+      assert.throws(() => parseStrategyConfig({ ...DEFAULT_STRATEGY, [name]: v }, POLICY),
+        new RegExp(`strategy: ${name} must be a whole number of hourly checks from 1 to 24`), `${name} ${String(v)}`);
+    }
+  }
+});
+
 test('Orderly fees: gimbal_dex on mainnet (maker 0, taker 4 = 3 base + 1 markup); the testnet broker keeps 1.5 bps', () => {
   assert.deepEqual(ORDERLY_BROKERS.mainnet, { brokerId: 'gimbal_dex', makerBps: 0, takerBps: 4, markupBps: 1 });
   assert.deepEqual(MAINNET_COSTS.fees.orderly, { takerBps: 3, extraBps: 1 });

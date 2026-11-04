@@ -321,6 +321,11 @@ export const DEFAULT_STRATEGY: StrategyConfig = {
   stopDrawdownPct: 10,
   rotate: { minGainPts: 3, forHours: 4 },
   risk: { watchDistancePct: 15, rescueDistancePct: 8 },
+  // The strategy loop's hourly-check counts (decide.ts LOOP_RULES holds the same defaults): enter after 3, exit after
+  // 6, picked from the backtest in docs/backtest-checks.md (exit after 1 or 2 lost money on round trips; 4 to 12 was
+  // flat and above 3).
+  enterAfterChecks: 3,
+  exitAfterChecks: 6,
 };
 
 /**
@@ -337,6 +342,9 @@ export const STRATEGY_LIMITS = {
   maxMinNetAprPct: 1_000,
   maxRotateGainPts: 1_000,
   maxRotateHours: 24 * 30,
+  // enterAfterChecks and exitAfterChecks: whole hourly checks, at most a day of them.
+  minChecks: 1,
+  maxChecks: 24,
 } as const;
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -350,7 +358,7 @@ const between = (v: unknown, lo: number, hi: number): v is number => isNum(v) &&
  */
 export function parseStrategyConfig(value: unknown, policy: ContractPolicy | null = null): StrategyConfig {
   if (!isObject(value)) throw new Error('strategy: not an object');
-  const known = ['auto', 'minNetAprPct', 'legUsd', 'maxLeverage', 'stopDrawdownPct', 'rotate', 'risk'];
+  const known = ['auto', 'minNetAprPct', 'legUsd', 'maxLeverage', 'stopDrawdownPct', 'rotate', 'risk', 'enterAfterChecks', 'exitAfterChecks'];
   const extra = Object.keys(value).filter((k) => !known.includes(k));
   if (extra.length > 0) throw new Error(`strategy: unknown field ${extra[0]}`);
   const { auto, minNetAprPct, legUsd, maxLeverage, stopDrawdownPct, rotate, risk } = value;
@@ -378,10 +386,21 @@ export function parseStrategyConfig(value: unknown, policy: ContractPolicy | nul
   if (!(risk.rescueDistancePct > 0 && risk.rescueDistancePct < risk.watchDistancePct && risk.watchDistancePct < 100)) {
     throw new Error('strategy: risk needs 0 < rescueDistancePct < watchDistancePct < 100');
   }
+  // The check counts came after the rest: a config saved (or a PUT sent) without them takes the defaults.
+  const checks = (name: 'enterAfterChecks' | 'exitAfterChecks'): number => {
+    const v = value[name];
+    if (v === undefined) return DEFAULT_STRATEGY[name];
+    if (!Number.isInteger(v) || (v as number) < L.minChecks || (v as number) > L.maxChecks) {
+      throw new Error(`strategy: ${name} must be a whole number of hourly checks from ${L.minChecks} to ${L.maxChecks}`);
+    }
+    return v as number;
+  };
   return {
     auto, minNetAprPct, legUsd, maxLeverage, stopDrawdownPct,
     rotate: { minGainPts: rotate.minGainPts, forHours: rotate.forHours },
     risk: { watchDistancePct: risk.watchDistancePct, rescueDistancePct: risk.rescueDistancePct },
+    enterAfterChecks: checks('enterAfterChecks'),
+    exitAfterChecks: checks('exitAfterChecks'),
   };
 }
 

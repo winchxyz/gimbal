@@ -50,3 +50,15 @@ test('a file that does not parse, or no longer fits the policy, is not used, and
   // Without a policy the same file is fine.
   assert.equal(store.load(null).strategy!.legUsd, 1000);
 });
+
+test('a file saved before the hourly-check counts existed loads with the defaults; a saved count is read back', async () => {
+  const { enterAfterChecks: _e, exitAfterChecks: _x, ...old } = DEFAULT_STRATEGY;
+  const before = join(dir, 'strategy-mainnet-before-checks.json');
+  writeFileSync(before, JSON.stringify({ ...old, legUsd: 12 }));
+  const loaded = new StrategyStore(before).load(POLICY);
+  assert.equal(loaded.problem, null);
+  assert.deepEqual(loaded.strategy, { ...DEFAULT_STRATEGY, legUsd: 12, enterAfterChecks: 3, exitAfterChecks: 6 });
+  const store = new StrategyStore(join(dir, 'strategy-mainnet-checks.json'));
+  await store.save({ ...DEFAULT_STRATEGY, legUsd: 12, enterAfterChecks: 2, exitAfterChecks: 8 });
+  assert.deepEqual(store.load(POLICY).strategy, { ...DEFAULT_STRATEGY, legUsd: 12, enterAfterChecks: 2, exitAfterChecks: 8 });
+});

@@ -43,10 +43,13 @@ import { MAX_LEVERAGE, NO_RESCUE_MAX_LEVERAGE } from '../trade/carry-plan.ts';
 import { commonLot, floorToLot, qtyNumber, qtyString, toQty } from '../trade/lots.ts';
 import { venueName } from '../venues/names.ts';
 
-/** The rules StrategyConfig does not carry: engine constants, proposed for E10 and printed at start. */
+/**
+ * Engine constants, printed at start. enterAfterChecks and exitAfterChecks are only the defaults of the owner's
+ * StrategyConfig settings of the same names (DEFAULT_STRATEGY; exit 6 from docs/backtest-checks.md).
+ */
 export const LOOP_RULES = {
   enterAfterChecks: 3,        // hourly checks in a row a window must hold before entry
-  exitAfterChecks: 3,         // hourly checks in a row of compression or a sign flip before exit
+  exitAfterChecks: 6,         // hourly checks in a row of compression or a sign flip before exit
   cooldownHours: 6,           // after an exit, no new entry for this long
   maxHoldDays: 14,            // time stop
   maxRotationsPerDay: 2,
@@ -121,13 +124,14 @@ export interface DecideInput {
    */
   unopenable?: Record<string, string>;
   /**
-   * The hourly-check counts, when not LOOP_RULES' own: what the entry/exit-checks backtest (src/backtest) varies.
-   * serve never passes it.
+   * The hourly-check counts: loop.ts passes the owner's (StrategyConfig.enterAfterChecks / exitAfterChecks), the
+   * entry/exit-checks backtest (src/backtest) varies them. Absent = LOOP_RULES' defaults. The counters stay raw
+   * counts: a changed number is compared against the count already reached, never resets it.
    */
   rules?: Partial<CheckRules>;
 }
 
-/** The two counts a backtest may set: hourly checks in a row before an entry, and before a counted exit. */
+/** The two counts the owner sets (and a backtest varies): hourly checks in a row before an entry, and before a counted exit. */
 export interface CheckRules { enterAfterChecks: number; exitAfterChecks: number }
 
 /** The counts this decision runs on: the input's, else LOOP_RULES'. */

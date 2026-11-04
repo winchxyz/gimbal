@@ -1,4 +1,4 @@
-// Read-only backtest of the strategy loop's hourly-check counts (LOOP_RULES.enterAfterChecks and exitAfterChecks):
+// Read-only backtest of the strategy loop's hourly-check counts (StrategyConfig.enterAfterChecks and exitAfterChecks):
 // the real scanner and decide() stepped hour by hour over public funding history, for every pair of counts, and what
 // each pair nets in USD. Public reads only, no keys, nothing signed; the history is cached so a rerun reads nothing.
 //   npm run backtest:checks -- [--cache <dir>] [--no-fetch] [--leg-usd 12,1000] [--scope live,all] [--enter 1,2,3,4]
@@ -102,11 +102,12 @@ async function main(): Promise<void> {
       console.log('\nNet USD by when the trade was entered (the checks in three equal spans):\n');
       for (const l of periodLines(s, 3)) console.log(l);
       const best = [...s.results].sort((a, b) => b.netUsd - a.netUsd)[0]!;
-      const current = s.results.find((r) => r.enterAfterChecks === 3 && r.exitAfterChecks === 3);
+      const { enterAfterChecks: e0, exitAfterChecks: x0 } = DEFAULT_STRATEGY;
+      const current = s.results.find((r) => r.enterAfterChecks === e0 && r.exitAfterChecks === x0);
       console.log(`\nTop 5 trades, best setting (enter ${best.enterAfterChecks}, exit ${best.exitAfterChecks}):\n`);
       for (const l of tradeLines(best.trades, 5, legUsd)) console.log(l);
       if (current !== undefined) {
-        console.log('\nTop 5 trades, current setting (enter 3, exit 3):\n');
+        console.log(`\nTop 5 trades, the default setting (enter ${e0}, exit ${x0}):\n`);
         for (const l of tradeLines(current.trades, 5, legUsd)) console.log(l);
       }
     }

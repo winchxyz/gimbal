@@ -35,6 +35,7 @@ function notEnterable(w: FundingWindow): string {
 /** `3`, `2.5`: a whole number without its decimal. */
 const count = (n: number): string => plain(n, Number.isInteger(n) ? 0 : 1);
 const hoursText = (h: number): string => `${count(h)} ${h === 1 ? 'hour' : 'hours'}`;
+const checksText = (n: number): string => `${count(n)} hourly ${n === 1 ? 'check' : 'checks'}`;
 
 /** The rotation rule in the owner's words: "3 points of net APR for 4 hours in a row". */
 const ruleText = (rotate: StrategyConfig['rotate']): string => `${count(rotate.minGainPts)} points of net APR for ${hoursText(rotate.forHours)} in a row`;
@@ -50,7 +51,7 @@ export function decide({ selected, windows, strategy, now }: DecisionInput): Dec
       strategy === null
         ? ''
         : strategy.auto
-          ? ` Auto moves out of it when another window beats it by ${ruleText(strategy.rotate)}.`
+          ? ` Auto moves out of it when another window beats it by ${ruleText(strategy.rotate)}, and exits after ${checksText(strategy.exitAfterChecks)} in a row under your minimum or with the spread flipped.`
           : ' Auto is off, so the engine will not exit or rotate it by itself.';
     return { ...none(`${since}${rule}`), close: true };
   }
@@ -95,7 +96,8 @@ export function decide({ selected, windows, strategy, now }: DecisionInput): Dec
       `Nothing is held. Auto enters ${best.symbol} first: ${pct(best.netAprPct)} against ${pct(selected.netAprPct)} here.`,
     );
   }
-  return none(`Nothing is held. Auto enters ${selected.symbol}: it is the best window that clears your ${plain(minimum, 0)}% minimum.`);
+  const after = strategy === null ? '' : ` It enters once it has passed ${checksText(strategy.enterAfterChecks)} in a row.`;
+  return none(`Nothing is held. Auto enters ${selected.symbol}: it is the best window that clears your ${plain(minimum, 0)}% minimum.${after}`);
 }
 
 function againstHeld(selected: FundingWindow, held: FundingWindow, strategy: StrategyConfig | null): Decision {

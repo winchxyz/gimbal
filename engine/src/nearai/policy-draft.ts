@@ -505,7 +505,11 @@ function buildStrategy(answer: DraftAnswer, maxNotional: number, notes: string[]
     risk = { ...D.risk };
   }
 
-  return { auto: answer.auto ?? D.auto, minNetAprPct, legUsd, maxLeverage, stopDrawdownPct, rotate, risk };
+  // The hourly-check counts are not drafted: the defaults, which the owner changes in the form.
+  return {
+    auto: answer.auto ?? D.auto, minNetAprPct, legUsd, maxLeverage, stopDrawdownPct, rotate, risk,
+    enterAfterChecks: D.enterAfterChecks, exitAfterChecks: D.exitAfterChecks,
+  };
 }
 
 /** The venue entries of `symbols` from the market lists: the engine's numbers, never the model's. */

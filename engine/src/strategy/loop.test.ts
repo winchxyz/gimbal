@@ -200,7 +200,7 @@ test('decision events only when the decision changes; a wait is journaled only w
   assert.equal(n.window, 'sol-phoenix-hyperliquid');
   assert.equal(n.netAprPct, 24);
   assert.equal(n.minNetAprPct, DEFAULT_STRATEGY.minNetAprPct);
-  assert.equal(n.checks, `0/${LOOP_RULES.enterAfterChecks}`);
+  assert.equal(n.checks, `0/${DEFAULT_STRATEGY.enterAfterChecks}`);
   assert.equal(typeof n.block, 'string');
 });
 
@@ -851,6 +851,32 @@ test('hold: journaled on a change of category and once per hourly check, with th
   assert.equal(n.hourly, 1);
   // The adoption says since=now is an assumption.
   assert.match(journal(w).find((j) => j.numbers.action === 'adopt')!.summary, /held since now is an assumption/);
+});
+
+test('the owner\'s check counts: fed to decide() as rules, on the start line and in the journal; a change keeps the counts reached', async () => {
+  const w = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 } });
+  assert.equal(w.strategy.enterAfterChecks, 3);
+  assert.equal(w.strategy.exitAfterChecks, 6);
+  const loop = makeLoop(w);
+  assert.match(loop.startLine(), /enter after 3 hourly checks in a row, exit after 6 \(owner settings\)/);
+  // Two bad hours counted under exit 3.
+  w.strategy = { ...w.strategy, exitAfterChecks: 3 };
+  w.next = { decision: { action: 'hold', reason: 'held: under the minimum' }, counters: { ...NO_COUNTERS, badChecks: 2 } };
+  await loop.check();
+  assert.deepEqual(w.inputs.at(-1)!.rules, { enterAfterChecks: 3, exitAfterChecks: 3 });
+  assert.equal(loop.counters.badChecks, 2);
+  // The owner raises it to 6 (PUT /strategy, then onScan): the next input carries 6 and the counts already reached.
+  w.strategy = { ...w.strategy, exitAfterChecks: 6, enterAfterChecks: 4 };
+  w.next = { decision: { action: 'hold', reason: 'held: under the minimum, 2 of 6' } };
+  w.now += 60_000;
+  await loop.check();
+  const after = w.inputs.at(-1)!;
+  assert.deepEqual(after.rules, { enterAfterChecks: 4, exitAfterChecks: 6 });
+  assert.equal(after.counters.badChecks, 2, 'a changed count never resets the count in progress');
+  assert.equal(loop.counters.badChecks, 2);
+  assert.match(loop.startLine(), /enter after 4 hourly checks in a row, exit after 6 /);
+  const hold = journal(w).filter((j) => j.numbers.action === 'hold').at(-1)!;
+  assert.equal(hold.numbers.exitAfterChecks, 6);
 });
 
 test('F1: each check asks the hands to check their record against the venues first; a correction is journaled and acted on', async () => {

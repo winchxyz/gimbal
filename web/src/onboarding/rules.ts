@@ -34,6 +34,8 @@ export function defaultStrategy(): StrategyConfig {
     stopDrawdownPct: null,
     rotate: { minGainPts: 3, forHours: 6 },
     risk: { watchDistancePct: 15, rescueDistancePct: 8 },
+    enterAfterChecks: 3,
+    exitAfterChecks: 6,
   };
 }
 
@@ -52,6 +54,8 @@ export type EditId =
   | 'stop'
   | 'rotate-gain'
   | 'rotate-hours'
+  | 'enter-checks'
+  | 'exit-checks'
   | 'watch-distance'
   | 'rescue-distance';
 
@@ -83,6 +87,8 @@ export const EDITS: Record<EditId, EditDef> = {
   stop: { label: 'Stop at a drawdown of', unit: '%', whole: false, optional: true, get: (d) => d.strategy.stopDrawdownPct, set: (d, n) => withStrategy(d, { stopDrawdownPct: n }) },
   'rotate-gain': { label: 'Rotate for a gain of', unit: 'points', whole: false, get: (d) => d.strategy.rotate.minGainPts, set: (d, n) => withStrategy(d, { rotate: { ...d.strategy.rotate, minGainPts: n ?? 0 } }) },
   'rotate-hours': { label: 'Rotate after', unit: 'hours', whole: false, get: (d) => d.strategy.rotate.forHours, set: (d, n) => withStrategy(d, { rotate: { ...d.strategy.rotate, forHours: n ?? 0 } }) },
+  'enter-checks': { label: 'Enter after', unit: 'hourly checks', whole: true, get: (d) => d.strategy.enterAfterChecks, set: (d, n) => withStrategy(d, { enterAfterChecks: n ?? 0 }) },
+  'exit-checks': { label: 'Exit after', unit: 'hourly checks', whole: true, get: (d) => d.strategy.exitAfterChecks, set: (d, n) => withStrategy(d, { exitAfterChecks: n ?? 0 }) },
   'watch-distance': { label: 'Watch below', unit: '% from liquidation', whole: false, get: (d) => d.strategy.risk.watchDistancePct, set: (d, n) => withStrategy(d, { risk: { ...d.strategy.risk, watchDistancePct: n ?? 0 } }) },
   'rescue-distance': { label: 'Rescue below', unit: '% from liquidation', whole: false, get: (d) => d.strategy.risk.rescueDistancePct, set: (d, n) => withStrategy(d, { risk: { ...d.strategy.risk, rescueDistancePct: n ?? 0 } }) },
 };
@@ -213,6 +219,13 @@ export function engineRows(d: RulesDraft, words: string): RuleRow[] {
       value: `to a window that is ${s.rotate.minGainPts} points better for ${s.rotate.forHours} hours in a row`,
       source: d.model === null ? { kind: 'fixed', note: 'Set by you' } : { kind: 'ai', note: 'the defaults' },
       edit: 'rotate-gain',
+    },
+    {
+      id: 'checks',
+      label: 'Hourly checks',
+      value: `enter after ${s.enterAfterChecks} hours in a row that pass the entry rules, exit after ${s.exitAfterChecks} in a row under the minimum or with the spread flipped`,
+      source: d.model === null ? { kind: 'fixed', note: 'Set by you' } : { kind: 'fixed', note: 'the defaults, picked on a backtest of funding history' },
+      edit: 'enter-checks',
     },
     {
       id: 'risk',

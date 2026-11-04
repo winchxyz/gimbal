@@ -23,6 +23,9 @@ test('numbers are edited as the owner reads them and stored as the contract want
   assert.equal(set('watch-distance', '20').strategy.risk.watchDistancePct, 20);
   assert.equal(set('stop', '25').strategy.stopDrawdownPct, 25);
   assert.equal(set('stop', '').strategy.stopDrawdownPct, null, 'an empty stop is off');
+  assert.equal(set('enter-checks', '4').strategy.enterAfterChecks, 4);
+  assert.equal(set('exit-checks', '8').strategy.exitAfterChecks, 8);
+  assert.deepEqual(applyEdit(d, 'exit-checks', '2.5'), { error: '“Exit after” is a whole number.' });
 });
 
 test('text that is not a number, or a fraction where the contract wants a whole number, changes nothing', () => {
@@ -70,6 +73,8 @@ test('the engine part is separate and says the same about its numbers', () => {
   assert.equal(sourceLine(row('min-apr').source).ai, true, '5% is not in the words');
   assert.equal(row('stop').value, 'off');
   assert.match(row('risk').value, /watch below 15%, rescue below 8%/);
+  assert.equal(row('checks').value, 'enter after 3 hours in a row that pass the entry rules, exit after 6 in a row under the minimum or with the spread flipped');
+  assert.equal(row('checks').edit, 'enter-checks');
   assert.match(engineRows(setAuto(draft(), false), WORDS)[0]!.value, /you act by hand/);
 });
 
