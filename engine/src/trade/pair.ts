@@ -160,6 +160,11 @@ export interface PairTraderState {
   net: bigint;
   unhedged: string | null;
   unsettled: { index: 0 | 1; refs: LegRef[]; until: number; from: bigint; unwind: { to: bigint; reason: string; failed: boolean } | null }[];
+  /**
+   * A replayable leg's replay watch still running (local ms it ends): a restart inside it watches on. Absent when none
+   * runs (always for short Hyperliquid / long Phoenix, whose legs cannot be replayed: its file is as before).
+   */
+  replay?: { index: 0 | 1; until: number }[];
 }
 
 /**
@@ -551,7 +556,16 @@ export class PairTrader {
       if (u === undefined) continue;
       unsettled.push({ index: i as 0 | 1, refs: u.refs.map((r) => ({ ...r, tx: [...r.tx] })), until: u.until, from: u.from, unwind: u.unwind === null ? null : { ...u.unwind } });
     }
-    return { intents: pair(this.#intent), baselines: pair(this.#baseline), known: pair(this.#known), net: this.#net, unhedged: this.unhedged, unsettled };
+    const now = this.#clock.now();
+    const replay: NonNullable<PairTraderState['replay']> = [];
+    for (const [i, leg] of this.legs.entries()) {
+      const until = this.#until.get(leg);
+      if (leg.replayable && until !== undefined && until >= now) replay.push({ index: i as 0 | 1, until });
+    }
+    return {
+      intents: pair(this.#intent), baselines: pair(this.#baseline), known: pair(this.#known), net: this.#net, unhedged: this.unhedged, unsettled,
+      ...(replay.length === 0 ? {} : { replay }),
+    };
   }
 
   /**
@@ -567,6 +581,12 @@ export class PairTrader {
       this.#known.set(leg, s.known[i] ?? null);
     }
     this.unhedged = s.unhedged;
+    for (const r of s.replay ?? []) {
+      const leg = this.legs[r.index];
+      if (!leg.replayable || r.until < this.#clock.now()) continue;
+      this.#until.set(leg, Math.max(this.#until.get(leg) ?? 0, r.until));
+      this.#log(`${leg.venue} ${leg.symbol}: a signed order from before the restart can still be replayed: watched until ${iso(r.until)}`);
+    }
     for (const u of s.unsettled) {
       const leg = this.legs[u.index];
       const ref = u.refs.at(-1);

@@ -128,6 +128,23 @@ test('sweep: every Orderly position but the covered ones is closed reduce-only, 
   await s.sweep.watch;
 });
 
+test('serve stops during a sweep: the order in flight is read back, and no further order is signed', async () => {
+  const eth = new Leg('PERP_ETH_USDC', '-5', '2');
+  const s = setup([eth]);
+  const order = eth.order.bind(eth);
+  eth.order = async (side, size, reduceOnly, reason) => {
+    const out = await order(side, size, reduceOnly, reason);
+    if (eth.orders.length === 2) s.sweep.stop();               // serve stops while the second order is out
+    return out;
+  };
+  const r = await s.sweep.sweep('panic_close: the owner closed the desk');
+  assert.equal(eth.orders.length, 2);
+  assert.equal(eth.pos, toQty('-3'));
+  assert.equal(r.closed, false);
+  assert.match(r.notes.join('; '), /Orderly PERP_ETH_USDC: serve stops, so no further order is sent/);
+  assert.equal(s.sweep.watch, null, 'no watch after stop');
+});
+
 test('the watch runs from the sweep\'s start only (its own orders never extend it); a position that comes back is closed and journaled', async () => {
   const eth = new Leg('PERP_ETH_USDC', '3');
   const s = setup([eth]);

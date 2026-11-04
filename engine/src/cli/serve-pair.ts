@@ -79,7 +79,9 @@ import type { PairResult } from '../trade/pair.ts';
 import { PairTrader, REPLAY_WINDOW_MS } from '../trade/pair.ts';
 import { PhoenixLeg, phoenixTraderApi } from '../trade/phoenix-leg.ts';
 import type { PairShape } from '../trade/pair-shape.ts';
-import { PAIR_VENUES, defaultShape, isDefaultShape, makerIndexOf, orderlyPairsOn, pairShape, policyLists, sameShape, shapeRefusal, shapeText } from '../trade/pair-shape.ts';
+import {
+  PAIR_VENUES, defaultShape, isDefaultShape, longLeg, makerIndexOf, orderlyPairsOn, pairShape, pairSymbols, policyLists, sameShape, shapeRefusal, shapeText, shortLeg,
+} from '../trade/pair-shape.ts';
 import type { ProtectionCloseReport } from '../trade/protected-pair.ts';
 import { GuardedLeg, InFlightBook, ProtectedPair, inFlightEnds, reconcileHow, startPlan } from '../trade/protected-pair.ts';
 import type { TraderFileState, TraderLock } from '../trade/trader-state.ts';
@@ -166,6 +168,10 @@ export interface ServeOrderly {
   leg(spec: OrderlyLegSpec): TradeLeg | null;
   /** The desk's Orderly account over the session (equity, maintenance, positions); throws when it is not known. */
   account(): Promise<AccountState>;
+  /** Before leg(): the session up and the market's lot known (read now when it is not); why not, or null. */
+  ready?(symbol: string): Promise<string | null>;
+  /** The session's position pushes (and seed reads): an Orderly leg's replay watch (PairTrader.positionPushed). */
+  onPositions?(fn: (rows: { symbol: string; qty: bigint }[]) => void): () => void;
 }
 
 /** Where an open's or a close's lines go: `say` its plan and results, `open` what the owner must reconcile. */
@@ -250,9 +256,14 @@ export interface ServePairInput {
   sleep?: (ms: number) => Promise<void>;
   deps?: Partial<ServePairDeps>;
   /** What the start could read of each venue it needs (serve's health map): slow or down until the start is confirmed. */
-  health?: (venue: StartVenue, status: 'ok' | 'slow' | 'down', detail: string | null) => void;
+  health?: (venue: StartReadVenue, status: 'ok' | 'slow' | 'down', detail: string | null) => void;
   /** A protection's close (panic_close, a rescue's reduce, an ADL unwind) as it ended: serve's position book takes it. */
   onProtectionClose?: (report: ProtectionCloseReport) => void;
+  /**
+   * The contract client on the operator key that serve's Orderly session signs with (GIMBAL_ORDERLY_PAIRS=1 only): the
+   * pair's relayer signs through the same one (one transport, one nonce). Absent: the pair builds its own.
+   */
+  operator?: () => Promise<NearContractClient>;
   /** serve's Orderly session (GIMBAL_ORDERLY_PAIRS=1 only): absent, no Orderly pair is built or opened. */
   orderly?: ServeOrderly;
 }
@@ -305,6 +316,13 @@ export interface HandsResult {
 export interface PairHands {
   /** The pair symbols the policy allows (in both policy.hl_assets and policy.phoenix_markets). */
   readonly symbols: readonly string[];
+  /**
+   * GIMBAL_ORDERLY_PAIRS=1 only (absent otherwise): the symbols a pair long `long` / short `short` may open on (both
+   * venues list it; an Orderly leg only with serve's Orderly session).
+   */
+  pairSymbols?(long: VenueId, short: VenueId): readonly string[];
+  /** GIMBAL_ORDERLY_PAIRS=1 only: the long and short venues of the pair the trader has now (held or flat), or null. */
+  heldPair?(): { long: VenueId; short: VenueId } | null;
   /** Why nothing can be opened or closed now, or null. */
   blocked(): string | null;
   /**
@@ -386,7 +404,7 @@ const none = (lines: string[], why: string, stop: () => void = () => {}): ServeP
 
 /** What a start reads from: the two venues and NEAR (the signing client): serve's health keys. */
 export type StartVenue = 'hyperliquid' | 'phoenix' | 'near';
-/** A start read's venue: Orderly too (an Orderly pair's), which serve's health map does not key (journaled only). */
+/** A start read's venue: Orderly too (an Orderly pair's; serve's health map keys it with GIMBAL_ORDERLY_PAIRS=1). */
 export type StartReadVenue = StartVenue | 'orderly';
 
 /** A start read that failed (a timeout, an HTTP error, a lagging snapshot): tried again, never a reason to exit. */
@@ -437,7 +455,11 @@ interface Slot {
   lines: string[];
   settle(): Promise<string | null>;
   /** Legs flat and nothing of ours left that could move them: it may be replaced by another symbol's pair. */
-  quiet(): string | null;
+  /**
+   * Why a new pair cannot open next to this slot now, or null. `replacing` (default true): the open builds another slot
+   * in its place, so a replayable leg still watched counts too (the same slot keeps its trader and its watch).
+   */
+  quiet(replacing?: boolean): string | null;
   /** While a new pair is built: nothing signed or saved; `false` resumes. */
   suspend(on: boolean): void;
   /** After an open: legs moved outside the trader (finish()'s residual hedge) are adopted when they offset. */
@@ -494,6 +516,20 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         lock = acquireTraderLock(lockPath());
       } catch (err) {
         return `the trader lock is not held: ${errorMessage(err)} (pair-mainnet --send holds the same lock)`;
+      }
+      // A stale lock taken over is journaled as the start's attempt() journals it (GIMBAL_ORDERLY_PAIRS=1 only: with it
+      // off a borrow says nothing, as before).
+      const took = (lock as TraderLock).tookOver;
+      if (took !== null && orderlyPairsOn(env)) {
+        log(`pair      ${took}`);
+        const t = input.clock.now();
+        input.publish({
+          type: 'journal',
+          data: {
+            id: `pair-lock-${t.toString(36)}`, t, kind: 'error', numbers: { stage: 'lock' }, tx: [],
+            summary: `pair: ${took}. A serve or pair-mainnet that was killed (an OOM, a SIGKILL, a container restart) leaves its lock behind; nothing else trades this desk now`,
+          },
+        });
       }
     }
     borrowed++;
@@ -636,7 +672,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         ...(legs.priced ? { freshPrice: async () => { await ensureFresh(prices, sym, PRICE_MARGIN_S); } } : {}),
         pendingMaker: () => hlLeg?.pendingMakerOrders() ?? [],
         cancelPending: async (reason) => (hlLeg === null ? [] : hlLeg.cancelPending(reason)),
-        save, onOpen, log: (l) => log(`pair      ${l}`), sleep,
+        save, onOpen, log: (l) => log(`pair      ${l}`), sleep, now: () => input.clock.now(),
         ...(input.onProtectionClose === undefined ? {} : { onProtectionClose: input.onProtectionClose }),
       });
       const pq = pp;
@@ -646,6 +682,15 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         onChange: () => save(),
       });
       watch = adl;
+      // An Orderly leg: the session's position pushes feed the trader's replay watch (a signed copy of an order can
+      // still run for 300 s), as pair-live does on testnet.
+      const orderlyIndex = trader.legs.findIndex((l) => l.venue === 'orderly');
+      const unpushed = orderlyIndex === -1 || input.orderly?.onPositions === undefined ? () => {} : input.orderly.onPositions((rows) => {
+        const leg = trader.legs[orderlyIndex]!;
+        const mine = rows.filter((r) => r.symbol === leg.symbol);
+        if (mine.length === 0 || !trades()) return;
+        void trader.positionPushed(leg, mine.reduce((sum, r) => sum + r.qty, 0n));
+      });
       snapshot = () => ({
         version: TRADER_STATE_VERSION, savedAt: input.clock.now(), symbol: sym, pair: shape, trader: trader.exportState(),
         pendingMaker: [...(hlLeg?.pendingMakerOrders() ?? [])], inFlight: book.orders, adl: adl.state,
@@ -702,12 +747,16 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       return {
         symbol: sym, shape, pp: pq, adl, trader, carry, why, lines: slotLines, settle,
         live: trades,
-        quiet: () => {
+        quiet: (replacing = true) => {
           const base = trader.legs.map((l) => trader.baseline(l));
           if (base.some((b) => b === null || b === undefined || b !== 0n)) return `the ${sym} legs are not flat (${base.map((b) => (b === null || b === undefined ? 'unknown' : signedQtyString(b))).join(' and ')})`;
           if (pq.closing) return `a close runs on ${sym}`;
           if (book.orders.length > 0) return `${book.orders.length} ${sym} order(s) are in flight with no saved result`;
           if (trader.legs.some((l) => trader.unsettled(l) !== null)) return `a ${sym} order has no answer and may still run`;
+          // Orderly takes a signed copy of an order for 300 s: this pair's trader watches for one until then, and a
+          // pair built in its place would not (only Orderly legs are replayable).
+          const replay = replacing ? trader.legs.find((l) => l.replayable && trader.watching(l)) : undefined;
+          if (replay !== undefined) return `a signed ${replay.venue} ${replay.symbol} order can still be replayed, and this pair's trader watches for it until its window ends`;
           if ((hlLeg?.pendingMakerOrders().length ?? 0) > 0) return `a ${sym} post-only order is not settled`;
           if (pq.adlHold !== null) return `ADL only alerts on ${sym}: ${pq.adlHold}`;
           if (adl.state.event !== null) return `an ADL event on ${sym} is in progress`;
@@ -736,6 +785,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         end: () => {
           ended = true;
           live = false;
+          unpushed();
           pq.stop();
           if (settleTimer !== null) clearTimeout(settleTimer);
           settleTimer = null;
@@ -916,8 +966,10 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       const t = input.clock.now();
       input.publish({ type: 'journal', data: { id: `pair-start-${t.toString(36)}-${failures}`, t, kind, summary, numbers, tx: [] } });
     };
+    // Orderly is a start venue only with GIMBAL_ORDERLY_PAIRS=1 and serve's Orderly session (an Orderly pair's reads).
+    const healthKeys: readonly StartReadVenue[] = orderlyOn && input.orderly !== undefined ? ['hyperliquid', 'phoenix', 'near', 'orderly'] : ['hyperliquid', 'phoenix', 'near'];
     const healthOk = () => {
-      for (const key of ['hyperliquid', 'phoenix', 'near'] as const) input.health?.(key, 'ok', null);
+      for (const key of healthKeys) input.health?.(key, 'ok', null);
     };
     /** The start's result taken: a slot that does not trade lets the lock go (pair-mainnet must be able to fix it). */
     const land = (s: Started): string[] => {
@@ -948,7 +1000,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       const read = err instanceof StartReadError ? err : null;
       // The start's own word on each venue: the one that failed slow or down, the others ok (the risk engine's reads
       // and the scan add theirs).
-      for (const key of ['hyperliquid', 'phoenix', 'near'] as const) {
+      for (const key of healthKeys) {
         const bad = read !== null && read.venue === key && read.status !== null;
         input.health?.(key, bad ? read.status! : 'ok', bad ? why : null);
       }
@@ -1175,6 +1227,10 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
     };
     const hands: PairHands = {
       symbols: common,
+      ...(orderlyOn ? {
+        pairSymbols: (long: VenueId, short: VenueId) => (input.orderly === undefined && (long === 'orderly' || short === 'orderly') ? [] : pairSymbols(policy, long, short)),
+        heldPair: () => (current === null ? null : { long: longLeg(current.shape).venue, short: shortLeg(current.shape).venue }),
+      } : {}),
       blocked,
       canOpen: () => blockedWhy(false) === null,
       heldSymbol,
@@ -1189,6 +1245,13 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
         let paid = false;
         return exclusive(async () => {
           const sym = request.symbol;
+          // A rotate closes the held pair before it opens the next: closing an Orderly leg arms its 300 s replay watch,
+          // and no other pair opens while it runs (quiet), so the rotate would leave the desk flat. Refused here, before
+          // anything is closed: the pair is kept and exits on its own rules.
+          const replayable = orderlyOn && current !== null && heldSymbol() !== null ? current.trader.legs.find((l) => l.replayable) : undefined;
+          if (replayable !== undefined) {
+            return result(false, `the held ${current!.symbol} pair has an Orderly leg (${replayable.symbol}): its close arms the trader's replay watch (Orderly takes a signed copy of an order for up to 300 s), so no other pair could open after it and the rotate would leave the desk flat`);
+          }
           if (policy.unpriced.some((u) => u.symbol === sym)) return result(true, `${sym} is unpriced: no stored price to refresh`);
           const marginS = SERVE_MAKER.timeoutMs / 1000 + PRICE_MARGIN_S;
           const sp = await prices.read(sym);
@@ -1228,7 +1291,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           const holding = heldSymbol();
           if (holding !== null) return result(false, `a ${holding} pair is held: it is closed first (exit or rotate)`);
           if (current !== null && current.adl.state.paused !== null) return result(false, `the pair is paused since an ADL (${current.adl.state.paused}): no new pair opens until the owner reconciles`);
-          const off = current?.quiet() ?? null;
+          const off = current?.quiet(current.symbol !== sym || !sameShape(current.shape, shape)) ?? null;
           if (off !== null) return result(false, `the ${current!.symbol} pair is not settled: ${off}`);
           let slot = current;
           if (slot === null || slot.symbol !== sym || !sameShape(slot.shape, shape)) {
@@ -1544,8 +1607,9 @@ function defaultDeps(p: { input: ServePairInput; hlUrl: string; phoenixUrl: stri
     signing: async () => {
       const cfg = contractEnv(input.env, input.mode, { signing: true });
       if (cfg === null) throw new ConfigError('GIMBAL_TRADE=1 needs GIMBAL_CONTRACT_ID, DESK_ID and the operator key');
-      const transport: NearTransport = new NearApiTransport({ network: cfg.network, accountId: cfg.accountId!, privateKey: cfg.privateKey!, ...(cfg.rpcUrl === undefined ? {} : { rpcUrl: cfg.rpcUrl }) });
-      const client = new NearContractClient({ contractId: cfg.contractId, network: cfg.network, transport, onHealth: (s, d) => input.log(`pair near ${s}: ${d}`) });
+      const transport = (): NearTransport => new NearApiTransport({ network: cfg.network, accountId: cfg.accountId!, privateKey: cfg.privateKey!, ...(cfg.rpcUrl === undefined ? {} : { rpcUrl: cfg.rpcUrl }) });
+      const client = input.operator !== undefined ? await input.operator()
+        : new NearContractClient({ contractId: cfg.contractId, network: cfg.network, transport: transport(), onHealth: (s, d) => input.log(`pair near ${s}: ${d}`) });
       checkContractNetwork(cfg.contractId, await client.config(), cfg.network);
       return { client, relayer: new Relayer({ contract: client, deskId: input.deskId, hyperliquid: new HyperliquidSubmitter({ network: 'mainnet', apiUrl: hlUrl }), solana: r().solana }) };
     },
@@ -1784,6 +1848,8 @@ export async function buildLiveShapeLegs(input: LiveLegsInput, shape: PairShape,
   const ol = shape.legs.find((l) => l.venue === 'orderly');
   if (ol !== undefined) {
     if (orderly === null) throw new Error(`an Orderly leg (${ol.symbol}) needs serve's Orderly session, and serve has none`);
+    const notReady = (await orderly.ready?.(ol.symbol)) ?? null;
+    if (notReady !== null) throw new Error(`the Orderly leg (${ol.symbol}) cannot be made: ${notReady}`);
     orderlyLeg = orderly.leg({ symbol: ol.symbol, oraclePx, maxNotionalUsd, ...(unpriced === undefined ? {} : { maxSz: unpriced.max_sz }), slippageBps: input.slippageBps });
     if (orderlyLeg === null) throw new Error(`the Orderly leg (${ol.symbol}) cannot be made: serve's Orderly session is not up`);
     if (orderlyLeg.venue !== 'orderly') throw new Error(`the Orderly session made a ${orderlyLeg.venue} leg for ${ol.symbol}`);

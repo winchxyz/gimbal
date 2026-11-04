@@ -16,7 +16,10 @@ import type { AccountState } from '../venues/venue.ts';
 import type { WebSocketLike, WsEvent } from '../venues/ws.ts';
 import { freeMarginReader } from './serve-loop.ts';
 import type { KeptStream } from './serve-orderly.ts';
-import { ORDERLY_PAIRS_ENV, OrderlySessionKeeper, SESSION_TIMING, orderlyPairsOn, riskOrderlyNote, serveOrderly } from './serve-orderly.ts';
+import { ORDERLY_PAIRS_ENV, OrderlySessionKeeper, SESSION_TIMING, orderlyPairSide, orderlyPairsOn, riskOrderlyNote, serveOrderly } from './serve-orderly.ts';
+import { LOOP_ACCOUNT_MAX_AGE_MS } from '../readers.ts';
+import { toQty } from '../trade/lots.ts';
+import { noteDeskAct } from '../venues/desk-acts.ts';
 import { ConfigError } from './start-errors.ts';
 
 const NOW = Date.UTC(2026, 10, 4, 1);
@@ -126,6 +129,8 @@ function harness(options: HarnessOptions = {}) {
   const rest: Record<string, unknown> = { ...REST, ...options.rest };
   /** Set to make every REST call hang (a venue that stops answering). */
   const hang = { rest: false };
+  /** Every REST path asked, in order. */
+  const fetched: string[] = [];
   const action = (kind: string, method: string, path: string, timestamp: number): OrderlyRestAction => ({
     desk_id: 'carry', request_id: signed.length, venue: 'orderly', kind,
     payload: { method, path, body: '', timestamp, message: kind === 'ws_auth' ? String(timestamp) : orderlyRestMessage(timestamp, method, path, '') },
@@ -145,6 +150,7 @@ function harness(options: HarnessOptions = {}) {
   const fetchFake = (async (url: string | URL) => {
     if (hang.rest) await new Promise(() => {});
     const path = new URL(String(url)).pathname;
+    fetched.push(path);
     const data = rest[path];
     if (data === undefined) return new Response('{"success":false,"message":"unknown"}', { status: 404 });
     if (typeof data === 'number') return new Response('{"success":false,"message":"server error"}', { status: data });
@@ -162,7 +168,7 @@ function harness(options: HarnessOptions = {}) {
     ...(options.loopDeadlineMs === undefined ? {} : { loopDeadlineMs: options.loopDeadlineMs }),
   })!;
   const source = new AccountsDeskSource({ deskId: 'carry', owner: 'owner.near', contract: 'gimbal.near', accounts: [orderly.riskAccount], readDeadlineMs: 2_000 });
-  return { clock, sockets, signed, logs, orderly, source, rest, hang };
+  return { clock, sockets, signed, logs, orderly, source, rest, hang, fetched };
 }
 
 async function settle(h: ReturnType<typeof harness>): Promise<void> {
@@ -594,4 +600,86 @@ test('keeper: stopped, it signs nothing and the account is unknown', async () =>
   k.keeper.check();
   assert.equal(k.stream.signatures, 0);
   await assert.rejects(k.keeper.state(), /orderly account unknown: the private session is stopped/);
+});
+
+// ---- the loop's free margin and the pair trader's Orderly side (GIMBAL_ORDERLY_PAIRS=1) ----
+
+test('loop free margin: the risk engine\'s last Orderly read is reused (no read of its own) while it is young and no desk act came since', async () => {
+  const h = harness();
+  const futures = () => h.fetched.filter((p) => p === '/v1/public/futures').length;
+  try {
+    h.orderly.keeper.check();
+    await settle(h);
+    // The risk engine reads the account (one futures read); the loop's read a moment later is that answer.
+    const risk = await h.source.read();
+    assert.equal(futures(), 1);
+    h.clock.set(NOW + 3_000);
+    assert.equal((await h.orderly.loopAccount.read()).freeMarginUsd, risk.legs[0]!.account.freeMarginUsd);
+    assert.equal(futures(), 1, 'reused, not read again');
+    // Older than LOOP_ACCOUNT_MAX_AGE_MS: read again.
+    h.clock.set(NOW + LOOP_ACCOUNT_MAX_AGE_MS + 1_000);
+    await h.orderly.loopAccount.read();
+    assert.equal(futures(), 2);
+    // A desk act since that read (an order, a close, a rescue): never reused across it.
+    noteDeskAct();
+    await h.orderly.loopAccount.read();
+    assert.equal(futures(), 3);
+  } finally {
+    h.orderly.stop();
+  }
+});
+
+test('orderlyPairSide: no leg, fill log or readiness before the session is up; then legs on known markets, pushes into the fill log, and nothing before onUp covers a window', async () => {
+  const h = harness();
+  const logs: string[] = [];
+  const side = orderlyPairSide(h.orderly, { log: (l) => logs.push(l), clock: h.clock });
+  const spec = (symbol: string) => ({ symbol, oraclePx: async () => 100, maxNotionalUsd: 20, slippageBps: 50 });
+  const pushed: { symbol: string; qty: bigint }[][] = [];
+  const unpushed = side.onPositions((rows) => pushed.push(rows));
+  try {
+    // Before the session: no leg, no fill log (the book's Orderly reads fail, never "nothing filled"), a plain reason.
+    assert.equal(side.leg(spec('PERP_SOL_USDC')), null);
+    assert.equal(side.fills(), null);
+    assert.match(await side.ready('PERP_SOL_USDC') ?? '', /^serve's Orderly session is not up \(idle/);
+
+    h.orderly.keeper.check();
+    await settle(h);
+    const log = side.fills();
+    assert.ok(log !== null, 'the fill log is made at the first onUp');
+    // Known from onUp on: a window reaching back before it is never covered (a fill then was not heard).
+    assert.match(log.uncovered(NOW - 60_000, NOW + 1_000) ?? '', /the session's fills are known from/);
+    assert.equal(await side.ready('PERP_SOL_USDC'), null);
+    assert.match(await side.ready('PERP_ETH_USDC') ?? '', /^PERP_ETH_USDC is not an active Orderly market the desk can trade/);
+    assert.equal(side.leg(spec('PERP_ETH_USDC')), null);
+    const leg = side.leg(spec('PERP_SOL_USDC'));
+    assert.ok(leg !== null);
+    assert.deepEqual([leg.venue, leg.symbol, leg.replayable, leg.lot], ['orderly', 'PERP_SOL_USDC', true, toQty('0.01')]);
+
+    // An executionreport push reaches the log: the fill's fee is read back once the session was heard past it.
+    const at = NOW + 30_000;
+    h.clock.set(at);
+    h.sockets[0]!.push({
+      topic: 'executionreport', ts: at, data: {
+        symbol: 'PERP_SOL_USDC', clientOrderId: 'g1', orderId: 1, type: 'LIMIT', side: 'BUY', quantity: 0.1, price: 100, tradeId: 7, executedPrice: 100,
+        executedQuantity: 0.1, fee: 0.004, feeAsset: 'USDC', totalExecutedQuantity: 0.1, avgPrice: 100, averageExecutedPrice: 100, status: 'FILLED',
+        reason: '', totalFee: 0.004, timestamp: at, createdTime: at - 4, matchId: 7, seq: 1, marginMode: 'CROSS', maker: false,
+      },
+    });
+    h.clock.set(at + 20_000);
+    h.sockets[0]!.push({ event: 'ping', ts: at + 20_000 });
+    const fee = log.fillFee({ venue: 'orderly', address: ACCOUNT, symbol: 'SOL', side: 'BUY', startedAt: at - 1_000, at: at + 1_000, tx: [] });
+    assert.ok(fee !== null && Math.abs(fee - 0.004) < 1e-12, `fee ${fee}`);
+    // A position push reaches the pair trader's replay watch (ServeOrderly.onPositions).
+    h.sockets[0]!.push({ topic: 'position', ts: at + 20_000, data: { positions: [{ symbol: 'PERP_SOL_USDC', positionQty: 0.1, costPosition: 10, lastSumUnitaryFunding: 10, averageOpenPrice: 100, estLiqPrice: 0, accruedFundingFee: 0 }] } });
+    assert.deepEqual(pushed.at(-1), [{ symbol: 'PERP_SOL_USDC', qty: toQty('0.1') }]);
+
+    // Stopped: nothing more is made or heard.
+    side.stop();
+    assert.equal(side.leg(spec('PERP_SOL_USDC')), null);
+    assert.equal(await side.ready('PERP_SOL_USDC'), 'serve is stopping');
+    assert.ok(!logs.some((l) => /not read/.test(l)), logs.join('\n'));
+  } finally {
+    unpushed();
+    h.orderly.stop();
+  }
 });

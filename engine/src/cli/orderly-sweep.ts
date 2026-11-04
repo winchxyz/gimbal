@@ -254,6 +254,11 @@ export class OrderlySweep {
     }
     report.start = signedQtyString(pos);
     for (let n = 0; n < SWEEP_MAX_ORDERS && pos !== null && pos !== 0n; n++) {
+      // serve stops (its lock goes with it): no order is signed after stop(), one in flight is read back above.
+      if (this.#ended) {
+        notes.push(`Orderly ${leg.symbol}: serve stops, so no further order is sent`);
+        break;
+      }
       const before: bigint = pos;
       const side: LegSide = before > 0n ? 'SELL' : 'BUY';
       const size = await this.#chunk(leg, side, abs(before));

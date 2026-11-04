@@ -23,6 +23,8 @@ import {
 } from './orderly-units.ts';
 import type { WsRequester } from './ws.ts';
 import { WsRequestClient } from './ws.ts';
+import type { DeskActStamp } from './desk-acts.ts';
+import { deskActStamp, stillReusable } from './desk-acts.ts';
 
 // Static market parameters change only with a listing; funding() and account() reuse them this long.
 const INFO_TTL_MS = 10 * 60_000;
@@ -204,6 +206,7 @@ export class OrderlyReader implements VenueReader, FundingHistorySource, MarketH
   #streamId: Promise<string> | null;
   #info: { at: number; value: Promise<OrderlyInfoRow[]> } | null = null;
   #requests = 0;
+  readonly #lastAccount = new Map<string, { at: number; value: OrderlyAccountState; stamp: DeskActStamp }>();
 
   constructor(options: OrderlyReaderOptions = {}) {
     this.network = options.network ?? 'mainnet';
@@ -259,8 +262,26 @@ export class OrderlyReader implements VenueReader, FundingHistorySource, MarketH
     const stream = this.#accountStream;
     if (stream === undefined) throw new Error('orderly account: needs the desk\'s private stream session (accountStream)');
     if (stream.accountId !== accountId) throw new Error(`orderly account: the stream is for ${stream.accountId}, not ${accountId}`);
+    const at = this.#clock.now();
+    const stamp = deskActStamp();
     const [snapshot, futures, info] = await Promise.all([stream.state(), this.#futures(), this.#infoRows(false)]);
-    return parseAccount(snapshot, futures, info, this.#clock.now(), this.#maxStateAgeMs);
+    const value = parseAccount(snapshot, futures, info, this.#clock.now(), this.#maxStateAgeMs);
+    const last = this.#lastAccount.get(accountId);
+    if (last === undefined || at >= last.at) this.#lastAccount.set(accountId, { at, value, stamp });
+    return value;
+  }
+
+  /**
+   * The account as read at most `maxAgeMs` ago by anyone in this process (the risk engine reads it every 5 s), else
+   * read now. For the strategy loop's free margin, so it adds no REST read per decision. Never across the desk's own
+   * act (venues/desk-acts.ts): sizing takes the margin after it.
+   */
+  async accountWithin(address: string, maxAgeMs: number): Promise<OrderlyAccountState> {
+    const accountId = normalizeAccountId(address);
+    const last = this.#lastAccount.get(accountId);
+    const now = this.#clock.now();
+    if (last !== undefined && stillReusable(last.stamp) && now >= last.at && now - last.at <= maxAgeMs) return last.value;
+    return this.account(accountId);
   }
 
   /**

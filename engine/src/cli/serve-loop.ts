@@ -5,14 +5,19 @@
 //
 // The loop decides in every mode (testnet and replay too, with GIMBAL_TRADE=1): with no hands its acts are journaled
 // as refused, nothing is signed. On mainnet it opens and closes through the same code as pair-mainnet open and close
-// (pair-ops.ts), and only the short hyperliquid / long phoenix direction pair-mainnet opens.
+// (pair-ops.ts), and only the short hyperliquid / long phoenix direction pair-mainnet opens. With
+// GIMBAL_ORDERLY_PAIRS=1 (the hands then name the symbols each pair of venues may open on: PairHands.pairSymbols) a
+// window on any two of Hyperliquid, Orderly and Phoenix is traded in the direction it pays, its lots and mid read on
+// its own two venues, and the open names its legs.
 
-import type { ContractPolicy, DeskState, Mode, StrategyConfig, StreamEvent, Window as FundingWindow } from '@gimbal/shared';
+import type { ContractPolicy, DeskState, Mode, StrategyConfig, StreamEvent, VenueId, Window as FundingWindow } from '@gimbal/shared';
 import { isEnterable } from '../scanner/price.ts';
 import type { WindowCarry } from '../scanner/scanner.ts';
 import { withTimeout } from '../scanner/scanner.ts';
 import type { RiskLedgerSink } from '../book/risk-ledger.ts';
 import { LIVE_RESCUE } from '../trade/carry-plan.ts';
+import { PAIR_VENUES, venueSymbol } from '../trade/pair-shape.ts';
+import { orderlyBase } from '../venues/orderly.ts';
 import { userStateDir } from '../trade/trader-state.ts';
 import { kiloBase } from '../venues/base-symbol.ts';
 import { errorMessage } from '../venues/recorder.ts';
@@ -81,6 +86,11 @@ export interface ServeLoopInput {
   grossHours?: (windowId: string, fromMs: number, toMs: number) => { t: number; grossAprPct: number }[] | null;
   /** The position book: every carried-out enter and exit; default none. */
   book?: BookSink;
+  /**
+   * The symbols a pair long `long` / short `short` may open on (GIMBAL_ORDERLY_PAIRS=1); default the pair's hands'
+   * (PairHands.pairSymbols). None: short Hyperliquid / long Phoenix only, on policySymbols.
+   */
+  pairSymbols?: (long: VenueId, short: VenueId) => readonly string[];
   /** Tests: stand-ins for the hands and decide(). */
   hands?: LoopHands | null;
   decide?: (input: DecideInput) => Decision;
@@ -134,8 +144,10 @@ export function serveLoop(input: ServeLoopInput): StrategyLoop {
     : input.pair.notTrading() ?? 'the pair is alert only';
   const dir = input.stateDir ?? userStateDir(input.env);
   const store = new LoopStore(loopStateFile(dir, input.mode, input.contractId, input.deskId));
+  const pairs = input.pairSymbols ?? (pairHands?.pairSymbols === undefined ? undefined : pairHands.pairSymbols.bind(pairHands));
   const facts = input.carry === undefined ? undefined : windowFacts({
     carry: input.carry, venues: input.venues ?? [], symbols: () => policySymbols(input.policy()), clock: input.clock, log: input.log,
+    ...(pairs === undefined ? {} : { pairs }),
   });
   return new StrategyLoop({
     trade, hands, ...(handsWhy === undefined ? {} : { handsWhy }),
@@ -308,12 +320,17 @@ export function loopHands(
       // One leg: one venue holds a position and the other is known flat (an unknown leg is not called flat).
       const oneLeg = open.length === 1 && open[0]!.qty !== null && known.length === 2 && known.every((l) => l.qty !== null)
         ? { venue: open[0]!.venue, qty: signedQtyString(open[0]!.qty!) } : null;
-      return { symbol, legUsd, pnlUsd, oneLeg, ...(legs.length === 0 ? {} : { freedMarginUsd: freed }) };
+      // GIMBAL_ORDERLY_PAIRS=1: the legs the trader has, the default pair included (the loop matches its record on them).
+      const pair = hands.heldPair?.() ?? null;
+      const venues = pair === null ? {} : { long: pair.long, short: pair.short };
+      return { symbol, legUsd, pnlUsd, oneLeg, ...(legs.length === 0 ? {} : { freedMarginUsd: freed }), ...venues };
     },
-    symbolOf: (w) => windowSymbol(w, hands.symbols),
+    symbolOf: (w) => windowSymbol(w, hands.symbols, hands.pairSymbols?.bind(hands)),
     open: async (r) => {
+      // GIMBAL_ORDERLY_PAIRS=1: the legs the window pays (without it the hands open short Hyperliquid / long Phoenix).
+      const legs = hands.pairSymbols === undefined ? {} : { long: r.window.longVenue as VenueId, short: r.window.shortVenue as VenueId };
       const h = await hands.open({
-        symbol: r.symbol, legUsd: r.legUsd, leverage: r.leverage, reason: r.reason, qty: r.qty, gate, ...(r.noRefresh === undefined ? {} : { noRefresh: r.noRefresh }),
+        symbol: r.symbol, ...legs, legUsd: r.legUsd, leverage: r.leverage, reason: r.reason, qty: r.qty, gate, ...(r.noRefresh === undefined ? {} : { noRefresh: r.noRefresh }),
       });
       // What filled, not what was asked (a later part the gate stopped holds nothing): the journal and the held size.
       return { ...outcome(h), filledQty: openedQty(h.results) };
@@ -324,20 +341,47 @@ export function loopHands(
   };
 }
 
-/** A desk leg's symbol and a policy symbol name the same market (kPEPE and PEPE, case aside). */
+/**
+ * A desk leg's symbol and a policy symbol name the same market: the same name case aside, or the same base and
+ * multiplier (an Orderly leg's PERP_SOL_USDC and SOL, its PERP_1000PEPE_USDC and kPEPE; kPEPE and PEPE are not).
+ */
 function sameSymbol(a: string, b: string): boolean {
-  const n = (s: string) => kiloBase(s).base.toUpperCase();
+  const n = (s: string) => {
+    const k = s.startsWith('PERP_') ? orderlyBase(s) : kiloBase(s);
+    return `${k.multiplier === 1 ? '' : 'k'}${k.base.toUpperCase()}`;
+  };
   return a.toUpperCase() === b.toUpperCase() || n(a) === n(b);
 }
 
-/** The policy symbol (a Hyperliquid asset Phoenix also lists) a window trades here, or why serve cannot trade it. */
-export function windowSymbol(w: FundingWindow, symbols: readonly string[]): { symbol: string } | { refused: string } {
-  if (w.longVenue !== 'phoenix' || w.shortVenue !== 'hyperliquid') {
-    return { refused: `serve opens short hyperliquid, long phoenix only (as pair-mainnet open); ${w.id} is long ${w.longVenue}, short ${w.shortVenue}` };
+/** A venue a pair can have a leg on (Hyperliquid, Orderly, Phoenix). */
+function isPairVenue(v: string): v is VenueId {
+  return (PAIR_VENUES as readonly string[]).includes(v);
+}
+
+/**
+ * The policy symbol a window trades here, or why serve cannot trade it. Without `pairs`: short Hyperliquid / long
+ * Phoenix only, on `symbols` (a Hyperliquid asset Phoenix also lists). With `pairs` (GIMBAL_ORDERLY_PAIRS=1): any two
+ * of Hyperliquid, Orderly and Phoenix, in the window's direction, on a symbol both its venues list.
+ */
+export function windowSymbol(
+  w: FundingWindow, symbols: readonly string[], pairs?: (long: VenueId, short: VenueId) => readonly string[],
+): { symbol: string } | { refused: string } {
+  let list = symbols;
+  let legs = '';
+  if (pairs === undefined) {
+    if (w.longVenue !== 'phoenix' || w.shortVenue !== 'hyperliquid') {
+      return { refused: `serve opens short hyperliquid, long phoenix only (as pair-mainnet open); ${w.id} is long ${w.longVenue}, short ${w.shortVenue}` };
+    }
+  } else {
+    if (w.longVenue === w.shortVenue || !isPairVenue(w.longVenue) || !isPairVenue(w.shortVenue)) {
+      return { refused: `serve opens a pair on two of ${PAIR_VENUES.join(', ')}; ${w.id} is long ${w.longVenue}, short ${w.shortVenue}` };
+    }
+    list = pairs(w.longVenue, w.shortVenue);
+    if (w.longVenue !== 'phoenix' || w.shortVenue !== 'hyperliquid') legs = ` (long ${w.longVenue}, short ${w.shortVenue})`;
   }
   const base = w.symbol.toUpperCase();
-  const symbol = symbols.find((s) => s.toUpperCase() === base || kiloBase(s).base.toUpperCase() === base);
-  return symbol === undefined ? { refused: `${w.symbol} is not a market both legs list in the desk's policy (${symbols.join(', ') || 'none'})` } : { symbol };
+  const symbol = list.find((s) => s.toUpperCase() === base || kiloBase(s).base.toUpperCase() === base);
+  return symbol === undefined ? { refused: `${w.symbol} is not a market both legs${legs} list in the desk's policy (${list.join(', ') || 'none'})` } : { symbol };
 }
 
 /**
@@ -349,6 +393,8 @@ export function windowSymbol(w: FundingWindow, symbols: readonly string[]): { sy
 export function windowFacts(p: {
   carry: (windowId: string) => WindowCarry | null; venues: readonly VenueReader[]; symbols: () => readonly string[]; clock: Clock;
   log: (line: string) => void;
+  /** GIMBAL_ORDERLY_PAIRS=1: windowSymbol's pairs (any two venues; lots and mid on the window's own two). */
+  pairs?: (long: VenueId, short: VenueId) => readonly string[];
 }): (windows: readonly FundingWindow[]) => Promise<WindowFacts> {
   const markets = new Map<string, { at: number; bySymbol: Map<string, Market> }>();
   const mids = new Map<string, { at: number; px: number | null }>();
@@ -368,23 +414,26 @@ export function windowFacts(p: {
       return cached?.bySymbol ?? null;
     }
   };
-  const midOf = async (symbol: string): Promise<number | null> => {
+  /** The mean of both venues' best bid and ask; `venues` in PAIR_VENUES order (Hyperliquid and Phoenix by default). */
+  const midOf = async (symbol: string, venues: readonly [VenueId, VenueId] = ['hyperliquid', 'phoenix']): Promise<number | null> => {
     const now = p.clock.now();
-    const cached = mids.get(symbol);
+    const plain = venues[0] === 'hyperliquid' && venues[1] === 'phoenix';
+    const key = plain ? symbol : `${symbol}|${venues.join('|')}`;
+    const cached = mids.get(key);
     if (cached !== undefined && now - cached.at < MID_TTL_MS) return cached.px;
-    const hl = reader('hyperliquid');
-    const px = reader('phoenix');
+    const ra = reader(venues[0]);
+    const rb = reader(venues[1]);
     let mid: number | null = null;
-    if (hl !== undefined && px !== undefined) {
+    if (ra !== undefined && rb !== undefined) {
       try {
-        const [a, b] = await Promise.all([hl.book(symbol, 5), px.book(symbol, 5)]);
+        const [a, b] = await Promise.all([ra.book(venueSymbol(venues[0], symbol), 5), rb.book(venueSymbol(venues[1], symbol), 5)]);
         const quotes = [a.bids[0]?.px, a.asks[0]?.px, b.bids[0]?.px, b.asks[0]?.px];
         if (quotes.every((q) => q !== undefined && q > 0)) mid = (quotes as number[]).reduce((s, q) => s + q, 0) / 4;
       } catch (err) {
-        p.log(`strategy loop: ${symbol} books not read (${errorMessage(err)}), no lots this check`);
+        p.log(`strategy loop: ${symbol}${plain ? '' : ` (${venues.join(', ')})`} books not read (${errorMessage(err)}), no lots this check`);
       }
     }
-    mids.set(symbol, { at: now, px: mid });
+    mids.set(key, { at: now, px: mid });
     return mid;
   };
   return async (windows) => {
@@ -400,17 +449,23 @@ export function windowFacts(p: {
     const symbols = p.symbols();
     const candidates = windows
       .filter((w) => isEnterable(w))
-      .map((w) => ({ w, s: windowSymbol(w, symbols) }))
+      .map((w) => ({ w, s: windowSymbol(w, symbols, p.pairs) }))
       .filter((x): x is { w: FundingWindow; s: { symbol: string } } => 'symbol' in x.s)
       .sort((a, b) => b.w.netAprPct - a.w.netAprPct)
       .slice(0, MAX_LOT_WINDOWS);
     if (candidates.length > 0) {
-      const [hlM, pxM] = await Promise.all([marketsOf('hyperliquid'), marketsOf('phoenix')]);
+      // Each window's own two venues (Hyperliquid and Phoenix only, without Orderly pairs), read once each.
+      const need = PAIR_VENUES.filter((v) => candidates.some(({ w }) => w.longVenue === v || w.shortVenue === v));
+      const read = await Promise.all(need.map((v) => marketsOf(v)));
+      const byVenue = new Map(need.map((v, i) => [v, read[i]] as const));
       for (const { w, s } of candidates) {
-        const short = hlM?.get(s.symbol);
-        const long = pxM?.get(s.symbol);
+        const sv = w.shortVenue as VenueId;
+        const lv = w.longVenue as VenueId;
+        const short = byVenue.get(sv)?.get(venueSymbol(sv, s.symbol));
+        const long = byVenue.get(lv)?.get(venueSymbol(lv, s.symbol));
         if (short === undefined || long === undefined) continue;
-        const px = await midOf(s.symbol);
+        const venues = PAIR_VENUES.filter((v) => v === w.longVenue || v === w.shortVenue) as unknown as [VenueId, VenueId];
+        const px = await midOf(s.symbol, venues);
         if (px === null) continue;
         lots[w.id] = { longLot: long.lotSize, shortLot: short.lotSize, px };
       }
@@ -522,7 +577,7 @@ export function loopBook(book: LoopBookPort, publish: (event: StreamEvent) => vo
     try {
       const id = book.adopt({
         windowId: held.windowId, symbol: held.symbol, since: held.since, legUsd: held.legUsd, forecastNetAprPct: held.entryNetAprPct,
-        legs: [{ venue: 'hyperliquid', side: 'short' }, { venue: 'phoenix', side: 'long' }], by: 'manual',
+        legs: [{ venue: held.short ?? 'hyperliquid', side: 'short' }, { venue: held.long ?? 'phoenix', side: 'long' }], by: 'manual',
       });
       // A position the book closed after `since` (a protection's close the loop has not seen yet) is not adopted again.
       if (book.openWindow() === held.windowId) log(`book: holds ${held.symbol} as ${id} (adopted from the strategy loop, from ${new Date(held.since).toISOString()})`);
@@ -563,7 +618,8 @@ export function loopBook(book: LoopBookPort, publish: (event: StreamEvent) => vo
           try {
             const flat = r.legs.every((l) => l.final !== null && toQty(l.final) === 0n);
             book.recordOutside({
-              reason: c.by, by, startedAt: c.startedAt, at: c.at, fills: fillsOf([r]), feeUsd: r.feeUsd, tx: r.tx, flat, symbol: r.legs[0].symbol,
+              // The book names the pair by the first leg's market, or by the pair's symbol when that is Orderly's PERP_X_USDC.
+              reason: c.by, by, startedAt: c.startedAt, at: c.at, fills: fillsOf([r]), feeUsd: r.feeUsd, tx: r.tx, flat, symbol: r.legs[0].venue === 'orderly' ? c.symbol : r.legs[0].symbol,
             });
           } catch (err) {
             log(`book: the ${c.by} close was not booked (${errorMessage(err)}); the next sync reads its fills from the venues`);
