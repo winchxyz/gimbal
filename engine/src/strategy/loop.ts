@@ -67,9 +67,12 @@ export const HOUR_GRACE_MS = 60_000;
 export const VERDICT_SHOWN_MS = HOUR_MS;
 /** An act refused before anything was sent is not tried again for the same target before this. */
 export const RETRY_AFTER_MS = 15 * 60_000;
-/** A single leg's close that failed is tried again after this, doubling on each failure up to ONE_LEG_RETRY_MAX_MS. */
+/**
+ * A single leg's close that failed is tried again after this, doubling on each failure that sent orders up to
+ * ONE_LEG_RETRY_MAX_MS; one refused before anything was signed is tried again after this, undoubled.
+ */
 export const ONE_LEG_RETRY_MS = 5_000;
-export const ONE_LEG_RETRY_MAX_MS = 10 * 60_000;
+export const ONE_LEG_RETRY_MAX_MS = 2 * 60_000;
 /**
  * An enter or rotate refused after the open paid for a refresh_prices (refreshForOpen) is not tried again for its
  * window before this: each try would pay again (a fresh price lives 5 minutes, a retry comes after 15).
@@ -1125,9 +1128,10 @@ export class StrategyLoop {
 
   /**
    * One venue holds a position, the other none: closed at once, reduce-only, tried on the checks until flat. A close
-   * that fails is tried again after ONE_LEG_RETRY_MS, doubling up to ONE_LEG_RETRY_MAX_MS (each try signs NEAR calls,
-   * whose gas a refusal that repeats every check could make larger than the leg); a close that ends flat, or another
-   * leg or size, starts over. Each wait is journaled once, with its length.
+   * that fails is tried again after ONE_LEG_RETRY_MS, doubling up to ONE_LEG_RETRY_MAX_MS while its tries send orders
+   * (each signs NEAR calls, whose gas a refusal that repeats every check could make larger than the leg); one refused
+   * before anything was signed waits ONE_LEG_RETRY_MS. A close that ends flat, or another leg or size, starts over.
+   * Each wait is journaled once, with its length.
    */
   async #closeOneLeg(leg: { venue: string; qty: string }, now: number): Promise<void> {
     const line = `one leg open: ${leg.venue} ${leg.qty}`;
@@ -1152,7 +1156,9 @@ export class StrategyLoop {
     this.#owner(r.open);
     if (!r.ok) {
       this.#record('fill', { windowId: this.#state.held?.windowId ?? `${leg.venue} leg`, symbol: this.#state.held?.symbol ?? '', outcome: r, forecastNetAprPct: null, exitReason: r.reason, rotation: null, manual: false, startedAt: closeAt });
-      const ms = retry === null ? ONE_LEG_RETRY_MS : Math.min(retry.ms * 2, ONE_LEG_RETRY_MAX_MS);
+      // Only a close that signed something backs off: one refused before signing (a price refresh or an RPC that
+      // failed, alert only) costs no gas, and the leg must not sit naked longer once its cause clears.
+      const ms = retry === null || !r.sent ? ONE_LEG_RETRY_MS : Math.min(retry.ms * 2, ONE_LEG_RETRY_MAX_MS);
       this.#oneLegRetry = { key: line, at: this.#o.clock.now() + ms, ms };
       say('error', `${line}: the close did not end flat: ${r.reason}; tried again in ${waitText(ms)}`, { venue: leg.venue, qty: leg.qty, feeUsd: r.feeUsd, retryMs: ms }, r.tx);
       return;

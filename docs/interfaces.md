@@ -1082,8 +1082,9 @@ anywhere the policy does not allow.
   each enter, rotate and refusal with the risk check's why line, books every check in the risk check ledger (a ledger
   that fails is logged, never the act's), and saves `LoopCounters` next to the trader state. `POST /rotate` and `POST /close` go through the same path.
   A single leg (one venue holds a position, the other is known flat) is closed reduce-only before anything is decided;
-  a close of it that fails is tried again after 5 s, doubling up to 10 min (each try signs NEAR calls), journaled once
-  per wait with its length ("tried again in 20 s"); a close that ends flat, or another leg or size, starts over at once.
+  a close of it that fails after sending orders is tried again after 5 s, doubling up to 2 min (each try signs NEAR
+  calls); one refused before anything was signed is tried again after 5 s; each wait is journaled once,
+  with its length ("tried again in 20 s"); a close that ends flat, or another leg or size, starts over at once.
 
 **Position book** (`engine/src/book/`, serve with a contract desk). Every carried-out enter and exit comes in through
 the loop's `book` sink (`BookRecord`, with `startedAt`: when the act began), and so do the fills of an open or close

@@ -848,7 +848,8 @@ test('one leg is never held: closed reduce-only at once (auto off too), retried 
   w.now += 60_000;
   await loop.check();
   assert.equal(w.closes.length, 2, 'retried: its 5 s wait is over');
-  assert.match(journal(w).at(-1)!.summary, /; tried again in 10 s$/);
+  // Nothing was signed (sent false): no backoff, the same 5 s, the same line not journaled again.
+  assert.equal(journal(w).filter((j) => j.kind === 'error').length, 1);
   w.closeAnswer = () => OK('closed, flat');
   w.now += 60_000;
   await loop.check();
@@ -857,23 +858,38 @@ test('one leg is never held: closed reduce-only at once (auto off too), retried 
   assert.equal(loop.counters.lastExitAt, w.now);
 });
 
-test('a one-leg close that keeps failing backs off: 5 s doubling to 10 min, one journal line per step; flat or another leg starts over', async () => {
+test('a one-leg close that keeps failing with orders sent backs off: 5 s doubling to 2 min, one journal line per step; unsent refusals stay at 5 s; flat or another leg starts over', async () => {
   const w = world({ strategy: { ...DEFAULT_STRATEGY, auto: false }, held: { symbol: 'SOL', legUsd: 250, pnlUsd: 0, oneLeg: { venue: 'orderly', qty: '2.5' } } });
   w.closeAnswer = () => ({ ok: false, reason: 'Orderly refused the reduce-only order', sent: true, tx: [], feeUsd: 0, open: [] });
   const loop = makeLoop(w);
   // A check every second (the scan): the close goes out only when its wait is over.
   const at: number[] = [];
-  for (let s = 0; s <= 1_300; s++) {
+  for (let s = 0; s <= 400; s++) {
     const before = w.closes.length;
     await loop.check();
     if (w.closes.length > before) at.push((w.now - T0) / 1000);
     w.now += 1_000;
   }
-  // 0, then +5, +10, +20, +40, +80, +160, +320, +600 (the cap), +600.
-  assert.deepEqual(at, [0, 5, 15, 35, 75, 155, 315, 635, 1235]);
+  // 0, then +5, +10, +20, +40, +80, +120 (the cap), +120.
+  assert.deepEqual(at, [0, 5, 15, 35, 75, 155, 275, 395]);
   const lines = journal(w).filter((j) => j.kind === 'error').map((j) => j.summary.replace(/^.*; tried again in /, ''));
-  assert.deepEqual(lines, ['5 s', '10 s', '20 s', '40 s', '1 min 20 s', '2 min 40 s', '5 min 20 s', '10 min'], 'one line per step; the cap repeats nothing');
-  assert.equal(journal(w).filter((j) => j.kind === 'error').at(-1)!.numbers['retryMs'], 600_000);
+  assert.deepEqual(lines, ['5 s', '10 s', '20 s', '40 s', '1 min 20 s', '2 min'], 'one line per step; the cap repeats nothing');
+  assert.equal(journal(w).filter((j) => j.kind === 'error').at(-1)!.numbers['retryMs'], 120_000);
+
+  // Refused before anything was signed (a refresh or an RPC outage): tried every 5 s, never backed off, so the leg is
+  // closed within 5 s of the cause clearing.
+  const u = world({ strategy: { ...DEFAULT_STRATEGY, auto: false }, held: { symbol: 'SOL', legUsd: 250, pnlUsd: 0, oneLeg: { venue: 'orderly', qty: '2.5' } } });
+  u.closeAnswer = () => REFUSED('the stored SOL price could not be refreshed');
+  const unsent = makeLoop(u);
+  const uat: number[] = [];
+  for (let s = 0; s <= 30; s++) {
+    const before = u.closes.length;
+    await unsent.check();
+    if (u.closes.length > before) uat.push((u.now - T0) / 1000);
+    u.now += 1_000;
+  }
+  assert.deepEqual(uat, [0, 5, 10, 15, 20, 25, 30]);
+  assert.equal(journal(u).filter((j) => j.kind === 'error').length, 1, 'the same 5 s line once');
   assert.match(decisions(w).at(-1)!.reason, /^one leg open: orderly 2\.5: closing it, reduce-only; the last close failed, next try at /);
 
   // Another size is a new state: it starts over at 5 s.

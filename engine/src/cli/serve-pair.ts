@@ -1196,7 +1196,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       if (replayable === undefined) return null;
       return `the held ${current!.symbol} pair has an Orderly leg (${replayable.symbol}): its close arms the trader's replay watch (Orderly takes a signed copy of an order for up to 300 s), so no other pair could open after it and the rotate would leave the desk flat`;
     };
-    const result =(ok: boolean, reason: string, extra: Partial<HandsResult> = {}): HandsResult => ({
+    const result = (ok: boolean, reason: string, extra: Partial<HandsResult> = {}): HandsResult => ({
       ok, reason, results: [], lines: [], open: [], tx: [], feeUsd: 0, ...extra,
     });
     const collect = () => {
