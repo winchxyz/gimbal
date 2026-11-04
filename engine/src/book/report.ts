@@ -27,6 +27,14 @@ function legLine(l: LegResult, open: boolean): string {
 }
 
 function fundingPart(l: LegResult): string {
+  // A venue paying once per funding period: its payments against the funding times of its period inside the hold.
+  const per = l.periodic;
+  if (per !== undefined) {
+    if (!per.read) return `${l.venue} ${signed(l.fundingUsd)} (not read)`;
+    const missing = per.due - l.payments;
+    return `${l.venue} ${signed(l.fundingUsd)} (${l.payments} of ${per.due} payment(s) of its ${per.periodHours} h funding period in ${l.hours} h`
+      + `${missing > 0 ? `, ${missing} with no payment booked` : ''})`;
+  }
   const missing = l.hours - l.paidHours;
   const estimated = l.estimatedHours > 0 ? `, ${l.estimatedHours} h ${signed(l.estimatedUsd)} estimated from daily aggregates` : '';
   return `${l.venue} ${signed(l.fundingUsd)} (${l.paidHours} of ${l.hours} h paid${missing > 0 ? `, ${missing} h with no payment booked` : ''}${estimated})`;

@@ -155,6 +155,75 @@ test('orderly: an IOC confirmed by its executionreport, even one pushed before t
   assert.equal(s.leg.reportsFor('77').length, 2);
 });
 
+/** An executionreport in the shape a testnet push of 2026-10-27 had (every field it carried), with a fill. */
+const pushed = (status: string, fill: { qty: number; px: number; fee: number; total: number; totalFee: number; tradeId: number }, extra: Record<string, unknown> = {}) => ({
+  symbol: 'PERP_ETH_USDC', clientOrderId: 'g12', orderId: 77, type: 'LIMIT', side: 'SELL', quantity: 0.005, price: 2487.5,
+  tradeId: fill.tradeId, executedPrice: fill.px, executedQuantity: fill.qty, fee: fill.fee, feeAsset: 'USDC', totalExecutedQuantity: fill.total,
+  avgPrice: 2499.5, averageExecutedPrice: 2499.5, status, reason: '', totalFee: fill.totalFee, visible: 0.005, visibleQuantity: 0.005,
+  timestamp: 1_793_060_012_806, createdTime: 1_793_060_012_802, matchId: 0, seq: 1, marginMode: 'CROSS', maker: false, ...extra,
+});
+
+test('orderly: fills and final report disagreeing on the fee: the fills\' sum is booked and the disagreement logged once', async () => {
+  const s = orderlyLeg({
+    reports: (leg) => {
+      leg.onExecutionReport(pushed('PARTIAL_FILLED', { qty: 0.002, px: 2499, fee: 0.002, total: 0.002, totalFee: 0.002, tradeId: 501 }));
+      leg.onExecutionReport(pushed('FILLED', { qty: 0.003, px: 2500, fee: 0.003, total: 0.005, totalFee: 0.006, tradeId: 502 }));
+    },
+  });
+  const out = await s.leg.order('SELL', q('0.005'), false, 'open');
+  assert.ok(out.kind === 'filled' && Math.abs(out.fee! - 0.005) < 1e-12);
+  const notes = s.lines.filter((l) => /totalFee/.test(l));
+  assert.equal(notes.length, 1);
+  assert.match(notes[0]!, /^orderly order 77: the fills' fees add up to 0\.005\d*, its final report says totalFee 0\.006; booked 0\.005\d* \(said once\)$/);
+
+  // Orderly's rounding (1e-6 USDC) apart is agreement: nothing logged.
+  const rounded = orderlyLeg({
+    reports: (leg) => {
+      leg.onExecutionReport(pushed('PARTIAL_FILLED', { qty: 0.002, px: 2499, fee: 0.001999, total: 0.002, totalFee: 0.001999, tradeId: 501 }));
+      leg.onExecutionReport(pushed('FILLED', { qty: 0.003, px: 2500, fee: 0.003, total: 0.005, totalFee: 0.005, tradeId: 502 }));
+    },
+  });
+  await rounded.leg.order('SELL', q('0.005'), false, 'open');
+  assert.equal(rounded.lines.filter((l) => /totalFee/.test(l)).length, 0);
+
+  // A fill report the leg never saw (the reports seen add up to less than the order executed): the final totalFee.
+  const missed = await orderlyLeg({
+    reports: (leg) => leg.onExecutionReport(pushed('FILLED', { qty: 0.003, px: 2500, fee: 0.003, total: 0.005, totalFee: 0.005, tradeId: 502 })),
+  }).leg.order('SELL', q('0.005'), false, 'open');
+  assert.equal(missed.kind === 'filled' && missed.fee, 0.005);
+});
+
+test('orderly: a fill books the fee Orderly reported (the fills\' fee, else totalFee of the final report); not USDC or absent is unknown', async () => {
+  // Two executions of one IOC at the 4 bps taker fee: 0.002 x 2499 x 0.0004 and 0.003 x 2500 x 0.0004.
+  const two = orderlyLeg({
+    reports: (leg) => {
+      leg.onExecutionReport(pushed('PARTIAL_FILLED', { qty: 0.002, px: 2499, fee: 0.0019992, total: 0.002, totalFee: 0.0019992, tradeId: 501 }));
+      leg.onExecutionReport(pushed('FILLED', { qty: 0.003, px: 2500, fee: 0.003, total: 0.005, totalFee: 0.0049992, tradeId: 502 }));
+    },
+  });
+  const twoOut = await two.leg.order('SELL', q('0.005'), false, 'open');
+  assert.ok(twoOut.kind === 'filled' && Math.abs(twoOut.fee! - 0.0049992) < 1e-12);
+  assert.equal(two.lines.filter((l) => /totalFee/.test(l)).length, 0, 'they agree: nothing logged');
+
+  // A final report without totalFee: the fill reports' fee summed.
+  const summed = await orderlyLeg({
+    reports: (leg) => {
+      leg.onExecutionReport(pushed('PARTIAL_FILLED', { qty: 0.002, px: 2499, fee: 0.002, total: 0.002, totalFee: 0.002, tradeId: 501 }, { totalFee: undefined }));
+      leg.onExecutionReport(pushed('FILLED', { qty: 0.003, px: 2500, fee: 0.003, total: 0.005, totalFee: 0, tradeId: 502 }, { totalFee: undefined }));
+    },
+  }).leg.order('SELL', q('0.005'), false, 'open');
+  assert.ok(summed.kind === 'filled' && Math.abs(summed.fee! - 0.005) < 1e-12);
+
+  // A fee in another asset, or none at all: unknown (null), never 0.
+  const other = await orderlyLeg({
+    reports: (leg) => leg.onExecutionReport(pushed('FILLED', { qty: 0.005, px: 2500, fee: 0.005, total: 0.005, totalFee: 0.005, tradeId: 503 }, { feeAsset: 'ORDER' })),
+  }).leg.order('SELL', q('0.005'), false, 'open');
+  assert.equal(other.kind === 'filled' && other.fee, null);
+  const none = await orderlyLeg({ reports: (leg) => leg.onExecutionReport(report('FILLED', { executedQuantity: 0.005, totalExecutedQuantity: 0.005 })) })
+    .leg.order('SELL', q('0.005'), false, 'open');
+  assert.equal(none.kind === 'filled' && none.fee, null);
+});
+
 test('orderly: prices sit past the best by the slippage, on the tick, and never inside the best', async () => {
   const s = orderlyLeg({ reports: (leg) => leg.onExecutionReport(report('FILLED', { side: 'BUY', executedQuantity: 0.005, totalExecutedQuantity: 0.005 })) });
   await s.leg.order('BUY', q('0.005'), true, 'close');

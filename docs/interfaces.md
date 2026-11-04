@@ -1101,8 +1101,21 @@ payment stored once (venue, time, symbol; a Phoenix hour whose sum changes later
 and counted only on its position's symbol between the act's start (`startedAt`, else the record less 10 min; never
 before the previous exit there) and its exit, on the leg side its signed size matches. A Hyperliquid daily aggregate
 counts only the hours of its day no hourly row covers; its split per hour is not verified, so its amount is marked
-estimated (`estimated` 1 in the funding entry and the final one, "estimated from daily aggregates" in the report). Fill fees come from the record, else the venue's fills in the
-act's window (`userFillsByTime`, Phoenix trades-history); margin-move fees and `addTransfer()` (rescue, fund scripts)
+estimated (`estimated` 1 in the funding entry and the final one, "estimated from daily aggregates" in the report).
+Orderly (only when serve hands `liveBookSources` its `orderly` reads; the book's `orderly` address is the account id):
+funding from the signed `funding_fee_history` read (made only when a funding time on the 4 h UTC grid, plus 1 h to
+post, fell after the last read), booked under the book's symbol ("PERP_SOL_USDC" as SOL, 1000X as kX); one row per
+funding period (8 h or 4 h), exact, never estimated; owed only on its funding times (each payment interval on that
+payment's period, else 8 h): missing there, nothing between (journal "its 8 h funding period"; report "N of M
+payment(s)", "not read" for a leg never read). Its fills come from the private session's executionreports
+(`OrderlyFillLog`, `book/orderly.ts`: the fills' `fee`, else `totalFee`, in USDC, > 0 a cost; fed `onExecutionReport`,
+`heard` per frame, `down` / `up`; fills and gaps kept 48 h); a window it did not hear (before the session started,
+reaching back to something it dropped, while down, or not heard 10 s past its end; a read up to now waits up to 30 s
+for that, once per silence) is a failed read, and an Orderly leg without the log fails its fill reads. Known limit: a
+position opened before serve's last restart starts its close window before the new session, so an Orderly close of it
+made outside the loop is booked after 24 h as "fills unread" (price and close fees estimated); the contract has no
+fills read kind that could recover it. Fill fees come from the record, else the venue's fills in the
+act's window (`userFillsByTime`, Phoenix trades-history, the Orderly fill log); margin-move fees and `addTransfer()` (rescue, fund scripts)
 are transfer costs; the desk's Hyperliquid `userNonFundingLedgerUpdates` are booked to the desk, not a position; a tx
 hash already booked is never counted twice. Per position: funding per leg and in total, fees and price over every fill
 (price: each fill's cash flow, once closed), transfers, net, hours held, and the actual APR next to the forecast net

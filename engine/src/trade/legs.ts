@@ -39,7 +39,8 @@ export const HL_EXPIRY_MARGIN_MS = 10_000;
 export const HL_NONCE_WINDOW_MS = 2 * 86_400_000;
 
 /** What one order did, as far as the venue's answer proves it. */
-// `fee`: what the venue charged for the fill, USD (Hyperliquid userFills `fee`, Phoenix trades-history `fees`); null
+// `fee`: what the venue charged for the fill, USD (Hyperliquid userFills `fee`, Phoenix trades-history `fees`, Orderly
+// executionreport `fee` / `totalFee`); null
 // or absent when the venue's answer did not say. `parts`: a maker order is several orders (post-only limits, then an
 // IOC); the outcome sums them, and each part is its own order record.
 export type LegOutcome =
@@ -605,21 +606,61 @@ export interface OrderlyReport {
   executedQuantity: number;      // this report's fill (0 on a status change without a fill)
   totalExecutedQuantity: number | null;
   avgPrice: number | null;
+  /**
+   * What Orderly charged, USD: `fee` for this report's execution, `totalFee` for the order so far (> 0 a cost, < 0 a
+   * maker rebate, as Orderly's fee rates are signed). Null when absent, or when `feeAsset` is not USDC.
+   */
+  fee: number | null;
+  totalFee: number | null;
+  executedPrice: number | null;  // this report's fill price (0 on a report without a fill)
+  tradeId: string | null;        // this report's fill ("0" on a report without a fill)
+  time: number | null;           // the venue's event time (`timestamp`), ms
   receivedAt: number;            // local ms
 }
 
 const TERMINAL = new Set(['FILLED', 'CANCELLED', 'REJECTED', 'EXPIRED']);
 
+// Field names as Orderly's private executionreport sends them (a testnet push of 2026-10-27 carried fee 0, feeAsset
+// "USDC", totalFee 0, executedPrice, tradeId, timestamp; Orderly's docs list the same names).
 export function parseOrderlyReport(r: Record<string, unknown>, receivedAt: number): OrderlyReport | null {
   const orderId = r.orderId ?? r.order_id;
   if (typeof r.symbol !== 'string' || (typeof orderId !== 'number' && typeof orderId !== 'string') || typeof r.status !== 'string') return null;
   const side = r.side === 'BUY' || r.side === 'SELL' ? r.side : null;
   const clientOrderId = r.clientOrderId ?? r.client_order_id;
+  const usdFee = r.feeAsset === undefined || r.feeAsset === 'USDC';
+  const tradeId = r.tradeId;
+  const time = streamNumber(r.timestamp);
   return {
     symbol: r.symbol, orderId: String(orderId), clientOrderId: typeof clientOrderId === 'string' && clientOrderId !== '' ? clientOrderId : null, side,
     status: r.status, executedQuantity: streamNumber(r.executedQuantity) ?? 0, totalExecutedQuantity: streamNumber(r.totalExecutedQuantity) ?? null,
-    avgPrice: streamNumber(r.avgPrice) ?? null, receivedAt,
+    avgPrice: streamNumber(r.avgPrice) ?? null,
+    fee: usdFee ? streamNumber(r.fee) ?? null : null, totalFee: usdFee ? streamNumber(r.totalFee) ?? null : null,
+    executedPrice: streamNumber(r.executedPrice) ?? null,
+    tradeId: (typeof tradeId === 'number' || typeof tradeId === 'string') && String(tradeId) !== '' ? String(tradeId) : null,
+    time: time !== undefined && time > 0 ? time : null, receivedAt,
   };
+}
+
+/** How far the fills' fee sum and the final report's totalFee may differ before it is a disagreement, USD. */
+export const ORDERLY_FEE_TOLERANCE_USD = 2e-6;
+
+/**
+ * What Orderly charged for one order: the sum of its fill reports' `fee` when every fill report seen has one and they
+ * add up to the order's executed total, else its final report's `totalFee`; null when neither says. When both are
+ * known and differ, `onDisagree` hears it (the sum is kept).
+ */
+export function orderlyOrderFee(end: OrderlyReport, reports: readonly OrderlyReport[], onDisagree?: (note: string) => void): number | null {
+  const fills = reports.filter((r) => r.executedQuantity > 0);
+  const executed = fills.reduce((s, r) => s + r.executedQuantity, 0);
+  const whole = fills.length > 0 && fills.every((r) => r.fee !== null)
+    && (end.totalExecutedQuantity === null || Math.abs(executed - end.totalExecutedQuantity) <= 1e-9 * Math.max(1, executed));
+  const sum = whole ? fills.reduce((s, r) => s + r.fee!, 0) : null;
+  if (sum === null) return end.totalFee;
+  // Orderly rounds each fee to 1e-6 USDC: a difference within that is the rounding, not a disagreement.
+  if (end.totalFee !== null && Math.abs(sum - end.totalFee) > ORDERLY_FEE_TOLERANCE_USD) {
+    onDisagree?.(`orderly order ${end.orderId}: the fills' fees add up to ${sum}, its final report says totalFee ${end.totalFee}; booked ${sum}`);
+  }
+  return sum;
 }
 
 export interface OrderlyLegOptions {
@@ -671,6 +712,8 @@ export class OrderlyLeg implements TradeLeg {
   #readRefused: Error | null = null;
   /** The newest terminal report an order of this leg waited for: a push before it may predate the fill. */
   #lastSettledAt = 0;
+  /** A fee disagreement between the fills and the final report was logged (once per leg). */
+  #feeNoted = false;
 
   constructor(options: OrderlyLegOptions) {
     this.#o = options;
@@ -775,7 +818,12 @@ export class OrderlyLeg implements TradeLeg {
     const executed = end.totalExecutedQuantity ?? this.reportsFor(ref.orderId).reduce((s, r) => s + r.executedQuantity, 0);
     const filled = toQty(executed);
     if (filled === 0n) return { kind: 'failed', error: new NothingExecuted('orderly', `the IOC ${ref.orderId} did not fill (${end.status})`, ref.tx), ref };
-    return { kind: 'filled', filled, avgPx: end.avgPrice, ref };
+    const fee = orderlyOrderFee(end, this.reportsFor(ref.orderId), (note) => {
+      if (this.#feeNoted) return;
+      this.#feeNoted = true;
+      this.#o.log?.(`${note} (said once)`);
+    });
+    return { kind: 'filled', filled, avgPx: end.avgPrice, fee, ref };
   }
 
   #oracle(): Promise<number | null> {

@@ -11,7 +11,7 @@
 
 import type { JournalEntry, TxRef } from '@gimbal/shared';
 import type { PositionResult } from './derive.ts';
-import { HOUR_MS, attribute, hourOf, positionsOf, spans } from './derive.ts';
+import { HOUR_MS, PERIODIC_FUNDING_VENUES, attribute, fundingPeriodAt, hourOf, isEstimate, positionsOf, spans } from './derive.ts';
 import type { MissingFee } from './sync.ts';
 import type { BookEvent, FeeEvent, FundingEvent, JournalEvent, TransferEvent } from './types.ts';
 
@@ -65,7 +65,16 @@ export function fundingJournal(events: readonly BookEvent[], now: number): Journ
     const late = done.has(k);
     const venues = g.position.legs.map((l) => l.venue);
     const paid = new Set(g.rows.map((r) => r.venue));
-    if (!late && !venues.every((v) => paid.has(v)) && now - g.hour < JOURNAL_GRACE_MS) continue;
+    // A venue that pays once per funding period is waited for, and missing, only on its funding times (the period of
+    // the payment interval the hour is in, from the payments booked on the symbol, else the default); in the hours
+    // between them it owes nothing.
+    const periodic = (v: string) => PERIODIC_FUNDING_VENUES.has(v);
+    const owes = (v: string) => {
+      if (!periodic(v)) return true;
+      const p = fundingPeriodAt(events.filter((e): e is FundingEvent => e.type === 'funding' && e.venue === v && e.symbol === g.position.symbol), g.hour);
+      return g.hour % (p * HOUR_MS) === 0;
+    };
+    if (!late && !venues.every((v) => !owes(v) || paid.has(v)) && now - g.hour < JOURNAL_GRACE_MS) continue;
     const total = g.rows.reduce((s, r) => s + r.usd, 0);
     const numbers: Record<string, number | string> = {
       usd: round6(total), position: g.position.id, window: g.position.windowId, symbol: g.position.symbol, hour: iso(g.hour),
@@ -74,6 +83,7 @@ export function fundingJournal(events: readonly BookEvent[], now: number): Journ
     for (const v of late ? [...paid] : venues) {
       const rows = g.rows.filter((r) => r.venue === v);
       if (rows.length === 0) {
+        if (!owes(v)) continue;
         parts.push(`${v} no payment`);
         numbers[`${v}Usd`] = 'missing';
         continue;
@@ -83,11 +93,12 @@ export function fundingJournal(events: readonly BookEvent[], now: number): Journ
       numbers[`${v}RatePerHour`] = rows[0]!.ratePerHour;
       const samples = rows.reduce((s, r) => s + (r.samples ?? 0), 0);
       if (samples > 0) numbers[`${v}Hours`] = samples;
-      parts.push(`${v} ${signed(usd)}${samples > 0 ? ` (${samples} h aggregated, estimated)` : ''}`);
+      const note = samples === 0 ? '' : periodic(v) ? ` (its ${samples} h funding period)` : ` (${samples} h aggregated, estimated)`;
+      parts.push(`${v} ${signed(usd)}${note}`);
     }
     if (late) numbers.late = 1;
     // A daily aggregate's amount per hour is not verified against a real row: marked as an estimate.
-    if (g.rows.some((r) => r.samples !== null)) numbers.estimated = 1;
+    if (g.rows.some(isEstimate)) numbers.estimated = 1;
     // Booked after the position's final entry: an adjustment against it.
     const afterFinal = late && finals.has(g.position.id);
     if (afterFinal) numbers.afterFinal = 1;
