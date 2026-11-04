@@ -125,7 +125,12 @@ export function carryPlan(input: CarryInput): CarryPlan {
   const legs: [CarryLegPlan, CarryLegPlan] = [leg(short, 'short'), leg(long, 'long')];
   const refusals: string[] = [];
   let costRefusal: string | null = null;
-  if (!priced.ok) {
+  // A fee that is not known (the caller's fee read failed) prices nothing: refused, and not for cost (the window's
+  // spread was never judged).
+  const unknownFee = ([short, long] as const).filter((l) => !(Number.isFinite(l.feeBps) && l.feeBps >= 0));
+  if (unknownFee.length > 0) {
+    refusals.push(`${unknownFee.map((l) => `the ${l.venue} fee a fill is not known (${l.feeBps})`).join('; ')}: the round trip cannot be priced`);
+  } else if (!priced.ok) {
     costRefusal = `the ${(priced.side === 'long' ? long : short).venue} book has no two-sided touch: the round trip cannot be priced`;
   } else {
     const rt = priced.roundTrip;
@@ -149,7 +154,7 @@ export function carryPlan(input: CarryInput): CarryPlan {
       refusals.push(`${l.venue}: the ${l.side} leg would be liquidated ${pct(l.liquidationDistance)} away, not more than ${pct(MIN_LIQUIDATION_DISTANCE)}`);
     }
   }
-  const roundTrip = priced.ok ? priced.roundTrip : null;
+  const roundTrip = priced.ok && unknownFee.length === 0 ? priced.roundTrip : null;
   return {
     netPerHourNow, netPerHour7d, grossAprNow: netPerHourNow * HOURS_PER_YEAR, grossApr7d: netPerHour7d * HOURS_PER_YEAR,
     expectedSpreadUsd, roundTrip, roundTripBps: roundTrip?.bps ?? NaN, roundTripUsd: roundTrip?.totalUsd ?? NaN, legs, refusals, costRefusal,

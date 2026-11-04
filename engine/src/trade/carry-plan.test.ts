@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { deskRoundTrip } from '../scanner/carry.ts';
-import { CARRY_BASIS_BUFFER_BPS, CARRY_HOLD_HOURS, MAINNET_COSTS } from '../scanner/config.ts';
+import { CARRY_BASIS_BUFFER_BPS, CARRY_HOLD_HOURS, DEFAULT_SCANNER_CONFIG, HL_BUILDER_TENTH_BPS, MAINNET_COSTS, hlFillFeeBps, withBuilderFee } from '../scanner/config.ts';
 import { fillFeeBps } from '../scanner/costs.ts';
 import type { CarryInput } from './carry-plan.ts';
 import { LIVE_RESCUE, MIN_LIQUIDATION_DISTANCE, carryPlan, halfSpreadBps, meanRatePerHour, venueMaxLeverage } from './carry-plan.ts';
@@ -62,6 +62,15 @@ test('the serve defaults are the scanner\'s: a 7-day hold, a 10 bps buffer, Hype
   assert.equal(CARRY_BASIS_BUFFER_BPS, 10);
   assert.equal(fillFeeBps(MAINNET_COSTS.fees.hyperliquid), 5.5);
   assert.equal(fillFeeBps(MAINNET_COSTS.fees.phoenix), 3.5);
+  // One source for Hyperliquid's fee: the trader's open (hlFillFeeBps) and the scanner (withBuilderFee) take the
+  // contract's builder fee alike; one the contract would not accept is unknown to the trader and changes no scanner cost.
+  assert.deepEqual([hlFillFeeBps(10), hlFillFeeBps(20), hlFillFeeBps(100)], [5.5, 6.5, 14.5]);
+  assert.deepEqual([hlFillFeeBps(undefined), hlFillFeeBps(null), hlFillFeeBps(0), hlFillFeeBps(101), hlFillFeeBps(1.5)], [null, null, null, null, null]);
+  const base = { ...DEFAULT_SCANNER_CONFIG, costs: MAINNET_COSTS };
+  for (const tenth of [10, 20, 35]) assert.equal(fillFeeBps(withBuilderFee(base, tenth).costs.fees.hyperliquid), hlFillFeeBps(tenth));
+  assert.equal(withBuilderFee(base, null), base);
+  assert.equal(withBuilderFee(base, 0), base);
+  assert.equal(fillFeeBps(MAINNET_COSTS.fees.hyperliquid), hlFillFeeBps(HL_BUILDER_TENTH_BPS), 'the default is the contract default');
 });
 
 test('XLM on 2026-11-04: 17.8 % over 7 days at 11.44 USD a leg does not cover the round trip, so it is refused for cost', () => {

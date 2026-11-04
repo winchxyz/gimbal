@@ -179,6 +179,8 @@ export class AdlWatch {
   #stopped = false;
   /** An unwind attempt runs: from taking it off the budget until its close returned and the legs were read. */
   #unwinding = false;
+  /** A check saw a leg off its baseline and is confirming it (the second read, CONFIRM_MS later), until it returns. */
+  #confirming = false;
 
   constructor(trader: AdlTrader, options: AdlWatchOptions = {}) {
     this.#trader = trader;
@@ -210,8 +212,24 @@ export class AdlWatch {
     return this.#unwinding;
   }
 
+  /**
+   * Whether a check saw a leg off its baseline and is confirming it: from the first read that saw it until the check
+   * returns (the event made, or not confirmed). An open must not start its orders then: the event may be made under it.
+   */
+  get confirming(): boolean {
+    return this.#confirming;
+  }
+
   /** One look at both legs; a report for every end (journal it), null when there is nothing new. */
   async check(): Promise<AdlReport | null> {
+    try {
+      return await this.#check();
+    } finally {
+      this.#confirming = false;
+    }
+  }
+
+  async #check(): Promise<AdlReport | null> {
     if (this.#stopped) return null;
     if (this.state.event !== null) return this.#follow();
     const first = await this.#read();
@@ -222,6 +240,7 @@ export class AdlWatch {
       return null;
     }
     if (first.key === this.#reported) return null;
+    this.#confirming = true;
     await this.#sleep(this.#confirmMs);
     if (this.#stopped) return null;
     const second = await this.#read();

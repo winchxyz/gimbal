@@ -1073,8 +1073,10 @@ anywhere the policy does not allow.
   (running while open). Then the totals: the fully priced refusals' sum, and the pending ones' estimate apart.
 - `loop.ts` (serve): runs `decide` after each funding payment (the hourly check) and on each scan event, only with
   `GIMBAL_TRADE=1` and `strategy.auto`, one decision at a time under the per-desk trader lock, never while a rescue,
-  an ADL unwind (`AdlWatch.unwinding`: its close signs or is in flight, not the read-only ADL check beside every desk
-  read) or panic_close runs. It carries `act` out with the same open and close code as `pair-mainnet` (maker first),
+  an ADL unwind (`AdlWatch.unwinding`: its close signs or is in flight), an open ADL event, an ADL check confirming a
+  leg off its baseline (`AdlWatch.confirming`) or panic_close runs; the read-only ADL check beside every desk read is
+  not one while it sees nothing off. Every open's gate, asked again before its first order and each later part, also
+  refuses a pair paused since an ADL (serve-loop.ts `openGateText`). It carries `act` out with the same open and close code as `pair-mainnet` (maker first),
   publishes `decision` events and journals `enter` / `exit` / `rotate` / `veto` / `wait` with numbers and tx links,
   each enter, rotate and refusal with the risk check's why line, books every check in the risk check ledger (a ledger
   that fails is logged, never the act's), and saves `LoopCounters` next to the trader state. `POST /rotate` and `POST /close` go through the same path.

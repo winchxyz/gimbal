@@ -145,6 +145,37 @@ test('unwinding: true only while an unwind attempt\'s close signs or is in fligh
   assert.equal(s.adl.unwinding, false, 'over when the attempt returns');
 });
 
+test('confirming: true from the read that saw a leg off its baseline until the check returns, confirmed or not', async () => {
+  const s = setup();
+  await opened(s);
+  const seen: boolean[] = [];
+  const watchReads = () => {
+    s.hl.onRead = () => {
+      seen.push(s.adl.confirming);
+      s.hl.onRead = () => seen.push(s.adl.confirming);
+    };
+  };
+  watchReads();
+  assert.equal(await s.adl.check(), null);
+  assert.deepEqual(seen, [false], 'nothing off: one read, never confirming');
+  // A read that is not confirmed 3 s later: confirming during the second read, over after.
+  seen.length = 0;
+  s.hl.reads = [toQty('-30'), toQty('-50')];
+  watchReads();
+  assert.equal(await s.adl.check(), null);
+  assert.deepEqual(seen, [false, true]);
+  assert.equal(s.adl.confirming, false);
+  assert.equal(s.adl.state.event, null);
+  // Confirmed: the same, and the event is made (its unwind runs before the check returns).
+  seen.length = 0;
+  s.hl.pos = toQty('-30');
+  watchReads();
+  const report = await s.adl.check();
+  assert.equal(report?.stage, 'unwound');
+  assert.deepEqual(seen.slice(0, 2), [false, true]);
+  assert.equal(s.adl.confirming, false);
+});
+
 test('a partial ADL is unwound too, not re-hedged at the smaller size', async () => {
   const s = setup();
   await opened(s);

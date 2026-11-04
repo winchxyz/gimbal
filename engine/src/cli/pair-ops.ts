@@ -21,7 +21,7 @@ import type { Relayer } from '../relayer/relayer.ts';
 import type { SolanaSubmitter } from '../relayer/solana.ts';
 import type { CarryLegInput, CarryPlan } from '../trade/carry-plan.ts';
 import { carryPlan, meanRatePerHour, pct, usd } from '../trade/carry-plan.ts';
-import { DEFAULT_SCANNER_CONFIG, HL_TAKER_BPS } from '../scanner/config.ts';
+import { DEFAULT_SCANNER_CONFIG, hlFillFeeBps } from '../scanner/config.ts';
 import { bookMid } from '../scanner/costs.ts';
 import type { LegOutcome, LegSide, MakerSettings } from '../trade/legs.ts';
 import { HlLeg } from '../trade/legs.ts';
@@ -379,14 +379,18 @@ export async function planOpen(ctx: OpsCtx, pair: Pair, request: OpenRequest): P
     }
   }
   if (size === 0n) refusals.push(`${usd(legUsd)} at ${mid.toFixed(4)} is under one common lot ${qtyString(pair.lot)}`);
-  // Hyperliquid's taker fee plus the builder fee every order carries (the contract's FeeConfig), counted once.
-  const builderBps = (ctx.config.fees?.hl_builder_tenth_bps ?? 0) / 10;
+  // Hyperliquid's taker fee plus the builder fee every order carries (the contract's FeeConfig), counted once. Fails
+  // closed: a config read without the fee (or with one the contract would not accept) prices nothing, it refuses.
+  const hlFeeBps = hlFillFeeBps(ctx.config.fees?.hl_builder_tenth_bps);
+  if (hlFeeBps === null) {
+    refusals.push(`the contract's config() gave no usable fees.hl_builder_tenth_bps (${String(ctx.config.fees?.hl_builder_tenth_bps)}): the Hyperliquid fee, and so the round trip, is unknown`);
+  }
   // Cross margin on both venues, open notional at the mark: what liquidation and the effective leverage run on.
   const hlC = hlCross(hlState);
   const pxC = pxAccount === null ? { equityUsd: 0, maintenanceUsd: 0, notionalUsd: 0 } : phoenixCross(pxAccount);
   const pxLotsAfter = (toQty(String(Math.abs(pxAccount?.positions.find((p) => p.symbol === symbol)?.size ?? 0))) + size) / pair.phoenix.lot;
   const short: CarryLegInput = {
-    venue: 'hyperliquid', ratePerHour: hlF.now, rate7dPerHour: hlF.mean7d ?? hlF.now, feeBps: HL_TAKER_BPS + builderBps, book: hlBook,
+    venue: 'hyperliquid', ratePerHour: hlF.now, rate7dPerHour: hlF.mean7d ?? hlF.now, feeBps: hlFeeBps ?? Number.NaN, book: hlBook,
     equityUsd: hlC.equityUsd, maintenanceUsd: hlC.maintenanceUsd, notionalUsd: hlC.notionalUsd, maintenanceRate: 1 / (2 * hlF.maxLeverage),
   };
   const long: CarryLegInput = {

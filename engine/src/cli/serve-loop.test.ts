@@ -19,7 +19,7 @@ import { sizeFor } from '../strategy/decide.ts';
 import { STRATEGY, T0, win as deskWin } from '../strategy/test-helpers.ts';
 import { VirtualClock, readRecording } from '../venues/replay.ts';
 import { replayStart } from './serve-replay.ts';
-import { depthAtSize, fillsOf, loopHands, openedQty, protectionText, riskFacts, serveLoop, windowFacts, windowSymbol } from './serve-loop.ts';
+import { adlGate, depthAtSize, fillsOf, loopHands, openGateText, openedQty, protectionText, riskFacts, serveLoop, windowFacts, windowSymbol } from './serve-loop.ts';
 import type { PairHands, ServePair } from './serve-pair.ts';
 import { toQty } from '../trade/lots.ts';
 import type { PairResult } from '../trade/pair.ts';
@@ -421,12 +421,27 @@ test('risk facts: each leg\'s book at size, the 24 h move from the carry, the li
   assert.deepEqual(await facts({ id: 'eth-orderly-hyperliquid' } as FundingWindow, 500), {});
 });
 
-test('protectionText: the loop waits on a rescue, an ADL unwind in flight or panic_close, never on the read-only ADL check', () => {
-  const none = { rescue: null, adlUnwinding: false, panicClose: false };
-  // serve runs the ADL check beside every 5 s read: with no unwind attempt it holds nothing back.
+test('protectionText and openGateText: a rescue, an ADL unwind, event or confirming check, panic_close; the open also stops on a pause', () => {
+  const quiet = { unwinding: false, confirming: false, event: false, paused: null };
+  const none = { rescue: null, adl: quiet, panicClose: false };
+  // serve runs the ADL check beside every 5 s read: while it sees nothing off it holds nothing back.
   assert.equal(protectionText(none), null);
-  assert.equal(protectionText({ ...none, adlUnwinding: true }), 'an ADL unwind is in flight');
+  assert.equal(protectionText({ ...none, adl: null }), null, 'no pair, no ADL watch');
+  assert.equal(protectionText({ ...none, adl: { ...quiet, unwinding: true } }), 'an ADL unwind is in flight');
+  // An event whose attempt failed (no unwind in flight) or a check confirming a leg off its baseline: the loop waits.
+  assert.equal(protectionText({ ...none, adl: { ...quiet, event: true } }), 'an ADL event is in progress');
+  assert.equal(protectionText({ ...none, adl: { ...quiet, confirming: true } }), 'an ADL check is confirming a leg off its baseline');
   assert.equal(protectionText({ ...none, rescue: 'r-1' }), 'rescue r-1 runs');
   assert.equal(protectionText({ ...none, panicClose: true }), 'panic_close runs');
-  assert.equal(protectionText({ rescue: 'r-1', adlUnwinding: true, panicClose: true }), 'rescue r-1 runs', 'the rescue is named first');
+  assert.equal(protectionText({ rescue: 'r-1', adl: { ...quiet, unwinding: true }, panicClose: true }), 'rescue r-1 runs', 'the rescue is named first');
+  // A pause after an ADL does not stop the loop's decisions (a held pair may still be closed), but stops every open.
+  const paused = { ...none, adl: { ...quiet, paused: 'ADL on hyperliquid XLM -50 -> -30' } };
+  assert.equal(protectionText(paused), null);
+  assert.equal(openGateText(paused), 'the pair is paused since an ADL (ADL on hyperliquid XLM -50 -> -30): no new pair opens until the owner reconciles');
+  assert.equal(openGateText({ ...none, adl: { ...quiet, event: true } }), 'an ADL event is in progress');
+  assert.equal(openGateText(none), null);
+  // adlGate reads serve-pair's PairAdl.
+  const state = { attemptsLeft: 3, paused: null, event: null };
+  assert.deepEqual(adlGate({ check: async () => null, stop: () => {}, state, unwinding: false, confirming: true }), { ...quiet, confirming: true });
+  assert.equal(adlGate(undefined), null);
 });

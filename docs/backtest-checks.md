@@ -29,8 +29,9 @@ rerun reads nothing. A full run takes about an hour on one core; each scope and 
   Books, marks, open interest and lots are today's.
 - **The real scanner.** `Scanner` runs with the mainnet costs (`MAINNET_COSTS`: taker fees with the Hyperliquid
   builder fee, slippage on the books at the leg size, the basis buffer of adverse mark gap + timing loss + 10 bps,
-  spread over the assumed 168 h hold: the round trip and hold the pair trader's open is held to, `deskRoundTrip`;
-  the runs reported below before 2026-11-04 used 5 bps over 240 h), the desk policy, the 2 % open-interest cap, the 7- and 14-day multi-day gate
+  spread over the assumed 168 h hold: the round trip and hold the pair trader's open is held to, `deskRoundTrip`.
+  The "Results on the one round trip" grid below is on these; every section after it was run before 2026-11-04 on
+  5 bps over 240 h, a hurdle the trader's open never applied), the desk policy, the 2 % open-interest cap, the 7- and 14-day multi-day gate
   and its ranking. The contract's oracle prices count as fresh (serve refreshes them at the open). The margin sits on
   the desk's venues: no 1Click move is priced.
 - **The real decide().** Every hour: two scans (the first loads that hour's history, the second is priced on it, as
@@ -87,7 +88,82 @@ Hyperliquid is read back 400 days (the tool's cap), Orderly answers about 360, P
 ETH, SOL), 2026-03-13 (DOGE, ZEC), 2026-06-02 (XLM) and 2026-09-22 (LTC). Checks run 2025-12-02 to 2026-11-04,
 336.6 days, 8,080 hourly checks per run (the all-venues scope ends at Orderly's last 8-hour print, 5 hours earlier).
 
-## Results: what the live desk can open (long Phoenix / short Hyperliquid)
+## Results on the one round trip (2026-11-04: 168 h hold, 10 bps buffer)
+
+The scanner's gate now prices the round trip the pair trader's open is held to (`deskRoundTrip`, a 7-day hold, a
+10 bps buffer, Hyperliquid's builder fee once). Same cache, scope live (long Phoenix / short Hyperliquid), run with
+`npm run backtest:checks -- --no-fetch --scope live --enter 1,2,3,4 --exit 1,2,3,4,6`.
+
+**12 USD a leg (the live desk)**
+
+| enter | exit | entries | exits | rotations | hours held | gross USD | costs USD | net USD | net / entry | missed (valued at N=1) | waited-hours funding USD | late-exit hours | late-exit funding USD | bad runs held through |
+|-------|------|---------|-------|-----------|------------|-----------|-----------|---------|-------------|------------------------|--------------------------|-----------------|-----------------------|-----------------------|
+| enter | exit | entries | exits | rotations | hours held | gross USD | costs USD | net USD | net / entry | missed (valued at N=1) | waited-hours funding USD | late-exit hours | late-exit funding USD | bad runs held through |
+|-------|------|---------|-------|-----------|------------|-----------|-----------|---------|-------------|------------------------|--------------------------|-----------------|-----------------------|-----------------------|
+| 1 | 1 | 4 | 4 | 0 | 814 | 0.236 | 0.160 | **0.077** | 0.019 | 0 | 0.000 | 0 | 0.000 | 0 |
+| 1 | 2 | 4 | 4 | 0 | 822 | 0.235 | 0.160 | **0.076** | 0.019 | 0 | 0.000 | 2 | -0.000 | 2 |
+| 1 | 3 | 3 | 3 | 0 | 833 | 0.237 | 0.118 | **0.119** | 0.040 | 0 | 0.000 | 2 | -0.000 | 3 |
+| 1 | 4 | 3 | 3 | 0 | 834 | 0.237 | 0.118 | **0.119** | 0.040 | 0 | 0.000 | 3 | -0.001 | 3 |
+| 1 | 6 | 3 | 3 | 0 | 868 | 0.242 | 0.118 | **0.124** | 0.041 | 0 | 0.000 | 5 | 0.001 | 7 |
+| 2 | 1 | 4 | 4 | 0 | 813 | 0.236 | 0.160 | **0.076** | 0.019 | 0 | 0.001 | 0 | 0.000 | 0 |
+| 2 | 2 | 4 | 4 | 0 | 820 | 0.234 | 0.160 | **0.075** | 0.019 | 0 | 0.001 | 2 | -0.000 | 2 |
+| 2 | 3 | 3 | 3 | 0 | 832 | 0.237 | 0.118 | **0.118** | 0.039 | 0 | 0.001 | 2 | -0.000 | 3 |
+| 2 | 4 | 3 | 3 | 0 | 833 | 0.236 | 0.118 | **0.118** | 0.039 | 0 | 0.001 | 3 | -0.001 | 3 |
+| 2 | 6 | 3 | 3 | 0 | 867 | 0.241 | 0.118 | **0.123** | 0.041 | 0 | 0.001 | 5 | 0.001 | 7 |
+| 3 | 1 | 4 | 4 | 0 | 812 | 0.235 | 0.160 | **0.075** | 0.019 | 0 | 0.002 | 0 | 0.000 | 0 |
+| 3 | 2 | 4 | 4 | 0 | 818 | 0.233 | 0.160 | **0.074** | 0.018 | 0 | 0.002 | 2 | -0.000 | 2 |
+| 3 | 3 | 3 | 3 | 0 | 831 | 0.236 | 0.118 | **0.118** | 0.039 | 0 | 0.002 | 2 | -0.000 | 3 |
+| 3 | 4 | 3 | 3 | 0 | 832 | 0.236 | 0.118 | **0.118** | 0.039 | 0 | 0.002 | 3 | -0.001 | 3 |
+| 3 | 6 | 3 | 3 | 0 | 866 | 0.241 | 0.118 | **0.123** | 0.041 | 0 | 0.002 | 5 | 0.001 | 7 |
+| 4 | 1 | 4 | 4 | 0 | 811 | 0.235 | 0.160 | **0.075** | 0.019 | 0 | 0.002 | 0 | 0.000 | 0 |
+| 4 | 2 | 4 | 4 | 0 | 816 | 0.233 | 0.160 | **0.073** | 0.018 | 0 | 0.003 | 2 | -0.000 | 2 |
+| 4 | 3 | 3 | 3 | 0 | 830 | 0.236 | 0.118 | **0.117** | 0.039 | 0 | 0.002 | 2 | -0.000 | 3 |
+| 4 | 4 | 3 | 3 | 0 | 831 | 0.235 | 0.118 | **0.117** | 0.039 | 0 | 0.002 | 3 | -0.001 | 3 |
+| 4 | 6 | 3 | 3 | 0 | 865 | 0.240 | 0.118 | **0.122** | 0.041 | 0 | 0.002 | 5 | 0.001 | 7 |
+
+**1000 USD a leg**
+
+| enter | exit | entries | exits | rotations | hours held | gross USD | costs USD | net USD | net / entry | missed (valued at N=1) | waited-hours funding USD | late-exit hours | late-exit funding USD | bad runs held through |
+|-------|------|---------|-------|-----------|------------|-----------|-----------|---------|-------------|------------------------|--------------------------|-----------------|-----------------------|-----------------------|
+| enter | exit | entries | exits | rotations | hours held | gross USD | costs USD | net USD | net / entry | missed (valued at N=1) | waited-hours funding USD | late-exit hours | late-exit funding USD | bad runs held through |
+|-------|------|---------|-------|-----------|------------|-----------|-----------|---------|-------------|------------------------|--------------------------|-----------------|-----------------------|-----------------------|
+| 1 | 1 | 4 | 4 | 0 | 237 | 5.87 | 12.96 | **-7.09** | -1.77 | 0 | 0.00 | 0 | 0.00 | 0 |
+| 1 | 2 | 2 | 2 | 0 | 329 | 7.42 | 6.48 | **0.94** | 0.47 | 0 | 0.00 | 2 | -0.03 | 7 |
+| 1 | 3 | 2 | 2 | 0 | 361 | 7.74 | 6.48 | **1.27** | 0.63 | 0 | 0.00 | 4 | -0.01 | 9 |
+| 1 | 4 | 2 | 2 | 0 | 363 | 7.73 | 6.48 | **1.25** | 0.63 | 0 | 0.00 | 6 | -0.03 | 9 |
+| 1 | 6 | 2 | 2 | 0 | 367 | 7.70 | 6.48 | **1.22** | 0.61 | 0 | 0.00 | 10 | -0.06 | 9 |
+| 2 | 1 | 4 | 4 | 0 | 235 | 5.82 | 12.96 | **-7.14** | -1.78 | 0 | 0.05 | 0 | 0.00 | 0 |
+| 2 | 2 | 2 | 2 | 0 | 327 | 7.36 | 6.48 | **0.88** | 0.44 | 0 | 0.05 | 2 | -0.03 | 7 |
+| 2 | 3 | 2 | 2 | 0 | 359 | 7.69 | 6.48 | **1.21** | 0.61 | 0 | 0.05 | 4 | -0.01 | 9 |
+| 2 | 4 | 2 | 2 | 0 | 361 | 7.68 | 6.48 | **1.20** | 0.60 | 0 | 0.05 | 6 | -0.03 | 9 |
+| 2 | 6 | 2 | 2 | 0 | 365 | 7.64 | 6.48 | **1.17** | 0.58 | 0 | 0.05 | 10 | -0.06 | 9 |
+| 3 | 1 | 4 | 4 | 0 | 233 | 5.76 | 12.96 | **-7.20** | -1.80 | 0 | 0.11 | 0 | 0.00 | 0 |
+| 3 | 2 | 2 | 2 | 0 | 325 | 7.30 | 6.48 | **0.82** | 0.41 | 0 | 0.11 | 2 | -0.03 | 7 |
+| 3 | 3 | 2 | 2 | 0 | 357 | 7.63 | 6.48 | **1.15** | 0.58 | 0 | 0.11 | 4 | -0.01 | 9 |
+| 3 | 4 | 2 | 2 | 0 | 359 | 7.62 | 6.48 | **1.14** | 0.57 | 0 | 0.11 | 6 | -0.03 | 9 |
+| 3 | 6 | 2 | 2 | 0 | 363 | 7.58 | 6.48 | **1.10** | 0.55 | 0 | 0.11 | 10 | -0.06 | 9 |
+| 4 | 1 | 4 | 4 | 0 | 231 | 5.69 | 12.96 | **-7.26** | -1.82 | 0 | 0.18 | 0 | 0.00 | 0 |
+| 4 | 2 | 2 | 2 | 0 | 323 | 7.24 | 6.48 | **0.76** | 0.38 | 0 | 0.18 | 2 | -0.03 | 7 |
+| 4 | 3 | 2 | 2 | 0 | 355 | 7.57 | 6.48 | **1.09** | 0.54 | 0 | 0.18 | 4 | -0.01 | 9 |
+| 4 | 4 | 2 | 2 | 0 | 357 | 7.55 | 6.48 | **1.07** | 0.54 | 0 | 0.18 | 6 | -0.03 | 9 |
+| 4 | 6 | 2 | 2 | 0 | 361 | 7.52 | 6.48 | **1.04** | 0.52 | 0 | 0.18 | 10 | -0.06 | 9 |
+
+What moved, at the adopted enter 3, exit 6:
+
+| leg | before (240 h, 5 bps) | after (168 h, 10 bps) |
+|---|---|---|
+| 12 USD | 18 entries, net 0.524 USD (0.029 an entry) | 3 entries, net 0.123 USD (0.041 an entry) |
+| 1000 USD | 9 entries, net 17.29 USD (1.92 an entry) | 2 entries, net 1.10 USD (0.55 an entry) |
+
+- **Most entries go.** The 15 entries at 12 USD a leg that drop out paid their round trip only over 10 days of
+  spread with a 5 bps buffer; the live trader's open (7 days, 10 bps) would have refused most of them, so the
+  desk could not have taken them. What is left is XLM in July 2026 (twice) and LTC in September, two of them to the 14-day time stop.
+- **Each entry is worth more** (0.041 against 0.029 USD at 12 USD a leg); the year's net is a quarter of before.
+- **The counts still order the same way:** exit 1 loses at 1000 USD a leg and earns least at 12; from exit 3 on the
+  net is flat; the entry count moves it by at most 0.003 USD at 12 USD and 0.18 USD at 1000.
+- With 2 to 4 trades a setting these numbers say little on their own: they record the hurdle, not a strategy.
+
+## Results: what the live desk can open (long Phoenix / short Hyperliquid), on 240 h and 5 bps
 
 **12 USD a leg (the live desk)**
 

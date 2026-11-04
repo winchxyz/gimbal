@@ -249,6 +249,40 @@ export const CARRY_HOLD_HOURS = 168;
 export const CARRY_BASIS_BUFFER_BPS = 10;
 /** Hyperliquid's tier-0 taker fee on perps, bps, before the treasury builder fee every order carries. */
 export const HL_TAKER_BPS = 4.5;
+/**
+ * The contract's builder fee until serve reads the deployed one (FeeConfig.hl_builder_tenth_bps, tenths of a bp: the
+ * contract's default 10 = 1 bp). The pair trader always prices the contract's own value (hlFillFeeBps).
+ */
+export const HL_BUILDER_TENTH_BPS = 10;
+/** The builder fees the contract accepts, tenths of a bp: at least 1 (every order carries it), at most Hyperliquid's cap. */
+const HL_BUILDER_TENTH_BPS_RANGE = [1, 100] as const;
+
+/**
+ * Hyperliquid's fee a fill, bps: the tier-0 taker plus the builder fee every order carries (the contract's
+ * FeeConfig.hl_builder_tenth_bps), counted once. null when the builder fee is missing or not one the contract accepts:
+ * the fee, and so any round trip on Hyperliquid, is unknown. The scanner's costs (withBuilderFee) and the pair
+ * trader's open (pair-ops.ts planOpen) both take it from here.
+ */
+export function hlFillFeeBps(builderTenthBps: number | null | undefined): number | null {
+  const extra = hlBuilderBps(builderTenthBps);
+  return extra === null ? null : HL_TAKER_BPS + extra;
+}
+
+function hlBuilderBps(tenth: number | null | undefined): number | null {
+  if (typeof tenth !== 'number' || !Number.isInteger(tenth) || tenth < HL_BUILDER_TENTH_BPS_RANGE[0] || tenth > HL_BUILDER_TENTH_BPS_RANGE[1]) return null;
+  return tenth / 10;
+}
+
+/**
+ * The scanner's costs with the deployed contract's builder fee on Hyperliquid's fills, the one the pair trader's open
+ * prices. A fee that is missing or not one the contract accepts leaves the config as it is (HL_BUILDER_TENTH_BPS).
+ */
+export function withBuilderFee(config: ScannerConfig, builderTenthBps: number | null | undefined): ScannerConfig {
+  const extraBps = hlBuilderBps(builderTenthBps);
+  if (extraBps === null) return config;
+  const fees = config.costs.fees;
+  return { ...config, costs: { ...config.costs, fees: { ...fees, hyperliquid: { ...fees.hyperliquid, extraBps } } } };
+}
 
 /** Costs on mainnet, and in replay, which plays recorded mainnet answers. */
 export const MAINNET_COSTS: CostParams = {
@@ -262,9 +296,10 @@ export const MAINNET_COSTS: CostParams = {
   // whatever it was at entry; the adverse gap at entry is priced on top (carry.ts deskRoundTrip).
   basisBufferBps: CARRY_BASIS_BUFFER_BPS,
   fees: {
-    // Hyperliquid tier-0 taker 4.5 bps, plus the treasury builder fee on every order (FeeConfig.hl_builder_tenth_bps
-    // 10 = 1 bp). The referral discount is not counted.
-    hyperliquid: { takerBps: HL_TAKER_BPS, extraBps: 1 },
+    // Hyperliquid tier-0 taker 4.5 bps, plus the treasury builder fee on every order: the contract's default here,
+    // replaced by the deployed contract's FeeConfig.hl_builder_tenth_bps when serve reads it (withBuilderFee), the
+    // value the pair trader prices (hlFillFeeBps). The referral discount is not counted.
+    hyperliquid: { takerBps: HL_TAKER_BPS, extraBps: HL_BUILDER_TENTH_BPS / 10 },
     // Phoenix: 3.5 bps taker on every market (its market config, 2026-10-31).
     phoenix: { takerBps: 3.5, extraBps: 0 },
     // Orderly under gimbal_dex: 3 bps base taker plus the 1 bp markup (ORDERLY_BROKERS.mainnet).

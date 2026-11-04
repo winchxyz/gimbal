@@ -84,7 +84,7 @@ import { StrategyStore, strategyFile } from '../strategy-store.ts';
 import { setupFromEnv } from '../setup/serve-setup.ts';
 import { LOOP_ACCOUNT_MAX_AGE_MS, accountWithin, liveReaders, replayReaders } from '../readers.ts';
 import type { Readers } from '../readers.ts';
-import { DEFAULT_STRATEGY, ORDERLY_BROKERS, scannerConfigFor } from '../scanner/config.ts';
+import { DEFAULT_STRATEGY, ORDERLY_BROKERS, scannerConfigFor, withBuilderFee } from '../scanner/config.ts';
 import { Scanner } from '../scanner/scanner.ts';
 import { DEFAULT_ENGINE_HOST, DEFAULT_ENGINE_PORT, EngineServer } from '../server.ts';
 import type { RecordLine } from '../venues/recorder.ts';
@@ -104,7 +104,7 @@ import type { ServePair } from './serve-pair.ts';
 import { liveLines, pairRefreshesAtOpen, servePair } from './serve-pair.ts';
 import type { ContractSide } from './serve-contract.ts';
 import { connectContract, contractEnv, marginVenues } from './serve-contract.ts';
-import { loopBook, protectionText, serveLoop } from './serve-loop.ts';
+import { adlGate, loopBook, openGateText, protectionText, serveLoop } from './serve-loop.ts';
 import { ConfigError, retryStart } from './start-errors.ts';
 import type { PositionBook } from '../book/book.ts';
 import { createBook } from '../book/book.ts';
@@ -230,7 +230,8 @@ if (mode === 'replay') {
 let server: EngineServer | null = null;
 // The costs of the network the desk trades on: testnet prices Orderly under woofi_dex, mainnet and replay (recorded
 // mainnet answers) under gimbal_dex.
-const scannerConfig = { ...scannerConfigFor(mode), policy };
+// Hyperliquid's fills carry the deployed contract's builder fee, the one the pair trader's open prices (hlFillFeeBps).
+const scannerConfig = { ...withBuilderFee(scannerConfigFor(mode), contract?.builderTenthBps), policy };
 const fees = scannerConfig.costs.fees;
 const fill = (v: keyof typeof fees) => `${v} ${fees[v].takerBps + fees[v].extraBps} bps`;
 log(`scanner costs (${mode}): taker fill ${fill('hyperliquid')}, ${fill('phoenix')}, ${fill('orderly')} `
@@ -449,12 +450,15 @@ if (values.once === true) {
 }
 
 /**
- * A protection runs (a rescue, its fund_venue step included; an ADL unwind; panic_close): no order of the loop goes
- * out. An ADL unwind is one whose close signs or is in flight (risk.adlUnwinding), not the read-only ADL check that
- * starts beside every desk read (risk.adlRunning).
+ * A protection runs (a rescue, its fund_venue step included; an ADL unwind, an open ADL event or a check confirming a
+ * leg off its baseline; panic_close): the loop decides nothing and no order of it goes out. The read-only ADL check
+ * that starts beside every desk read (risk.adlRunning) is not one while it sees nothing off.
  */
+function protections() {
+  return { rescue: rescueRunning?.() ?? null, adl: adlGate(pair?.adl), panicClose: closingWatch?.current != null };
+}
 function protectionRunning(): string | null {
-  return protectionText({ rescue: rescueRunning?.() ?? null, adlUnwinding: risk?.adlUnwinding === true, panicClose: closingWatch?.current != null });
+  return protectionText(protections());
 }
 
 // The position book: next to the loop state. An unreadable book file is never started over: serve runs without the
@@ -537,7 +541,8 @@ loop = serveLoop({
   ...(booked === null ? {} : { book: booked.sink }),
   ...(stateDirSet === undefined ? {} : { stateDir: resolve(stateDirSet) }),
   busy: () => protectionRunning() ?? (pair?.pair?.closing === true ? 'a close of the pair runs' : null),
-  orderGate: protectionRunning,
+  // Every open's gate, asked again before its first order and each later part: also a pair paused since an ADL.
+  orderGate: () => openGateText(protections()),
 });
 log(loop.startLine());
 booked?.adopt(loop.held);

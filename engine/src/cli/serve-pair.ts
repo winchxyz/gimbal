@@ -206,6 +206,8 @@ export interface PairAdl {
   readonly state: AdlState;
   /** An unwind attempt runs now (AdlWatch.unwinding). */
   readonly unwinding: boolean;
+  /** A check is confirming a leg off its baseline (AdlWatch.confirming). */
+  readonly confirming: boolean;
 }
 
 /** What an open or a close of the strategy loop did. */
@@ -1060,6 +1062,9 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       },
       get unwinding() {
         return current?.adl.unwinding ?? false;
+      },
+      get confirming() {
+        return current?.adl.confirming ?? false;
       },
     };
     // A start not confirmed yet keeps the hands (they refuse until it is) and the ADL watch: it may go live later, the

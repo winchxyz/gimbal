@@ -17,6 +17,7 @@ import { LOCK_STALE_MS, THIS_PROCESS, TRADER_STATE_VERSION, TraderStateStore, lo
 import type { ContractSide } from './serve-contract.ts';
 import type { CarryInput, ServePairDeps, ServePairInput, SlotCarry } from './serve-pair.ts';
 import { liveLines, pairRefreshesAtOpen, servePair } from './serve-pair.ts';
+import { adlGate, openGateText } from './serve-loop.ts';
 import { ConfigError } from './start-errors.ts';
 
 const CONTRACT = 'gimbal-test.near';
@@ -88,6 +89,8 @@ interface World {
   refuse: string[];
   /** The stand-in carry's refusal for cost (one of `refuse`), as liveCarry passes CarryPlan.costRefusal. */
   costRefuse?: string;
+  /** Runs inside the stand-in carry's open, after the plan and before its last gate (what changed meanwhile). */
+  beforeLastGate?: () => void;
   /** The stand-in carry signs one order outside the trader, then throws (an open that dies before its result). */
   throwAfterOrder: boolean;
   /** hlHeld throws this, when set (Hyperliquid info not answering). */
@@ -166,6 +169,10 @@ function testCarry(c: CarryInput, w: World): SlotCarry {
         throw new Error('the open died before its result was recorded');
       }
       out.say(`plan      ${c.symbol} ${request.legUsd} a leg at ${request.leverage}x`);
+      // As liveCarry: the open's gate asked again after the plan, right before the first order.
+      w.beforeLastGate?.();
+      const gated = request.gate?.() ?? null;
+      if (gated !== null) return { refusals: [`${gated}: nothing sent`], results: [] };
       return { refusals: [], results: await c.pair.openInChunks({ size: toQty(String(request.legUsd)), longIndex: 1, reason: request.reason }) };
     },
     close: async (request) => ({ refusals: [], results: [await c.pair.close({ reason: request.reason })] }),
@@ -497,6 +504,47 @@ test('(C) stop() turns trading off first: no reducer, closes and guarded orders 
     const r = await p.pair!.legs[0].order('BUY', toQty('10'), true, 'rescue: reduce');
     assert.match(r.kind === 'failed' ? r.error.message : '', /serve is stopping and its trader lock is released; nothing signed/);
     assert.equal(w.hl.orders.length + w.px.orders.length, 0);
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+test('the open\'s last gate (serve\'s orderGate) meets an ADL event made or a pause set while it planned: nothing is sent', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
+  try {
+    const p = await servePair(input(w));
+    const hands = p.hands!;
+    assert.ok(p.adl !== undefined);
+    // serve's orderGate: no rescue, no panic_close; only what the pair's ADL watch says.
+    const gate = () => openGateText({ rescue: null, adl: adlGate(p.adl), panicClose: false });
+    const open = () => hands.open({ symbol: 'XLM', legUsd: 10, leverage: 1.5, reason: 'strategy: enter xlm-phoenix-hyperliquid', gate });
+    // The start checks passed (no event, not paused); then a check confirmed an ADL, paused the pair, and its first
+    // attempt failed: no unwind is in flight, the event is open.
+    w.beforeLastGate = () => {
+      p.adl!.state.event = { at: Date.now(), reference: [-toQty('10'), toQty('10')], seen: [-toQty('6'), toQty('10')], attempts: 1, nextAt: Date.now() + 60_000, alerted: false };
+      p.adl!.state.paused = 'ADL on hyperliquid XLM -10 -> -6';
+    };
+    const r = await open();
+    assert.equal(p.adl.unwinding, false, 'no unwind in flight');
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'open refused, nothing signed: an ADL event is in progress: nothing sent');
+    assert.equal(w.hl.orders.length + w.px.orders.length, 0);
+    // A pause set while the open planned (the event over, the legs unwound): refused too.
+    p.adl.state.event = null;
+    p.adl.state.paused = null;
+    w.beforeLastGate = () => {
+      p.adl!.state.paused = 'ADL on hyperliquid XLM -10 -> -6';
+    };
+    const paused = await open();
+    assert.equal(paused.reason, 'open refused, nothing signed: the pair is paused since an ADL (ADL on hyperliquid XLM -10 -> -6): no new pair opens until the owner reconciles: nothing sent');
+    assert.equal(w.hl.orders.length + w.px.orders.length, 0);
+    // Neither: the open goes out.
+    p.adl.state.paused = null;
+    delete w.beforeLastGate;
+    const opened = await open();
+    assert.equal(opened.ok, true, opened.reason);
+    assert.ok(w.hl.orders.length > 0);
+    p.stop();
   } finally {
     rmSync(w.dir, { recursive: true, force: true });
   }

@@ -76,6 +76,11 @@ test('connectContract: the policy from get_desk and the stored prices, by views 
   assert.deepEqual(side.policy, desk.policy);
   assert.deepEqual(side.prices.price('hyperliquid', 'ETH'), { px: 2500, at: 5 });
   assert.deepEqual(t.views.slice(0, 3), ['config', 'get_desk', 'prices']);
+  assert.equal(side.builderTenthBps, null, 'config() gave no fees');
+  const fees = new ViewOnly({ config: { network: 'Testnet', fees: { hl_builder_tenth_bps: 20 } }, get_desk: desk, prices: [] });
+  const withFees = await connectContract(cfg, { transport: fees, refreshMs: 60_000 });
+  withFees.prices.stop();
+  assert.equal(withFees.builderTenthBps, 20, 'the builder fee the scanner prices (withBuilderFee)');
   const net = { config: { network: 'Testnet' } };
   await assert.rejects(connectContract(cfg, { transport: new ViewOnly({ ...net, get_desk: null }) }), /has no desk alpha/);
   await assert.rejects(connectContract(cfg, { transport: new ViewOnly({ ...net, get_desk: { ...desk, policy: { hl_assets: 'x' } } }) }), /get_desk\(alpha\)\.policy/);
