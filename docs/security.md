@@ -192,7 +192,8 @@ the act go ahead. No answer within 15 s (asked twice), NEAR AI unreachable, or n
 next hourly check, journaled "the NEAR AI risk check did not answer ... held, not passed"; an unreadable reply is a
 refusal. So a NEAR AI outage costs carry not taken, never an unchecked entry. Exits, stops, `POST /close`,
 `panic_close` and rescues never ask it, and a close, a drawdown or time stop, or a shutdown cancels an entry still
-waiting on its check, with nothing sent; an exit on the hourly counts can wait for a check in flight, at most 30 s.
+waiting on its check, with nothing sent; an exit on the hourly counts can wait for a check in flight, about 35 s at
+most (two 15 s attempts plus the 3 s fact reads).
 The check gates the strategy loop only: the operator's MCP desk tools (`engine/src/mcp/server.ts`: `place_hl_order`,
 `fund_venue`, `withdraw`) and the `pair-live` / `pair-mainnet` CLIs, which open and close pairs by hand, are gated by
 the contract's policy alone, not by the NEAR AI risk check. The model never signs and nothing it returns reaches the

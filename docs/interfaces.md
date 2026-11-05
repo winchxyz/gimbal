@@ -1040,9 +1040,13 @@ anywhere the policy does not allow.
   a drawdown or time stop that comes due on a scan (decide.ts `stopDue`, on the venues' P&L) cancel an enter or
   rotate whose check is pending, or (a close) one queued before it, journaled `refused` "<enter|rotate …> not carried
   out: <a close came first | a stop came first (<why>) | serve is stopping>; nothing sent" (`cancelled: 1`); the check
-  is aborted and not booked. An act already past its pass ends first and the close runs right after it; serve
-  stopping also stops it before its first order. An exit on the hourly counts is decided at the next check, so it can
-  wait for a check in flight: at most `vetoAttempts` × `vetoTimeoutMs` (30 s). Each attempt's call is aborted at its
+  is aborted and not booked. An act already past its pass stops before each later step that sends (a rotate's
+  `prepareOpen`, its close, the open) when a close was accepted or serve is stopping, journaled the same way with
+  "<A> is kept, nothing closed" or "<A> was closed, so the desk stays flat; nothing opened"; so no new pair is opened
+  only for the close to close it. An accepted close that serve's stop drops says so: "POST /close not carried out:
+  serve is stopping; nothing sent; ask again after the restart". An exit on the hourly counts is decided at the next check, so it can
+  wait for a check in flight: about 35 s at most (`vetoAttempts` × `vetoTimeoutMs`, 30 s, plus serve's 3 s risk fact
+  reads, `RISK_FACT_TIMEOUT_MS`). Each attempt's call is aborted at its
   timeout (an `AbortSignal` through `VetoSource.complete`), so a retry never overlaps it. While an act is held, the
   published decision is a `wait` whose reason is the held line, until the next hourly check; with no key every enter
   or rotate decision is published so (never "enter" or "rotate"). The owner demo entry waives only its profit checks,

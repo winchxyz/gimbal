@@ -62,7 +62,7 @@ test('an enter or rotate the NEAR AI risk check held (no answer, no key, a rejec
   assert.equal(c?.text, 'Opening sol-phoenix-hyperliquid is waiting: the NEAR AI risk check did not answer, so nothing was sent. '
     + 'The desk asks again at the next hourly check (11:01 UTC). This is not a refusal, so the window is not held out for 6 h.');
   assert.match(refusedCopy(`enter sol-phoenix-hyperliquid not carried out: no NEAR AI key, so the NEAR AI risk check cannot answer: ${tail}`)?.text ?? '',
-    /^Opening sol-phoenix-hyperliquid is waiting: this engine has no NEAR AI key, so the NEAR AI risk check cannot answer, so nothing was sent\./);
+    /^Opening sol-phoenix-hyperliquid is waiting: this engine has no NEAR AI key, so the NEAR AI risk check cannot answer\. Nothing was sent\./);
   assert.match(refusedCopy(`enter sol-phoenix-hyperliquid not carried out: NEAR AI key rejected (HTTP 401: invalid api key), so the NEAR AI risk check cannot answer: ${tail}`)?.text ?? '',
     /^Opening sol-phoenix-hyperliquid is waiting: NEAR AI rejected this engine's key/);
   // A rotate keeps the held pair; a manual (demo) one is not tried again by itself.

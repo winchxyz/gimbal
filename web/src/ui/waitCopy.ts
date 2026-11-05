@@ -240,17 +240,18 @@ export function riskHeldCopy(raw: string): WaitCopy | null {
   if (!m) return null;
   const [, enterId, fromId, toId, why, , time, hours] = m as unknown as [string, string | undefined, string | undefined, string | undefined, string, string, string | undefined, string];
   const head = enterId !== undefined ? `Opening ${enterId} is waiting` : `Rotation from ${fromId} into ${toId} is waiting`;
+  // A key that is missing or rejected: "... cannot answer. Nothing was sent." (one "so" per sentence).
   const reason = why.startsWith('no NEAR AI key')
-    ? 'this engine has no NEAR AI key, so the NEAR AI risk check cannot answer'
+    ? 'this engine has no NEAR AI key, so the NEAR AI risk check cannot answer. Nothing was sent.'
     : why.startsWith('NEAR AI key rejected')
-      ? 'NEAR AI rejected this engine\'s key, so the NEAR AI risk check cannot answer'
-      : 'the NEAR AI risk check did not answer';
+      ? 'NEAR AI rejected this engine\'s key, so the NEAR AI risk check cannot answer. Nothing was sent.'
+      : 'the NEAR AI risk check did not answer, so nothing was sent.';
   const kept = fromId === undefined ? '' : ` ${fromId} is kept.`;
   const when = time === undefined
     ? 'It is not tried again by itself: ask again with POST /rotate.'
     : `The desk asks again at the next hourly check (${time} UTC).`;
   return {
-    text: `${head}: ${reason}, so nothing was sent.${kept} ${when} This is not a refusal, so the window is not held out for ${hours} h.`,
+    text: `${head}: ${reason}${kept} ${when} This is not a refusal, so the window is not held out for ${hours} h.`,
     raw, mapped: true,
   };
 }

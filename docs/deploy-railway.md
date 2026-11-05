@@ -226,8 +226,10 @@ scan.
   journal's `enter` line, the book and the risk ledger mark it as an owner demo entry (`demo: true`).
 - **`POST /close`**: both legs, reduce-only. It works with `auto` on or off and answers `409 no pair is held` when
   there is none. It never waits for the NEAR AI risk check: an enter or rotate still waiting on its check is cancelled
-  with nothing sent ("not carried out: a close came first; nothing sent") and the close runs right after; one already
-  sending orders ends first.
+  with nothing sent ("not carried out: a close came first; nothing sent") and the close runs right after. A rotate past
+  its pass stops before its next step (the price refresh, its close or the open): the close then closes the pair as
+  it is, and no new pair is opened only to be closed again. A second `POST /close` while one is queued or running is
+  refused.
 - **`PUT /strategy <the whole config>`**: every engine rule, the rescue and watch lines included (there is no
   separate risk route). Copy the last `control: engine rules before the call` line (every run logs it; also
   `GET /strategy` on the read-only view) and change only what you mean to. **Send every field**: a config without

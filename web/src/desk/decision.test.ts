@@ -73,7 +73,7 @@ test('a decision the engine publishes as a wait because the NEAR AI risk check i
   const tail = 'nothing sent; asked again at the next hourly check (2026-11-05T11:01:00.000Z); not a refusal, so no 6 h hold-out';
   const noKey = decisionLine(held(`enter sol-phoenix-hyperliquid not carried out: no NEAR AI key, so the NEAR AI risk check cannot answer: held, not passed: the act waits; ${tail}`), NOW)!;
   assert.equal(noKey.word, 'Waiting');
-  assert.equal(noKey.reason, 'Opening sol-phoenix-hyperliquid is waiting: this engine has no NEAR AI key, so the NEAR AI risk check cannot answer, so nothing was sent. '
+  assert.equal(noKey.reason, 'Opening sol-phoenix-hyperliquid is waiting: this engine has no NEAR AI key, so the NEAR AI risk check cannot answer. Nothing was sent. '
     + 'The desk asks again at the next hourly check (11:01 UTC). This is not a refusal, so the window is not held out for 6 h.');
   const silent = decisionLine(held(`enter sol-phoenix-hyperliquid not carried out: the NEAR AI risk check did not answer (no answer within 15 s, asked 2 times): held, not passed: the act waits; ${tail}`), NOW)!;
   assert.equal(silent.word, 'Waiting');

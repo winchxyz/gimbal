@@ -988,6 +988,8 @@ test('a manual close accepted while a check runs: the check\'s act waits for it;
   loop2.stop();
   await loop2.idle(1000);
   assert.equal(w2.closes.length, 0);
+  // An accepted close dropped by the stop says so, never silently.
+  assert.deepEqual(journal(w2).map((j) => [j.kind, j.summary]), [['refused', 'POST /close not carried out: serve is stopping; nothing sent; ask again after the restart']]);
 });
 
 test('hold: journaled on a change of category and once per hourly check, with the held net, P&L, hours held and bad checks', async () => {
@@ -1943,33 +1945,94 @@ test('POST /close during a rotate\'s pending risk check: accepted at once, the r
   assert.deepEqual(loop.counters.vetoedUntil, {});
 });
 
-test('POST /close after a rotate passed its risk check, before the open: queued, not refused; the rotate ends, then the close closes the new pair', async () => {
-  const w = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 } });
-  let loop: StrategyLoop | null = null;
-  let answer: ReturnType<StrategyLoop['close']> | null = null;
-  w.prepareAnswer = () => {
-    answer = loop!.close();
-    return OK('price fresh');
-  };
-  loop = makeLoop(w, tmpStore());
-  await loop.check();
-  w.next = ROTATE_ETH;
-  w.now += 60_000;
-  await loop.check();
-  await loop.idle(1000);
-  assert.deepEqual(answer, { ok: true });
-  // The rotate: SOL closed, ETH opened; then POST /close closes ETH.
-  assert.equal(w.opens.length, 1);
-  assert.equal(w.closes.length, 2);
-  assert.match(w.closes[0]!, /rotate out of sol-phoenix-hyperliquid/);
-  assert.match(w.closes[1]!, /POST \/close \(manual\)/);
-  assert.equal(w.held, null);
-  assert.deepEqual(journal(w).filter((j) => j.kind === 'rotate' || j.kind === 'exit').map((j) => j.kind), ['exit', 'rotate', 'exit']);
-  // A second close while one is queued is refused at once, never queued twice.
+test('POST /close after a rotate passed its risk check: the rotate stops before its next step (prepareOpen, its close, the open); no new pair is opened', async () => {
+  const KEPT = 'rotate sol-phoenix-hyperliquid -> eth-phoenix-hyperliquid not carried out: a close came first; sol-phoenix-hyperliquid is kept, nothing closed; NEAR AI risk check passed';
+  // 1. Before prepareOpen (nothing paid for a refresh): the close comes as the rotate's gate is read, right after its pass.
+  {
+    const w = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 }, prepareAnswer: () => OK('price fresh') });
+    let armed = false;
+    let answer: ReturnType<StrategyLoop['close']> | null = null;
+    let loop: StrategyLoop | null = null;
+    const veto = counting(async () => {
+      armed = true;
+      return passReply;
+    });
+    loop = makeLoop(w, tmpStore(), {
+      veto,
+      busy: () => {
+        if (armed) {
+          armed = false;
+          answer = loop!.close();
+        }
+        return null;
+      },
+    });
+    await loop.check();
+    w.next = ROTATE_ETH;
+    w.now += 60_000;
+    await loop.check();
+    await loop.idle(1000);
+    assert.deepEqual(answer, { ok: true });
+    assert.equal(veto.calls, 1);
+    assert.deepEqual([w.prepares.length, w.opens.length], [0, 0], 'no prepareOpen, nothing opened');
+    assert.equal(w.closes.length, 1, 'SOL closed once, by the close');
+    assert.match(w.closes[0]!, /POST \/close \(manual\)/);
+    assert.ok(journal(w).find((j) => j.kind === 'refused')!.summary.startsWith(KEPT));
+    assert.equal(journal(w).find((j) => j.kind === 'refused')!.numbers.cancelled, 1);
+    assert.equal(w.held, null);
+  }
+  // 2. Before the rotate's close (prepareOpen ran): SOL is kept for the close, which closes it.
+  {
+    const w = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 } });
+    let loop: StrategyLoop | null = null;
+    let answer: ReturnType<StrategyLoop['close']> | null = null;
+    w.prepareAnswer = () => {
+      answer = loop!.close();
+      return OK('price fresh');
+    };
+    loop = makeLoop(w, tmpStore());
+    await loop.check();
+    w.next = ROTATE_ETH;
+    w.now += 60_000;
+    await loop.check();
+    await loop.idle(1000);
+    assert.deepEqual(answer, { ok: true });
+    assert.deepEqual([w.prepares.length, w.opens.length], [1, 0]);
+    assert.equal(w.closes.length, 1, 'SOL closed once, by the close');
+    assert.match(w.closes[0]!, /POST \/close \(manual\)/);
+    assert.ok(journal(w).find((j) => j.kind === 'refused')!.summary.startsWith(KEPT));
+    assert.equal(w.held, null);
+  }
+  // 3. Before the open (SOL already closed by the rotate): the desk stays flat; the close finds nothing to close.
+  {
+    const w = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 }, prepareAnswer: () => OK('price fresh') });
+    let loop: StrategyLoop | null = null;
+    let answer: ReturnType<StrategyLoop['close']> | null = null;
+    w.closeAnswer = () => {
+      if (answer === null) answer = loop!.close();
+      return OK('closed both legs, flat');
+    };
+    loop = makeLoop(w, tmpStore());
+    await loop.check();
+    w.next = ROTATE_ETH;
+    w.now += 60_000;
+    await loop.check();
+    await loop.idle(1000);
+    assert.deepEqual(answer, { ok: true });
+    assert.equal(w.opens.length, 0, 'nothing opened');
+    assert.equal(w.closes.length, 1, 'SOL closed exactly once');
+    assert.match(w.closes[0]!, /rotate out of sol-phoenix-hyperliquid/);
+    const refused = journal(w).filter((j) => j.kind === 'refused').map((j) => j.summary);
+    assert.ok(refused[0]!.startsWith('rotate eth-phoenix-hyperliquid not carried out: a close came first; sol-phoenix-hyperliquid was closed, so the desk stays flat; nothing opened; NEAR AI risk check passed'), refused[0]);
+    assert.equal(refused[1], 'POST /close not carried out: no pair is held any more (the act before it left the desk flat); nothing sent');
+    assert.equal(w.held, null);
+    assert.equal(loop.held, null);
+  }
+  // A second close while one is queued or running is refused at once, never queued twice.
   const v = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 } });
   const two = makeLoop(v, tmpStore());
   assert.deepEqual(two.close(), { ok: true });
-  assert.deepEqual(two.close(), { ok: false, reason: 'a POST /close is already queued: it runs next' });
+  assert.deepEqual(two.close(), { ok: false, reason: 'a POST /close is queued or running: wait for its result' });
   await two.idle(1000);
   assert.equal(v.closes.length, 1);
 });

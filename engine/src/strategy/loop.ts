@@ -764,13 +764,14 @@ export class StrategyLoop {
   /**
    * POST /close: refused at once with the reason, or started. Works with auto on or off. It never waits for a NEAR AI
    * risk check: an enter or rotate whose check is pending, or queued and not checked yet, is cancelled with nothing
-   * sent ("a close came first"), and the close runs right after. An act already past its check (sending) ends first.
+   * sent ("a close came first"), and the close runs right after. An act already past its check stops before its next
+   * step that sends (a rotate's prepareOpen, its close, the open), so the close closes the pair as it is.
    */
   close(): { ok: true } | { ok: false; reason: string } {
     if (this.#stopped) return { ok: false, reason: 'serve is stopping' };
     if (!this.#o.trade) return { ok: false, reason: 'GIMBAL_TRADE is not 1: this engine trades nothing' };
     if (this.#o.hands === null) return { ok: false, reason: `no pair trader here: ${this.#o.handsWhy ?? 'nothing can be opened or closed'}` };
-    if (this.#closing) return { ok: false, reason: 'a POST /close is already queued: it runs next' };
+    if (this.#closing) return { ok: false, reason: 'a POST /close is queued or running: wait for its result' };
     const gate = this.#gate();
     if (gate !== null) return { ok: false, reason: gate };
     if (this.#o.hands.held() === null) return { ok: false, reason: 'no pair is held: nothing to close' };
@@ -779,7 +780,10 @@ export class StrategyLoop {
     void this.#serial(async () => {
       this.#acting = 'POST /close';
       try {
-        if (this.#stopped) return;
+        if (this.#stopped) {
+          this.#journal('refused', 'POST /close not carried out: serve is stopping; nothing sent; ask again after the restart', { by: 'POST /close (manual)' });
+          return;
+        }
         // The act before it (one past its risk check) may have left the desk flat.
         if (this.#o.hands!.held() === null) {
           this.#journal('refused', 'POST /close not carried out: no pair is held any more (the act before it left the desk flat); nothing sent', { by: 'POST /close (manual)' });
@@ -1265,11 +1269,20 @@ export class StrategyLoop {
     // An owner demo entry says so on every line after its risk check, with the cost the owner accepted: after the
     // line's own lead (`enter ID not carried out: `, `enter ID: `), which stays as without demo (web waitCopy.ts reads it).
     const tag = p.demo === undefined ? '' : `(${demoText(p.demo)}) `;
+    // Past its pass, an act still stops before each step that sends (the rotate's prepareOpen, which may pay for a
+    // refresh, its close, and the open) when serve is stopping or a POST /close was accepted: the close then runs on
+    // the pair as it is, and no new pair is opened only to be closed again.
+    const first = (): string | null => (this.#stopped ? 'serve is stopping' : this.#closing ? 'a close came first' : null);
     if (p.fromId !== null) {
       const gate = this.#gate();
       if (gate !== null) {
         this.#refuseOnce(key, `rotate ${p.fromId} -> ${w.id} not carried out: ${gate}; ${why}`);
         return { ...SKIPPED, passing: true, result: `not rotated: ${gate}` };
+      }
+      const beforePrepare = first();
+      if (beforePrepare !== null) {
+        this.#journal('refused', `rotate ${p.fromId} -> ${w.id} not carried out: ${beforePrepare}; ${p.fromId} is kept, nothing closed; ${why}`, { ...base, from: p.fromId, cancelled: 1 });
+        return { ...SKIPPED, passing: true };
       }
       // The target's stored price before the held pair is closed: a refresh that fails keeps the pair held, where
       // the open after the close would leave the desk flat.
@@ -1281,8 +1294,9 @@ export class StrategyLoop {
           return { ...SKIPPED, passing: this.#gate() !== null, result: `not rotated: ${ready.reason}`, ...(ready.refreshed === true ? { paidRefusal: ready.reason } : {}) };
         }
       }
-      if (this.#stopped) {
-        this.#journal('refused', `rotate ${p.fromId} -> ${w.id} not carried out: serve is stopping; ${p.fromId} is kept, nothing closed; ${why}`, { ...base, from: p.fromId });
+      const beforeClose = first();
+      if (beforeClose !== null) {
+        this.#journal('refused', `rotate ${p.fromId} -> ${w.id} not carried out: ${beforeClose}; ${p.fromId} is kept, nothing closed; ${why}`, { ...base, from: p.fromId, cancelled: 1 });
         return { ...SKIPPED, passing: true };
       }
       const closeAt = this.#o.clock.now();
@@ -1304,9 +1318,10 @@ export class StrategyLoop {
       this.#journal('refused', `${kind} ${w.id} not carried out: ${tag}${gate}${flat}; ${why}`, base);
       return p.fromId === null ? { ...SKIPPED, passing: true, result: `not opened: ${gate}` } : { end: 'flat', sent: true, passing: true, result: `not opened: ${gate}` };
     }
-    if (this.#stopped) {
-      this.#journal('refused', `${kind} ${w.id} not carried out: ${tag}serve is stopping${flat}; nothing opened; ${why}`, base);
-      return p.fromId === null ? { ...SKIPPED, passing: true } : { end: 'flat', sent: true, passing: true, result: 'not opened: serve is stopping' };
+    const beforeOpen = first();
+    if (beforeOpen !== null) {
+      this.#journal('refused', `${kind} ${w.id} not carried out: ${tag}${beforeOpen}${flat}; nothing opened; ${why}`, { ...base, cancelled: 1, ...(p.fromId === null ? {} : { from: p.fromId }) });
+      return p.fromId === null ? { ...SKIPPED, passing: true } : { end: 'flat', sent: true, passing: true, result: `not opened: ${beforeOpen}` };
     }
     const openAt = this.#o.clock.now();
     const opened = await hands.open({
