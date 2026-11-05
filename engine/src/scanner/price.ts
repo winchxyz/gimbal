@@ -107,6 +107,25 @@ export type PriceResult = { ok: true; priced: PricedWindow } | { ok: false; reas
  */
 export const NO_BREAKEVEN_TEXT = 'Does not break even within a year at today\'s rates';
 
+/**
+ * A window check with its category: `profit` on the checks of what the window is expected to earn against what it
+ * costs (carry.ts carryChecks on a spread that pays, and the break-even checks), which an owner demo entry waives
+ * (strategy/loop.ts); absent on every other check, a safety check none waives, funding against the position included
+ * (carryChecks leaves it off a spread not known, mixed, or of 0 or less over the hold). An extra optional field on Window.checks: a reader that does not
+ * know it sees `ok` and `text` as before.
+ */
+export type WindowCheck = FundingWindow['checks'][number] & { kind?: 'profit' };
+
+/** A profit check (WindowCheck): failing unless `ok`. */
+export function profitCheck(text: string, ok = false): WindowCheck {
+  return { ok, text, kind: 'profit' };
+}
+
+/** Whether a check is a profit check (WindowCheck.kind), the only kind an owner demo entry waives. */
+export function isProfitCheck(c: FundingWindow['checks'][number]): boolean {
+  return (c as WindowCheck).kind === 'profit';
+}
+
 /** Money for a check line: cents under $100, whole dollars to $10k, then k and M. */
 export function usd(n: number): string {
   const a = Math.abs(n);
@@ -122,6 +141,11 @@ export function usd(n: number): string {
  */
 export function isEnterable(w: FundingWindow): boolean {
   return w.tradable && w.refused === undefined && !w.stale && w.checks.every((c) => c.ok) && w.veto?.verdict !== 'veto';
+}
+
+/** As isEnterable with the profit checks waived (an owner demo entry, strategy/loop.ts): every other check still counts. */
+export function isEnterableButForProfit(w: FundingWindow): boolean {
+  return w.tradable && w.refused === undefined && !w.stale && w.checks.every((c) => c.ok || isProfitCheck(c)) && w.veto?.verdict !== 'veto';
 }
 
 /**
@@ -223,12 +247,12 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
   if (staleVenues.length > 0) {
     head.push({ ok: false, text: `${venueNames(staleVenues)} did not answer: numbers from ${Math.max(0, Math.round((ctx.now - oldest) / 1000))} s ago` });
   }
-  const tail: FundingWindow['checks'] = [];
+  const tail: WindowCheck[] = [];
   for (const leg of [long, short]) {
     if (leg.heldOnly !== undefined) tail.push({ ok: false, text: `Kept only because the desk holds it: ${venueName(leg.venue)} ${leg.symbol} ${leg.heldOnly}` });
     else if (leg.deskOnly !== undefined) tail.push({ ok: false, text: `Shown for its multi-day spread, not entered: ${venueName(leg.venue)} ${leg.symbol} ${leg.deskOnly}` });
   }
-  if (be === null) tail.push({ ok: false, text: NO_BREAKEVEN_TEXT });
+  if (be === null) tail.push(profitCheck(NO_BREAKEVEN_TEXT));
   if (basisUsd === null) {
     const missing = [long, short].filter((l) => l.markPx === null).map((l) => l.venue);
     tail.push({ ok: false, text: `No mark on ${venueNames(missing)}: basis not priced` });

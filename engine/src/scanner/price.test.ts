@@ -9,7 +9,7 @@ import { DEFAULT_COSTS, DEFAULT_STRATEGY } from './config.ts';
 import { pairLegs } from './pairs.ts';
 import type { Pair, ScanLeg } from './pairs.ts';
 import type { BookRead, OracleSource, PricedWindow, PricingContext } from './price.ts';
-import { ORACLE_MAX_SKEW_MS, deskVerdict, isEnterable, priceWindow, switchCostUsd, usd } from './price.ts';
+import { NO_BREAKEVEN_TEXT, ORACLE_MAX_SKEW_MS, deskVerdict, isEnterable, isEnterableButForProfit, isProfitCheck, priceWindow, switchCostUsd, usd } from './price.ts';
 import { T0, book, leg } from './test-helpers.ts';
 import type { Book } from '../venues/venue.ts';
 
@@ -229,6 +229,26 @@ test('a book too thin for the leg prices what it fills, fails a check, and is no
   near(breakdown.slippageUsd, 10 / 100.01 + 10 / 99.99 + 0.05 + 0.05);
   assert.equal(w.refused, undefined);
   assert.equal(isEnterable(w), false);
+});
+
+test('kind: the break-even check is a profit check, every other check a safety check; only profit checks are waived', () => {
+  // The same rate on both legs: the spread pays nothing, so the one-off costs never break even.
+  const flat = leg('hyperliquid', 'SOL', { ratePerHour: 0.00001, markPx: 99.995, openInterest: 50_000 });
+  const { window: w } = priced(LONG, flat, ctx({ policy: POLICY, oracle: FRESH }));
+  const breakEven = w.checks.find((c) => c.text === NO_BREAKEVEN_TEXT);
+  assert.deepEqual(breakEven, { ok: false, text: NO_BREAKEVEN_TEXT, kind: 'profit' });
+  assert.ok(w.checks.filter((c) => c !== breakEven).every((c) => !isProfitCheck(c) && !('kind' in c)), JSON.stringify(w.checks));
+  assert.equal(isEnterable(w), false);
+  assert.equal(isEnterableButForProfit(w), true, 'only the profit check fails');
+  // A safety check that fails is never waived: a thin book.
+  const thin: BookRead = { book: book('hyperliquid', 'SOL', 99.99, 100.01, 5), readAt: T0, stale: false };
+  const t = priced(LONG, flat, ctx({ policy: POLICY, oracle: FRESH }, { hyperliquid: thin })).window;
+  assert.equal(isEnterableButForProfit(t), false);
+  // Nor anything else: refused, stale, vetoed, watch only.
+  assert.equal(isEnterableButForProfit({ ...w, refused: { code: 'E_ASSET', reason: 'test' } }), false);
+  assert.equal(isEnterableButForProfit({ ...w, stale: true }), false);
+  assert.equal(isEnterableButForProfit({ ...w, veto: { verdict: 'veto', reasons: ['test'], model: 'test', at: T0 } }), false);
+  assert.equal(isEnterableButForProfit({ ...w, tradable: false }), false);
 });
 
 test('watch-only pairs: gross and basis priced, fees, slippage and reserve not, and the check says so', () => {

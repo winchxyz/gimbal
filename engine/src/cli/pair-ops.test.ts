@@ -149,6 +149,8 @@ interface PlanWorldOptions {
   resting?: unknown[];
   /** The contract's FeeConfig.hl_builder_tenth_bps as config() gives it. Default 10 (1 bp); null: config() has none. */
   builderTenthBps?: number | null;
+  /** Hyperliquid's funding now (the 7-day mean without history), fraction per hour. Default 0.0002. */
+  hlRatePerHour?: number;
 }
 
 /**
@@ -184,7 +186,7 @@ function planWorld(o: PlanWorldOptions) {
     client, config: { fees: o.builderTenthBps === null ? {} : { hl_builder_tenth_bps: o.builderTenthBps ?? 10 } }, desk: { policy, paused: o.desk?.paused ?? false, closing: o.desk?.closing ?? false, evm_address: '0xDESK' },
     hlUrl: 'http://hl.plan.test', phoenixUrl: 'http://phoenix.plan.test',
     hl: {
-      funding: async () => [{ symbol: sym, ratePerHour: 0.0002 }], marketFundingHistory: async () => [],
+      funding: async () => [{ symbol: sym, ratePerHour: o.hlRatePerHour ?? 0.0002 }], marketFundingHistory: async () => [],
       markets: async () => [{ symbol: sym, maxLeverage: 25 }], book,
     },
     phoenix: {
@@ -464,6 +466,37 @@ test('a refresh that moves the price over the band from what the plan judged on:
   assert.equal(refused.paid, true);
   assert.match(refused.refused ?? '', /^the stored ETH price after refresh_prices is 2540, 160 bps from the 2500 the open was judged on \(over the 100 bps band\), and planned again the open refuses: the desk authority holds/);
   await assert.rejects(sendOpen(low.ctx, low.pair, refused.plan), /open refused, nothing signed/);
+});
+
+test('an owner demo entry reaches the carry plan: a small positive spread is waived, kept through a replan; funding against it never is', async () => {
+  // Hyperliquid pays the short 0.000001/h: over 7 days a 50 USD leg earns about $0.0084, short of the round trip.
+  const small = planWorld({ send: true, hlRatePerHour: 0.000001, refreshedPx: 2540 });
+  const plain = await withVenues(() => planOpen(small.ctx, small.pair, small.request));
+  assert.match(plain.carry.costRefusal ?? '', /^the expected spread over 7 days, \$0\.0084, does not cover the round trip/);
+  const demoWorld = planWorld({ send: true, hlRatePerHour: 0.000001, refreshedPx: 2540 });
+  const request = { ...demoWorld.request, demo: { maxLossUsd: 1 } };
+  const demo = await withVenues(() => planOpen(demoWorld.ctx, demoWorld.pair, request));
+  assert.equal(demo.carry.costRefusal, null);
+  assert.match(demo.carry.waived ?? '', /^the expected spread over 7 days, \$0\.0084, does not cover the round trip/);
+  assert.deepEqual(demo.refusals, []);
+  assert.deepEqual(demo.request.demo, { maxLossUsd: 1 });
+  assert.match(demoWorld.said.join('\n'), /does NOT cover the round trip \(waived: an owner demo entry\)/);
+  // The refresh moves the price over the band: planned again on the same request, demo and its waiver kept.
+  const fresh = await withVenues(() => refreshForOpen(demoWorld.ctx, demoWorld.pair, demo));
+  assert.deepEqual([fresh.refused, fresh.paid], [null, true]);
+  assert.notEqual(fresh.plan, demo);
+  assert.deepEqual(fresh.plan.request.demo, { maxLossUsd: 1 });
+  assert.notEqual(fresh.plan.carry.waived, null);
+  assert.deepEqual(fresh.plan.refusals, []);
+  // The round trip over maxLossUsd: refused, with both numbers.
+  const tight = planWorld({ send: true, hlRatePerHour: 0.000001 });
+  const over = await withVenues(() => planOpen(tight.ctx, tight.pair, { ...tight.request, demo: { maxLossUsd: 0.01 } }));
+  assert.match(over.refusals.join('\n'), /owner demo entry: the round trip \$0\.\d{4} on this open's books is over the \$0\.0100 the owner accepted \(maxLossUsd\)/);
+  // Hyperliquid charging the short (funding against the position): refused for cost, demo or not.
+  const against = planWorld({ send: true, hlRatePerHour: -0.000001 });
+  const refused = await withVenues(() => planOpen(against.ctx, against.pair, { ...against.request, demo: { maxLossUsd: 1 } }));
+  assert.equal(refused.carry.waived, null);
+  assert.match(refused.carry.costRefusal ?? '', /^the expected spread over 7 days, -\$0\.0084, does not cover the round trip/);
 });
 
 test('planning again takes the price past the headroom: refused, paid, before anything else runs', async () => {

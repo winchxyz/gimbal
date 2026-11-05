@@ -103,6 +103,8 @@ interface World {
   /** refresh_prices throws this, when set (an RPC error before the call reached the chain). */
   refreshFails: Error | null;
   stored: { asset: string; price_e8: string; at_ms: number } | null;
+  /** Each open's request.demo as the stand-in carry got it (an owner demo entry; undefined: none). */
+  demos: unknown[];
 }
 
 function world(symbol = 'XLM', env: Record<string, string> = {}): World {
@@ -110,7 +112,7 @@ function world(symbol = 'XLM', env: Record<string, string> = {}): World {
   return {
     dir, env: { LOCALAPPDATA: dir, XDG_STATE_HOME: dir, ...env },
     hl: new Leg('hyperliquid', symbol), px: new Leg('phoenix', symbol), openOrders: [], signed: 0, cancels: [], lines: [], refuse: [], throwAfterOrder: false, hlHeldFails: null, signingFails: null,
-    refreshes: 0, refreshFails: null, stored: null,
+    refreshes: 0, refreshFails: null, stored: null, demos: [],
   };
 }
 
@@ -164,6 +166,7 @@ function input(w: World, extra: Partial<ServePairInput> = {}): ServePairInput {
 function testCarry(c: CarryInput, w: World): SlotCarry {
   return {
     open: async (request, out) => {
+      w.demos.push(request.demo);
       if (w.refuse.length > 0) return { refusals: [...w.refuse], results: [], ...(w.costRefuse === undefined ? {} : { costRefused: w.costRefuse }) };
       if (w.throwAfterOrder) {
         await c.pair.hedge(0, 'SELL', toQty('1'), false, 'test: an order signed inside the open', true);
@@ -631,6 +634,22 @@ test('the hands (strategy loop): a flat desk opens through the pair, is held and
     assert.equal(w.px.pos, 0n);
     assert.ok(w.hl.orders.slice(before).every((o) => o.reduceOnly));
     assert.equal(hands.heldSymbol(), null);
+    p.stop();
+  } finally {
+    rmSync(w.dir, { recursive: true, force: true });
+  }
+});
+
+test('the hands pass an owner demo entry to the carry open as asked; a plain open carries none', async () => {
+  const w = world('XLM', { GIMBAL_TRADE: '1', GIMBAL_TRADER_FRESH: `${CONTRACT}/${DESK}` });
+  try {
+    const p = await servePair(input(w));
+    const hands = p.hands!;
+    w.refuse = ['test: refused after the plan'];
+    await hands.open({ symbol: 'XLM', legUsd: 10, leverage: 1.5, reason: 'strategy: enter xlm-phoenix-hyperliquid (manual, owner demo entry)', demo: { maxLossUsd: 0.25 } });
+    await hands.open({ symbol: 'XLM', legUsd: 10, leverage: 1.5, reason: 'strategy: enter xlm-phoenix-hyperliquid' });
+    assert.deepEqual(w.demos, [{ maxLossUsd: 0.25 }, undefined]);
+    assert.equal(w.hl.orders.length + w.px.orders.length, 0);
     p.stop();
   } finally {
     rmSync(w.dir, { recursive: true, force: true });

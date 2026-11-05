@@ -205,6 +205,73 @@ test('window facts: the 14 days and open interest from the carry, lots and the m
   assert.equal(bookReads, 2, 'the mid is kept for 30 s');
 });
 
+test('window facts: lots for the 6 best enterable windows and the windows named (a demo target); the round trip only when tradable and priced', async () => {
+  const SYMS = ['S1', 'S2', 'S3', 'S4', 'S5', 'S6', 'S7', 'ZEC', 'XMR', 'DOGE'];
+  const win = (symbol: string, over: Partial<FundingWindow> = {}): FundingWindow => ({
+    id: `${symbol.toLowerCase()}-phoenix-hyperliquid`, symbol, longVenue: 'phoenix', shortVenue: 'hyperliquid', tradable: true, stale: false,
+    checks: [{ ok: true, text: 'ok' }], netAprPct: 20, held: null, ...over,
+  }) as unknown as FundingWindow;
+  const reads = { markets: 0, books: [] as string[] };
+  const reader = (id: string) => ({
+    id,
+    markets: async () => {
+      reads.markets++;
+      return SYMS.map((symbol) => ({ symbol, lotSize: 0.01 }));
+    },
+    book: async (symbol: string) => {
+      reads.books.push(`${id} ${symbol}`);
+      return { bids: [{ px: 99, sz: 1 }], asks: [{ px: 101, sz: 1 }] };
+    },
+  }) as unknown as VenueReader;
+  const rt = (totalUsd: number) => ({ totalUsd });
+  const carries: Record<string, unknown> = {
+    'zec-phoenix-hyperliquid': { estimate: { gross: { d14AprPct: -1 }, roundTrip: rt(0.04) }, long: { oiUsd: 1 }, short: { oiUsd: 1 }, roundTripPriced: true },
+    // Put together with unknown costs as 0: not a bound for a demo entry.
+    'xmr-phoenix-hyperliquid': { estimate: { gross: { d14AprPct: 1 }, roundTrip: rt(0.01) }, long: { oiUsd: 1 }, short: { oiUsd: 1 }, roundTripPriced: false },
+    // Watch only: left out.
+    'doge-phoenix-hyperliquid': { estimate: { gross: { d14AprPct: 1 }, roundTrip: rt(0.02) }, long: { oiUsd: 1 }, short: { oiUsd: 1 }, roundTripPriced: true },
+    's1-phoenix-hyperliquid': { estimate: { gross: { d14AprPct: 30 }, roundTrip: rt(0.05) }, long: { oiUsd: 1 }, short: { oiUsd: 1 }, roundTripPriced: true },
+    // A stub with no round trip at all.
+    's2-phoenix-hyperliquid': { estimate: { gross: { d14AprPct: 30 } }, long: { oiUsd: 1 }, short: { oiUsd: 1 } },
+  };
+  const make = () => windowFacts({
+    carry: (id) => (carries[id] ?? null) as WindowCarry | null, venues: [reader('hyperliquid'), reader('phoenix')], symbols: () => SYMS,
+    clock: { now: () => 0 }, log: () => {},
+  });
+  const profitFail = { ok: false, text: 'does not pay', kind: 'profit' } as FundingWindow['checks'][number];
+  const windows = [
+    ...['S1', 'S2', 'S3', 'S4', 'S5', 'S6', 'S7'].map((s, i) => win(s, { netAprPct: 70 - i })),
+    win('ZEC', { netAprPct: -3, checks: [profitFail] }),
+    win('XMR', { netAprPct: -2, checks: [profitFail] }),
+    win('DOGE', { tradable: false, checks: [profitFail] }),
+  ];
+  const ids = (f: { lots?: Record<string, unknown> }) => Object.keys(f.lots ?? {}).sort();
+  const top6 = ['s1', 's2', 's3', 's4', 's5', 's6'].map((s) => `${s}-phoenix-hyperliquid`);
+  const booksOf = (list: string[]) => list.flatMap((id) => {
+    const s = id.split('-')[0]!.toUpperCase();
+    return [`hyperliquid ${s}`, `phoenix ${s}`];
+  }).sort();
+
+  // No lotsFor: the same reads as before, the 6 best enterable windows (S7 past the cap, ZEC and XMR not enterable).
+  const plain = await make()(windows);
+  assert.deepEqual(ids(plain), top6);
+  assert.equal(reads.markets, 2, 'each venue\'s markets once');
+  assert.deepEqual(reads.books.sort(), booksOf(top6));
+  assert.deepEqual(plain.roundTripUsd, { 'zec-phoenix-hyperliquid': 0.04, 's1-phoenix-hyperliquid': 0.05 });
+
+  // A window named in lotsFor, past MAX_LOT_WINDOWS and not enterable: read by name, and only it is added.
+  reads.markets = 0;
+  reads.books.length = 0;
+  const named = await make()(windows, ['zec-phoenix-hyperliquid']);
+  assert.deepEqual(ids(named), [...top6, 'zec-phoenix-hyperliquid'].sort());
+  assert.deepEqual(named.lots!['zec-phoenix-hyperliquid'], { longLot: 0.01, shortLot: 0.01, px: 100 });
+  assert.deepEqual(reads.books.sort(), booksOf([...top6, 'zec-phoenix-hyperliquid']));
+  // A named window that is watch only, or not in the scan, gets no lots.
+  const watch = await make()(windows, ['doge-phoenix-hyperliquid', 'nope-phoenix-hyperliquid']);
+  assert.deepEqual(ids(watch), top6);
+  assert.equal(watch.roundTripUsd!['doge-phoenix-hyperliquid'], undefined);
+});
+
 test('fillsOf: each leg summed over its orders, size-weighted price, a fee not reported makes the leg fee unknown', () => {
   const ref = (venue: string, side: 'BUY' | 'SELL') => ({ venue, side, size: '1', reduceOnly: false, orderId: null, clientId: null, tx: [], sentAt: 0 });
   const order = (venue: string, side: 'BUY' | 'SELL', filled: string | null, avgPx: number | null, fee: number | null) =>
@@ -370,6 +437,15 @@ test('loopHands: the held symbol\'s legs only, one leg named, busy() refusing fi
   const refused = await cost.open({ window: deskWin('sol-phoenix-hyperliquid'), symbol: 'SOL', legUsd: 12, leverage: 1, qty: '0.12', reason: 'test' });
   assert.deepEqual([refused.ok, refused.sent, refused.costRefused], [false, false, why]);
   assert.equal(opened.costRefused, undefined);
+  // An owner demo entry reaches the pair's open as the loop asked it; a plain open carries none.
+  const demos: unknown[] = [];
+  const demo = loopHands({ ...pair, open: async (r) => {
+    demos.push(r.demo);
+    return { ok: false, reason: 'test', results: [], lines: [], open: [], tx: [], feeUsd: 0 };
+  } }, () => desk, () => {}, () => null);
+  await demo.open({ window: deskWin('sol-phoenix-hyperliquid'), symbol: 'SOL', legUsd: 12, leverage: 1, qty: '0.12', reason: 'test', demo: { maxLossUsd: 0.25 } });
+  await demo.open({ window: deskWin('sol-phoenix-hyperliquid'), symbol: 'SOL', legUsd: 12, leverage: 1, qty: '0.12', reason: 'test' });
+  assert.deepEqual(demos, [{ maxLossUsd: 0.25 }, undefined]);
 });
 
 test('depth at size: a long walks the asks, a short the bids; the fill\'s distance from the mid in bps, unknown when the levels read do not fill it', () => {

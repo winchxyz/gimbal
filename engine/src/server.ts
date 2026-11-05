@@ -35,6 +35,7 @@ import type { PolicyDrafter } from './nearai/draft-route.ts';
 import { setupRoute } from './setup/route.ts';
 import type { SetupStarter } from './setup/route.ts';
 import { parseStrategyConfig } from './scanner/config.ts';
+import { parseDemo } from './strategy/loop.ts';
 import type { ScanResult, Scanner } from './scanner/scanner.ts';
 import type { RiskEngine } from './risk/engine.ts';
 import { stressRoute } from './risk/stress-route.ts';
@@ -123,9 +124,12 @@ export interface EngineServerOptions {
   keepJournal?: (entry: JournalEntry) => void;
 }
 
-/** What POST /rotate and /close call: they answer at once, whether the act was started or why not. */
+/**
+ * What POST /rotate and /close call: they answer at once, whether the act was started or why not. `demo`: POST
+ * /rotate's demo as sent (an owner demo entry, checked by the loop: strategy/loop.ts parseDemo); absent when not sent.
+ */
 export interface StrategyHands {
-  rotate(windowId: unknown): { ok: true } | { ok: false; reason: string };
+  rotate(windowId: unknown, demo?: unknown): { ok: true } | { ok: false; reason: string };
   close(): { ok: true } | { ok: false; reason: string };
 }
 
@@ -488,14 +492,20 @@ export class EngineServer {
       const loop = this.#options.strategyLoop;
       if (loop === undefined) return json(res, 503, { ok: false, reason: 'no strategy loop in this engine: nothing is entered or closed here' });
       let answer: { ok: true } | { ok: false; reason: string };
+      let route = path === '/rotate' ? 'POST /rotate' : 'POST /close';
       if (path === '/rotate') {
         const windowId = body !== null && typeof body === 'object' ? (body as { windowId?: unknown }).windowId : undefined;
         if (typeof windowId !== 'string' || windowId.trim() === '') return json(res, 400, { ok: false, reason: 'POST /rotate needs { "windowId": "<window id>" }' });
-        answer = loop.rotate(windowId);
+        // `demo` sent (null included) is checked here first (409 with parseDemo's reason), and again by the loop.
+        const sent = Object.prototype.hasOwnProperty.call(body, 'demo');
+        const demo = (body as { demo?: unknown }).demo;
+        const parsed = sent ? parseDemo(demo) : null;
+        route = sent ? `POST /rotate (owner demo entry ${JSON.stringify(demo) ?? String(demo)})` : 'POST /rotate';
+        answer = parsed === null ? loop.rotate(windowId) : 'refused' in parsed ? { ok: false, reason: parsed.refused } : loop.rotate(windowId, parsed);
       } else {
         answer = loop.close();
       }
-      this.#log(`${path === '/rotate' ? 'POST /rotate' : 'POST /close'}: ${answer.ok ? 'started' : `refused, ${answer.reason}`}`);
+      this.#log(`${route}: ${answer.ok ? 'started' : `refused, ${answer.reason}`}`);
       return json(res, answer.ok ? 200 : 409, answer);
     }
     if (path === '/stress') {

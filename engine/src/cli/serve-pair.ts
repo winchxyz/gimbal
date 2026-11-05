@@ -200,10 +200,18 @@ export interface RefreshAllowance {
   onPaidRefresh?: () => void;
 }
 
+/**
+ * An owner demo entry's open (the strategy loop's POST /rotate with demo): the trader waives its refusal for the
+ * spread not covering the round trip, and refuses a round trip over maxLossUsd instead (carry-plan.ts carryPlan).
+ */
+export interface DemoOpen {
+  maxLossUsd: number;
+}
+
 /** pair-mainnet's open and close (pair-ops.ts) on one pair's legs, sending through its ProtectedPair. */
 export interface SlotCarry {
   /** `gate`: why nothing may be sent now (a rescue, an ADL unwind or panic_close running), checked again before each part. */
-  open(request: { legUsd: number; leverage: number; reason: string; qty?: string; gate?: () => string | null } & RefreshAllowance, out: CarryOut): Promise<CarryResult>;
+  open(request: { legUsd: number; leverage: number; reason: string; qty?: string; gate?: () => string | null; demo?: DemoOpen } & RefreshAllowance, out: CarryOut): Promise<CarryResult>;
   close(request: { reason: string }, out: CarryOut): Promise<CarryResult>;
 }
 
@@ -353,7 +361,7 @@ export interface PairHands {
    * maker first (or two IOCs at once without a Hyperliquid leg). `gate` is asked again right before the first order and
    * before each later part: a reason refuses (or stops) the open there.
    */
-  open(request: { symbol: string; long?: VenueId; short?: VenueId; legUsd: number; leverage: number; reason: string; qty?: string; gate?: () => string | null } & Pick<RefreshAllowance, 'noRefresh'>): Promise<HandsResult>;
+  open(request: { symbol: string; long?: VenueId; short?: VenueId; legUsd: number; leverage: number; reason: string; qty?: string; gate?: () => string | null; demo?: DemoOpen } & Pick<RefreshAllowance, 'noRefresh'>): Promise<HandsResult>;
   /**
    * The trader's record against its last live reads (reconcileWithVenues): when they disagree on one leg or flat, two
    * agreeing venue reads that confirm it are adopted as the record. The line says what changed; null: nothing did.
@@ -1335,7 +1343,7 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           const r = await slot.carry.open({
             legUsd: request.legUsd, leverage: request.leverage, reason: request.reason,
             ...(request.qty === undefined ? {} : { qty: request.qty }), ...(request.gate === undefined ? {} : { gate: request.gate }),
-            ...(request.noRefresh === undefined ? {} : { noRefresh: request.noRefresh }),
+            ...(request.noRefresh === undefined ? {} : { noRefresh: request.noRefresh }), ...(request.demo === undefined ? {} : { demo: request.demo }),
             onPaidRefresh: () => {
               paid++;
             },
@@ -1554,11 +1562,12 @@ export function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string
       try {
         plan = await planOpen(ctx, pair, {
           symbol: p.symbol, legUsd: request.legUsd, leverage: request.leverage, holdDays: SERVE_HOLD_DAYS, basisBps: SERVE_BASIS_BPS,
-          ...(request.qty === undefined ? {} : { qty: request.qty }),
+          ...(request.qty === undefined ? {} : { qty: request.qty }), ...(request.demo === undefined ? {} : { demo: request.demo }),
         });
       } finally {
         p.planning(false);
       }
+      if (plan.carry.waived !== null) out.say(`demo      owner demo entry: waived, the ${plan.carry.waived}`);
       // Every refusal that needs no fresh price first: the plan's (the closing desk among them), a maker timeout the
       // price cannot outlive (buildPair's), the gate, and the loop's daily cap on refreshes. Only then refresh_prices.
       const refusals = [...plan.refusals];

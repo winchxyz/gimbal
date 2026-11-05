@@ -449,6 +449,11 @@ export interface OpenRequest {
    * down to whole lots (pair-mainnet open). legUsd is still held to the policy cap.
    */
   qty?: string;
+  /**
+   * An owner demo entry (the strategy loop's POST /rotate with demo): the spread need not cover the round trip, which
+   * must be at most maxLossUsd (carry-plan.ts carryPlan). Absent: none; pair-mainnet never sets it.
+   */
+  demo?: { maxLossUsd: number };
 }
 
 export interface OpenPlan {
@@ -605,7 +610,7 @@ export async function planOpen(ctx: OpsCtx, pair: Pair, request: OpenRequest): P
   const shortI: 0 | 1 = longI === 0 ? 1 : 0;
   const short = legInput(shortI);
   const long = legInput(longI);
-  const plan = carryPlan({ symbol, legUsd, leverage, holdDays, basisBufferBps: basisBps, short, long });
+  const plan = carryPlan({ symbol, legUsd, leverage, holdDays, basisBufferBps: basisBps, short, long, ...(request.demo === undefined ? {} : { demo: request.demo }) });
   refusals.push(...plan.refusals);
 
   // The stored price. One missing (a contract that never had refresh_prices) or too old to live the first part is not
@@ -950,7 +955,7 @@ function printCarry(
     : `          round trip ${rt.bps.toFixed(2)} bps = ${usd(rt.totalUsd)}: 4 fills ${usd(rt.feesUsd)} (${short.feeBps} + ${long.feeBps} bps each way), `
       + `slippage ${usd(rt.slippageUsd)} (the books walked at ${usd(legUsd)}), basis buffer ${usd(rt.basisBufferUsd)} (adverse gap of the mids `
       + `${mids.map((m) => (m === null ? '?' : m.toString())).join(' / ')} + ${basisBps} bps)`);
-  say(`          ${plan.costRefusal === null ? 'covers the round trip' : 'does NOT cover the round trip'}`);
+  say(`          ${plan.costRefusal === null && plan.waived === null ? 'covers the round trip' : `does NOT cover the round trip${plan.waived === null ? '' : ' (waived: an owner demo entry)'}`}`);
   for (const [i, l] of plan.legs.entries()) {
     const src = i === 0 ? short : long;
     const eff = Number.isFinite(l.effectiveLeverage) ? `${l.effectiveLeverage.toFixed(2)}x` : 'no equity';

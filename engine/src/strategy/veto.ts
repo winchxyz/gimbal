@@ -67,10 +67,21 @@ export interface VetoFacts {
    * minimum is waived and leaves the streak out, rather than show a minimum the act was never held to. Absent: auto.
    */
   manual?: boolean;
+  /**
+   * An owner demo entry (POST /rotate with demo, always manual): its profit checks are waived, and the owner accepted
+   * a round-trip cost estimate of at most maxLossUsd (the window's estimate: roundTripUsd); funding during the hold is
+   * expected positive (the spread must be) and is not part of that bound. The prompt says so. Absent: none.
+   */
+  demo?: { maxLossUsd: number; roundTripUsd: number };
 }
 
 /** What a manual act's prompt says in place of the owner's minimum. */
 export const MANUAL_MINIMUM = 'waived: the owner asked for this trade';
+/** What a demo entry's prompt says it is. */
+export const DEMO_ENTRY_TEXT = 'an owner-requested demonstration entry: the profit checks (the owner minimum, the round trip paid back, break-even) '
+  + 'are waived; every other check passed, the expected funding spread over the hold included, which must be positive. '
+  + 'owner_accepted_cost_usd bounds the estimated round-trip cost (fees, slippage, basis buffer) only: funding during the '
+  + 'hold is expected positive and is not part of that bound';
 
 /** The most reasons kept from a reply, and the longest. */
 const MAX_REASONS = 3;
@@ -92,6 +103,7 @@ Facts given as null are unknown: never veto because a fact is unknown.
 Answer with one JSON object and nothing else: {"verdict": "pass" or "veto", "reasons": [up to 3 short sentences, each naming the fact and its number]}. With "pass", reasons may be empty.`;
 
 const r2 = (n: number | null) => (n === null ? null : Math.round(n * 100) / 100);
+const r4 = (n: number) => Math.round(n * 1e4) / 1e4;
 
 /** The messages that ask for a verdict on `facts`: deterministic, so a recording is found again by them. */
 export function vetoMessages(facts: VetoFacts): ChatMessage[] {
@@ -101,8 +113,12 @@ export function vetoMessages(facts: VetoFacts): ChatMessage[] {
   const gate = facts.manual === true
     ? { manual: true, owner_minimum_net_apr_pct: MANUAL_MINIMUM }
     : { owner_minimum_net_apr_pct: r2(facts.minNetAprPct), hours_in_a_row_above_minimum: facts.hoursAbove };
+  // A demo entry says what it is and what it may cost: the owner accepted that cost; the risks are judged as ever.
+  const demo = facts.demo === undefined ? {} : {
+    demo_entry: DEMO_ENTRY_TEXT, expected_round_trip_cost_usd: r4(facts.demo.roundTripUsd), owner_accepted_cost_usd: r4(facts.demo.maxLossUsd),
+  };
   const f = {
-    trade: facts.manual === true ? `${trade} (asked by the owner by hand)` : trade,
+    trade: facts.demo !== undefined ? `${trade} (an owner-requested demonstration entry, asked by hand)` : facts.manual === true ? `${trade} (asked by the owner by hand)` : trade,
     asset: facts.symbol,
     long_venue: facts.longVenue,
     short_venue: facts.shortVenue,
@@ -111,6 +127,7 @@ export function vetoMessages(facts: VetoFacts): ChatMessage[] {
     gross_apr_pct_14d: r2(facts.grossApr14dPct),
     net_apr_pct_after_costs: r2(facts.netAprPct),
     ...gate,
+    ...demo,
     leg_usd: r2(facts.legUsd),
     leverage: r2(facts.leverage),
     legs: facts.legs.map((l) => ({
@@ -127,6 +144,7 @@ export function vetoFacts(
   extra: {
     kind: 'enter' | 'rotate'; legUsd: number; leverage: number; minNetAprPct: number; hoursAbove: number;
     grossApr14dPct?: number | null; legs?: { long?: VetoLegFacts; short?: VetoLegFacts }; manual?: boolean;
+    demo?: { maxLossUsd: number; roundTripUsd: number };
   },
 ): VetoFacts {
   const leg = (venue: string, side: 'long' | 'short', x: VetoLegFacts | undefined): VetoLeg => ({
@@ -140,6 +158,7 @@ export function vetoFacts(
     legUsd: extra.legUsd, leverage: extra.leverage,
     legs: [leg(w.longVenue, 'long', extra.legs?.long), leg(w.shortVenue, 'short', extra.legs?.short)],
     ...(extra.manual === true ? { manual: true } : {}),
+    ...(extra.demo === undefined ? {} : { demo: extra.demo }),
   };
 }
 

@@ -6,15 +6,17 @@ import { after, test } from 'node:test';
 import type { JournalEntry, StrategyConfig, StrategyDecision, StreamEvent, Window as FundingWindow } from '@gimbal/shared';
 import { DEFAULT_SCANNER_CONFIG, DEFAULT_STRATEGY } from '../scanner/config.ts';
 import type { DecideInput, Decision } from './decide.ts';
-import { LOOP_RULES, NO_COUNTERS } from './decide.ts';
+import { LOOP_RULES, NO_COUNTERS, decide as realDecide } from './decide.ts';
+import { NO_BREAKEVEN_TEXT, isEnterable, profitCheck } from '../scanner/price.ts';
 import type { ActOutcome, BookFill, BookRecord, HandsHeld, LoopHands, StrategyLoopOptions } from './loop.ts';
 import {
-  HOUR_GRACE_MS, LEDGER_HOLD_HOURS, LOOP_STATE_VERSION, LoopStore, MAX_OPEN_REFRESHES_PER_DAY, MAX_OPEN_REFRESHES_PER_DAY_ALL, REFRESH_HOLD_MS, RETRY_AFTER_MS,
-  RISK_NOT_ASKED, StrategyLoop, loopStateFile, nextHourlyCheck, notEnterable, parseLoopState,
+  DEMO_MAX_LOSS_USD, HOUR_GRACE_MS, LEDGER_HOLD_HOURS, LOOP_STATE_VERSION, LoopStore, MAX_OPEN_REFRESHES_PER_DAY, MAX_OPEN_REFRESHES_PER_DAY_ALL, REFRESH_HOLD_MS, RETRY_AFTER_MS,
+  RISK_NOT_ASKED, StrategyLoop, loopStateFile, nextHourlyCheck, notEnterable, parseDemo, parseLoopState,
 } from './loop.ts';
 import type { RiskActRecord, RiskCheckRecord, RiskLedgerSink } from '../book/risk-ledger.ts';
 import { positionIdOf } from '../book/derive.ts';
 import type { VetoSource } from './veto.ts';
+import { DEMO_ENTRY_TEXT, VETO_SYSTEM_PROMPT } from './veto.ts';
 import { NearAiClient } from '../nearai/client.ts';
 
 const dirs: string[] = [];
@@ -44,7 +46,7 @@ interface World {
   held: (Omit<HandsHeld, 'oneLeg'> & { oneLeg?: HandsHeld['oneLeg'] }) | null;
   blocked: string | null;
   busy: string | null;
-  opens: { symbol: string; legUsd: number; leverage: number; qty: string; reason: string; noRefresh?: string }[];
+  opens: { symbol: string; legUsd: number; leverage: number; qty: string; reason: string; noRefresh?: string; demo?: { maxLossUsd: number } }[];
   /** A rotate's prepareOpen (none: the hands have no such step), and what each call saw: `SYMBOL closes=N`. */
   prepareAnswer?: (symbol: string) => ActOutcome;
   prepares: string[];
@@ -80,7 +82,10 @@ function fakeHands(w: World): LoopHands {
       },
     }),
     open: async (r) => {
-      w.opens.push({ symbol: r.symbol, legUsd: r.legUsd, leverage: r.leverage, qty: r.qty, reason: r.reason, ...(r.noRefresh === undefined ? {} : { noRefresh: r.noRefresh }) });
+      w.opens.push({
+        symbol: r.symbol, legUsd: r.legUsd, leverage: r.leverage, qty: r.qty, reason: r.reason, ...(r.noRefresh === undefined ? {} : { noRefresh: r.noRefresh }),
+        ...(r.demo === undefined ? {} : { demo: r.demo }),
+      });
       const a = w.openAnswer(r.symbol);
       if (a.ok) w.held = { symbol: r.symbol, legUsd: r.legUsd, pnlUsd: 0 };
       return a;
@@ -1375,4 +1380,287 @@ test('checked counts only the checks that read a scan and the free margin (GIMBA
   w.busy = null;
   await loop.check();
   assert.equal(loop.checked, 1);
+});
+
+// ---- the owner demo entry (POST /rotate with demo) ----
+
+const DEMO_ID = 'zec-phoenix-hyperliquid';
+/** A window every safety check passes and its profit checks fail: today's ZEC, on the fake hands' direction. */
+const demoWin = (over: Partial<FundingWindow> = {}) => win(DEMO_ID, {
+  netAprPct: -3, checks: [{ ok: true, text: 'policy ok' }, profitCheck('Over a 7-day hold ... no more than the $0.04 round trip: it never pays it back'), profitCheck(NO_BREAKEVEN_TEXT)], ...over,
+});
+/** The facts serve-loop.ts windowFacts gives: lots for the enterable windows and those named, every round trip. */
+const demoFacts = (roundTripUsd: Record<string, number> = { [DEMO_ID]: 0.04 }, asked: string[][] = []): StrategyLoopOptions['facts'] => async (ws, lotsFor = []) => {
+  asked.push([...lotsFor]);
+  const lots = ws.filter((x) => isEnterable(x) || lotsFor.includes(x.id)).map((x) => [x.id, { longLot: '0.01', shortLot: '0.01', px: 100 }]);
+  return { lots: Object.fromEntries(lots), roundTripUsd };
+};
+const DEMO = { maxLossUsd: 0.25 };
+
+test('demo: a window that fails only its profit checks is entered, said so on the journal, the book, the ledger and to the hands', async () => {
+  const w = world({ windows: [demoWin(), win('sol-phoenix-hyperliquid')] });
+  const records: BookRecord[] = [];
+  const checks: RiskCheckRecord[] = [];
+  const ledger: RiskLedgerSink = { check: (r) => checks.push(r), hourly: () => {} };
+  const asked: string[][] = [];
+  const loop = makeLoop(w, tmpStore(), { facts: demoFacts(undefined, asked), book: (r) => records.push(r), ledger });
+  await loop.check();
+  assert.equal(notEnterable(w.windows![0]!), `${DEMO_ID} fails a check: Over a 7-day hold ... no more than the $0.04 round trip: it never pays it back`);
+  assert.equal(notEnterable(w.windows![0]!, true), null);
+  // The last check read no lots for it (it is not enterable): POST /rotate still answers at once, sized when it runs.
+  assert.deepEqual(loop.rotate(DEMO_ID, DEMO), { ok: true });
+  await loop.idle(1000);
+  assert.deepEqual(asked.at(-1), [DEMO_ID], 'its lots are read by name when it runs');
+  assert.deepEqual(w.opens.map((o) => [o.symbol, o.legUsd, o.qty, o.demo]), [['ZEC', 1000, '10', DEMO]]);
+  assert.match(w.opens[0]!.reason, /owner demo entry/);
+  const enter = journal(w).find((j) => j.kind === 'enter')!;
+  assert.match(enter.summary, new RegExp(`^enter ${DEMO_ID}, ZEC short hyperliquid, long phoenix, .* \\(POST /rotate \\(manual\\)\\); `
+    + 'owner demo entry: the profit checks are waived; round trip \\$0\\.04 estimated, at most \\$0\\.25 accepted; no NEAR AI key: not checked; opened both legs$'));
+  assert.equal(enter.numbers.demo, 1);
+  assert.equal(enter.numbers.maxLossUsd, 0.25);
+  assert.equal(enter.numbers.roundTripUsd, 0.04);
+  assert.equal(enter.numbers.by, 'POST /rotate (manual)');
+  assert.deepEqual(records.map((r) => [r.kind, r.by, r.demo]), [['enter', 'manual', true]]);
+  assert.deepEqual(checks.map((c) => [c.kind, c.by, c.demo]), [['enter', 'manual', true]]);
+  assert.equal(loop.held?.windowId, DEMO_ID);
+
+  // An auto enter carries no demo anywhere.
+  const a = world();
+  a.next = { decision: { action: 'enter', reason: 'go', windowId: 'sol-phoenix-hyperliquid' }, act: { kind: 'enter', windowId: 'sol-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' } };
+  const autoRecords: BookRecord[] = [];
+  await makeLoop(a, tmpStore(), { book: (r) => autoRecords.push(r) }).check();
+  assert.equal(a.opens[0]!.demo, undefined);
+  assert.equal(autoRecords[0]!.demo, undefined);
+  assert.equal(journal(a).find((j) => j.kind === 'enter')!.numbers.demo, undefined);
+});
+
+test('demo: without the flag nothing changes; the same window is refused with the first failing check, as before', async () => {
+  const w = world({ windows: [demoWin()] });
+  const loop = makeLoop(w, tmpStore(), { facts: demoFacts() });
+  await loop.check();
+  const first = (demoWin().checks[1]!).text;
+  assert.deepEqual(loop.rotate(DEMO_ID), { ok: false, reason: `${DEMO_ID} fails a check: ${first}` });
+  // The break-even check alone is refused in its own words, as the 409 said.
+  w.windows = [demoWin({ checks: [{ ok: true, text: 'policy ok' }, profitCheck(NO_BREAKEVEN_TEXT)] })];
+  assert.deepEqual(loop.rotate(DEMO_ID), { ok: false, reason: `${DEMO_ID} fails a check: Does not break even within a year at today's rates` });
+  assert.equal(w.opens.length, 0);
+});
+
+test('demo: every safety reason still refuses it: a failing safety check, stale, refused, watch only, the risk check, the policy, the size, a held pair', async () => {
+  const refusedWith = async (over: Partial<FundingWindow>, why: RegExp, o: { id?: string; store?: LoopStore; setup?: (w: World) => void; loop?: Partial<StrategyLoopOptions> } = {}) => {
+    const w = world({ windows: [demoWin(over), win('btc-hyperliquid-phoenix', { netAprPct: -3, checks: demoWin().checks })] });
+    const loop = makeLoop(w, o.store ?? tmpStore(), { facts: demoFacts({ [DEMO_ID]: 0.04, 'btc-hyperliquid-phoenix': 0.04 }), ...o.loop });
+    await loop.check();
+    o.setup?.(w);
+    const r = loop.rotate(o.id ?? DEMO_ID, DEMO) as { ok: false; reason: string };
+    assert.equal(r.ok, false, `${why}`);
+    assert.match(r.reason, why);
+    await loop.idle(1000);
+    assert.equal(w.opens.length, 0);
+  };
+  const safety = { ok: false, text: 'The oracle price for ZEC on Phoenix is 90 s old, over the 60 s limit: the contract refuses its orders' };
+  await refusedWith({ checks: [...demoWin().checks, safety] }, /^zec-phoenix-hyperliquid fails a check a demo entry does not waive: The oracle price for ZEC on Phoenix is 90 s old/);
+  // A failing check with no kind is a safety check, whatever its words.
+  await refusedWith({ checks: [{ ok: false, text: NO_BREAKEVEN_TEXT }] }, /fails a check a demo entry does not waive: Does not break even/);
+  await refusedWith({ stale: true }, /is stale: a venue it needs did not answer/);
+  await refusedWith({ refused: { code: 'E_ORACLE_STALE', reason: 'no oracle price for ZEC on phoenix' } }, /is refused: E_ORACLE_STALE/);
+  await refusedWith({ tradable: false }, /is watch only/);
+  await refusedWith({ veto: { verdict: 'veto', reasons: ['a spike'], model: 'test', at: T0 } }, /was refused by the NEAR AI risk check: a spike/);
+  const held = tmpStore();
+  writeFileSync(held.path, JSON.stringify({ version: LOOP_STATE_VERSION, held: null, counters: { ...NO_COUNTERS, vetoedUntil: { [DEMO_ID]: T0 + HOUR } } }));
+  await refusedWith({}, /was refused by the NEAR AI risk check: held out until/, { store: held });
+  // The policy's markets and the direction rule (symbolOf).
+  await refusedWith({}, /short hyperliquid, long phoenix only/, { id: 'btc-hyperliquid-phoenix' });
+  // The size: no free margin.
+  await refusedWith({}, /cannot be sized: .*free margin/, { loop: { freeMargin: async () => ({ hyperliquid: 0, phoenix: 0 }) } });
+  // From flat only.
+  await refusedWith({}, /a pair is held \(SOL\): a demo entry opens from flat only, so its cost is its own round trip; POST \/close first/, {
+    setup: (w) => { w.held = { symbol: 'SOL', legUsd: 500, pnlUsd: 0 }; },
+  });
+});
+
+test('demo: maxLossUsd is required, a number above 0 and at most 1 USD, and at least the window\'s round trip, which must be known', async () => {
+  for (const [demo, why] of [
+    [{}, /^a demo entry needs maxLossUsd, the most its round trip may cost/],
+    [{ maxLossUsd: 0 }, /^demo maxLossUsd 0 is not a number above 0/],
+    [{ maxLossUsd: -0.1 }, /^demo maxLossUsd -0\.1 is not a number above 0/],
+    [{ maxLossUsd: Number.NaN }, /^demo maxLossUsd NaN is not a number above 0/],
+    [{ maxLossUsd: Infinity }, /^demo maxLossUsd Infinity is not a number above 0/],
+    [{ maxLossUsd: '0.25' }, /^demo maxLossUsd "0\.25" is not a number above 0/],
+    [{ maxLossUsd: 1.01 }, /^demo maxLossUsd 1\.01 is over the \$1\.00 a demo entry may accept/],
+    [{ maxLossUsd: 0.25, extra: 1 }, /unknown field "extra"/],
+    [null, /^POST \/rotate's demo must be "demo": \{ "maxLossUsd"/],
+    [true, /^POST \/rotate's demo must be/],
+    [[], /^POST \/rotate's demo must be/],
+    [[{ maxLossUsd: 0.25 }], /^POST \/rotate's demo must be/],
+    [{ maxLossUsd: {} }, /^demo maxLossUsd \{\} is not a number above 0/],
+    [{ maxLossUsd: null }, /^demo maxLossUsd null is not a number above 0/],
+  ] as [unknown, RegExp][]) {
+    const r = parseDemo(demo);
+    assert.ok('refused' in r, JSON.stringify(demo));
+    assert.match(r.refused, why);
+  }
+  assert.equal(DEMO_MAX_LOSS_USD, 1);
+  assert.deepEqual(parseDemo({ maxLossUsd: 1 }), { maxLossUsd: 1 });
+
+  const w = world({ windows: [demoWin()] });
+  const loop = makeLoop(w, tmpStore(), { facts: demoFacts() });
+  await loop.check();
+  // Through rotate: the same refusals, before anything else.
+  assert.match((loop.rotate(DEMO_ID, { maxLossUsd: 5 }) as { reason: string }).reason, /over the \$1\.00 a demo entry may accept/);
+  assert.match((loop.rotate(DEMO_ID, {}) as { reason: string }).reason, /needs maxLossUsd/);
+  // Under the window's round trip: refused, with both numbers.
+  assert.deepEqual(loop.rotate(DEMO_ID, { maxLossUsd: 0.03 }), { ok: false, reason: `${DEMO_ID}: its round trip, $0.04, is over the $0.03 the demo entry accepts (maxLossUsd)` });
+  // Its round trip not known: refused.
+  const u = world({ windows: [demoWin()] });
+  const unknown = makeLoop(u, tmpStore(), { facts: demoFacts({}) });
+  await unknown.check();
+  assert.match((unknown.rotate(DEMO_ID, DEMO) as { reason: string }).reason, /its round trip in USD is not known, so a demo entry cannot be held to its \$0\.25 maxLossUsd/);
+  // A round trip that grew over maxLossUsd by the time it runs: refused then, journaled with the number.
+  const g = world({ windows: [demoWin()] });
+  let rt = 0.04;
+  const growing = makeLoop(g, tmpStore(), { facts: async (ws, lotsFor = []) => ({ ...(await demoFacts({ [DEMO_ID]: rt })!(ws, lotsFor)) }) });
+  await growing.check();
+  rt = 0.3;
+  assert.deepEqual(growing.rotate(DEMO_ID, DEMO), { ok: true });
+  await growing.idle(1000);
+  assert.equal(g.opens.length, 0);
+  const line = journal(g).at(-1)!;
+  assert.equal(line.summary, `POST /rotate ${DEMO_ID} not carried out: (owner demo entry, at most $0.25) ${DEMO_ID}: its round trip, $0.30, is over the $0.25 the demo entry accepts (maxLossUsd)`);
+  assert.equal(line.numbers.demo, 1);
+});
+
+test('demo: the NEAR AI risk check is still asked, told it is an owner demonstration entry with the profit checks waived and the cost accepted; its refusal stands', async () => {
+  const reply = (content: string) => ({ content, raw: { choices: [{ message: { content } }] } });
+  const sent: { system: string; user: Record<string, unknown> }[] = [];
+  let verdict = '{"verdict":"pass","reasons":[]}';
+  const veto: VetoSource = {
+    model: 'test-model', configured: true,
+    complete: async (messages) => {
+      sent.push({ system: messages[0]!.content, user: JSON.parse(messages[1]!.content) as Record<string, unknown> });
+      return reply(verdict);
+    },
+  };
+  const w = world({ windows: [demoWin()], strategy: { ...DEFAULT_STRATEGY, auto: true, minNetAprPct: 1000 } });
+  const loop = makeLoop(w, tmpStore(), { veto, facts: demoFacts() });
+  await loop.check();
+  assert.deepEqual(loop.rotate(DEMO_ID, DEMO), { ok: true });
+  await loop.idle(1000);
+  assert.equal(w.opens.length, 1);
+  const p = sent.at(-1)!;
+  assert.equal(p.system, VETO_SYSTEM_PROMPT, 'the risk check itself is the same');
+  assert.equal(p.user.manual, true);
+  assert.equal(p.user.owner_minimum_net_apr_pct, 'waived: the owner asked for this trade');
+  assert.equal(p.user.demo_entry, DEMO_ENTRY_TEXT);
+  assert.match(String(p.user.demo_entry), /^an owner-requested demonstration entry: the profit checks .* are waived/);
+  assert.match(String(p.user.demo_entry), /must be positive\. owner_accepted_cost_usd bounds the estimated round-trip cost .* only: funding during the hold is expected positive and is not part of that bound$/);
+  assert.equal(p.user.expected_round_trip_cost_usd, 0.04);
+  assert.equal(p.user.owner_accepted_cost_usd, 0.25);
+  assert.equal(p.user.trade, 'open a new pair (an owner-requested demonstration entry, asked by hand)');
+  assert.equal(p.user.net_apr_pct_after_costs, -3, 'the net is shown as it is');
+  assert.ok(Object.entries(p.user).every(([k, v]) => !k.includes('minimum') || v !== 1000), 'the 1000 % demo minimum is not passed as the bar');
+
+  // A refusal opens nothing, journaled as a demo entry.
+  verdict = '{"verdict":"veto","reasons":["the ZEC book is thin"]}';
+  const v = world({ windows: [demoWin()] });
+  const vetoed = makeLoop(v, tmpStore(), { veto, facts: demoFacts() });
+  await vetoed.check();
+  assert.deepEqual(vetoed.rotate(DEMO_ID, DEMO), { ok: true });
+  await vetoed.idle(1000);
+  assert.equal(v.opens.length, 0);
+  const line = journal(v).find((j) => j.kind === 'veto')!;
+  assert.match(line.summary, new RegExp(`^${DEMO_ID} \\(owner demo entry: the profit checks are waived; .*\\): NEAR AI risk check refused`));
+  assert.equal(line.numbers.demo, 1);
+});
+
+test('demo: held under the demo rules, the loop does not close or rotate it by itself for 23 hourly checks; the 24th is the counted exit', async () => {
+  // The demo rules (docs/deploy-railway.md): auto on, a 1000 % minimum, rotation at 1000 points, exit after 24 checks.
+  const rules: StrategyConfig = { ...DEFAULT_STRATEGY, auto: true, minNetAprPct: 1000, rotate: { ...DEFAULT_STRATEGY.rotate, minGainPts: 1000 }, exitAfterChecks: 24 };
+  const w = world({ windows: [demoWin(), win('sol-phoenix-hyperliquid'), win('eth-phoenix-hyperliquid', { netAprPct: 60 })], strategy: rules });
+  const loop = makeLoop(w, tmpStore(), { facts: demoFacts(), decide: realDecide });
+  await loop.check();
+  assert.deepEqual(loop.rotate(DEMO_ID, DEMO), { ok: true });
+  await loop.idle(1000);
+  assert.equal(loop.held?.windowId, DEMO_ID);
+  for (let h = 1; h <= 23; h++) {
+    w.now = T0 + h * HOUR;
+    await loop.check();
+    assert.equal(w.closes.length, 0, `closed at hour ${h}: ${decisions(w).at(-1)!.reason}`);
+    assert.equal(w.opens.length, 1, `opened again at hour ${h}`);
+    assert.equal(decisions(w).at(-1)!.action, 'hold');
+  }
+  assert.match(decisions(w).at(-1)!.reason, /^Hold ZEC: .* under your 1000 % minimum, 23 of 24/);
+  // Scan events between the hours change nothing either.
+  w.now += 5 * 60_000;
+  await loop.check();
+  assert.equal(w.closes.length, 0);
+  // The 24th hourly check in a row under the minimum: the counted exit, a day after the entry.
+  w.now = T0 + 24 * HOUR;
+  await loop.check();
+  assert.equal(w.closes.length, 1);
+  assert.match(decisions(w).at(-1)!.reason, /^Exit ZEC: .* under your 1000 % minimum, 24 of 24/);
+});
+
+test('demo: the risk check ledger never books a demo open against an auto or plain check, nor the reverse', async () => {
+  const records: (RiskCheckRecord | RiskActRecord)[] = [];
+  const ledger: RiskLedgerSink = { check: (r) => records.push(r), act: (r) => records.push(r), hourly: () => {} };
+  const veto: VetoSource = { model: 'test-model', configured: true, complete: async () => ({ content: '{"verdict":"pass","reasons":[]}', raw: {} }) };
+  const SOL = 'sol-phoenix-hyperliquid';
+  const w = world({ openAnswer: () => REFUSED('the venue is busy') });
+  const loop = makeLoop(w, tmpStore(), { veto, ledger, attestation: () => 'attested', facts: demoFacts({ [SOL]: 0.04 }) });
+  // An auto enter, refused with nothing sent: one check (auto), one act.
+  w.next = { decision: { action: 'enter', reason: 'go', windowId: SOL }, act: { kind: 'enter', windowId: SOL, legUsd: 500, leverage: 1.5, qty: '5' } };
+  await loop.check();
+  w.next = {};
+  // A demo entry into the same window at once: a check of its own, not the auto one.
+  w.now += 60_000;
+  await loop.check();
+  assert.deepEqual(loop.rotate(SOL, DEMO), { ok: true });
+  await loop.idle(1000);
+  // The same demo entry again: the same act, its check stands (no new check, no act booked for a retry not opened).
+  assert.deepEqual(loop.rotate(SOL, DEMO), { ok: true });
+  await loop.idle(1000);
+  // A plain manual rotate: not booked against the demo check.
+  assert.deepEqual(loop.rotate(SOL), { ok: true });
+  await loop.idle(1000);
+  assert.equal(w.opens.length, 4);
+  const checks = records.filter((r): r is RiskCheckRecord => r.type === 'check');
+  assert.deepEqual(checks.map((c) => [c.by, c.demo]), [['auto', undefined], ['manual', true], ['manual', undefined]]);
+  assert.deepEqual(records.map((r) => r.type), ['check', 'act', 'check', 'act', 'check', 'act']);
+  const acts = records.filter((r): r is RiskActRecord => r.type === 'act');
+  assert.deepEqual(acts.map((a) => a.checkId), checks.map((c) => c.id));
+  assert.equal(new Set(checks.map((c) => c.id)).size, 3);
+});
+
+test('demo: a refusal line after the risk check keeps the plain lead (web waitCopy.ts reads it), the demo tag after it', async () => {
+  const w = world({ windows: [demoWin()], openAnswer: () => REFUSED('open refused, nothing signed: the venue is busy') });
+  const loop = makeLoop(w, tmpStore(), { facts: demoFacts() });
+  await loop.check();
+  assert.deepEqual(loop.rotate(DEMO_ID, DEMO), { ok: true });
+  await loop.idle(1000);
+  const line = journal(w).find((j) => j.kind === 'refused')!;
+  assert.equal(line.summary, `enter ${DEMO_ID}: (owner demo entry: the profit checks are waived; round trip $0.04 estimated, at most $0.25 accepted) `
+    + 'open refused, nothing signed: the venue is busy; no NEAR AI key: not checked');
+  assert.equal(line.numbers.demo, 1);
+  // The same refusal without demo, for comparison: the same lead.
+  const p = world({ windows: [win('sol-phoenix-hyperliquid')], openAnswer: () => REFUSED('open refused, nothing signed: the venue is busy') });
+  const plain = makeLoop(p, tmpStore());
+  await plain.check();
+  assert.deepEqual(plain.rotate('sol-phoenix-hyperliquid'), { ok: true });
+  await plain.idle(1000);
+  assert.match(journal(p).find((j) => j.kind === 'refused')!.summary, /^enter sol-phoenix-hyperliquid: open refused, nothing signed: the venue is busy; /);
+});
+
+test('demo: refused on a safety carry line: no 7 days of history, two weeks that disagree, a spread of 0 or less', async () => {
+  const lines = [
+    { ok: false, text: 'No 7-day funding history on both legs yet: the spread expected over a 7-day hold is not known' },
+    { ok: false, text: 'The 7-day spread (5.11 % APR) and the 14-day spread (-2.00 % APR) point opposite ways: no steady carry in this direction' },
+    { ok: false, text: 'Over a 7-day hold, the 7-day spread of -3.00 % APR pays -$0.01 at $12.00 a leg, no more than the $0.04 round trip: it never pays it back' },
+  ];
+  for (const safety of lines) {
+    const w = world({ windows: [demoWin({ checks: [safety, profitCheck(NO_BREAKEVEN_TEXT)] })] });
+    const loop = makeLoop(w, tmpStore(), { facts: demoFacts() });
+    await loop.check();
+    assert.deepEqual(loop.rotate(DEMO_ID, DEMO), { ok: false, reason: `${DEMO_ID} fails a check a demo entry does not waive: ${safety.text}` });
+  }
 });

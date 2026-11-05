@@ -6,11 +6,11 @@
 //
 // Units: APR in percentage points a year on one leg's notional (as costs.ts); money in USD at `legUsd` a leg.
 
-import type { Window as FundingWindow } from '@gimbal/shared';
 import type { BookLevel } from '../venues/venue.ts';
 import { HOURS_PER_YEAR, basisCostUsd, legSlippage, takerFeesUsd } from './costs.ts';
 import type { LegSlippage } from './costs.ts';
 import { usd } from './price.ts';
+import type { WindowCheck } from './price.ts';
 
 /** What one round trip of a desk window costs, USD at `legUsd`: everything paid once whatever the hold. */
 export interface RoundTrip {
@@ -95,6 +95,12 @@ export type MultiDay =
 
 /** A 7-day mean under this (APR points, either sign) counts as 0. */
 export const DEAD_BAND_APR_PCT = 0.5;
+/**
+ * The most an owner demo entry (POST /rotate with demo) may accept as its maxLossUsd: the bound on its round-trip cost
+ * estimate. Funding during the hold is expected positive and is not part of it. Checked by the strategy loop
+ * (parseDemo) and again by the trader's carry plan.
+ */
+export const DEMO_MAX_LOSS_USD = 1;
 
 /**
  * The multi-day figure from the 7- and 14-day means; `fortnightPending` while a leg's older read is still due.
@@ -189,8 +195,12 @@ const minimum = (n: number) => `${Number.isInteger(n) ? n : n.toFixed(2)} %`;
  * The window's check lines for its expected carry: the gate (fails without a multi-day figure, while the older week
  * loads, when the 7 and 14 days disagree in sign, when the spread over the hold does not pay the round trip, or when
  * what it nets over the hold is under the owner's minimum), and a note when the current hour points the other way.
+ * The lines of a spread that pays (positive over the 7 days, or over the hold) are profit checks (WindowCheck.kind):
+ * an owner demo entry waives them, and nothing else. A spread not known yet (no 7 days of history), two weeks that
+ * disagree, and a spread over the hold of 0 or less (funding runs against the position) are safety checks: never
+ * waived, since a demo entry bounds its round trip and expects funding during the hold to be positive.
  */
-export function carryChecks(e: CarryEstimate): FundingWindow['checks'] {
+export function carryChecks(e: CarryEstimate): WindowCheck[] {
   const hold = `a ${holdLabel(e.holdHours)} hold (assumed: the engine rules set none)`;
   const rt = e.roundTrip;
   const parts = `4 fills ${money(rt.feesUsd)}, slippage ${money(rt.slippageUsd)}, basis buffer ${money(rt.basisBufferUsd)}; ${rt.bps.toFixed(1)} bps`;
@@ -200,11 +210,11 @@ export function carryChecks(e: CarryEstimate): FundingWindow['checks'] {
     return [{ ok: false, text: `No 7-day funding history on both legs yet: the spread expected over ${hold} is not known, ${against}` }];
   }
   if (e.state === 'loading') {
-    const out: FundingWindow['checks'] = [{
-      ok: false,
+    const out: WindowCheck[] = [{
+      ok: false, ...(d7! > 0 ? { kind: 'profit' as const } : {}),
       text: `14-day history loading: the 7-day spread of ${pct(d7!)} APR is in, the week before it is still being read; the gate waits for both, ${against}`,
     }];
-    if (d7! > 0 && !(now > 0)) out.push({ ok: true, text: `Listed on the 7-day spread: this hour pays ${pct(now)} APR in this direction` });
+    if (d7! > 0 && !(now > 0)) out.push({ ok: true, kind: 'profit', text: `Listed on the 7-day spread: this hour pays ${pct(now)} APR in this direction` });
     return out;
   }
   if (e.state === 'mixed') {
@@ -214,24 +224,25 @@ export function carryChecks(e: CarryEstimate): FundingWindow['checks'] {
   const which = d14 === null ? `no 14-day mean: ${e.noFortnightWhy ?? 'it could not be had'}` : 'the smaller of the 7- and 14-day means';
   const head = `Over ${hold}, the ${label} spread of ${pct(e.expectedAprPct!)} APR (${which}) pays ${money(e.expectedUsd!)} at ${usd(e.legUsd)} a leg`;
   const nets = `${pct(e.netAprPct!)} APR over the hold`;
-  const out: FundingWindow['checks'] = [];
+  const out: WindowCheck[] = [];
   if (e.ok) {
     out.push({
-      ok: true,
+      ok: true, kind: 'profit',
       text: `${head}, more than the ${money(rt.totalUsd)} round trip (${parts}): it nets ${nets}, at least your ${minimum(e.minNetAprPct)} minimum, `
         + `and pays the round trip back in ${e.breakevenDays!.toFixed(1)} days`,
     });
   } else if (e.netUsd! > 0) {
     out.push({
-      ok: false,
+      ok: false, kind: 'profit',
       text: `${head}, more than the ${money(rt.totalUsd)} round trip (${parts}), but it nets only ${nets}, under your ${minimum(e.minNetAprPct)} minimum`,
     });
   } else {
     const even = e.breakevenDays === null ? 'it never pays it back' : `it takes ${e.breakevenDays.toFixed(1)} days to pay it back`;
-    out.push({ ok: false, text: `${head}, no more than the ${money(rt.totalUsd)} round trip (${parts}): ${even}` });
+    // A spread of 0 or less over the hold: funding runs against the position, a safety check.
+    out.push({ ok: false, ...(e.expectedUsd! > 0 ? { kind: 'profit' as const } : {}), text: `${head}, no more than the ${money(rt.totalUsd)} round trip (${parts}): ${even}` });
   }
   if (e.expectedAprPct! > 0 && !(now > 0)) {
-    out.push({ ok: true, text: `Listed on the ${label} spread: this hour pays ${pct(now)} APR in this direction` });
+    out.push({ ok: true, kind: 'profit', text: `Listed on the ${label} spread: this hour pays ${pct(now)} APR in this direction` });
   }
   return out;
 }

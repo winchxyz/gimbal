@@ -44,6 +44,8 @@ export interface RiskCheckRecord {
   at: number;
   kind: 'enter' | 'rotate';
   by: 'auto' | 'manual';
+  /** An owner demo entry (POST /rotate with demo: the profit checks waived); absent otherwise. */
+  demo?: true;
   windowId: string;
   symbol: string;
   outcome: RiskCheckOutcome;

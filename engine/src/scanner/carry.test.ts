@@ -59,9 +59,9 @@ test('the gate: a 14-day spread that a weaker 7 days undercut fails; the spread 
   near(doge.expectedUsd, 0.028);
   assert.equal(doge.ok, false);
   assert.deepEqual(carryChecks(doge), [
-    { ok: false, text: 'Over a 10-day hold (assumed: the engine rules set none), the 7-day spread of 5.11 % APR (the smaller of the 7- and 14-day means) '
+    { ok: false, kind: 'profit', text: 'Over a 10-day hold (assumed: the engine rules set none), the 7-day spread of 5.11 % APR (the smaller of the 7- and 14-day means) '
       + `pays $0.03 at $20.00 a leg, no more than the ${RT_TEXT}: it takes 17.9 days to pay it back` },
-    { ok: true, text: 'Listed on the 7-day spread: this hour pays -1.21 % APR in this direction' },
+    { ok: true, kind: 'profit', text: 'Listed on the 7-day spread: this hour pays -1.21 % APR in this direction' },
   ]);
 
   // 12 % over 7 days and 10.95 % over 14: judged on 10.95 %, 0.06 USD over the hold, 0.01 USD net of the round trip,
@@ -73,7 +73,7 @@ test('the gate: a 14-day spread that a weaker 7 days undercut fails; the spread 
   near(steady.netAprPct, 1.825);
   assert.equal(steady.ok, true);
   assert.deepEqual(carryChecks(steady)[0], {
-    ok: true,
+    ok: true, kind: 'profit',
     text: 'Over a 10-day hold (assumed: the engine rules set none), the 14-day spread of 10.95 % APR (the smaller of the 7- and 14-day means) '
       + `pays $0.06 at $20.00 a leg, more than the ${RT_TEXT}: it nets 1.82 % APR over the hold, at least your 1 % minimum, `
       + 'and pays the round trip back in 8.3 days',
@@ -82,7 +82,7 @@ test('the gate: a 14-day spread that a weaker 7 days undercut fails; the spread 
   const under = estimate(12, 10.95, false, 5);
   assert.equal(under.ok, false);
   assert.deepEqual(carryChecks(under)[0], {
-    ok: false,
+    ok: false, kind: 'profit',
     text: 'Over a 10-day hold (assumed: the engine rules set none), the 14-day spread of 10.95 % APR (the smaller of the 7- and 14-day means) '
       + `pays $0.06 at $20.00 a leg, more than the ${RT_TEXT}, but it nets only 1.82 % APR over the hold, under your 5 % minimum`,
   });
@@ -101,8 +101,8 @@ test('the gate fails while the week before loads, when the 7 and 14 days disagre
   assert.equal(loading.ok, false);
   assert.equal(loading.netUsd, null);
   assert.deepEqual(carryChecks(loading), [
-    { ok: false, text: `14-day history loading: the 7-day spread of 12.00 % APR is in, the week before it is still being read; the gate waits for both, against a ${RT_TEXT}` },
-    { ok: true, text: 'Listed on the 7-day spread: this hour pays -1.21 % APR in this direction' },
+    { ok: false, kind: 'profit', text: `14-day history loading: the 7-day spread of 12.00 % APR is in, the week before it is still being read; the gate waits for both, against a ${RT_TEXT}` },
+    { ok: true, kind: 'profit', text: 'Listed on the 7-day spread: this hour pays -1.21 % APR in this direction' },
   ]);
 
   const mixed = estimate(5.11, -2, false);
@@ -118,6 +118,21 @@ test('the gate fails while the week before loads, when the 7 and 14 days disagre
   assert.equal(none.breakevenDays, null);
   assert.match(carryChecks(none)[0]!.text, /^No 7-day funding history on both legs yet: the spread expected over a 10-day hold/);
   assert.equal(carryChecks(none)[0]!.ok, false);
+  // The lines of a spread that pays are profit checks (an owner demo entry waives them, strategy/loop.ts). No 7 days
+  // of history, two weeks that disagree, and a spread of 0 or less (funding against the position) are safety checks.
+  assert.ok(carryChecks(loading).every((c) => c.kind === 'profit'));
+  assert.deepEqual([...carryChecks(mixed), ...carryChecks(none)].map((c) => c.kind), [undefined, undefined]);
+  const loadingAgainst = estimate(-3, null, true);
+  assert.equal(loadingAgainst.state, 'loading');
+  assert.deepEqual(carryChecks(loadingAgainst).map((c) => [c.ok, c.kind]), [[false, undefined]]);
+  for (const [d7, d14] of [[-3, -2], [0, 0]] as const) {
+    const against = estimate(d7, d14, false);
+    assert.equal(against.state, 'known', `${d7} ${d14}`);
+    assert.ok(!(against.expectedUsd! > 0));
+    const lines = carryChecks(against);
+    assert.match(lines[0]!.text, /no more than the .* round trip/);
+    assert.deepEqual(lines.map((c) => c.kind), lines.map(() => undefined), JSON.stringify(lines));
+  }
 });
 
 test('labels: the hold in days or hours; money with the sign first and four decimals under a cent', () => {

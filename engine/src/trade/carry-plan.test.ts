@@ -3,7 +3,7 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { deskRoundTrip } from '../scanner/carry.ts';
+import { DEMO_MAX_LOSS_USD, deskRoundTrip } from '../scanner/carry.ts';
 import { CARRY_BASIS_BUFFER_BPS, CARRY_HOLD_HOURS, DEFAULT_SCANNER_CONFIG, HL_BUILDER_TENTH_BPS, MAINNET_COSTS, hlFillFeeBps, withBuilderFee } from '../scanner/config.ts';
 import { fillFeeBps } from '../scanner/costs.ts';
 import type { CarryInput } from './carry-plan.ts';
@@ -109,6 +109,56 @@ test('refused for cost when a book cannot price the round trip: one side empty, 
   assert.equal(empty.costRefusal, 'the phoenix book has no two-sided touch: the round trip cannot be priced');
   const shallow = carryPlan({ ...base, short: { ...base.short, book: { bids: [{ px: 99.99, sz: 0.05 }], asks: [{ px: 100.01, sz: 1 }] } } });
   assert.match(shallow.costRefusal!, /^the hyperliquid book fills only \$4\.9995 of \$15\.0000 within the levels read: the round trip cannot be priced$/);
+});
+
+test('an owner demo entry: the spread not covering the round trip is waived and said; a round trip over maxLossUsd and every other refusal stand', () => {
+  // XLM as refused for cost above (0.0397 USD round trip): with demo it is waived, nothing refused.
+  const xlm: CarryInput = {
+    symbol: 'XLM', legUsd: 11.44, leverage: 1.5, holdDays: 7, basisBufferBps: 10,
+    short: { ...base.short, ratePerHour: 0.178 / 8760, rate7dPerHour: 0.178 / 8760, feeBps: 5.5, book: book(1, 2.35) },
+    long: { ...base.long, ratePerHour: 0, rate7dPerHour: 0, feeBps: 3.5, book: book(1, 1) },
+  };
+  const demo = carryPlan({ ...xlm, demo: { maxLossUsd: 0.25 } });
+  assert.equal(demo.costRefusal, null);
+  assert.match(demo.waived!, /^the expected spread over 7 days, \$0\.0391, does not cover the round trip \$0\.0397/);
+  assert.deepEqual(demo.refusals, []);
+  assert.equal(carryPlan(xlm).waived, null, 'without demo nothing is waived');
+  // The round trip over what the owner accepted: refused, with both numbers; not a refusal for cost (no hold-out).
+  const over = carryPlan({ ...xlm, demo: { maxLossUsd: 0.03 } });
+  assert.deepEqual(over.refusals, ['owner demo entry: the round trip $0.0397 on this open\'s books is over the $0.0300 the owner accepted (maxLossUsd)']);
+  assert.equal(over.costRefusal, null);
+  // A book that cannot price it, margin and liquidation: refused as without demo.
+  const empty = carryPlan({ ...xlm, demo: { maxLossUsd: 0.25 }, long: { ...xlm.long, book: { bids: [], asks: [{ px: 1, sz: 1 }] } } });
+  assert.equal(empty.costRefusal, 'the phoenix book has no two-sided touch: the round trip cannot be priced');
+  assert.equal(empty.waived, null);
+  const tight = carryPlan({ ...base, holdDays: 1, demo: { maxLossUsd: 0.25 }, long: { ...base.long, equityUsd: 6 } });
+  assert.notEqual(tight.waived, null);
+  assert.equal(tight.refusals.length, 2);
+  assert.match(tight.refusals.join(' | '), /1\.5x cap .* \| .*liquidated 38\.00 % away/);
+});
+
+test('an owner demo entry never waives funding against the position, and checks maxLossUsd again', () => {
+  const xlm: CarryInput = {
+    symbol: 'XLM', legUsd: 11.44, leverage: 1.5, holdDays: 7, basisBufferBps: 10,
+    short: { ...base.short, ratePerHour: 0.178 / 8760, rate7dPerHour: 0.178 / 8760, feeBps: 5.5, book: book(1, 2.35) },
+    long: { ...base.long, ratePerHour: 0, rate7dPerHour: 0, feeBps: 3.5, book: book(1, 1) },
+  };
+  // A 7-day spread of 0 or less: funding runs against the position, refused for cost as without demo.
+  for (const rate7d of [0, -0.1 / 8760]) {
+    const against = carryPlan({ ...xlm, demo: { maxLossUsd: 0.25 }, short: { ...xlm.short, rate7dPerHour: rate7d } });
+    assert.ok(!(against.expectedSpreadUsd > 0));
+    assert.equal(against.waived, null);
+    assert.match(against.costRefusal!, /^the expected spread over 7 days, (\$0\.0000|-\$0\.0219), does not cover the round trip/);
+    assert.ok(against.refusals.includes(against.costRefusal!));
+  }
+  // maxLossUsd not above 0, not finite, over DEMO_MAX_LOSS_USD or not a number: refused, and nothing is waived.
+  for (const m of [0, -1, Number.NaN, Infinity, DEMO_MAX_LOSS_USD + 0.01, '0.25' as unknown as number]) {
+    const bad = carryPlan({ ...xlm, demo: { maxLossUsd: m } });
+    assert.equal(bad.waived, null, String(m));
+    assert.ok(bad.refusals.some((r) => r.startsWith(`owner demo entry: maxLossUsd ${String(m)} is not a number above 0 and at most $1.0000`)), JSON.stringify(bad.refusals));
+    assert.notEqual(bad.costRefusal, null);
+  }
+  assert.deepEqual(carryPlan({ ...xlm, demo: { maxLossUsd: DEMO_MAX_LOSS_USD } }).refusals, []);
 });
 
 test('the 7-day mean weights each print by its hours; half spread in bps of the mid', () => {
