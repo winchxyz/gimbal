@@ -21,7 +21,7 @@
 // web/vite.config.ts) and the engine's allowed browser Origin with it (serve --web-port), so the two always match.
 
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -32,15 +32,8 @@ import { parseArgs } from 'node:util';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const START_TIMEOUT_MS = 90_000;
 // The demo's engine rules (PUT /strategy): the engine's defaults, with legs the final policy accepts and auto on.
-const DEMO_STRATEGY = {
-  auto: true,
-  minNetAprPct: 5,
-  legUsd: 12,
-  maxLeverage: 3,
-  stopDrawdownPct: 10,
-  rotate: { minGainPts: 3, forHours: 4 },
-  risk: { watchDistancePct: 15, rescueDistancePct: 8 },
-};
+// In a file of their own so the hosted replay (engine/src/cli/replay-host.ts) sets the same ones.
+const DEMO_STRATEGY = JSON.parse(readFileSync(join(root, 'tools', 'demo-strategy.json'), 'utf8'));
 
 const { values } = parseArgs({
   options: {

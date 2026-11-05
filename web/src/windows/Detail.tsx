@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { StrategyConfig, Window as FundingWindow } from '@gimbal/shared';
+import { writeControls } from '../remote/readonly.ts';
 import { Flash } from '../ui/Flash.tsx';
 import { cx } from '../ui/cx.ts';
 import { useNow } from '../ui/useNow.ts';
@@ -175,7 +176,10 @@ function DecisionLine({ decision, w, alerts, onToggleAlert }: DecisionProps) {
   const [asking, setAsking] = useState<Asking>(null);
   const [sending, setSending] = useState(false);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
-  const { rotate, alert: alertOver, close } = decision;
+  // Remote view and hosted replay: the line says what auto will do; the overrides are not offered.
+  const { alert: alertOver } = decision;
+  const rotate = writeControls().rotate ? decision.rotate : null;
+  const close = writeControls().close && decision.close;
   const alertSet = alertOver ? hasAlert(alerts, w.id, alertOver.over.id) : false;
 
   useEffect(() => {

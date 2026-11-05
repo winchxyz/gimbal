@@ -1,4 +1,5 @@
 import type { DeskState, JournalEntry, Leg, ScanStatus, StrategyConfig, StrategyDecision, VenueId, Window as FundingWindow } from '@gimbal/shared';
+import { writeControls } from '../remote/readonly.ts';
 import { MoneyActions } from '../shell/Header.tsx';
 import { StatusActions } from '../shell/StatusActions.tsx';
 import { downVenues, type StatusActionsView } from '../shell/status.ts';
@@ -389,13 +390,16 @@ function Waiting({ desk, windows, strategy, scan, journal, now }: WaitingProps) 
         </div>
         <div className="go">
           <a className="btn primary" href="#/windows">See all windows</a>
-          <button
-            type="button"
-            className="btn quiet"
-            onClick={() => notify('Your minimum is part of the rules. Changing a signed policy is not built yet. Nothing changed.')}
-          >
-            Change my minimum
-          </button>
+          {/* The owner's rules: not drawn where nothing may change them (remote view, hosted replay). */}
+          {writeControls().owner ? (
+            <button
+              type="button"
+              className="btn quiet"
+              onClick={() => notify('Your minimum is part of the rules. Changing a signed policy is not built yet. Nothing changed.')}
+            >
+              Change my minimum
+            </button>
+          ) : null}
         </div>
         <MoneyActions mode={desk.mode} className="btns d-phone" />
       </div>

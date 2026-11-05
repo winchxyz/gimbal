@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { Mode } from '@gimbal/shared';
-import { writeControls } from '../remote/readonly.ts';
+import { isHostedReplay, writeControls } from '../remote/readonly.ts';
 import { notify } from '../ui/notice.ts';
 import { stressView } from './model.ts';
 import { sendStress } from './useRescue.ts';
@@ -37,6 +37,7 @@ export function Stress({ mode, running }: { mode: Mode | null; running: boolean 
       <p>
         Pushes one leg past the rescue line so you can watch every step run. NEAR Intents has no testnet, so the transfer steps play
         back a recorded mainnet run, marked as replay.
+        {isHostedReplay() ? ' This public replay runs one stress test per run, for all visitors.' : null}
       </p>
       <StressButton mode={mode} running={running} />
       {note ? <p className="note">{note}</p> : null}
