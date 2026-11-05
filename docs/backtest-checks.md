@@ -40,7 +40,7 @@ rerun reads nothing. A full run takes about an hour on one core; each scope and 
   `auto` on, and LOOP_RULES as they are (cooldown 6 h, time stop 14 d, at most 2 rotations a day, the 1.5x no-rescue
   leverage cap) except the two counts, which `DecideInput.rules` sets (serve never passes it). Lots are the venues'
   `Market.lotSize` at the mean of today's marks, so a leg is sized and rounded as `sizeFor` sizes it. Free margin is
-  set high enough never to bind. The NEAR AI veto is not run.
+  set high enough never to bind. The NEAR AI risk check is not run.
 - **Booking.** A pair held over an hour books that hour's funding on both legs from the venues' booked rates:
   `legUsd x (short leg's rate - long leg's rate)`. Each entry and each rotation books the round trip the scanner
   priced for that window (4 fills, slippage, basis buffer) at the size `decide()` opened. Price P&L is not counted
@@ -98,8 +98,6 @@ The scanner's gate now prices the round trip the pair trader's open is held to (
 
 | enter | exit | entries | exits | rotations | hours held | gross USD | costs USD | net USD | net / entry | missed (valued at N=1) | waited-hours funding USD | late-exit hours | late-exit funding USD | bad runs held through |
 |-------|------|---------|-------|-----------|------------|-----------|-----------|---------|-------------|------------------------|--------------------------|-----------------|-----------------------|-----------------------|
-| enter | exit | entries | exits | rotations | hours held | gross USD | costs USD | net USD | net / entry | missed (valued at N=1) | waited-hours funding USD | late-exit hours | late-exit funding USD | bad runs held through |
-|-------|------|---------|-------|-----------|------------|-----------|-----------|---------|-------------|------------------------|--------------------------|-----------------|-----------------------|-----------------------|
 | 1 | 1 | 4 | 4 | 0 | 814 | 0.236 | 0.160 | **0.077** | 0.019 | 0 | 0.000 | 0 | 0.000 | 0 |
 | 1 | 2 | 4 | 4 | 0 | 822 | 0.235 | 0.160 | **0.076** | 0.019 | 0 | 0.000 | 2 | -0.000 | 2 |
 | 1 | 3 | 3 | 3 | 0 | 833 | 0.237 | 0.118 | **0.119** | 0.040 | 0 | 0.000 | 2 | -0.000 | 3 |
@@ -123,8 +121,6 @@ The scanner's gate now prices the round trip the pair trader's open is held to (
 
 **1000 USD a leg**
 
-| enter | exit | entries | exits | rotations | hours held | gross USD | costs USD | net USD | net / entry | missed (valued at N=1) | waited-hours funding USD | late-exit hours | late-exit funding USD | bad runs held through |
-|-------|------|---------|-------|-----------|------------|-----------|-----------|---------|-------------|------------------------|--------------------------|-----------------|-----------------------|-----------------------|
 | enter | exit | entries | exits | rotations | hours held | gross USD | costs USD | net USD | net / entry | missed (valued at N=1) | waited-hours funding USD | late-exit hours | late-exit funding USD | bad runs held through |
 |-------|------|---------|-------|-----------|------------|-----------|-----------|---------|-------------|------------------------|--------------------------|-----------------|-----------------------|-----------------------|
 | 1 | 1 | 4 | 4 | 0 | 237 | 5.87 | 12.96 | **-7.09** | -1.77 | 0 | 0.00 | 0 | 0.00 | 0 |
@@ -424,7 +420,7 @@ resets a count in progress. `npm run backtest:checks` prints the default setting
   and longer holds better still.
 - **The current hour.** Live, Hyperliquid's `funding()` reports the predicted rate of the hour under way; here every
   venue's current rate is the last booked one. The "this hour pays < 0" check therefore lags live by up to an hour.
-- **Not counted.** Price P&L and basis convergence, 1Click margin moves and their cost, rescues, the NEAR AI veto,
+- **Not counted.** Price P&L and basis convergence, 1Click margin moves and their cost, rescues, the NEAR AI risk check,
   Phoenix's daily settlement, the 5 s scan events between hourly checks, order failures and partial fills. Orderly's
   8-hour prints are spread evenly over their hours.
 - **Live serve and other directions.** In the live scope only serve's direction reaches `decide()`. Live, serve gives
