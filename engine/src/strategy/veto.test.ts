@@ -395,7 +395,7 @@ test('riskCheckSource: testnet and mainnet always get NEAR AI (no key holds); re
     for (const nearAi of [withKey, noKey]) {
       const s = riskCheckSource(mode, nearAi, files);
       assert.equal(s, nearAi, `${mode}: NEAR AI itself`);
-      assert.notEqual(s.replayPassUnrecorded, true, `${mode}: never the replay-only pass`);
+      assert.notEqual((s as VetoSource).replayPassUnrecorded, true, `${mode}: never the replay-only pass`);
     }
     // With no key, every enter and rotate is held, never passed.
     const r = await checkVeto(riskCheckSource(mode, noKey, files), PASS_FACTS, { now: T0 });
