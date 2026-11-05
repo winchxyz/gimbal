@@ -1228,7 +1228,8 @@ export class StrategyLoop {
     }
     this.#record('exit', { windowId: id, symbol: held?.symbol ?? '', outcome: r, forecastNetAprPct: held?.entryNetAprPct ?? null, exitReason: reason, rotation: null, manual, startedAt: closeAt });
     this.#setHeld(null);
-    this.#journal('exit', `exit ${id}: ${reason}; ${r.reason} (${who})`, { window: id, by: who, feeUsd: r.feeUsd, ...(pnl === undefined ? {} : { pnlUsd: round(pnl) }) }, r.tx);
+    // A manual close's reason is already its "who": said once.
+    this.#journal('exit', `exit ${id}: ${reason}; ${r.reason}${reason === who ? '' : ` (${who})`}`, { window: id, by: who, feeUsd: r.feeUsd, ...(pnl === undefined ? {} : { pnlUsd: round(pnl) }) }, r.tx);
     return { end: 'done', sent: true, passing: false };
   }
 

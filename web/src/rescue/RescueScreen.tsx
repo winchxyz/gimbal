@@ -143,7 +143,7 @@ function Run({ progress: p, desk, strategy, mode }: RunProps) {
             id={id}
             n={i + 1}
             state={states[id]}
-            text={states[id] === 'fail' ? failText(failure) : stepText(id, { p, leg, line })}
+            text={states[id] === 'fail' ? failText(failure) : stepText(id, { p, leg, line, mode })}
             time={timeOf(id, states[id], p, book, now, failure?.tries ?? null, failed)}
             replay={mode === 'testnet' && (id === 'quote' || id === 'deposit' || id === 'landed') && (states[id] === 'done' || states[id] === 'now')}
             tx={txs[id]}

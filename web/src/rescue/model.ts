@@ -142,6 +142,8 @@ export interface TriggerFacts {
   stress: boolean;
   /** What the leg needed, before a transfer was planned. */
   needUsd: number | null;
+  /** The leg's distance to liquidation when the trigger fired, in percent. */
+  distancePct: number | null;
 }
 
 /** How long before the rescuer starts the risk engine's trigger line can be: the rescuer takes it on its next tick. */
@@ -158,28 +160,38 @@ export function triggerOf(journal: readonly JournalEntry[], p: Pick<RescueProgre
     if (e === undefined || x.t > e.t) e = x;
   }
   if (!e) return null;
-  return { t: e.t, rescuePct: numberOf(e, 'rescuePct')!, stress: numberOf(e, 'stress') === 1, needUsd: numberOf(e, 'amountUsd') };
+  return { t: e.t, rescuePct: numberOf(e, 'rescuePct')!, stress: numberOf(e, 'stress') === 1, needUsd: numberOf(e, 'amountUsd'), distancePct: numberOf(e, 'distancePct') };
 }
 
 /** The line a rescue is measured against: the owner's, unless the trigger came under a raised one. */
 export interface RescueLine {
   /** The percent the distance is compared with, or null before the owner's line is read. */
   pct: number | null;
-  /** How the detect step names it: "your 8% rescue line, raised to 85.4% by the stress test". */
+  /** How the detect step names it: "your 8% rescue line", or "your 8% rescue line, raised to 11.5% for the venue's volatility". */
   text: string;
-  /** How the hero names it: "the 85.4% stress-test line". */
+  /** How the hero names it: "the 87.32% line the stress test set". */
   short: string;
+  /**
+   * The detect step's whole sentence when a stress test raised the line: "The stress test raised this leg's rescue line
+   * from your 8% to 87.32% (5 points above its 82.29% distance), so a rescue starts". Null otherwise.
+   */
+  raised: string | null;
 }
 
 const pctText = (n: number): string => `${Number(n.toFixed(2))}%`;
 
 export function rescueLine(owner: number | null, trigger: TriggerFacts | null): RescueLine {
   const own = owner === null ? 'your rescue line' : `your ${pctText(owner)} rescue line`;
-  if (trigger === null || (owner !== null && trigger.rescuePct <= owner + 1e-9)) return { pct: owner, text: own, short: own };
+  if (trigger === null || (owner !== null && trigger.rescuePct <= owner + 1e-9)) return { pct: owner, text: own, short: own, raised: null };
   const at = pctText(trigger.rescuePct);
-  return trigger.stress
-    ? { pct: trigger.rescuePct, text: `${own}, raised to ${at} by the stress test`, short: `the ${at} stress-test line` }
-    : { pct: trigger.rescuePct, text: `${own}, raised to ${at} for the venue’s volatility`, short: `the ${at} volatility-raised line` };
+  if (!trigger.stress) return { pct: trigger.rescuePct, text: `${own}, raised to ${at} for the venue’s volatility`, short: `the ${at} line the venue’s volatility set`, raised: null };
+  const from = owner === null ? '' : ` from your ${pctText(owner)}`;
+  const d = trigger.distancePct;
+  const above = d === null ? '' : ` (${Number((trigger.rescuePct - d).toFixed(1))} points above its ${pctText(d)} distance)`;
+  return {
+    pct: trigger.rescuePct, text: `${own}, raised to ${at} by the stress test`, short: `the ${at} line the stress test set`,
+    raised: `The stress test raised this leg’s rescue line${from} to ${at}${above}, so a rescue starts`,
+  };
 }
 
 export interface StepContext {
@@ -187,13 +199,19 @@ export interface StepContext {
   leg: Leg | null;
   /** The line the rescue is measured against (`rescueLine`). */
   line: RescueLine;
+  /** A replay has no contract and signs nothing: the verify and sign steps say what the contract would do. */
+  mode?: Mode | null;
 }
 
+const REPLAY_NOTHING = '(replay: no contract, nothing signed)';
+
 /** The sentence under each step's title. */
-export function stepText(id: StepId, { p, leg, line }: StepContext): string {
+export function stepText(id: StepId, { p, leg, line, mode = null }: StepContext): string {
   const to = VENUE_NAMES[p.to];
+  const replay = mode === 'replay';
   switch (id) {
     case 'detect':
+      if (line.raised !== null) return line.raised;
       return leg ? `The ${to} ${leg.side} came inside ${line.text}` : `A leg on ${to} came inside ${line.text}`;
     case 'source':
       return p.from === 'reserve' ? 'The reserve pays. Both legs keep their margin.' : `${VENUE_NAMES[p.from]} free margin pays. The reserve is kept.`;
@@ -201,12 +219,19 @@ export function stepText(id: StepId, { p, leg, line }: StepContext): string {
       // What was quoted and sent; once landed, amountUsd is what arrived after fees, so the row keeps sentUsd.
       return `NEAR Intents: ${usd(p.sentUsd ?? p.amountUsd)} to ${to} margin`;
     case 'verify':
-      return 'The contract checks the quote signature and the deposit address';
+      return replay
+        ? `Live, the contract would check the quote signature and the deposit address ${REPLAY_NOTHING}`
+        : 'The contract checks the quote signature and the deposit address';
     case 'sign':
       // fund_venue is one contract call that sends the reserve's USDC on NEAR itself: no MPC signature.
+      if (replay) {
+        return p.from === 'reserve'
+          ? `Live, the contract would pay the Intents deposit address from the reserve (fund_venue) ${REPLAY_NOTHING}`
+          : `Live, NEAR MPC would sign the transfer ${REPLAY_NOTHING}`;
+      }
       return p.from === 'reserve' ? 'The contract pays the Intents deposit address from the reserve (fund_venue)' : 'NEAR MPC signs the transfer';
     case 'deposit':
-      return 'Sent to the Intents deposit address';
+      return replay ? `The recorded quote’s deposit, played on the replay desk ${REPLAY_NOTHING}` : 'Sent to the Intents deposit address';
     case 'landed':
       return `Credited to ${to} margin`;
   }

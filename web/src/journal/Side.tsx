@@ -75,7 +75,7 @@ export function Side({ entries, desk, windows }: { entries: readonly JournalEntr
           <b>
             <Flash value={counts.refused} />
           </b>
-          <span>refused by your policy</span>
+          <span>refused (sizing, policy or contract)</span>
         </div>
         <div>
           <b>

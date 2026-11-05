@@ -88,7 +88,7 @@ export function JournalLoading() {
             </div>
           </div>
           <div className="j-counts">
-            {['actions signed by the contract', 'signed by a private key', 'refused by your policy', 'refused by the NEAR AI risk check'].map((label) => (
+            {['actions signed by the contract', 'signed by a private key', 'refused (sizing, policy or contract)', 'refused by the NEAR AI risk check'].map((label) => (
               <div key={label}>
                 <Sk w={48} h={40} />
                 <span>{label}</span>

@@ -498,6 +498,8 @@ if (deskSource !== null) {
     // Detect only while the live rescuer is not running: the trigger is not taken and is published at `detect`.
     rescuer: rescue.rescuer, rescuerRunning: rescue.running,
     ...(pair?.adl === undefined ? {} : { adl: pair.adl }),
+    // Replay: the trigger names the reserve its rescuer plans from first.
+    ...(replayDesk === null ? {} : { reserveUsd: () => replayDesk?.reserveUsd ?? null }),
   });
   if (pair !== null) {
     const lines = liveLines({
@@ -632,12 +634,17 @@ const strategyLoop = loop;
 // The journal survives a restart (journal-store.ts): next to the book in testnet and mainnet, memory only in replay.
 const journal = openJournal(mode, stateDirSet === undefined ? userStateDir(envVar) : resolve(stateDirSet), contract?.client.contractId ?? null, deskId, log);
 
+/** The owner's rules are in force: saved ones loaded at the start, or set over PUT /strategy (the replay script waits for them). */
+let strategySetByOwner = saved.strategy !== null;
 server = new EngineServer({
   mode,
   allowedOrigins: webOrigins(webPort),
   scanner,
   strategyLoop,
-  onStrategy: () => strategyLoop.onScan(),
+  onStrategy: () => {
+    strategySetByOwner = true;
+    strategyLoop.onScan();
+  },
   strategy: saved.strategy ?? DEFAULT_STRATEGY,
   saveStrategy: (s) => strategyStore.save(s),
   drafter,
@@ -661,10 +668,13 @@ const listening = await server.start(port, host);
 risk?.start();
 // Replay with GIMBAL_TRADE=1 (npm run demo): the script that plays the owner's demo entry and close, so the loop's
 // whole cycle fits in the recording (serve-replay-loop.ts).
+let stopReplayScript: (() => void) | null = null;
 if (replayParts !== null && replayBegin !== null && replayEnd !== null && envVar('GIMBAL_TRADE') === '1') {
   const live = server;
-  new ReplayScript({
+  stopReplayScript = new ReplayScript({
     clock, start: replayBegin, end: replayEnd, loop: strategyLoop, windows: () => live.state().windows, strategy: () => live.strategy,
+    // The demo sets the owner's rules (PUT /strategy) once the engine answers: the script waits for them.
+    rulesSet: () => strategySetByOwner,
     policy: () => policy, publish, log,
   }).start();
 }
@@ -744,6 +754,7 @@ async function shutdown(reason: string): Promise<void> {
   clearInterval(monitorTimer);
   egress?.stop();
   // The loop starts nothing new; an open or close it runs is waited for with the rest, under the same deadline.
+  stopReplayScript?.();
   strategyLoop.stop();
   attestor.stop();
   book?.stop();

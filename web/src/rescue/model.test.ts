@@ -183,6 +183,18 @@ test('every step has a sentence, and the source never names a withdrawal from a 
   assert.match(stepText('quote', { p, leg: null, line: rescueLine(null, null) }), /\$120\.00 to Hyperliquid margin/);
 });
 
+test('in a replay the verify, sign and deposit steps say what the contract would do: no contract, nothing signed', () => {
+  const reserve = progress('sign', 5, { from: 'reserve' });
+  for (const id of ['verify', 'sign', 'deposit'] as const) {
+    assert.match(stepText(id, { p: reserve, leg: null, line: OWN8, mode: 'replay' }), /\(replay: no contract, nothing signed\)$/);
+  }
+  assert.equal(stepText('sign', { p: reserve, leg: null, line: OWN8, mode: 'replay' }), 'Live, the contract would pay the Intents deposit address from the reserve (fund_venue) (replay: no contract, nothing signed)');
+  assert.equal(stepText('verify', { p: reserve, leg: null, line: OWN8, mode: 'replay' }), 'Live, the contract would check the quote signature and the deposit address (replay: no contract, nothing signed)');
+  // Live and testnet are unchanged.
+  assert.equal(stepText('verify', { p: reserve, leg: null, line: OWN8, mode: 'mainnet' }), 'The contract checks the quote signature and the deposit address');
+  assert.equal(stepText('sign', { p: reserve, leg: null, line: OWN8, mode: 'testnet' }), 'The contract pays the Intents deposit address from the reserve (fund_venue)');
+});
+
 test('the sign step names MPC only where MPC signs: a reserve rescue is the contract paying with fund_venue', () => {
   // Phoenix -> Hyperliquid (sol_sign_rescue) and Hyperliquid's routes are MPC-signed transactions.
   assert.equal(stepText('sign', { p: progress('sign', 5), leg: null, line: OWN8 }), 'NEAR MPC signs the transfer');
@@ -230,18 +242,20 @@ test('a stress test\'s raised line is named with the owner\'s, so the detect ste
     trigger({ venue: 'hyperliquid', distancePct: 6, rescuePct: 8, watchPct: 15, amountUsd: 30, from: 'reserve' }, T0 - 60_000),
   ];
   const facts = triggerOf(journal, { startedAt: T0 });
-  assert.deepEqual(facts, { t: T0 - 700, rescuePct: 85.4, stress: true, needUsd: 1.4 });
+  assert.deepEqual(facts, { t: T0 - 700, rescuePct: 85.4, stress: true, needUsd: 1.4, distancePct: 80.4 });
   assert.equal(triggerOf(journal, { startedAt: T0 - 701 })?.t, T0 - 60_000);
   assert.equal(triggerOf(journal, { startedAt: T0 + 61_000 }), null);
   const line = rescueLine(8, facts);
   assert.equal(line.pct, 85.4);
   const p = progress('detect', 0);
-  assert.equal(stepText('detect', { p, leg: null, line }), 'A leg on Hyperliquid came inside your 8% rescue line, raised to 85.4% by the stress test');
-  assert.equal(distanceNote(80.4, line), 'inside the 85.4% stress-test line');
-  assert.equal(distanceNote(96.2, line), 'clear of the 85.4% stress-test line');
+  assert.equal(stepText('detect', { p, leg: null, line }), 'The stress test raised this leg’s rescue line from your 8% to 85.4% (5 points above its 80.4% distance), so a rescue starts');
+  assert.equal(distanceNote(80.4, line), 'inside the 85.4% line the stress test set');
+  assert.equal(distanceNote(96.2, line), 'clear of the 85.4% line the stress test set');
   // A trigger at the owner's own line changes nothing; a higher one without a stress test is the volatility term.
-  assert.deepEqual(rescueLine(8, { t: T0, rescuePct: 8, stress: false, needUsd: 30 }), OWN8);
-  assert.match(rescueLine(8, { t: T0, rescuePct: 11.5, stress: false, needUsd: 30 }).text, /raised to 11\.5% for the venue’s volatility$/);
+  assert.deepEqual(rescueLine(8, { t: T0, rescuePct: 8, stress: false, needUsd: 30, distancePct: 6 }), OWN8);
+  const vol = rescueLine(8, { t: T0, rescuePct: 11.5, stress: false, needUsd: 30, distancePct: 10 });
+  assert.match(vol.text, /raised to 11\.5% for the venue’s volatility$/);
+  assert.equal(stepText('detect', { p, leg: null, line: vol }), 'A leg on Hyperliquid came inside your 8% rescue line, raised to 11.5% for the venue’s volatility');
 });
 
 test('a transfer that is not what the leg needed says why', () => {

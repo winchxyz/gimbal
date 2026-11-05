@@ -267,6 +267,30 @@ test('a rescue the engine journaled with its fee apart counts that fee once, on 
   assert.equal(attributionOf(flat, [trigger, sent, landed]).otherUsd, -0.52);
   // A rescue whose cost is its amount (the web's own fixtures) keeps it.
   assert.equal(pnlOf(entry({ kind: 'rescue', numbers: { usd: -0.31, landedS: 52 } })), -0.31);
+  // The sent line's fee is the quote: labelled so, not counted; the landed line's is the fee.
+  assert.equal(rowOf(sent).note, 'quoted fee −$0.52');
+  assert.equal(rowOf(landed).note, 'fee −$0.52');
+});
+
+test('from Hyperliquid, the withdrawal fee and the 1Click fee each count once; a reduce costs nothing here', () => {
+  // The rescuer's lines for a Hyperliquid source: hl_withdraw (1 USDC fee, to the desk's own Arbitrum address), the
+  // 1Click send from Arbitrum (quoted), the landing (the 1Click fee); and a reduce, whose cost is in the fills.
+  const started = entry({ kind: 'rescue', numbers: { venue: 'phoenix', amountUsd: 12, from: 'hyperliquid' } });
+  const withdraw = entry({ kind: 'rescue', numbers: { from: 'hyperliquid', usd: 0, feeUsd: -1, signedS: 3.2 } });
+  const sent = entry({ kind: 'rescue', numbers: { from: 'hyperliquid', usd: 0, feeUsd: -0.3, amountUsd: 11, signedS: 41.5 } });
+  const landed = entry({ kind: 'rescue', numbers: { from: 'hyperliquid', landedS: 160.2, signedS: 41.5, usd: 0, amountUsd: 10.7, feeUsd: -0.3 } });
+  const reduce = entry({ kind: 'rescue', numbers: { from: 'phoenix', usd: 0, signedS: 2 } });
+  assert.deepEqual([started, withdraw, sent, landed, reduce].map(pnlOf), [0, -1, 0, -0.3, 0]);
+  const flat: DeskState['pnl'] = { fundingUsd: 0, feesUsd: 0, priceUsd: 0, netUsd: 0 };
+  assert.equal(attributionOf(flat, [started, withdraw, sent, landed, reduce]).otherUsd, -1.3);
+  assert.equal(rowOf(withdraw).note, 'fee −$1.00');
+  assert.equal(rowOf(sent).note, 'quoted fee −$0.30');
+});
+
+test('a replay rescue row shows no signature time: nothing is signed', () => {
+  const landed = entry({ kind: 'rescue', numbers: { from: 'reserve', usd: 0, feeUsd: -0.52, amountUsd: 19.48, landedS: 100.9, signedS: 0 } });
+  assert.deepEqual(rowOf(landed, { replay: true }).steps, ['detected', 'source: reserve', 'quote ✓', 'landed 101 s']);
+  assert.deepEqual(rowOf(landed).steps, ['detected', 'source: reserve', 'quote ✓', 'signed 0.0 s', 'landed 101 s']);
 });
 
 test('where the money went: the desk’s funding, fees and price, and the journal’s cost of moving money', () => {

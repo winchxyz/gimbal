@@ -66,13 +66,24 @@ export function pnlOf(entry: JournalEntry): number {
 }
 
 /**
- * A rescue's cost: its `usd`; the engine's own rescue lines carry `usd: 0` and the transfer's fee in `feeUsd`, on the
- * line that sent it and again on the one that says it landed, so that fee is counted once, on the landed line.
+ * A rescue's cost: its `usd`; the engine's own rescue lines carry `usd: 0` and a fee in `feeUsd`. Each fee counts once:
+ * Hyperliquid's withdrawal fee on its hl_withdraw line (no `amountUsd`, it moves to the desk's own address), and the
+ * 1Click transfer's fee on the line that says it landed (`landedS`). The line that sent the transfer repeats that fee as
+ * quoted (`amountUsd`, no `landedS`: `isQuotedFee`) and is not counted.
  */
 export function rescueCostUsd(entry: JournalEntry): number {
   const usd = amountUsd(entry) ?? 0;
-  if (usd !== 0 || numberOf(entry, 'landedS') === null) return usd;
+  if (usd !== 0) return usd;
+  const landed = numberOf(entry, 'landedS') !== null;
+  if (!landed && numberOf(entry, 'amountUsd') !== null) return 0;
   return feeUsd(entry) ?? 0;
+}
+
+/** A rescue line whose fee is the transfer's quote, counted when it lands (see rescueCostUsd). */
+export function isQuotedFee(entry: JournalEntry): boolean {
+  const fee = feeUsd(entry);
+  return entry.kind === 'rescue' && fee !== null && fee !== 0 && (amountUsd(entry) ?? 0) === 0
+    && numberOf(entry, 'landedS') === null && numberOf(entry, 'amountUsd') !== null;
 }
 
 // ---------- days ----------
@@ -178,8 +189,11 @@ export interface RowView {
 
 const seconds = (s: number): string => `${s < 10 ? s.toFixed(1) : Math.round(s)} s`;
 
-/** A rescue's steps as far as the entry says: detected, where the margin came from, the quote, the signature, the landing. */
-export function stepsOf(entry: JournalEntry): string[] | null {
+/**
+ * A rescue's steps as far as the entry says: detected, where the margin came from, the quote, the signature, the
+ * landing. A replay signs nothing, so it shows no signature time.
+ */
+export function stepsOf(entry: JournalEntry, replay = false): string[] | null {
   if (entry.kind !== 'rescue') return null;
   const from = entry.numbers.from;
   const signed = numberOf(entry, 'signedS');
@@ -188,7 +202,7 @@ export function stepsOf(entry: JournalEntry): string[] | null {
   const steps = ['detected'];
   if (typeof from === 'string' && from.length > 0) steps.push(`source: ${from === 'reserve' ? 'reserve' : venueName(from)}`);
   if (signed !== null || landed !== null) steps.push('quote ✓');
-  if (signed !== null) steps.push(`signed ${seconds(signed)}`);
+  if (signed !== null && !replay) steps.push(`signed ${seconds(signed)}`);
   if (landed !== null) steps.push(`landed ${seconds(landed)}`);
   return steps;
 }
@@ -204,13 +218,13 @@ export function whyOf(entry: JournalEntry): RowView['why'] {
 function noteOf(entry: JournalEntry, amount: number | null): string | null {
   if (amount === null) return null;
   const fee = feeUsd(entry);
-  if (fee !== null && fee !== 0) return `fee ${signedUsd(fee)}`;
+  if (fee !== null && fee !== 0) return `${isQuotedFee(entry) ? 'quoted fee' : 'fee'} ${signedUsd(fee)}`;
   if (entry.kind === 'enter') return 'fees';
   if (entry.kind === 'exit' || entry.kind === 'rotate') return 'after fees';
   return null;
 }
 
-export function rowOf(entry: JournalEntry): RowView {
+export function rowOf(entry: JournalEntry, { replay = false }: { replay?: boolean } = {}): RowView {
   const info = KINDS[entry.kind];
   const amount = amountUsd(entry);
   return {
@@ -221,7 +235,7 @@ export function rowOf(entry: JournalEntry): RowView {
     label: info.label,
     tone: info.tone,
     summary: entry.summary,
-    steps: stepsOf(entry),
+    steps: stepsOf(entry, replay),
     why: whyOf(entry),
     flag: unprotectedText(entry),
     // Positive money is green; moving principal is not earning, so a deposit stays plain like a withdrawal.

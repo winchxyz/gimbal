@@ -360,6 +360,11 @@ export class ReplayDesk implements DeskSource {
     this.#reserve -= usd;
   }
 
+  /** The reserve now, USD (the risk engine's trigger names it as the source when it covers the need). */
+  get reserveUsd(): number {
+    return Math.max(0, this.#reserve);
+  }
+
   #accountVenues(): VenueId[] {
     return REPLAY_ACCOUNT_VENUES.filter((v) => this.#o.venues.some((r) => r.id === v));
   }

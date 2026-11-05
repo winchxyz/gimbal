@@ -9,7 +9,7 @@
 // the hourly `funding` lines (fundingEntry) the journal's amounts add up to the realized net.
 //
 // ReplayScript: a recording is about an hour long, too short for the loop to enter on its own (enterAfterChecks
-// hourly checks above the minimum) or to exit on its own (exitAfterChecks, or a demo pair's 24). So, labelled on the
+// hourly checks above the minimum) or to exit on its own (exitAfterChecks hourly checks). So, labelled on the
 // journal, it plays what the owner would do: an owner demo entry (POST /rotate with demo, the loop's own path: only the
 // profit checks are waived, the round trip held to REPLAY_DEMO_MAX_LOSS_USD) on the best window the policy allows,
 // a few minutes in; and POST /close a few minutes after the first hour boundary the pair holds through, once its
@@ -22,6 +22,7 @@ import { isEnterableButForProfit } from '../scanner/price.ts';
 import type { ReplayClose, ReplayDesk, ReplayFill, ReplayFunding } from '../risk/sources.ts';
 import { REPLAY_ACCOUNT_VENUES } from '../risk/sources.ts';
 import type { ActOutcome, BookFill, LoopHands, LoopHeld } from '../strategy/loop.ts';
+import { checkRulesOf } from '../strategy/loop.ts';
 import { HyperliquidReader } from '../venues/hyperliquid.ts';
 import { venueName } from '../venues/names.ts';
 import { PhoenixReader } from '../venues/phoenix.ts';
@@ -214,6 +215,16 @@ export interface ReplayScriptInput {
   policy: () => ContractPolicy | null;
   publish: (event: StreamEvent) => void;
   log: (line: string) => void;
+  /** True once the owner's rules are applied (PUT /strategy); unset means they are (no entry waits on it). */
+  rulesSet?: () => boolean;
+}
+
+/** A window whose spread pays the other way this hour, in words, with its rates: the demo shows the cycle, not a profit. */
+export function againstText(w: FundingWindow): string {
+  const pct = (v: number) => `${v > 0 ? '+' : ''}${v.toFixed(1)} %`;
+  const week = w.grossApr7dPct === null ? '' : `; its 7-day spread, ${pct(w.grossApr7dPct)}, is why it is listed in this direction`;
+  return `${w.symbol}: this hour's rates pay the other way (${pct(w.grossAprPct)} APR${week}), so in this recorded hour the pair pays funding: `
+    + 'the demo shows the cycle, not a profit';
 }
 
 /** The windows a demo entry may open on the replay desk, best net first: Hyperliquid and Phoenix, in the policy. */
@@ -274,6 +285,8 @@ export class ReplayScript {
         return;
       }
       if (now < this.#i.start + REPLAY_ENTER_AFTER_MS || loop.checked < 1) return;
+      // `npm run demo` sets the owner's rules first (PUT /strategy): no entry is tried on the defaults.
+      if (this.#i.rulesSet !== undefined && !this.#i.rulesSet()) return;
       if (this.#asked !== null && now - this.#asked.at < ENTRY_WAIT_MS) return;
       const windows = this.#i.windows();
       if (windows === null) return;
@@ -288,14 +301,15 @@ export class ReplayScript {
       const first = this.#tried.size === 0;
       this.#tried.add(next.id);
       const s = this.#i.strategy();
-      const target = `POST /rotate on ${next.symbol} (short ${venueName(next.shortVenue)}, long ${venueName(next.longVenue)}, ${next.netAprPct.toFixed(1)} % net`
-        + `${next.grossAprPct > 0 ? '' : ', its spread pays the other way at the recorded rates, so this pair pays funding: the demo shows the cycle, not a profit'})`;
+      // A window whose spread pays the other way says so first (a panel that shortens the line keeps its head).
+      const against = next.grossAprPct > 0 ? '' : `${againstText(next)}; `;
+      const target = `POST /rotate on ${next.symbol} (short ${venueName(next.shortVenue)}, long ${venueName(next.longVenue)}, ${next.netAprPct.toFixed(1)} % net)`;
       this.#note(
         first
-          ? `replay script: the recorded hour is too short for the loop to enter on its own (${s.enterAfterChecks ?? 3} hourly checks in a row above your ${s.minNetAprPct} % minimum) `
+          ? `replay script: ${against}the recorded hour is too short for the loop to enter on its own (${checkRulesOf(s).enterAfterChecks} hourly checks in a row above your ${s.minNetAprPct} % minimum) `
             + `or to exit on its own, so the replay plays the owner's demo entry on the best window the policy allows: ${target}, its round trip at most ${REPLAY_DEMO_MAX_LOSS_USD.toFixed(2)} USD. `
             + 'Only the profit checks are waived; the policy, the NEAR AI risk check and the sizing still count. Nothing is signed or sent.'
-          : `replay script: the window before was not entered (its line says why); the next one the policy allows: ${target}. Nothing is signed or sent.`,
+          : `replay script: ${against}the window before was not entered (its line says why); the next one the policy allows: ${target}. Nothing is signed or sent.`,
         { window: next.id, maxLossUsd: REPLAY_DEMO_MAX_LOSS_USD },
       );
       const r = loop.rotate(next.id, { maxLossUsd: REPLAY_DEMO_MAX_LOSS_USD });
@@ -324,7 +338,7 @@ export class ReplayScript {
     const hour = Math.floor(held.since / HOUR_MS) * HOUR_MS + HOUR_MS;
     this.#note(
       `replay script: closes ${held.symbol} with POST /close, as the owner would${now >= hour ? `, after its ${hhmm(hour)} funding` : ''}, so the whole loop fits in the recorded hour; `
-      + 'live, a demo pair exits on its 24th hourly check in a row, at a stop, or when the owner closes it. Nothing is signed or sent.',
+      + `live, a pair exits after ${checkRulesOf(this.#i.strategy()).exitAfterChecks} hourly checks in a row of a shrinking or flipped spread, at a stop, or when the owner closes it. Nothing is signed or sent.`,
       { window: held.windowId },
     );
   }

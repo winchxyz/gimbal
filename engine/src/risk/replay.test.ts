@@ -39,7 +39,9 @@ test('replay: the replay desk from flat, a 12 USD pair on recorded prices, fundi
   const desk = new ReplayDesk({
     venues: readers.venues, clock, strategy: () => STRATEGY, takerBps: (v) => (v === 'hyperliquid' ? 5.5 : 3.5), onFunding: (f) => bookings.push(f),
   });
-  const risk = new RiskEngine({ mode: 'replay', clock, strategy: () => STRATEGY, health, publish: (e) => events.push(e), source: desk });
+  const risk = new RiskEngine({
+    mode: 'replay', clock, strategy: () => STRATEGY, health, publish: (e) => events.push(e), source: desk, reserveUsd: () => desk.reserveUsd,
+  });
   const of = <K extends StreamEvent['type']>(type: K) => events.filter((e) => e.type === type).map((e) => e.data) as Extract<StreamEvent, { type: K }>['data'][];
 
   // Flat at the start: the deposit, on two accounts and the reserve.
@@ -88,17 +90,22 @@ test('replay: the replay desk from flat, a 12 USD pair on recorded prices, fundi
   // health: ok at the first read, Phoenix down through the recorded outage, ok again after it.
   const maps = of('health') as HealthMap[];
   assert.deepEqual(maps.map((m) => m.phoenix), ['ok', 'down', 'ok']);
+  assert.ok(maps.every((m) => m.hyperliquid === 'ok' && m.intents === 'ok' && m.near === 'ok'));
   const errors = (of('journal') as JournalEntry[]).filter((j) => j.kind === 'error');
   assert.deepEqual(errors.map((j) => j.summary), ['phoenix not answering: fetch failed: ETIMEDOUT']);
+  // While Phoenix was down its leg stayed, watched.
   const during = desks.find((d) => d.updatedAt > outageAt && d.updatedAt < back)!;
+  assert.equal(during.legs.length, 2);
   assert.equal(during.health, 'watch');
 
   // POST /stress's path: rescue now, with its journal line and a detect step; a small desk needs a small amount.
   const stressed = await risk.stress(true);
   assert.equal(stressed.health, 'rescue');
+  assert.equal((of('desk') as DeskState[]).at(-1)!.health, 'rescue');
   const rescue = (of('journal') as JournalEntry[]).filter((j) => j.kind === 'rescue');
   assert.equal(rescue.length, 1);
-  assert.match(rescue[0]!.summary, /^health rescue: .* \(stress test\).*; [\d.]+ USD from (reserve|phoenix) brings it back to [\d.]+ %$/);
+  // The replay's rescuer plans from the reserve first, and the trigger names it (reserveUsd, replay only).
+  assert.match(rescue[0]!.summary, /^health rescue: .* \(stress test\).*; [\d.]+ USD from reserve brings it back to [\d.]+ %$/);
   const progress = of('rescue') as RescueProgress[];
   assert.equal(progress.length, 1);
   assert.equal(progress[0]!.step, 'detect');

@@ -241,14 +241,25 @@ export const LATEST_TEXT_MAX = 160;
 const HEAD_MIN = 40;
 
 /**
+ * Labels a head never hides: an owner demo entry's waived profit checks, and a demo pair that pays funding ("not a
+ * profit"). A summary that carries one is cut only after it, however long its head gets.
+ */
+const KEEP_IN_HEAD = [/owner demo entry: the profit checks are waived/, /the demo shows the cycle, not a profit/];
+
+/**
  * A long summary as a head and the rest: the head runs to the first `: ` or `; ` past the first few words (where the
  * engine's lines turn from what happened to its details, as an attestation's TEE measurements), else to the last
- * space before the limit.
+ * space before the limit. A label in KEEP_IN_HEAD stays in the head.
  */
 export function splitSummary(summary: string, max = LATEST_TEXT_MAX): { text: string; detail: string | null } {
   if (summary.length <= max) return { text: summary, detail: null };
-  const marks = [...summary.matchAll(/[:;] /g)].map((m) => m.index).filter((i) => i >= HEAD_MIN && i < max);
-  const cut = marks.length > 0 ? Math.min(...marks) : summary.lastIndexOf(' ', max);
+  const keep = Math.max(0, ...KEEP_IN_HEAD.map((re) => {
+    const m = re.exec(summary);
+    return m === null ? 0 : m.index + m[0].length;
+  }));
+  const marks = [...summary.matchAll(/[:;] /g)].map((m) => m.index)
+    .filter((i) => i >= Math.max(HEAD_MIN, keep) && (keep > 0 || i < max));
+  const cut = marks.length > 0 ? Math.min(...marks) : keep > 0 ? summary.indexOf(' ', keep) : summary.lastIndexOf(' ', max);
   if (cut <= 0) return { text: summary, detail: null };
   return { text: summary.slice(0, cut), detail: summary.slice(cut).replace(/^[:;]?\s*/, '') };
 }

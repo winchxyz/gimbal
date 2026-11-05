@@ -157,6 +157,11 @@ export interface RiskEngineOptions {
   log?: (line: string) => void;
   /** Monotonic milliseconds for read starts and landings (default performance.now(); tests pass their own). */
   monotonic?: () => number;
+  /**
+   * Replay only: the replay desk's reserve, USD. The replay's rescuer plans from the reserve first, so a trigger names
+   * the reserve as its source when it covers the amount (only the journal line's words change). Unset live.
+   */
+  reserveUsd?: () => number | null;
 }
 
 interface LegView {
@@ -525,7 +530,9 @@ export class RiskEngine {
     const amountUsd = Math.max(0, Math.ceil(sized.usd * 100 - 1e-6) / 100);
     // Orderly is never a source (four signatures and several hops); the partner leg's venue when its free margin
     // covers the amount, else the reserve.
-    const partner = views.find((o) => o !== v && o.leg.venue !== 'orderly' && o.leg.venue !== v.leg.venue && o.freeMarginUsd >= amountUsd);
+    const reserve = this.#o.reserveUsd?.() ?? null;
+    const partner = reserve !== null && reserve >= amountUsd ? undefined
+      : views.find((o) => o !== v && o.leg.venue !== 'orderly' && o.leg.venue !== v.leg.venue && o.freeMarginUsd >= amountUsd);
     const k = key(v.leg.venue, v.leg.symbol);
     const stress = this.#stress !== null && this.#stress.key === k && v.lines.rescuePct === this.#stress.rescuePct;
     const trigger: RescueTrigger = {

@@ -872,9 +872,13 @@ export interface JournalEntry {
   //   feeUsd                  a fee on top of `usd`, ≤ 0
   //   unpriced, venue         1 or "true" when an order went out without the oracle price band, and on which venue
   //   from, signedS, landedS  on a rescue: "reserve" or the venue id the margin came from, then the seconds the
-  //                           MPC signature and the landing took
+  //                           MPC signature and the landing took (a replay signs nothing: the Journal hides signedS)
+  //                           A rescue's `feeUsd` counts once: on hl_withdraw's line (no `amountUsd`) and on the
+  //                           line with `landedS`; the line that sent a 1Click transfer (`amountUsd`, no `landedS`)
+  //                           repeats the quote's fee, shown as "quoted fee" and not counted
   //   rescuePct, stress       on a rescue's trigger (at its `startedAt`): the line the leg came under (the owner's,
-  //                           or raised by a stress test, `stress` 1, or by volatility) and `amountUsd`, its need
+  //                           or raised by a stress test, `stress` 1, or by volatility), `distancePct`, the leg's
+  //                           distance then, and `amountUsd`, its need
   //   realizedFundingUsd, realizedFeesUsd, realizedPriceUsd, realizedNetUsd
   //                           on a replay desk's `exit`: the closed pair's realized split (fees ≤ 0); the Journal
   //                           adds it to the flat desk's P&L, the Desk's flat page shows the net

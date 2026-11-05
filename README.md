@@ -50,7 +50,7 @@ Nov 14, rule Q-001 of the hackathon).
 
 ```bash
 npm ci                     # the four workspaces from the lockfile; one zod advisory (see docs/reviewer-checks.md)
-npm run ci -- --only npm   # ci: green - npm ci, build, test, typecheck (node tests 1426 + 504 + 233) in N s
+npm run ci -- --only npm   # ci: green - npm ci, build, test, typecheck (node tests 1436 + 513 + 233) in N s
 npm run demo               # demo: ready. Open http://localhost:5190 (recorded mainnet data, nothing signed)
 ```
 
@@ -236,8 +236,8 @@ Not done yet:
   been dry-run against mainnet; the money path itself ran on the canary
   ([docs/onchain-evidence.md](docs/onchain-evidence.md#mainnet-canary-gimbal-canary2near)).
 - The money is small on purpose. At 12 USD a leg, funding earns about a cent a day while each one-off transfer costs
-  about 0.3 to 1.3 USD, so the desk's record will stay negative through Nov 14; the book shows funding and costs
-  apart.
+  about 0.3 USDC into Hyperliquid (under 0.01 into Orderly), plus 1 USDC to withdraw from Hyperliquid, so the desk's
+  record will stay negative through Nov 14; the book shows funding and costs apart.
 
 ## Run it
 
@@ -253,20 +253,23 @@ npm run demo
 `npm run demo` ([tools/demo.mjs](tools/demo.mjs)) starts the engine in replay mode and the dashboard, waits until both
 answer, and prints the URL. Replay plays a recorded hour of mainnet venue answers (2026-10-31, 16:15 to 17:19 UTC,
 `engine/fixtures/replay/`) at ×10 through the real scanner, strategy loop and risk engine, under the final mainnet
-policy, with legs of 12 USD and auto on. It needs no keys and no chain: a replay has no contract, so nothing is signed
-or sent, and the demo drops every key and chain variable of your shell. The engine's state goes to a temp folder that
-is removed on exit. Ports 5190 (dashboard) and 8790 (engine) must be free; `npm run demo -- --web-port <n>` moves
+policy, with legs of 12 USD and auto on. The strategy loop trades a simulated 40 USD replay desk (10 USD on
+Hyperliquid, 10 USD on Phoenix, 20 USD in reserve) that fills at the recorded best bid and ask with the venues' taker
+fees. The recorded hour is too short for the loop to enter or exit on its own, so a short script, labelled on the
+Journal, plays the owner's demo entry and close. It needs no keys and no chain: a replay has no contract, so nothing is
+signed or sent, and the demo drops every key and chain variable of your shell. The engine's state goes to a temp folder
+that is removed on exit. Ports 5190 (dashboard) and 8790 (engine) must be free; `npm run demo -- --web-port <n>` moves
 the dashboard (the engine's allowed browser Origin follows it) and `--engine-port <n>` the engine.
 
 | Do | You see |
 | --- | --- |
 | `npm run demo` | within a few seconds `demo: engine rules set: legs 12 USD at up to 3x, enter above 5 % net APR, auto on` (the engine caps legs at 2x), then `demo: ready. Open http://localhost:5190` |
-| Open http://localhost:5190 | **Desk**: a Replay badge, "Both legs are safe", a scripted ETH pair (Hyperliquid short, Phoenix long, each about 31 % from liquidation) and a Waiting line with the loop's reason: no window clears the entry rules, and the best one, NEAR, is refused `E_ASSET` because NEAR is not in the policy |
-| Click **Windows** | "Nothing clears your 5% right now"; **Show windows below my minimum** lists every window by net APR, and the selected one shows its costs from gross to net and its checks, such as "The contract would refuse it (E_ASSET)" |
-| Click **Journal** | the loop's Waiting decisions with their reasons, and the counters: 1 action signed by the contract, 0 by a private key |
-| Click **Rescue**, then **Run a stress test** | the Hyperliquid short is pushed inside a raised rescue line, and steps 1 Detect to 7 Landed run on recorded mainnet 1Click answers; within about a minute a few reserve → Hyperliquid moves land (about 1 min 40 s each in replay time), and Earlier rescues lists them, each marked "no funds moved" |
+| Open http://localhost:5190 | **Desk**: a Replay badge and the flat 40 USD replay desk. Within about a minute the script's owner demo entry tries the windows the policy allows: ZEC and BTC are refused at 12 USD legs (a ZEC lot is over a leg; BTC's whole lots size a leg under the 10 USD venue minimum), and SOL enters, short Hyperliquid and long Phoenix, 0.12 SOL a leg at recorded prices. Latest keeps the labels in view: "owner demo entry: the profit checks are waived", and SOL's spread pays the other way this hour, so "the demo shows the cycle, not a profit" |
+| Click **Windows** | every window by net APR after costs, the held SOL window marked Held, and NEAR refused because it is not in the policy; the selected one shows its costs from gross to net and its checks |
+| Click **Journal** | the whole loop in order: the script's lines, the two sizing refusals, the open, one hourly funding line at 17:00, the scripted close at 17:05 (`POST /close`, as the owner would) with the realized net, about −$0.02 (funding, fees, price), and the counters: "N simulated actions. Nothing signed or sent." |
+| Click **Rescue**, then **Run a stress test** while the pair is held (about 30 s to 5 min after the start) | the Hyperliquid short comes inside a line the stress test raised to just above its distance ("The stress test raised this leg's rescue line from your 8% to …"), and steps 1 Detect to 7 Landed run on recorded mainnet 1Click answers, Verify and Sign saying what the contract would do (replay: no contract, nothing signed). The recorded quote moves a fixed $20 from the reserve, more than the leg needs, and its 0.52 USD fee is the recording's, not the engine's estimate; it lands in about 1 min 40 s of replay time and Earlier rescues lists it, marked "no funds moved" |
 | Click **Security** | "0 private keys exist for this desk", how an order gets signed, and what the operator can and cannot do; the policy and key panels say a replay has no contract to read |
-| Ctrl+C in the terminal | both stop |
+| Ctrl+C in the terminal | both stop, and the temp state folder is removed |
 
 ### For reviewers
 
@@ -357,7 +360,7 @@ Hyperliquid pays the code's owner 10% of the fees the desk pays.
   within about 3 minutes (the slow signature plus the slow 1Click transfer), so the rescue line sits far from
   liquidation (8 % by default).
 - **Small carries.** Funding spreads on liquid coins are small, and 1Click fees are roughly flat per transfer
-  (about 0.3 USDC, plus Hyperliquid's 1 USDC withdrawal fee), so small desks lose a large share of a transfer
+  (about 0.3 USDC into Hyperliquid, under 0.01 into Orderly, plus 1 USDC to withdraw from Hyperliquid), so small desks lose a large share of a transfer
   ([Does it make money?](#does-it-make-money)).
 - **Orderly is a trading venue without a live rescue.** Orderly pairs run only with `GIMBAL_ORDERLY_PAIRS=1`
   (off in the code by default, on in the mainnet engine since 2026-11-04); without it the desk trades short

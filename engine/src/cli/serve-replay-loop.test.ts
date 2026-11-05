@@ -189,16 +189,21 @@ test('the replay script: enters a few minutes in, moves on from a window the loo
   const journal: JournalEntry[] = [];
   const start = T0;
   const end = T0 + HOUR + 19 * MIN;
+  let rulesSet = false;
   const script = new ReplayScript({
-    clock, start, end, loop, windows: () => windows, strategy: () => STRATEGY, policy: () => POLICY,
+    clock, start, end, loop, windows: () => windows, strategy: () => ({ ...STRATEGY, exitAfterChecks: 6 }), policy: () => POLICY,
     publish: (e: StreamEvent) => {
       if (e.type === 'journal') journal.push(e.data);
     },
     log: () => {},
+    rulesSet: () => rulesSet,
   });
   script.tick();
   assert.deepEqual(asked, [], 'the flat desk shows first');
   clock.set(start + REPLAY_ENTER_AFTER_MS);
+  script.tick();
+  assert.deepEqual(asked, [], 'no entry before the owner rules are applied (PUT /strategy)');
+  rulesSet = true;
   script.tick();
   assert.deepEqual(asked, ['zec-phoenix-hyperliquid']);
   assert.match(journal[0]!.summary, /^replay script: the recorded hour is too short .* POST \/rotate on ZEC \(short Hyperliquid, long Phoenix, -7\.0 % net\), its round trip at most 1\.00 USD\. .*Nothing is signed or sent\.$/);
@@ -210,7 +215,8 @@ test('the replay script: enters a few minutes in, moves on from a window the loo
   clock.set(start + REPLAY_ENTER_AFTER_MS + 2 * MIN);
   script.tick();
   assert.deepEqual(asked, ['zec-phoenix-hyperliquid', 'sol-phoenix-hyperliquid']);
-  assert.match(journal[1]!.summary, /^replay script: the window before was not entered .* POST \/rotate on SOL .*pays funding: the demo shows the cycle, not a profit\)\. Nothing is signed or sent\.$/);
+  // A spread that pays the other way says so first, with this hour's and the week's rates.
+  assert.match(journal[1]!.summary, /^replay script: SOL: this hour's rates pay the other way \(-9\.0 % APR; its 7-day spread, \+18\.0 %, is why it is listed in this direction\), so in this recorded hour the pair pays funding: the demo shows the cycle, not a profit; the window before was not entered .* POST \/rotate on SOL \(short Hyperliquid, long Phoenix, -15\.0 % net\)\. Nothing is signed or sent\.$/);
   script.tick();
   assert.equal(script.phase, 'hold');
   // Held through the hour boundary; the close comes before the recording ends.
@@ -220,7 +226,7 @@ test('the replay script: enters a few minutes in, moves on from a window the loo
   clock.set(T0 + HOUR + REPLAY_EXIT_AFTER_HOUR_MS);
   script.tick();
   assert.equal(closes(), 1);
-  assert.match(journal[2]!.summary, /^replay script: closes SOL with POST \/close, as the owner would, after its 13:00 funding/);
+  assert.match(journal[2]!.summary, /^replay script: closes SOL with POST \/close, as the owner would, after its 13:00 funding.*; live, a pair exits after 6 hourly checks in a row of a shrinking or flipped spread, /);
   script.tick();
   assert.equal(script.phase, 'done');
 });

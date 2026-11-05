@@ -244,6 +244,15 @@ test('a long line shows its head, the rest behind a control; a short one stays w
   const script = splitSummary(`replay script: the window before was not entered (its line says why); the next one: ${'x '.repeat(60)}`);
   assert.equal(script.text, 'replay script: the window before was not entered (its line says why)');
   assert.deepEqual(splitSummary('Opened DOGE'), { text: 'Opened DOGE', detail: null });
+  // The honesty labels stay in the head: an owner demo entry's waived profit checks, a demo pair that pays funding.
+  const enter = 'enter sol-phoenix-hyperliquid, SOL short hyperliquid, long phoenix, at most 0.12 SOL (12 USD) a leg at 1.5x, -15 % net (POST /rotate (manual)); '
+    + 'owner demo entry: the profit checks are waived; round trip $0.02 estimated, at most $1.00 accepted; checks: x; filled 0.12 SOL';
+  assert.equal(splitSummary(enter).text, enter.slice(0, enter.indexOf('waived') + 'waived'.length));
+  const sol = 'replay script: SOL: this hour\'s rates pay the other way (-9.1 % APR; its 7-day spread, +0.8 %, is why it is listed in this direction), '
+    + 'so in this recorded hour the pair pays funding: the demo shows the cycle, not a profit; the window before was not entered (its line says why); the next one';
+  assert.equal(splitSummary(sol).text, sol.slice(0, sol.indexOf('not a profit') + 'not a profit'.length));
+  const tail = `${'x '.repeat(90)}owner demo entry: the profit checks are waived and the rest`;
+  assert.equal(splitSummary(tail).text, tail.slice(0, tail.indexOf('waived') + 'waived'.length));
   // No ": " or "; " before the limit: cut at the last space.
   const words = 'word '.repeat(40).trim();
   const cut = splitSummary(words);
