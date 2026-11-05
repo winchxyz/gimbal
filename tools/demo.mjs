@@ -14,8 +14,9 @@
 // (max 20 USD an order) lets through; the engine's default of 1000 USD would be refused E_SIZE everywhere.
 // Plain node and the repo's own node_modules only; no shell, so it runs the same on Windows and Linux.
 //
-//   npm run demo [-- --speed 10] [--engine-port 8790]
-// The web port is 5190 (web/vite.config.ts, strictPort); the engine must not answer on its port before the start.
+//   npm run demo [-- --speed 10] [--web-port 5190] [--engine-port 8790]
+// Neither port may answer before the start. --web-port moves the dashboard (Vite's --port; strictPort stays from
+// web/vite.config.ts) and the engine's allowed browser Origin with it (serve --web-port), so the two always match.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
@@ -27,7 +28,6 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const WEB_PORT = 5190;
 const START_TIMEOUT_MS = 90_000;
 // The demo's engine rules (PUT /strategy): the engine's defaults, with legs the final policy accepts and auto on.
 const DEMO_STRATEGY = {
@@ -41,12 +41,20 @@ const DEMO_STRATEGY = {
 };
 
 const { values } = parseArgs({
-  options: { speed: { type: 'string', default: '10' }, 'engine-port': { type: 'string', default: '8790' } },
+  options: {
+    speed: { type: 'string', default: '10' },
+    'engine-port': { type: 'string', default: '8790' },
+    'web-port': { type: 'string', default: '5190' },
+  },
 });
 const speed = values.speed;
 const enginePort = Number(values['engine-port']);
+const WEB_PORT = Number(values['web-port']);
 if (!(Number(speed) > 0)) fail('--speed must be > 0');
-if (!Number.isInteger(enginePort) || enginePort <= 0) fail('--engine-port must be a port number');
+for (const [flag, port] of [['--engine-port', enginePort], ['--web-port', WEB_PORT]]) {
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) fail(`${flag} must be a port number`);
+}
+if (enginePort === WEB_PORT) fail('--engine-port and --web-port must differ');
 
 // Variables that would point serve at a chain, a venue account or a key. Replay needs none of them.
 const DROP = /^(GIMBAL_|NEAR_|OPERATOR_|OWNER_|DESK_ID$|ORDERLY_|HL_|PHOENIX_|SOLANA_|ARBITRUM_|RELAYER_|ONECLICK_|ENGINE_PORT$|VITE_)/;
@@ -145,7 +153,7 @@ if (!existsSync(join(root, 'node_modules'))) fail('run `npm install` first');
 for (const [name, port] of [['engine', enginePort], ['web', WEB_PORT]]) {
   const host = await portInUse(port);
   if (host !== null) {
-    const hint = name === 'engine' ? '; or move the engine with `npm run demo -- --engine-port <n>`' : ' (the dashboard needs 5190)';
+    const hint = `; or move the ${name === 'engine' ? 'engine' : 'dashboard'} with \`npm run demo -- --${name}-port <n>\``;
     fail(`port ${port} is already in use (a server answers on ${host.includes(':') ? `[${host}]` : host}:${port}); stop whatever runs there, the ${name} would clash with it${hint}`);
   }
 }
@@ -159,10 +167,10 @@ if (!existsSync(join(root, 'shared', 'dist', 'index.js'))) {
 
 const policy = join(root, 'tools', 'mainnet-final-policy.json');
 stateDir = mkdtempSync(join(tmpdir(), 'gimbal-demo-'));
-const engineArgs = ['src/cli/serve.ts', '--speed', speed, '--port', String(enginePort), '--policy', policy, '--state-dir', stateDir];
+const engineArgs = ['src/cli/serve.ts', '--speed', speed, '--port', String(enginePort), '--web-port', String(WEB_PORT), '--policy', policy, '--state-dir', stateDir];
 run('engine', engineArgs, join(root, 'engine'), { ...baseEnv, GIMBAL_MODE: 'replay', GIMBAL_TRADE: '1' });
 const vite = join(pkgDir('vite', join(root, 'web')), 'bin', 'vite.js');
-run('web', [vite, '--clearScreen', 'false'], join(root, 'web'), { ...baseEnv, ENGINE_PORT: String(enginePort) });
+run('web', [vite, '--port', String(WEB_PORT), '--clearScreen', 'false'], join(root, 'web'), { ...baseEnv, ENGINE_PORT: String(enginePort) });
 
 await waitFor('engine', `http://127.0.0.1:${enginePort}/state`);
 const put = await fetch(`http://127.0.0.1:${enginePort}/strategy`, {

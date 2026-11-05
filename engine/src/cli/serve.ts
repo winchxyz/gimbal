@@ -6,6 +6,8 @@
 // Options (and the environment variables they override):
 //   --port <n>          ENGINE_PORT, default 8790
 //   --host <addr>       GIMBAL_HOST: the address to listen on, default 127.0.0.1 (this machine only)
+//   --web-port <n>      GIMBAL_WEB_PORT: the dashboard's port on this machine, default 5190; only the browser Origins of
+//                       that port (localhost, 127.0.0.1, [::1]) may call the engine
 //   --replay <file>     GIMBAL_REPLAY_FILE: a recording made with --record; default the newest scan-*.jsonl.gz
 //                       in fixtures/replay/
 //   --speed <x>         GIMBAL_REPLAY_SPEED: replay time runs x times faster than real time, default 1
@@ -96,7 +98,7 @@ import { LOOP_ACCOUNT_MAX_AGE_MS, accountWithin, liveReaders, replayReaders } fr
 import type { Readers } from '../readers.ts';
 import { DEFAULT_STRATEGY, ORDERLY_BROKERS, scannerConfigFor, withBuilderFee } from '../scanner/config.ts';
 import { Scanner } from '../scanner/scanner.ts';
-import { DEFAULT_ENGINE_HOST, DEFAULT_ENGINE_PORT, EngineServer } from '../server.ts';
+import { DEFAULT_ENGINE_HOST, DEFAULT_ENGINE_PORT, DEFAULT_WEB_PORT, EngineServer, webOrigins } from '../server.ts';
 import type { RecordLine } from '../venues/recorder.ts';
 import { JsonlGzWriter, RecordingVenue, RecordingWatch, errorMessage } from '../venues/recorder.ts';
 import { ScaledClock, readRecording } from '../venues/replay.ts';
@@ -136,6 +138,7 @@ const { values } = parseArgs({
   options: {
     port: { type: 'string' },
     host: { type: 'string' },
+    'web-port': { type: 'string' },
     replay: { type: 'string' },
     speed: { type: 'string' },
     policy: { type: 'string' },
@@ -157,6 +160,8 @@ const port = Number(values.port ?? envVar('ENGINE_PORT') ?? DEFAULT_ENGINE_PORT)
 if (!Number.isInteger(port) || port < 0 || port > 65535) fail(`bad port ${values.port ?? envVar('ENGINE_PORT')}`);
 const host = values.host ?? envVar('GIMBAL_HOST') ?? DEFAULT_ENGINE_HOST;
 if (host.trim() === '') fail('--host must not be empty');
+const webPort = Number(values['web-port'] ?? envVar('GIMBAL_WEB_PORT') ?? DEFAULT_WEB_PORT);
+if (!Number.isInteger(webPort) || webPort <= 0 || webPort > 65535) fail(`bad web port ${values['web-port'] ?? envVar('GIMBAL_WEB_PORT')}`);
 const policyFile = values.policy ?? envVar('GIMBAL_POLICY_FILE');
 let policy: ContractPolicy | null = null;
 if (policyFile !== undefined && policyFile !== '') {
@@ -611,6 +616,7 @@ const journal = openJournal(mode, stateDirSet === undefined ? userStateDir(envVa
 
 server = new EngineServer({
   mode,
+  allowedOrigins: webOrigins(webPort),
   scanner,
   strategyLoop,
   onStrategy: () => strategyLoop.onScan(),

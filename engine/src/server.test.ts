@@ -11,7 +11,7 @@ import { VirtualClock } from './venues/replay.ts';
 import type { Book, MarketFunding, VenueReader } from './venues/venue.ts';
 import { DEFAULT_SCANNER_CONFIG, DEFAULT_STRATEGY } from './scanner/config.ts';
 import { Scanner } from './scanner/scanner.ts';
-import { EngineServer, isLoopback } from './server.ts';
+import { DEFAULT_WEB_ORIGINS, EngineServer, isLoopback, webOrigins } from './server.ts';
 
 const T0 = Date.UTC(2026, 9, 31, 10, 30);
 
@@ -263,6 +263,25 @@ test('a browser Origin other than the dashboard\'s is refused; the dashboard\'s 
     const r = await call('GET', '/state', undefined, { origin });
     assert.equal(r.status, 403, origin);
     assert.match((r.json as { error: string }).error, /is not the dashboard's/);
+  }
+});
+
+test('a dashboard on another port (serve --web-port, npm run demo -- --web-port): its Origins pass, 5190\'s are refused', async () => {
+  assert.deepEqual(DEFAULT_WEB_ORIGINS, webOrigins(5190));
+  const scanner = new Scanner([reader('hyperliquid', 0.00005)], [], { config: DEFAULT_SCANNER_CONFIG, clock: new VirtualClock(T0), strategy: () => DEFAULT_STRATEGY });
+  const moved = new EngineServer({
+    mode: 'replay', scanner, strategy: DEFAULT_STRATEGY, policy: emptyPolicy(), intervalMs: 3_600_000, now: () => T0 + 1,
+    allowedOrigins: webOrigins(5291),
+  });
+  const port = await moved.start(0);
+  const status = (origin: string) => new Promise<number>((resolve, reject) => {
+    get(`http://127.0.0.1:${port}/state`, { headers: { origin } }, (res) => { res.resume(); resolve(res.statusCode!); }).on('error', reject);
+  });
+  try {
+    for (const origin of webOrigins(5291)) assert.equal(await status(origin), 200, origin);
+    for (const origin of DEFAULT_WEB_ORIGINS) assert.equal(await status(origin), 403, origin);
+  } finally {
+    await moved.stop();
   }
 });
 
