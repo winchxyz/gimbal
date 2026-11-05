@@ -95,6 +95,12 @@ export type MultiDay =
 
 /** A 7-day mean under this (APR points, either sign) counts as 0. */
 export const DEAD_BAND_APR_PCT = 0.5;
+/**
+ * The most an owner demo entry (POST /rotate with demo) may accept as its maxLossUsd: the bound on its round-trip cost
+ * estimate. Funding during the hold is expected positive and is not part of it. Checked by the strategy loop
+ * (parseDemo) and again by the trader's carry plan.
+ */
+export const DEMO_MAX_LOSS_USD = 1;
 
 /**
  * The multi-day figure from the 7- and 14-day means; `fortnightPending` while a leg's older read is still due.
@@ -189,7 +195,10 @@ const minimum = (n: number) => `${Number.isInteger(n) ? n : n.toFixed(2)} %`;
  * The window's check lines for its expected carry: the gate (fails without a multi-day figure, while the older week
  * loads, when the 7 and 14 days disagree in sign, when the spread over the hold does not pay the round trip, or when
  * what it nets over the hold is under the owner's minimum), and a note when the current hour points the other way.
- * Every line is a profit check (WindowCheck.kind): an owner demo entry waives them, and nothing else.
+ * The lines of a spread that pays (positive over the 7 days, or over the hold) are profit checks (WindowCheck.kind):
+ * an owner demo entry waives them, and nothing else. A spread not known yet (no 7 days of history), two weeks that
+ * disagree, and a spread over the hold of 0 or less (funding runs against the position) are safety checks: never
+ * waived, since a demo entry bounds its round trip and expects funding during the hold to be positive.
  */
 export function carryChecks(e: CarryEstimate): WindowCheck[] {
   const hold = `a ${holdLabel(e.holdHours)} hold (assumed: the engine rules set none)`;
@@ -198,18 +207,18 @@ export function carryChecks(e: CarryEstimate): WindowCheck[] {
   const against = `against a ${money(rt.totalUsd)} round trip (${parts})`;
   const { d7AprPct: d7, d14AprPct: d14, nowAprPct: now } = e.gross;
   if (e.state === 'none') {
-    return [{ ok: false, kind: 'profit', text: `No 7-day funding history on both legs yet: the spread expected over ${hold} is not known, ${against}` }];
+    return [{ ok: false, text: `No 7-day funding history on both legs yet: the spread expected over ${hold} is not known, ${against}` }];
   }
   if (e.state === 'loading') {
     const out: WindowCheck[] = [{
-      ok: false, kind: 'profit',
+      ok: false, ...(d7! > 0 ? { kind: 'profit' as const } : {}),
       text: `14-day history loading: the 7-day spread of ${pct(d7!)} APR is in, the week before it is still being read; the gate waits for both, ${against}`,
     }];
     if (d7! > 0 && !(now > 0)) out.push({ ok: true, kind: 'profit', text: `Listed on the 7-day spread: this hour pays ${pct(now)} APR in this direction` });
     return out;
   }
   if (e.state === 'mixed') {
-    return [{ ok: false, kind: 'profit', text: `The 7-day spread (${pct(d7!)} APR) and the 14-day spread (${pct(d14!)} APR) point opposite ways: no steady carry in this direction` }];
+    return [{ ok: false, text: `The 7-day spread (${pct(d7!)} APR) and the 14-day spread (${pct(d14!)} APR) point opposite ways: no steady carry in this direction` }];
   }
   const label = e.basis === '14d' ? '14-day' : '7-day';
   const which = d14 === null ? `no 14-day mean: ${e.noFortnightWhy ?? 'it could not be had'}` : 'the smaller of the 7- and 14-day means';
@@ -229,7 +238,8 @@ export function carryChecks(e: CarryEstimate): WindowCheck[] {
     });
   } else {
     const even = e.breakevenDays === null ? 'it never pays it back' : `it takes ${e.breakevenDays.toFixed(1)} days to pay it back`;
-    out.push({ ok: false, kind: 'profit', text: `${head}, no more than the ${money(rt.totalUsd)} round trip (${parts}): ${even}` });
+    // A spread of 0 or less over the hold: funding runs against the position, a safety check.
+    out.push({ ok: false, ...(e.expectedUsd! > 0 ? { kind: 'profit' as const } : {}), text: `${head}, no more than the ${money(rt.totalUsd)} round trip (${parts}): ${even}` });
   }
   if (e.expectedAprPct! > 0 && !(now > 0)) {
     out.push({ ok: true, kind: 'profit', text: `Listed on the ${label} spread: this hour pays ${pct(now)} APR in this direction` });

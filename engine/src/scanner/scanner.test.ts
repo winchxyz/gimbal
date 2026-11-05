@@ -10,7 +10,7 @@ import { DEFAULT_SCANNER_CONFIG, DEFAULT_STRATEGY } from './config.ts';
 import type { ScannerConfig } from './config.ts';
 import { HOUR_MS } from './history.ts';
 import type { OracleSource } from './price.ts';
-import { isEnterable, isProfitCheck } from './price.ts';
+import { isEnterable, isEnterableButForProfit, isProfitCheck } from './price.ts';
 import { Scanner } from './scanner.ts';
 import type { HeldWindow, ScannerOptions } from './scanner.ts';
 import { T0, row } from './test-helpers.ts';
@@ -883,30 +883,41 @@ test('a desk pair whose 7 and 14 days disagree in sign is listed in neither dire
   assert.equal(w.costs.rescueReservePct, 0);
 });
 
-test('kind: a held window whose spread paid the other way fails its profit checks, the carry and the break-even on its spread, marked profit; the rest are not', async () => {
+test('kind: a held window whose spread paid the other way fails a safety carry check (funding against it); a small positive spread fails profit checks only', async () => {
+  const run = async (hlRate: number, phRate: number) => {
+    const hl = new HistoryVenue('hyperliquid', [DOGE_HL], () => hlRate);
+    const phoenix = new HistoryVenue('phoenix', [DOGE_PH], () => phRate);
+    const clock = new VirtualClock(T0);
+    const held: HeldWindow = { windowId: 'doge-phoenix-hyperliquid', since: T0 - HOUR_MS };
+    const { scanner: s } = scanner({ venues: [hl, phoenix] }, clock, { policy: DOGE_POLICY, ...TEN_DAYS }, { strategy: () => LEG_20_ANY, oracle: dogeOracle(clock), held: () => held });
+    for (const t of [0, 5_000]) {
+      clock.set(T0 + t);
+      await s.scan();
+      await s.idle();
+    }
+    clock.set(T0 + 10_000);
+    const w = byId((await s.scan()).windows, 'doge-phoenix-hyperliquid')!;
+    assert.equal(s.carry(w.id)!.estimate.state, 'known');
+    return w;
+  };
   // Both weeks Hyperliquid paid nothing and Phoenix 0.00004/h: short HL / long PH lost 35 % APR, held in its direction.
-  const hl = new HistoryVenue('hyperliquid', [DOGE_HL], () => 0);
-  const phoenix = new HistoryVenue('phoenix', [DOGE_PH], () => 0.00004);
-  const clock = new VirtualClock(T0);
-  const held: HeldWindow = { windowId: 'doge-phoenix-hyperliquid', since: T0 - HOUR_MS };
-  const { scanner: s } = scanner({ venues: [hl, phoenix] }, clock, { policy: DOGE_POLICY, ...TEN_DAYS }, { strategy: () => LEG_20_ANY, oracle: dogeOracle(clock), held: () => held });
-  for (const t of [0, 5_000]) {
-    clock.set(T0 + t);
-    await s.scan();
-    await s.idle();
-  }
-  clock.set(T0 + 10_000);
-  const w = byId((await s.scan()).windows, 'doge-phoenix-hyperliquid')!;
-  assert.equal(s.carry(w.id)!.estimate.state, 'known');
-  const failed = w.checks.filter((c) => !c.ok);
-  const breakEven = failed.find((c) => c.text.startsWith('Does not break even within a year on its'));
-  assert.deepEqual(breakEven, { ok: false, text: 'Does not break even within a year on its 7-day spread', kind: 'profit' });
-  assert.ok(failed.some((c) => isProfitCheck(c) && /no more than the .* round trip .*: it never pays it back$/.test(c.text)), JSON.stringify(failed));
-  // The checks of what it earns are the profit ones; the policy, the oracle, the books and the cap are not.
-  const lines = (pred: (k: string | undefined) => boolean) => w.checks.filter((c) => pred((c as { kind?: string }).kind)).map((c) => c.text);
-  assert.ok(lines((k) => k === 'profit').every((t) => /round trip|break even|spread/.test(t)), JSON.stringify(lines((k) => k === 'profit')));
-  assert.ok(lines((k) => k === undefined).some((t) => t.startsWith('The oracle price for DOGE')), JSON.stringify(w.checks));
-  assert.ok(lines((k) => k === undefined).some((t) => t.startsWith('Books ')), JSON.stringify(w.checks));
+  const against = await run(0, 0.00004);
+  const failed = against.checks.filter((c) => !c.ok);
+  const carryLine = failed.find((c) => /no more than the .* round trip .*: it never pays it back$/.test(c.text));
+  assert.ok(carryLine !== undefined && !isProfitCheck(carryLine), JSON.stringify(failed));
+  assert.deepEqual(failed.find((c) => c.text.startsWith('Does not break even within a year on its')), { ok: false, text: 'Does not break even within a year on its 7-day spread', kind: 'profit' });
+  assert.equal(isEnterableButForProfit(against), false, 'funding against the position is never waived');
+  // The policy, the oracle and the books are safety checks.
+  const safety = against.checks.filter((c) => !isProfitCheck(c)).map((c) => c.text);
+  assert.ok(safety.some((t) => t.startsWith('The oracle price for DOGE')), JSON.stringify(against.checks));
+  assert.ok(safety.some((t) => t.startsWith('Books ')), JSON.stringify(against.checks));
+
+  // Hyperliquid paying 0.000002/h (1.75 % APR to the short): positive, short of the round trip. Profit checks only.
+  const small = await run(0.000002, 0);
+  const smallFailed = small.checks.filter((c) => !c.ok);
+  const smallCarry = smallFailed.find((c) => /no more than the .* round trip/.test(c.text));
+  assert.ok(smallCarry !== undefined && isProfitCheck(smallCarry), JSON.stringify(smallFailed));
+  assert.ok(small.checks.filter(isProfitCheck).every((c) => /round trip|break even|spread/.test(c.text)), JSON.stringify(small.checks));
 });
 
 test('a desk leg over 2 % of its open interest: listed only on a multi-day spread that pays, with a failing check naming the share', async () => {

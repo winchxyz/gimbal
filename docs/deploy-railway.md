@@ -207,9 +207,13 @@ scan.
   enter's prompt carries both). A refusal holds that window out for 6 h: then rotate into another one. With a pair held it closes that pair first. The route needs `auto` on and answers `409 auto is off`
   otherwise.
 - **`POST /rotate {"windowId": ..., "demo": {"maxLossUsd": <USD>}}`, an owner demo entry.** As above, and it also
-  waives the window's **profit checks** only: the owner minimum, the expected spread paying back the round trip, and
-  break-even within a year. Every other check stays. `maxLossUsd` is required, above 0 and at most 1 USD, and the
-  window's estimated round trip in USD must be known and at most `maxLossUsd`; the refusal says the number. It opens
+  waives the window's **profit checks** only: the owner minimum, a positive expected spread paying back the round trip,
+  and break-even within a year. Every other check stays, and so does funding against the position: a window without
+  7 days of funding history, whose 7- and 14-day spreads disagree, or whose expected spread over the hold is 0 or less
+  is refused as without demo. `maxLossUsd` is required, above 0 and at most 1 USD, and the window's estimated round
+  trip in USD (fees, slippage, basis buffer) must be known and at most `maxLossUsd`; the refusal says the number.
+  `maxLossUsd` bounds that round-trip cost estimate only: funding during the hold is expected positive (the spread
+  must be) and is not part of the bound. The pair trader checks both again on its own books. It opens
   from flat only (`POST /close` first). The NEAR AI risk check runs as for any manual enter, and its prompt says this
   is an owner-requested demonstration entry with the profit checks waived and the cost the owner accepted. The
   journal's `enter` line, the book and the risk ledger mark it as an owner demo entry (`demo: true`).
@@ -305,9 +309,10 @@ log printed. `<rules>` below stands for every field of that line, with the chang
 2. **Enter** (`POST /rotate` with `demo`). Pick the window and a backup from the scan lines or the Windows view
    first. The body carries `"demo":{"maxLossUsd":0.25}`: under the step 1 rules every window fails its profit checks
    (nothing earns 1000 % net), so a plain `/rotate` is refused with `fails a check`. The demo flag waives those profit
-   checks only; the safety checks (tradable, not stale, not refused, the risk check, the policy, the size) all stay.
-   `maxLossUsd` is the most the round trip may cost, at most 1 USD; a 12 USD ZEC Orderly/Hyperliquid leg costs about
-   0.04 USD. Wait for `journal   enter: enter <window id>, ...; owner demo entry: ...` (or `error` / `refused`). A
+   checks only; the safety checks (tradable, not stale, not refused, the risk check, the policy, the size, and a
+   positive spread over at least 7 days of history) all stay, so pick a window whose 7-day spread pays in its
+   direction. `maxLossUsd` bounds the estimated round-trip cost, at most 1 USD; a 12 USD ZEC Orderly/Hyperliquid leg
+   costs about 0.04 USD. Funding during the hold is expected positive and is not part of that bound. Wait for `journal   enter: enter <window id>, ...; owner demo entry: ...` (or `error` / `refused`). A
    `veto` / `refused ... NEAR AI risk check` line means the model refused that window: send the same step with the
    backup window. **Every attempt needs a new run-id**, a refused one included: a used run-id never runs again.
 

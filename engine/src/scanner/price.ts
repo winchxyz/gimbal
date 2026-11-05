@@ -109,8 +109,9 @@ export const NO_BREAKEVEN_TEXT = 'Does not break even within a year at today\'s 
 
 /**
  * A window check with its category: `profit` on the checks of what the window is expected to earn against what it
- * costs (carry.ts carryChecks, and the break-even checks), which an owner demo entry waives (strategy/loop.ts); absent
- * on every other check, a safety check none waives. An extra optional field on Window.checks: a reader that does not
+ * costs (carry.ts carryChecks on a spread that pays, and the break-even checks), which an owner demo entry waives
+ * (strategy/loop.ts); absent on every other check, a safety check none waives, funding against the position included
+ * (carryChecks leaves it off a spread not known, mixed, or of 0 or less over the hold). An extra optional field on Window.checks: a reader that does not
  * know it sees `ok` and `text` as before.
  */
 export type WindowCheck = FundingWindow['checks'][number] & { kind?: 'profit' };

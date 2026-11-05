@@ -42,12 +42,14 @@
 // no `hold` or `off` kind: those are `wait` entries whose numbers.action says which.
 //
 // An owner demo entry (POST /rotate { windowId, demo: { maxLossUsd } }, to show one small real trade): the window's
-// profit checks (scanner/price.ts WindowCheck.kind: the carry gate and break-even) are waived and nothing else is. It
-// must still be tradable, not refused, not stale, not refused or held out by the NEAR AI risk check, pass every other
-// check, the policy's markets and the direction rule (symbolOf), and be sized (sizeFor); the desk must be flat. Its
-// cost is bounded: maxLossUsd above 0 and at most DEMO_MAX_LOSS_USD, and the window's round trip in USD (the one its
-// checks print, WindowFacts.roundTripUsd) at most maxLossUsd, else refused with the number; the trader's open holds its
-// own round trip to it again (carry-plan.ts). The risk check is asked as for any manual act, told it is a
+// profit checks (scanner/price.ts WindowCheck.kind: the carry gate on a spread that pays, and break-even) are waived and
+// nothing else is: a spread not known yet, two weeks that disagree, or one of 0 or less over the hold (funding against
+// the position) stay safety checks. It must still be tradable, not refused, not stale, not refused or held out by the
+// NEAR AI risk check, pass every other check, the policy's markets and the direction rule (symbolOf), and be sized
+// (sizeFor); the desk must be flat. Its round-trip cost estimate is bounded: maxLossUsd above 0 and at most
+// DEMO_MAX_LOSS_USD, and the window's round trip in USD (the one its checks print, WindowFacts.roundTripUsd) at most
+// maxLossUsd, else refused with the number; funding during the hold is expected positive and is not part of the bound;
+// the trader's open holds its own round trip to it again (carry-plan.ts). The risk check is asked as for any manual act, told it is a
 // demonstration entry with the profit checks waived and the cost accepted. A held demo pair is decided on as any held
 // pair: under the demo rules (a 1000 % minimum, exit after 24 checks) its counted exit comes on the 24th hourly check
 // in a row; the stops, the one-leg close and POST /close at any time.
@@ -60,7 +62,7 @@ import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, un
 import { dirname, join } from 'node:path';
 import type { ContractPolicy, JournalEntry, Mode, StrategyConfig, StrategyDecision, StreamEvent, TxRef, Window as FundingWindow } from '@gimbal/shared';
 import { isEnterable, isEnterableButForProfit, isProfitCheck } from '../scanner/price.ts';
-import { money } from '../scanner/carry.ts';
+import { DEMO_MAX_LOSS_USD, money } from '../scanner/carry.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { Clock } from '../venues/venue.ts';
 import type { CheckRules, DecideInput, Decision, HeldPair, LoopCounters } from './decide.ts';
@@ -100,11 +102,8 @@ export const MAX_OPEN_REFRESHES_PER_DAY = 12;
 /** And at most this many per UTC day over all symbols (the sum of the day's per-symbol counts, saved with them). */
 export const MAX_OPEN_REFRESHES_PER_DAY_ALL = 24;
 export const LOOP_STATE_VERSION = 1;
-/**
- * The most an owner demo entry may accept to lose on its round trip, USD (POST /rotate demo.maxLossUsd): it is there to
- * show one small trade, not to trade past the profit checks.
- */
-export const DEMO_MAX_LOSS_USD = 1;
+/** The most an owner demo entry may accept as its maxLossUsd, USD (scanner/carry.ts, one place for the loop and the trader). */
+export { DEMO_MAX_LOSS_USD };
 
 /** An owner demo entry (POST /rotate with demo): the profit checks waived, the round trip at most maxLossUsd. */
 export interface DemoEntry {
@@ -577,7 +576,8 @@ export class StrategyLoop {
   /** Window id -> NEAR AI's last verdict, shown on the window until `until` (display only: the hold is vetoedUntil). */
   readonly #verdicts = new Map<string, { veto: Veto; until: number }>();
   /** Window id -> its last booked risk check (for a retry of the same act: not booked again). */
-  readonly #lastChecks = new Map<string, { id: string; kind: 'enter' | 'rotate'; verdict: string; at: number; opened: boolean }>();
+  #checkSeq = 0;
+  readonly #lastChecks = new Map<string, { id: string; kind: 'enter' | 'rotate'; by: 'auto' | 'manual'; demo: boolean; verdict: string; at: number; opened: boolean }>();
   /** `kind window` -> until when an act refused with nothing sent is not tried again, and the line journaled. */
   readonly #refused = new Map<string, { until: number; reason: string }>();
   /** Window id -> until when (the next hourly check) its open stays refused for cost, and the trader's why. */
@@ -679,6 +679,8 @@ export class StrategyLoop {
     const first = this.#rotateCheck(windowId, this.#lastFree, this.#lastFacts, demo, true);
     if ('reason' in first) return { ok: false, reason: first.reason };
     const what = demo === undefined ? `POST /rotate ${windowId}` : `POST /rotate ${windowId} (owner demo entry, at most ${money(demo.maxLossUsd)})`;
+    // A refusal line keeps the lead it has without demo; the demo tag comes after it.
+    const notDone = `POST /rotate ${windowId} not carried out: ${demo === undefined ? '' : `(owner demo entry, at most ${money(demo.maxLossUsd)}) `}`;
     const refusedNumbers = { window: windowId, by: 'POST /rotate (manual)', ...(demo === undefined ? {} : { demo: 1, maxLossUsd: demo.maxLossUsd }) };
     this.#manual = what;
     void this.#serial(async () => {
@@ -686,7 +688,7 @@ export class StrategyLoop {
       try {
         if (this.#stopped) return;
         if (!this.#o.strategy().auto) {
-          this.#journal('refused', `${what} not carried out: auto was turned off before it ran`, refusedNumbers);
+          this.#journal('refused', `${notDone}auto was turned off before it ran`, refusedNumbers);
           return;
         }
         // Checked and sized again on the numbers of the moment (a demo entry's window: its lots read by name).
@@ -694,7 +696,7 @@ export class StrategyLoop {
         const [free, facts] = await Promise.all([this.#readFree(), this.#readFacts(scanned, demo === undefined ? undefined : [windowId])]);
         const again = this.#rotateCheck(windowId, free, facts, demo);
         if ('reason' in again) {
-          this.#journal('refused', `${what} not carried out: ${again.reason}`, refusedNumbers);
+          this.#journal('refused', `${notDone}${again.reason}`, refusedNumbers);
           return;
         }
         const fromId = this.#o.hands!.held() === null ? null : (this.#state.held?.windowId ?? 'the pair held');
@@ -1115,8 +1117,9 @@ export class StrategyLoop {
       netAprPct: round(w.netAprPct), grossAprPct: round(w.grossAprPct), veto: check.result.line, by: who, ...check.numbers,
       ...(p.demo === undefined ? {} : { demo: 1, maxLossUsd: p.demo.maxLossUsd, roundTripUsd: round4(p.demo.roundTripUsd) }),
     };
-    // An owner demo entry says so on every line after its risk check, with the cost the owner accepted.
-    const tag = p.demo === undefined ? '' : ` (${demoText(p.demo)})`;
+    // An owner demo entry says so on every line after its risk check, with the cost the owner accepted: after the
+    // line's own lead (`enter ID not carried out: `, `enter ID: `), which stays as without demo (web waitCopy.ts reads it).
+    const tag = p.demo === undefined ? '' : `(${demoText(p.demo)}) `;
     if (p.fromId !== null) {
       const gate = this.#gate();
       if (gate !== null) {
@@ -1149,7 +1152,7 @@ export class StrategyLoop {
     const flat = p.fromId === null ? '' : `; ${p.fromId} was closed, so the desk stays flat`;
     const gate = this.#gate();
     if (gate !== null) {
-      this.#journal('refused', `${kind} ${w.id}${tag} not carried out: ${gate}${flat}; ${why}`, base);
+      this.#journal('refused', `${kind} ${w.id} not carried out: ${tag}${gate}${flat}; ${why}`, base);
       return p.fromId === null ? { ...SKIPPED, passing: true, result: `not opened: ${gate}` } : { end: 'flat', sent: true, passing: true, result: `not opened: ${gate}` };
     }
     const openAt = this.#o.clock.now();
@@ -1167,7 +1170,7 @@ export class StrategyLoop {
         // Orders went out and the venues hold a position: the desk holds it, the book sees the entry.
         this.#setHeld({ windowId: w.id, symbol: sym.symbol, since: now, legUsd: after.legUsd, entryNetAprPct: w.netAprPct, ...heldVenues(w.longVenue, w.shortVenue) });
         const bookedAt = this.#record('enter', { windowId: w.id, symbol: sym.symbol, outcome: opened, forecastNetAprPct: w.netAprPct, exitReason: null, rotation: p.fromId === null ? null : { fromId: p.fromId, toId: w.id }, manual: p.manual, startedAt: openAt, demo: p.demo !== undefined });
-        this.#journal('error', `${kind} ${w.id}${tag}: ${opened.reason}; the venues hold ${after.symbol} (${round(after.legUsd)} USD a leg${after.oneLeg === null ? '' : `, one leg only: ${after.oneLeg.venue} ${after.oneLeg.qty}`}): held from now; ${why}`, { ...base, heldLegUsd: round(after.legUsd), feeUsd: opened.feeUsd }, opened.tx);
+        this.#journal('error', `${kind} ${w.id}: ${tag}${opened.reason}; the venues hold ${after.symbol} (${round(after.legUsd)} USD a leg${after.oneLeg === null ? '' : `, one leg only: ${after.oneLeg.venue} ${after.oneLeg.qty}`}): held from now; ${why}`, { ...base, heldLegUsd: round(after.legUsd), feeUsd: opened.feeUsd }, opened.tx);
         return { end: 'done', sent: true, passing: false, positionId: bookedAt === null ? null : positionIdOf(w.id, bookedAt), result: `opened, partly: ${opened.reason}` };
       }
       this.#record('fill', { windowId: w.id, symbol: sym.symbol, outcome: opened, forecastNetAprPct: null, exitReason: opened.reason, rotation: null, manual: p.manual, startedAt: openAt, demo: p.demo !== undefined });
@@ -1179,7 +1182,7 @@ export class StrategyLoop {
         this.#costRefused.set(w.id, { until, reason: costRefused });
         held = `; ${w.id} is held out of the entry rules until the hourly check at ${new Date(until).toISOString()} and its hours start again`;
       }
-      this.#journal(opened.sent ? 'error' : 'refused', `${kind} ${w.id}${tag}: ${opened.reason}${flat}${held}; ${why}`, { ...base, feeUsd: opened.feeUsd }, opened.tx);
+      this.#journal(opened.sent ? 'error' : 'refused', `${kind} ${w.id}: ${tag}${opened.reason}${flat}${held}; ${why}`, { ...base, feeUsd: opened.feeUsd }, opened.tx);
       // Stopped by the open's own gate (a rescue that started after the check before it): tried again next check.
       const passing = this.#gate() !== null;
       const paid = opened.refreshed === true && !opened.sent ? { paidRefusal: opened.reason } : {};
@@ -1324,21 +1327,26 @@ export class StrategyLoop {
 
   /**
    * The check, to the risk check ledger, with its id. The same act asked again (a retry after a refusal that passes:
-   * the same window, kind and verdict, its earlier act not opened, within LEDGER_RETRY_MS) is not booked again: the
-   * earlier check stands for it (`fresh` false). Its failure is logged, never the act's.
+   * the same window, kind, verdict, asker (auto or manual) and demo flag, its earlier act not opened, within
+   * LEDGER_RETRY_MS) is not booked again: the earlier check stands for it (`fresh` false). So a demo open is never booked
+   * against a plain or auto check, nor the reverse. Its failure is logged, never the act's.
    */
   #bookCheck(w: FundingWindow, p: { kind: 'enter' | 'rotate'; legUsd: number; leverage: number; manual: boolean; demo?: DemoCost }, r: VetoResult, why: string, attestation: string | null, now: number): { checkId: string | null; fresh: boolean } {
     if (this.#o.ledger === undefined) return { checkId: null, fresh: false };
     const verdict = r.veto.verdict === 'veto' ? 'refused' : r.checked ? 'passed' : 'unchecked';
+    const by = p.manual ? 'manual' : 'auto';
+    const demo = p.demo !== undefined;
     const last = this.#lastChecks.get(w.id);
-    if (last !== undefined && last.kind === p.kind && last.verdict === verdict && !last.opened && now - last.at < LEDGER_RETRY_MS) {
+    if (last !== undefined && last.kind === p.kind && last.by === by && last.demo === demo && last.verdict === verdict && !last.opened && now - last.at < LEDGER_RETRY_MS) {
       return { checkId: last.id, fresh: false };
     }
-    const id = `${now}-${w.id}`;
+    // A second check on the window in the same millisecond (a demo after a plain one): its own id all the same.
+    const base = `${now}-${w.id}`;
+    const id = last === undefined || (last.id !== base && !last.id.startsWith(`${base}-`)) ? base : `${base}-${++this.#checkSeq}`;
     try {
       const holdHours = LEDGER_HOLD_HOURS;
       this.#o.ledger.check({
-        v: 1, type: 'check', id, at: now, kind: p.kind, by: p.manual ? 'manual' : 'auto', ...(p.demo === undefined ? {} : { demo: true as const }), windowId: w.id, symbol: w.symbol,
+        v: 1, type: 'check', id, at: now, kind: p.kind, by, ...(demo ? { demo: true as const } : {}), windowId: w.id, symbol: w.symbol,
         outcome: r.outcome, verdict, reason: r.reason, why, attestation,
         model: r.veto.model, prompt: r.exchange?.messages ?? null, reply: r.exchange === null ? '' : replyText(r.exchange), latencyMs: r.latencyMs,
         legUsd: p.legUsd, leverage: p.leverage, forecastNetAprPct: w.netAprPct, roundTripCostUsd: roundTripUsd(w.costs, p.legUsd, DEFAULT_SCANNER_CONFIG.costs.holdHours), holdHours,
@@ -1347,7 +1355,7 @@ export class StrategyLoop {
       this.#log(`strategy loop: the risk check on ${w.id} was not booked (${errorMessage(err)})`);
       return { checkId: null, fresh: false };
     }
-    this.#lastChecks.set(w.id, { id, kind: p.kind, verdict, at: now, opened: false });
+    this.#lastChecks.set(w.id, { id, kind: p.kind, by, demo, verdict, at: now, opened: false });
     for (const [k, v] of this.#lastChecks) if (now - v.at >= LEDGER_RETRY_MS) this.#lastChecks.delete(k);
     return { checkId: id, fresh: true };
   }

@@ -140,6 +140,12 @@ export interface WindowCarry {
   long: LegRates;
   short: LegRates;
   breakdown: CostBreakdown;
+  /**
+   * True when estimate.roundTrip is the desk round trip priceWindow took on the books (carry.ts deskRoundTrip); false
+   * when it was put together from the cost breakdown with unknown parts counted as 0. Only a priced one bounds an owner
+   * demo entry (serve-loop.ts windowFacts). Absent: not priced.
+   */
+  roundTripPriced?: boolean;
 }
 
 /**
@@ -529,7 +535,7 @@ export class Scanner {
         w.breakevenHours = hours === null ? HOURS_PER_YEAR : round(Math.min(hours, HOURS_PER_YEAR), 1);
       }
       carry.set(pw.pair.id, {
-        estimate, breakdown: b,
+        estimate, breakdown: b, roundTripPriced: pw.roundTrip !== null,
         long: this.#legRates(pw.pair.long, longKey, pw.pair.long.ratePerHour, now),
         short: this.#legRates(pw.pair.short, shortKey, pw.pair.short.shortRatePerHour, now),
       });

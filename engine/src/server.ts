@@ -35,6 +35,7 @@ import type { PolicyDrafter } from './nearai/draft-route.ts';
 import { setupRoute } from './setup/route.ts';
 import type { SetupStarter } from './setup/route.ts';
 import { parseStrategyConfig } from './scanner/config.ts';
+import { parseDemo } from './strategy/loop.ts';
 import type { ScanResult, Scanner } from './scanner/scanner.ts';
 import type { RiskEngine } from './risk/engine.ts';
 import { stressRoute } from './risk/stress-route.ts';
@@ -495,9 +496,12 @@ export class EngineServer {
       if (path === '/rotate') {
         const windowId = body !== null && typeof body === 'object' ? (body as { windowId?: unknown }).windowId : undefined;
         if (typeof windowId !== 'string' || windowId.trim() === '') return json(res, 400, { ok: false, reason: 'POST /rotate needs { "windowId": "<window id>" }' });
+        // `demo` sent (null included) is checked here first (409 with parseDemo's reason), and again by the loop.
+        const sent = Object.prototype.hasOwnProperty.call(body, 'demo');
         const demo = (body as { demo?: unknown }).demo;
-        answer = demo === undefined ? loop.rotate(windowId) : loop.rotate(windowId, demo);
-        route = demo === undefined ? 'POST /rotate' : `POST /rotate (owner demo entry ${JSON.stringify(demo)})`;
+        const parsed = sent ? parseDemo(demo) : null;
+        route = sent ? `POST /rotate (owner demo entry ${JSON.stringify(demo) ?? String(demo)})` : 'POST /rotate';
+        answer = parsed === null ? loop.rotate(windowId) : 'refused' in parsed ? { ok: false, reason: parsed.refused } : loop.rotate(windowId, parsed);
       } else {
         answer = loop.close();
       }

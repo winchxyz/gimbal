@@ -36,6 +36,14 @@ test('the loop line for an open refused for cost says when it is tried again', (
   assert.match(refusedCopy(HELD_OUT(THIN))?.text ?? '', /the Phoenix book is too thin to price opening and closing it\./);
 });
 
+test('an owner demo entry\'s refusal keeps the plain lead (the demo tag comes after it), so it reads the same', () => {
+  const tag = '(owner demo entry: the profit checks are waived; round trip $0.04 estimated, at most $0.25 accepted) ';
+  const raw = `enter xlm-phoenix-hyperliquid: ${tag}open refused, nothing signed: ${SPREAD}; xlm-phoenix-hyperliquid is held out of the entry rules until the hourly check at 2026-11-04T10:00:00.000Z and its hours start again; NEAR AI passed XLM`;
+  const c = refusedCopy(raw);
+  assert.equal(c?.mapped, true);
+  assert.equal(c?.text, refusedCopy(HELD_OUT(SPREAD))?.text);
+});
+
 test('a rotation that closed the old pair first says the desk is flat; other refusals are left alone', () => {
   const raw = `rotate a-b: open refused, nothing signed: ${SPREAD}; a-b was closed, so the desk stays flat; b-c is held out of the entry rules until the hourly check at 2026-11-04T11:00:00.000Z and its hours start again; NEAR AI passed XLM`;
   assert.equal(refusedCopy(raw), null); // the window named differs from the one rotated into: not this shape

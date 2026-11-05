@@ -183,6 +183,35 @@ test('/rotate with demo: the body goes to the route as given (the route and the 
   assert.deepEqual(hands.demos, [{ maxLossUsd: 0.25 }, undefined]);
 });
 
+test('POST /rotate with a demo that is not { maxLossUsd } within the cap: 409 with parseDemo\'s reason, the loop never called', async () => {
+  const post = async (body: unknown) => {
+    const r = await fetch(`http://127.0.0.1:${port}/rotate`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+    return { status: r.status, body: await r.json() as { ok: boolean; reason?: string } };
+  };
+  hands.rotates.length = 0;
+  hands.demos.length = 0;
+  for (const [demo, why] of [
+    [null, /^POST \/rotate's demo must be "demo": \{ "maxLossUsd"/],
+    [[], /^POST \/rotate's demo must be/],
+    [[0.25], /^POST \/rotate's demo must be/],
+    [{}, /^a demo entry needs maxLossUsd/],
+    [{ maxLossUsd: {} }, /^demo maxLossUsd \{\} is not a number above 0/],
+    [{ maxLossUsd: 0 }, /^demo maxLossUsd 0 is not a number above 0/],
+    [{ maxLossUsd: 2 }, /^demo maxLossUsd 2 is over the \$1\.00 a demo entry may accept/],
+    [{ maxLossUsd: 0.25, by: 'x' }, /unknown field "by"/],
+    ['0.25', /^POST \/rotate's demo must be/],
+  ] as [unknown, RegExp][]) {
+    const r = await post({ windowId: WINDOW, demo });
+    assert.equal(r.status, 409, JSON.stringify(demo));
+    assert.equal(r.body.ok, false);
+    assert.match(r.body.reason!, why);
+  }
+  assert.deepEqual(hands.rotates, [], 'nothing reached the loop');
+  // A valid one reaches it, parsed.
+  assert.deepEqual(await post({ windowId: WINDOW, demo: { maxLossUsd: 0.25 } }), { status: 200, body: { ok: true } });
+  assert.deepEqual(hands.demos, [{ maxLossUsd: 0.25 }]);
+});
+
 test('the route\'s own refusal is its answer: kept in the marker as done, with the status and the reason', async (t) => {
   const dir = tempDir(t);
   const before = hands.closes;

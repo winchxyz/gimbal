@@ -69,7 +69,8 @@ export interface VetoFacts {
   manual?: boolean;
   /**
    * An owner demo entry (POST /rotate with demo, always manual): its profit checks are waived, and the owner accepted
-   * a round trip of at most maxLossUsd (the window's estimate: roundTripUsd). The prompt says so. Absent: none.
+   * a round-trip cost estimate of at most maxLossUsd (the window's estimate: roundTripUsd); funding during the hold is
+   * expected positive (the spread must be) and is not part of that bound. The prompt says so. Absent: none.
    */
   demo?: { maxLossUsd: number; roundTripUsd: number };
 }
@@ -77,7 +78,10 @@ export interface VetoFacts {
 /** What a manual act's prompt says in place of the owner's minimum. */
 export const MANUAL_MINIMUM = 'waived: the owner asked for this trade';
 /** What a demo entry's prompt says it is. */
-export const DEMO_ENTRY_TEXT = 'an owner-requested demonstration entry: the profit checks (the owner minimum, the round trip paid back, break-even) are waived; every other check passed';
+export const DEMO_ENTRY_TEXT = 'an owner-requested demonstration entry: the profit checks (the owner minimum, the round trip paid back, break-even) '
+  + 'are waived; every other check passed, the expected funding spread over the hold included, which must be positive. '
+  + 'owner_accepted_cost_usd bounds the estimated round-trip cost (fees, slippage, basis buffer) only: funding during the '
+  + 'hold is expected positive and is not part of that bound';
 
 /** The most reasons kept from a reply, and the longest. */
 const MAX_REASONS = 3;

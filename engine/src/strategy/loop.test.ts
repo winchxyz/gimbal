@@ -1491,6 +1491,10 @@ test('demo: maxLossUsd is required, a number above 0 and at most 1 USD, and at l
     [{ maxLossUsd: 0.25, extra: 1 }, /unknown field "extra"/],
     [null, /^POST \/rotate's demo must be "demo": \{ "maxLossUsd"/],
     [true, /^POST \/rotate's demo must be/],
+    [[], /^POST \/rotate's demo must be/],
+    [[{ maxLossUsd: 0.25 }], /^POST \/rotate's demo must be/],
+    [{ maxLossUsd: {} }, /^demo maxLossUsd \{\} is not a number above 0/],
+    [{ maxLossUsd: null }, /^demo maxLossUsd null is not a number above 0/],
   ] as [unknown, RegExp][]) {
     const r = parseDemo(demo);
     assert.ok('refused' in r, JSON.stringify(demo));
@@ -1522,7 +1526,7 @@ test('demo: maxLossUsd is required, a number above 0 and at most 1 USD, and at l
   await growing.idle(1000);
   assert.equal(g.opens.length, 0);
   const line = journal(g).at(-1)!;
-  assert.equal(line.summary, `POST /rotate ${DEMO_ID} (owner demo entry, at most $0.25) not carried out: ${DEMO_ID}: its round trip, $0.30, is over the $0.25 the demo entry accepts (maxLossUsd)`);
+  assert.equal(line.summary, `POST /rotate ${DEMO_ID} not carried out: (owner demo entry, at most $0.25) ${DEMO_ID}: its round trip, $0.30, is over the $0.25 the demo entry accepts (maxLossUsd)`);
   assert.equal(line.numbers.demo, 1);
 });
 
@@ -1549,6 +1553,7 @@ test('demo: the NEAR AI risk check is still asked, told it is an owner demonstra
   assert.equal(p.user.owner_minimum_net_apr_pct, 'waived: the owner asked for this trade');
   assert.equal(p.user.demo_entry, DEMO_ENTRY_TEXT);
   assert.match(String(p.user.demo_entry), /^an owner-requested demonstration entry: the profit checks .* are waived/);
+  assert.match(String(p.user.demo_entry), /must be positive\. owner_accepted_cost_usd bounds the estimated round-trip cost .* only: funding during the hold is expected positive and is not part of that bound$/);
   assert.equal(p.user.expected_round_trip_cost_usd, 0.04);
   assert.equal(p.user.owner_accepted_cost_usd, 0.25);
   assert.equal(p.user.trade, 'open a new pair (an owner-requested demonstration entry, asked by hand)');
@@ -1594,4 +1599,68 @@ test('demo: held under the demo rules, the loop does not close or rotate it by i
   await loop.check();
   assert.equal(w.closes.length, 1);
   assert.match(decisions(w).at(-1)!.reason, /^Exit ZEC: .* under your 1000 % minimum, 24 of 24/);
+});
+
+test('demo: the risk check ledger never books a demo open against an auto or plain check, nor the reverse', async () => {
+  const records: (RiskCheckRecord | RiskActRecord)[] = [];
+  const ledger: RiskLedgerSink = { check: (r) => records.push(r), act: (r) => records.push(r), hourly: () => {} };
+  const veto: VetoSource = { model: 'test-model', configured: true, complete: async () => ({ content: '{"verdict":"pass","reasons":[]}', raw: {} }) };
+  const SOL = 'sol-phoenix-hyperliquid';
+  const w = world({ openAnswer: () => REFUSED('the venue is busy') });
+  const loop = makeLoop(w, tmpStore(), { veto, ledger, attestation: () => 'attested', facts: demoFacts({ [SOL]: 0.04 }) });
+  // An auto enter, refused with nothing sent: one check (auto), one act.
+  w.next = { decision: { action: 'enter', reason: 'go', windowId: SOL }, act: { kind: 'enter', windowId: SOL, legUsd: 500, leverage: 1.5, qty: '5' } };
+  await loop.check();
+  w.next = {};
+  // A demo entry into the same window at once: a check of its own, not the auto one.
+  w.now += 60_000;
+  await loop.check();
+  assert.deepEqual(loop.rotate(SOL, DEMO), { ok: true });
+  await loop.idle(1000);
+  // The same demo entry again: the same act, its check stands (no new check, no act booked for a retry not opened).
+  assert.deepEqual(loop.rotate(SOL, DEMO), { ok: true });
+  await loop.idle(1000);
+  // A plain manual rotate: not booked against the demo check.
+  assert.deepEqual(loop.rotate(SOL), { ok: true });
+  await loop.idle(1000);
+  assert.equal(w.opens.length, 4);
+  const checks = records.filter((r): r is RiskCheckRecord => r.type === 'check');
+  assert.deepEqual(checks.map((c) => [c.by, c.demo]), [['auto', undefined], ['manual', true], ['manual', undefined]]);
+  assert.deepEqual(records.map((r) => r.type), ['check', 'act', 'check', 'act', 'check', 'act']);
+  const acts = records.filter((r): r is RiskActRecord => r.type === 'act');
+  assert.deepEqual(acts.map((a) => a.checkId), checks.map((c) => c.id));
+  assert.equal(new Set(checks.map((c) => c.id)).size, 3);
+});
+
+test('demo: a refusal line after the risk check keeps the plain lead (web waitCopy.ts reads it), the demo tag after it', async () => {
+  const w = world({ windows: [demoWin()], openAnswer: () => REFUSED('open refused, nothing signed: the venue is busy') });
+  const loop = makeLoop(w, tmpStore(), { facts: demoFacts() });
+  await loop.check();
+  assert.deepEqual(loop.rotate(DEMO_ID, DEMO), { ok: true });
+  await loop.idle(1000);
+  const line = journal(w).find((j) => j.kind === 'refused')!;
+  assert.equal(line.summary, `enter ${DEMO_ID}: (owner demo entry: the profit checks are waived; round trip $0.04 estimated, at most $0.25 accepted) `
+    + 'open refused, nothing signed: the venue is busy; no NEAR AI key: not checked');
+  assert.equal(line.numbers.demo, 1);
+  // The same refusal without demo, for comparison: the same lead.
+  const p = world({ windows: [win('sol-phoenix-hyperliquid')], openAnswer: () => REFUSED('open refused, nothing signed: the venue is busy') });
+  const plain = makeLoop(p, tmpStore());
+  await plain.check();
+  assert.deepEqual(plain.rotate('sol-phoenix-hyperliquid'), { ok: true });
+  await plain.idle(1000);
+  assert.match(journal(p).find((j) => j.kind === 'refused')!.summary, /^enter sol-phoenix-hyperliquid: open refused, nothing signed: the venue is busy; /);
+});
+
+test('demo: refused on a safety carry line: no 7 days of history, two weeks that disagree, a spread of 0 or less', async () => {
+  const lines = [
+    { ok: false, text: 'No 7-day funding history on both legs yet: the spread expected over a 7-day hold is not known' },
+    { ok: false, text: 'The 7-day spread (5.11 % APR) and the 14-day spread (-2.00 % APR) point opposite ways: no steady carry in this direction' },
+    { ok: false, text: 'Over a 7-day hold, the 7-day spread of -3.00 % APR pays -$0.01 at $12.00 a leg, no more than the $0.04 round trip: it never pays it back' },
+  ];
+  for (const safety of lines) {
+    const w = world({ windows: [demoWin({ checks: [safety, profitCheck(NO_BREAKEVEN_TEXT)] })] });
+    const loop = makeLoop(w, tmpStore(), { facts: demoFacts() });
+    await loop.check();
+    assert.deepEqual(loop.rotate(DEMO_ID, DEMO), { ok: false, reason: `${DEMO_ID} fails a check a demo entry does not waive: ${safety.text}` });
+  }
 });
