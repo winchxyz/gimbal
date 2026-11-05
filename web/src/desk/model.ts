@@ -216,7 +216,10 @@ export function pnlRows(pnl: DeskState['pnl']): PnlRow[] {
 export interface EventRow {
   id: string;
   when: string;
+  /** The summary, or its head when it is long (`splitSummary`). */
   text: string;
+  /** The rest of a long summary, behind a small control; null when the summary is short. */
+  detail: string | null;
   /** A signed amount for the phone's top line, when the entry carries `numbers.usd`. */
   amountUsd: number | null;
   proof: { label: string; href: string } | null;
@@ -232,6 +235,33 @@ export function whenLabel(t: number, now: number): string {
   return Math.floor(t / SAME_DAY) === Math.floor(now / SAME_DAY) ? `Today ${clock(t)}` : full;
 }
 
+/** A summary longer than this shows its head only; the rest opens on request. */
+export const LATEST_TEXT_MAX = 160;
+/** A head is at least this long, so a label such as "replay script:" is never all that shows. */
+const HEAD_MIN = 40;
+
+/**
+ * A long summary as a head and the rest: the head runs to the first `: ` or `; ` past the first few words (where the
+ * engine's lines turn from what happened to its details, as an attestation's TEE measurements), else to the last
+ * space before the limit.
+ */
+export function splitSummary(summary: string, max = LATEST_TEXT_MAX): { text: string; detail: string | null } {
+  if (summary.length <= max) return { text: summary, detail: null };
+  const marks = [...summary.matchAll(/[:;] /g)].map((m) => m.index).filter((i) => i >= HEAD_MIN && i < max);
+  const cut = marks.length > 0 ? Math.min(...marks) : summary.lastIndexOf(' ', max);
+  if (cut <= 0) return { text: summary, detail: null };
+  return { text: summary.slice(0, cut), detail: summary.slice(cut).replace(/^[:;]?\s*/, '') };
+}
+
+/**
+ * The flat desk's line about the pair it closed last: the newest close that carries its realized net
+ * (`realizedNetUsd`, the replay desk's closes do). Null when there is none.
+ */
+export function lastClose(journal: readonly JournalEntry[], now: number): { when: string; netUsd: number } | null {
+  const e = journal.find((x) => x.kind === 'exit' && typeof x.numbers.realizedNetUsd === 'number');
+  return e ? { when: whenLabel(e.t, now), netUsd: e.numbers.realizedNetUsd as number } : null;
+}
+
 /** The most recent journal entries, newest first: the engine sends them in that order. */
 export function latestEvents(journal: readonly JournalEntry[], now: number, limit = 3): EventRow[] {
   return journal.slice(0, limit).map((e) => {
@@ -242,7 +272,7 @@ export function latestEvents(journal: readonly JournalEntry[], now: number, limi
       : e.why
         ? { label: 'Why ↗', href: '#/journal' }
         : null;
-    return { id: e.id, when: whenLabel(e.t, now), text: e.summary, amountUsd: amountUsd(e), proof, unprotected: unprotectedText(e) };
+    return { id: e.id, when: whenLabel(e.t, now), ...splitSummary(e.summary), amountUsd: amountUsd(e), proof, unprotected: unprotectedText(e) };
   });
 }
 

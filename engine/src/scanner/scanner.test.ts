@@ -401,7 +401,7 @@ test('replay: a book the recording never captured leaves the pair out, but the v
   const r = await s.scan();
   assert.deepEqual(r.scan.failed, []);
   assert.equal(r.windows.filter((w) => w.longVenue === 'orderly' || w.shortVenue === 'orderly').length, 0);
-  const miss = '1 book not in the recording, their pairs left out: orderly PERP_SOL_USDC';
+  const miss = 'replay: 1 more book not in the recording, their pairs left out';
   assert.equal(notes.filter((n) => n === miss).length, 1);
 
   // Asked again on a later scan, it is still missing and still not a failure; the note is not repeated.

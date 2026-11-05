@@ -83,6 +83,7 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
   const groups = useMemo(() => groupByDay(listed, now), [listed, now]);
   const { shown: days, fold } = useMemo(() => (expanded ? { shown: groups, fold: null } : foldOlder(groups)), [groups, expanded]);
 
+  const replay = desk?.mode === 'replay';
   const attribution = attributionOf(desk?.pnl ?? null, shown);
   const costs = costsUsd(attribution);
 
@@ -97,15 +98,32 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
       <section className="j-top">
         <div>
           <h1>Journal</h1>
-          <p className="j-desk">
-            Everything the desk did, as the contract recorded it.{' '}
-            <b>
-              <Flash value={signed}>{actionsText(signed)}</Flash>, 0 by a private key.
-            </b>
-          </p>
-          <p className="j-phone">
-            <Flash value={signed}>{actionsText(signed)}</Flash> by the contract. <span className="lvl">0</span> by a private key.
-          </p>
+          {replay ? (
+            // A replay has no contract: its actions are simulated on recorded prices, and nothing is signed or sent.
+            <>
+              <p className="j-desk">
+                Everything the replay desk did, on recorded mainnet prices.{' '}
+                <b>
+                  <Flash value={signed}>{actionsText(signed, true)}</Flash>, nothing signed or sent.
+                </b>
+              </p>
+              <p className="j-phone">
+                <Flash value={signed}>{actionsText(signed, true)}</Flash>. Nothing signed or sent.
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="j-desk">
+                Everything the desk did, as the contract recorded it.{' '}
+                <b>
+                  <Flash value={signed}>{actionsText(signed)}</Flash>, 0 by a private key.
+                </b>
+              </p>
+              <p className="j-phone">
+                <Flash value={signed}>{actionsText(signed)}</Flash> by the contract. <span className="lvl">0</span> by a private key.
+              </p>
+            </>
+          )}
         </div>
         <button
           type="button"

@@ -873,6 +873,11 @@ export interface JournalEntry {
   //   unpriced, venue         1 or "true" when an order went out without the oracle price band, and on which venue
   //   from, signedS, landedS  on a rescue: "reserve" or the venue id the margin came from, then the seconds the
   //                           MPC signature and the landing took
+  //   rescuePct, stress       on a rescue's trigger (at its `startedAt`): the line the leg came under (the owner's,
+  //                           or raised by a stress test, `stress` 1, or by volatility) and `amountUsd`, its need
+  //   realizedFundingUsd, realizedFeesUsd, realizedPriceUsd, realizedNetUsd
+  //                           on a replay desk's `exit`: the closed pair's realized split (fees ≤ 0); the Journal
+  //                           adds it to the flat desk's P&L, the Desk's flat page shows the net
   numbers: Record<string, number | string>;
   tx: TxRef[];
 }
@@ -1431,3 +1436,16 @@ from the file on a virtual clock; `npm run demo` (`tools/demo.mjs`) plays the ne
 mainnet answers, at ×10 (`--speed`) with the dashboard, and the Rescue screen's stress test pushes a leg past the
 rescue line. `serve` in replay has no contract client and signs nothing; the tests use `ReplayContractClient`,
 which applies the same policy checks and refusal codes as the contract (signatures marked as replay).
+
+With `GIMBAL_TRADE=1` (the demo sets it) the strategy loop acts on a simulated replay desk (`ReplayDesk`,
+engine/src/risk/sources.ts): 40 USD deposited, 10 USD on Hyperliquid and on Phoenix, the rest in the reserve; fills
+at the recorded best bid or ask with the scanner's taker fees; funding accrued at the recorded rates and booked as a
+`funding` journal line at each hour boundary. Markets (lots) come from the venues' wire recordings
+(fixtures/hl-wire, fixtures/phoenix-wire), as scan recordings keep none. An hour is too short for the loop to enter
+(3 hourly checks) or exit (6, or a demo pair's 24) on its own, so `ReplayScript` (engine/src/cli/serve-replay-loop.ts)
+plays the owner's two buttons, each journaled as `stage: "replay script"`: a few minutes in, an owner demo entry
+(`POST /rotate` with demo: only the profit checks are waived, the round trip held to 1 USD; the policy, the sizing at
+the owner's `legUsd` and the NEAR AI risk check run as live) on the best window the policy allows, trying the next
+when the loop does not enter one; and `POST /close` five minutes after the first hour boundary the pair holds through
+(at the latest five minutes before the recording ends). The close's line carries the realized split. Nothing is
+signed or sent, and every screen says replay.

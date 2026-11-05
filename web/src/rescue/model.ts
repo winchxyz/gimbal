@@ -132,11 +132,61 @@ export const venueLabel = (v: VenueId | 'reserve'): string => (v === 'reserve' ?
 /** The leg a rescue feeds: the one on the venue the margin goes to. */
 export const targetLeg = (desk: DeskState | null, p: RescueProgress): Leg | null => desk?.legs.find((l) => l.venue === p.to) ?? null;
 
+/** What the risk engine journaled when it started this rescue (its `rescue` entry just before `startedAt`). */
+export interface TriggerFacts {
+  /** When the risk engine journaled it: earlier rescues are the ones before this. */
+  t: number;
+  /** The line the leg came under, in percent: the owner's, or higher (a stress test, or the venue's volatility). */
+  rescuePct: number;
+  /** A stress test raised the line to just over the leg's distance. */
+  stress: boolean;
+  /** What the leg needed, before a transfer was planned. */
+  needUsd: number | null;
+}
+
+/** How long before the rescuer starts the risk engine's trigger line can be: the rescuer takes it on its next tick. */
+export const TRIGGER_LEAD_MS = 60_000;
+
+/**
+ * The risk engine's trigger entry for this rescue (the newest `rescue` line with a `rescuePct` at or up to a minute
+ * before `startedAt`), or null when the page does not hold it.
+ */
+export function triggerOf(journal: readonly JournalEntry[], p: Pick<RescueProgress, 'startedAt'>): TriggerFacts | null {
+  let e: JournalEntry | undefined;
+  for (const x of journal) {
+    if (x.kind !== 'rescue' || numberOf(x, 'rescuePct') === null || x.t > p.startedAt || p.startedAt - x.t > TRIGGER_LEAD_MS) continue;
+    if (e === undefined || x.t > e.t) e = x;
+  }
+  if (!e) return null;
+  return { t: e.t, rescuePct: numberOf(e, 'rescuePct')!, stress: numberOf(e, 'stress') === 1, needUsd: numberOf(e, 'amountUsd') };
+}
+
+/** The line a rescue is measured against: the owner's, unless the trigger came under a raised one. */
+export interface RescueLine {
+  /** The percent the distance is compared with, or null before the owner's line is read. */
+  pct: number | null;
+  /** How the detect step names it: "your 8% rescue line, raised to 85.4% by the stress test". */
+  text: string;
+  /** How the hero names it: "the 85.4% stress-test line". */
+  short: string;
+}
+
+const pctText = (n: number): string => `${Number(n.toFixed(2))}%`;
+
+export function rescueLine(owner: number | null, trigger: TriggerFacts | null): RescueLine {
+  const own = owner === null ? 'your rescue line' : `your ${pctText(owner)} rescue line`;
+  if (trigger === null || (owner !== null && trigger.rescuePct <= owner + 1e-9)) return { pct: owner, text: own, short: own };
+  const at = pctText(trigger.rescuePct);
+  return trigger.stress
+    ? { pct: trigger.rescuePct, text: `${own}, raised to ${at} by the stress test`, short: `the ${at} stress-test line` }
+    : { pct: trigger.rescuePct, text: `${own}, raised to ${at} for the venue’s volatility`, short: `the ${at} volatility-raised line` };
+}
+
 export interface StepContext {
   p: RescueProgress;
   leg: Leg | null;
-  /** The owner's rescue line in percent (`StrategyConfig.risk.rescueDistancePct`), or null before it is read. */
-  line: number | null;
+  /** The line the rescue is measured against (`rescueLine`). */
+  line: RescueLine;
 }
 
 /** The sentence under each step's title. */
@@ -144,9 +194,7 @@ export function stepText(id: StepId, { p, leg, line }: StepContext): string {
   const to = VENUE_NAMES[p.to];
   switch (id) {
     case 'detect':
-      return leg
-        ? `The ${to} ${leg.side} came inside ${line === null ? 'your rescue line' : `your ${line}% rescue line`}`
-        : `A leg on ${to} came inside ${line === null ? 'your rescue line' : `your ${line}% rescue line`}`;
+      return leg ? `The ${to} ${leg.side} came inside ${line.text}` : `A leg on ${to} came inside ${line.text}`;
     case 'source':
       return p.from === 'reserve' ? 'The reserve pays. Both legs keep their margin.' : `${VENUE_NAMES[p.from]} free margin pays. The reserve is kept.`;
     case 'quote':
@@ -192,19 +240,30 @@ export interface MovingView {
 /**
  * The engine's amount means what the step can say (RescueProgress.amountUsd): at detect what the leg needs, before
  * a transfer is planned; from source on what the transfer sends; once landed what reached the margin after fees.
+ * When the transfer is not what the leg needed (`needUsd`, from the trigger), the text says why in plain words: a
+ * replay or testnet plays a recorded quote of a fixed size; elsewhere the caps and the source's free margin limit it.
  */
-export function movingOf(p: RescueProgress, failure: RescueFailure | null): MovingView {
+export function movingOf(p: RescueProgress, failure: RescueFailure | null, needUsd: number | null = null, mode: Mode | null = null): MovingView {
   const route = `${p.from === 'reserve' ? 'Reserve' : `${VENUE_NAMES[p.from]} free margin`} → ${VENUE_NAMES[p.to]} margin, through NEAR Intents`;
   if (p.step === 'failed') return { label: 'The desk tries next', amount: null, text: nextText(failure) };
   const label = p.step === 'detect' ? 'The leg needs' : p.step === 'landed' ? 'Moved' : 'Moving';
-  return { label, amount: usd(p.amountUsd), text: route };
+  const sent = p.sentUsd ?? p.amountUsd;
+  if (p.step === 'detect' || needUsd === null || Math.abs(sent - needUsd) < 0.005) return { label, amount: usd(p.amountUsd), text: route };
+  const recorded = mode === 'replay' || mode === 'testnet';
+  const why =
+    sent > needUsd
+      ? recorded
+        ? `The leg needs ${usd(needUsd)}; the recorded mainnet quote this ${mode === 'replay' ? 'replay' : 'test'} plays moves a fixed ${usd(sent)}.`
+        : `The leg needs ${usd(needUsd)}; the transfer sends ${usd(sent)} with its fees.`
+      : `The leg needs ${usd(needUsd)}; the rescue cap and the source’s free margin limit this transfer to ${usd(sent)}.`;
+  return { label, amount: usd(p.amountUsd), text: `${route}. ${why}` };
 }
 
-/** The line under the distance in the hero. */
-export function distanceNote(distance: number | null, line: number | null): string {
+/** The line under the distance in the hero, against the line the rescue is measured with (`rescueLine`). */
+export function distanceNote(distance: number | null, line: RescueLine): string {
   if (distance === null) return 'the venue gives no distance right now';
-  if (line === null) return 'to liquidation';
-  return distance < line ? `inside your ${line}% rescue line` : `clear of your ${line}% rescue line`;
+  if (line.pct === null) return 'to liquidation';
+  return distance < line.pct ? `inside ${line.short}` : `clear of ${line.short}`;
 }
 
 // ---------- transactions ----------

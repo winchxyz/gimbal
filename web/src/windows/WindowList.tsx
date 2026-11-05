@@ -30,6 +30,8 @@ interface HeadProps {
   scan: ScanStatus | null;
   newestAt: number | null;
   connection: Connection;
+  /** The engine plays a recording: the marker says Replay, never Live. */
+  replay?: boolean;
 }
 
 const LIVE: Record<Connection, { label: string; dot: string }> = {
@@ -38,10 +40,11 @@ const LIVE: Record<Connection, { label: string; dot: string }> = {
   retrying: { label: 'Reconnecting', dot: 'var(--watch)' },
   idle: { label: 'Not live', dot: 'var(--ink-3)' },
 };
+const REPLAY_OPEN = { label: 'Replay', dot: 'var(--replay)' };
 
 /** Tabs and the live marker. On the phone the title comes first, then the marker, then the tabs. */
-export function ListHead({ tab, onTab, tradableCount, watchCount, watchVenues, scan, newestAt, connection }: HeadProps) {
-  const live = LIVE[connection];
+export function ListHead({ tab, onTab, tradableCount, watchCount, watchVenues, scan, newestAt, connection, replay = false }: HeadProps) {
+  const live = replay && connection === 'open' ? REPLAY_OPEN : LIVE[connection];
   const at = scan?.at ?? newestAt;
   return (
     <div className="w-head">

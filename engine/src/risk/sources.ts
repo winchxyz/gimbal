@@ -8,15 +8,17 @@
 // deadline (ACCOUNT_READ_DEADLINE_MS): past it that venue's read fails for this tick instead of holding the tick up.
 // Phoenix legs are marked with marks up to 5 s old (phoenix.ts MARKS_MAX_AGE_MS), refreshed between ticks.
 //
-// ReplayDesk (replay): there are no recorded accounts, so the desk is scripted: one pair at strategy.legUsd a leg and
-// strategy.maxLeverage, opened at the first recorded marks, then marked and funded by the recording as the replay
-// clock runs. The positions are a script; every price and funding rate is the recording's. Its first read journals
-// what it opened, saying so.
+// ReplayDesk (replay): there are no recorded accounts, so the desk is simulated: REPLAY_DEPOSIT_USD deposited,
+// REPLAY_VENUE_CASH_USD of it on each of Hyperliquid and Phoenix and the rest in the reserve, flat at the start. The
+// strategy loop opens and closes a pair on it through the replay hands (cli/serve-replay-loop.ts): fills at the
+// recorded best bid and ask, the scanner's taker fees, marked and funded by the recording as the replay clock runs,
+// funding booked at every hour boundary it holds a pair through (onFunding). Nothing is signed or sent; every price
+// and funding rate is the recording's.
 
 import type { DeskState, StrategyConfig, VenueId } from '@gimbal/shared';
 import { readBy } from '../venues/http-budget.ts';
 import { errorMessage } from '../venues/recorder.ts';
-import type { AccountState, Clock, MarketFunding, Position, VenueReader } from '../venues/venue.ts';
+import type { AccountState, Clock, Position, VenueReader } from '../venues/venue.ts';
 import type { DeskSnapshot, DeskSource, LegInput } from './engine.ts';
 
 export interface AccountsDeskSourceOptions {
@@ -144,159 +146,351 @@ export async function withDeadline<T>(ms: number, what: string, fn: () => Promis
   }
 }
 
-/** The replay script's maintenance fraction where the recording has no market list: Hyperliquid's ETH (1/(2×25)). */
+/** The replay desk's maintenance fraction where the recording has no market list: Hyperliquid's ETH (1/(2×25)). */
 export const REPLAY_MAINTENANCE_FRACTION = 0.02;
-/** The replay desk's reserve: this share of the margin it posts on both legs. */
-export const REPLAY_RESERVE_SHARE = 0.2;
+/**
+ * What the replay desk's owner deposited, USD: the scale of the final mainnet policy (legs of 12 USD, a 20 USD cap an
+ * order, the 20 USD recorded NEAR Intents transfer a rescue plays).
+ */
+export const REPLAY_DEPOSIT_USD = 40;
+/**
+ * Of the deposit, the USDC on each of Hyperliquid and Phoenix from the start: a 12 USD leg at the 1.5x a venue with no
+ * live rescue allows (decide.ts sizeFor) needs 8. The rest is the reserve on NEAR.
+ */
+export const REPLAY_VENUE_CASH_USD = 10;
+/** The venues the replay desk keeps an account on: the default pair's (short Hyperliquid, long Phoenix). */
+export const REPLAY_ACCOUNT_VENUES: readonly VenueId[] = ['hyperliquid', 'phoenix'];
+
+const HOUR_MS = 3_600_000;
 
 interface ScriptLeg {
   venue: VenueId;
   symbol: string;
   size: number;          // signed, units of `symbol`
   entryPx: number;
-  marginUsd: number;
   m: number;
   lotSize: number;
+  leverage: number;
+  /** Accrued since the open at the recorded rates: received > 0. */
   fundingUsd: number;
+  /** The part of fundingUsd an hourly booking already journaled. */
+  bookedUsd: number;
+  /** The open's fee, a cost > 0 (taken from the venue's cash). */
+  feeUsd: number;
   mark: number;
   rate: number;
   at: number;
+}
+
+/** One leg's fill in an open or a close of the replay desk: at the recorded best bid or ask, else its recorded mark. */
+export interface ReplayFill {
+  venue: VenueId;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  qty: number;
+  px: number;
+  /** A cost > 0. */
+  feeUsd: number;
+  source: 'book' | 'mark';
+}
+
+export type ReplayOpen = { ok: true; fills: ReplayFill[]; feeUsd: number } | { ok: false; reason: string };
+
+/** A close of the replay desk's pair, with the position's realized P&L (fees as costs > 0). */
+export type ReplayClose = {
+  ok: true;
+  fills: ReplayFill[];
+  /** The close's own fees. */
+  feeUsd: number;
+  /** The open's fees. */
+  entryFeeUsd: number;
+  /** Funding over the whole hold, and the part no hourly booking journaled yet. */
+  fundingUsd: number;
+  unbookedFundingUsd: number;
+  /** Both legs' price P&L, entry fill to exit fill. */
+  priceUsd: number;
+  /** fundingUsd + priceUsd − entryFeeUsd − feeUsd. */
+  netUsd: number;
+  heldMs: number;
+} | { ok: false; reason: string };
+
+/** Funding the replay desk booked at an hour boundary: what accrued since the last booking (or the open). */
+export interface ReplayFunding {
+  from: number;
+  to: number;
+  usd: number;
+  legs: { venue: VenueId; symbol: string; side: 'long' | 'short'; usd: number; ratePerHour: number }[];
+}
+
+/** The pair the replay desk holds. */
+export interface ReplayHeld {
+  symbol: string;
+  openedAt: number;
+  legs: { venue: VenueId; side: 'long' | 'short'; size: number; entryPx: number; mark: number; fundingUsd: number; feeUsd: number; leverage: number }[];
 }
 
 export interface ReplayDeskOptions {
   venues: readonly VenueReader[];
   clock: Clock;
   strategy: () => StrategyConfig;
-  /** The pair to script; default: ETH on Hyperliquid and Phoenix when both have it, else the first common base. */
-  base?: string;
-  /** Called once, with what the script opened. */
-  onOpen?: (summary: string) => void;
+  /** A venue's taker fee, bps (serve: the scanner's fill costs); default none. */
+  takerBps?: (venue: VenueId) => number;
+  /** At each hour boundary the desk holds a pair through: the funding accrued since the last booking. */
+  onFunding?: (funding: ReplayFunding) => void;
 }
 
 export class ReplayDesk implements DeskSource {
   readonly #o: ReplayDeskOptions;
-  #legs: ScriptLeg[] | null = null;
-  #opening: Promise<ScriptLeg[]> | null = null;
-  /** The reserve, fixed when the script opens, less what replayed rescues took from it. */
-  #reserve: number | null = null;
+  #legs: ScriptLeg[] = [];
+  readonly #cash = new Map<VenueId, number>();
+  #reserve = REPLAY_DEPOSIT_USD;
+  /** The end of the last funding booking, or the open; null while flat. */
+  #bookedAt: number | null = null;
+  #openedAt: number | null = null;
+  /** One read, open or close at a time: each moves the legs' accrual clock. */
+  #queue: Promise<unknown> = Promise.resolve();
 
   constructor(options: ReplayDeskOptions) {
     this.#o = options;
+    for (const v of this.#accountVenues()) {
+      this.#cash.set(v, REPLAY_VENUE_CASH_USD);
+      this.#reserve -= REPLAY_VENUE_CASH_USD;
+    }
   }
 
-  async read(): Promise<DeskSnapshot> {
-    if (this.#legs === null) {
-      this.#opening ??= this.#open();
-      this.#legs = await this.#opening;
-    }
+  read(): Promise<DeskSnapshot> {
+    return this.#serial(() => this.#read());
+  }
+
+  /** A venue account as the strategy loop reads its free margin (the last marks; no venue read). */
+  async account(venue: VenueId): Promise<AccountState> {
+    if (!this.#cash.has(venue)) throw new Error(`replay desk: no account on ${venue}`);
     const now = this.#o.clock.now();
-    const reads: DeskSnapshot['reads'] = [];
-    for (const v of this.#o.venues) {
-      const mine = this.#legs.filter((l) => l.venue === v.id);
-      if (mine.length === 0) continue;
-      const started = Date.now();
-      try {
-        const rows = await v.funding();
-        for (const l of mine) {
-          const row = rows.find((r) => r.symbol === l.symbol);
-          if (row === undefined || row.markPx === null || !(row.markPx > 0)) throw new Error(`replay: no recorded mark for ${l.symbol}`);
-          // Funding since the last read, at the rate in force then: a long pays a positive rate.
-          const hours = Math.max(0, now - l.at) / 3_600_000;
-          l.fundingUsd += -l.size * l.mark * l.rate * hours;
-          l.mark = row.markPx;
-          l.rate = row.ratePerHour;
-          l.at = now;
-        }
-        reads.push({ venue: v.id, ms: Date.now() - started, error: null });
-      } catch (err) {
-        reads.push({ venue: v.id, ms: Date.now() - started, error: errorMessage(err) });
+    const leg = this.#legs.find((l) => l.venue === venue);
+    return leg === undefined ? this.#flatAccount(venue, now) : this.#input(leg, now).account;
+  }
+
+  /** The pair held now, or null when flat. */
+  held(): ReplayHeld | null {
+    if (this.#legs.length === 0 || this.#openedAt === null) return null;
+    return {
+      symbol: this.#legs[0]!.symbol, openedAt: this.#openedAt,
+      legs: this.#legs.map((l) => ({
+        venue: l.venue, side: l.size >= 0 ? 'long' : 'short', size: Math.abs(l.size), entryPx: l.entryPx, mark: l.mark, fundingUsd: l.fundingUsd,
+        feeUsd: l.feeUsd, leverage: l.leverage,
+      })),
+    };
+  }
+
+  /** Opens `qty` of `symbol` long on `long` and short on `short`, from flat. Nothing is signed or sent. */
+  openPair(p: { symbol: string; qty: number; long: VenueId; short: VenueId; leverage: number }): Promise<ReplayOpen> {
+    return this.#serial(async (): Promise<ReplayOpen> => {
+      if (this.#legs.length > 0) return { ok: false, reason: `the replay desk holds ${this.#legs[0]!.symbol} already` };
+      if (!(p.qty > 0) || !Number.isFinite(p.qty)) return { ok: false, reason: `size ${p.qty} is not above 0` };
+      if (!(p.leverage > 0)) return { ok: false, reason: `leverage ${p.leverage} is not above 0` };
+      const now = this.#o.clock.now();
+      const fills: ReplayFill[] = [];
+      const legs: ScriptLeg[] = [];
+      for (const [venue, side] of [[p.long, 'BUY'], [p.short, 'SELL']] as const) {
+        const cash = this.#cash.get(venue);
+        if (cash === undefined) return { ok: false, reason: `the replay desk has no account on ${venue}` };
+        const fill = await this.#fill(venue, p.symbol, side, p.qty);
+        if ('reason' in fill) return { ok: false, reason: fill.reason };
+        const need = p.qty * fill.px / p.leverage + fill.feeUsd;
+        if (need > cash + 1e-9) return { ok: false, reason: `${venue}: ${cash.toFixed(2)} USD on the account, under the ${need.toFixed(2)} USD the leg's margin and fee need` };
+        const market = await this.#market(venue, p.symbol);
+        fills.push(fill);
+        legs.push({
+          venue, symbol: p.symbol, size: side === 'BUY' ? p.qty : -p.qty, entryPx: fill.px, m: market.m, lotSize: market.lot, leverage: p.leverage,
+          fundingUsd: 0, bookedUsd: 0, feeUsd: fill.feeUsd, mark: fill.mark, rate: fill.rate, at: now,
+        });
       }
-    }
+      for (const l of legs) this.#cash.set(l.venue, this.#cash.get(l.venue)! - l.feeUsd);
+      this.#legs = legs;
+      this.#openedAt = now;
+      this.#bookedAt = now;
+      return { ok: true, fills, feeUsd: fills.reduce((s, f) => s + f.feeUsd, 0) };
+    });
+  }
+
+  /** Closes both legs to flat; their P&L and funding go to each venue's cash. Nothing is signed or sent. */
+  closePair(): Promise<ReplayClose> {
+    return this.#serial(async (): Promise<ReplayClose> => {
+      if (this.#legs.length === 0 || this.#openedAt === null) return { ok: false, reason: 'the replay desk holds no pair' };
+      const now = this.#o.clock.now();
+      await this.#mark(now);
+      const fills: ReplayFill[] = [];
+      for (const l of this.#legs) {
+        const fill = await this.#fill(l.venue, l.symbol, l.size >= 0 ? 'SELL' : 'BUY', Math.abs(l.size), l.mark);
+        if ('reason' in fill) return { ok: false, reason: fill.reason };
+        fills.push(fill);
+      }
+      let priceUsd = 0;
+      let fundingUsd = 0;
+      let unbooked = 0;
+      let entryFeeUsd = 0;
+      this.#legs.forEach((l, i) => {
+        const f = fills[i]!;
+        const price = l.size * (f.px - l.entryPx);
+        priceUsd += price;
+        fundingUsd += l.fundingUsd;
+        unbooked += l.fundingUsd - l.bookedUsd;
+        entryFeeUsd += l.feeUsd;
+        this.#cash.set(l.venue, this.#cash.get(l.venue)! + price + l.fundingUsd - f.feeUsd);
+      });
+      const feeUsd = fills.reduce((s, f) => s + f.feeUsd, 0);
+      const heldMs = now - this.#openedAt;
+      this.#legs = [];
+      this.#openedAt = null;
+      this.#bookedAt = null;
+      return {
+        ok: true, fills, feeUsd, entryFeeUsd, fundingUsd, unbookedFundingUsd: unbooked, priceUsd,
+        netUsd: fundingUsd + priceUsd - entryFeeUsd - feeUsd, heldMs,
+      };
+    });
+  }
+
+  /** A replayed rescue landed `usd` on `venue`: that account holds that much more. */
+  credit(venue: VenueId, usd: number): void {
+    if (this.#cash.has(venue)) this.#cash.set(venue, this.#cash.get(venue)! + usd);
+  }
+
+  /** A replayed rescue took `usd` from the reserve. */
+  spendReserve(usd: number): void {
+    this.#reserve -= usd;
+  }
+
+  #accountVenues(): VenueId[] {
+    return REPLAY_ACCOUNT_VENUES.filter((v) => this.#o.venues.some((r) => r.id === v));
+  }
+
+  #serial<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.#queue.then(fn, fn);
+    this.#queue = run.catch(() => {});
+    return run;
+  }
+
+  async #read(): Promise<DeskSnapshot> {
+    const now = this.#o.clock.now();
+    const reads = await this.#mark(now);
     const failed = new Set(reads.filter((r) => r.error !== null).map((r) => r.venue));
     const legs = this.#legs.filter((l) => !failed.has(l.venue)).map((l) => this.#input(l, now));
-    this.#reserve ??= this.#legs.reduce((s, l) => s + l.marginUsd, 0) * REPLAY_RESERVE_SHARE;
-    // The script's accounts are its legs' venues (one scripted account per leg).
-    const accounts: { venue: VenueId; equityUsd: number | null }[] = [];
-    for (const l of this.#legs) {
-      if (accounts.some((a) => a.venue === l.venue)) continue;
-      accounts.push({ venue: l.venue, equityUsd: failed.has(l.venue) ? null : legs.filter((i) => i.venue === l.venue).reduce((s, i) => s + i.account.equityUsd, 0) });
-    }
+    const accounts = this.#accountVenues().map((venue) => {
+      if (failed.has(venue)) return { venue, equityUsd: null };
+      const leg = legs.find((i) => i.venue === venue);
+      return { venue, equityUsd: leg === undefined ? this.#cash.get(venue)! : leg.account.equityUsd };
+    });
     return {
       deskId: 'replay', owner: 'replay', contract: 'replay', reserveUsd: Math.max(0, this.#reserve), paused: null, legs, accounts, reads,
     };
   }
 
-  /** A replayed rescue landed `usd` on `venue`: the scripted leg there holds that much more margin. */
-  credit(venue: VenueId, usd: number): void {
-    const leg = this.#legs?.find((l) => l.venue === venue);
-    if (leg !== undefined) leg.marginUsd += usd;
+  /**
+   * Every account venue's recorded funding read: the legs' funding accrued at the rate in force since the last mark
+   * (booked at each hour boundary on the way), then their marks and rates moved to the recording's now.
+   */
+  async #mark(now: number): Promise<DeskSnapshot['reads']> {
+    const reads: DeskSnapshot['reads'] = [];
+    const rows = new Map<VenueId, Awaited<ReturnType<VenueReader['funding']>>>();
+    for (const venue of this.#accountVenues()) {
+      const reader = this.#o.venues.find((v) => v.id === venue)!;
+      const started = Date.now();
+      try {
+        const got = await reader.funding();
+        for (const l of this.#legs.filter((x) => x.venue === venue)) {
+          const row = got.find((r) => r.symbol === l.symbol);
+          if (row === undefined || row.markPx === null || !(row.markPx > 0)) throw new Error(`replay: no recorded mark for ${l.symbol}`);
+        }
+        rows.set(venue, got);
+        reads.push({ venue, ms: Date.now() - started, error: null });
+      } catch (err) {
+        reads.push({ venue, ms: Date.now() - started, error: errorMessage(err) });
+      }
+    }
+    if (this.#legs.length > 0 && this.#bookedAt !== null) {
+      for (let b = Math.floor(this.#bookedAt / HOUR_MS) * HOUR_MS + HOUR_MS; b <= now; b += HOUR_MS) {
+        this.#accrue(b);
+        this.#book(b);
+      }
+      this.#accrue(now);
+    }
+    for (const l of this.#legs) {
+      const row = rows.get(l.venue)?.find((r) => r.symbol === l.symbol);
+      if (row === undefined || row.markPx === null || !(row.markPx > 0)) continue;
+      l.mark = row.markPx;
+      l.rate = row.ratePerHour;
+    }
+    return reads;
   }
 
-  /** A replayed rescue took `usd` from the reserve. */
-  spendReserve(usd: number): void {
-    if (this.#reserve !== null) this.#reserve -= usd;
+  /** Funding to `t` at each leg's last rate: a long pays a positive rate. */
+  #accrue(t: number): void {
+    for (const l of this.#legs) {
+      const hours = Math.max(0, t - l.at) / HOUR_MS;
+      l.fundingUsd += -l.size * l.mark * l.rate * hours;
+      l.at = Math.max(l.at, t);
+    }
+  }
+
+  #book(to: number): void {
+    const from = this.#bookedAt ?? to;
+    const legs = this.#legs.map((l) => {
+      const usd = l.fundingUsd - l.bookedUsd;
+      l.bookedUsd = l.fundingUsd;
+      return { venue: l.venue, symbol: l.symbol, side: l.size >= 0 ? 'long' as const : 'short' as const, usd, ratePerHour: l.rate };
+    });
+    this.#bookedAt = to;
+    this.#o.onFunding?.({ from, to, usd: legs.reduce((s, l) => s + l.usd, 0), legs });
+  }
+
+  /** A fill of `qty` at the recorded best ask (BUY) or bid (SELL), else at the recorded mark; with its taker fee. */
+  async #fill(venue: VenueId, symbol: string, side: 'BUY' | 'SELL', qty: number, lastMark?: number):
+    Promise<ReplayFill & { mark: number; rate: number } | { reason: string }> {
+    const reader = this.#o.venues.find((v) => v.id === venue);
+    if (reader === undefined) return { reason: `the replay has no ${venue} recording` };
+    let row: { markPx: number | null; ratePerHour: number } | undefined;
+    try {
+      row = (await reader.funding()).find((r) => r.symbol === symbol);
+    } catch {
+      // the mark below falls back to the last one
+    }
+    const mark = row?.markPx != null && row.markPx > 0 ? row.markPx : lastMark;
+    let px: number | undefined;
+    let source: ReplayFill['source'] = 'book';
+    try {
+      const book = await reader.book(symbol, 5);
+      px = side === 'BUY' ? book.asks[0]?.px : book.bids[0]?.px;
+    } catch {
+      // not recorded: the mark
+    }
+    if (px === undefined || !(px > 0)) {
+      px = mark;
+      source = 'mark';
+    }
+    if (px === undefined || !(px > 0) || mark === undefined) return { reason: `the recording has no price for ${symbol} on ${venue}` };
+    const feeUsd = qty * px * (this.#o.takerBps?.(venue) ?? 0) / 1e4;
+    return { venue, symbol, side, qty, px, feeUsd, source, mark, rate: row?.ratePerHour ?? 0 };
+  }
+
+  #flatAccount(venue: VenueId, now: number): AccountState {
+    const cash = this.#cash.get(venue) ?? 0;
+    return { venue, address: 'replay', time: now, equityUsd: cash, freeMarginUsd: Math.max(0, cash), maintenanceMarginUsd: 0, positions: [] };
   }
 
   #input(l: ScriptLeg, now: number): LegInput {
     const upnl = l.size * (l.mark - l.entryPx);
-    const equity = l.marginUsd + upnl + l.fundingUsd;
+    const equity = (this.#cash.get(l.venue) ?? 0) + upnl + l.fundingUsd;
+    const notional = Math.abs(l.size) * l.mark;
     const position: Position = {
-      symbol: l.symbol, size: l.size, entryPx: l.entryPx, liqPx: null, marginUsd: l.marginUsd, unrealizedPnlUsd: upnl,
-      leverage: Math.abs(l.size) * l.mark / l.marginUsd, fundingSinceOpenUsd: l.fundingUsd, unsettledFundingUsd: 0,
+      symbol: l.symbol, size: l.size, entryPx: l.entryPx, liqPx: null, marginUsd: notional / l.leverage, unrealizedPnlUsd: upnl,
+      leverage: equity > 0 ? notional / equity : Infinity, fundingSinceOpenUsd: l.fundingUsd, unsettledFundingUsd: 0,
     };
     const account: AccountState = {
       venue: l.venue, address: 'replay', time: now, equityUsd: equity,
-      freeMarginUsd: Math.max(0, equity - Math.abs(l.size) * l.mark / Math.max(1, this.#o.strategy().maxLeverage)),
-      maintenanceMarginUsd: l.m * Math.abs(l.size) * l.mark, positions: [position],
+      freeMarginUsd: Math.max(0, equity - notional / l.leverage),
+      maintenanceMarginUsd: l.m * notional, positions: [position],
     };
-    return { venue: l.venue, symbol: l.symbol, lotSize: l.lotSize, account, position, markPx: l.mark, feesUsd: 0, unpriced: false };
-  }
-
-  async #open(): Promise<ScriptLeg[]> {
-    const funding = new Map<VenueId, MarketFunding[]>();
-    for (const v of this.#o.venues) {
-      try {
-        funding.set(v.id, await v.funding());
-      } catch {
-        // a venue the recording does not answer yet is left out of the script
-      }
-    }
-    const baseOf = (r: MarketFunding) => r.base ?? r.symbol;
-    const priced = (venue: VenueId, base: string) => funding.get(venue)?.find((r) => baseOf(r) === base && (r.multiplier ?? 1) === 1 && r.markPx !== null && r.markPx > 0);
-    const venues = [...funding.keys()];
-    const pairs: [VenueId, VenueId][] = [];
-    if (venues.includes('hyperliquid') && venues.includes('phoenix')) pairs.push(['hyperliquid', 'phoenix']);
-    for (let i = 0; i < venues.length; i++) for (let j = i + 1; j < venues.length; j++) pairs.push([venues[i]!, venues[j]!]);
-    let pick: { a: MarketFunding; b: MarketFunding } | null = null;
-    for (const [x, y] of pairs) {
-      const bases = this.#o.base !== undefined ? [this.#o.base] : ['ETH', ...(funding.get(x) ?? []).map(baseOf)];
-      for (const base of bases) {
-        const a = priced(x, base);
-        const b = priced(y, base);
-        if (a !== undefined && b !== undefined) {
-          pick = { a, b };
-          break;
-        }
-      }
-      if (pick !== null) break;
-    }
-    if (pick === null) throw new Error('replay desk: no market the recording prices on two desk venues');
-    const strategy = this.#o.strategy();
-    const now = this.#o.clock.now();
-    // Long where funding is lower (a long pays a positive rate), short where it is higher: what the desk would hold.
-    const [long, short] = pick.a.ratePerHour <= pick.b.ratePerHour ? [pick.a, pick.b] : [pick.b, pick.a];
-    const units = strategy.legUsd / long.markPx!;
-    const legs: ScriptLeg[] = [];
-    for (const [row, sign] of [[long, 1], [short, -1]] as const) {
-      const venue = row.venue as VenueId;
-      const market = await this.#market(venue, row.symbol);
-      legs.push({
-        venue, symbol: row.symbol, size: sign * units, entryPx: row.markPx!, marginUsd: strategy.legUsd / strategy.maxLeverage,
-        m: market.m, lotSize: market.lot, fundingUsd: 0, mark: row.markPx!, rate: row.ratePerHour, at: now,
-      });
-    }
-    this.#o.onOpen?.(`replay desk (scripted positions, recorded prices): long ${units.toPrecision(4)} ${long.symbol} on ${long.venue} at ${long.markPx}, short on ${short.venue} at ${short.markPx}, ${strategy.legUsd} USD a leg at ${strategy.maxLeverage}x`);
-    return legs;
+    return { venue: l.venue, symbol: l.symbol, lotSize: l.lotSize, account, position, markPx: l.mark, feesUsd: -l.feeUsd, unpriced: false };
   }
 
   /** Maintenance fraction (1/(2 × max leverage), Hyperliquid's rule) and lot from the recorded market list, if any. */

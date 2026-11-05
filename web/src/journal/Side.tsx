@@ -15,7 +15,8 @@ export function Side({ entries, desk, windows }: { entries: readonly JournalEntr
   const a = attributionOf(desk?.pnl ?? null, entries);
   const counts = countsOf(entries);
   const note = desk ? sinceNote(desk, windows) : null;
-  const explorer = desk ? contractUrl(desk.contract, desk.mode) : null;
+  const replay = desk?.mode === 'replay';
+  const explorer = desk && !replay ? contractUrl(desk.contract, desk.mode) : null;
 
   return (
     <aside className="j-side" aria-label="Summary">
@@ -61,13 +62,15 @@ export function Side({ entries, desk, windows }: { entries: readonly JournalEntr
           <b>
             <Flash value={counts.signed} />
           </b>
-          <span>actions signed by the contract</span>
+          <span>{replay ? 'simulated actions, nothing signed or sent' : 'actions signed by the contract'}</span>
         </div>
-        <div>
-          {/* Gimbal holds no private key: the contract owns the accounts and asks the MPC network to sign (CLAUDE.md). */}
-          <b className="lvl">0</b>
-          <span>signed by a private key</span>
-        </div>
+        {replay ? null : (
+          <div>
+            {/* Gimbal holds no private key: the contract owns the accounts and asks the MPC network to sign (CLAUDE.md). */}
+            <b className="lvl">0</b>
+            <span>signed by a private key</span>
+          </div>
+        )}
         <div>
           <b>
             <Flash value={counts.refused} />
@@ -83,8 +86,12 @@ export function Side({ entries, desk, windows }: { entries: readonly JournalEntr
       </div>
 
       <div className="j-contract">
-        <p>Every row is an event the contract emitted on NEAR. Open any link to check it yourself.</p>
-        {desk ? (
+        {replay ? (
+          <p>A replay has no contract: every row is the engine’s own record, made on recorded mainnet prices. Nothing was signed or sent.</p>
+        ) : (
+          <p>Every row is an event the contract emitted on NEAR. Open any link to check it yourself.</p>
+        )}
+        {desk && !replay ? (
           <p>
             <span className="mono">
               {desk.contract} · {desk.deskId}

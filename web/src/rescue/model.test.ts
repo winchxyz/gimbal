@@ -16,12 +16,14 @@ import {
   feesText,
   movingOf,
   observe,
+  rescueLine,
   stepSeconds,
   stepStates,
   stepText,
   stressOutcome,
   stressView,
   timerSeconds,
+  triggerOf,
   txByStep,
   usualSeconds,
   type StepBook,
@@ -43,6 +45,8 @@ const progress = (step: RescueProgress['step'], elapsedS: number, extra: Partial
   tx: [],
   ...extra,
 });
+
+const OWN8 = rescueLine(8, null);
 
 const states = (step: RescueProgress['step'], failedAt: StepId | null = null) => STEPS.map((id) => stepStates(step, failedAt)[id]);
 
@@ -172,25 +176,25 @@ test('clock and duration text', () => {
 
 test('every step has a sentence, and the source never names a withdrawal from a venue the desk does not use', () => {
   const p = progress('sign', 5);
-  for (const id of STEPS) assert.ok(stepText(id, { p, leg: null, line: 8 }).length > 0);
-  assert.match(stepText('source', { p, leg: null, line: 8 }), /^Phoenix free margin pays/);
-  assert.match(stepText('source', { p: progress('sign', 5, { from: 'reserve' }), leg: null, line: 8 }), /^The reserve pays/);
-  assert.match(stepText('detect', { p, leg: null, line: 8 }), /8% rescue line/);
-  assert.match(stepText('quote', { p, leg: null, line: null }), /\$120\.00 to Hyperliquid margin/);
+  for (const id of STEPS) assert.ok(stepText(id, { p, leg: null, line: OWN8 }).length > 0);
+  assert.match(stepText('source', { p, leg: null, line: OWN8 }), /^Phoenix free margin pays/);
+  assert.match(stepText('source', { p: progress('sign', 5, { from: 'reserve' }), leg: null, line: OWN8 }), /^The reserve pays/);
+  assert.match(stepText('detect', { p, leg: null, line: OWN8 }), /8% rescue line/);
+  assert.match(stepText('quote', { p, leg: null, line: rescueLine(null, null) }), /\$120\.00 to Hyperliquid margin/);
 });
 
 test('the sign step names MPC only where MPC signs: a reserve rescue is the contract paying with fund_venue', () => {
   // Phoenix -> Hyperliquid (sol_sign_rescue) and Hyperliquid's routes are MPC-signed transactions.
-  assert.equal(stepText('sign', { p: progress('sign', 5), leg: null, line: 8 }), 'NEAR MPC signs the transfer');
-  assert.equal(stepText('sign', { p: progress('sign', 5, { from: 'hyperliquid', to: 'phoenix' }), leg: null, line: 8 }), 'NEAR MPC signs the transfer');
-  const reserve = stepText('sign', { p: progress('sign', 5, { from: 'reserve' }), leg: null, line: 8 });
+  assert.equal(stepText('sign', { p: progress('sign', 5), leg: null, line: OWN8 }), 'NEAR MPC signs the transfer');
+  assert.equal(stepText('sign', { p: progress('sign', 5, { from: 'hyperliquid', to: 'phoenix' }), leg: null, line: OWN8 }), 'NEAR MPC signs the transfer');
+  const reserve = stepText('sign', { p: progress('sign', 5, { from: 'reserve' }), leg: null, line: OWN8 });
   assert.equal(reserve, 'The contract pays the Intents deposit address from the reserve (fund_venue)');
   assert.doesNotMatch(reserve, /MPC|sign/i);
 });
 
 test('the quote row keeps what was quoted after landing, while the amount turns to what arrived', () => {
   const landed = progress('landed', 52, { amountUsd: 19.48, sentUsd: 20 });
-  assert.equal(stepText('quote', { p: landed, leg: null, line: 8 }), 'NEAR Intents: $20.00 to Hyperliquid margin');
+  assert.equal(stepText('quote', { p: landed, leg: null, line: OWN8 }), 'NEAR Intents: $20.00 to Hyperliquid margin');
   assert.equal(movingOf(landed, null).amount, '$19.48');
 });
 
@@ -212,10 +216,44 @@ test('a failure says why, how many tries and what the desk does next', () => {
 });
 
 test('the distance note compares with the owner\'s rescue line', () => {
-  assert.equal(distanceNote(7.9, 8), 'inside your 8% rescue line');
-  assert.equal(distanceNote(16.1, 8), 'clear of your 8% rescue line');
-  assert.equal(distanceNote(7.9, null), 'to liquidation');
-  assert.equal(distanceNote(null, 8), 'the venue gives no distance right now');
+  assert.equal(distanceNote(7.9, OWN8), 'inside your 8% rescue line');
+  assert.equal(distanceNote(16.1, OWN8), 'clear of your 8% rescue line');
+  assert.equal(distanceNote(7.9, rescueLine(null, null)), 'to liquidation');
+  assert.equal(distanceNote(null, OWN8), 'the venue gives no distance right now');
+});
+
+const trigger = (numbers: JournalEntry['numbers'], t = T0): JournalEntry => ({ id: `j-${t}`, t, kind: 'rescue', summary: 'health rescue', numbers, tx: [] });
+
+test('a stress test\'s raised line is named with the owner\'s, so the detect step and the distance agree', () => {
+  const journal = [
+    trigger({ venue: 'hyperliquid', distancePct: 80.4, rescuePct: 85.4, watchPct: 92.4, amountUsd: 1.4, from: 'reserve', stress: 1 }, T0 - 700),
+    trigger({ venue: 'hyperliquid', distancePct: 6, rescuePct: 8, watchPct: 15, amountUsd: 30, from: 'reserve' }, T0 - 60_000),
+  ];
+  const facts = triggerOf(journal, { startedAt: T0 });
+  assert.deepEqual(facts, { t: T0 - 700, rescuePct: 85.4, stress: true, needUsd: 1.4 });
+  assert.equal(triggerOf(journal, { startedAt: T0 - 701 })?.t, T0 - 60_000);
+  assert.equal(triggerOf(journal, { startedAt: T0 + 61_000 }), null);
+  const line = rescueLine(8, facts);
+  assert.equal(line.pct, 85.4);
+  const p = progress('detect', 0);
+  assert.equal(stepText('detect', { p, leg: null, line }), 'A leg on Hyperliquid came inside your 8% rescue line, raised to 85.4% by the stress test');
+  assert.equal(distanceNote(80.4, line), 'inside the 85.4% stress-test line');
+  assert.equal(distanceNote(96.2, line), 'clear of the 85.4% stress-test line');
+  // A trigger at the owner's own line changes nothing; a higher one without a stress test is the volatility term.
+  assert.deepEqual(rescueLine(8, { t: T0, rescuePct: 8, stress: false, needUsd: 30 }), OWN8);
+  assert.match(rescueLine(8, { t: T0, rescuePct: 11.5, stress: false, needUsd: 30 }).text, /raised to 11\.5% for the venue’s volatility$/);
+});
+
+test('a transfer that is not what the leg needed says why', () => {
+  const sent = progress('sign', 5, { from: 'reserve', amountUsd: 20, sentUsd: 20 });
+  assert.match(movingOf(sent, null, 1.4, 'replay').text, /The leg needs \$1\.40; the recorded mainnet quote this replay plays moves a fixed \$20\.00\.$/);
+  assert.match(movingOf(sent, null, 1.4, 'testnet').text, /this test plays moves a fixed \$20\.00\.$/);
+  assert.match(movingOf(sent, null, 112, 'mainnet').text, /The leg needs \$112\.00; the rescue cap and the source’s free margin limit this transfer to \$20\.00\.$/);
+  // The same amount, or no trigger at hand: the route alone.
+  assert.equal(movingOf(sent, null, 20, 'replay').text, 'Reserve → Hyperliquid margin, through NEAR Intents');
+  assert.equal(movingOf(sent, null, null, 'replay').text, 'Reserve → Hyperliquid margin, through NEAR Intents');
+  // At detect the amount is the need itself.
+  assert.equal(movingOf(progress('detect', 0, { amountUsd: 1.4 }), null, 1.4, 'replay').amount, '$1.40');
 });
 
 // ---------- transactions ----------

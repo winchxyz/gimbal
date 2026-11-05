@@ -8,8 +8,10 @@
 // The engine plays the newest recording in engine/fixtures/replay/ (about an hour of real mainnet venue answers)
 // through the real scanner, strategy loop and risk engine. Nothing is signed or sent: replay has no contract client,
 // and every GIMBAL_* / NEAR_* / venue / key variable of the calling shell is dropped, so a mainnet environment cannot
-// leak into the demo. The strategy loop runs (GIMBAL_TRADE=1) but replay has no hands: what it would do is journaled
-// as refused. The engine's state lives in a fresh temp folder, removed on exit, so every run starts the same and the
+// leak into the demo. The strategy loop runs (GIMBAL_TRADE=1) on a simulated replay desk (40 USD deposited, 10 USD on
+// Hyperliquid and on Phoenix, fills at the recorded best bid / ask): a short script plays the owner's demo entry and
+// close, so the recorded hour shows the whole loop (window, checks, both legs, hourly funding, exit, realized PnL).
+// The engine's state lives in a fresh temp folder, removed on exit, so every run starts the same and the
 // user's own state/ is never touched. The rules are set to legs of 12 USD with auto on, the size the final policy
 // (max 20 USD an order) lets through; the engine's default of 1000 USD would be refused E_SIZE everywhere.
 // Plain node and the repo's own node_modules only; no shell, so it runs the same on Windows and Linux.
@@ -69,19 +71,28 @@ function fail(msg) {
   stop(1);
 }
 
-// Kills both children (the signal is sent synchronously) and exits; never returns.
+const STOP_WAIT_MS = 3000;
+
+// Kills both children, waits (up to 3 s) for them to exit so the engine lets go of its state files, removes the temp
+// state folder and exits. A second call while stopping does nothing.
 function stop(code) {
+  if (stopping) return;
   stopping = true;
-  for (const c of children) if (c.exitCode === null) c.kill();
-  if (stateDir !== null) {
-    // The engine may still hold a file for a moment after the kill; a leftover temp folder is harmless.
-    try { rmSync(stateDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch {}
-  }
-  process.exit(code);
+  const alive = children.filter((c) => c.exitCode === null && c.signalCode === null);
+  for (const c of alive) c.kill();
+  const done = () => {
+    if (stateDir !== null) {
+      try { rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch {}
+    }
+    process.exit(code);
+  };
+  if (alive.length === 0) done();
+  const exited = alive.map((c) => new Promise((r) => c.once('exit', r)));
+  Promise.race([Promise.all(exited), new Promise((r) => setTimeout(r, STOP_WAIT_MS))]).then(done);
 }
 
-process.on('SIGINT', () => stop(0));
-process.on('SIGTERM', () => stop(0));
+// Ctrl+C, a kill, a closed terminal (SIGHUP) and Ctrl+Break on Windows (SIGBREAK) all clean up the same way.
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK']) process.on(sig, () => stop(0));
 
 // A package's folder as seen from `from` (a workspace may have its own copy, else the hoisted one). Not through
 // require.resolve of a bin path: packages like typescript do not export their bin files.
@@ -178,8 +189,8 @@ const put = await fetch(`http://127.0.0.1:${enginePort}/strategy`, {
   headers: { 'content-type': 'application/json' },
   body: JSON.stringify(DEMO_STRATEGY),
 }).catch((err) => ({ ok: false, status: 0, text: async () => String(err) }));
-if (!put.ok) fail(`PUT /strategy failed (${put.status}): ${(await put.text()).slice(0, 300)}`);
-console.log(`demo: engine rules set: legs ${DEMO_STRATEGY.legUsd} USD at up to ${DEMO_STRATEGY.maxLeverage}x, enter above ${DEMO_STRATEGY.minNetAprPct} % net APR, auto on`);
+if (!put.ok && !stopping) fail(`PUT /strategy failed (${put.status}): ${(await put.text()).slice(0, 300)}`);
+if (!stopping) console.log(`demo: engine rules set: legs ${DEMO_STRATEGY.legUsd} USD at up to ${DEMO_STRATEGY.maxLeverage}x, enter above ${DEMO_STRATEGY.minNetAprPct} % net APR, auto on`);
 await waitFor('web', `http://localhost:${WEB_PORT}/`);
 if (!stopping) {
   console.log('');

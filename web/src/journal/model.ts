@@ -60,7 +60,19 @@ export function visibleFeed(entries: readonly JournalEntry[], frozen: ReadonlySe
  * (design/HANDOFF.md: day totals are P&L only, transfers of principal are excluded).
  */
 export function pnlOf(entry: JournalEntry): number {
-  return KINDS[entry.kind].principal ? (feeUsd(entry) ?? 0) : (amountUsd(entry) ?? 0);
+  if (KINDS[entry.kind].principal) return feeUsd(entry) ?? 0;
+  if (entry.kind === 'rescue') return rescueCostUsd(entry);
+  return amountUsd(entry) ?? 0;
+}
+
+/**
+ * A rescue's cost: its `usd`; the engine's own rescue lines carry `usd: 0` and the transfer's fee in `feeUsd`, on the
+ * line that sent it and again on the one that says it landed, so that fee is counted once, on the landed line.
+ */
+export function rescueCostUsd(entry: JournalEntry): number {
+  const usd = amountUsd(entry) ?? 0;
+  if (usd !== 0 || numberOf(entry, 'landedS') === null) return usd;
+  return feeUsd(entry) ?? 0;
 }
 
 // ---------- days ----------
@@ -266,20 +278,30 @@ export interface Attribution {
 /**
  * Where the money went since the start. Funding, fees and price come from the desk's own P&L (`DeskState.pnl`);
  * what the journal adds is the cost of moving money: rescues, app fees and transfer fees. Null until a desk arrives.
+ * The desk's P&L covers the legs it holds; a close that carries its realized split (`realizedFundingUsd`,
+ * `realizedFeesUsd`, `realizedPriceUsd`: the replay desk's closes do) adds the pair it closed, so the net still agrees
+ * with the day totals once the desk is flat.
  */
 export function attributionOf(pnl: DeskState['pnl'] | null, entries: readonly JournalEntry[]): Attribution {
   let otherUsd = 0;
+  const realized = { fundingUsd: 0, feesUsd: 0, priceUsd: 0 };
   for (const e of entries) {
     const info = KINDS[e.kind];
     if (info.principal) otherUsd += feeUsd(e) ?? 0;
-    else if (e.kind === 'rescue' || e.kind === 'fee') otherUsd += amountUsd(e) ?? 0;
+    else if (e.kind === 'rescue') otherUsd += rescueCostUsd(e);
+    else if (e.kind === 'fee') otherUsd += amountUsd(e) ?? 0;
+    else if (e.kind === 'exit') {
+      realized.fundingUsd += numberOf(e, 'realizedFundingUsd') ?? 0;
+      realized.feesUsd += numberOf(e, 'realizedFeesUsd') ?? 0;
+      realized.priceUsd += numberOf(e, 'realizedPriceUsd') ?? 0;
+    }
   }
   return {
-    fundingUsd: pnl ? pnl.fundingUsd : null,
-    feesUsd: pnl ? pnl.feesUsd : null,
-    basisUsd: pnl ? pnl.priceUsd : null,
+    fundingUsd: pnl ? pnl.fundingUsd + realized.fundingUsd : null,
+    feesUsd: pnl ? pnl.feesUsd + realized.feesUsd : null,
+    basisUsd: pnl ? pnl.priceUsd + realized.priceUsd : null,
     otherUsd,
-    netUsd: pnl ? pnl.netUsd + otherUsd : null,
+    netUsd: pnl ? pnl.netUsd + realized.fundingUsd + realized.feesUsd + realized.priceUsd + otherUsd : null,
   };
 }
 
@@ -294,8 +316,12 @@ export function sinceNote(desk: DeskState, windows: readonly FundingWindow[] | n
   return `The ${symbol} window paid its entry costs up front; they are not earned back yet.`;
 }
 
-/** The headline's count: "23 actions signed", "1 action signed". */
-export const actionsText = (n: number): string => `${n.toLocaleString('en-US')} ${n === 1 ? 'action' : 'actions'} signed`;
+/**
+ * The headline's count: "23 actions signed", "1 action signed". A replay has no contract and signs nothing: its
+ * actions are the engine's own, simulated on recorded prices ("2 simulated actions").
+ */
+export const actionsText = (n: number, replay = false): string =>
+  `${n.toLocaleString('en-US')} ${replay ? 'simulated ' : ''}${n === 1 ? 'action' : 'actions'}${replay ? '' : ' signed'}`;
 
 /** Fees, basis and transfers in one figure, for the phone's summary. */
 export const costsUsd = (a: Attribution): number | null => (a.feesUsd === null || a.basisUsd === null ? null : a.feesUsd + a.basisUsd + a.otherUsd);

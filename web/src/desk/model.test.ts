@@ -7,6 +7,8 @@ import {
   distanceText,
   exposureOf,
   hoursLeftText,
+  LATEST_TEXT_MAX,
+  lastClose,
   latestEvents,
   legNotional,
   legRows,
@@ -18,6 +20,7 @@ import {
   placeLegs,
   pnlRows,
   sizeText,
+  splitSummary,
   dayRate,
   thresholdText,
   valueGaps,
@@ -228,6 +231,30 @@ test('an event links to its proof, or to the reason, and an unprotected order ke
   assert.equal(plain?.unprotected, null);
   assert.equal(unprotectedText(entry({ numbers: { unpriced: 'true' } })), 'Sent without price protection');
   assert.equal(unprotectedText(entry({ numbers: { unpriced: 0 } })), null);
+});
+
+test('a long line shows its head, the rest behind a control; a short one stays whole', () => {
+  const tees = 'gpu 0xabc mrtd 1234 rtmr3 5678 compose 9abc; '.repeat(6);
+  const head = 'NEAR AI attestation of Qwen/Qwen3-VL-30B-A3B-Instruct (recorded 2026-11-04T04:55:11.490Z)';
+  const long = `${head}: verified TDX quote; ${tees}`;
+  const [row] = latestEvents([entry({ summary: long })], NOW);
+  assert.equal(row?.text, head);
+  assert.equal(row?.detail, long.slice(head.length + 2));
+  // A short label before the first colon is not cut off on its own.
+  const script = splitSummary(`replay script: the window before was not entered (its line says why); the next one: ${'x '.repeat(60)}`);
+  assert.equal(script.text, 'replay script: the window before was not entered (its line says why)');
+  assert.deepEqual(splitSummary('Opened DOGE'), { text: 'Opened DOGE', detail: null });
+  // No ": " or "; " before the limit: cut at the last space.
+  const words = 'word '.repeat(40).trim();
+  const cut = splitSummary(words);
+  assert.ok(cut.text.length <= LATEST_TEXT_MAX && cut.detail !== null && `${cut.text} ${cut.detail}` === words);
+});
+
+test('the flat desk names the pair it closed last and its realized net', () => {
+  const t = Date.UTC(2026, 9, 27, 17, 5);
+  const journal = [entry({ kind: 'wait' }), entry({ kind: 'exit', t, numbers: { usd: -0.02, realizedNetUsd: -0.026 } }), entry({ kind: 'enter' })];
+  assert.deepEqual(lastClose(journal, NOW), { when: 'Today 17:05', netUsd: -0.026 });
+  assert.equal(lastClose([entry({ kind: 'exit', numbers: { usd: 1 } })], NOW), null);
 });
 
 test('the next best window: the best open one that is not held, against the held one, with the rotation rule', () => {
