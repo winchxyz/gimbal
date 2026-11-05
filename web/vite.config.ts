@@ -11,6 +11,8 @@ import { findRefusalTests, readContractSources } from './src/security/scan.ts';
 // The engine answers only its own dashboard: it refuses a Host that is not this machine and an Origin other than
 // localhost:5190, and takes JSON bodies only. `changeOrigin` rewrites Host to the engine's, which it accepts; Origin
 // is left as the browser sent it (http://localhost:5190), which it also accepts. Open the page on localhost or 127.0.0.1.
+// A dashboard on another port (`vite --port <n>`) needs the engine started with `--web-port <n>`; `npm run demo --
+// --web-port <n>` sets both.
 const engine = process.env.GIMBAL_ENGINE_URL ?? `http://localhost:${process.env.ENGINE_PORT ?? '8790'}`;
 const engineRoutes = [
   '/events',

@@ -32,7 +32,7 @@ except the designer.
 npm run ci                       # everything below, in order; one line when green, else the failing step's tail
 npm install                      # root workspaces, in order: shared, engine, web, tools
 npm run build                    # shared first: engine and web import its dist/
-npm run demo                     # replay: engine + web on :5190, no keys, temp state; prints the URL when both answer
+npm run demo                     # replay: engine + web on :5190 (-- --web-port <n> / --engine-port <n>), no keys, temp state
 npm test                         # all workspaces; run npm run build first; the output must say "tests N" with N > 0
 npm run typecheck
 cd contract && cargo fmt --all --check

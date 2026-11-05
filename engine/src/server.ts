@@ -49,8 +49,13 @@ export function isLoopback(host: string): boolean {
   return h === 'localhost' || h === '::1' || /^127(\.\d{1,3}){3}$/.test(h) || /^::ffff:127(\.\d{1,3}){3}$/.test(h);
 }
 export const DEFAULT_ENGINE_HOST = '127.0.0.1';
-/** The dashboard's origins: Vite dev and preview both serve it on port 5190 (web/vite.config.ts). */
-export const DEFAULT_WEB_ORIGINS: readonly string[] = ['http://localhost:5190', 'http://127.0.0.1:5190', 'http://[::1]:5190'];
+/** The dashboard's port: Vite dev and preview both serve it on 5190 (web/vite.config.ts) unless told otherwise. */
+export const DEFAULT_WEB_PORT = 5190;
+/** The origins a browser sends for a dashboard served on this machine at `port`. */
+export function webOrigins(port: number): readonly string[] {
+  return [`http://localhost:${port}`, `http://127.0.0.1:${port}`, `http://[::1]:${port}`];
+}
+export const DEFAULT_WEB_ORIGINS: readonly string[] = webOrigins(DEFAULT_WEB_PORT);
 /** Names a Host header may carry for this machine, with or without a port. */
 const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
 /** Journal entries per page: GET /state's newest and each GET /journal?before= page. */

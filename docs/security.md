@@ -143,9 +143,19 @@ built. Accepted because the gap is on 1Click's side; the contract keeps `hl_send
 
 ### Oversized Phoenix answers (zod < 4.6.6)
 
-The Phoenix SDK validates every API answer with zod 4.4.3, so a huge malformed array from Phoenix's API could exhaust
-the engine's memory and stop it (no signing, funds or policy affected; rescues wait for the restart). Fixed by
-`@ellipsis-labs/rise` 0.6.8, which we take after the hackathon demo.
+The Phoenix SDK validates every API answer with zod 4.4.3, which it pins exactly; `engine/package.json` pins the same
+version to match it (the desk's MCP server, `engine/src/mcp/server.ts`, uses it too). A huge malformed array from
+Phoenix's API could exhaust the engine's memory and stop it (no signing, funds or policy affected; rescues wait for the
+restart). Fixed by `@ellipsis-labs/rise` ≥ 0.6.7 plus zod ≥ 4.6.6 in the engine, which we take after the hackathon
+demo.
+
+### Unpriced symbols
+
+ZRO, ETHFI and AAVE trade on Hyperliquid and Orderly under `policy.unpriced` since 2026-11-05 (the owner's
+`set_policy`). They have no oracle price, so their orders skip the price band; each order is bounded instead by the
+symbol's `max_sz` and by `unpriced_max_notional_usd` (20 USD on the mainnet desk), and the hourly notional meter counts
+it at no less than its share of that cap (docs/interfaces.md §1.2). Only the owner can add a symbol there. Accepted
+because each order is capped in size and in USD, and the dashboard shows such symbols as "no price protection".
 
 ## Other bounded residuals
 
