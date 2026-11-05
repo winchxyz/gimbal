@@ -21,9 +21,10 @@
 // - flat: after an exit, nothing for cooldownHours; then the top of the scanner's ranked list among the windows that
 //   pass the entry rules now: once it has passed them for enterAfterChecks hourly checks in a row, enter it, sized by
 //   sizeFor; until then, or if it cannot be sized, wait. A lower window is never entered in its place.
-// No model picks the window, the size or the leverage: the NEAR AI veto (veto.ts) can only drop a window. A vetoed
-// window is held out for LOOP_RULES.vetoHoldHours (skipAct with { vetoed: true }), so the veto is not asked again
-// until it passes.
+// No model picks the window, the size or the leverage: the NEAR AI risk check (veto.ts) can only drop a window. A
+// refused window is held out for LOOP_RULES.vetoHoldHours (skipAct with { vetoed: true }), so it is not asked again
+// until that passes. A check that did not answer holds the act without that hold-out (plain skipAct): the window keeps
+// its counts and is asked again at the next hourly check.
 //
 // Counters move only on hourly checks (one after each funding payment): a 5 s scan event can act on counts already
 // reached, never add to them. The counters a Decision returns assume its `act` is carried out; when the veto refuses
@@ -53,7 +54,9 @@ export const LOOP_RULES = {
   cooldownHours: 6,           // after an exit, no new entry for this long
   maxHoldDays: 14,            // time stop
   maxRotationsPerDay: 2,
-  vetoTimeoutMs: 5_000,       // NEAR AI veto: no answer in time = pass, journaled as "no NEAR AI risk check"
+  vetoTimeoutMs: 15_000,      // NEAR AI risk check: each ask waits this long for an answer
+  vetoAttempts: 2,            // asks in all on a timeout or a transport/HTTP error; still none = held, never passed:
+                              // the act waits for the next hourly check, with no vetoHoldHours hold-out
   vetoHoldHours: 6,           // a window NEAR AI risk check refused is not entered or rotated into for this long
 } as const;
 
@@ -327,7 +330,7 @@ export function heldForwardAprPct(w: FundingWindow): number {
 }
 
 /** Whether a stop can be judged: the time stop needs a finite `since`; the drawdown stop needs these. */
-function drawdownKnown(held: HeldPair, stop: number | null): stop is number {
+function drawdownKnown(held: Pick<HeldPair, 'pnlUsd' | 'legUsd'>, stop: number | null): stop is number {
   return stop !== null && finite(stop) && finite(held.pnlUsd) && finite(held.legUsd) && held.legUsd > 0;
 }
 
@@ -481,24 +484,30 @@ export function decide(input: DecideInput): Decision {
 
 type Out = (action: StrategyDecision['action'], reason: string, windowId: string | null, act?: Decision['act'], waitKey?: string | null) => Decision;
 
+/**
+ * The held pair's stops, which act at once whatever the counts: the drawdown stop (the pair's P&L against one leg)
+ * and the maxHoldDays time stop (needs only a finite `since`). The exit's reason, or null. Pure: the loop also asks
+ * it while an act's NEAR AI risk check is pending, so a stop never waits for that check.
+ */
+export function stopDue(held: Pick<HeldPair, 'symbol' | 'since' | 'legUsd' | 'pnlUsd'>, strategy: Pick<StrategyConfig, 'stopDrawdownPct'>, now: number): string | null {
+  const stop = strategy.stopDrawdownPct;
+  if (drawdownKnown(held, stop)) {
+    const downPct = (-held.pnlUsd / held.legUsd) * 100;
+    if (held.pnlUsd < 0 && downPct >= stop) return `Exit ${held.symbol}: down ${usd(-held.pnlUsd)}, ${downPct.toFixed(1)} % of the ${usd(held.legUsd)} leg, at your ${minimum(stop)} stop`;
+  }
+  const heldHours = (now - held.since) / HOUR_MS;
+  if (finite(held.since) && heldHours >= LOOP_RULES.maxHoldDays * 24) return `Exit ${held.symbol}: held ${(heldHours / 24).toFixed(1)} days, the ${LOOP_RULES.maxHoldDays}-day time stop`;
+  return null;
+}
+
 function decideHeld(input: DecideInput, held: HeldPair, heldW: FundingWindow | null, counters: LoopCounters, out: Out): Decision {
   const { strategy, now } = input;
   const heldHours = (now - held.since) / HOUR_MS;
 
   // The stops first, at once, whatever the counts: each needs only its own numbers, so nothing else that is unknown
-  // (a scan number, the minimum) keeps a losing or overdue pair open. Drawdown: the pair's P&L against one leg.
-  const stop = strategy.stopDrawdownPct;
-  if (drawdownKnown(held, stop)) {
-    const downPct = (-held.pnlUsd / held.legUsd) * 100;
-    if (held.pnlUsd < 0 && downPct >= stop) {
-      const reason = `Exit ${held.symbol}: down ${usd(-held.pnlUsd)}, ${downPct.toFixed(1)} % of the ${usd(held.legUsd)} leg, at your ${minimum(stop)} stop`;
-      return out('exit', reason, held.windowId, { kind: 'exit', reason });
-    }
-  }
-  if (finite(held.since) && heldHours >= LOOP_RULES.maxHoldDays * 24) {
-    const reason = `Exit ${held.symbol}: held ${(heldHours / 24).toFixed(1)} days, the ${LOOP_RULES.maxHoldDays}-day time stop`;
-    return out('exit', reason, held.windowId, { kind: 'exit', reason });
-  }
+  // (a scan number, the minimum) keeps a losing or overdue pair open.
+  const stopped = stopDue(held, strategy, now);
+  if (stopped !== null) return out('exit', stopped, held.windowId, { kind: 'exit', reason: stopped });
 
   // Past the stops, nothing is decided on a number that is not one: no compression, no rotation, no "healthy".
   const unknown = heldUnknown(held, heldW !== null && !heldW.stale ? heldW : null, input);

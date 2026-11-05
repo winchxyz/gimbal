@@ -49,7 +49,11 @@ export interface RiskCheckRecord {
   windowId: string;
   symbol: string;
   outcome: RiskCheckOutcome;
-  /** refused: the window was dropped; passed: a readable pass; unchecked: no answer, the window passed unchecked. */
+  /**
+   * refused: the window was dropped; passed: a readable pass; unchecked: no readable answer (no key, a timeout, NEAR AI
+   * down): the act was held, nothing opened. In replay only, a prompt with no recorded reply passes and is booked
+   * unchecked too; a ledger written before the check failed closed may hold unchecked checks whose act opened.
+   */
   verdict: 'passed' | 'refused' | 'unchecked';
   reason: string;
   /** The why line the decision carried. */
@@ -81,7 +85,7 @@ export interface RiskHoursRecord {
   points: { t: number; grossAprPct: number }[];
 }
 
-/** How the act after a pass (or an unchecked pass) ended. */
+/** How the act after a check that was not a refusal ended (a pass, a held check, a replay-only pass). */
 export interface RiskActRecord {
   v: 1;
   type: 'act';

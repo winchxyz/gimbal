@@ -42,7 +42,7 @@ test('every kind the mockup shows is there, with its reason, steps, flag and lin
   assert.equal(rowOf(by('fake-latest-funding')).amount?.text, '+$0.03');
   const counts = filterCounts(entries);
   assert.deepEqual(counts, { all: 20, trades: 3, funding: 12, money: 2, rescue: 1, refused: 2 });
-  assert.deepEqual(countsOf(entries), { signed: 6, refused: 1, vetoed: 1 });
+  assert.deepEqual(countsOf(entries), { signed: 6, refused: 1, vetoed: 1, held: 0 });
 });
 
 test('funding adds up to what the fake desk reports as funding received', () => {

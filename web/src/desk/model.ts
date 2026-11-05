@@ -241,10 +241,14 @@ export const LATEST_TEXT_MAX = 160;
 const HEAD_MIN = 40;
 
 /**
- * Labels a head never hides: an owner demo entry's waived profit checks, and a demo pair that pays funding ("not a
- * profit"). A summary that carries one is cut only after it, however long its head gets.
+ * Labels a head never hides: an owner demo entry's waived profit checks, a demo pair that pays funding ("not a
+ * profit"), an act the NEAR AI risk check held for want of an answer, and a pass that only replay gives (a prompt
+ * with no recorded reply). A summary that carries one is cut only after it, however long its head gets.
  */
-const KEEP_IN_HEAD = [/owner demo entry: the profit checks are waived/, /the demo shows the cycle, not a profit/];
+const KEEP_IN_HEAD = [
+  /owner demo entry: the profit checks are waived/, /the demo shows the cycle, not a profit/,
+  /held, not passed: the act waits/, /passed in replay only; live, the entry would wait/,
+];
 
 /**
  * A long summary as a head and the rest: the head runs to the first `: ` or `; ` past the first few words (where the

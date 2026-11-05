@@ -20,7 +20,14 @@
 // flat and the journal says so. Before an enter or a rotate the window goes to the NEAR AI risk check (veto.ts
 // checkVeto), with the facts serve adds (riskFacts: book depth at the size, the 24 h move, the listing age); a refusal
 // saves skipAct(…, { vetoed: true, why }), whose counters hold the window out (vetoedUntil, vetoWhy), writes a `veto`
-// entry and signs nothing; the verdict is shown on the window (Window.veto, republished). Every check is booked in the
+// entry and signs nothing; the verdict is shown on the window (Window.veto, republished). A check with no readable
+// verdict (no answer after LOOP_RULES.vetoAttempts tries, no key, the key rejected) holds the act: journaled `refused`
+// ("the NEAR AI risk check did not answer ... held, not passed"), nothing closed or sent, no hold-out (it is not a
+// refusal), and the act is not tried again before the next hourly check; until then the decision is published as a
+// wait with that line (with no key, every enter and rotate decision is). Only enters and rotates are checked: exits,
+// stops, the one-leg close and POST /close never ask NEAR AI, and none waits for a pending check: POST /close, a
+// drawdown or time stop that comes due, and stop() cancel an act whose check is pending (#pending), with nothing
+// sent; each attempt's call is aborted at its timeout. Every check is booked in the
 // risk check ledger (book/risk-ledger.ts), and the decision, the act's journal entry and any refusal after it carry
 // its why line (riskCheckWhy, with the attestation label); a refusal before it says RISK_NOT_ASKED. An act refused before anything was
 // sent is journaled and not tried again for RETRY_AFTER_MS; one that sent orders, or was refused for a passing reason
@@ -50,7 +57,8 @@
 // DEMO_MAX_LOSS_USD, and the window's round trip in USD (the one its checks print, WindowFacts.roundTripUsd) at most
 // maxLossUsd, else refused with the number; funding during the hold is expected positive and is not part of the bound;
 // the trader's open holds its own round trip to it again (carry-plan.ts). The risk check is asked as for any manual act, told it is a
-// demonstration entry with the profit checks waived and the cost accepted. A held demo pair is decided on as any held
+// demonstration entry with the profit checks waived and the cost accepted; it is never waived: a refusal refuses it and
+// no readable answer holds it, as any entry. A held demo pair is decided on as any held
 // pair: under the demo rules (a 1000 % minimum, exit after 24 checks) its counted exit comes on the 24th hourly check
 // in a row; the stops, the one-leg close and POST /close at any time.
 //
@@ -66,9 +74,9 @@ import { DEMO_MAX_LOSS_USD, money } from '../scanner/carry.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { Clock } from '../venues/venue.ts';
 import type { CheckRules, DecideInput, Decision, HeldPair, LoopCounters } from './decide.ts';
-import { LOOP_RULES, NO_COUNTERS, decide as defaultDecide, heldForwardAprPct, journalWait, sizeFor, skipAct } from './decide.ts';
+import { LOOP_RULES, NO_COUNTERS, decide as defaultDecide, heldForwardAprPct, journalWait, sizeFor, skipAct, stopDue } from './decide.ts';
 import type { Veto, VetoLegFacts, VetoResult, VetoSource } from './veto.ts';
-import { checkVeto, replyText, riskCheckWhy, vetoFacts, vetoJournalNumbers } from './veto.ts';
+import { NO_KEY_WHY, checkVeto, replyText, riskCheckWhy, vetoFacts, vetoJournalNumbers } from './veto.ts';
 import type { RiskLedgerSink } from '../book/risk-ledger.ts';
 import { roundTripUsd } from '../book/risk-ledger.ts';
 import { positionIdOf } from '../book/derive.ts';
@@ -139,7 +147,7 @@ export const RISK_NOT_ASKED = 'NEAR AI risk check: not asked (refused before it)
 export const LEDGER_RETRY_MS = 3_600_000;
 export const LEDGER_HOLD_HOURS = Math.min(DEFAULT_SCANNER_CONFIG.costs.holdHours, LOOP_RULES.maxHoldDays * 24);
 
-/** No NEAR AI here: checkVeto answers "no NEAR AI risk check: NEAR_AI_API_KEY is not set", a pass. */
+/** No NEAR AI here: checkVeto answers "NEAR_AI_API_KEY is not set", and every enter and rotate is held, never passed. */
 export const NO_VETO_SOURCE: VetoSource = {
   model: 'none', configured: false,
   complete: async () => {
@@ -547,7 +555,11 @@ type Task = () => Promise<void>;
  * running, a close in flight): tried again on the next check.
  */
 interface ActEnd {
-  end: 'done' | 'skipped' | 'vetoed' | 'flat';
+  /**
+   * `held`: the NEAR AI risk check gave no readable verdict (no answer, no key, the key rejected), nothing was closed
+   * or sent; the act waits for the next hourly check, with no LOOP_RULES.vetoHoldHours hold-out.
+   */
+  end: 'done' | 'skipped' | 'vetoed' | 'held' | 'flat';
   sent: boolean;
   passing: boolean;
   /** The NEAR AI risk check's why line: on every outcome after it was asked (a refusal keeps it with the hold-out). */
@@ -559,8 +571,27 @@ interface ActEnd {
   paidRefusal?: string;
   /** The open was refused for its cost (ActOutcome.costRefused), nothing sent: why. */
   costRefused?: string;
+  /** `held`: the line journaled, which the decision shows until the next hourly check (#shownDecision). */
+  heldLine?: string;
 }
 const SKIPPED: ActEnd = { end: 'skipped', sent: false, passing: false };
+
+/** A risk check asked for an act: the result, its why line and journal numbers, and its booking in the ledger. */
+interface VetoAsked {
+  result: VetoResult;
+  why: string;
+  numbers: Record<string, number | string>;
+  checkId: string | null;
+  fresh: boolean;
+}
+
+/** Resolves null once `signal` aborts (at once when it already has). */
+function untilAborted(signal: AbortSignal): Promise<null> {
+  return new Promise((resolve) => {
+    if (signal.aborted) resolve(null);
+    else signal.addEventListener('abort', () => resolve(null), { once: true });
+  });
+}
 
 export class StrategyLoop {
   readonly #o: StrategyLoopOptions;
@@ -571,8 +602,15 @@ export class StrategyLoop {
   #checkQueued = false;
   /** An act (or a manual rotate or close) runs. */
   #acting: string | null = null;
-  /** A manual rotate or close was accepted and has not ended: auto acts wait for it. */
+  /** A manual rotate was accepted and has not ended: auto acts wait for it. */
   #manual: string | null = null;
+  /** A POST /close was accepted and has not ended: auto acts wait for it, and an enter or rotate not yet past its risk check is cancelled. */
+  #closing = false;
+  /**
+   * The enter or rotate whose NEAR AI risk check is being asked (nothing sent yet). A POST /close, a stop that came due
+   * (decide.ts stopDue) or serve stopping aborts it (`why`), so none of them waits for the check.
+   */
+  #pending: { kind: 'enter' | 'rotate'; cancel: AbortController; why: string | null } | null = null;
   #stopped = false;
   #seq = 0;
   /** Window id -> NEAR AI's last verdict, shown on the window until `until` (display only: the hold is vetoedUntil). */
@@ -580,8 +618,11 @@ export class StrategyLoop {
   /** Window id -> its last booked risk check (for a retry of the same act: not booked again). */
   #checkSeq = 0;
   readonly #lastChecks = new Map<string, { id: string; kind: 'enter' | 'rotate'; by: 'auto' | 'manual'; demo: boolean; verdict: string; at: number; opened: boolean }>();
-  /** `kind window` -> until when an act refused with nothing sent is not tried again, and the line journaled. */
-  readonly #refused = new Map<string, { until: number; reason: string }>();
+  /**
+   * `kind window` -> until when an act refused with nothing sent is not tried again, and the line journaled. `held`:
+   * held by a risk check with no readable verdict; the decision says so until `until` (#shownDecision).
+   */
+  readonly #refused = new Map<string, { until: number; reason: string; held?: boolean }>();
   /** Window id -> until when (the next hourly check) its open stays refused for cost, and the trader's why. */
   readonly #costRefused = new Map<string, { until: number; reason: string }>();
   #lastSkip: string | null = null;
@@ -642,14 +683,18 @@ export class StrategyLoop {
   startLine(): string {
     const counts = checkRulesOf(this.#o.strategy());
     const rules = `enter after ${counts.enterAfterChecks} hourly checks in a row, exit after ${counts.exitAfterChecks} (owner settings), cooldown ${LOOP_RULES.cooldownHours} h, time stop ${LOOP_RULES.maxHoldDays} d, at most ${LOOP_RULES.maxRotationsPerDay} rotations a day, a NEAR AI risk check refusal holds ${LOOP_RULES.vetoHoldHours} h`;
-    const veto = this.#o.veto?.configured === true ? `NEAR AI risk check ${this.#o.veto.model} (${(this.#o.vetoTimeoutMs ?? LOOP_RULES.vetoTimeoutMs) / 1000} s)` : 'no NEAR AI risk check (NEAR_AI_API_KEY is not set: every window passes)';
+    const veto = this.#o.veto?.configured === true
+      ? `NEAR AI risk check ${this.#o.veto.model} (${(this.#o.vetoTimeoutMs ?? LOOP_RULES.vetoTimeoutMs) / 1000} s, asked ${LOOP_RULES.vetoAttempts} times at most; no readable answer holds the enter or rotate until the next hourly check${this.#o.veto.replayPassUnrecorded === true ? '; replay only: a prompt with no recorded reply passes, labelled so' : ''})`
+      : 'WARNING: no NEAR AI risk check (NEAR_AI_API_KEY is not set): no enter or rotate can pass until a working NEAR AI key is set; exits, stops and rescues do not need it';
     const hands = this.#o.hands === null ? `no hands (${this.#o.handsWhy ?? 'nothing can be opened or closed here'}): decisions are published, acts journaled as refused` : (this.#o.handsLine ?? 'acts through the pair trader (pair-mainnet open / close)');
     return `strategy loop: ${this.#o.trade ? 'GIMBAL_TRADE=1' : 'GIMBAL_TRADE is not 1 (off)'}, auto ${this.#o.strategy().auto ? 'on' : 'off'}; ${hands}; ${veto}; ${rules}; state ${this.#o.store.path}`;
   }
 
   /** A scan ended (or the strategy changed): one check, the hourly one when due. Coalesced while one waits. */
   onScan(): void {
-    if (this.#stopped || this.#checkQueued) return;
+    if (this.#stopped) return;
+    this.#stopFirst();
+    if (this.#checkQueued) return;
     this.#checkQueued = true;
     void this.#serial(async () => {
       this.#checkQueued = false;
@@ -716,21 +761,39 @@ export class StrategyLoop {
     return { ok: true };
   }
 
-  /** POST /close: refused at once with the reason, or started. Works with auto on or off. */
+  /**
+   * POST /close: refused at once with the reason, or started. Works with auto on or off. It never waits for a NEAR AI
+   * risk check: an enter or rotate whose check is pending, or queued and not checked yet, is cancelled with nothing
+   * sent ("a close came first"), and the close runs right after. An act already past its check stops before its next
+   * step that sends (a rotate's prepareOpen, its close, the open), so the close closes the pair as it is.
+   */
   close(): { ok: true } | { ok: false; reason: string } {
-    const pre = this.#manualRefusal();
-    if (pre !== null) return { ok: false, reason: pre };
-    if (this.#o.hands!.held() === null) return { ok: false, reason: 'no pair is held: nothing to close' };
-    this.#manual = 'POST /close';
+    if (this.#stopped) return { ok: false, reason: 'serve is stopping' };
+    if (!this.#o.trade) return { ok: false, reason: 'GIMBAL_TRADE is not 1: this engine trades nothing' };
+    if (this.#o.hands === null) return { ok: false, reason: `no pair trader here: ${this.#o.handsWhy ?? 'nothing can be opened or closed'}` };
+    if (this.#closing) return { ok: false, reason: 'a POST /close is queued or running: wait for its result' };
+    const gate = this.#gate();
+    if (gate !== null) return { ok: false, reason: gate };
+    if (this.#o.hands.held() === null) return { ok: false, reason: 'no pair is held: nothing to close' };
+    this.#closing = true;
+    this.#cancelPending('a close came first');
     void this.#serial(async () => {
-      this.#acting = this.#manual;
+      this.#acting = 'POST /close';
       try {
-        if (this.#stopped) return;
+        if (this.#stopped) {
+          this.#journal('refused', 'POST /close not carried out: serve is stopping; nothing sent; ask again after the restart', { by: 'POST /close (manual)' });
+          return;
+        }
+        // The act before it (one past its risk check) may have left the desk flat.
+        if (this.#o.hands!.held() === null) {
+          this.#journal('refused', 'POST /close not carried out: no pair is held any more (the act before it left the desk flat); nothing sent', { by: 'POST /close (manual)' });
+          return;
+        }
         const r = await this.#exit('POST /close (manual)', true);
         if (r.end === 'done') this.#patchCounters({ badChecks: 0, betterByWindow: {}, lastExitAt: this.#o.clock.now() });
       } finally {
         this.#acting = null;
-        this.#manual = null;
+        this.#closing = false;
       }
     });
     return { ok: true };
@@ -741,9 +804,39 @@ export class StrategyLoop {
     return Promise.race([this.#queue.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), timeoutMs).unref())]);
   }
 
-  /** No new check or act starts after this (one running ends on its own). */
+  /**
+   * No new check or act starts after this. One running ends on its own, except an enter or rotate not past its NEAR AI
+   * risk check: the check is aborted and the act ends with nothing sent.
+   */
   stop(): void {
     this.#stopped = true;
+    this.#cancelPending('serve is stopping');
+  }
+
+  /** Cancels the act whose risk check is pending, if any (the first reason stands). */
+  #cancelPending(why: string): void {
+    const p = this.#pending;
+    if (p === null || p.why !== null) return;
+    p.why = why;
+    p.cancel.abort();
+  }
+
+  /**
+   * A rotate's risk check is pending and the held pair's drawdown or time stop came due (decide.ts stopDue, on the
+   * venues' P&L now): the rotate is cancelled, so the next check exits at once instead of waiting for NEAR AI.
+   */
+  #stopFirst(): void {
+    if (this.#pending?.kind !== 'rotate') return;
+    const venues = this.#o.hands?.held() ?? null;
+    const record = this.#state.held;
+    if (venues === null || record === null || venues.symbol !== record.symbol) return;
+    const due = stopDue({ symbol: record.symbol, since: record.since, legUsd: venues.legUsd > 0 ? venues.legUsd : record.legUsd, pnlUsd: venues.pnlUsd }, this.#o.strategy(), this.#o.clock.now());
+    if (due !== null) this.#cancelPending(`a stop came first (${due})`);
+  }
+
+  /** A manual rotate or close was accepted and has not ended: auto acts and the record's checks wait for it. */
+  get #manualQueued(): boolean {
+    return this.#manual !== null || this.#closing;
   }
 
   // ---- state kept between checks for a manual rotate ----
@@ -763,7 +856,7 @@ export class StrategyLoop {
     if (this.#stopped) return 'serve is stopping';
     if (!this.#o.trade) return 'GIMBAL_TRADE is not 1: this engine trades nothing';
     if (this.#o.hands === null) return `no pair trader here: ${this.#o.handsWhy ?? 'nothing can be opened or closed'}`;
-    const acting = this.#manual ?? this.#acting;
+    const acting = this.#manual ?? (this.#closing ? 'POST /close' : null) ?? this.#acting;
     if (acting !== null) return `the strategy loop is acting (${acting}): try again when it is done`;
     return this.#gate();
   }
@@ -893,7 +986,7 @@ export class StrategyLoop {
     }
 
     // The record against the venues first: a pair recorded while one leg or none is open is corrected (two reads).
-    if (this.#o.hands?.reconcile !== undefined && this.#manual === null) {
+    if (this.#o.hands?.reconcile !== undefined && !this.#manualQueued) {
       const fixed = await this.#o.hands.reconcile().catch((err: unknown) => {
         this.#log(`strategy loop: the record was not checked against the venues (${errorMessage(err)})`);
         return null;
@@ -902,7 +995,7 @@ export class StrategyLoop {
     }
     // A single leg is never held as a pair: it is closed, reduce-only, every check until flat.
     const venues = this.#o.hands?.held() ?? null;
-    if (venues?.oneLeg != null && this.#manual === null) {
+    if (venues?.oneLeg != null && !this.#manualQueued) {
       await this.#closeOneLeg(venues.oneLeg, now);
       return;
     }
@@ -925,13 +1018,13 @@ export class StrategyLoop {
     };
     const d = (this.#o.decide ?? defaultDecide)(input);
     this.#journalDecision(input, d, before);
-    this.#publishDecision(d.decision);
+    this.#publishDecision(this.#shownDecision(d, now));
     if (d.act === null || !strategy.auto) {
       this.#saveCounters(d.counters);
       return;
     }
     // A manual rotate or close is queued: it goes first, this act waits for the next check.
-    if (this.#manual !== null) {
+    if (this.#manualQueued) {
       this.#saveCounters(skipAct(input, d));
       return;
     }
@@ -1057,6 +1150,13 @@ export class StrategyLoop {
         this.#journal('refused', line, { window: target, holdHours: REFRESH_HOLD_MS / HOUR_MS });
         return r;
       }
+      // The NEAR AI risk check did not answer: the act waits for the next hourly check (whichever act comes for the
+      // window next), so NEAR AI is not asked on every scan in between. Not a refusal: no hold-out, the counts stay.
+      if (r.end === 'held' && act.kind !== 'exit') {
+        const until = nextHourlyCheck(this.#o.clock.now());
+        for (const k of [`enter ${target}`, `rotate ${target}`]) this.#refused.set(k, { until, reason: r.heldLine ?? r.why ?? '', held: true });
+        return r;
+      }
       // Not tried again for a while only when it was refused with nothing sent, for a reason that does not pass.
       if (r.end === 'done' || r.sent || r.passing || r.end === 'vetoed') this.#refused.delete(key);
       else this.#refused.set(key, { until: this.#o.clock.now() + RETRY_AFTER_MS, reason: this.#refused.get(key)?.reason ?? '' });
@@ -1106,12 +1206,59 @@ export class StrategyLoop {
       this.#refuseOnce(key, `rotate ${p.fromId} -> ${w.id} not carried out: ${out}; ${p.fromId} is kept, nothing closed; ${RISK_NOT_ASKED}`);
       return SKIPPED;
     }
-    // NEAR AI first: it can only remove a window.
-    const check = await this.#veto(w, {
-      kind, legUsd: p.legUsd, leverage: p.leverage, hoursAbove: p.hoursAbove ?? this.#state.counters.aboveByWindow[w.id] ?? 0, facts: p.facts ?? this.#lastFacts,
-      manual: p.manual, ...(p.demo === undefined ? {} : { demo: p.demo }),
-    });
+    const head = p.fromId === null ? `enter ${w.id}` : `rotate ${p.fromId} -> ${w.id}`;
+    const cancelledNumbers = {
+      window: w.id, symbol: sym.symbol, by: who, cancelled: 1, ...(p.fromId === null ? {} : { from: p.fromId }),
+      ...(p.demo === undefined ? {} : { demo: 1, maxLossUsd: p.demo.maxLossUsd }),
+    };
+    const tagFirst = p.demo === undefined ? '' : `(${demoText(p.demo)}) `;
+    // A POST /close accepted before this act reached its check: the close goes first, NEAR AI is not asked.
+    if (this.#closing) {
+      this.#journal('refused', `${head} not carried out: ${tagFirst}a close came first; nothing sent; ${RISK_NOT_ASKED}`, cancelledNumbers);
+      return { ...SKIPPED, passing: true };
+    }
+    // NEAR AI first: it can only remove a window. While it is asked, a close, a stop that came due or serve stopping
+    // cancels the act (#cancelPending): none of them waits for the check.
+    const pending: { kind: 'enter' | 'rotate'; cancel: AbortController; why: string | null } = { kind, cancel: new AbortController(), why: null };
+    this.#pending = pending;
+    let asked: VetoAsked | null;
+    try {
+      asked = await this.#veto(w, {
+        kind, legUsd: p.legUsd, leverage: p.leverage, hoursAbove: p.hoursAbove ?? this.#state.counters.aboveByWindow[w.id] ?? 0, facts: p.facts ?? this.#lastFacts,
+        manual: p.manual, ...(p.demo === undefined ? {} : { demo: p.demo }),
+      }, pending.cancel.signal);
+    } finally {
+      if (this.#pending === pending) this.#pending = null;
+    }
+    // Serve stopping, a close or a stop came while it was asked: nothing is sent, whatever NEAR AI said.
+    const cancelled = this.#stopped ? 'serve is stopping' : pending.why;
+    if (cancelled !== null || asked === null) {
+      this.#journal('refused', `${head} not carried out: ${tagFirst}${cancelled ?? 'cancelled'}; nothing sent`, cancelledNumbers);
+      return { ...SKIPPED, passing: true };
+    }
+    const check = asked;
     onChecked({ checkId: check.checkId, fresh: check.fresh, why: check.why });
+    // No readable verdict: held, never passed. Checked first: a held result carries a "veto" (fail closed), but it is
+    // not a refusal, so it starts no hold-out. Nothing is closed (a rotate keeps the held pair) and nothing is sent.
+    if (check.result.held) {
+      const next = new Date(nextHourlyCheck(this.#o.clock.now())).toISOString();
+      const waits = p.manual ? 'not tried again by itself: POST /rotate asks again' : `asked again at the next hourly check (${next})`;
+      const tag = p.demo === undefined ? '' : `(${demoText(p.demo)}) `;
+      const line = p.fromId === null
+        ? `enter ${w.id} not carried out: ${tag}${check.why}; nothing sent; ${waits}; not a refusal, so no ${LOOP_RULES.vetoHoldHours} h hold-out`
+        : `rotate ${p.fromId} -> ${w.id} not carried out: ${tag}${check.why}; ${p.fromId} is kept, nothing closed; ${waits}; not a refusal, so no ${LOOP_RULES.vetoHoldHours} h hold-out`;
+      this.#journal('refused', line, {
+        window: w.id, symbol: sym.symbol, legUsd: p.legUsd, leverage: p.leverage, qty: p.qty, by: who, veto: check.result.line, held: 1,
+        riskCheckAttempts: check.result.attempts, ...(p.fromId === null ? {} : { from: p.fromId }), ...check.numbers,
+        ...(p.demo === undefined ? {} : { demo: 1, maxLossUsd: p.demo.maxLossUsd, roundTripUsd: round4(p.demo.roundTripUsd) }),
+      });
+      // The decision that asked waits, and says why: never "Entering" while the act is held (#shownDecision keeps it so).
+      const d = this.#decision;
+      if (!p.manual && d !== null && d.windowId === w.id && (d.action === 'enter' || d.action === 'rotate')) {
+        this.#publishDecision({ ...d, action: 'wait', reason: line, at: this.#o.clock.now() });
+      }
+      return { end: 'held', sent: false, passing: false, why: check.why, heldLine: line, result: `not opened: ${check.why}` };
+    }
     if (check.result.veto.verdict === 'veto') return { end: 'vetoed', sent: false, passing: false, why: check.why };
     const why = check.why;
     const base = {
@@ -1122,11 +1269,20 @@ export class StrategyLoop {
     // An owner demo entry says so on every line after its risk check, with the cost the owner accepted: after the
     // line's own lead (`enter ID not carried out: `, `enter ID: `), which stays as without demo (web waitCopy.ts reads it).
     const tag = p.demo === undefined ? '' : `(${demoText(p.demo)}) `;
+    // Past its pass, an act still stops before each step that sends (the rotate's prepareOpen, which may pay for a
+    // refresh, its close, and the open) when serve is stopping or a POST /close was accepted: the close then runs on
+    // the pair as it is, and no new pair is opened only to be closed again.
+    const first = (): string | null => (this.#stopped ? 'serve is stopping' : this.#closing ? 'a close came first' : null);
     if (p.fromId !== null) {
       const gate = this.#gate();
       if (gate !== null) {
         this.#refuseOnce(key, `rotate ${p.fromId} -> ${w.id} not carried out: ${gate}; ${why}`);
         return { ...SKIPPED, passing: true, result: `not rotated: ${gate}` };
+      }
+      const beforePrepare = first();
+      if (beforePrepare !== null) {
+        this.#journal('refused', `rotate ${p.fromId} -> ${w.id} not carried out: ${beforePrepare}; ${p.fromId} is kept, nothing closed; ${why}`, { ...base, from: p.fromId, cancelled: 1 });
+        return { ...SKIPPED, passing: true };
       }
       // The target's stored price before the held pair is closed: a refresh that fails keeps the pair held, where
       // the open after the close would leave the desk flat.
@@ -1137,6 +1293,11 @@ export class StrategyLoop {
           this.#journal('refused', `rotate ${p.fromId} -> ${w.id} not carried out: ${ready.reason}; ${p.fromId} is kept, nothing closed; ${why}`, { ...base, from: p.fromId });
           return { ...SKIPPED, passing: this.#gate() !== null, result: `not rotated: ${ready.reason}`, ...(ready.refreshed === true ? { paidRefusal: ready.reason } : {}) };
         }
+      }
+      const beforeClose = first();
+      if (beforeClose !== null) {
+        this.#journal('refused', `rotate ${p.fromId} -> ${w.id} not carried out: ${beforeClose}; ${p.fromId} is kept, nothing closed; ${why}`, { ...base, from: p.fromId, cancelled: 1 });
+        return { ...SKIPPED, passing: true };
       }
       const closeAt = this.#o.clock.now();
       const closed = await hands.close({ reason: `strategy: rotate out of ${p.fromId} into ${w.id} (${who})` });
@@ -1156,6 +1317,11 @@ export class StrategyLoop {
     if (gate !== null) {
       this.#journal('refused', `${kind} ${w.id} not carried out: ${tag}${gate}${flat}; ${why}`, base);
       return p.fromId === null ? { ...SKIPPED, passing: true, result: `not opened: ${gate}` } : { end: 'flat', sent: true, passing: true, result: `not opened: ${gate}` };
+    }
+    const beforeOpen = first();
+    if (beforeOpen !== null) {
+      this.#journal('refused', `${kind} ${w.id} not carried out: ${tag}${beforeOpen}${flat}; nothing opened; ${why}`, { ...base, cancelled: 1, ...(p.fromId === null ? {} : { from: p.fromId }) });
+      return p.fromId === null ? { ...SKIPPED, passing: true } : { end: 'flat', sent: true, passing: true, result: `not opened: ${beforeOpen}` };
     }
     const openAt = this.#o.clock.now();
     const opened = await hands.open({
@@ -1283,25 +1449,28 @@ export class StrategyLoop {
    * NEAR AI's verdict (veto.ts checkVeto), shown on the window and booked in the risk check ledger; a refusal is
    * journaled (decide's vetoedUntil holds it out). `why` is the line every decision after it carries.
    */
-  async #veto(w: FundingWindow, p: { kind: 'enter' | 'rotate'; legUsd: number; leverage: number; hoursAbove: number; facts: WindowFacts; manual: boolean; demo?: DemoCost }): Promise<{
-    result: VetoResult; why: string; numbers: Record<string, number | string>; checkId: string | null; fresh: boolean;
-  }> {
+  async #veto(w: FundingWindow, p: { kind: 'enter' | 'rotate'; legUsd: number; leverage: number; hoursAbove: number; facts: WindowFacts; manual: boolean; demo?: DemoCost }, signal: AbortSignal): Promise<VetoAsked | null> {
     const now = this.#o.clock.now();
     const oi = p.facts.openInterest?.[w.id];
     // Book depth at the leg's size, the 24 h move and the listing age come from riskFacts where a venue gives them;
     // anything it cannot get stays null (unknown), never invented.
     // No reads for a check that will not be asked (no key): nothing would be sent.
     const asks = this.#o.veto?.configured === true;
-    const extra = await ((asks ? this.#o.riskFacts?.(w, p.legUsd) : undefined) ?? Promise.resolve({})).catch((err: unknown) => {
+    const read = ((asks ? this.#o.riskFacts?.(w, p.legUsd) : undefined) ?? Promise.resolve({})).catch((err: unknown) => {
       this.#log(`strategy loop: risk check facts for ${w.id} not read (${errorMessage(err)})`);
       return {};
-    }) as { long?: VetoLegFacts; short?: VetoLegFacts };
+    }) as Promise<{ long?: VetoLegFacts; short?: VetoLegFacts }>;
+    // A cancel does not wait for the fact reads either.
+    const extra = await Promise.race([read, untilAborted(signal)]);
+    if (signal.aborted || extra === null) return null;
     const facts = vetoFacts(w, {
       kind: p.kind, legUsd: p.legUsd, leverage: p.leverage, minNetAprPct: this.#o.strategy().minNetAprPct, hoursAbove: p.hoursAbove,
       grossApr14dPct: p.facts.gross14dAprPct?.[w.id] ?? null, manual: p.manual, ...(p.demo === undefined ? {} : { demo: p.demo }),
       legs: { long: { ...extra.long, openInterestUsd: oi?.longUsd ?? null }, short: { ...extra.short, openInterestUsd: oi?.shortUsd ?? null } },
     });
-    const result = await checkVeto(this.#o.veto ?? NO_VETO_SOURCE, facts, { now, timeoutMs: this.#o.vetoTimeoutMs ?? LOOP_RULES.vetoTimeoutMs });
+    const result = await checkVeto(this.#o.veto ?? NO_VETO_SOURCE, facts, { now, timeoutMs: this.#o.vetoTimeoutMs ?? LOOP_RULES.vetoTimeoutMs, signal });
+    // Cancelled while asked: no verdict to book, show or journal; the act says why it was not carried out.
+    if (signal.aborted) return null;
     // The attestation is shown only for a reply that came: an unchecked window has nothing to attest.
     const attestation = result.exchange?.response == null ? null : (this.#o.attestation?.() ?? 'TEE not attested: no attestation fetched in this run');
     const why = riskCheckWhy(result, attestation ?? '');
@@ -1310,17 +1479,21 @@ export class StrategyLoop {
       ...(result.exchange === null ? {} : vetoJournalNumbers(result.exchange)),
     };
     const booked = this.#bookCheck(w, p, result, why, attestation, now);
-    const shown = result.veto.verdict === 'veto' ? LOOP_RULES.vetoHoldHours * HOUR_MS : VERDICT_SHOWN_MS;
-    this.#verdicts.set(w.id, { veto: result.veto, until: now + shown });
-    const scanned = this.#o.windows();
-    if (scanned !== null) this.#republishVerdicts(scanned, now);
-    // The decision that asked carries the verdict from here.
+    // A held check (no readable verdict) is not shown on the window: there is no verdict to show, and it is no refusal.
+    if (!result.held) {
+      const shown = result.veto.verdict === 'veto' ? LOOP_RULES.vetoHoldHours * HOUR_MS : VERDICT_SHOWN_MS;
+      this.#verdicts.set(w.id, { veto: result.veto, until: now + shown });
+      const scanned = this.#o.windows();
+      if (scanned !== null) this.#republishVerdicts(scanned, now);
+    }
+    // The decision that asked carries the verdict from here (a held one: the act publishes a wait with its line).
     const d = this.#decision;
-    if (!p.manual && d !== null && d.windowId === w.id && (d.action === 'enter' || d.action === 'rotate')) {
-      const tail = result.veto.verdict === 'veto' ? `; ${why}: not ${d.action === 'enter' ? 'entered' : 'rotated'}` : `; ${why}`;
+    if (!result.held && !p.manual && d !== null && d.windowId === w.id && (d.action === 'enter' || d.action === 'rotate')) {
+      const not = d.action === 'enter' ? 'entered' : 'rotated';
+      const tail = result.veto.verdict === 'veto' ? `; ${why}: not ${not}` : `; ${why}`;
       this.#publishDecision({ ...d, reason: `${d.reason}${tail}`, at: now });
     }
-    if (result.veto.verdict === 'veto') {
+    if (!result.held && result.veto.verdict === 'veto') {
       this.#journal('veto', `${w.id}${p.demo === undefined ? '' : ` (${demoText(p.demo)})`}: ${why}; not ${p.kind === 'enter' ? 'entered' : 'rotated into'}, held out for ${LOOP_RULES.vetoHoldHours} h`, {
         window: w.id, model: result.veto.model, ...numbers, ...(p.demo === undefined ? {} : { demo: 1, maxLossUsd: p.demo.maxLossUsd, roundTripUsd: round4(p.demo.roundTripUsd) }),
       });
@@ -1336,7 +1509,8 @@ export class StrategyLoop {
    */
   #bookCheck(w: FundingWindow, p: { kind: 'enter' | 'rotate'; legUsd: number; leverage: number; manual: boolean; demo?: DemoCost }, r: VetoResult, why: string, attestation: string | null, now: number): { checkId: string | null; fresh: boolean } {
     if (this.#o.ledger === undefined) return { checkId: null, fresh: false };
-    const verdict = r.veto.verdict === 'veto' ? 'refused' : r.checked ? 'passed' : 'unchecked';
+    // Held (no readable verdict) is booked unchecked, never as a refusal the ledger would price as helped or hurt.
+    const verdict = r.held ? 'unchecked' : r.veto.verdict === 'veto' ? 'refused' : r.checked ? 'passed' : 'unchecked';
     const by = p.manual ? 'manual' : 'auto';
     const demo = p.demo !== undefined;
     const last = this.#lastChecks.get(w.id);
@@ -1513,6 +1687,29 @@ export class StrategyLoop {
     } catch (err) {
       this.#log(`strategy loop: state not saved (${errorMessage(err)})`);
     }
+  }
+
+  /**
+   * The decision as published: an enter or rotate whose act is held by a risk check with no readable verdict, until
+   * the next hourly check, is a wait with the held line; with no NEAR AI key every enter or rotate is (its act will be
+   * held). So the Desk says why it waits and never "Entering" or "Rotating" while nothing can pass.
+   */
+  #shownDecision(d: Decision, now: number): StrategyDecision {
+    const act = d.act;
+    if (act === null || act.kind === 'exit') return d.decision;
+    const target = act.kind === 'enter' ? act.windowId : act.toId;
+    const h = this.#refused.get(`${act.kind} ${target}`);
+    if (h !== undefined && h.held === true && now < h.until) return { ...d.decision, action: 'wait', reason: h.reason };
+    if (this.#o.veto?.configured !== true) {
+      const head = act.kind === 'enter' ? `enter ${target}` : `rotate ${act.fromId} -> ${target}`;
+      const kept = act.kind === 'enter' ? 'nothing sent' : `${act.fromId} is kept, nothing closed`;
+      const next = new Date(nextHourlyCheck(now)).toISOString();
+      return {
+        ...d.decision, action: 'wait',
+        reason: `${head} not carried out: ${NO_KEY_WHY}; ${kept}; asked again at the next hourly check (${next}); not a refusal, so no ${LOOP_RULES.vetoHoldHours} h hold-out`,
+      };
+    }
+    return d.decision;
   }
 
   #publishDecision(d: StrategyDecision): void {

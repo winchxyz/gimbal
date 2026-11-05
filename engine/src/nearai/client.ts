@@ -66,8 +66,11 @@ export class NearAiClient {
     return this.#apiKey !== undefined;
   }
 
-  /** One completion at temperature 0; `json` asks for a JSON object (response_format json_object). */
-  async complete(messages: readonly ChatMessage[], options: { json?: boolean; maxTokens?: number } = {}): Promise<Completion> {
+  /**
+   * One completion at temperature 0; `json` asks for a JSON object (response_format json_object). `signal` ends the
+   * request early (the risk check's own timeout, or its act cancelled), beside this client's timeout.
+   */
+  async complete(messages: readonly ChatMessage[], options: { json?: boolean; maxTokens?: number; signal?: AbortSignal } = {}): Promise<Completion> {
     const key = this.#apiKey;
     if (key === undefined) throw new NearAiUnavailable('NEAR_AI_API_KEY is not set');
     const body = {
@@ -84,7 +87,7 @@ export class NearAiClient {
         method: 'POST',
         headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', accept: 'application/json' },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(this.#timeoutMs),
+        signal: options.signal === undefined ? AbortSignal.timeout(this.#timeoutMs) : AbortSignal.any([AbortSignal.timeout(this.#timeoutMs), options.signal]),
       });
       text = await res.text();
     } catch (err) {

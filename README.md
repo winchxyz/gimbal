@@ -36,7 +36,7 @@ before NEAR's MPC network signs it. The engine that trades and moves margin can 
 
 Not yet: a live pair or a live margin rescue on mainnet (on-chain counters 0; [Status](#status-2026-11-04)).
 
-Tracks: DeFi (main); Agents and Security. Built for NEAR HACKATHON, Nov 1–14, 2026, by winch
+Tracks: DeFi (main) and Security. Built for NEAR HACKATHON, Nov 1–14, 2026, by winch
 ([@winchxyz](https://x.com/winchxyz)). This repository started on Oct 30, 2026, inside the build window (Oct 19 to
 Nov 14, rule Q-001 of the hackathon).
 
@@ -99,9 +99,12 @@ The main risks, and the guard for each:
   flipped or shrunken spread, and closes both legs at once when the pair's loss reaches the owner's stop drawdown
   (10 % of a leg on this desk) or after 14 days.
 - **A bad entry.** Before every entry and rotation the NEAR AI risk check reads the window's facts and can refuse it;
-  it cannot pick a pair, a size or an order. It counts only when it answers within 5 s: with no answer in time, or
-  NEAR AI unreachable, the entry goes ahead and the journal says so; an answer that cannot be read counts as a
-  refusal. Whatever the engine asks, the contract refuses an order above the policy's size caps, or on a priced
+  it cannot pick a pair, a size or an order. It fails closed: only a readable pass lets the entry go ahead. With no
+  answer within 15 s (asked twice), NEAR AI unreachable, or no working key, the entry is held, not passed: the
+  journal says the risk check did not answer, and the window is asked again at the next hourly check. An answer that
+  cannot be read counts as a refusal. Exits, stops, `POST /close`, `panic_close` and rescues never ask it, and none
+  waits for it: a close, a drawdown or time stop, or a shutdown cancels an entry still waiting on its check, with
+  nothing sent. Whatever the engine asks, the contract refuses an order above the policy's size caps, or on a priced
   symbol more than 1 % from the oracle price.
 
 ## What it does
@@ -122,7 +125,7 @@ Gimbal runs the whole loop with no private key for the venue accounts:
 
 ## Why it matters
 
-Agent guards usually cap what an agent may spend. A trading desk needs more: an order inside a spending cap can
+Guards on automated trading usually cap only how much may be spent. A trading desk needs more: an order inside a spending cap can
 still be priced far from the market, sized past the plan, or open risk when it should only close. Gimbal's contract
 checks the order itself, per venue, for every signature:
 
@@ -161,7 +164,8 @@ that proves the refusal.
   `exitAfterChecks`, picked on [a backtest](docs/backtest-checks.md)); then a 6 h cooldown, a 14-day time stop and at
   most 2 rotations a day. The pair is the top allowed window; its size is the smallest of the owner's leg size, the
   policy cap less the band, free margin and book depth, in whole lots. Before every enter and rotate the **NEAR AI
-  risk check** reads the window's facts and may refuse it (held out for 6 h); it cannot pick a pair, a size or an
+  risk check** reads the window's facts and may refuse it (held out for 6 h); only a readable pass lets the act go
+  ahead, and no answer holds it until the next hourly check (no 6 h hold). It cannot pick a pair, a size or an
   order, and nothing it returns reaches the contract or a venue. By default the pair is short Hyperliquid and long
   Phoenix. With `GIMBAL_ORDERLY_PAIRS=1` (off in the code by default; on in the mainnet engine since 2026-11-04) it
   can be any two of Hyperliquid, Orderly and Phoenix, in the direction the window pays. The pair opens maker first on
@@ -169,8 +173,8 @@ that proves the refusal.
   moves money only with `GIMBAL_TRADE=1` and auto turned on by the owner.
 - **Owner demo entry** (`POST /rotate` with `demo: {maxLossUsd}`, [docs/deploy-railway.md](docs/deploy-railway.md)).
   One small real pair the owner asks for, to show the loop: only the profit checks are waived (the spread need not
-  cover the round trip); the policy, the NEAR AI risk check, sizing, a flat desk and funding not against the position
-  still count, and its estimated round trip may cost at most 1 USD. It has never opened a pair (two tries on
+  cover the round trip); the policy, the NEAR AI risk check (never waived: no answer holds the entry), sizing, a flat
+  desk and funding not against the position still count, and its estimated round trip may cost at most 1 USD. It has never opened a pair (two tries on
   2026-11-05 were refused by the engine's checks; nothing was signed). Such an entry is labeled an owner demo entry in
   the journal, the book and the risk ledger.
 - **Rescue** (`engine/src/rescue/`). When a leg crosses its rescue line, the rescuer pays it from the first source that
@@ -220,10 +224,11 @@ Done (read from the chain and the venues' public APIs at about 03:00 UTC):
   ([below](#refusals-on-chain-npm-run-attack)).
 - On mainnet `gimbal_dex.near` refused a deliberately mispriced test Hyperliquid order with `E_PRICE_BAND`
   (2026-11-04 07:00:43 UTC, in the desk table of [docs/onchain-evidence.md](docs/onchain-evidence.md#mainnet-desk-carry)).
-- The NEAR AI risk check runs on the mainnet engine before every enter and rotate, with a 5 s timeout; without an
-  answer in time the window passes, and the journal says "risk check timed out: passed". `npm run report` books
-  every outcome (refusals as helped or hurt, estimated); each pass shows the position its act opened, with that
-  position's net.
+- The NEAR AI risk check runs on the mainnet engine before every enter and rotate and fails closed: each ask waits
+  15 s and is asked once more; with still no answer (or no working key) the entry is held, not passed, and the
+  journal says "the NEAR AI risk check did not answer ... held, not passed: the act waits"; the window is asked
+  again at the next hourly check, with no 6 h hold. `npm run report` books every outcome (refusals as helped or hurt,
+  estimated); each pass shows the position its act opened, with that position's net.
 
 Not done yet:
 
@@ -266,7 +271,7 @@ the dashboard (the engine's allowed browser Origin follows it) and `--engine-por
 | `npm run demo` | within a few seconds `demo: engine rules set: legs 12 USD at up to 3x, enter above 5 % net APR, auto on` (the engine caps legs at 2x), then `demo: ready. Open http://localhost:5190` |
 | Open http://localhost:5190 | **Desk**: a Replay badge and the flat 40 USD replay desk. Within about a minute the script's owner demo entry tries the windows the policy allows: ZEC and BTC are refused at 12 USD legs (a ZEC lot is over a leg; BTC's whole lots size a leg under the 10 USD venue minimum), and SOL enters, short Hyperliquid and long Phoenix, 0.12 SOL a leg at recorded prices. Latest keeps the labels in view: "owner demo entry: the profit checks are waived", and SOL's spread pays the other way this hour, so "the demo shows the cycle, not a profit" |
 | Click **Windows** | every window by net APR after costs, the held SOL window marked Held, and NEAR refused because it is not in the policy; the selected one shows its costs from gross to net and its checks |
-| Click **Journal** | the whole loop in order: the script's lines, the two sizing refusals, the open, one hourly funding line at 17:00, the scripted close at 17:05 (`POST /close`, as the owner would) with the realized net, about −$0.02 (funding, fees, price), and the counters: "N simulated actions. Nothing signed or sent." |
+| Click **Journal** | the whole loop in order: the script's lines, the two sizing refusals, the open (the recording holds no NEAR AI risk check reply for its prompt, so its line says "passed in replay only; live, the entry would wait"), one hourly funding line at 17:00, the scripted close at 17:05 (`POST /close`, as the owner would) with the realized net, about −$0.02 (funding, fees, price), and the counters: "N simulated actions. Nothing signed or sent." |
 | Click **Rescue**, then **Run a stress test** while the pair is held (about 30 s to 5 min after the start) | the Hyperliquid short comes inside a line the stress test raised to just above its distance ("The stress test raised this leg's rescue line from your 8% to …"), and steps 1 Detect to 7 Landed run on recorded mainnet 1Click answers, Verify and Sign saying what the contract would do (replay: no contract, nothing signed). The recorded quote moves a fixed $20 from the reserve, more than the leg needs, and its 0.52 USD fee is the recording's, not the engine's estimate; it lands in about 1 min 40 s of replay time and Earlier rescues lists it, marked "no funds moved" |
 | Click **Security** | "0 private keys exist for this desk", how an order gets signed, and what the operator can and cannot do; the policy and key panels say a replay has no contract to read |
 | Ctrl+C in the terminal | both stop, and the temp state folder is removed |
@@ -318,7 +323,7 @@ operator key file). Each tool returns the contract's answer: a result, or a refu
 | FunctionCall access keys | `docs/interfaces.md` §1.3 | the engine's key can call only the operator methods and cannot attach deposits |
 | NEP-297 events | `contract/src/events.rs` | an auditable on-chain journal |
 | OutLayer TEE price oracle | `contract/src/prices.rs`, `contract/core/src/oracle.rs` | the price band on every order |
-| NEAR AI Cloud | `engine/src/nearai/`, `engine/src/strategy/` | drafts the desk policy from the owner's words (the owner signs it); the NEAR AI risk check before every enter and rotate, which can only refuse. Never in the signing path |
+| NEAR AI Cloud | `engine/src/nearai/`, `engine/src/strategy/` | drafts the desk policy from the owner's words (the owner signs it); the NEAR AI risk check before every enter and rotate, which can only refuse and fails closed (no answer holds the act). Never in the signing path |
 
 ## Security model
 

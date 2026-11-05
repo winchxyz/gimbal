@@ -76,7 +76,7 @@ export interface ServeLoopInput {
   /** The scanner's carry per window and the desk venues' readers, for decide()'s 14 days and lots. */
   carry?: (windowId: string) => WindowCarry | null;
   venues?: readonly VenueReader[];
-  /** NEAR AI (the client POST /policy/draft uses); none = every window passes, "no NEAR AI risk check". */
+  /** NEAR AI (the client POST /policy/draft uses); none = no key, every enter and rotate is held, never passed. */
   veto?: VetoSource;
   /** How a reply shows its attestation (Attestor.label). */
   attestation?: () => string;

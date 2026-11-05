@@ -16,7 +16,7 @@ import { EngineServer } from '../server.ts';
 import type { DecideInput, Decision } from '../strategy/decide.ts';
 import type { ActOutcome, LoopHands, StrategyLoop } from '../strategy/loop.ts';
 import { sizeFor } from '../strategy/decide.ts';
-import { STRATEGY, T0, win as deskWin } from '../strategy/test-helpers.ts';
+import { PASSING_RISK_CHECK, STRATEGY, T0, win as deskWin } from '../strategy/test-helpers.ts';
 import { VirtualClock, readRecording } from '../venues/replay.ts';
 import { replayStart } from './serve-replay.ts';
 import { adlGate, depthAtSize, fillsOf, loopGates, loopHands, openGateText, openedQty, protectionText, riskFacts, serveLoop, windowFacts, windowSymbol } from './serve-loop.ts';
@@ -88,6 +88,7 @@ test('replay: scan -> decide -> act (fake executor) -> journal and decision even
     server?.publish(e);
   };
   const strategyLoop = serveLoop({
+    veto: PASSING_RISK_CHECK,
     mode: 'replay', env: (n) => (n === 'GIMBAL_TRADE' ? '1' : undefined), once: false, stateDir: dir, contractId: null, deskId: null,
     pair: null, lastDesk: () => null, accounts: [], rescueLive: false, busy: () => null, windows: () => server?.state().windows ?? null,
     strategy: () => server?.strategy ?? DEFAULT_STRATEGY, policy: () => null, publish, clock, log: () => {},
@@ -125,7 +126,7 @@ test('replay: scan -> decide -> act (fake executor) -> journal and decision even
     assert.equal(state.decision?.action, 'enter');
     const enter = state.journal.find((j) => j.kind === 'enter')!;
     assert.match(enter.summary, new RegExp(`enter ${best.id}`));
-    assert.match(String(enter.numbers.veto), /^no NEAR AI risk check on .*: NEAR_AI_API_KEY is not set/);
+    assert.match(String(enter.numbers.veto), /^NEAR AI passed /);
     assert.equal(enter.tx[0]!.id, '0xopen');
 
     // The next scan: the scanner marks the held window, decide() holds.
@@ -153,8 +154,8 @@ test('replay: scan -> decide -> act (fake executor) -> journal and decision even
     const shown = events.filter((e) => e.type === 'decision').map((e) => e.data as StrategyDecision);
     // The enter is published twice: as decided, then with the risk check's why line once it answered.
     assert.deepEqual(shown.map((d) => d.action), ['off', 'enter', 'enter', 'hold']);
-    assert.match(shown[2]!.reason, /; no NEAR AI key: not checked$/);
-    assert.match(enter.summary, /; no NEAR AI key: not checked; /);
+    assert.match(shown[2]!.reason, /; NEAR AI risk check passed \(TEE not attested: no attestation fetched in this run\): no red flag named$/);
+    assert.match(enter.summary, /; NEAR AI risk check passed \(TEE not attested: no attestation fetched in this run\): no red flag named; /);
     assert.equal(strategyLoop.held, null);
   } finally {
     strategyLoop.stop();
@@ -325,6 +326,7 @@ test('the real decide(): three hourly checks above the bar, then the exact qty i
   const clock = new VirtualClock(T0 + 5 * 60_000);
   const events: StreamEvent[] = [];
   const loop = serveLoop({
+    veto: PASSING_RISK_CHECK,
     mode: 'replay', env: (n) => (n === 'GIMBAL_TRADE' ? '1' : undefined), once: false, stateDir: dir, contractId: null, deskId: null,
     pair: null, lastDesk: () => null, rescueLive: true, busy: () => null, windows: () => [window],
     accounts: [{ venue: 'hyperliquid', read: async () => ({ freeMarginUsd: 50 }) as never }, { venue: 'phoenix', read: async () => ({ freeMarginUsd: 50 }) as never }],
@@ -364,6 +366,7 @@ test('a pair whose start is not confirmed: the loop decides nothing and refuses 
   };
   const pair = { hands, unconfirmed: () => pending, notTrading: () => pending } as unknown as ServePair;
   const loop = serveLoop({
+    veto: PASSING_RISK_CHECK,
     mode: 'mainnet', env: (n) => (n === 'GIMBAL_TRADE' ? '1' : undefined), once: false, stateDir: dir, contractId: 'gimbal.near', deskId: 'desk-1',
     pair, lastDesk: () => null, accounts: [], rescueLive: false, busy: () => null, windows: () => [],
     strategy: () => ({ ...DEFAULT_STRATEGY, auto: true }), policy: () => null, publish: () => {}, clock: { now: () => T0 }, log: (l) => logs.push(l),
@@ -587,6 +590,7 @@ test('serveLoop wired as serve wires it (...loopGates): the gate an open carries
   const window = deskWin('sol-phoenix-hyperliquid', { netAprPct: 15 });
   let now = T0 + 5 * 60_000;
   const loop = serveLoop({
+    veto: PASSING_RISK_CHECK,
     mode: 'mainnet', env: (n) => (n === 'GIMBAL_TRADE' ? '1' : undefined), once: false, stateDir: dir, contractId: 'gimbal.near', deskId: 'desk-1',
     pair, lastDesk: () => null, accounts: [], rescueLive: false, windows: () => [window],
     strategy: () => ({ ...DEFAULT_STRATEGY, auto: true }), policy: () => null, publish: () => {}, clock: { now: () => now }, log: () => {},

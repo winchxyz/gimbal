@@ -121,7 +121,8 @@ export function riskLedgerLines(r: RiskLedgerSummary | null, file?: string): str
   out.push(`  passes     ${t.passed}: each with the position its own act opened`);
   for (const x of r.passes) out.push(...passLines(x));
   if (t.unchecked > 0) {
-    out.push(`  unchecked  ${t.unchecked}: no answer (no key, a timeout, NEAR AI down), the window passed unchecked`);
+    out.push(`  unchecked  ${t.unchecked}: no readable answer (no key, a timeout, NEAR AI down): the act was held, nothing opened`
+      + ' (in replay only, a prompt with no recorded reply passes; a ledger from before the check failed closed may show a position here)');
     for (const x of r.unchecked) out.push(...passLines(x));
   }
   out.push('  totals');

@@ -24,7 +24,7 @@ import type { Relayer } from '../relayer/relayer.ts';
 import type { WindowCarry } from '../scanner/scanner.ts';
 import { loopStateFile } from '../strategy/loop.ts';
 import type { StrategyLoop } from '../strategy/loop.ts';
-import { HOUR, STRATEGY, T0, win } from '../strategy/test-helpers.ts';
+import { HOUR, PASSING_RISK_CHECK, STRATEGY, T0, win } from '../strategy/test-helpers.ts';
 import type { LegOutcome, LegSide, PendingMakerOrder, TradeLeg } from '../trade/legs.ts';
 import { qtyNumber, toQty } from '../trade/lots.ts';
 import { makerIndexOf } from '../trade/pair-shape.ts';
@@ -294,6 +294,7 @@ async function serve(d: Desk, o: { orderly?: boolean } = {}) {
     venue, read: async (): Promise<AccountState> => ({ venue, address: 'a', time: d.now, equityUsd: 100, freeMarginUsd: d.margin[venue]!, maintenanceMarginUsd: 0, positions: [] } as unknown as AccountState),
   });
   loop = serveLoop({
+    veto: PASSING_RISK_CHECK,
     mode: 'mainnet', env: (n) => d.env[n], once: false, stateDir: d.dir, contractId: CONTRACT, deskId: DESK, pair, lastDesk: () => null,
     accounts: ['hyperliquid', 'phoenix', ...(o.orderly === false ? [] : ['orderly'])].map(account), rescueLive: false, busy: () => null,
     windows: () => d.windows, strategy: () => STRATEGY, policy: () => POLICY as unknown as ContractPolicy, publish: booked.publish, clock: { now: () => d.now },

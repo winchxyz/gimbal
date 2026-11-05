@@ -56,8 +56,9 @@ repo root are all it needs.
      `NEAR_NETWORK`, `GIMBAL_CONTRACT_ID`, `DESK_ID`, `OWNER_ACCOUNT_ID`, `OPERATOR_ACCOUNT_ID`,
      `OPERATOR_PRIVATE_KEY`, `OPERATOR_ALLOWANCE_NEAR`, `ORDERLY_BROKER_ID`, `HL_API_URL`, `ORDERLY_API_URL`,
      `PHOENIX_API_URL`, `SOLANA_RPC_URL`;
-   - `ONECLICK_API_KEY` (rescues and transfers), `NEAR_AI_API_KEY` (the NEAR AI risk check; without it windows pass with
-     "no NEAR AI risk check");
+   - `ONECLICK_API_KEY` (rescues and transfers), `NEAR_AI_API_KEY` (the NEAR AI risk check, which fails closed: without a
+     working key every enter and rotate is held, never passed, and the start line warns so; exits, stops and rescues
+     do not need it, and a redeploy's SIGTERM cancels an enter or rotate still waiting on its check, with nothing sent);
    - `GIMBAL_TRADE=1`, `GIMBAL_RESCUE=1`;
    - `RELAYER_EVM_PRIVATE_KEY`, required with `GIMBAL_RESCUE=1`: the Arbitrum gas wallet that submits
      `evm_usdc_to_intents`; without it serve exits at start with a configuration error;
@@ -203,7 +204,9 @@ scan.
   `minNetAprPct` and keeps every other check: the window must be in the last scan, tradable and not stale, pass its
   checks, not be held out by the NEAR AI risk check (a hold-out the loop's own auto acts set), be in a direction the
   pair trader opens, and size within the free margin and the policy. It is checked and sized again when it runs, and
-  the NEAR AI risk check runs as for any enter; its prompt says the trade was asked by hand and the owner's minimum is
+  the NEAR AI risk check runs as for any enter. It fails closed: with no readable answer (two asks of 15 s each, or
+  no working key) the request is held, journaled `refused ... the NEAR AI risk check did not answer ... held, not
+  passed`, with nothing sent and no hold-out; ask again later. Its prompt says the trade was asked by hand and the owner's minimum is
   waived, with no streak (an auto enter's prompt carries both). A risk check refusal holds a window out for 6 h only
   when the loop's own (auto) act asked it. On a manual `POST /rotate`, plain or demo, a refusal refuses that one
   request and sets no hold-out (its `veto` journal line and the window's verdict on the dashboard still read 6 h):
@@ -217,11 +220,16 @@ scan.
   trip in USD (fees, slippage, basis buffer) must be known and at most `maxLossUsd`; the refusal says the number.
   `maxLossUsd` bounds that round-trip cost estimate only: funding during the hold is expected positive (the spread
   must be) and is not part of the bound. The pair trader checks both again on its own books. It opens
-  from flat only (`POST /close` first). The NEAR AI risk check runs as for any manual enter, and its prompt says this
+  from flat only (`POST /close` first). The NEAR AI risk check runs as for any manual enter and is never waived (a
+  refusal refuses it, no answer holds it), and its prompt says this
   is an owner-requested demonstration entry with the profit checks waived and the cost the owner accepted. The
   journal's `enter` line, the book and the risk ledger mark it as an owner demo entry (`demo: true`).
 - **`POST /close`**: both legs, reduce-only. It works with `auto` on or off and answers `409 no pair is held` when
-  there is none.
+  there is none. It never waits for the NEAR AI risk check: an enter or rotate still waiting on its check is cancelled
+  with nothing sent ("not carried out: a close came first; nothing sent") and the close runs right after. A rotate past
+  its pass stops before its next step (the price refresh, its close or the open): the close then closes the pair as
+  it is, and no new pair is opened only to be closed again. A second `POST /close` while one is queued or running is
+  refused.
 - **`PUT /strategy <the whole config>`**: every engine rule, the rescue and watch lines included (there is no
   separate risk route). Copy the last `control: engine rules before the call` line (every run logs it; also
   `GET /strategy` on the read-only view) and change only what you mean to. **Send every field**: a config without
@@ -317,7 +325,8 @@ log printed. `<rules>` below stands for every field of that line, with the chang
    direction. `maxLossUsd` bounds the estimated round-trip cost, at most 1 USD; a 12 USD ZEC Orderly/Hyperliquid leg
    costs about 0.04 USD. Funding during the hold is expected positive and is not part of that bound. Wait for `journal   enter: enter <window id>, ...; owner demo entry: ...` (or `error` / `refused`). A
    `veto` / `refused ... NEAR AI risk check` line means the model refused that window: send the same step with the
-   backup window. **Every attempt needs a new run-id**, a refused one included: a used run-id never runs again.
+   backup window. A `refused ... the NEAR AI risk check did not answer ... held, not passed` line means no answer
+   came (nothing sent, no hold-out): send the same step again once NEAR AI answers. **Every attempt needs a new run-id**, a refused one included: a used run-id never runs again.
 
    ```
    '{"id":"demo-enter","method":"POST","path":"/rotate","until":"2026-11-06T18:00:00Z","body":{"windowId":"eth-phoenix-hyperliquid","demo":{"maxLossUsd":0.25}}}' | railway variable set GIMBAL_CONTROL --stdin

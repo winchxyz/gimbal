@@ -90,7 +90,7 @@ import { Attestor, readAttestationRecording } from '../nearai/attestation.ts';
 import { newestAttestationFile, riskCheckFiles } from '../nearai/recorded.ts';
 import { RiskLedger, riskLedgerFile } from '../book/risk-ledger.ts';
 import type { VetoSource } from '../strategy/veto.ts';
-import { RecordedVeto } from '../strategy/veto.ts';
+import { RecordedVeto, riskCheckSource } from '../strategy/veto.ts';
 import { PolicyDrafter, deskMarkets } from '../nearai/draft-route.ts';
 import { StrategyStore, strategyFile } from '../strategy-store.ts';
 import { setupFromEnv } from '../setup/serve-setup.ts';
@@ -321,13 +321,16 @@ else if (saved.strategy !== null) log(`engine rules from ${strategyStore.path}`)
 const nearAi = new NearAiClient({ apiKey: envVar('NEAR_AI_API_KEY') });
 const drafter = new PolicyDrafter({ client: nearAi, markets: deskMarkets(readers.venues) });
 log(drafter.configured ? `policy drafts: NEAR AI ${drafter.model}` : 'policy drafts: off (NEAR_AI_API_KEY is not set), POST /policy/draft answers 503');
-// The NEAR AI risk check: the client with a key; replay with no key plays the risk check replies recorded by
-// `npm run record-nearai -w engine -- --risk-checks` (a prompt with no recorded reply passes, said so).
-const recordedChecks = mode === 'replay' && !nearAi.configured ? riskCheckFiles().filter((f) => !f.synthetic).map((f) => f.file) : [];
-const riskCheck: VetoSource = recordedChecks.length === 0 ? nearAi : RecordedVeto.fromFiles(recordedChecks);
+// The NEAR AI risk check, fail closed: the client with a key (no readable answer holds the enter or rotate); replay
+// with no key plays the risk check replies recorded by `npm run record-nearai -w engine -- --risk-checks`, and there
+// only a prompt with no recorded reply passes, labelled replay-only. Testnet and mainnet never take that path.
+let recordedChecks: string[] = [];
+const riskCheck: VetoSource = riskCheckSource(mode, nearAi, () => (recordedChecks = riskCheckFiles().filter((f) => !f.synthetic).map((f) => f.file)));
 log(riskCheck === nearAi
-  ? `NEAR AI risk check: ${nearAi.configured ? `NEAR AI ${nearAi.model}` : 'no NEAR AI key: every enter and rotate passes unchecked, said so'}`
-  : `NEAR AI risk check: replay plays ${(riskCheck as RecordedVeto).size} recorded repl${(riskCheck as RecordedVeto).size === 1 ? 'y' : 'ies'} from ${recordedChecks.length} file(s); other prompts pass unchecked`);
+  ? `NEAR AI risk check: ${nearAi.configured
+    ? `NEAR AI ${nearAi.model}; only a readable pass lets an enter or rotate go ahead: no answer, or a key NEAR AI rejects, holds it until the next hourly check (entries cannot pass without a working NEAR AI key)`
+    : 'WARNING: no NEAR AI key (NEAR_AI_API_KEY is not set): no enter or rotate can pass without a working NEAR AI key, each is held and said so; exits, stops and rescues do not need it'}`
+  : `NEAR AI risk check: replay plays ${(riskCheck as RecordedVeto).size} recorded repl${(riskCheck as RecordedVeto).size === 1 ? 'y' : 'ies'} from ${recordedChecks.length} file(s); a prompt with no recorded reply passes in replay only (live, the entry would wait)`);
 const setup = await setupFromEnv(mode, envVar, log, { autoOn: () => envVar('GIMBAL_TRADE') === '1' && (server?.strategy ?? saved.strategy ?? DEFAULT_STRATEGY).auto }).catch((err: unknown) => {
   if (err instanceof ConfigError) fail(`setup: ${errorMessage(err)}`);
   // Review S1: NEAR not answering at start turns POST /setup off for this run instead of stopping serve.
