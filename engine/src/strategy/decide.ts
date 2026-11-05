@@ -330,7 +330,7 @@ export function heldForwardAprPct(w: FundingWindow): number {
 }
 
 /** Whether a stop can be judged: the time stop needs a finite `since`; the drawdown stop needs these. */
-function drawdownKnown(held: HeldPair, stop: number | null): stop is number {
+function drawdownKnown(held: Pick<HeldPair, 'pnlUsd' | 'legUsd'>, stop: number | null): stop is number {
   return stop !== null && finite(stop) && finite(held.pnlUsd) && finite(held.legUsd) && held.legUsd > 0;
 }
 
@@ -484,24 +484,30 @@ export function decide(input: DecideInput): Decision {
 
 type Out = (action: StrategyDecision['action'], reason: string, windowId: string | null, act?: Decision['act'], waitKey?: string | null) => Decision;
 
+/**
+ * The held pair's stops, which act at once whatever the counts: the drawdown stop (the pair's P&L against one leg)
+ * and the maxHoldDays time stop (needs only a finite `since`). The exit's reason, or null. Pure: the loop also asks
+ * it while an act's NEAR AI risk check is pending, so a stop never waits for that check.
+ */
+export function stopDue(held: Pick<HeldPair, 'symbol' | 'since' | 'legUsd' | 'pnlUsd'>, strategy: Pick<StrategyConfig, 'stopDrawdownPct'>, now: number): string | null {
+  const stop = strategy.stopDrawdownPct;
+  if (drawdownKnown(held, stop)) {
+    const downPct = (-held.pnlUsd / held.legUsd) * 100;
+    if (held.pnlUsd < 0 && downPct >= stop) return `Exit ${held.symbol}: down ${usd(-held.pnlUsd)}, ${downPct.toFixed(1)} % of the ${usd(held.legUsd)} leg, at your ${minimum(stop)} stop`;
+  }
+  const heldHours = (now - held.since) / HOUR_MS;
+  if (finite(held.since) && heldHours >= LOOP_RULES.maxHoldDays * 24) return `Exit ${held.symbol}: held ${(heldHours / 24).toFixed(1)} days, the ${LOOP_RULES.maxHoldDays}-day time stop`;
+  return null;
+}
+
 function decideHeld(input: DecideInput, held: HeldPair, heldW: FundingWindow | null, counters: LoopCounters, out: Out): Decision {
   const { strategy, now } = input;
   const heldHours = (now - held.since) / HOUR_MS;
 
   // The stops first, at once, whatever the counts: each needs only its own numbers, so nothing else that is unknown
-  // (a scan number, the minimum) keeps a losing or overdue pair open. Drawdown: the pair's P&L against one leg.
-  const stop = strategy.stopDrawdownPct;
-  if (drawdownKnown(held, stop)) {
-    const downPct = (-held.pnlUsd / held.legUsd) * 100;
-    if (held.pnlUsd < 0 && downPct >= stop) {
-      const reason = `Exit ${held.symbol}: down ${usd(-held.pnlUsd)}, ${downPct.toFixed(1)} % of the ${usd(held.legUsd)} leg, at your ${minimum(stop)} stop`;
-      return out('exit', reason, held.windowId, { kind: 'exit', reason });
-    }
-  }
-  if (finite(held.since) && heldHours >= LOOP_RULES.maxHoldDays * 24) {
-    const reason = `Exit ${held.symbol}: held ${(heldHours / 24).toFixed(1)} days, the ${LOOP_RULES.maxHoldDays}-day time stop`;
-    return out('exit', reason, held.windowId, { kind: 'exit', reason });
-  }
+  // (a scan number, the minimum) keeps a losing or overdue pair open.
+  const stopped = stopDue(held, strategy, now);
+  if (stopped !== null) return out('exit', stopped, held.windowId, { kind: 'exit', reason: stopped });
 
   // Past the stops, nothing is decided on a number that is not one: no compression, no rotation, no "healthy".
   const unknown = heldUnknown(held, heldW !== null && !heldW.stale ? heldW : null, input);

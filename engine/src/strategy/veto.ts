@@ -22,10 +22,9 @@
 
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import type { Window as FundingWindow } from '@gimbal/shared';
+import type { Mode, Window as FundingWindow } from '@gimbal/shared';
 import { NEAR_AI_MODEL, NearAiUnavailable, completionContent, parseJsonObject } from '../nearai/client.ts';
 import type { ChatMessage, Completion } from '../nearai/client.ts';
-import { withTimeout } from '../scanner/scanner.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import { LOOP_RULES } from './decide.ts';
 
@@ -40,8 +39,11 @@ export interface VetoSource {
    * Absent or false (every live and testnet source): no answer, and the act is held.
    */
   readonly replayPassUnrecorded?: boolean;
-  /** A recording may say how long the answer took when it was recorded (`latencyMs`); a live call is timed here. */
-  complete(messages: readonly ChatMessage[], options?: { json?: boolean; maxTokens?: number }): Promise<Completion & { latencyMs?: number }>;
+  /**
+   * A recording may say how long the answer took when it was recorded (`latencyMs`); a live call is timed here.
+   * `signal`: checkVeto aborts it when an attempt times out or the act is cancelled, so a retry never overlaps it.
+   */
+  complete(messages: readonly ChatMessage[], options?: { json?: boolean; maxTokens?: number; signal?: AbortSignal }): Promise<Completion & { latencyMs?: number }>;
 }
 
 export interface VetoLeg {
@@ -247,7 +249,9 @@ export function replyText(e: Pick<VetoExchange, 'response'>): string {
 }
 
 /** What every held line ends with: the act waits; it is not refused. */
-export const HELD_TAIL = 'held, not passed: the entry waits';
+export const HELD_TAIL = 'held, not passed: the act waits';
+/** riskCheckWhy of a check with no key: it can never answer, so every enter and rotate is held. */
+export const NO_KEY_WHY = `no NEAR AI key, so the NEAR AI risk check cannot answer: ${HELD_TAIL}`;
 /** What a replay-only pass says (live and testnet, such a prompt is no answer, and the act is held). */
 export const REPLAY_UNRECORDED = 'no recorded NEAR AI risk check reply for this prompt: passed in replay only; live, the entry would wait';
 
@@ -262,7 +266,7 @@ export function riskCheckWhy(r: Pick<VetoResult, 'outcome' | 'reason'>, attestat
     case 'unreadable': return `NEAR AI risk check refused (${attestation}): ${r.reason}`;
     case 'timeout':
     case 'unavailable': return `the NEAR AI risk check did not answer (${r.reason}): ${HELD_TAIL}`;
-    case 'no-key': return `no NEAR AI key, so the NEAR AI risk check cannot answer: ${HELD_TAIL}`;
+    case 'no-key': return NO_KEY_WHY;
     case 'key-rejected': return `${r.reason}, so the NEAR AI risk check cannot answer: ${HELD_TAIL}`;
     case 'replay-unrecorded': return REPLAY_UNRECORDED;
   }
@@ -402,14 +406,52 @@ interface NoReply {
   again: boolean;
 }
 
+/** The why of a check cancelled before NEAR AI answered (the loop's act was cancelled or serve is stopping). */
+export const RISK_CHECK_CANCELLED = 'cancelled before NEAR AI answered';
+
+/**
+ * One attempt: `source.complete` with a signal that aborts at `timeoutMs` or when `cancel` aborts, so the call is
+ * ended, not left running beside the retry. Rejects with "no answer within N s" at the timeout, and with
+ * RISK_CHECK_CANCELLED on a cancel, whether or not the source honours the signal.
+ */
+async function askOnce(
+  source: VetoSource, messages: readonly ChatMessage[], timeoutMs: number, cancel: AbortSignal | undefined,
+): Promise<Completion & { latencyMs?: number }> {
+  if (cancel?.aborted === true) throw new Error(RISK_CHECK_CANCELLED);
+  const attempt = new AbortController();
+  let stop: ((err: Error) => void) | null = null;
+  const stopped = new Promise<never>((_, reject) => {
+    stop = reject;
+  });
+  // `stopped` settles first, so the race ends on the timeout or cancel, not on the call's own abort error.
+  const end = (err: Error) => {
+    stop?.(err);
+    attempt.abort(err);
+  };
+  const timer = setTimeout(() => end(new Error(`NEAR AI risk check: no answer within ${timeoutMs / 1000} s`)), timeoutMs);
+  const onCancel = () => end(new Error(RISK_CHECK_CANCELLED));
+  cancel?.addEventListener('abort', onCancel, { once: true });
+  try {
+    const call = source.complete(messages, { json: true, maxTokens: MAX_TOKENS, signal: attempt.signal });
+    // A call that settles after the attempt ended is ignored, never unhandled.
+    call.catch(() => undefined);
+    return await Promise.race([call, stopped]);
+  } finally {
+    clearTimeout(timer);
+    cancel?.removeEventListener('abort', onCancel);
+  }
+}
+
 /**
  * Asks for a verdict on `facts`. Never throws. A timeout or a transport/HTTP error is asked again, up to
  * LOOP_RULES.vetoAttempts tries; still no reply, and the act is held (`held`, never a pass). No key or a rejected key
  * holds it at once. A reply that came but is not a readable verdict (including one cut off at its token limit) is a
  * veto, "unreadable reply". Replay only (source.replayPassUnrecorded): a prompt with no recording passes, said so.
+ * Each attempt's call is aborted when it times out, so a retry never overlaps it. `signal` (the loop's act cancelled,
+ * or serve stopping) ends the check at once, held with RISK_CHECK_CANCELLED and asked no more.
  */
 export async function checkVeto(
-  source: VetoSource, facts: VetoFacts, options: { now: number; timeoutMs?: number; attempts?: number; timer?: () => number },
+  source: VetoSource, facts: VetoFacts, options: { now: number; timeoutMs?: number; attempts?: number; timer?: () => number; signal?: AbortSignal },
 ): Promise<VetoResult> {
   const timeoutMs = options.timeoutMs ?? LOOP_RULES.vetoTimeoutMs;
   const tries = Math.max(1, Math.floor(options.attempts ?? LOOP_RULES.vetoAttempts));
@@ -437,8 +479,9 @@ export async function checkVeto(
     attempts++;
     started = timer();
     try {
-      completion = await withTimeout(source.complete(messages, { json: true, maxTokens: MAX_TOKENS }), timeoutMs, 'NEAR AI risk check');
+      completion = await askOnce(source, messages, timeoutMs, options.signal);
     } catch (err) {
+      if (options.signal?.aborted === true) return held(RISK_CHECK_CANCELLED, 'unavailable', attempts, asked);
       const message = errorMessage(err);
       if (err instanceof UnrecordedPrompt) {
         // Replay only: the demo's scripted entry has no recorded reply. Anywhere else it is no answer, as live.
@@ -534,4 +577,15 @@ export function readExchanges(path: string): VetoExchange[] {
   const body = JSON.parse(readFileSync(path, 'utf8')) as { exchanges?: VetoExchange[] };
   if (!Array.isArray(body.exchanges)) throw new Error(`${path}: no "exchanges" list`);
   return body.exchanges;
+}
+
+/**
+ * The risk check serve gives the strategy loop. Testnet and mainnet always get NEAR AI (`nearAi`), with or without a
+ * key: no key holds every enter and rotate, never passes one. Replay with a key gets NEAR AI too. Only replay without
+ * a key plays the recorded replies in `files` (read only then), and only there a prompt with no recorded reply passes,
+ * labelled replay-only.
+ */
+export function riskCheckSource(mode: Mode, nearAi: VetoSource, files: () => readonly string[]): VetoSource {
+  if (mode !== 'replay' || nearAi.configured) return nearAi;
+  return RecordedVeto.fromFiles(files(), { replayPassUnrecorded: true });
 }

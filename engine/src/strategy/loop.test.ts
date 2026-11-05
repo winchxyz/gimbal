@@ -677,7 +677,8 @@ test('POST /rotate (auto on only) and /close (always): refused at once with the 
 
   // A manual rotate, SOL -> ETH, at strategy.legUsd capped by the policy, sized again when it runs.
   assert.deepEqual(loop.rotate('eth-phoenix-hyperliquid'), { ok: true });
-  assert.match((loop.close() as { reason: string }).reason, /the strategy loop is acting \(POST \/rotate eth-phoenix-hyperliquid\)/);
+  // A second manual rotate waits for the first (a close never does: see the close-first tests).
+  assert.match((loop.rotate('eth-phoenix-hyperliquid') as { reason: string }).reason, /the strategy loop is acting \(POST \/rotate eth-phoenix-hyperliquid\)/);
   await loop.idle(1000);
   assert.equal(w.closes.length, 1);
   assert.deepEqual(w.opens.map((o) => [o.symbol, o.legUsd, o.qty]), [['ETH', 1000, '10']]);
@@ -1201,7 +1202,7 @@ test('the risk check why line: every enter and refusal carries the verdict, the 
   await loop2.check();
   assert.equal(w2.opens.length, 0);
   const held2 = journal(w2).find((j) => j.kind === 'refused')!;
-  assert.match(held2.summary, /^enter sol-phoenix-hyperliquid not carried out: no NEAR AI key, so the NEAR AI risk check cannot answer: held, not passed: the entry waits; nothing sent; /);
+  assert.match(held2.summary, /^enter sol-phoenix-hyperliquid not carried out: no NEAR AI key, so the NEAR AI risk check cannot answer: held, not passed: the act waits; nothing sent; /);
   assert.equal(held2.numbers.attestation, undefined);
   assert.deepEqual(booked2.map((r) => [r.verdict, r.outcome, r.attestation, r.prompt]), [['unchecked', 'no-key', null, null]]);
 
@@ -1697,7 +1698,7 @@ test('fail closed: no answer is asked once more, then the enter is held (not pas
   const held = journal(w).find((j) => j.kind === 'refused')!;
   const next = new Date(nextHourlyCheck(T0)).toISOString();
   assert.equal(held.summary, 'enter sol-phoenix-hyperliquid not carried out: the NEAR AI risk check did not answer (no answer within 0.05 s, asked 2 times): '
-    + `held, not passed: the entry waits; nothing sent; asked again at the next hourly check (${next}); not a refusal, so no 6 h hold-out`);
+    + `held, not passed: the act waits; nothing sent; asked again at the next hourly check (${next}); not a refusal, so no 6 h hold-out`);
   assert.equal(held.numbers.riskCheckOutcome, 'timeout');
   assert.equal(held.numbers.riskCheckAttempts, 2);
   assert.equal(journal(w).some((j) => j.kind === 'veto'), false, 'no refusal entry');
@@ -1705,15 +1706,19 @@ test('fail closed: no answer is asked once more, then the enter is held (not pas
   assert.deepEqual(loop.counters.vetoedUntil, {});
   assert.equal(loop.counters.vetoWhy?.['sol-phoenix-hyperliquid'], undefined);
   assert.equal(w.events.some((e) => e.type === 'windows'), false);
-  assert.match(decisions(w).at(-1)!.reason, /did not answer .*: held, not passed: the entry waits: not entered now, asked again at the next hourly check$/);
+  // The decision waits, with the held line: not "enter" while the act is held.
+  assert.deepEqual([decisions(w).at(-1)!.action, decisions(w).at(-1)!.reason], ['wait', held.summary]);
   // Booked unchecked (never priced as a refusal).
   assert.deepEqual(checks.map((c) => [c.verdict, c.outcome]), [['unchecked', 'timeout']]);
-  // A scan before the next hourly check does not ask again.
+  // A scan before the next hourly check does not ask again, and decide()'s enter is still published as that wait.
   answer = true;
   w.now += 20 * 60_000;
+  const before = decisions(w).length;
   await loop.check();
   assert.equal(veto.calls, 2);
   assert.equal(w.opens.length, 0);
+  assert.ok(decisions(w).slice(before).every((d) => d.action === 'wait' && d.reason === held.summary), 'never "enter" again until the next hourly check');
+  assert.deepEqual([loop.decision!.action, loop.decision!.reason], ['wait', held.summary]);
   // The next hourly check asks again, and a readable pass opens it.
   w.now = nextHourlyCheck(T0);
   await loop.check();
@@ -1725,7 +1730,7 @@ test('fail closed: a transport error is asked once more, then held; a rejected k
   const cases: { complete: VetoSource['complete']; calls: number; opens: number; outcome: string; why: RegExp; vetoed: boolean }[] = [
     {
       complete: async () => { throw new NearAiUnavailable('NEAR AI did not answer: connection reset'); }, calls: 2, opens: 0, outcome: 'unavailable', vetoed: false,
-      why: /^enter sol-phoenix-hyperliquid not carried out: the NEAR AI risk check did not answer \(NEAR AI did not answer: connection reset, asked 2 times\): held, not passed: the entry waits; /,
+      why: /^enter sol-phoenix-hyperliquid not carried out: the NEAR AI risk check did not answer \(NEAR AI did not answer: connection reset, asked 2 times\): held, not passed: the act waits; /,
     },
     {
       complete: async () => { throw new NearAiUnavailable('NEAR AI answered HTTP 401: invalid api key'); }, calls: 1, opens: 0, outcome: 'key-rejected', vetoed: false,
@@ -1787,7 +1792,7 @@ test('the owner demo entry waives only the profit checks, never the NEAR AI risk
   assert.equal(silent.calls, 2);
   assert.equal(w2.opens.length, 0);
   const held = journal(w2).find((j) => j.kind === 'refused')!;
-  assert.match(held.summary, new RegExp(`^enter ${DEMO_ID} not carried out: \\(owner demo entry: .*\\) the NEAR AI risk check did not answer .*held, not passed: the entry waits; nothing sent; not tried again by itself: POST /rotate asks again; not a refusal, so no 6 h hold-out$`));
+  assert.match(held.summary, new RegExp(`^enter ${DEMO_ID} not carried out: \\(owner demo entry: .*\\) the NEAR AI risk check did not answer .*held, not passed: the act waits; nothing sent; not tried again by itself: POST /rotate asks again; not a refusal, so no 6 h hold-out$`));
   assert.equal(held.numbers.demo, 1);
   // No key holds it too.
   const w3 = world({ windows: [demoWin(), win('sol-phoenix-hyperliquid')] });
@@ -1852,4 +1857,232 @@ test('the rescue, the risk engine, the trader and panic_close have no path to th
   assert.equal(loop.match(/this\.#veto\(/g)?.length, 1);
   const enterOrRotate = loop.slice(loop.indexOf('async #enterOrRotateChecked('), loop.indexOf('this.#veto('));
   assert.ok(enterOrRotate.length > 0 && !enterOrRotate.includes('\n  async #'), 'the call sits in #enterOrRotateChecked');
+});
+
+// ---- Nothing waits on a pending NEAR AI risk check: serve stopping, POST /close and a stop cancel it ----
+
+const ROTATE_ETH: World['next'] = {
+  decision: { action: 'rotate', reason: 'eth better', windowId: 'eth-phoenix-hyperliquid' },
+  act: { kind: 'rotate', fromId: 'sol-phoenix-hyperliquid', toId: 'eth-phoenix-hyperliquid', legUsd: 500, leverage: 1.5, qty: '5' },
+};
+/** Waits (real time, at most 2 s) until `cond` holds. */
+const until = async (cond: () => boolean): Promise<void> => {
+  for (let i = 0; i < 2_000 && !cond(); i++) await new Promise((r) => setTimeout(r, 1));
+  assert.ok(cond(), 'the condition never held');
+};
+/** A NEAR AI that answers pass only when `release` is called, and never looks at the abort signal. */
+const slowPass = () => {
+  let release: () => void = () => {};
+  const answered = new Promise<typeof passReply>((r) => {
+    release = () => r(passReply);
+  });
+  return { veto: counting(() => answered), release: () => release() };
+};
+
+test('serve stopping during a slow risk check: the entry is not carried out, nothing sent, even if NEAR AI passes after', async () => {
+  const slow = slowPass();
+  const w = world();
+  const loop = makeLoop(w, tmpStore(), { veto: slow.veto, vetoTimeoutMs: 120_000 });
+  w.next = HOLD_ENTER_SOL;
+  const started = Date.now();
+  const running = loop.check();
+  await until(() => slow.veto.calls === 1);
+  loop.stop();                                           // SIGTERM: Railway's redeploy on every merge
+  await running;
+  assert.ok(Date.now() - started < 30_000, 'the stop does not wait for the 2 min check');
+  slow.release();                                        // NEAR AI passes after the stop: too late, nothing opens
+  await loop.idle(1000);
+  assert.equal(w.opens.length, 0);
+  assert.equal(w.closes.length, 0, 'nothing closed');
+  const line = journal(w).at(-1)!;
+  assert.equal(line.kind, 'refused');
+  assert.equal(line.summary, 'enter sol-phoenix-hyperliquid not carried out: serve is stopping; nothing sent');
+  assert.equal(line.numbers.cancelled, 1);
+  assert.equal(slow.veto.calls, 1, 'not asked again');
+
+  // A rotate past its pass when serve stops (in prepareOpen): the held pair is kept, nothing closed or opened.
+  const v = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 } });
+  let rot: StrategyLoop | null = null;
+  v.prepareAnswer = () => {
+    rot!.stop();
+    return OK('price fresh');
+  };
+  rot = makeLoop(v, tmpStore());
+  await rot.check();
+  v.next = ROTATE_ETH;
+  v.now += 60_000;
+  await rot.check();
+  assert.deepEqual([v.closes.length, v.opens.length], [0, 0]);
+  assert.match(journal(v).at(-1)!.summary, /^rotate sol-phoenix-hyperliquid -> eth-phoenix-hyperliquid not carried out: serve is stopping; sol-phoenix-hyperliquid is kept, nothing closed; NEAR AI risk check passed/);
+});
+
+test('POST /close during a rotate\'s pending risk check: accepted at once, the rotate is cancelled with nothing sent, the close runs right after', async () => {
+  const silent = counting(() => new Promise(() => {}));
+  const checks: RiskCheckRecord[] = [];
+  const w = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 }, prepareAnswer: () => OK('price fresh') });
+  const loop = makeLoop(w, tmpStore(), { veto: silent, vetoTimeoutMs: 120_000, ledger: { check: (r) => checks.push(r), hourly: () => {} } });
+  await loop.check();
+  w.next = ROTATE_ETH;
+  w.now += 60_000;
+  const started = Date.now();
+  const running = loop.check();
+  await until(() => silent.calls === 1);
+  assert.deepEqual(loop.close(), { ok: true }, 'never "the strategy loop is acting"');
+  await running;
+  await loop.idle(1000);
+  assert.ok(Date.now() - started < 30_000, 'the close did not wait for the 2 min check');
+  assert.equal(silent.calls, 1);
+  assert.deepEqual([w.prepares.length, w.opens.length], [0, 0]);
+  assert.equal(w.closes.length, 1);
+  assert.match(w.closes[0]!, /POST \/close \(manual\)/);
+  assert.equal(w.held, null);
+  const lines = journal(w).map((j) => [j.kind, j.summary]);
+  assert.deepEqual(lines.at(-2), ['refused', 'rotate sol-phoenix-hyperliquid -> eth-phoenix-hyperliquid not carried out: a close came first; nothing sent']);
+  assert.equal(lines.at(-1)![0], 'exit');
+  assert.deepEqual(checks, [], 'a cancelled check is not booked');
+  assert.deepEqual(loop.counters.vetoedUntil, {});
+});
+
+test('POST /close after a rotate passed its risk check, before the open: queued, not refused; the rotate ends, then the close closes the new pair', async () => {
+  const w = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 } });
+  let loop: StrategyLoop | null = null;
+  let answer: ReturnType<StrategyLoop['close']> | null = null;
+  w.prepareAnswer = () => {
+    answer = loop!.close();
+    return OK('price fresh');
+  };
+  loop = makeLoop(w, tmpStore());
+  await loop.check();
+  w.next = ROTATE_ETH;
+  w.now += 60_000;
+  await loop.check();
+  await loop.idle(1000);
+  assert.deepEqual(answer, { ok: true });
+  // The rotate: SOL closed, ETH opened; then POST /close closes ETH.
+  assert.equal(w.opens.length, 1);
+  assert.equal(w.closes.length, 2);
+  assert.match(w.closes[0]!, /rotate out of sol-phoenix-hyperliquid/);
+  assert.match(w.closes[1]!, /POST \/close \(manual\)/);
+  assert.equal(w.held, null);
+  assert.deepEqual(journal(w).filter((j) => j.kind === 'rotate' || j.kind === 'exit').map((j) => j.kind), ['exit', 'rotate', 'exit']);
+  // A second close while one is queued is refused at once, never queued twice.
+  const v = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 } });
+  const two = makeLoop(v, tmpStore());
+  assert.deepEqual(two.close(), { ok: true });
+  assert.deepEqual(two.close(), { ok: false, reason: 'a POST /close is already queued: it runs next' });
+  await two.idle(1000);
+  assert.equal(v.closes.length, 1);
+});
+
+test('POST /close right after a POST /rotate that has not reached its risk check: the rotate is not asked, nothing sent; the close runs', async () => {
+  const veto = counting(async () => passReply);
+  const w = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 } });
+  const loop = makeLoop(w, tmpStore(), { veto });
+  await loop.check();
+  assert.deepEqual(loop.rotate('eth-phoenix-hyperliquid'), { ok: true });
+  assert.deepEqual(loop.close(), { ok: true });
+  await loop.idle(1000);
+  assert.equal(veto.calls, 0, 'NEAR AI not asked');
+  assert.deepEqual([w.opens.length, w.closes.length], [0, 1]);
+  assert.match(w.closes[0]!, /POST \/close \(manual\)/);
+  assert.equal(journal(w).find((j) => j.kind === 'refused')!.summary,
+    `rotate sol-phoenix-hyperliquid -> eth-phoenix-hyperliquid not carried out: a close came first; nothing sent; ${RISK_NOT_ASKED}`);
+});
+
+test('a drawdown stop that comes due during a rotate\'s pending risk check cancels the rotate: the exit runs next, without waiting for NEAR AI', async () => {
+  const silent = counting(() => new Promise(() => {}));
+  const w = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 }, prepareAnswer: () => OK('price fresh') });
+  const loop = makeLoop(w, tmpStore(), { veto: silent, vetoTimeoutMs: 120_000 });
+  await loop.check();
+  w.next = ROTATE_ETH;
+  w.now += 60_000;
+  const started = Date.now();
+  const running = loop.check();
+  await until(() => silent.calls === 1);
+  // Not due yet: a scan leaves the check alone.
+  w.held = { symbol: 'SOL', legUsd: 500, pnlUsd: -10 };
+  loop.onScan();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(journal(w).some((j) => j.numbers.cancelled === 1), false);
+  // 20 % down on a 500 USD leg, past the 10 % stop: the next scan cancels the rotate, and the queued check exits.
+  w.held = { symbol: 'SOL', legUsd: 500, pnlUsd: -100 };
+  w.next = { decision: { action: 'exit', reason: 'stop' }, act: { kind: 'exit', reason: 'stop' } };
+  loop.onScan();
+  await running;
+  await loop.idle(1000);
+  assert.ok(Date.now() - started < 30_000, 'the stop did not wait for the 2 min check');
+  assert.equal(silent.calls, 1);
+  assert.deepEqual([w.opens.length, w.closes.length], [0, 1]);
+  assert.match(w.closes[0]!, /strategy: exit sol-phoenix-hyperliquid \(auto\): stop/);
+  assert.match(journal(w).find((j) => j.numbers.cancelled === 1)!.summary,
+    /^rotate sol-phoenix-hyperliquid -> eth-phoenix-hyperliquid not carried out: a stop came first \(Exit SOL: down \$100\.00, 20\.0 % of the \$500\.00 leg, at your 10 % stop\); nothing sent$/);
+});
+
+test('no NEAR AI key: decide()\'s enter is published as a wait that says why, never "enter", on every scan', async () => {
+  const w = world();
+  const loop = makeLoop(w, tmpStore(), { veto: NO_VETO_SOURCE });
+  w.next = HOLD_ENTER_SOL;
+  for (let i = 0; i < 3; i++) {
+    await loop.check();
+    w.now += 60_000;
+  }
+  assert.equal(w.opens.length, 0);
+  const ds = decisions(w);
+  assert.ok(ds.length > 0);
+  assert.ok(ds.every((d) => d.action === 'wait'), 'never "enter"');
+  assert.match(ds.at(-1)!.reason, /^enter sol-phoenix-hyperliquid not carried out: no NEAR AI key, so the NEAR AI risk check cannot answer: held, not passed: the act waits; nothing sent; asked again at the next hourly check \(.*\); not a refusal, so no 6 h hold-out$/);
+  // A rotate the same: the held pair is kept.
+  const v = world({ held: { symbol: 'SOL', legUsd: 500, pnlUsd: 0 }, prepareAnswer: () => OK('price fresh') });
+  const rot = makeLoop(v, tmpStore(), { veto: NO_VETO_SOURCE });
+  await rot.check();
+  v.next = ROTATE_ETH;
+  v.now += 60_000;
+  await rot.check();
+  assert.ok(decisions(v).every((d) => d.action !== 'rotate'));
+  assert.match(rot.decision!.reason, /^rotate sol-phoenix-hyperliquid -> eth-phoenix-hyperliquid not carried out: no NEAR AI key, .*; sol-phoenix-hyperliquid is kept, nothing closed; /);
+  assert.deepEqual([v.closes.length, v.opens.length], [0, 0]);
+});
+
+test('a held manual POST /rotate (no demo): nothing sent, no hold-out, the decision untouched; the next POST /rotate asks again', async () => {
+  const silent = counting(() => new Promise(() => {}));
+  const w = world();
+  const loop = makeLoop(w, tmpStore(), { veto: silent });
+  await loop.check();
+  const shown = loop.decision;
+  assert.deepEqual(loop.rotate('sol-phoenix-hyperliquid'), { ok: true });
+  await loop.idle(2000);
+  assert.equal(silent.calls, 2);
+  assert.equal(w.opens.length, 0);
+  const held = journal(w).find((j) => j.kind === 'refused')!;
+  assert.equal(held.summary, 'enter sol-phoenix-hyperliquid not carried out: the NEAR AI risk check did not answer (no answer within 0.05 s, asked 2 times): '
+    + 'held, not passed: the act waits; nothing sent; not tried again by itself: POST /rotate asks again; not a refusal, so no 6 h hold-out');
+  assert.equal(held.numbers.by, 'POST /rotate (manual)');
+  assert.equal(held.numbers.held, 1);
+  assert.equal(held.numbers.demo, undefined);
+  assert.deepEqual(loop.counters.vetoedUntil, {});
+  assert.deepEqual(loop.decision, shown, 'a manual act does not change the published decision');
+  assert.deepEqual(loop.rotate('sol-phoenix-hyperliquid'), { ok: true });
+  await loop.idle(2000);
+  assert.equal(silent.calls, 4, 'asked again');
+});
+
+test('only enters and rotates reach the risk check: #enterOrRotate is called from POST /rotate and from #act\'s non-exit branch, nowhere else', () => {
+  const loop = readFileSync(fileURLToPath(new URL('./loop.ts', import.meta.url)), 'utf8');
+  assert.equal(loop.match(/this\.#enterOrRotate\(/g)?.length, 2);
+  const rotate = loop.slice(loop.indexOf('  rotate(windowId: unknown'), loop.indexOf('  close(): {'));
+  assert.equal(rotate.match(/this\.#enterOrRotate\(/g)?.length, 1, 'POST /rotate');
+  const act = loop.slice(loop.indexOf('  async #act('), loop.indexOf('  async #enterOrRotate('));
+  assert.equal(act.match(/this\.#enterOrRotate\(/g)?.length, 1);
+  const exitBranch = act.indexOf("if (act.kind === 'exit') {");
+  const elseBranch = act.indexOf('} else {', exitBranch);
+  assert.ok(exitBranch > 0 && elseBranch > exitBranch);
+  assert.match(act.slice(exitBranch, elseBranch), /r = await this\.#exit\(/);
+  assert.doesNotMatch(act.slice(exitBranch, elseBranch), /#enterOrRotate|#veto/);
+  assert.ok(act.indexOf('this.#enterOrRotate(') > elseBranch, '#act calls it inside the non-exit branch');
+  // #exit and #closeOneLeg never reach it.
+  for (const name of ['  async #exit(', '  async #closeOneLeg(']) {
+    const start = loop.indexOf(name);
+    const body = loop.slice(start, loop.indexOf('\n  }\n', start));
+    assert.doesNotMatch(body, /#enterOrRotate|#veto|checkVeto/, name);
+  }
 });

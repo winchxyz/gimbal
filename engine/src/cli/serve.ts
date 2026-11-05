@@ -90,7 +90,7 @@ import { Attestor, readAttestationRecording } from '../nearai/attestation.ts';
 import { newestAttestationFile, riskCheckFiles } from '../nearai/recorded.ts';
 import { RiskLedger, riskLedgerFile } from '../book/risk-ledger.ts';
 import type { VetoSource } from '../strategy/veto.ts';
-import { RecordedVeto } from '../strategy/veto.ts';
+import { RecordedVeto, riskCheckSource } from '../strategy/veto.ts';
 import { PolicyDrafter, deskMarkets } from '../nearai/draft-route.ts';
 import { StrategyStore, strategyFile } from '../strategy-store.ts';
 import { setupFromEnv } from '../setup/serve-setup.ts';
@@ -324,9 +324,8 @@ log(drafter.configured ? `policy drafts: NEAR AI ${drafter.model}` : 'policy dra
 // The NEAR AI risk check, fail closed: the client with a key (no readable answer holds the enter or rotate); replay
 // with no key plays the risk check replies recorded by `npm run record-nearai -w engine -- --risk-checks`, and there
 // only a prompt with no recorded reply passes, labelled replay-only. Testnet and mainnet never take that path.
-const replayChecks = mode === 'replay' && !nearAi.configured;
-const recordedChecks = replayChecks ? riskCheckFiles().filter((f) => !f.synthetic).map((f) => f.file) : [];
-const riskCheck: VetoSource = replayChecks ? RecordedVeto.fromFiles(recordedChecks, { replayPassUnrecorded: true }) : nearAi;
+let recordedChecks: string[] = [];
+const riskCheck: VetoSource = riskCheckSource(mode, nearAi, () => (recordedChecks = riskCheckFiles().filter((f) => !f.synthetic).map((f) => f.file)));
 log(riskCheck === nearAi
   ? `NEAR AI risk check: ${nearAi.configured
     ? `NEAR AI ${nearAi.model}; only a readable pass lets an enter or rotate go ahead: no answer, or a key NEAR AI rejects, holds it until the next hourly check (entries cannot pass without a working NEAR AI key)`

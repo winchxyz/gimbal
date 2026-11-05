@@ -10,7 +10,7 @@ import { completion, fixedFetch } from '../nearai/test-helpers.ts';
 import { LOOP_RULES } from './decide.ts';
 import { PASS_FACTS, T0, VETO_FACTS, VETO_FIXTURE, win } from './test-helpers.ts';
 import {
-  MANUAL_MINIMUM, RecordedVeto, UNREADABLE_REPLY, UnrecordedPrompt, VETO_SYSTEM_PROMPT, checkVeto, parseVerdict, promptKey, riskCheckWhy, vetoFacts, vetoJournalNumbers, vetoMessages,
+  MANUAL_MINIMUM, RISK_CHECK_CANCELLED, RecordedVeto, UNREADABLE_REPLY, UnrecordedPrompt, VETO_SYSTEM_PROMPT, checkVeto, riskCheckSource, parseVerdict, promptKey, riskCheckWhy, vetoFacts, vetoJournalNumbers, vetoMessages,
 } from './veto.ts';
 import type { VetoSource } from './veto.ts';
 
@@ -52,7 +52,7 @@ test('no NEAR_AI_API_KEY: held, never passed, nothing sent', async () => {
   assert.equal(r.outcome, 'no-key');
   // Fail closed: what reads only the verdict refuses.
   assert.deepEqual(r.veto, { verdict: 'veto', reasons: ['the NEAR AI risk check did not answer: NEAR_AI_API_KEY is not set'], model: NEAR_AI_MODEL, at: T0 });
-  assert.equal(r.line, 'the NEAR AI risk check did not answer on NEAR: NEAR_AI_API_KEY is not set: held, not passed: the entry waits');
+  assert.equal(r.line, 'the NEAR AI risk check did not answer on NEAR: NEAR_AI_API_KEY is not set: held, not passed: the act waits');
   assert.equal(r.exchange, null);
 });
 
@@ -67,12 +67,12 @@ test('no answer within the timeout: asked once more, then held, never passed', a
   assert.equal(r.checked, false);
   assert.equal(r.held, true);
   assert.equal(r.veto.verdict, 'veto');
-  assert.equal(r.line, 'the NEAR AI risk check did not answer on NEAR: no answer within 0.05 s, asked 2 times: held, not passed: the entry waits');
+  assert.equal(r.line, 'the NEAR AI risk check did not answer on NEAR: no answer within 0.05 s, asked 2 times: held, not passed: the act waits');
   // The prompt is still kept for the journal, with no answer.
   assert.deepEqual(r.exchange, { key: promptKey(vetoMessages(PASS_FACTS)), model: NEAR_AI_MODEL, messages: vetoMessages(PASS_FACTS), response: null });
   assert.equal(r.outcome, 'timeout');
   assert.equal(r.latencyMs, null);
-  assert.equal(riskCheckWhy(r, 'attested'), 'the NEAR AI risk check did not answer (no answer within 0.05 s, asked 2 times): held, not passed: the entry waits');
+  assert.equal(riskCheckWhy(r, 'attested'), 'the NEAR AI risk check did not answer (no answer within 0.05 s, asked 2 times): held, not passed: the act waits');
   assert.equal(LOOP_RULES.vetoTimeoutMs, 15_000);
   assert.equal(LOOP_RULES.vetoAttempts, 2);
 });
@@ -122,12 +122,12 @@ test('the why line: verdict and one-line reason, with the attestation for a repl
   assert.equal(unreadable.outcome, 'unreadable');
   assert.match(riskCheckWhy(unreadable, 'attested'), /^NEAR AI risk check refused \(attested\): unreadable reply \(/);
   const noKey = await checkVeto(new NearAiClient({ apiKey: undefined }), PASS_FACTS, { now: T0 });
-  assert.equal(riskCheckWhy(noKey, 'attested'), 'no NEAR AI key, so the NEAR AI risk check cannot answer: held, not passed: the entry waits');
+  assert.equal(riskCheckWhy(noKey, 'attested'), 'no NEAR AI key, so the NEAR AI risk check cannot answer: held, not passed: the act waits');
   const rejected = await ask({ error: { message: 'invalid api key' } }, 401);
-  assert.equal(riskCheckWhy(rejected, 'attested'), 'NEAR AI key rejected (HTTP 401: invalid api key), so the NEAR AI risk check cannot answer: held, not passed: the entry waits');
+  assert.equal(riskCheckWhy(rejected, 'attested'), 'NEAR AI key rejected (HTTP 401: invalid api key), so the NEAR AI risk check cannot answer: held, not passed: the act waits');
   const down = await ask({ error: { message: 'overloaded' } }, 503);
   assert.equal(down.outcome, 'unavailable');
-  assert.equal(riskCheckWhy(down, 'attested'), 'the NEAR AI risk check did not answer (NEAR AI answered HTTP 503: overloaded, asked 2 times): held, not passed: the entry waits');
+  assert.equal(riskCheckWhy(down, 'attested'), 'the NEAR AI risk check did not answer (NEAR AI answered HTTP 503: overloaded, asked 2 times): held, not passed: the act waits');
   assert.equal(riskCheckWhy({ outcome: 'replay-unrecorded', reason: '' }, 'attested'),
     'no recorded NEAR AI risk check reply for this prompt: passed in replay only; live, the entry would wait');
 });
@@ -146,7 +146,7 @@ test('NEAR AI down (HTTP or transport error): asked once more, then held, never 
   const fetched = fixedFetch({ error: { message: 'overloaded' } }, 503);
   const down = await checkVeto(new NearAiClient({ apiKey: KEY, fetch: fetched.fetch }), PASS_FACTS, { now: T0 });
   assert.equal(fetched.sent.length, 2, 'one retry');
-  assert.equal(down.line, 'the NEAR AI risk check did not answer on NEAR: NEAR AI answered HTTP 503: overloaded, asked 2 times: held, not passed: the entry waits');
+  assert.equal(down.line, 'the NEAR AI risk check did not answer on NEAR: NEAR AI answered HTTP 503: overloaded, asked 2 times: held, not passed: the act waits');
   assert.equal(down.veto.verdict, 'veto');
   assert.deepEqual([down.checked, down.held, down.outcome], [false, true, 'unavailable']);
   let calls = 0;
@@ -157,7 +157,7 @@ test('NEAR AI down (HTTP or transport error): asked once more, then held, never 
   const reset = await checkVeto(broken, PASS_FACTS, { now: T0 });
   assert.equal(calls, 2);
   assert.deepEqual([reset.held, reset.veto.verdict, reset.outcome], [true, 'veto', 'unavailable']);
-  assert.equal(reset.line, 'the NEAR AI risk check did not answer on NEAR: NEAR AI did not answer: connection reset, asked 2 times: held, not passed: the entry waits');
+  assert.equal(reset.line, 'the NEAR AI risk check did not answer on NEAR: NEAR AI did not answer: connection reset, asked 2 times: held, not passed: the act waits');
   // A transport error, then a readable pass on the retry: it passes.
   let tries = 0;
   const flaky: VetoSource = {
@@ -177,7 +177,7 @@ test('a key NEAR AI rejects (401, 403) is asked once and held, and the line says
     const r = await checkVeto(new NearAiClient({ apiKey: KEY, fetch: fetched.fetch }), PASS_FACTS, { now: T0 });
     assert.equal(fetched.sent.length, 1, 'a rejected key is not asked again');
     assert.deepEqual([r.veto.verdict, r.checked, r.held, r.outcome], ['veto', false, true, 'key-rejected']);
-    assert.equal(r.line, `the NEAR AI risk check did not answer on NEAR: NEAR AI key rejected (HTTP ${status}: invalid api key): held, not passed: the entry waits`);
+    assert.equal(r.line, `the NEAR AI risk check did not answer on NEAR: NEAR AI key rejected (HTTP ${status}: invalid api key): held, not passed: the act waits`);
     assert.deepEqual(r.veto.reasons, [`the NEAR AI risk check did not answer: NEAR AI key rejected (HTTP ${status}: invalid api key)`]);
   }
 });
@@ -289,7 +289,7 @@ test('the recorded exchanges play back without a key; an unrecorded prompt is "n
   // An unrecorded prompt is no answer, as live: held (and not asked again, a recording never changes).
   const other = await checkVeto(recorded, { ...PASS_FACTS, netAprPct: 9.5 }, { now: T0 });
   assert.deepEqual([other.checked, other.held, other.outcome, other.veto.verdict, other.attempts], [false, true, 'unavailable', 'veto', 1]);
-  assert.equal(other.line, 'the NEAR AI risk check did not answer on NEAR: no recorded NEAR AI risk check reply for this prompt: held, not passed: the entry waits');
+  assert.equal(other.line, 'the NEAR AI risk check did not answer on NEAR: no recorded NEAR AI risk check reply for this prompt: held, not passed: the act waits');
 });
 
 test('replay only (replayPassUnrecorded): an unrecorded prompt passes with the replay-only label; recorded replies still count', async () => {
@@ -328,4 +328,87 @@ test('vetoMessages: a manual act says the minimum is waived and carries no strea
   assert.equal(manual.owner_minimum_net_apr_pct, MANUAL_MINIMUM);
   assert.equal('hours_in_a_row_above_minimum' in manual, false);
   assert.notEqual(promptKey(vetoMessages({ ...PASS_FACTS, manual: true })), promptKey(vetoMessages(PASS_FACTS)));
+});
+
+test('a timed-out attempt is aborted before the retry starts, so the two calls never overlap', async () => {
+  const signals: AbortSignal[] = [];
+  let open = 0;
+  let overlap = false;
+  const silent: VetoSource = {
+    model: NEAR_AI_MODEL, configured: true,
+    complete: (_m, o) => {
+      signals.push(o!.signal!);
+      if (open > 0) overlap = true;
+      open++;
+      return new Promise((_, reject) => o!.signal!.addEventListener('abort', () => {
+        open--;
+        reject(new Error('aborted'));
+      }));
+    },
+  };
+  const r = await checkVeto(silent, PASS_FACTS, { now: T0, timeoutMs: 30 });
+  assert.equal(r.outcome, 'timeout');
+  assert.equal(signals.length, 2);
+  assert.ok(signals.every((s) => s.aborted), 'each attempt is aborted at its timeout');
+  assert.equal(overlap, false, 'the retry starts only after the first call was aborted');
+  assert.equal(open, 0);
+});
+
+test('a cancel ends the check at once: held, RISK_CHECK_CANCELLED, the call aborted, not asked again', async () => {
+  const signals: AbortSignal[] = [];
+  const silent: VetoSource = { model: NEAR_AI_MODEL, configured: true, complete: (_m, o) => (signals.push(o!.signal!), new Promise(() => {})) };
+  const cancel = new AbortController();
+  setTimeout(() => cancel.abort(), 20);
+  const started = Date.now();
+  const r = await checkVeto(silent, PASS_FACTS, { now: T0, timeoutMs: 120_000, signal: cancel.signal });
+  assert.ok(Date.now() - started < 30_000, 'it does not wait for the 2 min timeout');
+  assert.equal(r.held, true);
+  assert.equal(r.reason, RISK_CHECK_CANCELLED);
+  assert.equal(signals.length, 1, 'not asked again');
+  assert.equal(signals[0]!.aborted, true);
+  // Cancelled before it starts: nothing is asked.
+  const before = await checkVeto(silent, PASS_FACTS, { now: T0, signal: AbortSignal.abort() });
+  assert.equal(before.held, true);
+  assert.equal(signals.length, 1);
+});
+
+test('the client ends its request when the risk check aborts it', async () => {
+  let aborted = false;
+  const hang = ((_url: unknown, init?: RequestInit) => new Promise<Response>((_, reject) => {
+    init?.signal?.addEventListener('abort', () => {
+      aborted = true;
+      reject(init.signal!.reason);
+    });
+  })) as unknown as typeof fetch;
+  const client = new NearAiClient({ apiKey: KEY, fetch: hang, timeoutMs: 20_000 });
+  const r = await checkVeto(client, PASS_FACTS, { now: T0, timeoutMs: 30, attempts: 1 });
+  assert.equal(r.outcome, 'timeout');
+  assert.equal(aborted, true, 'the fetch was aborted at the 30 ms risk check timeout, not the client\'s 20 s');
+});
+
+test('riskCheckSource: testnet and mainnet always get NEAR AI (no key holds); replay with a key gets NEAR AI; only replay without a key plays recordings with the replay-only pass', async () => {
+  const withKey = new NearAiClient({ apiKey: KEY, fetch: fixedFetch(completion({ verdict: 'pass', reasons: [] })).fetch });
+  const noKey = new NearAiClient({ apiKey: undefined });
+  let read = 0;
+  const files = () => (read++, [VETO_FIXTURE]);
+  for (const mode of ['testnet', 'mainnet'] as const) {
+    for (const nearAi of [withKey, noKey]) {
+      const s = riskCheckSource(mode, nearAi, files);
+      assert.equal(s, nearAi, `${mode}: NEAR AI itself`);
+      assert.notEqual(s.replayPassUnrecorded, true, `${mode}: never the replay-only pass`);
+    }
+    // With no key, every enter and rotate is held, never passed.
+    const r = await checkVeto(riskCheckSource(mode, noKey, files), PASS_FACTS, { now: T0 });
+    assert.equal(r.held, true);
+    assert.equal(r.outcome, 'no-key');
+  }
+  assert.equal(riskCheckSource('replay', withKey, files), withKey, 'replay with a key: NEAR AI');
+  assert.equal(read, 0, 'no recording read for any of those');
+  const recorded = riskCheckSource('replay', noKey, files);
+  assert.equal(read, 1);
+  assert.ok(recorded instanceof RecordedVeto);
+  assert.equal(recorded.replayPassUnrecorded, true);
+  assert.ok((recorded as RecordedVeto).size > 0);
+  const unrecorded = await checkVeto(recorded, { ...PASS_FACTS, symbol: 'NOT-RECORDED' }, { now: T0 });
+  assert.equal(unrecorded.outcome, 'replay-unrecorded');
 });
