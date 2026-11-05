@@ -22,10 +22,20 @@ It runs as a **second Railway service** from the same repo, next to the live eng
 - `GET /healthz` answers 200 once a run serves: `{"ok":true,"run":N,"servingS":...,"runS":430}`.
 
 **Nothing live.** The engine gets none of the host's variables (only the system's own, such as `PATH`), so no key,
-token or account can reach it even if one were set on the service. Every outbound connection in its process is
-refused before any DNS lookup (`engine/src/cli/no-egress.ts`); a line `outbound connection to <host> refused` in the
-log would mean a replay path tried the network and was stopped. Nothing is signed or sent: replay has no contract
-client, and its 1Click steps play recorded answers.
+token or account can reach it even if one were set on the service. Its process is preloaded with
+`engine/src/cli/no-egress.ts`, which refuses:
+
+- every TCP or TLS connect (fetch, WebSocket, `http.request`, `tls.connect`) to a host that is not this machine,
+  before any DNS lookup; a loopback name that a custom `lookup` resolves elsewhere is stopped when the lookup answers,
+  before it connects, and checked again on connect;
+- `dns.lookup` and every resolver query (`dns.resolve*`, `reverse`, `dns.promises`, `dns.Resolver`) for a name that
+  is not this machine;
+- UDP (`dgram`) send and connect to an address that is not loopback.
+
+A refusal never crashes the engine (a socket with no error listener gets a quiet one). A line `hosted replay: ...
+refused` in the log would mean a replay path tried the network and was stopped. Not covered: a child process the
+engine might spawn (it spawns none in replay) and native addons (it loads none). Nothing is signed or sent: replay has
+no contract client, and its 1Click steps play recorded answers.
 
 **Read-only for visitors.** The page is built with `VITE_HOSTED_REPLAY=1` (only `Dockerfile.replay` sets it): it
 leaves out Close position, Change my minimum, the owner's status buttons, rotating, Exit replay, Connect wallet and the
@@ -33,8 +43,20 @@ set-up flow, keeps Run a stress test on Rescue, and says "Public replay: read-on
 under the header. Every other build (`npm run demo`, the live dashboard) is unchanged. The public port refuses, before they reach the engine, `PUT /strategy`, `POST /rotate`,
 `POST /close`, `POST /policy/draft`, `POST /setup` and every other write, with a reason the page shows
 ("This is the hosted replay ... read-only"). The replay script drives entry and close inside the engine. `POST /stress`
-(the Rescue screen's "Run a stress test") stays open: one at a time, at most one a minute for all visitors, never while
-a rescue runs, and only while a pair is held; otherwise it answers why (409 or 429).
+(the Rescue screen's "Run a stress test") stays open: one at a time, **one per run** for all visitors (so the realized
+P&L stays the recorded hour's plus at most one rescue), never while a rescue runs, and only while a pair is held;
+otherwise it answers 409 with why (a second one in the same run also says when the replay starts over, with
+`Retry-After`). Its body must be empty, `{}` (what the page sends) or `{"on":true}`; anything else is answered 400
+and does not use up the run's stress test. The engine always receives `{"on":true}`.
+
+**Built for many visitors.** Every proxied response is written with backpressure: a client that stops reading stops
+the read from the engine (whose own 1 MiB SSE cap then drops that stream), and a client that leaves more than 1 MiB
+unread is dropped. Event streams are capped at 500 in all (503, the page retries) and 4 per client address (429),
+the address being `X-Real-IP`, else the last `X-Forwarded-For` entry, else the socket's. A GET or HEAD that carries a
+body (`Content-Length` above 0, or `Transfer-Encoding`) is answered 400 and its connection closed, and each request
+to the engine uses a connection of its own, so nothing a client sends can be read as a second request. `HEAD` on an
+API path is a GET without the body: `HEAD /events` is answered by the host (200, `text/event-stream`, no stream
+opened), every other API path with the engine's headers; `HEAD` on a page or asset gives its headers.
 
 ## Why the live engine is unaffected
 
@@ -50,7 +72,8 @@ a rescue runs, and only while a pair is held; otherwise it answers why (409 or 4
 ## Config as code: why there is no `railway.replay.json`
 
 Railway's config-as-code page (checked 2026-11-05) says Config as Code is deprecated: "Existing files keep working
-for legacy services until 2026-12-01", and its Infrastructure as Code page says "New services cannot opt into Config as
+for legacy services until 2026-12-01", and its
+[Infrastructure as Code page](https://docs.railway.com/infrastructure-as-code) says "New services cannot opt into Config as
 Code" and that existing files "stop being read on 2026-12-01 (hard cutoff)". So:
 
 - a second config file would not be read by a service created now: the replay service is set up in its dashboard
@@ -68,8 +91,9 @@ Code" and that existing files "stop being read on 2026-12-01 (hard cutoff)". So:
 2. The new service → **Variables**: add exactly one, `RAILWAY_DOCKERFILE_PATH` = `Dockerfile.replay`. Nothing else: no
    `GIMBAL_*`, no key, no token. Railway sets `PORT` itself.
 3. **Settings → Deploy → Custom Start Command**: `node engine/src/cli/replay-host.ts`. It is the image's own `CMD`;
-   set here too, it keeps the service right even if the variable in step 2 were missed (with the plain `Dockerfile` the
-   host builds the dashboard once at start, about a minute, then serves).
+   set here too, it keeps the service right even if the variable in step 2 were missed: the host serves `web/dist`
+   only when it is the hosted build (its `index.html` carries `<meta name="gimbal-build" content="hosted-replay">`),
+   and otherwise builds the hosted dashboard once at start, about a minute, then serves.
 4. **Settings → Deploy → Healthcheck Path**: `/healthz` (the default 300 s timeout is plenty; the first run serves
    about 5 s after the container starts).
 5. **Settings → Networking → Public Networking → Generate Domain**, on the port Railway offers (the one in `$PORT`).
@@ -86,8 +110,9 @@ Code" and that existing files "stop being read on 2026-12-01 (hard cutoff)". So:
    the branch trigger, or turn off automatic deploys), so the judging days run one fixed build and no merge to `main`
    restarts it. The live service keeps its own auto-deploy.
 
-Memory (measured locally): the host about 80 MB, one engine about 250 MB, so about 600 MB for the few seconds of
-each switch when two engines run; leave the service at least 1 GB.
+Memory (measured locally): the host about 80 MB; one engine about 240 MB when its run starts and about 440 MB near
+its end. At a switch the old engine (near its end) and the new one (starting) run together for a few seconds: about
+750 MB. **Give the service 2 GB** (Settings → Deploy → Resource limits) to leave room for visitors' streams.
 
 ## Stop it (after 2026-11-25)
 
@@ -99,8 +124,9 @@ service. Then remove the "Hosted demo" line from the README.
 
 ```bash
 npm ci --no-audit --no-fund && npm run build
-VITE_HOSTED_REPLAY=1 npm run build -w web         # the hosted page (without it, web/dist is the normal page)
 PORT=8080 node engine/src/cli/replay-host.ts      # open http://localhost:8080
+# web/dist from `npm run build` is the normal page: the host sees no hosted marker and rebuilds it as the hosted one
+# first (VITE_HOSTED_REPLAY=1 npm run build -w web does the same by hand).
 # or as Railway builds it:
 docker build -f Dockerfile.replay -t gimbal-replay . && docker run --rm -p 8080:8080 -e PORT=8080 gimbal-replay
 ```

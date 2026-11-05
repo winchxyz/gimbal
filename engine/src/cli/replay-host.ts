@@ -22,7 +22,7 @@ import { parseArgs } from 'node:util';
 import { readRecording } from '../venues/replay.ts';
 import { replayStart } from './serve-replay.ts';
 import type { ReplayEngine } from './replay-host-lib.ts';
-import { ReplayCycler, StressGate, childEnv, createHostServer } from './replay-host-lib.ts';
+import { ReplayCycler, StressGate, childEnv, createHostServer, isHostedBuild } from './replay-host-lib.ts';
 
 const root = fileURLToPath(new URL('../../../', import.meta.url));
 const engineDir = join(root, 'engine');
@@ -67,7 +67,7 @@ log(`engine environment: ${kept} system variables kept, the host's other ${Objec
 
 ensureWebBuild();
 
-const gate = new StressGate();
+const gate = new StressGate({ nextRunAt: () => cycler.nextRunAt });
 let servingSince = 0;
 const cycler = new ReplayCycler({
   ports: [ports[0]!, ports[1]!],
@@ -170,10 +170,11 @@ function startEngine(port: number, run: number): ReplayEngine {
   };
 }
 
-/** web/dist from the image's build; built here when missing (a host that ran the plain Dockerfile), as the hosted build. */
+/** web/dist from the image's build; built here as the hosted build when missing or not hosted (the plain Dockerfile, a local `npm run build`). */
 function ensureWebBuild(): void {
-  if (existsSync(join(webDir, 'index.html'))) return;
-  log('web/dist is missing: building the dashboard once (production build)');
+  const index = join(webDir, 'index.html');
+  if (existsSync(index) && isHostedBuild(readFileSync(index, 'utf8'))) return;
+  log(`web/dist ${existsSync(index) ? 'is not the hosted build (no hosted-replay marker)' : 'is missing'}: building the hosted dashboard once (production build)`);
   const require = createRequire(join(root, 'package.json'));
   if (!existsSync(join(root, 'shared', 'dist', 'index.js'))) {
     const tsc = join(dirname(require.resolve('typescript/package.json')), 'bin', 'tsc');

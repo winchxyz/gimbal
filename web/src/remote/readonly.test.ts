@@ -36,9 +36,13 @@ test('only VITE_HOSTED_REPLAY=1 makes the hosted build; the normal build (no fla
 test('only Dockerfile.replay builds the page with VITE_HOSTED_REPLAY=1', () => {
   const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
   assert.match(readFileSync(join(root, 'Dockerfile.replay'), 'utf8'), /VITE_HOSTED_REPLAY=1 npm run build -w web/);
-  for (const file of ['Dockerfile', 'package.json', 'web/package.json', 'web/vite.config.ts', 'tools/demo.mjs']) {
+  for (const file of ['Dockerfile', 'package.json', 'web/package.json', 'tools/demo.mjs']) {
     assert.doesNotMatch(readFileSync(join(root, file), 'utf8'), /VITE_HOSTED_REPLAY/, file);
   }
+  // The Vite config only reads it (to mark the hosted build's index.html), never sets it.
+  const vite = readFileSync(join(root, 'web/vite.config.ts'), 'utf8');
+  assert.doesNotMatch(vite, /VITE_HOSTED_REPLAY\s*(=|:)\s*['"]1/);
+  assert.match(vite, /process\.env\.VITE_HOSTED_REPLAY === '1' \?/);
 });
 
 test('an address in the settings makes the page read-only; none leaves it local', () => {
@@ -68,6 +72,8 @@ test('every component that draws a write control asks writeControls first', () =
     ['security/States.tsx', 'onboarding'],
     ['shell/Shell.tsx', 'onboarding'],
     ['desk/DeskScreen.tsx', 'owner'],
+    ['windows/Detail.tsx', 'close'],
+    ['windows/Detail.tsx', 'rotate'],
   ];
   for (const [file, control] of gated) {
     const code = readFileSync(join(src, file), 'utf8');

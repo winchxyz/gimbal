@@ -61,8 +61,16 @@ const refusalTests = (): Plugin => ({
     id === `\0${REFUSAL_TESTS}` ? `export default ${JSON.stringify(findRefusalTests(readContractSources(repoRoot), REFUSAL_CODES))};` : null,
 });
 
+// The hosted replay's build (Dockerfile.replay, VITE_HOSTED_REPLAY=1) marks its index.html, so the host
+// (engine/src/cli/replay-host.ts) can tell it from the normal build. Every other build is left as it was.
+const hostedMarker = (): Plugin => ({
+  name: 'gimbal-hosted-marker',
+  transformIndexHtml: (html) =>
+    process.env.VITE_HOSTED_REPLAY === '1' ? html.replace('<head>', '<head>\n<meta name="gimbal-build" content="hosted-replay">') : html,
+});
+
 export default defineConfig({
-  plugins: [react(), refusalTests()],
+  plugins: [react(), refusalTests(), hostedMarker()],
   server: {
     port: 5190,
     strictPort: true,

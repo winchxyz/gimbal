@@ -1,14 +1,15 @@
 // The hosted replay's parts (replay-host.ts runs them), kept apart so they are tested without a child engine:
 //   hostedRoute()    which requests the public port answers, and how: the dashboard's files, the engine's GET routes,
 //                    POST /stress through StressGate, everything else refused as read-only;
-//   StressGate       POST /stress one at a time, at most one a minute for all visitors, only while a pair is held;
+//   StressGate       POST /stress one at a time, one per run, never during a rescue, only while a pair is held;
 //   ReplayCycler     starts the replay engine, and once its recorded hour has played (plus a pause on the flat desk)
 //                    starts a fresh one on the other internal port, switches the proxy to it and stops the old one;
 //   childEnv()       the engine's environment: an allowlist, so no variable of the host (a key, a token) reaches it;
-//   createHostServer the public HTTP server: one origin for the built dashboard and the engine's read routes.
+//   createHostServer the public HTTP server: one origin for the built dashboard and the engine's read routes, with
+//                    backpressure and a per-client cap on event streams.
 
 import { createReadStream, existsSync, statSync } from 'node:fs';
-import { createServer, request } from 'node:http';
+import { Agent, createServer, request } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { extname, join, normalize, resolve, sep } from 'node:path';
 import type { EngineState } from '@gimbal/shared';
@@ -58,27 +59,46 @@ export interface StressRefusal {
   retryAfterS?: number;
 }
 
-/** Real ms between two stress tests the engine accepted, for everyone together. */
-export const STRESS_COOLDOWN_MS = 60_000;
-
 /**
  * POST /stress for the public: the engine itself refuses one with no leg open; this also keeps it to one at a time,
- * one a minute for all visitors, and never while a rescue runs, so a crowd of clicks cannot keep the desk in rescue.
+ * never while a rescue runs, and one per replay run, so the realized P&L a visitor sees is the recorded hour's plus at
+ * most one rescue, and a crowd of clicks cannot keep the desk in rescue.
  */
 export class StressGate {
-  readonly #cooldownMs: number;
+  readonly #nextRunAt: () => number | null;
   readonly #now: () => number;
   #inFlight = false;
-  #lastAccepted: number | null = null;
+  #used = false;
 
-  constructor(options: { cooldownMs?: number; now?: () => number } = {}) {
-    this.#cooldownMs = options.cooldownMs ?? STRESS_COOLDOWN_MS;
+  /** `nextRunAt`: when the next run takes over (ms), for the answer to a second stress test; null when unknown. */
+  constructor(options: { nextRunAt?: () => number | null; now?: () => number } = {}) {
+    this.#nextRunAt = options.nextRunAt ?? (() => null);
     this.#now = options.now ?? Date.now;
   }
 
   /** Why a stress test cannot start now, given the engine's GET /state (null: it did not answer). */
   check(state: Pick<EngineState, 'desk' | 'rescue'> | null): StressRefusal | null {
+    return this.busy() ?? this.#checkState(state);
+  }
+
+  /** The refusals that need no look at the engine: one in flight, or this run's already used. */
+  busy(): StressRefusal | null {
     if (this.#inFlight) return { status: 409, reason: 'A stress test request is being handled right now; watch it on Rescue.' };
+    if (this.#used) {
+      const at = this.#nextRunAt();
+      const s = at === null ? null : Math.max(1, Math.ceil((at - this.#now()) / 1000));
+      return {
+        status: 409,
+        reason: 'This public replay allows one stress test per run, so the realized P&L stays the recorded hour\'s plus at most one rescue, '
+          + `and this run has had its stress test. The replay starts over in ${s === null ? 'a few minutes' : `${s} s`}; `
+          + 'run `npm run demo` for a desk of your own.',
+        ...(s === null ? {} : { retryAfterS: s }),
+      };
+    }
+    return null;
+  }
+
+  #checkState(state: Pick<EngineState, 'desk' | 'rescue'> | null): StressRefusal | null {
     if (state === null) return { status: 503, reason: 'The replay is starting over; try again in a few seconds.' };
     const rescue = state.rescue;
     if (state.desk?.health === 'rescue' || (rescue !== null && rescue.step !== 'landed' && rescue.step !== 'failed')) {
@@ -91,13 +111,6 @@ export class StressGate {
           + 'and holds it for most of the recorded hour; try again once the Desk shows two legs.',
       };
     }
-    if (this.#lastAccepted !== null) {
-      const left = this.#lastAccepted + this.#cooldownMs - this.#now();
-      if (left > 0) {
-        const s = Math.ceil(left / 1000);
-        return { status: 429, reason: `One stress test a minute for all visitors; the next one in ${s} s.`, retryAfterS: s };
-      }
-    }
     return null;
   }
 
@@ -106,16 +119,36 @@ export class StressGate {
     this.#inFlight = true;
   }
 
-  /** The engine answered; `accepted` starts the cooldown. */
+  /** The engine answered; `accepted` uses up this run's stress test. */
   end(accepted: boolean): void {
     this.#inFlight = false;
-    if (accepted) this.#lastAccepted = this.#now();
+    if (accepted) this.#used = true;
   }
 
-  /** A new replay starts: the last one's cooldown does not carry over. */
+  /** A new run serves: it has its own stress test. */
   reset(): void {
-    this.#lastAccepted = null;
+    this.#used = false;
   }
+}
+
+/**
+ * The only bodies POST /stress takes from the public: none, `{}` (what the dashboard sends) or `{"on":true}`. Null when
+ * the body is one of them, else why not: turning stress off, or anything else, is not the public's.
+ */
+export function stressBodyProblem(text: string): string | null {
+  const t = text.trim();
+  if (t === '') return null;
+  let body: unknown;
+  try {
+    body = JSON.parse(t);
+  } catch {
+    return 'the body is not JSON';
+  }
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return 'the body must be {} or {"on":true}';
+  const keys = Object.keys(body);
+  if (keys.length === 0) return null;
+  if (keys.length === 1 && (body as { on?: unknown }).on === true) return null;
+  return 'the body must be {} or {"on":true}';
 }
 
 /** One replay engine the cycler started. */
@@ -162,6 +195,7 @@ export class ReplayCycler {
   #serving = 0;
   #failures = 0;
   #timer: ReturnType<typeof setTimeout> | undefined;
+  #nextAt: number | null = null;
   #stopped = false;
   #launching: Promise<void> | null = null;
 
@@ -177,6 +211,11 @@ export class ReplayCycler {
   /** The run serving now (1 for the first), 0 before any. */
   get serving(): number {
     return this.#current === null ? 0 : this.#serving;
+  }
+
+  /** When the next run is due to start (ms), or null while none is scheduled. */
+  get nextRunAt(): number | null {
+    return this.#nextAt;
   }
 
   start(): Promise<void> {
@@ -198,7 +237,9 @@ export class ReplayCycler {
 
   #schedule(ms: number): void {
     clearTimeout(this.#timer);
+    this.#nextAt = null;
     if (this.#stopped) return;
+    this.#nextAt = Date.now() + ms;
     this.#timer = setTimeout(() => void this.#launch(), ms);
     this.#timer.unref?.();
   }
@@ -275,6 +316,16 @@ export function childEnv(env: Readonly<Record<string, string | undefined>>): Rec
   return { ...out, GIMBAL_MODE: 'replay', GIMBAL_TRADE: '1' };
 }
 
+/**
+ * What the hosted build writes into index.html (web/vite.config.ts, with VITE_HOSTED_REPLAY=1): the host rebuilds a
+ * web/dist without it, so it never serves the normal page with its write controls.
+ */
+export const HOSTED_BUILD_MARKER = '<meta name="gimbal-build" content="hosted-replay">';
+
+export function isHostedBuild(indexHtml: string): boolean {
+  return indexHtml.includes(HOSTED_BUILD_MARKER);
+}
+
 const TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -320,44 +371,106 @@ export interface HostServerOptions {
   log?: (line: string) => void;
   /** Event streams open at once, for everyone; more are answered 503 (the page retries). */
   maxStreams?: number;
+  /** Event streams open at once from one address (clientKey); more are answered 429. */
+  maxStreamsPerClient?: number;
+  /** Bytes a client may leave unread on one response before it is dropped. */
+  maxUnreadBytes?: number;
   /** A line for GET /healthz while serving (which run, where in it). */
   status?: () => Record<string, unknown>;
 }
 
 /** What a request to the engine keeps of the browser's headers; Host is the engine's own, Origin is never sent. */
-const FORWARD_HEADERS = ['accept', 'content-type', 'content-length', 'last-event-id', 'cache-control'];
+const FORWARD_HEADERS = ['accept', 'content-type', 'last-event-id', 'cache-control'];
+/** A client that leaves more than this unread is dropped, as the engine drops its own slow SSE clients (1 MiB). */
+export const MAX_UNREAD_BYTES = 1024 * 1024;
+export const MAX_STREAMS_PER_CLIENT = 4;
 
 /**
- * The public server. Requests proxied to the engine are tracked, so a switch to the next run ends them (dropStreams):
- * the page sees its stream close, reconnects, and reads the new run's GET /state.
+ * Who a request comes from, for the per-client stream cap: behind Railway's proxy X-Real-IP (the client address its
+ * edge sets), else the last X-Forwarded-For entry (the one the nearest proxy appended), else the socket's address.
+ * A client that forges these gains at most its own extra streams; the global cap still holds.
  */
-export function createHostServer(o: HostServerOptions): Server & { dropStreams(): void } {
+export function clientKey(req: { headers: IncomingMessage['headers']; socket: { remoteAddress?: string | undefined } }): string {
+  const real = req.headers['x-real-ip'];
+  if (typeof real === 'string' && real.trim() !== '') return real.trim();
+  const xff = req.headers['x-forwarded-for'];
+  const list = typeof xff === 'string' ? xff : Array.isArray(xff) ? xff.join(',') : '';
+  const last = list.split(',').map((s) => s.trim()).filter((s) => s !== '').at(-1);
+  if (last !== undefined) return last;
+  return req.socket.remoteAddress ?? 'unknown';
+}
+
+/** A request with a body where none belongs (a GET or HEAD): answered 400 and its connection closed, never forwarded. */
+function hasBody(req: IncomingMessage): boolean {
+  const length = req.headers['content-length'];
+  return req.headers['transfer-encoding'] !== undefined || (length !== undefined && length.trim() !== '0');
+}
+
+export interface HostServer extends Server {
+  /** Ends every proxied response (a switch to the next run): the page reconnects to the new one. */
+  dropStreams(): void;
+  /** What the server holds now: proxied responses open, event streams, bytes written and not yet read by clients. */
+  stats(): { proxied: number; streams: number; unreadBytes: number };
+}
+
+/**
+ * The public server. Every proxied response is written with backpressure: a client that stops reading stops the read
+ * from the engine (whose own 1 MiB cap then drops that stream), and one that leaves more than maxUnreadBytes is dropped
+ * here, so slow or paused clients cannot grow the host's memory. Requests to the engine use a connection each (no
+ * keep-alive), so nothing one request leaves on a socket can reach the next.
+ */
+export function createHostServer(o: HostServerOptions): HostServer {
   const open = new Set<ServerResponse>();
+  const perClient = new Map<string, number>();
   let streams = 0;
   const log = (line: string) => o.log?.(line);
+  const agent = new Agent({ keepAlive: false });
+  const maxUnread = o.maxUnreadBytes ?? MAX_UNREAD_BYTES;
 
-  const proxy = (req: IncomingMessage, res: ServerResponse, port: number, body?: Buffer): Promise<{ status: number; text: string | null }> =>
+  const proxy = (
+    req: IncomingMessage, res: ServerResponse, port: number, opts: { method?: string; body?: Buffer; headOnly?: boolean } = {},
+  ): Promise<{ status: number; text: string | null }> =>
     new Promise((done) => {
       const headers: Record<string, string> = { host: `127.0.0.1:${port}` };
       for (const h of FORWARD_HEADERS) {
         const v = req.headers[h];
         if (typeof v === 'string') headers[h] = v;
       }
-      if (body !== undefined) headers['content-length'] = String(body.length);
-      const up = request({ host: '127.0.0.1', port, method: req.method, path: req.url, headers }, (upRes) => {
+      // Only a body actually sent is announced: a length with nothing behind it would leave the engine waiting.
+      if (opts.body !== undefined) headers['content-length'] = String(opts.body.length);
+      const up = request({ agent, host: '127.0.0.1', port, method: opts.method ?? req.method, path: req.url, headers }, (upRes) => {
         const status = upRes.statusCode ?? 502;
         const keep: Record<string, string | string[]> = {};
-        for (const [k, v] of Object.entries(upRes.headers)) if (v !== undefined && k !== 'connection') keep[k] = v;
+        for (const [k, v] of Object.entries(upRes.headers)) if (v !== undefined && k !== 'connection' && k !== 'keep-alive') keep[k] = v;
         res.writeHead(status, keep);
+        if (opts.headOnly === true) {
+          res.end();
+          upRes.destroy();
+          done({ status, text: null });
+          return;
+        }
         open.add(res);
         const chunks: Buffer[] = [];
+        let waiting = false;
         upRes.on('data', (c: Buffer) => {
-          if (body !== undefined) chunks.push(c);
-          res.write(c);
+          if (opts.body !== undefined) chunks.push(c);
+          if (!res.write(c) && !waiting) {
+            waiting = true;
+            upRes.pause();
+            res.once('drain', () => {
+              waiting = false;
+              upRes.resume();
+            });
+          }
+          if (res.writableLength > maxUnread) {
+            log(`client dropped: ${res.writableLength} bytes unread on ${req.url}, over ${maxUnread}`);
+            res.destroy();
+            upRes.destroy();
+          }
         });
         upRes.on('end', () => {
           res.end();
-          done({ status, text: body === undefined ? null : Buffer.concat(chunks).toString('utf8') });
+          done({ status, text: opts.body === undefined ? null : Buffer.concat(chunks).toString('utf8') });
         });
         // The engine stopped mid-stream: end the browser's side too, so the page notices and reconnects.
         upRes.on('close', () => {
@@ -375,7 +488,7 @@ export function createHostServer(o: HostServerOptions): Server & { dropStreams()
         open.delete(res);
         up.destroy();
       });
-      up.end(body);
+      up.end(opts.body);
     });
 
   const readState = async (port: number): Promise<EngineState | null> => {
@@ -393,8 +506,14 @@ export function createHostServer(o: HostServerOptions): Server & { dropStreams()
     const route = hostedRoute(method, url.pathname);
     res.setHeader('x-content-type-options', 'nosniff');
     if (route.kind === 'refuse') {
+      res.setHeader('connection', 'close');
       req.resume();
       return sendJson(res, route.status, route.body);
+    }
+    if (route.kind !== 'stress' && hasBody(req)) {
+      res.setHeader('connection', 'close');
+      req.resume();
+      return sendJson(res, 400, { ok: false, reason: `${method} ${url.pathname} takes no body`, error: 'body' });
     }
     if (route.kind === 'health') {
       const port = o.target();
@@ -418,11 +537,31 @@ export function createHostServer(o: HostServerOptions): Server & { dropStreams()
       return sendJson(res, 503, { ok: false, reason: 'The replay is starting; try again in a few seconds.', error: 'engine not ready' });
     }
     if (route.kind === 'proxy') {
-      const stream = url.pathname.startsWith('/events');
+      const stream = url.pathname === '/events' || url.pathname.startsWith('/events/');
+      // HEAD is a GET without the body: answered here for the stream, with the engine's headers for the rest.
+      if (method === 'HEAD') {
+        if (stream) {
+          res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform' });
+          return void res.end();
+        }
+        await proxy(req, res, port, { method: 'GET', headOnly: true });
+        return;
+      }
       if (stream) {
+        const key = clientKey(req);
+        const mine = perClient.get(key) ?? 0;
         if (streams >= (o.maxStreams ?? 500)) return sendJson(res, 503, { error: 'too many open streams; the page retries' });
+        if (mine >= (o.maxStreamsPerClient ?? MAX_STREAMS_PER_CLIENT)) {
+          return sendJson(res, 429, { error: `${mine} streams are open from this address already; close a tab and the page retries` });
+        }
         streams++;
-        res.on('close', () => streams--);
+        perClient.set(key, mine + 1);
+        res.on('close', () => {
+          streams--;
+          const n = (perClient.get(key) ?? 1) - 1;
+          if (n <= 0) perClient.delete(key);
+          else perClient.set(key, n);
+        });
       }
       await proxy(req, res, port);
       return;
@@ -439,7 +578,10 @@ export function createHostServer(o: HostServerOptions): Server & { dropStreams()
     } catch (err) {
       return sendJson(res, 400, { ok: false, reason: `POST /stress: ${err instanceof Error ? err.message : String(err)}`, error: 'body' });
     }
-    const refused = o.gate.check(await readState(port));
+    // Checked before the gate: a refused body does not use up the run's stress test.
+    const problem = stressBodyProblem(body.toString('utf8'));
+    if (problem !== null) return sendJson(res, 400, { ok: false, reason: `POST /stress: ${problem}`, error: 'body' });
+    const refused = o.gate.busy() ?? o.gate.check(await readState(port));
     if (refused !== null) {
       if (refused.retryAfterS !== undefined) res.setHeader('retry-after', String(refused.retryAfterS));
       return sendJson(res, refused.status, { ok: false, reason: refused.reason, error: refused.reason });
@@ -447,7 +589,7 @@ export function createHostServer(o: HostServerOptions): Server & { dropStreams()
     o.gate.begin();
     let accepted = false;
     try {
-      const answer = await proxy(req, res, port, body);
+      const answer = await proxy(req, res, port, { body: Buffer.from('{"on":true}') });
       accepted = answer.status === 200;
       log(`POST /stress: ${accepted ? 'started' : `refused by the engine (${answer.status}) ${answer.text ?? ''}`}`);
     } finally {
@@ -466,6 +608,11 @@ export function createHostServer(o: HostServerOptions): Server & { dropStreams()
     dropStreams(): void {
       for (const res of open) res.destroy();
       open.clear();
+    },
+    stats() {
+      let unreadBytes = 0;
+      for (const res of open) unreadBytes += res.writableLength;
+      return { proxied: open.size, streams, unreadBytes };
     },
   });
 }

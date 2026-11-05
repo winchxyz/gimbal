@@ -8,3 +8,19 @@ node_modules
 contract/target
 target
 *.log
+# Kept in step with .gitignore: local tool settings, submission drafts, caches and scratch fixtures never go in an image.
+.claude
+submission*.json
+**/*.tsbuildinfo
+.cache
+**/.cache
+.vite
+**/.vite
+coverage
+**/coverage
+.eslintcache
+**/*.tmp
+**/*.tmp-*
+**/.DS_Store
+**/fixtures/**/scratch
+**/fixtures/**/*.partial
