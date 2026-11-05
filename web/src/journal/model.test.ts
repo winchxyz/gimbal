@@ -233,6 +233,64 @@ test('the counts: actions the contract signed, refusals and risk check refusals'
   assert.equal(actionsText(23), '23 actions signed');
   assert.equal(actionsText(1), '1 action signed');
   assert.equal(actionsText(1234), '1,234 actions signed');
+  // A replay signs nothing: its actions are simulated.
+  assert.equal(actionsText(2, true), '2 simulated actions');
+  assert.equal(actionsText(1, true), '1 simulated action');
+});
+
+test('a closed pair’s realized split joins the flat desk’s P&L, so the net agrees with the day totals', () => {
+  const flat: DeskState['pnl'] = { fundingUsd: 0, feesUsd: 0, priceUsd: 0, netUsd: 0 };
+  const journal = [
+    entry({ kind: 'enter', numbers: { usd: -0.011, feeUsd: -0.011 } }),
+    entry({ kind: 'funding', numbers: { usd: 0.004 } }),
+    entry({
+      kind: 'exit',
+      numbers: { usd: -0.019, feeUsd: -0.011, realizedFundingUsd: 0.005, realizedFeesUsd: -0.022, realizedPriceUsd: -0.009, realizedNetUsd: -0.026 },
+    }),
+  ];
+  const a = attributionOf(flat, journal);
+  assert.equal(Math.round((a.fundingUsd ?? 0) * 1000) / 1000, 0.005);
+  assert.equal(Math.round((a.feesUsd ?? 0) * 1000) / 1000, -0.022);
+  assert.equal(Math.round((a.basisUsd ?? 0) * 1000) / 1000, -0.009);
+  assert.equal(Math.round((a.netUsd ?? 0) * 1000) / 1000, -0.026);
+  // The same as the entries' money effects summed (what the day totals count).
+  const days = journal.reduce((s, e) => s + pnlOf(e), 0);
+  assert.equal(Math.round(days * 1000) / 1000, -0.026);
+});
+
+test('a rescue the engine journaled with its fee apart counts that fee once, on the line that says it landed', () => {
+  const sent = entry({ kind: 'rescue', numbers: { from: 'reserve', usd: 0, feeUsd: -0.52, amountUsd: 20, signedS: 0 } });
+  const landed = entry({ kind: 'rescue', numbers: { from: 'reserve', usd: 0, feeUsd: -0.52, amountUsd: 19.48, landedS: 100.9 } });
+  const trigger = entry({ kind: 'rescue', numbers: { venue: 'hyperliquid', rescuePct: 87.27, amountUsd: 1.42 } });
+  assert.deepEqual([pnlOf(trigger), pnlOf(sent), pnlOf(landed)], [0, 0, -0.52]);
+  const flat: DeskState['pnl'] = { fundingUsd: 0, feesUsd: 0, priceUsd: 0, netUsd: 0 };
+  assert.equal(attributionOf(flat, [trigger, sent, landed]).otherUsd, -0.52);
+  // A rescue whose cost is its amount (the web's own fixtures) keeps it.
+  assert.equal(pnlOf(entry({ kind: 'rescue', numbers: { usd: -0.31, landedS: 52 } })), -0.31);
+  // The sent line's fee is the quote: labelled so, not counted; the landed line's is the fee.
+  assert.equal(rowOf(sent).note, 'quoted fee −$0.52');
+  assert.equal(rowOf(landed).note, 'fee −$0.52');
+});
+
+test('from Hyperliquid, the withdrawal fee and the 1Click fee each count once; a reduce costs nothing here', () => {
+  // The rescuer's lines for a Hyperliquid source: hl_withdraw (1 USDC fee, to the desk's own Arbitrum address), the
+  // 1Click send from Arbitrum (quoted), the landing (the 1Click fee); and a reduce, whose cost is in the fills.
+  const started = entry({ kind: 'rescue', numbers: { venue: 'phoenix', amountUsd: 12, from: 'hyperliquid' } });
+  const withdraw = entry({ kind: 'rescue', numbers: { from: 'hyperliquid', usd: 0, feeUsd: -1, signedS: 3.2 } });
+  const sent = entry({ kind: 'rescue', numbers: { from: 'hyperliquid', usd: 0, feeUsd: -0.3, amountUsd: 11, signedS: 41.5 } });
+  const landed = entry({ kind: 'rescue', numbers: { from: 'hyperliquid', landedS: 160.2, signedS: 41.5, usd: 0, amountUsd: 10.7, feeUsd: -0.3 } });
+  const reduce = entry({ kind: 'rescue', numbers: { from: 'phoenix', usd: 0, signedS: 2 } });
+  assert.deepEqual([started, withdraw, sent, landed, reduce].map(pnlOf), [0, -1, 0, -0.3, 0]);
+  const flat: DeskState['pnl'] = { fundingUsd: 0, feesUsd: 0, priceUsd: 0, netUsd: 0 };
+  assert.equal(attributionOf(flat, [started, withdraw, sent, landed, reduce]).otherUsd, -1.3);
+  assert.equal(rowOf(withdraw).note, 'fee −$1.00');
+  assert.equal(rowOf(sent).note, 'quoted fee −$0.30');
+});
+
+test('a replay rescue row shows no signature time: nothing is signed', () => {
+  const landed = entry({ kind: 'rescue', numbers: { from: 'reserve', usd: 0, feeUsd: -0.52, amountUsd: 19.48, landedS: 100.9, signedS: 0 } });
+  assert.deepEqual(rowOf(landed, { replay: true }).steps, ['detected', 'source: reserve', 'quote ✓', 'landed 101 s']);
+  assert.deepEqual(rowOf(landed).steps, ['detected', 'source: reserve', 'quote ✓', 'signed 0.0 s', 'landed 101 s']);
 });
 
 test('where the money went: the desk’s funding, fees and price, and the journal’s cost of moving money', () => {

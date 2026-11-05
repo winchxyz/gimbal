@@ -4,12 +4,15 @@ import { signedUsd } from '../desk/format.ts';
 import { Flash } from '../ui/Flash.tsx';
 import { oneLegCopy, refusedCopy } from '../ui/waitCopy.ts';
 import { cx } from '../ui/cx.ts';
+import { useStream } from '../stream/hub.ts';
 import { rowOf, type DayGroup } from './model.ts';
 import { collapseWaits, waitsView } from './waits.ts';
 
 /** One entry: when, what kind, the engine's one line, the reason, the money, and the links that prove it. */
 const Entry = memo(function Entry({ entry }: { entry: JournalEntry }) {
-  const row = rowOf(entry);
+  // A replay signs nothing: its rescue rows show no signature time.
+  const replay = useStream((s) => (s.desk?.mode ?? s.mode) === 'replay');
+  const row = rowOf(entry, { replay });
   // A refused open (cost, the pair's venues, a rotation out of an Orderly leg) and the close of a lone leg say so in
   // plain words; the engine's line stays under it.
   const refused = entry.kind === 'refused' ? refusedCopy(entry.summary) : entry.kind === 'error' ? oneLegCopy(entry.summary) : null;

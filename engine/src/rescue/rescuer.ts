@@ -685,8 +685,12 @@ export class Rescuer {
     // From here the screen shows what this transfer sends, not what the leg needed: a capped or fixed-size move
     // (the recorded 20 USDC) is smaller, and the rest comes from the next rescue.
     if (plan.kind === 'transfer') run.amountUsd = run.sentUsd = round2(plan.amountInUsd);
+    // Recorded mode plays a recorded quote of a fixed amount: it says so, since its fee is the recording's, not the estimate.
+    const fixed = plan.kind === 'transfer' ? this.#o.fixedAmountUsd?.(plan.from, plan.to) ?? null : null;
+    const recorded = fixed === null ? ''
+      : `; the recording's quote is for a fixed ${fixed.toFixed(2)} USD, so it moves that, and its fee is the one the recording quoted, not this estimate`;
     this.#journal(run, `rescue ${t.id} started: ${t.venue} ${t.symbol} needs ${t.amountUsd.toFixed(2)} USD of margin; ${planText(plan)}`
-      + `${plan.notes.length === 0 ? '' : ` (passed over: ${plan.notes.join('; ')})`}`, { venue: t.venue, amountUsd: t.amountUsd, from: run.from });
+      + `${plan.notes.length === 0 ? '' : ` (passed over: ${plan.notes.join('; ')})`}${recorded}`, { venue: t.venue, amountUsd: t.amountUsd, from: run.from });
     if (plan.kind === 'none') {
       return this.#fail(run, 'source', `${plan.reason}${plan.notes.length === 0 ? '' : `; passed over: ${plan.notes.join('; ')}`}`, 'only the owner can act now');
     }

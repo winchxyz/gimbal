@@ -94,6 +94,8 @@ export interface ServeLoopInput {
   /** Tests: stand-ins for the hands and decide(). */
   hands?: LoopHands | null;
   decide?: (input: DecideInput) => Decision;
+  /** What `hands` are, for the loop's start line (replay: the replay desk's). */
+  handsLine?: string;
 }
 
 /**
@@ -150,7 +152,7 @@ export function serveLoop(input: ServeLoopInput): StrategyLoop {
     ...(pairs === undefined ? {} : { pairs }),
   });
   return new StrategyLoop({
-    trade, hands, ...(handsWhy === undefined ? {} : { handsWhy }),
+    trade, hands, ...(handsWhy === undefined ? {} : { handsWhy }), ...(input.handsLine === undefined ? {} : { handsLine: input.handsLine }),
     strategy: input.strategy, policy: input.policy, windows: input.windows,
     freeMargin: freeMarginReader(input.accounts, input.log),
     liveRescue: () => Object.fromEntries(LOOP_VENUES.map((v) => [v, (typeof input.rescueLive === 'function' ? input.rescueLive() : input.rescueLive) && LIVE_RESCUE[v] === true])),

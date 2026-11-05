@@ -26,12 +26,14 @@ import {
   feesText,
   isRunning,
   movingOf,
+  rescueLine,
   stepSeconds,
   stepStates,
   stepText,
   targetLeg,
   timerSeconds,
   triesText,
+  triggerOf,
   txByStep,
   usualSeconds,
   type StepId,
@@ -83,11 +85,16 @@ function Run({ progress: p, desk, strategy, mode }: RunProps) {
   const failedAt = failedStep(p, failure, book);
   const states = stepStates(p.step, failedAt);
   const leg = targetLeg(desk, p);
-  const line = strategy?.risk.rescueDistancePct ?? null;
+  // A stress test (or the venue's volatility) raises the line the leg is measured against: the page names the raised
+  // line with the owner's, so "came inside" and "clear of" talk about the same line.
+  const trigger = triggerOf(entries, p);
+  const line = rescueLine(strategy?.risk.rescueDistancePct ?? null, trigger);
   const seconds = timerSeconds(p, now);
   const txs = txByStep(p, CHAIN_OF[p.to]);
-  const usual = usualSeconds(entries, p.startedAt);
-  const moving = movingOf(p, failure);
+  // Earlier rescues are the ones before this rescue's own trigger line, which comes a moment before it starts.
+  const before = trigger?.t ?? p.startedAt;
+  const usual = usualSeconds(entries, before);
+  const moving = movingOf(p, failure, trigger?.needUsd ?? null, mode);
   const distance = leg?.distanceToLiqPct ?? null;
   const failed = p.step === 'failed';
   // The phone has no buttons in the status line: the owner's choices go under the numbers when the desk needs them.
@@ -119,7 +126,7 @@ function Run({ progress: p, desk, strategy, mode }: RunProps) {
         <div className="end">
           <div className="r-lab">{leg ? `${VENUE_NAMES[p.to]} ${leg.side}, distance to liquidation` : `${VENUE_NAMES[p.to]}, distance to liquidation`}</div>
           <div className="val">
-            <b className={cx(failed && distance !== null && line !== null && distance < line && 'neg')}>
+            <b className={cx(failed && distance !== null && line.pct !== null && distance < line.pct && 'neg')}>
               <Flash value={distance}>{distance === null ? '—' : pct(distance)}</Flash>
             </b>
             <span>{distanceNote(distance, line)}</span>
@@ -136,7 +143,7 @@ function Run({ progress: p, desk, strategy, mode }: RunProps) {
             id={id}
             n={i + 1}
             state={states[id]}
-            text={states[id] === 'fail' ? failText(failure) : stepText(id, { p, leg, line })}
+            text={states[id] === 'fail' ? failText(failure) : stepText(id, { p, leg, line, mode })}
             time={timeOf(id, states[id], p, book, now, failure?.tries ?? null, failed)}
             replay={mode === 'testnet' && (id === 'quote' || id === 'deposit' || id === 'landed') && (states[id] === 'done' || states[id] === 'now')}
             tx={txs[id]}
@@ -146,7 +153,7 @@ function Run({ progress: p, desk, strategy, mode }: RunProps) {
 
       <div className="r-bottom">
         <Now leg={leg} desk={desk} p={p} />
-        <Earlier entries={entries} before={p.startedAt} />
+        <Earlier entries={entries} before={before} />
         <Stress mode={mode} running={running} />
       </div>
     </div>

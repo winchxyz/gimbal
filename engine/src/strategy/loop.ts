@@ -507,6 +507,8 @@ export interface StrategyLoopOptions {
   /** The hands, or null when this serve has none (testnet, replay, alert only), with why. */
   hands: LoopHands | null;
   handsWhy?: string;
+  /** What the hands are, for the start line; default the pair trader (pair-mainnet open / close). */
+  handsLine?: string;
   /** Free margin per venue now (decide's freeMarginUsd); a venue that cannot be read is left out. */
   freeMargin: () => Promise<Record<string, number>>;
   /** Whether a live rescue route covers a leg on each venue (decide's liveRescue: a route exists, not one running). */
@@ -641,7 +643,7 @@ export class StrategyLoop {
     const counts = checkRulesOf(this.#o.strategy());
     const rules = `enter after ${counts.enterAfterChecks} hourly checks in a row, exit after ${counts.exitAfterChecks} (owner settings), cooldown ${LOOP_RULES.cooldownHours} h, time stop ${LOOP_RULES.maxHoldDays} d, at most ${LOOP_RULES.maxRotationsPerDay} rotations a day, a NEAR AI risk check refusal holds ${LOOP_RULES.vetoHoldHours} h`;
     const veto = this.#o.veto?.configured === true ? `NEAR AI risk check ${this.#o.veto.model} (${(this.#o.vetoTimeoutMs ?? LOOP_RULES.vetoTimeoutMs) / 1000} s)` : 'no NEAR AI risk check (NEAR_AI_API_KEY is not set: every window passes)';
-    const hands = this.#o.hands === null ? `no hands (${this.#o.handsWhy ?? 'nothing can be opened or closed here'}): decisions are published, acts journaled as refused` : 'acts through the pair trader (pair-mainnet open / close)';
+    const hands = this.#o.hands === null ? `no hands (${this.#o.handsWhy ?? 'nothing can be opened or closed here'}): decisions are published, acts journaled as refused` : (this.#o.handsLine ?? 'acts through the pair trader (pair-mainnet open / close)');
     return `strategy loop: ${this.#o.trade ? 'GIMBAL_TRADE=1' : 'GIMBAL_TRADE is not 1 (off)'}, auto ${this.#o.strategy().auto ? 'on' : 'off'}; ${hands}; ${veto}; ${rules}; state ${this.#o.store.path}`;
   }
 
@@ -1226,7 +1228,8 @@ export class StrategyLoop {
     }
     this.#record('exit', { windowId: id, symbol: held?.symbol ?? '', outcome: r, forecastNetAprPct: held?.entryNetAprPct ?? null, exitReason: reason, rotation: null, manual, startedAt: closeAt });
     this.#setHeld(null);
-    this.#journal('exit', `exit ${id}: ${reason}; ${r.reason} (${who})`, { window: id, by: who, feeUsd: r.feeUsd, ...(pnl === undefined ? {} : { pnlUsd: round(pnl) }) }, r.tx);
+    // A manual close's reason is already its "who": said once.
+    this.#journal('exit', `exit ${id}: ${reason}; ${r.reason}${reason === who ? '' : ` (${who})`}`, { window: id, by: who, feeUsd: r.feeUsd, ...(pnl === undefined ? {} : { pnlUsd: round(pnl) }) }, r.tx);
     return { end: 'done', sent: true, passing: false };
   }
 

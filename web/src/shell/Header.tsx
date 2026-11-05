@@ -53,7 +53,8 @@ export function Header({ screen }: { screen: ScreenId }) {
             {CONNECTING[connection]}
           </span>
         )}
-        {desk && <span>{desk.deskId}</span>}
+        {/* A replay's desk has no id of its own (it is "replay"): the network badge already says Replay. */}
+        {desk && mode !== 'replay' && <span>{desk.deskId}</span>}
         {mode && <MoneyActions mode={mode} />}
       </div>
     </header>

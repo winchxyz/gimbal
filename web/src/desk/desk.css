@@ -97,6 +97,12 @@
 .ev .t { color: var(--ink-3); }
 .ev .proof { color: var(--ink-3); transition: color var(--dur) var(--ease); }
 .ev a.proof:hover { color: var(--ink-2); }
+/* The rest of a long line: a quiet "more" after the head, the text under it when opened. */
+.ev .more { display: inline; margin-left: var(--s-2); }
+.ev .more > summary { display: inline; cursor: pointer; color: var(--ink-3); list-style: none; }
+.ev .more > summary::-webkit-details-marker { display: none; }
+.ev .more > summary:hover { color: var(--ink-2); }
+.ev .more[open] { display: block; margin: var(--s-2) 0 0; color: var(--ink-2); overflow-wrap: anywhere; }
 .ev .flag::before { content: ''; display: inline-block; width: 6px; height: 6px; border-radius: var(--r-dot); background: var(--watch); margin-right: var(--s-2); vertical-align: 1px; }
 
 .next { display: flex; justify-content: space-between; align-items: baseline; }

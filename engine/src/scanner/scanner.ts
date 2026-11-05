@@ -235,6 +235,8 @@ export class Scanner {
   readonly #books = new Map<string, BookRead>();
   /** Books a replay never recorded: noted the first scan each one is missed, in one line (they are asked every scan). */
   readonly #replayMisses = new Set<string>();
+  /** A replay's history read found nothing recorded: noted once. */
+  #replayHistoryMissed = false;
   readonly #rates = new RateStore();
   readonly #history = new Map<string, HistoryState>();
   readonly #older = new Map<string, OlderState>();
@@ -445,7 +447,8 @@ export class Scanner {
     }
     if (replayMissed.length > 0) {
       const n = replayMissed.length;
-      this.#note(`${n} book${n === 1 ? '' : 's'} not in the recording, their pairs left out: ${replayMissed.sort().join(', ')}`);
+      // A count, not the list: a replay finds most of them in its first scans, and the list is a screenful.
+      this.#note(`replay: ${n} more book${n === 1 ? '' : 's'} not in the recording, their pairs left out`);
     }
 
     // 5. price
@@ -789,7 +792,11 @@ export class Scanner {
           }
           return;
         }
-        this.#note(`${what} failed: ${errorMessage(err)}`);
+        // A replay asks for history the recording did not keep (each hour asks a new range): said once, not per read.
+        if (err instanceof ReplayMissError) {
+          if (!this.#replayHistoryMissed) this.#note('replay: funding history the recording did not keep goes without (each miss after this one is not logged)');
+          this.#replayHistoryMissed = true;
+        } else this.#note(`${what} failed: ${errorMessage(err)}`);
         if (older) {
           const o = this.#older.get(key);
           const failures = (o?.failures ?? 0) + 1;

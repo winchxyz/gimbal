@@ -106,7 +106,7 @@ import { watchReaders } from '../venues/watch/index.ts';
 import type { Clock } from '../venues/venue.ts';
 import { RiskEngine } from '../risk/engine.ts';
 import type { DeskSource } from '../risk/engine.ts';
-import { AccountsDeskSource, ReplayDesk } from '../risk/sources.ts';
+import { AccountsDeskSource, REPLAY_ACCOUNT_VENUES, REPLAY_DEPOSIT_USD, REPLAY_VENUE_CASH_USD, ReplayDesk } from '../risk/sources.ts';
 import type { ClosingWatch } from '../rescue/closing.ts';
 import { serveRescue } from '../rescue/serve-rescue.ts';
 import { retryingRescue } from '../rescue/rescue-retry.ts';
@@ -131,6 +131,7 @@ import { liveBookSources } from '../book/sources.ts';
 import { userStateDir } from '../trade/trader-state.ts';
 import type { StrategyLoop } from '../strategy/loop.ts';
 import { ThinningSink, WATCH_RECORD_GAPS, loadPolicyFile, replayStart, scanLine } from './serve-replay.ts';
+import { ReplayScript, fundingEntry, replayLoop, replayMarginVenues, replayMarketLines, replayPairSymbols } from './serve-replay-loop.ts';
 import { startView } from '../view/serve-view.ts';
 import { openJournal } from '../journal-store.ts';
 
@@ -208,6 +209,7 @@ let clock: Clock;
 let readers: Readers;
 let writer: JsonlGzWriter | null = null;
 let replayEnd: number | null = null;
+let replayBegin: number | null = null;
 let replayOracle: ReplayOracle | null = null;
 
 if (mode === 'replay') {
@@ -217,7 +219,14 @@ if (mode === 'replay') {
   const lines: RecordLine[] = readRecording(file);
   if (lines.length === 0) fail(`${file}: empty recording`);
   const start = replayStart(lines);
+  replayBegin = start;
   replayEnd = lines.reduce((m, l) => Math.max(m, l.t), 0);
+  // The replay desk sizes on whole lots, and a scan recording keeps no markets: the venues' wire recordings' stand in.
+  if (envVar('GIMBAL_TRADE') === '1') {
+    const markets = await replayMarketLines(lines, start);
+    lines.push(...markets);
+    if (markets.length > 0) log(`replay: markets (lots) for ${markets.map((l) => l.venue).join(', ')} from the venues' wire recordings (fixtures/hl-wire, fixtures/phoenix-wire); the scan recording keeps none`);
+  }
   const scaled = new ScaledClock(start, speed);
   const end = replayEnd;
   // The recording ends: time stops there, so the windows keep their last real numbers and timestamps.
@@ -262,7 +271,8 @@ const scanner = new Scanner(readers.venues, readers.watch, {
   config: scannerConfig,
   clock,
   oracle: contract?.prices ?? replayOracle,
-  marginHeldAt: () => marginVenues(server?.state().desk ?? null),
+  // Replay: the replay desk's accounts hold their USDC from the start, flat or not.
+  marginHeldAt: () => (mode === 'replay' ? replayMarginVenues(server?.state().desk ?? null) : marginVenues(server?.state().desk ?? null)),
   strategy: () => server?.strategy ?? DEFAULT_STRATEGY,
   onNote: (note) => noteOnce(note),
   held: () => loop?.heldWindow() ?? null,
@@ -377,13 +387,16 @@ if (orderlyPairsOn(envVar)) {
   }
 }
 if (mode === 'replay') {
-  deskSource = replayDesk = new ReplayDesk({
+  let fundingSeq = 0;
+  const desk = replayDesk = new ReplayDesk({
     venues: readers.venues, clock, strategy: () => server?.strategy ?? DEFAULT_STRATEGY,
-    onOpen: (summary) => {
-      log(summary);
-      publish({ type: 'journal', data: { id: `replay-desk-${clock.now().toString(36)}`, t: clock.now(), kind: 'enter', summary, numbers: {}, tx: [] } });
-    },
+    takerBps: (v) => (v in fees ? fees[v as keyof typeof fees].takerBps + fees[v as keyof typeof fees].extraBps : 0),
+    onFunding: (f) => publish({ type: 'journal', data: fundingEntry(f, `replay-funding-${f.to.toString(36)}-${++fundingSeq}`) }),
   });
+  deskSource = desk;
+  // The loop's free margin: the replay desk's accounts.
+  for (const v of REPLAY_ACCOUNT_VENUES) loopAccounts.push({ venue: v, read: () => desk.account(v) });
+  log(`replay desk (simulated, recorded prices): ${REPLAY_DEPOSIT_USD} USD deposited, ${REPLAY_VENUE_CASH_USD} USD on each of ${REPLAY_ACCOUNT_VENUES.join(' and ')}, the rest in the reserve; flat until the strategy loop opens a pair`);
 } else if (contract !== null) {
   const side = contract;
   const reader = (id: string) => readers.venues.find((v) => v.id === id);
@@ -485,6 +498,8 @@ if (deskSource !== null) {
     // Detect only while the live rescuer is not running: the trigger is not taken and is published at `detect`.
     rescuer: rescue.rescuer, rescuerRunning: rescue.running,
     ...(pair?.adl === undefined ? {} : { adl: pair.adl }),
+    // Replay: the trigger names the reserve its rescuer plans from first.
+    ...(replayDesk === null ? {} : { reserveUsd: () => replayDesk?.reserveUsd ?? null }),
   });
   if (pair !== null) {
     const lines = liveLines({
@@ -550,7 +565,8 @@ if (contract !== null && deskId !== null) {
 // the newest recorded one, shown as not attested (it is not fresh). A failed attestation never blocks trading.
 let attestationJournalSeq = 0;
 const attestationJournal = (line: string, a: Attestation | null) => {
-  const t = Date.now();
+  // Replay: on the replay clock, as every other line of its journal.
+  const t = mode === 'replay' ? clock.now() : Date.now();
   publish({
     type: 'journal',
     data: {
@@ -595,7 +611,10 @@ try {
 } catch (err) {
   log(`risk checks: NOT booked (${errorMessage(err)})`);
 }
-const booked = book === null ? null : loopBook(book, publish, log, () => loop?.held ?? null);
+// Replay: the loop's hands are the replay desk's, and its book port puts each act's money on its journal line.
+const replayParts = replayDesk === null ? null : replayLoop({ desk: replayDesk, policy: () => policy });
+const bookPort = book ?? replayParts?.book ?? null;
+const booked = bookPort === null ? null : loopBook(bookPort, publish, log, () => loop?.held ?? null);
 if (booked !== null) protectionClosed = booked.protectionClose;
 loop = serveLoop({
   mode, env: envVar, once: false, contractId: contract?.client.contractId ?? null, deskId, pair, lastDesk: () => lastDesk,
@@ -605,6 +624,7 @@ loop = serveLoop({
   strategy: () => server?.strategy ?? saved.strategy ?? DEFAULT_STRATEGY, policy: () => policy, publish: booked?.publish ?? publish, clock, log,
   ...(booked === null ? {} : { book: booked.sink }),
   ...(stateDirSet === undefined ? {} : { stateDir: resolve(stateDirSet) }),
+  ...(replayParts === null ? {} : { hands: replayParts.hands, pairSymbols: replayPairSymbols(() => policy), handsLine: 'acts on the replay desk (simulated fills at recorded prices, nothing signed or sent)' }),
   ...gates,
 });
 log(loop.startLine());
@@ -614,12 +634,17 @@ const strategyLoop = loop;
 // The journal survives a restart (journal-store.ts): next to the book in testnet and mainnet, memory only in replay.
 const journal = openJournal(mode, stateDirSet === undefined ? userStateDir(envVar) : resolve(stateDirSet), contract?.client.contractId ?? null, deskId, log);
 
+/** The owner's rules are in force: saved ones loaded at the start, or set over PUT /strategy (the replay script waits for them). */
+let strategySetByOwner = saved.strategy !== null;
 server = new EngineServer({
   mode,
   allowedOrigins: webOrigins(webPort),
   scanner,
   strategyLoop,
-  onStrategy: () => strategyLoop.onScan(),
+  onStrategy: () => {
+    strategySetByOwner = true;
+    strategyLoop.onScan();
+  },
   strategy: saved.strategy ?? DEFAULT_STRATEGY,
   saveStrategy: (s) => strategyStore.save(s),
   drafter,
@@ -641,6 +666,18 @@ server = new EngineServer({
 
 const listening = await server.start(port, host);
 risk?.start();
+// Replay with GIMBAL_TRADE=1 (npm run demo): the script that plays the owner's demo entry and close, so the loop's
+// whole cycle fits in the recording (serve-replay-loop.ts).
+let stopReplayScript: (() => void) | null = null;
+if (replayParts !== null && replayBegin !== null && replayEnd !== null && envVar('GIMBAL_TRADE') === '1') {
+  const live = server;
+  stopReplayScript = new ReplayScript({
+    clock, start: replayBegin, end: replayEnd, loop: strategyLoop, windows: () => live.state().windows, strategy: () => live.strategy,
+    // The demo sets the owner's rules (PUT /strategy) once the engine answers: the script waits for them.
+    rulesSet: () => strategySetByOwner,
+    policy: () => policy, publish, log,
+  }).start();
+}
 // GIMBAL_ORDERLY_PAIRS=1: the Orderly session was opened before the pair's start (startOrderlySession).
 // GIMBAL_LOG_EGRESS=1 only: the public IPv4 addresses serve's traffic leaves from, now and hourly (never fatal).
 const egress = startEgressLog({ env: envVar, log });
@@ -717,6 +754,7 @@ async function shutdown(reason: string): Promise<void> {
   clearInterval(monitorTimer);
   egress?.stop();
   // The loop starts nothing new; an open or close it runs is waited for with the rest, under the same deadline.
+  stopReplayScript?.();
   strategyLoop.stop();
   attestor.stop();
   book?.stop();

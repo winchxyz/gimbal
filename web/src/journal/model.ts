@@ -60,7 +60,30 @@ export function visibleFeed(entries: readonly JournalEntry[], frozen: ReadonlySe
  * (design/HANDOFF.md: day totals are P&L only, transfers of principal are excluded).
  */
 export function pnlOf(entry: JournalEntry): number {
-  return KINDS[entry.kind].principal ? (feeUsd(entry) ?? 0) : (amountUsd(entry) ?? 0);
+  if (KINDS[entry.kind].principal) return feeUsd(entry) ?? 0;
+  if (entry.kind === 'rescue') return rescueCostUsd(entry);
+  return amountUsd(entry) ?? 0;
+}
+
+/**
+ * A rescue's cost: its `usd`; the engine's own rescue lines carry `usd: 0` and a fee in `feeUsd`. Each fee counts once:
+ * Hyperliquid's withdrawal fee on its hl_withdraw line (no `amountUsd`, it moves to the desk's own address), and the
+ * 1Click transfer's fee on the line that says it landed (`landedS`). The line that sent the transfer repeats that fee as
+ * quoted (`amountUsd`, no `landedS`: `isQuotedFee`) and is not counted.
+ */
+export function rescueCostUsd(entry: JournalEntry): number {
+  const usd = amountUsd(entry) ?? 0;
+  if (usd !== 0) return usd;
+  const landed = numberOf(entry, 'landedS') !== null;
+  if (!landed && numberOf(entry, 'amountUsd') !== null) return 0;
+  return feeUsd(entry) ?? 0;
+}
+
+/** A rescue line whose fee is the transfer's quote, counted when it lands (see rescueCostUsd). */
+export function isQuotedFee(entry: JournalEntry): boolean {
+  const fee = feeUsd(entry);
+  return entry.kind === 'rescue' && fee !== null && fee !== 0 && (amountUsd(entry) ?? 0) === 0
+    && numberOf(entry, 'landedS') === null && numberOf(entry, 'amountUsd') !== null;
 }
 
 // ---------- days ----------
@@ -166,8 +189,11 @@ export interface RowView {
 
 const seconds = (s: number): string => `${s < 10 ? s.toFixed(1) : Math.round(s)} s`;
 
-/** A rescue's steps as far as the entry says: detected, where the margin came from, the quote, the signature, the landing. */
-export function stepsOf(entry: JournalEntry): string[] | null {
+/**
+ * A rescue's steps as far as the entry says: detected, where the margin came from, the quote, the signature, the
+ * landing. A replay signs nothing, so it shows no signature time.
+ */
+export function stepsOf(entry: JournalEntry, replay = false): string[] | null {
   if (entry.kind !== 'rescue') return null;
   const from = entry.numbers.from;
   const signed = numberOf(entry, 'signedS');
@@ -176,7 +202,7 @@ export function stepsOf(entry: JournalEntry): string[] | null {
   const steps = ['detected'];
   if (typeof from === 'string' && from.length > 0) steps.push(`source: ${from === 'reserve' ? 'reserve' : venueName(from)}`);
   if (signed !== null || landed !== null) steps.push('quote ✓');
-  if (signed !== null) steps.push(`signed ${seconds(signed)}`);
+  if (signed !== null && !replay) steps.push(`signed ${seconds(signed)}`);
   if (landed !== null) steps.push(`landed ${seconds(landed)}`);
   return steps;
 }
@@ -192,13 +218,13 @@ export function whyOf(entry: JournalEntry): RowView['why'] {
 function noteOf(entry: JournalEntry, amount: number | null): string | null {
   if (amount === null) return null;
   const fee = feeUsd(entry);
-  if (fee !== null && fee !== 0) return `fee ${signedUsd(fee)}`;
+  if (fee !== null && fee !== 0) return `${isQuotedFee(entry) ? 'quoted fee' : 'fee'} ${signedUsd(fee)}`;
   if (entry.kind === 'enter') return 'fees';
   if (entry.kind === 'exit' || entry.kind === 'rotate') return 'after fees';
   return null;
 }
 
-export function rowOf(entry: JournalEntry): RowView {
+export function rowOf(entry: JournalEntry, { replay = false }: { replay?: boolean } = {}): RowView {
   const info = KINDS[entry.kind];
   const amount = amountUsd(entry);
   return {
@@ -209,7 +235,7 @@ export function rowOf(entry: JournalEntry): RowView {
     label: info.label,
     tone: info.tone,
     summary: entry.summary,
-    steps: stepsOf(entry),
+    steps: stepsOf(entry, replay),
     why: whyOf(entry),
     flag: unprotectedText(entry),
     // Positive money is green; moving principal is not earning, so a deposit stays plain like a withdrawal.
@@ -266,20 +292,30 @@ export interface Attribution {
 /**
  * Where the money went since the start. Funding, fees and price come from the desk's own P&L (`DeskState.pnl`);
  * what the journal adds is the cost of moving money: rescues, app fees and transfer fees. Null until a desk arrives.
+ * The desk's P&L covers the legs it holds; a close that carries its realized split (`realizedFundingUsd`,
+ * `realizedFeesUsd`, `realizedPriceUsd`: the replay desk's closes do) adds the pair it closed, so the net still agrees
+ * with the day totals once the desk is flat.
  */
 export function attributionOf(pnl: DeskState['pnl'] | null, entries: readonly JournalEntry[]): Attribution {
   let otherUsd = 0;
+  const realized = { fundingUsd: 0, feesUsd: 0, priceUsd: 0 };
   for (const e of entries) {
     const info = KINDS[e.kind];
     if (info.principal) otherUsd += feeUsd(e) ?? 0;
-    else if (e.kind === 'rescue' || e.kind === 'fee') otherUsd += amountUsd(e) ?? 0;
+    else if (e.kind === 'rescue') otherUsd += rescueCostUsd(e);
+    else if (e.kind === 'fee') otherUsd += amountUsd(e) ?? 0;
+    else if (e.kind === 'exit') {
+      realized.fundingUsd += numberOf(e, 'realizedFundingUsd') ?? 0;
+      realized.feesUsd += numberOf(e, 'realizedFeesUsd') ?? 0;
+      realized.priceUsd += numberOf(e, 'realizedPriceUsd') ?? 0;
+    }
   }
   return {
-    fundingUsd: pnl ? pnl.fundingUsd : null,
-    feesUsd: pnl ? pnl.feesUsd : null,
-    basisUsd: pnl ? pnl.priceUsd : null,
+    fundingUsd: pnl ? pnl.fundingUsd + realized.fundingUsd : null,
+    feesUsd: pnl ? pnl.feesUsd + realized.feesUsd : null,
+    basisUsd: pnl ? pnl.priceUsd + realized.priceUsd : null,
     otherUsd,
-    netUsd: pnl ? pnl.netUsd + otherUsd : null,
+    netUsd: pnl ? pnl.netUsd + realized.fundingUsd + realized.feesUsd + realized.priceUsd + otherUsd : null,
   };
 }
 
@@ -294,8 +330,12 @@ export function sinceNote(desk: DeskState, windows: readonly FundingWindow[] | n
   return `The ${symbol} window paid its entry costs up front; they are not earned back yet.`;
 }
 
-/** The headline's count: "23 actions signed", "1 action signed". */
-export const actionsText = (n: number): string => `${n.toLocaleString('en-US')} ${n === 1 ? 'action' : 'actions'} signed`;
+/**
+ * The headline's count: "23 actions signed", "1 action signed". A replay has no contract and signs nothing: its
+ * actions are the engine's own, simulated on recorded prices ("2 simulated actions").
+ */
+export const actionsText = (n: number, replay = false): string =>
+  `${n.toLocaleString('en-US')} ${replay ? 'simulated ' : ''}${n === 1 ? 'action' : 'actions'}${replay ? '' : ' signed'}`;
 
 /** Fees, basis and transfers in one figure, for the phone's summary. */
 export const costsUsd = (a: Attribution): number | null => (a.feesUsd === null || a.basisUsd === null ? null : a.feesUsd + a.basisUsd + a.otherUsd);

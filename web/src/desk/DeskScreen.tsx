@@ -19,6 +19,7 @@ import {
   exposureOf,
   hoursLeftText,
   isDown,
+  lastClose,
   latestEvents,
   legRows,
   legTitle,
@@ -54,7 +55,7 @@ export function DeskScreen() {
     return (
       <div className="d-page">
         <DecisionBar decision={decision} now={now} held={false} symbol={null} urgent={false} minNetAprPct={strategy?.minNetAprPct ?? null} />
-        <Waiting desk={desk} windows={windows} strategy={strategy} scan={scan} now={now} />
+        <Waiting desk={desk} windows={windows} strategy={strategy} scan={scan} journal={journal} now={now} />
       </div>
     );
   }
@@ -254,6 +255,13 @@ function Latest({ events }: { events: EventRow[] }) {
           <span className="t">{e.when}</span>
           <span className="what">
             {e.text}
+            {e.detail ? (
+              // The rest of a long line (an attestation's measurements, a long reason): one small control, closed.
+              <details className="more">
+                <summary>more</summary>
+                {e.detail}
+              </details>
+            ) : null}
             {e.unprotected ? (
               <>
                 <span className="sep"> · </span>
@@ -308,6 +316,7 @@ interface WaitingProps {
   windows: readonly FundingWindow[] | null;
   strategy: StrategyConfig | null;
   scan: ScanStatus | null;
+  journal: readonly JournalEntry[];
   now: number;
 }
 
@@ -334,8 +343,9 @@ function NoDesk({ scan, now }: { scan: ScanStatus | null; now: number }) {
 }
 
 /** No legs (design/HANDOFF.md, Desk: Empty): the desk value, best window now against the owner's minimum, and a way to Windows. */
-function Waiting({ desk, windows, strategy, scan, now }: WaitingProps) {
+function Waiting({ desk, windows, strategy, scan, journal, now }: WaitingProps) {
   const best = windows ? bestEnterable(windows) : null;
+  const closed = lastClose(journal, now);
   const minimum = strategy?.minNetAprPct ?? null;
   const rounded = (n: number) => (Number.isInteger(n) ? n.toFixed(0) : n.toFixed(1));
   const gaps = valueGaps(desk);
@@ -347,6 +357,11 @@ function Waiting({ desk, windows, strategy, scan, now }: WaitingProps) {
           <Flash value={desk.equityUsd}>{usd(desk.equityUsd)}</Flash>
         </h1>
         {gaps === null ? null : <p data-testid="desk-value-gaps">{gaps}</p>}
+        {closed === null ? null : (
+          <p data-testid="desk-last-close">
+            Last pair closed {closed.when}, realized <b>{signedUsd(closed.netUsd)}</b>. <a href="#/journal">Journal</a>
+          </p>
+        )}
         <p>
           Your money sits in the desk’s accounts and earns nothing until a window pays{' '}
           {minimum === null ? (

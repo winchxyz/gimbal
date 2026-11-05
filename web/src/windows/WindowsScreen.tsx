@@ -32,6 +32,7 @@ export function WindowsScreen() {
   const windows = useStream((s) => s.windows);
   const scan = useStream((s) => s.scan);
   const connection = useStream((s) => s.connection);
+  const replay = useStream((s) => (s.desk?.mode ?? s.mode) === 'replay');
   const strategyState = useStrategy();
   const strategy = strategyState.value;
   const minimum = strategy?.minNetAprPct ?? null;
@@ -163,6 +164,7 @@ export function WindowsScreen() {
           scan={scan}
           newestAt={newestAt}
           connection={connection}
+          replay={replay}
         />
         {notices}
         <div
