@@ -7,8 +7,12 @@
 // other read (an account or trader state for the risk engine, a rescue or the pair trader, a trader's book before a
 // close) is critical: it goes first, keeps tokens and a slot no scanner read may take, waits out a cool-down and is
 // retried after a 429. The scanner marks its reads by running them inside scanRead(); a read outside it is critical.
-// The scanner's own classes leave more of the bucket the less they matter: funding keeps criticalReserve tokens for
-// critical reads, books and history (classReserve) more, so history only spends what the bucket has to spare.
+// The scanner's own classes queue funding, then history, then books, and leave tokens for critical reads: funding
+// criticalReserve, history and books (classReserve) more. History goes ahead of books because it is a handful of
+// requests an hour (Phoenix: one all-market request serves every leg's week) that a window cannot enter without (its
+// 7-day figure), while a book the budget skips serves its last good one; behind books, on a host whose books spend
+// the bucket every scan, it was never sent. Its reserve must not exceed the books': a read at the head of the queue
+// that needs more tokens than the reads behind it holds them up.
 // A caller with a deadline of its own (the risk engine's account read) runs inside readBy(): its reads wait for the
 // budget and run at most until then. A Retry-After longer than retryAfterMaxMs is cut to it, so a host that asks for
 // an hour cannot lock critical reads out: they probe it again after the capped wait. With `adaptive`, a 429 also
@@ -23,10 +27,10 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 /** What a reader asks for; the scanner's context turns it into a queue class (critical outside the scanner). */
 export type ReadKind = 'account' | 'funding' | 'book' | 'history';
 
-/** Queue order: critical first, then the scanner's funding, books, history. */
+/** Queue order: critical first, then the scanner's funding, history, books. */
 export type ReadClass = 'critical' | 'funding' | 'book' | 'history';
 
-const RANK: Record<ReadClass, number> = { critical: 0, funding: 1, book: 2, history: 3 };
+const RANK: Record<ReadClass, number> = { critical: 0, funding: 1, history: 2, book: 3 };
 
 /**
  * A read the budget did not send: `cooling` while the host is in a cool-down after a 429 (a scanner read never adds
@@ -107,7 +111,10 @@ export interface HostBudgetOptions {
   scanMaxInFlight: number;
   /** Tokens a scanner read must leave in the bucket, kept for critical reads. */
   criticalReserve: number;
-  /** Tokens a scanner read of this class must leave instead (default criticalReserve); at most burst - 1 is used. */
+  /**
+   * Tokens a scanner read of this class must leave instead (default criticalReserve); at most burst - 1 is used. A
+   * class should leave no more than the classes queued after it (funding <= history <= book), or it holds them up.
+   */
   classReserve?: Partial<Record<Exclude<ReadClass, 'critical'>, number>>;
   /** A 429 cuts the rate to `cut` of itself, down to minRatePerSec; it climbs back by recoverStep every recoverEveryMs. */
   adaptive?: AdaptiveRate | null;
@@ -161,7 +168,7 @@ const realTimers: BudgetTimers = {
  * 30 passed; at 1.5 a second the first after 38 s, then 1 a second passed; 1 a second for 90 s all passed). So 0.75 a
  * second with a burst of 10: our load alone never empties the host's bucket, and a 429 (someone else on the same
  * egress IP, as on a shared cloud host, or a second process here) halves the rate until quiet minutes step it back.
- * Critical reads keep 2 tokens of the shared bucket (books leave 3, history 5) and have 0.45 a second of their own
+ * Critical reads keep 2 tokens of the shared bucket (books and history leave 3) and have 0.45 a second of their own
  * that no 429 cuts: a risk tick is one request every 5 s (the trader snapshot; the marks come from a cache of at most
  * 5 s that a scanner-class read refreshes between ticks, phoenix.ts), two when that refresh was skipped, so even at
  * the cut floor and after Retry-After: 2 the risk read is answered well inside its 7 s deadline
@@ -173,7 +180,7 @@ export const PHOENIX_BUDGET: HostBudgetOptions = {
   maxInFlight: 4,
   scanMaxInFlight: 2,
   criticalReserve: 2,
-  classReserve: { book: 3, history: 5 },
+  classReserve: { book: 3, history: 3 },
   adaptive: { cut: 0.5, minRatePerSec: 0.25, recoverEveryMs: 60_000, recoverStep: 0.1 },
   criticalFloor: { ratePerSec: 0.45, burst: 2 },
   // The scanner times out a funding read at 4 s and a book at 8 s: it hears "skipped" well before either.
