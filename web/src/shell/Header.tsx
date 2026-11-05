@@ -2,6 +2,8 @@ import type { Mode } from '@gimbal/shared';
 import { useStream } from '../stream/hub.ts';
 import type { Connection } from '../stream/store.ts';
 import { dotColor } from '../ui/dot.ts';
+import { useNow } from '../ui/useNow.ts';
+import { clock } from '../journal/entry.ts';
 import { writeControls } from '../remote/readonly.ts';
 import { ONBOARDING_HREF, SCREENS, hrefOf, type ScreenId } from './routes.ts';
 import { Wordmark } from './Wordmark.tsx';
@@ -53,12 +55,19 @@ export function Header({ screen }: { screen: ScreenId }) {
             {CONNECTING[connection]}
           </span>
         )}
+        {/* A replay's clock is the recording's: where in the recorded hour the page is (a hosted replay starts over). */}
+        {mode === 'replay' && <ReplayClock />}
         {/* A replay's desk has no id of its own (it is "replay"): the network badge already says Replay. */}
         {desk && mode !== 'replay' && <span>{desk.deskId}</span>}
         {mode && <MoneyActions mode={mode} />}
       </div>
     </header>
   );
+}
+
+function ReplayClock() {
+  const now = useNow(5_000);
+  return <span className="g3" title="The replay clock: the recorded mainnet hour's time, UTC">{clock(now)} UTC</span>;
 }
 
 // design/HANDOFF.md, Network: testnet swaps Add funds for Get test USDC; replay has no money buttons.

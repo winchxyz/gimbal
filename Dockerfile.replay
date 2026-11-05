@@ -1,0 +1,10 @@
+# The hosted replay (docs/deploy-replay.md): the dashboard and a replay engine on one public port ($PORT), looping
+# the recorded mainnet hour. A second Railway service points at this file (RAILWAY_DOCKERFILE_PATH); the live engine's
+# service keeps building `Dockerfile`. No volume, no secrets: the engine reads fixtures only and connects to nothing.
+FROM node:24.16.0-slim
+
+WORKDIR /app
+COPY . .
+RUN npm ci --no-audit --no-fund && npm run build -w shared && npm run build -w web
+
+CMD ["node", "engine/src/cli/replay-host.ts"]
