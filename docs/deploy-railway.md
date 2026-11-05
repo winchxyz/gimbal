@@ -201,11 +201,14 @@ scan.
 
 - **`POST /rotate {"windowId": ...}`, a manual enter.** It skips the entry streak (`enterAfterChecks`) and
   `minNetAprPct` and keeps every other check: the window must be in the last scan, tradable and not stale, pass its
-  checks, not be held out by the NEAR AI risk check, be in a direction the pair trader opens, and size within the
-  free margin and the policy. It is checked and sized again when it runs, and the NEAR AI risk check runs as for any
-  enter; its prompt says the trade was asked by hand and the owner's minimum is waived, with no streak (an auto
-  enter's prompt carries both). A refusal holds that window out for 6 h: then rotate into another one. With a pair held it closes that pair first. The route needs `auto` on and answers `409 auto is off`
-  otherwise.
+  checks, not be held out by the NEAR AI risk check (a hold-out the loop's own auto acts set), be in a direction the
+  pair trader opens, and size within the free margin and the policy. It is checked and sized again when it runs, and
+  the NEAR AI risk check runs as for any enter; its prompt says the trade was asked by hand and the owner's minimum is
+  waived, with no streak (an auto enter's prompt carries both). A risk check refusal holds a window out for 6 h only
+  when the loop's own (auto) act asked it. On a manual `POST /rotate`, plain or demo, a refusal refuses that one
+  request and sets no hold-out (its `veto` journal line and the window's verdict on the dashboard still read 6 h):
+  rotate into another window, or ask again with a new request. With a pair held it closes that pair first. The route
+  needs `auto` on and answers `409 auto is off` otherwise.
 - **`POST /rotate {"windowId": ..., "demo": {"maxLossUsd": <USD>}}`, an owner demo entry.** As above, and it also
   waives the window's **profit checks** only: the owner minimum, a positive expected spread paying back the round trip,
   and break-even within a year. Every other check stays, and so does funding against the position: a window without
