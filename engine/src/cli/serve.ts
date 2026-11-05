@@ -697,6 +697,8 @@ const control = controlFromEnv(envVar, {
     if (unsure !== null) return `the pair's start (${unsure})`;
     return strategyLoop.checked === 0 ? 'the strategy loop\'s first check of a scan' : null;
   },
+  // POST /rotate also waits for its window to pass its checks (the last scan's windows, as the loop reads them).
+  windows: () => server?.state().windows ?? null,
   call: loopbackCall(host, listening),
   log,
 });

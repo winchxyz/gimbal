@@ -13,8 +13,9 @@ import { DEFAULT_SCANNER_CONFIG, DEFAULT_STRATEGY } from '../scanner/config.ts';
 import { Scanner } from '../scanner/scanner.ts';
 import { EngineServer } from '../server.ts';
 import type { StrategyHands } from '../server.ts';
+import type { Window as FundingWindow } from '@gimbal/shared';
 import type { ControlDeps, ControlPath, RouteAnswer, RouteCall } from './serve-control.ts';
-import { controlAddress, controlFromEnv, controlMarker, loopbackCall, parseControl, runControl, startControl } from './serve-control.ts';
+import { controlAddress, controlFromEnv, controlMarker, loopbackCall, parseControl, rotateWaitReason, runControl, startControl } from './serve-control.ts';
 
 const T0 = Date.UTC(2026, 10, 5, 10, 30);
 const WINDOW = 'sol-hyperliquid-phoenix';
@@ -426,6 +427,127 @@ test('serve\'s own stopping flag stops a run still waiting, without a drain', as
   serveStopping = true;
   assert.deepEqual(await run.done, { status: 'stopped' });
   assert.equal(existsSync(controlMarker(dir, 'serve-stops')), false);
+});
+
+// ---- POST /rotate waits for its window to pass the checks it cannot waive (step 3b) ----
+
+const ZEC = 'zec-orderly-hyperliquid';
+const NO_HISTORY = 'No 7-day funding history on both legs yet: the spread expected over a 7-day hold is not known, against a $0.04 round trip';
+const PROFIT = { ok: false, kind: 'profit', text: 'Over a 7-day hold, the 7-day spread of 3.00 % APR pays $0.01 at $12.00 a leg, no more than the $0.04 round trip' };
+const zec = (checks: FundingWindow['checks'], over: Partial<FundingWindow> = {}) => ({
+  id: ZEC, symbol: 'ZEC', tradable: true, stale: false, checks: [{ ok: true, text: 'policy ok' }, ...checks], ...over,
+}) as unknown as FundingWindow;
+
+/**
+ * A run against a stub route: the scans are `scans` in turn, one per poll (the last one kept); each poll moves the clock
+ * by pollMs. The route answers `answer`.
+ */
+function windowRun(dir: string, body: Record<string, unknown>, scans: (FundingWindow[] | null)[], o: { waitMs?: number; answer?: RouteAnswer } = {}) {
+  const lines: string[] = [];
+  const calls: { method: string; path: string; body?: unknown }[] = [];
+  const clock = { t: T0 };
+  let i = 0;
+  const d: ControlDeps = {
+    ask: parseControl(JSON.stringify({ id: 'wait-1', method: 'POST', path: '/rotate', body })), stateDir: dir, trade: true, waitingFor: () => null,
+    windows: () => scans[Math.min(i, scans.length - 1)]!,
+    call: async (method, path, b) => {
+      calls.push({ method, path, ...(b === undefined ? {} : { body: b }) });
+      return method === 'GET' ? { status: 200, body: { auto: true } } : (o.answer ?? { status: 200, body: { ok: true } });
+    },
+    log: (l) => lines.push(l), now: () => clock.t, waitMs: o.waitMs ?? 60_000, pollMs: 1_000,
+    sleep: async (ms) => {
+      clock.t += ms;
+      i++;
+    },
+  };
+  const rotates = () => calls.filter((c) => c.path === '/rotate');
+  const waits = () => lines.filter((l) => l.startsWith(`control: waiting for ${ZEC}`));
+  return { d, lines, calls, rotates, waits, clock };
+}
+
+test('/rotate waits while its window has no 7-day history, then calls once it loads (a demo request: the profit checks it waives are not waited on)', async (t) => {
+  const dir = tempDir(t);
+  const demo = { windowId: ZEC, demo: { maxLossUsd: 0.25 } };
+  const r = windowRun(dir, demo, [[zec([{ ok: false, text: NO_HISTORY }])], [zec([{ ok: false, text: NO_HISTORY }])], [zec([{ ok: false, text: NO_HISTORY }])], [zec([PROFIT])]]);
+  const result = await runControl(r.d);
+  assert.deepEqual(result, { status: 'done', answer: { status: 200, body: { ok: true } } });
+  assert.deepEqual(r.rotates(), [{ method: 'POST', path: '/rotate', body: demo }], 'called once, with the body as given');
+  assert.deepEqual(r.waits(), [`control: waiting for ${ZEC} to pass its checks (No 7-day funding history on both legs yet)`]);
+  assert.ok(r.lines.includes(`control: ${ZEC} passes its checks (the profit checks a demo entry waives aside)`));
+  assert.equal(r.clock.t, T0 + 3_000, 'three polls, one per scan');
+  // The wait comes before the marker: nothing was started while it waited.
+  assert.ok(r.lines.findIndex((l) => l.startsWith('control: waiting for zec')) < r.lines.findIndex((l) => l.startsWith('control: started: marker')));
+});
+
+test('/rotate with demo does not wait on profit checks; a plain /rotate does', async (t) => {
+  const dir = tempDir(t);
+  const demo = windowRun(dir, { windowId: ZEC, demo: { maxLossUsd: 0.25 } }, [[zec([PROFIT])]]);
+  assert.equal((await runControl(demo.d)).status, 'done');
+  assert.deepEqual(demo.waits(), []);
+  assert.equal(demo.clock.t, T0, 'called at once');
+  assert.equal(demo.rotates().length, 1);
+
+  const plainDir = tempDir(t);
+  const plain = windowRun(plainDir, { windowId: ZEC }, [[zec([PROFIT])], [zec([PROFIT])], [zec([{ ok: true, text: 'pays' }])]]);
+  assert.equal((await runControl(plain.d)).status, 'done');
+  assert.deepEqual(plain.waits(), [`control: waiting for ${ZEC} to pass its checks (${PROFIT.text.slice(0, 99)}…)`], 'the check\'s first clause, at most 100 characters');
+  assert.equal(plain.clock.t, T0 + 2_000);
+  assert.equal(plain.rotates().length, 1);
+});
+
+test('/rotate whose window never passes: past the budget the route is still called once, and its answer is what the marker keeps', async (t) => {
+  const dir = tempDir(t);
+  const refusal = { status: 409, body: { ok: false, reason: `${ZEC} fails a check a demo entry does not waive: ${NO_HISTORY}` } };
+  const r = windowRun(dir, { windowId: ZEC, demo: { maxLossUsd: 0.25 } }, [[zec([{ ok: false, text: NO_HISTORY }])]], { waitMs: 5_000, answer: refusal });
+  const result = await runControl(r.d);
+  assert.deepEqual(result, { status: 'done', answer: refusal });
+  assert.equal(r.rotates().length, 1);
+  assert.equal(r.waits().length, 1, 'one line for one reason');
+  assert.ok(r.lines.includes(`control: ${ZEC} still does not pass its checks after 5 s (No 7-day funding history on both legs yet): calling the route anyway, its answer decides`));
+  const marker = JSON.parse(readFileSync(controlMarker(dir, 'wait-1'), 'utf8'));
+  assert.equal(marker.status, 'done');
+  assert.deepEqual(marker.answer, refusal);
+  assert.ok(r.lines.some((l) => l.startsWith(`control: done: POST /rotate answered 409 {"ok":false,"reason":"${ZEC} fails a check a demo entry does not waive`)));
+});
+
+test('/rotate waits for a window missing from the scan, and logs a line only when the reason changes', async (t) => {
+  const dir = tempDir(t);
+  const stale = zec([], { stale: true });
+  const r = windowRun(dir, { windowId: ZEC }, [null, [], [], [stale], [stale], [stale], [zec([{ ok: false, text: NO_HISTORY }])], [zec([])]]);
+  assert.equal((await runControl(r.d)).status, 'done');
+  assert.deepEqual(r.waits(), [
+    `control: waiting for ${ZEC} to pass its checks (no scan yet)`,
+    `control: waiting for ${ZEC} to pass its checks (it is not in the last scan)`,
+    `control: waiting for ${ZEC} to pass its checks (it is stale: a venue it needs did not answer)`,
+    `control: waiting for ${ZEC} to pass its checks (No 7-day funding history on both legs yet)`,
+  ]);
+  assert.equal(r.rotates().length, 1);
+  assert.equal(r.clock.t, T0 + 7_000);
+});
+
+test('rotateWaitReason: what the request cannot waive, in order; a NEAR AI refusal is left to the route; /close and /strategy never wait on a window', async (t) => {
+  const veto = { verdict: 'veto', reasons: ['a spike'], model: 'm', at: T0 } as FundingWindow['veto'];
+  assert.equal(rotateWaitReason([zec([], { veto })], ZEC, false), null);
+  assert.equal(rotateWaitReason([zec([], { refused: { code: 'E_ORACLE_STALE', reason: 'old' } } as Partial<FundingWindow>)], ZEC, true), 'it is refused: E_ORACLE_STALE');
+  assert.equal(rotateWaitReason([zec([], { tradable: false })], ZEC, true), 'it is watch only');
+  assert.equal(rotateWaitReason([zec([PROFIT, { ok: false, text: 'Books ' + 'x'.repeat(200) }])], ZEC, true), `Books ${'x'.repeat(93)}…`);
+  assert.equal(rotateWaitReason([zec([PROFIT])], ZEC, true), null);
+  for (const value of [JSON.stringify({ id: 'c', method: 'POST', path: '/close' }), JSON.stringify({ id: 's', method: 'PUT', path: '/strategy', body: { auto: false } })]) {
+    const dir = tempDir(t);
+    let asked = 0;
+    const lines: string[] = [];
+    const result = await runControl({
+      ask: parseControl(value), stateDir: dir, trade: true, waitingFor: () => null, log: (l) => lines.push(l), now: () => T0, sleep: async () => {},
+      windows: () => {
+        asked++;
+        return [];
+      },
+      call: async () => ({ status: 200, body: {} }),
+    });
+    assert.equal(result.status, 'done');
+    assert.equal(asked, 0);
+    assert.ok(!lines.some((l) => l.includes('to pass its checks')));
+  }
 });
 
 test('a wildcard listen address is reached on loopback; a named one as is', () => {

@@ -3,7 +3,7 @@
 // (which Orderly's key restriction needs) has no `railway ssh`: without it the owner could not enter, close or change
 // the engine rules at all. It adds no route and no check of its own: it sends the request to the engine's own HTTP
 // server on loopback, so the route's handler, its checks and its answer are exactly those of a request made from
-// inside the container.
+// inside the container. The window wait (3b) only chooses when to call: it never refuses a request.
 //
 //   GIMBAL_CONTROL={"id":"<run-id>","method":"POST","path":"/rotate","body":{"windowId":"<window id>"},"until":"<ISO time>"}
 //
@@ -21,6 +21,13 @@
 //   3  wait, at most CONTROL_WAIT_MS, until the engine is ready for the route: the first scan for PUT /strategy; also
 //      the pair's start confirmed and the strategy loop's first check of a scan for /rotate and /close (so /rotate
 //      sees the window and the free margin). Past the wait: the marker `failed`, never retried
+//   3b for POST /rotate, within the same CONTROL_WAIT_MS, until the named window is in the last scan and passes every
+//      check the request cannot waive (rotateWaitReason): tradable, not refused, not stale, and every check ok, or
+//      for a demo request every check that is not a profit check (a demo request never waits on profit checks). It
+//      is read again on every poll, so after each scan (a restart re-reads the funding history, and a window has no
+//      7-day history for its first minute or so). One `waiting for <window>` line each time the reason changes. Past
+//      the budget the route is called anyway: this wait never refuses, the route's own answer is what is logged and
+//      kept in the marker. A NEAR AI refusal is not waited on (it does not clear within the budget): the route says it
 //   4  the engine rules as GET /strategy answers them, logged; then the marker `started`, created exclusively and
 //      fsynced before the call
 //   5  the call over loopback; the marker `done` with the route's status and body, or `failed` with the error
@@ -34,7 +41,9 @@
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync } from 'node:fs';
 import { request } from 'node:http';
 import { dirname, join } from 'node:path';
+import type { Window as FundingWindow } from '@gimbal/shared';
 import { fsyncDir, writeAtomic } from '../book/store.ts';
+import { isProfitCheck } from '../scanner/price.ts';
 import { errorMessage } from '../venues/recorder.ts';
 
 export const CONTROL_ENV = 'GIMBAL_CONTROL';
@@ -147,6 +156,8 @@ export interface ControlDeps {
   /** What the engine still lacks for this route (the first scan, the pair's start, the loop's first check), or null when ready. */
   waitingFor(path: ControlPath): string | null;
   call: RouteCall;
+  /** The last scan's windows (null before any): POST /rotate waits for its window to pass its checks (step 3b). Absent: no such wait. */
+  windows?: () => readonly FundingWindow[] | null;
   /** serve is shutting down: a run still waiting stops (no marker). */
   stopping?: () => boolean;
   /** Called once the `started` marker is on disk. */
@@ -248,6 +259,34 @@ export async function runControl(d: ControlDeps): Promise<ControlResult> {
     await sleep(d.pollMs ?? POLL_MS);
   }
 
+  // 3b. POST /rotate: its window in the last scan and passing what the request cannot waive, within the same bound.
+  // Never a refusal of its own: past the bound the route is called and its answer decides.
+  const windowId = ask.body?.windowId;
+  if (ask.path === '/rotate' && d.windows !== undefined && typeof windowId === 'string') {
+    const demo = ask.body?.demo !== undefined;
+    let lastWhy: string | null = null;
+    for (;;) {
+      if (d.stopping?.() === true) {
+        say(`stopped: serve is stopping before the call; nothing was called and no marker was written, so ${ask.runId} runs at the next start`);
+        return { status: 'stopped' };
+      }
+      const why = rotateWaitReason(d.windows(), windowId, demo);
+      if (why === null) {
+        if (lastWhy !== null) say(`${windowId} passes its checks${demo ? ' (the profit checks a demo entry waives aside)' : ''}`);
+        break;
+      }
+      if (why !== lastWhy) {
+        say(`waiting for ${windowId} to pass its checks (${why})`);
+        lastWhy = why;
+      }
+      if (now() >= until) {
+        say(`${windowId} still does not pass its checks after ${Math.round(waitMs / 1000)} s (${why}): calling the route anyway, its answer decides`);
+        break;
+      }
+      await sleep(d.pollMs ?? POLL_MS);
+    }
+  }
+
   // 4. The rules before the call (the whole config PUT /strategy takes back), then the marker.
   const expiredReady = expired();
   if (expiredReady !== null) return expiredReady;
@@ -301,6 +340,30 @@ export async function runControl(d: ControlDeps): Promise<ControlResult> {
     : '';
   say(`done: ${ask.method} ${ask.path} answered ${answer.status} ${JSON.stringify(answer.body)}${next}`);
   return { status: 'done', answer };
+}
+
+/** The first clause of a check's text, at most 100 characters: enough to say which check, short enough for a log line. */
+function shortText(text: string): string {
+  const head = text.split(': ')[0]!;
+  return head.length <= 100 ? head : `${head.slice(0, 99)}…`;
+}
+
+/**
+ * Why POST /rotate into `windowId` would still be refused by a check that can clear by itself within minutes (the
+ * window not in the last scan yet, a venue that did not answer, history still loading), or null when it passes every
+ * check the request cannot waive: tradable, not refused, not stale, every check ok, or for a demo request every check
+ * but the profit checks (scanner/price.ts isEnterable and isEnterableButForProfit). A NEAR AI refusal is left to the
+ * route: it holds for hours, past any wait.
+ */
+export function rotateWaitReason(windows: readonly FundingWindow[] | null, windowId: string, demo: boolean): string | null {
+  const w = windows?.find((x) => x.id === windowId);
+  if (w === undefined) return windows === null ? 'no scan yet' : 'it is not in the last scan';
+  if (w.refused !== undefined) return `it is refused: ${w.refused.code}`;
+  if (w.stale) return 'it is stale: a venue it needs did not answer';
+  const failing = w.checks.find((c) => !c.ok && !(demo && isProfitCheck(c)));
+  if (failing !== undefined) return shortText(failing.text);
+  if (!w.tradable) return 'it is watch only';
+  return null;
 }
 
 /** A started run: `done` settles with its result; `drain()` (serve's shutdown) stops it while it waits, then waits for it. */

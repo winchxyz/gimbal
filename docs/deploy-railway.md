@@ -149,6 +149,16 @@ What it does (every line starts with `control:`):
    margin). The `waiting for ...` lines say what for. Past 10 min it writes the marker `failed` and calls nothing; that
    run-id is not tried again. `PUT /strategy` waits for the first scan only: it does not touch the pair, and restoring
    the rescue line must not hang on a pair whose start is not confirmed.
+
+   `POST /rotate` then also waits, within the same 10 min, until its window is in the last scan and passes every
+   check the request cannot waive: tradable, not refused, not stale, and every check ok, or with `demo` every check
+   but the profit checks (a demo request never waits on those). Every restart, so every variable change, reads the
+   funding history again, and for about its first minute a window fails `No 7-day funding history on both legs yet`:
+   without this wait the call would race it. It is checked again after each scan and logs
+   `control: waiting for <window id> to pass its checks (<the first failing check>)` each time the reason changes.
+   Past 10 min it calls the route anyway (`... still does not pass its checks after 600 s ...: calling the route
+   anyway`): the route's own `409` and its reason are what the log and the marker keep. A NEAR AI refusal is not
+   waited on; the route answers it.
 4. It logs the engine rules as `GET /strategy` answers them (`control: engine rules before the call ...`), then
    writes the marker `started`, created exclusively and fsynced.
 5. It sends the request and logs the route's answer, and the marker becomes `done` with that status and body. A
