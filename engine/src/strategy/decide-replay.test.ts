@@ -14,8 +14,9 @@
 // - the recording holds no markets() answer: the lot sizes are set here (Hyperliquid's are its szDecimals on
 //   mainnet); a leg is sized at the recorded Hyperliquid mark. BTC and ZEC are not used: one common lot of either is
 //   under 10 USD or over 12 at their recorded prices, so a 12 USD leg cannot be sized (decide waits on that).
-// The veto plays NEAR AI exchanges recorded for these prompts (fixtures/nearai/SYNTHETIC-veto.json) with no key; a
-// prompt it has no reply for (the scanner's numbers changed) passes with "no NEAR AI risk check". E10_DUMP_FACTS=1 prints
+// The NEAR AI risk check plays exchanges recorded for these prompts (fixtures/nearai/SYNTHETIC-veto.json) with no key,
+// as serve's replay does: a prompt it has no reply for (the scanner's numbers changed) passes in replay only, labelled
+// so (live, it would be held). E10_DUMP_FACTS=1 prints
 // the facts of each prompt to stderr, to rebuild those exchanges.
 //
 // Expected: wait, wait, enter NEAR, hold, hold, exit, cooldown waits, enter SOL, hold while ETH counts, rotate to ETH.
@@ -120,7 +121,8 @@ async function run(costs = RECORDED_COSTS): Promise<Step[]> {
     await scanner.scan();
     await scanner.idle();
   }
-  const veto = RecordedVeto.fromFile(VETO_FIXTURE);
+  // A replay, as serve's: a prompt with no recorded reply passes, labelled replay-only (live it would be held).
+  const veto = RecordedVeto.fromFile(VETO_FIXTURE, { replayPassUnrecorded: true });
   const simStart = Date.UTC(2026, 10, 3, 0);
   const span = end - (start + WARMUP_MS);
   let counters: LoopCounters = NO_COUNTERS;
@@ -168,7 +170,9 @@ async function run(costs = RECORDED_COSTS): Promise<Step[]> {
       if (process.env.E10_DUMP_FACTS === '1') console.error(`FACTS ${JSON.stringify(facts)}`);
       const r = await checkVeto(veto, facts, { now: input.now });
       line = r.line;
-      if (r.veto.verdict === 'veto') counted = skipAct(input, d, { vetoed: true });
+      // As loop.ts: no readable verdict holds the act with no hold-out; a refusal holds the window out.
+      if (r.held) counted = skipAct(input, d);
+      else if (r.veto.verdict === 'veto') counted = skipAct(input, d, { vetoed: true });
     }
     // loop.ts carries the act out; here it simply happens.
     if (counted === d.counters && d.act !== null) {
@@ -230,8 +234,8 @@ test('a recorded hour of mainnet scans, one an hour: enter, compression, exit, c
     assert.equal(s.d.vetoCandidate !== null, s.d.act?.kind === 'enter' || s.d.act?.kind === 'rotate');
     assert.equal(s.veto !== null, s.d.vetoCandidate !== null, 'the veto is asked before every enter and rotate');
     if (['wait', 'hold'].includes(s.d.decision.action)) assert.equal(s.d.act, null);
-    // The recorded verdicts pass; a prompt with no recording passes unchecked. Either way the act stands.
-    if (s.veto !== null) assert.match(s.veto, /^(NEAR AI passed|no NEAR AI risk check)/);
+    // The recorded verdicts pass; a prompt with no recording passes in replay only, said so. Either way the act stands.
+    if (s.veto !== null) assert.match(s.veto, /^(NEAR AI passed|\S+: no recorded NEAR AI risk check reply for this prompt: passed in replay only; live, the entry would wait$)/);
   }
 });
 

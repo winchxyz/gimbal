@@ -250,20 +250,26 @@ export function rowOf(entry: JournalEntry, { replay = false }: { replay?: boolea
 export interface Counts {
   /** Entries the contract signed an action for. */
   signed: number;
+  /** Refused on sizing, policy or the contract (not the NEAR AI risk check, and not a held check). */
   refused: number;
   vetoed: number;
+  /** Enters and rotates held because the NEAR AI risk check did not answer: not refusals, asked again later. */
+  held: number;
 }
 
 export function countsOf(entries: readonly JournalEntry[]): Counts {
   let signed = 0;
   let refused = 0;
   let vetoed = 0;
+  let held = 0;
   for (const e of entries) {
     if (KINDS[e.kind].signed) signed += 1;
-    if (e.kind === 'refused') refused += 1;
+    // The engine journals a held risk check as `refused` with `held: 1`; it is no sizing or policy refusal.
+    if (e.kind === 'refused' && e.numbers.held === 1) held += 1;
+    else if (e.kind === 'refused') refused += 1;
     if (e.kind === 'veto') vetoed += 1;
   }
-  return { signed, refused, vetoed };
+  return { signed, refused, vetoed, held };
 }
 
 /**

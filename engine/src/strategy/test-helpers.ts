@@ -5,7 +5,18 @@ import type { StrategyConfig, Window as FundingWindow } from '@gimbal/shared';
 import { fileURLToPath } from 'node:url';
 import { NO_COUNTERS, decide } from './decide.ts';
 import type { DecideInput, Decision, HeldPair, LoopCounters } from './decide.ts';
-import type { VetoFacts } from './veto.ts';
+import type { VetoFacts, VetoSource } from './veto.ts';
+
+/**
+ * A NEAR AI risk check that answers a readable pass with no reasons, for tests whose subject is not the check: the
+ * check fails closed, so without a source (no key) every enter and rotate would be held.
+ */
+export const PASSING_RISK_CHECK: VetoSource = {
+  model: 'test-model', configured: true,
+  complete: async () => ({ content: '{"verdict":"pass","reasons":[]}', raw: { choices: [{ message: { content: '{"verdict":"pass","reasons":[]}' } }] } }),
+};
+/** The why line PASSING_RISK_CHECK gives when no attestation was fetched. */
+export const PASSED_WHY = 'NEAR AI risk check passed (TEE not attested: no attestation fetched in this run): no red flag named';
 
 export const T0 = Date.UTC(2026, 10, 3, 12);
 export const HOUR = 3_600_000;

@@ -53,6 +53,28 @@ test('a rotation that closed the old pair first says the desk is flat; other ref
   assert.equal(refusedCopy(''), null);
 });
 
+test('an enter or rotate the NEAR AI risk check held (no answer, no key, a rejected key) says it waits, not that it was refused', () => {
+  const tail = 'held, not passed: the entry waits; nothing sent; asked again at the next hourly check (2026-11-05T11:01:00.000Z); not a refusal, so no 6 h hold-out';
+  const timeout = `enter sol-phoenix-hyperliquid not carried out: the NEAR AI risk check did not answer (no answer within 15 s, asked 2 times): ${tail}`;
+  const c = refusedCopy(timeout);
+  assert.equal(c?.mapped, true);
+  assert.equal(c?.raw, timeout);
+  assert.equal(c?.text, 'Opening sol-phoenix-hyperliquid is waiting: the NEAR AI risk check did not answer, so nothing was sent. '
+    + 'The desk asks again at the next hourly check (11:01 UTC). This is not a refusal, so the window is not held out for 6 h.');
+  assert.match(refusedCopy(`enter sol-phoenix-hyperliquid not carried out: no NEAR AI key, so the NEAR AI risk check cannot answer: ${tail}`)?.text ?? '',
+    /^Opening sol-phoenix-hyperliquid is waiting: this engine has no NEAR AI key, so the NEAR AI risk check cannot answer, so nothing was sent\./);
+  assert.match(refusedCopy(`enter sol-phoenix-hyperliquid not carried out: NEAR AI key rejected (HTTP 401: invalid api key), so the NEAR AI risk check cannot answer: ${tail}`)?.text ?? '',
+    /^Opening sol-phoenix-hyperliquid is waiting: NEAR AI rejected this engine's key/);
+  // A rotate keeps the held pair; a manual (demo) one is not tried again by itself.
+  const rotate = 'rotate sol-phoenix-hyperliquid -> eth-phoenix-hyperliquid not carried out: the NEAR AI risk check did not answer (NEAR AI answered HTTP 503: overloaded, asked 2 times): '
+    + 'held, not passed: the entry waits; sol-phoenix-hyperliquid is kept, nothing closed; asked again at the next hourly check (2026-11-05T11:01:00.000Z); not a refusal, so no 6 h hold-out';
+  assert.equal(refusedCopy(rotate)?.text, 'Rotation from sol-phoenix-hyperliquid into eth-phoenix-hyperliquid is waiting: the NEAR AI risk check did not answer, so nothing was sent. '
+    + 'sol-phoenix-hyperliquid is kept. The desk asks again at the next hourly check (11:01 UTC). This is not a refusal, so the window is not held out for 6 h.');
+  const demo = 'enter zec-phoenix-hyperliquid not carried out: (owner demo entry: the profit checks are waived; round trip $0.04 estimated, at most $0.25 accepted) '
+    + 'the NEAR AI risk check did not answer (no answer within 15 s, asked 2 times): held, not passed: the entry waits; nothing sent; not tried again by itself: POST /rotate asks again; not a refusal, so no 6 h hold-out';
+  assert.match(refusedCopy(demo)?.text ?? '', /^Opening zec-phoenix-hyperliquid is waiting: .* It is not tried again by itself: ask again with POST \/rotate\. This is not a refusal/);
+});
+
 test('hold lines in plain words', () => {
   assert.equal(
     waitCopy('Hold XLM: 12.0 % net of the exit, at least your 5 % minimum; day 2 of 7').text,

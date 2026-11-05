@@ -2,11 +2,18 @@
 // "veto", every text the owner reads says "NEAR AI risk check"): the window's facts go to the
 // same client, endpoint, key and model as POST /policy/draft, and the model answers {verdict: 'pass' | 'veto',
 // reasons}, before every enter and every rotate. A veto can only remove a window: nothing the model says changes the
-// window, the size or the leverage, or is sent to the contract or a venue. No key, no answer within
-// LOOP_RULES.vetoTimeoutMs, or NEAR AI down (a transport or HTTP error): the window passes, and the journal line says
-// "no NEAR AI risk check" (a 401 or 403 says "NEAR AI key rejected", so a bad key shows on every decision). A reply that
-// came but cannot be read as one verdict (not JSON, no verdict, more than one JSON object, text around it, a key
-// given twice, a "veto" inside a "pass", cut off at its token limit) fails closed: it is a veto, "unreadable reply".
+// window, the size or the leverage, or is sent to the contract or a venue.
+//
+// It fails closed: only a readable "pass" lets the act go ahead. No answer within LOOP_RULES.vetoTimeoutMs, or NEAR AI
+// down (a transport or HTTP error), is asked once more (LOOP_RULES.vetoAttempts tries in all); still no answer, and the
+// act is held ("the NEAR AI risk check did not answer"): not carried out, and asked again at the next hourly check. A
+// held act is not a refusal: it starts no LOOP_RULES.vetoHoldHours hold-out. No key, or a key NEAR AI rejects (401 or
+// 403, asked once: it never heals by itself), holds it too, said on every decision. A reply that came but cannot be
+// read as one verdict (not JSON, no verdict, more than one JSON object, text around it, a key given twice, a "veto"
+// inside a "pass", cut off at its token limit) is a veto, "unreadable reply", with its hold-out.
+//
+// Replay only (`npm run demo`: RecordedVeto with replayPassUnrecorded, which serve sets in replay mode alone): a prompt
+// with no recorded reply passes, and its line says this is replay-only behaviour and that live the entry would wait.
 //
 // The prompt is built from the facts alone (no clock, no ids that change between runs), so a recorded exchange is
 // found again by its prompt: RecordedVeto plays a recording back without a key (replay mode, tests). checkVeto returns
@@ -28,6 +35,11 @@ export type Veto = NonNullable<FundingWindow['veto']>;
 export interface VetoSource {
   readonly model: string;
   readonly configured: boolean;
+  /**
+   * Replay only: a prompt with no recorded reply (complete() throws UnrecordedPrompt) passes, labelled replay-only.
+   * Absent or false (every live and testnet source): no answer, and the act is held.
+   */
+  readonly replayPassUnrecorded?: boolean;
   /** A recording may say how long the answer took when it was recorded (`latencyMs`); a live call is timed here. */
   complete(messages: readonly ChatMessage[], options?: { json?: boolean; maxTokens?: number }): Promise<Completion & { latencyMs?: number }>;
 }
@@ -177,21 +189,36 @@ export interface VetoExchange {
 }
 
 /**
- * How a check ended: passed or refused on a readable verdict; refused on an unreadable reply; or passed unchecked
- * (timed out, NEAR AI unavailable, no key, the key rejected).
+ * How a check ended: passed or refused on a readable verdict; refused on an unreadable reply; held for want of an
+ * answer (timed out, NEAR AI unavailable, no key, the key rejected); or, in replay only, passed on a prompt with no
+ * recorded reply.
  */
-export type RiskCheckOutcome = 'passed' | 'refused' | 'unreadable' | 'timeout' | 'unavailable' | 'no-key' | 'key-rejected';
+export type RiskCheckOutcome = 'passed' | 'refused' | 'unreadable' | 'timeout' | 'unavailable' | 'no-key' | 'key-rejected' | 'replay-unrecorded';
 
 export interface VetoResult {
+  /**
+   * The verdict as Window.veto shows it. A held check carries "veto" (fail closed: whatever reads only this refuses the
+   * act); loop.ts tells it apart by `held`, and neither shows it on the window nor holds the window out.
+   */
   veto: Veto;
-  /** false = no NEAR AI risk check (no answer came): the window passes unchecked, and `line` says why. */
+  /** true = a reply came (a readable verdict, or an unreadable reply, which is refused). */
   checked: boolean;
+  /**
+   * true = no readable verdict came (no answer after LOOP_RULES.vetoAttempts tries, no key, the key rejected): the act
+   * is not carried out and waits for the next hourly check. Not a refusal: no LOOP_RULES.vetoHoldHours hold-out.
+   */
+  held: boolean;
   outcome: RiskCheckOutcome;
-  /** The one-line reason: the model's reasons joined, or why it was not checked. */
+  /** The one-line reason: the model's reasons joined, or why no verdict came. */
   reason: string;
   /** How long the answer took (ms); null when no answer came. */
   latencyMs: number | null;
-  /** One line for the journal: "NEAR AI passed …", "NEAR AI risk check refused …: <reason>", or "no NEAR AI risk check: <why>". */
+  /** How many times NEAR AI was asked (0: no key, nothing sent). */
+  attempts: number;
+  /**
+   * One line for the journal: "NEAR AI passed …", "NEAR AI risk check refused …: <reason>", "the NEAR AI risk check did
+   * not answer on …: <why>: held, …", or (replay only) "…: passed in replay only; live, the entry would wait".
+   */
   line: string;
   /** What was asked and what came back; null only when nothing was asked (no key). */
   exchange: VetoExchange | null;
@@ -219,19 +246,25 @@ export function replyText(e: Pick<VetoExchange, 'response'>): string {
   }
 }
 
+/** What every held line ends with: the act waits; it is not refused. */
+export const HELD_TAIL = 'held, not passed: the entry waits';
+/** What a replay-only pass says (live and testnet, such a prompt is no answer, and the act is held). */
+export const REPLAY_UNRECORDED = 'no recorded NEAR AI risk check reply for this prompt: passed in replay only; live, the entry would wait';
+
 /**
  * The risk check's part of a "why" line: its verdict and one-line reason, with the attestation for a reply that came
- * ("TEE attested <date> UTC" or "TEE not attested: <why>"), or why it was not checked.
+ * ("TEE attested <date> UTC" or "TEE not attested: <why>"), or why no verdict came and the act is held.
  */
 export function riskCheckWhy(r: Pick<VetoResult, 'outcome' | 'reason'>, attestation: string): string {
   switch (r.outcome) {
     case 'passed': return `NEAR AI risk check passed (${attestation}): ${r.reason === '' ? 'no red flag named' : r.reason}`;
     case 'refused':
     case 'unreadable': return `NEAR AI risk check refused (${attestation}): ${r.reason}`;
-    case 'timeout': return 'risk check timed out: passed';
-    case 'no-key': return 'no NEAR AI key: not checked';
-    case 'key-rejected': return `${r.reason}: not checked, passed`;
-    case 'unavailable': return `NEAR AI risk check unavailable (${r.reason}): passed`;
+    case 'timeout':
+    case 'unavailable': return `the NEAR AI risk check did not answer (${r.reason}): ${HELD_TAIL}`;
+    case 'no-key': return `no NEAR AI key, so the NEAR AI risk check cannot answer: ${HELD_TAIL}`;
+    case 'key-rejected': return `${r.reason}, so the NEAR AI risk check cannot answer: ${HELD_TAIL}`;
+    case 'replay-unrecorded': return REPLAY_UNRECORDED;
   }
 }
 
@@ -354,48 +387,87 @@ const NO_ANSWER = ['NEAR_AI_API_KEY is not set', 'NEAR AI did not answer', 'NEAR
 /** The reason a veto that fails closed carries. */
 export const UNREADABLE_REPLY = 'unreadable reply';
 
+/** RecordedVeto with replayPassUnrecorded: no reply was recorded for this prompt (replay only). */
+export class UnrecordedPrompt extends Error {
+  constructor() {
+    super('no recorded NEAR AI risk check reply for this prompt');
+    this.name = 'UnrecordedPrompt';
+  }
+}
+
+/** How one ask ended without a reply: why, the outcome, and whether asking again may help. */
+interface NoReply {
+  why: string;
+  outcome: 'timeout' | 'unavailable' | 'key-rejected';
+  again: boolean;
+}
+
 /**
- * Asks for a verdict on `facts`. Never throws. A timeout or a transport/HTTP error passes with "no NEAR AI risk check"; a
- * reply that came but is not a readable verdict (including one cut off at its token limit) is a veto, "unreadable
- * reply".
+ * Asks for a verdict on `facts`. Never throws. A timeout or a transport/HTTP error is asked again, up to
+ * LOOP_RULES.vetoAttempts tries; still no reply, and the act is held (`held`, never a pass). No key or a rejected key
+ * holds it at once. A reply that came but is not a readable verdict (including one cut off at its token limit) is a
+ * veto, "unreadable reply". Replay only (source.replayPassUnrecorded): a prompt with no recording passes, said so.
  */
 export async function checkVeto(
-  source: VetoSource, facts: VetoFacts, options: { now: number; timeoutMs?: number; timer?: () => number },
+  source: VetoSource, facts: VetoFacts, options: { now: number; timeoutMs?: number; attempts?: number; timer?: () => number },
 ): Promise<VetoResult> {
   const timeoutMs = options.timeoutMs ?? LOOP_RULES.vetoTimeoutMs;
+  const tries = Math.max(1, Math.floor(options.attempts ?? LOOP_RULES.vetoAttempts));
   const timer = options.timer ?? (() => performance.now());
-  const unchecked = (why: string, outcome: RiskCheckOutcome): VetoResult => ({
-    veto: { verdict: 'pass', reasons: [`no NEAR AI risk check: ${why}`], model: source.model, at: options.now },
-    checked: false, outcome, reason: why, latencyMs: null,
-    line: `no NEAR AI risk check on ${facts.symbol}: ${why}`,
-    exchange: null,
+  const held = (why: string, outcome: RiskCheckOutcome, attempts: number, exchange: VetoExchange | null): VetoResult => ({
+    veto: { verdict: 'veto', reasons: [`the NEAR AI risk check did not answer: ${why}`], model: source.model, at: options.now },
+    checked: false, held: true, outcome, reason: why, latencyMs: null, attempts,
+    line: `the NEAR AI risk check did not answer on ${facts.symbol}: ${why}: ${HELD_TAIL}`,
+    exchange,
   });
-  const unreadable = (why: string, exchange: VetoExchange): VetoResult => ({
+  const unreadable = (why: string, exchange: VetoExchange, attempts: number): VetoResult => ({
     veto: { verdict: 'veto', reasons: [UNREADABLE_REPLY], model: source.model, at: options.now },
-    checked: true, outcome: 'unreadable', reason: `${UNREADABLE_REPLY} (${why})`, latencyMs: exchange.latencyMs ?? null,
+    checked: true, held: false, outcome: 'unreadable', reason: `${UNREADABLE_REPLY} (${why})`, latencyMs: exchange.latencyMs ?? null, attempts,
     line: `NEAR AI risk check refused ${facts.symbol}: ${UNREADABLE_REPLY} (${why})`,
     exchange,
   });
-  if (!source.configured) return unchecked('NEAR_AI_API_KEY is not set', 'no-key');
+  if (!source.configured) return held('NEAR_AI_API_KEY is not set', 'no-key', 0, null);
   const messages = vetoMessages(facts);
   const asked: VetoExchange = { key: promptKey(messages), model: source.model, messages, response: null };
-  let completion: Completion & { latencyMs?: number };
-  const started = timer();
-  try {
-    completion = await withTimeout(source.complete(messages, { json: true, maxTokens: MAX_TOKENS }), timeoutMs, 'NEAR AI risk check');
-  } catch (err) {
-    const message = errorMessage(err);
-    if (!(err instanceof NearAiUnavailable) && /no answer within/.test(message)) {
-      return { ...unchecked(`no answer within ${timeoutMs / 1000} s`, 'timeout'), exchange: asked };
+  let completion: (Completion & { latencyMs?: number }) | null = null;
+  let started = timer();
+  let last: NoReply | null = null;
+  let attempts = 0;
+  while (completion === null && attempts < tries) {
+    attempts++;
+    started = timer();
+    try {
+      completion = await withTimeout(source.complete(messages, { json: true, maxTokens: MAX_TOKENS }), timeoutMs, 'NEAR AI risk check');
+    } catch (err) {
+      const message = errorMessage(err);
+      if (err instanceof UnrecordedPrompt) {
+        // Replay only: the demo's scripted entry has no recorded reply. Anywhere else it is no answer, as live.
+        if (source.replayPassUnrecorded === true) {
+          return {
+            veto: { verdict: 'pass', reasons: [REPLAY_UNRECORDED], model: source.model, at: options.now },
+            checked: false, held: false, outcome: 'replay-unrecorded', reason: REPLAY_UNRECORDED, latencyMs: null, attempts,
+            line: `${facts.symbol}: ${REPLAY_UNRECORDED}`, exchange: asked,
+          };
+        }
+        last = { why: message, outcome: 'unavailable', again: false };
+      } else if (!(err instanceof NearAiUnavailable) && /no answer within/.test(message)) {
+        last = { why: `no answer within ${timeoutMs / 1000} s`, outcome: 'timeout', again: true };
+      } else if (err instanceof NearAiUnavailable && NO_ANSWER.some((p) => message.startsWith(p))) {
+        if (message.startsWith('NEAR_AI_API_KEY')) return held(message, 'no-key', attempts, asked);
+        // A bad key is no answer too, but it never heals by itself: asked once, and it says so on every decision.
+        const rejected = /^NEAR AI answered (HTTP 40[13]\b.*)$/s.exec(message);
+        if (rejected !== null) last = { why: `NEAR AI key rejected (${rejected[1]})`, outcome: 'key-rejected', again: false };
+        else last = { why: message, outcome: 'unavailable', again: !message.startsWith('no recorded') };
+      } else {
+        // A reply came and could not be read (cut off, not a chat completion, not JSON): fail closed.
+        return unreadable(message, { ...asked, latencyMs: timer() - started }, attempts);
+      }
+      if (!last.again) break;
     }
-    if (err instanceof NearAiUnavailable && NO_ANSWER.some((p) => message.startsWith(p))) {
-      // A bad key is no answer too, but it never heals by itself: it says so on every decision.
-      const rejected = /^NEAR AI answered (HTTP 40[13]\b.*)$/s.exec(message);
-      if (rejected !== null) return { ...unchecked(`NEAR AI key rejected (${rejected[1]})`, 'key-rejected'), exchange: asked };
-      return { ...unchecked(message, message.startsWith('NEAR_AI_API_KEY') ? 'no-key' : 'unavailable'), exchange: asked };
-    }
-    // A reply came and could not be read (cut off, not a chat completion, not JSON): fail closed.
-    return unreadable(message, { ...asked, latencyMs: timer() - started });
+  }
+  if (completion === null) {
+    const l = last ?? { why: 'no answer', outcome: 'unavailable' as const, again: false };
+    return held(attempts > 1 ? `${l.why}, asked ${attempts} times` : l.why, l.outcome, attempts, asked);
   }
   const latencyMs = completion.latencyMs ?? timer() - started;
   const exchange: VetoExchange = { ...asked, response: completion.raw, latencyMs };
@@ -403,40 +475,43 @@ export async function checkVeto(
   try {
     verdict = verdictFromReply(completion.content);
   } catch (err) {
-    return unreadable(errorMessage(err), exchange);
+    return unreadable(errorMessage(err), exchange, attempts);
   }
   const veto: Veto = { verdict: verdict.verdict, reasons: verdict.reasons, model: source.model, at: options.now };
   const line = verdict.verdict === 'veto'
     ? `NEAR AI risk check refused ${facts.symbol}: ${verdict.reasons.join('; ')}`
     : `NEAR AI passed ${facts.symbol}${verdict.reasons.length === 0 ? '' : `: ${verdict.reasons.join('; ')}`}`;
   return {
-    veto, checked: true, outcome: verdict.verdict === 'veto' ? 'refused' : 'passed', reason: verdict.reasons.join('; '), latencyMs, line, exchange,
+    veto, checked: true, held: false, outcome: verdict.verdict === 'veto' ? 'refused' : 'passed', reason: verdict.reasons.join('; '), latencyMs, attempts, line, exchange,
   };
 }
 
 /**
- * Plays recorded veto exchanges back, found by their prompt: no key, no network. A prompt with no recording is
- * NearAiUnavailable, so checkVeto passes it with "no NEAR AI risk check".
+ * Plays recorded veto exchanges back, found by their prompt: no key, no network. A prompt with no recording is no
+ * answer (NearAiUnavailable), so checkVeto holds the act, as live. With replayPassUnrecorded (serve sets it in replay
+ * mode only) it is UnrecordedPrompt instead, which checkVeto passes with the replay-only label.
  */
 export class RecordedVeto implements VetoSource {
   readonly configured = true;
   readonly model: string;
+  readonly replayPassUnrecorded: boolean;
   readonly #byKey: Map<string, VetoExchange>;
 
-  constructor(exchanges: readonly VetoExchange[], model = NEAR_AI_MODEL) {
+  constructor(exchanges: readonly VetoExchange[], model = NEAR_AI_MODEL, options: { replayPassUnrecorded?: boolean } = {}) {
     this.model = model;
+    this.replayPassUnrecorded = options.replayPassUnrecorded === true;
     // An exchange with no answer recorded plays back as no answer. A later answer to the same prompt wins.
     this.#byKey = new Map(exchanges.filter((e) => e.response !== null && e.response !== undefined).map((e) => [e.key, e]));
   }
 
   /** A recording file: `{ "exchanges": VetoExchange[] }` (other keys, like `_comment`, are ignored). */
-  static fromFile(path: string): RecordedVeto {
-    return RecordedVeto.fromFiles([path]);
+  static fromFile(path: string, options: { replayPassUnrecorded?: boolean } = {}): RecordedVeto {
+    return RecordedVeto.fromFiles([path], options);
   }
 
   /** Several recordings, in order: a later file's answer to a prompt replaces an earlier one's. */
-  static fromFiles(paths: readonly string[]): RecordedVeto {
-    return new RecordedVeto(paths.flatMap((path) => readExchanges(path)));
+  static fromFiles(paths: readonly string[], options: { replayPassUnrecorded?: boolean } = {}): RecordedVeto {
+    return new RecordedVeto(paths.flatMap((path) => readExchanges(path)), NEAR_AI_MODEL, options);
   }
 
   /** Prompts with a recorded answer. */
@@ -446,7 +521,10 @@ export class RecordedVeto implements VetoSource {
 
   async complete(messages: readonly ChatMessage[]): Promise<Completion & { latencyMs?: number }> {
     const e = this.#byKey.get(promptKey(messages));
-    if (e === undefined) throw new NearAiUnavailable('no recorded NEAR AI risk check reply for this prompt');
+    if (e === undefined) {
+      if (this.replayPassUnrecorded) throw new UnrecordedPrompt();
+      throw new NearAiUnavailable('no recorded NEAR AI risk check reply for this prompt');
+    }
     return { content: completionContent(e.response), raw: e.response, ...(typeof e.latencyMs === 'number' ? { latencyMs: e.latencyMs } : {}) };
   }
 }

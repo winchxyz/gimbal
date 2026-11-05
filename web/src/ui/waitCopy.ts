@@ -229,12 +229,41 @@ export function orderlyRotateReason(reason: string): string | null {
 }
 
 /**
+ * The loop's journal line for an enter or rotate the NEAR AI risk check held because no readable answer came (loop.ts,
+ * journaled `refused`; the check fails closed): `enter ID not carried out: [(owner demo entry …) ]<why>: held, not
+ * passed: the entry waits; nothing sent; <when>; not a refusal, so no 6 h hold-out`, and `rotate A -> B not carried
+ * out: …; A is kept, nothing closed; <when>; …`. `<when>` is `asked again at the next hourly check (<ISO>)` (auto) or
+ * `not tried again by itself: POST /rotate asks again` (by hand). Null for any other text.
+ */
+export function riskHeldCopy(raw: string): WaitCopy | null {
+  const m = raw.match(/^(?:enter (\S+)|rotate (\S+) -> (\S+)) not carried out: (?:\([^)]*\) )?(.*?): held, not passed: the entry waits; (?:nothing sent|\S+ is kept, nothing closed); (asked again at the next hourly check \(\d{4}-\d\d-\d\dT(\d\d:\d\d)[^)]*\)|not tried again by itself: POST \/rotate asks again); not a refusal, so no (\d+) h hold-out$/s);
+  if (!m) return null;
+  const [, enterId, fromId, toId, why, , time, hours] = m as unknown as [string, string | undefined, string | undefined, string | undefined, string, string, string | undefined, string];
+  const head = enterId !== undefined ? `Opening ${enterId} is waiting` : `Rotation from ${fromId} into ${toId} is waiting`;
+  const reason = why.startsWith('no NEAR AI key')
+    ? 'this engine has no NEAR AI key, so the NEAR AI risk check cannot answer'
+    : why.startsWith('NEAR AI key rejected')
+      ? 'NEAR AI rejected this engine\'s key, so the NEAR AI risk check cannot answer'
+      : 'the NEAR AI risk check did not answer';
+  const kept = fromId === undefined ? '' : ` ${fromId} is kept.`;
+  const when = time === undefined
+    ? 'It is not tried again by itself: ask again with POST /rotate.'
+    : `The desk asks again at the next hourly check (${time} UTC).`;
+  return {
+    text: `${head}: ${reason}, so nothing was sent.${kept} ${when} This is not a refusal, so the window is not held out for ${hours} h.`,
+    raw, mapped: true,
+  };
+}
+
+/**
  * The loop's journal line for a window it did not carry out before the NEAR AI risk check (loop.ts, journaled `refused`):
  * `enter|rotate ID not carried out: <hands' refusal>; NEAR AI risk check: not asked (refused before it)`, and
  * `rotate A -> B not carried out: <reason>; A is kept, nothing closed; <risk check>`. Null for any other text.
  */
 function notCarriedOutCopy(raw: string): WaitCopy | null {
   let m: RegExpMatchArray | null;
+  const held = riskHeldCopy(raw);
+  if (held !== null) return held;
   if ((m = raw.match(/^rotate (\S+) -> (\S+) not carried out: (.*?); \1 is kept, nothing closed(?:; (.*))?$/s))) {
     const why = orderlyRotateReason(m[3]!);
     if (why === null) return null;

@@ -40,7 +40,9 @@ rerun reads nothing. A full run takes about an hour on one core; each scope and 
   `auto` on, and LOOP_RULES as they are (cooldown 6 h, time stop 14 d, at most 2 rotations a day, the 1.5x no-rescue
   leverage cap) except the two counts, which `DecideInput.rules` sets (serve never passes it). Lots are the venues'
   `Market.lotSize` at the mean of today's marks, so a leg is sized and rounded as `sizeFor` sizes it. Free margin is
-  set high enough never to bind. The NEAR AI risk check is not run.
+  set high enough never to bind. The NEAR AI risk check is not run: the backtest takes every entry as passed. Live it
+  fails closed (a refusal holds the window out 6 h; no answer holds the entry until the next hourly check), so live
+  can only enter less often than the backtest, never more.
 - **Booking.** A pair held over an hour books that hour's funding on both legs from the venues' booked rates:
   `legUsd x (short leg's rate - long leg's rate)`. Each entry and each rotation books the round trip the scanner
   priced for that window (4 fills, slippage, basis buffer) at the size `decide()` opened. Price P&L is not counted

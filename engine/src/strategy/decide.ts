@@ -21,9 +21,10 @@
 // - flat: after an exit, nothing for cooldownHours; then the top of the scanner's ranked list among the windows that
 //   pass the entry rules now: once it has passed them for enterAfterChecks hourly checks in a row, enter it, sized by
 //   sizeFor; until then, or if it cannot be sized, wait. A lower window is never entered in its place.
-// No model picks the window, the size or the leverage: the NEAR AI veto (veto.ts) can only drop a window. A vetoed
-// window is held out for LOOP_RULES.vetoHoldHours (skipAct with { vetoed: true }), so the veto is not asked again
-// until it passes.
+// No model picks the window, the size or the leverage: the NEAR AI risk check (veto.ts) can only drop a window. A
+// refused window is held out for LOOP_RULES.vetoHoldHours (skipAct with { vetoed: true }), so it is not asked again
+// until that passes. A check that did not answer holds the act without that hold-out (plain skipAct): the window keeps
+// its counts and is asked again at the next hourly check.
 //
 // Counters move only on hourly checks (one after each funding payment): a 5 s scan event can act on counts already
 // reached, never add to them. The counters a Decision returns assume its `act` is carried out; when the veto refuses
@@ -53,7 +54,9 @@ export const LOOP_RULES = {
   cooldownHours: 6,           // after an exit, no new entry for this long
   maxHoldDays: 14,            // time stop
   maxRotationsPerDay: 2,
-  vetoTimeoutMs: 5_000,       // NEAR AI veto: no answer in time = pass, journaled as "no NEAR AI risk check"
+  vetoTimeoutMs: 15_000,      // NEAR AI risk check: each ask waits this long for an answer
+  vetoAttempts: 2,            // asks in all on a timeout or a transport/HTTP error; still none = held, never passed:
+                              // the act waits for the next hourly check, with no vetoHoldHours hold-out
   vetoHoldHours: 6,           // a window NEAR AI risk check refused is not entered or rotated into for this long
 } as const;
 

@@ -253,6 +253,12 @@ test('a long line shows its head, the rest behind a control; a short one stays w
   assert.equal(splitSummary(sol).text, sol.slice(0, sol.indexOf('not a profit') + 'not a profit'.length));
   const tail = `${'x '.repeat(90)}owner demo entry: the profit checks are waived and the rest`;
   assert.equal(splitSummary(tail).text, tail.slice(0, tail.indexOf('waived') + 'waived'.length));
+  // And the NEAR AI risk check's: a replay-only pass, and an entry held for want of an answer.
+  const replayOnly = `${enter.replace('; checks: x; filled 0.12 SOL', '')}; no recorded NEAR AI risk check reply for this prompt: passed in replay only; live, the entry would wait; opened both legs`;
+  assert.equal(splitSummary(replayOnly).text, replayOnly.slice(0, replayOnly.indexOf('would wait') + 'would wait'.length));
+  const heldLine = 'enter sol-phoenix-hyperliquid not carried out: the NEAR AI risk check did not answer (no answer within 15 s, asked 2 times): '
+    + 'held, not passed: the entry waits; nothing sent; asked again at the next hourly check (2026-11-05T11:01:00.000Z); not a refusal, so no 6 h hold-out';
+  assert.equal(splitSummary(heldLine).text, heldLine.slice(0, heldLine.indexOf('entry waits') + 'entry waits'.length));
   // No ": " or "; " before the limit: cut at the last space.
   const words = 'word '.repeat(40).trim();
   const cut = splitSummary(words);

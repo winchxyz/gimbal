@@ -20,7 +20,11 @@
 // flat and the journal says so. Before an enter or a rotate the window goes to the NEAR AI risk check (veto.ts
 // checkVeto), with the facts serve adds (riskFacts: book depth at the size, the 24 h move, the listing age); a refusal
 // saves skipAct(…, { vetoed: true, why }), whose counters hold the window out (vetoedUntil, vetoWhy), writes a `veto`
-// entry and signs nothing; the verdict is shown on the window (Window.veto, republished). Every check is booked in the
+// entry and signs nothing; the verdict is shown on the window (Window.veto, republished). A check with no readable
+// verdict (no answer after LOOP_RULES.vetoAttempts tries, no key, the key rejected) holds the act: journaled `refused`
+// ("the NEAR AI risk check did not answer ... held, not passed"), nothing closed or sent, no hold-out (it is not a
+// refusal), and the act is not tried again before the next hourly check. Only enters and rotates are checked: exits,
+// stops, the one-leg close and POST /close never ask NEAR AI. Every check is booked in the
 // risk check ledger (book/risk-ledger.ts), and the decision, the act's journal entry and any refusal after it carry
 // its why line (riskCheckWhy, with the attestation label); a refusal before it says RISK_NOT_ASKED. An act refused before anything was
 // sent is journaled and not tried again for RETRY_AFTER_MS; one that sent orders, or was refused for a passing reason
@@ -50,7 +54,8 @@
 // DEMO_MAX_LOSS_USD, and the window's round trip in USD (the one its checks print, WindowFacts.roundTripUsd) at most
 // maxLossUsd, else refused with the number; funding during the hold is expected positive and is not part of the bound;
 // the trader's open holds its own round trip to it again (carry-plan.ts). The risk check is asked as for any manual act, told it is a
-// demonstration entry with the profit checks waived and the cost accepted. A held demo pair is decided on as any held
+// demonstration entry with the profit checks waived and the cost accepted; it is never waived: a refusal refuses it and
+// no readable answer holds it, as any entry. A held demo pair is decided on as any held
 // pair: under the demo rules (a 1000 % minimum, exit after 24 checks) its counted exit comes on the 24th hourly check
 // in a row; the stops, the one-leg close and POST /close at any time.
 //
@@ -139,7 +144,7 @@ export const RISK_NOT_ASKED = 'NEAR AI risk check: not asked (refused before it)
 export const LEDGER_RETRY_MS = 3_600_000;
 export const LEDGER_HOLD_HOURS = Math.min(DEFAULT_SCANNER_CONFIG.costs.holdHours, LOOP_RULES.maxHoldDays * 24);
 
-/** No NEAR AI here: checkVeto answers "no NEAR AI risk check: NEAR_AI_API_KEY is not set", a pass. */
+/** No NEAR AI here: checkVeto answers "NEAR_AI_API_KEY is not set", and every enter and rotate is held, never passed. */
 export const NO_VETO_SOURCE: VetoSource = {
   model: 'none', configured: false,
   complete: async () => {
@@ -547,7 +552,11 @@ type Task = () => Promise<void>;
  * running, a close in flight): tried again on the next check.
  */
 interface ActEnd {
-  end: 'done' | 'skipped' | 'vetoed' | 'flat';
+  /**
+   * `held`: the NEAR AI risk check gave no readable verdict (no answer, no key, the key rejected), nothing was closed
+   * or sent; the act waits for the next hourly check, with no LOOP_RULES.vetoHoldHours hold-out.
+   */
+  end: 'done' | 'skipped' | 'vetoed' | 'held' | 'flat';
   sent: boolean;
   passing: boolean;
   /** The NEAR AI risk check's why line: on every outcome after it was asked (a refusal keeps it with the hold-out). */
@@ -642,7 +651,9 @@ export class StrategyLoop {
   startLine(): string {
     const counts = checkRulesOf(this.#o.strategy());
     const rules = `enter after ${counts.enterAfterChecks} hourly checks in a row, exit after ${counts.exitAfterChecks} (owner settings), cooldown ${LOOP_RULES.cooldownHours} h, time stop ${LOOP_RULES.maxHoldDays} d, at most ${LOOP_RULES.maxRotationsPerDay} rotations a day, a NEAR AI risk check refusal holds ${LOOP_RULES.vetoHoldHours} h`;
-    const veto = this.#o.veto?.configured === true ? `NEAR AI risk check ${this.#o.veto.model} (${(this.#o.vetoTimeoutMs ?? LOOP_RULES.vetoTimeoutMs) / 1000} s)` : 'no NEAR AI risk check (NEAR_AI_API_KEY is not set: every window passes)';
+    const veto = this.#o.veto?.configured === true
+      ? `NEAR AI risk check ${this.#o.veto.model} (${(this.#o.vetoTimeoutMs ?? LOOP_RULES.vetoTimeoutMs) / 1000} s, asked ${LOOP_RULES.vetoAttempts} times at most; no readable answer holds the enter or rotate until the next hourly check${this.#o.veto.replayPassUnrecorded === true ? '; replay only: a prompt with no recorded reply passes, labelled so' : ''})`
+      : 'WARNING: no NEAR AI risk check (NEAR_AI_API_KEY is not set): no enter or rotate can pass until a working NEAR AI key is set; exits, stops and rescues do not need it';
     const hands = this.#o.hands === null ? `no hands (${this.#o.handsWhy ?? 'nothing can be opened or closed here'}): decisions are published, acts journaled as refused` : (this.#o.handsLine ?? 'acts through the pair trader (pair-mainnet open / close)');
     return `strategy loop: ${this.#o.trade ? 'GIMBAL_TRADE=1' : 'GIMBAL_TRADE is not 1 (off)'}, auto ${this.#o.strategy().auto ? 'on' : 'off'}; ${hands}; ${veto}; ${rules}; state ${this.#o.store.path}`;
   }
@@ -1057,6 +1068,13 @@ export class StrategyLoop {
         this.#journal('refused', line, { window: target, holdHours: REFRESH_HOLD_MS / HOUR_MS });
         return r;
       }
+      // The NEAR AI risk check did not answer: the act waits for the next hourly check (whichever act comes for the
+      // window next), so NEAR AI is not asked on every scan in between. Not a refusal: no hold-out, the counts stay.
+      if (r.end === 'held' && act.kind !== 'exit') {
+        const until = nextHourlyCheck(this.#o.clock.now());
+        for (const k of [`enter ${target}`, `rotate ${target}`]) this.#refused.set(k, { until, reason: r.why ?? '' });
+        return r;
+      }
       // Not tried again for a while only when it was refused with nothing sent, for a reason that does not pass.
       if (r.end === 'done' || r.sent || r.passing || r.end === 'vetoed') this.#refused.delete(key);
       else this.#refused.set(key, { until: this.#o.clock.now() + RETRY_AFTER_MS, reason: this.#refused.get(key)?.reason ?? '' });
@@ -1112,6 +1130,22 @@ export class StrategyLoop {
       manual: p.manual, ...(p.demo === undefined ? {} : { demo: p.demo }),
     });
     onChecked({ checkId: check.checkId, fresh: check.fresh, why: check.why });
+    // No readable verdict: held, never passed. Checked first: a held result carries a "veto" (fail closed), but it is
+    // not a refusal, so it starts no hold-out. Nothing is closed (a rotate keeps the held pair) and nothing is sent.
+    if (check.result.held) {
+      const next = new Date(nextHourlyCheck(this.#o.clock.now())).toISOString();
+      const waits = p.manual ? 'not tried again by itself: POST /rotate asks again' : `asked again at the next hourly check (${next})`;
+      const tag = p.demo === undefined ? '' : `(${demoText(p.demo)}) `;
+      const line = p.fromId === null
+        ? `enter ${w.id} not carried out: ${tag}${check.why}; nothing sent; ${waits}; not a refusal, so no ${LOOP_RULES.vetoHoldHours} h hold-out`
+        : `rotate ${p.fromId} -> ${w.id} not carried out: ${tag}${check.why}; ${p.fromId} is kept, nothing closed; ${waits}; not a refusal, so no ${LOOP_RULES.vetoHoldHours} h hold-out`;
+      this.#journal('refused', line, {
+        window: w.id, symbol: sym.symbol, legUsd: p.legUsd, leverage: p.leverage, qty: p.qty, by: who, veto: check.result.line, held: 1,
+        riskCheckAttempts: check.result.attempts, ...(p.fromId === null ? {} : { from: p.fromId }), ...check.numbers,
+        ...(p.demo === undefined ? {} : { demo: 1, maxLossUsd: p.demo.maxLossUsd, roundTripUsd: round4(p.demo.roundTripUsd) }),
+      });
+      return { end: 'held', sent: false, passing: false, why: check.why, result: `not opened: ${check.why}` };
+    }
     if (check.result.veto.verdict === 'veto') return { end: 'vetoed', sent: false, passing: false, why: check.why };
     const why = check.why;
     const base = {
@@ -1310,17 +1344,22 @@ export class StrategyLoop {
       ...(result.exchange === null ? {} : vetoJournalNumbers(result.exchange)),
     };
     const booked = this.#bookCheck(w, p, result, why, attestation, now);
-    const shown = result.veto.verdict === 'veto' ? LOOP_RULES.vetoHoldHours * HOUR_MS : VERDICT_SHOWN_MS;
-    this.#verdicts.set(w.id, { veto: result.veto, until: now + shown });
-    const scanned = this.#o.windows();
-    if (scanned !== null) this.#republishVerdicts(scanned, now);
+    // A held check (no readable verdict) is not shown on the window: there is no verdict to show, and it is no refusal.
+    if (!result.held) {
+      const shown = result.veto.verdict === 'veto' ? LOOP_RULES.vetoHoldHours * HOUR_MS : VERDICT_SHOWN_MS;
+      this.#verdicts.set(w.id, { veto: result.veto, until: now + shown });
+      const scanned = this.#o.windows();
+      if (scanned !== null) this.#republishVerdicts(scanned, now);
+    }
     // The decision that asked carries the verdict from here.
     const d = this.#decision;
     if (!p.manual && d !== null && d.windowId === w.id && (d.action === 'enter' || d.action === 'rotate')) {
-      const tail = result.veto.verdict === 'veto' ? `; ${why}: not ${d.action === 'enter' ? 'entered' : 'rotated'}` : `; ${why}`;
+      const not = d.action === 'enter' ? 'entered' : 'rotated';
+      const tail = result.held ? `; ${why}: not ${not} now, asked again at the next hourly check`
+        : result.veto.verdict === 'veto' ? `; ${why}: not ${not}` : `; ${why}`;
       this.#publishDecision({ ...d, reason: `${d.reason}${tail}`, at: now });
     }
-    if (result.veto.verdict === 'veto') {
+    if (!result.held && result.veto.verdict === 'veto') {
       this.#journal('veto', `${w.id}${p.demo === undefined ? '' : ` (${demoText(p.demo)})`}: ${why}; not ${p.kind === 'enter' ? 'entered' : 'rotated into'}, held out for ${LOOP_RULES.vetoHoldHours} h`, {
         window: w.id, model: result.veto.model, ...numbers, ...(p.demo === undefined ? {} : { demo: 1, maxLossUsd: p.demo.maxLossUsd, roundTripUsd: round4(p.demo.roundTripUsd) }),
       });
@@ -1336,7 +1375,8 @@ export class StrategyLoop {
    */
   #bookCheck(w: FundingWindow, p: { kind: 'enter' | 'rotate'; legUsd: number; leverage: number; manual: boolean; demo?: DemoCost }, r: VetoResult, why: string, attestation: string | null, now: number): { checkId: string | null; fresh: boolean } {
     if (this.#o.ledger === undefined) return { checkId: null, fresh: false };
-    const verdict = r.veto.verdict === 'veto' ? 'refused' : r.checked ? 'passed' : 'unchecked';
+    // Held (no readable verdict) is booked unchecked, never as a refusal the ledger would price as helped or hurt.
+    const verdict = r.held ? 'unchecked' : r.veto.verdict === 'veto' ? 'refused' : r.checked ? 'passed' : 'unchecked';
     const by = p.manual ? 'manual' : 'auto';
     const demo = p.demo !== undefined;
     const last = this.#lastChecks.get(w.id);

@@ -185,6 +185,16 @@ desk, for good.
 The seven oracle ids are fixed and asked together; if one breaks, owners move symbols to `unpriced`. `refresh_prices`
 costs the contract up to 29–58 NEAR a day if spammed, so its balance is watched.
 
+### NEAR AI risk check
+
+The engine asks the NEAR AI risk check before every enter and rotate, and it fails closed: only a readable pass lets
+the act go ahead. No answer within 15 s (asked twice), NEAR AI unreachable, or no working key holds the act until the
+next hourly check, journaled "the NEAR AI risk check did not answer ... held, not passed"; an unreadable reply is a
+refusal. So a NEAR AI outage costs carry not taken, never an unchecked entry. Exits, stops, `panic_close` and rescues
+never ask it. The model never signs and nothing it returns reaches the contract or a venue; the contract checks every
+order against the policy either way. In replay only (`npm run demo`), a prompt with no recorded reply passes, and the
+journal says it would wait live.
+
 ### Frozen venues
 
 A new Phoenix or Ember program id, PhUSD mint, onboarder or permission account needs a new contract.

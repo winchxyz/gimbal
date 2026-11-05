@@ -966,12 +966,13 @@ merged.
 **NEAR AI rule:** the model drafts and refuses, never acts. A policy draft becomes real only through the
 owner's own `set_policy` transaction (and the engine rules only after the owner confirms them); the NEAR AI risk check can
 only remove a window from consideration; nothing a model returns is ever sent to the contract or a venue. Model: a NEAR AI Cloud TEE model with JSON output
-(`Qwen/Qwen3-VL-30B-A3B-Instruct`, no reasoning, ~1 s); if NEAR AI is down, drafting is unavailable and
-windows pass with no NEAR AI risk check.
+(`Qwen/Qwen3-VL-30B-A3B-Instruct`, no reasoning, ~1 s); if NEAR AI is down, drafting is unavailable and the NEAR AI
+risk check fails closed: every enter and rotate is held (never passed) until it answers; exits, stops, `panic_close`
+and rescues never ask it.
 
 ## 3. Engine internals
 
-**Strategy loop** (E10, `engine/src/strategy/`). The agent finds funding, enters, holds, exits and rotates by itself;
+**Strategy loop** (E10, `engine/src/strategy/`). The loop finds funding, enters, holds, exits and rotates by itself;
 the contract still decides what is possible, so the loop can lose money on a bad trade but cannot move money
 anywhere the policy does not allow.
 
@@ -1021,18 +1022,35 @@ anywhere the policy does not allow.
     that window out of entries and rotations for `LOOP_RULES.vetoHoldHours` (6 h, `LoopCounters.vetoedUntil`) and
     starts its counts again, and the wait says so ("refused by the NEAR AI risk check (<why line>), held out for N h
     more"; the why line is kept in `LoopCounters.vetoWhy` while the hold lasts). Saved counters without `vetoedUntil`
-    read as none refused.
-- `veto.ts`: the NEAR AI risk check before an enter or a rotate (the client behind `POST /policy/draft`). No key, no
-  answer in `vetoTimeoutMs`, or a transport/HTTP error = pass, journaled "no NEAR AI risk check" (a 401 or 403 says "NEAR AI
-  key rejected", so a bad key shows on every decision). The whole reply is read; one that is not exactly one readable
+    read as none refused. A check with no readable verdict (below) is not a refusal: loop.ts saves plain
+    `skipAct(input, decision)` (no hold-out, the counts kept), and the act is not tried again before the next hourly
+    check (`nextHourlyCheck`).
+- `veto.ts`: the NEAR AI risk check before an enter or a rotate (the client behind `POST /policy/draft`). It fails
+  closed: only a readable "pass" lets the act go ahead. No answer within `LOOP_RULES.vetoTimeoutMs` (15 s) or a
+  transport/HTTP error is asked again, `LOOP_RULES.vetoAttempts` (2) tries in all; still no answer, and the act is
+  **held** (`VetoResult.held`, outcome `timeout` or `unavailable`): not carried out, nothing closed or sent, journaled
+  `refused` "<enter|rotate …> not carried out: the NEAR AI risk check did not answer (<why>, asked 2 times): held, not
+  passed: the entry waits; …; asked again at the next hourly check (<ISO>); not a refusal, so no 6 h hold-out" (a
+  manual one: "not tried again by itself: POST /rotate asks again"), and not shown on the window. No key (`no-key`)
+  or a 401 or 403 (`key-rejected`, asked once: it never heals by itself, so it shows on every decision) holds the act
+  the same way, and serve's start lines warn that no enter or rotate can pass without a working key. Only enters and
+  rotates are checked: exits (counted, the time and drawdown stops), the one-leg close, `POST /close`, `panic_close`
+  and rescues never ask NEAR AI. The owner demo entry waives only its profit checks, never this check. Replay only
+  (`npm run demo`, serve with no key in replay mode: `RecordedVeto` with `replayPassUnrecorded`): a prompt with no
+  recorded reply passes (outcome `replay-unrecorded`), and its line says "no recorded NEAR AI risk check reply for
+  this prompt: passed in replay only; live, the entry would wait"; testnet and mainnet never build that source. The
+  whole reply is read; one that is not exactly one readable
   verdict (no JSON object, more than one, text around it other than ``` fences, a key given twice, not "pass" or
   "veto" after trimming and lowercasing, a "veto" inside a "pass", cut off at its token limit) fails closed: refused,
   "unreadable reply". A refusal drops the window and writes a journal entry of kind `veto` (the kind keeps its name;
   every text the owner reads says "NEAR AI risk check").
   - The why line (`riskCheckWhy`): every enter, rotate, skip and refusal decision carries one, in its summary and as
     `numbers.riskCheck`: "NEAR AI risk check passed (<attestation>): <reason>", "NEAR AI risk check refused
-    (<attestation>): <reason>" (an unreadable reply too), "risk check timed out: passed", "no NEAR AI key: not
-    checked", "NEAR AI key rejected (…): not checked, passed" or "NEAR AI risk check unavailable (…): passed".
+    (<attestation>): <reason>" (an unreadable reply too), "the NEAR AI risk check did not answer (…): held, not
+    passed: the entry waits" (a timeout or NEAR AI unavailable), "no NEAR AI key, so the NEAR AI risk check cannot
+    answer: held, not passed: the entry waits", "NEAR AI key rejected (…), so the NEAR AI risk check cannot answer:
+    held, not passed: the entry waits", or, in replay only, "no recorded NEAR AI risk check reply for this prompt:
+    passed in replay only; live, the entry would wait".
     `<attestation>` is serve's `Attestor.label()` ("TEE attested <date> UTC" or "TEE not attested: <why>"), shown
     only for a reply that came. It says what the model's TEE instances were when last attested; that the reply came
     from those instances is not verified (per-reply signatures need the key and are not fetched). A refusal before the check is asked (no hands, the window not in the scan, a symbol serve does not trade, an
@@ -1045,7 +1063,8 @@ anywhere the policy does not allow.
     refresh), the close and the open: a refusal never costs a refresh.
   - The journal numbers of every check that was asked: `vetoModel`, `vetoKey`, `vetoSystem` and `vetoPrompt` (the
     exact messages sent), `vetoReply` (the model's text as it came), `vetoMs` (latency), `riskCheckOutcome`
-    (passed, refused, unreadable, timeout, unavailable, no-key, key-rejected) and `attestation`. The API key is never
+    (passed, refused, unreadable, timeout, unavailable, no-key, key-rejected, replay-unrecorded) and `attestation`; a
+    held act's `refused` line adds `held: 1` and `riskCheckAttempts`. The API key is never
     in an exchange, a line, a reason or the ledger (an error quoting it, or a 200 body quoting it, is redacted).
   - The facts sent (`vetoFacts`): per leg `open_interest_usd` (the carry), `book_depth_usd` and `fill_impact_bps`
     (serve-loop.ts `riskFacts`: 20 levels of the side the leg fills, read when asked, and not read at all when the
@@ -1057,7 +1076,8 @@ anywhere the policy does not allow.
   - Recordings: `RecordedVeto` plays exchanges by prompt key, with their recorded latency.
     `npm run record-nearai -w engine -- --risk-checks` sends the prompts of `fixtures/nearai/SYNTHETIC-veto.json`
     for real (the human's step: it spends tokens) and writes `risk-checks-<date>.json`; serve replay with no key
-    plays those.
+    plays those, and passes a prompt none of them holds with the replay-only line (a `RecordedVeto` built without
+    `replayPassUnrecorded`, as in tests, holds it, as live).
 - `nearai/attestation.ts`: the TEE attestation of the model. `GET https://cloud-api.near.ai/v1/attestation/report
   ?model=…&nonce=<32 fresh bytes>&signing_algo=ecdsa` (public, no key) and NVIDIA NRAS
   (`POST https://nras.attestation.nvidia.com/v3/attest/gpu`) for each model TEE's GPU evidence. For the gateway and
@@ -1088,7 +1108,10 @@ anywhere the policy does not allow.
   less the round trip prorated by hours priced / hold; it is pending until the whole hold is priced, then helped
   (< 0: a loss avoided), hurt (> 0: a gain given up) or even. A window refused again inside an earlier refusal's
   hold is a repeat, counted in that first one, so each window-hour counts once. The counterfactual is a full hold: it
-  leaves out the exits the loop's own bad checks would have made. A pass (and an unchecked pass) shows the position
+  leaves out the exits the loop's own bad checks would have made. A held check (no readable verdict) is booked
+  `unchecked`, never priced as a refusal; it opens nothing (in replay only, a prompt with no recorded reply passes
+  and is booked `unchecked` too; a ledger from before the check failed closed may hold unchecked checks that opened).
+  A pass (and an unchecked one) shows the position
   its own act opened (matched by position id, never by time; a pass whose open failed shows none), realised net
   (running while open). Then the totals: the fully priced refusals' sum, and the pending ones' estimate apart.
 - `loop.ts` (serve): runs `decide` after each funding payment (the hourly check) and on each scan event, only with
@@ -1449,7 +1472,9 @@ at the recorded best bid or ask with the scanner's taker fees; funding accrued a
 (3 hourly checks) or exit (6, or a demo pair's 24) on its own, so `ReplayScript` (engine/src/cli/serve-replay-loop.ts)
 plays the owner's two buttons, each journaled as `stage: "replay script"`: a few minutes in, an owner demo entry
 (`POST /rotate` with demo: only the profit checks are waived, the round trip held to 1 USD; the policy, the sizing at
-the owner's `legUsd` and the NEAR AI risk check run as live) on the best window the policy allows, trying the next
+the owner's `legUsd` and the NEAR AI risk check run as live, except that a prompt with no recorded reply passes in
+replay only, journaled "no recorded NEAR AI risk check reply for this prompt: passed in replay only; live, the entry
+would wait") on the best window the policy allows, trying the next
 when the loop does not enter one; and `POST /close` five minutes after the first hour boundary the pair holds through
 (at the latest five minutes before the recording ends). The close's line carries the realized split. Nothing is
 signed or sent, and every screen says replay.

@@ -83,6 +83,14 @@ export function Side({ entries, desk, windows }: { entries: readonly JournalEntr
           </b>
           <span>refused by the NEAR AI risk check</span>
         </div>
+        {counts.held === 0 ? null : (
+          <div>
+            <b>
+              <Flash value={counts.held} />
+            </b>
+            <span>held: the NEAR AI risk check did not answer</span>
+          </div>
+        )}
       </div>
 
       <div className="j-contract">
