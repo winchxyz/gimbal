@@ -1,13 +1,37 @@
 # Gimbal
 
-**Autonomous funding-carry desk: a keyless NEAR contract that is built to trade perps on Hyperliquid, Phoenix and
-Orderly and to move its own margin across chains before a leg is liquidated.**
+**A funding-carry trading desk whose money sits in accounts a NEAR contract controls, with no private key anywhere.**
 
-**Guards cap what an agent spends. Gimbal checks every order it signs.**
+A funding carry is two opposite positions in the same coin on two exchanges, short where the hourly "funding" payment
+pays more and long where it pays less, so price moves cancel out and the gap between the two payments is the income:
+from 2026-07-07 to 2026-07-21, a BTC pair of 1000 USD a leg, short on Hyperliquid and long on Phoenix, would have
+collected 8.69 USD of funding for 2.83 USD of estimated trading costs
+([backtest](docs/backtest-checks.md#top-trades-1000-usd-a-leg)). It is hard to run safely because the two legs sit
+on different chains, so one leg can be liquidated while the spare money sits on the other, and whoever runs the bot
+normally holds keys that could send any order or move the money anywhere. In Gimbal a NEAR contract holds the
+trading accounts and checks every order and transfer against the owner's policy before NEAR's MPC network signs it;
+the engine that trades and moves margin can act only inside that policy.
 
-Live on mainnet: a locked contract with no access keys, desk accounts on all three venues set up with MPC signatures
-the contract built, three 1Click payments whose quote signatures it verified, an on-chain refusal, and the engine
-running against the desk. Not yet: a live pair or a live rescue (on-chain counters 0; [Status](#status-2026-11-04)).
+**Built and verified on mainnet** (every transaction, with what it proves:
+[docs/onchain-evidence.md](docs/onchain-evidence.md)):
+
+- The contract [`gimbal_dex.near`](https://nearblocks.io/address/gimbal_dex.near) is deployed from a reproducible
+  build and locked: its [last access key is deleted](https://nearblocks.io/txns/C3vpb1cvqJMG8ivPJV9nTeJX9XGGGTfQzH7QVYYuMY4E),
+  so nobody can change its code.
+- The desk's accounts on Hyperliquid, Orderly and Phoenix are
+  [derived from NEAR's MPC network](https://nearblocks.io/txns/DMUGLvkVTtf6Atim4jneLvWTmFsbhfDetxcwgHCdWSfN) for the
+  contract; no private key for them exists.
+- Three cross-chain payments into the desk's venues were paid only after the contract verified 1Click's quote
+  signature: [Hyperliquid](https://nearblocks.io/txns/BvJDHBC2SoWduBCSYAynPX1QvYMmqhs8tf7T2HpcYMqi),
+  [Solana](https://nearblocks.io/txns/97DivxqnJgiA3r4t9Kwjcq62bhVvVBWa4bkDtXFyhVKp),
+  [Orderly](https://nearblocks.io/txns/6LGEdqp9bv7WAWKyAz9VkZLACBh5mJRtK6if6EwKC89K).
+- A deliberately mispriced test order was
+  [refused on chain with `E_PRICE_BAND`](https://nearblocks.io/txns/33K2sHAd7TzJrEoAav6JymkuvPG7sUbtDcfRrPf74NSj);
+  on testnet the same code [refused 8 of 8 scripted attacks](#refusals-on-chain-npm-run-attack), 0 USDC moved.
+- The engine runs against the mainnet desk: each start signs an Orderly session through the contract
+  ([the first](https://nearblocks.io/txns/7FKrWJzCGVyGoKEZkGUAJ3jq6o6w5EcPxjWd5h5APxQa); 12 by 2026-11-05).
+
+Not yet: a live pair or a live margin rescue on mainnet (on-chain counters 0; [Status](#status-2026-11-04)).
 
 Tracks: DeFi (main); Agents and Security. Built for NEAR HACKATHON, Nov 1–14, 2026, by winch
 ([@winchxyz](https://x.com/winchxyz)). This repository started on Oct 30, 2026, inside the build window (Oct 19 to
@@ -22,7 +46,7 @@ Nov 14, rule Q-001 of the hackathon).
 ## 30 seconds for a judge
 
 ```bash
-npm ci                     # the four workspaces from the lockfile; npm audit's 2 "high" are one zod advisory (below)
+npm ci                     # the four workspaces from the lockfile; npm audit's 2 "high" are one zod advisory (docs/reviewer-checks.md)
 npm run ci -- --only npm   # ci: green - npm ci, build, test, typecheck (node tests 1426 + 504 + 233) in N s
 npm run demo               # demo: ready. Open http://localhost:5190 (recorded mainnet data, nothing signed)
 ```
@@ -33,11 +57,40 @@ On chain: [the contract's last key deleted](https://nearblocks.io/txns/C3vpb1cvq
 [`E_PRICE_BAND` on a deliberately mispriced test order](https://nearblocks.io/txns/33K2sHAd7TzJrEoAav6JymkuvPG7sUbtDcfRrPf74NSj),
 and the [testnet attack run](#refusals-on-chain-npm-run-attack): 8 of 8 refused, 0 USDC moved, a tx per row.
 
-## What it does
+## Does it make money?
 
-A funding carry is two positions that cancel out: short a perp on the venue that pays high funding, long the same
-coin on a venue that pays less, and collect the difference every hour. It breaks in two ways: one leg is liquidated
-because its margin sits on the wrong venue, and whoever runs it holds keys to both accounts.
+Not at the size it runs today. What a pair nets is the funding gap between the two venues while it is held, minus
+its round trip (four fills, slippage on the order books and a buffer for the price gap between the venues), minus
+any cross-chain transfer of margin. The round trip is paid once and funding arrives by the hour, so a pair pays only
+if the gap lasts: the strategy loop opens one only when the gap, held for 7 days, is forecast to pay the round trip
+and still clear the owner's minimum of 5 % net APR. On 336 days of real funding history (2025-12-02 to 2026-11-04)
+with the engine's own scanner, rules and costs, those rules entered 3 pairs at 12 USD a leg, the live desk's size, and
+netted 0.123 USD (0.241 USD funding, 0.118 USD costs); at 1000 USD a leg they entered 2 pairs and netted 1.10 USD
+(7.58 USD funding, 6.48 USD costs), holding a pair for 363 of the 8,080 hours checked
+([backtest](docs/backtest-checks.md#results-on-the-one-round-trip-2026-11-04-168-h-hold-10-bps-buffer)). The
+backtest leaves out cross-chain transfers, which cost mostly a fixed fee rather than a share of the amount: about
+0.3 USDC through 1Click, plus 1 USDC to withdraw from Hyperliquid. One transfer costs more than the 12 USD desk's
+whole year, so today's 38.68 USDC desk is a demonstration that the controls hold with real money, not an income. At 1000 USD a leg a pair
+netted 0.55 USD on average, enough to pay for one 0.3 USDC transfer but not for a withdrawal from Hyperliquid. The
+backtest shows no size at which the desk becomes an income, and with 2 to 4 trades per setting its numbers record the
+entry hurdle, not a strategy's return.
+
+The main risks, and the guard for each:
+
+- **One leg is liquidated.** The legs cancel on price, but each has its own margin on its own venue, so a sharp move
+  can push one toward liquidation while the other gains. The risk engine reads the desk every 5 s and sets a rescue
+  line for each leg (8 % from liquidation by default, wider when the market moves fast). A leg that crosses it gets
+  USDC from the desk's reserve or the other leg through 1Click (the contract pays only the desk's own accounts, at
+  most 50 USD an hour on this desk); if no route can pay, both legs are cut by the same size. Legs open at up to 3x
+  leverage, and at 1.5x at most where no live rescue route exists. No rescue has run on mainnet yet.
+- **The spread flips.** The venue that paid can start charging. The loop exits after 6 hourly checks in a row of a
+  flipped or shrunken spread, and closes both legs at once when the pair's loss reaches the owner's stop drawdown
+  (10 % of a leg on this desk) or after 14 days.
+- **A bad entry.** Before every entry and rotation the NEAR AI risk check reads the window's facts and can refuse it;
+  it cannot pick a pair, a size or an order. Whatever the engine asks, the contract refuses an order above the
+  policy's size caps, or on a priced symbol more than 1 % from the oracle price.
+
+## What it does
 
 Gimbal runs the whole loop without a private key:
 
@@ -115,33 +168,12 @@ that proves the refusal.
   venues' ledgers (never estimated), fees from fills, transfers, exit and reason, net USD and actual APR against the
   forecast. `npm run report` prints it.
 
-### Rescue routes: live on mainnet or replay only
-
-On mainnet `serve` moves real money only with `GIMBAL_RESCUE=1`, and only on the routes marked live; it prints the
-list at start. Steps and checks: [tools/mainnet/README.md](tools/mainnet/README.md), "The live rescue".
-
-| route | on mainnet | how |
-|---|---|---|
-| reserve (the desk's idle USDC on NEAR) → Hyperliquid | live | `fund_venue` into HyperCore USDC |
-| reserve → Phoenix | live | `fund_venue` into the desk's Solana USDC, then a deposit into Phoenix |
-| Phoenix → Hyperliquid | live | one Solana transaction (`sol_sign_rescue`) to the 1Click deposit address |
-| Hyperliquid → Phoenix | replay only | wired (`hl_withdraw`, `evm_usdc_to_intents`, the deposit), not yet dry-run on mainnet |
-| reserve or Phoenix → Orderly | replay only | an Orderly landing needs Orderly's private API, which the rescuer does not read yet (the owner's one-off `fund_venue` to Orderly is below) |
-| Hyperliquid → Orderly | not built | Arbitrum USDC into Arbitrum USDC, which 1Click does not quote |
-
-The Phoenix routes also need a Solana RPC that serves transaction history; without one `serve` refuses them and
-says why. A leg without a live rescue route is opened at 1.5x leverage at most (`engine/src/trade/carry-plan.ts`).
+Which rescue routes run live on mainnet and which only in replay: [docs/rescue-routes.md](docs/rescue-routes.md).
 
 ## Live on mainnet
 
 The contract is [`gimbal_dex.near`](https://nearblocks.io/address/gimbal_dex.near). It has no access keys, so nobody
 can change its code, sign for it or move its NEAR; only the contract's own methods run.
-
-| Action | Time (UTC) | NEAR tx | What it proves |
-| --- | --- | --- | --- |
-| account created | 2026-11-03 19:34:31 | [GwzYcqsg…](https://nearblocks.io/txns/GwzYcqsgQMZ4Tv6DV79Hhz4Nj9uLjwerpMfHvrjMWHGr) | the contract account exists |
-| code deployed, `new()` called | 2026-11-03 19:34:37 | [5xJqg6NR…](https://nearblocks.io/txns/5xJqg6NRApFngnzTDM12ZNH6r2sT5G2zqwrd8Co9MZP9) | the reproducible wasm below is the code on chain |
-| last key deleted (locked) | 2026-11-03 19:37:15 | [C3vpb1cv…](https://nearblocks.io/txns/C3vpb1cvqJMG8ivPJV9nTeJX9XGGGTfQzH7QVYYuMY4E) | nobody can upgrade or drain the contract |
 
 The code on chain has code_hash `8SJ968Gyuwx9PAkU3v2ujJcdC7As4KX5SrqE8eqaQKaR` (sha256
 `6e7cb556b86ab64414196d76243bce6e04bd9a5da0ce49b7093a0d279cc15482`, 675,664 bytes). Its NEP-330 `build_info`
@@ -150,42 +182,12 @@ names a reproducible build of commit
 `sourcescan/cargo-near:0.22.0-rust-1.99.1@sha256:c9655eaf7436b90c87ea8b25739f91063032c5c30ba24cfeafe72c142943b5bb`.
 To check it, run `cargo near build reproducible-wasm` in `contract/` at that commit and compare the sha256.
 
-**Desk `carry`** on `gimbal_dex.near`, policy [tools/mainnet-final-policy.json](tools/mainnet-final-policy.json)
-(20 USD per order, price band 100 bps, oracle at most 900 s old, rescues at most 50 USD per hour, opening orders at
-most 300 USD per hour), plus since 2026-11-05 three unpriced symbols (the `set_policy` row):
-
-| Action | Time (UTC) | NEAR tx | What it proves |
-| --- | --- | --- | --- |
-| `create_desk` | 2026-11-03 19:46:16 | [DMUGLvkV…](https://nearblocks.io/txns/DMUGLvkVTtf6Atim4jneLvWTmFsbhfDetxcwgHCdWSfN) | the desk's EVM and Solana accounts are derived from the MPC network for this contract (two `derived_public_key` calls); no key was created |
-| USDC deposit | 2026-11-03 19:51:13 | [5wA87LhQ…](https://nearblocks.io/txns/5wA87LhQuMYHYK3TzdabTdYuQmbWCbW3v3ARDLdebJiE) | USDC on NEAR is booked to the desk (`ft_on_transfer`) |
-| `orderly_register`, `orderly_add_key` | 2026-11-03 19:55:48 | [CkzBDxER…](https://nearblocks.io/txns/CkzBDxERRpqnDY4rvBDjqFhy6sgx5ehA9dizqA4nszJj), [8azYasTE…](https://nearblocks.io/txns/8azYasTEYXdTXSoo7P9nFF2mQZzyMhnQ4K5WCfut7GJs) | MPC signs Orderly EIP-712 messages the contract built: the account under broker `gimbal_dex` and its Ed25519 key |
-| `sol_sign_register` | 2026-11-03 19:57:44 | [9YCsKaxv…](https://nearblocks.io/txns/9YCsKaxvBGJ3Tb12jMGDgmwZSpFdbjhzbzyjrFDjwqhU) | MPC signs a Phoenix registration transaction the contract parsed |
-| `fund_venue` to Hyperliquid | 2026-11-03 20:09:15 | [BvJDHBC2…](https://nearblocks.io/txns/BvJDHBC2SoWduBCSYAynPX1QvYMmqhs8tf7T2HpcYMqi) | the contract verified a signed 1Click quote and paid it; 7.683406 USDC landed in the desk's Hyperliquid perps about 42 s later (Hyperliquid ledger `send`) |
-| `hl_set_referrer`, `hl_approve_builder_fee` | 2026-11-03 20:10:05 | [6hPqfFKM…](https://nearblocks.io/txns/6hPqfFKMZgy261xuhjR9sSRzRbMJchGfaLAXu4V3hQd5), [7AA2AeUa…](https://nearblocks.io/txns/7AA2AeUahAHB6K57zqZfqBWeLqoYv2EjpDHCY7Fv5MvR) | MPC signs a Hyperliquid L1 action and a user-signed action the contract built |
-| `fund_venue` to Solana | 2026-11-03 20:19:37 | [97DivxqnJ…](https://nearblocks.io/txns/97DivxqnJgiA3r4t9Kwjcq62bhVvVBWa4bkDtXFyhVKp) | a second verified quote: USDC to the desk's own Solana account, the Phoenix leg's margin |
-| `sol_sign` Phoenix deposit | 2026-11-04 03:09:46 | [BBABoMmY…](https://nearblocks.io/txns/BBABoMmYvHx6os8Nmg8fz1Gek9zsX9FMbF1KamDTjUFS) | MPC signs a Phoenix deposit transaction the contract parsed; 9.75 USDC is now the desk's Phoenix equity |
-| `refresh_prices` | 2026-11-04 07:00:30 | [7RpGjfP4…](https://nearblocks.io/txns/7RpGjfP4YNL7bxiqA682FR7mdARCQo7wZc4X5JDyQJ8e) | the contract stores fresh OutLayer TEE oracle prices |
-| `hl_order` refused: `E_PRICE_BAND` | 2026-11-04 07:00:43 | [33K2sHAd…](https://nearblocks.io/txns/33K2sHAd7TzJrEoAav6JymkuvPG7sUbtDcfRrPf74NSj) | a deliberately mispriced test order, sent on purpose (`pair-mainnet refuse-band ETH`): an ETH buy at 2343.5, 2.0007 % above the stored oracle price 2297.535, is refused on chain (band 100 bps); nothing is signed |
-| `set_orderly_receiver` | 2026-11-04 18:32:59 | [3kRLjLqZ…](https://nearblocks.io/txns/3kRLjLqZ4rxoPVFNZxcYpHXjxkZZ5Swa4KkDyRv72TWd) | the owner pins the Orderly account's receiver address on Arbitrum (read just before by a signed `orderly_request` `receiver_address`); the only non-desk recipient a 1Click quote may name; refunds go to the owner |
-| `set_orderly_ips`, then `orderly_request` `ip_restriction` | 2026-11-04 18:46:12, 18:50:44 | [3jbv172w…](https://nearblocks.io/txns/3jbv172w4wrv2vfw6yjtgS2TPuR6rD12BRp8pWm8Tuj8), [3LvAC6Qa…](https://nearblocks.io/txns/3LvAC6QasvGEuBfd762PUXrUKVMuxAmT3w7TgkM2Qa8K) | the owner lists three IPs, the engine server's egress addresses, and an MPC-signed request limits the desk's Orderly key to them (`get_desk_settings`: `orderly_ips_applied: true`) |
-| USDC deposit, 16 USDC | 2026-11-04 19:07:51 | [3PT6hN1t…](https://nearblocks.io/txns/3PT6hN1tCNoG69v8TbyHLc44KUTD5CJh3rPZkAVCaxcn) | booked to the desk as principal: 38.681147 USDC deposited in all (`get_desk` ledger) |
-| `fund_venue` to Orderly | 2026-11-04 20:30:44 | [6LGEdqp9…](https://nearblocks.io/txns/6LGEdqp9bv7WAWKyAz9VkZLACBh5mJRtK6if6EwKC89K) | a third verified 1Click quote, 13 USDC to the pinned Orderly receiver, sent with the runbook's `tools/mainnet/fund.mjs` (not a rescue); 12.992204 USDC arrived on Arbitrum 33 s later (1Click status SUCCESS, [0x5bfd659b…](https://arbiscan.io/tx/0x5bfd659b44a30325ed4f2708123413ec6c515fae7f269aeae5e96d1232ed8308)) |
-| `orderly_ws_auth` ×12, `orderly_request` ×28 more | 2026-11-04 18:28:56 to 2026-11-05 02:29:15 | first session: [7FKrWJzC…](https://nearblocks.io/txns/7FKrWJzCGVyGoKEZkGUAJ3jq6o6w5EcPxjWd5h5APxQa), [H7pjoKoL…](https://nearblocks.io/txns/H7pjoKoL46JDe5TUbv9UTcWBHAEgBaX9WhfcvP9tv5iH) (20:32) | each engine start with Orderly pairs on signs one WebSocket login for the desk's Orderly key and two private reads that seed the session (`holding`, `positions`): 12 starts so far. The other four are setup reads (three `receiver_address`, one `holding`). Three MPC signatures per engine start (the login and two seed reads); reads after that ride the session and sign nothing |
-| `set_policy` | 2026-11-05 02:28:21 | [8qaB5a79…](https://nearblocks.io/txns/8qaB5a79diUU6nriYVsMThhTA39z7Cwrpy3wS52c9EMP) | the owner adds ZRO, ETHFI and AAVE on Hyperliquid and Orderly as unpriced symbols: no oracle price, so no band, but a size cap per symbol (`max_sz`) and the 20 USD unpriced cap; every other field is unchanged |
-
-**Canary `gimbal-canary2.near`** (an earlier build of the contract, before the audit fixes; emptied on 2026-11-03).
-It carried the first real money around the full cross-chain path: NEAR → Hyperliquid → Arbitrum → NEAR.
-
-| Action | Time (UTC) | NEAR tx | What it proves |
-| --- | --- | --- | --- |
-| USDC deposit, 29 USDC | 2026-11-01 22:07:50 | [ArcSi2Vy…](https://nearblocks.io/txns/ArcSi2Vy7TJGCe9iYmAc4mszAAcEQEJ7sKBqzL18KTMw) | the desk's ledger on NEAR |
-| `fund_venue` to Hyperliquid, 12 USDC | 2026-11-01 22:09:02 | [uPP67mZg…](https://nearblocks.io/txns/uPP67mZgkxy9NmHyau5WotYu2yATT8UVqXpdbHqRDgv) | 11.682396 USDC landed on Hyperliquid through 1Click (0.32 USDC cost) |
-| `hl_withdraw` | 2026-11-03 01:38:48 | [GpyueMBc…](https://nearblocks.io/txns/GpyueMBcWoDZQNb535LKPy1hQPvQc7xG5jntqARjjjyi) | an MPC-signed Hyperliquid withdrawal can only go to the desk's own Arbitrum address; 10.682396 USDC arrived (1 USDC Hyperliquid fee) |
-| `evm_usdc_to_intents`, twice | 2026-11-03 01:52:32, 01:55:24 | [2ugwGTYu…](https://nearblocks.io/txns/2ugwGTYu4jAZnnihKwJ9u6FvqiJqBBoBpsoUQZhv1Yd8), [5Aj4kaFP…](https://nearblocks.io/txns/5Aj4kaFPXd4qtj2DFKtgWLLzom4g7qLXomKDjJHRCMdT) | MPC signs EIP-3009 USDC authorizations on Arbitrum to verified 1Click addresses; both came back to the desk on NEAR within a minute ([4aLX5NfV…](https://nearblocks.io/txns/4aLX5NfVbTiE5qDApCvR52U6ewGVQWDuSVVwQsYGcKtY), [231oHMYf…](https://nearblocks.io/txns/231oHMYfLJsjK33quXA17iE7MS9dtywvmbv5YjipGkCm)) |
-| `withdraw_to_owner` | 2026-11-03 19:50:57 | [6tpfUnHk…](https://nearblocks.io/txns/6tpfUnHkTnvsrY9mHhVQGD9vmxU3AHh2Le479eQuHthf) | money leaves a desk only to its owner |
-
-The full round trip cost 1.32 USDC: 0.32 into Hyperliquid, Hyperliquid's 1.00 withdrawal fee, about 0.003 back to
-NEAR, plus a little Arbitrum gas paid by a gas-only relayer wallet that never holds desk money.
+**Desk `carry`** on `gimbal_dex.near` runs under the policy
+[tools/mainnet-final-policy.json](tools/mainnet-final-policy.json) (20 USD per order, price band 100 bps, rescues at
+most 50 USD per hour), plus three unpriced symbols since 2026-11-05. The canary `gimbal-canary2.near`, an earlier
+build, carried the first real money around the full path NEAR → Hyperliquid → Arbitrum → NEAR for 1.32 USDC.
+Every transaction of the contract, the desk and the canary, with what it proves:
+[docs/onchain-evidence.md](docs/onchain-evidence.md).
 
 <a id="status-2026-11-04"></a>
 
@@ -200,9 +202,10 @@ Done (read from the chain and the venues' public APIs at about 03:00 UTC):
 - The engine runs on a server (`docs/deploy-railway.md`) with the operator key and a gas-only relayer wallet, with
   the strategy loop on, live rescue enabled and, since 2026-11-04, Orderly pairs on (12 Orderly sessions signed on
   chain). Its NEAR AI model is `Qwen/Qwen3-VL-30B-A3B-Instruct`, for policy drafts and the risk check.
-- On testnet the same contract code refused 8 of 8 scripted malicious requests, 0 USDC moved (below).
+- On testnet the same contract code refused 8 of 8 scripted malicious requests, 0 USDC moved
+  ([below](#refusals-on-chain-npm-run-attack)).
 - On mainnet `gimbal_dex.near` refused a deliberately mispriced test Hyperliquid order with `E_PRICE_BAND`
-  (2026-11-04 07:00:43 UTC, in the desk table above).
+  (2026-11-04 07:00:43 UTC, in the desk table of [docs/onchain-evidence.md](docs/onchain-evidence.md#mainnet-desk-carry)).
 - The NEAR AI risk check runs on the mainnet engine before every enter and rotate, with a 5 s timeout; without an
   answer in time the window passes, and the journal says "risk check timed out: passed". `npm run report` books
   every outcome (refusals as helped or hurt, estimated); each pass shows the position its act opened, with that
@@ -215,8 +218,9 @@ Not done yet:
   no position. The owner's threshold is 5 % net APR at 12 USD a leg, and the loop opens only a window inside the
   desk's policy. The two owner demo entry tries of 2026-11-05 were refused by the engine; nothing was signed.
 - **No margin rescue has run on mainnet yet.** The desk's rescue counters on chain are zero; the three `fund_venue`
-  payments above were setup transfers, not rescues. The live routes have
-  been dry-run against mainnet; the money path itself ran on the canary (above).
+  payments were setup transfers, not rescues. The live routes have
+  been dry-run against mainnet; the money path itself ran on the canary
+  ([docs/onchain-evidence.md](docs/onchain-evidence.md#mainnet-canary-gimbal-canary2near)).
 - The money is small on purpose. At 12 USD a leg, funding earns about a cent a day while each one-off transfer costs
   about 0.3 to 1.3 USD, so the desk's record will stay negative through Nov 14; the book shows funding and costs
   apart.
@@ -252,21 +256,8 @@ the dashboard (the engine's allowed browser Origin follows it) and `--engine-por
 
 ### For reviewers
 
-Each command from the repo root of a fresh clone, and what it prints when it works (the reproducible run, rule
-Q-012). None needs a key, an account or a chain; only the last row needs Docker.
-
-| Command | Prints |
-| --- | --- |
-| `npm ci` | installs the four workspaces (`engine`, `web`, `shared`, `tools`) from the lockfile, no errors; npm audit's "2 high" are one advisory, zod 4.4.3 ([GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5)), pinned exactly by the Phoenix SDK 0.6.2 and, to match it, by `engine/package.json` (`npm audit fix` without `--force` changes nothing). The fix is rise ≥ 0.6.7 plus zod ≥ 4.6.6 in the engine, deferred until after the hackathon demo; until then an oversized Phoenix answer could stop the engine, never sign or move funds (the engine's own MCP server reads only its local stdio client) ([docs/security.md](docs/security.md#oversized-phoenix-answers-zod--466)) |
-| `npm run ci -- --only npm` | `ci: green - npm ci, build, test, typecheck (node tests N + N + N) in N s`, the engine, web and tools test counts (1426 + 504 + 233 at this commit) |
-| `npm run demo` | `demo: ready. Open http://localhost:5190`, then the steps above (`-- --web-port <n>` if 5190 is taken) |
-| `cd contract && cargo test -p gimbal-core` | `test result: ok.` for the 126 unit tests and for each vector file (decimal, EIP-3009, Hyperliquid, 1Click, Orderly, Solana, Solana fuzz): 190 passed, 0 failed |
-| `npm run ci -- --only contract` | `ci: green - cargo fmt, clippy, cargo test, wasm (cargo tests 439; wasm 674,490 bytes) in N s` |
-| `cd contract && cargo near build non-reproducible-wasm --no-abi` | writes `contract/target/near/gimbal.wasm`, sha256 `da4bff79edb36baec4a4c5a636a267abe9c0505fa30790a2771584a14b2e30fa`, the code on the testnet deploy |
-| `git checkout eed9a99`, then `cd contract && cargo near build reproducible-wasm` (needs Docker) | sha256 `6e7cb556b86ab64414196d76243bce6e04bd9a5da0ce49b7093a0d279cc15482`, the code on `gimbal_dex.near` |
-
-On Windows the full contract tests need the MSVC Rust toolchain (`npm run ci -- --only contract` picks it);
-`cargo test -p gimbal-core` runs on the default one.
+Every check a reviewer can run from a fresh clone, with no key, account or chain, and what each prints when it
+works (the reproducible run, rule Q-012): [docs/reviewer-checks.md](docs/reviewer-checks.md).
 
 ### Read the mainnet desk (no keys)
 
@@ -278,23 +269,8 @@ near contract call-function as-read-only gimbal_dex.near get_desk_counters json-
 
 ### Testnet
 
-The frozen contract code also runs on NEAR testnet (deploy and `new`:
-[EjKZNnRj…](https://testnet.nearblocks.io/txns/EjKZNnRjS8AUkuL9s3kMtVmLFHLbQTW8WdrkeTrdSsTD), desk `final-1`:
-[5MLj2NfS…](https://testnet.nearblocks.io/txns/5MLj2NfSMYh54kYWvjLDM9DBuXndRgqkRPyGge4DLJtw)), with Mock prices
-because the testnet oracle returns none. Its first MPC signature,
-[`hl_order` 9RgCHtyJ…](https://testnet.nearblocks.io/txns/9RgCHtyJ4g8PBoHd4fMPivaJrckoBQMPRPTVbnzC3ARQ), is an order
-Hyperliquid testnet recovered the desk's address from. Same wasm (sha256
-`da4bff79edb36baec4a4c5a636a267abe9c0505fa30790a2771584a14b2e30fa`, `cargo near build non-reproducible-wasm --no-abi`);
-the mainnet build differs only by its embedded build info.
-
-```bash
-node tools/testnet/desk.mjs <contract> <desk_id> --owner <account>.testnet          # create a desk (0.5 NEAR storage, refunded in part)
-node tools/testnet/live.mjs <contract> <desk_id> hl --owner <account>.testnet       # one MPC-signed order, digest re-checked locally
-```
-
-The contract id is the receiver of the deploy transaction above. `live.mjs` recomputes the EIP-712 digest itself,
-without trusting the contract, prints the address it recovers to, and posts the order to Hyperliquid testnet, which
-names the same address.
+The frozen contract code also runs on NEAR testnet, with the same wasm and Mock prices. Its deploy, its first MPC
+signature and the scripts to make your own desk there: [docs/onchain-evidence.md](docs/onchain-evidence.md#testnet).
 
 ### Refusals on chain: `npm run attack`
 
@@ -308,21 +284,9 @@ value before and after. A row passes only on exactly its expected refusal. It re
 npm run attack -w engine -- --contract <contract> --desk <desk> --dry
 ```
 
-**Recorded live run**, 2026-11-03 16:05 UTC, desk `final-1` on the testnet deploy above. The operator key is a
-FunctionCall key for the 21 operator methods with 1 NEAR allowance
-([AddKey](https://testnet.nearblocks.io/txns/496dM6TPyYggn37UJ4yBf7dPsyyfcriH3TTFfJGuvygY)). Result: 8 of 8 PASS,
-`0 USDC moved (NEAR ledger + Hyperliquid account)`.
-
-| Attack | Method | Refusal | NEAR tx |
-| --- | --- | --- | --- |
-| an order 20x over the size cap | `hl_order` | `E_SIZE` | [74qDfhFW…](https://testnet.nearblocks.io/txns/74qDfhFW27u8FzW2B4MGjy3U3wD1dZV4ZG1Y7XxZ938n) |
-| an asset outside the policy | `hl_order` | `E_ASSET` | [GRD7CqNC…](https://testnet.nearblocks.io/txns/GRD7CqNCwPQPoMKLLUCRa5BPzVSBXR8jLnAn6uZoxEEi) |
-| `hl_withdraw` to the attacker's address | `hl_withdraw` | `E_ARGS` (unknown field `destination`) | [7shw8Vtj…](https://testnet.nearblocks.io/txns/7shw8VtjKqP55CMhWvQG9Jx4t9Dx4mHbhhXXR9mAZEz3) |
-| a made-up quote paying the attacker | `fund_venue` | `E_QUOTE_SIGNATURE` | [R3JguFEX…](https://testnet.nearblocks.io/txns/R3JguFEXBoaGrjUASBKiBierDFsHf3RrZHMUbpW3WJP) |
-| a real 1Click quote for another desk | `evm_usdc_to_intents` | `E_QUOTE_FIELDS` | [6ySbdhLq…](https://testnet.nearblocks.io/txns/6ySbdhLqBnd81HTt6VpoVWCWQ5zJ5YdJMP9BBYDFxhVt) |
-| raise its own caps | `set_policy` | rejected by the node (not in the key's methods) | no tx |
-| resume a desk the owner paused | `set_paused` | `E_NOT_ALLOWED` (needs 1 yoctoNEAR) | [2NR9UKQk…](https://testnet.nearblocks.io/txns/2NR9UKQk752b1QcD9UL3UW2tRYyCT3iPJsUAwrSWrWH6) |
-| an Orderly `MARKET` order (no limit price inside the band) | `orderly_request` | `E_PRICE_BAND` | [CryW9jNZ…](https://testnet.nearblocks.io/txns/CryW9jNZKyDEgRYaDcG58kM1yvi6kvgQnRUSN8gmvQBi) |
+**Recorded live run**, 2026-11-03 16:05 UTC, desk `final-1` on the testnet deploy: 8 of 8 PASS,
+`0 USDC moved (NEAR ledger + Hyperliquid account)`. Each attack, its refusal code and its transaction:
+[docs/onchain-evidence.md](docs/onchain-evidence.md#refusals-on-chain-the-recorded-attack-run).
 
 The desk is also a stdio MCP server with five tools (`read_desk`, `place_hl_order`, `fund_venue`, `withdraw`,
 `try_attack`; `npm run mcp -w engine`, configured by `GIMBAL_CONTRACT_ID`, `DESK_ID`, `NEAR_NETWORK` and the
@@ -379,7 +343,8 @@ Hyperliquid pays the code's owner 10% of the fees the desk pays.
   within about 3 minutes (the slow signature plus the slow 1Click transfer), so the rescue line sits far from
   liquidation (8 % by default).
 - **Small carries.** Funding spreads on liquid coins are small, and 1Click fees are roughly flat per transfer
-  (about 0.3 USDC, plus Hyperliquid's 1 USDC withdrawal fee), so small desks lose a large share of a transfer.
+  (about 0.3 USDC, plus Hyperliquid's 1 USDC withdrawal fee), so small desks lose a large share of a transfer
+  ([Does it make money?](#does-it-make-money)).
 - **Orderly is a trading venue without a live rescue.** Orderly pairs run only with `GIMBAL_ORDERLY_PAIRS=1`
   (off in the code by default, on in the mainnet engine since 2026-11-04); without it the desk trades short
   Hyperliquid and long Phoenix only. No rescue can move margin into Orderly live yet (the Orderly routes run in
@@ -401,7 +366,7 @@ Hyperliquid pays the code's owner 10% of the fees the desk pays.
 | `engine/` | TypeScript engine: venue readers, scanner, strategy loop, risk engine, rescue, position book, journal, HTTP/SSE server, replay, MCP server |
 | `web/` | the dashboard: Windows, Desk, Journal, Rescue, Security and onboarding screens; `shared/` holds the types it shares with the engine |
 | `tools/` | mainnet and testnet scripts (dry run by default), policies, and the runbook [tools/mainnet/README.md](tools/mainnet/README.md) |
-| `docs/`, `design/` | [interfaces.md](docs/interfaces.md) (every method, rule, refusal code and event), [security.md](docs/security.md), the server setup; the designer's tokens and mockups |
+| `docs/`, `design/` | [interfaces.md](docs/interfaces.md) (every method, rule, refusal code and event), [security.md](docs/security.md), [onchain-evidence.md](docs/onchain-evidence.md) (every mainnet and testnet transaction), [reviewer-checks.md](docs/reviewer-checks.md), [rescue-routes.md](docs/rescue-routes.md), [backtest-checks.md](docs/backtest-checks.md), the server setup; the designer's tokens and mockups |
 
 ## Built with
 
