@@ -1,5 +1,5 @@
 // The per-host request budget on fake requests: the rate cap and the concurrency limit, critical reads ahead of the
-// scanner's, Retry-After (an hour of it cut to the cap), the backoff without it, the cool-down that skips scanner reads,
+// scanner's and history ahead of books, Retry-After (an hour of it cut to the cap), the backoff without it, the cool-down that skips scanner reads,
 // waits that run out, a caller's deadline (readBy), and a request that times out freeing its slot.
 
 import assert from 'node:assert/strict';
@@ -86,6 +86,22 @@ test('critical reads go ahead of queued scanner books, and a scanner read never 
   assert.equal(order[0], 'book0');
   assert.ok(order.indexOf('account') <= 1, order.join(' '));
   assert.ok(order.indexOf('account') < order.indexOf('book2'), order.join(' '));
+});
+
+test('queue order: a critical read first, then a history read asked after queued books, then the books', async () => {
+  const b = new HostBudget('test', { ...FAST, ratePerSec: 40, burst: 2, maxInFlight: 2, scanMaxInFlight: 1, criticalReserve: 1 });
+  const order: string[] = [];
+  const send = (name: string) => async () => {
+    order.push(name);
+    await sleep(10);
+    return ok();
+  };
+  const books = Array.from({ length: 4 }, (_, i) => read(b, 'book', true, send(`book${i}`)).catch((e: unknown) => e));
+  await sleep(1);
+  const history = read(b, 'history', true, send('history'));
+  const account = read(b, 'account', false, send('account'));
+  await Promise.all([history, account, ...books]);
+  assert.deepEqual(order, ['book0', 'account', 'history', 'book1', 'book2', 'book3']);
 });
 
 test('a scanner read that cannot be sent within its wait is skipped (budget), never sent late', async () => {

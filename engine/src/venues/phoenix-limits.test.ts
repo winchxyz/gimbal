@@ -1,7 +1,8 @@
 // PHOENIX_BUDGET against Phoenix's measured limits, on a fake clock: a host that answers like perp-api.phoenix.trade
 // (one token bucket per IP, 1 request a second, a burst of 20, then 429 with Retry-After: 2) under serve's steady load
 // (the risk engine's account read every 5 s, the scanner's funding, books and history, the hourly book sync). Also the
-// class reserves (critical reads first, history last) and the rate cut after a 429 (a host shared with someone else).
+// class reserves and queue order (critical reads first, history ahead of books), history still sent when the scanner's
+// books spend the bucket every scan, and the rate cut after a 429 (a host shared with someone else).
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -221,7 +222,9 @@ test('the same load under the budget before (5 a second, a burst of 5) and its r
   assert.ok(host.counts().limited > 20, JSON.stringify(host.counts()));
 });
 
-test('class reserves: critical reads take the last tokens, the scanner\'s funding leaves 2, books 3, history 5', async () => {
+// Before 2026-11-06 history left 5 tokens and queued behind books: it only spent what the bucket had to spare, and on
+// a host whose books spend the bucket every scan that was nothing, so no Phoenix leg ever had its 7 days.
+test('class reserves and order: critical reads take the last tokens, funding leaves 2, books and history 3, history ahead of books', async () => {
   const time = new FakeTime(T0);
   const budget = new HostBudget('phoenix-sim', { ...PHOENIX_BUDGET, now: time.now, timers: time.timers, random: () => 0.5 });
   const sent: ReadClass[] = [];
@@ -229,26 +232,117 @@ test('class reserves: critical reads take the last tokens, the scanner\'s fundin
     sent.push(cls);
     return new Response('{}', { status: 200 });
   }).then(() => 'sent', (err: unknown) => (isReadSkipped(err) ? `skipped ${err.reason}` : 'error'));
-  // A full bucket of 10: history may spend 5 of it, books 2 more, funding 1 more, critical reads the rest.
-  const history = Promise.all(Array.from({ length: 6 }, () => go('history')));
+  // A full bucket of 10: books may spend 7 of it.
+  const first = Promise.all(Array.from({ length: 7 }, () => go('book')));
   await time.advance(0);
-  assert.equal(sent.filter((c) => c === 'history').length, 5);
-  const books = Promise.all(Array.from({ length: 3 }, () => go('book')));
-  await time.advance(0);
-  assert.equal(sent.filter((c) => c === 'book').length, 2);
+  assert.equal(sent.filter((c) => c === 'book').length, 7);
+  assert.deepEqual(await first, Array(7).fill('sent'));
+  // 3 left: two more books wait, then a history read asked after them; the next token (4 in the bucket, 1.33 s on) is
+  // the history read's, and the books' wait (1.5 s) is up before another comes.
+  const books = Promise.all([go('book'), go('book')]);
+  const history = go('history');
+  await time.advance(1_400);
+  assert.deepEqual(sent.slice(7), ['history']);
+  assert.equal(await history, 'sent');
+  await time.advance(200);
+  assert.deepEqual(await books, ['skipped budget', 'skipped budget']);
+  // Funding leaves 2, critical reads take the rest.
   const funding = go('funding');
   await time.advance(0);
-  assert.equal(sent.filter((c) => c === 'funding').length, 1);
+  assert.equal(await funding, 'sent');
   const critical = Promise.all([go('critical'), go('critical')]);
   await time.advance(0);
-  assert.equal(sent.filter((c) => c === 'critical').length, 2, 'the last two tokens go to critical reads');
-  assert.deepEqual(await critical, ['sent', 'sent']);
-  assert.equal(await funding, 'sent');
-  // The waiting scanner reads hear "budget" once their wait is up: the bucket refills at 0.75 a second, and every
-  // token goes to the class that needs the fewest.
+  assert.deepEqual(await critical, ['sent', 'sent'], 'the last two tokens go to critical reads');
+  // Nothing left for the scanner: a book and a history read now wait and are skipped, and nothing more was sent.
+  const late = Promise.all([go('book'), go('history')]);
   await time.advance(5_000);
-  assert.deepEqual((await books).sort(), ['sent', 'sent', 'skipped budget']);
-  assert.deepEqual((await history).filter((r) => r !== 'sent'), ['skipped budget']);
+  assert.deepEqual(await late, ['skipped budget', 'skipped budget']);
+  assert.deepEqual(sent.slice(8), ['funding', 'critical', 'critical']);
+});
+
+/**
+ * The scanner's Phoenix load as it runs on a busy host: every 5 s a scan asks for `books` books, each due once 30 s
+ * old (more than the budget can read, so every scan ends with a skip: "phoenix books: N not read this scan"), six at a
+ * time and none after the first skip; then, once the scan's books are done (scanner.ts #loadHistory runs after
+ * pricing), up to 4 history reads, two at a time, until one is answered (one all-market request serves every leg's
+ * week). Around it the risk engine's account read every 5 s and the marks refresh between ticks. Returns when the
+ * first history read was answered (null: never), the critical reads' tally and the books read.
+ */
+async function busyScans(options: HostBudgetOptions, books = 40, minutes = 10) {
+  const time = new FakeTime(T0);
+  const host = phoenixHost(time);
+  const budget = new HostBudget('phoenix-sim', { ...options, now: time.now, timers: time.timers, random: () => 0.5 });
+  const answered = (cls: ReadClass) => budget.run(cls, host.send).then((res) => res.status !== 429, (err: unknown) => {
+    if (!isReadSkipped(err)) throw err;
+    return false;
+  });
+  const critical = { asked: 0, answered: 0 };
+  time.every(5_000, () => {
+    critical.asked++;
+    void answered('critical').then((ok) => {
+      if (ok) critical.answered++;
+    });
+  });
+  time.every(5_000, () => void answered('funding'), 2_500);
+  time.every(60_000, () => void answered('funding'), 100);
+  const readAt = Array.from({ length: books }, () => -Infinity);
+  let booksRead = 0;
+  let historyAt: number | null = null;
+  let historyRun = false;
+  const loadHistory = () => {
+    if (historyRun || historyAt !== null) return;
+    historyRun = true;
+    let asked = 0;
+    const worker = async () => {
+      while (asked < 4 && historyAt === null) {
+        asked++;
+        if (await answered('history') && historyAt === null) historyAt = time.now() - T0;
+      }
+    };
+    void Promise.all([worker(), worker()]).then(() => {
+      historyRun = false;
+    });
+  };
+  let scanning = false;
+  time.every(5_000, () => {
+    if (scanning) return;
+    scanning = true;
+    void (async () => {
+      const now = time.now();
+      const due = readAt.flatMap((at, i) => (now - at >= 30_000 ? [i] : []));
+      let held = false;
+      let next = 0;
+      const worker = async () => {
+        while (next < due.length) {
+          const i = due[next++]!;
+          if (held) continue;
+          if (await answered('book')) {
+            readAt[i] = now;
+            booksRead++;
+          } else held = true;
+        }
+      };
+      await Promise.all(Array.from({ length: 6 }, worker));
+      loadHistory();
+      scanning = false;
+    })();
+  }, 50);
+  await time.advance(minutes * 60_000);
+  await time.advance(20_000);
+  return { historyAt, critical, booksRead, limited: host.counts().limited };
+}
+
+test('history under books that spend the bucket every scan: still sent within the first scans, critical reads first', async () => {
+  const now = await busyScans(PHOENIX_BUDGET);
+  assert.ok(now.historyAt !== null && now.historyAt <= 30_000, `the first history answer at ${now.historyAt} ms`);
+  assert.equal(now.limited, 0);
+  // Every account read answered; the books still get nearly the whole scanner share (history asked for once).
+  assert.ok(now.critical.answered >= now.critical.asked - 4, JSON.stringify(now.critical));
+  assert.ok(now.booksRead >= 150, `${now.booksRead} books read`);
+  // The budget before (history leaving 5 tokens): the scan's books leave the bucket at 3, the history read needs 6 within
+  // its 1.5 s wait (4 s at 0.75 a second), and by the next scan the books have taken the refill again. Never sent.
+  const before = await busyScans({ ...PHOENIX_BUDGET, classReserve: { book: 3, history: 5 } });
+  assert.equal(before.historyAt, null);
 });
 
 test('a 429 halves the rate and empties the bucket; quiet minutes step it back by 0.1 up to 0.75; it never falls under 0.25', async () => {
