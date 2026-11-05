@@ -35,12 +35,25 @@ export interface WriteControls {
   onboarding: boolean;
 }
 
-export const writeControlsFor = (readOnly: boolean): WriteControls => {
-  const on = !readOnly;
-  return { close: on, rotate: on, stress: on, owner: on, money: on, onboarding: on };
+/**
+ * The hosted replay's build (docs/deploy-replay.md): Dockerfile.replay builds the page with VITE_HOSTED_REPLAY=1. Every
+ * other build (`npm run demo`, the live dashboard) leaves it unset. Under `node --test` there is no Vite env at all.
+ */
+export const hostedReplayFlag = (env: Readonly<Record<string, unknown>> | undefined): boolean => env?.VITE_HOSTED_REPLAY === '1';
+
+export const isHostedReplay = (): boolean => hostedReplayFlag(import.meta.env);
+
+/**
+ * Remote: nothing writes. Hosted replay: a public page whose server refuses every write but `POST /stress`, so only the
+ * stress test is drawn. Otherwise everything, as before.
+ */
+export const writeControlsFor = (readOnly: boolean, hosted = false): WriteControls => {
+  const on = !readOnly && !hosted;
+  return { close: on, rotate: on, stress: !readOnly, owner: on, money: on, onboarding: on };
 };
 
-export const writeControls = (): WriteControls => writeControlsFor(isReadOnly());
+export const writeControls = (): WriteControls => writeControlsFor(isReadOnly(), isHostedReplay());
 
 export const READ_ONLY_LINE = 'Read-only view';
 export const READ_ONLY_TEXT = 'Read-only view. This page shows the desk and cannot change anything on it.';
+export const HOSTED_LINE = 'Public replay: read-only. Run it yourself with npm run demo.';

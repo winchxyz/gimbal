@@ -170,7 +170,7 @@ function startEngine(port: number, run: number): ReplayEngine {
   };
 }
 
-/** web/dist from the image's build; built here when missing (a host that ran the plain Dockerfile). */
+/** web/dist from the image's build; built here when missing (a host that ran the plain Dockerfile), as the hosted build. */
 function ensureWebBuild(): void {
   if (existsSync(join(webDir, 'index.html'))) return;
   log('web/dist is missing: building the dashboard once (production build)');
@@ -181,7 +181,9 @@ function ensureWebBuild(): void {
   }
   const vite = [join(root, 'web', 'node_modules', 'vite', 'bin', 'vite.js'), join(root, 'node_modules', 'vite', 'bin', 'vite.js')].find((f) => existsSync(f));
   if (vite === undefined) fail('vite is not installed; run `npm ci`');
-  if (spawnSync(process.execPath, [vite, 'build'], { cwd: join(root, 'web'), stdio: 'inherit' }).status !== 0) fail('building web/ failed');
+  // The hosted build: the page leaves out the controls a visitor cannot use (web/src/remote/readonly.ts).
+  const env = { ...process.env, VITE_HOSTED_REPLAY: '1' };
+  if (spawnSync(process.execPath, [vite, 'build'], { cwd: join(root, 'web'), stdio: 'inherit', env }).status !== 0) fail('building web/ failed');
 }
 
 function newestRecording(): string {
