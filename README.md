@@ -70,10 +70,10 @@ netted 0.123 USD (0.241 USD funding, 0.118 USD costs); at 1000 USD a leg they en
 ([backtest](docs/backtest-checks.md#results-on-the-one-round-trip-2026-11-04-168-h-hold-10-bps-buffer)). The
 backtest leaves out cross-chain transfers, which cost mostly a fixed fee rather than a share of the amount: about
 0.3 USDC through 1Click, plus 1 USDC to withdraw from Hyperliquid. One transfer costs more than the 12 USD desk's
-whole year, so today's 38.68 USDC desk is a demonstration that the controls hold with real money, not an income. At 1000 USD a leg a pair
-netted 0.55 USD on average, enough to pay for one 0.3 USDC transfer but not for a withdrawal from Hyperliquid. The
-backtest shows no size at which the desk becomes an income, and with 2 to 4 trades per setting its numbers record the
-entry hurdle, not a strategy's return.
+whole year, so today's 38.68 USDC desk is a demonstration that the controls hold with real money, not an income.
+At 1000 USD a leg a pair netted 0.55 USD on average, enough to pay for one 0.3 USDC transfer but not for a withdrawal
+from Hyperliquid. The backtest shows no size at which the desk becomes an income, and with 2 to 4 trades per setting
+its numbers record the entry hurdle, not a strategy's return.
 
 The main risks, and the guard for each:
 
