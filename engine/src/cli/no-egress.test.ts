@@ -124,6 +124,12 @@ test('DNS lookups and resolver queries for other names fail without asking a ser
     await assert.rejects(dns.promises.resolveTxt('example.com'), /refused/);
     await assert.rejects(new dns.promises.Resolver().resolve4('example.com'), /refused/);
     assert.equal((await dns.promises.lookup('localhost', { family: 4 })).address.startsWith('127.'), true);
+    // Reverse lookups of an address that is not this machine: refused; loopback goes to the system as before.
+    const service = await new Promise<string>((done) => dns.lookupService('203.0.113.5', 443, (err) => done(err?.message ?? 'resolved')));
+    assert.match(service, /DNS lookupService of 203\.0\.113\.5 refused/);
+    await assert.rejects(dns.promises.lookupService('8.8.8.8', 53), /DNS lookupService of 8\.8\.8\.8 refused/);
+    const local = await dns.promises.lookupService('127.0.0.1', 80).then(() => 'answered', (err: Error) => err.message);
+    assert.doesNotMatch(local, /refused/);
 
     const sock = dgram.createSocket('udp4');
     const sent = await new Promise<string>((done) => sock.send('x', 53, '8.8.8.8', (err) => done(err?.message ?? 'sent')));

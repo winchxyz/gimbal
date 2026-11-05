@@ -3,8 +3,8 @@
 // - TCP and TLS (fetch, WebSocket, http.request and tls.connect all end in net.Socket#connect): a connect to a host
 //   that is not this machine fails at once, before any DNS lookup; a loopback name that resolves elsewhere (a custom
 //   `lookup`) is stopped when the lookup answers, before the connect starts, and checked again on connect;
-// - DNS: dns.lookup and every resolver query (dns.resolve*, reverse, dns.promises, dns.Resolver) for a name that is
-//   not this machine fail without asking any server;
+// - DNS: dns.lookup, dns.lookupService and every resolver query (dns.resolve*, reverse, dns.promises, dns.Resolver)
+//   for a name or address that is not this machine fail without asking any server;
 // - UDP (dgram): send and connect to an address that is not loopback fail.
 // Local IPC (a pipe path) and loopback are left alone. A refused socket that has no error listener gets a quiet one,
 // so a trip never crashes the engine with an unhandled 'error'; every trip is logged with where it would have gone.
@@ -103,6 +103,23 @@ export function refuseEgress(log: (line: string) => void): () => void {
   patch(dns.promises, 'lookup', function (this: unknown, hostname: unknown, ...rest: unknown[]) {
     if (typeof hostname === 'string' && isLoopbackHost(hostname)) return promiseLookup.call(this, hostname, ...rest);
     const err = refusal(`DNS lookup of ${String(hostname)}`);
+    log(err.message);
+    return Promise.reject(err);
+  });
+  // lookupService(address, port): a reverse lookup through the system resolver, which may ask a DNS server.
+  const lookupService = dns.lookupService as (...a: unknown[]) => unknown;
+  patch(dns, 'lookupService', function (this: unknown, address: unknown, ...rest: unknown[]) {
+    if (typeof address === 'string' && isLoopbackHost(address)) return lookupService.call(this, address, ...rest);
+    const err = refusal(`DNS lookupService of ${String(address)}`);
+    log(err.message);
+    const cb = rest.at(-1);
+    if (typeof cb === 'function') process.nextTick(() => cb(err));
+    return {};
+  });
+  const promiseLookupService = dns.promises.lookupService as (...a: unknown[]) => unknown;
+  patch(dns.promises, 'lookupService', function (this: unknown, address: unknown, ...rest: unknown[]) {
+    if (typeof address === 'string' && isLoopbackHost(address)) return promiseLookupService.call(this, address, ...rest);
+    const err = refusal(`DNS lookupService of ${String(address)}`);
     log(err.message);
     return Promise.reject(err);
   });

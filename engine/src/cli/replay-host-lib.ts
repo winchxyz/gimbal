@@ -383,7 +383,8 @@ export interface HostServerOptions {
 const FORWARD_HEADERS = ['accept', 'content-type', 'last-event-id', 'cache-control'];
 /** A client that leaves more than this unread is dropped, as the engine drops its own slow SSE clients (1 MiB). */
 export const MAX_UNREAD_BYTES = 1024 * 1024;
-export const MAX_STREAMS_PER_CLIENT = 4;
+/** Event streams per client address: room for several judges' tabs behind one office or venue address. */
+export const MAX_STREAMS_PER_CLIENT = 16;
 
 /**
  * Who a request comes from, for the per-client stream cap: behind Railway's proxy X-Real-IP (the client address its
@@ -436,8 +437,13 @@ export function createHostServer(o: HostServerOptions): HostServer {
         const v = req.headers[h];
         if (typeof v === 'string') headers[h] = v;
       }
-      // Only a body actually sent is announced: a length with nothing behind it would leave the engine waiting.
-      if (opts.body !== undefined) headers['content-length'] = String(opts.body.length);
+      // Only a body actually sent is announced: a length with nothing behind it would leave the engine waiting. The
+      // only body sent is the host's own JSON ({"on":true} for POST /stress), so its type is the host's too: a visitor's
+      // bodyless POST carries no content-type, and copying that would get it refused 415.
+      if (opts.body !== undefined) {
+        headers['content-length'] = String(opts.body.length);
+        headers['content-type'] = 'application/json';
+      }
       const up = request({ agent, host: '127.0.0.1', port, method: opts.method ?? req.method, path: req.url, headers }, (upRes) => {
         const status = upRes.statusCode ?? 502;
         const keep: Record<string, string | string[]> = {};

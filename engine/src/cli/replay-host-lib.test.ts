@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import type { DeskState, EngineState, Leg, RescueProgress } from '@gimbal/shared';
 import type { ReplayEngine } from './replay-host-lib.ts';
 import {
-  HOSTED_BUILD_MARKER, READ_ONLY_REASON, ReplayCycler, StressGate, childEnv, clientKey, createHostServer, hostedRoute, isHostedBuild, staticFile,
+  HOSTED_BUILD_MARKER, MAX_STREAMS_PER_CLIENT, READ_ONLY_REASON, ReplayCycler, StressGate, childEnv, clientKey, createHostServer, hostedRoute, isHostedBuild, staticFile,
   stressBodyProblem,
 } from './replay-host-lib.ts';
 
@@ -238,7 +238,9 @@ test('static files: the file, else index.html; never a path outside the build', 
 
 /** A stand-in engine over HTTP: answers GET /state from `state`, POST /stress with 200, and logs every request. */
 async function fakeEngineServer(state: { desk: DeskState | null; rescue: RescueProgress | null }) {
-  const seen: { method: string; url: string; host: string | undefined; origin: string | undefined; body: string; length: string | undefined }[] = [];
+  const seen: {
+    method: string; url: string; host: string | undefined; origin: string | undefined; body: string; length: string | undefined; type: string | undefined;
+  }[] = [];
   const flood = { written: 0 };
   const server = createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -246,8 +248,13 @@ async function fakeEngineServer(state: { desk: DeskState | null; rescue: RescueP
     req.on('end', () => {
       seen.push({
         method: req.method ?? '', url: req.url ?? '', host: req.headers.host, origin: req.headers.origin, body: Buffer.concat(chunks).toString(),
-        length: req.headers['content-length'],
+        length: req.headers['content-length'], type: req.headers['content-type'],
       });
+      // As the engine does: a POST takes JSON bodies only.
+      if (req.method === 'POST' && !/^application\/json/.test(req.headers['content-type'] ?? '')) {
+        res.writeHead(415, { 'content-type': 'application/json' });
+        return void res.end(JSON.stringify({ ok: false, reason: 'JSON bodies only' }));
+      }
       if (req.url === '/events?flood') {
         // Writes as fast as the reader takes it, the way the engine's SSE writer respects backpressure.
         res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -371,11 +378,29 @@ test('the host server: refused writes never reach the engine, reads do, stress p
     assert.equal(ok.status, 200);
     assert.deepEqual(engine.seen.at(-1), {
       method: 'POST', url: '/stress', host: `127.0.0.1:${engine.port}`, origin: undefined, body: '{"on":true}', length: '11',
+      type: 'application/json',
     });
     const again = await raw(port, 'POST', '/stress', json, '{"on":true}');
     assert.equal(again.status, 409);
     assert.match(JSON.parse(again.text).reason, /one stress test per run/);
     assert.equal(engine.seen.at(-1)?.url, '/stress', 'the second one did not even read the state');
+  } finally {
+    host.close();
+    engine.server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a bodyless POST /stress with no content-type reaches the engine as JSON, not a 415', async () => {
+  const dir = webDir();
+  const engine = await fakeEngineServer({ desk: desk([leg(0.06), leg(0.06)]), rescue: null });
+  const host = createHostServer({ webDir: dir, target: () => engine.port, gate: new StressGate() });
+  const port = await listen(host);
+  try {
+    const r = await raw(port, 'POST', '/stress');
+    assert.equal(r.status, 200, r.text);
+    const sent = engine.seen.at(-1);
+    assert.deepEqual([sent?.method, sent?.url, sent?.type, sent?.body], ['POST', '/stress', 'application/json', '{"on":true}']);
   } finally {
     host.close();
     engine.server.close();
@@ -490,13 +515,15 @@ test('event streams are capped per client address (X-Forwarded-For behind the pr
       open.push(req);
     });
   try {
-    for (let i = 0; i < 4; i++) assert.equal(await stream('198.51.100.1, 192.0.2.7'), 200, `stream ${i + 1}`);
-    assert.equal(host.stats().streams, 4);
+    // Room for several judges' tabs behind one office or venue address.
+    assert.equal(MAX_STREAMS_PER_CLIENT, 16);
+    for (let i = 0; i < MAX_STREAMS_PER_CLIENT; i++) assert.equal(await stream('198.51.100.1, 192.0.2.7'), 200, `stream ${i + 1}`);
+    assert.equal(host.stats().streams, MAX_STREAMS_PER_CLIENT);
     assert.equal(await stream('198.51.100.9, 192.0.2.7'), 429, 'the same last hop is the same client');
     assert.equal(await stream('192.0.2.8'), 200, 'another address still gets one');
     // Closing one frees a place.
     open[0]!.destroy();
-    await until(() => host.stats().streams === 4);
+    await until(() => host.stats().streams === MAX_STREAMS_PER_CLIENT);
     assert.equal(await stream('192.0.2.7'), 200);
   } finally {
     for (const r of open) r.destroy();

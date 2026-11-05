@@ -28,8 +28,8 @@ token or account can reach it even if one were set on the service. Its process i
 - every TCP or TLS connect (fetch, WebSocket, `http.request`, `tls.connect`) to a host that is not this machine,
   before any DNS lookup; a loopback name that a custom `lookup` resolves elsewhere is stopped when the lookup answers,
   before it connects, and checked again on connect;
-- `dns.lookup` and every resolver query (`dns.resolve*`, `reverse`, `dns.promises`, `dns.Resolver`) for a name that
-  is not this machine;
+- `dns.lookup`, `dns.lookupService` and every resolver query (`dns.resolve*`, `reverse`, `dns.promises`,
+  `dns.Resolver`) for a name or address that is not this machine;
 - UDP (`dgram`) send and connect to an address that is not loopback.
 
 A refusal never crashes the engine (a socket with no error listener gets a quiet one). A line `hosted replay: ...
@@ -51,8 +51,9 @@ and does not use up the run's stress test. The engine always receives `{"on":tru
 
 **Built for many visitors.** Every proxied response is written with backpressure: a client that stops reading stops
 the read from the engine (whose own 1 MiB SSE cap then drops that stream), and a client that leaves more than 1 MiB
-unread is dropped. Event streams are capped at 500 in all (503, the page retries) and 4 per client address (429),
-the address being `X-Real-IP`, else the last `X-Forwarded-For` entry, else the socket's. A GET or HEAD that carries a
+unread is dropped. Event streams are capped at 500 in all (503, the page retries) and 16 per client address (429;
+room for several judges' tabs behind one office or venue address), the address being `X-Real-IP`, else the last
+`X-Forwarded-For` entry, else the socket's (set-up step 9 checks this behind Railway's edge). A GET or HEAD that carries a
 body (`Content-Length` above 0, or `Transfer-Encoding`) is answered 400 and its connection closed, and each request
 to the engine uses a connection of its own, so nothing a client sends can be read as a second request. `HEAD` on an
 API path is a GET without the body: `HEAD /events` is answered by the host (200, `text/event-stream`, no stream
@@ -66,7 +67,7 @@ opened), every other API path with the engine's headers; `HEAD` on a page or ass
   `node engine/src/cli/serve.ts`.
 - The replay service has its own settings, no volume and no variables but one. It cannot reach the live engine:
   that one listens on `127.0.0.1` inside its own container.
-- Until its auto-deploy is turned off (step 9), a merge to `main` redeploys the replay too, next to the live one; the
+- Until its auto-deploy is turned off (step 10), a merge to `main` redeploys the replay too, next to the live one; the
   replay simply starts over at run 1.
 
 ## Config as code: why there is no `railway.replay.json`
@@ -103,10 +104,21 @@ Code" and that existing files "stop being read on 2026-12-01 (hard cutoff)". So:
 7. Deploy, then read the log: `recording engine/fixtures/replay/scan-mainnet-2026-10-31T16.jsonl.gz: ... one run plays
    385 s`, `engine environment: N system variables kept, the host's other M not passed on`, `hosted replay on
    http://0.0.0.0:<port>`, `run 1: serving; the next run starts in 430 s`, and every 430 s `run N: serving` followed by
-   `run N-1: stopped`. No line should say `outbound connection ... refused`.
+   `run N-1: stopped`. No line should say `hosted replay: ... refused`.
 8. Open the domain: the header says Replay with the replay clock, the line under it "Public replay: read-only";
    within a minute the Desk shows two SOL legs, with no Close position button.
-9. **Once the hackathon submission is in, turn off auto-deploy** for the replay service (**Settings → Source**: disconnect
+9. Check that the per-client stream cap is real behind Railway's edge. From one machine, open 17 streams (the cap is
+   16), each with a different forged `X-Real-IP`:
+
+   ```bash
+   for i in $(seq 1 17); do curl -sN -m 5 -o /dev/null -w "%{http_code}\n" -H "X-Real-IP: 10.0.0.$i" https://<domain>/events & done; wait
+   ```
+
+   Expect sixteen `200` and one `429`: the edge replaced the forged header with your real address, so all 17 counted
+   as one client. If all 17 answer `200`, the edge passes `X-Real-IP` through and the per-client cap can be dodged.
+   There is no code change to ship for that: the global cap (500 streams) and the 1 MiB unread limit still bound
+   memory. Leave the service running and report it to the maintainer, with the output.
+10. **Once the hackathon submission is in, turn off auto-deploy** for the replay service (**Settings → Source**: disconnect
    the branch trigger, or turn off automatic deploys), so the judging days run one fixed build and no merge to `main`
    restarts it. The live service keeps its own auto-deploy.
 
