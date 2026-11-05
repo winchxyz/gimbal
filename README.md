@@ -1,18 +1,21 @@
 # Gimbal
 
-**A funding-carry trading desk whose money sits in accounts a NEAR contract controls, with no private key anywhere.**
+**A trading desk that earns the gap in funding rates between two exchanges, with its money in accounts only a NEAR
+contract can sign for.**
 
-A funding carry is two opposite positions in the same coin on two exchanges, short where the hourly "funding" payment
-pays more and long where it pays less, so price moves cancel out and the gap between the two payments is the income:
-from 2026-07-07 to 2026-07-21, a BTC pair of 1000 USD a leg, short on Hyperliquid and long on Phoenix, would have
-collected 8.69 USD of funding for 2.83 USD of estimated trading costs
-([backtest](docs/backtest-checks.md#top-trades-1000-usd-a-leg)). It is hard to run safely because the two legs sit
-on different chains, so one leg can be liquidated while the spare money sits on the other, and whoever runs the bot
-normally holds keys that could send any order or move the money anywhere. In Gimbal a NEAR contract holds the
-trading accounts and checks every order and transfer against the owner's policy before NEAR's MPC network signs it;
-the engine that trades and moves margin can act only inside that policy.
+Perpetual-futures exchanges make one side of the market pay the other a small regular fee, called funding, and the
+rate differs from one exchange to the next. A funding carry is short a coin where funding pays more and long the same
+coin where it pays less: the price moves cancel out, and the gap is the income. As an illustration (not a measured
+figure): if one exchange pays 20 % a year on a short and the other charges 8 % on a long, the pair earns the 12 % gap
+on the leg size, before trading costs; whether that pays at real sizes: [Does it make money?](#does-it-make-money).
 
-**Built and verified on mainnet** (every transaction, with what it proves:
+The hard part is that the two legs sit on different chains. One leg can be liquidated while the spare money sits on
+the other, and the bot that runs them usually holds keys that could send any order or move the money anywhere.
+
+In Gimbal a NEAR contract holds the trading accounts and checks every order and transfer against the owner's policy
+before NEAR's MPC network signs it. The engine that trades and moves margin can act only inside that policy.
+
+**Built and verified on mainnet** (the transactions behind each claim, with what each proves:
 [docs/onchain-evidence.md](docs/onchain-evidence.md)):
 
 - The contract [`gimbal_dex.near`](https://nearblocks.io/address/gimbal_dex.near) is deployed from a reproducible
@@ -23,7 +26,7 @@ the engine that trades and moves margin can act only inside that policy.
   contract; no private key for them exists.
 - Three cross-chain payments into the desk's venues were paid only after the contract verified 1Click's quote
   signature: [Hyperliquid](https://nearblocks.io/txns/BvJDHBC2SoWduBCSYAynPX1QvYMmqhs8tf7T2HpcYMqi),
-  [Solana](https://nearblocks.io/txns/97DivxqnJgiA3r4t9Kwjcq62bhVvVBWa4bkDtXFyhVKp),
+  [Phoenix (paid to the desk's Solana account)](https://nearblocks.io/txns/97DivxqnJgiA3r4t9Kwjcq62bhVvVBWa4bkDtXFyhVKp),
   [Orderly](https://nearblocks.io/txns/6LGEdqp9bv7WAWKyAz9VkZLACBh5mJRtK6if6EwKC89K).
 - A deliberately mispriced test order was
   [refused on chain with `E_PRICE_BAND`](https://nearblocks.io/txns/33K2sHAd7TzJrEoAav6JymkuvPG7sUbtDcfRrPf74NSj);
@@ -46,7 +49,7 @@ Nov 14, rule Q-001 of the hackathon).
 ## 30 seconds for a judge
 
 ```bash
-npm ci                     # the four workspaces from the lockfile; npm audit's 2 "high" are one zod advisory (docs/reviewer-checks.md)
+npm ci                     # the four workspaces from the lockfile; one zod advisory (see docs/reviewer-checks.md)
 npm run ci -- --only npm   # ci: green - npm ci, build, test, typecheck (node tests 1426 + 504 + 233) in N s
 npm run demo               # demo: ready. Open http://localhost:5190 (recorded mainnet data, nothing signed)
 ```
@@ -59,21 +62,29 @@ and the [testnet attack run](#refusals-on-chain-npm-run-attack): 8 of 8 refused,
 
 ## Does it make money?
 
-Not at the size it runs today. What a pair nets is the funding gap between the two venues while it is held, minus
-its round trip (four fills, slippage on the order books and a buffer for the price gap between the venues), minus
-any cross-chain transfer of margin. The round trip is paid once and funding arrives by the hour, so a pair pays only
-if the gap lasts: the strategy loop opens one only when the gap, held for 7 days, is forecast to pay the round trip
-and still clear the owner's minimum of 5 % net APR. On 336 days of real funding history (2025-12-02 to 2026-11-04)
-with the engine's own scanner, rules and costs, those rules entered 3 pairs at 12 USD a leg, the live desk's size, and
-netted 0.123 USD (0.241 USD funding, 0.118 USD costs); at 1000 USD a leg they entered 2 pairs and netted 1.10 USD
-(7.58 USD funding, 6.48 USD costs), holding a pair for 363 of the 8,080 hours checked
-([backtest](docs/backtest-checks.md#results-on-the-one-round-trip-2026-11-04-168-h-hold-10-bps-buffer)). The
-backtest leaves out cross-chain transfers, which cost mostly a fixed fee rather than a share of the amount: about
-0.3 USDC through 1Click, plus 1 USDC to withdraw from Hyperliquid. One transfer costs more than the 12 USD desk's
-whole year, so today's 38.68 USDC desk is a demonstration that the controls hold with real money, not an income.
-At 1000 USD a leg a pair netted 0.55 USD on average, enough to pay for one 0.3 USDC transfer but not for a withdrawal
-from Hyperliquid. The backtest shows no size at which the desk becomes an income, and with 2 to 4 trades per setting
-its numbers record the entry hurdle, not a strategy's return.
+**Not at the size it runs today.** Today's 38.68 USDC desk shows that the controls hold with real money; it is not
+an income.
+
+**What a pair earns:** the funding gap between the two venues while it is held, minus its round trip (four fills,
+slippage on the order books and a buffer for the price gap between the venues), minus any cross-chain transfer of
+margin. The round trip is paid once and funding comes in over time, so a pair pays only if the gap lasts. The
+strategy loop opens one only when the gap, held for 7 days, is forecast to pay the round trip and still clear the
+owner's minimum of 5 % net APR.
+
+**Backtest** ([docs/backtest-checks.md](docs/backtest-checks.md#results-on-the-one-round-trip-2026-11-04-168-h-hold-10-bps-buffer)):
+336 days of real funding history (2025-12-02 to 2026-11-04), run through the engine's own scanner, rules and costs
+and today's order books. At 12 USD a leg, the live desk's size, those rules entered 3 pairs and netted 0.123 USD
+(0.241 USD funding, 0.118 USD costs). At 1000 USD a leg they entered 2 pairs and netted 1.10 USD (7.58 USD funding,
+6.48 USD costs), 0.55 USD a pair, holding a pair for 363 of the 8,080 hours checked.
+
+**Not in the backtest:** moving margin between chains. On mainnet a 1Click transfer into Hyperliquid cost about
+0.3 USDC, and the recorded transfer into Orderly on Arbitrum under 0.01 USDC; a withdrawal from Hyperliquid costs
+1 USDC more. The engine budgets each transfer at a fixed part plus 20 bps of the amount. One transfer into
+Hyperliquid costs more than the 12 USD desk netted in the whole backtest, and one withdrawal from Hyperliquid more
+than an average 1000 USD pair netted.
+
+**How much to read into it:** neither size tested (12 or 1000 USD a leg) is an income, and with 2 to 4 trades per
+setting the numbers record the entry hurdle, not a strategy's return.
 
 The main risks, and the guard for each:
 
@@ -81,18 +92,21 @@ The main risks, and the guard for each:
   can push one toward liquidation while the other gains. The risk engine reads the desk every 5 s and sets a rescue
   line for each leg (8 % from liquidation by default, wider when the market moves fast). A leg that crosses it gets
   USDC from the desk's reserve or the other leg through 1Click (the contract pays only the desk's own accounts, at
-  most 50 USD an hour on this desk); if no route can pay, both legs are cut by the same size. Legs open at up to 3x
-  leverage, and at 1.5x at most where no live rescue route exists. No rescue has run on mainnet yet.
+  most 50 USD an hour on this desk); if no route can pay, both legs are cut by the same size. Legs open at 2x
+  leverage at most (the engine caps the owner's 3x setting), and at 1.5x where no live rescue route exists. No rescue
+  has run on mainnet yet.
 - **The spread flips.** The venue that paid can start charging. The loop exits after 6 hourly checks in a row of a
   flipped or shrunken spread, and closes both legs at once when the pair's loss reaches the owner's stop drawdown
   (10 % of a leg on this desk) or after 14 days.
 - **A bad entry.** Before every entry and rotation the NEAR AI risk check reads the window's facts and can refuse it;
-  it cannot pick a pair, a size or an order. Whatever the engine asks, the contract refuses an order above the
-  policy's size caps, or on a priced symbol more than 1 % from the oracle price.
+  it cannot pick a pair, a size or an order. It counts only when it answers within 5 s: with no answer in time, or
+  NEAR AI unreachable, the entry goes ahead and the journal says so; an answer that cannot be read counts as a
+  refusal. Whatever the engine asks, the contract refuses an order above the policy's size caps, or on a priced
+  symbol more than 1 % from the oracle price.
 
 ## What it does
 
-Gimbal runs the whole loop without a private key:
+Gimbal runs the whole loop with no private key for the venue accounts:
 
 - **One NEAR contract owns the venue accounts.** Each desk's Hyperliquid and Orderly account (EVM) and its Phoenix
   account (Solana) are keys of NEAR's MPC network, derived for the contract. No private key for them exists anywhere.
@@ -186,7 +200,7 @@ To check it, run `cargo near build reproducible-wasm` in `contract/` at that com
 [tools/mainnet-final-policy.json](tools/mainnet-final-policy.json) (20 USD per order, price band 100 bps, rescues at
 most 50 USD per hour), plus three unpriced symbols since 2026-11-05. The canary `gimbal-canary2.near`, an earlier
 build, carried the first real money around the full path NEAR → Hyperliquid → Arbitrum → NEAR for 1.32 USDC.
-Every transaction of the contract, the desk and the canary, with what it proves:
+The transactions of the contract, the desk and the canary, with what each proves:
 [docs/onchain-evidence.md](docs/onchain-evidence.md).
 
 <a id="status-2026-11-04"></a>
@@ -246,7 +260,7 @@ the dashboard (the engine's allowed browser Origin follows it) and `--engine-por
 
 | Do | You see |
 | --- | --- |
-| `npm run demo` | within a few seconds `demo: engine rules set: legs 12 USD at up to 3x, enter above 5 % net APR, auto on`, then `demo: ready. Open http://localhost:5190` |
+| `npm run demo` | within a few seconds `demo: engine rules set: legs 12 USD at up to 3x, enter above 5 % net APR, auto on` (the engine caps legs at 2x), then `demo: ready. Open http://localhost:5190` |
 | Open http://localhost:5190 | **Desk**: a Replay badge, "Both legs are safe", a scripted ETH pair (Hyperliquid short, Phoenix long, each about 31 % from liquidation) and a Waiting line with the loop's reason: no window clears the entry rules, and the best one, NEAR, is refused `E_ASSET` because NEAR is not in the policy |
 | Click **Windows** | "Nothing clears your 5% right now"; **Show windows below my minimum** lists every window by net APR, and the selected one shows its costs from gross to net and its checks, such as "The contract would refuse it (E_ASSET)" |
 | Click **Journal** | the loop's Waiting decisions with their reasons, and the counters: 1 action signed by the contract, 0 by a private key |
@@ -366,7 +380,7 @@ Hyperliquid pays the code's owner 10% of the fees the desk pays.
 | `engine/` | TypeScript engine: venue readers, scanner, strategy loop, risk engine, rescue, position book, journal, HTTP/SSE server, replay, MCP server |
 | `web/` | the dashboard: Windows, Desk, Journal, Rescue, Security and onboarding screens; `shared/` holds the types it shares with the engine |
 | `tools/` | mainnet and testnet scripts (dry run by default), policies, and the runbook [tools/mainnet/README.md](tools/mainnet/README.md) |
-| `docs/`, `design/` | [interfaces.md](docs/interfaces.md) (every method, rule, refusal code and event), [security.md](docs/security.md), [onchain-evidence.md](docs/onchain-evidence.md) (every mainnet and testnet transaction), [reviewer-checks.md](docs/reviewer-checks.md), [rescue-routes.md](docs/rescue-routes.md), [backtest-checks.md](docs/backtest-checks.md), the server setup; the designer's tokens and mockups |
+| `docs/`, `design/` | [interfaces.md](docs/interfaces.md) (every method, rule, refusal code and event), [security.md](docs/security.md), [onchain-evidence.md](docs/onchain-evidence.md) (the transactions behind each claim), [reviewer-checks.md](docs/reviewer-checks.md), [rescue-routes.md](docs/rescue-routes.md), [backtest-checks.md](docs/backtest-checks.md), the server setup; the designer's tokens and mockups |
 
 ## Built with
 

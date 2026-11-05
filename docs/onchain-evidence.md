@@ -1,6 +1,7 @@
 # On-chain evidence
 
-Every transaction Gimbal has sent on NEAR mainnet and testnet, with what each proves. Times are UTC. The README's
+The transactions behind each claim, with what each proves, on NEAR mainnet and testnet. Repeated calls of one kind
+share a row. Times are UTC. The README's
 [Live on mainnet](../README.md#live-on-mainnet) section has the contract's code hash and reproducible build, and its
 [Status](../README.md#status-2026-11-04) section says what has not run yet.
 
