@@ -190,9 +190,13 @@ costs the contract up to 29–58 NEAR a day if spammed, so its balance is watche
 The engine asks the NEAR AI risk check before every enter and rotate, and it fails closed: only a readable pass lets
 the act go ahead. No answer within 15 s (asked twice), NEAR AI unreachable, or no working key holds the act until the
 next hourly check, journaled "the NEAR AI risk check did not answer ... held, not passed"; an unreadable reply is a
-refusal. So a NEAR AI outage costs carry not taken, never an unchecked entry. Exits, stops, `panic_close` and rescues
-never ask it. The model never signs and nothing it returns reaches the contract or a venue; the contract checks every
-order against the policy either way. In replay only (`npm run demo`), a prompt with no recorded reply passes, and the
+refusal. So a NEAR AI outage costs carry not taken, never an unchecked entry. Exits, stops, `POST /close`,
+`panic_close` and rescues never ask it, and a close, a drawdown or time stop, or a shutdown cancels an entry still
+waiting on its check, with nothing sent; an exit on the hourly counts can wait for a check in flight, at most 30 s.
+The check gates the strategy loop only: the operator's MCP desk tools (`engine/src/mcp/server.ts`: `place_hl_order`,
+`fund_venue`, `withdraw`) and the `pair-live` / `pair-mainnet` CLIs, which open and close pairs by hand, are gated by
+the contract's policy alone, not by the NEAR AI risk check. The model never signs and nothing it returns reaches the
+contract or a venue; the contract checks every order against the policy either way. In replay only (`npm run demo`), a prompt with no recorded reply passes, and the
 journal says it would wait live.
 
 ### Frozen venues

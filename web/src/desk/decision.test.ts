@@ -67,3 +67,19 @@ test('the dev fake sends a decision the store keeps, and none while the desk is 
   assert.equal(fakeDecision(NOW, 'waiting')?.action, 'wait');
   assert.equal(fakeDecision(NOW, 'loading'), null);
 });
+
+test('a decision the engine publishes as a wait because the NEAR AI risk check is held: "Waiting", with why, never "Entering"', () => {
+  const held = (reason: string): StrategyDecision => ({ action: 'wait', reason, windowId: 'sol-phoenix-hyperliquid', heldId: null, at: NOW - 60_000 });
+  const tail = 'nothing sent; asked again at the next hourly check (2026-11-05T11:01:00.000Z); not a refusal, so no 6 h hold-out';
+  const noKey = decisionLine(held(`enter sol-phoenix-hyperliquid not carried out: no NEAR AI key, so the NEAR AI risk check cannot answer: held, not passed: the act waits; ${tail}`), NOW)!;
+  assert.equal(noKey.word, 'Waiting');
+  assert.equal(noKey.reason, 'Opening sol-phoenix-hyperliquid is waiting: this engine has no NEAR AI key, so the NEAR AI risk check cannot answer, so nothing was sent. '
+    + 'The desk asks again at the next hourly check (11:01 UTC). This is not a refusal, so the window is not held out for 6 h.');
+  const silent = decisionLine(held(`enter sol-phoenix-hyperliquid not carried out: the NEAR AI risk check did not answer (no answer within 15 s, asked 2 times): held, not passed: the act waits; ${tail}`), NOW)!;
+  assert.equal(silent.word, 'Waiting');
+  assert.match(silent.reason, /^Opening sol-phoenix-hyperliquid is waiting: the NEAR AI risk check did not answer, so nothing was sent\. /);
+  const rotate = decisionLine(held('rotate sol-phoenix-hyperliquid -> eth-phoenix-hyperliquid not carried out: no NEAR AI key, so the NEAR AI risk check cannot answer: held, not passed: the act waits; '
+    + 'sol-phoenix-hyperliquid is kept, nothing closed; asked again at the next hourly check (2026-11-05T11:01:00.000Z); not a refusal, so no 6 h hold-out'), NOW)!;
+  assert.equal(rotate.word, 'Waiting');
+  assert.match(rotate.reason, /^Rotation from sol-phoenix-hyperliquid into eth-phoenix-hyperliquid is waiting: .* sol-phoenix-hyperliquid is kept\. /);
+});

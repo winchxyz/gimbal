@@ -247,7 +247,7 @@ const HEAD_MIN = 40;
  */
 const KEEP_IN_HEAD = [
   /owner demo entry: the profit checks are waived/, /the demo shows the cycle, not a profit/,
-  /held, not passed: the entry waits/, /passed in replay only; live, the entry would wait/,
+  /held, not passed: the act waits/, /passed in replay only; live, the entry would wait/,
 ];
 
 /**

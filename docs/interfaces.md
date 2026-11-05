@@ -945,8 +945,8 @@ oldest or for an id the engine no longer holds), `POST /policy/draft` `{ text }`
 and confirms the engine rules), `GET` / `PUT /strategy` (`StrategyConfig`), `POST /setup` `{ deskId }` (starts
 venue setup; progress arrives as `setup` events), `POST /rotate` `{ windowId }` (manual override: close the held
 window and open this one, with the same checks as auto; refused with the reason when a check fails) and
-`POST /close` (close both legs with reduce-only orders). Both answer `{ ok: true }` or `{ ok: false, reason }`
-at once; progress arrives as `journal` and `desk` events. Pause and Resume are not engine calls: the owner's
+`POST /close` (close both legs with reduce-only orders; it cancels an enter or rotate still waiting on its NEAR AI
+risk check, `veto.ts` below). Both answer `{ ok: true }` or `{ ok: false, reason }` at once; progress arrives as `journal` and `desk` events. Pause and Resume are not engine calls: the owner's
 wallet signs `set_paused` (§1.3).
 
 **Health** (`HealthMap`, published on change; `engine/src/risk/venue-health.ts`):
@@ -968,7 +968,7 @@ owner's own `set_policy` transaction (and the engine rules only after the owner 
 only remove a window from consideration; nothing a model returns is ever sent to the contract or a venue. Model: a NEAR AI Cloud TEE model with JSON output
 (`Qwen/Qwen3-VL-30B-A3B-Instruct`, no reasoning, ~1 s); if NEAR AI is down, drafting is unavailable and the NEAR AI
 risk check fails closed: every enter and rotate is held (never passed) until it answers; exits, stops, `panic_close`
-and rescues never ask it.
+and rescues never ask it, and a close, a stop or a shutdown never waits for it (`veto.ts` below).
 
 ## 3. Engine internals
 
@@ -1030,12 +1030,23 @@ anywhere the policy does not allow.
   transport/HTTP error is asked again, `LOOP_RULES.vetoAttempts` (2) tries in all; still no answer, and the act is
   **held** (`VetoResult.held`, outcome `timeout` or `unavailable`): not carried out, nothing closed or sent, journaled
   `refused` "<enter|rotate …> not carried out: the NEAR AI risk check did not answer (<why>, asked 2 times): held, not
-  passed: the entry waits; …; asked again at the next hourly check (<ISO>); not a refusal, so no 6 h hold-out" (a
+  passed: the act waits; …; asked again at the next hourly check (<ISO>); not a refusal, so no 6 h hold-out" (a
   manual one: "not tried again by itself: POST /rotate asks again"), and not shown on the window. No key (`no-key`)
   or a 401 or 403 (`key-rejected`, asked once: it never heals by itself, so it shows on every decision) holds the act
   the same way, and serve's start lines warn that no enter or rotate can pass without a working key. Only enters and
   rotates are checked: exits (counted, the time and drawdown stops), the one-leg close, `POST /close`, `panic_close`
-  and rescues never ask NEAR AI. The owner demo entry waives only its profit checks, never this check. Replay only
+  and rescues never ask NEAR AI. None of them waits for a pending check either: `POST /close` (accepted at once, never
+  "the strategy loop is acting"; a second one while one is queued is refused), serve stopping (`stop()`, SIGTERM) and
+  a drawdown or time stop that comes due on a scan (decide.ts `stopDue`, on the venues' P&L) cancel an enter or
+  rotate whose check is pending, or (a close) one queued before it, journaled `refused` "<enter|rotate …> not carried
+  out: <a close came first | a stop came first (<why>) | serve is stopping>; nothing sent" (`cancelled: 1`); the check
+  is aborted and not booked. An act already past its pass ends first and the close runs right after it; serve
+  stopping also stops it before its first order. An exit on the hourly counts is decided at the next check, so it can
+  wait for a check in flight: at most `vetoAttempts` × `vetoTimeoutMs` (30 s). Each attempt's call is aborted at its
+  timeout (an `AbortSignal` through `VetoSource.complete`), so a retry never overlaps it. While an act is held, the
+  published decision is a `wait` whose reason is the held line, until the next hourly check; with no key every enter
+  or rotate decision is published so (never "enter" or "rotate"). The owner demo entry waives only its profit checks,
+  never this check. Replay only
   (`npm run demo`, serve with no key in replay mode: `RecordedVeto` with `replayPassUnrecorded`): a prompt with no
   recorded reply passes (outcome `replay-unrecorded`), and its line says "no recorded NEAR AI risk check reply for
   this prompt: passed in replay only; live, the entry would wait"; testnet and mainnet never build that source. The
@@ -1047,9 +1058,9 @@ anywhere the policy does not allow.
   - The why line (`riskCheckWhy`): every enter, rotate, skip and refusal decision carries one, in its summary and as
     `numbers.riskCheck`: "NEAR AI risk check passed (<attestation>): <reason>", "NEAR AI risk check refused
     (<attestation>): <reason>" (an unreadable reply too), "the NEAR AI risk check did not answer (…): held, not
-    passed: the entry waits" (a timeout or NEAR AI unavailable), "no NEAR AI key, so the NEAR AI risk check cannot
-    answer: held, not passed: the entry waits", "NEAR AI key rejected (…), so the NEAR AI risk check cannot answer:
-    held, not passed: the entry waits", or, in replay only, "no recorded NEAR AI risk check reply for this prompt:
+    passed: the act waits" (a timeout or NEAR AI unavailable), "no NEAR AI key, so the NEAR AI risk check cannot
+    answer: held, not passed: the act waits", "NEAR AI key rejected (…), so the NEAR AI risk check cannot answer:
+    held, not passed: the act waits", or, in replay only, "no recorded NEAR AI risk check reply for this prompt:
     passed in replay only; live, the entry would wait".
     `<attestation>` is serve's `Attestor.label()` ("TEE attested <date> UTC" or "TEE not attested: <why>"), shown
     only for a reply that came. It says what the model's TEE instances were when last attested; that the reply came

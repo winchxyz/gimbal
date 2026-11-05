@@ -257,8 +257,8 @@ test('a long line shows its head, the rest behind a control; a short one stays w
   const replayOnly = `${enter.replace('; checks: x; filled 0.12 SOL', '')}; no recorded NEAR AI risk check reply for this prompt: passed in replay only; live, the entry would wait; opened both legs`;
   assert.equal(splitSummary(replayOnly).text, replayOnly.slice(0, replayOnly.indexOf('would wait') + 'would wait'.length));
   const heldLine = 'enter sol-phoenix-hyperliquid not carried out: the NEAR AI risk check did not answer (no answer within 15 s, asked 2 times): '
-    + 'held, not passed: the entry waits; nothing sent; asked again at the next hourly check (2026-11-05T11:01:00.000Z); not a refusal, so no 6 h hold-out';
-  assert.equal(splitSummary(heldLine).text, heldLine.slice(0, heldLine.indexOf('entry waits') + 'entry waits'.length));
+    + 'held, not passed: the act waits; nothing sent; asked again at the next hourly check (2026-11-05T11:01:00.000Z); not a refusal, so no 6 h hold-out';
+  assert.equal(splitSummary(heldLine).text, heldLine.slice(0, heldLine.indexOf('act waits') + 'act waits'.length));
   // No ": " or "; " before the limit: cut at the last space.
   const words = 'word '.repeat(40).trim();
   const cut = splitSummary(words);

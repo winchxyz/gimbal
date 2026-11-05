@@ -233,6 +233,9 @@ test('the counts: actions the contract signed, refusals and risk check refusals'
   // a risk check that did not answer is journaled `refused` with `held: 1`: held, not a sizing or policy refusal
   const held = entry({ id: 'h1', kind: 'refused', summary: 'enter SOL hl/orderly not carried out: the NEAR AI risk check did not answer', numbers: { held: 1, symbol: 'SOL' } });
   assert.deepEqual(countsOf([...MOCKUP, held]), { signed: 4, refused: 1, vetoed: 1, held: 1 });
+  // an act cancelled with nothing sent (a close came first, serve stopping) is no refusal either
+  const cancelled = entry({ id: 'c1', kind: 'refused', summary: 'enter SOL not carried out: a close came first; nothing sent', numbers: { cancelled: 1, symbol: 'SOL' } });
+  assert.deepEqual(countsOf([...MOCKUP, cancelled]), { signed: 4, refused: 1, vetoed: 1, held: 0 });
   assert.equal(actionsText(23), '23 actions signed');
   assert.equal(actionsText(1), '1 action signed');
   assert.equal(actionsText(1234), '1,234 actions signed');

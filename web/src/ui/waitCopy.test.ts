@@ -54,7 +54,7 @@ test('a rotation that closed the old pair first says the desk is flat; other ref
 });
 
 test('an enter or rotate the NEAR AI risk check held (no answer, no key, a rejected key) says it waits, not that it was refused', () => {
-  const tail = 'held, not passed: the entry waits; nothing sent; asked again at the next hourly check (2026-11-05T11:01:00.000Z); not a refusal, so no 6 h hold-out';
+  const tail = 'held, not passed: the act waits; nothing sent; asked again at the next hourly check (2026-11-05T11:01:00.000Z); not a refusal, so no 6 h hold-out';
   const timeout = `enter sol-phoenix-hyperliquid not carried out: the NEAR AI risk check did not answer (no answer within 15 s, asked 2 times): ${tail}`;
   const c = refusedCopy(timeout);
   assert.equal(c?.mapped, true);
@@ -67,11 +67,11 @@ test('an enter or rotate the NEAR AI risk check held (no answer, no key, a rejec
     /^Opening sol-phoenix-hyperliquid is waiting: NEAR AI rejected this engine's key/);
   // A rotate keeps the held pair; a manual (demo) one is not tried again by itself.
   const rotate = 'rotate sol-phoenix-hyperliquid -> eth-phoenix-hyperliquid not carried out: the NEAR AI risk check did not answer (NEAR AI answered HTTP 503: overloaded, asked 2 times): '
-    + 'held, not passed: the entry waits; sol-phoenix-hyperliquid is kept, nothing closed; asked again at the next hourly check (2026-11-05T11:01:00.000Z); not a refusal, so no 6 h hold-out';
+    + 'held, not passed: the act waits; sol-phoenix-hyperliquid is kept, nothing closed; asked again at the next hourly check (2026-11-05T11:01:00.000Z); not a refusal, so no 6 h hold-out';
   assert.equal(refusedCopy(rotate)?.text, 'Rotation from sol-phoenix-hyperliquid into eth-phoenix-hyperliquid is waiting: the NEAR AI risk check did not answer, so nothing was sent. '
     + 'sol-phoenix-hyperliquid is kept. The desk asks again at the next hourly check (11:01 UTC). This is not a refusal, so the window is not held out for 6 h.');
   const demo = 'enter zec-phoenix-hyperliquid not carried out: (owner demo entry: the profit checks are waived; round trip $0.04 estimated, at most $0.25 accepted) '
-    + 'the NEAR AI risk check did not answer (no answer within 15 s, asked 2 times): held, not passed: the entry waits; nothing sent; not tried again by itself: POST /rotate asks again; not a refusal, so no 6 h hold-out';
+    + 'the NEAR AI risk check did not answer (no answer within 15 s, asked 2 times): held, not passed: the act waits; nothing sent; not tried again by itself: POST /rotate asks again; not a refusal, so no 6 h hold-out';
   assert.match(refusedCopy(demo)?.text ?? '', /^Opening zec-phoenix-hyperliquid is waiting: .* It is not tried again by itself: ask again with POST \/rotate\. This is not a refusal/);
 });
 

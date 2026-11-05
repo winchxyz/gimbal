@@ -58,7 +58,7 @@ repo root are all it needs.
      `PHOENIX_API_URL`, `SOLANA_RPC_URL`;
    - `ONECLICK_API_KEY` (rescues and transfers), `NEAR_AI_API_KEY` (the NEAR AI risk check, which fails closed: without a
      working key every enter and rotate is held, never passed, and the start line warns so; exits, stops and rescues
-     do not need it);
+     do not need it, and a redeploy's SIGTERM cancels an enter or rotate still waiting on its check, with nothing sent);
    - `GIMBAL_TRADE=1`, `GIMBAL_RESCUE=1`;
    - `RELAYER_EVM_PRIVATE_KEY`, required with `GIMBAL_RESCUE=1`: the Arbitrum gas wallet that submits
      `evm_usdc_to_intents`; without it serve exits at start with a configuration error;
@@ -225,7 +225,9 @@ scan.
   is an owner-requested demonstration entry with the profit checks waived and the cost the owner accepted. The
   journal's `enter` line, the book and the risk ledger mark it as an owner demo entry (`demo: true`).
 - **`POST /close`**: both legs, reduce-only. It works with `auto` on or off and answers `409 no pair is held` when
-  there is none.
+  there is none. It never waits for the NEAR AI risk check: an enter or rotate still waiting on its check is cancelled
+  with nothing sent ("not carried out: a close came first; nothing sent") and the close runs right after; one already
+  sending orders ends first.
 - **`PUT /strategy <the whole config>`**: every engine rule, the rescue and watch lines included (there is no
   separate risk route). Copy the last `control: engine rules before the call` line (every run logs it; also
   `GET /strategy` on the read-only view) and change only what you mean to. **Send every field**: a config without

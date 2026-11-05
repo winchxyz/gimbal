@@ -231,12 +231,12 @@ export function orderlyRotateReason(reason: string): string | null {
 /**
  * The loop's journal line for an enter or rotate the NEAR AI risk check held because no readable answer came (loop.ts,
  * journaled `refused`; the check fails closed): `enter ID not carried out: [(owner demo entry …) ]<why>: held, not
- * passed: the entry waits; nothing sent; <when>; not a refusal, so no 6 h hold-out`, and `rotate A -> B not carried
+ * passed: the act waits; nothing sent; <when>; not a refusal, so no 6 h hold-out`, and `rotate A -> B not carried
  * out: …; A is kept, nothing closed; <when>; …`. `<when>` is `asked again at the next hourly check (<ISO>)` (auto) or
  * `not tried again by itself: POST /rotate asks again` (by hand). Null for any other text.
  */
 export function riskHeldCopy(raw: string): WaitCopy | null {
-  const m = raw.match(/^(?:enter (\S+)|rotate (\S+) -> (\S+)) not carried out: (?:\([^)]*\) )?(.*?): held, not passed: the entry waits; (?:nothing sent|\S+ is kept, nothing closed); (asked again at the next hourly check \(\d{4}-\d\d-\d\dT(\d\d:\d\d)[^)]*\)|not tried again by itself: POST \/rotate asks again); not a refusal, so no (\d+) h hold-out$/s);
+  const m = raw.match(/^(?:enter (\S+)|rotate (\S+) -> (\S+)) not carried out: (?:\([^)]*\) )?(.*?): held, not passed: the act waits; (?:nothing sent|\S+ is kept, nothing closed); (asked again at the next hourly check \(\d{4}-\d\d-\d\dT(\d\d:\d\d)[^)]*\)|not tried again by itself: POST \/rotate asks again); not a refusal, so no (\d+) h hold-out$/s);
   if (!m) return null;
   const [, enterId, fromId, toId, why, , time, hours] = m as unknown as [string, string | undefined, string | undefined, string | undefined, string, string, string | undefined, string];
   const head = enterId !== undefined ? `Opening ${enterId} is waiting` : `Rotation from ${fromId} into ${toId} is waiting`;
@@ -347,6 +347,9 @@ function whole(raw: string, ctx: WaitContext): Part | null {
       : { text: `${m[1]} is ready at ${m[2]} net, but ${clause}.`, mapped: true };
   }
   if (raw.startsWith('Hold ')) return hold(raw);
+  // An enter or rotate held by the NEAR AI risk check: the engine publishes the decision as a wait with the held line.
+  const held = riskHeldCopy(raw);
+  if (held !== null) return { text: held.text, mapped: true };
   if (raw.startsWith('one leg open: ')) {
     const leg = oneLegCopy(raw);
     return leg === null ? null : { text: leg.text, mapped: true };

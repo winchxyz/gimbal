@@ -102,8 +102,10 @@ The main risks, and the guard for each:
   it cannot pick a pair, a size or an order. It fails closed: only a readable pass lets the entry go ahead. With no
   answer within 15 s (asked twice), NEAR AI unreachable, or no working key, the entry is held, not passed: the
   journal says the risk check did not answer, and the window is asked again at the next hourly check. An answer that
-  cannot be read counts as a refusal. Exits, stops and rescues never wait on it. Whatever the engine asks, the
-  contract refuses an order above the policy's size caps, or on a priced symbol more than 1 % from the oracle price.
+  cannot be read counts as a refusal. Exits, stops, `POST /close`, `panic_close` and rescues never ask it, and none
+  waits for it: a close, a drawdown or time stop, or a shutdown cancels an entry still waiting on its check, with
+  nothing sent. Whatever the engine asks, the contract refuses an order above the policy's size caps, or on a priced
+  symbol more than 1 % from the oracle price.
 
 ## What it does
 
@@ -224,7 +226,7 @@ Done (read from the chain and the venues' public APIs at about 03:00 UTC):
   (2026-11-04 07:00:43 UTC, in the desk table of [docs/onchain-evidence.md](docs/onchain-evidence.md#mainnet-desk-carry)).
 - The NEAR AI risk check runs on the mainnet engine before every enter and rotate and fails closed: each ask waits
   15 s and is asked once more; with still no answer (or no working key) the entry is held, not passed, and the
-  journal says "the NEAR AI risk check did not answer ... held, not passed: the entry waits"; the window is asked
+  journal says "the NEAR AI risk check did not answer ... held, not passed: the act waits"; the window is asked
   again at the next hourly check, with no 6 h hold. `npm run report` books every outcome (refusals as helped or hurt,
   estimated); each pass shows the position its act opened, with that position's net.
 
