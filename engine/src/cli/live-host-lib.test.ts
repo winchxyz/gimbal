@@ -19,8 +19,8 @@ import { ViewServer } from '../view/view-server.ts';
 import type { ViewSource } from '../view/view-server.ts';
 import type { LiveHostOptions, LiveHostServer, LiveUpstreamOptions } from './live-host-lib.ts';
 import {
-  LIVE_BUILD_MARKER, LIVE_READ_ONLY_REASON, LiveUpstream, NOT_CONFIGURED_REASON, addressGroup, createLiveHostServer, isLiveBuild, liveConfigFromEnv,
-  liveRoute, liveStaticFile, publicCutter, publicEvent, publicRead, publicSetup, publicState,
+  LIVE_BUILD_MARKER, LIVE_READ_ONLY_REASON, LiveUpstream, NOT_CONFIGURED_REASON, addressGroup, createLiveHostServer, isLiveBuild, liveClientKey,
+  liveConfigFromEnv, liveRoute, liveStaticFile, publicCutter, publicEvent, publicRead, publicSetup, publicState,
 } from './live-host-lib.ts';
 
 const TOKEN = 'b7e2c94f1a6d38e05c7b9a2f4e81d6c3a5f0b9e7';
@@ -91,13 +91,13 @@ async function listen(server: Server): Promise<number> {
   return (server.address() as AddressInfo).port;
 }
 
-type HostLimits = Pick<LiveHostOptions, 'maxStreams' | 'maxStreamsPerClient' | 'maxUnreadBytes' | 'maxUnreadTotal' | 'heartbeatMs'>;
+type HostLimits = Pick<LiveHostOptions, 'maxStreams' | 'maxStreamsPerClient' | 'maxUnreadBytes' | 'maxUnreadTotal' | 'unreadCheckMs' | 'heartbeatMs'>;
 
 async function startHost(engineBase: string | null, opts: Partial<LiveUpstreamOptions> & HostLimits & { stream?: boolean; token?: string; upstream?: LiveUpstream } = {}): Promise<Running> {
   const lines: string[] = [];
-  const { maxStreams, maxStreamsPerClient, maxUnreadBytes, maxUnreadTotal, heartbeatMs, stream = true, token = TOKEN, upstream: given, ...up } = opts;
+  const { maxStreams, maxStreamsPerClient, maxUnreadBytes, maxUnreadTotal, unreadCheckMs, heartbeatMs, stream = true, token = TOKEN, upstream: given, ...up } = opts;
   const upstream = given ?? (engineBase === null ? null : new LiveUpstream({ base: engineBase, token, log: (l) => lines.push(l), backoff: () => 50, ...up }));
-  const limits = Object.fromEntries(Object.entries({ maxStreams, maxStreamsPerClient, maxUnreadBytes, maxUnreadTotal, heartbeatMs }).filter(([, v]) => v !== undefined));
+  const limits = Object.fromEntries(Object.entries({ maxStreams, maxStreamsPerClient, maxUnreadBytes, maxUnreadTotal, unreadCheckMs, heartbeatMs }).filter(([, v]) => v !== undefined));
   const host = createLiveHostServer({
     webDir, upstream, offReason: upstream === null ? 'GIMBAL_LIVE_URL and GIMBAL_VIEW_TOKEN are not set' : null, log: (l) => lines.push(l), ...limits,
   });
@@ -566,6 +566,28 @@ test('a failed read never replaces the last good answer: it is served stale, and
   assert.equal((await up.read('/strategy')).status, 502);
 });
 
+test('a stale core answer is served for at most maxStaleMs after it was read; then the failure is answered as one', async () => {
+  let t = T0;
+  let down = false;
+  const fetchFn = (async () => {
+    if (down) throw new TypeError('fetch failed');
+    return Response.json(stateWith(T0));
+  }) as typeof fetch;
+  const up = new LiveUpstream({ base: 'http://127.0.0.1:9', token: TOKEN, fetch: fetchFn, now: () => t, maxStaleMs: 60_000 });
+  const good = await up.read('/state');
+  down = true;
+  t += 30_000;
+  assert.deepEqual(await up.read('/state'), good, 'within the stale age');
+  t += 31_000;
+  const old = await up.read('/state');
+  assert.equal(old.status, 503, 'past it: the page says the engine is not answering');
+  t += 1_000;
+  assert.equal((await up.read('/state')).status, 503, 'and while the retry waits too');
+  down = false;
+  t += 2_000;
+  assert.equal((await up.read('/state')).status, 200);
+});
+
 test('a /state read in flight when the stream says it changed is not taken as fresh', async () => {
   const held = heldFetch();
   const sse = sseBody();
@@ -605,6 +627,34 @@ test('a /state read in flight when the stream says it changed is not taken as fr
     await p3;
     assert.equal(JSON.parse((await up.read('/state')).body).at, 4);
     assert.equal(held.pending.length, 4);
+  } finally {
+    up.stop();
+  }
+});
+
+test('a /state asked for before a windows event does not set the host\'s window list back', async () => {
+  const held = heldFetch();
+  const sse = sseBody();
+  const fetchFn = ((url: string | URL, init?: RequestInit) => (new URL(String(url)).pathname === '/events' ? Promise.resolve(sse.open(init?.signal)) : held.fetchFn(url))) as typeof fetch;
+  const up = new LiveUpstream({ base: 'http://127.0.0.1:9', token: TOKEN, fetch: fetchFn, backoff: () => 60_000 });
+  const seen: string[] = [];
+  up.subscribe({ event: (c) => seen.push(c.toString('utf8')), drop: () => undefined });
+  up.start();
+  try {
+    await until(() => up.status === 'connected');
+    const p = up.read('/state');
+    await until(() => held.pending.length === 1);
+    sse.push(`data: ${JSON.stringify({ type: 'windows', data: [win('NEW')] })}\n\n`);
+    await until(() => seen.length === 1);
+    held.pending[0]!.settle(Response.json({ ...stateWith(1), windows: [win('OLD')] }));
+    await p;
+    assert.equal((await up.read('/windows/history?id=OLD')).status, 404, 'the older list was not taken');
+    assert.equal(held.pending.length, 1);
+    const next = up.read('/windows/history?id=NEW');
+    await until(() => held.pending.length === 2);
+    assert.equal(held.pending[1]!.path, '/windows/history?id=NEW');
+    held.pending[1]!.settle(Response.json({ windowId: 'NEW', points: [] }));
+    assert.equal((await next).status, 200);
   } finally {
     up.stop();
   }
@@ -710,7 +760,7 @@ for (const limit of ['one visitor', 'all visitors'] as const) {
     const fetchFn = ((url: string | URL, init?: RequestInit) => Promise.resolve(new URL(String(url)).pathname === '/events' ? sse.open(init?.signal) : Response.json({}, { status: 404 }))) as typeof fetch;
     const upstream = new LiveUpstream({ base: 'http://127.0.0.1:9', token: TOKEN, fetch: fetchFn, backoff: () => 60_000 });
     const h = await startHost(null, {
-      upstream, ...(limit === 'one visitor' ? { maxUnreadBytes: 256 * 1024, maxUnreadTotal: 64 * 1024 * 1024 } : { maxUnreadBytes: 64 * 1024 * 1024, maxUnreadTotal: 256 * 1024 }),
+      upstream, ...(limit === 'one visitor' ? { maxUnreadBytes: 256 * 1024, maxUnreadTotal: 64 * 1024 * 1024 } : { maxUnreadBytes: 64 * 1024 * 1024, maxUnreadTotal: 256 * 1024 }), unreadCheckMs: 50,
     });
     let stuck: Socket | null = null;
     try {
@@ -733,6 +783,85 @@ for (const limit of ['one visitor', 'all visitors'] as const) {
 }
 
 // ---------- addresses ----------
+
+test('three hundred visitors that read a 117 KB windows event each scan are never dropped; visitors that do not read are', async () => {
+  const sse = sseBody();
+  const fetchFn = ((url: string | URL, init?: RequestInit) => Promise.resolve(new URL(String(url)).pathname === '/events' ? sse.open(init?.signal) : Response.json({}, { status: 404 }))) as typeof fetch;
+  const upstream = new LiveUpstream({ base: 'http://127.0.0.1:9', token: TOKEN, fetch: fetchFn, backoff: () => 60_000 });
+  // 512 KiB a visitor (the default), and 8 MiB in all: less than what 300 reading visitors hold in flight right after
+  // one fan-out (300 x 117 KB is 35 MB written at once), so a total measured on the write path would drop them.
+  const h = await startHost(null, { upstream, maxStreams: 400, maxUnreadTotal: 8 * 1024 * 1024, unreadCheckMs: 1_000 });
+  const readers: { bytes: () => number; close: () => void }[] = [];
+  const stuck: Socket[] = [];
+  try {
+    await until(() => upstream.status === 'connected');
+    for (let i = 0; i < 300; i++) readers.push(await byteVisitor(h.base, `10.${Math.floor(i / 250)}.${i % 250}.1`));
+    for (let i = 0; i < 3; i++) stuck.push(stuckVisitor(h.base, `192.0.2.${i + 1}`));
+    await until(() => h.host.stats().visitors === 303, 10_000);
+    const windows = Array.from({ length: 159 }, (_, i) => win(`SYM${i}:hyperliquid/phoenix`, { checks: Array.from({ length: 4 }, (_, j) => ({ ok: true, text: `check ${j} `.padEnd(58, '.') })) }));
+    const chunk = `data: ${JSON.stringify({ type: 'windows', data: windows })}\n\n`;
+    assert.ok(chunk.length > 110_000 && chunk.length < 125_000, `${chunk.length} bytes`);
+    const start = readers.map((r) => r.bytes());
+    let sent = 0;
+    while (h.host.stats().visitors > 300 && sent < 20) {
+      sse.push(chunk);
+      sent++;
+      await sleep(600);
+    }
+    assert.equal(h.host.stats().visitors, 300, `the three that do not read are dropped (after ${sent} scans)`);
+    await until(() => readers.every((r, i) => r.bytes() - start[i]! >= sent * chunk.length), 20_000);
+    assert.ok(!h.lines.some((l) => l.includes('for all visitors')), 'no reading visitor went over the total');
+    assert.equal(h.host.stats().visitors, 300);
+  } finally {
+    for (const r of readers) r.close();
+    for (const s of stuck) s.destroy();
+    await h.stop();
+  }
+});
+
+/** A visitor's /events that reads everything and only counts the bytes. */
+function byteVisitor(base: string, ip: string): Promise<{ bytes: () => number; close: () => void }> {
+  return new Promise((resolve, reject) => {
+    let n = 0;
+    const req = request(`${base}/events`, { headers: { 'x-real-ip': ip } }, (res) => {
+      res.on('data', (c: Buffer) => (n += c.length));
+      res.on('error', () => undefined);
+      if (res.statusCode !== 200) reject(new Error(`status ${res.statusCode}`));
+      else resolve({ bytes: () => n, close: () => req.destroy() });
+    });
+    req.on('error', () => undefined);
+    req.end();
+  });
+}
+
+test('the visitor key: X-Real-IP only when it is an IP address, else the last X-Forwarded-For entry that is one, else the socket', () => {
+  const key = (headers: IncomingHttpHeaders, remoteAddress = '127.0.0.1') => liveClientKey({ headers, socket: { remoteAddress } });
+  assert.equal(key({ 'x-real-ip': '198.51.100.7' }), '198.51.100.7');
+  assert.equal(key({ 'x-real-ip': ' [2001:db8:1:2::9] ' }), '2001:db8:1:2::/64');
+  assert.equal(key({ 'x-real-ip': 'x'.repeat(10_000), 'x-forwarded-for': '203.0.113.5, not-an-ip, 198.51.100.9 , junk' }), '198.51.100.9');
+  assert.equal(key({ 'x-real-ip': 'anything', 'x-forwarded-for': 'a, b' }), '127.0.0.1');
+  assert.equal(key({ 'x-real-ip': '999.1.1.1' }, '::ffff:203.0.113.4'), '203.0.113.4');
+  assert.equal(liveClientKey({ headers: {}, socket: {} }), 'unknown');
+});
+
+test('forged non-address X-Real-IP values do not open fresh stream slots or read budgets', async () => {
+  const eng = fakeEngine({ windows: ['A', 'B', 'C', 'D'].map((id) => win(id)) });
+  const v = await startView(eng.source);
+  const h = await startHost(v.base, { maxStreamsPerClient: 2, clientRate: { perSecond: 0, burst: 2 } });
+  try {
+    await until(() => h.upstream!.status === 'connected');
+    const streams = [];
+    for (const forged of ['one', 'two', 'three']) streams.push(await visit(h.base, { 'x-real-ip': forged }));
+    assert.deepEqual(streams.map((s) => s.status), [200, 200, 429], 'all three are the socket\'s address');
+    const reads = [];
+    for (const [i, id] of ['A', 'B', 'C'].entries()) reads.push((await call(h.base, 'GET', `/windows/history?id=${id}`, { 'x-real-ip': `forged-${i}` })).status);
+    assert.deepEqual(reads, [200, 200, 503]);
+    for (const s of streams) s.close();
+  } finally {
+    await h.stop();
+    await v.view.stop();
+  }
+});
 
 test('one address for the caps: an IPv6 /64 counts as one, an IPv4-mapped address as its IPv4', () => {
   assert.equal(addressGroup('198.51.100.7'), '198.51.100.7');
@@ -787,7 +916,7 @@ test('every field of every shared type passes the allowlist unchanged (the set-u
       ...desk(),
       legs: [{
         venue: 'hyperliquid', symbol: 'SOL', side: 'long', size: 0.1, lotSize: 0.01, entry: 180.1, mark: 182.45, liqPx: 120, marginUsd: 6, marginRatio: 0.31,
-        distanceToLiqPct: 32.6, fundingEarnedUsd: 0.02, unsettledFundingUsd: 0.01, feesUsd: -0.01, unpriced: false,
+        distanceToLiqPct: 32.6, fundingEarnedUsd: 0.02, unsettledFundingUsd: 0.01, feesUsd: -0.01, feesPositionId: 'SOL@1', unpriced: false,
       }],
       paused: { by: 'owne…near', at: T0 }, rescueFailure: { rescueId: 'r1', step: 'quote', reason: 'no quote', tries: 2, next: 'the owner must act', at: T0 },
       accounts: [{ venue: 'hyperliquid', equityUsd: 20, at: T0 }, { venue: 'phoenix', equityUsd: null, at: null }],
@@ -869,6 +998,46 @@ test('the page\'s own fixtures (the web fake stream, every desk and rescue scena
     histories++;
   }
   assert.ok(histories > 0);
+});
+
+test('a leg\'s feesPositionId and a late-read fill fee reach the page unchanged through the host, so the Journal counts that fee once', async () => {
+  const position = 'XLM@1730000000000';
+  const leg = (venue: 'hyperliquid' | 'phoenix', side: 'long' | 'short') => ({
+    venue, symbol: 'XLM', side, size: 100, lotSize: 1, entry: 0.3, mark: 0.31, liqPx: null, marginUsd: 6, marginRatio: 0.2, distanceToLiqPct: null,
+    fundingEarnedUsd: 0.01, unsettledFundingUsd: 0, feesUsd: -0.03, feesPositionId: position, unpriced: false,
+  });
+  const held: DeskState = { ...desk(), legs: [leg('hyperliquid', 'long'), leg('phoenix', 'short')], pnl: { fundingUsd: 0.02, feesUsd: -0.06, priceUsd: 0, netUsd: -0.04 } };
+  const fee: JournalEntry = {
+    id: 'book-fee-1', t: T0, kind: 'fee', summary: 'Fill fee read from Phoenix', tx: [],
+    numbers: { usd: -0.03, fillFee: 1, position, stage: 'enter', venue: 'phoenix', symbol: 'XLM', fills: 1 },
+  };
+  const eng = fakeEngine({ desk: held, journal: [fee] });
+  const v = await startView(eng.source);
+  const h = await startHost(v.base);
+  try {
+    await until(() => h.upstream!.status === 'connected');
+    const state = JSON.parse((await call(h.base, 'GET', '/state')).text) as EngineState;
+    assert.deepEqual(state.desk!.legs, held.legs);
+    assert.deepEqual(state.journal, [fee]);
+    const visitor = await visit(h.base);
+    await until(() => visitor.events().some((e) => e.type === 'desk'));
+    const late = { ...fee, id: 'book-fee-2', numbers: { ...fee.numbers, venue: 'hyperliquid' } };
+    eng.emit({ type: 'journal', data: late });
+    await until(() => visitor.events().some((e) => e.type === 'journal'));
+    const streamed = visitor.events();
+    visitor.close();
+    assert.deepEqual(streamed.find((e) => e.type === 'desk')!.data, held);
+    assert.deepEqual(streamed.find((e) => e.type === 'journal')!.data, late);
+
+    // The web's own attribution, on what the host served: the desk's P&L already holds both fees, so neither entry adds.
+    const model = await import(new URL('../../../web/src/journal/model.ts', import.meta.url).href);
+    const fees = (legs: unknown[]) => (model.attributionOf(state.desk!.pnl, [...state.journal, late], legs) as { feesUsd: number }).feesUsd;
+    assert.equal(Math.round(fees(state.desk!.legs) * 100) / 100, -0.06);
+    assert.equal(Math.round(fees([]) * 100) / 100, -0.12, 'without the legs\' position the same entries would count twice');
+  } finally {
+    await h.stop();
+    await v.view.stop();
+  }
 });
 
 test('the upstream stream reconnects with backoff, and every visitor stream ends so each page reads /state again', async () => {

@@ -57,13 +57,16 @@ configured** ("This site is not connected to the live engine yet ..., so there i
   each event is shaped, cut and encoded once, and the same bytes go to every visitor. A new visitor's stream starts
   with the latest of each type (scan, windows, desk, health, setup, rescue, decision) from the host's memory, then
   follows the live events. Visitor streams are capped at 300 in all (503; the page retries) and 16 per client address
-  (429). The address is the replay host's rule (`X-Real-IP`, which Railway's edge sets, else the last
-  `X-Forwarded-For` entry, else the socket), with an IPv6 address taken as its /64 (one home or phone gets a whole
-  /64, so picking another address in it does not open more streams) and an IPv4-mapped one as its IPv4.
-- **Slow readers.** A visitor that leaves more than 512 KiB unread (a few of the largest events, the windows list) is
-  dropped; its page reconnects and reads `/state` again. All visitors together may leave at most 32 MiB unread: past
-  that the one holding most is dropped first, then the next, until the total is under it. So slow readers can park at
-  most 32 MiB in the host, however many there are.
+  (429). The address is `X-Real-IP` (which Railway's edge sets) when it is an IP address, else the last
+  `X-Forwarded-For` entry that is one, else the socket; any other text in those headers is ignored, so a forged value
+  cannot mint a fresh key. An IPv6 address counts as its /64 (one home or phone gets a whole /64, so picking another
+  address in it does not open more streams), an IPv4-mapped one as its IPv4.
+- **Slow readers.** A visitor that leaves more than 512 KiB unread (a few of the largest events, the windows list of
+  about 120 KB) is dropped; its page reconnects and reads `/state` again. All visitors together may leave at most
+  32 MiB unread for longer than 5 s: every 5 s the host adds up what each visitor has left unread since before the
+  last count, and past 32 MiB the one holding most is dropped first, then the next. Bytes just written are in flight,
+  not unread, so a scan's fan-out to 300 reading visitors (35 MB at once) drops none of them. So slow readers can
+  park at most about 32 MiB in the host for more than a few seconds, however many there are.
 - **Reconnect with backoff.** When the upstream stream ends (an engine deploy, a network blip, no byte for 45 s while
   the engine pings every 15 s), every visitor stream ends too, so each page reconnects and reads `/state` again
   (nothing is missed); while the engine is down a visitor's `/events` is answered 503 by the host at once. The host
@@ -77,7 +80,9 @@ configured** ("This site is not connected to the live engine yet ..., so there i
   deleted), and a read already in flight then is not taken as fresh, so the next page reads what came after. A failed
   read (the engine down, a 5xx, a refusal) never replaces the last good answer: the host serves that answer, stale,
   and asks the engine again only after 2 s (a minute after a 401 or 403). Only with no good answer at all does a
-  visitor see the failure (502 or 503).
+  visitor see the failure (502 or 503). A core read's last good answer is served this way for at most 5 minutes
+  after it was read (longer than an engine redeploy takes); past that the host answers 503, and the page says the
+  engine is not answering rather than show an old desk as current.
 - **Reads by id are held to what the engine listed.** `GET /windows/history?id=` is answered only for a window in the
   engine's latest list (the stream's windows, or the last `/state`); any other id is 404 at the host and never asked.
   `GET /journal?before=` is asked only before an entry the host has served (in `/state`, an event or a page); any

@@ -20,12 +20,13 @@
 import { createReadStream, existsSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
+import { isIP } from 'node:net';
 import { extname, join, normalize, resolve, sep } from 'node:path';
 import type {
   DeskState, EngineState, JournalEntry, Leg, RescueFailure, RescueProgress, ScanStatus, SetupProgress, StrategyConfig, StrategyDecision, TxRef,
   VenueAccount, Window, WindowHistory,
 } from '@gimbal/shared';
-import { MAX_STREAMS_PER_CLIENT, clientKey } from './replay-host-lib.ts';
+import { MAX_STREAMS_PER_CLIENT } from './replay-host-lib.ts';
 
 export const HEALTH_PATH = '/healthz';
 
@@ -150,11 +151,36 @@ export function liveStaticFile(webDir: string, urlPath: string): string | null {
   return existsSync(path) && statSync(path).isFile() ? path : null;
 }
 
+/** An IP address as a header carries it (brackets and an IPv6 zone allowed), or null for anything else. */
+function ipOf(value: string): string | null {
+  const v = value.trim().replace(/^\[(.*)\]$/, '$1');
+  if (v.length > 64) return null;
+  const zone = v.indexOf('%');
+  return isIP(zone >= 0 ? v.slice(0, zone) : v) !== 0 ? v : null;
+}
+
 /**
- * Who a visitor is, for the stream caps and the read budget: replay-host-lib's clientKey (X-Real-IP from the edge, else
- * the last X-Forwarded-For entry, else the socket), with an IPv6 address taken as its /64. One home or phone is given
- * a whole /64, so a visitor cannot open a fresh budget by picking another address in it. An IPv4-mapped address is
- * its IPv4.
+ * Who a visitor is, for the stream caps and the read budget: X-Real-IP (which the edge sets) when it is an IP address,
+ * else the last X-Forwarded-For entry that is one, else the socket's address; never any other text a visitor sends,
+ * so a forged header cannot mint unlimited keys. Then grouped (addressGroup).
+ */
+export function liveClientKey(req: { headers: IncomingMessage['headers']; socket: { remoteAddress?: string | undefined } }): string {
+  const real = req.headers['x-real-ip'];
+  const fromReal = typeof real === 'string' ? ipOf(real) : null;
+  if (fromReal !== null) return addressGroup(fromReal);
+  const xff = req.headers['x-forwarded-for'];
+  const list = (typeof xff === 'string' ? xff : Array.isArray(xff) ? xff.join(',') : '').split(',');
+  for (let i = list.length - 1; i >= 0; i--) {
+    const ip = ipOf(list[i]!);
+    if (ip !== null) return addressGroup(ip);
+  }
+  const socket = req.socket.remoteAddress;
+  return socket === undefined ? 'unknown' : addressGroup(socket);
+}
+
+/**
+ * An address as the caps count it: an IPv6 address as its /64 (one home or phone is given a whole /64, so a visitor
+ * cannot open a fresh budget by picking another address in it), an IPv4-mapped address as its IPv4, an IPv4 as is.
  */
 export function addressGroup(key: string): string {
   let k = key.trim().replace(/^\[(.*)\]$/, '$1');
@@ -192,7 +218,7 @@ const obj = (fields: Readonly<Record<string, Shape>>): Shape => ({ fields });
 const TX = obj({ chain: V, id: V, url: V } satisfies Record<keyof TxRef, Shape>);
 const LEG = obj({
   venue: V, symbol: V, side: V, size: V, lotSize: V, entry: V, mark: V, liqPx: V, marginUsd: V, marginRatio: V, distanceToLiqPct: V,
-  fundingEarnedUsd: V, unsettledFundingUsd: V, feesUsd: V, unpriced: V,
+  fundingEarnedUsd: V, unsettledFundingUsd: V, feesUsd: V, feesPositionId: V, unpriced: V,
 } satisfies Record<keyof Leg, Shape>);
 const ACCOUNT = obj({ venue: V, equityUsd: V, at: V } satisfies Record<keyof VenueAccount, Shape>);
 const RESCUE_FAILURE = obj({ rescueId: V, step: V, reason: V, tries: V, next: V, at: V } satisfies Record<keyof RescueFailure, Shape>);
@@ -402,6 +428,11 @@ export interface LiveUpstreamOptions extends LiveConfig {
   idleMs?: number;
   /** After the engine refuses the host's token (401) or origin (403), nothing is asked for this long. */
   refusedPauseMs?: number;
+  /**
+   * A core read's last good answer is served stale for at most this long after it was read; past it, a failure is
+   * answered as one (503), so the page says the engine is not answering instead of showing an old desk as current.
+   */
+  maxStaleMs?: number;
 }
 
 export const STATE_TTL_MS = 3_000;
@@ -419,6 +450,8 @@ const MAX_CLIENTS = 10_000;
 /** Journal ids the host has seen (in /state, in events, in pages); `before=` must be one of them. */
 const MAX_JOURNAL_IDS = 20_000;
 export const REFUSED_PAUSE_MS = 60_000;
+/** Longer than an engine redeploy takes, so a deploy never blanks the page; short enough that an outage shows. */
+export const MAX_STALE_MS = 5 * 60_000;
 const LOG_EVERY_MS = 60_000;
 const CORE_KEYS: ReadonlySet<string> = new Set(['/state', '/strategy', '/journal']);
 
@@ -457,6 +490,8 @@ interface Entry {
   good: Answer | null;
   /** The invalidation count when `good` was asked for: an answer asked for earlier never replaces it. */
   goodGen: number;
+  /** When `good` was read. */
+  goodAt: number;
   freshUntil: number;
   /** The last failure, served only while there is no good answer, until retryAt. */
   failed: Answer | null;
@@ -491,6 +526,8 @@ export class LiveUpstream {
   /** Window ids of the engine's latest list (stream or /state); a history of another id is 404 at the host. */
   #windowIds: ReadonlySet<string> | null = null;
   readonly #journalIds = new Set<string>();
+  /** Windows events seen: a /state asked for before the latest one does not set the window list back. */
+  #windowsEvents = 0;
   #cacheBytes = 0;
   #refusedUntil = 0;
   #status: StreamStatus = 'connecting';
@@ -565,7 +602,7 @@ export class LiveUpstream {
 
   #store(key: string, answer: Answer, gen: number): void {
     const now = this.#now();
-    const e = this.#cache.get(key) ?? { good: null, goodGen: -1, freshUntil: 0, failed: null, retryAt: 0, bytes: 0 };
+    const e = this.#cache.get(key) ?? { good: null, goodGen: -1, goodAt: 0, freshUntil: 0, failed: null, retryAt: 0, bytes: 0 };
     const good = answer.status === 200 || answer.status === 400 || answer.status === 404;
     // Two fetches of one key overlap only across an invalidation; the older one, landing last, changes nothing.
     if (good && e.good !== null && gen < e.goodGen) return;
@@ -574,6 +611,7 @@ export class LiveUpstream {
     if (good) {
       e.good = answer;
       e.goodGen = gen;
+      e.goodAt = now;
       // A fetch that started before an invalidation is kept, but as stale: what it read may predate the change.
       e.freshUntil = gen === (this.#gen.get(key) ?? 0) ? now + this.#ttl(key) : 0;
       e.failed = null;
@@ -620,6 +658,14 @@ export class LiveUpstream {
     this.#windowIds = new Set(windows.map((w: unknown) => (typeof w === 'object' && w !== null ? (w as { id?: unknown }).id : undefined)).filter((id) => typeof id === 'string'));
   }
 
+  /** The last good answer for `key`, if it may still be served: a core read's for maxStaleMs after it was read. */
+  #stale(key: string, now: number): Answer | null {
+    const e = this.#cache.get(key);
+    if (e === undefined || e.good === null) return null;
+    if (CORE_KEYS.has(key) && now - e.goodAt > (this.#o.maxStaleMs ?? MAX_STALE_MS)) return null;
+    return e.good;
+  }
+
   /**
    * GET `key` (a path and query from liveRoute) of the engine, as the public may see it, for `client` (addressGroup).
    * A history is answered only for a window the engine listed; an older journal page only before an entry the host
@@ -647,7 +693,7 @@ export class LiveUpstream {
     const gen = this.#gen.get(key) ?? 0;
     const running = this.#inflight.get(key);
     if (running !== undefined && running.gen === gen) return running.p;
-    const stale = e?.good ?? null;
+    const stale = this.#stale(key, now);
     if (e !== undefined && now < e.retryAt) return stale ?? e.failed ?? BUSY();
     if (now < this.#refusedUntil) return stale ?? json(503, { ok: false, error: 'live engine refused', reason: NOT_ANSWERING }, 30);
     if (!core) {
@@ -659,7 +705,9 @@ export class LiveUpstream {
     }
     const p = this.#get(key).then((answer) => {
       this.#store(key, answer, gen);
-      return this.#cache.get(key)?.good ?? answer;
+      const good = answer.status === 200 || answer.status === 400 || answer.status === 404;
+      // A good answer, or a newer one that landed first; a failure: the last good answer while it may be served.
+      return (good ? this.#cache.get(key)?.good : this.#stale(key, this.#now())) ?? answer;
     }).finally(() => {
       if (this.#inflight.get(key)?.p === p) this.#inflight.delete(key);
     });
@@ -669,6 +717,7 @@ export class LiveUpstream {
 
   async #get(key: string): Promise<Answer> {
     this.counts.requests++;
+    const windowsEventsBefore = this.#windowsEvents;
     let res: Response;
     try {
       res = await this.#fetch()(`${this.#o.base}${key}`, {
@@ -718,7 +767,7 @@ export class LiveUpstream {
     const body = publicRead(route, parsed, this.#cut);
     if (body === undefined || body === null) return json(502, { ok: false, error: 'live engine error', reason: 'The live engine\'s answer was not what this page reads.' });
     if (route === '/state') {
-      this.#learnWindows((body as { windows?: unknown }).windows);
+      if (this.#windowsEvents === windowsEventsBefore) this.#learnWindows((body as { windows?: unknown }).windows);
       this.#learnJournal((body as { journal?: unknown }).journal);
     } else if (route === '/journal') {
       this.#learnJournal(body);
@@ -883,7 +932,10 @@ export class LiveUpstream {
     if (event === null) return;
     const chunk = Buffer.from(`data: ${JSON.stringify(event)}\n\n`);
     if ((SNAPSHOT_TYPES as readonly string[]).includes(event.type)) this.#latest.set(event.type, chunk);
-    if (event.type === 'windows') this.#learnWindows(event.data);
+    if (event.type === 'windows') {
+      this.#windowsEvents++;
+      this.#learnWindows(event.data);
+    }
     if (event.type === 'journal') {
       this.#learnJournal([event.data]);
       this.#invalidate('/state', '/journal');
@@ -908,8 +960,13 @@ export interface LiveHostOptions {
   maxStreamsPerClient?: number;
   /** Bytes one visitor may leave unread on its stream before it is dropped. */
   maxUnreadBytes?: number;
-  /** Bytes all visitors together may leave unread; past it the slowest are dropped first. */
+  /**
+   * Bytes all visitors together may leave unread for longer than `unreadCheckMs`; past it the one holding most is
+   * dropped first. Measured off the write path: what was just written to a reading visitor is in flight, not unread.
+   */
   maxUnreadTotal?: number;
+  /** How often the total above is measured (the bytes written since the last measure are left out). */
+  unreadCheckMs?: number;
   heartbeatMs?: number;
 }
 
@@ -918,6 +975,8 @@ export const MAX_VISITOR_STREAMS = 300;
 export const MAX_VISITOR_UNREAD = 512 * 1024;
 /** What all slow visitors together may park in the host's memory. */
 export const MAX_UNREAD_TOTAL = 32 * 1024 * 1024;
+/** A reading visitor takes in a scan's events (the windows list is about 120 KB) well within this. */
+export const UNREAD_CHECK_MS = 5_000;
 
 const TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -975,42 +1034,56 @@ export function createLiveHostServer(o: LiveHostOptions): LiveHostServer {
   const maxTotal = o.maxUnreadTotal ?? MAX_UNREAD_TOTAL;
   const notConfigured = { ok: false, error: 'live engine not configured', reason: NOT_CONFIGURED_REASON };
 
+  /** Bytes written to each visitor since the last measure of the total. */
+  const recent = new Map<ServerResponse, number>();
   const drop = (res: ServerResponse, why: string): void => {
     visitors.delete(res);
+    recent.delete(res);
     logEvery(`drop-${why}`, `visitor stream dropped: ${res.writableLength} bytes unread (${why})`);
     res.destroy();
   };
   const send = (res: ServerResponse, chunk: Buffer): void => {
     if (!visitors.has(res)) return;
     res.write(chunk);
+    recent.set(res, (recent.get(res) ?? 0) + chunk.length);
     if (res.writableLength > maxUnread) drop(res, `over ${maxUnread} for one visitor`);
   };
-  /** After a fan-out: while all visitors together hold more than maxTotal unread, the one holding most goes. */
-  const enforceTotal = (): void => {
+  /**
+   * Every unreadCheckMs: the bytes each visitor has left unread since before the last measure (its unread bytes less
+   * what was written since); while those add up to more than maxTotal, the visitor holding most goes. A fan-out to many
+   * reading visitors writes far more than maxTotal at once, and none of it counts here.
+   */
+  const measureUnread = (): void => {
+    const old = new Map<ServerResponse, number>();
     let total = 0;
-    for (const res of visitors) total += res.writableLength;
+    for (const res of visitors) {
+      const n = Math.max(0, res.writableLength - (recent.get(res) ?? 0));
+      old.set(res, n);
+      total += n;
+    }
+    recent.clear();
     if (total <= maxTotal) return;
-    const slowest = [...visitors].sort((a, b) => b.writableLength - a.writableLength);
-    for (const res of slowest) {
+    for (const [res, n] of [...old].sort((a, b) => b[1] - a[1])) {
       if (total <= maxTotal) break;
-      total -= res.writableLength;
+      total -= n;
       drop(res, `over ${maxTotal} for all visitors`);
     }
   };
+  const unreadCheck = setInterval(measureUnread, o.unreadCheckMs ?? UNREAD_CHECK_MS);
+  unreadCheck.unref();
   const unsubscribe = o.upstream?.subscribe({
     event: (chunk) => {
       for (const res of visitors) send(res, chunk);
-      enforceTotal();
     },
     drop: () => {
       // Each page notices, reconnects, and reads /state again once the engine is back.
       for (const res of visitors) res.end();
       visitors.clear();
+      recent.clear();
     },
   });
   const heartbeat = setInterval(() => {
     for (const res of visitors) send(res, PING);
-    enforceTotal();
   }, o.heartbeatMs ?? 15_000);
   heartbeat.unref();
 
@@ -1043,6 +1116,7 @@ export function createLiveHostServer(o: LiveHostOptions): LiveHostServer {
     let counted = true;
     const gone = () => {
       visitors.delete(res);
+      recent.delete(res);
       if (!counted) return;
       counted = false;
       const n = (perClient.get(key) ?? 1) - 1;
@@ -1090,7 +1164,7 @@ export function createLiveHostServer(o: LiveHostOptions): LiveHostServer {
       stream.pipe(res);
       return;
     }
-    const key = addressGroup(clientKey(req));
+    const key = liveClientKey(req);
     if (route.kind === 'events') {
       if (method === 'HEAD') {
         res.writeHead(o.upstream?.status === 'connected' ? 200 : 503, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store' });
@@ -1119,6 +1193,7 @@ export function createLiveHostServer(o: LiveHostOptions): LiveHostServer {
   });
   server.on('close', () => {
     clearInterval(heartbeat);
+    clearInterval(unreadCheck);
     unsubscribe?.();
   });
   return Object.assign(server, {
@@ -1129,6 +1204,7 @@ export function createLiveHostServer(o: LiveHostOptions): LiveHostServer {
     },
     dropStreams(): void {
       clearInterval(heartbeat);
+      clearInterval(unreadCheck);
       for (const res of visitors) res.end();
       visitors.clear();
     },
