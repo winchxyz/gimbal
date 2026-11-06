@@ -40,9 +40,10 @@ Tracks: DeFi (main) and Security. Built for NEAR HACKATHON, Nov 1–14, 2026, by
 ([@winchxyz](https://x.com/winchxyz)). This repository started on Oct 30, 2026, inside the build window (Oct 19 to
 Nov 14, rule Q-001 of the hackathon).
 
-**Hosted demo:** https://gimbal-production-1b10.up.railway.app — the same replay as `npm run demo` (recorded mainnet
-hour of 2026-10-31, x10, 40 USD replay desk), starting over every ~7 min; read-only, nothing signed. Run a stress test
-from Rescue while a pair is held.
+**Hosted demo:** https://gimbal-production-1b10.up.railway.app — the live mainnet desk, read-only: the real engine
+as it trades now, through a host that refuses every write ([docs/deploy-live-view.md](docs/deploy-live-view.md)). With
+no pair held it shows a flat desk and the scanner's windows, which is the truth. For the recorded replay (mainnet hour
+of 2026-10-31, x10, a stress test from Rescue), run `npm run demo`.
 
 <!-- SUBMISSION: fill the three lines below on submit day, then delete this comment. -->
 - **Demo video:** TODO(submission): video link

@@ -72,6 +72,14 @@ export function remoteApi(target: ViewTarget, deps: ViewDeps & { client?: ViewCl
   };
 }
 
+/**
+ * An API whose writes are refused in the page, without a request: the public live view's (its host refuses every
+ * write too, and never forwards one to the engine).
+ */
+export function readOnlyApi(api: EngineApi): EngineApi {
+  return { ...api, rotate: refused, close: refused, stress: refused };
+}
+
 /** The API of a remote page with no token yet: every read says so. */
 export function lockedApi(): EngineApi {
   const locked = <T>(): Promise<T> => Promise.reject(new ViewError('needs-token', 'no view token entered'));

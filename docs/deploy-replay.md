@@ -1,5 +1,10 @@
 # The hosted replay on Railway
 
+> **The public URL now serves the live desk, read-only** (docs/deploy-live-view.md). This replay host is kept as the
+> local or optional replay: `npm run demo` on your machine, or a service of its own started with
+> `node engine/src/cli/replay-host.ts` as below. To put the replay back on the public URL, set that service's Custom
+> Start Command back to it.
+
 A public page that shows what `npm run demo` shows, with nothing to install: the recorded mainnet hour of
 2026-10-31 (16:15 to 17:19 UTC) played x10 through the real scanner, strategy loop and risk engine, on the simulated
 40 USD replay desk. The replay script opens a pair (SOL) within the first minute, holds it through the 17:00
@@ -164,9 +169,10 @@ its end. At a switch the old engine (near its end) and the new one (starting) ru
 
 ## Stop it (after 2026-11-25)
 
-The replay project → **Settings → Danger → Delete Project** (or, to keep its settings, the replay service →
-**Deployments → the active deployment → Remove**). It is a project of its own, so this touches nothing of the live
-service. Then remove the "Hosted demo" line from the README.
+**Since the public URL's service runs the live view (docs/deploy-live-view.md), do not delete that project**: it is
+the public site now. Only a separate replay service, if one was set up again, is stopped this way: its project →
+**Settings → Danger → Delete Project** (or, to keep its settings, the service → **Deployments → the active
+deployment → Remove**). A project of its own touches nothing of the live engine's service.
 
 ## Run it locally
 

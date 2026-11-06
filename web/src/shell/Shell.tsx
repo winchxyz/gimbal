@@ -7,7 +7,7 @@ import { Placeholder } from '../screens/Placeholder.tsx';
 import { SecurityScreen } from '../security/SecurityScreen.tsx';
 import { Connect } from '../remote/Connect.tsx';
 import { RemoteBar } from '../remote/RemoteBar.tsx';
-import { READ_ONLY_TEXT, writeControls } from '../remote/readonly.ts';
+import { isHostedLive, READ_ONLY_TEXT, writeControls } from '../remote/readonly.ts';
 import { NoticeBar } from '../ui/NoticeBar.tsx';
 import { focusScroller } from '../ui/scroller.ts';
 import { WindowsScreen } from '../windows/WindowsScreen.tsx';
@@ -23,7 +23,8 @@ const WITH_STATUS = new Set(['desk', 'rescue']);
 export function Shell() {
   const screen = useScreen();
   const onboarding = useOnboardingRoute();
-  const connect = useConnectRoute();
+  // The public live view reads its own origin only: it has no engine settings to show.
+  const connect = useConnectRoute() && !isHostedLive();
   const label = connect ? 'Engine' : onboarding ? 'Set up' : (SCREENS.find((s) => s.id === screen)?.label ?? '');
 
   // On the desktop the document does not scroll: a screen scrolls inside <main>, or in a column of its own (the Windows
