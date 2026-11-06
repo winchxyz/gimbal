@@ -32,7 +32,7 @@ export function useScrolled(ref: RefObject<Element | null>, offset = 160): boole
       const top = target === null ? window.scrollY : target.scrollTop;
       const room = target === null ? document.documentElement.scrollHeight - window.innerHeight : target.scrollHeight - target.clientHeight;
       // a state set to its current value does not render again
-      setScrolled(room > 0 && top > Math.min(offset, room - 1));
+      setScrolled(room > 0 && top > (room <= offset ? 0 : offset));
     };
     const bind = () => {
       (target ?? window).removeEventListener('scroll', read);

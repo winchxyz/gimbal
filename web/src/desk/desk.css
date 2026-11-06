@@ -111,15 +111,15 @@
 .d-next .note { margin-top: var(--s-3); font: var(--t-s); color: var(--ink-2); }
 
 /* "more" beside a line cut to fit: a quiet link to the Journal, where the line is written in full. Its hit area is
-   larger than the word (touch), without making the line any taller. */
+   larger than the word (touch), without making the line any taller or reaching into the next row. */
 .jump { flex: none; position: relative; margin-left: var(--s-2); color: var(--ink-3); transition: color var(--dur) var(--ease); }
 .jump:hover { color: var(--ink-2); }
-.jump::after { content: ''; position: absolute; inset: -12px -8px; }
+.jump::after { content: ''; position: absolute; inset: -4px -8px; }
 
 /* Desktop: lines whose words change with the data keep one line, so nothing under them moves when they do. A cut line
    has its full text on hover and "more" beside it. The unprotected-order flag is a warning and is never cut: it sits
-   outside the cut text, beside it when there is room and on a line of its own when there is not (its amber dot is the
-   separator, so the " · " is the phone's only). */
+   outside the cut text, on a line of its own under it, so only the rare row that carries it grows and the text keeps
+   its width (the " · " between them is the phone's only). */
 @media (min-width: 1024px) {
   /* The decision line is one of the lines under the header: when a short window scrolls the Desk, it stays with them. */
   .d-decision { position: sticky; top: 0; z-index: 2; background: var(--bg); }
@@ -130,7 +130,7 @@
   .ev .txt { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ev .jump { margin-left: 0; white-space: nowrap; }
   .ev .sep { display: none; }
-  .ev .flag { flex: 0 1 auto; min-width: 0; }
+  .ev .flag { flex: 1 0 100%; min-width: 0; }
   .ev .proof { white-space: nowrap; }
 }
 
