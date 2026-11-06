@@ -35,7 +35,7 @@ export function DecisionBar({ decision, now, held, symbol, urgent, minNetAprPct 
       {line ? (
         <p className="say">
           <span className="word">{line.word}</span>
-          <span className="reason" title={line.raw !== line.reason ? line.raw : undefined}>{line.reason}</span>
+          <span className="reason" title={line.raw !== line.reason ? line.raw : line.reason}>{line.reason}</span>
           <span className="g3 when">{line.when}</span>
         </p>
       ) : (

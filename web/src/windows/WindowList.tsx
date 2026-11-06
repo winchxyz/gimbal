@@ -57,7 +57,8 @@ export function ListHead({ tab, onTab, tradableCount, watchCount, watchVenues, s
           Watch-only {watchVenues === null ? watchCount : `${watchVenues} venues`}
         </button>
       </div>
-      <p className="w-live">
+      {/* The list column can be too narrow for the whole marker: what it cuts off is on hover. */}
+      <p className="w-live" title={`${live.label}${scan ? ` · ${scan.venues} venues` : ''} · sorted by ${tab === 'tradable' ? 'net APR after costs' : 'gross APR'}`}>
         <span className="dot" style={dotColor(live.dot)}>{live.label}</span>
         {scan ? <>{'  '}{scan.venues} venues</> : null}
         {at !== null ? <> · <Ago at={at} /></> : null}

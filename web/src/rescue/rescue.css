@@ -5,7 +5,7 @@
 @media (min-width: 1024px) { .r-phone { display: none !important; } }
 @media (max-width: 1023px) { .r-desk { display: none !important; } }
 
-.r-page { display: flex; flex-direction: column; min-height: calc(100dvh - var(--header) - var(--status)); }
+.r-page { display: flex; flex-direction: column; min-height: 100%; }
 .r-lab { font: var(--t-s); color: var(--ink-2); }
 
 /* ---------- the three numbers: time, what is moving, distance ---------- */
@@ -57,7 +57,7 @@
 .r-btns .note { text-align: center; padding: var(--s-3) 0; font: var(--t-s); }
 
 /* ---------- standing by, no desk, can't reach the engine ---------- */
-.r-empty { display: flex; min-height: calc(100dvh - var(--header) - var(--status)); }
+.r-empty { display: flex; min-height: 100%; }
 .r-empty .msg { margin: auto; width: 640px; max-width: 100%; padding: 0 var(--s-4); text-align: center; transform: translateY(-8%); }
 .r-empty h1 { font: var(--t-xl); letter-spacing: var(--track-xl); margin-top: 14px; }
 .r-empty p { color: var(--ink-2); margin: var(--s-4) auto 0; max-width: 560px; }
@@ -114,6 +114,7 @@
   .r-stress .btn { width: 100%; }
   .r-btns { padding: 0 var(--gutter); margin-top: var(--s-5); }
 
+  .r-empty { min-height: calc(100dvh - var(--header) - var(--status)); }
   .r-empty .msg { transform: none; padding: var(--s-5) var(--gutter); text-align: left; width: auto; }
   .r-empty h1 { font: 400 40px/1.05 var(--display); letter-spacing: var(--track-xl); }
   .r-empty p { margin-left: 0; }

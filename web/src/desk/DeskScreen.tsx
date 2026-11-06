@@ -254,7 +254,7 @@ function Latest({ events }: { events: EventRow[] }) {
       {events.map((e) => (
         <div key={e.id} className={cx('ev', e.amountUsd !== null && 'has-amt')}>
           <span className="t">{e.when}</span>
-          <span className="what">
+          <span className="what" title={e.detail ? `${e.text} ${e.detail}` : e.text}>
             {e.text}
             {e.detail ? (
               // The rest of a long line (an attestation's measurements, a long reason): one small control, closed.

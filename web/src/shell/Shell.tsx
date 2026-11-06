@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { DeskScreen } from '../desk/DeskScreen.tsx';
 import { JournalScreen } from '../journal/JournalScreen.tsx';
 import { OnboardingScreen } from '../onboarding/OnboardingScreen.tsx';
@@ -25,9 +25,17 @@ export function Shell() {
   const connect = useConnectRoute();
   const label = connect ? 'Engine' : onboarding ? 'Set up' : (SCREENS.find((s) => s.id === screen)?.label ?? '');
 
+  // On the desktop the screen scrolls inside <main> and the document does not: a new screen starts at its top, and <main>
+  // takes the focus (without a ring: it is not a control) so the arrow keys, Page Down and Space scroll it at once.
+  const main = useRef<HTMLElement>(null);
   useEffect(() => {
     document.title = `Gimbal · ${label}`;
     window.scrollTo(0, 0);
+    const el = main.current;
+    if (!el) return;
+    el.scrollTop = 0;
+    const active = document.activeElement;
+    if (active === null || active === document.body || active.closest('.hdr, .tabs')) el.focus({ preventScroll: true });
   }, [label]);
 
   // The engine settings are a page of their own, without the tabs.
@@ -36,7 +44,7 @@ export function Shell() {
   // Read-only, the set-up flow would write to the engine and the owner's wallet at every step: there is nothing to show.
   if (onboarding && !writeControls().onboarding) {
     return (
-      <div className="app">
+      <div className="app shell">
         <Header screen="desk" />
         <RemoteBar />
         <main className="page">
@@ -58,13 +66,13 @@ export function Shell() {
   }
 
   return (
-    <div className="app">
+    <div className="app shell">
       <Header screen={screen} />
       <RemoteBar />
       <ConnectionBar />
       {WITH_STATUS.has(screen) && <StatusLine screen={screen} />}
       <NoticeBar />
-      <main className="page">
+      <main className="page" ref={main} tabIndex={-1}>
         {screen === 'desk' ? (
           <DeskScreen />
         ) : screen === 'windows' ? (
