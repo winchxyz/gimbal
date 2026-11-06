@@ -743,6 +743,8 @@ const control = controlFromEnv(envVar, {
     if (unsure !== null) return `the pair's start (${unsure})`;
     return strategyLoop.checked === 0 ? 'the strategy loop\'s first check of a scan' : null;
   },
+  // POST /rotate then waits until the route would start it: the loop's own check, the one rotate() answers on.
+  rotateRefusal: (windowId, demo) => strategyLoop.rotateRefusal(windowId, demo),
   call: loopbackCall(host, listening),
   log,
 });

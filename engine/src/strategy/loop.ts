@@ -713,18 +713,13 @@ export class StrategyLoop {
    * owner demo entry, the window's profit checks waived and its round trip held to demo.maxLossUsd.
    */
   rotate(windowId: unknown, demoAsk?: unknown): { ok: true } | { ok: false; reason: string } {
-    if (typeof windowId !== 'string' || windowId.trim() === '') return { ok: false, reason: 'POST /rotate needs { "windowId": "<window id>" }' };
-    let demo: DemoEntry | undefined;
-    if (demoAsk !== undefined) {
-      const parsed = parseDemo(demoAsk);
-      if ('refused' in parsed) return { ok: false, reason: parsed.refused };
-      demo = parsed;
-    }
-    const pre = this.#manualRefusal();
-    if (pre !== null) return { ok: false, reason: pre };
-    if (!this.#o.strategy().auto) return { ok: false, reason: 'auto is off: nothing new is opened (PUT /strategy auto=true first; POST /close works either way)' };
-    const first = this.#rotateCheck(windowId, this.#lastFree, this.#lastFacts, demo, true);
+    const first = this.#rotateFirst(windowId, demoAsk);
     if ('reason' in first) return { ok: false, reason: first.reason };
+    return this.#rotateStart(first.windowId, first.demo);
+  }
+
+  /** rotate() once its first check passed: the act queued, checked and sized again when it runs. */
+  #rotateStart(windowId: string, demo: DemoEntry | undefined): { ok: true } {
     const what = demo === undefined ? `POST /rotate ${windowId}` : `POST /rotate ${windowId} (owner demo entry, at most ${money(demo.maxLossUsd)})`;
     // A refusal line keeps the lead it has without demo; the demo tag comes after it.
     const notDone = `POST /rotate ${windowId} not carried out: ${demo === undefined ? '' : `(owner demo entry, at most ${money(demo.maxLossUsd)}) `}`;
@@ -759,6 +754,33 @@ export class StrategyLoop {
       }
     });
     return { ok: true };
+  }
+
+  /**
+   * Why POST /rotate with these arguments would be refused at once now, or null when it would be started: the very
+   * check rotate() answers on (the demo waiver included), with nothing started, journaled or changed. GIMBAL_CONTROL
+   * (cli/serve-control.ts) waits on it before it sends, so a restart's funding history still loading is not a refusal.
+   */
+  rotateRefusal(windowId: unknown, demoAsk?: unknown): string | null {
+    const first = this.#rotateFirst(windowId, demoAsk);
+    return 'reason' in first ? first.reason : null;
+  }
+
+  /** rotate()'s answer before it starts anything: the reason it is refused, or the window and demo entry it runs with. */
+  #rotateFirst(windowId: unknown, demoAsk?: unknown): { reason: string } | { windowId: string; demo: DemoEntry | undefined } {
+    if (typeof windowId !== 'string' || windowId.trim() === '') return { reason: 'POST /rotate needs { "windowId": "<window id>" }' };
+    let demo: DemoEntry | undefined;
+    if (demoAsk !== undefined) {
+      const parsed = parseDemo(demoAsk);
+      if ('refused' in parsed) return { reason: parsed.refused };
+      demo = parsed;
+    }
+    const pre = this.#manualRefusal();
+    if (pre !== null) return { reason: pre };
+    if (!this.#o.strategy().auto) return { reason: 'auto is off: nothing new is opened (PUT /strategy auto=true first; POST /close works either way)' };
+    const first = this.#rotateCheck(windowId, this.#lastFree, this.#lastFacts, demo, true);
+    if ('reason' in first) return { reason: first.reason };
+    return { windowId, demo };
   }
 
   /**

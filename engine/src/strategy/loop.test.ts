@@ -1440,6 +1440,29 @@ test('demo: a window that fails only its profit checks is entered, said so on th
   assert.equal(journal(a).find((j) => j.kind === 'enter')!.numbers.demo, undefined);
 });
 
+test('rotateRefusal is POST /rotate\'s own first answer, with nothing started: no 7-day history refuses a demo entry too, its profit checks do not', async () => {
+  const noHistory = { ok: false, text: 'No 7-day funding history on both legs yet: the spread expected over a 7-day hold is not known' };
+  const w = world({ windows: [demoWin({ checks: [{ ok: true, text: 'policy ok' }, noHistory] })] });
+  const loop = makeLoop(w, tmpStore(), { facts: demoFacts() });
+  await loop.check();
+  const events = w.events.length;
+  const refused = `${DEMO_ID} fails a check a demo entry does not waive: ${noHistory.text}`;
+  assert.equal(loop.rotateRefusal(DEMO_ID, DEMO), refused);
+  assert.deepEqual(loop.rotate(DEMO_ID, DEMO), { ok: false, reason: refused }, 'the same answer the route gives');
+  assert.equal(loop.rotateRefusal(DEMO_ID), `${DEMO_ID} fails a check: ${noHistory.text}`);
+  assert.equal(loop.rotateRefusal('nope-phoenix-hyperliquid', DEMO), 'nope-phoenix-hyperliquid is not in the last scan');
+  assert.match(loop.rotateRefusal(DEMO_ID, null)!, /^POST \/rotate's demo must be/);
+  assert.equal(loop.rotateRefusal(''), 'POST /rotate needs { "windowId": "<window id>" }');
+  // The history is in: only the profit checks fail. A demo entry would start; a plain one is still refused on them.
+  w.windows = [demoWin()];
+  assert.equal(loop.rotateRefusal(DEMO_ID, DEMO), null);
+  assert.equal(loop.rotateRefusal(DEMO_ID), `${DEMO_ID} fails a check: ${demoWin().checks[1]!.text}`);
+  await loop.idle(1000);
+  assert.equal(w.events.length, events, 'asking started, journaled and published nothing');
+  assert.equal(w.opens.length, 0);
+  assert.deepEqual(loop.rotate(DEMO_ID, DEMO), { ok: true });
+});
+
 test('demo: without the flag nothing changes; the same window is refused with the first failing check, as before', async () => {
   const w = world({ windows: [demoWin()] });
   const loop = makeLoop(w, tmpStore(), { facts: demoFacts() });
