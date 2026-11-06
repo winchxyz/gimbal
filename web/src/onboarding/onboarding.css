@@ -54,6 +54,13 @@
 .rail .st.todo b { color: var(--ink-2); }
 .rail .st.todo span { color: var(--ink-3); }
 
+/* A short desktop window: the rail's eight steps were taller than the window under the 72 px header (a finished set-up
+   scrolled the page by 40 px at 720), so the rail sits a little tighter there. */
+@media (min-width: 1024px) and (max-height: 800px) {
+  .rail { padding-top: var(--s-5); }
+  .rail .st { padding: var(--s-3) 0; }
+}
+
 .obmain { padding: var(--s-6) 72px 0 80px; display: flex; flex-direction: column; min-width: 0; }
 .obmain h1 { font: var(--t-display); letter-spacing: var(--track-display); }
 .ob-lead { margin-top: 14px; color: var(--ink-2); max-width: 720px; }

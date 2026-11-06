@@ -127,13 +127,26 @@
 .w-head .w-live-sk { margin-left: auto; }
 .w-detail-sk .w-dtop .n { flex: 1; }
 
+/* ---------- a narrow desktop, 1024 to 1279 px: the 600 px list left the stage too little room for its own content
+   (the asset and the net APR side by side, two columns under the chart). The list gives up 120 px, the stage its outer
+   air, the asset and the net APR step down from 72 to 56 px so they stay side by side, and the two blocks under the
+   chart stack. ---------- */
+@media (min-width: 1024px) and (max-width: 1279px) {
+  .w-split { grid-template-columns: 480px minmax(0, 1fr); }
+  .w-detail { padding: 40px 40px 32px 48px; }
+  .w-dtop { flex-wrap: wrap; row-gap: var(--s-4); }
+  .w-dtop > div:first-child { flex: 1 1 0; min-width: 0; }   /* the asset's lines wrap beside the net APR */
+  .w-dtop h1, .w-dtop .n b { font-size: 56px; }
+  .w-cols2 { grid-template-columns: minmax(0, 1fr); row-gap: var(--s-5); }
+}
+
 /* ---------- phone: up to 1023 px, one column; the list and the detail are separate pages ---------- */
 @media (max-width: 1023px) {
   .phone-only { display: inline; }
   .desk-only { display: none; }
   .w-hint { display: block; margin-top: var(--s-2); padding: 12px var(--gutter); font: var(--t-s); color: var(--ink-2); }
 
-  .w-split { display: block; height: auto; min-height: 0; }
+  .w-split { display: block; height: auto; }
   .w-list, .w-detail { overflow: visible; }
   .w-list { border-right: 0; }
   .w-split.detail-open .w-list { display: none; }

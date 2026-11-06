@@ -19,6 +19,7 @@ import {
 } from './model.ts';
 import { usePhone, useWindowRoute } from './route.ts';
 import { EmptyState, LoadingView } from './States.tsx';
+import { SCROLLER, takeFocus } from '../ui/scroller.ts';
 import { useFlip } from './useFlip.ts';
 import { useHistories, useStrategy } from './useEngine.ts';
 import { ListHead, MinimumRule, Notices, Row, rowId } from './WindowList.tsx';
@@ -150,7 +151,7 @@ export function WindowsScreen() {
 
   return (
     <div className={detailOpen ? 'w-split detail-open' : 'w-split'}>
-      <section className="w-list" aria-label="Windows">
+      <section className="w-list" aria-label="Windows" ref={takeFocus} {...SCROLLER}>
         <ListHead
           tab={tab}
           onTab={(next) => {

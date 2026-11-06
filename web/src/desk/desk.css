@@ -110,22 +110,34 @@
 .next b { font: 400 28px/1 var(--display); letter-spacing: var(--track-num); }
 .d-next .note { margin-top: var(--s-3); font: var(--t-s); color: var(--ink-2); }
 
-/* Desktop: lines whose words change with the data keep one line, so nothing under them moves when they do. The rest of a
-   long line is on hover (title), and in full in the Journal. */
+/* "more" beside a line cut to fit: a quiet link to the Journal, where the line is written in full. Its hit area is
+   larger than the word (touch), without making the line any taller. */
+.jump { flex: none; position: relative; margin-left: var(--s-2); color: var(--ink-3); transition: color var(--dur) var(--ease); }
+.jump:hover { color: var(--ink-2); }
+.jump::after { content: ''; position: absolute; inset: -12px -8px; }
+
+/* Desktop: lines whose words change with the data keep one line, so nothing under them moves when they do. A cut line
+   has its full text on hover and "more" beside it. The unprotected-order flag is a warning and is never cut: it sits
+   outside the cut text, beside it when there is room and on a line of its own when there is not (its amber dot is the
+   separator, so the " · " is the phone's only). */
 @media (min-width: 1024px) {
   /* The decision line is one of the lines under the header: when a short window scrolls the Desk, it stays with them. */
   .d-decision { position: sticky; top: 0; z-index: 2; background: var(--bg); }
   .d-decision .say { display: flex; align-items: baseline; white-space: nowrap; }
   .d-decision .word, .d-decision .when { flex: none; }
   .d-decision .reason { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-  .ev .what { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .ev .more { display: none; }
+  .ev .what { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: var(--s-2); min-width: 0; }
+  .ev .txt { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ev .jump { margin-left: 0; white-space: nowrap; }
+  .ev .sep { display: none; }
+  .ev .flag { flex: 0 1 auto; min-width: 0; }
   .ev .proof { white-space: nowrap; }
 }
 
-/* A window under 1000 px tall: the same Desk with the slack taken out of it, so a held pair and its latest events fit
-   under the header and the lines at 900 px. Type and order stay as they are; shorter still, the Desk scrolls under
-   those lines. */
+/* A window under 1000 px tall: the same Desk with the slack taken out of it. The 1000 px assumes the stack above the
+   Desk: header (72) + one replay or read-only line (35) + status line (52) + decision line (52) = 211 px, which leaves
+   689 px at 900 px for a held pair and its latest events; they fit there. Type and order stay as they are. Shorter
+   still, or with a notice line on top, the Desk scrolls under those lines. */
 @media (min-width: 1024px) and (max-height: 1000px) {
   .d-grid { grid-template-rows: auto auto auto; padding: var(--s-5) 0 var(--s-2); }
   .d-hero { padding-bottom: var(--s-4); }   /* the first row is as tall as its content now: keep the desk value off the net exposure */
@@ -174,7 +186,6 @@
 
 /* ---------- phone: up to 1023 px, one column ---------- */
 @media (max-width: 1023px) {
-  .d-page { min-height: 0; }
   .d-decision { flex-direction: column; align-items: stretch; gap: var(--s-3); }
   .d-decision .end { max-width: none; flex-wrap: wrap; justify-content: flex-start; }
   .d-decision .end .btn { height: 44px; }

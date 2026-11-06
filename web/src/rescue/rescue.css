@@ -80,7 +80,6 @@
 
 /* ---------- phone: up to 1023 px, one column ---------- */
 @media (max-width: 1023px) {
-  .r-page { min-height: 0; }
   .r-hero { display: block; padding: var(--s-5) var(--gutter) 0; }
   .r-timer { font: 400 64px/.95 var(--display); letter-spacing: var(--track-hero); margin-top: var(--s-2); }
   .r-timer + .r-lab { margin-top: var(--s-3); }

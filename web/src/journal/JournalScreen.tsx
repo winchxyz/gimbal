@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { DeskState, JournalEntry } from '@gimbal/shared';
 import { signedUsd } from '../desk/format.ts';
 import { useStream } from '../stream/hub.ts';
 import { Flash } from '../ui/Flash.tsx';
+import { SCROLLER, takeFocus } from '../ui/scroller.ts';
 import { useNow } from '../ui/useNow.ts';
 import { csvName, toCsv } from './csv.ts';
 import { Day } from './Feed.tsx';
@@ -70,6 +71,10 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
   // showed and counts the new ones ("2 new events") until the reader asks for them or scrolls back up.
   const feed = useRef<HTMLElement>(null);
   const scrolled = useScrolled(feed);
+  const feedRef = useCallback((el: HTMLElement | null) => {
+    feed.current = el;
+    takeFocus(el);
+  }, []);
   const ids = useRef<string[]>([]);
   ids.current = entries.map((e) => e.id);
   const [frozen, setFrozen] = useState<ReadonlySet<string> | null>(null);
@@ -155,7 +160,7 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
       <Filters filter={filter} counts={counts} onChange={setFilter} />
 
       <div className="j-grid">
-        <section className="j-feed" aria-label="Journal entries" ref={feed}>
+        <section className="j-feed" aria-label="Journal entries" ref={feedRef} {...SCROLLER}>
           {pending > 0 ? (
             <div className="j-new" role="status">
               <button type="button" className="btn" onClick={showNew}>

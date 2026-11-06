@@ -9,6 +9,7 @@ import { Flash } from '../ui/Flash.tsx';
 import { cx } from '../ui/cx.ts';
 import { dotColor } from '../ui/dot.ts';
 import { notify } from '../ui/notice.ts';
+import { useCut } from '../ui/scroller.ts';
 import { useNow } from '../ui/useNow.ts';
 import { pct, usd } from '../windows/format.ts';
 import { bestEnterable, deskMissing, heldWindow } from '../windows/model.ts';
@@ -252,33 +253,54 @@ function Latest({ events }: { events: EventRow[] }) {
       </h3>
       {events.length === 0 ? <p className="g d-none">Nothing yet. What the desk does shows up here.</p> : null}
       {events.map((e) => (
-        <div key={e.id} className={cx('ev', e.amountUsd !== null && 'has-amt')}>
-          <span className="t">{e.when}</span>
-          <span className="what" title={e.detail ? `${e.text} ${e.detail}` : e.text}>
-            {e.text}
-            {e.detail ? (
-              // The rest of a long line (an attestation's measurements, a long reason): one small control, closed.
-              <details className="more">
-                <summary>more</summary>
-                {e.detail}
-              </details>
-            ) : null}
-            {e.unprotected ? (
-              <>
-                <span className="sep"> · </span>
-                <span className="flag wt">{e.unprotected}</span>
-              </>
-            ) : null}
-          </span>
-          {e.amountUsd !== null ? <span className={cx('amt', 'd-phone', e.amountUsd < 0 ? 'neg' : 'pos')}>{signedUsd(e.amountUsd)}</span> : null}
-          {e.proof ? (
-            <a className="proof" href={e.proof.href} {...(e.proof.href.startsWith('http') ? { target: '_blank', rel: 'noreferrer noopener' } : {})}>
-              {e.proof.label}
-            </a>
-          ) : null}
-        </div>
+        <LatestRow key={e.id} e={e} />
       ))}
     </section>
+  );
+}
+
+/**
+ * One latest event. On the desktop the row keeps one line so live updates never move the block: the text is cut with
+ * an ellipsis, and a cut or shortened line gets its full text on hover and a "more" link to the Journal, which holds
+ * it in full. The unprotected-order flag sits outside the cut text and always shows whole.
+ */
+function LatestRow({ e }: { e: EventRow }) {
+  const [text, cut] = useCut<HTMLSpanElement>(e.text);
+  const full = e.detail ? `${e.text} ${e.detail}` : e.text;
+  const more = cut || e.detail !== null;
+  return (
+    <div className={cx('ev', e.amountUsd !== null && 'has-amt')}>
+      <span className="t">{e.when}</span>
+      <span className="what">
+        <span className="txt" ref={text} title={more ? full : undefined}>
+          {e.text}
+        </span>
+        {e.detail ? (
+          // The phone wraps the line: the rest of a long one (an attestation's measurements, a long reason) is one small control, closed.
+          <details className="more d-phone">
+            <summary>more</summary>
+            {e.detail}
+          </details>
+        ) : null}
+        {more ? (
+          <a className="jump d-desk" href="#/journal" aria-label="Read the whole entry in the Journal">
+            more
+          </a>
+        ) : null}
+        {e.unprotected ? (
+          <>
+            <span className="sep"> · </span>
+            <span className="flag wt">{e.unprotected}</span>
+          </>
+        ) : null}
+      </span>
+      {e.amountUsd !== null ? <span className={cx('amt', 'd-phone', e.amountUsd < 0 ? 'neg' : 'pos')}>{signedUsd(e.amountUsd)}</span> : null}
+      {e.proof ? (
+        <a className="proof" href={e.proof.href} {...(e.proof.href.startsWith('http') ? { target: '_blank', rel: 'noreferrer noopener' } : {})}>
+          {e.proof.label}
+        </a>
+      ) : null}
+    </div>
   );
 }
 
