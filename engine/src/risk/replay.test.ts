@@ -76,6 +76,10 @@ test('replay: the replay desk from flat, a 12 USD pair on recorded prices, fundi
   assert.deepEqual(first.legs.map((l) => l.side).sort(), ['long', 'short']);
   // 12 USD of notional on 10 USD of margin: far from liquidation; the fees are the desk's only cost at the open.
   assert.ok(first.legs.every((l) => l.size * l.mark < 12.5 && l.distanceToLiqPct! > 60 && l.feesUsd < 0));
+  // Each leg's fees are its open fill's taker fee, as a cost (the replay desk's own; no position book in replay).
+  const openFee = new Map(opened.fills.map((f) => [f.venue, f.feeUsd]));
+  assert.ok(first.legs.every((l) => l.feesUsd === -openFee.get(l.venue)!));
+  assert.ok(Math.abs(first.pnl.feesUsd + opened.feeUsd) < 1e-12);
   assert.ok(Math.abs(first.equityUsd - (REPLAY_DEPOSIT_USD + first.pnl.netUsd)) < 1e-9, `${first.equityUsd} ${JSON.stringify(first.pnl)}`);
   assert.ok(marks.size > 1, 'the recording moves the marks');
   assert.ok(desks.every((d) => d.mode === 'replay' && (d.health === 'level' || d.health === 'watch')));

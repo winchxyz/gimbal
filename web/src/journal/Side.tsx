@@ -12,7 +12,7 @@ const positive = (value: number | null): string | undefined => (value !== null &
  * It reads every entry, not only the filtered ones.
  */
 export function Side({ entries, desk, windows }: { entries: readonly JournalEntry[]; desk: DeskState | null; windows: readonly FundingWindow[] | null }) {
-  const a = attributionOf(desk?.pnl ?? null, entries);
+  const a = attributionOf(desk?.pnl ?? null, entries, desk?.legs ?? []);
   const counts = countsOf(entries);
   const note = desk ? sinceNote(desk, windows) : null;
   const replay = desk?.mode === 'replay';

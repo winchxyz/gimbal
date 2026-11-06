@@ -810,7 +810,7 @@ export interface SetupProgress {   // venue setup the engine runs through operat
   }[];
 }
 
-// Money is signed USD: income positive, costs negative (fees are ≤ 0).
+// Money is signed USD: income positive, costs negative (fees are < 0 a cost, > 0 a maker rebate).
 export interface Leg {
   venue: VenueId; symbol: string; side: 'long' | 'short';
   size: number;                   // base units, always positive; side gives the direction
@@ -820,7 +820,11 @@ export interface Leg {
   marginRatio: number;            // maintenance margin ÷ margin, a fraction: 0.31 = 31 %, 1 = liquidation
   distanceToLiqPct: number | null;   // how far mark must move to reach liqPx, in percent: 32.6 = 32.6 %
   fundingEarnedUsd: number; unsettledFundingUsd: number;
-  feesUsd: number;                // trading fees paid on this leg since it opened (≤ 0)
+  feesUsd: number;                // trading fees on this leg since it opened (< 0 a cost, > 0 a maker rebate); live:
+                                  // what the engine's position book booked for the open position's fills, 0 when it
+                                  // booked none
+  feesPositionId?: string;        // live: the book position those fees are of (a late-read fill fee's `fee` journal
+                                  // entry names it: the Journal does not count that entry again while a leg names it)
   unpriced: boolean;              // opened under policy.unpriced: no oracle price band
 }
 
@@ -882,6 +886,9 @@ export interface JournalEntry {
   //   realizedFundingUsd, realizedFeesUsd, realizedPriceUsd, realizedNetUsd
   //                           on a replay desk's `exit`: the closed pair's realized split (fees ≤ 0); the Journal
   //                           adds it to the flat desk's P&L, the Desk's flat page shows the net
+  //   fillFee, position, stage  on a `fee` for a fill's fee read from the venue later: 1, the book position, and
+  //                           'enter' | 'fill' | 'exit'; counted under fees, but not while a desk leg on its `venue`
+  //                           names that position (Leg.feesPositionId: the desk's P&L already holds it)
   numbers: Record<string, number | string>;
   tx: TxRef[];
 }

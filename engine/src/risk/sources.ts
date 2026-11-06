@@ -7,6 +7,14 @@
 // read has a
 // deadline (ACCOUNT_READ_DEADLINE_MS): past it that venue's read fails for this tick instead of holding the tick up.
 // Phoenix legs are marked with marks up to 5 s old (phoenix.ts MARKS_MAX_AGE_MS), refreshed between ticks.
+// The account reads carry no fees: a leg's fees (the desk P&L's `feesUsd`) come from the position book (`fees`
+// option; serve: PositionBook.openLegFees through serve-loop.ts bookLegFees): the fills' fees it booked for the open
+// position's leg on that venue, symbol and side, the entry's and those of later acts on it while open (a cost < 0, a
+// maker rebate > 0); the leg names that position (Leg.feesPositionId). With no book, a book gone read only, no open
+// position booked for the leg (one opened by hand and not adopted yet, or on the other side) or a fee the book has not
+// read yet, that part is 0: nothing is estimated. monitor (cli/monitor.ts) has no book: its legs show fees 0. Neither
+// venue's entry price carries fees (Hyperliquid's entryPx is the fills' average; Phoenix's virtual quote position is
+// the fills' quote, the fee comes out of collateral apart), so the price P&L does not count them again.
 //
 // ReplayDesk (replay): there are no recorded accounts, so the desk is simulated: REPLAY_DEPOSIT_USD deposited,
 // REPLAY_VENUE_CASH_USD of it on each of Hyperliquid and Phoenix and the rest in the reserve, flat at the start. The
@@ -42,6 +50,12 @@ export interface AccountsDeskSourceOptions {
   deskWaitMs?: number;
   /** Default ACCOUNT_READ_DEADLINE_MS. */
   readDeadlineMs?: number;
+  /**
+   * A leg's trading fees, signed (a cost < 0, a rebate > 0), and the book position they are of: serve passes what the
+   * position book booked for the open position's leg on that venue, symbol and side (the venue position's sign)
+   * (PositionBook.openLegFees). Null, absent, not a number or a throw: 0 (nothing invented), no position named.
+   */
+  fees?: (venue: VenueId, symbol: string, side: 'long' | 'short') => { usd: number; positionId: string } | null;
 }
 
 /** A snapshot waits this long for the desk view (get_desk) before it goes on with the last answer. */
@@ -62,6 +76,7 @@ export class AccountsDeskSource implements DeskSource {
   #deskAt: number | null = null;
   #deskError: string | null = null;
   #deskRead: { promise: Promise<void>; since: number } | null = null;
+  #feesError: string | null = null;
 
   constructor(options: AccountsDeskSourceOptions) {
     this.#o = options;
@@ -81,16 +96,20 @@ export class AccountsDeskSource implements DeskSource {
       }
     }));
     const legs: LegInput[] = [];
+    let feesThrew = false;
     for (const r of reads) {
       if (r.account === null) continue;
       for (const position of r.account.positions) {
         if (position.size === 0) continue;
+        const { threw, ...fees } = this.#fees(r.venue, position);
+        feesThrew ||= threw;
         legs.push({
           venue: r.venue, symbol: position.symbol, lotSize: this.#o.lotSize?.(r.venue, position.symbol) ?? 1e-8,
-          account: r.account, position, markPx: null, feesUsd: 0, unpriced: false,
+          account: r.account, position, markPx: null, ...fees, unpriced: false,
         });
       }
     }
+    if (!feesThrew) this.#feesError = null;
     await deskRead;
     const late = this.#deskRead === null ? null : `get_desk has not answered for ${Math.round((now() - this.#deskRead.since) / 1000)} s`;
     return {
@@ -103,6 +122,24 @@ export class AccountsDeskSource implements DeskSource {
       reads: reads.map(({ venue, ms, error }) => ({ venue, ms, error })),
       ...(this.#o.desk === undefined ? {} : { deskView: { at: this.#deskAt, error: late ?? this.#deskError } }),
     };
+  }
+
+  /**
+   * The `fees` option's answer for a leg (with the position it names), else 0. A throw is logged once per message
+   * until a read whose fees all came through clears it (read()), so the same error after a recovery is logged again.
+   */
+  #fees(venue: VenueId, position: Position): { feesUsd: number; feesPositionId?: string; threw: boolean } {
+    if (this.#o.fees === undefined || position.size === 0) return { feesUsd: 0, threw: false };
+    try {
+      const got = this.#o.fees(venue, position.symbol, position.size > 0 ? 'long' : 'short');
+      if (got === null || !Number.isFinite(got.usd)) return { feesUsd: 0, threw: false };
+      return { feesUsd: got.usd, feesPositionId: got.positionId, threw: false };
+    } catch (err) {
+      const message = errorMessage(err);
+      if (this.#feesError !== message) this.#o.log?.(`risk: the ${venue} ${position.symbol} leg's fees could not be read from the book, shown as 0: ${message}`);
+      this.#feesError = message;
+      return { feesUsd: 0, threw: true };
+    }
   }
 
   /** Starts a desk view read unless one is out, and waits for it at most deskWaitMs (see the option). */

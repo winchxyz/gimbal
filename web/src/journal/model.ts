@@ -1,6 +1,6 @@
 // What the Journal screen shows, worked out from the entries the engine sent. Pure functions, so the rules in
 // design/HANDOFF.md (Journal) are tested without a browser.
-import type { DeskState, JournalEntry, Window as FundingWindow } from '@gimbal/shared';
+import type { DeskState, JournalEntry, Leg, Window as FundingWindow } from '@gimbal/shared';
 import { signedUsd } from '../desk/format.ts';
 import { dayRate, paybackOf } from '../desk/model.ts';
 import { dayMonth, dayMonthTime, hours, venueName } from '../windows/format.ts';
@@ -302,15 +302,22 @@ export interface Attribution {
  * The desk's P&L covers the legs it holds; a close that carries its realized split (`realizedFundingUsd`,
  * `realizedFeesUsd`, `realizedPriceUsd`: the replay desk's closes do) adds the pair it closed, so the net still agrees
  * with the day totals once the desk is flat.
+ * A fill's fee the engine read from the venue later (a `fee` entry with `fillFee`) is a trading fee, counted once: in
+ * the desk's P&L while a desk leg on its venue names its position (`Leg.feesPositionId`: the live desk counts the
+ * open position's fills), else from the entry, under fees.
  */
-export function attributionOf(pnl: DeskState['pnl'] | null, entries: readonly JournalEntry[]): Attribution {
+export function attributionOf(
+  pnl: DeskState['pnl'] | null, entries: readonly JournalEntry[], legs: readonly Pick<Leg, 'venue' | 'feesPositionId'>[] = [],
+): Attribution {
   let otherUsd = 0;
   const realized = { fundingUsd: 0, feesUsd: 0, priceUsd: 0 };
   for (const e of entries) {
     const info = KINDS[e.kind];
     if (info.principal) otherUsd += feeUsd(e) ?? 0;
     else if (e.kind === 'rescue') otherUsd += rescueCostUsd(e);
-    else if (e.kind === 'fee') otherUsd += amountUsd(e) ?? 0;
+    else if (e.kind === 'fee' && isFillFee(e)) {
+      if (!inDeskFees(e, legs)) realized.feesUsd += amountUsd(e) ?? 0;
+    } else if (e.kind === 'fee') otherUsd += amountUsd(e) ?? 0;
     else if (e.kind === 'exit') {
       realized.fundingUsd += numberOf(e, 'realizedFundingUsd') ?? 0;
       realized.feesUsd += numberOf(e, 'realizedFeesUsd') ?? 0;
@@ -324,6 +331,22 @@ export function attributionOf(pnl: DeskState['pnl'] | null, entries: readonly Jo
     otherUsd,
     netUsd: pnl ? pnl.netUsd + realized.fundingUsd + realized.feesUsd + realized.priceUsd + otherUsd : null,
   };
+}
+
+/**
+ * A `fee` entry for a fill's fee read from the venue (the book's feeJournal): `fillFee` 1, or, on entries written
+ * before that tag, the count of `fills` it covers, which a transfer's fee never carries.
+ */
+export const isFillFee = (e: Pick<JournalEntry, 'numbers'>): boolean => numberOf(e, 'fillFee') === 1 || numberOf(e, 'fills') !== null;
+
+/**
+ * The desk's P&L already holds this read fill fee: a leg on its venue names its position. A close's fee never is (the
+ * live desk counts an open position's fills only, and a closed one has no leg).
+ */
+function inDeskFees(e: Pick<JournalEntry, 'numbers'>, legs: readonly Pick<Leg, 'venue' | 'feesPositionId'>[]): boolean {
+  const { position, venue, stage } = e.numbers;
+  if (typeof position !== 'string' || typeof venue !== 'string' || stage === 'exit') return false;
+  return legs.some((l) => l.feesPositionId === position && l.venue === venue);
 }
 
 /** The line under the net: where the held window stands against its entry costs. Null when nothing is held. */

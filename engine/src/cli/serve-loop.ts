@@ -24,7 +24,8 @@ import { errorMessage } from '../venues/recorder.ts';
 import type { AccountState, Book, Clock, Market, VenueReader } from '../venues/venue.ts';
 import type { DecideInput, Decision } from '../strategy/decide.ts';
 import type { ActOutcome, BookFill, BookSink, HandsHeld, LoopHands, LoopHeld, WindowFacts } from '../strategy/loop.ts';
-import type { AdoptInput, CloseLookup, OutsideClose } from '../book/book.ts';
+import type { AdoptInput, CloseLookup, OutsideClose, PositionBook } from '../book/book.ts';
+import type { OpenLegFees } from '../book/derive.ts';
 import type { ProtectionCloseReport } from '../trade/protected-pair.ts';
 import type { BookRecord } from '../book/types.ts';
 import type { PairResult } from '../trade/pair.ts';
@@ -309,6 +310,8 @@ export function loopHands(
       if (symbol === null) return null;
       const legs = (lastDesk()?.legs ?? []).filter((l) => sameSymbol(l.symbol, symbol));
       const legUsd = legs.length === 0 ? 0 : Math.max(...legs.map((l) => l.size * l.mark));
+      // Price, funding and the fees paid so far (live: the book's open fees, bookLegFees; nothing else in the loop
+      // subtracts them, so they count once). The close's own fees are not in it.
       let pnlUsd = 0;
       // What closing each leg frees on its venue: its margin plus its P&L.
       const freed: Record<string, number> = {};
@@ -343,6 +346,17 @@ export function loopHands(
     reconcile: () => hands.reconcile(),
     close: async (r) => outcome(await hands.close({ reason: r.reason })),
   };
+}
+
+/**
+ * The live desk's leg fees (risk/sources.ts AccountsDeskSource `fees`): what the position book booked for the open
+ * position's leg on that venue, symbol and side (PositionBook.openLegFees), signed (a cost < 0), with the position's
+ * id; null with no book (not loaded yet, or not kept), a book gone read only, or no open position booked there. `book`
+ * is asked at each read: serve creates the book after the desk source.
+ */
+export function bookLegFees(book: () => Pick<PositionBook, 'openLegFees'> | null):
+  (venue: VenueId, symbol: string, side: 'long' | 'short') => OpenLegFees | null {
+  return (venue, symbol, side) => book()?.openLegFees(venue, side, (s) => sameSymbol(s, symbol)) ?? null;
 }
 
 /**

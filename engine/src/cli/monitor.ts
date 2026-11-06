@@ -62,6 +62,7 @@ async function main(): Promise<number> {
     publish: (e: StreamEvent) => {
       if (e.type === 'desk') state = e.data;
     },
+    // No position book here (serve keeps it): the legs' fees are 0 (the lines printed do not show fees or P&L).
     source: new AccountsDeskSource({
       deskId: cfg.deskId, owner: desk.owner, contract: cfg.contractId,
       accounts: [{ reader: hl, address: desk.evm_address }, { reader: phoenix, address: desk.solana.authority }],
