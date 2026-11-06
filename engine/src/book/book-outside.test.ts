@@ -525,10 +525,14 @@ test('a short write whose cut fails too: the book goes read only until restart, 
     },
   });
   s.book.record(enterXlm());
+  const xlm = (symbol: string) => symbol === 'XLM';
+  assert.ok(Math.abs(s.book.openLegFees('hyperliquid', 'short', xlm)!.usd + 0.15) < 1e-9, 'the open position lends its fees');
   broken = true;
   s.clock.set(exitXlm().at);
   assert.throws(() => s.book.record(exitXlm()), /short write: 10 of \d+ bytes.*cutting it back failed too \(EIO: truncate failed\): the book is read only until restart/);
   assert.match(s.book.readOnly() ?? '', /^short write/);
+  // The exit that failed to write may have closed it: memory still holds XLM open, so no leg takes fees from it.
+  assert.equal(s.book.openLegFees('hyperliquid', 'short', xlm), null, 'read only: no open-leg fees');
   broken = false;
   assert.throws(() => s.book.record(exitXlm()), /the book is read only until restart/);
   const errors = s.journal.filter((j) => j.kind === 'error');

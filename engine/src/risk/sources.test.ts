@@ -106,16 +106,21 @@ async function deskOf(source: AccountsDeskSource): Promise<DeskState> {
 
 test('live legs carry the fees the book booked for the open position: in each leg, pnl.feesUsd and pnl.netUsd', async () => {
   const asked: string[] = [];
-  const booked: Record<string, number> = { 'hyperliquid XLM': -0.0041, 'phoenix XLM': -0.0027 };
+  const booked: Record<string, number> = { 'hyperliquid XLM short': -0.0041, 'phoenix XLM long': -0.0027 };
   const d = await deskOf(new AccountsDeskSource({
     deskId: 'alpha', owner: 'owner.near', contract: 'gimbal.near', accounts: xlmAccounts(),
-    fees: (venue, symbol) => {
-      asked.push(`${venue} ${symbol}`);
-      return booked[`${venue} ${symbol}`] ?? null;
+    fees: (venue, symbol, side) => {
+      asked.push(`${venue} ${symbol} ${side}`);
+      const usd = booked[`${venue} ${symbol} ${side}`];
+      return usd === undefined ? null : { usd, positionId: 'xlm@1' };
     },
   }));
-  assert.deepEqual(asked, ['hyperliquid XLM', 'hyperliquid ETH', 'phoenix XLM']);
-  assert.deepEqual(d.legs.map((l) => [l.venue, l.symbol, l.feesUsd]), [['hyperliquid', 'XLM', -0.0041], ['hyperliquid', 'ETH', 0], ['phoenix', 'XLM', -0.0027]]);
+  // Each leg asked with the side of the venue position's sign.
+  assert.deepEqual(asked, ['hyperliquid XLM short', 'hyperliquid ETH short', 'phoenix XLM long']);
+  assert.deepEqual(d.legs.map((l) => [l.venue, l.symbol, l.feesUsd, l.feesPositionId]), [
+    ['hyperliquid', 'XLM', -0.0041, 'xlm@1'], ['hyperliquid', 'ETH', 0, undefined], ['phoenix', 'XLM', -0.0027, 'xlm@1'],
+  ]);
+  assert.ok(!('feesPositionId' in d.legs[1]!), 'no position named where the book has none');
   const near = (a: number, b: number, what: string) => assert.ok(Math.abs(a - b) < 1e-12, `${what}: ${a} vs ${b}`);
   near(d.pnl.feesUsd, -0.0068, 'fees');
   near(d.pnl.fundingUsd, 0.003, 'funding');
@@ -128,17 +133,37 @@ test('live legs with no book, no open position booked, or a book that throws: fe
   const sources = {
     'no book (monitor)': new AccountsDeskSource({ ...base, accounts: xlmAccounts() }),
     'book not loaded yet, or nothing open': new AccountsDeskSource({ ...base, accounts: xlmAccounts(), fees: () => null }),
-    'not a number': new AccountsDeskSource({ ...base, accounts: xlmAccounts(), fees: () => Number.NaN }),
+    'not a number': new AccountsDeskSource({ ...base, accounts: xlmAccounts(), fees: () => ({ usd: Number.NaN, positionId: 'xlm@1' }) }),
     'throws': new AccountsDeskSource({ ...base, accounts: xlmAccounts(), log: (l) => lines.push(l), fees: () => { throw new Error('book: torn line'); } }),
   };
   for (const [what, source] of Object.entries(sources)) {
     const d = await deskOf(source);
-    assert.deepEqual(d.legs.map((l) => l.feesUsd), [0, 0, 0], what);
+    assert.deepEqual(d.legs.map((l) => [l.feesUsd, l.feesPositionId]), [[0, undefined], [0, undefined], [0, undefined]], what);
     assert.equal(d.pnl.feesUsd, 0, what);
     assert.equal(d.pnl.netUsd, d.pnl.fundingUsd + d.pnl.priceUsd, what);
   }
   // Logged once per message, not once per leg and tick.
   assert.deepEqual(lines, ['risk: the hyperliquid XLM leg\'s fees could not be read from the book, shown as 0: book: torn line']);
+});
+
+test('a fees error is logged once while it lasts; after a read whose fees all came through, the same error is logged again', async () => {
+  const lines: string[] = [];
+  let failing = true;
+  const source = new AccountsDeskSource({
+    deskId: 'alpha', owner: 'owner.near', contract: 'gimbal.near', accounts: xlmAccounts(), log: (l) => lines.push(l),
+    fees: () => {
+      if (failing) throw new Error('book: torn line');
+      return null;
+    },
+  });
+  await source.read();
+  await source.read();
+  assert.equal(lines.length, 1, 'once while it lasts');
+  failing = false;
+  await source.read();
+  failing = true;
+  await source.read();
+  assert.equal(lines.length, 2, 'again after the recovery');
 });
 
 test('the reserve and the pause are read again with every snapshot; a read that throws keeps the last answer', async () => {

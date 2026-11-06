@@ -25,6 +25,7 @@ import type { AccountState, Book, Clock, Market, VenueReader } from '../venues/v
 import type { DecideInput, Decision } from '../strategy/decide.ts';
 import type { ActOutcome, BookFill, BookSink, HandsHeld, LoopHands, LoopHeld, WindowFacts } from '../strategy/loop.ts';
 import type { AdoptInput, CloseLookup, OutsideClose, PositionBook } from '../book/book.ts';
+import type { OpenLegFees } from '../book/derive.ts';
 import type { ProtectionCloseReport } from '../trade/protected-pair.ts';
 import type { BookRecord } from '../book/types.ts';
 import type { PairResult } from '../trade/pair.ts';
@@ -349,12 +350,13 @@ export function loopHands(
 
 /**
  * The live desk's leg fees (risk/sources.ts AccountsDeskSource `fees`): what the position book booked for the open
- * position's leg on that venue and symbol (PositionBook.openLegFees), signed (a cost < 0); null with no book (not
- * loaded yet, or not kept) or no open position booked there. `book` is asked at each read: serve creates the book after
- * the desk source.
+ * position's leg on that venue, symbol and side (PositionBook.openLegFees), signed (a cost < 0), with the position's
+ * id; null with no book (not loaded yet, or not kept), a book gone read only, or no open position booked there. `book`
+ * is asked at each read: serve creates the book after the desk source.
  */
-export function bookLegFees(book: () => Pick<PositionBook, 'openLegFees'> | null): (venue: VenueId, symbol: string) => number | null {
-  return (venue, symbol) => book()?.openLegFees(venue, (s) => sameSymbol(s, symbol)) ?? null;
+export function bookLegFees(book: () => Pick<PositionBook, 'openLegFees'> | null):
+  (venue: VenueId, symbol: string, side: 'long' | 'short') => OpenLegFees | null {
+  return (venue, symbol, side) => book()?.openLegFees(venue, side, (s) => sameSymbol(s, symbol)) ?? null;
 }
 
 /**

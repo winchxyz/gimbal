@@ -23,7 +23,8 @@ import { adlGate, bookLegFees, depthAtSize, fillsOf, loopGates, loopHands, openG
 import type { PairAdl, PairHands, ServePair } from './serve-pair.ts';
 import type { PositionBook } from '../book/book.ts';
 import { createBook } from '../book/book.ts';
-import { T0 as BOOK_T0, enterXlm } from '../book/test-helpers.ts';
+import { positionIdOf } from '../book/derive.ts';
+import { T0 as BOOK_T0, XLM as XLM_WINDOW, enterXlm } from '../book/test-helpers.ts';
 import { RiskEngine } from '../risk/engine.ts';
 import { AccountsDeskSource } from '../risk/sources.ts';
 import { VenueHealth } from '../risk/venue-health.ts';
@@ -490,7 +491,8 @@ test('serve wiring of the live desk fees: bookLegFees -> AccountsDeskSource -> d
     // The loop enters XLM: 0.15 on Hyperliquid, 0.05 on Phoenix (enterXlm).
     created.record(enterXlm());
     desk = (await risk.tick())!;
-    assert.deepEqual(desk.legs.map((l) => [l.venue, l.feesUsd]), [['hyperliquid', -0.15], ['phoenix', -0.05]]);
+    const xlmId = positionIdOf(XLM_WINDOW, enterXlm().at);
+    assert.deepEqual(desk.legs.map((l) => [l.venue, l.feesUsd, l.feesPositionId]), [['hyperliquid', -0.15, xlmId], ['phoenix', -0.05, xlmId]]);
     near(desk.pnl.feesUsd, -0.2, 'desk fees');
     near(desk.pnl.netUsd, 0.03 - 0.01 - 0.2, 'desk net: funding + fees, price 0');
     // The loop's held P&L reads the same legs: funding 0.02 and the open fees 0.20, once; nothing else subtracts them.
@@ -498,11 +500,12 @@ test('serve wiring of the live desk fees: bookLegFees -> AccountsDeskSource -> d
     const last = desk;
     near(loopHands(hands, () => last, () => {}).held()!.pnlUsd, 0.02 - 0.2, 'held P&L');
     // A lower-case or Orderly-style venue symbol names the same booked position.
-    near(bookLegFees(() => created)('hyperliquid', 'xlm')!, -0.15, 'case');
-    const asked: boolean[] = [];
-    bookLegFees(() => ({ openLegFees: (_venue, matches) => { asked.push(matches('XLM'), matches('SOL')); return null; } }))('orderly', 'PERP_XLM_USDC');
-    assert.deepEqual(asked, [true, false]);
-    assert.equal(bookLegFees(() => null)('hyperliquid', 'XLM'), null, 'no book');
+    near(bookLegFees(() => created)('hyperliquid', 'xlm', 'short')!.usd, -0.15, 'case');
+    assert.equal(bookLegFees(() => created)('hyperliquid', 'XLM', 'long'), null, 'the other side');
+    const asked: unknown[] = [];
+    bookLegFees(() => ({ openLegFees: (_venue, side, matches) => { asked.push(side, matches('XLM'), matches('SOL')); return null; } }))('orderly', 'PERP_XLM_USDC', 'long');
+    assert.deepEqual(asked, ['long', true, false]);
+    assert.equal(bookLegFees(() => null)('hyperliquid', 'XLM', 'short'), null, 'no book');
   } finally {
     await risk.stop();
   }

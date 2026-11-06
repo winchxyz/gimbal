@@ -15,9 +15,9 @@ import { scanRead } from '../venues/http-budget.ts';
 import type { Clock } from '../venues/venue.ts';
 import { systemClock } from '../venues/venue.ts';
 import { errorMessage } from '../venues/recorder.ts';
-import type { BookSummary, PositionResult } from './derive.ts';
+import type { BookSummary, OpenFeesIndex, OpenLegFees, PositionResult } from './derive.ts';
 import {
-  HOUR_MS, indexBook, openLegFeesUsd, openPosition, positionIdOf, positionResult, positionsOf, summarize, unsettledJournals,
+  HOUR_MS, indexBook, openFeesIndex, openLegFeesUsd, openPosition, positionIdOf, positionResult, positionsOf, summarize, unsettledJournals,
 } from './derive.ts';
 import { entryNumbers, exitNumbers, feeJournal, fundingJournal, settledJournal, settlingNote, transferJournal } from './journal.ts';
 import { FILL_WINDOW_SLACK_MS } from './sources.ts';
@@ -154,6 +154,8 @@ export class PositionBook {
   /** Position id -> when the read of its closing fills first failed (the detector retries until FILL_READ_GIVE_UP_MS). */
   readonly #detectFailing = new Map<string, number>();
   #readOnlyJournaled = false;
+  /** openLegFees' index and the event count it was derived at (the store only appends). */
+  #openFees: { n: number; ix: OpenFeesIndex } | null = null;
 
   constructor(o: BookOptions) {
     this.#o = o;
@@ -654,11 +656,16 @@ export class PositionBook {
   }
 
   /**
-   * The fill fees booked for the open position's leg on `venue` whose symbol `matches` (derive.ts openLegFeesUsd),
-   * signed (a cost < 0); null with no such open position. The live desk's leg fees (risk/sources.ts).
+   * The fill fees booked for the open position's leg on `venue` and `side` whose symbol `matches` (derive.ts
+   * openLegFeesUsd), signed (a cost < 0), with that position's id; null with no such open position, and while the book
+   * is read only (a write that failed may have been the exit: what memory holds open may not be). The live desk's leg
+   * fees (risk/sources.ts). Derived again only once an event was added.
    */
-  openLegFees(venue: string, matches: (symbol: string) => boolean): number | null {
-    return openLegFeesUsd(this.events, venue, matches);
+  openLegFees(venue: string, side: 'long' | 'short', matches: (symbol: string) => boolean): OpenLegFees | null {
+    if (this.readOnly() !== null) return null;
+    const n = this.events.length;
+    if (this.#openFees?.n !== n) this.#openFees = { n, ix: openFeesIndex(this.events) };
+    return openLegFeesUsd(this.#openFees.ix, venue, side, matches);
   }
 
   /** What serve merges into the loop's enter (or rotate) journal entry. */

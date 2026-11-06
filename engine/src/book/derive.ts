@@ -566,19 +566,38 @@ function entryNotional(fills: readonly BookFill[]): number | null {
   return sum([...byVenue.values()]) / byVenue.size;
 }
 
-/**
- * The fill fees booked so far on `venue` for the open position whose symbol `matches` (the latest one if several, which
- * the loop never makes): the entry's (none for an adopted position) and those of acts on it that did not end as asked,
- * signed (a cost < 0, a rebate > 0). A fee neither the record nor the venue gave yet is left out, never guessed. Null
- * when no open position has a leg on `venue` with a matching symbol. What the live desk shows as a leg's fees.
- */
-export function openLegFeesUsd(events: readonly BookEvent[], venue: string, matches: (symbol: string) => boolean): number | null {
-  const p = positionsOf(events).findLast((q) => q.exit === null && matches(q.symbol) && q.legs.some((l) => l.venue === venue));
-  if (p === undefined) return null;
+/** What openLegFeesUsd reads, derived once per state of the book (PositionBook keeps it until an event is added). */
+export interface OpenFeesIndex {
+  positions: Position[];
+  /** feeKey -> a fill fee read from the venue (FeeEvent.usd). */
+  fees: Map<string, number>;
+}
+
+export function openFeesIndex(events: readonly BookEvent[]): OpenFeesIndex {
   const fees = new Map<string, number>();
   for (const e of events) if (e.type === 'fee') fees.set(feeKey(e.positionId, e.recordAt, e.index), e.usd);
-  const entry = p.enter.adopted ? 0 : recordFees(p.enter.record, p.id, fees, venue).usd;
-  return entry + sum(p.fills.map((f) => recordFees(f.record, p.id, fees, venue).usd));
+  return { positions: positionsOf(events), fees };
+}
+
+/** A leg's booked fees and the position they are of. */
+export interface OpenLegFees {
+  /** Signed: a cost < 0, a rebate > 0. */
+  usd: number;
+  positionId: string;
+}
+
+/**
+ * The fill fees booked so far on `venue` for the open position whose symbol `matches` and whose leg there is on `side`
+ * (the latest one if several, which the loop never makes): the entry's (none for an adopted position) and those of
+ * acts on it that did not end as asked. A fee neither the record nor the venue gave yet is left out, never guessed; an
+ * exit's fees are not an open leg's. Null when no open position has such a leg (a venue position on the other side is
+ * not this one's). What the live desk shows as a leg's fees.
+ */
+export function openLegFeesUsd(ix: OpenFeesIndex, venue: string, side: 'long' | 'short', matches: (symbol: string) => boolean): OpenLegFees | null {
+  const p = ix.positions.findLast((q) => q.exit === null && matches(q.symbol) && q.legs.some((l) => l.venue === venue && l.side === side));
+  if (p === undefined) return null;
+  const entry = p.enter.adopted ? 0 : recordFees(p.enter.record, p.id, ix.fees, venue).usd;
+  return { usd: entry + sum(p.fills.map((f) => recordFees(f.record, p.id, ix.fees, venue).usd)), positionId: p.id };
 }
 
 /** Fill records with no position (a failed open that left the desk flat): their fees and cash flow. */

@@ -117,7 +117,11 @@ export function fundingJournal(events: readonly BookEvent[], now: number): Journ
 
 const STAGE = { enter: 'open', exit: 'close', fill: 'partial fill' } as const;
 
-/** The fees read from a venue for one record's fills on one venue and side. */
+/**
+ * The fees read from a venue for one record's fills on one venue and side. `fillFee` 1 tells it from a transfer's fee:
+ * while the position is open an open's or partial fill's read fee is also in the live desk's leg fees (derive.ts
+ * openLegFeesUsd), so the web counts this entry only while no desk leg names the position (Leg.feesPositionId).
+ */
 export function feeJournal(m: MissingFee, fees: readonly FeeEvent[], now: number): JournalEvent {
   const usd = fees.reduce((a, f) => a + f.usd, 0);
   const summary = `fee ${m.venue} ${m.symbol} ${STAGE[m.stage]}: ${signed(usd)} USD, read from the venue's fills (the record had none)`
@@ -125,7 +129,8 @@ export function feeJournal(m: MissingFee, fees: readonly FeeEvent[], now: number
   return {
     v: 1, type: 'journal', at: now, ...(m.positionId === null ? {} : { positionId: m.positionId }),
     entry: entry(`book-fee-${m.positionId ?? 'desk'}-${m.stage}-${m.record.at}-${m.venue}-${m.side}`, now, 'fee', summary, {
-      usd: round6(usd), ...(m.positionId === null ? {} : { position: m.positionId }), venue: m.venue, stage: m.stage, fills: fees.length,
+      usd: round6(usd), ...(m.positionId === null ? {} : { position: m.positionId }), venue: m.venue, symbol: m.symbol, stage: m.stage,
+      fills: fees.length, fillFee: 1,
     }),
   };
 }
