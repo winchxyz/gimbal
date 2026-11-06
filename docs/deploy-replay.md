@@ -33,12 +33,15 @@ token or account can reach it even if one were set on the service. Its process i
   `dns.Resolver`) for a name or address that is not this machine;
 - UDP (`dgram`) send and connect to an address that is not loopback.
 
-A refusal never crashes the engine (a socket with no error listener gets a quiet one). A line `hosted replay: ...
-refused` in the log would mean a replay path tried the network and was stopped. Not covered: a child process the
+A refusal never crashes the engine (a socket with no error listener gets a quiet one). A line
+`hosted replay: <what> refused (the replay reads fixtures only)` in the log would mean a replay path tried the network
+and was stopped. The engine's startup line `hosted replay: outbound connections refused in this process (loopback
+only)` is expected: it says the guard is on. Not covered: a child process the
 engine might spawn (it spawns none in replay) and native addons (it loads none). Nothing is signed or sent: replay has
 no contract client, and its 1Click steps play recorded answers.
 
-**Read-only for visitors.** The page is built with `VITE_HOSTED_REPLAY=1` (only `Dockerfile.replay` sets it): it
+**Read-only for visitors.** The page is built with `VITE_HOSTED_REPLAY=1`, set by `Dockerfile.replay` and by the host
+itself when it builds the page at start (what runs on Railway); nothing else sets it. It
 leaves out Close position, Change my minimum, the owner's status buttons, rotating, Exit replay, Connect wallet and the
 set-up flow, keeps Run a stress test on Rescue, and says "Public replay: read-only. Run it yourself with npm run demo."
 under the header. Every other build (`npm run demo`, the live dashboard) is unchanged. The public port refuses, before they reach the engine, `PUT /strategy`, `POST /rotate`,
@@ -84,10 +87,11 @@ override values from the dashboard". So:
 - `build.dockerfilePath: "Dockerfile"` in `railway.json` overrides the `RAILWAY_DOCKERFILE_PATH` variable: the replay
   service builds the live `Dockerfile`, whose `CMD` is `serve.ts`. Left at that, the domain answers 502;
 - `railway.json` sets no `startCommand`, so the dashboard's **Custom Start Command** applies, and it is what makes the
-  service the hosted replay (step 3). On the live image the host finds no hosted `web/dist` and builds the hosted
-  dashboard once at start (about a minute), then serves;
-- the `deploy` block applies to the replay service too: `restartPolicyType: ALWAYS` (also right for it),
-  `drainingSeconds: 180`, `overlapSeconds: 0`;
+  service the hosted replay (step 3). The live image has no `web/dist`, so on every container start the host builds
+  the hosted dashboard (under a second on 2026-11-06), then serves;
+- the `deploy` block (`restartPolicyType: ALWAYS`, `drainingSeconds: 180`, `overlapSeconds: 0`) should apply to the
+  replay service as the `build` block did; this was not checked, see **Settings → Deploy**. Either restart policy,
+  `ALWAYS` or the default on failure, restarts the host, because it exits with code 1 after five runs in a row fail;
 - there is no `railway.replay.json`: Config as Code is deprecated, and the start command needs no change to
   `railway.json` or the Dockerfiles. After 2026-12-01 the root file stops being read and the variable from step 2
   would take effect (`Dockerfile.replay`, same start command); the replay is planned to stop before that;
@@ -100,7 +104,9 @@ override values from the dashboard". So:
 
 1. Create a **separate Railway project** for it (**New Project → Deploy from GitHub repo → winchxyz/gimbal**), not a
    service inside the live engine's project: no shared variable, volume or setting of the live project can reach it
-   (the host would not pass a variable on anyway), and deleting it later cannot touch the live service.
+   (the host would not pass a variable on anyway), and deleting it later cannot touch the live service. Deploying
+   from the repo starts a first deploy at once; it runs the live image's `serve.ts` and fails until step 3 is set.
+   That is expected: finish steps 2 to 6, then deploy again (step 7).
 2. The new service → **Variables**: add exactly one, `RAILWAY_DOCKERFILE_PATH` = `Dockerfile.replay`. Nothing else: no
    `GIMBAL_*`, no key, no token. Railway sets `PORT` itself. The variable is harmless but does not take effect while
    the root `railway.json` sets `dockerfilePath` (see [Config as code](#config-as-code-the-root-railwayjson-decides-the-dockerfile));
@@ -108,24 +114,28 @@ override values from the dashboard". So:
 3. **Settings → Deploy → Custom Start Command**: `node engine/src/cli/replay-host.ts`. **This is the step that makes
    it the hosted replay.** Without it the service runs the live image's `CMD` (`serve.ts`) and the domain answers 502.
    The host serves `web/dist` only when it is the hosted build (its `index.html` carries
-   `<meta name="gimbal-build" content="hosted-replay">`); the live image has none, so the first start logs
-   `web/dist is missing: building the hosted dashboard once (production build)` and serves about a minute later.
-4. **Settings → Deploy → Healthcheck Path**: `/healthz` (the default 300 s timeout is plenty for the one-minute
-   dashboard build; the first run serves about 5 s after that).
-5. **Settings → Networking → Public Networking → Generate Domain**. That URL is the hosted demo.
-6. No volume, one replica, any region (it calls no venue). The restart policy comes from `railway.json`
-   (`ALWAYS`), which is right: the host exits after five runs in a row fail, and Railway starts it again.
+   `<meta name="gimbal-build" content="hosted-replay">`); the live image has no `web/dist`, so every container start
+   logs `web/dist is missing: building the hosted dashboard once (production build)` and builds it before serving.
+   The build is fast: on 2026-11-06 vite reported "built in 229ms", and `run 1: starting the replay engine` came about
+   0.4 s after the missing line.
+4. **Settings → Deploy → Healthcheck Path**: `/healthz` (the default 300 s timeout is plenty: the page builds in under
+   a second and the first run serves about 5 s after that).
+5. **Settings → Networking → Public Networking → Generate Domain**, with the port the host serves on: Railway's
+   `PORT` (the host's default is 8080; it was 8080 on 2026-11-06). Step 7's log line `hosted replay on
+   http://0.0.0.0:<port>` confirms it. That URL is the hosted demo.
+6. No volume, one replica, any region (it calls no venue). The restart policy should come from `railway.json`
+   (`ALWAYS`; check **Settings → Deploy**). Either that or the default on failure is right: the host exits with code 1
+   after five runs in a row fail, and Railway starts it again.
 7. Deploy, then read the log: `recording engine/fixtures/replay/scan-mainnet-2026-10-31T16.jsonl.gz: ... one run plays
    385 s`, `engine environment: N system variables kept, the host's other M not passed on` (2 system variables on
    Railway), `hosted replay on http://0.0.0.0:<port>`, `run 1: serving; the next run starts in 430 s`,
-   the engine's `hosted replay: outbound connections refused in this process (loopback only)` (the guard is on), and
-   every 430 s `run N: serving` followed by `run N-1: stopped`. No line should say `hosted replay: ... refused (the
-   replay reads fixtures only)`: that one would mean a replay path tried the network.
+   the engine's `hosted replay: outbound connections refused in this process (loopback only)` (expected: the guard is
+   on), and every 430 s `run N: serving` followed by `run N-1: stopped`. No line should say
+   `hosted replay: <what> refused (the replay reads fixtures only)`: that one would mean a replay path tried the network.
 8. **Check the domain's port**, then open it. **Settings → Networking → Public Networking**: the domain's target port
-   must be the port in the log line `hosted replay on http://0.0.0.0:<port>` (Railway sets `PORT`; it was 8080 on
-   2026-11-06, but read it from the log). A domain generated while another program ran (for example before step 3 took
-   effect) can point at a different port and keeps answering 502 ("Application failed to respond") even after the
-   host serves: edit the domain's port to the one in the log.
+   must be the port in the log line `hosted replay on http://0.0.0.0:<port>`. If it differs (a domain generated with
+   another port, or while another program ran), the domain keeps answering 502 ("Application failed to respond")
+   even after the host serves: edit the domain's port to the one in the log.
    Open the domain: the header says Replay with the replay clock, the line under it "Public replay: read-only";
    within a minute the Desk shows two SOL legs, with no Close position button. Quick checks from a shell:
    `GET /healthz` is 200 with `{"ok":true,...}`; the page carries `<meta name="gimbal-build" content="hosted-replay">`;
