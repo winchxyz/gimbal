@@ -79,6 +79,8 @@ export interface LegInput {
   /** USD per base unit; null: derived from the position. */
   markPx: number | null;
   feesUsd: number;
+  /** The position book's position whose fill fees feesUsd holds (live, sources.ts); absent otherwise. */
+  feesPositionId?: string;
   unpriced: boolean;
 }
 
@@ -442,6 +444,7 @@ export class RiskEngine {
       fundingEarnedUsd: p.fundingSinceOpenUsd,
       unsettledFundingUsd: p.unsettledFundingUsd,
       feesUsd: input.feesUsd,
+      ...(input.feesPositionId === undefined ? {} : { feesPositionId: input.feesPositionId }),
       unpriced: input.unpriced,
     };
     return { leg, risk, lines, level, freeMarginUsd: input.account.freeMarginUsd, readAt };

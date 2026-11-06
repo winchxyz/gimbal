@@ -90,7 +90,7 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
   const { shown: days, fold } = useMemo(() => (expanded ? { shown: groups, fold: null } : foldOlder(groups)), [groups, expanded]);
 
   const replay = desk?.mode === 'replay';
-  const attribution = attributionOf(desk?.pnl ?? null, shown);
+  const attribution = attributionOf(desk?.pnl ?? null, shown, desk?.legs ?? []);
   const costs = costsUsd(attribution);
 
   const showNew = () => {

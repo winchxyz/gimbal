@@ -315,6 +315,35 @@ test('where the money went: the desk’s funding, fees and price, and the journa
   assert.equal(Math.round(small.otherUsd * 100) / 100, -0.25);
 });
 
+test('a fill fee read from the venue later counts once: in the desk P&L while a leg names its position, else under fees', () => {
+  const r = (x: number | null) => (x === null ? null : Math.round(x * 1e6) / 1e6);
+  const P = 'xlm-phoenix-hyperliquid@2026-11-06T10:00:00Z';
+  const readFee = entry({ kind: 'fee', numbers: { usd: -0.03, position: P, venue: 'phoenix', symbol: 'XLM', stage: 'enter', fills: 1, fillFee: 1 } });
+  const moveFee = entry({ kind: 'fee', numbers: { usd: -0.32, from: 'phoenix', to: 'hyperliquid', movedUsd: 100, position: P } });
+  const journal = [readFee, moveFee];
+  // Open: the live desk's Phoenix leg names the position, its fees (-0.05 recorded, -0.03 read) already hold the read one.
+  const open: DeskState['pnl'] = { fundingUsd: 0.02, feesUsd: -0.08, priceUsd: 0, netUsd: -0.06 };
+  const held = [{ venue: 'hyperliquid' as const, feesPositionId: P }, { venue: 'phoenix' as const, feesPositionId: P }];
+  const a = attributionOf(open, journal, held);
+  assert.deepEqual([r(a.feesUsd), r(a.otherUsd), r(a.netUsd)], [-0.08, -0.32, -0.38]);
+  // A margin move's fee is not a fill's: it stays in the other costs (the desk P&L never holds it).
+  assert.equal(r(attributionOf(open, [moveFee], held).otherUsd), -0.32);
+  // Closed (the desk flat, no leg names it): the read fee counts from its entry, under fees, still once.
+  const flat: DeskState['pnl'] = { fundingUsd: 0, feesUsd: 0, priceUsd: 0, netUsd: 0 };
+  const b = attributionOf(flat, journal, []);
+  assert.deepEqual([r(b.feesUsd), r(b.otherUsd), r(b.netUsd)], [-0.03, -0.32, -0.35]);
+  // A leg on another venue, or one naming another position, does not hold it.
+  assert.equal(r(attributionOf(flat, [readFee], [{ venue: 'hyperliquid', feesPositionId: P }]).feesUsd), -0.03);
+  assert.equal(r(attributionOf(flat, [readFee], [{ venue: 'phoenix', feesPositionId: 'sol@1' }]).feesUsd), -0.03);
+  assert.equal(r(attributionOf(flat, [readFee], [{ venue: 'phoenix' }]).feesUsd), -0.03, 'a leg with no book position');
+  // A close's read fee is never in the desk's open legs.
+  const closeFee = entry({ kind: 'fee', numbers: { usd: -0.04, position: P, venue: 'phoenix', stage: 'exit', fills: 1, fillFee: 1 } });
+  assert.equal(r(attributionOf(flat, [closeFee], held).feesUsd), -0.04);
+  // An entry written before the tag: its `fills` count says it is a fill's fee.
+  const untagged = entry({ kind: 'fee', numbers: { usd: -0.03, position: P, venue: 'phoenix', stage: 'enter', fills: 1 } });
+  assert.deepEqual([r(attributionOf(open, [untagged], held).feesUsd), r(attributionOf(open, [untagged], held).otherUsd)], [-0.08, 0]);
+});
+
 test('Since names the oldest entry the page holds', () => {
   assert.equal(sinceLabel(MOCKUP), 'Since 24 Oct');
   assert.equal(sinceLabel([]), null);

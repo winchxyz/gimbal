@@ -492,6 +492,58 @@ test('partial fills: an act that did not end as asked is booked; its fills count
   assert.match(bookReport(sum), /stray fills 1 act\(s\) that left no position: fees -0\.0400, price -0\.5000/);
 });
 
+test('open leg fees (the live desk\'s): the open position\'s entry and partial fills per venue; unknown left out; none once closed', async () => {
+  const s = bookAt(tempDir(dirs), T0 + 20 * 60_000);
+  const xlm = (symbol: string) => symbol === 'XLM';
+  const usd = (venue: string, side: 'long' | 'short', matches: (symbol: string) => boolean = xlm) => s.book.openLegFees(venue, side, matches)?.usd ?? null;
+  assert.equal(s.book.openLegFees('hyperliquid', 'short', xlm), null, 'nothing booked');
+  s.book.record(enterXlm());
+  const xlmId = positionIdOf(XLM, enterXlm().at);
+  // The entry's fills only: the 0.32 margin move is a transfer cost, not a leg's fee. The leg names its position.
+  assert.equal(s.book.openLegFees('hyperliquid', 'short', xlm)!.positionId, xlmId);
+  close(usd('hyperliquid', 'short')!, -0.15, 'hyperliquid open');
+  close(usd('phoenix', 'long')!, -0.05, 'phoenix open');
+  // The book's Hyperliquid leg is short and its Phoenix leg long: a venue position on the other side is not this one's.
+  assert.equal(usd('hyperliquid', 'long'), null, 'a long on Hyperliquid');
+  assert.equal(usd('phoenix', 'short'), null, 'a short on Phoenix');
+  assert.equal(usd('orderly', 'short'), null, 'no leg on that venue');
+  assert.equal(usd('hyperliquid', 'short', (symbol) => symbol === 'SOL'), null, 'another symbol');
+  // A partial fill on the open position adds to its venue's leg only (the cached index follows the new event).
+  s.clock.set(T0 + 5 * H);
+  s.book.record({
+    kind: 'fill', windowId: XLM, symbol: 'XLM', at: T0 + 5 * H, legs: [{ venue: 'hyperliquid', side: 'BUY', qty: '1000', avgPx: 0.2495, feeUsd: 0.04 }],
+    feeUsd: 0.04, tx: [], forecastNetAprPct: null, exitReason: 'one leg did not fill', rotation: null, by: 'auto', marginMoves: [],
+  });
+  close(usd('hyperliquid', 'short')!, -0.19, 'open and the partial fill');
+  close(usd('phoenix', 'long')!, -0.05, 'phoenix unchanged');
+  // Closed: no open position, so the live desk keeps 0 for any XLM leg left on a venue.
+  s.clock.set(exitXlm().at);
+  s.book.record(exitXlm());
+  assert.equal(usd('hyperliquid', 'short'), null);
+  // SOL: Phoenix did not report its fill's fee, so that leg shows none until the venue's is read; never a guess.
+  s.clock.set(enterSol().at);
+  s.book.record(enterSol());
+  const sol = (symbol: string) => symbol === 'SOL';
+  close(usd('hyperliquid', 'short', sol)!, -0.1, 'hyperliquid SOL');
+  assert.equal(usd('phoenix', 'long', sol), 0, 'unknown fee left out');
+  // Adopted (opened outside the loop): no opening fills booked, so 0, not null.
+  const a = bookAt(tempDir(dirs), T0);
+  a.book.adopt({ windowId: XLM, symbol: 'XLM', since: T0, legs: [{ venue: 'hyperliquid', side: 'short', qty: '74' }, { venue: 'phoenix', side: 'long', qty: '74' }] });
+  assert.equal(a.book.openLegFees('hyperliquid', 'short', xlm)?.usd, 0);
+});
+
+test('open leg fees: a fill fee the venue gave later counts once it is read, and its fee entry says it is a fill\'s', async () => {
+  const { book, journal } = await rotated(tempDir(dirs), async () => 0.03);
+  const sol = book.openLegFees('phoenix', 'long', (symbol) => symbol === 'SOL')!;
+  close(sol.usd, -0.03, 'read from Phoenix');
+  // The read fee's journal entry names the position the desk leg names, and is tagged a fill's fee; a margin move's
+  // fee entry is not.
+  const read = journal.find((j) => j.kind === 'fee' && j.numbers.venue === 'phoenix' && j.numbers.stage === 'enter')!;
+  assert.deepEqual([read.numbers.fillFee, read.numbers.position, read.numbers.symbol], [1, sol.positionId, 'SOL']);
+  const move = journal.find((j) => j.kind === 'fee' && j.numbers.from === 'phoenix')!;
+  assert.equal(move.numbers.fillFee, undefined);
+});
+
 test('transfers: addTransfer ties one to the open position or to the desk; the Hyperliquid ledger books the desks', async () => {
   const { book, journal } = await rotated(tempDir(dirs));
   const sol = book.summary().positions[1]!;
