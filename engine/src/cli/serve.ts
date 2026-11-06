@@ -57,7 +57,8 @@
 // adopted from the loop's own record), its funding from the venues' own ledgers (synced at start, with a catch-up from
 // the last read, and every hour after the funding time), fees and transfers, in book-<mode>-<contract>-<desk>.jsonl
 // plus a .summary.json next to the loop state. Read only: the sync calls public ledger endpoints and signs nothing. The
-// loop's enter and exit journal entries carry the book's numbers; `npm run report` prints it.
+// loop's enter and exit journal entries carry the book's numbers; `npm run report` prints it. The desk's leg fees (the
+// desk P&L's fees, and the loop's held P&L) are the fills' fees the book booked for the open position (bookLegFees).
 // The monitor (src/risk/monitor.ts): every 30 min the legs, their distance to liquidation and the net; an alert to the
 // journal and the console when a leg is under 25 % from liquidation. `npm run monitor -w engine -- --mainnet` is the
 // one-shot form.
@@ -122,7 +123,7 @@ import type { NearContractClient } from '../contract/near-client.ts';
 import { startEgressLog } from './serve-egress.ts';
 import { controlFromEnv, loopbackCall } from './serve-control.ts';
 import type { LoopAccount } from './serve-loop.ts';
-import { loopBook, loopGates, serveLoop } from './serve-loop.ts';
+import { bookLegFees, loopBook, loopGates, serveLoop } from './serve-loop.ts';
 import { ConfigError, retryStart } from './start-errors.ts';
 import type { PositionBook } from '../book/book.ts';
 import { createBook } from '../book/book.ts';
@@ -357,6 +358,9 @@ const publish = (event: StreamEvent) => {
 };
 let deskSource: DeskSource | null = null;
 let replayDesk: ReplayDesk | null = null;
+// The position book, created further down (with the loop's state): declared here for the desk source's fees, which ask
+// it at each read (null until then, and with --once).
+let book: PositionBook | null = null;
 // panic_close: every get_desk read tells it whether the desk is closing (rescue/closing.ts).
 let closingWatch: ClosingWatch | null = null;
 // The rescuer's shutdown (serve-rescue.ts stop) and the id of the rescue running, for the shutdown's wait.
@@ -421,6 +425,8 @@ if (mode === 'replay') {
   let pausedSince: number | null = null;
   deskSource = new AccountsDeskSource({
     deskId: deskId!, owner: side.desk.owner, contract: side.client.contractId, accounts, log,
+    // The account reads carry no fees: the book's for the open position (0 until the book is created, and without one).
+    fees: bookLegFees(() => book),
     desk: async () => {
       const view = await side.client.getDesk(deskId!);
       if (view === null) throw new Error(`get_desk(${deskId}) answered null`);
@@ -543,8 +549,8 @@ const gates = loopGates({
 // The position book: next to the loop state. An unreadable book file is never started over: serve runs without the
 // book (the loop trades as before) and says so, until the owner fixes or moves the file. It does not wait for the
 // pair (review S1): with the pair's start not confirmed the book still loads, holds what the loop's own record holds,
-// and syncs the venue ledgers on its own timer (a failed sync is logged and tried at the next one).
-let book: PositionBook | null = null;
+// and syncs the venue ledgers on its own timer (a failed sync is logged and tried at the next one). `book` is declared
+// above the desk source.
 if (contract !== null && deskId !== null) {
   try {
     book = createBook({

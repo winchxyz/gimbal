@@ -1,12 +1,17 @@
 // AccountsDeskSource: every open position on the desk's accounts is a leg; a failed account read is reported with
-// how long it took, and the others still come in; a read held up by a venue's request budget gives up at its deadline.
+// how long it took, and the others still come in; a read held up by a venue's request budget gives up at its deadline;
+// a leg's fees are the book's for its open position (the `fees` option), else 0.
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { DeskState } from '@gimbal/shared';
+import { DEFAULT_STRATEGY } from '../scanner/config.ts';
 import { HostBudget, PHOENIX_BUDGET, readClass } from '../venues/http-budget.ts';
 import type { AccountState } from '../venues/venue.ts';
+import { RiskEngine } from './engine.ts';
+import type { AccountsDeskSourceOptions } from './sources.ts';
 import { ACCOUNT_READ_DEADLINE_MS, AccountsDeskSource } from './sources.ts';
+import { VenueHealth } from './venue-health.ts';
 
 test('an account read past its deadline fails that venue for the tick: the snapshot is not held up', async () => {
   // A Phoenix budget in a cool-down that a critical read would wait out (10 s), and a reader that never answers.
@@ -67,6 +72,73 @@ test('accounts: open positions become legs, a flat one does not, a failed read i
   assert.deepEqual(snap.legs.map((l) => [l.venue, l.symbol, l.position.size, l.lotSize]), [['hyperliquid', 'ETH', -1, 1e-4]]);
   assert.equal(snap.reserveUsd, 12.5);
   assert.deepEqual(snap.reads.map((r) => [r.venue, r.error]), [['hyperliquid', null], ['phoenix', 'phoenix trader: 503']]);
+});
+
+/** The live XLM pair: short 74 on Hyperliquid, long 74 on Phoenix, marked at entry; plus an ETH short the book never entered. */
+function xlmAccounts(): AccountsDeskSourceOptions['accounts'] {
+  const position = (symbol: string, size: number, entryPx: number, fundingSinceOpenUsd: number) => ({
+    symbol, size, entryPx, liqPx: null, marginUsd: 10, unrealizedPnlUsd: 0, leverage: 1, fundingSinceOpenUsd, unsettledFundingUsd: 0,
+  });
+  const hl: AccountState = {
+    venue: 'hyperliquid', address: '0xdesk', time: 1, equityUsd: 20, freeMarginUsd: 10, maintenanceMarginUsd: 0.5,
+    positions: [position('XLM', -74, 0.27, 0.004), position('ETH', -0.001, 3000, 0)],
+  };
+  const px: AccountState = {
+    venue: 'phoenix', address: 'Auth111', time: 1, equityUsd: 20, freeMarginUsd: 10, maintenanceMarginUsd: 0.5, positions: [position('XLM', 74, 0.27, -0.001)],
+  };
+  return [
+    { reader: { id: 'hyperliquid', account: async () => hl }, address: '0xdesk' },
+    { reader: { id: 'phoenix', account: async () => px }, address: 'Auth111' },
+  ];
+}
+
+async function deskOf(source: AccountsDeskSource): Promise<DeskState> {
+  let t = 1_000_000;
+  const risk = new RiskEngine({
+    mode: 'mainnet', source, strategy: () => DEFAULT_STRATEGY, health: new VenueHealth(), publish: () => {}, clock: { now: () => (t += 5_000) },
+  });
+  try {
+    return (await risk.tick())!;
+  } finally {
+    await risk.stop();
+  }
+}
+
+test('live legs carry the fees the book booked for the open position: in each leg, pnl.feesUsd and pnl.netUsd', async () => {
+  const asked: string[] = [];
+  const booked: Record<string, number> = { 'hyperliquid XLM': -0.0041, 'phoenix XLM': -0.0027 };
+  const d = await deskOf(new AccountsDeskSource({
+    deskId: 'alpha', owner: 'owner.near', contract: 'gimbal.near', accounts: xlmAccounts(),
+    fees: (venue, symbol) => {
+      asked.push(`${venue} ${symbol}`);
+      return booked[`${venue} ${symbol}`] ?? null;
+    },
+  }));
+  assert.deepEqual(asked, ['hyperliquid XLM', 'hyperliquid ETH', 'phoenix XLM']);
+  assert.deepEqual(d.legs.map((l) => [l.venue, l.symbol, l.feesUsd]), [['hyperliquid', 'XLM', -0.0041], ['hyperliquid', 'ETH', 0], ['phoenix', 'XLM', -0.0027]]);
+  const near = (a: number, b: number, what: string) => assert.ok(Math.abs(a - b) < 1e-12, `${what}: ${a} vs ${b}`);
+  near(d.pnl.feesUsd, -0.0068, 'fees');
+  near(d.pnl.fundingUsd, 0.003, 'funding');
+  near(d.pnl.netUsd, 0.003 - 0.0068 + d.pnl.priceUsd, 'net');
+});
+
+test('live legs with no book, no open position booked, or a book that throws: fees 0, nothing invented', async () => {
+  const base = { deskId: 'alpha', owner: 'owner.near', contract: 'gimbal.near' };
+  const lines: string[] = [];
+  const sources = {
+    'no book (monitor)': new AccountsDeskSource({ ...base, accounts: xlmAccounts() }),
+    'book not loaded yet, or nothing open': new AccountsDeskSource({ ...base, accounts: xlmAccounts(), fees: () => null }),
+    'not a number': new AccountsDeskSource({ ...base, accounts: xlmAccounts(), fees: () => Number.NaN }),
+    'throws': new AccountsDeskSource({ ...base, accounts: xlmAccounts(), log: (l) => lines.push(l), fees: () => { throw new Error('book: torn line'); } }),
+  };
+  for (const [what, source] of Object.entries(sources)) {
+    const d = await deskOf(source);
+    assert.deepEqual(d.legs.map((l) => l.feesUsd), [0, 0, 0], what);
+    assert.equal(d.pnl.feesUsd, 0, what);
+    assert.equal(d.pnl.netUsd, d.pnl.fundingUsd + d.pnl.priceUsd, what);
+  }
+  // Logged once per message, not once per leg and tick.
+  assert.deepEqual(lines, ['risk: the hyperliquid XLM leg\'s fees could not be read from the book, shown as 0: book: torn line']);
 });
 
 test('the reserve and the pause are read again with every snapshot; a read that throws keeps the last answer', async () => {

@@ -17,7 +17,7 @@ import { systemClock } from '../venues/venue.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { BookSummary, PositionResult } from './derive.ts';
 import {
-  HOUR_MS, indexBook, openPosition, positionIdOf, positionResult, positionsOf, summarize, unsettledJournals,
+  HOUR_MS, indexBook, openLegFeesUsd, openPosition, positionIdOf, positionResult, positionsOf, summarize, unsettledJournals,
 } from './derive.ts';
 import { entryNumbers, exitNumbers, feeJournal, fundingJournal, settledJournal, settlingNote, transferJournal } from './journal.ts';
 import { FILL_WINDOW_SLACK_MS } from './sources.ts';
@@ -651,6 +651,14 @@ export class PositionBook {
     const ix = indexBook(this.events, this.#cursors);
     const p = ix.all.find((x) => x.id === positionId);
     return p === undefined ? null : positionResult(p, ix, this.#clock.now());
+  }
+
+  /**
+   * The fill fees booked for the open position's leg on `venue` whose symbol `matches` (derive.ts openLegFeesUsd),
+   * signed (a cost < 0); null with no such open position. The live desk's leg fees (risk/sources.ts).
+   */
+  openLegFees(venue: string, matches: (symbol: string) => boolean): number | null {
+    return openLegFeesUsd(this.events, venue, matches);
   }
 
   /** What serve merges into the loop's enter (or rotate) journal entry. */

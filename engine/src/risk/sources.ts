@@ -7,6 +7,11 @@
 // read has a
 // deadline (ACCOUNT_READ_DEADLINE_MS): past it that venue's read fails for this tick instead of holding the tick up.
 // Phoenix legs are marked with marks up to 5 s old (phoenix.ts MARKS_MAX_AGE_MS), refreshed between ticks.
+// The account reads carry no fees: a leg's fees (the desk P&L's `feesUsd`) come from the position book (`fees`
+// option; serve: PositionBook.openLegFees through serve-loop.ts bookLegFees): the fills' fees it booked for the open
+// position's leg on that venue and symbol, the entry's and those of later acts on it while open, a cost < 0. With no
+// book, no open position booked for the leg (one opened by hand and not adopted yet) or a fee the book has not read
+// yet, that part is 0: nothing is estimated. monitor (cli/monitor.ts) has no book: its legs show fees 0.
 //
 // ReplayDesk (replay): there are no recorded accounts, so the desk is simulated: REPLAY_DEPOSIT_USD deposited,
 // REPLAY_VENUE_CASH_USD of it on each of Hyperliquid and Phoenix and the rest in the reserve, flat at the start. The
@@ -42,6 +47,11 @@ export interface AccountsDeskSourceOptions {
   deskWaitMs?: number;
   /** Default ACCOUNT_READ_DEADLINE_MS. */
   readDeadlineMs?: number;
+  /**
+   * A leg's trading fees, signed (a cost < 0): serve passes what the position book booked for the open position's leg
+   * on that venue and symbol (PositionBook.openLegFees). Null, absent, not a number or a throw: 0 (nothing invented).
+   */
+  fees?: (venue: VenueId, symbol: string) => number | null;
 }
 
 /** A snapshot waits this long for the desk view (get_desk) before it goes on with the last answer. */
@@ -62,6 +72,7 @@ export class AccountsDeskSource implements DeskSource {
   #deskAt: number | null = null;
   #deskError: string | null = null;
   #deskRead: { promise: Promise<void>; since: number } | null = null;
+  #feesError: string | null = null;
 
   constructor(options: AccountsDeskSourceOptions) {
     this.#o = options;
@@ -87,7 +98,7 @@ export class AccountsDeskSource implements DeskSource {
         if (position.size === 0) continue;
         legs.push({
           venue: r.venue, symbol: position.symbol, lotSize: this.#o.lotSize?.(r.venue, position.symbol) ?? 1e-8,
-          account: r.account, position, markPx: null, feesUsd: 0, unpriced: false,
+          account: r.account, position, markPx: null, feesUsd: this.#fees(r.venue, position.symbol), unpriced: false,
         });
       }
     }
@@ -103,6 +114,20 @@ export class AccountsDeskSource implements DeskSource {
       reads: reads.map(({ venue, ms, error }) => ({ venue, ms, error })),
       ...(this.#o.desk === undefined ? {} : { deskView: { at: this.#deskAt, error: late ?? this.#deskError } }),
     };
+  }
+
+  /** The `fees` option's answer for a leg, else 0; a throw is logged once per message. */
+  #fees(venue: VenueId, symbol: string): number {
+    if (this.#o.fees === undefined) return 0;
+    try {
+      const usd = this.#o.fees(venue, symbol);
+      return usd !== null && Number.isFinite(usd) ? usd : 0;
+    } catch (err) {
+      const message = errorMessage(err);
+      if (this.#feesError !== message) this.#o.log?.(`risk: the ${venue} ${symbol} leg's fees could not be read from the book, shown as 0: ${message}`);
+      this.#feesError = message;
+      return 0;
+    }
   }
 
   /** Starts a desk view read unless one is out, and waits for it at most deskWaitMs (see the option). */

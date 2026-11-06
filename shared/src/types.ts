@@ -134,7 +134,8 @@ export interface Leg {
   marginRatio: number;            // maintenance margin ÷ margin, a fraction: 0.31 = 31 %, 1 = liquidation
   distanceToLiqPct: number | null;   // how far mark must move to reach liqPx, in percent: 32.6 = 32.6 %
   fundingEarnedUsd: number; unsettledFundingUsd: number;
-  feesUsd: number;                // trading fees paid on this leg since it opened (≤ 0)
+  feesUsd: number;                // trading fees paid on this leg since it opened (≤ 0); live: what the engine's
+                                  // position book booked for the open position's fills, 0 when it booked none
   unpriced: boolean;              // opened under policy.unpriced: no oracle price band
 }
 

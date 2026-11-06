@@ -566,6 +566,21 @@ function entryNotional(fills: readonly BookFill[]): number | null {
   return sum([...byVenue.values()]) / byVenue.size;
 }
 
+/**
+ * The fill fees booked so far on `venue` for the open position whose symbol `matches` (the latest one if several, which
+ * the loop never makes): the entry's (none for an adopted position) and those of acts on it that did not end as asked,
+ * signed (a cost < 0, a rebate > 0). A fee neither the record nor the venue gave yet is left out, never guessed. Null
+ * when no open position has a leg on `venue` with a matching symbol. What the live desk shows as a leg's fees.
+ */
+export function openLegFeesUsd(events: readonly BookEvent[], venue: string, matches: (symbol: string) => boolean): number | null {
+  const p = positionsOf(events).findLast((q) => q.exit === null && matches(q.symbol) && q.legs.some((l) => l.venue === venue));
+  if (p === undefined) return null;
+  const fees = new Map<string, number>();
+  for (const e of events) if (e.type === 'fee') fees.set(feeKey(e.positionId, e.recordAt, e.index), e.usd);
+  const entry = p.enter.adopted ? 0 : recordFees(p.enter.record, p.id, fees, venue).usd;
+  return entry + sum(p.fills.map((f) => recordFees(f.record, p.id, fees, venue).usd));
+}
+
 /** Fill records with no position (a failed open that left the desk flat): their fees and cash flow. */
 export function strayFills(events: readonly BookEvent[], fees: Map<string, number>): StrayFills {
   const records = events.filter((e): e is FillEvent => e.type === 'fill' && e.positionId === null).map((e) => e.record);

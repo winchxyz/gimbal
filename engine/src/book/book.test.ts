@@ -492,6 +492,45 @@ test('partial fills: an act that did not end as asked is booked; its fills count
   assert.match(bookReport(sum), /stray fills 1 act\(s\) that left no position: fees -0\.0400, price -0\.5000/);
 });
 
+test('open leg fees (the live desk\'s): the open position\'s entry and partial fills per venue; unknown left out; none once closed', async () => {
+  const s = bookAt(tempDir(dirs), T0 + 20 * 60_000);
+  const xlm = (symbol: string) => symbol === 'XLM';
+  assert.equal(s.book.openLegFees('hyperliquid', xlm), null, 'nothing booked');
+  s.book.record(enterXlm());
+  // The entry's fills only: the 0.32 margin move is a transfer cost, not a leg's fee.
+  close(s.book.openLegFees('hyperliquid', xlm)!, -0.15, 'hyperliquid open');
+  close(s.book.openLegFees('phoenix', xlm)!, -0.05, 'phoenix open');
+  assert.equal(s.book.openLegFees('orderly', xlm), null, 'no leg on that venue');
+  assert.equal(s.book.openLegFees('hyperliquid', (symbol) => symbol === 'SOL'), null, 'another symbol');
+  // A partial fill on the open position adds to its venue's leg only.
+  s.clock.set(T0 + 5 * H);
+  s.book.record({
+    kind: 'fill', windowId: XLM, symbol: 'XLM', at: T0 + 5 * H, legs: [{ venue: 'hyperliquid', side: 'BUY', qty: '1000', avgPx: 0.2495, feeUsd: 0.04 }],
+    feeUsd: 0.04, tx: [], forecastNetAprPct: null, exitReason: 'one leg did not fill', rotation: null, by: 'auto', marginMoves: [],
+  });
+  close(s.book.openLegFees('hyperliquid', xlm)!, -0.19, 'open and the partial fill');
+  close(s.book.openLegFees('phoenix', xlm)!, -0.05, 'phoenix unchanged');
+  // Closed: no open position, so the live desk keeps 0 for any XLM leg left on a venue.
+  s.clock.set(exitXlm().at);
+  s.book.record(exitXlm());
+  assert.equal(s.book.openLegFees('hyperliquid', xlm), null);
+  // SOL: Phoenix did not report its fill's fee, so that leg shows none until the venue's is read; never a guess.
+  s.clock.set(enterSol().at);
+  s.book.record(enterSol());
+  const sol = (symbol: string) => symbol === 'SOL';
+  close(s.book.openLegFees('hyperliquid', sol)!, -0.1, 'hyperliquid SOL');
+  assert.equal(s.book.openLegFees('phoenix', sol), 0, 'unknown fee left out');
+  // Adopted (opened outside the loop): no opening fills booked, so 0, not null.
+  const a = bookAt(tempDir(dirs), T0);
+  a.book.adopt({ windowId: XLM, symbol: 'XLM', since: T0, legs: [{ venue: 'hyperliquid', side: 'short', qty: '74' }, { venue: 'phoenix', side: 'long', qty: '74' }] });
+  assert.equal(a.book.openLegFees('hyperliquid', xlm), 0);
+});
+
+test('open leg fees: a fill fee the venue gave later counts once it is read', async () => {
+  const { book } = await rotated(tempDir(dirs), async () => 0.03);
+  close(book.openLegFees('phoenix', (symbol) => symbol === 'SOL')!, -0.03, 'read from Phoenix');
+});
+
 test('transfers: addTransfer ties one to the open position or to the desk; the Hyperliquid ledger books the desks', async () => {
   const { book, journal } = await rotated(tempDir(dirs));
   const sol = book.summary().positions[1]!;

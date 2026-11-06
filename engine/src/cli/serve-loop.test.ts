@@ -19,11 +19,17 @@ import { sizeFor } from '../strategy/decide.ts';
 import { PASSING_RISK_CHECK, STRATEGY, T0, win as deskWin } from '../strategy/test-helpers.ts';
 import { VirtualClock, readRecording } from '../venues/replay.ts';
 import { replayStart } from './serve-replay.ts';
-import { adlGate, depthAtSize, fillsOf, loopGates, loopHands, openGateText, openedQty, protectionText, riskFacts, serveLoop, windowFacts, windowSymbol } from './serve-loop.ts';
+import { adlGate, bookLegFees, depthAtSize, fillsOf, loopGates, loopHands, openGateText, openedQty, protectionText, riskFacts, serveLoop, windowFacts, windowSymbol } from './serve-loop.ts';
 import type { PairAdl, PairHands, ServePair } from './serve-pair.ts';
+import type { PositionBook } from '../book/book.ts';
+import { createBook } from '../book/book.ts';
+import { T0 as BOOK_T0, enterXlm } from '../book/test-helpers.ts';
+import { RiskEngine } from '../risk/engine.ts';
+import { AccountsDeskSource } from '../risk/sources.ts';
+import { VenueHealth } from '../risk/venue-health.ts';
 import { toQty } from '../trade/lots.ts';
 import type { PairResult } from '../trade/pair.ts';
-import type { VenueReader } from '../venues/venue.ts';
+import type { AccountState, VenueReader } from '../venues/venue.ts';
 import type { WindowCarry } from '../scanner/scanner.ts';
 
 const dirs: string[] = [];
@@ -449,6 +455,57 @@ test('loopHands: the held symbol\'s legs only, one leg named, busy() refusing fi
   await demo.open({ window: deskWin('sol-phoenix-hyperliquid'), symbol: 'SOL', legUsd: 12, leverage: 1, qty: '0.12', reason: 'test', demo: { maxLossUsd: 0.25 } });
   await demo.open({ window: deskWin('sol-phoenix-hyperliquid'), symbol: 'SOL', legUsd: 12, leverage: 1, qty: '0.12', reason: 'test' });
   assert.deepEqual(demos, [{ maxLossUsd: 0.25 }, undefined]);
+});
+
+test('serve wiring of the live desk fees: bookLegFees -> AccountsDeskSource -> desk P&L, and the loop\'s held P&L counts them once', async () => {
+  const near = (a: number, b: number, what: string) => assert.ok(Math.abs(a - b) < 1e-12, `${what}: ${a} vs ${b}`);
+  // As serve: the book does not exist yet when the desk source is built; the closure asks it at each read.
+  let book: PositionBook | null = null;
+  const position = (size: number, fundingSinceOpenUsd: number) => ({
+    symbol: 'XLM', size, entryPx: 0.25, liqPx: null, marginUsd: 500, unrealizedPnlUsd: 0, leverage: 2, fundingSinceOpenUsd, unsettledFundingUsd: 0,
+  });
+  const account = (venue: 'hyperliquid' | 'phoenix', p: ReturnType<typeof position>): AccountState => ({
+    venue, address: venue, time: 1, equityUsd: 500, freeMarginUsd: 100, maintenanceMarginUsd: 10, positions: [p],
+  });
+  const source = new AccountsDeskSource({
+    deskId: 'desk-1', owner: 'owner.near', contract: 'gimbal-test.near', fees: bookLegFees(() => book),
+    accounts: [
+      { reader: { id: 'hyperliquid', account: async () => account('hyperliquid', position(-4000, 0.03)) }, address: '0xdesk' },
+      { reader: { id: 'phoenix', account: async () => account('phoenix', position(4000, -0.01)) }, address: 'Auth111' },
+    ],
+  });
+  let t = BOOK_T0;
+  const risk = new RiskEngine({
+    mode: 'mainnet', source, strategy: () => DEFAULT_STRATEGY, health: new VenueHealth(), publish: () => {}, clock: { now: () => (t += 5_000) },
+  });
+  try {
+    let desk = (await risk.tick())!;
+    assert.deepEqual(desk.legs.map((l) => l.feesUsd), [0, 0], 'no book yet: 0');
+    const dir = mkdtempSync(join(tmpdir(), 'gimbal-serve-loop-'));
+    dirs.push(dir);
+    const created = createBook({ dir, mode: 'mainnet', contractId: 'gimbal-test.near', deskId: 'desk-1', sources: null, clock: new VirtualClock(BOOK_T0), log: () => {} });
+    book = created;
+    desk = (await risk.tick())!;
+    assert.deepEqual(desk.legs.map((l) => l.feesUsd), [0, 0], 'a book with nothing open: 0');
+    // The loop enters XLM: 0.15 on Hyperliquid, 0.05 on Phoenix (enterXlm).
+    created.record(enterXlm());
+    desk = (await risk.tick())!;
+    assert.deepEqual(desk.legs.map((l) => [l.venue, l.feesUsd]), [['hyperliquid', -0.15], ['phoenix', -0.05]]);
+    near(desk.pnl.feesUsd, -0.2, 'desk fees');
+    near(desk.pnl.netUsd, 0.03 - 0.01 - 0.2, 'desk net: funding + fees, price 0');
+    // The loop's held P&L reads the same legs: funding 0.02 and the open fees 0.20, once; nothing else subtracts them.
+    const hands = { heldSymbol: () => 'XLM', heldLegs: () => [], blocked: () => null } as unknown as PairHands;
+    const last = desk;
+    near(loopHands(hands, () => last, () => {}).held()!.pnlUsd, 0.02 - 0.2, 'held P&L');
+    // A lower-case or Orderly-style venue symbol names the same booked position.
+    near(bookLegFees(() => created)('hyperliquid', 'xlm')!, -0.15, 'case');
+    const asked: boolean[] = [];
+    bookLegFees(() => ({ openLegFees: (_venue, matches) => { asked.push(matches('XLM'), matches('SOL')); return null; } }))('orderly', 'PERP_XLM_USDC');
+    assert.deepEqual(asked, [true, false]);
+    assert.equal(bookLegFees(() => null)('hyperliquid', 'XLM'), null, 'no book');
+  } finally {
+    await risk.stop();
+  }
 });
 
 test('depth at size: a long walks the asks, a short the bids; the fill\'s distance from the mid in bps, unknown when the levels read do not fill it', () => {
