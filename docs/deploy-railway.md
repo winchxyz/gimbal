@@ -501,6 +501,11 @@ For the dashboard on another machine (the demo video, the owner watching the des
 listener, `engine/src/view/`. It is built on read functions only (`EngineServer.viewSource`), never on the control
 server, so no request to it can reach `PUT /strategy`, `POST /rotate` or `POST /close`.
 
+The public site reads this view too, through its own host (`engine/src/cli/live-host.ts`,
+[deploy-live-view.md](deploy-live-view.md)): the host holds the token server-side, keeps one stream to the view for
+all its visitors and caches the reads, so the public never has the token and never adds load past a few reads a
+second.
+
 **Variables:**
 
 | Name | What |

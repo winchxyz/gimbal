@@ -3,7 +3,7 @@
 // failures, window checks) is written from error messages, and client libraries quote URLs and keys in those. A
 // viewer is someone outside the container, so every string in a payload goes through this before it is sent:
 // - the value of every environment variable whose name says it is a secret (…_KEY, …_SECRET, …_TOKEN, …PRIVATE…),
-//   also without its `ed25519:` / `secp256k1:` prefix, a hex key with or without 0x in any case, and each of these
+//   or is a platform id (RAILWAY_…_ID) or the engine's egress IP (GIMBAL_PUBLIC_IP), also without its `ed25519:` / `secp256k1:` prefix, a hex key with or without 0x in any case, and each of these
 //   URL-encoded or JSON-escaped;
 // - the parts of every URL in the environment that can hold an API key (path segments long enough to be one, the
 //   query, credentials), the URL itself shown only as its origin (redact.ts rpcLabel);
@@ -17,8 +17,12 @@
 
 import { rpcLabel } from '../redact.ts';
 
-/** A variable named like this holds a secret: its whole value is cut wherever it appears. */
-const SECRET_NAME = /(^|_)(KEY|SECRET|TOKEN|PASSWORD|PASSPHRASE|MNEMONIC|SEED)$|PRIVATE/i;
+/**
+ * A variable named like this holds a secret: its whole value is cut wherever it appears. The platform's own ids
+ * (RAILWAY_PROJECT_ID, RAILWAY_SERVICE_ID, …) and the engine's egress IP (GIMBAL_PUBLIC_IP) are not secrets, but
+ * they say nothing a viewer needs, so they are cut too.
+ */
+const SECRET_NAME = /(^|_)(KEY|SECRET|TOKEN|PASSWORD|PASSPHRASE|MNEMONIC|SEED)$|PRIVATE|^RAILWAY_[A-Z0-9_]*_ID$|^GIMBAL_PUBLIC_IP$/i;
 /** Shorter values are not cut by name: "1" or "true" would cut every digit or word out of the payload. */
 const MIN_SECRET_LENGTH = 8;
 /** A URL path segment at least this long may be an API key (…/v2/<key>); shorter ones are words such as "mainnet". */

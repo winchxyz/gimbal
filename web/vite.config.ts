@@ -62,11 +62,14 @@ const refusalTests = (): Plugin => ({
 });
 
 // The hosted replay's build (Dockerfile.replay, VITE_HOSTED_REPLAY=1) marks its index.html, so the host
-// (engine/src/cli/replay-host.ts) can tell it from the normal build. Every other build is left as it was.
+// (engine/src/cli/replay-host.ts) can tell it from the normal build. So does the public live view's build
+// (engine/src/cli/live-host.ts, VITE_HOSTED_LIVE=1), with its own marker. Every other build is left as it was.
 const hostedMarker = (): Plugin => ({
   name: 'gimbal-hosted-marker',
   transformIndexHtml: (html) =>
-    process.env.VITE_HOSTED_REPLAY === '1' ? html.replace('<head>', '<head>\n<meta name="gimbal-build" content="hosted-replay">') : html,
+    process.env.VITE_HOSTED_LIVE === '1'
+      ? html.replace('<head>', '<head>\n<meta name="gimbal-build" content="hosted-live">')
+      : process.env.VITE_HOSTED_REPLAY === '1' ? html.replace('<head>', '<head>\n<meta name="gimbal-build" content="hosted-replay">') : html,
 });
 
 export default defineConfig({

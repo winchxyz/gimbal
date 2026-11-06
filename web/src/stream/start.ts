@@ -4,8 +4,8 @@ import { httpApi, readEngineState, type EngineApi } from './api.ts';
 import { pickFakeDesk, pickFakeDrift, pickFakeMode, pickFakeRescue, pickFakeScenario, resolveSource } from './source.ts';
 import type { Source } from './store.ts';
 import { reportProblem } from '../remote/problem.ts';
-import { remoteSettings } from '../remote/readonly.ts';
-import { lockedApi, remoteApi, startRemoteStream } from '../remote/stream.ts';
+import { isHostedLive, remoteSettings } from '../remote/readonly.ts';
+import { lockedApi, readOnlyApi, remoteApi, startRemoteStream } from '../remote/stream.ts';
 import { ViewError } from '../remote/view.ts';
 
 /** How long the page waits for the engine to answer before it falls back to the fake (development only). */
@@ -78,6 +78,11 @@ export function engineApi(): Promise<EngineApi> {
   const remote = remoteSettings();
   if (remote.base !== null) {
     api ??= Promise.resolve(remote.token === null ? lockedApi() : remoteApi({ base: remote.base, token: remote.token }));
+    return api;
+  }
+  // The public live view: the same origin's reads (its host adds the token), and no write leaves the page.
+  if (isHostedLive()) {
+    api ??= Promise.resolve(readOnlyApi(httpApi()));
     return api;
   }
   api ??= pageSource().then((picked) =>
