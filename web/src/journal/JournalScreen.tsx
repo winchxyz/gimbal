@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { DeskState, JournalEntry } from '@gimbal/shared';
 import { signedUsd } from '../desk/format.ts';
 import { useStream } from '../stream/hub.ts';
 import { Flash } from '../ui/Flash.tsx';
+import { SCROLLER, takeFocus } from '../ui/scroller.ts';
 import { useNow } from '../ui/useNow.ts';
 import { csvName, toCsv } from './csv.ts';
 import { Day } from './Feed.tsx';
@@ -22,7 +23,7 @@ import {
 import { Side } from './Side.tsx';
 import { JournalEmpty, JournalError, JournalLoading } from './States.tsx';
 import { useJournal, type JournalData } from './useJournal.ts';
-import { useScrolled } from './useScrolled.ts';
+import { scrollToTop, useScrolled } from './useScrolled.ts';
 import './journal.css';
 
 /** The Journal screen: everything the desk did, as the contract recorded it, newest first. */
@@ -68,7 +69,12 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
 
   // New entries arrive at the top, but never under a reader who has scrolled down: the page keeps the entries it
   // showed and counts the new ones ("2 new events") until the reader asks for them or scrolls back up.
-  const scrolled = useScrolled();
+  const feed = useRef<HTMLElement>(null);
+  const scrolled = useScrolled(feed);
+  const feedRef = useCallback((el: HTMLElement | null) => {
+    feed.current = el;
+    takeFocus(el);
+  }, []);
   const ids = useRef<string[]>([]);
   ids.current = entries.map((e) => e.id);
   const [frozen, setFrozen] = useState<ReadonlySet<string> | null>(null);
@@ -90,11 +96,11 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
   const showNew = () => {
     setFrozen(null);
     const calm = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    window.scrollTo({ top: 0, behavior: calm ? 'auto' : 'smooth' });
+    scrollToTop(feed.current, calm ? 'auto' : 'smooth');
   };
 
   return (
-    <div>
+    <div className="j-page">
       <section className="j-top">
         <div>
           <h1>Journal</h1>
@@ -154,7 +160,7 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
       <Filters filter={filter} counts={counts} onChange={setFilter} />
 
       <div className="j-grid">
-        <section className="j-feed" aria-label="Journal entries">
+        <section className="j-feed" aria-label="Journal entries" ref={feedRef} {...SCROLLER}>
           {pending > 0 ? (
             <div className="j-new" role="status">
               <button type="button" className="btn" onClick={showNew}>

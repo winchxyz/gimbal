@@ -12,7 +12,7 @@ import { Sk } from './Sk.tsx';
  */
 export function JournalLoading() {
   return (
-    <div aria-busy="true" aria-label="Loading the journal">
+    <div className="j-page" aria-busy="true" aria-label="Loading the journal">
       <section className="j-top">
         <div>
           <h1>Journal</h1>

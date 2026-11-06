@@ -24,6 +24,21 @@
 
 .j-grid { display: grid; grid-template-columns: minmax(0, 1fr) 400px; }
 
+/* Desktop: the title and the filters stay at the top of the screen; the feed scrolls in its own column, and the side
+   column beside it only when it is taller than the window. */
+@media (min-width: 1024px) {
+  .j-page { height: 100%; display: flex; flex-direction: column; }
+  .j-page > * { flex: none; }
+  .j-page > .j-grid { flex: 1 1 0; min-height: 0; }
+  .j-feed, .j-side { min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--line-2) transparent; }
+}
+/* A short window gives the feed the room: less air above the title and the filters. The 800 px assumes the stack above
+   the Journal: header (72) + at most one replay or read-only line (35), so the feed keeps about 420 px at 720 px. */
+@media (min-width: 1024px) and (max-height: 800px) {
+  .j-top { padding-top: var(--s-5); }
+  .j-filters { margin-top: var(--s-5); }
+}
+
 /* ---------- the feed ---------- */
 .j-feed { padding: 0 48px 64px var(--gutter); border-right: 1px solid var(--line); min-width: 0; }
 .j-day { font: var(--t-s); color: var(--ink-2); padding: 28px 0 10px; border-bottom: 1px solid var(--line-2); display: flex; justify-content: space-between; gap: var(--s-4); }
@@ -80,6 +95,7 @@
 .j-attr { margin-top: 28px; }
 .j-attr > div { display: flex; justify-content: space-between; gap: var(--s-3); padding: 9px 0; border-bottom: 1px solid var(--line); }
 .j-attr > div > span:first-child { color: var(--ink-2); }
+.j-attr > div > span:last-child { white-space: nowrap; }   /* a long label wraps; the amount beside it never does */
 .j-attr > .tot { border-bottom: 0; border-top: 1px solid var(--ink-2); margin-top: -1px; }
 .j-counts { margin-top: 40px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px var(--s-4); }
 .j-counts b { display: block; font: var(--t-num); letter-spacing: var(--track-num); font-weight: 400; }
@@ -92,7 +108,7 @@
 .j-contract a:hover { color: var(--ink); }
 
 /* ---------- empty and error: one message in the middle ---------- */
-.j-state { min-height: calc(100dvh - var(--header)); display: flex; }
+.j-state { min-height: 100%; display: flex; }
 .j-state-msg { margin: auto; width: 640px; max-width: 100%; padding: 0 var(--s-4); text-align: center; transform: translateY(-5%); }
 .j-state-msg .lab { font: var(--t-s); color: var(--ink-2); }
 .j-state-msg h1 { font: var(--t-xl); letter-spacing: var(--track-xl); margin: 14px 0 0; }
@@ -107,6 +123,19 @@
 .j-evt .amt .j-sk, .j-evt .proof .j-sk { margin-left: auto; }
 .j-evt .proof { align-items: flex-end; }
 .j-counts .j-sk { margin-bottom: 6px; }
+
+/* ---------- a narrow desktop, 1024 to 1279 px: with five columns beside a 400 px side column the entry text was left a
+   few dozen pixels and ran one letter a line. The side column gives up 80 px, and the proof links move under the
+   text, so the text keeps the amount column beside it. ---------- */
+@media (min-width: 1024px) and (max-width: 1279px) {
+  .j-grid { grid-template-columns: minmax(0, 1fr) 320px; }
+  .j-feed { padding-right: var(--s-6); }
+  .j-side { padding-left: var(--s-6); }
+  .j-evt { grid-template-columns: 56px 88px minmax(0, 1fr) 104px; }
+  .j-evt .proof { grid-column: 3 / -1; flex-direction: row; flex-wrap: wrap; justify-content: flex-start; align-items: baseline; gap: var(--s-1) var(--s-4); margin-top: var(--s-2); text-align: left; }
+  .j-evt .proof:empty { display: none; }
+  .j-steps { margin-right: 0; }
+}
 
 /* ---------- phone: up to 1023 px, one column ---------- */
 @media (max-width: 1023px) {

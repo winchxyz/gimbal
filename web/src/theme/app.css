@@ -34,6 +34,18 @@ h1, h2, h3, p { margin: 0; font-weight: 400; }
 /* ---------- frame ---------- */
 .app { min-height: 100vh; display: flex; flex-direction: column; }
 .page { flex: 1; }
+/* The shell focuses the element that scrolls a new screen so the keyboard scrolls it; it is not a control. */
+.page:focus, [data-scroller]:focus { outline: none; }
+
+/* Desktop: the shell is the window. The header and the lines under it stay put; only the screen under them scrolls,
+   inside its own area (Windows and Journal split it further into columns that scroll on their own). The document
+   never scrolls, and a scroll that reaches an end stops there instead of chaining. The phone keeps a normal page. */
+@media (min-width: 1024px) {
+  .shell { height: 100dvh; overflow: hidden; }
+  .shell > * { flex: none; }
+  /* the thin, quiet bar the Windows columns use */
+  .shell > .page { flex: 1 1 0; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--line-2) transparent; }
+}
 
 /* header: brand, the five sections centred, network and the one money action */
 .hdr { height: var(--header); padding: 0 var(--gutter); display: grid; grid-template-columns: 1fr auto 1fr; column-gap: var(--s-6); align-items: center; border-bottom: 1px solid var(--line); }

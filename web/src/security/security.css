@@ -86,7 +86,7 @@ a.s-ext.mono:hover { text-decoration: underline; text-underline-offset: 3px; }
 .s-ref-links .mono { font-size: 12px; }
 
 /* ---------- empty and error: one message in the middle ---------- */
-.s-state { min-height: calc(100dvh - var(--header)); display: flex; }
+.s-state { min-height: 100%; display: flex; }
 .s-state-msg { margin: auto; width: 640px; max-width: 100%; padding: 0 var(--s-4); text-align: center; transform: translateY(-5%); }
 .s-state-msg .lab { font: var(--t-s); color: var(--ink-2); }
 .s-state-msg h1 { font: var(--t-xl); letter-spacing: var(--track-xl); margin: 14px 0 0; }

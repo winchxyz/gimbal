@@ -1,5 +1,6 @@
 import type { StrategyDecision } from '@gimbal/shared';
 import { writeControls } from '../remote/readonly.ts';
+import { useCut } from '../ui/scroller.ts';
 import { useManualSend } from '../ui/useManualSend.ts';
 import { cx } from '../ui/cx.ts';
 import { confirmText } from '../windows/manual.ts';
@@ -28,6 +29,9 @@ export function DecisionBar({ decision, now, held, symbol, urgent, minNetAprPct 
   // Read-only view: the line says what the loop decided; the override is not offered.
   const canClose = held && writeControls().close;
   const send = useManualSend(canClose ? { kind: 'close', symbol } : null);
+  // On the desktop the reason keeps one line (live updates never change the line's height): a cut reason gets its full
+  // text on hover and a "more" link to the Journal, where every decision is written in full.
+  const [reason, cut] = useCut<HTMLSpanElement>(line?.reason);
   if (line === null && !canClose) return null;
 
   return (
@@ -35,7 +39,14 @@ export function DecisionBar({ decision, now, held, symbol, urgent, minNetAprPct 
       {line ? (
         <p className="say">
           <span className="word">{line.word}</span>
-          <span className="reason" title={line.raw !== line.reason ? line.raw : undefined}>{line.reason}</span>
+          <span className="reason" ref={reason} title={line.raw !== line.reason ? line.raw : cut ? line.reason : undefined}>
+            {line.reason}
+          </span>
+          {cut ? (
+            <a className="jump" href="#/journal" aria-label="Read the whole decision in the Journal">
+              more
+            </a>
+          ) : null}
           <span className="g3 when">{line.when}</span>
         </p>
       ) : (
