@@ -150,6 +150,19 @@ What it does (every line starts with `control:`):
    margin). The `waiting for ...` lines say what for. Past 10 min it writes the marker `failed` and calls nothing; that
    run-id is not tried again. `PUT /strategy` waits for the first scan only: it does not touch the pair, and restoring
    the rescue line must not hang on a pair whose start is not confirmed.
+
+   `POST /rotate` then also waits, within the same 10 min, until the route would start it. It asks the route's own
+   check (the strategy loop's `rotateRefusal`, the very check `POST /rotate` answers on) once a second, with the
+   `windowId` and `demo` of the body, and sends only when that check passes. Every restart (so every variable change)
+   reads the funding history again, and for about the first minute or two a window fails `No 7-day funding history
+   on both legs yet`, a safety check that is never waived: without this wait the request would be refused for that
+   alone and its run-id spent. Nothing is waived here that the route does not waive: a demo request does not wait on
+   the profit checks (the route waives them), and every other check counts. The line is
+   `control: waiting for <window id>: POST /rotate would be refused now (<the route's reason>); ...`, logged when the
+   reason changes and otherwise once a minute. Then `control: <window id> passes every check POST /rotate does not
+   waive ...: calling it`. A window that still does not pass at 10 min (not in the policy, refused by the NEAR AI
+   risk check, a pair held, auto off, ...) gets the marker `failed` with
+   `POST /rotate <window id> would still be refused after 600 s: <the reason>`, and nothing is called.
 4. It logs the engine rules as `GET /strategy` answers them (`control: engine rules before the call ...`), then
    writes the marker `started`, created exclusively and fsynced.
 5. It sends the request and logs the route's answer, and the marker becomes `done` with that status and body. A
@@ -160,6 +173,8 @@ What it does (every line starts with `control:`):
      `journal   enter: ...` / `journal   rotate: ...` / `journal   exit: ...` line, or `journal   error: ...` /
      `journal   refused: ...`. **Wait for that result line before any redeploy.**
    - `409` is the route's own refusal, for example `{"ok":false,"reason":"auto is off: ..."}`. The run-id is spent.
+     For `POST /rotate` this is rare (the wait above sends only once the route's check passes): it means something
+     changed between that check and the call.
 
 Serve's start does not wait for the run; serve's shutdown does (within the 180 s drain). A shutdown while it still
 waits stops it with no marker, so the next start runs it. A marker that says `started` with no outcome (the
@@ -184,7 +199,7 @@ PowerShell 7.2 or older strip the double quotes from an argument to a native pro
 
 **Watching it.** `railway logs | grep control:` (bash) or `railway logs | Select-String 'control:'` (PowerShell).
 The first line, `control: run <run-id>: POST /close ...`, echoes what serve read; `control: refused: GIMBAL_CONTROL
-is not JSON` means the quotes were lost. Then `waiting for ...`, `engine rules before the call ...`,
+is not JSON` means the quotes were lost. Then `waiting for ...` (for `/rotate`, also `waiting for <window id>: ...`), `engine rules before the call ...`,
 `started: marker ...` and `done: ...` (or `failed: ...`). For the act's result, also watch `journal   ` lines; a
 rescue shows as `rescue trigger ...` in the log and in full in the dashboard's Rescue view and Journal.
 
@@ -323,7 +338,12 @@ log printed. `<rules>` below stands for every field of that line, with the chang
    checks only; the safety checks (tradable, not stale, not refused, the risk check, the policy, the size, and a
    positive spread over at least 7 days of history) all stay, so pick a window whose 7-day spread pays in its
    direction. `maxLossUsd` bounds the estimated round-trip cost, at most 1 USD; a 12 USD ZEC Orderly/Hyperliquid leg
-   costs about 0.04 USD. Funding during the hold is expected positive and is not part of that bound. Wait for `journal   enter: enter <window id>, ...; owner demo entry: ...` (or `error` / `refused`). A
+   costs about 0.04 USD. Funding during the hold is expected positive and is not part of that bound. Setting the
+   variable restarts the engine, so for its first minute or two the window has no 7-day history yet: the run logs
+   `control: waiting for <window id>: ... No 7-day funding history ...` and sends once the history is in, by itself
+   (nothing to retry). A window the route would still refuse after 10 min ends as
+   `control: failed: POST /rotate <window id> would still be refused after 600 s: <reason>`, with nothing sent: send
+   the same step with the backup window. Wait for `journal   enter: enter <window id>, ...; owner demo entry: ...` (or `error` / `refused`). A
    `veto` / `refused ... NEAR AI risk check` line means the model refused that window: send the same step with the
    backup window. A `refused ... the NEAR AI risk check did not answer ... held, not passed` line means no answer
    came (nothing sent, no hold-out): send the same step again once NEAR AI answers. **Every attempt needs a new run-id**, a refused one included: a used run-id never runs again.
@@ -333,7 +353,7 @@ log printed. `<rules>` below stands for every field of that line, with the chang
    '{"id":"demo-enter-2","method":"POST","path":"/rotate","until":"2026-11-06T18:00:00Z","body":{"windowId":"sol-phoenix-hyperliquid","demo":{"maxLossUsd":0.25}}}' | railway variable set GIMBAL_CONTROL --stdin
    ```
 
-   (the second line only after a refusal of the first). The held demo pair then counts as compressed at every hourly
+   (the second line only after a refusal or a `failed` line for the first). The held demo pair then counts as compressed at every hourly
    check under the 1000 % minimum and the loop exits it by itself at the 24th hourly check in a row, about a day
    after the entry (no rotation: nothing gains 1000 points); the drawdown and time stops still act.
 

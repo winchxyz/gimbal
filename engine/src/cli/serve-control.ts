@@ -21,6 +21,12 @@
 //   3  wait, at most CONTROL_WAIT_MS, until the engine is ready for the route: the first scan for PUT /strategy; also
 //      the pair's start confirmed and the strategy loop's first check of a scan for /rotate and /close (so /rotate
 //      sees the window and the free margin). Past the wait: the marker `failed`, never retried
+//   3b POST /rotate, within the same CONTROL_WAIT_MS: until the route would start it, asked of the route's own check
+//      (StrategyLoop.rotateRefusal, which rotate() answers on, the demo waiver of the profit checks included) once a
+//      poll. A restart reads the funding history again, and for a minute or so a window has no 7-day history: the
+//      call would be refused for that alone. Nothing is waived here that the route does not waive. A `waiting for
+//      <window>` line when the reason changes, else at most once a minute. Past the wait: the marker `failed` with
+//      the reason that never cleared, nothing called, never retried
 //   4  the engine rules as GET /strategy answers them, logged; then the marker `started`, created exclusively and
 //      fsynced before the call
 //   5  the call over loopback; the marker `done` with the route's status and body, or `failed` with the error
@@ -35,12 +41,15 @@ import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync } fr
 import { request } from 'node:http';
 import { dirname, join } from 'node:path';
 import { fsyncDir, writeAtomic } from '../book/store.ts';
+import { reasonCategory } from '../strategy/loop.ts';
 import { errorMessage } from '../venues/recorder.ts';
 
 export const CONTROL_ENV = 'GIMBAL_CONTROL';
 /** How long a run waits for the engine to be ready for its route; a pair that is taken over goes live in 90 s to 3 min. */
 export const CONTROL_WAIT_MS = 10 * 60_000;
 const POLL_MS = 1_000;
+/** While POST /rotate waits for its window (3b): a line when the reason changes, else one at most this often. */
+const WAIT_LINE_MS = 60_000;
 /** One loopback request: the routes answer at once (a rotate's act runs after the answer). */
 const CALL_TIMEOUT_MS = 30_000;
 const PREFIX = 'control:';
@@ -147,6 +156,11 @@ export interface ControlDeps {
   /** What the engine still lacks for this route (the first scan, the pair's start, the loop's first check), or null when ready. */
   waitingFor(path: ControlPath): string | null;
   call: RouteCall;
+  /**
+   * Why POST /rotate (windowId, demo as the handler passes them: demo undefined when not sent) would be refused now, or
+   * null when it would be started: the strategy loop's rotateRefusal, the route's own check. Absent: no such wait.
+   */
+  rotateRefusal?: (windowId: unknown, demo: unknown) => string | null;
   /** serve is shutting down: a run still waiting stops (no marker). */
   stopping?: () => boolean;
   /** Called once the `started` marker is on disk. */
@@ -246,6 +260,49 @@ export async function runControl(d: ControlDeps): Promise<ControlResult> {
       return { status: 'failed', error };
     }
     await sleep(d.pollMs ?? POLL_MS);
+  }
+
+  // 3b. POST /rotate: within the same bound, until the route would start it. Asked of the route's own check (the
+  // strategy loop's rotateRefusal, the demo waiver included), with the arguments the /rotate handler passes it.
+  if (ask.path === '/rotate' && d.rotateRefusal !== undefined) {
+    const body = ask.body ?? {};
+    const windowId = body.windowId;
+    const demoSent = Object.prototype.hasOwnProperty.call(body, 'demo');
+    const label = typeof windowId === 'string' ? windowId : JSON.stringify(windowId) ?? 'no windowId';
+    let lastCategory: string | null = null;
+    let lastLineAt = 0;
+    for (;;) {
+      if (d.stopping?.() === true) {
+        say(`stopped: serve is stopping before the call; nothing was called and no marker was written, so ${ask.runId} runs at the next start`);
+        return { status: 'stopped' };
+      }
+      const late3b = expired();
+      if (late3b !== null) return late3b;
+      const reason = d.rotateRefusal(windowId, demoSent ? body.demo : undefined);
+      if (reason === null) {
+        if (lastCategory !== null) say(`${label} passes every check POST /rotate does not waive${demoSent ? ' (the profit checks a demo entry waives are not waited on)' : ''}: calling it`);
+        break;
+      }
+      const category = reasonCategory(reason);
+      if (now() >= until) {
+        const error = `POST /rotate ${label} would still be refused after ${Math.round(waitMs / 1000)} s: ${reason}`;
+        try {
+          createExclusive(path, `${JSON.stringify({ ...base, status: 'failed', finishedAt: new Date(now()).toISOString(), error }, null, 2)}\n`);
+        } catch (err) {
+          say(`could not write the marker ${path}: ${errorMessage(err)}`);
+        }
+        say(`failed: ${error}; nothing was called; marker ${path}; not retried: pick a new run-id once it passes`);
+        return { status: 'failed', error };
+      }
+      if (category !== lastCategory || now() - lastLineAt >= WAIT_LINE_MS) {
+        const first = lastCategory === null;
+        say(`waiting for ${label}: POST /rotate would be refused now (${reason}); asked again every ${Math.round((d.pollMs ?? POLL_MS) / 1000)} s, `
+          + `at most ${Math.round(waitMs / 1000)} s in all${first && demoSent ? '; a demo entry waives the profit checks only, so they are not waited on' : ''}`);
+        lastCategory = category;
+        lastLineAt = now();
+      }
+      await sleep(d.pollMs ?? POLL_MS);
+    }
   }
 
   // 4. The rules before the call (the whole config PUT /strategy takes back), then the marker.
