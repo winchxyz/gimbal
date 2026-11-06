@@ -14,9 +14,10 @@ enters when a window clears the owner's minimum and the checks pass. The page ne
 `node engine/src/cli/live-host.ts` (the public service's Custom Start Command), on one public port, `$PORT` (default
 8080):
 
-- the dashboard (`web/dist`), built with `VITE_HOSTED_LIVE=1`. The live image has no `web/dist`, so on every container
-  start the host builds it once (about a second; the log says `web/dist is missing: building the hosted-live dashboard
-  once`), then serves. The build gets neither the token nor the engine address;
+- the dashboard (`web/dist-live`), built with `VITE_HOSTED_LIVE=1` into a folder of its own, so it and the replay's
+  `web/dist` never overwrite each other. The live image has neither, so on every container start the host builds it
+  once (about a second; the log says `web/dist-live is missing: building the hosted-live dashboard once`), then
+  serves. The build gets neither the token nor the engine address;
 - a read-only proxy, on the same origin, to the live engine's **read-only view** (`engine/src/view/`, docs/deploy-railway.md
   "The read-only view"): `GIMBAL_LIVE_URL` is the view's public address, `GIMBAL_VIEW_TOKEN` its bearer token. The
   host adds the token to its own requests, server-side. It is never sent to a browser, never put in a URL, a response
@@ -46,29 +47,49 @@ configured** ("This site is not connected to the live engine yet ..., so there i
   `/resume`, `/setup`, `/policy/draft`, `PUT /strategy` and the rest answer 403 ("This is the public view of the
   live mainnet desk, and it is read-only ..."); writes to any other path 405. A GET of any other API path
   (`/policy`, `/setup`, `/view-ticket`, `/rotate`, ...) is 404 at the host. Static files are `/` and the files of
-  `web/dist`; anything else 404.
+  `web/dist-live`; anything else 404.
 - **The engine.** Its view answers GET only, built on read functions (no route there can reach the control API), so
   even a forwarded write would be refused there too.
 
 ## Protecting the live engine from public traffic
 
-- **One upstream stream.** The host keeps ONE `/events` connection to the engine and fans it out to every visitor.
-  A new visitor's stream starts with the latest of each type (scan, windows, desk, health, setup, rescue, decision)
-  from the host's memory, then follows the live events. Visitor streams are capped at 300 in all (503; the page
-  retries) and 16 per client address (429), with the same address rule as the replay host (`X-Real-IP`, else the last
-  `X-Forwarded-For` entry, else the socket). A visitor that leaves more than 1 MiB unread is dropped.
+- **One upstream stream.** The host keeps ONE `/events` connection to the engine and fans it out to every visitor;
+  each event is shaped, cut and encoded once, and the same bytes go to every visitor. A new visitor's stream starts
+  with the latest of each type (scan, windows, desk, health, setup, rescue, decision) from the host's memory, then
+  follows the live events. Visitor streams are capped at 300 in all (503; the page retries) and 16 per client address
+  (429). The address is the replay host's rule (`X-Real-IP`, which Railway's edge sets, else the last
+  `X-Forwarded-For` entry, else the socket), with an IPv6 address taken as its /64 (one home or phone gets a whole
+  /64, so picking another address in it does not open more streams) and an IPv4-mapped one as its IPv4.
+- **Slow readers.** A visitor that leaves more than 512 KiB unread (a few of the largest events, the windows list) is
+  dropped; its page reconnects and reads `/state` again. All visitors together may leave at most 32 MiB unread: past
+  that the one holding most is dropped first, then the next, until the total is under it. So slow readers can park at
+  most 32 MiB in the host, however many there are.
 - **Reconnect with backoff.** When the upstream stream ends (an engine deploy, a network blip, no byte for 45 s while
   the engine pings every 15 s), every visitor stream ends too, so each page reconnects and reads `/state` again
   (nothing is missed); while the engine is down a visitor's `/events` is answered 503 by the host at once. The host
-  tries again after 1 s, 2 s, 4 s ... up to 30 s. If the engine refuses the host's token (401) or origin (403), the
+  tries again after about 1 s, 2 s, 4 s ... up to 30 s, each wait shifted at random by up to a quarter, so hosts
+  restarted together do not knock in step. If the engine refuses the host's token (401) or origin (403), the
   host asks nothing for a minute and logs `live: the engine refused the host's view token (401): check
   GIMBAL_VIEW_TOKEN on this service`, so it never runs into the view's failed-try limit (10 a minute).
-- **Cached reads.** `GET /state` and `/strategy` are answered from the host's cache for 3 s, journal pages and window
-  histories for 30 s, failures for 2 s; one request per key is in flight at a time however many visitors ask; a
-  journal event or a reconnect drops the cached `/state` and newest journal page, so a page that opens next reads
-  fresh. New upstream requests share a budget of 3 a second (bursts of 10): past it, the last answer is served even if
-  old, else 503 with `Retry-After: 2`. A crowd of visitors therefore costs the engine one stream and a few reads a
-  second at most. Answers over 8 MiB are refused; the cache holds at most 32 MiB.
+- **Cached reads, stale kept.** `GET /state`, `/strategy` and the newest journal page are fresh in the host's cache
+  for 3 s, older journal pages and window histories for 30 s; one request per key is in flight at a time however many
+  visitors ask. A journal event or a reconnect marks the cached `/state` and newest journal page stale (they are not
+  deleted), and a read already in flight then is not taken as fresh, so the next page reads what came after. A failed
+  read (the engine down, a 5xx, a refusal) never replaces the last good answer: the host serves that answer, stale,
+  and asks the engine again only after 2 s (a minute after a 401 or 403). Only with no good answer at all does a
+  visitor see the failure (502 or 503).
+- **Reads by id are held to what the engine listed.** `GET /windows/history?id=` is answered only for a window in the
+  engine's latest list (the stream's windows, or the last `/state`); any other id is 404 at the host and never asked.
+  `GET /journal?before=` is asked only before an entry the host has served (in `/state`, an event or a page); any
+  other id is answered `[]`, as the engine answers for an id it does not hold. So no visitor can make the host ask the
+  engine for an unbounded set of keys.
+- **The read budget.** The core reads (`/state`, `/strategy`, the newest journal page) are one key each and fetched
+  at most once per 3 s, so they are outside any budget and always get through. The reads by id share a budget on
+  cache misses: 80 at once per client address (the same /64 rule), then 1 a second, and 120 at once for the whole
+  host, then 5 a second. A cold page on a desk with 40 tradable windows (one history each) loads without a refusal,
+  and the next visitors' histories come from the cache. Past a budget the last answer is served even if old, else
+  503 with `Retry-After: 2`. A crowd of visitors therefore costs the engine one stream, the core reads every 3 s, and
+  a few reads a second at most. Answers over 8 MiB are refused; the cache holds at most 32 MiB.
 
 ## What the public sees (exposure audit, 2026-11-06)
 
@@ -84,9 +105,14 @@ and the owner's and operator's accounts masked to first 4 + "…" + last 4. This
 - **cuts**, in every string it serves: IPv4 and IPv6 addresses, e-mail addresses, local paths (`/app/…`, `/data/…`,
   `/home/…`, `C:\…`, `file://…`), Railway private host names (`*.railway.internal`), referral codes where text names
   one, and its own token and the engine view's host name, should any of these ever appear in an error text;
-- **publishes only the known fields**: `GET /state` keeps `mode, windows, scan, strategy, desk, journal, rescue,
-  setup, health, decision, at`; the stream keeps the eight event types the page reads. A field or type an engine adds
-  later is not published until it is added here.
+- **publishes only the fields the page reads**, at every depth: one field allowlist per shared type
+  (`shared/src/types.ts`: the state, the desk and its legs, accounts and P&L, each window with its costs, checks and
+  NEAR AI risk check, journal entries, rescue progress, the set-up steps, venue health, the strategy's decision, the
+  strategy rules, the scan status, window histories), applied to `GET /state`, `/strategy`, journal pages, histories
+  and each of the eight event types the page reads. A field the type does not have, or a value of the wrong kind (an
+  object where a number belongs), is not published; the build fails when a type gains a field the list does not name,
+  so it is added on purpose. A test runs the page's own fixtures (the web's fake stream, every desk and rescue
+  scenario) through the allowlist and finds them unchanged.
 
 What stays public, on purpose: the funding windows and their checks; the desk (desk id, contract id, the masked
 owner, every leg with size, prices, liquidation price, margin, funding and fees, equity, reserve, P&L, health, pause
@@ -120,8 +146,10 @@ Nothing on the live engine's service changes, as long as its read-only view is o
    configured or up).
 5. **Settings → Networking → Public Networking:** the domain's target port is **8080**, the port in the log line
    `live view on http://0.0.0.0:8080`. Keep the same domain, so the public URL does not change.
-6. Resources: the host is one small Node process (under 100 MB idle when run locally, plus the visitors' streams);
-   the 2 GB the replay needed can come down to 512 MB. No volume.
+6. Resources: **512 MB** of memory, no volume (the 2 GB the replay needed can come down). The reason: the host is one
+   Node process, under 100 MB when idle; on top of that its cache holds at most 32 MiB, slow readers at most 32 MiB
+   all together, and each open visitor stream a few KiB besides; even 300 visitors stay well under 256 MB, which
+   leaves room for the one-off web build at start.
 7. Deploy, then read the log: `live engine: <view host> (the read-only view; token from GIMBAL_VIEW_TOKEN, added
    server-side)`, `live view on http://0.0.0.0:8080: ...`, `live: event stream open`. On the live engine's log
    there is no `view: refused` line for the host.
@@ -129,6 +157,20 @@ Nothing on the live engine's service changes, as long as its read-only view is o
    Desk, Windows, Journal, Rescue and Security show the live desk; there is no Close position button. Quick checks
    from a shell: `GET /healthz` is 200 with `"live":"connected"`; `POST /close`, `POST /rotate`, `POST /stress`,
    `POST /pause` and `PUT /strategy` answer 403; `GET /view-ticket` and `GET /policy` answer 404.
+9. **Check that the per-address cap counts the real address**, once after the first deploy (and after any change to
+   the domain or the edge): the caps trust `X-Real-IP`, which only holds if the edge sets it and drops one a visitor
+   sends. From one machine, open 17 streams that all send the same made-up address (one from the documentation range,
+   so it is no one's):
+
+   ```bash
+   for i in $(seq 17); do curl -sN -H 'X-Real-IP: 192.0.2.77' -o /dev/null -w '%{http_code}\n' --max-time 5 https://<public domain>/events & done; wait
+   ```
+
+   Sixteen print 200 (cut by `--max-time`) and one 429, and the public service's log has a line
+   `visitor streams: 16 open from <address>, the cap of 16; refused (429)`. The address there must be this machine's
+   public address, not `192.0.2.77`. If it says `192.0.2.77`, the edge passes the visitor's header through and anyone
+   can open a fresh set of streams by sending another value: stop here and report it. (Without any of these headers,
+   locally, the host falls back to the last `X-Forwarded-For` entry, then the socket.)
 
 **If the view token changes** on the live engine, set the same value on the public service and redeploy it; until
 then the page says the engine is not answering and the host logs the 401 line once a minute. **To show the replay
@@ -145,7 +187,8 @@ PORT=8080 node engine/src/cli/live-host.ts      # open http://localhost:8080: "L
 GIMBAL_LIVE_URL=http://127.0.0.1:<view port> GIMBAL_VIEW_TOKEN=<that token> PORT=8080 node engine/src/cli/live-host.ts
 ```
 
-`web/dist` from `npm run build` is the normal page: the host sees no hosted-live marker
-(`<meta name="gimbal-build" content="hosted-live">`) and rebuilds it as the hosted-live page first. Plain `http` is
+The host serves `web/dist-live`, never `web/dist` (the normal page from `npm run build`, or the replay's): when
+`web/dist-live` is missing or has no hosted-live marker (`<meta name="gimbal-build" content="hosted-live">`), the host
+builds it as the hosted-live page first. Plain `http` is
 accepted for `GIMBAL_LIVE_URL` only on this machine (`localhost`, `127.0.0.1`); anywhere else it must be `https`.
 Option: `--host` (default 0.0.0.0).

@@ -3,13 +3,16 @@
 //                         has no live engine (it then serves the page with a "not configured" state);
 //   liveRoute()           what the public port answers: an allowlist of the reads the dashboard needs; every write is
 //                         refused here and never forwarded; any other API path is 404;
-//   publicCutter()        what the host cuts on top of the engine's own redaction (engine/src/view/view-redact.ts):
-//                         IP addresses, e-mail addresses, local paths, private Railway host names, referral codes,
-//                         the venue set-up details, and the host's own token and engine address, should either appear;
+//   publicState() & co.   what the public sees of the engine's payloads: a field allowlist per shared type (a field
+//                         the page does not read is not published), then the host's cut on every string (IPs, e-mail
+//                         addresses, local paths, private Railway names, referral codes, its own token and engine
+//                         address), on top of the engine's own redaction (engine/src/view/view-redact.ts);
 //   LiveUpstream          the host's only link to the live engine: the token is added here, server-side; GETs are
-//                         cached, shared while in flight and rate-limited; ONE event stream, reconnected with backoff;
+//                         cached (stale kept), shared while in flight, and the reads a page asks for by id are held to
+//                         ids the engine has listed, under a budget per client and in all; ONE event stream,
+//                         reconnected with backoff and jitter;
 //   createLiveHostServer  the public HTTP server: the built dashboard and the reads on one origin, the one upstream
-//                         stream fanned out to every visitor, with a cap on visitor streams.
+//                         stream fanned out to every visitor, with caps on visitor streams and on unread bytes.
 //
 // No visitor header reaches the engine: every upstream request is built here from nothing but the path, `accept` and
 // the host's own `authorization`. The token is never in a response, a URL or a log line.
@@ -18,7 +21,11 @@ import { createReadStream, existsSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { extname, join, normalize, resolve, sep } from 'node:path';
-import { MAX_STREAMS_PER_CLIENT, MAX_UNREAD_BYTES, clientKey } from './replay-host-lib.ts';
+import type {
+  DeskState, EngineState, JournalEntry, Leg, RescueFailure, RescueProgress, ScanStatus, SetupProgress, StrategyConfig, StrategyDecision, TxRef,
+  VenueAccount, Window, WindowHistory,
+} from '@gimbal/shared';
+import { MAX_STREAMS_PER_CLIENT, clientKey } from './replay-host-lib.ts';
 
 export const HEALTH_PATH = '/healthz';
 
@@ -143,7 +150,128 @@ export function liveStaticFile(webDir: string, urlPath: string): string | null {
   return existsSync(path) && statSync(path).isFile() ? path : null;
 }
 
-// ---------- what the public must not see ----------
+/**
+ * Who a visitor is, for the stream caps and the read budget: replay-host-lib's clientKey (X-Real-IP from the edge, else
+ * the last X-Forwarded-For entry, else the socket), with an IPv6 address taken as its /64. One home or phone is given
+ * a whole /64, so a visitor cannot open a fresh budget by picking another address in it. An IPv4-mapped address is
+ * its IPv4.
+ */
+export function addressGroup(key: string): string {
+  let k = key.trim().replace(/^\[(.*)\]$/, '$1');
+  const zone = k.indexOf('%');
+  if (zone >= 0) k = k.slice(0, zone);
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(k);
+  if (mapped !== null) return mapped[1]!;
+  if (!k.includes(':')) return k;
+  let canonical: string;
+  try {
+    const host = new URL(`http://[${k}]/`).hostname;
+    canonical = host.slice(1, -1);
+  } catch {
+    return k;
+  }
+  const [head = '', tail] = canonical.split('::');
+  const h = head === '' ? [] : head.split(':');
+  const t = tail === undefined || tail === '' ? [] : tail.split(':');
+  const groups = tail === undefined ? h : [...h, ...Array<string>(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t];
+  return `${groups.slice(0, 4).join(':')}::/64`;
+}
+
+// ---------- what the public sees ----------
+
+/** A JSON primitive (string, number, boolean, null); anything else in its place is dropped. */
+type Shape = 'v' | 'record' | { list: Shape } | { fields: Readonly<Record<string, Shape>> };
+const V = 'v' as const;
+/** An object of primitives under any keys (the venue health map, a journal entry's numbers). */
+const RECORD = 'record' as const;
+const list = (of: Shape): Shape => ({ list: of });
+const obj = (fields: Readonly<Record<string, Shape>>): Shape => ({ fields });
+
+// One shape per shared type (shared/src/types.ts): `satisfies` keeps each in step with its type, so a field added
+// to a type has to be added here (or the build fails) before the public sees it.
+const TX = obj({ chain: V, id: V, url: V } satisfies Record<keyof TxRef, Shape>);
+const LEG = obj({
+  venue: V, symbol: V, side: V, size: V, lotSize: V, entry: V, mark: V, liqPx: V, marginUsd: V, marginRatio: V, distanceToLiqPct: V,
+  fundingEarnedUsd: V, unsettledFundingUsd: V, feesUsd: V, unpriced: V,
+} satisfies Record<keyof Leg, Shape>);
+const ACCOUNT = obj({ venue: V, equityUsd: V, at: V } satisfies Record<keyof VenueAccount, Shape>);
+const RESCUE_FAILURE = obj({ rescueId: V, step: V, reason: V, tries: V, next: V, at: V } satisfies Record<keyof RescueFailure, Shape>);
+const DESK = obj({
+  deskId: V, owner: V, contract: V, mode: V, legs: list(LEG), netDelta: V, equityUsd: V, reserveUsd: V,
+  pnl: obj({ fundingUsd: V, feesUsd: V, priceUsd: V, netUsd: V } satisfies Record<keyof DeskState['pnl'], Shape>),
+  health: V, paused: obj({ by: V, at: V } satisfies Record<keyof NonNullable<DeskState['paused']>, Shape>), rescueFailure: RESCUE_FAILURE,
+  updatedAt: V, accounts: list(ACCOUNT),
+} satisfies Record<keyof DeskState, Shape>);
+const WINDOW = obj({
+  id: V, symbol: V, longVenue: V, shortVenue: V, grossAprPct: V, grossApr7dPct: V,
+  costs: obj({ feesPct: V, slippagePct: V, basisPct: V, rescueReservePct: V } satisfies Record<keyof Window['costs'], Shape>),
+  netAprPct: V, usdPerDayPer1k: V, breakevenHours: V, depthUsd: V, intervalsAbove: V, updatedAt: V, tradable: V,
+  // The NEAR AI risk check's verdict on the window (the shared type's field name).
+  veto: obj({ verdict: V, reasons: list(V), model: V, at: V } satisfies Record<keyof NonNullable<Window['veto']>, Shape>),
+  refused: obj({ code: V, reason: V } satisfies Record<keyof NonNullable<Window['refused']>, Shape>),
+  note: V, held: obj({ since: V } satisfies Record<keyof NonNullable<Window['held']>, Shape>),
+  checks: list(obj({ ok: V, text: V } satisfies Record<keyof Window['checks'][number], Shape>)), switchCostUsd: V, stale: V,
+} satisfies Record<keyof Window, Shape>);
+const SCAN = obj({ venues: V, failed: list(V), at: V } satisfies Record<keyof ScanStatus, Shape>);
+const STRATEGY = obj({
+  auto: V, minNetAprPct: V, legUsd: V, maxLeverage: V, stopDrawdownPct: V,
+  rotate: obj({ minGainPts: V, forHours: V } satisfies Record<keyof StrategyConfig['rotate'], Shape>),
+  risk: obj({ watchDistancePct: V, rescueDistancePct: V } satisfies Record<keyof StrategyConfig['risk'], Shape>), enterAfterChecks: V, exitAfterChecks: V,
+} satisfies Record<keyof StrategyConfig, Shape>);
+const ENTRY = obj({ id: V, t: V, kind: V, summary: V, why: V, numbers: RECORD, tx: list(TX) } satisfies Record<keyof JournalEntry, Shape>);
+const RESCUE = obj({
+  id: V, from: V, to: V, amountUsd: V, sentUsd: V, step: V, startedAt: V, elapsedS: V, tx: list(TX),
+} satisfies Record<keyof RescueProgress, Shape>);
+/**
+ * The venue set-up without each step's `detail`: those lines name the desk's referral codes, its Orderly IP allow-list,
+ * its venue account ids and its key's expiry, the owner's business. The steps, statuses and transactions stay.
+ */
+const SETUP = obj({
+  deskId: V, steps: list(obj({ step: V, status: V, tx: list(TX) } satisfies Record<Exclude<keyof SetupProgress['steps'][number], 'detail'>, Shape>)),
+} satisfies Record<keyof SetupProgress, Shape>);
+const DECISION = obj({ action: V, reason: V, windowId: V, heldId: V, at: V } satisfies Record<keyof StrategyDecision, Shape>);
+const HISTORY = obj({ windowId: V, points: list(obj({ t: V, netAprPct: V })) } satisfies Record<keyof WindowHistory, Shape>);
+const STATE = obj({
+  mode: V, windows: list(WINDOW), scan: SCAN, strategy: STRATEGY, desk: DESK, journal: list(ENTRY), rescue: RESCUE, setup: SETUP, health: RECORD,
+  decision: DECISION, at: V,
+} satisfies Record<keyof EngineState, Shape>);
+/** The engine's own refusal of a read ({ error }). */
+const ERROR = obj({ ok: V, error: V, reason: V });
+
+/** The event types the page reads (shared StreamEvent), each with its data's shape. */
+export const EVENT_SHAPES: Readonly<Record<string, Shape>> = {
+  windows: list(WINDOW), scan: SCAN, desk: DESK, journal: ENTRY, rescue: RESCUE, setup: SETUP, health: RECORD, decision: DECISION,
+};
+/** The types whose latest value a new visitor's stream starts with, in the engine's order (view-server.ts). */
+export const SNAPSHOT_TYPES = ['scan', 'windows', 'desk', 'health', 'setup', 'rescue', 'decision'] as const;
+
+const isPrimitive = (v: unknown): boolean => v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean';
+
+/** `value` as `shape` allows, every string through `cut`; undefined when it does not fit (the field is then left out). */
+function shaped(value: unknown, shape: Shape, cut: (text: string) => string): unknown {
+  if (shape === V) return isPrimitive(value) ? (typeof value === 'string' ? cut(value) : value) : undefined;
+  if (value === null) return null;
+  if (typeof value !== 'object') return undefined;
+  if (shape === RECORD) {
+    if (Array.isArray(value)) return undefined;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) if (isPrimitive(v)) out[k] = typeof v === 'string' ? cut(v) : v;
+    return out;
+  }
+  if ('list' in shape) {
+    if (!Array.isArray(value)) return undefined;
+    return value.map((v) => shaped(v, shape.list, cut)).filter((v) => v !== undefined);
+  }
+  if (Array.isArray(value)) return undefined;
+  const out: Record<string, unknown> = {};
+  const from = value as Record<string, unknown>;
+  for (const [k, s] of Object.entries(shape.fields)) {
+    if (!Object.hasOwn(from, k)) continue;
+    const v = shaped(from[k], s, cut);
+    if (v !== undefined) out[k] = v;
+  }
+  return out;
+}
 
 const CUT = '…';
 const IPV4 = /(?<![\d.])(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}(?!\.?\d)/g;
@@ -194,65 +322,40 @@ export function publicCutter(literals: readonly string[] = []): (text: string) =
   };
 }
 
-/** Every string in a JSON value through `cut` (object keys are field names and stay). */
-export function cutJson(value: unknown, cut: (text: string) => string): unknown {
-  if (typeof value === 'string') return cut(value);
-  if (Array.isArray(value)) return value.map((v) => cutJson(v, cut));
-  if (value !== null && typeof value === 'object') {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value)) out[k] = cutJson(v, cut);
-    return out;
-  }
-  return value;
+/** The venue set-up as the public sees it (SETUP above). */
+export function publicSetup(setup: unknown, cut: (text: string) => string = (s) => s): unknown {
+  return shaped(setup, SETUP, cut) ?? null;
 }
 
-/**
- * The venue set-up as the public sees it: each step's name, status and transactions, without its detail. The details
- * name referral codes, the desk's Orderly IP list, its venue account ids and its key's expiry: the owner's, not the
- * public's. The transactions are on chain already.
- */
-export function publicSetup(setup: unknown): unknown {
-  if (setup === null || typeof setup !== 'object' || Array.isArray(setup)) return setup;
-  const s = setup as { steps?: unknown };
-  if (!Array.isArray(s.steps)) return setup;
-  return {
-    ...setup,
-    steps: s.steps.map((step: unknown) => {
-      if (step === null || typeof step !== 'object') return step;
-      const { detail: _detail, ...rest } = step as Record<string, unknown>;
-      return rest;
-    }),
-  };
-}
-
-/** The fields of GET /state the page reads (shared EngineState): a field an engine adds later is not published by default. */
-export const STATE_FIELDS = ['mode', 'windows', 'scan', 'strategy', 'desk', 'journal', 'rescue', 'setup', 'health', 'decision', 'at'] as const;
-/** The event types the page reads (shared StreamEvent). */
-export const EVENT_TYPES = ['windows', 'scan', 'desk', 'journal', 'rescue', 'setup', 'health', 'decision'] as const;
-/** The types whose latest value a new visitor's stream starts with, in the engine's order (view-server.ts). */
-export const SNAPSHOT_TYPES = ['scan', 'windows', 'desk', 'health', 'setup', 'rescue', 'decision'] as const;
-
+/** GET /state as the public sees it, or null when it is not an object. */
 export function publicState(state: unknown, cut: (text: string) => string): unknown {
   if (state === null || typeof state !== 'object' || Array.isArray(state)) return null;
-  const s = state as Record<string, unknown>;
-  const out: Record<string, unknown> = {};
-  for (const f of STATE_FIELDS) if (f in s) out[f] = f === 'setup' ? publicSetup(s[f]) : s[f];
-  return cutJson(out, cut);
+  return shaped(state, STATE, cut) ?? null;
+}
+
+/** The body of a read (by its route) as the public sees it; undefined when it does not fit the route's shape. */
+export function publicRead(route: string, body: unknown, cut: (text: string) => string): unknown {
+  if (route === '/state') return publicState(body, cut) ?? undefined;
+  if (route === '/strategy') return shaped(body, STRATEGY, cut);
+  if (route === '/journal') return shaped(body, list(ENTRY), cut);
+  if (route === '/windows/history') return shaped(body, HISTORY, cut);
+  return undefined;
 }
 
 /** One stream event as the public sees it, or null for a type the page does not read. */
 export function publicEvent(event: unknown, cut: (text: string) => string): { type: string; data: unknown } | null {
   if (event === null || typeof event !== 'object') return null;
   const { type, data } = event as { type?: unknown; data?: unknown };
-  if (typeof type !== 'string' || !(EVENT_TYPES as readonly string[]).includes(type)) return null;
-  return { type, data: cutJson(type === 'setup' ? publicSetup(data) : data, cut) };
+  if (typeof type !== 'string' || !Object.hasOwn(EVENT_SHAPES, type)) return null;
+  const out = shaped(data, EVENT_SHAPES[type]!, cut);
+  return out === undefined ? null : { type, data: out };
 }
 
 // ---------- the upstream ----------
 
 export interface Answer {
   status: number;
-  /** JSON text, already cut. */
+  /** JSON text, already shaped and cut. */
   body: string;
   retryAfterS?: number;
 }
@@ -260,29 +363,40 @@ export interface Answer {
 export type StreamStatus = 'connecting' | 'connected' | 'down';
 
 export interface UpstreamListener {
-  /** One SSE chunk (`data: …\n\n`), already cut. */
-  event(chunk: string): void;
+  /** One SSE chunk (`data: …\n\n`), already shaped and cut, encoded once for every visitor. */
+  event(chunk: Buffer): void;
   /** The upstream stream ended: every visitor stream should end, so each page reconnects and reads /state again. */
   drop(): void;
+}
+
+export interface Rate {
+  perSecond: number;
+  burst: number;
 }
 
 export interface LiveUpstreamOptions extends LiveConfig {
   fetch?: typeof fetch;
   now?: () => number;
+  random?: () => number;
   log?: (line: string) => void;
-  /** GET /state and /strategy are answered from the cache this long. */
+  /** GET /state, /strategy and the newest journal page are fresh in the cache this long. */
   stateTtlMs?: number;
-  /** Journal pages and window histories: they change slowly. */
+  /** Older journal pages and window histories: they change slowly. */
   pageTtlMs?: number;
-  /** A failed read is answered from the cache this long, so a crowd during an outage sends one request, not many. */
+  /** After a failed read the key is not asked again for this long (the last good answer is served meanwhile). */
   errorTtlMs?: number;
   maxCacheBytes?: number;
   /** A larger answer from the engine is refused. */
   maxBodyBytes?: number;
-  /** Upstream GETs the host may start: a token bucket, `perSecond` refilled, `burst` at most. */
-  rate?: { perSecond: number; burst: number };
+  /**
+   * Cache misses on the reads a page asks for by id (window histories, older journal pages), in all and per client: token
+   * buckets. The core reads (/state, /strategy, the newest journal page) are outside both: they are one key each,
+   * fetched at most once per stateTtlMs, so no crowd can starve them.
+   */
+  rate?: Rate;
+  clientRate?: Rate;
   timeoutMs?: number;
-  /** The wait before the stream is opened again, after `attempt` failures in a row (0 = the first). */
+  /** The wait before the stream is opened again, after `attempt` failures in a row (0 = the first); jitter is added. */
   backoff?: (attempt: number) => number;
   /** No byte from the engine's stream for this long (it pings every 15 s): the stream is taken as dead. */
   idleMs?: number;
@@ -297,41 +411,87 @@ export const MAX_CACHE_BYTES = 32 * 1024 * 1024;
 export const MAX_BODY_BYTES = 8 * 1024 * 1024;
 /** One SSE event larger than this ends the stream: the engine never sends one near it. */
 const MAX_EVENT_BYTES = 4 * 1024 * 1024;
-export const UPSTREAM_RATE = { perSecond: 3, burst: 10 } as const;
+/** Room for a cold page's window histories (one per tradable window) and some paging, then a few a second. */
+export const UPSTREAM_RATE: Rate = { perSecond: 5, burst: 120 };
+export const CLIENT_RATE: Rate = { perSecond: 1, burst: 80 };
+/** Clients whose read budget is remembered; past this the oldest is forgotten. */
+const MAX_CLIENTS = 10_000;
+/** Journal ids the host has seen (in /state, in events, in pages); `before=` must be one of them. */
+const MAX_JOURNAL_IDS = 20_000;
 export const REFUSED_PAUSE_MS = 60_000;
 const LOG_EVERY_MS = 60_000;
+const CORE_KEYS: ReadonlySet<string> = new Set(['/state', '/strategy', '/journal']);
 
 /** 1 s, 2 s, 4 s ... up to 30 s. */
 export function upstreamBackoff(attempt: number): number {
   return Math.min(30_000, 1000 * 2 ** Math.max(0, attempt));
 }
 
-interface Cached {
-  answer: Answer;
-  until: number;
+class Bucket {
+  readonly rate: Rate;
+  #tokens: number;
+  #at: number;
+  constructor(rate: Rate, now: number) {
+    this.rate = rate;
+    this.#tokens = rate.burst;
+    this.#at = now;
+  }
+
+  #refill(now: number): void {
+    this.#tokens = Math.min(this.rate.burst, this.#tokens + ((now - this.#at) / 1000) * this.rate.perSecond);
+    this.#at = now;
+  }
+
+  has(now: number): boolean {
+    this.#refill(now);
+    return this.#tokens >= 1;
+  }
+
+  take(): void {
+    this.#tokens -= 1;
+  }
+}
+
+interface Entry {
+  /** The last 200 (or the engine's own 400 or 404) for this key; never replaced by a failure. */
+  good: Answer | null;
+  /** The invalidation count when `good` was asked for: an answer asked for earlier never replaces it. */
+  goodGen: number;
+  freshUntil: number;
+  /** The last failure, served only while there is no good answer, until retryAt. */
+  failed: Answer | null;
+  retryAt: number;
   bytes: number;
 }
 
 const json = (status: number, body: unknown, retryAfterS?: number): Answer => ({ status, body: JSON.stringify(body), ...(retryAfterS === undefined ? {} : { retryAfterS }) });
 
-export const NOT_ANSWERING = 'The live engine is not answering right now. This page tries again by itself.';
+const NO_HISTORY = { error: 'no history for that window: the last scan did not list it' };
+
+export const NOT_ANSWERING ='The live engine is not answering right now. This page tries again by itself.';
+const BUSY = (): Answer => json(503, { ok: false, error: 'busy', reason: 'Too many requests reach the live engine right now; try again in a few seconds.' }, 2);
 
 /**
- * The host's one link to the live engine's read-only view. Reads are cached per path and query, one request per key
- * at a time however many visitors ask, and at most `rate` new requests a second in all; past that, the last answer
- * is served stale, or 503. The event stream is one connection, opened at start(), reconnected with backoff.
+ * The host's one link to the live engine's read-only view. Reads are cached per path and query (a stale answer is kept
+ * and served whenever a fresh one cannot be had), one request per key at a time however many visitors ask. The event
+ * stream is one connection, opened at start(), reconnected with backoff.
  */
 export class LiveUpstream {
   readonly #o: LiveUpstreamOptions;
   readonly #cut: (text: string) => string;
-  readonly #cache = new Map<string, Cached>();
-  readonly #inflight = new Map<string, Promise<Answer>>();
+  readonly #cache = new Map<string, Entry>();
+  readonly #inflight = new Map<string, { gen: number; p: Promise<Answer> }>();
+  /** Bumped by an invalidation: a fetch that started before it is not stored as fresh. */
+  readonly #gen = new Map<string, number>();
   readonly #listeners = new Set<UpstreamListener>();
-  readonly #latest = new Map<string, string>();
+  readonly #latest = new Map<string, Buffer>();
   readonly #logged = new Map<string, { at: number; skipped: number }>();
+  readonly #clients = new Map<string, Bucket>();
+  readonly #budget: Bucket;
+  /** Window ids of the engine's latest list (stream or /state); a history of another id is 404 at the host. */
+  #windowIds: ReadonlySet<string> | null = null;
+  readonly #journalIds = new Set<string>();
   #cacheBytes = 0;
-  #tokens: number;
-  #refilledAt: number;
   #refusedUntil = 0;
   #status: StreamStatus = 'connecting';
   #stopped = true;
@@ -344,8 +504,7 @@ export class LiveUpstream {
   constructor(options: LiveUpstreamOptions) {
     this.#o = options;
     this.#cut = publicCutter([options.token, options.base, new URL(options.base).host]);
-    this.#tokens = (options.rate ?? UPSTREAM_RATE).burst;
-    this.#refilledAt = this.#now();
+    this.#budget = new Bucket(options.rate ?? UPSTREAM_RATE, this.#now());
   }
 
   get status(): StreamStatus {
@@ -388,69 +547,123 @@ export class LiveUpstream {
     return { accept, authorization: `Bearer ${this.#o.token}` };
   }
 
-  #takeToken(): boolean {
-    const rate = this.#o.rate ?? UPSTREAM_RATE;
-    const now = this.#now();
-    this.#tokens = Math.min(rate.burst, this.#tokens + ((now - this.#refilledAt) / 1000) * rate.perSecond);
-    this.#refilledAt = now;
-    if (this.#tokens < 1) return false;
-    this.#tokens -= 1;
-    return true;
-  }
-
-  #ttl(key: string, answer: Answer): number {
-    if (answer.status !== 200 && answer.status !== 404 && answer.status !== 400) return this.#o.errorTtlMs ?? ERROR_TTL_MS;
-    return key === '/state' || key === '/strategy' ? (this.#o.stateTtlMs ?? STATE_TTL_MS) : (this.#o.pageTtlMs ?? PAGE_TTL_MS);
-  }
-
-  #store(key: string, answer: Answer): void {
-    const old = this.#cache.get(key);
-    if (old !== undefined) {
-      this.#cacheBytes -= old.bytes;
-      this.#cache.delete(key);
+  #clientBucket(client: string): Bucket {
+    let b = this.#clients.get(client);
+    if (b === undefined) {
+      b = new Bucket(this.#o.clientRate ?? CLIENT_RATE, this.#now());
+      if (this.#clients.size >= MAX_CLIENTS) this.#clients.delete(this.#clients.keys().next().value!);
+    } else {
+      this.#clients.delete(client);
     }
-    const bytes = answer.body.length + key.length;
+    this.#clients.set(client, b);
+    return b;
+  }
+
+  #ttl(key: string): number {
+    return CORE_KEYS.has(key) ? (this.#o.stateTtlMs ?? STATE_TTL_MS) : (this.#o.pageTtlMs ?? PAGE_TTL_MS);
+  }
+
+  #store(key: string, answer: Answer, gen: number): void {
+    const now = this.#now();
+    const e = this.#cache.get(key) ?? { good: null, goodGen: -1, freshUntil: 0, failed: null, retryAt: 0, bytes: 0 };
+    const good = answer.status === 200 || answer.status === 400 || answer.status === 404;
+    // Two fetches of one key overlap only across an invalidation; the older one, landing last, changes nothing.
+    if (good && e.good !== null && gen < e.goodGen) return;
+    this.#cache.delete(key);
+    this.#cacheBytes -= e.bytes;
+    if (good) {
+      e.good = answer;
+      e.goodGen = gen;
+      // A fetch that started before an invalidation is kept, but as stale: what it read may predate the change.
+      e.freshUntil = gen === (this.#gen.get(key) ?? 0) ? now + this.#ttl(key) : 0;
+      e.failed = null;
+      e.retryAt = 0;
+    } else {
+      // A failure never replaces the last good answer.
+      e.failed = answer;
+      e.retryAt = now + (this.#o.errorTtlMs ?? ERROR_TTL_MS);
+    }
+    e.bytes = (e.good?.body.length ?? 0) + (e.failed?.body.length ?? 0) + key.length;
     const max = this.#o.maxCacheBytes ?? MAX_CACHE_BYTES;
-    if (bytes > max) return;
-    while (this.#cacheBytes + bytes > max && this.#cache.size > 0) {
+    if (e.bytes > max) return;
+    while (this.#cacheBytes + e.bytes > max && this.#cache.size > 0) {
       const [oldest, entry] = this.#cache.entries().next().value!;
       this.#cacheBytes -= entry.bytes;
       this.#cache.delete(oldest);
     }
-    this.#cache.set(key, { answer, until: this.#now() + this.#ttl(key, answer), bytes });
-    this.#cacheBytes += bytes;
+    this.#cache.set(key, e);
+    this.#cacheBytes += e.bytes;
   }
 
-  /** Forgets the cached answers for these keys: the stream says they changed. */
+  /** The stream says these keys changed: their answers are kept, but stale, and a fetch in flight is not taken as fresh. */
   #invalidate(...keys: string[]): void {
-    for (const [key, entry] of this.#cache) {
-      if (keys.includes(key)) {
-        this.#cacheBytes -= entry.bytes;
-        this.#cache.delete(key);
+    for (const key of keys) {
+      this.#gen.set(key, (this.#gen.get(key) ?? 0) + 1);
+      const e = this.#cache.get(key);
+      if (e !== undefined) e.freshUntil = 0;
+    }
+  }
+
+  #learnJournal(entries: unknown): void {
+    if (!Array.isArray(entries)) return;
+    for (const e of entries) {
+      const id = typeof e === 'object' && e !== null ? (e as { id?: unknown }).id : undefined;
+      if (typeof id !== 'string') continue;
+      this.#journalIds.delete(id);
+      this.#journalIds.add(id);
+      if (this.#journalIds.size > MAX_JOURNAL_IDS) this.#journalIds.delete(this.#journalIds.values().next().value!);
+    }
+  }
+
+  #learnWindows(windows: unknown): void {
+    if (!Array.isArray(windows)) return;
+    this.#windowIds = new Set(windows.map((w: unknown) => (typeof w === 'object' && w !== null ? (w as { id?: unknown }).id : undefined)).filter((id) => typeof id === 'string'));
+  }
+
+  /**
+   * GET `key` (a path and query from liveRoute) of the engine, as the public may see it, for `client` (addressGroup).
+   * A history is answered only for a window the engine listed; an older journal page only before an entry the host
+   * has served (else `[]`, as the engine answers for an id it does not hold).
+   */
+  async read(key: string, client = 'unknown'): Promise<Answer> {
+    const now = this.#now();
+    const route = key.split('?')[0]!;
+    const core = CORE_KEYS.has(key);
+    if (!core) {
+      const param = decodeURIComponent(key.slice(key.indexOf('=') + 1));
+      if (route === '/windows/history') {
+        if (this.#windowIds === null) {
+          // The host has not seen a window list yet: /state brings one (or says why the engine cannot be read).
+          const state = await this.read('/state', client);
+          if (this.#windowIds === null) return state.status === 200 ? json(404, NO_HISTORY) : state;
+        }
+        if (!this.#windowIds.has(param)) return json(404, NO_HISTORY);
+      } else if (route === '/journal' && !this.#journalIds.has(param)) {
+        return { status: 200, body: '[]' };
       }
     }
-  }
-
-  /** GET `key` (a path and query from liveRoute) of the engine, as the public may see it. */
-  read(key: string): Promise<Answer> {
-    const cached = this.#cache.get(key);
-    if (cached !== undefined && cached.until > this.#now()) return Promise.resolve(cached.answer);
+    const e = this.#cache.get(key);
+    if (e?.good && e.freshUntil > now) return e.good;
+    const gen = this.#gen.get(key) ?? 0;
     const running = this.#inflight.get(key);
-    if (running !== undefined) return running;
-    if (this.#now() < this.#refusedUntil) {
-      return Promise.resolve(cached?.answer ?? json(503, { ok: false, error: 'live engine refused', reason: NOT_ANSWERING }, 30));
-    }
-    if (!this.#takeToken()) {
-      // Over the budget: the last answer, even if old, else ask the page to wait.
-      return Promise.resolve(cached?.answer ?? json(503, { ok: false, error: 'busy', reason: 'Too many requests reach the live engine right now; try again in a few seconds.' }, 2));
+    if (running !== undefined && running.gen === gen) return running.p;
+    const stale = e?.good ?? null;
+    if (e !== undefined && now < e.retryAt) return stale ?? e.failed ?? BUSY();
+    if (now < this.#refusedUntil) return stale ?? json(503, { ok: false, error: 'live engine refused', reason: NOT_ANSWERING }, 30);
+    if (!core) {
+      // Over a budget: the last answer, even if old, else ask the page to wait. Nothing is spent unless both have room.
+      const mine = this.#clientBucket(client);
+      if (!mine.has(now) || !this.#budget.has(now)) return stale ?? BUSY();
+      mine.take();
+      this.#budget.take();
     }
     const p = this.#get(key).then((answer) => {
-      this.#store(key, answer);
-      return answer;
+      this.#store(key, answer, gen);
+      return this.#cache.get(key)?.good ?? answer;
     }).finally(() => {
-      this.#inflight.delete(key);
+      if (this.#inflight.get(key)?.p === p) this.#inflight.delete(key);
     });
-    this.#inflight.set(key, p);
+    this.#inflight.set(key, { gen, p });
     return p;
   }
 
@@ -488,24 +701,28 @@ export class LiveUpstream {
     }
     const length = Number(res.headers.get('content-length') ?? '0');
     const max = this.#o.maxBodyBytes ?? MAX_BODY_BYTES;
+    const tooLarge = () => json(502, { ok: false, error: 'too large', reason: 'The live engine\'s answer is too large to serve.' });
     if (length > max) {
       await res.body?.cancel().catch(() => undefined);
-      return json(502, { ok: false, error: 'too large', reason: 'The live engine\'s answer is too large to serve.' });
+      return tooLarge();
     }
     let parsed: unknown;
     try {
       const text = await res.text();
-      if (text.length > max) return json(502, { ok: false, error: 'too large', reason: 'The live engine\'s answer is too large to serve.' });
+      if (text.length > max) return tooLarge();
       parsed = JSON.parse(text);
     } catch {
       return json(502, { ok: false, error: 'live engine error', reason: 'The live engine\'s answer was not JSON.' });
     }
-    if (res.status !== 200) {
-      // The engine's own 400 or 404 ({ error }): its words, cut like the rest.
-      return { status: res.status, body: JSON.stringify(cutJson(parsed, this.#cut)) };
+    if (res.status !== 200) return { status: res.status, body: JSON.stringify(shaped(parsed, ERROR, this.#cut) ?? {}) };
+    const body = publicRead(route, parsed, this.#cut);
+    if (body === undefined || body === null) return json(502, { ok: false, error: 'live engine error', reason: 'The live engine\'s answer was not what this page reads.' });
+    if (route === '/state') {
+      this.#learnWindows((body as { windows?: unknown }).windows);
+      this.#learnJournal((body as { journal?: unknown }).journal);
+    } else if (route === '/journal') {
+      this.#learnJournal(body);
     }
-    const body = route === '/state' ? publicState(parsed, this.#cut) : cutJson(parsed, this.#cut);
-    if (body === null) return json(502, { ok: false, error: 'live engine error', reason: 'The live engine\'s state was not an object.' });
     return { status: 200, body: JSON.stringify(body) };
   }
 
@@ -524,7 +741,7 @@ export class LiveUpstream {
   }
 
   /** The latest event of each snapshot type, as chunks, for a visitor's stream to start with. */
-  snapshots(): string[] {
+  snapshots(): Buffer[] {
     return SNAPSHOT_TYPES.map((t) => this.#latest.get(t)).filter((c) => c !== undefined);
   }
 
@@ -549,6 +766,12 @@ export class LiveUpstream {
     this.#timer.unref?.();
   }
 
+  /** The backoff for this failure, with ±25 % jitter, so hosts restarted together do not knock in step. */
+  #backoff(): number {
+    const base = (this.#o.backoff ?? upstreamBackoff)(this.#failures++);
+    return Math.round(base * (0.75 + 0.5 * (this.#o.random ?? Math.random)()));
+  }
+
   #down(): void {
     const was = this.#status;
     this.#status = 'down';
@@ -558,7 +781,6 @@ export class LiveUpstream {
 
   async #open(): Promise<void> {
     if (this.#stopped) return;
-    const backoff = this.#o.backoff ?? upstreamBackoff;
     const wait = this.#refusedUntil - this.#now();
     if (wait > 0) return this.#schedule(wait);
     if (this.#status !== 'connected') this.#status = this.#failures === 0 ? 'connecting' : 'down';
@@ -572,7 +794,7 @@ export class LiveUpstream {
       if (this.#stopped) return;
       this.#logEvery('stream', `live: GET /events: the engine did not answer (${err instanceof Error ? err.name : 'error'}); trying again`);
       this.#down();
-      this.#schedule(backoff(this.#failures++));
+      this.#schedule(this.#backoff());
       return;
     }
     if (res.status !== 200 || res.body === null) {
@@ -580,7 +802,7 @@ export class LiveUpstream {
       if (res.status === 401 || res.status === 403) this.#refused(res.status);
       else this.#logEvery('stream', `live: GET /events: the engine answered ${res.status}; trying again`);
       this.#down();
-      this.#schedule(Math.max(backoff(this.#failures++), this.#refusedUntil - this.#now()));
+      this.#schedule(Math.max(this.#backoff(), this.#refusedUntil - this.#now()));
       return;
     }
     const openedAt = this.#now();
@@ -594,14 +816,16 @@ export class LiveUpstream {
     if (this.#now() - openedAt >= 10_000) this.#failures = 0;
     this.#logEvery('stream', `live: event stream ended (${reason}); reconnecting`);
     this.#down();
-    this.#schedule(backoff(this.#failures++));
+    this.#schedule(this.#backoff());
   }
 
-  /** Reads the engine's SSE until it ends; resolves with why. */
+  /** Reads the engine's SSE until it ends; resolves with why. Events may arrive split across any number of chunks. */
   async #pump(body: ReadableStream<Uint8Array>, abort: AbortController): Promise<string> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    /** A CR at the end of a chunk: whether it is a CRLF is known only with the next one. */
+    let carry = '';
     let idle: ReturnType<typeof setTimeout> | undefined;
     let timedOut = false;
     const arm = () => {
@@ -618,7 +842,13 @@ export class LiveUpstream {
         const { value, done } = await reader.read();
         if (done) return 'closed by the engine';
         arm();
-        buffer += decoder.decode(value, { stream: true }).replace(/\r\n?/g, '\n');
+        let text = carry + decoder.decode(value, { stream: true });
+        carry = '';
+        if (text.endsWith('\r')) {
+          carry = '\r';
+          text = text.slice(0, -1);
+        }
+        buffer += text.replace(/\r\n?/g, '\n');
         let at: number;
         while ((at = buffer.indexOf('\n\n')) >= 0) {
           const block = buffer.slice(0, at);
@@ -651,9 +881,13 @@ export class LiveUpstream {
     }
     const event = publicEvent(parsed, this.#cut);
     if (event === null) return;
-    const chunk = `data: ${JSON.stringify(event)}\n\n`;
+    const chunk = Buffer.from(`data: ${JSON.stringify(event)}\n\n`);
     if ((SNAPSHOT_TYPES as readonly string[]).includes(event.type)) this.#latest.set(event.type, chunk);
-    if (event.type === 'journal') this.#invalidate('/state', '/journal');
+    if (event.type === 'windows') this.#learnWindows(event.data);
+    if (event.type === 'journal') {
+      this.#learnJournal([event.data]);
+      this.#invalidate('/state', '/journal');
+    }
     for (const l of this.#listeners) l.event(chunk);
   }
 }
@@ -661,7 +895,7 @@ export class LiveUpstream {
 // ---------- the public server ----------
 
 export interface LiveHostOptions {
-  /** The built dashboard (web/dist, the hosted-live build). */
+  /** The built dashboard (web/dist-live, the hosted-live build). */
   webDir: string;
   /** Null: not configured; the page still serves and says so. */
   upstream: LiveUpstream | null;
@@ -670,13 +904,20 @@ export interface LiveHostOptions {
   log?: (line: string) => void;
   /** Visitor event streams at once, for everyone; more are answered 503 (the page retries). */
   maxStreams?: number;
-  /** Visitor event streams at once from one address (clientKey); more are answered 429. */
+  /** Visitor event streams at once from one address (addressGroup); more are answered 429. */
   maxStreamsPerClient?: number;
+  /** Bytes one visitor may leave unread on its stream before it is dropped. */
   maxUnreadBytes?: number;
+  /** Bytes all visitors together may leave unread; past it the slowest are dropped first. */
+  maxUnreadTotal?: number;
   heartbeatMs?: number;
 }
 
 export const MAX_VISITOR_STREAMS = 300;
+/** A few of the largest events (the windows list) behind: more and the visitor reconnects and reads /state. */
+export const MAX_VISITOR_UNREAD = 512 * 1024;
+/** What all slow visitors together may park in the host's memory. */
+export const MAX_UNREAD_TOTAL = 32 * 1024 * 1024;
 
 const TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -699,8 +940,11 @@ const COMMON_HEADERS = {
   'x-frame-options': 'DENY',
 } as const;
 
+const PING = Buffer.from(': ping\n\n');
+const RETRY = Buffer.from('retry: 5000\n\n');
+
 export interface LiveHostServer extends Server {
-  stats(): { visitors: number };
+  stats(): { visitors: number; unreadBytes: number };
   /** Ends every visitor stream and stops the heartbeat (shutdown). */
   dropStreams(): void;
 }
@@ -719,22 +963,44 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extra: Rec
 export function createLiveHostServer(o: LiveHostOptions): LiveHostServer {
   const visitors = new Set<ServerResponse>();
   const perClient = new Map<string, number>();
+  const logged = new Map<string, number>();
   const log = (line: string) => o.log?.(line);
-  const maxUnread = o.maxUnreadBytes ?? MAX_UNREAD_BYTES;
+  const logEvery = (kind: string, line: string) => {
+    const now = Date.now();
+    if (now - (logged.get(kind) ?? 0) < LOG_EVERY_MS) return;
+    logged.set(kind, now);
+    log(line);
+  };
+  const maxUnread = o.maxUnreadBytes ?? MAX_VISITOR_UNREAD;
+  const maxTotal = o.maxUnreadTotal ?? MAX_UNREAD_TOTAL;
   const notConfigured = { ok: false, error: 'live engine not configured', reason: NOT_CONFIGURED_REASON };
 
-  const send = (res: ServerResponse, chunk: string): void => {
+  const drop = (res: ServerResponse, why: string): void => {
+    visitors.delete(res);
+    logEvery(`drop-${why}`, `visitor stream dropped: ${res.writableLength} bytes unread (${why})`);
+    res.destroy();
+  };
+  const send = (res: ServerResponse, chunk: Buffer): void => {
     if (!visitors.has(res)) return;
     res.write(chunk);
-    if (res.writableLength > maxUnread) {
-      visitors.delete(res);
-      log(`visitor stream dropped: ${res.writableLength} bytes unread, over ${maxUnread}`);
-      res.destroy();
+    if (res.writableLength > maxUnread) drop(res, `over ${maxUnread} for one visitor`);
+  };
+  /** After a fan-out: while all visitors together hold more than maxTotal unread, the one holding most goes. */
+  const enforceTotal = (): void => {
+    let total = 0;
+    for (const res of visitors) total += res.writableLength;
+    if (total <= maxTotal) return;
+    const slowest = [...visitors].sort((a, b) => b.writableLength - a.writableLength);
+    for (const res of slowest) {
+      if (total <= maxTotal) break;
+      total -= res.writableLength;
+      drop(res, `over ${maxTotal} for all visitors`);
     }
   };
   const unsubscribe = o.upstream?.subscribe({
     event: (chunk) => {
       for (const res of visitors) send(res, chunk);
+      enforceTotal();
     },
     drop: () => {
       // Each page notices, reconnects, and reads /state again once the engine is back.
@@ -743,7 +1009,8 @@ export function createLiveHostServer(o: LiveHostOptions): LiveHostServer {
     },
   });
   const heartbeat = setInterval(() => {
-    for (const res of visitors) send(res, ': ping\n\n');
+    for (const res of visitors) send(res, PING);
+    enforceTotal();
   }, o.heartbeatMs ?? 15_000);
   heartbeat.unref();
 
@@ -751,13 +1018,16 @@ export function createLiveHostServer(o: LiveHostOptions): LiveHostServer {
     ? { live: 'not-configured', reason: o.offReason ?? NOT_CONFIGURED_REASON }
     : { live: o.upstream.status };
 
-  const events = (req: IncomingMessage, res: ServerResponse): void => {
+  const events = (req: IncomingMessage, res: ServerResponse, key: string): void => {
     if (o.upstream === null) return sendJson(res, 503, notConfigured);
     if (o.upstream.status !== 'connected') return sendJson(res, 503, { ok: false, error: 'live engine not answering', reason: NOT_ANSWERING }, { 'retry-after': '5' });
-    const key = clientKey(req);
     const mine = perClient.get(key) ?? 0;
     if (visitors.size >= (o.maxStreams ?? MAX_VISITOR_STREAMS)) return sendJson(res, 503, { ok: false, error: 'too many streams', reason: 'This site serves as many live streams as it allows right now; the page tries again by itself.' });
-    if (mine >= (o.maxStreamsPerClient ?? MAX_STREAMS_PER_CLIENT)) {
+    const cap = o.maxStreamsPerClient ?? MAX_STREAMS_PER_CLIENT;
+    if (mine >= cap) {
+      // The address the cap counted, for the post-deploy check (docs/deploy-live-view.md): the edge's, never one a visitor forged.
+      // The key came from a header: printable characters only, and short, in the log.
+      logEvery('per-client', `visitor streams: ${mine} open from ${key.replace(/[^!-~]/g, '?').slice(0, 64)}, the cap of ${cap}; refused (429)`);
       return sendJson(res, 429, { ok: false, error: 'too many streams', reason: `${mine} streams are open from this address already; close a tab and the page tries again.` });
     }
     perClient.set(key, mine + 1);
@@ -768,7 +1038,7 @@ export function createLiveHostServer(o: LiveHostOptions): LiveHostServer {
       'x-accel-buffering': 'no',
     });
     visitors.add(res);
-    send(res, 'retry: 5000\n\n');
+    send(res, RETRY);
     for (const chunk of o.upstream.snapshots()) send(res, chunk);
     let counted = true;
     const gone = () => {
@@ -814,19 +1084,23 @@ export function createLiveHostServer(o: LiveHostOptions): LiveHostServer {
         'cache-control': url.pathname.startsWith('/assets/') ? 'public, max-age=31536000, immutable' : 'no-cache',
       });
       if (method === 'HEAD') return void res.end();
-      createReadStream(file).pipe(res);
+      const stream = createReadStream(file);
+      // A file that cannot be read (removed by a rebuild, a disk error) ends this response, never the host.
+      stream.on('error', () => res.destroy());
+      stream.pipe(res);
       return;
     }
+    const key = addressGroup(clientKey(req));
     if (route.kind === 'events') {
       if (method === 'HEAD') {
         res.writeHead(o.upstream?.status === 'connected' ? 200 : 503, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-store' });
         return void res.end();
       }
-      return events(req, res);
+      return events(req, res, key);
     }
     // A read.
     if (o.upstream === null) return sendJson(res, 503, notConfigured);
-    const answer = await o.upstream.read(route.key);
+    const answer = await o.upstream.read(route.key, key);
     const extra: Record<string, string> = answer.retryAfterS === undefined ? {} : { 'retry-after': String(answer.retryAfterS) };
     if (method === 'HEAD') {
       res.writeHead(answer.status, { 'content-type': 'application/json; charset=utf-8', 'content-length': Buffer.byteLength(answer.body), 'cache-control': 'no-store', ...extra });
@@ -848,7 +1122,11 @@ export function createLiveHostServer(o: LiveHostOptions): LiveHostServer {
     unsubscribe?.();
   });
   return Object.assign(server, {
-    stats: () => ({ visitors: visitors.size }),
+    stats: () => {
+      let unreadBytes = 0;
+      for (const res of visitors) unreadBytes += res.writableLength;
+      return { visitors: visitors.size, unreadBytes };
+    },
     dropStreams(): void {
       clearInterval(heartbeat);
       for (const res of visitors) res.end();

@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dist-live/
 target/
 .env
 .env.*

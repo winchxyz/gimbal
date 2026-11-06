@@ -1,16 +1,17 @@
 // The public live view (docs/deploy-live-view.md): the real mainnet desk, read-only, for anyone with a browser.
 //   node engine/src/cli/live-host.ts [--host 0.0.0.0]
-// It listens on $PORT (default 8080) on every address and serves, on that one origin, the built dashboard (web/dist,
-// the hosted-live build, built first if missing) and a read-only proxy to the live engine's view
-// (engine/src/view/): GIMBAL_LIVE_URL is the view's address, GIMBAL_VIEW_TOKEN its bearer token. The token is added
-// here, server-side, and never reaches a browser, a response or a log line. Without either variable the page still
-// serves and says the live engine is not configured.
+// It listens on $PORT (default 8080) on every address and serves, on that one origin, the built dashboard
+// (web/dist-live, the hosted-live build, built first if missing; a folder of its own, so the replay's web/dist is never
+// overwritten) and a read-only proxy to the live engine's view (engine/src/view/): GIMBAL_LIVE_URL is the view's
+// address, GIMBAL_VIEW_TOKEN its bearer token. The token is added here, server-side, and never reaches a browser, a
+// response or a log line. Without either variable the page still serves and says the live engine is not configured.
 //
 // Read-only for visitors: only the reads the dashboard needs (GET /state, /strategy, /journal?before=,
 // /windows/history?id=, /events) are forwarded; every write is refused here (live-host-lib.ts liveRoute) and never
 // reaches the engine. The engine is protected from the crowd: one upstream event stream fanned out to every visitor
-// (capped), GET answers cached for a few seconds, one request per key at a time, a small budget of new requests a
-// second. GET /healthz answers 200 with the upstream's state.
+// (capped), GET answers cached (a stale one served when a fresh one cannot be had), one request per key at a time, the
+// reads asked for by id held to ids the engine listed and to a budget per visitor and in all. GET /healthz answers
+// 200 with the upstream's state.
 //
 // The replay is not this: `npm run demo` (locally) or engine/src/cli/replay-host.ts (docs/deploy-replay.md).
 
@@ -23,7 +24,7 @@ import { parseArgs } from 'node:util';
 import { LiveUpstream, createLiveHostServer, isLiveBuild, liveConfigFromEnv } from './live-host-lib.ts';
 
 const root = fileURLToPath(new URL('../../../', import.meta.url));
-const webDir = join(root, 'web', 'dist');
+const webDir = join(root, 'web', 'dist-live');
 
 const { values } = parseArgs({ options: { host: { type: 'string', default: '0.0.0.0' } } });
 const publicPort = Number(process.env.PORT ?? '8080');
@@ -59,11 +60,11 @@ function shutdown(code: number): void {
 }
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK'] as const) process.on(sig, () => shutdown(0));
 
-/** web/dist from the image's build; built here as the hosted-live build when missing or another build. */
+/** web/dist-live: built here as the hosted-live build when missing or another build. */
 function ensureWebBuild(): void {
   const index = join(webDir, 'index.html');
   if (existsSync(index) && isLiveBuild(readFileSync(index, 'utf8'))) return;
-  log(`web/dist ${existsSync(index) ? 'is not the hosted-live build (no hosted-live marker)' : 'is missing'}: building the hosted-live dashboard once (production build)`);
+  log(`web/dist-live ${existsSync(index) ? 'is not the hosted-live build (no hosted-live marker)' : 'is missing'}: building the hosted-live dashboard once (production build)`);
   const require = createRequire(join(root, 'package.json'));
   if (!existsSync(join(root, 'shared', 'dist', 'index.js'))) {
     const tsc = join(dirname(require.resolve('typescript/package.json')), 'bin', 'tsc');
@@ -76,7 +77,7 @@ function ensureWebBuild(): void {
   const env: Record<string, string | undefined> = { ...process.env, VITE_HOSTED_LIVE: '1' };
   delete env.GIMBAL_VIEW_TOKEN;
   delete env.GIMBAL_LIVE_URL;
-  if (spawnSync(process.execPath, [vite, 'build'], { cwd: join(root, 'web'), stdio: 'inherit', env }).status !== 0) fail('building web/ failed');
+  if (spawnSync(process.execPath, [vite, 'build', '--outDir', 'dist-live', '--emptyOutDir'], { cwd: join(root, 'web'), stdio: 'inherit', env }).status !== 0) fail('building web/ failed');
 }
 
 function log(line: string): void {

@@ -13,7 +13,19 @@ let hostedLiveForTests: boolean | undefined;
  */
 export const hostedLiveFlag = (env: Readonly<Record<string, unknown>> | undefined): boolean => env?.VITE_HOSTED_LIVE === '1';
 
-export const isHostedLive = (): boolean => hostedLiveForTests ?? hostedLiveFlag(import.meta.env);
+/**
+ * One Vite variable, read by its full name (`import.meta.env.VITE_X`), so the build inlines that value alone and not
+ * the whole env object. Under `node --test` `import.meta.env` is undefined and the read throws: no value.
+ */
+const viteValue = (read: () => unknown): unknown => {
+  try {
+    return read();
+  } catch {
+    return undefined;
+  }
+};
+
+export const isHostedLive = (): boolean => hostedLiveForTests ?? hostedLiveFlag({ VITE_HOSTED_LIVE: viteValue(() => import.meta.env.VITE_HOSTED_LIVE) });
 
 /** For tests: makes the page the hosted-live build, or not (undefined: back to the build's own flag). */
 export function setHostedLiveForTests(on: boolean | undefined): void {
@@ -62,7 +74,7 @@ export interface WriteControls {
  */
 export const hostedReplayFlag = (env: Readonly<Record<string, unknown>> | undefined): boolean => env?.VITE_HOSTED_REPLAY === '1';
 
-export const isHostedReplay = (): boolean => hostedReplayFlag(import.meta.env);
+export const isHostedReplay = (): boolean => hostedReplayFlag({ VITE_HOSTED_REPLAY: viteValue(() => import.meta.env.VITE_HOSTED_REPLAY) });
 
 /**
  * Remote and the public live view: nothing writes. Hosted replay: a public page whose server refuses every write but

@@ -1,24 +1,26 @@
 // The public live view's host: what it refuses (every write, never forwarded), what it 404s, that the token never
 // leaves it (no response, no log line), that visitor headers never reach the engine, one upstream stream for any
-// number of visitors, the visitor caps, the cache and the request budget, the reconnect, the not-configured state,
-// and what it cuts from the engine's payloads before the public sees them.
+// number of visitors, the visitor caps (per address, an IPv6 /64 as one), the unread-bytes caps, the cache (stale kept)
+// and the read budget, the SSE framing, the reconnect, the not-configured state, and what the public sees of the
+// engine's payloads (a field allowlist per type, then the cut), checked against the page's own fixtures.
 
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, request } from 'node:http';
 import type { IncomingHttpHeaders, IncomingMessage, OutgoingHttpHeaders, Server, ServerResponse } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { connect } from 'node:net';
+import type { AddressInfo, Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
-import type { DeskState, EngineState, JournalEntry, StreamEvent } from '@gimbal/shared';
+import type { DeskState, EngineState, JournalEntry, StreamEvent, Window } from '@gimbal/shared';
 import { viewRedactor } from '../view/view-redact.ts';
 import { ViewServer } from '../view/view-server.ts';
 import type { ViewSource } from '../view/view-server.ts';
-import type { LiveHostServer, LiveUpstreamOptions } from './live-host-lib.ts';
+import type { LiveHostOptions, LiveHostServer, LiveUpstreamOptions } from './live-host-lib.ts';
 import {
-  LIVE_BUILD_MARKER, LIVE_READ_ONLY_REASON, LiveUpstream, NOT_CONFIGURED_REASON, createLiveHostServer, isLiveBuild, liveConfigFromEnv, liveRoute,
-  liveStaticFile, publicCutter, publicEvent, publicSetup, publicState,
+  LIVE_BUILD_MARKER, LIVE_READ_ONLY_REASON, LiveUpstream, NOT_CONFIGURED_REASON, addressGroup, createLiveHostServer, isLiveBuild, liveConfigFromEnv,
+  liveRoute, liveStaticFile, publicCutter, publicEvent, publicRead, publicSetup, publicState,
 } from './live-host-lib.ts';
 
 const TOKEN = 'b7e2c94f1a6d38e05c7b9a2f4e81d6c3a5f0b9e7';
@@ -35,6 +37,13 @@ const desk = (): DeskState => ({
   reserveUsd: 20, pnl: { fundingUsd: 0, feesUsd: 0, priceUsd: 0, netUsd: 0 }, health: 'level', paused: null, rescueFailure: null, updatedAt: T0,
 });
 const entry = (id: string, summary: string): JournalEntry => ({ id, t: T0, kind: 'wait', summary, numbers: {}, tx: [] });
+const win = (id: string, extra: Partial<Window> = {}): Window => ({
+  id, symbol: 'SOL', longVenue: 'hyperliquid', shortVenue: 'phoenix', grossAprPct: 20, grossApr7dPct: 18,
+  costs: { feesPct: 1, slippagePct: 0.5, basisPct: 0.2, rescueReservePct: 0 }, netAprPct: 15, usdPerDayPer1k: 0.41, breakevenHours: 12,
+  depthUsd: 1_000_000, intervalsAbove: 3, updatedAt: T0, tradable: true, held: null, checks: [{ ok: true, text: 'policy allows SOL' }], switchCostUsd: null,
+  stale: false, ...extra,
+});
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** A stand-in engine behind a real ViewServer: counts its reads, and emits events on demand. */
 function fakeEngine(extra: Partial<EngineState> = {}) {
@@ -82,13 +91,15 @@ async function listen(server: Server): Promise<number> {
   return (server.address() as AddressInfo).port;
 }
 
-async function startHost(engineBase: string | null, opts: Partial<LiveUpstreamOptions> & { maxStreams?: number; maxStreamsPerClient?: number; stream?: boolean; token?: string } = {}): Promise<Running> {
+type HostLimits = Pick<LiveHostOptions, 'maxStreams' | 'maxStreamsPerClient' | 'maxUnreadBytes' | 'maxUnreadTotal' | 'heartbeatMs'>;
+
+async function startHost(engineBase: string | null, opts: Partial<LiveUpstreamOptions> & HostLimits & { stream?: boolean; token?: string; upstream?: LiveUpstream } = {}): Promise<Running> {
   const lines: string[] = [];
-  const { maxStreams, maxStreamsPerClient, stream = true, token = TOKEN, ...up } = opts;
-  const upstream = engineBase === null ? null : new LiveUpstream({ base: engineBase, token, log: (l) => lines.push(l), backoff: () => 50, ...up });
+  const { maxStreams, maxStreamsPerClient, maxUnreadBytes, maxUnreadTotal, heartbeatMs, stream = true, token = TOKEN, upstream: given, ...up } = opts;
+  const upstream = given ?? (engineBase === null ? null : new LiveUpstream({ base: engineBase, token, log: (l) => lines.push(l), backoff: () => 50, ...up }));
+  const limits = Object.fromEntries(Object.entries({ maxStreams, maxStreamsPerClient, maxUnreadBytes, maxUnreadTotal, heartbeatMs }).filter(([, v]) => v !== undefined));
   const host = createLiveHostServer({
-    webDir, upstream, offReason: engineBase === null ? 'GIMBAL_LIVE_URL and GIMBAL_VIEW_TOKEN are not set' : null, log: (l) => lines.push(l),
-    ...(maxStreams === undefined ? {} : { maxStreams }), ...(maxStreamsPerClient === undefined ? {} : { maxStreamsPerClient }),
+    webDir, upstream, offReason: upstream === null ? 'GIMBAL_LIVE_URL and GIMBAL_VIEW_TOKEN are not set' : null, log: (l) => lines.push(l), ...limits,
   });
   const port = await listen(host);
   if (stream) upstream?.start();
@@ -412,28 +423,452 @@ test('visitor streams are capped, in all and per address', async () => {
   }
 });
 
-test('a crowd reading /state sends one request to the engine; distinct keys share a small budget', async () => {
-  const eng = fakeEngine();
+test('a crowd reading /state sends one request to the engine; histories share a budget per client and in all; the core reads are outside it', async () => {
+  const eng = fakeEngine({ windows: ['A', 'B', 'C', 'D', 'E'].map((id) => win(id)) });
   const v = await startView(eng.source);
-  const h = await startHost(v.base, { stream: false, rate: { perSecond: 0, burst: 4 } });
+  const h = await startHost(v.base, { stream: false, rate: { perSecond: 0, burst: 4 }, clientRate: { perSecond: 0, burst: 3 } });
+  const a = { 'x-real-ip': '198.51.100.7' };
+  const b = { 'x-real-ip': '198.51.100.8' };
   try {
-    const crowd = await Promise.all(Array.from({ length: 60 }, () => call(h.base, 'GET', '/state')));
+    const crowd = await Promise.all(Array.from({ length: 60 }, () => call(h.base, 'GET', '/state', a)));
     for (const r of crowd) assert.equal(r.status, 200);
     assert.equal(eng.reads.state, 1, 'one read for sixty visitors at once');
-    for (let i = 0; i < 20; i++) await call(h.base, 'GET', '/state');
+    for (let i = 0; i < 20; i++) await call(h.base, 'GET', '/state', a);
     assert.equal(eng.reads.state, 1, 'answered from the cache while it is fresh');
-    // Four requests in the budget: /state used one; three window histories pass, the fourth is answered 503 by the host.
-    const histories = [];
-    for (const id of ['A', 'B', 'C', 'D']) histories.push(await call(h.base, 'GET', `/windows/history?id=${id}`));
-    assert.deepEqual(histories.map((r) => r.status), [200, 200, 200, 503]);
-    assert.equal(histories[3]!.headers['retry-after'], '2');
-    assert.equal(eng.reads.history, 3);
-    assert.equal((await call(h.base, 'GET', '/windows/history?id=A')).status, 200, 'a cached key still answers when the budget is spent');
-    assert.equal(h.upstream!.counts.requests, 4);
+    // Client a has three misses, the host four in all.
+    const statuses = async (who: OutgoingHttpHeaders, ids: string[]) => {
+      const out: number[] = [];
+      for (const id of ids) out.push((await call(h.base, 'GET', `/windows/history?id=${id}`, who)).status);
+      return out;
+    };
+    assert.deepEqual(await statuses(a, ['A', 'B', 'C', 'D']), [200, 200, 200, 503]);
+    assert.deepEqual(await statuses(b, ['D', 'E']), [200, 503], 'another client has its own budget, until the host\'s runs out');
+    const busy = await call(h.base, 'GET', '/windows/history?id=E', b);
+    assert.equal(busy.headers['retry-after'], '2');
+    assert.equal(eng.reads.history, 4);
+    assert.equal((await call(h.base, 'GET', '/windows/history?id=A', b)).status, 200, 'a cached key still answers when the budget is spent');
+    // The page's first reads never wait on the budget.
+    for (const p of ['/strategy', '/journal']) assert.equal((await call(h.base, 'GET', p, a)).status, 200, p);
+    assert.equal(h.upstream!.counts.requests, 7);
   } finally {
     await h.stop();
     await v.view.stop();
   }
+});
+
+test('a history the engine did not list is 404 at the host, and an older journal page only follows an entry the host served', async () => {
+  const eng = fakeEngine({ windows: [win('SOL:hyperliquid/phoenix')], journal: [entry('loop-1', 'waiting')] });
+  const v = await startView(eng.source);
+  const h = await startHost(v.base, { stream: false });
+  try {
+    // Cold: the host reads /state first, to learn the windows.
+    assert.equal((await call(h.base, 'GET', '/windows/history?id=SOL%3Ahyperliquid%2Fphoenix')).status, 200);
+    assert.equal(eng.reads.state, 1);
+    for (let i = 0; i < 50; i++) {
+      const r = await call(h.base, 'GET', `/windows/history?id=made-up-${i}`);
+      assert.equal(r.status, 404);
+    }
+    assert.equal(eng.reads.history, 1, 'made-up ids never reach the engine, nor spend the budget');
+    const unknown = await call(h.base, 'GET', '/journal?before=made-up');
+    assert.deepEqual([unknown.status, unknown.text], [200, '[]'], 'what the engine answers for an id it does not hold');
+    assert.equal(eng.reads.journal, 0);
+    assert.equal((await call(h.base, 'GET', '/journal?before=loop-1')).status, 200);
+    assert.equal(eng.reads.journal, 1);
+  } finally {
+    await h.stop();
+    await v.view.stop();
+  }
+});
+
+test('a cold visitor on a desk with 40 tradable windows loads every read without a 503, and the next visitors come from the cache', async () => {
+  const windows = Array.from({ length: 40 }, (_, i) => win(`SYM${i}:hyperliquid/phoenix`));
+  const eng = fakeEngine({ windows });
+  const v = await startView(eng.source);
+  for (const stream of [false, true]) {
+    eng.reads.history = 0;
+    const h = await startHost(v.base, { stream });
+    try {
+      if (stream) await until(() => h.upstream!.status === 'connected');
+      // What the page asks for when it opens: the core reads, and the Windows screen's one history per tradable window,
+      // all at once (useHistories), before the host has seen a window list when there is no stream.
+      const page = (ip: string) => Promise.all([
+        call(h.base, 'GET', '/state', { 'x-real-ip': ip }), call(h.base, 'GET', '/strategy', { 'x-real-ip': ip }), call(h.base, 'GET', '/journal', { 'x-real-ip': ip }),
+        ...windows.map((w) => call(h.base, 'GET', `/windows/history?id=${encodeURIComponent(w.id)}`, { 'x-real-ip': ip })),
+      ]);
+      const first = await page('198.51.100.7');
+      assert.deepEqual(first.filter((r) => r.status !== 200).map((r) => r.status), [], `no refusal (stream ${stream})`);
+      assert.equal(eng.reads.history, 40);
+      for (let i = 0; i < 5; i++) {
+        const next = await page(`203.0.113.${i + 1}`);
+        assert.ok(next.every((r) => r.status === 200));
+      }
+      assert.equal(eng.reads.history, 40, 'the next visitors\' histories come from the cache');
+    } finally {
+      await h.stop();
+    }
+  }
+  await v.view.stop();
+});
+
+// ---------- the cache: stale kept, never overwritten by a failure ----------
+
+/** A fetch whose answers the test settles one by one. */
+function heldFetch() {
+  const pending: { path: string; settle: (r: Response) => void }[] = [];
+  const fetchFn = ((url: string | URL) => new Promise<Response>((settle) => {
+    const u = new URL(String(url));
+    pending.push({ path: `${u.pathname}${u.search}`, settle });
+  })) as typeof fetch;
+  return { fetchFn, pending };
+}
+
+const stateWith = (at: number): EngineState => ({
+  mode: 'mainnet', windows: [], scan: null, strategy: null, desk: null, journal: [], rescue: null, setup: null, health: null, decision: null, at,
+});
+
+test('a failed read never replaces the last good answer: it is served stale, and the engine is asked again only after a pause', async () => {
+  let t = T0;
+  let mode: 'ok' | '500' | 'down' | '401' = 'ok';
+  let asked = 0;
+  const fetchFn = (async () => {
+    asked++;
+    if (mode === 'down') throw new TypeError('fetch failed');
+    if (mode === '500') return new Response('oops', { status: 500 });
+    if (mode === '401') return new Response('no', { status: 401 });
+    return Response.json(stateWith(T0 + asked));
+  }) as typeof fetch;
+  const up = new LiveUpstream({ base: 'http://127.0.0.1:9', token: TOKEN, fetch: fetchFn, now: () => t });
+  const good = await up.read('/state');
+  assert.equal(good.status, 200);
+  for (const m of ['500', 'down'] as const) {
+    t += 10_000;
+    mode = m;
+    const before = asked;
+    assert.deepEqual(await up.read('/state'), good, `${m}: the last good answer`);
+    assert.deepEqual(await up.read('/state'), good);
+    assert.equal(asked, before + 1, `${m}: asked once, then the pause`);
+  }
+  t += 10_000;
+  mode = '401';
+  assert.deepEqual(await up.read('/state'), good, 'refused: still the last good answer');
+  t += 10_000;
+  mode = 'ok';
+  const before = asked;
+  assert.deepEqual(await up.read('/state'), good, 'paused after the refusal: nothing asked');
+  assert.equal(asked, before);
+  t += 60_000;
+  const fresh = await up.read('/state');
+  assert.notDeepEqual(fresh, good);
+  assert.equal(JSON.parse(fresh.body).at, T0 + asked);
+  // With no good answer at all, a failure is answered as one.
+  mode = '500';
+  t += 10_000;
+  assert.equal((await up.read('/strategy')).status, 502);
+});
+
+test('a /state read in flight when the stream says it changed is not taken as fresh', async () => {
+  const held = heldFetch();
+  const sse = sseBody();
+  const fetchFn = ((url: string | URL, init?: RequestInit) => (new URL(String(url)).pathname === '/events' ? Promise.resolve(sse.open(init?.signal)) : held.fetchFn(url))) as typeof fetch;
+  const up = new LiveUpstream({ base: 'http://127.0.0.1:9', token: TOKEN, fetch: fetchFn, backoff: () => 60_000 });
+  const seen: string[] = [];
+  up.subscribe({ event: (c) => seen.push(c.toString('utf8')), drop: () => undefined });
+  up.start();
+  try {
+    await until(() => up.status === 'connected');
+    // 1. Asked before a journal event, answered after it: served to whoever asked, but kept stale.
+    const p1 = up.read('/state');
+    await until(() => held.pending.length === 1);
+    sse.push(`data: ${JSON.stringify({ type: 'journal', data: entry('loop-2', 'entered') })}\n\n`);
+    await until(() => seen.length === 1);
+    held.pending[0]!.settle(Response.json(stateWith(1)));
+    assert.equal(JSON.parse((await p1).body).at, 1);
+    const p2 = up.read('/state');
+    await until(() => held.pending.length === 2);
+    held.pending[1]!.settle(Response.json(stateWith(2)));
+    assert.equal(JSON.parse((await p2).body).at, 2, 'the next read asks again');
+    assert.equal(JSON.parse((await up.read('/state')).body).at, 2, 'and that one is fresh');
+    assert.equal(held.pending.length, 2);
+
+    // 2. Two reads overlap across an event: the older answer, landing last, does not replace the newer.
+    sse.push(`data: ${JSON.stringify({ type: 'journal', data: entry('loop-3', 'rotated') })}\n\n`);
+    await until(() => seen.length === 2);
+    const p3 = up.read('/state');
+    await until(() => held.pending.length === 3);
+    sse.push(`data: ${JSON.stringify({ type: 'journal', data: entry('loop-4', 'exited') })}\n\n`);
+    await until(() => seen.length === 3);
+    const p4 = up.read('/state');
+    await until(() => held.pending.length === 4);
+    held.pending[3]!.settle(Response.json(stateWith(4)));
+    assert.equal(JSON.parse((await p4).body).at, 4);
+    held.pending[2]!.settle(Response.json(stateWith(3)));
+    await p3;
+    assert.equal(JSON.parse((await up.read('/state')).body).at, 4);
+    assert.equal(held.pending.length, 4);
+  } finally {
+    up.stop();
+  }
+});
+
+// ---------- the stream ----------
+
+/** An SSE body the test writes into, chunk by chunk; aborting the request errors it, as a real connection would. */
+function sseBody() {
+  let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+  const encoder = new TextEncoder();
+  return {
+    open(signal?: AbortSignal | null): Response {
+      const body = new ReadableStream<Uint8Array>({ start: (c) => void (controller = c) });
+      signal?.addEventListener('abort', () => {
+        try {
+          controller?.error(new Error('aborted'));
+        } catch {}
+      });
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    },
+    push(text: string): void {
+      controller!.enqueue(encoder.encode(text));
+    },
+  };
+}
+
+test('SSE framing: an event split over chunks, a CRLF split between two chunks, several events in one chunk', async () => {
+  const sse = sseBody();
+  const fetchFn = ((_url: string | URL, init?: RequestInit) => Promise.resolve(sse.open(init?.signal))) as typeof fetch;
+  const up = new LiveUpstream({ base: 'http://127.0.0.1:9', token: TOKEN, fetch: fetchFn, backoff: () => 60_000 });
+  const got: string[] = [];
+  up.subscribe({ event: (c) => got.push(c.toString('utf8')), drop: () => undefined });
+  up.start();
+  try {
+    await until(() => up.status === 'connected');
+    const decision = (reason: string) => JSON.stringify({ type: 'decision', data: { action: 'wait', reason, windowId: null, heldId: null, at: T0 } });
+    const one = `data: ${decision('one')}\n\n`;
+    for (const part of [one.slice(0, 3), one.slice(3, 40), one.slice(40, -1), one.slice(-1)]) sse.push(part);
+    // CRLF endings, one data field over two lines, and the CR and LF of a line in different chunks: still one event.
+    const two = decision('two');
+    const at = two.indexOf(',') + 1;
+    sse.push(`data: ${two.slice(0, at)}\r`);
+    sse.push(`\ndata: ${two.slice(at)}\r\n\r`);
+    sse.push('\n');
+    // A comment and two events in one chunk, with lone CR endings.
+    sse.push(`: ping\r\rdata: ${decision('three')}\r\rdata: ${decision('four')}\n\n`);
+    await until(() => got.length >= 4);
+    await sleep(30);
+    assert.deepEqual(got.map((c) => (JSON.parse(c.slice(6)) as { data: { reason: string } }).data.reason), ['one', 'two', 'three', 'four']);
+    for (const c of got) assert.ok(c.startsWith('data: {') && c.endsWith('}\n\n'), 'each fanned-out chunk is one whole event');
+  } finally {
+    up.stop();
+  }
+});
+
+test('the stream honours the cool-down after a 401: one knock on the engine, not one per backoff', async () => {
+  const engine = await rawEngine((_req, res) => {
+    res.writeHead(401, { 'content-type': 'application/json' }).end('{"error":"unauthorized"}');
+  });
+  const h = await startHost(engine.base, { backoff: () => 20 });
+  try {
+    await until(() => h.upstream!.counts.streams === 1);
+    await sleep(400);
+    assert.equal(engine.seen.filter((s) => s.url === '/events').length, 1, 'twenty backoffs went by; the engine was asked once');
+    assert.equal((await call(h.base, 'GET', '/state')).status, 503);
+    assert.equal((await visit(h.base)).status, 503);
+    assert.equal(engine.seen.length, 1, 'no read either while refused');
+    assert.ok(h.lines.some((l) => l.includes('401') && l.includes('GIMBAL_VIEW_TOKEN')));
+  } finally {
+    await h.stop();
+    await closeServer(engine.server);
+  }
+});
+
+// ---------- slow visitors ----------
+
+/** A visitor that opens /events and never reads: what it is sent piles up on the host. */
+function stuckVisitor(base: string, ip: string): Socket {
+  const u = new URL(base);
+  const s = connect(Number(u.port), u.hostname);
+  s.write(`GET /events HTTP/1.1\r\nHost: ${u.host}\r\nX-Real-IP: ${ip}\r\n\r\n`);
+  s.pause();
+  s.on('error', () => undefined);
+  return s;
+}
+
+/** Sends windows events of about 100 KB through an SSE body until `done`, at most `max` of them. */
+async function flood(sse: ReturnType<typeof sseBody>, done: () => boolean, max = 400): Promise<number> {
+  const big = Array.from({ length: 20 }, (_, i) => win(`W${i}`, { checks: Array.from({ length: 25 }, (_, j) => ({ ok: true, text: `check ${j} `.padEnd(180, '.') })) }));
+  let n = 0;
+  while (!done() && n < max) {
+    sse.push(`data: ${JSON.stringify({ type: 'windows', data: big.map((w) => ({ ...w, updatedAt: T0 + n })) })}\n\n`);
+    n++;
+    await sleep(5);
+  }
+  return n;
+}
+
+for (const limit of ['one visitor', 'all visitors'] as const) {
+  test(`a visitor that does not read is dropped once it holds too much unread (${limit}); a reading visitor keeps every event`, async () => {
+    const sse = sseBody();
+    const fetchFn = ((url: string | URL, init?: RequestInit) => Promise.resolve(new URL(String(url)).pathname === '/events' ? sse.open(init?.signal) : Response.json({}, { status: 404 }))) as typeof fetch;
+    const upstream = new LiveUpstream({ base: 'http://127.0.0.1:9', token: TOKEN, fetch: fetchFn, backoff: () => 60_000 });
+    const h = await startHost(null, {
+      upstream, ...(limit === 'one visitor' ? { maxUnreadBytes: 256 * 1024, maxUnreadTotal: 64 * 1024 * 1024 } : { maxUnreadBytes: 64 * 1024 * 1024, maxUnreadTotal: 256 * 1024 }),
+    });
+    let stuck: Socket | null = null;
+    try {
+      await until(() => upstream.status === 'connected');
+      const fast = await visit(h.base, { 'x-real-ip': '198.51.100.7' });
+      stuck = stuckVisitor(h.base, '198.51.100.8');
+      await until(() => h.host.stats().visitors === 2);
+      const dropped = () => h.lines.some((l) => l.startsWith('visitor stream dropped') && l.includes(`for ${limit}`));
+      const sent = await flood(sse, () => dropped());
+      assert.ok(dropped(), `dropped after ${sent} events`);
+      assert.equal(h.host.stats().visitors, 1, 'the reading visitor stays');
+      await until(() => fast.events().filter((e) => e.type === 'windows').length === sent, 10_000);
+      assert.ok(h.host.stats().unreadBytes < 256 * 1024);
+      fast.close();
+    } finally {
+      stuck?.destroy();
+      await h.stop();
+    }
+  });
+}
+
+// ---------- addresses ----------
+
+test('one address for the caps: an IPv6 /64 counts as one, an IPv4-mapped address as its IPv4', () => {
+  assert.equal(addressGroup('198.51.100.7'), '198.51.100.7');
+  assert.equal(addressGroup('::ffff:198.51.100.7'), '198.51.100.7');
+  assert.equal(addressGroup('2001:db8:1:2:aaaa::1'), '2001:db8:1:2::/64');
+  assert.equal(addressGroup('2001:DB8:1:2:bbbb:cccc:dddd:2'), '2001:db8:1:2::/64');
+  assert.equal(addressGroup('[2001:db8::1]'), '2001:db8:0:0::/64');
+  assert.equal(addressGroup('fe80::1%eth0'), 'fe80:0:0:0::/64');
+  assert.equal(addressGroup('::1'), '0:0:0:0::/64');
+  assert.notEqual(addressGroup('2001:db8:1:3::1'), addressGroup('2001:db8:1:2::1'));
+  assert.equal(addressGroup('unknown'), 'unknown');
+});
+
+test('the per-address stream cap counts a whole IPv6 /64, and its refusal logs the address it counted', async () => {
+  const eng = fakeEngine();
+  const v = await startView(eng.source);
+  const h = await startHost(v.base, { maxStreamsPerClient: 2 });
+  try {
+    await until(() => h.upstream!.status === 'connected');
+    const statuses: number[] = [];
+    const open: Visitor[] = [];
+    for (const ip of ['2001:db8:1:2::a', '2001:db8:1:2:ffff::b', '2001:db8:1:2:1234:5678:9abc:def0', '2001:db8:1:3::a']) {
+      const vi = await visit(h.base, { 'x-real-ip': ip });
+      statuses.push(vi.status);
+      open.push(vi);
+    }
+    assert.deepEqual(statuses, [200, 200, 429, 200]);
+    assert.ok(h.lines.some((l) => l.includes('2 open from 2001:db8:1:2::/64') && l.includes('429')), h.lines.join('\n'));
+    for (const vi of open) vi.close();
+  } finally {
+    await h.stop();
+    await v.view.stop();
+  }
+});
+
+// ---------- the allowlist keeps everything the page reads ----------
+
+const same = (text: string) => text;
+const roundTrip = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
+
+test('every field of every shared type passes the allowlist unchanged (the set-up step details aside); a field the types do not have is dropped', () => {
+  const tx = { chain: 'near' as const, id: '9xQe', url: 'https://nearblocks.io/txns/9xQe' };
+  const full: EngineState = {
+    mode: 'mainnet',
+    windows: [win('SOL:hyperliquid/phoenix', {
+      veto: { verdict: 'pass', reasons: ['spread steady for a week'], model: 'model-a', at: T0 }, refused: { code: 'E_ORACLE_STALE', reason: 'stored price stale' },
+      note: 'refreshed at open', held: { since: T0 - 3_600_000 }, switchCostUsd: 0.42, grossApr7dPct: null,
+    })],
+    scan: { venues: 33, failed: ['paradex'], at: T0 },
+    strategy: { auto: true, minNetAprPct: 10, legUsd: 12, maxLeverage: 2, stopDrawdownPct: 5, rotate: { minGainPts: 5, forHours: 3 }, risk: { watchDistancePct: 15, rescueDistancePct: 8 }, enterAfterChecks: 3, exitAfterChecks: 6 },
+    desk: {
+      ...desk(),
+      legs: [{
+        venue: 'hyperliquid', symbol: 'SOL', side: 'long', size: 0.1, lotSize: 0.01, entry: 180.1, mark: 182.45, liqPx: 120, marginUsd: 6, marginRatio: 0.31,
+        distanceToLiqPct: 32.6, fundingEarnedUsd: 0.02, unsettledFundingUsd: 0.01, feesUsd: -0.01, unpriced: false,
+      }],
+      paused: { by: 'owne…near', at: T0 }, rescueFailure: { rescueId: 'r1', step: 'quote', reason: 'no quote', tries: 2, next: 'the owner must act', at: T0 },
+      accounts: [{ venue: 'hyperliquid', equityUsd: 20, at: T0 }, { venue: 'phoenix', equityUsd: null, at: null }],
+    },
+    journal: [{ id: 'loop-1', t: T0, kind: 'rescue', summary: 'rescued', why: 'margin was low', numbers: { usd: -0.1, from: 'reserve', signedS: '2.1' }, tx: [tx] }],
+    rescue: { id: 'r1', from: 'reserve', to: 'phoenix', amountUsd: 5, sentUsd: 5.1, step: 'landed', startedAt: T0, elapsedS: 52, tx: [tx] },
+    setup: { deskId: 'gimbal-desk', steps: [{ step: 'hl_set_referrer', status: 'done', detail: 'referrer set: CODE', tx: [tx] }] },
+    health: { hyperliquid: 'ok', phoenix: 'slow', orderly: 'down', intents: 'ok', near: 'ok' },
+    decision: { action: 'hold', reason: 'SOL 14.2 % net', windowId: 'SOL:hyperliquid/phoenix', heldId: 'SOL:hyperliquid/phoenix', at: T0 },
+    at: T0,
+  };
+  const want = roundTrip({ ...full, setup: { deskId: 'gimbal-desk', steps: [{ step: 'hl_set_referrer', status: 'done', tx: [tx] }] } });
+  assert.deepEqual(publicState(roundTrip(full), same), want);
+
+  // Unknown fields at every depth go; so does a value of the wrong kind (an object where a number belongs).
+  const noisy = roundTrip(full) as unknown as Record<string, unknown> & EngineState;
+  Object.assign(noisy, { internal: { key: 'x' } });
+  Object.assign(noisy.desk!, { operatorKey: 'ed25519:x', equityUsd: { nested: 1 } });
+  Object.assign(noisy.desk!.legs[0]!, { apiKey: 'x' });
+  Object.assign(noisy.windows![0]!, { debug: { path: '/app/x' } });
+  Object.assign(noisy.windows![0]!.veto!, { prompt: 'x' });
+  Object.assign(noisy.journal[0]!, { raw: { headers: {} } });
+  Object.assign(noisy.journal[0]!.numbers, { nested: { a: 1 } });
+  Object.assign(noisy.health!, { detail: { ip: 'x' } });
+  const out = publicState(noisy, same) as EngineState;
+  const { equityUsd: _dropped, ...deskWithout } = want.desk!;
+  assert.deepEqual(out, { ...want, desk: deskWithout });
+
+  for (const event of [
+    { type: 'windows', data: full.windows }, { type: 'scan', data: full.scan }, { type: 'desk', data: full.desk }, { type: 'journal', data: full.journal[0] },
+    { type: 'rescue', data: full.rescue }, { type: 'health', data: full.health }, { type: 'decision', data: full.decision },
+  ]) assert.deepEqual(publicEvent(roundTrip(event), same), roundTrip(event), event.type);
+  assert.deepEqual(publicRead('/strategy', full.strategy, same), full.strategy);
+  assert.deepEqual(publicRead('/journal', roundTrip(full.journal), same), roundTrip(full.journal));
+  const history = { windowId: 'SOL:hyperliquid/phoenix', points: [{ t: T0, netAprPct: 14.2 }] };
+  assert.deepEqual(publicRead('/windows/history', { ...history, extra: 1 }, same), history);
+});
+
+test('the page\'s own fixtures (the web fake stream, every desk and rescue scenario) pass the allowlist unchanged', async () => {
+  // Imported at run time: they are the web's files, written for the browser, and pure.
+  const at = (path: string) => new URL(`../../../web/src/stream/${path}`, import.meta.url).href;
+  const fake = await import(at('fake.ts'));
+  const fakeWindows = await import(at('fake-windows.ts'));
+  const fakeJournal = await import(at('fake-journal.ts'));
+  const source = await import(at('source.ts'));
+  const events: StreamEvent[] = [];
+  const collect = (action: { kind: string; event?: StreamEvent }) => {
+    if (action.kind === 'event' && action.event !== undefined) events.push(roundTrip(action.event));
+  };
+  const runs: Record<string, unknown>[] = [
+    ...(source.DESK_SCENARIOS as readonly string[]).map((desk) => ({ desk })),
+    ...(source.RESCUE_SCENARIOS as readonly string[]).map((rescue) => ({ rescue })),
+    ...['normal', 'empty', 'error'].map((scenario) => ({ scenario })),
+  ];
+  for (const run of runs) {
+    const stop = fake.startFakeStream(collect, { mode: 'mainnet', intervalMs: 1, drift: true, ...run }) as () => void;
+    await sleep(30);
+    stop();
+  }
+  assert.deepEqual([...new Set(events.map((e) => e.type))].sort(), ['decision', 'desk', 'health', 'journal', 'rescue', 'scan', 'setup', 'windows']);
+  for (const e of events) assert.deepEqual(publicEvent(e, same), e, e.type);
+
+  const latest = <K extends StreamEvent['type']>(type: K) => (events.filter((e) => e.type === type).at(-1)?.data ?? null) as Extract<StreamEvent, { type: K }>['data'] | null;
+  const journal = roundTrip(fakeJournal.fakeJournal(T0, 'mainnet') as JournalEntry[]);
+  const state: EngineState = {
+    mode: 'mainnet', windows: latest('windows'), scan: latest('scan'), strategy: roundTrip(fakeWindows.FAKE_STRATEGY), desk: latest('desk'), journal,
+    rescue: latest('rescue'), setup: latest('setup'), health: latest('health'), decision: latest('decision'), at: T0,
+  };
+  assert.deepEqual(publicState(state, same), state);
+  assert.deepEqual(publicRead('/journal', journal, same), journal);
+  assert.deepEqual(publicRead('/strategy', state.strategy, same), state.strategy);
+  const api = fakeWindows.fakeApi();
+  let histories = 0;
+  for (const w of state.windows ?? []) {
+    if (!w.tradable) continue;
+    const history = roundTrip(await api.windowHistory(w.id).catch(() => null));
+    if (history === null) continue;
+    assert.deepEqual(publicRead('/windows/history', history, same), history, w.id);
+    histories++;
+  }
+  assert.ok(histories > 0);
 });
 
 test('the upstream stream reconnects with backoff, and every visitor stream ends so each page reads /state again', async () => {
