@@ -35,13 +35,16 @@ before NEAR's MPC network signs it. The engine that trades and moves margin can 
   ([the first](https://nearblocks.io/txns/7FKrWJzCGVyGoKEZkGUAJ3jq6o6w5EcPxjWd5h5APxQa); 12 by 2026-11-05).
 - The first live pair ran its whole cycle on mainnet: 74 XLM a leg (about 11.4 USD), short on Hyperliquid and long
   on Phoenix, every order checked and signed through the contract. The owner opened it by hand on 2026-11-06 05:04
-  UTC (an owner demo entry: the profit checks are waived, the contract's policy checks are not;
+  UTC as an owner demo entry, forecast at -3.3 % net APR after costs, below any threshold the loop would open on (the
+  profit checks are waived, the contract's policy checks are not;
   [Hyperliquid leg](https://nearblocks.io/txns/6WxR3Yj7p8ZdEYSVaDmYqiKwxD5Bz6Z1rXTdshAe98wr),
   [Phoenix leg](https://nearblocks.io/txns/4esnzwZZKttnXDEncMZ5Ms8MoojBqECY4KCSAYsRtTbV)). The strategy loop held it
-  27 hours and closed it by itself on 2026-11-07 08:03 UTC with reduce-only orders
+  27 hours and closed it on 2026-11-07 08:03 UTC with reduce-only orders
   ([Hyperliquid](https://nearblocks.io/txns/22rYMiTeSCDcCFNypDt7pmNWtm3TLQNmawgQDQ437iTa),
-  [Phoenix](https://nearblocks.io/txns/CyCZ26LQpKNaAzNfFfZPEgf7dALYJNo8dojvVnDxkcio)). Booked: funding +0.0085 USD,
-  fees -0.0169, price -0.0178, net -0.026 USD ([Status](#status-2026-11-04)).
+  [Phoenix](https://nearblocks.io/txns/CyCZ26LQpKNaAzNfFfZPEgf7dALYJNo8dojvVnDxkcio)), under a temporary owner rule
+  (a 1000 % net minimum, exit after 24 hourly checks) set so the pair would close after about a day; by its own
+  numbers the pair was still at 5.1 % net. Booked (funding read to 07:00 UTC; the last hour was still settling):
+  funding +0.0085 USD, fees -0.0169, price -0.0178, net -0.026 USD ([Status](#status-2026-11-04)).
 
 Not yet: a live margin rescue on mainnet (the desk's rescue counters on chain are 0; [Status](#status-2026-11-04)).
 
@@ -238,11 +241,13 @@ Done (read from the chain and the venues' public APIs at about 08:10 UTC):
   chain at every engine start). Its NEAR AI model is `Qwen/Qwen3-VL-30B-A3B-Instruct`, for policy drafts and the
   risk check.
 - **The first live pair ran its whole cycle.** XLM, 74 a leg (about 11.4 USD), short on Hyperliquid, long on
-  Phoenix. The owner opened it by hand on 2026-11-06 05:04 UTC as an owner demo entry (the profit checks are waived;
-  the contract still checked every order against the policy) and, to hold it about a day, set a temporary rule for
-  it: a 1000 % net minimum, exit after 24 hourly checks under it. The strategy loop held it 27 hours, booked each
-  funding hour from the venues' ledgers, and closed both legs by itself on 2026-11-07 08:03 UTC: three post-only
-  Hyperliquid buys did not fill, a reduce-only taker buy did, then Phoenix by a reduce-only IOC. Booked result:
+  Phoenix. The owner opened it by hand on 2026-11-06 05:04 UTC as an owner demo entry, forecast at -3.3 % net APR
+  after costs, below any threshold the loop would open on (the profit checks are waived; the contract still checked
+  every order against the policy) and, to close it after about a day, set a temporary rule for it: a 1000 % net
+  minimum, exit after 24 hourly checks under it. The strategy loop held it 27 hours, booked each funding hour from
+  the venues' ledgers, and closed both legs under that rule on 2026-11-07 08:03 UTC, when by its own numbers the
+  pair was still at 5.1 % net: three post-only Hyperliquid buys did not fill, a reduce-only taker buy did, then
+  Phoenix by a reduce-only IOC. Booked result (funding read to 07:00 UTC; the last hour was still settling):
   funding +0.0085 USD, fees -0.0169 (entry 0.0068, exit 0.0101), price -0.0178 (the entry and exit fills gave up about
   0.00024 USD per XLM in spread and basis between the two venues), net -0.026 USD. The transactions:
   [docs/onchain-evidence.md](docs/onchain-evidence.md#mainnet-desk-carry).
