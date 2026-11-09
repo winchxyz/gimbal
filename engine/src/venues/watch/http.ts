@@ -6,6 +6,7 @@
 // as if the venue were healthy.
 
 import type { ScanVenueId } from '@gimbal/shared';
+import { isReadSkipped } from '../http-budget.ts';
 import type { Clock, MarketFunding } from '../venue.ts';
 import { systemClock } from '../venue.ts';
 
@@ -47,21 +48,27 @@ export class WatchHttp {
     return this.#send<T>(url, { method: 'GET', headers: { accept: 'application/json', ...headers } });
   }
 
-  post<T = unknown>(url: string, body: unknown): Promise<T> {
+  /**
+   * With `gate`, the request goes through it (a host's request budget, hyperliquid.ts hlBudgetedSend) and a read it
+   * skips rejects with its ReadSkipped as is, so the scanner can tell "not sent" from "no answer".
+   */
+  post<T = unknown>(url: string, body: unknown, gate?: (send: () => Promise<Response>) => Promise<Response>): Promise<T> {
     return this.#send<T>(url, {
       method: 'POST',
       headers: { accept: 'application/json', 'content-type': 'application/json' },
       body: JSON.stringify(body),
-    });
+    }, gate);
   }
 
-  async #send<T>(url: string, init: RequestInit): Promise<T> {
+  async #send<T>(url: string, init: RequestInit, gate?: (send: () => Promise<Response>) => Promise<Response>): Promise<T> {
     let res: Response;
     let text: string;
     try {
-      res = await this.#fetch(url, { ...init, signal: AbortSignal.timeout(this.#timeoutMs) });
+      const send = () => this.#fetch(url, { ...init, signal: AbortSignal.timeout(this.#timeoutMs) });
+      res = await (gate === undefined ? send() : gate(send));
       text = await res.text();
     } catch (err) {
+      if (isReadSkipped(err)) throw err;
       const name = err instanceof Error ? err.name : '';
       if (name === 'TimeoutError' || name === 'AbortError') throw new WatchVenueError(this.venue, `no answer within ${this.#timeoutMs} ms from ${url}`);
       throw new WatchVenueError(this.venue, `request to ${url} failed: ${err instanceof Error ? err.message : String(err)}`);

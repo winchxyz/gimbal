@@ -671,7 +671,7 @@ server = new EngineServer({
     scans++;
     if (scans === 1 || scans % 12 === 0) log(scanLine(scans, r));
     if (writer !== null && scans % 12 === 0) void writer.flush();
-    venueHealth.scan(r.scan);
+    venueHealth.scan(r.scan, r.failedWhy);
     publishHealth();
     strategyLoop.onScan();
   },

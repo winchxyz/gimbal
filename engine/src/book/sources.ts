@@ -6,7 +6,7 @@
 import type { TxRef } from '@gimbal/shared';
 import { hyperliquidTxRef } from '../relayer/tx.ts';
 import { fillsOf, phoenixTraderApi } from '../trade/phoenix-leg.ts';
-import { HL_MAINNET_INFO_URL, HL_TESTNET_INFO_URL, HyperliquidReader } from '../venues/hyperliquid.ts';
+import { HL_MAINNET_INFO_URL, HL_TESTNET_INFO_URL, HyperliquidReader, hlBudgetedFetch, hlHostBudget } from '../venues/hyperliquid.ts';
 import type { OrderlyFundingFeeSource } from '../venues/orderly.ts';
 import { OrderlyReader } from '../venues/orderly.ts';
 import { PHOENIX_API_URL, PhoenixReader } from '../venues/phoenix.ts';
@@ -174,7 +174,11 @@ export async function phoenixFillFee(api: ReturnType<typeof phoenixTraderApi>, q
 export function liveBookSources(o: LiveSourceOptions): BookSources {
   const f = o.fetch ?? fetch;
   const infoUrl = o.hlInfoUrl ?? (o.network === 'mainnet' ? HL_MAINNET_INFO_URL : HL_TESTNET_INFO_URL);
-  const hl = new HyperliquidReader({ network: o.network, url: infoUrl, fetch: f });
+  // On the network (no fetch passed), the ledger reads share the host's weight budget with every other reader of it
+  // in serve, as critical reads (a few, once an hour and after an act).
+  const budget = o.fetch === undefined ? hlHostBudget(infoUrl) : null;
+  const hl = new HyperliquidReader({ network: o.network, url: infoUrl, fetch: f, budget });
+  const hlFetch = budget === null ? f : hlBudgetedFetch(budget, f);
   const phoenixUrl = o.phoenixApiUrl ?? PHOENIX_API_URL;
   const phoenix = o.network === 'mainnet' ? new PhoenixReader({ apiUrl: phoenixUrl, fetch: f }) : null;
   const phoenixApi = o.network === 'mainnet' ? phoenixTraderApi(phoenixUrl, f) : null;
@@ -190,16 +194,16 @@ export function liveBookSources(o: LiveSourceOptions): BookSources {
   };
   return {
     funding: { hyperliquid: hl, ...(phoenix === null ? {} : { phoenix }), ...(orderlyFunding === null ? {} : { orderly: orderlyFunding }) },
-    hlLedger: (user, startTime, endTime) => hlNonFundingLedger(f, infoUrl, user, startTime, endTime),
+    hlLedger: (user, startTime, endTime) => hlNonFundingLedger(hlFetch, infoUrl, user, startTime, endTime),
     fillFee: async (q) => {
-      if (q.venue === 'hyperliquid') return hlFillFee(f, infoUrl, q);
+      if (q.venue === 'hyperliquid') return hlFillFee(hlFetch, infoUrl, q);
       if (q.venue === 'phoenix' && phoenixApi !== null) return phoenixFillFee(phoenixApi, q);
       if (q.venue === 'orderly') return orderlyLog().fillFee(q);
       return null;
     },
     hlTxRef: (hash: string): TxRef => hyperliquidTxRef(o.network, hash),
     closeFills: async (q) => {
-      if (q.venue === 'hyperliquid') return hlCloseFills(f, infoUrl, q);
+      if (q.venue === 'hyperliquid') return hlCloseFills(hlFetch, infoUrl, q);
       if (q.venue === 'phoenix' && phoenixApi !== null) return phoenixCloseFills(phoenixApi, q);
       if (q.venue === 'orderly') return orderlyLog().readCloseFills(q, ox?.hearWaitMs);
       return null;

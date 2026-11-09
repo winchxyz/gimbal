@@ -96,7 +96,10 @@ test('replay: the replay desk from flat, a 12 USD pair on recorded prices, fundi
   assert.deepEqual(maps.map((m) => m.phoenix), ['ok', 'down', 'ok']);
   assert.ok(maps.every((m) => m.hyperliquid === 'ok' && m.intents === 'ok' && m.near === 'ok'));
   const errors = (of('journal') as JournalEntry[]).filter((j) => j.kind === 'error');
-  assert.deepEqual(errors.map((j) => j.summary), ['phoenix not answering: fetch failed: ETIMEDOUT']);
+  // Journaled once the leg there was judged on a read LEG_READ_STALE_MS old, and its end with the outage's length.
+  assert.equal(errors.length, 1);
+  assert.match(errors[0]!.summary, /^phoenix not answering for \d+ s: fetch failed: ETIMEDOUT$/);
+  assert.ok((of('journal') as JournalEntry[]).some((j) => j.kind === 'wait' && /^phoenix answering again after \d+ s unreadable/.test(j.summary)));
   // While Phoenix was down its leg stayed, watched.
   const during = desks.find((d) => d.updatedAt > outageAt && d.updatedAt < back)!;
   assert.equal(during.legs.length, 2);

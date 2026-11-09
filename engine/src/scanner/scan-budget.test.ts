@@ -304,3 +304,43 @@ test('history reads the budget skips: one note for the venue, no failure, and th
   await s.idle();
   assert.equal(asked.length, 2, JSON.stringify(asked));
 });
+
+test('funding the budget skips: not a failure while the last read is usable; a cool-down skip is, and says why (failedWhy)', async () => {
+  const { hl, phoenix } = venues();
+  let refuse: 'cooling' | 'budget' | null = null;
+  const clock = new VirtualClock(T0);
+  const px = Object.assign(phoenix, {
+    funding: async () => {
+      if (refuse !== null) throw new ReadSkipped('perp-api.phoenix.trade', 'funding', refuse, refuse === 'cooling' ? clock.now() + 30_000 : null, clock.now());
+      return phoenix.rows;
+    },
+  });
+  const { scanner: s, notes } = scanner([hl, px], clock, null, POLICY);
+  const r1 = await s.scan();
+  assert.deepEqual(r1.scan.failed, []);
+
+  // Not sent: the last read (40 s old) stands in, stale, and the venue is not failed.
+  refuse = 'budget';
+  clock.set(T0 + 40_000);
+  const r2 = await s.scan();
+  assert.deepEqual(r2.scan.failed, []);
+  assert.equal(r2.failedWhy?.phoenix, undefined);
+  assert.ok(notes.some((n) => n.startsWith('phoenix funding not read: perp-api.phoenix.trade funding read skipped: request budget spent')), notes.join('\n'));
+  assert.ok(phoenixWindows(r2.windows).length > 0 && phoenixWindows(r2.windows).every((w) => w.stale));
+
+  // Refused for a cool-down after a 429: the venue did refuse us, so it is failed, with the reason.
+  refuse = 'cooling';
+  clock.set(T0 + 80_000);
+  const r3 = await s.scan();
+  assert.deepEqual(r3.scan.failed, ['phoenix']);
+  assert.match(r3.failedWhy?.phoenix ?? '', /^funding: .*cool-down/);
+
+  // A budget skip with no usable last read is a failure too: there is nothing to scan with.
+  const fresh = venues();
+  const px2 = Object.assign(fresh.phoenix, {
+    funding: async () => { throw new ReadSkipped('perp-api.phoenix.trade', 'funding', 'budget', null, T0); },
+  });
+  const r4 = await scanner([fresh.hl, px2], new VirtualClock(T0)).scanner.scan();
+  assert.deepEqual(r4.scan.failed, ['phoenix']);
+  assert.match(r4.failedWhy?.phoenix ?? '', /^funding: .*request budget spent/);
+});
