@@ -45,11 +45,17 @@ before NEAR's MPC network signs it. The engine that trades and moves margin can 
   (a 1000 % net minimum, exit after 24 hourly checks) set so the pair would close after about a day; by its own
   numbers the pair's forward rate was still 5.1 % net APR after exit costs. Booked (funding read to 07:00 UTC; the last hour was still settling):
   funding +0.0085 USD, fees -0.0169, price -0.0178, net -0.026 USD ([Status](#status-2026-11-04)).
-- A second live pair has been held since 2026-11-09 03:08 UTC: 716 MON a leg (about 11.5 USD), short on Hyperliquid
-  (a post-only order that filled as maker) and long on Phoenix, about 40 % net APR forecast at entry. The owner opened
-  it from the hosted demo's owner console, again as an owner demo entry, after the NEAR AI risk check passed
-  ([Hyperliquid leg](https://nearblocks.io/txns/SdYWNMUp4gyqjx3nBQibUKbnXffLum6pj6fChwV2z9q),
-  [Phoenix leg](https://nearblocks.io/txns/2Gk3rxrpsDyuwJQoyRBSyVscsPpppX9hEtQRN6Fr22Nh)).
+- A second live pair was held from 2026-11-09 03:08 to 21:19 UTC: 716 MON a leg (about 11.5 USD), short on
+  Hyperliquid (a post-only order that filled as maker) and long on Phoenix, about 40 % net APR forecast at entry. The
+  owner opened it from the hosted demo's owner console, again as an owner demo entry, after the NEAR AI risk check
+  passed ([Hyperliquid leg](https://nearblocks.io/txns/SdYWNMUp4gyqjx3nBQibUKbnXffLum6pj6fChwV2z9q),
+  [Phoenix leg](https://nearblocks.io/txns/2Gk3rxrpsDyuwJQoyRBSyVscsPpppX9hEtQRN6Fr22Nh)), and closed it from the same
+  console at 21:17 UTC with Close pair, recorded for the demo video. The contract signed three reduce-only post-only
+  Hyperliquid buys that were cancelled unfilled as the price moved, then a reduce-only IOC buy that filled
+  ([NEAR](https://nearblocks.io/txns/BwovNwuKg9m13kQvo4CEbtLQVuyUmKgBNtRhhj3LpjR7),
+  [Hyperliquid](https://app.hyperliquid.xyz/explorer/tx/0x03923a896ec48e43050b044871482e02023e006f09c7ad15a75ae5dc2dc8682d)),
+  then the Phoenix sell ([NEAR](https://nearblocks.io/txns/CBxuqjxy2xCknbL46ZokR65A4PrEuqaNMW6X4Bvj9yCT),
+  [Solscan](https://solscan.io/tx/2aj9kXAP3cSB4XoVxBU2sRecVZjLwUcKDAnncqxPNnCs6WJAjybh6dY6An8FRuyEueh4RnHo5sBSyQccirGgta4p)).
 
 Not yet: a live margin rescue on mainnet (the desk's rescue counters on chain are 0; [Status](#status-2026-11-04)).
 
@@ -66,8 +72,8 @@ of 2026-10-31, x10, a stress test from Rescue), run `npm run demo`.
 <!-- SUBMISSION: fill the two link lines below on submit day, then delete this comment. -->
 - **Demo video:** TODO(submission): video link
 - **X post:** TODO(submission): X post link
-- **Status (2026-11-09):** the first live pair opened (by the owner) and closed (by the loop) on mainnet, net
-  -0.026 USD after fees; a second (MON, opened from the owner console) is held; no live margin rescue yet. The dated details are under [Status](#status-2026-11-04)
+- **Status (2026-11-09):** two live pairs opened by the owner and closed on mainnet: the first (XLM) by the loop, net
+  -0.026 USD after fees; the second (MON) from the owner console after 18 hours; no live margin rescue yet. The dated details are under [Status](#status-2026-11-04)
 
 ## 30 seconds for a judge
 
@@ -264,7 +270,10 @@ Done (read from the chain and the venues' public APIs at about 08:10 UTC on 2026
   (16 unpriced symbols; 23 Hyperliquid assets, 15 Phoenix markets, 21 Orderly symbols), then opened MON from the hosted
   demo with the owner token: 716 MON a leg (about 11.5 USD), short on Hyperliquid, long on Phoenix, about 40 % net
   APR forecast at entry, NEAR AI risk check passed. The Hyperliquid post-only order was repriced three times before it
-  filled as maker at 0.016013; Phoenix filled by IOC at 0.016012; entry fees 0.0068 USD. The strategy loop holds it.
+  filled as maker at 0.016013; Phoenix filled by IOC at 0.016012; entry fees 0.0068 USD. The strategy loop held it
+  until the owner closed it from the console at 21:17 UTC (recorded for the demo video): three reduce-only post-only
+  Hyperliquid buys were cancelled unfilled as the price moved, a reduce-only IOC buy filled, then the Phoenix sell; flat
+  at 21:19 UTC, 18 hours after entry.
   The transactions: [docs/onchain-evidence.md](docs/onchain-evidence.md#mainnet-desk-carry).
 - On testnet the same contract code refused 8 of 8 scripted malicious requests, 0 USDC moved
   ([below](#refusals-on-chain-npm-run-attack)).
