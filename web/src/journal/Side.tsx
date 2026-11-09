@@ -1,26 +1,61 @@
 import type { DeskState, JournalEntry, Window as FundingWindow } from '@gimbal/shared';
 import { signedUsd } from '../desk/format.ts';
+import { moneyTone } from '../desk/answer.ts';
 import { Flash } from '../ui/Flash.tsx';
+import { cx } from '../ui/cx.ts';
+import { dayMonthTime } from '../windows/format.ts';
 import { contractUrl } from './entry.ts';
-import { attributionOf, countsOf, sinceLabel, sinceNote } from './model.ts';
+import type { TrueCounts } from './counts.ts';
+import { attributionOf, sinceLabel, sinceNote } from './model.ts';
 
 const money = (value: number | null): string => (value === null ? '—' : signedUsd(value));
 const positive = (value: number | null): string | undefined => (value !== null && value > 0 ? 'pos' : undefined);
 
 /**
+ * The counters (brand book C, Journal: Counts). True when the engine sent its counts over every entry it holds; over
+ * the loaded page otherwise, and the note says which. A refusal row shows only when there is one to count.
+ */
+export function Counts({ counts, replay, className }: { counts: TrueCounts; replay: boolean; className?: string }) {
+  const row = (label: string, n: number) => (
+    <div className="kv">
+      <span>{label}</span>
+      <b>
+        <Flash value={n} />
+      </b>
+    </div>
+  );
+  const since = counts.since === null ? '' : `, since ${dayMonthTime(counts.since)} UTC`;
+  return (
+    <section className={cx('j-cnt', className)} aria-label="Counts">
+      <h3>Counts</h3>
+      {row('Trades', counts.filters.trades)}
+      {row(replay ? 'Simulated actions, nothing signed or sent' : 'Actions signed by the contract', counts.signed)}
+      {/* Gimbal holds no private key: the contract owns the accounts and asks the MPC network to sign (CLAUDE.md). */}
+      {replay ? null : row('Signed by a private key', 0)}
+      {row('Funding payments', counts.filters.funding)}
+      {row('Incidents', counts.incidents)}
+      {counts.refused > 0 ? row('Refused: sizing, policy or contract', counts.refused) : null}
+      {counts.vetoed > 0 ? row('Refused by the NEAR AI risk check', counts.vetoed) : null}
+      {counts.held > 0 ? row('Held: no NEAR AI verdict', counts.held) : null}
+      <p className="j-note">{counts.complete ? `Counted over every entry the engine holds${since}.` : `Counted over the entries loaded on this page${since}.`}</p>
+    </section>
+  );
+}
+
+/**
  * The column beside the feed: the net since the first entry and where it came from, the counts, and the contract.
  * It reads every entry, not only the filtered ones.
  */
-export function Side({ entries, desk, windows }: { entries: readonly JournalEntry[]; desk: DeskState | null; windows: readonly FundingWindow[] | null }) {
+export function Side({ entries, counts, desk, windows }: { entries: readonly JournalEntry[]; counts: TrueCounts; desk: DeskState | null; windows: readonly FundingWindow[] | null }) {
   const a = attributionOf(desk?.pnl ?? null, entries, desk?.legs ?? []);
-  const counts = countsOf(entries);
   const note = desk ? sinceNote(desk, windows) : null;
   const replay = desk?.mode === 'replay';
   const explorer = desk && !replay ? contractUrl(desk.contract, desk.mode) : null;
 
   return (
     <aside className="j-side" aria-label="Summary">
-      <h3>{sinceLabel(entries)}</h3>
+      <Counts counts={counts} replay={replay} />
+      <h3 className="j-since">{sinceLabel(entries)}</h3>
       <div className="big">
         <Flash value={a.netUsd}>{money(a.netUsd)}</Flash>
       </div>
@@ -53,45 +88,10 @@ export function Side({ entries, desk, windows }: { entries: readonly JournalEntr
         </div>
         <div className="tot">
           <span>Net</span>
-          <span>{money(a.netUsd)}</span>
+          <span className={moneyTone(a.netUsd) ?? undefined}>{money(a.netUsd)}</span>
         </div>
       </div>
-
-      <div className="j-counts">
-        <div>
-          <b>
-            <Flash value={counts.signed} />
-          </b>
-          <span>{replay ? 'simulated actions, nothing signed or sent' : 'actions signed by the contract'}</span>
-        </div>
-        {replay ? null : (
-          <div>
-            {/* Gimbal holds no private key: the contract owns the accounts and asks the MPC network to sign (CLAUDE.md). */}
-            <b className="lvl">0</b>
-            <span>signed by a private key</span>
-          </div>
-        )}
-        <div>
-          <b>
-            <Flash value={counts.refused} />
-          </b>
-          <span>refused (sizing, policy or contract)</span>
-        </div>
-        <div>
-          <b>
-            <Flash value={counts.vetoed} />
-          </b>
-          <span>refused by the NEAR AI risk check</span>
-        </div>
-        {counts.held === 0 ? null : (
-          <div>
-            <b>
-              <Flash value={counts.held} />
-            </b>
-            <span>held: no NEAR AI verdict</span>
-          </div>
-        )}
-      </div>
+      {counts.complete ? null : <p className="j-partial">Counted over the entries loaded on this page.</p>}
 
       <div className="j-contract">
         {replay ? (

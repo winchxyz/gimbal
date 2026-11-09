@@ -2,24 +2,16 @@ import { useEffect, useRef } from 'react';
 import { DeskScreen } from '../desk/DeskScreen.tsx';
 import { JournalScreen } from '../journal/JournalScreen.tsx';
 import { OnboardingScreen } from '../onboarding/OnboardingScreen.tsx';
-import { RescueScreen } from '../rescue/RescueScreen.tsx';
-import { Placeholder } from '../screens/Placeholder.tsx';
-import { SecurityScreen } from '../security/SecurityScreen.tsx';
+import { SafetyScreen } from '../safety/SafetyScreen.tsx';
 import { Connect } from '../remote/Connect.tsx';
 import { OwnerUnlock } from '../remote/OwnerUnlock.tsx';
-import { RemoteBar } from '../remote/RemoteBar.tsx';
 import { isHostedLive, READ_ONLY_TEXT, writeControls } from '../remote/readonly.ts';
 import { NoticeBar } from '../ui/NoticeBar.tsx';
 import { focusScroller } from '../ui/scroller.ts';
 import { WindowsScreen } from '../windows/WindowsScreen.tsx';
-import { ConnectionBar } from './ConnectionBar.tsx';
 import { Header } from './Header.tsx';
 import { SCREENS, useConnectRoute, useOnboardingRoute, useOwnerRoute, useScreen } from './routes.ts';
-import { StatusLine } from './StatusLine.tsx';
 import { TabBar } from './TabBar.tsx';
-
-// Screens with the status line under the header (design/components.html, Status line).
-const WITH_STATUS = new Set(['desk', 'rescue']);
 
 export function Shell() {
   const screen = useScreen();
@@ -30,7 +22,7 @@ export function Shell() {
   const owner = useOwnerRoute() && isHostedLive();
   const label = connect ? 'Engine' : owner ? 'Owner' : onboarding ? 'Set up' : (SCREENS.find((s) => s.id === screen)?.label ?? '');
 
-  // On the desktop the document does not scroll: a screen scrolls inside <main>, or in a column of its own (the Windows
+  // On the desktop the document does not scroll: a screen scrolls inside <main>, or in a column of its own (the Markets
   // list, the Journal feed, marked `data-scroller`). A new screen starts at its top, and the element that scrolls it takes
   // the focus (without a ring: it is not a control), so the arrow keys, Page Down and Space scroll it at once. A column
   // that renders after a loading state takes the focus over from <main> itself (`takeFocus`).
@@ -53,8 +45,7 @@ export function Shell() {
   if (onboarding && !writeControls().onboarding) {
     return (
       <div className="app shell">
-        <Header screen="desk" />
-        <RemoteBar />
+        <Header screen={null} />
         <main className="page">
           <p className="g" style={{ padding: 'var(--s-6) var(--gutter)' }}>
             {READ_ONLY_TEXT}
@@ -64,7 +55,7 @@ export function Shell() {
     );
   }
 
-  // Onboarding brings its own header and has no tab bar (design/screens/desktop/onboarding.html).
+  // Onboarding brings its own header and has no tab bar.
   if (onboarding) {
     return (
       <div className="app ob-app">
@@ -76,25 +67,10 @@ export function Shell() {
   return (
     <div className="app shell">
       <Header screen={screen} />
-      <RemoteBar />
-      <ConnectionBar />
-      {WITH_STATUS.has(screen) && <StatusLine screen={screen} />}
-      <NoticeBar />
-      <main className="page" ref={main} tabIndex={-1}>
-        {screen === 'desk' ? (
-          <DeskScreen />
-        ) : screen === 'windows' ? (
-          <WindowsScreen />
-        ) : screen === 'journal' ? (
-          <JournalScreen />
-        ) : screen === 'rescue' ? (
-          <RescueScreen />
-        ) : screen === 'security' ? (
-          <SecurityScreen />
-        ) : (
-          <Placeholder screen={screen} />
-        )}
+      <main className="page" ref={main} tabIndex={-1} data-screen={screen}>
+        {screen === 'desk' ? <DeskScreen /> : screen === 'markets' ? <WindowsScreen /> : screen === 'journal' ? <JournalScreen /> : <SafetyScreen />}
       </main>
+      <NoticeBar />
       <TabBar screen={screen} />
     </div>
   );

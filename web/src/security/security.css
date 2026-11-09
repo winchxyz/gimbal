@@ -17,9 +17,7 @@ a.s-ext.mono:hover { text-decoration: underline; text-underline-offset: 3px; }
 .s-stale { font: var(--t-s); margin: 0 0 var(--s-5); }
 
 /* a placeholder bar where a figure goes (loading), as the other screens draw them */
-.s-sk { display: inline-block; vertical-align: middle; max-width: 100%; background: var(--sel); border-radius: 4px; animation: s-sk 1.4s var(--ease) infinite; }
-@keyframes s-sk { 50% { background: var(--line-2); } }
-@media (prefers-reduced-motion: reduce) { .s-sk { animation: none; } }
+.s-sk { display: inline-block; vertical-align: middle; max-width: 100%; background: var(--sel); border-radius: 4px; }
 
 /* ---------- the zero and the five steps ---------- */
 .s-head { display: grid; grid-template-columns: 1fr 1fr; column-gap: 64px; align-items: end; }
@@ -33,7 +31,7 @@ a.s-ext.mono:hover { text-decoration: underline; text-underline-offset: 3px; }
 .s-flow li::before { content: counter(f); color: var(--ink-2); grid-row: span 2; }
 .s-flow li b { font-weight: 400; }
 .s-flow li span { font: var(--t-s); color: var(--ink-2); margin-top: 2px; }
-.s-flow li.on b { color: var(--level); }
+.s-flow li.on b { font-weight: 600; }
 .s-flow p { font: var(--t-s); color: var(--ink-2); margin: 12px 0 0; }
 
 /* ---------- three columns ---------- */

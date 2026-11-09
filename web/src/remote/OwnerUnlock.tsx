@@ -27,7 +27,7 @@ export function OwnerUnlock() {
     setError(null);
     void unlockOwner(token, { session: ownerStore() }).then((answer) => {
       setChecking(false);
-      if (answer.ok) return apply(hrefOf('windows'));
+      if (answer.ok) return apply(hrefOf('markets'));
       setError(answer.reason);
     });
   };
@@ -44,9 +44,9 @@ export function OwnerUnlock() {
           <div className="cx-form">
             <div className="lab">Owner</div>
             <h1>Unlocked in this tab</h1>
-            <p>You can enter a window and close the held pair from this tab. The engine checks every request, and the contract checks every order against your policy.</p>
+            <p>You can enter a market and close the held pair from this tab. The engine checks every request, and the contract checks every order against your policy.</p>
             <div className="cx-go">
-              <a className="btn primary" href={hrefOf('windows')}>Windows</a>
+              <a className="btn primary" href={hrefOf('markets')}>Markets</a>
               <button
                 type="button"
                 className="btn"
@@ -63,7 +63,7 @@ export function OwnerUnlock() {
           <form className="cx-form" onSubmit={submit} autoComplete="off">
             <div className="lab">Owner</div>
             <h1>Unlock this desk</h1>
-            <p>For the desk’s owner. Visitors read only; with the owner token this tab can enter a window and close the held pair.</p>
+            <p>For the desk’s owner. Visitors read only; with the owner token this tab can enter a market and close the held pair.</p>
             <div className="cx-field">
               <label htmlFor="ow-token">Owner token</label>
               <input

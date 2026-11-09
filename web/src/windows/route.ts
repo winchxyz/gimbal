@@ -1,9 +1,9 @@
-// `#/windows/<id>` opens one window. On the phone it is the detail page and Back closes it; on the desktop it
-// is the selected row, so a link can point at a window. The shell's own `screenFromHash` stops at the first
-// slash, so it still reads this as the Windows screen.
+// `#/markets/<id>` opens one market. On the phone it is the detail page and Back closes it; on the desktop it
+// is the selected row, so a link can point at a market. The shell's own `screenFromHash` stops at the first
+// slash, so it still reads this as the Markets screen. A link from before the redesign (`#/windows/<id>`) still opens.
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
-const PREFIX = /^#\/?windows\/([^/?]+)/;
+const PREFIX = /^#\/?(?:markets|windows)\/([^/?]+)/;
 
 export function windowIdFromHash(hash: string): string | null {
   const match = PREFIX.exec(hash);
@@ -15,7 +15,7 @@ export function windowIdFromHash(hash: string): string | null {
   }
 }
 
-export const hashForWindow = (id: string | null): string => (id === null ? '#/windows' : `#/windows/${encodeURIComponent(id)}`);
+export const hashForWindow = (id: string | null): string => (id === null ? '#/markets' : `#/markets/${encodeURIComponent(id)}`);
 
 export interface WindowRoute {
   /** The window named in the address, or null. */

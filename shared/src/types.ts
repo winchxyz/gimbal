@@ -245,5 +245,18 @@ export interface EngineState {
   setup: SetupProgress | null;
   health: HealthMap | null;
   decision: StrategyDecision | null;
+  // Every entry the engine holds counted by kind (not only the 100 above), so a counter on the page is true.
+  // Absent from an engine from before it.
+  journalCounts?: JournalCounts;
   at: number;                     // ms, when the engine built the response
+}
+
+// The journal counted: every entry the engine holds (up to its JOURNAL_KEEP, newest first, and the journal file's
+// bound at a restart) plus every entry it dropped from memory while running. `since` is the oldest entry counted.
+export interface JournalCounts {
+  entries: number;
+  since: number | null;           // ms; null while the journal is empty
+  kinds: Partial<Record<JournalEntry['kind'], number>>;
+  refusedHeld: number;            // `refused` entries with numbers.held = 1 (a NEAR AI risk check with no verdict)
+  refusedCancelled: number;       // `refused` entries with numbers.cancelled = 1 (cancelled before anything was sent)
 }

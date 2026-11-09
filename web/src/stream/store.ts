@@ -1,6 +1,7 @@
 // The dashboard's view of the engine: the latest of each StreamEvent type plus counters.
 // Pure functions only (no DOM, no timers), so `node --test` can run them as they are.
 import type {
+  JournalCounts,
   DeskState,
   EngineState,
   JournalEntry,
@@ -12,6 +13,7 @@ import type {
   StreamEvent,
   Window as FundingWindow,
 } from '@gimbal/shared';
+import { withEntry } from '../journal/counts.ts';
 
 export type StreamType = StreamEvent['type'];
 export type Health = Extract<StreamEvent, { type: 'health' }>['data'];
@@ -48,6 +50,8 @@ export interface StreamState {
   scan: ScanStatus | null;
   desk: DeskState | null;
   journal: JournalEntry[];               // newest first
+  /** Every entry the engine holds, counted (EngineState.journalCounts), plus the new ones heard since; null from an older engine. */
+  journalCounts: JournalCounts | null;
   rescue: RescueProgress | null;
   setup: SetupProgress | null;
   health: Health | null;
@@ -77,6 +81,7 @@ export function initialStreamState(): StreamState {
     scan: null,
     desk: null,
     journal: [],
+    journalCounts: null,
     rescue: null,
     setup: null,
     health: null,
@@ -106,6 +111,7 @@ export function reduceStream(state: StreamState, action: StreamAction): StreamSt
         scan: engine.scan,
         desk: engine.desk,
         journal: engine.journal.reduce<JournalEntry[]>(addJournalEntry, []),
+        journalCounts: engine.journalCounts ?? null,
         rescue: engine.rescue,
         setup: engine.setup,
         health: engine.health,
@@ -129,7 +135,13 @@ export function reduceStream(state: StreamState, action: StreamAction): StreamSt
         case 'desk':
           return { ...next, desk: event.data };
         case 'journal':
-          return { ...next, journal: addJournalEntry(state.journal, event.data) };
+          return {
+            ...next,
+            journal: addJournalEntry(state.journal, event.data),
+            // A new entry adds to the counts; one sent again under its id (a reconnect) was counted already.
+            journalCounts:
+              state.journalCounts && !state.journal.some((e) => e.id === event.data.id) ? withEntry(state.journalCounts, event.data) : state.journalCounts,
+          };
         case 'rescue':
           return { ...next, rescue: event.data };
         case 'setup':

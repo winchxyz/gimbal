@@ -2,7 +2,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ContractPolicy } from '@gimbal/shared';
 import { fakePolicy } from './dev.ts';
-import { ageWords, bpsPct, builderFeeText, feeLines, fullAccessText, groupDecimal, hourlyCostBudgetUsd, oracleTrust, policyLines, readFailureText, trimmed } from './words.ts';
+import { ageWords, bpsPct, builderFeeText, feeLines, fullAccessText, groupDecimal, hourlyCostBudgetUsd, oracleTrust, policyLines, policyShort, readFailureText, trimmed } from './words.ts';
+
+test('the policy in one line: coins per venue and the leg size', () => {
+  assert.equal(policyShort(fakePolicy(false)), '7 coins on Hyperliquid, 2 on Phoenix, 4 on Orderly, each leg up to $1,500');
+  assert.equal(policyShort({ ...fakePolicy(false), phoenix_markets: [], orderly_symbols: [], hl_assets: fakePolicy(false).hl_assets.slice(0, 1), max_notional_usd: 20 }), '1 coin on Hyperliquid, each leg up to $20');
+  assert.equal(policyShort({ ...fakePolicy(false), hl_assets: [], phoenix_markets: [], orderly_symbols: [], max_notional_usd: 0 }), 'No coin allowed, no leg size allowed');
+});
 
 const OWNER = 'ada.testnet';
 const text = (p: ContractPolicy): string[] => policyLines(p, OWNER).map((l) => l.text);

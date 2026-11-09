@@ -12,7 +12,7 @@ export function SecurityEmpty() {
     <div className="s-state">
       <div className="s-state-msg">
         <div className="lab">Security</div>
-        <h1>No desk yet</h1>
+        <h2>No desk yet</h2>
         <p>Once you create a desk, this page shows the accounts its contract controls, your policy, and what the operator can and cannot do.</p>
         {writeControls().onboarding ? (
           <div className="go">
@@ -36,7 +36,7 @@ export function SecurityError({ message, at, target, onRetry }: { message: strin
     <div className="s-state">
       <div className="s-state-msg">
         <div className="lab">Security</div>
-        <h1>Can’t read the contract</h1>
+        <h2>Can’t read the contract</h2>
         <p>
           {readFailureText(message, clock(at))} Nothing about the desk has changed; this page reads the contract directly and will refresh when it can.
         </p>

@@ -5,22 +5,25 @@ import { useStream } from '../stream/hub.ts';
 import { Flash } from '../ui/Flash.tsx';
 import { SCROLLER, takeFocus } from '../ui/scroller.ts';
 import { useNow } from '../ui/useNow.ts';
+import { dayMonth } from '../windows/format.ts';
+import { heldWindow } from '../windows/model.ts';
 import { csvName, toCsv } from './csv.ts';
+import { journalAnswer, trueCounts } from './counts.ts';
 import { Day } from './Feed.tsx';
 import { Filters } from './Filters.tsx';
 import { filterLabel, type FilterId } from './kinds.ts';
+import { moneyTone } from '../desk/answer.ts';
 import {
-  actionsText,
   attributionOf,
   costsUsd,
   entriesIn,
   foldOlder,
   groupByDay,
-  pageCounts,
-  sinceLabel,
   visibleFeed,
 } from './model.ts';
-import { Side } from './Side.tsx';
+import { storyOf, type StoryItem } from './story.ts';
+import { journalHeadline, periodFacts, type HoldItem } from './period.ts';
+import { Counts, Side } from './Side.tsx';
 import { JournalEmpty, JournalError, JournalLoading } from './States.tsx';
 import { useJournal, type JournalData } from './useJournal.ts';
 import { scrollToTop, useScrolled } from './useScrolled.ts';
@@ -49,6 +52,16 @@ export function JournalScreen() {
 
 const money = (value: number | null): string => (value === null ? '—' : signedUsd(value));
 
+/** Story lines by the UTC day of their newest moment, so a holding period sits under the day it was last checked. */
+function byDay(items: readonly StoryItem[]): Map<number, StoryItem[]> {
+  const days = new Map<number, StoryItem[]>();
+  for (const item of items) {
+    const day = Math.floor(item.t / 86_400_000);
+    days.set(day, [...(days.get(day) ?? []), item]);
+  }
+  return days;
+}
+
 /** Saves text as a file through the browser's own download: nothing leaves the page. */
 function download(name: string, text: string): void {
   const url = URL.createObjectURL(new Blob([`﻿${text}`], { type: 'text/csv;charset=utf-8' })); // the BOM makes Excel read UTF-8
@@ -63,6 +76,7 @@ function download(name: string, text: string): void {
 
 function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry[]; desk: DeskState | null; paging: Pick<JournalData, 'more' | 'older' | 'loadOlder'> }) {
   const windows = useStream((s) => s.windows);
+  const engineCounts = useStream((s) => s.journalCounts);
   const now = useNow(30_000);
   const [filter, setFilter] = useState<FilterId>('all');
   const [expanded, setExpanded] = useState(false);
@@ -83,15 +97,21 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
   }, [scrolled]);
 
   const { shown, pending } = useMemo(() => visibleFeed(entries, frozen), [entries, frozen]);
-  // The header, the filters and the side column all count the same entries: the ones on the page (pageCounts).
-  const { filters: counts, signed } = useMemo(() => pageCounts(shown), [shown]);
+  // The sentence, the filters and the side column count every entry the engine holds (journalCounts), not the page.
+  const counts = useMemo(() => trueCounts(engineCounts, shown), [engineCounts, shown]);
+  const heldId = windows ? (heldWindow(windows)?.id ?? null) : null;
   const listed = useMemo(() => entriesIn(shown, filter), [shown, filter]);
   const groups = useMemo(() => groupByDay(listed, now), [listed, now]);
   const { shown: days, fold } = useMemo(() => (expanded ? { shown: groups, fold: null } : foldOlder(groups)), [groups, expanded]);
+  // One line per holding period, funding in words, an incident with its recovery (story.ts), filed under its day.
+  const lines = useMemo(() => storyOf(days.flatMap((d) => d.entries), heldId), [days, heldId]);
+  const story = useMemo(() => byDay(lines), [lines]);
+  // The sentence: the period held now, its funding and outages (period.ts); without one, what the contract signed.
+  const headline = useMemo(() => journalHeadline(storyOf(shown, heldId), desk?.pnl.fundingUsd ?? null, now), [shown, heldId, desk, now]);
+  const factsOf = useCallback((item: HoldItem) => periodFacts(item, { entries: shown, desk, now }), [shown, desk, now]);
 
   const replay = desk?.mode === 'replay';
   const attribution = attributionOf(desk?.pnl ?? null, shown, desk?.legs ?? []);
-  const costs = costsUsd(attribution);
 
   const showNew = () => {
     setFrozen(null);
@@ -102,62 +122,44 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
   return (
     <div className="j-page">
       <section className="j-top">
-        <div>
-          <h1>Journal</h1>
-          {replay ? (
-            // A replay has no contract: its actions are simulated on recorded prices, and nothing is signed or sent.
-            <>
-              <p className="j-desk">
-                Everything the replay desk did, on recorded mainnet prices.{' '}
-                <b>
-                  <Flash value={signed}>{actionsText(signed, true)}</Flash>, nothing signed or sent.
-                </b>
-              </p>
-              <p className="j-phone">
-                <Flash value={signed}>{actionsText(signed, true)}</Flash>. Nothing signed or sent.
-              </p>
-            </>
-          ) : (
-            <>
-              <p className="j-desk">
-                Everything the desk did, as the contract recorded it.{' '}
-                <b>
-                  <Flash value={signed}>{actionsText(signed)}</Flash>, 0 by a private key.
-                </b>
-              </p>
-              <p className="j-phone">
-                <Flash value={signed}>{actionsText(signed)}</Flash> by the contract. <span className="lvl">0</span> by a private key.
-              </p>
-            </>
-          )}
-        </div>
-        <button
-          type="button"
-          className="btn j-desk"
-          disabled={listed.length === 0}
-          onClick={() => download(csvName(filter, Date.now()), toCsv(listed))}
-          title={`Download the ${listed.length} ${listed.length === 1 ? 'entry' : 'entries'} under ${filterLabel(filter)} as a CSV file`}
-        >
-          Export CSV
-        </button>
+        <h1 className="answer wide" data-testid="journal-answer">
+          {headline !== null && !replay ? headline : <Flash value={counts.signed}>{journalAnswer(counts, replay)}</Flash>}
+        </h1>
+        <p className="j-sub g">
+          {replay ? 'Everything the replay desk did, on recorded mainnet prices.' : 'Everything the desk did, as the contract recorded it.'}
+          {counts.since === null
+            ? ''
+            : ` Since ${dayMonth(counts.since)}, ${counts.filters.all.toLocaleString('en-US')} ${counts.filters.all === 1 ? 'entry' : 'entries'}${counts.complete ? '' : ' loaded'}.`}{' '}
+          <button
+            type="button"
+            className="btn quiet j-desk"
+            disabled={listed.length === 0}
+            onClick={() => download(csvName(filter, Date.now()), toCsv(listed))}
+            title={`Download the ${listed.length} ${listed.length === 1 ? 'entry' : 'entries'} under ${filterLabel(filter)} as a CSV file`}
+          >
+            Export CSV
+          </button>
+        </p>
       </section>
+
+      <Counts counts={counts} replay={replay} className="j-phone" />
 
       <div className="j-summary j-phone">
         <div>
-          <span>{sinceLabel(shown)}</span>
-          <span>{money(attribution.netUsd)}</span>
+          <span>Net on the entries shown</span>
+          <span className={moneyTone(attribution.netUsd) ?? undefined}>{money(attribution.netUsd)}</span>
         </div>
         <div>
           <span>Funding received</span>
-          <span className={attribution.fundingUsd !== null && attribution.fundingUsd > 0 ? 'pos' : undefined}>{money(attribution.fundingUsd)}</span>
+          <span className={moneyTone(attribution.fundingUsd) ?? undefined}>{money(attribution.fundingUsd)}</span>
         </div>
         <div>
           <span>Fees, basis, transfers</span>
-          <span>{money(costs)}</span>
+          <span>{money(costsUsd(attribution))}</span>
         </div>
       </div>
 
-      <Filters filter={filter} counts={counts} onChange={setFilter} />
+      <Filters filter={filter} counts={counts.filters} onChange={setFilter} />
 
       <div className="j-grid">
         <section className="j-feed" aria-label="Journal entries" ref={feedRef} {...SCROLLER}>
@@ -169,7 +171,7 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
             </div>
           ) : null}
           {days.map((group) => (
-            <Day key={group.day} group={group} />
+            <Day key={group.day} group={group} items={story.get(group.day) ?? []} factsOf={factsOf} />
           ))}
           {days.length === 0 ? <p className="j-none">Nothing under {filterLabel(filter)} yet.</p> : null}
           {fold ? (
@@ -180,7 +182,7 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
             <Older {...paging} />
           )}
         </section>
-        <Side entries={shown} desk={desk} windows={windows} />
+        <Side entries={shown} counts={counts} desk={desk} windows={windows} />
       </div>
     </div>
   );

@@ -1,7 +1,7 @@
 import { useEffect } from 'react';
 import { NOTICE_MS, clearNotice, useNotice } from './notice.ts';
 
-/** The line under the status line that says what a button did: amber when it was not sent. It goes by itself after a few seconds. */
+/** A small note at the foot of the screen that says what a button did: amber when it was not sent. It goes by itself after a few seconds. */
 export function NoticeBar() {
   const notice = useNotice();
   const id = notice?.id;
@@ -13,7 +13,7 @@ export function NoticeBar() {
 
   if (!notice) return null;
   return (
-    <div className={notice.tone === 'ok' ? 'notice ok' : 'notice'} role="status">
+    <div className={notice.tone === 'ok' ? 'toast ok' : 'toast'} role="status">
       <b>{notice.title}</b>
       <span>{notice.text}</span>
       <button type="button" className="btn quiet" onClick={clearNotice}>Dismiss</button>

@@ -5,8 +5,28 @@ import { Flash } from '../ui/Flash.tsx';
 import { oneLegCopy, refusedCopy } from '../ui/waitCopy.ts';
 import { cx } from '../ui/cx.ts';
 import { useStream } from '../stream/hub.ts';
+import { clock } from './entry.ts';
 import { rowOf, type DayGroup } from './model.ts';
-import { collapseWaits, waitsView } from './waits.ts';
+import { moneyTone } from '../desk/answer.ts';
+import type { HoldItem, PeriodFact } from './period.ts';
+import { smallUsd, type StoryItem } from './story.ts';
+import { waitsView } from './waits.ts';
+
+/** Lines longer than this show their start, with the rest behind "Show all". */
+const LONG = 180;
+
+function Long({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  if (text.length <= LONG) return <>{text}</>;
+  return (
+    <>
+      {open ? text : `${text.slice(0, LONG).replace(/\s+\S*$/, '')}…`}
+      <button type="button" className="j-wait-more" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
+        {open ? 'Show less' : 'Show all'}
+      </button>
+    </>
+  );
+}
 
 /** One entry: when, what kind, the engine's one line, the reason, the money, and the links that prove it. */
 const Entry = memo(function Entry({ entry }: { entry: JournalEntry }) {
@@ -26,7 +46,7 @@ const Entry = memo(function Entry({ entry }: { entry: JournalEntry }) {
         <span className={cx('k', row.tone)}>{row.label}</span>
       </span>
       <div className="what">
-        {refused ? refused.text : row.summary}
+        {refused ? refused.text : <Long text={row.summary} />}
         {refused ? <span className="why">{refused.raw}</span> : null}
         {row.steps ? (
           <div className="j-steps">
@@ -111,8 +131,61 @@ const WaitRun = memo(function WaitRun({ entries }: { entries: JournalEntry[] }) 
   );
 });
 
-/** A day: its date and P&L total, then its entries newest first. */
-export function Day({ group }: { group: DayGroup }) {
+/** The desk's own line on a venue it could not read: it holds, and decides nothing on it (UX, Journal). */
+const HELD_NOTE = 'The desk held; it decides nothing on a venue it cannot read.';
+
+/** Funding in words, or an incident with its recovery: one line with its time and, for funding, the amount. */
+function Line({ item }: { item: Extract<StoryItem, { type: 'funding' } | { type: 'incident' }> }) {
+  const usd = item.type === 'funding' ? item.usd : null;
+  return (
+    <article className="j-line" data-kind={item.type}>
+      <time className="t" dateTime={new Date(item.t).toISOString()}>
+        {clock(item.t)}
+      </time>
+      <span className="what">
+        {item.text}
+        {item.type === 'incident' && item.entry.kind === 'error' ? <small>{HELD_NOTE}</small> : null}
+      </span>
+      <span className={cx('amt', moneyTone(usd, 4))}>{usd === null ? '' : smallUsd(usd)}</span>
+    </article>
+  );
+}
+
+/**
+ * A holding period: one line (when it began, the pair, how many checks), unfolded on tap to its facts (period.ts). An
+ * ongoing period starts unfolded on the desktop and folded on the phone, as the book draws them.
+ */
+function Period({ item, facts }: { item: HoldItem; facts: readonly PeriodFact[] }) {
+  // null until the reader taps: the default follows the period (it may turn ongoing once the windows are read).
+  const [tapped, setOpen] = useState<boolean | null>(null);
+  const open = tapped ?? (item.ongoing && typeof window !== 'undefined' && window.matchMedia('(min-width: 1024px)').matches);
+  const id = `pd-${item.id}`;
+  return (
+    <article className="j-per" data-kind="hold">
+      <button type="button" className="j-per-row" aria-expanded={open} aria-controls={id} onClick={() => setOpen(!open)}>
+        <time className="t" dateTime={new Date(item.from).toISOString()}>
+          {clock(item.from)}
+        </time>
+        <b>{item.text}</b>
+        <span className="r">
+          {item.ongoing ? 'Still held' : 'Ended'}
+          <i className={cx('chev', open && 'u')} aria-hidden="true" />
+        </span>
+      </button>
+      <div className={cx('j-pd', !open && 'shut')} id={id} hidden={!open}>
+        {facts.map((f) => (
+          <div className="kv" key={f.label}>
+            <span>{f.label}</span>
+            <span className={f.tone ?? undefined}>{f.value}</span>
+          </div>
+        ))}
+      </div>
+    </article>
+  );
+}
+
+/** A day: its date and P&L total, then what happened, as story lines, newest first. */
+export function Day({ group, items, factsOf }: { group: DayGroup; items: readonly StoryItem[]; factsOf: (item: HoldItem) => PeriodFact[] }) {
   return (
     <section aria-label={group.label}>
       <div className="j-day">
@@ -121,8 +194,16 @@ export function Day({ group }: { group: DayGroup }) {
           <Flash value={group.totalUsd}>{signedUsd(group.totalUsd)}</Flash>
         </span>
       </div>
-      {collapseWaits(group.entries).map((item) =>
-        item.type === 'waits' ? <WaitRun key={item.id} entries={item.entries} /> : <Entry key={item.entry.id} entry={item.entry} />,
+      {items.map((item) =>
+        item.type === 'waits' ? (
+          <WaitRun key={item.id} entries={item.entries} />
+        ) : item.type === 'entry' ? (
+          <Entry key={item.id} entry={item.entry} />
+        ) : item.type === 'hold' ? (
+          <Period key={item.id} item={item} facts={factsOf(item)} />
+        ) : (
+          <Line key={item.id} item={item} />
+        ),
       )}
     </section>
   );

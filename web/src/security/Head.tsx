@@ -1,4 +1,4 @@
-import { Figure, Sk, type Reading } from './Sk.tsx';
+import { Figure, type Reading } from './Sk.tsx';
 
 /**
  * The zero, and the five steps an order goes through (design/screens/desktop/security.html). The zero is a fact of the
@@ -7,15 +7,12 @@ import { Figure, Sk, type Reading } from './Sk.tsx';
  */
 export function Head({ r }: { r: Reading }) {
   return (
-    <section className="s-head" aria-label="Keys that exist">
+    <div className="s-zero-col" aria-label="Keys that exist">
       <div>
-        {/* While the contract is being read the zero is a block, as in the design: it is said of this desk once it is known. */}
-        <div className="s-zero" aria-hidden="true">
-          {r.kind === 'loading' ? <Sk w={93} h={128} /> : '0'}
-        </div>
-        <h1>
-          {r.kind === 'loading' ? null : <span className="s-sr">0 </span>}private keys exist for this desk
-        </h1>
+        <div className="s-zero" aria-hidden="true">0</div>
+        <h2 className="s-zero-text">
+          <span className="s-sr">0 </span>private keys exist for this desk.
+        </h2>
         <p>
           No private key exists for any exchange account: not ours, not the engine’s, not yours. A NEAR contract owns every account and asks the NEAR
           MPC network to sign, one order at a time, only after checking it against your policy.
@@ -57,6 +54,6 @@ export function Head({ r }: { r: Reading }) {
         </ol>
         <p>If step 3 fails, nothing is signed and the refusal goes in the Journal.</p>
       </div>
-    </section>
+    </div>
   );
 }

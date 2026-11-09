@@ -64,14 +64,12 @@ test('every component that draws a write control asks writeControls first', () =
   const src = join(dirname(fileURLToPath(import.meta.url)), '..');
   const gated: [string, string][] = [
     ['shell/Header.tsx', 'money'],
-    ['shell/StatusActions.tsx', 'owner'],
-    ['desk/Decision.tsx', 'close'],
+    ['desk/DeskScreen.tsx', 'close'],
     ['windows/WindowList.tsx', 'rotate'],
     ['rescue/Stress.tsx', 'stress'],
     ['journal/States.tsx', 'money'],
     ['security/States.tsx', 'onboarding'],
     ['shell/Shell.tsx', 'onboarding'],
-    ['desk/DeskScreen.tsx', 'owner'],
     ['windows/Detail.tsx', 'close'],
     ['windows/Detail.tsx', 'rotate'],
     ['windows/Detail.tsx', 'enter'],

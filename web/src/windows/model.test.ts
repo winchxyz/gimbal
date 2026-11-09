@@ -113,7 +113,7 @@ test('status word: held wins, then the contract refusal, then the NEAR AI risk c
 test('a stored price the open refreshes is a note on an enterable row, never a refusal', () => {
   const note = 'stored ETH price stale: refreshed at open';
   const w = win({ note });
-  assert.deepEqual(rowStatus(w), { kind: 'note', text: note, compact: 'Price at open' });
+  assert.deepEqual(rowStatus(w), { kind: 'note', text: 'Price is read again when it opens', compact: 'Price at open' });
   assert.equal(bestEnterable([w]), w, 'still the first window auto would open');
   // A refusal or the desk holding it still wins over the note.
   assert.equal(rowStatus(win({ note, refused: { code: 'E_SIZE', reason: 'leg over the cap' } })).kind, 'refused');

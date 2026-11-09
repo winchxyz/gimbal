@@ -2,16 +2,11 @@ import type { DeskState, JournalEntry, Leg, Mode, RescueProgress, StrategyConfig
 import { price, qty } from '../desk/format.ts';
 import type { ProofLink } from '../journal/entry.ts';
 import { useJournal } from '../journal/useJournal.ts';
-import { StatusActions } from '../shell/StatusActions.tsx';
 import { VENUE_NAMES } from '../shell/status.ts';
-import { useStatus } from '../shell/useStatus.ts';
-import { useStream } from '../stream/hub.ts';
 import { Flash } from '../ui/Flash.tsx';
 import { cx } from '../ui/cx.ts';
 import { useNow } from '../ui/useNow.ts';
 import { pct, usd } from '../windows/format.ts';
-import { deskMissing } from '../windows/model.ts';
-import { useStrategy } from '../windows/useEngine.ts';
 import {
   CHAIN_OF,
   STEPS,
@@ -39,46 +34,24 @@ import {
   type StepId,
   type StepState,
 } from './model.ts';
-import { RescueError, RescueLoading, Standing } from './States.tsx';
 import { Stress } from './Stress.tsx';
 import { useStepBook } from './useRescue.ts';
 import './rescue.css';
 
-/** The Rescue screen: the seven steps of a rescue with a live timer, or "Standing by" while there is none. */
-export function RescueScreen() {
-  const rescue = useStream((s) => s.rescue);
-  const desk = useStream((s) => s.desk);
-  const windows = useStream((s) => s.windows);
-  const source = useStream((s) => s.source);
-  const connection = useStream((s) => s.connection);
-  const error = useStream((s) => s.error);
-  const engineMode = useStream((s) => s.mode);
-  const noDesk = useStream((s) => deskMissing(s.windows));
-  const strategy = useStrategy().value;
-  const mode = desk?.mode ?? engineMode;
-
-  if (rescue === null) {
-    if (desk === null && source === 'sse' && connection === 'retrying') return <RescueError reason={error} />;
-    if (desk === null && !noDesk) return <RescueLoading />;
-    return <Standing desk={desk} windows={windows} strategy={strategy} mode={mode} />;
-  }
-  return <Run progress={rescue} desk={desk} strategy={strategy} mode={mode} />;
-}
-
 // ---------- a rescue ----------
 
-interface RunProps {
+export interface RunProps {
   progress: RescueProgress;
   desk: DeskState | null;
   strategy: StrategyConfig | null;
   mode: Mode | null;
 }
 
-function Run({ progress: p, desk, strategy, mode }: RunProps) {
+/** A rescue, step by step, with a live timer (Safety, while one runs or just ended). */
+export function Run({ progress: p, desk, strategy, mode }: RunProps) {
   const now = useNow(1000);
   const book = useStepBook();
   const { entries } = useJournal();
-  const status = useStatus('rescue');
 
   const running = isRunning(p);
   const failure = failureOf(p, desk);
@@ -97,8 +70,6 @@ function Run({ progress: p, desk, strategy, mode }: RunProps) {
   const moving = movingOf(p, failure, trigger?.needUsd ?? null, mode);
   const distance = leg?.distanceToLiqPct ?? null;
   const failed = p.step === 'failed';
-  // The phone has no buttons in the status line: the owner's choices go under the numbers when the desk needs them.
-  const phoneActions = status && status.actions.buttons.length > 0 ? status.actions : null;
 
   return (
     <div className="r-page" data-step={p.step}>
@@ -133,8 +104,6 @@ function Run({ progress: p, desk, strategy, mode }: RunProps) {
           </div>
         </div>
       </section>
-
-      {phoneActions ? <StatusActions view={phoneActions} className="r-btns r-phone" /> : null}
 
       <ol className="r-steps" aria-label="Steps of the rescue">
         {STEPS.map((id, i) => (
@@ -247,7 +216,7 @@ function Now({ leg, desk, p }: { leg: Leg | null; desk: DeskState | null; p: Res
   );
 }
 
-function Earlier({ entries, before }: { entries: readonly JournalEntry[]; before: number }) {
+export function Earlier({ entries, before }: { entries: readonly JournalEntry[]; before: number }) {
   const rows = earlierRows(entries, before);
   const usual = usualSeconds(entries, before);
   const fees = feesText(entries, before);

@@ -100,33 +100,4 @@ export const isOwnerUnlocked = (): boolean => isHostedLive() && ownerToken() !==
 
 export const writeControls = (): WriteControls => writeControlsFor(isReadOnly(), isHostedReplay(), isOwnerUnlocked());
 
-export const READ_ONLY_LINE = 'Read-only view';
 export const READ_ONLY_TEXT = 'Read-only view. This page shows the desk and cannot change anything on it.';
-export const HOSTED_LINE = 'Public replay: read-only. Run it yourself with npm run demo.';
-
-/**
- * The public live view's line, from the network the engine itself reports (GET /state `mode`), so live data is never
- * called a replay and a replay is never called live. Null: the engine has not said yet. Visitors cannot change
- * anything; `unlocked`: the owner unlocked this tab with the owner token (remote/owner.ts), and the line says so.
- * `ownerWrites`: the host has owner writes on (its /healthz); off, the line is exactly as it was before owner writes.
- */
-export function hostedLiveLine(mode: 'mainnet' | 'testnet' | 'replay' | null, unlocked = false, ownerWrites = false): string {
-  if (unlocked) {
-    const what = mode === 'mainnet' ? 'Live mainnet desk' : mode === 'testnet' ? 'Live testnet desk, test money' : mode === 'replay' ? 'Replay, not the live desk' : 'Waiting for the engine';
-    return `${what}. Owner unlocked in this tab: you can enter and close; the contract checks every order.`;
-  }
-  switch (mode) {
-    case 'mainnet':
-      return ownerWrites
-        ? 'Live mainnet desk, read-only for visitors: the real desk as it trades now. Nothing a visitor does here can change it. For the recorded replay, run npm run demo.'
-        : 'Live mainnet desk, read-only: the real desk as it trades now. Nothing on this page can change it. For the recorded replay, run npm run demo.';
-    case 'testnet':
-      return ownerWrites
-        ? 'Live testnet desk, read-only for visitors: test money, not the mainnet desk. Nothing a visitor does here can change it.'
-        : 'Live testnet desk, read-only: test money, not the mainnet desk. Nothing on this page can change it.';
-    case 'replay':
-      return 'Replay, read-only: this engine plays recorded mainnet data back. It is not the live desk.';
-    case null:
-      return 'Read-only view. Waiting for the engine to answer.';
-  }
-}

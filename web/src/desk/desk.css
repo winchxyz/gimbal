@@ -1,257 +1,98 @@
-/* Desk screen. The layout follows design/screens/desktop/desk.html (1440 px) and phone/desk.html (390 px) with
-   the numbers of design/screens/shared/stage.css and phone.css; every value comes from tokens.css.
-   Colour means state only; a line separates rows or shows data. */
+/* Desk, brand book C (Desk 1440 and Desk 390). Every value comes from tokens.css.
+   The sentence, the desk value, the held pair as one row that unfolds, then payback, next best and the latest lines.
+   Colour sits on a number or a word only, for its state. */
 
-/* What only the phone or only the desktop draws. The flag beats the display a rule on the element itself sets. */
-@media (min-width: 1024px) { .d-phone { display: none !important; } }
-@media (max-width: 1023px) { .d-desk { display: none !important; } }
+.dk { padding: 0 var(--gutter) var(--s-8); }
 
-/* At least the height of the area under the shell's lines (the shell's <main>), so the bottom blocks sit at its foot. */
-.d-page { display: flex; flex-direction: column; min-height: 100%; }
+/* ---------- the answer and the desk value ---------- */
+.dk-hero { padding: 72px 0 56px; }
+.dk-hero .answer { max-width: 860px; }
+.dk-v { margin-top: 40px; display: flex; align-items: baseline; flex-wrap: wrap; column-gap: 22px; row-gap: var(--s-2); }
+.dk-v .fig { font: var(--t-figure); letter-spacing: -0.025em; }
+.dk-v .fig small { font: inherit; color: var(--ink-2); }
+.dk-v p { font: var(--t-body); }
+.dk-gaps { margin-top: var(--s-3); font: var(--t-s); max-width: 70ch; }
+.dk-lead { margin-top: var(--s-5); font: var(--t-body); max-width: 60ch; }
+.dk-lead a { color: var(--ink); }
+.dk-money { display: block; margin-top: var(--s-4); font: var(--t-s); }
+.dk-money a { color: var(--ink); }
+.dk-ink { color: var(--ink); }
+.dk-none { padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 
-/* ---------- desktop: two legs facing each other, the desk value between them ---------- */
-/* Columns: left leg | desk value (500 px) | right leg. Extra width goes to the sides, away from the middle.
-   The first row is 300 px: legs and desk value start 32 px under the status line, their rows 300 px below that. */
-/* the strategy loop's decision, then the owner's Close: one quiet line under the status line */
-.d-decision { display: flex; align-items: center; gap: var(--s-4); padding: var(--s-3) var(--gutter); border-bottom: 1px solid var(--line); font: var(--t-s); color: var(--ink-2); min-height: 52px; }
-.d-decision .say { margin: 0; min-width: 0; flex: 1; }
-.d-decision .word { color: var(--ink); margin-right: var(--s-3); }
-.d-decision .reason { color: var(--ink-2); }
-.d-decision .when { margin-left: var(--s-3); white-space: nowrap; }
-.d-decision .end { flex: none; display: inline-flex; align-items: center; justify-content: flex-end; gap: var(--s-3); max-width: 60%; }
-.d-decision .end .out, .d-decision .end .ink { text-align: right; }
-.d-decision .end .ink { color: var(--ink); }
-.d-decision .end .out.ok { color: var(--ink); }
-.d-decision .end .btn { height: 32px; }
-.d-page > .d-empty { min-height: 0; flex: 1; }
+/* ---------- the held pair: one row ---------- */
+.dk-row { display: grid; grid-template-columns: 1.1fr 1.5fr 1.5fr 1.1fr auto; gap: var(--s-5); align-items: center; padding: var(--s-5) 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.dk-row .c { min-width: 0; text-align: left; }
+.dk-row .c b { display: block; font: var(--t-l); letter-spacing: -0.01em; }
+.dk-row .c > span { display: block; font: var(--t-s); color: var(--ink-2); margin-top: 3px; }
+.dk-row .c.end { display: flex; gap: 36px; align-items: center; justify-content: flex-end; }
+.dk-row .dim b, .dk-row .dim > span { color: var(--ink-3); }
+.dk-toggle { display: block; }
+.dk-details { font: var(--t-s); min-height: 0; }
+.dk-ask { display: inline-flex; align-items: center; gap: var(--s-4); font: var(--t-s); color: var(--ink-2); white-space: normal; }
+.dk-ask .btn + .btn { margin-left: 0; }
+.dk-ask > span[role='status'] { max-width: 36ch; }
+/* Close, asked in place: the question, what happens, then the two buttons */
+.dk-confirm { display: flex; flex-direction: column; align-items: flex-start; gap: var(--s-2); max-width: 44ch; text-align: left; }
+.dk-confirm b { font: var(--t-l); color: var(--ink); font-weight: 600; }
+.dk-confirm .row { display: flex; gap: var(--s-4); margin-top: var(--s-2); }
+.dk-gaps a { color: var(--ink); }
 
-.d-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(380px, 500px) minmax(0, 1fr);
-  grid-template-rows: minmax(300px, auto) auto auto;
-  grid-template-areas:
-    'lh hero rh'
-    'lr ex rr'
-    'lr pnl rr';
-  padding: var(--s-6) 0 var(--s-4);
-}
+/* the unfold: height and opacity only */
+.dk-legs { display: grid; grid-template-columns: 1fr 1fr; column-gap: var(--s-8); padding-top: var(--s-2); overflow: hidden; max-height: 1400px; opacity: 1; transition: max-height var(--dur-sheet) var(--ease), opacity var(--dur-sheet) var(--ease); }
+.dk-legs.shut { max-height: 0; opacity: 0; padding-top: 0; }
+.dk-legs h4 { margin: 20px 0 6px; font-weight: 600; font-size: 15px; }
+.dk-legs .dk-legnotes { grid-column: 1 / -1; display: grid; gap: var(--s-2); margin-top: var(--s-4); font: var(--t-s); max-width: 90ch; }
+.dk-legs .dk-pnl { grid-column: 1; }
+.dk-flag { font: var(--t-s); margin-bottom: var(--s-2); }
+.dk-close-phone { display: none; }
 
-/* desk value */
-.d-hero { grid-area: hero; text-align: center; min-width: 0; }
-.d-hero .lab, .d-exposure .lab, .d-pnl .lab { font: var(--t-s); color: var(--ink-2); }
-.d-value { font: var(--t-hero); letter-spacing: var(--track-hero); margin-top: var(--s-3); }
-.d-value small { font-size: 56px; letter-spacing: var(--track-xl); color: var(--ink-2); }
-.d-rate { margin-top: var(--s-4); }
-.d-payback { width: 300px; max-width: 100%; margin: 22px auto 0; padding: 6px 0; }
-.d-payback .t { height: 3px; background: var(--line-2); border-radius: 2px; position: relative; overflow: hidden; }
-.d-payback .t i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--ink); border-radius: 2px; }
-.d-payback .c { display: flex; justify-content: space-between; gap: var(--s-4); font: var(--t-s); color: var(--ink-2); margin-top: var(--s-2); }
-.d-payback > .c:first-child { margin-top: 0; justify-content: center; }
-.d-reserve { margin-top: var(--s-2); font: var(--t-s); color: var(--ink-2); }
+.dk-prow { display: none; }
 
-/* one leg: head (venue, distance to liquidation) and rows */
-.d-head { min-width: 0; }
-.d-head.left { grid-area: lh; padding-left: var(--gutter); }
-.d-head.right { grid-area: rh; padding-right: var(--gutter); text-align: right; }
-.d-head h2 { font: var(--t-xl); letter-spacing: var(--track-xl); }
-.d-head .sub { margin-top: 10px; color: var(--ink-2); }
-.d-head .d-flag { margin-top: var(--s-2); font: var(--t-s); }
-.d-head .dist { margin-top: 44px; font: var(--t-num); letter-spacing: var(--track-num); }
-.d-head .dist.flagged { margin-top: 18px; }
-.d-head .move, .d-head .thr { font: var(--t-s); color: var(--ink-2); }
-.d-head .move { margin-top: 10px; }
-.d-head .thr { margin-top: var(--s-2); }
-.d-head.missing h2 { color: var(--ink-3); }
-.d-head.stale, .d-rows.stale { opacity: .45; }
+/* ---------- under the pair ---------- */
+.dk-lower { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-8); padding-top: var(--s-7); }
+.dk-payback .dk-big { display: block; font: var(--t-num); letter-spacing: var(--track-num); }
+.dk-payback .bar { height: 4px; background: var(--line); margin: 14px 0 12px; position: relative; }
+.dk-payback .bar i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--ink); transition: width var(--dur) var(--ease); }
+.dk-next { margin-top: 44px; }
+.dk-facts .dk-next { margin-top: var(--s-7); }
+.dk .next { display: flex; justify-content: space-between; align-items: baseline; gap: var(--s-4); padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.dk .next b { font: var(--t-l); letter-spacing: -0.01em; }
+.dk .next:hover b { text-decoration: underline; text-underline-offset: 4px; text-decoration-thickness: 1px; }
+.dk .hd a { color: var(--ink-2); }
+.jl { display: grid; grid-template-columns: 76px 1fr; gap: var(--s-4); padding: var(--s-3) 0; border-bottom: 1px solid var(--line); }
+.jl:first-of-type { border-top: 1px solid var(--line); }
+.jl > span:first-child { color: var(--ink-2); }
+.dk-facts .kv:first-child { border-top: 1px solid var(--line); }
 
-.d-rows { align-self: start; width: min(100%, 464px); padding-top: var(--s-3); min-width: 0; }
-.d-rows.left { grid-area: lr; justify-self: start; padding-left: var(--gutter); }
-.d-rows.right { grid-area: rr; justify-self: end; padding-right: var(--gutter); }
-.d-rows > div { display: flex; justify-content: space-between; gap: var(--s-3); padding: 10px 0; border-bottom: 1px solid var(--line); }
-.d-rows > div > span:first-child { color: var(--ink-2); }
-.d-rows.right > div { flex-direction: row-reverse; }
-.d-rows:empty { border: 0; }
-
-/* net exposure: the level between the legs, in --watch when they drift apart */
-.d-exposure { grid-area: ex; text-align: center; min-width: 0; }
-.d-net { font: var(--t-num); letter-spacing: var(--track-num); margin-top: var(--s-2); }
-.d-exposure .ex { max-width: 340px; margin: 10px auto 0; font: var(--t-s); line-height: 1.5; color: var(--ink-2); }
-.d-exposure .ex.wt { color: var(--watch); }
-
-/* profit and loss: funding, fees, price and net, under the net exposure */
-.d-pnl { grid-area: pnl; width: 340px; max-width: 100%; margin: 18px auto 0; min-width: 0; }
-.d-pnl-rows > div { display: flex; justify-content: space-between; gap: var(--s-3); padding: 4px 0; border-bottom: 1px solid var(--line); }
-.d-pnl-rows > div > span:first-child { color: var(--ink-2); }
-.d-pnl-rows > .tot { border-bottom: 0; border-top: 1px solid var(--line-2); margin-top: -1px; }
-.d-pnl-rows > .tot > span:first-child { color: var(--ink); }
-
-/* the two blocks at the bottom: latest events, next best window */
-.d-bottom { margin-top: auto; border-top: 1px solid var(--line); display: grid; grid-template-columns: 1fr 1fr; }
-.d-bottom > section { padding: 20px var(--gutter) 24px; min-width: 0; }
-.d-bottom > section + section { border-left: 1px solid var(--line); }
-.d-bottom h3 { font: var(--t-s); color: var(--ink-2); margin: 0 0 10px; display: flex; justify-content: space-between; }
-.d-bottom h3 a { transition: color var(--dur) var(--ease); }
-.d-bottom h3 a:hover { color: var(--ink); }
-.d-none { font: var(--t-s); }
-
-.ev { display: grid; grid-template-columns: 96px minmax(0, 1fr) auto; gap: var(--s-4); padding: 7px 0; font: var(--t-s); }
-.ev .t { color: var(--ink-3); }
-.ev .proof { color: var(--ink-3); transition: color var(--dur) var(--ease); }
-.ev a.proof:hover { color: var(--ink-2); }
-/* The rest of a long line: a quiet "more" after the head, the text under it when opened. */
-.ev .more { display: inline; margin-left: var(--s-2); }
-.ev .more > summary { display: inline; cursor: pointer; color: var(--ink-3); list-style: none; }
-.ev .more > summary::-webkit-details-marker { display: none; }
-.ev .more > summary:hover { color: var(--ink-2); }
-.ev .more[open] { display: block; margin: var(--s-2) 0 0; color: var(--ink-2); overflow-wrap: anywhere; }
-.ev .flag::before { content: ''; display: inline-block; width: 6px; height: 6px; border-radius: var(--r-dot); background: var(--watch); margin-right: var(--s-2); vertical-align: 1px; }
-
-.next { display: flex; justify-content: space-between; align-items: baseline; }
-.next b { font: 400 28px/1 var(--display); letter-spacing: var(--track-num); }
-.d-next .note { margin-top: var(--s-3); font: var(--t-s); color: var(--ink-2); }
-
-/* "more" beside a line cut to fit: a quiet link to the Journal, where the line is written in full. Its hit area is
-   larger than the word (touch), without making the line any taller or reaching into the next row. */
-.jump { flex: none; position: relative; margin-left: var(--s-2); color: var(--ink-3); transition: color var(--dur) var(--ease); }
-.jump:hover { color: var(--ink-2); }
-.jump::after { content: ''; position: absolute; inset: -4px -8px; }
-
-/* Desktop: lines whose words change with the data keep one line, so nothing under them moves when they do. A cut line
-   has its full text on hover and "more" beside it. The unprotected-order flag is a warning and is never cut: it sits
-   outside the cut text, on a line of its own under it, so only the rare row that carries it grows and the text keeps
-   its width (the " · " between them is the phone's only). */
-@media (min-width: 1024px) {
-  /* The decision line is one of the lines under the header: when a short window scrolls the Desk, it stays with them. */
-  .d-decision { position: sticky; top: 0; z-index: 2; background: var(--bg); }
-  .d-decision .say { display: flex; align-items: baseline; white-space: nowrap; }
-  .d-decision .word, .d-decision .when { flex: none; }
-  .d-decision .reason { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-  .ev .what { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: var(--s-2); min-width: 0; }
-  .ev .txt { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ev .jump { margin-left: 0; white-space: nowrap; }
-  .ev .sep { display: none; }
-  .ev .flag { flex: 1 0 100%; min-width: 0; }
-  .ev .proof { white-space: nowrap; }
-}
-
-/* A window under 1000 px tall: the same Desk with the slack taken out of it. The 1000 px assumes the stack above the
-   Desk: header (72) + one replay or read-only line (35) + status line (52) + decision line (52) = 211 px, which leaves
-   689 px at 900 px for a held pair and its latest events; they fit there. Type and order stay as they are. Shorter
-   still, or with a notice line on top, the Desk scrolls under those lines. */
-@media (min-width: 1024px) and (max-height: 1000px) {
-  .d-grid { grid-template-rows: auto auto auto; padding: var(--s-5) 0 var(--s-2); }
-  .d-hero { padding-bottom: var(--s-4); }   /* the first row is as tall as its content now: keep the desk value off the net exposure */
-  .d-payback { margin-top: var(--s-4); }
-  .d-rows > div { padding: var(--s-2) 0; }
-  .d-pnl { margin-top: var(--s-2); }
-  .d-exposure .ex { margin-top: var(--s-2); }
-  .d-bottom > section { padding: var(--s-4) var(--gutter) var(--s-4); }
-  .d-bottom h3 { margin-bottom: var(--s-1); }
-  .ev { padding: var(--s-1) 0; }
-}
-
-/* ---------- no position ---------- */
-.d-empty { display: flex; min-height: 100%; }
-.d-empty .msg { margin: auto; width: 640px; max-width: 100%; padding: 0 var(--s-4); text-align: center; transform: translateY(-8%); }
-.d-empty .lab { font: var(--t-s); color: var(--ink-2); }
-.d-empty h1 { font: var(--t-xl); letter-spacing: var(--track-xl); margin-top: 14px; }
-.d-empty p { color: var(--ink-2); margin: var(--s-4) auto 0; max-width: 560px; }
-.d-empty p b { color: var(--ink); font-weight: 400; }
-.d-empty .facts { display: flex; justify-content: center; gap: var(--s-7); margin-top: 40px; }
-.d-empty .facts b { display: block; font: var(--t-num); letter-spacing: var(--track-num); font-weight: 400; }
-.d-empty .facts span { font: var(--t-s); color: var(--ink-2); }
-.d-empty .go { display: flex; justify-content: center; gap: 10px; margin-top: 28px; }
-
-/* ---------- loading: placeholder bars where the figures go ---------- */
-.d-sk { display: block; background: var(--sel); border-radius: 4px; animation: d-sk 1.4s var(--ease) infinite; }
-@keyframes d-sk { 50% { background: var(--line-2); } }
-@media (prefers-reduced-motion: reduce) { .d-sk { animation: none; } }
-.d-hero .d-sk-value { margin: var(--s-3) auto 0; }
-.d-hero .d-sk-rate { margin: var(--s-4) auto 0; }
-.d-payback .c .d-sk { flex: none; }
-.d-head .d-sk-title { margin: 0; }
-.d-head .d-sk-sub { margin-top: 14px; }
-.d-head.right .d-sk, .d-head.right .d-title .d-sk { margin-left: auto; }
-.d-head .d-sk-dist { margin-top: 44px; }
-.d-head .d-sk-move { margin-top: 14px; }
-.d-exposure .d-sk-net { margin: var(--s-2) auto 0; }
-.d-rows .d-sk { flex: none; }
-.d-pnl-rows .d-sk { flex: none; }
-.ev .d-sk { align-self: center; }
-.d-next > .d-sk { margin: 0; }
-
-/* the phone's own buttons (money under the desk value, owner's actions at the bottom) */
-.btns { display: grid; grid-template-columns: repeat(auto-fit, minmax(0, 1fr)); gap: var(--s-2); margin-top: 20px; }
-.btns .note { text-align: center; padding: var(--s-3) 0; font: var(--t-s); }
-
-/* ---------- phone: up to 1023 px, one column ---------- */
+/* ---------- phone: the book's Desk 390 ---------- */
 @media (max-width: 1023px) {
-  .d-decision { flex-direction: column; align-items: stretch; gap: var(--s-3); }
-  .d-decision .end { max-width: none; flex-wrap: wrap; justify-content: flex-start; }
-  .d-decision .end .btn { height: 44px; }
-  .d-grid { display: flex; flex-direction: column; padding-top: 0; }
+  .dk { padding: 0 var(--gutter) var(--s-6); }
+  .dk-hero { padding: 20px 0 0; }
+  .dk-v { margin-top: 36px; display: block; }
+  .dk-v .fig { display: block; font: 600 44px/1 var(--display); letter-spacing: -0.03em; }
+  .dk-v p { margin-top: 10px; }
+  .dk-wide { display: none; }
+  .dk-money { display: block; }
 
-  .d-hero { order: 1; text-align: left; padding: var(--s-5) var(--gutter) 0; }
-  .d-value { font: 400 64px/.95 var(--display); letter-spacing: var(--track-hero); margin-top: var(--s-2); }
-  .d-value small { font-size: 32px; letter-spacing: var(--track-hero); }
-  .d-rate { margin-top: var(--s-2); }
-  .d-hero .d-sk-value, .d-hero .d-sk-rate { margin-left: 0; }
-  .d-payback { width: auto; margin: var(--s-4) 0 0; padding: 0; }
-  .d-payback .c { margin-top: var(--s-2); }
-  .d-reserve { margin-top: var(--s-3); }
+  .dk-row { display: none; }
+  .dk-prow { display: block; margin-top: 44px; padding: 18px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .dk-prow .t { display: flex; justify-content: space-between; align-items: baseline; }
+  .dk-prow .t b { font: var(--t-l); }
+  .dk-prow .t .btn { font: var(--t-s); }
+  .dk-prow .kv { border-bottom: 0; padding: 0; margin-top: 10px; }
+  .dk-prow .kv.dim span { color: var(--ink-3); }
 
-  .d-exposure { order: 2; text-align: left; margin-top: var(--s-5); padding: var(--s-5) var(--gutter) 0; border-top: 1px solid var(--line); }
-  .d-net { font: 400 28px/1.1 var(--display); letter-spacing: var(--track-num); margin-top: 6px; }
-  .d-exposure .ex { max-width: none; margin: var(--s-2) 0 0; line-height: 1.4; }
+  .dk-legs { display: block; }
+  .dk-legs h4 { margin: 18px 0 2px; }
+  .dk-legs .kv { font-size: 14px; padding: 8px 0; }
+  .dk-close-phone { display: flex; justify-content: flex-end; margin-top: 14px; }
+  .dk-legs .dk-legnotes { margin-top: var(--s-4); }
 
-  .d-head { padding: var(--s-5) var(--gutter) 0; margin-top: var(--s-5); border-top: 1px solid var(--line); text-align: left; }
-  .d-head.left { order: 3; padding-left: var(--gutter); }
-  .d-rows.left { order: 4; }
-  .d-head.right { order: 5; padding-right: var(--gutter); text-align: left; }
-  .d-rows.right { order: 6; }
-  .d-head .d-title { display: flex; justify-content: space-between; align-items: baseline; gap: var(--s-3); }
-  .d-head h2 { font: 400 24px/1.15 var(--display); letter-spacing: var(--track-num); }
-  .d-head .sub { margin-top: 0; font: var(--t-m); }
-  .d-head.stale .sub { font: var(--t-s); text-align: right; }
-  .d-head .d-flag { margin-top: var(--s-2); }
-  .d-head .dist { margin-top: var(--s-2); font: 400 40px/1 var(--display); letter-spacing: var(--track-xl); }
-  .d-head .dist.flagged { margin-top: var(--s-2); }
-  .d-head .move { margin-top: var(--s-2); }
-
-  .d-rows { width: 100%; justify-self: stretch; padding: var(--s-3) var(--gutter) 0; }
-  .d-rows.left, .d-rows.right { padding: var(--s-3) var(--gutter) 0; }
-  .d-rows.right > div { flex-direction: row; }
-  .d-rows > div > span:last-child { text-align: right; }
-
-  .d-pnl { order: 7; width: auto; margin: var(--s-5) 0 0; padding: var(--s-5) var(--gutter) 0; border-top: 1px solid var(--line); }
-  .d-pnl .lab { margin-bottom: var(--s-2); }
-  .d-pnl-rows > div { padding: 10px 0; }
-
-  .d-bottom { display: block; margin-top: var(--s-5); border-top: 0; }
-  .d-bottom > section { padding: var(--s-5) var(--gutter) 0; border-top: 1px solid var(--line); }
-  .d-bottom > section + section { border-left: 0; margin-top: var(--s-5); }
-  .d-bottom h3 { margin-bottom: 0; align-items: center; }
-  .d-bottom h3 a { padding: 13px 0; margin: -13px 0; }   /* 44 px tap target, same layout */
-
-  .ev { grid-template-columns: 1fr auto; grid-template-areas: 't right' 'what what'; row-gap: 6px; column-gap: var(--s-3); padding: var(--s-3) 0; border-bottom: 1px solid var(--line); }
-  .ev:last-child { border-bottom: 0; }
-  .ev .t { grid-area: t; color: var(--ink-2); }
-  .ev .what { grid-area: what; font: var(--t-m); }
-  .ev .amt, .ev .proof { grid-area: right; text-align: right; color: var(--ink-2); }
-  .ev .amt { color: inherit; }
-  .ev.has-amt .proof { display: none; }
-  .ev .sep { display: none; }
-  .ev .flag { display: block; margin-top: 6px; font: var(--t-s); }
-
-  .d-actions { margin-top: var(--s-5); padding: var(--s-5) var(--gutter) 0; border-top: 1px solid var(--line); }
-  .d-actions .btns { margin-top: 0; }
-  .d-actions:empty { display: none; }
-
-  .d-empty { min-height: calc(100dvh - var(--header) - var(--status)); }
-  .d-empty .msg { transform: none; padding: var(--s-5) var(--gutter); text-align: left; width: auto; }
-  .d-empty h1 { font: 400 40px/1.05 var(--display); letter-spacing: var(--track-xl); }
-  .d-empty p { margin-left: 0; }
-  .d-empty .facts { justify-content: flex-start; gap: var(--s-5); flex-wrap: wrap; margin-top: var(--s-5); }
-  .d-empty .facts b { font: 400 28px/1.1 var(--display); letter-spacing: var(--track-num); }
-  .d-empty .go { justify-content: stretch; flex-direction: column; margin-top: var(--s-5); }
+  .dk-lower { display: block; padding-top: 28px; }
+  .dk-lower > * + * { margin-top: var(--s-6); }
+  .dk-next { margin-top: var(--s-6); }
+  .jl { grid-template-columns: 56px 1fr; }
 }
+
+/* Latest: a long line keeps to two lines and never widens the page */
+.dk-latest .jl > span:last-child { min-width: 0; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }

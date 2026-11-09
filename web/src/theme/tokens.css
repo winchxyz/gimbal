@@ -1,5 +1,7 @@
-/* Gimbal · Stage — design tokens. Source of truth: tokens.json (same values).
-   Dark ground; one typeface; colour reports state only. Copy into web/ with the fonts/ folder. */
+/* Gimbal · brand book C (Chrome) — design tokens for the product screens.
+   Grey carries the brand; colour reports state only. The product sits on Ink #2c2c2e.
+   Every state colour is defined here once and only here: components use the custom properties, never a hex value.
+   The accent is not final: swapping it is the one line `--accent` below. */
 
 /* Apple devices use the system SF fonts. Everywhere else the open fallbacks below
    stand in (Inter 4.1 and Geist Mono, SIL OFL 1.1, Latin subset), so no screen
@@ -11,55 +13,73 @@
 :root {
   color-scheme: dark;
 
-  /* colour */
-  --bg: #0A0A0A;          /* page ground */
-  --sel: #141414;         /* selected row */
-  --line: #1E1E1D;        /* dividers */
-  --line-2: #2E2E2C;      /* the level line, tracks, outlined buttons */
-  --ink: #F2F2F0;         /* primary text, primary button fill */
-  --ink-2: #7E7E7B;       /* secondary text, labels */
-  --ink-3: #4A4A48;       /* timestamps, disabled */
-  --level: #00EC97;       /* level bar, live dots, "Level" state; never a fill larger than 4 px tall */
-  --pos: #3FD9A0;         /* positive money and rates */
-  --watch: #F0A531;       /* watch state, unprotected orders */
-  --danger: #FF5A5F;      /* rescue state, refusals, negative values */
-  --testnet: #6FD8E8;     /* network marker on testnet */
-  --replay: #B9A6FF;      /* network marker in replay mode */
+  /* greys (brand book C, Colour) */
+  --ink-ground: #2c2c2e;  /* product ground (Ink), as the X avatar */
+  --graphite: #3a3a3c;    /* the book's Graphite, kept for anything that uses it on purpose */
+  --raised: #38383a;      /* a selected row, a hovered control: +12 over the ground */
+  --rule: #424245;        /* row separators: the contrast the old rule had on Graphite (1.39:1) */
+  --pewter: #8a8a8e;      /* non-text marks, large type only (4.05:1 on Ink) */
+  --silver: #b2b2b6;      /* secondary text */
+  --chalk: #f3f3f4;       /* primary text, the flat mark */
 
-  /* type: SF on Apple devices, the open Gimbal fallbacks everywhere else */
+  /* state: the only colour on a screen */
+  --level: #63d68f;       /* level, safe, positive money */
+  --watch: #f0bf4c;       /* watch, unprotected orders */
+  --danger: #ff8077;      /* rescue, refusals, negative values */
+  --accent: var(--level); /* the brand accent (live dot); not final: change this line only */
+
+  /* the names the screens use */
+  --bg: var(--ink-ground);
+  --sel: var(--raised);
+  --line: var(--rule);
+  --line-2: var(--pewter);
+  --ink: var(--chalk);
+  --ink-2: var(--silver);
+  --ink-3: var(--pewter);
+  --pos: var(--level);
+  --testnet: #6fd8e8;     /* network marker on testnet */
+  --replay: #b9a6ff;      /* network marker in replay mode */
+  --wash-watch: rgba(240, 191, 76, .10);
+  --wash-danger: rgba(255, 128, 119, .10);
+
+  /* type: SF on Apple devices, the open Gimbal fallbacks everywhere else. Two weights: 400 and 600. */
   --font: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Gimbal Sans', sans-serif;
   --display: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Gimbal Sans', sans-serif;
   --mono: ui-monospace, 'SF Mono', 'Gimbal Mono', monospace; /* hashes and addresses only */
-  --t-hero: 400 112px/0.9 var(--display);   /* desk value */
-  --t-display: 400 72px/1 var(--display);   /* selected window asset and net APR */
-  --t-xl: 400 48px/1 var(--display);        /* venue names */
-  --t-num: 400 44px/1 var(--display);       /* distance to liquidation */
-  --t-l: 400 20px/1.2 var(--display);       /* list assets and values */
-  --t-m: 400 15px/1.45 var(--font);         /* body */
-  --t-s: 400 13px/1.4 var(--font);          /* labels, captions */
-  --t-btn: 500 14px/1 var(--font);
-  --track-hero: -0.03em;
-  --track-display: -0.025em;
-  --track-xl: -0.025em;
-  --track-num: -0.02em;
+  --t-answer: 600 64px/1.04 var(--display);   /* the sentence that opens a screen */
+  --t-figure: 600 48px/1 var(--display);      /* the one number under it */
+  --t-hero: 600 112px/1 var(--display);       /* a market's net a year */
+  --t-display: 600 56px/1.05 var(--display);
+  --t-xl: 600 28px/1.15 var(--display);       /* titles */
+  --t-num: 600 28px/1.15 var(--display);
+  --t-l: 600 21px/1.25 var(--display);        /* a row's lead value */
+  --t-m: 400 15px/1.45 var(--font);           /* body */
+  --t-body: 400 17px/1.5 var(--font);
+  --t-s: 400 13px/1.4 var(--font);            /* labels, captions */
+  --t-btn: 600 15px/1 var(--font);
+  --track-answer: -0.032em;
+  --track-hero: -0.045em;
+  --track-display: -0.03em;
+  --track-xl: -0.016em;
+  --track-num: -0.016em;
   --track-text: 0;
 
   /* space: every distance is a multiple of 4, layout steps of 8 */
   --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px; --s-5: 24px; --s-6: 32px; --s-7: 48px; --s-8: 64px; --s-9: 80px;
   --gutter: 64px;          /* 16px on phones */
-  --header: 72px;
-  --status: 52px;
-  --list-w: 600px;         /* Windows list column */
+  --header: 76px;
+  --list-w: 600px;         /* Markets list column */
 
-  /* radius: only buttons are rounded */
+  /* radius: only the confirm buttons are rounded */
   --r-0: 0;
-  --r-btn: 18px;           /* 36 px tall pill */
+  --r-btn: 18px;
   --r-dot: 50%;
 
-  /* motion */
-  --ease: cubic-bezier(.25, .1, .25, 1);
-  --dur-fast: 120ms;       /* a number that changed flashes once */
-  --dur: 240ms;            /* hover, selection */
-  --dur-tilt: 400ms;       /* level line tilts with net delta */
+  /* motion: things settle, they do not perform */
+  --ease: cubic-bezier(.2, 0, 0, 1);
+  --dur-fast: 240ms;       /* a new number crossfades in place */
+  --dur: 240ms;            /* state change, hover, selection */
+  --dur-sheet: 500ms;      /* unfold: height and opacity only */
+  --dur-tilt: 400ms;
 }
-@media (prefers-reduced-motion: reduce) { :root { --dur-fast: 0ms; --dur: 0ms; --dur-tilt: 0ms; } }
+@media (prefers-reduced-motion: reduce) { :root { --dur-fast: 0ms; --dur: 0ms; --dur-sheet: 0ms; --dur-tilt: 0ms; } }
