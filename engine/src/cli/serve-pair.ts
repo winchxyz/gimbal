@@ -91,7 +91,7 @@ import type { ProtectionCloseReport } from '../trade/protected-pair.ts';
 import { GuardedLeg, InFlightBook, ProtectedPair, inFlightEnds, reconcileHow, startPlan } from '../trade/protected-pair.ts';
 import type { TraderFileState, TraderLock } from '../trade/trader-state.ts';
 import { TRADER_STATE_VERSION, TraderStateStore, acquireTraderLock, savedShape, traderLockPath, traderStateFile, userStateDir } from '../trade/trader-state.ts';
-import { HL_MAINNET_URL, HyperliquidReader, hlTradeFetch } from '../venues/hyperliquid.ts';
+import { HL_MAINNET_URL, HyperliquidReader, hlTradeInfo } from '../venues/hyperliquid.ts';
 import type { HostBudget } from '../venues/http-budget.ts';
 import { OrderlyReader, orderlyBaseSymbol } from '../venues/orderly.ts';
 import { PHOENIX_API_URL, PhoenixReader, SOLANA_MAINNET_RPC_URL, phoenixGet } from '../venues/phoenix.ts';
@@ -1644,7 +1644,9 @@ function defaultDeps(p: { input: ServePairInput; hlUrl: string; phoenixUrl: stri
   // Orderly's public reader only with GIMBAL_ORDERLY_PAIRS=1 and serve's Orderly session: otherwise nothing reads Orderly.
   const orderlyReads = orderlyPairsOn(input.env) && input.orderly !== undefined;
   const r = () => (made ??= {
-    hl: new HyperliquidReader({ network: 'mainnet', url: `${hlUrl}/info` }),
+    // The trade path's reader (hlHeld, an open or close's books, margin and funding, a taker's best price): its reads
+    // go at once, charged to the host's budget, never queued behind the scanner's.
+    hl: new HyperliquidReader({ network: 'mainnet', url: `${hlUrl}/info`, trade: true }),
     phoenix: new PhoenixReader({ apiUrl: phoenixUrl, rpcUrl: solRpcUrl }),
     solana: new SolanaSubmitter({ rpcUrl: solRpcUrl, network: 'mainnet' }),
     ...(orderlyReads ? { orderly: new OrderlyReader({ network: 'mainnet', brokerId: ORDERLY_BROKERS.mainnet.brokerId }) } : {}),
@@ -1676,12 +1678,11 @@ function defaultDeps(p: { input: ServePairInput; hlUrl: string; phoenixUrl: stri
 
 /**
  * One Hyperliquid /info read of the trade path (open orders, the legs' orderStatus and userFills, the taker
- * fallback's mark): never waits for the host's weight budget, but is charged to it (hlTradeFetch).
+ * fallback's mark): never waits for the host's weight budget, but is charged to it (hlTradeInfo). Its book and
+ * account reads (bestPx, hlHeld) go through defaultDeps' trade reader, at once too.
  */
-async function hlInfo(hlUrl: string, body: Record<string, unknown>): Promise<unknown> {
-  const res = await hlTradeFetch(hlUrl)(`${hlUrl}/info`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) });
-  if (!res.ok) throw new Error(`hyperliquid /info ${String(body.type)}: HTTP ${res.status}`);
-  return res.json();
+function hlInfo(hlUrl: string, body: Record<string, unknown>): Promise<unknown> {
+  return hlTradeInfo(hlUrl, body);
 }
 
 /** The symbols the desk's Phoenix trader holds (every subaccount); none when it is not registered. */

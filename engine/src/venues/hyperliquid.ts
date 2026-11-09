@@ -117,6 +117,12 @@ export interface HyperliquidReaderOptions {
    * `fetch` is passed (tests, capture), which then goes without one; null: none.
    */
   budget?: HostBudget | null;
+  /**
+   * The trade path's reader (an open or close's books, margin and funding reads, a taker's best price, what the desk
+   * holds): its reads never wait in the budget's queue, they go at once as trade debt (hlMeteredSend), so a trade is
+   * never held up or skipped by the scanner's load or by its own earlier requests.
+   */
+  trade?: boolean;
 }
 
 /** Info requests that weigh 2; userRole weighs 60; every other one 20. */
@@ -210,27 +216,71 @@ export function hlExchangeWeight(body: unknown): number {
 }
 
 /**
- * Sends one Hyperliquid request that must never wait (the trade path: an /exchange post, the reads around an order,
- * a rescue's ledger read, setup) outside `budget`'s queue (http-budget.ts unqueued()), charged its weight as it goes:
- * an /info read its type's weight and the rows its answer brought, an /exchange post hlExchangeWeight. The scanner's
- * reads after it wait until the bucket has paid it back; it is never delayed, skipped or retried here. A 429 on /info
- * starts the budget's cool-down; one on /exchange does not (it may be the address's own action limit, which grows
- * with volume traded, not this IP's weight).
+ * One /info read sent outside `budget`'s queue (http-budget.ts unqueued()): charged its type's weight and the rows it
+ * should bring as it goes; `settle` charges the rows the answer really brought (call it once with the parsed answer,
+ * or with undefined when it could not be read).
  */
-export async function hlMeteredSend(budget: HostBudget | null, endpoint: 'info' | 'exchange', body: unknown, send: () => Promise<Response>): Promise<Response> {
-  if (budget === null) return send();
-  if (endpoint === 'exchange') return budget.unqueued(send, hlExchangeWeight(body), { rateLimits: false });
+async function unqueuedInfo(budget: HostBudget, body: unknown, send: () => Promise<Response>): Promise<{ res: Response; settle: (answer: unknown) => void }> {
   const typed = body as { type?: unknown } & Record<string, unknown> | null;
   const type = typeof typed?.type === 'string' ? typed.type : '';
   const charged = type === '' ? 0 : hlRowsWeight(type, hlRowsExpected(typed as { type: string } & Record<string, unknown>));
   const res = await budget.unqueued(send, hlInfoWeight(type) + charged);
-  if (res.ok && (PER_ROW_INFO.has(type) || type === 'candleSnapshot')) {
-    res.clone().json().then(
-      (rows: unknown) => budget.charge(hlRowsWeight(type, Array.isArray(rows) ? rows.length : 0) - charged, true),
-      () => budget.charge(-charged, true),
-    );
-  }
+  const rowed = res.ok && (PER_ROW_INFO.has(type) || type === 'candleSnapshot');
+  let settled = false;
+  const settle = (answer: unknown) => {
+    if (!rowed || settled) return;
+    settled = true;
+    budget.charge(hlRowsWeight(type, Array.isArray(answer) ? answer.length : 0) - charged, true);
+  };
+  return { res, settle };
+}
+
+/**
+ * Sends one Hyperliquid request that must never wait (the trade path: an /exchange post, the reads around an order,
+ * a rescue's ledger read, setup) outside `budget`'s queue (http-budget.ts unqueued()), charged its weight as it goes:
+ * an /info read its type's weight and the rows its answer brought (read from a copy of the answer), an /exchange post
+ * hlExchangeWeight. It is booked as trade debt: the scanner's reads wait until it is paid back, critical reads do
+ * not; it is never delayed, skipped or retried here. A 429 on /info holds the scanner's reads; one on /exchange does
+ * not (it may be the address's own action limit, which grows with volume traded, not this IP's weight).
+ */
+export async function hlMeteredSend(budget: HostBudget | null, endpoint: 'info' | 'exchange', body: unknown, send: () => Promise<Response>): Promise<Response> {
+  if (budget === null) return send();
+  if (endpoint === 'exchange') return budget.unqueued(send, hlExchangeWeight(body), { rateLimits: false });
+  const { res, settle } = await unqueuedInfo(budget, body, send);
+  if (res.ok) res.clone().json().then(settle, () => settle(undefined));
   return res;
+}
+
+/**
+ * One trade-path /info read of the Hyperliquid API at `apiUrl` (root or /info URL), sent at once and charged to the
+ * host's shared budget (hlHostBudget) as hlMeteredSend does, its answer parsed once (a 2000-row userFills is not read
+ * twice to count its rows). A non-2xx answer throws `hyperliquid /info <type>: HTTP <status>`.
+ */
+export async function hlTradeInfo<T>(apiUrl: string, body: Record<string, unknown>, o: { fetch?: typeof fetch; timeoutMs?: number } = {}): Promise<T> {
+  const root = apiUrl.replace(/\/+$/, '').replace(/\/info$/, '');
+  const f = o.fetch ?? ((input: string | URL | Request, init?: RequestInit) => globalThis.fetch(input, init));
+  const send = () => f(`${root}/info`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(o.timeoutMs ?? 15_000),
+  });
+  const budget = sharedBudget(root);
+  const { res, settle } = budget === null ? { res: await send(), settle: () => {} } : await unqueuedInfo(budget, body, send);
+  if (!res.ok) throw new Error(`hyperliquid /info ${String(body.type)}: HTTP ${res.status}`);
+  let answer: unknown;
+  try {
+    answer = await res.json();
+  } finally {
+    settle(answer);
+  }
+  return answer as T;
+}
+
+/** The host's shared budget (hlHostBudget), or null when `apiUrl` is not a URL (the request fails on its own). */
+function sharedBudget(apiUrl: string): HostBudget | null {
+  try {
+    return hlHostBudget(apiUrl);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -254,20 +304,23 @@ export function hlMeteredFetch(budget: HostBudget | null, inner: typeof fetch): 
   };
 }
 
+const tradeFetches = new Map<string, typeof fetch>();
+
 /**
  * The trade path's fetch for the Hyperliquid API at `apiUrl` (the root, or its /info URL): every /info and /exchange
  * POST metered against the budget the host's readers share in this process (hlHostBudget), never delayed. `inner`
- * defaults to the global fetch, looked up when called (a test may stub it).
+ * defaults to the global fetch, looked up when called (a test may stub it); that one is made once per URL.
  */
-export function hlTradeFetch(apiUrl: string, inner: typeof fetch = (input, init) => globalThis.fetch(input, init)): typeof fetch {
-  let budget: HostBudget | null;
-  try {
-    budget = hlHostBudget(apiUrl);
-  } catch {
-    // Not a URL: the request fails on its own when it is made; nothing to meter.
-    budget = null;
+export function hlTradeFetch(apiUrl: string, inner?: typeof fetch): typeof fetch {
+  if (inner !== undefined) return hlMeteredFetch(sharedBudget(apiUrl), inner);
+  let f = tradeFetches.get(apiUrl);
+  if (f === undefined) {
+    // The budget is looked up per request: a test may forget the process's budgets (resetHostBudgets).
+    const global: typeof fetch = (input, init) => globalThis.fetch(input, init);
+    f = (input, init) => hlMeteredFetch(sharedBudget(apiUrl), global)(input, init);
+    tradeFetches.set(apiUrl, f);
   }
-  return hlMeteredFetch(budget, inner);
+  return f;
 }
 
 /** A non-2xx answer from /info, kept apart so callers can tell an outage from a request the venue refused. */
@@ -290,6 +343,7 @@ export class HyperliquidReader implements VenueReader, FundingHistorySource, Mar
   readonly #clock: Clock;
   readonly #timeoutMs: number;
   readonly #budget: HostBudget | null;
+  readonly #trade: boolean;
   /** Each address's last account answer, when it was asked for and under which desk-act stamp (accountWithin). */
   readonly #lastAccount = new Map<string, { at: number; value: AccountState; stamp: DeskActStamp }>();
 
@@ -301,6 +355,7 @@ export class HyperliquidReader implements VenueReader, FundingHistorySource, Mar
     this.#clock = options.clock ?? systemClock;
     this.#timeoutMs = options.timeoutMs ?? 10_000;
     this.#budget = options.budget !== undefined ? options.budget : options.fetch === undefined ? hlHostBudget(this.infoUrl) : null;
+    this.#trade = options.trade === true;
   }
 
   async markets(): Promise<Market[]> {
@@ -436,12 +491,20 @@ export class HyperliquidReader implements VenueReader, FundingHistorySource, Mar
         signal: signal === undefined ? timeout : AbortSignal.any([timeout, signal]),
       });
     };
-    const res = await hlBudgetedSend(this.#budget, body, send);
+    // The trade path's reader: at once, as trade debt, its rows charged from the answer parsed here.
+    const { res, settle } = this.#trade && this.#budget !== null ? await unqueuedInfo(this.#budget, body, send)
+      : { res: await hlBudgetedSend(this.#budget, body, send), settle: () => {} };
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       throw new HlHttpError(body.type, res.status, text);
     }
-    return (await res.json()) as T;
+    let answer: unknown;
+    try {
+      answer = await res.json();
+    } finally {
+      settle(answer);
+    }
+    return answer as T;
   }
 }
 

@@ -180,7 +180,7 @@ export interface HlLegOptions {
   /**
    * POST /info on the venue's API (clearinghouseState, orderStatus, userFills, the taker fallback's metaAndAssetCtxs).
    * On the network it must be charged to the host's weight budget without waiting for it (cli/pair-ops.ts and
-   * serve-pair.ts hlInfo: venues/hyperliquid.ts hlTradeFetch), so a trade near the scanner's busiest minute does not
+   * serve-pair.ts hlInfo: venues/hyperliquid.ts hlTradeInfo), so a trade near the scanner's busiest minute does not
    * take the IP past Hyperliquid's limit, and is never held up by it.
    */
   info: (body: Record<string, unknown>) => Promise<unknown>;

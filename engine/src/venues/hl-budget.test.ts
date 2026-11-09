@@ -12,11 +12,11 @@ import { HyperliquidSubmitter } from '../relayer/hyperliquid.ts';
 import { TEST_EVM_ADDRESS, fakeTime, stubFetch, testContract } from '../relayer/test-helpers.ts';
 import { HlLedgerLanding } from '../rescue/hl-ledger.ts';
 import type { BudgetTimers, HostBudgetOptions } from './http-budget.ts';
-import { HL_BUDGET, HostBudget, RETRY_PAUSE_MS, ReadSkipped, isReadSkipped, readBy, scanRead } from './http-budget.ts';
+import { HL_BUDGET, HostBudget, RETRY_PAUSE_MS, ReadSkipped, isReadSkipped, readBy, resetHostBudgets, scanRead } from './http-budget.ts';
 import { noteDeskAct } from './desk-acts.ts';
 import {
   HyperliquidReader, hlBudgetedFetch, hlBudgetedSend, hlExchangeWeight, hlHostBudget, hlInfoWeight, hlMeteredFetch, hlMeteredSend, hlReadKind,
-  hlRowsWeight, hlTradeFetch,
+  hlRowsWeight, hlTradeFetch, hlTradeInfo,
 } from './hyperliquid.ts';
 import { HlDexReader } from './watch/hyperliquid.ts';
 
@@ -407,8 +407,9 @@ test('a trade-path request goes at once through a spent bucket, is charged, and 
   // orderStatus 2, the cancel 1 + 1 (41 in its batch), userFills 20 + 3 for its 41 rows.
   assert.equal(s.unqueuedSpent, 2 + 2 + 23);
   assert.equal(s.spent, 150 + 27);
-  // (The clock is real here: a few ms of refill at 11 a second.)
-  assert.ok(s.tokens < -26.5, `taken from the shared bucket, below zero: ${s.tokens}`);
+  // Booked as trade debt, not taken from the tokens critical reads go on (the clock is real: a few ms of refill).
+  assert.equal(s.tradeDebt, 27);
+  assert.ok(s.tokens >= 0 && s.tokens < 1, `the bucket is left as the scanner left it: ${s.tokens}`);
   assert.ok(s.floorTokens >= HL_BUDGET.criticalFloor!.burst - 1e-9, 'the critical floor is not touched: the risk read keeps its rate');
   assert.equal(s.sent, 3);
   // The scanner's book read waits for the bucket to pay the trade back: skipped (its wait is 30 ms here).
@@ -419,12 +420,14 @@ test('a trade-path request goes at once through a spent bucket, is charged, and 
   assert.equal(budget.state().spent, 177);
 });
 
-test('a trade-path request goes at once through a cool-down; a 429 on /info starts one, on /exchange it does not', async () => {
+test('a trade-path request goes at once through a cool-down; a 429 on /info holds the scanner only, on /exchange nothing', async () => {
   const now = 2_000_000;
   const budget = new HostBudget('hl-trade-429', { ...HL_BUDGET, now: () => now });
   await hlMeteredSend(budget, 'info', { type: 'openOrders', user: USER }, async () => tooMany('5'));
   const cooling = budget.state();
-  assert.ok(cooling.criticalRetryAt > now && cooling.retryAt > now && cooling.rateLimited === 1, 'the queued reads wait out the server\'s pause');
+  assert.ok(cooling.retryAt > now && cooling.quietUntil > now && cooling.rateLimited === 1, 'the scanner\'s reads wait out the server\'s pause');
+  assert.equal(cooling.criticalRetryAt, 0, 'critical reads do not');
+  assert.equal(cooling.tokens, HL_BUDGET.burst, 'and the bucket they go on is not emptied');
   let sent = 0;
   const res = await hlMeteredSend(budget, 'info', { type: 'orderStatus', user: USER, oid: 1 }, async () => {
     sent++;
@@ -460,6 +463,7 @@ test('the trade path\'s callers are metered against the host\'s shared budget: p
     assert.equal(ops.state().unqueuedSpent, 4);
   } finally {
     globalThis.fetch = real;
+    resetHostBudgets();
   }
   // The relayer: the /exchange post and the userFillsByTime read that confirms the fill.
   const time = fakeTime(1_793_491_200_000);
@@ -482,16 +486,22 @@ test('the trade path\'s callers are metered against the host\'s shared budget: p
 
 test('a 429 keeps the bucket\'s debt: what was spent is still paid back after the rate is cut', async () => {
   const now = 5_000_000;
-  const budget = new HostBudget('hl-debt', { ...HL_BUDGET, now: () => now });
+  // A queued critical read that meets a 429 once (no Retry-After), then goes; on its floor while the bucket is in debt.
+  const once = (b: HostBudget) => {
+    let n = 0;
+    return b.run('critical', async () => (n++ === 0 ? tooMany() : ok({})), 2);
+  };
+  const budget = new HostBudget('hl-debt', { ...HL_BUDGET, now: () => now, random: () => 0 });
   budget.charge(450);
   assert.equal(budget.state().tokens, -300);
-  await budget.unqueued(async () => tooMany(), 2);
+  assert.equal((await once(budget)).status, 200);
   const s = budget.state();
-  assert.equal(s.tokens, -302, 'not reset to zero');
+  assert.equal(s.tokens, -300, 'not reset to zero');
+  assert.equal(s.floorTokens, HL_BUDGET.criticalFloor!.burst - 4, 'both tries on the floor, which stays above zero');
   assert.equal(s.ratePerSec, HL_BUDGET.ratePerSec * HL_BUDGET.adaptive!.cut);
   // A bucket above zero is still emptied.
-  const full = new HostBudget('hl-debt-2', { ...HL_BUDGET, now: () => now });
-  await full.unqueued(async () => tooMany(), 2);
+  const full = new HostBudget('hl-debt-2', { ...HL_BUDGET, now: () => now, random: () => 0 });
+  assert.equal((await once(full)).status, 200);
   assert.equal(full.state().tokens, 0);
 });
 
@@ -526,7 +536,108 @@ test('Hyperliquid\'s Retry-After is believed up to 6 s: a critical read probes a
   assert.ok(HL_BUDGET.retryAfterMaxMs <= 6_000);
   const now = 9_000_000;
   const budget = new HostBudget('hl-retry-after', { ...HL_BUDGET, now: () => now, random: () => 1 });
-  await budget.unqueued(async () => tooMany('3600'), 2);
+  // A queued critical read with a short deadline: the 429 is returned at once, the gate set for the next.
+  const res = await readBy(Date.now() + 100, () => budget.run('critical', async () => tooMany('3600'), 2));
+  assert.equal(res.status, 429);
   assert.equal(budget.state().criticalRetryAt - now, Math.round(6_000 * 1.15));
   assert.ok(budget.state().criticalRetryAt - now < 7_000);
+  // An unqueued request's Retry-After is capped the same way, for the scanner's reads.
+  const scan = new HostBudget('hl-retry-after-2', { ...HL_BUDGET, now: () => now, random: () => 1 });
+  await scan.unqueued(async () => tooMany('3600'), 2);
+  assert.equal(scan.state().retryAt - now, Math.round(6_000 * 1.15));
+});
+
+test('critical reads are served within 2 s of a trade\'s large debt and a 20-weight critical read; the floor never goes below zero', async () => {
+  const timers = new VirtualTimers();
+  timers.now = 0;
+  const budget = new HostBudget('hl-after-trade', { ...HL_BUDGET, now: () => timers.now, timers, random: () => 0.5 });
+  // The scanner has spent the bucket; a close then read userFills five times (120 each) and polled userFillsByTime.
+  budget.charge(150);
+  for (let i = 0; i < 5; i++) await budget.unqueued(async () => ok([]), 120);
+  for (let i = 0; i < 10; i++) await budget.unqueued(async () => ok([]), 21);
+  assert.equal(budget.state().tradeDebt, 810);
+  const sentAt: Record<string, number> = {};
+  const read = (name: string, type: string, scan = false) => {
+    const go = () => hlBudgetedSend(budget, { type, user: USER }, async () => {
+      sentAt[name] = timers.now;
+      return ok({});
+    });
+    return (scan ? scanRead(go) : go()).catch((e: unknown) => e);
+  };
+  // The book's ledger reads after the act (20 each, critical), then the risk read and a book read (2 each).
+  const asked = [
+    read('ledger', 'userNonFundingLedgerUpdates'), read('fills', 'userFillsByTime'),
+    read('risk', 'clearinghouseState'), read('book', 'l2Book'), read('funding', 'metaAndAssetCtxs', true),
+  ];
+  await timers.runUntil(3_000);
+  assert.equal(sentAt.ledger, 0, 'the first 20-weight read goes on the floor and the shared bucket');
+  assert.ok(sentAt.risk! <= 2_000, `the risk read at ${sentAt.risk} ms`);
+  assert.ok(sentAt.book! <= 2_000, `the book read at ${sentAt.book} ms`);
+  assert.ok(budget.state().floorTokens >= 0);
+  assert.equal(sentAt.funding, undefined, 'the scanner waits for the trade debt');
+  await timers.runUntil(60_000);
+  await Promise.all(asked);
+  assert.ok(sentAt.fills! < 5_000, `the second ledger read at ${sentAt.fills} ms`);
+  assert.equal(sentAt.funding, undefined, 'skipped: 810 of debt is more than its 3 s wait');
+});
+
+test('an unqueued request\'s 429 does not delay a queued critical read; it holds the scanner\'s', async () => {
+  const timers = new VirtualTimers();
+  timers.now = 0;
+  const budget = new HostBudget('hl-unqueued-429', { ...HL_BUDGET, now: () => timers.now, timers, random: () => 0.5 });
+  await hlMeteredSend(budget, 'info', { type: 'orderStatus', user: USER, oid: 1 }, async () => tooMany('5'));
+  const sentAt: Record<string, number> = {};
+  const risk = hlBudgetedSend(budget, { type: 'clearinghouseState', user: USER }, async () => {
+    sentAt.risk = timers.now;
+    return ok(account);
+  });
+  const funding = scanRead(() => hlBudgetedSend(budget, { type: 'metaAndAssetCtxs' }, async () => {
+    sentAt.funding = timers.now;
+    return ok([meta, [ctx]]);
+  })).catch((e: unknown) => e);
+  await timers.runUntil(20_000);
+  assert.equal((await risk).status, 200);
+  assert.equal(sentAt.risk, 0, 'sent at once');
+  assert.ok(isReadSkipped(await funding), 'the scanner\'s funding read waits out the pause (past its 3 s wait: skipped)');
+  assert.equal(sentAt.funding, undefined);
+});
+
+test('the trade reader (bestPx, hlHeld, legBook) goes at once through a spent bucket and a cool-down, charged as trade debt', async () => {
+  const budget = new HostBudget('hl-trade-reader', { ...HL_BUDGET, now: () => 7_000_000 });
+  budget.charge(450);
+  await budget.unqueued(async () => tooMany('5'), 2);
+  const { f, calls } = info({ history: 0, funding: 41 });
+  const hl = new HyperliquidReader({ fetch: f, budget, trade: true });
+  await hl.book('ETH');
+  await hl.account(USER);
+  // userFunding: its rows charged from the answer the reader parsed (20 + 3), not from a second copy.
+  await hl.userFunding(USER, 0);
+  assert.deepEqual(calls, ['l2Book', 'clearinghouseState', 'userFunding']);
+  assert.equal(budget.state().unqueuedSpent, 2 + 2 + 2 + 23);
+  assert.equal(budget.state().tradeDebt, 29);
+});
+
+test('hlTradeInfo parses a long answer once and charges its rows from it; resetHostBudgets gives tests a fresh budget', async () => {
+  const real = globalThis.fetch;
+  let copies = 0;
+  globalThis.fetch = (async () => {
+    const res = ok(Array.from({ length: 2000 }, (_, i) => ({ oid: i })));
+    const clone = res.clone.bind(res);
+    res.clone = () => {
+      copies++;
+      return clone();
+    };
+    return res;
+  }) as typeof fetch;
+  try {
+    const rows = await hlTradeInfo<unknown[]>('https://hl-once.test', { type: 'userFills', user: USER });
+    assert.equal(rows.length, 2000);
+    assert.equal(copies, 0, 'no copy of the answer is read for its rows');
+    assert.equal(hlHostBudget('https://hl-once.test').state().unqueuedSpent, 20 + 100);
+    resetHostBudgets();
+    assert.equal(hlHostBudget('https://hl-once.test').state().unqueuedSpent, 0);
+  } finally {
+    globalThis.fetch = real;
+    resetHostBudgets();
+  }
 });
