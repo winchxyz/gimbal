@@ -237,7 +237,8 @@ The transactions of the contract, the desk and the canary, with what each proves
 
 ## Status (2026-11-07)
 
-Done (read from the chain and the venues' public APIs at about 08:10 UTC):
+Done (read from the chain and the venues' public APIs at about 08:10 UTC on 2026-11-07; the 2026-11-09 item on
+2026-11-09):
 
 - The contract code is frozen after three internal review rounds (no external audit), deployed from a reproducible
   build and locked.
@@ -278,7 +279,7 @@ Done (read from the chain and the venues' public APIs at about 08:10 UTC):
 Not done yet:
 
 - **The strategy loop has not opened a pair on its own.** The owner's threshold is 5 % net APR at 12 USD a leg,
-  the loop opens only a window inside the desk's policy, and only after it holds over 3 hourly checks. Both live
+  the loop opens only a window inside the desk's policy, and only after it holds for 3 hourly checks in a row. Both live
   pairs so far were owner demo entries.
 - **No margin rescue has run on mainnet yet.** The desk's rescue counters on chain are zero; the three `fund_venue`
   payments were setup transfers, not rescues. The live routes have
