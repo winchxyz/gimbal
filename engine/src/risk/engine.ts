@@ -83,7 +83,12 @@ export const LEG_READ_STALE_MS = 3 * RISK_INTERVAL_MS;
 /** 1Click is probed once a minute: down across two probes in a row is journaled (one timeout is not). */
 export const INTENTS_DOWN_JOURNAL_MS = 90_000;
 
-/** A spell of `down` for one health key. */
+/**
+ * A spell of `down` for one health key. Kept in memory only: after a restart a venue still down starts a new spell,
+ * journaled again once it lasts. Carrying it over would need a state file the risk engine does not have (nothing in
+ * risk/ is kept across restarts), and a restart in the middle of an outage is rare enough that a second line is the
+ * cheaper cost.
+ */
 interface DownSpell {
   since: number;
   /** What was journaled of it: nothing yet, the session-starting wait, or the error. */

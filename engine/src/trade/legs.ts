@@ -177,7 +177,12 @@ export interface HlLegOptions {
     /** Needed by makerOrder only: a resting post-only order is cancelled before it is repriced. */
     hlCancel?(asset: number, oid: number, reason: string): Promise<HlSubmitResult>;
   };
-  /** POST /info on the venue's API. */
+  /**
+   * POST /info on the venue's API (clearinghouseState, orderStatus, userFills, the taker fallback's metaAndAssetCtxs).
+   * On the network it must be charged to the host's weight budget without waiting for it (cli/pair-ops.ts and
+   * serve-pair.ts hlInfo: venues/hyperliquid.ts hlTradeInfo), so a trade near the scanner's busiest minute does not
+   * take the IP past Hyperliquid's limit, and is never held up by it.
+   */
   info: (body: Record<string, unknown>) => Promise<unknown>;
   user: string;                  // the desk's EVM address
   coin: string;                  // "ETH"

@@ -16,11 +16,18 @@
 // A caller with a deadline of its own (the risk engine's account read) runs inside readBy(): its reads wait for the
 // budget and run at most until then. A Retry-After longer than retryAfterMaxMs is cut to it, so a host that asks for
 // an hour cannot lock critical reads out: they probe it again after the capped wait. With `adaptive`, a 429 also
-// cuts the rate (the host is shared with someone, or allows less than thought) and empties the bucket; the rate
-// climbs back a step a minute while no 429 comes. With `criticalFloor`, critical reads also have a bucket of their
-// own that no 429 cuts or empties: they take a token from the shared bucket while it has one, else from theirs, so
-// the desk's own account reads keep that rate through a storm of 429s; and they wait out only the server's
-// Retry-After, never the budget's own backoff (which holds the scanner's reads).
+// cuts the rate (the host is shared with someone, or allows less than thought) and empties the bucket, keeping any
+// debt in it (a bucket below zero stays there, so what was spent is still paid back); the rate climbs back a step a
+// minute while no 429 comes. With `criticalFloor`, critical reads also have a bucket of their own that no 429 cuts
+// or empties: they take a token from the shared bucket while it has one, else from theirs, so the desk's own account
+// reads keep that rate through a storm of 429s; and they wait out only the server's Retry-After, never the budget's
+// own backoff (which holds the scanner's reads); after a 429 without one they retry after a short jittered pause of
+// their own (RETRY_PAUSE_MS), never at once.
+// A request that must never wait (the trade path: an order, a cancel, the reads around them, a rescue) goes outside
+// the queue with unqueued(): sent at once, its cost booked as trade debt that the scanner's reads wait to see paid
+// back (the host's limit holds for both together), while critical reads never wait for it; a 429 it gets holds the
+// scanner's reads only. A critical read too heavy for what the bucket and its floor hold yet does not hold up a
+// lighter critical read behind it, and the floor never goes below zero.
 // Tokens are a host's own unit: one request on Phoenix, one unit of request weight on Hyperliquid (HL_BUDGET). A read
 // costs `cost` tokens (default 1); a host that prices an answer by its size too is charged the rest once the answer is
 // in (charge()), so the bucket may run below zero and the reads after it wait that much longer. The scanner classes
@@ -163,6 +170,13 @@ export interface BudgetTimers {
   clearTimeout(handle: unknown): void;
 }
 
+/**
+ * ms: the pause before a critical read with a floor (whose gate ignores the backoff) is retried after a 429 that named
+ * no Retry-After, at least the first and up to the second (jittered): a retry at once would only add to the host's
+ * count while it is over its limit.
+ */
+export const RETRY_PAUSE_MS: readonly [number, number] = [500, 1_000];
+
 const realTimers: BudgetTimers = {
   setTimeout: (fn, ms) => setTimeout(fn, ms),
   clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
@@ -211,13 +225,22 @@ export const PHOENIX_BUDGET: HostBudgetOptions = {
  * Why it exists: serve spent about 570 a minute steady (risk reads, books, funding sweeps), but the scanner's hourly
  * fundingHistory refresh for about 230 windows (20 each, plus 1 per 20 rows) went out from :01 in a burst, and the
  * busiest minute after the hour reached about 1970: HL answered 429 to whatever came next, often the risk read.
- * With this budget (hl-budget.test.ts simulates serve's load): steady 567, busiest minute 833 with the refresh
- * spread over about 15 minutes (22 after a restart), at most 970 in any minute by construction (12.5/s plus the
- * 150 burst plus the critical floor's 70), so at least 230 of the 1200 stay free for the trade path, which does not
- * go through it (serve-pair's order and ADL reads, rescue, the relayer).
+ * With this budget (hl-budget.test.ts simulates serve's load): steady 567, busiest minute 751 with the refresh
+ * spread over about 19 minutes (30 after a restart; 15 and 22 at 12.5/s), at most 880 in any minute by
+ * construction (11/s plus the 150 burst plus the critical floor's 70). That 880 is what the budget's own queued
+ * reads send: critical reads never wait for the trade path's debt, so in a minute the trade path spends heavily the
+ * host's total can pass 880 by what it spent (by design: neither a trade nor the risk read is held for the other).
+ *
+ * The trade path (the relayer's /exchange posts and its fill and ledger reads, the legs' orderStatus and userFills,
+ * serve-pair's order and margin reads, the rescue's ledger read, setup) never waits for this budget, but it is charged
+ * to it as trade debt (hlMeteredFetch: unqueued()), so the scanner's reads after it wait until the refill has paid
+ * it back; critical reads (the risk read, the book's ledger reads) never wait for that debt. What it
+ * can still add on top is a burst that comes after the budget spent its own most in the last minute: 11/s rather
+ * than 12.5 keeps 320 of the 1200 free for that (a close polls userFillsByTime once a second for up to 15 s, 20 or
+ * more each, and userFills, orderStatus and the cancel around it), where 12.5 kept 230.
  */
 export const HL_BUDGET: HostBudgetOptions = {
-  ratePerSec: 12.5,
+  ratePerSec: 11,
   burst: 150,
   maxInFlight: 10,
   scanMaxInFlight: 8,
@@ -226,7 +249,10 @@ export const HL_BUDGET: HostBudgetOptions = {
   // (a 69-weight fundingHistory read waits for 69 tokens, so the reads before it keep their headroom).
   classReserve: { funding: 20, book: 30, history: 40 },
   classOrder: ['funding', 'book', 'history'],
-  adaptive: { cut: 0.5, minRatePerSec: 5, recoverEveryMs: 60_000, recoverStep: 1.25 },
+  // A 429 halves the rate (11 -> 5.5); it climbs back a tenth of the full rate a minute, so about 5 minutes to the full
+  // 11 without another 429: as at 12.5 with a step of 1.25. Intended: HL counts a rolling minute, and stepping back
+  // faster after a 429 would only meet the next one.
+  adaptive: { cut: 0.5, minRatePerSec: 5, recoverEveryMs: 60_000, recoverStep: 1.1 },
   criticalFloor: { ratePerSec: 1, burst: 10 },
   // The scanner times out a funding read at 4 s and a book or history read at 8 s: it hears "skipped" first. History
   // waits longest, so it goes at the pace the bucket allows instead of being skipped and asked again a minute later.
@@ -234,7 +260,9 @@ export const HL_BUDGET: HostBudgetOptions = {
   retries: { critical: 2, funding: 0, book: 0, history: 0 },
   backoffBaseMs: 2_000,
   backoffMaxMs: 30_000,
-  retryAfterMaxMs: 10_000,
+  // Hyperliquid's window is a minute and it rarely names a Retry-After; past 6 s is not believed, so a critical read
+  // probes again well inside its 15 s wait (and the risk read's 7 s deadline, with the 15 % spread).
+  retryAfterMaxMs: 6_000,
   quietBaseMs: 10_000,
   quietMaxMs: 120_000,
 };
@@ -249,7 +277,7 @@ interface Waiter {
 }
 
 export interface HostBudgetState {
-  /** ms: no request goes out before this (Retry-After or the backoff of the last 429). */
+  /** ms: no scanner request goes out before this (Retry-After or the backoff of the last 429). */
   retryAt: number;
   /** ms: no critical request goes out before this (with criticalFloor: the server's Retry-After only). */
   criticalRetryAt: number;
@@ -266,8 +294,15 @@ export interface HostBudgetState {
   sent: number;
   /** Tokens in the shared bucket now (below zero after a charge() larger than it held). */
   tokens: number;
+  /**
+   * What the requests sent outside the queue (unqueued()) cost and the refill has not paid back yet: scanner reads
+   * wait for it (they see tokens - tradeDebt), critical reads do not. At most tradeDebtCap (a minute of the rate).
+   */
+  tradeDebt: number;
   /** Tokens spent in all: the cost of every read sent plus what charge() added (Hyperliquid: request weight). */
   spent: number;
+  /** Of `spent`, what requests sent outside the queue (unqueued()) cost, with their answers' rows. */
+  unqueuedSpent: number;
 }
 
 /** Parses Retry-After: seconds (fractions allowed) or an HTTP date; null when absent or unusable. */
@@ -301,11 +336,20 @@ export class HostBudget {
   #retryAt = 0;
   /** The server's Retry-After alone: what critical reads wait for when there is a criticalFloor. */
   #serverRetryAt = 0;
+  /** The cool-down of a 429 an unqueued request got: scanner reads wait for it, critical reads never do. */
+  #scanRetryAt = 0;
+  /** unqueued() cost not paid back yet: the refill pays it first; only scanner reads wait for it. */
+  #tradeDebt = 0;
+  /** The most trade debt kept: a minute of the full rate (Hyperliquid: 660), the window the host counts over. */
+  get tradeDebtCap(): number {
+    return 60 * this.#o.ratePerSec;
+  }
   #floorTokens: number;
   #quietUntil = 0;
   #rateLimited = 0;
   #sent = 0;
   #spent = 0;
+  #unqueuedSpent = 0;
   readonly #rank: Record<ReadClass, number>;
 
   constructor(host: string, options: HostBudgetOptions) {
@@ -329,10 +373,10 @@ export class HostBudget {
 
   state(): HostBudgetState {
     return {
-      retryAt: this.#retryAt, criticalRetryAt: this.#gate('critical'), floorTokens: this.#floorTokens,
+      retryAt: this.#gate('funding'), criticalRetryAt: this.#gate('critical'), floorTokens: this.#floorTokens,
       quietUntil: this.#quietUntil, rateLimited: this.#rateLimited,
       inFlight: this.#inFlight, queued: this.#queue.length, sent: this.#sent, ratePerSec: this.#rate,
-      tokens: this.#tokens, spent: this.#spent,
+      tokens: this.#tokens, tradeDebt: this.#tradeDebt, spent: this.#spent, unqueuedSpent: this.#unqueuedSpent,
     };
   }
 
@@ -360,27 +404,68 @@ export class HostBudget {
         if (this.#now() >= this.#quietUntil) this.#rateLimited = 0;
         return res;
       }
-      this.#onRateLimited(res);
+      const serverSaid = this.#onRateLimited(res);
       if (attempt >= this.#o.retries[cls] || this.#gate(cls) > deadline) return res;
+      // No Retry-After, and a class that does not wait for the backoff (a critical read with a floor: its gate is the
+      // server's pause alone): not at once, but after a short pause. Every other class waits for the backoff already.
+      const [lo, hi] = RETRY_PAUSE_MS;
+      const pause = serverSaid || this.#gate(cls) >= this.#retryAt ? 0 : Math.round(lo + (hi - lo) * this.#random());
+      if (this.#now() + pause > deadline) return res;
       // The body is not read: release the connection before waiting.
       await res.body?.cancel().catch(() => {});
+      if (pause > 0) await new Promise<void>((resolve) => this.#timers.setTimeout(resolve, pause));
     }
   }
 
   /**
-   * Tokens a read turned out to cost on top of what run() took for it (a host that prices the size of an answer):
-   * taken from the shared bucket now, below zero if need be, so the reads after it wait for them. Negative gives
-   * back what was taken over the answer's real cost (up to a full bucket).
+   * Sends one request outside the queue, for a caller that must never wait (an order, a cancel, the reads a trade or
+   * a rescue makes): `send` is called at once, whatever the bucket, a cool-down or the slots say, and is never
+   * skipped or retried. Its `cost` becomes trade debt (tradeDebt), which the refill pays back before it adds tokens:
+   * the scanner's reads wait until it is paid, critical reads do not (they keep the tokens the bucket held, and their
+   * floor), so the risk read and the next trade's own queued reads are never held up by a trade. A 429 it gets holds
+   * the scanner's reads only (a cool-down, the quiet period, the rate cut), never a critical read; with `rateLimits`
+   * false (a 429 that is not about this budget's limit) not even those. The answer is returned as it came.
    */
-  charge(tokens: number): void {
+  async unqueued(send: () => Promise<Response>, cost: number, o: { rateLimits?: boolean } = {}): Promise<Response> {
+    if (!(cost > 0) || !Number.isFinite(cost)) throw new RangeError(`host budget ${this.host}: a request's cost must be positive, got ${cost}`);
+    this.#sent++;
+    this.charge(cost, true);
+    const res = await send();
+    if (res.status === 429 && o.rateLimits !== false) this.#onRateLimited(res, 'scan');
+    return res;
+  }
+
+  /**
+   * Tokens a read turned out to cost on top of what run() or unqueued() took for it (a host that prices the size of
+   * an answer): taken from the shared bucket now, below zero if need be, so the reads after it wait for them.
+   * Negative gives back what was taken over the answer's real cost (up to a full bucket). `unqueued`: for a request
+   * sent with unqueued(): added to (or, negative, taken off) its trade debt instead, and counted in unqueuedSpent.
+   */
+  charge(tokens: number, unqueued = false): void {
     if (!Number.isFinite(tokens) || tokens === 0) return;
     this.#refill(this.#now());
-    this.#tokens = Math.min(this.#o.burst, this.#tokens - tokens);
+    if (unqueued) {
+      // At most a minute of the full rate (tradeDebtCap): Hyperliquid counts only the last minute, so weight older
+      // than that is not owed any more, and sustained trading cannot hold the scanner off for many minutes.
+      this.#tradeDebt = Math.min(this.tradeDebtCap, this.#tradeDebt + tokens);
+      this.#unqueuedSpent += tokens;
+      // A refund larger than the debt left goes back to the bucket.
+      if (this.#tradeDebt < 0) {
+        this.#tokens = Math.min(this.#o.burst, this.#tokens - this.#tradeDebt);
+        this.#tradeDebt = 0;
+      }
+    } else {
+      this.#tokens = Math.min(this.#o.burst, this.#tokens - tokens);
+    }
     this.#spent += tokens;
     this.#pump();
   }
 
-  #onRateLimited(res: Response): void {
+  /**
+   * A 429: the cool-down, the quiet period and (adaptive) the rate cut. True when the server named a Retry-After.
+   * `scan`: the 429 of an unqueued request: only the scanner's reads wait for it, and the bucket keeps its tokens.
+   */
+  #onRateLimited(res: Response, holds: 'all' | 'scan' = 'all'): boolean {
     const now = this.#now();
     this.#rateLimited++;
     const n = this.#rateLimited;
@@ -391,21 +476,30 @@ export class HostBudget {
     const pause = said !== null
       ? Math.round(said * (1 + 0.15 * this.#random()))
       : Math.round(Math.min(this.#o.backoffMaxMs, this.#o.backoffBaseMs * 2 ** (n - 1)) * (0.5 + 0.5 * this.#random()));
-    this.#retryAt = Math.max(this.#retryAt, now + pause);
-    // The server's own pause only: #retryAt may still hold a longer backoff of an earlier 429 without Retry-After.
-    if (said !== null) this.#serverRetryAt = Math.max(this.#serverRetryAt, now + pause);
+    if (holds === 'scan') {
+      this.#scanRetryAt = Math.max(this.#scanRetryAt, now + pause);
+    } else {
+      this.#retryAt = Math.max(this.#retryAt, now + pause);
+      // The server's own pause only: #retryAt may still hold a longer backoff of an earlier 429 without Retry-After.
+      if (said !== null) this.#serverRetryAt = Math.max(this.#serverRetryAt, now + pause);
+    }
     const quiet = Math.round(Math.min(this.#o.quietMaxMs, this.#o.quietBaseMs * 2 ** (n - 1)) * (0.75 + 0.25 * this.#random()));
-    this.#quietUntil = Math.max(this.#quietUntil, this.#retryAt, now + quiet);
+    this.#quietUntil = Math.max(this.#quietUntil, this.#gate('funding'), now + quiet);
     const a = this.#o.adaptive;
     if (a !== undefined && a !== null) {
       // The host's bucket for us is empty, and it allows less than the rate we ran at: slower, from an empty bucket.
-      // The critical floor is neither cut nor emptied.
+      // A bucket already below zero (a long answer) keeps its debt: reset to zero it would forget weight the host has
+      // counted, and the cap would hold only approximately. The trade debt is kept as it is. The critical floor is
+      // neither cut nor emptied, and after an unqueued request's 429 the bucket is not emptied either (the tokens it
+      // holds are what critical reads go on). The cut does slow the shared refill critical reads also draw on, after
+      // an unqueued request's 429 too (one refill rate serves both); what they keep whatever it does is the floor.
       this.#refill(now);
       this.#rate = Math.max(a.minRatePerSec, this.#rate * a.cut);
       this.#rateAt = now;
-      this.#tokens = 0;
+      if (holds === 'all') this.#tokens = Math.min(0, this.#tokens);
     }
     this.#pump();
+    return said !== null;
   }
 
   #acquire(cls: ReadClass, deadline: number, cost: number): Promise<void> {
@@ -436,12 +530,18 @@ export class HostBudget {
 
   /** ms: when a read of `cls` may go out after the last 429s. */
   #gate(cls: ReadClass): number {
-    return cls === 'critical' && this.#o.criticalFloor ? this.#serverRetryAt : this.#retryAt;
+    if (cls !== 'critical') return Math.max(this.#retryAt, this.#scanRetryAt);
+    return this.#o.criticalFloor ? this.#serverRetryAt : this.#retryAt;
   }
 
   #refill(now: number): void {
     if (now > this.#refilledAt) {
-      this.#tokens = Math.min(this.#o.burst, this.#tokens + ((now - this.#refilledAt) / 1000) * this.#rate);
+      // The bucket fills first (critical reads go on it), and what overflows a full bucket pays the trade debt: the
+      // scanner, which sees tokens - tradeDebt, gains at the rate either way.
+      const filled = this.#tokens + ((now - this.#refilledAt) / 1000) * this.#rate;
+      const over = Math.max(0, filled - this.#o.burst);
+      this.#tokens = Math.min(this.#o.burst, filled);
+      this.#tradeDebt = Math.max(0, this.#tradeDebt - over);
       const f = this.#o.criticalFloor;
       if (f) this.#floorTokens = Math.min(f.burst, this.#floorTokens + ((now - this.#refilledAt) / 1000) * f.ratePerSec);
     }
@@ -463,7 +563,12 @@ export class HostBudget {
     return Math.min(this.#o.burst, cost + reserve);
   }
 
-  /** Starts what can start, in queue order; skips what waited too long; sets one timer for the next change. */
+  /**
+   * Starts what can start, in queue order; skips what waited too long; sets one timer for the next change. Scanner
+   * reads see the bucket less the trade debt, critical reads the bucket itself. A critical read whose cost the
+   * bucket and its floor cannot cover yet does not hold up a later critical read they can (a 2-weight risk read
+   * behind a 20-weight ledger read); no scanner read passes a waiting critical one.
+   */
   #pump(): void {
     const now = this.#now();
     this.#refill(now);
@@ -477,32 +582,46 @@ export class HostBudget {
       else kept.push(w);
     }
     this.#queue = kept;
-    while (this.#queue.length > 0) {
-      const w = this.#queue[0]!;
+    // Set once a critical read could not go for want of tokens: only critical reads may pass it.
+    let passed = false;
+    for (let i = 0; i < this.#queue.length;) {
+      const w = this.#queue[i]!;
+      const critical = w.cls === 'critical';
+      if (passed && !critical) break;
       const gate = this.#gate(w.cls);
       if (now < gate) {
-        wakeAt = gate;
+        wakeAt = Math.min(wakeAt, gate);
         break;
       }
-      const critical = w.cls === 'critical';
       const slots = critical ? this.#inFlight < this.#o.maxInFlight
         : this.#inFlight < this.#o.maxInFlight && this.#scanInFlight < this.#o.scanMaxInFlight;
       // A release wakes the queue again; nothing to time.
       if (!slots) break;
       const need = this.#need(w.cls, w.cost);
+      const have = critical ? this.#tokens : this.#tokens - this.#tradeDebt;
       // A critical read takes shared tokens while the bucket holds its cost, else its floor's.
       const f = critical ? this.#o.criticalFloor : null;
       const floorNeed = f ? Math.min(f.burst, w.cost) : Infinity;
-      const floor = critical && this.#tokens < need && this.#floorTokens >= floorNeed;
-      if (this.#tokens < need && !floor) {
-        const shared = ((need - this.#tokens) / this.#rate) * 1000;
+      const floor = critical && have < need && this.#floorTokens >= floorNeed;
+      if (have < need && !floor) {
+        const shared = ((need - have) / this.#rate) * 1000;
         const own = f ? ((floorNeed - this.#floorTokens) / f.ratePerSec) * 1000 : Infinity;
-        wakeAt = now + Math.max(1, Math.ceil(Math.min(shared, own)));
-        break;
+        wakeAt = Math.min(wakeAt, now + Math.max(1, Math.ceil(Math.min(shared, own))));
+        if (!critical) break;
+        passed = true;
+        i++;
+        continue;
       }
-      this.#queue.shift();
-      if (floor) this.#floorTokens -= w.cost;
-      else this.#tokens -= w.cost;
+      this.#queue.splice(i, 1);
+      if (floor) {
+        // The floor never goes below zero: a read heavier than it holds takes the rest from the shared bucket (the
+        // scanner pays it back), so the next small critical read still finds its floor refilling from zero.
+        const fromFloor = Math.min(w.cost, this.#floorTokens);
+        this.#floorTokens -= fromFloor;
+        this.#tokens -= w.cost - fromFloor;
+      } else {
+        this.#tokens -= w.cost;
+      }
       this.#inFlight++;
       if (!critical) this.#scanInFlight++;
       this.#sent++;
@@ -534,6 +653,11 @@ export class HostBudget {
 }
 
 const budgets = new Map<string, HostBudget>();
+
+/** Forgets every host's budget in this process (tests: a fresh budget per test, nothing carried between them). */
+export function resetHostBudgets(): void {
+  budgets.clear();
+}
 
 /** The budget every reader of `origin` in this process shares (made with `options` the first time). */
 export function hostBudget(origin: string, options: HostBudgetOptions): HostBudget {

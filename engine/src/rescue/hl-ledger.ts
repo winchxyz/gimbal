@@ -5,7 +5,7 @@
 import type { VenueId } from '@gimbal/shared';
 import type { ChainNetwork } from '../relayer/tx.ts';
 import { hyperliquidTxRef } from '../relayer/tx.ts';
-import { HL_MAINNET_URL } from '../venues/hyperliquid.ts';
+import { HL_MAINNET_URL, hlTradeFetch } from '../venues/hyperliquid.ts';
 import type { VerifiedQuote } from './oneclick.ts';
 import type { LandingPort, LedgerEntry } from './rescuer.ts';
 
@@ -81,7 +81,9 @@ export class HlLedgerLanding implements LandingPort {
 
   constructor(options: HlLedgerLandingOptions) {
     this.#o = options;
-    this.#fetch = options.fetch ?? fetch;
+    // On the network (no fetch passed) the ledger read is the rescue's: charged to the host's weight budget, never
+    // waiting for it (venues/hyperliquid.ts hlTradeFetch).
+    this.#fetch = options.fetch ?? hlTradeFetch(options.apiUrl ?? HL_MAINNET_URL);
   }
 
   confirms(venue: VenueId): string | null {

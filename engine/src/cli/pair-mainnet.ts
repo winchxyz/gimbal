@@ -235,7 +235,7 @@ async function run(args: Args, cfg: NonNullable<ReturnType<typeof contractEnv>>,
     ? new Relayer({ contract: client, deskId: cfg.deskId, hyperliquid: new HyperliquidSubmitter({ network: 'mainnet', apiUrl: hlUrl }), solana })
     : null;
   const ctx: Ctx = {
-    args, client, config, desk, deskId: cfg.deskId, hlUrl, hl: new HyperliquidReader({ network: 'mainnet', url: `${hlUrl}/info` }),
+    args, client, config, desk, deskId: cfg.deskId, hlUrl, hl: new HyperliquidReader({ network: 'mainnet', url: `${hlUrl}/info`, trade: true }),
     phoenix: new PhoenixReader({ apiUrl: phoenixUrl, rpcUrl: solRpcUrl }), phoenixUrl, chain: solanaChain(solRpcUrl), solana, sol, relayer,
     prices: {
       maxAgeS: desk.policy.oracle_max_age_s, send: args.send, read: (symbol) => storedPrice(client, symbol),

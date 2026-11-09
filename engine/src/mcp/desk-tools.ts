@@ -13,7 +13,7 @@ import { NothingExecuted } from '../relayer/tx.ts';
 import type { OneClickApi, QuoteRequest } from '../rescue/oneclick.ts';
 import { ASSETS, canonicalQuote, unitsOf } from '../rescue/oneclick.ts';
 import { SLIPPAGE_BPS } from '../rescue/plan.ts';
-import { HL_MAINNET_URL, HL_TESTNET_URL } from '../venues/hyperliquid.ts';
+import { HL_MAINNET_URL, HL_TESTNET_URL, hlTradeFetch } from '../venues/hyperliquid.ts';
 import type { AttackDeps } from './attacks.ts';
 import { ATTACKS, isNodeRejection, runAttack } from './attacks.ts';
 
@@ -82,7 +82,8 @@ export class DeskTools {
     this.contractId = o.contractId;
     this.deskId = o.deskId;
     this.#o = o;
-    this.#fetch = o.fetch ?? fetch;
+    // On the network (no fetch passed) its /info reads are charged to the host's weight budget, never waiting for it.
+    this.#fetch = o.fetch ?? hlTradeFetch(o.network === 'mainnet' ? HL_MAINNET_URL : HL_TESTNET_URL);
     this.#now = o.now ?? Date.now;
   }
 

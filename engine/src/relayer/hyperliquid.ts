@@ -8,11 +8,14 @@
 // own refusal ({"status":"err"}, an HTTP 4xx) is HlExchangeError. When /exchange gives no answer (a timeout, a
 // dropped connection, a 5xx, a body that is not JSON) the action may have run: OutcomeUnknown with its cloid and
 // nonce. Once /exchange has answered, a failing /info read only leaves the result unconfirmed (confirmed: false).
+// Every post (the /exchange one and the confirming /info reads) is charged to the host's weight budget as it goes,
+// never waiting for it (HyperliquidSubmitterOptions.budget).
 
 import type { TxRef } from '@gimbal/shared';
 import type { HlSignedAction, OutcomeIds } from '../contract/types.ts';
 import { OutcomeUnknown } from '../contract/types.ts';
-import { HL_MAINNET_URL, HL_TESTNET_URL } from '../venues/hyperliquid.ts';
+import type { HostBudget } from '../venues/http-budget.ts';
+import { HL_MAINNET_URL, HL_TESTNET_URL, hlMeteredFetch, hlTradeFetch } from '../venues/hyperliquid.ts';
 import type { Clock } from '../venues/venue.ts';
 import { systemClock } from '../venues/venue.ts';
 import type { HlNetwork } from './hl-wire.ts';
@@ -69,6 +72,13 @@ export interface HyperliquidSubmitterOptions {
   /** API root, without /exchange; default by network. */
   apiUrl?: string;
   fetch?: typeof fetch;
+  /**
+   * The host's weight budget, which every post here is charged to without waiting for it (venues/hyperliquid.ts
+   * hlMeteredFetch): an order or cancel is never held up, but the scanner's reads back off after it. Default: the
+   * one the host's readers share in this process, unless a `fetch` is passed (tests), which then goes without one;
+   * null: none.
+   */
+  budget?: HostBudget | null;
   clock?: Clock;
   timeoutMs?: number;
   /** How long to look for the fill or ledger entry after a success; default 15 s. */
@@ -92,7 +102,9 @@ export class HyperliquidSubmitter {
   constructor(options: HyperliquidSubmitterOptions) {
     this.network = options.network;
     this.apiUrl = (options.apiUrl ?? (options.network === 'mainnet' ? HL_MAINNET_URL : HL_TESTNET_URL)).replace(/\/+$/, '');
-    this.#fetch = options.fetch ?? fetch;
+    const inner = options.fetch ?? ((input: string | URL | Request, init?: RequestInit) => globalThis.fetch(input, init));
+    this.#fetch = options.budget !== undefined ? hlMeteredFetch(options.budget, inner)
+      : options.fetch === undefined ? hlTradeFetch(this.apiUrl, inner) : inner;
     this.#clock = options.clock ?? systemClock;
     this.#timeoutMs = options.timeoutMs ?? 15_000;
     this.#confirmMs = options.confirmMs ?? 15_000;

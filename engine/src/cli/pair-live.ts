@@ -20,7 +20,7 @@ import type { OrderlyRestAction } from '../venues/orderly-signer.ts';
 import { Relayer } from '../relayer/relayer.ts';
 import { HyperliquidSubmitter } from '../relayer/hyperliquid.ts';
 import { sendOrderlyRest } from '../relayer/orderly.ts';
-import { HyperliquidReader } from '../venues/hyperliquid.ts';
+import { HyperliquidReader, hlTradeFetch } from '../venues/hyperliquid.ts';
 import { OrderlyReader } from '../venues/orderly.ts';
 import { ORDERLY_ENDPOINTS } from '../venues/orderly-http.ts';
 import { OrderlyAccountStream } from '../venues/orderly-stream.ts';
@@ -100,9 +100,9 @@ async function run(): Promise<void> {
   // Each leg by its own venue's policy symbol (contract/unpriced.ts): ETH on Hyperliquid, base_of(PERP_ETH_USDC) = ETH.
   const oraclePxOf = (venue: 'hyperliquid' | 'orderly', symbol: string) => (unpricedEntry(desk.policy, venue, symbol) !== undefined ? async () => null : storedPx);
   if (unpriced === undefined) log(`${HL_COIN} is priced: oracle ${await storedPx()} USD from the contract's prices()`);
-  const hlReader = new HyperliquidReader({ network: 'testnet', url: `${live.hlUrl}/info` });
+  const hlReader = new HyperliquidReader({ network: 'testnet', url: `${live.hlUrl}/info`, trade: true });
   const info = async (body: Record<string, unknown>): Promise<unknown> => {
-    const res = await fetch(`${live.hlUrl}/info`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) });
+    const res = await hlTradeFetch(live.hlUrl)(`${live.hlUrl}/info`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) });
     if (!res.ok) throw new Error(`hyperliquid /info ${String(body.type)}: HTTP ${res.status}`);
     return res.json();
   };

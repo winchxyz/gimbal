@@ -174,8 +174,10 @@ export async function phoenixFillFee(api: ReturnType<typeof phoenixTraderApi>, q
 export function liveBookSources(o: LiveSourceOptions): BookSources {
   const f = o.fetch ?? fetch;
   const infoUrl = o.hlInfoUrl ?? (o.network === 'mainnet' ? HL_MAINNET_INFO_URL : HL_TESTNET_INFO_URL);
-  // On the network (no fetch passed), the ledger reads share the host's weight budget with every other reader of it
-  // in serve, as critical reads (a few, once an hour and after an act).
+  // On the network (no fetch passed), every Hyperliquid read here (userFunding through the reader, the ledger updates,
+  // the fills for an act's fees and a close's prices) is queued in the host's weight budget with every other reader of
+  // it in the process, as critical reads: a few at start, 5 min past each hour (book.ts HOUR_SYNC_DELAY_MS) and when a
+  // position is booked. A test's fetch goes without one.
   const budget = o.fetch === undefined ? hlHostBudget(infoUrl) : null;
   const hl = new HyperliquidReader({ network: o.network, url: infoUrl, fetch: f, budget });
   const hlFetch = budget === null ? f : hlBudgetedFetch(budget, f);

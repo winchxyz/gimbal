@@ -7,6 +7,7 @@ import type { ContractClient, DeskView, HlSignedAction } from '../contract/types
 import { OutcomeUnknown } from '../contract/types.ts';
 import { HyperliquidSubmitter } from '../relayer/hyperliquid.ts';
 import { Relayer } from '../relayer/relayer.ts';
+import { hlTradeFetch } from '../venues/hyperliquid.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import { OrderlyDeskClient } from '../venues/orderly-actions.ts';
 import type { OrderlySigner } from '../venues/orderly-signer.ts';
@@ -136,7 +137,7 @@ export class SetupService implements SetupStarter {
       hl: hlSetup(o.hlUrl, desk.evm_address, builder ?? null, {
         setReferrer: () => o.contract.hlSetReferrer(deskId), approveBuilderFee: () => o.contract.hlApproveBuilderFee(deskId),
         submit: (signed) => relayer.submitHl(signed),
-      }, o.fetch ?? fetch),
+      }, o.fetch ?? hlTradeFetch(o.hlUrl)),
       orderly,
       phoenix,
       relayerIps: this.#publicIps,
