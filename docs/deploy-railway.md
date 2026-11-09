@@ -594,8 +594,9 @@ view can also take the owner's `POST /rotate`, `POST /close` and `PUT /strategy`
 3. **The public service → Variables:** `GIMBAL_OWNER_WRITES` = `1` (deploy-live-view.md). The public service never
    gets the owner token: the owner pastes it into the page, and the host passes it through.
 
-Each owner request needs the view's bearer token (checked first, before even the method, so without it nothing says
-whether owner writes are on) and the owner token in the `x-gimbal-owner` header, both compared in constant time.
+Each owner request needs the view's bearer token (checked first, before even the method: without it every owner
+path answers 401; a caller without it can still tell whether owner writes are on, since with them off those paths
+answer 404 or 405 as before, and learns nothing else) and the owner token in the `x-gimbal-owner` header, both compared in constant time.
 `GET /owner` answers 204 for a right owner token, and writes nothing. A write must be
 `content-type: application/json`, a JSON object of at most 4 KiB (`POST /close`: empty or `{}`). At most 6 writes a
 minute (429). After five wrong owner tokens within 15 minutes, further wrong ones are answered 429 (with

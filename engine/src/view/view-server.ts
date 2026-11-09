@@ -42,8 +42,10 @@
 // owner tokens in OWNER_FAIL_WINDOW_MS every wrong try is refused (429) for OWNER_LOCK_MS. The right token is always
 // served, so nobody can lock the owner out by sending wrong ones; what stops guessing is the token's size (at least
 // 32 characters with 16 distinct ones or about 128 bits, view-config.ts), and the lock only slows the noise. The lock is for the whole
-// listener, not per client: the live host is one client for every visitor. The view token is checked before anything
-// else, the method included, so without it nothing says whether owner writes are on. One log line per owner write: method, path, window id and the route's status; never a token or a body.
+// listener, not per client: the live host is one client for every visitor. On an owner path the view token is checked
+// before anything else, the method included. A caller without it can still tell whether owner writes are on (off:
+// /owner, /rotate and /close are 404 and PUT /strategy 405, as before; on: 401), and learns nothing else. One log
+// line per owner write: method, path, window id and the route's status; never a token or a body.
 
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
@@ -331,7 +333,7 @@ export class ViewServer {
 
   /** GET /owner, POST /rotate, POST /close, PUT /strategy with owner writes on (the top of this file). */
   async #owner(req: IncomingMessage, res: ServerResponse, method: string, path: string): Promise<void> {
-    // The view token first: without it nothing here says whether owner writes are on (not even a 405).
+    // The view token first, before the method: without it every owner path answers 401 and nothing more.
     if (!this.#bearerOk(req)) return this.#unauthorized(req, res, method, path, false);
     const want = path === '/owner' ? 'GET' : path === '/strategy' ? 'PUT' : 'POST';
     if (method !== want) {

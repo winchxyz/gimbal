@@ -71,8 +71,9 @@ pair. Visitors see and can do exactly what is described above; nothing changes f
   requests at once per client address, then one every 10 s. The host forwards the owner header as the visitor sent
   it, next to its own view token; it never stores, caches or logs the owner token. Its log has one line per write:
   `owner: POST /rotate: 200` (method, path, status).
-- **What the engine checks.** The view token first (without it every owner path answers 401, so nothing says
-  whether owner writes are on), then the owner token, each compared in constant time. The right owner token is
+- **What the engine checks.** The view token first (without it every owner path answers 401; a caller without it
+  can still tell that owner writes are on, since with them off those paths answer 404 or 405 as before, and learns
+  nothing else), then the owner token, each compared in constant time. The right owner token is
   always served. After five wrong owner tokens within 15 minutes, every further wrong one is answered 429 for 15
   minutes; the host is one client for all its visitors, so this is not per address. The trade-off: wrong tries from
   anyone cannot lock the owner out, and the lock no longer stops guessing by itself. What stops guessing is the
