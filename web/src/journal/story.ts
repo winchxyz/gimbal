@@ -197,11 +197,37 @@ export function storyOf(entries: readonly JournalEntry[], heldWindowId: string |
 }
 
 /**
- * The Desk's Latest: the three newest lines, leaving out the NEAR AI attestation record (a long technical line that
- * belongs in the Journal, where it stays).
+ * A technical note the engine writes as a `wait` while it starts or reads a venue, which a visitor needs no word of:
+ * the verified NEAR AI attestation (`stage: 'attestation'`), the pair start (`stage: 'start'`: "pair start confirmed
+ * after 1 failed attempt(s)…", "pair start waits for the Orderly session…") and a venue session opening (only
+ * `numbers.venue`, no `downS`: "orderly session starting…"). Errors of the same stages are not notes: they stay.
  */
-export const latestOf = (items: readonly StoryItem[], n = 3): StoryItem[] =>
-  items.filter((i) => !(i.type === 'entry' && i.entry.kind === 'wait' && i.entry.numbers.stage === 'attestation')).slice(0, n);
+export const isTechnicalNote = (e: JournalEntry): boolean =>
+  e.kind === 'wait' &&
+  (e.numbers.stage === 'attestation' ||
+    e.numbers.stage === 'start' ||
+    (typeof e.numbers.venue === 'string' && numberOf(e, 'downS') === null && e.numbers.action === undefined && e.numbers.stage === undefined));
+
+/**
+ * The Desk's Latest: the three newest lines, leaving out the engine's technical notes (isTechnicalNote), which belong
+ * in the Journal, where they stay. A run of waits keeps its other waits (so its line never reads a note) and is left out
+ * when nothing else is in it.
+ */
+export function latestOf(items: readonly StoryItem[], n = 3): StoryItem[] {
+  const out: StoryItem[] = [];
+  for (const i of items) {
+    if (out.length === n) break;
+    if (i.type === 'entry' && isTechnicalNote(i.entry)) continue;
+    if (i.type === 'waits') {
+      const entries = i.entries.filter((e) => !isTechnicalNote(e));
+      if (entries.length === 0) continue;
+      out.push(entries.length === i.entries.length ? i : { ...i, t: entries[0]!.t, entries });
+      continue;
+    }
+    out.push(i);
+  }
+  return out;
+}
 
 /**
  * The coin the desk's open legs hold, in the words the hold checks use (`MON`, not Orderly's `PERP_MON_USDC`): the coin

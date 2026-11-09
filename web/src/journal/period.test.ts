@@ -105,6 +105,30 @@ test("the Desk's Latest leaves out the NEAR AI attestation line; the Journal kee
   assert.ok(withFailed.some((i) => i.type === 'entry' && i.entry.id === failed.id));
 });
 
+test("the Desk's Latest leaves out the engine's start-up notes; the Journal keeps them, and errors stay", () => {
+  const session = entry(at('05:20'), 'wait', 'orderly session starting: its account is read once the session is up', { venue: 'orderly' });
+  const waitsSession = entry(at('05:21'), 'wait', 'pair start waits for the Orderly session, which is still opening', { stage: 'start', venue: 'orderly' });
+  const confirmed = entry(at('05:22'), 'wait', 'pair start confirmed after 1 failed attempt(s): both legs synced', { stage: 'start' });
+  const all = newestFirst([down('04:23', 33), back('04:24'), hold('05:19', 50), session, waitsSession, confirmed]);
+  const story = storyOf(all, W, 'MON');
+  const shownIds = (items: ReturnType<typeof storyOf>) => items.flatMap((i) => (i.type === 'waits' ? i.entries.map((e) => e.id) : 'entry' in i && i.entry ? [i.entry.id] : []));
+  // The Journal keeps every note.
+  for (const e of [session, waitsSession, confirmed]) assert.ok(shownIds(story).includes(e.id));
+  // The Desk shows the period and the incident, none of the notes.
+  const latest = latestOf(story);
+  assert.deepEqual(latest.map((i) => i.type), ['hold', 'incident']);
+  // A pair start that failed is an error: it stays on the Desk.
+  const refused = entry(at('05:23'), 'error', 'pair start refused: the legs differ', { stage: 'start' });
+  assert.ok(latestOf(storyOf(newestFirst([...all, refused]), W, 'MON')).some((i) => i.type === 'entry' && i.entry.id === refused.id));
+  // A venue answering again is not a note: it is the incident's recovery.
+  assert.ok(latest.some((i) => i.type === 'incident'));
+  // On a flat desk a run of waits mixes notes and real waits: the line is read from the real waits only.
+  const quiet = entry(at('05:10'), 'wait', 'No market pays your 5 % minimum', { action: 'wait' });
+  const run = latestOf(storyOf(newestFirst([quiet, session, confirmed]), null, null));
+  assert.equal(run.length, 1);
+  assert.ok(run[0]!.type === 'waits' && run[0]!.entries.length === 1 && run[0]!.entries[0]!.id === quiet.id);
+});
+
 test('a closed period never reads "Holding": not after a re-entry of the same coin, nor of the same window', () => {
   const W2 = 'mon-orderly-hyperliquid';
   const holdOn = (w: string, hhmm: string, opened: string): JournalEntry =>
