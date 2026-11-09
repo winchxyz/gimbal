@@ -50,3 +50,25 @@ test('every planned IOC carries a fresh cloid; an unpriced asset has no band but
   assert.equal(u.order.px, '2613');
   assert.throws(() => planIoc({ asset: 1, szDecimals: 1, side: 'buy', oraclePx: null, bandBps: 200, bookPx: 1, maxNotionalUsd: 100, notionalUsd: 50, maxSz: '3' }), /over the unpriced asset's max_sz 3/);
 });
+
+test('planIoc with a mark (the owner entry’s taker fallback): the limit is held within mark ± bps, unpriced too', () => {
+  const unpriced = { asset: 1, szDecimals: 4, oraclePx: null, bandBps: 200, maxNotionalUsd: 100, maxSz: '3' } as const;
+  // Unpriced, the book alone would allow 2613; the mark 2595 + 50 bps holds it at 2607.975, rounded down.
+  const buy = planIoc({ ...unpriced, side: 'buy', bookPx: 2600, mark: { px: 2595, bps: 50 } });
+  assert.ok(buy.px <= 2595 * 1.005 && buy.px >= 2600, `buy limit ${buy.px}`);
+  assert.equal(buy.order.px, '2607.9');
+  // A sell: book 2600 - 50 bps = 2587, the mark 2605 - 50 bps = 2591.975, rounded up.
+  const sell = planIoc({ ...unpriced, side: 'sell', bookPx: 2600, mark: { px: 2605, bps: 50 } });
+  assert.ok(sell.px >= 2605 * 0.995 && sell.px <= 2600, `sell limit ${sell.px}`);
+  // The tighter of the two wins: a mark far away leaves the book's own slippage bound.
+  assert.equal(planIoc({ ...unpriced, side: 'buy', bookPx: 2600, mark: { px: 2700, bps: 50 } }).order.px, '2613');
+  // A touch already past the mark's bound could not fill within it, and no mark at all is refused: nothing is planned.
+  assert.throws(() => planIoc({ ...unpriced, side: 'buy', bookPx: 2620, mark: { px: 2595, bps: 50 } }), /more than 50 bps from the mark 2595/);
+  assert.throws(() => planIoc({ ...unpriced, side: 'sell', bookPx: 2580, mark: { px: 2605, bps: 50 } }), /more than 50 bps from the mark 2605/);
+  assert.throws(() => planIoc({ ...unpriced, side: 'buy', bookPx: 2600, mark: { px: 0, bps: 50 } }), /no usable mark price/);
+  assert.throws(() => planIoc({ ...unpriced, side: 'buy', bookPx: 2600, mark: { px: Number.NaN, bps: 50 } }), /no usable mark price/);
+  // Priced: the band still applies, and the tightest of the book (2513.5), the band (2547.5) and the mark (2512.5) wins.
+  const priced = planIoc({ asset: 1, szDecimals: 4, side: 'buy', oraclePx: 2500, bandBps: 200, bookPx: 2501, maxNotionalUsd: 1000, mark: { px: 2500, bps: 50 } });
+  assert.equal(priced.order.px, '2512.5');
+  assert.throws(() => planIoc({ asset: 1, szDecimals: 4, side: 'buy', oraclePx: 2500, bandBps: 200, bookPx: 2560, maxNotionalUsd: 1000, mark: { px: 2560, bps: 50 } }), /outside the contract's band/);
+});

@@ -313,7 +313,9 @@ const RESCUE = obj({
 const SETUP = obj({
   deskId: V, steps: list(obj({ step: V, status: V, tx: list(TX) } satisfies Record<Exclude<keyof SetupProgress['steps'][number], 'detail'>, Shape>)),
 } satisfies Record<keyof SetupProgress, Shape>);
-const DECISION = obj({ action: V, reason: V, windowId: V, heldId: V, at: V } satisfies Record<keyof StrategyDecision, Shape>);
+// `acting`: the act running now (a window id or a manual request's name), what the journal says anyway; the owner
+// console disables Enter while it is set.
+const DECISION = obj({ action: V, reason: V, windowId: V, heldId: V, at: V, acting: V } satisfies Record<keyof StrategyDecision, Shape>);
 const HISTORY = obj({ windowId: V, points: list(obj({ t: V, netAprPct: V })) } satisfies Record<keyof WindowHistory, Shape>);
 const STATE = obj({
   mode: V, windows: list(WINDOW), scan: SCAN, strategy: STRATEGY, desk: DESK, journal: list(ENTRY), rescue: RESCUE, setup: SETUP, health: RECORD,

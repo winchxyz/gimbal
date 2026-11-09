@@ -80,7 +80,14 @@ pair. Visitors see and can do exactly what is described above; nothing changes f
   token's size (the engine requires at least 32 characters with 16 distinct ones or about 128 bits by its own estimate; `openssl rand -hex 32` gives 256 bits).
   At most 6 writes a minute. Then the request goes to the engine's own loopback routes, the same ones the dashboard on
   the engine's machine uses, with all their checks. `POST /rotate` needs `GIMBAL_TRADE=1` and auto on. With `demo`
-  (what the page sends) it opens from flat only and is refused if the round trip would cost more than 1 USD. Without
+  (what the page sends) it opens from flat only and is refused if the round trip would cost more than 1 USD. It posts
+  maker (post-only) orders first, and after the maker window falls back to a taker order: an IOC on the maker venue
+  for what the maker orders left, its limit within 50 bps of the touch, the contract's price band and 50 bps of the
+  mark (so an unpriced symbol is bounded too), sized within the caps, then hedged on the other venue. The 1 USD check
+  is on the estimate: it counts the taker fees and 50 bps of slippage for the fallback and again for its hedge, but
+  not the price moving in the up to 120 s between the maker fill and the hedge, so the realized cost can differ. In
+  an open sent in parts, once the shared post-only budget is spent a later part goes straight to the taker IOC. The
+  loop's own entries and a plain rotate stay maker-only. Without
   `demo`, which the page never sends but anyone holding the token can, it is an ordinary rotate: it may close the
   held pair and open another, with the profit checks and no loss cap. `PUT /strategy` can change the rules (auto,
   thresholds, leg size) within the engine's own limits. One log line per write:
@@ -93,7 +100,10 @@ pair. Visitors see and can do exactly what is described above; nothing changes f
   the size per leg, the 1 USD maximum loss, that the NEAR AI risk check is asked and the contract checks every
   order, and that an entry opens from flat only. A window the contract would refuse (`E_ASSET`, `E_SIZE`, ...),
   stale numbers, no desk, a NEAR AI refusal, a held pair or auto off keep the button disabled, with the reason
-  shown. The strategy rules are not editable from the page yet;
+  shown. After the engine takes it, the control says "Entry started: <symbol> …, watch the Journal"; while the loop
+  acts (the decision's `acting`) Enter is disabled on every window ("Your entry is still running"), a second send
+  answered 409 reads the same way, and when the act's Journal line lands the control shows its result: opened, or
+  not opened and why. The strategy rules are not editable from the page yet;
   `PUT /strategy` works for a client that sends the owner header.
 
 ## Protecting the live engine from public traffic

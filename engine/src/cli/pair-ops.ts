@@ -33,7 +33,7 @@ import type { CarryLegInput, CarryPlan } from '../trade/carry-plan.ts';
 import { carryPlan, meanRatePerHour, pct, usd } from '../trade/carry-plan.ts';
 import { DEFAULT_SCANNER_CONFIG, MAINNET_COSTS, hlFillFeeBps } from '../scanner/config.ts';
 import { bookMid } from '../scanner/costs.ts';
-import type { LegOutcome, LegSide, MakerSettings, TradeLeg } from '../trade/legs.ts';
+import type { LegOutcome, LegSide, MakerSettings, TakerFallback, TradeLeg } from '../trade/legs.ts';
 import { HlLeg, LegCheckError } from '../trade/legs.ts';
 import { commonLot, floorToLot, qtyNumber, qtyString, signedQtyString, toQty } from '../trade/lots.ts';
 import type { CloseRequest, PairResult } from '../trade/pair.ts';
@@ -213,6 +213,12 @@ export interface Pair {
   /** Orderly's market when Orderly is a leg (base MMR, funding period, minimum notional). */
   orderlyMarket: OrderlyMarket | null;
   maker: MakerSettings;
+  /**
+   * An owner demo entry's open (serve-pair.ts): after the maker window, what the post-only part did not fill goes as
+   * an IOC on the maker leg, held within markBps of its mark as well as the band and caps (MakerFirst.takerFallback).
+   * Absent: maker.takerFallback alone decides (pair-mainnet's --taker-fallback, without the mark bound).
+   */
+  takerFallback?: TakerFallback;
   microLamports: number;
   /**
    * The sum of the operation's targets, what finish() brings the pair back to (PairTrader.net after it): hl + px as an
@@ -333,6 +339,8 @@ export async function buildPair(ctx: OpsCtx, symbol: string, orders: () => Order
  */
 export async function pairOf(ctx: Pick<OpsCtx, 'desk' | 'phoenixUrl' | 'orderly'>, p: {
   symbol: string; shape: PairShape; legs: [TradeLeg, TradeLeg]; trader: PairTrader; run: PairRunner; maker: MakerSettings; microLamports: number; priced: boolean; closing: boolean;
+  /** An owner demo entry's open: Pair.takerFallback. Ignored for a close. */
+  takerFallback?: TakerFallback;
 }): Promise<Pair> {
   const venueOf = (i: 0 | 1) => p.shape.legs[i].venue;
   for (const i of [0, 1] as const) {
@@ -372,6 +380,7 @@ export async function pairOf(ctx: Pick<OpsCtx, 'desk' | 'phoenixUrl' | 'orderly'
     symbol: p.symbol, shape: p.shape, legs: p.legs, hl: hl as HlLeg | null, phoenix: phoenix as PhoenixLeg | null, makerIndex,
     trader: p.trader, run: p.run, lot: commonLot(p.legs[0].lot, p.legs[1].lot), bandBps: ctx.desk.policy.price_band_bps,
     priced: p.priced, mismatches: diffs, marketConfig, orderlyMarket, maker: p.maker, microLamports: p.microLamports, targetNet: null,
+    ...(p.takerFallback === undefined || p.closing ? {} : { takerFallback: p.takerFallback }),
   };
 }
 
@@ -457,9 +466,10 @@ export interface OpenRequest {
   qty?: string;
   /**
    * An owner demo entry (the strategy loop's POST /rotate with demo): the spread need not cover the round trip, which
-   * must be at most maxLossUsd (carry-plan.ts carryPlan). Absent: none; pair-mainnet never sets it.
+   * must be at most maxLossUsd (carry-plan.ts carryPlan), with the taker fallback's takerFallbackBps past the touch
+   * when it has one. Absent: none; pair-mainnet never sets it.
    */
-  demo?: { maxLossUsd: number };
+  demo?: { maxLossUsd: number; takerFallbackBps?: number };
 }
 
 export interface OpenPlan {
@@ -697,7 +707,11 @@ function orderPlanLine(pair: Pair): string {
   }
   const ioc = iocIndexOf(pair);
   const side = openSide(pair, m);
-  return `maker first: ${venueName(pair.shape.legs[m].venue)} ${side} post-only at the ${side === 'SELL' ? 'ask' : 'bid'}, repriced every ${pair.maker.repriceMs / 1000} s, at most ${pair.maker.maxOrders} signed post-only orders for the whole open (the C10 meter counts each), for ${pair.maker.timeoutMs / 1000} s${pair.maker.takerFallback ? ', then an IOC for the rest' : ', no taker fallback (--taker-fallback to add one)'}; then ${venueName(pair.shape.legs[ioc].venue)} ${openSide(pair, ioc)} IOC for what filled`;
+  const fallback = pair.takerFallback !== undefined
+    ? `, then a taker fallback: an IOC for the rest, its limit within the band, the caps, the slippage and ${pair.takerFallback.markBps} bps of the mark`
+      + ' (an open in parts: once the shared post-only budget is spent, a later part goes straight to that IOC)'
+    : pair.maker.takerFallback ? ', then a taker fallback: an IOC for the rest' : ', no taker fallback (--taker-fallback to add one)';
+  return `maker first: ${venueName(pair.shape.legs[m].venue)} ${side} post-only at the ${side === 'SELL' ? 'ask' : 'bid'}, repriced every ${pair.maker.repriceMs / 1000} s, at most ${pair.maker.maxOrders} signed post-only orders for the whole open (the C10 meter counts each), for ${pair.maker.timeoutMs / 1000} s${fallback}; then ${venueName(pair.shape.legs[ioc].venue)} ${openSide(pair, ioc)} IOC for what filled`;
 }
 
 /** What refreshForOpen did: `refused` why the open must not be sent (null: it may); `paid` a refresh_prices was sent. */
@@ -810,7 +824,8 @@ export async function sendOpen(
   if (pair.hl !== null) await approveBuilderFee(ctx);
   try {
     const results = await pair.run.openInChunks({
-      size: plan.size, longIndex: pair.shape.longIndex, reason, ...(pair.makerIndex === null ? {} : { maker: { index: pair.makerIndex } }),
+      size: plan.size, longIndex: pair.shape.longIndex, reason,
+      ...(pair.makerIndex === null ? {} : { maker: { index: pair.makerIndex, ...(pair.takerFallback === undefined ? {} : { takerFallback: pair.takerFallback }) } }),
       beforePart: async () => {
         // Counted for the loop's caps. The legs' own read during a part (oraclePxOf, trading) may still refresh a
         // price within PRICE_STALE_MARGIN_S of going stale: not counted, on purpose. It fires only when a part outlasts

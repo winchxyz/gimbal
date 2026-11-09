@@ -20,7 +20,8 @@ import type { PriceDeps } from './pair-mainnet-lib.ts';
 import { PRICE_MARGIN_S, newPriceState, refreshLanded, refreshReachedChain } from './pair-mainnet-lib.ts';
 import { storedPrice } from './pair-ops.ts';
 import type { CarryResult, RefreshAllowance, ServePairInput } from './serve-pair.ts';
-import { SERVE_MAKER, buildLiveLegs, builderFeeDrift, liveCarry } from './serve-pair.ts';
+import { SERVE_DEMO_TAKER_FALLBACK, SERVE_MAKER, buildLiveLegs, builderFeeDrift, liveCarry } from './serve-pair.ts';
+import { DEMO_TAKER_FALLBACK_BPS } from '../scanner/carry.ts';
 
 const HL_URL = 'https://hl.carry.test';
 const PHOENIX_URL = 'https://phoenix.carry.test';
@@ -129,8 +130,10 @@ async function carryWorld(o: {
   }));
   assert.deepEqual(legs.mismatches, []);
   const trader = new PairTrader({ legs: [legs.hl, legs.phoenix], priceBandBps: 100 });
+  const sent: { maker?: unknown }[] = [];
   const pair = {
-    openInChunks: async (r: { beforePart?: (part: number, parts: number) => Promise<void> }) => {
+    openInChunks: async (r: { maker?: unknown; beforePart?: (part: number, parts: number) => Promise<void> }) => {
+      sent.push({ maker: r.maker });
       await trader.openChunk(1);                         // as the trader does: the legs price the part, trading
       if (o.agedBeforePartS !== undefined) {            // a long earlier part: the price and the last refresh grow old
         for (const row of rows) row.at_ms -= o.agedBeforePartS * 1000;
@@ -161,7 +164,7 @@ async function carryWorld(o: {
   });
   const said: string[] = [];
   let paid = 0;
-  const open = (allow: RefreshAllowance & { gate?: () => string | null } = {}): Promise<CarryResult> => withVenues(() => carry.open({
+  const open = (allow: RefreshAllowance & { gate?: () => string | null; demo?: { maxLossUsd: number } } = {}): Promise<CarryResult> => withVenues(() => carry.open({
     legUsd: 50, leverage: 2, reason: 'strategy: enter eth-phoenix-hyperliquid', qty: '0.02', gate: () => null, ...allow,
     onPaidRefresh: () => {
       paid++;
@@ -173,7 +176,7 @@ async function carryWorld(o: {
     },
     open: (l) => said.push(`open: ${l}`),
   }));
-  return { open, timeline, said, logs, paid: () => paid };
+  return { open, timeline, said, logs, sent, paid: () => paid };
 }
 
 test('serve\'s carry, no stored price: planning (read-only) -> one refresh_prices -> the size held to the cap -> the first part, no second refresh', async () => {
@@ -187,6 +190,32 @@ test('serve\'s carry, no stored price: planning (read-only) -> one refresh_price
   assert.match(said, /stored ETH none \(planned on the books' mid 2500\.0000\); the open refreshes it once every check above passed/);
   assert.match(said, new RegExp(`stored ETH 2500, 610 s old \\(refreshed for this open\\): it lives 50 s past the first part's ${SERVE_MAKER.timeoutMs / 1000 + PRICE_MARGIN_S} s`));
   assert.match(said, /ioc sim   Phoenix BUY 0\.02 ETH .*: ok/);
+});
+
+test('serve\'s carry: an owner demo entry\'s open ends with a taker fallback held to the mark; the loop\'s own open stays maker only', async () => {
+  const plain = await carryWorld();
+  assert.deepEqual((await plain.open()).refusals, []);
+  assert.deepEqual(plain.sent, [{ maker: { index: 0 } }], 'no taker fallback on the loop\'s own open');
+  assert.match(plain.said.join('\n'), /no taker fallback/);
+  assert.doesNotMatch(plain.said.join('\n'), /^demo /m);
+
+  const demo = await carryWorld();
+  const r = await demo.open({ demo: { maxLossUsd: 1 } });
+  assert.deepEqual(r.refusals, []);
+  assert.deepEqual(demo.sent, [{ maker: { index: 0, takerFallback: SERVE_DEMO_TAKER_FALLBACK } }]);
+  assert.deepEqual(SERVE_DEMO_TAKER_FALLBACK, { markBps: DEMO_TAKER_FALLBACK_BPS });
+  const said = demo.said.join('\n');
+  assert.match(said, /then a taker fallback: an IOC for the rest, its limit within the band, the caps, the slippage and 50 bps of the mark/);
+  assert.match(said, /an open in parts: once the shared post-only budget is spent, a later part goes straight to that IOC/);
+  // The cost line: the round trip (every fill at the taker fee) plus 50 bps of the 50 USD leg for the fallback and
+  // again for its hedge, against what was accepted.
+  assert.match(said, /demo {6}owner demo entry: taker fallback after the 120 s maker window, within 50 bps of the touch and 50 bps of the mark; round trip \$\d+\.\d{4} \(every fill at the taker fee\) \+ \$0\.5000 for the fallback's and its hedge's slippage, at most \$1\.0000 accepted/);
+
+  // A maxLossUsd the round trip fits but not with the slippage of the fallback and its hedge: refused before anything is signed.
+  const tight = await carryWorld();
+  const refused = await tight.open({ demo: { maxLossUsd: 0.51 } });
+  assert.ok(refused.refusals.some((x) => /plus the taker fallback's and its hedge's 50 bps past the touch \(\$0\.5000\), .* is over the \$0\.5100 the owner accepted/.test(x)), JSON.stringify(refused.refusals));
+  assert.deepEqual(tight.sent, []);
 });
 
 test('serve\'s carry, its last gate (serve\'s orderGate) refusing after the plan and the refresh: nothing sent, the refresh paid', async () => {

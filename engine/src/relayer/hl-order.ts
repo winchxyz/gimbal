@@ -61,6 +61,12 @@ export interface IocInput {
   maxNotionalUsd: number;
   /** How far past the best price the limit may go; default 50 bps. */
   slippageBps?: number;
+  /**
+   * The venue's mark and how far from it the limit may go, bps (an owner entry's taker fallback): the limit is held
+   * within mark ± bps as well, so a thin book whose touch ran away from the mark cannot pull the fill past it. For an
+   * unpriced asset (no band) the only bound on the price besides the book itself. Absent: no such bound.
+   */
+  mark?: { px: number; bps: number };
   /** A size to trade instead of notionalUsd (closing a position). */
   sz?: string;
   reduceOnly?: boolean;
@@ -91,7 +97,16 @@ export function planIoc(input: IocInput): IocPlan {
   const want = buy ? input.bookPx * (1 + slip) : input.bookPx * (1 - slip);
   const oracle = input.oraclePx;
   const edge = oracle === null ? want : buy ? oracle * (1 + band) : oracle * (1 - band);
-  const limit = buy ? Math.min(want, edge) : Math.max(want, edge);
+  let limit = buy ? Math.min(want, edge) : Math.max(want, edge);
+  if (input.mark !== undefined) {
+    const { px: mark, bps } = input.mark;
+    if (!(mark > 0) || !Number.isFinite(mark) || !(bps >= 0)) throw new Error(`no usable mark price (${mark}) to hold the limit to`);
+    const markEdge = buy ? mark * (1 + bps / 10_000) : mark * (1 - bps / 10_000);
+    if (buy ? markEdge < input.bookPx : markEdge > input.bookPx) {
+      throw new Error(`the best ${buy ? 'ask' : 'bid'} ${input.bookPx} is more than ${bps} bps from the mark ${mark}: an IOC held within it would not fill`);
+    }
+    limit = buy ? Math.min(limit, markEdge) : Math.max(limit, markEdge);
+  }
   const px = hlPx(limit, input.szDecimals, buy ? 'down' : 'up');
   const pxN = Number(px);
   if (buy ? pxN < input.bookPx : pxN > input.bookPx) {
