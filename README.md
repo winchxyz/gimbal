@@ -33,8 +33,20 @@ before NEAR's MPC network signs it. The engine that trades and moves margin can 
   on testnet the same code [refused 8 of 8 scripted attacks](#refusals-on-chain-npm-run-attack), 0 USDC moved.
 - The engine runs against the mainnet desk: each start signs an Orderly session through the contract
   ([the first](https://nearblocks.io/txns/7FKrWJzCGVyGoKEZkGUAJ3jq6o6w5EcPxjWd5h5APxQa); 12 by 2026-11-05).
+- The first live pair ran its whole cycle on mainnet: 74 XLM a leg (about 11.4 USD), short on Hyperliquid and long
+  on Phoenix, every order checked and signed through the contract. The owner opened it by hand on 2026-11-06 05:04
+  UTC as an owner demo entry, forecast at -3.3 % net APR after costs, below any threshold the loop would open on (the
+  profit checks are waived, the contract's policy checks are not;
+  [Hyperliquid leg](https://nearblocks.io/txns/6WxR3Yj7p8ZdEYSVaDmYqiKwxD5Bz6Z1rXTdshAe98wr),
+  [Phoenix leg](https://nearblocks.io/txns/4esnzwZZKttnXDEncMZ5Ms8MoojBqECY4KCSAYsRtTbV)). The strategy loop held it
+  27 hours and closed it on 2026-11-07 08:03 UTC with reduce-only orders
+  ([Hyperliquid](https://nearblocks.io/txns/22rYMiTeSCDcCFNypDt7pmNWtm3TLQNmawgQDQ437iTa),
+  [Phoenix](https://nearblocks.io/txns/CyCZ26LQpKNaAzNfFfZPEgf7dALYJNo8dojvVnDxkcio)), under a temporary owner rule
+  (a 1000 % net minimum, exit after 24 hourly checks) set so the pair would close after about a day; by its own
+  numbers the pair's forward rate was still 5.1 % net APR after exit costs. Booked (funding read to 07:00 UTC; the last hour was still settling):
+  funding +0.0085 USD, fees -0.0169, price -0.0178, net -0.026 USD ([Status](#status-2026-11-04)).
 
-Not yet: a live pair or a live margin rescue on mainnet (on-chain counters 0; [Status](#status-2026-11-04)).
+Not yet: a live margin rescue on mainnet (the desk's rescue counters on chain are 0; [Status](#status-2026-11-04)).
 
 Tracks: DeFi (main) and Security. Built for NEAR HACKATHON, Nov 1–14, 2026, by winch
 ([@winchxyz](https://x.com/winchxyz)). This repository started on Oct 30, 2026, inside the build window (Oct 19 to
@@ -45,17 +57,17 @@ as it trades now, through a host that refuses every write ([docs/deploy-live-vie
 no pair held it shows a flat desk and the scanner's windows, which is the truth. For the recorded replay (mainnet hour
 of 2026-10-31, x10, a stress test from Rescue), run `npm run demo`.
 
-<!-- SUBMISSION: fill the three lines below on submit day, then delete this comment. -->
+<!-- SUBMISSION: fill the two link lines below on submit day, then delete this comment. -->
 - **Demo video:** TODO(submission): video link
 - **X post:** TODO(submission): X post link
-- **Status:** TODO(submission): one line read from the chain on submit day (for example the first live pair or the
-  first live rescue); the dated details are under [Status](#status-2026-11-04)
+- **Status (2026-11-07):** the first live pair opened (by the owner) and closed (by the loop) on mainnet, net
+  -0.026 USD after fees; no live margin rescue yet. The dated details are under [Status](#status-2026-11-04)
 
 ## 30 seconds for a judge
 
 ```bash
 npm ci                     # the four workspaces from the lockfile; one zod advisory (see docs/reviewer-checks.md)
-npm run ci -- --only npm   # ci: green - npm ci, build, test, typecheck (node tests 1436 + 513 + 233) in N s
+npm run ci -- --only npm   # ci: green - npm ci, build, test, typecheck (node tests 1527 + 525 + 233) in N s
 npm run demo               # demo: ready. Open http://localhost:5190 (recorded mainnet data, nothing signed)
 ```
 
@@ -123,7 +135,8 @@ Gimbal runs the whole loop with no private key for the venue accounts:
   asks the MPC network for a signature.
 - **An engine trades it.** It ranks funding windows across venues after fees, slippage, basis and funding timing,
   opens both legs, holds them, exits or rotates, and books every hour of funding from the venues' own ledgers. It
-  runs on mainnet; it has not opened a live pair yet (see [Status](#status-2026-11-04)).
+  runs on mainnet; it held and closed its first live pair, which the owner opened by hand (see
+  [Status](#status-2026-11-04)).
 - **It moves its own margin.** When a leg nears liquidation, the engine moves USDC to it across chains through
   NEAR Intents (1Click); the contract verifies 1Click's quote signature and pays only the desk's own accounts. The
   payment path ran on mainnet; no rescue has run there yet.
@@ -214,17 +227,30 @@ The transactions of the contract, the desk and the canary, with what each proves
 
 <a id="status-2026-11-04"></a>
 
-## Status (2026-11-05)
+## Status (2026-11-07)
 
-Done (read from the chain and the venues' public APIs at about 03:00 UTC):
+Done (read from the chain and the venues' public APIs at about 08:10 UTC):
 
 - The contract code is frozen after three internal review rounds (no external audit), deployed from a reproducible
   build and locked.
-- Desk `carry` is set up on all three venues and funded (38.68 USDC deposited): 7.68 USDC on Hyperliquid, 9.75 USDC
-  on Phoenix, 12.99 USDC sent to Orderly, 7.68 USDC idle on NEAR as the rescue reserve.
+- Desk `carry` is set up on all three venues and funded (38.68 USDC deposited): 7.64 USDC on Hyperliquid, 9.76 USDC
+  on Phoenix, 12.99 USDC sent to Orderly, 7.68 USDC idle on NEAR as the rescue reserve; 38.08 USDC in all after the
+  transfer costs and the first pair.
 - The engine runs on a server (`docs/deploy-railway.md`) with the operator key and a gas-only relayer wallet, with
-  the strategy loop on, live rescue enabled and, since 2026-11-04, Orderly pairs on (12 Orderly sessions signed on
-  chain). Its NEAR AI model is `Qwen/Qwen3-VL-30B-A3B-Instruct`, for policy drafts and the risk check.
+  the strategy loop on, live rescue enabled and, since 2026-11-04, Orderly pairs on (one Orderly session signed on
+  chain at every engine start). Its NEAR AI model is `Qwen/Qwen3-VL-30B-A3B-Instruct`, for policy drafts and the
+  risk check.
+- **The first live pair ran its whole cycle.** XLM, 74 a leg (about 11.4 USD), short on Hyperliquid, long on
+  Phoenix. The owner opened it by hand on 2026-11-06 05:04 UTC as an owner demo entry, forecast at -3.3 % net APR
+  after costs, below any threshold the loop would open on (the profit checks are waived; the contract still checked
+  every order against the policy) and, to close it after about a day, set a temporary rule for it: a 1000 % net
+  minimum, exit after 24 hourly checks under it. The strategy loop held it 27 hours, booked each funding hour from
+  the venues' ledgers, and closed both legs under that rule on 2026-11-07 08:03 UTC, when by its own numbers the
+  pair's forward rate was still 5.1 % net APR after exit costs: three post-only Hyperliquid buys did not fill, a reduce-only taker buy did, then
+  Phoenix by a reduce-only IOC. Booked result (funding read to 07:00 UTC; the last hour was still settling):
+  funding +0.0085 USD, fees -0.0169 (entry 0.0068, exit 0.0101), price -0.0178 (the entry and exit fills gave up about
+  0.00024 USD per XLM in spread and basis between the two venues), net -0.026 USD. The transactions:
+  [docs/onchain-evidence.md](docs/onchain-evidence.md#mainnet-desk-carry).
 - On testnet the same contract code refused 8 of 8 scripted malicious requests, 0 USDC moved
   ([below](#refusals-on-chain-npm-run-attack)).
 - On mainnet `gimbal_dex.near` refused a deliberately mispriced test Hyperliquid order with `E_PRICE_BAND`
@@ -237,10 +263,9 @@ Done (read from the chain and the venues' public APIs at about 03:00 UTC):
 
 Not done yet:
 
-- **The strategy loop has not opened its first live pair.** The contract has signed no opening order on
-  `gimbal_dex.near` yet (`get_desk_counters`: hourly notional meter at 0), and the desk's Hyperliquid account holds
-  no position. The owner's threshold is 5 % net APR at 12 USD a leg, and the loop opens only a window inside the
-  desk's policy. The two owner demo entry tries of 2026-11-05 were refused by the engine; nothing was signed.
+- **The strategy loop has not opened a pair on its own.** The owner's threshold is 5 % net APR at 12 USD a leg,
+  and the loop opens only a window inside the desk's policy; none has cleared both yet. The one live pair so far
+  was the owner's demo entry above.
 - **No margin rescue has run on mainnet yet.** The desk's rescue counters on chain are zero; the three `fund_venue`
   payments were setup transfers, not rescues. The live routes have
   been dry-run against mainnet; the money path itself ran on the canary
