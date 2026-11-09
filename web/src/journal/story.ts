@@ -109,8 +109,10 @@ export function holdText(item: Pick<Extract<StoryItem, { type: 'hold' }>, 'symbo
 /**
  * The entries (newest first, as the engine sends them) as story lines, newest first. `heldWindowId` is the window the
  * desk holds now (`Window.held`), so the newest period of that window reads "Holding"; null when nothing is held.
+ * `heldSymbol` is the symbol of the desk's open legs: it stands in while the windows are not read yet (right after the
+ * engine restarts), so a pair still held never reads "Held … to …" for that minute. The window, once known, wins.
  */
-export function storyOf(entries: readonly JournalEntry[], heldWindowId: string | null = null): StoryItem[] {
+export function storyOf(entries: readonly JournalEntry[], heldWindowId: string | null = null, heldSymbol: string | null = null): StoryItem[] {
   const items: StoryItem[] = [];
 
   // Holding periods: by window, then by the opening time the checks give.
@@ -125,17 +127,24 @@ export function storyOf(entries: readonly JournalEntry[], heldWindowId: string |
   }
   const newestPeriodOf = new Map<string, number>();
   for (const p of periods) newestPeriodOf.set(p.window, Math.max(newestPeriodOf.get(p.window) ?? -Infinity, p.entries[0]!.t));
+  // Without the window: the newest period of the held symbol, across that symbol's windows.
+  const newestOfSymbol = heldWindowId === null && heldSymbol !== null
+    ? Math.max(-Infinity, ...periods.filter((p) => symbolOf(p.entries[0]!) === heldSymbol).map((p) => p.entries[0]!.t))
+    : null;
   for (const p of periods) {
     const newest = p.entries[0]!;
     const oldest = p.entries[p.entries.length - 1]!;
     const from = p.opened ?? oldest.t;
+    const symbol = symbolOf(newest);
     const base = {
-      symbol: symbolOf(newest),
+      symbol,
       from: Math.min(from, oldest.t),
       firstCheck: oldest.t,
       t: newest.t,
       checks: p.entries.length,
-      ongoing: p.window === heldWindowId && newestPeriodOf.get(p.window) === newest.t,
+      ongoing: heldWindowId !== null
+        ? p.window === heldWindowId && newestPeriodOf.get(p.window) === newest.t
+        : symbol === heldSymbol && newestOfSymbol === newest.t,
     };
     items.push({ type: 'hold', id: `hold-${oldest.id}`, ...base, text: holdText(base), entries: p.entries });
   }
@@ -178,6 +187,13 @@ export function storyOf(entries: readonly JournalEntry[], heldWindowId: string |
 
   return items.sort((a, b) => b.t - a.t);
 }
+
+/**
+ * The Desk's Latest: the three newest lines, leaving out the NEAR AI attestation record (a long technical line that
+ * belongs in the Journal, where it stays).
+ */
+export const latestOf = (items: readonly StoryItem[], n = 3): StoryItem[] =>
+  items.filter((i) => !(i.type === 'entry' && i.entry.numbers.stage === 'attestation')).slice(0, n);
 
 /** The time a line shows: a holding period shows when it began; everything else its own time. */
 export const storyTime = (item: StoryItem): number => (item.type === 'hold' ? item.from : item.t);

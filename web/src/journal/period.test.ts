@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { DeskState, JournalEntry, Leg } from '@gimbal/shared';
 import { incidentsText, journalHeadline, periodFacts, type HoldItem } from './period.ts';
-import { storyOf } from './story.ts';
+import { latestOf, storyOf } from './story.ts';
 
 const at = (hhmm: string): number => Date.parse(`2026-11-09T${hhmm}:00Z`);
 const OPEN = at('03:08');
@@ -77,4 +77,26 @@ test('an ended period gives its own numbers, never the desk P&L of another pair'
   assert.ok(!facts.some((f) => f.label === 'Funding paid' || f.label.startsWith('Short ')));
   assert.deepEqual(facts.find((f) => f.label === 'Held for')?.value, '2 h');
   assert.deepEqual(facts.at(-1), { label: 'Net at the last check', value: '−$0.0002', tone: 'down' });
+});
+
+test('right after an engine restart (windows not read yet) the open legs keep the period "Holding", not "Held … to …"', () => {
+  const entries = newestFirst([hold('03:56', 42.2), hold('05:19', 50)]);
+  const holdOf = (s: ReturnType<typeof storyOf>) => s.find((i): i is HoldItem => i.type === 'hold')!;
+  // No window and no legs: the page cannot tell, so the period reads as ended (as before).
+  assert.equal(holdOf(storyOf(entries, null, null)).text, 'Held MON from 03:08 to 05:19, checked 2 times since 03:56');
+  // No window yet, but the desk's legs are MON: still held.
+  assert.equal(holdOf(storyOf(entries, null, 'MON')).text, 'Holding MON since 03:08, checked 2 times since 03:56');
+  // Legs of another symbol: the MON period ended.
+  assert.equal(holdOf(storyOf(entries, null, 'XPL')).ongoing, false);
+  // Once the windows are read, the window wins over the symbol.
+  assert.equal(holdOf(storyOf(entries, 'xpl-phoenix-hyperliquid', 'MON')).ongoing, false);
+});
+
+test("the Desk's Latest leaves out the NEAR AI attestation line; the Journal keeps it", () => {
+  const att = entry(at('05:20'), 'wait', 'NEAR AI attestation of a model: verified TDX quote', { stage: 'attestation' });
+  const story = storyOf(newestFirst([hold('05:19', 50), down('04:23', 33), back('04:24'), att]), W, 'MON');
+  assert.ok(story.some((i) => i.type === 'entry' && i.entry.id === att.id));
+  const latest = latestOf(story);
+  assert.equal(latest.some((i) => i.type === 'entry' && i.entry.id === att.id), false);
+  assert.deepEqual(latest.map((i) => i.type), ['hold', 'incident']);
 });

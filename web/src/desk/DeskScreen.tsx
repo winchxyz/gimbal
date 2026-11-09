@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { DeskState, JournalEntry, Leg, ScanStatus, StrategyConfig, StrategyDecision, VenueId, Window as FundingWindow } from '@gimbal/shared';
 import { clock } from '../journal/entry.ts';
-import { storyOf, type StoryItem } from '../journal/story.ts';
+import { latestOf, storyOf, type StoryItem } from '../journal/story.ts';
 import { rowOf } from '../journal/model.ts';
 import { waitsView } from '../journal/waits.ts';
 import { writeControls } from '../remote/readonly.ts';
@@ -81,7 +81,7 @@ export function DeskScreen() {
           <Payback pnl={desk.pnl} />
           <NextBest windows={windows} strategy={strategy} />
         </div>
-        <Latest journal={journal} heldId={held?.id ?? null} />
+        <Latest journal={journal} heldId={held?.id ?? null} heldSymbol={desk.legs[0]?.symbol ?? null} />
       </div>
     </div>
   );
@@ -381,8 +381,8 @@ export function storyLine(item: StoryItem): string {
   }
 }
 
-function Latest({ journal, heldId }: { journal: readonly JournalEntry[]; heldId: string | null }) {
-  const lines = storyOf(journal, heldId).slice(0, 3);
+function Latest({ journal, heldId, heldSymbol }: { journal: readonly JournalEntry[]; heldId: string | null; heldSymbol: string | null }) {
+  const lines = latestOf(storyOf(journal, heldId, heldSymbol));
   return (
     <section className="dk-latest" aria-label="Latest">
       <div className="hd">
@@ -463,7 +463,7 @@ function Flat({ desk, answer, windows, strategy, scan, journal, now }: FlatProps
           </div>
           <NextBest windows={windows} strategy={strategy} />
         </section>
-        <Latest journal={journal} heldId={null} />
+        <Latest journal={journal} heldId={null} heldSymbol={null} />
       </div>
     </div>
   );
