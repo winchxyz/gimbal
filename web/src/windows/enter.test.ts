@@ -120,6 +120,8 @@ test('the act’s result comes from its Journal line: opened, opened by the take
   assert.deepEqual(entryResult([opened, older], pending(['a'])), { kind: 'opened', text: 'Opened SOL: both legs are open, $20.00 a leg. It shows on the Desk.' }, 'the demo tag naming the fallback’s cost is not a fallback');
   const byTaker = { ...opened, summary: `${opened.summary} (taker fallback: hyperliquid SELL IOC 500000 after the maker window filled 0.1 at 2512)` };
   assert.match(entryResult([byTaker], pending())!.text, /the taker fallback took the rest/);
+  const takerFailed = { ...opened, summary: `${opened.summary} (taker fallback: hyperliquid SELL IOC 500000 after the maker window failed: no fill)` };
+  assert.doesNotMatch(entryResult([takerFailed], pending())!.text, /taker fallback/, 'a fallback that did not fill took nothing');
 
   // Not opened: the reason after the window id, without the owner entry's tag, the symbol's lead and the later clauses.
   const maker = line('e', 'refused', `enter sol-phoenix-orderly: ${TAG} SOL not opened: the maker window filled nothing (hyperliquid post-only; no fill); NEAR AI risk check: passed`);
