@@ -426,9 +426,20 @@ Hyperliquid pays the code's owner 10% of the fees the desk pays.
 
 ## Roadmap (after the hackathon)
 
-Nothing in this section is built. Every item keeps the rule Gimbal already follows: a venue joins only if the
-contract itself can sign its orders and check each one against the owner's policy.
+Nothing in this section is built, except where an item says what already exists. Every on-chain venue keeps the rule
+Gimbal already follows: a venue joins only if the contract itself can sign its orders and check each one against
+the owner's policy. The one exception, centralized exchanges, is planned as a separate mode with a weaker guarantee,
+and the app would say so.
 
+- **Many users, each with their own desk.** The contract already supports many desks: any NEAR account can create
+  its own, with its own policy (`create_desk`, `desks_of`). The onboarding screens are written: NEAR wallet sign-in,
+  then `create_desk` and the steps after it. So far they are tested only against a fake wallet and chain; the
+  mainnet desk was created with a script (`tools/mainnet/desk.mjs`). What is missing:
+  - one engine runs one desk today; it would run many, each with its own strategy, risk checks and rescue;
+  - a page per user: deposit and withdraw, the policy in plain words, the desk's own Journal and P&L;
+  - EVM wallet sign-in next to NEAR's, through a NEAR account that the EVM wallet controls.
+- **P&L cards.** A share image per pair (net APR, held since, net so far), built from the desk's own Journal at share
+  time, never from a model or a guess.
 - **More markets on Hyperliquid.** Hyperliquid's builder-deployed (HIP-3) markets, such as trade.xyz's equities and
   commodities, are signed the same way as Hyperliquid's own. The scanner already reads them as watch-only venues,
   and the contract already accepts their asset ids. What they still need:
@@ -449,11 +460,18 @@ contract itself can sign its orders and check each one against the owner's polic
   a funding carry. Two venues can resolve the same question differently,
   and the money stays locked until the event resolves. So the policy would list events and their resolution
   sources, not coins.
-- **Not planned: centralized exchanges and bookmakers.**
-  - A centralized exchange trades through an API secret on a KYC account. The secret cannot live in a contract, so
-    no policy could check its orders. Holding it in a TEE is possible, but that is a weaker, different guarantee.
-    Kalshi is an exchange of this kind.
-  - Most sports bookmakers forbid arbitrage in their terms and limit the accounts that do it.
+- **Centralized exchanges, as a separate mode.** A centralized exchange trades through an API key on the user's own
+  account there. The key cannot live in the contract, so the contract cannot check those orders against the policy.
+  That is a weaker guarantee than the keyless venues, and the app would mark every leg that runs this way. The plan:
+  - the user pastes a trade-only key, with withdrawals switched off on the exchange;
+  - the engine stores the key encrypted (inside a TEE where one is available), never shows it again, and the user
+    can remove it at any time;
+  - a pair can then hold one on-chain leg and one centralized leg, with the same risk checks on both. A rescue
+    could only top up the centralized leg, through a deposit address the owner pins (as with the Orderly receiver).
+    It could never draw from that leg, since its withdrawals are off.
+
+  Kalshi, a prediction market, is an exchange of this kind: it could pair with Polymarket only in this mode.
+- **Not planned: sports bookmakers.** Most forbid arbitrage in their terms and limit the accounts that do it.
 
 ## Repo map
 
