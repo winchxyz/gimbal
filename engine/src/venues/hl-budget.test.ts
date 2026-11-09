@@ -555,7 +555,9 @@ test('critical reads are served within 2 s of a trade\'s large debt and a 20-wei
   budget.charge(150);
   for (let i = 0; i < 5; i++) await budget.unqueued(async () => ok([]), 120);
   for (let i = 0; i < 10; i++) await budget.unqueued(async () => ok([]), 21);
-  assert.equal(budget.state().tradeDebt, 810);
+  // 810 spent; the debt kept is capped at a minute of the rate.
+  assert.equal(budget.state().unqueuedSpent, 810);
+  assert.equal(budget.state().tradeDebt, 660);
   const sentAt: Record<string, number> = {};
   const read = (name: string, type: string, scan = false) => {
     const go = () => hlBudgetedSend(budget, { type, user: USER }, async () => {
@@ -578,7 +580,7 @@ test('critical reads are served within 2 s of a trade\'s large debt and a 20-wei
   await timers.runUntil(60_000);
   await Promise.all(asked);
   assert.ok(sentAt.fills! < 5_000, `the second ledger read at ${sentAt.fills} ms`);
-  assert.equal(sentAt.funding, undefined, 'skipped: 810 of debt is more than its 3 s wait');
+  assert.equal(sentAt.funding, undefined, 'skipped: 660 of debt is more than its 3 s wait');
 });
 
 test('an unqueued request\'s 429 does not delay a queued critical read; it holds the scanner\'s', async () => {
@@ -640,4 +642,32 @@ test('hlTradeInfo parses a long answer once and charges its rows from it; resetH
     globalThis.fetch = real;
     resetHostBudgets();
   }
+});
+
+test('the trade debt is capped at a minute of the rate: sustained trading holds the scanner about a minute, not many', async () => {
+  const timers = new VirtualTimers();
+  timers.now = 0;
+  const budget = new HostBudget('hl-debt-cap', { ...HL_BUDGET, now: () => timers.now, timers, random: () => 0.5 });
+  assert.equal(budget.tradeDebtCap, 60 * HL_BUDGET.ratePerSec);
+  // A maker reprice loop: 120-weight userFills reads, 30 a minute for 5 minutes (60 a second, well above 11).
+  for (let t = 0; t < 300_000; t += 2_000) {
+    timers.now = t;
+    await budget.unqueued(async () => ok([]), 120);
+    assert.ok(budget.state().tradeDebt <= budget.tradeDebtCap);
+  }
+  assert.equal(budget.state().unqueuedSpent, 150 * 120);
+  assert.equal(budget.state().tradeDebt, budget.tradeDebtCap);
+  // Trading stops: the scanner's funding read (20, leaving 20) goes once the overflow of a full bucket has paid the
+  // capped debt down, about (660 - 150 + 40) / 11 = 50 s later; uncapped (about 15000 left) it would wait 20 minutes.
+  const stopped = timers.now;
+  const hit: { at: number | null } = { at: null };
+  const tryFunding = () => scanRead(() => hlBudgetedSend(budget, { type: 'metaAndAssetCtxs' }, async () => {
+    hit.at = timers.now;
+    return ok([meta, [ctx]]);
+  })).catch(() => null);
+  for (let i = 0; i < 40 && hit.at === null; i++) {
+    void tryFunding();
+    await timers.runUntil(timers.now + 3_000);
+  }
+  assert.ok(hit.at !== null && hit.at - stopped <= 90_000, `the scanner read again ${hit.at === null ? 'never' : `${(hit.at - stopped) / 1000} s`} after trading stopped`);
 });

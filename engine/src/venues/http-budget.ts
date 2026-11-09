@@ -227,7 +227,9 @@ export const PHOENIX_BUDGET: HostBudgetOptions = {
  * busiest minute after the hour reached about 1970: HL answered 429 to whatever came next, often the risk read.
  * With this budget (hl-budget.test.ts simulates serve's load): steady 567, busiest minute 751 with the refresh
  * spread over about 19 minutes (30 after a restart; 15 and 22 at 12.5/s), at most 880 in any minute by
- * construction (11/s plus the 150 burst plus the critical floor's 70).
+ * construction (11/s plus the 150 burst plus the critical floor's 70). That 880 is what the budget's own queued
+ * reads send: critical reads never wait for the trade path's debt, so in a minute the trade path spends heavily the
+ * host's total can pass 880 by what it spent (by design: neither a trade nor the risk read is held for the other).
  *
  * The trade path (the relayer's /exchange posts and its fill and ledger reads, the legs' orderStatus and userFills,
  * serve-pair's order and margin reads, the rescue's ledger read, setup) never waits for this budget, but it is charged
@@ -294,7 +296,7 @@ export interface HostBudgetState {
   tokens: number;
   /**
    * What the requests sent outside the queue (unqueued()) cost and the refill has not paid back yet: scanner reads
-   * wait for it (they see tokens - tradeDebt), critical reads do not.
+   * wait for it (they see tokens - tradeDebt), critical reads do not. At most tradeDebtCap (a minute of the rate).
    */
   tradeDebt: number;
   /** Tokens spent in all: the cost of every read sent plus what charge() added (Hyperliquid: request weight). */
@@ -338,6 +340,10 @@ export class HostBudget {
   #scanRetryAt = 0;
   /** unqueued() cost not paid back yet: the refill pays it first; only scanner reads wait for it. */
   #tradeDebt = 0;
+  /** The most trade debt kept: a minute of the full rate (Hyperliquid: 660), the window the host counts over. */
+  get tradeDebtCap(): number {
+    return 60 * this.#o.ratePerSec;
+  }
   #floorTokens: number;
   #quietUntil = 0;
   #rateLimited = 0;
@@ -439,7 +445,9 @@ export class HostBudget {
     if (!Number.isFinite(tokens) || tokens === 0) return;
     this.#refill(this.#now());
     if (unqueued) {
-      this.#tradeDebt += tokens;
+      // At most a minute of the full rate (tradeDebtCap): Hyperliquid counts only the last minute, so weight older
+      // than that is not owed any more, and sustained trading cannot hold the scanner off for many minutes.
+      this.#tradeDebt = Math.min(this.tradeDebtCap, this.#tradeDebt + tokens);
       this.#unqueuedSpent += tokens;
       // A refund larger than the debt left goes back to the bucket.
       if (this.#tradeDebt < 0) {
@@ -483,7 +491,8 @@ export class HostBudget {
       // A bucket already below zero (a long answer) keeps its debt: reset to zero it would forget weight the host has
       // counted, and the cap would hold only approximately. The trade debt is kept as it is. The critical floor is
       // neither cut nor emptied, and after an unqueued request's 429 the bucket is not emptied either (the tokens it
-      // holds are what critical reads go on).
+      // holds are what critical reads go on). The cut does slow the shared refill critical reads also draw on, after
+      // an unqueued request's 429 too (one refill rate serves both); what they keep whatever it does is the floor.
       this.#refill(now);
       this.#rate = Math.max(a.minRatePerSec, this.#rate * a.cut);
       this.#rateAt = now;
