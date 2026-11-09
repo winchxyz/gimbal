@@ -148,6 +148,7 @@ interface RowProps {
   /** Every window and the engine rules' leg size: the owner's entry (unlocked live view) reads them. */
   windows?: readonly FundingWindow[];
   legUsd?: number | null;
+  auto?: boolean | null;
   onSelect(id: string): void;
 }
 
@@ -184,7 +185,7 @@ function RowRotate({ from, to }: { from: FundingWindow; to: FundingWindow }) {
   );
 }
 
-export function Row({ w, selected, below, history, held, windows, legUsd, onSelect }: RowProps) {
+export function Row({ w, selected, below, history, held, windows, legUsd, auto, onSelect }: RowProps) {
   const status = rowStatus(w);
   const watch = !w.tradable;
   const costs = totalCosts(w);
@@ -235,7 +236,7 @@ export function Row({ w, selected, below, history, held, windows, legUsd, onSele
         </span>
       </span>
       {rotateFrom ? <RowRotate from={rotateFrom} to={w} /> : null}
-      {ownerEnter ? <OwnerEnter w={w} windows={windows} legUsd={legUsd ?? null} place="row" /> : null}
+      {ownerEnter ? <OwnerEnter w={w} windows={windows} legUsd={legUsd ?? null} auto={auto ?? null} place="row" /> : null}
     </div>
   );
 }

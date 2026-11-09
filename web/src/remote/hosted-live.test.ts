@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { NOT_CONFIGURED_TEXT, parseHostedHealth } from './hosted.ts';
+import { NOT_CONFIGURED_TEXT, parseHostedHealth, parseOwnerWrites } from './hosted.ts';
 import {
   hostedLiveFlag, hostedLiveLine, isHostedLive, isReadOnly, isRemote, remoteSettings, setHostedLiveForTests, setRemoteSettingsForTests, writeControls,
   writeControlsFor,
@@ -50,6 +50,21 @@ test('the line names what the engine reports: live mainnet is never called a rep
   assert.match(hostedLiveLine('testnet'), /^Live testnet desk/);
   const unknown = hostedLiveLine(null);
   assert.doesNotMatch(unknown, /\b(live|mainnet|replay)\b/i, 'before the engine answers, nothing is claimed');
+});
+
+test('owner writes off on the host: the line is exactly as before, with no word of an owner; on: "read-only for visitors"', () => {
+  assert.equal(hostedLiveLine('mainnet'), 'Live mainnet desk, read-only: the real desk as it trades now. Nothing on this page can change it. For the recorded replay, run npm run demo.');
+  assert.equal(hostedLiveLine('testnet'), 'Live testnet desk, read-only: test money, not the mainnet desk. Nothing on this page can change it.');
+  assert.equal(hostedLiveLine('mainnet', false, false), hostedLiveLine('mainnet'));
+  assert.match(hostedLiveLine('mainnet', false, true), /^Live mainnet desk, read-only for visitors: /);
+  assert.match(hostedLiveLine('mainnet', true, true), /Owner unlocked in this tab/);
+  for (const mode of ['mainnet', 'testnet', 'replay', null] as const) assert.doesNotMatch(hostedLiveLine(mode), /owner/i);
+  // The host says owner writes are on only with `owner: true` in /healthz; anything else is off.
+  assert.equal(parseOwnerWrites({ ok: true, live: 'connected', visitors: 1, owner: true }), true);
+  for (const body of [null, {}, { ok: true, live: 'connected', visitors: 1 }, { owner: 'true' }, { owner: 1 }]) assert.equal(parseOwnerWrites(body), false);
+  // The Owner link is drawn only when the host says so, or this tab is unlocked (to Lock).
+  const bar = readFileSync(join(root, 'web', 'src', 'remote', 'RemoteBar.tsx'), 'utf8');
+  assert.match(bar, /\{ownerWrites \|\| unlocked \? <a href=\{OWNER_HREF\}>Owner<\/a> : null\}/);
 });
 
 test('the host\'s /healthz: its live state, anything else unknown', () => {

@@ -186,6 +186,7 @@ export function WindowsScreen() {
               held={held}
               windows={all}
               legUsd={strategy?.legUsd ?? null}
+              auto={strategy?.auto ?? null}
               onSelect={select}
             />
           ))}

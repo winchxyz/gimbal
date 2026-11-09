@@ -48,9 +48,13 @@ export function isLiveBuild(indexHtml: string): boolean {
   return indexHtml.includes(LIVE_BUILD_MARKER);
 }
 
-export const LIVE_READ_ONLY_REASON = 'This is the public view of the live mainnet desk, and it is read-only for visitors: they cannot change the rules, '
+export const LIVE_READ_ONLY_REASON = 'This is the public view of the live mainnet desk, and it is read-only: visitors cannot change the rules, '
+  + 'enter, rotate, close, pause or stress it. The host refuses every write and never forwards one to the engine.';
+
+/** The same, with owner writes on (GIMBAL_OWNER_WRITES=1): only then does the text mention the owner's way in. */
+export const LIVE_OWNER_READ_ONLY_REASON = 'This is the public view of the live mainnet desk, and it is read-only for visitors: they cannot change the rules, '
   + 'enter, rotate, close, pause or stress it. The host refuses every write from a visitor and never forwards one to the engine; '
-  + 'only the owner, with the owner token, can unlock entering, closing and the engine rules.';
+  + 'only the owner, with the owner token, can unlock entering and closing.';
 
 export const NOT_CONFIGURED_REASON = 'The live engine is not configured on this site: the host has no engine address or view token, so there is no desk to show.';
 
@@ -165,7 +169,7 @@ export function liveRoute(
   }
   if (!read) {
     return isApiPath(path) || path === HEALTH_PATH
-      ? refuse(403, 'read-only', `${method} ${path} is refused. ${LIVE_READ_ONLY_REASON}`)
+      ? refuse(403, 'read-only', `${method} ${path} is refused. ${owner.on ? LIVE_OWNER_READ_ONLY_REASON : LIVE_READ_ONLY_REASON}`)
       : refuse(405, 'method', `${method} ${path}: this site only serves pages and reads`);
   }
   if (path === HEALTH_PATH) return { kind: 'health' };
@@ -877,6 +881,8 @@ export class LiveUpstream {
     } catch {
       return json(502, { ok: false, error: 'live engine error', reason: 'The live engine\'s answer was not JSON.' });
     }
+    // New rules: the cached GET /strategy is stale now, so the next read asks the engine (never the old rules as fresh).
+    if (method === 'PUT' && path === '/strategy' && res.status >= 200 && res.status < 300) this.#invalidate('/strategy');
     const shape = path === '/strategy' && res.status === 200 ? STRATEGY : ERROR;
     const s = Number(res.headers.get('retry-after'));
     return {
@@ -1103,10 +1109,22 @@ const TYPES: Record<string, string> = {
   '.txt': 'text/plain; charset=utf-8',
 };
 
+/**
+ * The page's own files only: no inline script or style (the Vite build has none; React sets styles through the DOM,
+ * which a CSP allows), fonts and icons from this origin (the favicon is `data:`), and fetches to this origin plus the
+ * public NEAR RPCs the Security screen reads the contract from (web/src/onboarding/chain.ts RPC_URLS). No frames.
+ */
+export const LIVE_CSP = [
+  "default-src 'self'", "script-src 'self'", "style-src 'self'", "img-src 'self' data:", "font-src 'self'",
+  "connect-src 'self' https://free.rpc.fastnear.com https://rpc.mainnet.near.org https://test.rpc.fastnear.com https://rpc.testnet.near.org",
+  "frame-ancestors 'none'", "base-uri 'none'", "form-action 'self'", "object-src 'none'",
+].join('; ');
+
 const COMMON_HEADERS = {
   'x-content-type-options': 'nosniff',
   'referrer-policy': 'no-referrer',
   'x-frame-options': 'DENY',
+  'content-security-policy': LIVE_CSP,
 } as const;
 
 const PING = Buffer.from(': ping\n\n');
@@ -1344,7 +1362,8 @@ export function createLiveHostServer(o: LiveHostOptions): LiveHostServer {
       res.setHeader('connection', 'close');
       return sendJson(res, 400, { ok: false, error: 'body', reason: `${method} ${url.pathname} takes no body` });
     }
-    if (route.kind === 'health') return sendJson(res, 200, { ok: true, ...liveStatus(), visitors: visitors.size });
+    // `owner: true` only with owner writes on, so the page shows its Owner link then; off, the answer is as before.
+    if (route.kind === 'health') return sendJson(res, 200, { ok: true, ...liveStatus(), visitors: visitors.size, ...(o.ownerWrites === true ? { owner: true } : {}) });
     if (route.kind === 'static') {
       const file = liveStaticFile(o.webDir, url.pathname);
       if (file === null || !existsSync(file)) return sendJson(res, 404, { ok: false, error: 'not found', reason: `no file ${url.pathname}` });

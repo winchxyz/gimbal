@@ -88,7 +88,7 @@ export function Detail({ w, windows, strategy, histories, alerts, onToggleAlert 
 
       <DecisionLine key={w.id} decision={decision} w={w} alerts={alerts} onToggleAlert={onToggleAlert} />
       {/* The live view's owner, unlocked in this tab: an entry from flat on this window (enter.ts says when it cannot). */}
-      {writeControls().enter ? <OwnerEnter key={`enter-${w.id}`} w={w} windows={windows} legUsd={strategy?.legUsd ?? null} place="detail" /> : null}
+      {writeControls().enter ? <OwnerEnter key={`enter-${w.id}`} w={w} windows={windows} legUsd={strategy?.legUsd ?? null} auto={strategy?.auto ?? null} place="detail" /> : null}
     </section>
   );
 }

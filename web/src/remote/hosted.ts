@@ -20,12 +20,26 @@ export const NOT_CONFIGURED_TEXT = 'This site is not connected to the live engin
 
 const hostedStore = createStore((_state: HostedLive, next: HostedLive) => next, 'unknown' as HostedLive);
 
+/** Whether the host has owner writes on (GIMBAL_OWNER_WRITES=1): its /healthz says `owner: true` only then. */
+export function parseOwnerWrites(body: unknown): boolean {
+  return typeof body === 'object' && body !== null && (body as { owner?: unknown }).owner === true;
+}
+
+const ownerWritesStore = createStore((_state: boolean, next: boolean) => next, false);
+
+/** The host's owner writes as last read; false until it says otherwise (so a visitor's page is as before). */
+export function useHostedOwnerWrites(): boolean {
+  return useSyncExternalStore(ownerWritesStore.subscribe, ownerWritesStore.getState);
+}
+
 export const POLL_MS = 30_000;
 
 async function readHealth(): Promise<void> {
   try {
     const r = await fetch('/healthz', { headers: { accept: 'application/json' }, cache: 'no-store', signal: AbortSignal.timeout(5_000) });
-    hostedStore.dispatch(parseHostedHealth(await r.json()));
+    const body: unknown = await r.json();
+    hostedStore.dispatch(parseHostedHealth(body));
+    ownerWritesStore.dispatch(parseOwnerWrites(body));
   } catch {
     // The host itself is unreachable: the connection bar already says the engine is not answering.
   }

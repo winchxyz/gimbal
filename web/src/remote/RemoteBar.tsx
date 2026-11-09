@@ -1,6 +1,6 @@
 import { useStream } from '../stream/hub.ts';
 import { CONNECT_HREF, OWNER_HREF } from '../shell/routes.ts';
-import { NOT_CONFIGURED_TEXT, NOT_CONFIGURED_TITLE, usePollHostedLive } from './hosted.ts';
+import { NOT_CONFIGURED_TEXT, NOT_CONFIGURED_TITLE, useHostedOwnerWrites, usePollHostedLive } from './hosted.ts';
 import { hasOwnLine, needsToken, useProblem } from './problem.ts';
 import { HOSTED_LINE, hostedLiveLine, isHostedLive, isHostedReplay, isOwnerUnlocked, isRemote, READ_ONLY_LINE, remoteSettings } from './readonly.ts';
 
@@ -27,12 +27,14 @@ export function RemoteBar() {
 function HostedLiveBar() {
   const mode = useStream((s) => s.desk?.mode ?? s.mode);
   const live = usePollHostedLive();
+  const ownerWrites = useHostedOwnerWrites();
+  const unlocked = isOwnerUnlocked();
   return (
     <>
       <div className="ro-line">
-        <span>{hostedLiveLine(live === 'not-configured' ? null : mode, isOwnerUnlocked())}</span>
-        {/* Quiet, at the end of the line: the owner's way in, and to Lock. Nothing else changes for a visitor. */}
-        <a href={OWNER_HREF}>Owner</a>
+        <span>{hostedLiveLine(live === 'not-configured' ? null : mode, unlocked, ownerWrites)}</span>
+        {/* Quiet, at the end of the line, only when the host has owner writes on (or this tab is unlocked, to Lock). */}
+        {ownerWrites || unlocked ? <a href={OWNER_HREF}>Owner</a> : null}
       </div>
       {live === 'not-configured' ? (
         <div className="notice" role="status">

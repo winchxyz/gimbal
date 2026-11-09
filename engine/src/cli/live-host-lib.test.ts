@@ -5,7 +5,7 @@
 // engine's payloads (a field allowlist per type, then the cut), checked against the page's own fixtures.
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, request } from 'node:http';
 import type { IncomingHttpHeaders, IncomingMessage, OutgoingHttpHeaders, Server, ServerResponse } from 'node:http';
 import { connect } from 'node:net';
@@ -19,7 +19,7 @@ import { ViewServer } from '../view/view-server.ts';
 import type { ViewOwner, ViewSource } from '../view/view-server.ts';
 import type { LiveHostOptions, LiveHostServer, LiveUpstreamOptions } from './live-host-lib.ts';
 import {
-  LIVE_BUILD_MARKER, LIVE_READ_ONLY_REASON, LiveUpstream, NOT_CONFIGURED_REASON, addressGroup, createLiveHostServer, isLiveBuild, liveClientKey,
+  LIVE_BUILD_MARKER, LIVE_CSP, LIVE_OWNER_READ_ONLY_REASON, LIVE_READ_ONLY_REASON, LiveUpstream, NOT_CONFIGURED_REASON, addressGroup, createLiveHostServer, isLiveBuild, liveClientKey,
   liveConfigFromEnv, liveRoute, liveStaticFile, OWNER_HEADER, ownerWritesFromEnv, publicCutter, publicEvent, publicRead, publicSetup, publicState, sameOrigin,
 } from './live-host-lib.ts';
 
@@ -1185,16 +1185,26 @@ test('owner routes exist only with the opt-in and the owner header; every other 
     ['POST', '/stress'], ['POST', '/strategy'], ['PUT', '/rotate'], ['GET', '/rotate'], ['POST', '/pause'], ['POST', '/setup'],
     ['PUT', '/journal'], ['POST', '/owner'], ['DELETE', '/close'], ['POST', '/control'], ['GET', '/strategy'],
   ];
-  for (const [m, p] of others) assert.deepEqual(liveRoute(m, p, none, on), liveRoute(m, p), `${m} ${p}`);
-  // Without the header, or without the opt-in: refused as before.
-  for (const owner of [{ on: true, header: false }, { on: false, header: true }, { on: false, header: false }]) {
+  for (const [m, p] of others) {
+    assert.deepEqual(liveRoute(m, p, none, on), liveRoute(m, p, none, { on: true, header: false }), `${m} ${p}`);
+    assert.equal(liveRoute(m, p, none, on).kind, liveRoute(m, p).kind, `${m} ${p}`);
+  }
+  // Without the opt-in: refused exactly as before, header or not, with the old text (no word of an owner).
+  for (const owner of [{ on: false, header: true }, { on: false, header: false }]) {
     for (const [m, p] of [['POST', '/rotate'], ['POST', '/close'], ['PUT', '/strategy']]) {
       const r = liveRoute(m!, p!, none, owner);
       assert.deepEqual(r, liveRoute(m!, p!), `${m} ${p} ${JSON.stringify(owner)}`);
       assert.equal(r.kind, 'refuse');
       assert.equal((r as { status: number }).status, 403);
       assert.ok((r as { body: { reason: string } }).body.reason.includes(LIVE_READ_ONLY_REASON));
+      assert.doesNotMatch((r as { body: { reason: string } }).body.reason, /owner/);
     }
+  }
+  // On, without the header: refused, and the text says the owner can unlock.
+  for (const [m, p] of [['POST', '/rotate'], ['POST', '/close'], ['PUT', '/strategy']]) {
+    const r = liveRoute(m!, p!, none, { on: true, header: false });
+    assert.equal((r as { status: number }).status, 403);
+    assert.ok((r as { body: { reason: string } }).body.reason.includes(LIVE_OWNER_READ_ONLY_REASON));
   }
   assert.deepEqual(liveRoute('GET', '/owner', none, { on: false, header: true }), { kind: 'static' }, 'off: /owner is a missing file, as before');
   assert.equal((liveRoute('GET', '/owner', none, { on: true, header: false }) as { status: number }).status, 403);
@@ -1318,5 +1328,45 @@ test('an engine whose view has owner writes off: the host says so, and nothing i
   } finally {
     await h.stop();
     await v.view.stop();
+  }
+});
+
+test('with owner writes on, /healthz says so (the page shows its Owner link only then); new rules are not served from the cache', async () => {
+  const eng = fakeEngine();
+  const v = await startView(eng.source, {}, { token: OWNER, call: async () => ({ status: 200, body: { ok: true } }) });
+  const h = await startHost(v.base, { stream: false, ownerWrites: true });
+  try {
+    assert.equal(JSON.parse((await call(h.base, 'GET', '/healthz')).text).owner, true);
+    assert.equal((await fresh(h.base, 'GET', '/strategy')).status, 200);
+    assert.equal((await fresh(h.base, 'GET', '/strategy')).status, 200);
+    assert.equal(eng.reads.strategy, 1, 'the second read is the cache');
+    const put = await fresh(h.base, 'PUT', '/strategy', { origin: h.base, 'content-type': 'application/json', [OWNER_HEADER]: OWNER }, '{"auto":false}');
+    assert.equal(put.status, 200);
+    assert.equal((await fresh(h.base, 'GET', '/strategy')).status, 200);
+    assert.equal(eng.reads.strategy, 2, 'after the owner\'s PUT the next read asks the engine');
+  } finally {
+    await h.stop();
+    await v.view.stop();
+  }
+});
+
+test('every answer carries the page\'s CSP: own files only, no inline script, no frames, fetches to this site and the NEAR RPCs the page reads', async () => {
+  const h = await startHost(null, { stream: false });
+  try {
+    for (const path of ['/', '/healthz', '/state']) {
+      const csp = String((await call(h.base, 'GET', path)).headers['content-security-policy']);
+      assert.equal(csp, LIVE_CSP, path);
+    }
+    assert.match(LIVE_CSP, /script-src 'self'(;|$)/);
+    assert.doesNotMatch(LIVE_CSP, /unsafe-/);
+    assert.match(LIVE_CSP, /frame-ancestors 'none'/);
+    // The connect list is exactly the page's NEAR RPC list (web/src/onboarding/chain.ts), so the Security screen works.
+    const chain = readFileSync(join(import.meta.dirname, '..', '..', '..', 'web', 'src', 'onboarding', 'chain.ts'), 'utf8');
+    const rpcs = chain.slice(chain.indexOf('export const RPC_URLS'), chain.indexOf('};', chain.indexOf('export const RPC_URLS'))).match(/https:\/\/[a-z0-9.-]+/g) ?? [];
+    assert.equal(rpcs.length, 4);
+    const connect = LIVE_CSP.split('; ').find((d) => d.startsWith('connect-src '))!.split(' ').slice(1);
+    assert.deepEqual(connect, ["'self'", ...rpcs]);
+  } finally {
+    await h.stop();
   }
 });

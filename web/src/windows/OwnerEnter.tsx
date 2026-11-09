@@ -8,6 +8,8 @@ interface Props {
   w: FundingWindow;
   windows: readonly FundingWindow[];
   legUsd: number | null;
+  /** The engine rules' `auto` (null: not read yet). Off, the engine refuses every entry, so the button says so. */
+  auto: boolean | null;
   /** `row`: inside a list row (its own clicks must not select the row again); `detail`: the detail's action line. */
   place: 'row' | 'detail';
 }
@@ -18,8 +20,8 @@ interface Props {
  * answer stays next to the button. A window the page knows cannot be entered shows the button disabled, with why.
  * Drawn only when writeControls().enter (the owner unlocked this tab).
  */
-export function OwnerEnter({ w, windows, legUsd, place }: Props) {
-  const state = enterState(w, windows);
+export function OwnerEnter({ w, windows, legUsd, auto, place }: Props) {
+  const state = enterState(w, windows, auto);
   const action: ManualAction | null =
     state.kind === 'open' ? { kind: 'enter', symbol: w.symbol, windowId: w.id, maxLossUsd: OWNER_MAX_LOSS_USD } : null;
   const send = useManualSend(action);

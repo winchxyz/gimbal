@@ -100,7 +100,7 @@ test('the token lives in sessionStorage only: no localStorage, cookie or address
   assert.match(readFileSync(join(here, 'owner.ts'), 'utf8'), /browserStores\(\)\.session/);
 });
 
-test('unlocked on the live view: rotate, close and the owner entry are drawn; nothing else; locked: none, as before', () => {
+test('unlocked on the live view: close and the owner entry are drawn; not rotate (no loss cap), nothing else; locked: none, as before', () => {
   try {
     setHostedLiveForTests(true);
     setRemoteSettingsForTests(undefined);
@@ -109,7 +109,7 @@ test('unlocked on the live view: rotate, close and the owner entry are drawn; no
     assert.deepEqual(writeControls(), { close: false, rotate: false, enter: false, stress: false, owner: false, money: false, onboarding: false });
     setOwnerTokenForTests(TOKEN);
     assert.equal(isOwnerUnlocked(), true);
-    assert.deepEqual(writeControls(), { close: true, rotate: true, enter: true, stress: false, owner: false, money: false, onboarding: false });
+    assert.deepEqual(writeControls(), { close: true, rotate: false, enter: true, stress: false, owner: false, money: false, onboarding: false });
     assert.deepEqual(writeControls(), writeControlsFor(true, false, true));
     // A token in the tab means nothing off the live view (a remote engine's read-only page, the local dashboard).
     setHostedLiveForTests(false);

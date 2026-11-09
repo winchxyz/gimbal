@@ -30,6 +30,11 @@ test('contract refusals, no desk, stale numbers, a NEAR AI refusal and a held pa
   assert.match(reason(win({ veto: { verdict: 'veto', reasons: ['thin book'], model: 'm', at: 1 } })), /NEAR AI risk check refused it/);
   const heldXlm = win({ symbol: 'XLM', held: { since: 1 } });
   assert.match(reason(win({ symbol: 'SOL' }), [heldXlm, win({ symbol: 'SOL' })]), /^XLM is held\. An owner entry opens from flat only: close XLM first\.$/);
+  // Auto off in the engine rules: the engine refuses every entry, so the button says why. Unknown (not read yet): open.
+  const sol = win({ symbol: 'SOL' });
+  assert.deepEqual(enterState(sol, [sol], false), { kind: 'blocked', reason: 'Auto is off in the engine rules, and the engine opens nothing while it is off.' });
+  assert.deepEqual(enterState(sol, [sol], true), { kind: 'open' });
+  assert.deepEqual(enterState(sol, [sol], null), { kind: 'open' });
 });
 
 test('the confirm says both legs, the venues, the size per leg, the most it may lose, the contract, and flat only', () => {

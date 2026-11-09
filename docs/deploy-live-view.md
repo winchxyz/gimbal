@@ -33,9 +33,10 @@ configured** ("This site is not connected to the live engine yet ..., so there i
 
 - **The page.** The hosted-live build opens straight into the live view: no Settings step, and an engine address a
   visitor once saved in Settings is ignored. Under the header one line says what the engine itself reports: on
-  mainnet "Live mainnet desk, read-only for visitors: the real desk as it trades now. Nothing a visitor does here can
-  change it. For the recorded replay, run npm run demo." (An engine in replay mode would be labelled "Replay, read-only ... It is not the
-  live desk"; live data is never called a replay, nor a replay live.) Every control that acts is left out, as in the
+  mainnet "Live mainnet desk, read-only: the real desk as it trades now. Nothing on this page can change it. For the
+  recorded replay, run npm run demo." (An engine in replay mode would be labelled "Replay, read-only ... It is not the
+  live desk"; live data is never called a replay, nor a replay live. With the owner's console on, below, the line says
+  "read-only for visitors" instead, and ends in an Owner link.) Every control that acts is left out, as in the
   remote read-only mode: Close position, rotate, Run a stress test, the owner's status buttons (auto, pause, resume,
   add margin), Add funds, Withdraw, Connect wallet and the set-up flow (which shows "Read-only view. This page shows
   the desk and cannot change anything on it."). The page's API refuses those calls itself, without a request.
@@ -62,26 +63,36 @@ pair. Visitors see and can do exactly what is described above; nothing changes f
   check), `POST /rotate`, `POST /close` and `PUT /strategy`. On the public service, `GIMBAL_OWNER_WRITES=1` lets the
   host forward those four, and nothing else, and only for a request that carries the owner header
   (`x-gimbal-owner`). Either one off and every write is refused exactly as before: the host answers 403 "read-only"
-  without the opt-in, and "owner writes are off on the live engine" when the engine has no owner token.
+  without the opt-in, and "owner writes are off on the live engine" when the engine has no owner token. Without the
+  opt-in a visitor's page is exactly as before: the same line, the same refusal text, no Owner link (the host's
+  `/healthz` adds `"owner": true` only with the opt-in, and the page shows the link only then).
 - **What the host checks.** A write must come from this site's own page (its `Origin` is the host the request was
   sent to, over https), with `content-type: application/json` and a JSON object of at most 4 KiB. At most 10 owner
   requests at once per client address, then one every 10 s. The host forwards the owner header as the visitor sent
   it, next to its own view token; it never stores, caches or logs the owner token. Its log has one line per write:
   `owner: POST /rotate: 200` (method, path, status).
-- **What the engine checks.** The view token and the owner token, each compared in constant time. Five wrong owner
-  tokens within 15 minutes lock every owner request for 15 minutes (429; the host is one client for all its
-  visitors, so the lock is not per address). At most 6 writes a minute. Then the request goes to the engine's own
-  loopback routes, the same ones the dashboard on the engine's machine uses, with all their checks: `POST /rotate`
-  needs `GIMBAL_TRADE=1` and auto on, opens from flat only, and an entry with `demo` is capped at 1 USD of maximum
-  loss. One log line per write: `view: owner POST /rotate <window id> (demo): 200` (method, path, window id, status).
+- **What the engine checks.** The view token first (without it every owner path answers 401, so nothing says
+  whether owner writes are on), then the owner token, each compared in constant time. The right owner token is
+  always served. After five wrong owner tokens within 15 minutes, every further wrong one is answered 429 for 15
+  minutes; the host is one client for all its visitors, so this is not per address. The trade-off: wrong tries from
+  anyone cannot lock the owner out, and the lock no longer stops guessing by itself. What stops guessing is the
+  token's size (the engine requires at least 32 characters with 16 distinct ones or about 128 bits by its own estimate; `openssl rand -hex 32` gives 256 bits).
+  At most 6 writes a minute. Then the request goes to the engine's own loopback routes, the same ones the dashboard on
+  the engine's machine uses, with all their checks. `POST /rotate` needs `GIMBAL_TRADE=1` and auto on. With `demo`
+  (what the page sends) it opens from flat only and is refused if the round trip would cost more than 1 USD. Without
+  `demo`, which the page never sends but anyone holding the token can, it is an ordinary rotate: it may close the
+  held pair and open another, with the profit checks and no loss cap. `PUT /strategy` can change the rules (auto,
+  thresholds, leg size) within the engine's own limits. One log line per write:
+  `view: owner POST /rotate <window id> (demo): 200` (method, path, window id, status).
 - **The page.** The line under the header ends in a quiet **Owner** link. It asks for the token once, checks it with
   `GET /owner`, and keeps it in this tab's `sessionStorage` only (never `localStorage`, a cookie or the address
   bar); **Lock** forgets it. Unlocked, the line says "Owner unlocked in this tab: you can enter and close; the
   contract checks every order.", the Windows list and a window's detail offer **Enter** on a tradable window, and
-  Close position comes back. Enter asks first: both legs and their venues, the size per leg, the 1 USD maximum
-  loss, that the NEAR AI risk check is asked and the contract checks every order, and that an entry opens from
-  flat only. A window the contract would refuse (`E_ASSET`, `E_SIZE`, ...), stale numbers, no desk or a NEAR AI
-  refusal keep the button disabled, with the reason shown. The strategy rules are not editable from the page yet;
+  Close position comes back. Rotate stays off (it has no loss cap). Enter asks first: both legs and their venues,
+  the size per leg, the 1 USD maximum loss, that the NEAR AI risk check is asked and the contract checks every
+  order, and that an entry opens from flat only. A window the contract would refuse (`E_ASSET`, `E_SIZE`, ...),
+  stale numbers, no desk, a NEAR AI refusal, a held pair or auto off keep the button disabled, with the reason
+  shown. The strategy rules are not editable from the page yet;
   `PUT /strategy` works for a client that sends the owner header.
 
 ## Protecting the live engine from public traffic
@@ -219,7 +230,8 @@ the public service add `GIMBAL_OWNER_WRITES` = `1` and redeploy (its log says `o
 token goes on the engine's service only, never on the public one. Check: open the domain, click Owner, paste the
 token: the line says "Owner unlocked in this tab". From a shell, `POST /close` with no owner header still answers
 403. To turn it off again, delete either variable. **To rotate the owner token**, set a new value on the live
-engine's service (nothing changes on the public service); a tab unlocked with the old token then has its writes
+engine's service (nothing changes on the public service). The engine reads it at start, so the old token works until
+the redeploy that the change starts is live, then never again; a tab unlocked with the old token then has its writes
 refused ("the owner token was not accepted"): Lock, then unlock with the new one. **To show the replay
 again** set the Custom Start Command back to `node engine/src/cli/replay-host.ts` (docs/deploy-replay.md); the two
 variables above are not read by it (the replay engine gets none of the host's variables).

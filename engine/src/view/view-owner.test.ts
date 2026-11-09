@@ -203,21 +203,27 @@ test('the view token is still required, and the owner token is checked: missing 
   }
 });
 
-test(`${OWNER_FAIL_LIMIT} wrong owner tokens lock every owner request out, the right token included, for the lock time`, async () => {
+test(`${OWNER_FAIL_LIMIT} wrong owner tokens make further wrong tries 429 for the lock time; the right token is always served`, async () => {
   reset();
   const v = await makeView();
   try {
     for (let i = 0; i < OWNER_FAIL_LIMIT; i++) assert.equal((await call(v.base, 'GET', '/owner', { ...auth, [OWNER_HEADER]: `wrong-${i}` })).status, 403);
-    const locked = await call(v.base, 'GET', '/owner', both);
+    const locked = await call(v.base, 'GET', '/owner', { ...auth, [OWNER_HEADER]: 'wrong-again' });
     assert.equal(locked.status, 429);
     assert.ok(Number(locked.headers['retry-after']) > 0);
-    assert.equal((await call(v.base, 'POST', '/close', { ...both, ...jsonType }, '{}')).status, 429);
+    assert.equal((await call(v.base, 'POST', '/close', { ...auth, [OWNER_HEADER]: 'wrong-again', ...jsonType }, '{}')).status, 429);
     assert.equal(loop.close, 0);
-    assert.ok(v.lines.some((l) => /^view: owner requests locked until /.test(l)));
+    assert.ok(v.lines.some((l) => /^view: wrong owner tokens refused until /.test(l)));
+    // Wrong tries from anyone cannot lock the owner out: the right token is served during the lock.
+    assert.equal((await call(v.base, 'GET', '/owner', both)).status, 204);
+    assert.notEqual((await call(v.base, 'POST', '/close', { ...both, ...jsonType }, '{}')).status, 429);
     // Reads are not owner requests: still served.
     assert.equal((await call(v.base, 'GET', '/state', auth)).status, 200);
     v.clock.t += OWNER_LOCK_MS;
-    assert.equal((await call(v.base, 'GET', '/owner', both)).status, 204);
+    assert.equal((await call(v.base, 'GET', '/owner', { ...auth, [OWNER_HEADER]: 'wrong-later' })).status, 403);
+    // Without the view token even a wrong method says nothing about owner writes: 401, not 405.
+    assert.equal((await call(v.base, 'POST', '/owner', { [OWNER_HEADER]: OWNER, ...jsonType }, '{}')).status, 401);
+    assert.equal((await call(v.base, 'GET', '/close', {})).status, 401);
   } finally {
     await v.view.stop();
   }

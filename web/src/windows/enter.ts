@@ -5,7 +5,7 @@
 // (the carry gate, break-even) are waived; it must still be tradable, not refused by the contract, not stale, not
 // refused or held out by the NEAR AI risk check, pass every other check and the policy's markets, be sized within the
 // leg size, free margin and the policy's cap, and its round trip may cost at most `maxLossUsd`. The desk must be flat:
-// a demo entry never closes a held pair. Auto must be on (the engine says so when it is not). Every order is still
+// a demo entry never closes a held pair. Auto must be on: with auto off it is disabled here, and the engine refuses it. Every order is still
 // checked by the contract against the owner's policy before the MPC network signs it.
 import type { Window as FundingWindow } from '@gimbal/shared';
 import { capital } from './format.ts';
@@ -22,10 +22,11 @@ export type EnterState =
   | { kind: 'open' };
 
 /** Whether the owner can ask to enter `w` now, as far as the page can tell (the engine checks again and answers). */
-export function enterState(w: FundingWindow, windows: readonly FundingWindow[]): EnterState {
+export function enterState(w: FundingWindow, windows: readonly FundingWindow[], auto: boolean | null = null): EnterState {
   if (!w.tradable || w.held) return { kind: 'none' };
   const held = heldWindow(windows);
   if (held !== null) return { kind: 'blocked', reason: `${held.symbol} is held. An owner entry opens from flat only: close ${held.symbol} first.` };
+  if (auto === false) return { kind: 'blocked', reason: 'Auto is off in the engine rules, and the engine opens nothing while it is off.' };
   if (isNoDesk(w)) return { kind: 'blocked', reason: 'There is no desk to trade it with.' };
   if (w.refused) return { kind: 'blocked', reason: `The contract would refuse it (${w.refused.code}): ${capital(w.refused.reason)}` };
   if (w.stale) return { kind: 'blocked', reason: 'Its numbers are stale: a venue it needs did not answer.' };

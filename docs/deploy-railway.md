@@ -514,7 +514,7 @@ second.
 | `GIMBAL_VIEW_TOKEN` | The bearer token. Unset = the view is off. At least 32 characters, no whitespace, and not guessable: 16 distinct characters or about 128 bits by the characters' own frequencies, no repeated piece (`abcabc…`) and no run of 6 in sequence (`012345`, `zyxwvu`). It is the only guard against guessing, so make it with `openssl rand -hex 32` or `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`, never by hand. Otherwise the view stays off and says why. |
 | `GIMBAL_VIEW_PORT` | The port it listens on, on `0.0.0.0`. Default: `PORT`, which Railway sets for the service. Must differ from `ENGINE_PORT` (8790). |
 | `GIMBAL_VIEW_ORIGINS` | The dashboard origins allowed to call it from a browser, comma separated, e.g. `https://gimbal.example`: scheme, host and port only, no path, no `*`. A request with any other `Origin` is refused (403). Empty: no browser page can call it; `curl` still can. |
-| `GIMBAL_OWNER_TOKEN` | Optional: turns on owner writes ("Owner writes", below). Unset = off, and the view is exactly as described here. The same rules as `GIMBAL_VIEW_TOKEN` (32+ characters, made with `openssl rand -hex 32`, never by hand), and it must differ from it. A bad value leaves owner writes off; the start line says why, never the value. |
+| `GIMBAL_OWNER_TOKEN` | Optional: turns on owner writes ("Owner writes", below). Unset = off, and the view is exactly as described here. The same rules as `GIMBAL_VIEW_TOKEN` (at least 32 characters and not guessable; make it with `openssl rand -hex 32`, never by hand), and it must differ from it. A bad value leaves owner writes off; the start line says why, never the value. |
 
 Then Settings → Networking → Generate Domain, with the target port set to the view's port. The start line reads
 `view: read-only on :<port> for origins <list>`. The view starts only while the control API is on loopback (the
@@ -594,19 +594,23 @@ view can also take the owner's `POST /rotate`, `POST /close` and `PUT /strategy`
 3. **The public service → Variables:** `GIMBAL_OWNER_WRITES` = `1` (deploy-live-view.md). The public service never
    gets the owner token: the owner pastes it into the page, and the host passes it through.
 
-Each owner request needs the view's bearer token and the owner token in the `x-gimbal-owner` header, both compared in
-constant time. `GET /owner` answers 204 for a right owner token, and writes nothing. A write must be
+Each owner request needs the view's bearer token (checked first, before even the method, so without it nothing says
+whether owner writes are on) and the owner token in the `x-gimbal-owner` header, both compared in constant time.
+`GET /owner` answers 204 for a right owner token, and writes nothing. A write must be
 `content-type: application/json`, a JSON object of at most 4 KiB (`POST /close`: empty or `{}`). At most 6 writes a
-minute (429). Five wrong owner tokens within 15 minutes lock every owner request for 15 minutes (429 with
-`Retry-After`), and the log says so once. The request then goes to the engine's own control routes on loopback, as
-`serve-control.ts` does, so every check there still holds: `POST /rotate` needs `GIMBAL_TRADE=1` and `auto` on,
-`demo.maxLossUsd` is capped at 1 USD, and an entry opens from flat only. One log line per write:
+minute (429). After five wrong owner tokens within 15 minutes, further wrong ones are answered 429 (with
+`Retry-After`) for 15 minutes, and the log says so once; the right token is always served, so nobody can lock the
+owner out, and guessing is held off by the token's size. The request then goes to the engine's own control routes
+on loopback, as `serve-control.ts` does, so every check there still holds: `POST /rotate` needs `GIMBAL_TRADE=1` and
+`auto` on; with `demo` (what the public page sends) `maxLossUsd` is capped at 1 USD and it opens from flat only;
+without `demo` it is an ordinary rotate (it may close the held pair and open another, no loss cap). One log line per write:
 `view: owner POST /rotate <window id> (demo): 200` (method, path, window id, status); never a token or a body.
 With `GIMBAL_OWNER_TOKEN` unset the view is as before: `/owner`, `/rotate` and `/close` are 404 like any path it
 does not serve, and `PUT /strategy` is 405 like any other write.
 
-**Rotate it:** set a new `GIMBAL_OWNER_TOKEN` on the live engine's service and redeploy; the old one stops working
-at once. **Turn it off:** delete the variable. Nothing on the public service needs to change for either.
+**Rotate it:** set a new `GIMBAL_OWNER_TOKEN` on the live engine's service. The engine reads it at start, so the old
+one works until the redeploy that the change starts is live, then never again. **Turn it off:** delete the variable
+(the same redeploy). Nothing on the public service needs to change for either.
 
 ## What the server holds, and what it cannot do
 

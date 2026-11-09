@@ -39,10 +39,11 @@
 // route's handler answers with its own checks and status: GIMBAL_TRADE=1, auto, the strategy loop's checks, the
 // contract's policy on every order. Before that: a JSON body of at most OWNER_MAX_BODY_BYTES (an object; POST /close
 // takes none or `{}`), at most OWNER_WRITE_LIMIT writes in OWNER_WRITE_WINDOW_MS, and after OWNER_FAIL_LIMIT wrong
-// owner tokens in OWNER_FAIL_WINDOW_MS every owner request is refused (429) for OWNER_LOCK_MS, the right token
-// included: the token cannot be guessed by trying. The lock is for the whole listener, not per client: the live host
-// is one client for every visitor, and a lock that holds the owner off too is the safe side (GIMBAL_CONTROL still
-// works). One log line per owner write: method, path, window id and the route's status; never a token or a body.
+// owner tokens in OWNER_FAIL_WINDOW_MS every wrong try is refused (429) for OWNER_LOCK_MS. The right token is always
+// served, so nobody can lock the owner out by sending wrong ones; what stops guessing is the token's size (at least
+// 32 characters with 16 distinct ones or about 128 bits, view-config.ts), and the lock only slows the noise. The lock is for the whole
+// listener, not per client: the live host is one client for every visitor. The view token is checked before anything
+// else, the method included, so without it nothing says whether owner writes are on. One log line per owner write: method, path, window id and the route's status; never a token or a body.
 
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
@@ -94,7 +95,7 @@ export const OWNER_MAX_BODY_BYTES = 4 * 1024;
 /** Owner writes forwarded in OWNER_WRITE_WINDOW_MS at most; more are 429. */
 export const OWNER_WRITE_LIMIT = 6;
 export const OWNER_WRITE_WINDOW_MS = 60_000;
-/** Wrong owner tokens in OWNER_FAIL_WINDOW_MS that lock every owner request out for OWNER_LOCK_MS. */
+/** Wrong owner tokens in OWNER_FAIL_WINDOW_MS that make every further wrong try 429 for OWNER_LOCK_MS. */
 export const OWNER_FAIL_LIMIT = 5;
 export const OWNER_FAIL_WINDOW_MS = 15 * 60_000;
 export const OWNER_LOCK_MS = 15 * 60_000;
@@ -330,25 +331,28 @@ export class ViewServer {
 
   /** GET /owner, POST /rotate, POST /close, PUT /strategy with owner writes on (the top of this file). */
   async #owner(req: IncomingMessage, res: ServerResponse, method: string, path: string): Promise<void> {
+    // The view token first: without it nothing here says whether owner writes are on (not even a 405).
+    if (!this.#bearerOk(req)) return this.#unauthorized(req, res, method, path, false);
     const want = path === '/owner' ? 'GET' : path === '/strategy' ? 'PUT' : 'POST';
     if (method !== want) {
       res.setHeader('allow', path === '/strategy' ? 'GET, PUT' : want);
       return json(res, 405, { ok: false, error: 'method', reason: `${path} takes ${want} only` });
     }
-    if (!this.#bearerOk(req)) return this.#unauthorized(req, res, method, path, false);
     const now = this.#now();
-    if (now < this.#ownerLockedUntil) {
-      this.#logRefused('owner', `view: refused ${method} ${path}: owner requests are locked after wrong owner tokens`);
-      res.setHeader('retry-after', String(Math.ceil((this.#ownerLockedUntil - now) / 1000)));
-      return json(res, 429, { ok: false, error: 'owner locked', reason: `too many wrong owner tokens: owner requests are refused until ${new Date(this.#ownerLockedUntil).toISOString()}` });
-    }
+    // The right owner token is always served, lock or not, so wrong tries from anyone cannot lock the owner out. The
+    // lock answers only wrong tries (429); guessing is held off by the token's own size (view-config.ts).
     if (!this.#ownerOk(req)) {
+      if (now < this.#ownerLockedUntil) {
+        this.#logRefused('owner', `view: refused ${method} ${path}: wrong owner token while owner tries are locked`);
+        res.setHeader('retry-after', String(Math.ceil((this.#ownerLockedUntil - now) / 1000)));
+        return json(res, 429, { ok: false, error: 'owner locked', reason: `too many wrong owner tokens: wrong tries are refused until ${new Date(this.#ownerLockedUntil).toISOString()}` });
+      }
       this.#ownerFails = this.#ownerFails.filter((t) => now - t < OWNER_FAIL_WINDOW_MS);
       this.#ownerFails.push(now);
       if (this.#ownerFails.length >= OWNER_FAIL_LIMIT) {
         this.#ownerLockedUntil = now + OWNER_LOCK_MS;
         this.#ownerFails = [];
-        this.#log(`view: owner requests locked until ${new Date(this.#ownerLockedUntil).toISOString()}: ${OWNER_FAIL_LIMIT} wrong owner tokens in ${OWNER_FAIL_WINDOW_MS / 60_000} min`);
+        this.#log(`view: wrong owner tokens refused until ${new Date(this.#ownerLockedUntil).toISOString()}: ${OWNER_FAIL_LIMIT} wrong owner tokens in ${OWNER_FAIL_WINDOW_MS / 60_000} min`);
       } else {
         this.#logRefused('owner', `view: refused ${method} ${path}: bad or missing owner token`);
       }
