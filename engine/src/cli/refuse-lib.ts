@@ -37,6 +37,7 @@ import type { NearContractClient } from '../contract/near-client.ts';
 import { nearTxRef } from '../contract/near-client.ts';
 import type { DeskView, HlOrder } from '../contract/types.ts';
 import { ContractRefusal, OutcomeUnknown } from '../contract/types.ts';
+import { unpricedEntry } from '../contract/unpriced.ts';
 import { HL_MIN_ORDER_USD, hlPx, hlSz, newCloid } from '../relayer/hl-order.ts';
 import { qtyString, toQty } from '../trade/lots.ts';
 import type { PriceDeps } from './pair-mainnet-lib.ts';
@@ -189,7 +190,7 @@ export function deskRefusal(d: Pick<RefuseDeps, 'desk' | 'symbol'>): string | nu
   if (d.desk.paused) return 'the desk is paused: hl_order would refuse E_PAUSED before the band or the cap';
   if (d.desk.closing === true) return 'the desk is closing (panic_close pauses it): hl_order would refuse E_PAUSED before the band or the cap';
   if (!p.hl_assets.some((a) => a.symbol === d.symbol)) return `${d.symbol} is not in policy.hl_assets (${p.hl_assets.map((a) => a.symbol).join(', ')}): hl_order would refuse E_ASSET`;
-  if (p.unpriced.some((u) => u.symbol === d.symbol)) return `${d.symbol} is in policy.unpriced: it has no price band`;
+  if (unpricedEntry(p, 'hyperliquid', d.symbol) !== undefined) return `${d.symbol} is in policy.unpriced: it has no price band`;
   return null;
 }
 

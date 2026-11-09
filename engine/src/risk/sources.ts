@@ -23,11 +23,19 @@
 // funding booked at every hour boundary it holds a pair through (onFunding). Nothing is signed or sent; every price
 // and funding rate is the recording's.
 
-import type { DeskState, StrategyConfig, VenueId } from '@gimbal/shared';
+import type { ContractPolicy, DeskState, StrategyConfig, VenueId } from '@gimbal/shared';
+import { unpricedEntry } from '../contract/unpriced.ts';
 import { readBy } from '../venues/http-budget.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { AccountState, Clock, Position, VenueReader } from '../venues/venue.ts';
 import type { DeskSnapshot, DeskSource, LegInput } from './engine.ts';
+
+/** What AccountsDeskSourceOptions.desk answers. */
+export interface DeskViewAnswer {
+  reserveUsd: number;
+  paused: DeskState['paused'];
+  policy?: Pick<ContractPolicy, 'unpriced'>;
+}
 
 export interface AccountsDeskSourceOptions {
   deskId: string;
@@ -39,9 +47,11 @@ export interface AccountsDeskSourceOptions {
    * paused. Read again with every snapshot, but off its path: one read at a time, and a snapshot waits for it at most
    * DESK_VIEW_WAIT_MS (a slow NEAR RPC retries for minutes) and goes on with the last answer. A read that throws keeps
    * the last answer and is logged. The snapshot says how old the answer is (deskView), and the risk engine marks NEAR
-   * slow or down and the desk unknown from it.
+   * slow or down and the desk unknown from it. With the desk's policy (get_desk's), a leg on a market the policy lists
+   * in `unpriced` (by the contract's policy symbol for it: an Orderly leg by its base, contract/unpriced.ts) is marked
+   * unpriced; without one, no leg is.
    */
-  desk?: () => Promise<{ reserveUsd: number; paused: DeskState['paused'] }>;
+  desk?: () => Promise<DeskViewAnswer>;
   log?: (line: string) => void;
   /** Lot size per venue and symbol; default 10^-8 (unknown). */
   lotSize?: (venue: VenueId, symbol: string) => number;
@@ -72,7 +82,7 @@ export const ACCOUNT_READ_DEADLINE_MS = 7_000;
 
 export class AccountsDeskSource implements DeskSource {
   readonly #o: AccountsDeskSourceOptions;
-  #desk: { reserveUsd: number; paused: DeskState['paused'] } = { reserveUsd: 0, paused: null };
+  #desk: DeskViewAnswer = { reserveUsd: 0, paused: null };
   #deskAt: number | null = null;
   #deskError: string | null = null;
   #deskRead: { promise: Promise<void>; since: number } | null = null;
@@ -111,6 +121,9 @@ export class AccountsDeskSource implements DeskSource {
     }
     if (!feesThrew) this.#feesError = null;
     await deskRead;
+    // Under the desk view's policy, as the contract checks each leg's orders (the last answer while a read is out).
+    const policy = this.#desk.policy;
+    if (policy !== undefined) for (const l of legs) l.unpriced = unpricedEntry(policy, l.venue, l.symbol) !== undefined;
     const late = this.#deskRead === null ? null : `get_desk has not answered for ${Math.round((now() - this.#deskRead.since) / 1000)} s`;
     return {
       deskId: this.#o.deskId, owner: this.#o.owner, contract: this.#o.contract,

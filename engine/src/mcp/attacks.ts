@@ -15,6 +15,7 @@ import type { NearContractClient, NearNetwork, NearTransport } from '../contract
 import { formatE8, parseE8 } from '../contract/replay-checks.ts';
 import type { DeskView, HlOrder } from '../contract/types.ts';
 import { ContractRefusal, OutcomeUnknown, parseRefusal } from '../contract/types.ts';
+import { unpricedCapUsd, unpricedEntry } from '../contract/unpriced.ts';
 import { ASSETS, stableStringify } from '../rescue/oneclick.ts';
 import { base58 } from '../venues/orderly-signer.ts';
 
@@ -114,9 +115,9 @@ export function hlPx(value: number, szDecimals: number): string {
 /** The first policy asset with no oracle price (an `unpriced` symbol), with its caps. */
 function unpricedAsset(desk: DeskView) {
   for (const a of desk.policy.hl_assets) {
-    const u = desk.policy.unpriced.find((x) => x.symbol === a.symbol);
+    const u = unpricedEntry(desk.policy, 'hyperliquid', a.symbol);
     if (u !== undefined) {
-      const cap = Math.min(desk.policy.max_notional_usd, desk.policy.unpriced_max_notional_usd);
+      const cap = unpricedCapUsd(desk.policy);
       const maxSzE8 = parseE8('max_sz', u.max_sz);
       return { asset: a, maxSz: u.max_sz, maxSzE8, cap, px: hlPx(cap / (Number(maxSzE8) / 1e8), a.sz_decimals) };
     }

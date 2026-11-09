@@ -342,28 +342,47 @@ test('a trading serve still refuses what a refresh cannot fix: a symbol the cont
   assert.equal(big.note, undefined);
 });
 
-test('unpriced is per leg: WIF on Hyperliquid is unpriced, PERP_WIF_USDC on Orderly is not', () => {
+test('an Orderly leg is unpriced by its base, as the contract looks it up (orderly.rs base_of): WIF covers PERP_WIF_USDC', () => {
   const wifHl = leg('hyperliquid', 'WIF', { markPx: 0.5, openInterest: 9e6 });
   const wifOrderly = leg('orderly', 'PERP_WIF_USDC', { base: 'WIF', markPx: 0.5, openInterest: 9e6 });
   const pair = pairOf(wifHl, wifOrderly);
-  // Only the Hyperliquid symbol is in policy.unpriced: the Orderly leg still needs an oracle price, and has none.
-  const half = deskVerdict(pair, verdictCtx());
-  assert.deepEqual(half.refused, { code: 'E_ORACLE_STALE', reason: 'no oracle price for PERP_WIF_USDC on orderly' });
-  assert.deepEqual(half.checks.slice(0, 2), [
+  // WIF is in policy.unpriced: both legs are unpriced, Hyperliquid's WIF and Orderly's PERP_WIF_USDC alike. No oracle.
+  const both = deskVerdict(pair, verdictCtx());
+  assert.equal(both.refused, undefined);
+  assert.deepEqual(both.checks, [
     { ok: true, text: 'WIF on Hyperliquid is unpriced, no price protection: a $1,000 leg is 2000 WIF, within its max_sz 5000' },
+    { ok: true, text: 'PERP_WIF_USDC on Orderly is unpriced, no price protection: a $1,000 leg is 2000 PERP_WIF_USDC, within its max_sz 5000' },
+    { ok: true, text: 'A $1,000 leg (up to $1,010 at the edge of the price band) fits the $2,000 cap' },
+  ]);
+  // An entry under the full Orderly name is not what the contract reads: it looks up WIF, and WIF is priced then.
+  const fullName = deskVerdict(pair, verdictCtx({ policy: { ...POLICY, unpriced: [{ symbol: 'PERP_WIF_USDC', max_sz: '5000' }] } }));
+  assert.deepEqual(fullName.refused, { code: 'E_ORACLE_STALE', reason: 'no oracle price for WIF on hyperliquid' });
+  assert.deepEqual(fullName.checks.slice(0, 2), [
+    { ok: false, text: 'No oracle price for WIF on Hyperliquid: the contract refuses its orders' },
     { ok: false, text: 'No oracle price for PERP_WIF_USDC on Orderly: the contract refuses its orders' },
   ]);
+  // The unpriced notional cap: 500 USD.
+  const capped = deskVerdict(pair, verdictCtx({ policy: { ...POLICY, unpriced_max_notional_usd: 500 } }));
+  assert.deepEqual(capped.refused, { code: 'E_SIZE', reason: 'leg over the $500 cap' });
+  // Over max_sz on the Orderly leg: 2000 WIF against a max_sz of 1500.
+  const over = deskVerdict(pair, verdictCtx({ policy: { ...POLICY, unpriced: [{ symbol: 'WIF', max_sz: '1500' }] } }));
+  assert.deepEqual(over.refused, { code: 'E_SIZE', reason: 'WIF on hyperliquid over max_sz 1500' });
+  assert.equal(over.checks[1]!.text, 'PERP_WIF_USDC on Orderly is unpriced: a $1,000 leg is 2000 PERP_WIF_USDC, over its max_sz 1500');
+});
+
+test('unpriced is per leg, by each venue\'s policy symbol: kPEPE unpriced on Hyperliquid, PERP_1000PEPE_USDC (1000PEPE) priced', () => {
+  const kpepe = leg('hyperliquid', 'kPEPE', { base: 'PEPE', multiplier: 1000, markPx: 0.01, openInterest: 1e9 });
+  const pepe1000 = leg('orderly', 'PERP_1000PEPE_USDC', { base: 'PEPE', multiplier: 1000, markPx: 0.01, openInterest: 1e9 });
+  const pair = pairOf(kpepe, pepe1000);
+  const policy: ContractPolicy = { ...POLICY, unpriced: [{ symbol: 'kPEPE', max_sz: '200000' }] };
+  // Only kPEPE is listed: the Orderly leg's policy symbol is 1000PEPE, priced, and it needs an oracle price.
+  const half = deskVerdict(pair, verdictCtx({ policy }));
+  assert.deepEqual(half.refused, { code: 'E_ORACLE_STALE', reason: 'no oracle price for PERP_1000PEPE_USDC on orderly' });
   // A fresh oracle price for the Orderly leg covers it: one leg unpriced, one priced, both covered.
-  const mixed = deskVerdict(pair, verdictCtx({ oracle: oracleAged(5, (v) => v === 'orderly') }));
+  const mixed = deskVerdict(pair, verdictCtx({ policy, oracle: oracleAged(5, (v) => v === 'orderly') }));
   assert.equal(mixed.refused, undefined);
   // The unpriced cap (2000 USD) applies to the window, since one of its legs is unpriced.
   assert.equal(mixed.checks.at(-1)!.text, 'A $1,000 leg (up to $1,010 at the edge of the price band) fits the $2,000 cap');
-  // Both symbols listed as unpriced: no oracle needed at all.
-  const both = deskVerdict(pair, verdictCtx({ policy: { ...POLICY, unpriced: [{ symbol: 'WIF', max_sz: '5000' }, { symbol: 'PERP_WIF_USDC', max_sz: '5000' }] } }));
-  assert.equal(both.refused, undefined);
-  // The unpriced notional cap: 500 USD.
-  const capped = deskVerdict(pair, verdictCtx({ oracle: FRESH, policy: { ...POLICY, unpriced_max_notional_usd: 500 } }));
-  assert.deepEqual(capped.refused, { code: 'E_SIZE', reason: 'leg over the $500 cap' });
 });
 
 test('max_sz is per leg, in each venue\'s own units: kPEPE on Hyperliquid against PERP_1000PEPE_USDC on Orderly', () => {
@@ -371,8 +390,9 @@ test('max_sz is per leg, in each venue\'s own units: kPEPE on Hyperliquid agains
   const kpepe = leg('hyperliquid', 'kPEPE', { base: 'PEPE', multiplier: 1000, markPx: 0.01, openInterest: 1e9 });
   const pepe1000 = leg('orderly', 'PERP_1000PEPE_USDC', { base: 'PEPE', multiplier: 1000, markPx: 0.01, openInterest: 1e9 });
   const pair = pairOf(kpepe, pepe1000);
+  // Orderly's entry is its base, 1000PEPE (orderly.rs base_of), in units of PERP_1000PEPE_USDC's quantity.
   const policy = (hl: string, orderly: string): ContractPolicy => ({
-    ...POLICY, unpriced: [{ symbol: 'kPEPE', max_sz: hl }, { symbol: 'PERP_1000PEPE_USDC', max_sz: orderly }],
+    ...POLICY, unpriced: [{ symbol: 'kPEPE', max_sz: hl }, { symbol: '1000PEPE', max_sz: orderly }],
   });
   assert.equal(deskVerdict(pair, verdictCtx({ policy: policy('200000', '200000') })).refused, undefined);
   // Orderly's own max_sz is the tighter one: that leg is refused, the Hyperliquid leg passes.
@@ -384,6 +404,82 @@ test('max_sz is per leg, in each venue\'s own units: kPEPE on Hyperliquid agains
   ]);
   // And the other way round.
   assert.deepEqual(deskVerdict(pair, verdictCtx({ policy: policy('50000', '200000') })).refused, { code: 'E_SIZE', reason: 'kPEPE on hyperliquid over max_sz 50000' });
+});
+
+/** The carry desk's policy on mainnet as it was when every Orderly unpriced window was refused E_ORACLE_STALE. */
+const LIVE_UNPRICED: ContractPolicy = {
+  hl_assets: [
+    { index: 1, symbol: 'ETH', sz_decimals: 4 }, { index: 5, symbol: 'SOL', sz_decimals: 2 },
+    { index: 191, symbol: 'ZRO', sz_decimals: 1 }, { index: 192, symbol: 'ETHFI', sz_decimals: 1 }, { index: 193, symbol: 'AAVE', sz_decimals: 2 },
+  ],
+  phoenix_markets: [{ symbol: 'SOL', orderbook: 'test-orderbook-sol', base_lot_e8: 1_000_000, tick_e8: 1_000_000 }],
+  orderly_symbols: ['PERP_ETH_USDC', 'PERP_SOL_USDC', 'PERP_ZRO_USDC', 'PERP_ETHFI_USDC', 'PERP_AAVE_USDC'],
+  max_notional_usd: 20, price_band_bps: 100, oracle_max_age_s: 900, rescue_cap_usd_per_hour: 50,
+  unpriced: [{ symbol: 'ZRO', max_sz: '8.2' }, { symbol: 'ETHFI', max_sz: '25.2' }, { symbol: 'AAVE', max_sz: '0.11' }],
+  unpriced_max_notional_usd: 20, max_transfer_cost_bps: 300, max_transfer_cost_flat_e6: 1_000_000,
+};
+const LIVE_LEG = { ...DEFAULT_STRATEGY, legUsd: 12 };
+
+test('regression (mainnet): ZRO, ETHFI and AAVE unpriced pass on Orderly without an oracle price, within max_sz', () => {
+  // Marks where a 12 USD leg fits each max_sz: 12 / 0.6 = 20 ETHFI (25.2), 12 / 1.6 = 7.5 ZRO (8.2), 12 / 120 = 0.1 AAVE (0.11).
+  for (const [base, mark, size, maxSz] of [['ETHFI', 0.6, '20', '25.2'], ['ZRO', 1.6, '7.5', '8.2'], ['AAVE', 120, '0.1', '0.11']] as const) {
+    const hl = leg('hyperliquid', base, { markPx: mark, openInterest: 1e9 });
+    const ol = leg('orderly', `PERP_${base}_USDC`, { base, markPx: mark, openInterest: 1e9 });
+    for (const pair of [pairOf(hl, ol), pairOf(ol, hl)]) {
+      // No oracle source at all: the contract needs none for an unpriced symbol, and neither does the verdict.
+      const v = deskVerdict(pair, verdictCtx({ policy: LIVE_UNPRICED, strategy: LIVE_LEG }));
+      assert.equal(v.refused, undefined, `${base}: ${JSON.stringify(v)}`);
+      assert.ok(v.checks.some((c) => c.ok && c.text === `PERP_${base}_USDC on Orderly is unpriced, no price protection: a $12.00 leg is ${size} PERP_${base}_USDC, within its max_sz ${maxSz}`), JSON.stringify(v.checks));
+      assert.ok(!v.checks.some((c) => /oracle/i.test(c.text)), 'no oracle check for an unpriced leg');
+    }
+  }
+});
+
+test('regression (mainnet): an Orderly unpriced leg over its max_sz is E_SIZE, never E_ORACLE_STALE', () => {
+  // ETHFI at 0.45: a 12 USD leg is 26.6667 ETHFI, over max_sz 25.2.
+  const hl = leg('hyperliquid', 'ETHFI', { markPx: 0.5, openInterest: 1e9 });
+  const ol = leg('orderly', 'PERP_ETHFI_USDC', { base: 'ETHFI', markPx: 0.45, openInterest: 1e9 });
+  const v = deskVerdict(pairOf(ol, hl), verdictCtx({ policy: LIVE_UNPRICED, strategy: LIVE_LEG }));
+  assert.deepEqual(v.refused, { code: 'E_SIZE', reason: 'PERP_ETHFI_USDC on orderly over max_sz 25.2' });
+  assert.deepEqual(v.checks[0], { ok: false, text: 'PERP_ETHFI_USDC on Orderly is unpriced: a $12.00 leg is 26.6667 PERP_ETHFI_USDC, over its max_sz 25.2' });
+  // The Hyperliquid leg at 0.5 is 24 ETHFI, within it.
+  assert.equal(v.checks[1]!.ok, true);
+});
+
+test('regression (mainnet): a priced symbol on Orderly still needs the oracle price, keyed as before', () => {
+  const hl = leg('hyperliquid', 'ETH', { markPx: 3000, openInterest: 1e9 });
+  const ol = leg('orderly', 'PERP_ETH_USDC', { base: 'ETH', markPx: 3000, openInterest: 1e9 });
+  const none = deskVerdict(pairOf(ol, hl), verdictCtx({ policy: LIVE_UNPRICED, strategy: LIVE_LEG }));
+  assert.deepEqual(none.refused, { code: 'E_ORACLE_STALE', reason: 'no oracle price for PERP_ETH_USDC on orderly' });
+  // The oracle is asked by the leg's own venue symbol (contract/prices.ts falls back to its base).
+  const asked: string[] = [];
+  const oracle: OracleSource = { price: (venue, symbol) => { asked.push(`${venue} ${symbol}`); return { px: 3000, at: T0 - 5000 }; } };
+  assert.equal(deskVerdict(pairOf(ol, hl), verdictCtx({ policy: LIVE_UNPRICED, strategy: LIVE_LEG, oracle })).refused, undefined);
+  assert.deepEqual(asked, ['orderly PERP_ETH_USDC', 'hyperliquid ETH']);
+});
+
+test('unpriced on Phoenix and Hyperliquid: MON listed passes without an oracle, sized in MON against max_sz', () => {
+  const policy: ContractPolicy = {
+    ...LIVE_UNPRICED,
+    hl_assets: [...LIVE_UNPRICED.hl_assets, { index: 194, symbol: 'MON', sz_decimals: 0 }],
+    phoenix_markets: [...LIVE_UNPRICED.phoenix_markets, { symbol: 'MON', orderbook: 'test-orderbook-mon', base_lot_e8: 100_000_000, tick_e8: 1 }],
+    orderly_symbols: [...LIVE_UNPRICED.orderly_symbols, 'PERP_MON_USDC'],
+    unpriced: [...LIVE_UNPRICED.unpriced, { symbol: 'MON', max_sz: '500' }],
+  };
+  // 12 USD at 0.03 is 400 MON on every venue.
+  const px = leg('phoenix', 'MON', { markPx: 0.03, openInterest: 1e9 });
+  const hl = leg('hyperliquid', 'MON', { markPx: 0.03, openInterest: 1e9 });
+  const ol = leg('orderly', 'PERP_MON_USDC', { base: 'MON', markPx: 0.03, openInterest: 1e9 });
+  for (const [a, b] of [[px, hl], [px, ol], [hl, ol]] as const) {
+    const v = deskVerdict(pairOf(a, b), verdictCtx({ policy, strategy: LIVE_LEG }));
+    assert.equal(v.refused, undefined, `${a.venue} / ${b.venue}: ${JSON.stringify(v)}`);
+    assert.equal(v.checks.filter((c) => c.ok && /is unpriced, no price protection: a \$12\.00 leg is 400 /.test(c.text)).length, 2);
+  }
+  const tight = { ...policy, unpriced: [{ symbol: 'MON', max_sz: '399' }] };
+  assert.deepEqual(deskVerdict(pairOf(px, hl), verdictCtx({ policy: tight, strategy: LIVE_LEG })).refused, { code: 'E_SIZE', reason: 'MON on phoenix over max_sz 399' });
+  // Without MON in unpriced, MON is priced: every leg needs an oracle price.
+  const priced = { ...policy, unpriced: LIVE_UNPRICED.unpriced };
+  assert.deepEqual(deskVerdict(pairOf(px, hl), verdictCtx({ policy: priced, strategy: LIVE_LEG })).refused, { code: 'E_ORACLE_STALE', reason: 'no oracle price for MON on phoenix' });
 });
 
 test('E_SIZE counts the price band: a 4990 USD leg is up to 5039.90 USD inside a 100 bps band, over a 5000 USD cap', () => {

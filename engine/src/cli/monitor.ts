@@ -66,7 +66,7 @@ async function main(): Promise<number> {
     source: new AccountsDeskSource({
       deskId: cfg.deskId, owner: desk.owner, contract: cfg.contractId,
       accounts: [{ reader: hl, address: desk.evm_address }, { reader: phoenix, address: desk.solana.authority }],
-      desk: async () => ({ reserveUsd: Number(desk.ledger.idle_usdc) / 1e6, paused: desk.paused ? { by: 'unknown', at: Date.now() } : null }),
+      desk: async () => ({ reserveUsd: Number(desk.ledger.idle_usdc) / 1e6, paused: desk.paused ? { by: 'unknown', at: Date.now() } : null, policy: desk.policy }),
     }),
   });
   try {

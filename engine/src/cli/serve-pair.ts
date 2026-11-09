@@ -61,6 +61,7 @@ import { NearContractClient } from '../contract/near-client.ts';
 import { NearApiTransport } from '../contract/near-transport.ts';
 import { oraclePriced } from '../contract/oracle-assets.ts';
 import type { DeskView } from '../contract/types.ts';
+import { anyLegPriced, legCaps, unpricedBySymbol, unpricedEntry } from '../contract/unpriced.ts';
 import { HyperliquidSubmitter } from '../relayer/hyperliquid.ts';
 import type { SolanaChain } from '../relayer/phoenix-money.ts';
 import { solanaChain } from '../relayer/phoenix-money.ts';
@@ -131,7 +132,7 @@ export interface SlotLegs {
   hl: PairHlLeg | null;
   /** Phoenix's leg when it is one, else null. */
   phoenix: TradeLeg | null;
-  /** The symbol has a stored price (not in policy.unpriced). */
+  /** A leg is priced (not in policy.unpriced by its venue's policy symbol): the stored price must be fresh. */
   priced: boolean;
 }
 
@@ -926,11 +927,10 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
       spec: (market) => {
         const base = orderlyBaseSymbol(market);
         if (base === null) return null;
-        const unpriced = policy.unpriced.find((u) => u.symbol === base);
+        const unpriced = unpricedEntry(policy, 'orderly', market);
         return {
           symbol: market, oraclePx: unpriced !== undefined ? async () => null : oraclePxOf(prices, base, () => !stopped),
-          maxNotionalUsd: unpriced === undefined ? policy.max_notional_usd : Math.min(policy.max_notional_usd, policy.unpriced_max_notional_usd),
-          ...(unpriced === undefined ? {} : { maxSz: unpriced.max_sz }), slippageBps: SERVE_SLIPPAGE_BPS,
+          ...legCaps(policy, 'orderly', market), slippageBps: SERVE_SLIPPAGE_BPS,
         };
       },
       begin: async () => {
@@ -1274,7 +1274,8 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           const sym = request.symbol;
           const out = rotateOutRefused();
           if (out !== null) return result(false, out);
-          if (policy.unpriced.some((u) => u.symbol === sym)) return result(true, `${sym} is unpriced: no stored price to refresh`);
+          // The pair symbol is every leg's policy symbol (Hyperliquid's and Phoenix's name, Orderly's base).
+          if (unpricedBySymbol(policy, sym) !== undefined) return result(true, `${sym} is unpriced: no stored price to refresh`);
           const marginS = SERVE_MAKER.timeoutMs / 1000 + PRICE_MARGIN_S;
           const sp = await prices.read(sym);
           if (sp !== null && sp.ageS <= prices.maxAgeS - marginS) return result(true, `the stored ${sym} price is ${Math.round(sp.ageS)} s old: it lives the open's ${marginS} s`);
@@ -1789,7 +1790,7 @@ export interface LiveLegsInput {
 export interface LiveLegs {
   hl: HlLeg;
   phoenix: PhoenixLeg;
-  /** The symbol has a stored price (not in policy.unpriced). */
+  /** A leg is priced (not in policy.unpriced by its venue's policy symbol): the stored price must be fresh. */
   priced: boolean;
   /** The Phoenix exchange and the policy market against the pinned accounts (status ignored: closes are reduce-only). */
   mismatches: string[];
@@ -1826,9 +1827,13 @@ export async function buildLiveShapeLegs(input: LiveLegsInput, shape: PairShape,
     const listed = shapeRefusal(p, symbol, shape, true);
     if (listed !== null) throw new Error(listed);
   }
-  const unpriced = p.unpriced.find((u) => u.symbol === symbol);
-  const maxNotionalUsd = unpriced === undefined ? p.max_notional_usd : Math.min(p.max_notional_usd, p.unpriced_max_notional_usd);
-  const oraclePx = unpriced !== undefined ? async () => null : oraclePxOf(input.prices, symbol, input.trading);
+  // Each leg capped as the contract checks it, by its own venue's policy symbol (contract/unpriced.ts: an Orderly
+  // PERP_<symbol>_USDC leg by its base): an unpriced leg gets the unpriced cap and its max_sz, and no stored price.
+  const storedPx = oraclePxOf(input.prices, symbol, input.trading);
+  const capsOf = (venue: VenueId, venueSymbol: string) => ({
+    oraclePx: unpricedEntry(p, venue, venueSymbol) !== undefined ? async () => null : storedPx,
+    ...legCaps(p, venue, venueSymbol),
+  });
   const relayer = input.relayer ?? refusingRelayer();
   const best = (book: { bids: { px: number }[]; asks: { px: number }[] }, side: LegSide, venue: string): number => {
     const px = side === 'BUY' ? book.asks[0]?.px : book.bids[0]?.px;
@@ -1837,8 +1842,8 @@ export async function buildLiveShapeLegs(input: LiveLegsInput, shape: PairShape,
   };
   const has = (v: VenueId) => shape.legs.some((l) => l.venue === v);
   const hl = !has('hyperliquid') ? null : new HlLeg({
-    relayer, info: (body) => hlInfo(input.hlUrl, body), user: desk.evm_address.toLowerCase(), coin: symbol, asset: asset!.index, szDecimals: asset!.sz_decimals, oraclePx,
-    bandBps: p.price_band_bps, maxNotionalUsd, ...(unpriced === undefined ? {} : { maxSz: unpriced.max_sz }),
+    relayer, info: (body) => hlInfo(input.hlUrl, body), user: desk.evm_address.toLowerCase(), coin: symbol, asset: asset!.index, szDecimals: asset!.sz_decimals,
+    bandBps: p.price_band_bps, ...capsOf('hyperliquid', symbol),
     bestPx: async (side) => best(await input.hl.book(symbol, 5), side, 'Hyperliquid'),
     slippageBps: input.slippageBps, maker: input.maker,
   });
@@ -1852,7 +1857,7 @@ export async function buildLiveShapeLegs(input: LiveLegsInput, shape: PairShape,
       api: phoenixTraderApi(input.phoenixUrl, input.phoenixFetch, 0, input.phoenixBudget),
       desk: sol,
       market: { symbol, orderbook: market!.orderbook, spline, baseLotE8: market!.base_lot_e8, tickE8: market!.tick_e8 },
-      oraclePx, bandBps: p.price_band_bps, maxNotionalUsd, ...(unpriced === undefined ? {} : { maxSz: unpriced.max_sz }),
+      bandBps: p.price_band_bps, ...capsOf('phoenix', symbol),
       bestPx: async (side) => best(await input.phoenix.book(symbol, 5), side, 'Phoenix'),
       slippageBps: input.slippageBps, microLamports: input.microLamports,
     });
@@ -1873,13 +1878,13 @@ export async function buildLiveShapeLegs(input: LiveLegsInput, shape: PairShape,
     if (orderly === null) throw new Error(`an Orderly leg (${ol.symbol}) needs serve's Orderly session, and serve has none`);
     const notReady = (await orderly.ready?.(ol.symbol)) ?? null;
     if (notReady !== null) throw new Error(`the Orderly leg (${ol.symbol}) cannot be made: ${notReady}`);
-    orderlyLeg = orderly.leg({ symbol: ol.symbol, oraclePx, maxNotionalUsd, ...(unpriced === undefined ? {} : { maxSz: unpriced.max_sz }), slippageBps: input.slippageBps });
+    orderlyLeg = orderly.leg({ symbol: ol.symbol, ...capsOf('orderly', ol.symbol), slippageBps: input.slippageBps });
     if (orderlyLeg === null) throw new Error(`the Orderly leg (${ol.symbol}) cannot be made: serve's Orderly session is not up`);
     if (orderlyLeg.venue !== 'orderly') throw new Error(`the Orderly session made a ${orderlyLeg.venue} leg for ${ol.symbol}`);
   }
   const byVenue = (v: VenueId): TradeLeg => (v === 'hyperliquid' ? hl! : v === 'phoenix' ? phoenix! : orderlyLeg!);
   const legs: [TradeLeg, TradeLeg] = [byVenue(shape.legs[0].venue), byVenue(shape.legs[1].venue)];
-  return { shape, legs, hl, phoenix, priced: unpriced === undefined, mismatches };
+  return { shape, legs, hl, phoenix, priced: anyLegPriced(p, shape.legs), mismatches };
 }
 
 /** The relayer of a pair that does not trade: anything that would sign is refused (a bug if reached: legs refuse first). */
