@@ -914,6 +914,10 @@ export interface StrategyDecision {
   windowId: string | null;        // the window entered, rotated into or waited for
   heldId: string | null;          // the window the desk holds, if any
   at: number;                     // ms
+  // The act the loop is carrying out now ("enter mon-phoenix-hyperliquid", "POST /rotate <id> (owner demo entry, at
+  // most $1.00)", "POST /close"), or null when none runs: POST /rotate and POST /close are refused (409) meanwhile.
+  // Published again when it starts and ends. Absent: an engine from before it.
+  acting?: string | null;
 }
 
 export type StreamEvent =

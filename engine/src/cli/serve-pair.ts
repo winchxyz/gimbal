@@ -24,7 +24,10 @@
 //
 // The strategy loop's hands (`hands`, strategy/loop.ts): open and close run pair-mainnet's own code (pair-ops.ts:
 // planOpen's refusals, then maker first through the pair's ProtectedPair; planClose, then a maker-first close,
-// reduce-only), one at a time. An open on another symbol than the pair held (flat) builds that symbol's pair the way
+// reduce-only), one at a time. An owner demo entry's open (the loop's POST /rotate with demo) alone adds a taker
+// fallback (SERVE_DEMO_TAKER_FALLBACK): after the maker window, what the post-only part did not fill goes as an IOC on
+// the maker leg within the band, the caps, SERVE_SLIPPAGE_BPS past the touch and the same of the mark, and its partner
+// hedges what filled; the loop's own entries and a plain rotate stay maker only. An open on another symbol than the pair held (flat) builds that symbol's pair the way
 // the start does (the legs, the Phoenix market check, resting orders, two agreeing reads, startPlan on the same state
 // file) and only then replaces the flat one; a new pair that would not trade is dropped and the open refused. From
 // then on the new pair is held and protected exactly as an adopted one: the reducer, panic_close, the ADL watch (which
@@ -73,7 +76,8 @@ import type { Reducer } from '../rescue/rescuer.ts';
 import type { AdlState } from '../risk/adl.ts';
 import { ADL_ATTEMPTS, AdlWatch, newAdlState } from '../risk/adl.ts';
 import { MAINNET_COSTS, ORDERLY_BROKERS, hlFillFeeBps } from '../scanner/config.ts';
-import type { LegSide, MakerSettings, TradeLeg } from '../trade/legs.ts';
+import type { LegSide, MakerSettings, TakerFallback, TradeLeg } from '../trade/legs.ts';
+import { DEMO_TAKER_FALLBACK_BPS } from '../scanner/carry.ts';
 import { DEFAULT_MAKER, HlLeg } from '../trade/legs.ts';
 import { signedQtyString } from '../trade/lots.ts';
 import type { PairResult } from '../trade/pair.ts';
@@ -107,6 +111,16 @@ import { ConfigError, START_RETRY_MAX_MS, startBackoffMs } from './start-errors.
 export const SERVE_SLIPPAGE_BPS = 50;
 /** serve's maker settings: pair-mainnet's defaults (--reprice-s 30, --maker-timeout-s 120, --max-orders 6, no taker fallback). */
 export const SERVE_MAKER: MakerSettings = { ...DEFAULT_MAKER, timeoutMs: 120_000 };
+/**
+ * An owner demo entry's taker fallback (the only open serve sends one for): the IOC after the maker window is held
+ * within SERVE_SLIPPAGE_BPS of Hyperliquid's mark as well as of the touch, the band and the caps. The same 50 bps every
+ * serve IOC may go past the touch, measured from the mark too: for an unpriced symbol (no stored price, so no band) it
+ * is what keeps a thin book whose touch ran away from the mark from pulling the fill past it, and it is the margin the
+ * demo's cost bound adds (carry-plan.ts takerFallbackUsd), so the worst fill stays inside what the owner accepted.
+ */
+export const SERVE_DEMO_TAKER_FALLBACK: TakerFallback = { markBps: DEMO_TAKER_FALLBACK_BPS };
+/** What the demo's cost bound adds per USD of leg: the farther of the two limits past the touch and the mark. */
+const DEMO_FALLBACK_COST_BPS = Math.max(SERVE_SLIPPAGE_BPS, DEMO_TAKER_FALLBACK_BPS);
 /**
  * The strategy loop's open, for what StrategyConfig does not set: the hold and the basis buffer the scanner's gate
  * prices a desk window on (MAINNET_COSTS), so a window shown as enterable is judged on the same numbers here.
@@ -1357,8 +1371,10 @@ export async function servePair(input: ServePairInput): Promise<ServePair> {
           const opened = r.results.filter((x) => x.status === 'open');
           const last = r.results.at(-1);
           const ok = opened.length > 0 && heldSymbol() !== null;
+          // The taker fallback (an owner demo entry's open) says what it did on an open too; a failed open's notes say it.
+          const fallback = r.results.flatMap((x) => x.notes.filter((n) => n.startsWith('taker fallback')));
           const reason = ok
-            ? `${sym} opened: ${opened.map((x) => x.size).join(' + ')} a leg${last !== undefined && last.status !== 'open' ? ` (the last part ended ${last.status})` : ''}`
+            ? `${sym} opened: ${opened.map((x) => x.size).join(' + ')} a leg${last !== undefined && last.status !== 'open' ? ` (the last part ended ${last.status})` : ''}${fallback.length > 0 ? `; ${fallback.join('; ')}` : ''}`
             : `${sym} not opened: ${last === undefined ? 'no part was sent' : `${last.status}${last.notes.length > 0 ? ` (${last.notes.join('; ')})` : ''}`}`;
           // Orders went out when a part sent any (a part the gate stopped before its first order sent none).
           const sent = r.results.some((x) => x.legs.some((l) => l.orders.length > 0)) || heldSymbol() !== null;
@@ -1551,24 +1567,32 @@ export function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string
     hedge: (side, size, reduceOnly, reason, targetNet) => p.pair.hedge(iocIndex, side, size, reduceOnly, reason, opening, targetNet),
     stopOnFinish: false,
   });
-  const pairFor = (ctx: OpsCtx, opening: boolean) => pairOf(ctx, {
+  // `demo`: an owner demo entry's open, the only one with a taker fallback.
+  const pairFor = (ctx: OpsCtx, opening: boolean, demo = false) => pairOf(ctx, {
     symbol: p.symbol, shape: full.shape, legs: full.legs, trader: p.trader, run: runner(opening), maker: SERVE_MAKER, microLamports: ORDER_PRIORITY_MICROLAMPORTS, priced: p.legs.priced, closing: !opening,
+    ...(demo && opening ? { takerFallback: SERVE_DEMO_TAKER_FALLBACK } : {}),
   });
   return {
     open: async (request, out) => {
       const ctx = await ctxFor(out);
-      const pair = await pairFor(ctx, true);
+      const pair = await pairFor(ctx, true, request.demo !== undefined);
       p.planning(true);
       let plan: Awaited<ReturnType<typeof planOpen>>;
       try {
         plan = await planOpen(ctx, pair, {
           symbol: p.symbol, legUsd: request.legUsd, leverage: request.leverage, holdDays: SERVE_HOLD_DAYS, basisBps: SERVE_BASIS_BPS,
-          ...(request.qty === undefined ? {} : { qty: request.qty }), ...(request.demo === undefined ? {} : { demo: request.demo }),
+          ...(request.qty === undefined ? {} : { qty: request.qty }),
+          ...(request.demo === undefined ? {} : { demo: { maxLossUsd: request.demo.maxLossUsd, takerFallbackBps: DEMO_FALLBACK_COST_BPS } }),
         });
       } finally {
         p.planning(false);
       }
       if (plan.carry.waived !== null) out.say(`demo      owner demo entry: waived, the ${plan.carry.waived}`);
+      if (request.demo !== undefined) {
+        const rt = plan.carry.roundTripUsd;
+        out.say(`demo      owner demo entry: taker fallback after the ${SERVE_MAKER.timeoutMs / 1000} s maker window, within ${SERVE_SLIPPAGE_BPS} bps of the touch and ${SERVE_DEMO_TAKER_FALLBACK.markBps} bps of the mark; `
+          + `round trip ${Number.isFinite(rt) ? `$${rt.toFixed(4)}` : 'not priced'} (every fill at the taker fee) + $${plan.carry.takerFallbackUsd.toFixed(4)} for the fallback's slippage, at most $${request.demo.maxLossUsd.toFixed(4)} accepted`);
+      }
       // Every refusal that needs no fresh price first: the plan's (the closing desk among them), a maker timeout the
       // price cannot outlive (buildPair's), the gate, and the loop's daily cap on refreshes. Only then refresh_prices.
       const refusals = [...plan.refusals];

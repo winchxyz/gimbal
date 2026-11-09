@@ -158,10 +158,17 @@ test('replay: scan -> decide -> act (fake executor) -> journal and decision even
     const entries = events.filter((e) => e.type === 'journal').map((e) => e.data as JournalEntry);
     // off on its transition and hold on its change of category are `wait` entries whose numbers.action says which.
     assert.deepEqual(entries.map((j) => (j.kind === 'wait' ? `wait ${String(j.numbers.action)}` : j.kind)), ['wait off', 'enter', 'wait hold', 'exit']);
-    const shown = events.filter((e) => e.type === 'decision').map((e) => e.data as StrategyDecision);
+    const all = events.filter((e) => e.type === 'decision').map((e) => e.data as StrategyDecision);
+    // Published again when an act starts and ends (acting); the decisions themselves are the ones that changed.
+    const shown = all.filter((d, i) => i === 0 || d.action !== all[i - 1]!.action || d.reason !== all[i - 1]!.reason);
     // The enter is published twice: as decided, then with the risk check's why line once it answered.
     assert.deepEqual(shown.map((d) => d.action), ['off', 'enter', 'enter', 'hold']);
     assert.match(shown[2]!.reason, /; NEAR AI risk check passed \(TEE not attested: no attestation fetched in this run\): no red flag named$/);
+    // What the loop was carrying out, as the page saw it: the enter, then the manual close, and nothing once done.
+    const acting = all.map((d) => d.acting ?? null).filter((a, i, list) => i === 0 || a !== list[i - 1]);
+    assert.ok(acting.some((a) => a !== null && /^enter /.test(a)), JSON.stringify(acting));
+    assert.ok(acting.includes('POST /close'), JSON.stringify(acting));
+    assert.equal(acting.at(-1), null);
     assert.match(enter.summary, /; NEAR AI risk check passed \(TEE not attested: no attestation fetched in this run\): no red flag named; /);
     assert.equal(strategyLoop.held, null);
   } finally {

@@ -26,10 +26,19 @@ interface Rest {
   statusDown?: boolean;          // every orderStatus read of it throws
 }
 
-function venue(rests: Rest[], book = { bid: 2499, ask: 2500 }, ioc: string | null = null, maker: Partial<MakerSettings> = {}) {
+/**
+ * `px.oracle`: the stored price (null: an unpriced asset, no band); `px.mark`: Hyperliquid's mark in metaAndAssetCtxs
+ * (null: the coin is not listed there, so no mark is read); `px.markDown`: that read throws.
+ */
+function venue(
+  rests: Rest[], book = { bid: 2499, ask: 2500 }, ioc: string | null = null, maker: Partial<MakerSettings> = {},
+  px: { oracle?: number | null; mark?: number | null; markDown?: boolean } = {},
+) {
   let now = 1_000_000;
   let oid = 100;
   const orders: HlOrder[] = [];
+  const reasons: string[] = [];
+  const infos: string[] = [];
   const cancels: number[] = [];
   const status = new Map<number, { sz: string; origSz: string; status: string; limitPx: string; full: boolean; fill: string; errors: number; down: boolean }>();
   const fills: HlFill[] = [];
@@ -38,8 +47,9 @@ function venue(rests: Rest[], book = { bid: 2499, ask: 2500 }, ioc: string | nul
   });
   const leg = new HlLeg({
     relayer: {
-      hlOrder: async (order) => {
+      hlOrder: async (order, reason) => {
         orders.push(order);
+        reasons.push(reason);
         if (order.tif === 'Ioc') {
           if (ioc === null) throw new NothingExecuted('hyperliquid', 'Order could not immediately match', [NEAR_TX]);
           const o = ++oid;
@@ -65,6 +75,12 @@ function venue(rests: Rest[], book = { bid: 2499, ask: 2500 }, ioc: string | nul
       },
     },
     info: async (body) => {
+      infos.push(String(body.type));
+      if (body.type === 'metaAndAssetCtxs') {
+        if (px.markDown === true) throw new Error('hyperliquid /info: HTTP 503');
+        const mark = px.mark === undefined ? 2499.5 : px.mark;
+        return [{ universe: [{ name: 'BTC' }, ...(mark === null ? [] : [{ name: 'ETH' }])] }, [{ markPx: '100000' }, ...(mark === null ? [] : [{ markPx: String(mark) }])]];
+      }
       if (body.type === 'orderStatus') {
         const st = status.get(Number(body.oid));
         if (st === undefined) return { status: 'unknownOid' };
@@ -83,7 +99,7 @@ function venue(rests: Rest[], book = { bid: 2499, ask: 2500 }, ioc: string | nul
       if (body.type === 'userFills') return fills;
       return { assetPositions: [] };
     },
-    user: '0xABC', coin: 'ETH', asset: 1, szDecimals: 4, oraclePx: async () => 2500, bandBps: 100, maxNotionalUsd: 50,
+    user: '0xABC', coin: 'ETH', asset: 1, szDecimals: 4, oraclePx: async () => (px.oracle === undefined ? 2500 : px.oracle), bandBps: 100, maxNotionalUsd: 50,
     bestPx: async (side) => (side === 'BUY' ? book.ask : book.bid),
     maker: { repriceMs: 5_000, timeoutMs: 10_000, takerFallback: true, pollMs: 1_000, ...maker },
     clock: { now: () => now },
@@ -91,7 +107,7 @@ function venue(rests: Rest[], book = { bid: 2499, ask: 2500 }, ioc: string | nul
       now += ms;
     },
   });
-  return { leg, orders, cancels };
+  return { leg, orders, cancels, reasons, infos };
 }
 
 test('a post-only buy rests at the best bid and fills: one part, the maker fee (a rebate) from userFills', async () => {
@@ -202,4 +218,82 @@ test('the reprice floor holds across the maker orders of one operation, and ends
   e2();
   const c = await v.leg.makerOrder('BUY', toQty('0.005'), false, 'another open');
   assert.equal(c.parts![0]!.ref.sentAt, c.ref.sentAt, 'no operation: no floor carried over, placed at once');
+});
+
+// ---- an owner demo entry's taker fallback (makerOrder's options.takerFallback) ----
+
+const FALLBACK = { takerFallback: { markBps: 50 } };
+
+test('owner entry: after the maker window the rest goes as a taker fallback IOC, its ref and reason say so', async () => {
+  // The leg's own settings have no fallback (serve's): only the call's option adds it. 0.004 fills post-only, 0.006 by IOC.
+  const v = venue([{ fills: '0.004' }, { fills: '0' }], undefined, '0.006', { takerFallback: false });
+  const out = await v.leg.makerOrder('BUY', toQty('0.01'), false, 'open', FALLBACK);
+  assert.ok(out.kind === 'filled');
+  assert.equal(out.filled, toQty('0.01'));
+  assert.deepEqual(v.orders.map((o) => [o.tif, o.sz]), [['Alo', '0.01'], ['Alo', '0.006'], ['Ioc', '0.006']]);
+  assert.deepEqual(out.parts!.map((p) => p.ref.takerFallback === true), [false, false, true]);
+  assert.equal(v.reasons.at(-1), 'open (taker fallback)');
+  assert.ok(v.infos.includes('metaAndAssetCtxs'), 'the mark was read for it');
+});
+
+test('owner entry: without the option (the loop\'s own entries, a plain rotate) no IOC follows the maker window', async () => {
+  const v = venue([{ fills: '0.004' }, { fills: '0' }], undefined, '0.006', { takerFallback: false });
+  const out = await v.leg.makerOrder('BUY', toQty('0.01'), false, 'open');
+  assert.ok(out.kind === 'filled');
+  assert.equal(out.filled, toQty('0.004'), 'what the post-only part filled, nothing more');
+  assert.deepEqual(v.orders.map((o) => o.tif), ['Alo', 'Alo']);
+  assert.ok(!v.infos.includes('metaAndAssetCtxs'), 'no mark read');
+});
+
+test('owner entry, unpriced symbol (no band): the fallback\'s limit is held within 50 bps of the mark as well as the touch', async () => {
+  // Ask 2500, mark 2499.5: the touch's 50 bps would allow 2512.5; the mark's 50 bps hold it to 2511.99 (2511.9 on the tick).
+  const unpriced = venue([{ fills: '0' }, { fills: '0' }], undefined, '0.01', { takerFallback: false }, { oracle: null, mark: 2499.5 });
+  const out = await unpriced.leg.makerOrder('BUY', toQty('0.01'), false, 'open', FALLBACK);
+  assert.ok(out.kind === 'filled');
+  const ioc = unpriced.orders.at(-1)!;
+  assert.equal(ioc.tif, 'Ioc');
+  assert.equal(ioc.px, '2511.9');
+  assert.ok(Number(ioc.px) <= 2499.5 * 1.005 && Number(ioc.px) >= 2500);
+  // The same without the mark bound (pair-mainnet's --taker-fallback): the touch's 50 bps alone.
+  const plain = venue([{ fills: '0' }, { fills: '0' }], undefined, '0.01', { takerFallback: true }, { oracle: null });
+  await plain.leg.makerOrder('BUY', toQty('0.01'), false, 'open');
+  assert.equal(plain.orders.at(-1)!.px, '2512.5');
+  // A sell: held to the mark's 50 bps below it.
+  const sell = venue([{ fills: '0' }, { fills: '0' }], { bid: 2499, ask: 2500 }, '0.01', { takerFallback: false }, { oracle: null, mark: 2499.5 });
+  await sell.leg.makerOrder('SELL', toQty('0.01'), false, 'open', FALLBACK);
+  assert.ok(Number(sell.orders.at(-1)!.px) >= 2499.5 * 0.995 && Number(sell.orders.at(-1)!.px) <= 2499);
+});
+
+test('owner entry: a touch more than 50 bps from the mark, or a mark that cannot be read, signs no fallback: nothing sent', async () => {
+  // The book's ask ran 4 % above the mark (a thin unpriced book): an IOC held within 50 bps of the mark would not fill.
+  const thin = venue([{ fills: '0' }, { fills: '0' }], undefined, '0.01', { takerFallback: false }, { oracle: null, mark: 2400 });
+  const out = await thin.leg.makerOrder('BUY', toQty('0.01'), false, 'open', FALLBACK);
+  assert.ok(out.kind === 'failed');
+  assert.deepEqual(thin.orders.map((o) => o.tif), ['Alo', 'Alo'], 'no IOC signed');
+  assert.match(out.error.message, /the best ask 2500 is more than 50 bps from the mark 2400/);
+  assert.equal(out.parts!.at(-1)!.ref.takerFallback, true);
+
+  for (const px of [{ oracle: null, markDown: true }, { oracle: null, mark: null }]) {
+    const blind = venue([{ fills: '0' }, { fills: '0' }], undefined, '0.01', { takerFallback: false }, px);
+    const b = await blind.leg.makerOrder('BUY', toQty('0.01'), false, 'open', FALLBACK);
+    assert.ok(b.kind === 'failed');
+    assert.deepEqual(blind.orders.map((o) => o.tif), ['Alo', 'Alo'], JSON.stringify(px));
+    assert.match(b.error.message, /the mark price cannot be read, so the taker fallback's limit cannot be held within 50 bps of it: nothing sent/);
+  }
+});
+
+test('owner entry, priced symbol: the fallback stays inside the contract\'s band and the cap as every IOC does', async () => {
+  // Stored price 2450, band 100 bps (95 % used): the edge 2473.27 is under the book (bid 2499, ask 2500), so neither the
+  // post-only order nor the fallback is signed.
+  const out = venue([{ fills: '0' }, { fills: '0' }], undefined, '0.01', { takerFallback: false }, { oracle: 2450 });
+  const r = await out.leg.makerOrder('BUY', toQty('0.01'), false, 'open', FALLBACK);
+  assert.ok(r.kind === 'failed');
+  assert.deepEqual(out.orders, []);
+  assert.match(r.error.message, /outside the contract's band/);
+  assert.equal(r.parts!.at(-1)!.ref.takerFallback, true, 'the fallback was tried and refused before signing');
+  // Over the policy's 50 USD cap: refused before signing.
+  const big = venue([{ fills: '0' }, { fills: '0' }], undefined, '0.03', { takerFallback: false });
+  const b = await big.leg.makerOrder('BUY', toQty('0.03'), false, 'open', FALLBACK);
+  assert.ok(b.kind === 'failed');
+  assert.ok(!big.orders.some((o) => o.tif === 'Ioc'));
 });

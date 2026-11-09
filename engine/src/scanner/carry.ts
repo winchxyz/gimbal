@@ -101,6 +101,18 @@ export const DEAD_BAND_APR_PCT = 0.5;
  * (parseDemo) and again by the trader's carry plan.
  */
 export const DEMO_MAX_LOSS_USD = 1;
+/**
+ * An owner demo entry's open ends with a taker fallback (serve-pair.ts SERVE_DEMO_TAKER_FALLBACK): an IOC on the maker
+ * leg for what the post-only part did not fill, its limit at most this many bps past the touch and past the venue's
+ * mark. Its fee is already in the round trip (every fill is priced at the taker fee); legUsd × this is added to the
+ * round trip before it is held to maxLossUsd, by the strategy loop and again by the trader's carry plan.
+ */
+export const DEMO_TAKER_FALLBACK_BPS = 50;
+
+/** The most an owner demo entry's taker fallback may fill past the walked book, USD, on a leg of legUsd. */
+export function demoTakerFallbackUsd(legUsd: number): number {
+  return (legUsd * DEMO_TAKER_FALLBACK_BPS) / 10_000;
+}
 
 /**
  * The multi-day figure from the 7- and 14-day means; `fortnightPending` while a leg's older read is still due.

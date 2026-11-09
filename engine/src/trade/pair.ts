@@ -44,7 +44,7 @@
 import type { TxRef, VenueId } from '@gimbal/shared';
 import type { Clock } from '../venues/venue.ts';
 import { systemClock } from '../venues/venue.ts';
-import type { LegOutcome, LegRef, LegSide, TradeLeg } from './legs.ts';
+import type { LegOutcome, LegRef, LegSide, MakerOrderOptions, TakerFallback, TradeLeg } from './legs.ts';
 import { HL_EXPIRY_MARGIN_MS, HL_NONCE_WINDOW_MS, LegCheckError, ORDERLY_REPLAY_MS, wasSigned } from './legs.ts';
 import { abs, commonLot, floorToLot, qtyString, signedQtyString, toQty } from './lots.ts';
 import { outsideOpen } from './open-scope.ts';
@@ -101,9 +101,14 @@ export interface PairResult {
   feeUnknown: number;
 }
 
-/** Maker first: leg `index` goes first as a maker order (TradeLeg.makerOrder), its partner after it as an IOC. */
+/**
+ * Maker first: leg `index` goes first as a maker order (TradeLeg.makerOrder), its partner after it as an IOC.
+ * `takerFallback` (an open only; a close ignores it): after the maker window, what the post-only part did not fill is
+ * sent as an IOC on the maker leg (TradeLeg.makerOrder's options), and the partner hedges what the two filled.
+ */
 export interface MakerFirst {
   index: 0 | 1;
+  takerFallback?: TakerFallback;
 }
 
 /** PairTrader.close's request (see there). */
@@ -629,7 +634,7 @@ export class PairTrader {
     if (request.maker === undefined) {
       await Promise.all(runs.map((r) => this.#move(r, r.target, false, request.reason, 'open')));
     } else {
-      const hedge = await this.#makerFirstOpen(runs, request.maker.index, size, request.reason, notes);
+      const hedge = await this.#makerFirstOpen(runs, request.maker.index, size, request.reason, notes, request.maker.takerFallback);
       if (hedge === null) return this.#halt(runs, notes, size, net, request.reason);
       opened = hedge;
     }
@@ -696,13 +701,19 @@ export class PairTrader {
    * reduce-only first. Both targets are set to the hedge, so the legging guard after it works on the real size.
    * Returns the hedge size (0: nothing to hedge), or null when the maker leg stopped on an unsettled order or a lost
    * position (the caller halts). On an unsettled order, what its filled parts are known to have filled is hedged
-   * first (#hedgeKnownFill), and that hedge is kept; otherwise the partner has not moved.
+   * first (#hedgeKnownFill), and that hedge is kept; otherwise the partner has not moved. `takerFallback`: the maker
+   * leg's IOC after its window for what the post-only part left (one note says what it did).
    */
-  async #makerFirstOpen(runs: [LegRun, LegRun], index: 0 | 1, size: bigint, reason: string, notes: string[]): Promise<bigint | null> {
+  async #makerFirstOpen(runs: [LegRun, LegRun], index: 0 | 1, size: bigint, reason: string, notes: string[], takerFallback?: TakerFallback): Promise<bigint | null> {
     const first = runs[index];
     const second = runs[index === 0 ? 1 : 0];
     if (first.leg.makerOrder === undefined) throw new Error(`${first.leg.venue} has no maker order`);
-    await this.#makerMove(first, first.target, false, `${reason} (maker)`, 'open');
+    const before = first.report.orders.length;
+    await this.#makerMove(first, first.target, false, `${reason} (maker)`, 'open', takerFallback === undefined ? {} : { takerFallback });
+    for (const o of first.report.orders.slice(before)) {
+      if (o.ref.takerFallback !== true) continue;
+      notes.push(`taker fallback: ${first.leg.venue} ${o.ref.side} IOC ${o.ref.size} after the maker window ${o.outcome === 'filled' ? `filled ${o.filled}${o.avgPx === null ? '' : ` at ${o.avgPx}`}` : `${o.outcome}: ${o.error ?? 'no fill'}`}`);
+    }
     if (this.#stopped([first], notes)) {
       await this.#hedgeKnownFill(first, second, false, reason, notes);
       return null;
@@ -1001,7 +1012,7 @@ export class PairTrader {
    * #move with maker orders (TradeLeg.makerOrder): split under the cap for a reduce-only move as #move splits. A maker
    * order is several orders, so the leg's position after it is read from the venue (the fill sum if that read fails).
    */
-  async #makerMove(r: LegRun, target: bigint, reduceOnly: boolean, reason: string, purpose: LegOrderRecord['purpose']): Promise<void> {
+  async #makerMove(r: LegRun, target: bigint, reduceOnly: boolean, reason: string, purpose: LegOrderRecord['purpose'], options: MakerOrderOptions = {}): Promise<void> {
     const leg = r.leg;
     for (let n = 0; n < MAX_MOVE_ORDERS; n++) {
       if (r.pos === null || r.unsettled !== null) return;
@@ -1012,9 +1023,10 @@ export class PairTrader {
       const side: LegSide = delta > 0n ? 'BUY' : 'SELL';
       const want = abs(delta);
       const size = reduceOnly ? await this.#chunk(leg, side, want) : want;
-      const out = await leg.makerOrder!(side, size, reduceOnly, reason);
+      const out = await leg.makerOrder!(side, size, reduceOnly, reason, options);
       r.report.orders.push(...records(out, purpose));
-      this.#log(`${leg.venue} ${purpose} maker ${side} ${qtyString(size)}${reduceOnly ? ' reduce-only' : ''}: ${describe(out)}`);
+      const fallback = (out.parts ?? []).find((p) => p.ref.takerFallback === true);
+      this.#log(`${leg.venue} ${purpose} maker ${side} ${qtyString(size)}${reduceOnly ? ' reduce-only' : ''}: ${describe(out)}${fallback === undefined ? '' : `; taker fallback IOC ${fallback.ref.size}: ${describe(fallback)}`}`);
       this.#arm(leg, out);
       if (out.kind === 'filled') {
         const read = await this.#read(leg, undefined, 'after a maker order');

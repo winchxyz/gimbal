@@ -63,6 +63,22 @@ export interface LegRef {
   settledAt?: number;
   /** The signed Hyperliquid action's expiresAfter (ms), when it had one and the answer showed it. */
   expiresAfter?: number;
+  /** The IOC a maker order sent after its window for what the post-only part did not fill (the taker fallback). */
+  takerFallback?: true;
+}
+
+/**
+ * One maker order's taker fallback, asked for by its caller (an owner demo entry's open, serve-pair.ts): after the
+ * maker window, an IOC for what the post-only part did not fill, its limit held within `markBps` of the venue's mark
+ * as well as by the band, the caps and the slippage every IOC has. The mark must be read, else nothing is sent.
+ */
+export interface TakerFallback {
+  markBps: number;
+}
+
+/** What one makerOrder call may add to the leg's MakerSettings. */
+export interface MakerOrderOptions {
+  takerFallback?: TakerFallback;
 }
 
 export interface TradeLeg {
@@ -81,10 +97,11 @@ export interface TradeLeg {
   /** One IOC. Never throws: every error is classified into the outcome. */
   order(side: LegSide, size: bigint, reduceOnly: boolean, reason: string): Promise<LegOutcome>;
   /**
-   * Maker first (optional): post-only limits at the touch, repriced, then an IOC for what is left after the timeout.
-   * The outcome sums every part; never throws.
+   * Maker first (optional): post-only limits at the touch, repriced, then an IOC for what is left after the timeout
+   * when the leg's MakerSettings.takerFallback or `options.takerFallback` asks for one. The outcome sums every part;
+   * never throws.
    */
-  makerOrder?(side: LegSide, size: bigint, reduceOnly: boolean, reason: string): Promise<LegOutcome>;
+  makerOrder?(side: LegSide, size: bigint, reduceOnly: boolean, reason: string, options?: MakerOrderOptions): Promise<LegOutcome>;
   /**
    * Starts one pair operation (an open with all its parts, or a close): until the returned function ends it, the leg's
    * maker orders share one budget of maxOrders post-only orders and one reprice floor (repriceMs between placements).
@@ -174,6 +191,11 @@ export interface HlLegOptions {
   /** Best ask for a buy, best bid for a sell. */
   bestPx: (side: LegSide) => Promise<number>;
   slippageBps?: number;
+  /**
+   * The venue's mark price now (a taker fallback's limit is held within TakerFallback.markBps of it). Default: read
+   * from `info` (metaAndAssetCtxs, the coin's markPx); null or a throw: not known, and no fallback is sent.
+   */
+  markPx?: () => Promise<number | null>;
   /** How makerOrder works the book (default DEFAULT_MAKER). */
   maker?: MakerSettings;
   clock?: Clock;
@@ -230,10 +252,15 @@ export class HlLeg implements TradeLeg {
   }
 
   async order(side: LegSide, size: bigint, reduceOnly: boolean, reason: string): Promise<LegOutcome> {
+    return this.#ioc(side, size, reduceOnly, reason, null);
+  }
+
+  /** One IOC; `markBps`: its limit also held within that many bps of the mark (a taker fallback), refused unread. */
+  async #ioc(side: LegSide, size: bigint, reduceOnly: boolean, reason: string, markBps: number | null): Promise<LegOutcome> {
     const ref: LegRef = { venue: this.venue, side, size: qtyString(size), reduceOnly, orderId: null, clientId: null, tx: [], sentAt: this.#clock.now() };
     let order: HlOrder;
     try {
-      order = (await this.#plan(side, size, reduceOnly)).order;
+      order = (await this.#plan(side, size, reduceOnly, markBps)).order;
     } catch (err) {
       return classify(err instanceof LegCheckError ? err : new LegCheckError(errorText(err)), ref, null);
     }
@@ -258,15 +285,17 @@ export class HlLeg implements TradeLeg {
   /**
    * Maker first: a post-only (Alo) limit at the touch (best bid for a buy, best ask for a sell), read every pollMs,
    * cancelled and placed again at the new touch every repriceMs, until the size filled or timeoutMs passed; then an
-   * IOC for the rest when takerFallback is on. An Alo that would cross is refused by Hyperliquid (nothing ran) and is
+   * IOC for the rest when takerFallback is on (the leg's MakerSettings, or `options.takerFallback`, whose IOC limit is
+   * also held within markBps of the mark; that IOC's ref says takerFallback). An Alo that would cross is refused by Hyperliquid (nothing ran) and is
    * placed again repriceMs after it. Each resting order's fill is read from orderStatus (origSz − sz) once it is no longer open,
    * its price and fee from userFills. A post-only order whose state cannot be settled (no answer and no expiry, still
    * open after two cancels, or a status read that keeps failing) stops the whole order as unknown with no expiry: it
    * may still fill, and it is kept for cancelPending. At most maxOrders post-only orders are signed (per pair
    * operation once beginMakerOperation was called), each at least repriceMs after the one before. Never throws.
    */
-  async makerOrder(side: LegSide, size: bigint, reduceOnly: boolean, reason: string): Promise<LegOutcome> {
+  async makerOrder(side: LegSide, size: bigint, reduceOnly: boolean, reason: string, options: MakerOrderOptions = {}): Promise<LegOutcome> {
     const s = { ...DEFAULT_MAKER, ...this.#o.maker };
+    const fallback = options.takerFallback;
     const sleep = this.#o.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
     const poll = s.pollMs ?? 1_000;
     const maxOrders = s.maxOrders ?? 6;
@@ -397,10 +426,13 @@ export class HlLeg implements TradeLeg {
       }
 
       spent = filled < size && !budget();
-      if (filled < size && s.takerFallback) {
-        const out = await this.order(side, size - filled, reduceOnly, `${reason} (taker fallback)`);
+      if (filled < size && (s.takerFallback || fallback !== undefined)) {
+        const out = await this.#ioc(side, size - filled, reduceOnly, `${reason} (taker fallback)`, fallback?.markBps ?? null);
+        out.ref.takerFallback = true;
         total(out);
         if (out.kind === 'unknown') return summary(out, out);
+        // Nothing filled at all: the fallback's own refusal or miss is the reason, not the spent post-only budget.
+        spent = false;
       }
       return summary(parts.at(-1), null);
     } catch (err) {
@@ -577,20 +609,39 @@ export class HlLeg implements TradeLeg {
     return signed === undefined ? null : signed + HL_EXPIRY_MARGIN_MS;
   }
 
-  async #plan(side: LegSide, size: bigint, reduceOnly: boolean): Promise<{ order: HlOrder; px: number }> {
+  /** `markBps` (a taker fallback): the limit also held within that many bps of the mark, which must be read. */
+  async #plan(side: LegSide, size: bigint, reduceOnly: boolean, markBps: number | null = null): Promise<{ order: HlOrder; px: number }> {
     if (size <= 0n || !isWholeLots(size, this.lot)) throw new LegCheckError(`hyperliquid ${this.symbol}: ${signedQtyString(size)} is not a positive multiple of the lot ${qtyString(this.lot)}`);
-    const [bookPx, oraclePx] = await Promise.all([this.#o.bestPx(side), this.#o.oraclePx()]);
+    const [bookPx, oraclePx, markPx] = await Promise.all([
+      this.#o.bestPx(side), this.#o.oraclePx(), markBps === null ? Promise.resolve(null) : this.#markPx().catch(() => null),
+    ]);
+    if (markBps !== null && (markPx === null || !(markPx > 0) || !Number.isFinite(markPx))) {
+      throw new LegCheckError(`hyperliquid ${this.symbol}: the mark price cannot be read, so the taker fallback's limit cannot be held within ${markBps} bps of it: nothing sent`);
+    }
     try {
       const plan = planIoc({
         asset: this.#o.asset, szDecimals: this.#o.szDecimals, side: side === 'BUY' ? 'buy' : 'sell', oraclePx, bandBps: this.#o.bandBps,
         bookPx, maxNotionalUsd: this.#o.maxNotionalUsd, sz: qtyString(size), reduceOnly,
         ...(this.#o.maxSz === undefined ? {} : { maxSz: this.#o.maxSz }),
         ...(this.#o.slippageBps === undefined ? {} : { slippageBps: this.#o.slippageBps }),
+        ...(markBps === null || markPx === null ? {} : { mark: { px: markPx, bps: markBps } }),
       });
       return { order: plan.order, px: plan.px };
     } catch (err) {
       throw new LegCheckError(`hyperliquid ${this.symbol}: ${errorText(err)}`);
     }
+  }
+
+  /** The coin's mark: the option's, else metaAndAssetCtxs (a builder-deployed "dex:COIN" asks that dex). Null: none. */
+  async #markPx(): Promise<number | null> {
+    if (this.#o.markPx !== undefined) return this.#o.markPx();
+    const colon = this.symbol.indexOf(':');
+    const r = await this.#o.info({ type: 'metaAndAssetCtxs', ...(colon > 0 ? { dex: this.symbol.slice(0, colon) } : {}) });
+    if (!Array.isArray(r) || r.length < 2) return null;
+    const [meta, ctxs] = r as [{ universe?: { name?: unknown }[] }, { markPx?: unknown }[]];
+    const i = meta?.universe?.findIndex((u) => u?.name === this.symbol) ?? -1;
+    const px = i >= 0 && Array.isArray(ctxs) ? Number(ctxs[i]?.markPx) : NaN;
+    return px > 0 && Number.isFinite(px) ? px : null;
   }
 }
 

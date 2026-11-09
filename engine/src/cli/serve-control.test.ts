@@ -452,7 +452,8 @@ async function realLoop(t: { after(fn: () => void): void }, scan: { windows: Fun
   const dir = tempDir(t);
   const nothing = { ok: false, reason: 'not in this test', sent: false, tx: [], feeUsd: 0, open: [] };
   const loop = new StrategyLoop({
-    trade: true, strategy: () => ({ ...DEFAULT_STRATEGY, auto: true }), policy: () => ({ max_notional_usd: 5000 }) as never, windows: () => scan.windows,
+    // A 20 USD leg, as on mainnet: a demo entry's taker fallback (50 bps of it) is held to maxLossUsd with the round trip.
+    trade: true, strategy: () => ({ ...DEFAULT_STRATEGY, auto: true, legUsd: 20 }), policy: () => ({ max_notional_usd: 5000 }) as never, windows: () => scan.windows,
     hands: { blocked: () => null, held: () => null, symbolOf: (w) => ({ symbol: w.symbol }), open: async () => nothing, close: async () => nothing },
     freeMargin: async () => ({ hyperliquid: 900, phoenix: 800 }), liveRescue: () => ({ hyperliquid: true, phoenix: false }), busy: () => null,
     store: new LoopStore(loopStateFile(dir, 'testnet', 'gimbal-test.testnet', 'desk-1')), publish: () => {}, clock: { now: () => T0 }, log: () => {},

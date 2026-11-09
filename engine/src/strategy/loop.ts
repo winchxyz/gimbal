@@ -54,9 +54,12 @@
 // the position) stay safety checks. It must still be tradable, not refused, not stale, not refused or held out by the
 // NEAR AI risk check, pass every other check, the policy's markets and the direction rule (symbolOf), and be sized
 // (sizeFor); the desk must be flat. Its round-trip cost estimate is bounded: maxLossUsd above 0 and at most
-// DEMO_MAX_LOSS_USD, and the window's round trip in USD (the one its checks print, WindowFacts.roundTripUsd) at most
-// maxLossUsd, else refused with the number; funding during the hold is expected positive and is not part of the bound;
-// the trader's open holds its own round trip to it again (carry-plan.ts). The risk check is asked as for any manual act, told it is a
+// DEMO_MAX_LOSS_USD, and the window's round trip in USD (the one its checks print, WindowFacts.roundTripUsd) plus its
+// taker fallback's slippage (demoTakerFallbackUsd at strategy.legUsd: the open ends with an IOC on the maker leg for what
+// the post-only part did not fill, serve-pair.ts; its fee is in the round trip already) at most maxLossUsd, else
+// refused with the numbers; funding during the hold is expected positive and is not part of the bound;
+// the trader's open holds its own round trip to it again (carry-plan.ts). The loop's own entries and a plain POST
+// /rotate get no taker fallback. The risk check is asked as for any manual act, told it is a
 // demonstration entry with the profit checks waived and the cost accepted; it is never waived: a refusal refuses it and
 // no readable answer holds it, as any entry. A held demo pair is decided on as any held
 // pair: under the demo rules (a 1000 % minimum, exit after 24 checks) its counted exit comes on the 24th hourly check
@@ -70,7 +73,7 @@ import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, un
 import { dirname, join } from 'node:path';
 import type { ContractPolicy, JournalEntry, Mode, StrategyConfig, StrategyDecision, StreamEvent, TxRef, Window as FundingWindow } from '@gimbal/shared';
 import { isEnterable, isEnterableButForProfit, isProfitCheck } from '../scanner/price.ts';
-import { DEMO_MAX_LOSS_USD, money } from '../scanner/carry.ts';
+import { DEMO_MAX_LOSS_USD, DEMO_TAKER_FALLBACK_BPS, demoTakerFallbackUsd, money } from '../scanner/carry.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import type { Clock } from '../venues/venue.ts';
 import type { CheckRules, DecideInput, Decision, HeldPair, LoopCounters } from './decide.ts';
@@ -135,6 +138,8 @@ export function parseDemo(v: unknown): DemoEntry | { refused: string } {
 interface DemoCost {
   maxLossUsd: number;
   roundTripUsd: number;
+  /** The taker fallback's slippage past the book counted with it (scanner/carry.ts demoTakerFallbackUsd). */
+  takerFallbackUsd: number;
 }
 
 /** A refusal before the risk check was asked says so. */
@@ -725,6 +730,7 @@ export class StrategyLoop {
     const notDone = `POST /rotate ${windowId} not carried out: ${demo === undefined ? '' : `(owner demo entry, at most ${money(demo.maxLossUsd)}) `}`;
     const refusedNumbers = { window: windowId, by: 'POST /rotate (manual)', ...(demo === undefined ? {} : { demo: 1, maxLossUsd: demo.maxLossUsd }) };
     this.#manual = what;
+    this.#actingChanged();
     void this.#serial(async () => {
       this.#acting = this.#manual;
       try {
@@ -751,6 +757,7 @@ export class StrategyLoop {
       } finally {
         this.#acting = null;
         this.#manual = null;
+        this.#actingChanged();
       }
     });
     return { ok: true };
@@ -798,6 +805,7 @@ export class StrategyLoop {
     if (gate !== null) return { ok: false, reason: gate };
     if (this.#o.hands.held() === null) return { ok: false, reason: 'no pair is held: nothing to close' };
     this.#closing = true;
+    this.#actingChanged();
     this.#cancelPending('a close came first');
     void this.#serial(async () => {
       this.#acting = 'POST /close';
@@ -816,6 +824,7 @@ export class StrategyLoop {
       } finally {
         this.#acting = null;
         this.#closing = false;
+        this.#actingChanged();
       }
     });
     return { ok: true };
@@ -878,7 +887,7 @@ export class StrategyLoop {
     if (this.#stopped) return 'serve is stopping';
     if (!this.#o.trade) return 'GIMBAL_TRADE is not 1: this engine trades nothing';
     if (this.#o.hands === null) return `no pair trader here: ${this.#o.handsWhy ?? 'nothing can be opened or closed'}`;
-    const acting = this.#manual ?? (this.#closing ? 'POST /close' : null) ?? this.#acting;
+    const acting = this.#actingNow();
     if (acting !== null) return `the strategy loop is acting (${acting}): try again when it is done`;
     return this.#gate();
   }
@@ -918,8 +927,15 @@ export class StrategyLoop {
       if (rt === undefined || !Number.isFinite(rt) || rt < 0) {
         return { reason: `${windowId}: its round trip in USD is not known, so a demo entry cannot be held to its ${money(demo.maxLossUsd)} maxLossUsd` };
       }
-      if (rt > demo.maxLossUsd) return { reason: `${windowId}: its round trip, ${money(rt)}, is over the ${money(demo.maxLossUsd)} the demo entry accepts (maxLossUsd)` };
-      cost = { maxLossUsd: demo.maxLossUsd, roundTripUsd: rt };
+      // The entry ends with a taker fallback: its fee is in the round trip already, its slippage past the book is not.
+      // On the most a leg can be: the rules' leg size, held to the policy's cap as sizeFor holds it.
+      const cap = this.#o.policy()?.max_notional_usd;
+      const legMax = Math.min(this.#o.strategy().legUsd, cap !== undefined && cap > 0 ? cap : Infinity);
+      const fallback = demoTakerFallbackUsd(legMax);
+      if (rt + fallback > demo.maxLossUsd) {
+        return { reason: `${windowId}: its round trip, ${money(rt)}, plus ${money(fallback)} for the taker fallback's ${DEMO_TAKER_FALLBACK_BPS} bps past the touch, is over the ${money(demo.maxLossUsd)} the demo entry accepts (maxLossUsd)` };
+      }
+      cost = { maxLossUsd: demo.maxLossUsd, roundTripUsd: rt, takerFallbackUsd: fallback };
     }
     const policy = this.#o.policy();
     const size = sizeFor(w, {
@@ -1140,6 +1156,7 @@ export class StrategyLoop {
     const waiting = this.#refused.get(key);
     if (waiting !== undefined && now < waiting.until) return SKIPPED;
     this.#acting = key;
+    this.#actingChanged();
     try {
       let r: ActEnd;
       if (act.kind === 'exit') {
@@ -1185,6 +1202,7 @@ export class StrategyLoop {
       return r;
     } finally {
       this.#acting = null;
+      this.#actingChanged();
     }
   }
 
@@ -1734,11 +1752,24 @@ export class StrategyLoop {
     return d.decision;
   }
 
+  /** Every decision published carries the act running now (StrategyDecision.acting); only a new decision is logged. */
   #publishDecision(d: StrategyDecision): void {
-    if (sameDecision(this.#decision, d)) return;
-    this.#decision = d;
-    this.#log(`decision  ${d.action}: ${d.reason}`);
-    this.#o.publish({ type: 'decision', data: d });
+    const acting = this.#actingNow();
+    const same = sameDecision(this.#decision, d);
+    if (same && (this.#decision?.acting ?? null) === acting) return;
+    this.#decision = { ...d, acting };
+    if (!same) this.#log(`decision  ${d.action}: ${d.reason}`);
+    this.#o.publish({ type: 'decision', data: this.#decision });
+  }
+
+  /** What the loop is carrying out now: a manual rotate or close accepted, else an act of its own; null: nothing. */
+  #actingNow(): string | null {
+    return this.#manual ?? (this.#closing ? 'POST /close' : null) ?? this.#acting;
+  }
+
+  /** The decision published again when the act running changed (one starts or ends), so the page can tell. */
+  #actingChanged(): void {
+    if (this.#decision !== null) this.#publishDecision(this.#decision);
   }
 
   #refuse(key: string, line: string, now: number): void {
@@ -1803,7 +1834,7 @@ function round4(v: number): number {
 
 /** How a demo entry's journal lines name it: the profit checks waived, the round trip estimated and the most accepted. */
 function demoText(d: DemoCost): string {
-  return `owner demo entry: the profit checks are waived; round trip ${money(d.roundTripUsd)} estimated, at most ${money(d.maxLossUsd)} accepted`;
+  return `owner demo entry: the profit checks are waived; round trip ${money(d.roundTripUsd)} estimated (+ ${money(d.takerFallbackUsd)} for a taker fallback after the maker window), at most ${money(d.maxLossUsd)} accepted`;
 }
 
 /** A wait as a journal line says it: "5 s", "2 min 40 s", "10 min". */

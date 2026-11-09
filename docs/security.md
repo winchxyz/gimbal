@@ -205,7 +205,11 @@ journal says it would wait live.
 With owner writes on (`GIMBAL_OWNER_TOKEN` on the engine, `GIMBAL_OWNER_WRITES=1` on the public host;
 docs/deploy-railway.md, "Owner writes"), the owner token is a hot credential: anyone holding it, together with the
 public site, can do what the owner's dashboard does through `POST /rotate`, `POST /close` and `PUT /strategy`. The
-page itself only sends demo entries (from flat, refused above 1 USD of round-trip cost) and closes, but the token
+page itself only sends demo entries (from flat, refused above 1 USD of round-trip cost) and closes. A demo entry
+posts maker orders first and, after the maker window, falls back to a taker order (an IOC for what is left, its limit
+within 50 bps of the touch, the price band and 50 bps of the mark, so an unpriced symbol is bounded too), within the
+same caps and checked by the contract like any order; the 1 USD check counts that taker fee and slippage. The loop's
+own entries and a plain rotate stay maker-only. The token
 also takes a plain `POST /rotate` (it may close the held pair and open another, with no loss cap) and a
 `PUT /strategy` that turns auto on or loosens the thresholds and leg size within the engine's own limits (the
 leverage cap holds). It moves no money out and reaches no owner method of the contract. Every order still goes

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { sendManual } from '../windows/useEngine.ts';
 import type { ManualAction, Outcome } from '../windows/manual.ts';
 
@@ -20,11 +20,14 @@ export interface ManualSend {
 /**
  * Ask, confirm, send, and keep the answer for the control that sent it: `POST /rotate` and `POST /close` through
  * `sendManual`, which never throws. One instance per control, so a Desk Close and a list row's Rotate do not share a state.
+ * `onOutcome` hears every answer once, as it comes (the owner entry starts waiting for its Journal line on a 200).
  */
-export function useManualSend(action: ManualAction | null): ManualSend {
+export function useManualSend(action: ManualAction | null, onOutcome?: (outcome: Outcome) => void): ManualSend {
   const [asking, setAsking] = useState(false);
   const [sending, setSending] = useState(false);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
+  const heard = useRef(onOutcome);
+  heard.current = onOutcome;
 
   useEffect(() => {
     if (outcome === null) return;
@@ -44,6 +47,7 @@ export function useManualSend(action: ManualAction | null): ManualSend {
     void sendManual(action).then((result) => {
       setSending(false);
       setOutcome(result);
+      heard.current?.(result);
     });
   }, [action, sending]);
 

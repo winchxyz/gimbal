@@ -3,6 +3,7 @@
 // events. Pure, so every wording is tested; useEngine.ts does the sending.
 import type { ActionResult, EngineApi } from '../stream/api.ts';
 import { orderlyRotateReason } from '../ui/waitCopy.ts';
+import { actingText } from './enter.ts';
 import { capital, sentence } from './format.ts';
 
 /**
@@ -16,11 +17,24 @@ export type ManualAction =
   | { kind: 'enter'; symbol: string; windowId: string; maxLossUsd: number };
 
 export interface Outcome {
-  /** `sent`: the engine took it. `refused`: it said no, and nothing changed. `unknown`: no answer, so nobody can say. */
-  tone: 'sent' | 'refused' | 'unknown';
+  /**
+   * `sent`: the engine took it. `refused`: it said no, and nothing changed. `running`: it said no because the loop is
+   * still acting (an entry sent before, for one), so nothing new was taken but something is under way. `unknown`: no
+   * answer, so nobody can say.
+   */
+  tone: 'sent' | 'refused' | 'running' | 'unknown';
   /** The word in front of the text on the notice line. */
   title: string;
   text: string;
+}
+
+/**
+ * What the loop is doing, from the engine's 409 while it acts (loop.ts #manualRefusal: `the strategy loop is acting
+ * (<what>): try again when it is done`); null for any other reason.
+ */
+export function actingOf(reason: string): string | null {
+  const m = /^the strategy loop is acting \((.+)\): try again when it is done$/.exec(reason.trim());
+  return m === null ? null : m[1]!;
 }
 
 /** The engine's reason as a sentence: "the strategy engine is not running yet" becomes "The strategy engine is not running yet." */
@@ -43,17 +57,25 @@ export function outcomeOf(action: ManualAction, answer: ActionResult | Error): O
     };
   }
   if (answer.ok) {
+    if (action.kind === 'enter') {
+      return {
+        tone: 'sent',
+        title: 'Entry started',
+        text: `${action.symbol}, checked again with the NEAR AI risk check, then maker orders, then a taker order for what they leave, within the caps. It takes a few minutes, watch the Journal.`,
+      };
+    }
     return {
       tone: 'sent',
       title: 'Sent',
       text:
         action.kind === 'rotate'
           ? `The engine checks the rotation again, then closes ${action.from} and opens ${action.to}. Follow it in the Journal.`
-          : action.kind === 'enter'
-            ? `The engine checks ${action.symbol} again, asks the NEAR AI risk check, then opens both legs. Follow it in the Journal.`
-            : 'The engine closes both legs with reduce-only orders. Follow it in the Journal.',
+          : 'The engine closes both legs with reduce-only orders. Follow it in the Journal.',
     };
   }
+  // 409 while the loop acts: not a refusal of this request's merits. An entry sent before is still running.
+  const acting = actingOf(answer.reason);
+  if (acting !== null) return { tone: 'running', title: 'Still running', text: actingText(acting) };
   return { tone: 'refused', title: 'Not sent', text: `The engine refused it. ${reasonText(answer.reason)} ${unchanged(action)}` };
 }
 

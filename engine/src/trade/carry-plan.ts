@@ -23,7 +23,11 @@
 //
 // Every fill is priced as a taker fill, though serve's opens and closes put the Hyperliquid leg first as a post-only
 // order (maker fee, no spread crossed): its partner is hedged only once it fills, after the price came to it, so the
-// maker saving is not counted, as the scanner does not count it either.
+// maker saving is not counted, as the scanner does not count it either. So an owner demo entry's taker fallback (the
+// maker leg's IOC after its window for what the post-only part left) already pays the fee the round trip counts for
+// that fill. What the estimate does not count is how far past the walked book that IOC may fill: its limit is held
+// within `demo.takerFallbackBps` of the touch and of the mark, so legUsd × takerFallbackBps is added to the round trip
+// before it is held to maxLossUsd (takerFallbackUsd): the waiver never hides a cost above what the owner accepted.
 
 import type { BookLevel } from '../venues/venue.ts';
 import { aprPct, fundingTimingUsd } from '../scanner/costs.ts';
@@ -79,9 +83,10 @@ export interface CarryInput {
   long: CarryLegInput;
   /**
    * An owner demo entry: a positive spread need not cover the round trip, which must be at most maxLossUsd (above 0, at
-   * most DEMO_MAX_LOSS_USD). Absent: none.
+   * most DEMO_MAX_LOSS_USD). Absent: none. `takerFallbackBps`: the open ends with a taker fallback whose limit may go
+   * that far past the touch; legUsd × that is held to maxLossUsd with the round trip.
    */
-  demo?: { maxLossUsd: number };
+  demo?: { maxLossUsd: number; takerFallbackBps?: number };
 }
 
 export interface CarryLegPlan {
@@ -112,6 +117,8 @@ export interface CarryPlan {
   costRefusal: string | null;
   /** The refusal for cost an owner demo entry waived (a positive spread does not cover the round trip); null: none waived. */
   waived: string | null;
+  /** The most a demo entry's taker fallback may fill past the walked book, USD (legUsd × takerFallbackBps); 0 without one. */
+  takerFallbackUsd: number;
 }
 
 export function carryPlan(input: CarryInput): CarryPlan {
@@ -144,6 +151,9 @@ export function carryPlan(input: CarryInput): CarryPlan {
   if (input.demo !== undefined && !demoOk) {
     refusals.push(`owner demo entry: maxLossUsd ${String(m)} is not a number above 0 and at most ${usd(DEMO_MAX_LOSS_USD)}`);
   }
+  const fbBps = input.demo?.takerFallbackBps;
+  if (fbBps !== undefined && !(Number.isFinite(fbBps) && fbBps >= 0)) refusals.push(`owner demo entry: takerFallbackBps ${String(fbBps)} is not a number of 0 or more`);
+  const takerFallbackUsd = fbBps !== undefined && Number.isFinite(fbBps) && fbBps > 0 ? (legUsd * fbBps) / 10_000 : 0;
   // A fee that is not known (the caller's fee read failed) prices nothing: refused, and not for cost (the window's
   // spread was never judged).
   const unknownFee = ([short, long] as const).filter((l) => !(Number.isFinite(l.feeBps) && l.feeBps >= 0));
@@ -165,8 +175,9 @@ export function carryPlan(input: CarryInput): CarryPlan {
         else costRefusal = line;
       }
       // The demo's bound, on this open's own books: what the owner accepted to pay is never exceeded by the estimate.
-      if (demoOk && !(rt.totalUsd <= m!)) {
-        refusals.push(`owner demo entry: the round trip ${usd(rt.totalUsd)} on this open's books is over the ${usd(m!)} the owner accepted (maxLossUsd)`);
+      if (demoOk && !(rt.totalUsd + takerFallbackUsd <= m!)) {
+        const plus = takerFallbackUsd > 0 ? ` plus the taker fallback's ${fbBps} bps past the touch (${usd(takerFallbackUsd)}), ${usd(rt.totalUsd + takerFallbackUsd)},` : '';
+        refusals.push(`owner demo entry: the round trip ${usd(rt.totalUsd)} on this open's books${plus} is over the ${usd(m!)} the owner accepted (maxLossUsd)`);
       }
     }
   }
@@ -186,6 +197,7 @@ export function carryPlan(input: CarryInput): CarryPlan {
   return {
     netPerHourNow, netPerHour7d, grossAprNow: netPerHourNow * HOURS_PER_YEAR, grossApr7d: netPerHour7d * HOURS_PER_YEAR,
     expectedSpreadUsd, roundTrip, roundTripBps: roundTrip?.bps ?? NaN, roundTripUsd: roundTrip?.totalUsd ?? NaN, legs, refusals, costRefusal, waived,
+    takerFallbackUsd,
   };
 }
 
