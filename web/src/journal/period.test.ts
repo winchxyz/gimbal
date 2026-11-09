@@ -33,7 +33,7 @@ const desk: Pick<DeskState, 'legs' | 'pnl'> = {
 test('the Journal opens with the period: since when, the funding, the outages and their recovery', () => {
   const entries = newestFirst([hold('03:56', 42.2), down('04:18', 31), back('04:19'), down('04:23', 33), back('04:24'), hold('05:19', 109.2)]);
   const story = storyOf(entries, W);
-  assert.equal(journalHeadline(story, 0.0031, NOW), 'Holding MON since 03:08. Funding paid +$0.0031; Hyperliquid missed two reads and came back.');
+  assert.equal(journalHeadline(story, 0.0031, NOW), 'Holding MON since 03:08. Funding paid +$0.0031; Hyperliquid did not answer twice and came back.');
   // Funding that rounds to nothing and no outage: the sentence is the period alone.
   assert.equal(journalHeadline(storyOf([hold('05:19', 50)], W), 0.00001, NOW), 'Holding MON since 03:08.');
   // A pair held since an earlier day says the day.

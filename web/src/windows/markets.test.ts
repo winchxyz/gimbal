@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { checksSummary, closedGroups, coinsText, isOpenToDesk, marketsAnswer, marketsText } from './markets.ts';
+import { checksSummary, closedGroups, coinsText, isOpenToDesk, marketsAnswer, marketsText, nettedFunding } from './markets.ts';
 import { net, win } from './testing.ts';
 
 const refused = (symbol: string, code: string, netAprPct = 30) => net(symbol, netAprPct, { refused: { code, reason: 'x' } });
@@ -12,6 +12,10 @@ test('open to the desk: tradable, not refused, not held back by the NEAR AI risk
   assert.equal(isOpenToDesk(refused('BONK', 'E_ASSET')), false);
   assert.equal(isOpenToDesk(net('X', 9, { veto: { verdict: 'veto', reasons: ['one-off spike'] } } as never)), false);
   assert.equal(isOpenToDesk(win({ symbol: 'XMR', tradable: false })), false);
+  // The held pair stays in the list even when a new entry into it would be refused: its detail and Close stay reachable.
+  assert.equal(isOpenToDesk(refused('MON', 'E_ORACLE_STALE', 30)), false);
+  assert.equal(isOpenToDesk({ ...refused('MON', 'E_ORACLE_STALE', 30), held: { since: 1 } }), true);
+  assert.ok(closedGroups([{ ...refused('MON', 'E_ORACLE_STALE', 30), held: { since: 1 } }]).every((g) => g.windows.length === 0));
 });
 
 test('everything else is grouped by a plain reason: your policy first, watch-only last, best first inside', () => {
@@ -65,4 +69,12 @@ test('with a pair held, the sentence is about what comes next to it', () => {
   assert.equal(marketsText(marketsAnswer([held, mon2], 5)), 'Next best is MON on Phoenix and Orderly at 20% a year. MON, held, still leads.');
   assert.equal(marketsText(marketsAnswer([held, net('CAKE', 2, { id: 'c' })], 5)), 'MON, held, pays the most: 43% a year after costs.');
   assert.equal(marketsText(marketsAnswer([{ ...held, netAprPct: 30 }, xpl], 5)), 'XPL pays the most: 40% a year after costs. MON, held, pays 30%.');
+});
+
+test('the funding line is what the net was worked out on, so the three lines add up', () => {
+  const w = net('MON', 43.8, { grossAprPct: 67, grossApr7dPct: 70, costs: { feesPct: 10, slippagePct: 5, basisPct: 4.3, rescueReservePct: 0 } });
+  const f = nettedFunding(w);
+  assert.ok(Math.abs(f.pct - 63.1) < 1e-9, 'net 43.8 plus 19.3 of costs, not the 7-day 70 nor this hour 67');
+  assert.equal(f.multiDay, true);
+  assert.equal(nettedFunding({ ...w, grossApr7dPct: null }).multiDay, false);
 });

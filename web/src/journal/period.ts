@@ -29,19 +29,21 @@ function when(ms: number, now: number): string {
 
 const isZero = (usd: number, decimals = 4): boolean => Number(Math.abs(usd).toFixed(decimals)) === 0;
 
-/** `Hyperliquid missed two reads and came back`, `Hyperliquid did not answer at 04:23`: the period's outages. */
+/** `Hyperliquid did not answer twice and came back`, `Hyperliquid did not answer at 04:23`: the period's outages. */
 export function incidentsText(incidents: readonly Pick<Incident, 't' | 'entry' | 'recovery'>[]): string | null {
   if (incidents.length === 0) return null;
   const venues = [...new Set(incidents.map((i) => venueName(String(i.entry.numbers.venue ?? ''))))];
   const who = venues.length === 1 ? venues[0]! : 'The venues';
   const open = incidents.filter((i) => i.recovery === null).sort((a, b) => b.t - a.t)[0];
   if (open) return `${venueName(String(open.entry.numbers.venue ?? ''))} did not answer at ${clock(open.t)}`;
-  return `${who} missed ${count(incidents.length)} ${incidents.length === 1 ? 'read' : 'reads'} and came back`;
+  // Each incident is one outage (several missed reads in a row), so the count is of times it did not answer.
+  const n = incidents.length;
+  return `${who} did not answer ${n === 1 ? 'once' : n === 2 ? 'twice' : `${count(n)} times`} and came back`;
 }
 
 /**
- * The Journal's sentence while a pair is held: `Holding MON since 03:08. Funding paid +$0.0031; Hyperliquid missed two
- * reads and came back.` Null when no period on the page is ongoing (the screen then says what the contract signed).
+ * The Journal's sentence while a pair is held: `Holding MON since 03:08. Funding paid +$0.0031; Hyperliquid did not
+ * answer twice and came back.` Null when no period on the page is ongoing (the screen then says what the contract signed).
  * `fundingUsd` is the desk's own P&L for the held pair (`DeskState.pnl.fundingUsd`), null when it is not known.
  */
 export function journalHeadline(items: readonly StoryItem[], fundingUsd: number | null, now: number): string | null {

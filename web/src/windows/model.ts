@@ -179,9 +179,12 @@ export function isEmpty(windows: readonly FundingWindow[], minimum: number | nul
 export const heldWindow = (windows: readonly FundingWindow[]): FundingWindow | null =>
   windows.find((w) => w.held) ?? null;
 
-/** Which row is selected: the one asked for if it is still listed, else the held one, else the first. */
-export function pickSelection(rows: readonly FundingWindow[], wanted: string | null): string | null {
-  if (wanted !== null && rows.some((w) => w.id === wanted)) return wanted;
+/**
+ * Which row is selected: the one asked for if it is listed, or is any window the page knows (`all`: a market from the
+ * "Not open to the desk" section, an old `#/windows/<id>` link), else the held one, else the first.
+ */
+export function pickSelection(rows: readonly FundingWindow[], wanted: string | null, all: readonly FundingWindow[] = rows): string | null {
+  if (wanted !== null && (rows.some((w) => w.id === wanted) || all.some((w) => w.id === wanted))) return wanted;
   return (rows.find((w) => w.held) ?? rows[0])?.id ?? null;
 }
 

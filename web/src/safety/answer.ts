@@ -42,10 +42,13 @@ export function safetyAnswer({
   }
   const which = both ? `The ${VENUE_NAMES[nearest.venue]} leg is ` : 'The leg is ';
   if (risk === null) return { lead: which, figure: whole(d), tone: null, rest: ' from liquidation. Standing by.' };
+  const tone = distanceTone(d, risk);
+  // The nearest leg read is far, but another is not read yet: never "inside the watch line", never "both far".
+  if (d > risk.watchDistancePct) return { lead: which, figure: whole(d), tone, rest: ' from liquidation; the other leg is not read yet. Standing by.' };
   return {
     lead: which,
     figure: whole(d),
-    tone: distanceTone(d, risk),
+    tone,
     rest:
       d > risk.rescueDistancePct
         ? ` from liquidation, inside the ${risk.watchDistancePct}% watch line. The rescue is ready.`

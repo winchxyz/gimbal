@@ -31,8 +31,8 @@ export function parseJournalCounts(value: unknown): JournalCounts | null {
 
 /** The counts with one more entry (a new one heard on the stream). */
 export function withEntry(counts: JournalCounts, entry: JournalEntry): JournalCounts {
-  const held = entry.kind === 'refused' && Number(entry.numbers.held) === 1;
-  const cancelled = entry.kind === 'refused' && !held && Number(entry.numbers.cancelled) === 1;
+  const held = entry.kind === 'refused' && entry.numbers.held === 1;
+  const cancelled = entry.kind === 'refused' && !held && entry.numbers.cancelled === 1;
   return {
     entries: counts.entries + 1,
     since: counts.since === null ? entry.t : Math.min(counts.since, entry.t),

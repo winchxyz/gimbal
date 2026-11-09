@@ -10,7 +10,7 @@ import { decide, perDayOnLegs, type Decision } from './decision.ts';
 import { depth, pct, usd, usdWhole, venueName } from './format.ts';
 import type { HistoryState } from './history.ts';
 import { checkLines, heldWindow, isNoDesk, plainNote } from './model.ts';
-import { checksSummary, closedGroups, isOpenToDesk } from './markets.ts';
+import { checksSummary, closedGroups, isOpenToDesk, nettedFunding } from './markets.ts';
 import { Ago } from './WindowList.tsx';
 import { stepValue, waterfall } from './waterfall.ts';
 import type { ManualAction, Outcome } from './manual.ts';
@@ -98,11 +98,15 @@ function ThreeLines({ w, legUsd }: { w: FundingWindow; legUsd: number | null }) 
   const wf = useMemo(() => waterfall(w, legUsd), [w, legUsd]);
   const costs = wf.steps.filter((s) => s.key !== 'gross' && s.key !== 'net');
   const total = costs.reduce((sum, s) => sum + s.value, 0);
+  const { pct: funding, multiDay } = nettedFunding(w);
   return (
     <div className="w-three">
-      <div className="kv">
-        <span>{w.grossApr7dPct === null ? 'Funding now, a year' : 'Funding, last 7 days, a year'}</span>
-        <span>{pct(w.grossApr7dPct ?? w.grossAprPct)}</span>
+      {/* The funding the engine netted, so the three lines add up: the net plus the costs. A desk window with its 7 days
+          in is netted on the multi-day basis (the smaller of the 7- and 14-day means when they agree, else the 7 days);
+          any other on this hour's rates (shared Window.netAprPct). */}
+      <div className="kv" title={multiDay ? 'The smaller of the 7- and 14-day averages when they agree, else the last 7 days' : undefined}>
+        <span>{multiDay ? 'Funding, 7 to 14 days, a year' : 'Funding now, a year'}</span>
+        <span>{pct(funding)}</span>
       </div>
       <details className="w-costs">
         <summary className="kv">

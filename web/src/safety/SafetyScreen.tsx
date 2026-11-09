@@ -1,4 +1,5 @@
 import type { Leg, StrategyConfig } from '@gimbal/shared';
+import { ClosePair } from '../desk/DeskScreen.tsx';
 import { qty } from '../desk/format.ts';
 import { clock } from '../journal/entry.ts';
 import { useJournal } from '../journal/useJournal.ts';
@@ -82,7 +83,8 @@ export function SafetyScreen() {
             <div className="sf-stand">
               <b>{shownDesk.rescueFailure ? 'Needs the owner' : running ? 'Rescue running' : 'Standing by'}</b>
               <span>
-                <span className={cx('sf-dot', shownDesk.rescueFailure || running ? 'down' : 'up')} aria-hidden="true" />
+                {/* A rescue running is a watch state (amber); one that could not finish needs the owner (coral). */}
+                <span className={cx('sf-dot', shownDesk.rescueFailure ? 'down' : running ? 'watch-t' : 'up')} aria-hidden="true" />
                 {shownDesk.rescueFailure ? 'a rescue could not finish' : running ? 'started at the line' : 'nothing to rescue'}
               </span>
             </div>
@@ -118,6 +120,11 @@ export function SafetyScreen() {
                 <span>{usd(capPerHour, 0)} an hour</span>
               </div>
             )}
+            {shownDesk.rescueFailure && shownDesk.legs.length > 0 ? (
+              <div className="sf-close">
+                <ClosePair symbol={held?.symbol ?? shownDesk.legs[0]!.symbol} urgent />
+              </div>
+            ) : null}
             <p className="sf-lead g">A rescue moves margin from the reserve or the other leg through NEAR Intents, usually in about a minute.</p>
             {rescue ? null : (
               <div className="sf-standing">

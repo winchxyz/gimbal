@@ -56,7 +56,7 @@ export function WindowsScreen() {
   // so the default selection does not hop around as the order changes.
   const sticky = useRef<string | null>(null);
   const natural = useMemo(() => arrange(open, 'tradable', minimum), [open, minimum]);
-  const guess = pickSelection(natural.rows, route.id ?? sticky.current);
+  const guess = pickSelection(natural.rows, route.id ?? sticky.current, all);
   if (route.id === null) sticky.current = guess;
   const pin: Pin | null = useMemo(() => {
     const slot = guess === null ? -1 : drawn.current.indexOf(guess);

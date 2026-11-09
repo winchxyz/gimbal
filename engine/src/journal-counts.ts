@@ -13,8 +13,8 @@ export function addCount(counts: JournalCounts, entry: JournalEntry): void {
   if (entry.kind === 'refused') {
     // The engine journals a held risk check as `refused` with `held: 1`, and an act cancelled before anything was sent
     // with `cancelled: 1`; neither is a sizing or policy refusal (web/src/journal/model.ts, countsOf).
-    if (Number(entry.numbers.held) === 1) counts.refusedHeld += 1;
-    else if (Number(entry.numbers.cancelled) === 1) counts.refusedCancelled += 1;
+    if (entry.numbers.held === 1) counts.refusedHeld += 1;
+    else if (entry.numbers.cancelled === 1) counts.refusedCancelled += 1;
   }
 }
 

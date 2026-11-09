@@ -170,7 +170,7 @@ function Pair({ desk, held, strategy, down, decision, now }: PairProps) {
           <span>Net exposure</span>
         </div>
         <div className="c end">
-          <ClosePair symbol={symbol} />
+          <ClosePair symbol={symbol} urgent={desk.rescueFailure !== null} />
           <button type="button" className="btn quiet dk-details" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
             {open ? 'Hide' : 'Details'}
             <i className={cx('chev', open && 'u')} aria-hidden="true" />
@@ -199,7 +199,8 @@ function Pair({ desk, held, strategy, down, decision, now }: PairProps) {
         </div>
       </div>
 
-      <div className={cx('dk-legs', !open && 'shut')} aria-hidden={!open}>
+      {/* Folded, the block is inert: nothing in it (the phone's Close) can be focused or clicked while it is invisible. */}
+      <div className={cx('dk-legs', !open && 'shut')} aria-hidden={!open} inert={!open}>
         {legs.map((leg) => (
           <LegDetails key={leg.venue + leg.side} leg={leg} now={now} />
         ))}
@@ -221,7 +222,7 @@ function Pair({ desk, held, strategy, down, decision, now }: PairProps) {
           ))}
         </div>
         <div className="dk-close-phone">
-          <ClosePair symbol={symbol} />
+          <ClosePair symbol={symbol} urgent={desk.rescueFailure !== null} />
         </div>
       </div>
     </section>
@@ -268,8 +269,11 @@ function Decision({ decision, now, minNetAprPct }: { decision: StrategyDecision 
   );
 }
 
-/** Close both legs, for the owner (POST /close), asked in place; the engine's answer stays next to it. */
-function ClosePair({ symbol }: { symbol: string }) {
+/**
+ * Close both legs, for the owner (POST /close), asked in place; the engine's answer stays next to it. `urgent`: a rescue
+ * could not finish and the owner is needed, so Close is the filled button.
+ */
+export function ClosePair({ symbol, urgent = false }: { symbol: string; urgent?: boolean }) {
   const can = writeControls().close;
   const send = useManualSend(can ? { kind: 'close', symbol } : null);
   if (!can) return null;
@@ -278,8 +282,8 @@ function ClosePair({ symbol }: { symbol: string }) {
       <span className="dk-ask dk-confirm" role="alertdialog" aria-label="Close both legs now?">
         <b>Close both legs now?</b>
         <span>
-          The engine closes both {symbol} legs with reduce-only orders. The contract checks and signs each one; a reduce-only order is always
-          allowed, even on a paused desk.
+          The engine closes both {symbol} legs with reduce-only orders. A reduce-only order passes even a paused desk; the contract still checks
+          its price.
         </span>
         <span className="row">
           <button type="button" className="btn primary" onClick={send.confirm}>Close pair</button>
@@ -296,7 +300,7 @@ function ClosePair({ symbol }: { symbol: string }) {
           {send.outcome.title}: {send.outcome.text}
         </span>
       ) : null}
-      <button type="button" className="btn" disabled={send.sending} onClick={send.ask}>Close pair</button>
+      <button type="button" className={cx('btn', urgent && 'primary')} disabled={send.sending} onClick={send.ask}>Close pair</button>
     </span>
   );
 }
@@ -314,10 +318,15 @@ function Payback({ pnl }: { pnl: DeskState['pnl'] }) {
         <span>Entry costs earned back</span>
         <span>{costs <= 0 ? 'no costs yet' : `${signedUsd(Math.min(earned, costs), 4).replace('+', '')} of ${usd(costs, 4)}`}</span>
       </div>
-      <b className="dk-big">{p.pct}%</b>
-      <div className="bar" role="progressbar" aria-label="Entry costs earned back" aria-valuemin={0} aria-valuemax={100} aria-valuenow={p.pct}>
-        <i style={{ width: `${p.pct}%` }} />
-      </div>
+      {/* No cost yet: nothing to earn back, so no figure and no bar. */}
+      {costs <= 0 ? null : (
+        <>
+          <b className="dk-big">{p.pct}%</b>
+          <div className="bar" role="progressbar" aria-label="Entry costs earned back" aria-valuemin={0} aria-valuemax={100} aria-valuenow={p.pct}>
+            <i style={{ width: `${p.pct}%` }} />
+          </div>
+        </>
+      )}
     </section>
   );
 }
@@ -423,7 +432,11 @@ function Flat({ desk, answer, windows, strategy, scan, journal, now }: FlatProps
               <small>{value.cents}</small>
             </Flash>
           </span>
-          <p className="g">in the desk’s accounts, earning nothing until a market pays at least the minimum</p>
+          <p className="g">
+            {strategy?.auto === false
+              ? 'in the desk’s accounts, earning nothing: Auto is off, so the desk opens nothing by itself'
+              : 'in the desk’s accounts, earning nothing until a market pays at least the minimum'}
+          </p>
         </div>
         {gaps === null ? null : <p className="dk-gaps g" data-testid="desk-value-gaps">{gaps}</p>}
         {closed === null ? null : (

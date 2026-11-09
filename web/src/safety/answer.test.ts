@@ -24,7 +24,10 @@ test('standing by: both legs far, or the nearer one named and coloured by the ow
   assert.equal(safetyText(plain), 'The leg is 52% from liquidation. Standing by.');
   assert.equal(plain.tone, null);
   // One leg not read yet: never "both far".
-  assert.match(safetyText(safetyAnswer({ desk: { legs: [leg('hyperliquid', 52), leg('phoenix', null)], rescueFailure: null }, rescue: null, risk: RISK })), /^The Hyperliquid leg is 52%/);
+  assert.equal(
+    safetyText(safetyAnswer({ desk: { legs: [leg('hyperliquid', 60), leg('phoenix', null)], rescueFailure: null }, rescue: null, risk: RISK })),
+    'The Hyperliquid leg is 60% from liquidation; the other leg is not read yet. Standing by.',
+  );
 });
 
 test('the rescue estimate is the engine check, read as it is', () => {

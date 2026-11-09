@@ -34,6 +34,8 @@
 .sf-dot { display: inline-block; width: 7px; height: 7px; border-radius: var(--r-dot); margin-right: 9px; vertical-align: 1px; background: var(--ink-3); }
 .sf-dot.up { background: var(--level); }
 .sf-dot.down { background: var(--danger); }
+.sf-dot.watch-t { background: var(--watch); }
+.sf-close { display: flex; justify-content: flex-end; padding: var(--s-4) 0; border-bottom: 1px solid var(--line); }
 .sf-guard .kv { font: var(--t-body); }
 .sf-lead { margin-top: var(--s-4); max-width: 70ch; font: var(--t-s); }
 

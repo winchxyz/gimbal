@@ -8,10 +8,11 @@ import { hasHistory, isNoDesk, sortWindows } from './model.ts';
 /**
  * Open to the desk: on venues it trades, not refused by the contract and not held back by the NEAR AI risk check. A
  * window refused only because no desk exists yet stays in the list (its numbers are real). A window whose numbers
- * are from an earlier scan stays too: the list never says "stale", the next scan reads it again.
+ * are from an earlier scan stays too: the list never says "stale", the next scan reads it again. The held window always
+ * stays, whatever the contract or the risk check says of a new entry into it: its detail and Close must be reachable.
  */
 export const isOpenToDesk = (w: FundingWindow): boolean =>
-  w.tradable && (!w.refused || isNoDesk(w)) && w.veto?.verdict !== 'veto';
+  w.held !== null || (w.tradable && (!w.refused || isNoDesk(w)) && w.veto?.verdict !== 'veto');
 
 /** The plain reason a window is not open to the desk, by the contract's refusal code where there is one. */
 const REFUSAL_WORDS: Readonly<Record<string, string>> = {
@@ -105,6 +106,15 @@ export function marketsAnswer(windows: readonly FundingWindow[], minimum: number
 /** A market's name in a sentence beside the held one: its venues too when the coin is the same. */
 const nameBeside = (w: FundingWindow, held: FundingWindow): string =>
   w.symbol === held.symbol ? `${w.symbol} on ${venueName(w.longVenue)} and ${venueName(w.shortVenue)}` : w.symbol;
+
+/**
+ * The funding a market's net was worked out on, so funding, costs and net add up: the net plus today's costs. For a
+ * desk window with its 7 days in that is the engine's multi-day basis, not this hour's or the plain 7-day gross.
+ */
+export function nettedFunding(w: FundingWindow): { pct: number; multiDay: boolean } {
+  const c = w.costs;
+  return { pct: w.netAprPct + c.feesPct + c.slippagePct + c.basisPct + c.rescueReservePct, multiDay: w.tradable && w.grossApr7dPct !== null };
+}
 
 export const marketsText = (a: MarketsAnswer): string => `${a.lead}${a.rate ?? ''}${a.rest}`;
 

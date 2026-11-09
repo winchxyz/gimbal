@@ -17,6 +17,7 @@ import {
   attributionOf,
   costsUsd,
   entriesIn,
+  filterCounts,
   foldOlder,
   groupByDay,
   visibleFeed,
@@ -99,6 +100,7 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
   const { shown, pending } = useMemo(() => visibleFeed(entries, frozen), [entries, frozen]);
   // The sentence, the filters and the side column count every entry the engine holds (journalCounts), not the page.
   const counts = useMemo(() => trueCounts(engineCounts, shown), [engineCounts, shown]);
+  const pageFilters = useMemo(() => filterCounts(shown), [shown]);
   const heldId = windows ? (heldWindow(windows)?.id ?? null) : null;
   const listed = useMemo(() => entriesIn(shown, filter), [shown, filter]);
   const groups = useMemo(() => groupByDay(listed, now), [listed, now]);
@@ -159,7 +161,8 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
         </div>
       </div>
 
-      <Filters filter={filter} counts={counts.filters} onChange={setFilter} />
+      {/* The filters list the loaded entries, so they count those; the totals over all history are in Counts. */}
+      <Filters filter={filter} counts={pageFilters} onChange={setFilter} />
 
       <div className="j-grid">
         <section className="j-feed" aria-label="Journal entries" ref={feedRef} {...SCROLLER}>

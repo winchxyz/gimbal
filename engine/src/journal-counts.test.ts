@@ -18,12 +18,14 @@ test('counts by kind, with the oldest time, and the two refusals that are not si
     entry('funding', 250),
     entry('refused', 150),
     entry('refused', 140, { held: 1 }),
-    entry('refused', 130, { cancelled: '1' }),
+    entry('refused', 130, { cancelled: 1 }),
+    // Strict, as the web counts the page: a string '1' is not the engine's flag, so it is a plain refusal.
+    entry('refused', 120, { cancelled: '1' }),
     entry('wait', 100),
   ]);
-  assert.equal(c.entries, 7);
+  assert.equal(c.entries, 8);
   assert.equal(c.since, 100);
-  assert.deepEqual(c.kinds, { enter: 1, funding: 2, refused: 3, wait: 1 });
+  assert.deepEqual(c.kinds, { enter: 1, funding: 2, refused: 4, wait: 1 });
   assert.equal(c.refusedHeld, 1);
   assert.equal(c.refusedCancelled, 1);
   assert.deepEqual(countJournal([]), emptyCounts());
