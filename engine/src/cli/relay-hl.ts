@@ -19,6 +19,7 @@ import { NearContractClient } from '../contract/near-client.ts';
 import { NearApiTransport } from '../contract/near-transport.ts';
 import { priceUsd } from '../contract/prices.ts';
 import { ContractRefusal, OutcomeUnknown } from '../contract/types.ts';
+import { legCaps, unpricedEntry } from '../contract/unpriced.ts';
 import { planIoc } from '../relayer/hl-order.ts';
 import type { HlSubmitResult } from '../relayer/hyperliquid.ts';
 import { HyperliquidSubmitter } from '../relayer/hyperliquid.ts';
@@ -116,9 +117,9 @@ async function run(): Promise<void> {
     log('config(): no treasury.hl_builder / fees.hl_builder_tenth_bps read; the builder fee is not checked');
   }
 
-  const unpriced = desk.policy.unpriced.find((u) => u.symbol === coin);
+  const unpriced = unpricedEntry(desk.policy, 'hyperliquid', coin);
   const oracle = unpriced === undefined ? await freshPrice(desk.policy.oracle_max_age_s) : null;
-  const maxNotionalUsd = unpriced === undefined ? desk.policy.max_notional_usd : Math.min(desk.policy.max_notional_usd, desk.policy.unpriced_max_notional_usd);
+  const { maxNotionalUsd } = legCaps(desk.policy, 'hyperliquid', coin);
   if (unpriced !== undefined) log(`${coin} is unpriced in the policy: no oracle band; max_sz ${unpriced.max_sz}, max ${maxNotionalUsd} USD`);
   const caps = unpriced === undefined ? {} : { maxSz: unpriced.max_sz };
   const book = await reader.book(coin, 5);

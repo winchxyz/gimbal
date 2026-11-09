@@ -74,6 +74,29 @@ test('accounts: open positions become legs, a flat one does not, a failed read i
   assert.deepEqual(snap.reads.map((r) => [r.venue, r.error]), [['hyperliquid', null], ['phoenix', 'phoenix trader: 503']]);
 });
 
+test('a leg is unpriced when the desk view\'s policy lists its policy symbol: an Orderly leg by its base; no policy, none is', async () => {
+  const position = (symbol: string, size: number) => ({
+    symbol, size, entryPx: 0.6, liqPx: null, marginUsd: 10, unrealizedPnlUsd: 0, leverage: 1, fundingSinceOpenUsd: 0, unsettledFundingUsd: 0,
+  });
+  const account = (venue: 'hyperliquid' | 'orderly' | 'phoenix', positions: ReturnType<typeof position>[]): AccountState => ({
+    venue, address: 'a', time: 1, equityUsd: 20, freeMarginUsd: 10, maintenanceMarginUsd: 0.5, positions,
+  });
+  const accounts: AccountsDeskSourceOptions['accounts'] = [
+    { reader: { id: 'hyperliquid', account: async () => account('hyperliquid', [position('ETHFI', -20), position('ETH', -0.001)]) }, address: '0xdesk' },
+    { reader: { id: 'orderly', account: async () => account('orderly', [position('PERP_ETHFI_USDC', 20), position('PERP_ETH_USDC', 0.001)]) }, address: 'acct' },
+    { reader: { id: 'phoenix', account: async () => account('phoenix', [position('MON', 400)]) }, address: 'Auth111' },
+  ];
+  const unpriced = [{ symbol: 'ZRO', max_sz: '8.2' }, { symbol: 'ETHFI', max_sz: '25.2' }, { symbol: 'AAVE', max_sz: '0.11' }, { symbol: 'MON', max_sz: '500' }];
+  const base = { deskId: 'carry', owner: 'owner.near', contract: 'gimbal.near', accounts };
+  const flags = async (o: Partial<AccountsDeskSourceOptions>) => (await new AccountsDeskSource({ ...base, ...o }).read()).legs.map((l) => `${l.venue} ${l.symbol} ${l.unpriced}`);
+  assert.deepEqual(await flags({ desk: async () => ({ reserveUsd: 0, paused: null, policy: { unpriced } }) }), [
+    'hyperliquid ETHFI true', 'hyperliquid ETH false', 'orderly PERP_ETHFI_USDC true', 'orderly PERP_ETH_USDC false', 'phoenix MON true',
+  ]);
+  for (const o of [{}, { desk: async () => ({ reserveUsd: 0, paused: null }) }]) {
+    assert.ok((await flags(o)).every((l) => l.endsWith(' false')));
+  }
+});
+
 /** The live XLM pair: short 74 on Hyperliquid, long 74 on Phoenix, marked at entry; plus an ETH short the book never entered. */
 function xlmAccounts(): AccountsDeskSourceOptions['accounts'] {
   const position = (symbol: string, size: number, entryPx: number, fundingSinceOpenUsd: number) => ({

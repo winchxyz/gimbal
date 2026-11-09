@@ -432,7 +432,8 @@ if (mode === 'replay') {
       if (view === null) throw new Error(`get_desk(${deskId}) answered null`);
       pausedSince = view.paused ? (pausedSince ?? Date.now()) : null;
       closingWatch?.observe(view.closing === true);
-      return { reserveUsd: Number(view.ledger.idle_usdc) / 1e6, paused: pausedSince === null ? null : { by: 'unknown', at: pausedSince } };
+      // The policy marks the legs the contract checks without a price band (Leg.unpriced).
+      return { reserveUsd: Number(view.ledger.idle_usdc) / 1e6, paused: pausedSince === null ? null : { by: 'unknown', at: pausedSince }, policy: view.policy };
     },
   });
   log(`risk: reading the desk's ${accounts.map((a) => a.reader.id).join(' and ')} accounts every 5 s ${riskOrderlyNote(orderly)}`);

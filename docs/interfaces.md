@@ -167,7 +167,10 @@ default it can open 15 full-size orders an hour.
 
 **Unpriced assets.** An order for a symbol in `unpriced` skips the oracle band (there is no trusted price), so
 its size is capped in base units instead: `sz ≤ max_sz` of that symbol, and `sz × px` must also fit
-min(`max_notional_usd`, `unpriced_max_notional_usd`) (`E_SIZE`). The hourly notional meter counts an unpriced order
+min(`max_notional_usd`, `unpriced_max_notional_usd`) (`E_SIZE`). The symbol is the one each venue's check values an
+order under: a Hyperliquid asset's and a Phoenix market's policy symbol, and an Orderly order's base (`ETHFI` for
+`PERP_ETHFI_USDC`, `max_sz` in units of its quantity); the engine resolves it the same way (`engine/src/contract/unpriced.ts`).
+The hourly notional meter counts an unpriced order
 at max(`px`, min(`max_notional_usd`, `unpriced_max_notional_usd`) × 1e8 / `max_sz`) per unit, its share of that
 unpriced cap at least, so a
 sell at a far-off limit (1 tick, say) cannot pass the meter for nothing. The `signed` event carries `oracle_px: null,
