@@ -1,33 +1,20 @@
 import type { Mode } from '@gimbal/shared';
+import { NOT_CONFIGURED_TEXT, NOT_CONFIGURED_TITLE, useHostedOwnerWrites, usePollHostedLive } from '../remote/hosted.ts';
+import { hasOwnLine, needsToken, useProblem } from '../remote/problem.ts';
+import { isHostedLive, isOwnerUnlocked, isReadOnly, isRemote, writeControls } from '../remote/readonly.ts';
 import { useStream } from '../stream/hub.ts';
-import type { Connection } from '../stream/store.ts';
-import { dotColor } from '../ui/dot.ts';
+import { cx } from '../ui/cx.ts';
 import { useNow } from '../ui/useNow.ts';
-import { clock } from '../journal/entry.ts';
-import { writeControls } from '../remote/readonly.ts';
-import { ONBOARDING_HREF, SCREENS, hrefOf, type ScreenId } from './routes.ts';
+import { degradedOf, headline } from './headline.ts';
+import { CONNECT_HREF, ONBOARDING_HREF, OWNER_HREF, SCREENS, hrefOf, type ScreenId } from './routes.ts';
 import { Wordmark } from './Wordmark.tsx';
 
-const NETWORKS: Record<Mode, { label: string; dot: string }> = {
-  mainnet: { label: 'Mainnet', dot: 'var(--level)' },
-  testnet: { label: 'Testnet', dot: 'var(--testnet)' },
-  replay: { label: 'Replay', dot: 'var(--replay)' },
-};
-
-const CONNECTING: Record<Connection, string> = {
-  idle: 'Offline',
-  connecting: 'Connecting',
-  open: 'No desk yet',
-  retrying: 'Reconnecting',
-};
-
-export function Header({ screen }: { screen: ScreenId }) {
-  const desk = useStream((s) => s.desk);
-  const connection = useStream((s) => s.connection);
-  const engineMode = useStream((s) => s.mode);
-  // The desk names its network; before a desk exists the engine still knows which one it runs on (`GET /state`).
-  const mode = desk?.mode ?? engineMode;
-
+/**
+ * The header: the logo, the four sections (the phone moves them to the bottom tab bar) and the one status line
+ * (`Live · mainnet · checked 5 s ago`). A link sits after the line only when it is the way out of what the line says
+ * (enter a token, use another engine) or the owner's door on the public live view.
+ */
+export function Header({ screen }: { screen: ScreenId | null }) {
   return (
     <header className="hdr">
       <a className="brand" href={hrefOf('desk')} aria-label="Gimbal, go to Desk">
@@ -35,60 +22,59 @@ export function Header({ screen }: { screen: ScreenId }) {
       </a>
       <nav className="sections" aria-label="Sections">
         {SCREENS.map((s) => (
-          <a
-            key={s.id}
-            href={hrefOf(s.id)}
-            className={s.id === screen ? 'on' : undefined}
-            aria-current={s.id === screen ? 'page' : undefined}
-          >
+          <a key={s.id} href={hrefOf(s.id)} className={s.id === screen ? 'on' : undefined} aria-current={s.id === screen ? 'page' : undefined}>
             {s.label}
           </a>
         ))}
       </nav>
-      <div className="right">
-        {mode ? (
-          <span className="dot net" style={dotColor(NETWORKS[mode].dot)}>
-            {NETWORKS[mode].label}
-          </span>
-        ) : (
-          <span className="dot" style={dotColor('var(--ink-3)')}>
-            {CONNECTING[connection]}
-          </span>
-        )}
-        {/* A replay's clock is the recording's: where in the recorded hour the page is (a hosted replay starts over). */}
-        {mode === 'replay' && <ReplayClock />}
-        {/* A replay's desk has no id of its own (it is "replay"): the network badge already says Replay. */}
-        {desk && mode !== 'replay' && <span>{desk.deskId}</span>}
-        {mode && <MoneyActions mode={mode} />}
-      </div>
+      <HeaderStatus />
     </header>
   );
 }
 
-function ReplayClock() {
-  const now = useNow(5_000);
-  return <span className="g3" title="The replay clock: the recorded mainnet hour's time, UTC">{clock(now)} UTC</span>;
+function HeaderStatus() {
+  const source = useStream((s) => s.source);
+  const connection = useStream((s) => s.connection);
+  const mode = useStream((s) => s.desk?.mode ?? s.mode);
+  const checkedAt = useStream((s) => s.desk?.updatedAt ?? s.scan?.at ?? null);
+  const heardAt = useStream((s) => s.heardAt);
+  const now = useNow(1000);
+  const pageNow = useNow(1000, 'page');
+  const problem = useProblem();
+  const hosted = usePollHostedLive();
+  const ownerWrites = useHostedOwnerWrites();
+  const unlocked = isOwnerUnlocked();
+  const degraded = useStream((s) => degradedOf(s.desk, s.health));
+
+  const shown =
+    hosted === 'not-configured'
+      ? { title: NOT_CONFIGURED_TITLE, text: NOT_CONFIGURED_TEXT }
+      : isRemote() && hasOwnLine(problem)
+        ? problem
+        : null;
+  const h = headline({ source, connection, mode, checkedAt, heardAt, now, pageNow, problem: shown, owner: unlocked, readOnly: isReadOnly(), degraded });
+
+  return (
+    <div className="right">
+      <span className={cx('hl', h.tone)} title={h.more ?? undefined} role="status">
+        <span className="hl-long">{h.text}</span>
+        <span className="hl-short" aria-hidden="true">{h.short}</span>
+        {h.more ? <span className="sr">. {h.more}</span> : null}
+      </span>
+      {isRemote() && needsToken(problem) ? <a href={CONNECT_HREF}>Enter token</a> : isRemote() ? <a className="quiet" href={CONNECT_HREF}>Settings</a> : null}
+      {!isReadOnly() && source === 'sse' && connection === 'retrying' ? <a href={CONNECT_HREF}>Use a remote engine</a> : null}
+      {isHostedLive() && (ownerWrites || unlocked) ? <a className="quiet" href={OWNER_HREF}>Owner</a> : null}
+    </div>
+  );
 }
 
-// design/HANDOFF.md, Network: testnet swaps Add funds for Get test USDC; replay has no money buttons.
-// Connecting and adding funds both open onboarding, which reads the chain and lands on the step that is next for this
-// wallet (the funds step once the desk exists). The phone has no header buttons: the Desk screen draws the same pair
-// under the desk value, with its own `className`.
+// Adding funds opens onboarding, which reads the chain and lands on the step that is next for this wallet (the funds
+// step once the desk exists). Not drawn read-only, and not for a replay, which has no money.
 export function MoneyActions({ mode, className = 'money' }: { mode: Mode; className?: string }) {
-  // Read-only view: nothing here is drawn; every one of these opens a wallet or the set-up flow.
-  if (!writeControls().money) return null;
-  if (mode === 'replay') {
-    return (
-      <span className={className}>
-        <button type="button" className="btn">Exit replay</button>
-        <a className="btn primary" href={ONBOARDING_HREF}>Connect wallet</a>
-      </span>
-    );
-  }
+  if (!writeControls().money || mode === 'replay') return null;
   return (
     <span className={className}>
-      <button type="button" className="btn">Withdraw</button>
-      <a className="btn primary" href={ONBOARDING_HREF}>{mode === 'testnet' ? 'Get test USDC' : 'Add funds'}</a>
+      <a href={ONBOARDING_HREF}>{mode === 'testnet' ? 'Get test USDC' : 'Add funds'}</a>
     </span>
   );
 }

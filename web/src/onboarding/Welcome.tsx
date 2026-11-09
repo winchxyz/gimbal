@@ -55,7 +55,7 @@ export function Welcome({ flow, s, mode }: Props) {
   const best = bestNetAprPct(windows);
   const waiting = s.busy === 'connect';
   const failed = s.errors.connect !== undefined && !waiting;
-  const look = mode === 'replay' ? { href: hrefOf('desk'), label: 'Watch the replay first' } : { href: hrefOf('windows'), label: 'Look at the windows first' };
+  const look = mode === 'replay' ? { href: hrefOf('desk'), label: 'Watch the replay first' } : { href: hrefOf('markets'), label: 'Look at the markets first' };
 
   if (failed) {
     return (

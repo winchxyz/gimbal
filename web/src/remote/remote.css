@@ -1,7 +1,4 @@
-/* Remote view: the one plain line under the header, and the settings form. Tokens only; colour means state. */
-.ro-line { display: flex; align-items: baseline; gap: var(--s-4); padding: var(--s-2) var(--gutter); border-bottom: 1px solid var(--line); font: var(--t-s); color: var(--ink-2); }
-.ro-line a { margin-left: auto; color: var(--ink-2); }
-.ro-line a:hover { color: var(--ink); }
+/* The settings form and the owner unlock: a page of their own. Tokens only; colour means state. */
 
 .cx-hdr { grid-template-columns: 1fr; }
 .cx-page { min-height: calc(100dvh - var(--header)); display: grid; place-items: center; padding: var(--s-6) var(--gutter); }

@@ -7,9 +7,10 @@ import { useNow } from '../ui/useNow.ts';
 import { hasAlert, makeAlert, type Alert } from './alerts.ts';
 import { Chart } from './Chart.tsx';
 import { decide, perDayOnLegs, type Decision } from './decision.ts';
-import { depth, hours, pct, usd, usdWhole, venueName } from './format.ts';
+import { depth, pct, usd, usdWhole, venueName } from './format.ts';
 import type { HistoryState } from './history.ts';
-import { checkLines, heldWindow, isNoDesk } from './model.ts';
+import { checkLines, heldWindow, isNoDesk, plainNote } from './model.ts';
+import { checksSummary, closedGroups, isOpenToDesk, nettedFunding } from './markets.ts';
 import { Ago } from './WindowList.tsx';
 import { stepValue, waterfall } from './waterfall.ts';
 import type { ManualAction, Outcome } from './manual.ts';
@@ -37,41 +38,41 @@ export function Detail({ w, windows, strategy, histories, alerts, onToggleAlert 
 
   return (
     <section className="w-detail" aria-label={`${w.symbol} detail`}>
-      <a className="w-back" href="#/windows">{'←'} Windows</a>
+      <a className="w-back" href="#/markets">{'←'} Markets</a>
 
-      <div className="w-dtop">
-        <div>
-          <h1>{w.symbol}</h1>
-          <p>
-            Long {venueName(w.longVenue)} · short {venueName(w.shortVenue)} · {depth(w.depthUsd)} depth
-          </p>
-          {watch ? null : (
-            <p className="w-facts">
-              {usd(w.usdPerDayPer1k)} a day per $1k · breakeven {hours(w.breakevenHours)} · updated <Ago at={w.updatedAt} />
-            </p>
-          )}
-        </div>
-        <div className="n">
-          {watch ? (
-            <>
-              <b><Flash value={w.grossAprPct}>{pct(w.grossAprPct)}</Flash></b>
-              <span className="g">gross a year</span>
-              <span>Watch-only, no net APR</span>
-            </>
-          ) : (
-            <>
-              <b className={cx(neg && 'neg', w.refused && !isNoDesk(w) && 'struck')}><Flash value={w.netAprPct}>{pct(w.netAprPct)}</Flash></b>
-              <span className="g">net a year</span>
-              {strategy ? <span>≈ {usd(perDayOnLegs(w, strategy.legUsd))} a day on {usdWhole(strategy.legUsd)} legs</span> : null}
-            </>
-          )}
-        </div>
+      <div className="w-coin">
+        <b>{w.symbol}</b>
+        <span className="g">
+          Long {venueName(w.longVenue)} · short {venueName(w.shortVenue)}
+        </span>
       </div>
+      {watch ? (
+        <div className="w-big">
+          <b>
+            <Flash value={w.grossAprPct}>{pct(w.grossAprPct, 0)}</Flash>
+          </b>
+          <p className="g">gross a year. Watch-only: the desk cannot trade these venues, so there is no net.</p>
+        </div>
+      ) : (
+        <div className="w-big">
+          <b className={cx(neg && 'neg')}>
+            <Flash value={w.netAprPct}>{pct(w.netAprPct, Math.abs(w.netAprPct) >= 10 ? 0 : 1)}</Flash>
+          </b>
+          <p className="g">
+            a year after costs
+            {strategy ? <> · about {usd(perDayOnLegs(w, strategy.legUsd))} a day on {usdWhole(strategy.legUsd)} legs</> : null}
+            {' · '}
+            {depth(w.depthUsd)} depth · read <Ago at={w.updatedAt} />
+          </p>
+          <p className="g w-status">{statusLine(w)}</p>
+        </div>
+      )}
 
       {watch ? (
         <WatchFacts w={w} />
       ) : (
         <>
+          <ThreeLines w={w} legUsd={strategy?.legUsd ?? null} />
           <Chart
             symbol={w.symbol}
             history={histories[w.id]}
@@ -79,10 +80,7 @@ export function Detail({ w, windows, strategy, histories, alerts, onToggleAlert 
             minimum={minimum}
             onRetry={() => retryHistory(w.id)}
           />
-          <div className="w-cols2">
-            <Waterfall w={w} legUsd={strategy?.legUsd ?? null} />
-            <Checks w={w} />
-          </div>
+          <Checks w={w} />
         </>
       )}
 
@@ -93,28 +91,40 @@ export function Detail({ w, windows, strategy, histories, alerts, onToggleAlert 
   );
 }
 
-// ---------- cost waterfall ----------
+// ---------- gross to net ----------
 
-function Waterfall({ w, legUsd }: { w: FundingWindow; legUsd: number | null }) {
+/** Gross to net in three lines (funding, costs, net); how the costs add up is one tap away. */
+function ThreeLines({ w, legUsd }: { w: FundingWindow; legUsd: number | null }) {
   const wf = useMemo(() => waterfall(w, legUsd), [w, legUsd]);
+  const costs = wf.steps.filter((s) => s.key !== 'gross' && s.key !== 'net');
+  const total = costs.reduce((sum, s) => sum + s.value, 0);
+  const { pct: funding, multiDay } = nettedFunding(w);
   return (
-    <div>
-      <h3>From {pct(w.grossAprPct)} gross to {pct(w.netAprPct)} net</h3>
-      <div className="stack">
-        <i className="k-gross" style={{ width: `${wf.grossWidth}%` }} />
+    <div className="w-three">
+      {/* The funding the engine netted, so the three lines add up: the net plus the costs. A desk window with its 7 days
+          in is netted on the multi-day basis (the smaller of the 7- and 14-day means when they agree, else the 7 days);
+          any other on this hour's rates (shared Window.netAprPct). */}
+      <div className="kv" title={multiDay ? 'The smaller of the 7- and 14-day averages when they agree, else the last 7 days' : undefined}>
+        <span>{multiDay ? 'Funding, 7 to 14 days, a year' : 'Funding now, a year'}</span>
+        <span>{pct(funding)}</span>
       </div>
-      <div className="stack" style={{ marginTop: 4 }}>
-        {wf.parts.map((p) => (
-          <i key={p.key} className={`k-${p.key}`} style={{ width: `${p.width}%` }} />
-        ))}
-      </div>
-      <div className="legend">
-        {wf.steps.map((s) => (
-          <div key={s.key} className={cx(s.key === 'net' && 'tot')}>
-            <span><i className={`k-${s.key}`} />{s.label}</span>
-            <span className={cx(s.key === 'net' && s.value < 0 && 'neg')}>{stepValue(s.key, s.value)}</span>
+      <details className="w-costs">
+        <summary className="kv">
+          <span>
+            Costs, as a year<i className="chev" aria-hidden="true" />
+          </span>
+          <span>{stepValue('fees', total)}</span>
+        </summary>
+        {costs.map((s) => (
+          <div key={s.key} className="kv sub">
+            <span>{s.label}</span>
+            <span>{stepValue(s.key, s.value)}</span>
           </div>
         ))}
+      </details>
+      <div className="kv tot">
+        <span>Net, a year</span>
+        <span className={cx(w.netAprPct < 0 && 'neg')}>{pct(w.netAprPct)}</span>
       </div>
     </div>
   );
@@ -122,20 +132,32 @@ function Waterfall({ w, legUsd }: { w: FundingWindow; legUsd: number | null }) {
 
 // ---------- checks ----------
 
+/** The checks folded into one line ("7 of 7 checks passed"); a tap reads them. */
 function Checks({ w }: { w: FundingWindow }) {
   const lines = useMemo(() => checkLines(w), [w]);
   return (
-    <div className="w-verdict">
-      <h3>Checks</h3>
-      {lines.length === 0 ? <p className="g">The engine has not checked this window yet.</p> : null}
+    <details className="w-checks">
+      <summary>
+        <span>{checksSummary(lines)}</span>
+        <i className="chev" aria-hidden="true" />
+      </summary>
+      {lines.length === 0 ? <p className="g">The engine has not checked this market yet.</p> : null}
       {lines.map((l, i) => (
         <p key={i} className={l.ok ? 'ok' : 'bad'}>
           {l.text}
           {l.blocking ? <span className="g"> · why it is not entered</span> : null}
         </p>
       ))}
-    </div>
+    </details>
   );
+}
+
+/** Held, no desk yet, or what keeps the desk out, in plain words; empty for a market open to the desk. */
+function statusLine(w: FundingWindow): string {
+  if (w.held) return 'The desk holds this market.';
+  if (isNoDesk(w)) return 'No desk yet: nothing can be entered until one exists.';
+  if (!isOpenToDesk(w)) return closedGroups([w])[0]?.reason ? `${closedGroups([w])[0]!.reason}.` : '';
+  return w.note ? plainNote(w.note) : '';
 }
 
 // ---------- watch-only ----------

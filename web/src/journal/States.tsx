@@ -70,7 +70,16 @@ export function JournalLoading() {
         </section>
 
         <aside className="j-side" aria-hidden="true">
-          <h3>
+          <div className="j-cnt">
+            <h3>Counts</h3>
+            {['Trades', 'Actions signed by the contract', 'Funding payments', 'Incidents'].map((label) => (
+              <div key={label} className="kv">
+                <span>{label}</span>
+                <Sk w={24} h={20} />
+              </div>
+            ))}
+          </div>
+          <h3 className="j-since">
             <Sk w={76} h={14} />
           </h3>
           <Sk w={146} h={48} />
@@ -86,14 +95,6 @@ export function JournalLoading() {
               <span>Net</span>
               <Sk w={52} h={18} />
             </div>
-          </div>
-          <div className="j-counts">
-            {['actions signed by the contract', 'signed by a private key', 'refused (sizing, policy or contract)', 'refused by the NEAR AI risk check'].map((label) => (
-              <div key={label}>
-                <Sk w={48} h={40} />
-                <span>{label}</span>
-              </div>
-            ))}
           </div>
         </aside>
       </div>

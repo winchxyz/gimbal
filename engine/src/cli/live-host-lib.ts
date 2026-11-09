@@ -31,7 +31,7 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { isIP } from 'node:net';
 import { extname, join, normalize, resolve, sep } from 'node:path';
 import type {
-  DeskState, EngineState, JournalEntry, Leg, RescueFailure, RescueProgress, ScanStatus, SetupProgress, StrategyConfig, StrategyDecision, TxRef,
+  DeskState, EngineState, JournalCounts, JournalEntry, Leg, RescueFailure, RescueProgress, ScanStatus, SetupProgress, StrategyConfig, StrategyDecision, TxRef,
   VenueAccount, Window, WindowHistory,
 } from '@gimbal/shared';
 import { MAX_STREAMS_PER_CLIENT } from './replay-host-lib.ts';
@@ -317,9 +317,11 @@ const SETUP = obj({
 // console disables Enter while it is set.
 const DECISION = obj({ action: V, reason: V, windowId: V, heldId: V, at: V, acting: V } satisfies Record<keyof StrategyDecision, Shape>);
 const HISTORY = obj({ windowId: V, points: list(obj({ t: V, netAprPct: V })) } satisfies Record<keyof WindowHistory, Shape>);
+// The journal counted by kind: numbers only, nothing of an entry's text.
+const JOURNAL_COUNTS = obj({ entries: V, since: V, kinds: RECORD, refusedHeld: V, refusedCancelled: V } satisfies Record<keyof JournalCounts, Shape>);
 const STATE = obj({
   mode: V, windows: list(WINDOW), scan: SCAN, strategy: STRATEGY, desk: DESK, journal: list(ENTRY), rescue: RESCUE, setup: SETUP, health: RECORD,
-  decision: DECISION, at: V,
+  decision: DECISION, journalCounts: JOURNAL_COUNTS, at: V,
 } satisfies Record<keyof EngineState, Shape>);
 /** The engine's own refusal of a read ({ error }). */
 const ERROR = obj({ ok: V, error: V, reason: V });
@@ -1113,7 +1115,7 @@ const TYPES: Record<string, string> = {
 
 /**
  * The page's own files only: no inline script or style (the Vite build has none; React sets styles through the DOM,
- * which a CSP allows), fonts and icons from this origin (the favicon is `data:`), and fetches to this origin plus the
+ * which a CSP allows), fonts and icons from this origin (the favicon and touch icon are files here), and fetches to this origin plus the
  * public NEAR RPCs the Security screen reads the contract from (web/src/onboarding/chain.ts RPC_URLS). No frames.
  */
 export const LIVE_CSP = [

@@ -26,9 +26,10 @@ import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type {
-  ContractPolicy, DeskState, EngineState, HealthMap, JournalEntry, Mode, RescueProgress, ScanStatus, SetupProgress,
+  ContractPolicy, DeskState, EngineState, HealthMap, JournalCounts, JournalEntry, Mode, RescueProgress, ScanStatus, SetupProgress,
   StrategyConfig, StrategyDecision, StreamEvent, Window as FundingWindow,
 } from '@gimbal/shared';
+import { addCount, countJournal, emptyCounts } from './journal-counts.ts';
 import { errorMessage } from './venues/recorder.ts';
 import { policyDraftRoute } from './nearai/draft-route.ts';
 import type { PolicyDrafter } from './nearai/draft-route.ts';
@@ -156,6 +157,8 @@ export class EngineServer {
   readonly #journal: JournalEntry[] = [];
   /** The ids in #journal: an entry published again under its id replaces the older copy, so a page never lists it twice. */
   readonly #journalIds = new Set<string>();
+  /** The entries dropped from #journal past JOURNAL_KEEP, counted, so GET /state's journalCounts still counts them. */
+  readonly #dropped: JournalCounts = emptyCounts();
   #strategy: StrategyConfig;
   #timer: ReturnType<typeof setTimeout> | undefined;
   #heartbeat: ReturnType<typeof setInterval> | undefined;
@@ -264,7 +267,11 @@ export class EngineServer {
     }
     this.#journal.unshift(entry);
     this.#journalIds.add(entry.id);
-    while (this.#journal.length > JOURNAL_KEEP) this.#journalIds.delete(this.#journal.pop()!.id);
+    while (this.#journal.length > JOURNAL_KEEP) {
+      const dropped = this.#journal.pop()!;
+      this.#journalIds.delete(dropped.id);
+      addCount(this.#dropped, dropped);
+    }
   }
 
   /** Calls `listener` with every event published from now on; the function returned stops it. */
@@ -308,6 +315,7 @@ export class EngineServer {
       setup: this.#latest.setup,
       health: this.#latest.health,
       decision: this.#latest.decision,
+      journalCounts: countJournal(this.#journal, this.#dropped),
       at: (this.#options.now ?? Date.now)(),
     };
   }

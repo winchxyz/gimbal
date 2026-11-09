@@ -1,25 +1,34 @@
-/* Windows screen. The layout follows design/screens/shared/stage.css (desktop, 1440 px) and phone.css (390 px);
-   every value comes from tokens.css. Colour means state only; a line separates rows or shows data. */
+/* Markets, brand book C (Markets 1440). The sentence on top, then the list of markets open to the desk on the left and
+   the selected market on the right. Every value comes from tokens.css. Colour means state only; a line separates rows. */
 
 .phone-only { display: none; }
 .w-hint { display: none; }
 
 /* ---------- frame: list on the left, the selected window on the right ---------- */
-/* The height of the area under the shell's lines: the list and the stage scroll on their own, the page does not. */
-.w-split { display: grid; grid-template-columns: var(--list-w) minmax(0, 1fr); height: 100%; }
+/* The height of the area under the header: the sentence stays, the list and the stage scroll on their own. */
+.w-page { display: flex; flex-direction: column; height: 100%; }
+.w-split { flex: 1 1 0; min-height: 0; display: grid; grid-template-columns: var(--list-w) minmax(0, 1fr); column-gap: 72px; padding: 0 0 0 var(--gutter); }
 .w-list, .w-detail { min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--line-2) transparent; }
-.w-list { border-right: 1px solid var(--line); }
+.w-list { padding-bottom: var(--s-7); }
 
-/* list header: tabs, then the live marker pushed to the right */
-.w-head { position: sticky; top: 0; z-index: 2; background: var(--bg); height: 64px; padding: 0 var(--s-6) 0 var(--gutter); display: flex; align-items: center; gap: var(--s-5); border-bottom: 1px solid var(--line); font: var(--t-s); }
-.w-title { display: none; }
-.w-tabs { display: flex; gap: var(--s-5); flex: none; white-space: nowrap; }
-.w-tab { color: var(--ink-2); font: inherit; transition: color var(--dur) var(--ease); }
-.w-tab:hover, .w-tab.on { color: var(--ink); }
-.w-live { margin: 0 0 0 auto; color: var(--ink-2); white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* the sentence that answers the screen, and what the list holds */
+.w-head { padding: 56px var(--gutter) 32px; }
+.w-answer { font: var(--t-display); letter-spacing: var(--track-display); max-width: 20ch; }
+.w-sub { margin-top: var(--s-4); font: var(--t-s); }
 
-/* amber lines under the header: venues that did not answer, a fired alert, a minimum that could not be read */
-.w-notice { display: flex; gap: var(--s-4); align-items: baseline; padding: 14px var(--s-6) 14px var(--gutter); border-bottom: 1px solid var(--line); background: rgba(240, 165, 49, .08); font: var(--t-s); }
+/* everything the desk may not trade now, folded */
+.w-closed { margin-top: 28px; }
+.w-closed summary { list-style: none; display: flex; justify-content: space-between; align-items: center; padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); cursor: pointer; }
+.w-closed summary::-webkit-details-marker { display: none; }
+.w-closed[open] summary .chev { transform: rotate(-135deg); margin-bottom: -2px; }
+.w-closed .gr { padding: 14px 0; border-bottom: 1px solid var(--line); }
+.w-closed .gr b { display: block; font-weight: 400; }
+.w-closed .gr > span { display: block; font: var(--t-s); color: var(--ink-2); margin-top: 4px; }
+.w-closed .coin { font: inherit; color: var(--ink-2); padding: 2px 0; }
+.w-closed .coin:hover { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
+
+/* lines over the list: venues that did not answer, a fired alert, a minimum that could not be read */
+.w-notice { display: flex; gap: var(--s-4); align-items: baseline; padding: 14px 0; border-bottom: 1px solid var(--line); font: var(--t-s); }
 .w-notice b { color: var(--watch); font-weight: 500; }
 .w-notice span { color: var(--ink-2); }
 /* A fact, not a risk: no desk is loaded. Colour is for state, so it is plain. */
@@ -27,13 +36,13 @@
 .w-notice.calm b { color: var(--ink); white-space: nowrap; flex: none; }
 
 /* ---------- rows ---------- */
-.w-rows { position: relative; }
-.w-item { display: grid; grid-template-columns: 1fr 88px 92px; column-gap: var(--s-4); align-items: center; padding: 13px var(--s-6) 13px var(--gutter); border-bottom: 1px solid var(--line); position: relative; cursor: pointer; outline: none; transition: background-color var(--dur) var(--ease), opacity var(--dur) var(--ease); }
-.w-item:hover:not(.sel) { background: rgba(242, 242, 240, .025); }
+.w-rows { position: relative; border-top: 1px solid var(--line); }
+.w-item { display: grid; grid-template-columns: 1fr 88px 92px; column-gap: var(--s-4); align-items: center; padding: 16px; margin: 0 -16px; border-bottom: 1px solid var(--line); position: relative; cursor: pointer; outline: none; transition: background-color var(--dur) var(--ease), opacity var(--dur) var(--ease); }
+.w-item:hover:not(.sel) { background: var(--sel); }
 .w-item:focus-visible { box-shadow: inset 0 0 0 1px var(--ink-3); }
 .w-item .a { font: var(--t-l); display: flex; align-items: baseline; min-width: 0; }
 .w-item .st { font: var(--t-s); margin-left: 10px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-.w-item .st.held { color: var(--pos); }
+.w-item .st.held { color: var(--ink); }
 .w-item .st.veto { color: var(--watch); }
 .w-item .st.refused { color: var(--danger); }
 .w-spark { display: block; width: 88px; height: 24px; }
@@ -49,16 +58,38 @@
 .w-item .rot .ask { display: inline-flex; align-items: center; flex-wrap: wrap; gap: var(--s-2) var(--s-3); }
 .w-item .rot .ink { color: var(--ink); }
 .w-item .rot .btn { height: 28px; }
-.w-item.sel::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--ink); }
 .w-item.below { opacity: .4; }
 .w-item.stale { opacity: .45; }
 .w-item.below.stale { opacity: .22; }
 .struck { text-decoration: line-through; text-decoration-thickness: 1px; color: var(--ink-2); }
-.w-minline { padding: 8px var(--s-6) 8px var(--gutter); border-bottom: 1px solid var(--ink-3); font: var(--t-s); color: var(--ink-2); text-align: right; }
-.w-none { padding: var(--s-5) var(--gutter); font: var(--t-s); color: var(--ink-2); }
+.w-minline { padding: 10px 0 8px; border-bottom: 1px solid var(--ink-3); font: var(--t-s); color: var(--ink-2); text-align: right; }
+.w-none { padding: var(--s-5) 0; font: var(--t-s); color: var(--ink-2); }
 
 /* ---------- detail stage ---------- */
-.w-detail { padding: 40px 72px 32px 80px; display: flex; flex-direction: column; }
+.w-detail { padding: 0 var(--gutter) 32px 0; display: flex; flex-direction: column; }
+.w-coin { display: flex; justify-content: space-between; align-items: baseline; gap: var(--s-4); }
+.w-coin b { font: var(--t-xl); letter-spacing: var(--track-xl); }
+.w-coin span { font: var(--t-s); }
+.w-big { margin-top: 28px; }
+.w-big b { display: block; font: var(--t-hero); letter-spacing: var(--track-hero); }
+.w-big p { margin-top: var(--s-3); font: var(--t-s); }
+.w-big p.w-status { margin-top: var(--s-1); }
+.w-three { margin-top: 36px; }
+.w-three .kv { font: var(--t-body); padding: 14px 0; }
+.w-three .kv.tot { border-bottom: 0; }
+.w-three .kv.sub { font: var(--t-s); padding: 8px 0 8px var(--s-4); }
+.w-costs summary { list-style: none; cursor: pointer; }
+.w-costs summary::-webkit-details-marker { display: none; }
+.w-costs[open] summary .chev { transform: rotate(-135deg); margin-bottom: -2px; }
+.w-checks { margin-top: 28px; margin-bottom: var(--s-6); }
+.w-checks summary { list-style: none; display: flex; justify-content: space-between; align-items: center; padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); cursor: pointer; }
+.w-checks summary::-webkit-details-marker { display: none; }
+.w-checks[open] summary .chev { transform: rotate(-135deg); margin-bottom: -2px; }
+.w-checks[open] summary { margin-bottom: var(--s-3); }
+.w-checks p { margin: 0 0 10px; font: var(--t-s); color: var(--ink); }
+.w-checks p.ok::before { content: '\2713'; color: var(--pos); margin-right: 8px; }
+.w-checks p.bad::before { content: '\00d7'; color: var(--danger); margin-right: 8px; }
+.w-checks p.g { color: var(--ink-2); }
 .w-back { display: none; }
 .w-dtop { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--s-5); }
 .w-dtop h1 { font: var(--t-display); letter-spacing: var(--track-display); }
@@ -70,7 +101,7 @@
 .w-dtop .n > span { display: block; margin-top: 10px; }
 .w-dtop .n > span + span { margin-top: 4px; }
 
-.w-chart { margin-top: var(--s-6); }
+.w-chart { margin-top: 40px; }
 .w-chart .cap { display: flex; justify-content: space-between; gap: var(--s-4); font: var(--t-s); color: var(--ink-2); margin-bottom: var(--s-2); }
 .w-chart .cap .own { color: var(--ink); }
 .w-chart svg { display: block; }
@@ -120,9 +151,7 @@
 .w-state-msg .go { display: flex; justify-content: center; gap: 10px; margin-top: 28px; }
 
 /* ---------- loading: placeholder bars where the figures go ---------- */
-.sk { display: block; background: var(--sel); border-radius: 4px; animation: w-sk 1.4s var(--ease) infinite; }
-@keyframes w-sk { 50% { background: var(--line-2); } }
-@media (prefers-reduced-motion: reduce) { .sk { animation: none; } }
+.sk { display: block; background: var(--sel); }
 .w-head .sk, .w-tabs .sk { flex: none; }
 .w-head .w-live-sk { margin-left: auto; }
 .w-detail-sk .w-dtop .n { flex: 1; }
@@ -132,8 +161,8 @@
    air, the asset and the net APR step down from 72 to 56 px so they stay side by side, and the two blocks under the
    chart stack. ---------- */
 @media (min-width: 1024px) and (max-width: 1279px) {
-  .w-split { grid-template-columns: 480px minmax(0, 1fr); }
-  .w-detail { padding: 40px 40px 32px 48px; }
+  .w-split { grid-template-columns: 480px minmax(0, 1fr); column-gap: 48px; }
+  .w-big b { font-size: 88px; }
   .w-dtop { flex-wrap: wrap; row-gap: var(--s-4); }
   .w-dtop > div:first-child { flex: 1 1 0; min-width: 0; }   /* the asset's lines wrap beside the net APR */
   .w-dtop h1, .w-dtop .n b { font-size: 56px; }
@@ -144,30 +173,29 @@
 @media (max-width: 1023px) {
   .phone-only { display: inline; }
   .desk-only { display: none; }
-  .w-hint { display: block; margin-top: var(--s-2); padding: 12px var(--gutter); font: var(--t-s); color: var(--ink-2); }
+  .w-hint { display: block; margin-top: var(--s-2); padding: 12px 0; font: var(--t-s); color: var(--ink-2); }
 
-  .w-split { display: block; height: auto; }
+  .w-page { display: block; height: auto; }
+  .w-page.detail-open > .w-head { display: none; }
+  .w-head { padding: 20px var(--gutter) 20px; }
+  .w-answer { font: 600 36px/1.06 var(--display); letter-spacing: -0.03em; max-width: none; }
+  .w-split { display: block; height: auto; padding: 0; }
+  .w-list { padding: 0 var(--gutter) var(--s-5); }
+  .w-big b { font: 600 72px/1 var(--display); letter-spacing: var(--track-hero); }
+  .w-three .kv { font: var(--t-m); }
   .w-list, .w-detail { overflow: visible; }
   .w-list { border-right: 0; }
   .w-split.detail-open .w-list { display: none; }
 
-  .w-head { position: static; height: auto; flex-direction: column; align-items: flex-start; gap: 0; padding: var(--s-5) var(--gutter) 3px; border-bottom: 0; }
-  .w-title { display: block; order: 0; font: 400 40px/1.05 var(--display); letter-spacing: var(--track-xl); }
-  .w-live { order: 1; margin: var(--s-2) 0 0; white-space: normal; }
-  .w-tabs { order: 2; margin-top: 3px; gap: 20px; }
-  .w-tab { padding: 13px 0; min-height: 44px; }   /* 44 px tap target; the margin above and the padding below give back the 13 px */
-  .w-head .w-live-sk { margin: 8px 0 0; }
-  .w-rows { border-top: 1px solid var(--line); }
 
-  .w-notice { display: block; padding: 14px var(--gutter); }
+  .w-notice { display: block; padding: 14px 0; }
   .w-notice b { display: block; margin-bottom: 2px; }
 
-  .w-item { grid-template-columns: 1fr 64px 64px; column-gap: var(--s-3); padding: 14px var(--gutter); }
+  .w-item { grid-template-columns: 1fr 64px 64px; column-gap: var(--s-3); padding: 14px var(--gutter); margin: 0 calc(-1 * var(--gutter)); }
   .w-item .st { margin-left: var(--s-2); }
   .w-item .s { margin-top: var(--s-1); }
   .w-spark { width: 64px; height: 20px; }
-  .w-minline { padding: 8px var(--gutter); }
-  .w-none { padding: var(--s-4) var(--gutter); }
+  .w-none { padding: var(--s-4) 0; }
 
   .w-detail { display: block; padding: 0 var(--gutter) var(--s-5); }
   .w-detail-sk { display: none; }

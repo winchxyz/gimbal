@@ -1,35 +1,53 @@
-/* Shell styles. Every value comes from tokens.css (copied as is from design/); the layout follows
-   design/screens/shared/stage.css (desktop, 1440 px) and phone.css (390 px).
-   Colour means state only; lines separate rows or show data. */
+/* Shell styles, brand book C. Every value comes from tokens.css.
+   Colour means state only; a line separates rows or carries data. No cards, chips, badges or stamps. */
 
 *, *::before, *::after { box-sizing: border-box; }
-html, body { margin: 0; background: var(--bg); color: var(--ink); font: var(--t-m); letter-spacing: var(--track-text); -webkit-font-smoothing: antialiased; font-variant-numeric: tabular-nums; }
+html, body { margin: 0; background: var(--bg); color: var(--ink); font: var(--t-m); letter-spacing: var(--track-text); -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; text-rendering: optimizeLegibility; font-variant-numeric: tabular-nums; }
 body { min-height: 100vh; }
 /* The `font` shorthand every type token uses resets font-variant-numeric, so the inherited value never reaches a number set
    in a token. Figures line up in columns, so every element asks for tabular ones directly. */
 *, *::before, *::after { font-variant-numeric: tabular-nums !important; }
 a { color: inherit; text-decoration: none; }
 button { font: inherit; color: inherit; background: none; border: 0; margin: 0; padding: 0; cursor: pointer; }
-h1, h2, h3, p { margin: 0; font-weight: 400; }
+h1, h2, h3, h4, p { margin: 0; font-weight: 400; }
 :focus-visible { outline: 1px solid var(--ink-2); outline-offset: 4px; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 
 .g { color: var(--ink-2); }
 .g3 { color: var(--ink-3); }
-.pos { color: var(--pos); }
-.neg { color: var(--danger); }
-.wt { color: var(--watch); }
-.dot::before { content: ''; display: inline-block; width: 6px; height: 6px; border-radius: var(--r-dot); background: var(--dot, var(--level)); margin-right: var(--s-2); vertical-align: 2px; }
+.pos, .up { color: var(--level); }
+.neg, .down { color: var(--danger); }
+.wt, .watch-t { color: var(--watch); }
+.dot::before { content: ''; display: inline-block; width: 7px; height: 7px; border-radius: var(--r-dot); background: var(--dot, var(--accent)); margin-right: 9px; vertical-align: 1px; }
 
-/* buttons: 36 px pills on desktop, 44 px on phone; one primary per view */
-.btn { white-space: nowrap; display: inline-flex; align-items: center; justify-content: center; height: 36px; padding: 0 var(--s-4); border-radius: var(--r-btn); font: var(--t-btn); border: 1px solid var(--line-2); color: var(--ink); background: none; transition: background-color var(--dur) var(--ease); }
-.btn:hover { background: var(--sel); }
-.btn.primary { background: var(--ink); color: var(--bg); border-color: var(--ink); }
-.btn.primary:hover { background: var(--ink); opacity: .88; }
-.btn.quiet { border-color: transparent; color: var(--ink-2); padding: 0 var(--s-2); }
+/* Buttons: words, not boxes (brand book C). A confirm is the one filled pill on a view. */
+.btn { white-space: nowrap; display: inline-flex; align-items: center; justify-content: center; min-height: 36px; padding: 0; font: var(--t-btn); color: var(--ink); background: none; border: 0; transition: opacity var(--dur) var(--ease), color var(--dur) var(--ease); }
+.btn + .btn { margin-left: var(--s-5); }
+.btn:hover { opacity: .8; }
+.btn:disabled { color: var(--ink-3); cursor: default; opacity: 1; }
+.btn.primary { background: var(--ink); color: var(--bg); padding: 0 var(--s-4); border-radius: var(--r-btn); }
+.btn.quiet { color: var(--ink-2); font-weight: 400; }
 
-/* a number that changed flashes once */
+/* the chevron after "Details", "Journal", "Markets" */
+.chev { display: inline-block; width: 7px; height: 7px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(45deg); margin: 0 2px 3px 8px; transition: transform var(--dur) var(--ease); }
+.chev.r { transform: rotate(-45deg); margin-bottom: 1px; }
+.chev.u { transform: rotate(-135deg); margin-bottom: -2px; }
+
+/* A new number crossfades in place: never counts up, never slides. */
 .flash { animation: flash var(--dur-fast) var(--ease); }
-@keyframes flash { 50% { color: var(--ink-2); } }
+@keyframes flash { 0% { opacity: .35; } 100% { opacity: 1; } }
+
+/* ---------- the screen's answer: one sentence, the biggest type ---------- */
+.answer { font: var(--t-answer); letter-spacing: var(--track-answer); max-width: 15ch; text-wrap: balance; }
+.answer.wide { max-width: 22ch; }
+.lab { font: var(--t-s); color: var(--ink-2); }
+/* a block's head: its label on the left, a link to the screen that holds the rest on the right */
+.hd { display: flex; justify-content: space-between; align-items: baseline; gap: var(--s-4); font: var(--t-s); color: var(--ink-2); margin-bottom: 14px; }
+.hd a:hover { color: var(--ink); }
+.kv { display: flex; justify-content: space-between; gap: var(--s-4); padding: 11px 0; border-bottom: 1px solid var(--line); }
+.kv > span:first-child { color: var(--ink-2); }
+.kv > span:last-child { text-align: right; }
+.kv.tot > span { color: var(--ink); font-weight: 600; }
 
 /* ---------- frame ---------- */
 .app { min-height: 100vh; display: flex; flex-direction: column; }
@@ -37,106 +55,71 @@ h1, h2, h3, p { margin: 0; font-weight: 400; }
 /* The shell focuses the element that scrolls a new screen so the keyboard scrolls it; it is not a control. */
 .page:focus, [data-scroller]:focus { outline: none; }
 
-/* Desktop: the shell is the window. The header and the lines under it stay put; only the screen under them scrolls,
-   inside its own area (Windows and Journal split it further into columns that scroll on their own). The document
-   never scrolls, and a scroll that reaches an end stops there instead of chaining. The phone keeps a normal page. */
+/* Desktop: the header stays put; only the screen under it scrolls, inside its own area (Markets and Journal split it
+   further into columns that scroll on their own). The phone keeps a normal page. */
 @media (min-width: 1024px) {
   .shell { height: 100dvh; overflow: hidden; }
   .shell > * { flex: none; }
-  /* the thin, quiet bar the Windows columns use */
-  .shell > .page { flex: 1 1 0; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--line-2) transparent; }
+  .shell > .page { flex: 1 1 0; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
 }
 
-/* header: brand, the five sections centred, network and the one money action */
-.hdr { height: var(--header); padding: 0 var(--gutter); display: grid; grid-template-columns: 1fr auto 1fr; column-gap: var(--s-6); align-items: center; border-bottom: 1px solid var(--line); }
+/* header: the lockup, the four sections centred, the one status line */
+.hdr { height: var(--header); padding: 0 var(--gutter); display: grid; grid-template-columns: 1fr auto 1fr; column-gap: var(--s-6); align-items: center; position: relative; z-index: 2; }
 .brand { justify-self: start; display: block; }
 .wordmark { display: block; color: var(--ink); }
-.wordmark svg { display: block; height: 19px; width: auto; }
-.wordmark .level { fill: var(--level); }
-.sections { display: flex; gap: var(--s-6); }
+/* The B lockup sized from its word (brand book C): the word is --wh tall, the box is the word / 0.4545, and the box
+   moves down 0.2145 of itself so the word sits on the header's middle and the long arm hangs below it. */
+.hdr { --wh: 23px; }
+.wordmark svg { display: block; height: calc(var(--wh) / 0.4545); width: auto; transform: translateY(calc(var(--wh) / 0.4545 * 0.2145)); }
+.sections { display: flex; gap: 36px; }
 .sections a { color: var(--ink-2); transition: color var(--dur) var(--ease); }
-.sections a:hover, .sections a.on { color: var(--ink); }
-.hdr .right { justify-self: end; display: flex; align-items: center; gap: var(--s-5); font: var(--t-s); color: var(--ink-2); white-space: nowrap; }
-.hdr .net { color: var(--ink); }
+.sections a:hover { color: var(--ink); }
+.sections a.on { color: var(--ink); font-weight: 600; }   /* the active tab: Chalk and bold, as brand book C draws it */
+.hdr .right { justify-self: end; display: flex; align-items: baseline; gap: var(--s-5); font: var(--t-s); color: var(--ink-2); white-space: nowrap; min-width: 0; }
+.hdr .right a { color: var(--ink); }
+.hdr .right a.quiet { color: var(--ink-2); }
+.hdr .right a:hover { color: var(--ink); }
+.hl { overflow: hidden; text-overflow: ellipsis; }
+.hl::before { content: ''; display: inline-block; width: 7px; height: 7px; border-radius: var(--r-dot); background: var(--ink-3); margin-right: 9px; vertical-align: 1px; }
+.hl.live::before { background: var(--accent); }
+.hl.watch::before { background: var(--watch); }
+.hl.down { color: var(--danger); }
+.hl.down::before { background: var(--danger); }
+.hl-short { display: none; }
 .money { display: contents; }
 
-/* status line: under the header on Desk and Rescue; the only line that changes colour for risk */
-.status { min-height: var(--status); padding: var(--s-2) var(--gutter); display: flex; align-items: center; gap: var(--s-4); border-bottom: 1px solid var(--line); --dot: var(--level); }
-.status .state { color: var(--level); font-weight: 500; flex: none; }
-.status .say { min-width: 0; }
-.status.watch { --dot: var(--watch); }
-.status.watch .state { color: var(--watch); }
-.status.rescuing { --dot: var(--watch); background: rgba(240, 165, 49, .08); }
-.status.rescuing .state { color: var(--watch); }
-.status.needs, .status.down { --dot: var(--danger); background: rgba(255, 90, 95, .08); }
-.status.needs .state, .status.down .state { color: var(--danger); }
-.status.waiting, .status.loading, .status.paused { --dot: var(--ink-3); }
-.status.waiting .state, .status.loading .state, .status.paused .state { color: var(--ink-2); }
-.status .checked { flex: none; }
-
-/* the owner's buttons for the state, at the right end of the status line; the phone draws them on the page */
-.actions { display: inline-flex; align-items: center; gap: var(--s-1); }
-.status .actions { margin-left: auto; flex: none; }
-.actions .note { font: var(--t-s); }
-.actions .ask { margin-right: var(--s-3); }
-
-/* "Not sent": a button whose wallet or engine call is not connected yet says so, and nothing changes */
-.notice { display: flex; align-items: baseline; gap: var(--s-4); padding: var(--s-3) var(--gutter); border-bottom: 1px solid var(--line); background: rgba(240, 165, 49, .08); font: var(--t-s); }
-.notice b { color: var(--watch); font-weight: 500; flex: none; }
-.notice span { color: var(--ink-2); flex: 1; min-width: 0; }
-.notice .btn { height: 28px; flex: none; }
-.notice.ok { background: none; }
-.notice.ok b { color: var(--ink); }
-
-/* ---------- placeholder body (until each screen is built) ---------- */
-.ph { display: grid; grid-template-columns: minmax(0, 1fr) 400px; column-gap: var(--s-8); padding: 40px var(--gutter) var(--s-8); }
-.ph h1 { font: var(--t-display); letter-spacing: var(--track-display); }
-.ph .lead { margin-top: 14px; color: var(--ink-2); max-width: 560px; }
-.ph .note { margin-top: var(--s-5); font: var(--t-s); color: var(--ink-3); max-width: 560px; }
-
-.stream .lab { font: var(--t-s); color: var(--ink-2); }
-.stream .count { margin-top: var(--s-3); font: var(--t-num); letter-spacing: var(--track-num); }
-.stream .src { margin-top: 10px; font: var(--t-s); color: var(--ink-2); }
-.rows { margin-top: var(--s-5); }
-.rows > div { display: flex; justify-content: space-between; gap: var(--s-3); padding: 10px 0; border-bottom: 1px solid var(--line); }
-.rows > div > span:first-child { color: var(--ink-2); }
-.rows > div > span:last-child { text-align: right; }
+/* What a button did: one small note at the foot of the screen, gone by itself. */
+.toast { position: fixed; left: 50%; bottom: var(--s-6); transform: translateX(-50%); z-index: 5; width: min(640px, calc(100vw - 2 * var(--gutter))); display: flex; align-items: baseline; gap: var(--s-4); padding: var(--s-3) var(--s-4); background: var(--sel); font: var(--t-s); }
+.toast b { color: var(--watch); font-weight: 600; flex: none; }
+.toast span { color: var(--ink); flex: 1; min-width: 0; }
+.toast.ok b { color: var(--ink); }
+.toast .btn { min-height: 0; flex: none; }
 
 /* the tab bar is the phone's navigation */
 .tabs { display: none; }
+
+/* placeholder bars while a screen reads: still, no shimmer */
+.sk, .d-sk, .r-sk, .s-sk, .j-sk { display: block; background: var(--sel); }
 
 /* ---------- phone: up to 1023 px, one centred column up to 640 px ---------- */
 @media (max-width: 1023px) {
   :root { --gutter: 16px; }
   .app { max-width: 640px; margin: 0 auto; padding-bottom: 96px; }
 
-  .hdr { height: 56px; grid-template-columns: auto 1fr; }
+  .hdr { height: 60px; grid-template-columns: auto 1fr; }
   .sections, .money { display: none; }
-  .wordmark svg { height: 16px; }
+  .hdr { --wh: 20px; }
   .hdr .right { gap: 14px; }
-  .brand { display: flex; align-items: center; min-height: 44px; padding-right: var(--s-4); }   /* a 44 px tap target around the 16 px wordmark */
+  .hl-long { display: none; }
+  .hl-short { display: inline; }
+  .brand { display: flex; align-items: center; min-height: 44px; padding-right: var(--s-4); }
 
-  .status { display: block; min-height: 0; padding: var(--s-3) var(--gutter); font: var(--t-s); }
-  .status .state { margin-right: 6px; }
-  .status .checked, .status .actions { display: none; }
-  .status .say { display: inline; }
-  .notice { display: block; padding: var(--s-3) var(--gutter); }
-  .notice b { margin-right: var(--s-2); }
-  .notice span { display: inline; }
-  .notice .btn { display: block; margin-top: var(--s-2); height: 44px; padding: 0; width: 100%; }
+  .answer { font: 600 36px/1.06 var(--display); letter-spacing: -0.03em; max-width: none; }
+  .btn { min-height: 44px; font-size: 15px; }
+  .toast { bottom: 96px; }
 
-  .ph { display: block; padding: var(--s-5) var(--gutter) 0; }
-  .ph h1 { font: 400 40px/1.05 var(--display); letter-spacing: var(--track-xl); }
-  .ph .lead { margin-top: var(--s-2); }
-  .ph .note { margin-top: var(--s-3); }
-  .stream { margin-top: var(--s-5); padding-top: var(--s-5); border-top: 1px solid var(--line); }
-  .stream .count { margin-top: var(--s-2); font: 400 40px/1 var(--display); letter-spacing: var(--track-xl); }
-
-  .btn { height: 44px; padding: 0 18px; border-radius: 22px; font-size: 15px; }
-
-  .tabs { position: fixed; left: 0; right: 0; bottom: 0; max-width: 640px; margin: 0 auto; min-height: 72px; padding: 0 8px max(8px, env(safe-area-inset-bottom)); display: grid; grid-template-columns: repeat(5, 1fr); background: var(--bg); border-top: 1px solid var(--line); font: 500 11px/1 var(--font); text-align: center; }
-  .tabs a { color: var(--ink-3); display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 0 14px; min-height: 48px; }   /* the whole cell is the tap target */
-  .tabs a i { width: 18px; height: 3px; border-radius: 2px; background: var(--level); opacity: 0; }
-  .tabs a.on { color: var(--ink); }
-  .tabs a.on i { opacity: 1; }
+  .tabs { position: fixed; z-index: 4; left: 0; right: 0; bottom: 0; max-width: 640px; margin: 0 auto; padding: 0 0 max(8px, env(safe-area-inset-bottom)); display: grid; grid-template-columns: repeat(4, 1fr); background: var(--bg); border-top: 1px solid var(--line); font: 400 12px/1 var(--font); text-align: center; }
+  .tabs a { color: var(--ink-2); display: flex; flex-direction: column; align-items: center; gap: 5px; padding: 14px 0 12px; min-height: 48px; }   /* the whole cell is the tap target */
+  .tabs svg { width: 22px; height: 22px; display: block; }
+  .tabs a.on { color: var(--accent); font-weight: 600; }   /* the active label and icon in mint */
 }

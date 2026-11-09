@@ -3,6 +3,7 @@
 // `EngineApi`, so the fake and the engine look alike to it, and `engineApi()` in start.ts picks one. Pure apart from
 // `fetch`, so the parsers are tested.
 import type { EngineState, JournalEntry, Mode, StrategyConfig, WindowHistory } from '@gimbal/shared';
+import { parseJournalCounts } from '../journal/counts.ts';
 import { KINDS } from '../journal/kinds.ts';
 import { isStreamData, type StreamType } from './store.ts';
 
@@ -158,6 +159,8 @@ export function parseEngineState(value: unknown): EngineState {
     at,
     strategy: strategy === null || strategy === undefined ? null : parseStrategy(strategy),
     journal: parseJournal(value),
+    // Absent from an engine from before it; counts that do not check out are left out the same way.
+    ...(parseJournalCounts(value.journalCounts) === null ? {} : { journalCounts: parseJournalCounts(value.journalCounts)! }),
     ...slots,
   } as EngineState;
 }

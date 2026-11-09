@@ -55,7 +55,7 @@ export function enterState(w: FundingWindow, windows: readonly FundingWindow[], 
   if (auto === false) return { kind: 'blocked', reason: 'Auto is off in the engine rules, and the engine opens nothing while it is off.' };
   if (isNoDesk(w)) return { kind: 'blocked', reason: 'There is no desk to trade it with.' };
   if (w.refused) return { kind: 'blocked', reason: `The contract would refuse it (${w.refused.code}): ${capital(w.refused.reason)}` };
-  if (w.stale) return { kind: 'blocked', reason: 'Its numbers are stale: a venue it needs did not answer.' };
+  if (w.stale) return { kind: 'blocked', reason: 'Its numbers are from an earlier scan: a venue it needs did not answer. The next scan reads it again.' };
   if (w.veto?.verdict === 'veto') return { kind: 'blocked', reason: 'The NEAR AI risk check refused it.' };
   return { kind: 'open' };
 }

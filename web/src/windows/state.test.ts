@@ -85,13 +85,14 @@ test('GET /windows/history: points come back oldest first', () => {
   assert.throws(() => parseHistory([]), /points|windowId/);
 });
 
-test('#/windows/<id> names a window; the shell still reads it as Windows', () => {
+test('#/markets/<id> names a market (an old #/windows/<id> link too); the shell reads it as Markets', () => {
+  assert.equal(windowIdFromHash('#/markets/sol-phoenix-orderly'), 'sol-phoenix-orderly');
   assert.equal(windowIdFromHash('#/windows/sol-phoenix-orderly'), 'sol-phoenix-orderly');
   assert.equal(windowIdFromHash('#/windows/a%2Fb%3Fc'), 'a/b?c');
   assert.equal(windowIdFromHash('#/windows'), null);
   assert.equal(windowIdFromHash('#/desk'), null);
   assert.equal(windowIdFromHash('#/windows/%E0%A4%A'), null);
-  assert.equal(hashForWindow('a/b'), '#/windows/a%2Fb');
-  assert.equal(hashForWindow(null), '#/windows');
+  assert.equal(hashForWindow('a/b'), '#/markets/a%2Fb');
+  assert.equal(hashForWindow(null), '#/markets');
   assert.equal(windowIdFromHash(hashForWindow('x y/z')), 'x y/z');
 });

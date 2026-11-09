@@ -1,18 +1,17 @@
 import { useMemo } from 'react';
-import type { ScanStatus, Window as FundingWindow } from '@gimbal/shared';
-import type { Connection } from '../stream/store.ts';
+import type { Window as FundingWindow } from '@gimbal/shared';
 import { Flash } from '../ui/Flash.tsx';
 import { cx } from '../ui/cx.ts';
-import { dotColor } from '../ui/dot.ts';
 import { ago, useNow } from '../ui/useNow.ts';
 import { writeControls } from '../remote/readonly.ts';
 import { useManualSend } from '../ui/useManualSend.ts';
 import type { Alert, Reached } from './alerts.ts';
 import { sparkline } from './chart.ts';
-import { depth, hours, pct, plain, usd } from './format.ts';
+import { depth, hours, pct, plain, usd, venueName } from './format.ts';
+import type { ClosedGroup, MarketsAnswer } from './markets.ts';
 import type { HistoryEntry } from './history.ts';
 import { confirmText } from './manual.ts';
-import { isEnterable, isNoDesk, rowStatus, totalCosts, venuePair, type FailedScan, type Tab } from './model.ts';
+import { isEnterable, isNoDesk, rowStatus, totalCosts, venuePair, type FailedScan } from './model.ts';
 import { OwnerEnter } from './OwnerEnter.tsx';
 
 /** "2 s ago", ticking: a component of its own so the list does not re-render every second. */
@@ -23,53 +22,65 @@ export function Ago({ at }: { at: number }) {
 // ---------- header ----------
 
 interface HeadProps {
-  tab: Tab;
-  onTab(tab: Tab): void;
-  tradableCount: number;
-  watchCount: number;
+  answer: MarketsAnswer;
+  /** Markets open to the desk now. */
+  open: number;
+  /** Venues the last scan read, and how many of them the desk cannot trade. */
+  venues: number | null;
   watchVenues: number | null;
-  scan: ScanStatus | null;
-  newestAt: number | null;
-  connection: Connection;
-  /** The engine plays a recording: the marker says Replay, never Live. */
-  replay?: boolean;
 }
 
-const LIVE: Record<Connection, { label: string; dot: string }> = {
-  open: { label: 'Live', dot: 'var(--level)' },
-  connecting: { label: 'Connecting', dot: 'var(--ink-3)' },
-  retrying: { label: 'Reconnecting', dot: 'var(--watch)' },
-  idle: { label: 'Not live', dot: 'var(--ink-3)' },
-};
-const REPLAY_OPEN = { label: 'Replay', dot: 'var(--replay)' };
-
-/** Tabs and the live marker. On the phone the title comes first, then the marker, then the tabs. */
-export function ListHead({ tab, onTab, tradableCount, watchCount, watchVenues, scan, newestAt, connection, replay = false }: HeadProps) {
-  const live = replay && connection === 'open' ? REPLAY_OPEN : LIVE[connection];
-  const at = scan?.at ?? newestAt;
+/** The sentence (the best market open to the desk), then what the list holds, quietly. */
+export function ListHead({ answer, open, venues, watchVenues }: HeadProps) {
   return (
     <div className="w-head">
-      <h1 className="w-title">Windows</h1>
-      <div className="w-tabs" role="tablist" aria-label="Windows">
-        <button type="button" role="tab" aria-selected={tab === 'tradable'} className={cx('w-tab', tab === 'tradable' && 'on')} onClick={() => onTab('tradable')}>
-          Tradable {tradableCount}
-        </button>
-        <button type="button" role="tab" aria-selected={tab === 'watch'} className={cx('w-tab', tab === 'watch' && 'on')} onClick={() => onTab('watch')}>
-          Watch-only {watchVenues === null ? watchCount : `${watchVenues} venues`}
-        </button>
-      </div>
-      {/* The list column can be too narrow for the whole marker: what it cuts off is on hover. */}
-      <p className="w-live" title={`${live.label}${scan ? ` · ${scan.venues} venues` : ''} · sorted by ${tab === 'tradable' ? 'net APR after costs' : 'gross APR'}`}>
-        <span className="dot" style={dotColor(live.dot)}>{live.label}</span>
-        {scan ? <>{'  '}{scan.venues} venues</> : null}
-        {at !== null ? <> · <Ago at={at} /></> : null}
-        {' · '}
-        <span className="desk-only">{tab === 'tradable' ? 'net APR ↓' : 'gross APR ↓'}</span>
-        <span className="phone-only">{tab === 'tradable' ? 'net APR after costs' : 'gross APR'}</span>
+      <h1 className="answer w-answer" data-testid="markets-answer">
+        {answer.lead}
+        {answer.rate === null ? null : <span className={answer.tone ?? undefined}>{answer.rate}</span>}
+        {answer.rest}
+      </h1>
+      <p className="w-sub g">
+        {open} {open === 1 ? 'market' : 'markets'} open to the desk
+        {venues === null ? '' : `, from ${venues} venues read${watchVenues ? ` (${watchVenues} watch-only)` : ''}`} · net a year after costs, best first
       </p>
     </div>
   );
 }
+
+/** Everything the desk may not trade now, folded: one line per plain reason, the coins under it; a coin opens its detail. */
+export function Closed({ groups, onSelect }: { groups: readonly ClosedGroup[]; onSelect(id: string): void }) {
+  const count = groups.reduce((n, g) => n + g.windows.length, 0);
+  if (count === 0) return null;
+  return (
+    <details className="w-closed">
+      <summary>
+        <span>Not open to the desk · {count}</span>
+        <i className="chev" aria-hidden="true" />
+      </summary>
+      {groups.map((g) => (
+        <div key={g.key} className="gr">
+          <b>
+            {g.reason} · {g.windows.length}
+          </b>
+          <span>
+            {g.windows.slice(0, CLOSED_SHOWN).map((w, i) => (
+              <span key={w.id}>
+                {i === 0 ? '' : ', '}
+                <button type="button" className="coin" onClick={() => onSelect(w.id)} title={`${w.symbol}: long ${venueName(w.longVenue)}, short ${venueName(w.shortVenue)}`}>
+                  {w.symbol}
+                </button>
+              </span>
+            ))}
+            {g.windows.length > CLOSED_SHOWN ? ` and ${g.windows.length - CLOSED_SHOWN} more` : ''}
+          </span>
+        </div>
+      ))}
+    </details>
+  );
+}
+
+/** Coins named under a reason before the rest is counted. */
+const CLOSED_SHOWN = 24;
 
 // ---------- notices under the header ----------
 
@@ -91,7 +102,7 @@ export function Notices({ noDesk, failed, held, reached, onClearAlert, strategyE
         <div className="w-notice calm" role="status">
           <b>No desk yet</b>
           <span>
-            The scanner is reading funding, but no desk is loaded, so nothing here can be entered. These are the windows a desk could trade;
+            The scanner is reading funding, but no desk is loaded, so nothing here can be entered. These are the markets a desk could trade;
             they open for entry once one exists.
           </span>
         </div>

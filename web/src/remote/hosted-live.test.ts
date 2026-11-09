@@ -1,6 +1,5 @@
 // The public live view's build: read-only with no Settings step, every write control left out, the engine's masked
-// ids, a line that names what the engine runs (never live data as a replay, never a replay as live), and the host's
-// not-configured state.
+// ids, the Owner link, and the host's not-configured state.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -8,7 +7,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { NOT_CONFIGURED_TEXT, parseHostedHealth, parseOwnerWrites } from './hosted.ts';
 import {
-  hostedLiveFlag, hostedLiveLine, isHostedLive, isReadOnly, isRemote, remoteSettings, setHostedLiveForTests, setRemoteSettingsForTests, writeControls,
+  hostedLiveFlag, isHostedLive, isReadOnly, isRemote, remoteSettings, setHostedLiveForTests, setRemoteSettingsForTests, writeControls,
   writeControlsFor,
 } from './readonly.ts';
 
@@ -38,33 +37,14 @@ test('the hosted-live build is read-only from the start: no Settings step, a sav
   }
 });
 
-test('the line names what the engine reports: live mainnet is never called a replay, and a replay is never called live', () => {
-  const mainnet = hostedLiveLine('mainnet');
-  assert.match(mainnet, /^Live mainnet desk, read-only/);
-  assert.doesNotMatch(mainnet.replace('For the recorded replay, run npm run demo.', ''), /replay/i);
-  assert.match(mainnet, /npm run demo/);
-  const replay = hostedLiveLine('replay');
-  assert.match(replay, /^Replay, read-only/);
-  assert.match(replay, /not the live desk/);
-  assert.doesNotMatch(replay.replace('not the live desk', ''), /\blive\b/i);
-  assert.match(hostedLiveLine('testnet'), /^Live testnet desk/);
-  const unknown = hostedLiveLine(null);
-  assert.doesNotMatch(unknown, /\b(live|mainnet|replay)\b/i, 'before the engine answers, nothing is claimed');
-});
-
-test('owner writes off on the host: the line is exactly as before, with no word of an owner; on: "read-only for visitors"', () => {
-  assert.equal(hostedLiveLine('mainnet'), 'Live mainnet desk, read-only: the real desk as it trades now. Nothing on this page can change it. For the recorded replay, run npm run demo.');
-  assert.equal(hostedLiveLine('testnet'), 'Live testnet desk, read-only: test money, not the mainnet desk. Nothing on this page can change it.');
-  assert.equal(hostedLiveLine('mainnet', false, false), hostedLiveLine('mainnet'));
-  assert.match(hostedLiveLine('mainnet', false, true), /^Live mainnet desk, read-only for visitors: /);
-  assert.match(hostedLiveLine('mainnet', true, true), /Owner unlocked in this tab/);
-  for (const mode of ['mainnet', 'testnet', 'replay', null] as const) assert.doesNotMatch(hostedLiveLine(mode), /owner/i);
+test('owner writes: the host says so in /healthz, and only then (or unlocked) does the header draw the Owner link', () => {
+  // The header line's wording (live never called a replay, a replay never live) is tested in shell/headline.test.ts.
   // The host says owner writes are on only with `owner: true` in /healthz; anything else is off.
   assert.equal(parseOwnerWrites({ ok: true, live: 'connected', visitors: 1, owner: true }), true);
   for (const body of [null, {}, { ok: true, live: 'connected', visitors: 1 }, { owner: 'true' }, { owner: 1 }]) assert.equal(parseOwnerWrites(body), false);
   // The Owner link is drawn only when the host says so, or this tab is unlocked (to Lock).
-  const bar = readFileSync(join(root, 'web', 'src', 'remote', 'RemoteBar.tsx'), 'utf8');
-  assert.match(bar, /\{ownerWrites \|\| unlocked \? <a href=\{OWNER_HREF\}>Owner<\/a> : null\}/);
+  const header = readFileSync(join(root, 'web', 'src', 'shell', 'Header.tsx'), 'utf8');
+  assert.match(header, /\{isHostedLive\(\) && \(ownerWrites \|\| unlocked\) \? <a className="quiet" href=\{OWNER_HREF\}>Owner<\/a> : null\}/);
 });
 
 test('the host\'s /healthz: its live state, anything else unknown', () => {

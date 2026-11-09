@@ -51,11 +51,17 @@ test('the status line follows desk health and names the nearest leg', () => {
   assert.equal(statusOf(desk('level', [])).tone, 'waiting');
 });
 
-test('hash routes map to the five sections, Desk by default', () => {
+test('hash routes map to the four sections, Desk by default', () => {
   assert.equal(screenFromHash(''), 'desk');
-  assert.equal(screenFromHash('#/windows'), 'windows');
+  assert.equal(screenFromHash('#/markets'), 'markets');
   assert.equal(screenFromHash('#journal'), 'journal');
-  assert.equal(screenFromHash('#/rescue/42'), 'rescue');
-  assert.equal(screenFromHash('#/security?x=1'), 'security');
+  assert.equal(screenFromHash('#/safety'), 'safety');
   assert.equal(screenFromHash('#/nope'), 'desk');
+});
+
+test('the old five sections still land on the screen that holds them now', () => {
+  assert.equal(screenFromHash('#/windows'), 'markets');
+  assert.equal(screenFromHash('#/windows/mon-phoenix-hyperliquid'), 'markets');
+  assert.equal(screenFromHash('#/rescue/42'), 'safety');
+  assert.equal(screenFromHash('#/security?x=1'), 'safety');
 });

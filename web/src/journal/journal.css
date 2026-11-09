@@ -6,14 +6,13 @@
 @media (min-width: 1024px) { .j-phone { display: none !important; } }
 @media (max-width: 1023px) { .j-desk { display: none !important; } }
 
-/* ---------- head: title, one sentence, Export CSV; then the filters ---------- */
-.j-top { padding: 40px var(--gutter) 0; display: flex; justify-content: space-between; align-items: flex-end; gap: var(--s-5); }
-.j-top h1 { font: var(--t-display); letter-spacing: var(--track-display); }
-.j-top h1 + p { margin: 14px 0 0; color: var(--ink-2); }
-.j-top h1 + p b { color: var(--ink); font-weight: 400; }
-.j-top .btn { flex: none; }
-.j-top .btn:disabled { opacity: .4; cursor: default; }
-.j-top .btn:disabled:hover { background: none; }
+/* ---------- head: the sentence, what it counts, Export CSV; then the filters ---------- */
+.j-top { padding: 56px var(--gutter) 0; }
+.j-top .answer { font: var(--t-display); letter-spacing: var(--track-display); max-width: 24ch; }
+.j-sub { margin-top: var(--s-4); font: var(--t-s); }
+.j-sub .btn { min-height: 0; margin-left: var(--s-3); font: var(--t-s); color: var(--ink); }
+.j-sub .btn:disabled { color: var(--ink-3); }
+.j-partial { margin-top: var(--s-3); font: var(--t-s); color: var(--ink-2); }
 
 .j-filters { display: flex; gap: 28px; padding: 0 var(--gutter); margin-top: 32px; border-bottom: 1px solid var(--line); }
 .j-filters button { color: var(--ink-2); padding-bottom: 14px; white-space: nowrap; transition: color var(--dur) var(--ease); }
@@ -41,10 +40,10 @@
 
 /* ---------- the feed ---------- */
 .j-feed { padding: 0 48px 64px var(--gutter); border-right: 1px solid var(--line); min-width: 0; }
-.j-day { font: var(--t-s); color: var(--ink-2); padding: 28px 0 10px; border-bottom: 1px solid var(--line-2); display: flex; justify-content: space-between; gap: var(--s-4); }
+.j-day { font: var(--t-s); color: var(--ink-2); padding: 28px 0 10px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: var(--s-4); }
 .j-day h2 { font: inherit; }
 
-.j-evt { display: grid; grid-template-columns: 56px 88px minmax(0, 1fr) 104px 200px; column-gap: var(--s-4); padding: var(--s-4) 0; border-bottom: 1px solid var(--line); align-items: baseline; }
+.j-evt { display: grid; grid-template-columns: 76px 88px minmax(0, 1fr) 104px 200px; column-gap: var(--s-4); padding: var(--s-4) 0; border-bottom: 1px solid var(--line); align-items: baseline; }
 .j-lead { display: contents; }
 .j-lead .sep { display: none; }
 .j-evt .t { font: var(--t-s); color: var(--ink-3); }
@@ -56,8 +55,8 @@
 .j-evt .why { display: block; font: var(--t-s); color: var(--ink-2); margin-top: 6px; }
 .j-evt .why.flag { color: var(--watch); }
 .j-evt .why.flag::before { content: ''; display: inline-block; width: 6px; height: 6px; border-radius: var(--r-dot); background: var(--watch); margin-right: var(--s-2); vertical-align: 1px; }
-.j-wait .j-wait-more { display: block; margin-top: 6px; padding: 0; border: 0; background: none; font: var(--t-s); color: var(--ink-3); cursor: pointer; }
-.j-wait .j-wait-more:hover { color: var(--ink); }
+.j-evt .j-wait-more { display: block; margin-top: 6px; padding: 0; border: 0; background: none; font: var(--t-s); color: var(--ink-3); cursor: pointer; }
+.j-evt .j-wait-more:hover { color: var(--ink); }
 .j-wait-list { list-style: none; margin: 10px 0 0; padding: 0; font: var(--t-s); color: var(--ink-2); }
 .j-wait-list li { display: grid; grid-template-columns: 48px minmax(0, 1fr); column-gap: var(--s-3); padding: 4px 0; }
 .j-wait-list .t { color: var(--ink-3); }
@@ -84,8 +83,7 @@
 
 /* "2 new events": stays in view while the reader is scrolled down, and takes them to the top */
 .j-new { position: sticky; top: var(--s-3); z-index: 2; height: 0; display: flex; justify-content: center; }
-.j-new .btn { background: var(--sel); border-color: var(--line-2); height: 32px; margin-top: var(--s-2); }
-.j-new .btn:hover { background: var(--line); }
+.j-new .btn { background: var(--ink); color: var(--bg); padding: 0 var(--s-4); border-radius: var(--r-btn); height: 32px; min-height: 32px; margin-top: var(--s-2); }
 
 /* ---------- the side column ---------- */
 .j-side { padding: var(--s-6) var(--gutter) 0 40px; min-width: 0; }
@@ -97,10 +95,12 @@
 .j-attr > div > span:first-child { color: var(--ink-2); }
 .j-attr > div > span:last-child { white-space: nowrap; }   /* a long label wraps; the amount beside it never does */
 .j-attr > .tot { border-bottom: 0; border-top: 1px solid var(--ink-2); margin-top: -1px; }
-.j-counts { margin-top: 40px; display: grid; grid-template-columns: 1fr 1fr; gap: 24px var(--s-4); }
-.j-counts b { display: block; font: var(--t-num); letter-spacing: var(--track-num); font-weight: 400; }
-.j-counts b.lvl { color: var(--level); }
-.j-counts > div > span { font: var(--t-s); color: var(--ink-2); }
+/* Counts: the label left, the count right and bold (brand book C, Journal) */
+.j-cnt h3 { font: var(--t-s); color: var(--ink-2); margin: 0 0 4px; }
+.j-cnt .kv { align-items: baseline; }
+.j-cnt .kv b { font-weight: 600; font-size: 21px; letter-spacing: -0.01em; color: var(--ink); }
+.j-note { font: var(--t-s); color: var(--ink-2); margin: 14px 0 0; }
+.j-side .j-since { margin-top: 40px; }
 .j-contract { margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--line); font: var(--t-s); color: var(--ink-2); }
 .j-contract p { margin: 0 0 8px; }
 .j-contract .mono { font-family: var(--mono); color: var(--ink); font-size: 12px; overflow-wrap: anywhere; }
@@ -116,13 +116,10 @@
 .j-state-msg .go { display: flex; justify-content: center; gap: 10px; margin-top: 28px; }
 
 /* ---------- loading: the labels stay, every figure is a placeholder bar ---------- */
-.j-sk { display: inline-block; vertical-align: middle; background: var(--sel); border-radius: 4px; animation: j-sk 1.4s var(--ease) infinite; }
-@keyframes j-sk { 50% { background: var(--line-2); } }
-@media (prefers-reduced-motion: reduce) { .j-sk { animation: none; } }
-.j-evt .j-sk, .j-day .j-sk, .j-attr .j-sk, .j-counts .j-sk { display: block; }
+.j-sk { display: inline-block; vertical-align: middle; background: var(--sel); }
+.j-evt .j-sk, .j-day .j-sk, .j-attr .j-sk { display: block; }
 .j-evt .amt .j-sk, .j-evt .proof .j-sk { margin-left: auto; }
 .j-evt .proof { align-items: flex-end; }
-.j-counts .j-sk { margin-bottom: 6px; }
 
 /* ---------- a narrow desktop, 1024 to 1279 px: with five columns beside a 400 px side column the entry text was left a
    few dozen pixels and ran one letter a line. The side column gives up 80 px, and the proof links move under the
@@ -131,7 +128,7 @@
   .j-grid { grid-template-columns: minmax(0, 1fr) 320px; }
   .j-feed { padding-right: var(--s-6); }
   .j-side { padding-left: var(--s-6); }
-  .j-evt { grid-template-columns: 56px 88px minmax(0, 1fr) 104px; }
+  .j-evt { grid-template-columns: 76px 88px minmax(0, 1fr) 104px; }
   .j-evt .proof { grid-column: 3 / -1; flex-direction: row; flex-wrap: wrap; justify-content: flex-start; align-items: baseline; gap: var(--s-1) var(--s-4); margin-top: var(--s-2); text-align: left; }
   .j-evt .proof:empty { display: none; }
   .j-steps { margin-right: 0; }
@@ -139,10 +136,9 @@
 
 /* ---------- phone: up to 1023 px, one column ---------- */
 @media (max-width: 1023px) {
-  .j-top { display: block; padding: var(--s-5) var(--gutter) 0; }
-  .j-top h1 { font: 400 40px/1.05 var(--display); letter-spacing: var(--track-xl); }
-  .j-top p { margin: var(--s-2) 0 0; }
-  .j-top .lvl { color: var(--level); }
+  .j-top { padding: 20px var(--gutter) 0; }
+  .j-top .answer { font: 600 36px/1.06 var(--display); letter-spacing: -0.03em; max-width: none; }
+  .j-sub { margin-top: var(--s-3); }
 
   .j-summary { margin: var(--s-4) var(--gutter) 0; }
   .j-summary > div { display: flex; justify-content: space-between; gap: var(--s-3); padding: 10px 0; border-bottom: 1px solid var(--line); }
@@ -186,4 +182,29 @@
   .j-state-msg p { margin-left: 0; }
   .j-state-msg .go { flex-direction: column; justify-content: stretch; }
   .j-state-msg .go .btn { width: 100%; }
+}
+
+/* ---------- the story lines: a holding period that unfolds, funding and incidents (brand book C, Journal) ---------- */
+.j-per-row { display: grid; grid-template-columns: 76px minmax(0, 1fr) auto; column-gap: var(--s-4); align-items: baseline; width: 100%; padding: 18px 0; border-bottom: 1px solid var(--line); text-align: left; color: var(--ink); cursor: pointer; }
+.j-per-row .t { font: var(--t-s); color: var(--ink-2); }
+.j-per-row b { font-weight: 600; font-size: 21px; letter-spacing: -0.01em; min-width: 0; overflow-wrap: anywhere; }
+.j-per-row .r { font: var(--t-s); color: var(--ink-2); white-space: nowrap; }
+.j-per-row:hover .r { color: var(--ink); }
+.j-pd { padding: 4px 0 8px 92px; overflow: hidden; }
+.j-pd.shut { display: none; }
+.j-pd .kv { font-size: 15px; }
+.j-line { display: grid; grid-template-columns: 76px minmax(0, 1fr) auto; column-gap: var(--s-4); align-items: baseline; padding: var(--s-4) 0; border-bottom: 1px solid var(--line); }
+.j-line .t { font: var(--t-s); color: var(--ink-2); }
+.j-line .what { min-width: 0; overflow-wrap: anywhere; }
+.j-line small { display: block; font: var(--t-s); color: var(--ink-2); margin-top: 2px; }
+.j-line .amt { text-align: right; white-space: nowrap; }
+
+@media (max-width: 1023px) {
+  .j-cnt { margin: var(--s-5) var(--gutter) 0; }
+  .j-cnt .kv b { font-size: 17px; }
+  .j-per-row { grid-template-columns: 52px minmax(0, 1fr) auto; column-gap: 10px; padding: 14px var(--gutter); min-height: 44px; }
+  .j-per-row b { font-size: 17px; }
+  .j-pd { padding: 2px var(--gutter) 6px; }
+  .j-pd .kv { font-size: 14px; padding: 8px 0; }
+  .j-line { grid-template-columns: 44px minmax(0, 1fr) auto; column-gap: 10px; padding: 10px var(--gutter); font-size: 14px; }
 }

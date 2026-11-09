@@ -84,6 +84,12 @@ const REFUSAL_SHORT: Readonly<Record<string, string>> = {
 const firstReason = (reasons: readonly string[]): string => reasons[0]?.trim() ?? '';
 const withReason = (word: string, reason: string): string => (reason ? `${word} · ${reason}` : word);
 
+/**
+ * The engine's note on a row in plain words. "stored ETH price stale: refreshed at open" is the engine's own state; a
+ * visitor reads what happens: the price is read again when the pair opens.
+ */
+export const plainNote = (note: string): string => (/stale/i.test(note) ? 'Price is read again when it opens' : note);
+
 // Held wins: the desk is in it. Then the contract's refusal (a hard stop), then the NEAR AI risk check.
 export function rowStatus(w: FundingWindow): RowStatus {
   const plainStatus = (kind: StatusKind, text: string): RowStatus => ({ kind, text, compact: text });
@@ -98,7 +104,7 @@ export function rowStatus(w: FundingWindow): RowStatus {
   if (w.veto?.verdict === 'veto') return plainStatus('veto', withReason('Risk check', firstReason(w.veto.reasons)));
   if (!w.tradable) return plainStatus('watch', 'Watch-only');
   // Not a refusal: what the open does first (a stored price it refreshes), in the row's plain grey.
-  if (w.note) return { kind: 'note', text: w.note, compact: 'Price at open' };
+  if (w.note) return { kind: 'note', text: plainNote(w.note), compact: 'Price at open' };
   return plainStatus('none', '');
 }
 
@@ -173,9 +179,12 @@ export function isEmpty(windows: readonly FundingWindow[], minimum: number | nul
 export const heldWindow = (windows: readonly FundingWindow[]): FundingWindow | null =>
   windows.find((w) => w.held) ?? null;
 
-/** Which row is selected: the one asked for if it is still listed, else the held one, else the first. */
-export function pickSelection(rows: readonly FundingWindow[], wanted: string | null): string | null {
-  if (wanted !== null && rows.some((w) => w.id === wanted)) return wanted;
+/**
+ * Which row is selected: the one asked for if it is listed, or is any window the page knows (`all`: a market from the
+ * "Not open to the desk" section, an old `#/windows/<id>` link), else the held one, else the first.
+ */
+export function pickSelection(rows: readonly FundingWindow[], wanted: string | null, all: readonly FundingWindow[] = rows): string | null {
+  if (wanted !== null && (rows.some((w) => w.id === wanted) || all.some((w) => w.id === wanted))) return wanted;
   return (rows.find((w) => w.held) ?? rows[0])?.id ?? null;
 }
 

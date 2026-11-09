@@ -68,9 +68,7 @@
 .r-empty .go { display: flex; justify-content: center; gap: 10px; margin-top: 28px; }
 
 /* ---------- loading: the labels stay, every figure is a placeholder bar ---------- */
-.r-sk { display: block; background: var(--sel); border-radius: 4px; animation: r-sk 1.4s var(--ease) infinite; }
-@keyframes r-sk { 50% { background: var(--line-2); } }
-@media (prefers-reduced-motion: reduce) { .r-sk { animation: none; } }
+.r-sk { display: block; background: var(--sel); border-radius: 4px; }
 .r-hero .mid .r-sk { margin: var(--s-3) auto 0; }
 .r-hero .end .r-sk { margin: var(--s-3) 0 0 auto; }
 .r-timer .r-sk { margin-top: 0; }

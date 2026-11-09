@@ -18,7 +18,7 @@
 /* ---------- Welcome: a large gimbal behind the copy ---------- */
 .ob-welcome { position: relative; overflow: hidden; min-height: max(calc(100dvh - var(--header)), 640px); }
 .gimbal-bg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; z-index: 0; }
-.gimbal-bg.fallback { filter: drop-shadow(0 0 5px rgba(242, 242, 240, .22)); }   /* the 2D fallback has no glow of its own */
+.gimbal-bg.fallback { filter: none; }   /* the 2D fallback has no glow of its own */
 .hero-copy { position: absolute; z-index: 1; left: var(--gutter); top: 124px; width: 600px; max-width: calc(100% - 2 * var(--gutter)); }
 .hero-copy h1 { font: 400 72px/1 var(--display); letter-spacing: var(--track-display); }
 .hero-copy p { color: var(--ink-2); margin: 28px 0 0; max-width: 520px; font-size: 17px; line-height: 1.55; }
@@ -155,7 +155,7 @@ textarea.ob-input:focus { border-color: var(--ink-2); }
 .ob-unpriced span { color: var(--ink-2); font: var(--t-s); flex: 1; }
 .ob-unpriced .btn { height: 24px; }
 
-.ob-notes { margin-top: var(--s-5); padding: var(--s-3) var(--s-4); background: rgba(240, 165, 49, .08); font: var(--t-s); }
+.ob-notes { margin-top: var(--s-5); padding: var(--s-3) var(--s-4); background: var(--wash-watch); font: var(--t-s); }
 .ob-notes p { margin: 0 0 4px; color: var(--watch); }
 .ob-notes p.g { color: var(--ink-2); }
 .ob-problems { margin: var(--s-4) 0 0; padding: 0; list-style: none; color: var(--danger); font: var(--t-s); }

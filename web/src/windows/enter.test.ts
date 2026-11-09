@@ -27,7 +27,7 @@ test('contract refusals, no desk, stale numbers, a NEAR AI refusal and a held pa
   assert.match(reason(win({ refused: { code: 'E_ASSET', reason: 'market not in the policy' } })), /^The contract would refuse it \(E_ASSET\): Market not in the policy/);
   assert.match(reason(win({ refused: { code: 'E_SIZE', reason: 'over max_notional_usd' } })), /\(E_SIZE\)/);
   assert.match(reason(win({ refused: { code: 'E_NO_DESK', reason: 'no desk' } })), /no desk/);
-  assert.match(reason(win({ stale: true })), /stale/);
+  assert.match(reason(win({ stale: true })), /from an earlier scan/);
   assert.match(reason(win({ veto: { verdict: 'veto', reasons: ['thin book'], model: 'm', at: 1 } })), /NEAR AI risk check refused it/);
   const heldXlm = win({ symbol: 'XLM', held: { since: 1 } });
   assert.match(reason(win({ symbol: 'SOL' }), [heldXlm, win({ symbol: 'SOL' })]), /^XLM is held\. An owner entry opens from flat only: close XLM first\.$/);

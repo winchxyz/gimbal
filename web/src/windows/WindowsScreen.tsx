@@ -4,47 +4,45 @@ import { loadAlerts, reached, saveAlerts, toggleAlert, type Alert } from './aler
 import { Detail } from './Detail.tsx';
 import {
   arrange,
-  bestEnterable,
   deskMissing,
   failedScan,
   heldWindow,
-  inTab,
   isBelow,
-  isEmpty,
   pickSelection,
   stepSelection,
   watchOnlyVenues,
   type Pin,
-  type Tab,
 } from './model.ts';
+import { closedGroups, isOpenToDesk, marketsAnswer } from './markets.ts';
 import { usePhone, useWindowRoute } from './route.ts';
-import { EmptyState, LoadingView } from './States.tsx';
+import { LoadingView } from './States.tsx';
 import { SCROLLER, takeFocus } from '../ui/scroller.ts';
 import { useFlip } from './useFlip.ts';
 import { useHistories, useStrategy } from './useEngine.ts';
-import { ListHead, MinimumRule, Notices, Row, rowId } from './WindowList.tsx';
+import { Closed, ListHead, MinimumRule, Notices, Row, rowId } from './WindowList.tsx';
 import './windows.css';
 
 /** After the last arrow key the selected row stays put for this long, then the list settles into its sort order. */
 const KEY_PIN_MS = 2000;
 
-/** The Windows screen: every funding window sorted by net APR, and the detail of the selected one. */
+/**
+ * Markets: one sentence (the best market open to the desk), the markets the desk may trade best net first, everything
+ * else in one collapsed section with a plain reason each, and the detail of the selected market.
+ */
 export function WindowsScreen() {
   const windows = useStream((s) => s.windows);
   const scan = useStream((s) => s.scan);
-  const connection = useStream((s) => s.connection);
-  const replay = useStream((s) => (s.desk?.mode ?? s.mode) === 'replay');
   const strategyState = useStrategy();
   const strategy = strategyState.value;
   const minimum = strategy?.minNetAprPct ?? null;
 
   const phone = usePhone();
   const route = useWindowRoute();
-  const [tab, setTab] = useState<Tab>('tradable');
-  const [showBelow, setShowBelow] = useState(false);
   const [alerts, setAlerts] = useState<Alert[]>(loadAlerts);
 
   const all = useMemo(() => windows ?? [], [windows]);
+  // The list holds only what the desk may trade now; the rest is in the collapsed section under it.
+  const open = useMemo(() => all.filter(isOpenToDesk), [all]);
   const tradableIds = useMemo(() => all.filter((w) => w.tradable).map((w) => w.id), [all]);
   const histories = useHistories(tradableIds);
 
@@ -57,15 +55,15 @@ export function WindowsScreen() {
   // With nothing chosen the desktop selects the held window, else the first row, and then keeps that choice,
   // so the default selection does not hop around as the order changes.
   const sticky = useRef<string | null>(null);
-  const natural = useMemo(() => arrange(all, tab, minimum), [all, tab, minimum]);
-  const guess = pickSelection(natural.rows, route.id ?? sticky.current);
+  const natural = useMemo(() => arrange(open, 'tradable', minimum), [open, minimum]);
+  const guess = pickSelection(natural.rows, route.id ?? sticky.current, all);
   if (route.id === null) sticky.current = guess;
   const pin: Pin | null = useMemo(() => {
     const slot = guess === null ? -1 : drawn.current.indexOf(guess);
     return (hovering || keying) && guess !== null && slot >= 0 ? { id: guess, slot } : null;
     // `drawn` is read, not watched: it only changes when rows are drawn, and `natural` changes first
   }, [hovering, keying, guess, natural]);
-  const arranged = useMemo(() => (pin ? arrange(all, tab, minimum, pin) : natural), [all, tab, minimum, pin, natural]);
+  const arranged = useMemo(() => (pin ? arrange(open, 'tradable', minimum, pin) : natural), [open, minimum, pin, natural]);
   useLayoutEffect(() => {
     drawn.current = arranged.rows.map((w) => w.id);
   }, [arranged]);
@@ -139,39 +137,18 @@ export function WindowsScreen() {
     />
   );
 
-  if (!showBelow && isEmpty(all, minimum) && minimum !== null) {
-    return (
-      <EmptyState minimum={minimum} best={bestEnterable(all)} scan={scan} notices={notices} onShowBelow={() => setShowBelow(true)} />
-    );
-  }
-
-  const newestAt = all.length > 0 ? Math.max(...all.map((w) => w.updatedAt)) : null;
-  const watchCount = inTab(all, 'watch').length;
   const detailOpen = phone && selected !== null;
 
   return (
-    <div className={detailOpen ? 'w-split detail-open' : 'w-split'}>
-      <section className="w-list" aria-label="Windows" ref={takeFocus} {...SCROLLER}>
-        <ListHead
-          tab={tab}
-          onTab={(next) => {
-            setTab(next);
-            sticky.current = null;
-            route.replace(null);
-          }}
-          tradableCount={inTab(all, 'tradable').length}
-          watchCount={watchCount}
-          watchVenues={watchOnlyVenues(scan)}
-          scan={scan}
-          newestAt={newestAt}
-          connection={connection}
-          replay={replay}
-        />
+    <div className={detailOpen ? 'w-page detail-open' : 'w-page'}>
+      <ListHead answer={marketsAnswer(all, minimum)} open={open.length} venues={scan?.venues ?? null} watchVenues={watchOnlyVenues(scan)} />
+      <div className="w-split">
+      <section className="w-list" aria-label="Markets" ref={takeFocus} {...SCROLLER}>
         {notices}
         <div
           className="w-rows"
           role="listbox"
-          aria-label={tab === 'tradable' ? 'Tradable windows' : 'Watch-only windows'}
+          aria-label="Markets open to the desk"
           ref={rowsRef}
           onPointerEnter={(e) => e.pointerType === 'mouse' && setHovering(true)}
           onPointerLeave={() => setHovering(false)}
@@ -191,16 +168,18 @@ export function WindowsScreen() {
             />
           ))}
           {arranged.rows.length === 0 ? (
-            <p className="w-none">{tab === 'tradable' ? 'No tradable windows in this scan.' : 'No watch-only windows in this scan.'}</p>
+            <p className="w-none g">No market is open to the desk in this scan.</p>
           ) : null}
         </div>
-        <p className="w-hint phone-only">Tap a window for its 7-day chart, costs and checks.</p>
+        <Closed groups={closedGroups(all)} onSelect={select} />
+        <p className="w-hint phone-only">Tap a market for its 7-day line, costs and checks.</p>
       </section>
       {selected && (!phone || detailOpen) ? (
         <Detail w={selected} windows={all} strategy={strategy} histories={histories} alerts={alerts} onToggleAlert={toggle} />
       ) : phone ? null : (
         <section className="w-detail" />
       )}
+      </div>
     </div>
   );
 }

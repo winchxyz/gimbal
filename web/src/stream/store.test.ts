@@ -158,3 +158,20 @@ test('the fake stream emits valid StreamEvents into the store', () => {
   assert.equal(s.windows?.length, 13);
   assert.equal(s.scan?.venues, 32);
 });
+
+test('the journal counts come from GET /state and grow with each new entry on the stream, not with one sent again', () => {
+  const e = (id: string, kind: JournalEntry['kind']): JournalEntry => ({ id, t: 5_000, kind, summary: kind, numbers: {}, tx: [] });
+  const counts = { entries: 900, since: 1_000, kinds: { exit: 3 }, refusedHeld: 0, refusedCancelled: 0 };
+  let s = reduceStream(initialStreamState(), {
+    kind: 'state',
+    at: 1,
+    state: { mode: 'mainnet', windows: null, scan: null, strategy: null, desk: null, journal: [e('a', 'wait')], rescue: null, setup: null, health: null, decision: null, journalCounts: counts, at: 1 },
+  });
+  assert.equal(s.journalCounts?.entries, 900);
+  s = reduceStream(s, { kind: 'event', at: 2, event: { type: 'journal', data: e('b', 'exit') } });
+  assert.equal(s.journalCounts?.entries, 901);
+  assert.equal(s.journalCounts?.kinds.exit, 4);
+  s = reduceStream(s, { kind: 'event', at: 3, event: { type: 'journal', data: e('b', 'exit') } });
+  assert.equal(s.journalCounts?.entries, 901, 'sent again under its id: counted once');
+  assert.equal(reduceStream(initialStreamState(), { kind: 'event', at: 1, event: { type: 'journal', data: e('c', 'exit') } }).journalCounts, null);
+});

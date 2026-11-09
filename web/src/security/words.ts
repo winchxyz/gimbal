@@ -49,6 +49,22 @@ export function hourlyCostBudgetUsd(p: ContractPolicy): number {
   return Math.max((p.rescue_cap_usd_per_hour * p.max_transfer_cost_bps) / 10_000, (2 * p.max_transfer_cost_flat_e6) / 1e6);
 }
 
+/**
+ * The policy in one line (UX, Safety): `23 coins on Hyperliquid, 4 on Phoenix, each leg up to $20`. The full list
+ * (policyLines) is one tap away.
+ */
+export function policyShort(p: ContractPolicy): string {
+  const venues: [string, number][] = [
+    ['Hyperliquid', p.hl_assets.length],
+    ['Phoenix', p.phoenix_markets.length],
+    ['Orderly', p.orderly_symbols.length],
+  ];
+  const allowed = venues.filter(([, n]) => n > 0).map(([venue, n], i) => `${n} ${i === 0 ? (n === 1 ? 'coin ' : 'coins ') : ''}on ${venue}`);
+  const coins = allowed.length === 0 ? 'No coin allowed' : allowed.join(', ');
+  const size = p.max_notional_usd === 0 ? 'no leg size allowed' : `each leg up to ${usd(p.max_notional_usd, 0)}`;
+  return `${coins}, ${size}`;
+}
+
 /** The policy in plain words, one line per rule, in the order the contract checks an order. */
 export function policyLines(p: ContractPolicy, owner: string): PolicyLine[] {
   const lines: PolicyLine[] = [

@@ -113,7 +113,7 @@ test('status word: held wins, then the contract refusal, then the NEAR AI risk c
 test('a stored price the open refreshes is a note on an enterable row, never a refusal', () => {
   const note = 'stored ETH price stale: refreshed at open';
   const w = win({ note });
-  assert.deepEqual(rowStatus(w), { kind: 'note', text: note, compact: 'Price at open' });
+  assert.deepEqual(rowStatus(w), { kind: 'note', text: 'Price is read again when it opens', compact: 'Price at open' });
   assert.equal(bestEnterable([w]), w, 'still the first window auto would open');
   // A refusal or the desk holding it still wins over the note.
   assert.equal(rowStatus(win({ note, refused: { code: 'E_SIZE', reason: 'leg over the cap' } })).kind, 'refused');
@@ -141,6 +141,10 @@ test('selection: the one asked for, else the held one, else the first; arrows st
   assert.equal(pickSelection(rows, null), 'b-phoenix-orderly');
   assert.equal(pickSelection([net('A', 1), net('B', 2)], null), 'a-phoenix-orderly');
   assert.equal(pickSelection([], null), null);
+  // A market not in the list (from "Not open to the desk", or an old link) is still selected when the page knows it.
+  const closed = net('Z', 30, { refused: { code: 'E_ASSET', reason: 'x' } });
+  assert.equal(pickSelection(rows, closed.id, [...rows, closed]), closed.id);
+  assert.equal(pickSelection(rows, 'unknown', [...rows, closed]), 'b-phoenix-orderly');
 
   assert.equal(stepSelection(rows, 'b-phoenix-orderly', 1), 'c-phoenix-orderly');
   assert.equal(stepSelection(rows, 'c-phoenix-orderly', 1), 'c-phoenix-orderly');
