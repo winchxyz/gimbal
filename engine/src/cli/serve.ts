@@ -78,6 +78,9 @@
 // GIMBAL_VIEW_ORIGINS, with every payload redacted and the owner's and operator's accounts masked; the API above stays
 // on its own address, unchanged, and must be on loopback for the view to start. Its start line is
 // `view: read-only on :<port> for origins ...` or `view: off` (with the reason when the token is set).
+// GIMBAL_OWNER_TOKEN (32+ characters, not the view token; opt in) adds owner writes to the view: POST /rotate, POST
+// /close and PUT /strategy with both tokens, sent to this server's own routes over loopback (src/view/view-server.ts);
+// the start line then says `view: reads on ...; owner writes on: ...`, or `...; owner writes off: <why>` for a bad value.
 
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -732,7 +735,12 @@ monitorTimer.unref();
 const shown = host.includes(':') ? `[${host}]` : host;
 log(`engine ${mode} on http://${shown}:${listening}: GET /events /state /windows/history?id= /strategy /journal, PUT /strategy, POST /rotate /close`);
 // The read-only view: a second listener on a ViewSource (reads only), never on the server above.
-const view = await startView({ env: envVar, processEnv: process.env, enginePort: listening, engineHost: host, source: server.viewSource(), log });
+// With GIMBAL_OWNER_TOKEN it also forwards the owner's POST /rotate, POST /close and PUT /strategy to this server's own
+// routes over loopback, as GIMBAL_CONTROL does: the routes' checks answer, nothing is relaxed (view-server.ts).
+const view = await startView({
+  env: envVar, processEnv: process.env, enginePort: listening, engineHost: host, source: server.viewSource(), log,
+  ownerCall: loopbackCall(host, listening),
+});
 
 let stopping = false;
 // GIMBAL_CONTROL (serve-control.ts): one request to this server's own POST /rotate, POST /close or PUT /strategy, sent

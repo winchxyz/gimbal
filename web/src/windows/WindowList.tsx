@@ -13,6 +13,7 @@ import { depth, hours, pct, plain, usd } from './format.ts';
 import type { HistoryEntry } from './history.ts';
 import { confirmText } from './manual.ts';
 import { isEnterable, isNoDesk, rowStatus, totalCosts, venuePair, type FailedScan, type Tab } from './model.ts';
+import { OwnerEnter } from './OwnerEnter.tsx';
 
 /** "2 s ago", ticking: a component of its own so the list does not re-render every second. */
 export function Ago({ at }: { at: number }) {
@@ -144,6 +145,9 @@ interface RowProps {
   history: HistoryEntry | undefined;
   /** The window the desk holds, if any: a row that could replace it offers Rotate. */
   held: FundingWindow | null;
+  /** Every window and the engine rules' leg size: the owner's entry (unlocked live view) reads them. */
+  windows?: readonly FundingWindow[];
+  legUsd?: number | null;
   onSelect(id: string): void;
 }
 
@@ -180,12 +184,14 @@ function RowRotate({ from, to }: { from: FundingWindow; to: FundingWindow }) {
   );
 }
 
-export function Row({ w, selected, below, history, held, onSelect }: RowProps) {
+export function Row({ w, selected, below, history, held, windows, legUsd, onSelect }: RowProps) {
   const status = rowStatus(w);
   const watch = !w.tradable;
   const costs = totalCosts(w);
   const seven = w.grossApr7dPct === null ? '—' : plain(w.grossApr7dPct);
   const rotateFrom = selected && held !== null && !w.held && isEnterable(w) && writeControls().rotate ? held : null;
+  // The live view's owner, unlocked: the selected row offers an entry from flat (a held pair offers Rotate instead).
+  const ownerEnter = selected && rotateFrom === null && held === null && writeControls().enter && windows !== undefined;
   return (
     <div
       role="option"
@@ -229,6 +235,7 @@ export function Row({ w, selected, below, history, held, onSelect }: RowProps) {
         </span>
       </span>
       {rotateFrom ? <RowRotate from={rotateFrom} to={w} /> : null}
+      {ownerEnter ? <OwnerEnter w={w} windows={windows} legUsd={legUsd ?? null} place="row" /> : null}
     </div>
   );
 }

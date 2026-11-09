@@ -6,8 +6,8 @@
 //   GET /state, /journal?before=, /strategy, /windows/history?id=   as the engine's
 // Everything else is 404 (another path) or 405 (another method, PUT and POST included), answered before any body is
 // read. It is built on a ViewSource (EngineServer.viewSource): plain read functions and the event stream, never the
-// engine server itself, so no request here can reach PUT /strategy, POST /rotate or POST /close; those stay on the
-// engine's own listener, on 127.0.0.1.
+// engine server itself, so without owner writes (below) no request here can reach PUT /strategy, POST /rotate or POST
+// /close; those stay on the engine's own listener, on 127.0.0.1.
 //
 // Auth: `Authorization: Bearer <GIMBAL_VIEW_TOKEN>`, compared in constant time (both sides hashed first, so the
 // length does not leak either). EventSource cannot send headers, so /events also takes ?ticket=<t> from GET
@@ -28,6 +28,21 @@
 //
 // Every payload goes through the redactor (view-redact.ts) before it is sent. Log lines carry the method and the
 // path, never the query (a ticket) or a header (the token).
+//
+// Owner writes (opt in: GIMBAL_OWNER_TOKEN, view-config.ts; without it everything above is exactly as described and
+// the routes below are 404). The view then also answers
+//   GET  /owner                  204: both tokens are right (the page checks an unlock with it; it writes nothing)
+//   POST /rotate, POST /close, PUT /strategy
+// and nothing else, each only with the view's bearer token AND the owner token in the `x-gimbal-owner` header
+// (compared in constant time). It adds no route and no check of its own: the request is sent to the engine's own
+// HTTP server on loopback (the `call` serve passes, serve-control.ts loopbackCall, as GIMBAL_CONTROL does), so the
+// route's handler answers with its own checks and status: GIMBAL_TRADE=1, auto, the strategy loop's checks, the
+// contract's policy on every order. Before that: a JSON body of at most OWNER_MAX_BODY_BYTES (an object; POST /close
+// takes none or `{}`), at most OWNER_WRITE_LIMIT writes in OWNER_WRITE_WINDOW_MS, and after OWNER_FAIL_LIMIT wrong
+// owner tokens in OWNER_FAIL_WINDOW_MS every owner request is refused (429) for OWNER_LOCK_MS, the right token
+// included: the token cannot be guessed by trying. The lock is for the whole listener, not per client: the live host
+// is one client for every visitor, and a lock that holds the owner off too is the safe side (GIMBAL_CONTROL still
+// works). One log line per owner write: method, path, window id and the route's status; never a token or a body.
 
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
@@ -70,7 +85,30 @@ const COMMON_HEADERS = {
   'referrer-policy': 'no-referrer',
 } as const;
 
-type LogKind = 'auth' | 'origin' | 'limited';
+type LogKind = 'auth' | 'origin' | 'limited' | 'owner';
+
+/** The header that carries the owner token (never a query, never a cookie). */
+export const OWNER_HEADER = 'x-gimbal-owner';
+/** A write's body at most: a rotate is ~100 bytes, the whole engine rules ~400. */
+export const OWNER_MAX_BODY_BYTES = 4 * 1024;
+/** Owner writes forwarded in OWNER_WRITE_WINDOW_MS at most; more are 429. */
+export const OWNER_WRITE_LIMIT = 6;
+export const OWNER_WRITE_WINDOW_MS = 60_000;
+/** Wrong owner tokens in OWNER_FAIL_WINDOW_MS that lock every owner request out for OWNER_LOCK_MS. */
+export const OWNER_FAIL_LIMIT = 5;
+export const OWNER_FAIL_WINDOW_MS = 15 * 60_000;
+export const OWNER_LOCK_MS = 15 * 60_000;
+/** Paths that exist on the view only with owner writes on (PUT /strategy shares its path with the GET). */
+const OWNER_PATHS: ReadonlySet<string> = new Set(['/owner', '/rotate', '/close']);
+
+/** One request to the engine's own server on loopback: what its route answered. */
+export type OwnerCall = (method: 'POST' | 'PUT', path: string, body: unknown) => Promise<{ status: number; body: unknown }>;
+
+export interface ViewOwner {
+  /** GIMBAL_OWNER_TOKEN, checked (view-config.ts ownerTokenFromEnv). */
+  token: string;
+  call: OwnerCall;
+}
 
 export interface ViewServerOptions {
   source: ViewSource;
@@ -78,6 +116,8 @@ export interface ViewServerOptions {
   /** Browser origins allowed (CORS); others are refused. */
   origins: readonly string[];
   redact: Redactor;
+  /** Owner writes: absent = the view is read-only and the owner routes are 404. */
+  owner?: ViewOwner;
   now?: () => number;
   log?: (line: string) => void;
   ticketTtlMs?: number;
@@ -100,6 +140,12 @@ export class ViewServer {
   readonly #fails = new Map<string, { count: number; since: number }>();
   readonly #clients = new Set<ServerResponse>();
   readonly #logged = new Map<LogKind, { at: number; skipped: number }>();
+  /** sha256 of GIMBAL_OWNER_TOKEN; null = owner writes off. */
+  readonly #ownerHash: Buffer | null;
+  /** Times of wrong owner tokens within OWNER_FAIL_WINDOW_MS, and of owner writes within OWNER_WRITE_WINDOW_MS. */
+  #ownerFails: number[] = [];
+  #ownerWrites: number[] = [];
+  #ownerLockedUntil = 0;
   #unsubscribe: (() => void) | null = null;
   #heartbeat: ReturnType<typeof setInterval> | undefined;
 
@@ -107,6 +153,7 @@ export class ViewServer {
     this.#o = options;
     this.#origins = new Set(options.origins);
     this.#tokenHash = sha256(options.token);
+    this.#ownerHash = options.owner === undefined ? null : sha256(options.owner.token);
     const timeout = options.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
     this.#server = createServer({
       requestTimeout: timeout,
@@ -196,7 +243,9 @@ export class ViewServer {
       if (method !== 'GET' && method !== 'HEAD') return notAllowed(res);
       return json(res, 200, { ok: true });
     }
-    if (!ROUTES.has(path)) return json(res, 404, { error: 'not found' });
+    const ownerOn = this.#ownerHash !== null;
+    const ownerPath = ownerOn && OWNER_PATHS.has(path);
+    if (!ROUTES.has(path) && !ownerPath) return json(res, 404, { error: 'not found' });
 
     const origin = req.headers.origin;
     if (origin !== undefined) {
@@ -207,13 +256,23 @@ export class ViewServer {
       res.setHeader('access-control-allow-origin', origin);
       res.setHeader('vary', 'Origin');
     }
+    const ownerRoute = ownerPath || (ownerOn && path === '/strategy' && method === 'PUT');
     if (method === 'OPTIONS' && origin !== undefined) {
+      const owner = ownerPath || (ownerOn && path === '/strategy');
       res.writeHead(204, {
-        'access-control-allow-methods': 'GET',
-        'access-control-allow-headers': 'authorization',
+        'access-control-allow-methods': owner ? 'GET, POST, PUT' : 'GET',
+        'access-control-allow-headers': owner ? `authorization, content-type, ${OWNER_HEADER}` : 'authorization',
         'access-control-max-age': '600',
       });
       return void res.end();
+    }
+    if (ownerRoute) {
+      this.#owner(req, res, method, path).catch(() => {
+        this.#log(`view: ${method} ${path}: internal error`);
+        if (!res.headersSent) json(res, 500, { ok: false, error: 'internal error' });
+        else res.destroy();
+      });
+      return;
     }
     if (method !== 'GET') return notAllowed(res);
 
@@ -222,18 +281,7 @@ export class ViewServer {
     // the viewer its ticket; an outsider gets 401 before the cap is looked at.
     const nonce = ticket !== null ? this.#validTicket(ticket) : null;
     const ok = ticket !== null ? nonce !== null : this.#bearerOk(req);
-    if (!ok) {
-      const client = clientOf(req);
-      if (this.#limited(client)) {
-        this.#logRefused('limited', `view: refused ${method} ${path}: too many failed tries from one client`);
-        res.setHeader('retry-after', String(Math.ceil(FAIL_WINDOW_MS / 1000)));
-        return json(res, 429, { error: 'too many failed tries; wait and try again' });
-      }
-      this.#fail(client);
-      this.#logRefused('auth', `view: refused ${method} ${path}: ${ticket !== null ? 'bad or spent ticket' : 'bad or missing token'}`);
-      res.setHeader('www-authenticate', 'Bearer');
-      return json(res, 401, { error: ticket !== null ? 'ticket not valid: get a new one from /view-ticket' : 'unauthorized' });
-    }
+    if (!ok) return this.#unauthorized(req, res, method, path, ticket !== null);
 
     if (path === '/view-ticket') return json(res, 200, this.#issueTicket());
     if (path === '/events') {
@@ -258,6 +306,94 @@ export class ViewServer {
     const m = /^Bearer[ ]+(\S+)[ ]*$/i.exec(header);
     if (m === null) return false;
     return timingSafeEqual(sha256(m[1]!), this.#tokenHash);
+  }
+
+  /** 401 for a missing or wrong view token (or ticket), 429 once the client has failed too often. */
+  #unauthorized(req: IncomingMessage, res: ServerResponse, method: string, path: string, ticket: boolean): void {
+    const client = clientOf(req);
+    if (this.#limited(client)) {
+      this.#logRefused('limited', `view: refused ${method} ${path}: too many failed tries from one client`);
+      res.setHeader('retry-after', String(Math.ceil(FAIL_WINDOW_MS / 1000)));
+      return json(res, 429, { error: 'too many failed tries; wait and try again' });
+    }
+    this.#fail(client);
+    this.#logRefused('auth', `view: refused ${method} ${path}: ${ticket ? 'bad or spent ticket' : 'bad or missing token'}`);
+    res.setHeader('www-authenticate', 'Bearer');
+    return json(res, 401, { error: ticket ? 'ticket not valid: get a new one from /view-ticket' : 'unauthorized' });
+  }
+
+  #ownerOk(req: IncomingMessage): boolean {
+    const header = req.headers[OWNER_HEADER];
+    if (typeof header !== 'string' || header === '' || this.#ownerHash === null) return false;
+    return timingSafeEqual(sha256(header), this.#ownerHash);
+  }
+
+  /** GET /owner, POST /rotate, POST /close, PUT /strategy with owner writes on (the top of this file). */
+  async #owner(req: IncomingMessage, res: ServerResponse, method: string, path: string): Promise<void> {
+    const want = path === '/owner' ? 'GET' : path === '/strategy' ? 'PUT' : 'POST';
+    if (method !== want) {
+      res.setHeader('allow', path === '/strategy' ? 'GET, PUT' : want);
+      return json(res, 405, { ok: false, error: 'method', reason: `${path} takes ${want} only` });
+    }
+    if (!this.#bearerOk(req)) return this.#unauthorized(req, res, method, path, false);
+    const now = this.#now();
+    if (now < this.#ownerLockedUntil) {
+      this.#logRefused('owner', `view: refused ${method} ${path}: owner requests are locked after wrong owner tokens`);
+      res.setHeader('retry-after', String(Math.ceil((this.#ownerLockedUntil - now) / 1000)));
+      return json(res, 429, { ok: false, error: 'owner locked', reason: `too many wrong owner tokens: owner requests are refused until ${new Date(this.#ownerLockedUntil).toISOString()}` });
+    }
+    if (!this.#ownerOk(req)) {
+      this.#ownerFails = this.#ownerFails.filter((t) => now - t < OWNER_FAIL_WINDOW_MS);
+      this.#ownerFails.push(now);
+      if (this.#ownerFails.length >= OWNER_FAIL_LIMIT) {
+        this.#ownerLockedUntil = now + OWNER_LOCK_MS;
+        this.#ownerFails = [];
+        this.#log(`view: owner requests locked until ${new Date(this.#ownerLockedUntil).toISOString()}: ${OWNER_FAIL_LIMIT} wrong owner tokens in ${OWNER_FAIL_WINDOW_MS / 60_000} min`);
+      } else {
+        this.#logRefused('owner', `view: refused ${method} ${path}: bad or missing owner token`);
+      }
+      return json(res, 403, { ok: false, error: 'owner', reason: 'the owner token was not accepted' });
+    }
+    if (path === '/owner') {
+      res.writeHead(204);
+      return void res.end();
+    }
+
+    this.#ownerWrites = this.#ownerWrites.filter((t) => now - t < OWNER_WRITE_WINDOW_MS);
+    if (this.#ownerWrites.length >= OWNER_WRITE_LIMIT) {
+      this.#log(`view: owner ${method} ${path}: refused, over ${OWNER_WRITE_LIMIT} writes a minute`);
+      res.setHeader('retry-after', String(Math.ceil((this.#ownerWrites[0]! + OWNER_WRITE_WINDOW_MS - now) / 1000)));
+      return json(res, 429, { ok: false, error: 'owner busy', reason: `at most ${OWNER_WRITE_LIMIT} owner writes a minute; wait and try again` });
+    }
+    const type = (req.headers['content-type'] ?? '').split(';')[0]!.trim().toLowerCase();
+    if (type !== 'application/json') return json(res, 415, { ok: false, error: 'content-type', reason: `${method} ${path} needs content-type application/json` });
+    const declared = Number(req.headers['content-length'] ?? '0');
+    if (Number.isFinite(declared) && declared > OWNER_MAX_BODY_BYTES) return json(res, 413, { ok: false, error: 'body', reason: `the body is over ${OWNER_MAX_BODY_BYTES} bytes` });
+    const text = await readCapped(req, OWNER_MAX_BODY_BYTES);
+    if (text === null) return json(res, 413, { ok: false, error: 'body', reason: `the body is over ${OWNER_MAX_BODY_BYTES} bytes` });
+    let body: unknown = {};
+    if (text.trim() !== '') {
+      try {
+        body = JSON.parse(text);
+      } catch {
+        return json(res, 400, { ok: false, error: 'body', reason: `${method} ${path}: the body is not JSON` });
+      }
+    }
+    if (body === null || typeof body !== 'object' || Array.isArray(body)) return json(res, 400, { ok: false, error: 'body', reason: `${method} ${path}: the body must be a JSON object` });
+    if (path === '/close' && Object.keys(body).length > 0) return json(res, 400, { ok: false, error: 'body', reason: 'POST /close takes no body' });
+
+    this.#ownerWrites.push(now);
+    const id = path === '/rotate' ? (body as { windowId?: unknown }).windowId : undefined;
+    const what = `${method} ${path}${typeof id === 'string' ? ` ${id.replace(/[^\x21-\x7e]/g, '?').slice(0, 80)}` : ''}${path === '/rotate' && Object.hasOwn(body, 'demo') ? ' (demo)' : ''}`;
+    let answer: { status: number; body: unknown };
+    try {
+      answer = await this.#o.owner!.call(method as 'POST' | 'PUT', path, body);
+    } catch (err) {
+      this.#log(`view: owner ${what}: the engine's own server did not answer (${err instanceof Error ? err.name : 'error'})`);
+      return json(res, 502, { ok: false, error: 'engine', reason: 'the engine\'s own server did not answer; check the journal before trying again' });
+    }
+    this.#log(`view: owner ${what}: ${answer.status}`);
+    return json(res, answer.status, this.#o.redact(answer.body));
   }
 
   #issueTicket(): { ticket: string; expiresAt: number } {
@@ -380,6 +516,33 @@ function clientOf(req: IncomingMessage): string {
   const fwd = req.headers['x-forwarded-for'];
   const list = (Array.isArray(fwd) ? fwd.join(',') : fwd ?? '').split(',').map((s) => s.trim()).filter((s) => s !== '');
   return list.at(-1) ?? req.socket.remoteAddress ?? 'unknown';
+}
+
+/** The request's body as text, or null once it passes `max` bytes (the rest is not read; the connection closes). */
+function readCapped(req: IncomingMessage, max: number): Promise<string | null> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let done = false;
+    const finish = (v: string | null) => {
+      if (done) return;
+      done = true;
+      resolve(v);
+    };
+    req.on('data', (chunk: Buffer) => {
+      if (done) return;
+      size += chunk.length;
+      if (size > max) {
+        req.pause();
+        finish(null);
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => finish(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', () => finish(null));
+    req.on('close', () => finish(null));
+  });
 }
 
 function pathOf(req: IncomingMessage): string {

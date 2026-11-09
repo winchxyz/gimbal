@@ -30,7 +30,7 @@ test('the hosted-live build is read-only from the start: no Settings step, a sav
     assert.deepEqual(remoteSettings(), { base: null, token: null });
     assert.equal(isRemote(), false);
     assert.equal(isReadOnly(), true, 'read-only, so the Security screen masks the owner\'s and the operator\'s ids');
-    assert.deepEqual(writeControls(), { close: false, rotate: false, stress: false, owner: false, money: false, onboarding: false });
+    assert.deepEqual(writeControls(), { close: false, rotate: false, enter: false, stress: false, owner: false, money: false, onboarding: false });
     assert.deepEqual(writeControls(), writeControlsFor(true));
   } finally {
     setHostedLiveForTests(undefined);
@@ -72,5 +72,6 @@ test('only the live host builds the page with VITE_HOSTED_LIVE=1; the Vite confi
 test('the hosted-live page leaves out the engine settings and uses read-only API calls', () => {
   const src = join(root, 'web', 'src');
   assert.match(readFileSync(join(src, 'shell/Shell.tsx'), 'utf8'), /useConnectRoute\(\) && !isHostedLive\(\)/);
-  assert.match(readFileSync(join(src, 'stream/start.ts'), 'utf8'), /isHostedLive\(\)\) \{\s*api \?\?= Promise\.resolve\(readOnlyApi\(httpApi\(\)\)\)/);
+  // Locked (no owner token in the tab), every write is refused in the page; unlocked, only rotate and close carry the owner header.
+  assert.match(readFileSync(join(src, 'stream/start.ts'), 'utf8'), /owner === null \? readOnlyApi\(httpApi\(\)\) : ownerApi\(httpApi\('', \{ \[OWNER_HEADER\]: owner \}\)\)/);
 });

@@ -53,7 +53,8 @@ Tracks: DeFi (main) and Security. Built for NEAR HACKATHON, Nov 1–14, 2026, by
 Nov 14, rule Q-001 of the hackathon).
 
 **Hosted demo:** https://gimbal-production-1b10.up.railway.app — the live mainnet desk, read-only: the real engine
-as it trades now, through a host that refuses every write ([docs/deploy-live-view.md](docs/deploy-live-view.md)). With
+as it trades now, through a host that refuses every visitor's write ([docs/deploy-live-view.md](docs/deploy-live-view.md);
+only the owner, with the owner token, can unlock entering and closing). With
 no pair held it shows a flat desk and the scanner's windows, which is the truth. For the recorded replay (mainnet hour
 of 2026-10-31, x10, a stress test from Rescue), run `npm run demo`.
 

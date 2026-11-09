@@ -13,6 +13,7 @@ import { checkLines, heldWindow, isNoDesk } from './model.ts';
 import { Ago } from './WindowList.tsx';
 import { stepValue, waterfall } from './waterfall.ts';
 import type { ManualAction, Outcome } from './manual.ts';
+import { OwnerEnter } from './OwnerEnter.tsx';
 import { retryHistory, sendManual } from './useEngine.ts';
 
 interface Props {
@@ -86,6 +87,8 @@ export function Detail({ w, windows, strategy, histories, alerts, onToggleAlert 
       )}
 
       <DecisionLine key={w.id} decision={decision} w={w} alerts={alerts} onToggleAlert={onToggleAlert} />
+      {/* The live view's owner, unlocked in this tab: an entry from flat on this window (enter.ts says when it cannot). */}
+      {writeControls().enter ? <OwnerEnter key={`enter-${w.id}`} w={w} windows={windows} legUsd={strategy?.legUsd ?? null} place="detail" /> : null}
     </section>
   );
 }

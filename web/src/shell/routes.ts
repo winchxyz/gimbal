@@ -38,6 +38,21 @@ export function useConnectRoute(): boolean {
   return on;
 }
 
+/** The public live view's owner unlock (remote/OwnerUnlock.tsx): a page of its own, like the settings form. */
+export const OWNER_HREF = '#/owner';
+
+export const isOwnerHash = (hash: string): boolean => /^#\/?owner(?:[/?]|$)/.test(hash);
+
+export function useOwnerRoute(): boolean {
+  const [on, setOn] = useState<boolean>(() => isOwnerHash(window.location.hash));
+  useEffect(() => {
+    const onChange = () => setOn(isOwnerHash(window.location.hash));
+    window.addEventListener('hashchange', onChange);
+    return () => window.removeEventListener('hashchange', onChange);
+  }, []);
+  return on;
+}
+
 export function isOnboardingHash(hash: string): boolean {
   return /^#\/?onboarding(?:[/?]|$)/.test(hash);
 }

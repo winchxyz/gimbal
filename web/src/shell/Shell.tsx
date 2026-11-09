@@ -6,6 +6,7 @@ import { RescueScreen } from '../rescue/RescueScreen.tsx';
 import { Placeholder } from '../screens/Placeholder.tsx';
 import { SecurityScreen } from '../security/SecurityScreen.tsx';
 import { Connect } from '../remote/Connect.tsx';
+import { OwnerUnlock } from '../remote/OwnerUnlock.tsx';
 import { RemoteBar } from '../remote/RemoteBar.tsx';
 import { isHostedLive, READ_ONLY_TEXT, writeControls } from '../remote/readonly.ts';
 import { NoticeBar } from '../ui/NoticeBar.tsx';
@@ -13,7 +14,7 @@ import { focusScroller } from '../ui/scroller.ts';
 import { WindowsScreen } from '../windows/WindowsScreen.tsx';
 import { ConnectionBar } from './ConnectionBar.tsx';
 import { Header } from './Header.tsx';
-import { SCREENS, useConnectRoute, useOnboardingRoute, useScreen } from './routes.ts';
+import { SCREENS, useConnectRoute, useOnboardingRoute, useOwnerRoute, useScreen } from './routes.ts';
 import { StatusLine } from './StatusLine.tsx';
 import { TabBar } from './TabBar.tsx';
 
@@ -25,7 +26,9 @@ export function Shell() {
   const onboarding = useOnboardingRoute();
   // The public live view reads its own origin only: it has no engine settings to show.
   const connect = useConnectRoute() && !isHostedLive();
-  const label = connect ? 'Engine' : onboarding ? 'Set up' : (SCREENS.find((s) => s.id === screen)?.label ?? '');
+  // The owner's unlock exists on the public live view only.
+  const owner = useOwnerRoute() && isHostedLive();
+  const label = connect ? 'Engine' : owner ? 'Owner' : onboarding ? 'Set up' : (SCREENS.find((s) => s.id === screen)?.label ?? '');
 
   // On the desktop the document does not scroll: a screen scrolls inside <main>, or in a column of its own (the Windows
   // list, the Journal feed, marked `data-scroller`). A new screen starts at its top, and the element that scrolls it takes
@@ -44,6 +47,7 @@ export function Shell() {
 
   // The engine settings are a page of their own, without the tabs.
   if (connect) return <Connect />;
+  if (owner) return <OwnerUnlock />;
 
   // Read-only, the set-up flow would write to the engine and the owner's wallet at every step: there is nothing to show.
   if (onboarding && !writeControls().onboarding) {

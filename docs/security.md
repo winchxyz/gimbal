@@ -200,6 +200,21 @@ the contract's policy alone, not by the NEAR AI risk check. The model never sign
 contract or a venue; the contract checks every order against the policy either way. In replay only (`npm run demo`), a prompt with no recorded reply passes, and the
 journal says it would wait live.
 
+### The owner token (public site's owner console)
+
+With owner writes on (`GIMBAL_OWNER_TOKEN` on the engine, `GIMBAL_OWNER_WRITES=1` on the public host;
+docs/deploy-railway.md, "Owner writes"), the owner token is a hot credential: anyone holding it, together with the
+public site, can do what the owner's dashboard does through `POST /rotate`, `POST /close` and `PUT /strategy`. It
+moves no money out and reaches no owner method: every order still goes through the contract, which checks it against
+the policy (asset list, `max_notional_usd` per order, the price band, the hourly notional meter
+`max_hourly_notional_usd`), so the worst case is bounded by those caps: on the mainnet desk 20 USD per order and
+300 USD of opening orders per hour, each entry also behind the NEAR AI risk check and capped at 1 USD of maximum loss,
+plus the fees and slippage of entering and closing. A held pair can be closed early, or the rules changed within the
+engine's own limits (the leverage cap holds). Guessing is held off by the token's size (256 bits), constant-time
+comparison and a 15-minute lockout after five wrong tries; the host never stores or logs it, and the page keeps it in
+one tab's `sessionStorage`. If it may have leaked, rotate it: set a new `GIMBAL_OWNER_TOKEN` on the engine's service
+(the old one stops working at the next deploy), or delete the variable to turn owner writes off.
+
 ### Frozen venues
 
 A new Phoenix or Ember program id, PhUSD mint, onboarder or permission account needs a new contract.

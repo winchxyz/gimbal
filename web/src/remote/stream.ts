@@ -80,6 +80,15 @@ export function readOnlyApi(api: EngineApi): EngineApi {
   return { ...api, rotate: refused, close: refused, stress: refused };
 }
 
+/**
+ * The public live view unlocked by its owner (remote/owner.ts): the same reads, and rotate and close sent with the owner
+ * header (the host forwards those only; the engine checks the token and its routes check the rest). The stress test
+ * stays refused in the page.
+ */
+export function ownerApi(api: EngineApi): EngineApi {
+  return { ...api, stress: refused };
+}
+
 /** The API of a remote page with no token yet: every read says so. */
 export function lockedApi(): EngineApi {
   const locked = <T>(): Promise<T> => Promise.reject(new ViewError('needs-token', 'no view token entered'));

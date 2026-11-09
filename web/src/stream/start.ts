@@ -5,7 +5,8 @@ import { pickFakeDesk, pickFakeDrift, pickFakeMode, pickFakeRescue, pickFakeScen
 import type { Source } from './store.ts';
 import { reportProblem } from '../remote/problem.ts';
 import { isHostedLive, remoteSettings } from '../remote/readonly.ts';
-import { lockedApi, readOnlyApi, remoteApi, startRemoteStream } from '../remote/stream.ts';
+import { lockedApi, ownerApi, readOnlyApi, remoteApi, startRemoteStream } from '../remote/stream.ts';
+import { OWNER_HEADER, ownerToken } from '../remote/owner.ts';
 import { ViewError } from '../remote/view.ts';
 
 /** How long the page waits for the engine to answer before it falls back to the fake (development only). */
@@ -80,9 +81,11 @@ export function engineApi(): Promise<EngineApi> {
     api ??= Promise.resolve(remote.token === null ? lockedApi() : remoteApi({ base: remote.base, token: remote.token }));
     return api;
   }
-  // The public live view: the same origin's reads (its host adds the token), and no write leaves the page.
+  // The public live view: the same origin's reads (its host adds the token), and no write leaves the page; unless the
+  // owner unlocked this tab, whose rotate and close carry the owner header (remote/owner.ts).
   if (isHostedLive()) {
-    api ??= Promise.resolve(readOnlyApi(httpApi()));
+    const owner = ownerToken();
+    api ??= Promise.resolve(owner === null ? readOnlyApi(httpApi()) : ownerApi(httpApi('', { [OWNER_HEADER]: owner })));
     return api;
   }
   api ??= pageSource().then((picked) =>

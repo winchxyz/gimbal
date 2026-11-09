@@ -1,6 +1,7 @@
 // Remote mode is read-only: the engine's view answers GET only, so every control that would write is left out of the
 // page rather than shown and refused. Which mode the page is in is settled once, when it loads: changing the address
 // or the token reloads the page, so nothing has to react to a switch.
+import { ownerToken } from './owner.ts';
 import { browserStores, readSettings, type RemoteSettings } from './settings.ts';
 
 let current: RemoteSettings | undefined;
@@ -58,6 +59,11 @@ export interface WriteControls {
   close: boolean;
   /** Rotate to this window (`POST /rotate`). */
   rotate: boolean;
+  /**
+   * Enter this window as an owner demo entry (`POST /rotate` with `demo`, from flat): the public live view's owner,
+   * unlocked in this tab, only.
+   */
+  enter: boolean;
   /** Run a stress test (`POST /stress`). */
   stress: boolean;
   /** Auto, pause, resume, add margin: the owner's buttons in the status line. */
@@ -77,15 +83,21 @@ export const hostedReplayFlag = (env: Readonly<Record<string, unknown>> | undefi
 export const isHostedReplay = (): boolean => hostedReplayFlag({ VITE_HOSTED_REPLAY: viteValue(() => import.meta.env.VITE_HOSTED_REPLAY) });
 
 /**
- * Remote and the public live view: nothing writes. Hosted replay: a public page whose server refuses every write but
+ * Remote and the public live view: nothing writes, unless the live view's owner unlocked this tab. Hosted replay: a public page whose server refuses every write but
  * `POST /stress`, so only the stress test is drawn. Otherwise everything, as before.
  */
-export const writeControlsFor = (readOnly: boolean, hosted = false): WriteControls => {
+export const writeControlsFor = (readOnly: boolean, hosted = false, ownerUnlocked = false): WriteControls => {
+  // The public live view with the owner token in this tab: rotate, close and the owner's entry go through the host to
+  // the engine's own routes; nothing else (no stress, no wallet, no set-up, no Auto or pause buttons).
+  if (ownerUnlocked) return { close: true, rotate: true, enter: true, stress: false, owner: false, money: false, onboarding: false };
   const on = !readOnly && !hosted;
-  return { close: on, rotate: on, stress: !readOnly, owner: on, money: on, onboarding: on };
+  return { close: on, rotate: on, enter: false, stress: !readOnly, owner: on, money: on, onboarding: on };
 };
 
-export const writeControls = (): WriteControls => writeControlsFor(isReadOnly(), isHostedReplay());
+/** The public live view, unlocked with the owner token in this tab (remote/owner.ts). */
+export const isOwnerUnlocked = (): boolean => isHostedLive() && ownerToken() !== null;
+
+export const writeControls = (): WriteControls => writeControlsFor(isReadOnly(), isHostedReplay(), isOwnerUnlocked());
 
 export const READ_ONLY_LINE = 'Read-only view';
 export const READ_ONLY_TEXT = 'Read-only view. This page shows the desk and cannot change anything on it.';
@@ -93,14 +105,19 @@ export const HOSTED_LINE = 'Public replay: read-only. Run it yourself with npm r
 
 /**
  * The public live view's line, from the network the engine itself reports (GET /state `mode`), so live data is never
- * called a replay and a replay is never called live. Null: the engine has not said yet.
+ * called a replay and a replay is never called live. Null: the engine has not said yet. Visitors cannot change
+ * anything; `unlocked`: the owner unlocked this tab with the owner token (remote/owner.ts), and the line says so.
  */
-export function hostedLiveLine(mode: 'mainnet' | 'testnet' | 'replay' | null): string {
+export function hostedLiveLine(mode: 'mainnet' | 'testnet' | 'replay' | null, unlocked = false): string {
+  if (unlocked) {
+    const what = mode === 'mainnet' ? 'Live mainnet desk' : mode === 'testnet' ? 'Live testnet desk, test money' : mode === 'replay' ? 'Replay, not the live desk' : 'Waiting for the engine';
+    return `${what}. Owner unlocked in this tab: you can enter and close; the contract checks every order.`;
+  }
   switch (mode) {
     case 'mainnet':
-      return 'Live mainnet desk, read-only: the real desk as it trades now. Nothing on this page can change it. For the recorded replay, run npm run demo.';
+      return 'Live mainnet desk, read-only for visitors: the real desk as it trades now. Nothing a visitor does here can change it. For the recorded replay, run npm run demo.';
     case 'testnet':
-      return 'Live testnet desk, read-only: test money, not the mainnet desk. Nothing on this page can change it.';
+      return 'Live testnet desk, read-only for visitors: test money, not the mainnet desk. Nothing a visitor does here can change it.';
     case 'replay':
       return 'Replay, read-only: this engine plays recorded mainnet data back. It is not the live desk.';
     case null:

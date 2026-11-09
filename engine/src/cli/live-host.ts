@@ -8,7 +8,10 @@
 //
 // Read-only for visitors: only the reads the dashboard needs (GET /state, /strategy, /journal?before=,
 // /windows/history?id=, /events) are forwarded; every write is refused here (live-host-lib.ts liveRoute) and never
-// reaches the engine. The engine is protected from the crowd: one upstream event stream fanned out to every visitor
+// reaches the engine. The one exception is opt in, GIMBAL_OWNER_WRITES=1: a request carrying the owner token in its
+// own header (POST /rotate, POST /close, PUT /strategy, and GET /owner to check an unlock) is forwarded, from this
+// site's own page only; the engine checks that token (GIMBAL_OWNER_TOKEN there) and its routes check the rest. The
+// host never stores, caches or logs the owner token. The engine is protected from the crowd: one upstream event stream fanned out to every visitor
 // (capped), GET answers cached (a stale one served when a fresh one cannot be had), one request per key at a time, the
 // reads asked for by id held to ids the engine listed and to a budget per visitor and in all. GET /healthz answers
 // 200 with the upstream's state.
@@ -21,7 +24,7 @@ import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { LiveUpstream, createLiveHostServer, isLiveBuild, liveConfigFromEnv } from './live-host-lib.ts';
+import { LiveUpstream, createLiveHostServer, isLiveBuild, liveConfigFromEnv, ownerWritesFromEnv } from './live-host-lib.ts';
 
 const root = fileURLToPath(new URL('../../../', import.meta.url));
 const webDir = join(root, 'web', 'dist-live');
@@ -40,10 +43,15 @@ if ('config' in cfg) {
 } else {
   log(`live engine not configured: ${cfg.off}; serving the page with that state`);
 }
-const server = createLiveHostServer({ webDir, upstream, offReason: 'off' in cfg ? cfg.off : null, log });
+// GIMBAL_OWNER_WRITES=1: the owner's requests (with the owner header) are forwarded; the engine checks the owner token.
+const ownerWrites = ownerWritesFromEnv((name) => process.env[name]);
+log(ownerWrites
+  ? 'owner writes: on (GET /owner, POST /rotate, POST /close, PUT /strategy with the owner header, from this site\'s own page; the engine checks the owner token)'
+  : 'owner writes: off (GIMBAL_OWNER_WRITES is not 1): every write is refused');
+const server = createLiveHostServer({ webDir, upstream, offReason: 'off' in cfg ? cfg.off : null, ownerWrites, log });
 server.listen(publicPort, values.host, () => {
   const a = server.address();
-  log(`live view on http://${values.host}:${a !== null && typeof a === 'object' ? a.port : publicPort}: the dashboard and the live engine's reads; every write refused`);
+  log(`live view on http://${values.host}:${a !== null && typeof a === 'object' ? a.port : publicPort}: the dashboard and the live engine's reads; ${ownerWrites ? 'visitors\' writes refused, the owner\'s forwarded' : 'every write refused'}`);
 });
 upstream?.start();
 

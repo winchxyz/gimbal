@@ -4,10 +4,10 @@
 
 import { isLoopback } from '../server.ts';
 import { errorMessage } from '../venues/recorder.ts';
-import { viewConfigFromEnv } from './view-config.ts';
+import { ownerTokenFromEnv, viewConfigFromEnv } from './view-config.ts';
 import { viewRedactor } from './view-redact.ts';
 import { ViewServer } from './view-server.ts';
-import type { ViewSource } from './view-server.ts';
+import type { OwnerCall, ViewSource } from './view-server.ts';
 
 export interface StartViewInput {
   /** serve's envVar: empty counts as unset. */
@@ -19,6 +19,11 @@ export interface StartViewInput {
   engineHost: string;
   source: ViewSource;
   log: (line: string) => void;
+  /**
+   * The engine's own server on loopback (serve-control.ts loopbackCall): what owner writes are sent to, when
+   * GIMBAL_OWNER_TOKEN is set. Absent: owner writes stay off whatever the environment says.
+   */
+  ownerCall?: OwnerCall;
   /** Tests: the address to bind; default every interface. */
   host?: string;
 }
@@ -36,10 +41,16 @@ export async function startView(input: StartViewInput): Promise<ViewServer | nul
     return null;
   }
   const { token, port, origins } = cfg.config;
-  const view = new ViewServer({ source: input.source, token, origins, redact: viewRedactor(input.processEnv), log: input.log });
+  // Owner writes: unset says nothing (the start line is as before); a value that cannot be used says why, never what.
+  const owner = ownerTokenFromEnv(input.env, token);
+  const ownerOn = 'token' in owner && input.ownerCall !== undefined ? { token: owner.token, call: input.ownerCall } : undefined;
+  const ownerNote = ownerOn !== undefined
+    ? '; owner writes on: POST /rotate, POST /close and PUT /strategy with the view token and GIMBAL_OWNER_TOKEN, sent to the engine\'s own routes'
+    : 'off' in owner && owner.off !== null ? `; owner writes off: ${owner.off}` : '';
+  const view = new ViewServer({ source: input.source, token, origins, redact: viewRedactor(input.processEnv), log: input.log, ...(ownerOn === undefined ? {} : { owner: ownerOn }) });
   try {
     const listening = await view.start(port, input.host ?? '0.0.0.0');
-    input.log(`view: read-only on :${listening} for origins ${origins.length === 0 ? '(none: no browser page may call it)' : origins.join(', ')}`);
+    input.log(`view: ${ownerOn === undefined ? 'read-only' : 'reads'} on :${listening} for origins ${origins.length === 0 ? '(none: no browser page may call it)' : origins.join(', ')}${ownerNote}`);
     return view;
   } catch (err) {
     input.log(`view: off: cannot listen on :${port} (${errorMessage(err)})`);
