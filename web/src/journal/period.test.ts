@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { DeskState, JournalEntry, Leg } from '@gimbal/shared';
 import { incidentsText, journalHeadline, periodFacts, type HoldItem } from './period.ts';
-import { latestOf, storyOf } from './story.ts';
+import { heldSymbolOf, latestOf, storyOf } from './story.ts';
 
 const at = (hhmm: string): number => Date.parse(`2026-11-09T${hhmm}:00Z`);
 const OPEN = at('03:08');
@@ -99,4 +99,33 @@ test("the Desk's Latest leaves out the NEAR AI attestation line; the Journal kee
   const latest = latestOf(story);
   assert.equal(latest.some((i) => i.type === 'entry' && i.entry.id === att.id), false);
   assert.deepEqual(latest.map((i) => i.type), ['hold', 'incident']);
+  // A failed attestation is an error the Desk still shows.
+  const failed = entry(at('05:21'), 'error', 'NEAR AI attestation failed: quote not verified', { stage: 'attestation' });
+  const withFailed = latestOf(storyOf(newestFirst([hold('05:19', 50), failed]), W, 'MON'));
+  assert.ok(withFailed.some((i) => i.type === 'entry' && i.entry.id === failed.id));
+});
+
+test('a closed period never reads "Holding": not after a re-entry of the same coin, nor of the same window', () => {
+  const W2 = 'mon-orderly-hyperliquid';
+  const holdOn = (w: string, hhmm: string, opened: string): JournalEntry =>
+    entry(at(hhmm), 'wait', 'Hold MON: 49.0 % net of the exit; day 1 of 14', { action: 'hold', window: w, hoursHeld: Number(((at(hhmm) - at(opened)) / 3_600_000).toFixed(2)) });
+  const exitOf = (w: string, hhmm: string) => entry(at(hhmm), 'exit', 'Exit MON', { window: w });
+  const holdsOf = (s: ReturnType<typeof storyOf>) => s.filter((i): i is HoldItem => i.type === 'hold');
+  // MON closed on W at 04:05 and opened on W2 at 04:06; the engine restarts before W2's first check.
+  const reentered = newestFirst([holdOn(W, '03:30', '03:08'), holdOn(W, '04:00', '03:08'), exitOf(W, '04:05')]);
+  assert.match(holdsOf(storyOf(reentered, null, 'MON'))[0]!.text, /^Held MON from 03:0[78] to 04:00, checked 2 times/);
+  // The same window re-entered, no check yet: the old period has ended too.
+  assert.equal(holdsOf(storyOf(reentered, W, 'MON'))[0]!.ongoing, false);
+  // Two MON windows, no close between: without the window, only the newest period is held.
+  const two = newestFirst([holdOn(W, '03:30', '03:08'), holdOn(W2, '05:00', '04:06')]);
+  const items = holdsOf(storyOf(two, null, 'MON'));
+  assert.deepEqual(items.map((i) => [i.t === at('05:00'), i.ongoing]), [[true, true], [false, false]]);
+});
+
+test("the held coin comes from the legs in the hold checks' words (Orderly's PERP_MON_USDC is MON)", () => {
+  assert.equal(heldSymbolOf([]), null);
+  assert.equal(heldSymbolOf([{ symbol: 'PERP_MON_USDC' }]), 'MON');
+  assert.equal(heldSymbolOf([{ symbol: 'MON' }, { symbol: 'PERP_MON_USDC' }]), 'MON');
+  // A stray leg first: the coin two legs share wins.
+  assert.equal(heldSymbolOf([{ symbol: 'XPL' }, { symbol: 'MON' }, { symbol: 'PERP_MON_USDC' }]), 'MON');
 });

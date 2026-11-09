@@ -131,6 +131,14 @@ export function storyOf(entries: readonly JournalEntry[], heldWindowId: string |
   const newestOfSymbol = heldWindowId === null && heldSymbol !== null
     ? Math.max(-Infinity, ...periods.filter((p) => symbolOf(p.entries[0]!) === heldSymbol).map((p) => p.entries[0]!.t))
     : null;
+  // The engine journals every close (an exit or a rotate's first leg) as kind `exit` naming its window: a period with a
+  // close of its window after its newest check has ended, whatever is held now (a re-entry with no check yet).
+  const lastCloseOf = new Map<string, number>();
+  for (const e of entries) {
+    if (e.kind !== 'exit' || e.numbers.window === undefined) continue;
+    const w = String(e.numbers.window);
+    lastCloseOf.set(w, Math.max(lastCloseOf.get(w) ?? -Infinity, e.t));
+  }
   for (const p of periods) {
     const newest = p.entries[0]!;
     const oldest = p.entries[p.entries.length - 1]!;
@@ -142,9 +150,9 @@ export function storyOf(entries: readonly JournalEntry[], heldWindowId: string |
       firstCheck: oldest.t,
       t: newest.t,
       checks: p.entries.length,
-      ongoing: heldWindowId !== null
+      ongoing: !((lastCloseOf.get(p.window) ?? -Infinity) > newest.t) && (heldWindowId !== null
         ? p.window === heldWindowId && newestPeriodOf.get(p.window) === newest.t
-        : symbol === heldSymbol && newestOfSymbol === newest.t,
+        : symbol === heldSymbol && newestOfSymbol === newest.t),
     };
     items.push({ type: 'hold', id: `hold-${oldest.id}`, ...base, text: holdText(base), entries: p.entries });
   }
@@ -193,7 +201,16 @@ export function storyOf(entries: readonly JournalEntry[], heldWindowId: string |
  * belongs in the Journal, where it stays).
  */
 export const latestOf = (items: readonly StoryItem[], n = 3): StoryItem[] =>
-  items.filter((i) => !(i.type === 'entry' && i.entry.numbers.stage === 'attestation')).slice(0, n);
+  items.filter((i) => !(i.type === 'entry' && i.entry.kind === 'wait' && i.entry.numbers.stage === 'attestation')).slice(0, n);
+
+/**
+ * The coin the desk's open legs hold, in the words the hold checks use (`MON`, not Orderly's `PERP_MON_USDC`): the coin
+ * two legs share, else the first leg's; null with no legs.
+ */
+export function heldSymbolOf(legs: readonly { symbol: string }[]): string | null {
+  const coins = legs.map((l) => l.symbol.replace(/^PERP_/, '').replace(/_USDC$/, ''));
+  return coins.find((c, i) => coins.indexOf(c) !== i) ?? coins[0] ?? null;
+}
 
 /** The time a line shows: a holding period shows when it began; everything else its own time. */
 export const storyTime = (item: StoryItem): number => (item.type === 'hold' ? item.from : item.t);

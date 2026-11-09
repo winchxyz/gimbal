@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { DeskState, JournalEntry, Leg, ScanStatus, StrategyConfig, StrategyDecision, VenueId, Window as FundingWindow } from '@gimbal/shared';
 import { clock } from '../journal/entry.ts';
-import { latestOf, storyOf, type StoryItem } from '../journal/story.ts';
+import { heldSymbolOf, latestOf, storyOf, type StoryItem } from '../journal/story.ts';
 import { rowOf } from '../journal/model.ts';
 import { waitsView } from '../journal/waits.ts';
 import { writeControls } from '../remote/readonly.ts';
@@ -81,7 +81,7 @@ export function DeskScreen() {
           <Payback pnl={desk.pnl} />
           <NextBest windows={windows} strategy={strategy} />
         </div>
-        <Latest journal={journal} heldId={held?.id ?? null} heldSymbol={desk.legs[0]?.symbol ?? null} />
+        <Latest journal={journal} heldId={held?.id ?? null} heldSymbol={heldSymbolOf(desk.legs)} />
       </div>
     </div>
   );
