@@ -21,6 +21,7 @@ import type { ContractPolicy, TxRef, VenueId } from '@gimbal/shared';
 import type { ContractConfigView, NearContractClient } from '../contract/near-client.ts';
 import { oraclePriced } from '../contract/oracle-assets.ts';
 import type { DeskView } from '../contract/types.ts';
+import { anyLegPriced, legCaps, pairCapUsd, unpricedEntry } from '../contract/unpriced.ts';
 import type { SolanaChain } from '../relayer/phoenix-money.ts';
 import { SYSTEM_ACCOUNT_RENT_LAMPORTS, solText, txCostLamports } from '../relayer/phoenix-money.ts';
 import type { SnapshotMarket } from '../relayer/phoenix-tx.ts';
@@ -265,21 +266,26 @@ export async function buildPair(ctx: OpsCtx, symbol: string, orders: () => Order
   const listed = shapeRefusal(p, symbol, shape, true);
   if (listed !== null) throw new Error(listed);
   const { maker, microLamports, slippageBps } = orders();
-  const unpriced = p.unpriced.find((u) => u.symbol === symbol);
-  // An unpriced symbol has no stored price to outlive (no band, max_sz instead).
-  const fit = unpriced === undefined ? priceFitRefusal(maker.timeoutMs / 1000, p.oracle_max_age_s) : null;
+  // Each leg is capped as the contract checks it, by the policy symbol of its own venue (contract/unpriced.ts: an
+  // Orderly PERP_<symbol>_USDC leg by its base): an unpriced leg gets the unpriced cap and its max_sz, and no band.
+  // A pair with a priced leg needs the stored price to outlive the maker part; an all-unpriced pair has none to outlive.
+  const priced = anyLegPriced(p, shape.legs);
+  const fit = priced ? priceFitRefusal(maker.timeoutMs / 1000, p.oracle_max_age_s) : null;
   if (fit !== null) throw new UsageError(fit);
-  const maxNotionalUsd = unpriced === undefined ? p.max_notional_usd : Math.min(p.max_notional_usd, p.unpriced_max_notional_usd);
   // Planning (a dry run, or --send before its refusals pass) prices with the stored price as it is; once trading, one
   // about to go stale is refreshed before an order is priced, so an unwind or a close is never refused for it.
-  const oraclePx = unpriced !== undefined ? async () => null : oraclePxOf(ctx.prices, symbol, () => ctx.send && ctx.trading);
+  const storedPx = oraclePxOf(ctx.prices, symbol, () => ctx.send && ctx.trading);
+  const capsOf = (leg: PairLeg) => {
+    const unpriced = unpricedEntry(p, leg.venue, leg.symbol) !== undefined;
+    return { oraclePx: unpriced ? async () => null : storedPx, ...legCaps(p, leg.venue, leg.symbol) };
+  };
   const relayer = ctx.relayer ?? dryRelayer();
   const evm = ctx.desk.evm_address.toLowerCase();
   const build = async (leg: PairLeg): Promise<TradeLeg> => {
     if (leg.venue === 'hyperliquid') {
       return new HlLeg({
-        relayer, info: (body) => hlInfo(ctx, body), user: evm, coin: symbol, asset: asset!.index, szDecimals: asset!.sz_decimals, oraclePx,
-        bandBps: p.price_band_bps, maxNotionalUsd, ...(unpriced === undefined ? {} : { maxSz: unpriced.max_sz }),
+        relayer, info: (body) => hlInfo(ctx, body), user: evm, coin: symbol, asset: asset!.index, szDecimals: asset!.sz_decimals,
+        bandBps: p.price_band_bps, ...capsOf(leg),
         bestPx: async (side: LegSide) => {
           const book = await ctx.hl.book(symbol, 5);
           const px = side === 'BUY' ? book.asks[0]?.px : book.bids[0]?.px;
@@ -295,7 +301,7 @@ export async function buildPair(ctx: OpsCtx, symbol: string, orders: () => Order
         relayer, chain: ctx.chain, landedSlot: (sig) => ctx.solana.landedSlot(sig), waitPastLastValidHeight: (h) => ctx.solana.waitPastLastValidHeightSlot(h),
         api: phoenixTraderApi(ctx.phoenixUrl), desk: ctx.sol,
         market: { symbol, orderbook: market!.orderbook, spline, baseLotE8: market!.base_lot_e8, tickE8: market!.tick_e8 },
-        oraclePx, bandBps: p.price_band_bps, maxNotionalUsd, ...(unpriced === undefined ? {} : { maxSz: unpriced.max_sz }),
+        bandBps: p.price_band_bps, ...capsOf(leg),
         bestPx: async (side) => {
           const book = await ctx.phoenix.book(symbol, 5);
           const px = side === 'BUY' ? book.asks[0]?.px : book.bids[0]?.px;
@@ -305,7 +311,7 @@ export async function buildPair(ctx: OpsCtx, symbol: string, orders: () => Order
         slippageBps, microLamports,
       });
     }
-    const made = ctx.orderly?.leg({ symbol: leg.symbol, oraclePx, maxNotionalUsd, ...(unpriced === undefined ? {} : { maxSz: unpriced.max_sz }), slippageBps }) ?? null;
+    const made = ctx.orderly?.leg({ symbol: leg.symbol, ...capsOf(leg), slippageBps }) ?? null;
     if (made === null) throw new Error(`an Orderly leg (${leg.symbol}) needs the desk's Orderly session, and ${ctx.orderly == null ? 'there is none here (pair-mainnet has none: Orderly pairs run in serve)' : 'it is not up'}: nothing is built or sent`);
     return made;
   };
@@ -318,7 +324,7 @@ export async function buildPair(ctx: OpsCtx, symbol: string, orders: () => Order
     },
   });
   const iocLeg = legs[makerIndexOf(shape) === 0 ? 1 : 0];
-  return pairOf(ctx, { symbol, shape, legs, trader, run: traderRunner(trader, iocLeg), maker, microLamports, priced: unpriced === undefined, closing });
+  return pairOf(ctx, { symbol, shape, legs, trader, run: traderRunner(trader, iocLeg), maker, microLamports, priced, closing });
 }
 
 /**
@@ -871,8 +877,8 @@ export async function recheckOpenSize(
   let buyLimit = longAsk * (1 + slippageBps / 10_000);
   if (sp !== null) buyLimit = Math.min(buyLimit, sp.px * (1 + policy.price_band_bps / 10_000));
   const worstPx = Math.max(buyLimit, shortAsk, sp?.px ?? 0);
-  const unpriced = policy.unpriced.find((u) => u.symbol === symbol);
-  const capUsd = unpriced === undefined ? policy.max_notional_usd : Math.min(policy.max_notional_usd, policy.unpriced_max_notional_usd);
+  // Every leg's cap, each by its own venue's policy symbol (an unpriced leg: the unpriced cap).
+  const capUsd = pairCapUsd(policy, pair.shape.legs);
   const r = capQtyAtOrder({ qty: size, lot: pair.lot, worstPx, midPx: mid, capUsd });
   if ('refused' in r) return r;
   const line = r.cut

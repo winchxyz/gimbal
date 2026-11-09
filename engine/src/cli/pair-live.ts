@@ -29,6 +29,7 @@ import { HlLeg, LegCheckError, OrderlyLeg } from '../trade/legs.ts';
 import { lotQty, qtyString, signedQtyString, toQty } from '../trade/lots.ts';
 import type { PairResult } from '../trade/pair.ts';
 import { PairTrader } from '../trade/pair.ts';
+import { legCaps, unpricedEntry } from '../contract/unpriced.ts';
 import { liveTestnet, log as logAs, refs, reportFailure } from './live.ts';
 
 const TAG = 'pair-live';
@@ -88,26 +89,26 @@ async function run(): Promise<void> {
   const asset = desk.policy.hl_assets.find((a) => a.symbol === HL_COIN);
   if (asset === undefined) throw new Error(`${HL_COIN} is not in the desk's policy.hl_assets`);
   // Priced: the contract checks the band and values the cap at max(limit, its stored price); unpriced: max_sz instead.
-  const unpriced = desk.policy.unpriced.find((u) => u.symbol === HL_COIN);
-  const oraclePx = unpriced !== undefined ? async () => null : async (): Promise<number> => {
+  const unpriced = unpricedEntry(desk.policy, 'hyperliquid', HL_COIN);
+  const storedPx = async (): Promise<number> => {
     const row = (await client.prices()).find((p) => p.asset === HL_COIN);
     if (row === undefined) throw new Error(`the contract has no stored ${HL_COIN} price (set_mock_price or refresh_prices first)`);
     const ageS = (Date.now() - row.at_ms) / 1000;
     if (ageS > desk.policy.oracle_max_age_s) throw new Error(`the contract's ${HL_COIN} price is ${Math.round(ageS)} s old, over oracle_max_age_s ${desk.policy.oracle_max_age_s}: refresh it first`);
     return Number(row.price_e8) / 1e8;
   };
-  if (unpriced === undefined) log(`${HL_COIN} is priced: oracle ${await oraclePx()} USD from the contract's prices()`);
+  // Each leg by its own venue's policy symbol (contract/unpriced.ts): ETH on Hyperliquid, base_of(PERP_ETH_USDC) = ETH.
+  const oraclePxOf = (venue: 'hyperliquid' | 'orderly', symbol: string) => (unpricedEntry(desk.policy, venue, symbol) !== undefined ? async () => null : storedPx);
+  if (unpriced === undefined) log(`${HL_COIN} is priced: oracle ${await storedPx()} USD from the contract's prices()`);
   const hlReader = new HyperliquidReader({ network: 'testnet', url: `${live.hlUrl}/info` });
   const info = async (body: Record<string, unknown>): Promise<unknown> => {
     const res = await fetch(`${live.hlUrl}/info`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) });
     if (!res.ok) throw new Error(`hyperliquid /info ${String(body.type)}: HTTP ${res.status}`);
     return res.json();
   };
-  const maxNotionalUsd = unpriced === undefined ? desk.policy.max_notional_usd : Math.min(desk.policy.max_notional_usd, desk.policy.unpriced_max_notional_usd);
-  const maxSz = unpriced === undefined ? {} : { maxSz: unpriced.max_sz };
   const hl = new HlLeg({
-    relayer, info, user, coin: HL_COIN, asset: asset.index, szDecimals: asset.sz_decimals, oraclePx,
-    bandBps: desk.policy.price_band_bps, maxNotionalUsd, ...maxSz,
+    relayer, info, user, coin: HL_COIN, asset: asset.index, szDecimals: asset.sz_decimals, oraclePx: oraclePxOf('hyperliquid', HL_COIN),
+    bandBps: desk.policy.price_band_bps, ...legCaps(desk.policy, 'hyperliquid', HL_COIN),
     bestPx: async (side) => {
       const book = await hlReader.book(HL_COIN, 5);
       const px = side === 'BUY' ? book.asks[0]?.px : book.bids[0]?.px;
@@ -139,7 +140,7 @@ async function run(): Promise<void> {
   orderly = new OrderlyLeg({
     relayer, readPositions: () => live.orderly.positions('pair-live: reconcile'), stream, symbol: ORDERLY_SYMBOL,
     lot: lotQty(String(market.data.base_tick)), baseMin: lotQty(String(market.data.base_min)), quoteTick: market.data.quote_tick,
-    minNotional: market.data.min_notional, maxNotionalUsd, oraclePx, ...maxSz,
+    minNotional: market.data.min_notional, oraclePx: oraclePxOf('orderly', ORDERLY_SYMBOL), ...legCaps(desk.policy, 'orderly', ORDERLY_SYMBOL),
     bestPx: async (side) => {
       const book = await orderlyReader.book(ORDERLY_SYMBOL, 5);
       const px = side === 'BUY' ? book.asks[0]?.px : book.bids[0]?.px;

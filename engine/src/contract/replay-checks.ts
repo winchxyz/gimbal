@@ -5,6 +5,7 @@
 import type { ContractPolicy } from '@gimbal/shared';
 import type { HlOrder } from './types.ts';
 import { ContractRefusal } from './types.ts';
+import { unpricedBySymbol, unpricedCapUsd } from './unpriced.ts';
 
 const DECIMALS = 8;
 const E8 = 10n ** 8n;
@@ -100,10 +101,11 @@ function checkNotional(symbol: string, pxE8: bigint, oracleE8: bigint | null, sz
  * limits.rs check_value: zero size; an unpriced symbol within its max_sz and the unpriced cap at its own price; any
  * other symbol a fresh reference price (E_ORACLE_STALE), the band (E_PRICE_BAND), sz × max(px, reference) within
  * max_notional_usd (E_SIZE). Returns the oracle price it was checked against, null for an unpriced symbol.
+ * `symbol` is the policy symbol the venue's check resolved (unpriced.ts policySymbolOf: an Orderly market's base).
  */
 export function checkValue(policy: ContractPolicy, symbol: string, pxE8: bigint, szE8: bigint, referenceE8: bigint | null): bigint | null {
   if (szE8 === 0n) throw new ContractRefusal('E_SIZE', `${symbol} size is zero`);
-  const unpriced = policy.unpriced.find((u) => u.symbol === symbol);
+  const unpriced = unpricedBySymbol(policy, symbol);
   if (unpriced !== undefined) {
     let maxSz = 0n;
     try {
@@ -114,7 +116,7 @@ export function checkValue(policy: ContractPolicy, symbol: string, pxE8: bigint,
     if (szE8 > maxSz) {
       throw new ContractRefusal('E_SIZE', `${symbol} size ${formatE8(szE8)} is over its max_sz ${formatE8(maxSz)} (an unpriced symbol, capped in base units)`);
     }
-    const cap = Math.min(policy.max_notional_usd, policy.unpriced_max_notional_usd);
+    const cap = unpricedCapUsd(policy);
     checkNotional(symbol, pxE8, null, szE8, cap, 'the unpriced cap, min(max_notional_usd, unpriced_max_notional_usd)');
     return null;
   }
@@ -140,6 +142,6 @@ export function checkHlOrder(policy: ContractPolicy, order: HlOrder, reference: 
   }
   const pxE8 = checkPx(order.px, asset.sz_decimals);
   const szE8 = checkSz(order.sz, asset.sz_decimals);
-  const oracleE8 = checkValue(policy, asset.symbol, pxE8, szE8, policy.unpriced.some((u) => u.symbol === asset.symbol) ? null : reference(asset.symbol));
+  const oracleE8 = checkValue(policy, asset.symbol, pxE8, szE8, unpricedBySymbol(policy, asset.symbol) !== undefined ? null : reference(asset.symbol));
   return { symbol: asset.symbol, cloid, oracleE8 };
 }

@@ -296,6 +296,33 @@ test('buildPair: the Orderly leg prices on the stored price, refreshed first onc
   assert.deepEqual(timeline, ['refresh_prices SOL']);
 });
 
+test('buildPair: an unpriced base caps the Orderly leg PERP_ETHFI_USDC by ETHFI\'s entry (the unpriced cap, max_sz, no stored price), and the Hyperliquid leg too', async () => {
+  const timeline: string[] = [];
+  const specs: OrderlyLegSpec[] = [];
+  // The mainnet entries: policy.unpriced is keyed by the base, which is what the contract looks an Orderly order up by.
+  const policy = {
+    ...POLICY, max_notional_usd: 100, unpriced_max_notional_usd: 40,
+    hl_assets: [{ symbol: 'ETHFI', index: 192, sz_decimals: 1 }], orderly_symbols: ['PERP_ETHFI_USDC'],
+    unpriced: [{ symbol: 'ZRO', max_sz: '8.2' }, { symbol: 'ETHFI', max_sz: '25.2' }, { symbol: 'AAVE', max_sz: '0.11' }],
+  };
+  const ctx = buildCtx(timeline, orderlySession(timeline, specs, true, async () => [{ ...SOL_MARKET, symbol: 'PERP_ETHFI_USDC' }]), 10, policy);
+  (ctx as { hl: unknown }).hl = { book: async () => ({ bids: [{ px: 0.6, sz: 1e6 }], asks: [{ px: 0.6, sz: 1e6 }] }) };
+  const pair = await buildPair(ctx, 'ETHFI', ORDERS, false, pairShape('ETHFI', 'orderly', 'hyperliquid'));
+  assert.equal(pair.priced, false, 'no leg is priced: nothing waits on a stored ETHFI price');
+  assert.equal(specs.length, 1);
+  assert.deepEqual({ ...specs[0]!, oraclePx: null }, { symbol: 'PERP_ETHFI_USDC', oraclePx: null, maxNotionalUsd: 40, maxSz: '25.2', slippageBps: 50 });
+  assert.equal(await specs[0]!.oraclePx(), null);
+  // Hyperliquid's ETHFI: 40 USD at 0.6 would be 66 ETHFI; max_sz holds it to 25.2.
+  assert.equal(await pair.legs[0].maxSize('BUY', false), toQty('25.2'));
+  assert.deepEqual(timeline, [], 'no stored price read or refreshed');
+  // A priced base (ETHFI not listed): max_notional_usd, no max_sz, the stored price.
+  const pricedSpecs: OrderlyLegSpec[] = [];
+  const priced = await buildPair(buildCtx(timeline, orderlySession(timeline, pricedSpecs, true, async () => [{ ...SOL_MARKET, symbol: 'PERP_ETHFI_USDC' }]), 10, { ...policy, unpriced: [] }),
+    'ETHFI', ORDERS, false, pairShape('ETHFI', 'orderly', 'hyperliquid'));
+  assert.equal(priced.priced, true);
+  assert.deepEqual({ ...pricedSpecs[0]!, oraclePx: null }, { symbol: 'PERP_ETHFI_USDC', oraclePx: null, maxNotionalUsd: 100, slippageBps: 50 });
+});
+
 // ---- planOpen: Orderly's carry inputs and refusals ----
 
 function planCtx(o: { ips?: boolean | Error; funding?: boolean; account?: boolean } = {}) {

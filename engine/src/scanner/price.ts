@@ -3,6 +3,7 @@
 
 import type { ContractPolicy, StrategyConfig, VenueId, Window as FundingWindow } from '@gimbal/shared';
 import { oraclePriced } from '../contract/oracle-assets.ts';
+import { unpricedEntry } from '../contract/unpriced.ts';
 import { venueName, venueNames } from '../venues/names.ts';
 import { orderlyBaseSymbol } from '../venues/orderly.ts';
 import type { Book } from '../venues/venue.ts';
@@ -329,7 +330,8 @@ function inVenuePolicy(policy: ContractPolicy, leg: ScanLeg): boolean {
  * refusal found is the one reported; every leg still gets its check line.
  * - no policy (no desk yet): E_NO_DESK;
  * - a leg outside the policy's list for its venue: E_ASSET;
- * - a leg in policy.unpriced needs no oracle, but its size in the venue's own units (legUsd at the venue mark) must
+ * - a leg in policy.unpriced (under the policy symbol the contract checks it by, contract/unpriced.ts: an Orderly
+ *   leg by its base) needs no oracle, but its size in the venue's own units (legUsd at the venue mark) must
  *   fit its own max_sz, and its notional the unpriced cap (E_SIZE; a leg without a mark cannot be sized: E_SIZE);
  * - any other leg needs an oracle price no older than policy.oracle_max_age_s, and dated no more than
  *   ORACLE_MAX_SKEW_MS ahead of now (E_ORACLE_STALE). With ctx.oracleRefreshAtOpen (a trading serve), a missing or
@@ -366,7 +368,8 @@ export function deskVerdict(pair: Pair, ctx: Pick<PricingContext, 'strategy' | '
     // Checks are read by the owner (venue names); refusal reasons are logged and matched (venue ids).
     const where = `${leg.symbol} on ${venueName(leg.venue)}`;
     const whereId = `${leg.symbol} on ${leg.venue}`;
-    const unpriced = policy.unpriced.find((u) => u.symbol === leg.symbol);
+    // By the policy symbol the contract checks the leg's orders under: an Orderly PERP_ETHFI_USDC leg is ETHFI's entry.
+    const unpriced = unpricedEntry(policy, leg.venue as VenueId, leg.symbol);
     if (unpriced !== undefined) {
       cap = Math.min(cap, policy.unpriced_max_notional_usd);
       if (leg.venueMarkPx === null) {
