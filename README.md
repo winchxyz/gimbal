@@ -410,6 +410,37 @@ Hyperliquid pays the code's owner 10% of the fees the desk pays.
   mainnet and are replayed elsewhere.
 - **Trust.** Gimbal trusts NEAR's MPC network, the OutLayer oracle, 1Click and the venues themselves.
 
+## Roadmap (after the hackathon)
+
+Nothing in this section is built. Every item keeps the rule Gimbal already follows: a venue joins only if the
+contract itself can sign its orders and check each one against the owner's policy.
+
+- **More markets on Hyperliquid.** Hyperliquid's builder-deployed (HIP-3) markets, such as trade.xyz's equities and
+  commodities, are signed the same way as Hyperliquid's own. The scanner already reads them as watch-only venues,
+  and the contract already accepts their asset ids. What they still need:
+  - a trusted price for each. The oracle lists none of them, so today they could enter only as unpriced symbols;
+  - USDC moved into each market's own balance;
+  - each market's margin mode and collateral checked.
+
+  Some of the widest funding gaps on the Windows screen show up on new, thin listings. A gap is a snapshot, and
+  each needs its history and depth checked before a policy lists it.
+- **More on-chain perp venues.** Venues whose orders are signed with a key NEAR's MPC network can hold (secp256k1
+  or Ed25519). Each one needs its own order builder, digest and policy check in `contract/core`, the way Phoenix
+  and Orderly were added. Lighter is not one yet: its orders use a Schnorr key on a curve the MPC network does not
+  sign with.
+- **A prediction-market module.** The desk would buy "yes" on one market and "no" on another when the two prices of
+  the same event add up to less than 1. Polymarket fits first: its orders are EIP-712 messages that an MPC-derived
+  EVM key can sign. It needs setup the desk does not have yet: USDC and gas on Polygon, one-time token approvals,
+  and API credentials the engine holds, which authenticate requests but cannot sign orders. The risks differ from
+  a funding carry. Two venues can resolve the same question differently,
+  and the money stays locked until the event resolves. So the policy would list events and their resolution
+  sources, not coins.
+- **Not planned: centralized exchanges and bookmakers.**
+  - A centralized exchange trades through an API secret on a KYC account. The secret cannot live in a contract, so
+    no policy could check its orders. Holding it in a TEE is possible, but that is a weaker, different guarantee.
+    Kalshi is an exchange of this kind.
+  - Most sports bookmakers forbid arbitrage in their terms and limit the accounts that do it.
+
 ## Repo map
 
 | Folder | What |
