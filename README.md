@@ -45,6 +45,11 @@ before NEAR's MPC network signs it. The engine that trades and moves margin can 
   (a 1000 % net minimum, exit after 24 hourly checks) set so the pair would close after about a day; by its own
   numbers the pair's forward rate was still 5.1 % net APR after exit costs. Booked (funding read to 07:00 UTC; the last hour was still settling):
   funding +0.0085 USD, fees -0.0169, price -0.0178, net -0.026 USD ([Status](#status-2026-11-04)).
+- A second live pair has been held since 2026-11-09 03:08 UTC: 716 MON a leg (about 11.5 USD), short on Hyperliquid
+  (a post-only order that filled as maker) and long on Phoenix, about 40 % net APR forecast at entry. The owner opened
+  it from the hosted demo's owner console, again as an owner demo entry, after the NEAR AI risk check passed
+  ([Hyperliquid leg](https://nearblocks.io/txns/SdYWNMUp4gyqjx3nBQibUKbnXffLum6pj6fChwV2z9q),
+  [Phoenix leg](https://nearblocks.io/txns/2Gk3rxrpsDyuwJQoyRBSyVscsPpppX9hEtQRN6Fr22Nh)).
 
 Not yet: a live margin rescue on mainnet (the desk's rescue counters on chain are 0; [Status](#status-2026-11-04)).
 
@@ -61,8 +66,8 @@ of 2026-10-31, x10, a stress test from Rescue), run `npm run demo`.
 <!-- SUBMISSION: fill the two link lines below on submit day, then delete this comment. -->
 - **Demo video:** TODO(submission): video link
 - **X post:** TODO(submission): X post link
-- **Status (2026-11-07):** the first live pair opened (by the owner) and closed (by the loop) on mainnet, net
-  -0.026 USD after fees; no live margin rescue yet. The dated details are under [Status](#status-2026-11-04)
+- **Status (2026-11-09):** the first live pair opened (by the owner) and closed (by the loop) on mainnet, net
+  -0.026 USD after fees; a second (MON, opened from the owner console) is held; no live margin rescue yet. The dated details are under [Status](#status-2026-11-04)
 
 ## 30 seconds for a judge
 
@@ -221,7 +226,9 @@ To check it, run `cargo near build reproducible-wasm` in `contract/` at that com
 
 **Desk `carry`** on `gimbal_dex.near` runs under the policy
 [tools/mainnet-final-policy.json](tools/mainnet-final-policy.json) (20 USD per order, price band 100 bps, rescues at
-most 50 USD per hour), plus three unpriced symbols since 2026-11-05. The canary `gimbal-canary2.near`, an earlier
+most 50 USD per hour), plus unpriced symbols (no oracle price, so a size cap each and a 20 USD cap): three since
+2026-11-05, 16 since 2026-11-09, when the owner also widened the lists to 23 Hyperliquid assets, 15 Phoenix markets
+and 21 Orderly symbols. The canary `gimbal-canary2.near`, an earlier
 build, carried the first real money around the full path NEAR → Hyperliquid → Arbitrum → NEAR for 1.32 USDC.
 The transactions of the contract, the desk and the canary, with what each proves:
 [docs/onchain-evidence.md](docs/onchain-evidence.md).
@@ -230,7 +237,8 @@ The transactions of the contract, the desk and the canary, with what each proves
 
 ## Status (2026-11-07)
 
-Done (read from the chain and the venues' public APIs at about 08:10 UTC):
+Done (read from the chain and the venues' public APIs at about 08:10 UTC on 2026-11-07; the 2026-11-09 item on
+2026-11-09):
 
 - The contract code is frozen after three internal review rounds (no external audit), deployed from a reproducible
   build and locked.
@@ -252,6 +260,12 @@ Done (read from the chain and the venues' public APIs at about 08:10 UTC):
   funding +0.0085 USD, fees -0.0169 (entry 0.0068, exit 0.0101), price -0.0178 (the entry and exit fills gave up about
   0.00024 USD per XLM in spread and basis between the two venues), net -0.026 USD. The transactions:
   [docs/onchain-evidence.md](docs/onchain-evidence.md#mainnet-desk-carry).
+- **2026-11-09: a second live pair, opened from the owner console.** The owner widened the desk's policy on chain
+  (16 unpriced symbols; 23 Hyperliquid assets, 15 Phoenix markets, 21 Orderly symbols), then opened MON from the hosted
+  demo with the owner token: 716 MON a leg (about 11.5 USD), short on Hyperliquid, long on Phoenix, about 40 % net
+  APR forecast at entry, NEAR AI risk check passed. The Hyperliquid post-only order was repriced three times before it
+  filled as maker at 0.016013; Phoenix filled by IOC at 0.016012; entry fees 0.0068 USD. The strategy loop holds it.
+  The transactions: [docs/onchain-evidence.md](docs/onchain-evidence.md#mainnet-desk-carry).
 - On testnet the same contract code refused 8 of 8 scripted malicious requests, 0 USDC moved
   ([below](#refusals-on-chain-npm-run-attack)).
 - On mainnet `gimbal_dex.near` refused a deliberately mispriced test Hyperliquid order with `E_PRICE_BAND`
@@ -265,8 +279,8 @@ Done (read from the chain and the venues' public APIs at about 08:10 UTC):
 Not done yet:
 
 - **The strategy loop has not opened a pair on its own.** The owner's threshold is 5 % net APR at 12 USD a leg,
-  and the loop opens only a window inside the desk's policy; none has cleared both yet. The one live pair so far
-  was the owner's demo entry above.
+  the loop opens only a window inside the desk's policy, and only after it holds for 3 hourly checks in a row. Both live
+  pairs so far were owner demo entries.
 - **No margin rescue has run on mainnet yet.** The desk's rescue counters on chain are zero; the three `fund_venue`
   payments were setup transfers, not rescues. The live routes have
   been dry-run against mainnet; the money path itself ran on the canary
