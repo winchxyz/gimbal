@@ -115,11 +115,12 @@ export const SERVE_MAKER: MakerSettings = { ...DEFAULT_MAKER, timeoutMs: 120_000
  * An owner demo entry's taker fallback (the only open serve sends one for): the IOC after the maker window is held
  * within SERVE_SLIPPAGE_BPS of Hyperliquid's mark as well as of the touch, the band and the caps. The same 50 bps every
  * serve IOC may go past the touch, measured from the mark too: for an unpriced symbol (no stored price, so no band) it
- * is what keeps a thin book whose touch ran away from the mark from pulling the fill past it, and it is the margin the
- * demo's cost bound adds (carry-plan.ts takerFallbackUsd), so the worst fill stays inside what the owner accepted.
+ * is what keeps a thin book whose touch ran away from the mark from pulling the fill past it. The demo's cost bound
+ * adds that margin for the fallback and for its hedge (carry-plan.ts takerFallbackUsd); the basis moving between the
+ * maker fill and the hedge is not in it, as for every open.
  */
 export const SERVE_DEMO_TAKER_FALLBACK: TakerFallback = { markBps: DEMO_TAKER_FALLBACK_BPS };
-/** What the demo's cost bound adds per USD of leg: the farther of the two limits past the touch and the mark. */
+/** What the demo's cost bound counts per fill past the touch (the fallback, and its hedge): the farther of the two limits. */
 const DEMO_FALLBACK_COST_BPS = Math.max(SERVE_SLIPPAGE_BPS, DEMO_TAKER_FALLBACK_BPS);
 /**
  * The strategy loop's open, for what StrategyConfig does not set: the hold and the basis buffer the scanner's gate
@@ -1591,7 +1592,7 @@ export function liveCarry(p: CarryInput & { input: ServePairInput; hlUrl: string
       if (request.demo !== undefined) {
         const rt = plan.carry.roundTripUsd;
         out.say(`demo      owner demo entry: taker fallback after the ${SERVE_MAKER.timeoutMs / 1000} s maker window, within ${SERVE_SLIPPAGE_BPS} bps of the touch and ${SERVE_DEMO_TAKER_FALLBACK.markBps} bps of the mark; `
-          + `round trip ${Number.isFinite(rt) ? `$${rt.toFixed(4)}` : 'not priced'} (every fill at the taker fee) + $${plan.carry.takerFallbackUsd.toFixed(4)} for the fallback's slippage, at most $${request.demo.maxLossUsd.toFixed(4)} accepted`);
+          + `round trip ${Number.isFinite(rt) ? `$${rt.toFixed(4)}` : 'not priced'} (every fill at the taker fee) + $${plan.carry.takerFallbackUsd.toFixed(4)} for the fallback's and its hedge's slippage, at most $${request.demo.maxLossUsd.toFixed(4)} accepted`);
       }
       // Every refusal that needs no fresh price first: the plan's (the closing desk among them), a maker timeout the
       // price cannot outlive (buildPair's), the gate, and the loop's daily cap on refreshes. Only then refresh_prices.

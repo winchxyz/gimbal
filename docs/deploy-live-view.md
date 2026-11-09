@@ -84,7 +84,10 @@ pair. Visitors see and can do exactly what is described above; nothing changes f
   maker (post-only) orders first, and after the maker window falls back to a taker order: an IOC on the maker venue
   for what the maker orders left, its limit within 50 bps of the touch, the contract's price band and 50 bps of the
   mark (so an unpriced symbol is bounded too), sized within the caps, then hedged on the other venue. The 1 USD check
-  counts that taker fee and slippage. The loop's own entries and a plain rotate stay maker-only. Without
+  is on the estimate: it counts the taker fees and 50 bps of slippage for the fallback and again for its hedge, but
+  not the price moving in the up to 120 s between the maker fill and the hedge, so the realized cost can differ. In
+  an open sent in parts, once the shared post-only budget is spent a later part goes straight to the taker IOC. The
+  loop's own entries and a plain rotate stay maker-only. Without
   `demo`, which the page never sends but anyone holding the token can, it is an ordinary rotate: it may close the
   held pair and open another, with the profit checks and no loss cap. `PUT /strategy` can change the rules (auto,
   thresholds, leg size) within the engine's own limits. One log line per write:

@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { JournalEntry } from '@gimbal/shared';
-import { actingText, enterConfirmText, enterState, entryReason, entryResult, OWNER_MAX_LOSS_USD, type PendingEntry } from './enter.ts';
+import { actingText, enterConfirmText, enterState, entryReason, entryResult, isOwnerEntryOn, OWNER_MAX_LOSS_USD, type PendingEntry } from './enter.ts';
 import { venueName } from './format.ts';
 import { actingOf, confirmText, outcomeOf, sendVia, type ManualAction } from './manual.ts';
 import { win } from './testing.ts';
@@ -138,4 +138,13 @@ test('the act’s result comes from its Journal line: opened, opened by the take
 test('entryReason keeps parentheses inside the reason and falls back when there is none', () => {
   assert.equal(entryReason('enter w-1: (a (b; c) d) X not opened: cause (x; y); later', 'w-1', 'X'), 'Cause (x; y).');
   assert.equal(entryReason('enter w-1 not carried out: ', 'w-1', 'X'), 'The Journal has the reason.');
+});
+
+test('a window id is matched whole: an entry on sol-phoenix is not one on sol-phoenix-orderly', () => {
+  assert.equal(isOwnerEntryOn(DEMO_ACTING, 'sol-phoenix-orderly'), true);
+  assert.equal(isOwnerEntryOn(DEMO_ACTING, 'sol-phoenix'), false);
+  assert.equal(isOwnerEntryOn('POST /rotate sol-phoenix-orderly', 'sol-phoenix-orderly'), false, 'a plain rotate is not an owner entry');
+  const short: PendingEntry = { windowId: 'sol-phoenix', symbol: 'SOL', seen: new Set() };
+  assert.equal(entryResult([line('x', 'refused', 'enter sol-phoenix-orderly not carried out: no lots', {})], short), null);
+  assert.equal(entryResult([line('y', 'refused', 'enter sol-phoenix not carried out: no lots', {})], short)!.text, 'Not opened: No lots.');
 });

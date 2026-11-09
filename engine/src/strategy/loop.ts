@@ -55,8 +55,9 @@
 // NEAR AI risk check, pass every other check, the policy's markets and the direction rule (symbolOf), and be sized
 // (sizeFor); the desk must be flat. Its round-trip cost estimate is bounded: maxLossUsd above 0 and at most
 // DEMO_MAX_LOSS_USD, and the window's round trip in USD (the one its checks print, WindowFacts.roundTripUsd) plus its
-// taker fallback's slippage (demoTakerFallbackUsd at strategy.legUsd: the open ends with an IOC on the maker leg for what
-// the post-only part did not fill, serve-pair.ts; its fee is in the round trip already) at most maxLossUsd, else
+// taker fallback's slippage and its hedge's (demoTakerFallbackUsd at strategy.legUsd: the open ends with an IOC on the
+// maker leg for what the post-only part did not fill, then the hedge IOC, serve-pair.ts; their fees are in the round
+// trip already; the basis moving between the maker fill and the hedge is not counted) at most maxLossUsd, else
 // refused with the numbers; funding during the hold is expected positive and is not part of the bound;
 // the trader's open holds its own round trip to it again (carry-plan.ts). The loop's own entries and a plain POST
 // /rotate get no taker fallback. The risk check is asked as for any manual act, told it is a
@@ -933,7 +934,7 @@ export class StrategyLoop {
       const legMax = Math.min(this.#o.strategy().legUsd, cap !== undefined && cap > 0 ? cap : Infinity);
       const fallback = demoTakerFallbackUsd(legMax);
       if (rt + fallback > demo.maxLossUsd) {
-        return { reason: `${windowId}: its round trip, ${money(rt)}, plus ${money(fallback)} for the taker fallback's ${DEMO_TAKER_FALLBACK_BPS} bps past the touch, is over the ${money(demo.maxLossUsd)} the demo entry accepts (maxLossUsd)` };
+        return { reason: `${windowId}: its round trip, ${money(rt)}, plus ${money(fallback)} for the taker fallback's and its hedge's ${DEMO_TAKER_FALLBACK_BPS} bps past the touch, is over the ${money(demo.maxLossUsd)} the demo entry accepts (maxLossUsd)` };
       }
       cost = { maxLossUsd: demo.maxLossUsd, roundTripUsd: rt, takerFallbackUsd: fallback };
     }

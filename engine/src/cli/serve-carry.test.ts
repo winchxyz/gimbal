@@ -206,13 +206,15 @@ test('serve\'s carry: an owner demo entry\'s open ends with a taker fallback hel
   assert.deepEqual(SERVE_DEMO_TAKER_FALLBACK, { markBps: DEMO_TAKER_FALLBACK_BPS });
   const said = demo.said.join('\n');
   assert.match(said, /then a taker fallback: an IOC for the rest, its limit within the band, the caps, the slippage and 50 bps of the mark/);
-  // The cost line: the round trip (every fill at the taker fee) plus 50 bps of the 50 USD leg, against what was accepted.
-  assert.match(said, /demo {6}owner demo entry: taker fallback after the 120 s maker window, within 50 bps of the touch and 50 bps of the mark; round trip \$\d+\.\d{4} \(every fill at the taker fee\) \+ \$0\.2500 for the fallback's slippage, at most \$1\.0000 accepted/);
+  assert.match(said, /an open in parts: once the shared post-only budget is spent, a later part goes straight to that IOC/);
+  // The cost line: the round trip (every fill at the taker fee) plus 50 bps of the 50 USD leg for the fallback and
+  // again for its hedge, against what was accepted.
+  assert.match(said, /demo {6}owner demo entry: taker fallback after the 120 s maker window, within 50 bps of the touch and 50 bps of the mark; round trip \$\d+\.\d{4} \(every fill at the taker fee\) \+ \$0\.5000 for the fallback's and its hedge's slippage, at most \$1\.0000 accepted/);
 
-  // A maxLossUsd the round trip fits but not with the fallback's slippage: refused before anything is signed.
+  // A maxLossUsd the round trip fits but not with the slippage of the fallback and its hedge: refused before anything is signed.
   const tight = await carryWorld();
-  const refused = await tight.open({ demo: { maxLossUsd: 0.26 } });
-  assert.ok(refused.refusals.some((x) => /plus the taker fallback's 50 bps past the touch \(\$0\.2500\), .* is over the \$0\.2600 the owner accepted/.test(x)), JSON.stringify(refused.refusals));
+  const refused = await tight.open({ demo: { maxLossUsd: 0.51 } });
+  assert.ok(refused.refusals.some((x) => /plus the taker fallback's and its hedge's 50 bps past the touch \(\$0\.5000\), .* is over the \$0\.5100 the owner accepted/.test(x)), JSON.stringify(refused.refusals));
   assert.deepEqual(tight.sent, []);
 });
 

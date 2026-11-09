@@ -49,7 +49,7 @@
 import type { VenueId } from '@gimbal/shared';
 import type { AdlState } from '../risk/adl.ts';
 import { ADL_ATTEMPTS, newAdlState } from '../risk/adl.ts';
-import type { LegOutcome, LegRef, LegSide, PendingMakerOrder, TradeLeg } from './legs.ts';
+import type { LegOutcome, LegRef, LegSide, MakerOrderOptions, PendingMakerOrder, TradeLeg } from './legs.ts';
 import { LegCheckError } from './legs.ts';
 import { qtyString, signedQtyString, toQty } from './lots.ts';
 import type { MakerFirst, PairResult, PairTrader, PairTraderState } from './pair.ts';
@@ -246,7 +246,7 @@ export class GuardedLeg implements TradeLeg {
   readonly symbol: string;
   readonly lot: bigint;
   readonly replayable: boolean;
-  readonly makerOrder?: (side: LegSide, size: bigint, reduceOnly: boolean, reason: string) => Promise<LegOutcome>;
+  readonly makerOrder?: (side: LegSide, size: bigint, reduceOnly: boolean, reason: string, options: MakerOrderOptions | undefined) => Promise<LegOutcome>;
   readonly #o: GuardedLegOptions;
 
   constructor(inner: TradeLeg, options: GuardedLegOptions) {
@@ -258,7 +258,10 @@ export class GuardedLeg implements TradeLeg {
     this.#o = options;
     const maker = inner.makerOrder;
     if (maker !== undefined) {
-      this.makerOrder = (side, size, reduceOnly, reason) => this.#guard(side, size, reduceOnly, reason, () => maker.call(inner, side, size, reduceOnly, reason));
+      // The options (an owner entry's taker fallback) go through as they came: the guard checks the order, it does not
+      // decide how it is worked. The fallback's IOC is part of this one guarded order (same side, size and reduceOnly).
+      this.makerOrder = (side, size, reduceOnly, reason, options) =>
+        this.#guard(side, size, reduceOnly, reason, () => maker.call(inner, side, size, reduceOnly, reason, options));
     }
   }
 

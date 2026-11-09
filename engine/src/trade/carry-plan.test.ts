@@ -161,7 +161,7 @@ test('an owner demo entry never waives funding against the position, and checks 
   assert.deepEqual(carryPlan({ ...xlm, demo: { maxLossUsd: DEMO_MAX_LOSS_USD } }).refusals, []);
 });
 
-test('an owner demo entry with a taker fallback: its fill is priced at the taker fee, and its slippage is held to maxLossUsd too', () => {
+test('an owner demo entry with a taker fallback: its fill is priced at the taker fee, and its slippage and its hedge’s are held to maxLossUsd too', () => {
   const xlm: CarryInput = {
     symbol: 'XLM', legUsd: 11.44, leverage: 1.5, holdDays: 7, basisBufferBps: 10,
     short: { ...base.short, ratePerHour: 0.178 / 8760, rate7dPerHour: 0.178 / 8760, feeBps: 5.5, book: book(1, 2.35) },
@@ -172,14 +172,14 @@ test('an owner demo entry with a taker fallback: its fill is priced at the taker
   // Every fill of the round trip, the maker leg's open (which the fallback may take) included, at its taker fee.
   near(taker.roundTrip!.feesUsd, 2 * 11.44 * (5.5 + 3.5) / 10_000);
   near(taker.roundTripUsd, plain.roundTripUsd);
-  near(taker.takerFallbackUsd, 11.44 * 50 / 10_000);
+  near(taker.takerFallbackUsd, 2 * 11.44 * 50 / 10_000); // the fallback and its hedge
   assert.equal(plain.takerFallbackUsd, 0);
-  assert.deepEqual(taker.refusals, [], '0.0397 + 0.0572 is under 0.25');
-  // Between the round trip and the round trip with the fallback: refused, with the numbers (the waiver hides nothing).
+  assert.deepEqual(taker.refusals, [], '0.0397 + 0.1144 is under 0.25');
+  // Between the round trip and the round trip with the fallback: refused, with the numbers (the estimate held to it includes both IOCs' slippage).
   const between = carryPlan({ ...xlm, demo: { maxLossUsd: 0.05, takerFallbackBps: 50 } });
   assert.deepEqual(carryPlan({ ...xlm, demo: { maxLossUsd: 0.05 } }).refusals, [], 'without the fallback 0.0397 fits 0.05');
   assert.deepEqual(between.refusals, [
-    'owner demo entry: the round trip $0.0397 on this open\'s books plus the taker fallback\'s 50 bps past the touch ($0.0572), $0.0969, is over the $0.0500 the owner accepted (maxLossUsd)',
+    'owner demo entry: the round trip $0.0397 on this open\'s books plus the taker fallback\'s and its hedge\'s 50 bps past the touch ($0.1144), $0.1541, is over the $0.0500 the owner accepted (maxLossUsd)',
   ]);
   assert.notEqual(between.waived, null, 'the spread not covering it is still the only check waived');
   // A takerFallbackBps that is not a number of 0 or more: refused.

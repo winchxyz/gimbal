@@ -99,9 +99,9 @@ export interface TradeLeg {
   /**
    * Maker first (optional): post-only limits at the touch, repriced, then an IOC for what is left after the timeout
    * when the leg's MakerSettings.takerFallback or `options.takerFallback` asks for one. The outcome sums every part;
-   * never throws.
+   * never throws. `options` is required (pass undefined for none) so a wrapper (GuardedLeg) cannot drop it unseen.
    */
-  makerOrder?(side: LegSide, size: bigint, reduceOnly: boolean, reason: string, options?: MakerOrderOptions): Promise<LegOutcome>;
+  makerOrder?(side: LegSide, size: bigint, reduceOnly: boolean, reason: string, options: MakerOrderOptions | undefined): Promise<LegOutcome>;
   /**
    * Starts one pair operation (an open with all its parts, or a close): until the returned function ends it, the leg's
    * maker orders share one budget of maxOrders post-only orders and one reprice floor (repriceMs between placements).

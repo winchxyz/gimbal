@@ -11,6 +11,7 @@ import { NothingExecuted } from '../relayer/tx.ts';
 import type { LegOutcome, LegRef, LegSide, MakerOrderOptions, TradeLeg } from './legs.ts';
 import { lotQty, toQty } from './lots.ts';
 import { PairTrader } from './pair.ts';
+import { GuardedLeg } from './protected-pair.ts';
 
 type Answer = { fill: string; fee?: number } | 'fail' | 'unknown-none' | { partial: string; late?: string } | { fallback: string };
 
@@ -148,6 +149,24 @@ test('an owner entry\'s taker fallback: the maker leg gets the option on the ope
   assert.deepEqual(q.a.makerOptions, [{}]);
   assert.ok(flat.notes.some((n) => /did not fill: nothing to hedge, nothing opened/.test(n)));
   assert.ok(!flat.notes.some((n) => /taker fallback/.test(n)));
+});
+
+test('serve’s guarded legs pass the taker fallback through: the fallback IOC is signed, then hedged', async () => {
+  // serve wraps both venue legs in GuardedLeg (serve-pair.ts); a wrapper that dropped makerOrder's options would turn
+  // the owner entry back into a maker-only open that misses and opens nothing.
+  const log: string[] = [];
+  const signed: string[] = [];
+  const inner = [new Leg('hyperliquid', log, { lot: '0.0001', makers: [{ fallback: '0.005' }] }), new Leg('phoenix', log, { lot: '0.001' })] as const;
+  const legs = inner.map((l, i) => new GuardedLeg(l, {
+    index: i as 0 | 1, live: () => true, opening: () => true, beforeSign: (o) => { signed.push(`${o.venue} ${o.side} ${o.size}${o.reduceOnly ? ' ro' : ''}`); },
+  })) as [GuardedLeg, GuardedLeg];
+  const trader = new PairTrader({ legs, priceBandBps: 100, unsettledPollMs: null, sleep: async () => {} });
+  const r = await trader.open({ size: '0.005', longIndex: 1, reason: 'carry', maker: { index: 0, takerFallback: { markBps: 50 } } });
+  assert.equal(r.status, 'open');
+  assert.deepEqual(inner[0].makerOptions, [{ takerFallback: { markBps: 50 } }]);
+  assert.deepEqual(log, ['hyperliquid maker SELL 0.005 +taker fallback', 'phoenix ioc BUY 0.005']);
+  assert.deepEqual(signed, ['hyperliquid SELL 0.005', 'phoenix BUY 0.005']);
+  assert.deepEqual(r.notes, ['taker fallback: hyperliquid SELL IOC 500000 after the maker window filled 0.005 at 2501']);
 });
 
 test('the IOC partner fails twice: the maker leg is unwound reduce-only, flat', async () => {

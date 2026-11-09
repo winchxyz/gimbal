@@ -2,7 +2,7 @@ import { useEffect, useSyncExternalStore } from 'react';
 import type { Window as FundingWindow } from '@gimbal/shared';
 import { createStore, stream, useStream } from '../stream/hub.ts';
 import { useManualSend } from '../ui/useManualSend.ts';
-import { enterConfirmText, enterState, entryResult, isOwnerEntry, OWNER_MAX_LOSS_USD, type PendingEntry } from './enter.ts';
+import { enterConfirmText, enterState, entryResult, isOwnerEntryOn, OWNER_MAX_LOSS_USD, type PendingEntry } from './enter.ts';
 import { venueName } from './format.ts';
 import type { ManualAction } from './manual.ts';
 
@@ -52,7 +52,7 @@ export function OwnerEnter({ w, windows, legUsd, auto, place }: Props) {
     }
   });
   const mine = entry !== null && entry.windowId === w.id ? entry : null;
-  const actingOnMine = mine !== null && acting !== null && isOwnerEntry(acting) && acting.includes(w.id);
+  const actingOnMine = mine !== null && acting !== null && isOwnerEntryOn(acting, w.id);
   useEffect(() => {
     if (actingOnMine) started.dispatch({ kind: 'acting', windowId: w.id });
   }, [actingOnMine, w.id]);

@@ -1390,7 +1390,7 @@ test('checked counts only the checks that read a scan and the free margin (GIMBA
 
 // ---- the owner demo entry (POST /rotate with demo) ----
 
-/** The demo tests' world: a leg of 20 USD, as on mainnet (the taker fallback's 50 bps of it is held to maxLossUsd). */
+/** The demo tests' world: a leg of 20 USD, as on mainnet (the taker fallback's and its hedge's 50 bps of it are held to maxLossUsd). */
 const demoWorld = (over: Partial<World> = {}): World => world({ ...over, strategy: { ...DEFAULT_STRATEGY, auto: true, ...over.strategy, legUsd: 20 } });
 
 const DEMO_ID = 'zec-phoenix-hyperliquid';
@@ -1424,7 +1424,7 @@ test('demo: a window that fails only its profit checks is entered, said so on th
   assert.match(w.opens[0]!.reason, /owner demo entry/);
   const enter = journal(w).find((j) => j.kind === 'enter')!;
   assert.match(enter.summary, new RegExp(`^enter ${DEMO_ID}, ZEC short hyperliquid, long phoenix, .* \\(POST /rotate \\(manual\\)\\); `
-    + 'owner demo entry: the profit checks are waived; round trip \\$0\\.04 estimated \\(\\+ \\$0\\.10 for a taker fallback after the maker window\\), at most \\$0\\.25 accepted; NEAR AI risk check passed \\(TEE not attested: no attestation fetched in this run\\): no red flag named; opened both legs$'));
+    + 'owner demo entry: the profit checks are waived; round trip \\$0\\.04 estimated \\(\\+ \\$0\\.20 for a taker fallback after the maker window\\), at most \\$0\\.25 accepted; NEAR AI risk check passed \\(TEE not attested: no attestation fetched in this run\\): no red flag named; opened both legs$'));
   assert.equal(enter.numbers.demo, 1);
   assert.equal(enter.numbers.maxLossUsd, 0.25);
   assert.equal(enter.numbers.roundTripUsd, 0.04);
@@ -1541,19 +1541,19 @@ test('demo: maxLossUsd is required, a number above 0 and at most 1 USD, and at l
   // Through rotate: the same refusals, before anything else.
   assert.match((loop.rotate(DEMO_ID, { maxLossUsd: 5 }) as { reason: string }).reason, /over the \$1\.00 a demo entry may accept/);
   assert.match((loop.rotate(DEMO_ID, {}) as { reason: string }).reason, /needs maxLossUsd/);
-  // Under the window's round trip: refused, with both numbers and the taker fallback's slippage (50 bps of 20 USD).
+  // Under the window's round trip: refused, with both numbers and the taker fallback's slippage (50 bps of 20 USD, for the fallback and for its hedge).
   assert.deepEqual(loop.rotate(DEMO_ID, { maxLossUsd: 0.03 }), {
-    ok: false, reason: `${DEMO_ID}: its round trip, $0.04, plus $0.10 for the taker fallback's 50 bps past the touch, is over the $0.03 the demo entry accepts (maxLossUsd)`,
+    ok: false, reason: `${DEMO_ID}: its round trip, $0.04, plus $0.20 for the taker fallback's and its hedge's 50 bps past the touch, is over the $0.03 the demo entry accepts (maxLossUsd)`,
   });
   // Over the round trip but not over it with the taker fallback: refused too (the fallback's fee is in the round trip,
-  // its slippage past the book is added), so the waiver never hides a cost above maxLossUsd.
-  assert.match((loop.rotate(DEMO_ID, { maxLossUsd: 0.12 }) as { reason: string }).reason, /round trip, \$0\.04, plus \$0\.10 for the taker fallback's 50 bps past the touch, is over the \$0\.12/);
+  // its slippage past the book and its hedge's are added), so the estimate held to maxLossUsd includes them.
+  assert.match((loop.rotate(DEMO_ID, { maxLossUsd: 0.2 }) as { reason: string }).reason, /round trip, \$0\.04, plus \$0\.20 for the taker fallback's and its hedge's 50 bps past the touch, is over the \$0\.20/);
   // At the policy's cap when it is under the rules' leg: the fallback is counted on the leg the cap allows.
   const capped = world({ windows: [demoWin()] });
   const cappedLoop = makeLoop(capped, tmpStore(), { facts: demoFacts(), policy: () => ({ max_notional_usd: 20 }) as never });
   await cappedLoop.check();
-  assert.match((cappedLoop.rotate(DEMO_ID, { maxLossUsd: 0.13 }) as { reason: string }).reason, /plus \$0\.10 for the taker fallback/);
-  assert.deepEqual(cappedLoop.rotate(DEMO_ID, { maxLossUsd: 0.15 }), { ok: true });
+  assert.match((cappedLoop.rotate(DEMO_ID, { maxLossUsd: 0.23 }) as { reason: string }).reason, /plus \$0\.20 for the taker fallback/);
+  assert.deepEqual(cappedLoop.rotate(DEMO_ID, { maxLossUsd: 0.25 }), { ok: true });
   await cappedLoop.idle(1000);
   // Its round trip not known: refused.
   const u = demoWorld({ windows: [demoWin()] });
@@ -1570,7 +1570,7 @@ test('demo: maxLossUsd is required, a number above 0 and at most 1 USD, and at l
   await growing.idle(1000);
   assert.equal(g.opens.length, 0);
   const line = journal(g).at(-1)!;
-  assert.equal(line.summary, `POST /rotate ${DEMO_ID} not carried out: (owner demo entry, at most $0.25) ${DEMO_ID}: its round trip, $0.30, plus $0.10 for the taker fallback's 50 bps past the touch, is over the $0.25 the demo entry accepts (maxLossUsd)`);
+  assert.equal(line.summary, `POST /rotate ${DEMO_ID} not carried out: (owner demo entry, at most $0.25) ${DEMO_ID}: its round trip, $0.30, plus $0.20 for the taker fallback's and its hedge's 50 bps past the touch, is over the $0.25 the demo entry accepts (maxLossUsd)`);
   assert.equal(line.numbers.demo, 1);
 });
 
@@ -1683,7 +1683,7 @@ test('demo: a refusal line after the risk check keeps the plain lead (web waitCo
   assert.deepEqual(loop.rotate(DEMO_ID, DEMO), { ok: true });
   await loop.idle(1000);
   const line = journal(w).find((j) => j.kind === 'refused')!;
-  assert.equal(line.summary, `enter ${DEMO_ID}: (owner demo entry: the profit checks are waived; round trip $0.04 estimated (+ $0.10 for a taker fallback after the maker window), at most $0.25 accepted) `
+  assert.equal(line.summary, `enter ${DEMO_ID}: (owner demo entry: the profit checks are waived; round trip $0.04 estimated (+ $0.20 for a taker fallback after the maker window), at most $0.25 accepted) `
     + 'open refused, nothing signed: the venue is busy; ' + PASSED_WHY);
   assert.equal(line.numbers.demo, 1);
   // The same refusal without demo, for comparison: the same lead.

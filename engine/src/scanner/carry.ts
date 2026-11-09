@@ -104,14 +104,18 @@ export const DEMO_MAX_LOSS_USD = 1;
 /**
  * An owner demo entry's open ends with a taker fallback (serve-pair.ts SERVE_DEMO_TAKER_FALLBACK): an IOC on the maker
  * leg for what the post-only part did not fill, its limit at most this many bps past the touch and past the venue's
- * mark. Its fee is already in the round trip (every fill is priced at the taker fee); legUsd × this is added to the
- * round trip before it is held to maxLossUsd, by the strategy loop and again by the trader's carry plan.
+ * mark, then hedged by an IOC on the other leg whose limit may also go this far past its touch. Their fees are already
+ * in the round trip (every fill is priced at the taker fee); 2 × legUsd × this (the fallback and its hedge) is added
+ * to the round trip before it is held to maxLossUsd, by the strategy loop and again by the trader's carry plan.
  */
 export const DEMO_TAKER_FALLBACK_BPS = 50;
 
-/** The most an owner demo entry's taker fallback may fill past the walked book, USD, on a leg of legUsd. */
+/**
+ * The most an owner demo entry's taker fallback and its hedge may fill past the walked books, USD, on a leg of legUsd.
+ * Not counted: the basis moving in the up to 120 s between the maker window's fill and the hedge (as for every open).
+ */
 export function demoTakerFallbackUsd(legUsd: number): number {
-  return (legUsd * DEMO_TAKER_FALLBACK_BPS) / 10_000;
+  return (2 * legUsd * DEMO_TAKER_FALLBACK_BPS) / 10_000;
 }
 
 /**

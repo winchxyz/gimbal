@@ -709,6 +709,7 @@ function orderPlanLine(pair: Pair): string {
   const side = openSide(pair, m);
   const fallback = pair.takerFallback !== undefined
     ? `, then a taker fallback: an IOC for the rest, its limit within the band, the caps, the slippage and ${pair.takerFallback.markBps} bps of the mark`
+      + ' (an open in parts: once the shared post-only budget is spent, a later part goes straight to that IOC)'
     : pair.maker.takerFallback ? ', then a taker fallback: an IOC for the rest' : ', no taker fallback (--taker-fallback to add one)';
   return `maker first: ${venueName(pair.shape.legs[m].venue)} ${side} post-only at the ${side === 'SELL' ? 'ask' : 'bid'}, repriced every ${pair.maker.repriceMs / 1000} s, at most ${pair.maker.maxOrders} signed post-only orders for the whole open (the C10 meter counts each), for ${pair.maker.timeoutMs / 1000} s${fallback}; then ${venueName(pair.shape.legs[ioc].venue)} ${openSide(pair, ioc)} IOC for what filled`;
 }

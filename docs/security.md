@@ -208,8 +208,9 @@ public site, can do what the owner's dashboard does through `POST /rotate`, `POS
 page itself only sends demo entries (from flat, refused above 1 USD of round-trip cost) and closes. A demo entry
 posts maker orders first and, after the maker window, falls back to a taker order (an IOC for what is left, its limit
 within 50 bps of the touch, the price band and 50 bps of the mark, so an unpriced symbol is bounded too), within the
-same caps and checked by the contract like any order; the 1 USD check counts that taker fee and slippage. The loop's
-own entries and a plain rotate stay maker-only. The token
+same caps and checked by the contract like any order. The 1 USD check bounds the estimate (taker fees, and 50 bps
+of slippage for the fallback and for its hedge), not the realized cost: the price moving in the up to 120 s between
+the maker fill and the hedge is not in it. The loop's own entries and a plain rotate stay maker-only. The token
 also takes a plain `POST /rotate` (it may close the held pair and open another, with no loss cap) and a
 `PUT /strategy` that turns auto on or loosens the thresholds and leg size within the engine's own limits (the
 leverage cap holds). It moves no money out and reaches no owner method of the contract. Every order still goes

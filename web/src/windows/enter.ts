@@ -32,6 +32,10 @@ export type EnterState =
 /** The engine's `acting` for an owner entry (loop.ts #rotateStart: `POST /rotate <id> (owner demo entry, …)`). */
 export const isOwnerEntry = (acting: string): boolean => acting.includes('owner demo entry');
 
+/** Whether `acting` is the owner entry on exactly this window (not one whose id merely starts the same). */
+export const isOwnerEntryOn = (acting: string, windowId: string): boolean =>
+  isOwnerEntry(acting) && acting.startsWith(`POST /rotate ${windowId} (`);
+
 /** Why Enter waits while the loop acts: the owner's own entry, a close, or another act of the engine. */
 export function actingText(acting: string): string {
   if (isOwnerEntry(acting)) return 'Your entry is still running. Enter comes back when it ends; watch the Journal.';
@@ -119,12 +123,22 @@ function firstClause(text: string): string {
   return text;
 }
 
+/** Where `id` stands in `text` as a whole window id (not the start of a longer one), or -1. */
+function idAt(text: string, id: string): number {
+  for (let at = text.indexOf(id); at >= 0; at = text.indexOf(id, at + 1)) {
+    const before = at === 0 ? ' ' : text[at - 1]!;
+    const after = text[at + id.length] ?? ' ';
+    if (!/[a-z0-9_-]/i.test(before) && !/[a-z0-9_-]/i.test(after)) return at;
+  }
+  return -1;
+}
+
 /**
  * Why an entry was not opened, from its Journal line: what follows the window id (`… <id> not carried out: `,
  * `enter <id>: `), without the owner entry's tag, the `<SYMBOL> not opened: ` lead and the clauses after the first.
  */
 export function entryReason(summary: string, windowId: string, symbol: string): string {
-  const at = summary.indexOf(windowId);
+  const at = idAt(summary, windowId);
   let text = at < 0 ? summary : summary.slice(at + windowId.length);
   text = text.replace(/^ not carried out/, '').replace(/^:\s*/, '');
   text = dropTag(text);
@@ -142,7 +156,7 @@ export function entryResult(journal: readonly JournalEntry[], pending: PendingEn
   for (const e of journal) {
     if (pending.seen.has(e.id) || !ENDS.has(e.kind)) continue;
     const window = e.numbers.window;
-    const names = window === undefined ? e.summary.includes(pending.windowId) : window === pending.windowId;
+    const names = window === undefined ? idAt(e.summary, pending.windowId) >= 0 : window === pending.windowId;
     if (names) line = e; // newest first: the last one found is the first written
   }
   if (line === null) return null;
