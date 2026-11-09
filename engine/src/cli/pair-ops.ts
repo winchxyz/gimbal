@@ -42,6 +42,7 @@ import { PhoenixLeg, parseTraderSnapshot, phoenixTraderApi } from '../trade/phoe
 import type { PairLeg, PairShape } from '../trade/pair-shape.ts';
 import { defaultShape, isDefaultShape, longLeg, makerIndexOf, shapeRefusal, shortLeg } from '../trade/pair-shape.ts';
 import type { HyperliquidReader } from '../venues/hyperliquid.ts';
+import { hlTradeFetch } from '../venues/hyperliquid.ts';
 import type { OrderlyMarket, OrderlyReader } from '../venues/orderly.ts';
 import type { PhoenixReader } from '../venues/phoenix.ts';
 import { phoenixGet } from '../venues/phoenix.ts';
@@ -118,8 +119,13 @@ export interface OrderOptions {
 
 // ---- reads ----
 
+/**
+ * One Hyperliquid /info read of the trade path (orderStatus, userFills, margin and open orders before a part): never
+ * waits for the host's weight budget, but is charged to it (venues/hyperliquid.ts hlTradeFetch), so the scanner's
+ * reads back off after it.
+ */
 export async function hlInfo<T>(ctx: Pick<OpsCtx, 'hlUrl'>, body: Record<string, unknown>): Promise<T> {
-  const res = await fetch(`${ctx.hlUrl}/info`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) });
+  const res = await hlTradeFetch(ctx.hlUrl)(`${ctx.hlUrl}/info`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) });
   if (!res.ok) throw new Error(`hyperliquid /info ${String(body.type)}: HTTP ${res.status}`);
   return (await res.json()) as T;
 }

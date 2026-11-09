@@ -91,7 +91,7 @@ import type { ProtectionCloseReport } from '../trade/protected-pair.ts';
 import { GuardedLeg, InFlightBook, ProtectedPair, inFlightEnds, reconcileHow, startPlan } from '../trade/protected-pair.ts';
 import type { TraderFileState, TraderLock } from '../trade/trader-state.ts';
 import { TRADER_STATE_VERSION, TraderStateStore, acquireTraderLock, savedShape, traderLockPath, traderStateFile, userStateDir } from '../trade/trader-state.ts';
-import { HL_MAINNET_URL, HyperliquidReader } from '../venues/hyperliquid.ts';
+import { HL_MAINNET_URL, HyperliquidReader, hlTradeFetch } from '../venues/hyperliquid.ts';
 import type { HostBudget } from '../venues/http-budget.ts';
 import { OrderlyReader, orderlyBaseSymbol } from '../venues/orderly.ts';
 import { PHOENIX_API_URL, PhoenixReader, SOLANA_MAINNET_RPC_URL, phoenixGet } from '../venues/phoenix.ts';
@@ -1674,8 +1674,12 @@ function defaultDeps(p: { input: ServePairInput; hlUrl: string; phoenixUrl: stri
   };
 }
 
+/**
+ * One Hyperliquid /info read of the trade path (open orders, the legs' orderStatus and userFills, the taker
+ * fallback's mark): never waits for the host's weight budget, but is charged to it (hlTradeFetch).
+ */
 async function hlInfo(hlUrl: string, body: Record<string, unknown>): Promise<unknown> {
-  const res = await fetch(`${hlUrl}/info`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) });
+  const res = await hlTradeFetch(hlUrl)(`${hlUrl}/info`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) });
   if (!res.ok) throw new Error(`hyperliquid /info ${String(body.type)}: HTTP ${res.status}`);
   return res.json();
 }

@@ -199,6 +199,77 @@ export function hlBudgetedFetch(budget: HostBudget, inner: typeof fetch): typeof
   };
 }
 
+/**
+ * The weight of an /exchange request: 1 + floor(batch length / 40), the batch being the action's orders, cancels or
+ * modifies (docs, "Rate limits and user limits"); 1 for an action without one (a transfer, a builder fee approval).
+ */
+export function hlExchangeWeight(body: unknown): number {
+  const action = (body as { action?: Record<string, unknown> } | null)?.action;
+  const batch = [action?.orders, action?.cancels, action?.modifies].find(Array.isArray) as unknown[] | undefined;
+  return 1 + Math.floor((batch?.length ?? 0) / 40);
+}
+
+/**
+ * Sends one Hyperliquid request that must never wait (the trade path: an /exchange post, the reads around an order,
+ * a rescue's ledger read, setup) outside `budget`'s queue (http-budget.ts unqueued()), charged its weight as it goes:
+ * an /info read its type's weight and the rows its answer brought, an /exchange post hlExchangeWeight. The scanner's
+ * reads after it wait until the bucket has paid it back; it is never delayed, skipped or retried here. A 429 on /info
+ * starts the budget's cool-down; one on /exchange does not (it may be the address's own action limit, which grows
+ * with volume traded, not this IP's weight).
+ */
+export async function hlMeteredSend(budget: HostBudget | null, endpoint: 'info' | 'exchange', body: unknown, send: () => Promise<Response>): Promise<Response> {
+  if (budget === null) return send();
+  if (endpoint === 'exchange') return budget.unqueued(send, hlExchangeWeight(body), { rateLimits: false });
+  const typed = body as { type?: unknown } & Record<string, unknown> | null;
+  const type = typeof typed?.type === 'string' ? typed.type : '';
+  const charged = type === '' ? 0 : hlRowsWeight(type, hlRowsExpected(typed as { type: string } & Record<string, unknown>));
+  const res = await budget.unqueued(send, hlInfoWeight(type) + charged);
+  if (res.ok && (PER_ROW_INFO.has(type) || type === 'candleSnapshot')) {
+    res.clone().json().then(
+      (rows: unknown) => budget.charge(hlRowsWeight(type, Array.isArray(rows) ? rows.length : 0) - charged, true),
+      () => budget.charge(-charged, true),
+    );
+  }
+  return res;
+}
+
+/**
+ * `inner` with every POST to an /info or /exchange URL metered through hlMeteredSend (never delayed); anything else
+ * goes as is. None: `inner` itself.
+ */
+export function hlMeteredFetch(budget: HostBudget | null, inner: typeof fetch): typeof fetch {
+  if (budget === null) return inner;
+  return (input, init) => {
+    const href = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    const path = href.split(/[?#]/)[0]!.replace(/\/+$/, '');
+    const endpoint = path.endsWith('/info') ? 'info' : path.endsWith('/exchange') ? 'exchange' : null;
+    if (endpoint === null) return inner(input, init);
+    let body: unknown = null;
+    try {
+      body = typeof init?.body === 'string' ? JSON.parse(init.body) : null;
+    } catch {
+      body = null;
+    }
+    return hlMeteredSend(budget, endpoint, body, () => inner(input, init));
+  };
+}
+
+/**
+ * The trade path's fetch for the Hyperliquid API at `apiUrl` (the root, or its /info URL): every /info and /exchange
+ * POST metered against the budget the host's readers share in this process (hlHostBudget), never delayed. `inner`
+ * defaults to the global fetch, looked up when called (a test may stub it).
+ */
+export function hlTradeFetch(apiUrl: string, inner: typeof fetch = (input, init) => globalThis.fetch(input, init)): typeof fetch {
+  let budget: HostBudget | null;
+  try {
+    budget = hlHostBudget(apiUrl);
+  } catch {
+    // Not a URL: the request fails on its own when it is made; nothing to meter.
+    budget = null;
+  }
+  return hlMeteredFetch(budget, inner);
+}
+
 /** A non-2xx answer from /info, kept apart so callers can tell an outage from a request the venue refused. */
 export class HlHttpError extends Error {
   status: number;

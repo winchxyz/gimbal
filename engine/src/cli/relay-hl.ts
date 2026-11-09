@@ -25,7 +25,7 @@ import type { HlSubmitResult } from '../relayer/hyperliquid.ts';
 import { HyperliquidSubmitter } from '../relayer/hyperliquid.ts';
 import { Relayer } from '../relayer/relayer.ts';
 import { NothingExecuted } from '../relayer/tx.ts';
-import { HL_TESTNET_URL, HyperliquidReader } from '../venues/hyperliquid.ts';
+import { HL_TESTNET_URL, HyperliquidReader, hlTradeFetch } from '../venues/hyperliquid.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import { checkContractNetwork, contractEnv } from './serve-contract.ts';
 
@@ -186,7 +186,7 @@ async function timed<T>(what: string, run: () => Promise<T>): Promise<T> {
 }
 
 async function info<T>(body: Record<string, unknown>): Promise<T> {
-  const res = await fetch(`${hlUrl}/info`, {
+  const res = await hlTradeFetch(hlUrl)(`${hlUrl}/info`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000),
   });
   if (!res.ok) throw new Error(`hyperliquid /info ${String(body.type)}: HTTP ${res.status}`);

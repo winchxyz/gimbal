@@ -16,7 +16,7 @@ import { parseArgs } from 'node:util';
 import { NearContractClient } from '../contract/near-client.ts';
 import { NearViewTransport } from '../contract/near-transport.ts';
 import type { DeskView } from '../contract/types.ts';
-import { HL_MAINNET_URL, HL_TESTNET_URL } from '../venues/hyperliquid.ts';
+import { HL_MAINNET_URL, HL_TESTNET_URL, hlTradeFetch } from '../venues/hyperliquid.ts';
 import type { AttackDeps } from './attacks.ts';
 import { held, keyProblems, report, runAttacks } from './attacks.ts';
 import { connectDesk } from './connect.ts';
@@ -46,7 +46,7 @@ export async function main(argv: string[]): Promise<number> {
 
   const hlUrl = env.network === 'mainnet' ? HL_MAINNET_URL : HL_TESTNET_URL;
   const hlInfo = async (body: object): Promise<unknown> => {
-    const res = await fetch(`${hlUrl}/info`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) });
+    const res = await hlTradeFetch(hlUrl)(`${hlUrl}/info`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(15_000) });
     if (!res.ok) throw new Error(`Hyperliquid /info ${res.status}`);
     return res.json();
   };
