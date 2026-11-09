@@ -22,7 +22,7 @@ import {
   groupByDay,
   visibleFeed,
 } from './model.ts';
-import { storyOf, type StoryItem } from './story.ts';
+import { heldSymbolOf, storyOf, type StoryItem } from './story.ts';
 import { journalHeadline, periodFacts, type HoldItem } from './period.ts';
 import { Counts, Side } from './Side.tsx';
 import { JournalEmpty, JournalError, JournalLoading } from './States.tsx';
@@ -106,10 +106,12 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
   const groups = useMemo(() => groupByDay(listed, now), [listed, now]);
   const { shown: days, fold } = useMemo(() => (expanded ? { shown: groups, fold: null } : foldOlder(groups)), [groups, expanded]);
   // One line per holding period, funding in words, an incident with its recovery (story.ts), filed under its day.
-  const lines = useMemo(() => storyOf(days.flatMap((d) => d.entries), heldId), [days, heldId]);
+  // Before the windows are read (right after an engine restart) the desk's open legs say what is held.
+  const heldSymbol = desk ? heldSymbolOf(desk.legs) : null;
+  const lines = useMemo(() => storyOf(days.flatMap((d) => d.entries), heldId, heldSymbol), [days, heldId, heldSymbol]);
   const story = useMemo(() => byDay(lines), [lines]);
   // The sentence: the period held now, its funding and outages (period.ts); without one, what the contract signed.
-  const headline = useMemo(() => journalHeadline(storyOf(shown, heldId), desk?.pnl.fundingUsd ?? null, now), [shown, heldId, desk, now]);
+  const headline = useMemo(() => journalHeadline(storyOf(shown, heldId, heldSymbol), desk?.pnl.fundingUsd ?? null, now), [shown, heldId, heldSymbol, desk, now]);
   const factsOf = useCallback((item: HoldItem) => periodFacts(item, { entries: shown, desk, now }), [shown, desk, now]);
 
   const replay = desk?.mode === 'replay';
