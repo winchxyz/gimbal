@@ -201,32 +201,49 @@ export function storyOf(entries: readonly JournalEntry[], heldWindowId: string |
  * the verified NEAR AI attestation (`stage: 'attestation'`), the pair start (`stage: 'start'`: "pair start confirmed
  * after 1 failed attempt(s)…", "pair start waits for the Orderly session…") and a venue session opening (only
  * `numbers.venue`, no `downS`: "orderly session starting…"). Errors of the same stages are not notes: they stay.
+ * A start-stage wait that follows a start-stage error is that error's recovery ("rescue: the live rescuer started…",
+ * "pair start confirmed…" after "pair start not confirmed…"): `resolves` lists those, and they stay too.
  */
-export const isTechnicalNote = (e: JournalEntry): boolean =>
+export const isTechnicalNote = (e: JournalEntry, resolves: ReadonlySet<string> = new Set()): boolean =>
   e.kind === 'wait' &&
   (e.numbers.stage === 'attestation' ||
-    e.numbers.stage === 'start' ||
+    (e.numbers.stage === 'start' && !resolves.has(e.id)) ||
     (typeof e.numbers.venue === 'string' && numberOf(e, 'downS') === null && e.numbers.action === undefined && e.numbers.stage === undefined));
+
+/** The start-stage waits whose nearest earlier start-stage entry is an error: the recoveries of a shown error. */
+function startRecoveries(items: readonly StoryItem[]): Set<string> {
+  const starts = items
+    .flatMap((i) => (i.type === 'waits' ? i.entries : i.type === 'entry' ? [i.entry] : []))
+    .filter((e) => e.numbers.stage === 'start')
+    .sort((a, b) => a.t - b.t);
+  const out = new Set<string>();
+  starts.forEach((e, k) => {
+    if (e.kind === 'wait' && k > 0 && starts[k - 1]!.kind === 'error') out.add(e.id);
+  });
+  return out;
+}
 
 /**
  * The Desk's Latest: the three newest lines, leaving out the engine's technical notes (isTechnicalNote), which belong
- * in the Journal, where they stay. A run of waits keeps its other waits (so its line never reads a note) and is left out
- * when nothing else is in it.
+ * in the Journal, where they stay. A run of waits keeps its other waits (so its line never reads a note, and its time
+ * is its newest real wait) and is left out when nothing else is in it.
  */
 export function latestOf(items: readonly StoryItem[], n = 3): StoryItem[] {
+  const resolves = startRecoveries(items);
+  const note = (e: JournalEntry) => isTechnicalNote(e, resolves);
   const out: StoryItem[] = [];
   for (const i of items) {
-    if (out.length === n) break;
-    if (i.type === 'entry' && isTechnicalNote(i.entry)) continue;
+    if (i.type === 'entry' && note(i.entry)) continue;
     if (i.type === 'waits') {
-      const entries = i.entries.filter((e) => !isTechnicalNote(e));
+      const entries = i.entries.filter((e) => !note(e));
       if (entries.length === 0) continue;
       out.push(entries.length === i.entries.length ? i : { ...i, t: entries[0]!.t, entries });
       continue;
     }
     out.push(i);
   }
-  return out;
+  // A shortened run's time can be older than its slot: order again by the time each line shows.
+  return out.sort((a, b) => b.t - a.t).slice(0, n);
 }
 
 /**
