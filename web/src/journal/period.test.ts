@@ -140,7 +140,12 @@ test('a start-stage error keeps its recovery on the Desk (rescue started, pair s
   const ids = (items: ReturnType<typeof storyOf>) => items.flatMap((i) => (i.type === 'waits' ? i.entries.map((e) => e.id) : 'entry' in i && i.entry ? [i.entry.id] : []));
   const latest = ids(latestOf(storyOf(newestFirst([hold('05:19', 50), failed, started, notConfirmed, confirmed]), W, 'MON'), 4));
   for (const e of [failed, started, notConfirmed, confirmed]) assert.ok(latest.includes(e.id), e.summary);
-  // The same confirmation after a plain wait (the Orderly session opening) is a note.
+  // The rescuer and the pair start interleave: both recoveries stay, whatever comes between them.
+  const pairDown = entry(at('05:21'), 'error', 'pair start not confirmed: near read timed out', { stage: 'start' });
+  const rescueUp = entry(at('05:22'), 'wait', 'rescue: the live rescuer started after 1 failed attempt(s)', { stage: 'start' });
+  const mixed = ids(latestOf(storyOf(newestFirst([failed, pairDown, rescueUp, confirmed]), W, 'MON'), 4));
+  for (const e of [failed, pairDown, rescueUp, confirmed]) assert.ok(mixed.includes(e.id), e.summary);
+  // With no start-stage error, a confirmation after the Orderly session opening is a note.
   const waiting = entry(at('05:22'), 'wait', 'pair start waits for the Orderly session, which is still opening', { stage: 'start', venue: 'orderly' });
   assert.equal(ids(latestOf(storyOf(newestFirst([hold('05:19', 50), waiting, confirmed]), W, 'MON'))).includes(confirmed.id), false);
 });

@@ -201,8 +201,10 @@ export function storyOf(entries: readonly JournalEntry[], heldWindowId: string |
  * the verified NEAR AI attestation (`stage: 'attestation'`), the pair start (`stage: 'start'`: "pair start confirmed
  * after 1 failed attempt(s)…", "pair start waits for the Orderly session…") and a venue session opening (only
  * `numbers.venue`, no `downS`: "orderly session starting…"). Errors of the same stages are not notes: they stay.
- * A start-stage wait that follows a start-stage error is that error's recovery ("rescue: the live rescuer started…",
- * "pair start confirmed…" after "pair start not confirmed…"): `resolves` lists those, and they stay too.
+ * A start-stage wait can be a start-stage error's recovery ("rescue: the live rescuer started…", "pair start
+ * confirmed…" after "pair start not confirmed…"); two processes (the rescuer and the pair start) write that stage at
+ * once and can interleave, so no wait is paired with an error: `resolves` lists them all whenever a start-stage error
+ * is on the page, and they stay. A start-up with no error, the usual one, shows none of them.
  */
 export const isTechnicalNote = (e: JournalEntry, resolves: ReadonlySet<string> = new Set()): boolean =>
   e.kind === 'wait' &&
@@ -210,17 +212,12 @@ export const isTechnicalNote = (e: JournalEntry, resolves: ReadonlySet<string> =
     (e.numbers.stage === 'start' && !resolves.has(e.id)) ||
     (typeof e.numbers.venue === 'string' && numberOf(e, 'downS') === null && e.numbers.action === undefined && e.numbers.stage === undefined));
 
-/** The start-stage waits whose nearest earlier start-stage entry is an error: the recoveries of a shown error. */
+/** Every start-stage wait when a start-stage error is on the page (any of them may be its recovery); else none. */
 function startRecoveries(items: readonly StoryItem[]): Set<string> {
   const starts = items
     .flatMap((i) => (i.type === 'waits' ? i.entries : i.type === 'entry' ? [i.entry] : []))
-    .filter((e) => e.numbers.stage === 'start')
-    .sort((a, b) => a.t - b.t);
-  const out = new Set<string>();
-  starts.forEach((e, k) => {
-    if (e.kind === 'wait' && k > 0 && starts[k - 1]!.kind === 'error') out.add(e.id);
-  });
-  return out;
+    .filter((e) => e.numbers.stage === 'start');
+  return starts.some((e) => e.kind === 'error') ? new Set(starts.filter((e) => e.kind === 'wait').map((e) => e.id)) : new Set();
 }
 
 /**
