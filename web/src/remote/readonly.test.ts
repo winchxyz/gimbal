@@ -8,16 +8,16 @@ import { hostedReplayFlag, isHostedReplay, isReadOnly, setRemoteSettingsForTests
 import { hasOwnLine, type Problem } from './problem.ts';
 
 test('remote mode hides every control that writes', () => {
-  assert.deepEqual(writeControlsFor(true), { close: false, rotate: false, stress: false, owner: false, money: false, onboarding: false });
+  assert.deepEqual(writeControlsFor(true), { close: false, rotate: false, enter: false, stress: false, owner: false, money: false, onboarding: false });
 });
 
 test('the local engine keeps all of them, as before', () => {
-  assert.deepEqual(writeControlsFor(false), { close: true, rotate: true, stress: true, owner: true, money: true, onboarding: true });
+  assert.deepEqual(writeControlsFor(false), { close: true, rotate: true, enter: false, stress: true, owner: true, money: true, onboarding: true });
   assert.deepEqual(writeControlsFor(false, false), writeControlsFor(false));
 });
 
 test('the hosted replay build keeps the stress test only; remote stays all off', () => {
-  assert.deepEqual(writeControlsFor(false, true), { close: false, rotate: false, stress: true, owner: false, money: false, onboarding: false });
+  assert.deepEqual(writeControlsFor(false, true), { close: false, rotate: false, enter: false, stress: true, owner: false, money: false, onboarding: false });
   assert.deepEqual(writeControlsFor(true, true), writeControlsFor(true));
 });
 
@@ -74,6 +74,8 @@ test('every component that draws a write control asks writeControls first', () =
     ['desk/DeskScreen.tsx', 'owner'],
     ['windows/Detail.tsx', 'close'],
     ['windows/Detail.tsx', 'rotate'],
+    ['windows/Detail.tsx', 'enter'],
+    ['windows/WindowList.tsx', 'enter'],
   ];
   for (const [file, control] of gated) {
     const code = readFileSync(join(src, file), 'utf8');

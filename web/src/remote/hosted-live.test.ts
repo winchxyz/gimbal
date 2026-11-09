@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { NOT_CONFIGURED_TEXT, parseHostedHealth } from './hosted.ts';
+import { NOT_CONFIGURED_TEXT, parseHostedHealth, parseOwnerWrites } from './hosted.ts';
 import {
   hostedLiveFlag, hostedLiveLine, isHostedLive, isReadOnly, isRemote, remoteSettings, setHostedLiveForTests, setRemoteSettingsForTests, writeControls,
   writeControlsFor,
@@ -30,7 +30,7 @@ test('the hosted-live build is read-only from the start: no Settings step, a sav
     assert.deepEqual(remoteSettings(), { base: null, token: null });
     assert.equal(isRemote(), false);
     assert.equal(isReadOnly(), true, 'read-only, so the Security screen masks the owner\'s and the operator\'s ids');
-    assert.deepEqual(writeControls(), { close: false, rotate: false, stress: false, owner: false, money: false, onboarding: false });
+    assert.deepEqual(writeControls(), { close: false, rotate: false, enter: false, stress: false, owner: false, money: false, onboarding: false });
     assert.deepEqual(writeControls(), writeControlsFor(true));
   } finally {
     setHostedLiveForTests(undefined);
@@ -50,6 +50,21 @@ test('the line names what the engine reports: live mainnet is never called a rep
   assert.match(hostedLiveLine('testnet'), /^Live testnet desk/);
   const unknown = hostedLiveLine(null);
   assert.doesNotMatch(unknown, /\b(live|mainnet|replay)\b/i, 'before the engine answers, nothing is claimed');
+});
+
+test('owner writes off on the host: the line is exactly as before, with no word of an owner; on: "read-only for visitors"', () => {
+  assert.equal(hostedLiveLine('mainnet'), 'Live mainnet desk, read-only: the real desk as it trades now. Nothing on this page can change it. For the recorded replay, run npm run demo.');
+  assert.equal(hostedLiveLine('testnet'), 'Live testnet desk, read-only: test money, not the mainnet desk. Nothing on this page can change it.');
+  assert.equal(hostedLiveLine('mainnet', false, false), hostedLiveLine('mainnet'));
+  assert.match(hostedLiveLine('mainnet', false, true), /^Live mainnet desk, read-only for visitors: /);
+  assert.match(hostedLiveLine('mainnet', true, true), /Owner unlocked in this tab/);
+  for (const mode of ['mainnet', 'testnet', 'replay', null] as const) assert.doesNotMatch(hostedLiveLine(mode), /owner/i);
+  // The host says owner writes are on only with `owner: true` in /healthz; anything else is off.
+  assert.equal(parseOwnerWrites({ ok: true, live: 'connected', visitors: 1, owner: true }), true);
+  for (const body of [null, {}, { ok: true, live: 'connected', visitors: 1 }, { owner: 'true' }, { owner: 1 }]) assert.equal(parseOwnerWrites(body), false);
+  // The Owner link is drawn only when the host says so, or this tab is unlocked (to Lock).
+  const bar = readFileSync(join(root, 'web', 'src', 'remote', 'RemoteBar.tsx'), 'utf8');
+  assert.match(bar, /\{ownerWrites \|\| unlocked \? <a href=\{OWNER_HREF\}>Owner<\/a> : null\}/);
 });
 
 test('the host\'s /healthz: its live state, anything else unknown', () => {
@@ -72,5 +87,6 @@ test('only the live host builds the page with VITE_HOSTED_LIVE=1; the Vite confi
 test('the hosted-live page leaves out the engine settings and uses read-only API calls', () => {
   const src = join(root, 'web', 'src');
   assert.match(readFileSync(join(src, 'shell/Shell.tsx'), 'utf8'), /useConnectRoute\(\) && !isHostedLive\(\)/);
-  assert.match(readFileSync(join(src, 'stream/start.ts'), 'utf8'), /isHostedLive\(\)\) \{\s*api \?\?= Promise\.resolve\(readOnlyApi\(httpApi\(\)\)\)/);
+  // Locked (no owner token in the tab), every write is refused in the page; unlocked, only rotate and close carry the owner header.
+  assert.match(readFileSync(join(src, 'stream/start.ts'), 'utf8'), /owner === null \? readOnlyApi\(httpApi\(\)\) : ownerApi\(httpApi\('', \{ \[OWNER_HEADER\]: owner \}\)\)/);
 });

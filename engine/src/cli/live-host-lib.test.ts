@@ -5,7 +5,7 @@
 // engine's payloads (a field allowlist per type, then the cut), checked against the page's own fixtures.
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, request } from 'node:http';
 import type { IncomingHttpHeaders, IncomingMessage, OutgoingHttpHeaders, Server, ServerResponse } from 'node:http';
 import { connect } from 'node:net';
@@ -16,11 +16,11 @@ import { after, test } from 'node:test';
 import type { DeskState, EngineState, JournalEntry, StreamEvent, Window } from '@gimbal/shared';
 import { viewRedactor } from '../view/view-redact.ts';
 import { ViewServer } from '../view/view-server.ts';
-import type { ViewSource } from '../view/view-server.ts';
+import type { ViewOwner, ViewSource } from '../view/view-server.ts';
 import type { LiveHostOptions, LiveHostServer, LiveUpstreamOptions } from './live-host-lib.ts';
 import {
-  LIVE_BUILD_MARKER, LIVE_READ_ONLY_REASON, LiveUpstream, NOT_CONFIGURED_REASON, addressGroup, createLiveHostServer, isLiveBuild, liveClientKey,
-  liveConfigFromEnv, liveRoute, liveStaticFile, publicCutter, publicEvent, publicRead, publicSetup, publicState,
+  LIVE_BUILD_MARKER, LIVE_CSP, LIVE_OWNER_READ_ONLY_REASON, LIVE_READ_ONLY_REASON, LiveUpstream, NOT_CONFIGURED_REASON, addressGroup, createLiveHostServer, isLiveBuild, liveClientKey,
+  liveConfigFromEnv, liveRoute, liveStaticFile, OWNER_HEADER, ownerWritesFromEnv, publicCutter, publicEvent, publicRead, publicSetup, publicState, sameOrigin,
 } from './live-host-lib.ts';
 
 const TOKEN = 'b7e2c94f1a6d38e05c7b9a2f4e81d6c3a5f0b9e7';
@@ -91,13 +91,13 @@ async function listen(server: Server): Promise<number> {
   return (server.address() as AddressInfo).port;
 }
 
-type HostLimits = Pick<LiveHostOptions, 'maxStreams' | 'maxStreamsPerClient' | 'maxUnreadBytes' | 'maxUnreadTotal' | 'unreadCheckMs' | 'heartbeatMs'>;
+type HostLimits = Pick<LiveHostOptions, 'maxStreams' | 'maxStreamsPerClient' | 'maxUnreadBytes' | 'maxUnreadTotal' | 'unreadCheckMs' | 'heartbeatMs' | 'ownerWrites'>;
 
 async function startHost(engineBase: string | null, opts: Partial<LiveUpstreamOptions> & HostLimits & { stream?: boolean; token?: string; upstream?: LiveUpstream } = {}): Promise<Running> {
   const lines: string[] = [];
-  const { maxStreams, maxStreamsPerClient, maxUnreadBytes, maxUnreadTotal, unreadCheckMs, heartbeatMs, stream = true, token = TOKEN, upstream: given, ...up } = opts;
+  const { maxStreams, maxStreamsPerClient, maxUnreadBytes, maxUnreadTotal, unreadCheckMs, heartbeatMs, ownerWrites, stream = true, token = TOKEN, upstream: given, ...up } = opts;
   const upstream = given ?? (engineBase === null ? null : new LiveUpstream({ base: engineBase, token, log: (l) => lines.push(l), backoff: () => 50, ...up }));
-  const limits = Object.fromEntries(Object.entries({ maxStreams, maxStreamsPerClient, maxUnreadBytes, maxUnreadTotal, unreadCheckMs, heartbeatMs }).filter(([, v]) => v !== undefined));
+  const limits = Object.fromEntries(Object.entries({ maxStreams, maxStreamsPerClient, maxUnreadBytes, maxUnreadTotal, unreadCheckMs, heartbeatMs, ownerWrites }).filter(([, v]) => v !== undefined));
   const host = createLiveHostServer({
     webDir, upstream, offReason: upstream === null ? 'GIMBAL_LIVE_URL and GIMBAL_VIEW_TOKEN are not set' : null, log: (l) => lines.push(l), ...limits,
   });
@@ -114,9 +114,9 @@ async function startHost(engineBase: string | null, opts: Partial<LiveUpstreamOp
   };
 }
 
-async function startView(source: ViewSource, env: Record<string, string> = {}): Promise<{ view: ViewServer; base: string; lines: string[] }> {
+async function startView(source: ViewSource, env: Record<string, string> = {}, owner?: ViewOwner): Promise<{ view: ViewServer; base: string; lines: string[] }> {
   const lines: string[] = [];
-  const view = new ViewServer({ source, token: TOKEN, origins: [], redact: viewRedactor(env), log: (l) => lines.push(l) });
+  const view = new ViewServer({ source, token: TOKEN, origins: [], redact: viewRedactor(env), log: (l) => lines.push(l), ...(owner === undefined ? {} : { owner }) });
   const port = await view.start(0, '127.0.0.1');
   return { view, base: `http://127.0.0.1:${port}`, lines };
 }
@@ -1151,5 +1151,222 @@ test('HEAD answers a read\'s headers without its body', async () => {
   } finally {
     await h.stop();
     await v.view.stop();
+  }
+});
+
+// ---------- owner writes (GIMBAL_OWNER_WRITES=1) ----------
+
+const OWNER = '9c2e7a1f4b8d3e6a0c5f9b2d7e1a4c8f3b6d0e5a';
+
+/** A request on a connection of its own (a refused owner request closes its connection). */
+function fresh(base: string, method: string, path: string, headers: OutgoingHttpHeaders = {}, body?: string): Promise<Reply> {
+  return new Promise((resolve, reject) => {
+    const req = request(`${base}${path}`, { method, headers, agent: false }, (res) => {
+      let text = '';
+      res.setEncoding('utf8');
+      res.on('data', (c: string) => (text += c));
+      res.on('end', () => resolve({ status: res.statusCode!, text, headers: res.headers }));
+    });
+    req.on('error', reject);
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+}
+
+test('owner routes exist only with the opt-in and the owner header; every other write is refused as before', () => {
+  const on = { on: true, header: true };
+  const none = new URLSearchParams();
+  assert.deepEqual(liveRoute('GET', '/owner', none, on), { kind: 'owner', method: 'GET', path: '/owner' });
+  assert.deepEqual(liveRoute('POST', '/rotate', none, on), { kind: 'owner', method: 'POST', path: '/rotate' });
+  assert.deepEqual(liveRoute('POST', '/close/', none, on), { kind: 'owner', method: 'POST', path: '/close' });
+  assert.deepEqual(liveRoute('PUT', '/strategy', none, on), { kind: 'owner', method: 'PUT', path: '/strategy' });
+  // Not these, header or not: the same answer as without owner writes.
+  const others: [string, string][] = [
+    ['POST', '/stress'], ['POST', '/strategy'], ['PUT', '/rotate'], ['GET', '/rotate'], ['POST', '/pause'], ['POST', '/setup'],
+    ['PUT', '/journal'], ['POST', '/owner'], ['DELETE', '/close'], ['POST', '/control'], ['GET', '/strategy'],
+  ];
+  for (const [m, p] of others) {
+    assert.deepEqual(liveRoute(m, p, none, on), liveRoute(m, p, none, { on: true, header: false }), `${m} ${p}`);
+    assert.equal(liveRoute(m, p, none, on).kind, liveRoute(m, p).kind, `${m} ${p}`);
+  }
+  // Without the opt-in: refused exactly as before, header or not, with the old text (no word of an owner).
+  for (const owner of [{ on: false, header: true }, { on: false, header: false }]) {
+    for (const [m, p] of [['POST', '/rotate'], ['POST', '/close'], ['PUT', '/strategy']]) {
+      const r = liveRoute(m!, p!, none, owner);
+      assert.deepEqual(r, liveRoute(m!, p!), `${m} ${p} ${JSON.stringify(owner)}`);
+      assert.equal(r.kind, 'refuse');
+      assert.equal((r as { status: number }).status, 403);
+      assert.ok((r as { body: { reason: string } }).body.reason.includes(LIVE_READ_ONLY_REASON));
+      assert.doesNotMatch((r as { body: { reason: string } }).body.reason, /owner/);
+    }
+  }
+  // On, without the header: refused, and the text says the owner can unlock.
+  for (const [m, p] of [['POST', '/rotate'], ['POST', '/close'], ['PUT', '/strategy']]) {
+    const r = liveRoute(m!, p!, none, { on: true, header: false });
+    assert.equal((r as { status: number }).status, 403);
+    assert.ok((r as { body: { reason: string } }).body.reason.includes(LIVE_OWNER_READ_ONLY_REASON));
+  }
+  assert.deepEqual(liveRoute('GET', '/owner', none, { on: false, header: true }), { kind: 'static' }, 'off: /owner is a missing file, as before');
+  assert.equal((liveRoute('GET', '/owner', none, { on: true, header: false }) as { status: number }).status, 403);
+  assert.equal(ownerWritesFromEnv((n) => (n === 'GIMBAL_OWNER_WRITES' ? '1' : undefined)), true);
+  for (const v of [undefined, '', '0', 'true', 'yes']) assert.equal(ownerWritesFromEnv(() => v), false);
+});
+
+test('same origin: the Host the request was sent to, over https (http for this machine only)', () => {
+  assert.equal(sameOrigin('https://gimbal-live.example', 'gimbal-live.example'), true);
+  assert.equal(sameOrigin('http://127.0.0.1:8080', '127.0.0.1:8080'), true);
+  assert.equal(sameOrigin('http://localhost:8080', 'localhost:8080'), true);
+  const no: [string | undefined, string | undefined][] = [
+    [undefined, 'gimbal-live.example'], ['null', 'gimbal-live.example'], ['https://evil.example', 'gimbal-live.example'],
+    ['http://gimbal-live.example', 'gimbal-live.example'], ['https://gimbal-live.example:8443', 'gimbal-live.example'],
+    ['https://gimbal-live.example/path', 'gimbal-live.example'], ['https://gimbal-live.example', undefined], ['http://127.0.0.1:8081', '127.0.0.1:8080'],
+  ];
+  for (const [origin, host] of no) assert.equal(sameOrigin(origin, host), false, `${origin} on ${host}`);
+});
+
+test('the owner\'s requests are forwarded with the host\'s view token and the owner header as sent; the route answers', async () => {
+  const eng = fakeEngine();
+  const calls: unknown[][] = [];
+  const v = await startView(eng.source, {}, {
+    token: OWNER,
+    call: async (method, path, body) => {
+      calls.push([method, path, body]);
+      return path === '/close' ? { status: 409, body: { ok: false, reason: 'no pair is held: nothing to close' } } : { status: 200, body: { ok: true } };
+    },
+  });
+  const h = await startHost(v.base, { stream: false, ownerWrites: true });
+  const write = { origin: h.base, 'content-type': 'application/json', [OWNER_HEADER]: OWNER };
+  try {
+    const check = await fresh(h.base, 'GET', '/owner', { [OWNER_HEADER]: OWNER });
+    assert.equal(check.status, 204);
+    const rotate = await fresh(h.base, 'POST', '/rotate', write, JSON.stringify({ windowId: 'sol-hyperliquid-phoenix', demo: { maxLossUsd: 1 } }));
+    assert.deepEqual([rotate.status, JSON.parse(rotate.text)], [200, { ok: true }]);
+    const close = await fresh(h.base, 'POST', '/close', write, '{}');
+    assert.equal(close.status, 409);
+    assert.match(close.text, /no pair is held/);
+    assert.deepEqual(calls, [['POST', '/rotate', { windowId: 'sol-hyperliquid-phoenix', demo: { maxLossUsd: 1 } }], ['POST', '/close', {}]]);
+    // A wrong owner token: the engine's 403 comes back, and nothing reaches the route.
+    const wrong = await fresh(h.base, 'POST', '/close', { ...write, [OWNER_HEADER]: `${OWNER.slice(0, -1)}0` }, '{}');
+    assert.equal(wrong.status, 403);
+    assert.equal((JSON.parse(wrong.text) as { error: string }).error, 'owner');
+    assert.equal(calls.length, 2);
+    // One host line per write (method, path, status); no token in any line, answer or header.
+    assert.deepEqual(h.lines.filter((l) => l.startsWith('owner: ')), ['owner: POST /rotate: 200', 'owner: POST /close: 409', 'owner: POST /close: 403']);
+    for (const line of [...h.lines, ...v.lines]) {
+      assert.ok(!line.includes(OWNER) && !line.includes(TOKEN) && !line.includes(OWNER.slice(0, -1)), line);
+    }
+    for (const r of [check, rotate, close, wrong]) {
+      assert.ok(!r.text.includes(OWNER) && !r.text.includes(TOKEN) && !JSON.stringify(r.headers).includes(OWNER));
+    }
+  } finally {
+    await h.stop();
+    await v.view.stop();
+  }
+});
+
+test('an owner write from another site, with no Origin, not JSON or too large is refused at the host and never forwarded', async () => {
+  const eng = fakeEngine();
+  const calls: unknown[][] = [];
+  const v = await startView(eng.source, {}, { token: OWNER, call: async (...a) => (calls.push(a), { status: 200, body: { ok: true } }) });
+  const h = await startHost(v.base, { stream: false, ownerWrites: true });
+  const good = { origin: h.base, 'content-type': 'application/json', [OWNER_HEADER]: OWNER };
+  const body = JSON.stringify({ windowId: 'w' });
+  try {
+    const cases: [OutgoingHttpHeaders, string, number][] = [
+      [{ ...good, origin: 'https://evil.example' }, body, 403],
+      [{ 'content-type': 'application/json', [OWNER_HEADER]: OWNER }, body, 403],
+      [{ ...good, 'content-type': 'text/plain' }, body, 415],
+      [good, JSON.stringify({ windowId: 'w', pad: 'x'.repeat(5000) }), 413],
+      [good, '{"windowId":', 400],
+      [good, '[1]', 400],
+      [{ ...good, [OWNER_HEADER]: 'has space inside' }, body, 400],
+    ];
+    for (const [headers, b, status] of cases) {
+      const r = await fresh(h.base, 'POST', '/rotate', headers, b);
+      assert.equal(r.status, status, JSON.stringify({ ...headers, [OWNER_HEADER]: '…' }));
+    }
+    // GET /owner from another site's page is refused too.
+    assert.equal((await fresh(h.base, 'GET', '/owner', { origin: 'https://evil.example', [OWNER_HEADER]: OWNER })).status, 403);
+    assert.equal(calls.length, 0);
+    for (const line of h.lines) assert.ok(!line.includes(OWNER), line);
+  } finally {
+    await h.stop();
+    await v.view.stop();
+  }
+});
+
+test('without the opt-in the owner header changes nothing: refused at the host, never forwarded', async () => {
+  const eng = fakeEngine();
+  const calls: unknown[][] = [];
+  const v = await startView(eng.source, {}, { token: OWNER, call: async (...a) => (calls.push(a), { status: 200, body: { ok: true } }) });
+  const h = await startHost(v.base, { stream: false });
+  try {
+    const r = await fresh(h.base, 'POST', '/rotate', { origin: h.base, 'content-type': 'application/json', [OWNER_HEADER]: OWNER }, JSON.stringify({ windowId: 'w' }));
+    assert.equal(r.status, 403);
+    assert.equal((JSON.parse(r.text) as { error: string }).error, 'read-only');
+    const put = await fresh(h.base, 'PUT', '/strategy', { origin: h.base, 'content-type': 'application/json', [OWNER_HEADER]: OWNER }, '{}');
+    assert.equal(put.status, 403);
+    assert.notEqual((await fresh(h.base, 'GET', '/owner', { [OWNER_HEADER]: OWNER })).status, 204);
+    assert.equal(calls.length, 0);
+  } finally {
+    await h.stop();
+    await v.view.stop();
+  }
+});
+
+test('an engine whose view has owner writes off: the host says so, and nothing is written', async () => {
+  const eng = fakeEngine();
+  const v = await startView(eng.source);
+  const h = await startHost(v.base, { stream: false, ownerWrites: true });
+  try {
+    const check = await fresh(h.base, 'GET', '/owner', { [OWNER_HEADER]: OWNER });
+    assert.equal(check.status, 403);
+    assert.equal((JSON.parse(check.text) as { error: string }).error, 'owner-off');
+    const put = await fresh(h.base, 'PUT', '/strategy', { origin: h.base, 'content-type': 'application/json', [OWNER_HEADER]: OWNER }, '{}');
+    assert.equal(put.status, 403);
+    assert.equal((JSON.parse(put.text) as { error: string }).error, 'owner-off');
+  } finally {
+    await h.stop();
+    await v.view.stop();
+  }
+});
+
+test('with owner writes on, /healthz says so (the page shows its Owner link only then); new rules are not served from the cache', async () => {
+  const eng = fakeEngine();
+  const v = await startView(eng.source, {}, { token: OWNER, call: async () => ({ status: 200, body: { ok: true } }) });
+  const h = await startHost(v.base, { stream: false, ownerWrites: true });
+  try {
+    assert.equal(JSON.parse((await call(h.base, 'GET', '/healthz')).text).owner, true);
+    assert.equal((await fresh(h.base, 'GET', '/strategy')).status, 200);
+    assert.equal((await fresh(h.base, 'GET', '/strategy')).status, 200);
+    assert.equal(eng.reads.strategy, 1, 'the second read is the cache');
+    const put = await fresh(h.base, 'PUT', '/strategy', { origin: h.base, 'content-type': 'application/json', [OWNER_HEADER]: OWNER }, '{"auto":false}');
+    assert.equal(put.status, 200);
+    assert.equal((await fresh(h.base, 'GET', '/strategy')).status, 200);
+    assert.equal(eng.reads.strategy, 2, 'after the owner\'s PUT the next read asks the engine');
+  } finally {
+    await h.stop();
+    await v.view.stop();
+  }
+});
+
+test('every answer carries the page\'s CSP: own files only, no inline script, no frames, fetches to this site and the NEAR RPCs the page reads', async () => {
+  const h = await startHost(null, { stream: false });
+  try {
+    for (const path of ['/', '/healthz', '/state']) {
+      const csp = String((await call(h.base, 'GET', path)).headers['content-security-policy']);
+      assert.equal(csp, LIVE_CSP, path);
+    }
+    assert.match(LIVE_CSP, /script-src 'self'(;|$)/);
+    assert.doesNotMatch(LIVE_CSP, /unsafe-/);
+    assert.match(LIVE_CSP, /frame-ancestors 'none'/);
+    // The connect list is exactly the page's NEAR RPC list (web/src/onboarding/chain.ts), so the Security screen works.
+    const chain = readFileSync(join(import.meta.dirname, '..', '..', '..', 'web', 'src', 'onboarding', 'chain.ts'), 'utf8');
+    const rpcs = chain.slice(chain.indexOf('export const RPC_URLS'), chain.indexOf('};', chain.indexOf('export const RPC_URLS'))).match(/https:\/\/[a-z0-9.-]+/g) ?? [];
+    assert.equal(rpcs.length, 4);
+    const connect = LIVE_CSP.split('; ').find((d) => d.startsWith('connect-src '))!.split(' ').slice(1);
+    assert.deepEqual(connect, ["'self'", ...rpcs]);
+  } finally {
+    await h.stop();
   }
 });

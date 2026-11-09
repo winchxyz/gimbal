@@ -184,6 +184,9 @@ export function WindowsScreen() {
               below={isBelow(w, minimum)}
               history={histories[w.id]}
               held={held}
+              windows={all}
+              legUsd={strategy?.legUsd ?? null}
+              auto={strategy?.auto ?? null}
               onSelect={select}
             />
           ))}

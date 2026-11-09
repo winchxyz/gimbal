@@ -200,6 +200,26 @@ the contract's policy alone, not by the NEAR AI risk check. The model never sign
 contract or a venue; the contract checks every order against the policy either way. In replay only (`npm run demo`), a prompt with no recorded reply passes, and the
 journal says it would wait live.
 
+### The owner token (public site's owner console)
+
+With owner writes on (`GIMBAL_OWNER_TOKEN` on the engine, `GIMBAL_OWNER_WRITES=1` on the public host;
+docs/deploy-railway.md, "Owner writes"), the owner token is a hot credential: anyone holding it, together with the
+public site, can do what the owner's dashboard does through `POST /rotate`, `POST /close` and `PUT /strategy`. The
+page itself only sends demo entries (from flat, refused above 1 USD of round-trip cost) and closes, but the token
+also takes a plain `POST /rotate` (it may close the held pair and open another, with no loss cap) and a
+`PUT /strategy` that turns auto on or loosens the thresholds and leg size within the engine's own limits (the
+leverage cap holds). It moves no money out and reaches no owner method of the contract. Every order still goes
+through the contract, which checks it against the policy (asset list, `max_notional_usd` per order, the price band,
+the hourly notional meter `max_hourly_notional_usd`), and every entry still asks the NEAR AI risk check. So the worst
+case is what those caps allow: on the mainnet desk 20 USD per order and 300 USD of opening orders per hour, and the
+fees, slippage and funding lost by entering, rotating and closing again and again (churn) within them. Guessing is
+held off by the token's size: the engine requires at least 32 characters with 16 distinct ones or about 128 bits by its own estimate, and
+`openssl rand -hex 32` gives 256. Comparison is constant time. After five wrong tries in 15 minutes, further wrong
+ones get 429 for 15 minutes, but the right token is always served, so nobody can lock the owner out (the lock slows
+noise, it does not stop guessing). The host never stores or logs the token, and the page keeps it in one tab's
+`sessionStorage`. If it may have leaked, rotate it: set a new `GIMBAL_OWNER_TOKEN` on the engine's service (the old
+one works until the redeploy that the change starts is live), or delete the variable to turn owner writes off.
+
 ### Frozen venues
 
 A new Phoenix or Ember program id, PhUSD mint, onboarder or permission account needs a new contract.

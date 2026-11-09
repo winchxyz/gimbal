@@ -9,6 +9,11 @@ import { isStreamData, type StreamType } from './store.ts';
 /** What `POST /rotate` and `POST /close` answer at once: done, or refused with the reason a check gave. */
 export type ActionResult = { ok: true } | { ok: false; reason: string };
 
+/** `POST /rotate`'s `demo` (engine/src/strategy/loop.ts parseDemo): the most the entry's round trip may cost, USD. */
+export interface DemoEntry {
+  maxLossUsd: number;
+}
+
 export interface EngineApi {
   /** The owner's engine rules, as `GET /strategy` returns them. */
   strategy(): Promise<StrategyConfig>;
@@ -18,8 +23,12 @@ export interface EngineApi {
   journal(): Promise<JournalEntry[]>;
   /** Up to 100 entries older than `before`, newest first; `[]` past the oldest or for an id the engine no longer holds. */
   journalBefore(before: string): Promise<JournalEntry[]>;
-  /** Manual override: close the held window and open this one. Rejects when the engine does not answer. */
-  rotate(windowId: string): Promise<ActionResult>;
+  /**
+   * Manual override: close the held window and open this one. With `demo`: an owner demo entry from flat (the engine
+   * waives the window's profit checks, holds its round trip to `demo.maxLossUsd`, and checks everything else). Rejects
+   * when the engine does not answer.
+   */
+  rotate(windowId: string, demo?: DemoEntry): Promise<ActionResult>;
   /** Close both legs with reduce-only orders. Rejects when the engine does not answer. */
   close(): Promise<ActionResult>;
   /** Testnet and replay only: tighten the margin threshold so a leg crosses the rescue line. Rejects when the engine does not answer. */
@@ -181,12 +190,12 @@ async function getJson(url: string): Promise<unknown> {
   return response.json();
 }
 
-async function postJson(url: string, body: unknown): Promise<ActionResult> {
+async function postJson(url: string, body: unknown, headers: Readonly<Record<string, string>> = {}): Promise<ActionResult> {
   let response: Response;
   try {
     response = await fetch(url, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      headers: { ...headers, 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
@@ -212,12 +221,15 @@ export function readApi(get: (path: string) => Promise<unknown>): Pick<EngineApi
   };
 }
 
-/** The real engine, through the dev proxy or the same origin in production. */
-export function httpApi(base = ''): EngineApi {
+/**
+ * The real engine, through the dev proxy or the same origin in production. `writeHeaders` go on the writes only (the
+ * public live view's owner header, remote/owner.ts); reads never carry them.
+ */
+export function httpApi(base = '', writeHeaders: Readonly<Record<string, string>> = {}): EngineApi {
   return {
     ...readApi((path) => getJson(`${base}${path}`)),
-    rotate: (windowId) => postJson(`${base}/rotate`, { windowId }),
-    close: () => postJson(`${base}/close`, {}),
-    stress: () => postJson(`${base}/stress`, {}),
+    rotate: (windowId, demo) => postJson(`${base}/rotate`, demo === undefined ? { windowId } : { windowId, demo }, writeHeaders),
+    close: () => postJson(`${base}/close`, {}, writeHeaders),
+    stress: () => postJson(`${base}/stress`, {}, writeHeaders),
   };
 }

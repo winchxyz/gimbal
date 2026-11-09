@@ -16,6 +16,14 @@
 //
 // No visitor header reaches the engine: every upstream request is built here from nothing but the path, `accept` and
 // the host's own `authorization`. The token is never in a response, a URL or a log line.
+//
+// Owner writes (opt in: GIMBAL_OWNER_WRITES=1 on the host, ownerWritesFromEnv): a request that carries the owner header
+// (`x-gimbal-owner`) for GET /owner, POST /rotate, POST /close or PUT /strategy is forwarded to the engine's view with
+// the host's view token and that header passed through unchanged, and nothing else of the visitor's. A write must come
+// from this site's own page (its Origin is this site, against CSRF), with a JSON body of at most
+// OWNER_MAX_BODY_BYTES; a few a minute per visitor. The engine checks the owner token (and locks out after wrong ones)
+// and its routes check everything else. The host never stores, caches or logs the owner token: its log line names the
+// method, the path and the status. Without the opt-in, or without the header, every write is refused exactly as before.
 
 import { createReadStream, existsSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
@@ -27,6 +35,9 @@ import type {
   VenueAccount, Window, WindowHistory,
 } from '@gimbal/shared';
 import { MAX_STREAMS_PER_CLIENT } from './replay-host-lib.ts';
+import { OWNER_HEADER, OWNER_MAX_BODY_BYTES } from '../view/view-server.ts';
+
+export { OWNER_HEADER };
 
 export const HEALTH_PATH = '/healthz';
 
@@ -39,6 +50,11 @@ export function isLiveBuild(indexHtml: string): boolean {
 
 export const LIVE_READ_ONLY_REASON = 'This is the public view of the live mainnet desk, and it is read-only: visitors cannot change the rules, '
   + 'enter, rotate, close, pause or stress it. The host refuses every write and never forwards one to the engine.';
+
+/** The same, with owner writes on (GIMBAL_OWNER_WRITES=1): only then does the text mention the owner's way in. */
+export const LIVE_OWNER_READ_ONLY_REASON = 'This is the public view of the live mainnet desk, and it is read-only for visitors: they cannot change the rules, '
+  + 'enter, rotate, close, pause or stress it. The host refuses every write from a visitor and never forwards one to the engine; '
+  + 'only the owner, with the owner token, can unlock entering and closing.';
 
 export const NOT_CONFIGURED_REASON = 'The live engine is not configured on this site: the host has no engine address or view token, so there is no desk to show.';
 
@@ -77,6 +93,28 @@ export function liveConfigFromEnv(env: (name: string) => string | undefined): { 
   return { config: { base: url.origin, token } };
 }
 
+/** GIMBAL_OWNER_WRITES=1: the owner's requests (with the owner header) are forwarded; anything else: refused as before. */
+export function ownerWritesFromEnv(env: (name: string) => string | undefined): boolean {
+  return env('GIMBAL_OWNER_WRITES')?.trim() === '1';
+}
+
+/**
+ * Whether `origin` (the request's Origin header) is this site's own: the host the request was sent to (its Host
+ * header, which the edge passes through), over https (plain http only for this machine). A cross-site page sends its
+ * own origin; a missing one is not this site's page.
+ */
+export function sameOrigin(origin: string | undefined, host: string | undefined): boolean {
+  if (origin === undefined || host === undefined || host === '') return false;
+  let u: URL;
+  try {
+    u = new URL(origin);
+  } catch {
+    return false;
+  }
+  if (u.origin !== origin.toLowerCase().replace(/\/$/, '') || u.host !== host.toLowerCase()) return false;
+  return u.protocol === 'https:' || (u.protocol === 'http:' && isLoopbackHost(u.hostname));
+}
+
 // ---------- routes ----------
 
 /** Paths that belong to the engine's API: GET on one that is not a read below is 404, never the page. */
@@ -93,7 +131,19 @@ export type LiveRoute =
   | { kind: 'events' }
   /** A read of the engine: `key` is the path and query the host asks for, built here (never the visitor's query). */
   | { kind: 'read'; key: string }
+  /** The owner's request, forwarded with the owner header (owner writes on, the header sent). */
+  | { kind: 'owner'; method: 'GET' | 'POST' | 'PUT'; path: '/owner' | '/rotate' | '/close' | '/strategy' }
   | { kind: 'refuse'; status: number; body: { ok: false; error: string; reason: string } };
+
+/** What the host may forward for the owner, and nothing else. */
+const OWNER_ROUTES: Readonly<Record<string, 'GET' | 'POST' | 'PUT'>> = { '/owner': 'GET', '/rotate': 'POST', '/close': 'POST', '/strategy': 'PUT' };
+
+export interface OwnerAsk {
+  /** GIMBAL_OWNER_WRITES=1 on this host. */
+  on: boolean;
+  /** The request carries the owner header. */
+  header: boolean;
+}
 
 const refuse = (status: number, error: string, reason: string): LiveRoute => ({ kind: 'refuse', status, body: { ok: false, error, reason } });
 
@@ -104,14 +154,22 @@ export function isApiPath(path: string): boolean {
 /**
  * What the public port does with `method` `path`?`search`. Only GET and HEAD of the reads the dashboard needs reach the
  * engine; every other method is refused here (POST /rotate, /close, /stress, /pause, PUT /strategy and the rest), and
- * so is every GET of an API path that is not on the list.
+ * so is every GET of an API path that is not on the list. With owner writes on (`owner.on`) and the owner header
+ * sent, GET /owner, POST /rotate, POST /close and PUT /strategy are the owner's (forwarded); nothing else changes.
  */
-export function liveRoute(method: string, rawPath: string, search: URLSearchParams = new URLSearchParams()): LiveRoute {
+export function liveRoute(
+  method: string, rawPath: string, search: URLSearchParams = new URLSearchParams(), owner: OwnerAsk = { on: false, header: false },
+): LiveRoute {
   const path = rawPath.replace(/\/+$/, '') || '/';
   const read = method === 'GET' || method === 'HEAD';
+  if (owner.on) {
+    const want = OWNER_ROUTES[path];
+    if (owner.header && want === method) return { kind: 'owner', method: want, path: path as '/owner' | '/rotate' | '/close' | '/strategy' };
+    if (path === '/owner' && method === 'GET') return refuse(403, 'owner', 'GET /owner needs the owner token');
+  }
   if (!read) {
     return isApiPath(path) || path === HEALTH_PATH
-      ? refuse(403, 'read-only', `${method} ${path} is refused. ${LIVE_READ_ONLY_REASON}`)
+      ? refuse(403, 'read-only', `${method} ${path} is refused. ${owner.on ? LIVE_OWNER_READ_ONLY_REASON : LIVE_READ_ONLY_REASON}`)
       : refuse(405, 'method', `${method} ${path}: this site only serves pages and reads`);
   }
   if (path === HEALTH_PATH) return { kind: 'health' };
@@ -782,6 +840,57 @@ export class LiveUpstream {
       : 'live: the engine refused this host (403): GIMBAL_VIEW_ORIGINS on the engine must not list a browser origin for a server; asking nothing for a minute');
   }
 
+  /**
+   * The owner's request, sent to the engine's view as it came: the host's view token, the owner header as the visitor
+   * sent it, the JSON body (writes). Never cached, never retried. The answer is the route's own status and body, with
+   * the fields the page reads and the host's cut (the owner token included, should anything quote it). A view without
+   * owner writes (404, 405) is said so (403 owner-off); the engine refusing the host's own token is a host error (502).
+   */
+  async owner(method: 'GET' | 'POST' | 'PUT', path: string, ownerToken: string, body: string | null): Promise<Answer> {
+    const headers: Record<string, string> = { ...this.#headers('application/json'), [OWNER_HEADER]: ownerToken };
+    if (body !== null) headers['content-type'] = 'application/json';
+    let res: Response;
+    try {
+      res = await this.#fetch()(`${this.#o.base}${path}`, {
+        method, headers, ...(body === null ? {} : { body }), redirect: 'manual', cache: 'no-store', signal: AbortSignal.timeout(this.#o.timeoutMs ?? 15_000),
+      });
+    } catch (err) {
+      this.#logEvery('owner', `live: owner ${method} ${path}: the engine did not answer (${err instanceof Error ? err.name : 'error'})`);
+      return json(502, { ok: false, error: 'live engine not answering', reason: 'The live engine did not answer, so this page cannot tell whether it was carried out. Check the Journal before you try again.' });
+    }
+    const cut = (text: string): string => this.#cut(text).split(ownerToken).join(CUT);
+    const drain = () => res.body?.cancel().catch(() => undefined);
+    if (res.status === 204) {
+      await drain();
+      return { status: 204, body: '' };
+    }
+    if (res.status === 401) {
+      await drain();
+      this.#logEvery('owner-401', 'live: owner request: the engine refused the host\'s view token (401): check GIMBAL_VIEW_TOKEN on this service');
+      return json(502, { ok: false, error: 'live engine refused', reason: 'The live engine refused this site\'s view token. Nothing was sent.' });
+    }
+    if (res.status === 404 || res.status === 405) {
+      await drain();
+      return json(403, { ok: false, error: 'owner-off', reason: 'Owner writes are off on the live engine (GIMBAL_OWNER_TOKEN is not set there). Nothing was sent.' });
+    }
+    let parsed: unknown = null;
+    try {
+      const text = await res.text();
+      if (text.length > 64 * 1024) return json(502, { ok: false, error: 'too large', reason: 'The live engine\'s answer is too large to serve.' });
+      parsed = text === '' ? null : JSON.parse(text);
+    } catch {
+      return json(502, { ok: false, error: 'live engine error', reason: 'The live engine\'s answer was not JSON.' });
+    }
+    // New rules: the cached GET /strategy is stale now, so the next read asks the engine (never the old rules as fresh).
+    if (method === 'PUT' && path === '/strategy' && res.status >= 200 && res.status < 300) this.#invalidate('/strategy');
+    const shape = path === '/strategy' && res.status === 200 ? STRATEGY : ERROR;
+    const s = Number(res.headers.get('retry-after'));
+    return {
+      status: res.status, body: JSON.stringify(shaped(parsed, shape, cut) ?? {}),
+      ...(Number.isFinite(s) && s > 0 ? { retryAfterS: Math.min(Math.ceil(s), 3600) } : {}),
+    };
+  }
+
   // ---------- the one stream ----------
 
   subscribe(listener: UpstreamListener): () => void {
@@ -953,6 +1062,10 @@ export interface LiveHostOptions {
   upstream: LiveUpstream | null;
   /** Why there is no upstream (variable names only). */
   offReason?: string | null;
+  /** GIMBAL_OWNER_WRITES=1: forward the owner's requests (the owner header sent); else refuse them as every write. */
+  ownerWrites?: boolean;
+  /** The owner's requests per visitor (addressGroup); more are 429. */
+  ownerRate?: Rate;
   log?: (line: string) => void;
   /** Visitor event streams at once, for everyone; more are answered 503 (the page retries). */
   maxStreams?: number;
@@ -969,6 +1082,9 @@ export interface LiveHostOptions {
   unreadCheckMs?: number;
   heartbeatMs?: number;
 }
+
+/** The owner's requests per visitor: an unlock check and a few writes, then one every 10 s. */
+export const OWNER_RATE: Rate = { perSecond: 0.1, burst: 10 };
 
 export const MAX_VISITOR_STREAMS = 300;
 /** A few of the largest events (the windows list) behind: more and the visitor reconnects and reads /state. */
@@ -993,10 +1109,22 @@ const TYPES: Record<string, string> = {
   '.txt': 'text/plain; charset=utf-8',
 };
 
+/**
+ * The page's own files only: no inline script or style (the Vite build has none; React sets styles through the DOM,
+ * which a CSP allows), fonts and icons from this origin (the favicon is `data:`), and fetches to this origin plus the
+ * public NEAR RPCs the Security screen reads the contract from (web/src/onboarding/chain.ts RPC_URLS). No frames.
+ */
+export const LIVE_CSP = [
+  "default-src 'self'", "script-src 'self'", "style-src 'self'", "img-src 'self' data:", "font-src 'self'",
+  "connect-src 'self' https://free.rpc.fastnear.com https://rpc.mainnet.near.org https://test.rpc.fastnear.com https://rpc.testnet.near.org",
+  "frame-ancestors 'none'", "base-uri 'none'", "form-action 'self'", "object-src 'none'",
+].join('; ');
+
 const COMMON_HEADERS = {
   'x-content-type-options': 'nosniff',
   'referrer-policy': 'no-referrer',
   'x-frame-options': 'DENY',
+  'content-security-policy': LIVE_CSP,
 } as const;
 
 const PING = Buffer.from(': ping\n\n');
@@ -1011,6 +1139,33 @@ export interface LiveHostServer extends Server {
 function hasBody(req: IncomingMessage): boolean {
   const length = req.headers['content-length'];
   return req.headers['transfer-encoding'] !== undefined || (length !== undefined && length.trim() !== '0');
+}
+
+/** A request's body as text, or null once it passes `max` bytes (the rest is not read; the connection closes). */
+function readCappedBody(req: IncomingMessage, max: number): Promise<string | null> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let done = false;
+    const finish = (v: string | null) => {
+      if (done) return;
+      done = true;
+      resolve(v);
+    };
+    req.on('data', (chunk: Buffer) => {
+      if (done) return;
+      size += chunk.length;
+      if (size > max) {
+        req.pause();
+        finish(null);
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => finish(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', () => finish(null));
+    req.on('close', () => finish(null));
+  });
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
@@ -1087,6 +1242,63 @@ export function createLiveHostServer(o: LiveHostOptions): LiveHostServer {
   }, o.heartbeatMs ?? 15_000);
   heartbeat.unref();
 
+  const ownerBuckets = new Map<string, Bucket>();
+  /**
+   * The owner's request (liveRoute kind `owner`): the header checked for shape only (the engine checks the token), a
+   * write from this site's own page only, with a JSON body under the cap; then forwarded as it came. Logged as method,
+   * path and status: never the header or the body.
+   */
+  const owner = async (req: IncomingMessage, res: ServerResponse, route: Extract<LiveRoute, { kind: 'owner' }>, client: string): Promise<void> => {
+    const header = req.headers[OWNER_HEADER];
+    const refuseOwner = (status: number, error: string, reason: string, extra: Record<string, string> = {}): void => {
+      res.setHeader('connection', 'close');
+      return sendJson(res, status, { ok: false, error, reason }, extra);
+    };
+    if (typeof header !== 'string' || !/^[\x21-\x7e]{1,512}$/.test(header)) return refuseOwner(400, 'owner', 'The owner token must be one header of printable characters.');
+    if (o.upstream === null) return refuseOwner(503, 'live engine not configured', NOT_CONFIGURED_REASON);
+    const write = route.method !== 'GET';
+    const origin = req.headers.origin;
+    if (write ? !sameOrigin(origin, req.headers.host) : origin !== undefined && !sameOrigin(origin, req.headers.host)) {
+      logEvery('owner-origin', `owner: ${route.method} ${route.path} refused: not from this site's own page`);
+      return refuseOwner(403, 'origin', 'Owner requests are taken from this site\'s own page only.');
+    }
+    const now = Date.now();
+    let bucket = ownerBuckets.get(client);
+    if (bucket === undefined) {
+      bucket = new Bucket(o.ownerRate ?? OWNER_RATE, now);
+      if (ownerBuckets.size >= MAX_CLIENTS) ownerBuckets.delete(ownerBuckets.keys().next().value!);
+      ownerBuckets.set(client, bucket);
+    }
+    if (!bucket.has(now)) return refuseOwner(429, 'busy', 'Too many owner requests from this address; wait a few seconds.', { 'retry-after': '10' });
+    bucket.take();
+    let body: string | null = null;
+    if (!write) {
+      if (hasBody(req)) return refuseOwner(400, 'body', 'GET /owner takes no body');
+    } else {
+      const type = (req.headers['content-type'] ?? '').split(';')[0]!.trim().toLowerCase();
+      if (type !== 'application/json') return refuseOwner(415, 'content-type', `${route.method} ${route.path} needs content-type application/json`);
+      const declared = Number(req.headers['content-length'] ?? '0');
+      if (Number.isFinite(declared) && declared > OWNER_MAX_BODY_BYTES) return refuseOwner(413, 'body', `The body is over ${OWNER_MAX_BODY_BYTES} bytes.`);
+      const text = await readCappedBody(req, OWNER_MAX_BODY_BYTES);
+      if (text === null) return refuseOwner(413, 'body', `The body is over ${OWNER_MAX_BODY_BYTES} bytes.`);
+      body = text.trim() === '' ? '{}' : text;
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        return refuseOwner(400, 'body', 'The body is not JSON.');
+      }
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return refuseOwner(400, 'body', 'The body must be a JSON object.');
+    }
+    const answer = await o.upstream.owner(route.method, route.path, header, body);
+    if (write) log(`owner: ${route.method} ${route.path}: ${answer.status}`);
+    if (answer.status === 204) {
+      res.writeHead(204, { 'cache-control': 'no-store' });
+      return void res.end();
+    }
+    return sendJson(res, answer.status, answer.body, answer.retryAfterS === undefined ? {} : { 'retry-after': String(answer.retryAfterS) });
+  };
+
   const liveStatus = (): Record<string, unknown> => o.upstream === null
     ? { live: 'not-configured', reason: o.offReason ?? NOT_CONFIGURED_REASON }
     : { live: o.upstream.status };
@@ -1138,7 +1350,8 @@ export function createLiveHostServer(o: LiveHostOptions): LiveHostServer {
       return sendJson(res, 400, { ok: false, error: 'bad request', reason: 'that is not a path' });
     }
     for (const [k, v] of Object.entries(COMMON_HEADERS)) res.setHeader(k, v);
-    const route = liveRoute(method, url.pathname, url.searchParams);
+    const route = liveRoute(method, url.pathname, url.searchParams, { on: o.ownerWrites === true, header: req.headers[OWNER_HEADER] !== undefined });
+    if (route.kind === 'owner') return owner(req, res, route, liveClientKey(req));
     if (route.kind === 'refuse') {
       // The body is never read: the connection closes after the answer.
       res.setHeader('connection', 'close');
@@ -1149,7 +1362,8 @@ export function createLiveHostServer(o: LiveHostOptions): LiveHostServer {
       res.setHeader('connection', 'close');
       return sendJson(res, 400, { ok: false, error: 'body', reason: `${method} ${url.pathname} takes no body` });
     }
-    if (route.kind === 'health') return sendJson(res, 200, { ok: true, ...liveStatus(), visitors: visitors.size });
+    // `owner: true` only with owner writes on, so the page shows its Owner link then; off, the answer is as before.
+    if (route.kind === 'health') return sendJson(res, 200, { ok: true, ...liveStatus(), visitors: visitors.size, ...(o.ownerWrites === true ? { owner: true } : {}) });
     if (route.kind === 'static') {
       const file = liveStaticFile(o.webDir, url.pathname);
       if (file === null || !existsSync(file)) return sendJson(res, 404, { ok: false, error: 'not found', reason: `no file ${url.pathname}` });

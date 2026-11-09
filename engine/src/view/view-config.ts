@@ -5,6 +5,10 @@
 //   GIMBAL_VIEW_PORT     the port it listens on, on every interface (0.0.0.0); default PORT, which Railway sets
 //   GIMBAL_VIEW_ORIGINS  the browser origins allowed to call it (CORS), comma or space separated, e.g.
 //                        https://gimbal.example; none = no browser page may call it (curl still can)
+//   GIMBAL_OWNER_TOKEN   optional: with it the view also forwards the owner's POST /rotate, POST /close and PUT
+//                        /strategy (view-server.ts, "Owner writes"); the same rules as the view token, and not equal
+//                        to it. Unset = the view is read-only, as without this variable; a bad value = read-only,
+//                        with the reason on the start line
 // Off is never an error: serve runs the engine either way, and the start line says why the view is off.
 
 export const VIEW_TOKEN_MIN_LENGTH = 32;
@@ -66,22 +70,44 @@ export interface ViewConfig {
   origins: string[];
 }
 
+/**
+ * What is wrong with a token set in `name`, or null when it may be used: whitespace, too short, too few distinct
+ * characters and bits, or an obvious pattern. Never quotes the value.
+ */
+export function tokenProblem(name: string, token: string): string | null {
+  if (/\s/.test(token)) return `${name} has whitespace in it`;
+  if (token.length < VIEW_TOKEN_MIN_LENGTH) return `${name} is ${token.length} characters, under the ${VIEW_TOKEN_MIN_LENGTH} required: ${MAKE_ONE}`;
+  const distinct = new Set(token).size;
+  if (distinct < VIEW_TOKEN_MIN_DISTINCT && tokenBits(token) < VIEW_TOKEN_MIN_BITS) {
+    return `${name} looks guessable (${distinct} distinct characters, about ${Math.floor(tokenBits(token))} bits; needs ${VIEW_TOKEN_MIN_DISTINCT} distinct or ${VIEW_TOKEN_MIN_BITS} bits): ${MAKE_ONE}`;
+  }
+  const pattern = tokenPattern(token);
+  if (pattern !== null) return `${name} looks guessable (${pattern}): ${MAKE_ONE}`;
+  return null;
+}
+
+/**
+ * GIMBAL_OWNER_TOKEN: the second credential that lets the view forward the owner's writes (view-server.ts, "Owner
+ * writes"). Unset: off, nothing to say (`off` null). Set but unusable: off, with the reason (names only, never the
+ * value): the same rules as the view token, and it must not be the view token, which the live host holds.
+ */
+export function ownerTokenFromEnv(env: (name: string) => string | undefined, viewToken: string): { token: string } | { off: string | null } {
+  const token = env('GIMBAL_OWNER_TOKEN');
+  if (token === undefined || token === '') return { off: null };
+  const problem = tokenProblem('GIMBAL_OWNER_TOKEN', token);
+  if (problem !== null) return { off: problem };
+  if (token === viewToken) return { off: 'GIMBAL_OWNER_TOKEN is the same as GIMBAL_VIEW_TOKEN: make it a token of its own' };
+  return { token };
+}
+
 /** The view's settings, or why it is off (`reason` null: GIMBAL_VIEW_TOKEN is not set, nothing to say). */
 export function viewConfigFromEnv(
   env: (name: string) => string | undefined, enginePort: number,
 ): { config: ViewConfig } | { off: string | null } {
   const token = env('GIMBAL_VIEW_TOKEN');
   if (token === undefined || token === '') return { off: null };
-  if (/\s/.test(token)) return { off: 'GIMBAL_VIEW_TOKEN has whitespace in it' };
-  if (token.length < VIEW_TOKEN_MIN_LENGTH) {
-    return { off: `GIMBAL_VIEW_TOKEN is ${token.length} characters, under the ${VIEW_TOKEN_MIN_LENGTH} required: ${MAKE_ONE}` };
-  }
-  const distinct = new Set(token).size;
-  if (distinct < VIEW_TOKEN_MIN_DISTINCT && tokenBits(token) < VIEW_TOKEN_MIN_BITS) {
-    return { off: `GIMBAL_VIEW_TOKEN looks guessable (${distinct} distinct characters, about ${Math.floor(tokenBits(token))} bits; needs ${VIEW_TOKEN_MIN_DISTINCT} distinct or ${VIEW_TOKEN_MIN_BITS} bits): ${MAKE_ONE}` };
-  }
-  const pattern = tokenPattern(token);
-  if (pattern !== null) return { off: `GIMBAL_VIEW_TOKEN looks guessable (${pattern}): ${MAKE_ONE}` };
+  const problem = tokenProblem('GIMBAL_VIEW_TOKEN', token);
+  if (problem !== null) return { off: problem };
   const portText = env('GIMBAL_VIEW_PORT') ?? env('PORT');
   if (portText === undefined) return { off: 'GIMBAL_VIEW_TOKEN is set but neither GIMBAL_VIEW_PORT nor PORT is' };
   const port = Number(portText);
