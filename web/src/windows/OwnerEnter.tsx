@@ -46,11 +46,15 @@ export function OwnerEnter({ w, windows, legUsd, auto, place }: Props) {
   const action: ManualAction | null =
     state.kind === 'open' ? { kind: 'enter', symbol: w.symbol, windowId: w.id, maxLossUsd: OWNER_MAX_LOSS_USD } : null;
   const send = useManualSend(action, (outcome) => {
-    // Taken: this window's entry is the one whose result the page waits for. The ids the Journal holds now are older.
-    if (outcome.tone === 'sent') {
-      started.dispatch({ kind: 'start', entry: { windowId: w.id, symbol: w.symbol, seen: new Set(stream.getState().journal.map((e) => e.id)), sawActing: false } });
-    }
+    // Not taken (refused, still running, no answer): there is no act of this send to wait for.
+    if (outcome.tone !== 'sent' && started.getState()?.windowId === w.id) started.dispatch({ kind: 'clear' });
   });
+  // The Journal ids are read when the owner confirms, before the request goes out: the act can end, and its line
+  // arrive on the stream, before the engine's 200 does (a refusal at its first check takes milliseconds).
+  const confirm = () => {
+    started.dispatch({ kind: 'start', entry: { windowId: w.id, symbol: w.symbol, seen: new Set(stream.getState().journal.map((e) => e.id)), sawActing: false } });
+    send.confirm();
+  };
   const mine = entry !== null && entry.windowId === w.id ? entry : null;
   const actingOnMine = mine !== null && acting !== null && isOwnerEntryOn(acting, w.id);
   useEffect(() => {
@@ -77,7 +81,7 @@ export function OwnerEnter({ w, windows, legUsd, auto, place }: Props) {
         <span className="ink">{enterConfirmText(w, venueName, legUsd)}</span>
         <span className={place === 'row' ? 'ask' : 'end'}>
           <button type="button" className="btn quiet" onClick={send.cancel}>Cancel</button>
-          <button type="button" className="btn primary" onClick={send.confirm}>Enter {w.symbol}</button>
+          <button type="button" className="btn primary" onClick={confirm}>Enter {w.symbol}</button>
         </span>
       </Wrap>
     );

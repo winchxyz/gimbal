@@ -162,8 +162,11 @@ export function entryResult(journal: readonly JournalEntry[], pending: PendingEn
   if (line === null) return null;
   const { symbol } = pending;
   if (line.kind === 'enter' || line.kind === 'rotate') {
-    const leg = num(line.numbers.usd) ?? num(line.numbers.legUsd);
-    const taker = line.summary.includes('taker fallback') ? ' The maker orders did not fill it all; the taker fallback took the rest.' : '';
+    // legUsd is the leg as sized (what filled, for a partial fill); `usd` is the line's money effect, not a size.
+    const sized = num(line.numbers.legUsd);
+    const leg = sized !== null && sized > 0 ? sized : null;
+    // The fallback's own note (trade/pair.ts: `taker fallback: <venue> <side> IOC …`), not the demo tag's cost words.
+    const taker = /taker fallback: \S+ (BUY|SELL) IOC/.test(line.summary) ? ' The maker orders did not fill it all; the taker fallback took the rest.' : '';
     return { kind: 'opened', text: `Opened ${symbol}: both legs are open${leg === null ? '' : `, ${usd(leg)} a leg`}.${taker} It shows on the Desk.` };
   }
   if (line.kind === 'veto') return { kind: 'not', text: `Not opened: the NEAR AI risk check refused ${symbol}. Nothing was sent.` };

@@ -115,9 +115,10 @@ test('the act’s result comes from its Journal line: opened, opened by the take
   assert.equal(entryResult([older], pending(['a'])), null);
   assert.equal(entryResult([line('b', 'wait', 'waiting'), line('c', 'refused', 'enter eth-x not carried out', { window: 'eth-phoenix-orderly' }), older], pending(['a'])), null);
 
-  const opened = line('d', 'enter', 'enter sol-phoenix-orderly, SOL short orderly, long phoenix, at most 0.2 SOL (20 USD) a leg at 2x, 8.6 % net (POST /rotate (manual)); owner demo entry: …; risk ok; opened', { window: 'sol-phoenix-orderly', usd: 20 });
-  assert.deepEqual(entryResult([opened, older], pending(['a'])), { kind: 'opened', text: 'Opened SOL: both legs are open, $20.00 a leg. It shows on the Desk.' });
-  const byTaker = { ...opened, summary: `${opened.summary} (taker fallback: hyperliquid buy IOC 0.1 after the maker window filled 0.1 at 2512)` };
+  // The leg is numbers.legUsd (as sized); `usd` is the line's money effect, never shown as the leg.
+  const opened = line('d', 'enter', `enter sol-phoenix-orderly, SOL short orderly, long phoenix, at most 0.2 SOL (20 USD) a leg at 2x, 8.6 % net (POST /rotate (manual)); ${TAG.slice(1, -1)}; risk ok; opened`, { window: 'sol-phoenix-orderly', legUsd: 20, usd: -0.01 });
+  assert.deepEqual(entryResult([opened, older], pending(['a'])), { kind: 'opened', text: 'Opened SOL: both legs are open, $20.00 a leg. It shows on the Desk.' }, 'the demo tag naming the fallback’s cost is not a fallback');
+  const byTaker = { ...opened, summary: `${opened.summary} (taker fallback: hyperliquid SELL IOC 500000 after the maker window filled 0.1 at 2512)` };
   assert.match(entryResult([byTaker], pending())!.text, /the taker fallback took the rest/);
 
   // Not opened: the reason after the window id, without the owner entry's tag, the symbol's lead and the later clauses.
