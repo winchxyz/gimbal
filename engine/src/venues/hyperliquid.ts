@@ -1,5 +1,17 @@
 // Hyperliquid reader over the public info endpoint. Everything here is a POST to /info; no keys.
+//
+// Request weight. Hyperliquid allows 1200 weight a minute per IP across its REST API (docs, "Rate limits and user
+// limits"): clearinghouseState, l2Book, allMids, orderStatus, spotClearinghouseState and exchangeStatus weigh 2,
+// userRole 60, every other info request 20, and the list answers (fundingHistory, userFunding, userFillsByTime, the
+// ledger updates and a few more) 1 more per 20 rows they return. Every reader of the host in one process goes through
+// one weight budget (http-budget.ts HL_BUDGET, which says what serve spends and why it stays under the limit): a read
+// is charged its weight before it is sent (a history read: with the rows its hours should bring), and the rows an
+// answer really brought once it is in.
 
+import type { HostBudget, ReadKind } from './http-budget.ts';
+import { HL_BUDGET, hostBudget, readClass, requestTimeoutMs } from './http-budget.ts';
+import type { DeskActStamp } from './desk-acts.ts';
+import { deskActStamp, stillReusable } from './desk-acts.ts';
 import type {
   AccountState, Book, BookLevel, Clock, FundingHistorySource, FundingPayment, Market, MarketFunding, MarketFundingPoint,
   MarketHistorySource, Position, VenueReader,
@@ -100,6 +112,91 @@ export interface HyperliquidReaderOptions {
   fetch?: typeof fetch;
   clock?: Clock;
   timeoutMs?: number;
+  /**
+   * The weight budget (http-budget.ts). Default: the one every reader of this host in the process shares, unless a
+   * `fetch` is passed (tests, capture), which then goes without one; null: none.
+   */
+  budget?: HostBudget | null;
+}
+
+/** Info requests that weigh 2; userRole weighs 60; every other one 20. */
+const LIGHT_INFO = new Set(['l2Book', 'allMids', 'clearinghouseState', 'orderStatus', 'spotClearinghouseState', 'exchangeStatus']);
+/** Info answers that weigh 1 more per 20 rows (the docs' list, with the ledger read under both of its names). */
+const PER_ROW_INFO = new Set([
+  'recentTrades', 'historicalOrders', 'userFills', 'userFillsByTime', 'fundingHistory', 'userFunding', 'nonUserFundingUpdates',
+  'userNonFundingLedgerUpdates', 'twapHistory', 'userTwapSliceFills', 'userTwapSliceFillsByTime', 'delegatorHistory',
+  'delegatorRewards', 'validatorStats',
+]);
+
+/** The weight of an info request of `type` before its rows (docs, see the header). */
+export function hlInfoWeight(type: string): number {
+  if (LIGHT_INFO.has(type)) return 2;
+  return type === 'userRole' ? 60 : 20;
+}
+
+/** The weight `rows` rows of an answer of `type` add: 1 per 20 (rounded up) for the list answers, 1 per 60 for candles. */
+export function hlRowsWeight(type: string, rows: number): number {
+  if (!(rows > 0)) return 0;
+  if (PER_ROW_INFO.has(type)) return Math.ceil(rows / 20);
+  return type === 'candleSnapshot' ? Math.ceil(rows / 60) : 0;
+}
+
+/** The rows a request should bring, charged before it is sent: a fundingHistory window's hours (500 at most). */
+export function hlRowsExpected(body: { type: string } & Record<string, unknown>): number {
+  if (body.type !== 'fundingHistory' || typeof body.startTime !== 'number') return 0;
+  const end = typeof body.endTime === 'number' ? body.endTime : Date.now();
+  return Math.min(FUNDING_PAGE_ROWS, Math.max(1, Math.ceil((end - body.startTime) / HOUR_MS)));
+}
+
+/** The budget class an info request of `type` reads as (critical outside the scanner, http-budget.ts readClass). */
+export function hlReadKind(type: string): ReadKind {
+  if (type === 'l2Book') return 'book';
+  if (type === 'fundingHistory') return 'history';
+  if (type === 'metaAndAssetCtxs' || type === 'meta' || type === 'predictedFundings') return 'funding';
+  return 'account';
+}
+
+/** The budget every reader of `infoUrl`'s host shares in this process (HL_BUDGET). */
+export function hlHostBudget(infoUrl: string = HL_MAINNET_INFO_URL): HostBudget {
+  return hostBudget(infoUrl, HL_BUDGET);
+}
+
+/**
+ * Sends one /info request through `budget` (none: as is): charged its weight and the rows it should bring, in the
+ * class its type and the caller's context give, and once a list answer is in, the rows it really brought (a refund
+ * when fewer). `send` is called when the budget lets it go. A read the budget skips rejects with ReadSkipped.
+ */
+export async function hlBudgetedSend(budget: HostBudget | null, body: { type: string } & Record<string, unknown>, send: () => Promise<Response>): Promise<Response> {
+  if (budget === null) return send();
+  const expected = hlRowsExpected(body);
+  const charged = hlRowsWeight(body.type, expected);
+  const res = await budget.run(readClass(hlReadKind(body.type)), send, hlInfoWeight(body.type) + charged);
+  if (res.ok && (PER_ROW_INFO.has(body.type) || body.type === 'candleSnapshot')) {
+    // A copy of the body: the caller reads the answer as before. Rows of an answer that cannot be read count as none.
+    res.clone().json().then(
+      (rows: unknown) => budget.charge(hlRowsWeight(body.type, Array.isArray(rows) ? rows.length : 0) - charged),
+      () => budget.charge(-charged),
+    );
+  }
+  return res;
+}
+
+/**
+ * `inner` with every /info POST sent through `budget` (hlBudgetedSend; the request's JSON body names its type), for
+ * callers that post to /info themselves (the position book's ledger reads). Anything else goes as is.
+ */
+export function hlBudgetedFetch(budget: HostBudget, inner: typeof fetch): typeof fetch {
+  return (input, init) => {
+    let body: unknown = null;
+    try {
+      body = typeof init?.body === 'string' ? JSON.parse(init.body) : null;
+    } catch {
+      body = null;
+    }
+    const typed = body as ({ type?: unknown } & Record<string, unknown>) | null;
+    if (typed === null || typeof typed.type !== 'string') return inner(input, init);
+    return hlBudgetedSend(budget, typed as { type: string } & Record<string, unknown>, () => inner(input, init));
+  };
 }
 
 /** A non-2xx answer from /info, kept apart so callers can tell an outage from a request the venue refused. */
@@ -121,13 +218,18 @@ export class HyperliquidReader implements VenueReader, FundingHistorySource, Mar
   readonly #fetch: typeof fetch;
   readonly #clock: Clock;
   readonly #timeoutMs: number;
+  readonly #budget: HostBudget | null;
+  /** Each address's last account answer, when it was asked for and under which desk-act stamp (accountWithin). */
+  readonly #lastAccount = new Map<string, { at: number; value: AccountState; stamp: DeskActStamp }>();
 
   constructor(options: HyperliquidReaderOptions = {}) {
     this.network = options.network ?? 'mainnet';
     this.infoUrl = options.url ?? (this.network === 'testnet' ? HL_TESTNET_INFO_URL : HL_MAINNET_INFO_URL);
-    this.#fetch = options.fetch ?? fetch;
+    // Looked up when called, not bound here: a test may stub the global fetch after the reader is made.
+    this.#fetch = options.fetch ?? ((input, init) => globalThis.fetch(input, init));
     this.#clock = options.clock ?? systemClock;
     this.#timeoutMs = options.timeoutMs ?? 10_000;
+    this.#budget = options.budget !== undefined ? options.budget : options.fetch === undefined ? hlHostBudget(this.infoUrl) : null;
   }
 
   async markets(): Promise<Market[]> {
@@ -156,8 +258,26 @@ export class HyperliquidReader implements VenueReader, FundingHistorySource, Mar
 
   async account(address: string): Promise<AccountState> {
     const user = normalizeAddress(address);
+    const at = this.#clock.now();
+    const stamp = deskActStamp();
     const raw = await this.#info<HlClearinghouseState>({ type: 'clearinghouseState', user });
-    return parseAccount(user, raw);
+    const value = parseAccount(user, raw);
+    const last = this.#lastAccount.get(user);
+    if (last === undefined || at >= last.at) this.#lastAccount.set(user, { at, value, stamp });
+    return value;
+  }
+
+  /**
+   * The account as read at most `maxAgeMs` ago by anyone in this process (the risk engine reads it every 5 s), else
+   * read now: for callers that need it only roughly fresh (the strategy loop's free margin), so they add no request.
+   * Never across the desk's own act (desk-acts.ts): sizing takes the margin after it.
+   */
+  async accountWithin(address: string, maxAgeMs: number): Promise<AccountState> {
+    const user = normalizeAddress(address);
+    const last = this.#lastAccount.get(user);
+    const now = this.#clock.now();
+    if (last !== undefined && stillReusable(last.stamp) && now >= last.at && now - last.at <= maxAgeMs) return last.value;
+    return this.account(user);
   }
 
   /**
@@ -235,13 +355,17 @@ export class HyperliquidReader implements VenueReader, FundingHistorySource, Mar
   }
 
   async #info<T>(body: { type: string } & Record<string, unknown>, signal?: AbortSignal): Promise<T> {
-    const timeout = AbortSignal.timeout(this.#timeoutMs);
-    const res = await this.#fetch(this.infoUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: signal === undefined ? timeout : AbortSignal.any([timeout, signal]),
-    });
+    // The timeout runs from when the budget lets the request go, and ends at the caller's deadline (readBy) if sooner.
+    const send = () => {
+      const timeout = AbortSignal.timeout(requestTimeoutMs(this.#timeoutMs));
+      return this.#fetch(this.infoUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: signal === undefined ? timeout : AbortSignal.any([timeout, signal]),
+      });
+    };
+    const res = await hlBudgetedSend(this.#budget, body, send);
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       throw new HlHttpError(body.type, res.status, text);

@@ -117,17 +117,22 @@ test('a venue whose session is in its first open is journaled once as starting (
   await risk.tick();
   await risk.tick();
   assert.deepEqual(journal(), [`wait: orderly session starting: its account is read once the session is up (orderly account unknown: ${SESSION_STARTING} (its first open runs))`]);
-  // The open failed: the word stays down, the reason is now a failure.
+  // The open failed: the word stays down, the reason is now a failure, journaled once the spell (from the start of
+  // the wait) lasted DOWN_JOURNAL_AFTER_MS: no leg is held there, so nothing is judged on stale numbers meanwhile.
   orderly = new Error('orderly account unknown: the private session is down (login refused)');
   await risk.tick();
   await risk.tick();
+  assert.equal(journal().length, 1, '20 s in: not yet');
+  for (let i = 0; i < 3; i++) await risk.tick();
   assert.equal(journal().length, 2);
-  assert.equal(journal()[1], 'error: orderly not answering: orderly account unknown: the private session is down (login refused)');
-  // Up, then a drop: an error again (never "starting" after the first open).
+  assert.equal(journal()[1], 'error: orderly not answering for 30 s: orderly account unknown: the private session is down (login refused)');
+  // Up: the outage's end, with its length. Then a drop: an error again once it lasts (never "starting" after the
+  // first open).
   orderly = account('orderly', 13);
   await risk.tick();
+  assert.match(journal()[2]!, /^wait: orderly answering again after 35 s unreadable/);
   orderly = new Error('orderly account unknown: the private session is down (closed 1006)');
-  await risk.tick();
-  assert.equal(journal().length, 3);
-  assert.match(journal()[2]!, /^error: orderly not answering: .*closed 1006/);
+  for (let i = 0; i < 7; i++) await risk.tick();
+  assert.equal(journal().length, 4);
+  assert.match(journal()[3]!, /^error: orderly not answering for 30 s: .*closed 1006/);
 });

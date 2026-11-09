@@ -13,7 +13,10 @@ import { EngineServer } from '../server.ts';
 import type { AccountState, Position } from '../venues/venue.ts';
 import type { DeskSnapshot, DeskSource, LegInput } from './engine.ts';
 import type { RescueTrigger } from './engine.ts';
-import { DESK_VIEW_STALE_MS, LANDED_SETTLE_MS, RESCUE_LAPSE_MS, RESCUE_RETRY_MS, RiskEngine, STRESS_MARGIN_PTS, StressRefused } from './engine.ts';
+import {
+  DESK_VIEW_STALE_MS, DOWN_JOURNAL_AFTER_MS, LANDED_SETTLE_MS, LEG_READ_STALE_MS, RESCUE_LAPSE_MS, RESCUE_RETRY_MS, RiskEngine,
+  STRESS_MARGIN_PTS, StressRefused,
+} from './engine.ts';
 import type { AdlReport, AdlWatch } from './adl.ts';
 import type { TradeLeg } from '../trade/legs.ts';
 import { STRESS_MAINNET_REASON } from './stress-route.ts';
@@ -113,23 +116,91 @@ test('the partner\'s free margin does not cover the rescue: it comes from the re
   assert.equal((of('rescue') as RescueProgress[])[0]!.from, 'reserve');
 });
 
-test('a venue that stops answering: health down (one journal line), its leg kept at its last numbers and watched', async () => {
-  const { risk, desk, of } = engine('testnet');
+test('a venue that stops answering with a leg there: down at once, one journal line once the leg is judged on stale reads', async () => {
+  const { risk, desk, health, journal, advance } = rig();
   await risk.tick();
-  assert.deepEqual(of('health').at(-1), { intents: 'ok', near: 'ok', hyperliquid: 'ok', phoenix: 'ok', orderly: 'ok' });
+  assert.deepEqual(health().at(-1), { intents: 'ok', near: 'ok', hyperliquid: 'ok', phoenix: 'ok', orderly: 'ok' });
   desk.phoenixDown = 'phoenix account: fetch failed';
+  advance(5_000);
   const d = (await risk.tick())!;
-  assert.equal(of('health').at(-1)!.phoenix, 'down');
+  assert.equal(health().at(-1)!.phoenix, 'down', 'the health map says it at once');
   assert.deepEqual(d.legs.map((l) => l.venue), ['hyperliquid', 'phoenix'], 'kept');
   assert.equal(d.health, 'watch', 'a leg that cannot be seen is watched');
+  assert.equal(journal().filter((j) => j.kind === 'error').length, 0, 'one failed read is not journaled');
+  advance(5_000);
   await risk.tick();
-  const errors = (of('journal') as JournalEntry[]).filter((j) => j.kind === 'error');
+  assert.equal(journal().filter((j) => j.kind === 'error').length, 0, 'the last good read is 10 s old');
+  // The last good read is LEG_READ_STALE_MS old: the leg is judged on stale numbers, before DOWN_JOURNAL_AFTER_MS.
+  advance(5_000);
+  await risk.tick();
+  advance(5_000);
+  await risk.tick();
+  const errors = journal().filter((j) => j.kind === 'error');
   assert.equal(errors.length, 1);
-  assert.equal(errors[0]!.summary, 'phoenix not answering: phoenix account: fetch failed');
+  assert.equal(LEG_READ_STALE_MS, 15_000);
+  assert.equal(errors[0]!.summary, 'phoenix not answering for 10 s: phoenix account: fetch failed');
+  assert.deepEqual(errors[0]!.numbers, { venue: 'phoenix', downS: 10 });
   desk.phoenixDown = null;
+  advance(5_000);
   assert.equal((await risk.tick())!.health, 'level');
-  assert.equal(of('health').at(-1)!.phoenix, 'ok');
-  assert.equal(of('health').length, 3, 'published on change only');
+  assert.equal(health().at(-1)!.phoenix, 'ok');
+  assert.equal(health().length, 3, 'published on change only');
+  const back = journal().filter((j) => j.kind === 'wait');
+  assert.equal(back.length, 1);
+  assert.match(back[0]!.summary, /^phoenix answering again after 20 s unreadable \(since \d\d:\d\d:\d\d UTC\)$/);
+  assert.deepEqual(back[0]!.numbers, { venue: 'phoenix', downS: 20 });
+});
+
+test('a venue without a leg: down at once on the map, journaled only after DOWN_JOURNAL_AFTER_MS; a shorter spell only logged', async () => {
+  const { risk, venues, health, journal, advance } = rig();
+  await risk.tick();
+  const failed = (why: Record<string, string> | undefined) => {
+    venues.scan({ venues: 3, failed: why === undefined ? ['orderly'] : Object.keys(why), at: 0 }, why);
+    risk.healthChanged();
+  };
+  const ok = () => {
+    venues.scan({ venues: 3, failed: [], at: 0 });
+    risk.healthChanged();
+  };
+  // A blip: 25 s of failed scans, then an answer. The map says down and ok again; the journal says nothing.
+  for (let i = 0; i < 6; i++) {
+    failed({ orderly: 'funding: api.orderly.org funding read skipped: rate-limit cool-down for 3 s more' });
+    await risk.tick();
+    advance(5_000);
+  }
+  assert.equal(health().at(-1)!.orderly, 'down');
+  ok();
+  assert.equal(health().at(-1)!.orderly, 'ok');
+  assert.equal(journal().length, 0, 'a 25 s spell is not journaled');
+  // A lasting spell: journaled once at 30 s, with the scan's reason; once more when it ends, with its length.
+  for (let i = 0; i <= 8; i++) {
+    failed({ orderly: 'funding: orderly funding: no answer within 4000 ms' });
+    await risk.tick();
+    if (i < 8) advance(5_000);
+  }
+  const errors = journal().filter((j) => j.kind === 'error');
+  assert.equal(errors.length, 1, 'once per spell');
+  assert.equal(DOWN_JOURNAL_AFTER_MS, 30_000);
+  assert.equal(errors[0]!.summary, 'orderly not answering for 30 s: the scan could not read it: funding: orderly funding: no answer within 4000 ms');
+  advance(5_000);
+  ok();
+  const back = journal().filter((j) => j.kind === 'wait');
+  assert.equal(back.length, 1);
+  assert.match(back[0]!.summary, /^orderly answering again after 45 s unreadable/);
+  assert.equal(back[0]!.numbers.downS, 45);
+});
+
+test('a scan failure with no reason given still names one: never a bare "not answering"', async () => {
+  const { risk, venues, journal, advance } = rig();
+  await risk.tick();
+  for (let i = 0; i <= 6; i++) {
+    venues.scan({ venues: 3, failed: ['orderly'], at: 0 });
+    risk.healthChanged();
+    if (i < 6) advance(5_000);
+  }
+  const errors = journal().filter((j) => j.kind === 'error');
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0]!.summary, 'orderly not answering for 30 s: the scan could not read it');
 });
 
 test('stress on testnet: the rescue line goes 5 points over the nearest leg, the desk goes to rescue; off restores it', async () => {
@@ -172,14 +243,15 @@ function rig(options: { adl?: AdlWatch; desk?: Desk; rescuer?: (x: RescueTrigger
   const events: StreamEvent[] = [];
   const triggers: RescueTrigger[] = [];
   const desk = options.desk ?? new Desk();
+  const venues = new VenueHealth({ now: () => t });
   const risk = new RiskEngine({
-    mode: 'testnet', source: options.source ?? desk, strategy: () => DEFAULT_STRATEGY, health: new VenueHealth(), publish: (e) => events.push(e),
+    mode: 'testnet', source: options.source ?? desk, strategy: () => DEFAULT_STRATEGY, health: venues, publish: (e) => events.push(e),
     clock: { now: () => t }, monotonic: () => t, rescuer: (x) => { triggers.push(x); return options.rescuer?.(x); }, ...(options.adl !== undefined ? { adl: options.adl } : {}),
     ...(options.running !== undefined ? { rescuerRunning: options.running } : {}),
   });
   const journal = () => events.filter((e) => e.type === 'journal').map((e) => e.data as JournalEntry);
   const health = () => events.filter((e) => e.type === 'health').map((e) => e.data as HealthMap);
-  return { risk, desk, triggers, events, journal, health, now: () => t, advance: (ms: number) => { t += ms; } };
+  return { risk, desk, triggers, events, journal, health, venues, now: () => t, advance: (ms: number) => { t += ms; } };
 }
 
 async function within<T>(p: Promise<T>, ms = 1_000): Promise<T | 'hung'> {

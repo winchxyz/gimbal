@@ -21,16 +21,21 @@
 // own that no 429 cuts or empties: they take a token from the shared bucket while it has one, else from theirs, so
 // the desk's own account reads keep that rate through a storm of 429s; and they wait out only the server's
 // Retry-After, never the budget's own backoff (which holds the scanner's reads).
+// Tokens are a host's own unit: one request on Phoenix, one unit of request weight on Hyperliquid (HL_BUDGET). A read
+// costs `cost` tokens (default 1); a host that prices an answer by its size too is charged the rest once the answer is
+// in (charge()), so the bucket may run below zero and the reads after it wait that much longer. The scanner classes
+// queue in `classOrder` (default funding, history, books; Hyperliquid: funding, books, history).
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 
 /** What a reader asks for; the scanner's context turns it into a queue class (critical outside the scanner). */
 export type ReadKind = 'account' | 'funding' | 'book' | 'history';
 
-/** Queue order: critical first, then the scanner's funding, history, books. */
+/** Queue order: critical first, then the scanner's classes in the budget's classOrder. */
 export type ReadClass = 'critical' | 'funding' | 'book' | 'history';
 
-const RANK: Record<ReadClass, number> = { critical: 0, funding: 1, history: 2, book: 3 };
+/** The scanner classes' default queue order (Phoenix): funding, history, books. */
+export const DEFAULT_CLASS_ORDER: readonly Exclude<ReadClass, 'critical'>[] = ['funding', 'history', 'book'];
 
 /**
  * A read the budget did not send: `cooling` while the host is in a cool-down after a 429 (a scanner read never adds
@@ -112,10 +117,13 @@ export interface HostBudgetOptions {
   /** Tokens a scanner read must leave in the bucket, kept for critical reads. */
   criticalReserve: number;
   /**
-   * Tokens a scanner read of this class must leave instead (default criticalReserve); at most burst - 1 is used. A
-   * class should leave no more than the classes queued after it (funding <= history <= book), or it holds them up.
+   * Tokens a scanner read of this class must leave instead (default criticalReserve); a read's cost plus its reserve
+   * is capped at burst. A class should leave no more than the classes queued after it (in classOrder), or it holds
+   * them up.
    */
   classReserve?: Partial<Record<Exclude<ReadClass, 'critical'>, number>>;
+  /** The scanner classes' queue order after critical reads; default DEFAULT_CLASS_ORDER. */
+  classOrder?: readonly Exclude<ReadClass, 'critical'>[];
   /** A 429 cuts the rate to `cut` of itself, down to minRatePerSec; it climbs back by recoverStep every recoverEveryMs. */
   adaptive?: AdaptiveRate | null;
   /**
@@ -195,8 +203,45 @@ export const PHOENIX_BUDGET: HostBudgetOptions = {
   quietMaxMs: 60_000,
 };
 
+/**
+ * Hyperliquid's /info, in units of request weight (hyperliquid.ts hlInfoWeight has the docs' table: 2 for
+ * clearinghouseState, l2Book, allMids and the like, 20 for everything else, plus 1 per 20 rows of a list answer).
+ * The limit is 1200 a minute per IP. Every reader of api.hyperliquid.xyz/info in serve shares this budget.
+ *
+ * Why it exists: serve spent about 570 a minute steady (risk reads, books, funding sweeps), but the scanner's hourly
+ * fundingHistory refresh for about 230 windows (20 each, plus 1 per 20 rows) went out from :01 in a burst, and the
+ * busiest minute after the hour reached about 1970: HL answered 429 to whatever came next, often the risk read.
+ * With this budget (hl-budget.test.ts simulates serve's load): steady 567, busiest minute 833 with the refresh
+ * spread over about 15 minutes (22 after a restart), at most 970 in any minute by construction (12.5/s plus the
+ * 150 burst plus the critical floor's 70), so at least 230 of the 1200 stay free for the trade path, which does not
+ * go through it (serve-pair's order and ADL reads, rescue, the relayer).
+ */
+export const HL_BUDGET: HostBudgetOptions = {
+  ratePerSec: 12.5,
+  burst: 150,
+  maxInFlight: 10,
+  scanMaxInFlight: 8,
+  criticalReserve: 20,
+  // Each class leaves at least what the classes before it leave: funding 20 (10 account reads), books 30, history 40
+  // (a 69-weight fundingHistory read waits for 69 tokens, so the reads before it keep their headroom).
+  classReserve: { funding: 20, book: 30, history: 40 },
+  classOrder: ['funding', 'book', 'history'],
+  adaptive: { cut: 0.5, minRatePerSec: 5, recoverEveryMs: 60_000, recoverStep: 1.25 },
+  criticalFloor: { ratePerSec: 1, burst: 10 },
+  // The scanner times out a funding read at 4 s and a book or history read at 8 s: it hears "skipped" first. History
+  // waits longest, so it goes at the pace the bucket allows instead of being skipped and asked again a minute later.
+  maxWaitMs: { critical: 15_000, funding: 3_000, book: 2_000, history: 6_000 },
+  retries: { critical: 2, funding: 0, book: 0, history: 0 },
+  backoffBaseMs: 2_000,
+  backoffMaxMs: 30_000,
+  retryAfterMaxMs: 10_000,
+  quietBaseMs: 10_000,
+  quietMaxMs: 120_000,
+};
+
 interface Waiter {
   cls: ReadClass;
+  cost: number;
   seq: number;
   deadline: number;
   start: () => void;
@@ -219,6 +264,10 @@ export interface HostBudgetState {
   inFlight: number;
   queued: number;
   sent: number;
+  /** Tokens in the shared bucket now (below zero after a charge() larger than it held). */
+  tokens: number;
+  /** Tokens spent in all: the cost of every read sent plus what charge() added (Hyperliquid: request weight). */
+  spent: number;
 }
 
 /** Parses Retry-After: seconds (fractions allowed) or an HTTP date; null when absent or unusable. */
@@ -256,11 +305,16 @@ export class HostBudget {
   #quietUntil = 0;
   #rateLimited = 0;
   #sent = 0;
+  #spent = 0;
+  readonly #rank: Record<ReadClass, number>;
 
   constructor(host: string, options: HostBudgetOptions) {
     if (!(options.ratePerSec > 0) || !(options.burst >= 1) || !(options.maxInFlight >= 1)) {
       throw new RangeError(`host budget ${host}: rate, burst and maxInFlight must be positive`);
     }
+    const order = options.classOrder ?? DEFAULT_CLASS_ORDER;
+    if (order.length !== 3 || new Set(order).size !== 3) throw new RangeError(`host budget ${host}: classOrder must name funding, book and history once each`);
+    this.#rank = { critical: 0, [order[0]!]: 1, [order[1]!]: 2, [order[2]!]: 3 } as Record<ReadClass, number>;
     this.host = host;
     this.#o = options;
     this.#now = options.now ?? Date.now;
@@ -278,21 +332,24 @@ export class HostBudget {
       retryAt: this.#retryAt, criticalRetryAt: this.#gate('critical'), floorTokens: this.#floorTokens,
       quietUntil: this.#quietUntil, rateLimited: this.#rateLimited,
       inFlight: this.#inFlight, queued: this.#queue.length, sent: this.#sent, ratePerSec: this.#rate,
+      tokens: this.#tokens, spent: this.#spent,
     };
   }
 
   /**
-   * Sends one request through the budget. `send` is called when a token and a slot are free (again after a 429 the
-   * class may retry); a 429 that is not retried is returned as it came, for the caller to raise. Rejects with
-   * ReadSkipped when nothing was sent. Inside readBy() the wait ends at the caller's deadline when that comes first.
+   * Sends one request through the budget. `send` is called when `cost` tokens and a slot are free (again after a 429
+   * the class may retry, at the same cost); a 429 that is not retried is returned as it came, for the caller to raise.
+   * Rejects with ReadSkipped when nothing was sent. Inside readBy() the wait ends at the caller's deadline when that
+   * comes first.
    */
-  async run(cls: ReadClass, send: () => Promise<Response>): Promise<Response> {
+  async run(cls: ReadClass, send: () => Promise<Response>, cost = 1): Promise<Response> {
+    if (!(cost > 0) || !Number.isFinite(cost)) throw new RangeError(`host budget ${this.host}: a read's cost must be positive, got ${cost}`);
     const left = readTimeLeft();
     const now = this.#now();
     if (left === 0) throw new ReadSkipped(this.host, cls, 'budget', null, now);
     const deadline = now + Math.min(this.#o.maxWaitMs[cls], left ?? Infinity);
     for (let attempt = 0; ; attempt++) {
-      await this.#acquire(cls, deadline);
+      await this.#acquire(cls, deadline, cost);
       let res: Response;
       try {
         res = await send();
@@ -308,6 +365,19 @@ export class HostBudget {
       // The body is not read: release the connection before waiting.
       await res.body?.cancel().catch(() => {});
     }
+  }
+
+  /**
+   * Tokens a read turned out to cost on top of what run() took for it (a host that prices the size of an answer):
+   * taken from the shared bucket now, below zero if need be, so the reads after it wait for them. Negative gives
+   * back what was taken over the answer's real cost (up to a full bucket).
+   */
+  charge(tokens: number): void {
+    if (!Number.isFinite(tokens) || tokens === 0) return;
+    this.#refill(this.#now());
+    this.#tokens = Math.min(this.#o.burst, this.#tokens - tokens);
+    this.#spent += tokens;
+    this.#pump();
   }
 
   #onRateLimited(res: Response): void {
@@ -338,7 +408,7 @@ export class HostBudget {
     this.#pump();
   }
 
-  #acquire(cls: ReadClass, deadline: number): Promise<void> {
+  #acquire(cls: ReadClass, deadline: number, cost: number): Promise<void> {
     const now = this.#now();
     // Scanner books and history stand aside for the whole quiet period; any read whose wait ends before the
     // cool-down does is told at once.
@@ -348,12 +418,12 @@ export class HostBudget {
     if (this.#gate(cls) > deadline) return Promise.reject(new ReadSkipped(this.host, cls, 'cooling', this.#gate(cls), now));
     return new Promise<void>((resolve, reject) => {
       const w: Waiter = {
-        cls, seq: this.#seq++, deadline,
+        cls, cost, seq: this.#seq++, deadline,
         start: () => resolve(),
         skip: (reason) => reject(new ReadSkipped(this.host, cls, reason, reason === 'cooling' ? Math.max(this.#gate(cls), cls === 'critical' ? 0 : this.#quietUntil) : null, this.#now())),
       };
       this.#queue.push(w);
-      this.#queue.sort((a, b) => RANK[a.cls] - RANK[b.cls] || a.seq - b.seq);
+      this.#queue.sort((a, b) => this.#rank[a.cls] - this.#rank[b.cls] || a.seq - b.seq);
       this.#pump();
     });
   }
@@ -386,11 +456,11 @@ export class HostBudget {
     }
   }
 
-  /** Tokens a read of `cls` needs in the bucket to be sent: 1, plus what a scanner class must leave. */
-  #need(cls: ReadClass): number {
-    if (cls === 'critical') return 1;
+  /** Tokens a read of `cls` and `cost` needs in the bucket to be sent: its cost, plus what a scanner class must leave. */
+  #need(cls: ReadClass, cost: number): number {
+    if (cls === 'critical') return Math.min(this.#o.burst, cost);
     const reserve = this.#o.classReserve?.[cls] ?? this.#o.criticalReserve;
-    return Math.min(this.#o.burst, 1 + reserve);
+    return Math.min(this.#o.burst, cost + reserve);
   }
 
   /** Starts what can start, in queue order; skips what waited too long; sets one timer for the next change. */
@@ -419,22 +489,24 @@ export class HostBudget {
         : this.#inFlight < this.#o.maxInFlight && this.#scanInFlight < this.#o.scanMaxInFlight;
       // A release wakes the queue again; nothing to time.
       if (!slots) break;
-      const need = this.#need(w.cls);
-      // A critical read takes a shared token while there is one, else one of its floor's.
-      const floor = critical && this.#tokens < need && this.#floorTokens >= 1;
+      const need = this.#need(w.cls, w.cost);
+      // A critical read takes shared tokens while the bucket holds its cost, else its floor's.
+      const f = critical ? this.#o.criticalFloor : null;
+      const floorNeed = f ? Math.min(f.burst, w.cost) : Infinity;
+      const floor = critical && this.#tokens < need && this.#floorTokens >= floorNeed;
       if (this.#tokens < need && !floor) {
-        const f = critical ? this.#o.criticalFloor : null;
         const shared = ((need - this.#tokens) / this.#rate) * 1000;
-        const own = f ? ((1 - this.#floorTokens) / f.ratePerSec) * 1000 : Infinity;
-        wakeAt = now + Math.ceil(Math.min(shared, own));
+        const own = f ? ((floorNeed - this.#floorTokens) / f.ratePerSec) * 1000 : Infinity;
+        wakeAt = now + Math.max(1, Math.ceil(Math.min(shared, own)));
         break;
       }
       this.#queue.shift();
-      if (floor) this.#floorTokens -= 1;
-      else this.#tokens -= 1;
+      if (floor) this.#floorTokens -= w.cost;
+      else this.#tokens -= w.cost;
       this.#inFlight++;
       if (!critical) this.#scanInFlight++;
       this.#sent++;
+      this.#spent += w.cost;
       w.start();
     }
     for (const w of this.#queue) wakeAt = Math.min(wakeAt, w.deadline);

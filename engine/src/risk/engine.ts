@@ -4,9 +4,10 @@
 //   - `desk`: DeskState with the legs and the desk's health (the worst leg's level);
 //   - `health`: the HealthMap, when a venue, 1Click or NEAR changes state (venue-health.ts);
 //   - `journal`: `rescue` for each rescue trigger, `adl` for every end of an ADL check (adl.ts: confirmed, each unwind
-//     attempt, the budget spent, the event ended), `error` when a venue stops answering or only the owner can act
-//     (a `wait` instead while a venue's private session is in its first open since serve started, venue.ts
-//     SESSION_STARTING; an `error` follows if that open fails);
+//     attempt, the budget spent, the event ended), `error` when only the owner can act, or when a venue has not
+//     answered for a lasting spell (DOWN_JOURNAL_AFTER_MS; sooner while a leg there is judged on stale numbers), with a
+//     `wait` line giving the outage's length when it answers again (a `wait` instead while a venue's private session
+//     is in its first open since serve started, venue.ts SESSION_STARTING; an `error` follows if that open fails);
 //   - `rescue`: a RescueProgress at step `detect` for each rescue trigger, unless a rescuer (E9) takes the trigger.
 //
 // Rescue triggers are per leg. A leg that reaches rescue is triggered once; while it stays in rescue it is triggered
@@ -68,6 +69,28 @@ export const LANDED_SETTLE_MS = 3_000;
 const TRIGGER_MEMORY_MS = 24 * 3_600_000;
 /** The desk's view (get_desk) older than this marks NEAR down; any failed or late read in between marks it slow. */
 export const DESK_VIEW_STALE_MS = 60_000;
+/**
+ * A desk venue down this long is journaled `X not answering` (the health map says `down` at once). 30 s is six risk
+ * ticks and six scans in a row: a lone 429, one budget-skipped scan or one slow read (the journal's noise before)
+ * recovers well inside it, while a real outage is journaled half a minute in, and its end with its length.
+ */
+export const DOWN_JOURNAL_AFTER_MS = 30_000;
+/**
+ * A leg judged on an account read this old is judged on stale numbers (three ticks): while the desk holds a leg on a
+ * venue that is down, its spell is journaled once the last good read is this old, before DOWN_JOURNAL_AFTER_MS.
+ */
+export const LEG_READ_STALE_MS = 3 * RISK_INTERVAL_MS;
+/** 1Click is probed once a minute: down across two probes in a row is journaled (one timeout is not). */
+export const INTENTS_DOWN_JOURNAL_MS = 90_000;
+
+/** A spell of `down` for one health key. */
+interface DownSpell {
+  since: number;
+  /** What was journaled of it: nothing yet, the session-starting wait, or the error. */
+  journaled: 'starting' | 'down' | null;
+  /** The last reason seen while down. */
+  why: string | null;
+}
 
 /** One desk leg as a source read it: the venue account that holds it and the position. */
 export interface LegInput {
@@ -206,8 +229,10 @@ export class RiskEngine {
   #ticking: Promise<DeskState | null> | null = null;
   #adlRun: Promise<void> | null = null;
   #stopped = false;
-  /** Each key down now, and whether it was journaled as a session starting or as down. */
-  readonly #down = new Map<string, 'starting' | 'down'>();
+  /** Each key down now: since when, what was journaled of it, and the last reason seen. */
+  readonly #down = new Map<string, DownSpell>();
+  /** Each venue's last account read that answered (clock ms). */
+  readonly #lastGoodRead = new Map<VenueId, number>();
 
   constructor(options: RiskEngineOptions) {
     this.#o = options;
@@ -363,8 +388,10 @@ export class RiskEngine {
     if (this.#stopped) return this.#desk;
     const t = this.#clock.now();
     for (const r of snap.reads) {
-      if (r.error === null) this.#o.health.readOk(r.venue, r.ms);
-      else this.#o.health.readFailed(r.venue, new Error(r.error));
+      if (r.error === null) {
+        this.#o.health.readOk(r.venue, r.ms);
+        this.#lastGoodRead.set(r.venue, t);
+      } else this.#o.health.readFailed(r.venue, new Error(r.error));
     }
     const view = snap.deskView;
     const viewUnknown = view !== undefined && (view.at === null || t - view.at >= DESK_VIEW_STALE_MS);
@@ -601,29 +628,73 @@ export class RiskEngine {
     return { usd: 0, known: false, note: '' };
   }
 
+  /**
+   * The health map, published on every change (the UI's real-time word); and the journal, which hears of a spell of
+   * `down` only once it lasted (see DOWN_JOURNAL_AFTER_MS) and once more when it ends. Nothing here gates a rescue,
+   * a stop or a trigger: those run on the reads themselves.
+   */
   #publishHealth(t: number): void {
     const map = this.#o.health.changed();
     if (map !== null) this.#o.publish({ type: 'health', data: map });
-    // Unchanged, the map still has to be looked at while a venue is down only because its session is starting: that
-    // turning into a failure (the open failed) changes the reason, not the word.
-    if (map === null && ![...this.#down.values()].includes('starting')) return;
+    // Unchanged, the map still has to be looked at while anything is down: a spell grows into a journal line, and a
+    // session starting turning into a failure (the open failed) changes the reason, not the word.
+    if (map === null && this.#down.size === 0) return;
     for (const [k, status] of Object.entries(map ?? this.#o.health.map())) {
+      const spell = this.#down.get(k);
       if (status !== 'down') {
-        this.#down.delete(k);
+        if (spell !== undefined) this.#spellEnded(k, spell, t);
         continue;
       }
-      const why = k === 'intents' ? this.#o.health.intentsDetail : k === 'near' ? this.#o.health.nearDetail : this.#o.health.detail(k as VenueId).readError ?? this.#o.health.detail(k as VenueId).start;
+      const why = k === 'intents' ? this.#o.health.intentsDetail : k === 'near' ? this.#o.health.nearDetail : this.#o.health.downReason(k as VenueId);
+      const s = spell ?? { since: t, journaled: null, why: null };
+      if (spell === undefined) this.#down.set(k, s);
+      s.why = why ?? s.why;
       // A private session in its first open since serve started (venue.ts SESSION_STARTING) is serve starting: said
-      // once as a wait. Anything else down is an error, journaled once per spell, after a "starting" one too.
-      const now = isSessionStarting(why) ? 'starting' : 'down';
-      const was = this.#down.get(k);
-      if (was === now || was === 'down') continue;
-      this.#down.set(k, now);
-      if (now === 'starting') {
-        this.#journal({ t, kind: 'wait', summary: `${k} session starting: its account is read once the session is up (${why})`, numbers: { venue: k }, tx: [] });
-      } else {
-        this.#journal({ t, kind: 'error', summary: `${k} not answering${why === null ? '' : `: ${why}`}`, numbers: { venue: k }, tx: [] });
+      // once as a wait, at once. Anything else down is an error, journaled once per spell once the spell is due, after
+      // a "starting" one too (the spell runs from the start of the wait).
+      if (isSessionStarting(why)) {
+        if (s.journaled === null) {
+          s.journaled = 'starting';
+          this.#journal({ t, kind: 'wait', summary: `${k} session starting: its account is read once the session is up (${why})`, numbers: { venue: k }, tx: [] });
+        }
+        continue;
       }
+      if (s.journaled === 'down' || !this.#spellDue(k, s, t)) continue;
+      s.journaled = 'down';
+      const lasted = Math.round((t - s.since) / 1000);
+      this.#journal({
+        t, kind: 'error', summary: `${k} not answering${lasted > 0 ? ` for ${lasted} s` : ''}${s.why === null ? '' : `: ${s.why}`}`,
+        numbers: { venue: k, downS: lasted }, tx: [],
+      });
+    }
+  }
+
+  /**
+   * Whether a spell of `down` is journaled now. A desk venue: once it lasted DOWN_JOURNAL_AFTER_MS, or sooner while
+   * the desk holds a leg there and its last good account read is LEG_READ_STALE_MS old (the leg is judged on old
+   * numbers). 1Click: across two probes (INTENTS_DOWN_JOURNAL_MS). NEAR: at once (its desk view is down only when
+   * never read or a minute old: already a lasting spell).
+   */
+  #spellDue(k: string, s: DownSpell, t: number): boolean {
+    if (k === 'near') return true;
+    if (k === 'intents') return t - s.since >= INTENTS_DOWN_JOURNAL_MS;
+    if (t - s.since >= DOWN_JOURNAL_AFTER_MS) return true;
+    const held = this.#views.some((v) => v.leg.venue === k);
+    const lastGood = this.#lastGoodRead.get(k as VenueId);
+    return held && (lastGood === undefined || t - lastGood >= LEG_READ_STALE_MS);
+  }
+
+  /** A spell of `down` ended: a `wait` line with its length when it was journaled; else a log line only. */
+  #spellEnded(k: string, s: DownSpell, t: number): void {
+    this.#down.delete(k);
+    const lasted = Math.max(0, Math.round((t - s.since) / 1000));
+    if (s.journaled === 'down') {
+      this.#journal({
+        t, kind: 'wait', summary: `${k} answering again after ${lasted} s unreadable (since ${new Date(s.since).toISOString().slice(11, 19)} UTC)`,
+        numbers: { venue: k, downS: lasted }, tx: [],
+      });
+    } else if (s.journaled === null) {
+      this.#log(`health: ${k} was down for ${lasted} s, back before it was journaled${s.why === null ? '' : ` (${s.why})`}`);
     }
   }
 

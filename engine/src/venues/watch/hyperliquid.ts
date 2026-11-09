@@ -1,9 +1,13 @@
 // Watch-only readers on Hyperliquid's public /info endpoint: the HIP-3 builder dexes (one `metaAndAssetCtxs` call
 // with `dex` each) and the Binance and Bybit rates Hyperliquid itself publishes for its listed coins
-// (`predictedFundings`). The desk trades only the main dex; these are ranked, never traded.
+// (`predictedFundings`). The desk trades only the main dex; these are ranked, never traded. Their requests weigh 20
+// each and go through the host's weight budget with every other reader of it (hyperliquid.ts, http-budget.ts
+// HL_BUDGET), as scanner funding reads; a reader given its own fetch (tests, capture) goes without one.
 
 import type { ScanVenueId } from '@gimbal/shared';
-import { HL_MAINNET_INFO_URL } from '../hyperliquid.ts';
+import type { HostBudget } from '../http-budget.ts';
+import { isReadSkipped } from '../http-budget.ts';
+import { HL_MAINNET_INFO_URL, hlBudgetedSend, hlHostBudget } from '../hyperliquid.ts';
 import type { MarketFunding, WatchReader } from '../venue.ts';
 import type { WatchReaderOptions } from './http.ts';
 import { WatchHttp, WatchVenueError, collect, list, optNum, optPrice, record } from './http.ts';
@@ -22,6 +26,13 @@ export const HL_DEX_OVERRIDES: Readonly<Record<string, { base: string; multiplie
   'mkts:US500': { base: 'SPX500', multiplier: 0.1 },
 };
 
+/** A watch reader's options on Hyperliquid: the /info URL and the weight budget (default: the host's, unless `fetch`). */
+export type HlWatchOptions = WatchReaderOptions & { url?: string; budget?: HostBudget | null };
+
+function watchBudget(options: HlWatchOptions, url: string): HostBudget | null {
+  return options.budget !== undefined ? options.budget : options.fetch === undefined ? hlHostBudget(url) : null;
+}
+
 interface DexAsset { name: string; isDelisted?: boolean }
 interface DexCtx { funding: string; openInterest: string; markPx: string; oraclePx: string; dayNtlVlm: string }
 
@@ -31,16 +42,19 @@ export class HlDexReader implements WatchReader {
   readonly dex: HlWatchDex;
   readonly #http: WatchHttp;
   readonly #url: string;
+  readonly #budget: HostBudget | null;
 
-  constructor(dex: HlWatchDex, options: WatchReaderOptions & { url?: string } = {}) {
+  constructor(dex: HlWatchDex, options: HlWatchOptions = {}) {
     this.dex = dex;
     this.id = `hl-${dex}`;
     this.#http = new WatchHttp(this.id, options);
     this.#url = options.url ?? HL_MAINNET_INFO_URL;
+    this.#budget = watchBudget(options, this.#url);
   }
 
   async funding(): Promise<MarketFunding[]> {
-    const answer = await this.#http.post(this.#url, { type: 'metaAndAssetCtxs', dex: this.dex });
+    const body = { type: 'metaAndAssetCtxs', dex: this.dex };
+    const answer = await this.#http.post(this.#url, body, (send) => hlBudgetedSend(this.#budget, body, send));
     return parseHlDex(this.id, this.dex, answer, this.#http.clock.now());
   }
 }
@@ -83,11 +97,13 @@ export type PredictedVenue = keyof typeof PREDICTED_VENUE_KEYS;
 export class HlPredictedFeed {
   readonly #http: WatchHttp;
   readonly #url: string;
+  readonly #budget: HostBudget | null;
   #inFlight: Promise<unknown> | null = null;
 
-  constructor(options: WatchReaderOptions & { url?: string } = {}) {
+  constructor(options: HlWatchOptions = {}) {
     this.#http = new WatchHttp('hyperliquid', options);
     this.#url = options.url ?? HL_MAINNET_INFO_URL;
+    this.#budget = watchBudget(options, this.#url);
   }
 
   get clock() {
@@ -96,7 +112,8 @@ export class HlPredictedFeed {
 
   read(): Promise<unknown> {
     if (this.#inFlight !== null) return this.#inFlight;
-    const p = this.#http.post(this.#url, { type: 'predictedFundings' });
+    const body = { type: 'predictedFundings' };
+    const p = this.#http.post(this.#url, body, (send) => hlBudgetedSend(this.#budget, body, send));
     this.#inFlight = p;
     const clear = () => {
       if (this.#inFlight === p) this.#inFlight = null;
@@ -125,6 +142,8 @@ export class HlPredictedReader implements WatchReader {
     try {
       answer = await this.#feed.read();
     } catch (err) {
+      // Not sent (the host's budget): said as such, so the scanner does not count the venue as down.
+      if (isReadSkipped(err)) throw err;
       // The feed is Hyperliquid's: say whose rates are missing, and through which venue.
       throw new WatchVenueError(this.id, `via hyperliquid predictedFundings: ${err instanceof Error ? err.message : String(err)}`);
     }

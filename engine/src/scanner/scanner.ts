@@ -2,9 +2,11 @@
 // leg size and ranks the windows. One scan is one call to scan(); the server calls it every 5 s.
 //
 // What a scan does, in order:
-// 1. funding() of every reader at once; a reader that fails or times out is listed in ScanStatus.failed and its last
-//    good read (if not older than dropAfterMs) is used, marked stale; a reader that answers with rates from an
-//    earlier read (rateReadAt: its refresh of them failed) is used marked stale too, dated that read, and noted;
+// 1. funding() of every reader at once; a reader that fails or times out is listed in ScanStatus.failed (and why in
+//    ScanResult.failedWhy) and its last good read (if not older than dropAfterMs) is used, marked stale; a read its
+//    venue's request budget did not send for want of budget is not a failure of the venue: the last good read
+//    stands in the same way, and only a reader left with none counts as failed; a reader that answers with rates from
+//    an earlier read (rateReadAt: its refresh of them failed) is used marked stale too, dated that read, and noted;
 // 2. legs: one per venue and base, marks checked against the other venues; a watch leg needs the open-interest floor,
 //    a desk leg at most deskMaxOiShare of its open interest (pairs.ts); the held window's legs are never dropped, they
 //    fail a check instead;
@@ -96,6 +98,8 @@ export interface ScanResult {
   windows: FundingWindow[];
   scan: ScanStatus;
   notes: ScanNotes;
+  /** Why each venue in scan.failed failed this scan (its first failure), for the health map's journal line. */
+  failedWhy?: Partial<Record<ScanVenueId, string>>;
 }
 
 interface Source {
@@ -313,7 +317,11 @@ export class Scanner {
     const strategy = this.#options.strategy();
     const heldNow = this.#options.held?.() ?? null;
     const heldId = heldNow?.windowId ?? null;
-    const failed = new Set<ScanVenueId>();
+    // Each venue that did not answer this scan, and its first failure.
+    const failed = new Map<ScanVenueId, string>();
+    const fail = (venue: ScanVenueId, why: string) => {
+      if (!failed.has(venue)) failed.set(venue, why);
+    };
 
     // 1. funding
     const reads = await Promise.all(this.#sources.map(async (s) => {
@@ -334,14 +342,18 @@ export class Scanner {
         this.#note(`${s.id} funding: the rates are from ${Math.max(0, Math.round((now - at) / 1000))} s ago, its refresh of them failed`);
         return { source: s, rows, at, stale: true };
       } catch (err) {
-        failed.add(s.id);
-        this.#note(`${s.id} funding failed: ${errorMessage(err)}`);
         const last = this.#lastGood.get(s.id);
-        if (last === undefined || now - last.at > config.dropAfterMs) return null;
+        const usable = last !== undefined && now - last.at <= config.dropAfterMs;
+        // Not sent because this process's budget for the host is spent: the venue did not fail. A read it skipped for a
+        // cool-down after a 429 did: the venue refused us a moment ago.
+        const unsent = isReadSkipped(err) && err.reason === 'budget';
+        if (!unsent || !usable) fail(s.id, `funding: ${errorMessage(err)}`);
+        this.#note(`${s.id} funding ${unsent ? 'not read' : 'failed'}: ${errorMessage(err)}`);
+        if (!usable) return null;
         return { source: s, rows: last.rows, at: last.at, stale: true };
       }
     }));
-    const fundingFailed = new Set(failed);
+    const fundingFailed = new Set(failed.keys());
 
     // 2. legs
     const legs: ScanLeg[] = [];
@@ -431,7 +443,7 @@ export class Scanner {
           this.#replayMisses.add(key);
           return;
         }
-        failed.add(leg.venue);
+        fail(leg.venue, `book ${leg.symbol}: ${errorMessage(err)}`);
         this.#note(`${leg.venue} book ${leg.symbol} failed: ${errorMessage(err)}`);
         const last = this.#books.get(key);
         if (last !== undefined) {
@@ -442,7 +454,7 @@ export class Scanner {
     }), 6);
     for (const [venue, d] of deferred) {
       // A cool-down means the venue refused us a moment ago: it did not answer this scan.
-      if (d.first.reason === 'cooling') failed.add(venue);
+      if (d.first.reason === 'cooling') fail(venue, `books: ${d.first.message}`);
       this.#note(`${venue} books: ${d.count} not read this scan (${d.first.message})`);
     }
     if (replayMissed.length > 0) {
@@ -579,8 +591,9 @@ export class Scanner {
 
     return {
       windows: ranked.map((pw) => pw.window),
-      scan: { venues: this.#sources.length, failed: [...failed].sort(), at: now },
+      scan: { venues: this.#sources.length, failed: [...failed.keys()].sort(), at: now },
       notes: { dropped: droppedCount, unpriced, historyReads, ms: Date.now() - started },
+      failedWhy: Object.fromEntries(failed),
     };
   }
 

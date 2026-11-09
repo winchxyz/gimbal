@@ -1,7 +1,8 @@
 // Venue health for the `health` event (HealthMap): each desk venue, NEAR Intents (1Click) and NEAR, as ok / slow / down.
 //
 // A venue is the worst of what the engine has seen of it:
-//   - down: the last scan could not read it, or the risk engine's last account read failed (API error, timeout);
+//   - down: the last scan could not read it (and why: the scan's first failure on it), or the risk engine's last
+//     account read failed (API error, timeout);
 //   - slow: the account read answered but took over SLOW_READ_MS, or withdrawals are paused there (it still trades,
 //     but it cannot be a rescue source: E9 reads that from `detail()`, since HealthMap has no word for it);
 //   - ok otherwise.
@@ -17,7 +18,7 @@
 // GIMBAL_ORDERLY_PAIRS=1 it adds Orderly's too (an Orderly pair's start reads); the session itself being down or
 // unseeded shows as the risk engine's Orderly account read failing (readFailed).
 
-import type { HealthMap, ScanStatus, VenueId } from '@gimbal/shared';
+import type { HealthMap, ScanStatus, ScanVenueId, VenueId } from '@gimbal/shared';
 import type { NearHealth } from '../contract/budget.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import { DESK_VENUE_IDS } from '../venues/venue.ts';
@@ -35,6 +36,8 @@ export const WITHDRAWALS_PAUSED_TTL_MS = 15 * 60_000;
 export interface VenueDetail {
   status: HealthStatus;
   scanFailed: boolean;
+  /** Why the last scan could not read it (null: it could, or the scan said no reason). */
+  scanError: string | null;
   readError: string | null;
   readMs: number | null;
   withdrawalsPaused: string | null;   // the venue's words, while the report counts
@@ -56,13 +59,29 @@ export class VenueHealth {
 
   constructor(options: { now?: () => number } = {}) {
     this.#now = options.now ?? Date.now;
-    for (const v of DESK_VENUE_IDS) this.#venues.set(v, { status: 'ok', scanFailed: false, readError: null, readMs: null, withdrawalsPaused: null, start: null });
+    for (const v of DESK_VENUE_IDS) this.#venues.set(v, { status: 'ok', scanFailed: false, scanError: null, readError: null, readMs: null, withdrawalsPaused: null, start: null });
   }
 
-  /** The scanner's view: the desk venues its last scan could not read. */
-  scan(scan: ScanStatus): void {
+  /** The scanner's view: the desk venues its last scan could not read, and why (scanner.ts ScanResult.failedWhy). */
+  scan(scan: ScanStatus, why: Partial<Record<ScanVenueId, string>> = {}): void {
     const failed = new Set(scan.failed);
-    for (const [v, d] of this.#venues) d.scanFailed = failed.has(v);
+    for (const [v, d] of this.#venues) {
+      d.scanFailed = failed.has(v);
+      d.scanError = d.scanFailed ? why[v] ?? null : null;
+    }
+  }
+
+  /**
+   * Why the venue is down, in words: the account read's error first, then the pair trader's start when that says
+   * down, then the scan's failure; null when it is not down. Never null for a venue that is down.
+   */
+  downReason(venue: VenueId): string | null {
+    const d = this.detail(venue);
+    if (d.status !== 'down') return null;
+    if (d.readError !== null) return d.readError;
+    if (d.start !== null && this.#start.get(venue)?.status === 'down') return d.start;
+    if (d.scanFailed) return d.scanError === null ? 'the scan could not read it' : `the scan could not read it: ${d.scanError}`;
+    return d.start ?? 'no reason recorded';
   }
 
   /** An account read that answered, and how long it took. */
