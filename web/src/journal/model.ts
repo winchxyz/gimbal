@@ -5,7 +5,7 @@ import { signedUsd } from '../desk/format.ts';
 import { dayRate, paybackOf } from '../desk/model.ts';
 import { dayMonth, dayMonthTime, hours, venueName } from '../windows/format.ts';
 import { heldWindow } from '../windows/model.ts';
-import { amountUsd, clock, feeUsd, numberOf, proofLinks, unprotectedText, type ProofLink } from './entry.ts';
+import { amountUsd, clock, feeUsd, isSizeAsUsd, moneyUsd, numberOf, proofLinks, unprotectedText, type ProofLink } from './entry.ts';
 import { KINDS, inFilter, type FilterId, type Kind, type Tone } from './kinds.ts';
 
 const DAY_MS = 86_400_000;
@@ -62,7 +62,7 @@ export function visibleFeed(entries: readonly JournalEntry[], frozen: ReadonlySe
 export function pnlOf(entry: JournalEntry): number {
   if (KINDS[entry.kind].principal) return feeUsd(entry) ?? 0;
   if (entry.kind === 'rescue') return rescueCostUsd(entry);
-  return amountUsd(entry) ?? 0;
+  return moneyUsd(entry) ?? 0;
 }
 
 /**
@@ -217,6 +217,8 @@ export function whyOf(entry: JournalEntry): RowView['why'] {
 
 function noteOf(entry: JournalEntry, amount: number | null): string | null {
   if (amount === null) return null;
+  // The amount is the fee itself (an open whose `usd` was its leg size): say what it is, not the fee a second time.
+  if (isSizeAsUsd(entry)) return entry.kind === 'enter' ? 'fees' : 'after fees';
   const fee = feeUsd(entry);
   if (fee !== null && fee !== 0) return `${isQuotedFee(entry) ? 'quoted fee' : 'fee'} ${signedUsd(fee)}`;
   if (entry.kind === 'enter') return 'fees';
@@ -226,7 +228,7 @@ function noteOf(entry: JournalEntry, amount: number | null): string | null {
 
 export function rowOf(entry: JournalEntry, { replay = false }: { replay?: boolean } = {}): RowView {
   const info = KINDS[entry.kind];
-  const amount = amountUsd(entry);
+  const amount = moneyUsd(entry);
   return {
     id: entry.id,
     kind: entry.kind,

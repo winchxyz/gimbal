@@ -124,6 +124,19 @@ test('older days fold into one line that counts what happened, and everything sh
   assert.equal(foldOlder(groups, 6).fold?.summary, '2 earlier events: 1 deposit, 1 open');
 });
 
+test('an open whose `usd` is its leg size shows its fee, not the size as income, and adds only the fee to the day', () => {
+  // The live engine's enter line (2026-11-09 03:08 UTC): `usd` 11.45 is the leg, `feeUsd` what the two fills cost.
+  const open = { id: 'o', t: Date.UTC(2026, 10, 9, 3, 8), kind: 'enter', summary: 'enter mon-phoenix-hyperliquid', numbers: { legUsd: 11.46495, usd: 11.45, feeUsd: -0.00681 }, tx: [] } as JournalEntry;
+  const row = rowOf(open);
+  assert.deepEqual(row.amount, { text: '−$0.01', positive: false });
+  assert.equal(row.note, 'fees');
+  assert.equal(pnlOf(open), -0.00681);
+  // No fee read yet: nothing to show, and nothing counted.
+  const bare = { ...open, numbers: { usd: 11.45 } } as JournalEntry;
+  assert.equal(rowOf(bare).amount, null);
+  assert.equal(pnlOf(bare), 0);
+});
+
 test('a range of days: one day, one month, two months', () => {
   assert.equal(dayRange(at(21, 5), at(21, 20)), '21 Oct');
   assert.equal(dayRange(at(23, 5), at(21, 5)), '21–23 Oct');

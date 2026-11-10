@@ -24,6 +24,22 @@ export function numberOf(entry: Pick<JournalEntry, 'numbers'>, key: string): num
 /** The signed money effect shown on the right of a row, or null when the entry has none. */
 export const amountUsd = (entry: Pick<JournalEntry, 'numbers'>): number | null => numberOf(entry, 'usd');
 
+/**
+ * Whether an entry's `usd` is a leg's size and not money earned or paid. The engine's open and rotation lines write
+ * the size there (`usd: 10.6` for a $10.60 leg) next to the fills' fee (`feeUsd`). An open never earns, so any
+ * positive `usd` on it is a size; a rotation is read so only with the fee beside it, since a result can be positive.
+ */
+export const isSizeAsUsd = (entry: Pick<JournalEntry, 'kind' | 'numbers'>): boolean =>
+  (amountUsd(entry) ?? 0) > 0 && (entry.kind === 'enter' || (entry.kind === 'rotate' && numberOf(entry, 'feeUsd') !== null));
+
+/**
+ * The money effect of an entry, as the Journal shows and sums it: its `usd`, except where that is a leg's size
+ * (isSizeAsUsd). Opening a pair earns nothing; what it costs is its fills' fee, so the fee is the amount there.
+ */
+export function moneyUsd(entry: Pick<JournalEntry, 'kind' | 'numbers'>): number | null {
+  return isSizeAsUsd(entry) ? numberOf(entry, 'feeUsd') : amountUsd(entry);
+}
+
 /** A fee on top of the amount (≤ 0), or null. */
 export const feeUsd = (entry: Pick<JournalEntry, 'numbers'>): number | null => numberOf(entry, 'feeUsd');
 
