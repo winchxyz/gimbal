@@ -909,8 +909,18 @@ test('every field of every shared type passes the allowlist unchanged (the set-u
     windows: [win('SOL:hyperliquid/phoenix', {
       veto: { verdict: 'pass', reasons: ['spread steady for a week'], model: 'model-a', at: T0 }, refused: { code: 'E_ORACLE_STALE', reason: 'stored price stale' },
       note: 'refreshed at open', held: { since: T0 - 3_600_000 }, switchCostUsd: 0.42, grossApr7dPct: null,
+      legs: {
+        long: { symbol: 'SOL', ratePerHour: 0.00001, apr7dPct: 8.76, settlement: 'hourly', nextAt: T0 + 60_000, markPx: 182.4, oiUsd: 5_000_000, volume24hUsd: 12_000_000, move24hPct: -1.25, readAt: T0 },
+        short: { symbol: 'SOL-PERP', ratePerHour: 0.00005, apr7dPct: null, settlement: 'daily', nextAt: T0 + 3_600_000, markPx: null, oiUsd: null, volume24hUsd: null, move24hPct: null, readAt: T0 - 5000 },
+      },
     })],
-    scan: { venues: 33, failed: ['paradex'], at: T0 },
+    scan: {
+      venues: 33, failed: ['paradex'], at: T0,
+      sources: [
+        { id: 'hyperliquid', kind: 'desk', markets: 229, oiUsd: 9_000_000_000, volume24hUsd: 7_000_000_000, readAt: T0, ok: true },
+        { id: 'paradex', kind: 'dex', markets: 0, oiUsd: null, volume24hUsd: null, readAt: null, ok: false },
+      ],
+    },
     strategy: { auto: true, minNetAprPct: 10, legUsd: 12, maxLeverage: 2, stopDrawdownPct: 5, rotate: { minGainPts: 5, forHours: 3 }, risk: { watchDistancePct: 15, rescueDistancePct: 8 }, enterAfterChecks: 3, exitAfterChecks: 6 },
     desk: {
       ...desk(),
@@ -938,6 +948,8 @@ test('every field of every shared type passes the allowlist unchanged (the set-u
   Object.assign(noisy.desk!.legs[0]!, { apiKey: 'x' });
   Object.assign(noisy.windows![0]!, { debug: { path: '/app/x' } });
   Object.assign(noisy.windows![0]!.veto!, { prompt: 'x' });
+  Object.assign(noisy.windows![0]!.legs!.long, { account: '0xabc' });
+  Object.assign(noisy.scan!.sources![0]!, { url: 'https://internal.example/x' });
   Object.assign(noisy.journal[0]!, { raw: { headers: {} } });
   Object.assign(noisy.journal[0]!.numbers, { nested: { a: 1 } });
   Object.assign(noisy.health!, { detail: { ip: 'x' } });

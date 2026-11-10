@@ -65,7 +65,6 @@ test('every component that draws a write control asks writeControls first', () =
   const gated: [string, string][] = [
     ['shell/Header.tsx', 'money'],
     ['desk/DeskScreen.tsx', 'close'],
-    ['windows/WindowList.tsx', 'rotate'],
     ['rescue/Stress.tsx', 'stress'],
     ['journal/States.tsx', 'money'],
     ['security/States.tsx', 'onboarding'],
@@ -73,7 +72,6 @@ test('every component that draws a write control asks writeControls first', () =
     ['windows/Detail.tsx', 'close'],
     ['windows/Detail.tsx', 'rotate'],
     ['windows/Detail.tsx', 'enter'],
-    ['windows/WindowList.tsx', 'enter'],
   ];
   for (const [file, control] of gated) {
     const code = readFileSync(join(src, file), 'utf8');

@@ -1,7 +1,7 @@
 // What the Windows list shows and in which order. Pure functions over the shared `Window` type, so the
 // rules in design/HANDOFF.md (Windows) are tested without a browser.
 import type { ScanStatus, Window as FundingWindow } from '@gimbal/shared';
-import { capital, list, sentence, venueName } from './format.ts';
+import { capital, list, sentence, tidy, venueName } from './format.ts';
 
 export type Tab = 'tradable' | 'watch';
 
@@ -264,7 +264,7 @@ export function checkLines(w: FundingWindow): CheckLine[] {
   } else if (w.refused) {
     lines.push({ ok: false, text: `The contract would refuse it (${w.refused.code}): ${capital(w.refused.reason)}` });
   }
-  lines.push(...w.checks);
+  lines.push(...w.checks.map((c) => ({ ok: c.ok, text: tidy(c.text) })));
   const blocking = lines.findIndex((l) => !l.ok);
   return lines.map((l, i) => ({ ...l, blocking: i === blocking }));
 }

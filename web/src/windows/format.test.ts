@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { dayMonth, dayMonthTime, depth, duration, hours, list, pct, plain, sentence, signedPct, usd, usdWhole, venueName } from './format.ts';
+import { dayMonth, dayMonthTime, depth, duration, hours, list, pct, plain, sentence, signedPct, tidy, usd, usdWhole, venueName } from './format.ts';
 
 test('percentages use the real minus sign and never show a negative zero', () => {
   assert.equal(pct(8.64), '8.6%');
@@ -34,6 +34,7 @@ test('depth is shown in k and M like the mockup', () => {
   assert.equal(depth(1_240_000), '$1.2M');
   assert.equal(depth(3_800_000), '$3.8M');
   assert.equal(depth(850), '$850');
+  assert.equal(depth(9_240_000_000), '$9.2B');
 });
 
 test('durations', () => {
@@ -62,4 +63,10 @@ test('venue names, lists and sentences', () => {
   assert.equal(list(['A', 'B', 'C']), 'A, B and C');
   assert.equal(sentence('no trusted price'), 'no trusted price.');
   assert.equal(sentence('Already a sentence.'), 'Already a sentence.');
+});
+
+test('a line the engine wrote is set the way the site writes figures', () => {
+  assert.equal(tidy('it nets 25.59 % APR over the hold, at least your 5 % minimum'), 'it nets 25.59% a year over the hold, at least your 5% minimum');
+  assert.equal(tidy('39.5 bps of a 12 % move'), '39.5 bps of a 12% move');
+  assert.equal(tidy('Books 13 s old'), 'Books 13 s old');
 });

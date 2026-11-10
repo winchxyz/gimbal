@@ -45,8 +45,18 @@
   /* type: SF on Apple devices, the open Gimbal fallbacks everywhere else. Two weights: 400 and 600. */
   --font: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Gimbal Sans', sans-serif;
   --display: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Gimbal Sans', sans-serif;
-  --mono: ui-monospace, 'SF Mono', 'Gimbal Mono', monospace; /* hashes and addresses only */
+  --mono: ui-monospace, 'SF Mono', 'Gimbal Mono', monospace; /* every figure, scale and reading; hashes and addresses */
   --t-answer: 600 64px/1.04 var(--display);   /* the sentence that opens a screen */
+  /* Instrument: words in the brand's type, figures in mono. A reading is a value on a row; a tick is a scale's label. */
+  --t-cap: 600 15px/1.4 var(--font);          /* a panel's title */
+  --t-note: 400 13px/1.4 var(--font);         /* what the panel measures, at its right */
+  --t-label: 400 14px/1.4 var(--font);        /* a reading's label */
+  --t-read: 500 14px/1.4 var(--mono);         /* a reading */
+  --t-read-s: 400 12px/1.4 var(--mono);       /* a reading's second line: an interval, a time */
+  --t-big: 500 44px/1 var(--mono);            /* a panel's one large figure */
+  --t-tick: 400 11px/1 var(--mono);           /* a scale's label */
+  --track-mono: -0.01em;
+  --track-big: -0.02em;
   --t-figure: 600 48px/1 var(--display);      /* the one number under it */
   --t-hero: 600 112px/1 var(--display);       /* a market's net a year */
   --t-display: 600 56px/1.05 var(--display);

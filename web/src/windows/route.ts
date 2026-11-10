@@ -1,13 +1,32 @@
-// `#/markets/<id>` opens one market. On the phone it is the detail page and Back closes it; on the desktop it
-// is the selected row, so a link can point at a market. The shell's own `screenFromHash` stops at the first
-// slash, so it still reads this as the Markets screen. A link from before the redesign (`#/windows/<id>`) still opens.
+// Markets has three views of the scan (`#/markets` the pairs, `#/markets/assets`, `#/markets/venues`) and a page per
+// pair (`#/markets/<id>`), so a link can point at any of them and Back returns to the list. A pair's id is
+// `<asset>-<venue>-<venue>`, never one of the two view words. The shell's own `screenFromHash` stops at the first
+// slash, so it still reads all of these as the Markets screen. A link from before the redesign (`#/windows/<id>`)
+// still opens.
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
 const PREFIX = /^#\/?(?:markets|windows)\/([^/?]+)/;
 
+export type MarketsView = 'pairs' | 'assets' | 'venues';
+
+export const MARKETS_VIEWS: readonly { id: MarketsView; label: string }[] = [
+  { id: 'pairs', label: 'Pairs' },
+  { id: 'assets', label: 'Assets' },
+  { id: 'venues', label: 'Venues' },
+];
+
+const isViewWord = (segment: string): segment is 'assets' | 'venues' => segment === 'assets' || segment === 'venues';
+
+export function marketsViewFromHash(hash: string): MarketsView {
+  const segment = PREFIX.exec(hash)?.[1];
+  return segment !== undefined && isViewWord(segment) ? segment : 'pairs';
+}
+
+export const hashForView = (view: MarketsView): string => (view === 'pairs' ? '#/markets' : `#/markets/${view}`);
+
 export function windowIdFromHash(hash: string): string | null {
   const match = PREFIX.exec(hash);
-  if (!match?.[1]) return null;
+  if (!match?.[1] || isViewWord(match[1])) return null;
   try {
     return decodeURIComponent(match[1]);
   } catch {
@@ -20,6 +39,8 @@ export const hashForWindow = (id: string | null): string => (id === null ? '#/ma
 export interface WindowRoute {
   /** The window named in the address, or null. */
   id: string | null;
+  /** Which view of the scan the address names; the pairs when it names a pair or nothing. */
+  view: MarketsView;
   /** Push a history entry: the phone's "open the detail page". */
   open(id: string): void;
   /** Change the address without a history entry: the desktop's row selection. */
@@ -28,9 +49,13 @@ export interface WindowRoute {
 
 export function useWindowRoute(): WindowRoute {
   const [id, setId] = useState(() => windowIdFromHash(window.location.hash));
+  const [view, setView] = useState(() => marketsViewFromHash(window.location.hash));
 
   useEffect(() => {
-    const onChange = () => setId(windowIdFromHash(window.location.hash));
+    const onChange = () => {
+      setId(windowIdFromHash(window.location.hash));
+      setView(marketsViewFromHash(window.location.hash));
+    };
     window.addEventListener('hashchange', onChange);
     return () => window.removeEventListener('hashchange', onChange);
   }, []);
@@ -44,7 +69,7 @@ export function useWindowRoute(): WindowRoute {
     setId(next);
   }, []);
 
-  return useMemo(() => ({ id, open, replace }), [id, open, replace]);
+  return useMemo(() => ({ id, view, open, replace }), [id, view, open, replace]);
 }
 
 /** The phone layout: one column, the list and the detail are separate pages (same breakpoint as app.css). */

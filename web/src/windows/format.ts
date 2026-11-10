@@ -21,6 +21,16 @@ export function signedPct(value: number, decimals = 1): string {
   return Number(text.replace(MINUS, '-')) > 0 ? `+${text}%` : `${text}%`;
 }
 
+/**
+ * A rate in a column of them: `8.6%`, `−2.4%`, whole from 100 up with its thousands grouped (`1,109%`), so a
+ * column of small rates keeps its decimal and an outlier does not widen it.
+ */
+export function rate(value: number): string {
+  if (Math.abs(value) < 99.95) return pct(value, 1);
+  const whole = Math.round(Math.abs(value));
+  return `${value < 0 ? MINUS : ''}${group.format(whole)}%`;
+}
+
 /** `8.6`, `−2.4`: a percentage without the sign, for the small lines under a row */
 export const plain = (value: number, decimals = 1): string => fixed(value, decimals);
 
@@ -33,8 +43,9 @@ export function usd(value: number, decimals = 2): string {
 /** `$1,200`: whole dollars, for leg sizes */
 export const usdWhole = (value: number): string => `${value < 0 ? MINUS : ''}$${group.format(Math.abs(Math.round(value)))}`;
 
-/** Depth on the thinner side: `$22k`, `$1.2M` */
+/** Depth on the thinner side: `$22k`, `$1.2M`, `$28.4B` */
 export function depth(value: number): string {
+  if (value >= 1e9) return `$${(value / 1e9).toFixed(1)}B`;
   if (value >= 1e6) return `$${(value / 1e6).toFixed(1)}M`;
   if (value >= 1e3) return `$${Math.round(value / 1e3)}k`;
   return `$${Math.round(value)}`;
@@ -74,15 +85,24 @@ export function dayMonthTime(ms: number): string {
   return `${dayMonth(ms)} ${two(d.getUTCHours())}:${two(d.getUTCMinutes())}`;
 }
 
-/** `Phoenix`, `dYdX`: the name a venue id is shown under */
+/**
+ * `Phoenix`, `dYdX`: the name a venue id is shown under, as the engine names them in its check texts
+ * (engine/src/venues/names.ts). The builder dexes on Hyperliquid go by their dex name.
+ */
 const SPECIAL_NAMES: Record<string, string> = {
   hyperliquid: 'Hyperliquid',
   phoenix: 'Phoenix',
   orderly: 'Orderly',
+  'hl-xyz': 'trade.xyz',
+  'hl-para': 'Hyperliquid para',
+  'hl-mkts': 'Hyperliquid mkts',
+  'hl-io': 'Hyperliquid io',
   dydx: 'dYdX',
   gmx: 'GMX',
+  'gmx-arbitrum': 'GMX',
   okx: 'OKX',
   mexc: 'MEXC',
+  kucoin: 'KuCoin',
   'trade.xyz': 'trade.xyz',
 };
 
@@ -100,6 +120,9 @@ export function list(items: readonly string[]): string {
 
 /** `no price` becomes `No price`. */
 export const capital = (text: string): string => text.charAt(0).toUpperCase() + text.slice(1);
+
+/** A line the engine wrote, set the way the site writes figures: `46.16 % APR` reads `46.16% a year`, `5 %` reads `5%`. */
+export const tidy = (text: string): string => text.replace(/(\d)\s+%/g, '$1%').replace(/% APR\b/g, '% a year');
 
 /** One sentence from a reason that may or may not end in a full stop. */
 export function sentence(text: string): string {

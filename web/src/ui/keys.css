@@ -1,0 +1,22 @@
+/* Keys: the zero, the sentence, and the five steps of a signature on one line. */
+.keys { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); column-gap: var(--s-6); align-items: start; }
+.keys-zero { display: flex; align-items: baseline; gap: 18px; }
+.keys-zero b { font: 500 64px/0.9 var(--mono); letter-spacing: -0.05em; color: var(--chalk); }
+.keys-zero span { font: 600 22px/1.25 var(--display); letter-spacing: -0.015em; color: var(--chalk); max-width: 11em; }
+.keys p { font: 400 15px/1.55 var(--font); color: var(--silver); max-width: 40em; text-wrap: pretty; }
+.keys-flow { list-style: none; padding: 0; position: relative; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); margin: 40px 0 0; }
+.keys-flow::before { content: ''; position: absolute; left: 3px; right: 20%; top: 3px; height: 1px; background: var(--pewter); }
+.keys-flow li { position: relative; padding: 22px 20px 0 0; }
+.keys-flow li::before { content: ''; position: absolute; left: 0; top: 0; width: 7px; height: 7px; border-radius: 50%; background: var(--bg); border: 1px solid var(--silver); box-sizing: border-box; }
+.keys-flow li.on::before { background: var(--chalk); border-color: var(--chalk); }
+.keys-flow b { display: block; font: 600 14px/1.4 var(--font); color: var(--chalk); overflow-wrap: anywhere; }
+.keys-flow span { display: block; margin-top: 4px; font: 400 13px/1.45 var(--font); color: var(--silver); }
+
+@media (max-width: 1023px) {
+  .keys { grid-template-columns: minmax(0, 1fr); row-gap: 18px; }
+  .keys-zero b { font-size: 52px; }
+  .keys-flow { grid-template-columns: minmax(0, 1fr); margin-top: 28px; }
+  .keys-flow::before { left: 3px; right: auto; top: 6px; bottom: 44px; width: 1px; height: auto; }
+  .keys-flow li { padding: 0 0 16px 24px; }
+  .keys-flow li::before { top: 6px; }
+}

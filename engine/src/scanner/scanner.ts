@@ -24,15 +24,16 @@
 //    stale (the numbers are from the last good read, so its windows cannot be entered on it); in a cool-down after a
 //    429 the venue also counts as failed, while a skip because only this scan's budget is spent does not. Either way
 //    the venue's other books wait for the next scan;
-// 5. each window priced (price.ts); the 7-day gross and intervalsAbove from the hourly rate store, which a few
-//    public history reads per scan fill in the background (a scan never waits on them);
+// 5. each window priced (price.ts), with both legs as read (Window.legs: rate, schedule, mark, open interest, volume);
+//    the 7-day gross, each leg's own 7-day mean and intervalsAbove from the hourly rate store, which a few public
+//    history reads per scan fill in the background (a scan never waits on them);
 // 6. ranked: enterable windows, then the other desk windows, each by the spread expected over the hold minus the
 //    round trip (carry.ts; windows without a multi-day figure after those with one, by net APR), then watch-only
 //    windows by gross APR (their net is not complete), the best maxWatchWindows of them: within those, first the
 //    windows whose legs pass every quality check (quality.ts), then the rest.
 
 import type {
-  ContractPolicy, ScanStatus, ScanVenueId, StrategyConfig, VenueId, Window as FundingWindow, WindowHistory,
+  ContractPolicy, ScanSource, ScanStatus, ScanVenueId, StrategyConfig, VenueId, Window as FundingWindow, WindowHistory,
 } from '@gimbal/shared';
 import type { Book, Clock, MarketFunding, MarketHistorySource, VenueReader, WatchReader } from '../venues/venue.ts';
 import type { ReadSkipped } from '../venues/http-budget.ts';
@@ -208,6 +209,29 @@ function policyLegKeys(policy: ContractPolicy | null): Set<string> {
  */
 const longSide = (leg: Pick<ScanLeg, 'venue' | 'symbol'>): string => legKey(leg);
 const shortSide = (leg: Pick<ScanLeg, 'venue' | 'symbol'>): string => `${legKey(leg)}|short`;
+
+/**
+ * One venue's line in ScanStatus.sources: what its last answer held. `read` is this scan's read of it (its last good
+ * answer when it did not answer now, null when there is none to use). Rows naming another venue are not counted, as
+ * the scan does not pair them. Open interest is in units of the venue's own symbol, so its USD value is OI × its mark.
+ */
+function sourceStatus(source: Source, read: { rows: MarketFunding[]; at: number; stale: boolean } | null): ScanSource {
+  const rows = (read?.rows ?? []).filter((r) => r.venue === source.id);
+  const sum = (values: (number | null)[]): number | null => {
+    const known = values.filter((v): v is number => v !== null);
+    return known.length === 0 ? null : Math.round(known.reduce((s, v) => s + v, 0));
+  };
+  const positive = (n: number | null | undefined): n is number => typeof n === 'number' && Number.isFinite(n) && n >= 0;
+  return {
+    id: source.id,
+    kind: source.kind,
+    markets: rows.length,
+    oiUsd: sum(rows.map((r) => (positive(r.openInterest) && positive(r.markPx) ? r.openInterest * r.markPx : null))),
+    volume24hUsd: sum(rows.map((r) => (positive(r.volume24hUsd) ? r.volume24hUsd : null))),
+    readAt: read?.at ?? null,
+    ok: read !== null && !read.stale,
+  };
+}
 
 /** `promise`, or a rejection after `ms`; the timer never outlives the race. */
 export function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
@@ -503,6 +527,13 @@ export class Scanner {
       const longKey = longSide(pw.pair.long);
       const shortKey = shortSide(pw.pair.short);
       const dh = pw.pair.desk ? multi.get(pw.pair.id) : undefined;
+      if (w.legs !== undefined) {
+        // Each side's own week, next to the pair's: which leg the spread comes from, and whether it is this hour's only.
+        const l7 = legAprOver(this.#rates, longKey, now, WEEK_HOURS);
+        const s7 = legAprOver(this.#rates, shortKey, now, WEEK_HOURS);
+        w.legs.long.apr7dPct = l7 === null ? null : round(l7, 3);
+        w.legs.short.apr7dPct = s7 === null ? null : round(s7, 3);
+      }
       if (dh === undefined) {
         const g7 = grossApr7d(this.#rates, longKey, shortKey, now);
         w.grossApr7dPct = g7 === null ? null : round(g7, 3);
@@ -591,7 +622,7 @@ export class Scanner {
 
     return {
       windows: ranked.map((pw) => pw.window),
-      scan: { venues: this.#sources.length, failed: [...failed.keys()].sort(), at: now },
+      scan: { venues: this.#sources.length, failed: [...failed.keys()].sort(), at: now, sources: reads.map((r, i) => sourceStatus(this.#sources[i]!, r)) },
       notes: { dropped: droppedCount, unpriced, historyReads, ms: Date.now() - started },
       failedWhy: Object.fromEntries(failed),
     };

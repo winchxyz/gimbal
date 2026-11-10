@@ -12,14 +12,12 @@ interface Props {
   legUsd: number | null;
   /** The engine rules' `auto` (null: not read yet). Off, the engine refuses every entry, so the button says so. */
   auto: boolean | null;
-  /** `row`: inside a list row (its own clicks must not select the row again); `detail`: the detail's action line. */
-  place: 'row' | 'detail';
 }
 
 /**
- * The entry the owner started on this page, shared by the list row and the detail (one control each): which window,
- * the Journal ids already there when it was sent, and whether the engine was seen acting on it (an entry that ends
- * without a line of its own then says so instead of waiting forever). Cleared when the owner asks to enter again.
+ * The entry the owner started on this page, kept outside the component so it survives a move between pairs: which
+ * window, the Journal ids already there when it was sent, and whether the engine was seen acting on it (an entry that
+ * ends without a line of its own then says so instead of waiting forever). Cleared when the owner asks to enter again.
  */
 interface Started extends PendingEntry {
   sawActing: boolean;
@@ -38,7 +36,7 @@ const started = createStore<Started | null, StartedAction>((state, action) => {
  * result (opened, or not opened and why) comes from its Journal line and stays next to the window's control.
  * Drawn only when writeControls().enter (the owner unlocked this tab).
  */
-export function OwnerEnter({ w, windows, legUsd, auto, place }: Props) {
+export function OwnerEnter({ w, windows, legUsd, auto }: Props) {
   const acting = useStream((s) => s.decision?.acting ?? null);
   const journal = useStream((s) => s.journal);
   const entry = useSyncExternalStore(started.subscribe, started.getState);
@@ -69,21 +67,15 @@ export function OwnerEnter({ w, windows, legUsd, auto, place }: Props) {
   // The window just entered is held now (no Enter on it): its result still shows where the owner looked.
   if (state.kind === 'none' && result === null) return null;
 
-  const stop = place === 'row'
-    ? { onClick: (e: { stopPropagation(): void }) => e.stopPropagation(), onKeyDown: (e: { stopPropagation(): void }) => e.stopPropagation() }
-    : {};
-  const Wrap = place === 'row' ? 'span' : 'div';
-  const className = place === 'row' ? 'rot' : 'w-cta';
-
   if (send.asking && action !== null) {
     return (
-      <Wrap className={className} role="alertdialog" aria-label="Confirm" {...stop}>
+      <div className="w-cta" role="alertdialog" aria-label="Confirm">
         <span className="ink">{enterConfirmText(w, venueName, legUsd)}</span>
-        <span className={place === 'row' ? 'ask' : 'end'}>
+        <span className="end">
           <button type="button" className="btn quiet" onClick={send.cancel}>Cancel</button>
           <button type="button" className="btn primary" onClick={confirm}>Enter {w.symbol}</button>
         </span>
-      </Wrap>
+      </div>
     );
   }
 
@@ -96,7 +88,7 @@ export function OwnerEnter({ w, windows, legUsd, auto, place }: Props) {
   const outcome = send.outcome !== null && !(result !== null && send.outcome.tone === 'sent') ? send.outcome : null;
 
   return (
-    <Wrap className={className} {...stop}>
+    <div className="w-cta">
       <span>
         {reason !== null ? <span className="g">{reason}</span> : null}
         {send.sending ? <span className="g" role="status">Sending to the engine…</span> : null}
@@ -114,12 +106,12 @@ export function OwnerEnter({ w, windows, legUsd, auto, place }: Props) {
         ) : null}
       </span>
       {state.kind === 'none' ? null : (
-        <span className={place === 'row' ? undefined : 'end'}>
+        <span className="end">
           <button type="button" className="btn" disabled={state.kind === 'blocked' || send.sending} onClick={ask}>
             Enter {w.symbol}
           </button>
         </span>
       )}
-    </Wrap>
+    </div>
   );
 }

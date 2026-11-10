@@ -31,8 +31,8 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { isIP } from 'node:net';
 import { extname, join, normalize, resolve, sep } from 'node:path';
 import type {
-  DeskState, EngineState, JournalCounts, JournalEntry, Leg, RescueFailure, RescueProgress, ScanStatus, SetupProgress, StrategyConfig, StrategyDecision, TxRef,
-  VenueAccount, Window, WindowHistory,
+  DeskState, EngineState, JournalCounts, JournalEntry, Leg, RescueFailure, RescueProgress, ScanSource, ScanStatus, SetupProgress, StrategyConfig,
+  StrategyDecision, TxRef, VenueAccount, Window, WindowHistory, WindowLeg,
 } from '@gimbal/shared';
 import { MAX_STREAMS_PER_CLIENT } from './replay-host-lib.ts';
 import { OWNER_HEADER, OWNER_MAX_BODY_BYTES } from '../view/view-server.ts';
@@ -286,6 +286,11 @@ const DESK = obj({
   health: V, paused: obj({ by: V, at: V } satisfies Record<keyof NonNullable<DeskState['paused']>, Shape>), rescueFailure: RESCUE_FAILURE,
   updatedAt: V, accounts: list(ACCOUNT),
 } satisfies Record<keyof DeskState, Shape>);
+// A window's side on its venue: public market data only (the venue's symbol, its funding rate and schedule, mark,
+// open interest and volume).
+const WINDOW_LEG = obj({
+  symbol: V, ratePerHour: V, apr7dPct: V, settlement: V, nextAt: V, markPx: V, oiUsd: V, volume24hUsd: V, move24hPct: V, readAt: V,
+} satisfies Record<keyof WindowLeg, Shape>);
 const WINDOW = obj({
   id: V, symbol: V, longVenue: V, shortVenue: V, grossAprPct: V, grossApr7dPct: V,
   costs: obj({ feesPct: V, slippagePct: V, basisPct: V, rescueReservePct: V } satisfies Record<keyof Window['costs'], Shape>),
@@ -295,8 +300,11 @@ const WINDOW = obj({
   refused: obj({ code: V, reason: V } satisfies Record<keyof NonNullable<Window['refused']>, Shape>),
   note: V, held: obj({ since: V } satisfies Record<keyof NonNullable<Window['held']>, Shape>),
   checks: list(obj({ ok: V, text: V } satisfies Record<keyof Window['checks'][number], Shape>)), switchCostUsd: V, stale: V,
+  legs: obj({ long: WINDOW_LEG, short: WINDOW_LEG } satisfies Record<keyof NonNullable<Window['legs']>, Shape>),
 } satisfies Record<keyof Window, Shape>);
-const SCAN = obj({ venues: V, failed: list(V), at: V } satisfies Record<keyof ScanStatus, Shape>);
+// The venues the scanner reads and what each one's last answer held: counts and public totals.
+const SCAN_SOURCE = obj({ id: V, kind: V, markets: V, oiUsd: V, volume24hUsd: V, readAt: V, ok: V } satisfies Record<keyof ScanSource, Shape>);
+const SCAN = obj({ venues: V, failed: list(V), at: V, sources: list(SCAN_SOURCE) } satisfies Record<keyof ScanStatus, Shape>);
 const STRATEGY = obj({
   auto: V, minNetAprPct: V, legUsd: V, maxLeverage: V, stopDrawdownPct: V,
   rotate: obj({ minGainPts: V, forHours: V } satisfies Record<keyof StrategyConfig['rotate'], Shape>),

@@ -30,7 +30,7 @@ test('auto off: the line says the engine will not move by itself, and the manual
 test('no desk loaded: the line says so in plain words and offers no way to enter', () => {
   const noDesk = net('SOL', 8.6, { refused: { code: 'E_NO_DESK', reason: 'no desk policy loaded yet' } });
   const d = decide({ selected: noDesk, windows: [noDesk], strategy: STRATEGY, now: NOW });
-  assert.equal(d.text, 'No desk is loaded, so nothing can be entered, by auto or by hand. It enters windows once a desk exists.');
+  assert.equal(d.text, 'No desk is loaded, so nothing can be entered, by auto or by hand. Pairs open for entry once a desk exists.');
   assert.equal(d.rotate, null);
   assert.equal(d.alert, null);
   assert.equal(d.close, false);

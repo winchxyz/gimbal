@@ -1,7 +1,7 @@
 // One pair priced as a Window: gross, every cost term, net, breakeven, capacity, and the checks the engine ran.
 // Pure: the books, the oracle prices and the time come in as arguments.
 
-import type { ContractPolicy, StrategyConfig, VenueId, Window as FundingWindow } from '@gimbal/shared';
+import type { ContractPolicy, StrategyConfig, VenueId, Window as FundingWindow, WindowLeg } from '@gimbal/shared';
 import { oraclePriced } from '../contract/oracle-assets.ts';
 import { unpricedEntry } from '../contract/unpriced.ts';
 import { venueName, venueNames } from '../venues/names.ts';
@@ -289,8 +289,29 @@ export function priceWindow(pair: Pair, ctx: PricingContext): PriceResult {
     checks: [...head, ...verdict.checks, ...quality, ...checks, ...tail],
     switchCostUsd: null,
     stale: staleVenues.length > 0,
+    legs: { long: windowLeg(long, long.ratePerHour), short: windowLeg(short, short.shortRatePerHour) },
   };
   return { ok: true, priced: { pair, window, costsApr, breakdown, roundTrip: rt, fills, flagged: quality.length > 0 } };
+}
+
+/**
+ * A leg as its window publishes it (shared WindowLeg): the read the pair was priced on, so the web can show each
+ * side's rate, schedule, mark and size next to the spread. apr7dPct is filled by the scanner, which keeps the history.
+ */
+function windowLeg(leg: ScanLeg, ratePerHour: number): WindowLeg {
+  const dollars = (n: number | null): number | null => (n === null ? null : Math.round(n));
+  return {
+    symbol: leg.symbol,
+    ratePerHour,
+    apr7dPct: null,
+    settlement: leg.settlement,
+    nextAt: leg.nextAt,
+    markPx: leg.markPx,
+    oiUsd: dollars(leg.oiUsd),
+    volume24hUsd: dollars(leg.volume24hUsd),
+    move24hPct: leg.prevDayPx == null || leg.venueMarkPx === null ? null : round((leg.venueMarkPx / leg.prevDayPx - 1) * 100, 3),
+    readAt: leg.readAt,
+  };
 }
 
 function schedule(leg: ScanLeg, incomePerHourUsd: number, now: number) {

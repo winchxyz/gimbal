@@ -156,7 +156,8 @@ test('the fake stream emits valid StreamEvents into the store', () => {
   assert.equal(s.desk?.mode, 'replay');
   assert.equal(s.desk?.legs.length, 2);
   assert.equal(s.windows?.length, 13);
-  assert.equal(s.scan?.venues, 32);
+  assert.equal(s.scan?.venues, 14);
+  assert.equal(s.scan?.sources?.length, 14);
 });
 
 test('the journal counts come from GET /state and grow with each new entry on the stream, not with one sent again', () => {

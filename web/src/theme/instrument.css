@@ -1,0 +1,180 @@
+/* Instrument: the look of every product screen. No pictures: a screen opens with one sentence and three readings,
+   then shows its measurement on a scale, then panels on a 12-column grid. A panel is a hairline, a title and what it
+   measures; a figure is set in mono and, where it has a range, drawn on a ruler. Every value comes from tokens.css.
+   Colour means state only: a word, a number, a 7 px dot or a data line, never a fill. */
+
+/* ---------- a screen's top: the sentence, and beside it the three readings that back it ---------- */
+.top { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 330px); column-gap: var(--s-8); align-items: end; padding: 44px var(--gutter) 56px; }
+.top .answer { max-width: 13.6em; }
+.top .answer.long { font-size: 52px; line-height: 1.06; max-width: 17em; }
+
+/* ---------- readings: a label in the brand's type, its value in mono, a hairline between rows ---------- */
+.rd { margin: 0; }
+.rd > div { display: flex; justify-content: space-between; align-items: baseline; gap: var(--s-4); padding: 10px 0; border-top: 1px solid var(--rule); }
+.rd.shut > div:last-child { border-bottom: 1px solid var(--rule); }
+.rd dt { font: var(--t-label); color: var(--silver); min-width: 0; }
+.rd dd { margin: 0; font: var(--t-read); letter-spacing: var(--track-mono); color: var(--chalk); white-space: nowrap; text-align: right; }
+.rd dd small { font: inherit; font-weight: 400; color: var(--silver); }
+.rd .tot dt { color: var(--chalk); font-weight: 600; }
+.rd .sub dt { padding-left: var(--s-4); font-size: 13px; }
+.rd .sub dd { font-size: 13px; font-weight: 400; color: var(--silver); }
+.num { font-family: var(--mono); font-weight: 500; letter-spacing: var(--track-mono); }
+
+/* ---------- the measurement under the top: a caption line, the instrument, one sentence that reads it ---------- */
+.hero { padding: 0 var(--gutter); }
+.cap { display: flex; justify-content: space-between; align-items: baseline; gap: var(--s-4); border-top: 1px solid var(--rule); padding: 16px 0 26px; font: var(--t-note); color: var(--silver); }
+.cap > :first-child { font: var(--t-cap); color: var(--chalk); }
+.cap > :last-child { text-align: right; }
+.say { margin-top: 26px; font: var(--t-body); color: var(--silver); max-width: 46em; text-wrap: pretty; }
+.say b { font-weight: 400; color: var(--chalk); }
+.say-row { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--s-7); }
+.say-row .say { flex: 1 1 0; min-width: 0; }
+.say-row .act { flex: none; margin-top: 26px; display: flex; align-items: center; gap: var(--s-5); }
+
+/* ---------- panels on the grid ---------- */
+.pg { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: var(--s-6); row-gap: 60px; padding: 68px var(--gutter) 96px; }
+.pn { grid-column: span 12; min-width: 0; border-top: 1px solid var(--rule); padding-top: 16px; }
+.pn.w4 { grid-column: span 4; }
+.pn.w5 { grid-column: span 5; }
+.pn.w6 { grid-column: span 6; }
+.pn.w7 { grid-column: span 7; }
+.pn.w8 { grid-column: span 8; }
+.pn-h { display: flex; justify-content: space-between; align-items: baseline; gap: var(--s-4); margin-bottom: 26px; }
+.pn-h h2 { font: var(--t-cap); color: var(--chalk); white-space: nowrap; flex: none; }
+.pn-h > span, .pn-h > a { font: var(--t-note); color: var(--silver); text-align: right; min-width: 0; }
+.pn-h > a { white-space: nowrap; transition: color var(--dur) var(--ease); }
+.pn-h > a:hover { color: var(--chalk); }
+.pn-foot { margin-top: var(--s-4); font: 400 13px/1.5 var(--font); color: var(--silver); max-width: 48em; text-wrap: pretty; }
+.pn-foot a { color: var(--chalk); }
+.pn-none { font: var(--t-label); color: var(--silver); padding: 2px 0 6px; max-width: 46em; }
+.pn .rd { margin-top: 18px; }
+.pn .rd.lead { margin-top: -10px; }                       /* readings right under the title: the title's hairline is theirs */
+.pn .rd.lead > div:first-child { border-top: 0; }
+
+/* a panel's one large figure, with the sentence that says what it is */
+.big { display: flex; align-items: baseline; gap: 18px; margin-bottom: var(--s-5); }
+.big b { font: var(--t-big); letter-spacing: var(--track-big); color: var(--chalk); white-space: nowrap; }
+.big b i { font-style: normal; margin-left: 0.14em; }
+.big span { font: 400 14px/1.5 var(--font); color: var(--silver); max-width: 24em; }
+
+/* ---------- the instruments: drawn at their real pixel size, so type never scales ---------- */
+.ins { display: block; overflow: visible; }
+.ins text { font: var(--t-tick); fill: var(--pewter); }
+.ins .tl { font: 400 13px var(--font); fill: var(--silver); }
+.ins .tv { font: 500 13px var(--mono); fill: var(--chalk); letter-spacing: var(--track-mono); }
+.ins .beam { stroke: var(--chalk); stroke-width: 1; }
+.ins .rail { stroke: var(--pewter); stroke-width: 1; }
+.ins .done { stroke: var(--chalk); stroke-width: 3; }
+.ins .tk1 { stroke: var(--pewter); stroke-width: 1; }
+.ins .tk2 { stroke: var(--pewter); stroke-width: 1; opacity: .55; }
+.ins .tk3 { stroke: var(--pewter); stroke-width: 1; opacity: .3; }
+.ins line.zr { stroke: var(--danger); stroke-width: 5; }
+.ins line.zw { stroke: var(--watch); stroke-width: 5; }
+.ins text.zr { fill: var(--danger); }
+.ins text.zw { fill: var(--watch); }
+.ins .needle { stroke: var(--chalk); stroke-width: 1; }
+.ins .dot { fill: var(--chalk); stroke: var(--bg); stroke-width: 2; }
+.ins .needle.up { stroke: var(--level); } .ins .dot.up { fill: var(--level); }
+.ins .needle.watch-t { stroke: var(--watch); } .ins .dot.watch-t { fill: var(--watch); }
+.ins .needle.down { stroke: var(--danger); } .ins .dot.down { fill: var(--danger); }
+.ins .needle.dim { stroke: var(--pewter); } .ins .dot.dim { fill: var(--pewter); }
+.ins .ring { fill: var(--bg); stroke: var(--silver); stroke-width: 1; }   /* a mean, beside the dot of what is read now */
+.ins .dim line { stroke: var(--pewter); stroke-width: 1; }
+.ins .dim text { fill: var(--silver); }
+.ins .gr { stroke: var(--rule); stroke-width: 1; }
+.ins .gr.soft { opacity: .55; }
+.ins .ax0 { stroke: var(--pewter); stroke-width: 1; }
+.ins .min { stroke: var(--silver); stroke-width: 1; stroke-dasharray: 2 5; }
+.ins .mn { fill: var(--silver); }
+.ins .cl { fill: none; stroke: var(--silver); stroke-width: 1.25; stroke-linejoin: round; }
+.ins .cl.held { stroke: var(--level); stroke-width: 2; }
+.ins .cl.behind { stroke: var(--pewter); }
+.ins-wait { background: var(--sel); }                    /* still, while an instrument's data is being read */
+.ins-msg { display: flex; align-items: center; flex-wrap: wrap; align-content: center; gap: 0 6px; font: var(--t-note); border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+
+/* the dot plot: one row a market, one scale for all of them, the owner's minimum as a line through every row */
+.ins .mk .ms { font: 600 14px var(--font); fill: var(--chalk); }
+.ins .mk .mv { font: 400 13px var(--font); fill: var(--silver); }
+.ins .mk .mv.sm { font-size: 12px; }
+.ins .mk .st { stroke: var(--pewter); stroke-width: 1; }
+.ins .mk circle { fill: var(--chalk); }
+.ins .mk.held circle { fill: var(--level); }
+.ins .mk.under .ms, .ins .mk.under .mv, .ins .mk.under .tv { fill: var(--pewter); font-weight: 400; }
+.ins .mk.under circle { fill: var(--pewter); }
+.ins .mk.under .st { opacity: .5; }
+.ins a .mk .ms { transition: fill var(--dur) var(--ease); }
+.ins a:hover .mk .ms, .ins a:focus-visible .mk .ms { text-decoration: underline; text-underline-offset: 3px; }
+.ins a:focus-visible { outline: none; }
+
+/* ---------- conditions: what has to be true, and where each stands ---------- */
+.conds { list-style: none; margin: 34px 0 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); column-gap: var(--s-6); }
+.conds li { display: grid; grid-template-columns: 22px minmax(0, 1fr); column-gap: var(--s-2); align-items: baseline; border-top: 1px solid var(--rule); padding-top: 14px; }
+.conds i { font-style: normal; font-size: 14px; color: var(--level); }
+.conds li:not(.done) i::before { content: ''; display: inline-block; width: 9px; height: 9px; border: 1.5px solid var(--pewter); border-radius: 50%; }
+.conds b { font: 500 15px/1.4 var(--mono); letter-spacing: -0.015em; color: var(--chalk); }
+.conds span { grid-column: 2; margin-top: 4px; font: 400 14px/1.45 var(--font); color: var(--silver); }
+
+/* ---------- a short log: the time in mono, the kind over the line ---------- */
+.log { list-style: none; margin: 0; padding: 0; }
+.log li { display: grid; grid-template-columns: 48px minmax(0, 1fr); column-gap: 14px; padding: 12px 0; border-top: 1px solid var(--rule); }
+.log li:first-child { border-top: 0; padding-top: 0; }
+.log time { font: 400 12px/1.75 var(--mono); color: var(--silver); }
+.log p { font: 400 14px/1.5 var(--font); color: var(--chalk); overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+.log p .k { display: block; font: 400 12px/1.6 var(--mono); color: var(--silver); }
+
+/* ---------- a table of readings: words left, figures right, hairlines between rows ---------- */
+.tb { width: 100%; border-collapse: collapse; }
+.tb th, .tb td { padding: 10px 0 10px var(--s-5); text-align: right; white-space: nowrap; vertical-align: baseline; }
+.tb th:first-child, .tb td:first-child { padding-left: 0; text-align: left; }
+.tb thead th { font: var(--t-note); color: var(--silver); font-weight: 400; padding-top: 0; padding-bottom: 12px; }
+.tb tbody th { font: var(--t-label); color: var(--silver); font-weight: 400; white-space: normal; }
+.tb tbody td { font: var(--t-read); letter-spacing: var(--track-mono); color: var(--chalk); }
+.tb tbody tr { border-top: 1px solid var(--rule); }
+.tb td small { display: block; font: var(--t-read-s); color: var(--silver); }
+.tb td.g, .tb td .g { color: var(--silver); font-weight: 400; }
+.tb-x { overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--rule) transparent; }
+
+/* ---------- quiet text controls: a set of views, a scope, a field ---------- */
+.seg { display: flex; flex-wrap: wrap; gap: 4px 28px; }
+.seg a, .seg button { font: var(--t-m); color: var(--silver); white-space: nowrap; padding: 6px 0; transition: color var(--dur) var(--ease); }
+.seg a:hover, .seg button:hover { color: var(--chalk); }
+.seg .on { color: var(--chalk); font-weight: 600; }
+.seg i { font-style: normal; font: 400 12px/1 var(--mono); color: var(--pewter); margin-left: 7px; }
+.seg .on i { color: var(--silver); }
+.field { display: flex; align-items: center; gap: var(--s-2); border-bottom: 1px solid var(--rule); transition: border-color var(--dur) var(--ease); }
+.field:focus-within { border-color: var(--silver); }
+.field input { width: 100%; min-width: 0; height: 36px; background: none; border: 0; outline: none; color: var(--chalk); font: var(--t-m); }
+.field input::placeholder { color: var(--pewter); }
+.field svg { flex: none; width: 14px; height: 14px; color: var(--pewter); }
+.field button { flex: none; font: var(--t-note); color: var(--silver); }
+.field button:hover { color: var(--chalk); }
+
+/* ---------- placeholders while a screen reads: still, in the frame the figures will take ---------- */
+.sk-line { display: block; background: var(--sel); height: 14px; }
+
+/* ---------- the narrow desktop, 1024 to 1279 px ---------- */
+@media (min-width: 1024px) and (max-width: 1279px) {
+  .top { column-gap: var(--s-7); grid-template-columns: minmax(0, 1fr) minmax(0, 290px); }
+  .top .answer { font-size: 54px; }
+  .top .answer.long { font-size: 44px; }
+  .pg { column-gap: var(--s-5); }
+  .pn.nw { grid-column: span 12; }                        /* a panel whose table needs the whole row at this width */
+}
+
+/* ---------- phone: one column ---------- */
+@media (max-width: 1023px) {
+  .top { grid-template-columns: minmax(0, 1fr); row-gap: 26px; padding: 18px var(--gutter) 34px; }
+  .top .answer.long { font-size: 30px; line-height: 1.1; }
+  .cap { flex-direction: column; gap: 2px; padding-bottom: 22px; }
+  .cap > :last-child { text-align: left; }
+  .say { font: var(--t-m); margin-top: 20px; }
+  .say-row { flex-direction: column; gap: 0; }
+  .say-row .act { margin-top: var(--s-4); flex-wrap: wrap; }
+  .pg { column-gap: 0; row-gap: 44px; padding: 48px var(--gutter) var(--s-6); }
+  .pn.w4, .pn.w5, .pn.w6, .pn.w7, .pn.w8 { grid-column: span 12; }
+  .pn-h { flex-direction: column; gap: 2px; margin-bottom: 20px; }
+  .pn-h > span, .pn-h > a { text-align: left; }
+  .big b { font-size: 40px; }
+  .conds { grid-template-columns: minmax(0, 1fr); row-gap: var(--s-4); margin-top: 26px; }
+  .tb th, .tb td { padding-left: var(--s-4); }
+}
