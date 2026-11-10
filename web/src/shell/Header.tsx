@@ -74,7 +74,8 @@ export function MoneyActions({ mode, className = 'money' }: { mode: Mode; classN
   if (!writeControls().money || mode === 'replay') return null;
   return (
     <span className={className}>
-      <a href={ONBOARDING_HREF}>{mode === 'testnet' ? 'Get test USDC' : 'Add funds'}</a>
+      {/* In the header it is a link among links; on a screen it is an action, so it takes the button's shape. */}
+      <a className={className === 'money' ? undefined : 'btn'} href={ONBOARDING_HREF}>{mode === 'testnet' ? 'Get test USDC' : 'Add funds'}</a>
     </span>
   );
 }

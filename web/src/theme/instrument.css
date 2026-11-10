@@ -31,7 +31,7 @@
 .say b { font-weight: 400; color: var(--chalk); }
 .say-row { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--s-7); }
 .say-row .say { flex: 1 1 0; min-width: 0; }
-.say-row .act { flex: none; margin-top: 26px; display: flex; align-items: center; gap: var(--s-5); }
+.say-row .act { flex: none; margin-top: 26px; display: flex; align-items: center; gap: var(--s-2); }
 
 /* ---------- panels on the grid ---------- */
 .pg { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); column-gap: var(--s-6); row-gap: 60px; padding: 68px var(--gutter) 96px; }

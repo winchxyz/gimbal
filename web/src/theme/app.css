@@ -21,12 +21,17 @@ h1, h2, h3, h4, p { margin: 0; font-weight: 400; }
 .dot::before { content: ''; display: inline-block; width: 7px; height: 7px; border-radius: var(--r-dot); background: var(--dot, var(--accent)); margin-right: 9px; vertical-align: 1px; }
 
 /* Buttons: words, not boxes (brand book C). A confirm is the one filled pill on a view. */
-.btn { white-space: nowrap; display: inline-flex; align-items: center; justify-content: center; min-height: 36px; padding: 0; font: var(--t-btn); color: var(--ink); background: none; border: 0; transition: opacity var(--dur) var(--ease), color var(--dur) var(--ease); }
-.btn + .btn { margin-left: var(--s-5); }
-.btn:hover { opacity: .8; }
-.btn:disabled { color: var(--ink-3); cursor: default; opacity: 1; }
-.btn.primary { background: var(--ink); color: var(--bg); padding: 0 var(--s-4); border-radius: var(--r-btn); }
-.btn.quiet { color: var(--ink-2); font-weight: 400; }
+/* A button always has a shape, so it never reads as a line of text: an outline for an action, a fill for the one
+   that commits, a faint outline for the way out. */
+.btn { white-space: nowrap; display: inline-flex; align-items: center; justify-content: center; min-height: 36px; padding: 0 var(--s-4); font: var(--t-btn); color: var(--ink); background: none; border: 1px solid var(--pewter); border-radius: var(--r-btn); cursor: pointer; transition: border-color var(--dur) var(--ease), background-color var(--dur) var(--ease), color var(--dur) var(--ease); }
+.btn + .btn { margin-left: var(--s-2); }
+.btn:hover { border-color: var(--ink); background: var(--sel); }
+.btn:disabled, .btn[aria-disabled='true'] { color: var(--ink-3); border-color: var(--rule); background: none; cursor: default; }
+.btn.primary { background: var(--ink); border-color: var(--ink); color: var(--bg); }
+.btn.primary:hover { background: var(--silver); border-color: var(--silver); }
+.btn.primary:disabled { background: var(--sel); border-color: var(--sel); color: var(--ink-3); }
+.btn.quiet { color: var(--ink-2); font-weight: 400; border-color: var(--rule); }
+.btn.quiet:hover { color: var(--ink); border-color: var(--pewter); background: none; }
 
 /* the chevron after "Details", "Journal", "Markets" */
 .chev { display: inline-block; width: 7px; height: 7px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(45deg); margin: 0 2px 3px 8px; transition: transform var(--dur) var(--ease); }
@@ -93,7 +98,7 @@ h1, h2, h3, h4, p { margin: 0; font-weight: 400; }
 .toast b { color: var(--watch); font-weight: 600; flex: none; }
 .toast span { color: var(--ink); flex: 1; min-width: 0; }
 .toast.ok b { color: var(--ink); }
-.toast .btn { min-height: 0; flex: none; }
+.toast .btn { min-height: 28px; padding: 0 var(--s-3); font-size: 13px; flex: none; }
 
 /* the tab bar is the phone's navigation */
 .tabs { display: none; }

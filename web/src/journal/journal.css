@@ -10,7 +10,7 @@
 .top.j-top { padding-bottom: 0; }
 .j-top .answer { max-width: 15em; }
 .j-sub { margin-top: var(--s-4); font: var(--t-note); color: var(--silver); }
-.j-sub .btn { min-height: 0; margin-left: var(--s-3); font: var(--t-s); color: var(--ink); }
+.j-sub .btn { min-height: 26px; padding: 0 var(--s-3); margin-left: var(--s-3); font: var(--t-s); color: var(--ink); vertical-align: middle; }
 .j-sub .btn:disabled { color: var(--ink-3); }
 .j-partial { margin-top: var(--s-3); font: var(--t-s); color: var(--ink-2); }
 

@@ -86,7 +86,7 @@
 .w-cta + .w-cta { margin-top: 18px; }
 .w-cta .ink { color: var(--chalk); }
 .w-cta .end { margin-left: auto; display: flex; gap: var(--s-2); flex: none; }
-.w-cta .btn.quiet { white-space: normal; text-align: right; height: auto; min-height: 36px; }
+.w-cta .btn.quiet { white-space: normal; text-align: center; height: auto; min-height: 36px; padding-top: 6px; padding-bottom: 6px; }
 .w-chk { list-style: none; margin: 0; padding: 0; }
 .w-chk li { display: grid; grid-template-columns: 22px minmax(0, 1fr); column-gap: var(--s-2); padding: 11px 0; border-top: 1px solid var(--rule); font: 400 14px/1.5 var(--font); color: var(--silver); }
 .w-chk li:first-child { border-top: 0; padding-top: 0; }

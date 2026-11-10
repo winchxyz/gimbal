@@ -10,7 +10,7 @@
 .ob-hdr .right .btn.quiet { height: 28px; }
 
 .btn.big { height: 48px; border-radius: 24px; padding: 0 var(--s-5); font-size: 15px; }
-.btn:disabled, .btn[aria-disabled='true'] { color: var(--ink-3); border-color: var(--line-2); cursor: default; pointer-events: none; }
+.btn:disabled, .btn[aria-disabled='true'] { color: var(--ink-3); border-color: var(--rule); cursor: default; pointer-events: none; }
 .btn.primary:disabled { background: var(--sel); }
 .btn[aria-pressed='true']:not(.primary):not(.quiet) { background: var(--sel); border-color: var(--ink-2); }
 .btn[aria-busy='true'] { cursor: progress; }
