@@ -86,10 +86,11 @@ export function marketsAnswer(windows: readonly FundingWindow[], minimum: number
     }
     return { lead: 'No market is open to the desk right now.', rate: null, tone: null, rest: '' };
   }
+  // A loss is said as a loss before anything else: the rate is printed without its sign, so the verb has to carry it.
+  if (top.netAprPct < 0) return { lead: `Every market costs more than it pays. ${top.symbol} loses least: `, rate: ratePct(top.netAprPct), tone: 'down', rest: ' a year.' };
   if (minimum !== null && top.netAprPct < minimum) {
     return { lead: `None pays your ${Number.isInteger(minimum) ? `${minimum}%` : ratePct(minimum)} minimum. The best, ${top.symbol}, pays `, rate: ratePct(top.netAprPct), tone: rateTone(top.netAprPct), rest: ' a year.' };
   }
-  if (top.netAprPct < 0) return { lead: `Every market costs more than it pays; ${top.symbol} loses least, `, rate: ratePct(top.netAprPct), tone: 'down', rest: ' a year.' };
   // A pair held (brand book C, Markets): the sentence is about what comes next to it.
   const held = windows.find((w) => w.held !== null) ?? null;
   if (held !== null) {

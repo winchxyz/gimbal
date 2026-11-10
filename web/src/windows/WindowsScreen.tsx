@@ -8,6 +8,7 @@ import { loadAlerts, reached, saveAlerts, toggleAlert, type Alert } from './aler
 import { Detail, Gone } from './Detail.tsx';
 import { depth, pct } from './format.ts';
 import { deskMissing, failedScan, heldWindow } from './model.ts';
+import { Sentences } from '../ui/Sentences.tsx';
 import { marketsAnswer, marketsText } from './markets.ts';
 import { hashForView, MARKETS_VIEWS, usePhone, useWindowRoute, type MarketsView } from './route.ts';
 import { kept } from './kept.ts';
@@ -158,6 +159,7 @@ function Scanner({ all, scan, strategy, strategyError, view, alerts, onClearAler
   const summary = scanSummary(scan, rows, minimum);
   const answer = marketsAnswer(all, minimum);
   const held = heldWindow(all);
+  const symbols = useMemo(() => [...new Set(all.map((w) => w.symbol))], [all]);
 
   /** A click on an asset or a venue: the pairs it is in, over every venue. */
   const pick = (query: string) => {
@@ -185,9 +187,7 @@ function Scanner({ all, scan, strategy, strategyError, view, alerts, onClearAler
     <>
       <div className="top sc-top">
         <h1 className={cx('answer', sentence.length > 54 && 'long')} data-testid="markets-answer">
-          {answer.lead}
-          {answer.rate === null ? null : <span className={answer.tone ?? undefined}>{answer.rate}</span>}
-          {answer.rest}
+          <Sentences parts={[answer.lead, answer.rate === null ? null : { text: answer.rate, tone: answer.tone }, answer.rest]} symbols={symbols} />
         </h1>
         {/* The phone has no room for the readings above the list: it says the scan in one line, and the counts are on the views. */}
         <p className="sc-sum">{scanLine(summary, minimum)}</p>

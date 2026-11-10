@@ -5,6 +5,7 @@ import { useStream } from '../stream/hub.ts';
 import { Flash } from '../ui/Flash.tsx';
 import { Readings, type Reading } from '../ui/Panel.tsx';
 import { cx } from '../ui/cx.ts';
+import { Sentences } from '../ui/Sentences.tsx';
 import { SCROLLER, takeFocus } from '../ui/scroller.ts';
 import { useNow } from '../ui/useNow.ts';
 import { dayMonth } from '../windows/format.ts';
@@ -140,7 +141,7 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
       <section className="top j-top">
         <div>
           <h1 className={cx('answer', answerLength > 54 && 'long')} data-testid="journal-answer">
-            {headline !== null && !replay ? headline : <Flash value={counts.signed}>{journalAnswer(counts, replay)}</Flash>}
+            {headline !== null && !replay ? <Sentences parts={[headline]} /> : <Flash value={counts.signed}><Sentences parts={[journalAnswer(counts, replay)]} /></Flash>}
           </h1>
           <p className="j-sub">
             {replay ? 'Everything the replay desk did, on recorded mainnet prices.' : 'Everything the desk did, as the contract recorded it.'}
