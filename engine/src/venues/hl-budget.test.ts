@@ -258,17 +258,22 @@ async function simulate(budget: HostBudget | null, timers: VirtualTimers, o: { s
       // History (scanner.ts #loadHistory): no new batch while one is out.
       if (!batch) {
         const current = hourOf(now);
-        const todo: { leg: (typeof legs)[number]; older: boolean }[] = [];
+        // Up to 4 a batch; the desk legs' weeks before get at least 2 of them while due.
+        type Read = { leg: (typeof legs)[number]; older: boolean };
+        const weeks: Read[] = [];
+        const olders: Read[] = [];
         for (const leg of legs) {
-          if (todo.length >= 4) break;
-          if (leg.loadedHour === current || now < leg.retryAt) continue;
-          if (leg.loadedHour !== null && now - current < 60_000) continue;
-          todo.push({ leg, older: false });
+          const weekWaits = leg.loadedHour === current || now < leg.retryAt || (leg.loadedHour !== null && now - current < 60_000);
+          if (weeks.length < 4 && !weekWaits) weeks.push({ leg, older: false });
+          if (olders.length < 4 && !leg.older && leg.loadedHour !== null && now >= leg.retryAt) olders.push({ leg, older: true });
         }
-        for (const leg of legs) {
-          if (todo.length >= 4) break;
-          if (leg.older || leg.loadedHour === null || now < leg.retryAt) continue;
-          todo.push({ leg, older: true });
+        const olderTake = Math.min(olders.length, Math.max(2, 4 - weeks.length));
+        const todo: Read[] = [];
+        const w = weeks.slice(0, 4 - olderTake);
+        const o = olders.slice(0, olderTake);
+        for (let i = 0; i < Math.max(w.length, o.length); i++) {
+          if (i < w.length) todo.push(w[i]!);
+          if (i < o.length) todo.push(o[i]!);
         }
         if (todo.length > 0) {
           batch = true;

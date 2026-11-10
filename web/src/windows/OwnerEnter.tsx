@@ -2,7 +2,7 @@ import { useEffect, useSyncExternalStore } from 'react';
 import type { Window as FundingWindow } from '@gimbal/shared';
 import { createStore, stream, useStream } from '../stream/hub.ts';
 import { useManualSend } from '../ui/useManualSend.ts';
-import { enterConfirmText, enterState, entryResult, isOwnerEntryOn, OWNER_MAX_LOSS_USD, type PendingEntry } from './enter.ts';
+import { advisedText, enterConfirmText, enterState, entryResult, isOwnerEntryOn, OWNER_MAX_LOSS_USD, type PendingEntry } from './enter.ts';
 import { venueName } from './format.ts';
 import type { ManualAction } from './manual.ts';
 
@@ -41,8 +41,12 @@ export function OwnerEnter({ w, windows, legUsd, auto }: Props) {
   const journal = useStream((s) => s.journal);
   const entry = useSyncExternalStore(started.subscribe, started.getState);
   const state = enterState(w, windows, auto, acting);
+  // Advised against by the NEAR AI risk check: still the owner's to enter, sent as their own decision (manual mode).
+  const advised = state.kind === 'advised' ? state.reasons : null;
   const action: ManualAction | null =
-    state.kind === 'open' ? { kind: 'enter', symbol: w.symbol, windowId: w.id, maxLossUsd: OWNER_MAX_LOSS_USD } : null;
+    state.kind === 'open' ? { kind: 'enter', symbol: w.symbol, windowId: w.id, maxLossUsd: OWNER_MAX_LOSS_USD }
+      : advised !== null ? { kind: 'enter', symbol: w.symbol, windowId: w.id, maxLossUsd: OWNER_MAX_LOSS_USD, ownerDecides: true }
+        : null;
   const send = useManualSend(action, (outcome) => {
     // Not taken (refused, still running, no answer): there is no act of this send to wait for.
     if (outcome.tone !== 'sent' && started.getState()?.windowId === w.id) started.dispatch({ kind: 'clear' });
@@ -70,10 +74,10 @@ export function OwnerEnter({ w, windows, legUsd, auto }: Props) {
   if (send.asking && action !== null) {
     return (
       <div className="w-cta" role="alertdialog" aria-label="Confirm">
-        <span className="ink">{enterConfirmText(w, venueName, legUsd)}</span>
+        <span className="ink">{enterConfirmText(w, venueName, legUsd, OWNER_MAX_LOSS_USD, advised)}</span>
         <span className="end">
           <button type="button" className="btn quiet" onClick={send.cancel}>Cancel</button>
-          <button type="button" className="btn primary" onClick={confirm}>Enter {w.symbol}</button>
+          <button type="button" className="btn primary" onClick={confirm}>{advised === null ? `Enter ${w.symbol}` : `Enter ${w.symbol} anyway`}</button>
         </span>
       </div>
     );
@@ -84,7 +88,8 @@ export function OwnerEnter({ w, windows, legUsd, auto }: Props) {
     send.ask();
   };
   // This window's own entry says how it is going; the "still running" reason would only repeat it.
-  const reason = state.kind === 'blocked' && !(running && actingOnMine) ? state.reason : null;
+  const reason = state.kind === 'blocked' && !(running && actingOnMine) ? state.reason
+    : advised !== null ? `${advisedText(advised)} On your own entry it advises: you decide.` : null;
   const outcome = send.outcome !== null && !(result !== null && send.outcome.tone === 'sent') ? send.outcome : null;
 
   return (
@@ -108,7 +113,7 @@ export function OwnerEnter({ w, windows, legUsd, auto }: Props) {
       {state.kind === 'none' ? null : (
         <span className="end">
           <button type="button" className="btn" disabled={state.kind === 'blocked' || send.sending} onClick={ask}>
-            Enter {w.symbol}
+            {advised === null ? `Enter ${w.symbol}` : 'Enter anyway'}
           </button>
         </span>
       )}

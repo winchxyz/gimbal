@@ -8,6 +8,8 @@ import { ReplayMissError, VirtualClock } from '../venues/replay.ts';
 import type { Book, MarketFunding, MarketFundingPoint, VenueReader, WatchReader } from '../venues/venue.ts';
 import { DEFAULT_SCANNER_CONFIG, DEFAULT_STRATEGY } from './config.ts';
 import type { ScannerConfig } from './config.ts';
+import { ReadSkipped } from '../venues/http-budget.ts';
+import type { HistoryStore } from './history-cache.ts';
 import { HOUR_MS } from './history.ts';
 import type { OracleSource } from './price.ts';
 import { isEnterable, isEnterableButForProfit, isProfitCheck } from './price.ts';
@@ -1079,4 +1081,262 @@ test('desk windows rank by the spread expected over the hold net of the round tr
   assert.ok(at > 1, ids.join(','));
   assert.equal(s.carry('sol-orderly-hyperliquid')!.estimate.basis, null);
   assert.ok(r2.windows[at]!.netAprPct > eth.netAprPct);
+});
+
+// ---- the history cache (history-cache.ts): a restart starts with the history it held ----
+
+/** A history store in memory; `failWith` makes every write throw. */
+class MemoryHistoryStore implements HistoryStore {
+  readonly path = 'memory:history.json';
+  text: string | null = null;
+  writes = 0;
+  failWith: Error | null = null;
+
+  read(): string | null {
+    return this.text;
+  }
+
+  write(text: string): void {
+    if (this.failWith !== null) throw this.failWith;
+    this.writes++;
+    this.text = text;
+  }
+}
+
+/** The DOGE desk (Hyperliquid and Phoenix with history) on `clock`, keeping its history in `store`. */
+function dogeDesk(clock: VirtualClock, store: HistoryStore | null) {
+  const hl = new HistoryVenue('hyperliquid', [DOGE_HL], () => 0.000026);
+  const phoenix = new HistoryVenue('phoenix', [DOGE_PH], () => 0.0000125);
+  const { scanner: s, notes } = scanner({ venues: [hl, phoenix] }, clock, { policy: DOGE_POLICY, ...TEN_DAYS }, { strategy: () => LEG_20_ANY, oracle: dogeOracle(clock), historyStore: store });
+  return { hl, phoenix, s, notes };
+}
+
+/** A cache written by a scanner that loaded both weeks of DOGE on both venues in the hour starting CURRENT. */
+async function fullCache(): Promise<{ store: MemoryHistoryStore; d7: number | null; d14: number | null }> {
+  const store = new MemoryHistoryStore();
+  const clock = new VirtualClock(T0);
+  const { s } = dogeDesk(clock, store);
+  for (const t of [0, 5_000]) {
+    clock.set(T0 + t);
+    await s.scan();
+    await s.idle();
+  }
+  clock.set(T0 + 10_000);
+  const r = await s.scan();
+  s.flushHistory();
+  const w = byId(r.windows, 'doge-phoenix-hyperliquid')!;
+  return { store, d7: w.grossApr7dPct, d14: s.carry(w.id)!.estimate.gross.d14AprPct };
+}
+
+const cacheJson = (store: MemoryHistoryStore) => JSON.parse(store.text!) as { version: number; savedAt: number; legs: { key: string; loadedHour: number; olderDone: boolean; from: number; rates: (number | null)[] }[] };
+
+test('history cache: written debounced after reads land; a restart in the same hour shows the 7 and 14 days at once and reads no history', async () => {
+  const store = new MemoryHistoryStore();
+  const clock = new VirtualClock(T0);
+  const first = dogeDesk(clock, store);
+  await first.s.scan();
+  // The reads answer after the scan: nothing to write yet.
+  assert.equal(store.writes, 0);
+  await first.s.idle();
+  clock.set(T0 + 5_000);
+  await first.s.scan();
+  assert.equal(store.writes, 1, 'the weeks, once they are in');
+  await first.s.idle();
+  clock.set(T0 + 10_000);
+  const r1 = await first.s.scan();
+  assert.equal(store.writes, 1, 'not again within 30 s');
+  clock.set(T0 + 35_000);
+  await first.s.scan();
+  assert.equal(store.writes, 2, 'the weeks before, 30 s on');
+  clock.set(T0 + 70_000);
+  await first.s.scan();
+  assert.equal(store.writes, 2, 'nothing new read: not written');
+  const w1 = byId(r1.windows, 'doge-phoenix-hyperliquid')!;
+  assert.equal(w1.grossApr7dPct, 11.826);
+  assert.equal(first.s.carry(w1.id)!.estimate.gross.d14AprPct, 11.826);
+  const file = cacheJson(store);
+  assert.equal(file.version, 1);
+  assert.deepEqual(file.legs.map((l) => [l.key, l.loadedHour, l.olderDone]).sort(), [['hyperliquid|DOGE', CURRENT, true], ['phoenix|DOGE', CURRENT, true]]);
+  for (const l of file.legs) {
+    assert.ok(l.from <= CURRENT - 344 * HOUR_MS, new Date(l.from).toISOString());
+    assert.equal(l.from + (l.rates.length - 1) * HOUR_MS, CURRENT - HOUR_MS, 'up to the hour before the read');
+    assert.ok(l.rates.every((r) => typeof r === 'number'));
+  }
+
+  // The restart, in the same hour: the cache gives both legs' two weeks.
+  clock.set(T0 + 20 * 60_000);
+  const second = dogeDesk(clock, store);
+  assert.deepEqual(second.s.restoreHistory(), { path: store.path, legs: 2, dropped: 0, problem: null });
+  const r2 = await second.s.scan();
+  assert.equal(r2.notes.historyReads, 0);
+  await second.s.idle();
+  assert.deepEqual([second.hl.historyCalls, second.phoenix.historyCalls], [[], []]);
+  const w2 = byId(r2.windows, 'doge-phoenix-hyperliquid')!;
+  assert.equal(w2.grossApr7dPct, 11.826);
+  const e = second.s.carry(w2.id)!.estimate;
+  assert.equal(e.state, 'known');
+  assert.equal(e.gross.d14AprPct, 11.826);
+  assert.equal(isEnterable(w2), true);
+  // Still no reads for the rest of the hour; the next hour's week is read as ever (and the week before never again).
+  clock.set(T0 + 25 * 60_000);
+  assert.equal((await second.s.scan()).notes.historyReads, 0);
+  clock.set(CURRENT + HOUR_MS + 61_000);
+  assert.equal((await second.s.scan()).notes.historyReads, 2);
+  await second.s.idle();
+  const start = CURRENT + HOUR_MS - 176 * HOUR_MS;
+  assert.deepEqual([second.hl.historyCalls, second.phoenix.historyCalls], [[['DOGE', start, CURRENT + 2 * HOUR_MS - 1]], [['DOGE', start, CURRENT + 2 * HOUR_MS - 1]]]);
+});
+
+test('history cache: a partial cache reads only what it lacks; hours past the cache come with the hourly week read', async () => {
+  const { store, d7, d14 } = await fullCache();
+  const full = store.text!;
+
+  // Phoenix's leg is not in the cache: its week and then its week before are read, Hyperliquid's never.
+  const file = cacheJson(store);
+  store.text = JSON.stringify({ ...file, legs: file.legs.filter((l) => l.key !== 'phoenix|DOGE') });
+  const clock = new VirtualClock(T0 + 20 * 60_000);
+  const partial = dogeDesk(clock, store);
+  const r1 = await partial.s.scan();
+  assert.equal(r1.notes.historyReads, 1);
+  await partial.s.idle();
+  assert.deepEqual(partial.phoenix.historyCalls, [['DOGE', CURRENT - 176 * HOUR_MS, CURRENT + HOUR_MS - 1]]);
+  clock.set(T0 + 20 * 60_000 + 5_000);
+  assert.equal((await partial.s.scan()).notes.historyReads, 1);
+  await partial.s.idle();
+  assert.deepEqual(partial.phoenix.historyCalls[1], ['DOGE', CURRENT - 344 * HOUR_MS, CURRENT - 168 * HOUR_MS]);
+  clock.set(T0 + 20 * 60_000 + 10_000);
+  const r3 = await partial.s.scan();
+  assert.equal(r3.notes.historyReads, 0);
+  assert.deepEqual(partial.hl.historyCalls, []);
+  const w3 = byId(r3.windows, 'doge-phoenix-hyperliquid')!;
+  assert.deepEqual([w3.grossApr7dPct, partial.s.carry(w3.id)!.estimate.gross.d14AprPct], [d7, d14]);
+
+  // A restart three hours on: the cache lacks the last three hours. The 7 and 14 days stand on the first scan (over
+  // 90 % of their hours are in); the hourly week read brings the rest, and the weeks before are not read again.
+  store.text = full;
+  const later = new VirtualClock(CURRENT + 3 * HOUR_MS + 61_000);
+  const restarted = dogeDesk(later, store);
+  const r = await restarted.s.scan();
+  const w = byId(r.windows, 'doge-phoenix-hyperliquid')!;
+  assert.equal(w.grossApr7dPct, 11.826);
+  assert.equal(restarted.s.carry(w.id)!.estimate.gross.d14AprPct, 11.826);
+  assert.equal(r.notes.historyReads, 2);
+  await restarted.s.idle();
+  const start = CURRENT + 3 * HOUR_MS - 176 * HOUR_MS;
+  assert.deepEqual([restarted.hl.historyCalls, restarted.phoenix.historyCalls], [[['DOGE', start, CURRENT + 4 * HOUR_MS - 1]], [['DOGE', start, CURRENT + 4 * HOUR_MS - 1]]]);
+  later.set(CURRENT + 3 * HOUR_MS + 66_000);
+  assert.equal((await restarted.s.scan()).notes.historyReads, 0);
+});
+
+test('history cache: a corrupt file, another version, a hole or a file from the future are ignored, read as without a cache', async () => {
+  const { store } = await fullCache();
+  const good = cacheJson(store);
+  const cold = async (text: string) => {
+    store.text = text;
+    const clock = new VirtualClock(T0 + 20 * 60_000);
+    const desk = dogeDesk(clock, store);
+    const restore = desk.s.restoreHistory();
+    const r = await desk.s.scan();
+    await desk.s.idle();
+    return { restore, r, desk };
+  };
+  const asToday = (x: Awaited<ReturnType<typeof cold>>) => {
+    assert.equal(x.r.notes.historyReads, 2);
+    // Before its history is in, the pair is listed in the direction this hour pays, with no 7-day figure.
+    assert.equal(byId(x.r.windows, 'doge-hyperliquid-phoenix')!.grossApr7dPct, null);
+    assert.equal(x.desk.hl.historyCalls.length + x.desk.phoenix.historyCalls.length, 2);
+  };
+
+  const corrupt = await cold(`${JSON.stringify(good).slice(0, 200)}`);
+  assert.match(corrupt.restore.problem!, /^not JSON/);
+  assert.equal(corrupt.restore.legs, 0);
+  asToday(corrupt);
+
+  const v2 = await cold(JSON.stringify({ ...good, version: 2 }));
+  assert.equal(v2.restore.problem, 'version 2, expected 1');
+  asToday(v2);
+
+  const future = await cold(JSON.stringify({ ...good, savedAt: T0 + 3_600_000 }));
+  assert.match(future.restore.problem!, /^saved in the future/);
+  asToday(future);
+
+  // A hole in each leg (an hour the venue booked nothing for), a rate that is not finite, an hour not on the hour.
+  const bad = (i: number, l: (typeof good.legs)[number]) => (i === 0
+    ? { ...l, rates: l.rates.map((r, j) => (j === 100 ? null : r)) }
+    : { ...l, from: l.from + 1 });
+  const holes = await cold(JSON.stringify({ ...good, legs: good.legs.map((l, i) => bad(i, l)) }));
+  assert.deepEqual([holes.restore.legs, holes.restore.dropped, holes.restore.problem], [0, 2, null]);
+  asToday(holes);
+
+  // An unreadable store: started without, said why.
+  store.text = null;
+  const broken = dogeDesk(new VirtualClock(T0), { path: 'x', read: () => { throw new Error('EACCES'); }, write: () => {} });
+  assert.deepEqual(broken.s.restoreHistory(), { path: 'x', legs: 0, dropped: 0, problem: 'not read (EACCES)' });
+});
+
+test('history cache: one older than 14 days is ignored; a failed write is noted once and never stops a scan', async () => {
+  const { store } = await fullCache();
+  const clock = new VirtualClock(T0 + 15 * 24 * HOUR_MS);
+  const desk = dogeDesk(clock, store);
+  assert.deepEqual(desk.s.restoreHistory(), { path: store.path, legs: 0, dropped: 2, problem: null });
+  const r = await desk.s.scan();
+  assert.equal(r.notes.historyReads, 2);
+  await desk.s.idle();
+
+  store.failWith = new Error('ENOSPC');
+  for (const t of [5_000, 40_000, 80_000]) {
+    clock.set(T0 + 15 * 24 * HOUR_MS + t);
+    await desk.s.scan();
+    await desk.s.idle();
+  }
+  const failed = desk.notes.filter((n) => n.startsWith('history: not saved to memory:history.json'));
+  assert.deepEqual(failed, ['history: not saved to memory:history.json, kept in memory, tried again in 30 s (ENOSPC)']);
+  store.failWith = null;
+  clock.set(T0 + 15 * 24 * HOUR_MS + 120_000);
+  await desk.s.scan();
+  assert.equal(cacheJson(store).savedAt, T0 + 15 * 24 * HOUR_MS + 120_000);
+});
+
+test('the week before of the desk legs is read while watch-only weeks keep being skipped by the budget', async () => {
+  // 100 watch-only legs whose week reads the budget never sends: before, they filled every batch (the older reads got
+  // only what was left), so no desk pair had its 14 days until each of them had been tried.
+  const symbols = Array.from({ length: 50 }, (_, i) => `W${i}`);
+  const skippedWeeks: string[] = [];
+  const watchVenue = (id: string, rate: number) => Object.assign(watch(id, 'dex', symbols.map((s) => row(id as 'pacifica', s, { ratePerHour: rate }))), {
+    marketFundingHistory: async (symbol: string): Promise<MarketFundingPoint[]> => {
+      skippedWeeks.push(`${id} ${symbol}`);
+      throw new ReadSkipped(`${id}.example`, 'history', 'budget', null, clock.now());
+    },
+  });
+  const hl = new HistoryVenue('hyperliquid', [DOGE_HL], () => 0.000026);
+  const phoenix = new HistoryVenue('phoenix', [DOGE_PH], () => 0.0000125);
+  const clock = new VirtualClock(T0);
+  const { scanner: s } = scanner({ venues: [hl, phoenix], watch: [watchVenue('pacifica', 0.0001), watchVenue('lighter', 0.00002)] }, clock,
+    { policy: DOGE_POLICY, ...TEN_DAYS }, { strategy: () => LEG_20_ANY, oracle: dogeOracle(clock) });
+  const r1 = await s.scan();
+  // The desk legs' weeks first, then watch-only weeks.
+  assert.equal(r1.notes.historyReads, 4);
+  await s.idle();
+  assert.deepEqual([hl.historyCalls.length, phoenix.historyCalls.length, skippedWeeks.length], [1, 1, 2]);
+
+  clock.set(T0 + 5_000);
+  const r2 = await s.scan();
+  assert.equal(r2.notes.historyReads, 4);
+  await s.idle();
+  // Half the batch: the desk legs' weeks before, best net first; the other half still goes to watch-only weeks.
+  assert.deepEqual([hl.historyCalls[1], phoenix.historyCalls[1]], [
+    ['DOGE', CURRENT - 344 * HOUR_MS, CURRENT - 168 * HOUR_MS], ['DOGE', CURRENT - 344 * HOUR_MS, CURRENT - 168 * HOUR_MS],
+  ]);
+  assert.equal(skippedWeeks.length, 4);
+
+  clock.set(T0 + 10_000);
+  const r3 = await s.scan();
+  // Watch-only weeks are still due (and skipped), and the desk pair has its 14 days.
+  assert.equal(r3.notes.historyReads, 4);
+  const w = byId(r3.windows, 'doge-phoenix-hyperliquid')!;
+  assert.equal(s.carry(w.id)!.estimate.state, 'known');
+  assert.equal(s.carry(w.id)!.estimate.gross.d14AprPct, 11.826);
+  assert.equal(isEnterable(w), true);
+  await s.idle();
+  assert.equal(skippedWeeks.length, 8);
 });

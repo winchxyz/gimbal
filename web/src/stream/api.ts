@@ -13,6 +13,8 @@ export type ActionResult = { ok: true } | { ok: false; reason: string };
 /** `POST /rotate`'s `demo` (engine/src/strategy/loop.ts parseDemo): the most the entry's round trip may cost, USD. */
 export interface DemoEntry {
   maxLossUsd: number;
+  /** Manual mode: the NEAR AI risk check advises on this entry and the owner decides (its refusal does not stop it). */
+  ownerDecides?: true;
 }
 
 export interface EngineApi {

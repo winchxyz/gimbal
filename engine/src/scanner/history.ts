@@ -55,6 +55,33 @@ export class RateStore {
     for (const p of points) for (const h of hoursCovered(p)) leg.booked.set(h, p.ratePerHour);
   }
 
+  /**
+   * Booked rates from a history cache (history-cache.ts): `rates[i]` is the rate of the hour starting at
+   * `from + i` hours. The caller has checked the hours.
+   */
+  restoreBooked(key: string, from: number, rates: readonly number[]): void {
+    const leg = this.#leg(key);
+    rates.forEach((r, i) => leg.booked.set(from + i * HOUR_MS, r));
+  }
+
+  /**
+   * A leg's booked hours from its first to its last, for the history cache: `rates[i]` is the hour starting at
+   * `from + i` hours, null where the venue booked nothing. Null when it has none.
+   */
+  bookedRun(key: string): { from: number; rates: (number | null)[] } | null {
+    const booked = this.#legs.get(key)?.booked;
+    if (booked === undefined || booked.size === 0) return null;
+    let from = Infinity;
+    let to = -Infinity;
+    for (const h of booked.keys()) {
+      if (h < from) from = h;
+      if (h > to) to = h;
+    }
+    const rates: (number | null)[] = [];
+    for (let h = from; h <= to; h += HOUR_MS) rates.push(booked.get(h) ?? null);
+    return { from, rates };
+  }
+
   rate(key: string, hour: number): number | null {
     const leg = this.#legs.get(key);
     if (leg === undefined) return null;

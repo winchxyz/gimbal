@@ -1844,6 +1844,62 @@ test('the owner demo entry waives only the profit checks, never the NEAR AI risk
   assert.match(journal(w3).find((j) => j.kind === 'refused')!.summary, /no NEAR AI key, so the NEAR AI risk check cannot answer: held, not passed/);
 });
 
+test('manual mode (demo.ownerDecides): the NEAR AI risk check is asked and journaled, and its refusal or silence is advice; every other check still refuses', async () => {
+  const OWN = { ...DEMO, ownerDecides: true };
+  // A refusal is advice: the pair is opened, its line says the check advised against and the owner decided.
+  const refuse = counting(async () => ({ content: '{"verdict":"veto","reasons":["thin book"]}', raw: {} }));
+  const w = demoWorld({ windows: [demoWin(), win('sol-phoenix-hyperliquid')] });
+  const loop = makeLoop(w, tmpStore(), { facts: demoFacts(), veto: refuse });
+  await loop.check();
+  assert.deepEqual(loop.rotate(DEMO_ID, OWN), { ok: true });
+  await loop.idle(1000);
+  assert.equal(refuse.calls, 1, 'the check is still asked');
+  assert.equal(w.opens.length, 1, 'and the owner decides');
+  assert.equal(journal(w).find((j) => j.kind === 'veto'), undefined, 'no "not entered" line');
+  const opened = journal(w).find((j) => j.kind === 'enter')!;
+  assert.match(opened.summary, /the NEAR AI risk check advises, the owner decides/);
+  assert.match(opened.summary, /NEAR AI risk check refused .*thin book; advice only on an owner entry: the owner decided to go ahead/);
+  assert.equal(opened.numbers.ownerDecides, 1);
+  assert.equal(opened.numbers.advisedAgainst, 1);
+  assert.equal(opened.numbers.riskCheckOutcome, 'refused');
+
+  // The refusal it left on the window does not stop the owner asking again; without the flag it still does.
+  const again = demoWorld({ windows: [{ ...demoWin(), veto: { verdict: 'veto' as const, reasons: ['thin book'], model: 'test-model', at: 1 } }] });
+  const loopAgain = makeLoop(again, tmpStore(), { facts: demoFacts(), veto: refuse });
+  await loopAgain.check();
+  assert.match(loopAgain.rotateRefusal(DEMO_ID, DEMO) ?? '', /was refused by the NEAR AI risk check/);
+  assert.equal(loopAgain.rotateRefusal(DEMO_ID, OWN), null);
+
+  // No answer is advice too: the entry goes on.
+  const silent = counting(() => new Promise(() => {}));
+  const w2 = demoWorld({ windows: [demoWin(), win('sol-phoenix-hyperliquid')] });
+  const loop2 = makeLoop(w2, tmpStore(), { facts: demoFacts(), veto: silent });
+  await loop2.check();
+  assert.deepEqual(loop2.rotate(DEMO_ID, OWN), { ok: true });
+  await loop2.idle(2000);
+  assert.equal(w2.opens.length, 1);
+  assert.match(journal(w2).find((j) => j.kind === 'enter')!.summary, /did not answer .*advice only on an owner entry: the owner decided to go ahead/);
+
+  // A pass reads as a pass: nothing says "advised against".
+  const pass = counting(async () => ({ content: '{"verdict":"pass","reasons":[]}', raw: {} }));
+  const w3 = demoWorld({ windows: [demoWin()] });
+  const loop3 = makeLoop(w3, tmpStore(), { facts: demoFacts(), veto: pass });
+  await loop3.check();
+  assert.deepEqual(loop3.rotate(DEMO_ID, OWN), { ok: true });
+  await loop3.idle(1000);
+  const passed = journal(w3).find((j) => j.kind === 'enter')!;
+  assert.equal(passed.numbers.ownerDecides, 1);
+  assert.equal(passed.numbers.advisedAgainst, undefined);
+  assert.doesNotMatch(passed.summary, /advice only/);
+
+  // Only `true` is taken, and the flag waives nothing else: a stale window is refused all the same.
+  assert.match((loop3.rotate(DEMO_ID, { ...DEMO, ownerDecides: false }) as { reason: string }).reason, /ownerDecides false is not true/);
+  const stale = demoWorld({ windows: [{ ...demoWin(), stale: true }] });
+  const loopStale = makeLoop(stale, tmpStore(), { facts: demoFacts(), veto: pass });
+  await loopStale.check();
+  assert.match(loopStale.rotateRefusal(DEMO_ID, OWN) ?? '', /is stale/);
+});
+
 test('exits never wait on NEAR AI: a counted exit, a stop, POST /close and the one-leg close never ask it, with no key or a silent one', async () => {
   for (const veto of [NO_VETO_SOURCE, counting(() => new Promise(() => {}))]) {
     const asked = () => ('calls' in veto ? (veto as { calls: number }).calls : 0);
