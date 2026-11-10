@@ -115,7 +115,7 @@ function waitingSentence({ minNetAprPct, bestNetAprPct, auto }: StatusContext): 
   if (auto === false) return 'No position is open. Auto is off, so the desk only watches.';
   const belowMinimum = bestNetAprPct === null || bestNetAprPct === undefined || bestNetAprPct < (minNetAprPct ?? 0);
   if (typeof minNetAprPct === 'number' && minNetAprPct > 0 && belowMinimum) {
-    return `No window clears your ${Number.isInteger(minNetAprPct) ? minNetAprPct : minNetAprPct.toFixed(1)}% minimum right now.`;
+    return `No market pays your ${Number.isInteger(minNetAprPct) ? minNetAprPct : minNetAprPct.toFixed(1)}% minimum right now.`;
   }
   return 'No position is open.';
 }

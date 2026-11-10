@@ -140,17 +140,17 @@ interface Part { text: string; mapped: boolean }
 function flat(line: string, ctx: WaitContext): Part | null {
   let m: RegExpMatchArray | null;
   if (/^no desk window in this scan$/i.test(line)) {
-    return { text: 'None of the windows in the last scan is one the desk can trade.', mapped: true };
+    return { text: 'None of the markets in the last scan is one the desk can trade.', mapped: true };
   }
 
   if ((m = line.match(new RegExp(`^no window clears the entry rules; best (\\S+) (${PCT}) net: (.+)$`, 'is')))) {
     const [, symbol, net, rest] = m as unknown as [string, string, string, string];
     const { body, tail } = vetoTail(rest);
     const minimum = body.match(new RegExp(`^${PCT} net, under your (${PCT}) minimum$`));
-    if (minimum) return { text: `No window clears your ${minimum[1]} minimum right now. Closest: ${symbol}, ${net} net.${tail}`, mapped: true };
+    if (minimum) return { text: `No market pays your ${minimum[1]} minimum right now. Closest: ${symbol}, ${net} net.${tail}`, mapped: true };
     const head = ctx.minNetAprPct != null && Number.isFinite(ctx.minNetAprPct)
-      ? `No window clears your ${minimumText(ctx.minNetAprPct)} minimum right now.`
-      : 'No window clears your entry rules right now.';
+      ? `No market pays your ${minimumText(ctx.minNetAprPct)} minimum right now.`
+      : 'No market passes your entry rules right now.';
     const clause = gateClause(body);
     return clause === null
       ? { text: `${head} Closest: ${symbol}, ${net} net: ${body}.${tail}`, mapped: false }
@@ -202,7 +202,7 @@ function hold(raw: string): Part | null {
   let head: string | null = null;
   let s: RegExpMatchArray | null;
   if (status === 'its window is not in this scan, so nothing is decided on it') {
-    head = `Holding ${symbol}: its window is not in this scan, so the desk decides nothing on it for now.`;
+    head = `Holding ${symbol}: its market is not in this scan, so the desk decides nothing on it for now.`;
   } else if (status === 'its numbers are stale this scan, so nothing is decided on them') {
     head = `Holding ${symbol}: its numbers are out of date this scan, so the desk decides nothing on it for now.`;
   } else if ((s = status.match(new RegExp(`^(${PCT}) net of the exit, at least your (${PCT}) minimum$`)))) {
@@ -251,7 +251,7 @@ export function riskHeldCopy(raw: string): WaitCopy | null {
     ? 'It is not tried again by itself: ask again with POST /rotate.'
     : `The desk asks again at the next hourly check (${time} UTC).`;
   return {
-    text: `${head}: ${reason}${kept} ${when} This is not a refusal, so the window is not held out for ${hours} h.`,
+    text: `${head}: ${reason}${kept} ${when} This is not a refusal, so the market is not held out for ${hours} h.`,
     raw, mapped: true,
   };
 }

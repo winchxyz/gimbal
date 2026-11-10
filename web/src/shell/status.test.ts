@@ -101,9 +101,9 @@ test('Level adds that funding comes in on both sides only when both legs have ea
 test('Waiting says why when it is told the minimum, the best window and Auto', () => {
   const idle = desk({ legs: [] });
   assert.equal(statusOf(idle).sentence, 'No position is open.');
-  assert.equal(statusOf(idle, { minNetAprPct: 5, bestNetAprPct: 2.1 }).sentence, 'No window clears your 5% minimum right now.');
-  assert.equal(statusOf(idle, { minNetAprPct: 5, bestNetAprPct: null }).sentence, 'No window clears your 5% minimum right now.');
-  assert.equal(statusOf(idle, { minNetAprPct: 5.5, bestNetAprPct: 1 }).sentence, 'No window clears your 5.5% minimum right now.');
+  assert.equal(statusOf(idle, { minNetAprPct: 5, bestNetAprPct: 2.1 }).sentence, 'No market pays your 5% minimum right now.');
+  assert.equal(statusOf(idle, { minNetAprPct: 5, bestNetAprPct: null }).sentence, 'No market pays your 5% minimum right now.');
+  assert.equal(statusOf(idle, { minNetAprPct: 5.5, bestNetAprPct: 1 }).sentence, 'No market pays your 5.5% minimum right now.');
   // a window clears the minimum but nothing is open: the line does not claim otherwise
   assert.equal(statusOf(idle, { minNetAprPct: 5, bestNetAprPct: 8 }).sentence, 'No position is open.');
   assert.equal(statusOf(idle, { minNetAprPct: 5, bestNetAprPct: 2, auto: false }).sentence, 'No position is open. Auto is off, so the desk only watches.');

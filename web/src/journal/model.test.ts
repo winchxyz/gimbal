@@ -385,8 +385,8 @@ test('the line under the net says where the held window stands against its entry
   const held = win({ symbol: 'DOGE', netAprPct: 13.8, held: { since: 0 } });
   const legs = [leg('short'), leg('long')];
   const owing = desk({ fundingUsd: 1.36, feesUsd: -1.47, priceUsd: -0.48, netUsd: -0.59 }, legs);
-  assert.match(sinceNote(owing, [held]) ?? '', /^The DOGE window paid its entry costs up front; about \d+ [dh][ \dh]* until they are earned back\.$/);
+  assert.match(sinceNote(owing, [held]) ?? '', /^The DOGE pair paid its entry costs up front; about \d+ [dh][ \dh]* until they are earned back\.$/);
   assert.match(sinceNote(owing, null) ?? '', /they are not earned back yet\.$/);
-  assert.equal(sinceNote(desk({ fundingUsd: 3, feesUsd: -1, priceUsd: 0, netUsd: 2 }, legs), [held]), 'The DOGE window’s entry costs are earned back.');
+  assert.equal(sinceNote(desk({ fundingUsd: 3, feesUsd: -1, priceUsd: 0, netUsd: 2 }, legs), [held]), 'The DOGE pair’s entry costs are earned back.');
   assert.equal(sinceNote(desk({ fundingUsd: 0, feesUsd: 0, priceUsd: 0, netUsd: 0 }, []), [held]), null);
 });

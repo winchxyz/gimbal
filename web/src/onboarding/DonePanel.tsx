@@ -10,7 +10,7 @@ export function DonePanel({ s, steps }: { s: FlowState; steps: StepView[] }) {
     <Page
       steps={steps}
       title="Your desk is ready"
-      lead="The contract holds your rules and the engine follows them. It enters a window when one clears your minimum, and rescues margin before a leg can be liquidated."
+      lead="The contract holds your rules and the engine follows them. It opens a pair when a market pays your minimum, and rescues margin before a leg can be liquidated."
       note="A change to the rules needs your signature again. This page does not reopen them yet."
       end={
         <a className="btn primary big" href={hrefOf('desk')}>

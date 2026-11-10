@@ -78,7 +78,14 @@ export interface MarketsAnswer {
 export function marketsAnswer(windows: readonly FundingWindow[], minimum: number | null): MarketsAnswer {
   const open = sortWindows(windows.filter((w) => isOpenToDesk(w) && hasHistory(w)));
   const top = open[0];
-  if (!top) return { lead: 'No market is open to the desk right now.', rate: null, tone: null, rest: '' };
+  if (!top) {
+    // Open, but too new to judge: the engine has not read its 7 days yet (a fresh listing, or the minutes after a restart).
+    const fresh = windows.filter((w) => isOpenToDesk(w) && w.tradable).length;
+    if (fresh > 0) {
+      return { lead: `${fresh === 1 ? 'One market is' : `${fresh} markets are`} open to the desk, but ${fresh === 1 ? 'its' : 'their'} 7 days of funding are not read yet.`, rate: null, tone: null, rest: '' };
+    }
+    return { lead: 'No market is open to the desk right now.', rate: null, tone: null, rest: '' };
+  }
   if (minimum !== null && top.netAprPct < minimum) {
     return { lead: `None pays your ${Number.isInteger(minimum) ? `${minimum}%` : ratePct(minimum)} minimum. The best, ${top.symbol}, pays `, rate: ratePct(top.netAprPct), tone: rateTone(top.netAprPct), rest: ' a year.' };
   }

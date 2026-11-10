@@ -51,7 +51,7 @@ test('the folded row: latest reason in plain words, since and count, and the raw
   const v = waitsView(entries);
   assert.equal(v.count, 3);
   assert.equal(v.since, 'Since 09:07, 3 checks');
-  assert.match(v.latest.text, /^No window clears your 5 % minimum right now\. Closest: BONK/);
+  assert.match(v.latest.text, /^No market pays your 5 % minimum right now\. Closest: BONK/);
   assert.equal(v.latest.raw, HANDS);
 });
 
@@ -62,5 +62,5 @@ test('a single check says no count', () => {
 test('the owner’s minimum comes from the entry; an entry without it gets the general sentence', () => {
   assert.match(waitText(wait(9, 1)).text, /your 5 % minimum/);
   const bare = entry({ kind: 'wait', summary: HANDS, numbers: {} });
-  assert.match(waitText(bare).text, /^No window clears your entry rules right now\./);
+  assert.match(waitText(bare).text, /^No market passes your entry rules right now\./);
 });

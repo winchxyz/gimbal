@@ -309,7 +309,7 @@ export function nextBest(windows: readonly FundingWindow[], strategy: StrategyCo
   const rule = !strategy
     ? ''
     : strategy.auto
-      ? ` The desk rotates when another window beats the held one by ${plain(strategy.rotate.minGainPts, 0)} points for ${strategy.rotate.forHours} hours.`
+      ? ` The desk rotates when another market beats the held one by ${plain(strategy.rotate.minGainPts, 0)} points for ${strategy.rotate.forHours} hours.`
       : ' Auto is off, so the desk does not rotate by itself.';
   let compare: string;
   if (held) {

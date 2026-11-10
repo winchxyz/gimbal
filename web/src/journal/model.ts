@@ -355,9 +355,9 @@ export function sinceNote(desk: DeskState, windows: readonly FundingWindow[] | n
   if (!symbol) return null;
   const rate = dayRate(windows ? heldWindow(windows) : null, desk.legs);
   const payback = paybackOf(desk.pnl, rate?.perDayUsd ?? null);
-  if (payback.earnedBack) return `The ${symbol} window’s entry costs are earned back.`;
-  if (payback.hoursLeft !== null) return `The ${symbol} window paid its entry costs up front; about ${hours(Math.ceil(payback.hoursLeft))} until they are earned back.`;
-  return `The ${symbol} window paid its entry costs up front; they are not earned back yet.`;
+  if (payback.earnedBack) return `The ${symbol} pair’s entry costs are earned back.`;
+  if (payback.hoursLeft !== null) return `The ${symbol} pair paid its entry costs up front; about ${hours(Math.ceil(payback.hoursLeft))} until they are earned back.`;
+  return `The ${symbol} pair paid its entry costs up front; they are not earned back yet.`;
 }
 
 /**

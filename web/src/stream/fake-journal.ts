@@ -41,7 +41,7 @@ function older(now: number, mode: Mode): JournalEntry[] {
       t: before(now, 6, 3, 40),
       kind: 'enter',
       summary: 'Opened LTC · both legs filled 0.9 s apart',
-      why: 'LTC paid the most of the windows open to the desk at the time.',
+      why: 'LTC paid the most of the markets open to the desk at the time.',
       numbers: { symbol: 'LTC', usd: -1.38 },
       tx: [near('Lt4c', 'o8Pq'), fakeTx('hyperliquid', '3c9a', 'e07f', mode), solana('5nVd', 'Rt2w')],
     },

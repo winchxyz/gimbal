@@ -41,7 +41,7 @@ test('a wait or an off line is put in plain words with the engine’s string kep
   const raw =
     'No window clears the entry rules; best BONK 14.8 % net: serve opens short hyperliquid, long phoenix only (as pair-mainnet open); bonk-orderly-hyperliquid is long orderly, short hyperliquid';
   const wait = decisionLine({ ...decision('wait'), reason: raw }, NOW, { minNetAprPct: 5 });
-  assert.match(wait?.reason ?? '', /^No window clears your 5 % minimum right now\. Closest: BONK, 14\.8 % net, but the desk can't open it/);
+  assert.match(wait?.reason ?? '', /^No market pays your 5 % minimum right now\. Closest: BONK, 14\.8 % net, but the desk can't open it/);
   assert.equal(wait?.raw, raw);
   const off = decisionLine({ ...decision('off'), reason: 'Auto is off: the engine watches and you act by hand; x' }, NOW);
   assert.equal(off?.reason, 'Auto is off, so the desk only watches and you act by hand.');
@@ -74,7 +74,7 @@ test('a decision the engine publishes as a wait because the NEAR AI risk check i
   const noKey = decisionLine(held(`enter sol-phoenix-hyperliquid not carried out: no NEAR AI key, so the NEAR AI risk check cannot answer: held, not passed: the act waits; ${tail}`), NOW)!;
   assert.equal(noKey.word, 'Waiting');
   assert.equal(noKey.reason, 'Opening sol-phoenix-hyperliquid is waiting: this engine has no NEAR AI key, so the NEAR AI risk check cannot answer. Nothing was sent. '
-    + 'The desk asks again at the next hourly check (11:01 UTC). This is not a refusal, so the window is not held out for 6 h.');
+    + 'The desk asks again at the next hourly check (11:01 UTC). This is not a refusal, so the market is not held out for 6 h.');
   const silent = decisionLine(held(`enter sol-phoenix-hyperliquid not carried out: the NEAR AI risk check did not answer (no answer within 15 s, asked 2 times): held, not passed: the act waits; ${tail}`), NOW)!;
   assert.equal(silent.word, 'Waiting');
   assert.match(silent.reason, /^Opening sol-phoenix-hyperliquid is waiting: the NEAR AI risk check did not answer, so nothing was sent\. /);
