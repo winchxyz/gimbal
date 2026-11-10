@@ -150,7 +150,26 @@ test('one scan without a desk: desk windows by net, then watch-only by gross; CE
   const { scanner: s } = scanner({ venues: [hl, phoenix, orderly], watch: watchers }, new VirtualClock(T0));
   const r = await s.scan();
   const { windows, scan, notes } = r;
-  assert.deepEqual(scan, { venues: 6, failed: [], at: T0 });
+  // Every reader with what its answer held: a row naming another venue is not counted, open interest is OI × mark.
+  const source = (id: string, kind: 'desk' | 'dex' | 'cex', markets: number, oiUsd: number | null) =>
+    ({ id, kind, markets, oiUsd, volume24hUsd: null, readAt: T0, ok: true });
+  assert.deepEqual(scan, {
+    venues: 6, failed: [], at: T0,
+    sources: [
+      source('hyperliquid', 'desk', 3, 16_500_000), source('phoenix', 'desk', 4, 46_500_000), source('orderly', 'desk', 1, 5_000_000),
+      source('pacifica', 'dex', 1, 5_000_000), source('okx', 'cex', 1, null), source('binance', 'cex', 1, null),
+    ],
+  });
+
+  // Both sides of a window as read: the gross is what the short receives minus what the long pays, a year.
+  const side = (ratePerHour: number) =>
+    ({ symbol: 'SOL', ratePerHour, apr7dPct: null, settlement: 'hourly', nextAt: Date.UTC(2026, 9, 31, 11), markPx: 100, oiUsd: 5_000_000, volume24hUsd: null, move24hPct: null, readAt: T0 });
+  const sol = byId(windows, 'sol-phoenix-hyperliquid')!;
+  assert.deepEqual(sol.legs, { long: side(0.00001), short: side(0.00005) });
+  assert.equal(sol.grossAprPct, 35.04);
+  // A leg keeps its venue's own symbol and schedule; a CEX leg without a mark or open interest says so with nulls.
+  assert.deepEqual(byId(windows, 'sol-orderly-hyperliquid')!.legs!.long, { ...side(0.00002), symbol: 'PERP_SOL_USDC', settlement: '8h', nextAt: Date.UTC(2026, 9, 31, 16) });
+  assert.deepEqual(byId(windows, 'sol-okx-pacifica')!.legs!.long, { ...side(0.00003), markPx: null, oiUsd: null });
 
   // tradable is structural: every desk pair with gross > 0, oracle price or not.
   const desk = windows.filter((w) => w.tradable);
@@ -490,10 +509,13 @@ test('history: read in the background, then the 7-day gross, intervalsAbove, the
   assert.equal(w.grossApr7dPct, 35.04);
   assert.ok(w.netAprPct >= DEFAULT_STRATEGY.minNetAprPct);
   assert.equal(w.intervalsAbove, 168);
+  // Each side's own week: the long pays 0.00001/h (8.76 % APR), the short receives 0.00005/h (43.8 %).
+  assert.deepEqual([w.legs!.long.apr7dPct, w.legs!.short.apr7dPct], [8.76, 43.8]);
   // Orderly has no history source here: its windows show null, never a 0 that ranks.
   const o = byId(r2.windows, 'sol-orderly-hyperliquid')!;
   assert.equal(o.grossApr7dPct, null);
   assert.ok(o.intervalsAbove <= 1);
+  assert.deepEqual([o.legs!.long.apr7dPct, o.legs!.short.apr7dPct], [null, 43.8]);
 
   const hist = s.history('sol-phoenix-hyperliquid')!;
   assert.equal(hist.windowId, 'sol-phoenix-hyperliquid');

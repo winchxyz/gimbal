@@ -1,98 +1,37 @@
-/* Desk, brand book C (Desk 1440 and Desk 390). Every value comes from tokens.css.
-   The sentence, the desk value, the held pair as one row that unfolds, then payback, next best and the latest lines.
-   Colour sits on a number or a word only, for its state. */
+/* Desk, in the Instrument look (theme/instrument.css): the sentence and three readings, the pair's room or the wait
+   as a measurement, then panels. Only what the Desk alone has is here. Colour sits on a number or a word, for state. */
 
-.dk { padding: 0 var(--gutter) var(--s-8); }
+.dk-gaps { margin: -30px var(--gutter) 34px; font: var(--t-s); color: var(--silver); max-width: 70ch; }
+.dk-noroom { min-height: 96px; padding: var(--s-4) 0; color: var(--silver); font: var(--t-m); }
+.dk-first { margin-top: 0; }
+.dk-first a, .dk .say a { color: var(--chalk); }
+.dk-money { font: var(--t-m); }
+.dk-money a { color: var(--chalk); }
+.dk-dec { margin-top: var(--s-4); font: var(--t-note); color: var(--silver); max-width: 62em; }
+.dk-dec span { color: var(--chalk); }
 
-/* ---------- the answer and the desk value ---------- */
-.dk-hero { padding: 72px 0 56px; }
-.dk-hero .answer { max-width: 860px; }
-.dk-v { margin-top: 40px; display: flex; align-items: baseline; flex-wrap: wrap; column-gap: 22px; row-gap: var(--s-2); }
-.dk-v .fig { font: var(--t-figure); letter-spacing: -0.025em; }
-.dk-v .fig small { font: inherit; color: var(--ink-2); }
-.dk-v p { font: var(--t-body); }
-.dk-gaps { margin-top: var(--s-3); font: var(--t-s); max-width: 70ch; }
-.dk-lead { margin-top: var(--s-5); font: var(--t-body); max-width: 60ch; }
-.dk-lead a { color: var(--ink); }
-.dk-money { display: block; margin-top: var(--s-4); font: var(--t-s); }
-.dk-money a { color: var(--ink); }
-.dk-ink { color: var(--ink); }
-.dk-none { padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+/* the legs: one column a leg, so a figure is read across both */
+.tb.dk-legs thead th { font: var(--t-cap); color: var(--chalk); }
+.tb.dk-legs thead th small { display: block; font: var(--t-note); color: var(--silver); }
+.tb.dk-legs thead th small.watch-t { color: var(--watch); }
+.tb.dk-legs td { width: 34%; }
 
-/* ---------- the held pair: one row ---------- */
-.dk-row { display: grid; grid-template-columns: 1.1fr 1.5fr 1.5fr 1.1fr auto; gap: var(--s-5); align-items: center; padding: var(--s-5) 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-.dk-row .c { min-width: 0; text-align: left; }
-.dk-row .c b { display: block; font: var(--t-l); letter-spacing: -0.01em; }
-.dk-row .c > span { display: block; font: var(--t-s); color: var(--ink-2); margin-top: 3px; }
-.dk-row .c.end { display: flex; gap: 36px; align-items: center; justify-content: flex-end; }
-.dk-row .dim b, .dk-row .dim > span { color: var(--ink-3); }
-.dk-toggle { display: block; }
-.dk-details { font: var(--t-s); min-height: 0; }
-.dk-ask { display: inline-flex; align-items: center; gap: var(--s-4); font: var(--t-s); color: var(--ink-2); white-space: normal; }
+/* Close, asked in place: the question, what happens, then the two buttons */
+.dk-ask { display: inline-flex; align-items: center; gap: var(--s-4); font: var(--t-s); color: var(--silver); white-space: normal; }
 .dk-ask .btn + .btn { margin-left: 0; }
 .dk-ask > span[role='status'] { max-width: 36ch; }
-/* Close, asked in place: the question, what happens, then the two buttons */
 .dk-confirm { display: flex; flex-direction: column; align-items: flex-start; gap: var(--s-2); max-width: 44ch; text-align: left; }
-.dk-confirm b { font: var(--t-l); color: var(--ink); font-weight: 600; }
+.dk-confirm b { font: var(--t-l); color: var(--chalk); font-weight: 600; }
 .dk-confirm .row { display: flex; gap: var(--s-4); margin-top: var(--s-2); }
-.dk-gaps a { color: var(--ink); }
 
-/* the unfold: height and opacity only */
-.dk-legs { display: grid; grid-template-columns: 1fr 1fr; column-gap: var(--s-8); padding-top: var(--s-2); overflow: hidden; max-height: 1400px; opacity: 1; transition: max-height var(--dur-sheet) var(--ease), opacity var(--dur-sheet) var(--ease); }
-.dk-legs.shut { max-height: 0; opacity: 0; padding-top: 0; }
-.dk-legs h4 { margin: 20px 0 6px; font-weight: 600; font-size: 15px; }
-.dk-legs .dk-legnotes { grid-column: 1 / -1; display: grid; gap: var(--s-2); margin-top: var(--s-4); font: var(--t-s); max-width: 90ch; }
-.dk-legs .dk-pnl { grid-column: 1; }
-.dk-flag { font: var(--t-s); margin-bottom: var(--s-2); }
-.dk-close-phone { display: none; }
+/* the conditions take as many columns as there are */
+.conds.n2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.conds.n4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 
-.dk-prow { display: none; }
-
-/* ---------- under the pair ---------- */
-.dk-lower { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s-8); padding-top: var(--s-7); }
-.dk-payback .dk-big { display: block; font: var(--t-num); letter-spacing: var(--track-num); }
-.dk-payback .bar { height: 4px; background: var(--line); margin: 14px 0 12px; position: relative; }
-.dk-payback .bar i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--ink); transition: width var(--dur) var(--ease); }
-.dk-next { margin-top: 44px; }
-.dk-facts .dk-next { margin-top: var(--s-7); }
-.dk .next { display: flex; justify-content: space-between; align-items: baseline; gap: var(--s-4); padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-.dk .next b { font: var(--t-l); letter-spacing: -0.01em; }
-.dk .next:hover b { text-decoration: underline; text-underline-offset: 4px; text-decoration-thickness: 1px; }
-.dk .hd a { color: var(--ink-2); }
-.jl { display: grid; grid-template-columns: 76px 1fr; gap: var(--s-4); padding: var(--s-3) 0; border-bottom: 1px solid var(--line); }
-.jl:first-of-type { border-top: 1px solid var(--line); }
-.jl > span:first-child { color: var(--ink-2); }
-.dk-facts .kv:first-child { border-top: 1px solid var(--line); }
-
-/* ---------- phone: the book's Desk 390 ---------- */
 @media (max-width: 1023px) {
-  .dk { padding: 0 var(--gutter) var(--s-6); }
-  .dk-hero { padding: 20px 0 0; }
-  .dk-v { margin-top: 36px; display: block; }
-  .dk-v .fig { display: block; font: 600 44px/1 var(--display); letter-spacing: -0.03em; }
-  .dk-v p { margin-top: 10px; }
-  .dk-wide { display: none; }
-  .dk-money { display: block; }
-
-  .dk-row { display: none; }
-  .dk-prow { display: block; margin-top: 44px; padding: 18px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-  .dk-prow .t { display: flex; justify-content: space-between; align-items: baseline; }
-  .dk-prow .t b { font: var(--t-l); }
-  .dk-prow .t .btn { font: var(--t-s); }
-  .dk-prow .kv { border-bottom: 0; padding: 0; margin-top: 10px; }
-  .dk-prow .kv.dim span { color: var(--ink-3); }
-
-  .dk-legs { display: block; }
-  .dk-legs h4 { margin: 18px 0 2px; }
-  .dk-legs .kv { font-size: 14px; padding: 8px 0; }
-  .dk-close-phone { display: flex; justify-content: flex-end; margin-top: 14px; }
-  .dk-legs .dk-legnotes { margin-top: var(--s-4); }
-
-  .dk-lower { display: block; padding-top: 28px; }
-  .dk-lower > * + * { margin-top: var(--s-6); }
-  .dk-next { margin-top: var(--s-6); }
-  .jl { grid-template-columns: 56px 1fr; }
+  .dk-gaps { margin: -14px var(--gutter) 26px; }
+  .conds.n2, .conds.n4 { grid-template-columns: minmax(0, 1fr); }
+  .tb.dk-legs { table-layout: fixed; }
+  .tb.dk-legs th:first-child { width: 34%; }
+  .tb.dk-legs td, .tb.dk-legs thead th { width: 33%; white-space: normal; overflow-wrap: anywhere; }
 }
-
-/* Latest: a long line keeps to two lines and never widens the page */
-.dk-latest .jl > span:last-child { min-width: 0; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }

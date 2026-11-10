@@ -2,6 +2,7 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import './theme/tokens.css';
 import './theme/app.css';
+import './theme/instrument.css';
 import { Shell } from './shell/Shell.tsx';
 import { startStream } from './stream/start.ts';
 

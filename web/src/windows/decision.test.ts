@@ -21,7 +21,7 @@ test('the held window: since when, for how long, and Close position', () => {
   const d = decide({ selected: doge, windows: [doge, sol], strategy: STRATEGY, now: NOW });
   assert.equal(
     d.text,
-    'Held since 25 Oct 00:00 UTC · 2 d 14 h. Auto moves out of it when another window beats it by 3 points of net APR for 4 hours in a row, and exits after 6 hourly checks in a row under your minimum or with the spread flipped.',
+    'Held since 25 Oct 00:00 UTC · 2 d 14 h. Auto moves out of it when another pair beats it by 3 points of net APR for 4 hours in a row, and exits after 6 hourly checks in a row under your minimum or with the spread flipped.',
   );
   assert.equal(d.close, true);
   assert.equal(d.rotate, null);
@@ -52,12 +52,12 @@ test('a window above the held one: the numbers, the payback, and whether it clea
 test('refused windows cannot be rotated into', () => {
   const refused = net('ZRO', 35.2, { refused: { code: 'E_ORACLE_STALE', reason: 'no trusted price' }, switchCostUsd: 1.1 });
   const d = decide({ selected: refused, windows: [doge, refused], strategy: STRATEGY, now: NOW });
-  assert.equal(d.text, 'The contract would refuse this window under your policy: no trusted price. Auto will not enter it.');
+  assert.equal(d.text, 'The contract would refuse this pair under your policy: no trusted price. Auto will not enter it.');
   assert.equal(d.rotate, null);
 
   const vetoed = net('AVAX', 9.1, { veto: { verdict: 'veto', reasons: ['one-off spike'], model: 'm', at: 1 } });
   const v = decide({ selected: vetoed, windows: [doge, vetoed], strategy: STRATEGY, now: NOW });
-  assert.equal(v.text, 'The NEAR AI risk check refused it: one-off spike. It can only remove a window, so auto will not enter it.');
+  assert.equal(v.text, 'The NEAR AI risk check refused it: one-off spike. It can only take a pair off the list, so auto will not enter it.');
   assert.equal(v.rotate, null);
   assert.equal(v.alert, null);
 });
@@ -78,7 +78,7 @@ test('nothing held: auto enters the best window that clears the minimum', () => 
   const windows = [b, a, c];
   const carryFirst = [a, b, c];
   assert.equal(decide({ selected: b, windows: carryFirst, strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters SOL first: 8.6% against 12.0% here.');
-  assert.equal(decide({ selected: b, windows, strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters NEAR: it is the best window that clears your 5% minimum. It enters once it has passed 3 hourly checks in a row.');
+  assert.equal(decide({ selected: b, windows, strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters NEAR: it is the best pair that clears your 5% minimum. It enters once it has passed 3 hourly checks in a row.');
   assert.equal(decide({ selected: a, windows, strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters NEAR first: 12.0% against 8.6% here.');
   assert.equal(decide({ selected: c, windows, strategy: STRATEGY, now: NOW }).text, 'Nothing is held. BTC is under your 5% minimum, so auto will not enter it.');
   assert.match(decide({ selected: a, windows, strategy: null, now: NOW }).text, /minimum could not be read/);
@@ -86,7 +86,7 @@ test('nothing held: auto enters the best window that clears the minimum', () => 
   // whatever its net; nor is one with stale numbers.
   const gated = net('DOGE', 30, { checks: [{ ok: false, text: '14-day history loading' }] });
   const stale = net('LTC', 25, { stale: true });
-  assert.equal(decide({ selected: a, windows: [gated, stale, a, c], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters SOL: it is the best window that clears your 5% minimum. It enters once it has passed 3 hourly checks in a row.');
+  assert.equal(decide({ selected: a, windows: [gated, stale, a, c], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto enters SOL: it is the best pair that clears your 5% minimum. It enters once it has passed 3 hourly checks in a row.');
   // Selected, such a window says why auto will not enter it, held window or not.
   assert.equal(decide({ selected: gated, windows: [gated, a], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto will not enter DOGE: 14-day history loading.');
   assert.equal(decide({ selected: stale, windows: [stale, a], strategy: STRATEGY, now: NOW }).text, 'Nothing is held. Auto will not enter LTC: its numbers are from an older read.');
@@ -99,7 +99,45 @@ test('nothing held: auto enters the best window that clears the minimum', () => 
   assert.equal(none.close, false);
 });
 
-test('"about $X a day on $Y legs" uses the window’s $/day per $1k at the strategy’s leg size', () => {
+test('nothing held: the line follows what the strategy loop itself last said', () => {
+  const a = net('SOL', 8.6);
+  const b = net('NEAR', 12);
+  const windows = [b, a];
+  const wait = (reason: string, windowId: string | null = b.id) => ({ action: 'wait' as const, reason, windowId, heldId: null, at: NOW });
+  // Counting the hourly checks of the pair it waits for.
+  assert.equal(
+    decide({ selected: b, windows, strategy: STRATEGY, now: NOW, engine: wait('NEAR 12.0 % net, 2 of 3 hours above 5 %') }).text,
+    'Nothing is held. Auto enters NEAR: it is the best pair that clears your 5% minimum. It enters once it has passed 3 hourly checks in a row: 2 so far.',
+  );
+  // A cool-down after an exit comes first, on the pair it waits for and on any other.
+  const cooling = wait('Cooling down after the exit, 1.8 h left; NEAR 12.0 % net, 3 of 3 hours above 5 %');
+  assert.equal(
+    decide({ selected: b, windows, strategy: STRATEGY, now: NOW, engine: cooling }).text,
+    'Nothing is held. The desk is cooling down after its last exit: 1.8 h left. After that auto enters NEAR: it is the best pair that clears your 5% minimum. It has passed its 3 hourly checks in a row.',
+  );
+  assert.equal(
+    decide({ selected: a, windows, strategy: STRATEGY, now: NOW, engine: cooling }).text,
+    'Nothing is held. The desk is cooling down after its last exit: 1.8 h left. After that auto enters NEAR first: 12.0% against 8.6% here.',
+  );
+  assert.match(
+    decide({ selected: b, windows, strategy: STRATEGY, now: NOW, engine: wait('Cooling down after the exit, 0.4 h left; NEAR 12.0 % net, 1 of 3 hours above 5 %') }).text,
+    /cooling down after its last exit: 24 min left\. After that auto enters NEAR: .* It enters once it has passed 3 hourly checks in a row: 1 so far\.$/,
+  );
+  // Trading switched off on the engine: it opens nothing, whatever the list says.
+  const off = { action: 'off' as const, reason: 'GIMBAL_TRADE is not 1: the loop decides and journals, and signs nothing', windowId: null, heldId: null, at: NOW };
+  assert.equal(
+    decide({ selected: b, windows, strategy: STRATEGY, now: NOW, engine: off }).text,
+    'Nothing is held. Trading is switched off on this engine: it watches and rescues, but opens nothing.',
+  );
+  // A decision about another matter (a hold line from before the exit) changes nothing.
+  const hold = { action: 'hold' as const, reason: 'Hold DOGE: 13.8 % net of the exit, at least your 5 % minimum; day 1 of 7', windowId: null, heldId: 'doge', at: NOW };
+  assert.equal(
+    decide({ selected: b, windows, strategy: STRATEGY, now: NOW, engine: hold }).text,
+    decide({ selected: b, windows, strategy: STRATEGY, now: NOW }).text,
+  );
+});
+
+test('"about $X a day on $Y legs" uses the pair’s $/day per $1k at the strategy’s leg size', () => {
   assert.ok(Math.abs(perDayOnLegs(sol, 1200) - 0.288) < 1e-9);
   assert.equal(perDayOnLegs(win({ usdPerDayPer1k: 0 }), 1200), 0);
 });

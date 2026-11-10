@@ -744,6 +744,25 @@ export interface Window {
                                     // back (a desk window's net APR with its 7 days in leaves those moves out);
                                     // null when nothing is held or this is the held one
   stale: boolean;                   // a venue it needs did not answer: the numbers are from the last good read
+  legs?: { long: WindowLeg; short: WindowLeg };   // each side as its venue lists it now: what the scanner read to
+                                                  // price the window. Absent from an engine from before it
+}
+
+// One side of a Window on its venue, as last read. grossAprPct is (short.ratePerHour − long.ratePerHour) a year.
+export interface WindowLeg {
+  symbol: string;                 // the venue's own symbol ("kPEPE", "PERP_SOL_USDC")
+  ratePerHour: number;            // the funding rate this side is priced at, fraction per hour, > 0 means longs pay
+                                  // shorts: what a long pays on the long leg, what a short receives on the short leg
+                                  // (the two differ on a venue with per-side funding, GMX v2)
+  apr7dPct: number | null;        // that rate's mean over the last 168 complete hours, as APR; null under 90 % of
+                                  // them known (the venue publishes no history and the engine has run under a week)
+  settlement: FundingRate['settlement'];
+  nextAt: number;                 // ms, the next funding payment; for continuous funding, the time of the read
+  markPx: number | null;          // USD per base unit of Window.symbol (the venue's mark ÷ its multiplier)
+  oiUsd: number | null;           // open interest, USD; null where the venue publishes none
+  volume24hUsd: number | null;    // traded in the last 24 h, USD; null where the venue does not say
+  move24hPct: number | null;      // the venue's mark against its price 24 h ago, signed percent; null where it gives none
+  readAt: number;                 // ms, when this venue's funding was read
 }
 
 export interface WindowHistory {   // GET /windows/history?id=<window id>: hourly net APR, oldest first
@@ -757,6 +776,18 @@ export interface ScanStatus {      // one per scan, next to the windows it produ
   venues: number;                  // venues the scanner read
   failed: ScanVenueId[];           // venues that did not answer this time
   at: number;                      // ms
+  sources?: ScanSource[];          // every venue the scanner reads, in its own order (the desk's first), with what its
+                                   // last answer held. Absent from an engine from before it
+}
+
+export interface ScanSource {      // one venue the scanner reads
+  id: ScanVenueId;
+  kind: 'desk' | 'dex' | 'cex';    // desk: a venue the desk can trade; dex and cex: read for reference, never traded
+  markets: number;                 // perp markets in its last answer; 0 before the first one
+  oiUsd: number | null;            // their open interest added up, USD; null where it publishes none
+  volume24hUsd: number | null;     // traded in the last 24 h over those markets, USD; null where it does not say
+  readAt: number | null;           // ms, when that answer was read; null: none since the engine started
+  ok: boolean;                     // it answered this scan, or its last answer is younger than the watch interval
 }
 
 export interface ContractPolicy {  // the contract's Policy (§1.2), same snake_case fields: passed as is to set_policy

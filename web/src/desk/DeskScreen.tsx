@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import type { ReactNode } from 'react';
 import type { DeskState, JournalEntry, Leg, ScanStatus, StrategyConfig, StrategyDecision, VenueId, Window as FundingWindow } from '@gimbal/shared';
 import { clock } from '../journal/entry.ts';
 import { heldSymbolOf, latestOf, storyOf, type StoryItem } from '../journal/story.ts';
@@ -6,21 +6,26 @@ import { rowOf } from '../journal/model.ts';
 import { waitsView } from '../journal/waits.ts';
 import { writeControls } from '../remote/readonly.ts';
 import { MoneyActions } from '../shell/Header.tsx';
-import { VENUE_NAMES, downVenues } from '../shell/status.ts';
+import { VENUE_NAMES, downVenues, joinNames } from '../shell/status.ts';
 import { useStatus } from '../shell/useStatus.ts';
 import { useStream } from '../stream/hub.ts';
 import { Flash } from '../ui/Flash.tsx';
+import { KeysFlow } from '../ui/KeysFlow.tsx';
+import { Panel, Readings, type Reading } from '../ui/Panel.tsx';
+import { RateChart } from '../ui/RateChart.tsx';
 import { cx } from '../ui/cx.ts';
 import { useManualSend } from '../ui/useManualSend.ts';
 import { useNow } from '../ui/useNow.ts';
-import { pct, usd, venueName } from '../windows/format.ts';
-import { bestEnterable, checkLines, deskMissing, hasHistory, heldWindow, sortWindows } from '../windows/model.ts';
-import { checksSummary, isOpenToDesk } from '../windows/markets.ts';
-import { useStrategy } from '../windows/useEngine.ts';
-import { distanceTone, deskAnswer, moneyTone, type DeskAnswer } from './answer.ts';
+import { pct, tidy, usd } from '../windows/format.ts';
+import { deskMissing, heldWindow } from '../windows/model.ts';
+import { retryHistory, useHistories, useStrategy } from '../windows/useEngine.ts';
+import { distanceTone, deskAnswer, moneyTone, answerText, type DeskAnswer } from './answer.ts';
 import { decisionLine } from './decision.ts';
-import { elapsed, price, qty, ratioPct, signedUsd, splitUsd } from './format.ts';
-import { dayRate, exposureOf, isDown, lastClose, nextBest, nextFunding, paybackOf, placeLegs, pnlRows, thresholdText, valueGaps } from './model.ts';
+import { conditionsOf, coolDownOf, COOLDOWN_HOURS, marketsNote, marketsPlot, waitedFor } from './flat.ts';
+import { elapsed, price, qty, ratioPct, signedUsd } from './format.ts';
+import { Corridor, CoolDownLine, MarketsDots, PaybackRuler } from './Instruments.tsx';
+import { dayRate, exposureOf, isDown, lastClose, nextFunding, paybackOf, valueGaps } from './model.ts';
+import { linesSentence, noRoomText, roomOf, roomSentence, roomTone } from './room.ts';
 import './desk.css';
 
 /** The Desk: is the money safe and what does it earn (UX, Desk). */
@@ -39,58 +44,15 @@ export function DeskScreen() {
   if (desk === null || status === null) return noDesk ? <NoDesk scan={scan} now={now} /> : <DeskLoading />;
   const held = windows ? heldWindow(windows) : null;
   const answer = deskAnswer({ desk, held, view: status.view });
-  if (desk.legs.length === 0) return <Flat desk={desk} answer={answer} windows={windows} strategy={strategy} scan={scan} journal={journal} now={now} />;
-
-  const rate = dayRate(held, desk.legs);
-  const value = splitUsd(desk.equityUsd);
-  const gaps = valueGaps(desk);
-  return (
-    <div className="dk">
-      <section className="dk-hero" aria-label="The desk now">
-        <Answer a={answer} />
-        <div className="dk-v">
-          <span className="fig" data-testid="desk-value">
-            <Flash value={desk.equityUsd}>
-              {value.dollars}
-              <small>{value.cents}</small>
-            </Flash>
-          </span>
-          <p>
-            {rate ? (
-              <>
-                <span className={moneyTone(rate.perDayUsd) ?? undefined}>
-                  <Flash value={rate.perDayUsd}>{signedUsd(rate.perDayUsd, Math.abs(rate.perDayUsd) < 0.01 ? 3 : 2)}</Flash> a day
-                </span>{' '}
-                <span className="g">after costs</span>
-              </>
-            ) : null}
-            <span className="g dk-wide">
-              {rate ? ' · ' : ''}
-              {usd(desk.reserveUsd)} of it held for rescues
-            </span>
-          </p>
-        </div>
-        {gaps === null ? null : <p className="dk-gaps g" data-testid="desk-value-gaps">{gaps}</p>}
-        <MoneyActions mode={desk.mode} className="dk-money" />
-      </section>
-
-      <Pair desk={desk} held={held} strategy={strategy} down={downVenues(desk, health)} decision={decision} now={now} />
-
-      <div className="dk-lower">
-        <div>
-          <Payback pnl={desk.pnl} />
-          <NextBest windows={windows} strategy={strategy} />
-        </div>
-        <Latest journal={journal} heldId={held?.id ?? null} heldSymbol={heldSymbolOf(desk.legs)} />
-      </div>
-    </div>
-  );
+  const shared = { desk, answer, windows, strategy, journal, decision, now };
+  if (desk.legs.length === 0) return <Flat {...shared} />;
+  return <Held {...shared} held={held} down={downVenues(desk, health)} />;
 }
 
 /** The sentence; only the rate carries a colour (mint earning, coral losing). */
 export function Answer({ a }: { a: DeskAnswer }) {
   return (
-    <h1 className="answer wide" data-testid="desk-answer">
+    <h1 className={cx('answer', answerText(a).length > 54 && 'long')} data-testid="desk-answer">
       {a.verb === null ? (
         a.rest
       ) : (
@@ -109,151 +71,156 @@ export function Answer({ a }: { a: DeskAnswer }) {
   );
 }
 
-// ---------- the held pair ----------
-
-interface PairProps {
+interface ScreenProps {
   desk: DeskState;
-  held: FundingWindow | null;
+  answer: DeskAnswer;
+  windows: readonly FundingWindow[] | null;
   strategy: StrategyConfig | null;
-  down: readonly VenueId[];
+  journal: readonly JournalEntry[];
   decision: StrategyDecision | null;
   now: number;
 }
 
-const legName = (leg: Leg): string => `${leg.side === 'short' ? 'Short' : 'Long'} ${VENUE_NAMES[leg.venue]} ${qty(Math.abs(leg.size))}`;
-
-/** The held pair as one row; tapped, it unfolds the details of both legs. Close sits on it, for the owner. */
-function Pair({ desk, held, strategy, down, decision, now }: PairProps) {
-  const [open, setOpen] = useState(false);
-  const { left, right } = placeLegs(desk.legs);
-  const legs = [left, right].filter((l): l is Leg => l !== null);
-  const symbol = held?.symbol ?? legs[0]?.symbol ?? '';
-  const exposure = exposureOf(desk);
-  const risk = strategy?.risk ?? null;
-  const since = held?.held ? `Held since ${clock(held.held.since)}` : 'Held now';
-
-  const distance = (leg: Leg, short = false) => (
-    <>
-      <span className={isDown(leg, down) ? undefined : (distanceTone(leg.distanceToLiqPct, risk) ?? undefined)}>
-        <Flash value={leg.distanceToLiqPct}>{leg.distanceToLiqPct === null ? '—' : pct(leg.distanceToLiqPct, 0)}</Flash>
-      </span>{' '}
-      {short ? 'from liq.' : 'from liquidation'}
-    </>
-  );
-
+/** The top of the screen: the sentence, and the three readings that back it. */
+function Top({ desk, answer, earning }: { desk: DeskState; answer: DeskAnswer; earning: Reading }) {
+  const gaps = valueGaps(desk);
+  const rows: Reading[] = [
+    { label: 'In the desk', value: <Flash value={desk.equityUsd}>{usd(desk.equityUsd)}</Flash>, testId: 'desk-value' },
+    earning,
+    { label: 'Held for rescues', value: <Flash value={desk.reserveUsd}>{usd(desk.reserveUsd)}</Flash>, title: 'Part of the desk’s value, kept free so a rescue can add margin to a leg.' },
+  ];
   return (
-    <section className="dk-pair" aria-label="The held pair">
-      <div className="dk-row">
-        <button type="button" className="c dk-toggle" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
-          <b>{symbol}</b>
-          <span>{since}</span>
-        </button>
-        {legs.map((leg) => (
-          <div key={leg.venue + leg.side} className={cx('c', isDown(leg, down) && 'dim')}>
-            <b>{legName(leg)}</b>
-            <span>
-              {isDown(leg, down) ? `${VENUE_NAMES[leg.venue]} not answering; figures may be old` : distance(leg)}
-              {leg.unpriced ? <span className="wt"> · no price protection</span> : null}
-            </span>
-          </div>
-        ))}
-        {legs.length === 1 ? (
-          <div className="c">
-            <b>One leg only</b>
-            <span>The desk is not hedged</span>
-          </div>
-        ) : null}
-        <div className="c">
-          <b className={exposure.drift ? 'wt' : undefined}>
-            <Flash value={desk.netDelta}>{exposure.text}</Flash>
-          </b>
-          <span>Net exposure</span>
-        </div>
-        <div className="c end">
-          <ClosePair symbol={symbol} urgent={desk.rescueFailure !== null} />
-          <button type="button" className="btn quiet dk-details" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
-            {open ? 'Hide' : 'Details'}
-            <i className={cx('chev', open && 'u')} aria-hidden="true" />
-          </button>
-        </div>
+    <>
+      <div className="top">
+        <Answer a={answer} />
+        <Readings rows={rows} shut />
       </div>
-
-      {/* The phone: the same pair as a short list (brand book C, Desk 390). */}
-      <div className="dk-prow">
-        <div className="t">
-          <b>{symbol}</b>
-          <button type="button" className="btn quiet" aria-expanded={open} onClick={() => setOpen((v) => !v)}>
-            {open ? 'Hide' : 'Details'}
-            <i className={cx('chev', open && 'u')} aria-hidden="true" />
-          </button>
-        </div>
-        {legs.map((leg) => (
-          <div key={leg.venue + leg.side} className={cx('kv', isDown(leg, down) && 'dim')}>
-            <span>{legName(leg)}</span>
-            <span>{isDown(leg, down) ? 'not answering' : distance(leg, true)}</span>
-          </div>
-        ))}
-        <div className="kv">
-          <span>Net exposure</span>
-          <span className={exposure.drift ? 'wt' : undefined}>{exposure.text}</span>
-        </div>
-      </div>
-
-      {/* Folded, the block is inert: nothing in it (the phone's Close) can be focused or clicked while it is invisible. */}
-      <div className={cx('dk-legs', !open && 'shut')} aria-hidden={!open} inert={!open}>
-        {legs.map((leg) => (
-          <LegDetails key={leg.venue + leg.side} leg={leg} now={now} />
-        ))}
-        <div className="dk-legnotes">
-          <p className="g">{exposure.explain}</p>
-          {thresholdText(risk) ? <p className="g">{thresholdText(risk)}</p> : null}
-          <Decision decision={decision} now={now} minNetAprPct={strategy?.minNetAprPct ?? null} />
-        </div>
-        <div className="dk-pnl">
-          <h4>The pair so far</h4>
-          {pnlRows(desk.pnl).map((r) => (
-            <div key={r.key} className={cx('kv', r.key === 'net' && 'tot')}>
-              <span>{r.label}</span>
-              {/* Fees and the price move are expected costs: neutral. Funding received and the net carry their state. */}
-              <span className={r.key === 'funding' || r.key === 'net' ? (moneyTone(r.key === 'net' ? desk.pnl.netUsd : desk.pnl.fundingUsd) ?? undefined) : undefined}>
-                <Flash value={r.value} />
-              </span>
-            </div>
-          ))}
-        </div>
-        <div className="dk-close-phone">
-          <ClosePair symbol={symbol} urgent={desk.rescueFailure !== null} />
-        </div>
-      </div>
-    </section>
+      {gaps === null ? null : <p className="dk-gaps" data-testid="desk-value-gaps">{gaps}</p>}
+    </>
   );
 }
 
-function LegDetails({ leg, now }: { leg: Leg; now: number }) {
-  const rows: [string, string][] = [
-    ['Entry', price(leg.entry)],
-    ['Mark', price(leg.mark)],
-    ['Liquidation price', leg.liqPx === null ? '—' : price(leg.liqPx)],
-    ['Margin', usd(leg.marginUsd)],
-    ['Margin ratio', ratioPct(leg.marginRatio)],
-    ['Funding', signedUsd(leg.fundingEarnedUsd + leg.unsettledFundingUsd, 4)],
-    ['Fees', signedUsd(leg.feesUsd, 4)],
-    ['Next funding', nextFunding(leg.venue, now)],
-  ];
+// ---------- a pair is held ----------
+
+const legName = (leg: Leg): string => `${leg.side === 'short' ? 'Short' : 'Long'} ${VENUE_NAMES[leg.venue]} ${qty(Math.abs(leg.size))}`;
+
+function Held({ desk, answer, windows, strategy, journal, decision, now, held, down }: ScreenProps & { held: FundingWindow | null; down: readonly VenueId[] }) {
+  const risk = strategy?.risk ?? null;
+  const minimum = strategy?.minNetAprPct ?? null;
+  const symbol = held?.symbol ?? desk.legs[0]?.symbol ?? '';
+  const rate = dayRate(held, desk.legs);
+  const room = roomOf(desk.legs, risk);
+  const silent = desk.legs.filter((l) => isDown(l, down));
+  const exposure = exposureOf(desk);
+  const earning: Reading = rate
+    ? {
+        label: rate.perDayUsd < 0 ? 'Losing, after costs' : 'Earning, after costs',
+        value: <Flash value={rate.perDayUsd}>{signedUsd(rate.perDayUsd, Math.abs(rate.perDayUsd) < 0.01 ? 3 : 2)} a day</Flash>,
+        tone: moneyTone(rate.perDayUsd, 3),
+      }
+    : { label: 'Earning, after costs', value: '—', title: 'The held market is not in the scan right now, so its rate is not known.' };
+  const said = room ? roomSentence(room, risk) : noRoomText(desk.legs);
+  const lines = room ? linesSentence(risk) : null;
+
   return (
-    <div>
-      <h4>
-        {leg.side === 'short' ? 'Short' : 'Long'} {VENUE_NAMES[leg.venue]} · {qty(Math.abs(leg.size))} {leg.symbol}
-      </h4>
-      {leg.unpriced ? <p className="wt dk-flag">Opened without an oracle price band (no price protection)</p> : null}
-      {rows.map(([label, value]) => (
-        <div key={label} className="kv">
-          <span>{label}</span>
+    <div className="dk">
+      <Top desk={desk} answer={answer} earning={earning} />
+
+      <section className="hero" aria-label="The held pair">
+        <div className="cap">
+          <span>Room to move</span>
           <span>
-            <Flash value={value} />
+            price move from now, {symbol}
+            {held?.held ? ` · held since ${clock(held.held.since)} UTC` : ''}
           </span>
         </div>
-      ))}
+        {room ? (
+          <Corridor room={room} tone={silent.length > 0 ? 'dim' : roomTone(room, risk)} zones={risk !== null} label={said} />
+        ) : (
+          <p className="ins-msg dk-noroom">{said}</p>
+        )}
+        <div className="say-row">
+          <p className="say">
+            {room ? <b>{said}</b> : null}
+            {lines ? ` ${lines}` : ''}
+            {silent.length > 0 ? ` ${joinNames(silent.map((l) => VENUE_NAMES[l.venue]))} ${silent.length === 1 ? 'is' : 'are'} not answering, so ${silent.length === 1 ? 'its' : 'their'} figures may be old.` : ''}
+            {' '}
+            Net exposure: <span className={cx('num', exposure.drift && 'watch-t')}><Flash value={desk.netDelta}>{exposure.text}</Flash></span>.
+          </p>
+          <div className="act">
+            <MoneyActions mode={desk.mode} className="dk-money" />
+            <ClosePair symbol={symbol} urgent={desk.rescueFailure !== null} />
+          </div>
+        </div>
+        <Decision decision={decision} now={now} minNetAprPct={minimum} />
+      </section>
+
+      <div className="pg">
+        <Panel title="The two legs" note="as each venue reports them" span={7} className="nw">
+          <LegsTable legs={desk.legs} down={down} risk={risk} now={now} />
+          <p className="pn-foot">{exposure.explain}</p>
+        </Panel>
+        <Payback pnl={desk.pnl} perDayUsd={rate?.perDayUsd ?? null} />
+        <Markets windows={windows} minimum={minimum} span={7} />
+        <Latest journal={journal} heldId={held?.id ?? null} heldSymbol={heldSymbolOf(desk.legs)} />
+        <Week w={held} minimum={minimum} span={12} />
+        <Keys contract={desk.contract} />
+      </div>
+    </div>
+  );
+}
+
+/** Both legs side by side, the long first: it is the one the corridor draws on the left. */
+function LegsTable({ legs, down, risk, now }: { legs: readonly Leg[]; down: readonly VenueId[]; risk: StrategyConfig['risk'] | null; now: number }) {
+  const ordered = [...legs].sort((a, b) => (a.side === b.side ? 0 : a.side === 'long' ? -1 : 1));
+  const rows: [string, (leg: Leg) => ReactNode][] = [
+    ['Size', (l) => `${qty(Math.abs(l.size))} ${l.symbol}`],
+    ['Entry price', (l) => price(l.entry)],
+    ['Price now', (l) => price(l.mark)],
+    ['Liquidation price', (l) => (l.liqPx === null ? '—' : price(l.liqPx))],
+    [
+      'From liquidation',
+      (l) => <span className={isDown(l, down) ? undefined : (distanceTone(l.distanceToLiqPct, risk) ?? undefined)}>{l.distanceToLiqPct === null ? '—' : pct(l.distanceToLiqPct)}</span>,
+    ],
+    ['Margin', (l) => usd(l.marginUsd)],
+    ['Margin ratio', (l) => ratioPct(l.marginRatio)],
+    ['Funding so far', (l) => signedUsd(l.fundingEarnedUsd + l.unsettledFundingUsd, 4)],
+    ['Fees', (l) => signedUsd(l.feesUsd, 4)],
+    ['Next funding', (l) => nextFunding(l.venue, now)],
+  ];
+  return (
+    <div className="tb-x">
+      <table className="tb dk-legs">
+        <thead>
+          <tr>
+            <th />
+            {ordered.map((l) => (
+              <th key={l.venue + l.side} scope="col">
+                {l.side === 'short' ? 'Short' : 'Long'} · {VENUE_NAMES[l.venue]}
+                {isDown(l, down) ? <small>not answering</small> : null}
+                {l.unpriced ? <small className="watch-t">no price protection</small> : null}
+              </th>
+            ))}
+            {ordered.length === 1 ? <th scope="col" className="watch-t">The other leg is not open</th> : null}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(([label, cell]) => (
+            <tr key={label}>
+              <th scope="row">{label}</th>
+              {ordered.map((l) => {
+                const value = cell(l);
+                return (
+                  <td key={l.venue + l.side} className={isDown(l, down) ? 'g' : undefined}>
+                    <Flash value={typeof value === 'string' ? value : l.distanceToLiqPct}>{value}</Flash>
+                  </td>
+                );
+              })}
+              {ordered.length === 1 ? <td className="g">—</td> : null}
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -263,8 +230,8 @@ function Decision({ decision, now, minNetAprPct }: { decision: StrategyDecision 
   const line = decisionLine(decision, now, { minNetAprPct });
   if (line === null || /stale|out of date/.test(line.raw)) return null;
   return (
-    <p className="g" data-testid="decision-line">
-      Last decision, {line.when}: <span className="dk-ink">{line.reason}</span>
+    <p className="dk-dec" data-testid="decision-line">
+      Last decision, {line.when}: <span>{tidy(line.reason)}</span>
     </p>
   );
 }
@@ -296,7 +263,7 @@ export function ClosePair({ symbol, urgent = false }: { symbol: string; urgent?:
     <span className="dk-ask">
       {send.sending ? <span className="g" role="status">Sending…</span> : null}
       {send.outcome ? (
-        <span className={send.outcome.tone === 'sent' ? undefined : 'wt'} role="status">
+        <span className={send.outcome.tone === 'sent' ? undefined : 'watch-t'} role="status">
           {send.outcome.title}: {send.outcome.text}
         </span>
       ) : null}
@@ -305,65 +272,79 @@ export function ClosePair({ symbol, urgent = false }: { symbol: string; urgent?:
   );
 }
 
-// ---------- under the pair ----------
+// ---------- the panels ----------
 
-/** Entry costs earned back: funding received against fees and the entry basis. Only figures the desk reports. */
-function Payback({ pnl }: { pnl: DeskState['pnl'] }) {
-  const p = paybackOf(pnl, null);
+/** The opening cost earned back: funding received against fees and the price difference between the legs. */
+function Payback({ pnl, perDayUsd }: { pnl: DeskState['pnl']; perDayUsd: number | null }) {
+  const p = paybackOf(pnl, perDayUsd);
   const costs = Math.max(0, -pnl.feesUsd) + Math.max(0, -pnl.priceUsd);
   const earned = Math.max(0, pnl.fundingUsd);
+  const rows: Reading[] = [
+    { label: 'Funding received', value: signedUsd(pnl.fundingUsd, 4), tone: moneyTone(pnl.fundingUsd, 4) },
+    { label: 'Trading fees', value: signedUsd(pnl.feesUsd, 4) },
+    { label: 'Price difference between the legs', value: signedUsd(pnl.priceUsd, 4) },
+    { label: 'Net so far', value: signedUsd(pnl.netUsd, 4), tone: moneyTone(pnl.netUsd, 4), kind: 'tot' },
+  ];
+  const rest = p.earnedBack
+    ? 'From here the funding is profit.'
+    : p.hoursLeft === null
+      ? ''
+      : `About ${Math.ceil(p.hoursLeft)} more ${Math.ceil(p.hoursLeft) === 1 ? 'hour' : 'hours'} at the rate it pays now.`;
   return (
-    <section className="dk-payback" aria-label="Entry costs earned back">
-      <div className="hd">
-        <span>Entry costs earned back</span>
-        <span>{costs <= 0 ? 'no costs yet' : `${signedUsd(Math.min(earned, costs), 4).replace('+', '')} of ${usd(costs, 4)}`}</span>
-      </div>
-      {/* No cost yet: nothing to earn back, so no figure and no bar. */}
+    <Panel title="Opening cost earned back" note={costs <= 0 ? 'no cost yet' : `${usd(Math.min(earned, costs), 4)} of ${usd(costs, 4)}`} span={5} className="nw">
+      {/* No cost yet: nothing to earn back, so no figure and no ruler. */}
       {costs <= 0 ? null : (
         <>
-          <b className="dk-big">{p.pct}%</b>
-          <div className="bar" role="progressbar" aria-label="Entry costs earned back" aria-valuemin={0} aria-valuemax={100} aria-valuenow={p.pct}>
-            <i style={{ width: `${p.pct}%` }} />
+          <div className="big">
+            <b>{p.pct}%</b>
+            <span>of what it cost to open the pair has come back as funding. {rest}</span>
           </div>
+          <PaybackRuler pct={p.pct} />
         </>
       )}
-    </section>
+      <Readings rows={rows} shut className={costs <= 0 ? 'lead' : undefined} />
+    </Panel>
   );
 }
 
-function NextBest({ windows, strategy }: { windows: readonly FundingWindow[] | null; strategy: StrategyConfig | null }) {
-  const next = windows ? nextBest(windows, strategy) : null;
-  const w = next && windows ? windows.find((x) => x.symbol === next.symbol && !x.held && x.netAprPct === next.netAprPct) : null;
-  // None passes every check: the best one Markets lists as open still shows, with how its checks stand.
-  const open = !next && windows ? (sortWindows(windows.filter((x) => x.held === null && isOpenToDesk(x) && hasHistory(x)))[0] ?? null) : null;
+function Markets({ windows, minimum, span }: { windows: readonly FundingWindow[] | null; minimum: number | null; span: 7 | 12 }) {
+  const plot = windows ? marketsPlot(windows, minimum) : null;
   return (
-    <section className="dk-next" aria-label="Next best market">
-      <div className="hd">
-        <span>Next best market</span>
-        <a href="#/markets">
-          Markets<i className="chev r" aria-hidden="true" />
-        </a>
-      </div>
-      {windows === null ? (
-        <p className="g dk-none">Reading the markets…</p>
-      ) : next && w ? (
-        <a className="next" href={`#/markets/${encodeURIComponent(w.id)}`} title={next.text}>
-          <b>{next.symbol}</b>
-          <span>
-            {pct(next.netAprPct, 0)} a year <span className="g">· short {venueName(w.shortVenue)}, long {venueName(w.longVenue)}</span>
-          </span>
-        </a>
-      ) : open ? (
-        <a className="next" href={`#/markets/${encodeURIComponent(open.id)}`}>
-          <b>{open.symbol}</b>
-          <span>
-            {pct(open.netAprPct, 0)} a year <span className="g">· {checksSummary(checkLines(open))}</span>
-          </span>
-        </a>
+    <Panel title="Markets against your minimum" note={<a href="#/markets">{plot ? `${marketsNote(plot, minimum)} · ` : ''}all markets<i className="chev r" aria-hidden="true" /></a>} span={span}>
+      {plot === null ? (
+        <p className="pn-none">Reading the markets…</p>
+      ) : plot.rows.length === 0 ? (
+        <p className="pn-none">No market is open to the desk right now. The scanner still lists every pair it reads.</p>
       ) : (
-        <p className="g dk-none">No other market is open to the desk right now.</p>
+        <>
+          <MarketsDots plot={plot} minimum={minimum} />
+          <p className="pn-foot">Net a year after fees and price impact, for the pairs the desk may open. A row opens the pair.</p>
+        </>
       )}
-    </section>
+    </Panel>
+  );
+}
+
+/** One market's net rate over seven days, hour by hour. */
+function Week({ w, minimum, span }: { w: FundingWindow | null; minimum: number | null; span: 7 | 12 }) {
+  const histories = useHistories(w ? [w.id] : []);
+  if (w === null) return null;
+  const entry = histories[w.id];
+  return (
+    <Panel title={`${w.symbol}, net a year`} note="hourly, last 7 days" span={span} className="nw">
+      <RateChart
+        label={`${w.symbol}, net a year over 7 days`}
+        points={entry?.history?.points ?? null}
+        status={entry?.status ?? 'loading'}
+        minimum={minimum}
+        held={w.held ? { from: w.held.since, to: null } : null}
+        onRetry={() => retryHistory(w.id)}
+      />
+      <p className="pn-foot">
+        {w.held ? 'The green hours are the time the desk has held it. ' : ''}
+        {minimum === null ? '' : `The dotted line is your ${Number(minimum.toFixed(1))}% minimum.`}
+      </p>
+    </Panel>
   );
 }
 
@@ -382,88 +363,102 @@ export function storyLine(item: StoryItem): string {
 }
 
 function Latest({ journal, heldId, heldSymbol }: { journal: readonly JournalEntry[]; heldId: string | null; heldSymbol: string | null }) {
-  const lines = latestOf(storyOf(journal, heldId, heldSymbol));
+  const lines = latestOf(storyOf(journal, heldId, heldSymbol), 4);
   return (
-    <section className="dk-latest" aria-label="Latest">
-      <div className="hd">
-        <span>Latest</span>
-        <a href="#/journal">
-          Journal<i className="chev r" aria-hidden="true" />
-        </a>
-      </div>
-      {lines.length === 0 ? <p className="g dk-none">Nothing yet. What the desk does shows up here.</p> : null}
-      {lines.map((item) => (
-        <div key={item.id} className="jl">
-          <span>{clock(item.t)}</span>
-          <span>{storyLine(item)}</span>
-        </div>
-      ))}
-    </section>
+    <Panel title="Latest" note={<a href="#/journal">Journal<i className="chev r" aria-hidden="true" /></a>} span={5}>
+      {lines.length === 0 ? (
+        <p className="pn-none">Nothing yet. What the desk does shows up here.</p>
+      ) : (
+        <ul className="log">
+          {lines.map((item) => (
+            <li key={item.id}>
+              <time>{clock(item.t)}</time>
+              <p>{tidy(storyLine(item))}</p>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Panel>
+  );
+}
+
+function Keys({ contract }: { contract: string }) {
+  return (
+    <Panel title="Keys" note={<a href="#/safety">how an order gets signed · Safety<i className="chev r" aria-hidden="true" /></a>}>
+      <KeysFlow contract={contract} />
+    </Panel>
   );
 }
 
 // ---------- no pair, no desk, loading ----------
 
-interface FlatProps {
-  desk: DeskState;
-  answer: DeskAnswer;
-  windows: readonly FundingWindow[] | null;
-  strategy: StrategyConfig | null;
-  scan: ScanStatus | null;
-  journal: readonly JournalEntry[];
-  now: number;
-}
-
-/** No pair held: the desk value, what it waits for, the best market against the owner's minimum, the last close. */
-function Flat({ desk, answer, windows, strategy, scan, journal, now }: FlatProps) {
-  const best = windows ? bestEnterable(windows) : null;
-  const closed = lastClose(journal, now);
+/** No pair held: when the next one can open and what it waits for, the markets against the minimum, the last close. */
+function Flat({ desk, answer, windows, strategy, journal, decision, now }: ScreenProps) {
   const minimum = strategy?.minNetAprPct ?? null;
-  const value = splitUsd(desk.equityUsd);
-  const gaps = valueGaps(desk);
+  const cool = coolDownOf(decision, journal, now);
+  const conds = conditionsOf({ decision, windows: windows ?? [], strategy, cool, now });
+  const waited = windows ? waitedFor(decision, windows) : null;
+  const closed = lastClose(journal, now);
+  const plot = windows ? marketsPlot(windows, minimum) : null;
+
   return (
     <div className="dk">
-      <section className="dk-hero" aria-label="The desk now">
-        <Answer a={answer} />
-        <div className="dk-v">
-          <span className="fig" data-testid="desk-value">
-            <Flash value={desk.equityUsd}>
-              {value.dollars}
-              <small>{value.cents}</small>
-            </Flash>
-          </span>
-          <p className="g">
-            {strategy?.auto === false
-              ? 'in the desk’s accounts, earning nothing: Auto is off, so the desk opens nothing by itself'
-              : 'in the desk’s accounts, earning nothing until a market pays at least the minimum'}
-          </p>
-        </div>
-        {gaps === null ? null : <p className="dk-gaps g" data-testid="desk-value-gaps">{gaps}</p>}
-        {closed === null ? null : (
-          <p className="dk-gaps g" data-testid="desk-last-close">
-            Last pair closed {closed.when}: both legs are flat, <span className={moneyTone(closed.netUsd) ?? undefined}>{signedUsd(closed.netUsd)}</span>{' '}
-            realized after funding, fees and price. The closing line is in the <a href="#/journal">Journal</a>.
-          </p>
+      <Top desk={desk} answer={answer} earning={{ label: 'Earning while it waits', value: `${usd(0)} a day` }} />
+
+      <section className="hero" aria-label="The next pair">
+        {cool ? (
+          <>
+            <div className="cap">
+              <span>The next pair</span>
+              <span>{COOLDOWN_HOURS}-hour cool-down after the last exit, UTC</span>
+            </div>
+            <CoolDownLine cool={cool} now={now} />
+          </>
+        ) : (
+          <>
+            <div className="cap">
+              <span>The next pair</span>
+              <span>{plot ? marketsNote(plot, minimum) : 'reading the markets'} · net a year after costs</span>
+            </div>
+            {plot === null ? (
+              <p className="ins-msg dk-noroom">Reading the markets…</p>
+            ) : plot.rows.length === 0 ? (
+              <p className="ins-msg dk-noroom">No market is open to the desk right now. The scanner still lists every pair it reads.</p>
+            ) : (
+              <MarketsDots plot={plot} minimum={minimum} />
+            )}
+          </>
         )}
-        <MoneyActions mode={desk.mode} className="dk-money" />
+        <ol className={cx('conds', `n${conds.length}`)} aria-label="Before the desk opens the next pair">
+          {conds.map((c) => (
+            <li key={c.text} className={c.done ? 'done' : undefined}>
+              <i aria-hidden="true">{c.done ? '✓' : ''}</i>
+              <b>{c.value}</b>
+              <span>{c.text}</span>
+            </li>
+          ))}
+        </ol>
+        <div className="say-row">
+          <p className="say">
+            The money sits in the desk’s own exchange accounts and earns nothing until a pair is open.
+            {closed === null ? null : (
+              <span data-testid="desk-last-close">
+                {' '}The last pair closed {closed.when} with <span className={cx('num', moneyTone(closed.netUsd))}>{signedUsd(closed.netUsd)}</span> after funding, fees
+                and price; its closing line is in the <a href="#/journal">Journal</a>.
+              </span>
+            )}
+          </p>
+          <div className="act">
+            <MoneyActions mode={desk.mode} className="dk-money" />
+          </div>
+        </div>
       </section>
-      <div className="dk-lower">
-        <section className="dk-facts" aria-label="Against your minimum">
-          <div className="kv">
-            <span>Best market open to the desk</span>
-            <span>{best ? `${best.symbol} ${pct(best.netAprPct)}` : '—'}</span>
-          </div>
-          <div className="kv">
-            <span>Your minimum, after costs</span>
-            <span>{minimum === null ? '—' : pct(minimum, Number.isInteger(minimum) ? 0 : 1)}</span>
-          </div>
-          <div className="kv">
-            <span>Last scan</span>
-            <span>{scan ? `${elapsed(now - scan.at)} ago, ${scan.venues} venues` : '—'}</span>
-          </div>
-          <NextBest windows={windows} strategy={strategy} />
-        </section>
+
+      <div className="pg">
+        {cool ? <Markets windows={windows} minimum={minimum} span={7} /> : <Week w={waited} minimum={minimum} span={7} />}
         <Latest journal={journal} heldId={null} heldSymbol={null} />
+        {cool ? <Week w={waited} minimum={minimum} span={12} /> : null}
+        <Keys contract={desk.contract} />
       </div>
     </div>
   );
@@ -473,13 +468,13 @@ function Flat({ desk, answer, windows, strategy, scan, journal, now }: FlatProps
 function NoDesk({ scan, now }: { scan: ScanStatus | null; now: number }) {
   return (
     <div className="dk">
-      <section className="dk-hero">
-        <h1 className="answer wide">No desk yet.</h1>
-        <p className="dk-lead g">
+      <div className="top">
+        <h1 className="answer">No desk yet.</h1>
+      </div>
+      <section className="hero">
+        <p className="say dk-first">
           The engine is reading funding{scan ? ` on ${scan.venues} venues, ${elapsed(now - scan.at)} ago` : ''}, but no desk is loaded, so there are no legs,
-          margin or value to show.
-        </p>
-        <p className="dk-lead">
+          margin or value to show.{' '}
           <a href="#/markets">
             See the markets<i className="chev r" aria-hidden="true" />
           </a>
@@ -493,10 +488,19 @@ function NoDesk({ scan, now }: { scan: ScanStatus | null; now: number }) {
 function DeskLoading() {
   return (
     <div className="dk" aria-busy="true" aria-label="Loading the desk">
-      <section className="dk-hero">
-        <i className="d-sk" style={{ width: '60%', height: 64 }} />
-        <i className="d-sk" style={{ width: '40%', height: 64, marginTop: 8 }} />
-        <i className="d-sk" style={{ width: 220, height: 48, marginTop: 40 }} />
+      <div className="top">
+        <div>
+          <i className="sk-line" style={{ width: '70%', height: 60 }} />
+          <i className="sk-line" style={{ width: '46%', height: 60, marginTop: 8 }} />
+        </div>
+        <div>
+          <i className="sk-line" style={{ marginTop: 12 }} />
+          <i className="sk-line" style={{ marginTop: 26 }} />
+          <i className="sk-line" style={{ marginTop: 26 }} />
+        </div>
+      </div>
+      <section className="hero">
+        <i className="sk-line" style={{ height: 176 }} />
       </section>
     </div>
   );

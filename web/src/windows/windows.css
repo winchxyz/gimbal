@@ -1,219 +1,187 @@
-/* Markets, brand book C (Markets 1440). The sentence on top, then the list of markets open to the desk on the left and
-   the selected market on the right. Every value comes from tokens.css. Colour means state only; a line separates rows. */
+/* Markets: the scanner (pairs, assets, venues) and one pair's page. Built on theme/instrument.css: a table is words
+   left and mono figures right with a hairline between rows; a control is a word; colour is state only. */
 
-.phone-only { display: none; }
-.w-hint { display: none; }
+/* ---------- lines under the top: no desk yet, venues that did not answer, an alert that fired ---------- */
+.w-notes { padding: 0 var(--gutter); margin: -20px 0 36px; }
+.w-notice { display: flex; gap: var(--s-4); align-items: baseline; padding: 14px 0; border-top: 1px solid var(--rule); font: var(--t-s); }
+.w-notice b { color: var(--watch); font-weight: 500; white-space: nowrap; flex: none; }
+.w-notice span { color: var(--silver); }
+.w-notice.calm b { color: var(--chalk); }
 
-/* ---------- frame: list on the left, the selected window on the right ---------- */
-/* The height of the area under the header: the sentence stays, the list and the stage scroll on their own. */
-.w-page { display: flex; flex-direction: column; height: 100%; }
-.w-split { flex: 1 1 0; min-height: 0; display: grid; grid-template-columns: var(--list-w) minmax(0, 1fr); column-gap: 72px; padding: 0 0 0 var(--gutter); }
-.w-list, .w-detail { min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--line-2) transparent; }
-.w-list { padding-bottom: var(--s-7); }
+/* ---------- the scanner: views, what is listed, the table ---------- */
+.sc { padding: 0 var(--gutter) 96px; }
+.sc-bar { display: flex; justify-content: space-between; align-items: baseline; gap: var(--s-5); border-top: 1px solid var(--rule); padding: 14px 0 0; }
+.sc-bar .seg a { font: var(--t-cap); padding: 2px 0; }
+.sc-bar .seg a:not(.on) { font-weight: 400; }
+.sc-bar > span { font: var(--t-note); color: var(--silver); text-align: right; }
+.sc-ctl { display: flex; align-items: center; flex-wrap: wrap; gap: 6px var(--s-7); padding: 22px 0 22px; }
+.sc-ctl .field { flex: 0 1 260px; margin-left: auto; }
+.sc-ctl .seg { gap: 4px 24px; }
+.sc-ctl .seg button, .sc-ctl .seg a { font: var(--t-s); }
+.sc-ctl .seg .on { font-weight: 500; }
+.sc-ctl .lbl { font: var(--t-s); color: var(--pewter); margin-right: -8px; }
+.sc-pick { display: none; }                                /* the phone's sort and size pickers */
+.sc-sum, .sc .narrow, .legs-pair { display: none; }        /* what the small phone shows in place of a column or a reading */
+.sc-none { padding: var(--s-6) 0; border-top: 1px solid var(--rule); font: var(--t-label); color: var(--silver); max-width: 46em; }
+.sc-foot { margin-top: var(--s-5); font: 400 13px/1.55 var(--font); color: var(--silver); max-width: 62em; text-wrap: pretty; }
 
-/* the sentence that answers the screen, and what the list holds */
-.w-head { padding: 56px var(--gutter) 32px; }
-.w-answer { font: var(--t-display); letter-spacing: var(--track-display); max-width: 20ch; }
-.w-sub { margin-top: var(--s-4); font: var(--t-s); }
+.st { width: 100%; border-collapse: collapse; table-layout: auto; }
+.st th, .st td { padding: 11px 0 11px var(--s-5); text-align: right; white-space: nowrap; vertical-align: top; }
+.st th:first-child, .st td:first-child { padding-left: 0; text-align: left; }
+.st .l { text-align: left; }
+.st thead th { font: var(--t-note); color: var(--silver); font-weight: 400; padding-top: 0; padding-bottom: 12px; vertical-align: bottom; }
+.st thead button { font: inherit; color: inherit; white-space: nowrap; transition: color var(--dur) var(--ease); }
+.st thead button:hover, .st thead .by button { color: var(--chalk); }
+.st thead button i { font: 400 11px/1 var(--mono); font-style: normal; margin-left: 5px; color: var(--chalk); }
+.st tbody tr { border-top: 1px solid var(--rule); }
+.st tbody tr.go { cursor: pointer; }
+.st tbody tr.go:hover { background: var(--sel); box-shadow: -12px 0 0 var(--sel), 12px 0 0 var(--sel); }
+.st tbody td { font: var(--t-read); letter-spacing: var(--track-mono); color: var(--chalk); }
+.st td small { display: block; margin-top: 3px; font: var(--t-read-s); letter-spacing: var(--track-mono); color: var(--silver); }
+.st td.w { font: 400 14px/1.4 var(--font); letter-spacing: 0; color: var(--chalk); white-space: normal; }
+.st td.w small { font: var(--t-read-s); }
+.st td.a { font: 600 15px/1.4 var(--font); letter-spacing: 0; }
+.st td.a a { color: inherit; }
+.st td.a a:hover { text-decoration: underline; text-underline-offset: 3px; }
+.st td.a small { font: 400 12px/1.4 var(--font); letter-spacing: 0; white-space: normal; max-width: 15em; }
+.st td.a small.held { color: var(--level); }
+.st td.a small.veto, .st td.a small.refused { color: var(--silver); }
+.st .dimmed td { color: var(--silver); }
+.st .dimmed td.a, .st .dimmed td.w { color: var(--silver); }
+.st .dimmed td small { color: var(--pewter); }
+.st .stale td { opacity: .6; }
+.st .none { color: var(--pewter); font-weight: 400; }
+.st .struck { text-decoration: line-through; text-decoration-color: var(--pewter); color: var(--silver); }
 
-/* everything the desk may not trade now, folded */
-.w-closed { margin-top: 28px; }
-.w-closed summary { list-style: none; display: flex; justify-content: space-between; align-items: center; padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); cursor: pointer; }
-.w-closed summary::-webkit-details-marker { display: none; }
-.w-closed[open] summary .chev { transform: rotate(-135deg); margin-bottom: -2px; }
-.w-closed .gr { padding: 14px 0; border-bottom: 1px solid var(--line); }
-.w-closed .gr b { display: block; font-weight: 400; }
-.w-closed .gr > span { display: block; font: var(--t-s); color: var(--ink-2); margin-top: 4px; }
-.w-closed .coin { font: inherit; color: var(--ink-2); padding: 2px 0; }
-.w-closed .coin:hover { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
+/* the net on one scale for every row: zero, the dot, the owner's minimum as a dotted line down the column */
+.st td.sc-net { width: 30%; min-width: 220px; padding-top: 0; padding-bottom: 0; vertical-align: middle; }
+.sc-scale { display: grid; grid-template-columns: 64px minmax(0, 1fr); align-items: center; column-gap: 14px; height: 100%; }
+.sc-scale b { font: var(--t-read); letter-spacing: var(--track-mono); text-align: right; }
+.sc-track { position: relative; height: 44px; }
+.sc-track::before { content: ''; position: absolute; left: 0; right: 0; top: 50%; border-top: 1px solid var(--rule); }
+.sc-track .zero { position: absolute; top: 14px; bottom: 14px; width: 1px; background: var(--pewter); }
+.sc-track .min { position: absolute; top: -1px; bottom: 0; width: 0; border-left: 1px dotted var(--silver); }
+.sc-track .stem { position: absolute; top: 50%; height: 1px; background: var(--pewter); }
+.sc-track .pt { position: absolute; top: 50%; width: 7px; height: 7px; margin: -3.5px 0 0 -3.5px; border-radius: 50%; background: var(--chalk); }
+.sc-track .pt.held { background: var(--level); }
+.sc-track .pt.off { background: none; border: 1px solid var(--pewter); }
+.dimmed .sc-track .pt { background: var(--pewter); }
+.st thead .sc-axis { position: relative; height: 14px; margin-left: 78px; font: var(--t-tick); color: var(--pewter); }
+.st thead .sc-axis span { position: absolute; bottom: 0; transform: translateX(-50%); }
+.st thead .sc-axis span.m { color: var(--silver); }
 
-/* lines over the list: venues that did not answer, a fired alert, a minimum that could not be read */
-.w-notice { display: flex; gap: var(--s-4); align-items: baseline; padding: 14px 0; border-bottom: 1px solid var(--line); font: var(--t-s); }
-.w-notice b { color: var(--watch); font-weight: 500; }
-.w-notice span { color: var(--ink-2); }
-/* A fact, not a risk: no desk is loaded. Colour is for state, so it is plain. */
-.w-notice.calm { background: none; }
-.w-notice.calm b { color: var(--ink); white-space: nowrap; flex: none; }
+/* an asset's venues on its own scale: a tick each, the desk's venues brighter */
+.lad { position: relative; height: 22px; min-width: 150px; }
+.lad::before { content: ''; position: absolute; left: 0; right: 0; top: 50%; border-top: 1px solid var(--rule); }
+.lad i { position: absolute; top: 5px; bottom: 5px; width: 1px; background: var(--pewter); }
+.lad i.d { background: var(--chalk); top: 3px; bottom: 3px; }
+.lad i.z { top: 9px; bottom: 9px; background: var(--rule); width: 1px; }
 
-/* ---------- rows ---------- */
-.w-rows { position: relative; border-top: 1px solid var(--line); }
-.w-item { display: grid; grid-template-columns: 1fr 88px 92px; column-gap: var(--s-4); align-items: center; padding: 16px; margin: 0 -16px; border-bottom: 1px solid var(--line); position: relative; cursor: pointer; outline: none; transition: background-color var(--dur) var(--ease), opacity var(--dur) var(--ease); }
-.w-item:hover:not(.sel) { background: var(--sel); }
-.w-item:focus-visible { box-shadow: inset 0 0 0 1px var(--ink-3); }
-.w-item .a { font: var(--t-l); display: flex; align-items: baseline; min-width: 0; }
-.w-item .st { font: var(--t-s); margin-left: 10px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-.w-item .st.held { color: var(--ink); }
-.w-item .st.veto { color: var(--watch); }
-.w-item .st.refused { color: var(--danger); }
-.w-spark { display: block; width: 88px; height: 24px; }
-.w-spark polyline { fill: none; stroke: var(--ink-2); stroke-width: 1.25; }
-.w-item.sel .w-spark polyline { stroke: var(--ink); }
-.w-item .netv { font: var(--t-l); text-align: right; }
-.w-item .s { grid-column: 1 / -1; display: flex; justify-content: space-between; gap: var(--s-3); font: var(--t-s); color: var(--ink-2); margin-top: 3px; }
-.w-item .s > span { white-space: nowrap; }
-.w-item .s > span:first-child { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-.w-item.sel { background: var(--sel); }
-/* Rotate on the selected row: the confirm and the engine's answer sit on a line of their own under the numbers. */
-.w-item .rot { grid-column: 1 / -1; display: flex; justify-content: flex-end; align-items: center; flex-wrap: wrap; gap: var(--s-2) var(--s-3); margin-top: var(--s-3); font: var(--t-s); color: var(--ink-2); cursor: default; }
-.w-item .rot .ask { display: inline-flex; align-items: center; flex-wrap: wrap; gap: var(--s-2) var(--s-3); }
-.w-item .rot .ink { color: var(--ink); }
-.w-item .rot .btn { height: 28px; }
-.w-item.below { opacity: .4; }
-.w-item.stale { opacity: .45; }
-.w-item.below.stale { opacity: .22; }
-.struck { text-decoration: line-through; text-decoration-thickness: 1px; color: var(--ink-2); }
-.w-minline { padding: 10px 0 8px; border-bottom: 1px solid var(--ink-3); font: var(--t-s); color: var(--ink-2); text-align: right; }
-.w-none { padding: var(--s-5) 0; font: var(--t-s); color: var(--ink-2); }
-
-/* ---------- detail stage ---------- */
-.w-detail { padding: 0 var(--gutter) 32px 0; display: flex; flex-direction: column; }
-.w-coin { display: flex; justify-content: space-between; align-items: baseline; gap: var(--s-4); }
-.w-coin b { font: var(--t-xl); letter-spacing: var(--track-xl); }
-.w-coin span { font: var(--t-s); }
-.w-big { margin-top: 28px; }
-.w-big b { display: block; font: var(--t-hero); letter-spacing: var(--track-hero); }
-.w-big p { margin-top: var(--s-3); font: var(--t-s); }
-.w-big p.w-status { margin-top: var(--s-1); }
-.w-three { margin-top: 36px; }
-.w-three .kv { font: var(--t-body); padding: 14px 0; }
-.w-three .kv.tot { border-bottom: 0; }
-.w-three .kv.sub { font: var(--t-s); padding: 8px 0 8px var(--s-4); }
-.w-costs summary { list-style: none; cursor: pointer; }
-.w-costs summary::-webkit-details-marker { display: none; }
-.w-costs[open] summary .chev { transform: rotate(-135deg); margin-bottom: -2px; }
-.w-checks { margin-top: 28px; margin-bottom: var(--s-6); }
-.w-checks summary { list-style: none; display: flex; justify-content: space-between; align-items: center; padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); cursor: pointer; }
-.w-checks summary::-webkit-details-marker { display: none; }
-.w-checks[open] summary .chev { transform: rotate(-135deg); margin-bottom: -2px; }
-.w-checks[open] summary { margin-bottom: var(--s-3); }
-.w-checks p { margin: 0 0 10px; font: var(--t-s); color: var(--ink); }
-.w-checks p.ok::before { content: '\2713'; color: var(--pos); margin-right: 8px; }
-.w-checks p.bad::before { content: '\00d7'; color: var(--danger); margin-right: 8px; }
-.w-checks p.g { color: var(--ink-2); }
-.w-back { display: none; }
-.w-dtop { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--s-5); }
-.w-dtop h1 { font: var(--t-display); letter-spacing: var(--track-display); }
-.w-dtop h1 + p { margin: 12px 0 0; color: var(--ink-2); }
-.w-dtop p.w-facts { margin: 4px 0 0; font: var(--t-s); color: var(--ink-2); }
-.w-dtop .n { text-align: right; flex: none; }
-.w-dtop .n b { display: block; font: var(--t-display); letter-spacing: var(--track-display); }
-.w-dtop .n b.struck { text-decoration-thickness: 2px; }
-.w-dtop .n > span { display: block; margin-top: 10px; }
-.w-dtop .n > span + span { margin-top: 4px; }
-
-.w-chart { margin-top: 40px; }
-.w-chart .cap { display: flex; justify-content: space-between; gap: var(--s-4); font: var(--t-s); color: var(--ink-2); margin-bottom: var(--s-2); }
-.w-chart .cap .own { color: var(--ink); }
-.w-chart svg { display: block; }
-.w-chart svg text { font: 400 11px var(--font); fill: var(--ink-2); }
-.w-chart-msg { display: flex; align-items: center; flex-wrap: wrap; align-content: center; font: var(--t-s); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-.w-chart-sk { width: 100%; }
-
-.w-cols2 { display: grid; grid-template-columns: 1fr 1fr; column-gap: 56px; margin-top: var(--s-5); margin-bottom: var(--s-6); }
-.w-cols2 h3 { font: var(--t-s); color: var(--ink-2); margin: 0 0 12px; }
-
-/* the cost waterfall: gross, then what each cost takes, then net */
-.k-gross { --sw: var(--ink); }
-.k-net { --sw: var(--level); }
-.k-fees { --sw: var(--ink-2); }
-.k-slippage { --sw: color-mix(in srgb, var(--ink-2) 62%, var(--bg)); }
-.k-basis { --sw: var(--ink-3); }
-.k-reserve { --sw: var(--line-2); }
-.stack { display: flex; height: 8px; gap: 2px; }
-.stack i { display: block; height: 8px; background: var(--sw); }
-.legend { margin-top: 12px; font: var(--t-s); }
-.legend > div { display: flex; justify-content: space-between; gap: var(--s-4); padding: 5px 0; }
-.legend > div > span:first-child { color: var(--ink-2); }
-.legend > div > span:first-child i { display: inline-block; width: 8px; height: 8px; margin-right: 8px; background: var(--sw); }
-.legend .tot { border-top: 1px solid var(--line-2); margin-top: 4px; padding-top: 8px; }
-.legend .tot > span { color: var(--ink) !important; }
-.legend .tot > span.neg { color: var(--danger) !important; }
-
-.w-verdict p { margin: 0 0 10px; font: var(--t-s); color: var(--ink); }
-.w-verdict p.ok::before { content: '\2713'; color: var(--pos); margin-right: 8px; }
-.w-verdict p.bad::before { content: '\00d7'; color: var(--danger); margin-right: 8px; }
-.w-verdict p.g { color: var(--ink-2); }
-
-/* the decision line sits at the bottom of the stage */
-.w-cta { margin-top: auto; display: flex; align-items: center; gap: var(--s-4); padding-top: 20px; border-top: 1px solid var(--line); font: var(--t-s); color: var(--ink-2); }
-.w-cta .ink { color: var(--ink); }
+/* ---------- one pair ---------- */
+.w-crumb { padding: 22px var(--gutter) 0; font: var(--t-s); }
+.w-crumb a { color: var(--silver); transition: color var(--dur) var(--ease); }
+.w-crumb a:hover { color: var(--chalk); }
+.w-crumb + .top { padding-top: 22px; }
+.w-cta { display: flex; align-items: center; gap: var(--s-4); margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--rule); font: var(--t-s); color: var(--silver); }
+.w-cta + .w-cta { margin-top: 18px; }
+.w-cta .ink { color: var(--chalk); }
 .w-cta .end { margin-left: auto; display: flex; gap: var(--s-2); flex: none; }
 .w-cta .btn.quiet { white-space: normal; text-align: right; height: auto; min-height: 36px; }
+.w-chk { list-style: none; margin: 0; padding: 0; }
+.w-chk li { display: grid; grid-template-columns: 22px minmax(0, 1fr); column-gap: var(--s-2); padding: 11px 0; border-top: 1px solid var(--rule); font: 400 14px/1.5 var(--font); color: var(--silver); }
+.w-chk li:first-child { border-top: 0; padding-top: 0; }
+.w-chk li i { font-style: normal; font: 400 13px/1.6 var(--mono); color: var(--level); }
+/* A check that fails is a hollow ring in the watch colour: the mark, not a fill. */
+.w-chk li.bad i::before { content: ''; display: inline-block; width: 7px; height: 7px; margin: 6px 0 0 1px; border: 1.5px solid var(--watch); border-radius: 50%; box-sizing: content-box; vertical-align: top; }
+.w-chk li.bad { color: var(--chalk); }
+.w-chk.plain li { grid-template-columns: minmax(0, 1fr); max-width: 62em; }
+.w-chk li small { display: block; font: inherit; color: var(--watch); }
+.w-chart-msg { display: flex; align-items: center; flex-wrap: wrap; gap: 0 6px; font: var(--t-note); border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); padding: 0 2px; }
+.w-chart-sk { background: var(--sel); }
+.w-gone { padding: 0 var(--gutter); }
 
-/* ---------- empty state ---------- */
-.w-state { height: 100%; display: flex; flex-direction: column; }
-.w-state .w-notice { padding-left: var(--gutter); }
-.w-state-msg { margin: auto; width: 640px; max-width: 100%; padding: 0 var(--s-4); text-align: center; transform: translateY(-5%); }
-.w-state-msg .lab { font: var(--t-s); color: var(--ink-2); }
-.w-state-msg h1 { font: var(--t-xl); letter-spacing: var(--track-xl); margin: 14px 0 0; }
-.w-state-msg p { color: var(--ink-2); margin: 16px auto 0; max-width: 560px; }
-.w-state-msg p b { color: var(--ink); font-weight: 400; }
-.w-state-msg .go { display: flex; justify-content: center; gap: 10px; margin-top: 28px; }
+/* An asset across its venues, and its other pairs: the instrument table, a small track per row. The two venues of
+   the pair on the page are bright; the rest are there to compare against. */
+.tb.acr tbody th { white-space: nowrap; }
+.tb.acr tbody th small { display: block; font: var(--t-read-s); color: var(--silver); }
+.tb.acr tbody th small.up { color: var(--level); }
+.tb.acr tbody tr.on th, .tb.acr tbody tr.on th a { color: var(--chalk); }
+.tb.acr tbody tr:not(.on) td { color: var(--silver); font-weight: 400; }
+.tb.acr td.acr-t, .tb.acr th.acr-t { width: 36%; min-width: 110px; padding-top: 0; padding-bottom: 0; vertical-align: middle; }
+.tb.acr .sc-track { height: 24px; }
+.tb.acr .sc-track .zero { top: 5px; bottom: 5px; }
+.tb.acr th a { text-decoration: underline; text-decoration-color: var(--rule); text-underline-offset: 4px; transition: text-decoration-color var(--dur) var(--ease); }
+.tb.acr th a:hover { text-decoration-color: var(--chalk); }
+.lk { color: var(--chalk); text-decoration: underline; text-decoration-color: var(--pewter); text-underline-offset: 3px; transition: text-decoration-color var(--dur) var(--ease); }
+.lk:hover { text-decoration-color: var(--chalk); }
 
-/* ---------- loading: placeholder bars where the figures go ---------- */
-.sk { display: block; background: var(--sel); }
-.w-head .sk, .w-tabs .sk { flex: none; }
-.w-head .w-live-sk { margin-left: auto; }
-.w-detail-sk .w-dtop .n { flex: 1; }
+/* ---------- loading: still bars in the frame the figures take ---------- */
+.w-sk-row { display: flex; gap: var(--s-6); padding: 16px 0; border-top: 1px solid var(--rule); }
+.w-sk-row i { display: block; height: 16px; background: var(--sel); }
 
-/* ---------- a narrow desktop, 1024 to 1279 px: the 600 px list left the stage too little room for its own content
-   (the asset and the net APR side by side, two columns under the chart). The list gives up 120 px, the stage its outer
-   air, the asset and the net APR step down from 72 to 56 px so they stay side by side, and the two blocks under the
-   chart stack. ---------- */
-@media (min-width: 1024px) and (max-width: 1279px) {
-  .w-split { grid-template-columns: 480px minmax(0, 1fr); column-gap: 48px; }
-  .w-big b { font-size: 88px; }
-  .w-dtop { flex-wrap: wrap; row-gap: var(--s-4); }
-  .w-dtop > div:first-child { flex: 1 1 0; min-width: 0; }   /* the asset's lines wrap beside the net APR */
-  .w-dtop h1, .w-dtop .n b { font-size: 56px; }
-  .w-cols2 { grid-template-columns: minmax(0, 1fr); row-gap: var(--s-5); }
+/* ---------- the narrow desktop ---------- */
+@media (min-width: 1024px) and (max-width: 1359px) {
+  .st .c-vol { display: none; }
+  .st th, .st td { padding-left: var(--s-4); }
+  .st td.sc-net { min-width: 190px; }
+}
+@media (min-width: 1024px) and (max-width: 1179px) {
+  .st .c-gap { display: none; }
+  .sc-ctl { column-gap: var(--s-6); }
+  .sc-ctl .field { flex-basis: 200px; }
 }
 
-/* ---------- phone: up to 1023 px, one column; the list and the detail are separate pages ---------- */
+/* ---------- phone: a pair is three lines, not ten columns ---------- */
 @media (max-width: 1023px) {
-  .phone-only { display: inline; }
-  .desk-only { display: none; }
-  .w-hint { display: block; margin-top: var(--s-2); padding: 12px 0; font: var(--t-s); color: var(--ink-2); }
-
-  .w-page { display: block; height: auto; }
-  .w-page.detail-open > .w-head { display: none; }
-  .w-head { padding: 20px var(--gutter) 20px; }
-  .w-answer { font: 600 36px/1.06 var(--display); letter-spacing: -0.03em; max-width: none; }
-  .w-split { display: block; height: auto; padding: 0; }
-  .w-list { padding: 0 var(--gutter) var(--s-5); }
-  .w-big b { font: 600 72px/1 var(--display); letter-spacing: var(--track-hero); }
-  .w-three .kv { font: var(--t-m); }
-  .w-list, .w-detail { overflow: visible; }
-  .w-list { border-right: 0; }
-  .w-split.detail-open .w-list { display: none; }
-
-
-  .w-notice { display: block; padding: 14px 0; }
+  .w-notes { margin: -8px 0 26px; }
+  .w-notice { display: block; }
   .w-notice b { display: block; margin-bottom: 2px; }
-
-  .w-item { grid-template-columns: 1fr 64px 64px; column-gap: var(--s-3); padding: 14px var(--gutter); margin: 0 calc(-1 * var(--gutter)); }
-  .w-item .st { margin-left: var(--s-2); }
-  .w-item .s { margin-top: var(--s-1); }
-  .w-spark { width: 64px; height: 20px; }
-  .w-none { padding: var(--s-4) 0; }
-
-  .w-detail { display: block; padding: 0 var(--gutter) var(--s-5); }
-  .w-detail-sk { display: none; }
-  .w-back { display: block; padding: var(--s-4) 0 var(--s-3); font: var(--t-s); color: var(--ink-2); }
-  .w-dtop { flex-wrap: wrap; row-gap: var(--s-4); }
-  .w-dtop h1 { font: 400 40px/1.05 var(--display); letter-spacing: var(--track-xl); }
-  .w-dtop .n { text-align: left; }
-  .w-dtop .n b { font: 400 40px/1 var(--display); letter-spacing: var(--track-xl); }
-  .w-chart { margin-top: var(--s-5); }
-  .w-cols2 { grid-template-columns: 1fr; row-gap: var(--s-5); margin-bottom: var(--s-5); }
+  .sc { padding-bottom: var(--s-6); }
+  .sc-bar { flex-direction: column; gap: 2px; }
+  .sc-bar > span { text-align: left; }
+  .sc-ctl { gap: 10px var(--s-5); padding: 18px 0; }
+  .sc-ctl > .seg:first-child { flex: 1 1 100%; }            /* the scopes take a row; the two pickers share the next */
+  .sc-ctl .field { flex: 1 1 100%; margin-left: 0; order: 9; }
+  .sc-ctl .oi, .sc-ctl .lbl { display: none; }
+  .sc-pick { display: flex; align-items: center; gap: 6px; font: var(--t-s); color: var(--pewter); }
+  .sc-pick select { appearance: none; background: none; border: 0; border-bottom: 1px solid var(--rule); border-radius: 0; color: var(--chalk); font: var(--t-s); padding: 6px 2px; }
+  .sc-pick select option { background: var(--raised); color: var(--chalk); }
+  .ml { list-style: none; margin: 0; padding: 0; }
+  .ml li { border-top: 1px solid var(--rule); }
+  .ml a { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: var(--s-4); row-gap: 3px; padding: 14px 0; color: inherit; }
+  .ml .a { font: 600 17px/1.3 var(--font); color: var(--chalk); }
+  .ml .a small { font: 400 12px/1.3 var(--font); color: var(--silver); margin-left: 8px; }
+  .ml .a small.held { color: var(--level); }
+  .ml .n { font: 500 17px/1.3 var(--mono); letter-spacing: var(--track-mono); color: var(--chalk); text-align: right; }
+  .ml .v { font: 400 14px/1.4 var(--font); color: var(--silver); min-width: 0; }
+  .ml .s { font: 400 13px/1.5 var(--mono); letter-spacing: var(--track-mono); color: var(--silver); text-align: right; white-space: nowrap; }
+  .ml .x { grid-column: 1 / -1; font: 400 12px/1.5 var(--mono); letter-spacing: var(--track-mono); color: var(--pewter); }
+  .ml .dimmed .a, .ml .dimmed .n { color: var(--silver); }
+  .ml .none { color: var(--pewter); font-weight: 400; }
+  .w-crumb { padding-top: 14px; }
+  .w-crumb + .top { padding-top: 14px; }
   .w-cta { flex-direction: column; align-items: stretch; gap: var(--s-3); }
   .w-cta .end { margin-left: 0; flex-direction: column; }
   .w-cta .btn.quiet { text-align: center; }
-
-  .w-state { height: auto; min-height: calc(100dvh - 56px - 96px); }
-  .w-state-msg { width: auto; transform: none; padding: var(--s-5) var(--gutter); text-align: left; }
-  .w-state-msg p { margin-left: 0; }
-  .w-state-msg .go { flex-direction: column; justify-content: stretch; }
-  .w-state-msg .go .btn { width: 100%; }
-  .w-state-msg h1 { font: 400 32px/1.1 var(--display); letter-spacing: var(--track-xl); }
+}
+/* ---------- the small phone: the list is on the first screen, and a table keeps the columns that fit ---------- */
+@media (max-width: 639px) {
+  .sc-top { row-gap: 12px; padding-bottom: 22px; }
+  .sc-top .rd { display: none; }
+  .sc-sum { display: block; font: var(--t-s); color: var(--silver); }
+  .w-notes .wide, .sc .wide { display: none; }
+  .sc .narrow { display: inline; }
+  .w-notes { margin: -6px 0 18px; }
+  .w-notice { padding: 12px 0; }
+  .sc-bar { flex-direction: row; flex-wrap: wrap; gap: 2px var(--s-4); }
+  .sc-bar .seg { gap: 4px 20px; }
+  .sc-ctl { gap: 8px var(--s-5); padding: 12px 0 14px; }
+  /* the scopes stay on one line and scroll sideways past the screen's edge */
+  .sc-ctl > .seg:first-child { flex: 1 1 100%; flex-wrap: nowrap; gap: 18px; overflow-x: auto; scrollbar-width: none; margin-right: calc(-1 * var(--gutter)); padding-right: var(--gutter); }
+  .sc-ctl > .seg:first-child::-webkit-scrollbar { display: none; }
+  .tb.acr .acr-x { display: none; }
+  .tb.acr td.acr-t, .tb.acr th.acr-t { width: 30%; min-width: 72px; }
+  .tb.acr thead th { white-space: normal; }
+  .tb.legs .c-pair { display: none; }
+  .pn .rd.legs-pair { display: block; margin-top: 0; }
 }

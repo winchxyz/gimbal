@@ -78,8 +78,11 @@ test('GET /state: the mode, the latest scan and windows, the strategy with its r
   assert.equal(status, 200);
   const state = json as EngineState;
   assert.equal(state.mode, 'replay');
-  assert.deepEqual(state.scan, { venues: 2, failed: [], at: T0 });
+  const source = (id: string) => ({ id, kind: 'desk', markets: 1, oiUsd: 5_000_000, volume24hUsd: null, readAt: T0, ok: true });
+  assert.deepEqual(state.scan, { venues: 2, failed: [], at: T0, sources: [source('hyperliquid'), source('phoenix')] });
   assert.deepEqual(state.windows!.map((w) => w.id), ['sol-phoenix-hyperliquid']);
+  // Each side of the window as its venue lists it: the long pays 0.00001/h, the short receives 0.00005/h.
+  assert.deepEqual(state.windows!.map((w) => [w.legs!.long.ratePerHour, w.legs!.short.ratePerHour]), [[0.00001, 0.00005]]);
   assert.deepEqual(state.strategy!.risk, { watchDistancePct: 15, rescueDistancePct: 8 });
   assert.deepEqual(state.journal, []);
   assert.equal(state.desk, null);
