@@ -1,4 +1,5 @@
-import type { ReactNode } from 'react';
+import { useMemo, type ReactNode } from 'react';
+import { Sentences } from '../ui/Sentences.tsx';
 import type { DeskState, JournalEntry, Leg, ScanStatus, StrategyConfig, StrategyDecision, VenueId, Window as FundingWindow } from '@gimbal/shared';
 import { clock } from '../journal/entry.ts';
 import { heldSymbolOf, latestOf, storyOf, type StoryItem } from '../journal/story.ts';
@@ -51,22 +52,11 @@ export function DeskScreen() {
 
 /** The sentence; only the rate carries a colour (mint earning, coral losing). */
 export function Answer({ a }: { a: DeskAnswer }) {
+  const windows = useStream((s) => s.windows);
+  const symbols = useMemo(() => [...new Set((windows ?? []).map((w) => w.symbol))], [windows]);
   return (
     <h1 className={cx('answer', answerText(a).length > 54 && 'long')} data-testid="desk-answer">
-      {a.verb === null ? (
-        a.rest
-      ) : (
-        <>
-          {a.verb}
-          {a.rate === null ? null : (
-            <>
-              {' '}
-              <span className={a.tone ?? undefined}>{a.rate}</span>
-            </>
-          )}
-          {a.rest}
-        </>
-      )}
+      <Sentences parts={a.verb === null ? [a.rest] : [a.rate === null ? a.verb : `${a.verb} `, a.rate === null ? null : { text: a.rate, tone: a.tone }, a.rest]} symbols={symbols} />
     </h1>
   );
 }

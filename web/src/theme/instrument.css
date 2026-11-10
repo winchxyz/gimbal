@@ -6,6 +6,8 @@
 /* ---------- a screen's top: the sentence, and beside it the three readings that back it ---------- */
 .top { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 330px); column-gap: var(--s-8); align-items: end; padding: 44px var(--gutter) 56px; }
 .top .answer { max-width: 13.6em; }
+.answer .ln { display: block; text-wrap: balance; }
+.answer .tk { font-family: var(--mono); font-weight: 500; font-size: 0.9em; letter-spacing: -0.045em; }   /* a coin's ticker, as the tables print it */
 .top .answer.long { font-size: 52px; line-height: 1.06; max-width: 17em; }
 
 /* ---------- readings: a label in the brand's type, its value in mono, a hairline between rows ---------- */

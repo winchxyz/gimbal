@@ -18,6 +18,7 @@ import { VENUE_NAMES } from '../shell/status.ts';
 import { useStream } from '../stream/hub.ts';
 import { cx } from '../ui/cx.ts';
 import { Flash } from '../ui/Flash.tsx';
+import { Sentences } from '../ui/Sentences.tsx';
 import { Panel, Readings, type Reading as PanelReading } from '../ui/Panel.tsx';
 import { pct, usd } from '../windows/format.ts';
 import { deskMissing, heldWindow } from '../windows/model.ts';
@@ -80,9 +81,7 @@ export function SafetyScreen() {
             </>
           ) : (
             <h1 className={cx('answer', (a.lead + (a.figure ?? '') + a.rest).length > 54 && 'long')} data-testid="safety-answer">
-              {a.lead}
-              {a.figure === null ? null : <span className={a.tone ?? undefined}>{a.figure}</span>}
-              {a.rest}
+              <Sentences parts={[a.lead, a.figure === null ? null : { text: a.figure, tone: a.tone }, a.rest]} />
             </h1>
           )}
         </div>
