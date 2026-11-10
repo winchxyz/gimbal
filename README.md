@@ -50,12 +50,18 @@ before NEAR's MPC network signs it. The engine that trades and moves margin can 
   owner opened it from the hosted demo's owner console, again as an owner demo entry, after the NEAR AI risk check
   passed ([Hyperliquid leg](https://nearblocks.io/txns/SdYWNMUp4gyqjx3nBQibUKbnXffLum6pj6fChwV2z9q),
   [Phoenix leg](https://nearblocks.io/txns/2Gk3rxrpsDyuwJQoyRBSyVscsPpppX9hEtQRN6Fr22Nh)), and closed it from the same
-  console at 21:17 UTC with Close pair, recorded for the demo video. The contract signed three reduce-only post-only
+  console at 21:17 UTC with Close pair. The contract signed three reduce-only post-only
   Hyperliquid buys that were cancelled unfilled as the price moved, then a reduce-only IOC buy that filled
   ([NEAR](https://nearblocks.io/txns/BwovNwuKg9m13kQvo4CEbtLQVuyUmKgBNtRhhj3LpjR7),
   [Hyperliquid](https://app.hyperliquid.xyz/explorer/tx/0x03923a896ec48e43050b044871482e02023e006f09c7ad15a75ae5dc2dc8682d)),
   then the Phoenix sell ([NEAR](https://nearblocks.io/txns/CBxuqjxy2xCknbL46ZokR65A4PrEuqaNMW6X4Bvj9yCT),
   [Solscan](https://solscan.io/tx/2aj9kXAP3cSB4XoVxBU2sRecVZjLwUcKDAnncqxPNnCs6WJAjybh6dY6An8FRuyEueh4RnHo5sBSyQccirGgta4p)).
+- A third live pair has been held since 2026-11-10 05:21 UTC, and its entry is the one in the demo video: 633 MON a
+  leg (about 10.65 USD), long on Phoenix and short on Hyperliquid, 23 % net APR forecast at entry. The owner opened it
+  from the hosted demo's owner console after the NEAR AI risk check passed
+  ([contract call on NEAR](https://nearblocks.io/txns/8ktWNd1GhLFmmwc2FehW7WFn1rwe2BNkzVkNNBwm4Hng),
+  [Hyperliquid fill](https://app.hyperliquid.xyz/explorer/tx/0x0b6d9988233036b30ce70448776f3601f500b16dbe335585af3644dae234109d),
+  [Solana transaction](https://solscan.io/tx/3MePm9WPW5toesXzpQeY6ZbWvFxLTuoWHdi1qsZN3ttYVKKstPDwMAtDzTX4fKd2GRL3xM1skjCwFgPge9KedkFW)).
 
 Not yet: a live margin rescue on mainnet (the desk's rescue counters on chain are 0; [Status](#status-2026-11-04)).
 
@@ -69,11 +75,11 @@ only the owner, with the owner token, can unlock entering and closing). With
 no pair held it shows a flat desk and the scanner's windows, which is the truth. For the recorded replay (mainnet hour
 of 2026-10-31, x10, a stress test from Rescue), run `npm run demo`.
 
-<!-- SUBMISSION: fill the two link lines below on submit day, then delete this comment. -->
-- **Demo video:** TODO(submission): video link
-- **X post:** TODO(submission): X post link
-- **Status (2026-11-09):** two live pairs opened by the owner and closed on mainnet: the first (XLM) by the loop, net
-  -0.026 USD after fees; the second (MON) from the owner console after 18 hours; no live margin rescue yet. The dated details are under [Status](#status-2026-11-04)
+- **Demo video (88 s):** attached to the X post, https://x.com/winchxyz/status/2120244506650165624
+- **X post:** https://x.com/winchxyz/status/2120244506650165624
+- **Status (2026-11-10):** three live pairs opened by the owner on mainnet. The first (XLM) was closed by the loop, net
+  -0.026 USD after fees; the second (MON) from the owner console after 18 hours; the third (MON, the entry in the
+  demo video) is held; no live margin rescue yet. The dated details are under [Status](#status-2026-11-04)
 
 ## 30 seconds for a judge
 
@@ -271,10 +277,14 @@ Done (read from the chain and the venues' public APIs at about 08:10 UTC on 2026
   demo with the owner token: 716 MON a leg (about 11.5 USD), short on Hyperliquid, long on Phoenix, about 40 % net
   APR forecast at entry, NEAR AI risk check passed. The Hyperliquid post-only order was repriced three times before it
   filled as maker at 0.016013; Phoenix filled by IOC at 0.016012; entry fees 0.0068 USD. The strategy loop held it
-  until the owner closed it from the console at 21:17 UTC (recorded for the demo video): three reduce-only post-only
+  until the owner closed it from the console at 21:17 UTC: three reduce-only post-only
   Hyperliquid buys were cancelled unfilled as the price moved, a reduce-only IOC buy filled, then the Phoenix sell; flat
   at 21:19 UTC, 18 hours after entry.
   The transactions: [docs/onchain-evidence.md](docs/onchain-evidence.md#mainnet-desk-carry).
+- **2026-11-10: a third live pair, the entry in the demo video.** The owner opened MON from the hosted demo with the
+  owner token at 05:21 UTC: 633 MON a leg (about 10.65 USD), long on Phoenix (filled at 0.016831), short on
+  Hyperliquid (filled at 0.016822), 23 % net APR forecast at entry, NEAR AI risk check passed. The strategy loop holds
+  it. The transactions: [docs/onchain-evidence.md](docs/onchain-evidence.md#mainnet-desk-carry).
 - On testnet the same contract code refused 8 of 8 scripted malicious requests, 0 USDC moved
   ([below](#refusals-on-chain-npm-run-attack)).
 - On mainnet `gimbal_dex.near` refused a deliberately mispriced test Hyperliquid order with `E_PRICE_BAND`
