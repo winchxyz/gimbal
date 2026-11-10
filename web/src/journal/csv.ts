@@ -1,7 +1,7 @@
 // Export CSV (design/HANDOFF.md, Journal): the entries of the current filter as a file the owner can open in a
 // spreadsheet. Pure, so the quoting is tested.
 import type { JournalEntry } from '@gimbal/shared';
-import { amountUsd } from './entry.ts';
+import { moneyUsd } from './entry.ts';
 import { KINDS, type FilterId } from './kinds.ts';
 
 export const CSV_HEADER = ['time_utc', 'kind', 'summary', 'amount_usd', 'why', 'numbers', 'transactions'] as const;
@@ -20,7 +20,7 @@ export function cell(text: string): string {
 export const isoTime = (ms: number): string => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
 
 function row(entry: JournalEntry): string {
-  const amount = amountUsd(entry);
+  const amount = moneyUsd(entry);
   return [
     isoTime(entry.t),
     KINDS[entry.kind].label,

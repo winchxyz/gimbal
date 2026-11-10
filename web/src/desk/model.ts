@@ -2,7 +2,7 @@
 // rules in design/HANDOFF.md (Desk) are tested without a browser.
 import type { DeskState, JournalEntry, Leg, StrategyConfig, VenueId, Window as FundingWindow } from '@gimbal/shared';
 import { VENUE_NAMES, joinNames } from '../shell/status.ts';
-import { amountUsd, clock, proofLinks, unprotectedText } from '../journal/entry.ts';
+import { clock, moneyUsd, proofLinks, unprotectedText } from '../journal/entry.ts';
 import { dayMonthTime, hours, pct, plain, usd } from '../windows/format.ts';
 import { bestEnterable, heldWindow, venuePair } from '../windows/model.ts';
 import { perDayOnLegs } from '../windows/decision.ts';
@@ -287,7 +287,7 @@ export function latestEvents(journal: readonly JournalEntry[], now: number, limi
       : e.why
         ? { label: 'Why ↗', href: '#/journal' }
         : null;
-    return { id: e.id, when: whenLabel(e.t, now), ...splitSummary(e.summary), amountUsd: amountUsd(e), proof, unprotected: unprotectedText(e) };
+    return { id: e.id, when: whenLabel(e.t, now), ...splitSummary(e.summary), amountUsd: moneyUsd(e), proof, unprotected: unprotectedText(e) };
   });
 }
 
