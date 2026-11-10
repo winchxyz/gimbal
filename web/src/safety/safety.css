@@ -1,80 +1,63 @@
 /* Safety, brand book C. The sentence; each leg's distance on a line with the rescue and watch marks beside the reserve
-   and "Standing by"; then who can do what (the Security sections, security.css). Every value comes from tokens.css.
+   and the rescue's state; then who can do what (the Security sections, security.css). Every value comes from tokens.css.
    Colour sits on the distance, its point and the dot only. */
 
-.sf { padding-bottom: var(--s-8); }
-.sf-hero { padding: 72px var(--gutter) 0; }
-.sf-hero .answer { max-width: 900px; }
+.sf-pg { padding-top: 12px; }
+.sf-wide { grid-column: 1 / -1; min-width: 0; }
 
-/* the legs beside "Standing by": two even columns */
-.sf-two { display: grid; grid-template-columns: 1fr 1fr; column-gap: 64px; padding: 48px var(--gutter) 0; align-items: start; }
-.sf-none { font: var(--t-body); padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-.sf-leg { padding: 22px 0 14px; border-bottom: 1px solid var(--line); }
-.sf-leg:first-child { border-top: 1px solid var(--line); }
-.sf-leg .t { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--s-4); }
-.sf-leg .t b { font: var(--t-l); letter-spacing: -0.01em; font-weight: 600; }
-.sf-leg .d { text-align: right; font: 600 30px/1 var(--display); letter-spacing: -0.02em; }
-.sf-leg .d small { display: block; font: var(--t-s); color: var(--ink-2); letter-spacing: 0; margin-top: 8px; font-weight: 400; }
+/* one leg: its name, the distance in mono, and the line it sits on */
+.sf-leg { padding: 0 0 10px; }
+.sf-leg + .sf-leg { margin-top: 14px; padding-top: 18px; border-top: 1px solid var(--rule); }
+.sf-leg .t { display: flex; justify-content: space-between; align-items: baseline; gap: var(--s-4); }
+.sf-leg .t b { font: var(--t-label); font-weight: 600; color: var(--chalk); }
+.sf-leg .d { text-align: right; font: var(--t-big); letter-spacing: var(--track-big); white-space: nowrap; }
+.sf-leg .d small { font: var(--t-note); color: var(--silver); letter-spacing: 0; margin-left: 10px; }
 
 /* the distance line: 0 % at the left, 100 % at the right; marks at the rescue and watch lines */
-.sf-dl { position: relative; height: 44px; margin-top: 4px; }
-.sf-dl::before { content: ''; position: absolute; left: 0; right: 0; top: 14px; border-top: 1px solid var(--line-2); }
-.sf-dl .mk { position: absolute; top: 8px; width: 1px; height: 12px; background: var(--ink-3); }
-.sf-dl .lb { position: absolute; top: 26px; font: 12px/1 var(--font); color: var(--ink-2); white-space: nowrap; }
+.sf-dl { position: relative; height: 44px; margin-top: 10px; }
+.sf-dl::before { content: ''; position: absolute; left: 0; right: 0; top: 14px; border-top: 1px solid var(--pewter); }
+.sf-dl .mk { position: absolute; top: 8px; width: 1px; height: 12px; background: var(--silver); }
+.sf-dl .lb { position: absolute; top: 28px; font: var(--t-tick); color: var(--silver); white-space: nowrap; }
 .sf-dl .lb.l { transform: translateX(calc(-100% - 4px)); }
 .sf-dl .lb.r { transform: translateX(4px); }
-.sf-dl .pt { position: absolute; top: 10px; width: 9px; height: 9px; margin-left: -4.5px; border-radius: var(--r-dot); background: var(--ink-2); transition: left var(--dur) var(--ease); }
+.sf-dl .pt { position: absolute; top: 10px; width: 9px; height: 9px; margin-left: -4.5px; border-radius: var(--r-dot); background: var(--silver); transition: left var(--dur) var(--ease); }
 .sf-dl .pt.up { background: var(--level); }
 .sf-dl .pt.watch-t { background: var(--watch); }
 .sf-dl .pt.down { background: var(--danger); }
 
-.sf-stand { display: flex; justify-content: space-between; align-items: baseline; gap: var(--s-4); padding: 14px 0; border-bottom: 1px solid var(--line); }
-.sf-stand b { font: var(--t-l); font-weight: 600; letter-spacing: -0.01em; }
-.sf-stand > span { font: var(--t-s); color: var(--ink); white-space: nowrap; }
-.sf-dot { display: inline-block; width: 7px; height: 7px; border-radius: var(--r-dot); margin-right: 9px; vertical-align: 1px; background: var(--ink-3); }
+.sf-state { white-space: nowrap; }
+.sf-dot { display: inline-block; width: 7px; height: 7px; border-radius: var(--r-dot); margin-right: 9px; vertical-align: 1px; background: var(--pewter); }
 .sf-dot.up { background: var(--level); }
 .sf-dot.down { background: var(--danger); }
 .sf-dot.watch-t { background: var(--watch); }
-.sf-close { display: flex; justify-content: flex-end; padding: var(--s-4) 0; border-bottom: 1px solid var(--line); }
-.sf-guard .kv { font: var(--t-body); }
-.sf-lead { margin-top: var(--s-4); max-width: 70ch; font: var(--t-s); }
+.sf-close { display: flex; justify-content: flex-end; padding: 0 0 var(--s-4); }
+.sf-lead { max-width: 46em; font: var(--t-label); color: var(--silver); }
 
 /* earlier rescues and the stress test, under the reserve */
 .sf-standing { margin-top: var(--s-6); display: grid; gap: var(--s-6); }
 .sf-standing h3 { font: var(--t-s); color: var(--ink-2); margin: 0 0 var(--s-3); display: flex; justify-content: space-between; gap: var(--s-3); }
 .sf-standing .note { font: var(--t-s); color: var(--ink-2); margin: var(--s-3) 0 0; }
 
-/* the three columns' titles are row titles, not section titles (brand book C) */
-.sf .s-cols h2 { font: 600 15px/1.4 var(--font); letter-spacing: 0; margin: 0 0 10px; }
-
-/* the Security sections under it: the zero and the five steps beside the policy, then three columns */
-.sf .s-page { padding-top: 72px; }
-.sf .s-head { align-items: start; }
-.s-zero-col .s-zero { font: 600 120px/0.9 var(--display); letter-spacing: -0.04em; color: var(--ink); }
-.s-zero-text { font: var(--t-body) !important; color: var(--ink); margin: 18px 0 0 !important; }
-.s-zero-col p { color: var(--ink-2); margin: 10px 0 0; max-width: 34em; }
-.s-zero-col .s-flow { margin-top: 40px; }
-.s-zero-col .s-flow h3 { font-weight: 600; color: var(--ink); font-size: 15px; margin-bottom: 14px; }
-.s-policy h2 { font: 600 15px/1.4 var(--font) !important; margin: 0 0 4px !important; }
-.s-head .s-pshort { font: var(--t-body); color: var(--ink); margin: 0 0 var(--s-4); max-width: none; }
-.s-more summary { list-style: none; cursor: pointer; padding: 12px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); color: var(--ink); display: flex; justify-content: space-between; align-items: center; gap: var(--s-4); }
+/* the Security sections as panels: the keys, the policy, then who can do what in three columns */
+.sf .pn.s-page { padding: 16px 0 0; }
+.sf .pn-h h2 { font: var(--t-cap); letter-spacing: 0; margin: 0; }
+.sf .s-cols { margin-top: 0; column-gap: var(--s-6); }
+.sf .s-cols h2 { font: 600 15px/1.4 var(--font); letter-spacing: 0; margin: 0 0 10px; color: var(--chalk); }
+.sf .s-pshort { font: 600 22px/1.3 var(--display); letter-spacing: -0.015em; color: var(--chalk); margin: 0 0 var(--s-4); max-width: 30em; text-wrap: balance; }
+.sf .s-engine, .sf .s-sign { font: var(--t-note); color: var(--silver); }
+.sf .s-list li, .sf .s-yn li { border-top-color: var(--rule); }
+.s-more summary { list-style: none; cursor: pointer; padding: 12px 0; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); color: var(--chalk); display: flex; justify-content: space-between; align-items: center; gap: var(--s-4); }
 .s-more summary::-webkit-details-marker { display: none; }
-.s-more summary:hover { color: var(--ink); }
 .s-more[open] summary .chev { transform: rotate(-135deg); margin-bottom: -2px; }
 .s-more[open] summary { border-bottom: 0; }
-.s-record { margin-top: 64px; }
-.s-record > summary { color: var(--ink-2); }
+.s-record { margin-top: 48px; }
+.s-record > summary { color: var(--silver); font: var(--t-label); }
 
 @media (max-width: 1023px) {
-  .sf { padding-bottom: var(--s-6); }
-  .sf-hero { padding: 20px var(--gutter) 0; }
-  .sf-two { display: block; padding: 24px var(--gutter) 0; }
-  .sf-guard { margin-top: var(--s-5); }
-  .sf-leg .t b { font-size: 17px; }
-  .sf-leg .d { font-size: 24px; }
-  .sf-guard .kv { font: var(--t-m); }
-  .sf .s-page { padding-top: var(--s-6); border-top: 1px solid var(--line); margin-top: var(--s-6); }
-  .s-zero-col .s-zero { font-size: 72px; }
+  .sf-pg { padding-top: 8px; }
+  .sf-leg .d small { display: block; margin: 4px 0 0; }
+  .sf-state { white-space: normal; }
+  .sf .s-pshort { font-size: 19px; }
+  .sf .s-cols { display: block; padding: 0; margin-top: 0; border-top: 0; }
   .s-record { margin-top: var(--s-6); }
-  .s-policy { margin-top: var(--s-6); }
 }

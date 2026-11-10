@@ -3,6 +3,8 @@ import type { DeskState, JournalEntry } from '@gimbal/shared';
 import { signedUsd } from '../desk/format.ts';
 import { useStream } from '../stream/hub.ts';
 import { Flash } from '../ui/Flash.tsx';
+import { Readings, type Reading } from '../ui/Panel.tsx';
+import { cx } from '../ui/cx.ts';
 import { SCROLLER, takeFocus } from '../ui/scroller.ts';
 import { useNow } from '../ui/useNow.ts';
 import { dayMonth } from '../windows/format.ts';
@@ -20,6 +22,7 @@ import {
   filterCounts,
   foldOlder,
   groupByDay,
+  sinceLabel,
   visibleFeed,
 } from './model.ts';
 import { heldSymbolOf, storyOf, type StoryItem } from './story.ts';
@@ -117,6 +120,15 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
   const replay = desk?.mode === 'replay';
   const attribution = attributionOf(desk?.pnl ?? null, shown, desk?.legs ?? []);
 
+  const answerLength = headline !== null && !replay ? headline.length : journalAnswer(counts, replay).length;
+  // The three figures behind the sentence: what the entries add up to, and who signed them.
+  const readings: Reading[] = [
+    { label: `Net${sinceLabel(shown) === null ? '' : `, ${sinceLabel(shown)!.replace(/^S/, 's')}`}`, value: money(attribution.netUsd), tone: moneyTone(attribution.netUsd) },
+    { label: 'Funding received', value: money(attribution.fundingUsd), tone: moneyTone(attribution.fundingUsd) },
+    { label: replay ? 'Simulated actions' : 'Signed by the contract', value: counts.signed.toLocaleString('en-US') },
+    ...(replay ? [] : [{ label: 'Signed by a private key', value: '0' }]),
+  ];
+
   const showNew = () => {
     setFrozen(null);
     const calm = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -125,25 +137,28 @@ function JournalPage({ entries, desk, paging }: { entries: readonly JournalEntry
 
   return (
     <div className="j-page">
-      <section className="j-top">
-        <h1 className="answer wide" data-testid="journal-answer">
-          {headline !== null && !replay ? headline : <Flash value={counts.signed}>{journalAnswer(counts, replay)}</Flash>}
-        </h1>
-        <p className="j-sub g">
-          {replay ? 'Everything the replay desk did, on recorded mainnet prices.' : 'Everything the desk did, as the contract recorded it.'}
-          {counts.since === null
-            ? ''
-            : ` Since ${dayMonth(counts.since)}, ${counts.filters.all.toLocaleString('en-US')} ${counts.filters.all === 1 ? 'entry' : 'entries'}${counts.complete ? '' : ' loaded'}.`}{' '}
-          <button
-            type="button"
-            className="btn quiet j-desk"
-            disabled={listed.length === 0}
-            onClick={() => download(csvName(filter, Date.now()), toCsv(listed))}
-            title={`Download the ${listed.length} ${listed.length === 1 ? 'entry' : 'entries'} under ${filterLabel(filter)} as a CSV file`}
-          >
-            Export CSV
-          </button>
-        </p>
+      <section className="top j-top">
+        <div>
+          <h1 className={cx('answer', answerLength > 54 && 'long')} data-testid="journal-answer">
+            {headline !== null && !replay ? headline : <Flash value={counts.signed}>{journalAnswer(counts, replay)}</Flash>}
+          </h1>
+          <p className="j-sub">
+            {replay ? 'Everything the replay desk did, on recorded mainnet prices.' : 'Everything the desk did, as the contract recorded it.'}
+            {counts.since === null
+              ? ''
+              : ` Since ${dayMonth(counts.since)}, ${counts.filters.all.toLocaleString('en-US')} ${counts.filters.all === 1 ? 'entry' : 'entries'}${counts.complete ? '' : ' loaded'}.`}{' '}
+            <button
+              type="button"
+              className="btn quiet j-desk"
+              disabled={listed.length === 0}
+              onClick={() => download(csvName(filter, Date.now()), toCsv(listed))}
+              title={`Download the ${listed.length} ${listed.length === 1 ? 'entry' : 'entries'} under ${filterLabel(filter)} as a CSV file`}
+            >
+              Export CSV
+            </button>
+          </p>
+        </div>
+        <Readings rows={readings} shut className="j-desk" />
       </section>
 
       <Counts counts={counts} replay={replay} className="j-phone" />

@@ -216,7 +216,7 @@ export function engineRows(d: RulesDraft, words: string): RuleRow[] {
     {
       id: 'rotate',
       label: 'Rotate',
-      value: `to a window that is ${s.rotate.minGainPts} points better for ${s.rotate.forHours} hours in a row`,
+      value: `to a market that is ${s.rotate.minGainPts} points better for ${s.rotate.forHours} hours in a row`,
       source: d.model === null ? { kind: 'fixed', note: 'Set by you' } : { kind: 'ai', note: 'the defaults' },
       edit: 'rotate-gain',
     },

@@ -7,19 +7,20 @@
 @media (max-width: 1023px) { .j-desk { display: none !important; } }
 
 /* ---------- head: the sentence, what it counts, Export CSV; then the filters ---------- */
-.j-top { padding: 56px var(--gutter) 0; }
-.j-top .answer { font: var(--t-display); letter-spacing: var(--track-display); max-width: 24ch; }
-.j-sub { margin-top: var(--s-4); font: var(--t-s); }
+.top.j-top { padding-bottom: 0; }
+.j-top .answer { max-width: 15em; }
+.j-sub { margin-top: var(--s-4); font: var(--t-note); color: var(--silver); }
 .j-sub .btn { min-height: 0; margin-left: var(--s-3); font: var(--t-s); color: var(--ink); }
 .j-sub .btn:disabled { color: var(--ink-3); }
 .j-partial { margin-top: var(--s-3); font: var(--t-s); color: var(--ink-2); }
 
-.j-filters { display: flex; gap: 28px; padding: 0 var(--gutter); margin-top: 32px; border-bottom: 1px solid var(--line); }
-.j-filters button { color: var(--ink-2); padding-bottom: 14px; white-space: nowrap; transition: color var(--dur) var(--ease); }
-.j-filters button:hover { color: var(--ink); }
-.j-filters button .n { color: var(--ink-3); margin-left: 6px; }
+.j-filters { display: flex; gap: 28px; padding: 14px 0 12px; margin: 36px var(--gutter) 0; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+.j-filters button { font: var(--t-m); color: var(--silver); white-space: nowrap; transition: color var(--dur) var(--ease); }
+.j-filters button:hover { color: var(--chalk); }
+.j-filters button .n { font: 400 12px/1 var(--mono); color: var(--pewter); margin-left: 7px; }
 .j-filters button:disabled { cursor: default; }
-.j-filters button[aria-pressed='true'] { color: var(--ink); box-shadow: inset 0 -2px 0 var(--ink); }
+.j-filters button[aria-pressed='true'] { color: var(--chalk); font-weight: 600; }
+.j-filters button[aria-pressed='true'] .n { color: var(--silver); }
 
 .j-grid { display: grid; grid-template-columns: minmax(0, 1fr) 400px; }
 
@@ -34,19 +35,19 @@
 /* A short window gives the feed the room: less air above the title and the filters. The 800 px assumes the stack above
    the Journal: header (72) + at most one replay or read-only line (35), so the feed keeps about 420 px at 720 px. */
 @media (min-width: 1024px) and (max-height: 800px) {
-  .j-top { padding-top: var(--s-5); }
+  .top.j-top { padding-top: var(--s-5); }
   .j-filters { margin-top: var(--s-5); }
 }
 
 /* ---------- the feed ---------- */
 .j-feed { padding: 0 48px 64px var(--gutter); border-right: 1px solid var(--line); min-width: 0; }
-.j-day { font: var(--t-s); color: var(--ink-2); padding: 28px 0 10px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: var(--s-4); }
-.j-day h2 { font: inherit; }
+.j-day { font: 400 13px/1.4 var(--mono); letter-spacing: var(--track-mono); color: var(--silver); padding: 28px 0 10px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: var(--s-4); }
+.j-day h2 { font: var(--t-cap); color: var(--chalk); letter-spacing: 0; }
 
 .j-evt { display: grid; grid-template-columns: 76px 88px minmax(0, 1fr) 104px 200px; column-gap: var(--s-4); padding: var(--s-4) 0; border-bottom: 1px solid var(--line); align-items: baseline; }
 .j-lead { display: contents; }
 .j-lead .sep { display: none; }
-.j-evt .t { font: var(--t-s); color: var(--ink-3); }
+.j-evt .t { font: 400 12px/1.75 var(--mono); color: var(--silver); }
 .j-evt .k { font: var(--t-s); color: var(--ink-2); }
 .j-evt .k.watch { color: var(--watch); }
 .j-evt .k.danger { color: var(--danger); }
@@ -61,7 +62,7 @@
 .j-wait-list li { display: grid; grid-template-columns: 48px minmax(0, 1fr); column-gap: var(--s-3); padding: 4px 0; }
 .j-wait-list .t { color: var(--ink-3); }
 .j-wait-list .raw { display: block; color: var(--ink-3); margin-top: 2px; }
-.j-evt .amt { text-align: right; min-width: 0; }
+.j-evt .amt { text-align: right; min-width: 0; font: var(--t-read); letter-spacing: var(--track-mono); }
 .j-evt .amt .note { display: block; font: var(--t-s); color: var(--ink-3); }
 .j-evt .proof { font: var(--t-s); color: var(--ink-2); text-align: right; display: flex; flex-direction: column; gap: var(--s-1); white-space: nowrap; min-width: 0; }
 .j-evt .proof a { transition: color var(--dur) var(--ease); }
@@ -87,18 +88,20 @@
 
 /* ---------- the side column ---------- */
 .j-side { padding: var(--s-6) var(--gutter) 0 40px; min-width: 0; }
-.j-side h3 { font: var(--t-s); color: var(--ink-2); margin: 0 0 12px; }
-.j-side .big { font: var(--t-xl); letter-spacing: var(--track-xl); }
+.j-side h3 { font: var(--t-cap); color: var(--chalk); margin: 0 0 12px; }
+.j-side .big { display: block; margin: 0; font: var(--t-big); letter-spacing: var(--track-big); }
 .j-side .big + p { margin: 10px 0 0; font: var(--t-s); color: var(--ink-2); }
 .j-attr { margin-top: 28px; }
 .j-attr > div { display: flex; justify-content: space-between; gap: var(--s-3); padding: 9px 0; border-bottom: 1px solid var(--line); }
 .j-attr > div > span:first-child { color: var(--ink-2); }
-.j-attr > div > span:last-child { white-space: nowrap; }   /* a long label wraps; the amount beside it never does */
+.j-attr > div > span:last-child { white-space: nowrap; font: var(--t-read); letter-spacing: var(--track-mono); }
+.j-attr > div > span:first-child { font: var(--t-label); }   /* a long label wraps; the amount beside it never does */
 .j-attr > .tot { border-bottom: 0; border-top: 1px solid var(--ink-2); margin-top: -1px; }
 /* Counts: the label left, the count right and bold (brand book C, Journal) */
-.j-cnt h3 { font: var(--t-s); color: var(--ink-2); margin: 0 0 4px; }
+.j-cnt h3 { font: var(--t-cap); color: var(--chalk); margin: 0 0 4px; }
 .j-cnt .kv { align-items: baseline; }
-.j-cnt .kv b { font-weight: 600; font-size: 21px; letter-spacing: -0.01em; color: var(--ink); }
+.j-cnt .kv > span { font: var(--t-label); }
+.j-cnt .kv b { font: var(--t-read); letter-spacing: var(--track-mono); color: var(--chalk); }
 .j-note { font: var(--t-s); color: var(--ink-2); margin: 14px 0 0; }
 .j-side .j-since { margin-top: 40px; }
 .j-contract { margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--line); font: var(--t-s); color: var(--ink-2); }
@@ -136,8 +139,7 @@
 
 /* ---------- phone: up to 1023 px, one column ---------- */
 @media (max-width: 1023px) {
-  .j-top { padding: 20px var(--gutter) 0; }
-  .j-top .answer { font: 600 36px/1.06 var(--display); letter-spacing: -0.03em; max-width: none; }
+  .top.j-top { padding-bottom: 0; }
   .j-sub { margin-top: var(--s-3); }
 
   .j-summary { margin: var(--s-4) var(--gutter) 0; }
@@ -145,7 +147,7 @@
   .j-summary > div > span:first-child { color: var(--ink-2); }
 
   /* the six filters do not fit in 390 px: the row scrolls sideways instead of cutting them off */
-  .j-filters { gap: 18px; padding: 0 var(--gutter); margin-top: 3px; border-bottom: 0; overflow-x: auto; scrollbar-width: none; font: var(--t-s); }
+  .j-filters { gap: 18px; padding: 0; margin: 10px 0 0; padding-left: var(--gutter); padding-right: var(--gutter); border: 0; overflow-x: auto; scrollbar-width: none; font: var(--t-s); }
   .j-filters::-webkit-scrollbar { display: none; }
   .j-filters button { flex: none; padding: 13px 0; min-width: 44px; text-align: left; }   /* 44 px tap target */
   .j-filters button[aria-pressed='true'] { box-shadow: none; }
@@ -186,7 +188,7 @@
 
 /* ---------- the story lines: a holding period that unfolds, funding and incidents (brand book C, Journal) ---------- */
 .j-per-row { display: grid; grid-template-columns: 76px minmax(0, 1fr) auto; column-gap: var(--s-4); align-items: baseline; width: 100%; padding: 18px 0; border-bottom: 1px solid var(--line); text-align: left; color: var(--ink); cursor: pointer; }
-.j-per-row .t { font: var(--t-s); color: var(--ink-2); }
+.j-per-row .t { font: 400 12px/1.75 var(--mono); color: var(--silver); }
 .j-per-row b { font-weight: 600; font-size: 21px; letter-spacing: -0.01em; min-width: 0; overflow-wrap: anywhere; }
 .j-per-row .r { font: var(--t-s); color: var(--ink-2); white-space: nowrap; }
 .j-per-row:hover .r { color: var(--ink); }
@@ -194,14 +196,14 @@
 .j-pd.shut { display: none; }
 .j-pd .kv { font-size: 15px; }
 .j-line { display: grid; grid-template-columns: 76px minmax(0, 1fr) auto; column-gap: var(--s-4); align-items: baseline; padding: var(--s-4) 0; border-bottom: 1px solid var(--line); }
-.j-line .t { font: var(--t-s); color: var(--ink-2); }
+.j-line .t { font: 400 12px/1.75 var(--mono); color: var(--silver); }
 .j-line .what { min-width: 0; overflow-wrap: anywhere; }
 .j-line small { display: block; font: var(--t-s); color: var(--ink-2); margin-top: 2px; }
-.j-line .amt { text-align: right; white-space: nowrap; }
+.j-line .amt { text-align: right; white-space: nowrap; font: var(--t-read); letter-spacing: var(--track-mono); }
 
 @media (max-width: 1023px) {
   .j-cnt { margin: var(--s-5) var(--gutter) 0; }
-  .j-cnt .kv b { font-size: 17px; }
+
   .j-per-row { grid-template-columns: 52px minmax(0, 1fr) auto; column-gap: 10px; padding: 14px var(--gutter); min-height: 44px; }
   .j-per-row b { font-size: 17px; }
   .j-pd { padding: 2px var(--gutter) 6px; }

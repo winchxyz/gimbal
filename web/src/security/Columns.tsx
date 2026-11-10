@@ -43,12 +43,11 @@ function PolicyList({ r }: { r: Reading }) {
 export function Policy({ r }: { r: Reading }) {
   return (
     <div className="s-policy">
-      <h2>Your policy</h2>
       <PolicyList r={r} />
       {r.kind === 'replay' ? null : (
         <>
-          <p className="s-engine g">Leverage and the minimum net APR are engine rules. The contract does not enforce them.</p>
-          <p className="s-sign g">
+          <p className="s-engine">Leverage and the minimum net APR are engine rules. The contract does not enforce them.</p>
+          <p className="s-sign">
             Signed by <Figure r={r} w={110} h={12}>{(d) => d.desk.owner}</Figure>. A change is a new signature from that wallet.
           </p>
         </>

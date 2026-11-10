@@ -283,7 +283,7 @@ test('the next best window: the best open one that is not held, against the held
     symbol: 'SOL',
     pair: 'Phoenix / Orderly',
     netAprPct: 8.6,
-    text: '5.2 points below DOGE. The desk rotates when another window beats the held one by 3 points for 4 hours.',
+    text: '5.2 points below DOGE. The desk rotates when another market beats the held one by 3 points for 4 hours.',
   });
   assert.equal(nextBest([held, win({ symbol: 'SOL', netAprPct: 15 })], STRATEGY)?.text.startsWith('1.2 points above DOGE.'), true);
   assert.equal(nextBest([held, win({ symbol: 'SOL', netAprPct: 13.8 })], null)?.text, 'Level with DOGE.');

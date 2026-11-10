@@ -116,7 +116,7 @@ export function Welcome({ flow, s, mode }: Props) {
         {best !== null ? (
           <div>
             <b>{best.toFixed(1)}%</b>
-            <span>best window now, net a year</span>
+            <span>best market now, net a year</span>
           </div>
         ) : null}
         <div>

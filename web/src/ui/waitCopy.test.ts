@@ -11,7 +11,7 @@ const costGate = (why: string) => `No window clears the entry rules; best XLM 14
 test('the cost gate: the carry does not cover the round trip, and the desk tries again after the next hourly check', () => {
   assert.equal(
     waitCopy(costGate(SPREAD), { minNetAprPct: 5 }).text,
-    'No window clears your 5 % minimum right now. Closest: XLM, 14.2 % net, but its carry does not cover the cost of opening and closing it ($0.30 expected over 3 days, against $0.52); the desk tries it again after the next hourly check, from zero.',
+    'No market pays your 5 % minimum right now. Closest: XLM, 14.2 % net, but its carry does not cover the cost of opening and closing it ($0.30 expected over 3 days, against $0.52); the desk tries it again after the next hourly check, from zero.',
   );
   assert.equal(waitCopy(costGate(SPREAD)).mapped, true);
 });
@@ -60,7 +60,7 @@ test('an enter or rotate the NEAR AI risk check held (no answer, no key, a rejec
   assert.equal(c?.mapped, true);
   assert.equal(c?.raw, timeout);
   assert.equal(c?.text, 'Opening sol-phoenix-hyperliquid is waiting: the NEAR AI risk check did not answer, so nothing was sent. '
-    + 'The desk asks again at the next hourly check (11:01 UTC). This is not a refusal, so the window is not held out for 6 h.');
+    + 'The desk asks again at the next hourly check (11:01 UTC). This is not a refusal, so the market is not held out for 6 h.');
   assert.match(refusedCopy(`enter sol-phoenix-hyperliquid not carried out: no NEAR AI key, so the NEAR AI risk check cannot answer: ${tail}`)?.text ?? '',
     /^Opening sol-phoenix-hyperliquid is waiting: this engine has no NEAR AI key, so the NEAR AI risk check cannot answer\. Nothing was sent\./);
   assert.match(refusedCopy(`enter sol-phoenix-hyperliquid not carried out: NEAR AI key rejected (HTTP 401: invalid api key), so the NEAR AI risk check cannot answer: ${tail}`)?.text ?? '',
@@ -69,7 +69,7 @@ test('an enter or rotate the NEAR AI risk check held (no answer, no key, a rejec
   const rotate = 'rotate sol-phoenix-hyperliquid -> eth-phoenix-hyperliquid not carried out: the NEAR AI risk check did not answer (NEAR AI answered HTTP 503: overloaded, asked 2 times): '
     + 'held, not passed: the act waits; sol-phoenix-hyperliquid is kept, nothing closed; asked again at the next hourly check (2026-11-05T11:01:00.000Z); not a refusal, so no 6 h hold-out';
   assert.equal(refusedCopy(rotate)?.text, 'Rotation from sol-phoenix-hyperliquid into eth-phoenix-hyperliquid is waiting: the NEAR AI risk check did not answer, so nothing was sent. '
-    + 'sol-phoenix-hyperliquid is kept. The desk asks again at the next hourly check (11:01 UTC). This is not a refusal, so the window is not held out for 6 h.');
+    + 'sol-phoenix-hyperliquid is kept. The desk asks again at the next hourly check (11:01 UTC). This is not a refusal, so the market is not held out for 6 h.');
   const demo = 'enter zec-phoenix-hyperliquid not carried out: (owner demo entry: the profit checks are waived; round trip $0.04 estimated, at most $0.25 accepted) '
     + 'the NEAR AI risk check did not answer (no answer within 15 s, asked 2 times): held, not passed: the act waits; nothing sent; not tried again by itself: POST /rotate asks again; not a refusal, so no 6 h hold-out';
   assert.match(refusedCopy(demo)?.text ?? '', /^Opening zec-phoenix-hyperliquid is waiting: .* It is not tried again by itself: ask again with POST \/rotate\. This is not a refusal/);
@@ -91,7 +91,7 @@ test('hold lines in plain words', () => {
   assert.match(waitCopy('Hold XLM: the spread flipped: the 7-day spread is -0.5 %, 1 of 1 hour before exit; day 1 of 7').text, /the 7-day spread is -0\.5 % \(1 of 1 hours?/);
   assert.equal(
     waitCopy('Hold XLM: its window is not in this scan, so nothing is decided on it; day 2 of 7').text,
-    'Holding XLM: its window is not in this scan, so the desk decides nothing on it for now. Day 2 of 7.',
+    'Holding XLM: its market is not in this scan, so the desk decides nothing on it for now. Day 2 of 7.',
   );
   assert.match(waitCopy('Hold XLM: its numbers are stale this scan, so nothing is decided on them; day 2 of 7').text, /^Holding XLM: its numbers are out of date this scan/);
 });
@@ -125,7 +125,7 @@ const OFF_NOTE = "but the desk can't open it (it is long Orderly / short Hyperli
 
 test('the hands refusal with Orderly pairs off says what the desk can open, and names the closest window', () => {
   const c = waitCopy(HANDS, { minNetAprPct: 5 });
-  assert.equal(c.text, `No window clears your 5 % minimum right now. Closest: BONK, 14.8 % net, ${OFF_NOTE}.`);
+  assert.equal(c.text, `No market pays your 5 % minimum right now. Closest: BONK, 14.8 % net, ${OFF_NOTE}.`);
   assert.equal(c.mapped, true);
   assert.equal(c.raw, HANDS);
 });
@@ -142,32 +142,32 @@ test('with Orderly pairs on, a window outside the three venues, and the markets 
   const v = waitCopy(venues, { minNetAprPct: 5 });
   assert.equal(
     v.text,
-    'No window clears your 5 % minimum right now. Closest: BONK, 14.8 % net, but the desk opens a pair only on two of Hyperliquid, Orderly and Phoenix (this one is long Lighter / short Hyperliquid).',
+    'No market pays your 5 % minimum right now. Closest: BONK, 14.8 % net, but the desk opens a pair only on two of Hyperliquid, Orderly and Phoenix (this one is long Lighter / short Hyperliquid).',
   );
   assert.equal(v.mapped, true);
   const policy = "No window clears the entry rules; best ZRO 12.0 % net: ZRO is not a market both legs (long orderly, short hyperliquid) list in the desk's policy (BTC, ETH)";
   assert.equal(
     waitCopy(policy, { minNetAprPct: 5 }).text,
-    'No window clears your 5 % minimum right now. Closest: ZRO, 12.0 % net, but ZRO is not in your policy on both Orderly and Hyperliquid.',
+    'No market pays your 5 % minimum right now. Closest: ZRO, 12.0 % net, but ZRO is not in your policy on both Orderly and Hyperliquid.',
   );
 });
 
 test('without the owner’s minimum the sentence does not invent one', () => {
-  assert.match(waitCopy(HANDS).text, /^No window clears your entry rules right now\. Closest: BONK, 14\.8 % net, but the desk can't open it/);
-  assert.match(waitCopy(HANDS, { minNetAprPct: 7.5 }).text, /^No window clears your 7\.5 % minimum right now\./);
-  assert.match(waitCopy(HANDS, { minNetAprPct: null }).text, /^No window clears your entry rules/);
+  assert.match(waitCopy(HANDS).text, /^No market passes your entry rules right now\. Closest: BONK, 14\.8 % net, but the desk can't open it/);
+  assert.match(waitCopy(HANDS, { minNetAprPct: 7.5 }).text, /^No market pays your 7\.5 % minimum right now\./);
+  assert.match(waitCopy(HANDS, { minNetAprPct: null }).text, /^No market passes your entry rules/);
 });
 
 test('a window under the minimum reads the minimum from the engine’s own line', () => {
   const raw = 'No window clears the entry rules; best LTC 8.1 % net: 8.1 % net, under your 10 % minimum';
-  assert.equal(waitCopy(raw).text, 'No window clears your 10 % minimum right now. Closest: LTC, 8.1 % net.');
+  assert.equal(waitCopy(raw).text, 'No market pays your 10 % minimum right now. Closest: LTC, 8.1 % net.');
 });
 
 test('the policy market refusal', () => {
   const raw = "No window clears the entry rules; best ZRO 12.0 % net: ZRO is not a market both legs list in the desk's policy (BTC, ETH)";
   assert.equal(
     waitCopy(raw, { minNetAprPct: 5 }).text,
-    'No window clears your 5 % minimum right now. Closest: ZRO, 12.0 % net, but ZRO is not one of the markets in your policy.',
+    'No market pays your 5 % minimum right now. Closest: ZRO, 12.0 % net, but ZRO is not one of the markets in your policy.',
   );
 });
 
@@ -175,7 +175,7 @@ test('the margin refusal gets one sentence', () => {
   const raw = 'No window clears the entry rules; best DOGE 9.1 % net: $4.20 free margin on Phoenix at 2x opens $0.00 a leg in whole lots, under the $5.00 minimum: the loop does not move margin to open';
   assert.equal(
     waitCopy(raw, { minNetAprPct: 5 }).text,
-    'No window clears your 5 % minimum right now. Closest: DOGE, 9.1 % net, but Phoenix has only $4.20 free margin, too little to open a leg, and the desk does not move margin to open.',
+    'No market pays your 5 % minimum right now. Closest: DOGE, 9.1 % net, but Phoenix has only $4.20 free margin, too little to open a leg, and the desk does not move margin to open.',
   );
 });
 
@@ -183,7 +183,7 @@ test('the margin refusal names an Orderly leg too', () => {
   const raw = 'No window clears the entry rules; best DOGE 9.1 % net: $0.00 free margin on Orderly at 2x opens $0.00 a leg in whole lots, under the $5.00 minimum: the loop does not move margin to open';
   assert.equal(
     waitCopy(raw, { minNetAprPct: 5 }).text,
-    'No window clears your 5 % minimum right now. Closest: DOGE, 9.1 % net, but Orderly has only $0.00 free margin, too little to open a leg, and the desk does not move margin to open.',
+    'No market pays your 5 % minimum right now. Closest: DOGE, 9.1 % net, but Orderly has only $0.00 free margin, too little to open a leg, and the desk does not move margin to open.',
   );
   assert.match(waitCopy('XLM 14.2 % net is ready, but $2.00 free margin on Orderly at 3x leaves nothing to open').text, /^XLM is ready at 14\.2 % net, but Orderly has only \$2\.00 free margin/);
 });
@@ -192,14 +192,14 @@ test('the cost refusals: the carry does not pay the round trip, or nets under th
   const never = 'No window clears the entry rules; best SOL 6.0 % net: Over a 3-day hold (assumed: the engine rules set none), the 7-day spread of 4.0 % APR (the smaller of the 7- and 14-day means) pays $0.30 at $50.00 a leg, no more than the $0.52 round trip (4 fills $0.20, slippage $0.12, basis buffer $0.20; 10.4 bps): it never pays it back';
   assert.equal(
     waitCopy(never, { minNetAprPct: 5 }).text,
-    'No window clears your 5 % minimum right now. Closest: SOL, 6.0 % net, but its carry does not cover the $0.52 cost of opening and closing it (it never pays it back).',
+    'No market pays your 5 % minimum right now. Closest: SOL, 6.0 % net, but its carry does not cover the $0.52 cost of opening and closing it (it never pays it back).',
   );
   const days = never.replace('it never pays it back', 'it takes 6.5 days to pay it back');
   assert.match(waitCopy(days).text, /\(6\.5 days to pay it back\)\.$/);
   const only = 'No window clears the entry rules; best SOL 6.0 % net: Over a 3-day hold (assumed), the 7-day spread of 9.0 % APR pays $1.00 at $50.00 a leg, more than the $0.52 round trip (4 fills), but it nets only 3.1 % APR over the hold, under your 5 % minimum';
   assert.equal(
     waitCopy(only).text,
-    'No window clears your entry rules right now. Closest: SOL, 6.0 % net, but after costs it nets only 3.1 % over a typical hold, under your 5 % minimum.',
+    'No market passes your entry rules right now. Closest: SOL, 6.0 % net, but after costs it nets only 3.1 % over a typical hold, under your 5 % minimum.',
   );
 });
 
@@ -219,7 +219,7 @@ test('the other gates: history, spreads, capacity, risk check, stale numbers, wa
 
 test('an unknown gate keeps the engine’s words inside a known frame, and is not marked as mapped', () => {
   const c = waitCopy('No window clears the entry rules; best X 9.0 % net: Books 30 s old', { minNetAprPct: 5 });
-  assert.equal(c.text, 'No window clears your 5 % minimum right now. Closest: X, 9.0 % net: Books 30 s old.');
+  assert.equal(c.text, 'No market pays your 5 % minimum right now. Closest: X, 9.0 % net: Books 30 s old.');
   assert.equal(c.mapped, false);
 });
 
@@ -250,11 +250,11 @@ test('a window ready but not sizable', () => {
 test('cooling down, auto off, trading off, no window, unknown held numbers', () => {
   assert.equal(
     waitCopy(`Cooling down after the exit, 3.2 h left; ${HANDS.replace('No', 'no')}`, { minNetAprPct: 5 }).text,
-    `Cooling down after the last exit, 3.2 h left. No window clears your 5 % minimum right now. Closest: BONK, 14.8 % net, ${OFF_NOTE}.`,
+    `Cooling down after the last exit, 3.2 h left. No market pays your 5 % minimum right now. Closest: BONK, 14.8 % net, ${OFF_NOTE}.`,
   );
   assert.equal(waitCopy('Auto is off: the engine watches and you act by hand; the desk holds BONK').text, 'Auto is off, so the desk only watches and you act by hand.');
   assert.match(waitCopy('GIMBAL_TRADE is not 1: the engine watches, rescues and journals, and trades nothing').text, /^Trading is switched off on this engine/);
-  assert.equal(waitCopy('No desk window in this scan').text, 'None of the windows in the last scan is one the desk can trade.');
+  assert.equal(waitCopy('No desk window in this scan').text, 'None of the markets in the last scan is one the desk can trade.');
   assert.equal(
     waitCopy('Held pair numbers unknown: BONK P&L is not a number (NaN); nothing is decided on BONK').text,
     'Some numbers for the held BONK pair are missing, so the desk leaves it alone until they are back.',

@@ -27,7 +27,7 @@ export interface KindInfo {
 }
 
 export const KINDS: Record<Kind, KindInfo> = {
-  window: { label: 'Window', tone: null, filter: null, signed: false, principal: false, noun: ['window', 'windows'] },
+  window: { label: 'Market', tone: null, filter: null, signed: false, principal: false, noun: ['market', 'markets'] },
   enter: { label: 'Open', tone: 'ink', filter: 'trades', signed: true, principal: false, noun: ['open', 'opens'] },
   exit: { label: 'Close', tone: 'ink', filter: 'trades', signed: true, principal: false, noun: ['close', 'closes'] },
   rotate: { label: 'Rotate', tone: 'ink', filter: 'trades', signed: true, principal: false, noun: ['rotation', 'rotations'] },

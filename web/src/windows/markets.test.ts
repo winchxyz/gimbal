@@ -44,6 +44,9 @@ test('the sentence: the best open market after costs, or why there is none', () 
   assert.equal(marketsText(best), 'MON pays the most: 28% a year after costs.');
   assert.equal(best.tone, 'up');
   assert.equal(marketsText(marketsAnswer([net('ETH', 3.2)], 5)), 'None pays your 5% minimum. The best, ETH, pays 3.2% a year.');
+  // Open but too new to judge (the minutes after a restart): the sentence does not say none is open.
+  assert.equal(marketsText(marketsAnswer([net('XPL', 95.6, { grossApr7dPct: null }), net('MORPHO', 50.6, { grossApr7dPct: null })], 5)), '2 markets are open to the desk, but their 7 days of funding are not read yet.');
+  assert.equal(marketsText(marketsAnswer([net('XPL', 95.6, { grossApr7dPct: null })], 5)), 'One market is open to the desk, but its 7 days of funding are not read yet.');
   assert.equal(marketsText(marketsAnswer([net('ETH', -2)], null)), 'Every market costs more than it pays; ETH loses least, 2.0% a year.');
   assert.equal(marketsAnswer([net('ETH', -2)], null).tone, 'down');
   assert.equal(marketsText(marketsAnswer([refused('PEPE', 'E_ASSET')], 5)), 'No market is open to the desk right now.');

@@ -192,8 +192,8 @@ test('checks: NEAR AI first, then the refusal, then the engine; the first failin
   assert.equal(lines[0]?.text, 'The NEAR AI risk check refused it. One-off spike. The median gap is 1.2%.');
   assert.equal(lines[1]?.text, 'The contract would refuse it (E_ASSET): Not in your policy');
 
-  const passing = checkLines(win({ veto: { verdict: 'pass', reasons: ['Deepest window on the list.'], model: 'm', at: 1 }, checks: [{ ok: true, text: 'Fine' }] }));
-  assert.equal(passing[0]?.text, 'NEAR AI: Deepest window on the list.');
+  const passing = checkLines(win({ veto: { verdict: 'pass', reasons: ['Deepest market on the list.'], model: 'm', at: 1 }, checks: [{ ok: true, text: 'Fine' }] }));
+  assert.equal(passing[0]?.text, 'NEAR AI: Deepest market on the list.');
   assert.ok(passing.every((l) => l.ok && !l.blocking));
   assert.deepEqual(checkLines(win()), []);
 });
