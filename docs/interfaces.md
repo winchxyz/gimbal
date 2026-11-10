@@ -1002,7 +1002,9 @@ replayed from recorded mainnet responses),
 oldest or for an id the engine no longer holds), `POST /policy/draft` `{ text }` → `PolicyDraft` (NEAR AI; nothing is applied until the owner signs `set_policy`
 and confirms the engine rules), `GET` / `PUT /strategy` (`StrategyConfig`), `POST /setup` `{ deskId }` (starts
 venue setup; progress arrives as `setup` events), `POST /rotate` `{ windowId }` (manual override: close the held
-window and open this one, with the same checks as auto; refused with the reason when a check fails) and
+window and open this one, with the same checks as auto; refused with the reason when a check fails; with
+`demo: { maxLossUsd, ownerDecides?: true }` an owner entry from flat: the profit checks waived, the round trip held to
+`maxLossUsd`, and with `ownerDecides` the NEAR AI risk check advises and the owner decides, `loop.ts`) and
 `POST /close` (close both legs with reduce-only orders; it cancels an enter or rotate still waiting on its NEAR AI
 risk check, `veto.ts` below). Both answer `{ ok: true }` or `{ ok: false, reason }` at once; progress arrives as `journal` and `desk` events. Pause and Resume are not engine calls: the owner's
 wallet signs `set_paused` (§1.3).

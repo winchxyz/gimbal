@@ -138,6 +138,7 @@ import { ThinningSink, WATCH_RECORD_GAPS, loadPolicyFile, replayStart, scanLine 
 import { ReplayScript, fundingEntry, replayLoop, replayMarginVenues, replayMarketLines, replayPairSymbols } from './serve-replay-loop.ts';
 import { startView } from '../view/serve-view.ts';
 import { openJournal } from '../journal-store.ts';
+import { historyLoadLine, openHistoryStore } from '../scanner/history-cache.ts';
 
 const { values } = parseArgs({
   options: {
@@ -271,6 +272,9 @@ const fees = scannerConfig.costs.fees;
 const fill = (v: keyof typeof fees) => `${v} ${fees[v].takerBps + fees[v].extraBps} bps`;
 log(`scanner costs (${mode}): taker fill ${fill('hyperliquid')}, ${fill('phoenix')}, ${fill('orderly')} `
   + `(Orderly broker ${ORDERLY_BROKERS[mode === 'testnet' ? 'testnet' : 'mainnet'].brokerId})`);
+// The funding history survives a restart (scanner/history-cache.ts), in the journal's directory; replay keeps none.
+const historyDir = values['state-dir'] ?? envVar('GIMBAL_STATE_DIR');
+const historyStore = openHistoryStore(mode, historyDir === undefined ? userStateDir(envVar) : resolve(historyDir), contract?.client.contractId ?? null, deskId, log);
 const scanner = new Scanner(readers.venues, readers.watch, {
   config: scannerConfig,
   clock,
@@ -286,7 +290,10 @@ const scanner = new Scanner(readers.venues, readers.watch, {
   oracleRefreshAtOpen: () => pairRefreshesAtOpen(pair),
   // GIMBAL_ORDERLY_PAIRS=1 with its session: an Orderly leg's open refreshes the stored price too.
   oracleRefreshOrderly: () => orderly !== null,
+  historyStore,
 });
+const historyLine = historyLoadLine(scanner.restoreHistory());
+if (historyLine !== null) log(historyLine);
 let loop: StrategyLoop | null = null;
 
 let scans = 0;

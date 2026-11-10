@@ -9,12 +9,12 @@ import { capital, sentence } from './format.ts';
 /**
  * `rotate` names the symbols for the notice and the target window's id for the request; `close.symbol` is the window
  * being closed, when the page knows it; `enter` is the public live view owner's demo entry from flat (`POST /rotate`
- * with `demo: { maxLossUsd }`).
+ * with `demo: { maxLossUsd }`); with `ownerDecides` the NEAR AI risk check advises on it and the owner decides.
  */
 export type ManualAction =
   | { kind: 'rotate'; from: string; to: string; windowId: string }
   | { kind: 'close'; symbol: string | null }
-  | { kind: 'enter'; symbol: string; windowId: string; maxLossUsd: number };
+  | { kind: 'enter'; symbol: string; windowId: string; maxLossUsd: number; ownerDecides?: boolean };
 
 export interface Outcome {
   /**
@@ -61,7 +61,9 @@ export function outcomeOf(action: ManualAction, answer: ActionResult | Error): O
       return {
         tone: 'sent',
         title: 'Entry started',
-        text: `${action.symbol}, checked again with the NEAR AI risk check, then maker orders, then a taker order for what they leave, within the caps. It takes a few minutes, watch the Journal.`,
+        text: action.ownerDecides === true
+          ? `${action.symbol}, on your decision: the NEAR AI risk check is asked again and its answer goes in the Journal, then maker orders, then a taker order for what they leave, within the caps. It takes a few minutes, watch the Journal.`
+          : `${action.symbol}, checked again with the NEAR AI risk check, then maker orders, then a taker order for what they leave, within the caps. It takes a few minutes, watch the Journal.`,
       };
     }
     return {
@@ -92,7 +94,7 @@ export async function sendVia(api: Pick<EngineApi, 'rotate' | 'close'>, action: 
     const answer = action.kind === 'rotate'
       ? await api.rotate(action.windowId)
       : action.kind === 'enter'
-        ? await api.rotate(action.windowId, { maxLossUsd: action.maxLossUsd })
+        ? await api.rotate(action.windowId, action.ownerDecides === true ? { maxLossUsd: action.maxLossUsd, ownerDecides: true } : { maxLossUsd: action.maxLossUsd })
         : await api.close();
     return outcomeOf(action, answer);
   } catch (error) {

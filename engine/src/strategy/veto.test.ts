@@ -328,6 +328,23 @@ test('vetoMessages: a manual act says the minimum is waived and carries no strea
   assert.equal(manual.owner_minimum_net_apr_pct, MANUAL_MINIMUM);
   assert.equal('hours_in_a_row_above_minimum' in manual, false);
   assert.notEqual(promptKey(vetoMessages({ ...PASS_FACTS, manual: true })), promptKey(vetoMessages(PASS_FACTS)));
+  // A manual prompt carries the comparisons worked out; an auto prompt does not (recorded replies are found by it).
+  assert.equal((JSON.parse(vetoMessages(PASS_FACTS)[1]!.content) as Record<string, unknown>).computed, undefined);
+  const thin = vetoMessages({
+    ...PASS_FACTS, manual: true, grossAprPct: 80.74, grossApr7dPct: 67.99, grossApr14dPct: 34.43, legUsd: 10.63,
+    legs: [
+      { venue: 'phoenix', side: 'long', openInterestUsd: 64543.95, bookDepthUsd: 330692.18, fillImpactBps: 1.94, priceMove24hPct: 0, daysSinceListing: null },
+      { venue: 'hyperliquid', side: 'short', openInterestUsd: 36532397.49, bookDepthUsd: 11224.94, fillImpactBps: 0.97, priceMove24hPct: -0.07, daysSinceListing: null },
+    ],
+  });
+  const computed = (JSON.parse(thin[1]!.content) as { computed: Record<string, unknown> & { legs: Record<string, unknown>[] } }).computed;
+  assert.equal(computed.this_hour_spread_over_7d_mean, 1.19);
+  assert.equal(computed.this_hour_spread_over_14d_mean, 2.35);
+  assert.equal(computed.spread_7d_and_14d_same_direction, true);
+  assert.deepEqual(computed.legs[1], {
+    venue: 'hyperliquid', side: 'short', book_depth_is_at_least_leg: true, book_depth_over_leg: 1055.97, open_interest_over_leg: 3436726.01,
+    fill_impact_is_50_bps_or_less: true, price_move_24h_is_within_15_pct: true, listed_14_days_or_more: null,
+  });
 });
 
 test('a timed-out attempt is aborted before the retry starts, so the two calls never overlap', async () => {

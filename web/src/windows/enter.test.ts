@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { JournalEntry } from '@gimbal/shared';
-import { actingText, enterConfirmText, enterState, entryReason, entryResult, isOwnerEntryOn, OWNER_MAX_LOSS_USD, type PendingEntry } from './enter.ts';
+import { actingText, advisedText, enterConfirmText, enterState, entryReason, entryResult, isOwnerEntryOn, OWNER_MAX_LOSS_USD, type PendingEntry } from './enter.ts';
 import { venueName } from './format.ts';
 import { actingOf, confirmText, outcomeOf, sendVia, type ManualAction } from './manual.ts';
 import { win } from './testing.ts';
@@ -28,7 +28,13 @@ test('contract refusals, no desk, stale numbers, a NEAR AI refusal and a held pa
   assert.match(reason(win({ refused: { code: 'E_SIZE', reason: 'over max_notional_usd' } })), /\(E_SIZE\)/);
   assert.match(reason(win({ refused: { code: 'E_NO_DESK', reason: 'no desk' } })), /no desk/);
   assert.match(reason(win({ stale: true })), /from an earlier scan/);
-  assert.match(reason(win({ veto: { verdict: 'veto', reasons: ['thin book'], model: 'm', at: 1 } })), /NEAR AI risk check refused it/);
+  // A NEAR AI refusal does not block the owner: the pair is offered as their own decision, with what the check said.
+  const advised = win({ veto: { verdict: 'veto', reasons: ['thin book.', ' spike '], model: 'm', at: 1 } });
+  assert.deepEqual(enterState(advised, [advised]), { kind: 'advised', reasons: ['thin book.', ' spike '] });
+  const anyway = enterConfirmText(advised, venueName, 12, 1, ['thin book.', ' spike ']);
+  assert.match(anyway, /The NEAR AI risk check advised against it: thin book; spike\. On your own entry it advises and you decide: it is asked again, its answer goes in the Journal, and it does not stop the entry\./);
+  assert.match(anyway, /refused if the round trip would cost more than \$1\.00, and every other check still runs\./);
+  assert.equal(advisedText([]), 'The NEAR AI risk check advised against it.');
   const heldXlm = win({ symbol: 'XLM', held: { since: 1 } });
   assert.match(reason(win({ symbol: 'SOL' }), [heldXlm, win({ symbol: 'SOL' })]), /^XLM is held\. An owner entry opens from flat only: close XLM first\.$/);
   // Auto off in the engine rules: the engine refuses every entry, so the button says why. Unknown (not read yet): open.
@@ -130,7 +136,7 @@ test('the act’s result comes from its Journal line: opened, opened by the take
   assert.equal(entryResult([cost], pending())!.text, 'Not opened: Its round trip, $0.90, plus $0.10 for the taker fallback is over the $1.00.');
   // A refusal written without numbers still names its window.
   assert.equal(entryResult([line('g', 'refused', 'enter sol-phoenix-orderly not carried out: no lots; NEAR AI risk check: not asked', {})], pending())!.text, 'Not opened: No lots.');
-  assert.deepEqual(entryResult([line('h', 'veto', `sol-phoenix-orderly ${TAG}: refused; not entered`)], pending()), { kind: 'not', text: 'Not opened: the NEAR AI risk check refused SOL. Nothing was sent.' });
+  assert.deepEqual(entryResult([line('h', 'veto', `sol-phoenix-orderly ${TAG}: refused; not entered`)], pending()), { kind: 'not', text: 'Not opened: the NEAR AI risk check advised against SOL. Nothing was sent. You can still enter: the decision is yours.' });
   const partly = line('i', 'error', `enter sol-phoenix-orderly: ${TAG} one leg only filled; the venues hold SOL: held from now; ok`, { window: 'sol-phoenix-orderly', heldLegUsd: 10 });
   assert.deepEqual(entryResult([partly], pending()), { kind: 'partly', text: 'Opened SOL, partly: One leg only filled. The desk holds it from now.' });
   // The first new line is the result, even when later ones follow.

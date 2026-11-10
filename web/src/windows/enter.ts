@@ -3,8 +3,10 @@
 //
 // What a demo entry waives and what it never does (the engine's own check, rotateRefusal): the window's profit checks
 // (the carry gate, break-even) are waived; it must still be tradable, not refused by the contract, not stale, not
-// refused or held out by the NEAR AI risk check, pass every other check and the policy's markets, be sized within the
-// leg size, free margin and the policy's cap, and its round trip may cost at most `maxLossUsd`. The desk must be flat:
+// pass every other check and the policy's markets, be sized within the leg size, free margin and the policy's cap,
+// and its round trip may cost at most `maxLossUsd`. The NEAR AI risk check is asked on every entry. On the owner's
+// first ask its refusal stops the entry; the page then shows what it said and offers "Enter anyway", which sends
+// `demo.ownerDecides`: the check is asked again, journaled, and advises only (manual mode: the owner decides). The desk must be flat:
 // a demo entry never closes a held pair. Auto must be on: with auto off it is disabled here, and the engine refuses it. Every order is still
 // checked by the contract against the owner's policy before the MPC network signs it.
 //
@@ -27,6 +29,8 @@ export type EnterState =
   | { kind: 'none' }
   /** Offered but disabled, with the reason shown next to it. */
   | { kind: 'blocked'; reason: string }
+  /** The NEAR AI risk check advised against it: still offered, as the owner's own decision ("Enter anyway"). */
+  | { kind: 'advised'; reasons: readonly string[] }
   | { kind: 'open' };
 
 /** The engine's `acting` for an owner entry (loop.ts #rotateStart: `POST /rotate <id> (owner demo entry, …)`). */
@@ -56,7 +60,7 @@ export function enterState(w: FundingWindow, windows: readonly FundingWindow[], 
   if (isNoDesk(w)) return { kind: 'blocked', reason: 'There is no desk to trade it with.' };
   if (w.refused) return { kind: 'blocked', reason: `The contract would refuse it (${w.refused.code}): ${capital(w.refused.reason)}` };
   if (w.stale) return { kind: 'blocked', reason: 'Its numbers are from an earlier scan: a venue it needs did not answer. The next scan reads it again.' };
-  if (w.veto?.verdict === 'veto') return { kind: 'blocked', reason: 'The NEAR AI risk check refused it.' };
+  if (w.veto?.verdict === 'veto') return { kind: 'advised', reasons: w.veto.reasons };
   return { kind: 'open' };
 }
 
@@ -67,17 +71,29 @@ const whole = (n: number): string => `$${Math.round(n).toLocaleString('en-US')}`
  * The confirm step: the two legs and their venues, the size per leg, the most the round trip may cost, that the contract
  * still checks every order, and that it opens from flat (a held pair is never closed by it).
  */
-export function enterConfirmText(w: FundingWindow, venue: (id: string) => string, legUsd: number | null, maxLossUsd = OWNER_MAX_LOSS_USD): string {
+export function enterConfirmText(w: FundingWindow, venue: (id: string) => string, legUsd: number | null, maxLossUsd = OWNER_MAX_LOSS_USD, advised: readonly string[] | null = null): string {
   const size = legUsd === null
     ? 'at the engine rules’ leg size'
     : `up to ${whole(legUsd)} a leg (the engine rules’ leg size; it sizes again on free margin and the policy’s cap)`;
   return [
     `Enter ${w.symbol}: long on ${venue(w.longVenue)} and short on ${venue(w.shortVenue)}, ${size}.`,
-    `An owner entry skips the profit checks only; it is refused if the round trip would cost more than ${money(maxLossUsd)}, and every other check still runs, the NEAR AI risk check included.`,
+    ...(advised === null
+      ? [`An owner entry skips the profit checks only; it is refused if the round trip would cost more than ${money(maxLossUsd)}, and every other check still runs, the NEAR AI risk check included.`]
+      : [
+          advisedText(advised),
+          'On your own entry it advises and you decide: it is asked again, its answer goes in the Journal, and it does not stop the entry.',
+          `The profit checks are skipped; it is refused if the round trip would cost more than ${money(maxLossUsd)}, and every other check still runs.`,
+        ]),
     'It posts maker orders first; what they leave after the maker window is taken with a taker order, within the same caps, and that cost counts in the round trip.',
     'The contract checks every order against your policy before it is signed.',
     'It opens from flat only: a held pair is never closed by it.',
   ].join(' ');
+}
+
+/** What the NEAR AI risk check said against a pair, as one sentence. */
+export function advisedText(reasons: readonly string[]): string {
+  const said = reasons.map((r) => r.trim().replace(/[.;]+$/, '')).filter((r) => r !== '');
+  return said.length === 0 ? 'The NEAR AI risk check advised against it.' : `The NEAR AI risk check advised against it: ${said.join('; ')}.`;
 }
 
 /** The entry the owner started: the window, and the Journal ids already there when it was sent (none of them is its result). */
@@ -168,9 +184,10 @@ export function entryResult(journal: readonly JournalEntry[], pending: PendingEn
     // The fallback's own note when it filled (trade/pair.ts: `taker fallback: <venue> <side> IOC <size> after the maker window filled …`),
     // not the demo tag's cost words and not a fallback that failed.
     const taker = /taker fallback: \S+ (BUY|SELL) IOC \S+ after the maker window filled /.test(line.summary) ? ' The maker orders did not fill it all; the taker fallback took the rest.' : '';
-    return { kind: 'opened', text: `Opened ${symbol}: both legs are open${leg === null ? '' : `, ${usd(leg)} a leg`}.${taker} It shows on the Desk.` };
+    const advised = line.numbers.advisedAgainst === 1 ? ' The NEAR AI risk check advised against it; you decided.' : '';
+    return { kind: 'opened', text: `Opened ${symbol}: both legs are open${leg === null ? '' : `, ${usd(leg)} a leg`}.${taker}${advised} It shows on the Desk.` };
   }
-  if (line.kind === 'veto') return { kind: 'not', text: `Not opened: the NEAR AI risk check refused ${symbol}. Nothing was sent.` };
+  if (line.kind === 'veto') return { kind: 'not', text: `Not opened: the NEAR AI risk check advised against ${symbol}. Nothing was sent. You can still enter: the decision is yours.` };
   const reason = entryReason(line.summary, pending.windowId, symbol);
   if (line.kind === 'error' && line.numbers.heldLegUsd !== undefined) {
     return { kind: 'partly', text: `Opened ${symbol}, partly: ${reason} The desk holds it from now.` };

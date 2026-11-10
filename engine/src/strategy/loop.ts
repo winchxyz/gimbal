@@ -62,7 +62,11 @@
 // the trader's open holds its own round trip to it again (carry-plan.ts). The loop's own entries and a plain POST
 // /rotate get no taker fallback. The risk check is asked as for any manual act, told it is a
 // demonstration entry with the profit checks waived and the cost accepted; it is never waived: a refusal refuses it and
-// no readable answer holds it, as any entry. A held demo pair is decided on as any held
+// no readable answer holds it, as any entry. Manual mode is the one exception, and only the owner can ask for it:
+// with demo.ownerDecides (true) the check is still asked, journaled and booked, but it advises and the owner decides:
+// a refusal, a held check or one shown on the window from before does not stop the entry, whose lines then say
+// "advice only on an owner entry: the owner decided to go ahead" (numbers ownerDecides, advisedAgainst). Nothing else
+// is waived by it, and the loop's own acts never set it. A held demo pair is decided on as any held
 // pair: under the demo rules (a 1000 % minimum, exit after 24 checks) its counted exit comes on the 24th hourly check
 // in a row; the stops, the one-leg close and POST /close at any time.
 //
@@ -120,19 +124,27 @@ export { DEMO_MAX_LOSS_USD };
 /** An owner demo entry (POST /rotate with demo): the profit checks waived, the round trip at most maxLossUsd. */
 export interface DemoEntry {
   maxLossUsd: number;
+  /**
+   * Manual mode: on this entry the NEAR AI risk check advises and the owner decides. The check is still asked,
+   * journaled and booked; a refusal or no answer does not stop the entry. Every other check stands (the contract's
+   * policy, the caps, the round trip bound, the safety checks). Never set by the loop's own acts.
+   */
+  ownerDecides?: true;
 }
 
 /** POST /rotate's `demo`, checked; or why it is refused. */
 export function parseDemo(v: unknown): DemoEntry | { refused: string } {
-  const shape = `"demo": { "maxLossUsd": <USD above 0, at most ${DEMO_MAX_LOSS_USD}> }`;
+  const shape = `"demo": { "maxLossUsd": <USD above 0, at most ${DEMO_MAX_LOSS_USD}>, "ownerDecides": true (optional) }`;
   if (v === null || typeof v !== 'object' || Array.isArray(v)) return { refused: `POST /rotate's demo must be ${shape}` };
-  const extra = Object.keys(v).filter((k) => k !== 'maxLossUsd');
+  const extra = Object.keys(v).filter((k) => k !== 'maxLossUsd' && k !== 'ownerDecides');
   if (extra.length > 0) return { refused: `POST /rotate's demo has an unknown field ${JSON.stringify(extra[0])}: ${shape}` };
   const m = (v as { maxLossUsd?: unknown }).maxLossUsd;
   if (m === undefined) return { refused: `a demo entry needs maxLossUsd, the most its round trip may cost: ${shape}` };
   if (typeof m !== 'number' || !Number.isFinite(m) || m <= 0) return { refused: `demo maxLossUsd ${typeof m === 'number' ? String(m) : JSON.stringify(m)} is not a number above 0: ${shape}` };
   if (m > DEMO_MAX_LOSS_USD) return { refused: `demo maxLossUsd ${m} is over the ${money(DEMO_MAX_LOSS_USD)} a demo entry may accept` };
-  return { maxLossUsd: m };
+  const own = (v as { ownerDecides?: unknown }).ownerDecides;
+  if (own !== undefined && own !== true) return { refused: `demo ownerDecides ${JSON.stringify(own) ?? String(own)} is not true: leave it out, or send true: ${shape}` };
+  return own === true ? { maxLossUsd: m, ownerDecides: true } : { maxLossUsd: m };
 }
 
 /** A demo entry as it is carried out: what the owner accepted, and the window's round trip it was held to. */
@@ -141,6 +153,8 @@ interface DemoCost {
   roundTripUsd: number;
   /** The taker fallback's slippage past the book counted with it (scanner/carry.ts demoTakerFallbackUsd). */
   takerFallbackUsd: number;
+  /** DemoEntry.ownerDecides: the NEAR AI risk check advises on this entry, the owner decides. */
+  ownerDecides?: true;
 }
 
 /** A refusal before the risk check was asked says so. */
@@ -494,9 +508,16 @@ function sameDecision(a: StrategyDecision | null, b: StrategyDecision): boolean 
 
 /**
  * Why a window is not enterable, one line (the first failing check), or null. `waiveProfit` (an owner demo entry):
- * the profit checks are passed over, every other reason stands.
+ * the profit checks are passed over, every other reason stands. `waiveVerdict` (that entry with ownerDecides): a
+ * NEAR AI refusal is passed over too.
  */
-export function notEnterable(w: FundingWindow, waiveProfit = false): string | null {
+export function notEnterable(shown: FundingWindow, waiveProfit = false, waiveVerdict = false): string | null {
+  // waiveVerdict (an owner entry with ownerDecides): a NEAR AI refusal shown on the window is advice, not a reason.
+  let w = shown;
+  if (waiveVerdict && shown.veto?.verdict === 'veto') {
+    const { veto: _advice, ...rest } = shown;
+    w = rest;
+  }
   if (waiveProfit ? isEnterableButForProfit(w) : isEnterable(w)) return null;
   if (!w.tradable) return `${w.id} is watch only`;
   if (w.refused !== undefined) return `${w.id} is refused: ${w.refused.code} ${w.refused.reason}`;
@@ -917,8 +938,9 @@ export class StrategyLoop {
     }
     if (this.#state.held?.windowId === windowId && heldNow !== null) return { reason: `${windowId} is the window held now` };
     const until = this.#state.counters.vetoedUntil[windowId];
-    if (until !== undefined && now < until) return { reason: `${windowId} was refused by the NEAR AI risk check: held out until ${new Date(until).toISOString()}` };
-    const not = notEnterable(w, demo !== undefined);
+    const owns = demo?.ownerDecides === true;
+    if (!owns && until !== undefined && now < until) return { reason: `${windowId} was refused by the NEAR AI risk check: held out until ${new Date(until).toISOString()}` };
+    const not = notEnterable(w, demo !== undefined, owns);
     if (not !== null) return { reason: not };
     const sym = hands.symbolOf(w);
     if ('refused' in sym) return { reason: sym.refused };
@@ -936,7 +958,7 @@ export class StrategyLoop {
       if (rt + fallback > demo.maxLossUsd) {
         return { reason: `${windowId}: its round trip, ${money(rt)}, plus ${money(fallback)} for the taker fallback's and its hedge's ${DEMO_TAKER_FALLBACK_BPS} bps past the touch, is over the ${money(demo.maxLossUsd)} the demo entry accepts (maxLossUsd)` };
       }
-      cost = { maxLossUsd: demo.maxLossUsd, roundTripUsd: rt, takerFallbackUsd: fallback };
+      cost = { maxLossUsd: demo.maxLossUsd, roundTripUsd: rt, takerFallbackUsd: fallback, ...(owns ? { ownerDecides: true as const } : {}) };
     }
     const policy = this.#o.policy();
     const size = sizeFor(w, {
@@ -1279,9 +1301,13 @@ export class StrategyLoop {
     }
     const check = asked;
     onChecked({ checkId: check.checkId, fresh: check.fresh, why: check.why });
+    // Manual mode (DemoEntry.ownerDecides): the verdict is advice. A refusal or no answer is journaled on the entry's
+    // own lines and the entry goes on to every other check; nothing below this is skipped for it.
+    const owns = p.demo?.ownerDecides === true;
+    const advisedAgainst = owns && (check.result.held || check.result.veto.verdict === 'veto');
     // No readable verdict: held, never passed. Checked first: a held result carries a "veto" (fail closed), but it is
     // not a refusal, so it starts no hold-out. Nothing is closed (a rotate keeps the held pair) and nothing is sent.
-    if (check.result.held) {
+    if (check.result.held && !owns) {
       const next = new Date(nextHourlyCheck(this.#o.clock.now())).toISOString();
       const waits = p.manual ? 'not tried again by itself: POST /rotate asks again' : `asked again at the next hourly check (${next})`;
       const tag = p.demo === undefined ? '' : `(${demoText(p.demo)}) `;
@@ -1300,11 +1326,12 @@ export class StrategyLoop {
       }
       return { end: 'held', sent: false, passing: false, why: check.why, heldLine: line, result: `not opened: ${check.why}` };
     }
-    if (check.result.veto.verdict === 'veto') return { end: 'vetoed', sent: false, passing: false, why: check.why };
-    const why = check.why;
+    if (check.result.veto.verdict === 'veto' && !owns) return { end: 'vetoed', sent: false, passing: false, why: check.why };
+    const why = advisedAgainst ? `${check.why}; advice only on an owner entry: the owner decided to go ahead` : check.why;
     const base = {
       window: w.id, symbol: sym.symbol, legUsd: p.legUsd, leverage: p.leverage, qty: p.qty,
       netAprPct: round(w.netAprPct), grossAprPct: round(w.grossAprPct), veto: check.result.line, by: who, ...check.numbers,
+      ...(owns ? { ownerDecides: 1 } : {}), ...(advisedAgainst ? { advisedAgainst: 1 } : {}),
       ...(p.demo === undefined ? {} : { demo: 1, maxLossUsd: p.demo.maxLossUsd, roundTripUsd: round4(p.demo.roundTripUsd) }),
     };
     // An owner demo entry says so on every line after its risk check, with the cost the owner accepted: after the
@@ -1534,7 +1561,8 @@ export class StrategyLoop {
       const tail = result.veto.verdict === 'veto' ? `; ${why}: not ${not}` : `; ${why}`;
       this.#publishDecision({ ...d, reason: `${d.reason}${tail}`, at: now });
     }
-    if (!result.held && result.veto.verdict === 'veto') {
+    // An owner entry with ownerDecides goes on: its own lines carry the advice (no `veto` line, which says "not entered").
+    if (!result.held && result.veto.verdict === 'veto' && p.demo?.ownerDecides !== true) {
       this.#journal('veto', `${w.id}${p.demo === undefined ? '' : ` (${demoText(p.demo)})`}: ${why}; not ${p.kind === 'enter' ? 'entered' : 'rotated into'}, held out for ${LOOP_RULES.vetoHoldHours} h`, {
         window: w.id, model: result.veto.model, ...numbers, ...(p.demo === undefined ? {} : { demo: 1, maxLossUsd: p.demo.maxLossUsd, roundTripUsd: round4(p.demo.roundTripUsd) }),
       });
@@ -1835,7 +1863,8 @@ function round4(v: number): number {
 
 /** How a demo entry's journal lines name it: the profit checks waived, the round trip estimated and the most accepted. */
 function demoText(d: DemoCost): string {
-  return `owner demo entry: the profit checks are waived; round trip ${money(d.roundTripUsd)} estimated (+ ${money(d.takerFallbackUsd)} for a taker fallback after the maker window), at most ${money(d.maxLossUsd)} accepted`;
+  const own = d.ownerDecides === true ? '; the NEAR AI risk check advises, the owner decides' : '';
+  return `owner demo entry: the profit checks are waived; round trip ${money(d.roundTripUsd)} estimated (+ ${money(d.takerFallbackUsd)} for a taker fallback after the maker window), at most ${money(d.maxLossUsd)} accepted${own}`;
 }
 
 /** A wait as a journal line says it: "5 s", "2 min 40 s", "10 min". */

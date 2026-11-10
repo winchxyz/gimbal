@@ -42,6 +42,8 @@ import { venueName } from '../venues/names.ts';
 import { errorMessage } from '../venues/recorder.ts';
 import { ReplayMissError } from '../venues/replay.ts';
 import type { ScannerConfig } from './config.ts';
+import type { HistoryStore } from './history-cache.ts';
+import { HISTORY_SAVE_EVERY_MS, parseHistoryCache, serializeHistoryCache } from './history-cache.ts';
 import type { CarryEstimate, MultiDay } from './carry.ts';
 import { DEAD_BAND_APR_PCT, carryChecks, carryEstimate, listingApr, multiDay, roundTrip, spreadOverHoldUsd } from './carry.ts';
 import { HOURS_PER_YEAR, aprPct, basisCostUsd, fillFeeBps, oneOffAprPct, takerFeesUsd } from './costs.ts';
@@ -83,6 +85,24 @@ export interface ScannerOptions {
   marginHeldAt?: () => ReadonlySet<VenueId>;
   /** Where notes go (a failed read, a skipped book); default nowhere. */
   onNote?: (note: string) => void;
+  /**
+   * Where the funding history is kept across restarts (history-cache.ts): loaded before the first scan, written at most
+   * every HISTORY_SAVE_EVERY_MS after a history read changed it. Default none: tests, replays and the CLI tools read
+   * every leg's history from the venues, as without a cache.
+   */
+  historyStore?: HistoryStore | null;
+}
+
+/** What restoreHistory() found. */
+export interface HistoryRestore {
+  /** The cache's path, or null without a store. */
+  path: string | null;
+  /** Legs restored. */
+  legs: number;
+  /** Legs in the file left out (read again from the venues). */
+  dropped: number;
+  /** Why nothing was restored from a file that is there, or null. */
+  problem: string | null;
 }
 
 /** Diagnostics of one scan, for logs: never sent to the web. */
@@ -273,6 +293,13 @@ export class Scanner {
   #historyRun: Promise<void> | null = null;
   #priced = new Map<string, PricedWindow>();
   #lastAt = 0;
+  /** What the history cache gave at start; null until restoreHistory() has run (the first scan runs it). */
+  #restored: HistoryRestore | null = null;
+  /** A history read has answered since the cache was last written. */
+  #historyDirty = false;
+  #historySavedAt = -Infinity;
+  /** A write of the cache failed and has been noted: not noted again until one succeeds. */
+  #historySaveFailing = false;
 
   constructor(venues: readonly VenueReader[], watch: readonly WatchReader[], options: ScannerOptions) {
     const ids = new Set<string>();
@@ -305,6 +332,7 @@ export class Scanner {
 
   async scan(): Promise<ScanResult> {
     const { config, clock } = this.#options;
+    if (this.#restored === null) this.restoreHistory();
     const started = Date.now();
     const now = clock.now();
     // A wall clock can step back (an NTP correction). Throwing would stop every scan until it caught up; instead
@@ -520,6 +548,8 @@ export class Scanner {
       historyReads = this.#loadHistory(priced, all.filter((p) => p.desk), now, heldId);
     }
     this.#rates.prune(now);
+    // Debounced: a cold start lands a few reads every scan, and the file holds every leg's two weeks.
+    if (this.#historyDirty && (now - this.#historySavedAt >= HISTORY_SAVE_EVERY_MS || now < this.#historySavedAt)) this.flushHistory();
 
     const carry = new Map<string, WindowCarry>();
     for (const pw of priced) {
@@ -732,6 +762,61 @@ export class Scanner {
     };
   }
 
+  /**
+   * Seeds the rate store and the history state from the history store, once (the first scan calls it if serve has
+   * not). A leg the cache gives keeps its week until its next hourly read is due (its stored hour is this one: no read
+   * this hour), and its week before counts as read when the cache says so; every other leg is read as without a cache.
+   * The gate (carry.ts) is unchanged: it sees the history sooner. Never throws.
+   */
+  restoreHistory(): HistoryRestore {
+    if (this.#restored !== null) return this.#restored;
+    const store = this.#options.historyStore ?? null;
+    if (store === null) return (this.#restored = { path: null, legs: 0, dropped: 0, problem: null });
+    const now = this.#options.clock.now();
+    let text: string | null;
+    try {
+      text = store.read();
+    } catch (err) {
+      return (this.#restored = { path: store.path, legs: 0, dropped: 0, problem: `not read (${errorMessage(err)})` });
+    }
+    if (text === null) return (this.#restored = { path: store.path, legs: 0, dropped: 0, problem: null });
+    const load = parseHistoryCache(text, now);
+    for (const leg of load.legs) {
+      this.#rates.restoreBooked(leg.key, leg.from, leg.rates);
+      this.#rates.restoreBooked(`${leg.key}|short`, leg.from, leg.rates);
+      this.#history.set(leg.key, { loadedHour: leg.loadedHour, retryAt: 0, points: leg.points });
+      if (leg.olderDone) this.#older.set(leg.key, { done: true, failures: 0, refusedSince: null, failingSince: null, givenUp: null, retryAt: 0 });
+    }
+    return (this.#restored = { path: store.path, legs: load.legs.length, dropped: load.dropped, problem: load.problem });
+  }
+
+  /**
+   * Writes the history cache now if a history read has changed it since the last write (scan() calls it at most every
+   * HISTORY_SAVE_EVERY_MS). A failed write is noted once, until one succeeds; it never throws into the scan.
+   */
+  flushHistory(): void {
+    const store = this.#options.historyStore ?? null;
+    if (store === null || !this.#historyDirty) return;
+    const now = this.#options.clock.now();
+    const current = hourStart(now);
+    const legs: Parameters<typeof serializeHistoryCache>[1][number][] = [];
+    for (const [key, st] of this.#history) {
+      // A week last read more than a week ago would not be restored: a leg the venues no longer list ends here.
+      if (st.loadedHour === null || st.loadedHour < current - WEEK_HOURS * HOUR_MS) continue;
+      const run = this.#rates.bookedRun(key) ?? { from: st.loadedHour, rates: [] };
+      legs.push({ key, loadedHour: st.loadedHour, points: st.points, olderDone: this.#older.get(key)?.done === true, from: run.from, rates: run.rates });
+    }
+    this.#historySavedAt = now;
+    try {
+      store.write(serializeHistoryCache(now, legs));
+      this.#historyDirty = false;
+      this.#historySaveFailing = false;
+    } catch (err) {
+      if (!this.#historySaveFailing) this.#note(`history: not saved to ${store.path}, kept in memory, tried again in ${HISTORY_SAVE_EVERY_MS / 1000} s (${errorMessage(err)})`);
+      this.#historySaveFailing = true;
+    }
+  }
+
   /** Resolves once the history reads started so far have answered or failed. */
   async idle(): Promise<void> {
     while (this.#historyRun !== null) await this.#historyRun;
@@ -743,8 +828,10 @@ export class Scanner {
    * its history), then the watch windows', at most historyPerScan reads, and no new batch while one is still out (a
    * slow venue never has reads piling up). A leg is read again once a new hour has begun (and a minute has passed, so
    * the venue has booked it); the window asked for is aligned to the hour, so a replay asks exactly what the
-   * recording asked. Once a desk leg's week is in, the week before it is read once too, for the 14-day average. Until
-   * a leg's history arrives its windows show grossApr7dPct null. Returns how many reads it started.
+   * recording asked. Once a desk leg's week is in, the week before it is read once too, for the 14-day average; while
+   * such reads are due they get at least half of each batch (rounded down), in the same order, so they never wait for
+   * every other week read. Until a leg's history arrives its windows show grossApr7dPct null. Returns how many reads it
+   * started.
    */
   #loadHistory(priced: readonly PricedWindow[], deskPairs: readonly Pair[], now: number, heldId: string | null): number {
     if (this.#historyRun !== null) return 0;
@@ -765,23 +852,35 @@ export class Scanner {
       const src = this.#sources.find((s) => s.id === leg.venue);
       if (src?.history !== undefined) unique.push({ leg, src });
     }
-    const todo: { leg: ScanLeg; src: Source; older: boolean }[] = [];
+    type Read = { leg: ScanLeg; src: Source; older: boolean };
+    const per = config.historyPerScan;
+    const weekDue: Read[] = [];
+    const olderDue: Read[] = [];
     for (const { leg, src } of unique) {
-      if (todo.length >= config.historyPerScan) break;
-      const st = this.#history.get(legKey(leg));
-      if (st !== undefined && (st.loadedHour === current || now < st.retryAt)) continue;
-      if (st !== undefined && st.loadedHour !== null && now - current < 60_000) continue;
-      todo.push({ leg, src, older: false });
-    }
-    for (const { leg, src } of unique) {
-      if (todo.length >= config.historyPerScan) break;
-      // Due alongside the leg's week read if need be: a week read that keeps failing must not starve it.
-      if (leg.kind !== 'desk') continue;
+      if (weekDue.length >= per && olderDue.length >= per) break;
       const key = legKey(leg);
-      if ((this.#history.get(key)?.loadedHour ?? null) === null) continue;
-      const o = this.#older.get(key);
-      if (o !== undefined && (o.done || now < o.retryAt)) continue;
-      todo.push({ leg, src, older: true });
+      const st = this.#history.get(key);
+      const weekWaits = st !== undefined && (st.loadedHour === current || now < st.retryAt || (st.loadedHour !== null && now - current < 60_000));
+      if (weekDue.length < per && !weekWaits) weekDue.push({ leg, src, older: false });
+      // Due alongside the leg's week read if need be: a week read that keeps failing must not starve it.
+      if (olderDue.length < per && leg.kind === 'desk' && (st?.loadedHour ?? null) !== null) {
+        const o = this.#older.get(key);
+        if (o === undefined || (!o.done && now >= o.retryAt)) olderDue.push({ leg, src, older: true });
+      }
+    }
+    // Part of every batch is kept for the week before of the desk legs whose week is in, best net first: filled only
+    // after the week reads, they waited on every watch-only leg's week (and on the budget skips of those), and after a
+    // restart no desk pair passed its gate for 45 min. The batch stays historyPerScan reads, so the request weight a
+    // scan can send is unchanged (http-budget.ts HL_BUDGET); once the older reads are done (they are read once) the
+    // hourly week refresh has every slot, as before.
+    const olderTake = Math.min(olderDue.length, Math.max(Math.floor(per / 2), per - weekDue.length));
+    const weeks = weekDue.slice(0, per - olderTake);
+    const olders = olderDue.slice(0, olderTake);
+    // Alternated, so with two reads in flight a week and an older read go out together when the budget is tight.
+    const todo: Read[] = [];
+    for (let i = 0; i < Math.max(weeks.length, olders.length); i++) {
+      if (i < weeks.length) todo.push(weeks[i]!);
+      if (i < olders.length) todo.push(olders[i]!);
     }
     if (todo.length === 0) return 0;
     // From 8 h before the week (Orderly's 8 h prints cover the hours before them) to the end of the current hour; for
@@ -805,6 +904,7 @@ export class Scanner {
         });
         this.#rates.recordBooked(longSide(leg), points);
         this.#rates.recordBooked(shortSide(leg), points);
+        this.#historyDirty = true;
         if (older) {
           this.#older.set(key, { done: true, failures: 0, refusedSince: null, failingSince: null, givenUp: null, retryAt: 0 });
           const week = this.#history.get(key)?.points ?? 0;

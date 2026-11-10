@@ -97,6 +97,38 @@ export const DEMO_ENTRY_TEXT = 'an owner-requested demonstration entry: the prof
   + 'owner_accepted_cost_usd bounds the estimated round-trip cost (fees, slippage, basis buffer) only: funding during the '
   + 'hold is expected positive and is not part of that bound';
 
+/**
+ * What a manual act's prompt says about `computed`: the comparisons the red flags turn on, worked out by the engine
+ * from the same numbers, so the model reads a result instead of comparing two numbers itself (it has called an
+ * $11,224.94 book smaller than a $10.63 leg, and a 0.07 % move a liquidation risk). Manual prompts only: an auto
+ * act's prompt is unchanged, since recorded replies are found by it.
+ */
+export const COMPUTED_NOTE = 'worked out by the engine from the numbers above: rely on these results instead of comparing the raw numbers yourself. '
+  + 'null means not known';
+
+const ratio = (a: number | null, b: number | null): number | null => (a === null || b === null || b === 0 ? null : Math.round((a / b) * 100) / 100);
+
+/** The red flags' comparisons, computed: ratios to two decimals, booleans, null where a number is not known. */
+export function computedFacts(facts: VetoFacts): Record<string, unknown> {
+  const { grossAprPct: now, grossApr7dPct: d7, grossApr14dPct: d14, legUsd } = facts;
+  return {
+    note: COMPUTED_NOTE,
+    this_hour_spread_over_7d_mean: ratio(now, d7),
+    this_hour_spread_over_14d_mean: ratio(now, d14),
+    spread_7d_and_14d_same_direction: d7 === null || d14 === null ? null : d7 * d14 > 0,
+    legs: facts.legs.map((l) => ({
+      venue: l.venue,
+      side: l.side,
+      book_depth_is_at_least_leg: l.bookDepthUsd === null ? null : l.bookDepthUsd >= legUsd,
+      book_depth_over_leg: ratio(l.bookDepthUsd, legUsd),
+      open_interest_over_leg: ratio(l.openInterestUsd, legUsd),
+      fill_impact_is_50_bps_or_less: l.fillImpactBps === null ? null : l.fillImpactBps <= 50,
+      price_move_24h_is_within_15_pct: l.priceMove24hPct === null ? null : Math.abs(l.priceMove24hPct) <= 15,
+      listed_14_days_or_more: l.daysSinceListing === null ? null : l.daysSinceListing >= 14,
+    })),
+  };
+}
+
 /** The most reasons kept from a reply, and the longest. */
 const MAX_REASONS = 3;
 const MAX_REASON_TEXT = 200;
@@ -148,6 +180,7 @@ export function vetoMessages(facts: VetoFacts): ChatMessage[] {
       venue: l.venue, side: l.side, open_interest_usd: r2(l.openInterestUsd), book_depth_usd: r2(l.bookDepthUsd),
       fill_impact_bps: r2(l.fillImpactBps), price_move_24h_pct: r2(l.priceMove24hPct), days_since_listing: r2(l.daysSinceListing),
     })),
+    ...(facts.manual === true ? { computed: computedFacts(facts) } : {}),
   };
   return [{ role: 'system', content: VETO_SYSTEM_PROMPT }, { role: 'user', content: JSON.stringify(f) }];
 }

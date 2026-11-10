@@ -90,6 +90,11 @@ cargo +stable-x86_64-pc-windows-msvc test --workspace   # plain `cargo test` run
   At start serve loads the newest 5 000 entries within 30 days (`journal: N entries loaded from ...`); the file is
   rewritten to that bound once it runs 1 000 lines past it. A line that is not a whole entry is skipped, a file that
   cannot be read starts the journal empty, and neither stops serve. Replay keeps its journal in memory only.
+- The scanner's funding history is kept there too (`history-<mode>-<contract>-<desk>.json`,
+  `engine/src/scanner/history-cache.ts`), written at most every 30 s after a history read lands, so a restart does
+  not read 14 days from the venues again (`history: N legs loaded from ...`). A file or a leg that fails its checks
+  (version, gaps, hours out of range, older than the window) is ignored and read from the venue as before. Replay
+  keeps none.
 - A persisted OutcomeUnknown (`"unknown"` in the rescuer's file) survives restarts and holds every transfer; reduces
   still run. The owner clears it after reconciling: stop serve, set `"unknown"` to `null` in that file, start again
   (docs/interfaces.md, "Rescuer state"). Never delete the file to clear it: a missing or unusable state file also
