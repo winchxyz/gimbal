@@ -6,7 +6,7 @@ Q-012). None needs a key, an account or a chain; only the last row needs Docker.
 | Command | Prints |
 | --- | --- |
 | `npm ci` | installs the four workspaces (`engine`, `web`, `shared`, `tools`) from the lockfile, no errors; npm audit's "2 high" are one advisory, zod 4.4.3 ([GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5)), pinned exactly by the Phoenix SDK 0.6.2 and, to match it, by `engine/package.json` (`npm audit fix` without `--force` changes nothing). The fix is rise ≥ 0.6.7 plus zod ≥ 4.6.6 in the engine, deferred until after the hackathon demo; until then an oversized Phoenix answer could stop the engine, never sign or move funds (the engine's own MCP server reads only its local stdio client) ([security.md](security.md#oversized-phoenix-answers-zod--466)) |
-| `npm run ci -- --only npm` | `ci: green - npm ci, build, test, typecheck (node tests N + N + N) in N s`, the engine, web and tools test counts (1527 + 525 + 233 at this commit) |
+| `npm run ci -- --only npm` | `ci: green - npm ci, build, test, typecheck (node tests N + N + N) in N s`, the engine, web and tools test counts (1599 + 630 + 233 at this commit) |
 | `npm run demo` | `demo: ready. Open http://localhost:5190`, then the steps in the README's [Demo](../README.md#demo-npm-run-demo) table (`-- --web-port <n>` if 5190 is taken) |
 | `cd contract && cargo test -p gimbal-core` | `test result: ok.` for the 126 unit tests and for each vector file (decimal, EIP-3009, Hyperliquid, 1Click, Orderly, Solana, Solana fuzz): 190 passed, 0 failed |
 | `npm run ci -- --only contract` | `ci: green - cargo fmt, clippy, cargo test, wasm (cargo tests 439; wasm 674,490 bytes) in N s` |

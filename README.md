@@ -1,7 +1,7 @@
 # Gimbal
 
-**A trading desk that earns the gap in funding rates between two exchanges, with its money in accounts only a NEAR
-contract can sign for.**
+**An automated funding arbitrage desk on NEAR: it earns the gap in funding rates between two exchanges, with its
+money in accounts only a NEAR contract can sign for.**
 
 Perpetual-futures exchanges make one side of the market pay the other a small regular fee, called funding, and the
 rate differs from one exchange to the next. A funding carry is short a coin where funding pays more and long the same
@@ -85,7 +85,7 @@ of 2026-10-31, x10, a stress test from Rescue), run `npm run demo`.
 
 ```bash
 npm ci                     # the four workspaces from the lockfile; one zod advisory (see docs/reviewer-checks.md)
-npm run ci -- --only npm   # ci: green - npm ci, build, test, typecheck (node tests 1527 + 525 + 233) in N s
+npm run ci -- --only npm   # ci: green - npm ci, build, test, typecheck (node tests 1599 + 630 + 233) in N s
 npm run demo               # demo: ready. Open http://localhost:5190 (recorded mainnet data, nothing signed)
 ```
 
@@ -247,10 +247,10 @@ The transactions of the contract, the desk and the canary, with what each proves
 
 <a id="status-2026-11-04"></a>
 
-## Status (2026-11-07)
+## Status (2026-11-10)
 
-Done (read from the chain and the venues' public APIs at about 08:10 UTC on 2026-11-07; the 2026-11-09 item on
-2026-11-09):
+Done (read from the chain and the venues' public APIs at about 08:10 UTC on 2026-11-07; the 2026-11-09 and
+2026-11-10 items on their own days):
 
 - The contract code is frozen after three internal review rounds (no external audit), deployed from a reproducible
   build and locked.
